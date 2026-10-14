@@ -125,13 +125,13 @@ def _bn_bwd_host(
 _KCACHE = {}
 
 
-def backward(spec, dy3d, x3d, gamma, saved_mean, saved_rstd, *, has_beta, cfg, params):
+def backward(spec, dy3d, x3d, gamma, saved_mean, saved_rstd, *, has_beta, cfg, params, out_dx=None, out_dgamma=None, out_dbeta=None):
     """Launch BatchNorm backward. Returns ``(dx, dgamma, dbeta)``."""
     import torch
 
-    dx = torch.empty_like(x3d)
-    dgamma = torch.zeros(spec.C, dtype=torch.float32, device=x3d.device)
-    dbeta = torch.zeros(spec.C, dtype=torch.float32, device=x3d.device)
+    dx = torch.empty_like(x3d) if out_dx is None else out_dx
+    dgamma = torch.zeros(spec.C, dtype=torch.float32, device=x3d.device) if out_dgamma is None else out_dgamma.zero_()
+    dbeta = torch.zeros(spec.C, dtype=torch.float32, device=x3d.device) if out_dbeta is None else out_dbeta.zero_()
 
     args = (
         dyn(dy3d),

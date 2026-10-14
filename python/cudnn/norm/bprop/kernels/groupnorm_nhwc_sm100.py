@@ -475,7 +475,7 @@ def eligible(C, cpg, eb):
     return _geom(C, cpg, eb) is not None
 
 
-def backward(spec, dy3, x3, gamma, mean, rstd, *, has_beta, cfg, params, knobs=None):
+def backward(spec, dy3, x3, gamma, mean, rstd, *, has_beta, cfg, params, knobs=None, out_dx=None, out_dgamma=None, out_dbeta=None):
     """Launch the native NHWC GroupNorm backward. ``x3``/``dy3`` are ``[N, H*W, C]``."""
     import torch
 
@@ -506,9 +506,9 @@ def backward(spec, dy3, x3, gamma, mean, rstd, *, has_beta, cfg, params, knobs=N
         return _launch(mparts, COOP)
 
     def _launch(mparts, COOP):
-        dx = torch.empty_like(x3)
-        dgamma = torch.empty(C, dtype=torch.float32, device=x3.device)
-        dbeta = torch.empty(C, dtype=torch.float32, device=x3.device)
+        dx = torch.empty_like(x3) if out_dx is None else out_dx
+        dgamma = torch.empty(C, dtype=torch.float32, device=x3.device) if out_dgamma is None else out_dgamma
+        dbeta = torch.empty(C, dtype=torch.float32, device=x3.device) if out_dbeta is None else out_dbeta
         NM = N * mparts
         s1 = torch.zeros(NM * C, dtype=torch.float32, device=x3.device)
         s2 = torch.zeros(NM * C, dtype=torch.float32, device=x3.device)

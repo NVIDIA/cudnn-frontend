@@ -303,7 +303,7 @@ def eligible(spec, elem_bytes):
     return (M // V + 31) // 32 <= _MAX_KREG
 
 
-def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params):
+def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params, out_dx=None, out_dgamma=None, out_dbeta=None):
     """Launch the warp-per-row InstanceNorm backward."""
     import torch
 
@@ -328,9 +328,9 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params):
         ctas = (W + WPB - 1) // WPB
         W = ctas * WPB
 
-    dx = torch.empty_like(x2d)
-    dgamma = torch.empty(spec.gamma_len, dtype=torch.float32, device=x2d.device)
-    dbeta = torch.empty(spec.gamma_len, dtype=torch.float32, device=x2d.device)
+    dx = torch.empty_like(x2d) if out_dx is None else out_dx
+    dgamma = torch.empty(spec.gamma_len, dtype=torch.float32, device=x2d.device) if out_dgamma is None else out_dgamma
+    dbeta = torch.empty(spec.gamma_len, dtype=torch.float32, device=x2d.device) if out_dbeta is None else out_dbeta
     dgp = torch.zeros(W, dtype=torch.float32, device=x2d.device)
     dbp = torch.zeros(W, dtype=torch.float32, device=x2d.device)
     if mean is None:

@@ -374,7 +374,7 @@ def _gn_bwd_cga_host(
 _KCACHE = {}
 
 
-def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, knobs=None):
+def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, knobs=None, out_dx=None, out_dgamma=None, out_dbeta=None):
     """Launch the long-row / few-row GN/IN backward. Returns ``(dx, dgamma, dbeta)``."""
     import torch
 
@@ -394,9 +394,9 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, knobs=None
     R = int(spec.R)
 
     nparts = ncta_rows * CGA
-    dx = torch.empty_like(x2d)
-    dgamma = torch.empty(spec.gamma_len, dtype=torch.float32, device=x2d.device)
-    dbeta = torch.empty(spec.gamma_len, dtype=torch.float32, device=x2d.device)
+    dx = torch.empty_like(x2d) if out_dx is None else out_dx
+    dgamma = torch.empty(spec.gamma_len, dtype=torch.float32, device=x2d.device) if out_dgamma is None else out_dgamma
+    dbeta = torch.empty(spec.gamma_len, dtype=torch.float32, device=x2d.device) if out_dbeta is None else out_dbeta
     dgp = torch.zeros(nparts * CPG, dtype=torch.float32, device=x2d.device)
     dbp = torch.zeros(nparts * CPG, dtype=torch.float32, device=x2d.device)
     if mean is None:

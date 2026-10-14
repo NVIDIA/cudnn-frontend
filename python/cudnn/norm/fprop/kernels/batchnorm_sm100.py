@@ -144,7 +144,7 @@ def _bn_fwd_host(
 _KCACHE = {}
 
 
-def forward(spec, x3d, gamma, beta, *, eps, momentum, training, running_mean=None, running_var=None, cfg, params):
+def forward(spec, x3d, gamma, beta, *, eps, momentum, training, running_mean=None, running_var=None, cfg, params, out_y=None, out_mean=None, out_rstd=None):
     """Launch BatchNorm forward. Returns ``(y, saved_mean, saved_rstd)``.
 
     When ``training`` and running tensors are supplied, they are updated in place.
@@ -161,9 +161,9 @@ def forward(spec, x3d, gamma, beta, *, eps, momentum, training, running_mean=Non
     if running_var is None:
         running_var = torch.ones(spec.C, dtype=torch.float32, device=x3d.device)
 
-    y = torch.empty_like(x3d)
-    saved_mean = torch.empty(spec.C, dtype=torch.float32, device=x3d.device)
-    saved_rstd = torch.empty(spec.C, dtype=torch.float32, device=x3d.device)
+    y = torch.empty_like(x3d) if out_y is None else out_y
+    saved_mean = torch.empty(spec.C, dtype=torch.float32, device=x3d.device) if out_mean is None else out_mean
+    saved_rstd = torch.empty(spec.C, dtype=torch.float32, device=x3d.device) if out_rstd is None else out_rstd
 
     args = (
         dyn(x3d),

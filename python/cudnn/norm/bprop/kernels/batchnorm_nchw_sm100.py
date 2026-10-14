@@ -460,7 +460,7 @@ def _ksr(nloc, WPB, CPW, S, eb, occ):
     return max(0, min(nloc, (smem_budget(_SMEM_CAP_PREF) // occ) // per_row))
 
 
-def backward(spec, dy3d, x3d, gamma, saved_mean, saved_rstd, *, has_beta, cfg, params, knobs=None):
+def backward(spec, dy3d, x3d, gamma, saved_mean, saved_rstd, *, has_beta, cfg, params, knobs=None, out_dx=None, out_dgamma=None, out_dbeta=None):
     """Launch the NCHW BatchNorm backward. Returns ``(dx, dgamma, dbeta)``."""
     import torch
 
@@ -473,9 +473,9 @@ def backward(spec, dy3d, x3d, gamma, saved_mean, saved_rstd, *, has_beta, cfg, p
         raise ValueError(f"NCHW BatchNorm backward: C={C} S={S} unsupported")
     VS, UF, WPB, CPW, CT, cparts, BT = geo
 
-    dx = torch.empty_like(x3d)
-    dgamma = torch.empty(C, dtype=torch.float32, device=x3d.device)
-    dbeta = torch.empty(C, dtype=torch.float32, device=x3d.device)
+    dx = torch.empty_like(x3d) if out_dx is None else out_dx
+    dgamma = torch.empty(C, dtype=torch.float32, device=x3d.device) if out_dgamma is None else out_dgamma
+    dbeta = torch.empty(C, dtype=torch.float32, device=x3d.device) if out_dbeta is None else out_dbeta
     xf, df, gf = x3d.reshape(-1), dy3d.reshape(-1), dx.reshape(-1)
     count = float(N * S)
 

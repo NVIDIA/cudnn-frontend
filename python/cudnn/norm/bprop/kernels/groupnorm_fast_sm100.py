@@ -338,7 +338,7 @@ def eligible(spec, elem_bytes):
     return True
 
 
-def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params):
+def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params, out_dx=None, out_dgamma=None, out_dbeta=None):
     """Launch the atomic-free GN/IN backward. Returns ``(dx, dgamma, dbeta)``."""
     import torch
 
@@ -370,9 +370,9 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params):
     if ctas > R:
         ctas = max(GPS, (R // GPS) * GPS) or GPS
 
-    dx = torch.empty_like(x2d)
-    dgamma = torch.empty(spec.gamma_len, dtype=torch.float32, device=x2d.device)
-    dbeta = torch.empty(spec.gamma_len, dtype=torch.float32, device=x2d.device)
+    dx = torch.empty_like(x2d) if out_dx is None else out_dx
+    dgamma = torch.empty(spec.gamma_len, dtype=torch.float32, device=x2d.device) if out_dgamma is None else out_dgamma
+    dbeta = torch.empty(spec.gamma_len, dtype=torch.float32, device=x2d.device) if out_dbeta is None else out_dbeta
     dgp = torch.zeros(ctas * CPG, dtype=torch.float32, device=x2d.device)
     dbp = torch.zeros(ctas * CPG, dtype=torch.float32, device=x2d.device)
     if mean is None:

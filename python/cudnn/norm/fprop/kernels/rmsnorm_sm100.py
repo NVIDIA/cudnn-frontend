@@ -14,6 +14,6 @@ from __future__ import annotations
 from . import layernorm_sm100
 
 
-def forward(spec, x2d, gamma, beta, *, eps, cfg, params):
+def forward(spec, x2d, gamma, beta, *, eps, cfg, params, out_y=None, out_mean=None, out_rstd=None):
     """Launch RMSNorm forward. Returns ``(y, mean, rstd)`` (``mean`` unused)."""
-    return layernorm_sm100.forward(spec, x2d, gamma, beta, eps=eps, cfg=cfg, params=params)
+    return layernorm_sm100.forward(spec, x2d, gamma, beta, eps=eps, cfg=cfg, params=params, out_y=out_y, out_mean=out_mean, out_rstd=out_rstd)

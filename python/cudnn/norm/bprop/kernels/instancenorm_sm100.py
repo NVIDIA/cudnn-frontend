@@ -13,6 +13,8 @@ from __future__ import annotations
 from . import groupnorm_sm100
 
 
-def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params):
+def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params, out_dx=None, out_dgamma=None, out_dbeta=None):
     """Launch InstanceNorm backward. Returns ``(dx, dgamma, dbeta)``."""
-    return groupnorm_sm100.backward(spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, cfg=cfg, params=params)
+    return groupnorm_sm100.backward(
+        spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, cfg=cfg, params=params, out_dx=out_dx, out_dgamma=out_dgamma, out_dbeta=out_dbeta
+    )

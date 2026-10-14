@@ -622,7 +622,7 @@ def _smem_bytes(BT, V, CPC, KS, elem_bytes):
     return BT * V * 4 + 2 * CPC * 4 + BT * KS * V * elem_bytes + 128
 
 
-def forward(spec, x2d, gamma, beta, *, eps, momentum, training, running_mean, running_var, cfg, params, knobs=None):
+def forward(spec, x2d, gamma, beta, *, eps, momentum, training, running_mean, running_var, cfg, params, knobs=None, out_y=None, out_mean=None, out_rstd=None):
     """Launch the NHWC BatchNorm forward on ``x2d`` viewed as ``[M, C]``.
 
     Returns ``(y2d, saved_mean, saved_rstd)``. ``running_mean``/``running_var`` are
@@ -642,9 +642,9 @@ def forward(spec, x2d, gamma, beta, *, eps, momentum, training, running_mean, ru
     if beta is None:
         beta = gamma
 
-    y2d = torch.empty_like(x2d)
-    saved_mean = torch.empty(C, dtype=torch.float32, device=x2d.device)
-    saved_rstd = torch.empty(C, dtype=torch.float32, device=x2d.device)
+    y2d = torch.empty_like(x2d) if out_y is None else out_y
+    saved_mean = torch.empty(C, dtype=torch.float32, device=x2d.device) if out_mean is None else out_mean
+    saved_rstd = torch.empty(C, dtype=torch.float32, device=x2d.device) if out_rstd is None else out_rstd
 
     if not training:
         rm = running_mean if running_mean is not None else torch.zeros(C, dtype=torch.float32, device=x2d.device)

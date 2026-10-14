@@ -800,7 +800,7 @@ def _pipe_bwd_cap(R, wn, C, cache_xd, eb):
     return min(R, NSM * mult)
 
 
-def _backward_pipe(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, wcfg):
+def _backward_pipe(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, wcfg, out_dx=None, out_dgamma=None, out_dbeta=None):
     import torch
 
     tpr, wn, ldgs, V = wcfg
@@ -813,7 +813,7 @@ def _backward_pipe(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, wcfg
     if mean is None:
         mean = rstd
 
-    dx = torch.empty_like(x2d)
+    dx = torch.empty_like(x2d) if out_dx is None else out_dx
     # finalize atomic-accumulates over partition chunks -> outputs start at zero. Zero
     # dgamma+dbeta in ONE fill (a contiguous [2,gamma_len] buffer, sliced to views) so
     # LN pays a single zeroing-kernel launch instead of two -- the launch overhead is a
@@ -822,7 +822,7 @@ def _backward_pipe(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, wcfg
         _gb = torch.zeros(2, spec.gamma_len, dtype=torch.float32, device=x2d.device)
         dgamma, dbeta = _gb[0], _gb[1]
     else:
-        dgamma = torch.zeros(spec.gamma_len, dtype=torch.float32, device=x2d.device)
+        dgamma = torch.zeros(spec.gamma_len, dtype=torch.float32, device=x2d.device) if out_dgamma is None else out_dgamma.zero_()
         dbeta = dgamma
     dgp = torch.empty(ctas * C, dtype=torch.float32, device=x2d.device)
     dbp = torch.empty(ctas * C, dtype=torch.float32, device=x2d.device) if has_beta else dgp
@@ -853,7 +853,7 @@ def _backward_pipe(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, wcfg
 _KTILED = {}
 
 
-def _backward_tiled(spec, dy2d, x2d, gamma, rstd, *, params, wcfg):
+def _backward_tiled(spec, dy2d, x2d, gamma, rstd, *, params, wcfg, out_dx=None, out_dgamma=None, out_dbeta=None):
     """Tiny-C (wn==1) RMS backward: multi-row tiled bulk-loads. Returns dgamma only
     (RMS has no dbeta)."""
     import torch
@@ -870,8 +870,8 @@ def _backward_tiled(spec, dy2d, x2d, gamma, rstd, *, params, wcfg):
     ntiles = R // RPT
     ctas = min(ntiles, _sm_count() * 12)
 
-    dx = torch.empty_like(x2d)
-    dgamma = torch.zeros(spec.gamma_len, dtype=torch.float32, device=x2d.device)
+    dx = torch.empty_like(x2d) if out_dx is None else out_dx
+    dgamma = torch.zeros(spec.gamma_len, dtype=torch.float32, device=x2d.device) if out_dgamma is None else out_dgamma.zero_()
     dgp = torch.empty(ctas * C, dtype=torch.float32, device=x2d.device)
 
     et = DTYPE_TO_CUTLASS[params.io_dtype]
@@ -907,7 +907,7 @@ def _sm_count():
 _KCACHE = {}
 
 
-def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params):
+def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params, out_dx=None, out_dgamma=None, out_dbeta=None):
     """Launch LayerNorm/RMSNorm backward. Returns ``(dx, dgamma, dbeta)``."""
     import torch
 
@@ -917,16 +917,18 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params):
         # Only without beta -- this path returns dgamma alone, and selecting it for a
         # bias-carrying RMSNorm silently dropped dbeta to None (the caller then saw an
         # unwritten gradient, not an error). RMSNorm with bias is legal in cuDNN.
-        return _backward_tiled(spec, dy2d, x2d, gamma, rstd, params=params, wcfg=wcfg)
+        return _backward_tiled(spec, dy2d, x2d, gamma, rstd, params=params, wcfg=wcfg, out_dx=out_dx, out_dgamma=out_dgamma, out_dbeta=out_dbeta)
     if wcfg is not None and _pipe_bwd_eligible(spec.M, wcfg[1], wcfg[2], wcfg[3], spec.R, has_beta, DTYPE_BYTES[params.io_dtype]):
-        return _backward_pipe(spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, params=params, wcfg=wcfg)
+        return _backward_pipe(
+            spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, params=params, wcfg=wcfg, out_dx=out_dx, out_dgamma=out_dgamma, out_dbeta=out_dbeta
+        )
 
     if mean is None:  # RMSNorm has no centering; kernel ignores it when has_mean=False
         mean = torch.empty(spec.R, dtype=torch.float32, device=x2d.device)
 
-    dx = torch.empty_like(x2d)
-    dgamma = torch.zeros(spec.gamma_len, dtype=torch.float32, device=x2d.device)
-    dbeta = torch.zeros(spec.gamma_len, dtype=torch.float32, device=x2d.device)
+    dx = torch.empty_like(x2d) if out_dx is None else out_dx
+    dgamma = torch.zeros(spec.gamma_len, dtype=torch.float32, device=x2d.device) if out_dgamma is None else out_dgamma.zero_()
+    dbeta = torch.zeros(spec.gamma_len, dtype=torch.float32, device=x2d.device) if out_dbeta is None else out_dbeta.zero_()
 
     args = (
         dyn(dy2d),

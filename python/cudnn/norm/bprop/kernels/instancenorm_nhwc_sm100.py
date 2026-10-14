@@ -404,7 +404,7 @@ def _in_bwd_nhwc_host(
 _KCACHE = {}
 
 
-def backward(spec, dy4d, x4d, gamma, mean, rstd, *, has_beta, cfg, params, knobs=None):
+def backward(spec, dy4d, x4d, gamma, mean, rstd, *, has_beta, cfg, params, knobs=None, out_dx=None, out_dgamma=None, out_dbeta=None):
     """Launch the native NHWC InstanceNorm backward. ``x4d``/``dy4d`` are the
     channels-last tensors viewed as ``[N, H*W, C]``."""
     import torch
@@ -432,9 +432,9 @@ def backward(spec, dy4d, x4d, gamma, mean, rstd, *, has_beta, cfg, params, knobs
         return _launch(mparts)
 
     def _launch(mparts):
-        dx = torch.empty_like(x4d)
-        dgamma = torch.empty(C, dtype=torch.float32, device=x4d.device)
-        dbeta = torch.empty(C, dtype=torch.float32, device=x4d.device)
+        dx = torch.empty_like(x4d) if out_dx is None else out_dx
+        dgamma = torch.empty(C, dtype=torch.float32, device=x4d.device) if out_dgamma is None else out_dgamma
+        dbeta = torch.empty(C, dtype=torch.float32, device=x4d.device) if out_dbeta is None else out_dbeta
         pbuf = torch.empty(N * cblks * mparts * TPP * V * 2, dtype=torch.float32, device=x4d.device)
         ret = torch.zeros(N * cblks, dtype=torch.int32, device=x4d.device)
         s1 = torch.empty(N * C, dtype=torch.float32, device=x4d.device)

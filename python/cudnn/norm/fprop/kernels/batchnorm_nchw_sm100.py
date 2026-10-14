@@ -804,7 +804,7 @@ def _ksr(nloc: int, WPB: int, CPW: int, S: int, eb: int, occ: int) -> int:
     return max(0, min(nloc, (smem_budget(_SMEM_CAP_PREF) // occ) // per_row))
 
 
-def forward(spec, x3d, gamma, beta, *, eps, momentum, training, running_mean, running_var, cfg, params, knobs=None):
+def forward(spec, x3d, gamma, beta, *, eps, momentum, training, running_mean, running_var, cfg, params, knobs=None, out_y=None, out_mean=None, out_rstd=None):
     """Launch the NCHW BatchNorm forward on ``x3d`` viewed as ``[N, C, S]``.
 
     Returns ``(y3d, saved_mean, saved_rstd)``.
@@ -823,11 +823,11 @@ def forward(spec, x3d, gamma, beta, *, eps, momentum, training, running_mean, ru
     if beta is None:
         beta = gamma
 
-    y3d = torch.empty_like(x3d)
+    y3d = torch.empty_like(x3d) if out_y is None else out_y
     xf = x3d.reshape(-1)
     yf = y3d.reshape(-1)
-    saved_mean = torch.empty(C, dtype=torch.float32, device=x3d.device)
-    saved_rstd = torch.empty(C, dtype=torch.float32, device=x3d.device)
+    saved_mean = torch.empty(C, dtype=torch.float32, device=x3d.device) if out_mean is None else out_mean
+    saved_rstd = torch.empty(C, dtype=torch.float32, device=x3d.device) if out_rstd is None else out_rstd
 
     if not training:
         rm = running_mean if running_mean is not None else torch.zeros(C, dtype=torch.float32, device=x3d.device)

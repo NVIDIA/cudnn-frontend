@@ -224,13 +224,13 @@ def _gn_bwd_host(
 _KCACHE = {}
 
 
-def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params):
+def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params, out_dx=None, out_dgamma=None, out_dbeta=None):
     """Launch GroupNorm/InstanceNorm backward. Returns ``(dx, dgamma, dbeta)``."""
     import torch
 
-    dx = torch.empty_like(x2d)
-    dgamma = torch.zeros(spec.gamma_len, dtype=torch.float32, device=x2d.device)
-    dbeta = torch.zeros(spec.gamma_len, dtype=torch.float32, device=x2d.device)
+    dx = torch.empty_like(x2d) if out_dx is None else out_dx
+    dgamma = torch.zeros(spec.gamma_len, dtype=torch.float32, device=x2d.device) if out_dgamma is None else out_dgamma.zero_()
+    dbeta = torch.zeros(spec.gamma_len, dtype=torch.float32, device=x2d.device) if out_dbeta is None else out_dbeta.zero_()
 
     args = (
         dyn(dy2d),

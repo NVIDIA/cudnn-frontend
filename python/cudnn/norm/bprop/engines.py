@@ -124,6 +124,13 @@ def lower_norm_bprop(spec: EngineSpec, facts: "ga.NormGraphFacts", requested: Op
         gamma = resolved.get(id(facts.scale_t)) if facts.scale_t is not None else None
         mean = resolved.get(id(facts.mean_t)) if facts.mean_t is not None else None
         rstd = resolved.get(id(facts.inv_var_t)) if facts.inv_var_t is not None else None
+        # Hand the graph's own buffers down so the kernels write them in place --
+        # no allocation in execute (Rule 1 / Rule 8), and no full-tensor copy of
+        # DX. norm_bprop ignores any buffer it cannot write directly, so
+        # _copy_into still covers those.
+        dx_buf = resolved.get(id(facts.dx_t))
+        dg_buf = resolved.get(id(facts.dscale_t)) if facts.dscale_t is not None else None
+        db_buf = resolved.get(id(facts.dbias_t)) if facts.dbias_t is not None else None
         dx, dgamma, dbeta = norm_bprop(
             facts.variant,
             dy,
@@ -134,20 +141,27 @@ def lower_norm_bprop(spec: EngineSpec, facts: "ga.NormGraphFacts", requested: Op
             normalized_shape=facts.normalized_shape,
             num_groups=facts.num_groups,
             has_beta=facts.has_beta,
+            out=(dx_buf, dg_buf, db_buf),
         )
-        _copy_into(resolved.get(id(facts.dx_t)), dx)
-        if facts.dscale_t is not None:
-            _copy_into(resolved.get(id(facts.dscale_t)), dgamma)
-        if facts.dbias_t is not None and dbeta is not None:
-            _copy_into(resolved.get(id(facts.dbias_t)), dbeta)
+        _copy_into(dx_buf, dx)
+        _copy_into(dg_buf, dgamma)
+        if dbeta is not None:
+            _copy_into(db_buf, dbeta)
         return None
 
     return _execute
 
 
 def _copy_into(buf, src):
-    if buf is not None:
-        buf.copy_(src.reshape(buf.shape))
+    """Land ``src`` in ``buf``, unless the kernel already wrote ``buf`` itself.
+
+    When the buffer went down through ``out=``, what comes back is a view of it
+    and the copy would be ``buf.copy_(buf)``. Comparing storage distinguishes
+    that from the fallback, where norm_bprop used a temporary instead.
+    """
+    if buf is None or src is None or buf.data_ptr() == src.data_ptr():
+        return
+    buf.copy_(src.reshape(buf.shape))
 
 
 def engine_name() -> str:

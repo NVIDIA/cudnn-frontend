@@ -190,7 +190,7 @@ def _ln_fwd_host(
 _KCACHE = {}
 
 
-def forward(spec, x2d, gamma, beta, *, eps, cfg, params):
+def forward(spec, x2d, gamma, beta, *, eps, cfg, params, out_y=None, out_mean=None, out_rstd=None):
     """Launch LayerNorm/RMSNorm forward. Returns ``(y, mean, rstd)``."""
     import torch
 
@@ -198,9 +198,9 @@ def forward(spec, x2d, gamma, beta, *, eps, cfg, params):
     if beta is None:
         beta = torch.zeros(spec.gamma_len, dtype=x2d.dtype, device=x2d.device)
 
-    y = torch.empty_like(x2d)
-    mean = torch.empty(spec.R, dtype=torch.float32, device=x2d.device)
-    rstd = torch.empty(spec.R, dtype=torch.float32, device=x2d.device)
+    y = torch.empty_like(x2d) if out_y is None else out_y
+    mean = torch.empty(spec.R, dtype=torch.float32, device=x2d.device) if out_mean is None else out_mean
+    rstd = torch.empty(spec.R, dtype=torch.float32, device=x2d.device) if out_rstd is None else out_rstd
 
     args = (
         dyn(x2d),

@@ -146,6 +146,14 @@ def lower_norm_fprop(spec: EngineSpec, facts: "ga.NormGraphFacts", requested: Op
         rv = _running_pair(resolved, facts.run_var_t, facts.prev_run_var_t)
         eps = _host_scalar(resolved.get(id(facts.eps_t)) if facts.eps_t is not None else None, facts.eps)
         momentum = _host_scalar(resolved.get(id(facts.momentum_t)) if facts.momentum_t is not None else None, facts.momentum)
+        # Hand the graph's own buffers down so the kernels write them in place:
+        # that is what keeps execute() free of allocations (Rule 1 / Rule 8), and
+        # it drops a full-tensor copy of Y that cost the graph path ~1.6x the
+        # direct one. norm_fprop ignores any buffer it cannot write directly, so
+        # _copy_into below still covers those.
+        y_buf = resolved.get(id(facts.y_t))
+        mean_buf = resolved.get(id(facts.mean_t)) if facts.mean_t is not None else None
+        rstd_buf = resolved.get(id(facts.inv_var_t)) if facts.inv_var_t is not None else None
         y, mean, rstd = norm_fprop(
             facts.variant,
             x,
@@ -158,12 +166,11 @@ def lower_norm_fprop(spec: EngineSpec, facts: "ga.NormGraphFacts", requested: Op
             training=facts.training,
             running_mean=rm,
             running_var=rv,
+            out=(y_buf, mean_buf, rstd_buf),
         )
-        _copy_into(resolved.get(id(facts.y_t)), y)
-        if facts.mean_t is not None:
-            _copy_into(resolved.get(id(facts.mean_t)), mean)
-        if facts.inv_var_t is not None:
-            _copy_into(resolved.get(id(facts.inv_var_t)), rstd)
+        _copy_into(y_buf, y)
+        _copy_into(mean_buf, mean)
+        _copy_into(rstd_buf, rstd)
         return None
 
     return _execute
@@ -208,8 +215,16 @@ def _host_scalar(buf, fallback):
 
 
 def _copy_into(buf, src):
-    if buf is not None:
-        buf.copy_(src.reshape(buf.shape))
+    """Land ``src`` in ``buf``, unless the kernel already wrote ``buf`` itself.
+
+    When the output buffer was passed down through ``out=``, what comes back is
+    a view of it and the copy would be ``buf.copy_(buf)`` -- same pointer, pure
+    waste. Comparing the storage is what tells the two cases apart, since
+    norm_fprop silently falls back to a temporary for any buffer it cannot use.
+    """
+    if buf is None or src is None or buf.data_ptr() == src.data_ptr():
+        return
+    buf.copy_(src.reshape(buf.shape))
 
 
 def engine_name() -> str:

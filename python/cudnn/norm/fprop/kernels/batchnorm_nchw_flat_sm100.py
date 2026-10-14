@@ -481,7 +481,7 @@ def _bn_flat_host(
 _KCACHE = {}
 
 
-def forward(spec, x3d, gamma, beta, *, eps, momentum, training, running_mean, running_var, cfg, params, knobs=None):
+def forward(spec, x3d, gamma, beta, *, eps, momentum, training, running_mean, running_var, cfg, params, knobs=None, out_y=None, out_mean=None, out_rstd=None):
     import torch
 
     N, C, S = int(spec.N), int(spec.C), int(spec.S)
@@ -495,11 +495,11 @@ def forward(spec, x3d, gamma, beta, *, eps, momentum, training, running_mean, ru
     if beta is None:
         beta = gamma
 
-    y3d = torch.empty_like(x3d)
+    y3d = torch.empty_like(x3d) if out_y is None else out_y
     xf = x3d.reshape(-1)
     yf = y3d.reshape(-1)
-    saved_mean = torch.empty(C, dtype=torch.float32, device=x3d.device)
-    saved_rstd = torch.empty(C, dtype=torch.float32, device=x3d.device)
+    saved_mean = torch.empty(C, dtype=torch.float32, device=x3d.device) if out_mean is None else out_mean
+    saved_rstd = torch.empty(C, dtype=torch.float32, device=x3d.device) if out_rstd is None else out_rstd
     update_running = bool(training and running_mean is not None and running_var is not None)
     rm = running_mean if update_running else saved_mean
     rv = running_var if update_running else saved_rstd

@@ -369,7 +369,7 @@ def _smem_bytes(BT, V, CPC, KS, eb):
     return 2 * BT * V * 4 + 2 * CPC * 4 + 2 * BT * KS * V * eb + 128
 
 
-def backward(spec, dy2d, x2d, gamma, saved_mean, saved_rstd, *, has_beta, cfg, params, knobs=None):
+def backward(spec, dy2d, x2d, gamma, saved_mean, saved_rstd, *, has_beta, cfg, params, knobs=None, out_dx=None, out_dgamma=None, out_dbeta=None):
     """Launch the NHWC BatchNorm backward on views of shape ``[M, C]``."""
     import torch
 
@@ -382,9 +382,9 @@ def backward(spec, dy2d, x2d, gamma, saved_mean, saved_rstd, *, has_beta, cfg, p
         raise ValueError(f"NHWC BatchNorm backward: C={C} is not 128-bit tileable")
     V, CPC, TPP, PPL, cblks, BT = geo
 
-    dx = torch.empty_like(x2d)
-    dgamma = torch.empty(C, dtype=torch.float32, device=x2d.device)
-    dbeta = torch.empty(C, dtype=torch.float32, device=x2d.device)
+    dx = torch.empty_like(x2d) if out_dx is None else out_dx
+    dgamma = torch.empty(C, dtype=torch.float32, device=x2d.device) if out_dgamma is None else out_dgamma
+    dbeta = torch.empty(C, dtype=torch.float32, device=x2d.device) if out_dbeta is None else out_dbeta
 
     mbpm, KC, KS = knobs if knobs is not None else _knobs_for(M, C)
     smem_bytes = _smem_bytes(BT, V, CPC, KS, eb)

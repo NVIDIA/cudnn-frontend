@@ -295,7 +295,7 @@ def _gn_fwd_cga_host(
 _KCACHE = {}
 
 
-def forward(spec, x2d, gamma, beta, *, eps, params, knobs=None):
+def forward(spec, x2d, gamma, beta, *, eps, params, knobs=None, out_y=None, out_mean=None, out_rstd=None):
     """Launch the CGA row-split GN/IN forward. ``x2d`` is ``[R, M]``."""
     import torch
 
@@ -312,9 +312,9 @@ def forward(spec, x2d, gamma, beta, *, eps, params, knobs=None):
     if beta is None:
         beta = gamma
 
-    y = torch.empty_like(x2d)
-    rstd = torch.empty(R, dtype=torch.float32, device=x2d.device)
-    mean = torch.empty(R, dtype=torch.float32, device=x2d.device) if spec.has_mean else rstd
+    y = torch.empty_like(x2d) if out_y is None else out_y
+    rstd = torch.empty(R, dtype=torch.float32, device=x2d.device) if out_rstd is None else out_rstd
+    mean = (out_mean if out_mean is not None else torch.empty(R, dtype=torch.float32, device=x2d.device)) if spec.has_mean else rstd
 
     args = (
         dyn(x2d.reshape(-1)),

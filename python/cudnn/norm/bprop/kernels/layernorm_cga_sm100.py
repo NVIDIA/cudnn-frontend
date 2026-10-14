@@ -355,7 +355,7 @@ def _ln_bwd_cga_host(
 _KCACHE = {}
 
 
-def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, knobs=None):
+def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, knobs=None, out_dx=None, out_dgamma=None, out_dbeta=None):
     """Launch the CGA row-split LN/RMS backward. ``dy2d``/``x2d`` are ``[R, C]``."""
     import torch
 
@@ -373,9 +373,9 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, knobs=None
 
     # One cluster per row up to a persistent cap, then grid-stride.
     nclusters = min(R, max(1, 4 * sm_count() // CGA))
-    dx = torch.empty_like(x2d)
-    dgamma = torch.zeros(spec.gamma_len, dtype=torch.float32, device=x2d.device)
-    dbeta = torch.zeros(spec.gamma_len, dtype=torch.float32, device=x2d.device) if has_beta else dgamma
+    dx = torch.empty_like(x2d) if out_dx is None else out_dx
+    dgamma = torch.zeros(spec.gamma_len, dtype=torch.float32, device=x2d.device) if out_dgamma is None else out_dgamma.zero_()
+    dbeta = (out_dbeta.zero_() if out_dbeta is not None else torch.zeros(spec.gamma_len, dtype=torch.float32, device=x2d.device)) if has_beta else dgamma
     dgp = torch.empty(nclusters * C, dtype=torch.float32, device=x2d.device)
     dbp = torch.empty(nclusters * C, dtype=torch.float32, device=x2d.device) if has_beta else dgp
 

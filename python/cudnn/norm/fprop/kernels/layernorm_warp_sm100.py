@@ -580,7 +580,7 @@ def eligible(spec, params, wcfg, has_beta):
     return _warp_smem(spec.M, has_beta, wn, rpc, spec.has_mean, eb) <= _smem_max()
 
 
-def forward(spec, x2d, gamma, beta, *, eps, wcfg, params):
+def forward(spec, x2d, gamma, beta, *, eps, wcfg, params, out_y=None, out_mean=None, out_rstd=None):
     """Launch the warp-per-row LN/RMS forward. ``wcfg`` = (tpr, wn, intra, ldgs, rpc, block_threads, V)."""
     import torch
 
@@ -589,15 +589,15 @@ def forward(spec, x2d, gamma, beta, *, eps, wcfg, params):
     R, C = spec.R, spec.M
 
     if _pipe_eligible(C, wn, has_beta, DTYPE_BYTES[params.io_dtype]):
-        return _forward_pipe(spec, x2d, gamma, beta, eps=eps, wcfg=wcfg, params=params, has_beta=has_beta)
+        return _forward_pipe(spec, x2d, gamma, beta, eps=eps, wcfg=wcfg, params=params, has_beta=has_beta, out_y=out_y, out_mean=out_mean, out_rstd=out_rstd)
 
     ctas = _persist_cap((R + rpc - 1) // rpc, block_threads, wn, ldgs)  # persistent grid
-    y = torch.empty_like(x2d)
-    rstd = torch.empty(R, dtype=torch.float32, device=x2d.device)
+    y = torch.empty_like(x2d) if out_y is None else out_y
+    rstd = torch.empty(R, dtype=torch.float32, device=x2d.device) if out_rstd is None else out_rstd
     # Unused kernel operands (beta for RMS, mean for RMS) alias an existing tensor:
     # a distinct dummy alloc adds a per-call memset (counted in device-time) and an
     # extra pointer register that tips ldgs=5 below the 8-CTA/SM occupancy cliff.
-    mean = torch.empty(R, dtype=torch.float32, device=x2d.device) if spec.has_mean else rstd
+    mean = (out_mean if out_mean is not None else torch.empty(R, dtype=torch.float32, device=x2d.device)) if spec.has_mean else rstd
     if beta is None:
         beta = gamma
 
@@ -617,7 +617,7 @@ def forward(spec, x2d, gamma, beta, *, eps, wcfg, params):
     return y, mean, rstd
 
 
-def _forward_pipe(spec, x2d, gamma, beta, *, eps, wcfg, params, has_beta):
+def _forward_pipe(spec, x2d, gamma, beta, *, eps, wcfg, params, has_beta, out_y=None, out_mean=None, out_rstd=None):
     """Warp-specialized software-pipelined launch (large C). block=(wn+1)*32 so the
     last warp is a dedicated DMA warp; one row per CTA (rpc=1), grid-strided."""
     import torch
@@ -628,9 +628,9 @@ def _forward_pipe(spec, x2d, gamma, beta, *, eps, wcfg, params, has_beta):
     block_threads = (wn + 1) * 32
     ctas = _pipe_cap(R, C)
 
-    y = torch.empty_like(x2d)
-    rstd = torch.empty(R, dtype=torch.float32, device=x2d.device)
-    mean = torch.empty(R, dtype=torch.float32, device=x2d.device) if spec.has_mean else rstd
+    y = torch.empty_like(x2d) if out_y is None else out_y
+    rstd = torch.empty(R, dtype=torch.float32, device=x2d.device) if out_rstd is None else out_rstd
+    mean = (out_mean if out_mean is not None else torch.empty(R, dtype=torch.float32, device=x2d.device)) if spec.has_mean else rstd
     if beta is None:
         beta = gamma  # unused (not bulk-loaded) when has_beta is False
 

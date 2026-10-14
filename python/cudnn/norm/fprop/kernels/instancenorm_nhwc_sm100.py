@@ -292,7 +292,7 @@ def _in_fwd_nhwc_host(
 _KCACHE = {}
 
 
-def forward(spec, x3, gamma, beta, *, eps, cfg, params, knobs=None):
+def forward(spec, x3, gamma, beta, *, eps, cfg, params, knobs=None, out_y=None, out_mean=None, out_rstd=None):
     """Launch the native NHWC InstanceNorm forward. ``x3`` is ``[N, H*W, C]``."""
     import torch
 
@@ -317,9 +317,9 @@ def forward(spec, x3, gamma, beta, *, eps, cfg, params, knobs=None):
         # thinner slice buys no bandwidth and still pays the whole grid barrier.
         mparts = max(1, min(sm_count() * occ // max(1, cblks * N), HW // (PPL * KC)))
         COOP = mparts > 1
-        y = torch.empty_like(x3)
-        mean = torch.empty(N * C, dtype=torch.float32, device=x3.device)
-        rstd = torch.empty(N * C, dtype=torch.float32, device=x3.device)
+        y = torch.empty_like(x3) if out_y is None else out_y
+        mean = torch.empty(N * C, dtype=torch.float32, device=x3.device) if out_mean is None else out_mean
+        rstd = torch.empty(N * C, dtype=torch.float32, device=x3.device) if out_rstd is None else out_rstd
         pbuf = torch.empty(N * cblks * mparts * TPP * V * 2, dtype=torch.float32, device=x3.device)
         ret = torch.zeros(N * cblks, dtype=torch.int32, device=x3.device)
         args = (
