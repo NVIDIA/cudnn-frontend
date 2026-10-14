@@ -20,7 +20,10 @@ right-to-left masked KV walk and P kept in registers, with every MMA lowered to
 - The load warp bulk-copies the 128-row K scale tile and the V scale tile that
   cover each K/V tile into SMEM on the K/V mbarriers. A 64-key tile reads the
   half of its 128-row tile. K scales are read as one 32-bit word (four D
-  blocks) per 16-key fragment pair and plane; V scales as one byte per k32
+  blocks) per n8 key block and plane. Q@K^T runs plane-major (one plane's
+  words live across every key fragment) for 256-column Q/K heads at 64-key
+  tiles, and pair-major (one fragment pair's words per plane) otherwise.
+  V scales are read as one byte per k32
   step and 8-column block, which keeps two scale registers live instead of a
   word per column held across the k32 steps.
 - K B-fragments: byte-preserving ``ldmatrix.m8n8.x4.b16``; V B-fragments: the
@@ -384,6 +387,10 @@ class SM120FusedMultiHeadAttentionForward:
         self.v_sf_tile_bytes = mxfp8_sf_tile_bytes(self.head_tile_v)
         self.qk_sf_planes = self.qk_sf_tile_bytes // SF_ATOM_BYTES
         self.v_sf_planes = self.v_sf_tile_bytes // SF_ATOM_BYTES
+        # Q@K^T order (mma_qk). Plane-major is the faster one for 256-column heads
+        # at 64-key tiles (the MXFP8 d256 tile); elsewhere the pair-major order,
+        # which keeps fewer K scale words live, is as fast or faster.
+        self.qk_plane_major = self.head_tile_qk == 256 and self.kv_tile == 64
 
     @cute.jit
     def load_one_kv_tile(
@@ -636,55 +643,54 @@ class SM120FusedMultiHeadAttentionForward:
             )
             return prims.ldmatrix(k_smem_ptr, 4, prims.MMALayout.ROW)
 
-        for k_frag_pair in cutlass.range_constexpr(self.qk_k_frags // 2):
-            # K scale words of this lane's B column (key lane // 4) in the
-            # pair's two n8 blocks, one word per head-dim plane.
-            sf_k = cutlass.Array(cutlass.Int32, 2 * self.qk_sf_planes, alignment=4)
-            key_lo = kv_sf_row0 + k_frag_pair * 16 + basic_params.lane // 4
+        def load_sf_k(plane: cutlass.Constexpr[int], k_frag: cutlass.Constexpr[int]) -> cutlass.Int32:
+            """K scale word of this lane's B column (key ``lane // 4``) in n8 block
+            ``k_frag``: the column's four 32-column blocks of ``plane``."""
+            sf_off = sf_atom_byte(kv_sf_row0 + k_frag * 8 + basic_params.lane // 4, 0, base=plane * SF_ATOM_BYTES)
+            return (mma_params.sKSF.data_ptr() + sf_off).load(count=4, alignment=4).bitcast(cutlass.Int32)[0]
+
+        def qk_step(k_frag_pair: cutlass.Constexpr[int], d_frag: cutlass.Constexpr[int], sf_k0, sf_k1) -> None:
+            """Both n8 blocks of one key fragment pair for one k32 step, which is one
+            32-column scale block: plane ``d_frag // 4``, byte ``d_frag % 4``."""
+            k_vec = load_k_frag_pair(k_frag_pair, d_frag)
+            q_off = d_frag * 4
+            s_off = (k_frag_pair * 2) * 4
+            for nh in cutlass.range_constexpr(2):
+                s_regs[s_off + 4 * nh : 4] = mma_m16n8k32_mxf8_f32(
+                    q_regs[q_off + 0],
+                    q_regs[q_off + 1],
+                    q_regs[q_off + 2],
+                    q_regs[q_off + 3],
+                    k_vec[2 * nh],
+                    k_vec[2 * nh + 1],
+                    s_regs[s_off + 4 * nh + 0],
+                    s_regs[s_off + 4 * nh + 1],
+                    s_regs[s_off + 4 * nh + 2],
+                    s_regs[s_off + 4 * nh + 3],
+                    q_sf[d_frag // 4],
+                    sf_k1 if nh else sf_k0,
+                    d_frag % 4,
+                    d_frag % 4,
+                    self.in_dtype,
+                )
+
+        # Both orders give every S accumulator the same k32 sequence.
+        if cutlass.const_expr(self.qk_plane_major):
+            # One plane's K scale words (one per n8 block) stay live while each
+            # of its d-fragments sweeps the key fragments, so consecutive MMAs
+            # accumulate into independent S fragments.
             for plane in cutlass.range_constexpr(self.qk_sf_planes):
-                for half in cutlass.range_constexpr(2):
-                    sf_off = sf_atom_byte(key_lo + half * 8, 0, base=plane * SF_ATOM_BYTES)
-                    sf_k[2 * plane + half] = (mma_params.sKSF.data_ptr() + sf_off).load(count=4, alignment=4).bitcast(cutlass.Int32)[0]
-            for d_frag in cutlass.range_constexpr(self.qk_d_frags):
-                k_vec = load_k_frag_pair(k_frag_pair, d_frag)
-                q_off = d_frag * 4
-                s_off = (k_frag_pair * 2) * 4
-                # One k32 step is one 32-column scale block: plane d_frag // 4, byte d_frag % 4.
-                plane = d_frag // 4
-                s_regs[s_off:4] = mma_m16n8k32_mxf8_f32(
-                    q_regs[q_off + 0],
-                    q_regs[q_off + 1],
-                    q_regs[q_off + 2],
-                    q_regs[q_off + 3],
-                    k_vec[0],
-                    k_vec[1],
-                    s_regs[s_off + 0],
-                    s_regs[s_off + 1],
-                    s_regs[s_off + 2],
-                    s_regs[s_off + 3],
-                    q_sf[plane],
-                    sf_k[2 * plane],
-                    d_frag % 4,
-                    d_frag % 4,
-                    self.in_dtype,
-                )
-                s_regs[s_off + 4 : 4] = mma_m16n8k32_mxf8_f32(
-                    q_regs[q_off + 0],
-                    q_regs[q_off + 1],
-                    q_regs[q_off + 2],
-                    q_regs[q_off + 3],
-                    k_vec[2],
-                    k_vec[3],
-                    s_regs[s_off + 4],
-                    s_regs[s_off + 5],
-                    s_regs[s_off + 6],
-                    s_regs[s_off + 7],
-                    q_sf[plane],
-                    sf_k[2 * plane + 1],
-                    d_frag % 4,
-                    d_frag % 4,
-                    self.in_dtype,
-                )
+                sf_k = [load_sf_k(plane, k_frag) for k_frag in range(self.qk_k_frags)]
+                for d_frag in cutlass.range_constexpr(plane * 4, min((plane + 1) * 4, self.qk_d_frags)):
+                    for k_frag_pair in cutlass.range_constexpr(self.qk_k_frags // 2):
+                        qk_step(k_frag_pair, d_frag, sf_k[2 * k_frag_pair], sf_k[2 * k_frag_pair + 1])
+        else:
+            # Each key fragment pair runs every d-fragment with only its two n8
+            # blocks' scale words live, one pair per plane.
+            for k_frag_pair in cutlass.range_constexpr(self.qk_k_frags // 2):
+                sf_k = [(load_sf_k(plane, 2 * k_frag_pair), load_sf_k(plane, 2 * k_frag_pair + 1)) for plane in range(self.qk_sf_planes)]
+                for d_frag in cutlass.range_constexpr(self.qk_d_frags):
+                    qk_step(k_frag_pair, d_frag, *sf_k[d_frag // 4])
 
         return s_regs
 

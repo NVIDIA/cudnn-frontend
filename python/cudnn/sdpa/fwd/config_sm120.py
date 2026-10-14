@@ -51,16 +51,22 @@ def pick_flavor(d_qk: int, d_v: int, fp8: bool) -> Optional[tuple[int, int]]:
     return tiles if tiles in (FP8_FLAVORS if fp8 else F16_FLAVORS) else None
 
 
-def tile_domain(d_qk: int, d_v: int, fp8: bool) -> frozenset[tuple[int, int]]:
+def tile_domain(d_qk: int, d_v: int, fp8: bool, mxfp8: bool = False) -> frozenset[tuple[int, int]]:
     """The (q_tile, kv_tile) pairs the kernel serving these head dims is built for.
 
     The d512 flavor has one tile; the general and d256 templates take any Q tile
-    with a 128- or 64-key KV tile. The ranking and the adapter intersect their
-    SMEM fit with this set, so no tile is proposed that declines at build.
+    with a 128- or 64-key KV tile, except MXFP8 (``mxfp8``) at (256, 256) head
+    tiles, which takes only the 64-key tile: the 128-key tile's S fragments do
+    not fit the compute warps' registers beside a D=256 O and Q, and spill.
+    The ranking and the adapter intersect their SMEM fit with this set, so no
+    tile is proposed that declines at build.
     """
     if pick_flavor(d_qk, d_v, fp8) == D512_FLAVOR:
         return frozenset({FP8_D512_TILE if fp8 else D512_TILE})
-    return frozenset((m, n) for m in SEQ_Q_TILES for n in GENERAL_KV_TILES)
+    kv_tiles = GENERAL_KV_TILES
+    if mxfp8 and (-(-d_qk // FP8_HEAD_TILE_GRANULE) * FP8_HEAD_TILE_GRANULE, -(-d_v // FP8_HEAD_TILE_GRANULE) * FP8_HEAD_TILE_GRANULE) == D256_FLAVOR:
+        kv_tiles = (64,)
+    return frozenset((m, n) for m in SEQ_Q_TILES for n in kv_tiles)
 
 
 # SMEM the SM120 parts expose to a kernel. The adapter asks cutlass for the
@@ -80,6 +86,12 @@ def register_budgets(q_tile: int) -> tuple[int, int]:
     return load_regs_per_thread, compute_regs_per_thread
 
 
+# The MXFP8 D512 kernel stages, per K tile and warp half, the first local K scale
+# plane (64 keys: 8 bytes of each of a plane's 32 atom lines) and the second
+# plane's first 32 keys (4 bytes per line).
+MXFP8_D512_K_SF_STAGE_BYTES = 2 * 32 * (8 + 4)
+
+
 def smem_bytes(d_qk: int, d_v: int, q_tile: int, kv_tile: int, itemsize: int = 2, out_itemsize: Optional[int] = None, mxfp8: bool = False) -> int:
     """SMEM the SM120 prefill kernel needs for one specialization.
 
@@ -97,7 +109,9 @@ def smem_bytes(d_qk: int, d_v: int, q_tile: int, kv_tile: int, itemsize: int = 2
     extra storage is the score exchange plus the three TMA barriers.
     MXFP8 (``mxfp8``) adds one 128-row K scale-factor tile and one V
     scale-factor tile beside the K/V slab; they are read during the KV loop
-    and do not alias the O staging tile.
+    and do not alias the O staging tile. The MXFP8 D512 flavor adds the V
+    tile and ``MXFP8_D512_K_SF_STAGE_BYTES`` of staged K scale words: there is
+    no room beside the exchange for a K tile.
 
     Lives here rather than in the adapter because the ranking must not propose
     a tile the kernel cannot fit, and two answers to that question is how a plan
@@ -115,7 +129,12 @@ def smem_bytes(d_qk: int, d_v: int, q_tile: int, kv_tile: int, itemsize: int = 2
         q_resident = q_tile * (flavor[0] // 4) * itemsize if itemsize == 2 else 0
         exchange = q_tile * kv_tile * 4 * 2
     barrier_bytes = 24 if flavor == D512_FLAVOR else 16
-    scale_factors = mxfp8_sf_tile_bytes(d_qk) + mxfp8_sf_tile_bytes(d_v) if mxfp8 else 0
+    scale_factors = 0
+    if mxfp8 and flavor == D512_FLAVOR:
+        # The d512 kernel keeps the V scale tile and the staged K scale words.
+        scale_factors = mxfp8_sf_tile_bytes(d_v) + MXFP8_D512_K_SF_STAGE_BYTES
+    elif mxfp8:
+        scale_factors = mxfp8_sf_tile_bytes(d_qk) + mxfp8_sf_tile_bytes(d_v)
     return kv_or_o + q_resident + exchange + barrier_bytes + scale_factors
 
 

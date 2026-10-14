@@ -501,8 +501,11 @@ def _sm120_tiles(caps: Capabilities, facts) -> Tuple[int, int]:
     ``tile_m=64`` when the grid cannot fill the machine AND each CTA has enough
     KV tiles to amortize the extra Q-tile loop; a causal mask counts as a
     halved grid because it halves the work per CTA. ``tile_n`` is the largest
-    that fits SMEM: 128 is fastest, but a wide head has no room for it (D>=208
-    in half, further out in FP8 -- its KV tile is a byte per element).
+    tile in the kernel table (``config_sm120.tile_domain``) that fits SMEM:
+    128 is fastest where the table offers it, but a wide head has no room for
+    it (D>=208 in half, further out in FP8 -- its KV tile is a byte per
+    element), and the MXFP8 table for (256, 256) head tiles holds only the
+    64-key tile, which runs Q@K^T plane-major.
 
     Fit is a KERNEL property, so ``config_sm120.smem_bytes`` is the one
     implementation and the adapter's check calls it too. So is the tuning: an
@@ -527,7 +530,7 @@ def _sm120_tiles(caps: Capabilities, facts) -> Tuple[int, int]:
     preferred_tile_m = 64 if fine else 128
     # Prefer the selected query tile, then larger query and KV tiles.
     candidate_tiles = sorted(
-        tile_domain(facts.d_qk, facts.d_v, facts.is_fp8 or facts.is_mxfp8),
+        tile_domain(facts.d_qk, facts.d_v, facts.is_fp8 or facts.is_mxfp8, mxfp8=facts.is_mxfp8),
         key=lambda tile: (tile[0] == preferred_tile_m, tile[0], tile[1]),
         reverse=True,
     )
@@ -553,7 +556,7 @@ def _tile_points(spec: EngineSpec, facts) -> List[Tuple[Optional[int], Optional[
         # axis, so there is nothing to choose between anyway.
         return [(_sole(caps.tile_ms), _sole(caps.tile_ns))]
     best = _sm120_tiles(caps, facts)
-    tile_choices = tile_domain(facts.d_qk, facts.d_v, facts.is_fp8 or facts.is_mxfp8)
+    tile_choices = tile_domain(facts.d_qk, facts.d_v, facts.is_fp8 or facts.is_mxfp8, mxfp8=facts.is_mxfp8)
     domain = [(m, n) for m in caps.tile_ms for n in caps.tile_ns if (m, n) in tile_choices and _sm120_fits_smem(facts, m, n)]
     return sorted(domain or [best], key=lambda mn: (mn != best, mn[1] != best[1], -mn[0]))
 
@@ -1308,11 +1311,13 @@ def _sm120_d512_windowed(caps: Capabilities, facts) -> bool:
     instead of ``tile_m`` plus the window, fewer K/V tiles through the L2->SMEM
     path and less masked-out MMA at the same DRAM bytes. And walk the units with
     plain LPT (see :func:`_sched_points`). Without a window the decode rule
-    alone decides the packing. The FP8 flavor takes only the LPT walk: its
-    64-key tile covers a 64-token unit's window in as many tiles as a packed
-    one-token unit, so packing saves no MMA there (measured 8-11% slower).
+    alone decides the packing. The FP8 and MXFP8 flavors take only the LPT
+    walk: their 64-key tile covers a 64-token unit's window in as many tiles as
+    a packed one-token unit, so packing saves no MMA there (measured 8-11%
+    slower on FP8).
     """
-    return caps.sm_lo >= 120 and caps.sm_hi < 130 and facts.window_left is not None and pick_flavor(facts.d_qk, facts.d_v, fp8=facts.is_fp8) == D512_FLAVOR
+    quantized = facts.is_fp8 or facts.is_mxfp8
+    return caps.sm_lo >= 120 and caps.sm_hi < 130 and facts.window_left is not None and pick_flavor(facts.d_qk, facts.d_v, fp8=quantized) == D512_FLAVOR
 
 
 def _d256_decode_tile_selected(caps: Capabilities, facts, pack_g: int, split_kv: Optional[int] = None) -> bool:
@@ -1484,7 +1489,7 @@ def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] 
             # 97.3 at parity.  Packing keeps the lead where no unpacked tile fits (b2 64/8 q256 KV 4k: packed 93.9 vs
             # unpacked 191.2) and under a band (_sm100_banded_gqa_packs below).  The packed set stays listed.
             wins = False
-    if wins or (_sm120_d512_windowed(caps, facts) and not facts.is_fp8) or _sm100_banded_gqa_packs(caps, facts):
+    if wins or (_sm120_d512_windowed(caps, facts) and not (facts.is_fp8 or facts.is_mxfp8)) or _sm100_banded_gqa_packs(caps, facts):
         return (True, False)
     return (False, True)
 

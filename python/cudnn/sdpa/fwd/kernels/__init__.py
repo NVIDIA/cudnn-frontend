@@ -16,7 +16,9 @@ A file omits the dimension when one implementation covers a range of head
 dims: ``sm120/prefill_f16.py`` and ``sm120/prefill_fp8.py`` do, while
 ``sm120/prefill_d256_f16.py`` is the d256 flavor (head dims that tile at 256 on
 both sides). ``sm120/prefill_d512_f16.py`` serves both head dims in (256, 512]
-at multiples of eight, with two warps per Q slab splitting the head dimension.
+at multiples of eight, with two warps per Q slab splitting the head dimension;
+``sm120/prefill_d512_fp8.py`` and ``sm120/prefill_d512_mxfp8.py`` are its FP8
+and MXFP8 siblings (multiples of 16).
 ``sm90/prefill_d512_f16.py`` is that line's only template: one D512 tile over
 three warpgroups, for every head dim up to it at multiples of eight.
 A ``decode_`` phase is a second template for the SAME flavor and contract,
