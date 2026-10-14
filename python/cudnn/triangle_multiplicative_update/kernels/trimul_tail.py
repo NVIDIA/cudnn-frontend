@@ -65,6 +65,7 @@ def tail_params(
     epi_math: Optional[str] = None,
     min_blocks_per_mp: Optional[int] = None,
     ln_once: Optional[str] = None,
+    ln_once_b_stages: Optional[int] = None,
 ) -> LnDualGemmParams:
     """The substrate's compile-time parameters of K3 for the ``(c_z, c)`` geometry.  Both GEMMs share one K (the ring stage is one k-tile of
     every operand), so ``c == c_z`` for now -- the Protenix-v2 ``c_z = 256, c = 128`` geometry is a typed decline until the per-GEMM k-tile
@@ -84,7 +85,9 @@ def tail_params(
             min_blocks_per_mp if isinstance(min_blocks_per_mp, bool) else int(min_blocks_per_mp)
         )  # a bool reaches the typed decline as itself
     if ln_once is not None:
-        kw["ln_once"] = str(ln_once)  # the LayerNorm-once-per-row-block lever (performance only, bitwise; the substrate's typed vocabulary)
+        kw["ln_once"] = str(ln_once)
+    if ln_once_b_stages is not None:
+        kw["ln_once_b_stages"] = ln_once_b_stages if isinstance(ln_once_b_stages, bool) else int(ln_once_b_stages)  # the LN-once item's B-ring depth (appended; a bool reaches the typed decline as itself)  # the LayerNorm-once-per-row-block lever (performance only, bitwise; the substrate's typed vocabulary)
     return LnDualGemmParams(
         k=int(c),
         c_out=int(c_z),

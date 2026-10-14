@@ -226,6 +226,7 @@ from cudnn.gemm.frost.ln_prologue import (
     SMEM_BUDGET_BYTES_BY_ARCH,
     LnDualGemmParams,
     ln_once_a_slots,
+    ln_once_b_stages_effective,
     ln_once_n_tiles_per_item,
     ln_once_tiles_per_item,
     ring_stages,
@@ -427,7 +428,9 @@ _LOG2_NTI: int = _NTI.bit_length() - 1
 _TPI: int = ln_once_tiles_per_item(PARAMS)  # GEMM tiles per work item (passes x _NTI; 1 when off)
 _A_SLOTS: int = ln_once_a_slots(PARAMS, BODY_ARCH)  # resident A region slots: 2 where the arch's ring bytes hold two, else 1 (host module); 0 off
 _A_REGION_STAGES: int = _A_SLOTS * _NK if _LN_ONCE else ab_stages  # the A buffers' stage count: the region's, or the shipped ring's
-_B_STAGES: int = ab_stages  # the B ring's depth (both arms)
+# the B ring's depth: the shipped ring in both arms -- under the LN-once item the host's ONE source may shallow it where the freed bytes buy the second
+# resident A slot (`ln_once_b_stages`, B-TriMul-1; the OFF arm and every rendering with the field 0 keep `ab_stages`: byte-identical cubins)
+_B_STAGES: int = ln_once_b_stages_effective(PARAMS, BODY_ARCH) if _LN_ONCE else ab_stages
 if ring_stages(BODY_ARCH, PARAMS.pairing) != ab_stages:
     raise ValueError(
         f"{__name__}: the host module's RING_STAGES_BY_ARCH[{BODY_ARCH!r}][{PARAMS.pairing!r}] = {ring_stages(BODY_ARCH, PARAMS.pairing)} but this body's ring is {ab_stages} deep -- the resident region and the K cap were sized against a ring the body does not have"

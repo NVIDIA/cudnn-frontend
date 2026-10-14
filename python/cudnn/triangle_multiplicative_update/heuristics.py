@@ -92,6 +92,10 @@ DEFAULT_K3_PROLOGUE = "mn_major"
 DEFAULT_CLC_STAGES = 2
 
 
+#: The LayerNorm-once item's B-ring depth vocabulary (0 = the shipped ring; the substrate declines a depth past the arch body's ring).
+LN_ONCE_B_STAGES_DOMAIN = tuple(range(0, 10))
+
+
 @dataclass(frozen=True)
 class TriMulKnobs:
     """One knob assignment -- COMPLETE when every axis is set (what a plan runs; :func:`recommend` returns one), PARTIAL when an axis is ``None``
@@ -112,6 +116,11 @@ class TriMulKnobs:
     #: appended (2026-10-13, wave 2): the two stages' LayerNorm-once-per-row-block work item (:data:`LN_ONCE_FORMS`; "" = today's per-tile item) -- a
     #: GEOMETRY axis (the persistent tail it coarsens is a function of N and B), so ``is_complete`` names it and every pick carries a value
     ln_once: Optional[str] = None
+    #: appended (2026-10-14, the SM100 lever B-TriMul-1): the two stages' B-RING depth under the LayerNorm-once item (the substrate's
+    #: ``LnDualGemmParams.ln_once_b_stages``: honoured only where the shallower ring buys the second resident A slot -- the SM100 body's projection
+    #: stage at c 256; a no-op elsewhere) -- an OVERRIDE axis the table may set per bucket: ``None`` = 0 = the shipped ring, so it is not one of the
+    #: geometry axes ``is_complete`` names
+    ln_once_b_stages: Optional[int] = None
 
     def is_complete(self) -> bool:
         return None not in (self.k2_tile, self.k1_pass_order, self.k3_prologue, self.clc_stages, self.k_block, self.ln_pass_form, self.epi_math, self.ln_once)
@@ -128,6 +137,7 @@ class TriMulKnobs:
             epi_math=self.epi_math if self.epi_math is not None else base.epi_math,
             min_blocks_per_mp=self.min_blocks_per_mp if self.min_blocks_per_mp is not None else base.min_blocks_per_mp,
             ln_once=self.ln_once if self.ln_once is not None else base.ln_once,
+            ln_once_b_stages=self.ln_once_b_stages if self.ln_once_b_stages is not None else base.ln_once_b_stages,
         )
 
 
@@ -159,6 +169,11 @@ def validate_knobs(knobs: TriMulKnobs) -> None:
         raise ValueError(
             f"ln_once must be one of {LN_ONCE_FORMS} (the two LayerNorm-prologue stages' work item: '' = one GEMM tile, 'block' = the row block "
             f"LayerNormed once across its passes x N tiles, 'passes' = across its passes at one N tile), got {knobs.ln_once!r}"
+        )
+    if knobs.ln_once_b_stages is not None and (isinstance(knobs.ln_once_b_stages, bool) or knobs.ln_once_b_stages not in LN_ONCE_B_STAGES_DOMAIN):
+        raise ValueError(
+            f"ln_once_b_stages must be one of {LN_ONCE_B_STAGES_DOMAIN} (the LayerNorm-once item's B-ring depth: 0 = the body's shipped ring; a shallower "
+            f"ring is honoured only where it buys the second resident A slot), got {knobs.ln_once_b_stages!r}"
         )
 
 
@@ -541,6 +556,7 @@ __all__ = [
     "DEFAULT_K3_PROLOGUE",
     "K2_TILE_DOMAIN",
     "K_BLOCK_DOMAIN",
+    "LN_ONCE_B_STAGES_DOMAIN",
     "MIN_BLOCKS_PER_MP_DOMAIN",
     "TriMulKnobs",
     "batch_bucket",

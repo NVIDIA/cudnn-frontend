@@ -262,6 +262,43 @@ def test_the_k_cap_follows_the_arch_body():
         sub.validate_ln_dual_gemm_params(k3.tail_params(512, 512, has_bias=True), "sm107")  # K 512 = 8 stages: past the sm107 accumulators ring too
 
 
+def test_ln_once_b_ring_depth_is_self_gating_and_buys_the_second_slot_on_sm100_only():
+    """The LayerNorm-once item's B-ring depth (`ln_once_b_stages`, B-TriMul-1, 2026-10-14): honoured ONLY where the shallower ring buys the second
+    resident A slot the shipped ring refuses -- the sm100 body's K1 at K = 256 (2 x 64 KiB + 4 x 16 KiB = the shipped 192 KiB) -- and the shipped ring
+    everywhere else (the Rubin body already holds two slots; K1 c 128 holds two under its own ring; the two-operand K3 region never fits twice).  The
+    default 0 keeps every production rendering's constants; the validator declines the field without the item, past the arch's ring, or malformed."""
+    from cudnn.gemm.frost import ln_prologue as sub
+    from cudnn.triangle_multiplicative_update.kernels import trimul_proj as k1
+    from cudnn.triangle_multiplicative_update.kernels import trimul_tail as k3
+
+    def p256(b):
+        return k1.proj_params(256, 256, has_bias=True, has_mask=True, pass_order="major", ln_pass_form="smem_rolled_pf", epi_math="packed", ln_once="block", ln_once_b_stages=b)
+
+    assert sub.LnDualGemmParams().ln_once_b_stages == 0 and p256(None).ln_once_b_stages == 0
+    # sm100 K1 K = 256: the shipped 6-deep ring -> ONE slot; 4 (and 3, 2) -> the second slot; 5 / 6 buy nothing -> the shipped ring stays
+    assert [(sub.ln_once_b_stages_effective(p256(b), "sm100"), sub.ln_once_a_slots(p256(b), "sm100")) for b in (0, 2, 3, 4, 5, 6)] == [(6, 1), (2, 2), (3, 2), (4, 2), (6, 1), (6, 1)]
+    # the Rubin body holds two slots under its own 9-deep ring: the field is a no-op there (no B depth traded for nothing)
+    assert [(sub.ln_once_b_stages_effective(p256(b), "sm107"), sub.ln_once_a_slots(p256(b), "sm107")) for b in (0, 4)] == [(9, 2), (9, 2)]
+    # K1 c 128 already holds two slots under the sm100 ring; the output stage's two-operand region never fits twice: both keep their ring
+    p128 = k1.proj_params(128, 128, has_bias=True, has_mask=True, pass_order="major", ln_pass_form="registers", epi_math="packed", ln_once="block", ln_once_b_stages=4)
+    assert (sub.ln_once_b_stages_effective(p128, "sm100"), sub.ln_once_a_slots(p128, "sm100")) == (6, 2)
+    t256 = k3.tail_params(256, 256, has_bias=True, a0_prologue="mn_major", ln_pass_form="smem_rolled_pf", epi_math="packed", ln_once="block", ln_once_b_stages=2)
+    assert (sub.ln_once_b_stages_effective(t256, "sm100"), sub.ln_once_a_slots(t256, "sm100")) == (4, 1)
+    off = k1.proj_params(256, 256, has_bias=True, has_mask=True)
+    assert sub.ln_once_b_stages_effective(off, "sm100") == 6 and sub.ln_once_b_stages_effective(off, "sm107") == 9
+    for arch in ("sm100", "sm107"):
+        sub.validate_ln_dual_gemm_params(p256(4), arch)
+    with pytest.raises(ValueError, match="LayerNorm-once item only"):
+        sub.validate_ln_dual_gemm_params(k1.proj_params(256, 256, has_bias=True, has_mask=True, ln_once_b_stages=4), "sm100")
+    with pytest.raises(ValueError, match="deeper than the sm100 body"):
+        sub.validate_ln_dual_gemm_params(p256(7), "sm100")
+    sub.validate_ln_dual_gemm_params(p256(7), "sm107")  # 7 < the Rubin ring: valid there (and a no-op: two slots already)
+    with pytest.raises(ValueError, match="non-negative integer"):
+        sub.validate_ln_dual_gemm_params(p256(-1), "sm100")
+    with pytest.raises(ValueError, match="non-negative integer"):
+        sub.validate_ln_dual_gemm_params(p256(True), "sm100")
+
+
 def test_sm100_declines_the_k256_register_form_with_a_packed_epilogue_typed():
     """The sm100 body's one unallocatable rendering class (ptxas C7600 at the flat 168-register entry count; the sm107 body renders every member): the
     K >= 256 register-form LayerNorm with a packed epilogue -- every accumulators-arm member (stats on or off, both prologues), the columns arm's
@@ -955,6 +992,36 @@ def th_recommend(n_res, c_z, batch):
     from cudnn.triangle_multiplicative_update import heuristics as th
 
     return th.recommend(n_res, c_z, batch, "outgoing")
+
+
+@requires_served_arch
+@pytest.mark.parametrize("n_res,batch,mask_kind,b_stages", [(128, 1, "padded", 4), (217, 2, "random", 3)])
+def test_ln_once_b_ring_depth_is_bitwise_the_shipped_ring(n_res, batch, mask_kind, b_stages):
+    """The LayerNorm-once item's B-ring depth (`ln_once_b_stages`, B-TriMul-1): the K1 c 256 rendering with the shallower B ring (the second resident
+    A slot on the sm100 body; a no-op on the sm107 body, whose ring already holds two slots) computes the SAME planes and statistics as the shipped
+    ring's rendering, BITWISE (the same normalised words, the same k-step order; only the ring index space changes).  Two launches bitwise equal; the
+    output within the fp64 oracle's derived bound; a sentinel fill leaves no survivor."""
+    c_z = c = 256
+    inp = _inputs(n_res, batch, c_z, c, mask_kind, True, seed=13)
+    kn = th_recommend(n_res, c_z, batch)
+    common = dict(has_bias=True, has_mask=True, want_stats=True, pass_order="major", clc_stages=1, ln_pass_form=kn.ln_pass_form, epi_math="packed", ln_once="block")
+    plan_ring = _build_k1(k1.proj_params(c_z, c, **common))
+    plan_lever = _build_k1(k1.proj_params(c_z, c, ln_once_b_stages=b_stages, **common))
+    stream = torch.cuda.current_stream().cuda_stream
+    outs = []
+    for plan in (plan_ring, plan_lever, plan_lever):
+        planes = torch.full(k1.planes_shape(c, batch, n_res), _SENTINEL, device="cuda", dtype=torch.bfloat16)
+        stats = torch.full((batch * n_res * n_res, 2), -1.0, device="cuda")
+        _launch(plan, inp, c, planes, stats, stream, k_block=kn.k_block)
+        torch.cuda.synchronize()
+        outs.append((planes, stats))
+    assert torch.equal(outs[1][0], outs[0][0]) and torch.equal(outs[1][1], outs[0][1]), "the shallower B ring must be bitwise the shipped ring"
+    assert torch.equal(outs[2][0], outs[1][0]) and torch.equal(outs[2][1], outs[1][1]), "two launches under the shallower B ring differ (a first-launch race)"
+    valid = outs[1][0][:, :, :, :n_res].float()
+    assert not (valid == _SENTINEL).any(), "a never-written cell survived"
+    ref, _, _ = _reference(inp, c, 1e-5)
+    diff = (valid.double() - ref).abs()
+    assert int((diff > 4e-3 + ref.abs() / 128.0).sum()) == 0, f"max |diff| {diff.max().item():.4g}"
 
 
 @requires_served_arch

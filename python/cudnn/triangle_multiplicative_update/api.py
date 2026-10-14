@@ -513,6 +513,7 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
                 epi_math=self.knobs.epi_math,
                 min_blocks_per_mp=k1_hint,
                 ln_once=k1_ln_once,
+                ln_once_b_stages=(self.knobs.ln_once_b_stages or 0) if k1_ln_once else 0,
             ),
             k3.tail_params(
                 self.c_z,
@@ -526,6 +527,7 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
                 epi_math=self.knobs.epi_math,
                 min_blocks_per_mp=k3_hint,
                 ln_once=k3_ln_once,
+                ln_once_b_stages=(self.knobs.ln_once_b_stages or 0) if k3_ln_once else 0,
             ),
         )
 

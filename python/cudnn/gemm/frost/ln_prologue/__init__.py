@@ -261,6 +261,13 @@ class LnDualGemmParams:
     #: accumulator protocol are per tile as today.  Requires ``pass_order = "major"`` (the pass lives inside the item), no ``prefetch_a_l2``, an item of
     #: at least two tiles.  The default stays OFF: a consumer picks it per geometry (the triangle multiplicative update's heuristics) once measured.
     ln_once: str = ""
+    #: appended (2026-10-14, the SM100 lever B-TriMul-1): the B RING's depth under the LayerNorm-once item (performance only; bitwise by construction;
+    #: 0 = the body's shipped ring).  Honoured ONLY where the shallower ring buys the SECOND resident A slot that the shipped ring's bytes refuse
+    #: (:func:`ln_once_b_stages_effective`: the sm100 body's K1 at K = 256 -- 2 x 64 KiB region + 4 x 16 KiB ring = the shipped 192 KiB; the Rubin body
+    #: already holds two slots there and keeps its ring, the output stage's two-operand region never fits twice and keeps its ring) -- so the field
+    #: never trades B depth for nothing.  Requires ``ln_once``; 1 <= value <= the arch body's ring (:func:`ring_stages`).  The default keeps every
+    #: production cubin byte-identical; a consumer sets it per geometry once measured (the triangle multiplicative update's heuristics).
+    ln_once_b_stages: int = 0
 
     @property
     def dual(self) -> bool:
@@ -300,20 +307,39 @@ def ln_once_tiles_per_item(p: LnDualGemmParams) -> int:
     return p.passes * ln_once_n_tiles_per_item(p) if p.ln_once else 1
 
 
-def ln_once_a_slots(p: LnDualGemmParams, arch: str = "sm107") -> int:
-    """The resident A region's slot count under the lever on the ``arch`` body: 2 (the next item's load + LayerNorm overlap this item's tiles)
-    where the two-slot region plus the shipped B ring fit in the bytes of that body's shipped A/B ring (the layout the rendering already launches
-    at -- a self-referential predicate per arch, no carveout constant), else 1.  sm107: 1 at K3 c_out 256 only (2 operands x 4 stages x 2 slots =
-    256 KiB would leave one B stage); sm100 (the 6-deep ring): 1 at K3 c_out 256 AND at K1 K = 256 (2 x 64 KiB + the 96 KiB B ring > 192 KiB) --
-    there the next item's LayerNorm no longer overlaps the current item's tiles.  0 when the lever is off.  One source for the body, the validator
-    and the tests."""
-    if not p.ln_once:
-        return 0
+def _ln_once_a_slots_at(p: LnDualGemmParams, arch: str, b_stages: int) -> int:
+    """The slot count the self-referential predicate gives with a B ring of ``b_stages`` stages (the shipped ring's bytes are the budget)."""
     ring = ring_stages(arch, p.pairing)
     off_bytes = ring * (p.num_a_operands * A_STAGE_BYTES + p.num_b_operands * B_STAGE_BYTES[p.pairing])
-    b_ring_bytes = ring * p.num_b_operands * B_STAGE_BYTES[p.pairing]
+    b_ring_bytes = b_stages * p.num_b_operands * B_STAGE_BYTES[p.pairing]
     region_bytes = p.num_a_operands * p.k_stages * A_STAGE_BYTES
     return 2 if 2 * region_bytes + b_ring_bytes <= off_bytes else 1
+
+
+def ln_once_b_stages_effective(p: LnDualGemmParams, arch: str = "sm107") -> int:
+    """The B ring's depth under the LayerNorm-once item on the ``arch`` body: ``p.ln_once_b_stages`` where it is set, shallower than the shipped ring
+    AND buys the second resident A slot the shipped ring refuses (``ln_once_a_slots`` 1 -> 2); otherwise the shipped ring (:func:`ring_stages`) -- the
+    field never trades B depth for nothing.  The shipped ring when the lever is off.  One source for the bodies' ``_B_STAGES``, the slot predicate,
+    the validator and the tests (appended 2026-10-14, B-TriMul-1)."""
+    ring = ring_stages(arch, p.pairing)
+    want = int(p.ln_once_b_stages or 0)
+    if not p.ln_once or want <= 0 or want >= ring:
+        return ring
+    if _ln_once_a_slots_at(p, arch, ring) == 2 or _ln_once_a_slots_at(p, arch, want) != 2:
+        return ring
+    return want
+
+
+def ln_once_a_slots(p: LnDualGemmParams, arch: str = "sm107") -> int:
+    """The resident A region's slot count under the lever on the ``arch`` body: 2 (the next item's load + LayerNorm overlap this item's tiles)
+    where the two-slot region plus the B ring fit in the bytes of that body's shipped A/B ring (the layout the rendering already launches
+    at -- a self-referential predicate per arch, no carveout constant), else 1.  sm107: 1 at K3 c_out 256 only (2 operands x 4 stages x 2 slots =
+    256 KiB would leave one B stage); sm100 (the 6-deep ring): 1 at K3 c_out 256 AND at K1 K = 256 (2 x 64 KiB + the 96 KiB B ring > 192 KiB) --
+    there the next item's LayerNorm no longer overlaps the current item's tiles, UNLESS ``ln_once_b_stages`` shallows the B ring to the depth that
+    fits (4 at K1 K = 256: :func:`ln_once_b_stages_effective`).  0 when the lever is off.  One source for the body, the validator and the tests."""
+    if not p.ln_once:
+        return 0
+    return _ln_once_a_slots_at(p, arch, ln_once_b_stages_effective(p, arch))
 
 
 #: The sm100 body's one rendering class ptxas cannot allocate (measured by host trace-compile for sm_100a, 2026-10-13: the whole K = 256 map of
@@ -375,6 +401,18 @@ def validate_ln_dual_gemm_params(p: LnDualGemmParams, arch: str = "sm107") -> No
         )
     if p.ln_once not in LN_ONCE_FORMS:
         raise ValueError(f"ln_once must be one of {LN_ONCE_FORMS}, got {p.ln_once!r}")
+    if isinstance(p.ln_once_b_stages, bool) or not isinstance(p.ln_once_b_stages, int) or p.ln_once_b_stages < 0:
+        raise ValueError(f"ln_once_b_stages must be a non-negative integer (0 = the body's shipped B ring), got {p.ln_once_b_stages!r}")
+    if p.ln_once_b_stages and not p.ln_once:
+        raise ValueError(
+            f"ln_once_b_stages={p.ln_once_b_stages} shallows the B ring under the LayerNorm-once item only (the item's resident A region is what the freed "
+            "bytes buy); with ln_once='' the ring is the shipped one -- leave the field 0"
+        )
+    if p.ln_once_b_stages and p.pairing in PAIRINGS and arch in BODIES and p.ln_once_b_stages > ring_stages(arch, p.pairing):
+        raise ValueError(
+            f"ln_once_b_stages={p.ln_once_b_stages} is deeper than the {arch} body's shipped {ring_stages(arch, p.pairing)}-deep ring (pairing {p.pairing!r}): "
+            "the field can only shallow the ring"
+        )
     if p.pairing in PAIRINGS and p.k > max_k(arch, p.pairing):
         raise ValueError(
             f"the {arch} body keeps every K stage of a tile resident in its {ring_stages(arch, p.pairing)}-deep operand ring (pairing {p.pairing!r}): "
