@@ -299,20 +299,17 @@ def test_pointer_combine_folds_the_sink_once():
 
 
 @pytest.mark.parametrize("sink", [False, True], ids=["plain", "sink"])
-@pytest.mark.parametrize("d", [128, 66], ids=["lean_d128", "serial_d66"])
-@pytest.mark.parametrize("splits", [8, 21, 37], ids=lambda s: f"split{s}")
+@pytest.mark.parametrize("d", [128, 66], ids=["fp32_rows_d128", "elementwise_d66"])
+@pytest.mark.parametrize("splits", [2, 4, 5, 8, 9, 21, 37], ids=lambda s: f"split{s}")
 def test_pointer_combine_walks_many_splits(splits, d, sink):
-    """The split walks past the up-front group run in two legs (_SERIAL_UNROLL = 16, then
-    _SERIAL_TAIL_UNROLL = 4) on both forms of the one-warp-per-row kernel: the lean fp32 path
-    (d % 4 == 0; its G_S = 4 up-front splits, then ``_lean_legs``) and the element-load serial
-    path (d = 66; ``_serial_legs`` and the ``_accumulate_splits`` helper).  8 splits stay below a
-    full group (tail leg only), 21 take one group plus a remainder, 37 take two; row 0 has every
-    split dead and split 1 is dead on row 1, so the dead-split select runs inside the deep leg
-    too.  The sink arm seeds the denominator with the sink column and lands the keyless row on
-    ``O := 0 / LSE := sink``."""
+    """Both forms of the one-warp-per-row kernel across the split axis.  The lean form (aligned fp32 rows, d % 4 == 0) serves
+    n_splits <= G_S: every split's LSE and partial-O row is loaded up front through a clamped index.  Past G_S -- and always for d = 66,
+    whose rows take bounded element loads -- the serial form walks the splits in two legs, sixteen deep and then four deep
+    (``_serial_legs`` and the ``_accumulate_splits`` helper).  2 to 9 splits stay below a full serial group (tail leg only; 2 to 8 are the
+    lean form for d = 128), 21 takes one group plus a remainder, 37 two; row 0 has every split dead and split 1 is dead on row 1, so the
+    dead-split select runs inside every form.  The sink arm seeds the denominator with the sink column and lands the keyless row on ``O := 0 / LSE := sink``."""
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 
-    assert splits > comb.G_S
     b, h, sq = 2, 3, 5
     op, lp, ref_o, ref_lse = _partials(b, h, sq, d, splits)
     sinks = torch.tensor([-120.0, 0.7, 4.0], device="cuda")

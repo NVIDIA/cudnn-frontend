@@ -79,8 +79,10 @@ FROST_SOURCE_DIGEST = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:1
 # 985 x 9 rows x 4 splits on B300 against ~18 MB of traffic.
 THREADS = 128
 ROWS_PER_BLOCK = THREADS // 32
-# Splits whose LSE and partial-O rows are loaded up front, before any math.
-G_S = 4
+# Splits whose LSE and partial-O rows the lean form loads up front, before any math.  The lean form serves a launch whose whole split axis fits in
+# this group (n_splits <= G_S): every load goes out at once, one memory round trip, which beats the serial form there (B300, d256 S_q = 4, 6-8 splits:
+# 2.9 us against 4.7).  Past it the serial form's sixteen-deep walks are far ahead.  G_S = 4 saves 0.5 us up to 4 splits but loses 2 us at 5-8.
+G_S = 8
 # Unroll depth of the serial combine's split walks (one warp per row): the
 # loads of this many splits are issued together, so the latency of the
 # dependent walk is paid once per group rather than once per split.  Each walk
@@ -100,12 +102,6 @@ _SERIAL_TAIL_UNROLL = 4
 def _serial_legs(n_splits):
     """``(n_main, n_splits)``: the end of the last full _SERIAL_UNROLL group."""
     return n_splits - n_splits % cutlass.Int32(_SERIAL_UNROLL), n_splits
-
-
-def _lean_legs(n_splits):
-    """``(n_main, n_splits)`` for the lean path's tail past the G_S up-front splits:
-    the end of the last full _SERIAL_UNROLL group of ``[G_S, n_splits)``."""
-    return n_splits - (n_splits - cutlass.Int32(G_S)) % cutlass.Int32(_SERIAL_UNROLL), n_splits
 
 
 @cute.jit
@@ -328,7 +324,7 @@ def _combine_kernel(
         # address is a single 64-bit add (the split axis is the leading, batch-stacked mode).
         lean = zero > zero
         if cutlass.const_expr(o_partial.element_type == cutlass.Float32):
-            lean = ((d_v & cutlass.Int32(3)) == cutlass.Int32(0)) & ((o_base & cutlass.Int64(15)) == cutlass.Int64(0))
+            lean = ((d_v & cutlass.Int32(3)) == cutlass.Int32(0)) & ((o_base & cutlass.Int64(15)) == cutlass.Int64(0)) & (n_splits <= cutlass.Int32(G_S))
         if lean:
             lse_base = lse_partial.iterator.toint() + cutlass.Int64(cute.crd2idx((batch, head, q_row), lse_partial.layout)) * 4
             lse_step = cutlass.Int64(lse_partial.stride[0]) * cutlass.Int64(n_batch) * 4
@@ -367,15 +363,6 @@ def _combine_kernel(
                     m = neg_inf
                     for s in cutlass.range_constexpr(G_S):
                         m = cute.math.max(m, lse_v[s])
-                    # Splits past G_S extend the max before any weight is formed.  Like the serial
-                    # form's walks, the tail runs _SERIAL_UNROLL deep in two legs (_lean_legs) so the
-                    # loads of many splits are in flight together instead of one L2 round trip each.
-                    if n_splits > cutlass.Int32(G_S):
-                        n_main, n_all = _lean_legs(n_splits)
-                        for s in cutlass.range(cutlass.Int32(G_S), n_main, 1, unroll=_SERIAL_UNROLL):
-                            m = cute.math.max(m, _ld_global_f32(lse_base + cutlass.Int64(s) * lse_step))
-                        for s in cutlass.range(n_main, n_all, 1, unroll=_SERIAL_TAIL_UNROLL):
-                            m = cute.math.max(m, _ld_global_f32(lse_base + cutlass.Int64(s) * lse_step))
                     # All splits dead (every row fully masked): emit O := 0 / lse := -inf rather than
                     # exp(-inf - -inf) == NaN.  m_safe only feeds the exponentials.
                     all_dead = m == neg_inf
@@ -410,40 +397,6 @@ def _combine_kernel(
                         acc1 = acc1 + w * v1
                         acc2 = acc2 + w * v2
                         acc3 = acc3 + w * v3
-                    if n_splits > cutlass.Int32(G_S):
-                        n_main, n_all = _lean_legs(n_splits)
-                        for s in cutlass.range(cutlass.Int32(G_S), n_main, 1, unroll=_SERIAL_UNROLL):
-                            s64 = cutlass.Int64(s)
-                            lse_s = _ld_global_f32(lse_base + s64 * lse_step)
-                            v = ld_global_v4(o_row_base + s64 * o_step, cutlass.Float32)
-                            live = lse_s > neg_inf
-                            e = cute.math.exp(lse_s - m_safe, fastmath=True)
-                            w = cutlass.Float32(arith.select(live.ir_value(), e.ir_value(), zero.ir_value()))
-                            v0 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[0]).ir_value(), zero.ir_value()))
-                            v1 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[1]).ir_value(), zero.ir_value()))
-                            v2 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[2]).ir_value(), zero.ir_value()))
-                            v3 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[3]).ir_value(), zero.ir_value()))
-                            den = den + w
-                            acc0 = acc0 + w * v0
-                            acc1 = acc1 + w * v1
-                            acc2 = acc2 + w * v2
-                            acc3 = acc3 + w * v3
-                        for s in cutlass.range(n_main, n_all, 1, unroll=_SERIAL_TAIL_UNROLL):
-                            s64 = cutlass.Int64(s)
-                            lse_s = _ld_global_f32(lse_base + s64 * lse_step)
-                            v = ld_global_v4(o_row_base + s64 * o_step, cutlass.Float32)
-                            live = lse_s > neg_inf
-                            e = cute.math.exp(lse_s - m_safe, fastmath=True)
-                            w = cutlass.Float32(arith.select(live.ir_value(), e.ir_value(), zero.ir_value()))
-                            v0 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[0]).ir_value(), zero.ir_value()))
-                            v1 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[1]).ir_value(), zero.ir_value()))
-                            v2 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[2]).ir_value(), zero.ir_value()))
-                            v3 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[3]).ir_value(), zero.ir_value()))
-                            den = den + w
-                            acc0 = acc0 + w * v0
-                            acc1 = acc1 + w * v1
-                            acc2 = acc2 + w * v2
-                            acc3 = acc3 + w * v3
                     inv_den = cutlass.Float32(1.0) / cute.math.max(den, cutlass.Float32(1e-30))
                     inv_den = cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), inv_den.ir_value()))
                     outs = (acc0 * inv_den, acc1 * inv_den, acc2 * inv_den, acc3 * inv_den)
