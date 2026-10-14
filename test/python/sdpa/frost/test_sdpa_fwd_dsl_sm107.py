@@ -3391,9 +3391,9 @@ def test_shared_d256_body_gate_seams_leave_every_ungated_rendering_byte_identica
 def test_shared_d256_body_gate_is_wired_through_every_layer():
     """Every layer names the SAME fact: config_sm100 admits ``epilogue_gate`` on the half d256 record (paged / THD / PackGQA; the
     quantized d256 bodies refuse by name, the split is refused), the body derives its gate geometry from the shared hook and
-    declares the staging tile AFTER the V ring, the kernel argument and the host slots are appended Optional / defaulted (the
-    render gate's precondition), the adapter admits paged x gate / PackGQA x gate on the route and keeps the split decline, and
-    both native binders publish the paged-gate role the adapter's tripwire reads."""
+    declares the staging tile AFTER the V ring, the kernel argument is appended Optional and the two host slots are appended,
+    required (the render gate's precondition: nothing ahead of them moves), the adapter admits paged x gate / PackGQA x gate on
+    the route and keeps the split decline, and both native binders publish the paged-gate role the adapter's tripwire reads."""
     import inspect
 
     from cudnn import _pybind_module
@@ -3428,7 +3428,10 @@ def test_shared_d256_body_gate_is_wired_through_every_layer():
     assert list(kparams)[-1] == "tma_gate_desc" and kparams["tma_gate_desc"].default is None
     hparams = list(inspect.signature(mod._host).parameters)
     assert hparams[-3:] == ["gate_ptr", "gate_strides", "stream"]
-    assert inspect.signature(mod._host).parameters["gate_ptr"].default is None
+    # Both slots are REQUIRED (the sm107 d256 body's convention): gate_strides is a runtime tuple slot on every rendering (the binders
+    # fill zeros), and a Python default cannot stand in -- None reaches the compiled tuple slot as a type mismatch, a non-None default
+    # is one the compiled-plan cache cannot carry (the cc 10.0 direct launches saw both).
+    assert all(inspect.signature(mod._host).parameters[n].default is inspect.Parameter.empty for n in ("gate_ptr", "gate_strides"))
     assert "thd=bool(CFG.THD_VARLEN)" in inspect.getsource(mod._host) and "HEADS_PER_TILE, _GG.tma_granu_elems)" in inspect.getsource(mod._host)
     # the binders' role and the adapter's tripwire
     assert getattr(_pybind_module._SdpaThdBinder, "supports_paged_epilogue_gate", False) is True

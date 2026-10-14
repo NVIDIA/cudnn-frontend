@@ -2106,11 +2106,16 @@ def _host(
     d_v: cutlass.Constexpr[int],
     lse_kind: cutlass.Constexpr[str],
     paged_hnd: cutlass.Constexpr[bool],
-    # Fused epilogue gate, [B, S, H_q, D_v] like O: a pointer + runtime (batch, seq, head) strides; None iff CFG.EPILOGUE_GATE == 0
-    # (sdpa_gate_tensor folds the slot out).  Under THD the gate is the packed [1, T, H_q, D_v] form like Q / O.  Appended with
-    # defaults (the prepared binders fill the two slots BY NAME; the THD-split wrapper, which never carries a gate, omits them).
-    gate_ptr: Optional[cute.Pointer] = None,
-    gate_strides: Optional[Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64]] = None,
+    # Fused epilogue gate, [B, S, H_q, D_v] like O: a pointer + runtime (batch, seq, head) strides.  gate_ptr is None iff
+    # CFG.EPILOGUE_GATE == 0 (a constexpr: sdpa_gate_tensor folds the slot out of the specialised signature); gate_strides is a
+    # RUNTIME Int64 triple on EVERY rendering (compile() specialises it like the other stride slots, gated or not), so the no-gate
+    # launch passes `gate_ptr=None, gate_strides=(0, 0, 0)` -- the sm107 d256 body's convention.  Appended, and REQUIRED like every
+    # other slot of this ABI: a Python default cannot stand in for the pair (a None default reaches the compiled tuple slot as a
+    # type mismatch; a non-None default is one the compiled-plan cache cannot carry, and the raw compiled callable then hides its
+    # parameter names from a keyword caller).  The prepared binders fill both BY NAME, the THD-split wrapper passes the no-gate pair
+    # (its `gate_slots`), direct launches pass it themselves.  Under THD the gate is the packed [1, T, H_q, D_v] form like Q / O.
+    gate_ptr: Optional[cute.Pointer],
+    gate_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     """Host entry: device pointers, runtime extents and strides in, TMA encodes and launches out.
@@ -2128,7 +2133,8 @@ def _host(
     ``lse_kind``: "dense" (B*SPLIT_KV, QH, SQ) in ``lse_strides``; "token" (SQ, QH)
     packed; "head" (1, QH, lse_ext) with lse_ext the head-row stride; "padded"
     (B, QH, lse_ext, 1) in ``lse_strides``. ``lse_ptr`` None compiles the store out.
-    Unused slots (no THD, no paged KV, no split, no gate) are passed as None / zeros."""
+    Unused slots (no THD, no paged KV, no split, no gate) are passed as None / zeros -- the gate's absence is
+    ``gate_ptr`` None with ``gate_strides`` (0, 0, 0), passed by every gate-less caller."""
     B, QH, KH, SQ, SKV, _ = problem_size
     (
         q_tensor,
@@ -2315,7 +2321,10 @@ def compile_thd_split(*, has_lse: bool = True, lse_kind: str = "head", paged_hnd
     if not (CFG.THD_VARLEN and SPLIT_KV > 1 and CFG.TILE_O == 256 and CFG.TILE_K == 256 and not CFG.PACK_GQA):
         raise ValueError("packed D256 split requires THD without PackGQA")
     cache_key = _template_key(globals(), locals(), "compile_thd_split")
-    return _compile_thd_split_host(_host, CFG, STORAGE_DTYPE, cache_key, has_lse=has_lse, lse_kind=lse_kind, paged_hnd=paged_hnd, ragged_q_slots=False)
+    # gate_slots: this body's host ends in the two required epilogue-gate slots; the split wrapper passes the no-gate pair.
+    return _compile_thd_split_host(
+        _host, CFG, STORAGE_DTYPE, cache_key, has_lse=has_lse, lse_kind=lse_kind, paged_hnd=paged_hnd, ragged_q_slots=False, gate_slots=True
+    )
 
 
 @lru_cache(maxsize=None)
