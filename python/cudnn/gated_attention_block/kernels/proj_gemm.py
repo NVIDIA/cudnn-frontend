@@ -1288,12 +1288,20 @@ def _forced_tile_config(n: int) -> Optional[str]:
 #                                         T 32         7.6 |        24.5 | 128x32 splitK8 swapAB   7.0
 #                                         T 128        8.4 |        24.5 | 64x32 (plain)           9.3
 #
-# The rule below spells those picks from the shape alone (no measurement at plan time): the token tile is the power of two
-# >= T; a WIDE weight (64-row tiles fill at least half the SMs) takes the 64-row weight tile in a 2x1 cluster (the token
-# tile multicast across the pair) up to 64 tokens and the plain 128x64 tile past it; a NARROW weight takes 128-row weight
-# tiles with the split-K slice count that fills one wave (capped at 8, every slice at least two K tiles) up to 64 tokens and
-# the plain 64x32 tile past it.  Dense bf16 / f16, K-major A and B, no epilogue -- the forward's two projections; everything
-# else keeps today's resolution.
+#   32/2 fused slab (N 17408, K 4096):    T 1   cuBLAS 13.3 | forced 45.6 | 128x8 swapAB            13.1
+#                                         T 32        15.8 |        19.9 | 128x32 swapAB           13.3
+#                                         T 128       21+  |        20.3 | 128x128 swapAB          15.5
+#   32/2 out projection (N 4096, K 8192): T 1   cuBLAS 9.5  | forced 32.2 | 128x8 splitK6 swapAB    7.7
+#                                         T 128       14.1 |        32.1 | 128x128 splitK6 swapAB  16.1
+#   8/1 fused slab (N 4608, K 4096):      T 1   cuBLAS 5.8  | forced 21.4 | 64x8 cluster1x1 swapAB  6.6
+#
+# The rule below spells those picks from the shape and the SM count alone (one-wave arithmetic, no measurement at plan
+# time): the token tile is the power of two >= T; a NARROW weight (fewer than a third of a wave of 64-row tiles) takes
+# 128-row weight tiles with the split-K slice count that fills one wave (capped at 8, every slice at least two K tiles) up to
+# 64 tokens and the plain 64x32 tile past it while that grid fits one wave; a weight whose 64-row tiles fit one wave takes
+# them (in a 2x1 cluster on a full machine) up to 64 tokens and the plain 128x64 tile past it; a weight whose 64-row tiles
+# overflow a wave takes 128-row weight tiles (one wave).  Dense bf16 / f16, K-major A and B, no epilogue -- the forward's two
+# projections; everything else keeps today's resolution.
 SMALL_M_MAX = 128
 _SMALL_M_SPLIT_K_MAX = 8
 _SMALL_M_CTA_K_ELEMS = 64  # the catalog's 128-byte K tile at 2 bytes per element
@@ -1333,20 +1341,32 @@ def small_m_tile_config(
     while tn < m:
         tn *= 2
     ctas_64 = -(-n // 64)
-    if 2 * ctas_64 >= sm_count:
-        # WIDE weight: one wave of 64-row weight tiles.  The 2x1 cluster multicasts the token tile across the pair.
-        if m <= 64:
-            return f"CONFIG_sm100_64x{tn}x128_64x{tn}x32_cluster2x1_1ctamma_swapAB"
-        return "CONFIG_sm100_128x64x128_128x64x32_cluster1x1_1ctamma"
-    # NARROW weight: 128-row weight tiles, split-K to fill one wave; past 64 tokens the plain 64x32 tile (N / 32 CTAs over
-    # the full K) measures ahead of every split (24/2 out projection at T 128: 9.3 vs 11.2 us for 128x128 splitK8 swapAB).
-    if m > 64:
-        return "CONFIG_sm100_64x32x128_64x32x32_cluster1x1_1ctamma"
     ctas_128 = -(-n // 128)
-    k_tiles = -(-k // _SMALL_M_CTA_K_ELEMS)
-    slices = max(1, min(_SMALL_M_SPLIT_K_MAX, round(sm_count / ctas_128), k_tiles // 2))
-    base = f"CONFIG_sm100_128x{tn}x128_128x{tn}x32_cluster1x1_1ctamma"
-    return f"{base}_splitK{slices}_swapAB" if slices > 1 else f"{base}_swapAB"
+    if 3 * ctas_64 < sm_count:
+        # NARROW weight (fewer than a third of a wave of 64-row tiles): 128-row weight tiles and the split-K slice count that
+        # fills ONE wave (a slice count that overflows the wave loses its tail: 32/2 out projection, 32 tiles, S 6 = 192 CTAs
+        # 7.7 us vs S 7 = 224 CTAs 9.0 us); past 64 tokens the plain 64x32 tile where its grid fits one wave, else the same
+        # 128x128 split.
+        k_tiles = -(-k // _SMALL_M_CTA_K_ELEMS)
+        slices = max(1, min(_SMALL_M_SPLIT_K_MAX, sm_count // ctas_128, k_tiles // 2))
+        if m > 64 and -(-m // 64) * -(-n // 32) <= sm_count:
+            return "CONFIG_sm100_64x32x128_64x32x32_cluster1x1_1ctamma"
+        base = f"CONFIG_sm100_128x{tn}x128_128x{tn}x32_cluster1x1_1ctamma"
+        return f"{base}_splitK{slices}_swapAB" if slices > 1 else f"{base}_swapAB"
+    if ctas_64 <= sm_count:
+        # The 64-row weight tile fits one wave.  The 2x1 cluster (the token tile multicast across the pair) pays on a FULL
+        # machine only (24/2 slab, 208 CTAs: +18 %; 8/1 slab, 72 CTAs: -10 %).
+        if m <= 64:
+            cluster = "2x1" if 2 * ctas_64 >= sm_count else "1x1"
+            return f"CONFIG_sm100_64x{tn}x128_64x{tn}x32_cluster{cluster}_1ctamma_swapAB"
+        # 65..128 tokens: the plain 128-token x 64-weight tile (full-rate MMA M) while its grid fits one wave.
+        if -(-m // 128) * ctas_64 <= sm_count:
+            return "CONFIG_sm100_128x64x128_128x64x32_cluster1x1_1ctamma"
+        return "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_swapAB"
+    # The 64-row tiles overflow a wave: 128-row weight tiles (one wave up to N = 128 x SMs; 32/2 slab, 136 CTAs).
+    if m <= 64:
+        return f"CONFIG_sm100_128x{tn}x128_128x{tn}x32_cluster1x1_1ctamma_swapAB"
+    return "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_swapAB"
 
 
 def _auto_tile_name(m: int, n: int, k: int, *, dtype: torch.dtype, a_major: str, b_major: str, block_scale: bool, alpha: bool) -> Optional[str]:

@@ -1014,8 +1014,16 @@ _RUBIN_SMS = 212
         (1, _FLASH_NEXT_24_2["d_model"], _FLASH_NEXT_24_2["k_o"], "CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_splitK8_swapAB"),
         (32, _FLASH_NEXT_24_2["d_model"], _FLASH_NEXT_24_2["k_o"], "CONFIG_sm100_128x32x128_128x32x32_cluster1x1_1ctamma_splitK8_swapAB"),
         (64, _FLASH_NEXT_24_2["d_model"], _FLASH_NEXT_24_2["k_o"], "CONFIG_sm100_128x64x128_128x64x32_cluster1x1_1ctamma_splitK8_swapAB"),
-        # past 64 tokens the narrow projection takes the plain 64x32 tile (N / 32 CTAs over the full K)
+        # past 64 tokens the narrow projection takes the plain 64x32 tile while that grid fits one wave (2 x 80 CTAs here)
         (128, _FLASH_NEXT_24_2["d_model"], _FLASH_NEXT_24_2["k_o"], "CONFIG_sm100_64x32x128_64x32x32_cluster1x1_1ctamma"),
+        # the 32/2 shard: 272 64-row tiles overflow a wave -> 128-row weight tiles (136 CTAs), no split; its out projection
+        # (32 tiles of 128 rows over K 8192) splits 6 ways = one wave; past 64 tokens 2 x 128 plain tiles overflow -> the split
+        (1, (2 * 32 + 2 * 2) * 256, 4096, "CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_swapAB"),
+        (128, (2 * 32 + 2 * 2) * 256, 4096, "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_swapAB"),
+        (1, 4096, 32 * 256, "CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_splitK6_swapAB"),
+        (128, 4096, 32 * 256, "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_splitK6_swapAB"),
+        # the 8/1 shard's slab: 72 64-row tiles (a third of the machine) -> the 64-row tile without the pair's multicast
+        (1, (2 * 8 + 2 * 1) * 256, 4096, "CONFIG_sm100_64x8x128_64x8x32_cluster1x1_1ctamma_swapAB"),
     ],
 )
 def test_small_m_route_names_a_swap_ab_tile_for_decode_row_counts(m, n, k, expect):
