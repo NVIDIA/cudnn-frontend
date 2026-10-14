@@ -474,19 +474,13 @@ class SM90FusedMultiHeadAttentionForward:
             # A negative scale always takes FP64 exponents and a zero scale never does.
             # A positive scale takes them when the launch-uniform term is set, or when an
             # anchor is large enough that rounding anchor * k once per row (the FFMA
-            # exponent's subtrahend) could move the top exponent by more than 1, or the
-            # anchors' distance could overflow. The anchors bound every score that can
-            # carry probability: a score far below its anchor has P = 0 on either path.
+            # exponent's subtrahend) could move the top exponent by more than 1. The
+            # anchors bound every score that can carry probability: a score far below its
+            # anchor has P = 0 on either path.
             wide = cutlass.Boolean(self.scale_mode < SCALE_ZERO)
             if cutlass.const_expr(self.scale_mode == SCALE_POSITIVE):
                 bound = cute.arch.fmax(cute.math.abs(safe_current), cute.math.abs(safe_old))
-                wide = softmax_params.wide_uniform
-                if bound > softmax_params.wide_floor:
-                    wide = (
-                        wide
-                        | (bound > softmax_params.wide_limit)
-                        | (cute.math.abs(cutlass.Float64(safe_old) - cutlass.Float64(safe_current)) > cutlass.Float64(FLT_MAX_F64))
-                    )
+                wide = softmax_params.wide_uniform | (bound > softmax_params.wide_limit)
             # Resolve the row's numerical path once, for its scores and the old anchor.
             # Keeping the branch outside the pairs avoids reconvergence around each
             # exp2, and computing the old anchor's exponent inside it keeps its FP64
@@ -804,7 +798,7 @@ class SM90FusedMultiHeadAttentionForward:
             alpha = cutlass.Array(cutlass.Float32, 2, alignment=8)
             scale_log2 = scale * cutlass.Float32(LOG2_E)
             scale_log2_wide = cutlass.Float64(scale) * cutlass.Float64(LOG2_E)
-            wide_uniform, wide_floor, wide_limit = cutlass.Boolean(False), cutlass.Float32(0.0), cutlass.Float32(0.0)
+            wide_uniform, wide_limit = cutlass.Boolean(False), cutlass.Float32(0.0)
             if cutlass.const_expr(self.scale_mode == SCALE_POSITIVE):
                 # Launch-uniform: decide the scale-only guard once, in setup. The row limit is
                 # the smaller of the FP32 overflow bound and 2**24 / |k|: past |anchor * k| =
@@ -815,7 +809,12 @@ class SM90FusedMultiHeadAttentionForward:
                 if cutlass.Float64(limit) * magnitude > cutlass.Float64(FLT_MAX_F64):
                     limit = (limit.bitcast(cutlass.Uint32) - cutlass.Uint32(1)).bitcast(cutlass.Float32)
                 limit = cute.arch.fmin(limit, cutlass.Float32(cutlass.Float64(2.0**24) / magnitude))
-                wide_floor, wide_limit = cute.arch.fmin(limit, cutlass.Float32(2.0**126)), limit
+                # Anchors up to 2**126 apart cannot overflow their FP32 difference. A row limit past
+                # 2**126 needs |k| below 2**-102, so such a launch takes FP64 exponents on every row,
+                # and the per-row test below stays one FP32 compare: no FP64 instruction issues on the
+                # narrow path, where it would wait behind the other warpgroup's WGMMA.
+                wide_uniform = wide_uniform | (limit > cutlass.Float32(2.0**126))
+                wide_limit = limit
             # Natural-log scale for finalization, FP32/FP64 log2 scales for EX2, and the
             # launch-uniform guard terms for the per-row magnitude test.
             softmax_params = SimpleNamespace(
@@ -826,7 +825,6 @@ class SM90FusedMultiHeadAttentionForward:
                 scale_log2=scale_log2,
                 scale_log2_wide=scale_log2_wide,
                 wide_uniform=wide_uniform,
-                wide_floor=wide_floor,
                 wide_limit=wide_limit,
             )
             row_lse = cutlass.Array(cutlass.Float32, 2, alignment=8)
