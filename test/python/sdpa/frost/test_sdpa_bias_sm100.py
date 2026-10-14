@@ -195,7 +195,8 @@ _RING_CASES = {
     "ring_x10_causal_384": dict(b=1, h=4, h_kv=4, s_q=384, s_kv=384, causal=True, bias_scale=10.0),
     "ring_dense_nkv4_512": dict(b=2, h=2, h_kv=2, s_q=512, s_kv=512),
     "ring_causal_nkv5_640": dict(b=2, h=2, h_kv=2, s_q=640, s_kv=640, causal=True),
-    "ring_padded_nkv8_tail_900_zero_batch": dict(b=3, h=2, h_kv=2, s_q=900, s_kv=900, kv_lens=[900, 0, 500]),
+    # S_kv 904 (not 900): a COMPACT bias needs S_kv % 8 == 0 for its TMA row stride (the row declines 900 typed; the Rubin module runs 900 on the mask-only arm)
+    "ring_padded_nkv8_tail_904_zero_batch": dict(b=3, h=2, h_kv=2, s_q=904, s_kv=904, kv_lens=[904, 0, 500]),
     "ring_dense_nkv8_1024_head_broadcast": dict(b=2, h=2, h_kv=2, s_q=1024, s_kv=1024, bias="1"),
 }
 # No form at any width of the flavor's domain: the 64-wide tile's cga2 holds one tile and no ring; cga1 none -- a typed decline on real graphs.
