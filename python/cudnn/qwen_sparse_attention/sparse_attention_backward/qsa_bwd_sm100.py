@@ -423,6 +423,7 @@ def qsa_bwd_sparse_kernel(
                                         if cutlass.const_expr(j == 1):
                                             if prims.elect_sync():
                                                 prims.tcgen05_commit(b_ke.subview(pb), group=prims.CTAGroup.CTA_1)
+                                                prims.tcgen05_commit(b_ve, group=prims.CTAGroup.CTA_1)
                                                 if c == nchunks:
                                                     prims.tcgen05_commit(b_dqf, group=prims.CTAGroup.CTA_1)
                                 elif cutlass.const_expr(j < 6):
@@ -445,7 +446,6 @@ def qsa_bwd_sparse_kernel(
                                                 )
                                         if cutlass.const_expr(j == 5):
                                             if prims.elect_sync():
-                                                prims.tcgen05_commit(b_ve, group=prims.CTAGroup.CTA_1)
                                                 prims.tcgen05_commit(b_sf, group=prims.CTAGroup.CTA_1)
                             if c >= 1:
                                 if prims.elect_sync():
