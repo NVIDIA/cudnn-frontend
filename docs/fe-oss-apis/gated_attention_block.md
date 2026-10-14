@@ -428,6 +428,7 @@ blk = GatedAttentionBlockFwd(
     inplace_qkv=None,            # None -> not save_for_backward: norm/RoPE Q,K in place in the projection slab
     fuse_norm_rope=False,        # stages (2)+(3) inside the projection epilogue
     fuse_gate=False,             # stage (5) inside the SDPA epilogue
+    fuse_cache_write=None,       # serving: where the paged write-through runs -- None = folded into the fused projection's epilogue where that arm serves, False = its own launch, True = the fused arm or a typed decline -- "Serving: write-through into a paged KV cache"
     quant=None,                  # QuantSpec (FP8) | MxQuantSpec (MXFP8, + fp4 weights / fp4 O) | None (bf16 / fp16)
     sample_h_sf=None, sample_w_qkvg_sf=None,   # MXFP8 scale-factor blobs
     sample_w_o_sf=None,          # fp4 O only (MxQuantSpec.o_fp4): the e2m1 W_o's scale blob, in O's format
@@ -706,7 +707,13 @@ runs the same launch over the same `[T, H_kv, D]` views.
 
 `P` is a positive multiple of 16 (the serving stacks' page granularity; a 4-token sparse block then never straddles a page);
 a block declared without the attribute REFUSES every one of these inputs (`ValueError`) rather than ignoring a pool it would
-never write. Served on the bf16 / f16 inference pipelines (`inplace_qkv` on or off, `fuse_norm_rope` on or off, `fuse_gate`
+never write. **`fuse_cache_write`** (appended; `None` = auto): on the bf16 / f16 fused norm + RoPE pipeline without an indexer band the write-through
+is FOLDED into the fused projection's epilogue -- every K / V tile's post-norm, post-RoPE row is stored to the pools from the same registers the
+slab store reads (the pool row is the slab row, bitwise the separate kernel; a negative slot or one past the pools writes nothing; no new
+barrier, no new SMEM), one launch fewer per step (EXTEND 3 stages with `fuse_gate=True`, DECODE 4); `False` keeps the separate cache-write
+launch (the control); `True` on the unfused chain, a quantized pipeline or an indexer band is a typed `NotImplementedError`; `blk.cache_write_fused`
+says what runs. The slot dtype (int32 / int64) is a compile key of the fused arm as of the separate kernel: both are compiled.
+Served on the bf16 / f16 inference pipelines (`inplace_qkv` on or off, `fuse_norm_rope` on or off, `fuse_gate`
 on or off, dense or packed); validated on Rubin at pages 16 / 32 / 64 / 128 on all three pool layouts, dense and packed, bf16
 and f16 (the live pool rows bitwise the K / V rows attention consumed; padded tokens unwritten). `quant` (the pools of a
 quantized cache arrive with a cache-dtype attribute and its cast kernel) and `save_for_backward` with `paged_kv_page_size` are

@@ -451,7 +451,13 @@ def test_declaration_facts(group, s_q):
     assert blk._sdpa.paged_dense and blk._sdpa.decode_route == r and blk._sdpa.decode_split_kv == blk.decode_split_kv and blk._sdpa.seq_lens_present
     assert r.decode_tile and blk.decode_split_kv >= 2 and blk.gate_fused and blk._gate is None and blk._sdpa.fuse_gate
     names = [st.name for st in blk._stages]
-    assert names == ["qkv_gate_proj_norm_rope", "cache_write", "sdpa"] + ([] if blk.gate_fused else ["sigmoid_gate"]) + ["out_proj"], names
+    # the write-through is FOLDED into the fused projection's epilogue under AUTO (fuse_cache_write=None): no cache_write stage
+    assert blk.cache_write_fused and blk._cache_write is None and blk._proj.kv_pool_page_size == blk.paged_kv_page_size
+    assert names == ["qkv_gate_proj_norm_rope", "sdpa"] + ([] if blk.gate_fused else ["sigmoid_gate"]) + ["out_proj"], names
+    blk_s, _ = _make_block(group, 4, s_q, fuse_gate=True, fuse_norm_rope=True, decode_split_kv=None if torch.cuda.is_available() else 2, fuse_cache_write=False)
+    assert not blk_s.cache_write_fused and [st.name for st in blk_s._stages] == ["qkv_gate_proj_norm_rope", "cache_write", "sdpa"] + (
+        [] if blk_s.gate_fused else ["sigmoid_gate"]
+    ) + ["out_proj"]
     assert blk._out_proj.capture_safe is True and (not isinstance(blk._proj, _Projection) or blk._proj.capture_safe is True)
     # the pinned split, the unfused gate, the unfused norm + RoPE
     blk1, _ = _make_block(group, 4, s_q, fuse_gate=True, decode_split_kv=1)
