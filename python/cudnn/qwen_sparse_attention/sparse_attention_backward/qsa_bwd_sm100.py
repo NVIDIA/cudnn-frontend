@@ -778,9 +778,7 @@ PREP_THREADS = 256
 def qsa_bwd_prep_kernel(
     g_o: cute.Tensor,
     g_do: cute.Tensor,
-    g_lse: cute.Tensor,
     g_delta: cute.Tensor,
-    g_dense_lse_delta: cute.Tensor,
     g_sparse_dk_acc: cute.Tensor,
     g_sparse_dv_acc: cute.Tensor,
     g_dense_block_bitmap: cute.Tensor,
@@ -788,7 +786,6 @@ def qsa_bwd_prep_kernel(
     g_dense_dk_acc: cute.Tensor,
     g_dense_dv_acc: cute.Tensor,
     T: I32,
-    Qd: I32,
     nz: I32,
     nsel: I32,
     n_dq_acc: I32,
@@ -802,8 +799,6 @@ def qsa_bwd_prep_kernel(
     p_o = g_o.iterator.raw_ptr()
     p_do = g_do.iterator.raw_ptr()
     p_delta = g_delta.iterator.raw_ptr()
-    p_lse = g_lse.iterator.raw_ptr()
-    p_dense_lse_delta = g_dense_lse_delta.iterator.raw_ptr()
     nrows = T * HQ
     for r in cutlass.range(bid * (PREP_THREADS // 32) + wib, nrows, nb * (PREP_THREADS // 32), unroll=1):
         ov = (p_o + r * D + lane * 8).load(count=8, alignment=16).to(F32)
@@ -815,12 +810,6 @@ def qsa_bwd_prep_kernel(
             acc = acc + prims.shfl_sync(0xFFFFFFFF, acc, 16 >> sh, 0x1F, prims.Shfl.BFLY)
         if lane == 0:
             (p_delta + r).store(acc)
-            t = r // HQ
-            if t < Qd:
-                # The dense kernel reads dense_lse_delta[t, 0, h] = lse * log2(e), pre-scaled for exp2, and dense_lse_delta[t, 1, h] = Delta.
-                hq = r - t * HQ
-                (p_dense_lse_delta + (t * 2 + 1) * HQ + hq).store(acc)
-                (p_dense_lse_delta + t * 2 * HQ + hq).store((p_lse + r).load() * F32(LOG2E))
     p_sparse_dk_acc = g_sparse_dk_acc.iterator.raw_ptr()
     p_sparse_dv_acc = g_sparse_dv_acc.iterator.raw_ptr()
     zf = cutlass.Vector.from_elements([F32(0.0)] * 8, F32)
@@ -848,9 +837,7 @@ qsa_bwd_prep_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 def _prep_host(
     o: cute.Tensor,
     do: cute.Tensor,
-    lse: cute.Tensor,
     delta: cute.Tensor,
-    dense_lse_delta: cute.Tensor,
     sparse_dk_acc: cute.Tensor,
     sparse_dv_acc: cute.Tensor,
     dense_block_bitmap: cute.Tensor,
@@ -861,14 +848,11 @@ def _prep_host(
     stream: cuda_driver.CUstream,
 ):
     T = o.shape[0]
-    Qd = dense_lse_delta.shape[0]
     nz = sparse_dk_acc.shape[0]
     qsa_bwd_prep_kernel(
         o,
         do,
-        lse,
         delta,
-        dense_lse_delta,
         sparse_dk_acc,
         sparse_dv_acc,
         dense_block_bitmap,
@@ -876,7 +860,6 @@ def _prep_host(
         dense_dk_acc,
         dense_dv_acc,
         I32(T),
-        I32(Qd),
         I32(nz),
         I32(dense_block_bitmap.shape[0]),
         I32(dq_acc.shape[0]),
@@ -942,14 +925,14 @@ def _part_host(idx: cute.Tensor, sparse_blocks: cute.Tensor, sparse_pass_offsets
 
 
 @cute.kernel
-def qsa_bwd_bitmap_kernel(g_idx: cute.Tensor, g_dense_block_bitmap: cute.Tensor, Qd: I32, NW: I32):
+def qsa_bwd_bitmap_kernel(g_idx: cute.Tensor, g_dense_block_bitmap: cute.Tensor, num_dense_queries: I32, NW: I32):
     tidx, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
     lane = tidx % 32
     qi = bid * 8 + tidx // 32
     p_idx = g_idx.iterator.raw_ptr()
     p_dense_block_bitmap = g_dense_block_bitmap.iterator.raw_ptr()
-    if qi < Qd:
+    if qi < num_dense_queries:
         ncb = (qi + 1) >> 2
         nsel = ncb
         if nsel > TOPK:
@@ -975,8 +958,8 @@ qsa_bwd_bitmap_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit
-def _bitmap_host(idx: cute.Tensor, dense_block_bitmap: cute.Tensor, Qd: I32, NW: I32, stream: cuda_driver.CUstream):
-    qsa_bwd_bitmap_kernel(idx, dense_block_bitmap, Qd, NW).launch(grid=((Qd + 7) // 8, 1, 1), block=(256, 1, 1), stream=stream)
+def _bitmap_host(idx: cute.Tensor, dense_block_bitmap: cute.Tensor, num_dense_queries: I32, NW: I32, stream: cuda_driver.CUstream):
+    qsa_bwd_bitmap_kernel(idx, dense_block_bitmap, num_dense_queries, NW).launch(grid=((num_dense_queries + 7) // 8, 1, 1), block=(256, 1, 1), stream=stream)
 
 
 FIN_THREADS = 256
@@ -993,7 +976,7 @@ def qsa_bwd_finalize_kernel(
     g_dv: cute.Tensor,
     g_dq: cute.Tensor,
     T: I32,
-    Qd: I32,
+    num_dense_queries: I32,
     HAS_SPARSE: cutlass.Constexpr[int],
 ):
     tidx, _, _ = cute.arch.thread_idx()
@@ -1016,12 +999,12 @@ def qsa_bwd_finalize_kernel(
         if cutlass.const_expr(HAS_SPARSE > 0):
             ak = ak + (p_sparse_dk_acc + eo).load(count=8, alignment=16)
             av = av + (p_sparse_dv_acc + eo).load(count=8, alignment=16)
-        if j < Qd:
+        if j < num_dense_queries:
             ak = ak + (p_dense_dk_acc + eo).load(count=8, alignment=16)
             av = av + (p_dense_dv_acc + eo).load(count=8, alignment=16)
         (p_dk + eo).store(ak.to(BF16), alignment=16)
         (p_dv + eo).store(av.to(BF16), alignment=16)
-    nq8 = Qd * (HQ * D // 8)
+    nq8 = num_dense_queries * (HQ * D // 8)
     if cutlass.const_expr(HAS_SPARSE > 0):
         nq8 = T * (HQ * D // 8)
     for it in cutlass.range(bid * FIN_THREADS + tidx, nq8, nb * FIN_THREADS, unroll=1):
@@ -1041,13 +1024,13 @@ def _fin_host(
     dk: cute.Tensor,
     dv: cute.Tensor,
     dq: cute.Tensor,
-    Qd: I32,
+    num_dense_queries: I32,
     nblocks: I32,
     HAS_SPARSE: cutlass.Constexpr[int],
     stream: cuda_driver.CUstream,
 ):
     T = dk.shape[0]
-    qsa_bwd_finalize_kernel(sparse_dk_acc, sparse_dv_acc, dense_dk_acc, dense_dv_acc, dq_acc, dk, dv, dq, I32(T), Qd, HAS_SPARSE).launch(
+    qsa_bwd_finalize_kernel(sparse_dk_acc, sparse_dv_acc, dense_dk_acc, dense_dv_acc, dq_acc, dk, dv, dq, I32(T), num_dense_queries, HAS_SPARSE).launch(
         grid=(nblocks, 1, 1), block=(FIN_THREADS, 1, 1), stream=stream
     )
 
@@ -1060,7 +1043,7 @@ def _rot(k, off, nk):
     return r
 
 
-# Key-tile-major path for the queries below Qd. The two CTAs of a cluster split each group's work by operand, so every
+# Key-tile-major path for the queries below num_dense_queries. The two CTAs of a cluster split each group's work by operand, so every
 # MMA keeps M=128 and each CTA holds one [128 x 256] fp32 dV or dK accumulator in TMEM across all groups.
 DP_TT = 128
 DP_G = 4
@@ -1097,13 +1080,14 @@ def qsa_bwd_dense_pair_kernel(
     tma_dq: cutlass.GridConstant[cuda.TensorMap],
     g_k: cute.Tensor,
     g_v: cute.Tensor,
-    g_dense_lse_delta: cute.Tensor,
+    g_lse: cute.Tensor,
+    g_delta: cute.Tensor,
     g_dense_block_bitmap: cute.Tensor,
     g_dense_dk_acc: cute.Tensor,
     g_dense_dv_acc: cute.Tensor,
     g_dense_done_count: cute.Tensor,
     T: I32,
-    Qd: I32,
+    num_dense_queries: I32,
     NW: I32,
     ntiles: I32,
     U: I32,
@@ -1120,7 +1104,7 @@ def qsa_bwd_dense_pair_kernel(
     part = rest // ntiles
     tile = rest - part * ntiles
     t0 = tile * DP_TT
-    Gd = (Qd + (DP_G - 1)) // DP_G
+    Gd = (num_dense_queries + (DP_G - 1)) // DP_G
     g_top = Gd - part * U
     g_lo = t0 // DP_G
     g_bot = g_top - U
@@ -1192,7 +1176,8 @@ def qsa_bwd_dense_pair_kernel(
         tmem_raw = tmem_slot.load()
         tmem_col0 = tmem_raw & I32(0xFFFF)
         tmem_row0 = tmem_raw >> I32(16)
-        p_dense_lse_delta = g_dense_lse_delta.iterator.raw_ptr()
+        p_lse = g_lse.iterator.raw_ptr()
+        p_delta = g_delta.iterator.raw_ptr()
         p_dense_block_bitmap = g_dense_block_bitmap.iterator.raw_ptr()
         p_dense_dk_acc = g_dense_dk_acc.iterator.raw_ptr()
         p_dense_dv_acc = g_dense_dv_acc.iterator.raw_ptr()
@@ -1365,7 +1350,7 @@ def qsa_bwd_dense_pair_kernel(
             qd = warp & 3
             r = qd * 32 + lane
             tok = t0 + r
-            row_ok = tok < Qd
+            row_ok = tok < num_dense_queries
             blk = tok >> 2
             wsel = blk >> 5
             bsel = blk & 31
@@ -1399,21 +1384,21 @@ def qsa_bwd_dense_pair_kernel(
                 prims.mbarrier_arrive(b_vt)
             scol = tmem_col0 + DP_TM_SD + hf * 24
             if rank == 0:
-                # Selection words and lse * log2(e) load one group ahead to hide their latency.
+                # Selection words and lse load one group ahead to hide their latency.
                 g_n = g_top - 1 - _rot(I32(0), off, nk)
                 sw_n = []
                 av_n = []
                 for jj in cutlass.range_constexpr(2):
                     qc = g_n * DP_G + hf * 2 + jj
-                    if qc >= Qd:
-                        qc = Qd - 1
+                    if qc >= num_dense_queries:
+                        qc = num_dense_queries - 1
                     sw_n.append((p_dense_block_bitmap + (qc * NW + wsel)).load())
-                    ab = qc * 2 * HQ + hk * GQ
+                    ab = qc * HQ + hk * GQ
                     av_n.append(
                         [
-                            (p_dense_lse_delta + ab).load(count=4, alignment=16),
-                            (p_dense_lse_delta + ab + 4).load(count=4, alignment=16),
-                            (p_dense_lse_delta + ab + 8).load(count=4, alignment=16),
+                            (p_lse + ab).load(count=4, alignment=16),
+                            (p_lse + ab + 4).load(count=4, alignment=16),
+                            (p_lse + ab + 8).load(count=4, alignment=16),
                         ]
                     )
                 for k in cutlass.range(nk, unroll=1):
@@ -1428,15 +1413,15 @@ def qsa_bwd_dense_pair_kernel(
                     av_n = []
                     for jj in cutlass.range_constexpr(2):
                         qc = g_n * DP_G + hf * 2 + jj
-                        if qc >= Qd:
-                            qc = Qd - 1
+                        if qc >= num_dense_queries:
+                            qc = num_dense_queries - 1
                         sw_n.append((p_dense_block_bitmap + (qc * NW + wsel)).load())
-                        ab = qc * 2 * HQ + hk * GQ
+                        ab = qc * HQ + hk * GQ
                         av_n.append(
                             [
-                                (p_dense_lse_delta + ab).load(count=4, alignment=16),
-                                (p_dense_lse_delta + ab + 4).load(count=4, alignment=16),
-                                (p_dense_lse_delta + ab + 8).load(count=4, alignment=16),
+                                (p_lse + ab).load(count=4, alignment=16),
+                                (p_lse + ab + 4).load(count=4, alignment=16),
+                                (p_lse + ab + 8).load(count=4, alignment=16),
                             ]
                         )
                     _wait(b_sf, k & 1)
@@ -1453,7 +1438,7 @@ def qsa_bwd_dense_pair_kernel(
                         qi = g * DP_G + hf * 2 + jj
                         ncb = (qi + 1) >> 2
                         sel = (sw[jj] >> bsel) & 1
-                        valid = row_ok & (qi < Qd) & (tok <= qi) & ((sel != 0) | (blk == ncb))
+                        valid = row_ok & (qi < num_dense_queries) & (tok <= qi) & ((sel != 0) | (blk == ncb))
                         ow = []
                         for hh in cutlass.range_constexpr(GQ):
                             n = jj * GQ + hh
@@ -1462,7 +1447,7 @@ def qsa_bwd_dense_pair_kernel(
                                 x = xv0[n]
                             else:
                                 x = xv1[n - 16]
-                            e = cute.math.exp2(x * c_s - a, fastmath=True)
+                            e = cute.math.exp2(x * c_s - a * F32(LOG2E), fastmath=True)
                             pj = F32(0.0)
                             if valid:
                                 pj = e
@@ -1499,14 +1484,14 @@ def qsa_bwd_dense_pair_kernel(
                 av_n = []
                 for jj in cutlass.range_constexpr(2):
                     qc = g_n * DP_G + hf * 2 + jj
-                    if qc >= Qd:
-                        qc = Qd - 1
-                    ab = (qc * 2 + 1) * HQ + hk * GQ
+                    if qc >= num_dense_queries:
+                        qc = num_dense_queries - 1
+                    ab = qc * HQ + hk * GQ
                     av_n.append(
                         [
-                            (p_dense_lse_delta + ab).load(count=4, alignment=16),
-                            (p_dense_lse_delta + ab + 4).load(count=4, alignment=16),
-                            (p_dense_lse_delta + ab + 8).load(count=4, alignment=16),
+                            (p_delta + ab).load(count=4, alignment=16),
+                            (p_delta + ab + 4).load(count=4, alignment=16),
+                            (p_delta + ab + 8).load(count=4, alignment=16),
                         ]
                     )
                 for k in cutlass.range(nk, unroll=1):
@@ -1518,14 +1503,14 @@ def qsa_bwd_dense_pair_kernel(
                     av_n = []
                     for jj in cutlass.range_constexpr(2):
                         qc = g_n * DP_G + hf * 2 + jj
-                        if qc >= Qd:
-                            qc = Qd - 1
-                        ab = (qc * 2 + 1) * HQ + hk * GQ
+                        if qc >= num_dense_queries:
+                            qc = num_dense_queries - 1
+                        ab = qc * HQ + hk * GQ
                         av_n.append(
                             [
-                                (p_dense_lse_delta + ab).load(count=4, alignment=16),
-                                (p_dense_lse_delta + ab + 4).load(count=4, alignment=16),
-                                (p_dense_lse_delta + ab + 8).load(count=4, alignment=16),
+                                (p_delta + ab).load(count=4, alignment=16),
+                                (p_delta + ab + 4).load(count=4, alignment=16),
+                                (p_delta + ab + 8).load(count=4, alignment=16),
                             ]
                         )
                     _wait(b_sf, k & 1)
@@ -1678,13 +1663,14 @@ def _dpair_host(
     v: cute.Tensor,
     q: cute.Tensor,
     do: cute.Tensor,
-    dense_lse_delta: cute.Tensor,
+    lse: cute.Tensor,
+    delta: cute.Tensor,
     dense_block_bitmap: cute.Tensor,
     dq_acc: cute.Tensor,
     dense_dk_acc: cute.Tensor,
     dense_dv_acc: cute.Tensor,
     dense_done_count: cute.Tensor,
-    Qd: I32,
+    num_dense_queries: I32,
     NW: I32,
     ntiles: I32,
     U: I32,
@@ -1697,20 +1683,37 @@ def _dpair_host(
     tma_qd = cuda.create_tensor_map_tiled_from_view(q, box_dims=(DP_G, GQ, 64), stride_order=(2, 1, 0), swizzle=cuda.TensorMapSwizzle.s128b)
     tma_dod = cuda.create_tensor_map_tiled_from_view(do, box_dims=(DP_G, GQ, 64), stride_order=(2, 1, 0), swizzle=cuda.TensorMapSwizzle.s128b)
     tma_dq = cuda.create_tensor_map_tiled_from_view(
-        cute.make_tensor(dq_acc.iterator, cute.make_layout((Qd, HQ, D), stride=(HQ * D, D, 1))),
+        cute.make_tensor(dq_acc.iterator, cute.make_layout((num_dense_queries, HQ, D), stride=(HQ * D, D, 1))),
         box_dims=(DP_G, GQ, 32),
         stride_order=(2, 1, 0),
         swizzle=cuda.TensorMapSwizzle.none,
     )
     qsa_bwd_dense_pair_kernel(
-        tma_kd, tma_qd, tma_dod, tma_dq, k, v, dense_lse_delta, dense_block_bitmap, dense_dk_acc, dense_dv_acc, dense_done_count, I32(T), Qd, NW, ntiles, U, PDL
+        tma_kd,
+        tma_qd,
+        tma_dod,
+        tma_dq,
+        k,
+        v,
+        lse,
+        delta,
+        dense_block_bitmap,
+        dense_dk_acc,
+        dense_dv_acc,
+        dense_done_count,
+        I32(T),
+        num_dense_queries,
+        NW,
+        ntiles,
+        U,
+        PDL,
     ).launch(grid=(nparts * ntiles * 4, 1, 1), block=(DP_THREADS, 1, 1), cluster=(2, 1, 1), stream=stream, use_pdl=(PDL == 1))
 
 
-# Tuned dense/sparse crossover: below it row i selects 2048 of its i + 1 tokens, dense enough that keeping dK/dV on
-# chip beats one fp32 reduction per (query, block) pair. A sparse remainder under 2048 queries is folded in too.
-QD_MAX = 16384
-QD_MAX_LONG = 24576  # the tuned crossover once T >= 32768
+# The dense path computes every visible key of a 128-token tile, the sparse path only selected keys but with fp32 atomics.
+# A selected key costs about SPARSE_COST_RATIO visible dense keys, so a query stays dense while it selects that share of its prefix.
+SPARSE_COST_RATIO = 12
+MAX_DENSE_QUERIES = SPARSE_COST_RATIO * TOPK * 4
 KV_PASS = 16384  # sparse kernel KV pass (tokens): one pass's K/V + fp32 dK/dV (~96 MB) stays L2 resident
 KV_PASS_MIN_T = 16384  # up to this T the whole sequence already fits one L2-resident pass
 DP_U = 320  # tuned query groups per dense work unit, small enough to backfill the sparse grid's tail evenly
@@ -1725,31 +1728,29 @@ class LaunchPlan:
     def __init__(self, seq_len: int, num_sms: int):
         T = int(seq_len)
         assert 1 <= T <= MAX_SEQ_LEN, f"sequence length {T} outside [1, {MAX_SEQ_LEN}]"
-        qd_max = QD_MAX if T < 32768 else QD_MAX_LONG
         self.seq_len = T
-        self.qd = T if T - qd_max < 2048 else qd_max
-        self.has_sparse = self.qd < T
-        self.nw = (self.qd + 127) // 128
-        self.nsel = ((self.qd + 2) * self.nw + 64 + 3) // 4 * 4
-        gd = (self.qd + DP_G - 1) // DP_G
+        self.num_dense_queries = min(T, MAX_DENSE_QUERIES)
+        self.has_sparse = self.num_dense_queries < T
+        self.nw = (self.num_dense_queries + 127) // 128
+        self.nsel = ((self.num_dense_queries + 2) * self.nw + 64 + 3) // 4 * 4
+        gd = (self.num_dense_queries + DP_G - 1) // DP_G
         self.dense_unit = DP_U if self.has_sparse else (DP_U_ALL[1] if gd >= 4096 else DP_U_ALL[0])
-        self.dense_tiles = (self.qd + DP_TT - 1) // DP_TT
+        self.dense_tiles = (self.num_dense_queries + DP_TT - 1) // DP_TT
         self.dense_parts = (gd + self.dense_unit - 1) // self.dense_unit
         rt = KV_PASS if T > KV_PASS_MIN_T else T
         self.pass_tokens = max(4, (rt + 3) // 4 * 4)
         self.num_passes = (T + self.pass_tokens - 1) // self.pass_tokens
         assert self.num_passes < POS, f"sequence length {T} needs {self.num_passes} KV passes, the offset rows hold {POS - 1}"
-        self.sparse_queries = T - self.qd
+        self.sparse_queries = T - self.num_dense_queries
         self.sparse_ctas = min(num_sms, self.sparse_queries)
         nz = T * HKV * D if self.has_sparse else 0
         dq_acc_size = T * HQ * D
-        dense_dkv_size = self.qd * HKV * D + 64
+        dense_dkv_size = self.num_dense_queries * HKV * D + 64
         self.prep_blocks = min(num_sms * 8, (max(T * HQ, nz // 8, (self.nsel + 4) // 4, dq_acc_size // 8, dense_dkv_size // 8) + 255) // 256)
         self.fin_blocks = min(num_sms * 8, (T * HKV * D // 8 + 255) // 256)
         # Without the sparse path its dK/dV accumulators shrink to one never-read PAD chunk that both kernels alias.
         self.chunks = [
             ("delta", (T, HQ), torch.float32),
-            ("dense_lse_delta", (self.qd, 2, HQ), torch.float32),
             ("sparse_dk_acc", (nz + PAD,), torch.float32),
             ("sparse_dv_acc", (nz + PAD if self.has_sparse else 0,), torch.float32),
             ("dense_block_bitmap", (self.nsel + 4,), torch.int32),
@@ -1793,7 +1794,6 @@ def compile_kernels(has_sparse: bool) -> dict:
         f_kv = _fake(BF16, (None, HKV, D), sym_t)
         f_idx = _fake(I32, (None, W), sym_t, align=4)
         f_lse = _fake(F32, (None, HQ), sym_t)
-        f_dense_lse_delta = _fake(F32, (None, 2, HQ), cute.sym_int64())
         f_h = _fake(F32, (None,), cute.sym_int64(divisibility=8))
         f_dense_block_bitmap = _fake(I32, (None,), cute.sym_int64(divisibility=4))
         f_dense_done_count = _fake(I32, (None,), cute.sym_int64(divisibility=4))
@@ -1808,8 +1808,6 @@ def compile_kernels(has_sparse: bool) -> dict:
                 f_q,
                 f_q,
                 f_lse,
-                f_lse,
-                f_dense_lse_delta,
                 f_h,
                 f_h,
                 f_dense_block_bitmap,
@@ -1845,7 +1843,8 @@ def compile_kernels(has_sparse: bool) -> dict:
                 f_kv,
                 f_q,
                 f_q,
-                f_dense_lse_delta,
+                f_lse,
+                f_lse,
                 f_dense_block_bitmap,
                 f_dq_acc,
                 f_dense_dkv,
@@ -1865,7 +1864,8 @@ def compile_kernels(has_sparse: bool) -> dict:
                 f_kv,
                 f_q,
                 f_q,
-                f_dense_lse_delta,
+                f_lse,
+                f_lse,
                 f_dense_block_bitmap,
                 f_dq_acc,
                 f_dense_dkv,
@@ -1894,9 +1894,7 @@ def launch(plan: LaunchPlan, fns: dict, q, k, v, out, dout, lse, topk_idxs, dq, 
     fns["prep"](
         out,
         dout,
-        lse,
         s["delta"],
-        s["dense_lse_delta"],
         s["sparse_dk_acc"],
         s["sparse_dv_acc"],
         s["dense_block_bitmap"],
@@ -1907,26 +1905,39 @@ def launch(plan: LaunchPlan, fns: dict, q, k, v, out, dout, lse, topk_idxs, dq, 
         stream,
     )
     if plan.has_sparse:
-        fns["part"](topk_idxs, s["sparse_blocks"], s["sparse_pass_offsets"], plan.qd, plan.pass_tokens // 4, plan.num_passes, stream)
-    fns["bitmap"](topk_idxs, s["dense_block_bitmap"], plan.qd, plan.nw, stream)
+        fns["part"](topk_idxs, s["sparse_blocks"], s["sparse_pass_offsets"], plan.num_dense_queries, plan.pass_tokens // 4, plan.num_passes, stream)
+    fns["bitmap"](topk_idxs, s["dense_block_bitmap"], plan.num_dense_queries, plan.nw, stream)
     dense_args = (
         k,
         v,
         q,
         dout,
-        s["dense_lse_delta"],
+        lse,
+        s["delta"],
         s["dense_block_bitmap"],
         s["dq_acc"],
         s["dense_dk_acc"],
         s["dense_dv_acc"],
         dense_done_count,
-        plan.qd,
+        plan.num_dense_queries,
         plan.nw,
         plan.dense_tiles,
         plan.dense_unit,
         plan.dense_parts,
     )
-    fin_args = (s["sparse_dk_acc"], s["sparse_dv_acc"], s["dense_dk_acc"], s["dense_dv_acc"], s["dq_acc"], dk, dv, dq, plan.qd, plan.fin_blocks, stream)
+    fin_args = (
+        s["sparse_dk_acc"],
+        s["sparse_dv_acc"],
+        s["dense_dk_acc"],
+        s["dense_dv_acc"],
+        s["dq_acc"],
+        dk,
+        dv,
+        dq,
+        plan.num_dense_queries,
+        plan.fin_blocks,
+        stream,
+    )
     if plan.has_sparse:
         # The sparse grid is a normal launch, so the PDL-launched dense grid sees the partition lists and the bitmap.
         fns["sparse"](
@@ -1942,7 +1953,7 @@ def launch(plan: LaunchPlan, fns: dict, q, k, v, out, dout, lse, topk_idxs, dq, 
             s["sparse_blocks"],
             s["sparse_pass_offsets"],
             plan.sparse_ctas,
-            plan.qd,
+            plan.num_dense_queries,
             plan.num_passes,
             stream,
         )

@@ -62,6 +62,7 @@ All tensors must be contiguous and on the same CUDA device. `check_support()` ra
 
 ```bash
 pip install nvidia-cudnn-frontend
+pip install -U "nvidia-cutlass-dsl>=4.7.0"
 ```
 
 The wrapper allocates the outputs and the workspace and caches one plan per tensor layout:
@@ -100,14 +101,14 @@ Six kernels run on the launch stream:
 | `qsa_bwd_prep_kernel` | computes `Delta` and zero-fills the accumulators |
 | `qsa_bwd_partition_kernel` | groups each sparse query's blocks by KV pass |
 | `qsa_bwd_bitmap_kernel` | builds the block bitmap of the dense queries |
-| `qsa_bwd_sparse_kernel` | query-major path for the queries at or above `Qd` |
-| `qsa_bwd_dense_pair_kernel` | key-tile-major path for the queries below `Qd` |
+| `qsa_bwd_sparse_kernel` | query-major path for the queries at or above `num_dense_queries` |
+| `qsa_bwd_dense_pair_kernel` | key-tile-major path for the queries below `num_dense_queries` |
 | `qsa_bwd_finalize_kernel` | sums the accumulators and writes bf16 `dq`, `dk` and `dv` |
 
-A query below `Qd` selects a large share of its visible tokens (2048 of `i + 1`), so the dense kernel keeps dK and dV
+A query below `num_dense_queries` selects a large share of its visible tokens (2048 of `i + 1`), so the dense kernel keeps dK and dV
 of a 128-token key tile on chip across all the queries that see it. The sparse kernel walks the selected blocks of
-the remaining queries in 16384-token KV passes, so that each pass's K/V and accumulators stay in L2. `Qd` is 16384,
-or 24576 once `T >= 32768`. When fewer than 2048 queries would remain above it, every query takes the dense path. The
+the remaining queries in 16384-token KV passes, so that each pass's K/V and accumulators stay in L2. `num_dense_queries` is
+`min(T, 24576)`: a query stays on the dense path while it selects at least 1/12 of its visible tokens. The
 dense kernel is a programmatic dependent launch of the sparse kernel and fills SMs as the sparse grid drains.
 
 ## Limitations

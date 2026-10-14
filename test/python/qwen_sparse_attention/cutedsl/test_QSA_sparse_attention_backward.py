@@ -45,9 +45,10 @@ def _check_against_reference(inputs, grads):
         (5, 1.0),  # one complete block and a tail
         (4099, 1.0),  # every query in the dense kernel, sparse rows above 2050 included
         (16384, 1.0),  # every query in the dense kernel with the larger dense unit
-        (20000, 1.0),  # dense and query-major kernels, two KV passes
-        (20000, 1e-7),  # training-scale gradients, which rule out reduced-range accumulators
-        (32769, 1.0),  # the long-sequence crossover, three KV passes and a partial last block
+        (24577, 1.0),  # a single query on the query-major kernel
+        (28000, 1.0),  # dense and query-major kernels, two KV passes
+        (28000, 1e-7),  # training-scale gradients, which rule out reduced-range accumulators
+        (32769, 1.0),  # three KV passes and a partial last block
     ],
 )
 def test_qsa_backward_matches_reference(seq_len, grad_scale):
@@ -87,7 +88,7 @@ def test_wrapper_on_explicit_stream_with_preallocated_outputs(monkeypatch):
         return call
 
     monkeypatch.setattr(kernel, "launch", lambda plan, fns, *rest: launch(plan, {name: record(fn) for name, fn in fns.items()}, *rest))
-    inputs = make_inputs(20000, seed=3)
+    inputs = make_inputs(28000, seed=3)
     args = [inputs[name] for name in _INPUT_NAMES]
     dq, dk, dv = torch.empty_like(inputs["q"]), torch.empty_like(inputs["k"]), torch.empty_like(inputs["v"])
     side = torch.cuda.Stream()
@@ -106,7 +107,7 @@ def test_execute_allocates_nothing_and_never_synchronizes(monkeypatch, compile_a
 
     # An empty artifact cache makes this a cold compile.
     monkeypatch.setattr(kernel, "_COMPILED", {})
-    inputs = make_inputs(20000, seed=5)
+    inputs = make_inputs(28000, seed=5)
     args = [inputs[name] for name in _INPUT_NAMES]
     plan = QSA.SparseAttentionBackward(*args)
     assert plan.check_support()
@@ -127,7 +128,7 @@ def test_execute_allocates_nothing_and_never_synchronizes(monkeypatch, compile_a
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("seq_len", [4099, 20000])  # the dense-only and the dense + sparse launch sequences
+@pytest.mark.parametrize("seq_len", [4099, 28000])  # the dense-only and the dense + sparse launch sequences
 def test_first_execute_under_cuda_graph_capture_replays_new_inputs(seq_len, monkeypatch):
     from cudnn import QSA
     from cudnn.qwen_sparse_attention.sparse_attention_backward import qsa_bwd_sm100 as kernel
