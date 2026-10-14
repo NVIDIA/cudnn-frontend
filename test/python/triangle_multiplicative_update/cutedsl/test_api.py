@@ -982,7 +982,7 @@ def test_heuristics_table_is_total_in_domain_and_resolvable():
 def test_register_split_hint_is_a_rendering_rule_the_knob_overrides():
     """The `.minnctapersm` hint is resolved per RENDERING (stage, width, bias arm, LayerNorm form, epilogue form), not per geometry: the table never
     sets the axis (`recommend` leaves it None, `is_complete` does not name it), `register_split_hint` returns a domain member for every rendering the
-    API can build (0 = as shipped unless a measured row says 1), the bias-ON renderings are never hinted, and a caller's `knobs=` value overrides
+    API can build (0 = as shipped unless a measured row says 1), a bias-ON rendering is hinted only by a row naming its exact form, and a caller's `knobs=` value overrides
     the rule for both stages at compile time (pinned on the params the API hands the substrate, GPU-free)."""
     from cudnn.gemm.frost.ln_prologue import LN_PASS_FORMS, EPI_MATHS, MIN_BLOCKS_PER_MP_DOMAIN
 
@@ -1051,12 +1051,16 @@ def test_register_split_hint_is_a_rendering_rule_the_knob_overrides():
     assert th.register_split_hint("k3", 128, True, "registers", "packed_biasfold") == 0
     assert th.register_split_hint("k1", 128, True, "smem_rolled", "packed_biasfold", "major") == 0  # a rolled K1 with biases: inside the bar
     # the API's wiring, GPU-free: a bare declaration hands the two stages the rule with THEIR bias flags, K1 its tile order AND its work item -- every
-    # c 128 pick from N = 256 carries the LayerNorm-once item, so a bare declaration runs UNHINTED there (no row names that item: its renderings
-    # spill under the hint and the whole call runs faster without it); the per-tile item (a caller's `ln_once=""`) keeps the measured rows; the knob
+    # c 128 pick from N = 256 carries the LayerNorm-once item, so on the Rubin column a bare declaration runs UNHINTED there (no Rubin row names that
+    # item: its renderings spill under the hint and the whole call runs faster without it), while the SM100 column's row hints the register-form K1
+    # pick with the plain packed epilogue under the block item WITH the in-biases (the 512 and 1024 buckets below; the 256 bucket's rolled pick and
+    # every bias-off plan stay unhinted, the output stage always); the per-tile item (a caller's `ln_once=""`) keeps the measured rows; the knob
     # `min_blocks_per_mp` overrides both stages
+    sm100_column = th.arch_column_for_cc(_cc()) == "sm100"
     for N, hb_in, hb_out in ((512, False, False), (1024, False, True), (512, True, False), (512, True, True), (1024, True, True), (256, False, False)):
+        want_k1 = 1 if (sm100_column and hb_in and N in (512, 1024)) else 0
         assert tapi.TriangleMultiplicativeUpdateFwd(_desc(N=N), "outgoing", c_hidden=128, has_in_bias=hb_in, has_out_bias=hb_out)._register_split_hints() == (
-            0,
+            want_k1,
             0,
         ), (N, hb_in, hb_out)
     per_tile = tapi.TriMulKnobs(ln_once="")
@@ -1112,11 +1116,13 @@ def test_k2_tile_knob_vocabulary_is_a_typed_decline_before_any_device_work():
     plan = tapi.TriangleMultiplicativeUpdateFwd(_desc(), "outgoing", c_hidden=128, knobs=tapi.TriMulKnobs(clc_stages=7))
     with pytest.raises(ValueError, match="clc_stages"):
         plan.check_support()
-    # the geometry's measured default is what a bare declaration gets
+    # the geometry's measured default is what a bare declaration gets -- the column of the device the plan is declared on (the Rubin table on a
+    # CPU declaration / cc 10.7, the SM100 column on cc 10.0 / 10.3; both pick the A-multicast x2 pair tile at N 512)
     from cudnn.triangle_multiplicative_update import heuristics as th
 
     plan = tapi.TriangleMultiplicativeUpdateFwd(_desc(N=512), "outgoing", c_hidden=128)
-    assert plan.knobs == th.recommend(512, 128, 1) and plan.k2_tile == k2.MULTICAST_A2_TILE_CONFIG
+    assert plan.knobs == th.recommend(512, 128, 1, cc=plan.cc) and plan.k2_tile == k2.MULTICAST_A2_TILE_CONFIG
+    assert th.recommend(512, 128, 1, cc=(10, 0)).epi_math == "packed" and th.recommend(512, 128, 1).epi_math == "packed_biasfold"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs one CUDA device for the tensors")
