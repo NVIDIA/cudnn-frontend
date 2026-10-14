@@ -2728,11 +2728,18 @@ _STAGES_KV_OVERRIDE_FOR_SWEEPS: Optional[int] = None
 
 
 def sm100_sweep_seam_state() -> Optional[tuple]:
-    """The SM100 small tiles' private sweep seam as ONE hashable, ``None`` when unset (every plan path): the sm100 twin of
-    ``config_sm107.sweep_seam_state``, folded into the template-module key by ``api_dsl._load_kernel_template``."""
-    if _STAGES_KV_OVERRIDE_FOR_SWEEPS is None:
+    """The SM100 small tiles' private sweep seams as ONE hashable, ``None`` when none is set (every plan path): the sm100 twin of
+    ``config_sm107.sweep_seam_state``, folded into the template-module key by ``api_dsl._load_kernel_template``.  The K / V ring depth
+    seam alone keeps its two-field form; the bias pre-load and the ring-wait seams (both module constants the kernel reads at trace
+    time, invisible to the TemplateParams record) append when set, so two renderings that differ only by one of them never share a
+    module or an artifact in one process."""
+    skv, pre, spin = _STAGES_KV_OVERRIDE_FOR_SWEEPS, _BIAS_PRELOAD_CHUNKS_OVERRIDE_FOR_SWEEPS, _SPIN_RING_WAITS_OVERRIDE_FOR_SWEEPS
+    if skv is None and pre is None and spin is None:
         return None
-    return ("sm100_sweep_seams", int(_STAGES_KV_OVERRIDE_FOR_SWEEPS))
+    state = ("sm100_sweep_seams", None if skv is None else int(skv))
+    if pre is not None or spin is not None:
+        state = state + (("bias_preload_chunks", None if pre is None else int(pre)), ("spin_ring_waits", None if spin is None else bool(spin)))
+    return state
 
 
 # The SM100 kernel's ``BIAS_PRELOAD_CHUNKS`` per KV tile width (bias chunks pre-loaded ABOVE the ``bmm1_done`` wait): the Rubin table
@@ -2755,6 +2762,24 @@ def sm100_bias_preload_chunks(tile_n: int) -> int:
             )
         return want
     return SM100_BIAS_PRELOAD_CHUNKS_BY_TILE_N.get(int(tile_n), 1)
+
+
+# The SM100 kernel's ``SPIN_RING_WAITS`` (the retry form of its per-kv-iteration ring waits: ``spin=True`` = the hint-less
+# ``mbarrier.try_wait.parity`` spin, ``False`` = the DSL's ``.timelimit`` suspend loop): the shipped constant is ``d_flavor == 128`` -- MEASURED
+# per flavor on the d128 / d64 bodies (the kernel's own comment); the 32- / 64-wide small-tile forms INHERITED the d64 flavor's sleeping form
+# un-A/B'd (the Rubin twin opts its small tiles IN: +4.6 / +8.3 % on the one-batch-entry ring there, ledger A24, a per-kernel / per-arch sign).
+# The sweep seam below pins the constant every small-tile rendering of the process gets (``monkeypatch.setattr`` in a test or a sweep driver that
+# resets it to None; never a plan path, an import or a config); the d128 flavor keeps its measured form whatever the seam says.
+_SPIN_RING_WAITS_OVERRIDE_FOR_SWEEPS: Optional[bool] = None
+
+
+def sm100_spin_ring_waits(d_flavor: int) -> bool:
+    """The SM100 kernel's ``SPIN_RING_WAITS`` for a rendering of head-dim flavor ``d_flavor``: the shipped per-flavor constant (``True`` on the
+    d128 flavor, ``False`` on the d64 flavor and the small tiles), or -- on the 32- / 64-wide tiles only -- the sweep seam
+    ``_SPIN_RING_WAITS_OVERRIDE_FOR_SWEEPS`` when set (folded into :func:`sm100_sweep_seam_state`)."""
+    if int(d_flavor) in (32, 64) and _SPIN_RING_WAITS_OVERRIDE_FOR_SWEEPS is not None:
+        return bool(_SPIN_RING_WAITS_OVERRIDE_FOR_SWEEPS)
+    return int(d_flavor) == 128
 
 
 def sm100_small_d_stages_kv(tile_k: int, cta_mma: int) -> int:
@@ -2887,22 +2912,31 @@ def sm100_tile_n_pick(d_flavor: int, s_kv: int, *, has_bias: bool, has_kv_mask: 
 # DEFAULT is 0 -- the shipped plain padded legs of the 32- / 64-wide tiles keep the body they run today; the Rubin default (1 at the 128-wide
 # tile, measured +17..+81 % there) is a PRIOR the GB200 sweep decides, reached through the sweep seam or an explicit request.
 SM100_PADDED_TAIL_FORM_DEFAULT = 0
+# The BIAS body on the padding leg (per-row kv_lengths; no kv_mask, no band) renders its -inf body with MASK_FLAGS == MASK_PADDED: the band words,
+# the R2P pass and one FSEL per cell on EVERY kv tile (the padded bias cells measured +13..+20 % per kv tile over the dense bias body on GB200,
+# 2026-10-14).  Form 1 on the bias body = the Rubin twin's arm (its ledger A44): the -inf body renders its band mask at MASK_NONE and each softmax
+# lane pre-masks its own row's out-of-range S columns in TMEM on the tail tile only.  SERVED on SM100 behind a request or the sweep seam; its
+# knob-less default per KV tile width is 0 until the GB200 A/B lands a rule (the entries below are that rule's landing place).
+SM100_BIAS_PADDED_TAIL_FORM_BY_TILE_N = {128: 0, 64: 0}
 _PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS: Optional[int] = None
 
 
 def sm100_padded_tail_form_pick(
     d_flavor: int, *, padded: bool, has_bias: bool, has_kv_mask: bool, causal: bool = False, swa: bool = False, request: Optional[int] = None, tile_n: int = 128
 ) -> int:
-    """The ``TemplateParams.padded_tail_form`` of a plan on the SM100 small tiles: 0 off the eligible set (a dense S_kv at a tile multiple, a bias
-    or a kv_mask -- whose -inf body is ONE body already -- a causal / SWA band, the d128 flavor); on it ``request`` when the caller made one (the
-    adapter's ``padded_tail_form=``, validated there: honoured or declined, never degraded), else the sweep seam, else
-    :data:`SM100_PADDED_TAIL_FORM_DEFAULT` (0 at every width until measured)."""
-    if not padded or has_bias or has_kv_mask or causal or swa or int(d_flavor) not in (32, 64):
+    """The ``TemplateParams.padded_tail_form`` of a plan on the SM100 small tiles: 0 off the eligible set (a dense S_kv at a tile multiple, a
+    kv_mask -- whose keep words fold the length in already -- a causal / SWA band, the d128 flavor); on it ``request`` when the caller made one
+    (the adapter's ``padded_tail_form=``, validated there: honoured or declined, never degraded), else the sweep seam, else the default: on the
+    PLAIN body :data:`SM100_PADDED_TAIL_FORM_DEFAULT` (0 at every width until measured); on the BIAS body (``has_bias``, served since the
+    pre-mask entered the -inf body) :data:`SM100_BIAS_PADDED_TAIL_FORM_BY_TILE_N` at the plan's KV tile width ``tile_n``."""
+    if not padded or has_kv_mask or causal or swa or int(d_flavor) not in (32, 64):
         return 0
     if request is not None:
         return int(request)
     if _PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS is not None:
         return int(_PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS)
+    if has_bias:
+        return SM100_BIAS_PADDED_TAIL_FORM_BY_TILE_N.get(int(tile_n), 0)
     return SM100_PADDED_TAIL_FORM_DEFAULT
 
 
@@ -3070,10 +3104,10 @@ def _make_cfg_small_d_sm100(params: TemplateParams, *, tile_k: int) -> Tuple[Cfg
     padded_tail_form = int(getattr(params, "padded_tail_form", 0))
     if padded_tail_form not in PADDED_TAIL_FORMS:
         raise ValueError(f"{tag}: padded_tail_form must be 0 (the legacy tail body) or 1 (the pre-masked tail); got {padded_tail_form}")
-    if padded_tail_form == 1 and (mask_flags != MASK_PADDED or bias_mode or kv_mask_form):
+    if padded_tail_form == 1 and (mask_flags != MASK_PADDED or kv_mask_form):
         raise ValueError(
-            f"{tag}: padded_tail_form=1 (the pre-masked tail) is wired on the f16/bf16 32- / 64-wide tiles' PLAIN padded body only "
-            f"(MASK_FLAGS == MASK_PADDED alone, no bias / kv_mask); got MASK_FLAGS={mask_flags}, bias_mode={bias_mode}, kv_mask_form={kv_mask_form}"
+            f"{tag}: padded_tail_form=1 (the pre-masked tail) is wired on the f16/bf16 32- / 64-wide tiles' padded body without a kv_mask only "
+            f"(MASK_FLAGS == MASK_PADDED alone; the plain or the bias body); got MASK_FLAGS={mask_flags}, kv_mask_form={kv_mask_form}"
         )
     dead_subtile_quiet = int(getattr(params, "dead_subtile_quiet", 0))
     if dead_subtile_quiet not in DEAD_SUBTILE_QUIET_FORMS:

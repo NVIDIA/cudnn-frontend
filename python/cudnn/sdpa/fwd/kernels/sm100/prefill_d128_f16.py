@@ -238,7 +238,7 @@ from cudnn.sdpa.fwd.config_d128_family import (
     BIAS_RING_STAGES,
     bias_smem_tiles,
 )
-from cudnn.sdpa.fwd.config_sm100 import sm100_bias_preload_chunks
+from cudnn.sdpa.fwd.config_sm100 import sm100_bias_preload_chunks, sm100_spin_ring_waits
 
 CGA_SIZE = CFG.CGA_M * CFG.CGA_N
 
@@ -271,8 +271,10 @@ FUSED_LDTM_STAT = int(PARAMS.fused_ldtm_stat)
 # CUPTI per-kernel medians, cuDNN 9.28 as the control): the d128 flavor wins on cc 10.0 and cc 10.3
 # alike, dense and causal, S=2K..32K; the d64 flavor (128x128x64, cga1, softmax-bound) read mixed
 # (dense / SWA slightly up, causal down on cc 10.0), so it keeps the sleeping form.  One constant,
-# never a literal at a call site.
-SPIN_RING_WAITS: bool = PARAMS.d_flavor == 128
+# never a literal at a call site.  The 32- / 64-wide small-tile forms inherited the d64 flavor's sleeping form un-A/B'd; their constant
+# comes from ``config_sm100.sm100_spin_ring_waits`` (the same per-flavor rule, plus the small tiles' process-local sweep seam
+# ``_SPIN_RING_WAITS_OVERRIDE_FOR_SWEEPS``, folded into the template-module key by ``sm100_sweep_seam_state``) so a GB200 A/B reads either form.
+SPIN_RING_WAITS: bool = sm100_spin_ring_waits(PARAMS.d_flavor)
 # Named-barrier id map of this kernel: 0 CTA-wide, 1 / 2 the TMEM-publish barriers (MMA with softmax / with
 # correction), 8 the wg0 -> wg1 softmax phase lock, 9 + sub / 11 + sub the two per-warpgroup PUBLISH FENCES below.
 # The fences (``named_barrier_fence``, 128 threads = the publishing warpgroup) sit right after the softmax's alpha
@@ -577,18 +579,28 @@ if CFG.S_SLOTS != 1 or CFG.Q_IN_TMEM or CFG.SOFTMAX_WARPGROUPS != 2:
         f"prefill_d128_f16_sm100: S_SLOTS={CFG.S_SLOTS} / Q_IN_TMEM={CFG.Q_IN_TMEM} / SOFTMAX_WARPGROUPS={CFG.SOFTMAX_WARPGROUPS}: the two-slot S, Q in TMEM and the "
         f"third softmax warp group are not wired on the SM100 file yet (one slot, Q in SMEM, two groups)"
     )
-# The PRE-MASKED padded tail (CFG.PADDED_TAIL_FORM == 1; the PLAIN padded body, MASK_FLAGS == MASK_PADDED alone -- the config factory refuses
-# it with a band, a bias or a kv_mask): ONE kv loop over the whole range with the UNMASKED body; on the tail kv tile the softmax warp first
-# rewrites its sub-tile's out-of-range S columns as -inf in TMEM (`_premask_padded_tail`) so the row max observes them masked.  The legacy
+# The PRE-MASKED padded tail (CFG.PADDED_TAIL_FORM == 1; MASK_FLAGS == MASK_PADDED alone and NO kv_mask -- the config factory refuses it with a
+# band or a kv_mask).  On the PLAIN padded body: ONE kv loop over the whole range with the UNMASKED body; on the tail kv tile the softmax warp
+# first rewrites its sub-tile's out-of-range S columns as -inf in TMEM (`_premask_padded_tail`) so the row max observes them masked.  The legacy
 # form (0, the SM100 default until measured) runs the tail tile through a SECOND, software-max body -- two full softmax bodies per warp
-# group in the rendering (the d32 padded rendering 4362 vs 2951 SASS lines dense).  No barrier row changes: the pre-mask sits inside the
-# body between the `mb_bmm1_done` wait and the P store, on the calling thread's own S columns.
+# group in the rendering (the d32 padded rendering 4362 vs 2951 SASS lines dense).  On the BIAS body (CFG.BIAS_MODE, no kv_mask; the Rubin
+# twin's arm): the -inf body (`_softmax_kv_body_inf`) renders its `apply_mask_chunk` at MASK_NONE (`_INF_BODY_MASK_FLAGS` below: the per-tile
+# band words, the R2P and the per-cell FSEL of the padding arm fold OUT of EVERY kv tile -- the word body paid them on every tile, +13..+20 %
+# per kv tile over the dense bias body on GB200) and runs the SAME pre-mask pass on the batch entry's tail tile (`tail_premask`, the one-batch-entry
+# item's `kv_loop >= bounds.unmasked_hi`: the last tile when the entry's length is off the tile multiple, never otherwise).  The bias FFMA reads
+# -inf through (`fma(bias, inv_scale, -inf) = -inf` for a finite bias: the form's contract, as on the Rubin twin), the software row max ignores -inf
+# while a valid column exists (the tail tile holds >= 1), `exp2(-inf * scale_log2 - m) = +0`: the word body's P and row sum from the same -inf
+# scores, with the dense bias body's instruction stream on every tile but the tail.  No barrier row changes on either body: the pre-mask sits
+# inside the body between the `mb_bmm1_done` wait and the first S load, on the calling thread's own S columns, ordered by one `tcgen05.wait::st`
+# (the MMA writes S[qs] again only for the next BMM1, after this body's `mb_bmm2_ready`); no SMEM buffer moves, the register split is unchanged.
 _PADDED_TAIL_PREMASK = CFG.PADDED_TAIL_FORM == 1
-if _PADDED_TAIL_PREMASK and (CFG.MASK_FLAGS != MASK_PADDED or _INF_MASK_ARM):
+if _PADDED_TAIL_PREMASK and (CFG.MASK_FLAGS != MASK_PADDED or _KV_MASK_ARM):
     raise ValueError(
-        f"prefill_d128_f16_sm100: PADDED_TAIL_FORM=1 is the PLAIN padded body's form (MASK_FLAGS == MASK_PADDED alone, no bias / kv_mask); got "
-        f"MASK_FLAGS={CFG.MASK_FLAGS}, BIAS_MODE={CFG.BIAS_MODE}, KV_MASK_FORM={CFG.KV_MASK_FORM}"
+        f"prefill_d128_f16_sm100: PADDED_TAIL_FORM=1 (the pre-masked tail) needs MASK_FLAGS == MASK_PADDED alone and no kv_mask (the plain or the "
+        f"bias body); got MASK_FLAGS={CFG.MASK_FLAGS}, BIAS_MODE={CFG.BIAS_MODE}, KV_MASK_FORM={CFG.KV_MASK_FORM}"
     )
+# The -inf body's mask flags: MASK_NONE (an identity `apply_mask_chunk`) when the padded tail is pre-masked in TMEM, else the config's.
+_INF_BODY_MASK_FLAGS = MASK_NONE if _PADDED_TAIL_PREMASK else CFG.MASK_FLAGS
 if CFG.DEAD_SUBTILE_QUIET:
     raise ValueError(
         f"prefill_d128_f16_sm100: PADDED_TAIL_FORM={CFG.PADDED_TAIL_FORM} / DEAD_SUBTILE_QUIET={CFG.DEAD_SUBTILE_QUIET} are not wired on the SM100 file yet"
@@ -2340,6 +2352,7 @@ def _softmax_kv_body_inf(
     sBias,
     kv_mask_tensor,
     bias_ring_state=None,
+    tail_premask=None,
 ):
     """The per-iter kv body of the BIAS / KV_MASK arms (CFG.BIAS_MODE or CFG.KV_MASK_FORM): every kv tile of the item takes this path.
     The Rubin twin's body on this file's plain ``_softmax_kv_body(apply_mask=True)`` skeleton (the same waits, publishes and fences;
@@ -2358,6 +2371,11 @@ def _softmax_kv_body_inf(
        max_k bias_row * (inv_scale * scale_log2)`` -- the raw chunk max from the fused ``tcgen05.ld.red...max`` on cc 10.3 and from the
        plain body's manual tree on cc 10.0 (no LDTM.STAT there), the bias row max in the packed 16-bit domain ahead of the wait; the
        software tree over the masked scores folds out.  Any m >= the true max is valid; the slack is the row's raw range in the tile.
+    5. CFG.PADDED_TAIL_FORM == 1 (the pre-masked tail on the BIAS body; ``tail_premask``, None = off, folded): the band mask of step 2 renders at
+       MASK_NONE (an identity: no words, no R2P, no per-cell FSEL on any tile) and on the batch entry's tail kv tile (``tail_premask``, a
+       warp-uniform runtime predicate the caller derives from the entry's length: ``kv_loop >= bounds.unmasked_hi``) the thread first rewrites
+       its out-of-range S columns as -inf in TMEM (``_premask_padded_tail``) right after the ``bmm1_done`` wait, so the loads of step 2 read
+       them masked; the bias FFMA keeps -inf, the row max and the exp2 see the word body's scores.
 
     ``kv_tile_rel`` = ``kv_loop - bounds.left``, the tile's index inside the resident block; ``block_row`` = the calling thread's row inside the
     256-row block (``sub_tile_id * TILE_M + tid_in_wg``).  Returns (total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase).
@@ -2403,6 +2421,11 @@ def _softmax_kv_body_inf(
     s_addr_base = tmem_base + cutlass.Int32(tmem_S_off)
     p_addr_base = tmem_base + cutlass.Int32(tmem_P_off)
     stats_addr = tmem_base + cutlass.Int32(stats_off)
+    if cutlass.const_expr(_PADDED_TAIL_PREMASK and tail_premask is not None):
+        # The pre-masked tail (CFG.PADDED_TAIL_FORM == 1, the bias body): on the batch entry's tail kv tile the out-of-range S columns of the
+        # thread's own row become -inf in TMEM before the loads below; every other tile runs the body untouched (a warp-uniform branch).
+        if tail_premask:
+            _premask_padded_tail(s_addr_base, q_abs, kv_loop, eff_seqlen_kv)
 
     # 2. Raw S chunk -> + bias (pre-scale) -> + the additive vector -> band mask AND kv_mask word (-inf) -> the row max: the software
     #    tree over the masked scores (CFG.BIAS_MAX_FORM 0) or the hardware upper bound (1).
@@ -2444,7 +2467,7 @@ def _softmax_kv_body_inf(
                 kv_col_base + cutlass.Int32(c * CHUNK),
                 eff_seqlen_kv,
                 CFG.WINDOW_LEFT,
-                CFG.MASK_FLAGS,
+                _INF_BODY_MASK_FLAGS,
                 N=CHUNK,
                 bottom_right=CFG.BOTTOM_RIGHT,
                 causal_diag=causal_diag,
@@ -2695,6 +2718,7 @@ def _softmax_warp_group(
                     sBias,
                     kv_mask_tensor,
                     bias_ring_state,
+                    tail_premask=(kv_loop >= bounds.unmasked_hi) if _PADDED_TAIL_PREMASK else None,
                 )
                 if cutlass.const_expr(_BIAS_STREAMED):
                     # One ring stage consumed per kv tile (the body waited and released it): advance in lockstep with the fill.

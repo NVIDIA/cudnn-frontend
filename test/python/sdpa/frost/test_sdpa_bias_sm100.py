@@ -101,9 +101,19 @@ def test_kernel_module_constants_and_the_not_yet_wired_backstops():
     with pytest.raises(ValueError, match="multicast bias ring"):
         _mod(bias_mode=3, bias_stages=2, n_chunk=2)
     tail = _mod(seq_kv_lens_present=True, padded_tail_form=1)
-    assert tail._PADDED_TAIL_PREMASK and not tail._INF_MASK_ARM
-    with pytest.raises(ValueError, match="PLAIN padded body"):
+    assert tail._PADDED_TAIL_PREMASK and not tail._INF_MASK_ARM and tail._INF_BODY_MASK_FLAGS == 0
+    # the pre-masked tail on the BIAS body (the Rubin twin's arm): the -inf body renders its band mask at MASK_NONE (the padding arm's words fold out
+    # of every kv tile; the tail tile is pre-masked in TMEM); a kv_mask is refused with either body (its keep words fold the length in already)
+    btail = _mod(seq_kv_lens_present=True, padded_tail_form=1, bias_mode=2, bias_stages=2)
+    assert btail._PADDED_TAIL_PREMASK and btail._BIAS_STREAMED and btail._INF_MASK_ARM and btail._INF_BODY_MASK_FLAGS == 0 and btail.CFG.MASK_FLAGS != 0
+    bword = _mod(seq_kv_lens_present=True, bias_mode=2, bias_stages=2)
+    assert not bword._PADDED_TAIL_PREMASK and bword._INF_BODY_MASK_FLAGS == bword.CFG.MASK_FLAGS != 0
+    with pytest.raises(ValueError, match="kv_mask"):
         _mod(seq_kv_lens_present=True, padded_tail_form=1, kv_mask_form=1)
+    with pytest.raises(ValueError, match="kv_mask"):
+        _mod(seq_kv_lens_present=True, padded_tail_form=1, bias_mode=2, bias_stages=2, kv_mask_form=1)
+    # the small tiles' ring-wait form: the shipped sleeping form (the d64 flavor's constant), never a literal
+    assert plain.SPIN_RING_WAITS is False and res.SPIN_RING_WAITS is False and btail.SPIN_RING_WAITS is False
     with pytest.raises(ValueError, match="pair item"):
         _mod(bias_mode=1, n_chunk=2)
     t64 = _mod(bias_mode=1, tile_n=64)
@@ -217,20 +227,39 @@ def test_adapter_check_support_is_the_rows_twin(_sm100_device_for_the_adapter, n
     assert params.bias_stages == _want_stages and params.s_slots == 1 and params.q_in_tmem == 0 and params.softmax_wgs == 2, (name, params)
 
 
-def test_padded_tail_form_pick_and_request_on_sm100(_sm100_device_for_the_adapter):
-    """The pre-masked tail is reached by request or by the sweep seam on the SM100 small tiles' PLAIN padded plans; the default stays 0; a plan with a
-    bias, a band, or one the d64 decode tile would take, is not eligible (a request there is a typed decline)."""
+def test_padded_tail_form_pick_and_request_on_sm100(_sm100_device_for_the_adapter, monkeypatch):
+    """The pre-masked tail is reached by request or by the sweep seam on the SM100 small tiles' padded plans WITHOUT a kv_mask -- the plain body
+    (default 0) and the BIAS body (the Rubin twin's arm; its knob-less default per KV tile width = ``SM100_BIAS_PADDED_TAIL_FORM_BY_TILE_N``); a
+    plan with a kv_mask, a band, or one the d64 decode tile would take, is not eligible (a request there is a typed decline)."""
     from cudnn.sdpa.fwd import config_sm100 as c0
 
     assert c0.sm100_padded_tail_form_pick(32, padded=True, has_bias=False, has_kv_mask=False) == 0
     assert c0.sm100_padded_tail_form_pick(32, padded=True, has_bias=False, has_kv_mask=False, request=1) == 1
-    assert c0.sm100_padded_tail_form_pick(32, padded=True, has_bias=True, has_kv_mask=False, request=1) == 0
+    # the BIAS body: a request and the seam are honoured at either width; the knob-less default reads the per-width table; a kv_mask / a band: 0
+    assert c0.sm100_padded_tail_form_pick(32, padded=True, has_bias=True, has_kv_mask=False, request=1) == 1
+    assert c0.sm100_padded_tail_form_pick(64, padded=True, has_bias=True, has_kv_mask=False, tile_n=64, request=1) == 1
+    for tn in (64, 128):
+        assert c0.sm100_padded_tail_form_pick(32, padded=True, has_bias=True, has_kv_mask=False, tile_n=tn) == c0.SM100_BIAS_PADDED_TAIL_FORM_BY_TILE_N[tn]
+        assert c0.sm100_padded_tail_form_pick(64, padded=True, has_bias=True, has_kv_mask=False, tile_n=tn) == c0.SM100_BIAS_PADDED_TAIL_FORM_BY_TILE_N[tn]
+    assert c0.sm100_padded_tail_form_pick(32, padded=True, has_bias=True, has_kv_mask=True, request=1) == 0
+    assert c0.sm100_padded_tail_form_pick(32, padded=True, has_bias=True, has_kv_mask=False, causal=True, request=1) == 0
+    assert c0.sm100_padded_tail_form_pick(32, padded=False, has_bias=True, has_kv_mask=False, request=1) == 0
+    monkeypatch.setattr(c0, "_PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS", 1)
+    assert c0.sm100_padded_tail_form_pick(32, padded=True, has_bias=True, has_kv_mask=False, tile_n=128) == 1
+    assert c0.sm100_padded_tail_form_pick(32, padded=True, has_bias=True, has_kv_mask=True) == 0, "the seam never reaches the kv_mask plan"
+    monkeypatch.setattr(c0, "_PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS", None)
     api = _api(s_q=256, s_kv=256, seq_kv_lens_present=True, padded_tail_form=1)
     assert api.check_support() is True and api.template_params().padded_tail_form == 1
     api0 = _api(s_q=256, s_kv=256, seq_kv_lens_present=True)
     assert api0.check_support() is True and api0.template_params().padded_tail_form == 0
+    # the bias body through the adapter: the request honoured (the resident block at S 256), the knob-less plan at its width's default
+    apib = _api(s_q=256, s_kv=256, seq_kv_lens_present=True, bias=(1, 4, 256, 256), padded_tail_form=1)
+    assert apib.check_support() is True and apib.template_params().padded_tail_form == 1 and apib.template_params().bias_mode != 0
+    apib0 = _api(s_q=256, s_kv=256, seq_kv_lens_present=True, bias=(1, 4, 256, 256))
+    assert apib0.check_support() is True
+    assert apib0.template_params().padded_tail_form == c0.SM100_BIAS_PADDED_TAIL_FORM_BY_TILE_N[apib0.template_params().tile_n]
     with pytest.raises((NotImplementedError, ValueError)):
-        _api(s_q=256, s_kv=256, seq_kv_lens_present=True, bias=(1, 4, 256, 256), padded_tail_form=1).check_support()
+        _api(s_q=256, s_kv=256, seq_kv_lens_present=True, bias=(1, 4, 256, 256), kv_mask=(2, 1, 1, 256), padded_tail_form=1).check_support()
     with pytest.raises((NotImplementedError, ValueError)):
         _api(d=64, s_q=128, s_kv=128, seq_kv_lens_present=True, padded_tail_form=1).check_support()  # the d64 decode tile's plan
 
@@ -539,6 +568,45 @@ def test_pre_masked_tail_matches_the_oracle_and_the_legacy_body_bitwise_on_sm100
     pre = _run(q, k, v, tile_n=tile_n, **kw)
     _t7._check(pre, ref)
     assert torch.equal(pre["o"], legacy["o"]) and torch.equal(pre["stats"], legacy["stats"]), (case, tile_n)
+
+
+# The BIAS body's pre-masked tail (the Rubin twin's arm, ledger A44; the sweep seam in-process): a padded bias row at D 32 / D 64 (the resident block,
+# the streamed ring across a wrap, a zero-length batch), both widths where the bias form fits -- against the oracle and BITWISE against the word body
+# (the same -inf scores: the pre-masked columns are the band words' columns, the bias FFMA reads -inf through, the software max and the exp2 see the
+# same values; the FFMA order on the live columns is unchanged).  D 64 at the 128-wide tile holds no bias form above S_kv 128 (declined typed): 64 only.
+# S_kv and every row length at a multiple of 8 (the COMPACT bias TMA's 16-byte rule: S 217 / 385 / 300 are typed declines of the row with a compact
+# bias -- the plain tail cases above carry them bias-less) and off the tile multiple at the width under test (a tail tile with 8..120 valid columns).
+_BIAS_TAIL_CASES = {
+    "bias_tail_216_zero_batch": dict(b=3, h=2, h_kv=2, s_q=216, s_kv=216, kv_lens=[216, 0, 104]),  # the resident block at both widths; a zero-length batch
+    "bias_tail_304_d64": dict(b=2, h=2, h_kv=2, s_q=256, s_kv=304, d=64, kv_lens=[304, 128]),  # the 64-wide cga-1 ring; one row at the tile multiple (no tail)
+    "bias_tail_392": dict(b=2, h=4, h_kv=4, s_q=392, s_kv=392, kv_lens=[392, 200]),  # the ring at both widths (2 st at 128, 3 st at 64); 8 valid tail columns
+    "bias_ring_tail_904_zero_batch": dict(b=3, h=2, h_kv=2, s_q=904, s_kv=904, kv_lens=[904, 0, 500]),  # the 2-stage ring across a wrap; a zero-length batch
+}
+_BIAS_TAIL_PAIRS = [
+    ("bias_tail_216_zero_batch", 128),
+    ("bias_tail_216_zero_batch", 64),
+    ("bias_tail_304_d64", 64),
+    ("bias_tail_392", 128),
+    ("bias_tail_392", 64),
+    ("bias_ring_tail_904_zero_batch", 128),
+]
+
+
+@requires_sm100_line
+@pytest.mark.parametrize("case,tile_n", _BIAS_TAIL_PAIRS, ids=[f"{c}-t{t}" for c, t in _BIAS_TAIL_PAIRS])
+def test_pre_masked_tail_on_the_bias_body_matches_the_oracle_and_the_word_body_bitwise_on_sm100(case, tile_n, monkeypatch):
+    from cudnn.sdpa.fwd import config_sm100 as c0
+
+    q, k, v, kw, ref = _t7._case_inputs(case, torch.bfloat16, table=_BIAS_TAIL_CASES)
+    kw.pop("cga", None)
+    assert kw["bias"] is not None
+    monkeypatch.setattr(c0, "_PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS", 0)
+    word = _run(q, k, v, tile_n=tile_n, **kw)
+    monkeypatch.setattr(c0, "_PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS", 1)
+    pre = _run(q, k, v, tile_n=tile_n, **kw)
+    assert word["knobs"].tile_n == pre["knobs"].tile_n == tile_n, (case, word["knobs"], pre["knobs"])
+    _t7._check(pre, ref)
+    assert torch.equal(pre["o"], word["o"]) and torch.equal(pre["stats"], word["stats"]), (case, tile_n)
 
 
 @requires_sm100_line

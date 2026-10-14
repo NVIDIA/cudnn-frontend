@@ -1102,14 +1102,11 @@ def validate_small_tile_masks(cfg, flavor: str) -> None:
                 f"EPILOGUE_GATE={getattr(cfg, 'EPILOGUE_GATE', 0)}); a bias arm kept quiet would skip the mb_bias_full wait its init count expects",
             ),
             (
-                not (
-                    int(getattr(cfg, "PADDED_TAIL_FORM", 0)) == 1
-                    and (cfg.MASK_FLAGS != MASK_PADDED or int(getattr(cfg, "BIAS_MODE", 0)) or int(getattr(cfg, "KV_MASK_FORM", 0)))
-                ),
-                f"{flavor}: PADDED_TAIL_FORM=1 (the pre-masked tail) needs MASK_FLAGS == MASK_PADDED alone and no bias / kv_mask -- its single HW-max "
-                f"loop has no masked segment for a band, and the -inf arms are one body already (got MASK_FLAGS={cfg.MASK_FLAGS}, "
-                f"BIAS_MODE={getattr(cfg, 'BIAS_MODE', 0)}, KV_MASK_FORM={getattr(cfg, 'KV_MASK_FORM', 0)}); a band's masked tail silently kept "
-                f"would read -inf on no column and the HW max would see the padding",
+                not (int(getattr(cfg, "PADDED_TAIL_FORM", 0)) == 1 and (cfg.MASK_FLAGS != MASK_PADDED or int(getattr(cfg, "KV_MASK_FORM", 0)))),
+                f"{flavor}: PADDED_TAIL_FORM=1 (the pre-masked tail) needs MASK_FLAGS == MASK_PADDED alone and no kv_mask -- the plain body's single "
+                f"HW-max loop and the bias body's MASK_NONE -inf loop have no masked segment for a band, and a kv_mask folds the length into its keep "
+                f"words already (got MASK_FLAGS={cfg.MASK_FLAGS}, KV_MASK_FORM={getattr(cfg, 'KV_MASK_FORM', 0)}); a band's masked tail silently kept "
+                f"would read -inf on no column and the row max would see the padding",
             ),
         ]
     )

@@ -136,6 +136,21 @@ def test_stages_kv_two_is_the_d64_at_128_budget_lever(monkeypatch):
     assert c0.sm100_sweep_seam_state() is None
     monkeypatch.setattr(c0, "_STAGES_KV_OVERRIDE_FOR_SWEEPS", 2)
     assert c0.sm100_sweep_seam_state() == ("sm100_sweep_seams", 2)
+    # the two module-constant seams (the bias pre-load, the small tiles' ring-wait form) append to the state when set and read back through their
+    # ONE readers; the d128 flavor keeps its measured spin form whatever the seam says
+    assert c0.sm100_spin_ring_waits(128) is True and c0.sm100_spin_ring_waits(64) is False and c0.sm100_spin_ring_waits(32) is False
+    monkeypatch.setattr(c0, "_SPIN_RING_WAITS_OVERRIDE_FOR_SWEEPS", True)
+    assert c0.sm100_sweep_seam_state() == ("sm100_sweep_seams", 2, ("bias_preload_chunks", None), ("spin_ring_waits", True))
+    assert c0.sm100_spin_ring_waits(64) is True and c0.sm100_spin_ring_waits(32) is True and c0.sm100_spin_ring_waits(128) is True
+    monkeypatch.setattr(c0, "_SPIN_RING_WAITS_OVERRIDE_FOR_SWEEPS", False)
+    monkeypatch.setattr(c0, "_STAGES_KV_OVERRIDE_FOR_SWEEPS", None)
+    monkeypatch.setattr(c0, "_BIAS_PRELOAD_CHUNKS_OVERRIDE_FOR_SWEEPS", 0)
+    assert c0.sm100_sweep_seam_state() == ("sm100_sweep_seams", None, ("bias_preload_chunks", 0), ("spin_ring_waits", False))
+    assert c0.sm100_bias_preload_chunks(64) == 0 and c0.sm100_spin_ring_waits(128) is True and c0.sm100_spin_ring_waits(64) is False
+    monkeypatch.setattr(c0, "_SPIN_RING_WAITS_OVERRIDE_FOR_SWEEPS", None)
+    monkeypatch.setattr(c0, "_BIAS_PRELOAD_CHUNKS_OVERRIDE_FOR_SWEEPS", None)
+    assert c0.sm100_sweep_seam_state() is None
+    monkeypatch.setattr(c0, "_STAGES_KV_OVERRIDE_FOR_SWEEPS", 2)
     assert c0.sm100_small_d_stages_kv(64, 1) == 2
     assert c0.sm100_bias_resident_tiles(64, 1, pair=True) == 3 and c0.sm100_bias_ring_stages(64, 1, pair=True) == 3
     cfg = c0.make_cfg_d64(TP(d_flavor=64, cta_mma=1, dtype_qkv=2, bias_mode=1, n_chunk=4))[0]
@@ -203,7 +218,7 @@ def test_the_small_tile_forms_build_with_the_sm100_geometry():
         (dict(d_flavor=64, cta_mma=1, dtype_qkv=2, bias_mode=1, pack_gqa=True, qh_per_kh=4), "dense, unsplit"),
         (dict(d_flavor=32, cta_mma=1, dtype_qkv=2, n_chunk=4), "needs bias_mode=1"),
         (dict(d_flavor=32, cta_mma=1, dtype_qkv=2, bias_mode=1, kv_mask_form=3, bias_max_form=1), "additive kv_mask vector"),
-        (dict(d_flavor=32, cta_mma=1, dtype_qkv=2, padded_tail_form=1), "PLAIN padded body"),
+        (dict(d_flavor=32, cta_mma=1, dtype_qkv=2, padded_tail_form=1), "MASK_FLAGS == MASK_PADDED alone"),  # a DENSE record: the pre-masked tail needs the padding arm (the plain or the bias body)
         (dict(d_flavor=32, cta_mma=1, dtype_qkv=2, bias_mode=1, dead_subtile_quiet=1), "one-batch-entry item without a bias"),
         (dict(d_flavor=32, cta_mma=1, dtype_qkv=2, q_in_tmem=1, cta_mma_=None), None),
     ],
@@ -219,7 +234,7 @@ def test_the_small_tile_forms_build_with_the_sm100_geometry():
         "pack_gqa_rides_the_d128_flavor",
         "pair_item_needs_a_bias",
         "hw_max_with_an_additive_vector",
-        "premasked_tail_needs_the_padded_plain_body",
+        "premasked_tail_needs_a_padded_body",
         "quiet_body_needs_no_bias",
         "q_in_tmem_builds",
     ],
