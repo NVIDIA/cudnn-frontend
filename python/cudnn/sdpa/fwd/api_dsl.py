@@ -60,6 +60,7 @@ from cudnn.sdpa.fwd.config_sm100 import SM100_BIAS_D_SHAPES as _SM100_BIAS_D_SHA
 from cudnn.sdpa.fwd.config_sm100 import sm100_bias_auto_cga as _sm100_bias_auto_cga
 from cudnn.sdpa.fwd.config_sm100 import sm100_bias_mode_pick as _sm100_bias_mode_pick
 from cudnn.sdpa.fwd.config_sm100 import sm100_bias_resident_s_kv_max as _sm100_bias_resident_s_kv_max
+from cudnn.sdpa.fwd.config_sm100 import sm100_bias_stages_pick as _sm100_bias_stages_pick
 
 # The SM100 line's device capabilities that serve the small tiles' bias / kv_mask arms (the sm100 row's sm 100..106 band: cc 10.0 and
 # 10.3); cc 10.7 is the Rubin row's.
@@ -1769,7 +1770,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # width (config_sm100.sm100_bias_mode_pick) when it is the resident block, else 0 (check_support declines typed; a ring REQUEST
             # is declined by name there).
             _mode = _sm100_bias_mode_pick(self.flavor[0], _cga, int(self.k_desc.shape[2]), request=self.bias_mode)
-            return _mode if _mode == _BIAS_MODE_RESIDENT else _BIAS_MODE_NONE
+            return _mode if _mode in (_BIAS_MODE_RESIDENT, _BIAS_MODE_STREAMED) else _BIAS_MODE_NONE
         return _sm107_bias_mode_pick(
             self.flavor[0],
             _cga,
@@ -1819,6 +1820,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         if self._resident_arm_bias_mode() not in _BIAS_STREAMED_MODES:
             return 0
         _cga = self._resident_arm_cga()
+        if self._device_cc != (10, 7):
+            # The SM100 line: the derived deepest ring at this width (config_sm100.sm100_bias_stages_pick; 2 at the 32-wide tile's
+            # one-batch-entry item), the request when it fits.
+            return _sm100_bias_stages_pick(self.flavor[0], _cga, request=self.bias_stages or 0)
         return _sm107_bias_stages_pick(
             self.flavor[0],
             _cga,
@@ -2573,8 +2578,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 # the streamed / multicast ring, the (n, n+1) pair item, the 64-wide KV tile and the fp32 additive vector WITH a bias (served
                 # at that tile only) are typed declines until they land -- the engine row's _bias_arm_decline is the twin (rule 8b).
                 self._not_implemented_error_if(
-                    self.bias_mode is not None and self.bias_mode != _BIAS_MODE_RESIDENT,
-                    f"bias_mode={self.bias_mode} (the streamed bias ring) is not on the SM100 file yet; the resident block (bias_mode=1) is",
+                    self.bias_mode == _BIAS_MODE_STREAMED_MULTICAST,
+                    f"bias_mode={self.bias_mode} (the multicast bias ring) is not on the SM100 file yet; the resident block (1) and the streamed ring (2) are",
                 )
                 self._not_implemented_error_if(
                     self.n_chunk is not None and self.n_chunk >= 1,
@@ -2633,8 +2638,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 _mode = self._resident_arm_bias_mode()
                 self._not_implemented_error_if(
                     self._device_cc != (10, 7) and _mode == _BIAS_MODE_NONE,
-                    f"no resident bias block holds S_kv {s_kv} at head-dim tile {self.flavor[0]} / cga {_bias_cga} on this arch line (the block holds "
-                    f"S_kv <= {_s_kv_max}); the streamed bias ring is not on the SM100 file yet",
+                    f"no bias form fits at head-dim tile {self.flavor[0]} / cga {_bias_cga} on this arch line for S_kv {s_kv}: the resident block holds "
+                    f"S_kv <= {_s_kv_max} and no 2-stage streamed ring of its tiles fits beside the operands (the pair item is not on the SM100 file yet)",
                 )
                 if _mode == _BIAS_MODE_STREAMED_MULTICAST:
                     # The multicast ring (a request, or the test seam): the PAIR item's ring at cga1 run as a cluster of two independent CTAs

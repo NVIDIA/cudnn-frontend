@@ -48,7 +48,8 @@ from cudnn.sdpa.fwd.config_sm100 import (
     supports_scalar_kv_tail_split,
     supports_paged_split_sink,
 )
-from cudnn.sdpa.fwd.config_sm100 import SM100_BIAS_D_SHAPES, SM100_DENSE_ONLY_D_SHAPES, SM100_SMALL_D_CGAS, sm100_bias_resident_s_kv_max
+from cudnn.sdpa.fwd.config_sm100 import SM100_BIAS_D_SHAPES, SM100_DENSE_ONLY_D_SHAPES, SM100_SMALL_D_CGAS, sm100_bias_mode_pick, sm100_bias_resident_s_kv_max
+from cudnn.sdpa.fwd.config_d128_family import BIAS_MODE_RESIDENT, BIAS_MODE_STREAMED
 from cudnn.sdpa.fwd import config_sm107 as _config_sm107
 from cudnn.sdpa.fwd.config_sm107 import (
     KV_MASK_ADDITIVE_GRANULE_ELEMS,
@@ -1105,12 +1106,14 @@ def _bias_arm_decline(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", kn
             widths = (knobs.cga,)
         else:
             widths = tuple(sorted(effective_cgas(capabilities, facts, knobs.split_kv if knobs is not None else None))) or (1,)
-        s_kv_max = {cga: sm100_bias_resident_s_kv_max(selected[0], cga) for cga in widths}
-        if not any(facts.s_kv <= m for m in s_kv_max.values()):
-            held = ", ".join(f"cga {cga}: S_kv <= {m}" for cga, m in s_kv_max.items())
+        # the budget pick per width: the resident block where it holds S_kv, else the streamed ring where >= 2 stages fit (the
+        # multicast form needs the pair item, not on the SM100 file yet); no form at any width = the typed decline
+        forms = {cga: sm100_bias_mode_pick(selected[0], cga, facts.s_kv) for cga in widths}
+        if not any(f in (BIAS_MODE_RESIDENT, BIAS_MODE_STREAMED) for f in forms.values()):
+            held = ", ".join(f"cga {cga}: resident S_kv <= {sm100_bias_resident_s_kv_max(selected[0], cga)}" for cga in widths)
             return (
-                f"no resident bias block holds S_kv {facts.s_kv} at head-dim tile {selected[0]} on this arch line ({held}); "
-                f"the streamed bias ring is not on the SM100 file yet"
+                f"no bias form fits at head-dim tile {selected[0]} on this arch line for S_kv {facts.s_kv} ({held}; no 2-stage streamed ring of "
+                f"its tiles fits beside the operands); the pair item is not on the SM100 file yet"
             )
         return None
     if capabilities.sm_lo != 107 or not facts.has_bias:

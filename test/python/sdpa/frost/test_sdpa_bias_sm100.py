@@ -49,6 +49,9 @@ def test_row_claims_the_resident_bias_on_the_derived_shapes_and_budgets():
     assert c0.sm100_bias_resident_s_kv_max(32, 1) == 256
     assert c0.sm100_bias_resident_s_kv_max(64, 1) == 0
     assert c0.sm100_bias_resident_s_kv_max(64, 2) == 128
+    # the streamed ring (the one-batch-entry item): 2 stages at the 32-wide tile's cga1, none at the 64-wide tile (cga1 holds no form, cga2 one tile)
+    assert c0.sm100_bias_ring_stages(32, 1) == 2 and c0.sm100_bias_ring_stages(64, 1) == 0 and c0.sm100_bias_ring_stages(64, 2) == 0
+    assert c0.sm100_bias_mode_pick(32, 1, 384) == 2 and c0.sm100_bias_mode_pick(32, 1, 256) == 1 and c0.sm100_bias_mode_pick(64, 2, 256) == 0
     # the heuristics' width pick = the row's: the narrowest width whose block holds S_kv
     assert c0.sm100_bias_auto_cga(32, 256, frozenset({1})) == 1
     assert c0.sm100_bias_auto_cga(64, 128, frozenset({1, 2})) == 2
@@ -75,8 +78,10 @@ def test_kernel_module_constants_and_the_not_yet_wired_backstops():
     assert res.BIAS_PRELOAD_CHUNKS == 0 and res.CFG.BIAS_EMPTY_ARRIVERS == 8
     mask = _mod(kv_mask_form=1, bias_max_form=1)
     assert mask._KV_MASK_BOOL and mask._HW_UPPER_MAX and not mask._BIAS_ARM and mask._INF_MASK_ARM
-    with pytest.raises(ValueError, match="streamed bias ring"):
-        _mod(bias_mode=2, bias_stages=2)
+    ring = _mod(bias_mode=2, bias_stages=2)
+    assert ring._BIAS_STREAMED and not ring._BIAS_RESIDENT and ring.CFG.STAGES_BIAS == 2 and ring._BIAS_GG.n_tiles == 2
+    with pytest.raises(ValueError, match="multicast bias ring"):
+        _mod(bias_mode=3, bias_stages=2, n_chunk=2)
     with pytest.raises(ValueError, match="pair item"):
         _mod(bias_mode=1, n_chunk=2)
     with pytest.raises(ValueError, match="64-wide KV tile"):
@@ -112,7 +117,9 @@ def _api(d=32, *, s_q=256, s_kv=256, b=2, h=4, h_kv=None, dtype=torch.bfloat16, 
 _ADAPTER_CELLS = [
     ("bias d32 S256 (the resident edge)", dict(bias=(1, 4, 256, 256)), True, (32, 32), 1, 0, 1),
     ("bias d32 S128 per batch", dict(s_q=128, s_kv=128, bias=(2, 4, 128, 128)), True, (32, 32), 1, 0, 1),
-    ("bias d32 S384 (no form on this line yet)", dict(s_q=384, s_kv=384, bias=(1, 4, 384, 384)), False, None, None, None, None),
+    ("bias d32 S384 -> the 2-stage streamed ring", dict(s_q=384, s_kv=384, bias=(1, 4, 384, 384)), True, (32, 32), 2, 0, 1),
+    ("bias d32 S1024 -> the streamed ring", dict(s_q=1024, s_kv=1024, bias=(1, 4, 1024, 1024)), True, (32, 32), 2, 0, 1),
+    ("bias_mode=2 request at S256 (honoured)", dict(bias=(1, 4, 256, 256), bias_mode=2), True, (32, 32), 2, 0, 1),
     ("bias d64 S128 -> cga2 block", dict(d=64, s_q=128, s_kv=128, bias=(1, 4, 128, 128)), True, (64, 64), 1, 0, 2),
     ("bias d64 S256 (no form on this line yet)", dict(d=64, s_q=256, s_kv=256, bias=(1, 4, 256, 256)), False, None, None, None, None),
     ("bias d64 S128 at a requested cga1 (holds no block)", dict(d=64, s_q=128, s_kv=128, bias=(1, 4, 128, 128), cga=1), False, None, None, None, None),
@@ -129,7 +136,8 @@ _ADAPTER_CELLS = [
         None,
         None,
     ),
-    ("bias_mode=2 request (the ring)", dict(bias=(1, 4, 256, 256), bias_mode=2), False, None, None, None, None),
+    ("bias_mode=3 request (the multicast ring)", dict(bias=(1, 1, 256, 256), bias_mode=3), False, None, None, None, None),
+    ("bias_stages=3 request (only 2 fit)", dict(s_q=384, s_kv=384, bias=(1, 4, 384, 384), bias_stages=3), False, None, None, None, None),
     ("n_chunk=2 request (the pair item)", dict(bias=(1, 1, 256, 256), n_chunk=2), False, None, None, None, None),
     ("tile_n=64 request", dict(bias=(1, 4, 256, 256), tile_n=64), False, None, None, None, None),
     ("softmax_wgs=3 request", dict(bias=(1, 1, 256, 256), softmax_wgs=3), False, None, None, None, None),
@@ -150,7 +158,7 @@ def test_adapter_check_support_is_the_rows_twin(_sm100_device_for_the_adapter, n
     params = api.template_params()
     assert (params.bias_mode, params.kv_mask_form) == (bias_mode, kv_mask_form), (name, params)
     assert params.d_flavor == flavor[0] and params.cta_mma == cta_mma and params.n_chunk == 0 and params.tile_n == 128, (name, params)
-    assert params.bias_stages == 0 and params.s_slots == 1 and params.q_in_tmem == 0 and params.softmax_wgs == 2, (name, params)
+    assert params.bias_stages == (2 if bias_mode == 2 else 0) and params.s_slots == 1 and params.q_in_tmem == 0 and params.softmax_wgs == 2, (name, params)
 
 
 # --------------------------------------------------------------------------- tier 3: the GPU cells (a cc 10.0 / 10.3 device)
@@ -179,7 +187,19 @@ _IN_BUDGET = [
     "causal_tail_100_padded_stride_bias",
 ]
 # Above the SM100 resident budget (the Rubin module streams or pairs these): a typed decline of the row on a real graph -- no FROST plan.
-_ABOVE_BUDGET = ["dense_nkv3_384", "causal_384", "bias_x10_causal_384", "d64_dense_256_cga2"]
+# The one-batch-entry item ABOVE the resident budget at the 32-wide tile: the 2-stage STREAMED ring (n_kv 3 = one stage past the ring, 4 = two
+# wraps, 5, 8 with a tail; the causal band; a padded zero-length batch on the ring: an empty item touches no ring row).
+_RING_CASES = {
+    "ring_dense_nkv3_384": dict(b=2, h=2, h_kv=2, s_q=384, s_kv=384),
+    "ring_causal_384": dict(b=1, h=4, h_kv=4, s_q=384, s_kv=384, causal=True),
+    "ring_x10_causal_384": dict(b=1, h=4, h_kv=4, s_q=384, s_kv=384, causal=True, bias_scale=10.0),
+    "ring_dense_nkv4_512": dict(b=2, h=2, h_kv=2, s_q=512, s_kv=512),
+    "ring_causal_nkv5_640": dict(b=2, h=2, h_kv=2, s_q=640, s_kv=640, causal=True),
+    "ring_padded_nkv8_tail_900_zero_batch": dict(b=3, h=2, h_kv=2, s_q=900, s_kv=900, kv_lens=[900, 0, 500]),
+    "ring_dense_nkv8_1024_head_broadcast": dict(b=2, h=2, h_kv=2, s_q=1024, s_kv=1024, bias="1"),
+}
+# No form at any width of the flavor's domain: the 64-wide tile's cga2 holds one tile and no ring; cga1 none -- a typed decline on real graphs.
+_ABOVE_BUDGET = ["d64_dense_256_cga2"]
 
 
 def _expected_cga(case):
@@ -351,10 +371,24 @@ def test_additive_kv_mask_vector_matches_the_fp64_oracle_on_sm100(dtype):
 
 
 @requires_sm100_line
+@pytest.mark.parametrize("case", list(_RING_CASES))
+@pytest.mark.parametrize("with_mask", [False, True], ids=["bias", "bias_and_mask"])
+def test_streamed_ring_matches_the_fp64_oracle_on_sm100(case, with_mask):
+    """The 2-stage streamed bias ring of the one-batch-entry item at the 32-wide tile (S_kv above the resident 256): the ring wrap axis
+    n_kv 3 / 4 / 5 / 8 (with a tail and a zero-length batch), the causal band, the magnitude cell, the head-broadcast form, with and without
+    the bit-word mask; the plan's record carries bias_mode 2 at cga1; O and Stats against the fp64 oracle, two launches bitwise."""
+    q, k, v, kw, ref = _t7._case_inputs(case, torch.bfloat16, kv_mask_p=0.3 if with_mask else None, table=_RING_CASES)
+    kw.pop("cga", None)
+    out = _run(q, k, v, **kw)
+    assert out["knobs"].cga == 1 and out["knobs"].tile_n == 128, (case, out["knobs"])
+    _t7._check(out, ref)
+
+
+@requires_sm100_line
 @pytest.mark.parametrize("case", _ABOVE_BUDGET)
 def test_declines_above_the_resident_budget_on_real_graphs(case):
-    """A bias graph the resident block does not hold at any width of the flavor's domain proposes NO plan of the row (the streamed ring is
-    not on the SM100 file yet) -- a typed decline on the real graph, never a plan that fails at build."""
+    """A bias graph no form holds at any width of the flavor's domain (the 64-wide tile at S_kv 256: cga2's block holds 128 and no ring fits)
+    proposes NO plan of the row -- a typed decline on the real graph, never a plan that fails at build."""
     q, k, v, kw, _ = _t7._case_inputs(case, torch.bfloat16)
     names = _frost_plan_names(q, k, v, kw)
     assert not any(n == _ROW or n.startswith(_ROW + "[") for n in names), (case, names)
