@@ -98,7 +98,7 @@ class SdpaBwdBinder : private FixedSdpaOperands {
         const auto workspace_end = end(workspace, workspace_bytes_);
         if (indices.size() != operands_.size()) invalid("incorrect native backward role indices");
         const auto facts            = read_native_operand_views(pack, indices);
-        const auto runtime_geometry = declared.is_none() ? py::tuple() : py::cast<py::tuple>(declared);
+        const auto runtime_geometry = declared.is_none() ? py::tuple() : py::tuple(declared);  // any sequence (#1631)
         if (!declared.is_none() && runtime_geometry.size() != operands_.size())
             invalid("incorrect standalone geometry count");
         int length_form = 0;
@@ -128,7 +128,7 @@ class SdpaBwdBinder : private FixedSdpaOperands {
             }
             if (!f.shape.empty()) {
                 if (!declared.is_none() && !runtime_geometry[i].is_none()) {
-                    const auto value = py::cast<py::tuple>(runtime_geometry[i]);
+                    const auto value = py::tuple(py::handle(runtime_geometry[i]));
                     auto shape       = py::cast<std::vector<int64_t>>(value[0]);
                     auto stride      = py::cast<std::vector<int64_t>>(value[1]);
                     if (geometry(f.shape, f.stride) != geometry(shape, stride))

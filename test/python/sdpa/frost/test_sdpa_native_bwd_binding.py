@@ -112,6 +112,21 @@ def test_standalone_uses_the_native_host_contract(arch, scale, monkeypatch):
     assert rebound[-1] == 31
 
 
+@pytest.mark.parametrize("arch", ["sm100", "sm107"])
+def test_standalone_geometry_accepts_lists(arch):
+    """#1631: the SM100/SM107 standalone callers pass the geometry as a list; nanobind's cast<tuple> rejected it."""
+    spec, native, facts, geometry, _ = _fixture(arch)
+    pack, indices = _pack(spec, facts), tuple(range(len(spec.operands)))
+    expected = native.bind(pack, indices, _WORKSPACE, 17, (), None, True, geometry)
+    as_lists = [None if g is None else [list(g[0]), list(g[1])] for g in geometry]
+    assert native.bind(pack, indices, _WORKSPACE, 17, (), None, True, as_lists) == expected
+    assert native.bind(pack, indices, _WORKSPACE, 17, (), None, True, list(geometry)) == expected
+    wrong = list(geometry)
+    wrong[0] = [list(wrong[0][0][::-1]), list(wrong[0][1])]
+    with pytest.raises(ValueError, match="runtime geometry"):
+        native.bind(pack, indices, _WORKSPACE, 17, (), None, True, wrong)
+
+
 @pytest.mark.parametrize("arch", ["sm80", "sm100", "sm107_thd"])
 @pytest.mark.parametrize("q_prefix,kv_prefix", [(False, False), (True, False), (False, True), (True, True)])
 def test_native_standalone_prefix_form_and_storage(arch, q_prefix, kv_prefix):
@@ -195,6 +210,28 @@ def test_backward_raw_storage_and_explicit_geometry(arch, role):
     assert list(_native(spec, native, dict(facts, **{role: same}), overridden=(i,))) == prep.bind(
         spec, dict(facts, **{role: same}), _WORKSPACE, 17, geometry=geometry, raw_storage=True
     )
+
+
+@pytest.mark.parametrize("arch", _ARCHES)
+def test_backward_native_binder_converts_sequence_geometry(arch):
+    # The standalone adapters hand ``bind`` their per-call geometry as a LIST of (shape, strides) pairs
+    # (``prepared_sm100.execute_standalone`` / ``prepared_sm107.execute_standalone``); the graph path builds tuples.  The native
+    # binder converts any sequence, as the Python binder does, instead of refusing a list with a C++ cast error before the
+    # geometry check runs.
+    spec, _, facts, declared, _ = _fixture(arch)
+    spec = replace(spec, native_binding=True)
+    expected = prep.bind(spec, facts, _WORKSPACE, 17, geometry=declared, raw_storage=True)
+    as_lists = [None if g is None else [list(g[0]), list(g[1])] for g in declared]
+    assert prep.bind(spec, facts, _WORKSPACE, 17, geometry=list(declared), raw_storage=True) == expected
+    assert prep.bind(spec, facts, _WORKSPACE, 17, geometry=as_lists, raw_storage=True) == expected
+    changed = dict(facts, q=facts["q"]._replace(shape=(facts["q"].span,), strides=(1,)))
+    with pytest.raises(ValueError, match="runtime geometry"):
+        prep.bind(spec, changed, _WORKSPACE, 17, geometry=as_lists, raw_storage=True)
+    with pytest.raises(ValueError, match="geometry count"):
+        prep.bind(spec, facts, _WORKSPACE, 17, geometry=as_lists[:-1], raw_storage=True)
+    # Something that is not a sequence is refused by Python's own TypeError, not by a C++ cast error.
+    with pytest.raises(TypeError):
+        prep.bind(spec, facts, _WORKSPACE, 17, geometry=7, raw_storage=True)
 
 
 @pytest.mark.parametrize("arch", _ARCHES)
