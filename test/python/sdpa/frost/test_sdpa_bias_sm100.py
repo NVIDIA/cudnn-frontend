@@ -135,13 +135,13 @@ _ADAPTER_CELLS = [
     ("bias_mode=2 request at S256 (honoured)", dict(bias=(1, 4, 256, 256), bias_mode=2), True, (32, 32), 2, 0, 1),
     ("bias d64 S128 -> cga2 block", dict(d=64, s_q=128, s_kv=128, bias=(1, 4, 128, 128)), True, (64, 64), 1, 0, 2),
     (
-        "bias d64 S256 -> the 64-wide tile by the budget rule (4 resident tiles... the ring: 4 > 3)",
+        "bias d64 S256 -> the 64-wide tile by the budget rule: the RESIDENT block at cga2 (4 tiles)",
         dict(d=64, s_q=256, s_kv=256, bias=(1, 4, 256, 256)),
         True,
         (64, 64),
-        2,
-        0,
         1,
+        0,
+        2,
     ),
     ("bias d64 S128 at a requested cga1 (holds no block)", dict(d=64, s_q=128, s_kv=128, bias=(1, 4, 128, 128), cga=1), False, None, None, None, None),
     ("kv_mask alone d32 S1024 (no budget)", dict(s_q=1024, s_kv=1024, kv_mask=(2, 1, 1, 1024)), True, (32, 32), 0, 1, 1),
@@ -519,12 +519,13 @@ def test_pre_masked_tail_matches_the_oracle_and_the_legacy_body_bitwise_on_sm100
 @pytest.mark.parametrize("case", _ABOVE_BUDGET)
 def test_d64_bias_above_128_lands_on_the_64_wide_tile_by_the_budget_rule(case):
     """A D 64 bias graph above S_kv 128 fits no form at the 128-wide tile (cga1 holds no block, cga2 one tile and no ring): the knob-less plan
-    takes the 64-wide KV tile by the budget rule -- tile_n 64, cga1, the 3-stage ring at S_kv 256 -- and matches the oracle (the Rubin cell ran
+    takes the 64-wide KV tile by the budget rule -- tile_n 64, the resident block at cga2 (four 64-wide tiles) -- and matches the oracle (the Rubin cell ran
     the same graph at the 128-wide tile's cga2 on its 320 KiB budget)."""
     q, k, v, kw, ref = _t7._case_inputs(case, torch.bfloat16)
     kw.pop("cga", None)  # the Rubin cell's cga2 request is the Rubin budget's; the knob-less pick is the point here
     out = _run(q, k, v, **kw)
-    assert out["knobs"].tile_n == 64 and out["knobs"].cga == 1, (case, out["knobs"])
+    # the budget pick prefers the resident block at cga2 (4 x 64 = 256 kv columns) over the cga1 ring (the budget table's row for the 64-wide tile)
+    assert out["knobs"].tile_n == 64 and out["knobs"].cga == 2, (case, out["knobs"])
     _t7._check(out, ref)
 
 
