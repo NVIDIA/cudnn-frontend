@@ -279,8 +279,8 @@ def place(spec, facts) -> str:
     qualified packed paged prefill, the measured dense shards, or dense d128 decode / verify with an
     attention sink inside its measured band; the SM107 MXFP8 row leads on exact cc 10.7 for every graph it
     admits (a qualification verdict, module docstring). Every unmeasured row (SM80, SM100 mxfp8, the
-    fp8 rows of SM107 / SM120) keeps the historical order -- those stay opt-in, so the order is only
-    observable with the flag set, which ranks ours first anyway."""
+    fp8 rows of SM107 / SM120, SM120 mxfp8) keeps the historical order -- those stay opt-in, so the order
+    is only observable with the flag set, which ranks ours first anyway."""
     if spec.name == "sdpa_fwd_prefill_sm107":
         return _place_sm107_f16(spec.capabilities, facts)
     if spec.name == "sdpa_fwd_prefill_sm107_mxfp8":

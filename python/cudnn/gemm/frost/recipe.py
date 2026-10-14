@@ -345,6 +345,39 @@ def _align_reject(recipe: GemmRecipe, operands) -> "str | None":
     return None
 
 
+def moe_weight_sf_reject(named_planes) -> str | None:
+    """Validate F8_128x4 weight SF before using its runtime expert stride.
+
+    Entries are (role, buffer, required_plane_bytes, num_experts). Each inner
+    plane is a dense byte blob, possibly larger than the blocked payload;
+    its axes may be permuted. Padding between planes is allowed. Requiring
+    an aligned pitch at least as large as the plane's span keeps every expert
+    read inside its own observed plane, including the last expert.
+    """
+    for role, buf, required, experts in named_planes:
+        shape, strides = tuple(buf.shape), tuple(buf.stride())
+        reason = None
+        if len(shape) != 3 or len(strides) != 3 or shape[0] != experts or any(s < 1 for s in shape):
+            reason = f"expected rank-3 shape [{experts}, ..., ...], got {shape}"
+        elif buf.element_size() != 1:
+            reason = "expected byte-sized scale factors"
+        else:
+            span = 1
+            for stride, extent in sorted((st, s) for s, st in zip(shape[1:], strides[1:]) if s > 1):
+                if stride != span:
+                    reason = f"each expert plane must be a dense byte run, got shape {shape} stride {strides}"
+                    break
+                span *= extent
+            if reason is None:
+                if span < required:
+                    reason = f"each expert plane has {span}B but the kernel reads {required}B"
+                elif strides[0] < span or strides[0] % 16:
+                    reason = f"expert stride {strides[0]}B must be a multiple of 16 and at least the {span}B plane span"
+        if reason is not None:
+            return f"block-scale F8_128x4 weight scale factors must have packed expert planes: {role}: {reason}"
+    return None
+
+
 def _sf_blob_reject(recipe: GemmRecipe, operands, axes, mnk) -> "str | None":
     """A block-scale SF reaches the kernel as a base pointer plus a layout the
     template re-synthesizes from M/N/K, so a blob that is not one dense byte run

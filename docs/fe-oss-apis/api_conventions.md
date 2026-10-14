@@ -9,8 +9,8 @@ the API pruning plan, not this document.
 
 ```
 cudnn.<op_name>_<direction>               # PyTorch
-cudnn.<op_name>_jax_<direction>           # JAX
-cudnn.<op_name>_standalone_<direction>    # no framework
+cudnn.<op_name>_<direction>_jax           # JAX
+cudnn.<op_name>_<direction>_standalone    # no framework
 ```
 
 - `<op_name>`: the operation in snake_case, such as `grouped_gemm_swiglu` or `sdpa`.
@@ -35,7 +35,7 @@ Each name is a function exported from the top-level `cudnn` package.
    clear error for an unsupported configuration.
 5. **No namespaces for ops.** Do not add op APIs under `cudnn.torch`,
    `cudnn.jax`, or an op package such as `cudnn.gemm`; a JAX variant is marked
-   by `_jax` in the name. Existing exports keep working until the API pruning
+   by a `_jax` suffix. Existing exports keep working until the API pruning
    plan retires them.
 
 ## Examples
@@ -44,12 +44,12 @@ Each name is a function exported from the top-level `cudnn` package.
 | --- | --- |
 | `cudnn.gemm.cutedsl.grouped.grouped_gemm_swiglu_wrapper_sm100` | `cudnn.grouped_gemm_swiglu_forward` |
 | `cudnn.gemm.cutedsl.grouped.GroupedGemmSwigluSm100` | none; use `cudnn.grouped_gemm_swiglu_forward` |
-| `cudnn.gemm.cutedsl.grouped.grouped_gemm_glu_jax_sm100` | `cudnn.grouped_gemm_glu_jax_forward` |
+| `cudnn.gemm.cutedsl.grouped.grouped_gemm_glu_jax_sm100` | `cudnn.grouped_gemm_glu_forward_jax` |
 | `cudnn.sdpa.fwd.sdpa_fwd_wrapper_dsl_sm100` | `cudnn.sdpa_forward` |
 | `cudnn.deepseek_sparse_attention.sparse_attention_backward_wrapper` | `cudnn.sparse_attention_backward` |
 | `cudnn.flex_attention.FlexAttentionBwd` | `cudnn.flex_attention_backward` |
 | `cudnn.rmsnorm_rht_amax.rmsnorm_rht_amax_wrapper_sm100` | `cudnn.rmsnorm_rht_amax_forward` |
 | `cudnn.torch.block_sparse_attention_forward` | `cudnn.block_sparse_attention_forward` |
-| `cudnn.jax.block_sparse_attention_forward` | `cudnn.block_sparse_attention_jax_forward` |
-| `cudnn.jax.kimi_delta_attention_fwd` | `cudnn.kimi_delta_attention_jax_forward` |
-| `cudnn.causal_conv1d_forward` (raw pointers) | `cudnn.causal_conv1d_standalone_forward` |
+| `cudnn.jax.block_sparse_attention_forward` | `cudnn.block_sparse_attention_forward_jax` |
+| `cudnn.jax.kimi_delta_attention_fwd` | `cudnn.kimi_delta_attention_forward_jax` |
+| `cudnn.causal_conv1d_forward` (raw pointers) | `cudnn.causal_conv1d_forward_standalone` |

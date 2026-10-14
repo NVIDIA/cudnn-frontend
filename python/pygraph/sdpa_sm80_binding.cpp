@@ -5,7 +5,7 @@
 
 #include "sdpa_fixed_binding.h"
 
-namespace py = pybind11;
+namespace py = nanobind;
 namespace cudnn_frontend {
 namespace python_bindings {
 namespace {
@@ -38,22 +38,22 @@ class SdpaSm80FwdBinder : private FixedSdpaOperands {
 
    public:
     explicit SdpaSm80FwdBinder(const py::object &spec)
-        : FixedSdpaOperands("sdpa_fwd_sm80", spec.attr("device_index").cast<int64_t>()),
+        : FixedSdpaOperands("sdpa_fwd_sm80", py::cast<int64_t>(spec.attr("device_index"))),
           fn_(spec.attr("fn")),
           owner_(spec.attr("artifact")),
-          scale_(spec.attr("scale").cast<double>()) {
+          scale_(py::cast<double>(spec.attr("scale"))) {
         const std::vector<std::string> roles{"q", "k", "v", "o", "stats", "seq_kv", "seq_q", "sink", "bias", "rope"};
-        const auto ops = spec.attr("operands").cast<py::tuple>();
+        const auto ops = py::cast<py::tuple>(spec.attr("operands"));
         if (ops.size() != 9 && ops.size() != roles.size()) invalid("invalid native forward operand declarations");
         for (size_t i = 0; i < ops.size(); ++i) {
             Carrier carrier;
             py::object declared = py::none();
             if (!ops[i].is_none()) {
-                auto shape         = ops[i].attr("shape").cast<std::vector<int64_t>>();
-                auto strides       = ops[i].attr("strides").cast<std::vector<int64_t>>();
+                auto shape         = py::cast<std::vector<int64_t>>(ops[i].attr("shape"));
+                auto strides       = py::cast<std::vector<int64_t>>(ops[i].attr("strides"));
                 declared           = py::make_tuple(shape, strides);
                 carrier.numel      = numel(shape);
-                carrier.contiguous = ops[i].attr("contiguous").cast<bool>();
+                carrier.contiguous = py::cast<bool>(ops[i].attr("contiguous"));
                 if (roles[i] == "bias") {
                     if (shape.size() != 4 || strides.size() != 4) invalid("invalid fixed bias declaration");
                     carrier.bias_plane = geometry(std::span(shape).subspan(1), std::span(strides).subspan(1));
@@ -73,13 +73,13 @@ class SdpaSm80FwdBinder : private FixedSdpaOperands {
          bool raw_storage) const {
         if (indices.size() != operands_.size()) invalid("incorrect native forward role indices");
         const auto facts = read_native_operand_views(pack, indices);
-        py::tuple frame(operands_.size() + 3);
+        py::list frame;
         for (size_t i = 0; i < operands_.size(); ++i) {
             const auto &op      = operands_[i];
             const auto &f       = facts[i];
             const auto &carrier = carriers_[i];
             if (!validate(op, f, op.name)) {
-                frame[i] = py::none();
+                frame.append(py::none());
                 continue;
             }
             if (!f.shape.empty()) {
@@ -100,18 +100,18 @@ class SdpaSm80FwdBinder : private FixedSdpaOperands {
                     invalid(op.name + " runtime geometry must match this fixed forward plan");
                 }
             }
-            frame[i] = py::int_(f.pointer);
+            frame.append(py::int_(f.pointer));
         }
-        const double current_scale = scale.is_none() ? scale_ : scale.cast<double>();
+        const double current_scale = scale.is_none() ? scale_ : py::cast<double>(scale);
         // The kernel folds the scale's sign into the scores at compile time (score_sign) and runs at |scale|, or 1 for
         // 0.
         if ((current_scale > 0) != (scale_ > 0) || (current_scale < 0) != (scale_ < 0))
             throw py::value_error("sdpa_fwd_sm80: attn_scale sign must match the compiled plan's");
-        const double kernel_scale   = current_scale == 0.0 ? 1.0 : std::fabs(current_scale);
-        frame[operands_.size()]     = py::float_(kernel_scale * 1.4426950408889634);
-        frame[operands_.size() + 1] = py::float_(1.0 / kernel_scale);
-        frame[operands_.size() + 2] = py::int_(stream);
-        return frame;
+        const double kernel_scale = current_scale == 0.0 ? 1.0 : std::fabs(current_scale);
+        frame.append(py::float_(kernel_scale * 1.4426950408889634));
+        frame.append(py::float_(1.0 / kernel_scale));
+        frame.append(py::int_(stream));
+        return py::tuple(frame);
     }
 
     void
@@ -122,8 +122,8 @@ class SdpaSm80FwdBinder : private FixedSdpaOperands {
             const std::vector<int64_t> &overridden,
             bool raw_storage) const {
         const auto frame = bind(pack, indices, stream, scale, overridden, raw_storage);
-        auto result      = py::reinterpret_steal<py::object>(PyObject_CallObject(fn_.ptr(), frame.ptr()));
-        if (!result) throw py::error_already_set();
+        auto result      = py::steal<py::object>(PyObject_CallObject(fn_.ptr(), frame.ptr()));
+        if (!result) throw py::python_error();
     }
 };
 }  // namespace
@@ -132,8 +132,22 @@ void
 init_sdpa_sm80_binding(py::module_ &m) {
     py::class_<SdpaSm80FwdBinder>(m, "_SdpaSm80FwdBinder")
         .def(py::init<const py::object &>())
-        .def("bind", &SdpaSm80FwdBinder::bind)
-        .def("execute", &SdpaSm80FwdBinder::execute);
+        .def("bind",
+             &SdpaSm80FwdBinder::bind,
+             py::arg("pack"),
+             py::arg("indices"),
+             py::arg("stream"),
+             py::arg("scale").none(),
+             py::arg("overridden"),
+             py::arg("raw_storage"))
+        .def("execute",
+             &SdpaSm80FwdBinder::execute,
+             py::arg("pack"),
+             py::arg("indices"),
+             py::arg("stream"),
+             py::arg("scale").none(),
+             py::arg("overridden"),
+             py::arg("raw_storage"));
 }
 }  // namespace python_bindings
 }  // namespace cudnn_frontend

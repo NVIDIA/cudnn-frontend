@@ -3,7 +3,7 @@
 
 """Engine-agnostic linear-attention graph analysis from ``graph.nodes`` to :class:`LaGraphFacts`.
 
-One analyzer serves the LA families (gdn / kda / gdn2 / gdp, single dedicated
+One analyzer serves the LA families (gdn / kda / gdn2 / gdp / mamba2, single dedicated
 nodes sharing the THD port vocabulary). :func:`analyze` is the callable each
 family names in ``engines/manifest.py``; PLANNING runs it once per frozen
 graph and attaches the record, so the family's engines read that same record
@@ -49,6 +49,10 @@ LA_NODE_OPS = {
     cudnn.NodeType.GDP_BWD: ("GDP", True),
     cudnn.NodeType.GDP_SUMMARY: ("GDP_SUMMARY", False),
     cudnn.NodeType.GDP_SUMMARY_BWD: ("GDP_SUMMARY", True),
+    cudnn.NodeType.MAMBA2: ("MAMBA2", False),
+    cudnn.NodeType.MAMBA2_BWD: ("MAMBA2", True),
+    cudnn.NodeType.MAMBA2_SUMMARY: ("MAMBA2_SUMMARY", False),
+    cudnn.NodeType.MAMBA2_SUMMARY_BWD: ("MAMBA2_SUMMARY", True),
 }
 
 
@@ -65,7 +69,7 @@ class LaGraphFacts:
 
     invalid: Optional[str] = None
 
-    op: str = ""  # "GDN" | "KDA" | "GDN2" | "GDP" | the family + "_SUMMARY"
+    op: str = ""  # "GDN" | "KDA" | "GDN2" | "GDP" | "MAMBA2" | the family + "_SUMMARY"
     is_bwd: bool = False
 
     # geometry (THD; zeros when the port ranks are not declared)
@@ -90,6 +94,7 @@ class LaGraphFacts:
     w_dtype: Any = None
     cu_dtype: Any = None
     a_log_dtype: Any = None
+    a_dtype: Any = None
     dt_bias_dtype: Any = None
     do_dtype: Any = None
     state_checkpoints_dtype: Any = None
@@ -107,6 +112,7 @@ class LaGraphFacts:
     dw_dtype: Any = None
     d_initial_state_dtype: Any = None
     d_a_log_dtype: Any = None
+    da_dtype: Any = None
     d_dt_bias_dtype: Any = None
 
     # ports present / requested
@@ -133,6 +139,20 @@ class LaGraphFacts:
     overwrite_initial_state: bool = False
     num_householder: int = 1
 
+    # Mamba-2 (the gate is dt; the decay rate ``a`` (A) is a required port; D skip and z gate are optional fusions)
+    has_d: bool = False
+    d_per_channel: bool = False
+    d_dtype: Any = None
+    has_z: bool = False
+    z_dtype: Any = None
+    wants_pre_gate: bool = False
+    o_pre_dtype: Any = None
+    dd_dtype: Any = None
+    dz_dtype: Any = None
+    dt_softplus: bool = True
+    dt_min: float = 0.0
+    dt_max: float = float("inf")
+
 
 def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
     """Facts for a single-LA graph, or None if the graph is anything else.
@@ -151,10 +171,12 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
     is_summary = op.endswith("_SUMMARY")
     ins, outs, params = node.inputs, node.outputs, node.params
 
+    is_mamba2 = op in ("MAMBA2", "MAMBA2_SUMMARY")
+    strength = "a" if is_mamba2 else "beta"
     if is_summary:
-        required_in = ["q", "k", "g", "beta", "cu_seqlens"] if is_bwd else ["k", "v", "g", "beta", "cu_seqlens"]
+        required_in = ["q", "k", "g", strength, "cu_seqlens"] if is_bwd else ["k", "v", "g", strength, "cu_seqlens"]
     else:
-        required_in = ["q", "k", "v", "g", "beta", "cu_seqlens"]
+        required_in = ["q", "k", "v", "g", strength, "cu_seqlens"]
     if op == "GDN2" or (op == "GDN2_SUMMARY" and not is_bwd):
         required_in.append("w")
     if is_bwd:
@@ -162,9 +184,12 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
     if is_summary:
         required_out = ["d_initial_state"] if is_bwd else ["final_state"]
     else:
-        required_out = (["dQ", "dK", "dV", "dG", "dBeta"] + (["dW"] if op == "GDN2" else [])) if is_bwd else ["O"]
+        bwd_out = ["dQ", "dK", "dV", "dG", "dA"] if is_mamba2 else ["dQ", "dK", "dV", "dG", "dBeta"] + (["dW"] if op == "GDN2" else [])
+        required_out = bwd_out if is_bwd else ["O"]
 
-    safe_gate = bool(params.get("safe_gate", False))
+    # Mamba-2's decay is the safe-gate transform on A itself and the write strength is the softplus itself
+    safe_gate = True if is_mamba2 else bool(params.get("safe_gate", False))
+    parameter_gradients = (("dA", "a"), ("d_dt_bias", "dt_bias")) if is_mamba2 else (("d_a_log", "a_log"), ("d_dt_bias", "dt_bias"))
     gate_domain = params.get("gate_domain") or "log"
     checkpoint = int(params.get("checkpoint_every_n_tokens", 0) or 0)
     num_householder = params.get("num_householder", 1)
@@ -197,12 +222,12 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         invalid = f"gate_domain must be 'log' or 'linear', got {gate_domain!r}"
     elif gate_domain == "linear" and safe_gate:
         invalid = "gate_domain='linear' cannot combine with safe_gate=True (the safe-gate transform takes raw logits)"
-    elif ("d_a_log" in outs or "d_dt_bias" in outs) and not is_bwd:
-        invalid = "d_a_log/d_dt_bias are outputs of a bwd node"
-    elif is_bwd and not is_summary and any((d in outs) != (p in ins) for d, p in (("d_a_log", "a_log"), ("d_dt_bias", "dt_bias"))):
-        invalid = "d_a_log is present iff a_log is, and d_dt_bias iff dt_bias"
-    elif is_bwd and any(list(outs[d].dim or []) != list(ins[p].dim or []) for d, p in (("d_a_log", "a_log"), ("d_dt_bias", "dt_bias")) if d in outs):
-        invalid = "d_a_log/d_dt_bias dims must match a_log/dt_bias"
+    elif any(d in outs for d, _ in parameter_gradients) and not is_bwd:
+        invalid = f"{'/'.join(d for d, _ in parameter_gradients)} are outputs of a bwd node"
+    elif is_bwd and not is_summary and any((d in outs) != (p in ins) for d, p in parameter_gradients):
+        invalid = " and ".join(f"{d} is present iff {p} is" for d, p in parameter_gradients)
+    elif is_bwd and any(list(outs[d].dim or []) != list(ins[p].dim or []) for d, p in parameter_gradients if d in outs):
+        invalid = "parameter gradient dims must match their parameters: " + ", ".join(f"{d}/{p}" for d, p in parameter_gradients)
     elif params.get("gate_lower_bound") is not None and not safe_gate:
         invalid = "gate_lower_bound requires safe_gate=True"
     elif checkpoint < 0:
@@ -221,6 +246,20 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         invalid = "allow_neg_eigval requires use_beta_sigmoid=True (the 2x rides on the fused sigmoid)"
     elif num_householder < 1:
         invalid = "num_householder must be a positive integer"
+    elif is_mamba2 and "beta" in ins:
+        invalid = "MAMBA2 has no beta port (the write strength is dt itself)"
+    elif is_mamba2 and ins.get("d") is not None and ins["d"].dim and len(ins["d"].dim) not in (1, 2):
+        invalid = "MAMBA2 d must be [HO] (per head) or [HO, V] (per channel)"
+    elif is_mamba2 and "O_pre" in (outs if not is_bwd else ins) and "z" not in ins:
+        invalid = "the pre-gate output O_pre exists only with the z gate"
+    elif is_mamba2 and is_bwd and "z" in ins and "O_pre" not in ins:
+        invalid = "the z-gate backward needs the forward's pre-gate output O_pre"
+    elif is_mamba2 and not is_bwd and not is_summary and bool(params.get("output_pre_gate", False)) and "O_pre" not in outs:
+        invalid = "output_pre_gate requires the O_pre output"
+    elif is_mamba2 and float(params.get("dt_min", 0.0) or 0.0) > float(
+        params.get("dt_max", float("inf")) if params.get("dt_max") is not None else float("inf")
+    ):
+        invalid = "dt_min must not exceed dt_max"
     elif op == "GDP" and ins["q"].dim and any(t.dim and int(t.dim[0]) != int(ins["q"].dim[0]) * num_householder for t in (ins["k"], ins["v"], ins["beta"])):
         invalid = "GDP k/v/beta rows must equal q rows * num_householder (the sub-token expansion)"
     elif op == "GDP" and ins["q"].dim and any(t is not None and t.dim and int(t.dim[0]) != int(ins["q"].dim[0]) for t in (ins["g"], ins.get("dO"))):
@@ -277,7 +316,7 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
     if checkpoint_port is None:
         checkpoint_port = outs.get("state_checkpoints")
     state_checkpoint_rows = int(checkpoint_port.dim[0]) if checkpoint_port is not None and checkpoint_port.dim else 0
-    gates_at_ho = all(t is None or not t.dim or (len(t.dim) > 1 and int(t.dim[1]) == h_o) for t in (ins["g"], ins["beta"], ins.get("w")))
+    gates_at_ho = all(t is None or not t.dim or (len(t.dim) > 1 and int(t.dim[1]) == h_o) for t in (ins["g"], ins.get("beta"), ins.get("w")))
     gate_channels = int(ins["g"].dim[2]) if ins["g"].dim and len(ins["g"].dim) == 3 else 0
     if is_summary:
         io_dtypes = ({in_dt["q"], in_dt["k"]} if is_bwd else {in_dt["k"], in_dt["v"]}) - {None}
@@ -304,10 +343,11 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         io_dtype=in_dt["k"] if is_summary else in_dt["q"],
         uniform_io=len(io_dtypes) <= 1,
         g_dtype=in_dt["g"],
-        beta_dtype=in_dt["beta"],
+        beta_dtype=in_dt.get("beta"),
         w_dtype=in_dt.get("w"),
         cu_dtype=in_dt["cu_seqlens"],
         a_log_dtype=in_dt.get("a_log"),
+        a_dtype=in_dt.get("a"),
         dt_bias_dtype=in_dt.get("dt_bias"),
         do_dtype=in_dt.get("dO"),
         state_checkpoints_dtype=in_dt.get("state_checkpoints"),
@@ -325,6 +365,7 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         dw_dtype=out_dt.get("dW"),
         d_initial_state_dtype=out_dt.get("d_initial_state"),
         d_a_log_dtype=out_dt.get("d_a_log"),
+        da_dtype=out_dt.get("dA"),
         d_dt_bias_dtype=out_dt.get("d_dt_bias"),
         has_initial_state="initial_state" in ins,
         has_state_indices="state_indices" in ins,
@@ -346,4 +387,16 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         batch_invariant=batch_invariant,
         overwrite_initial_state=overwrite_initial_state,
         num_householder=num_householder,
+        has_d="d" in ins,
+        d_per_channel=bool(ins["d"].dim and len(ins["d"].dim) == 2) if "d" in ins else False,
+        d_dtype=in_dt.get("d"),
+        has_z="z" in ins,
+        z_dtype=in_dt.get("z"),
+        wants_pre_gate="O_pre" in outs,
+        o_pre_dtype=out_dt.get("O_pre"),
+        dd_dtype=out_dt.get("dD"),
+        dz_dtype=out_dt.get("dZ"),
+        dt_softplus=bool(params.get("dt_softplus", True) if params.get("dt_softplus") is not None else True),
+        dt_min=float(params.get("dt_min", 0.0) or 0.0),
+        dt_max=float(params.get("dt_max")) if params.get("dt_max") is not None else float("inf"),
     )

@@ -20,7 +20,7 @@ from cutlass.cute.runtime import from_dlpack
 
 from cudnn.frost.device import current_device
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fmul2, fp32_to_fp16, l2norm_inv, lane_group_sum
-from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
+from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
 from cudnn.frost.tile_dsl.tma import ld_global_v4, st_global, st_global_v4
 
 USE_PDL = True
@@ -129,8 +129,6 @@ def frost_l2norm_qk(
             if cutlass.const_expr(mInvK is not None):
                 if lane_idx == cutlass.Int32(0):
                     st_global(nrm_addrs[r], inv, cutlass.Float32)
-    if cutlass.const_expr(USE_PDL):
-        launch_dependent_grids()
 
 
 @cute.jit

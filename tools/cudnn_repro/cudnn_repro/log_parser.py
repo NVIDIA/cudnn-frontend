@@ -40,7 +40,14 @@ def _parse_tensor_dump(line: str) -> Optional[Tuple[int, List[int]]]:
     match = TENSOR_DUMP_PATTERN.search(line)
     if match is None:
         return None
-    return int(match.group(1)), [int(value) for value in json.loads(match.group(2))]
+    try:
+        values = json.loads(match.group(2))
+    except (json.JSONDecodeError, ValueError):
+        return None
+    # Require exact integers: int() would truncate 1.5, accept True, and raise OverflowError on 1e10000.
+    if not isinstance(values, list) or any(type(value) is not int for value in values):
+        return None
+    return int(match.group(1)), values
 
 
 def _apply_tensor_dumps(entry: Tuple[str, dict], tensor_dumps_by_uid: Dict[int, List[int]]) -> Tuple[str, dict]:

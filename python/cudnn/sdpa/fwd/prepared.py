@@ -109,7 +109,12 @@ def _quant_spec(api):
     sizes = ()
     if getattr(api, "_prepared_mxfp8", False):
         km = api._k_mod
-        sizes = (km.SF_SMEM_SIZE_Q, km.SF_SMEM_SIZE_K) + (() if getattr(api, "pv_bf16", False) else (km.SF_SMEM_SIZE_V,))
+        # A template compiled per head geometry (SM120) sizes its scale tiles from
+        # the head dims; fixed-geometry templates carry them as module constants.
+        if hasattr(km, "mxfp8_sf_sizes"):
+            sizes = km.mxfp8_sf_sizes(int(api.head_dim_qk), int(api.head_dim_v))
+        else:
+            sizes = (km.SF_SMEM_SIZE_Q, km.SF_SMEM_SIZE_K) + (() if getattr(api, "pv_bf16", False) else (km.SF_SMEM_SIZE_V,))
     return QuantizedLaunchSpec(bool(api.has_amax_o), api._prepared_quant_offset(), sizes, block)
 
 
@@ -177,6 +182,7 @@ class ThdLaunchSpec:
         "paged_hnd",
         "decl",
         "expect",
+        "gate_expect",
         "has_lse",
         "has_sink",
         "lse_padded",
@@ -209,7 +215,7 @@ _FILLED_AT_BUILD = frozenset(
 )
 _FILLED_PER_CALL = frozenset(
     "q_ptr k_ptr v_ptr o_ptr lse_ptr sinks_ptr meta_ptr o_desc_ptr problem_size k_strides v_strides lse_ext n_pages thd_q_lens_ptr thd_kv_lens_ptr "
-    "block_table_ptr block_table_v_ptr table_strides table_v_strides stream".split()
+    "block_table_ptr block_table_v_ptr table_strides table_v_strides gate_ptr gate_strides stream".split()
 )
 
 
@@ -278,6 +284,13 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     s.paged_hnd = _compiled_paged_hnd(api) if s.paged else False
     s.decl = dict(q=plan.q, k=plan.k, v=plan.v, o=plan.o)  # (h, d, token_stride, head_stride, elem_stride, row_span)
     s.expect = {n: str(getattr(api, f"{n}_desc").dtype).split(".")[-1] for n in ("q", "k", "v", "o")}
+    # The kernel's epilogue gate on a THD plan (the f16/bf16 d256 prefill is the only THD body with the gate seams; it
+    # maps G through the same packed [1, T, H, D] form as Q / O): G is a PER-CALL operand the native binder validates and
+    # binds like Q / O -- the template keeps gate_ptr / gate_strides at None and the binder fills them from the gate's
+    # own pack index.  Every other THD plan has no gate (api.check_support declines the quantized THD bodies by name).
+    s.gate_expect = str(api.gate_desc.dtype).split(".")[-1] if getattr(api, "gate_desc", None) is not None else None
+    if s.gate_expect is not None:
+        s.decl["gate"] = api._thd_decl(api.gate_desc)
     s.has_lse, s.has_sink = api.lse_desc is not None, bool(api.has_sink)
     s.lse_padded, s.lse_head_major = bool(api.thd_stats_padded), bool(api.thd_stats_head_major)
     s.lse_head_stride = int(api.thd_stats_head_stride or 0)
@@ -333,7 +346,7 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     put("table_strides", (0, 0))
     put("table_v_strides", (0, 0) if s.paged else None)
     put("n_pages", 0)
-    put("gate_ptr", None)  # gate-capable hosts declare the slots; the prepared domain excludes the gate
+    put("gate_ptr", None)  # gate-capable hosts declare the slots; a GATED plan's binder fills both per call (s.gate_expect)
     put("gate_strides", (0, 0, 0))
     split_slots = {"lse_partial_ptr", "partial_o_strides"} if s.split_workspace is not None else set()
     unfilled = sorted(set(order) - _FILLED_AT_BUILD - _FILLED_PER_CALL - _quant_slots(s.quant) - split_slots)
@@ -344,6 +357,12 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     # contract must fail here, never silently choose a Python implementation.
     from cudnn import _pybind_module
 
+    if s.gate_expect is not None and not getattr(_pybind_module._SdpaThdBinder, "supports_epilogue_gate", False):
+        # The binder of an older extension has no gate role: a gated THD plan would launch with a null gate pointer.
+        raise NotImplementedError(
+            "cudnn.sdpa: the prepared THD binder of this build has no epilogue-gate role (the pybind extension predates the THD gate "
+            "descriptor); rebuild the extension, or run the gate as its own stage"
+        )
     s.native = _pybind_module._SdpaThdBinder(s)
     return s
 
@@ -384,16 +403,24 @@ def _native_pack_from_facts(facts, roles=_NATIVE_THD_ROLES):
     return _pybind_module._native_pack_from_facts(facts, roles, _buffers.DTYPES, _buffers.DTYPE_ITEMSIZE)
 
 
-def execute_native_thd_tensors(spec, buffers, workspace_ptr, stream, scale, *, lse_bhs_geometry=None):
+def execute_native_thd_tensors(spec, buffers, workspace_ptr, stream, scale, *, lse_bhs_geometry=None, gate=None):
     """Standalone observation, shared native validation/launch with graph.execute.
 
     Each invocation owns its pack and frame. Frameworks without the DLPack
     exchange API use the existing tensor observer only for the unread buffers.
+    ``gate`` (appended): the epilogue gate G of a gated THD plan (``spec.gate_expect``), observed as one more operand
+    of the pack OUTSIDE the role tuple and handed to the binder by its index -- the binder validates it like Q / O
+    (dtype, device, alignment, declared strides, a capacity covering the packed Q tokens) and refuses a gate on an
+    ungated plan or a missing one on a gated plan.
     """
     from cudnn import _pybind_module
 
     roles = _NATIVE_THD_ROLES + _native_quant_roles(getattr(spec, "quant", None))
     buffers = tuple(buffers) + (None,) * (len(roles) - len(buffers))
+    gate_index = -1
+    if gate is not None:
+        gate_index = len(buffers)
+        buffers = buffers + (gate,)
     pack, unread = _pybind_module._read_buffer_sequence(buffers)
     for index in unread:
         _set_native_fact(pack, index, facts_of_tensor(buffers[index]))
@@ -404,6 +431,8 @@ def execute_native_thd_tensors(spec, buffers, workspace_ptr, stream, scale, *, l
             # Standalone BHS and packed TH1 can have identical shapes at S=1.
             # Disambiguate metadata using the declaration, without a tensor view.
             _set_native_fact(pack, 6, lse._replace(shape=(*lse.shape, 1), strides=(*lse.strides, 1)))
+    if gate_index >= 0:
+        return spec.native.execute(pack, tuple(range(len(roles))), workspace_ptr, stream, scale, gate_index)
     return spec.native.execute(pack, tuple(range(len(roles))), workspace_ptr, stream, scale)
 
 

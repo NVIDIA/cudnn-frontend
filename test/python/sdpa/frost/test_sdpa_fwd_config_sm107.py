@@ -1,0 +1,746 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""``cudnn.sdpa.fwd.config_sm107.make_cfg_d256_sparse`` -- the Rubin index-list sparse d256 forward config, host-only.
+
+The config is a set of CLAIMS about a kernel body (warp count, arriver counts, ring depths, SMEM starts, the register split);
+the body cannot check them at run time, so a disagreement is undefined behaviour: an unreachable mbarrier init HANGS at every
+shape, a stale ring slot is a SILENT wrong answer, an SMEM overflow clobbers the last buffer with an exact LSE.  Every
+REACHABLE predicate of ``_validate_cfg_d256_sparse`` therefore gets ONE raising case here (``pytest.raises(ValueError,
+match=...)`` on the failure signature its message carries), the three predicates that are unreachable by construction get a
+simulated one (a misaligned layout; the whole predicate table on an oversized box), an in-module coverage check pins that the
+rows reach EVERY predicate (a row pre-empted by an earlier predicate is not coverage), and the accepting record is pinned
+VALUE by VALUE against the kernel header's tables -- the issuing-lane ledger (``SUM(issuing lanes) == init``), the byte-exact SMEM table, the box-bytes rule for every
+``expect_tx``, the register arithmetic ``SUM(role regs x warps) == entry x warps``, the descriptor version derived from the
+last K/V stage's start.
+
+Also pinned: the four index-list ``TemplateParams`` fields are appended with inert defaults (every existing forward config
+renders identically whether or not they are passed), every DENSE factory declines a record that sets them, the kernel
+module's prologue takes its geometry from the config (DESC_VERSION derived, the spin constant a module literal), and
+``_item_bounds`` is the kernel file's only source of ``n_tiles`` (a pin that ARMS with the body: a module with any function
+definition must define the helper and bind ``n_tiles`` from a call to it).
+
+Device-independent: nothing here compiles or launches.
+"""
+
+from __future__ import annotations
+
+import ast
+import dataclasses
+import inspect
+import pathlib
+import re
+
+import pytest
+
+from cudnn.sdpa.fwd import config_sm100 as c100
+from cudnn.sdpa.fwd import config_sm107 as c107
+from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+from cudnn.sdpa.fwd.config_sm107 import (
+    SMEM_STANDARD_CARVEOUT_BYTES,
+    SMEM_USABLE_BYTES,
+    SPARSE_D256_WIRED_ARMS,
+    TCGEN05_V0_ADDR_LIMIT,
+    CfgD256Sparse,
+    _validate_cfg_d256_sparse,
+    d256_sparse_smem_layout,
+    make_cfg_d256_sparse,
+    sparse_entry_regs,
+)
+
+pytestmark = [pytest.mark.L0]
+
+BF16, FP16, E4M3 = 2, 3, 0
+# The 24/2 geometry (12 query heads per KV head) at top_k = 512 -- the record the kernel's plain import builds.
+_BASE = dict(dtype_qkv=BF16, cta_mma=1, pack_gqa=True, qh_per_kh=12, qsa_block_topk=512, qsa_block_size=4)
+_KERNEL = pathlib.Path(c107.__file__).resolve().parent / "kernels" / "sm107" / "sparse_d256_f16.py"
+
+
+def _sparse(**over):
+    return TemplateParams(**{**_BASE, **over})
+
+
+# ---------------------------------------------------------------------------- the accepting record, value by value
+
+
+def test_sparse_record_pins_the_header_tables():
+    """The ONE-column-group (16-warp) record at 24/2, top_k 512 -- `softmax_groups=1`, the pre-split body and the A/B base: every number the
+    kernel header's tables quote for it (the DEFAULT record is the two-group one, pinned by test_sparse_split_config_is_twenty_warps_at_96_registers)."""
+    cfg, tma = make_cfg_d256_sparse(_sparse(), softmax_groups=1)
+    assert isinstance(cfg, CfgD256Sparse)
+    # tile geometry
+    assert (cfg.TILE_N, cfg.TILE_K, cfg.TILE_O, cfg.N_Q, cfg.BLOCK_SIZE, cfg.BLOCKS_PER_TILE) == (128, 256, 256, 16, 4, 32)
+    assert (cfg.BLOCK_TOPK, cfg.MAX_TILES_PER_ITEM) == (512, 17)
+    assert (cfg.DTYPE_QKV, cfg.DTYPE_O, cfg.BPE, cfg.BPE_O, cfg.GATE_BPE) == (BF16, BF16, 2, 2, 2)
+    assert (cfg.Q_SWZ_BYTES, cfg.K_SWZ_BYTES, cfg.V_SWZ_BYTES, cfg.P_SWZ_BYTES, cfg.TILE_K_HW) == (128, 128, 128, 32, 16)
+    assert (cfg.STAGES_KV, cfg.STAGES_Q, cfg.STAGES_IDS, cfg.STAGES_GATE, cfg.SCHEDULER_STAGES) == (3, 2, 2, 1, 2)
+    # the S^T / P^T ring depth is ONE derived field: the S^T TMEM slots, the sP buffers, the four per-tile rings (barrier rows 7-10)
+    assert cfg.STAGES_S == len(cfg.S_ACC_OFF) == 2
+    # warp map: role-homogeneous warpgroups
+    assert (cfg.SOFTMAX_WARPS, cfg.GATHER_WARPS, cfg.AUX_WARPS, cfg.TOTAL_WARPS, cfg.THREADS_PER_CTA) == (4, 8, 4, 16, 512)
+    assert (cfg.SOFTMAX_WARP_BASE, cfg.GATHER_WARP_BASE, cfg.MMA_WARP_ID, cfg.TMALDG_WARP_ID, cfg.SCHED_WARP_ID, cfg.SPARE_WARP_ID) == (0, 4, 12, 13, 14, 15)
+    # the issuing-lane ledger: SUM(issuing lanes) == init per barrier
+    assert (cfg.ONE_LANE, cfg.SOFTMAX_LANES) == (1, 128)
+    assert cfg.KV_FULL_ARRIVERS == cfg.GATHER_WARPS == 8, "mb_kv_full: one expect_tx per gather warp"
+    assert cfg.IDS_EMPTY_ARRIVERS == cfg.GATHER_WARPS + cfg.SOFTMAX_WARPS == 12, "mb_ids_empty: one elected lane per list-reading warp"
+    assert cfg.READ_TILE_ARRIVERS == cfg.SOFTMAX_WARPS + 1 + 1 + cfg.GATHER_WARPS == 14, "the scheduler credit: every warp but the scheduler and the spare"
+    assert (cfg.BAR_TMEM_THREADS, cfg.BAR_SOFTMAX_THREADS) == (160, 128)
+    # the gather geometry: the per-warp expect_tx equals its gather4 bytes and the warps sum to the stage
+    assert (cfg.BLOCKS_PER_WARP, cfg.GATHER_BOXES, cfg.GATHER_BOX_ELEMS, cfg.GATHER_ISSUE_BYTES, cfg.GATHERS_PER_WARP_PER_STAGE) == (4, 4, 64, 512, 16)
+    assert cfg.KV_TX_BYTES_PER_WARP == 16 * 512 == 8192 and cfg.KV_TX_BYTES_PER_WARP * cfg.GATHER_WARPS == cfg.KV_STAGE_BYTES == 65536
+    # the box-bytes rule: Q_TX / GATE_TX are the BOX (G rows x 128 B x 4 subtiles), never the 8 KiB slot
+    assert (cfg.Q_BOX_TOKENS, cfg.Q_BOX_ROWS, cfg.Q_SLOT_BYTES) == (1, 12, 8192)
+    assert cfg.Q_TX_BYTES == 12 * 256 * 2 == 6144 and cfg.GATE_TX_BYTES == 12 * 256 * 2 == 6144
+    assert (cfg.IDS_TX_BYTES, cfg.IDS_SLOT_BYTES) == (2048, 2112)
+    # TMEM
+    assert (cfg.TMEM_COLS, cfg.S_ACC_OFF, cfg.O_OFF) == (64, (0, 16), (32, 48))
+    # registers: the entry pool and the declared split
+    assert (cfg.ENTRY_REGS, cfg.SOFTMAX_REGS, cfg.GATHER_REGS, cfg.AUX_REGS, cfg.REG_SPLIT_DECLARED) == (128, 240, 96, 80, 1)
+    assert 4 * 240 + 8 * 96 + 4 * 80 == 2048 == 128 * 16
+    # SMEM: the byte table at 1024-B alignment
+    assert (cfg.SMEM_TOTAL_BYTES, cfg.SMEM_CARVEOUT_BYTES, cfg.DESC_VERSION) == (226688, SMEM_STANDARD_CARVEOUT_BYTES, 0)
+    assert SMEM_STANDARD_CARVEOUT_BYTES - cfg.SMEM_TOTAL_BYTES == 5760
+    # features of the base arm
+    assert (cfg.INCLUDE_OPEN_BLOCK, cfg.EPILOGUE_GATE, cfg.PAGED_KV, cfg.PAGE_SIZE, cfg.THD_VARLEN, cfg.BOTTOM_RIGHT, cfg.SPLIT_KV, cfg.LIST_PER_SEQUENCE) == (
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+    )
+    assert (cfg.PACK_GQA, cfg.QH_PER_KH, cfg.MASK_FLAGS, cfg.HAS_SINK, cfg.CTA_MMA, cfg.CGA_M, cfg.CGA_N, cfg.SCHEDULER_POLICY) == (1, 12, 0, 0, 1, 1, 1, 0)
+    # the Q^T / gate TMA walk: 4 subtiles of 64 elements (one 128-B span each)
+    assert (tma.QK_ITERS, tma.VO_ITERS, tma.QK_GRANU_ELEMS, tma.VO_GRANU_ELEMS) == (4, 4, 64, 64)
+
+
+def test_sparse_smem_layout_is_the_header_table():
+    """Declaration order = address order, descriptor-read operands first; sKV[2] at 152 KiB keeps the version-0 descriptor."""
+    cfg, _ = make_cfg_d256_sparse(_sparse())
+    lay = d256_sparse_smem_layout(cfg)
+    assert lay["starts"] == {"sQ": 0, "sP": 16384, "sKV": 24576, "sKV_last": 155648, "sIds": 221184, "red": 225408, "misc": 226176}
+    assert lay["total"] == 226688 and lay["carveout"] == SMEM_STANDARD_CARVEOUT_BYTES and lay["desc_version"] == 0
+    assert all(lay["starts"][k] % 1024 == 0 for k in ("sQ", "sP", "sKV")) and lay["starts"]["sIds"] % 16 == 0
+    assert lay["starts"]["sKV_last"] < TCGEN05_V0_ADDR_LIMIT
+    # depth 4 and depth 5: the layout grows by one 64 KiB stage each, into the oversized carveout, and the last stage crosses the
+    # version-0 window only at depth 5 (221,184 at depth 4 is still under it)
+    d4 = d256_sparse_smem_layout(dataclasses.replace(cfg, STAGES_KV=4))
+    assert d4["total"] == 226688 + 65536 and d4["carveout"] == SMEM_USABLE_BYTES and d4["desc_version"] == 0 and d4["starts"]["sKV_last"] == 221184
+    d5 = d256_sparse_smem_layout(dataclasses.replace(cfg, STAGES_KV=5))
+    assert d5["starts"]["sKV_last"] == 286720 >= TCGEN05_V0_ADDR_LIMIT and d5["desc_version"] == 1
+    # ... but depth 5 is 357,760 B > the 320 KiB usable carveout: no K/V depth that FITS crosses the version-0 window, so every
+    # expressible record of this kernel is DESC_VERSION 0 (the validator's version predicate is a tripwire for a layout change,
+    # not an arm the body carries)
+    assert d5["total"] == 357760 > SMEM_USABLE_BYTES
+    assert all(d256_sparse_smem_layout(dataclasses.replace(cfg, STAGES_KV=d))["desc_version"] == 0 for d in (2, 3, 4))
+    # the misc reserve covers what the body declares: tmem_ptr 16 B + 15 mbarrier arrays (29 stages, 16-B padded) + the payload ring
+    n_bar_arrays = 15
+    stage_counts = (2, 2, 2, 2, 3, 3, 2, 2, 2, 2, 1, 1, 1, 2, 2)
+    assert len(stage_counts) == n_bar_arrays and sum(stage_counts) == 29
+    padded = sum(-(-(n * 8) // 16) * 16 for n in stage_counts)
+    assert padded == 272 and 16 + padded + 2 * 8 * 4 == 352 <= 512
+
+
+@pytest.mark.parametrize("g, q_tx", [(6, 3072), (12, 6144), (16, 8192), (1, 512)])
+def test_sparse_q_and_gate_tx_are_the_box_bytes(g, q_tx):
+    """One token per item: Q_BOX_ROWS = G, and the two expect_tx values are G x 512 B -- 8192 only when G fills the 16-row tile.
+    An expect_tx of the slot against a G-row delivery would never complete (a hang at every shape)."""
+    cfg, _ = make_cfg_d256_sparse(_sparse(qh_per_kh=g))
+    assert (cfg.Q_BOX_TOKENS, cfg.Q_BOX_ROWS, cfg.QH_PER_KH) == (1, g, g)
+    assert cfg.Q_TX_BYTES == q_tx == cfg.Q_BOX_ROWS * cfg.TILE_K * cfg.BPE
+    assert cfg.GATE_TX_BYTES == q_tx == cfg.Q_BOX_ROWS * cfg.TILE_O * cfg.GATE_BPE
+    assert cfg.Q_TX_BYTES <= cfg.Q_SLOT_BYTES == 8192
+
+
+@pytest.mark.parametrize(
+    "top_k, ids_tx, slot, tiles, total", [(512, 2048, 2112, 17, 226688), (256, 1024, 1088, 9, 224640), (64, 256, 320, 3, 223104), (4, 16, 80, 1, 222624)]
+)
+def test_sparse_top_k_drives_every_ids_byte_count(top_k, ids_tx, slot, tiles, total):
+    """CFG.BLOCK_TOPK = the record's top_k; the bulk-copy length, the expect_tx and the staging slot all follow it (a fixed
+    2048-B row would over-read the next token's list at top_k < 512)."""
+    cfg, _ = make_cfg_d256_sparse(_sparse(qsa_block_topk=top_k))
+    assert (cfg.BLOCK_TOPK, cfg.IDS_TX_BYTES, cfg.IDS_SLOT_BYTES, cfg.MAX_TILES_PER_ITEM) == (top_k, ids_tx, slot, tiles)
+    assert cfg.IDS_TX_BYTES == top_k * 4 and cfg.IDS_TX_BYTES % 16 == 0 and cfg.IDS_SLOT_BYTES % 16 == 0
+    assert cfg.SMEM_TOTAL_BYTES == total and cfg.DESC_VERSION == 0
+
+
+def test_sparse_fallback_config_is_twelve_warps():
+    """``gather_warps=4``: the named fallback -- 12 warps, 168 entry registers, every arriver count re-derived, the split balanced
+    on ITS pool (2016), the same SMEM table."""
+    cfg, _ = make_cfg_d256_sparse(_sparse(), gather_warps=4, softmax_groups=1)
+    assert (cfg.GATHER_WARPS, cfg.TOTAL_WARPS, cfg.THREADS_PER_CTA, cfg.ENTRY_REGS) == (4, 12, 384, 168)
+    assert (cfg.GATHER_WARP_BASE, cfg.MMA_WARP_ID, cfg.TMALDG_WARP_ID, cfg.SCHED_WARP_ID, cfg.SPARE_WARP_ID) == (4, 8, 9, 10, 11)
+    assert (cfg.KV_FULL_ARRIVERS, cfg.IDS_EMPTY_ARRIVERS, cfg.READ_TILE_ARRIVERS) == (4, 8, 10)
+    assert (cfg.BLOCKS_PER_WARP, cfg.GATHERS_PER_WARP_PER_STAGE, cfg.KV_TX_BYTES_PER_WARP) == (8, 32, 16384)
+    assert cfg.KV_TX_BYTES_PER_WARP * cfg.GATHER_WARPS == 65536
+    assert (cfg.SOFTMAX_REGS, cfg.GATHER_REGS, cfg.AUX_REGS) == (240, 96, 168) and 4 * 240 + 4 * 96 + 4 * 168 == 2016 == 168 * 12
+    assert cfg.SMEM_TOTAL_BYTES == 226688 and cfg.DESC_VERSION == 0
+    for bad in (2, 6, 16, 0):
+        with pytest.raises(ValueError, match="gather_warps must be 8"):
+            make_cfg_d256_sparse(_sparse(), gather_warps=bad)
+
+
+def test_sparse_entry_regs_is_the_launch_pool():
+    assert (sparse_entry_regs(16), sparse_entry_regs(12), sparse_entry_regs(8), sparse_entry_regs(6)) == (128, 168, 255, 255)
+    assert sparse_entry_regs(20) == 96, "the 20-warp softmax-split population: floor(65536 / 640 / 8) x 8"
+
+
+def test_sparse_split_config_is_twenty_warps_at_96_registers():
+    """``softmax_groups=2`` (the softmax SPLIT): TWO 4-warp column groups of 8 columns -> 20 warps, 96 entry registers,
+    every softmax-fired arrival count re-derived (256 lanes, 16 list readers, 18 scheduler creditors, the 288-thread TMEM hand-off, the
+    128-thread per-group exchange), the declared split balanced on ITS pool (1920), the SMEM table unchanged (the 768-B exchange scratch
+    re-sliced [3][8][8]); the record route (``qsa_softmax_groups=2``) renders the same config as the keyword; the 4-gather-warp fallback of
+    the split is 16 warps at 128; every other value is refused."""
+    cfg, _ = make_cfg_d256_sparse(_sparse(), softmax_groups=2)
+    assert (cfg.SOFTMAX_GROUPS, cfg.SOFTMAX_WARPS_PER_GROUP, cfg.COLS_PER_GROUP, cfg.N_Q) == (2, 4, 8, 16)
+    assert (cfg.SOFTMAX_WARPS, cfg.GATHER_WARPS, cfg.AUX_WARPS, cfg.TOTAL_WARPS, cfg.THREADS_PER_CTA, cfg.ENTRY_REGS) == (8, 8, 4, 20, 640, 96)
+    assert (cfg.SOFTMAX_WARP_BASE, cfg.GATHER_WARP_BASE, cfg.MMA_WARP_ID, cfg.TMALDG_WARP_ID, cfg.SCHED_WARP_ID, cfg.SPARE_WARP_ID) == (0, 8, 16, 17, 18, 19)
+    # the issuing-lane ledger of the kernel header's barrier table at two column groups: rows 4 / 8 / 9 / 12 / 14 / 15 / 16 / 17
+    assert (cfg.ONE_LANE, cfg.SOFTMAX_LANES, cfg.KV_FULL_ARRIVERS) == (1, 256, 8)
+    assert cfg.IDS_EMPTY_ARRIVERS == cfg.GATHER_WARPS + cfg.SOFTMAX_WARPS == 16
+    assert cfg.READ_TILE_ARRIVERS == cfg.SOFTMAX_WARPS + 1 + 1 + cfg.GATHER_WARPS == 18
+    assert (cfg.BAR_TMEM_THREADS, cfg.BAR_SOFTMAX_THREADS) == (288, 128), "every softmax warp + the MMA warp; ONE group's four warps"
+    # registers: the entry pool and the declared split
+    assert (cfg.SOFTMAX_REGS, cfg.GATHER_REGS, cfg.AUX_REGS, cfg.REG_SPLIT_DECLARED) == (136, 72, 64, 1)
+    assert 8 * 136 + 8 * 72 + 4 * 64 == 1920 == 96 * 20
+    # SMEM / TMEM untouched
+    assert (cfg.SMEM_TOTAL_BYTES, cfg.SMEM_CARVEOUT_BYTES, cfg.DESC_VERSION) == (226688, SMEM_STANDARD_CARVEOUT_BYTES, 0)
+    assert d256_sparse_smem_layout(cfg)["starts"] == d256_sparse_smem_layout(make_cfg_d256_sparse(_sparse())[0])["starts"]
+    assert (cfg.TMEM_COLS, cfg.S_ACC_OFF, cfg.O_OFF) == (64, (0, 16), (32, 48))
+    _validate_cfg_d256_sparse(cfg)
+    # the record route == the keyword route; 0 = the record's value = the flavor default = TWO groups (since the A/B/A)
+    assert make_cfg_d256_sparse(_sparse(qsa_softmax_groups=2))[0] == cfg == make_cfg_d256_sparse(_sparse())[0]
+    one, _ = make_cfg_d256_sparse(_sparse(qsa_softmax_groups=1))
+    assert (one.SOFTMAX_GROUPS, one.TOTAL_WARPS, one.ENTRY_REGS) == (1, 16, 128) and one == make_cfg_d256_sparse(_sparse(), softmax_groups=1)[0]
+    assert make_cfg_d256_sparse(_sparse(qsa_softmax_groups=1), softmax_groups=2)[0] == cfg, "the keyword overrides the record"
+    # the split on the 4-gather-warp fallback: 16 warps at 128, the split balanced on 2048
+    fb, _ = make_cfg_d256_sparse(_sparse(), gather_warps=4, softmax_groups=2)
+    assert (fb.SOFTMAX_WARPS, fb.GATHER_WARPS, fb.TOTAL_WARPS, fb.ENTRY_REGS, fb.MMA_WARP_ID) == (8, 4, 16, 128, 12)
+    assert (fb.SOFTMAX_REGS, fb.GATHER_REGS, fb.AUX_REGS) == (160, 96, 96) and 8 * 160 + 4 * 96 + 4 * 96 == 2048 == 128 * 16
+    assert (fb.IDS_EMPTY_ARRIVERS, fb.READ_TILE_ARRIVERS, fb.BAR_TMEM_THREADS, fb.BAR_SOFTMAX_THREADS) == (12, 14, 288, 128)
+    _validate_cfg_d256_sparse(fb)
+    for bad in (3, 4, -1):
+        with pytest.raises(ValueError, match="softmax_groups must be 1"):
+            make_cfg_d256_sparse(_sparse(), softmax_groups=bad)
+    with pytest.raises(ValueError, match="softmax_groups must be 1"):
+        make_cfg_d256_sparse(_sparse(qsa_softmax_groups=3))
+
+
+@pytest.mark.parametrize("dtype", [BF16, FP16])
+def test_sparse_accepts_both_half_dtypes(dtype):
+    cfg, _ = make_cfg_d256_sparse(_sparse(dtype_qkv=dtype))
+    assert cfg.DTYPE_QKV == cfg.DTYPE_O == dtype and cfg.BPE == 2
+
+
+def test_sparse_accepts_the_padding_and_stats_fields():
+    cfg, _ = make_cfg_d256_sparse(_sparse(seq_kv_lens_present=True, seq_q_lens_present=False, stats_log2=True))
+    assert (cfg.SEQ_KV_LENS_PRESENT, cfg.SEQ_Q_LENS_PRESENT, cfg.STATS_LOG2, cfg.MASK_FLAGS) == (
+        1,
+        0,
+        1,
+        0,
+    ), "per-batch lengths are not a mask bit on this kernel"
+
+
+# ---------------------------------------------------------------------------- the TemplateParams-level declines (RED)
+
+
+@pytest.mark.parametrize(
+    "over, pattern",
+    [
+        (dict(qsa_block_topk=0), "not an index-list record"),
+        (dict(qsa_block_size=8), "qsa_block_size must be 4"),
+        (dict(qsa_block_size=0), "qsa_block_size must be 4"),
+        (dict(dtype_qkv=E4M3, dtype_o=E4M3), "f16/bf16 inputs only"),
+        (dict(dtype_o=FP16), "dtype_o == dtype_qkv"),
+        (dict(cta_mma=2), "cta_mma must be 1"),
+        (dict(pack_gqa=False), "pack_gqa must be True"),
+        (dict(qh_per_kh=17), "qh_per_kh must be in 1..16"),
+        (dict(qh_per_kh=0), "qh_per_kh must be in 1..16"),
+        (dict(window_right=0), "the selection IS the mask"),
+        (dict(window_left=640), "the selection IS the mask"),
+        (dict(has_sink=True), "no sink"),
+        (dict(decode_q_tile=16), "other kernels' specializations"),
+        (dict(mma_2x2=True), "other kernels' specializations"),
+        (dict(softmax_f16=True), "other kernels' specializations"),
+        # the dense line's compile-time options the sparse body has no field for: refused, never silently ignored
+        (dict(negate_scores=True), "other kernels' specializations"),
+        (dict(kv_tail_mask=True), "other kernels' specializations"),
+        (dict(thd_batch_one=True), "other kernels' specializations"),
+        (dict(lpt_head_group=2), "other kernels' specializations"),
+        (dict(sched_policy=1), "sched_policy must be NATURAL"),
+        (dict(paged_kv=True, page_size=6, seq_kv_lens_present=True), "multiple of 4"),
+        (dict(thd_varlen=True, paged_kv=True, page_size=16, seq_kv_lens_present=True), "THD x paged is not served"),  # both arms wired, never together
+        (dict(seq_q_lens_present=True), "SEQ_Q_LENS_PRESENT requires SEQ_KV_LENS_PRESENT"),
+        (dict(qsa_block_topk=2), "multiple of 4 in"),
+        (dict(qsa_block_topk=516), "multiple of 4 in"),
+        (dict(qsa_block_topk=510), "multiple of 4 in"),
+    ],
+)
+def test_sparse_declines_at_the_record(over, pattern):
+    with pytest.raises(ValueError, match=pattern):
+        make_cfg_d256_sparse(_sparse(**over))
+
+
+@pytest.mark.parametrize(
+    "over, arm",
+    [
+        (dict(epilogue_gate=True), "epilogue_gate"),
+        (dict(thd_varlen=True), "thd_varlen"),
+        (dict(paged_kv=True, page_size=16, seq_kv_lens_present=True), "paged_kv"),
+        (dict(split_kv=2), "split_kv"),
+        (dict(qsa_list_per_sequence=True), "list_per_sequence"),
+        (dict(bottom_right=True), "bottom_right"),
+        (dict(qsa_include_open_block=False), "pure_list"),
+        (dict(seq_q_lens_present=True, seq_kv_lens_present=True), "seq_q_lens"),
+    ],
+)
+def test_sparse_declines_the_arms_the_body_does_not_carry(over, arm):
+    """Each arm is admitted by adding its name to SPARSE_D256_WIRED_ARMS in the commit that lands its body (and flips the adapter's
+    claims record); until then the config declines it by NAME.  When an arm lands, move its row to an accept test -- do not delete it:
+    the skip below NAMES that accept test and fails when it does not exist in this module."""
+    if arm in SPARSE_D256_WIRED_ARMS:
+        accept = _ACCEPT_ROW_OF[arm]
+        assert callable(globals().get(accept)), f"the {arm} arm is wired but its accept row {accept} is missing from this module"
+        pytest.skip(f"the {arm} arm is wired now: its accept row {accept} replaces this one")
+    with pytest.raises(ValueError, match=f"does not carry the .*{arm}"):
+        make_cfg_d256_sparse(_sparse(**over))
+
+
+# the wired arm -> the accept row that replaced its decline row above (the skip message names it; a missing one fails the skip)
+_ACCEPT_ROW_OF = {
+    "epilogue_gate": "test_sparse_accepts_the_gate_arm",
+    "thd_varlen": "test_sparse_accepts_the_thd_arm",
+    "paged_kv": "test_sparse_accepts_the_paged_arm",
+    "split_kv": "test_sparse_accepts_the_decode_form_arms",
+    "list_per_sequence": "test_sparse_accepts_the_decode_form_arms",
+    "bottom_right": "test_sparse_accepts_the_decode_form_arms",
+}
+
+
+@pytest.mark.parametrize("page_size", [16, 64, 48])
+@pytest.mark.parametrize("kv_lens_declared", [True, False], ids=["kv-lens-declared", "kv-lens-forced"])
+def test_sparse_accepts_the_paged_arm(page_size, kv_lens_declared):
+    """The paged_kv arm's accept row (the wired arm; its decline row above skips): PAGE_SIZE carried as declared (16 / 64 and the
+    non-power-of-two 48 the kernel divides by), SEQ_KV_LENS_PRESENT FORCED to 1 whether or not the record declared it (a pool has no
+    dense extent -- the visible range is the per-batch length), and the dense record's SMEM / barrier geometry untouched (the arm is a
+    row-coordinate change of the gather warps, no new ring)."""
+    assert "paged_kv" in SPARSE_D256_WIRED_ARMS
+    cfg, _ = make_cfg_d256_sparse(_sparse(paged_kv=True, page_size=page_size, seq_kv_lens_present=kv_lens_declared))
+    dense, _ = make_cfg_d256_sparse(_sparse(seq_kv_lens_present=True))
+    assert (cfg.PAGED_KV, cfg.PAGE_SIZE, cfg.SEQ_KV_LENS_PRESENT) == (1, page_size, 1)
+    assert cfg.PAGE_SIZE % cfg.BLOCK_SIZE == 0
+    assert dataclasses.replace(cfg, PAGED_KV=0, PAGE_SIZE=0) == dense, "the paged arm changes no other field of the record"
+    _validate_cfg_d256_sparse(cfg)
+
+
+@pytest.mark.parametrize("kv_lens_declared", [True, False], ids=["kv-lens-declared", "kv-lens-forced"])
+def test_sparse_accepts_the_thd_arm(kv_lens_declared):
+    """The thd_varlen arm's accept row (the wired arm; its decline row above skips): THD_VARLEN carried, SEQ_KV_LENS_PRESENT FORCED
+    to 1 whether or not the record declared it (the THD metadata's first B words ARE the per-sequence KV lengths, read by the same
+    path), and the dense record's SMEM / barrier geometry untouched (the arm changes the scheduler form and the item decode, no new
+    ring -- barrier row 13 keeps init ONE_LANE in both forms).  THD together with the paged arm is refused (the RED row below)."""
+    assert "thd_varlen" in SPARSE_D256_WIRED_ARMS
+    cfg, _ = make_cfg_d256_sparse(_sparse(thd_varlen=True, seq_kv_lens_present=kv_lens_declared))
+    dense, _ = make_cfg_d256_sparse(_sparse(seq_kv_lens_present=True))
+    assert (cfg.THD_VARLEN, cfg.SEQ_KV_LENS_PRESENT, cfg.PAGED_KV, cfg.PAGE_SIZE) == (1, 1, 0, 0)
+    assert dataclasses.replace(cfg, THD_VARLEN=0) == dense, "the THD arm changes no other field of the record"
+    _validate_cfg_d256_sparse(cfg)
+
+
+@pytest.mark.parametrize("composition", ["alone", "thd", "paged"])
+def test_sparse_accepts_the_gate_arm(composition):
+    """The epilogue_gate arm's accept row (the wired arm; its decline row above skips): EPILOGUE_GATE carried, GATE_TX_BYTES the
+    gate BOX (Q_BOX_ROWS x TILE_O x GATE_BPE, never the 8 KiB slot), STAGES_GATE one slot (the gate aliases the item's freed Q^T
+    slot, so the SMEM table is the dense record's byte for byte -- 226,688 B), and the dense record's every other field untouched;
+    composed with the THD arm and with the paged arm the config ADMITS both (the gate touches the Q^T slot ring and the epilogue
+    only) and the arm fields read exactly as the single arms' accept rows say.  The split is the one composition refused (the gate
+    rides the combine: the RED row below)."""
+    assert "epilogue_gate" in SPARSE_D256_WIRED_ARMS
+    dense, _ = make_cfg_d256_sparse(_sparse(seq_kv_lens_present=True))
+    if composition == "alone":
+        cfg, _ = make_cfg_d256_sparse(_sparse(epilogue_gate=True, seq_kv_lens_present=True))
+        assert dataclasses.replace(cfg, EPILOGUE_GATE=0) == dense, "the gate arm changes no other field of the record"
+    elif composition == "thd":
+        cfg, _ = make_cfg_d256_sparse(_sparse(epilogue_gate=True, thd_varlen=True))
+        assert (cfg.THD_VARLEN, cfg.SEQ_KV_LENS_PRESENT, cfg.PAGED_KV) == (1, 1, 0)
+        assert dataclasses.replace(cfg, EPILOGUE_GATE=0, THD_VARLEN=0) == dense
+    else:
+        cfg, _ = make_cfg_d256_sparse(_sparse(epilogue_gate=True, paged_kv=True, page_size=16, seq_kv_lens_present=True))
+        assert (cfg.PAGED_KV, cfg.PAGE_SIZE, cfg.SEQ_KV_LENS_PRESENT, cfg.THD_VARLEN) == (1, 16, 1, 0)
+        assert dataclasses.replace(cfg, EPILOGUE_GATE=0, PAGED_KV=0, PAGE_SIZE=0) == dense
+    assert (cfg.EPILOGUE_GATE, cfg.STAGES_GATE) == (1, 1)
+    assert cfg.GATE_TX_BYTES == cfg.Q_BOX_ROWS * cfg.TILE_O * cfg.GATE_BPE == 6144 and cfg.GATE_TX_BYTES <= cfg.Q_SLOT_BYTES
+    assert (cfg.SMEM_TOTAL_BYTES, cfg.SMEM_CARVEOUT_BYTES, cfg.DESC_VERSION) == (dense.SMEM_TOTAL_BYTES, dense.SMEM_CARVEOUT_BYTES, dense.DESC_VERSION)
+    _validate_cfg_d256_sparse(cfg)
+
+
+@pytest.mark.parametrize("split", [1, 2, 4, 17])
+def test_sparse_accepts_the_decode_form_arms(split):
+    """The decode form's accept row (the three wired arms; their decline rows above skip): BOTTOM_RIGHT, LIST_PER_SEQUENCE and SPLIT_KV
+    carried as declared, every other field of the record -- the SMEM / barrier geometry, the ring depths, the arrival counts -- the
+    dense record's (the arms change the item decode, the one bounds helper's arithmetic and the epilogue's store target, no ring);
+    SPLIT_KV up to MAX_TILES_PER_ITEM = 17 at top_k 512 (one tile per chunk at 17)."""
+    for arm in ("split_kv", "list_per_sequence", "bottom_right"):
+        assert arm in SPARSE_D256_WIRED_ARMS
+    cfg, _ = make_cfg_d256_sparse(_sparse(split_kv=split, bottom_right=True, qsa_list_per_sequence=True, seq_kv_lens_present=True))
+    dense, _ = make_cfg_d256_sparse(_sparse(seq_kv_lens_present=True))
+    assert (cfg.SPLIT_KV, cfg.BOTTOM_RIGHT, cfg.LIST_PER_SEQUENCE, cfg.MAX_TILES_PER_ITEM) == (split, 1, 1, 17)
+    assert dataclasses.replace(cfg, SPLIT_KV=1, BOTTOM_RIGHT=0, LIST_PER_SEQUENCE=0) == dense, "the decode form changes no other field of the record"
+    _validate_cfg_d256_sparse(cfg)
+    # bottom-right with per-token lists (no shared list) and the split over paged pools are served too
+    br, _ = make_cfg_d256_sparse(_sparse(bottom_right=True, seq_kv_lens_present=True))
+    assert (br.BOTTOM_RIGHT, br.LIST_PER_SEQUENCE, br.SPLIT_KV) == (1, 0, 1)
+    paged, _ = make_cfg_d256_sparse(_sparse(split_kv=split, bottom_right=True, qsa_list_per_sequence=True, paged_kv=True, page_size=16))
+    assert (paged.SPLIT_KV, paged.PAGED_KV, paged.PAGE_SIZE, paged.SEQ_KV_LENS_PRESENT) == (split, 1, 16, 1)
+
+
+@pytest.mark.parametrize(
+    "over, pattern",
+    [
+        (dict(split_kv=18), "must not exceed MAX_TILES_PER_ITEM"),
+        (dict(split_kv=2, epilogue_gate=True), "split_kv > 1 with EPILOGUE_GATE"),
+        (dict(split_kv=2, thd_varlen=True), "split_kv > 1 under THD"),
+        (dict(qsa_list_per_sequence=True, bottom_right=True, thd_varlen=True), "list_per_sequence under THD"),
+        (dict(qsa_list_per_sequence=True), "list_per_sequence requires BOTTOM_RIGHT"),
+        (dict(bottom_right=True, thd_varlen=True), "bottom_right under THD"),
+    ],
+)
+def test_sparse_decode_form_arms_refuse_their_unserved_compositions(over, pattern):
+    """The decode form's arms against each other at the factory (the adapter declines each by name first; this is the backstop):
+    a split past the item's tile count, the kernel's own gate under a split (the gate rides the combine), any of the three under
+    THD, the shared list without the bottom-right anchor."""
+    with pytest.raises(ValueError, match=pattern):
+        make_cfg_d256_sparse(_sparse(**over))
+
+
+# ---------------------------------------------------------------------------- the validator, predicate by predicate (RED on a replaced field)
+
+# One row per REACHABLE predicate of _validate_cfg_d256_sparse: the replaced field(s) make THAT predicate the first to fail and the
+# pattern is a fragment of ITS message.  A row whose failure an earlier predicate reports is not coverage (the coverage test below
+# counts first-failing predicates, not rows); the predicates no replaced field can reach are the enumerated _TRIPWIRES.
+_RED_ROWS = [
+    (dict(DTYPE_QKV=E4M3, DTYPE_O=E4M3), "f16/bf16 inputs only"),
+    (dict(DTYPE_O=FP16), "DTYPE_O == DTYPE_QKV"),
+    (dict(GATE_BPE=1), "GATE_BPE are 2"),
+    (dict(TILE_N=64), "128-lane TMEM layout"),
+    (dict(BLOCKS_PER_TILE=16, TILE_N=64), "128-lane TMEM layout"),  # the TILE_N == 128 clause alone: 64 == 16 x 4 keeps the product clause true
+    (dict(BLOCK_SIZE=2, BLOCKS_PER_TILE=64), "four rows of one gather4"),  # 128 == 64 x 2 keeps the tile predicate true; the block predicate fires
+    (dict(TILE_K=128), "d_qk = d_v = 256 only"),
+    (dict(N_Q=32), "N_Q must be 16"),
+    (dict(SOFTMAX_WARPS=12), "4 softmax warps"),  # not 4 x SOFTMAX_GROUPS (the default record carries two groups = 8 softmax warps)
+    (dict(COLS_PER_GROUP=16), "COLS_PER_GROUP must be N_Q / SOFTMAX_GROUPS"),  # 16 columns per group at two groups: not N_Q / 2
+    (dict(GATHER_WARPS=6, TOTAL_WARPS=14, THREADS_PER_CTA=448), "must divide across the gather warps"),
+    (dict(GATHER_WARPS=2, TOTAL_WARPS=10, THREADS_PER_CTA=320), "whole warpgroups"),
+    (dict(TOTAL_WARPS=15, THREADS_PER_CTA=480), "TOTAL_WARPS must be SOFTMAX_WARPS \\+ GATHER_WARPS \\+ 4"),
+    (dict(THREADS_PER_CTA=256), "32 x TOTAL_WARPS"),
+    (dict(GATHER_WARP_BASE=4), "gather warps follow the softmax warpgroup"),  # the default record's softmax warps are 0-7
+    (dict(MMA_WARP_ID=13, TMALDG_WARP_ID=12), "MMA / TMA-LDG / scheduler / spare in that order"),
+    (dict(SPARE_WARP_ID=14), "in that order"),
+    (dict(SOFTMAX_LANES=96), "SOFTMAX_LANES is 32 x SOFTMAX_WARPS"),
+    (dict(KV_FULL_ARRIVERS=1), "one expect_tx per gather warp"),
+    (dict(IDS_EMPTY_ARRIVERS=8), "one elected lane per list-reading warp"),
+    (dict(READ_TILE_ARRIVERS=15), "hang at EVERY shape"),
+    (dict(BAR_TMEM_THREADS=128), "named barriers count"),
+    (dict(BLOCKS_PER_WARP=8), "32 / GATHER_WARPS"),
+    (dict(GATHER_BOXES=2), "4 boxes of 64 elements"),
+    (dict(GATHER_ISSUE_BYTES=256), "4 rows x 128 B"),
+    (dict(GATHERS_PER_WARP_PER_STAGE=8), "blocks per warp x boxes per row"),
+    (dict(KV_TX_BYTES_PER_WARP=65536), "per-warp expect_tx must equal its gather4 bytes"),
+    (dict(KV_STAGE_BYTES=32768), "must sum to the 64 KiB stage"),
+    (dict(PACK_GQA=0), "PACK_GQA must be 1"),
+    (dict(Q_BOX_TOKENS=2, Q_BOX_ROWS=24), "Q_BOX_TOKENS must be 1|must fit the N_Q"),
+    (dict(QH_PER_KH=17, Q_BOX_ROWS=17), "must fit the N_Q"),
+    (dict(Q_BOX_ROWS=16), "Q_BOX_ROWS must be Q_BOX_TOKENS x QH_PER_KH"),
+    (dict(Q_SLOT_BYTES=4096), "8 KiB"),
+    (dict(Q_TX_BYTES=8192), "hang at every shape"),
+    (dict(GATE_TX_BYTES=8192), "GATE_TX_BYTES must be the gate BOX's bytes"),
+    (dict(Q_SWZ_BYTES=64), "SW128"),
+    (dict(P_SWZ_BYTES=64), "P\\^T row bytes"),
+    (dict(TILE_K_HW=32), "2-chunk is silently wrong"),
+    (dict(BLOCK_TOPK=1024, IDS_TX_BYTES=4096, IDS_SLOT_BYTES=4160, MAX_TILES_PER_ITEM=33), "multiple of 4 in"),
+    (dict(IDS_TX_BYTES=2056), "IDS_TX_BYTES must be BLOCK_TOPK x 4"),
+    (dict(IDS_SLOT_BYTES=2048), "64-B reserve"),
+    (dict(MAX_TILES_PER_ITEM=16), "ceil"),
+    (dict(STAGES_KV=1), "at least K\\(t\\) and V\\(t\\)"),
+    (dict(STAGES_IDS=1), "one-item-ahead prefetch"),
+    (dict(SMEM_TOTAL_BYTES=1), "disagrees with the layout"),
+    (dict(SMEM_CARVEOUT_BYTES=327 * 1024), "227 KiB standard carveout or the 320 KiB"),
+    (dict(STAGES_KV=4), "disagrees with the layout"),  # a moved ring with a stale total
+    (
+        dict(STAGES_KV=4, SMEM_TOTAL_BYTES=226688 + 65536),
+        "needs the 320 KiB carveout",
+    ),  # the layout moved to the oversized mode but the record still claims standard
+    (dict(STAGES_KV=6, SMEM_TOTAL_BYTES=226688 + 3 * 65536, SMEM_CARVEOUT_BYTES=SMEM_USABLE_BYTES), "exceeds the 320 KiB usable Rubin carveout"),
+    (dict(DESC_VERSION=1), "descriptor version must be 0"),
+    (
+        dict(STAGES_S=3),
+        "STAGES_S \\(got 3\\) must be the number of S\\^T TMEM slots",
+    ),  # the TMEM map holds two S^T slots; a deeper ring would read a stale slot
+    (dict(TMEM_COLS=128), "4 x N_Q fp32 columns"),
+    (dict(O_OFF=(16, 32)), "TMEM map"),
+    (dict(ENTRY_REGS=136), "ENTRY_REGS must be the launch"),
+    (dict(SOFTMAX_REGS=244), "multiple of 8 in 24..256"),
+    (dict(SOFTMAX_REGS=248), "parks the last INCREASE warp forever"),
+    (dict(AUX_REGS=72), "parks the last INCREASE warp forever"),
+    (dict(MASK_FLAGS=1), "the selection IS the mask"),
+    (dict(HAS_SINK=1), "no sink"),
+    (dict(CTA_MMA=2), "one cga1 CTA per SM"),
+    (dict(PAGED_KV=1, PAGE_SIZE=6), "straddles two pages"),
+    (dict(PAGED_KV=1, PAGE_SIZE=0), "straddles two pages"),
+    (dict(PAGED_KV=1, PAGE_SIZE=16), "force SEQ_KV_LENS_PRESENT=1"),  # the record's SEQ_KV_LENS_PRESENT is 0: a paged body with no visible range
+    (dict(PAGE_SIZE=16), "PAGE_SIZE is 0 exactly when"),
+    (dict(SPLIT_KV=0), "split_kv must be >= 1"),
+    (dict(SPLIT_KV=18), "must not exceed MAX_TILES_PER_ITEM"),  # a larger split has an empty chunk on every item
+    (dict(SPLIT_KV=2, EPILOGUE_GATE=1), "split_kv > 1 with EPILOGUE_GATE is not served"),  # the gate rides the combine
+    (dict(SPLIT_KV=2, THD_VARLEN=1, SEQ_KV_LENS_PRESENT=1), "split_kv > 1 under THD is not served"),
+    (dict(LIST_PER_SEQUENCE=1, BOTTOM_RIGHT=1, THD_VARLEN=1, SEQ_KV_LENS_PRESENT=1), "list_per_sequence under THD is not served"),
+    (dict(LIST_PER_SEQUENCE=1), "list_per_sequence requires BOTTOM_RIGHT"),
+    (dict(BOTTOM_RIGHT=1, THD_VARLEN=1, SEQ_KV_LENS_PRESENT=1), "bottom_right under THD is not served"),
+    (dict(THD_VARLEN=1), "force SEQ_KV_LENS_PRESENT=1"),
+    (dict(THD_VARLEN=1, PAGED_KV=1, PAGE_SIZE=16, SEQ_KV_LENS_PRESENT=1), "THD x paged is not served"),  # both wired arms, never in one record
+    (dict(SEQ_Q_LENS_PRESENT=1), "SEQ_Q_LENS_PRESENT requires SEQ_KV_LENS_PRESENT"),
+    (dict(SCHEDULER_POLICY=1), "NATURAL in v1"),
+]
+
+
+@pytest.mark.parametrize("bad, pattern", _RED_ROWS)
+def test_sparse_validator_raises_on_each_claim(bad, pattern):
+    """RED side of every predicate: a config whose claim no longer holds raises with the message naming the failure's look."""
+    cfg, _ = make_cfg_d256_sparse(_sparse())
+    with pytest.raises(ValueError, match=pattern):
+        _validate_cfg_d256_sparse(dataclasses.replace(cfg, **bad))
+
+
+def test_sparse_validator_green_on_the_record_and_on_a_consistent_depth_4():
+    """GREEN side: the factory's own records pass, and a depth-4 record whose SMEM claims were re-derived (oversized carveout,
+    desc version from the layout) passes too -- the levers are expressible, just not the default."""
+    cfg, _ = make_cfg_d256_sparse(_sparse())
+    _validate_cfg_d256_sparse(cfg)
+    deep = dataclasses.replace(cfg, STAGES_KV=4)
+    lay = d256_sparse_smem_layout(deep)
+    _validate_cfg_d256_sparse(dataclasses.replace(deep, SMEM_TOTAL_BYTES=lay["total"], SMEM_CARVEOUT_BYTES=lay["carveout"], DESC_VERSION=lay["desc_version"]))
+    assert lay["carveout"] == SMEM_USABLE_BYTES and lay["total"] == 292224
+
+
+def _predicate_table(monkeypatch, cfg):
+    """The validator's WHOLE predicate table on ``cfg`` as ``[(ok, message)]``: ``_check`` is captured instead of raising at the
+    first failure, so a test sees which predicate reports first AND whether a later one would have fired too."""
+    seen = []
+    monkeypatch.setattr(c107, "_check", lambda preds: seen.extend(preds))
+    _validate_cfg_d256_sparse(cfg)
+    return seen
+
+
+# Predicates no replaced field can make the FIRST failure -- each has a simulated RED test below instead of a row in _RED_ROWS:
+_TRIPWIRES = (
+    "must fit the aliased slot",  # Q_TX / GATE_TX <= Q_SLOT: implied by Q_BOX_ROWS == QH_PER_KH <= N_Q, and the box-bytes rules report first
+    "must start 1024-B aligned",  # d256_sparse_smem_layout aligns every slab start by construction (_align_slab)
+    "sIds must start 16-B aligned",  # idem (_align16)
+)
+
+
+def test_every_validator_predicate_is_reached_by_a_red_row_or_is_an_enumerated_tripwire(monkeypatch):
+    """The "one RED row per predicate" claim, enforced in-module: for every row of _RED_ROWS the FIRST failing predicate's message
+    matches the row's pattern, the first-failing predicates cover every predicate of the table except the enumerated tripwires, and
+    every tripwire is indeed unreached (a tripwire a row reaches must leave the list).  A new predicate without a row, or a row an
+    earlier predicate pre-empts, fails here -- the counts never have to be quoted by hand."""
+    cfg, _ = make_cfg_d256_sparse(_sparse())
+    table = _predicate_table(monkeypatch, cfg)
+    assert table and all(ok for ok, _ in table), "the factory's record must be green on every predicate"
+    reached = {}
+    for bad, pattern in _RED_ROWS:
+        row = _predicate_table(monkeypatch, dataclasses.replace(cfg, **bad))
+        first = next((i for i, (ok, _) in enumerate(row) if not ok), None)
+        assert first is not None, f"{bad}: no predicate fails"
+        assert re.search(pattern, row[first][1]), f"{bad}: the first failing predicate says {row[first][1]!r}, the row expects {pattern!r}"
+        reached.setdefault(first, []).append(bad)
+    tripwires = {i for i, (_, msg) in enumerate(table) if any(t in msg for t in _TRIPWIRES)}
+    assert len(tripwires) == len(_TRIPWIRES), "every enumerated tripwire names exactly one predicate"
+    unreached = set(range(len(table))) - set(reached)
+    assert unreached == tripwires, (
+        f"predicates no RED row reaches: {[table[i][1] for i in sorted(unreached - tripwires)]}; "
+        f"tripwires a row reaches (drop them from _TRIPWIRES): {[table[i][1] for i in sorted(tripwires & set(reached))]}"
+    )
+
+
+def _layout_with(moved_starts):
+    """``d256_sparse_smem_layout`` with the named starts moved -- the only way to reach the alignment predicates, which the real
+    layout satisfies by construction."""
+    real = d256_sparse_smem_layout
+
+    def moved(cfg):
+        lay = real(cfg)
+        return {**lay, "starts": {**lay["starts"], **moved_starts}}
+
+    return moved
+
+
+@pytest.mark.parametrize(
+    "move, pattern",
+    [
+        (dict(sP=16384 + 512), "SW128 buffer must start 1024-B aligned .*sP 16896"),
+        (dict(sKV=24576 + 128), "SW128 buffer must start 1024-B aligned .*sKV 24704"),
+        (dict(sIds=221184 + 8), "sIds must start 16-B aligned .*got 221192"),
+    ],
+)
+def test_sparse_validator_alignment_tripwires_fire_on_a_misaligned_layout(monkeypatch, move, pattern):
+    """RED side of the two alignment tripwires: the layout function is replaced by one that moves a start, and the validator (which
+    reads the layout through the module, not a cached copy) names the misaligned buffer and its offset."""
+    cfg, _ = make_cfg_d256_sparse(_sparse())
+    monkeypatch.setattr(c107, "d256_sparse_smem_layout", _layout_with(move))
+    with pytest.raises(ValueError, match=pattern):
+        _validate_cfg_d256_sparse(cfg)
+
+
+def test_sparse_validator_box_fits_the_slot_is_implied_and_live(monkeypatch):
+    """The third tripwire: Q_TX / GATE_TX <= Q_SLOT can never be the FIRST failure (Q_BOX_ROWS == QH_PER_KH <= N_Q pins the box at or
+    under the 8 KiB slot, and an oversized Q_TX_BYTES is reported by the box-bytes rule first).  Pinned two ways: the implication over
+    the whole admitted domain (every G in 1..16, both half dtypes; the slot is exactly full at G = 16), and the predicate itself reading
+    False on an oversized box in the whole table while the box-bytes rule reports -- live code, not dead."""
+    for dtype in (BF16, FP16):
+        for g in range(1, 17):
+            cfg, _ = make_cfg_d256_sparse(_sparse(dtype_qkv=dtype, qh_per_kh=g))
+            assert cfg.Q_TX_BYTES == cfg.GATE_TX_BYTES == g * 512 <= cfg.Q_SLOT_BYTES == 8192
+    cfg, _ = make_cfg_d256_sparse(_sparse())
+    table = _predicate_table(monkeypatch, dataclasses.replace(cfg, Q_TX_BYTES=2 * cfg.Q_SLOT_BYTES))
+    assert [ok for ok, msg in table if "must fit the aliased slot" in msg] == [False]
+    assert "hang at every shape" in next(msg for ok, msg in table if not ok), "the box-bytes rule reports first"
+
+
+# ---------------------------------------------------------------------------- TemplateParams: appended, inert, declined by the dense factories
+
+
+def test_index_list_fields_are_appended_with_inert_defaults():
+    names = [f.name for f in dataclasses.fields(TemplateParams)]
+    assert names[-5:] == [
+        "qsa_block_topk",
+        "qsa_block_size",
+        "qsa_include_open_block",
+        "qsa_list_per_sequence",
+        "qsa_softmax_groups",
+    ], "append-only: the four index-list fields + the softmax-split knob are the LAST five"
+    assert TemplateParams() == TemplateParams(
+        qsa_block_topk=0, qsa_block_size=0, qsa_include_open_block=True, qsa_list_per_sequence=False, qsa_softmax_groups=0
+    )
+    d = TemplateParams()
+    assert (d.qsa_block_topk, d.qsa_block_size, d.qsa_include_open_block, d.qsa_list_per_sequence, d.qsa_softmax_groups) == (0, 0, True, False, 0)
+
+
+_DENSE_CASES = [
+    ("sm107.d128", c107.make_cfg_d128, {}),
+    ("sm107.d128.mxfp8", c107.make_cfg_d128_mxfp8, dict(dtype_qkv=E4M3, dtype_o=BF16)),
+    ("sm107.d192", c107.make_cfg_d192, {}),
+    ("sm107.d256", c107.make_cfg_d256, {}),
+    ("sm107.d256.decode", c107.make_cfg_d256_decode, dict(decode_q_tile=16, seq_kv_lens_present=True, pack_gqa=True, qh_per_kh=12)),
+    ("sm107.d256.gate", c107.make_cfg_d256, dict(epilogue_gate=True)),
+    ("sm107.d256.mxfp8", c107.make_cfg_d256_mxfp8, dict(dtype_qkv=E4M3, dtype_o=BF16, cta_mma=1)),
+    ("sm107.d512", c107.make_cfg_d512, {}),
+    ("sm107.d512.2x2", c107.make_cfg_d512_2x2, dict(mma_2x2=True)),
+    ("sm100.d128", c100.make_cfg_d128, {}),
+    ("sm100.d64", c100.make_cfg_d64, dict(d_flavor=64, cta_mma=1)),
+    ("sm100.d192", c100.make_cfg_d192, {}),
+    ("sm100.d256", c100.make_cfg_d256, {}),
+    ("sm100.d256.decode", c100.make_cfg_d256_decode, dict(decode_q_tile=16, seq_kv_lens_present=True, pack_gqa=True, qh_per_kh=12)),
+    ("sm100.d512", c100.make_cfg_d512, {}),
+    ("sm100.d512.2x2", c100.make_cfg_d512_2x2, dict(mma_2x2=True)),
+]
+
+
+@pytest.mark.parametrize("name, factory, kw", _DENSE_CASES, ids=[c[0] for c in _DENSE_CASES])
+def test_every_dense_config_is_unchanged_by_the_inert_defaults(name, factory, kw):
+    """Every existing forward factory renders the SAME record whether the four fields are left to their defaults or passed
+    explicitly at them: the append is invisible to the dense line (the base-vs-branch value snapshot is kept beside the
+    results; this is its in-tree twin)."""
+    plain = factory(TemplateParams(**kw))
+    explicit = factory(TemplateParams(**kw, qsa_block_topk=0, qsa_block_size=0, qsa_include_open_block=True, qsa_list_per_sequence=False))
+    assert plain == explicit
+
+
+@pytest.mark.parametrize("name, factory, kw", _DENSE_CASES, ids=[c[0] for c in _DENSE_CASES])
+def test_every_dense_config_declines_an_index_list_record(name, factory, kw):
+    """A dense template must never consume an index-list record -- it would read K/V densely and silently ignore the list."""
+    with pytest.raises(ValueError, match="select the index-list sparse kernel"):
+        factory(TemplateParams(**kw, qsa_block_topk=512, qsa_block_size=4))
+    with pytest.raises(ValueError, match="select the index-list sparse kernel"):
+        factory(TemplateParams(**kw, qsa_block_size=4))
+
+
+# ---------------------------------------------------------------------------- the kernel file: prologue pins and the one-helper invariant
+
+
+def test_sparse_kernel_prologue_takes_its_geometry_from_the_config():
+    """The module's CFG comes from make_cfg_d256_sparse, DESC_VERSION is the config's derived value (never a literal) and the ring
+    spin constant is a module literal -- the conventions every Rubin kernel's source pins rely on."""
+    src = _KERNEL.read_text()
+    code = "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))
+    assert "CFG, _TMA = make_cfg_d256_sparse(PARAMS)" in code
+    assert "DESC_VERSION: int = CFG.DESC_VERSION" in code
+    assert "SPIN_RING_WAITS: bool = False" in code
+    assert "desc_version=0" not in code and "desc_version=1" not in code, "a re-literalled descriptor version"
+    try:
+        import cudnn.sdpa.fwd.kernels.sm107.sparse_d256_f16 as kern
+    except NotImplementedError as exc:
+        # The body's Rule-7 gate: a DSL without the sm_107a target declines by name at import -- a skip here, never a failure.
+        pytest.skip(f"the sparse kernel module declines this DSL: {exc}")
+
+    assert kern.DESC_VERSION == kern.CFG.DESC_VERSION == 0 and kern.CFG.TOTAL_WARPS == 20 and kern.CFG.SOFTMAX_GROUPS == 2 and kern.Cfg is CfgD256Sparse
+
+
+def _n_tiles_bindings(tree: ast.AST):
+    """Every binding of a name ``n_tiles`` in the module: (line, inside a def named _item_bounds?, bound from a call to _item_bounds?)."""
+    out = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        for sub in ast.walk(node):
+            if isinstance(sub, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                targets = sub.targets if isinstance(sub, ast.Assign) else [sub.target]
+                names = []
+                for t in targets:
+                    for n in ast.walk(t):
+                        if isinstance(n, ast.Name) and n.id == "n_tiles":
+                            names.append(n)
+                if not names:
+                    continue
+                value = sub.value
+                from_helper = isinstance(value, ast.Call) and getattr(value.func, "id", None) == "_item_bounds"
+                out.append((sub.lineno, node.name == "_item_bounds", from_helper))
+    return out
+
+
+def test_item_bounds_is_the_only_n_tiles_source_in_the_kernel():
+    """``n_tiles`` (with ``count`` / ``has_open`` / ``dead``) comes from ONE pure helper called by every role over the same inputs; a
+    second source (a count word staged through SMEM, a role-local recomputation) is a disagreement between roles = an unreachable or
+    over-run barrier.  Every binding of ``n_tiles`` in the file is either inside ``_item_bounds`` itself or unpacked from a call to it
+    -- and the pin ARMS with the body: a module that defines any function must define ``_item_bounds`` and bind ``n_tiles`` from a
+    call to it at least once (a body that never calls the helper, or names the variable differently, fails); the header-only module
+    is asserted as such (no function, no binding), never read as a vacuous pass."""
+    src = _KERNEL.read_text()
+    assert "_item_bounds" in src, "the kernel header names the one helper"
+    tree = ast.parse(src)
+    bindings = _n_tiles_bindings(tree)
+    offenders = [(ln, in_helper, from_helper) for ln, in_helper, from_helper in bindings if not (in_helper or from_helper)]
+    assert not offenders, f"n_tiles bound outside _item_bounds and not from a call to it: {offenders}"
+    defs = {node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
+    if defs:
+        assert "_item_bounds" in defs, f"the body defines {len(defs)} functions but no _item_bounds"
+        assert any(from_helper for _, _, from_helper in bindings), "no role binds n_tiles from a call to _item_bounds"
+    else:
+        assert not bindings, "a header-only module binds n_tiles"
+    # the detector itself is live: a synthetic module with a role-local recomputation is caught
+    probe = ast.parse("def _mma_warp_group(hi, lo):\n    n_tiles = hi - lo\n    return n_tiles\n")
+    assert any(not (a or b) for _, a, b in _n_tiles_bindings(probe))
+    ok = ast.parse("def _item_bounds(p):\n    n_tiles = 1\n    return n_tiles\n\ndef _mma(p):\n    lo, n_tiles, dead = _item_bounds(p)\n    return n_tiles\n")
+    assert all(a or b for _, a, b in _n_tiles_bindings(ok))
+
+
+def test_sparse_factory_signature_is_append_only():
+    """``make_cfg_d256_sparse(params, *, gather_warps=8)``: the positional record first, the warp-population switch keyword-only."""
+    sig = inspect.signature(make_cfg_d256_sparse)
+    params = list(sig.parameters.values())
+    assert params[0].name == "params" and params[0].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+    assert params[1].name == "gather_warps" and params[1].kind is inspect.Parameter.KEYWORD_ONLY and params[1].default == 8
+    assert params[2].name == "softmax_groups" and params[2].kind is inspect.Parameter.KEYWORD_ONLY and params[2].default == 0, "appended after gather_warps"

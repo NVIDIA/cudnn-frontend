@@ -59,6 +59,7 @@ from cudnn.frost.tile_dsl.constants import (
     SCHED_NATURAL,
 )
 from cudnn.sdpa.fwd.config_sm100 import (
+    d256_mxfp8_pair_leg,
     TemplateParams as Sm100TemplateParams,
     cga_tile_m,
     cga_ctas,
@@ -86,13 +87,14 @@ from cudnn.sdpa.fwd.engines import (
     decode_d256_q_tile_for_row,
     effective_cgas,
     effective_sched_policies,
+    launch_grid_mismatch,
     mismatch,
     pack_gqa_partial,
     rubin_dense_d128_shared_leg,
 )
 
 # Cells whose (tile_m, tile_n) choice _sm120_tiles makes.
-_TILE_RULE_CELLS = frozenset({"sdpa_fwd_prefill_sm120", "sdpa_fwd_prefill_sm120_fp8"})
+_TILE_RULE_CELLS = frozenset({"sdpa_fwd_prefill_sm120", "sdpa_fwd_prefill_sm120_fp8", "sdpa_fwd_prefill_sm120_mxfp8"})
 
 # Cap on complete knob sets emitted per engine per kind. The combiner grows
 # Σ|axis runners|, never the cartesian product; this bound keeps the plan list
@@ -476,6 +478,23 @@ def choose_decode_tile_split_kv(
     return best
 
 
+def _sm120_envelope(facts) -> Tuple[int, int]:
+    """(D_QK, D_V) rounded up to the head-tile granule: the ENVELOPE tiles the
+    SM120 kernels stage, so a fit check must use them or a tile offered here
+    declines at build (and a knob-carried tile skips the adapter's fallback)."""
+    granule = FP8_HEAD_TILE_GRANULE if (facts.is_fp8 or facts.is_mxfp8) else HEAD_TILE_GRANULE
+    return -(-facts.d_qk // granule) * granule, -(-facts.d_v // granule) * granule
+
+
+def _sm120_fits_smem(facts, tile_m: int, tile_n: int) -> bool:
+    """Whether a (tile_m, tile_n) CTA fits SM120 SMEM. FP8 stages a byte per KV
+    element but still writes O in half, so the two SMEM terms size differently
+    (config_sm120.smem_bytes); MXFP8 adds its K/V scale tiles."""
+    quantized = facts.is_fp8 or facts.is_mxfp8
+    d_qp, d_vp = _sm120_envelope(facts)
+    return smem_bytes(d_qp, d_vp, tile_m, tile_n, 1 if quantized else 2, 2, mxfp8=facts.is_mxfp8) <= SMEM_CAPACITY_BYTES
+
+
 def _sm120_tiles(caps: Capabilities, facts) -> Tuple[int, int]:
     """(tile_m, tile_n) for the SM120 SDPA-forward prefill cell.
 
@@ -506,25 +525,16 @@ def _sm120_tiles(caps: Capabilities, facts) -> Tuple[int, int]:
     kv_tiles = -(-facts.s_kv // 128)
     fine = sm_count > 0 and (grid * 2 <= sm_count or (grid * 2 <= 3 * sm_count and kv_tiles >= 12))
     preferred_tile_m = 64 if fine else 128
-    # FP8 stages a byte per KV element but still writes O in half, so the two
-    # SMEM terms size differently -- see config_sm120.smem_bytes. The kernel
-    # stages ENVELOPE head tiles (actual dims round up to the granule), so
-    # the fit check must round the same way or a tile offered here declines
-    # at build -- and a knob-carried tile skips the adapter's fallback.
-    qkv_itemsize, o_itemsize = (1, 2) if facts.is_fp8 else (2, 2)
-    granule = FP8_HEAD_TILE_GRANULE if facts.is_fp8 else HEAD_TILE_GRANULE
-    d_qp = -(-facts.d_qk // granule) * granule
-    d_vp = -(-facts.d_v // granule) * granule
     # Prefer the selected query tile, then larger query and KV tiles.
     candidate_tiles = sorted(
-        tile_domain(facts.d_qk, facts.d_v, facts.is_fp8),
+        tile_domain(facts.d_qk, facts.d_v, facts.is_fp8 or facts.is_mxfp8),
         key=lambda tile: (tile[0] == preferred_tile_m, tile[0], tile[1]),
         reverse=True,
     )
     for m, n in candidate_tiles:
         if m not in caps.tile_ms or n not in caps.tile_ns:
             continue
-        if smem_bytes(d_qp, d_vp, m, n, qkv_itemsize, o_itemsize) <= SMEM_CAPACITY_BYTES:
+        if _sm120_fits_smem(facts, m, n):
             return m, n
     # Nothing fits: fall back to the smallest tile the kernel table admits for
     # the row, so the decline comes from the SMEM check rather than at build.
@@ -543,18 +553,8 @@ def _tile_points(spec: EngineSpec, facts) -> List[Tuple[Optional[int], Optional[
         # axis, so there is nothing to choose between anyway.
         return [(_sole(caps.tile_ms), _sole(caps.tile_ns))]
     best = _sm120_tiles(caps, facts)
-    qkv_itemsize, o_itemsize = (1, 2) if facts.is_fp8 else (2, 2)
-    # Same envelope rounding as _sm120_tiles / the adapter's SMEM check.
-    granule = FP8_HEAD_TILE_GRANULE if facts.is_fp8 else HEAD_TILE_GRANULE
-    d_qp = -(-facts.d_qk // granule) * granule
-    d_vp = -(-facts.d_v // granule) * granule
-    tile_choices = tile_domain(facts.d_qk, facts.d_v, facts.is_fp8)
-    domain = [
-        (m, n)
-        for m in caps.tile_ms
-        for n in caps.tile_ns
-        if (m, n) in tile_choices and smem_bytes(d_qp, d_vp, m, n, qkv_itemsize, o_itemsize) <= SMEM_CAPACITY_BYTES
-    ]
+    tile_choices = tile_domain(facts.d_qk, facts.d_v, facts.is_fp8 or facts.is_mxfp8)
+    domain = [(m, n) for m in caps.tile_ms for n in caps.tile_ns if (m, n) in tile_choices and _sm120_fits_smem(facts, m, n)]
     return sorted(domain or [best], key=lambda mn: (mn != best, mn[1] != best[1], -mn[0]))
 
 
@@ -860,18 +860,22 @@ def select_d256_auto_knobs(
     pertensor: bool,
     s_q: int,
     s_kv: int,
+    device_cc: Optional[tuple[int, int]] = None,
+    paged: bool = False,
 ) -> tuple[int, int]:
-    """Select the measured D256 scheduler and fixed FP8 CTA1 geometry."""
+    """Select the measured D256 scheduler and CTA geometry: the 2-CTA pair for f16 and for the cc 10.7 MXFP8 dense
+    unsplit legs (config_sm100.d256_mxfp8_pair_leg), one CTA for the other quantized legs."""
 
     fp8 = params.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
     if not fp8:
         return params.sched_policy, 2
     if params.split_kv > 1 or params.thd_varlen:
         return SCHED_NATURAL, 1
+    cga = 2 if d256_mxfp8_pair_leg(device_cc=device_cc, pertensor=pertensor, thd=params.thd_varlen, paged=paged, split_kv=params.split_kv) else 1
 
     no_mask = params.window_left is None and params.window_right is None and not params.seq_kv_lens_present
     if no_mask:
-        return SCHED_NATURAL, 1
+        return SCHED_NATURAL, cga
 
     top_left = not params.bottom_right or d256_square_br_as_tl(params, s_q=s_q, s_kv=s_kv)
     pt_lpt_l2 = (
@@ -883,8 +887,8 @@ def select_d256_auto_knobs(
         and _ceil_div(s_q, 256) >= 16
     )
     if pt_lpt_l2:
-        return params.sched_policy, 1
-    return SCHED_LPT, 1
+        return params.sched_policy, cga
+    return SCHED_LPT, cga
 
 
 def select_d512_auto_knobs(params: Sm100TemplateParams) -> tuple[int, int]:
@@ -1125,7 +1129,7 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
         # no-split 1.07x -> 1.05x, dense S=2K unchanged.  The split leg keeps
         # cga2 (split_cgas_by_d_shape); the THD and paged legs are cga2-only.
         return sched_policy, 1
-    if selected_shape == (128, 128) and facts.is_mxfp8 and 1 in domain and not facts.thd and not facts.has_paged_kv:
+    if selected_shape == (128, 128) and facts.is_mxfp8 and caps.sm_lo == 100 and 1 in domain and not facts.thd and not facts.has_paged_kv:
         # MXFP8 d128 on a dense graph.  cga1 = one 256-row CTA of the prefill body (the geometry cuDNN's own MXFP8
         # d128 kernel runs; no pair handshake at the tile boundary, but no K/V multicast either).  MEASURED 2026-10-07
         # against the cga2 pair in the benchmark regime (same-node A/B, cuDNN 9.27; O bit-identical between the
@@ -1190,7 +1194,9 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
         return sched_policy, (1 if _d128_decode_tile_fits(caps, facts, pack_gqa) or _d128_dense_cga1_waves_win(caps, facts, pack_gqa) else 2)
     if selected_shape == (256, 256) and any(shape == selected_shape for shape, _ in caps.cgas_by_d_shape):
         params = _sm100_params_from_facts(facts, split_kv=split_kv, sched_policy=sched_policy)
-        selected_sched, selected_cga = select_d256_auto_knobs(params, pertensor=facts.is_fp8, s_q=facts.s_q, s_kv=facts.s_kv)
+        selected_sched, selected_cga = select_d256_auto_knobs(
+            params, pertensor=facts.is_fp8, s_q=facts.s_q, s_kv=facts.s_kv, device_cc=facts.device_cc, paged=facts.has_paged_kv
+        )
         if selected_cga not in domain:
             raise ValueError(f"D256 heuristic selected cga={selected_cga} outside the declared domain {sorted(domain)}")
         return _in_flavor_sched_domain(caps, facts, selected_sched, sched_policy), selected_cga
@@ -2162,7 +2168,12 @@ def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
         caps = spec.capabilities
         sets = _knob_sets(spec, facts) if kind == "A" else [_fallback_knobs(spec, facts)]
         for knobs in sets:
-            if mismatch(caps, facts, knobs) is None:
+            if mismatch(caps, facts, knobs) is not None:
+                if knobs.split_kv != 1 or launch_grid_mismatch(caps, facts, knobs) is None:
+                    continue
+                # Past 65535 heads or batch the NATURAL grid cannot launch; the flat LPT grid serves the same set (#1573).
+                knobs = next((lpt for lpt in (replace(knobs, sched_policy=p) for p in (SCHED_LPT, SCHED_LPT_L2)) if mismatch(caps, facts, lpt) is None), None)
+            if knobs is not None and PlanConfig(engine_id, knobs) not in out:
                 out.append(PlanConfig(engine_id, knobs))
     return out
 

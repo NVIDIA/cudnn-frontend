@@ -2763,7 +2763,10 @@ def _softmax_warp_group(
                     )
                 if tail_phantom:
                     seg_hi = seg_hi - cutlass.Int32(1)
-            for kv_loop in cutlass.range(seg_lo, bounds.unmasked_lo, 1, unroll=1):
+            # Clamp the unmasked band into the peeled range, else a narrow band revisits the phantom step (#1604).
+            unmasked_lo = cute.math.min(cute.math.max(bounds.unmasked_lo, seg_lo), seg_hi)
+            unmasked_hi = cute.math.min(cute.math.max(bounds.unmasked_hi, unmasked_lo), seg_hi)
+            for kv_loop in cutlass.range(seg_lo, unmasked_lo, 1, unroll=1):
                 total_max, total_sum, bmm1_phase, stat_empty_phase, p_inplace_phase, alpha_addr = _softmax_kv_body(
                     True,
                     sub_tile_id,
@@ -2784,7 +2787,7 @@ def _softmax_warp_group(
                     alpha_addr,
                     leader_cta_id,
                 )
-            for kv_loop in cutlass.range(bounds.unmasked_lo, bounds.unmasked_hi, 1, unroll=1):
+            for kv_loop in cutlass.range(unmasked_lo, unmasked_hi, 1, unroll=1):
                 total_max, total_sum, bmm1_phase, stat_empty_phase, p_inplace_phase, alpha_addr = _softmax_kv_body(
                     False,
                     sub_tile_id,
@@ -2805,7 +2808,7 @@ def _softmax_warp_group(
                     alpha_addr,
                     leader_cta_id,
                 )
-            for kv_loop in cutlass.range(bounds.unmasked_hi, seg_hi, 1, unroll=1):
+            for kv_loop in cutlass.range(unmasked_hi, seg_hi, 1, unroll=1):
                 total_max, total_sum, bmm1_phase, stat_empty_phase, p_inplace_phase, alpha_addr = _softmax_kv_body(
                     True,
                     sub_tile_id,

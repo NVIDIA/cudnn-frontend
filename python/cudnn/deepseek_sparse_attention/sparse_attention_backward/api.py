@@ -10,6 +10,7 @@ implementation based on the active CUDA device. It consumes the ``out`` and
 
 from __future__ import annotations
 
+import math
 from typing import Optional, Tuple
 
 import torch
@@ -43,8 +44,15 @@ class SparseAttentionBackward(APIBase):
         softmax_scale: Optional[float] = None,
         block_tile: int = 64,
         deterministic: bool = False,
+        q_cluster_mode: str = "off",
     ):
-        """Capture the sample tensor contract and execution policy."""
+        """Capture the sample tensor contract and execution policy.
+
+        ``q_cluster_mode='adaptive_pair'`` opts H16/H32 Dqk576 into the
+        graph-safe adjacent-query sharing plan; the default keeps the existing
+        backend unchanged. H16 ``topk_max <= 256`` and H32 ``topk_max <= 128``
+        accept the mode but retain the ordinary backend.
+        """
         super().__init__()
         self.q_desc = self._make_tensor_desc(sample_q, name="sample_q")
         self.kv_desc = self._make_tensor_desc(sample_kv, name="sample_kv")
@@ -57,8 +65,10 @@ class SparseAttentionBackward(APIBase):
         self.block_tile = int(block_tile)
         self.softmax_scale = softmax_scale
         self.deterministic = bool(deterministic)
+        self.q_cluster_mode = q_cluster_mode
         self._backend = None
         self._two_cta_split_count = 1
+        self._qcluster_plan = None
 
     def check_support(self) -> bool:
         """Validate the device, dtype, shape, and deterministic contracts."""
@@ -119,6 +129,22 @@ class SparseAttentionBackward(APIBase):
         # coordinates derived from Q, so a mismatched shape silently reads or
         # writes out of place at execution time instead of failing.
         total_s_q, num_heads, head_dim = self.q_desc.shape
+        self._value_error_if(
+            self.q_cluster_mode not in ("off", "adaptive_pair"),
+            f"q_cluster_mode must be 'off' or 'adaptive_pair', got {self.q_cluster_mode!r}",
+        )
+        if self.q_cluster_mode == "adaptive_pair":
+            max_topk = self.topk_idxs_desc.shape[1] if self.topk_idxs_desc.ndim == 2 else 0
+            self._value_error_if(
+                capability not in _iface_sm100._BLACKWELL_CAPABILITIES
+                or self.q_desc.dtype != torch.bfloat16
+                or num_heads not in (16, 32)
+                or head_dim != 576
+                or self.deterministic
+                or not 0 < max_topk <= 2048
+                or not all(desc.is_contiguous() for desc in descriptors),
+                "q_cluster_mode='adaptive_pair' requires contiguous SM100 BF16 H16/H32 Dqk576 inputs, " "non-deterministic execution, and 1 <= topk <= 2048",
+            )
         self._value_error_if(
             self.deterministic and (major != 10 or num_heads not in _iface_sm100._DETERMINISTIC_HEAD_COUNTS),
             f"deterministic DSA backward requires SM100 and heads in {_iface_sm100._DETERMINISTIC_HEAD_COUNTS}, found SM{major} H{num_heads}",
@@ -195,7 +221,26 @@ class SparseAttentionBackward(APIBase):
         return True
 
     def compile(self) -> None:
+        """Compile the selected backend, including every adaptive-pair stage."""
         self._ensure_support_checked()
+        if self.q_cluster_mode == "adaptive_pair":
+            from ._qcluster_sm100 import compile_plan
+
+            total_q, heads, dim = self.q_desc.shape
+            tile = 128 if heads == 16 else 64
+            if total_q >= 2 and self.topk_idxs_desc.shape[1] > 2 * tile:
+                with torch.cuda.device(self.q_desc.device):
+                    self._qcluster_plan = compile_plan(
+                        torch.cuda.get_device_capability(self.q_desc.device),
+                        total_q,
+                        self.kv_desc.shape[0],
+                        heads,
+                        dim,
+                        self.topk_idxs_desc.shape[1],
+                        self.topk_length_desc is not None,
+                    )
+                self._compiled_kernel = self._qcluster_plan
+                return
         if self._backend == _iface_d576.BACKEND:
             with torch.cuda.device(self.q_desc.device):
                 self._compiled_kernel = _iface_d576._compile_d576_2cta(
@@ -216,6 +261,11 @@ class SparseAttentionBackward(APIBase):
         major, _ = device_capability(self.q_desc.device)
         total_s_q, num_heads, head_dim = self.q_desc.shape
         total_s_kv = self.kv_desc.shape[0]
+        tile = 128 if num_heads == 16 else 64
+        if self.q_cluster_mode == "adaptive_pair" and total_s_q >= 2 and self.topk_idxs_desc.shape[1] > 2 * tile:
+            from ._qcluster_sm100 import workspace_size
+
+            return workspace_size(total_s_q, total_s_kv, head_dim, num_heads, self.topk_idxs_desc.shape[1])
         if major == 9:
             from . import _interface_sm90 as _iface_sm90
 
@@ -252,7 +302,11 @@ class SparseAttentionBackward(APIBase):
         ``scratch_workspace_bytes()`` is non-zero) ``workspace`` to be
         caller-provided; execute never allocates. ``d_sink`` is keyword-only so
         the positional order of the pre-existing parameters is unchanged. The
-        H128/D576 two-CTA route additionally never compiles here.
+        H128/D576 two-CTA route additionally never compiles here. Adaptive
+        pairing makes its overlap decision on device and launches only stages
+        compiled by ``compile()``, so replay needs no host branch or D2H read.
+        Inputs, outputs, and the live workspace must not overlap; concurrent
+        executions need distinct output and workspace storage.
         """
         for name, tensor in (("dq", dq), ("dkv", dkv), ("d_sink", d_sink)):
             if not isinstance(tensor, torch.Tensor):
@@ -295,6 +349,27 @@ class SparseAttentionBackward(APIBase):
                 self._two_cta_split_count,
                 current_stream,
             )
+        if self._qcluster_plan is not None:
+            if self._compiled_kernel is None:
+                raise RuntimeError("call compile() before execute()")
+            scale = 1.0 / math.sqrt(self.q_desc.shape[2]) if scale is None else scale
+            with torch.cuda.device(q.device):
+                return self._qcluster_plan.execute(
+                    q,
+                    kv,
+                    out,
+                    dout,
+                    lse,
+                    attn_sink,
+                    topk_idxs,
+                    topk_length,
+                    dq,
+                    dkv,
+                    d_sink,
+                    workspace,
+                    scale,
+                    current_stream,
+                )
         # Resolve the architecture from Q's device rather than the ambient current
         # device, and launch under that device context, matching check_support().
         major, _ = device_capability(q.device)
@@ -356,6 +431,7 @@ def sparse_attention_backward_wrapper(
     deterministic: bool = False,
     stream: Optional[cuda.CUstream] = None,
     workspace: Optional[torch.Tensor] = None,
+    q_cluster_mode: str = "off",
 ) -> TupleDict:
     """High-level wrapper. Returns ``{'dq', 'dkv', 'd_sink'}``.
 
@@ -365,7 +441,18 @@ def sparse_attention_backward_wrapper(
     H16/H32/H64/H96/H128 gradients on SM100. The optional reusable uint8
     ``workspace`` must hold at least
     ``SparseAttentionBackward.scratch_workspace_bytes()`` bytes.
+
+    ``q_cluster_mode='adaptive_pair'`` partitions each adjacent query pair on
+    the GPU and evaluates a profitable shared KV segment once. The opt-in
+    SM100/SM103 BF16 H16/H32 Dqk576 path accepts contiguous raw top-k rows with
+    ``topk_max <= 2048``, requires non-deterministic execution, and remains
+    graph-capturable. Low-overlap pairs fall back on device; H16
+    ``topk_max <= 256`` and H32 ``topk_max <= 128`` use the ordinary backend.
+    The wrapper stages strided inputs and outputs and allocates omitted outputs
+    or workspace on the launch stream; the plan's ``execute()`` does neither.
     """
+    if q_cluster_mode not in ("off", "adaptive_pair"):
+        raise ValueError(f"q_cluster_mode must be 'off' or 'adaptive_pair', got {q_cluster_mode!r}")
     # The plan addresses contiguous tensors only (check_support declines the rest, R5).
     # The wrapper is the eager torch-op layer: it normalises strided inputs here, on the
     # launch stream, as it always did, and stages a strided caller output so the
@@ -390,6 +477,7 @@ def sparse_attention_backward_wrapper(
         int(block_tile),
         softmax_scale,
         bool(deterministic),
+        q_cluster_mode,
     )
     obj = _cache_of_SparseAttentionBackwardObjects.get(key)
     if obj is None:
@@ -405,6 +493,7 @@ def sparse_attention_backward_wrapper(
             softmax_scale=softmax_scale,
             block_tile=block_tile,
             deterministic=deterministic,
+            q_cluster_mode=q_cluster_mode,
         )
         assert obj.check_support()
         obj.compile()

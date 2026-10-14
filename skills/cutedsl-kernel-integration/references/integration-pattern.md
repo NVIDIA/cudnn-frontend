@@ -48,7 +48,7 @@ Use this routing table before choosing the package namespace:
 Follow the closest template instead of inventing a new lifecycle.
 
 - Public functions:
-  - Name each function `<op_name>_<direction>` (PyTorch) or `<op_name>_jax_<direction>` (JAX), following `docs/fe-oss-apis/api_conventions.md`.
+  - Name each function `<op_name>_<direction>` (PyTorch) or `<op_name>_<direction>_jax` (JAX), following `docs/fe-oss-apis/api_conventions.md`.
   - Validate dtype, shape, stride, tiling, architecture, and unsupported combinations before compiling.
   - For fused kernels, validate epilogue-specific constraints: activation mode, auxiliary inputs/outputs, output shape/stride contract, dtype compatibility, and unsupported activation/config combinations.
   - For dense blockscaled epilogue kernels, model every public output explicitly. Common contracts include `C` plus `AB12`, split `D1/D2`, `amax`, `SFC`, `SFD1/SFD2`, or probability inputs such as `prob_tensor`.
