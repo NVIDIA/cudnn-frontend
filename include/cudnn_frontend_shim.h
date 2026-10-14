@@ -20,6 +20,7 @@
 #endif
 #define NOMINMAX
 #include <windows.h>
+#include <memory>
 #include <string>
 
 namespace cudnn_frontend::detail {
@@ -168,6 +169,8 @@ load_cuda_so() {
 #ifdef _WIN32
 inline HMODULE
 validate_cuda13_runtime(HMODULE handle, const char *library) {
+    // Own the reference before diagnostics can allocate or throw.
+    std::unique_ptr<std::remove_pointer_t<HMODULE>, decltype(&FreeLibrary)> owner(handle, &FreeLibrary);
     // CUDA 13 graph wrappers use CUDA 13 signatures. Symbol names alone do not
     // distinguish those signatures from the incompatible CUDA 12 entry points.
     dlerror();
@@ -176,18 +179,16 @@ validate_cuda13_runtime(HMODULE handle, const char *library) {
     if (!symbol || error) {
         const std::string message = "Cannot validate CUDA 13 runtime " + std::string(library) + ": " +
                                     std::string(error ? error : "cudaRuntimeGetVersion unavailable");
-        dlclose(handle);
         throw std::runtime_error(message);
     }
     int version = 0;
     auto status = reinterpret_cast<decltype(&cudaRuntimeGetVersion)>(symbol)(&version);
     if (status != cudaSuccess || version / 1000 != 13) {
-        dlclose(handle);
         throw std::runtime_error("CUDA 13 runtime required; " + std::string(library) + " reported version " +
                                  std::to_string(version) + " (cudaRuntimeGetVersion status " +
                                  std::to_string(static_cast<int>(status)) + ")");
     }
-    return handle;
+    return owner.release();
 }
 #endif
 
