@@ -84,6 +84,27 @@ def live_kernel_view(tensor, normalize, canonical: bool, name: str):
     return view
 
 
+def operand_signature(tensor):
+    """Hashable (shape, stride, dtype, device) of an execute operand, or None; data pointers excluded."""
+    if tensor is None:
+        return None
+    from cudnn.tensor_adapter import get_device, get_shape, get_strides, is_torch_tensor
+
+    if is_torch_tensor(tensor):
+        return (tensor.shape, tensor.stride(), tensor.dtype, tensor.device)
+    return (get_shape(tensor), get_strides(tensor), tensor.dtype, get_device(tensor))
+
+
+def validate_once(cache: dict, check, operands) -> None:
+    """``check(*operands)`` once per distinct operand metadata; the outcome depends on nothing else."""
+    signature = tuple(operand_signature(tensor) for tensor in operands)
+    if signature not in cache:
+        check(*operands)
+        if len(cache) >= 1024:
+            cache.clear()
+        cache[signature] = True
+
+
 def is_flat_sf(tensor) -> bool:
     """True when a scale-factor tensor is a dense C-contiguous buffer (canonical form).
 

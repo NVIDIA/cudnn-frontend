@@ -1509,7 +1509,7 @@ def grouped_gemm_glu_wrapper_sm100(
 
 
 grouped_gemm_glu_wrapper_sm100.supports_canonical_layouts = True
-grouped_gemm_glu_wrapper_sm100.supports_canonical_bf16 = True
+grouped_gemm_glu_wrapper_sm100.supports_bf16_canonical_layouts = True
 
 
 __all__ = ["GluCall", "GroupedGemmGluSm100", "grouped_gemm_glu_wrapper_sm100"]

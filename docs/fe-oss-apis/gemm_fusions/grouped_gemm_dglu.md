@@ -73,7 +73,7 @@ For padded rows `M`, reduction dimension `K`, compact gradient width `N`, and
 Torch callers may instead pass the canonical layouts: contiguous `A` `(M, K)`,
 `C` `(M, 2N)`, `prob` and `dprob` `(M,)`, and dense `B` `(L, N, K)`, or the N-major
 `(L, K, N)` buffer with `b_major="n"`. With 2-D `A`, the wrapper returns `D_row`
-`(M, 2N)`. The wrapper advertises `supports_canonical_bf16`.
+`(M, 2N)`. The wrapper advertises `supports_bf16_canonical_layouts`.
 
 `padded_offsets` values and `b_ptrs` entries are a **device-data contract**: the kernel
 reads them on device, and neither `check_support()` nor `execute()` copies them to

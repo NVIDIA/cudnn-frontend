@@ -40,7 +40,7 @@ from cudnn.tensor_adapter import (
 )
 
 from ..backend_utils import debug_validate_offsets, debug_validate_pointer_values
-from ..canonical import canonical_b_fake, canonical_mx_fake, canonical_prob_fake, live_kernel_view, normalize_b, normalize_mx, normalize_prob
+from ..canonical import canonical_b_fake, canonical_mx_fake, canonical_prob_fake, live_kernel_view, normalize_b, normalize_mx, normalize_prob, validate_once
 from ..moe_utils import MoEWeightMode
 from .moe_grouped_gemm_dglu_dbias import MoEGroupedGemmDgluDbiasBf16Kernel
 
@@ -96,9 +96,8 @@ class GroupedGemmDgluBf16API(APIBase):
         else:
             raise ValueError("Provide sample_b for dense mode or (num_experts, b_shape, b_dtype) " "for discrete mode, but not both")
 
-        # A canonical TensorDesc is rebuilt and re-checked for every operand on every
-        # launch, which is the largest single cost in execute(). See _validate_live_tensor.
-        self._live_desc_cache: dict = {}
+        # execute() checks operand metadata once per distinct signature; see validate_live_operands.
+        self._validated_signatures: dict = {}
         self.canonical_a, sample_a = normalize_mx(sample_a)
         self.canonical_c, sample_c = normalize_mx(sample_c)
         self.canonical_d_row, sample_d_row = normalize_mx(sample_d_row)
@@ -540,14 +539,6 @@ class GroupedGemmDgluBf16API(APIBase):
     def _validate_live_tensor(
         self, tensor: torch.Tensor, sample: TensorDesc, name: str, *, dynamic_m: bool = False, normalize=None, canonical: bool = False
     ) -> TensorDesc:
-        # The outcome of this check is decided entirely by (shape, stride, dtype, device),
-        # so memoize on exactly that. An operand differing in any of them takes a different
-        # key, misses, and is checked in full; nothing is skipped on the strength of a
-        # tensor's identity. Data-pointer alignment is checked by the caller, not here.
-        key = (name, dynamic_m, get_shape(tensor), get_strides(tensor), tensor.dtype, get_device(tensor))
-        hit = self._live_desc_cache.get(key)
-        if hit is not None:
-            return hit
         if normalize is not None:
             tensor = live_kernel_view(tensor, normalize, canonical, name)
         desc = self._make_tensor_desc(tensor, name=name, canonical=True)
@@ -562,8 +553,81 @@ class GroupedGemmDgluBf16API(APIBase):
                 raise ValueError(f"{name} layout mismatch: expected stride order {sample.stride_order}, got {desc.stride_order}")
         elif desc.shape != sample.shape or desc.stride != sample.stride:
             raise ValueError(f"{name} descriptor mismatch: expected shape/stride {sample.shape}/{sample.stride}, " f"got {desc.shape}/{desc.stride}")
-        self._live_desc_cache[key] = desc
         return desc
+
+    def validate_live_operands(
+        self,
+        a_tensor,
+        c_tensor,
+        d_row_tensor,
+        padded_offsets,
+        alpha_tensor,
+        beta_tensor,
+        prob_tensor,
+        dprob_tensor,
+        b_tensor,
+        b_ptrs,
+        dbias_tensor,
+        activation_tensor,
+    ) -> None:
+        """Every metadata-only execute check; execute() memoizes it on the operands' metadata."""
+        a_desc = self._validate_live_tensor(a_tensor, self.a_desc, "a_tensor", dynamic_m=True, normalize=normalize_mx, canonical=self.canonical_a)
+        tensor_m, k, _ = a_desc.shape
+        if tensor_m % 256 != 0:
+            raise ValueError(f"a_tensor M dimension must be 256-aligned, got {tensor_m}")
+        c_desc = self._validate_live_tensor(c_tensor, self.c_desc, "c_tensor", dynamic_m=True, normalize=normalize_mx, canonical=self.canonical_c)
+        d_desc = self._validate_live_tensor(
+            d_row_tensor, self.d_row_desc, "d_row_tensor", dynamic_m=True, normalize=normalize_mx, canonical=self.canonical_d_row
+        )
+        prob_desc = self._validate_live_tensor(
+            prob_tensor, self.prob_desc, "prob_tensor", dynamic_m=True, normalize=normalize_prob, canonical=self.canonical_prob
+        )
+        dprob_desc = self._validate_live_tensor(
+            dprob_tensor, self.dprob_desc, "dprob_tensor", dynamic_m=True, normalize=normalize_prob, canonical=self.canonical_dprob
+        )
+        self._validate_live_tensor(padded_offsets, self.padded_offsets_desc, "padded_offsets")
+        self._validate_live_tensor(alpha_tensor, self.alpha_desc, "alpha_tensor")
+        self._validate_live_tensor(beta_tensor, self.beta_desc, "beta_tensor")
+
+        two_n = c_desc.shape[1]
+        self._expect_shape(c_desc, (tensor_m, two_n, 1), "c_tensor")
+        self._expect_shape(d_desc, (tensor_m, two_n, 1), "d_row_tensor")
+        self._expect_shape(prob_desc, (tensor_m, 1, 1), "prob_tensor")
+        self._expect_shape(dprob_desc, (tensor_m, 1, 1), "dprob_tensor")
+        self._expect_stride(a_desc, (k, 1, tensor_m * k), "a_tensor")
+        self._expect_stride(c_desc, (two_n, 1, tensor_m * two_n), "c_tensor")
+        self._expect_stride(d_desc, (two_n, 1, tensor_m * two_n), "d_row_tensor")
+        self._expect_stride(prob_desc, canonicalize_unit_dim_strides((tensor_m, 1, 1), (1, 1, 1)), "prob_tensor")
+        self._expect_stride(dprob_desc, canonicalize_unit_dim_strides((tensor_m, 1, 1), (1, 1, 1)), "dprob_tensor")
+
+        if self._has_dbias:
+            if dbias_tensor is None:
+                raise ValueError("dbias_tensor is required because the API was compiled with sample_dbias")
+            self._validate_live_tensor(dbias_tensor, self.dbias_desc, "dbias_tensor")
+        elif dbias_tensor is not None:
+            raise ValueError("dbias_tensor must be omitted because the API was compiled without sample_dbias")
+
+        if self.activation_desc is not None:
+            if activation_tensor is None:
+                raise ValueError("activation_tensor is required because the API was compiled with sample_activation")
+            activation_desc = self._validate_live_tensor(
+                activation_tensor, self.activation_desc, "activation_tensor", dynamic_m=True, normalize=normalize_mx, canonical=self.canonical_activation
+            )
+            self._expect_shape(activation_desc, (tensor_m, two_n // 2, 1), "activation_tensor")
+            self._expect_stride(activation_desc, (two_n // 2, 1, tensor_m * (two_n // 2)), "activation_tensor")
+        elif activation_tensor is not None:
+            raise ValueError("activation_tensor must be omitted because the API was compiled without sample_activation")
+
+        if self.weight_mode == MoEWeightMode.DENSE:
+            if b_tensor is None or b_ptrs is not None:
+                raise ValueError("Dense execution requires b_tensor and forbids b_ptrs")
+            self._validate_live_tensor(b_tensor, self.b_desc, "b_tensor", normalize=self.normalize_b, canonical=self.canonical_b)
+        else:
+            if b_tensor is not None or b_ptrs is None:
+                raise ValueError("Discrete execution requires b_ptrs and forbids b_tensor")
+            _validate_pointer_tensor(b_ptrs, "b_ptrs", self.expert_cnt)
+            if get_device(b_ptrs) != self.a_desc.device:
+                raise ValueError(f"b_ptrs must be on the same device as a_tensor ({self.a_desc.device}), got {get_device(b_ptrs)}")
 
     def execute(
         self,
@@ -593,36 +657,23 @@ class GroupedGemmDgluBf16API(APIBase):
         if self._compiled_kernel is None:
             raise RuntimeError("Kernel not compiled; call compile() first")
 
-        a_desc = self._validate_live_tensor(a_tensor, self.a_desc, "a_tensor", dynamic_m=True, normalize=normalize_mx, canonical=self.canonical_a)
-        tensor_m, k, _ = a_desc.shape
-        if tensor_m % 256 != 0:
-            raise ValueError(f"a_tensor M dimension must be 256-aligned, got {tensor_m}")
-        c_desc = self._validate_live_tensor(c_tensor, self.c_desc, "c_tensor", dynamic_m=True, normalize=normalize_mx, canonical=self.canonical_c)
-        d_desc = self._validate_live_tensor(
-            d_row_tensor, self.d_row_desc, "d_row_tensor", dynamic_m=True, normalize=normalize_mx, canonical=self.canonical_d_row
+        operands = (
+            a_tensor,
+            c_tensor,
+            d_row_tensor,
+            padded_offsets,
+            alpha_tensor,
+            beta_tensor,
+            prob_tensor,
+            dprob_tensor,
+            b_tensor,
+            b_ptrs,
+            dbias_tensor,
+            activation_tensor,
         )
-        prob_desc = self._validate_live_tensor(
-            prob_tensor, self.prob_desc, "prob_tensor", dynamic_m=True, normalize=normalize_prob, canonical=self.canonical_prob
-        )
-        dprob_desc = self._validate_live_tensor(
-            dprob_tensor, self.dprob_desc, "dprob_tensor", dynamic_m=True, normalize=normalize_prob, canonical=self.canonical_dprob
-        )
-        self._validate_live_tensor(padded_offsets, self.padded_offsets_desc, "padded_offsets")
-        self._validate_live_tensor(alpha_tensor, self.alpha_desc, "alpha_tensor")
-        self._validate_live_tensor(beta_tensor, self.beta_desc, "beta_tensor")
+        validate_once(self._validated_signatures, self.validate_live_operands, operands)
 
-        two_n = c_desc.shape[1]
-        self._expect_shape(c_desc, (tensor_m, two_n, 1), "c_tensor")
-        self._expect_shape(d_desc, (tensor_m, two_n, 1), "d_row_tensor")
-        self._expect_shape(prob_desc, (tensor_m, 1, 1), "prob_tensor")
-        self._expect_shape(dprob_desc, (tensor_m, 1, 1), "dprob_tensor")
-        self._expect_stride(a_desc, (k, 1, tensor_m * k), "a_tensor")
-        self._expect_stride(c_desc, (two_n, 1, tensor_m * two_n), "c_tensor")
-        self._expect_stride(d_desc, (two_n, 1, tensor_m * two_n), "d_row_tensor")
-        self._expect_stride(prob_desc, canonicalize_unit_dim_strides((tensor_m, 1, 1), (1, 1, 1)), "prob_tensor")
-        self._expect_stride(dprob_desc, canonicalize_unit_dim_strides((tensor_m, 1, 1), (1, 1, 1)), "dprob_tensor")
-        debug_validate_offsets(padded_offsets, expert_cnt=self.expert_cnt, limit=tensor_m, mode="padded", stream=current_stream)
-
+        # Per call: data pointers change even when the metadata does not.
         for tensor, name in (
             (a_tensor, "a_tensor"),
             (c_tensor, "c_tensor"),
@@ -632,25 +683,13 @@ class GroupedGemmDgluBf16API(APIBase):
             (beta_tensor, "beta_tensor"),
             (prob_tensor, "prob_tensor"),
             (dprob_tensor, "dprob_tensor"),
+            (dbias_tensor, "dbias_tensor"),
+            (b_tensor, "b_tensor"),
         ):
-            self._validate_data_alignment(tensor, name)
-
-        if self._has_dbias:
-            if dbias_tensor is None:
-                raise ValueError("dbias_tensor is required because the API was compiled with sample_dbias")
-            self._validate_live_tensor(dbias_tensor, self.dbias_desc, "dbias_tensor")
-            self._validate_data_alignment(dbias_tensor, "dbias_tensor")
-        elif dbias_tensor is not None:
-            raise ValueError("dbias_tensor must be omitted because the API was compiled without sample_dbias")
-
-        if self.activation_desc is not None:
-            if activation_tensor is None:
-                raise ValueError("activation_tensor is required because the API was compiled with sample_activation")
-            activation_desc = self._validate_live_tensor(
-                activation_tensor, self.activation_desc, "activation_tensor", dynamic_m=True, normalize=normalize_mx, canonical=self.canonical_activation
-            )
-            self._expect_shape(activation_desc, (tensor_m, two_n // 2, 1), "activation_tensor")
-            self._expect_stride(activation_desc, (two_n // 2, 1, tensor_m * (two_n // 2)), "activation_tensor")
+            if tensor is not None:
+                self._validate_data_alignment(tensor, name)
+        debug_validate_offsets(padded_offsets, expert_cnt=self.expert_cnt, limit=get_shape(a_tensor)[0], mode="padded", stream=current_stream)
+        if activation_tensor is not None:
             self._validate_activation_aliases(
                 activation_tensor,
                 {
@@ -667,20 +706,7 @@ class GroupedGemmDgluBf16API(APIBase):
                     "b_ptrs": b_ptrs,
                 },
             )
-        elif activation_tensor is not None:
-            raise ValueError("activation_tensor must be omitted because the API was compiled without sample_activation")
-
-        if self.weight_mode == MoEWeightMode.DENSE:
-            if b_tensor is None or b_ptrs is not None:
-                raise ValueError("Dense execution requires b_tensor and forbids b_ptrs")
-            self._validate_live_tensor(b_tensor, self.b_desc, "b_tensor", normalize=self.normalize_b, canonical=self.canonical_b)
-            self._validate_data_alignment(b_tensor, "b_tensor")
-        else:
-            if b_tensor is not None or b_ptrs is None:
-                raise ValueError("Discrete execution requires b_ptrs and forbids b_tensor")
-            _validate_pointer_tensor(b_ptrs, "b_ptrs", self.expert_cnt)
-            if get_device(b_ptrs) != self.a_desc.device:
-                raise ValueError(f"b_ptrs must be on the same device as a_tensor ({self.a_desc.device}), got {get_device(b_ptrs)}")
+        if b_ptrs is not None:
             if get_data_ptr(b_ptrs) % 8 != 0:
                 raise ValueError("b_ptrs data pointer must be 8-byte aligned")
             debug_validate_pointer_values(b_ptrs, "b_ptrs", stream=current_stream)

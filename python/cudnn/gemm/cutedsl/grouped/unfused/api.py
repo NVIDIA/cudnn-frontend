@@ -320,52 +320,52 @@ def grouped_gemm_wrapper_sm100(
     # pure function of the operands' metadata plus the scalar config, both of which are
     # in the key below. So a hit skips the derivation and reuses its result. It does not
     # skip any check: op.execute() still validates every operand, including the data
-    # pointers the key deliberately omits. Only the allocate-the-outputs case is memoized;
-    # caller-supplied c/d need _validate_output and fall through.
-    _memo_key = None
-    if c_tensor is None and d_tensor is None:
-        _memo_key = (
-            type(a_tensor),
-            _operand_meta(a_tensor),
-            _operand_meta(padded_offsets),
-            _operand_meta(alpha_tensor),
-            _operand_meta(prob_tensor),
-            _operand_meta(b_tensor),
-            _operand_meta(b_ptrs),
-            _operand_meta(bias_tensor),
-            n,
-            b_dtype,
-            b_major,
-            acc_dtype,
-            c_dtype,
-            d_dtype,
-            cd_major,
-            tuple(mma_tiler_mn),
-            None if cluster_shape_mn is None else tuple(cluster_shape_mn),
-            vector_f32,
-            m_aligned,
-            generate_c,
-            use_dynamic_sched,
-            os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"),
+    # pointers the key deliberately omits. Caller-supplied c/d are part of the key, so a hit
+    # reuses the _validate_output outcome for the same metadata.
+    _memo_key = (
+        type(a_tensor),
+        _operand_meta(a_tensor),
+        _operand_meta(c_tensor),
+        _operand_meta(d_tensor),
+        _operand_meta(padded_offsets),
+        _operand_meta(alpha_tensor),
+        _operand_meta(prob_tensor),
+        _operand_meta(b_tensor),
+        _operand_meta(b_ptrs),
+        _operand_meta(bias_tensor),
+        n,
+        b_dtype,
+        b_major,
+        acc_dtype,
+        c_dtype,
+        d_dtype,
+        cd_major,
+        tuple(mma_tiler_mn),
+        None if cluster_shape_mn is None else tuple(cluster_shape_mn),
+        vector_f32,
+        m_aligned,
+        generate_c,
+        use_dynamic_sched,
+        os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"),
+    )
+    memo = _wrapper_memo.get(_memo_key)
+    if memo is not None:
+        op, framework, expected_shape, expected_stride, memo_c_dtype, memo_d_dtype, is_dense = memo
+        internal_c = c_tensor if c_tensor is not None else _allocate_output(framework, expected_shape, expected_stride, memo_c_dtype, a_tensor.device)
+        d_out = d_tensor if d_tensor is not None else _allocate_output(framework, expected_shape, expected_stride, memo_d_dtype, a_tensor.device)
+        op.execute(
+            a_tensor=a_tensor,
+            c_tensor=internal_c,
+            d_tensor=d_out,
+            padded_offsets=padded_offsets,
+            alpha_tensor=alpha_tensor,
+            b_tensor=b_tensor if is_dense else None,
+            b_ptrs=None if is_dense else b_ptrs,
+            bias_tensor=bias_tensor,
+            prob_tensor=prob_tensor,
+            current_stream=current_stream,
         )
-        memo = _wrapper_memo.get(_memo_key)
-        if memo is not None:
-            op, framework, expected_shape, expected_stride, memo_c_dtype, memo_d_dtype, is_dense = memo
-            internal_c = _allocate_output(framework, expected_shape, expected_stride, memo_c_dtype, a_tensor.device)
-            d_out = _allocate_output(framework, expected_shape, expected_stride, memo_d_dtype, a_tensor.device)
-            op.execute(
-                a_tensor=a_tensor,
-                c_tensor=internal_c,
-                d_tensor=d_out,
-                padded_offsets=padded_offsets,
-                alpha_tensor=alpha_tensor,
-                b_tensor=b_tensor if is_dense else None,
-                b_ptrs=None if is_dense else b_ptrs,
-                bias_tensor=bias_tensor,
-                prob_tensor=prob_tensor,
-                current_stream=current_stream,
-            )
-            return TupleDict(d_tensor=d_out, c_tensor=internal_c if generate_c else None)
+        return TupleDict(d_tensor=d_out, c_tensor=internal_c if generate_c else None)
 
     framework = detect_framework(a_tensor)
     if framework not in ("torch", "jax"):
@@ -486,8 +486,7 @@ def grouped_gemm_wrapper_sm100(
         op.compile()
         _cache_of_GroupedGemmSm100Objects[cache_key] = op
 
-    if _memo_key is not None:
-        _wrapper_memo[_memo_key] = (op, framework, expected_shape, expected_stride, c_dtype, d_dtype, is_dense)
+    _wrapper_memo[_memo_key] = (op, framework, expected_shape, expected_stride, c_dtype, d_dtype, is_dense)
 
     op.execute(
         a_tensor=a_tensor,
@@ -507,7 +506,7 @@ def grouped_gemm_wrapper_sm100(
     )
 
 
-grouped_gemm_wrapper_sm100.supports_canonical_layouts = True
+grouped_gemm_wrapper_sm100.supports_bf16_canonical_layouts = True
 
 __all__ = [
     "GroupedGemmSm100",

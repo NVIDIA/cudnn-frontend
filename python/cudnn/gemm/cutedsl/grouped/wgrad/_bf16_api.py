@@ -30,10 +30,10 @@ from cudnn.tensor_adapter import (
     get_shape,
     get_strides,
     is_torch_tensor,
-    to_host_list,
 )
 
 from ..backend_utils import _torch_stream_context, debug_validate_offsets, debug_validate_pointer_values
+from ..canonical import validate_once
 from ..moe_utils import MoEWeightMode, WGradInputOrder
 from .moe_grouped_gemm_wgrad import MoEGroupedGemmWgradBF16Kernel
 
@@ -118,7 +118,7 @@ class GroupedGemmWgradBf16API(APIBase):
         self._compile_wgrad_ptrs: Optional[torch.Tensor] = None
         self._single_expert_placeholder: Optional[torch.Tensor] = None
         self._live_wgrad_ptrs = None
-        self._sample_offset_values = self._copy_values_to_host(sample_offsets)
+        self._validated_signatures: dict = {}
         self._sample_data_ptrs = {
             name: get_data_ptr(tensor)
             for name, tensor in (
@@ -133,28 +133,6 @@ class GroupedGemmWgradBf16API(APIBase):
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
         self.a_major: Optional[str] = None
         self.b_major: Optional[str] = None
-
-    @staticmethod
-    def _copy_values_to_host(tensor: torch.Tensor) -> Tuple[int, ...]:
-        return tuple(int(value) for value in to_host_list(tensor))
-
-    @staticmethod
-    def _validate_offset_sequence(values: Tuple[int, ...], *, expert_cnt: int, tokens_sum: int) -> Tuple[int, ...]:
-        if len(values) != expert_cnt:
-            raise ValueError(f"sample_offsets length mismatch: expected {expert_cnt}, got {len(values)}")
-        groups = []
-        previous = 0
-        for index, value in enumerate(values):
-            if value < previous:
-                raise ValueError("sample_offsets must be a non-decreasing cumulative sum; " f"index {index} is {value} after {previous}")
-            group_k = value - previous
-            if group_k % MoEGroupedGemmWgradBF16Kernel.FIX_PAD_SIZE != 0:
-                raise ValueError(f"sample_offsets group {index} must be 256-aligned, got {group_k}")
-            groups.append(group_k)
-            previous = value
-        if not values or values[-1] != tokens_sum:
-            raise ValueError(f"sample_offsets last value must equal total tokens {tokens_sum}, " f"got {values[-1] if values else None}")
-        return tuple(groups)
 
     @staticmethod
     def _validate_pointer_array_alignment(tensor: torch.Tensor) -> None:
@@ -261,11 +239,8 @@ class GroupedGemmWgradBf16API(APIBase):
             if pointer % alignment:
                 raise ValueError(f"{name} data pointer must be {alignment}-byte aligned")
 
-        groups = self._validate_offset_sequence(
-            self._sample_offset_values,
-            expert_cnt=self.expert_cnt,
-            tokens_sum=tokens_sum,
-        )
+        # Per-expert token counts are device data (Rule 3); can_implement gets a split with the right total.
+        groups = [tokens_sum] + [0] * (self.expert_cnt - 1)
 
         if not self._kernel.can_implement(
             cutlass.BFloat16,
@@ -466,6 +441,32 @@ class GroupedGemmWgradBf16API(APIBase):
         # Packed little-endian uint8 pointer bytes: JAX truncates int64 without x64 mode.
         return jax.block_until_ready(jnp.asarray(np.asarray(values, dtype=np.int64).view(np.uint8)))
 
+    def validate_live_operands(self, a_tensor, b_tensor, offsets_tensor, wgrad_tensor, wgrad_ptrs) -> None:
+        """Every metadata-only execute check; execute() memoizes it on the operands' metadata."""
+        a_desc = self._validate_live_input(a_tensor, self.a_desc, "a_tensor", token_axis=1)
+        b_desc = self._validate_live_input(b_tensor, self.b_desc, "b_tensor", token_axis=0)
+        if b_desc.shape[0] != a_desc.shape[1]:
+            raise ValueError("a_tensor and b_tensor token dimensions must match")
+        offsets_desc = self._make_tensor_desc(offsets_tensor, name="offsets_tensor", canonical=True)
+        if offsets_desc.shape != (self.expert_cnt,) or offsets_desc.stride != (1,) or offsets_desc.dtype is not cutlass.Int32:
+            raise ValueError("offsets_tensor must be a contiguous rank-1 int32 tensor with one entry per expert")
+        if offsets_desc.device != self.a_desc.device:
+            raise ValueError(f"offsets_tensor device mismatch: expected {self.a_desc.device}, got {offsets_desc.device}")
+        if self.weight_mode == MoEWeightMode.DENSE:
+            if wgrad_tensor is None or wgrad_ptrs is not None:
+                raise ValueError("Dense execution requires wgrad_tensor and forbids wgrad_ptrs")
+            self._validate_live_output(wgrad_tensor)
+            return
+        if wgrad_tensor is not None:
+            self._validate_live_output(wgrad_tensor)
+        if wgrad_ptrs is None:
+            if wgrad_tensor is None:
+                raise ValueError("Discrete execution requires wgrad_tensor or wgrad_ptrs")
+            return
+        _validate_pointer_tensor(wgrad_ptrs, "wgrad_ptrs", self.expert_cnt)
+        if get_device(wgrad_ptrs) != self.a_desc.device:
+            raise ValueError(f"wgrad_ptrs must be on {self.a_desc.device}, got {get_device(wgrad_ptrs)}")
+
     def execute(
         self,
         a_tensor: torch.Tensor,
@@ -494,39 +495,24 @@ class GroupedGemmWgradBf16API(APIBase):
         for name, value in forbidden:
             if value is not None:
                 raise ValueError(f"BF16 forbids scale control {name}")
-        a_desc = self._validate_live_input(a_tensor, self.a_desc, "a_tensor", token_axis=1)
-        b_desc = self._validate_live_input(b_tensor, self.b_desc, "b_tensor", token_axis=0)
-        tokens_sum = a_desc.shape[1]
-        if b_desc.shape[0] != tokens_sum:
-            raise ValueError("a_tensor and b_tensor token dimensions must match")
-        offsets_desc = self._make_tensor_desc(offsets_tensor, name="offsets_tensor", canonical=True)
-        if offsets_desc.shape != (self.expert_cnt,) or offsets_desc.stride != (1,) or offsets_desc.dtype is not cutlass.Int32:
-            raise ValueError("offsets_tensor must be a contiguous rank-1 int32 tensor with one entry per expert")
-        if offsets_desc.device != self.a_desc.device:
-            raise ValueError(f"offsets_tensor device mismatch: expected {self.a_desc.device}, got {offsets_desc.device}")
-        debug_validate_offsets(offsets_tensor, expert_cnt=self.expert_cnt, limit=tokens_sum, mode="wgrad", stream=current_stream, name="offsets_tensor")
+        operands = (a_tensor, b_tensor, offsets_tensor, wgrad_tensor, wgrad_ptrs)
+        validate_once(self._validated_signatures, self.validate_live_operands, operands)
+
+        # Per call: data pointers change even when the metadata does not.
+        debug_validate_offsets(
+            offsets_tensor, expert_cnt=self.expert_cnt, limit=get_shape(a_tensor)[1], mode="wgrad", stream=current_stream, name="offsets_tensor"
+        )
         self._validate_data_alignment(a_tensor, "a_tensor")
         self._validate_data_alignment(b_tensor, "b_tensor")
         self._validate_data_alignment(offsets_tensor, "offsets_tensor", 4)
-
-        if self.weight_mode == MoEWeightMode.DENSE:
-            if wgrad_tensor is None or wgrad_ptrs is not None:
-                raise ValueError("Dense execution requires wgrad_tensor and forbids wgrad_ptrs")
-            self._validate_live_output(wgrad_tensor)
+        if wgrad_tensor is not None:
             self._validate_data_alignment(wgrad_tensor, "wgrad_tensor")
+        if self.weight_mode == MoEWeightMode.DENSE:
             output = wgrad_tensor
         else:
-            if wgrad_tensor is not None:
-                self._validate_live_output(wgrad_tensor)
-                self._validate_data_alignment(wgrad_tensor, "wgrad_tensor")
             generated_wgrad_ptrs = wgrad_ptrs is None
             if wgrad_ptrs is None:
-                if wgrad_tensor is None:
-                    raise ValueError("Discrete execution requires wgrad_tensor or wgrad_ptrs")
                 wgrad_ptrs = self._generate_wgrad_ptrs(wgrad_tensor, current_stream)
-            _validate_pointer_tensor(wgrad_ptrs, "wgrad_ptrs", self.expert_cnt)
-            if get_device(wgrad_ptrs) != self.a_desc.device:
-                raise ValueError(f"wgrad_ptrs must be on {self.a_desc.device}, got {get_device(wgrad_ptrs)}")
             self._validate_pointer_array_alignment(wgrad_ptrs)
             if not generated_wgrad_ptrs:
                 debug_validate_pointer_values(wgrad_ptrs, "wgrad_ptrs", stream=current_stream)

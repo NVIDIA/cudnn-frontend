@@ -53,7 +53,7 @@ transpose for input gradients. Layout participates in wrapper/plan cache keys.
 Torch callers may instead pass the canonical layouts: contiguous `A` `(M, K)`,
 `prob` `(M,)`, and dense `B` `(L, N, K)`, or the N-major `(L, K, N)` buffer with
 `b_major="n"`. With 2-D `A`, `C` and `D` are `(M, N)`, including a caller-provided
-`d_tensor`. The wrapper advertises `supports_canonical_layouts`.
+`d_tensor`. The wrapper advertises `supports_bf16_canonical_layouts`.
 
 `padded_offsets` values and `b_ptrs` entries are a **device-data contract**: the kernel
 reads them on device and `execute()` does not copy them to the host. Set

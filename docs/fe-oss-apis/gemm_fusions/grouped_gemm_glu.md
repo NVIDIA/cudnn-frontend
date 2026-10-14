@@ -68,7 +68,7 @@ experts, BF16 uses:
 
 Torch callers may instead pass the canonical layouts: contiguous `A` `(M, K)`, dense
 `B` `(L, N, K)`, and `prob` `(M,)`. With 2-D `A`, the wrapper returns `C` `(M, N)` and
-`D` `(M, N/2)`. The wrapper advertises `supports_canonical_bf16`.
+`D` `(M, N/2)`. The wrapper advertises `supports_bf16_canonical_layouts`.
 
 `padded_offsets` values and `b_ptrs` entries are a **device-data contract**: the kernel
 reads them on device and `execute()` does not copy them to the host. Set
