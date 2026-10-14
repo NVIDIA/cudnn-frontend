@@ -280,8 +280,16 @@ def test_typed_declines_of_the_sparse_decode_mode():
     # the in-block indexer over the pools: the step form of the indexer is a follow-up (on a tree without the indexer at all, its own earlier decline speaks)
     with pytest.raises(NotImplementedError, match="indexer"):
         _declare_indexer()
-    with pytest.raises(NotImplementedError, match="fuse_prepare=True with kv_source='paged'"):
-        _declare(GEOM_SMALL, 2, 1, n_pages=4, fuse_prepare=True)
+    # the prepare-fusion knob exists on trees that carry the fused prepare kernel: there its own row declines the paged forms (the
+    # fusion is validated with the write-through alone); a tree without the knob refuses the keyword itself
+    import inspect
+
+    if "fuse_prepare" in inspect.signature(GatedAttentionBlockFwd.__init__).parameters:
+        with pytest.raises(NotImplementedError, match="fuse_prepare=True with kv_source='paged'"):
+            _declare(GEOM_SMALL, 2, 1, n_pages=4, fuse_prepare=True)
+    else:
+        with pytest.raises(TypeError, match="fuse_prepare"):
+            _declare(GEOM_SMALL, 2, 1, n_pages=4, fuse_prepare=True)
 
 
 def _declare_indexer():
