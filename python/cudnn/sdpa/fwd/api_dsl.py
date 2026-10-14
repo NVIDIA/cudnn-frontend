@@ -251,7 +251,7 @@ D512_2X2: bool = True
 # bit for bit, up to the sign of a zero O element (test_sdpa_fwd_d128_sm90.py::test_d128_variant_is_bitwise_v1), so
 # this is a speed choice. Measured on an H200 SXM (bf16, b2 32/8 and 32/32 heads at s 2k-16k, b8 16/4 at s 1k, dense
 # and causal; 7 interleaved rounds, after the per-row FP64 check left the narrow path): overlap ran 1.07-1.28x the v1
-# loop (geometric mean 1.21x over 12 shapes) and 0.91-1.13x cuDNN 9.27 in the same rounds; Nsight Compute at s16384
+# loop (geometric mean 1.20x over 12 shapes) and 0.91-1.12x cuDNN 9.27 in the same rounds; Nsight Compute at s16384
 # dense, base clock: 14.6 ms against 18.6 ms (v1) and 15.6 ms (cuDNN), tensor pipe 82.9% against 65.0% and 77.6%.
 # A ping-pong turn between the two compute warpgroups measured 1.11x alone and no further gain on top of overlap, so the
 # kernel has none: each warpgroup issues its own WGMMA groups and the hardware interleaves them.
