@@ -61,6 +61,8 @@ from cudnn.sdpa.fwd.config_sm100 import sm100_bias_auto_cga as _sm100_bias_auto_
 from cudnn.sdpa.fwd.config_sm100 import sm100_bias_mode_pick as _sm100_bias_mode_pick
 from cudnn.sdpa.fwd.config_sm100 import sm100_bias_resident_s_kv_max as _sm100_bias_resident_s_kv_max
 from cudnn.sdpa.fwd.config_sm100 import sm100_bias_stages_pick as _sm100_bias_stages_pick
+from cudnn.sdpa.fwd.config_sm100 import SM100_TILE_NS_BY_D_SHAPE as _SM100_TILE_NS_BY_D_SHAPE, sm100_tile_n_pick as _sm100_tile_n_pick
+from cudnn.sdpa.fwd.config_sm100 import SM100_FP32_VECTOR_WITH_BIAS_TILE_N as _SM100_FP32_VECTOR_WITH_BIAS_TILE_N
 
 # The SM100 line's device capabilities that serve the small tiles' bias / kv_mask arms (the sm100 row's sm 100..106 band: cc 10.0 and
 # 10.3); cc 10.7 is the Rubin row's.
@@ -1705,6 +1707,18 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 padded=self._kv_padded(),
                 domain=dict(_SM107_TILE_NS_BY_D_SHAPE)[self.flavor],
             )
+        if self.flavor in dict(_SM100_TILE_NS_BY_D_SHAPE) and self._device_cc in _SM100_BIAS_CCS and not self._fp8:
+            # The SM100 small tiles: config_sm100.sm100_tile_n_pick (128 unless the fp32 vector WITH a bias, which only the 64-wide tile serves;
+            # the row's _bias_arm_decline and the heuristics read the same arithmetic, rule 8b').
+            return _sm100_tile_n_pick(
+                self.flavor[0],
+                int(self.k_desc.shape[2]),
+                has_bias=self.bias_desc is not None,
+                has_kv_mask=self.kv_mask_desc is not None,
+                kv_mask_fp32=self.kv_mask_desc is not None and self.kv_mask_desc.dtype == torch.float32,
+                padded=bool(self.seq_kv_lens_present),
+                domain=dict(_SM100_TILE_NS_BY_D_SHAPE)[self.flavor],
+            )
         return 128
 
     def _resident_arm_cga(self) -> int:
@@ -1720,7 +1734,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # heuristics' and the row's arithmetic); 1 when none holds it, which check_support then declines typed.
             if self.flavor not in _SM100_BIAS_D_SHAPES:
                 return 1
-            return _sm100_bias_auto_cga(self.flavor[0], int(self.k_desc.shape[2]), _SM100_SMALL_D_CGAS[self.flavor]) or 1
+            return _sm100_bias_auto_cga(self.flavor[0], int(self.k_desc.shape[2]), _SM100_SMALL_D_CGAS[self.flavor], tile_n=self._effective_tile_n()) or 1
         if self.flavor not in _SM107_BIAS_D_SHAPES:
             return 1
         return (
@@ -1769,7 +1783,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # The SM100 line: the RESIDENT block only (the streamed / multicast ring is not on the SM100 file yet) -- the budget pick at this
             # width (config_sm100.sm100_bias_mode_pick) when it is the resident block, else 0 (check_support declines typed; a ring REQUEST
             # is declined by name there).
-            _mode = _sm100_bias_mode_pick(self.flavor[0], _cga, int(self.k_desc.shape[2]), request=self.bias_mode)
+            _mode = _sm100_bias_mode_pick(self.flavor[0], _cga, int(self.k_desc.shape[2]), tile_n=self._effective_tile_n(), request=self.bias_mode)
             return _mode if _mode in (_BIAS_MODE_RESIDENT, _BIAS_MODE_STREAMED) else _BIAS_MODE_NONE
         return _sm107_bias_mode_pick(
             self.flavor[0],
@@ -1823,7 +1837,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         if self._device_cc != (10, 7):
             # The SM100 line: the derived deepest ring at this width (config_sm100.sm100_bias_stages_pick; 2 at the 32-wide tile's
             # one-batch-entry item), the request when it fits.
-            return _sm100_bias_stages_pick(self.flavor[0], _cga, request=self.bias_stages or 0)
+            return _sm100_bias_stages_pick(self.flavor[0], _cga, tile_n=self._effective_tile_n(), request=self.bias_stages or 0)
         return _sm107_bias_stages_pick(
             self.flavor[0],
             _cga,
@@ -2433,7 +2447,19 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         self._value_error_if(self.tile_m is not None and self.tile_m != 128, "SM100 DSL SDPA only supports tile_m=128")
         # The KV tile width: 128 on every flavor; the Rubin f16/bf16 small tiles also render 64 (the TILE_N knob --
         # config_sm107.SM107_TILE_NS_BY_D_SHAPE, the engine row's per-shape domain, rule 8b').
-        _tile_ns = dict(_SM107_TILE_NS_BY_D_SHAPE).get(self.flavor, frozenset({128})) if (self._device_cc == (10, 7) and not self._fp8) else frozenset({128})
+        # the KV tile widths this plan may request: the Rubin small tiles' domain on cc 10.7, the SM100 small tiles' on cc 10.0 / 10.3 (both from the
+
+        # row's tile_ns_by_d_shape constants, rule 8b'), 128 everywhere else
+
+        _tile_ns = (
+            dict(_SM107_TILE_NS_BY_D_SHAPE).get(self.flavor, frozenset({128}))
+            if (self._device_cc == (10, 7) and not self._fp8)
+            else (
+                dict(_SM100_TILE_NS_BY_D_SHAPE).get(self.flavor, frozenset({128}))
+                if (self._device_cc in _SM100_BIAS_CCS and not self._fp8)
+                else frozenset({128})
+            )
+        )
         self._value_error_if(
             self.tile_n is not None and self.tile_n not in _tile_ns,
             f"SM100 DSL SDPA serves tile_n in {sorted(_tile_ns)} on the {self.flavor} flavor; got {self.tile_n}",
@@ -2585,14 +2611,18 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     self.n_chunk is not None and self.n_chunk >= 1,
                     f"n_chunk={self.n_chunk} (the (n, n+1) pair work item) is not on the SM100 file yet; every bias plan runs the one-batch-entry item there",
                 )
+                _sm100_tile_ns = dict(_SM100_TILE_NS_BY_D_SHAPE).get(self.flavor, frozenset({128}))
                 self._not_implemented_error_if(
-                    self.tile_n is not None and int(self.tile_n) != 128,
-                    f"tile_n={self.tile_n}: the 64-wide KV tile is not on the SM100 file yet (TILE_N 128 only)",
+                    self.tile_n is not None and int(self.tile_n) not in _sm100_tile_ns,
+                    f"tile_n={self.tile_n}: the small tiles render TILE_N {sorted(_sm100_tile_ns)} on this line",
                 )
                 self._not_implemented_error_if(
-                    self.bias_desc is not None and self.kv_mask_desc is not None and self.kv_mask_desc.dtype == torch.float32,
-                    "an fp32 additive kv_mask together with a bias is served at the 64-wide KV tile only, which is not on the SM100 file yet (the 128-wide "
-                    "rendering spills on the softmax role): bind the mask in the Q/K/V dtype or as a boolean",
+                    self.bias_desc is not None
+                    and self.kv_mask_desc is not None
+                    and self.kv_mask_desc.dtype == torch.float32
+                    and self._effective_tile_n() != _SM100_FP32_VECTOR_WITH_BIAS_TILE_N,
+                    f"an fp32 additive kv_mask together with a bias is served at TILE_N {_SM100_FP32_VECTOR_WITH_BIAS_TILE_N} (the heuristics' pick; the TILE_N "
+                    f"knob) or as a vector in the Q/K/V dtype: the 128-wide rendering spills on the softmax role; got TILE_N {self._effective_tile_n()}",
                 )
             self._not_implemented_error_if(
                 self.thd or self.paged or self.split_kv > 1 or bool(self.pack_gqa) or self.gate_desc is not None,
@@ -2614,7 +2644,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 _s_kv_max = (
                     _sm107_bias_resident_s_kv_max(self.flavor[0], _bias_cga, pair=_pair, tiles_q=_wgs)
                     if self._device_cc == (10, 7)
-                    else _sm100_bias_resident_s_kv_max(self.flavor[0], _bias_cga)
+                    else _sm100_bias_resident_s_kv_max(self.flavor[0], _bias_cga, tile_n=self._effective_tile_n())
                 )
                 _item = "the (n, n+1) pair item" if _pair else "the one-batch-entry item"
                 # The third softmax warp group (softmax_wgs=3): the pair item at tile_n 64 / cga 1 only -- the one form whose roles loop over the

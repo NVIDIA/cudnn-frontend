@@ -561,7 +561,7 @@ if _INF_MASK_ARM and (CFG.THD_VARLEN or SPLIT_KV > 1 or CFG.PACK_GQA or PAGED_KV
 # The seams of the Rubin small tiles NOT yet on this file -- trace-time backstops (the adapter declines each typed before a plan reaches
 # here; the config validators accept the records for both archs, so the kernel states its own envelope): the streamed / multicast bias
 # ring (BIAS_MODE 2 / 3), the (n, n+1) pair item (N_CHUNK), the double-buffered S (S_SLOTS 2), the third softmax warp group, Q in TMEM,
-# the pre-masked padded tail, the dead-sub-tile quiet body and the 64-wide KV tile.
+# the pre-masked padded tail and the dead-sub-tile quiet body.
 if _BIAS_MCAST:
     raise ValueError(
         f"prefill_d128_f16_sm100: the multicast bias ring (CFG.BIAS_MODE={CFG.BIAS_MODE}) is not wired on the SM100 file yet; the resident block (1) and the streamed ring (2) are"
@@ -581,8 +581,10 @@ if CFG.PADDED_TAIL_FORM or CFG.DEAD_SUBTILE_QUIET:
     raise ValueError(
         f"prefill_d128_f16_sm100: PADDED_TAIL_FORM={CFG.PADDED_TAIL_FORM} / DEAD_SUBTILE_QUIET={CFG.DEAD_SUBTILE_QUIET} are not wired on the SM100 file yet"
     )
-if CFG.TILE_N != 128:
-    raise ValueError(f"prefill_d128_f16_sm100: TILE_N={CFG.TILE_N}: the 64-wide KV tile is not wired on the SM100 file yet (128 only)")
+if CFG.N_BMM2_CHUNKS not in (1, 2):
+    # The softmax body unrolls its P chunks by hand for one or two 64-column chunks (TILE_N 64 / 128); TILE_N 256 is a validator decline at
+    # two sub-tiles and would need a third / fourth chunk here.
+    raise ValueError(f"prefill_d128_f16_sm100: the softmax body renders 1 or 2 chunks of 64 (TILE_N 64 / 128); got N_BMM2_CHUNKS={CFG.N_BMM2_CHUNKS}")
 
 
 # === Kernel ===

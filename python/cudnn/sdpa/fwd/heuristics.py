@@ -73,7 +73,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     supports_paged_prefill_cga1,
 )
 from cudnn.sdpa.fwd.config_sm107 import SM107_FP32_VECTOR_WITH_BIAS_TILE_N, sm107_bias_auto_cga, sm107_pair_item_active, sm107_tile_n_pick
-from cudnn.sdpa.fwd.config_sm100 import sm100_bias_auto_cga
+from cudnn.sdpa.fwd.config_sm100 import sm100_bias_auto_cga, sm100_tile_n_pick
 from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR, FP8_HEAD_TILE_GRANULE, HEAD_TILE_GRANULE, SMEM_CAPACITY_BYTES, pick_flavor, smem_bytes, tile_domain
 from cudnn.sdpa.fwd.engines import (
     ENGINE_SPECS,
@@ -1117,7 +1117,22 @@ def _resident_arm_tile_n(spec: EngineSpec, facts, default: Optional[int]) -> Opt
     caps = spec.capabilities
     selected = _selected_d_shape(caps, facts, None)
     domain = dict(caps.tile_ns_by_d_shape).get(selected)
-    if caps.sm_lo != 107 or selected is None or domain is None:
+    if selected is None or domain is None:
+        return default
+    if caps.sm_lo == 100:
+        # The SM100 small tiles: the same question through config_sm100.sm100_tile_n_pick (128 unless the fp32 vector WITH a bias, which the
+        # 128-wide rendering does not serve); the row's _bias_arm_decline and the adapter read the same arithmetic (rule 8b').
+        pick = sm100_tile_n_pick(
+            selected[0],
+            facts.s_kv,
+            has_bias=facts.has_bias,
+            has_kv_mask=facts.has_kv_mask,
+            kv_mask_fp32=facts.kv_mask_dtype == cudnn.data_type.FLOAT,
+            padded=facts.padded,
+            domain=domain,
+        )
+        return pick if pick in domain else default
+    if caps.sm_lo != 107:
         return default
     pick = sm107_tile_n_pick(selected[0], facts.s_kv, has_bias=facts.has_bias, has_kv_mask=facts.has_kv_mask, padded=facts.padded, domain=domain)
     return pick if pick in domain else default
@@ -1159,7 +1174,7 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
         # _bias_arm_decline and the adapter's _resident_arm_cga read, rule 8b'): the NARROWEST width whose resident block holds S_kv --
         # a D 64 bias graph lands on cga2 (its cga1 holds no block at 227 KiB), the 32-wide tile on its cga1.  No width holding it
         # falls through: mismatch() declined every plan of such a graph already (the ring is not on the SM100 file yet).
-        bias_cga = sm100_bias_auto_cga(selected_shape[0], facts.s_kv, domain)
+        bias_cga = sm100_bias_auto_cga(selected_shape[0], facts.s_kv, domain, tile_n=_resident_arm_tile_n(spec, facts, 128) or 128)
         if bias_cga is not None:
             return sched_policy, bias_cga
     if selected_shape == (64, 64) and domain == frozenset({1, 2}) and not (facts.is_fp8 or facts.is_mxfp8):

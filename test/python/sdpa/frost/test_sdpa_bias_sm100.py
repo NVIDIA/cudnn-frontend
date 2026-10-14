@@ -84,8 +84,9 @@ def test_kernel_module_constants_and_the_not_yet_wired_backstops():
         _mod(bias_mode=3, bias_stages=2, n_chunk=2)
     with pytest.raises(ValueError, match="pair item"):
         _mod(bias_mode=1, n_chunk=2)
-    with pytest.raises(ValueError, match="64-wide KV tile"):
-        _mod(bias_mode=1, tile_n=64)
+    t64 = _mod(bias_mode=1, tile_n=64)
+    assert t64.CFG.TILE_N == 64 and t64.CFG.N_BMM2_CHUNKS == 1 and t64._BIAS_GG.boxes_per_tile == 1 and t64.BIAS_PRELOAD_CHUNKS == 1
+    assert t64.CFG.BIAS_RESIDENT_TILES == 5  # the 32-wide tile holds 5 x 64 = 320 kv columns resident at the 64-wide KV tile
 
 
 # --------------------------------------------------------------------------- tier 2: the adapter's check_support twin (host, a modelled cc 10.0 device)
@@ -128,18 +129,39 @@ _ADAPTER_CELLS = [
     ("bias + bf16 additive kv_mask d32 S256", dict(bias=(1, 4, 256, 256), kv_mask=(2, 1, 1, 256), kv_mask_dtype=torch.bfloat16), True, (32, 32), 1, 2, 1),
     ("fp32 additive kv_mask alone d32 S256", dict(kv_mask=(2, 1, 1, 256), kv_mask_dtype=torch.float32), True, (32, 32), 0, 3, 1),
     (
-        "bias + fp32 additive kv_mask (the 64-wide tile's form)",
+        "bias + fp32 additive kv_mask -> the 64-wide KV tile (the pick)",
         dict(bias=(1, 4, 256, 256), kv_mask=(2, 1, 1, 256), kv_mask_dtype=torch.float32),
+        True,
+        (32, 32),
+        1,
+        3,
+        1,
+    ),
+    (
+        "bias + fp32 additive kv_mask at a requested tile_n 128",
+        dict(bias=(1, 4, 256, 256), kv_mask=(2, 1, 1, 256), kv_mask_dtype=torch.float32, tile_n=128),
         False,
         None,
         None,
         None,
         None,
     ),
+    # (the standalone adapter needs a DENSE S_kv at a multiple of 128 without a padding mask -- the graph path synthesizes it; the GPU cells carry the tails)
+    ("bias d32 S256 at tile_n 64 (4 of the 5 resident tiles)", dict(bias=(1, 4, 256, 256), tile_n=64), True, (32, 32), 1, 0, 1),
+    ("bias d32 S640 at tile_n 64 (the 3-stage ring)", dict(s_q=640, s_kv=640, bias=(1, 4, 640, 640), tile_n=64), True, (32, 32), 2, 0, 1),
+    (
+        "bias d64 S128 at tile_n 64 -> cga1 (2 of its 3 tiles; the 128-wide tile picks cga2)",
+        dict(d=64, s_q=128, s_kv=128, bias=(1, 4, 128, 128), tile_n=64),
+        True,
+        (64, 64),
+        1,
+        0,
+        1,
+    ),
     ("bias_mode=3 request (the multicast ring)", dict(bias=(1, 1, 256, 256), bias_mode=3), False, None, None, None, None),
     ("bias_stages=3 request (only 2 fit)", dict(s_q=384, s_kv=384, bias=(1, 4, 384, 384), bias_stages=3), False, None, None, None, None),
     ("n_chunk=2 request (the pair item)", dict(bias=(1, 1, 256, 256), n_chunk=2), False, None, None, None, None),
-    ("tile_n=64 request", dict(bias=(1, 4, 256, 256), tile_n=64), False, None, None, None, None),
+    ("tile_n=256 request (outside the domain)", dict(bias=(1, 4, 256, 256), tile_n=256), False, None, None, None, None),
     ("softmax_wgs=3 request", dict(bias=(1, 1, 256, 256), softmax_wgs=3), False, None, None, None, None),
 ]
 
@@ -157,8 +179,10 @@ def test_adapter_check_support_is_the_rows_twin(_sm100_device_for_the_adapter, n
     assert api.flavor == flavor, (name, api.flavor)
     params = api.template_params()
     assert (params.bias_mode, params.kv_mask_form) == (bias_mode, kv_mask_form), (name, params)
-    assert params.d_flavor == flavor[0] and params.cta_mma == cta_mma and params.n_chunk == 0 and params.tile_n == 128, (name, params)
-    assert params.bias_stages == (2 if bias_mode == 2 else 0) and params.s_slots == 1 and params.q_in_tmem == 0 and params.softmax_wgs == 2, (name, params)
+    _want_tile_n = kw.get("tile_n", 64 if (kw.get("kv_mask_dtype") == torch.float32 and kw.get("bias") is not None) else 128)
+    assert params.d_flavor == flavor[0] and params.cta_mma == cta_mma and params.n_chunk == 0 and params.tile_n == _want_tile_n, (name, params)
+    _want_stages = 0 if bias_mode != 2 else (3 if _want_tile_n == 64 else 2)  # the derived deepest ring: 3 stages at the 64-wide KV tile, 2 at the 128-wide
+    assert params.bias_stages == _want_stages and params.s_slots == 1 and params.q_in_tmem == 0 and params.softmax_wgs == 2, (name, params)
 
 
 # --------------------------------------------------------------------------- tier 3: the GPU cells (a cc 10.0 / 10.3 device)
@@ -385,6 +409,44 @@ def test_streamed_ring_matches_the_fp64_oracle_on_sm100(case, with_mask):
     _t7._check(out, ref)
 
 
+# The 64-wide KV tile (the TILE_N knob through the public autotune record): the resident block holds 5 tiles (S_kv 320) at the 32-wide tile and
+# 3 (192) at the 64-wide tile's cga1, the ring 3 stages above; the one-chunk softmax body; the fp32 vector WITH a bias is served HERE only.
+_T64_CASES = {
+    "t64_dense_nkv2_256": dict(b=2, h=4, h_kv=4, s_q=256, s_kv=256),
+    "t64_causal_320": dict(b=2, h=2, h_kv=2, s_q=320, s_kv=320, causal=True),
+    "t64_ring_dense_640": dict(b=2, h=2, h_kv=2, s_q=640, s_kv=640),
+    "t64_ring_padded_1024_zero_batch": dict(b=3, h=2, h_kv=2, s_q=1024, s_kv=1024, kv_lens=[1024, 0, 700]),
+    "t64_d64_dense_192_cga1": dict(b=2, h=2, h_kv=2, s_q=192, s_kv=192, d=64),
+    "t64_d64_causal_tail_200": dict(b=2, h=2, h_kv=2, s_q=200, s_kv=200, d=64, causal=True),
+}
+
+
+@requires_sm100_line
+@pytest.mark.parametrize("case", list(_T64_CASES))
+@pytest.mark.parametrize("with_mask", [False, True], ids=["bias", "bias_and_mask"])
+def test_tile_n_64_matches_the_fp64_oracle_on_sm100(case, with_mask):
+    """The 64-wide KV tile on the SM100 small tiles (TILE_N=64 through the autotune record): the resident block (S_kv 256 / 320 at D 32, 192 at D 64
+    cga1) and the 3-stage ring above it (640, 1024 with a zero-length batch), the one-chunk body, with and without the bit-word mask."""
+    q, k, v, kw, ref = _t7._case_inputs(case, torch.bfloat16, kv_mask_p=0.3 if with_mask else None, table=_T64_CASES)
+    kw.pop("cga", None)
+    out = _run(q, k, v, tile_n=64, **kw)
+    assert out["knobs"].tile_n == 64 and out["knobs"].cga == 1, (case, out["knobs"])
+    _t7._check(out, ref)
+
+
+@requires_sm100_line
+def test_fp32_additive_vector_with_a_bias_runs_at_tile_n_64_on_sm100():
+    """The fp32 additive kv_mask WITH a bias: a knob-less graph lands on the 64-wide KV tile (the pick; the 128-wide rendering spills) and matches the
+    oracle; the same graph at an explicit TILE_N 128 proposes no plan of the row."""
+    q, k, v, kw, _ = _t7._case_inputs("dense_nkv2", torch.bfloat16, kv_mask_p=0.3)
+    kw.pop("cga", None)
+    keep = kw["kv_mask"]
+    kw["kv_mask"] = torch.where(keep, torch.zeros((), device="cuda"), torch.full((), -1e9, device="cuda")).float()
+    out = _run(q, k, v, **kw)
+    assert out["knobs"].tile_n == 64, out["knobs"]
+    _t7._check(out, _t7._ref_of(_t7._CASES["dense_nkv2"], q, k, v, dict(kw, kv_mask=keep)))
+
+
 @requires_sm100_line
 @pytest.mark.parametrize("case", _ABOVE_BUDGET)
 def test_declines_above_the_resident_budget_on_real_graphs(case):
@@ -396,9 +458,36 @@ def test_declines_above_the_resident_budget_on_real_graphs(case):
 
 
 @requires_sm100_line
-def test_declines_the_fp32_additive_vector_with_a_bias_on_a_real_graph():
-    """The fp32 additive kv_mask WITH a bias is the 64-wide tile's form (its 128-wide rendering spills): no plan of the row on this line."""
+def test_declines_the_fp32_additive_vector_with_a_bias_at_tile_n_128_on_a_real_graph():
+    """The fp32 additive kv_mask WITH a bias at an EXPLICIT TILE_N 128 (the autotune record): the row declines it typed (the 128-wide rendering
+    spills), never a degraded plan -- the knob-less graph runs at 64 (the test above)."""
+    import cudnn
+
     q, k, v, kw, _ = _t7._case_inputs("dense_nkv2", torch.bfloat16, kv_mask_p=0.3)
     kw["kv_mask"] = torch.where(kw["kv_mask"], torch.zeros((), device="cuda"), torch.full((), -1e9, device="cuda")).float()
-    names = _frost_plan_names(q, k, v, kw)
-    assert not any(n == _ROW or n.startswith(_ROW + "[") for n in names), names
+    kw.pop("cga", None)
+    out = _run(q, k, v, **kw)  # the pick: 64
+    g, *_ = _t7._build(
+        q,
+        k,
+        v,
+        scale=kw["scale"],
+        bias=kw["bias"],
+        kv_mask=kw["kv_mask"],
+        sdpa_kwargs=kw["sdpa_kwargs"],
+        seq_len_kv=kw["seq_len_kv"],
+        seq_len_q=kw["seq_len_q"],
+        sink=kw["sink"],
+    )
+    g.create_execution_plans([cudnn.heur_mode.A])
+    names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
+    idx = next(i for i, nm in enumerate(names) if nm == _ROW or nm.startswith(_ROW + "["))
+    engine_id, record = g.get_engine_and_knobs_at_index(idx)
+    record = dict(record)
+    record[cudnn.knob_type.TILE_N] = 128
+    with pytest.raises(Exception):  # the typed decline of the row on the replayed record (NotImplementedError / the graph's not-supported error)
+        g.create_execution_plan(engine_id, record)
+        g.select_plan(g.get_execution_plan_count() - 1)
+        g.check_support()
+        g.build_plans()
+    assert out["knobs"].tile_n == 64

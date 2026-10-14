@@ -2840,6 +2840,23 @@ def sm100_bias_stages_pick(
     return deepest
 
 
+# The fp32 ADDITIVE kv_mask vector TOGETHER WITH a bias is served at the 64-wide KV tile only on this line too: the 128-wide rendering spills on
+# the softmax role (STL / LDL 53 / 64 on the sm_100a rendering, 2026-10-14; the Rubin finding, config_sm107.SM107_FP32_VECTOR_WITH_BIAS_TILE_N).
+SM100_FP32_VECTOR_WITH_BIAS_TILE_N = 64
+
+
+def sm100_tile_n_pick(d_flavor: int, s_kv: int, *, has_bias: bool, has_kv_mask: bool, kv_mask_fp32: bool = False, padded: bool = False, domain=None) -> int:
+    """The KV tile width of a plan on the SM100 small tiles when the TILE_N knob is unset -- ONE arithmetic for the engine row
+    (``engines._bias_arm_decline``), the heuristics (``_resident_arm_tile_n``) and the adapter (``_effective_tile_n``), rule 8b'.
+    The 128-wide tile everywhere (the SM100 default: the Rubin measured width table -- 64 for a bias with a kv_mask, for a bias at one or
+    two kv tiles, on the padding leg -- is a Rubin PRIOR the GB200 sweep decides, NOT applied here), except the one form the 128-wide
+    rendering does not serve: the fp32 additive vector WITH a bias lands on :data:`SM100_FP32_VECTOR_WITH_BIAS_TILE_N`.  A width outside
+    ``domain`` (the row's ``tile_ns_by_d_shape`` entry) falls back to the domain's minimum; a shape without a domain keeps 128."""
+    dom = frozenset(domain) if domain is not None else frozenset({128})
+    pick = SM100_FP32_VECTOR_WITH_BIAS_TILE_N if (has_bias and has_kv_mask and kv_mask_fp32) else 128
+    return pick if pick in dom else min(dom)
+
+
 def sm100_bias_auto_cga(
     d_flavor: int, s_kv: int, cgas, *, dtype_qkv: int = DTYPE_BF16, tile_n: int = 128, pair: bool = False, tiles_q: int = 2
 ) -> Optional[int]:
