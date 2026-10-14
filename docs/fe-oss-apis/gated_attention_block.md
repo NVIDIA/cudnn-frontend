@@ -303,12 +303,13 @@ blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace,
             lse=None, saved=None, current_stream=None, h_sf=None, w_qkvg_sf=None,
             w_o_sf=None,         # required iff MxQuantSpec.o_fp4, refused otherwise
             k_cache=None, v_cache=None, slot_mapping=None,   # REQUIRED iff paged_kv_page_size > 0, refused otherwise -- "Serving: write-through"
-            block_table=None, kv_lens=None)                  # REQUIRED iff kv_source="paged", refused otherwise -- "Serving: the extend form" / "Serving: the decode form"
+            block_table=None, kv_lens=None,                  # REQUIRED iff kv_source="paged", refused otherwise -- "Serving: the extend form" / "Serving: the decode form"
+            num_tokens_live=None)                            # the bounded packed form's LIVE token count, a host int (None = the capacity) -- "Serving: the extend form"
 ```
 
 Every appended argument (`sample_w_o_sf`, `w_o_sf`, `saved_gate_copy`, the four packing knobs `thd` / `num_sequences` /
 `max_seq_len` / `cu_seqlens`, the serving attributes `paged_kv_page_size` / `kv_source` / `token_capacity` with their samples, the DECODE
-form's `max_kv_len` / `decode_split_kv` and the execute inputs) sits at the end with a default,
+form's `max_kv_len` / `decode_split_kv`, the execute inputs and `num_tokens_live`) sits at the end with a default,
 so positional callers of the bf16, FP8 and MXFP8 pipelines are unchanged; `MxQuantSpec.o_fp4` and `sample_w_o_sf` must be given
 together (a typed `ValueError` names the missing half), and `num_sequences` / `max_seq_len` / `cu_seqlens` are refused without
 `thd=True`.
@@ -585,10 +586,12 @@ blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace,
             seq_lens=query_start_loc,                 # [B_max + 1] int32 prefix sums of the step's NEW tokens per sequence (zero-length pads)
             k_cache=k_cache, v_cache=v_cache,         # the pools the samples described, EXACTLY (shape and strides; the layout is compiled in)
             slot_mapping=slot_mapping,                # [T_max] int32 / int64: the new tokens' slots; -1 on every pad row
-            block_table=block_table, kv_lens=kv_lens) # [B_max, >= max_pages] int32 page ids; [B_max] int32 LOGICAL lengths incl. the new tokens
+            block_table=block_table, kv_lens=kv_lens, # [B_max, >= max_pages] int32 page ids; [B_max] int32 LOGICAL lengths incl. the new tokens
+            num_tokens_live=None)                     # or the step's live token count T_live: the token-indexed stages over T_live rows, no recompile
 ```
 
-Five launches on ONE stream: `(1)+(2)+(3)` the projection with norm + RoPE over all `T_max` rows (or `(1)` then `(2+3)`),
+Five launches on ONE stream: `(1)+(2)+(3)` the projection with norm + RoPE over all `T_max` rows -- or over the `T_live` rows of
+`num_tokens_live` -- (or `(1)` then `(2+3)`),
 `(4w)` the write-through of the new tokens' K / V at `slot_mapping`, `(4)` the SDPA over the pools -- query row `i` of a sequence
 with `q_len` new tokens and logical length `kv_len` attends keys `k <= i + kv_len - q_len` of `block_table[b]`'s pages -- then
 `(5)` the gate and `(6)` the out projection. The write is ordered before the read by STREAM order alone: no kernel on the chain
@@ -603,6 +606,7 @@ write must wait on its dependent grid before its first K / V load.
 | `block_table` (execute) | `[num_sequences, >= max_pages]` int32 on `h`'s device, the page axis contiguous, the row stride as declared; row `b` lists sequence `b`'s pages in logical order (the serving stacks' NULL block `0` for a padded entry); read on device |
 | `kv_lens` (execute) | `[num_sequences]` int32 contiguous: each sequence's LOGICAL KV length INCLUDING this step's new tokens (`prefix + q_len`); `0` = a padded entry (no keys: its `out` rows, if it has any, are exactly `0`); read on device |
 | `k_cache`, `v_cache` (execute) | the pools, matching the samples EXACTLY (shape and strides; another page count or layout is another plan). Rows past `kv_len` inside a sequence's last live page may hold stale values but must be FINITE (a serving pool is zero-initialised); pages past the live page count are never read |
+| `num_tokens_live` (execute, appended, the bounded form only) | the step's LIVE token count `T_live` as a HOST int; `None` (default) = the declared capacity, every stage over all `T_max` rows as before. With an int the projection (+ norm + RoPE), the cache write, the gate and the out projection run over `T_live <= T_max` rows with NO recompile (their kernels take the token count symbolically; the SDPA keeps the declared geometry and reads the live total from `seq_lens` on device, so the lengths must sum to `T_live`); `h` / `cos` / `sin` / `slot_mapping` / `out` may carry the declared `T_max` rows (the first `T_live` are read / written) or EXACTLY `T_live` rows -- a serving stack hands `hidden_states[rows]`, `output[rows]` and `slot_mapping[rows]` directly, with no staging copy -- and rows `[T_live, T_max)` of `out` are left UNTOUCHED (not written: slice nothing, or keep them as they were). Typed before any launch: a block declared without `token_capacity` refuses it by name, `T_live` outside `[1, T_max]` names the bound (`T_live > T_max` is the decline: more tokens are another declaration), a quantized pipeline and a dense projection on the graph route (a bounded block declared without `kv_source="paged"`) decline. A CUDA-graph capture bakes the host int into the captured launches: a replay serves the live count it was captured with, so a serving stack captures ONE graph per live-count bucket and pads a shorter step to the bucket (finite `h` / `cos` / `sin` pad rows, slot `-1`); the uncaptured EXTEND steps are where the count removes the staging copies |
 
 `GatedAttentionBlockFwd.serving_envelope(geometry, dtype, device) -> ServingEnvelope` is the static envelope a serving stack's
 init-time dispatch predicate reads instead of catching exceptions: the device / DSL facts, and per form (`extend` and `decode`,
@@ -616,7 +620,9 @@ entries (`kv_len = 0`, the NULL block `0`, slot `-1`), prefixes ending mid-page,
 end and in the middle of the packing, a row-sliced block table, the 2-chunk extend and the prefix-hit step against the single-shot oracle
 within the dense suite's budget (`cos >= 0.999` on `out`, `atol 2e-2` on the gated O), live rows bitwise between a bounded and a tight
 declaration, and -- with the projection GEMM driver's capture-safe route in the tree -- a CUDA-graph capture of the first execute replayed
-over new lengths / tables / slots; the three Qwen3.5-397B tensor-parallel shards (16 / 1, 8 / 1, 4 / 1 over `d_model` 4096, one replicated
+over new lengths / tables / slots; `num_tokens_live` at T_live 412 and 300 of T_max 512: the live rows bitwise the capacity launch and the
+rows past them untouched, the token tensors at exactly T_live rows bitwise too, a capture at T_live 412 replaying bitwise and serving the
+padded next chunk; the three Qwen3.5-397B tensor-parallel shards (16 / 1, 8 / 1, 4 / 1 over `d_model` 4096, one replicated
 KV head -- the table under "Qwen3.8 family" above) each with one EXTEND step at pages 16 / 32 / 64 and one DECODE step at the same
 pages -- the rows of the support-matrix
 tracker's `Rubin d256 gated attention block -- serving forms` section; the standalone adapter's own paged-prefill contract applies to the
