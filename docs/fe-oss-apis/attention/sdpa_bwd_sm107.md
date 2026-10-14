@@ -148,6 +148,20 @@ fp8 row (2 -> 1), and +9.3 % causal / +1.4 % dense on the MXFP8 row (8 -> 4; the
 twin's value -- the arm read +11.6 % against a slot whose control pair spread 2 %); every
 extra chunk launch ends in a scheduler tail the next launch cannot fill.
 
+On the SM100 / SM103 dense BF16 d = 256 row, a chunk may also divide one GQA
+group when even one complete group at batch size one exceeds that budget.
+Existing whole-group choices that fit are preserved. Each smaller chunk reads
+the group's K head and writes its own global per-query-head dK/dV partials;
+the final reduction still sums the complete group once, after every chunk.
+FP16, packed THD and other architecture rows retain their whole-group choices.
+
+The 8 GiB target is not a hard workspace limit: one query head alone can exceed
+it, and gradients and other scratch regions also require storage. For example,
+dense BF16 B=4, S_q=S_kv=131072, H_q=8, H_kv=2, D=256 uses a one-head dS slab
+of 32 GiB rather than a four-head slab of 128 GiB, reducing the full required
+workspace from about 132 GiB to 36 GiB. Allocate the size reported by the selected
+plan; these sizes do not include model tensors or communication buffers.
+
 The two GEMMs render the shared template at its **d = 256 cluster tile**
 (`MatmulTemplateParams.cgrp_tile_mn = (256, 256)`: cluster 2x1, one 256-row ×
 256-column tile per 2-CTA pair, six 32 KiB operand stages, a double-buffered

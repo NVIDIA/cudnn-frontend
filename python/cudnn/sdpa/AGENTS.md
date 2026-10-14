@@ -532,6 +532,20 @@ Backward (d512 stage 2):
 
 ## Stage-3 GEMM (`bwd/kernels/bprop_matmul_blackwell.py`) perf-method lessons
 
+- **A head subgroup is legal only when the final reduction covers all global
+  per-query-head partials.** The dense BF16 SM100 d256 chain can divide one GQA
+  group after whole-group choices exceed its workspace target. Every chunk must
+  divide the group, its grouped dQ tensor map must retain one K head (ceiling
+  division, never a zero-sized floor), and the global dK/dV fold must run once
+  after all chunks. Keep other chains' validation strict and gate inherited
+  chooser rules by dtype, layout and compute capability. Detectors in
+  `test_sdpa_bwd_d256_sm100.py`: `test_head_subgroups_match_full_group_gradients`,
+  `test_head_subgroups_preserve_mask_and_tail_gradients`,
+  `test_head_subgroups_rebind_stream_replay_and_launch_count` and
+  `test_head_subgroup_rule_is_scoped_and_workspace_is_honest`. They check
+  old/new bitwise gradients against an independent oracle, poisoned scratch,
+  stream/storage replay, exactly one fold and unchanged fitting choices.
+
 Measured on the SM100 d512 backward's dV / dK / dQ GEMMs (B200, 148 SMs, 1155 MHz SW power cap, cuDNN 9.26.0.51, DSL 4.7.0,
 2026-10-01; the numbers quoted here are the per-GEMM CUPTI medians of CLEAN in-process round-robin A/B slots, and the constant's
 comment in `bwd/api_dsl.py` carries the full set).  Each lesson names its runnable detector; add to the list, do not restate.
