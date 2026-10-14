@@ -1204,6 +1204,11 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 f"the fused epilogue gate is wired only at head dims {sorted(capabilities.epilogue_gate_d_shapes)}; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
             )
         if facts.thd:
+            # The GRAPH lowering binds no gate operand on its THD launch (prepared.PreparedThdLaunch carries
+            # no gate uid), so the row keeps declining the graph's THD x gate tail.  The STANDALONE adapter is
+            # wider here by design: it serves THD x gate on the f16/bf16 d256 prefill (api_dsl.check_support,
+            # the gated attention block's packed `fuse_gate`); a row must never admit what the adapter
+            # declines (rule 8b), the reverse is a conservative row.
             return "the fused epilogue gate is dense-only (no THD gate descriptor)"
         # The paged PREFILL kernel has no gate; the d256 decode tile's SPLIT applies the
         # gate in its combine over any cache (knobs None = the facts-only question: some

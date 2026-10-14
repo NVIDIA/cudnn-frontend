@@ -271,11 +271,13 @@ positions restart at every sequence; the caller packs them.  Served: bf16 / fp16
 ``quantize_mxfp8`` stages run their PACKED arm and write the SDPA row's
 per-sequence-tile-padded scale-factor layout at the slot capacity
 ``_sf_slot_bytes_packed``; ``kernels/quantize_mxfp8.py`` "PACKED sequences"),
-``fuse_norm_rope`` for bf16 / fp16 inference.  Typed declines: ``fuse_gate`` (the
-SDPA's epilogue gate has no THD gate descriptor), the fully fused quantized
-pipelines (``fuse_gate`` again, and the fused MXFP8 projection fork decodes
-``(b, s_tile)`` once per 128-row GEMM tile, which a packed tile may straddle),
-``seq_lens_present`` (the two length contracts are mutually exclusive).  The
+``fuse_norm_rope`` and ``fuse_gate`` for bf16 / fp16 inference (the gate rides the
+packed d256 prefill's epilogue through the SDPA's THD gate descriptor: one launch
+fewer, bitwise the dense gated block at ``B = 1``).  Typed declines: the fully
+fused quantized pipelines (the quantized THD SDPA bodies have no THD gate
+descriptor, and the fused MXFP8 projection fork decodes ``(b, s_tile)`` once per
+128-row GEMM tile, which a packed tile may straddle), ``seq_lens_present`` (the
+two length contracts are mutually exclusive).  The
 lengths are device data, never read on the host:
 the caller's contract is every length in ``[0, max_seq_len]`` and
 ``sum(lengths) == T`` -- the SDPA leaves rows past the live total UNWRITTEN, and
@@ -286,7 +288,7 @@ varies pads with zero-length sequences.
 Not in scope for v1, in the order they are likely to land: an MXFP8 (e4m3
 block-scaled) O / ``out_proj`` (D1 keeps the e4m3 O per-tensor; the block-scaled
 out projection exists only in the fp4 formats above); the graph-API engine row;
-the packed-sequence arms of ``fuse_gate`` and of the fully fused MXFP8 pipeline. This is a
+the packed-sequence arm of the fully fused MXFP8 pipeline. This is a
 frontend-only OSS API first; a manifest family + ``Capabilities`` comes when the
 stages exist to be honest about.
 """
@@ -3768,10 +3770,13 @@ class _Sdpa(_Stage):
         self.want_lse = bool(want_lse)
         self.seq_lens_present = bool(seq_lens_present)
         # THD (packed sequences).  The block validates the whole contract (typed, in order) before building this stage;
-        # the checks here keep the STAGE honest on its own: the envelope must be declared, and the two features whose
-        # SDPA specializations have no THD arm (the epilogue gate, the dense padding mask) are declined by name rather than
-        # left to the adapter's later message.  MXFP8 rides: the row's THD arm reads the packed per-sequence-tile-padded
-        # scale-factor layout the block's packed quantize stages write (class docstring).
+        # the checks here keep the STAGE honest on its own: the envelope must be declared, and the one feature whose
+        # SDPA specialization has no THD arm (the dense padding mask) is declined by name rather than left to the
+        # adapter's later message.  The epilogue gate rides the THD arm of the f16/bf16 d256 prefill (the SDPA's THD gate
+        # descriptor: G declared at the same (B_env, H, S_max, D) envelope as O, at the slab's gate column stride, bound
+        # as the packed (T, H, D) view); the quantized THD gate is the adapter's own typed decline.  MXFP8 rides: the
+        # row's THD arm reads the packed per-sequence-tile-padded scale-factor layout the block's packed quantize stages
+        # write (class docstring).
         self.thd = bool(thd)
         self.cu_seqlens = bool(cu_seqlens)
         self.num_sequences = None if num_sequences is None else int(num_sequences)
@@ -3779,10 +3784,6 @@ class _Sdpa(_Stage):
         if self.thd:
             if self.num_sequences is None or self.max_seq_len is None or self.num_sequences < 1 or self.max_seq_len < 1:
                 raise ValueError(f"{self.name}: thd=True needs num_sequences >= 1 and max_seq_len >= 1 (the (B, H, S_max, D) envelope the adapter declares)")
-            if self.fuse_gate:
-                raise NotImplementedError(
-                    f"{self.name}: fuse_gate=True has no THD arm (the adapter declines 'epilogue gate fusion is dense-only (no THD gate descriptor)')"
-                )
             if self.seq_lens_present:
                 raise ValueError(f"{self.name}: thd=True and seq_lens_present=True are mutually exclusive (the packed lengths ARE the per-sequence lengths)")
         elif self.num_sequences is not None or self.max_seq_len is not None or self.cu_seqlens:
@@ -3824,11 +3825,6 @@ class _Sdpa(_Stage):
         # pertensor_fp8 picks the kernel FAMILY: True -> prefill_d256_fp8.py
         # (scalar descales), False -> prefill_d256_mxfp8.py (block scales).
         kw = dict(pertensor_fp8=self.pertensor, dtype_o=self.o_dtype, has_amax_o=False) if self.fp8 else {}
-        if self.fuse_gate:
-            # The gate descriptor selects the epilogue_gate specialization
-            # (template_params().epilogue_gate); its stride is compiled in like
-            # Q/K/V's, so a slab column slice binds with no copy.
-            kw["sample_gate"] = _bhsd_desc(b, g.h_q, s, d, self.gate_dtype or self.dtype, self.device, "gate", token_stride=self.gate_token_stride)
         if self.thd:
             # THD: the adapter takes the (B_env, H, S_max, D) ENVELOPE at the block's token strides -- the same `_bhsd_desc`
             # the dense arm declares, at (num_sequences, max_seq_len) instead of (1, T); its (d, h, s) stride order is what
@@ -3885,6 +3881,13 @@ class _Sdpa(_Stage):
             b_env, s_env = b, s
             lse = _lse_desc(b, g.h_q, s, self.device) if self.want_lse else None
             sched = self._sched_policy()
+        if self.fuse_gate:
+            # The gate descriptor selects the epilogue_gate specialization
+            # (template_params().epilogue_gate); its stride is compiled in like
+            # Q/K/V's, so a slab column slice binds with no copy.  Declared at the
+            # SAME envelope as O -- (B_env, H, S_max, D) under THD, where the adapter
+            # maps G through the packed [1, T, H, D] form Q / O take.
+            kw["sample_gate"] = _bhsd_desc(b_env, g.h_q, s_env, d, self.gate_dtype or self.dtype, self.device, "gate", token_stride=self.gate_token_stride)
         return SdpaFwdDslSm100(
             _bhsd_desc(b_env, g.h_q, s_env, d, self.dtype, self.device, "q", token_stride=ts),
             _bhsd_desc(b_env, g.h_kv, s_env, d, self.dtype, self.device, "k", token_stride=ts),
@@ -4170,7 +4173,9 @@ class _Sdpa(_Stage):
         if self.mxfp8:
             kw.update(sf_q=sf_q, sf_k=sf_k, sf_v=sf_v)
         if self.fuse_gate:
-            kw["gate"] = gate.transpose(1, 2)
+            # Dense: the BHSD transpose like Q / K / V / O; THD: the rank-3 packed (T, H, D) view like them (below) -- an
+            # exact `.view` at the slab's token stride, no copy.
+            kw["gate"] = gate.view(self.batch * self.seq_len, self.geom.h_q, self.geom.d_head) if self.thd else gate.transpose(1, 2)
         if self.thd:
             # RANK-3 PACKED (T, H, D) views, never the rank-4 transpose: the adapter's THD binder admits a rank-4 operand
             # only with the RUNTIME sequence count as its leading extent (so (1, H, T, D) is refused once B > 1) and a
@@ -4545,6 +4550,7 @@ class _ServingDecl:
     save_for_backward: bool
     return_lse: bool
     geometry: GatedAttentionBlockGeometry
+    fuse_gate: bool = False
 
 
 def _is_paged(d: _ServingDecl) -> bool:
@@ -4596,6 +4602,13 @@ _EXTEND_DECLINES: Tuple[Tuple[str, type, Callable[[_ServingDecl], bool], str], .
         NotImplementedError,
         lambda d: _is_paged(d) and d.geometry.d_head != 256,
         "kv_source='paged' is validated at d_head == 256 only (the Rubin d256 paged THD leg); other head dims are a follow-up",
+    ),
+    (
+        "fuse_gate",
+        NotImplementedError,
+        lambda d: _is_paged(d) and d.fuse_gate,
+        "kv_source='paged' with fuse_gate=True: the paged THD body stage (4) binds carries no epilogue-gate seam (the packed block's gate rides "
+        "the dense THD prefill's epilogue only); the EXTEND form runs stage (5) as its own launch -- declare fuse_gate=False",
     ),
     (
         "return_lse",
@@ -4691,7 +4704,8 @@ class GatedAttentionBlockFwd(APIBase):
     the packed row count a CAPACITY: a step's lengths sum to ``T_live <= T_max`` and rows ``[T_live, T_max)`` are pad rows
     (slot ``-1``, finite ``cos`` / ``sin``, never attended; their ``out`` rows unspecified but finite).  Typed declines, in
     :data:`_EXTEND_DECLINES`'s order: a dense declaration (the DECODE form, not landed), a missing bottom-right diagonal, a
-    window, another head dim, an LSE; ``quant`` / ``save_for_backward`` are the write-through's, a sparse geometry the sparse
+    window, another head dim, a fused gate (the paged body carries no gate seam; the packed block's gate rides the dense THD
+    prefill only), an LSE; ``quant`` / ``save_for_backward`` are the write-through's, a sparse geometry the sparse
     declaration's (``QsaSpec`` refuses ``thd=True``).
 
     **MXFP8** (an :class:`MxQuantSpec` + e4m3 codes + F8_128x4 SF blobs for ``h`` /
@@ -4764,9 +4778,10 @@ class GatedAttentionBlockFwd(APIBase):
     and training), the UNFUSED per-tensor FP8 and MXFP8 pipelines (the fp4 modes
     included; the three MXFP8 quantize stages write the SDPA row's PACKED
     per-sequence-tile-padded scale-factor layout into slots sized at the capacity
-    ``_sf_slot_bytes_packed``) and ``fuse_norm_rope`` (bf16 / fp16 inference) are
-    served; ``fuse_gate``, the fully fused quantized pipelines and
-    ``seq_lens_present`` are typed declines.  Module docstring, "THD".
+    ``_sf_slot_bytes_packed``), ``fuse_norm_rope`` and ``fuse_gate`` (bf16 / fp16
+    inference; the gate rides the packed d256 prefill's epilogue through the
+    SDPA's THD gate descriptor) are served; the fully fused quantized pipelines
+    and ``seq_lens_present`` are typed declines.  Module docstring, "THD".
 
     **TRAINING (``save_for_backward=True``; bf16 / fp16, out of place, no fusion
     knob)** writes THROUGH the caller's :class:`SavedForBackward` instead of the
@@ -5023,16 +5038,10 @@ class GatedAttentionBlockFwd(APIBase):
                 )
             if quant is not None and (self.fuse_gate or self.fuse_norm_rope):
                 raise NotImplementedError(
-                    f"the fully fused {_family} pipeline (fuse_norm_rope + fuse_gate) is dense-only: its gated SDPA specialization has no THD "
-                    "arm ('epilogue gate fusion is dense-only (no THD gate descriptor)'), and the fused MXFP8 projection fork decodes (b, s_tile) "
-                    "once per 128-row GEMM tile, which a packed tile may straddle; under thd=True run the UNFUSED quantized pipeline "
-                    "(fuse_norm_rope=False, fuse_gate=False)"
-                )
-            if self.fuse_gate:
-                raise NotImplementedError(
-                    "fuse_gate=True is dense-only: the Rubin d256 SDPA's epilogue gate has no THD gate descriptor (sdpa/fwd/api_dsl.py declines "
-                    "'epilogue gate fusion is dense-only (no THD gate descriptor)'); under thd=True use fuse_gate=False (stage (5) runs as its "
-                    "own launch)"
+                    f"the fully fused {_family} pipeline (fuse_norm_rope + fuse_gate) is dense-only: its quantized gated SDPA specialization "
+                    "has no THD gate descriptor (the SDPA's THD gate descriptor is the f16/bf16 d256 prefill's), and the fused MXFP8 projection "
+                    "fork decodes (b, s_tile) once per 128-row GEMM tile, which a packed tile may straddle; under thd=True run the UNFUSED "
+                    "quantized pipeline (fuse_norm_rope=False, fuse_gate=False)"
                 )
             if self.num_sequences is None or self.max_seq_len is None:
                 raise ValueError(
@@ -5586,6 +5595,7 @@ class GatedAttentionBlockFwd(APIBase):
             save_for_backward=self.save_for_backward,
             return_lse=self.return_lse,
             geometry=self.geom,
+            fuse_gate=self.fuse_gate,
         )
         hit = _first_serving_decline(decl)
         if hit is not None:
@@ -5641,7 +5651,8 @@ class GatedAttentionBlockFwd(APIBase):
         reads instead of catching the block's exceptions.  Derived from the SAME code the constructor and ``check_support`` run:
         the device fact (Rubin, cc 10.7, the one arch every stage binds), the CuTe DSL facts (the version floor and the Rubin
         target, exactly as the stages' ``check_support`` gates them), the dtype (bf16 / f16 activations), and the EXTEND form's
-        geometry rows of :data:`_EXTEND_DECLINES` (``diagonal``, ``window``, ``head_dim``; a QsaSpec geometry reads
+        geometry rows of :data:`_EXTEND_DECLINES` (``diagonal``, ``window``, ``head_dim``; the knob rows -- ``return_lse``,
+        ``fuse_gate`` -- are the declaration's, listed in ``declines``; a QsaSpec geometry reads
         :data:`_QSA_THD_DECLINE`, the sparse declaration's own row the THD-only form always meets first) evaluated on
         ``geometry`` -- so ``extend.served`` is True iff a block declared as ``extend.requires`` spells it passes its
         declaration and ``check_support`` here, and ``extend.declines`` lists every typed decline the form raises at

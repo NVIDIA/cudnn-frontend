@@ -19,7 +19,11 @@ load warp AFTER the KV loop into a 64 KiB SMEM tile and consumed in the
 correction epilogue as the packed ``h*tanh(g/2) + h`` (shared hook in
 ``_common_blackwell``; every splice carries an ``EPILOGUE_FUSION_SEAM`` token).
 Gate-off traces byte-identically except for one aliased, unread
-``tma_gate_desc`` GridConstant.  Dense, unsplit, unpaged, non-THD only.
+``tma_gate_desc`` GridConstant.  Dense or THD (packed), unsplit, unpaged: under
+``CFG.THD_VARLEN`` the host maps G in the same packed ``[1, T, H_q, D_v]`` form
+as Q / O (``sdpa_gate_tensor(..., thd=)``) and the TMA-LDG warp's gate load
+already takes the THD coordinates (``q_row_base + q_seq_off``, ``tma_batch``) --
+the kernel body is the dense gated body, byte for byte.
 """
 
 from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
@@ -2143,7 +2147,8 @@ def _host(
     thd_lens_form: Optional[cutlass.Int32],
     # == EPILOGUE_FUSION_SEAM(host_desc) ==
     # Fused epilogue gate, [B, S, H_q, D_v] like O: a pointer + runtime (batch, seq, head) strides;
-    # None iff CFG.EPILOGUE_GATE == 0 (sdpa_gate_tensor folds the slot out).
+    # None iff CFG.EPILOGUE_GATE == 0 (sdpa_gate_tensor folds the slot out).  Under THD the gate is the
+    # packed [1, T, H_q, D_v] form like Q / O (batch extent 1, the token stride bound there, never stepped).
     gate_ptr: Optional[cute.Pointer],
     gate_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     d_qk: cutlass.Constexpr[int],
@@ -2204,7 +2209,7 @@ def _host(
         split_kv=1,  # the SM107 f16 hosts carry no split
         tensor_map_qwords=_TENSOR_MAP_QWORDS,
     )
-    gate_tensor = sdpa_gate_tensor(gate_ptr, problem_size, d_v, gate_strides)
+    gate_tensor = sdpa_gate_tensor(gate_ptr, problem_size, d_v, gate_strides, thd=bool(CFG.THD_VARLEN))
     _require_gate_presence_matches_cfg(gate_tensor)
     stride_order = (3, 2, 1, 0)
     _O_GRANU_ELEMS = CFG.O_SWZ_BYTES // CFG.BPE_O

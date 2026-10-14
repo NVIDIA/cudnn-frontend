@@ -164,6 +164,8 @@ enum HostSlot : size_t {
     OPartialPtr,
     LSEPartialPtr,
     PartialOStrides,
+    GatePtr,
+    GateStrides,
     NumHostSlots
 };
 constexpr std::array<const char *, NumHostSlots> host_slot_names = {"q_ptr",
@@ -191,7 +193,9 @@ constexpr std::array<const char *, NumHostSlots> host_slot_names = {"q_ptr",
                                                                     "n_pages",
                                                                     "o_partial_ptr",
                                                                     "lse_partial_ptr",
-                                                                    "partial_o_strides"};
+                                                                    "partial_o_strides",
+                                                                    "gate_ptr",
+                                                                    "gate_strides"};
 constexpr std::array<HostSlot, 4> pointer_slots                  = {QPtr, KPtr, VPtr, OPtr};
 constexpr std::array<HostSlot, 4> stride_slots                   = {QStrides, KStrides, VStrides, OStrides};
 
@@ -301,12 +305,35 @@ class SdpaThdBinder {
             if (geometry[0] <= 0 || geometry[1] <= 0 || geometry[2] <= 0 || geometry[3] <= 0 || geometry[4] != 1)
                 invalid("invalid native THD operand declaration");
         }
+        // The kernel's epilogue gate (O := O * sigmoid(G)) on a THD plan: the f16/bf16 d256 prefill is the only THD
+        // body with the gate seams, and it maps G through the same packed [1, T, H, D] form as Q / O.  G is a PER-CALL
+        // operand outside the fixed role pack (the gate's pack index arrives as its own argument, -1 = no gate), bound
+        // like Q / O: declared (token, head, elem) strides, Q's dtype, a 16-byte-aligned base, and a capacity that
+        // covers every packed Q token.  The dense binder's gate block is the twin.
+        has_gate_ = py::hasattr(spec, "gate_expect") && !spec.attr("gate_expect").is_none();
+        if (has_gate_) {
+            const auto dtype   = py::cast<std::string>(spec.attr("gate_expect"));
+            const int64_t g_dq = integer(spec, "d_qk"), g_dv = integer(spec, "d_v");
+            if ((dtype != "float16" && dtype != "bfloat16") || dtype != py::cast<std::string>(expect["q"]) ||
+                quantized_ || paged_ || splits_ != 1 || g_dq != 256 || g_dv != 256)
+                invalid(
+                    "native THD epilogue gate requires a nonpaged, unsplit half D256 plan with the gate in Q's dtype");
+            gate_code_ = dtype == "float16" ? kDLFloat : kDLBfloat;
+            if (!decl.contains("gate")) invalid("native THD epilogue gate plan declares no gate geometry");
+            gate_decl_ = py::cast<std::array<int64_t, 6>>(decl["gate"]);
+            if (gate_decl_[0] != qh_ || gate_decl_[1] != g_dv || gate_decl_[2] <= 0 || gate_decl_[3] <= 0 ||
+                gate_decl_[4] != 1)
+                invalid("invalid native THD gate declaration");
+        }
         auto order = py::cast<std::vector<std::string>>(spec.attr("order"));
         if (order.size() != template_.size()) invalid("native THD host argument template has the wrong size");
         for (size_t slot = 0; slot < NumHostSlots; ++slot) {
             // Nonpaged hosts (including SM120) need not expose paged ABI slots.
             if (!paged_ && slot >= KTablePtr && slot <= NumPages) continue;
-            if (splits_ == 1 && slot >= OPartialPtr) continue;
+            if (splits_ == 1 && slot >= OPartialPtr && slot <= PartialOStrides) continue;
+            // Only a gated plan addresses the gate slots (an ungated gate-capable host keeps the template's None
+            // there).
+            if (!has_gate_ && (slot == GatePtr || slot == GateStrides)) continue;
             auto found = std::find(order.begin(), order.end(), host_slot_names[slot]);
             if (slot == ScaleSoftmaxLog2 && found == order.end())
                 found = std::find(order.begin(), order.end(), "scale_softmax");
@@ -330,8 +357,9 @@ class SdpaThdBinder {
          const std::vector<int64_t> &indices,
          int64_t workspace,
          py::object stream,
-         py::object scale) const {
-        return bind_launch(pack, indices, workspace, std::move(stream), std::move(scale)).frame;
+         py::object scale,
+         int64_t gate_index) const {
+        return bind_launch(pack, indices, workspace, std::move(stream), std::move(scale), gate_index).frame;
     }
 
     py::tuple
@@ -340,7 +368,7 @@ class SdpaThdBinder {
                    int64_t workspace,
                    py::object stream) const {
         if (!quantized_) invalid("bind_quantized requires a per-tensor FP8 plan");
-        auto bound = bind_launch(pack, indices, workspace, std::move(stream), py::none());
+        auto bound = bind_launch(pack, indices, workspace, std::move(stream), py::none(), -1);
         return py::make_tuple(bound.frame, bound.identity, bound.amax);
     }
 
@@ -349,11 +377,20 @@ class SdpaThdBinder {
                 const std::vector<int64_t> &indices,
                 int64_t workspace,
                 py::object stream,
-                py::object scale) const {
+                py::object scale,
+                int64_t gate_index) const {
         if (indices.size() != (mx_scales_ ? NumRoles : (quantized_ ? PerTensorNumRoles : HalfNumRoles)))
             invalid("native THD binding has the wrong number of role indices");
         const auto facts = read_native_operand_views(pack, indices);
-        BoundLaunch bound{bind_facts(facts, workspace, std::move(stream), std::move(scale))};
+        // The epilogue gate is outside the role pack: its own index (-1 = none), validated both ways like every other
+        // compile-time presence contract (a gate on an ungated plan, no gate on a gated one).
+        NativeOperandView gate;
+        if (gate_index >= 0) gate = read_native_operand_views(pack, {gate_index})[0];
+        if (has_gate_ && !gate.filled)
+            invalid("gate is required by this compiled specialization (constructed with sample_gate)");
+        if (!has_gate_ && gate.filled) invalid("this specialization was compiled without an epilogue gate");
+        BoundLaunch bound{
+            bind_facts(facts, has_gate_ ? &gate : nullptr, workspace, std::move(stream), std::move(scale))};
         if (quantized_) bind_quantized_scalars(facts, bound, workspace);
         if (has_lse_ && lse_padded_) bound.padded_lse = facts[LSE].pointer;
         return bound;
@@ -361,6 +398,7 @@ class SdpaThdBinder {
 
     py::object
     bind_facts(const std::vector<NativeOperandView> &facts,
+               const NativeOperandView *gate,
                int64_t workspace,
                py::object stream,
                py::object scale) const {
@@ -390,6 +428,18 @@ class SdpaThdBinder {
             invalid("seq_kv_lens must describe the same " + std::to_string(b) + " sequences as seq_q_lens");
         for (size_t i = Q; i <= O; ++i) {
             if (!paged_ || i == Q || i == O) geometry[i] = resolve(facts[i], i, b);
+        }
+        Geometry gate_geometry{0, 0, 0, 0};
+        if (has_gate_) {
+            // G is bound exactly like Q / O: Q's dtype, this plan's device, a 16-byte-aligned base (the gate tile is a
+            // TMA load), the declared (token, head, elem) strides in the packed (T, H, D) or the graph's (B, H, S, D)
+            // form.
+            if (!dtype_is(*gate, gate_code_, 16))
+                invalid("gate: runtime buffer dtype does not match its declaration (the gate is Q's dtype)");
+            on_device(*gate, "gate");
+            if (gate->pointer % 16 != 0)
+                invalid("gate: runtime buffer base address must be 16-byte aligned (TMA global-address rule)");
+            gate_geometry = resolve_declared(*gate, "gate", gate_decl_, 16, b);
         }
         check_lens(q_lens, "q_lens", add(b, (lens_form_ & 1) ? 1 : 0));
         check_lens(kv_lens, "kv_lens", nk);
@@ -437,6 +487,11 @@ class SdpaThdBinder {
         if (has_lse_ && !lse_padded_ && lse_head_major_ && lse_head_stride &&
             numel(lse) < multiply(qh_, std::min(live_q, lse_head_stride)))
             invalid("head-major lse_tensor logical shape must cover bounded packed Q");
+        // The gate must cover every packed Q token the launch addresses: a shorter gate buffer is a caller error, never
+        // a silently shortened launch (Q / O / Stats bound tq above; the gate is an INPUT the kernel reads for each of
+        // them).
+        if (has_gate_ && capacity(*gate, gate_geometry, "gate") < tq)
+            invalid("gate must cover the packed Q tokens: its buffer holds fewer rows than the bound Q / O");
         // Empty Q still initializes padded Stats or quantized Amax/scalars.
         // Finish binding validation before authorizing those writes.
         if (tq == 0 && !(has_lse_ && lse_padded_) && !quantized_) return py::none();
@@ -470,6 +525,10 @@ class SdpaThdBinder {
         put(frame, QLensPtr, py::int_(q_lens.pointer));
         put(frame, KVLensPtr, py::int_(kv_lens.pointer));
         if (has_lse_) put(frame, LSEPtr, py::int_(lse.pointer));
+        if (has_gate_) {
+            put(frame, GatePtr, py::int_(gate->pointer));
+            put(frame, GateStrides, py::make_tuple(gate_geometry.token, gate_geometry.token, gate_geometry.head));
+        }
         if (paged_) tkv = bind_paged(frame, facts, b);
         if (tq == 0) return py::none();
         if (!paged_ && tkv == 0) {
@@ -510,8 +569,9 @@ class SdpaThdBinder {
             const std::vector<int64_t> &indices,
             int64_t workspace,
             py::object stream,
-            py::object scale) const {
-        auto bound = bind_launch(pack, indices, workspace, stream, std::move(scale));
+            py::object scale,
+            int64_t gate_index) const {
+        auto bound = bind_launch(pack, indices, workspace, stream, std::move(scale), gate_index);
         // Binding (including all quantized scalars) finishes before any write.
         // The seed is an existing declared operation, including empty Q.
         if (bound.padded_lse)
@@ -631,7 +691,14 @@ class SdpaThdBinder {
     }
     Geometry
     resolve(const NativeOperandView &f, size_t role, int64_t b) const {
-        const auto &decl = declarations_[role];
+        return resolve_declared(f, names[role], declarations_[role], dtype_bits_[role], b);
+    }
+    Geometry
+    resolve_declared(const NativeOperandView &f,
+                     const char *name,
+                     const std::array<int64_t, 6> &decl,
+                     int bits,
+                     int64_t b) const {
         const int64_t h = decl[0], d = decl[1];
         int64_t ts, hs, es;
         if (numel(f) == 0) {
@@ -640,25 +707,25 @@ class SdpaThdBinder {
             es = decl[4];
         } else if (f.shape.size() == 4) {
             if (f.shape[0] != b || f.shape[1] != h || f.shape[3] != d)
-                invalid(std::string(names[role]) + ": effective shape must be (B, H, S, D) for this plan");
+                invalid(std::string(name) + ": effective shape must be (B, H, S, D) for this plan");
             ts = stride(f, 2);
             hs = stride(f, 1);
             es = stride(f, 3);
         } else if (f.shape.size() == 3) {
             if (f.shape[1] != h || f.shape[2] != d)
-                invalid(std::string(names[role]) + ": a packed THD buffer is (T, H, D) for this plan");
+                invalid(std::string(name) + ": a packed THD buffer is (T, H, D) for this plan");
             ts = stride(f, 0);
             hs = stride(f, 1);
             es = stride(f, 2);
         } else {
-            invalid(std::string(names[role]) + ": a THD operand is (T, H, D) or the graph's (B, H, S, D)");
+            invalid(std::string(name) + ": a THD operand is (T, H, D) or the graph's (B, H, S, D)");
         }
-        if (es != 1) invalid(std::string(names[role]) + ": the head dim must be contiguous (elem stride 1)");
-        if (hs < d || hs % (128 / dtype_bits_[role]) != 0)
-            invalid(std::string(names[role]) + ": head stride must cover the head dim and be a 16-byte multiple");
+        if (es != 1) invalid(std::string(name) + ": the head dim must be contiguous (elem stride 1)");
+        if (hs < d || hs % (128 / bits) != 0)
+            invalid(std::string(name) + ": head stride must cover the head dim and be a 16-byte multiple");
         const int64_t row = add(multiply(h - 1, hs), d);
-        if (ts < row || ts % (128 / dtype_bits_[role]) != 0)
-            invalid(std::string(names[role]) + ": token stride must cover the heads and be a 16-byte multiple");
+        if (ts < row || ts % (128 / bits) != 0)
+            invalid(std::string(name) + ": token stride must cover the heads and be a 16-byte multiple");
         return {ts, hs, es, row};
     }
     static int64_t
@@ -776,6 +843,9 @@ class SdpaThdBinder {
     std::array<size_t, NumHostSlots> index_;
     std::array<std::array<int64_t, 6>, 4> declarations_;
     std::array<int, 4> dtype_code_, dtype_bits_;
+    bool has_gate_ = false;
+    int gate_code_ = kDLBfloat;
+    std::array<int64_t, 6> gate_decl_{};
     std::array<size_t, 5> quant_indices_;
     std::unique_ptr<SdpaMxScaleBinding> mx_scales_;
     int64_t quant_offset_ = 0;
@@ -803,13 +873,18 @@ init_sdpa_thd_binding(py::module_ &m) {
         .def_prop_ro_static("supports_nonpaged_d256_packed_split", [](py::object) { return true; })
         .def_prop_ro_static("supports_nonpaged_packed_split", [](py::object) { return true; })
         .def_prop_ro_static("supports_nonpaged_d128_packed_split", [](py::object) { return true; })
+        // The epilogue gate as a per-call THD slot (the f16/bf16 d256 THD prefill): a Python side that needs it reads
+        // this property and declines typed on an older extension instead of launching a gated kernel with a null gate
+        // pointer.
+        .def_prop_ro_static("supports_epilogue_gate", [](py::object) { return true; })
         .def("bind",
              &SdpaThdBinder::bind,
              py::arg("pack"),
              py::arg("indices"),
              py::arg("workspace"),
              py::arg("stream"),
-             py::arg("scale") = py::none())
+             py::arg("scale") = py::none(),
+             py::arg("gate")  = -1)
         .def("bind_quantized",
              &SdpaThdBinder::bind_quantized,
              py::arg("pack"),
@@ -822,7 +897,8 @@ init_sdpa_thd_binding(py::module_ &m) {
              py::arg("indices"),
              py::arg("workspace"),
              py::arg("stream"),
-             py::arg("scale") = py::none());
+             py::arg("scale") = py::none(),
+             py::arg("gate")  = -1);
 }
 
 }  // namespace python_bindings

@@ -332,7 +332,7 @@ def test_typed_declines_at_declaration_name_the_feature():
     for kw in (dict(fuse_norm_rope=True), dict(inplace_qkv=False), dict(fuse_gate=True), dict(fuse_norm_rope=True, fuse_gate=True)):
         blk, *_ = _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=16, **kw)
         assert isinstance(blk._cache_write, _CacheWrite)
-    for kw in (dict(fuse_norm_rope=True), dict(inplace_qkv=False)):  # fuse_gate under thd is the block's own (unrelated) typed decline
+    for kw in (dict(fuse_norm_rope=True), dict(inplace_qkv=False), dict(fuse_gate=True), dict(fuse_norm_rope=True, fuse_gate=True)):
         blk, *_ = _make_packed_block(_SMALL_D256, _PACKED_LENS, paged_kv_page_size=16, **kw)
         assert isinstance(blk._cache_write, _CacheWrite)
     blk16, *_ = _make_block(_SMALL_D256, 1, 64, dtype=torch.float16, paged_kv_page_size=16)
@@ -873,14 +873,14 @@ def test_write_through_matches_the_slab_and_the_oracle_on_every_layout_and_page(
 
 @pytest.mark.L1
 @requires_rubin
-@pytest.mark.parametrize("pipeline", ["fuse_norm_rope", "out_of_place", "fuse_gate", "packed_fuse_norm_rope", "packed_out_of_place"])
+@pytest.mark.parametrize("pipeline", ["fuse_norm_rope", "out_of_place", "fuse_gate", "packed_fuse_norm_rope", "packed_out_of_place", "packed_fuse_gate"])
 def test_write_through_on_the_other_bf16_pipelines(pipeline):
     """Fused norm + RoPE (the slab is written post-RoPE by the GEMM fork, which norms the fp32 ACCUMULATOR -- so the
     pool's K is checked against the oracle norm + RoPE of the fp32 projection rounded ONCE, where the only legal
     difference is a one-ulp flip from the two accumulation orders: ``rtol 2^-7`` = one bf16 ulp at the bottom of a binade,
     ``atol 1e-4`` = the fp32 noise floor on near-zero values), out-of-place Q / K / V (the compact buffers are the SDPA's
     operands -- and the slab keeps the PRE-norm K, so the oracle norm of the block's OWN pre-norm K is checked at the norm
-    suite's exact bar), and the fused gate (K / V untouched by it; dense only -- the packed block declines it on its own):
+    suite's exact bar), and the fused gate (K / V untouched by it), in dense and packed forms:
     pools bitwise the operands attention consumed, ``out`` bitwise the block's without write-through; then a second
     execute with another mapping on the SAME compiled block re-places every row."""
     form = "packed" if pipeline.startswith("packed_") else "dense"
@@ -1204,6 +1204,7 @@ def test_extend_typed_declines_match_the_envelope_row_by_row():
         "diagonal": lambda: _declare_extend(2, 128, max_kv_len=128, geom_kw=_SMALL_D256),
         "window": lambda: _declare_extend(2, 128, max_kv_len=128, geom_kw=dict(_EXTEND_GEOM, window_left=64)),
         "head_dim": lambda: _declare_extend(2, 128, max_kv_len=128, geom_kw=d128),
+        "fuse_gate": lambda: _declare_extend(2, 128, max_kv_len=128, fuse_gate=True),
         "return_lse": lambda: _declare_extend(2, 128, max_kv_len=128, return_lse=True),
         "token_capacity_dense": lambda: _make_block(_SMALL_D256, 1, 64, token_capacity=64),
         "token_capacity_training": lambda: _make_packed_block(
