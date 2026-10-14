@@ -456,8 +456,8 @@ _T64_CASES = {
     "t64_causal_320": dict(b=2, h=2, h_kv=2, s_q=320, s_kv=320, causal=True),
     "t64_ring_dense_640": dict(b=2, h=2, h_kv=2, s_q=640, s_kv=640),
     "t64_ring_padded_1024_zero_batch": dict(b=3, h=2, h_kv=2, s_q=1024, s_kv=1024, kv_lens=[1024, 0, 700]),
-    "t64_d64_dense_192_cga1": dict(b=2, h=2, h_kv=2, s_q=192, s_kv=192, d=64),
-    "t64_d64_causal_tail_200": dict(b=2, h=2, h_kv=2, s_q=200, s_kv=200, d=64, causal=True),
+    "t64_d64_dense_192_cga1": dict(b=2, h=2, h_kv=2, s_q=192, s_kv=192, d=64),  # 3 resident tiles at cga1
+    "t64_d64_causal_tail_200": dict(b=2, h=2, h_kv=2, s_q=200, s_kv=200, d=64, causal=True),  # 4 tiles: the resident block at cga2
 }
 
 
@@ -470,7 +470,15 @@ def test_tile_n_64_matches_the_fp64_oracle_on_sm100(case, with_mask):
     q, k, v, kw, ref = _t7._case_inputs(case, torch.bfloat16, kv_mask_p=0.3 if with_mask else None, table=_T64_CASES)
     kw.pop("cga", None)
     out = _run(q, k, v, tile_n=64, **kw)
-    assert out["knobs"].tile_n == 64 and out["knobs"].cga == 1, (case, out["knobs"])
+    # the width at the 64-wide tile = the budget pick's own answer (the row's, the heuristics' and the adapter's one arithmetic): cga1 while the
+    # resident block holds S_kv there (D 32 always; D 64 up to 3 tiles = 192), else the resident block at cga2 (D 64 S 200: 4 tiles) before any ring
+    from cudnn.sdpa.fwd import config_sm100 as c0
+
+    c = _T64_CASES[case]
+    d = c.get("d", 32)
+    want_cga = c0.sm100_bias_auto_cga(d, c["s_kv"], c0.SM100_SMALL_D_CGAS[(d, d)], tile_n=64)
+    assert want_cga == {"t64_d64_dense_192_cga1": 1, "t64_d64_causal_tail_200": 2}.get(case, 1), (case, want_cga)
+    assert out["knobs"].tile_n == 64 and out["knobs"].cga == want_cga, (case, out["knobs"])
     _t7._check(out, ref)
 
 
