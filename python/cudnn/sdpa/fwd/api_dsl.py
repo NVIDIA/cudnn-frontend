@@ -63,6 +63,7 @@ from cudnn.sdpa.fwd.config_sm100 import sm100_bias_resident_s_kv_max as _sm100_b
 from cudnn.sdpa.fwd.config_sm100 import sm100_bias_stages_pick as _sm100_bias_stages_pick
 from cudnn.sdpa.fwd.config_sm100 import SM100_TILE_NS_BY_D_SHAPE as _SM100_TILE_NS_BY_D_SHAPE, sm100_tile_n_pick as _sm100_tile_n_pick
 from cudnn.sdpa.fwd.config_sm100 import SM100_FP32_VECTOR_WITH_BIAS_TILE_N as _SM100_FP32_VECTOR_WITH_BIAS_TILE_N
+from cudnn.sdpa.fwd.config_sm100 import sm100_padded_tail_form_pick as _sm100_padded_tail_form_pick
 
 # The SM100 line's device capabilities that serve the small tiles' bias / kv_mask arms (the sm100 row's sm 100..106 band: cc 10.0 and
 # 10.3); cc 10.7 is the Rubin row's.
@@ -1872,6 +1873,21 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
     def _padded_tail_form_eligible(self) -> bool:
         """Whether this plan runs the Rubin small tiles' PLAIN padded body (MASK_FLAGS == MASK_PADDED alone): the only rendering with a
         padded tail form to choose (``TemplateParams.padded_tail_form``)."""
+        if self._device_cc in _SM100_BIAS_CCS:
+            # The SM100 small tiles' plain padded body (the same eligible set); a d64 plan the DECODE tile would take (S_q <= 128 at cga1) is
+            # not eligible: the decode tile has no tail form and the small-tile factory refuses a decode record.
+            return (
+                not self._fp8
+                and self.flavor in _SM100_BIAS_D_SHAPES
+                and bool(self.seq_kv_lens_present)
+                and not self.thd
+                and self.bias_desc is None
+                and self.kv_mask_desc is None
+                and not self.is_causal
+                and self.window_size_left is None
+                and self.window_size_right is None
+                and not self._d64_decode_tile()
+            )
         return (
             self._device_cc == (10, 7)
             and not self._fp8
@@ -1890,6 +1906,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         validated by ``check_support``) or the pick (``config_sm107.sm107_padded_tail_form_pick``: the default constant or the sweep seam)."""
         if not self._padded_tail_form_eligible():
             return 0
+        if self._device_cc != (10, 7):
+            return _sm100_padded_tail_form_pick(
+                self.flavor[0], padded=True, has_bias=False, has_kv_mask=False, request=self.padded_tail_form, tile_n=self._effective_tile_n()
+            )
         return _sm107_padded_tail_form_pick(
             self.flavor[0],
             padded=True,
@@ -3276,7 +3296,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         if self.thd:
             return self.packed_thd_split
         pack_g = (self.h_q // self.h_kv) if self.pack_gqa else 1
-        return int(self.s_q_max) * pack_g <= _D64_DECODE_TILE_ROWS
+        # the Q extent: s_q_max once check_support resolved it, the declared Q shape before (the padded tail form's eligibility asks earlier)
+        s_q = int(self.s_q_max) if self.s_q_max is not None else int(self.q_desc.shape[2])
+        return s_q * pack_g <= _D64_DECODE_TILE_ROWS
 
     def template_params(self) -> Sm100TemplateParams:
         """The compile-time record ``compile()`` loads the kernel module with.

@@ -82,6 +82,10 @@ def test_kernel_module_constants_and_the_not_yet_wired_backstops():
     assert ring._BIAS_STREAMED and not ring._BIAS_RESIDENT and ring.CFG.STAGES_BIAS == 2 and ring._BIAS_GG.n_tiles == 2
     with pytest.raises(ValueError, match="multicast bias ring"):
         _mod(bias_mode=3, bias_stages=2, n_chunk=2)
+    tail = _mod(seq_kv_lens_present=True, padded_tail_form=1)
+    assert tail._PADDED_TAIL_PREMASK and not tail._INF_MASK_ARM
+    with pytest.raises(ValueError, match="PLAIN padded body"):
+        _mod(seq_kv_lens_present=True, padded_tail_form=1, kv_mask_form=1)
     with pytest.raises(ValueError, match="pair item"):
         _mod(bias_mode=1, n_chunk=2)
     t64 = _mod(bias_mode=1, tile_n=64)
@@ -183,6 +187,24 @@ def test_adapter_check_support_is_the_rows_twin(_sm100_device_for_the_adapter, n
     assert params.d_flavor == flavor[0] and params.cta_mma == cta_mma and params.n_chunk == 0 and params.tile_n == _want_tile_n, (name, params)
     _want_stages = 0 if bias_mode != 2 else (3 if _want_tile_n == 64 else 2)  # the derived deepest ring: 3 stages at the 64-wide KV tile, 2 at the 128-wide
     assert params.bias_stages == _want_stages and params.s_slots == 1 and params.q_in_tmem == 0 and params.softmax_wgs == 2, (name, params)
+
+
+def test_padded_tail_form_pick_and_request_on_sm100(_sm100_device_for_the_adapter):
+    """The pre-masked tail is reached by request or by the sweep seam on the SM100 small tiles' PLAIN padded plans; the default stays 0; a plan with a
+    bias, a band, or one the d64 decode tile would take, is not eligible (a request there is a typed decline)."""
+    from cudnn.sdpa.fwd import config_sm100 as c0
+
+    assert c0.sm100_padded_tail_form_pick(32, padded=True, has_bias=False, has_kv_mask=False) == 0
+    assert c0.sm100_padded_tail_form_pick(32, padded=True, has_bias=False, has_kv_mask=False, request=1) == 1
+    assert c0.sm100_padded_tail_form_pick(32, padded=True, has_bias=True, has_kv_mask=False, request=1) == 0
+    api = _api(s_q=256, s_kv=256, seq_kv_lens_present=True, padded_tail_form=1)
+    assert api.check_support() is True and api.template_params().padded_tail_form == 1
+    api0 = _api(s_q=256, s_kv=256, seq_kv_lens_present=True)
+    assert api0.check_support() is True and api0.template_params().padded_tail_form == 0
+    with pytest.raises((NotImplementedError, ValueError)):
+        _api(s_q=256, s_kv=256, seq_kv_lens_present=True, bias=(1, 4, 256, 256), padded_tail_form=1).check_support()
+    with pytest.raises((NotImplementedError, ValueError)):
+        _api(d=64, s_q=128, s_kv=128, seq_kv_lens_present=True, padded_tail_form=1).check_support()  # the d64 decode tile's plan
 
 
 # --------------------------------------------------------------------------- tier 3: the GPU cells (a cc 10.0 / 10.3 device)
@@ -445,6 +467,34 @@ def test_fp32_additive_vector_with_a_bias_runs_at_tile_n_64_on_sm100():
     out = _run(q, k, v, **kw)
     assert out["knobs"].tile_n == 64, out["knobs"]
     _t7._check(out, _t7._ref_of(_t7._CASES["dense_nkv2"], q, k, v, dict(kw, kv_mask=keep)))
+
+
+# The PLAIN padded body's pre-masked tail (the sweep seam in-process; the graph path has no knob for the form): a tail tile at D 32 / D 64, the
+# zero-length batch, both widths -- against the oracle and BITWISE against the legacy form (the same values: the premask's -inf columns are the
+# masked body's; the manual max over them is the software max over the masked chunks).
+_TAIL_CASES = {
+    "tail_padded_217_zero_batch": dict(b=3, h=2, h_kv=2, s_q=217, s_kv=217, kv_lens=[217, 0, 100]),
+    "tail_padded_300_d64_s_q_256": dict(b=2, h=2, h_kv=2, s_q=256, s_kv=300, d=64, kv_lens=[300, 129]),
+    "tail_padded_385": dict(b=2, h=4, h_kv=4, s_q=385, s_kv=385, kv_lens=[385, 200]),
+}
+
+
+@requires_sm100_line
+@pytest.mark.parametrize("tile_n", [128, 64])
+@pytest.mark.parametrize("case", list(_TAIL_CASES))
+def test_pre_masked_tail_matches_the_oracle_and_the_legacy_body_bitwise_on_sm100(case, tile_n, monkeypatch):
+    from cudnn.sdpa.fwd import config_sm100 as c0
+
+    q, k, v, kw, ref = _t7._case_inputs(case, torch.bfloat16, table=_TAIL_CASES)
+    kw.pop("cga", None)
+    kw["bias"] = None
+    ref = _t7._ref_of(_TAIL_CASES[case], q, k, v, kw)
+    monkeypatch.setattr(c0, "_PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS", 0)
+    legacy = _run(q, k, v, tile_n=tile_n, **kw)
+    monkeypatch.setattr(c0, "_PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS", 1)
+    pre = _run(q, k, v, tile_n=tile_n, **kw)
+    _t7._check(pre, ref)
+    assert torch.equal(pre["o"], legacy["o"]) and torch.equal(pre["stats"], legacy["stats"]), (case, tile_n)
 
 
 @requires_sm100_line

@@ -561,7 +561,7 @@ if _INF_MASK_ARM and (CFG.THD_VARLEN or SPLIT_KV > 1 or CFG.PACK_GQA or PAGED_KV
 # The seams of the Rubin small tiles NOT yet on this file -- trace-time backstops (the adapter declines each typed before a plan reaches
 # here; the config validators accept the records for both archs, so the kernel states its own envelope): the streamed / multicast bias
 # ring (BIAS_MODE 2 / 3), the (n, n+1) pair item (N_CHUNK), the double-buffered S (S_SLOTS 2), the third softmax warp group, Q in TMEM,
-# the pre-masked padded tail and the dead-sub-tile quiet body.
+# the dead-sub-tile quiet body.
 if _BIAS_MCAST:
     raise ValueError(
         f"prefill_d128_f16_sm100: the multicast bias ring (CFG.BIAS_MODE={CFG.BIAS_MODE}) is not wired on the SM100 file yet; the resident block (1) and the streamed ring (2) are"
@@ -577,7 +577,19 @@ if CFG.S_SLOTS != 1 or CFG.Q_IN_TMEM or CFG.SOFTMAX_WARPGROUPS != 2:
         f"prefill_d128_f16_sm100: S_SLOTS={CFG.S_SLOTS} / Q_IN_TMEM={CFG.Q_IN_TMEM} / SOFTMAX_WARPGROUPS={CFG.SOFTMAX_WARPGROUPS}: the two-slot S, Q in TMEM and the "
         f"third softmax warp group are not wired on the SM100 file yet (one slot, Q in SMEM, two groups)"
     )
-if CFG.PADDED_TAIL_FORM or CFG.DEAD_SUBTILE_QUIET:
+# The PRE-MASKED padded tail (CFG.PADDED_TAIL_FORM == 1; the PLAIN padded body, MASK_FLAGS == MASK_PADDED alone -- the config factory refuses
+# it with a band, a bias or a kv_mask): ONE kv loop over the whole range with the UNMASKED body; on the tail kv tile the softmax warp first
+# rewrites its sub-tile's out-of-range S columns as -inf in TMEM (`_premask_padded_tail`) so the row max observes them masked.  The legacy
+# form (0, the SM100 default until measured) runs the tail tile through a SECOND, software-max body -- two full softmax bodies per warp
+# group in the rendering (the d32 padded rendering 4362 vs 2951 SASS lines dense).  No barrier row changes: the pre-mask sits inside the
+# body between the `mb_bmm1_done` wait and the P store, on the calling thread's own S columns.
+_PADDED_TAIL_PREMASK = CFG.PADDED_TAIL_FORM == 1
+if _PADDED_TAIL_PREMASK and (CFG.MASK_FLAGS != MASK_PADDED or _INF_MASK_ARM):
+    raise ValueError(
+        f"prefill_d128_f16_sm100: PADDED_TAIL_FORM=1 is the PLAIN padded body's form (MASK_FLAGS == MASK_PADDED alone, no bias / kv_mask); got "
+        f"MASK_FLAGS={CFG.MASK_FLAGS}, BIAS_MODE={CFG.BIAS_MODE}, KV_MASK_FORM={CFG.KV_MASK_FORM}"
+    )
+if CFG.DEAD_SUBTILE_QUIET:
     raise ValueError(
         f"prefill_d128_f16_sm100: PADDED_TAIL_FORM={CFG.PADDED_TAIL_FORM} / DEAD_SUBTILE_QUIET={CFG.DEAD_SUBTILE_QUIET} are not wired on the SM100 file yet"
     )
@@ -2035,6 +2047,26 @@ def _mma_warp_group(
 
 
 @cute.jit
+def _premask_padded_tail(s_addr_base, q_abs, kv_loop, eff_seqlen_kv):
+    """CFG.PADDED_TAIL_FORM == 1, the tail kv tile only: rewrite this thread's out-of-range S columns (kv >= eff_seqlen_kv) as -inf in TMEM so
+    the UNMASKED body's row max observes them masked -- the fused ``tcgen05.ld.red.max`` on cc 10.3, the plain body's manual tree on cc 10.0 --
+    per 64-column chunk that holds such columns (``eff_seqlen_kv - kv_col_base < (c + 1) * 64``, warp-uniform): a plain 32x32b load, the bit-word
+    PADDED mask (``apply_mask_chunk`` with the TRUE -inf), the store back; one ``tcgen05.wait::st`` orders the stores before the body's load.  Same
+    S slot, same thread; the tail tile always holds >= 1 valid column (``right = ceil(len / TILE_N)``), so the row max stays finite = the max over
+    the valid columns, exactly the masked body's software max; a masked column's ``exp2(-inf * scale - max)`` is +0, the P the legacy masked body
+    ships, and the row sum counts 0 for it (the Rubin twin's form, byte for byte in intent)."""
+    CHUNK = _SOFTMAX_CHUNK
+    kv_col_base = kv_loop * cutlass.Int32(CFG.TILE_N)
+    n_valid = eff_seqlen_kv - kv_col_base  # 1 .. TILE_N - 1 on the tail tile
+    for c in cutlass.range_constexpr(CFG.N_BMM2_CHUNKS):
+        if n_valid < cutlass.Int32((c + 1) * CHUNK):
+            raw = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(s_addr_base + cutlass.Int32(c * CHUNK), cutlass.Float32), num=CHUNK)
+            masked = apply_mask_chunk(raw, q_abs, kv_col_base + cutlass.Int32(c * CHUNK), eff_seqlen_kv, 0, MASK_PADDED, N=CHUNK, mask_value=float("-inf"))
+            nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(s_addr_base + cutlass.Int32(c * CHUNK), cutlass.Float32), masked)
+    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+
+
+@cute.jit
 def _softmax_kv_body(
     apply_mask: bool,
     sub_tile_id: int,
@@ -2053,8 +2085,12 @@ def _softmax_kv_body(
     leader_cta_id,
     true_max,
     track_true_max: bool = False,
+    tail_premask=None,
 ):
     """Per-iter kv body for the softmax warp group.
+
+    ``tail_premask`` (CFG.PADDED_TAIL_FORM == 1 only; None = off, folded): a warp-uniform runtime predicate, True on the tail kv tile of a
+    padded batch entry -- the out-of-range S columns are rewritten as -inf in TMEM before the unmasked load (`_premask_padded_tail`).
 
     Compile-time apply_mask (Python bool) picks the load+max strategy:
     apply_mask=False uses fused tcgen05.ld.red.f32.max (HW row-max);
@@ -2142,6 +2178,10 @@ def _softmax_kv_body(
         # Unmasked tiles only: the fused .max reduces before a mask could be applied.
         from cudnn.frost.tile_dsl.regtile import vec_concat
 
+        if cutlass.const_expr(_PADDED_TAIL_PREMASK and tail_premask is not None):
+            # The pre-masked tail: on the tail kv tile the out-of-range S columns become -inf in TMEM before the fused max load below.
+            if tail_premask:
+                _premask_padded_tail(s_addr_base, q_abs, kv_loop, eff_seqlen_kv)
         res_chunks = [tmem_load_max_reduction_x64(s_addr_base + cutlass.Int32(c * CHUNK)) for c in range(N_CHUNKS)]
         raw_chunks = [cutlass.Vector.from_elements(tuple(r[:CHUNK]), cutlass.Int32).bitcast(cutlass.Float32) for r in res_chunks]
         chunks_max = [cutlass.Vector.from_elements((r[CHUNK],), cutlass.Int32).bitcast(cutlass.Float32)[0] for r in res_chunks]
@@ -2155,6 +2195,10 @@ def _softmax_kv_body(
         # path's pattern sans mask.
         from cudnn.frost.tile_dsl.regtile import vec_concat
 
+        if cutlass.const_expr(_PADDED_TAIL_PREMASK and tail_premask is not None):
+            # The pre-masked tail: on the tail kv tile the out-of-range S columns become -inf in TMEM before the manual max tree below.
+            if tail_premask:
+                _premask_padded_tail(s_addr_base, q_abs, kv_loop, eff_seqlen_kv)
         raw_chunks = [
             nvvm.tcgen05_ld(
                 "32x32b",
@@ -2661,6 +2705,31 @@ def _softmax_warp_group(
                     # release it to the TMA-LDG warp -- one lane per warp (THREAD arrives have no pred= path, so the elect is a branch).
                     if nvvm.elect_sync():
                         bars.mb_bias_empty.arrive()
+        elif cutlass.const_expr(_PADDED_TAIL_PREMASK):
+            # The pre-masked tail (CFG.PADDED_TAIL_FORM == 1; MASK_FLAGS == MASK_PADDED alone, so left == unmasked_lo == 0): ONE loop over
+            # the whole range with the unmasked body; the tail tile (kv_loop >= unmasked_hi -- the last tile when this batch entry's S_kv is
+            # not a tile multiple, never otherwise) pre-masks its out-of-range S columns in TMEM.  One softmax body per warp group.
+            for kv_loop in cutlass.range(bounds.left, bounds.right, 1, unroll=1):
+                total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase, true_max = _softmax_kv_body(
+                    False,
+                    sub_tile_id,
+                    kv_loop,
+                    tmem_ptr_i32,
+                    bars,
+                    q_abs,
+                    eff_seqlen_kv,
+                    eff_seqlen_q,
+                    scale_log2,
+                    total_max,
+                    total_max_safe,
+                    total_sum,
+                    bmm1_phase,
+                    stat_empty_phase,
+                    leader_cta_id,
+                    true_max,
+                    track_true_max,
+                    tail_premask=kv_loop >= bounds.unmasked_hi,
+                )
         elif cutlass.const_expr(CFG.MASK_FLAGS == MASK_NONE):
             for kv_loop in cutlass.range(bounds.left, bounds.right, 1, unroll=1):
                 total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase, true_max = _softmax_kv_body(

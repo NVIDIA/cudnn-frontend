@@ -2857,6 +2857,30 @@ def sm100_tile_n_pick(d_flavor: int, s_kv: int, *, has_bias: bool, has_kv_mask: 
     return pick if pick in dom else min(dom)
 
 
+# The PLAIN padded body's tail form on the SM100 small tiles (TemplateParams.padded_tail_form): 0 = the legacy second (software-max) body for
+# the tail kv tile, 1 = the PRE-MASKED tail (one unmasked body; the tail tile's out-of-range S columns rewritten as -inf in TMEM).  The SM100
+# DEFAULT is 0 -- the shipped plain padded legs of the 32- / 64-wide tiles keep the body they run today; the Rubin default (1 at the 128-wide
+# tile, measured +17..+81 % there) is a PRIOR the GB200 sweep decides, reached through the sweep seam or an explicit request.
+SM100_PADDED_TAIL_FORM_DEFAULT = 0
+_PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS: Optional[int] = None
+
+
+def sm100_padded_tail_form_pick(
+    d_flavor: int, *, padded: bool, has_bias: bool, has_kv_mask: bool, causal: bool = False, swa: bool = False, request: Optional[int] = None, tile_n: int = 128
+) -> int:
+    """The ``TemplateParams.padded_tail_form`` of a plan on the SM100 small tiles: 0 off the eligible set (a dense S_kv at a tile multiple, a bias
+    or a kv_mask -- whose -inf body is ONE body already -- a causal / SWA band, the d128 flavor); on it ``request`` when the caller made one (the
+    adapter's ``padded_tail_form=``, validated there: honoured or declined, never degraded), else the sweep seam, else
+    :data:`SM100_PADDED_TAIL_FORM_DEFAULT` (0 at every width until measured)."""
+    if not padded or has_bias or has_kv_mask or causal or swa or int(d_flavor) not in (32, 64):
+        return 0
+    if request is not None:
+        return int(request)
+    if _PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS is not None:
+        return int(_PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS)
+    return SM100_PADDED_TAIL_FORM_DEFAULT
+
+
 def sm100_bias_auto_cga(
     d_flavor: int, s_kv: int, cgas, *, dtype_qkv: int = DTYPE_BF16, tile_n: int = 128, pair: bool = False, tiles_q: int = 2
 ) -> Optional[int]:
