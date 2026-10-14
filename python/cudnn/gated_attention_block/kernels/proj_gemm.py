@@ -1298,7 +1298,7 @@ def _forced_tile_config(n: int) -> Optional[str]:
 #
 # The rule below spells those picks from the shape and the SM count alone (one-wave arithmetic, no measurement at plan
 # time): the token tile is the power of two >= T; a NARROW weight (fewer than a third of a wave of 64-row tiles) takes
-# 128-row weight tiles with the split-K slice count that fills one wave (capped at 8, every slice at least two K tiles) up to
+# 128-row weight tiles with the split-K slice count that fills one wave (capped at 8, every slice at least eight K tiles) up to
 # 64 tokens and the plain 64x32 tile past it while that grid fits one wave -- a shallow K (fewer than 64 K tiles) takes the
 # 64-row swap-AB tile instead of any split; a weight whose 64-row tiles fit one wave takes
 # them (in a 2x1 cluster on a full machine) up to 64 tokens and the plain 128x64 tile past it; a weight whose 64-row tiles
