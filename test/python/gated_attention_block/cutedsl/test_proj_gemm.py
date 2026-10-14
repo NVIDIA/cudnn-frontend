@@ -1024,6 +1024,10 @@ _RUBIN_SMS = 212
         (128, 4096, 32 * 256, "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_splitK6_swapAB"),
         # the 8/1 shard's slab: 72 64-row tiles (a third of the machine) -> the 64-row tile without the pair's multicast
         (1, (2 * 8 + 2 * 1) * 256, 4096, "CONFIG_sm100_64x8x128_64x8x32_cluster1x1_1ctamma_swapAB"),
+        # its out projection is narrow but SHALLOW (K 2048 = 32 K tiles): no split pays -> the 64-row swap-AB tile, the plain
+        # 64x32 past 64 tokens
+        (1, 4096, 8 * 256, "CONFIG_sm100_64x8x128_64x8x32_cluster1x1_1ctamma_swapAB"),
+        (128, 4096, 8 * 256, "CONFIG_sm100_64x32x128_64x32x32_cluster1x1_1ctamma"),
     ],
 )
 def test_small_m_route_names_a_swap_ab_tile_for_decode_row_counts(m, n, k, expect):

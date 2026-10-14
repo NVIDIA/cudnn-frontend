@@ -1294,17 +1294,21 @@ def _forced_tile_config(n: int) -> Optional[str]:
 #   32/2 out projection (N 4096, K 8192): T 1   cuBLAS 9.5  | forced 32.2 | 128x8 splitK6 swapAB    7.7
 #                                         T 128       14.1 |        32.1 | 128x128 splitK6 swapAB  16.1
 #   8/1 fused slab (N 4608, K 4096):      T 1   cuBLAS 5.8  | forced 21.4 | 64x8 cluster1x1 swapAB  6.6
+#   8/1 out projection (N 4096, K 2048):  T 1   cuBLAS 3.9  | forced 11.2 | 64x8 swapAB (no split)  4.9   (cuBLAS stays ahead on this shard)
 #
 # The rule below spells those picks from the shape and the SM count alone (one-wave arithmetic, no measurement at plan
 # time): the token tile is the power of two >= T; a NARROW weight (fewer than a third of a wave of 64-row tiles) takes
 # 128-row weight tiles with the split-K slice count that fills one wave (capped at 8, every slice at least two K tiles) up to
-# 64 tokens and the plain 64x32 tile past it while that grid fits one wave; a weight whose 64-row tiles fit one wave takes
+# 64 tokens and the plain 64x32 tile past it while that grid fits one wave -- a shallow K (fewer than 64 K tiles) takes the
+# 64-row swap-AB tile instead of any split; a weight whose 64-row tiles fit one wave takes
 # them (in a 2x1 cluster on a full machine) up to 64 tokens and the plain 128x64 tile past it; a weight whose 64-row tiles
 # overflow a wave takes 128-row weight tiles (one wave).  Dense bf16 / f16, K-major A and B, no epilogue -- the forward's two
 # projections; everything else keeps today's resolution.
 SMALL_M_MAX = 128
 _SMALL_M_SPLIT_K_MAX = 8
 _SMALL_M_CTA_K_ELEMS = 64  # the catalog's 128-byte K tile at 2 bytes per element
+_SMALL_M_SPLIT_K_MIN_K_TILES = 64  # split K only past this depth (K 4096 at 2 bytes): below it the reducer costs more than it buys
+_SMALL_M_MIN_K_TILES_PER_SLICE = 8
 
 
 def small_m_tile_config(
@@ -1343,16 +1347,21 @@ def small_m_tile_config(
     ctas_64 = -(-n // 64)
     ctas_128 = -(-n // 128)
     if 3 * ctas_64 < sm_count:
-        # NARROW weight (fewer than a third of a wave of 64-row tiles): 128-row weight tiles and the split-K slice count that
-        # fills ONE wave (a slice count that overflows the wave loses its tail: 32/2 out projection, 32 tiles, S 6 = 192 CTAs
-        # 7.7 us vs S 7 = 224 CTAs 9.0 us); past 64 tokens the plain 64x32 tile where its grid fits one wave, else the same
-        # 128x128 split.
+        # NARROW weight (fewer than a third of a wave of 64-row tiles).  With a DEEP K (>= 64 K tiles) 128-row weight tiles
+        # and the split-K slice count that fills ONE wave (a slice count that overflows the wave loses its tail: 32/2 out
+        # projection, 32 tiles, S 6 = 192 CTAs 7.7 us vs S 7 = 224 CTAs 9.0 us; every slice at least 8 K tiles); past 64
+        # tokens the plain 64x32 tile where its grid fits one wave, else the same 128x128 split.  With a SHALLOW K the reducer's
+        # fixed cost outweighs the split (8/1 out projection, K 2048: 4.9 us unsplit vs 5.9 split) -- the 64-row swap-AB tile.
         k_tiles = -(-k // _SMALL_M_CTA_K_ELEMS)
-        slices = max(1, min(_SMALL_M_SPLIT_K_MAX, sm_count // ctas_128, k_tiles // 2))
-        if m > 64 and -(-m // 64) * -(-n // 32) <= sm_count:
+        slices = (
+            max(1, min(_SMALL_M_SPLIT_K_MAX, sm_count // ctas_128, k_tiles // _SMALL_M_MIN_K_TILES_PER_SLICE)) if k_tiles >= _SMALL_M_SPLIT_K_MIN_K_TILES else 1
+        )
+        if m > 64 and (slices == 1 or -(-m // 64) * -(-n // 32) <= sm_count):
             return "CONFIG_sm100_64x32x128_64x32x32_cluster1x1_1ctamma"
-        base = f"CONFIG_sm100_128x{tn}x128_128x{tn}x32_cluster1x1_1ctamma"
-        return f"{base}_splitK{slices}_swapAB" if slices > 1 else f"{base}_swapAB"
+        if slices > 1:
+            return f"CONFIG_sm100_128x{tn}x128_128x{tn}x32_cluster1x1_1ctamma_splitK{slices}_swapAB"
+        cluster = "2x1" if 2 * ctas_64 >= sm_count else "1x1"
+        return f"CONFIG_sm100_64x{tn}x128_64x{tn}x32_cluster{cluster}_1ctamma_swapAB"
     if ctas_64 <= sm_count:
         # The 64-row weight tile fits one wave.  The 2x1 cluster (the token tile multicast across the pair) pays on a FULL
         # machine only (24/2 slab, 208 CTAs: +18 %; 8/1 slab, 72 CTAs: -10 %).
