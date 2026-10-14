@@ -195,9 +195,9 @@ from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tens
 
 from .deterministic_dk_sm100 import (
     INDEXER_BACKWARD_SM100_CAPABILITIES,
-    NUM_DK_PRODUCER_CTAS,
     NUM_DK_PLANES,
     deterministic_dk_planes_bytes,
+    deterministic_dk_producer_ctas,
     deterministic_dk_workspace_bytes,
     reduce_deterministic_dk,
 )
@@ -406,11 +406,11 @@ class IndexerBackwardV2Sm100:
         # straight from gmem (mW is read-only), so weights are never staged
         # in smem.
         self.stage_barrier = pipeline.NamedBarrier(barrier_id=5, num_threads=128)
-        # Deterministic dK row boundary. The cluster relay removes cross-CTA
-        # atomic races; this barrier also keeps the four dK warps inside one
-        # acquire/release turn and prevents consecutive query rows from
-        # interleaving. Ordinary dynamic-ticket execution retains the fully
-        # overlapped schedule.
+        # Deterministic dK row boundary. CTA-private planes remove cross-CTA
+        # atomic races; this barrier keeps the four dK warps on one row and
+        # prevents consecutive query rows from interleaving within a plane.
+        # Ordinary dynamic-ticket execution retains the fully overlapped
+        # schedule.
         self.dk_row_barrier = pipeline.NamedBarrier(barrier_id=6, num_threads=128)
 
     # -----------------------------------------------------------------
@@ -938,8 +938,8 @@ class IndexerBackwardV2Sm100:
                             pipe_T.producer_acquire(tw_tst)
                             if const_expr(self.deterministic):
                                 # Fixed grid-stride ownership is required for
-                                # reproducible plane membership and relay turn
-                                # order. CTA i always consumes rows
+                                # reproducible plane membership and per-plane
+                                # row order. CTA i always consumes rows
                                 # i, i + num_ctas, ... in that order.
                                 tw_raw = Int32(cute.arch.block_idx()[0] + tw_k * self.num_ctas)
                             else:
@@ -1790,7 +1790,7 @@ def indexer_backward_v2_sm100(
         dq_flat = dIndexQ.view(rows, h, d)
         dw_flat = dWeights.view(rows, h)
 
-        num_ctas = NUM_DK_PRODUCER_CTAS if deterministic else torch.cuda.get_device_properties(IndexQ.device).multi_processor_count
+        num_ctas = deterministic_dk_producer_ctas(rows) if deterministic else torch.cuda.get_device_properties(IndexQ.device).multi_processor_count
         # per-CTA ring-slot trip count; the +8 surplus slots are the
         # work-stealing headroom (they come back as -1 tickets)
         if deterministic:

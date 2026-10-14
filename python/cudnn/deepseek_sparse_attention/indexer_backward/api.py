@@ -615,8 +615,8 @@ class IndexerBackward(APIBase):
 
         The ordinary sm100_v2 counter region comes first. Deterministic
         execution instead uses 96 dense FP32 CTA planes regardless of output
-        dtype; ordinary execution needs
-        one dense accumulator only for a bf16 ``d_index_k``.
+        dtype; ordinary execution needs one dense accumulator only for a bf16
+        ``d_index_k``.
         """
         counter = ws_align(8) if self.use_v2 and not self.deterministic else 0
         if self.deterministic:

@@ -446,6 +446,7 @@ class IndexerBackwardSm100:
             persistent_grid_size: CTA count available to a persistent launch.
             topk_indices_global: Whether indices are already flattened across batches.
             enable_score_pdl: Allow dependency overlap with the preceding score grid.
+            deterministic: Use fixed CTA row ownership and CTA-private dK planes.
         """
         self.head_dim = head_dim
         self.heads = heads
