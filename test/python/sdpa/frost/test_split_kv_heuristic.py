@@ -608,6 +608,30 @@ def test_decode_tile_longer_kv_never_splits_less(units, q_tile):
     assert all(s & (s - 1) == 0 for s in got), got
 
 
+def test_decode_tile_batch_one_prices_every_partial_of_the_combine(monkeypatch):
+    """Batch 1 x 2 KV heads (2 units) on a 212-SM part: the combine is one wave of
+    warps walking the split axis serially, so every partial costs it a step
+    (COMBINE_PER_PARTIAL). Measured optima of kernel + combine (grouped-load
+    combine, 2376 MHz lock): kv 4K 16 (14.6 us), kv 32K 32 (24.1), kv 128K 64
+    (41.6); 8 units (batch 4) x 128K 16 (96.8). Without the term the model took
+    64 at kv 32K (26.0 us measured) and 64 at kv 128K with the old combine
+    (68.3 us against 61.1 at 32)."""
+    assert _decode_tile(2, 4096, sm_count=212) == 16
+    assert _decode_tile(2, 32768, sm_count=212) == 32
+    assert _decode_tile(2, 131072, sm_count=212) == 64
+    assert _decode_tile(8, 131072, sm_count=212) == 16
+    # the captured caller (no launch term) keeps the same splits at these shapes
+    assert _decode_tile(2, 32768, sm_count=212, launch_cost=0.0) == 32
+    assert _decode_tile(2, 131072, sm_count=212, launch_cost=0.0) == 64
+    # the per-partial term is what decides: with it at 0 the model runs to 64 at kv 32K and 128K (the flat per-wave combine price
+    # makes every finer split free once the loop term stops paying for it -- the 40 us combine measured behind a 12 us kernel)
+    import cudnn.sdpa.fwd.heuristics as heur
+
+    monkeypatch.setattr(heur, "_DECODE_TILE_COMBINE_PER_PARTIAL", 0.0)
+    assert _decode_tile(2, 32768, sm_count=212) == 64
+    assert _decode_tile(2, 131072, sm_count=212) == 64
+
+
 def test_decode_tile_degenerate_inputs_do_not_split():
     assert choose_decode_tile_split_kv(units=0, kv_tiles=32, sm_count=B200_SMS) == 1
     assert choose_decode_tile_split_kv(units=64, kv_tiles=0, sm_count=B200_SMS) == 1
