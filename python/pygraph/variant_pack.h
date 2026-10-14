@@ -13,15 +13,6 @@
 namespace cudnn_frontend {
 namespace python_bindings {
 
-// Any Python sequence as a tuple. nanobind's cast<tuple> rejects lists that pybind11 converted.
-inline nanobind::tuple
-sequence_as_tuple(nanobind::handle value) {
-    if (PyTuple_Check(value.ptr())) return nanobind::borrow<nanobind::tuple>(value);
-    PyObject *converted = PySequence_Tuple(value.ptr());
-    if (!converted) throw nanobind::python_error();
-    return nanobind::steal<nanobind::tuple>(converted);
-}
-
 // Read-only native metadata borrowed for one binding call. Observed storage and
 // device remain distinct from effective (declared/overridden) dtype and geometry.
 struct NativeOperandView {
