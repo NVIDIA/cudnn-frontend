@@ -284,7 +284,14 @@ def test_prepared_override_capability_declines_legacy_features(feature):
     caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name())
     changed = dict(mxfp8=dict(is_mxfp8=True), bias=dict(has_bias=True))[feature]
     assert engines._prepared_decline_reason(caps, facts, 1) is None
-    assert engines._prepared_decline_reason(caps, replace(facts, **changed), 1) is not None
+    # The predicate's bias branch is the ROW's prepared bias binder: a row without one (``bias_d_shapes`` None) declines a bias on the
+    # prepared path; the resident-block rows (the SM107 row, and the SM100 row since its small-tile port) bind the bias through the
+    # prepared binder, so their own capabilities admit it here and the head-dim envelope is ``_bias_arm_decline``'s decision.
+    legacy_caps = replace(caps, bias_d_shapes=None) if feature == "bias" else caps
+    assert engines._prepared_decline_reason(legacy_caps, replace(facts, **changed), 1) is not None
+    if feature == "bias" and caps.bias_d_shapes is not None:
+        assert engines._prepared_decline_reason(caps, replace(facts, **changed), 1) is None
+        assert engines._bias_arm_decline(caps, replace(facts, **changed), None) is not None  # d 128 is outside the row's bias tiles
     # A mask-free S_kv off the KV tile masks its tail in-kernel, so overrides keep the prepared launch (#1425).
     assert engines._prepared_decline_reason(caps, replace(facts, s_kv=129), 1) is None
 
