@@ -144,6 +144,11 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
   Exact expectations belong to semantic/API contracts, with the invariant stated
   in the test. Performance rankings and tuning boundaries belong in reproducible
   offline benchmarks with source/hardware attribution, not CI golden assertions.
+- Benchmark labels must describe the executed backend layout. Apply route-specific
+  page-size constraints before deduplicating cases, and check the subprocess
+  arguments against result metadata. The CPU-only tests in
+  `benchmark/attention_inference/tests/test_runner.py` cover b12x's distinct
+  paged, absorbed-MLA and contiguous routes without launching kernels.
 - Memo-key regression tests should observe the actual lookup and the selected plan, rather than relying on positional offsets in private key tuples. Appending an independent cache axis must not break an unrelated test; keep the miss count, selected configuration, and A-B-A identity checks. `test_block_scaled_memo_respects_overlap_margin` records the lookup key through its test memo.
 - Workspace device checks compare storage with the declared launch device, not a fixed CUDA ordinal or the ambient current device. Match the diagnostic's actual expected/observed ordinals; the wrong-device message need not contain the word "device". `core/cutedsl/test_workspace_device.py` covers the diagnostic with one GPU and both storage-device directions when two are visible, including DLPack-only and CUDA-array-interface-only buffers.
 - **A regression test must be seen RED.** Before trusting one, run it against the unfixed code — restore the old line, confirm it fails, restore the fix. `test_dsl_sm100_thd_interleaved_kv_views` and `test_varlen_backward_does_not_sync` were both checked this way, and both were genuinely red beforehand; a test written for a bug and never seen to fail is asserting an unknown.

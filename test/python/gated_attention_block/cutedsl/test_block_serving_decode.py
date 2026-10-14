@@ -444,7 +444,8 @@ def test_the_thd_product_bound_names_the_decode_form():
 def test_declaration_facts(group, s_q):
     """A declared DECODE block records its route, its split and where the gate runs BEFORE anything compiles; the stage list
     is the serving pipeline; both projections are capture-safe; ``seq_lens_present`` reads True whatever was passed."""
-    blk, _ = _make_block(group, 4, s_q, fuse_gate=True, fuse_norm_rope=True)
+    # Pin the split off CUDA: sm_count=0 leaves the gate outside the combine.
+    blk, _ = _make_block(group, 4, s_q, fuse_gate=True, fuse_norm_rope=True, decode_split_kv=None if torch.cuda.is_available() else 2)
     r = blk.decode_route
     assert r == decode_route(blk.geom, s_q) and blk.kv_source == "paged" and blk.max_kv_len == 64 * 16 and blk.seq_lens_present is True
     assert blk._sdpa.paged_dense and blk._sdpa.decode_route == r and blk._sdpa.decode_split_kv == blk.decode_split_kv and blk._sdpa.seq_lens_present

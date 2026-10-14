@@ -599,8 +599,8 @@ write must wait on its dependent grid before its first K / V load.
 | `k_cache`, `v_cache` (execute) | the pools, matching the samples EXACTLY (shape and strides; another page count or layout is another plan). Rows past `kv_len` inside a sequence's last live page may hold stale values but must be FINITE (a serving pool is zero-initialised); pages past the live page count are never read |
 
 `GatedAttentionBlockFwd.serving_envelope(geometry, dtype, device) -> ServingEnvelope` is the static envelope a serving stack's
-init-time dispatch predicate reads instead of catching exceptions: the device / DSL facts, and per form (`extend` today; `decode`
-is `None` until the DECODE form lands) whether it is served for that geometry and dtype (`served` / `reason`), the declaration it
+init-time dispatch predicate reads instead of catching exceptions: the device / DSL facts, and per form (`extend` and `decode`,
+described under "Serving: the decode form" below) whether it is served for that geometry and dtype (`served` / `reason`), the declaration it
 requires, the validated page sizes and pool layouts, the dtypes, and `declines` -- every typed decline the form raises at
 declaration with its exact message, read off the same table the constructor raises from, so no declaration-time decline escapes
 the envelope.

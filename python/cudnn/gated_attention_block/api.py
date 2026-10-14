@@ -4938,9 +4938,9 @@ class GatedAttentionBlockFwd(APIBase):
     SAMPLES (their layout and row stride are compiled in; ``serving_envelope`` lists the rest).  ``token_capacity`` makes
     the packed row count a CAPACITY: a step's lengths sum to ``T_live <= T_max`` and rows ``[T_live, T_max)`` are pad rows
     (slot ``-1``, finite ``cos`` / ``sin``, never attended; their ``out`` rows unspecified but finite).  Typed declines, in
-    :data:`_EXTEND_DECLINES`'s order: a dense declaration (the DECODE form, not landed), a missing bottom-right diagonal, a
-    window, another head dim, an LSE; ``quant`` / ``save_for_backward`` are the write-through's, a sparse geometry the sparse
-    declaration's (``QsaSpec`` refuses ``thd=True``).
+    :data:`_EXTEND_DECLINES`'s order: a missing bottom-right diagonal, a window, another head dim, an LSE;
+    ``quant`` / ``save_for_backward`` are the write-through's, a sparse geometry the sparse declaration's
+    (``QsaSpec`` refuses ``thd=True``).  Dense declarations use the DECODE form described below.
 
     **The DECODE form (``kv_source="paged"`` on a DENSE ``[B, S_q, d_model]`` declaration, ``1 <= S_q`` -- the claimed
     envelope ``S_q <= 4``: one new token plus up to three speculative ones -- over ``paged_kv_page_size > 0``; bf16 / f16

@@ -79,12 +79,21 @@ class InferenceBenchmarkRunner:
         self.verbose = verbose
 
     @staticmethod
-    def page_sizes_for(config: InferenceBenchmarkConfig, backend: str) -> List[int]:
-        """The generation-phase page sizes ``backend``'s cases sweep: ``config.page_sizes`` (de-duplicated, in order) for a
-        paged-KV backend, else the one ``config.page_size``."""
-        if backend in PAGED_BACKENDS and config.page_sizes:
-            return list(dict.fromkeys(int(p) for p in config.page_sizes))
-        return [config.page_size]
+    def page_sizes_for(config: InferenceBenchmarkConfig, backend: str, model: Optional[ModelPreset] = None) -> List[int]:
+        """Generation pages, deduplicated after applying the model's backend layout constraints.
+
+        Without a model, return the requested backend axis. Case expansion supplies
+        the model so subprocess arguments, logs and result rows use effective sizes.
+        """
+        pages = config.page_sizes if backend in PAGED_BACKENDS and config.page_sizes else [config.page_size]
+        if backend == "b12x" and model is not None:
+            # Match setup_b12x: sliding-window GQA uses contiguous K/V; d576 MLA
+            # honors the requested page; the remaining paged paths require >=64.
+            if model.kind == "gqa" and model.sliding_window_size:
+                return [config.page_size]
+            if not (model.kind == "mla_absorbed" and model.head_dim_qk == 576):
+                pages = [max(int(p), 64) for p in pages]
+        return list(dict.fromkeys(int(p) for p in pages))
 
     def expand_config(self, config: InferenceBenchmarkConfig) -> Iterator[Dict[str, Any]]:
         for model in config.models:
@@ -106,7 +115,7 @@ class InferenceBenchmarkRunner:
                     for q_tokens, kv_len in config.generation_shapes:
                         for batch in config.generation_batch_sizes:
                             for kv_dtype in config.kv_cache_dtypes:
-                                for page_size in self.page_sizes_for(config, backend):
+                                for page_size in self.page_sizes_for(config, backend, model):
                                     yield {
                                         "config": config,
                                         "model": model,
