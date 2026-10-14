@@ -284,6 +284,7 @@ class IndexerBackward(APIBase):
         backend: str = "default",
         deterministic: bool = False,
     ):
+        """Capture a shape-specialized plan and its execution policy."""
         super().__init__()
         self.iq_desc = self._make_tensor_desc(sample_index_q, name="sample_index_q")
         self.w_desc = self._make_tensor_desc(sample_weights, name="sample_weights")
@@ -548,6 +549,7 @@ class IndexerBackward(APIBase):
         return True
 
     def compile(self) -> None:
+        """Compile the selected backend on the sample tensors' CUDA device."""
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
             return

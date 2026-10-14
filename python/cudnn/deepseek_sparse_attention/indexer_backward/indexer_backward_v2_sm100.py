@@ -253,6 +253,7 @@ class IndexerBackwardV2Sm100:
         idx_local: bool = False,
         deterministic: bool = False,
     ):
+        """Configure the persistent schedule and dK ownership policy."""
         assert num_heads == 64, "specialized for H=64"
         assert head_dim == 128, "specialized for D=128"
         self.num_heads = num_heads
@@ -433,6 +434,7 @@ class IndexerBackwardV2Sm100:
         stream: cuda.CUstream,
         mCnt: cute.Tensor,  # ordinary ticket counter or unused deterministic placeholder
     ):
+        """Build tensor layouts and launch the persistent v2 kernel."""
         # (S, H, D) -> (H, D, S): B-operand view (N=heads, K=dim, rest=row)
         mQ_v = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=[1, 2, 0]))
 
@@ -544,6 +546,7 @@ class IndexerBackwardV2Sm100:
         s_q_per_batch: Int32,
         s_k_local: Int32,
     ):
+        """Execute dynamic-ticket or fixed-owner row processing on device."""
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         seq_k = cute.size(mK.shape[0])
@@ -1707,6 +1710,7 @@ def indexer_backward_v2_sm100(
         current_stream=None,
         workspace=None,
     ):
+        """Validate buffers and run score-grad, v2 GEMM, and dK finalization."""
         # ---- execute-time contract validation: views only, no implicit
         # conversion, no allocation (python/cudnn/AGENTS.md Rule 1).
         # api.check_support() already validated the descriptor metadata;

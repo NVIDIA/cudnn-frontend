@@ -569,6 +569,7 @@ class IndexerBackwardSm100:
         sm_scale: Float32 | float,
         stream: cuda.CUstream,
     ):
+        """Materialize tensor views and launch the configured GEMM kernel."""
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
 
@@ -3506,6 +3507,11 @@ def indexer_backward_sm100(
     topk_indices_global: bool = True,
     deterministic: bool = False,
 ):
+    """Build the default SM100 backward pipeline for one plan signature.
+
+    ``deterministic=True`` replaces the cross-CTA dK atomic target with
+    fixed-owner CTA-private planes and a trailing fixed-order reduction.
+    """
     # ``batch``/``seqlen``/``seqlen_k`` are runtime extents (packed training
     # changes them every step, GitHub #1188). They only select the persistent
     # launch policy, and that policy -- not the shape -- is in the compile key.
@@ -3883,6 +3889,7 @@ def _build_cute_dsl_kernel(
     topk_indices_global: bool = True,
     deterministic: bool = False,
 ):
+    """Create lazily compiled score/GEMM runners for one launch policy."""
     from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 
     if torch.cuda.get_device_capability()[0] < 10:
@@ -3892,6 +3899,7 @@ def _build_cute_dsl_kernel(
     )
 
     def _make_kernel(enable_score_pdl: bool):
+        """Instantiate the GEMM object with or without score-stage PDL."""
         return IndexerBackwardSm100(
             head_dim=dim,
             heads=heads,
@@ -4016,6 +4024,7 @@ def _build_cute_dsl_kernel(
     def _run(
         IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK, AttnScore, IndexScore, TopkIndices, GradLoss, grad_scale, current_stream=None, workspace=None
     ):
+        """Run score-grad, GEMM, and the selected dK finalization in order."""
         # ``grad_scale`` is a host scalar (Python float / 0-D fp32 tensor)
         # multiplied into ``score_grad`` as a runtime ``Float32`` arg —
         # changing it across calls does **not** trigger recompilation.

@@ -44,6 +44,7 @@ class DeterministicDkReduceSm100:
     arch = 100
 
     def __init__(self, head_dim: int):
+        """Specialize the reducer for the contiguous dK row width."""
         self.head_dim = head_dim
 
     @cute.jit
@@ -53,6 +54,7 @@ class DeterministicDkReduceSm100:
         mdK: cute.Tensor,
         stream: cuda.CUstream,
     ):
+        """Launch one fixed-order reduction block per flattened KV row."""
         # Both tensors are contiguous. Keep the plane-major scratch layout so
         # producer CTA i and reducer operand i address the same plane.
         seqlen_k = cute.size(mdK.shape[0]) * cute.size(mdK.shape[1])
