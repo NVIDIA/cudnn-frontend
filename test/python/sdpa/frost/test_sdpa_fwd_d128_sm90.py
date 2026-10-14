@@ -309,6 +309,46 @@ def test_d128_fp64_bounds(shape, causal, dtype):
     torch.testing.assert_close(lse.double(), lse64, atol=1e-3, rtol=1e-5)
 
 
+# --- Large scores: the FP32 exponent rounding -------
+
+# Q and K hold one bf16 constant a = 1.5 * 2**k, so every score is M = 128 * a * a: exact in bf16 products and in every
+# FP32 partial sum (at most 11 significant bits), whatever order the WGMMA adds them in.
+_LARGE_SCORE_AMPS = [1.5 * 2.0**k for k in (0, 6, 12, 14, 16, 17)]
+
+
+def _row_max_id(a):
+    mantissa, exponent = f"{128 * a * a:.1e}".split("e")
+    return f"max-{mantissa}e{int(exponent)}"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("a", _LARGE_SCORE_AMPS, ids=[_row_max_id(a) for a in _LARGE_SCORE_AMPS])
+@torch_fork_set_rng(seed=0)
+def test_d128_large_scores_keep_rows_finite_and_nonzero(a):
+    """Every score equals M = 128 * a * a, so the softmax is uniform: O is the mean of V over the 256 keys and Stats is
+    M * scale + ln(256). The FP32 path forms each exponent as one FFMA, s * k - c with k = scale * log2(e) and c = M * k
+    rounded once per row, so the top score's exponent is c's rounding error instead of 0: about -16 at M = 4.8e9, -256 or
+    less from M = 7.7e10 on, where every P underflows and normalize_row takes its empty-row branch (O = 0, Stats = -inf).
+    The FP64 guard engages only above 2**126 (about 8.5e37), so it never sees these rows. The three largest cases are
+    expected red until the exponent formula changes: this test is their detector (python/cudnn/AGENTS.md)."""
+    q, k, v = _inputs(1, 2, 2, 128, 256, torch.bfloat16)
+    q.fill_(a)
+    k.fill_(a)
+    o, lse = _run(q, k, v, stats=True)
+    o64, lse64 = _ref64(q, k, v, scale=_SCALE, is_causal=False, bottom_right=False)
+    bad_o = (~torch.isfinite(o)).any(dim=-1)
+    zero_o = (o == 0).all(dim=-1)
+    bad_lse = ~torch.isfinite(lse)
+    assert not (bad_o.any() or zero_o.any() or bad_lse.any()), (
+        f"row max {128 * a * a:.3e}: {int(bad_o.sum())} rows with a non-finite O, {int(zero_o.sum())} all-zero O rows "
+        f"(V is random, the exact O is its mean), {int(bad_lse.sum())} non-finite Stats of {lse.numel()} rows"
+    )
+    u = 2.0**-8
+    excess = (o.double() - o64).abs() - 2 * u * (o64.abs() + v.double().abs().max())
+    assert excess.max().item() <= 0, f"row max {128 * a * a:.3e}: O exceeds its FP64 bound by up to {excess.max().item():.3e}"
+    torch.testing.assert_close(lse.double(), lse64, atol=0.0, rtol=1e-5)
+
+
 # --- Code generation: the register split, spills and WGMMA serialization -------
 
 _SASS_PROBE = textwrap.dedent(r"""
