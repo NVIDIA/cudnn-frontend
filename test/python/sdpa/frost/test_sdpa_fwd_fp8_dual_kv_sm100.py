@@ -15,6 +15,10 @@ and paged K/V with unaligned lengths.
 """
 
 import math
+import os
+import subprocess
+import sys
+import textwrap
 
 import pytest
 import torch
@@ -294,3 +298,59 @@ def test_paged_two_kv_streams_match_the_reference(routed, name, b, s_q, page, ma
     assert not torch.isnan(o).any()
     err = (o - ref).abs().max().item() / ref.abs().max().item()
     assert err < 0.04, (name, err)
+
+
+_PHANTOM_CHILD = textwrap.dedent(r"""
+    import os, sys
+    sys.path.insert(0, "__TEST_DIR__")
+    import torch
+    import test_sdpa_fwd_fp8_dual_kv_sm100 as t
+    from cudnn.sdpa.fwd import api_dsl, config_sm100
+
+    config_sm100.FP8_DUAL_KV_STREAM_ROUTED = True
+    kernels = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels")
+    src = open(os.path.join(kernels, api_dsl._SM100_FP8_KERNEL_FILES[(128, 128)])).read()
+    # The MMA warp sleeps before it consumes stream 1's P-ready credits: the adverse ordering in which
+    # stream 0 and the ping-pong run ahead while stream 1's previous credits sit unconsumed.
+    anchor = "    bars.mb_bmm2_ready[stream * CFG.N_BMM2_CHUNKS + 0].wait(bmm2_ready_phase, spin=SPIN_RING_WAITS)\n"
+    delay = (
+        "    if cutlass.const_expr(stream == 1):\n"
+        "        for _d in cutlass.range_constexpr(4):\n"
+        "            nvvm.inline_ptx('nanosleep.u32 6000;', write_only_types=[], read_only_args=[])\n"
+    )
+    assert src.count(anchor) == 1, "the stream-indexed ready wait of _mma_dual_pv moved: update this test's anchor"
+    path = os.path.join(os.getcwd(), "prefill_d128_fp8_delayed_mma.py")
+    open(path, "w").write(src.replace(anchor, delay + anchor))
+    api_dsl._SM100_FP8_KERNEL_FILES[(128, 128)] = path
+    # 4 sequences, 48 packed rows (12 q heads over one KV head x 4 tokens), page 128: 3 / 5 / 7 / 9 KV tiles.
+    # Every count is odd, so stream 1 ends on a phantom step with at least one real step before it.
+    torch.manual_seed(1234)  # the block table is a random permutation: pin it so the bound below is a number, not a draw
+    torch.cuda.manual_seed_all(1234)
+    o, ref = t._run_paged(4, 12, 1, 4, 128, 9, [300, 600, 800, 1100], causal_br=False)
+    assert not torch.isnan(o).any()
+    err = (o - ref).abs().max().item() / ref.abs().max().item()
+    print("max_rel_err", err, flush=True)
+    assert err < 0.04, err
+    print("OK", flush=True)
+    """)
+
+_PHANTOM_BUDGET_S = 900.0  # one cold compile of the patched kernel (1-3 min) + one launch; a lap parks the child in its synchronize for ever
+
+
+def test_phantom_step_cannot_lap_a_delayed_mma(tmp_path):
+    """Stream 1's phantom step (odd KV tile count) publishes its P-ready credits only after its own
+    previous PV completed, so a delayed MMA cannot be lapped.  The MMA issues the next pair's BMM1 --
+    which releases the phantom -- before the previous pair's PVs, and ``mb_bmm2_ready`` chunk 1 counts
+    softmax lanes only: a phantom that published at once completed a second phase of that barrier while
+    the MMA's parity wait for the first was still pending, and the wait never saw a flip.  Child process
+    under a wall budget (a regression is a budget miss, never a wedged suite): the kernel is run from a
+    copy whose MMA sleeps before consuming stream 1's credits, which makes the ordering deterministic."""
+    script = tmp_path / "phantom_lap_child.py"
+    script.write_text(_PHANTOM_CHILD.replace("__TEST_DIR__", os.path.dirname(os.path.abspath(__file__))))
+    try:
+        proc = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=_PHANTOM_BUDGET_S, cwd=str(tmp_path))
+    except subprocess.TimeoutExpired as e:
+        out = (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+        pytest.fail(f"HANG: the delayed-MMA two-stream child did not finish within {_PHANTOM_BUDGET_S:.0f} s (the phantom lapped its consumer).\n{out[-3000:]}")
+    assert proc.returncode == 0, f"child failed rc={proc.returncode}\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
+    assert "OK" in proc.stdout, proc.stdout[-2000:]

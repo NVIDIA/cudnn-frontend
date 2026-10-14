@@ -1994,11 +1994,18 @@ def _store_p_chunk(sP_sub_base, p_row, chunk: cutlass.Constexpr[int], p_vec):
 
 
 @cute.jit
-def _softmax_phantom_step(sub_tile_id: cutlass.Constexpr[int], bars, tmem_base, leader_cta_id):
+def _softmax_phantom_step(sub_tile_id: cutlass.Constexpr[int], bars, tmem_base, leader_cta_id, p_free_phase):
     """A step with no KV tile for this stream (two-stream mode, odd tile count: stream 1's
     last step).  Every per-step handshake runs -- alpha = 1 so the correction rescales
     nothing, the exp ping-pong pass, the P-ready arrivals -- while S, P and the running
-    statistics are left alone (the MMA issues no BMM1 / PV for it)."""
+    statistics are left alone (the MMA issues no BMM1 / PV for it).
+
+    The ready credits wait for this stream's PREVIOUS PV first, as a real step's P store does:
+    that completion proves the MMA consumed the previous step's credits.  The MMA issues the
+    next pair's BMM1 (which arrives the bmm1_done that releases this step) before the previous
+    pair's PVs, and mb_bmm2_ready chunk 1 counts softmax lanes only -- no correction arrival
+    bounds it -- so a phantom publishing at once could complete a second phase of that barrier
+    before the MMA's parity wait for the first, and the wait would never see a flip."""
     stats_addr = tmem_base + cutlass.Int32(LAYOUT.STATS_OFF + sub_tile_id * LAYOUT.STATS_STRIDE)
     alpha_vec = cutlass.Vector.from_elements((cutlass.Float32(1.0),), cutlass.Float32)
     nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
@@ -2006,6 +2013,7 @@ def _softmax_phantom_step(sub_tile_id: cutlass.Constexpr[int], bars, tmem_base, 
     bars.mb_stat_full[sub_tile_id].arrive()
     nvvm.barrier_cta_sync(barrier_id=8 + sub_tile_id, thread_count=256)
     cute.arch.barrier_arrive(barrier_id=8 + (1 - sub_tile_id), number_of_threads=256)
+    bars.mb_bmm2_done[sub_tile_id].wait(p_free_phase, spin=SPIN_RING_WAITS)
     for chunk in cutlass.range_constexpr(CFG.N_BMM2_CHUNKS):
         bars.mb_bmm2_ready[sub_tile_id * CFG.N_BMM2_CHUNKS + chunk].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
@@ -2359,7 +2367,7 @@ def _softmax_warp_group(
                 bars.mb_bmm1_done[sub_tile_id].wait(bmm1_phase, spin=SPIN_RING_WAITS)
                 bmm1_phase = bmm1_phase ^ 1
                 if kv_tile >= bounds.right:
-                    _softmax_phantom_step(sub_tile_id, bars, tmem_base_sm, leader_cta_id)
+                    _softmax_phantom_step(sub_tile_id, bars, tmem_base_sm, leader_cta_id, p_free_phase)
                 else:
                     if cutlass.const_expr(CFG.MASK_FLAGS == MASK_NONE):
                         total_max, total_sum = _softmax_kv_body(
