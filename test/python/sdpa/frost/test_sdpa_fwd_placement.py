@@ -496,13 +496,14 @@ _SM107_PAGED_D256_DECODE_CORNERS = [
     ("64/2", 256, 131072, placement.TRAIL),
     ("64/2", 1, 131072, placement.TRAIL),
     ("64/2", 32, 262144, placement.TRAIL),
+    ("32/1", 64, 8192, placement.TRAIL),  # the same group 32 on an unmeasured geometry (one KV head): the backend stays first
 ]
 
 _SM107_PAGED_D256_MTP_CORNERS = [
     # (heads, s_q, b, declared KV, dtype, page, verdict): the MTP rows -- FlashInfer's decode graph at q_len_per_req 2-4 (the bottom-right
     # causal diagonal + the padding mask) on 24/2 and 32/2: the tile 0.01-0.31 of the backend on every measured cell (b 1-128 x KV 1k-128k,
-    # page 16 bf16), so LEAD over the whole measured box incl. its 2-unit corner; outside it (another group, s_q 5, KV below 1k or past 128k,
-    # more than 256 units, page 32, f16) the backend stays first until measured.
+    # page 16 bf16), so LEAD over the whole measured box incl. its 2-unit corner; outside it (another geometry -- incl. 12/1 and 16/1, the
+    # same groups unmeasured at s_q > 1 -- s_q 5, KV below 1k or past 128k, more than 256 units, page 32, f16) the backend stays first.
     ("24/2", 2, 1, 1024, cudnn.data_type.BFLOAT16, 16, placement.LEAD),
     ("24/2", 3, 4, 8192, cudnn.data_type.BFLOAT16, 16, placement.LEAD),
     ("24/2", 4, 128, 131072, cudnn.data_type.BFLOAT16, 16, placement.LEAD),
@@ -515,6 +516,8 @@ _SM107_PAGED_D256_MTP_CORNERS = [
     ("24/2", 5, 32, 8192, cudnn.data_type.BFLOAT16, 16, placement.TRAIL),
     ("16/4", 2, 32, 8192, cudnn.data_type.BFLOAT16, 16, placement.TRAIL),
     ("64/2", 2, 32, 8192, cudnn.data_type.BFLOAT16, 16, placement.TRAIL),
+    ("12/1", 2, 64, 8192, cudnn.data_type.BFLOAT16, 16, placement.TRAIL),  # group 12 on the unmeasured 12/1 geometry at s_q > 1
+    ("16/1", 3, 64, 8192, cudnn.data_type.BFLOAT16, 16, placement.TRAIL),  # group 16 on the unmeasured 16/1 geometry at s_q > 1
     ("24/2", 2, 32, 8192, cudnn.data_type.HALF, 16, placement.TRAIL),
     ("24/2", 2, 32, 8192, cudnn.data_type.BFLOAT16, 32, placement.TRAIL),
 ]
@@ -587,6 +590,7 @@ def test_sm107_paged_d256_mtp_rows_lead_on_the_measured_box(heads, s_q, b, s_kv,
         dict(s_q=2),  # two query tokens WITHOUT the diagonal: not FlashInfer's MTP graph, unmeasured (the MTP band keys on the diagonal)
         dict(s_q=5, causal=True, bottom_right=True),  # past the MTP rows' envelope (a third token unit): the prefill kernel serves it
         dict(h_q=64, b=4, s_kv=8192),  # group 32 one step below its band (2**16 tokens in flight holds the parity cell)
+        dict(h_q=64, page_size=32),  # group 32 at page 32: measured on 24/2 only, not on 64/2
         dict(h_q=4),  # group 2: not measured
         dict(h_q=2),  # MHA: not measured
         dict(h_q=36, h_kv=8),  # a partial group
@@ -611,6 +615,7 @@ def test_sm107_paged_d256_mtp_rows_lead_on_the_measured_box(heads, s_q, b, s_kv,
         "q2_no_diagonal",
         "mtp_q5",
         "g32_below_band",
+        "g32_page32",
         "g2",
         "mha",
         "partial_group",

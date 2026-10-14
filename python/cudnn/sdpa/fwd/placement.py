@@ -175,14 +175,16 @@ Rubin row remains opt-in.
   units and past 128k declared KV: unmeasured. Two further bands of the SAME measurement (2026-10-13, the same board, method and
   arms) LEAD by default too, each where the tile is strictly faster than the backend's default plan with margin in BOTH regimes;
   FE's placement is a verdict against the backend's plan, and what the consumer's other kernels do is the consumer's routing:
-  -- group 32 (64/2: the 32-column tile in ONE unit, ``s_q == 1``): the tile 0.27-0.79 of the backend on every quotable cell with
+  -- group 32 on its measured geometry 64/2 (the 32-column tile in ONE unit, ``s_q == 1``; a 32/1 graph is the same group but was
+  not measured and trails): the tile 0.27-0.79 of the backend on every quotable cell with
   ``4 <= units <= 256`` and ``units * KV >= 2**17`` tokens in flight (28 cells x 2 regimes, all quotable; ``SM107_PAGED_D256_G32_*``);
   one step below (2**16) the 8 x 8k eager cell sits at parity (1.00) and 16 x 4k / 32 x 2k eager are unverifiable, so the band
   starts at 2**17 (the 2**15 / 2**16 cells that led -- 32 x 1k 0.64 / 0.58, 16 x 2k 0.68 / 0.68, 64 x 1k 0.54 / 0.79 -- are not
   admitted; 2 units led only at the 128k endpoint, 0.67, not admitted); the f16 twin (32 x 8k, 0.38 both regimes) measured inside the
-  band, the page sizes as the s_q == 1 band's. The tile trails FlashInfer's fa2 kernel on part of this band (7-9 % at the medians),
+  band; page 16 only -- page 32 / 64 were measured on 24/2, not on 64/2. The tile trails FlashInfer's fa2 kernel on part of this band (7-9 % at the medians),
   which does not change the verdict against the backend;
-  -- the MTP rows (``2 <= s_q <= 4`` on 24/2 and 32/2 = the 32-column tile in up to two token units; FlashInfer's decode graph at
+  -- the MTP rows (``2 <= s_q <= 4`` on the measured geometries 24/2 and 32/2 -- 12/1 and 16/1 share the groups but were not measured
+  at ``s_q > 1`` and trail -- = the 32-column tile in up to two token units; FlashInfer's decode graph at
   ``q_len_per_req`` 2-4 declares the BOTTOM-RIGHT CAUSAL diagonal with the padding mask): the tile 0.01-0.31 of the backend's default
   plan (which costs 6.8-142 ms per launch at KV 128k) on ALL 576 (cell, regime) pairs -- b 1-128 x declared KV 1k-128k, i.e.
   ``2 <= units <= 256`` and the whole KV band, every cell quotable -- so the band carries no tokens-in-flight floor
@@ -315,14 +317,15 @@ SM107_PAGED_D256_DECODE_PAGE_SIZES = (16, 32, 64)  # 16 on every geometry, 32 / 
 # The same measurement's two further bands (module docstring, "Two further bands"), each the tile strictly faster than the backend with
 # margin in both regimes.  Group 32 (64/2: the 32-column tile in one unit) at s_q == 1: units and the declared KV as above, the floor one
 # step higher (the 2**16 step holds the 8 x 8k eager parity cell).
-SM107_PAGED_D256_G32_GROUP = 32
+SM107_PAGED_D256_G32_GEOMETRIES = ((64, 2),)  # the (h_q, h_kv) pair measured for group 32; a 32/1 graph is the same group but unmeasured -> TRAIL
+SM107_PAGED_D256_G32_PAGE_SIZES = (16,)  # the page the 64/2 band and its f16 twin ran at; page 32 / 64 were measured on 24/2 only, not here
 SM107_PAGED_D256_G32_MIN_UNITS = 4  # 2 units led only at the 128k endpoint (0.67): one column, not admitted
 SM107_PAGED_D256_G32_MAX_UNITS = 256  # b 128 x 2 KV heads, the largest column measured at 64/2 (0.36-0.48 there)
 SM107_PAGED_D256_G32_MIN_KV_TOKENS_IN_FLIGHT = 2**17  # every quotable cell at or above it leads in both regimes, 0.27-0.79; 2**16 holds a parity cell (1.00)
 # The MTP rows: 2 <= s_q <= 4 on the groups measured (24/2, 32/2), FlashInfer's decode graph with the bottom-right causal diagonal; the tile
 # 0.01-0.31 of the backend on every one of the 576 (cell, regime) pairs over b 1-128 x KV 1k-128k, so no tokens-in-flight floor; page 16 bf16
 # is what was measured (page 32 / 64 and the f16 twin keep the backend first until measured).
-SM107_PAGED_D256_MTP_GROUPS = (12, 16)
+SM107_PAGED_D256_MTP_GEOMETRIES = ((24, 2), (32, 2))  # the (h_q, h_kv) pairs measured; 12/1 and 16/1 share the groups but were not measured at s_q > 1 -> TRAIL
 SM107_PAGED_D256_MTP_S_Q = (2, 4)  # q_len_per_req 2, 3, 4 (inclusive band)
 SM107_PAGED_D256_MTP_UNITS = (2, 256)  # b 1-128 x 2 KV heads
 SM107_PAGED_D256_MTP_KV_TOKENS = (1024, 131072)
@@ -390,11 +393,13 @@ def _sm107_paged_d256_decode_tile_leads(caps: Capabilities, facts) -> bool:
     * ``s_q == 1``, no mask, groups ``SM107_PAGED_D256_DECODE_GROUPS``: ``SM107_PAGED_D256_DECODE_MIN_UNITS <= b * h_kv <=
       SM107_PAGED_D256_DECODE_MAX_UNITS``, the declared KV inside ``SM107_PAGED_D256_DECODE_KV_TOKENS`` and ``units * KV >=
       SM107_PAGED_D256_DECODE_MIN_KV_TOKENS_IN_FLIGHT`` tokens in flight;
-    * ``s_q == 1``, no mask, group ``SM107_PAGED_D256_G32_GROUP`` (64/2): ``SM107_PAGED_D256_G32_MIN_UNITS <= units <=
+    * ``s_q == 1``, no mask, the measured group-32 geometry ``SM107_PAGED_D256_G32_GEOMETRIES`` (64/2 -- a 32/1 graph is the same
+      group but unmeasured) at ``SM107_PAGED_D256_G32_PAGE_SIZES`` (16): ``SM107_PAGED_D256_G32_MIN_UNITS <= units <=
       SM107_PAGED_D256_G32_MAX_UNITS``, the same declared-KV band, ``units * KV >= SM107_PAGED_D256_G32_MIN_KV_TOKENS_IN_FLIGHT``;
     * the MTP rows: ``SM107_PAGED_D256_MTP_S_Q`` (2 <= s_q <= 4) with the bottom-right causal diagonal FlashInfer's decode graph
-      declares there, groups ``SM107_PAGED_D256_MTP_GROUPS``, ``SM107_PAGED_D256_MTP_UNITS``, ``SM107_PAGED_D256_MTP_KV_TOKENS``,
-      bf16 at ``SM107_PAGED_D256_MTP_PAGE_SIZES`` (what was measured), no tokens-in-flight floor (every cell led)."""
+      declares there, the measured geometries ``SM107_PAGED_D256_MTP_GEOMETRIES`` (24/2, 32/2 -- 12/1 and 16/1 share the groups but
+      were not measured there), ``SM107_PAGED_D256_MTP_UNITS``, ``SM107_PAGED_D256_MTP_KV_TOKENS``, bf16 at
+      ``SM107_PAGED_D256_MTP_PAGE_SIZES`` (what was measured), no tokens-in-flight floor (every cell led)."""
     if not (facts.has_paged_kv and facts.padded and facts.h_kv > 0 and facts.h_q % facts.h_kv == 0):
         return False
     group = facts.h_q // facts.h_kv
@@ -414,7 +419,7 @@ def _sm107_paged_d256_decode_tile_leads(caps: Capabilities, facts) -> bool:
                 SM107_PAGED_D256_DECODE_MIN_UNITS <= units <= SM107_PAGED_D256_DECODE_MAX_UNITS
                 and units * facts.s_kv >= SM107_PAGED_D256_DECODE_MIN_KV_TOKENS_IN_FLIGHT
             )
-        if group == SM107_PAGED_D256_G32_GROUP:
+        if (facts.h_q, facts.h_kv) in SM107_PAGED_D256_G32_GEOMETRIES and facts.page_size in SM107_PAGED_D256_G32_PAGE_SIZES:
             return (
                 SM107_PAGED_D256_G32_MIN_UNITS <= units <= SM107_PAGED_D256_G32_MAX_UNITS and units * facts.s_kv >= SM107_PAGED_D256_G32_MIN_KV_TOKENS_IN_FLIGHT
             )
@@ -424,7 +429,11 @@ def _sm107_paged_d256_decode_tile_leads(caps: Capabilities, facts) -> bool:
     s_lo, s_hi = SM107_PAGED_D256_MTP_S_Q
     if not (s_lo <= facts.s_q <= s_hi and facts.causal and facts.bottom_right):
         return False
-    if group not in SM107_PAGED_D256_MTP_GROUPS or facts.dtype != cudnn.data_type.BFLOAT16 or facts.page_size not in SM107_PAGED_D256_MTP_PAGE_SIZES:
+    if (
+        (facts.h_q, facts.h_kv) not in SM107_PAGED_D256_MTP_GEOMETRIES
+        or facts.dtype != cudnn.data_type.BFLOAT16
+        or facts.page_size not in SM107_PAGED_D256_MTP_PAGE_SIZES
+    ):
         return False
     if not d256_decode_tile_selected(caps, facts, group):
         return False
