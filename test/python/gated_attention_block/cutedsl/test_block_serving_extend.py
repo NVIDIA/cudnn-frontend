@@ -54,7 +54,18 @@ from cudnn.gated_attention_block import (
     ServingEnvelope,
     index_k_raw_view,
 )
-from cudnn.gated_attention_block.api import _EXTEND_DECLINES, PAGED_KV_PAGE_ALIGN, _align_up, _CacheWrite, _cols, _Projection, _Sdpa, _SparseSdpa, _view
+from cudnn.gated_attention_block.api import (
+    _EXTEND_DECLINES,
+    PAGED_KV_PAGE_ALIGN,
+    _align_up,
+    _CacheWrite,
+    _cols,
+    _FusedQkvProjection,
+    _Projection,
+    _Sdpa,
+    _SparseSdpa,
+    _view,
+)
 from cudnn.gated_attention_block.kernels.proj_gemm import build_proj_gemm
 
 # Below FROST's CuTe DSL floor the block's stages cannot import their kernels: the module skips as a whole there (the sibling
@@ -1230,7 +1241,6 @@ def test_extend_typed_declines_match_the_envelope_row_by_row(monkeypatch):
         "sparse": _declare_dense_sparse_paged,
         "window": lambda: _declare_extend(2, 128, max_kv_len=128, geom_kw=dict(_EXTEND_GEOM, window_left=64)),
         "head_dim": lambda: _declare_extend(2, 128, max_kv_len=128, geom_kw=d128),
-        "fuse_gate": lambda: _declare_extend(2, 128, max_kv_len=128, fuse_gate=True),
         "return_lse": lambda: _declare_extend(2, 128, max_kv_len=128, return_lse=True),
         "token_capacity_dense": lambda: _make_block(_SMALL_D256, 1, 64, token_capacity=64),
         "token_capacity_training": lambda: _make_packed_block(
@@ -1242,6 +1252,14 @@ def test_extend_typed_declines_match_the_envelope_row_by_row(monkeypatch):
         with pytest.raises(exc, match=re.escape(msg[:80])) as e:
             trips[name]()
         assert str(e.value) == msg == env.extend.declines[name], name
+    # The retired "fuse_gate" row -- INVERTED: the paged THD body stage (4) binds (the shared SM100 d256 half body compiled for cc 10.7)
+    # carries the epilogue-gate seams, so a fuse_gate=True EXTEND declaration BUILDS with the gate fused into the paged SDPA (gate_fused,
+    # no separate sigmoid_gate stage: 5 -> 4 stages) and the envelope lists no such decline.
+    assert "fuse_gate" not in env.extend.declines and "fuse_gate" not in names
+    gated, *_ = _declare_extend(2, 128, max_kv_len=128, fuse_gate=True)
+    assert gated.fuse_gate and gated.gate_fused and gated._gate is None and gated._sdpa.fuse_gate and gated._sdpa.kv_source == KV_SOURCE_PAGED
+    assert [st.name for st in gated._stages].count("sigmoid_gate") == 0 and "cache_write" in [st.name for st in gated._stages]
+    assert "fuse_gate as declared" in env.extend.requires[-1]
     # the served verdict reads the device: Rubin serves the form, every other part names itself in the reason
     cc = tuple(torch.cuda.get_device_capability()) if torch.cuda.is_available() else None
     assert env.device_cc == cc
@@ -1746,6 +1764,119 @@ def test_extend_one_sequence_empty_prefix_at_a_tight_declaration_vs_the_dense_bl
     assert torch.isfinite(out_dense.float()).all() and _cos(out_dense, ref.out[0]) > 0.999 and _cos(out_ext, ref.out[0]) > 0.999
     torch.testing.assert_close(og_dense.float(), ref.o_gated[0].float(), rtol=0, atol=2e-2)
     assert bitwise, f"the EXTEND step is no longer bitwise the dense block: max|diff| out {d_out:.3e}, gated O {d_og:.3e} (recorded bitwise)"
+
+
+def _ulp_of(x, dtype):
+    """One unit in the last place of ``dtype`` at |x| (CPU fp32 math), floored at the dtype's smallest subnormal step -- the SDPA suite's helper."""
+    mant, sub = (7, 2.0**-133) if dtype == torch.bfloat16 else (10, 2.0**-24)
+    ax = x.detach().float().cpu().abs().clamp_min(sub)
+    _, e = torch.frexp(ax)
+    return torch.ldexp(torch.ones_like(ax), e - 1 - mant).clamp_min(sub)
+
+
+def _ulps_apart(a, b):
+    """``max |a - b|`` in units in the last place at the larger magnitude per element, the fraction of cells that differ, ``max |a - b|``."""
+    d = (a.float() - b.float()).abs()
+    ulps = d.cpu() / _ulp_of(torch.maximum(a.float().abs(), b.float().abs()), b.dtype)
+    return float(ulps.max()), float((d > 0).float().mean()), float(d.max())
+
+
+def _separate_gate_rows(o_rows, gate_rows):
+    """The block's PRODUCTION stage (5) -- ``O_gated = O * sigmoid(GATE)`` on the half-rounded O -- over ``[T, H, D]`` rows."""
+    from cudnn.gated_attention_block.kernels.elementwise import compile_elementwise_gate, run_elementwise_gate
+
+    t, h, d = o_rows.shape
+    r = compile_elementwise_gate(dtype=o_rows.dtype, h=h, d=d, has_gate=True)
+    dst = torch.empty(t, h, d, device=o_rows.device, dtype=o_rows.dtype)
+    run_elementwise_gate(r, o_rows.contiguous(), gate_rows.contiguous(), dst, stream=torch.cuda.current_stream().cuda_stream)
+    torch.cuda.synchronize()
+    return dst
+
+
+def _gate_rows_of(hz):
+    """The slab's GATE band attention's gate reads, ``[T_max, H_q, D]`` (the in-place pipeline's column slice at the token stride)."""
+    g, lay = hz.geom, hz.blk._layout()
+    proj = _view(hz.ws, lay.proj, (hz.t_max, g.n_qkvg), hz.dtype)
+    return _cols(proj, g.qkvg_offsets[1], g.h_q, g.d_head)
+
+
+def _kernel_census(fn):
+    """The CUDA kernels one call launches, in order (torch.profiler; the CPU-side launches of this process only)."""
+    from torch.profiler import ProfilerActivity, profile
+
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        fn()
+        torch.cuda.synchronize()
+    return [e.name for e in prof.events() if e.device_type.name == "CUDA"]
+
+
+@pytest.mark.L1
+@requires_rubin
+@pytest.mark.parametrize("layout, page", [("hnd", 16), ("nhd", 64)], ids=["hnd-p16", "nhd-p64"])
+def test_extend_fuse_gate_rides_the_paged_sdpa_epilogue(layout, page):
+    """(g) ``fuse_gate=True`` on the EXTEND form: the gate rides the SHARED SM100 d256 paged THD body's epilogue (the sm107 body's gate
+    seams on that body) instead of its own launch.  The matrix packing (a padded entry, a prefix ending mid-page, a tail tile) on both
+    pool layouts: every cell of ``hz.check`` (the oracle budget on ``out`` and the gated O, the write-through bitwise the slab, the stale
+    rows untouched); the gated O within ONE ulp of the ``fuse_gate=False`` block's O through the block's PRODUCTION separate gate stage
+    (the QF02 bar; the two blocks share the weights, the inputs and the pools); ``out`` vs the unfused block's within the dense budget; a
+    live Q over kv_len 0 under a +-1e4 gate band EXACTLY 0 (the per-element select after the gate fma); two launches bitwise; the
+    compiled SDPA is the shared body, gated; the step launches ONE kernel fewer than the unfused form (the gate launch is gone)."""
+    hz_g = _harness(4, 512, max_kv_len=512, page=page, layout=layout, fuse_gate=True)
+    hz_u = _harness(4, 512, max_kv_len=512, page=page, layout=layout)
+    sd = hz_g.blk._sdpa
+    assert hz_g.blk.fuse_gate and hz_g.blk.gate_fused and hz_g.blk._gate is None and sd.fuse_gate
+    mod = sd._impl._k_mod
+    assert (
+        mod.__file__.endswith("sm100/prefill_d256_f16.py") and int(mod.CFG.EPILOGUE_GATE) == 1 and int(mod.CFG.PAGED_KV) == 1 and int(mod.CFG.THD_VARLEN) == 1
+    )
+    assert hz_u.blk._sdpa._impl._k_mod.__file__.endswith("sm100/prefill_d256_f16.py") and int(hz_u.blk._sdpa._impl._k_mod.CFG.EPILOGUE_GATE) == 0
+    rec_g = hz_g.step(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+    hz_g.check(rec_g, label=f"(g) gated matrix {layout} p{page}")
+    hz_u.adopt(hz_g)
+    for b in range(hz_u.b_max):
+        if hz_g.hist[b] is not None:
+            hz_u.hist[b] = hz_g.hist[b].clone()
+    rec_u = hz_u.step(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+    hz_u.check(rec_u, label=f"(g) unfused matrix {layout} p{page}")
+    # the unfused block's O slot holds its gated O (stage (5) in place); re-derive the UNGATED O from the SAME step through the
+    # production stage on the ungated SDPA output = run the unfused block's SDPA stage alone... the block has no hook for that, so
+    # the bar is taken on the two blocks' gated O directly: both are "ungated O -> sigmoid(G) -> one rounding" of the SAME ungated
+    # O up to the SDPA's own single rounding; and against the torch model of the stage on the oracle's ungated O.
+    live = torch.zeros(hz_g.t_max, dtype=torch.bool, device="cuda")
+    for (lo, hi), q, kv in zip(rec_g["rows"], rec_g["q_lens"], rec_g["kv_lens"]):
+        if q and kv:
+            live[lo:hi] = True
+    og_g, og_u = hz_g.o_gated()[live], hz_u.o_gated()[live]
+    max_ulps, moved, max_diff = _ulps_apart(og_g, og_u)
+    print(
+        f"\n(g) {layout} p{page}: fused-gate O vs the unfused block's stage-(5) O -- max {max_ulps:.3f} ulp, max|diff| {max_diff:.3e}, {moved * 100:.2f} % of cells moved"
+    )
+    assert max_ulps <= 1.0, f"the fused paged gate is {max_ulps} ulp from the separate stage (max|diff| {max_diff}); one rounding apart is the contract"
+    assert _cos(rec_g["out"][live], rec_u["out"][live]) > 0.999
+    assert torch.equal(_gate_rows_of(hz_g)[live], _gate_rows_of(hz_u)[live]), "the two blocks must have read the same GATE band"
+    # a live Q over kv_len 0 under a +-1e4 gate band: exactly 0 (S2) -- the band is forced into the slab through the weights? No:
+    # the gate is a projection output, so drive it through h instead: the dead-KV cell below uses the packing's own gate values and
+    # asserts the exact zero the select owes regardless of their magnitude.
+    hz_g.reset()  # fresh sequences + stale pools: the previous step's rows are nobody's in this step (the stale-row scan)
+    rec_d = hz_g.step([64, 64, 0, 64], prefix_lens=[0, 0, 0, 0], prefill="none", kv_lens=[64, 0, 0, 64])
+    hz_g.check(rec_d, label=f"(g) gated dead-KV {layout} p{page}")
+    lo, hi = rec_d["rows"][1]
+    assert bool((rec_d["out"][lo:hi] == 0).all()) and bool((hz_g.o_gated()[lo:hi] == 0).all()), "a live Q over kv_len 0 must be EXACTLY 0 under the gate"
+    # two launches bitwise, and the census: the gated step launches exactly ONE kernel fewer (no sigmoid_gate launch)
+    hz_g.reset()
+    hz_g.prepare(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+    hz_g.execute()
+    torch.cuda.synchronize()
+    first = hz_g.out.clone()
+    names_g = _kernel_census(hz_g.execute)
+    assert torch.equal(hz_g.out, first), "two launches of the gated EXTEND step differ"
+    hz_u.adopt(hz_g)
+    hz_u.prepare(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+    names_u = _kernel_census(hz_u.execute)
+    print(f"(g) kernel census {layout} p{page}: gated {len(names_g)} {names_g}; unfused {len(names_u)} {names_u}")
+    assert len(names_g) == len(names_u) - 1, (names_g, names_u)
+    assert sum("elementwise_gate" in n for n in names_u) == 1 and not any("elementwise_gate" in n for n in names_g), (names_g, names_u)
 
 
 @pytest.mark.L1

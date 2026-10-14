@@ -3928,10 +3928,11 @@ class _Sdpa(_Stage):
         elif self.num_sequences is not None or self.max_seq_len is not None or self.cu_seqlens:
             raise ValueError(f"{self.name}: num_sequences / max_seq_len / cu_seqlens are THD-only (thd=True)")
         # The EXTEND form (kv_source="paged"): the stage's own honesty about the ONE leg it binds -- the adapter's paged THD
-        # leg of the f16 / bf16 d256 flavor: packed queries, pools with the page size compiled in, no gate (that body has no
-        # gate seam), no LSE (the form writes none), no quantized Q / K / V (the FP8 THD path clamps runtime descriptors to a
-        # packed total and serves no pools).  The block's declaration-time checks say the same in the caller's vocabulary
-        # first; these keep a standalone stage from binding a leg nobody validated.
+        # leg of the f16 / bf16 d256 flavor: packed queries, pools with the page size compiled in, the fused gate (the shared
+        # SM100 d256 body compiled for cc 10.7 carries the gate seams on its paged / THD arms; the adapter's paged x gate twin
+        # admits it and the prepared THD binder binds G per call), no LSE (the form writes none), no quantized Q / K / V (the
+        # FP8 THD path clamps runtime descriptors to a packed total and serves no pools).  The block's declaration-time checks
+        # say the same in the caller's vocabulary first; these keep a standalone stage from binding a leg nobody validated.
         if kv_source not in _KV_SOURCES:
             raise ValueError(f"{self.name}: kv_source must be one of {_KV_SOURCES}, got {kv_source!r}")
         self.kv_source = kv_source
@@ -3959,10 +3960,9 @@ class _Sdpa(_Stage):
             if self.fp8:
                 raise NotImplementedError(f"{self.name}: kv_source='paged' serves bf16 / f16 operands and pools only (no quantized paged leg)")
             if self.thd:
-                if self.fuse_gate:
-                    raise NotImplementedError(
-                        f"{self.name}: kv_source='paged' has no gate arm on the packed form (the paged THD body carries no epilogue-gate seam)"
-                    )
+                # fuse_gate rides the paged THD leg: the gate is declared at the SAME (B_env, H, S_max, D) envelope as O at the
+                # slab's GATE column stride and bound as the packed (T, H, D) view at execute -- the dense THD arm's contract.
+                pass
             else:
                 if self.decode_split_kv < 1:
                     raise ValueError(f"{self.name}: decode_split_kv must be >= 1, got {decode_split_kv}")
@@ -4029,6 +4029,13 @@ class _Sdpa(_Stage):
                     paged_table_stride=table_stride,
                     paged_table_v_stride=table_stride,
                 )
+                if self.fuse_gate:
+                    # The gate descriptor selects the epilogue_gate specialization of the paged body (template_params().epilogue_gate):
+                    # G at the slab's GATE column stride, the (B_env, H, S_max, D) envelope O takes, mapped by the adapter through the
+                    # packed [1, T, H, D] form Q / O take under THD.
+                    kw["sample_gate"] = _bhsd_desc(
+                        b_env, g.h_q, s_env, d, self.gate_dtype or self.dtype, self.device, "gate", token_stride=self.gate_token_stride
+                    )
                 return SdpaFwdDslSm100(
                     _bhsd_desc(b_env, g.h_q, s_env, d, self.dtype, self.device, "q", token_stride=ts),
                     dataclasses.replace(self.k_cache_desc, name="k"),
@@ -4381,6 +4388,9 @@ class _Sdpa(_Stage):
                 workspace=workspace,
                 current_stream=current_stream,
                 block_table=block_table,
+                # The fused gate: the rank-3 packed (T, H, D) view of the slab's GATE columns, as on the dense THD arm (an exact
+                # `.view` at the slab's token stride, no copy).
+                **({"gate": gate.view(t, g.h_q, g.d_head)} if self.fuse_gate else {}),
             )
             return
         if any(x is not None for x in paged_args):
@@ -5115,13 +5125,9 @@ _EXTEND_DECLINES: Tuple[Tuple[str, type, Callable[[_ServingDecl], bool], str], .
         lambda d: _is_paged(d) and d.geometry.d_head != 256,
         "kv_source='paged' is validated at d_head == 256 only (the Rubin d256 paged THD leg); other head dims are a follow-up",
     ),
-    (
-        "fuse_gate",
-        NotImplementedError,
-        lambda d: _is_paged(d) and d.thd and d.fuse_gate,
-        "kv_source='paged' with fuse_gate=True: the paged THD body stage (4) binds carries no epilogue-gate seam (the packed block's gate rides "
-        "the dense THD prefill's epilogue only); the EXTEND form runs stage (5) as its own launch -- declare fuse_gate=False",
-    ),
+    # (retired) "fuse_gate": the paged THD body stage (4) binds -- the shared SM100 d256 half body compiled for cc 10.7 -- carries the
+    # epilogue-gate seams (the paged gate), so fuse_gate=True rides the EXTEND form's SDPA epilogue (5 -> 4 stages) and
+    # the row is gone from the table; a hypothetical declaration that asked for it hears nothing (the envelope lists no such row).
     (
         "return_lse",
         NotImplementedError,
@@ -5194,7 +5200,7 @@ _EXTEND_REQUIRES = (
     "kv_source='paged'",
     "geometry.is_causal=True, geometry.causal_bottom_right=True, window_left=-1, window_right in (-1, 0), qsa=None, d_head=256",
     "sample_k_cache / sample_v_cache (the pools' [num_pages, H_kv, P, D] shape / dtype / strides) and sample_block_table ([B_max, max_pages] int32)",
-    "bf16 / f16 activations (quant=None), save_for_backward=False, return_lse=False, fuse_gate=False",
+    "bf16 / f16 activations (quant=None), save_for_backward=False, return_lse=False; fuse_gate as declared (True folds stage (5) into the paged SDPA's epilogue)",
 )
 
 
@@ -5246,19 +5252,19 @@ class GatedAttentionBlockFwd(APIBase):
         (1)+(2)+(3) proj + norm + rope   h [T_max, d_model]        -> slab          (or (1) then (2+3) unfused)
         (4w) cache write                  slab[K], slab[V]          -> k_cache / v_cache at slot_mapping
         (4)  sdpa (paged THD leg)         slab[Q], k_cache, v_cache -> O             block_table, kv_lens, seq_lens
-        (5)  gate                         O, slab[G]                -> O in place
+        (5)  gate                         O, slab[G]                -> O in place    | fuse_gate: (4)+(5) in ONE launch
         (6)  out_proj                     O                         -> out [T_max, d_model]
 
-    Five launches, one stream (the write is ordered before the read by STREAM order alone -- no programmatic dependent
-    launch on the chain).  Declared as ``thd=True, num_sequences=B_max, max_seq_len=token_capacity, token_capacity=T_max,
+    Five launches -- four with ``fuse_gate=True`` (the paged SDPA body carries the epilogue gate) -- one stream (the write is
+    ordered before the read by STREAM order alone -- no programmatic dependent launch on the chain).  Declared as ``thd=True, num_sequences=B_max, max_seq_len=token_capacity, token_capacity=T_max,
     paged_kv_page_size=P, kv_source="paged", geometry.causal_bottom_right=True`` with the pools' and the block table's
     SAMPLES (their layout and row stride are compiled in; ``serving_envelope`` lists the rest).  ``token_capacity`` makes
     the packed row count a CAPACITY: a step's lengths sum to ``T_live <= T_max`` and rows ``[T_live, T_max)`` are pad rows
     (slot ``-1``, finite ``cos`` / ``sin``, never attended; their ``out`` rows unspecified but finite); ``execute(num_tokens_live=T_live)``
     (appended) launches the token-indexed stages over the live rows alone -- no recompile, ``h`` / ``cos`` / ``sin`` / ``slot_mapping`` /
     ``out`` at ``T_max`` or exactly ``T_live`` rows, rows ``[T_live, T_max)`` of ``out`` untouched.  Typed declines, in
-    :data:`_EXTEND_DECLINES`'s order: a missing bottom-right diagonal, a window, another head dim, a fused gate
-    (the paged THD body carries no gate seam; the packed block's gate rides the dense THD prefill only), an LSE;
+    :data:`_EXTEND_DECLINES`'s order: a missing bottom-right diagonal, a window, another head dim, an LSE (a fused gate
+    is SERVED: the shared SM100 d256 body compiled for cc 10.7 carries the gate seams on its paged / THD arms);
     ``quant`` / ``save_for_backward`` are the write-through's, a sparse geometry the table's ``sparse`` row (the
     block-sparse forms' attention over the pools is its own binding; the sparse stage reads the block's own K / V,
     dense or packed).  Dense declarations use the DECODE form described below.

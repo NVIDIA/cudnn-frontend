@@ -677,7 +677,7 @@ blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_le
   KV-cache write-through (`paged_kv_page_size`: `slot_mapping` is `[T]` over the packed tokens, a pad token's slot `-1` --
   "Serving: write-through into a paged KV cache" below) and, on top of it, the EXTEND form (`kv_source="paged"`: the SDPA reads
   every sequence's K / V from the pools; `token_capacity` makes `T` a capacity -- "Serving: the extend form" below; `fuse_gate`
-  stays declined there, the paged body carrying no gate seam), block-sparse attention (`QsaSpec` with caller lists: the sparse
+  rides the paged body's epilogue there too, one launch fewer), block-sparse attention (`QsaSpec` with caller lists: the sparse
   core's packed arm, `block_ids` numbered per sequence, `fuse_gate` composing with it -- "Sparse attention (QSA)" above). Declined,
   typed: the fully fused quantized pipelines (the quantized THD SDPA bodies have no THD gate descriptor, and the fused
   MXFP8 projection fork decodes `(b, s_tile)` once per 128-row GEMM tile, which a packed tile may straddle), the MXFP8
@@ -738,17 +738,18 @@ blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace,
             num_tokens_live=None)                     # or the step's live token count T_live: the token-indexed stages over T_live rows, no recompile
 ```
 
-Five launches on ONE stream: `(1)+(2)+(3)` the projection with norm + RoPE over all `T_max` rows -- or over the `T_live` rows of
-`num_tokens_live` -- (or `(1)` then `(2+3)`),
-`(4w)` the write-through of the new tokens' K / V at `slot_mapping`, `(4)` the SDPA over the pools -- query row `i` of a sequence
-with `q_len` new tokens and logical length `kv_len` attends keys `k <= i + kv_len - q_len` of `block_table[b]`'s pages -- then
-`(5)` the gate and `(6)` the out projection. The write is ordered before the read by STREAM order alone: no kernel on the chain
+Five launches on ONE stream -- four with `fuse_gate=True`: `(1)+(2)+(3)` the projection with norm + RoPE over all `T_max` rows -- or
+over the `T_live` rows of `num_tokens_live` -- (or `(1)` then `(2+3)`), `(4w)` the write-through of the new tokens' K / V at
+`slot_mapping`, `(4)` the SDPA over the pools -- query row `i` of a sequence with `q_len` new tokens and logical length `kv_len`
+attends keys `k <= i + kv_len - q_len` of `block_table[b]`'s pages; under `fuse_gate=True` its epilogue applies `O *= sigmoid(GATE)`
+(the paged body carries the Rubin d256 gate seams, so stage `(5)` is not launched) -- then `(5)` the gate (unfused only) and `(6)`
+the out projection. The write is ordered before the read by STREAM order alone: no kernel on the chain
 launches as a programmatic dependent launch (pinned by `test_block_serving_extend.py`), so a kernel that adopts PDL after a pool
 write must wait on its dependent grid before its first K / V load.
 
 | appended | contract |
 |---|---|
-| `kv_source` | `"self"` (default) or `"paged"`; `"paged"` requires `paged_kv_page_size > 0`, `thd=True`, `geometry.is_causal=True` and `geometry.causal_bottom_right=True`, bf16 / f16 activations, inference (`save_for_backward=False`), `return_lse=False`, `fuse_gate=False`, `window_left=-1`, `window_right` unbounded or 0, no `QsaSpec`, `d_head=256`; every other combination is a typed decline naming the feature (`GatedAttentionBlockFwd.serving_envelope` lists them) |
+| `kv_source` | `"self"` (default) or `"paged"`; `"paged"` requires `paged_kv_page_size > 0`, `thd=True`, `geometry.is_causal=True` and `geometry.causal_bottom_right=True`, bf16 / f16 activations, inference (`save_for_backward=False`), `return_lse=False`, `fuse_gate` as declared (`True` folds stage (5) into the paged SDPA's epilogue), `window_left=-1`, `window_right` unbounded or 0, no `QsaSpec`, `d_head=256`; every other combination is a typed decline naming the feature (`GatedAttentionBlockFwd.serving_envelope` lists them) |
 | `token_capacity` | THD only; `None` = the tight contract (lengths sum to `T`), an int = the BOUNDED form and must equal the samples' packed row count `T`: a step's lengths may sum to `T_live <= T`; rows `[T_live, T)` are pad rows -- finite `h` / `cos` / `sin`, slot `-1` (never written to the cache), never attended; their `out` rows are UNSPECIFIED but finite given finite inputs. Zero the workspace once and slice `out[:T_live]`: an unwritten `o` row then reads `0`, so pad rows of `out` are exactly `0` until a later, longer step overwrites those `o` rows (the `o` slot is aliased by no other stage's scratch -- pinned). Refused with `save_for_backward` (the backward's weight-gradient GEMMs contract over every row) |
 | `sample_k_cache`, `sample_v_cache`, `sample_block_table` | REQUIRED under `kv_source="paged"`, refused otherwise: the pools' `[num_pages, H_kv, P, D]` shape / dtype / strides (the three stride patterns of the write-through, K and V of one HND / NHD kind, every non-innermost stride a 16-byte multiple) and the `[num_sequences, max_pages]` int32 block table (its row stride is free -- a `[:, :max_pages]` slice of a wider table -- and compiled in); the logical `S_kv` the tables may address is `max_pages * P` |
 | `block_table` (execute) | `[num_sequences, >= max_pages]` int32 on `h`'s device, the page axis contiguous, the row stride as declared; row `b` lists sequence `b`'s pages in logical order (the serving stacks' NULL block `0` for a padded entry); read on device |

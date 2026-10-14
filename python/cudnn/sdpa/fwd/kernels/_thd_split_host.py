@@ -90,7 +90,9 @@ def host(
     args += (d_qk, d_v, "dense", paged_hnd)
     if cutlass.const_expr(ragged_q_slots):
         args += (False,)
-    kernel_host(*args, stream)
+    # `stream` BY KEYWORD: a kernel host may carry defaulted trailing slots before its `stream` (the d256 half body's gate_ptr /
+    # gate_strides, never bound on the split path), and a positional stream would land in the first of them.
+    kernel_host(*args, stream=stream)
     final_stats_strides = (
         (cutlass.Int64(0), cutlass.Int64(lse_ext), cutlass.Int64(1)) if cutlass.const_expr(lse_kind == "head") else (cutlass.Int64(0), cutlass.Int64(1), heads)
     )
