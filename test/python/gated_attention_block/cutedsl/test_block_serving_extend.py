@@ -1345,22 +1345,27 @@ def test_extend_o_slot_is_aliased_by_no_other_stage_scratch():
 
 
 def _declare_dense_sparse_paged():
-    """A DENSE paged declaration on a QsaSpec geometry: the serving table's `sparse` row (the packed form reaches the same row -- the
-    block serves the packed sparse stage, so both paged forms meet the table's `sparse` row)."""
-    geom = GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec())
+    """A DENSE paged declaration on a QsaSpec geometry with the bottom-right diagonal CONSTRUCTS (2026-10-14): the block-sparse DECODE /
+    extend-with-prefix mode -- stage (4) is the sparse core reading the pools (``test_block_qsa_decode.py``); the serving table's
+    `sparse` row is the PACKED form's (the sparse core serves THD and paged pools one at a time).  Returns the declared block."""
+    geom = GatedAttentionBlockGeometry(**_SMALL_D256, causal_bottom_right=True, qsa=QsaSpec())
     mk = lambda *shape: torch.empty(*shape, dtype=torch.bfloat16, device=_DEV)  # noqa: E731
+    kc, vc = (torch.empty(4, geom.h_kv, 16, geom.d_head, dtype=torch.bfloat16, device=_DEV) for _ in range(2))
     return GatedAttentionBlockFwd(
-        mk(1, 16, geom.d_model),  # S <= 32: the decode_rows row sits before the sparse row
+        mk(1, 16, geom.d_model),  # 16 rows: past the shared-list cap, so one list per row (the extend-with-prefix form) -- no 32-row cap under QsaSpec
         mk(geom.n_qkvg, geom.d_model),
         mk(geom.d_head),
         mk(geom.d_head),
         mk(1, 16, geom.rope_dim),
         mk(1, 16, geom.rope_dim),
         mk(geom.d_model, geom.h_q * geom.d_head),
-        mk(1, 16, geom.d_model),  # S <= 32: the decode_rows row sits before the sparse row
+        mk(1, 16, geom.d_model),
         geom,
         paged_kv_page_size=16,
         kv_source=KV_SOURCE_PAGED,
+        sample_k_cache=kc,
+        sample_v_cache=vc,
+        sample_block_table=torch.zeros(1, 4, dtype=torch.int32, device=_DEV),
     )
 
 
@@ -1384,7 +1389,8 @@ def test_extend_typed_declines_match_the_envelope_row_by_row(monkeypatch):
         # a dense paged declaration IS the DECODE form now (test_block_serving_decode.py); past the decode tile's 32 rows it is this row
         "decode_rows": lambda: _make_block(_EXTEND_GEOM, 1, 64, paged_kv_page_size=16, kv_source=KV_SOURCE_PAGED),
         "diagonal": lambda: _declare_extend(2, 128, max_kv_len=128, geom_kw=_SMALL_D256),
-        "sparse": _declare_dense_sparse_paged,
+        # the PACKED form over the pools on a QsaSpec geometry (a dense one is the block-sparse decode mode since 2026-10-14: _declare_dense_sparse_paged)
+        "sparse": lambda: _declare_extend(2, 128, max_kv_len=128, geom_kw=dict(_SMALL_D256, qsa=QsaSpec())),
         "window": lambda: _declare_extend(2, 128, max_kv_len=128, geom_kw=dict(_EXTEND_GEOM, window_left=64)),
         "head_dim": lambda: _declare_extend(2, 128, max_kv_len=128, geom_kw=d128),
         "return_lse": lambda: _declare_extend(2, 128, max_kv_len=128, return_lse=True),
@@ -1424,8 +1430,9 @@ def test_extend_typed_declines_match_the_envelope_row_by_row(monkeypatch):
     else:
         assert not env.extend.served and env.forms == () and "targets Rubin" in env.extend.reason
     # a sparse geometry: the block serves the packed sparse stage (the sparse declaration's THD row is record-driven and the record claims
-    # the arm), so the THD-only form reaches the table like the dense one and meets its `sparse` row -- the envelope says so wherever the
-    # device / dtype facts let it speak (on Rubin: the very message the block raises for that declaration)
+    # the arm), so the THD-only form reaches the table like the dense one and meets its `sparse` row -- the PACKED form's row since
+    # 2026-10-14 (the sparse core serves THD and paged pools one at a time) -- the envelope says so wherever the device / dtype facts let
+    # it speak (on Rubin: the very message the block raises for that declaration)
     sparse = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec()), torch.bfloat16, _DEV)
     assert not sparse.extend.served
     with pytest.raises(NotImplementedError, match="kv_source='paged' with geometry.qsa") as e:
@@ -1433,12 +1440,18 @@ def test_extend_typed_declines_match_the_envelope_row_by_row(monkeypatch):
     assert str(e.value) == env.extend.declines["sparse"]
     if cc == (10, 7):
         assert sparse.extend.reason == str(e.value)
-    # ... and the Rubin reading on ANY host (device_cc=): BOTH halves say the table's `sparse` row -- the pin the first node run exposed
-    # (the envelope read the `diagonal` row for a QsaSpec geometry on the THD-only form)
+    # ... and the Rubin reading on ANY host (device_cc=): the EXTEND half says the table's `sparse` row; the DECODE half of a TOP-LEFT
+    # QsaSpec geometry says the `diagonal` row like a dense one (the `sparse` row is no dense-form row any more), and the bottom-right
+    # QsaSpec geometry SERVES the decode form -- the block-sparse decode mode (test_block_qsa_decode.py), stage (4) the sparse core
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     rubin = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec()), torch.bfloat16, _DEV, device_cc=(10, 7))
     assert rubin.cutedsl_ok and rubin.forms == ()
-    assert rubin.extend.reason == str(e.value) == rubin.decode.reason == env.decode.declines["sparse"]
+    assert rubin.extend.reason == str(e.value) and rubin.decode.reason == env.decode.declines["diagonal"] and "sparse" not in env.decode.declines
+    served = GatedAttentionBlockFwd.serving_envelope(
+        GatedAttentionBlockGeometry(**_SMALL_D256, causal_bottom_right=True, qsa=QsaSpec()), torch.bfloat16, _DEV, device_cc=(10, 7)
+    )
+    assert served.forms == ("decode",) and served.decode.served and served.decode.sparse_core and served.extend.reason == str(e.value)
+    assert isinstance(_declare_dense_sparse_paged(), GatedAttentionBlockFwd)  # the dense QsaSpec declaration over the pools constructs
 
 
 @pytest.mark.L0

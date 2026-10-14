@@ -1122,10 +1122,10 @@ def test_fuse_gate_with_thd_under_qsa_declares_the_gated_packed_sparse_stage():
 
 
 def test_fuse_gate_with_bottom_right_under_qsa_is_the_decode_modes_typed_decline():
-    """Host: the gate x decode-form composition through the BLOCK is the block's bottom-right decline -- the sparse decode mode
-    (bottom-right positions, the per-sequence list, split-KV) is the standalone adapter's today (it serves the gate on the decode
-    form: fused when unsplit, in the combine under a split), not routed by the block's sparse stage; ``fuse_gate=True`` leaves the
-    decline and its wording (the kernel carries the arm) unchanged."""
+    """Host: the bottom-right diagonal on the block's OWN K / V (``kv_source="self"``) has no serving meaning -- the decode step's rows
+    and its speculative verify rows sit at the end of a CACHED sequence, which is the block-sparse DECODE mode over the pools
+    (``kv_source="paged"``, served since 2026-10-14: ``test_block_qsa_decode.py``, the gate fused in the core's epilogue unsplit and in
+    the combine under a split); the decline names that mode, and ``fuse_gate=True`` leaves it and its wording unchanged."""
     geom = GatedAttentionBlockGeometry(**GEOM_SMALL, qsa=QsaSpec(), causal_bottom_right=True)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     z = lambda *shape, dt=BF16: torch.zeros(*shape, dtype=dt, device=dev)  # noqa: E731
@@ -1142,7 +1142,7 @@ def test_fuse_gate_with_bottom_right_under_qsa_is_the_decode_modes_typed_decline
             geom,
             fuse_gate=True,
         )
-    assert "the kernel carries the arm" in str(e.value) and "sparse adapter's record declines" not in str(e.value)
+    assert "kv_source='paged'" in str(e.value) and "sparse adapter's record declines" not in str(e.value)
 
 
 # (geometry, packing, dtype, list source, top_k, cu_seqlens, fuse_norm_rope, inplace_qkv): the fuse_gate axis of the THD matrix

@@ -265,7 +265,8 @@ def test_the_envelope_on_a_rubin_reading_serves_the_decode_form_and_names_every_
     assert [r.s_q for r in d.routes] == list(range(1, 2 * DECODE_MAX_S_Q + 1))
     assert [r.tile for r in d.routes] == [DECODE_TILE] * 8 and [r.pack_gqa for r in d.routes] == [True] * 4 + [False] * 4
     assert d.route(3).token_units == 2 and not d.route(5).pack_gqa and d.route(32).served and not d.route(33).served and "EXTEND form" in d.route(33).reason
-    assert set(d.declines) == {"write_through", "decode_rows", "diagonal", "window", "sparse", "head_dim", "return_lse", "token_capacity_dense"}
+    # (the table's `sparse` row is the PACKED form's since 2026-10-14: a dense QsaSpec declaration over the pools is the block-sparse decode mode)
+    assert set(d.declines) == {"write_through", "decode_rows", "diagonal", "window", "head_dim", "return_lse", "token_capacity_dense"}
     f16 = GatedAttentionBlockFwd.serving_envelope(geom, torch.float16, _DEV, device_cc=_SM107)
     assert f16.decode.served and f16.extend.served
 
@@ -309,17 +310,29 @@ def test_every_static_decline_of_the_decode_declaration_is_predicted_by_the_enve
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     geom16, _ = _geom(16)
     d128 = GatedAttentionBlockGeometry(d_model=_D_MODEL, h_q=8, h_kv=2, d_head=128, rope_dim=_ROPE, causal_bottom_right=True)
-    # (top-left causal: a QsaSpec with the bottom-right diagonal is the sparse declaration's own earlier decline)
+    # a TOP-LEFT QsaSpec geometry meets the `diagonal` row like a dense one (a ValueError); with the bottom-right diagonal it is the
+    # block-sparse DECODE mode, SERVED since 2026-10-14 (test_block_qsa_decode.py) -- the former `sparse` row is the packed form's
     sparse = GatedAttentionBlockGeometry(d_model=_D_MODEL, h_q=8, h_kv=2, d_head=_D, rope_dim=_ROPE, qsa=QsaSpec())
-    rows = [(geom16, torch.float8_e4m3fn, "bf16 / f16"), (d128, torch.bfloat16, "d_head == 256"), (sparse, torch.bfloat16, "geometry.qsa")]
-    for geom, dtype, match in rows:
+    rows = [
+        (geom16, torch.float8_e4m3fn, "bf16 / f16", NotImplementedError),
+        (d128, torch.bfloat16, "d_head == 256", NotImplementedError),
+        (sparse, torch.bfloat16, "causal_bottom_right=True", ValueError),
+    ]
+    for geom, dtype, match, _exc in rows:
         env = GatedAttentionBlockFwd.serving_envelope(geom, dtype, _DEV, device_cc=_SM107)
         assert not env.decode.served and match in env.decode.reason and "decode" not in env.forms, (match, env.decode.reason)
+    served = GatedAttentionBlockFwd.serving_envelope(
+        GatedAttentionBlockGeometry(d_model=_D_MODEL, h_q=8, h_kv=2, d_head=_D, rope_dim=_ROPE, causal_bottom_right=True, qsa=QsaSpec()),
+        torch.bfloat16,
+        _DEV,
+        device_cc=_SM107,
+    )
+    assert served.decode.served and served.decode.sparse_core and served.forms == ("decode",) and served.decode.routes == ()
     # ... and the declaration raises the same row (device-free), the e4m3 one through the quant halves it needs first
-    for geom, dtype, match in rows[1:]:
+    for geom, dtype, match, exc in rows[1:]:
         mk = lambda *shape: torch.empty(*shape, dtype=dtype, device=_DEV)  # noqa: E731
         kc, vc = _pools(4, 2, 16, geom.d_head, "hnd", dtype)
-        with pytest.raises(NotImplementedError, match=match):
+        with pytest.raises(exc, match=match):
             GatedAttentionBlockFwd(
                 mk(1, 1, _D_MODEL),
                 mk(geom.n_qkvg, _D_MODEL),
