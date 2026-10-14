@@ -1,5 +1,13 @@
 # test — Agent Guide
 
+For deterministic DSA indexer backward, cover large TopK with more than twice
+as many query rows as producer planes, so persistent CTAs consume at least
+three rows. Restore score inputs and poison workspace/outputs before each run;
+use `assert_bitwise_runs` to compare raw bytes, including signed zero, and retain
+an independent gradient reference. The L1
+`test_DSA_indexer_backward_deterministic_topk2048_boundary` covers both backends
+at 193 rows, 96 planes, and TopK 896/2048.
+
 Recurrent FP64 autograd references can retain a K x V state for every token
 and head. When a production stress case scales heads with the GPU SM count,
 bound the reference by independent head chunks while keeping the full kernel
