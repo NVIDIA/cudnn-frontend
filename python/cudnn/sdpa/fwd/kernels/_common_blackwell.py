@@ -1640,13 +1640,19 @@ def sdpa_operand_tensors(
     return SdpaOperandTensors(q, k, v, o, lse, sinks, meta, o_desc, q_lens, kv_lens, o_partial, table, table_v)
 
 
-def sdpa_gate_tensor(gate_ptr, problem_size, d_v, gate_strides):
+def sdpa_gate_tensor(gate_ptr, problem_size, d_v, gate_strides, thd=False):
     """The fused epilogue gate G (O's (B, SQ, QH, d_v) shape) over the caller's (batch, seq, head)
-    strides; None folds the gate path out (the module's CFG.EPILOGUE_GATE must agree)."""
+    strides; None folds the gate path out (the module's CFG.EPILOGUE_GATE must agree).
+
+    ``thd`` (appended; the kernel passes its ``CFG.THD_VARLEN``): under THD the gate is the SAME packed
+    ``[1, T, QH, d_v]`` map Q / O take (``_bshd(..., thd=True)``: batch extent 1 binding the token stride,
+    never stepped), so the TMA-LDG warp's ``issue_gate_load(..., q_row_base + q_seq_off, tma_batch=0)``
+    addresses the gate rows of each sequence exactly as it addresses its Q rows.  The dense form is
+    unchanged (the default keeps every caller's trace byte-identical)."""
     if gate_ptr is None:
         return None
     B, QH, _, SQ, _, _ = problem_size
-    return _bshd(gate_ptr, B, SQ, QH, d_v, gate_strides, False)
+    return _bshd(gate_ptr, B, SQ, QH, d_v, gate_strides, thd)
 
 
 def sdpa_bias_tensor(bias_ptr, problem_size, bias_strides, bias_extents):

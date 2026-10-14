@@ -2289,8 +2289,9 @@ def test_sdpa_mxfp8_fwd_L0(env_info, test_no, request, cudnn_handle):
         # Block-scaled O on the FROST d128 MXFP8 kernel: FP4 O + E4M3/16 scales (16)
         # or E4M3 O + UE8M0/32 scales (32) with the sf_o output. exec_sdpa_mxfp8
         # folds it to 0 on configs the epilogue does not serve (d != 128, unfuse_fma,
-        # a ragged KV tail without a covering causal band, FROST engines off, an arch
-        # without an MXFP8 engine row such as SM120), so the draw stays a plain mxfp8 run there.
+        # a ragged KV tail without a covering causal band, FROST engines off, a block
+        # size the arch's MXFP8 engine row does not serve such as 16 on SM120), so the draw
+        # stays a plain mxfp8 run there.
         o_block_scale=RandomChoice({0: 6, 16: 1, 32: 1}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
@@ -2452,6 +2453,44 @@ def test_sdpa_mxfp8_fwd_paged_pinned_frost_L0(env_info, case_id, batches, h_q, h
     )
     test.cfg.fill_derived_fields()
     _run_mxfp8_paged(test, (request.node.name, len(MXFP8_PAGED_PINNED_CASES)), request, cudnn_handle)
+
+
+@pytest.mark.L0
+def test_sdpa_mxfp8_fwd_narrow_band_phantom_frost_L0(env_info, request, cudnn_handle):
+    """A narrow top-left band peels a head phantom KV step whose tile is also the whole unmasked band (#1604: GPU hang)."""
+    _require_frost_sm100(FROST_MXFP8_ENGINE)
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+    test.cfg = ExecConfig(
+        data_type=torch.float8_e4m3fn,
+        output_type=torch.float16,
+        rng_data_seed=1058998424,
+        rng_geom_seed=1604,
+        is_alibi=False,
+        is_infer=True,
+        is_paged=False,
+        is_mxfp8=True,
+        o_block_scale=32,
+        is_bias=False,
+        is_block_mask=False,
+        is_padding=False,
+        is_ragged=False,
+        is_dropout=False,
+        is_determin=False,
+        batches=4,
+        d_qk=128,
+        d_v=128,
+        s_q=157,
+        s_kv=545,
+        h_q=4,
+        h_k=4,
+        h_v=4,
+        diag_align=cudnn.diagonal_alignment.TOP_LEFT,
+        left_bound=1,
+        right_bound=29,
+        rescale_threshold=2.0,
+    )
+    test.cfg.fill_derived_fields()
+    _run_mxfp8_paged(test, (request.node.name, 1), request, cudnn_handle)
 
 
 # # ==================================
@@ -3455,7 +3494,7 @@ def test_sdpa_fp8_fwd_cc107_L0(env_info, test_no, request, cudnn_handle):
 def test_sdpa_mxfp8_fwd_cc107_L0(env_info, test_no, request, cudnn_handle):
     """MXFP8 prefill + decode on the cc 10.7 MXFP8 row (s_q_min = 1, so s_q == 1 is drawn; that row
     runs decode on its prefill bodies): test_sdpa_mxfp8_fwd_L0's draw over the four exact flavors
-    (d192x128 is cga2-only, d256 cga1-only -- the heuristics pick), FULL layout, both output dtypes,
+    (d192x128 is cga2-only, dense d256 leads with the cga2 pair and its THD / split / paged legs with cga1 -- the heuristics pick), FULL layout, both output dtypes,
     block-scaled O on d128, Stats on / off (the fused HALF+fold arm is stats-less only, so both must be
     drawn); all four knob sets {FLOAT, HALF} x {in-kernel scale, fold}."""
     _require_frost_sm107(_cc107_engine("mxfp8"))

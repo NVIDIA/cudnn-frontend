@@ -7,15 +7,12 @@
 ## JAX support
 
 `cudnn.grouped_gemm_swiglu_wrapper_sm100` accepts Torch tensors and canonical
-MXFP8 JAX arrays or tracers. Torch execution is unchanged; JAX dispatches to
-`cudnn.jax.grouped_gemm_swiglu`, eagerly or under `jax.jit`, with XLA-owned
-buffers and stream ordering. `cudnn.torch.grouped_gemm_swiglu` remains an
-alias to the same wrapper and inherits its dispatch. Direct API-class construction
+MXFP8 JAX arrays or tracers. Torch execution is unchanged; JAX runs
+eagerly or under `jax.jit`, with XLA-owned buffers and stream ordering. Direct API-class construction
 with JAX samples remains unsupported.
 
 Wrapper signatures and defaults are unchanged. JAX wrapper calls must set
-`sf_vec_size=32` and an explicit FP8 `d_dtype`. The direct `cudnn.jax` API retains
-its MXFP8 defaults. See the JAX execution contract below.
+`sf_vec_size=32` and an explicit FP8 `d_dtype`. See the JAX execution contract below.
 
 ## Overview
 
@@ -376,12 +373,15 @@ C-contiguous physical `(1, ceil(mn/128), rest, 32, 4, 4)` buffers.
 
 ### JAX execution
 
-`cudnn.jax.grouped_gemm_swiglu` runs the contiguous-weight MXFP8 fusion
+With JAX arrays, the wrapper runs the contiguous-weight MXFP8 fusion
 through `cudnn.jax.call`, eagerly or under `jax.jit`. All operands are ordinary
-JAX arrays managed by XLA. Torch callers use `cudnn.torch.grouped_gemm_swiglu`
-or the existing top-level wrapper name.
-Both paths return `TupleDict` with the same key order and tuple-unpacking behavior.
-The JAX path registers this output type as a JAX pytree.
+JAX arrays managed by XLA. Torch and JAX calls return `TupleDict` with the same
+key order and tuple-unpacking behavior. The JAX path registers this output type
+as a JAX pytree.
+
+The `cudnn.jax.grouped_gemm_swiglu` and `cudnn.torch.grouped_gemm_swiglu` aliases
+have been removed. Call this wrapper, or `grouped_gemm_glu_jax_sm100` with
+`act_func="swiglu"`, `generate_c=True`, and an FP8 `d_dtype`.
 
 Use canonical `A (m,k)`, `B (experts,n,k)`, and `prob (m,)` (fp32 or bf16).
 Scale factors are E8M0 arrays, or uint8 bit patterns, containing the packed
@@ -393,26 +393,15 @@ multiple of 256. These device values are the caller's responsibility.
 Forward returns `c_tensor (m,n)`, `d_tensor`/`d_col_tensor (m,n/2)`, physical
 `sfd_row_tensor`/`sfd_col_tensor`, and `amax_tensor=None`.
 
-The JAX API fixes scale-vector size to 32 and defaults `d_dtype` to FP8 e4m3.
-It requires explicit probability and normalization arrays. Mixed Torch/JAX
-operands are rejected. Torch-specific streams, output buffers,
-accumulation/layout options, and epilogues are not JAX parameters. The optional JAX
-configuration is `c_dtype`, `d_dtype`, `mma_tiler_mn`, and `cluster_shape_mn`.
+The JAX path requires `sf_vec_size=32`, an FP8 `d_dtype`, and explicit probability and normalization arrays.
+Mixed Torch/JAX operands are rejected. The optional JAX configuration is
+`c_dtype`, `d_dtype`, `mma_tiler_mn`, and `cluster_shape_mn`.
 Configuration arguments must be static under `jax.jit`:
-
-```python
-import jax
-from cudnn.jax import grouped_gemm_swiglu
-
-compiled = jax.jit(grouped_gemm_swiglu)
-result = compiled(**jax_inputs)
-```
-
-The existing wrapper also works under `jax.jit`:
 
 ```python
 from functools import partial
 import cudnn
+import jax
 import ml_dtypes
 
 compiled = jax.jit(partial(
@@ -427,18 +416,8 @@ On the wrapper's JAX path, unsupported options raise `ValueError`: non-FP32
 accumulation, non-`n` output layout, scale-vector size other than 32,
 `vector_f32=True`, non-default `m_aligned`, and caller streams.
 
-The Torch alias preserves the existing wrapper signature, including its dtype and
-scale-vector defaults. For example, select MXFP8 explicitly:
-
-```python
-from cudnn.torch import grouped_gemm_swiglu
-import torch
-
-result = grouped_gemm_swiglu(**torch_inputs, d_dtype=torch.float8_e4m3fn, sf_vec_size=32)
-```
-
 This initial bridge supports FP8 e4m3/e5m2 A/B and FP8 D, with E8M0 block
-scales of vector size 32. It is an alias of `grouped_gemm_glu_jax_sm100` with
+scales of vector size 32. It runs `grouped_gemm_glu_jax_sm100` with
 `act_func="swiglu"` and `generate_c=True`, so on Rubin (SM107) it runs the Rubin
 GLU kernel, as the Torch path does. `discrete_col_sfd=True` packs column scales
 by expert. Packed FP4, BF16 D, and bias are outside its contract. Outputs are not initialized:

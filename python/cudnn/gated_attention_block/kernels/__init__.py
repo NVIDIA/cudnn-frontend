@@ -19,6 +19,8 @@ stage of the pipeline in ``api.py``::
     quantize.py                 (3q) / (5q): per-tensor e4m3 quantize pass (unfused FP8); the quantized BACKWARD's
                                 amax / amax-partials passes, gradient casts and scalar-block init
     elementwise.py              stage (5) sigmoid gate, and (3b) V compaction
+    cache_write.py              (4w) serving write-through: post-RoPE K / V (and the raw indexer key) into paged pools
+                                at a slot mapping -- two operands per launch, HND / NHD / unified-row pools by strides
     sigmoid_gate_bwd.py         BACKWARD of stage (5): dO, dG into the GATE band, optional O_gated
     qk_norm_rope_bwd.py         BACKWARD of stages (2)+(3): exact RoPE adjoint + RMSNorm backward into
                                 the Q / K bands, dW_norm partials + fixed-order reduce, the V band copy

@@ -1,6 +1,6 @@
 # python/cudnn — Agent Guide
 
-The `cudnn` Python package: pybind11-backed graph API plus pure-Python **frontend-only OSS kernels** (CuTeDSL). See `README.md` in this directory for the package inventory and [../../AGENTS.md](../../AGENTS.md) for build/test commands.
+The `cudnn` Python package: nanobind-backed graph API plus pure-Python **frontend-only OSS kernels** (CuTeDSL). See `README.md` in this directory for the package inventory and [../../AGENTS.md](../../AGENTS.md) for build/test commands.
 
 ## Import-time rules (the most common way to break this package)
 
@@ -58,6 +58,13 @@ Numbered so reviews can cite them; the list grows — append, never renumber.
   inputs against their observed span as well as their effective shape, and check
   pointer alignment for the element type. The host-only detector is
   `test_dense_metadata_rejects_short_observed_storage_and_misalignment`.
+- **A runtime SF expert stride needs a per-plane contract.** FROST MoE weight
+  scales in `F8_128x4` require E outermost, dense byte storage within each expert
+  plane, sufficient blocked capacity per plane, and a non-overlapping 16-byte
+  aligned expert pitch. Whole-blob density does not establish this: an
+  interleaved expert view can pass it and silently select the wrong scales.
+  Detector: `gemm/frost/test_moe_grouped_block_scale_matmul_fwd.py`'s
+  `test_moe_weight_sf_plane_binding` and `test_moe_weight_sf_runtime_stride`.
 - **Native geometry caches retain no storage observations.** A geometry hit must
   still check the current dtype, device, address alignment and observed byte span.
   Mark an uninitialized cache entry explicitly: an empty shape is an input to
@@ -202,6 +209,16 @@ not become a compile key.
   hit (`stats()["memo_hits"]` grows, `hits` does not) and a key compiled by
   an earlier test in the same process would turn the first build into a memo
   hit too, leaving nothing on disk to reload.
+- **Compiled CuTe launchables belong to their CUDA context.** Pin a plan's device
+  when compiling storage-free declarations; compile and execute under that device,
+  and reject differently placed bindings before lowering pointers. An outer
+  argument-only `functools.lru_cache` can bypass `compiled_cache`'s device/context
+  key and return another GPU's launchable: delegate reuse to the device-aware
+  cache. Detector: intercept device contexts and compilation, build identical
+  plans for two device ordinals, and verify each reaches compilation in its own
+  context; no invalid cross-device GPU launch is needed. See the sparse SDPA
+  tests `test_compilation_and_launch_preserve_the_declared_or_resolved_device`
+  and `test_compilation_bypasses_argument_only_caches_across_devices`.
 - **Issue #604 is closed**: SM80 THD compiles use symbolic packed extents.
   The prepared backward host takes Int64 capacities and launch bounds at
   runtime, including the compact Stats head pitch and deterministic-counter
@@ -332,6 +349,12 @@ DSL satisfies your kernel.**
   they do not fail. CI runs the `oss:` lanes across the supported DSL versions
   (`ci/stages/oss_tests/jobs.yml` in internal CI); a lane below your floor
   must show skips, not errors.
+- Keep declaration and execute-preflight metadata validators outside modules
+  that import newer DSL kernel APIs. A correctly gated stage cannot protect
+  an earlier constructor import of its validator. Exercise the public
+  constructor and preflight in a fresh process on the real dependency-floor
+  wheel; `test_gated_block_declaration_and_execute_preflight_do_not_import_cache_kernel`
+  is the detector for the gated block's paged-cache validation.
 - **MLIR argument widths are part of a DSL API migration.**
   `FastDivmodDivisorV2` carries two MLIR values (encoded divisor and scalar),
   while its predecessor carried one. Custom `__new_from_mlir_values__` methods
@@ -626,7 +649,7 @@ treatment at the caller boundary.**
 ```
 python/cudnn/<operation>/            # or sdpa/<direction>/, gemm/cutedsl/<layout>/<fusion>/
 ├── __init__.py                      # exports the public functions via __all__
-├── api.py                           # <op>_<direction>() / <op>_jax_<direction>() functions
+├── api.py                           # <op>_<direction>() / <op>_<direction>_jax() functions
 └── <kernel_module>.py               # CuTeDSL kernel implementation(s); some families use csrc/ per-arch trees
 ```
 
@@ -715,7 +738,7 @@ not by itself justify another compile-cache specialization.
 
 ## The public function contract
 
-Public functions (`<op>_<direction>(...)` / `<op>_jax_<direction>(...)`, see `docs/fe-oss-apis/api_conventions.md`) allocate outputs and return them in a stable, documented order. PyTorch functions return a **`TupleDict`** (dict that also unpacks as a tuple). JAX functions return a plain tuple or dict: `jax.jit` rejects `TupleDict`, which is not a registered pytree.
+Public functions (`<op>_<direction>(...)` / `<op>_<direction>_jax(...)`, see `docs/fe-oss-apis/api_conventions.md`) allocate outputs and return them in a stable, documented order. PyTorch functions return a **`TupleDict`** (dict that also unpacks as a tuple). JAX functions return a plain tuple or dict: `jax.jit` rejects `TupleDict`, which is not a registered pytree.
 
 ## Adding a new frontend-only API — required checklist
 

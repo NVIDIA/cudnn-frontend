@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_E5M2, DTYPE_FP16  # noqa: F401  (DTYPE_E4M3 re-exported for the FP8 template)
+from cudnn.frost.tile_dsl.sf_layout import SF_ATOM_BYTES, SF_ATOM_ROWS
 
 SEQ_Q_TILES = (128, 64)
 SEQ_KV_TILES = (128, 64, 32)
@@ -21,6 +22,15 @@ GENERAL_HEAD_TILES = tuple(range(SUPPORTED_HEAD_TILE_MIN, GENERAL_HEAD_TILE_MAX 
 FP8_HEAD_TILE_GRANULE = 32
 FP8_GENERAL_HEAD_TILE_MAX = 256
 FP8_GENERAL_HEAD_TILES = tuple(range(FP8_HEAD_TILE_GRANULE, FP8_GENERAL_HEAD_TILE_MAX + 1, FP8_HEAD_TILE_GRANULE))
+
+
+def mxfp8_sf_tile_bytes(head_dim: int) -> int:
+    """Bytes of one 128-row scale-factor tile covering every head-dim plane.
+
+    The same count serves Q/K (rows = tokens, blocks along D) and V (rows = D
+    columns, blocks along a 128-key span; a 64-key KV tile reads half of it).
+    """
+    return SF_ATOM_BYTES * ((head_dim + SF_ATOM_ROWS - 1) // SF_ATOM_ROWS)
 
 
 D256_FLAVOR = (256, 256)
@@ -70,7 +80,7 @@ def register_budgets(q_tile: int) -> tuple[int, int]:
     return load_regs_per_thread, compute_regs_per_thread
 
 
-def smem_bytes(d_qk: int, d_v: int, q_tile: int, kv_tile: int, itemsize: int = 2, out_itemsize: Optional[int] = None) -> int:
+def smem_bytes(d_qk: int, d_v: int, q_tile: int, kv_tile: int, itemsize: int = 2, out_itemsize: Optional[int] = None, mxfp8: bool = False) -> int:
     """SMEM the SM120 prefill kernel needs for one specialization.
 
     The general and D=256 kernels alias one K tile (D_QK wide) plus one V
@@ -85,6 +95,9 @@ def smem_bytes(d_qk: int, d_v: int, q_tile: int, kv_tile: int, itemsize: int = 2
     Every d512 envelope shape uses the full 512-wide storage on both sides.
     The FP8 D512 flavor keeps Q in registers and uses a 64-key tile, so its
     extra storage is the score exchange plus the three TMA barriers.
+    MXFP8 (``mxfp8``) adds one 128-row K scale-factor tile and one V
+    scale-factor tile beside the K/V slab; they are read during the KV loop
+    and do not alias the O staging tile.
 
     Lives here rather than in the adapter because the ranking must not propose
     a tile the kernel cannot fit, and two answers to that question is how a plan
@@ -102,7 +115,8 @@ def smem_bytes(d_qk: int, d_v: int, q_tile: int, kv_tile: int, itemsize: int = 2
         q_resident = q_tile * (flavor[0] // 4) * itemsize if itemsize == 2 else 0
         exchange = q_tile * kv_tile * 4 * 2
     barrier_bytes = 24 if flavor == D512_FLAVOR else 16
-    return kv_or_o + q_resident + exchange + barrier_bytes
+    scale_factors = mxfp8_sf_tile_bytes(d_qk) + mxfp8_sf_tile_bytes(d_v) if mxfp8 else 0
+    return kv_or_o + q_resident + exchange + barrier_bytes + scale_factors
 
 
 @dataclass(frozen=True)

@@ -14,16 +14,21 @@
 #define CUDNN_FRONTEND_DLPACK_CAPSULE_NAME "dltensor"
 #define CUDNN_FRONTEND_DLPACK_USED_CAPSULE_NAME "used_dltensor"
 
-#include "pybind11/pybind11.h"
-#include "pybind11/cast.h"
-#include "pybind11/stl.h"
+#include <nanobind/nanobind.h>
+#include <nanobind/stl/array.h>
+#include <nanobind/stl/function.h>
+#include <nanobind/stl/optional.h>
+#include <nanobind/stl/pair.h>
+#include <nanobind/stl/shared_ptr.h>
+#include <nanobind/stl/string.h>
+#include <nanobind/stl/unordered_map.h>
+#include <nanobind/stl/vector.h>
 
 #include "cudnn_frontend.h"
 #include "pygraph.h"
 #include "variant_pack.h"
 
-namespace py = pybind11;
-using namespace pybind11::literals;
+namespace py = nanobind;
 
 namespace cudnn_frontend::python_bindings {
 
@@ -124,7 +129,7 @@ extract_data_pointer(py::object const& obj) {
              cudnn_frontend::error_code_t::INVALID_VARIANT_PACK,
              "Object does not have the __dlpack__() method");
 
-    py::capsule capsule = obj.attr("__dlpack__")();
+    py::capsule capsule = py::cast<py::capsule>(obj.attr("__dlpack__")());
     throw_if(capsule.is_none(),
              cudnn_frontend::error_code_t::INVALID_VARIANT_PACK,
              "Failed to retrieve the DLPack capsule.");
@@ -150,7 +155,7 @@ PyGraph::tensor_like(py::object const& pyobj) {
              cudnn_frontend::error_code_t::INVALID_VARIANT_PACK,
              "Object does not have the __dlpack__() method");
 
-    py::capsule capsule = pyobj.attr("__dlpack__")();
+    py::capsule capsule = py::cast<py::capsule>(pyobj.attr("__dlpack__")());
     throw_if(capsule.is_none(),
              cudnn_frontend::error_code_t::INVALID_VARIANT_PACK,
              "Failed to retrieve the DLPack capsule.");
@@ -197,10 +202,7 @@ PyGraph::slice(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
     std::vector<int64_t> steps;
     steps.reserve(slices.size());
     for (size_t i = 0; i < slices.size(); ++i) {
-        int64_t start, stop, step, length;
-        if (!slices[i].compute(input_dim[i], &start, &stop, &step, &length)) {
-            throw std::runtime_error("Invalid slice");
-        }
+        auto [start, stop, step, length] = slices[i].compute(input_dim[i]);
         CUDNN_FRONTEND_UNUSED(length);
         start_end_indices.push_back({start, stop});
         steps.push_back(step);
@@ -568,13 +570,13 @@ PyGraph::get_workspace_size(std::optional<std::intptr_t> exec_handle,
                             py::object override_shapes,
                             py::object override_strides) {
     std::vector<int64_t> override_uids_vec =
-        override_uids.is_none() ? std::vector<int64_t>() : override_uids.cast<std::vector<int64_t>>();
+        override_uids.is_none() ? std::vector<int64_t>() : py::cast<std::vector<int64_t>>(override_uids);
     std::vector<std::vector<int64_t>> override_shapes_vec =
         override_shapes.is_none() ? std::vector<std::vector<int64_t>>()
-                                  : override_shapes.cast<std::vector<std::vector<int64_t>>>();
+                                  : py::cast<std::vector<std::vector<int64_t>>>(override_shapes);
     std::vector<std::vector<int64_t>> override_strides_vec =
         override_strides.is_none() ? std::vector<std::vector<int64_t>>()
-                                   : override_strides.cast<std::vector<std::vector<int64_t>>>();
+                                   : py::cast<std::vector<std::vector<int64_t>>>(override_strides);
 
     int64_t workspace     = 0;
     cudnnHandle_t handle_ = exec_handle.has_value() ? static_cast<cudnnHandle_t>((void*)(exec_handle.value())) : handle;
@@ -602,13 +604,13 @@ PyGraph::get_workspace_size_plan_at_index(int64_t index,
                                           py::object override_shapes,
                                           py::object override_strides) {
     std::vector<int64_t> override_uids_vec =
-        override_uids.is_none() ? std::vector<int64_t>() : override_uids.cast<std::vector<int64_t>>();
+        override_uids.is_none() ? std::vector<int64_t>() : py::cast<std::vector<int64_t>>(override_uids);
     std::vector<std::vector<int64_t>> override_shapes_vec =
         override_shapes.is_none() ? std::vector<std::vector<int64_t>>()
-                                  : override_shapes.cast<std::vector<std::vector<int64_t>>>();
+                                  : py::cast<std::vector<std::vector<int64_t>>>(override_shapes);
     std::vector<std::vector<int64_t>> override_strides_vec =
         override_strides.is_none() ? std::vector<std::vector<int64_t>>()
-                                   : override_strides.cast<std::vector<std::vector<int64_t>>>();
+                                   : py::cast<std::vector<std::vector<int64_t>>>(override_strides);
 
     int64_t workspace     = 0;
     cudnnHandle_t handle_ = exec_handle.has_value() ? static_cast<cudnnHandle_t>((void*)(exec_handle.value())) : handle;
@@ -630,14 +632,14 @@ PyGraph::serialize() const {
 void
 PyGraph::deserialize(std::optional<std::intptr_t> handle_, py::object const& pyobj, bool const enforce_precompiled) {
     if (py::isinstance<py::str>(pyobj)) {
-        json j = json::parse(pyobj.cast<std::string>());
+        json j = json::parse(py::cast<std::string>(pyobj));
 
         auto status = graph->deserialize(j, enforce_precompiled);
 
         throw_if(status.is_bad(), status.get_code(), status.get_message());
 
     } else {
-        std::vector<uint8_t> data = pyobj.cast<std::vector<uint8_t>>();
+        std::vector<uint8_t> data = py::cast<std::vector<uint8_t>>(pyobj);
 
         if (!handle_.has_value() && this->handle == nullptr && this->device_properties != nullptr) {
             // Handle-less path: use the device properties set at construction.
@@ -715,13 +717,13 @@ PyGraph::execute(std::unordered_map<int64_t, std::intptr_t> var_pack,
 
     // Convert override_uids to a vector of int64_t (one-liner)
     std::vector<int64_t> override_uids_vec =
-        override_uids.is_none() ? std::vector<int64_t>() : override_uids.cast<std::vector<int64_t>>();
+        override_uids.is_none() ? std::vector<int64_t>() : py::cast<std::vector<int64_t>>(override_uids);
     std::vector<std::vector<int64_t>> override_shapes_vec =
         override_shapes.is_none() ? std::vector<std::vector<int64_t>>()
-                                  : override_shapes.cast<std::vector<std::vector<int64_t>>>();
+                                  : py::cast<std::vector<std::vector<int64_t>>>(override_shapes);
     std::vector<std::vector<int64_t>> override_strides_vec =
         override_strides.is_none() ? std::vector<std::vector<int64_t>>()
-                                   : override_strides.cast<std::vector<std::vector<int64_t>>>();
+                                   : py::cast<std::vector<std::vector<int64_t>>>(override_strides);
 
     auto workspace_ptr = (void*)workspace;
 
@@ -806,9 +808,9 @@ PyGraph::execute_ordered(py::handle schema,
                          int64_t plan_index) {
     auto read = read_ordered_binding(
         schema, buffers, tensor_uids, auto_bindings, workspace, override_uids, override_shapes, override_strides);
-    if (!read[1].cast<py::list>().empty() || read[2].is_none()) return read;
-    const auto extent = read[2].cast<py::tuple>();
-    execute_ordered_pack(read[0], extent[0].cast<std::intptr_t>(), exec_handle, plan_index);
+    if (!py::cast<py::list>(read[1]).empty() || read[2].is_none()) return read;
+    const auto extent = py::cast<py::tuple>(read[2]);
+    execute_ordered_pack(read[0], py::cast<std::intptr_t>(extent[0]), exec_handle, plan_index);
     return py::none();
 }
 
@@ -827,13 +829,13 @@ PyGraph::execute_plan_at_index(std::unordered_map<int64_t, std::intptr_t> var_pa
 
     // Convert override_uids to a vector of int64_t (one-liner)
     std::vector<int64_t> override_uids_vec =
-        override_uids.is_none() ? std::vector<int64_t>() : override_uids.cast<std::vector<int64_t>>();
+        override_uids.is_none() ? std::vector<int64_t>() : py::cast<std::vector<int64_t>>(override_uids);
     std::vector<std::vector<int64_t>> override_shapes_vec =
         override_shapes.is_none() ? std::vector<std::vector<int64_t>>()
-                                  : override_shapes.cast<std::vector<std::vector<int64_t>>>();
+                                  : py::cast<std::vector<std::vector<int64_t>>>(override_shapes);
     std::vector<std::vector<int64_t>> override_strides_vec =
         override_strides.is_none() ? std::vector<std::vector<int64_t>>()
-                                   : override_strides.cast<std::vector<std::vector<int64_t>>>();
+                                   : py::cast<std::vector<std::vector<int64_t>>>(override_strides);
 
     auto workspace_ptr = (void*)workspace;
 
@@ -895,46 +897,46 @@ init_pygraph_submodule(py::module_& m) {
                       std::shared_ptr<cudnn_frontend::DeviceProperties>,
                       bool,
                       bool>(),
-             py::arg_v("name", "test_graph"),
-             py::arg_v("io_data_type", cudnn_frontend::DataType_t::NOT_SET),
-             py::arg_v("intermediate_data_type", cudnn_frontend::DataType_t::NOT_SET),
-             py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-             py::arg_v("handle", std::nullopt),
-             py::arg_v("sm_count", py::none()),
-             py::arg_v("sm_version", py::none()),
-             py::arg_v("kernel_cache", nullptr),
-             py::arg_v("device_property", nullptr),
-             py::arg_v("is_dynamic_shape_enabled", false),
-             py::arg_v("is_override_shape_enabled", false))
+             py::arg("name")                      = "test_graph",
+             py::arg("io_data_type")              = cudnn_frontend::DataType_t::NOT_SET,
+             py::arg("intermediate_data_type")    = cudnn_frontend::DataType_t::NOT_SET,
+             py::arg("compute_data_type")         = cudnn_frontend::DataType_t::NOT_SET,
+             py::arg("handle")                    = std::nullopt,
+             py::arg("sm_count")                  = py::none(),
+             py::arg("sm_version")                = py::none(),
+             py::arg("kernel_cache")              = py::none(),
+             py::arg("device_property")           = py::none(),
+             py::arg("is_dynamic_shape_enabled")  = false,
+             py::arg("is_override_shape_enabled") = false)
         .def("tensor_like",
              py::overload_cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> const&, std::string const&>(
                  &PyGraph::tensor_like),
              py::arg("input"),
-             py::arg_v("name", ""))
+             py::arg("name") = "")
         .def("tensor_like", py::overload_cast<py::object const&>(&PyGraph::tensor_like))
         .def("_make_tensor",
              &PyGraph::tensor,
              py::arg{"dim"},
              py::arg{"stride"},
-             py::arg_v("data_type", cudnn_frontend::DataType_t::NOT_SET),
-             py::arg_v{"is_virtual", false},
-             py::arg_v{"is_pass_by_value", false},
-             py::arg_v{"ragged_offset", nullptr},
-             py::arg_v{"reordering_type", cudnn_frontend::TensorReordering_t::NONE},
-             py::arg_v("name", ""),
-             py::arg_v("uid", -1),
-             py::arg_v("ragged_offset_multiplier", int64_t{1}))
+             py::arg("data_type")                = cudnn_frontend::DataType_t::NOT_SET,
+             py::arg("is_virtual")               = false,
+             py::arg("is_pass_by_value")         = false,
+             py::arg("ragged_offset")            = py::none(),
+             py::arg("reordering_type")          = cudnn_frontend::TensorReordering_t::NONE,
+             py::arg("name")                     = "",
+             py::arg("uid")                      = -1,
+             py::arg("ragged_offset_multiplier") = int64_t{1})
         .def("genstats",
              &PyGraph::genstats,
              py::arg("input"),
-             py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-             py::arg_v("name", ""))
+             py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+             py::arg("name")              = "")
         .def("slice",
              &PyGraph::slice,
              py::arg("input"),
-             py::arg_v{"slices", default_vector()},
-             py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-             py::arg_v("name", ""),
+             py::arg("slices")            = default_vector(),
+             py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+             py::arg("name")              = "",
              R"pbdoc(
                 Perform slice operation on the given input tensor.
 
@@ -970,23 +972,23 @@ init_pygraph_submodule(py::module_& m) {
             },
             py::arg("image"),
             py::arg("weight"),
-            py::arg_v{"padding", default_vector()},
-            py::arg_v{"stride", default_vector()},
-            py::arg_v{"dilation", default_vector()},
-            py::arg_v{"convolution_mode", cudnn_frontend::ConvolutionMode_t::CROSS_CORRELATION},
-            py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-            py::arg_v("name", ""))
+            py::arg("padding")           = default_vector(),
+            py::arg("stride")            = default_vector(),
+            py::arg("dilation")          = default_vector(),
+            py::arg("convolution_mode")  = cudnn_frontend::ConvolutionMode_t::CROSS_CORRELATION,
+            py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+            py::arg("name")              = "")
         .def("conv_fprop",
              &PyGraph::conv_fprop,
              py::arg("image"),
              py::arg("weight"),
-             py::arg_v{"pre_padding", default_vector()},
-             py::arg_v{"post_padding", default_vector()},
-             py::arg_v{"stride", default_vector()},
-             py::arg_v{"dilation", default_vector()},
-             py::arg_v{"convolution_mode", cudnn_frontend::ConvolutionMode_t::CROSS_CORRELATION},
-             py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-             py::arg_v("name", ""),
+             py::arg("pre_padding")       = default_vector(),
+             py::arg("post_padding")      = default_vector(),
+             py::arg("stride")            = default_vector(),
+             py::arg("dilation")          = default_vector(),
+             py::arg("convolution_mode")  = cudnn_frontend::ConvolutionMode_t::CROSS_CORRELATION,
+             py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+             py::arg("name")              = "",
              R"pbdoc(
                 Perform convolution operation with the given inputs.
 
@@ -1019,23 +1021,23 @@ init_pygraph_submodule(py::module_& m) {
             },
             py::arg("image"),
             py::arg("loss"),
-            py::arg_v{"padding", default_vector()},
-            py::arg_v{"stride", default_vector()},
-            py::arg_v{"dilation", default_vector()},
-            py::arg_v{"convolution_mode", cudnn_frontend::ConvolutionMode_t::CROSS_CORRELATION},
-            py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-            py::arg_v("name", ""))
+            py::arg("padding")           = default_vector(),
+            py::arg("stride")            = default_vector(),
+            py::arg("dilation")          = default_vector(),
+            py::arg("convolution_mode")  = cudnn_frontend::ConvolutionMode_t::CROSS_CORRELATION,
+            py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+            py::arg("name")              = "")
         .def("conv_wgrad",
              &PyGraph::conv_wgrad,
              py::arg("image"),
              py::arg("loss"),
-             py::arg_v{"pre_padding", default_vector()},
-             py::arg_v{"post_padding", default_vector()},
-             py::arg_v{"stride", default_vector()},
-             py::arg_v{"dilation", default_vector()},
-             py::arg_v{"convolution_mode", cudnn_frontend::ConvolutionMode_t::CROSS_CORRELATION},
-             py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-             py::arg_v("name", ""),
+             py::arg("pre_padding")       = default_vector(),
+             py::arg("post_padding")      = default_vector(),
+             py::arg("stride")            = default_vector(),
+             py::arg("dilation")          = default_vector(),
+             py::arg("convolution_mode")  = cudnn_frontend::ConvolutionMode_t::CROSS_CORRELATION,
+             py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+             py::arg("name")              = "",
              R"pbdoc(
                 Compute weight gradients using the given inputs and loss.
 
@@ -1067,23 +1069,23 @@ init_pygraph_submodule(py::module_& m) {
             },
             py::arg("loss"),
             py::arg("filter"),
-            py::arg_v{"padding", default_vector()},
-            py::arg_v{"stride", default_vector()},
-            py::arg_v{"dilation", default_vector()},
-            py::arg_v{"convolution_mode", cudnn_frontend::ConvolutionMode_t::CROSS_CORRELATION},
-            py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-            py::arg_v("name", ""))
+            py::arg("padding")           = default_vector(),
+            py::arg("stride")            = default_vector(),
+            py::arg("dilation")          = default_vector(),
+            py::arg("convolution_mode")  = cudnn_frontend::ConvolutionMode_t::CROSS_CORRELATION,
+            py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+            py::arg("name")              = "")
         .def("conv_dgrad",
              &PyGraph::conv_dgrad,
              py::arg("loss"),
              py::arg("filter"),
-             py::arg_v{"pre_padding", default_vector()},
-             py::arg_v{"post_padding", default_vector()},
-             py::arg_v{"stride", default_vector()},
-             py::arg_v{"dilation", default_vector()},
-             py::arg_v{"convolution_mode", cudnn_frontend::ConvolutionMode_t::CROSS_CORRELATION},
-             py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-             py::arg_v("name", ""),
+             py::arg("pre_padding")       = default_vector(),
+             py::arg("post_padding")      = default_vector(),
+             py::arg("stride")            = default_vector(),
+             py::arg("dilation")          = default_vector(),
+             py::arg("convolution_mode")  = cudnn_frontend::ConvolutionMode_t::CROSS_CORRELATION,
+             py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+             py::arg("name")              = "",
              R"pbdoc(
                 Compute filter gradients using the given inputs and loss.
 
@@ -1104,9 +1106,9 @@ init_pygraph_submodule(py::module_& m) {
              &PyGraph::matmul,
              py::arg("A"),
              py::arg("B"),
-             py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-             py::arg_v("padding", 0.0),
-             py::arg_v("name", ""),
+             py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+             py::arg("padding")           = 0.0,
+             py::arg("name")              = "",
              R"pbdoc(
                 Perform matrix multiplication of two tensors A and B.
 
@@ -1123,9 +1125,9 @@ init_pygraph_submodule(py::module_& m) {
              &PyGraph::reduction,
              py::arg("input"),
              py::arg("mode"),
-             py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-             py::arg_v("name", ""),
-             py::arg_v("group_offset", nullptr),
+             py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+             py::arg("name")              = "",
+             py::arg("group_offset")      = py::none(),
              R"pbdoc(
                 Reduce an input tensor along certain dimensions. These dimensions to reduce on are inferred from output tensor shape.
 
@@ -1144,9 +1146,9 @@ init_pygraph_submodule(py::module_& m) {
              py::arg("input"),
              py::arg("descale"),
              py::arg("block_size"),
-             py::arg_v("is_negative_scale", false),
-             py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-             py::arg_v("name", ""),
+             py::arg("is_negative_scale") = false,
+             py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+             py::arg("name")              = "",
              R"pbdoc(
                 Dequantize an input tensor to other dimensions without changing the actual memory layout.
                 
@@ -1165,10 +1167,10 @@ init_pygraph_submodule(py::module_& m) {
              &PyGraph::block_scale_quantize,
              py::arg("input"),
              py::arg("block_size"),
-             py::arg_v("axis", std::nullopt),
-             py::arg_v("transpose", false),
-             py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-             py::arg_v("name", ""),
+             py::arg("axis")              = std::nullopt,
+             py::arg("transpose")         = false,
+             py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+             py::arg("name")              = "",
              R"pbdoc(
                 Quantize an input tensor with block scaling to produce quantized output and scale tensors.
                 
@@ -1186,8 +1188,8 @@ init_pygraph_submodule(py::module_& m) {
         .def("reshape",
              &PyGraph::reshape,
              py::arg("input"),
-             py::arg_v("name", ""),
-             py::arg_v("reshape_mode", cudnn_frontend::ReshapeMode_t::VIEW_ONLY),
+             py::arg("name")         = "",
+             py::arg("reshape_mode") = cudnn_frontend::ReshapeMode_t::VIEW_ONLY,
              R"pbdoc(
                 Reshape an input tensor to other dimensions without changing the actual memory layout.
                 These dimensions to reshape to are inferred from output tensor shape.
@@ -1204,8 +1206,8 @@ init_pygraph_submodule(py::module_& m) {
              &PyGraph::transpose,
              py::arg("input"),
              py::arg("permutation"),
-             py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-             py::arg_v("name", ""),
+             py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+             py::arg("name")              = "",
              R"pbdoc(
                 Permute tensor dimensions using a permutation vector (output axis i reads input axis permutation[i]).
 
@@ -1222,8 +1224,8 @@ init_pygraph_submodule(py::module_& m) {
              &PyGraph::concatenate,
              py::arg("inputs"),
              py::arg("axis"),
-             py::arg_v("in_place_index", std::optional<int64_t>{}),
-             py::arg_v("name", ""),
+             py::arg("in_place_index") = std::optional<int64_t>{},
+             py::arg("name")           = "",
              R"pbdoc(
                 Concatenate tensors along an axis.
 
@@ -1267,13 +1269,13 @@ init_pygraph_submodule(py::module_& m) {
              py::arg("token"),
              py::arg("weight"),
              py::arg("first_token_offset"),
-             py::arg_v("token_index", nullptr),
-             py::arg_v("token_ks", nullptr),
-             py::arg_v("mode", cudnn_frontend::MoeGroupedMatmulMode_t::NONE),
-             py::arg_v("compute_data_type", cudnn_frontend::DataType_t::FLOAT),
-             py::arg_v("top_k", 0),
-             py::arg_v("name", ""),
-             py::arg_v("top_k_scores", nullptr),
+             py::arg("token_index")       = py::none(),
+             py::arg("token_ks")          = py::none(),
+             py::arg("mode")              = cudnn_frontend::MoeGroupedMatmulMode_t::NONE,
+             py::arg("compute_data_type") = cudnn_frontend::DataType_t::FLOAT,
+             py::arg("top_k")             = 0,
+             py::arg("name")              = "",
+             py::arg("top_k_scores")      = py::none(),
              R"pbdoc(
                 Perform MoE Grouped Matmul operation.
 
@@ -1294,8 +1296,8 @@ init_pygraph_submodule(py::module_& m) {
              py::arg("doutput"),
              py::arg("token"),
              py::arg("first_token_offset"),
-             py::arg_v("compute_data_type", cudnn_frontend::DataType_t::FLOAT),
-             py::arg_v("name", ""),
+             py::arg("compute_data_type") = cudnn_frontend::DataType_t::FLOAT,
+             py::arg("name")              = "",
              R"pbdoc(
                 Perform MoE Grouped Matmul Bwd operation.
 
@@ -1437,10 +1439,10 @@ init_pygraph_submodule(py::module_& m) {
              py::arg("buffers"),
              py::arg("tensor_uids"),
              py::arg("auto_bindings"),
-             py::arg("workspace"),
-             py::arg("override_uids"),
-             py::arg("override_shapes"),
-             py::arg("override_strides"),
+             py::arg("workspace").none(),
+             py::arg("override_uids").none(),
+             py::arg("override_shapes").none(),
+             py::arg("override_strides").none(),
              py::arg("handle"),
              py::arg("plan_index"))
         .def("populate_cuda_graph", &PyGraph::populate_cuda_graph)

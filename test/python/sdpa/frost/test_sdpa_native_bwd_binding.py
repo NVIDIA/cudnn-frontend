@@ -112,6 +112,21 @@ def test_standalone_uses_the_native_host_contract(arch, scale, monkeypatch):
     assert rebound[-1] == 31
 
 
+@pytest.mark.parametrize("arch", ["sm100", "sm107"])
+def test_standalone_geometry_accepts_lists(arch):
+    """#1631: the SM100/SM107 standalone callers pass the geometry as a list; nanobind's cast<tuple> rejected it."""
+    spec, native, facts, geometry, _ = _fixture(arch)
+    pack, indices = _pack(spec, facts), tuple(range(len(spec.operands)))
+    expected = native.bind(pack, indices, _WORKSPACE, 17, (), None, True, geometry)
+    as_lists = [None if g is None else [list(g[0]), list(g[1])] for g in geometry]
+    assert native.bind(pack, indices, _WORKSPACE, 17, (), None, True, as_lists) == expected
+    assert native.bind(pack, indices, _WORKSPACE, 17, (), None, True, list(geometry)) == expected
+    wrong = list(geometry)
+    wrong[0] = [list(wrong[0][0][::-1]), list(wrong[0][1])]
+    with pytest.raises(ValueError, match="runtime geometry"):
+        native.bind(pack, indices, _WORKSPACE, 17, (), None, True, wrong)
+
+
 @pytest.mark.parametrize("arch", ["sm80", "sm100", "sm107_thd"])
 @pytest.mark.parametrize("q_prefix,kv_prefix", [(False, False), (True, False), (False, True), (True, True)])
 def test_native_standalone_prefix_form_and_storage(arch, q_prefix, kv_prefix):

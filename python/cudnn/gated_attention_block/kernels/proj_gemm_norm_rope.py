@@ -97,6 +97,7 @@ from cutlass._mlir.dialects import arith
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32
 from cudnn.frost.tile_dsl.tma import ld_global_v4, st_global
 from cudnn.gated_attention_block.kernels.proj_gemm import NormRopeFusionParams, validate_norm_rope_params
+from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
 
 import cutlass.experimental.primitives as nvvm
 from cudnn.gemm.frost.tile_helpers import (
@@ -1800,6 +1801,9 @@ def _host(
 
 @lru_cache(maxsize=None)
 def compile() -> Callable:
+    # Persistent object across processes (cudnn.frost.compiled_cache): the key is the digest the template loader stamps on
+    # this module (the file + its FROST_TEMPLATE_PARAMS) -- a plain import of the file carries none and compiles as before.
+    _cache_key = _template_key(globals(), locals(), "compile")
     out_vec_elems = vec_bytes_epi // (cd_dtype.width // 8)
     ab_stride_elems = 16 // (ab_dtype.width // 8)
     sym_m = cute.sym_int64()
@@ -1883,7 +1887,7 @@ def compile() -> Callable:
     )
     pass
     _fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
-    return cute.compile(
+    return _compile_cached(
         _host,
         problem_size,
         fake_a_0,
@@ -1897,4 +1901,6 @@ def compile() -> Callable:
         fake_rstd_k,
         stream=_fake_stream,
         options=frost_compile_options,
+        cache_key=_cache_key,
+        symbol="frost_gemm_norm_rope",
     )

@@ -94,6 +94,9 @@ across its general and D512 head envelopes, with device scales, all four scalar
 output dtypes and native KV-tail masking. THD retains per-batch length inputs;
 CU-prefix-sum graph inputs remain unsupported on this FP8 row.
 SM100/SM103 MXFP8 uses prepared launches for scalar outputs with fixed dense or bounded THD geometry.
+SM120/SM121 MXFP8 uses prepared launches for scalar outputs with fixed dense (unsplit and split) or THD geometry,
+and for the block-scaled MXFP8 O on fixed dense unsplit plans;
+dense conversion layouts use staged copies around a prepared compact plan, with the scale tensors bound unchanged.
 SM107 MXFP8 at exact device cc 10.7 uses prepared launches for its four existing dense, unsplit native
 head shapes and for bounded THD at d256 (`config_sm107.SM107_MXFP8_THD_SHAPES`); THD at the other
 three shapes, split-KV and PackGQA remain unsupported. Dense MXFP8 runtime
@@ -335,7 +338,7 @@ MMA as d=512.
 | FP8 E4M3 / E5M2 (per-tensor descale) | ✅ (native d64, cga1)⁷ | ✅ | ✅ | ✅ | ✅ | ❌ |  ❌  |
 | MXFP8 (E4M3/E5M2 + per-32 E8M0 SF) | ✅ (native d64, cga1, dense / unsplit / unpaged)⁷ | ✅ | ✅ | ✅ | ✅ | ✅ᵍ (E4M3 only, d=256) |  ✅ᵍ (E4M3 only)  |
 | O dtype ≠ QKV dtype — **quantized graphs only**¹ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵍ (fp16/bf16 gradients) |  ✅ᵍ · —ᵇ²  |
-| Block-scaled O (`sdpa_fp8` / `sdpa_mxfp8` + `sf_o`): FP4_E2M1 O + E4M3 scale per 16 d, or E4M3 O + UE8M0 scale per 32 d — per-tensor FP8 and block-scale MXFP8 graphs, dense/unsplit/unpacked only; `scale_o` doubles as the FP4 global scale (a python-only input on `sdpa_mxfp8`) | ❌ | ✅ (FP8: SM100 / SM107 / SM120; MXFP8: SM100 / SM107) | ❌ | ❌ | ❌ | ❌ |  ❌  |
+| Block-scaled O (`sdpa_fp8` / `sdpa_mxfp8` + `sf_o`): FP4_E2M1 O + E4M3 scale per 16 d, or E4M3 O + UE8M0 scale per 32 d — per-tensor FP8 and block-scale MXFP8 graphs, dense/unsplit/unpacked only; `scale_o` doubles as the FP4 global scale (a python-only input on `sdpa_mxfp8`) | ❌ | ✅ (FP8: SM100 / SM107 / SM120; MXFP8: SM100 / SM107, and SM120 for the E4M3 + UE8M0/32 O) | ❌ | ❌ | ❌ | ❌ |  ❌  |
 | Head-dim envelope (zero-padded below native) | f16 ×8 · fp8 ×16 up to 64 (**native 64**: the d128 kernel files at `d_flavor=64`)⁷ · mxfp8 exact | f16 ×8 · fp8 ×16 · mxfp8 exact | f16 ×8 · **fp8 exact (192, 128) only**¹⁰ · mxfp8 exact | f16 ×8 · **fp8 exact 256 only**¹⁰ · mxfp8 exact | f16 ×8 · fp8 ×16, floor 256² · mxfp8 exact | f16 (256, 512] ×8ᵇ · mxfp8 exact 256ᵍ |  none — exact (256, 256)ᵇ² ᵍ  |
 | **Layout** | | | | | | |  |
 | BSHD | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᵍ |  ✅ᵇ² ᵍ  |
@@ -538,9 +541,9 @@ stay declined. The FP8 graph is `sdpa_fp8`
 with scalar `descale_q/k/v` and `scale_o` (`scale_s`/`descale_s` accepted and ignored),
 O in FP16/BF16/E4M3/E5M2, `Amax_O` out. **The graph must not declare
 `Amax_S`**: every FROST FP8 row declines a graph that requests that output (the kernels
-do not produce it), so a generic fp8 graph that binds `Amax_S` — the spelling a
-FlashInfer-style wrapper produces today — stays on the backend engine; the paged FP8
-capability is reachable only by omitting it. Masks validated over FP8 pools: a causal
+do not produce it), so a graph that binds `Amax_S` as a non-virtual output stays on
+the backend engine, and the paged FP8 capability is reachable only by leaving it
+virtual (FlashInfer's `sdpa_fp8` prefill graph already does: `set_output(False)`). Masks validated over FP8 pools: a causal
 upper bound top-left or bottom-right (MTP `S_q <= 8`, each batch's diagonal anchored
 at its own KV length, rows left without a key write O := 0 / LSE := -inf) and a left
 sliding window (`test_sdpa_fwd_paged_sm100.py` fp8 causal / sliding-window tests, pinned
@@ -1115,7 +1118,7 @@ red (2026-09-08).
 | Split-KV | f16/bf16 via the d128 flavorᵗ (envelopeᵛⁱⁱ) | per-tensor fp8, envelopeᵛⁱⁱ · f16/bf16 via the d128 flavorᵗ | denseᵛⁱⁱ; half THD | denseᵛⁱⁱ; half nonpaged THD | half paged THD, CGA2; the decode tile's dense (unpadded) / paged split, packed or not (fp32 partials + the shared combine, `choose_decode_tile_split_kv`)ᵈʳ | ❌ᵛⁱⁱ | — | — |
 | d128 decode tile (`TILE_CGA_M=1`, dense; the shared `sm100/decode_d128_f16.py` compiled for sm_107a; `S_q × packed group ≤ 128` proposes it first; past one tile the dense SM100 and cc 10.7 rows list both widths and lead with the decode tile while its waves stay within 1.6x the cga2 cluster's below a 16k cache, issue #1518; THD and the pre-folded scale keep the prefill tile) | envelope under split-KV only (the 32-wide tile is dense-only: a split selects d128; an unsplit graph runs the 32-wide prefill tile)ᵗ | envelope under split-KV only (the 64-wide tile is dense-only: a split selects d128; an unsplit graph runs the 64-wide prefill tile)ᵗ | ✅ (issue #1472) | ❌ (prefill) | ❌ (prefill) | ❌ (prefill) | — | — |
 | Paged KV (half THD; the attention sink composes ᵖˢ -- keyless rows O := 0 / LSE := sink; dense paged queries ❌ except decode-shaped dense Q on the cc 10.7 d256 decode tile ᵈʳ; MXFP8 pools with dense queries, sinks compose)ᵖ | ❌ᵗ (the pre-tile decline) | fp8 envelope · f16/bf16 ❌ᵗ (the pre-tile decline) | half THD ✅ (sink: unsplit, PackGQA on / off, cga1 / cga2, HND / NHD, page 8–1024) · mxfp8 pools ✅ (page 128 / 256 / 384 / 512, HND / NHD, cga2) | ❌ | half THD ✅, including unpacked split (sink: unsplit, PackGQA on / off) · mxfp8 pools ✅ (page 128 / 256 / 384 / 512, cga1) · decode-shaped dense Q on the d256 decode tile ✅ (sink, PackGQA and split included)ᵈʳ | ❌ | — | — |
-| Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`, `G = (B, H_q, S_q, D_v)`; graph tail + standalone `sample_gate`)ᵛⁱⁱⁱ | ❌ | ❌ | ❌ | ❌ | f16/bf16 ✅ (+ on the d256 decode tile's SPLIT the gate is applied by the combine: dense or paged, packed or not; not under execute-time shape overridesᵈʳ) · fp8 ✅ (bf16 G) · mxfp8 ✅ (bf16 G; a gated e4m3 O is unscaled) | ❌ | — | — |
+| Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`, `G = (B, H_q, S_q, D_v)`; graph tail + standalone `sample_gate`)ᵛⁱⁱⁱ | ❌ | ❌ | ❌ | ❌ | f16/bf16 ✅ (dense; and THD / packed sequences on the d256 prefill through the STANDALONE adapter -- `SdpaFwdDslSm100(thd=True, sample_gate=...)`, the gated attention block's packed `fuse_gate`; the graph tail stays dense-onlyᵛⁱⁱⁱ; + on the d256 decode tile's SPLIT the gate is applied by the combine: dense or paged, packed or not; not under execute-time shape overridesᵈʳ) · fp8 ✅ (bf16 G; dense only) · mxfp8 ✅ (bf16 G; a gated e4m3 O is unscaled; dense only) | ❌ | — | — |
 | Optional stats (LSE store compiled out) | ✅ᵗ | ✅ᵗ | ✅ | ✅ | ✅ | ✅ | — | — |
 | Bias (additive, `[1\|B, 1\|H_q, S_q, S_kv]` in the Q/K/V dtype; the RESIDENT row-block inside its budget, the STREAMED per-kv-tile ring above it; dense / unsplit / unpaged, no score outputs)ᵗᵇ | ✅ᵗᵇ any S_kv: resident up to 768 for a batch-broadcast bias on ≥ 2 flattened rows (the (n, n+1) pair work item, a 128-row block) / 384 for a per-batch bias, the 3-stage streamed ring above | ✅ᵗᵇ any S_kv: resident up to 384 (the pair item, cga1) / 128 (cga1) / 256 (cga2) for a per-batch bias, the streamed ring above (the pair item's 3 stages at cga1; a per-batch bias at cga2's 2 stages -- cga1 holds no ring for its 256-row tiles) | ❌ (no SMEM for a block or a ring) | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Per-key mask (`kv_mask`, a python-only `sdpa` input `[1\|B, 1, 1, S_kv]`: BOOLEAN = the bit word, False = the key is masked for every query; the Q/K/V dtype or FLOAT = an ADDITIVE per-key vector folded pre-scale like the bias, S_kv % 8 == 0, 16-byte strides)ᵗᵇ | ✅ᵗᵇ any S_kv (nothing staged in SMEM; the bit word validated to n_kv = 8, the additive forms to n_kv = 4; an fp32 vector WITH a bias runs TILE_N 64, the heuristics' pick) | ✅ᵗᵇ any S_kv (cga1; cga2 on request; both forms) | ❌ | ❌ | ❌ | ❌ | — | — |
@@ -1701,7 +1704,8 @@ is the three-node tail `sdpa(virtual O_v) -> sigmoid(G) -> mul(O_v, s)`
 (`cudnn._sdpa_tail.match_gate_tail`; either mul operand order), validated
 python-natively and lowered with the mul output bound as the kernel's O — the
 virtual `O_v` / `s` are never bound or materialised. Served **exactly** at
-(256, 256) (not through the head-dim envelope), dense only (no THD), unsplit,
+(256, 256) (not through the head-dim envelope), dense on the graph (the standalone
+adapter adds THD on the f16/bf16 row, below), unsplit,
 non-PackGQA, non-paged -- with ONE exception on the f16/bf16 row: a decode-shaped
 graph (`S_q · G` packed rows within the Rubin route, footnote ᵐᵗᵖ) whose plan SPLITS rides the d256 decode tile, which
 applies the gate in its split COMBINE (dense or paged, packed or not; the same
@@ -1709,7 +1713,31 @@ one-rounding arithmetic -- footnote ᵈʳ); the padding mask (`seq_len_kv`) comp
 the final O must be DECLARED (dim + stride, BSHD) — the classic C++
 `pre_validate_node` needs both on the sdpa output and only user-assigned values
 are pushed at lowering, so an undeclared `O_v` is a typed not-supported from
-`validate()` rather than a bare `ValueError` out of planning. `G` is Q's dtype on
+`validate()` rather than a bare `ValueError` out of planning. **THD (packed
+sequences) x gate -- the standalone adapter only, f16/bf16 d256 prefill only
+(the THD gate descriptor).** `SdpaFwdDslSm100(thd=True, sample_gate=G)` with G
+declared like O -- the `(B, H_q, S_max, D_v)` envelope at G's (token, head)
+strides (a gate sliced out of a fused projection slab at token stride N binds
+zero-copy, exactly as under dense) -- and handed to `execute(gate=)` as the
+packed `(T, H_q, D_v)` buffer: the kernel host maps G through the SAME packed
+`[1, T, H_q, D_v]` tensor map Q / O take and the TMA-LDG warp's gate load runs
+on the THD coordinates, so the kernel body is the dense gated body byte for
+byte; the prepared THD binder binds G per call (validated like Q / O: Q's dtype,
+16-byte-aligned base, TMA-expressible strides, a capacity covering every packed
+Q token -- a shorter gate is a typed `ValueError`, never a shortened launch).
+Validated on the cc 10.7 development class: per sequence against the fp32
+oracle at the gate suite's bounds, within one output ulp of the ungated THD run
+followed by the separate `O * sigmoid(G)` stage (the one-rounding convention
+the dense gate keeps), `B = 1` packed BITWISE the dense gated plan (O and LSE),
+LSE bitwise the ungated THD run's, a sequence with Q rows and ZERO keys exactly
+0 / −inf under a ±1e4 gate, a zero-length sequence in the packing, storage past
+the packed total untouched. NOT served under THD: the quantized (per-tensor FP8
+and MXFP8) THD bodies (they build the dense gate map; declined by name), and the
+GRAPH tail (the graph's THD lowering binds no gate operand: the rows keep the
+"dense-only (no THD gate descriptor)" decline for a THD gated graph -- the
+adapter is wider than the row here by design, never the reverse). A pybind
+extension older than the binder's gate role (`_SdpaThdBinder.supports_epilogue_gate`)
+declines a gated THD plan typed at `check_support`. `G` is Q's dtype on
 the f16/bf16 row and BF16 on the FP8 and MXFP8 rows (the kernels stage it in bf16), and must
 be **BSHD-physical with 16-byte-aligned, non-overlapping seq/head strides**: G is
 TMA-loaded zero-copy (no normalisation copy, unlike Q/K/V/O), so the row declines
@@ -2019,7 +2047,7 @@ Rubin config factories. Target-SM107 numerical validation is still required.
 ## SM120 / SM121 (Blackwell GeForce, cc 12.0–12.9)
 
 Engines: `sdpa_fwd_prefill_sm120`, `sdpa_fwd_prefill_sm120_fp8`,
-`sdpa_bwd_sm120`. Head dims are a **continuum**, not per-model flavors: the
+`sdpa_fwd_prefill_sm120_mxfp8`, `sdpa_bwd_sm120`. Head dims are a **continuum**, not per-model flavors: the
 kernel picks Q/K and V head tiles independently (f16/bf16 head dims it would
 tile at 256 on both sides run a dedicated template, `sm120/prefill_d256_f16.py`
 with the same support).
@@ -2031,15 +2059,19 @@ zero-padding, with the same MMA and on-chip storage cost.
 FP8 FPROP (`sm120/prefill_d512_fp8.py`) adds the same independent band with
 **multiples of 16** and a **64 x 64 CTA**. BPROP remains limited to 256.
 
-| Feature | FPROP<br>d ≤ 256, any ×8;<br>both dims ∈ (256, 512], any ×8 | FPROP FP8<br>both ≤256 or both ∈ (256, 512], any ×16 | BPROP<br>d ≤ 256, any ×8 |
+MXFP8 FPROP (`sm120/prefill_mxfp8.py`) runs the FP8 pipeline on the block-scaled
+`m16n8k32` MMA, with the same independent head band up to 256 in **multiples of
+16**; the d512 band is not served.
+
+| Feature | FPROP<br>d ≤ 256, any ×8;<br>both dims ∈ (256, 512], any ×8 | FPROP FP8 / MXFP8<br>both ≤256 or (FP8 only) both ∈ (256, 512], any ×16 | BPROP<br>d ≤ 256, any ×8 |
 |---|:--:|:--:|:--:|
 | **Data types** | | | |
 | FP16 / BF16 | ✅ | — | ✅ |
 | FP8 E4M3 / E5M2 (per-tensor) | — | ✅ | ❌ |
-| MXFP8 | ❌ | ❌ | ❌ |
+| MXFP8 | — | ✅ (both ≤ 256) | ❌ |
 | O dtype ≠ QKV — **FP8 graphs only** (fp16/bf16/fp8 out) | ❌ | ✅ | — |
 | Rectangular head dims (D_QK ≠ D_V) | ✅ (independent within each served band) | ✅ (independent) | ✅ (D_QK ≥ D_V) |
-| Head-dim alignment (actual `D_QK`/`D_V`) | ×8, both ≤ 256ᵃ; or both ∈ (256, 512] | ×16, both ≤ 256ᵃ; or both ∈ (256, 512] | ×8, ≤ 256 |
+| Head-dim alignment (actual `D_QK`/`D_V`) | ×8, both ≤ 256ᵃ; or both ∈ (256, 512] | ×16, both ≤ 256ᵃ; or (FP8 only) both ∈ (256, 512] | ×8, ≤ 256 |
 | **Layout** | | | |
 | BSHD / `dense_flex` | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
 | THD / ragged | ✅ | ✅ | ❌ |
@@ -2059,9 +2091,11 @@ FP8 FPROP (`sm120/prefill_d512_fp8.py`) adds the same independent band with
 | Ragged `S_kv` (no tile rule) | ✅ | ✅ | ✅ |
 | Decode-shaped (`S_q == 1`) | ✅ | ✅ | ✅ |
 
-Base-2 stats are wired into all three f16 templates and the FP8 template,
-including the final Split-KV combine. Target-SM120 numerical validation remains
-required; local SM80/SM100 results do not validate these kernels.
+Base-2 stats are wired into all three f16 templates and the FP8 and MXFP8
+templates, including the final Split-KV combine. `sdpa_mxfp8` graphs take no
+`stats_use_log2` input, so only the direct adapter reaches the MXFP8 wiring.
+Target-SM120 numerical validation remains required; local SM80/SM100 results do
+not validate these kernels.
 
 ᵃ **Head TILE granule and head-DIM alignment are different numbers — the column
 headers quote the head-dim rule.** `GENERAL_HEAD_TILES` steps by 16 (f16), and
@@ -2078,7 +2112,14 @@ on the 80-wide tile.
 
 Engines: `sdpa_fwd_prefill_sm80`, `sdpa_bwd_sm80`. Both use `mma.sync` (no
 tcgen05) and assume the A100's 164 KiB opt-in SMEM — sm86/sm89 are declined.
-The backward serves packed THD graphs (ᵏ); the forward does not yet.
+The backward serves packed THD graphs (ᵏ); the forward serves native-flavor packed THD graphs
+with per-batch or cumulative Q/KV lengths, compact BSHD Q/K/V/O, and packed
+head-major or token-major Stats.
+The packed caller contract still applies: every sequence length is within its
+declared `S_max`, the Q/KV length sums fit the respective bound packed buffers
+and any `max_total_seq_len_*`, and ragged offsets describe the same adjacent
+sequences. Runtime lengths stay on device; the adapter cannot host-validate
+these values without breaking graph capture.
 
 Dense forward uses a prepared pointer host when V matches its flavor width,
 Q/K head dimensions are multiples of eight, and every stepped Q/K/V/O outer
@@ -2106,9 +2147,9 @@ the former tensor compilers and their fake-operand construction are removed.
 | FP8 / MXFP8 | ❌ / ❌ | ❌ / ❌ | ❌ / ❌ | ❌ / ❌ |
 | **Layout** | | | | |
 | BSHD / `dense_flex` | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
-| THD / ragged | ❌ / ✅ᵏ | ❌ / ✅ᵏ | ❌ / ✅ᵏ | ❌ / ✅ᵏ |
-| `cu_seq_len_q/kv` | ❌ / ❌ʲ | ❌ / ❌ʲ | ❌ / ❌ʲ | ❌ / ❌ʲ |
-| Strided / permuted Stats | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
+| THD / ragged | ✅ / ✅ᵏ | ✅ / ✅ᵏ | ✅ / ✅ᵏ | ✅ / ✅ᵏ |
+| `cu_seq_len_q/kv` (THD forward only) | ✅ / ❌ʲ | ✅ / ❌ʲ | ✅ / ❌ʲ | ✅ / ❌ʲ |
+| Strided / permuted Stats (dense; packed THD uses the two layouts above) | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
 | **Masks / features** | | | | |
 | Causal (top-left) | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
 | Causal bottom-right | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
@@ -2158,7 +2199,11 @@ All SM80 forward tensor-fake construction is removed. Dense conversion copies,
 including standalone RoPE, share prepared gather/scatter plans with native GQA
 and natural-unit sinks. RoPE preserves its angle-table values through the shared prepared host;
 its obsolete tensor-staging executor and dedicated host compiler are removed.
-The forward graph row still declines THD and RoPE, so graph eligibility is unchanged.
+Native-flavor THD forward graphs reuse this pointer host, with optional head-major
+or token-major Stats and device-side length normalization in caller workspace.
+Plan construction and execution allocate no device memory. Graph admission requires
+compact packed Q/K/V/O, natural scheduling, and no bias, sink, or RoPE fusion.
+The graph path does not run the standalone wrapper's output-capacity initialization.
 
 Standalone packed forward/backward wrappers share prepared bitwise data copies
 for their existing head-width padding, backward compaction and output trimming.
@@ -2213,8 +2258,9 @@ write the caller's head dim, so nothing past the packed total is ever written in
 the caller's gradients (the ragged sweeps assert this with a NaN-filled tail). Served under THD: the causal family, GQA/MQA, sinks/dSink,
 deterministic dQ, head-dim envelope padding (carved staging at the packed
 capacities), zero-length and one-sided-empty sequences. Bias/dBias is dense-only (a packed graph has no `[B, H, S_q, S_kv]` bias); RoPE is a
-wrapper-only fusion no engine row admits. The forward row
-still declines THD (the wrapper's `cu_seqlen` path serves it).
+wrapper-only fusion no engine row admits. The SM80 forward row now serves
+native-flavor, compact packed THD with Q/KV lengths; its dense head-dim
+envelope and fused bias/sinks remain unavailable to THD.
 
 ---
 
@@ -2222,6 +2268,8 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 
 | Missing | Where |
 |---|---|
+| Gated attention block (frontend-only, no graph form): e4m3 (`kv_cache_dtype`) pools, the write-through folded into the projection epilogue, an LSE / a window / a `QsaSpec` / another head dim on the paged forms, a dense step wider than 32 rows | SM107 -- the block's paged KV-cache WRITE-THROUGH (`paged_kv_page_size`: bf16 / f16, dense and packed), the EXTEND form (`kv_source="paged"` + `token_capacity`: the packed step's attention over the pools through `block_table` / `kv_lens` on the bottom-right diagonal) AND the DECODE form (`kv_source="paged"` on a dense `[B, S_q <= 4]` block: the Rubin d256 decode tile, PackGQA + split-KV with the gate in the combine; the unpacked tile up to 32 rows declared, unmeasured) are served on HND / NHD / unified-row pools at pages 16 / 32 / 64 / 128, bf16 / f16 (the `Rubin d256 gated attention block -- serving forms` section below) |
+| Index-list (block-sparse) forward: a GRAPH form (no `sdpa` node carries a block-index list), any sparse attention through the gated attention block (`QsaSpec`, including dense, THD and paged-READ / DECODE), a sink, a band, Q-length trimming of a dense batch, log2 stats; THD and paged pools in ONE declaration; the decode form's arms (bottom-right, the per-sequence list, split-KV) under THD; a shared list at `S_q > 4` | SM107 — frontend-only: the standalone `sparse_gqa_sm107` adapter serves dense BSHD bf16 / f16, d = 256, caller lists at `top_k` in [4, 512] (multiples of 4), query-head groups 1..16, per-batch KV lengths, the fused epilogue gate (`epilogue_gate=` the gate operand on the adapter: O gated in place, the LSE untouched; it composes with the paged read and with THD); the standalone adapter also reads paged K / V pools (`paged_kv=True`: `[num_pages, H_kv, page_size, D]` HND compact or NHD by strides, one `(B, max_pages)` block table, `page_size` a positive multiple of 4, per-batch lengths required) and serves packed THD sequences (`thd=True`: per-sequence or cumulative lengths, sequence-relative block ids) -- one of the two per declaration (`thd=True` with `paged_kv=True` is a typed decline) -- and the DECODE form (`bottom_right=True`: positions `kv_len - S_q + row`; `list_per_sequence=True`: `block_ids [B, top_k]` shared by the sequence's `S_q <= 4` rows, anchored at the step-0 position; `split_kv=S` up to `ceil((top_k + 1) / 32)`: fp32 partials in the caller's workspace + the split combine, the gate riding the combine); every other arm is a typed decline by name (see the SM107 index-list section below) |
 | Backward pass entirely | SM90 |
 | Backward outside d ∈ (256, 512] ∪ {256} (f16/bf16) or d = 256 (per-tensor FP8 E4M3 and block-scale MXFP8 E4M3): every other head dim; and on the d256 rows the dense GRAPH padding mask (per-batch kv lengths ride every row's standalone adapter), sink / dSink, bias / dBias, deterministic, `dense_flex`, right-band widening, decode; on the MXFP8 row also fp16 gradients and the `amax_dQ/dK/dV` outputs; on the d512 row THD, `dense_flex`, the dense padding mask, sink / dSink, bias / dBias, deterministic, decode | SM107 — the three d256 rows plus the d512 2x2-datapath row (`sdpa_bwd_sm107_d512`, opt_in, since 2026-10-01) are the whole Rubin backward (see the SM107 table, ᵇ ᵐˣ and ᵇ³) |
 | Backward outside d ∈ (256, 512] ∪ {256} (f16/bf16) or d = 256 (MXFP8) | SM100, SM103 — the three backward engines there serve exactly those bands (f16/bf16 d = 256 via the 2x2-datapath row ᵇ², opt_in, since 2026-10-01) |
@@ -2233,11 +2281,11 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 | f16/bf16 forward split-KV | SM90, SM80; SM107 D512 and dense D256; THD outside D128/D256 and nonpaged D192 |
 | f16/bf16 forward PackGQA | SM107 outside dense D128 GQA (shared bodies, not with the pre-folded scale), D128 paged THD / nonpaged D128 split THD and exact D256 paged unsplit THD with CGA2 |
 | d192×d128 quantized PackGQA / split-KV, and d192 MXFP8 THD | SM107 — the shape is served in FP8 and MXFP8 as of 2026-09-09, and per-tensor FP8 **THD** with it; PackGQA and split-KV stay wired in the d128 flavor only (`pack_gqa_d_shapes` / `split_d_shapes`), and the MXFP8 line declines THD outside d256 (`SM107_MXFP8_THD_SHAPES`, ᶻ) |
-| MXFP8 forward | SM90, SM120, SM80 (SM107 is served — see the SM107 table; d512 is ⚠️ⁱᵛ, correct but with no test module -- covered through the graph API by `test_mhas_v2.py::test_sdpa_mxfp8_fwd_default_walk_cc107_L0` and `::test_sdpa_mxfp8_fwd_cc107_L0`, d512 being one of the four exact flavors drawn; a dedicated module is still open) |
+| MXFP8 forward | SM90, SM80, and SM120 above d = 256 (SM107 is served — see the SM107 table; d512 is ⚠️ⁱᵛ, correct but with no test module -- covered through the graph API by `test_mhas_v2.py::test_sdpa_mxfp8_fwd_default_walk_cc107_L0` and `::test_sdpa_mxfp8_fwd_cc107_L0`, d512 being one of the four exact flavors drawn; a dedicated module is still open; SM120 serves both dims ≤ 256 — see the SM120 table) |
 | Per-tensor FP8 backward | every arch except SM107 d = 256 E4M3 (`sdpa_bwd_sm107_fp8`, ᵇ) |
 | MXFP8 backward outside SM100/SM103 d = 256 and SM107 d = 256 (`sdpa_bwd_sm107_mxfp8`, ᵐˣ) | every arch |
 | THD / ragged backward | SM120, the SM107 d512 row (ᵇ³) and the SM100/SM103 MXFP8 and f16/bf16 d256 (ᵇ²) rows (the SM100/SM103 f16/bf16 d512 row serves it — see ʰ; the SM107 f16/bf16 and per-tensor FP8 rows — see ᵇ; the SM107 MXFP8 row — see ᵐˣ; SM80 — see ᵏ) |
-| THD forward | SM80 |
+| THD forward outside native-flavor dims or compact packed Q/K/V/O | SM80 — the graph path serves only the four native head-dim pairs and copy-free packed BSHD buffers |
 | **Decode tile on the Rubin line outside the d256 f16/bf16 flavor** | **SM107** — d128 / d192×d128 / d512 decode and every fp8 / mxfp8 decode run their flavor's prefill kernel; the d256 f16/bf16 decode tile (ᵈʳ: whole-group PackGQA, dense / paged split-KV, the MTP step in token units of the 32-column tile ᵐᵗᵖ) is the only Rubin decode tile today |
 | **Native d=64 (GPT-OSS) forward kernel** | **SM107 per-tensor FP8 / MXFP8** — served via the d128 envelope at ~2× MMA cost (the f16/bf16 row is native on its 64-wide tile, and every D ≤ 32 on its 32-wide one, since 2026-10-08 -- see the SM107 table's ᵗ). SM100/SM103 is native (⁷) for f16/bf16 (prefill, decode (ᵈ⁶⁴), paged and split-KV), per-tensor FP8 (prefill, paged, split-KV; cga1) and MXFP8 (dense / unsplit / unpaged; cga1) |
 | Decode tile outside the d128 / d256 f16/bf16 flavors | SM107 — dense d128 f16/bf16 rides the shared decode tile since issue #1472, and decode-shaped dense-Q d256 f16/bf16 (dense or paged cache) rides the Rubin d256 decode tile (ᵈʳ); d192×128 / d512 and every quantized flavor run their prefill kernels, d256 graphs past the tile's route run the d256 prefill kernel, THD keeps the prefill tile (the ragged-Q leg is SM100-line only), dense paged queries outside the d256 decode tile are not wired. SM100, SM103 — dense/paged d192×128 and d512 decode and every fp8 / mxfp8 decode have no dedicated decode tile: each runs its flavor's prefill kernel at that flavor's own CGA width (f16 d512 and the quantized d128 flavors at `TILE_CGA_M=2`; per-tensor FP8 d256 and SM100 MXFP8 d256 / d512 are cga1 kernels; d192×128 selects 1 or 2 by shape). Nonpaged, unpacked D192 THD can select the shared single-Q pipeline described below. Unsplit THD queries on the d128 f16/bf16 flavor keep its prefill pipeline (`TILE_CGA_M=2`) too (ᵈᵗ); exact D128 split THD can use the single-CTA path; d256 f16/bf16 graphs the adapter does not route onto the d256 decode tile (THD, or more packed Q rows than it routes, ᵈ) run the d256 prefill tile; on cc 10.7 the MXFP8 pools likewise run the d128 (`TILE_CGA_M=2`) / d256 (cga1) prefill tiles at `S_q <= 8` (the paged-vs-dense measurement is the R15 note of the SM107 paged MXFP8 pools section below: paged within 2 % of dense at the qwen35 decode shape; a decode tile for the quantized flavors is a P3-class follow-up) |
@@ -2245,6 +2293,7 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 | **d512 paged decode tile** | SM100, SM103 — paged d512 is served (ᵖ) but a decode-shaped (`S_q ≤ 8`) paged d512 graph runs the d512 PREFILL tile (cga4 role-split, 256 Q rows per cluster). Measured on the FlashInfer decode shape (`S_q = 1`, `B = 8`, `d_qk = d_v = 512`, page 16, bf16, mixed `S_kv ≤ 4096`, B200, CUDA-graph replay, kernel time): 64/1 MQA prefill tile **77.8 µs vs 65.1 µs on the backend's paged decode engine**; 64/8 GQA 136.9 vs 102.5 µs. `sdpa/fwd/placement.py` keeps the backend first for paged d512 at `S_q = 1` by default (the FROST plan serves it under the opt-in; multi-token paged d512 keeps the decode-shaped lead). Follow-up: a d512 decode tile, the d128 ᵈᵗ recipe on the d512 geometry (`test_sdpa_fwd_paged_d512_decode_frost_pinned_L0` pins the shape) |
 | d=64 quantized THD; d=64 MXFP8 paged / split-KV | SM100/SM103 (`thd_d_shapes` of both quantized rows, the MXFP8 row's `paged_d_shapes` / `split_d_shapes`, mirrored by `check_support`); every d=64 MXFP8 graph on SM107 (exact-shape gates) |
 | Bias forward | SM90, SM100, SM120; on SM107 every flavor except the f16/bf16 32- / 64-wide tiles, which serve it as a resident row-block up to S_kv 768 / 384 (the 32- / 64-wide tile; the (n, n+1) pair work item for a batch-broadcast bias on >= 2 flattened batch rows at cga1) or 384 / 128 (cga1) / 256 (cga2) for a per-batch bias, a single row or a requested cga2 (the one-batch-entry item) together with the per-key `kv_mask` in its BOOLEAN or additive (io dtype / fp32 vector) form (ᵗᵇ; the `kv_mask` ALONE has no S_kv bound there -- nothing is staged) -- above the block the same tiles stream the bias as a 2- / 3-stage per-kv-tile ring (any S_kv; a per-batch bias at the 64-wide tile above 256 on cga2 only), the d128 / d192 / d256 / d512 flavors decline; a compact bias at S_kv % 8 != 0 declines (TMA stride rule; pad the row stride) |
+| Forward with more than 65535 heads, or batch × split_kv (#1573) | every arch: CUDA caps `gridDim.y/z` at 65535 and `SCHED_POLICY=NATURAL` launches heads and batch × split_kv there, so `mismatch` (`launch_grid_mismatch`) declines a NATURAL set and the heuristic re-emits each unsplit set under LPT (flat grid). Declined outright: a flavor whose scheduler domain is NATURAL only, the d256 decode tile past 65535 batch (batch on `gridDim.y` under every policy), ragged graphs on SM80 / SM90 (3-D grid under every policy) and split_kv > 1 past 65535 heads or batch (the combine launches both on `gridDim.y/z` under every policy); the packed THD split combine launches only heads on `gridDim.y`, so it is declined past 65535 heads only. Measured 2026-10-11, cuDNN 9.27, b or h = 65536: NATURAL fails to launch on B200 (d64 / d128, prefill and `S_q = 1`), A100 (d64 / d128) and H100 (d512); LPT and LPT_L2 match the fp64 reference (max error ≤ 5.3e-4) |
 | Score side outputs (`score_max` / `score_sum_exp`) outside the f16/bf16 d128 prefill flavor — the d192×d128 / d256 / d512 files, the decode tiles (`cga = 1`), THD, paged KV, `split_kv > 1`, the native SM100 d64 flavor, every quantized row | every arch (the d128 f16/bf16 FPROP on SM100 / SM103 / SM107 serves them, ˢᶜ; SM107 d ≤ 64 through its d128 flavor, ᵗ); SM80 / SM90 / SM120 entirely |
 | Dropout, ALiBi, `block_mask`, `score_mod` | every arch, both passes |
 | Paged KV cache | SM107 serves half THD D128/D256 with or without an attention sink, plus decode-shaped dense-Q half d256 graphs (`S_q · G` within the Rubin route ᵐᵗᵖ: ≤ 16, the 32-column tile, a packed MTP step of two token units; sink included) on the d256 decode tile (ᵈʳ) (other dense paged queries and the d192×128 / d512 half pools stay declined there) and MXFP8 pools on D128 / D256 with dense queries (`page_size % 128`, 128 / 256 / 384 / 512 validated, HND / NHD, sinks compose; THD queries over MXFP8 pools and the d192×d128 / d512 MXFP8 pools are the SM107 follow-ups below); otherwise every arch except SM100/SM103 forward on f16/bf16 d128 / d192×d128 / d256 / d512, per-tensor FP8 d128 and MXFP8 on every native flavor (see ᵖ); the FP8 d512 flavor, MXFP8 pools with unreordered SF or page_size < 128 (page 64 included: a 64-row page cannot hold an F8_128x4 atom set, so a product page-64 contract needs a different SF encoding, not a half-page re-addressing of a 128-declared pool), THD queries over MXFP8 pools, packed (ragged-offset) block tables everywhere (THD queries over f16/bf16 pools ARE served — see ᵖ); THD queries and the attention sink over FP8 pools, a block-scaled O (`sf_o`) over FP8 and MXFP8 pools |
@@ -2304,8 +2353,9 @@ prepared calls require the declared caller workspace, like graph execution.
 
 Existing dense D128 NVFP4 and MXFP8 outputs use prepared pointer launches on
 SM100/SM103, SM107 and SM120/SM121 per-tensor FP8, and on SM100/SM103 and SM107
-MXFP8 input paths. The declared SF_O atom geometry stays fixed; each call binds
-current O, SF_O, optional Amax and device scales with observed storage checks.
+MXFP8 input paths; SM120/SM121 MXFP8 inputs serve the MXFP8 output. The declared
+SF_O atom geometry stays fixed; each call binds current O, SF_O, optional Amax
+and device scales with observed storage checks.
 FP4 O uses packed byte geometry, while V keeps its full logical head dimension.
 SF_O offsets and prepared copy strides preserve Int64 addressing.
 THD, paged, split-KV, PackGQA, gated output and shape-override combinations keep
@@ -2704,3 +2754,232 @@ padded Stats and fused gates remain outside this extension. Tests cover GQA/MHA,
 changed device lengths and sinks under graph replay, empty/keyless rows, runtime
 pointer validation, output tail canaries, and combine split counts on both sides
 of the warp reduction boundary. No timing or preferred split count is asserted.
+
+
+### Rubin d256 gated attention block -- serving forms (frontend-only, no graph form)
+
+The gated attention block (`cudnn.gated_attention_block`; `docs/fe-oss-apis/gated_attention_block.md`) has no engine row and no
+`sdpa` graph form: its serving forms are claims of the BLOCK, recorded here one row per form x pool layout x page size x dtype,
+each written in the same change as its accept cell (Rule S2). Rubin (cc 10.7) only. The pool contract is the SDPA adapter's own
+paged contract -- a 4-D view `[num_pages, H_kv, page_size, D]`, `D` contiguous, the other three strides free: **L1** HND compact
+`(H*P*D, P*D, D, 1)`; **L2** NHD by strides `(P*H*D, D, H*D, 1)`; **L3** a serving stack's unified `[num_pages, H_kv, P, 2D]`
+content row (K at `+0`, V at `+D`, token stride `2D`) bound as its two halves -- nothing is repacked; every non-innermost stride a
+whole number of 16-byte vectors (a typed `ValueError` otherwise), `page_size` a positive multiple of 16, `slot_mapping [T]` int32 or
+int64 (a negative slot writes nothing; a slot past the pool writes nothing either).
+
+**Served since 2026-10-12 -- the paged KV-cache WRITE-THROUGH** (`paged_kv_page_size > 0`, the block's `(4w)` stage: the post-RoPE
+K / V of every token into the caller's pools at `execute(k_cache=, v_cache=, slot_mapping=)`, after norm + RoPE and before the SDPA,
+which still attends over the block's own K / V; `out` bitwise the block's without it; `get_workspace_size()` unchanged; `quant`
+and `save_for_backward` with it are typed declines; a CuTe DSL below the floor is declined at `check_support`, named with the
+installed version). Validated on a Rubin development node (cc 10.7, 204 SMs; functional cells, no perf claim) at the 8 / 2 d256
+geometry, T = 512 (dense B = 2 x S = 256; packed sequences 300 / 0 / 128 / 84 -- a zero-length sequence in the packing), the
+default in-place pipeline, every 9th token padded (`-1`) on NaN-poisoned pools, int32 slots at pages 16 / 64 and int64 at 32 / 128:
+the live pool rows BITWISE the slab's post-RoPE K / V bands attention consumed and within the dense suite's bars of the
+per-sequence oracle (V at the band bar rtol 2^-7 / atol 1e-3; K at rtol 2^-7 / atol 8e-3), padded tokens unwritten, every
+unwritten slot still NaN (`test/python/gated_attention_block/cutedsl/test_block_serving_extend.py`):
+
+| form | pool layout | page 16 | page 32 | page 64 | page 128 |
+|---|---|---|---|---|---|
+| dense `[B, S, d_model]` write-through | L1 HND compact | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
+| dense | L2 NHD by strides | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
+| dense | L3 unified content row (K `+0`, V `+D`) | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
+| packed `thd=True` write-through (`B = 1, S = T` inside) | L1 HND compact | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
+| packed | L2 NHD by strides | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
+| packed | L3 unified content row | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
+
+Also validated (bf16, L3 at page 16): the other inference pipelines -- `fuse_norm_rope` (the fork-written slab; the pool's K
+within one bf16 ulp of the fp32-accumulator oracle rounded once), out-of-place Q / K / V (`inplace_qkv=False`: the compact buffers
+are the operands and the pool rows), `fuse_gate` (dense only) -- dense and, for the first two, packed; a second execute with
+another slot mapping on the same compiled block re-places every row; two launches bitwise on the pools and on `out`. The indexer
+band's raw-key pool (`index_k_raw`, `QsaSpec(index_band=True)`) is written by the same stage, bitwise `index_k_raw_view`, through
+the block's isolated stage objects; that validation did not execute the sparse attention core. The standalone sparse
+adapter's coverage is recorded separately in the index-list section below.
+
+**Served since 2026-10-13 -- the EXTEND form** (`kv_source="paged"` on a packed, bounded declaration: `thd=True, num_sequences=B_max,
+max_seq_len=token_capacity, token_capacity=T_max, paged_kv_page_size=P, kv_source="paged", geometry.causal_bottom_right=True` + the pools' and
+the block table's samples; `execute(seq_lens=, k_cache=, v_cache=, slot_mapping=, block_table=, kv_lens=)`): the step's new tokens are written
+through, then stage (4) reads EVERY sequence's K / V -- its prefix and the new tokens -- from the pools over `[0, kv_lens[b])` through
+`block_table[b]` on the bottom-right diagonal, on the sm107 f16 row's paged THD leg (the shared SM100 d256 paged / THD body compiled for
+sm_107a, CGA2, unsplit, unpacked, NATURAL, no gate, no LSE); five launches on one stream (the write ordered before the read by stream order:
+no kernel on the chain launches with programmatic dependent launch -- pinned). Validated on a Rubin development node (cc 10.7, 204 SMs;
+functional cells, no perf claim) at the 8 / 2 d256 geometry: one declaration per (dtype, layout, page) over four sequences at `T_max` 512 --
+kv_len 128 (one KV tile; `B x H_kv > 1` with it), an 84-token step over a 300-row prefix ending mid-page (kv_len 384), a PADDED entry
+(kv_len 0, the NULL block 0, no rows), a 200-token step over a 77-row prefix (kv_len 277: a tail tile, three KV tiles) -- `T_live` 412 of 512
+(pad rows at the END, slot -1), the prefix rows written by the torch reference, `isfinite(out)` on every row first, every live sequence
+within the dense suite's budget of the per-sequence oracle over its FULL history (`out` cos >= 0.999, the gated O within atol 2e-2), the new
+tokens' pool rows bitwise the slab rows attention consumed, every unaddressed pool row still its finite stale value, the NULL page untouched
+(`test/python/gated_attention_block/cutedsl/test_block_serving_extend.py`, the "EXTEND form" half):
+
+| form | pool layout | page 16 | page 32 | page 64 | page 128 |
+|---|---|---|---|---|---|
+| EXTEND `kv_source="paged"` (the paged THD read; bottom-right; bounded tokens) | L1 HND compact | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
+| EXTEND | L2 NHD by strides | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
+| EXTEND | L3 unified content row (K `+0`, V `+D`) | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
+
+Also validated (bf16): a one-sequence EXTEND with an EMPTY prefix at a tight declaration (`T_live = T_max = 384`) against the dense `B = 1`
+block on the same tokens -- the two bodies differ (the shared SM100 paged THD body vs the Rubin sibling): BITWISE on `out` and on the gated O (0 of 196 608 / 786 432 elements differ; both legs within the oracle budget, out cos 0.999995), pinned; a 512-token sequence
+as TWO chunks (300 + 212, `T_max` 320 -- a bounded declaration) on one compiled block against the single-shot dense block and the oracle,
+the pool after both chunks within the write-through's bars of the oracle's K / V over all 512 positions; the prefix-hit step on L3 with the
+prefix rows written by the torch reference through the stack's own `[..., :D]` / `[..., D:]` views and read back the same way (the layout
+proof, both directions); L1 / L2 / L3 declarations over pools holding the same values bitwise on `out`; a zero-length sequence in the
+MIDDLE of the packing and a live-Q entry over kv_len 0 with the NULL block and slot -1 (its `out` rows exactly 0, nothing written to the
+NULL block); kv_len = 128 x n_kv for n_kv in {1, 2, 3, 4, 8} and the tail twin 128 x n_kv - 37 (one tile, the ring depth, the wrap) on L2 at
+page 64; a `[:, :max_pages]` row slice of a wider block table (row stride 50) bitwise the compact table; a finite stale tail inside the last
+live page (777 vs 0) bitwise on `out`; the bounded token contract -- live rows BITWISE the tight declaration, pad rows of a sentinel-filled
+`out` EXACTLY 0 over a once-zeroed workspace (the `o` slot aliased by no other stage's scratch, pinned on the carve), a shorter second step
+leaving the previously live rows finite and the pad rows 0; two launches bitwise; with the projection GEMM driver's capture-safe route in
+the tree (`build_proj_gemm(capture_safe=True)`; the cell skips without it), the FIRST execute of a fresh declaration captured into a
+CUDA graph on a new stream with no warm-up under `set_sync_debug_mode("error")`, replayed bitwise an eager run and then replayed over the
+next chunk's lengths / tables / slots written through the captured tensors; 16 fresh processes (one launch each, under `timeout`: n_kv in {1, 2, 4, 8} x 3 seeds at kv_len = 128 x n_kv, plus the tail twins 128 x n_kv - 37 at n_kv in {1, 3, 4, 8}; B_max 2, L2, page 64) exit 0 / 124 / other = 16 / 0 / 0. `serving_envelope(geometry, dtype, device)`
+publishes the form's declines (every row reachable at declaration with the published message, pinned on the CPU) and its served verdict.
+Also executed on the same node, each through the suite's own harness and check (`test_extend_admitted_spellings_execute_within_the_budget`:
+5 / 5 within the dense suite's budget, worst `out` cos 0.999988 -- the fused pipeline -- and gated-O max|err| 3.906e-03 bf16 / 4.883e-04 f16;
+nothing widened): the five spellings the declaration admits -- the `[B]` lengths form (`cu_seqlens=False`) on the matrix packing (L1, page
+16), `fuse_norm_rope=True` (the fork-written slab the write-through reads; L2, page 32), the out-of-place Q / K / V pipeline
+(`inplace_qkv=False`, f16, L3, page 64), a FULL table row (`kv_len = max_pages x P` = 256) on a `[:, :max_pages]` slice of a wider table
+under the lengths form, and a block table WIDER than `max_pages` (`[2, 40]` at the declared row stride 50, `max_pages` 16).
+
+**Served since 2026-10-13 -- the DECODE form** (`kv_source="paged"` on a dense `[B, S_q]` declaration over `paged_kv_page_size > 0`:
+the step's tokens written through, then stage (4) over the first `kv_lens[b]` keys of every sequence's `block_table` row --
+`seq_kv_lens = kv_lens`, `seq_q_lens = None`, the batch uniform, bottom-right causal -- on the Rubin d256 DECODE tile
+(`sm107/decode_d256_f16.py`: PackGQA over the whole group, the decode split model's split-KV with fp32 partials in the block's
+workspace and one combine launch, `fuse_gate` applied IN THE COMBINE), the same tile unpacked past the packed route (one head per
+CTA, `S_q <= 32`); a wider dense step is a typed decline at declaration (the adapter serves dense half queries over paged K / V
+on the decode tile only -- the paged prefill body is the EXTEND form's). `GatedAttentionBlockFwd.serving_envelope()` is the static record
+(forms, page sizes, pool layouts, the route per `(group, S_q)`). Validated on a Rubin development node (cc 10.7, 204 SMs;
+functional cells, no perf claim; `test/python/gated_attention_block/cutedsl/test_block_serving_decode.py`) at a shrunk
+`d_model = 512` with `B = 4` batches holding one KV tile with a tail (`kv_lens` 100), the ring depth exactly (384), four tiles
+with a tail (500) and a PADDED entry (`kv_lens = 0`, block table row 0, slot -1) -- `out` within the dense suite's budget of the
+per-sequence fp32 oracle (the block on the full sequence, its last `S_q` rows; the prefix K / V of the pools ARE the oracle's bf16
+rows; cos > 0.999 on every live row, the padded entry's rows EXACTLY 0, block 0's bytes untouched), the compiled kernel pinned
+against the declared route (template, packing, split, `epilogue_gate` False):
+
+| group (`H_q / H_kv`) | `S_q = 1` | `S_q = 2` | `S_q = 3` | `S_q = 4` | `S_q = 5` | `S_q > 32` |
+|---|---|---|---|---|---|---|
+| 16 (32 / 2) | tile 16, packed, 1 unit ✅ | tile 32, packed, 1 unit ✅ | tile 32, packed, 2 units ✅ | tile 32, packed, 2 units ✅ | tile 16, UNPACKED (declared, unmeasured) ✅ | typed decline (the EXTEND form) |
+| 12 (24 / 2) | tile 16, packed, 1 unit ✅ | tile 32, packed, 1 unit ✅ | tile 32, packed, 2 units ✅ | tile 32, packed, 2 units ✅ | tile 16, UNPACKED (declared, unmeasured) ✅ | typed decline |
+| 8 (8 / 1) | tile 16, packed, 1 unit ✅ | tile 16, packed, 1 unit ✅ | tile 32, packed, 1 unit ✅ | tile 32, packed, 1 unit ✅ | tile 32, packed, 2 units (declared, unmeasured) ✅ | typed decline |
+| 6 (24 / 4) | tile 16, packed, 1 unit ✅ | tile 16, packed, 1 unit ✅ | tile 32, packed, 1 unit ✅ | tile 32, packed, 1 unit ✅ | tile 32, packed, 1 unit (declared, unmeasured) ✅ | typed decline |
+| 4 (4 / 1, the 397B TP 8 shard; 2026-10-13) | tile 16, packed, 1 unit ✅ (also at `d_model` 4096, page 64) | tile 16, packed, 1 unit ✅ | tile 16, packed, 1 unit ✅ | tile 16, packed, 1 unit ✅ | tile 32, packed, 1 unit (declared, unmeasured) ✅ | typed decline |
+| 16 (16 / 1, the 397B TP 2 shard, ONE KV head; 2026-10-13) | tile 16, packed, 1 unit ✅ (at `d_model` 4096, page 16) | the 32 / 2 row's route (declared; not re-run at 16 / 1) | same | same | same | typed decline |
+
+The CLAIMED envelope (`DecodeRoute.claimed`) is the packed tile at `S_q <= 4`; the packed route reaches `S_q = 8` at 8 / 1,
+`S_q = 10` at 24 / 4 and `S_q = 16` at 4 / 1 and the unpacked tile `S_q = 32` at every group -- routed, declared by the envelope,
+correct on the cells run, unmeasured (the serving perf cells). The pool matrix on the decode tile (the three stride patterns holding the
+same values BITWISE on `out`, each within the oracle's budget; `kv_lens` 200 / 0 / 77 / 1000 at 24 / 2, `S_q = 2`):
+
+| form | pool layout | page 16 | page 32 | page 64 | page 128 |
+|---|---|---|---|---|---|
+| DECODE `[B, S_q]` over the pools | L1 HND compact | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
+| DECODE | L2 NHD by strides | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
+| DECODE | L3 unified content row (K `+0`, V `+D`) | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
+
+Also validated: the block's form BITWISE the standalone `SdpaFwdDslSm100` on the same slab Q views / pools / table / gate at the
+same split and packing; paged == dense BITWISE (O and LSE) at the unsplit plan on the block's own operands (the padded dense
+adapter has no split); split == unsplit within the combine's derived two-term budget on the pre-gate O (max |diff| / budget
+0.26 at 32 / 2 and 0.16 at 8 / 1; the fp32 LSEs to 1e-5); the gate in the combine vs the separate gate launch at the same split
+within the stated one-rounding budget (max |diff| on O 9.766e-04 bf16 / 1.221e-04 f16 at split 2, 0.73 / 0.83 of the budget; `out` cos > 0.9999 between them);
+a block table that is a row SLICE of a wider table (row stride 37) bitwise the compact table (a block-table row slice); `kv_lens` 128 / 384 / 512 /
+1024 (one tile, the ring depth, four, eight) and an entry whose whole content is the step (`kv_lens == S_q`); the FIRST execute
+of a fresh declaration captured on a new stream with no warm-up under `set_sync_debug_mode("error")` (the capture launches
+nothing, the replay bitwise the eager run; the replay over new `kv_lens` / table / slots / inputs bitwise the eager run over them);
+`get_workspace_size()` honest (the split partials inside; a sentinel past it untouched); two launches bitwise; 12 fresh processes
+at `kv_lens = 128 x n_kv`, `n_kv` in {1, 2, 4, 8} (ok 12 / hang 0 / other 0). The tail tile
+READS the pool rows past `kv_lens[b]` (the last page's stale rows, block 0 for unlisted pages) and masks them to `P = 0`: they
+must be FINITE, as a zero-initialized cache's are (a NaN there is `0 x NaN` -- the suite's pools carry a finite sentinel).
+
+**Pinned 2026-10-13 -- the Qwen3.5-397B tensor-parallel shards end to end** (16 / 1 = TP 2, 8 / 1 = TP 4 -- the serving
+deployment's shard --, 4 / 1 = TP 8; `d_model` 4096, `d_head` 256, the ONE replicated KV head from TP 4 on; the layout contract
+`test/python/gated_attention_block/cutedsl/test_layout_contract.py` pins `n_qkvg` 8704 / 4608 / 2560 -- every band a whole number of
+256 columns, so the forced 256-wide GEMM tile holds and `qkvg_tile_plan(64 / 128 / 256)` is well defined -- and the TMA norm kernel's
+fitted tile 16 / 8 / 4 rows, the 4-row tile one row per warp). Validated on a Rubin development node (cc 10.7, 204 SMs; functional
+cells, no perf claim), bf16, L1 HND pools, one cell per shard and form within the dense suite's budget (`out` cos >= 0.999, the gated
+O within atol 2e-2 on the EXTEND cells; nothing widened), each shard on the kernel block size its deployment allocates:
+
+| shard | DENSE `[B, S]` (`test_block_end_to_end.py`: B = 1, S = 512, HF-form weights; `out` cos vs the oracle on the block's weights / vs the HF-faithful fp32 `(1 + w)` oracle) | EXTEND (`test_block_serving_extend.py`: two sequences at `T_max` 256, a 100-token step over a 60-row prefix and a 156-token step over a 100-row prefix; worst `out` cos / gated-O max abs err) | DECODE (`test_block_serving_decode.py`: `S_q = 1` over `kv_lens` 100 / 384 / 500 / 0, the whole group packed per tile, the gate in the combine; `out` cos / max abs diff) |
+|---|---|---|---|
+| 16 / 1 (TP 2) | ✅ 0.999995 / 0.999987 (TMA 16-row norm tile) | ✅ page 16: 0.999994 / 7.812e-03 | ✅ page 16: 0.999988 / 2.823e-03 (tile 16, HEADS_PER_TILE 16) |
+| 8 / 1 (TP 4) | ✅ 0.999996 / 0.999988 (TMA 8-row norm tile) | ✅ page 32: 0.999994 / 3.906e-03 | ✅ page 32: 0.999988 / 1.953e-03 (tile 16, HEADS_PER_TILE 8) |
+| 4 / 1 (TP 8) | ✅ 0.999995 / 0.999988 (TMA 4-row norm tile) | ✅ page 64: 0.999995 / 3.906e-03 | ✅ page 64: 0.999987 / 1.221e-03 (tile 16, HEADS_PER_TILE 4) |
+
+Group 4 also joined the shrunk-width DECODE matrix above (4 / 1 at `d_model` 512: `S_q` 1 .. 5 vs the oracle, the declaration facts,
+the route table -- its rows of the route table); 16 / 1 rides group 16's route with one KV head (its `S_q = 1` cell above; the wider
+`S_q` are the 32 / 2 cells' route, declared and not re-run at 16 / 1); a shard's route equals its group's shrunk-width route at every
+`S_q`, pinned on the CPU. The shards' `S_q > 1` decode steps and every page / layout cell beyond the ones named are functional
+claims only -- no perf claim before the serving perf cells land.
+
+Not served (typed declines by name; each lands with its accept cell and flips this section in the same change): an LSE / a sliding window or a right band / a `QsaSpec` / another head dim on the paged forms, a dense step wider than 32 rows (the DECODE form's `decode_rows` row: the EXTEND form's packed business), `save_for_backward` / `quant` on the paged forms, e4m3 pools (`kv_cache_dtype`), the write-through folded into the projection epilogue, `quant` / `save_for_backward` together with the write-through attribute; the DECODE form's `S_q > 4` arms and every page / layout cell above are functional claims only -- no perf claim before the serving perf cells land.
+
+### SM107 d256 index-list sparse forward
+
+Frontend-only (the standalone adapter `python/cudnn/sdpa/fwd/sparse_gqa_sm107.py`), no graph form: no `sdpa` node carries a block-index list, so there is NO engine row and NO manifest slot — an
+`EngineSpec` whose `lower` cannot run would break the engine contract.  The kernel's claims live in the adapter's frozen
+`SparseCapabilities` record, spelled in the `Capabilities` vocabulary where a field exists, and its `check_support` is the
+enforcement point (the CuTe DSL `sm_107a` gate first, then every field as a typed decline).
+
+The gated attention block's `_SparseSdpa.check_support()` currently declines every `QsaSpec` attention request. The
+standalone support below does not establish sparse attention through the block; its projection, norm/RoPE and cache-write
+stages can be exercised separately.
+
+Served (bring-up body, 2026-10-08): dense BSHD f16 / bf16, d_qk = d_v = 256 exactly, one query token per work item with its
+packed query-head group (1..16 heads per KV head), caller block lists `block_ids` int32 `[B, S_q, top_k]` (contiguous, `top_k`
+a multiple of 4 in [4, 512]; the valid prefix then -1; an optional `block_lens` count, clamped on device), the open tail block
+appended on device from the token's position (top-left causal), per-batch KV lengths (`seq_kv_lens`: a 0 length is a dead
+row, `O = 0` / `LSE = -inf`), and the fused epilogue gate (`epilogue_gate=` the gate operand on the adapter:
+G in O's shape in Q's dtype at its own strides; the kernel stages
+each query's gate slice into its freed Q^T slot and writes `O * sigmoid(G)` after the dead-row select, the LSE untouched; a
+module specialization, so gated and ungated are two artifacts; the gate composes with the paged read and with THD, where it is
+the packed `[1, T_q, H, D]` operand like O).  The K / V gather map is 2-D (tokens of every batch as
+rows), so the K / V batch stride must equal `S_kv x` the token stride (or B = 1); the head stride a multiple of 64 elements,
+the token stride a multiple of 8.
+
+Paged K / V (the standalone adapter, `paged_kv=True, page_size=, block_table=, seq_kv_lens=`; 2026-10-08): K / V are page
+pools `[num_pages, H_kv, page_size, D]` -- HND compact, or NHD storage declared through the strides (the same contract as the
+dense paged tiles) -- read through one `(B, max_pages)` int32 block table (the same table for K and V); `page_size` a positive
+multiple of 4 (a 4-token block never straddles a page: one table lookup per block, hoisted into the gather warps' id step);
+`seq_kv_lens` is REQUIRED as the per-batch logical KV length (the pool has no dense extent).  A `-1` table entry and a page
+index past the table read as zero rows; the rows of a partially filled last page beyond the length (another sequence's
+tokens, or garbage) are never gathered; the open block's rows past the length are masked exactly as in the dense form.  The
+same tokens through a paged pool and through a dense tensor produce BITWISE the same `O` and `LSE` (validated on Rubin at
+page 16 / 64 / 48, NHD and HND, bf16 and f16, B = 2 with different lengths and lists). The gated attention block's sparse
+paged-READ mode (`QsaSpec` with `block_table` / `kv_lens` at `execute`) stays a typed decline.
+
+Served since 2026-10-08, standalone adapter only (`thd=True`): packed THD sequences — Q / O `[1, T_q, H, 256]`, K / V `[1, T_kv,
+H_kv, 256]` (capacities; the live totals are device values), `block_ids` `[T_q, top_k]` with ids RELATIVE TO THEIR SEQUENCE,
+`seq_q_lens` and `seq_kv_lens` as per-sequence lengths `[B]` or cumulative `[B + 1]` (`cu_seq_q_lens` / `cu_seq_kv_lens`), LSE
+`(1, H, T_q)`, a `workspace` of `scratch_workspace_bytes()` for the shared THD metadata (`[seq_kv_lens | cu_q | cu_k | remap |
+live | ctr]`, written by the dense forwards' setup launch); the kernel runs the persistent claim-counter scheduler (one unit per
+packed token per KV head, the gather row carries `cu_k[b]`); a sequence with `S_kv_b = 0` is dead (`O = 0` / `LSE = -inf`
+stored), an empty sequence contributes no work, a one-sequence packing is bitwise the dense `B = 1` run. The gated attention
+block separately declines sparse THD under `QsaSpec`, as it does every sparse attention form. `thd=True` together with
+`paged_kv=True` is a typed decline (the packed sequence's K / V row offset `cu_k[b]`
+composes with a dense `[1, T_kv, H_kv, D]` tensor only, never with a page pool; the combination lands with its own accept cells
+when a serving stack asks for it).
+
+Served since 2026-10-08, standalone adapter only -- the DECODE FORM (`bottom_right=True`, `list_per_sequence=True`,
+`split_kv=S`; three `TemplateParams` arms of the same kernel, each a `const_expr` fold: the dense rendering traces the same
+program as before): the serving step's `S_q <= 4` rows per sequence sit at the END of the sequence (`bottom_right=True`: row `j`
+of sequence `b` is at position `kv_len_b - S_q + j`; a sequence shorter than the query count makes the rows with a negative
+position dead -- `O = 0` / `LSE = -inf`; also served with per-token lists), share ONE block list (`list_per_sequence=True`:
+`block_ids` int32 `[B, top_k]`, `block_lens` `[B]` or None) anchored at the step-0 position `kv_len_b - S_q` -- the count comes
+from it and the appended tail runs from the step-0 tail start to the row's own position, so the block completed between step 0
+and the row stays visible, its own token included (the MTP shared-list semantics; the oracle is `qsa_visible_mask(..., pos0=)`) --
+and `split_kv=S` (2 <= `S` <= `ceil((top_k + 1) / 32)` = 17 at `top_k` 512) cuts every item's tiles into `S` chunks, each its own
+work item (grid `S_q x S` per (sequence, KV head)) writing fp32 O / natural-log LSE partials into the caller's `workspace`
+(`scratch_workspace_bytes()`: the two split-major slabs, 16-byte aligned, plus a final-LSE scratch when no LSE is declared),
+reduced by `sm100/split_combine.py` into O / LSE as a second launch on the same stream (an empty chunk is a dead item: an identity
+partial, never residue); a split with the gate operand compiles the UNGATED kernel and the GATED combine (`O *= sigmoid(G)` on the
+fp32 merged value: ONE rounding, the fused epilogue's convention).  Dense BSHD or paged pools; never THD.  Validated on Rubin
+(dev node, functional): B in {1, 4}, S_kv in {2052, 8K, 32K}, bf16 and f16, page 16 HND / 64 NHD BITWISE the dense read at the
+same split, splits 1 / 2 / 3 / 4 / 8 / 17 within the budget vs the oracle and split == unsplit within the derived two-term budget
+(one output ulp + the half P quantisation), a dead sequence's partials exactly the combine's identity, the paged open block's
+rows past the length masked (NaN fill == other-sequence fill == dense), the MTP rows at `S_q` 2 / 4 against the step-0-anchored
+oracle (and differing from the per-row-tail reading on the `4k + 3` row).  The gated attention block's sparse decode mode (`kv_lens` /
+`block_table` / `slot_mapping` / pools through `_SparseSdpa`) stays a typed decline.
+
+Not served (typed declines by name; each lands with its accept cell and flips this section in the same change): any sparse
+attention through the gated attention block (`QsaSpec`, including dense, THD, paged-read and decode), THD and paged pools in
+one standalone declaration, any of the decode form's three
+arms under THD, a shared list at `S_q > 4`, a split past the item's tile count, the kernel's own epilogue gate under a split (the
+combine carries it), a sink, a sliding window / band, Q-length trimming of a dense batch, log2 stats, a pure caller list without
+the tail, head dims other than 256, FP8 / MXFP8.
