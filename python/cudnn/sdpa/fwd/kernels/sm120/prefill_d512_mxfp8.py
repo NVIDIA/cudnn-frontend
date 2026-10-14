@@ -3,11 +3,10 @@
 
 """Block-scaled MXFP8 SDPA for SM120/SM121 with independent head dimensions in (256, 512].
 
-The d512 variant of ``sm120/prefill_mxfp8.py``, on the warp layout of
-``sm120/prefill_d512_fp8.py``: a 64-query-row, 64-key tile uses eight compute
-warps. Two warps share each 16-row query slab: each forms a 256-column partial
-QK dot, then exchanges fp32 scores before softmax and accumulates its own
-256-column output half. Both products use the block-scaled
+A 64-query-row, 64-key tile uses eight compute warps. Two warps share each
+16-row query slab: each forms a 256-column partial QK dot, then exchanges fp32
+scores before softmax and accumulates its own 256-column output half. Both
+products use the block-scaled
 ``mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32``
 (``tile_dsl.mma.mma_m16n8k32_mxf8_f32``).
 
@@ -17,10 +16,10 @@ device metadata. All Q fragments reside in registers; K/V tiles consume
 64 KiB of shared memory and the partial-score exchange consumes 32 KiB.
 The output epilogue reuses the exchange storage in two rounds.
 
-The quantization contract matches ``sm120/prefill_mxfp8.py``: Q/K/V arrive
-pre-quantized e4m3/e5m2 with one E8M0 scale per 32 elements (Q/K along D,
-V along S) in the F8_128x4 atom order, there are no per-tensor descales, and P
-takes the unit block scale with a fixed 2**4 cast bias whose inverse scales O.
+Q/K/V arrive pre-quantized e4m3/e5m2 with one E8M0 scale per 32 elements
+(Q/K along D, V along S) in the F8_128x4 atom order, there are no per-tensor
+descales, and P takes the unit block scale with a fixed 2**4 cast bias whose
+inverse scales O.
 A warp's 256-column head-dim half spans two 128-column scale planes:
 - Q scales: one 32-bit word (four D blocks) per plane per lane, loaded from
   GMEM once per unit (lane ``t`` holds row ``t // 4 + 8 * (t % 2)`` of its
@@ -77,6 +76,7 @@ from cudnn.sdpa.fwd.kernels.thd_helpers import (
 from cudnn.sdpa.fwd.kernels.sm120._common import (
     SCHED_L2_BUDGET_BYTES,
     ceil_div,
+    mxfp8_sf_coords,
     nvvm_threadquad_reduction_max,
     nvvm_threadquad_reduction_sum,
 )
@@ -109,8 +109,7 @@ PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams(d
 # before the finalize paths (sink mix, rcp, LSE, zero-row guards run on
 # bit-identical true sums); the O leg's 2^4 is cancelled by O_SCALE.
 P_CAST_LOG2_SCALE = 4.0
-# The O factor, a runtime ``o_scale`` argument rather than a folded constant
-# (as in sm120/prefill_mxfp8.py).
+# The O factor, which the epilogue reads as the runtime ``o_scale`` argument.
 O_SCALE = 2.0**-P_CAST_LOG2_SCALE
 # MXFP8 SF constants -- E8M0 scale factor, 32 elems share one SF (the K of one
 # block-scaled m16n8k32 MMA).
@@ -451,8 +450,7 @@ class SM120FusedMultiHeadAttentionForward:
                 dst = k_sf_stage.data_ptr() + half * self.k_sf_stage_half_bytes
                 src = k_sf_src + half * (HALF_SF_PLANES * SF_ATOM_BYTES) + lane * 16
                 prims.cp_async_shared_global(dst + lane * 8, src, 8, "ca")
-                # A 3-plane tile has no fourth plane: half 1 stages none.
-                if cutlass.const_expr((half * HALF_SF_PLANES + 1) * SF_ATOM_BYTES < self.qk_sf_tile_bytes):
+                if cutlass.const_expr(self._qk_plane_present(half, 1)):
                     prims.cp_async_shared_global(dst + self.k_sf_stage_hi_off + lane * 4, src + SF_ATOM_BYTES, 4, "ca")
             prims.cp_async_mbarrier_arrive(mbar, noinc=True)
         if prims.elect_sync():
@@ -541,6 +539,22 @@ class SM120FusedMultiHeadAttentionForward:
             word = (word & mask) | (cutlass.Int32(SF_UNIT_X4) & (mask ^ cutlass.Int32(-1)))
         return word
 
+    def _qk_plane_present(self, half, lp: int):
+        """Whether warp half ``half`` has local Q/K scale plane ``lp``: a 3-plane
+        tile has no fourth plane, so half 1 lacks local plane 1."""
+        if HALF_SF_PLANES + lp < self.qk_sf_planes:
+            return True
+        return half == 0
+
+    @cute.jit
+    def _load_qk_sf_word(self, ptr, half, lp: cutlass.Constexpr[int]) -> cutlass.Int32:
+        """The Q/K scale word at ``ptr``; zero-filled blocks and absent planes take
+        the unit scale."""
+        word = cutlass.Int32(SF_UNIT_X4)
+        if self._qk_plane_present(half, lp):
+            word = ptr.load(count=4, alignment=4).bitcast(cutlass.Int32)[0]
+        return self._apply_qk_sf_mask(word, half, lp)
+
     @cute.jit
     def load_q_sf(
         self,
@@ -569,14 +583,9 @@ class SM120FusedMultiHeadAttentionForward:
         row_off = sf_atom_byte(q_token % SF_ATOM_ROWS, 0, base=tile * self.qk_sf_tile_bytes) + basic_params.half * (HALF_SF_PLANES * SF_ATOM_BYTES)
         for lp in cutlass.range_constexpr(HALF_SF_PLANES):
             word = cutlass.Int32(SF_UNIT_X4)
-            if cutlass.const_expr(HALF_SF_PLANES + lp < self.qk_sf_planes):
-                if q_token < basic_params.seqlen_q:
-                    word = (basic_params.sf_q_ptr + row_off + lp * SF_ATOM_BYTES).load(count=4, alignment=4).bitcast(cutlass.Int32)[0]
-            else:
-                # A 3-plane tile has no fourth plane: half 1 reads none.
-                if q_token < basic_params.seqlen_q and basic_params.half == 0:
-                    word = (basic_params.sf_q_ptr + row_off + lp * SF_ATOM_BYTES).load(count=4, alignment=4).bitcast(cutlass.Int32)[0]
-            q_sf[lp] = self._apply_qk_sf_mask(word, basic_params.half, lp)
+            if q_token < basic_params.seqlen_q:
+                word = self._load_qk_sf_word(basic_params.sf_q_ptr + row_off + lp * SF_ATOM_BYTES, basic_params.half, lp)
+            q_sf[lp] = word
         return q_sf
 
     @cute.jit
@@ -610,13 +619,7 @@ class SM120FusedMultiHeadAttentionForward:
         for nh in cutlass.range_constexpr(2):
             for kfp_lo in cutlass.range_constexpr(2):
                 line = base + (kfp_lo * 16 + nh * 8) * 16
-                word = cutlass.Int32(SF_UNIT_X4)
-                if cutlass.const_expr(HALF_SF_PLANES + 1 < self.qk_sf_planes):
-                    word = line.load(count=4, alignment=4).bitcast(cutlass.Int32)[0]
-                elif basic_params.half == 0:
-                    # A 3-plane tile has no fourth plane: half 1 reads none.
-                    word = line.load(count=4, alignment=4).bitcast(cutlass.Int32)[0]
-                k_sf[(2 + nh) * kfp_count + kfp_lo + 2] = self._apply_qk_sf_mask(word, basic_params.half, 1)
+                k_sf[(2 + nh) * kfp_count + kfp_lo + 2] = self._load_qk_sf_word(line, basic_params.half, 1)
 
     @cute.jit
     def load_k_sf_staged(
@@ -639,13 +642,7 @@ class SM120FusedMultiHeadAttentionForward:
                 pair = (line_lo + row * 8).load(count=8, alignment=8).bitcast(cutlass.Int32)
                 for q in cutlass.range_constexpr(2):
                     k_sf[nh * kfp_count + kfp_lo + 2 * q] = self._apply_qk_sf_mask(pair[q], basic_params.half, 0)
-                word = cutlass.Int32(SF_UNIT_X4)
-                if cutlass.const_expr(HALF_SF_PLANES + 1 < self.qk_sf_planes):
-                    word = (line_hi + row * 4).load(count=4, alignment=4).bitcast(cutlass.Int32)[0]
-                elif basic_params.half == 0:
-                    # A 3-plane tile has no fourth plane: half 1 reads none.
-                    word = (line_hi + row * 4).load(count=4, alignment=4).bitcast(cutlass.Int32)[0]
-                k_sf[(2 + nh) * kfp_count + kfp_lo] = self._apply_qk_sf_mask(word, basic_params.half, 1)
+                k_sf[(2 + nh) * kfp_count + kfp_lo] = self._load_qk_sf_word(line_hi + row * 4, basic_params.half, 1)
 
     @cute.jit
     def load_q_tile_tma(
@@ -1056,11 +1053,13 @@ class SM120FusedMultiHeadAttentionForward:
             col = d_frag_pair * 16 + nh * 8
             block = kv_sf_row0 // BLOCK_SCALE_BLOCK_SIZE + v_frag
             sf_off = sf_atom_byte(col % SF_ATOM_ROWS + lane // 4, block, base=(col // SF_ATOM_ROWS) * SF_ATOM_BYTES)
-            sf = cutlass.Int32((v_sf_half_base + sf_off).load(count=1, alignment=1)[0])
+            sf = cutlass.Int32(SF_UNIT_X4 & 0xFF)
+            col_valid = True
             if cutlass.const_expr(col >= head_dim_v_hi):
-                # A pad D column of half 1 (d_v is a multiple of 16, so each 8-column group is wholly
-                # valid or wholly pad): its V data is TMA zero-fill, and its stored scale byte may encode NaN.
-                sf = sf if half == 0 else cutlass.Int32(SF_UNIT_X4 & 0xFF)
+                # A pad D column of half 1 skips its scale byte (NaN or never copied).
+                col_valid = half == 0
+            if col_valid:
+                sf = cutlass.Int32((v_sf_half_base + sf_off).load(count=1, alignment=1)[0])
             if cutlass.const_expr(v_sf_valid_blocks is not None):
                 sf = sf if block < v_sf_valid_blocks else cutlass.Int32(SF_UNIT_X4 & 0xFF)
             return sf
@@ -1557,43 +1556,8 @@ class SM120FusedMultiHeadAttentionForward:
         if cutlass.const_expr(self.thd_varlen):
             tma_batch_idx = cutlass.Int32(0)
 
-        # Scale-tile coordinates of this (sequence, head). Dense scale tensors
-        # are (B, H, tiles, tile_bytes); THD packs each sequence's tiles along
-        # the tile axis of a batch-1 view, after every earlier sequence's
-        # ceil(len / 128) tiles (Q and K/V each count their own lengths).
-        sf_q_bh0 = batch_idx * num_heads_q
-        sf_kv_bh0 = batch_idx * num_heads_kv
-        sf_q_tile0 = cutlass.Int32(0)
-        sf_kv_tile0 = cutlass.Int32(0)
-        if cutlass.const_expr(self.thd_varlen):
-            sf_q_bh0 = cutlass.Int32(0)
-            sf_kv_bh0 = cutlass.Int32(0)
-            n_batch_meta = (seq_kv_lens.shape[0] - 4) // 4
-            meta_sf = cutlass.make_array_view(seq_kv_lens)
-            # The lanes split the earlier sequences and a butterfly sums their tile counts, so a unit
-            # reads ceil(batch_idx / 32) sequences' lengths per lane rather than batch_idx.
-            for prev in cutlass.range(lane, batch_idx, cute.arch.WARP_SIZE, unroll=1):
-                len_q_prev = cutlass.Int32(meta_sf[n_batch_meta + prev + 1]) - cutlass.Int32(meta_sf[n_batch_meta + prev])
-                len_kv_prev = cutlass.Int32(meta_sf[2 * n_batch_meta + 2 + prev]) - cutlass.Int32(meta_sf[2 * n_batch_meta + 1 + prev])
-                sf_q_tile0 = sf_q_tile0 + ceil_div(len_q_prev, SF_ATOM_ROWS)
-                sf_kv_tile0 = sf_kv_tile0 + ceil_div(len_kv_prev, SF_ATOM_ROWS)
-            for i in cutlass.range_constexpr(5):
-                sf_q_tile0 = sf_q_tile0 + prims.shfl_sync(thread_mask=0xFFFFFFFF, val=sf_q_tile0, offset=16 >> i, mask_and_clamp=0x1F, kind=prims.Shfl.BFLY)
-                sf_kv_tile0 = sf_kv_tile0 + prims.shfl_sync(thread_mask=0xFFFFFFFF, val=sf_kv_tile0, offset=16 >> i, mask_and_clamp=0x1F, kind=prims.Shfl.BFLY)
-        sf_kv_tiles = cutlass.Int32(sf_k.shape[2])
-        # Dense V planes sit a whole plane of B * H_kv * tiles atoms apart;
-        # THD keeps the planes of one tile contiguous.
-        v_sf_tile_stride = self.v_sf_tile_bytes if cutlass.const_expr(self.thd_varlen) else SF_ATOM_BYTES
-        v_sf_plane_stride = cutlass.Int64(SF_ATOM_BYTES)
-        if cutlass.const_expr(not self.thd_varlen):
-            v_sf_plane_stride = cutlass.Int64(sf_v.shape[0]) * cutlass.Int64(sf_v.shape[1]) * cutlass.Int64(sf_v.shape[2]) * SF_ATOM_BYTES
-        sf_coords = SimpleNamespace(
-            k_ptr=sf_k.iterator.raw_ptr(),
-            v_ptr=sf_v.iterator.raw_ptr(),
-            # First K/V scale tile of this (sequence, KV head).
-            kv_tile_base=(cutlass.Int64(sf_kv_bh0) + cutlass.Int64(kv_head_idx)) * sf_kv_tiles + sf_kv_tile0,
-            v_tile_stride=v_sf_tile_stride,
-            v_plane_stride=v_sf_plane_stride,
+        sf_coords = mxfp8_sf_coords(
+            sf_q, sf_k, sf_v, seq_kv_lens, batch_idx, kv_head_idx, num_heads_q, num_heads_kv, lane, self.v_sf_tile_bytes, self.thd_varlen
         )
         # /////////////////////////////////////////////////////////////////////////////
         #  COMPUTE (every warp)
@@ -1667,10 +1631,10 @@ class SM120FusedMultiHeadAttentionForward:
             k_envelope=k_envelope,
             v_envelope=v_envelope,
             q_head_base=q_head_base,
-            sf_q_ptr=sf_q.iterator.raw_ptr(),
-            sf_q_bh0=sf_q_bh0,
-            sf_q_tiles=cutlass.Int32(sf_q.shape[2]),
-            sf_q_tile0=sf_q_tile0,
+            sf_q_ptr=sf_coords.q_ptr,
+            sf_q_bh0=sf_coords.q_bh0,
+            sf_q_tiles=sf_coords.q_tiles,
+            sf_q_tile0=sf_coords.q_tile0,
             sf_coords=sf_coords,
         )
         mma_params = SimpleNamespace(

@@ -161,10 +161,10 @@ def _case(
         cgas = dict(caps.cgas_by_d_shape).get((d, dv), caps.cgas)
         tile_m, tile_n = max(caps.tile_ms), max(caps.tile_ns)
         if arch == "sm120":
-            # The SM120 kernel table narrows the row's tiles per head dims (D=256 MXFP8: 64-key tiles only).
+            # The SM120 kernel table narrows the row's tiles per head dims (the d512 flavor has one tile).
             from cudnn.sdpa.fwd.config_sm120 import tile_domain
 
-            tile_m, tile_n = max(tile_domain(d, dv, fp8=True, mxfp8=True))
+            tile_m, tile_n = max(tile_domain(d, dv, fp8=True))
         knobs = SdpaFwdKnobs(tile_m=tile_m, tile_n=tile_n, cga=max(cgas), split_kv=split_kv, sched_policy=0, pack_gqa=False)
         g.create_execution_plan(family.offered_ids()[name], knobs)
     else:

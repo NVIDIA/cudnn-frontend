@@ -83,6 +83,8 @@ from cudnn.sdpa.fwd.config_sm120 import (
     TemplateParams as Sm120TemplateParams,
     D256_FLAVOR as _SM120_D256_FLAVOR,
     D512_FLAVOR as _SM120_D512_FLAVOR,
+    head_tiles as _sm120_head_tiles,
+    kv_tile_preference as _sm120_kv_tile_preference,
     pick_flavor as _sm120_pick_flavor,
     smem_bytes as _sm120_smem_bytes,
     tile_domain as _sm120_tile_domain,
@@ -4213,8 +4215,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
     masks and length-tensor / sink / THD presence specialize every path. Legacy
     tensor entries additionally specialize dense batch and sequence extents.
     ``tile_m`` / ``tile_n`` are honored on every template within its kernel
-    table (``config_sm120.tile_domain``); left unset, each runs the largest KV
-    tile of that table that fits SMEM.
+    table (``config_sm120.tile_domain``); left unset, each runs the first KV
+    tile of ``config_sm120.kv_tile_preference`` in that table that fits SMEM.
     """
 
     def _initialize_implementation(self) -> None:
@@ -4385,11 +4387,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             f"D_V ({d_v}) must be a multiple of 8 (TMA 16-byte global-stride rule at 2 B/elem) and <= {head_tile_max}{above_cap}",
         )
         # The kernel table bounds the CTA tiles (d512: one tile, D512_TILE in
-        # f16/bf16 and FP8_D512_TILE in FP8/MXFP8; MXFP8 on 256-column Q/K and V
-        # head tiles: 64-key KV tiles only). An unset
+        # f16/bf16 and FP8_D512_TILE in FP8/MXFP8). An unset
         # tile_m takes the flavor's Q tile here so the checks below see it; the
         # KV tile is picked by SMEM fit further down.
-        self._tile_domain = _sm120_tile_domain(int(d_q), int(d_v), self._fp8, mxfp8=self._fp8 and not self._pertensor)
+        self._tile_domain = _sm120_tile_domain(int(d_q), int(d_v), self._fp8)
         if self.tile_m is None and not any(m == self.q_tile for m, _ in self._tile_domain):
             self.q_tile = max(m for m, _ in self._tile_domain)
         if self.pack_gqa:
@@ -4478,9 +4479,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         # General head dims round to the dtype's granule. The SMEM model also
         # promotes envelope-served dimensions to their flavor's fixed tiles;
         # TMA zero-fills the pad columns in those full-sized allocations.
-        granule = _SM120_FP8_HEAD_TILE_GRANULE if self._fp8 else _SM120_HEAD_TILE_GRANULE
-        d_qp = -(-d_q // granule) * granule
-        d_vp = -(-d_v // granule) * granule
+        d_qp, d_vp = _sm120_head_tiles(d_q, d_v, _SM120_FP8_HEAD_TILE_GRANULE if self._fp8 else _SM120_HEAD_TILE_GRANULE)
 
         def _smem_bytes(kv_tile: int) -> int:
             # FP8 stages a byte per KV element but still writes O in half; MXFP8
@@ -4490,8 +4489,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             )
 
         if self.tile_n is None:
-            # Pick the largest KV tile in the kernel table that fits this device.
-            self.kv_tile = next((t for t in _SM120_KV_TILES if (self.q_tile, t) in self._tile_domain and _smem_bytes(t) <= smem_capacity_bytes), self.kv_tile)
+            # Pick the fastest KV tile in the kernel table that fits this device.
+            kv_tiles = _sm120_kv_tile_preference(d_q, mxfp8=self._fp8 and not self._pertensor)
+            self.kv_tile = next((t for t in kv_tiles if (self.q_tile, t) in self._tile_domain and _smem_bytes(t) <= smem_capacity_bytes), self.kv_tile)
         self._not_implemented_error_if(
             _smem_bytes(self.kv_tile) > smem_capacity_bytes,
             (

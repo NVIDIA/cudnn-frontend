@@ -42,31 +42,47 @@ F16_FLAVORS: frozenset[tuple[int, int]] = frozenset({D256_FLAVOR, D512_FLAVOR})
 FP8_FLAVORS: frozenset[tuple[int, int]] = frozenset({D512_FLAVOR})
 
 
+def head_tile(d: int, granule: int) -> int:
+    """A head dim rounded up to a whole ``granule``-column head tile."""
+    return -(-d // granule) * granule
+
+
+def head_tiles(d_qk: int, d_v: int, granule: int) -> tuple[int, int]:
+    """Both head dims rounded up to whole ``granule``-column head tiles."""
+    return head_tile(d_qk, granule), head_tile(d_v, granule)
+
+
 def pick_flavor(d_qk: int, d_v: int, fp8: bool) -> Optional[tuple[int, int]]:
     """Select the fixed-tile flavor for the head dimensions, or the general template."""
     if GENERAL_HEAD_TILE_MAX < d_qk <= D512_FLAVOR[0] and GENERAL_HEAD_TILE_MAX < d_v <= D512_FLAVOR[1]:
         return D512_FLAVOR
-    granule = FP8_HEAD_TILE_GRANULE if fp8 else HEAD_TILE_GRANULE
-    tiles = (-(-d_qk // granule) * granule, -(-d_v // granule) * granule)
+    tiles = head_tiles(d_qk, d_v, FP8_HEAD_TILE_GRANULE if fp8 else HEAD_TILE_GRANULE)
     return tiles if tiles in (FP8_FLAVORS if fp8 else F16_FLAVORS) else None
 
 
-def tile_domain(d_qk: int, d_v: int, fp8: bool, mxfp8: bool = False) -> frozenset[tuple[int, int]]:
+def tile_domain(d_qk: int, d_v: int, fp8: bool) -> frozenset[tuple[int, int]]:
     """The (q_tile, kv_tile) pairs the kernel serving these head dims is built for.
 
     The d512 flavor has one tile; the general and d256 templates take any Q tile
-    with a 128- or 64-key KV tile, except MXFP8 (``mxfp8``) at (256, 256) head
-    tiles, which takes only the 64-key tile: the 128-key tile's S fragments do
-    not fit the compute warps' registers beside a D=256 O and Q, and spill.
-    The ranking and the adapter intersect their SMEM fit with this set, so no
-    tile is proposed that declines at build.
+    with a 128- or 64-key KV tile. The ranking and the adapter intersect their
+    SMEM fit with this set, so no tile is proposed that declines at build.
     """
     if pick_flavor(d_qk, d_v, fp8) == D512_FLAVOR:
         return frozenset({FP8_D512_TILE if fp8 else D512_TILE})
-    kv_tiles = GENERAL_KV_TILES
-    if mxfp8 and (-(-d_qk // FP8_HEAD_TILE_GRANULE) * FP8_HEAD_TILE_GRANULE, -(-d_v // FP8_HEAD_TILE_GRANULE) * FP8_HEAD_TILE_GRANULE) == D256_FLAVOR:
-        kv_tiles = (64,)
-    return frozenset((m, n) for m in SEQ_Q_TILES for n in kv_tiles)
+    return frozenset((m, n) for m in SEQ_Q_TILES for n in GENERAL_KV_TILES)
+
+
+MXFP8_KV64_MIN_HEAD_TILE_QK = 224
+
+
+def kv_tile_preference(d_qk: int, mxfp8: bool = False) -> tuple[int, ...]:
+    """KV tiles from fastest to slowest; the ranking and the adapter take the
+    first one in ``tile_domain`` that fits SMEM. Larger is faster, except MXFP8
+    Q/K head tiles of ``MXFP8_KV64_MIN_HEAD_TILE_QK`` or more, where the
+    128-key tile crowds the compute warps' registers (it spills at 256)."""
+    if mxfp8 and head_tile(d_qk, FP8_HEAD_TILE_GRANULE) >= MXFP8_KV64_MIN_HEAD_TILE_QK:
+        return (64, 128, 32)
+    return SEQ_KV_TILES
 
 
 # SMEM the SM120 parts expose to a kernel. The adapter asks cutlass for the

@@ -456,14 +456,22 @@ def test_mxfp8_sm120_o_dtype(out_dt):
 @pytest.mark.L0
 @pytest.mark.parametrize(
     "d_qk,d_v",
-    [(64, 64), (128, 128), (192, 128), (256, 256), (256, 128), (32, 32), (96, 160), pytest.param(224, 64, marks=pytest.mark.L1)],
+    [(64, 64), (128, 128), (192, 128), (256, 256), (32, 32), (96, 160), pytest.param(224, 64, marks=pytest.mark.L1)],
     ids=lambda d: str(d),
 )
 @torch_fork_set_rng(seed=17)
 def test_mxfp8_sm120_head_dims(d_qk, d_v):
-    """Native head tiles: each 32-column scale block is one k32 MMA step; D=256 spans two scale planes.
-    (256, 256) runs Q@K^T plane-major on its 64-key tile, (256, 128) pair-major on the 128-key tile."""
+    """Native head tiles: each 32-column scale block is one k32 MMA step; D=256 spans two scale planes."""
     _check(_run(1, 4, 2, 256, 384, d_qk=d_qk, d_v=d_v, sdpa_kwargs=_MASKS["causal"]), d_qk=d_qk)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("kv_tile", [64, 128], ids=lambda n: f"kv{n}")
+@pytest.mark.parametrize("d_v", [256, 128], ids=lambda d: f"dv{d}")
+@torch_fork_set_rng(seed=18)
+def test_mxfp8_sm120_d256_qk_on_both_kv_tiles(d_v, kv_tile):
+    """A 256-column Q/K head on either KV tile: plane-major Q@K^T at (256, 256) on 64 keys, pair-major otherwise."""
+    _check(_run(1, 4, 2, 256, 384, d_qk=256, d_v=d_v, tiles=(128, kv_tile), sdpa_kwargs=_MASKS["causal"]), d_qk=256)
 
 
 @pytest.mark.L0
@@ -559,6 +567,17 @@ def test_mxfp8_sm120_split_kv_graph_head_dims(d_qk, d_v):
     """Split-KV with two V scale planes (D_V = 256), asymmetric QK^T / P@V tiles and zero-padded envelope
     head dims, over a KV length off the tile grid (split-KV declines padding masks)."""
     _check(_run(1, 4, 1, 96, 1100, d_qk=d_qk, d_v=d_v, out_dt=torch.bfloat16, split_kv=2, sdpa_kwargs=_MASKS["causal"]), d_qk=d_qk)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("split_kv", [2, 3])
+@torch_fork_set_rng(seed=66)
+def test_mxfp8_sm120_split_kv_64_key_tiles(split_kv):
+    """(256, 256) 64-key tiles reuse each 128-key K/V scale copy; splits starting mid-span read their own scales."""
+    _check(
+        _run(1, 4, 4, 96, 1100, d_qk=256, d_v=256, tiles=(128, 64), out_dt=torch.bfloat16, split_kv=split_kv, sdpa_kwargs=_MASKS["causal_br"]),
+        d_qk=256,
+    )
 
 
 @pytest.mark.L0
@@ -825,10 +844,10 @@ def test_mxfp8_sm120_direct_rejects_per_tensor_descales():
 
 
 @pytest.mark.L0
-def test_mxfp8_sm120_direct_d256_takes_64_key_tiles():
-    """Head dims that pad to (256, 256) resolve to a 64-key KV tile, and an explicit 128-key tile declines;
-    narrower head dims keep the 128-key default."""
+def test_mxfp8_sm120_direct_d256_admits_both_kv_tiles():
+    """(256, 256) heads accept an explicit tile_n of 64 or 128; an unset one picks a kernel-table tile."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+    from cudnn.sdpa.fwd.config_sm120 import tile_domain
 
     def _api(d_qk, d_v, **kw):
         q, k = (torch.zeros(1, 128, 4, d_qk, device="cuda").to(torch.float8_e4m3fn).transpose(1, 2) for _ in range(2))
@@ -837,12 +856,11 @@ def test_mxfp8_sm120_direct_d256_takes_64_key_tiles():
         return SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o, **kw)
 
     for d_qk, d_v in ((256, 256), (240, 240), (256, 240)):
+        for tile_n in (64, 128):
+            api = _api(d_qk, d_v, tile_n=tile_n)
+            assert api.check_support() and api.kv_tile == tile_n, (d_qk, d_v, tile_n)
         api = _api(d_qk, d_v)
-        assert api.check_support() and api.kv_tile == 64, (d_qk, d_v)
-    api = _api(224, 224)
-    assert api.check_support() and api.kv_tile == 128
-    with pytest.raises(NotImplementedError, match="no kernel"):
-        _api(256, 256, tile_n=128).check_support()
+        assert api.check_support() and (api.q_tile, api.kv_tile) in tile_domain(d_qk, d_v, fp8=True), (d_qk, d_v)
 
 
 # --- engine admission -------------------------------------------------------------------------

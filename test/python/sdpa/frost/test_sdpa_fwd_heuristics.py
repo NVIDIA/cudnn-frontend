@@ -292,20 +292,16 @@ def test_sm120_mxfp8_proposals_are_admissible_cga1_sets(d_qk, d_v):
 
 
 @pytest.mark.L0
-def test_sm120_mxfp8_d256_takes_only_64_key_tiles():
-    """MXFP8 head dims that pad to (256, 256) run only 64-key KV tiles (config_sm120.tile_domain): every
-    proposal honors it on full and underfilled grids, while per-tensor FP8 and other MXFP8 head dims keep
-    the 128-key tile."""
-    from cudnn.sdpa.fwd.config_sm120 import tile_domain
+def test_sm120_mxfp8_d256_admits_both_kv_tiles():
+    """MXFP8 (256, 256) heads admit an explicit TILE_N of 64 or 128, and every proposal is a kernel-table
+    tile that fits SMEM."""
+    from cudnn.sdpa.fwd.config_sm120 import SMEM_CAPACITY_BYTES, smem_bytes, tile_domain
 
-    for d_qk, d_v in ((256, 256), (240, 240), (256, 240)):
-        assert tile_domain(d_qk, d_v, fp8=True, mxfp8=True) == frozenset({(128, 64), (64, 64)}), (d_qk, d_v)
-    assert (128, 128) in tile_domain(256, 256, fp8=True)
-    for d_qk, d_v in ((224, 224), (256, 192), (192, 256), (128, 128)):
-        assert (128, 128) in tile_domain(d_qk, d_v, fp8=True, mxfp8=True), (d_qk, d_v)
     name = "sdpa_fwd_prefill_sm120_mxfp8"
     spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == name)
     for d_qk, d_v in ((256, 256), (240, 256)):
+        domain = tile_domain(d_qk, d_v, fp8=True)
+        assert {(128, 128), (128, 64), (64, 128), (64, 64)} <= domain, (d_qk, d_v)
         for s_q, causal in ((2048, True), (16384, False)):
             facts = _facts(
                 s_q=s_q,
@@ -323,8 +319,41 @@ def test_sm120_mxfp8_d256_takes_only_64_key_tiles():
             )
             plans = recommend("A", facts, {name: 20518})
             assert plans, (d_qk, d_v, s_q)
-            assert {p.knobs.tile_n for p in plans} == {64}, (d_qk, d_v, s_q)
-            assert all(engines.mismatch(spec.capabilities, facts, p.knobs) is None for p in plans)
+            for plan in plans:
+                assert engines.mismatch(spec.capabilities, facts, plan.knobs) is None
+                assert (plan.knobs.tile_m, plan.knobs.tile_n) in domain
+                assert smem_bytes(256, 256, plan.knobs.tile_m, plan.knobs.tile_n, itemsize=1, out_itemsize=2, mxfp8=True) <= SMEM_CAPACITY_BYTES
+            for tile_n in (64, 128):
+                assert engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(tile_m=128, tile_n=tile_n)) is None, (d_qk, d_v, tile_n)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(256, 256), (224, 224), (128, 128)], ids=lambda d: str(d))
+def test_sm120_mxfp8_packed_sets_ride_the_rule_kv_tile(d_qk, d_v):
+    """The packed GQA leg takes the tile rule's KV tile."""
+    from cudnn.sdpa.fwd.heuristics import _sm120_tiles
+
+    name = "sdpa_fwd_prefill_sm120_mxfp8"
+    spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == name)
+    facts = _facts(
+        s_q=32,
+        s_kv=8192,
+        h_q=32,
+        h_kv=4,
+        d_qk=d_qk,
+        d_v=d_v,
+        causal=True,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=cudnn.data_type.BFLOAT16,
+        is_mxfp8=True,
+        device_cc=(12, 0),
+        device_sm_count=188,
+    )
+    plans = recommend("A", facts, {name: 20518})
+    packed = [plan for plan in plans if plan.knobs.pack_gqa]
+    assert packed, "a 32-token GQA-8 graph is packing-eligible"
+    assert packed[0].knobs.tile_n == _sm120_tiles(spec.capabilities, facts)[1]
+    assert all(engines.mismatch(spec.capabilities, facts, plan.knobs) is None for plan in plans)
 
 
 @pytest.mark.L0
@@ -414,7 +443,7 @@ def test_sm120_mxfp8_d512_flavor_and_tile_contract():
     from cudnn.sdpa.fwd.config_sm120 import SMEM_CAPACITY_BYTES, pick_flavor, smem_bytes, tile_domain
 
     assert pick_flavor(512, 512, fp8=True) == (512, 512)
-    assert tile_domain(512, 512, fp8=True, mxfp8=True) == frozenset({(64, 64)})
+    assert tile_domain(512, 512, fp8=True) == frozenset({(64, 64)})
     assert smem_bytes(512, 512, 64, 64, itemsize=1, out_itemsize=2, mxfp8=True) == 101144 <= SMEM_CAPACITY_BYTES
     assert smem_bytes(272, 496, 64, 64, itemsize=1, out_itemsize=2, mxfp8=True) == 101144
     name = "sdpa_fwd_prefill_sm120_mxfp8"
