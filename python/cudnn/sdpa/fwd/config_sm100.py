@@ -181,9 +181,10 @@ class TemplateParams:
     # at the DSv3 layer) and 32 on cc 10.7 (Rubin, where the same split is -9..-10 %: an emulated
     # exp2 costs 1.99x the MUFU time it frees); cc 10.3 (B300) has the doubled rate too -- MEASURED
     # -10 % causal / -6 % dense on d192x128 FP8 with the split on.  Auto-set by the adapter from the
-    # BUILD device (api_dsl._exp2_fma_split_for: cc == (10, 0) x the four kernels above) -- widen
-    # only after an A/B on the new cc / kernel.  Off, the kernel traces the plain MUFU exp2 (the
-    # develop spelling).  Only those four kernels read it.
+    # BUILD device (api_dsl._exp2_fma_split_for: cc == (10, 0) x the four kernels above, and the d64
+    # decode tile, sm100/decode_d128_f16.py, through its own set) -- widen only after an A/B on the new
+    # cc / kernel.  Off, the kernel traces the plain MUFU exp2 (the develop spelling).  Only those
+    # kernels read it.
     exp2_fma_split: bool = False
     # sdpa(softmax_precision=cudnn.data_type.HALF) op attribute: exponent + P-cast run as
     # f16x2 pairs (MUFU EX2.F16x2 + cvt.rn.satfinite.*x2.f16x2) instead of

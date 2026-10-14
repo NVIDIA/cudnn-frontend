@@ -143,6 +143,7 @@ from cudnn.frost.tile_dsl.scheduler import (
     SCHED_NATURAL,
 )
 from cudnn.frost.tile_dsl.pointwise import (
+    exp2_mixed,
     row_reduction_pair,
     row_max_reduction,
     vec_scale_pair,
@@ -155,6 +156,7 @@ from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 from cudnn.frost.tile_dsl.mask import (
     apply_mask_chunk,
     MASK_NONE,
+    MASK_SWA,
 )
 
 # Storage dtype + MMA kind dispatch — folded at trace time on CFG.DTYPE_QKV.
@@ -250,6 +252,24 @@ _split_h = make_split_helpers(
 )
 SPLIT_KV = _split_h.SPLIT_KV
 _FP32_PARTIALS = SPLIT_KV > 1
+# exp2 split MUFU / FMA (``_E2E_*``), the d128 prefill kernel's pattern (sm100/prefill_d128_f16.py): of every _E2E_FREQ P columns the LAST _E2E_RES are
+# evaluated on the FMA pipe (``exp2_emul_pair``), the rest on MUFU.EX2.  On cc 10.0 the d64 tile's one softmax warpgroup is MUFU-bound at a long KV (16
+# EX2 per clk per SM, and the 128 rows of a tile exponentiate whether live or not), so the FMA pipe takes a quarter of every row's columns.  Gate:
+# ``PARAMS.exp2_fma_split`` (api_dsl._exp2_fma_split_for: cc 10.0 x the d64 decode tile) and ``PARAMS.decode_tile`` (the d64 flavor of this file), and not on
+# a sliding-window build (its units are one or two KV tiles: a latency chain the polynomial's dependent FMAs lengthen, with no MUFU-bound loop to relieve);
+# off, both exp2 sites trace the plain MUFU spelling and the module is IR-identical to the unsplit kernel.
+_E2E_FREQ = 16
+_E2E_RES = 4
+_E2E_CHUNK = 64  # tcgen05_ld width of one softmax chunk (see _softmax_kv_body CHUNK)
+_E2E_ENABLED = bool(PARAMS.exp2_fma_split) and bool(PARAMS.decode_tile) and (CFG.MASK_FLAGS & MASK_SWA) == 0
+
+
+def _e2e_pairs(chunk: int) -> frozenset:
+    """Pair indices (pair p = columns 2p, 2p+1 of the chunk) that ``exp2_mixed`` emulates."""
+    return frozenset(p for p in range(_E2E_CHUNK // 2) if ((chunk * _E2E_CHUNK + 2 * p) % _E2E_FREQ) >= (_E2E_FREQ - _E2E_RES))
+
+
+_E2E_PAIRS = tuple(_e2e_pairs(c) if _E2E_ENABLED else frozenset() for c in range(CFG.N_BMM2_CHUNKS))
 MAY_BE_EMPTY = _split_h.MAY_BE_EMPTY
 _decode_initial_split = _split_h.decode_initial_split
 _decode_payload_split = _split_h.decode_payload_split
@@ -1372,7 +1392,7 @@ def _softmax_kv_body(
     reg_S = reg_S * scale_log2 - total_max_safe
 
     chunk_S_0 = reg_S[0:CHUNK].vec
-    chunk_P_0 = cute.math.exp2(chunk_S_0, fastmath=True)
+    chunk_P_0 = exp2_mixed(chunk_S_0, _E2E_PAIRS[0], CHUNK)
     hoisted_sum = row_reduction_pair(chunk_P_0)
     chunk_P_0_fp16 = chunk_P_0.to(STORAGE_DTYPE)
     nvvm.tcgen05_st(
@@ -1386,7 +1406,7 @@ def _softmax_kv_body(
     deferred_P_1 = None
     if cutlass.const_expr(N_CHUNKS == 2):
         chunk_S_1 = reg_S[CHUNK : 2 * CHUNK].vec
-        deferred_P_1 = cute.math.exp2(chunk_S_1, fastmath=True)
+        deferred_P_1 = exp2_mixed(chunk_S_1, _E2E_PAIRS[1], CHUNK)
         chunk_P_1_fp16 = deferred_P_1.to(STORAGE_DTYPE)
         nvvm.tcgen05_st(
             "32x32b",

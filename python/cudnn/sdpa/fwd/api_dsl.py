@@ -482,11 +482,22 @@ def _quant_kind(fp8: bool, pertensor: bool) -> str:
     return ("fp8" if pertensor else "mxfp8") if fp8 else "f16"
 
 
-def _exp2_fma_split_for(device_cc: tuple[int, int], *, kind: str, flavor: tuple[int, int]) -> bool:
+# The d64 decode tile (``TemplateParams.decode_tile``: sm100/decode_d128_f16.py at d_flavor 64) shares its (kind, flavor) key with the d64 prefill
+# tile but is another kernel, so it claims the split in its own set: the tile's one softmax warpgroup is MUFU-bound at a long KV on cc 10.0, and the
+# FMA pipe takes a quarter of every row's exp2 columns.  MEASURED on B200 (same-node A/B/A/B, kernel time, gpt-oss d64 full attention with a sink,
+# all four tp shards): -8..-9 % from 8 sequences x 32K keys up (b=128 x 128K keys 919 -> 841 us at tp8), -3..-6 % at 2K keys, 0 at b=1 x 2K; S_q = 4
+# -4..-5 %.  The kernel folds the split out of the sliding-window builds (a unit there is one or two KV tiles: +2..+5 % at S_q >= 2).  The d128 decode
+# tile is not listed (it is HBM-bound where it is measured); the d64 prefill tile stays off (unmeasured).
+_EXP2_FMA_SPLIT_DECODE_KERNELS: frozenset[tuple[str, tuple[int, int]]] = frozenset({("f16", (64, 64))})
+
+
+def _exp2_fma_split_for(device_cc: tuple[int, int], *, kind: str, flavor: tuple[int, int], decode_tile: bool = False) -> bool:
     """``TemplateParams.exp2_fma_split`` for one build: the (quantization kind, flavor) kernels that carry the split
     AND measured a win, on a cc where it was measured (``_EXP2_FMA_SPLIT_KERNELS`` x ``_EXP2_FMA_SPLIT_CC``); False
-    everywhere else.  ``kind`` is ``_quant_kind(fp8, pertensor)``."""
-    return bool((kind, tuple(flavor)) in _EXP2_FMA_SPLIT_KERNELS and tuple(device_cc) in _EXP2_FMA_SPLIT_CC)
+    everywhere else.  ``kind`` is ``_quant_kind(fp8, pertensor)``; ``decode_tile`` selects the decode tile's own set
+    (``_EXP2_FMA_SPLIT_DECODE_KERNELS``) in place of the prefill kernels'."""
+    kernels = _EXP2_FMA_SPLIT_DECODE_KERNELS if decode_tile else _EXP2_FMA_SPLIT_KERNELS
+    return bool((kind, tuple(flavor)) in kernels and tuple(device_cc) in _EXP2_FMA_SPLIT_CC)
 
 
 def supported_cgas_for(flavor: tuple[int, int], *, fp8: bool, device_cc: tuple[int, int], pertensor: bool = True) -> tuple[int, ...]:
@@ -2586,7 +2597,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # The exp2 MUFU / FMA split is on ONLY where it was measured (cc 10.0 x the d128 MXFP8 / d128 FP8 /
         # d192x128 f16 / d192x128 FP8 kernels) -- see _exp2_fma_split_for; the kernels not listed there never
         # read the field.
-        exp2_fma_split = _exp2_fma_split_for(self._device_cc, kind=_quant_kind(self._fp8, self._pertensor), flavor=self.flavor)
+        exp2_fma_split = _exp2_fma_split_for(
+            self._device_cc, kind=_quant_kind(self._fp8, self._pertensor), flavor=self.flavor, decode_tile=self._d64_decode_tile()
+        )
         # None = the standalone-wrapper tier stated no preference: derive the
         # causal-balancing policy here. The graph path never hits this branch —
         # the heuristic emits an explicit policy (the same primary this

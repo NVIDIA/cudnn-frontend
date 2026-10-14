@@ -383,6 +383,8 @@ def _run_kernel(
     paged=True,
     seed=0,
     expect_pack_g=None,
+    native_d64=False,
+    exp2_split=False,
 ):
     """Drive sm100/decode_d128_f16.py directly (the split-KV suite's idiom).
 
@@ -394,10 +396,12 @@ def _run_kernel(
     draws).  ``has_lse=False`` compiles the Stats store out (unsplit only).
     ``pack=None`` packs whenever the group shares a factor with the 128-row
     tile (the partial-PackGQA contract the kernel carries); ``expect_pack_g``
-    pins the config's packed group.
+    pins the config's packed group.  ``native_d64`` runs the d64 flavor of the tile (``d_flavor=64, decode_tile``; ``d`` must be 64) instead of
+    the d128 envelope, with the exp2 MUFU / FMA split switched by ``exp2_split`` (what the adapter's cc 10.0 build sets).
     """
     import cutlass
     import cuda.bindings.driver as cuda_driver
+    from dataclasses import replace
 
     from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d128_decode, pack_gqa_group_size
@@ -453,12 +457,15 @@ def _run_kernel(
         qh_per_kh=G if pack else 1,
         **paged_kw,
     )
+    if native_d64:
+        assert d == 64
+        params = replace(params, d_flavor=64, decode_tile=True, exp2_fma_split=exp2_split)
     if expect_pack_g is not None:
         cfg, _ = make_cfg_d128_decode(params)
         assert cfg.PACK_G == expect_pack_g, f"PACK_G={cfg.PACK_G} for G={G}, expected {expect_pack_g}"
     mod = _load_decode(
         params,
-        tag=f"decode_test_{'p' + str(P) if paged else 'dense'}_s{splits}_g{G if pack else 1}_{dtype}_br{int(causal_br)}_w{window_left}_sk{int(has_sink)}_l2{int(stats_log2)}_q{int(q_lens is not None)}_sc{sched}_lse{int(has_lse)}",
+        tag=f"decode_test_{'p' + str(P) if paged else 'dense'}_s{splits}_g{G if pack else 1}_{dtype}_br{int(causal_br)}_w{window_left}_sk{int(has_sink)}_l2{int(stats_log2)}_q{int(q_lens is not None)}_sc{sched}_lse{int(has_lse)}_n64{int(native_d64)}_e{int(exp2_split)}",
     )
     assert mod.CGA_TILE_M == 128 and mod.CFG.STAGES_KV == 3 and mod.CFG.TOTAL_WARPS == 12
     fn = mod.compile(d_qk=d, d_v=d, has_lse=has_lse, paged_hnd=paged and hnd)
@@ -697,6 +704,41 @@ def test_decode_kernel_keyless_rows_sink_split_kv(sink):
 def test_decode_kernel_d64_envelope():
     """d=64 (gpt-oss) rides the decode tile zero-padded: real extents on the descriptors."""
     _run_kernel(3, 8, 1, 16, 20, [300, 77, 1], hnd=False, splits=1, d=64, dtype=torch.bfloat16)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("exp2_split", [False, True], ids=["all_mufu", "fma_split"])
+@pytest.mark.parametrize(
+    "splits,s_q,window",
+    [(1, 1, None), (4, 1, None), (1, 2, 128)],
+    ids=["unsplit", "split4", "sliding_window"],
+)
+def test_decode_kernel_native_d64_exp2_split(splits, s_q, window, exp2_split):
+    """The native d64 flavor of the tile (``d_flavor=64, decode_tile``) with the exp2 MUFU / FMA split folded out (every cc but 10.0) and in (the cc
+    10.0 build: a quarter of each row's P columns through ``exp2_emul_pair`` on the FMA pipe) against the same fp32 reference: a long, a short and a
+    one-token cache, one sink logit per head, the split and sliding-window forms.  The trace-time pin is the count of emulated columns -- 32 of the
+    128 a tile covers, none with the split off or on a sliding-window build (one or two KV tiles a unit: no MUFU-bound loop to relieve)."""
+    mod = _run_kernel(
+        3,
+        8,
+        1,
+        16,
+        40,
+        [600, 77, 1],
+        hnd=True,
+        splits=splits,
+        s_q=s_q,
+        causal_br=window is not None,
+        window_left=window,
+        sink=True,
+        d=64,
+        dtype=torch.bfloat16,
+        native_d64=True,
+        exp2_split=exp2_split,
+    )
+    emulated = exp2_split and window is None
+    assert mod._E2E_ENABLED is emulated
+    assert 2 * sum(len(pairs) for pairs in mod._E2E_PAIRS) == (32 if emulated else 0)
 
 
 @pytest.mark.L0
