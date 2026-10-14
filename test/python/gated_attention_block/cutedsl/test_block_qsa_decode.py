@@ -206,11 +206,13 @@ def test_declaration_facts_of_the_sparse_decode_mode(s_q, fuse_gate):
 
 def test_the_sparse_split_rule_fills_the_machine_and_stays_inside_the_item():
     """The split the sparse decode mode lowers with when ``decode_split_kv=None``: enough chunks to put one work item per SM
-    (``ceil(SMs / (B x H_kv x S_q))``), never more than the item's tile count ``ceil((top_k + 1) / 32)``, 1 for a full launch and
+    (``ceil(SMs / (B x H_kv x S_q))``), never more than the item's tile count ``ceil((top_k + 1) / 32)`` nor than the measured cap of 8
+    (the 4 x 32K x 1 split sweep on a 212-SM part: the combine's cost grows with the partial count), 1 for a full launch and
     for a non-CUDA reading (0 SMs) -- a performance choice only: the same function under every value."""
     from cudnn.gated_attention_block.api import sparse_decode_split_choice as pick
 
-    assert pick(batch=4, h_kv=2, s_q=1, top_k=512, sm_count=212) == 17  # 212 / 8 = 27 -> capped at the 17 tiles of a 512-list item
+    assert pick(batch=4, h_kv=2, s_q=1, top_k=512, sm_count=212) == 8  # 212 / 8 = 27 -> the measured cap of 8 (below the 17 tiles of a 512-list item)
+    assert pick(batch=1, h_kv=2, s_q=1, top_k=512, sm_count=212) == 8  # 2 items: the cap again
     assert pick(batch=4, h_kv=2, s_q=4, top_k=512, sm_count=212) == 7  # ceil(212 / 32)
     assert pick(batch=32, h_kv=2, s_q=4, top_k=512, sm_count=212) == 1  # 256 items: a full launch never splits
     assert pick(batch=2, h_kv=2, s_q=1, top_k=64, sm_count=212) == 3  # ceil(65 / 32) = 3 tiles at top_k 64
