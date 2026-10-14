@@ -830,6 +830,52 @@ _SASS_SM100_PINS = {
 }
 
 
+# The SM100 column's register-split row (`heuristics._REGISTER_SPLIT_HINTS_SM100`, measured on a 152-SM GB200 perf node, 2026-10-14): the c 128
+# register-form K1 picks with the plain packed epilogue run under `.minnctapersm 1` with the biases -- the split honoured (USETMAXREG 6), no spill
+# either way on sm_100a; the output stage's twin under a caller's hint, and its unhinted production rendering, beside it.  Keyed (arm, K,
+# ln_pass_form, epi_math, has_bias, min_blocks_per_mp, order, ln_once); STL / LDL are BOUNDS, USETMAXREG is exact.
+_SASS_SM100_HINT_PINS = {
+    ("k1", 128, "registers", "packed", True, 1, "major", "block"): dict(STL=0, LDL=0, USETMAXREG=6),
+    ("k3", 128, "registers", "packed", True, 1, "transpose", ""): dict(STL=0, LDL=0, USETMAXREG=6),
+    ("k3", 128, "registers", "packed", True, 0, "transpose", ""): dict(STL=0, LDL=0, USETMAXREG=0),
+}
+
+
+@pytest.mark.parametrize("arm,k,ln_pass_form,epi_math,has_bias,hint,order,ln_once", sorted(_SASS_SM100_HINT_PINS))
+def test_sm100_renderings_under_the_hint_spill_pins(tmp_path, arm, k, ln_pass_form, epi_math, has_bias, hint, order, ln_once):
+    """Trace-compile the SM100 column's hinted production rendering (and the output stage's twins) for sm_100a (no GPU): STL / LDL within the pins,
+    USETMAXREG EXACTLY the pinned value (6 = the honoured split the SM100 row buys; 0 = the unhinted twin), CGAERRBAR 0."""
+    probe = sass_utils.run_sass_probe(
+        tmp_path,
+        probe_src=sass_utils.sass_probe_source(_SASS_PROBE_BODY, _SASS_COUNTS),
+        arch="sm_100a",
+        params=dict(
+            arm=arm,
+            k=k,
+            ln_pass_form=ln_pass_form,
+            epi_math=epi_math,
+            has_bias=has_bias,
+            min_blocks_per_mp=hint,
+            pass_order=order,
+            ln_once=ln_once,
+            body_arch="sm100",
+        ),
+        tag=f"ln_dual_gemm_sm100_hint_{arm}_k{k}_{ln_pass_form}_{epi_math}_bias{int(has_bias)}_h{hint}_{order}_{ln_once or 'tile'}",
+    )
+    st = probe.stats
+    pins = _SASS_SM100_HINT_PINS[(arm, k, ln_pass_form, epi_math, has_bias, hint, order, ln_once)]
+    print(
+        f"sm100 {arm} K={k} {ln_pass_form} {epi_math} bias {has_bias} hint {hint} {order} ln_once={ln_once}: STL {st['STL']} LDL {st['LDL']} USETMAXREG {st['USETMAXREG']} "
+        f"CGAERRBAR {st['CGAERRBAR']} lines {st['LINES']} cubin {probe.cubin_md5} module {probe.expect}"
+    )
+    assert probe.expect["EXPECT_TMEM_COLS"] == 512
+    sass_utils.assert_no_new_spills(st, pins, tag=f"sm100 {arm} K={k} {ln_pass_form} {epi_math} bias {has_bias} hint {hint}: ")
+    assert (
+        st["USETMAXREG"] == pins["USETMAXREG"]
+    ), f"sm100 {arm} K={k} hint {hint}: USETMAXREG {st['USETMAXREG']} != {pins['USETMAXREG']} -- re-measure the roles and the pins"
+    assert st["CGAERRBAR"] == 0
+
+
 @pytest.mark.parametrize("arm,k,ln_pass_form,epi_math,has_bias,order,ln_once", sorted(_SASS_SM100_PINS))
 def test_sm100_rendering_spill_pins(tmp_path, arm, k, ln_pass_form, epi_math, has_bias, order, ln_once):
     """Trace-compile the sm100 body's production renderings for sm_100a (no GPU): the ring depth and TMEM columns the body resolved (6 / 4

@@ -269,6 +269,19 @@ def test_heuristics_sm100_column_is_the_measured_gb200_table():
     assert r.clc_stages == 4 and replace(r, clc_stages=base.clc_stages) == base and r.is_complete()
     assert th.resolve(1024, 128, 1, "outgoing", k2_tile=k2.DESIGN_TILE_CONFIG, cc=(10, 0)).k2_tile == k2.DESIGN_TILE_CONFIG
     assert th.k2_tile_for(1024, 128, 1, "outgoing", cc=(10, 0)) == base.k2_tile
+    # the hint rows per column: the Rubin rows for 10.7 / None (the per-tile item), the row measured on a GB200 for 10.0 / 10.3 (the SM100 column's own
+    # register-form K1 pick under the block item with the biases), nothing else hinted on either column
+    assert th.register_split_hint("k1", 128, False, "registers", "packed", "major", "") == 1
+    assert th.register_split_hint("k1", 128, False, "registers", "packed", "major", "", cc=(10, 0)) == 0
+    assert th.register_split_hint("k1", 128, False, "registers", "packed", "major", "", cc=(10, 7)) == 1
+    assert th.register_split_hint("k1", 128, True, "registers", "packed", "major", "block", cc=(10, 0)) == 1
+    assert th.register_split_hint("k1", 128, True, "registers", "packed", "major", "block", cc=(10, 3)) == 1
+    assert th.register_split_hint("k1", 128, True, "registers", "packed", "major", "block") == 0
+    assert th.register_split_hint("k3", 128, True, "registers", "packed", None, "", cc=(10, 0)) == 0
+    assert th.register_split_hint("k1", 128, True, "registers", "packed_biasfold", "major", "block", cc=(10, 0)) == 0
+    assert th.register_split_hint("k1", 128, True, "smem_rolled_pf", "packed", "major", "block", cc=(10, 0)) == 0
+    assert th.register_split_hint("k1", 128, False, "registers", "packed", "major", "block", cc=(10, 0)) == 0
+    assert th.register_split_hint("k1", 256, True, "smem_rolled_pf", "packed", "major", "block", cc=(10, 0)) == 0
 
 
 def test_autograd_is_a_typed_decline_not_a_silent_constant():

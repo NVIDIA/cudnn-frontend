@@ -463,6 +463,20 @@ _REGISTER_SPLIT_HINTS: Dict[Tuple[str, int, bool, str, str, Optional[str], str],
     ("k1", 128, True, "registers", "packed_biasfold", "major", ""): 1,
 }
 
+# THE SM100 COLUMN'S REGISTER-SPLIT ROW (compute capability 10.0 / 10.3) -- MEASURED 2026-10-14 on the same 152-SM GB200 perf node (lock 1830 MHz,
+# sampled; one exclusive GPU; the measured column as the base, the hinted twin and the seeded pick as in-process arms beside the pick, its control
+# twin, cuEq and torch; graph replay >= 100 x 3; every arm bitwise the pick and inside the API oracle): with BOTH stages under `.minnctapersm 1`
+# the c 128 REGISTER-form picks (the plain packed epilogue, the pass-major order, the block item, the biases on) run +1.56 / +1.22 % at 512 x 1,
+# +1.31 / +1.22 % at 768 x 1, +0.92 / +0.95 % at 1024 x 1, +0.87 / +0.80 % at 1536 x 1, +0.72 / +0.76 % at 2048 x 1, +1.13 / +1.23 % at 256 x 4,
+# +0.85 / +1.13 % at 384 x 4 and +0.98 / +1.04 % at 512 x 4 (incoming / outgoing; decisive on all 16 cells, bar 0.5 %), while the pipelined
+# rolled picks of the 384 bucket and the 256 bucket's incoming cell LOSE -2.98 / -3.25 % and -2.94 % hinted -- so the row names the register-form
+# K1 rendering only, and the output stage (the same transpose register rendering on every c 128 plan) stays unhinted until an arm separates its
+# share.  The sm_100a renderings under the hint: 0 / 0 spills, USETMAXREG 6, both stages; unlike Rubin, where the block item's hinted renderings
+# spill and the whole call runs faster unhinted, so the two columns' rows differ by design.
+_REGISTER_SPLIT_HINTS_SM100: Dict[Tuple[str, int, bool, str, str, Optional[str], str], int] = {
+    ("k1", 128, True, "registers", "packed", "major", "block"): 1,
+}
+
 
 def register_split_hint(
     stage: str, channels: int, has_bias: bool, ln_pass_form: str, epi_math: str, pass_order: Optional[str] = None, ln_once: str = "", cc=None
@@ -471,17 +485,16 @@ def register_split_hint(
     hidden width, bias arm, LayerNorm / epilogue form, (K1) tile order and LayerNorm work item (``ln_once``; the stage's OWN item -- the output stage's
     is ``""`` where the substrate declines a one-tile item): the MEASURED rows of :data:`_REGISTER_SPLIT_HINTS`, else 0 (the rendering as shipped;
     every row names the per-tile item -- under the LayerNorm-once item the honoured split spills and the whole call runs faster unhinted).  A
-    caller's ``TriMulKnobs(min_blocks_per_mp=...)`` overrides it for both stages.  ``cc`` (appended): every row was measured on the Rubin class, so
-    a Blackwell plan (10.0 / 10.3) reads 0 = the rendering as shipped until a GB200 A/B/A lands a row of its own."""
+    caller's ``TriMulKnobs(min_blocks_per_mp=...)`` overrides it for both stages.  ``cc`` (appended) selects the column: the Rubin rows for 10.7 /
+    ``None``, :data:`_REGISTER_SPLIT_HINTS_SM100` (the rows measured on a GB200 for the SM100 column's own register-form renderings) for 10.0 / 10.3."""
     if stage not in ("k1", "k3"):
         raise ValueError(f"stage must be 'k1' or 'k3', got {stage!r}")
-    if arch_column_for_cc(cc) != "sm107":
-        return 0
+    table = _REGISTER_SPLIT_HINTS if arch_column_for_cc(cc) == "sm107" else _REGISTER_SPLIT_HINTS_SM100
     order = (str(pass_order) if pass_order is not None else None) if stage == "k1" else None
     # the rows are keyed by RENDERING: the three packed epilogue forms differ only under `has_bias` and render ONE cubin without biases, so a
     # bias-off lookup reads the family's row (`EPI_MATHS_PACKED`); a bias-on rendering is hinted only by a row naming its EXACT form
     epm = "packed" if (not has_bias and str(epi_math) in EPI_MATHS_PACKED) else str(epi_math)
-    return _REGISTER_SPLIT_HINTS.get((stage, _nearest_width(channels), bool(has_bias), str(ln_pass_form), epm, order, str(ln_once or "")), 0)
+    return table.get((stage, _nearest_width(channels), bool(has_bias), str(ln_pass_form), epm, order, str(ln_once or "")), 0)
 
 
 def recommend(n_res: int, channels: int = 128, batch: int = 1, direction: str = "outgoing", cc=None) -> TriMulKnobs:
