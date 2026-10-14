@@ -430,9 +430,10 @@ def test_dsl_sm90_wrapper_matches_the_reference(sm100):
 
 # --- The adapter's kernel flavor (issue #378) -------
 #
-# check_support picks its template first (config_sm90.pick_flavor over the flavors that have a
-# file in api_dsl._SM90_KERNEL_FILES), then reads that flavor's tile for the tile, band and PackGQA
-# checks; compile() loads the flavor's file under a per-flavor tag. D512 is the only template.
+# check_support picks its template once, first (config_sm90.pick_flavor over the flavors that have a
+# file in api_dsl._SM90_KERNEL_FILES and own any pinned tile, given the declared features), then reads
+# that flavor's tile for the tile, band and PackGQA checks; compile() loads the flavor's file under a
+# per-flavor tag. Exact (128, 128) declarations D128 serves take D128; everything else takes D512.
 
 
 class _TemplateNamed(Exception):
@@ -453,54 +454,74 @@ def _spy_template_loads(monkeypatch):
     return loads
 
 
-def _api_at(d, h_q=8, h_kv=8, s=96, **kw):
-    """A dense SM90 adapter at head dims ``d`` (an int for D_QK == D_V, else a pair)."""
+def _api_at(d, h_q=8, h_kv=8, s=96, b=2, stats=False, **kw):
+    """A dense SM90 adapter at head dims ``d`` (an int for D_QK == D_V, else a pair), optionally with Stats."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm90
 
     d_qk, d_v = (d, d) if isinstance(d, int) else d
-    q, k, v, o = (_bhsd(2, h, s, dim, torch.float16) for h, dim in ((h_q, d_qk), (h_kv, d_qk), (h_kv, d_v), (h_q, d_v)))
-    return SdpaFwdDslSm90(q, k, v, o, **kw)
+    q, k, v, o = (_bhsd(b, h, s, dim, torch.float16) for h, dim in ((h_q, d_qk), (h_kv, d_qk), (h_kv, d_v), (h_q, d_v)))
+    lse = torch.empty(b, h_q, s, dtype=torch.float32, device="cuda") if stats else None
+    return SdpaFwdDslSm90(q, k, v, o, sample_lse=lse, **kw)
 
 
-@pytest.mark.parametrize(
-    "declared",
-    [{}, dict(has_sink=True), dict(is_causal=True, window_size_left=16), dict(seq_q_lens_present=True, seq_kv_lens_present=True)],
-    ids=["dense", "sink", "swa", "lengths"],
-)
-@pytest.mark.parametrize("d", [128, 512, (96, 128)], ids=["d128", "d512", "d96x128"])
-def test_sm90_adapter_selects_d512_until_d128_has_a_template(monkeypatch, d, declared):
-    """Every declaration, (128, 128) included, still compiles sm90/prefill_d512_f16.py under its old tag."""
+_D128_FILE, _D512_FILE = ("sm90/prefill_d128_f16.py", "sdpa_fwd_sm90_d128"), ("sm90/prefill_d512_f16.py", "sdpa_fwd_sm90_d512")
+_FLAVOR_CASES = [
+    # What D128 serves, each taking it.
+    pytest.param(128, {}, _D128_FILE, id="d128-dense"),
+    pytest.param(128, dict(is_causal=True), _D128_FILE, id="d128-causal"),
+    pytest.param(128, dict(is_causal=True, causal_bottom_right=True), _D128_FILE, id="d128-causal_br"),
+    pytest.param(128, dict(stats=True, stats_log2=True), _D128_FILE, id="d128-stats_log2"),
+    pytest.param(128, dict(h_kv=2), _D128_FILE, id="d128-gqa"),
+    pytest.param(128, dict(scale_softmax=-0.5), _D128_FILE, id="d128-negative_scale"),
+    pytest.param(128, dict(sched_policy=SCHED_LPT_L2), _D128_FILE, id="d128-lpt_l2"),
+    pytest.param(128, dict(tile_m=128, tile_n=128), _D128_FILE, id="d128-own_tile"),
+    # Vacuous bounds name no feature: a left bound at or beyond S_q + S_kv masks nothing.
+    pytest.param(128, dict(is_causal=True, window_size_left=10**6), _D128_FILE, id="d128-vacuous_window"),
+    # What D128 does not serve (config_sm90.D128_NOT_SERVED), each staying on D512.
+    pytest.param(128, dict(has_sink=True), _D512_FILE, id="d128-sink"),
+    pytest.param(128, dict(is_causal=True, window_size_left=16), _D512_FILE, id="d128-swa"),
+    pytest.param(128, dict(is_causal=True, window_size_right=8), _D512_FILE, id="d128-right_band"),
+    pytest.param(128, dict(seq_q_lens_present=True, seq_kv_lens_present=True), _D512_FILE, id="d128-lengths"),
+    pytest.param(128, dict(b=1, thd=True), _D512_FILE, id="d128-thd"),
+    pytest.param(128, dict(pack_gqa=True), _D512_FILE, id="d128-pack_gqa"),
+    pytest.param(128, dict(split_kv=2), _D512_FILE, id="d128-split"),
+    # A pinned tile names its flavor: the D512 body's 64/64 keeps a (128, 128) declaration on D512.
+    pytest.param(128, dict(tile_m=64, tile_n=64), _D512_FILE, id="d128-d512_tile"),
+    # Other head dims never take D128.
+    pytest.param(512, {}, _D512_FILE, id="d512"),
+    pytest.param((96, 128), {}, _D512_FILE, id="d96x128"),
+    pytest.param((128, 96), {}, _D512_FILE, id="d128x96"),
+]
+
+
+@pytest.mark.parametrize("d, declared, expected", _FLAVOR_CASES)
+def test_sm90_adapter_picks_d128_for_what_it_serves(monkeypatch, d, declared, expected):
+    """The flavor is decided once, in check_support, and compile() loads exactly that file under its tag."""
     loads = _spy_template_loads(monkeypatch)
     api = _api_at(d, **declared)
-    assert api.check_support() and api.flavor == (512, 512)
+    assert api.check_support() and api.flavor == ((128, 128) if expected == _D128_FILE else (512, 512))
     with pytest.raises(_TemplateNamed):
         api.compile()
-    assert loads == [("sm90/prefill_d512_f16.py", "sdpa_fwd_sm90_d512")], loads
+    assert loads == [expected], loads
 
 
-def test_sm90_adapter_reads_the_flavor_tile_and_template(monkeypatch):
-    """D512's tile and PackGQA refusals keep their messages. With the picker forced to D128 (standing
-    in for the template entry #378 step 3 adds), the same checks read D128's tile and compile() asks
-    for D128's file under its own tag."""
-    from cudnn.sdpa.fwd import api_dsl
-
-    loads = _spy_template_loads(monkeypatch)
+def test_sm90_adapter_tile_and_pack_gqa_messages_name_the_chosen_flavor(monkeypatch):
+    """A pinned 128/128 tile names the D128 template: on a (128, 128) declaration D128 does not serve it
+    is refused with the reason; at head dims D128 does not cover, and with a mixed tile, it meets D512's
+    tile refusal; D512's PackGQA refusal keeps its message."""
+    _spy_template_loads(monkeypatch)
     with pytest.raises(NotImplementedError, match="does not support tiles other than 64/64$"):
         _api_at(512, tile_m=128, tile_n=128).check_support()
+    with pytest.raises(NotImplementedError, match="does not serve attention sinks$"):
+        _api_at(128, tile_m=128, tile_n=128, has_sink=True).check_support()
+    with pytest.raises(NotImplementedError, match="does not serve split-KV$"):
+        _api_at(128, tile_m=128, tile_n=128, split_kv=2).check_support()
+    with pytest.raises(NotImplementedError, match="does not support tiles other than 64/64$"):
+        _api_at(128, tile_m=128, tile_n=64).check_support()
     with pytest.raises(NotImplementedError, match="SM90 D512 PackGQA requires a head ratio sharing a factor with tile_m=64$"):
         _api_at(512, h_q=3, h_kv=1, pack_gqa=True).check_support()
-
-    monkeypatch.setattr(api_dsl, "_sm90_pick_flavor", lambda *args: (128, 128))
-    monkeypatch.setitem(api_dsl._SM90_KERNEL_FILES, (128, 128), "sm90/prefill_d128_f16.py")
-    with pytest.raises(NotImplementedError, match="does not support tiles other than 128/128$"):
-        _api_at(128, tile_m=64, tile_n=64).check_support()
-    with pytest.raises(NotImplementedError, match="SM90 D128 PackGQA requires a head ratio sharing a factor with tile_m=128$"):
+    with pytest.raises(NotImplementedError, match="SM90 D512 PackGQA requires a head ratio sharing a factor with tile_m=64$"):
         _api_at(128, h_q=3, h_kv=1, pack_gqa=True).check_support()
-    api = _api_at(128, tile_m=128, tile_n=128)
-    assert api.check_support() and api.flavor == (128, 128)
-    with pytest.raises(_TemplateNamed):
-        api.compile()
-    assert loads == [("sm90/prefill_d128_f16.py", "sdpa_fwd_sm90_d128")], loads
 
 
 # --- The row's head-dim envelope, floored above the template's -------

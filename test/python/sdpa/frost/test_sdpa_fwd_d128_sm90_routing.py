@@ -6,11 +6,11 @@
 The SM90 row is to lower two templates for exact (128, 128) graphs, chosen by the tile knob: the
 D512 body (#2426) on its 64 x 64 tile, and a dedicated D128 template on a 128 x 128 tile that
 serves a dense subset. The row's and config_sm90's per-flavor seams are checked here on a
-SYNTHETIC row (the shipped row plus the tile domains #378 will set on it), before any D128 kernel
-exists, and on every FROST lane: no CI lane runs Hopper. The adapter's seams (its flavor pick, that
-flavor's tile, the template it loads) ask the real device and are pinned in the cc 9.0 suite,
-test_sdpa_fwd_dsl_sm90.py. The shipped row is not changed by this plumbing; its behavior is the
-SM90 suite's to pin.
+SYNTHETIC row (the shipped row plus the tile domains #378 will set on it), and on every FROST
+lane: no CI lane runs Hopper. The adapter's seams (its flavor pick, that flavor's tile, the
+template it loads) ask the real device and are pinned in the cc 9.0 suite,
+test_sdpa_fwd_dsl_sm90.py; the D128 kernel's numerics are test_sdpa_fwd_d128_sm90.py's. The
+shipped row does not offer the 128 x 128 tile yet; its behavior is the SM90 suite's to pin.
 """
 
 import dataclasses
@@ -224,6 +224,17 @@ def test_d128_refusal_and_the_picker_read_one_table():
         assert refused == (c.pick_flavor(128, 128, c.FLAVORS, declared) == c.D512_FLAVOR), (values, declared)
 
 
+def test_d128_template_refuses_at_load_what_the_picker_keeps_away():
+    """The template module validates its injected specialization on import: loading it with a sink
+    raises before any trace, so a caller that bypasses the adapter cannot run D128 on a declaration
+    it does not serve."""
+    from cudnn.sdpa.fwd import config_sm90 as c
+    from cudnn.sdpa.fwd.api_dsl import _load_kernel_template
+
+    with pytest.raises(ValueError, match="^SM90 D128 does not serve attention sinks"):
+        _load_kernel_template("sm90/prefill_d128_f16.py", dataclasses.replace(c.TemplateParams(), has_sink=True), tag="refusal_probe_sm90_d128")
+
+
 def test_d512_template_params_messages_are_unchanged():
     """validate_params' flavor argument defaults to D512, and D512's messages keep their spelling
     (the SM90 suite pins them by substring on cc 9.0; here they are pinned whole on any GPU)."""
@@ -278,3 +289,71 @@ def test_d128_template_params_accept_the_dense_subset_under_their_own_name():
         c.validate_params(dataclasses.replace(c.TemplateParams(), scale_mode=2), flavor=c.D128_FLAVOR)
     with pytest.raises(ValueError, match=r"^SM90 has no \(256, 256\) template"):
         c.validate_params(c.TemplateParams(), flavor=(256, 256))
+
+
+# --- The shared SM90 prepared host (read from source: no trace, no device) -------
+
+
+def _sm90_host_sources():
+    """The D128 and D512 templates and the prepared host they share, parsed from source."""
+    import ast
+    from pathlib import Path
+
+    from cudnn.sdpa.fwd import config_sm90 as c
+
+    root = Path(c.__file__).parent / "kernels" / "sm90"
+    return [ast.parse((root / name).read_text(encoding="utf-8")) for name in ("prefill_d128_f16.py", "prefill_d512_f16.py", "prepared_host.py")]
+
+
+def test_d128_template_fits_the_shared_sm90_prepared_host():
+    """D128 launches through D512's prepared host, so that host's contract is D128's too: both templates import the same
+    host entries and export the same PREPARED_* values, D128's ``__call__`` takes D512's parameters (the host passes
+    them positionally), D128's ``compile`` takes D512's plus at most ``persistent_ctas``, and each template sets every
+    ``kernel.<attribute>`` the host reads (in its constructor or its compile path). Read from source, so a change to the
+    shared host that D128 does not follow (as #1894's five THD origin arguments and ``kernel.thd_origins``) fails on
+    every FROST lane, not at the first Hopper compile."""
+    import ast
+
+    d128, d512, host = _sm90_host_sources()
+
+    def top(tree, kind, name):
+        return next(n for n in tree.body if isinstance(n, kind) and n.name == name)
+
+    def method(tree, name):
+        return top(top(tree, ast.ClassDef, "SM90FusedMultiHeadAttentionForward"), ast.FunctionDef, name)
+
+    def host_imports(tree):
+        module = "cudnn.sdpa.fwd.kernels.sm90.prepared_host"
+        return sorted((a.name, a.asname) for n in tree.body if isinstance(n, ast.ImportFrom) and n.module == module for a in n.names)
+
+    def exports(tree):
+        assigns = [n for n in tree.body if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name)]
+        return {n.targets[0].id: ast.literal_eval(n.value) for n in assigns if n.targets[0].id.startswith("PREPARED_")}
+
+    def call_args(tree):
+        return [a.arg for a in method(tree, "__call__").args.args]
+
+    def compile_args(tree):
+        args = top(tree, ast.FunctionDef, "compile").args
+        return [a.arg for a in args.args + args.kwonlyargs]
+
+    def set_attrs(tree):
+        """Attributes the constructor sets on self, and those the template's compile path sets on its kernel object."""
+
+        def assigned(root, owner):
+            assigns = [n for n in ast.walk(root) if isinstance(n, (ast.Assign, ast.AnnAssign))]
+            targets = [t for n in assigns for t in (n.targets if isinstance(n, ast.Assign) else [n.target])]
+            flat = [e for t in targets for e in (t.elts if isinstance(t, ast.Tuple) else [t])]
+            return {e.attr for e in flat if isinstance(e, ast.Attribute) and isinstance(e.value, ast.Name) and e.value.id == owner}
+
+        functions = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
+        return assigned(method(tree, "__init__"), "self").union(*(assigned(f, "kernel") for f in functions))
+
+    assert ("host", "_host") in host_imports(d512) and host_imports(d128) == host_imports(d512), (host_imports(d128), host_imports(d512))
+    assert exports(d512) and exports(d128) == exports(d512), (exports(d128), exports(d512))
+    assert call_args(d128) == call_args(d512), (call_args(d128), call_args(d512))
+    head, extra = compile_args(d128)[: len(compile_args(d512))], compile_args(d128)[len(compile_args(d512)) :]
+    assert head == compile_args(d512) and set(extra) <= {"persistent_ctas"}, (compile_args(d128), compile_args(d512))
+    reads = {n.attr for n in ast.walk(host) if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "kernel"}
+    assert reads and reads <= set_attrs(d512), sorted(reads - set_attrs(d512))
+    assert reads <= set_attrs(d128), f"the prepared host reads kernel.{sorted(reads - set_attrs(d128))}, which the D128 template never sets"

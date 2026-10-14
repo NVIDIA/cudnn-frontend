@@ -40,6 +40,7 @@ from cudnn.frost.tile_dsl.constants import (
 )
 from cudnn.sdpa.fwd.config_sm90 import (
     BAND_COORDINATE_LIMIT as _SM90_BAND_COORDINATE_LIMIT,
+    D128_FLAVOR as _SM90_D128_FLAVOR,
     D512_FLAVOR as _SM90_D512_FLAVOR,
     FLAVORS as _SM90_FLAVORS,
     FLAVOR_TILES as _SM90_FLAVOR_TILES,
@@ -48,6 +49,8 @@ from cudnn.sdpa.fwd.config_sm90 import (
     SCALE_ZERO as _SM90_SCALE_ZERO,
     TILE_M as _SM90_TILE_M,
     TemplateParams as Sm90TemplateParams,
+    declared_features as _sm90_declared_features,
+    d128_decline as _sm90_d128_decline,
     head_dims_mismatch as _sm90_head_dims_mismatch,
     pick_flavor as _sm90_pick_flavor,
     validate_params as _sm90_validate_params,
@@ -394,9 +397,8 @@ _SM120_FP8_KERNEL_FILES = {_SM120_D512_FLAVOR: "sm120/prefill_d512_fp8.py", None
 _SM120_MXFP8_KERNEL_FILES = {_SM120_D512_FLAVOR: "sm120/prefill_d512_mxfp8.py", None: "sm120/prefill_mxfp8.py"}
 # Keyed by kernel flavor (config_sm90.FLAVORS), as the SM120 maps above. A flavor is
 # selectable only once it has an entry here: SdpaFwdDslSm90.check_support builds the
-# config_sm90.pick_flavor pool from these keys, so every declaration runs the D512
-# body until a native flavor's template joins (D128, issue #378).
-_SM90_KERNEL_FILES = {_SM90_D512_FLAVOR: "sm90/prefill_d512_f16.py"}
+# config_sm90.pick_flavor pool from these keys.
+_SM90_KERNEL_FILES = {_SM90_D512_FLAVOR: "sm90/prefill_d512_f16.py", _SM90_D128_FLAVOR: "sm90/prefill_d128_f16.py"}
 
 
 _SM120_DTYPE_QKV_CODE = {
@@ -5574,6 +5576,13 @@ def sdpa_fwd_wrapper_dsl_sm100(
 class SdpaFwdDslSm90(SdpaFwdDsl):
     """Compile native-width SM90 forward attention over dense, packed or paged KV.
 
+    The tile knob names the template: a 128 x 128 tile the dedicated D128 template, which
+    serves exact (128, 128) dense declarations outside ``config_sm90.NOT_SERVED`` and refuses
+    the rest; a 64 x 64 tile the D512 body, which serves every head dim up to 512 and every
+    declared feature. With no tile pinned, an exact (128, 128) declaration D128 serves runs on
+    it and every other declaration on the D512 body. The choice is made once, in
+    ``check_support``.
+
     Q, K, V and O keep their declared strides: the kernel binds native TMA
     views over caller storage, with no BSHD gather. Dtype, shape, band,
     lengths, sink, Stats and the sign of ``scale_softmax`` are compile-time
@@ -5662,10 +5671,37 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
         self._value_error_if(self.window_size_right is not None and not self.is_causal, "SM90 SDPA: window_size_right requires is_causal=True")
         self._value_error_if(self.causal_bottom_right and not self.is_causal, "SM90 SDPA: causal_bottom_right requires is_causal=True")
 
-        # The template this declaration lowers onto. The pool is the flavors that have a
-        # template (_SM90_KERNEL_FILES), so D512 serves every declaration until a native
-        # flavor joins; the tile, band, PackGQA and split checks below read that flavor's tile.
-        self.flavor = _sm90_pick_flavor(d_qk, d_v, tuple(f for f in _SM90_FLAVORS if f in _SM90_KERNEL_FILES))
+        # The base's canonical band; a bound at or beyond S_q + S_kv masks nothing.
+        unpadded = not (self.thd or self.seq_q_lens_present or self.seq_kv_lens_present)
+        envelope = s_q + s_kv
+        left = None if self.window_left is None or self.window_left >= envelope else int(self.window_left)
+        right = None if self.window_right is None or self.window_right >= envelope else int(self.window_right)
+
+        # The template this declaration lowers onto, decided once. A candidate has a template
+        # (_SM90_KERNEL_FILES) and owns any pinned tile; pick_flavor takes the smallest candidate
+        # that covers the head dims and serves every declared feature, else the D512 body. A pinned
+        # tile of D128's that D128 does not serve is refused, with the reason. The tile, band,
+        # PackGQA and split checks below read the chosen flavor's tile.
+        declared = _sm90_declared_features(
+            thd=self.thd,
+            sink=self.has_sink,
+            window_left=left,
+            window_right=right,
+            lengths=self.seq_q_lens_present or self.seq_kv_lens_present,
+            pack_gqa=self.pack_gqa,
+            paged=self.paged,
+            split_kv=self.split_kv,
+        )
+        pool = tuple(
+            flavor
+            for flavor in _SM90_FLAVORS
+            if flavor in _SM90_KERNEL_FILES and self.tile_m in (None, _SM90_FLAVOR_TILES[flavor][0]) and self.tile_n in (None, _SM90_FLAVOR_TILES[flavor][1])
+        )
+        self.flavor = _sm90_pick_flavor(d_qk, d_v, pool, declared)
+        if pool and _SM90_D512_FLAVOR not in pool and self.flavor == _SM90_D512_FLAVOR and _sm90_d128_decline(d_qk, d_v) is None:
+            # At (128, 128) the pinned tile names the D128 template, refused with the feature it does not serve. Other
+            # head dims keep the D512 body and meet its tile refusal below ("tiles other than 64/64").
+            self._not_implemented_error_if(True, f"SM90 SDPA: {_sm90_d128_decline(d_qk, d_v, declared)}")
         tile_m, tile_n = _SM90_FLAVOR_TILES[self.flavor]
 
         # Well-formed declarations this engine does not serve.
@@ -5732,11 +5768,7 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
                     f"Stats: dense Stats strides {self.lse_desc.stride} are outside dense_flex (non-broadcast, non-overlapping, each covering the full pitch below it)",
                 )
 
-        # The base's canonical band; a bound at or beyond S_q + S_kv masks nothing.
-        unpadded = not (self.thd or self.seq_q_lens_present or self.seq_kv_lens_present)
-        envelope = s_q + s_kv
-        left = None if self.window_left is None or self.window_left >= envelope else int(self.window_left)
-        right = None if self.window_right is None or self.window_right >= envelope else int(self.window_right)
+        # The band, from the canonical bounds computed before the flavor choice.
         if left is None and right is None:
             band = dict(causal=False)
         else:

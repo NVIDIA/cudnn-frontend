@@ -319,8 +319,8 @@ python/cudnn/
       api_dsl.py                DSL adapters (APIBase). Arch-free filename:
                                 APIs differ by PASS (fwd vs bwd), never by
                                 sm version or head dim
-      config_sm90.py            TemplateParams + the D512 envelope check +
-                                raising validation
+      config_sm90.py            TemplateParams + flavor picker + the D512
+                                envelope check + raising validation
       config_sm100.py           TemplateParams + per-geometry Cfg + raising
                                 validation
       config_sm120.py           TemplateParams + supported SM120 tile/layout
@@ -328,8 +328,12 @@ python/cudnn/
       kernels/                  one package per ARCH LINE; everything below
                                 an arch package is owned by that arch alone
         sm90/prefill_d512_f16.py      naming: <phase>_d<dim>_<dtype-family>.py
-                                      the Hopper line's only flavor: one D512
-                                      tile over three warpgroups
+                                      the D512 body: one 64-row tile over
+                                      three warpgroups, every D up to 512 on
+                                      native 128/256/512-column storage
+        sm90/prefill_d64_f16.py       the D512 body's exact dense D64 subset
+        sm90/prefill_d128_f16.py      dedicated exact D128: 128-row tile, two
+                                      64-row compute warpgroups
         sm90/_common_hopper.py        SM90-only tile / reduction / softmax helpers
         sm100/prefill_d256_f16.py
         sm100/decode_d256_f16.py      decode-shaped alternate of the d256 flavor

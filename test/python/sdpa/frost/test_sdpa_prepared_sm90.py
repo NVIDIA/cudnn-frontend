@@ -28,17 +28,22 @@ def test_graph_never_enters_tensor_adapter(sm100, monkeypatch, thd):
         sm100.test_sdpa_fwd_dsl_sm100_graph_api(torch.float16, True, 512)
 
 
-@pytest.mark.parametrize("thd", [False, True], ids=["dense", "thd"])
+# THD at D=128 runs the D512 template (config_sm90.NOT_SERVED), so only the dense arm adds D128.
+_PREPARED_CASES = [pytest.param(False, 512, id="dense"), pytest.param(True, 512, id="thd"), pytest.param(False, 128, id="dense-d128")]
+
+
+@pytest.mark.parametrize("thd, d", _PREPARED_CASES)
 @torch_fork_set_rng(seed=0)
-def test_prepared_rebind_capture_and_no_tensor_launch(monkeypatch, thd):
+def test_prepared_rebind_capture_and_no_tensor_launch(monkeypatch, thd, d):
     """Reuse one artifact for fresh buffers and changed-input replay without tensor conversion."""
     import cutlass.cute as cute
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm90
 
-    b, h, sq, skv, d = 2, 2, 70, 100, 512
+    b, h, sq, skv = 2, 2, 70, 100
     q, k, v, o = (_bhsd(b, h, s, d, torch.float16) for s in (sq, skv, skv, sq))
     api = SdpaFwdDslSm90(q, k, v, o, thd=thd)
     api.compile()
+    assert api.flavor == (d, d), api.flavor
     spec = api._thd_spec if thd else api._dense_spec
     assert spec is not None
     assert all("tensor" not in slot for slot in spec.order)
@@ -107,7 +112,7 @@ def test_prepared_thd_rejects_smaller_batch_and_misaligned_workspace():
 
 
 @pytest.mark.parametrize("thd", [False, True], ids=["dense", "thd"])
-def test_prepared_artifact_reloads_in_fresh_process(thd, tmp_path, splits=1, pack_gqa=False):
+def test_prepared_artifact_reloads_in_fresh_process(thd, tmp_path, splits=1, pack_gqa=False, d=512):
     """Verify exported artifacts launch and replay after a new interpreter forbids JIT."""
     import json
     import os
@@ -119,7 +124,7 @@ def test_prepared_artifact_reloads_in_fresh_process(thd, tmp_path, splits=1, pac
     child = r"""
 import hashlib, json, os, sys
 from pathlib import Path
-package, thd, reload, splits, pack_gqa = sys.argv[1:]
+package, thd, reload, splits, pack_gqa, d = sys.argv[1:]
 sys.meta_path[:] = [f for f in sys.meta_path if "__editable__" not in getattr(f, "__module__", "")]
 sys.path.insert(0, str(Path(package).resolve().parent.parent))
 if os.environ.get("FE_TEST_CUDA_BINDINGS"):
@@ -134,9 +139,10 @@ if reload == "1":
         raise AssertionError("fresh-process SM90 artifact invoked JIT")
     cute.compile = forbidden
 torch.manual_seed(0)
-q, k, v, o = (torch.randn(2, 64, 2, 512, device="cuda", dtype=torch.float16).transpose(1, 2) for _ in range(4))
+q, k, v, o = (torch.randn(2, 64, 2, int(d), device="cuda", dtype=torch.float16).transpose(1, 2) for _ in range(4))
 api = SdpaFwdDslSm90(q, k, v, o, thd=thd == "1", split_kv=int(splits), pack_gqa=pack_gqa == "1")
 api.compile()
+assert api.flavor == (int(d), int(d)), api.flavor
 if reload == "1":
     assert hasattr(api._compiled_kernel, "_compiled_cache_raw")
 lens = torch.full((2,), 64, device="cuda", dtype=torch.int32)
@@ -162,7 +168,7 @@ print(json.dumps(dict(digest=digest, stats=compiled_cache.stats())))
     results = []
     for reload in (0, 1):
         result = subprocess.run(
-            [sys.executable, "-c", child, cudnn.__file__, str(int(thd)), str(reload), str(splits), str(int(pack_gqa))],
+            [sys.executable, "-c", child, cudnn.__file__, str(int(thd)), str(reload), str(splits), str(int(pack_gqa)), str(d)],
             env=env,
             cwd=tmp_path,
             capture_output=True,
@@ -175,6 +181,11 @@ print(json.dumps(dict(digest=digest, stats=compiled_cache.stats())))
     assert first["stats"]["misses"] > 0 and first["stats"]["hits"] == 0, first
     assert second["stats"]["misses"] == 0 and second["stats"]["hits"] > 0, second
     assert first["digest"] == second["digest"]
+
+
+def test_prepared_d128_artifact_reloads_in_fresh_process(tmp_path):
+    """The D128 template's artifact reloads and replays without JIT, as D512's does."""
+    test_prepared_artifact_reloads_in_fresh_process(False, tmp_path, d=128)
 
 
 @pytest.mark.parametrize("thd", [False, True], ids=["dense", "thd"])

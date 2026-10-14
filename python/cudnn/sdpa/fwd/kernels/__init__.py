@@ -19,8 +19,12 @@ both sides). ``sm120/prefill_d512_f16.py`` serves both head dims in (256, 512]
 at multiples of eight, with two warps per Q slab splitting the head dimension;
 ``sm120/prefill_d512_fp8.py`` and ``sm120/prefill_d512_mxfp8.py`` are its FP8
 and MXFP8 siblings (multiples of 16).
-``sm90/prefill_d512_f16.py`` is that line's only template: one D512 tile over
-three warpgroups, for every head dim up to it at multiples of eight.
+``sm90/prefill_d512_f16.py`` is that line's D512 body: one 64-row tile over
+three warpgroups, for every head dim up to 512 at multiples of eight, on native
+128/256/512-column storage; ``sm90/prefill_d64_f16.py`` serves its exact dense
+D64 subset. ``sm90/prefill_d128_f16.py`` is the dedicated exact (128, 128)
+template, a 128 x 128 tile taken by that tile knob or, with none pinned, by the
+dense declarations it serves (``config_sm90.pick_flavor``).
 A ``decode_`` phase is a second template for the SAME flavor and contract,
 selected by the adapter when the graph is decode-shaped:
 ``sm100/decode_d256_f16.py`` takes the f16/bf16 d256 graphs whose S_q x packed

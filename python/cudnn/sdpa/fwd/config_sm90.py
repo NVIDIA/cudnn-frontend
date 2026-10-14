@@ -3,10 +3,13 @@
 
 """Kernel-facing configuration for the FROST SM90 SDPA forward templates.
 
-One flavor ships today, the D512 body (``sm90/prefill_d512_f16.py``, with its
-native 128/256/512-column storage and the exact dense D64 body beside it);
-``pick_flavor``, ``FLAVOR_TILES`` and ``NOT_SERVED`` are the seams through which
-a dedicated D128 template joins (issue #378). The frozen ``TemplateParams``
+Two templates ship: the dedicated D128 template (``sm90/prefill_d128_f16.py``,
+issue #378), a 128 x 128 tile for the exact (128, 128) dense declarations it
+serves, and the D512 body (``sm90/prefill_d512_f16.py``, with its native
+128/256/512-column storage and the exact dense D64 body beside it) on a 64 x 64
+tile for every head dim up to 512 and every declared feature. A pinned tile
+names the template; with none pinned ``pick_flavor`` chooses once, from the head
+dims and the declared features (``NOT_SERVED``). The frozen ``TemplateParams``
 record contains only graph declarations and selected tuning knobs. Runtime
 lengths, pointers, and packed token totals stay out of compile keys.
 Graph-adapter declaration logic lives with the adapter; this module keeps the
@@ -39,10 +42,8 @@ TILE_N = 64
 # smallest first. D512 is the D512 body: every head-dim pair up to its tile
 # (head_dims_mismatch), on its native 128/256/512-column storage (head_tile) or, for
 # the exact dense D64 subset, the D64 body (native_d64_mismatch). D128 (issue #378) is
-# the dedicated 128 x 128 template for exact (128, 128) declarations; it is named here so
-# the adapter, the engine row and the tests share one spelling, and no declaration
-# selects it until its template is in the adapter's kernel-file map
-# (api_dsl._SM90_KERNEL_FILES).
+# the dedicated 128 x 128 template; it serves exact (128, 128) dense declarations outside
+# NOT_SERVED. The adapter, the engine row and the tests share these spellings.
 D512_FLAVOR = (D_TILE, D_TILE)
 D128_FLAVOR = (128, 128)
 FLAVORS = (D128_FLAVOR, D512_FLAVOR)
@@ -147,6 +148,19 @@ def pick_flavor(d_qk: int, d_v: int, flavors: tuple[tuple[int, int], ...] = (D51
         if d_qk <= flavor[0] and d_v <= flavor[1] and min(d_qk, d_v) > FLAVOR_FLOORS.get(flavor, 0):
             return flavor
     return D512_FLAVOR
+
+
+def d128_decline(d_qk: int, d_v: int, declared: frozenset[str] = frozenset()) -> str | None:
+    """Why the D128 template (SM90's 128 x 128 tile) does not serve a ``(d_qk, d_v)``
+    declaration naming ``declared``, or None: the refusal a pinned 128 tile meets where
+    ``pick_flavor`` keeps the declaration on the D512 body. The head dims first (exactly
+    (128, 128), ``FLAVOR_FLOORS``), then the first ``NOT_SERVED`` feature in table order."""
+    if pick_flavor(d_qk, d_v, FLAVORS) != D128_FLAVOR:
+        return f"SM90's 128 x 128 tile (the D128 template) serves exact (128, 128) head dims; graph has D_QK={d_qk}/D_V={d_v}"
+    for feature, label in D128_NOT_SERVED.items():
+        if feature in declared:
+            return f"SM90's 128 x 128 tile (the D128 template) does not serve {label}"
+    return None
 
 
 def dense_bind_strides(shape: tuple, strides: tuple, elem_bytes: int) -> tuple | None:

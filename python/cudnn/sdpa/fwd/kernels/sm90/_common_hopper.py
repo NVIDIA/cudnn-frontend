@@ -3,10 +3,11 @@
 
 """Shared tile, reduction, and softmax helpers for the SM90 prefill kernels.
 
-The kernel module (``prefill_d512_f16.py``) owns launch state and scheduling;
-these helpers are stateless. The MMA helpers take the tile geometry (C slots,
-k16 steps, slab rows) as keywords whose defaults are the D512 kernel's. For
-local thread ``tid``, C slot ``i`` uses row
+The kernel modules (``prefill_d512_f16.py``, ``prefill_d64_f16.py``,
+``prefill_d128_f16.py``) own launch state and scheduling; these helpers are
+stateless. The MMA helpers take the tile geometry (C slots, k16 steps, slab
+rows) as keywords whose defaults are the D512 kernel's. For local thread
+``tid``, C slot ``i`` uses row
 ``16*(tid//32) + (tid%32)//4 + 8*((i//2)%2)`` and column
 ``2*(tid%4) + i%2 + 8*(i//4)``. Helpers keep their units, fragment order, and
 caller-owned synchronization at the boundary where those details matter.
