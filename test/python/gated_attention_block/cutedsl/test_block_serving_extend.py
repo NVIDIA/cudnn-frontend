@@ -11,7 +11,9 @@ single-shot oracle on L3, L1 vs L3 bitwise, the degenerate matrix on serving buf
 block, a live-Q dead-KV entry, mid-page prefixes, tail tiles, n_kv 1 / 3 / 4 and the ring wrap, pads at the END and in the
 MIDDLE, a row-sliced block table), the admitted spellings executed (the lengths form, the fused norm + RoPE and the out-of-place
 pipelines, a full and a wider block table), the bounded-token contract (live rows bitwise the tight declaration, pad rows exactly
-0 on a sentinel-filled out over a zeroed workspace), and a CUDA-graph replay over new lengths / tables / slots.
+0 on a sentinel-filled out over a zeroed workspace), a CUDA-graph replay over new lengths / tables / slots, and the live token count
+as an execute-time host int (``num_tokens_live``: the typed rows, the live rows bitwise the capacity launch with the rows past them
+untouched, the token tensors at exactly T_live rows, the capture pinned at the captured count).
 
 The pool contract a serving stack binds: a 4-D view ``[num_pages, H_kv, P, D]`` with ``D`` contiguous and the other strides
 free -- HND compact pools, NHD storage by strides, and a stack's UNIFIED content row ``[num_pages, H_kv, P, 2D]`` whose two
@@ -1580,17 +1582,27 @@ class _ExtendHarness:
         torch.cuda.synchronize()
         return dict(q_lens=q_lens, prefix_lens=prefix_lens, kv_lens=kv_lens, t_live=t_live, rows=rows, refs=refs)
 
-    def execute(self, current_stream=None):
-        """The block's execute over the prepared state (the ONE call a serving stack captures)."""
+    def execute(self, current_stream=None, num_tokens_live=None, live_rows_inputs=False, out_live=None):
+        """The block's execute over the prepared state (the ONE call a serving stack captures).  ``num_tokens_live`` (appended) is the
+        step's live token count as the execute-time host int; ``live_rows_inputs`` hands the token tensors at EXACTLY that many rows
+        (``h[:T_live]`` / ``cos`` / ``sin`` / ``slot_mapping[:T_live]`` and ``out_live``, a separate ``[T_live, d_model]`` output) -- a
+        serving stack's ``hidden_states[rows]`` / ``output[rows]`` with no staging copy.  Without the count the call is the one every
+        other cell makes (no keyword passed, so the signature without the count serves it)."""
+        n = num_tokens_live
+        if live_rows_inputs:
+            assert n is not None and out_live is not None and int(out_live.shape[0]) == n
+            h, cos, sin, slot, out = self.inp["h"][:n], self.inp["cos"][:n], self.inp["sin"][:n], self.slot[:n], out_live
+        else:
+            h, cos, sin, slot, out = self.inp["h"], self.inp["cos"], self.inp["sin"], self.slot, self.out
         self.blk.execute(
-            self.inp["h"],
+            h,
             self.inp["w_qkvg"],
             self.inp["w_q_norm"],
             self.inp["w_k_norm"],
-            self.inp["cos"],
-            self.inp["sin"],
+            cos,
+            sin,
             self.inp["w_o"],
-            self.out,
+            out,
             self.ws,
             seq_lens=self.seq_t,
             current_stream=current_stream,
@@ -1598,7 +1610,8 @@ class _ExtendHarness:
             v_cache=self.v_cache,
             block_table=self.table,
             kv_lens=self.kv_t,
-            slot_mapping=self.slot,
+            slot_mapping=slot,
+            **({} if n is None else dict(num_tokens_live=n)),
         )
 
     def step(self, q_lens, **kw):
@@ -1972,6 +1985,214 @@ def test_extend_capture_of_the_first_execute_replays_with_new_lengths_tables_and
         rec2_e = twin.step(_SECOND_PACKING["q_lens"], prefix_lens=_SECOND_PACKING["prefix_lens"], prefill="keep", out_fill=sentinel)
         twin.check(rec2_e, label="(g) eager twin, next chunk")
         assert torch.equal(rec2["out"], rec2_e["out"]), "the replay over new lengths / tables / slots differs from the eager run over them"
+    finally:
+        graph.reset()
+
+
+# ---------------------------------------------------------------------------
+# num_tokens_live (appended): the step's live token count as an execute-time HOST int -- a plan declared at T_max launches at T_live
+# with no recompile (the block kernels take a symbolic token count); the token-indexed inputs at T_max or exactly T_live rows
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.L0
+def test_num_tokens_live_is_the_last_execute_parameter_with_default_none():
+    """The append-only rule on the public ``execute`` signature: ``num_tokens_live`` is the LAST parameter with default ``None`` (= the
+    declared capacity), so every positional caller of the serving forms is unchanged; the slot-mapping form check gained its second
+    admitted count the same way (``t_live``, appended, default None)."""
+    from cudnn.gated_attention_block.cache_write_contract import check_slot_mapping
+
+    params = list(inspect.signature(GatedAttentionBlockFwd.execute).parameters.values())
+    assert params[-1].name == "num_tokens_live" and params[-1].default is None
+    assert [p.name for p in params[-3:]] == ["slot_mapping", "index_k_raw", "num_tokens_live"]
+    slot_params = inspect.signature(check_slot_mapping).parameters
+    assert list(slot_params)[-1] == "t_live" and slot_params["t_live"].default is None
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("width", [64, 0], ids=["rope_dim_64", "rope_dim_0"])
+def test_token_rows_flatten_every_admitted_form_including_a_zero_width_rope_table(width):
+    """The row-view helper behind ``execute``'s token matrices: ``[T, w]`` / ``[1, T, w]`` / ``[B, S, w]`` flatten to ``[T, w]`` (the first
+    ``T_live`` rows under a live count), exactly ``[T_live, w]`` / ``[1, T_live, w]`` pass through, any other row count is a typed
+    ``ValueError`` naming the admitted counts -- and all of it for a width-0 table, the RMSNorm-only geometry's ``rope_dim=0`` ``cos`` /
+    ``sin`` (``[T, 0]``), whose row count a ``-1`` view cannot infer (the regression a review found on the first shape of this feature)."""
+    from cudnn.gated_attention_block.api import _token_rows
+
+    t, t_live = 8, 5
+    flat, packed, dense = torch.zeros(t, width), torch.zeros(1, t, width), torch.zeros(2, 4, width)
+    for x in (flat, packed, dense):
+        assert tuple(_token_rows(x, "cos", width, t).shape) == (t, width)
+        assert tuple(_token_rows(x, "cos", width, t, t_live).shape) == (t_live, width)
+    for x in (torch.zeros(t_live, width), torch.zeros(1, t_live, width)):
+        assert tuple(_token_rows(x, "h", width, t, t_live).shape) == (t_live, width)
+        with pytest.raises(ValueError, match=f"h must carry {t} token rows of width {width}"):
+            _token_rows(x, "h", width, t)
+    with pytest.raises(ValueError, match=r"8 \(the declared capacity\) or 5 \(num_tokens_live\) token rows"):
+        _token_rows(torch.zeros(6, width), "out", width, t, t_live)
+    with pytest.raises(ValueError, match="token matrix"):
+        _token_rows(torch.zeros(2, 2, 2, width), "h", width, t)
+    # a VIEW, never a copy (Rule 1): the flattened rows alias the caller's storage
+    assert _token_rows(dense, "cos", width, t).data_ptr() == dense.data_ptr()
+
+
+@pytest.mark.L0
+def test_num_tokens_live_is_refused_on_a_block_declared_without_token_capacity():
+    """A DENSE block and a TIGHT packed block (lengths sum to T exactly) refuse ``num_tokens_live`` BY NAME, host-side, before the plan
+    check and under ``set_sync_debug_mode("error")``: the live count belongs to the bounded form -- silently ignoring it would launch T
+    rows for a T_live-row step (and read a T_live-row ``h`` as T rows)."""
+    ws = torch.empty(16, dtype=torch.uint8, device=_DEV)
+    blk, inp, out, _ = _make_block(_SMALL_D256, 2, 64)
+    blk2, inp2, out2, meta = _make_packed_block(_SMALL_D256, _PACKED_LENS)
+    seq = torch.tensor(list(_PACKED_LENS), device=_DEV, dtype=torch.int32)
+    with _no_host_sync():
+        with pytest.raises(ValueError, match="num_tokens_live=16 belongs to a block declared with token_capacity=T_max"):
+            _exec(blk, inp, out, ws, num_tokens_live=16)
+        with pytest.raises(ValueError, match="num_tokens_live=300 belongs to a block declared with token_capacity=T_max"):
+            _exec(blk2, inp2, out2, ws, seq_lens=seq, num_tokens_live=300)
+        # None IS the call without the count: the next refusal is the plan check, as before.
+        with pytest.raises(RuntimeError, match="compile"):
+            _exec(blk, inp, out, ws, num_tokens_live=None)
+
+
+@pytest.mark.L0
+def test_num_tokens_live_rows_are_typed_and_the_slot_mapping_takes_either_count():
+    """On a DECLARED (uncompiled) bounded EXTEND block (T_max 256), host-side and typed: 0 / -1 and T_max + 1 are ``ValueError``s naming
+    the bound, a bool or a float a ``TypeError``; 1, 100 and T_max itself pass every host check (the well-formed call reaches the plan
+    check); the slot mapping may carry the declared T_max slots or EXACTLY T_live (a serving stack's ``slot_mapping[rows]``), any other
+    count is refused naming both admitted counts -- and without the live count only T_max is admitted, as before."""
+    blk, inp, out, samples = _declare_extend(3, 256, max_kv_len=512, page=16)
+    ws = torch.empty(16, dtype=torch.uint8, device=_DEV)
+    k, v, bt = samples["sample_k_cache"], samples["sample_v_cache"], samples["sample_block_table"]
+    slot = torch.full((256,), -1, device=_DEV, dtype=torch.int32)
+    base = dict(
+        seq_lens=torch.zeros(4, device=_DEV, dtype=torch.int32),
+        k_cache=k,
+        v_cache=v,
+        slot_mapping=slot,
+        block_table=bt,
+        kv_lens=torch.zeros(3, device=_DEV, dtype=torch.int32),
+    )
+    with _no_host_sync():
+        for bad, exc, match in (
+            (0, ValueError, "num_tokens_live must be >= 1"),
+            (-1, ValueError, "num_tokens_live must be >= 1"),
+            (257, ValueError, "num_tokens_live=257 exceeds the declared token_capacity=256"),
+            (True, TypeError, "num_tokens_live must be an int"),
+            (2.5, TypeError, "num_tokens_live must be an int"),
+        ):
+            with pytest.raises(exc, match=match):
+                _exec(blk, inp, out, ws, **base, num_tokens_live=bad)
+        for ok in (1, 100, 256):
+            with pytest.raises(RuntimeError, match="compile"):
+                _exec(blk, inp, out, ws, **base, num_tokens_live=ok)
+        with pytest.raises(RuntimeError, match="compile"):  # exactly T_live slots: admitted
+            _exec(blk, inp, out, ws, **{**base, "slot_mapping": slot[:100]}, num_tokens_live=100)
+        with pytest.raises(ValueError, match=r"exactly T=256 \(the declared capacity\) or T_live=100 \(num_tokens_live\) entries"):
+            _exec(blk, inp, out, ws, **{**base, "slot_mapping": slot[:101]}, num_tokens_live=100)
+        with pytest.raises(ValueError, match="exactly T=256 entries"):  # the contract without the count: only T_max
+            _exec(blk, inp, out, ws, **{**base, "slot_mapping": slot[:100]})
+
+
+@pytest.mark.L1
+@requires_rubin
+def test_extend_num_tokens_live_launches_the_live_rows_and_leaves_the_rows_past_them_untouched():
+    """The live token count as an execute-time host int, NO recompile (ONE compiled block serves every count): the matrix packing (T_live
+    412) on the bounded T_max 512 declaration with ``num_tokens_live=412`` -- (a) the live rows of ``out`` and the gated O BITWISE the
+    capacity launch (the same step without the count, whose pad rows are exactly 0 under the zeroed-workspace contract) and the pools
+    identical; (b) rows [412, 512) of a sentinel-filled ``out`` keep the SENTINEL: no stage addressed them; (c) the SAME step with the
+    token tensors handed at exactly T_live rows (``h[:412]``, ``cos`` / ``sin[:412]``, ``slot[:412]``, a separate ``[412, d_model]`` out -- a
+    serving stack's ``hidden_states[rows]`` / ``output[rows]``, no staging copy) is bitwise too and leaves the declared ``out`` untouched
+    entirely; (d) the next chunk (300 live tokens) at ``num_tokens_live=300`` matches the capacity arm on [0, 300) and leaves [300, 512)
+    untouched.  Every step also passes the harness's per-sequence oracle / pool / stale-row checks."""
+    hz = _ExtendHarness(4, 512, max_kv_len=512, page=16, layout="hnd", seed=31)  # the LIVE-count arm
+    tw = _ExtendHarness(4, 512, max_kv_len=512, page=16, layout="hnd", seed=31)  # the capacity arm (the same weights; the same sequences by adopt)
+    sentinel = _OUT_SENTINEL[hz.dtype]
+    m, s = _MATRIX_PACKING, _SECOND_PACKING
+    # (a) + (b)
+    rec = hz.prepare(m["q_lens"], prefix_lens=m["prefix_lens"], prefill="reference", out_fill=sentinel)
+    hz.execute(num_tokens_live=412)
+    torch.cuda.synchronize()
+    rec["out"] = hz.out.clone()
+    hz.check(rec, label="(live) T_live 412 of 512, inputs at T_max rows")
+    og_live = hz.o_gated()[:412].clone()
+    tw.adopt(hz)
+    rec_t = tw.step(m["q_lens"], prefix_lens=m["prefix_lens"], prefill="reference", out_fill=sentinel)
+    tw.check(rec_t, label="(live) the capacity arm")
+    assert torch.equal(rec["out"][:412], rec_t["out"][:412]), "the live rows differ from the capacity launch"
+    assert bool((rec["out"][412:] == sentinel).all()), f"rows past T_live were touched: {int((rec['out'][412:] != sentinel).any(-1).sum())}"
+    assert bool((rec_t["out"][412:] == 0).all()), "the capacity arm's pad rows are exactly 0 (the zeroed-workspace contract)"
+    assert torch.equal(_bits(og_live), _bits(tw.o_gated()[:412]))
+    assert torch.equal(_bits(hz.k_cache), _bits(tw.k_cache)) and torch.equal(_bits(hz.v_cache), _bits(tw.v_cache))
+    # (c) the token tensors at exactly T_live rows
+    hz.refill_pools()
+    hz.prepare(m["q_lens"], prefix_lens=m["prefix_lens"], prefill="reference", out_fill=sentinel)
+    out_live = torch.full((412, hz.geom.d_model), sentinel, device="cuda", dtype=hz.dtype)
+    hz.execute(num_tokens_live=412, live_rows_inputs=True, out_live=out_live)
+    torch.cuda.synchronize()
+    assert torch.equal(out_live, rec_t["out"][:412]), "the T_live-row inputs differ from the capacity launch"
+    assert bool((hz.out == sentinel).all()), "the declared out was touched although a separate live-row out was handed over"
+    assert torch.equal(_bits(hz.k_cache), _bits(tw.k_cache)) and torch.equal(_bits(hz.v_cache), _bits(tw.v_cache))
+    # (d) the next chunk at 300 live tokens
+    rec2 = hz.prepare(s["q_lens"], prefix_lens=s["prefix_lens"], prefill="keep", out_fill=sentinel)
+    hz.execute(num_tokens_live=300)
+    torch.cuda.synchronize()
+    rec2["out"] = hz.out.clone()
+    hz.check(rec2, label="(live) second step T_live 300")
+    tw.adopt(hz)  # the next chunk's tokens were drawn by hz's generator: the twin takes them (its own generator would draw others)
+    rec2_t = tw.step(s["q_lens"], prefix_lens=s["prefix_lens"], prefill="keep", out_fill=sentinel)
+    tw.check(rec2_t, label="(live) the capacity arm, second step")
+    assert rec2["t_live"] == 300 and torch.equal(rec2["out"][:300], rec2_t["out"][:300])
+    assert bool((rec2["out"][300:] == sentinel).all()), "rows past the second step's T_live were touched"
+
+
+@pytest.mark.L1
+@requires_rubin
+@requires_capture_safe_gemm_route
+def test_extend_num_tokens_live_capture_replays_at_the_captured_count():
+    """The capture pin under ``num_tokens_live``: the FIRST execute of a fresh declaration captured at T_live 412 (vLLM's defaults -- a new
+    stream, no eager warm-up, ``set_sync_debug_mode("error")``) launches nothing at capture, replays BITWISE the eager capacity arm on the
+    live rows and leaves [412, 512) untouched.  The host int is BAKED into the captured launches (the row extents and grids), so every
+    replay serves 412 rows: the next chunk (300 live tokens) replays correctly through the captured tensors exactly because the step is
+    PADDED to the captured bucket (rows [300, 412): zero ``h``, finite ``cos`` / ``sin``, slot -1 -- finite pad rows, unwritten to the cache),
+    the contract a serving stack meets with ONE capture per live-count bucket; the live rows match the eager arm, [412, 512) stay untouched."""
+    hz = _ExtendHarness(4, 512, max_kv_len=512, page=16, layout="hnd", seed=37)
+    tw = _ExtendHarness(4, 512, max_kv_len=512, page=16, layout="hnd", seed=37)
+    sentinel = _OUT_SENTINEL[hz.dtype]
+    m, s = _MATRIX_PACKING, _SECOND_PACKING
+    rec = hz.prepare(m["q_lens"], prefix_lens=m["prefix_lens"], prefill="reference", out_fill=sentinel)
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            prev = torch.cuda.get_sync_debug_mode()
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                hz.execute(num_tokens_live=412)  # the FIRST execute of this declaration, captured at the live count
+            finally:
+                torch.cuda.set_sync_debug_mode(prev)
+        torch.cuda.synchronize()
+        assert bool((hz.out == sentinel).all()), "the capture launched work"
+        graph.replay()
+        torch.cuda.synchronize()
+        rec["out"] = hz.out.clone()
+        hz.check(rec, label="(live capture) replay at the captured T_live 412")
+        tw.adopt(hz)
+        rec_t = tw.step(m["q_lens"], prefix_lens=m["prefix_lens"], prefill="reference", out_fill=sentinel)
+        tw.check(rec_t, label="(live capture) the eager capacity arm")
+        assert torch.equal(rec["out"][:412], rec_t["out"][:412]), "the replay differs from the eager capacity arm on the live rows"
+        assert bool((rec["out"][412:] == sentinel).all()), "the replay touched rows past the captured T_live"
+        # the next chunk, padded to the captured bucket, through the captured tensors
+        rec2 = hz.prepare(s["q_lens"], prefix_lens=s["prefix_lens"], prefill="keep", out_fill=sentinel)
+        graph.replay()
+        torch.cuda.synchronize()
+        rec2["out"] = hz.out.clone()
+        hz.check(rec2, label="(live capture) replay over the next chunk (300 live, padded to 412)")
+        tw.adopt(hz)  # the next chunk's tokens were drawn by hz's generator: the twin takes them (its own generator would draw others)
+        rec2_t = tw.step(s["q_lens"], prefix_lens=s["prefix_lens"], prefill="keep", out_fill=sentinel)
+        tw.check(rec2_t, label="(live capture) the eager capacity arm, next chunk")
+        assert torch.equal(rec2["out"][:300], rec2_t["out"][:300]), "the replay over the padded next chunk differs from the eager arm"
+        assert torch.isfinite(rec2["out"][300:412].float()).all(), "the pad rows inside the captured bucket must stay finite"
+        assert bool((rec2["out"][412:] == sentinel).all()), "the replay touched rows past the captured T_live"
     finally:
         graph.reset()
 

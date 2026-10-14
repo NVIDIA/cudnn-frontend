@@ -3655,7 +3655,9 @@ class _QkNormRope(_Stage):
             raise RuntimeError("call compile() before execute()")
         g = self.geom
         _check_norm_weights_agree(g.qk_norm, w_q_norm, w_k_norm)
-        t = self.batch * self.seq_len
+        # The token rows: a flat [T, H, D] q names them (the block's strided slab views -- the LIVE rows under num_tokens_live); a
+        # compact [B, S, H, D] q is the declared geometry.
+        t = int(q.shape[0]) if q.ndim == 3 else self.batch * self.seq_len
         stream = current_stream if current_stream is not None else torch.cuda.current_stream(q.device).cuda_stream
 
         def _flat(x, h):
@@ -3678,7 +3680,7 @@ class _QkNormRope(_Stage):
             _flat(k if k_out is None else k_out, g.h_kv),
             w_q_norm,
             w_k_norm,
-            cos.view(t, g.rope_dim),
+            cos.view(t, g.rope_dim),  # t rows explicitly (a rope_dim 0 table is [T, 0]: -1 could not infer it)
             sin.view(t, g.rope_dim),
             None if rstd_q is None else rstd_q.view(t, g.h_q),
             None if rstd_k is None else rstd_k.view(t, g.h_kv),
@@ -5014,6 +5016,30 @@ class _CacheWrite(_Stage):
             run_cache_write(idx, index_src, None, index_cache.unsqueeze(1), None, slot_mapping, stream=stream)
 
 
+def _token_rows(x: torch.Tensor, name: str, width: int, t: int, t_live: Optional[int] = None) -> torch.Tensor:
+    """The caller's token matrix as its ``[rows, width]`` view -- ``.view`` only (a copy would be a silent extra kernel, Rule 1), the row
+    count read from the LEADING shape (never inferred with ``-1``: a RoPE table of ``rope_dim`` 0, the RMSNorm-only geometry, is a
+    ``[T, 0]`` tensor whose row count ``-1`` cannot infer).  Admitted forms: ``[T, width]`` / ``[1, T, width]`` / a dense ``[B, S, width]``
+    with ``B x S == T`` (the first ``t_live`` rows when a live count is given), or -- under ``num_tokens_live`` -- exactly ``[T_live, width]``
+    / ``[1, T_live, width]`` (a serving stack's ``hidden_states[rows]`` / ``output[rows]`` with no staging copy).  Any other row count is a
+    typed ``ValueError`` naming the admitted counts.  ``rows`` = ``t`` without a live count, else ``t_live``."""
+    if x.ndim == 2:
+        n = int(x.shape[0])
+    elif x.ndim == 3 and int(x.shape[0]) == 1:
+        n = int(x.shape[1])
+    elif x.ndim == 3:
+        n = int(x.shape[0]) * int(x.shape[1])
+    else:
+        raise ValueError(f"{name} must be a [T, {width}] / [1, T, {width}] / [B, S, {width}] token matrix, got shape {tuple(x.shape)}")
+    if n == t:
+        x2 = x.view(t, width)
+        return x2 if t_live is None else x2[:t_live]
+    if t_live is not None and n == t_live:
+        return x.view(t_live, width)
+    admitted = f"{t}" if t_live is None else f"{t} (the declared capacity) or {t_live} (num_tokens_live)"
+    raise ValueError(f"{name} must carry {admitted} token rows of width {width}, got {tuple(x.shape)}")
+
+
 @dataclass(frozen=True)
 class _ServingDecl:
     """The declaration facts the serving forms' typed declines read -- ONE record, built by the constructor from its arguments and
@@ -5228,7 +5254,9 @@ class GatedAttentionBlockFwd(APIBase):
     paged_kv_page_size=P, kv_source="paged", geometry.causal_bottom_right=True`` with the pools' and the block table's
     SAMPLES (their layout and row stride are compiled in; ``serving_envelope`` lists the rest).  ``token_capacity`` makes
     the packed row count a CAPACITY: a step's lengths sum to ``T_live <= T_max`` and rows ``[T_live, T_max)`` are pad rows
-    (slot ``-1``, finite ``cos`` / ``sin``, never attended; their ``out`` rows unspecified but finite).  Typed declines, in
+    (slot ``-1``, finite ``cos`` / ``sin``, never attended; their ``out`` rows unspecified but finite); ``execute(num_tokens_live=T_live)``
+    (appended) launches the token-indexed stages over the live rows alone -- no recompile, ``h`` / ``cos`` / ``sin`` / ``slot_mapping`` /
+    ``out`` at ``T_max`` or exactly ``T_live`` rows, rows ``[T_live, T_max)`` of ``out`` untouched.  Typed declines, in
     :data:`_EXTEND_DECLINES`'s order: a missing bottom-right diagonal, a window, another head dim, a fused gate
     (the paged THD body carries no gate seam; the packed block's gate rides the dense THD prefill only), an LSE;
     ``quant`` / ``save_for_backward`` are the write-through's, a sparse geometry the table's ``sparse`` row (the
@@ -6033,7 +6061,9 @@ class GatedAttentionBlockFwd(APIBase):
             )
         return page_size
 
-    def _check_cache_write_args(self, h: torch.Tensor, k_cache, v_cache, block_table, kv_lens, slot_mapping, index_k_raw, seq_lens=None) -> None:
+    def _check_cache_write_args(
+        self, h: torch.Tensor, k_cache, v_cache, block_table, kv_lens, slot_mapping, index_k_raw, seq_lens=None, num_tokens_live: Optional[int] = None
+    ) -> None:
         """The serving inputs against the declaration -- FORM only (dtype / rank / shape / strides / alignment / device),
         never a value and never a sync (Rule 3).  A block declared with ``paged_kv_page_size`` REQUIRES ``k_cache`` /
         ``v_cache`` / ``slot_mapping`` (and ``index_k_raw`` iff its geometry declares the indexer band); a block declared
@@ -6081,7 +6111,8 @@ class GatedAttentionBlockFwd(APIBase):
         t = self.batch * self.seq_len
         check_pool(k_cache, "k_cache", h=g.h_kv, page_size=ps, d=g.d_head, dtype=self.act_dtype, device=h.device)
         check_pool(v_cache, "v_cache", h=g.h_kv, page_size=ps, d=g.d_head, dtype=self.act_dtype, device=h.device)
-        check_slot_mapping(slot_mapping, "slot_mapping", t=t, device=h.device)
+        # Under num_tokens_live (appended) the slot mapping may carry the declared T_max slots (the first T_live are read) or exactly T_live.
+        check_slot_mapping(slot_mapping, "slot_mapping", t=t, device=h.device, t_live=num_tokens_live)
         if paged:
             self._check_extend_args(h, k_cache, v_cache, block_table, kv_lens, seq_lens=seq_lens)
         if g.index_band:
@@ -6103,6 +6134,35 @@ class GatedAttentionBlockFwd(APIBase):
                 "index_k_raw is the raw indexer key's pool of a geometry that declares the indexer band (QsaSpec.index_band=True); this block's "
                 "geometry has no band, so there is no raw key to write -- refused rather than silently ignored"
             )
+
+    def _check_num_tokens_live(self, num_tokens_live) -> Optional[int]:
+        """``execute(num_tokens_live=)`` against the declaration -- host-side, typed, callable on a declared (uncompiled) block, before
+        any launch: ``None`` = the declared capacity; an int belongs to the BOUNDED packed form (``token_capacity=T_max``) and must lie in
+        ``[1, T_max]`` -- ``T_live > T_max`` is the typed decline (a plan declared at ``T_max`` launches at ``T_live <= T_max``; more
+        tokens are another plan); a quantized pipeline declines (its scale-factor blobs and quantize stages are sized by the capacity).
+        Returns the normalised live count, or ``None`` when it equals the capacity (identical launches)."""
+        if num_tokens_live is None:
+            return None
+        if isinstance(num_tokens_live, bool) or not isinstance(num_tokens_live, int):
+            raise TypeError(f"num_tokens_live must be an int (the step's live token count T_live) or None, got {type(num_tokens_live).__name__}")
+        if self.token_capacity is None:
+            raise ValueError(
+                f"num_tokens_live={num_tokens_live} belongs to a block declared with token_capacity=T_max (the bounded packed form: thd=True, the "
+                "samples' T rows a capacity); this block was declared without it, so its lengths sum to T exactly -- refused rather than silently ignored"
+            )
+        if num_tokens_live < 1:
+            raise ValueError(f"num_tokens_live must be >= 1 (a step with no live token launches nothing), got {num_tokens_live}")
+        if num_tokens_live > self.token_capacity:
+            raise ValueError(
+                f"num_tokens_live={num_tokens_live} exceeds the declared token_capacity={self.token_capacity}: a plan declared at T_max launches at "
+                "T_live <= T_max; a longer step needs a declaration with a larger capacity (another plan)"
+            )
+        if self.quant is not None:
+            raise NotImplementedError(
+                f"num_tokens_live={num_tokens_live} on a quantized pipeline ({type(self.quant).__name__}): its scale-factor blobs and quantize stages "
+                "are sized by the declared capacity; the live token count serves the bf16 / f16 pipelines (the serving forms)"
+            )
+        return None if num_tokens_live == self.token_capacity else int(num_tokens_live)
 
     def _check_extend_args(self, h: torch.Tensor, k_cache, v_cache, block_table, kv_lens, seq_lens=None) -> None:
         """The paged forms' execute inputs against the declaration, FORM only (Rule 3): the pools match the declared samples'
@@ -6957,6 +7017,15 @@ class GatedAttentionBlockFwd(APIBase):
         kv_lens: Optional[torch.Tensor] = None,  # [num_sequences] int32 -- the EXTEND form's LOGICAL KV lengths incl. this step's tokens; refused otherwise
         slot_mapping: Optional[torch.Tensor] = None,  # [T] int32 / int64: the flat slot (page * page_size + offset) of every token; negative = no write
         index_k_raw: Optional[torch.Tensor] = None,  # [num_pages, page_size, index_head_dim] activation dtype: the raw indexer key's pool (index band only)
+        # APPENDED (serving, the bounded packed form -- token_capacity=T_max): the step's LIVE token count T_live, a HOST int.  None (the
+        # default) = the declared capacity, every stage over all T_max rows as before.  An int launches the token-indexed stages over
+        # T_live <= T_max rows WITHOUT a recompile (the block kernels take a symbolic token count): h / cos / sin / slot_mapping / out
+        # may then carry EITHER the declared T_max rows (the first T_live are read / written) OR exactly T_live rows (a serving stack's
+        # hidden_states[rows] / output[rows] directly -- no staging copy); rows [T_live, T_max) of `out` are UNTOUCHED.  The SDPA keeps the
+        # declared geometry and takes the live count from seq_lens on device, so the lengths must sum to T_live.  Typed declines: a
+        # block declared without token_capacity, T_live outside [1, T_max], a quantized pipeline, a projection on the graph route.
+        # Under a CUDA-graph capture the host int is baked into the captured launches: ONE capture per live-count bucket (docs).
+        num_tokens_live: Optional[int] = None,
     ) -> None:
         """Launch the five stages in pipeline order.
 
@@ -7014,14 +7083,49 @@ class GatedAttentionBlockFwd(APIBase):
         read.  Under ``token_capacity`` the lengths may sum to ``T_live <= T``; rows
         ``[T_live, T)`` of ``out`` are then unspecified but finite given finite
         inputs (hand them slot ``-1`` and finite ``cos`` / ``sin`` rows).
+
+        ``num_tokens_live`` (appended; the bounded packed form only): the step's
+        LIVE token count ``T_live`` as a HOST int.  ``None`` = the declared
+        capacity (every stage over all ``T_max`` rows, bitwise as before).  With
+        an int the projection, norm + RoPE, the cache write, the gate and the out
+        projection run over ``T_live <= T_max`` rows with NO recompile (their
+        kernels take the token count symbolically); ``h`` / ``cos`` / ``sin`` /
+        ``slot_mapping`` / ``out`` may carry the declared ``T_max`` rows (the
+        first ``T_live`` are read / written) or exactly ``T_live`` rows -- a
+        serving stack hands ``hidden_states[rows]`` and ``output[rows]`` directly,
+        with no staging copy -- and rows ``[T_live, T_max)`` of ``out`` are left
+        UNTOUCHED.  The SDPA keeps the declared geometry and reads the live total
+        from ``seq_lens`` on device, so the lengths must sum to ``T_live``
+        (device data, never read here).  Typed, before any launch: a block
+        declared without ``token_capacity`` refuses it (``ValueError`` naming the
+        attribute), ``T_live`` outside ``[1, T_max]`` is a ``ValueError`` naming
+        ``T_max``, a quantized pipeline a ``NotImplementedError`` (its scale-factor
+        blobs are sized by the capacity), a dense projection on the graph route
+        (a bounded block declared without ``kv_source="paged"``) a
+        ``NotImplementedError`` (the graph binds the declared ``M``).  A CUDA-graph
+        capture bakes the host int into the captured launches: a replay serves
+        the live count it was captured with -- one capture per live-count bucket.
         """
+        # The bounded packed form's LIVE token count (appended): validated FIRST -- host-side, typed, before the compile check, so a
+        # declared block pins the contract on any device -- and handed to the slot-mapping form check (the two admitted row counts).
+        t_live = self._check_num_tokens_live(num_tokens_live)
         # Block-sparse attention: the index tensors are a DECLARATION-vs-argument contract and need no plan, so they are
         # checked first and the refusal reads the same on every device (Rule 3: form only, never a value, never a sync).
         self._check_qsa_execute_args(block_ids, block_lens, h)
         # The paged-cache inputs: the same kind of contract (declared with paged_kv_page_size -> required; without -> refused).
-        self._check_cache_write_args(h, k_cache, v_cache, block_table, kv_lens, slot_mapping, index_k_raw, seq_lens=seq_lens)
+        self._check_cache_write_args(h, k_cache, v_cache, block_table, kv_lens, slot_mapping, index_k_raw, seq_lens=seq_lens, num_tokens_live=t_live)
         if self._ws is None:
             raise RuntimeError("call compile() before execute()")
+        if t_live is not None:
+            # The dense projections must take M from the buffers: the forced-tile JIT route does (the serving declaration's capture-safe
+            # route, kv_source="paged"); the graph route binds the declared M = T_max and would read T_live rows as T_max.
+            for st in (self._proj, self._out_proj):
+                if isinstance(st, _Projection) and (st._plan is None or getattr(st._plan, "jit", None) is None):
+                    raise NotImplementedError(
+                        f"num_tokens_live={t_live}: the {st.name} projection runs on the graph route (route={getattr(st._plan, 'route', None)!r}, "
+                        "no JIT), which binds the declared M=T_max; a live token count below the capacity needs the forced-tile JIT route both "
+                        "dense projections take under the serving declaration (kv_source='paged'). Declare the EXTEND form, or launch at the capacity"
+                    )
         _check_norm_weights_agree(self.geom.qk_norm, w_q_norm, w_k_norm)
         # `saved=` is the training forward's write-through record.  On an inference
         # block no stage targets saved.o / lse / rstd_* / proj_slab / gate, so
@@ -7076,6 +7180,15 @@ class GatedAttentionBlockFwd(APIBase):
             raise ValueError("w_o_sf is the e2m1 W_o's scale blob of the fp4 O mode; this block was declared without MxQuantSpec.o_fp4")
         g = self.geom
         t = self.batch * self.seq_len
+        # The token rows this step's stages address: the declared capacity, or the live count (the SDPA alone keeps T: its Q / O views
+        # are the declared slab / workspace geometry and the live total is seq_lens' on device).
+        rows = t if t_live is None else t_live
+
+        def tok(x: torch.Tensor, name: str, width: int) -> torch.Tensor:
+            """The caller's token matrix as its ``[rows, width]`` view (:func:`_token_rows`: the row count from the leading shape, so a
+            ``rope_dim`` 0 table of width 0 flattens too; the first ``rows`` rows of a ``T_max``-row tensor, or exactly ``T_live`` rows)."""
+            return _token_rows(x, name, width, t, t_live)
+
         # THE launch stream (Rule 5): the caller's ``current_stream``, else torch's
         # current stream on h's device -- resolved once, here, and handed to EVERY
         # stage.  The CuTe-DSL kernels take the raw CUstream int directly; the two
@@ -7124,6 +7237,10 @@ class GatedAttentionBlockFwd(APIBase):
         # (proj_slab save mode -- the GEMM binds `out` by pointer, so the slab the
         # backward reads is written exactly once, in place of the workspace one).
         proj = sv.proj if (sv is not None and sv.proj is not None) else _view(workspace, ws.proj, (t, g.n_qkvg), act)
+        # The live-row views of the caller's token matrices and of the slab (the first `rows` rows; the whole buffers when rows == t).
+        h_live, cos_live, sin_live, out_live = tok(h, "h", g.d_model), tok(cos, "cos", g.rope_dim), tok(sin, "sin", g.rope_dim), tok(out, "out", g.d_model)
+        proj_live = proj if rows == t else proj[:rows]
+        slot_live = slot_mapping if (slot_mapping is None or rows == t or int(slot_mapping.numel()) == rows) else slot_mapping[:rows]
         # In-place: there ARE no compact Q/K/V buffers -- the SDPA reads the
         # slab columns directly, so these are the same views stage (2)+(3)
         # normed over. Bound below, after `q_src`/`k_src`/`v_src` exist.
@@ -7175,13 +7292,13 @@ class GatedAttentionBlockFwd(APIBase):
             # epilogue and writes the slab; rstd (if wanted) comes out of the
             # same launch.
             self._proj.execute(
-                h.view(t, g.d_model),
+                h_live,
                 w_qkvg,
-                proj,
+                proj_live,
                 w_q_norm,
                 w_k_norm,
-                cos,
-                sin,
+                cos_live,
+                sin_live,
                 rstd_q if rstd_q is None else rstd_q.view(t, g.h_q),
                 rstd_k if rstd_k is None else rstd_k.view(t, g.h_kv),
                 stream=stream,
@@ -7190,10 +7307,10 @@ class GatedAttentionBlockFwd(APIBase):
             if mxfp8:
                 # (1) [MXFP8: e4m3 codes x e4m3 codes with the E8M0 block scales
                 # dequantized IN the MMA (block_scale_dequantize) -> bf16 slab; no alpha]
-                self._proj.execute(h.view(t, g.d_model), w_qkvg, proj, engine_ws, sf_a=h_sf, sf_w=w_qkvg_sf, stream=stream)
+                self._proj.execute(h_live, w_qkvg, proj_live, engine_ws, sf_a=h_sf, sf_w=w_qkvg_sf, stream=stream)
             else:
                 # (1) [FP8: e4m3 x e4m3, epilogue * alpha_qkvg, bf16 slab]
-                self._proj.execute(h.view(t, g.d_model), w_qkvg, proj, engine_ws, alpha=qd["alpha_qkvg"] if fp8 else None, stream=stream)
+                self._proj.execute(h_live, w_qkvg, proj_live, engine_ws, alpha=qd["alpha_qkvg"] if fp8 else None, stream=stream)
             # (2)+(3) -- on EVERY unfused pipeline (bf16 / FP8 / MXFP8; the S5 bring-up
             # bisect caught an MXFP8 arm that skipped this call: GEMM exact, SDPA
             # exact, end-to-end cos 0.73 -- the normed-Q/K comparison is the tell).
@@ -7201,7 +7318,18 @@ class GatedAttentionBlockFwd(APIBase):
             # default and is safe by construction: every lane holds its whole [D]
             # row in registers before it stores, and no lane touches another's.
             self._norm_rope.execute(
-                q_src, k_src, w_q_norm, w_k_norm, cos, sin, q_out=q_c, k_out=k_c, rstd_q=rstd_q, rstd_k=rstd_k, current_stream=stream, flat=True
+                q_src[:rows],
+                k_src[:rows],
+                w_q_norm,
+                w_k_norm,
+                cos_live,
+                sin_live,
+                q_out=None if q_c is None else q_c[:rows],
+                k_out=None if k_c is None else k_c[:rows],
+                rstd_q=rstd_q,
+                rstd_k=rstd_k,
+                current_stream=stream,
+                flat=True,
             )
         if sv is not None and sv.gate_dst is not None:
             # (3g) TRAINING, gate-copy save mode: the slab's GATE band -> the compact
@@ -7242,7 +7370,7 @@ class GatedAttentionBlockFwd(APIBase):
             q_c, k_c, v_c = q_src, k_src, v_src
         else:
             # (3b) -- exists only to hand the SDPA a compact V.
-            self._compact_v.execute(v_src, v_c, current_stream=stream)
+            self._compact_v.execute(v_src[:rows], v_c[:rows], current_stream=stream)
         if self._cache_write is not None:
             # (4w) SERVING write-through: the VERY operands stage (4) is about to read -- the post-RoPE K and the V (the
             # slab bands in place, or the compact buffers out of place) -- into the paged pools at slot_mapping, so a
@@ -7252,12 +7380,12 @@ class GatedAttentionBlockFwd(APIBase):
             # pipelines reach here (the quantized ones declined at declaration); their k_c / v_c are 16-bit views -- the
             # packed block's too (B = 1, S = T: the same [T, H_kv, D] views at the slab's token stride).
             self._cache_write.execute(
-                k_c,
-                v_c,
+                k_c[:rows],
+                v_c[:rows],
                 k_cache,
                 v_cache,
-                slot_mapping,
-                index_src=_cols(proj, g.index_k_raw_offset, g.qsa.index_kv_heads, g.qsa.index_head_dim) if g.index_band else None,
+                slot_live,
+                index_src=_cols(proj_live, g.index_k_raw_offset, g.qsa.index_kv_heads, g.qsa.index_head_dim) if g.index_band else None,
                 index_cache=index_k_raw if g.index_band else None,
                 current_stream=stream,
             )
@@ -7300,7 +7428,7 @@ class GatedAttentionBlockFwd(APIBase):
             # O := 0 on dead rows, so no residue reaches the sigmoid.  In place
             # under inference (`o_gated is o`); OUT of place under training, where
             # `o` is the caller's pre-gate saved.o and must survive for dG.
-            self._gate.execute(o, gate_src, o_gated, current_stream=stream)
+            self._gate.execute(o[:rows], gate_src[:rows], o_gated[:rows], current_stream=stream)
         if self.o_fp4 is not None:
             # (5q') bf16 gated O -> e2m1 codes + the out_proj GEMM's F8_128x4 blob (block scales, no per-tensor
             # scale); (6') fp4 x fp4 block-scale out projection, both blobs dequantized IN the MMA (no alpha).
@@ -7313,8 +7441,8 @@ class GatedAttentionBlockFwd(APIBase):
             self._quant_o.execute(o_gated, o8, qd["scale_o"], current_stream=stream)
             self._out_proj.execute(o8.view(t, g.h_q * g.d_head), w_o, out.view(t, g.d_model), engine_ws, alpha=qd["alpha_o"], stream=stream)
         else:
-            # (6) -- reads the gated O: the workspace `o` (inference) or `o_gated` (training).
-            self._out_proj.execute(o_gated.view(t, g.h_q * g.d_head), w_o, out.view(t, g.d_model), engine_ws, stream=stream)
+            # (6) -- reads the gated O: the workspace `o` (inference) or `o_gated` (training); the live rows under num_tokens_live.
+            self._out_proj.execute(o_gated[:rows].view(rows, g.h_q * g.d_head), w_o, out_live, engine_ws, stream=stream)
 
     def _sf_views(self, workspace: torch.Tensor, ws: "_Intermediates") -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """The three MXFP8 scale-factor slots as flat uint8 views, sized exactly as the carve reserved them: ``_sf_slot_bytes``
