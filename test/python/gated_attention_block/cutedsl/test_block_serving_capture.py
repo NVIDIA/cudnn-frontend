@@ -292,9 +292,17 @@ def _spy_ranked_list(monkeypatch):
     return seen
 
 
+def _auto_tile_of(plan):
+    """The tile ``tile_config="auto"`` resolves for the plan's own shape: the small-M route at m <= 128 (the decode row counts
+    these tests build at), the forced 256-wide tile past it -- ``proj_gemm._auto_tile_name``, the driver's one resolver."""
+    return proj_gemm._auto_tile_name(
+        plan.m, plan.n, plan.k, dtype=plan.dtype, a_major=plan.a_major, b_major=plan.b_major, block_scale=plan.block_scale, alpha=plan.has_alpha
+    )
+
+
 def _assert_jit_only(plan, seen):
     assert plan.route == "jit-only" and plan.jit is not None, (plan.label, plan.route, plan.jit)
-    assert plan.tile_config_name == _FORCED_TILE_NAME, (plan.label, plan.tile_config_name)
+    assert plan.tile_config_name == _auto_tile_of(plan), (plan.label, plan.tile_config_name, _auto_tile_of(plan))
     assert seen, "the pin never inspected a ranked list"
     for names in seen:
         assert not any(n == "frost_gemm" or n.startswith("frost_gemm[") for n in names), names
@@ -303,8 +311,9 @@ def _assert_jit_only(plan, seen):
 @requires_rubin
 @pytest.mark.parametrize("h_q, h_kv, d_model", _SERVED_GEOMETRIES)
 def test_dense_bf16_projections_compile_and_run_without_the_flag_at_every_served_geometry(monkeypatch, h_q, h_kv, d_model):
-    """Both projection GEMMs of every served geometry, built with the flag UNSET: the ``jit-only`` route at the forced tile, no
-    ``frost_gemm`` in any ranked list the pin saw, no cuDNN handle created, and the kernel RUNS (cos > 0.999 vs torch, finite)."""
+    """Both projection GEMMs of every served geometry, built with the flag UNSET: the ``jit-only`` route at the tile the driver resolves
+    for the shape (the small-M route at m = 128), no ``frost_gemm`` in any ranked list the pin saw, no cuDNN handle created, and the kernel RUNS (cos > 0.999 vs torch, finite).
+    """
     monkeypatch.delenv(_FLAG, raising=False)
     seen = _spy_ranked_list(monkeypatch)
     handles_before = dict(proj_gemm._GRAPH_HANDLES)
@@ -330,7 +339,7 @@ def test_dense_bf16_projections_compile_and_run_without_the_flag_at_every_served
 @pytest.mark.parametrize("h_q, h_kv, d_model", _SERVED_GEOMETRIES)
 def test_bf16_block_compiles_without_the_flag_at_every_served_geometry(monkeypatch, h_q, h_kv, d_model):
     """The whole bf16 block at each served geometry (B=1, S=128), declared and compiled with the flag UNSET: both projections on the
-    ``jit-only`` route at the forced tile, no ``frost_gemm`` in any ranked list, one execute finite."""
+    ``jit-only`` route at the tile the driver resolves for T = 128, no ``frost_gemm`` in any ranked list, one execute finite."""
     monkeypatch.delenv(_FLAG, raising=False)
     seen = _spy_ranked_list(monkeypatch)
     blk, inp, out = _make_block(dict(d_model=d_model, h_q=h_q, h_kv=h_kv, d_head=256, rope_dim=64), batch=1, seq_len=128)
@@ -350,7 +359,7 @@ def test_bf16_block_compiles_without_the_flag_at_every_served_geometry(monkeypat
 def test_capture_safe_plan_never_enters_the_ranked_list_whatever_the_flag(monkeypatch, flag):
     """The serving declaration with the opt-in flag SET (the suite's default) and UNSET: the plan's graph holds NO ranked list
     (``create_execution_plans`` never ran: ``plan.graph.plans == []``), the pin never inspected one, the route is ``jit-only`` at
-    the forced tile, ``workspace_bytes`` is the JIT's own, no cuDNN handle exists for it, and the kernel RUNS (cos > 0.999 vs
+    the tile the driver resolves for the shape, ``workspace_bytes`` is the JIT's own, no cuDNN handle exists for it, and the kernel RUNS (cos > 0.999 vs
     torch).  The flag-set half is the literal acceptance: with ``frost_gemm`` on a ranked list a plain declaration pins
     ``graph+jit`` and compiles once more inside the engine; the serving declaration does neither."""
     _set_flag(monkeypatch, flag)
@@ -359,7 +368,7 @@ def test_capture_safe_plan_never_enters_the_ranked_list_whatever_the_flag(monkey
     m, k, n = 128, 512, 512
     plan = build_proj_gemm(m=m, k=k, n=n, dtype=torch.bfloat16, label=f"cs_{flag}", capture_safe=True)
     assert plan.capture_safe and plan.route == "jit-only" and plan.jit is not None, (plan.route, plan.jit)
-    assert plan.tile_config_name == _FORCED_TILE_NAME, plan.tile_config_name
+    assert plan.tile_config_name == _auto_tile_of(plan), (plan.tile_config_name, _auto_tile_of(plan))
     assert plan.graph.plans == [], "the serving declaration built a ranked list"
     assert plan.workspace_bytes == max(int(getattr(plan.jit, "workspace_bytes", 0) or 0), 1), plan.workspace_bytes
     torch.manual_seed(0)
