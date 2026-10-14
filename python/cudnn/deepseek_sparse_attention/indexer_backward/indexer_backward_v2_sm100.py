@@ -1675,6 +1675,8 @@ def indexer_backward_v2_sm100(
     fix the plan's shape; execute re-validates the real tensors against it.
     """
     deterministic_dk_planes = validate_deterministic_dk_plane_policy(deterministic, deterministic_dk_planes)
+    rows = batch * seqlen
+    deterministic_num_ctas = deterministic_dk_producer_ctas(rows, deterministic_dk_planes) if deterministic else None
     if torch.cuda.get_device_capability() not in INDEXER_BACKWARD_SM100_CAPABILITIES:
         raise RuntimeError(f"indexer_backward_v2_sm100 requires capability in {INDEXER_BACKWARD_SM100_CAPABILITIES}; " "use backend='default' elsewhere")
     if heads != 64 or dim != 128:
@@ -1690,7 +1692,6 @@ def indexer_backward_v2_sm100(
     if dw_out_dtype not in (torch.float32, torch.bfloat16):
         raise ValueError(f"indexer backward v2 supports d_weights dtype float32 or bfloat16 (got {dw_out_dtype})")
 
-    rows = batch * seqlen
     seq_k_total = batch * seqlen_k
     idx_local = (not topk_indices_global) and batch > 1
 
@@ -1797,11 +1798,7 @@ def indexer_backward_v2_sm100(
         dq_flat = dIndexQ.view(rows, h, d)
         dw_flat = dWeights.view(rows, h)
 
-        num_ctas = (
-            deterministic_dk_producer_ctas(rows, deterministic_dk_planes)
-            if deterministic
-            else torch.cuda.get_device_properties(IndexQ.device).multi_processor_count
-        )
+        num_ctas = deterministic_num_ctas if deterministic else torch.cuda.get_device_properties(IndexQ.device).multi_processor_count
         # per-CTA ring-slot trip count; the +8 surplus slots are the
         # work-stealing headroom (they come back as -1 tickets)
         if deterministic:

@@ -1363,9 +1363,10 @@ def test_DSA_indexer_backward_deterministic_workspace_allows_disjoint_view_of_sa
 
 @pytest.mark.L0
 def test_DSA_indexer_backward_deterministic_plane_policy_rejects_invalid_values_before_tensors():
-    """Only 96/128/148 are accepted, and a non-default choice cannot be silently ignored."""
+    """Validate plane selection and the nonempty fixed-owner grid before tensors."""
     try:
         from cudnn import DSA
+        from cudnn.deepseek_sparse_attention.indexer_backward.deterministic_dk_sm100 import deterministic_dk_producer_ctas
         from cudnn.deepseek_sparse_attention.indexer_backward.indexer_backward_sm100 import indexer_backward_sm100
         from cudnn.deepseek_sparse_attention.indexer_backward.indexer_backward_v2_sm100 import indexer_backward_v2_sm100
     except ImportError:
@@ -1377,9 +1378,72 @@ def test_DSA_indexer_backward_deterministic_plane_policy_rejects_invalid_values_
             DSA.indexer_backward_wrapper(*args, deterministic=True, deterministic_dk_planes=value)
     with pytest.raises(ValueError, match="only configurable when deterministic=True"):
         DSA.indexer_backward_wrapper(*args, deterministic=False, deterministic_dk_planes=128)
+    for total_rows in (0, -1):
+        with pytest.raises(ValueError, match="at least one query row"):
+            deterministic_dk_producer_ctas(total_rows)
     for factory in (indexer_backward_sm100, indexer_backward_v2_sm100):
         with pytest.raises(ValueError, match="only configurable when deterministic=True"):
             factory(1, 1, 128, 64, 128, 128, deterministic=False, deterministic_dk_planes=128)
+        with pytest.raises(ValueError, match="at least one query row"):
+            factory(1, 0, 128, 64, 128, 128, deterministic=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("backend", ["default", "sm100_v2"])
+def test_DSA_indexer_backward_deterministic_empty_query_rejected_before_allocation(monkeypatch, backend):
+    """Reject an empty deterministic grid before output allocation or backend dispatch."""
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required to build IndexerBackward tensor descriptors")
+
+    b, s_q, s_k, h, d, topk = 1, 0, 128, 64, 128, 128
+    index_q = torch.empty((b, s_q, h, d), dtype=torch.bfloat16, device="cuda")
+    weights = torch.empty((b, s_q, h), dtype=torch.bfloat16, device="cuda")
+    index_k = torch.empty((b, s_k, d), dtype=torch.bfloat16, device="cuda")
+    attn_score = torch.empty((b, s_q, topk), dtype=torch.float32, device="cuda")
+    index_score = torch.empty_like(attn_score)
+    topk_indices = torch.empty((b, s_q, topk), dtype=torch.int32, device="cuda")
+    grad_loss = torch.ones((), dtype=torch.float32, device="cuda")
+    d_index_q = torch.empty_like(index_q)
+    d_weights = torch.empty_like(weights)
+    d_index_k = torch.empty_like(index_k)
+
+    plan = DSA.IndexerBackward(
+        index_q,
+        weights,
+        index_k,
+        d_index_q,
+        d_weights,
+        d_index_k,
+        attn_score,
+        index_score,
+        topk_indices,
+        backend=backend,
+        deterministic=True,
+    )
+    with pytest.raises(ValueError, match="at least one query row"):
+        plan.check_support()
+
+    monkeypatch.setattr(
+        torch,
+        "empty_like",
+        lambda *args, **kwargs: pytest.fail("output allocation happened before deterministic row validation"),
+    )
+    with pytest.raises(ValueError, match="at least one query row"):
+        DSA.indexer_backward_wrapper(
+            index_q,
+            weights,
+            index_k,
+            attn_score,
+            index_score,
+            topk_indices,
+            grad_loss,
+            backend=backend,
+            deterministic=True,
+        )
 
 
 @pytest.mark.L1

@@ -45,6 +45,7 @@ from .dense_indexer_backward_sm90 import dense_indexer_backward_sm90
 from .deterministic_dk_sm100 import (
     DEFAULT_DK_PLANES,
     INDEXER_BACKWARD_SM100_CAPABILITIES,
+    deterministic_dk_producer_ctas,
     deterministic_dk_workspace_bytes,
     validate_deterministic_dk_plane_policy,
 )
@@ -421,6 +422,8 @@ class IndexerBackward(APIBase):
 
     def check_support(self) -> bool:
         """Validate the common tensor contract and selected backend envelope."""
+        if self.deterministic:
+            deterministic_dk_producer_ctas(self.batch * self.seqlen, self.deterministic_dk_planes)
         # The generic gate reads the plan's own device for backend="sm100_v2"
         # (its kernel is compiled under that device, and a param-less query
         # would reject a valid plan whenever an unrelated pre-SM90 device
@@ -677,6 +680,15 @@ class IndexerBackward(APIBase):
         current_stream: Optional[cuda.CUstream] = None,
         workspace: Optional[torch.Tensor] = None,
     ) -> None:
+        """Run a compiled plan using caller-owned tensors and scratch.
+
+        This method allocates no device storage and revalidates the runtime
+        signature before launching. It overwrites ``attn_score`` with the
+        score gradient and preserves ``index_score``. ``workspace`` must cover
+        ``scratch_workspace_bytes()``; deterministic scratch must also be
+        disjoint from every operand. A warmed plan with stable outputs and
+        workspace is safe to capture and replay on ``current_stream``.
+        """
         self._logger.debug("Entering execute")
         # Stage 1: runtime signature re-validation against the descriptors
         # captured at plan-build time, BEFORE any kernel launch. The plan is
@@ -1089,6 +1101,13 @@ def indexer_backward_wrapper(
         raise ValueError(f"indexer_backward index_k must be 3D (B, S_k, D), got {index_k.ndim}D shape {tuple(index_k.shape)}")
     if topk_indices.ndim != 3:
         raise ValueError(f"indexer_backward topk_indices must be 3D (B, S_q, topk), got {topk_indices.ndim}D shape {tuple(topk_indices.shape)}")
+
+    b, s_q, h, d = index_q.shape
+    s_k = index_k.shape[1]
+    topk = topk_indices.shape[-1]
+    if deterministic:
+        deterministic_dk_producer_ctas(b * s_q, deterministic_dk_planes)
+
     with _torch_stream_context(stream, index_q.device):
         if d_index_q is None:
             d_index_q = torch.empty_like(index_q)
@@ -1096,10 +1115,6 @@ def indexer_backward_wrapper(
             d_weights = torch.empty_like(weights)
         if d_index_k is None:
             d_index_k = torch.empty_like(index_k)
-
-    b, s_q, h, d = index_q.shape
-    s_k = index_k.shape[1]
-    topk = topk_indices.shape[-1]
 
     # ``grad_scale = loss_coeff / (B * S_q)`` is a runtime arg (forwarded
     # into the score-grad kernel as a runtime ``Float32``), so it is not

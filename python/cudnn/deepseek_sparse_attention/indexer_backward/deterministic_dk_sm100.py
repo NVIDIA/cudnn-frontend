@@ -46,7 +46,10 @@ def validate_deterministic_dk_plane_policy(deterministic: bool, num_planes: int)
 
 def deterministic_dk_producer_ctas(total_rows: int, num_planes: int = DEFAULT_DK_PLANES) -> int:
     """Choose a fixed-owner grid in which every launched CTA has a row."""
-    return min(validate_deterministic_dk_planes(num_planes), total_rows)
+    num_planes = validate_deterministic_dk_planes(num_planes)
+    if isinstance(total_rows, bool) or not isinstance(total_rows, Integral) or total_rows < 1:
+        raise ValueError(f"deterministic IndexerBackward requires at least one query row, got {total_rows!r}")
+    return min(num_planes, int(total_rows))
 
 
 def deterministic_dk_planes_bytes(batch: int, seqlen_k: int, head_dim: int, num_planes: int = DEFAULT_DK_PLANES) -> int:

@@ -3897,13 +3897,13 @@ def _build_cute_dsl_kernel(
     """Create lazily compiled score/GEMM runners for one launch policy."""
     from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 
+    persistent_grid_size = None
+    if deterministic:
+        persistent_grid_size = deterministic_dk_producer_ctas(batch * seqlen, deterministic_dk_planes)
     if torch.cuda.get_device_capability()[0] < 10:
         raise RuntimeError("Requires SM100+")
-    persistent_grid_size = (
-        deterministic_dk_producer_ctas(batch * seqlen, deterministic_dk_planes)
-        if deterministic
-        else torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
-    )
+    if persistent_grid_size is None:
+        persistent_grid_size = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
 
     def _make_kernel(enable_score_pdl: bool):
         """Instantiate the GEMM object with or without score-stage PDL."""
