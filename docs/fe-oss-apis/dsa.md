@@ -618,8 +618,9 @@ indexer tower:
 2. `IndexerBackwardSm90` / `IndexerBackwardSm100` (kernel 2) — three
    warp-specialised GEMMs produce `d_index_q`, `d_weights`, and a
    `dIndexK_f32` accumulator.
-3. Pure-torch dtype cast (kernel 3) converts `dIndexK_f32` to the output
-   dtype.
+3. In ordinary execution, a pure-torch dtype cast (kernel 3) converts
+   `dIndexK_f32` to a BF16 output. Deterministic execution instead uses the
+   fixed-order reduction below to write the requested output dtype directly.
 
 With `deterministic=True` on SM100 or SM103, kernel 2 launches a fixed producer
 grid and accumulates dK into a CTA-private FP32 workspace. The compile-time
@@ -628,16 +629,16 @@ planes (default 96). One CuTe DSL reduction kernel folds the planes in fixed
 CTA order, converting only once to the requested `d_index_k` dtype. The dQ
 and dW stores remain single-writer.
 
-The plan owns no device memory. An fp32 `d_index_k` is the accumulator itself
-(zeroed on the launch stream inside `execute`); a BF16 `d_index_k` accumulates
-into a `B * S_k * D` fp32 view carved from the caller's workspace:
-`IndexerBackward.scratch_workspace_bytes()` is the size (0 for fp32
-`d_index_k` on the default backend), `execute(..., workspace=)` takes the
-uint8 buffer on `index_q.device`, and a missing or undersized buffer raises
-`ValueError` before `attn_score` is touched. `indexer_backward_wrapper`
-allocates it per call on the launch stream and accepts the same optional
-`workspace=` keyword for reuse; executions that share one buffer must not
-overlap on the device.
+The plan owns no device memory. For non-deterministic execution, an fp32
+`d_index_k` is the accumulator itself (zeroed on the launch stream inside
+`execute`); a BF16 `d_index_k` accumulates into a `B * S_k * D` fp32 view carved
+from the caller's workspace. `IndexerBackward.scratch_workspace_bytes()` reports
+that ordinary scratch size (0 for fp32 `d_index_k` on the default backend).
+`execute(..., workspace=)` takes the uint8 buffer on `index_q.device`, and a
+missing or undersized buffer raises `ValueError` before `attn_score` is touched.
+`indexer_backward_wrapper` allocates it per call on the launch stream and accepts
+the same optional `workspace=` keyword for reuse; executions that share one
+buffer must not overlap on the device.
 
 `deterministic=True` is request-or-fail and supports SM100/SM103, `H == 64`,
 `D == 128`, `block_I == 128`, and `topk % 128 == 0` for
@@ -649,14 +650,16 @@ association order across launches. Scratch is exactly
 `ws_align(deterministic_dk_planes * B * S_k * D * sizeof(float))` for either
 backend. It is
 cleared on the launch stream at every execute, then reduced once in fixed
-plane order. A warmed plan with caller-provided outputs and workspace is CUDA
-Graph compatible. To capture the convenience wrapper, warm it first and pass
-every output plus `workspace=` explicitly; omitted buffers are allocated per
-call. A fixed plane count is bitwise reproducible across runs; changing the
-plane count changes the FP32 accumulation grouping, so results from two plane
-counts are not required to be bitwise identical. As with the existing
-deterministic sparse-attention backward, valid IDs in a semantic top-k row are
-expected to be distinct.
+plane order. The live scratch byte range must not overlap any input or output;
+`execute` validates this before clearing the planes, while allowing disjoint
+views of the same allocation. A warmed plan with caller-provided outputs and
+workspace is CUDA Graph compatible. To capture the convenience wrapper, warm
+it first and pass every output plus `workspace=` explicitly; omitted buffers
+are allocated per call. A fixed plane count is bitwise reproducible across
+runs; changing the plane count changes the FP32 accumulation grouping, so
+results from two plane counts are not required to be bitwise identical. As
+with the existing deterministic sparse-attention backward, valid IDs in a
+semantic top-k row are expected to be distinct.
 
 **The TileLang fallback present in the upstream repo is dropped here
 (CuTe-DSL only).** If the CuTe-DSL path fails the wrapper raises

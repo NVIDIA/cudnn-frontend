@@ -1145,10 +1145,21 @@ def test_DSA_indexer_backward_deterministic_contract(backend, dk_dtype, repeats,
 
 @pytest.mark.L1
 @pytest.mark.parametrize("backend", ["default", "sm100_v2"])
-@pytest.mark.parametrize("dk_planes", [128, 148])
+@pytest.mark.parametrize(
+    "dk_planes,s_q,dk_dtype",
+    [
+        pytest.param(128, 128, torch.float32, id="planes128-fp32-single-row-stripe"),
+        pytest.param(148, 148, torch.float32, id="planes148-fp32-single-row-stripe"),
+        pytest.param(148, 149, torch.bfloat16, id="planes148-bf16-reused-plane"),
+    ],
+)
 @torch_fork_set_rng(seed=1702)
-def test_DSA_indexer_backward_deterministic_plane_specializations(backend, dk_planes):
-    """The two larger compile-time grids own distinct exact scratch and remain deterministic."""
+def test_DSA_indexer_backward_deterministic_plane_specializations(backend, dk_planes, s_q, dk_dtype):
+    """Larger compile-time grids own exact scratch and remain deterministic.
+
+    The BF16 case has one more query row than planes, so CTA/plane zero is
+    reused before the fixed-order reducer converts its accumulator.
+    """
     try:
         from cudnn import DSA
         from cudnn.deepseek_sparse_attention.indexer_backward.deterministic_dk_sm100 import deterministic_dk_workspace_bytes
@@ -1156,12 +1167,12 @@ def test_DSA_indexer_backward_deterministic_plane_specializations(backend, dk_pl
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
     _require_exact_sm100()
 
-    cfg = dict(b=1, s_q=dk_planes, s_kv=128, head_dim=128, qhead_per_kv_head=64, topk=128)
+    cfg = dict(b=1, s_q=s_q, s_kv=128, head_dim=128, qhead_per_kv_head=64, topk=128)
     index_q, weights, index_k, attn_source, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
     attn = attn_source.clone()
     d_index_q = torch.empty_like(index_q)
     d_weights = torch.empty_like(weights, dtype=torch.float32 if backend == "sm100_v2" else torch.bfloat16)
-    d_index_k = torch.empty_like(index_k, dtype=torch.float32)
+    d_index_k = torch.empty_like(index_k, dtype=dk_dtype)
     grad_loss = torch.ones((), dtype=torch.float32, device="cuda")
     plan = DSA.IndexerBackward(
         sample_index_q=index_q,
@@ -1221,6 +1232,133 @@ def test_DSA_indexer_backward_deterministic_plane_specializations(backend, dk_pl
         sm_scale=1.0,
         grad_scale=1.0,
     )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("aliased_name", ["index_q", "d_index_k"])
+@torch_fork_set_rng(seed=1703)
+def test_DSA_indexer_backward_deterministic_workspace_alias_rejected_before_launch(aliased_name):
+    """The live plane scratch cannot overlap a read or write operand."""
+    try:
+        from cudnn import DSA
+        from cudnn.deepseek_sparse_attention.indexer_backward.deterministic_dk_sm100 import deterministic_dk_workspace_bytes
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    _require_exact_sm100()
+
+    cfg = dict(b=1, s_q=96, s_kv=128, head_dim=128, qhead_per_kv_head=64, topk=128)
+    index_q, weights, index_k, attn_score, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
+    d_index_q = torch.empty_like(index_q)
+    d_weights = torch.empty_like(weights)
+    d_index_k = torch.empty_like(index_k)
+    required = deterministic_dk_workspace_bytes(cfg["b"], cfg["s_kv"], cfg["head_dim"])
+    workspace = torch.empty(required, dtype=torch.uint8, device="cuda")
+
+    if aliased_name == "index_q":
+        aliased = workspace[: index_q.numel() * index_q.element_size()].view(index_q.dtype).view_as(index_q)
+        aliased.copy_(index_q)
+        index_q = aliased
+    else:
+        aliased = workspace[: d_index_k.numel() * d_index_k.element_size()].view(d_index_k.dtype).view_as(d_index_k)
+        aliased.zero_()
+        d_index_k = aliased
+
+    plan = DSA.IndexerBackward(
+        index_q,
+        weights,
+        index_k,
+        d_index_q,
+        d_weights,
+        d_index_k,
+        attn_score,
+        index_score,
+        topk_indices,
+        deterministic=True,
+    )
+
+    def launch_tripwire(*args, **kwargs):
+        raise AssertionError("overlapping workspace reached the compiled kernel")
+
+    plan._compiled_kernel = launch_tripwire
+    attn_before = attn_score.clone()
+    aliased_before = aliased.clone()
+    grad_loss = torch.ones((), dtype=torch.float32, device="cuda")
+    with pytest.raises(ValueError, match=rf"workspace must not overlap {aliased_name}"):
+        plan.execute(
+            index_q,
+            weights,
+            index_k,
+            d_index_q,
+            d_weights,
+            d_index_k,
+            attn_score,
+            index_score,
+            topk_indices,
+            grad_loss,
+            loss_coeff=float(cfg["s_q"]),
+            workspace=workspace,
+        )
+    assert torch.equal(attn_score, attn_before)
+    assert torch.equal(aliased, aliased_before)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=1704)
+def test_DSA_indexer_backward_deterministic_workspace_allows_disjoint_view_of_same_allocation():
+    """Only the live scratch prefix aliases; a disjoint shared-storage tail is valid."""
+    try:
+        from cudnn import DSA
+        from cudnn.deepseek_sparse_attention.indexer_backward.deterministic_dk_sm100 import deterministic_dk_workspace_bytes
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    _require_exact_sm100()
+
+    cfg = dict(b=1, s_q=96, s_kv=128, head_dim=128, qhead_per_kv_head=64, topk=128)
+    source_q, weights, index_k, attn_score, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
+    required = deterministic_dk_workspace_bytes(cfg["b"], cfg["s_kv"], cfg["head_dim"])
+    q_bytes = source_q.numel() * source_q.element_size()
+    backing = torch.empty(required + q_bytes, dtype=torch.uint8, device="cuda")
+    workspace = backing
+    index_q = backing[required:].view(source_q.dtype).view_as(source_q)
+    index_q.copy_(source_q)
+    d_index_q = torch.empty_like(index_q)
+    d_weights = torch.empty_like(weights)
+    d_index_k = torch.empty_like(index_k)
+    plan = DSA.IndexerBackward(
+        index_q,
+        weights,
+        index_k,
+        d_index_q,
+        d_weights,
+        d_index_k,
+        attn_score,
+        index_score,
+        topk_indices,
+        deterministic=True,
+    )
+
+    class LaunchIntercepted(Exception):
+        pass
+
+    def launch_tripwire(*args, **kwargs):
+        raise LaunchIntercepted
+
+    plan._compiled_kernel = launch_tripwire
+    with pytest.raises(LaunchIntercepted):
+        plan.execute(
+            index_q,
+            weights,
+            index_k,
+            d_index_q,
+            d_weights,
+            d_index_k,
+            attn_score,
+            index_score,
+            topk_indices,
+            torch.ones((), dtype=torch.float32, device="cuda"),
+            loss_coeff=float(cfg["s_q"]),
+            workspace=workspace,
+        )
 
 
 @pytest.mark.L0

@@ -9,12 +9,13 @@ Combines backend-specific CuTe-DSL kernels:
 * IndexerBackwardSm90 or IndexerBackwardSm100 -- warp-specialized backward (kernel 2).
 * DenseIndexerBackward uses the dense full-KV score-grad + GEMM factories.
 
-When the ``dIndexK`` output buffer is bf16, a trailing pure-torch cast
-(FP32 accumulator → bf16) finishes the pipeline (kernel 3); an fp32
-``dIndexK`` buffer receives the accumulator directly, with no cast. The fp32
-ordinary accumulator behind a bf16 ``dIndexK`` (and the ordinary sm100_v2
-ticket counter) is carved from the caller's workspace; deterministic execution
-uses a compile-time-selected set of CTA-private FP32 dK planes instead.
+In ordinary execution, a bf16 ``dIndexK`` output receives a trailing pure-torch
+cast from its FP32 accumulator (kernel 3); an fp32 ``dIndexK`` buffer is the
+accumulator itself. The ordinary fp32 accumulator behind a bf16 ``dIndexK``
+(and the ordinary sm100_v2 ticket counter) is carved from the caller's
+workspace. Deterministic execution instead uses a compile-time-selected set of
+CTA-private FP32 dK planes and a fixed-order reduction that converts directly to
+the requested output dtype.
 ``scratch_workspace_bytes()`` reports the selected policy's exact size for
 ``execute(..., workspace=)``; the plans own no device memory (Rule 8, R2).
 """
@@ -72,6 +73,24 @@ def _validate_grad_loss_tensor(grad_loss: torch.Tensor, device: torch.device) ->
     if grad_loss.numel() != 1 or grad_loss.dtype != torch.float32 or grad_loss.device != device:
         raise ValueError(f"grad_loss must be a single-element float32 tensor on {device}")
     return grad_loss.detach().view(1)
+
+
+def _validate_deterministic_workspace_disjoint(workspace: torch.Tensor, required: int, **operands: torch.Tensor) -> None:
+    """Reject overlap between the live deterministic scratch and any operand.
+
+    Only the ``required``-byte prefix is live scratch. This permits disjoint
+    views of one allocation and avoids treating empty tensors as aliases.
+    """
+    WorkspaceCarver(workspace, required, "deterministic IndexerBackward")
+    workspace_begin = workspace.data_ptr()
+    workspace_end = workspace_begin + required
+    for name, tensor in operands.items():
+        if tensor is None or tensor.numel() == 0:
+            continue
+        tensor_begin = tensor.data_ptr()
+        tensor_end = tensor_begin + tensor.numel() * tensor.element_size()
+        if workspace_begin < tensor_end and tensor_begin < workspace_end:
+            raise ValueError(f"deterministic IndexerBackward workspace must not overlap {name}")
 
 
 def _contiguous_input(tensor: torch.Tensor, stream) -> torch.Tensor:
@@ -239,10 +258,11 @@ class IndexerBackward(APIBase):
     order.
     dQ/dW remain single-writer. The deterministic scratch is
     ``deterministic_dk_planes * B * S_k * D * 4`` bytes,
-    independent of output dtype. As with a top-k result, valid indices within
-    each query row must be unique; duplicate scatter targets inside one row
-    are outside the deterministic contract. A warmed plan with caller-owned
-    outputs and scratch is CUDA Graph compatible.
+    independent of output dtype. Its live byte range must not overlap any input
+    or output and is validated before the scratch is cleared. As with a top-k
+    result, valid indices within each query row must be unique; duplicate
+    scatter targets inside one row are outside the deterministic contract. A
+    warmed plan with caller-owned outputs and scratch is CUDA Graph compatible.
 
     ``backend="sm100_v2"`` (SM100/SM103, request-or-fail: ``check_support``
     raises outside the envelope, there is no silent fallback) selects an
@@ -685,15 +705,32 @@ class IndexerBackward(APIBase):
             (topk_indices, self.topk_desc, "topk_indices"),
         )
         # The scratch is carved from ``workspace`` on index_q's device; a
-        # missing or undersized buffer is the backend's WorkspaceCarver error,
-        # raised before kernel 1 overwrites ``attn_score``.
+        # missing or undersized buffer is a WorkspaceCarver error raised before
+        # kernel 1 overwrites ``attn_score``. Deterministic execution also
+        # rejects overlap between its live scratch prefix and every operand
+        # before the backend clears the planes.
         if workspace is not None and workspace.device != index_q.device:
             raise ValueError(f"IndexerBackward workspace must be on index_q's device {index_q.device}, got {workspace.device}")
+        grad_loss_tensor = _validate_grad_loss_tensor(grad_loss, index_q.device)
+        if self.deterministic:
+            _validate_deterministic_workspace_disjoint(
+                workspace,
+                self.scratch_workspace_bytes(),
+                index_q=index_q,
+                weights=weights,
+                index_k=index_k,
+                d_index_q=d_index_q,
+                d_weights=d_weights,
+                d_index_k=d_index_k,
+                attn_score=attn_score,
+                index_score=index_score,
+                topk_indices=topk_indices,
+                grad_loss=grad_loss_tensor,
+            )
         # ``grad_scale`` is forwarded as a runtime ``Float32`` arg; the
         # compiled kernel is reused when loss_coeff changes for the same
         # cached tensor shape.
         grad_scale = float(loss_coeff) / (int(self.batch) * int(self.seqlen))
-        grad_loss_tensor = _validate_grad_loss_tensor(grad_loss, index_q.device)
         self._compiled_kernel(
             index_q,
             weights,
@@ -1025,7 +1062,9 @@ def indexer_backward_wrapper(
             bf16 ``d_index_k``, plus the ordinary sm100_v2 ticket counter, or
             the deterministic CTA planes). When omitted
             the wrapper allocates it per call on the launch stream. Calls
-            sharing one buffer must not overlap on the device.
+            sharing one buffer must not overlap on the device. In deterministic
+            mode, the live scratch prefix must not overlap any input or output;
+            ``execute`` rejects such aliases before clearing the planes.
         deterministic: keyword-only opt-in for bitwise-reproducible gradients
             on SM100/SM103. Fixed-owner producer CTAs accumulate into
             CTA-private FP32 planes; a fixed CTA-order reduction writes
