@@ -11,6 +11,14 @@ High-level flow:
   2. load Q/K and SFB/SFA scales into SMEM,
   3. copy scales into TMEM SFB/SFA fields and issue blockscaled QK UMMA,
   4. reduce heads in FP32 to write scores and optional LSE.
+
+Head groups: the tile is always 128 packed (token, head) rows -- the blockscaled
+scale atom is 128 rows, so the Q scale packing (``packed_m = token * group + head``)
+and the TMA / TMEM scale plumbing do not depend on the group size.  64 and 32 heads
+keep their tuned epilogues (one, resp. two tokens per epilogue warpgroup); the small
+groups 4 / 8 / 16 pack ``128 // group`` tokens per tile and the two epilogue
+warpgroups split the tile's 128 columns in halves (``_epilogue_indexer_dense_group``).
+A plain-e4m3 scorer (no block scales) is this kernel with all-ones E8M0 blobs.
 """
 
 from __future__ import annotations
@@ -64,7 +72,9 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
     """Shared MXFP8 dense score kernel with unified indexer output semantics."""
 
     arch = 100
-    max_q_tokens_per_tile = 4
+    # The tile stays 128 packed rows wide for every group (the scale atom), so the
+    # smallest group (4 heads) packs 32 tokens; 64 / 32 heads pack 2 / 4 as before.
+    max_q_tokens_per_tile = 32
 
     def __init__(
         self,
@@ -90,8 +100,8 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
             raise ValueError("SM100 dense score MXFP8 currently requires sf_vec_size=32")
         if m_block_size != 128 or n_block_size != 128:
             raise ValueError("SM100 dense score MXFP8 currently requires m_block_size=n_block_size=128")
-        if qhead_per_kvhead not in (32, 64):
-            raise ValueError("SM100 unified indexer MXFP8 currently requires qhead_per_kvhead=32 or 64")
+        if qhead_per_kvhead not in (4, 8, 16, 32, 64):
+            raise ValueError("SM100 unified indexer MXFP8 requires qhead_per_kvhead in (4, 8, 16, 32, 64), " f"got {qhead_per_kvhead}")
         k_block_size = 64 if k_block_size is None else k_block_size
         # k_block_size is an internal K-split knob (num_k_chunks = head_dim_padded //
         # k_block_size; the per-chunk scale phase + base-class SMEM derive from it), so
@@ -947,6 +957,234 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
 
         return s_full_phase_bits, reduce_phase
 
+    @cute.jit
+    def _epilogue_indexer_dense_group(
+        self,
+        wg_index: cutlass.Constexpr[int],
+        tiled_mma_qk,
+        tStS_ref,
+        sW,
+        sScoreAll,
+        S_mbar_ptr,
+        reduce_sync_mbar_ptr,
+        mOut,
+        mDenom,
+        num_n_blocks_compute,
+        seqlen_k,
+        seqlen_q,
+        max_seqlen_k,
+        q_causal_offset,
+        m_block,
+        tidx,
+        s_full_phase_bits,
+        reduce_phase,
+        softmax_scale,
+        per_head_offset=None,
+        batch_idx=None,
+        cand_batch_offsets=None,
+    ):
+        """Epilogue of the SMALL head groups (4 / 8 / 16 heads per KV head).
+
+        The MXFP8 tile stays 128 packed rows wide (its scale atom), so a group of ``qhpkv``
+        heads packs ``q_tokens_per_tile = 128 // qhpkv`` query tokens per tile (32 / 16 / 8).
+        Each of the two epilogue warpgroups owns one 64-column half of the accumulator --
+        ``tokens_per_wg = q_tokens_per_tile // 2`` tokens -- and loads ONLY its half (the
+        half-tile TMEM load of the QH32 LSE schedule), so a thread carries 64 scores and 64
+        weights instead of the whole 128-column row.  Per n block and token: ReLU(QK) * W over
+        the group's columns (``W_ILP`` pairs per unrolled step, the whole even group for 4 / 8
+        heads), the ratio-causal column limit, one compact or dense store, the optional online
+        LSE.  The TMEM wait / load / release cadence per n block is the one every epilogue of
+        this kernel keeps (one arrive per thread on the slot's empty barrier).
+        """
+        tidx_wg = tidx % self.WARPGROUP_SIZE
+
+        sW_off = Int32(0) if per_head_offset is None else per_head_offset
+        qhpkv = self.qhead_per_kvhead
+        tokens_per_wg = self.q_tokens_per_tile // 2
+        half_cols = tokens_per_wg * qhpkv
+        ratio = Int32(self.ratio)
+
+        # The head reduce walks the group's columns in pairs, W_ILP pairs per unrolled step: the
+        # whole (even) group for 4 / 8 heads so no column is left outside the loop.
+        W_ILP = min(8, qhpkv // 2)
+        q_token_stage_base = wg_index * tokens_per_wg
+        tmem_head_offset = q_token_stage_base * qhpkv
+        sW_half = cute.make_tensor(
+            sW.iterator + sW_off + tmem_head_offset,
+            cute.make_layout((half_cols,), stride=(1,)),
+        )
+        rW_half = cute.make_rmem_tensor((half_cols,), Float32)
+
+        warp_id_in_wg = tidx_wg // self.WARP_SIZE
+        log2_e = Float32(math.log2(math.e))
+
+        q_token_base = m_block * self.q_tokens_per_tile + Int32(q_token_stage_base)
+        q_token_idxs = [q_token_base + Int32(qi) for qi in range(tokens_per_wg)]
+        col_limits = [(q_causal_offset + q_token_idxs[qi] + Int32(1)) // ratio for qi in range(tokens_per_wg)]
+        if cutlass.const_expr(self.is_compressed_logits):
+            q_global_start = Int64(q_causal_offset)
+            if cutlass.const_expr(cand_batch_offsets is not None):
+                cand_batch_base = Int64(cand_batch_offsets[batch_idx])
+            else:
+                cand_batch_base = Int64(batch_idx) * self._row_offset_i64(
+                    Int64(seqlen_q),
+                    q_global_start,
+                )
+            cand_row_offsets = [self._row_offset_i64(Int64(q_token_idxs[qi]), q_global_start) for qi in range(tokens_per_wg)]
+
+        local_max = [-Float32.inf for _ in range(tokens_per_wg)]
+        local_sum_exp = [Float32(0.0) for _ in range(tokens_per_wg)]
+        first_block = Int32(1)
+
+        # This warpgroup's half of the accumulator tile: 128 key rows x half_cols fp32 columns at
+        # column offset tmem_head_offset of every slot.  The Ld32x32b repetition covers the half in
+        # four loads, as the full tile's m_block_size // 4 does for 128 columns.
+        half_repetition = half_cols // 4
+        tStS_half = cute.make_tensor(
+            tStS_ref.iterator,
+            cute.make_layout(((self.n_block_size, half_cols), 1, 1), stride=tStS_ref.layout.stride),
+        )
+
+        n_blk = num_n_blocks_compute - Int32(1)
+        while n_blk >= Int32(0):
+            tmem_load_atom = cute.make_copy_atom(
+                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(half_repetition)),
+                Float32,
+            )
+            thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tStS_half).get_slice(tidx_wg)
+            thr_mma = tiled_mma_qk.get_slice(tidx_wg)
+            cS = cute.make_identity_tensor(self.mma_tiler_qk[:2])
+            tScS = thr_tmem_load.partition_D(thr_mma.partition_C(cS))
+            tSrS_shape = thr_tmem_load.partition_D(cute.make_identity_tensor(tStS_half.shape)).shape
+            tSrS = cute.make_rmem_tensor(tSrS_shape, Float32)
+
+            slot = n_blk % Int32(self.num_tmem_slots)
+            s_full_phase = self._phase_for_slot(s_full_phase_bits, slot)
+            cute.arch.mbarrier_wait(S_mbar_ptr + 2 * slot, s_full_phase)
+
+            if first_block == Int32(1):
+                cute.autovec_copy(sW_half, rW_half)
+                first_block = Int32(0)
+
+            tmem_ptr_cur = cute.make_ptr(
+                Float32,
+                slot * self.tmem_s_stride + tmem_head_offset,
+                mem_space=cute.AddressSpace.tmem,
+                assumed_align=16,
+            )
+            tStS_cur = cute.make_tensor(tmem_ptr_cur, tStS_half.layout)
+            tStS_t2r_cur = thr_tmem_load.partition_S(tStS_cur)
+
+            cute.copy(thr_tmem_load, tStS_t2r_cur, tSrS)
+            cute.arch.fence_view_async_tmem_load()
+
+            cute.arch.mbarrier_arrive(S_mbar_ptr + 2 * slot + 1)
+            s_full_phase_bits = self._toggle_phase_for_slot(
+                s_full_phase_bits,
+                slot,
+            )
+
+            kv_offset = tScS[0][0]
+            pos = kv_offset + n_blk * self.n_block_size
+
+            for qi in cutlass.range_constexpr(tokens_per_wg):
+                q_token_idx = q_token_idxs[qi]
+                col_limit = col_limits[qi]
+                if q_token_idx < seqlen_q and pos < col_limit and pos < seqlen_k:
+                    acc_score_0 = (Float32(0.0), Float32(0.0))
+                    acc_score_1 = (Float32(0.0), Float32(0.0))
+
+                    for ho in cutlass.range_constexpr(qhpkv // 2 // W_ILP):
+                        for ci in cutlass.range_constexpr(W_ILP):
+                            # column within this warpgroup's half: token qi's heads are contiguous
+                            idx0 = qi * qhpkv + (ho * W_ILP + ci) * 2
+                            idx1 = idx0 + 1
+                            w_pair = (rW_half[idx0], rW_half[idx1])
+
+                            val0 = tSrS[idx0]
+                            val0 = val0 if val0 > Float32(0.0) else Float32(0.0)
+                            val1 = tSrS[idx1]
+                            val1 = val1 if val1 > Float32(0.0) else Float32(0.0)
+
+                            if cutlass.const_expr(ci % 2 == 0):
+                                acc_score_0 = fma_packed_f32x2(
+                                    (val0, val1),
+                                    w_pair,
+                                    acc_score_0,
+                                )
+                            else:
+                                acc_score_1 = fma_packed_f32x2(
+                                    (val0, val1),
+                                    w_pair,
+                                    acc_score_1,
+                                )
+
+                    acc_score = add_packed_f32x2(acc_score_0, acc_score_1)
+                    score = (acc_score[0] + acc_score[1]) * Float32(softmax_scale)
+                    if cutlass.const_expr(self.is_compressed_logits):
+                        mOut[cand_batch_base + cand_row_offsets[qi] + Int64(pos)] = score
+                    else:
+                        mOut[q_token_idx, pos] = score
+
+                    if cutlass.const_expr(self.compute_lse):
+                        new_max = score if score > local_max[qi] else local_max[qi]
+                        local_rescale = cute.math.exp2(
+                            (local_max[qi] - new_max) * log2_e,
+                            fastmath=True,
+                        )
+                        local_sum_exp[qi] = local_sum_exp[qi] * local_rescale + cute.math.exp2(
+                            (score - new_max) * log2_e,
+                            fastmath=True,
+                        )
+                        local_max[qi] = new_max
+            n_blk = n_blk - 1
+
+        if cutlass.const_expr(not self.compute_lse):
+            return s_full_phase_bits, reduce_phase
+
+        sScoreAll_sum = cute.make_tensor(
+            sScoreAll.iterator + self.num_warps_in_epi_wg,
+            cute.make_layout((self.num_warps_in_epi_wg,), stride=(1,)),
+        )
+        inv_log2_e = Float32(1.0 / math.log2(math.e))
+
+        for qi in cutlass.range_constexpr(tokens_per_wg):
+            global_max, reduce_phase = self._intra_inter_warp_reduce_max(
+                sScoreAll,
+                reduce_sync_mbar_ptr,
+                reduce_phase,
+                warp_id_in_wg,
+                local_max[qi],
+            )
+
+            lse_val = -Float32.inf
+            if global_max > Float32(-1e30):
+                global_rescale = cute.math.exp2(
+                    (local_max[qi] - global_max) * log2_e,
+                    fastmath=True,
+                )
+                adjusted_sum = local_sum_exp[qi] * global_rescale
+
+                global_sum_exp, reduce_phase = self._intra_inter_warp_reduce_sum(
+                    sScoreAll_sum,
+                    reduce_sync_mbar_ptr,
+                    reduce_phase,
+                    warp_id_in_wg,
+                    adjusted_sum,
+                )
+                lse_val = global_max + cute.math.log2(global_sum_exp) * inv_log2_e
+            else:
+                cute.arch.mbarrier_arrive(reduce_sync_mbar_ptr)
+                cute.arch.mbarrier_wait(reduce_sync_mbar_ptr, reduce_phase)
+                reduce_phase = reduce_phase ^ 1
+
+            q_token_idx = q_token_idxs[qi]
+            if q_token_idx < seqlen_q:
+                with cute.arch.elect_one():
+                    mDenom[q_token_idx] = lse_val
+
+        return s_full_phase_bits, reduce_phase
+
     @cute.kernel
     def kernel(
         self,
@@ -1548,8 +1786,34 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
                             batch_idx=batch_idx,
                             cand_batch_offsets=mCandBatchOffsets,
                         )
-                    else:
+                    elif cutlass.const_expr(self.qhead_per_kvhead == 32):
                         s_full_phase_bits, reduce_phase = self._epilogue_indexer_dense_qh32_pair(
+                            0,
+                            tiled_mma_qk,
+                            tStS_ref,
+                            sPerHead,
+                            sScoreAll_epi0,
+                            S_mbar_ptr,
+                            reduce_sync_mbar_ptr,
+                            mOut_cur,
+                            mDenom_cur,
+                            num_n_blocks_compute,
+                            seqlen.seqlen_k,
+                            seqlen.seqlen_q,
+                            max_seqlen_k,
+                            q_causal_offset,
+                            m_block,
+                            tidx,
+                            s_full_phase_bits,
+                            reduce_phase,
+                            softmax_scale,
+                            per_head_offset=per_head_offset,
+                            batch_idx=batch_idx,
+                            cand_batch_offsets=mCandBatchOffsets,
+                        )
+                    else:
+                        # 4 / 8 / 16 heads: this warpgroup owns the first half of the tile's tokens.
+                        s_full_phase_bits, reduce_phase = self._epilogue_indexer_dense_group(
                             0,
                             tiled_mma_qk,
                             tStS_ref,
@@ -1642,9 +1906,35 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
                             batch_idx=batch_idx,
                             cand_batch_offsets=mCandBatchOffsets,
                         )
-                    else:
+                    elif cutlass.const_expr(self.qhead_per_kvhead == 32):
                         s_full_phase_bits, reduce_phase = self._epilogue_indexer_dense_qh32_pair(
                             2,
+                            tiled_mma_qk,
+                            tStS_ref,
+                            sPerHead,
+                            sScoreAll_epi1,
+                            S_mbar_ptr,
+                            reduce_sync_mbar_ptr_epi1,
+                            mOut_cur,
+                            mDenom_cur,
+                            num_n_blocks_compute,
+                            seqlen.seqlen_k,
+                            seqlen.seqlen_q,
+                            max_seqlen_k,
+                            q_causal_offset,
+                            m_block,
+                            tidx,
+                            s_full_phase_bits,
+                            reduce_phase,
+                            softmax_scale,
+                            per_head_offset=per_head_offset,
+                            batch_idx=batch_idx,
+                            cand_batch_offsets=mCandBatchOffsets,
+                        )
+                    else:
+                        # 4 / 8 / 16 heads: this warpgroup owns the second half of the tile's tokens.
+                        s_full_phase_bits, reduce_phase = self._epilogue_indexer_dense_group(
+                            1,
                             tiled_mma_qk,
                             tStS_ref,
                             sPerHead,

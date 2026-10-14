@@ -352,7 +352,9 @@ compressed column 0.
     `lse_out`) to compute LSE in the same kernel invocation.
   - SM100 `precision="mxfp8"`: Q/K use E4M3 with block-scaled, packed E8M0
     scale tensors; `sf_vec_size` is currently fixed at 32 and
-    `qhead_per_kv_head ∈ {32, 64}`.
+    `qhead_per_kv_head ∈ {4, 8, 16, 32, 64}` (the tile is always 128 packed
+    rows -- the scale atom -- so a 4-head group packs 32 query tokens per
+    tile; all-ones scale blobs make it a plain E4M3 x E4M3 scorer).
     THD inputs additionally require
     `cu_seqlens_q_scale_padded`/`cu_seqlens_k_scale_padded`: contiguous CUDA
     INT32 prefix tensors of shape `(B + 1,)` on the Q/K device. The interface
@@ -365,8 +367,13 @@ compressed column 0.
 - **Constraints** — `head_dim == 128`. The SM90 direct path supports
   `qhead_per_kv_head ∈ {16, 32, 64}` and currently requires `H_kv == 1`;
   SM100 BF16 dense and combined Top-K paths support
-  `qhead_per_kv_head ∈ {32, 64}`, as do their MXFP8 paths. All currently
-  require `H_kv == 1` (MQA).
+  `qhead_per_kv_head ∈ {4, 8, 16, 32, 64}` (a group packs up to 8 query
+  tokens per MMA tile: 4 heads x 8 tokens = 32 columns, ..., 64 heads x 2
+  tokens = 128), their MXFP8 paths the same set at a fixed 128-row tile
+  (4 heads x 32 tokens, ..., 64 heads x 2 tokens). All currently require
+  `H_kv == 1` (MQA). A query may be up to `ratio - 1` tokens longer than
+  `ratio * seqlen_k` (its trailing tokens have not completed a compressed
+  block and score the complete blocks only); a longer one is refused.
 
 ```python
 result = DSA.indexer_forward_wrapper(
@@ -875,13 +882,13 @@ result = DSA.dense_indexer_backward_wrapper(
   descriptor; the issued data movement remains hardware TMA `gather4`.
 - **Indexer Forward only supports `head_dim = 128`**. SM90 supports
   `qhead_per_kv_head ∈ {16, 32, 64}` with `H_kv = 1`; SM100 BF16 and MXFP8
-  support `qhead_per_kv_head ∈ {32, 64}`. Both the dense and combined Top-K
-  paths require `H_kv = 1`.
+  support `qhead_per_kv_head ∈ {4, 8, 16, 32, 64}`. Both the dense and
+  combined Top-K paths require `H_kv = 1`.
 - **Standalone Top-K only up to 2048**; `top_k > 2048` is not supported by
   its radix Top-K kernel. The combined compressed path uses a separate stage-2
   implementation.
 - **Compressed-path limits** — the stage-1 compact score kernel is MQA-only
-  (`H_kv = 1`); MXFP8 requires `qhead_per_kv_head ∈ {32, 64}`; explicit
+  (`H_kv = 1`); MXFP8 keeps its 128-row tile for every head group; explicit
   microbatching cannot be combined with MXFP8, LSE, or explicit per-batch
   causal offsets.
 
