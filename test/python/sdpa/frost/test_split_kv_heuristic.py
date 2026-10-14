@@ -624,8 +624,8 @@ def test_decode_tile_serving_shape_stays_unsplit():
 
 def test_decode_tile_short_kv_at_batch_one_splits():
     """b=1 x 2 KV heads (2 units) over 2048 keys (16 tiles): unsplit, two CTAs
-    stream 16 tiles each (25 us on B300 against trtllm-gen's 10); split 8 puts
-    16 streams on the device for two tiles each plus one combine."""
+    stream 16 tiles each (25 us on B300); split 8 puts 16 streams on the device
+    for two tiles each plus one combine."""
     assert _decode_tile(2, 2048) == 8
     assert _decode_tile(2, 8192) >= 16
 
