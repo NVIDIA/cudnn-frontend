@@ -239,9 +239,11 @@ def validate_knobs(knobs: TriMulKnobs) -> None:
 #            reads -0.3..-2.6 % (the lever carries it); the whole call +8.1 / +8.1 % at 256 x 128 x 1 and +12.5 / +13.4 % at 384 x 128 x 1 -> the 256
 #            and 384 floors take ("major", ln_once="block"); the 129 and 0 floors (N < 256: 0.6-1.2 tile-waves at B 1, the coarser item most exposed)
 #            stay as shipped until measured.
-def _pick(k2_tile: str, k1_pass_order: str, k3_prologue: str, clc_stages: int, ln_pass_form: str, epi_math: str, ln_once: str = "") -> TriMulKnobs:
+def _pick(
+    k2_tile: str, k1_pass_order: str, k3_prologue: str, clc_stages: int, ln_pass_form: str, epi_math: str, ln_once: str = "", ln_once_b_stages: Optional[int] = None
+) -> TriMulKnobs:
     """One COMPLETE bucket pick in axis order (the row tile ``k_block`` is left to :func:`default_k_block`; the LayerNorm-once item ``ln_once`` is OFF
-    unless a bucket's A/B/A set it)."""
+    unless a bucket's A/B/A set it; ``ln_once_b_stages`` (appended) = the item's B-ring depth where a bucket's A/B/A set it, else the shipped ring)."""
     return TriMulKnobs(
         k2_tile=k2_tile,
         k1_pass_order=k1_pass_order,
@@ -250,6 +252,7 @@ def _pick(k2_tile: str, k1_pass_order: str, k3_prologue: str, clc_stages: int, l
         ln_pass_form=ln_pass_form,
         epi_math=epi_math,
         ln_once=ln_once,
+        ln_once_b_stages=ln_once_b_stages,
     )
 
 
@@ -351,6 +354,12 @@ _REFINEMENTS: Dict[int, Tuple[Tuple[int, int, Optional[str], TriMulKnobs], ...]]
 #   c = 256 -- every pick STANDS: the pipelined rolled form + packed + the block item + ring depth 1 + the recorded tile beat every arm on all 18 served
 #            cells (ring depth 2 -0.3..-1.3 %, the rolled form -9.3..-10.5 %, the bias-path fold -1.6..-2.1 %, the per-tile item -35..-46 %, the next tile
 #            -0.1..-4.0 %, kb 128 -0.1..+0.7 % -- the +0.7 % at 256 x 1 outgoing is a single-direction, single-pass read under twice its bar: no row).
+#            THE LayerNorm-once B RING (`ln_once_b_stages`, measured 2026-10-14 on the same node class as a knob arm beside the pick, its control twin and
+#            cuEq in one low-duty process per cell, every arm bitwise the pick and inside the API oracle): on this part the shipped 6-deep ring leaves the
+#            K1 c 256 item ONE resident A slot (2 x 64 KiB + 96 KiB > 192 KiB), so the next row block's load + LayerNorm no longer overlap the current item's
+#            tiles; the 4-deep ring under the item buys the second slot (2 x 64 + 4 x 16 = 192 KiB) and wins on EVERY c 256 cell -- +1.70 / +1.67 % at 256 x 1 (incoming / outgoing), +2.06 / +2.12 % at 384 x 1, +2.55 / +2.47 % at 512 x 1, +2.71 / +2.79 % at 768 x 1, +2.65 / +2.61 % at 1024 x 1, +2.37 / +2.43 % at 1536 x 1, +2.40 / +2.45 % at 256 x 4, +2.74 / +2.78 % at 384 x 4, +2.82 / +2.75 % at 512 x 4 (decisive on 18 / 18 cells, bar 0.5 %; geomean +2.45 %)
+#            -- while the 3-deep ring (also two slots) is neutral (-0.7..+0.2 %): the slot gain and the B-depth loss balance at 3 and the gain wins at 4.
+#            Every c 256 pick: ln_once_b_stages=4.  The Rubin body holds two slots under its own ring and ignores the field (ln_once_b_stages_effective).
 # Whole-call speed-ups of the SEEDED picks over cuEq 0.12.0 on this node class: c 128 +39..+64 %, c 256 +73..+124 %; the cells from N = 1024 (c 128)
 # and N = 512 x 4 / 768 (c 256) ran into the part's 1200 W cap for a fraction of their windows (the counter moved; the sampled median stayed at the lock)
 # and are lower bounds on the absolute time -- the within-process ratios stand.
@@ -366,13 +375,13 @@ _PICKS_SM100: Dict[int, Tuple[Tuple[int, TriMulKnobs], ...]] = {
         (0, _pick(k2.SMALL_N_TILE_CONFIG, "interleaved", "transpose", 2, "registers", "packed")),
     ),
     256: (
-        (1024, _pick(k2.MULTICAST_A2_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", ln_once="block")),
-        (768, _pick(k2.DESIGN_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", ln_once="block")),
-        (512, _pick(k2.MULTICAST_A2_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", ln_once="block")),
-        (384, _pick(k2.SMALL_N_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", ln_once="block")),
-        (256, _pick(k2.DESIGN_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", ln_once="block")),
-        (129, _pick(k2.DESIGN_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", ln_once="block")),
-        (0, _pick(k2.SMALL_N_TILE_CONFIG, "major", "mn_major", 2, "smem_rolled_pf", "packed", ln_once="block")),
+        (1024, _pick(k2.MULTICAST_A2_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", ln_once="block", ln_once_b_stages=4)),
+        (768, _pick(k2.DESIGN_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", ln_once="block", ln_once_b_stages=4)),
+        (512, _pick(k2.MULTICAST_A2_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", ln_once="block", ln_once_b_stages=4)),
+        (384, _pick(k2.SMALL_N_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", ln_once="block", ln_once_b_stages=4)),
+        (256, _pick(k2.DESIGN_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", ln_once="block", ln_once_b_stages=4)),
+        (129, _pick(k2.DESIGN_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", ln_once="block", ln_once_b_stages=4)),
+        (0, _pick(k2.SMALL_N_TILE_CONFIG, "major", "mn_major", 2, "smem_rolled_pf", "packed", ln_once="block", ln_once_b_stages=4)),
     ),
 }
 _REFINEMENTS_SM100: Dict[int, Tuple[Tuple[int, int, Optional[str], TriMulKnobs], ...]] = {

@@ -221,22 +221,23 @@ def test_heuristics_sm100_column_is_the_measured_gb200_table():
         "sm107",
         "sm107",
     )
-    # the bucket picks: (width, N floor) -> (k2 tile, K1 order, K3 prologue, ring depth, LayerNorm form, epilogue form, work item)
+    # the bucket picks: (width, N floor) -> (k2 tile, K1 order, K3 prologue, ring depth, LayerNorm form, epilogue form, work item, the item's B-ring depth
+    # (None = the shipped ring; 4 on every c 256 pick since the 2026-10-14 A/B: the second resident A slot on the 227 KiB part))
     picks = {
-        (128, 1024): (k2.MULTICAST_A2_TILE_CONFIG, "major", "transpose", 2, "registers", "packed", "block"),
-        (128, 768): (k2.DESIGN_TILE_CONFIG, "major", "transpose", 1, "registers", "packed", "block"),
-        (128, 512): (k2.MULTICAST_A2_TILE_CONFIG, "major", "transpose", 1, "registers", "packed", "block"),
-        (128, 384): (k2.SMALL_N_TILE_CONFIG, "major", "transpose", 2, "smem_rolled_pf", "packed", "block"),
-        (128, 256): (k2.DESIGN_TILE_CONFIG, "major", "transpose", 2, "smem_rolled", "packed", "block"),
-        (128, 129): (k2.DESIGN_TILE_CONFIG, "interleaved", "transpose", 1, "registers", "packed", ""),
-        (128, 0): (k2.SMALL_N_TILE_CONFIG, "interleaved", "transpose", 2, "registers", "packed", ""),
-        (256, 1024): (k2.MULTICAST_A2_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", "block"),
-        (256, 768): (k2.DESIGN_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", "block"),
-        (256, 512): (k2.MULTICAST_A2_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", "block"),
-        (256, 384): (k2.SMALL_N_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", "block"),
-        (256, 256): (k2.DESIGN_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", "block"),
-        (256, 129): (k2.DESIGN_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", "block"),
-        (256, 0): (k2.SMALL_N_TILE_CONFIG, "major", "mn_major", 2, "smem_rolled_pf", "packed", "block"),
+        (128, 1024): (k2.MULTICAST_A2_TILE_CONFIG, "major", "transpose", 2, "registers", "packed", "block", None),
+        (128, 768): (k2.DESIGN_TILE_CONFIG, "major", "transpose", 1, "registers", "packed", "block", None),
+        (128, 512): (k2.MULTICAST_A2_TILE_CONFIG, "major", "transpose", 1, "registers", "packed", "block", None),
+        (128, 384): (k2.SMALL_N_TILE_CONFIG, "major", "transpose", 2, "smem_rolled_pf", "packed", "block", None),
+        (128, 256): (k2.DESIGN_TILE_CONFIG, "major", "transpose", 2, "smem_rolled", "packed", "block", None),
+        (128, 129): (k2.DESIGN_TILE_CONFIG, "interleaved", "transpose", 1, "registers", "packed", "", None),
+        (128, 0): (k2.SMALL_N_TILE_CONFIG, "interleaved", "transpose", 2, "registers", "packed", "", None),
+        (256, 1024): (k2.MULTICAST_A2_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", "block", 4),
+        (256, 768): (k2.DESIGN_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", "block", 4),
+        (256, 512): (k2.MULTICAST_A2_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", "block", 4),
+        (256, 384): (k2.SMALL_N_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", "block", 4),
+        (256, 256): (k2.DESIGN_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", "block", 4),
+        (256, 129): (k2.DESIGN_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", "block", 4),
+        (256, 0): (k2.SMALL_N_TILE_CONFIG, "major", "mn_major", 2, "smem_rolled_pf", "packed", "block", 4),
     }
     # the refinements: (width, N floor, batch bucket, direction or None) -> the ONE axis overridden
     refinements = [
@@ -247,7 +248,7 @@ def test_heuristics_sm100_column_is_the_measured_gb200_table():
         (128, 512, 4, None, {"clc_stages": 2}),
         (256, 0, 4, None, {"clc_stages": 1}),
     ]
-    axes = ("k2_tile", "k1_pass_order", "k3_prologue", "clc_stages", "ln_pass_form", "epi_math", "ln_once")
+    axes = ("k2_tile", "k1_pass_order", "k3_prologue", "clc_stages", "ln_pass_form", "epi_math", "ln_once", "ln_once_b_stages")
     for c in (128, 256):
         for n in (33, 128, 217, 256, 384, 512, 768, 1024, 1536, 2048):
             for b in (1, 4):
