@@ -329,8 +329,8 @@ def test_d128_large_scores_keep_rows_finite_and_nonzero(a):
     M * scale + ln(256). The FP32 path forms each exponent as one FFMA, s * k - c with k = scale * log2(e) and c = M * k
     rounded once per row, so the top score's exponent is c's rounding error instead of 0: about -16 at M = 4.8e9, -256 or
     less from M = 7.7e10 on, where every P underflows and normalize_row takes its empty-row branch (O = 0, Stats = -inf).
-    The FP64 guard engages only above 2**126 (about 8.5e37), so it never sees these rows. The three largest cases are
-    expected red until the exponent formula changes: this test is their detector (python/cudnn/AGENTS.md)."""
+    With the row limit at 2**24 / |k| (about 1.3e8 here) every case from M = 4.8e9 on takes the FP64 exponents instead;
+    with only the old overflow limit (2**126) the three largest cases fail. This test is the detector."""
     q, k, v = _inputs(1, 2, 2, 128, 256, torch.bfloat16)
     q.fill_(a)
     k.fill_(a)

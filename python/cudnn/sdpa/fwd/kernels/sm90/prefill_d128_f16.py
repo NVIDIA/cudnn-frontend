@@ -416,7 +416,6 @@ class SM90FusedMultiHeadAttentionForward:
             # sum pass. Column c = 2*k_frag + j extends extremum chain c % 4; the four
             # chains are independent.
             score_pairs, validity, chains = [], [], []
-            local_abs = cutlass.Float32(0.0)
             for k_frag in cutlass.range_constexpr(self.qk_row_slots // 2):
                 s_off = k_frag * 4
                 # A zero scale scores every valid key 0, so a live row's anchor is 0 and
@@ -438,12 +437,6 @@ class SM90FusedMultiHeadAttentionForward:
                 else:
                     chain = 2 * (k_frag % 2)
                     chains[chain], chains[chain + 1] = extremum(chains[chain], s0), extremum(chains[chain + 1], s1)
-                if cutlass.const_expr(self.scale_mode == SCALE_POSITIVE):
-                    # A magnitude guard, not a finiteness proof: fmax quiets NaNs.
-                    if valid0:
-                        local_abs = cute.arch.fmax(local_abs, cute.math.abs(s0))
-                    if valid1:
-                        local_abs = cute.arch.fmax(local_abs, cute.math.abs(s1))
 
             scores = RegTile(vec_concat(score_pairs), size=self.qk_row_slots)
 
@@ -458,12 +451,14 @@ class SM90FusedMultiHeadAttentionForward:
             alive, old_alive = current != sentinel, old != sentinel
             safe_current, safe_old = current if alive else zero, old if old_alive else zero
             # A negative scale always takes FP64 exponents and a zero scale never does.
-            # A positive scale takes them when the launch-uniform term is set, or when a
-            # valid score, either anchor or their distance could overflow the FP32
-            # products.
+            # A positive scale takes them when the launch-uniform term is set, or when an
+            # anchor is large enough that rounding anchor * k once per row (the FFMA
+            # exponent's subtrahend) could move the top exponent by more than 1, or the
+            # anchors' distance could overflow. The anchors bound every score that can
+            # carry probability: a score far below its anchor has P = 0 on either path.
             wide = cutlass.Boolean(self.scale_mode < SCALE_ZERO)
             if cutlass.const_expr(self.scale_mode == SCALE_POSITIVE):
-                bound = cute.arch.fmax(cute.arch.fmax(quad_reduce(local_abs, "max"), cute.math.abs(safe_current)), cute.math.abs(safe_old))
+                bound = cute.arch.fmax(cute.math.abs(safe_current), cute.math.abs(safe_old))
                 wide = softmax_params.wide_uniform
                 if bound > softmax_params.wide_floor:
                     wide = (
@@ -657,12 +652,15 @@ class SM90FusedMultiHeadAttentionForward:
             scale_log2_wide = cutlass.Float64(scale) * cutlass.Float64(LOG2_E)
             wide_uniform, wide_floor, wide_limit = cutlass.Boolean(False), cutlass.Float32(0.0), cutlass.Float32(0.0)
             if cutlass.const_expr(self.scale_mode == SCALE_POSITIVE):
-                # Launch-uniform: decide the scale-only guard once, in setup.
+                # Launch-uniform: decide the scale-only guard once, in setup. The row limit is
+                # the smaller of the FP32 overflow bound and 2**24 / |k|: past |anchor * k| =
+                # 2**24 one rounding of anchor * k moves the top exponent by more than 1.
                 magnitude = cutlass.Float64(cute.math.abs(scale_log2))
                 wide_uniform = magnitude > cutlass.Float64(FLT_MAX_F64)
                 limit = cutlass.Float32(cutlass.Float64(FLT_MAX_F64) / magnitude)
                 if cutlass.Float64(limit) * magnitude > cutlass.Float64(FLT_MAX_F64):
                     limit = (limit.bitcast(cutlass.Uint32) - cutlass.Uint32(1)).bitcast(cutlass.Float32)
+                limit = cute.arch.fmin(limit, cutlass.Float32(cutlass.Float64(2.0**24) / magnitude))
                 wide_floor, wide_limit = cute.arch.fmin(limit, cutlass.Float32(2.0**126)), limit
             # Natural-log scale for finalization, FP32/FP64 log2 scales for EX2, and the
             # launch-uniform guard terms for the per-row magnitude test.
