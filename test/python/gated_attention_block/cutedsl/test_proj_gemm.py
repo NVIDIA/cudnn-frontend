@@ -987,3 +987,96 @@ def test_fused_fp8_runner_rejects_wrong_bindings():
         launch(cos=inp["cos"].to(_FP8))  # the table dtype is the ACTIVATION dtype, not a.dtype
     with pytest.raises(ValueError, match="e4m3 operands"):
         launch(a=inp["a8"].to(torch.bfloat16))
+
+
+# ---------------------------------------------------------------------------
+# The SMALL-M route: the serving DECODE / MTP row counts (T = B x S_q <= 128)
+# ---------------------------------------------------------------------------
+
+from cudnn.gated_attention_block.kernels.proj_gemm import _FORCED_TILE_NAME, SMALL_M_MAX, small_m_tile_config  # noqa: E402
+
+# The Flash-Next 24/2 shard's two projections: the fused QKV + gate slab (N = (2 h_q + 2 h_kv) d_head) and the out projection.
+_FLASH_NEXT_24_2 = dict(d_model=2560, n_qkvg=(2 * 24 + 2 * 2) * 256, k_o=24 * 256)
+_RUBIN_SMS = 212
+
+
+@pytest.mark.parametrize(
+    "m, n, k, expect",
+    [
+        # the WIDE slab: a 64-row weight tile fills the machine (208 CTAs on 212 SMs) -> the 2x1-cluster swap-AB tile, tokens as the N tile
+        (1, _FLASH_NEXT_24_2["n_qkvg"], _FLASH_NEXT_24_2["d_model"], "CONFIG_sm100_64x8x128_64x8x32_cluster2x1_1ctamma_swapAB"),
+        (4, _FLASH_NEXT_24_2["n_qkvg"], _FLASH_NEXT_24_2["d_model"], "CONFIG_sm100_64x8x128_64x8x32_cluster2x1_1ctamma_swapAB"),
+        (9, _FLASH_NEXT_24_2["n_qkvg"], _FLASH_NEXT_24_2["d_model"], "CONFIG_sm100_64x16x128_64x16x32_cluster2x1_1ctamma_swapAB"),
+        (32, _FLASH_NEXT_24_2["n_qkvg"], _FLASH_NEXT_24_2["d_model"], "CONFIG_sm100_64x32x128_64x32x32_cluster2x1_1ctamma_swapAB"),
+        (64, _FLASH_NEXT_24_2["n_qkvg"], _FLASH_NEXT_24_2["d_model"], "CONFIG_sm100_64x64x128_64x64x32_cluster2x1_1ctamma_swapAB"),
+        (128, _FLASH_NEXT_24_2["n_qkvg"], _FLASH_NEXT_24_2["d_model"], "CONFIG_sm100_128x64x128_128x64x32_cluster1x1_1ctamma"),
+        # the NARROW out projection: 20 weight tiles of 128 rows -> split-K 8 fills one wave
+        (1, _FLASH_NEXT_24_2["d_model"], _FLASH_NEXT_24_2["k_o"], "CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_splitK8_swapAB"),
+        (32, _FLASH_NEXT_24_2["d_model"], _FLASH_NEXT_24_2["k_o"], "CONFIG_sm100_128x32x128_128x32x32_cluster1x1_1ctamma_splitK8_swapAB"),
+        (64, _FLASH_NEXT_24_2["d_model"], _FLASH_NEXT_24_2["k_o"], "CONFIG_sm100_128x64x128_128x64x32_cluster1x1_1ctamma_splitK8_swapAB"),
+        # past 64 tokens the narrow projection takes the plain 64x32 tile (N / 32 CTAs over the full K)
+        (128, _FLASH_NEXT_24_2["d_model"], _FLASH_NEXT_24_2["k_o"], "CONFIG_sm100_64x32x128_64x32x32_cluster1x1_1ctamma"),
+    ],
+)
+def test_small_m_route_names_a_swap_ab_tile_for_decode_row_counts(m, n, k, expect):
+    """The route is a pure function of the shape and the SM count: the token tile is the power of two >= T, the weight
+    tile and the slice count follow the weight's width.  Every name it spells resolves in the catalog grammar."""
+    from cudnn.gemm.frost.tile_config import by_name
+
+    name = small_m_tile_config(m, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS)
+    assert name == expect
+    cfg = by_name(name)
+    assert cfg.swap_ab == name.endswith("_swapAB")
+    assert cfg.cta_tile_n >= min(m, 128) or not cfg.swap_ab  # the token tile covers the step
+
+
+def test_small_m_route_leaves_prefill_rows_on_the_forced_tile():
+    """Past SMALL_M_MAX nothing changes: the 256-wide forced tile is the prefill / training plan it always was."""
+    n, k = _FLASH_NEXT_24_2["n_qkvg"], _FLASH_NEXT_24_2["d_model"]
+    assert small_m_tile_config(SMALL_M_MAX + 1, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS) is None
+    assert small_m_tile_config(8192, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS) is None
+    from cudnn.gated_attention_block.kernels.proj_gemm import _auto_tile_name
+
+    assert _auto_tile_name(8192, n, k, dtype=torch.bfloat16, a_major="k", b_major="k", block_scale=False, alpha=False) == _FORCED_TILE_NAME
+    assert _auto_tile_name(1, n, k, dtype=torch.bfloat16, a_major="k", b_major="k", block_scale=False, alpha=False) != _FORCED_TILE_NAME
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        dict(dtype=torch.float8_e4m3fn),  # the fp8 plans keep their validated forced tile (and the alpha epilogue)
+        dict(dtype=torch.bfloat16, alpha=True),
+        dict(dtype=torch.bfloat16, block_scale=True),
+        dict(dtype=torch.bfloat16, a_major="m"),  # the backward's transposed operands
+        dict(dtype=torch.bfloat16, b_major="n"),
+    ],
+    ids=["fp8", "alpha", "block_scale", "a_mmajor", "b_nmajor"],
+)
+def test_small_m_route_is_dense_k_major_bf16_only(kwargs):
+    assert small_m_tile_config(4, _FLASH_NEXT_24_2["n_qkvg"], _FLASH_NEXT_24_2["d_model"], sm_count=_RUBIN_SMS, **kwargs) is None
+
+
+@requires_rubin
+@pytest.mark.parametrize("m", [1, 4, 32, 128])
+@pytest.mark.parametrize("shape", ["qkvg", "out"])
+def test_small_m_plans_run_the_named_tile_and_match_torch_linear(m, shape):
+    """The block's own driver at the 24/2 shard's shapes and the decode row counts: the plan names the small-M tile (never
+    the forced one), the kernel matches the fp32 reference within the module's budget, and two launches agree bitwise
+    (the split-K reducer is fixed-order)."""
+    n, k = (_FLASH_NEXT_24_2["n_qkvg"], _FLASH_NEXT_24_2["d_model"]) if shape == "qkvg" else (_FLASH_NEXT_24_2["d_model"], _FLASH_NEXT_24_2["k_o"])
+    torch.manual_seed(0)
+    a = (torch.randn(m, k, device="cuda", dtype=torch.float32) * 0.1).to(torch.bfloat16)
+    w = (torch.randn(n, k, device="cuda", dtype=torch.float32) * 0.05).to(torch.bfloat16)
+    out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
+    plan = build_proj_gemm(m=m, k=k, n=n, dtype=torch.bfloat16, label=f"small_m_{shape}", capture_safe=True)
+    assert plan.tile_config_name != _FORCED_TILE_NAME
+    assert plan.tile_config_name == small_m_tile_config(m, n, k, dtype=torch.bfloat16)
+    assert plan.route == "jit-only"
+    _run(plan, a, w, out)
+    first = out.clone()
+    _run(plan, a, w, out)
+    assert torch.equal(first.view(torch.int16), out.view(torch.int16))
+    ref = torch.nn.functional.linear(a.float(), w.float())
+    cos = torch.nn.functional.cosine_similarity(out.float().flatten(), ref.flatten(), dim=0).item()
+    assert cos > 0.999, f"cos {cos}"
+    assert torch.isfinite(out.float()).all()
