@@ -128,6 +128,11 @@ _SM107_NO_GQA_LPT_MAX_WAVES = 24
 # b32 32/8 q8 KV 8k f16: 0.80x), so the other policy stays listed as the runner.  The unpacked (MHA) decode tile
 # measured parity (b128 64/8 unpacked 0.997-1.025) and keeps the Rubin no-GQA wave rule.
 _SM107_DECODE_TILE_LPT_MIN_KV = 2048
+# cc 10.7 D128 nonpaged THD split: the shortest cache it is proposed for (the SM100 line keeps 2048; 1024-token caches
+# lost up to 1.29x warm), and below 2048 the cache must hold this many query rows' worth (Q256 over 1-2k caches lost up
+# to 1.39x to the backend).
+_SM107_THD_SPLIT_MIN_KV = 1280
+_SM107_THD_SPLIT_SHORT_KV_RATIO = 12
 # Dense d128 half past one decode tile: one cga2 wave (512-row clusters on SMs / 2 slots) costs this many single-CTA
 # decode-tile waves (128-row CTAs on every SM); the narrower tile leads while its grid quantizes into no more than that.
 # Fit on cc 10.7 (216 SMs) and B300 (148 SMs) bottom-right causal prefill / chunk cells (issue #1518).
@@ -1918,7 +1923,8 @@ def nonpaged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
         and 1 <= facts.b <= 4
         and 4 <= facts.h_q <= 64
         and (8 if counted_d128 else 64) <= facts.s_q <= 1024
-        and 2048 <= facts.s_kv <= 32768
+        and (_SM107_THD_SPLIT_MIN_KV if counted_d128 and caps.sm_lo == 107 else 2048) <= facts.s_kv <= 32768
+        and (facts.s_kv >= 2048 or _SM107_THD_SPLIT_SHORT_KV_RATIO * facts.s_q <= facts.s_kv)
         and 4 * facts.s_q <= facts.s_kv
         and (not facts.causal or facts.bottom_right)
         and not facts.right_band_widening
@@ -1946,11 +1952,12 @@ def nonpaged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
             if counted_d128 and caps.sm_lo == 107 and s > 16:
                 break  # Rubin D128 was measured at splits 2-16
             if s > 1 and units * s <= budget and kv_tiles // s >= 4:
-                # Fewest waves x loop, then fewer partials, then unpacked.
-                choices.append((_ceil_div(units * s, facts.device_sm_count) * _ceil_div(kv_tiles, s), s, pack))
+                # Fewest waves x loop, then fewer partials, then unpacked (packed on Rubin).
+                prefer = not pack if caps.sm_lo == 107 else pack
+                choices.append((_ceil_div(units * s, facts.device_sm_count) * _ceil_div(kv_tiles, s), s, prefer, pack))
     if not choices:
         return 1, False
-    _, splits, pack = min(choices)
+    _, splits, _, pack = min(choices)
     return splits, pack
 
 
