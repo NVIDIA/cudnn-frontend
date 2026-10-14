@@ -57,7 +57,11 @@ windows_dlopen(const char *name) {
     }
     auto handle = LoadLibraryExA(library, nullptr, flags);
     if (!handle) {
-        handle = LoadLibraryA(name);
+        const auto error = GetLastError();
+        handle           = LoadLibraryA(name);
+        if (!handle) {
+            SetLastError(error);
+        }
     }
     if (handle) {
         SetLastError(ERROR_SUCCESS);
