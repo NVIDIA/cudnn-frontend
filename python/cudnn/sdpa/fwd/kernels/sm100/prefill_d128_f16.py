@@ -209,7 +209,34 @@ from cudnn.sdpa.fwd.kernels._common_blackwell import (
     lpt_tile_coords,
     row_max_for_exp2,
     make_sdpa_helpers,
+    sdpa_bias_tensor,
+    sdpa_kv_mask_tensor,
 )
+from cudnn.frost.tile_dsl.regtile import vec_concat
+from cudnn.frost.tile_dsl.bias import (
+    bias_block_geometry,
+    issue_bias_block_load,
+    load_bias_row_chunk,
+    bias_fma_chunk,
+    additive_vec_granules,
+    additive_vec_fma_chunk,
+    max_f16x2_word,
+    packed_row_max_words,
+    packed_pair_max_f32,
+)
+from cudnn.frost.tile_dsl.mask import kv_mask_keep_words
+from cudnn.sdpa.fwd.config_d128_family import (
+    BIAS_MODE_RESIDENT,
+    BIAS_STREAMED_MODES,
+    BIAS_MODE_STREAMED_MULTICAST,
+    KV_MASK_BOOL_WORD,
+    KV_MASK_ADDITIVE_16,
+    KV_MASK_ADDITIVE_F32,
+    BIAS_MAX_HW_UPPER_BOUND,
+    BIAS_PRELOAD_CHUNKS_DOMAIN,
+    bias_smem_tiles,
+)
+from cudnn.sdpa.fwd.config_sm100 import sm100_bias_preload_chunks
 
 CGA_SIZE = CFG.CGA_M * CFG.CGA_N
 
@@ -464,6 +491,93 @@ class KernelTmemLayout:
 
 LAYOUT = KernelTmemLayout()
 
+# === Additive bias (resident row-block) + per-key kv_mask: CFG.BIAS_MODE / CFG.KV_MASK_FORM -- the SM100 port of the Rubin small tiles'
+# arms (sm107/prefill_d128_f16.py; the same const_expr fields, the shared tile_dsl.bias / tile_dsl.mask primitives, the same two item-level
+# barrier rows of make_classic_bars(bias_resident=True)).  Both arms fold on their Cfg field (TemplateParams.bias_mode / kv_mask_form):
+# 0 / 0 traces the pre-bias instruction stream byte for byte (the committed sm_100a records pin it).  Either arm routes EVERY kv tile of
+# the item through the -inf masked softmax body (_softmax_kv_body_inf): the bias in NATURAL units added pre-scale as one packed FFMA per
+# pair (s_raw + bias * inv_scale), the band mask AND the kv_mask keep word in one bit-word pass with the TRUE -inf, the online softmax of
+# the -inf form (total_max from -inf, row_max_for_exp2 on both alpha operands), so a row whose every key is masked ends the item with
+# total_sum == 0 exactly and the correction epilogue's row_dead SELECT writes O = 0 / Stats = -inf.
+#
+# BARRIER TABLE -- the two ITEM-level rows CFG.BIAS_MODE == 1 adds (counts in LANES per phase per CTA; the sixteen rows of the plain body
+# are unchanged, _common_blackwell.make_classic_bars):
+#   mb_bias_full    TMA_LOAD / LOCAL / 1 stage.  Producer: the TMA-LDG warp, ONCE per non-empty item, after the item's Q / K / V prologue
+#                   loads, INSIDE tile_dsl.bias.issue_bias_block_load (the single elected arrive.expect_tx of n_tiles x tile_bytes, then the
+#                   tiles' boxes with cta_group=1 -- every byte lands on THIS CTA's mbar, on BOTH CTAs at cga2; the call site adds no arrive)
+#                   -> 1 lane x 1 warp = ONE_LANE (1 == 1).  Consumer: both softmax warp groups, once per non-empty item before their
+#                   first bias read (bias_full_phase, start(0)).  bytes = (kv_right - kv_left) x BIAS_BOXES_PER_TILE full 64-column boxes
+#                   of BIAS_BLOCK_ROWS rows (an overshooting box past S_q / S_kv is zero-filled AND counted).
+#   mb_bias_empty   THREAD / LOCAL / 1 stage.  Producer: every softmax warp, ONCE per non-empty item, after the item's LAST bias read
+#                   (`if nvvm.elect_sync(): arrive()` -- THREAD has no pred= path) -> 1 lane x 8 warps = BIAS_EMPTY_ARRIVERS
+#                   (SOFTMAX_WARPGROUPS x SOFTMAX_WG_WARPS, pinned by the config validator; 8 == 8).  Consumer: the TMA-LDG warp before
+#                   the NEXT item's fill (bias_empty_phase PRE-ARMED at 1, P5 b).
+#   An EMPTY item (kv_right <= kv_left, MAY_BE_EMPTY) fires and waits NEITHER row on either side: the TMA-LDG folds the fill out with
+#   its prologue, the softmax keys its wait / release on `item_live = bounds.right > bounds.left` -- the same decode, the same range
+#   (the invariant mb_empty_mainloop already rests on).  No cross-CTA arrive on either row -> no P15 drain.  The kv_mask word adds no
+#   barrier row and no SMEM buffer (4 byte loads + 4 ballots per 128-column tile per warp; the additive vector is a warp-uniform GMEM
+#   granule load); BIAS_MAX_FORM is a pure instruction-stream axis.
+# SMEM BUFFER ROW (frost-kernels s 5): sBias = BIAS_RESIDENT_TILES x BIAS_BLOCK_ROWS x TILE_N of the io dtype, declared LAST (after sV:
+# the descriptor-fed operands first, the lane-read block last), written by TMA under the 128-byte swizzle atom (job D) and read by the
+# softmax lanes one 128-byte row slice per 64-column box each (job L: a per-lane stride of 128 B is the bank cycle -- the 16-byte
+# chunk index XOR (row % 8) of cutlass.Swizzle(3, 4, 3) spreads eight rows over eight bank groups, 4 wavefronts per warp-wide load).
+# The SM100 budget (227 KiB usable, the derived carveout of config_d128_family.bias_resident_tiles at SM100_ARCH) sizes the block:
+# 2 tiles (S_kv 256) on the 32-wide tile's one-batch-entry item at cga1, 1 tile (128) on the 64-wide tile at cga2, none on the 64-wide
+# tile at cga1 (the factory declines that typed).
+_BIAS_ARM = bool(CFG.BIAS_MODE)
+_BIAS_RESIDENT = CFG.BIAS_MODE == BIAS_MODE_RESIDENT
+_BIAS_STREAMED = CFG.BIAS_MODE in BIAS_STREAMED_MODES
+_BIAS_MCAST = CFG.BIAS_MODE == BIAS_MODE_STREAMED_MULTICAST
+_KV_MASK_ARM = bool(CFG.KV_MASK_FORM)
+_KV_MASK_BOOL = CFG.KV_MASK_FORM == KV_MASK_BOOL_WORD
+_KV_MASK_ADD = CFG.KV_MASK_FORM in (KV_MASK_ADDITIVE_16, KV_MASK_ADDITIVE_F32)
+# The kv_mask operand's element type at the tvm-ffi boundary: bytes for the bit word, the io dtype / fp32 for the additive vector.
+KV_MASK_DTYPE = cutlass.Int8 if _KV_MASK_BOOL else (cutlass.Float32 if CFG.KV_MASK_FORM == KV_MASK_ADDITIVE_F32 else STORAGE_DTYPE)
+_INF_MASK_ARM = _BIAS_ARM or _KV_MASK_ARM
+# The ROW-MAX FORM of the -inf body (CFG.BIAS_MAX_FORM): 0 = the software row_max_reduction over the biased, masked scores; 1 = the
+# HARDWARE UPPER BOUND -- max_k S_raw * scale_log2 + max_k bias_row * (inv_scale * scale_log2) >= the true row max (the bit-word mask
+# can only lower it; any m >= the true max is valid for the online softmax, the slack is the row's raw score range inside the tile).
+# On cc 10.0 the raw chunk max is the plain body's MANUAL tree (no LDTM.STAT); cc 10.3 fuses it (tmem_load_max_reduction_x64) -- the
+# bias tile's packed max ahead of the bmm1_done wait is the saving on both; its sign on this arch line is a GB200 A/B cell.
+_HW_UPPER_MAX = CFG.BIAS_MAX_FORM == BIAS_MAX_HW_UPPER_BOUND
+# Bias chunks pre-loaded ABOVE the bmm1_done wait (per rendering, from the KV tile width): the Rubin table as the PRIOR until measured.
+BIAS_PRELOAD_CHUNKS: int = sm100_bias_preload_chunks(CFG.TILE_N)
+_BIAS_PRELOAD_EFF: int = BIAS_PRELOAD_CHUNKS if CFG.SOFTMAX_WARPGROUPS == 2 else 0
+if BIAS_PRELOAD_CHUNKS not in BIAS_PRELOAD_CHUNKS_DOMAIN:
+    raise ValueError(f"prefill_d128_f16_sm100: BIAS_PRELOAD_CHUNKS must be one of {sorted(BIAS_PRELOAD_CHUNKS_DOMAIN)} (got {BIAS_PRELOAD_CHUNKS})")
+if _INF_MASK_ARM and IS_TF32:
+    raise ValueError("prefill_d128_f16_sm100: the bias / kv_mask arms are wired for the 16-bit dtypes only")
+if _BIAS_ARM and (_BIAS_RESIDENT == _BIAS_STREAMED):
+    raise ValueError(f"prefill_d128_f16_sm100: CFG.BIAS_MODE={CFG.BIAS_MODE} is neither the resident block (1) nor the streamed ring (2 / 3)")
+if _HW_UPPER_MAX and not _INF_MASK_ARM:
+    raise ValueError("prefill_d128_f16_sm100: CFG.BIAS_MAX_FORM=1 is the row-max form of the bias / kv_mask body; this config has neither arm")
+if _HW_UPPER_MAX and _KV_MASK_ADD:
+    # The additive vector has no per-tile max to bound: the upper bound could sit BELOW the true row max (P > 1, an overflowing exp2).
+    raise ValueError(f"prefill_d128_f16_sm100: CFG.BIAS_MAX_FORM=1 is served with the bit-word kv_mask or none (KV_MASK_FORM={CFG.KV_MASK_FORM})")
+if _INF_MASK_ARM and (CFG.THD_VARLEN or SPLIT_KV > 1 or CFG.PACK_GQA or PAGED_KV):
+    raise ValueError("prefill_d128_f16_sm100: the bias / kv_mask arms serve dense, unsplit, unpaged, non-PackGQA renderings only")
+# The seams of the Rubin small tiles NOT yet on this file -- trace-time backstops (the adapter declines each typed before a plan reaches
+# here; the config validators accept the records for both archs, so the kernel states its own envelope): the streamed / multicast bias
+# ring (BIAS_MODE 2 / 3), the (n, n+1) pair item (N_CHUNK), the double-buffered S (S_SLOTS 2), the third softmax warp group, Q in TMEM,
+# the pre-masked padded tail, the dead-sub-tile quiet body and the 64-wide KV tile.
+if _BIAS_STREAMED:
+    raise ValueError(
+        f"prefill_d128_f16_sm100: the streamed bias ring (CFG.BIAS_MODE={CFG.BIAS_MODE}) is not wired on the SM100 file yet; the resident block (1) is"
+    )
+if CFG.N_CHUNK > 0:
+    raise ValueError(f"prefill_d128_f16_sm100: the (n, n+1) pair item (CFG.N_CHUNK={CFG.N_CHUNK}) is not wired on the SM100 file yet")
+if CFG.S_SLOTS != 1 or CFG.Q_IN_TMEM or CFG.SOFTMAX_WARPGROUPS != 2:
+    raise ValueError(
+        f"prefill_d128_f16_sm100: S_SLOTS={CFG.S_SLOTS} / Q_IN_TMEM={CFG.Q_IN_TMEM} / SOFTMAX_WARPGROUPS={CFG.SOFTMAX_WARPGROUPS}: the two-slot S, Q in TMEM and the "
+        f"third softmax warp group are not wired on the SM100 file yet (one slot, Q in SMEM, two groups)"
+    )
+if CFG.PADDED_TAIL_FORM or CFG.DEAD_SUBTILE_QUIET:
+    raise ValueError(
+        f"prefill_d128_f16_sm100: PADDED_TAIL_FORM={CFG.PADDED_TAIL_FORM} / DEAD_SUBTILE_QUIET={CFG.DEAD_SUBTILE_QUIET} are not wired on the SM100 file yet"
+    )
+if CFG.TILE_N != 128:
+    raise ValueError(f"prefill_d128_f16_sm100: TILE_N={CFG.TILE_N}: the 64-wide KV tile is not wired on the SM100 file yet (128 only)")
+
 
 # === Kernel ===
 
@@ -508,6 +622,17 @@ def _kernel(
     # None), so a plan without them traces byte-identically to before the slots existed.
     score_max_tensor: Optional[cute.Tensor] = None,
     score_sum_exp_tensor: Optional[cute.Tensor] = None,
+    # Bias / kv_mask arms (APPENDED, every one None-specialised: a plan without the arm passes None for each and traces
+    # byte-identically to before they existed -- the committed sm_100a records pin it).  The resident bias block's LOAD
+    # descriptor; the bias tensor [B_b, H_b, S_q, S_kv] (unread in the body: the descriptor carries the address; present so
+    # the bias-on artifact binds it at the tvm-ffi boundary) with its two broadcast extents; the per-key boolean mask as a
+    # (B, S_kv) byte view (or the additive vector); 1 / softmax_scale for the pre-scale bias add.
+    tma_bias_desc: Optional[cutlass.GridConstant[tmap.TensorMap]] = None,
+    bias_tensor: Optional[cute.Tensor] = None,
+    bias_b_extent: Optional[cutlass.Int32] = None,
+    bias_h_extent: Optional[cutlass.Int32] = None,
+    kv_mask_tensor: Optional[cute.Tensor] = None,
+    inv_scale_softmax: Optional[cutlass.Float32] = None,
 ) -> None:
     if cutlass.const_expr(PARAMS.thd_batch_one):
         # Specialize only declared batch capacity; Q/KV lengths remain live.
@@ -582,8 +707,32 @@ def _kernel(
         tma_granu_elems=TMA_O_GRANU_ELEMS_HOST,
         tma_subtile_stride_elems=CFG.TILE_M * TMA_O_GRANU_ELEMS_HOST,
     )
+    # The bias block -- LAST in SMEM (the buffer lanes read directly sits after every descriptor-fed operand; the SMEM BUFFER ROW at
+    # the module constants).  One stage per resident kv tile; each tile is BIAS_BOXES_PER_TILE 64-column boxes, box-major, 128 B per
+    # row per box (tile_dsl.bias.bias_block_geometry, all from CFG).  None when the arm is off (never traced).
+    sBias_raw = (
+        cutlass.Array(STORAGE_DTYPE, _BIAS_GG.n_tiles * _BIAS_GG.tile_elems, alignment=1024, space=cutlass.AddressSpace.smem)
+        if cutlass.const_expr(_BIAS_ARM)
+        else None
+    )
+    sBias = (
+        SmemTile(
+            base=sBias_raw,
+            elems_per_stage=_BIAS_GG.tile_elems,
+            stages=_BIAS_GG.n_tiles,
+            leading_byte_offset=0,
+            stride_byte_offset=0,
+            layout=SMEM_LAYOUT_BIAS,
+            tma_loads_per_tile=_BIAS_GG.boxes_per_tile,
+            tma_granu_elems=_BIAS_GG.granu_elems,
+            tma_subtile_stride_elems=_BIAS_GG.subtile_stride_elems,
+        )
+        if cutlass.const_expr(_BIAS_ARM)
+        else None
+    )
 
-    bars = make_classic_bars(CFG)
+    # The two item-level bias rows join the bundle on the resident form only (False traces the pre-bias bundle byte for byte).
+    bars = make_classic_bars(CFG, bias_resident=_BIAS_RESIDENT)
 
     tmem_ptr_i32 = cutlass.Array(cutlass.Int32, 1, alignment=16, space=cutlass.AddressSpace.smem)
 
@@ -633,6 +782,10 @@ def _kernel(
                 nvvm.mbarrier_init(sched.mb_read_tile_id.subview(s), READ_TILE_ARRIVERS_TOTAL)
             bars.mb_tmem_dealloc.init()
             bars.mb_empty_mainloop.init()
+            if cutlass.const_expr(_BIAS_RESIDENT):
+                # The two item-level bias rows (one stage each; the same single-warp, single-lane init block, before the fence).
+                bars.mb_bias_full.init()
+                bars.mb_bias_empty.init()
 
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync()
@@ -674,6 +827,9 @@ def _kernel(
             cta_in_pair=cta_in_pair,
             qh_per_kh=qh_per_kh,
             track_true_max=_score_stats,
+            sBias=sBias,
+            kv_mask_tensor=kv_mask_tensor,
+            inv_scale=inv_scale_softmax,
         )
 
     elif warp_idx >= CFG.SOFTMAX_WG1_BASE and warp_idx < CFG.SOFTMAX_WG1_BASE + CFG.SOFTMAX_WG_WARPS:
@@ -696,6 +852,9 @@ def _kernel(
             cta_in_pair=cta_in_pair,
             qh_per_kh=qh_per_kh,
             track_true_max=_score_stats,
+            sBias=sBias,
+            kv_mask_tensor=kv_mask_tensor,
+            inv_scale=inv_scale_softmax,
         )
 
     elif warp_idx >= CFG.CORR_WARP_BASE and warp_idx < CFG.CORR_WARP_BASE + CFG.CORRECTION_WARPS:
@@ -774,6 +933,8 @@ def _kernel(
         nvvm.prefetch_tensormap(tma_q_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_k_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_v_desc.get_ptr())
+        if cutlass.const_expr(_BIAS_ARM):
+            nvvm.prefetch_tensormap(tma_bias_desc.get_ptr())
         _tmaldg_warp_group(
             tma_q_desc=tma_q_desc,
             tma_k_desc=tma_k_desc,
@@ -798,6 +959,10 @@ def _kernel(
             block_table_tensor=block_table_tensor,
             block_table_v_tensor=block_table_v_tensor,
             paged_hnd=paged_hnd,
+            tma_bias_desc=tma_bias_desc,
+            sBias=sBias,
+            bias_b_extent=bias_b_extent,
+            bias_h_extent=bias_h_extent,
         )
 
     elif warp_idx == CFG.TMASTG_WARP_ID:
@@ -933,6 +1098,11 @@ def _tmaldg_warp_group(
     block_table_tensor=None,
     block_table_v_tensor=None,
     paged_hnd: cutlass.Constexpr[bool] = False,
+    # Resident bias block (appended; the call is by keyword).  None = bias off (CFG.BIAS_MODE == 0).
+    tma_bias_desc=None,
+    sBias=None,
+    bias_b_extent=None,
+    bias_h_extent=None,
 ):
     """Unified TMA-LDG warp — cga1 / cga2 x MASK_NONE / PADDED / CAUSAL / SWA.
 
@@ -942,6 +1112,10 @@ def _tmaldg_warp_group(
     """
     q_empty_phase = cutlass.Int32(1)
     kv_state = PipelineState.start(phase=1)
+    # mb_bias_empty consumer phase, PRE-ARMED at 1 (P5 b): the first item's block is untouched, so the first wait must return with no
+    # producer arrive.  Loop-carried like q_empty_phase; flips once per NON-empty item on both sides.
+    bias_empty_phase = cutlass.Int32(1)
+    tma_bias = GmemTileTma(tma_bias_desc) if cutlass.const_expr(_BIAS_ARM) else None
 
     # Q-reload gate: under QO_ALIAS the next tile's Q-load must wait for the
     # prior tile's O (sharing the slab) to drain — TMA-STG fires mb_q_o_alias
@@ -1161,6 +1335,20 @@ def _tmaldg_warp_group(
                     acquire=not (CFG.THD_VARLEN and not PAGED_KV),
                 )
             kv_state = advance(kv_state, CFG.STAGES_KV)
+
+            if cutlass.const_expr(_BIAS_RESIDENT):
+                # The resident bias block for this item: wait the readers' release of the previous block, then ONE expect_tx for the
+                # whole block and its tiles' boxes (both inside issue_bias_block_load).  Queued AFTER the prologue's Q / K / V so BMM1 of
+                # the first kv tile is not delayed behind the block, and BEFORE the mainloop fills (a fill after them deadlocks through
+                # the k_empty ring at n_kv > STAGES_KV: the softmax's first step needs the block).  The head / batch coordinates are
+                # clamped to the bias tensor's broadcast extents (a dim of 1 reads row 0); the block row is the CTA's 256-row q block.
+                bars.mb_bias_empty.wait(bias_empty_phase)
+                bias_empty_phase = bias_empty_phase ^ cutlass.Int32(1)
+                bias_head = cute.math.min(head_idx, bias_h_extent - cutlass.Int32(1))
+                bias_batch = cute.math.min(batch_idx, bias_b_extent - cutlass.Int32(1))
+                issue_bias_block_load(
+                    sBias, tma_bias, bars.mb_bias_full, kv_right - kv_left, _BIAS_GG.tile_bytes, CFG.TILE_N, kv_left, q_row_base, bias_head, bias_batch
+                )
 
             for kv_loop in cutlass.range(kv_left + cutlass.Int32(1), kv_right, 1, unroll=1):
                 kv_row_base = kv_loop * CFG.TILE_N
@@ -1416,6 +1604,10 @@ SMEM_LAYOUT_K = _SWZ_ENUM[CFG.K_SWZ_BYTES]
 SMEM_LAYOUT_V = _SWZ_ATOM_32B if IS_TF32 else _SWZ_ENUM[CFG.V_SWZ_BYTES]
 SMEM_LAYOUT_O = _SWZ_ENUM[CFG.O_SWZ_BYTES]
 SMEM_LAYOUT_QKO = SMEM_LAYOUT_Q
+# The resident bias block's geometry (every term from CFG: the box count, the expect_tx and the per-lane offsets are ONE arithmetic;
+# n_tiles = the form's SMEM extent) and its 128-byte swizzle enum.  None / the Q layout when the arm is off (never traced).
+_BIAS_GG = bias_block_geometry(CFG, swz_enum=_SWZ_ENUM, n_tiles=bias_smem_tiles(CFG)) if _BIAS_ARM else None
+SMEM_LAYOUT_BIAS = _BIAS_GG.layout_enum if _BIAS_ARM else SMEM_LAYOUT_QKO
 
 # O SMEM swizzle: third param is the XOR shift offset (=3 across all widths), NOT the B value.
 _O_SWZ_B = {128: 3, 64: 2, 32: 1}[CFG.O_SWZ_BYTES]
@@ -2015,6 +2207,219 @@ def _softmax_kv_body(
 
 
 @cute.jit
+def _softmax_kv_body_inf(
+    sub_tile_id: int,
+    kv_loop,
+    kv_tile_rel,
+    tmem_ptr_i32,
+    bars,
+    q_abs,
+    block_row,
+    batch_idx,
+    eff_seqlen_kv,
+    eff_seqlen_q,
+    scale_log2,
+    inv_scale,
+    total_max,
+    total_max_safe,
+    total_sum,
+    bmm1_phase,
+    stat_empty_phase,
+    leader_cta_id,
+    sBias,
+    kv_mask_tensor,
+):
+    """The per-iter kv body of the BIAS / KV_MASK arms (CFG.BIAS_MODE or CFG.KV_MASK_FORM): every kv tile of the item takes this path.
+    The Rubin twin's body on this file's plain ``_softmax_kv_body(apply_mask=True)`` skeleton (the same waits, publishes and fences;
+    one S / P slot, Q in SMEM, two softmax warp groups).  Differences from the plain masked body, in pipeline order:
+
+    1. BEFORE the ``bmm1_done`` wait (no BMM1 dependency): the kv_mask keep words of this tile (4 byte loads + 4 ballots per warp;
+       ``tile_dsl.mask.kv_mask_keep_words``) and the first ``BIAS_PRELOAD_CHUNKS`` 64-column bias chunks of the calling lane's row
+       from the resident block (one swizzled 128-byte load each, kept as 32 packed 16-bit pairs).
+    2. Per 64-column chunk after the raw S load: ``s = bias * inv_scale + s`` as one ``fma.rn.f32x2`` per pair (the bias in NATURAL
+       units added pre-scale, so the exp2 argument ``s * scale_log2 - m`` keeps its form), the additive kv_mask vector the same way,
+       then the band mask AND the kv_mask word in ONE bit-word pass with the TRUE -inf.
+    3. The online softmax of the -inf form (the plain body's own on this file): ``total_max`` from -inf, the 0-substitution at the point
+       of use on BOTH alpha operands (``row_max_for_exp2``), so a dead iteration ships ``P == 0`` and alpha == 1 exactly and a row whose
+       every key is masked ends the item with ``total_sum == 0`` (the correction epilogue's ``row_dead`` SELECT reads that).
+    4. CFG.BIAS_MAX_FORM == 1 (the hardware upper-bound row max): the iteration's max is the UPPER BOUND ``max_k S_raw * scale_log2 +
+       max_k bias_row * (inv_scale * scale_log2)`` -- the raw chunk max from the fused ``tcgen05.ld.red...max`` on cc 10.3 and from the
+       plain body's manual tree on cc 10.0 (no LDTM.STAT there), the bias row max in the packed 16-bit domain ahead of the wait; the
+       software tree over the masked scores folds out.  Any m >= the true max is valid; the slack is the row's raw range in the tile.
+
+    ``kv_tile_rel`` = ``kv_loop - bounds.left``, the tile's index inside the resident block; ``block_row`` = the lane's row inside the
+    256-row block (``sub_tile_id * TILE_M + tid_in_wg``).  Returns (total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase).
+    """
+    tmem_S_off = LAYOUT.S0_OFF if sub_tile_id == 0 else LAYOUT.S1_OFF
+    tmem_P_off = LAYOUT.P0_OFF if sub_tile_id == 0 else LAYOUT.P1_OFF
+    stats_off = LAYOUT.STATS_OFF + sub_tile_id * LAYOUT.STATS_STRIDE
+    CHUNK = _SOFTMAX_CHUNK
+    P_COLS_PER_CHUNK = CHUNK // 2
+    N_CHUNKS = CFG.N_BMM2_CHUNKS
+    WORDS_PER_CHUNK = CHUNK // 32
+    RESCALE_THRESHOLD = cutlass.Float32(CFG.RESCALE_THRESHOLD)
+    kv_col_base = kv_loop * cutlass.Int32(CFG.TILE_N)
+
+    # 1. Loads with no BMM1 dependency go ahead of the wait.
+    kv_words = None
+    if cutlass.const_expr(_KV_MASK_BOOL):
+        kv_words = kv_mask_keep_words(kv_mask_tensor, batch_idx, kv_col_base, eff_seqlen_kv, CFG.TILE_N)
+    # Python comprehensions (not a staged loop / container mutation): the pre-loaded chunks' packed words.
+    bias_pre = [load_bias_row_chunk(sBias.base, _BIAS_GG, kv_tile_rel, c, block_row) for c in range(min(_BIAS_PRELOAD_EFF, N_CHUNKS))] if _BIAS_ARM else []
+    # The hardware upper-bound form: EVERY chunk's packed per-row bias max is computed HERE, ahead of the wait.  The pre-loaded chunks
+    # reduce the words they keep for the FFMA; a non-pre-loaded chunk is read ONCE MORE through an opaque offset and its 32 words die
+    # right after the tree (one shared load would hold the FFMA's words across both TMEM chunks: the Rubin rendering's 37 / 44 spills).
+    bias_max_words = (
+        [packed_row_max_words(w, dtype=STORAGE_DTYPE) for w in bias_pre]
+        + [
+            packed_row_max_words(load_bias_row_chunk(sBias.base, _BIAS_GG, kv_tile_rel, c, block_row, opaque_offset=True), dtype=STORAGE_DTYPE)
+            for c in range(min(_BIAS_PRELOAD_EFF, N_CHUNKS), N_CHUNKS)
+        ]
+        if (_BIAS_ARM and _HW_UPPER_MAX)
+        else []
+    )
+
+    bars.mb_bmm1_done[sub_tile_id].wait(bmm1_phase, spin=SPIN_RING_WAITS)
+    bmm1_phase = bmm1_phase ^ 1
+
+    tmem_base = tmem_ptr_i32.load()
+    s_addr_base = tmem_base + cutlass.Int32(tmem_S_off)
+    p_addr_base = tmem_base + cutlass.Int32(tmem_P_off)
+    stats_addr = tmem_base + cutlass.Int32(stats_off)
+
+    # 2. Raw S chunk -> + bias (pre-scale) -> + the additive vector -> band mask AND kv_mask word (-inf) -> the row max: the software
+    #    tree over the masked scores (CFG.BIAS_MAX_FORM 0) or the hardware upper bound (1).
+    causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else None
+    chunks_S = []
+    chunk_raw_max = []  # per chunk: the raw scores' row max (the hardware upper-bound form only)
+    for c in cutlass.range_constexpr(N_CHUNKS):
+        if cutlass.const_expr(_HW_UPPER_MAX and FUSED_LDTM_STAT != 0):
+            # cc 10.3: the fused tcgen05.ld.red...max -- the chunk's data registers AND its raw row max at index CHUNK.
+            res = tmem_load_max_reduction_x64(s_addr_base + cutlass.Int32(c * CHUNK))
+            raw = cutlass.Vector.from_elements(tuple(res[:CHUNK]), cutlass.Int32).bitcast(cutlass.Float32)
+            chunk_raw_max.append(cutlass.Vector.from_elements((res[CHUNK],), cutlass.Int32).bitcast(cutlass.Float32)[0])
+        else:
+            raw = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(s_addr_base + cutlass.Int32(c * CHUNK), cutlass.Float32), num=CHUNK)
+            if cutlass.const_expr(_HW_UPPER_MAX):
+                # cc 10.0 has no LDTM.STAT: the raw chunk's row max is the plain body's manual tree, over the RAW scores (before the mask).
+                chunk_raw_max.append(row_max_reduction(raw))
+        if cutlass.const_expr(_BIAS_ARM):
+            # Chunk c's words: pre-loaded ahead of the wait, or loaded here (a Python ternary on a trace-time bool).
+            bias_words = bias_pre[c] if c < _BIAS_PRELOAD_EFF else load_bias_row_chunk(sBias.base, _BIAS_GG, kv_tile_rel, c, block_row)
+            s_chunk = bias_fma_chunk(raw, bias_words, inv_scale, CHUNK, dtype=STORAGE_DTYPE)
+        else:
+            s_chunk = raw
+        if cutlass.const_expr(_KV_MASK_ADD):
+            # The additive per-key vector: this chunk's 64 values (warp-uniform 16-byte granules, loaded right here so at most one
+            # granule is live beside the S chunk) folded pre-scale like the bias.
+            s_chunk = additive_vec_fma_chunk(
+                s_chunk,
+                additive_vec_granules(kv_mask_tensor, batch_idx, kv_col_base + cutlass.Int32(c * CHUNK), eff_seqlen_kv, CHUNK, dtype=KV_MASK_DTYPE),
+                inv_scale,
+                CHUNK,
+                dtype=KV_MASK_DTYPE,
+            )
+        keep = tuple(kv_words[c * WORDS_PER_CHUNK : (c + 1) * WORDS_PER_CHUNK]) if cutlass.const_expr(_KV_MASK_BOOL) else None
+        chunks_S.append(
+            apply_mask_chunk(
+                s_chunk,
+                q_abs,
+                kv_col_base + cutlass.Int32(c * CHUNK),
+                eff_seqlen_kv,
+                CFG.WINDOW_LEFT,
+                CFG.MASK_FLAGS,
+                N=CHUNK,
+                bottom_right=CFG.BOTTOM_RIGHT,
+                causal_diag=causal_diag,
+                mask_value=float("-inf"),
+                window_right=CFG.WINDOW_RIGHT,
+                keep_words=keep,
+            )
+        )
+    reg_S_vec = vec_concat(chunks_S)
+    if cutlass.const_expr(_HW_UPPER_MAX):
+        # The UPPER BOUND of this iteration's true row max in the exp2 argument's units: max_k S_raw * scale_log2 (masked columns included
+        # -- they can only LOWER the true max) + max_k bias_row * (inv_scale * scale_log2) (the bias adds pre-scale as bias * inv_scale).
+        raw_max = chunk_raw_max[0]
+        for m in chunk_raw_max[1:]:
+            raw_max = cute.math.max(raw_max, m)
+        if cutlass.const_expr(_BIAS_ARM):
+            bias_pair = bias_max_words[0]
+            for w in bias_max_words[1:]:
+                bias_pair = max_f16x2_word(bias_pair, w, dtype=STORAGE_DTYPE)
+            current_max = raw_max * scale_log2 + packed_pair_max_f32(bias_pair, dtype=STORAGE_DTYPE) * (inv_scale * scale_log2)
+        else:
+            current_max = raw_max * scale_log2
+    else:
+        chunks_max = [row_max_reduction(chunks_S[c]) for c in range(N_CHUNKS)]
+        current_max_unscaled = chunks_max[0]
+        for m in chunks_max[1:]:
+            current_max_unscaled = cute.math.max(current_max_unscaled, m)
+        current_max = current_max_unscaled * scale_log2  # -inf when every column of this iteration is masked
+    reg_S = RegTile(reg_S_vec, size=CFG.TILE_N)
+
+    # Named-barrier wg0/wg1 sync: sub_tile_id==1 waits at TOP for sub_tile_id==0's bottom arrive.
+    if sub_tile_id == 1:
+        nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
+
+    # 3. Online softmax, -inf form (the plain body's: total_max starts at -inf, a dead iteration never moves it).
+    update_cond = (current_max - total_max) > RESCALE_THRESHOLD
+    total_max = cutlass.Float32(arith.select(update_cond.ir_value(), current_max.ir_value(), total_max.ir_value()))
+    new_total_max_safe = row_max_for_exp2(total_max)
+    alpha = cute.math.exp2(cute.math.min(total_max_safe - new_total_max_safe, cutlass.Float32(0.0)), fastmath=True)
+    total_max_safe = new_total_max_safe
+
+    alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
+    nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
+    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+    bars.mb_stat_full[sub_tile_id].arrive()
+    # Publish fence: keeps the alpha publish ahead of the exp burst (see _NB_FENCE_ALPHA).
+    named_barrier_fence(_NB_FENCE_ALPHA + sub_tile_id, 32 * CFG.SOFTMAX_WG_WARPS)
+
+    reg_S = reg_S * scale_log2 - total_max_safe
+
+    chunk_S_0 = reg_S[0:CHUNK].vec
+    if cutlass.const_expr(_E2E_ENABLED):
+        chunk_P_0 = exp2_mixed(chunk_S_0, _E2E_PAIRS[0], CHUNK)
+    else:
+        chunk_P_0 = cute.math.exp2(chunk_S_0, fastmath=True)
+    hoisted_sum = row_reduction_pair(chunk_P_0)
+    chunk_P_0_fp16 = chunk_P_0.to(STORAGE_DTYPE)
+    nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_base, cutlass.Float32), chunk_P_0_fp16)
+    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+    bars.mb_bmm2_ready[sub_tile_id * N_CHUNKS + 0].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+    # Publish fence: keeps the chunk-0 P publish ahead of chunk 1's exps (see _NB_FENCE_P0).
+    named_barrier_fence(_NB_FENCE_P0 + sub_tile_id, 32 * CFG.SOFTMAX_WG_WARPS)
+
+    deferred_P_1 = None
+    if cutlass.const_expr(N_CHUNKS == 2):
+        chunk_S_1 = reg_S[CHUNK : 2 * CHUNK].vec
+        if cutlass.const_expr(_E2E_ENABLED):
+            deferred_P_1 = exp2_mixed(chunk_S_1, _E2E_PAIRS[1], CHUNK)
+        else:
+            deferred_P_1 = cute.math.exp2(chunk_S_1, fastmath=True)
+        chunk_P_1_fp16 = deferred_P_1.to(STORAGE_DTYPE)
+        nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_base + cutlass.Int32(P_COLS_PER_CHUNK), cutlass.Float32), chunk_P_1_fp16)
+        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+        bars.mb_bmm2_ready[sub_tile_id * N_CHUNKS + 1].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+
+    # wg0 fires bottom sync to release wg1 spinning at TOP barrier.
+    if sub_tile_id == 0:
+        nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
+
+    new_p_sum_pair = hoisted_sum
+    if cutlass.const_expr(N_CHUNKS == 2):
+        new_p_sum_pair = new_p_sum_pair + row_reduction_pair(deferred_P_1)
+    alpha_pair = cutlass.Vector.from_elements((alpha, alpha), cutlass.Float32)
+    total_sum = total_sum * alpha_pair + new_p_sum_pair
+
+    bars.mb_stat_empty[sub_tile_id].wait(stat_empty_phase, spin=SPIN_RING_WAITS)
+    stat_empty_phase = stat_empty_phase ^ 1
+
+    return total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase
+
+
+@cute.jit
 def _softmax_warp_group(
     sub_tile_id: int,
     seqlen_q,
@@ -2033,8 +2438,16 @@ def _softmax_warp_group(
     cta_in_pair,
     qh_per_kh,
     track_true_max: bool = False,
+    # Bias / kv_mask arms (appended; the call is by keyword).  None = the arm is off.
+    sBias=None,
+    kv_mask_tensor=None,
+    inv_scale=None,
 ):
     """Softmax warp group (one of two): online softmax per kv iter.
+
+    CFG.BIAS_MODE / CFG.KV_MASK_FORM: every kv tile runs ``_softmax_kv_body_inf`` (the -inf-masked body with the bias add and the
+    kv_mask word); with the resident block, each warp waits ``mb_bias_full`` once per non-empty item before its first read and
+    releases ``mb_bias_empty`` once per non-empty item after its last (``if elect_sync():`` -> one lane per warp; 8 == init).
 
     Each lane owns one row of the 128 x 128 S_acc tile, loads its 128 fp32
     cols with a single tcgen05.ld.red.max, runs online softmax (total_max +
@@ -2059,6 +2472,8 @@ def _softmax_warp_group(
     stat_empty_phase = cutlass.Int32(1)  # bootstrap pre-armed at phase 1 so first wait passes immediately
     # init phase=1; each softmax wg waits its own O slot (see the top-of-tile wait).
     epilogue_state = cutlass.Int32(1)
+    # mb_bias_full consumer phase (wait-then-arrive, start(0)); flips once per NON-empty item, like the producer's.
+    bias_full_phase = cutlass.Int32(0)
 
     # total_sum kept as Vector[Float32, 2] (even/odd partials) so per-iter update lowers to packed FMUL2 + FADD2.
     total_max = NEG_INF
@@ -2123,7 +2538,45 @@ def _softmax_warp_group(
         stat_empty_phase = stat_empty_phase ^ 1
         # 3-segment kv loop: LEFT-masked / fully-unmasked / RIGHT-masked.
         # At MASK_NONE bounds collapse so the two masked sub-loops have empty range and fold out.
-        if cutlass.const_expr(CFG.MASK_FLAGS == MASK_NONE):
+        if cutlass.const_expr(_INF_MASK_ARM):
+            # Bias / kv_mask: ONE loop, every tile through the -inf masked body.  The resident block is waited once per non-empty
+            # item (the TMA-LDG warp arms it once; the predicate is the SAME kv range both decodes produced, so an empty item
+            # touches neither bias barrier on either side).
+            item_live = bounds.right > bounds.left
+            if cutlass.const_expr(_BIAS_RESIDENT):
+                if item_live:
+                    bars.mb_bias_full.wait(bias_full_phase)
+                    bias_full_phase = bias_full_phase ^ cutlass.Int32(1)
+            for kv_loop in cutlass.range(bounds.left, bounds.right, 1, unroll=1):
+                total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body_inf(
+                    sub_tile_id,
+                    kv_loop,
+                    kv_loop - bounds.left,
+                    tmem_ptr_i32,
+                    bars,
+                    q_abs,
+                    cutlass.Int32(sub_tile_id * CFG.TILE_M) + tid_in_wg,
+                    batch_idx,
+                    eff_seqlen_kv,
+                    eff_seqlen_q,
+                    scale_log2,
+                    inv_scale,
+                    total_max,
+                    total_max_safe,
+                    total_sum,
+                    bmm1_phase,
+                    stat_empty_phase,
+                    leader_cta_id,
+                    sBias,
+                    kv_mask_tensor,
+                )
+            if cutlass.const_expr(_BIAS_RESIDENT):
+                if item_live:
+                    # The block's LAST read of this item is behind us (the FMAs that consumed every lane's words precede this point):
+                    # release it to the TMA-LDG warp -- one lane per warp (THREAD arrives have no pred= path, so the elect is a branch).
+                    if nvvm.elect_sync():
+                        bars.mb_bias_empty.arrive()
+        elif cutlass.const_expr(CFG.MASK_FLAGS == MASK_NONE):
             for kv_loop in cutlass.range(bounds.left, bounds.right, 1, unroll=1):
                 total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase, true_max = _softmax_kv_body(
                     False,
@@ -2678,6 +3131,16 @@ def _host(
     score_sum_exp_ptr: Optional[cute.Pointer] = None,
     score_max_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64] = (0, 0, 0),
     score_sum_exp_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64] = (0, 0, 0),
+    # Additive bias [B_b, H_b, S_q, S_kv] in the io dtype (APPENDED; the prepared binder fills them): pointer, its (batch, head, q-row)
+    # element strides and its two broadcast extents (B_b in {1, B}, H_b in {1, QH}); the per-key kv_mask [B_m, S_kv] (bytes, or the
+    # additive vector) with its batch element stride; 1 / softmax_scale for the pre-scale bias add.  None / zeros on a plan without
+    # the arm (CFG.BIAS_MODE / KV_MASK_FORM fold the paths out; compile() backstops).
+    bias_ptr: Optional[cute.Pointer] = None,
+    bias_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64] = (0, 0, 0),
+    bias_extents: Tuple[int, int] = (1, 1),
+    kv_mask_ptr: Optional[cute.Pointer] = None,
+    kv_mask_batch_stride: cutlass.Int64 = 0,
+    inv_scale_softmax: cutlass.Float32 = 1.0,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     """Host entry: device pointers, runtime extents and strides in, TMA encodes and launches out.
@@ -2758,6 +3221,8 @@ def _host(
     vo_box_o = (1, CFG.TILE_M // HEADS_PER_TILE, HEADS_PER_TILE, _O_GRANU_ELEMS)
     score_max_tensor = sdpa_score_tensor(score_max_ptr, problem_size, score_max_strides)
     score_sum_exp_tensor = sdpa_score_tensor(score_sum_exp_ptr, problem_size, score_sum_exp_strides)
+    bias_tensor = sdpa_bias_tensor(bias_ptr, problem_size, bias_strides, bias_extents)
+    kv_mask_tensor = sdpa_kv_mask_tensor(kv_mask_ptr, problem_size, kv_mask_batch_stride)
     stride_order = (3, 2, 1, 0)
     # Paged KV: the in-page layout is nothing but the pool's strides.  HND
     # storage ([num_pages, H_kv, page_size, D]) viewed as [page, row, H_kv, D]
@@ -2804,6 +3269,23 @@ def _host(
         swizzle=_tma_swz(CFG.O_SWZ_BYTES),
         l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
     )
+    # Resident bias block LOAD descriptor over the bias tensor's (B_b, H_b, S_q, S_kv) dims: one box = BIAS_BLOCK_ROWS rows x 64
+    # columns under the 128-B swizzle (tile_dsl.bias.bias_block_geometry).  None when the arm is off: every bias / kv_mask kernel
+    # argument is None-specialised so the plain rendering keeps its parameter list (and its cubin).
+    tma_bias_desc = (
+        tmap.create_tensor_map_tiled_from_view(
+            bias_tensor,
+            box_dims=_BIAS_GG.box_dims,
+            stride_order=stride_order,
+            swizzle=_tma_swz(_BIAS_GG.swz_bytes),
+            l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
+        )
+        if cutlass.const_expr(bias_tensor is not None)
+        else None
+    )
+    bias_b_ext = cutlass.Int32(bias_extents[0]) if cutlass.const_expr(bias_tensor is not None) else None
+    bias_h_ext = cutlass.Int32(bias_extents[1]) if cutlass.const_expr(bias_tensor is not None) else None
+    inv_scale_arg = inv_scale_softmax if cutlass.const_expr(_INF_MASK_ARM) else None
 
     # Each cluster pair (CTA_MMA CTAs) collectively covers TILE_M*TILES_Q*CTA_MMA Q rows;
     # without the cluster-wide divisor cga2 over-launches and OOB clusters collide in GMEM.
@@ -2866,6 +3348,12 @@ def _host(
         paged_hnd,
         score_max_tensor,
         score_sum_exp_tensor,
+        tma_bias_desc,
+        bias_tensor,
+        bias_b_ext,
+        bias_h_ext,
+        kv_mask_tensor,
+        inv_scale_arg,
     ).launch(
         grid=grid_shape,
         block=[CFG.THREADS_PER_CTA, 1, 1],
@@ -2887,8 +3375,14 @@ def compile(  # noqa: A001
     paged_hnd: bool = False,
     has_score_max: bool = False,
     has_score_sum_exp: bool = False,
+    has_bias: bool = False,
+    has_kv_mask: bool = False,
 ) -> Callable:
     """Compile the host entry for one layout kind.
+
+    ``has_bias`` / ``has_kv_mask`` (APPENDED) bind the additive bias (pointer + strides + broadcast extents) and the per-key
+    kv_mask (pointer + batch stride) at the tvm-ffi boundary; each must agree with the module's ``CFG.BIAS_MODE`` /
+    ``CFG.KV_MASK_FORM`` (the TemplateParams decided the traced arm, this key only shapes the argument list).
 
     Extents and strides are runtime arguments (see ``_host``), except the
     existing ``thd_batch_one`` template specialization of batch capacity,
@@ -2921,6 +3415,14 @@ def compile(  # noqa: A001
         # such slot (the combine writes no score outputs), and the paged specialization is not validated
         # with them.  Declined by the engine row first; a backstop here.
         raise ValueError("score_max / score_sum_exp are served on dense, unsplit, unpaged builds only (no THD, no split_kv > 1, no paged KV)")
+    if has_bias != _BIAS_ARM or has_kv_mask != _KV_MASK_ARM:
+        raise ValueError(
+            f"compile(has_bias={has_bias}, has_kv_mask={has_kv_mask}) disagrees with the module's CFG.BIAS_MODE={CFG.BIAS_MODE} / "
+            f"CFG.KV_MASK_FORM={CFG.KV_MASK_FORM}: the TemplateParams decide the traced arm, the key must bind the operands it reads"
+        )
+    if _INF_MASK_ARM and (has_score_max or has_score_sum_exp):
+        # The -inf body does not publish the true max.  Declined by the engine row (the bias / kv_mask legs select no score flavor); a backstop.
+        raise ValueError("score_max / score_sum_exp are not wired on the bias / kv_mask arms")
     gmem = cute.AddressSpace.gmem
 
     def P(dtype, align=16):
@@ -2965,6 +3467,12 @@ def compile(  # noqa: A001
         P(cutlass.Float32, 4) if has_score_sum_exp else None,
         i64_3,
         i64_3,
+        P(STORAGE_DTYPE) if has_bias else None,
+        i64_3,
+        (1, 1),
+        P(KV_MASK_DTYPE, 1 if _KV_MASK_BOOL else 16) if has_kv_mask else None,
+        cutlass.Int64(0),
+        cutlass.Float32(1.0),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
         cache_key=_cache_key,

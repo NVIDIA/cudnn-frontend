@@ -49,20 +49,21 @@ from cudnn.sdpa.fwd.config_d128_family import (
     BIAS_MAX_FORMS,
     BIAS_MAX_HW_UPPER_BOUND,
     BIAS_MCAST_CTAS,
+    BIAS_MODES,
     BIAS_MODE_NONE,
     BIAS_MODE_RESIDENT,
     BIAS_MODE_STREAMED,
     BIAS_MODE_STREAMED_MULTICAST,
-    BIAS_MODES,
+    BIAS_PRELOAD_CHUNKS_DOMAIN,
     BIAS_RING_STAGES,
     BIAS_STREAMED_MODES,
     BIAS_SWZ_BYTES,
+    D128FamilyArch,
+    D128FamilySmallTileFields,
     D128_CORRECTION_WARPS,
     D128_OTHER_WARPS,
     D128_REG_SPLIT,
     D128_SOFTMAX_WG_WARPS,
-    D128FamilyArch,
-    D128FamilySmallTileFields,
     DEAD_SUBTILE_QUIET_FORMS,
     KV_MASK_ADDITIVE_16,
     KV_MASK_ADDITIVE_F32,
@@ -2732,6 +2733,28 @@ def sm100_sweep_seam_state() -> Optional[tuple]:
     if _STAGES_KV_OVERRIDE_FOR_SWEEPS is None:
         return None
     return ("sm100_sweep_seams", int(_STAGES_KV_OVERRIDE_FOR_SWEEPS))
+
+
+# The SM100 kernel's ``BIAS_PRELOAD_CHUNKS`` per KV tile width (bias chunks pre-loaded ABOVE the ``bmm1_done`` wait): the Rubin table
+# (``config_sm107.SM107_BIAS_PRELOAD_CHUNKS_BY_TILE_N``: 0 at the 128-wide tile, 1 at the 64-wide one) as the PRIOR until the GB200 sweep
+# measures it -- said so here, not applied as a measurement.  The sweep seam below pins the constant every rendering of the process gets
+# (``monkeypatch.setattr`` in a test or a sweep driver that resets it to None; never a plan path, an import or a config).
+SM100_BIAS_PRELOAD_CHUNKS_BY_TILE_N = {128: 0, 64: 1}
+_BIAS_PRELOAD_CHUNKS_OVERRIDE_FOR_SWEEPS: Optional[int] = None
+
+
+def sm100_bias_preload_chunks(tile_n: int) -> int:
+    """The SM100 kernel's ``BIAS_PRELOAD_CHUNKS`` for a rendering at KV tile width ``tile_n`` (:data:`SM100_BIAS_PRELOAD_CHUNKS_BY_TILE_N`,
+    the Rubin PRIOR); a width outside the table keeps the one-chunk default so an unrelated rendering's instruction stream is unchanged.
+    The sweep seam ``_BIAS_PRELOAD_CHUNKS_OVERRIDE_FOR_SWEEPS`` (validated to the kernel's domain) wins over the table."""
+    if _BIAS_PRELOAD_CHUNKS_OVERRIDE_FOR_SWEEPS is not None:
+        want = int(_BIAS_PRELOAD_CHUNKS_OVERRIDE_FOR_SWEEPS)
+        if want not in BIAS_PRELOAD_CHUNKS_DOMAIN:
+            raise ValueError(
+                f"_BIAS_PRELOAD_CHUNKS_OVERRIDE_FOR_SWEEPS={want}: the kernel's BIAS_PRELOAD_CHUNKS domain is {sorted(BIAS_PRELOAD_CHUNKS_DOMAIN)}"
+            )
+        return want
+    return SM100_BIAS_PRELOAD_CHUNKS_BY_TILE_N.get(int(tile_n), 1)
 
 
 def sm100_small_d_stages_kv(tile_k: int, cta_mma: int) -> int:
