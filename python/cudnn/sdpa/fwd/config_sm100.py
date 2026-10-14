@@ -2771,14 +2771,23 @@ def sm100_bias_preload_chunks(tile_n: int) -> int:
 # The sweep seam below pins the constant every small-tile rendering of the process gets (``monkeypatch.setattr`` in a test or a sweep driver that
 # resets it to None; never a plan path, an import or a config); the d128 flavor keeps its measured form whatever the seam says.
 _SPIN_RING_WAITS_OVERRIDE_FOR_SWEEPS: Optional[bool] = None
+# MEASURED on GB200 (152 SMs @ 1830 MHz, cc 10.0, 2026-10-14; in-process A/B, 3 x 100 graph replays, a control twin, every window at 1830): the BIAS
+# body of the 32- / 64-wide tiles runs FASTER with the hint-less ring waits -- D 64 S 640 / 768 bias 579.9 -> 526.7 us / 812.9 -> 738.1 us (+10.1 /
+# +10.1 %), S 512 +9.6 %, S 256 +5.4 %; bias + kv_mask word +17.6 / +17.9 / +14.7 %; the padded leg +9.3 / +9.0 / +8.0 % (the Rubin twin's sign on
+# the same forms, ledger A24) -- so the bias renderings take ``True``; the PLAIN small-tile forms and the kv_mask-ONLY body were not measured and
+# keep the d64 flavor's sleeping form (a per-kernel / per-arch sign: never flipped without its own A/B).
+SM100_BIAS_BODY_SPIN_RING_WAITS = True
 
 
-def sm100_spin_ring_waits(d_flavor: int) -> bool:
+def sm100_spin_ring_waits(d_flavor: int, *, bias_body: bool = False) -> bool:
     """The SM100 kernel's ``SPIN_RING_WAITS`` for a rendering of head-dim flavor ``d_flavor``: the shipped per-flavor constant (``True`` on the
-    d128 flavor, ``False`` on the d64 flavor and the small tiles), or -- on the 32- / 64-wide tiles only -- the sweep seam
-    ``_SPIN_RING_WAITS_OVERRIDE_FOR_SWEEPS`` when set (folded into :func:`sm100_sweep_seam_state`)."""
+    d128 flavor, ``False`` on the plain d64 flavor, the plain small tiles and the kv_mask-only body) or :data:`SM100_BIAS_BODY_SPIN_RING_WAITS` on
+    the BIAS body (``bias_body``: ``CFG.BIAS_MODE`` set, with or without the kv_mask word) of the 32- / 64-wide tiles; on the 32- / 64-wide tiles
+    the sweep seam ``_SPIN_RING_WAITS_OVERRIDE_FOR_SWEEPS`` wins when set (folded into :func:`sm100_sweep_seam_state`)."""
     if int(d_flavor) in (32, 64) and _SPIN_RING_WAITS_OVERRIDE_FOR_SWEEPS is not None:
         return bool(_SPIN_RING_WAITS_OVERRIDE_FOR_SWEEPS)
+    if int(d_flavor) in (32, 64) and bias_body:
+        return SM100_BIAS_BODY_SPIN_RING_WAITS
     return int(d_flavor) == 128
 
 
@@ -2917,7 +2926,7 @@ SM100_PADDED_TAIL_FORM_DEFAULT = 0
 # 2026-10-14).  Form 1 on the bias body = the Rubin twin's arm (its ledger A44): the -inf body renders its band mask at MASK_NONE and each softmax
 # lane pre-masks its own row's out-of-range S columns in TMEM on the tail tile only.  SERVED on SM100 behind a request or the sweep seam; its
 # knob-less default per KV tile width is 0 until the GB200 A/B lands a rule (the entries below are that rule's landing place).
-SM100_BIAS_PADDED_TAIL_FORM_BY_TILE_N = {128: 0, 64: 0}
+SM100_BIAS_PADDED_TAIL_FORM_BY_TILE_N = {128: 1, 64: 1}
 _PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS: Optional[int] = None
 
 # The DEAD-SUB-TILE QUIET body on the SM100 small tiles' -inf body (TemplateParams.dead_subtile_quiet; a bias or a kv_mask, the one-batch-entry

@@ -273,9 +273,11 @@ FUSED_LDTM_STAT = int(PARAMS.fused_ldtm_stat)
 # alike, dense and causal, S=2K..32K; the d64 flavor (128x128x64, cga1, softmax-bound) read mixed
 # (dense / SWA slightly up, causal down on cc 10.0), so it keeps the sleeping form.  One constant,
 # never a literal at a call site.  The 32- / 64-wide small-tile forms inherited the d64 flavor's sleeping form un-A/B'd; their constant
-# comes from ``config_sm100.sm100_spin_ring_waits`` (the same per-flavor rule, plus the small tiles' process-local sweep seam
-# ``_SPIN_RING_WAITS_OVERRIDE_FOR_SWEEPS``, folded into the template-module key by ``sm100_sweep_seam_state``) so a GB200 A/B reads either form.
-SPIN_RING_WAITS: bool = sm100_spin_ring_waits(PARAMS.d_flavor)
+# comes from ``config_sm100.sm100_spin_ring_waits`` (the per-flavor rule plus the FORM: the BIAS arms on the 32- / 64-wide tiles -- the bias body
+# and the bias + kv_mask body -- take the hint-less spin, MEASURED on GB200 2026-10-14 (+10 % on the D 64 bias ring at S 640 / 768, +18 % with the
+# kv_mask word; the plain small-tile forms and the kv_mask-only body were not measured and keep the sleeping form), plus the small tiles'
+# process-local sweep seam ``_SPIN_RING_WAITS_OVERRIDE_FOR_SWEEPS``, folded into the template-module key by ``sm100_sweep_seam_state``).
+SPIN_RING_WAITS: bool = sm100_spin_ring_waits(PARAMS.d_flavor, bias_body=bool(CFG.BIAS_MODE))
 # Named-barrier id map of this kernel: 0 CTA-wide, 1 / 2 the TMEM-publish barriers (MMA with softmax / with
 # correction), 8 the wg0 -> wg1 softmax phase lock, 9 + sub / 11 + sub the two per-warpgroup PUBLISH FENCES below.
 # The fences (``named_barrier_fence``, 128 threads = the publishing warpgroup) sit right after the softmax's alpha

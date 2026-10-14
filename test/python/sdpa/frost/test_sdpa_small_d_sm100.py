@@ -139,6 +139,9 @@ def test_stages_kv_two_is_the_d64_at_128_budget_lever(monkeypatch):
     # the two module-constant seams (the bias pre-load, the small tiles' ring-wait form) append to the state when set and read back through their
     # ONE readers; the d128 flavor keeps its measured spin form whatever the seam says
     assert c0.sm100_spin_ring_waits(128) is True and c0.sm100_spin_ring_waits(64) is False and c0.sm100_spin_ring_waits(32) is False
+    # the BIAS body's default (measured on GB200): True on the small tiles; the d128 flavor ignores the form
+    assert c0.sm100_spin_ring_waits(64, bias_body=True) is c0.SM100_BIAS_BODY_SPIN_RING_WAITS is True and c0.sm100_spin_ring_waits(32, bias_body=True) is True
+    assert c0.sm100_spin_ring_waits(128, bias_body=True) is True
     monkeypatch.setattr(c0, "_SPIN_RING_WAITS_OVERRIDE_FOR_SWEEPS", True)
     assert c0.sm100_sweep_seam_state() == ("sm100_sweep_seams", 2, ("bias_preload_chunks", None), ("spin_ring_waits", True))
     assert c0.sm100_spin_ring_waits(64) is True and c0.sm100_spin_ring_waits(32) is True and c0.sm100_spin_ring_waits(128) is True
@@ -147,6 +150,7 @@ def test_stages_kv_two_is_the_d64_at_128_budget_lever(monkeypatch):
     monkeypatch.setattr(c0, "_BIAS_PRELOAD_CHUNKS_OVERRIDE_FOR_SWEEPS", 0)
     assert c0.sm100_sweep_seam_state() == ("sm100_sweep_seams", None, ("bias_preload_chunks", 0), ("spin_ring_waits", False))
     assert c0.sm100_bias_preload_chunks(64) == 0 and c0.sm100_spin_ring_waits(128) is True and c0.sm100_spin_ring_waits(64) is False
+    assert c0.sm100_spin_ring_waits(64, bias_body=True) is False, "the seam pins the sleeping form on the bias body too"
     monkeypatch.setattr(c0, "_SPIN_RING_WAITS_OVERRIDE_FOR_SWEEPS", None)
     monkeypatch.setattr(c0, "_BIAS_PRELOAD_CHUNKS_OVERRIDE_FOR_SWEEPS", None)
     assert c0.sm100_sweep_seam_state() is None

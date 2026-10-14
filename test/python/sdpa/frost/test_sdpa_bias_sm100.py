@@ -112,8 +112,10 @@ def test_kernel_module_constants_and_the_not_yet_wired_backstops():
         _mod(seq_kv_lens_present=True, padded_tail_form=1, kv_mask_form=1)
     with pytest.raises(ValueError, match="kv_mask"):
         _mod(seq_kv_lens_present=True, padded_tail_form=1, bias_mode=2, bias_stages=2, kv_mask_form=1)
-    # the small tiles' ring-wait form: the shipped sleeping form (the d64 flavor's constant), never a literal
-    assert plain.SPIN_RING_WAITS is False and res.SPIN_RING_WAITS is False and btail.SPIN_RING_WAITS is False
+    # the small tiles' ring-wait form: the BIAS body spins (MEASURED on GB200 2026-10-14: +5..+10 % on the bias cells, +8..+18 % with the kv_mask word);
+    # the plain small tile and the kv_mask-only body keep the d64 flavor's sleeping form (unmeasured); never a literal at a call site
+    assert res.SPIN_RING_WAITS is True and btail.SPIN_RING_WAITS is True and bword.SPIN_RING_WAITS is True
+    assert plain.SPIN_RING_WAITS is False and mask.SPIN_RING_WAITS is False and tail.SPIN_RING_WAITS is False
     # the dead-sub-tile quiet body: wired on the -inf arms (a bias / a kv_mask), refused on the plain body of this file (the factory's admission)
     quiet = _mod(bias_mode=2, bias_stages=2, dead_subtile_quiet=1)
     assert quiet._DEAD_SUBTILE_QUIET and quiet._BIAS_STREAMED and not res._DEAD_SUBTILE_QUIET
