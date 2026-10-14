@@ -30,8 +30,9 @@ The three kernels are the same code on both: the LayerNorm-prologue dual-GEMM bo
 part's geometry (Rubin: a 9-deep operand ring in the 327 KiB carveout, 576 TMEM columns; Blackwell: a 6-deep ring -- 4 in the output
 stage -- in the 227 KiB opt-in carveout, 512 TMEM columns, so `c_z = 256` fills the output stage's ring exactly), and the contraction's
 FROST GEMM template sizes its pipeline from the live device. Every other architecture is declined with a typed error
-(`NotImplementedError`), never served slowly. The measured performance below is Rubin's; the Blackwell column of the heuristics carries
-the contraction tile per N measured on a GB200 and the Rubin picks for every other knob until its own sweep lands.
+(`NotImplementedError`), never served slowly. The measured performance below is Rubin's; the Blackwell column of the heuristics is its own
+measured table (every knob swept on a GB200, 152 SMs at a 1830 MHz lock, by the same protocol; the `N < 256` buckets carry the Rubin picks
+until measured there).
 
 ## Mathematics and numerics
 

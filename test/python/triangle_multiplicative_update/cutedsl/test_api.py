@@ -199,10 +199,11 @@ def test_check_support_declines_a_knob_set_the_arch_body_cannot_render_typed():
             plan.check_support()
 
 
-def test_heuristics_sm100_column_is_the_rubin_table_with_the_recorded_contraction_tiles():
-    """The SM100 column: every axis of the Rubin picks and refinements carried (unmeasured there, stated), the contraction tile per N bucket the
-    recorded GB200 winner -- the one axis that differs is the 1024 floor (the A-multicast x2 pair tile; x4 on Rubin); the register-split hint rows
-    are Rubin-only (0 = the rendering as shipped on cc 10.0); ``None`` and any other part read the Rubin table."""
+def test_heuristics_sm100_column_is_the_measured_gb200_table():
+    """The SM100 column (compute capability 10.0 / 10.3) = the table MEASURED on a 152-SM GB200 perf node (the sweep of record: sweep of record: a 152-SM GB200 perf node, 2026-10-14, every knob as a single-axis arm against the seeded pick, 16-20 arms per cell, graph replay >= 100 x 3, in-process control twins, the fp64 oracle on every arm):
+    every (width, N bucket) pick and every refinement below is the literal record the heuristics ship; the N < 256 floors (129 / 0) carry the Rubin
+    picks with the recorded contraction tile (unmeasured on SM100, stated); the Rubin table is unchanged for cc 10.7 and for ``None``; the register-split
+    hint rows follow the column; a caller's overrides merge over the SM100 column exactly as over the Rubin one."""
     from dataclasses import replace
 
     from cudnn.triangle_multiplicative_update import heuristics as th
@@ -220,28 +221,54 @@ def test_heuristics_sm100_column_is_the_rubin_table_with_the_recorded_contractio
         "sm107",
         "sm107",
     )
+    # the bucket picks: (width, N floor) -> (k2 tile, K1 order, K3 prologue, ring depth, LayerNorm form, epilogue form, work item)
+    picks = {
+        (128, 1024): (k2.MULTICAST_A2_TILE_CONFIG, "major", "transpose", 2, "registers", "packed", "block"),
+        (128, 768): (k2.DESIGN_TILE_CONFIG, "major", "transpose", 1, "registers", "packed", "block"),
+        (128, 512): (k2.MULTICAST_A2_TILE_CONFIG, "major", "transpose", 1, "registers", "packed", "block"),
+        (128, 384): (k2.SMALL_N_TILE_CONFIG, "major", "transpose", 2, "smem_rolled_pf", "packed", "block"),
+        (128, 256): (k2.DESIGN_TILE_CONFIG, "major", "transpose", 2, "smem_rolled", "packed", "block"),
+        (128, 129): (k2.DESIGN_TILE_CONFIG, "interleaved", "transpose", 1, "registers", "packed", ""),
+        (128, 0): (k2.SMALL_N_TILE_CONFIG, "interleaved", "transpose", 2, "registers", "packed", ""),
+        (256, 1024): (k2.MULTICAST_A2_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", "block"),
+        (256, 768): (k2.DESIGN_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", "block"),
+        (256, 512): (k2.MULTICAST_A2_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", "block"),
+        (256, 384): (k2.SMALL_N_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", "block"),
+        (256, 256): (k2.DESIGN_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", "block"),
+        (256, 129): (k2.DESIGN_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", "block"),
+        (256, 0): (k2.SMALL_N_TILE_CONFIG, "major", "mn_major", 2, "smem_rolled_pf", "packed", "block"),
+    }
+    # the refinements: (width, N floor, batch bucket, direction or None) -> the ONE axis overridden
+    refinements = [
+        (128, 0, 1, "incoming", {"clc_stages": 1}),
+        (128, 256, 1, "incoming", {"ln_pass_form": "smem_rolled_pf"}),
+        (128, 256, 4, None, {"ln_pass_form": "registers"}),
+        (128, 384, 4, None, {"ln_pass_form": "registers"}),
+        (128, 512, 4, None, {"clc_stages": 2}),
+        (256, 0, 4, None, {"clc_stages": 1}),
+    ]
+    axes = ("k2_tile", "k1_pass_order", "k3_prologue", "clc_stages", "ln_pass_form", "epi_math", "ln_once")
     for c in (128, 256):
-        for n in (33, 128, 217, 256, 384, 512, 768, 1024, 2048):
+        for n in (33, 128, 217, 256, 384, 512, 768, 1024, 1536, 2048):
             for b in (1, 4):
                 for d in k2.DIRECTIONS:
                     rubin, sm100 = th.recommend(n, c, b, d), th.recommend(n, c, b, d, cc=(10, 0))
                     assert sm100.is_complete() and th.recommend(n, c, b, d, cc=(10, 7)) == rubin and th.recommend(n, c, b, d, cc=None) == rubin
-                    assert replace(sm100, k2_tile=rubin.k2_tile) == rubin, (n, c, b, d)
-                    assert sm100.k2_tile == (k2.MULTICAST_A2_TILE_CONFIG if n >= 1024 else rubin.k2_tile), (n, c, b, d)
-    assert th.recommend(1024, 128, 1, cc=(10, 0)).k2_tile == th.recommend(2048, 128, 1, cc=(10, 3)).k2_tile == k2.MULTICAST_A2_TILE_CONFIG
-    assert th.recommend(1024, 128, 1).k2_tile == k2.MULTICAST_A4_TILE_CONFIG
-    assert (
-        th.k2_tile_for(1024, 128, 1, "outgoing", cc=(10, 0)) == k2.MULTICAST_A2_TILE_CONFIG
-        and th.k2_tile_for(1024, 128, 1, "outgoing") == k2.MULTICAST_A4_TILE_CONFIG
-    )
+                    floor = next(f for f in (1024, 768, 512, 384, 256, 129, 0) if n >= f)
+                    want = dict(zip(axes, picks[(c, floor)]))
+                    for w_, f_, b_, d_, over in refinements:
+                        if (w_, f_) == (c, floor) and b_ == th.batch_bucket(b) and (d_ is None or d_ == d):
+                            want.update(over)
+                    got = {a: (getattr(sm100, a) or "") if a == "ln_once" else getattr(sm100, a) for a in axes}
+                    assert got == want, (n, c, b, d, got, want)
+                    assert sm100.k_block == th.default_k_block(n), (n, c, b, d)
+                    assert th.recommend(n, c, b, d, cc=(10, 3)) == sm100
     # the caller's overrides merge over the SM100 column exactly as over the Rubin one
+    base = th.recommend(1024, 128, 1, "outgoing", cc=(10, 0))
     r = th.resolve(1024, 128, 1, "outgoing", knobs=th.TriMulKnobs(clc_stages=4), cc=(10, 0))
-    assert r.clc_stages == 4 and r.k2_tile == k2.MULTICAST_A2_TILE_CONFIG and r.is_complete()
+    assert r.clc_stages == 4 and replace(r, clc_stages=base.clc_stages) == base and r.is_complete()
     assert th.resolve(1024, 128, 1, "outgoing", k2_tile=k2.DESIGN_TILE_CONFIG, cc=(10, 0)).k2_tile == k2.DESIGN_TILE_CONFIG
-    # the hint rows are Rubin measurements
-    assert th.register_split_hint("k1", 128, False, "registers", "packed", "major", "") == 1
-    assert th.register_split_hint("k1", 128, False, "registers", "packed", "major", "", cc=(10, 0)) == 0
-    assert th.register_split_hint("k1", 128, False, "registers", "packed", "major", "", cc=(10, 7)) == 1
+    assert th.k2_tile_for(1024, 128, 1, "outgoing", cc=(10, 0)) == base.k2_tile
 
 
 def test_autograd_is_a_typed_decline_not_a_silent_constant():

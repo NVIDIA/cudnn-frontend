@@ -814,6 +814,11 @@ _SASS_SM100_PINS = {
     ("k1", 128, "registers", "packed", False, "major", "block"): dict(STL=0, LDL=0),
     ("k1", 128, "smem_rolled", "packed", True, "major", "block"): dict(STL=0, LDL=0),
     ("k1", 128, "smem_rolled", "packed", False, "major", "block"): dict(STL=3, LDL=3),
+    # the SM100 column's own picks (measured on a 152-SM GB200 perf node, 2026-10-14): the register form + the plain packed epilogue from N = 512
+    # (B 1) / N = 384 (B >= 4), the pipelined rolled form at the 384 bucket
+    ("k1", 128, "registers", "packed", True, "major", "block"): dict(STL=0, LDL=0),
+    ("k1", 128, "smem_rolled_pf", "packed", True, "major", "block"): dict(STL=0, LDL=0),
+    ("k1", 128, "smem_rolled_pf", "packed", False, "major", "block"): dict(STL=0, LDL=0),
     ("k1", 256, "smem_rolled_pf", "packed", True, "major", "block"): dict(STL=0, LDL=0),
     ("k1", 256, "smem_rolled_pf", "packed", False, "major", "block"): dict(STL=1, LDL=1),
     ("k3", 128, "registers", "packed", True, "transpose", ""): dict(STL=0, LDL=0),

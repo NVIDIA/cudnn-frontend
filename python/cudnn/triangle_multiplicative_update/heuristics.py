@@ -35,10 +35,10 @@ function and stay op attributes the API never sets.
                      axis of the table (the persistent tail is a function of N and B), OFF in every pick until its A/B/A lands a per-bucket default.
 
 :func:`recommend` is the table -- the best MEASURED configuration per geometry on the 212-SM Rubin perf-node class, keyed by hidden width ``c``,
-N bucket, batch bucket and direction (and, appended, the device's compute capability ``cc``: the SM100 COLUMN below is the Rubin table with the
-contraction tile per N replaced by the winners recorded on a 152-SM GB200 perf node -- the two LayerNorm-prologue stages' axes are carried from
-Rubin UNMEASURED on SM100 until the GB200 sweep lands its own picks, and the register-split hint rows are Rubin-only, so a cc 10.0 plan runs
-the renderings as shipped): a bucket table (width, N) carries the complete knob set, and a short refinement table overrides ONE axis
+N bucket, batch bucket and direction (and, appended, the device's compute capability ``cc``: the SM100 COLUMN below is its own MEASURED table --
+every axis swept on a 152-SM GB200 perf node (lock 1830 MHz) as a single-axis arm against the seeded pick, in-process control twins, graph replay
+>= 100 x 3, the fp64 oracle on every arm, for N >= 256 at B 1 / 4 in both directions; the N < 256 floors carry the Rubin picks with the recorded
+contraction tile until measured there, and the register-split hint rows are per column): a bucket table (width, N) carries the complete knob set, and a short refinement table overrides ONE axis
 where a cell of the measured grid (B in {1, 4}, both directions) beat the bucket's pick decisively in every pass that measured it.  A geometry
 nobody timed takes the nearest measured bucket's pick (N: the first floor at or below it; B: 4 from B >= 4, else 1), never a guess outside the
 domain.  :func:`resolve` merges a caller's ``k2_tile`` / ``knobs`` over it -- a :class:`TriMulKnobs` is a PARTIAL record: an axis left ``None``
@@ -307,26 +307,73 @@ _REFINEMENTS: Dict[int, Tuple[Tuple[int, int, Optional[str], TriMulKnobs], ...]]
 }
 
 
-# THE SM100 COLUMN (compute capability 10.0 / 10.3; the 227 KiB / 512-column part): the SAME bucket picks and refinements as the Rubin table
-# with the CONTRACTION TILE per N bucket replaced by the tile measured fastest on a 152-SM GB200 perf node (lock 1830 MHz; 100 x 3 graph replay,
-# control pair 0.02-0.92 %; bf16, c = 128, B = 1, both directions; every pick a win over the pair tile `DESIGN_TILE_CONFIG` by > 2x its N's control-pair floor): N 256
-# the pair tile, 384 the 1-CTA tile, 512 the A-multicast x2 pair tile, 768 the pair tile, 1024 the A-multicast x2 pair tile (the x4 one within
-# 0.0 % of it at 1024 and 0.2 % at 2048: the x2 is the recorded winner in both directions at 2048), 2048 the x2 again -- so the ONE axis that
-# differs from the Rubin column is the 1024 floor (x2 here, x4 there).  Everything else -- the K1 tile order, the K3 prologue form, the ring depth,
-# the LayerNorm pass form, the epilogue form, the LayerNorm-once item and the per-cell refinements -- is CARRIED from the Rubin table UNMEASURED
-# on SM100 (stated here so a reader never takes it for a GB200 measurement); the GB200 sweep replaces this seed per bucket as its cells land.
-_K2_TILE_SM100_BY_FLOOR: Dict[int, str] = {1024: k2.MULTICAST_A2_TILE_CONFIG}
+# THE SM100 COLUMN (compute capability 10.0 / 10.3; the 227 KiB / 512-column part) -- MEASURED 2026-10-14 on ONE 152-SM GB200 perf node (bf16, one
+# exclusive GPU per process, SM clock locked at 1830 MHz and sampled per cell, the SW-power-cap counter read before / after every cell, cuEquivariance
+# 0.12.0 in the same process as the baseline): every knob of the seeded column (the Rubin table with the recorded contraction tile per N) was swept as a
+# SINGLE-AXIS ARM against the seeded pick -- the contraction tile (all five catalog names; the 1-CTA tiles below N 1024), the ring depth 1 / 2 / 4, the
+# LayerNorm work item x the K1 tile order, the LayerNorm pass form x the epilogue form, the row tile, the register-split hint, the K3 prologue -- with
+# every arm its own eager + graph slot pair in ONE shuffled loop beside the pick, its control twin, cuEq and torch (graph replay >= 100 x 3, raised to
+# 1000 iterations on the small cells; 16-20 arms per cell), every arm bitwise the pick and inside the API oracle; the grid N {256, 384, 512, 768, 1024,
+# 1536, 2048} x c {128, 256} x B 1 (+ B 4 at N <= 512) x both directions (N 2048 x c 256 = the 32-bit element-offset decline).  A bucket pick moves when
+# the arm beat the seeded pick DECISIVELY (> max(0.5 %, 2 x the cell's FROST control spread)) in EVERY cell of the bucket at B = 1; a refinement where
+# it did so in every cell of one (batch bucket, direction) subset (a single-direction row only beyond twice the bar, the other direction not losing);
+# nothing else moved, and the N < 256 floors (129 / 0) carry the Rubin picks with the recorded contraction tile (unmeasured on SM100).  Margins =
+# t_seeded_pick / t_arm - 1, positive = the arm is faster; outgoing / incoming:
+#   c = 128 -- the LayerNorm PASS FORM and the EPILOGUE form: the REGISTER form with the plain PACKED epilogue is the winner from N = 512 at B 1 and
+#            from N = 384 at B >= 4 (over the rolled form + packed: +4.6 / +4.6 % at 1024, +4.0 / +4.1 % at 1536, +3.7 / +3.7 % at 2048, +4.7 / +4.8 % at
+#            384 x 4, +5.0 / +4.9 % at 512 x 4; over the register form + the bias-path fold: +3.9 / +4.0 % at 512, +4.2 / +3.9 % at 768, +4.2 / +4.1 % at
+#            256 x 4) -- the bias-path fold (`packed_biasfold`) LOSES ~4 % on every sm_100a register-form rendering, the opposite sign to Rubin; the
+#            pipelined rolled form wins the 384 bucket at B 1 (+0.9 / +0.8 % over the rolled form) and the 256 bucket's incoming cell (+1.8 %; outgoing
+#            -0.6 % inside its 2.1 % bar -> a direction refinement); the 256 bucket's outgoing pick stands (every arm inside the bar or losing).
+#            The RING DEPTH 2 beats 1 on the 1024 floor (+3.3 / +3.2 % at 1024, +2.9 / +2.9 % at 1536, +2.6 / +2.6 % at 2048), on the B >= 4 cells
+#            (+3.2 / +3.2 % at 384 x 4, +3.4 / +3.4 % at 512 x 4; +0.2 / +0.7 % at 256 x 4 over the Rubin row's 1) and over the Rubin row's 4 at 384 x 1
+#            (+0.6 / +0.3 %); it is inside the bar at 512 and 768 (+0.3..+0.4 %), which keep 1.  The contraction tile column of the seed (recorded on
+#            the same node class) stands on every cell, c 256 and B 4 included (the next tile -0.1..-5.7 %); the block item + the pass-major order stand
+#            (the per-tile item -10.8..-16.4 %, "passes" within +-0.3 %); the transpose K3 prologue stands (mn_major -2.3..-17.7 %); the row-tile rule
+#            stands (kb 128 elsewhere -0.3..+0.1 %, kb 256 at N 384 -17.5 %); the register-split hint on the seeded bias-fold rendering read +1.5 / +1.6 %
+#            at 512, +1.1 / +1.1 % at 768, +1.2 / +1.2 % at 256 x 4 and -0.3..-1.4 % on every rolled-form cell -- no row (the winning renderings differ;
+#            a row needs its own A/B/A).
+#   c = 256 -- every pick STANDS: the pipelined rolled form + packed + the block item + ring depth 1 + the recorded tile beat every arm on all 18 served
+#            cells (ring depth 2 -0.3..-1.3 %, the rolled form -9.3..-10.5 %, the bias-path fold -1.6..-2.1 %, the per-tile item -35..-46 %, the next tile
+#            -0.1..-4.0 %, kb 128 -0.1..+0.7 % -- the +0.7 % at 256 x 1 outgoing is a single-direction, single-pass read under twice its bar: no row).
+# Whole-call speed-ups of the SEEDED picks over cuEq 0.12.0 on this node class: c 128 +39..+64 %, c 256 +73..+124 %; the cells from N = 1024 (c 128)
+# and N = 512 x 4 / 768 (c 256) ran into the part's 1200 W cap for a fraction of their windows (the counter moved; the sampled median stayed at the lock)
+# and are lower bounds on the absolute time -- the within-process ratios stand.
+
+_PICKS_SM100: Dict[int, Tuple[Tuple[int, TriMulKnobs], ...]] = {
+    128: (
+        (1024, _pick(k2.MULTICAST_A2_TILE_CONFIG, "major", "transpose", 2, "registers", "packed", ln_once="block")),
+        (768, _pick(k2.DESIGN_TILE_CONFIG, "major", "transpose", 1, "registers", "packed", ln_once="block")),
+        (512, _pick(k2.MULTICAST_A2_TILE_CONFIG, "major", "transpose", 1, "registers", "packed", ln_once="block")),
+        (384, _pick(k2.SMALL_N_TILE_CONFIG, "major", "transpose", 2, "smem_rolled_pf", "packed", ln_once="block")),
+        (256, _pick(k2.DESIGN_TILE_CONFIG, "major", "transpose", 2, "smem_rolled", "packed", ln_once="block")),
+        (129, _pick(k2.DESIGN_TILE_CONFIG, "interleaved", "transpose", 1, "registers", "packed")),
+        (0, _pick(k2.SMALL_N_TILE_CONFIG, "interleaved", "transpose", 2, "registers", "packed")),
+    ),
+    256: (
+        (1024, _pick(k2.MULTICAST_A2_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", ln_once="block")),
+        (768, _pick(k2.DESIGN_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", ln_once="block")),
+        (512, _pick(k2.MULTICAST_A2_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", ln_once="block")),
+        (384, _pick(k2.SMALL_N_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", ln_once="block")),
+        (256, _pick(k2.DESIGN_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", ln_once="block")),
+        (129, _pick(k2.DESIGN_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", ln_once="block")),
+        (0, _pick(k2.SMALL_N_TILE_CONFIG, "major", "mn_major", 2, "smem_rolled_pf", "packed", ln_once="block")),
+    ),
+}
+_REFINEMENTS_SM100: Dict[int, Tuple[Tuple[int, int, Optional[str], TriMulKnobs], ...]] = {
+    128: (
+        (0, 1, "incoming", TriMulKnobs(clc_stages=1)),
+        (256, 1, "incoming", TriMulKnobs(ln_pass_form="smem_rolled_pf")),
+        (256, 4, None, TriMulKnobs(ln_pass_form="registers")),
+        (384, 4, None, TriMulKnobs(ln_pass_form="registers")),
+        (512, 4, None, TriMulKnobs(clc_stages=2)),
+    ),
+    256: ((0, 4, None, TriMulKnobs(clc_stages=1)),),
+}
 
 
-def _sm100_picks(rubin: Dict[int, Tuple[Tuple[int, TriMulKnobs], ...]]) -> Dict[int, Tuple[Tuple[int, TriMulKnobs], ...]]:
-    return {
-        width: tuple((floor, replace(knobs, k2_tile=_K2_TILE_SM100_BY_FLOOR.get(floor, knobs.k2_tile))) for floor, knobs in table)
-        for width, table in rubin.items()
-    }
-
-
-_PICKS_BY_ARCH: Dict[str, Dict[int, Tuple[Tuple[int, TriMulKnobs], ...]]] = {"sm107": _PICKS, "sm100": _sm100_picks(_PICKS)}
-_REFINEMENTS_BY_ARCH: Dict[str, Dict[int, Tuple[Tuple[int, int, Optional[str], TriMulKnobs], ...]]] = {"sm107": _REFINEMENTS, "sm100": _REFINEMENTS}
+_PICKS_BY_ARCH: Dict[str, Dict[int, Tuple[Tuple[int, TriMulKnobs], ...]]] = {"sm107": _PICKS, "sm100": _PICKS_SM100}
+_REFINEMENTS_BY_ARCH: Dict[str, Dict[int, Tuple[Tuple[int, int, Optional[str], TriMulKnobs], ...]]] = {"sm107": _REFINEMENTS, "sm100": _REFINEMENTS_SM100}
 #: The arch column a compute capability reads: Blackwell (10.0 / 10.3) the SM100 column, everything else -- Rubin, an unknown part, or ``None``
 #: (no device at hand: a CPU declaration, whose ``check_support`` declines before any launch) -- the Rubin table.  The heuristics never
 #: decline a part; the API's ``check_support`` does.
