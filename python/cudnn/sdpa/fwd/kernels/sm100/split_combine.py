@@ -69,6 +69,18 @@ THREADS = 128
 ROWS_PER_BLOCK = THREADS // 32
 # Splits whose LSE and partial-O rows are loaded up front, before any math.
 G_S = 4
+# Splits past G_S are walked in GROUPS of G_T: every group's LSE and partial-O
+# rows are loaded before any of its math, so a warp pays one memory round trip
+# per group instead of one per split.  The old ``unroll=1`` walk issued one
+# dependent global load per split (twice: the max pass and the accumulate
+# pass, per 128-column chunk), and a launch with fewer rows than the machine
+# holds at once had nothing to hide the chain behind: the d256 decode tile at
+# batch 1 (QH warps in all) read 40 us for 64 splits where 2 splits cost 3.3 us
+# -- ~0.3 us, one DRAM round trip, per split per pass.  The arithmetic is
+# unchanged: the same splits are accumulated in the same order (a slot past
+# ``n_splits`` re-reads the last split and contributes nothing, as the head
+# group's slots do), so the pass is bitwise what it was for every split count.
+G_T = 16
 
 NEG_INF = float("-inf")
 
@@ -236,10 +248,16 @@ def _combine_kernel(
                     m = neg_inf
                     for s in cutlass.range_constexpr(G_S):
                         m = cute.math.max(m, lse_v[s])
-                    # Splits past G_S (rare) extend the max before any weight is formed.
+                    # Splits past G_S extend the max before any weight is formed: G_T LSEs per
+                    # round trip (a clamped slot re-reads the last split; max is idempotent).
                     if n_splits > cutlass.Int32(G_S):
-                        for s in cutlass.range(G_S, n_splits, 1, unroll=1):
-                            m = cute.math.max(m, _ld_global_f32(lse_base + cutlass.Int64(s) * lse_step))
+                        for s0 in cutlass.range(G_S, n_splits, G_T, unroll=1):
+                            lse_t = []
+                            for j in cutlass.range_constexpr(G_T):
+                                s_eff64 = cutlass.Int64(cute.math.min(s0 + cutlass.Int32(j), s_last))
+                                lse_t.append(_ld_global_f32(lse_base + s_eff64 * lse_step))
+                            for j in cutlass.range_constexpr(G_T):
+                                m = cute.math.max(m, lse_t[j])
                     # All splits dead (every row fully masked): emit O := 0 / lse := -inf rather than
                     # exp(-inf - -inf) == NaN.  m_safe only feeds the exponentials.
                     all_dead = m == neg_inf
@@ -265,22 +283,34 @@ def _combine_kernel(
                         acc2 = acc2 + w * v2
                         acc3 = acc3 + w * v3
                     if n_splits > cutlass.Int32(G_S):
-                        for s in cutlass.range(G_S, n_splits, 1, unroll=1):
-                            s64 = cutlass.Int64(s)
-                            lse_s = _ld_global_f32(lse_base + s64 * lse_step)
-                            v = ld_global_v4(o_row_base + s64 * o_step, cutlass.Float32)
-                            live = lse_s > neg_inf
-                            e = cute.math.exp(lse_s - m_safe, fastmath=True)
-                            w = cutlass.Float32(arith.select(live.ir_value(), e.ir_value(), zero.ir_value()))
-                            v0 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[0]).ir_value(), zero.ir_value()))
-                            v1 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[1]).ir_value(), zero.ir_value()))
-                            v2 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[2]).ir_value(), zero.ir_value()))
-                            v3 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[3]).ir_value(), zero.ir_value()))
-                            den = den + w
-                            acc0 = acc0 + w * v0
-                            acc1 = acc1 + w * v1
-                            acc2 = acc2 + w * v2
-                            acc3 = acc3 + w * v3
+                        # G_T splits per round trip: every LSE and partial-O row of the group
+                        # is loaded first, then the group is accumulated in split order.  A
+                        # slot past n_splits (the last group only) re-reads the last split
+                        # and is SELECTED out of the sums, so den / acc hold exactly what the
+                        # one-split-per-step walk left in them.
+                        for s0 in cutlass.range(G_S, n_splits, G_T, unroll=1):
+                            lse_t = []
+                            o_t = []
+                            for j in cutlass.range_constexpr(G_T):
+                                s_eff64 = cutlass.Int64(cute.math.min(s0 + cutlass.Int32(j), s_last))
+                                lse_t.append(_ld_global_f32(lse_base + s_eff64 * lse_step))
+                                o_t.append(ld_global_v4(o_row_base + s_eff64 * o_step, cutlass.Float32))
+                            for j in cutlass.range_constexpr(G_T):
+                                lse_s = lse_t[j]
+                                v = o_t[j]
+                                in_range = (s0 + cutlass.Int32(j)) < n_splits
+                                live = (lse_s > neg_inf) & in_range
+                                e = cute.math.exp(lse_s - m_safe, fastmath=True)
+                                w = cutlass.Float32(arith.select(live.ir_value(), e.ir_value(), zero.ir_value()))
+                                v0 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[0]).ir_value(), zero.ir_value()))
+                                v1 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[1]).ir_value(), zero.ir_value()))
+                                v2 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[2]).ir_value(), zero.ir_value()))
+                                v3 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[3]).ir_value(), zero.ir_value()))
+                                den = cutlass.Float32(arith.select(in_range.ir_value(), (den + w).ir_value(), den.ir_value()))
+                                acc0 = cutlass.Float32(arith.select(in_range.ir_value(), (acc0 + w * v0).ir_value(), acc0.ir_value()))
+                                acc1 = cutlass.Float32(arith.select(in_range.ir_value(), (acc1 + w * v1).ir_value(), acc1.ir_value()))
+                                acc2 = cutlass.Float32(arith.select(in_range.ir_value(), (acc2 + w * v2).ir_value(), acc2.ir_value()))
+                                acc3 = cutlass.Float32(arith.select(in_range.ir_value(), (acc3 + w * v3).ir_value(), acc3.ir_value()))
                     inv_den = cutlass.Float32(1.0) / cute.math.max(den, cutlass.Float32(1e-30))
                     inv_den = cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), inv_den.ir_value()))
                     outs = (acc0 * inv_den, acc1 * inv_den, acc2 * inv_den, acc3 * inv_den)

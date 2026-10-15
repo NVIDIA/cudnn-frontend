@@ -405,6 +405,19 @@ _DECODE_TILE_WIDE_Q_TILE_COST = 1.6
 # The shared sm100/split_combine pass over a decode-shaped grid: one combine
 # wave, ~6 us measured at b=32 x 32 heads.
 _DECODE_TILE_COMBINE_COST = 3.5
+# What EVERY partial adds to that pass, in KV-tile units.  A decode-shaped grid
+# is one wave of warps with nothing to hide a serial split walk behind, so the
+# combine grows linearly with the split count: measured on the Rubin d256 tile
+# (212 SMs, 2376 MHz lock; batch 1 x 2 KV heads, pack 12:1, kv 4K / 32K / 128K
+# and batch 4 x 128K; splits 4 .. 64 pinned) 3.0-3.4 us + 0.17-0.18 us per
+# split with the grouped-load walk of sm100/split_combine (0.63-0.67 before it,
+# when the pass read one split per memory round trip), against 1.03 us per KV
+# tile for a lone CTA there.  Without this term the model took split 64 at
+# batch 1 wherever the KV was long (the per-wave term is flat in s) and paid a
+# 40 us combine for a 12 us kernel; with it the batch-1 optima measured at
+# kv 4K / 32K / 128K (16 / 32 / 64) and the batch-4 x 128K one (16) all fall
+# out, and every B200 pin below holds (the term is 0.3-2.7 tiles there).
+_DECODE_TILE_COMBINE_PER_PARTIAL = 0.17
 # What the two-launch split path costs an EAGER caller on the host per
 # graph.execute beyond the one-launch path: a second CuTe-DSL launch plus the
 # partial-slab carving. Measured 62 -> 92 us on the b=32 x 2 KV heads x 4096
@@ -424,7 +437,7 @@ def _decode_tile_cost(split: int, *, units: int, kv_tiles: int, sm_count: int, t
     per_tile = max(tile_cost, streams / (_DECODE_TILE_SATURATION_FRACTION * sm_count))
     cost = (_ceil_div(kv_tiles, split) + _DECODE_TILE_CTA_COST) * per_tile
     if split > 1:
-        cost += _DECODE_TILE_COMBINE_COST + launch_cost
+        cost += _DECODE_TILE_COMBINE_COST + split * _DECODE_TILE_COMBINE_PER_PARTIAL + launch_cost
     return cost
 
 
@@ -448,14 +461,17 @@ def choose_decode_tile_split_kv(
         streams(s)  = units * s                                   # concurrent K/V streams
         per_tile(s) = max(TILE_COST(q_tile), streams(s) / (SATURATION * sm_count))
         cost(s)     = (ceil(kv_tiles / s) + CTA_COST) * per_tile(s)
-                    + [s > 1] * (COMBINE_COST + launch_cost)
+                    + [s > 1] * (COMBINE_COST + s * COMBINE_PER_PARTIAL + launch_cost)
 
     A lone CTA streams a KV tile at TILE_COST (1 on the 16-column tile, 1.6 on
     the issue-bound 32-column one); once the streams saturate HBM every CTA
     slows with their count instead.  What falls out: an under-full launch
     splits until its streams saturate HBM; a launch already past it never
     splits (the bytes are the same, only the fixed costs grow); in between,
-    the split must SAVE more than it ADDS.  With the default ``launch_cost``
+    the split must SAVE more than it ADDS -- and every partial it adds costs
+    the one-wave combine a serial step (COMBINE_PER_PARTIAL), which is what
+    stops a few-unit launch from splitting past the point where the combine
+    outweighs the kernel.  With the default ``launch_cost``
     the added part includes the eager caller's second host launch, so on the
     16-column tile the b=32 x 2 KV heads x 4096-key serving shape (6 us of GPU
     saving for 30 us of host time) stays unsplit while a small batch or a
