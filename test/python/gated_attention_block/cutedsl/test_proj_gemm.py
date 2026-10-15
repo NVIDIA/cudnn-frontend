@@ -1089,18 +1089,31 @@ def test_small_m_route_declines_non_positive_extents(m, n, k):
         build_proj_gemm(m=m, k=k, n=n, dtype=torch.bfloat16, label="extent")
 
 
+def test_small_m_route_keeps_off_256_geometries_on_todays_resolution():
+    """An N that 256 does not divide keeps today's resolution: the forced tile never existed for it, so the plan stays on the
+    graph route and a ``capture_safe`` declaration is refused, typed, before any graph or backend call -- the indexer band's
+    + 640 columns (``QsaSpec.index_band``) are the serving case.  The route never names a tile for such an N."""
+    n, k = _FLASH_NEXT_24_2["n_qkvg"] + 640, _FLASH_NEXT_24_2["d_model"]
+    assert n % 256 and n % 8 == 0
+    from cudnn.gated_attention_block.kernels.proj_gemm import _auto_tile_name
+
+    assert small_m_tile_config(1, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS) is None
+    assert _auto_tile_name(1, n, k, dtype=torch.bfloat16, a_major="k", b_major="k", block_scale=False, alpha=False) is None
+    with pytest.raises(NotImplementedError, match="capture_safe=True needs the forced-tile JIT route"):
+        build_proj_gemm(m=1, k=k, n=n, dtype=torch.bfloat16, label="off256", capture_safe=True)
+
+
 def test_small_m_route_is_an_sm100_family_selection(monkeypatch):
-    """The route's names are the tcgen05 tree's: a process on the ``sm120`` compiler family (SM 12.x) keeps the family-aware
-    automatic tile for a small-M projection whose N the forced tile does not divide, instead of a name its compiler would
-    refuse; the ``sm100`` family takes the route."""
+    """The route's names are the tcgen05 tree's: a process on the ``sm120`` compiler family (SM 12.x) keeps the forced tile
+    for a small-M projection instead of a name its compiler would refuse; the ``sm100`` family takes the route."""
     from cudnn.gemm.frost import arch_family
     from cudnn.gated_attention_block.kernels.proj_gemm import _auto_tile_name
 
     kw = dict(dtype=torch.bfloat16, a_major="k", b_major="k", block_scale=False, alpha=False)
     monkeypatch.setattr(arch_family, "active_family", lambda: "sm120")
-    assert _auto_tile_name(32, 248, 4096, **kw) is None  # 256 does not divide 248: the graph heuristic's own tile, as before the route
+    assert _auto_tile_name(32, 768, 4096, **kw) == _FORCED_TILE_NAME  # the forced tile, as before the route
     monkeypatch.setattr(arch_family, "active_family", lambda: "sm100")
-    assert _auto_tile_name(32, 248, 4096, **kw) == small_m_tile_config(32, 248, 4096, dtype=torch.bfloat16)
+    assert _auto_tile_name(32, 768, 4096, **kw) == small_m_tile_config(32, 768, 4096, dtype=torch.bfloat16) != _FORCED_TILE_NAME
 
 
 @requires_rubin
