@@ -1280,10 +1280,15 @@ class ConvergenceRun:
                 self.opt.step()
                 torch.cuda.synchronize()
                 wall_ms = (time.perf_counter() - t0) * 1e3
+                # The row is built from the TRAINING step's layer state -- its ``spec`` and activation scales -- BEFORE the arm's
+                # evaluation forward, which rewrites every layer's ``spec`` / ``act_scales`` with the validation windows' descales and
+                # the next step's scales; ``val_loss`` is attached afterwards and the digest re-sealed over the row as written.
+                row = self._row(step, loss_val, lr, grad_norm, mets, scalars, calib_fwd, wall_ms)
                 val_loss = None
                 if self.val_windows is not None and ((step + 1) % self.val_every == 0 or step == steps - 1):
                     val_loss = self.evaluate()
-                row = self._row(step, loss_val, lr, grad_norm, mets, scalars, calib_fwd, wall_ms, val_loss)
+                    row["val_loss"] = val_loss
+                    row["row_digest"] = row_digest(row)
                 rows.append(row)
                 if f is not None:
                     f.write(json.dumps(row, sort_keys=True) + "\n")

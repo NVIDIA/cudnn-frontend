@@ -53,6 +53,7 @@ Accept tests are ``requires_rubin`` (the block targets SM107 only); the refusal 
 detector carry no marker and run on any CUDA device.
 """
 
+import array
 import ast
 import dataclasses
 import importlib
@@ -1133,3 +1134,33 @@ def test_update_quant_scales_reaches_a_captured_execute_of_a_warmed_up_block(fam
         graph.reset()
         if graph2 is not None:
             graph2.reset()
+
+
+@_L1
+@requires_rubin
+def test_a_validation_step_row_records_the_training_steps_quantization(tmp_path, deterministic_cublas):
+    """A row of a step that also scores the validation windows digests the TRAINING step's ``spec`` -- the descales the logged
+    forward quantized ``h`` and the weights with -- and not the evaluation forward's, which runs after the update on other tokens
+    and rewrites every layer's ``spec`` / activation scales (a review finding on the harness's second slice): with ``val_every=1``
+    the per-layer spec read in the ``on_grads`` hook (after the backward, before the update) is the row's on every step,
+    ``val_loss`` is present and finite, and the row digest seals the row as written."""
+    arm = gbt.ARMS["fp8-recal1"]
+    geom = _SMOKE
+    # the validation windows' token file: ``batch`` windows of synthetic tokens (uint16, every id < vocab), as the data path reads it
+    flat = gbt.SyntheticTokens(geom, 7).batch().reshape(-1).tolist()
+    path = tmp_path / "val_tokens.bin"
+    path.write_bytes(array.array("H", flat).tobytes())
+    val = gbt.ValidationWindows(geom, str(path), n_windows=geom.batch)
+    seen = {}
+
+    def on_grads(run, step, inp, tgt):
+        spec0 = run.layers[0].spec
+        fields = [f.name for f in dataclasses.fields(type(spec0)) if isinstance(getattr(spec0, f.name), float)]
+        seen[step] = {f: [float(getattr(st.spec, f)) for st in run.layers] for f in fields}
+
+    res = gbt.run_training(arm, geom, steps=2, seed=0, val_windows=val, val_every=1, on_grads=on_grads)
+    assert len(res.rows) == 2 and set(seen) == {0, 1}
+    for r in res.rows:
+        assert r["val_loss"] is not None and math.isfinite(r["val_loss"]), r["step"]
+        assert r["spec"] == seen[r["step"]], (r["step"], r["spec"], seen[r["step"]])
+        assert r["row_digest"] == gbt.row_digest(r)
