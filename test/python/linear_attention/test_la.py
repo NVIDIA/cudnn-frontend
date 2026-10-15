@@ -3202,14 +3202,14 @@ def token_major_views(case, pad=24, return_buffers=False):
 
 @pytest.mark.parametrize("l2norm", [False, True], ids=["plain", "l2norm"])
 @pytest.mark.parametrize("V", [128, 64])
-@pytest.mark.parametrize("n", (2, 3, 4, 5))
+@pytest.mark.parametrize("n", (1, 2, 3, 4, 5))
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 def test_gdp_token_major_bitwise(backend, n, V, l2norm):
     """Token-major k / v / beta (the column slices of a joint projection buffer, the joint token stride) give o, the final
     state and every gradient bitwise equal to the expanded rows, differentiated through the joint buffers themselves (the
-    gradients land in the slices, the padding columns stay zero), ragged batch with a zero-length sequence included.  At
-    n = 3 (Megatron's default) the dense token-major views of the expanded rows and the mixed form (strided k / v with
-    the expanded beta) are checked too."""
+    gradients land in the slices, the padding columns stay zero), ragged batch with a zero-length sequence included.  n = 1
+    is the GDN case, a singleton slot axis whose own stride is not the token stride.  At n = 3 (Megatron's default) the
+    dense token-major views of the expanded rows and the mixed form (strided k / v with the expanded beta) are checked too."""
     case = make_case("gdp", torch.bfloat16, seq_lens=[100, 333, 0, 64], V=V, n=n)
     state0 = random_state(case)
     tokens = case.T * case.B
@@ -3278,7 +3278,7 @@ def test_gdp_token_major_bitwise(backend, n, V, l2norm):
         check("mixed", o_m, fs_m, dq_m, dg_m, dk_m, dv_m, dbeta_m)
 
 
-@pytest.mark.parametrize("n", (2, 3))
+@pytest.mark.parametrize("n", (1, 2, 3))
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 def test_gdp_summary_token_major_bitwise(backend, n):
     """The GDP summaries (H, M and the backward G) read token-major k / v / beta bitwise like the expanded rows."""
