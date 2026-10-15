@@ -1614,3 +1614,35 @@ def test_decode_s_q_four_on_the_64_column_tile_capture_of_the_first_execute_repl
         assert torch.equal(case.out, replayed2), "the replay over new lengths / tables / slots differs from the eager run over them"
     finally:
         graph.reset()
+
+
+# --- the split ladder on the decode-grid combine ---------------------------------------------------------------------------
+
+
+def _ladder_lens(batch):
+    # kv 4K at B 1; at B 4 three live lengths beside it (a tail tile, a page-unaligned one) and a PADDED entry (0: block 0 + slot -1)
+    return [4096] if batch == 1 else [4096, 3000, 2048, 0]
+
+
+@requires_rubin
+@pytest.mark.parametrize("split", [4, 8, 16], ids=lambda s: f"split{s}")
+@pytest.mark.parametrize("s_q", [1, 4], ids=["sq1", "sq4"])
+@pytest.mark.parametrize("batch", [1, 4], ids=["b1", "b4"])
+def test_decode_split_ladder_recombines_on_the_decode_grid(batch, s_q, split):
+    """The serving step (group 12 = 24/2, page 16, the gate in the COMBINE, the MTP step in token units) at a PINNED split -- the
+    splits the kv 4K route offers (its 32 KV tiles bound the candidates at 16) -- against the per-sequence fp32 oracle: every cell's
+    combine is the shared pass's DECODE-GRID kernel (one block per (row, head, batch, 64-column chunk): the lean kernel's grid of
+    ``ceil(S_q / 4) x 24 x B`` blocks is under ``heuristics.DECODE_COMBINE_MAX_LEAN_BLOCKS``), the padded entry exactly 0, the route
+    readback at the pinned split with the gate OUT of the tile."""
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
+
+    assert comb.decode_grid_selected(batch, 24, s_q, _D)
+    lens = _ladder_lens(batch)
+    case = _case(("ladder", batch, s_q, split), 12, s_q, lens, seed=31 + split, blk_kw=dict(fuse_gate=True, decode_split_kv=split))
+    assert case.blk.decode_split_kv == split and case.blk.gate_fused
+    case.run()
+    case.check_against_oracle(what=f"b{batch} sq{s_q} split {split}")
+    rb = case.route_readback()
+    assert rb["template"] == case.blk.decode_route.tile and rb["split"] == split and rb["epilogue_gate"] is False, rb
+    if 0 in lens:
+        assert (case.out[lens.index(0)] == 0).all(), "the padded entry writes exactly 0"

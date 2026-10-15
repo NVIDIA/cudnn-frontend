@@ -429,6 +429,25 @@ _DECODE_TILE_COMBINE_COST = 3.5
 # kv 4K / 32K / 128K (16 / 32 / 64) and the batch-4 x 128K one (16) all fall
 # out, and every B200 pin below holds (the term is 0.3-2.7 tiles there).
 _DECODE_TILE_COMBINE_PER_PARTIAL = 0.17
+# Which FORM of the shared sm100/split_combine serves a launch (the selection
+# constant; the kernel module reads it).  The lean fp32-partial path has two
+# kernels: the LEAN one (one warp per output row, four rows per block, the split
+# axis walked in groups of G_T = 16 per memory round trip) and the DECODE-GRID
+# one (one block per (row, head, batch, 64-column chunk) -- 4x the blocks at
+# d 256 -- with the split axis spread over the block's eight 16-lane chains and
+# merged once through SMEM in a fixed order, so a lane's dependent-load chain is
+# ONE round trip up to 128 splits instead of one per 16 splits per pass).  The
+# decode-grid kernel is taken when the lean kernel's grid, ceil(S_q / 4) x H_q x
+# B blocks, holds at most this many blocks: fewer blocks than SMs on every
+# SM100-line part (148 .. 212), i.e. a launch the lean kernel could not fill one
+# wave with (B 1 x 24 Q heads = 24 blocks; B 4 x 24 = 96; B 4 x 32 = 128), where
+# nothing hides a serial walk; a prefill grid (thousands of blocks) and a
+# large-batch decode keep the lean kernel by construction.  The constant is
+# GEOMETRY, not a fit: both kernels move the same bytes and the decode-grid
+# kernel is never the longer chain, so the threshold only bounds which launches
+# change at all.  The per-partial price above was fitted on the lean kernel's
+# grouped walk and is REFIT after the decode-grid kernel is measured (owed).
+DECODE_COMBINE_MAX_LEAN_BLOCKS = 128
 # What the two-launch split path costs an EAGER caller on the host per
 # graph.execute beyond the one-launch path: a second CuTe-DSL launch plus the
 # partial-slab carving. Measured 62 -> 92 us on the b=32 x 2 KV heads x 4096
