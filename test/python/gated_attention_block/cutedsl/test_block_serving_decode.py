@@ -1411,10 +1411,13 @@ def test_decode_s_q_four_on_the_64_column_tile_capture_of_the_first_execute_repl
     with _route_64():
         case = _Case(16, 4, lens, seed=23)  # fresh: never executed
         sib = _Case(16, 4, (301, 0, 1000, 77), seed=29, table_row_stride=case.block_table.shape[1])
-    assert (case.blk.decode_route.n_q, case.blk.decode_route.token_units) == (64, 1)
-    case.blk.check_support()
-    case.blk.compile()
-    assert case.route_readback()["n_q"] == 64
+        assert (case.blk.decode_route.n_q, case.blk.decode_route.token_units) == (64, 1)
+        # The adapter reads the rule again at compile (its own _decode_q_tile), so the pin covers the compile too: declared at
+        # 64 and compiled outside the pin, the block lowered at 32 while its decode_route said 64 -- a drift the block's
+        # kernel_template pin (both widths are decode_d256_f16) does not see.
+        case.blk.check_support()
+        case.blk.compile()
+    assert case.route_readback()["n_q"] == 64, case.route_readback()
     case.ws = torch.empty(case.blk.get_workspace_size(), dtype=torch.uint8, device=_DEV)
     case.out.fill_(float("nan"))
     k_before = _written(case.k_cache)
