@@ -649,6 +649,10 @@ class DenseLaunchSpec:
         "split",
         "fp32_partial",
         "combine",
+        # The split sink combine takes the per-batch Q lengths (int32 (B,)) after the sink pointer: a plan with a split sink AND the dense padded-Q
+        # trim (``seq_q_present``).  The combine cannot tell a padded query row from a valid keyless one without them (the native binder appends the
+        # bound Q-length address to the combine frame).
+        "combine_q_lens",
         "tile_n",
         "kv_tail_native",
         "causal",
@@ -746,9 +750,17 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     if s.ragged and (s.split < 2 or not s.paged or not getattr(cfg, "RAGGED_Q", 0)):
         raise NotImplementedError("cudnn.sdpa: the ragged-Q decode leg needs a split, paged launch of a RAGGED_Q-compiled decode tile")
     s.combine = None
+    s.combine_q_lens = False
     if s.split > 1:
         from cudnn.sdpa.fwd.api_dsl import ws_align
         from cudnn.sdpa.fwd.kernels.sm100 import split_combine
+        from cudnn import _pybind_module
+
+        s.combine_q_lens = bool(s.has_sink) and s.quant is None and s.seq_q_present and not s.ragged
+        if s.combine_q_lens and not getattr(_pybind_module._SdpaDenseBinder, "supports_combine_q_lens", False):
+            raise NotImplementedError(
+                "cudnn.sdpa: a split attention sink over padded query lengths needs the native binder that passes them to the combine; rebuild the extension"
+            )
 
         owner = split_combine.compile_ptr(
             dtype_o=api._combine_dtype_tag(),
@@ -763,6 +775,9 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
             has_scale_o_input=not (s.quant is not None and s.quant.sf_sizes),
             gate=gate_in_combine,
             dtype_gate=({"bfloat16": "bf16", "float16": "f16"}[gate_dtype] if gate_in_combine else None),
+            # Half flavors fold the attention sink in the combine (sink-free partials).
+            has_sink=bool(s.has_sink) and s.quant is None,
+            has_q_lens=s.combine_q_lens,
         )
         fn = positional_entry(owner)
         if fn is None:

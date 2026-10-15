@@ -80,6 +80,8 @@ from cudnn.sdpa.fwd.config_sm107 import TemplateParams, make_cfg_d128
 
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 CFG, _TMA = make_cfg_d128(PARAMS)
+if PARAMS.dual_kv_stream:
+    raise ValueError("sm107/prefill_d128_f16: dual_kv_stream (two KV streams over one Q tile) is served by sm100/prefill_d128_fp8.py only")
 if PARAMS.paged_kv:
     raise ValueError(
         "prefill_d128_f16_sm107: paged_kv is not wired on this kernel (the PAGED_KV specialization lives in sm100/prefill_d128_f16, sm100/prefill_d256_f16 and sm100/prefill_d128_fp8)"
