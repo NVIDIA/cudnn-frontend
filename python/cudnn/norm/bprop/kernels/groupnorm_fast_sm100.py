@@ -37,7 +37,7 @@ import cutlass.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
-from cudnn.norm.utils import cur_stream, dyn, fake_stream, smem_budget
+from cudnn.norm.utils import ws_bytes, ws_empty, ws_zeros, cur_stream, dyn, fake_stream, smem_budget
 
 _CTA_SS = nvvm.SharedSpace.shared_cta
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
@@ -338,7 +338,23 @@ def eligible(spec, elem_bytes):
     return True
 
 
-def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params, out_dx=None, out_dgamma=None, out_dbeta=None):
+def scratch_bytes(spec, params, shape=None, has_beta=False, knobs=None):
+    """Upper bound on the workspace this launch may carve.
+
+    Evaluated at the highest occupancy the cooperative probe can pick, because
+    the partial count only grows with it. Over-reporting costs address space;
+    under-reporting would push the carve back onto torch and reintroduce the
+    allocation the workspace exists to remove.
+    """
+    GPS, R = int(spec.groups_per_sample), int(spec.R)
+    ctas = max(GPS, (max(1, min(4 * _nsm(), R)) // GPS) * GPS)
+    if ctas > R:
+        ctas = max(GPS, (R // GPS) * GPS) or GPS
+    n = ctas * int(spec.channels_per_group)
+    return ws_bytes((n, 4), (n, 4))
+
+
+def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params, out_dx=None, out_dgamma=None, out_dbeta=None, ws=None):
     """Launch the atomic-free GN/IN backward. Returns ``(dx, dgamma, dbeta)``."""
     import torch
 
@@ -373,8 +389,8 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params, out_d
     dx = torch.empty_like(x2d) if out_dx is None else out_dx
     dgamma = torch.empty(spec.gamma_len, dtype=torch.float32, device=x2d.device) if out_dgamma is None else out_dgamma
     dbeta = torch.empty(spec.gamma_len, dtype=torch.float32, device=x2d.device) if out_dbeta is None else out_dbeta
-    dgp = torch.zeros(ctas * CPG, dtype=torch.float32, device=x2d.device)
-    dbp = torch.zeros(ctas * CPG, dtype=torch.float32, device=x2d.device)
+    dgp = ws_zeros(ws, ctas * CPG, torch.float32, x2d.device)
+    dbp = ws_zeros(ws, ctas * CPG, torch.float32, x2d.device)
     if mean is None:
         mean = rstd
 

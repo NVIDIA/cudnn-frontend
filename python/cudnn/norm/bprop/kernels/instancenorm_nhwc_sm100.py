@@ -34,7 +34,7 @@ import cutlass.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
-from cudnn.norm.utils import cur_stream, dyn, fake_stream, run_coop, sm_count
+from cudnn.norm.utils import COOP_OCC_MAX, ws_bytes, ws_empty, ws_reset, ws_zeros, cur_stream, dyn, fake_stream, run_coop, sm_count
 
 _CTA_SS = nvvm.SharedSpace.shared_cta
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
@@ -404,7 +404,25 @@ def _in_bwd_nhwc_host(
 _KCACHE = {}
 
 
-def backward(spec, dy4d, x4d, gamma, mean, rstd, *, has_beta, cfg, params, knobs=None, out_dx=None, out_dgamma=None, out_dbeta=None):
+def scratch_bytes(spec, params, shape, has_beta=False, knobs=None):
+    """Upper bound on the workspace this launch may carve.
+
+    Evaluated at the highest occupancy the cooperative probe can pick, because
+    the partial count only grows with it. Over-reporting costs address space;
+    under-reporting would push the carve back onto torch and reintroduce the
+    allocation the workspace exists to remove.
+    """
+    N, HW, C = (int(v) for v in shape)
+    geo = nhwc_cfg(C, DTYPE_BYTES[params.io_dtype])
+    if geo is None:
+        return 0
+    V, _CPC, TPP, PPL, cblks, _BTg = geo
+    KC, KS = knobs if knobs is not None else (4, 0)
+    mparts = max(1, min(sm_count() * COOP_OCC_MAX // max(1, cblks * N), HW // (PPL * max(KC + KS, 4))))
+    return ws_bytes((N * cblks * mparts * TPP * V * 2, 4), (N * cblks, 4), (N * C, 4), (N * C, 4))
+
+
+def backward(spec, dy4d, x4d, gamma, mean, rstd, *, has_beta, cfg, params, knobs=None, out_dx=None, out_dgamma=None, out_dbeta=None, ws=None):
     """Launch the native NHWC InstanceNorm backward. ``x4d``/``dy4d`` are the
     channels-last tensors viewed as ``[N, H*W, C]``."""
     import torch
@@ -435,10 +453,11 @@ def backward(spec, dy4d, x4d, gamma, mean, rstd, *, has_beta, cfg, params, knobs
         dx = torch.empty_like(x4d) if out_dx is None else out_dx
         dgamma = torch.empty(C, dtype=torch.float32, device=x4d.device) if out_dgamma is None else out_dgamma
         dbeta = torch.empty(C, dtype=torch.float32, device=x4d.device) if out_dbeta is None else out_dbeta
-        pbuf = torch.empty(N * cblks * mparts * TPP * V * 2, dtype=torch.float32, device=x4d.device)
-        ret = torch.zeros(N * cblks, dtype=torch.int32, device=x4d.device)
-        s1 = torch.empty(N * C, dtype=torch.float32, device=x4d.device)
-        s2 = torch.empty(N * C, dtype=torch.float32, device=x4d.device)
+        ws_reset(ws)  # this block is retried at a lower occupancy
+        pbuf = ws_empty(ws, N * cblks * mparts * TPP * V * 2, torch.float32, x4d.device)
+        ret = ws_zeros(ws, N * cblks, torch.int32, x4d.device)
+        s1 = ws_empty(ws, N * C, torch.float32, x4d.device)
+        s2 = ws_empty(ws, N * C, torch.float32, x4d.device)
 
         args = (
             dyn(dy4d.reshape(-1)),

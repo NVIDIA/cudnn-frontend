@@ -92,6 +92,43 @@ def _is_nhwc(x) -> bool:
     return x.dim() == 4 and x.is_contiguous(memory_format=torch.channels_last)
 
 
+def fprop_workspace_bytes(variant, shape, io, *, normalized_shape=None, num_groups=None, nhwc=False):
+    """Upper bound on the scratch :func:`norm_fprop` may carve for this call.
+
+    Takes the MAX over every kernel the routing could pick rather than
+    reproducing the if/else chain. The routing is performance-tuned and moves;
+    a sizer that drifted from it would under-report, and the kernels would
+    quietly fall back to allocating -- which is the thing the workspace exists
+    to prevent. Over-reporting only costs address space.
+
+    Returns 0 for the routes that need no scratch at all, which is every
+    rowwise LayerNorm / RMSNorm / GroupNorm / InstanceNorm forward.
+    """
+    from .kernels import batchnorm_nchw_sm100, batchnorm_nhwc_sm100, groupnorm_nhwc_sm100, instancenorm_nhwc_sm100
+
+    variant = _as_variant(variant)
+    shape = tuple(int(v) for v in shape)
+    best = 0
+    # Only an unsupported SHAPE is tolerated here. A broad except would turn a
+    # genuine bug into a silent 0, and a 0 means the kernels allocate -- the
+    # exact failure this function exists to prevent, and an invisible one.
+    try:
+        if variant in (NormVariant.GROUP_NORM, NormVariant.INSTANCE_NORM) and nhwc and len(shape) == 4:
+            N, C, H, W = shape
+            spec = rowwise_spec(variant, shape, normalized_shape=normalized_shape, num_groups=num_groups)
+            mod = groupnorm_nhwc_sm100 if variant == NormVariant.GROUP_NORM else instancenorm_nhwc_sm100
+            best = max(best, mod.scratch_bytes(spec, TemplateParams(variant=variant, io_dtype=io), (N, H * W, C)))
+        elif variant == NormVariant.BATCH_NORM:
+            spec = batchnorm_spec(shape)
+            params = TemplateParams(variant=variant, io_dtype=io)
+            best = max(best, batchnorm_nchw_sm100.scratch_bytes(params=params, spec=spec, shape=(spec.N, spec.C, spec.S)))
+            if nhwc:
+                best = max(best, batchnorm_nhwc_sm100.scratch_bytes(params=params, spec=spec, shape=(spec.N * spec.S, spec.C)))
+    except ValueError:  # a shape no kernel accepts needs no workspace
+        return 0
+    return best
+
+
 def norm_fprop(
     variant,
     x,
@@ -106,6 +143,7 @@ def norm_fprop(
     running_mean=None,
     running_var=None,
     out=None,
+    ws=None,
 ):
     """Forward pass for any of the five norm variants.
 
@@ -118,6 +156,10 @@ def norm_fprop(
     costs the graph path ~1.6x the direct one. A buffer that cannot be used is
     ignored and a temporary takes its place, so this stays an optimisation
     rather than a contract the caller has to satisfy exactly.
+
+    ``ws`` is a :class:`cudnn.norm.utils.Workspace` the cooperative kernels
+    carve their scratch from; size it with :func:`fprop_workspace_bytes`. Left
+    at None (the torch API) they allocate as before.
     """
     import torch
 
@@ -163,6 +205,7 @@ def norm_fprop(
                     out_y=o3,
                     out_mean=_stat_out(out_mean, spec.R),
                     out_rstd=_stat_out(out_rstd, spec.R),
+                    ws=ws,
                 )
                 return y3.reshape(N, H, W, C).permute(0, 3, 1, 2), mean, rstd
         if variant == NormVariant.INSTANCE_NORM and _is_nhwc(x):
@@ -181,6 +224,7 @@ def norm_fprop(
                     out_y=o3,
                     out_mean=_stat_out(out_mean, spec.R),
                     out_rstd=_stat_out(out_rstd, spec.R),
+                    ws=ws,
                 )
                 return y3.reshape(N, H, W, C).permute(0, 3, 1, 2), mean, rstd
 
@@ -260,6 +304,7 @@ def norm_fprop(
                 cfg=None,
                 params=params,
                 out_y=o2d,
+                ws=ws,
                 out_mean=_stat_out(out_mean, spec.C),
                 out_rstd=_stat_out(out_rstd, spec.C),
             )
@@ -283,6 +328,7 @@ def norm_fprop(
                 cfg=None,
                 params=params,
                 out_y=o3d,
+                ws=ws,
                 out_mean=_stat_out(out_mean, spec.C),
                 out_rstd=_stat_out(out_rstd, spec.C),
             )

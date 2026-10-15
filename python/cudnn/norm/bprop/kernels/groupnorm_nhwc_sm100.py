@@ -56,7 +56,7 @@ import cutlass.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
-from cudnn.norm.utils import cur_stream, dyn, fake_stream, run_coop, sm_count
+from cudnn.norm.utils import COOP_OCC_MAX, ws_bytes, ws_empty, ws_reset, ws_zeros, cur_stream, dyn, fake_stream, run_coop, sm_count
 
 _CTA_SS = nvvm.SharedSpace.shared_cta
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
@@ -475,7 +475,27 @@ def eligible(C, cpg, eb):
     return _geom(C, cpg, eb) is not None
 
 
-def backward(spec, dy3, x3, gamma, mean, rstd, *, has_beta, cfg, params, knobs=None, out_dx=None, out_dgamma=None, out_dbeta=None):
+def scratch_bytes(spec, params, shape, has_beta=False, knobs=None):
+    """Upper bound on the workspace this launch may carve.
+
+    Evaluated at the highest occupancy the cooperative probe can pick, because
+    the partial count only grows with it. Over-reporting costs address space;
+    under-reporting would push the carve back onto torch and reintroduce the
+    allocation the workspace exists to remove.
+    """
+    N, HW, C = (int(v) for v in shape)
+    geo = _geom(C, int(spec.channels_per_group), DTYPE_BYTES[params.io_dtype], _BT)
+    if geo is None:
+        return 0
+    _V, CPC, _TPP, PPL, GPT, _LPG, _GPL = geo
+    KC = 0 if knobs is None else int(knobs)  # the BACKWARD defaults to 0, unlike the forward's 4
+    TILES = C // CPC
+    mparts = max(1, min(sm_count() * COOP_OCC_MAX // max(1, TILES * N), HW // (PPL * max(1, KC))))
+    NM = N * mparts
+    return ws_bytes((NM * C, 4), (NM * C, 4), (N * TILES * mparts * 2 * GPT, 4), (N * TILES, 4))
+
+
+def backward(spec, dy3, x3, gamma, mean, rstd, *, has_beta, cfg, params, knobs=None, out_dx=None, out_dgamma=None, out_dbeta=None, ws=None):
     """Launch the native NHWC GroupNorm backward. ``x3``/``dy3`` are ``[N, H*W, C]``."""
     import torch
 
@@ -510,10 +530,11 @@ def backward(spec, dy3, x3, gamma, mean, rstd, *, has_beta, cfg, params, knobs=N
         dgamma = torch.empty(C, dtype=torch.float32, device=x3.device) if out_dgamma is None else out_dgamma
         dbeta = torch.empty(C, dtype=torch.float32, device=x3.device) if out_dbeta is None else out_dbeta
         NM = N * mparts
-        s1 = torch.zeros(NM * C, dtype=torch.float32, device=x3.device)
-        s2 = torch.zeros(NM * C, dtype=torch.float32, device=x3.device)
-        pbuf = torch.empty(N * TILES * mparts * 2 * GPT, dtype=torch.float32, device=x3.device)
-        ret = torch.zeros(N * TILES, dtype=torch.int32, device=x3.device)
+        ws_reset(ws)  # this block is retried at a lower occupancy
+        s1 = ws_zeros(ws, NM * C, torch.float32, x3.device)
+        s2 = ws_zeros(ws, NM * C, torch.float32, x3.device)
+        pbuf = ws_empty(ws, N * TILES * mparts * 2 * GPT, torch.float32, x3.device)
+        ret = ws_zeros(ws, N * TILES, torch.int32, x3.device)
 
         args = (
             dyn(dy3.reshape(-1)),

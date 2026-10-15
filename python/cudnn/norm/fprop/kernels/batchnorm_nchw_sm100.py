@@ -49,7 +49,7 @@ import cutlass.cute as cute
 import cutlass.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
-from cudnn.norm.utils import cur_stream, dyn, fake_stream, smem_budget, smem_per_sm
+from cudnn.norm.utils import ws_bytes, ws_empty, ws_reset, ws_zeros, cur_stream, dyn, fake_stream, smem_budget, smem_per_sm
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 
 _CTA_SS = nvvm.SharedSpace.shared_cta
@@ -804,7 +804,26 @@ def _ksr(nloc: int, WPB: int, CPW: int, S: int, eb: int, occ: int) -> int:
     return max(0, min(nloc, (smem_budget(_SMEM_CAP_PREF) // occ) // per_row))
 
 
-def forward(spec, x3d, gamma, beta, *, eps, momentum, training, running_mean, running_var, cfg, params, knobs=None, out_y=None, out_mean=None, out_rstd=None):
+def scratch_bytes(spec, params, shape, has_beta=False, knobs=None):
+    """Upper bound on the workspace this launch may carve.
+
+    Evaluated at the highest occupancy the cooperative probe can pick, because
+    the partial count only grows with it. Over-reporting costs address space;
+    under-reporting would push the carve back onto torch and reintroduce the
+    allocation the workspace exists to remove.
+    """
+    N, C, S = (int(v) for v in shape)
+    geo = nchw_cfg(C, N, S, DTYPE_BYTES[params.io_dtype])
+    if geo is None:
+        return 0
+    _VS, _UF, _WPB, _CPW, CT, cparts, _BTg = geo
+    mparts = _split(N, cparts, 2)  # the loop tries occ=2 first, and 2 is its max
+    return ws_bytes((cparts * 2 * mparts * CT, 4), (cparts, 4))
+
+
+def forward(
+    spec, x3d, gamma, beta, *, eps, momentum, training, running_mean, running_var, cfg, params, knobs=None, out_y=None, out_mean=None, out_rstd=None, ws=None
+):
     """Launch the NCHW BatchNorm forward on ``x3d`` viewed as ``[N, C, S]``.
 
     Returns ``(y3d, saved_mean, saved_rstd)``.
@@ -877,8 +896,9 @@ def forward(spec, x3d, gamma, beta, *, eps, momentum, training, running_mean, ru
             smem_bytes = max(smem_bytes, smem_per_sm() // (occ + 1) + 1)
         ce = (C, S, VS, UF, WPB, CPW, CT, BT, KSR, KTR, LPT, TCOLS, cparts, it_ty, et, count, float(eps), has_beta, update_running, smem_bytes, mbpm)
         key = (params.io_dtype,) + ce
-        pbuf = torch.empty(cparts * 2 * mparts * CT, dtype=torch.float32, device=x3d.device)
-        ret = torch.zeros(cparts, dtype=torch.int32, device=x3d.device)
+        ws_reset(ws)  # this block is retried at a lower occupancy
+        pbuf = ws_empty(ws, cparts * 2 * mparts * CT, torch.float32, x3d.device)
+        ret = ws_zeros(ws, cparts, torch.int32, x3d.device)
         args = (
             dyn(xf),
             dyn(yf),

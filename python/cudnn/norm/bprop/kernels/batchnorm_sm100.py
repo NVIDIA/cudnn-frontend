@@ -125,7 +125,7 @@ def _bn_bwd_host(
 _KCACHE = {}
 
 
-def backward(spec, dy3d, x3d, gamma, saved_mean, saved_rstd, *, has_beta, cfg, params, out_dx=None, out_dgamma=None, out_dbeta=None):
+def backward(spec, dy3d, x3d, gamma, saved_mean, saved_rstd, *, has_beta, cfg, params, out_dx=None, out_dgamma=None, out_dbeta=None, ws=None):
     """Launch BatchNorm backward. Returns ``(dx, dgamma, dbeta)``."""
     import torch
 

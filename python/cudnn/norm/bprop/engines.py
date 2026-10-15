@@ -102,7 +102,7 @@ def lower_norm_bprop(spec: EngineSpec, facts: "ga.NormGraphFacts", requested: Op
     """Default lowering: resolve buffers at execute time and call
     :func:`cudnn.norm.bprop.api.norm_bprop` (dispatches by ``facts.variant``);
     outputs are copied into the graph's DX / Dscale / Dbias buffers."""
-    from cudnn.norm.bprop.api import norm_bprop
+    from cudnn.norm.bprop.api import bprop_workspace_bytes, norm_bprop
 
     binding = ga.NormBinding(
         {
@@ -117,7 +117,7 @@ def lower_norm_bprop(spec: EngineSpec, facts: "ga.NormGraphFacts", requested: Op
         }
     )
 
-    def _execute(variant_pack):
+    def _execute(variant_pack, ws=None):
         resolved = ga.resolve_variant_pack(variant_pack, binding)
         dy = resolved[id(facts.dy_t)]
         x = resolved[id(facts.x_t)]
@@ -142,6 +142,7 @@ def lower_norm_bprop(spec: EngineSpec, facts: "ga.NormGraphFacts", requested: Op
             num_groups=facts.num_groups,
             has_beta=facts.has_beta,
             out=(dx_buf, dg_buf, db_buf),
+            ws=ws,
         )
         _copy_into(dx_buf, dx)
         _copy_into(dg_buf, dgamma)
@@ -149,7 +150,37 @@ def lower_norm_bprop(spec: EngineSpec, facts: "ga.NormGraphFacts", requested: Op
             _copy_into(db_buf, dbeta)
         return None
 
+    # Sized once, at build: get_workspace_size() is asked before any execute.
+    _execute.workspace_bytes = bprop_workspace_bytes(
+        facts.variant,
+        facts.x_shape,
+        _io_of(facts),
+        normalized_shape=facts.normalized_shape,
+        num_groups=facts.num_groups,
+        has_beta=facts.has_beta,
+        nhwc=_is_channels_last(facts),
+    )
     return _execute
+
+
+def _io_of(facts):
+    """The kernels' dtype tag for this graph's X."""
+    from cudnn.norm.dtypes import torch_dtype_to_str
+
+    return torch_dtype_to_str(facts.dtype)
+
+
+def _is_channels_last(facts):
+    """True when X is declared channels-last; read off the graph's strides,
+    because sizing happens at build time with no buffer bound."""
+    shape = tuple(int(v) for v in facts.x_shape)
+    if len(shape) != 4 or facts.x_t is None:
+        return False
+    try:
+        n, c, h, w = (int(v) for v in facts.x_t.get_stride())
+    except Exception:  # noqa: BLE001
+        return False
+    return c == 1 and w == shape[1] and h == shape[1] * shape[3]
 
 
 def _copy_into(buf, src):

@@ -48,7 +48,7 @@ from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 from cudnn.norm.fprop.kernels.layernorm_cga_sm100 import _MAX_CGA, _pick_cga
-from cudnn.norm.utils import cur_stream, dyn, fake_stream, sm_count
+from cudnn.norm.utils import ws_bytes, ws_empty, ws_zeros, cur_stream, dyn, fake_stream, sm_count
 
 from .layernorm_sm100 import _ln_bwd_finalize_kernel
 
@@ -355,7 +355,25 @@ def _ln_bwd_cga_host(
 _KCACHE = {}
 
 
-def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, knobs=None, out_dx=None, out_dgamma=None, out_dbeta=None):
+def scratch_bytes(spec, params, shape=None, has_beta=False, knobs=None):
+    """Upper bound on the workspace this launch may carve.
+
+    Evaluated at the highest occupancy the cooperative probe can pick, because
+    the partial count only grows with it. Over-reporting costs address space;
+    under-reporting would push the carve back onto torch and reintroduce the
+    allocation the workspace exists to remove.
+    """
+    C, R = int(spec.M), int(spec.R)
+    cfg = cga_cfg(C, R, DTYPE_BYTES[params.io_dtype], _BT)
+    if cfg is None:
+        return 0
+    CGA = cfg[2] if not isinstance(cfg, int) else cfg
+    nclusters = min(R, max(1, 4 * sm_count() // CGA))
+    parts = [(nclusters * C, 4)] * (2 if has_beta else 1)
+    return ws_bytes(*parts)
+
+
+def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, knobs=None, out_dx=None, out_dgamma=None, out_dbeta=None, ws=None):
     """Launch the CGA row-split LN/RMS backward. ``dy2d``/``x2d`` are ``[R, C]``."""
     import torch
 
@@ -376,8 +394,8 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, knobs=None
     dx = torch.empty_like(x2d) if out_dx is None else out_dx
     dgamma = torch.zeros(spec.gamma_len, dtype=torch.float32, device=x2d.device) if out_dgamma is None else out_dgamma.zero_()
     dbeta = (out_dbeta.zero_() if out_dbeta is not None else torch.zeros(spec.gamma_len, dtype=torch.float32, device=x2d.device)) if has_beta else dgamma
-    dgp = torch.empty(nclusters * C, dtype=torch.float32, device=x2d.device)
-    dbp = torch.empty(nclusters * C, dtype=torch.float32, device=x2d.device) if has_beta else dgp
+    dgp = ws_empty(ws, nclusters * C, torch.float32, x2d.device)
+    dbp = ws_empty(ws, nclusters * C, torch.float32, x2d.device) if has_beta else dgp
 
     FB = 128 if C < 256 else 256
     fgrid = (C + FB - 1) // FB

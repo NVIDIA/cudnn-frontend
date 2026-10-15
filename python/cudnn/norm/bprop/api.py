@@ -80,6 +80,56 @@ def _is_nhwc(t) -> bool:
     return t.dim() == 4 and t.is_contiguous(memory_format=torch.channels_last)
 
 
+def bprop_workspace_bytes(variant, shape, io, *, normalized_shape=None, num_groups=None, has_beta=True, nhwc=False):
+    """Upper bound on the scratch :func:`norm_bprop` may carve for this call.
+
+    Max over every kernel the routing could pick, for the same reason as the
+    forward sizer: the routing is tuned and moves, and a sizer that drifted
+    from it would under-report, sending the kernels back to torch for the
+    partial buffers the workspace exists to hold. Over-reporting costs only
+    address space -- and the dominant term, LayerNorm's per-CTA dgamma
+    partials, is bounded by the grid cap rather than by the input size.
+    """
+    from .kernels import (
+        batchnorm_nchw_sm100,
+        batchnorm_nhwc_sm100,
+        groupnorm_cga_sm100,
+        groupnorm_fast_sm100,
+        groupnorm_nhwc_sm100,
+        instancenorm_nhwc_sm100,
+        instancenorm_warp_sm100,
+        layernorm_cga_sm100,
+        layernorm_sm100,
+    )
+
+    variant = _as_variant(variant)
+    shape = tuple(int(v) for v in shape)
+    params = TemplateParams(variant=variant, io_dtype=io, has_beta=has_beta)
+    best = 0
+    # Only an unsupported SHAPE is tolerated; see fprop_workspace_bytes.
+    try:
+        if variant in (NormVariant.LAYER_NORM, NormVariant.RMS_NORM):
+            spec = rowwise_spec(variant, shape, normalized_shape=normalized_shape, num_groups=num_groups)
+            for mod in (layernorm_sm100, layernorm_cga_sm100):
+                best = max(best, mod.scratch_bytes(spec, params, has_beta=has_beta))
+        elif variant in (NormVariant.GROUP_NORM, NormVariant.INSTANCE_NORM):
+            spec = rowwise_spec(variant, shape, normalized_shape=normalized_shape, num_groups=num_groups)
+            for mod in (groupnorm_cga_sm100, groupnorm_fast_sm100, instancenorm_warp_sm100):
+                best = max(best, mod.scratch_bytes(spec, params, has_beta=has_beta))
+            if nhwc and len(shape) == 4:
+                N, C, H, W = shape
+                mod = groupnorm_nhwc_sm100 if variant == NormVariant.GROUP_NORM else instancenorm_nhwc_sm100
+                best = max(best, mod.scratch_bytes(spec, params, (N, H * W, C), has_beta=has_beta))
+        elif variant == NormVariant.BATCH_NORM:
+            spec = batchnorm_spec(shape)
+            best = max(best, batchnorm_nchw_sm100.scratch_bytes(spec, params, (spec.N, spec.C, spec.S), has_beta=has_beta))
+            if nhwc:
+                best = max(best, batchnorm_nhwc_sm100.scratch_bytes(spec, params, (spec.N * spec.S, spec.C), has_beta=has_beta))
+    except ValueError:  # a shape no kernel accepts needs no workspace
+        return 0
+    return best
+
+
 def norm_bprop(
     variant,
     dy,
@@ -92,6 +142,7 @@ def norm_bprop(
     num_groups: Optional[int] = None,
     has_beta: bool = True,
     out=None,
+    ws=None,
 ):
     """Backward pass for any of the five norm variants.
 
@@ -103,6 +154,9 @@ def norm_bprop(
     the graph's own tensors so execute() allocates nothing and does not copy DX.
     Kernels that accumulate into dgamma/dbeta clear the buffer first, so a
     caller need not hand over zeroed memory.
+
+    ``ws`` is a :class:`cudnn.norm.utils.Workspace` the kernels carve their
+    partial buffers from; size it with :func:`bprop_workspace_bytes`.
     """
     variant = _as_variant(variant)
     # BatchNorm has a native channels-last backward, so preserve NHWC instead of
@@ -143,6 +197,7 @@ def norm_bprop(
                     cfg=cfg,
                     params=params,
                     out_dx=odx3,
+                    ws=ws,
                     out_dgamma=_stat_out(out_dgamma, spec.gamma_len),
                     out_dbeta=_stat_out(out_dbeta, spec.gamma_len),
                 )
@@ -167,6 +222,7 @@ def norm_bprop(
                     cfg=cfg,
                     params=params,
                     out_dx=odx3,
+                    ws=ws,
                     out_dgamma=_stat_out(out_dgamma, spec.gamma_len),
                     out_dbeta=_stat_out(out_dbeta, spec.gamma_len),
                 )
@@ -180,7 +236,7 @@ def norm_bprop(
         # shuffle rather than a block reduce through shared memory.
         if variant == NormVariant.INSTANCE_NORM and instancenorm_warp_sm100.eligible(spec, DTYPE_BYTES[io]):
             dx, dgamma, dbeta = instancenorm_warp_sm100.backward(
-                spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, cfg=cfg, params=params, out_dx=odx, out_dgamma=odg, out_dbeta=odb
+                spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, cfg=cfg, params=params, out_dx=odx, out_dgamma=odg, out_dbeta=odb, ws=ws
             )
             return dx.reshape(x.shape), dgamma, dbeta
         # Long rows and few rows: groupnorm_fast_sm100 declines when the row will not
@@ -191,12 +247,12 @@ def norm_bprop(
 
             if groupnorm_cga_sm100.should_use(spec, DTYPE_BYTES[io]):
                 dx, dgamma, dbeta = groupnorm_cga_sm100.backward(
-                    spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, params=params, out_dx=odx, out_dgamma=odg, out_dbeta=odb
+                    spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, params=params, out_dx=odx, out_dgamma=odg, out_dbeta=odb, ws=ws
                 )
                 return dx.reshape(x.shape), dgamma, dbeta
         if variant in (NormVariant.GROUP_NORM, NormVariant.INSTANCE_NORM) and groupnorm_fast_sm100.eligible(spec, DTYPE_BYTES[io]):
             dx, dgamma, dbeta = groupnorm_fast_sm100.backward(
-                spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, cfg=cfg, params=params, out_dx=odx, out_dgamma=odg, out_dbeta=odb
+                spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, cfg=cfg, params=params, out_dx=odx, out_dgamma=odg, out_dbeta=odb, ws=ws
             )
             return dx.reshape(x.shape), dgamma, dbeta
         # LN/RMS with a long row: split it across a CGA and reduce c1/c2 through
@@ -207,11 +263,11 @@ def norm_bprop(
 
             if layernorm_cga_sm100.should_use(spec.M, spec.R, DTYPE_BYTES[io]):
                 dx, dgamma, dbeta = layernorm_cga_sm100.backward(
-                    spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, params=params, out_dx=odx, out_dgamma=odg, out_dbeta=odb
+                    spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, params=params, out_dx=odx, out_dgamma=odg, out_dbeta=odb, ws=ws
                 )
                 return dx.reshape(x.shape), dgamma, dbeta
         dx, dgamma, dbeta = _ROWWISE_KERNEL[variant].backward(
-            spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, cfg=cfg, params=params, out_dx=odx, out_dgamma=odg, out_dbeta=odb
+            spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, cfg=cfg, params=params, out_dx=odx, out_dgamma=odg, out_dbeta=odb, ws=ws
         )
         return dx.reshape(x.shape), dgamma, dbeta
 
@@ -241,6 +297,7 @@ def norm_bprop(
                 cfg=cfg,
                 params=params,
                 out_dx=odx2,
+                ws=ws,
                 out_dgamma=_stat_out(out_dgamma, spec.C),
                 out_dbeta=_stat_out(out_dbeta, spec.C),
             )
@@ -248,11 +305,11 @@ def norm_bprop(
         # NCHW: split-K over the batch, fixed channels per warp (no atomics).
         if batchnorm_nchw_sm100.nchw_cfg(spec.C, spec.N, spec.S, eb) is not None:
             dx, dgamma, dbeta = batchnorm_nchw_sm100.backward(
-                spec, dy3d, x3d, gamma, mean, rstd, has_beta=has_beta, cfg=cfg, params=params, out_dx=odx3d, out_dgamma=odg, out_dbeta=odb
+                spec, dy3d, x3d, gamma, mean, rstd, has_beta=has_beta, cfg=cfg, params=params, out_dx=odx3d, out_dgamma=odg, out_dbeta=odb, ws=ws
             )
             return dx.reshape(x.shape), dgamma, dbeta
         dx, dgamma, dbeta = batchnorm_sm100.backward(
-            spec, dy3d, x3d, gamma, mean, rstd, has_beta=has_beta, cfg=cfg, params=params, out_dx=odx3d, out_dgamma=odg, out_dbeta=odb
+            spec, dy3d, x3d, gamma, mean, rstd, has_beta=has_beta, cfg=cfg, params=params, out_dx=odx3d, out_dgamma=odg, out_dbeta=odb, ws=ws
         )
         return dx.reshape(x.shape), dgamma, dbeta
 

@@ -33,7 +33,7 @@ import cutlass.cute as cute
 import cutlass.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
-from cudnn.norm.utils import cur_stream, dyn, fake_stream, smem_budget, smem_per_sm
+from cudnn.norm.utils import ws_bytes, ws_empty, ws_reset, ws_zeros, cur_stream, dyn, fake_stream, smem_budget, smem_per_sm
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 
 _CTA_SS = nvvm.SharedSpace.shared_cta
@@ -622,7 +622,26 @@ def _smem_bytes(BT, V, CPC, KS, elem_bytes):
     return BT * V * 4 + 2 * CPC * 4 + BT * KS * V * elem_bytes + 128
 
 
-def forward(spec, x2d, gamma, beta, *, eps, momentum, training, running_mean, running_var, cfg, params, knobs=None, out_y=None, out_mean=None, out_rstd=None):
+def scratch_bytes(spec, params, shape, has_beta=False, knobs=None):
+    """Upper bound on the workspace this launch may carve.
+
+    Evaluated at the highest occupancy the cooperative probe can pick, because
+    the partial count only grows with it. Over-reporting costs address space;
+    under-reporting would push the carve back onto torch and reintroduce the
+    allocation the workspace exists to remove.
+    """
+    M, C = (int(v) for v in shape)
+    geo = nhwc_cfg(C, DTYPE_BYTES[params.io_dtype])
+    if geo is None:
+        return 0
+    V, _CPC, TPP, PPL, cblks, _BTg = geo
+    mparts = _mparts(M, PPL, cblks, 2)  # occ=2 is the loop's maximum
+    return ws_bytes((cblks * mparts * TPP * V * 2, 4), (cblks, 4))
+
+
+def forward(
+    spec, x2d, gamma, beta, *, eps, momentum, training, running_mean, running_var, cfg, params, knobs=None, out_y=None, out_mean=None, out_rstd=None, ws=None
+):
     """Launch the NHWC BatchNorm forward on ``x2d`` viewed as ``[M, C]``.
 
     Returns ``(y2d, saved_mean, saved_rstd)``. ``running_mean``/``running_var`` are
@@ -691,8 +710,9 @@ def forward(spec, x2d, gamma, beta, *, eps, momentum, training, running_mean, ru
         fn = _KCACHE.get(key)
         mparts = _mparts(M, PPL, cblks, occ)
         # Partials [cblks, 2, mparts, C_tile]; every slot is written, so no zeroing.
-        pbuf = torch.empty(cblks * mparts * TPP * V * 2, dtype=torch.float32, device=x2d.device)
-        ret = torch.zeros(cblks, dtype=torch.int32, device=x2d.device)
+        ws_reset(ws)  # this block is retried at a lower occupancy
+        pbuf = ws_empty(ws, cblks * mparts * TPP * V * 2, torch.float32, x2d.device)
+        ret = ws_zeros(ws, cblks, torch.int32, x2d.device)
         args = (
             dyn(x2d),
             dyn(y2d),

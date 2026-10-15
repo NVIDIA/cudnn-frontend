@@ -43,7 +43,7 @@ import cutlass.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
-from cudnn.norm.utils import cur_stream, dyn, fake_stream, run_coop, sm_count
+from cudnn.norm.utils import COOP_OCC_MAX, ws_bytes, ws_empty, ws_reset, ws_zeros, cur_stream, dyn, fake_stream, run_coop, sm_count
 
 _CTA_SS = nvvm.SharedSpace.shared_cta
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
@@ -352,7 +352,26 @@ def _gn_fwd_nhwc_host(
 _KCACHE = {}
 
 
-def forward(spec, x3, gamma, beta, *, eps, cfg, params, knobs=None, out_y=None, out_mean=None, out_rstd=None):
+def scratch_bytes(spec, params, shape, has_beta=False, knobs=None):
+    """Upper bound on the workspace this launch may carve.
+
+    Evaluated at the highest occupancy the cooperative probe can pick, because
+    the partial count only grows with it. Over-reporting costs address space;
+    under-reporting would push the carve back onto torch and reintroduce the
+    allocation the workspace exists to remove.
+    """
+    N, HW, C = (int(v) for v in shape)
+    geo = _geom(C, int(spec.channels_per_group), DTYPE_BYTES[params.io_dtype], _BT)
+    if geo is None:
+        return 0
+    _V, CPC, _TPP, PPL, GPT, _LPG, _GPL = geo
+    KC = 4 if knobs is None else int(knobs)
+    TILES = C // CPC
+    mparts = max(1, min(sm_count() * COOP_OCC_MAX // max(1, TILES * N), HW // (PPL * KC)))
+    return ws_bytes((N * TILES * mparts * 2 * GPT, 4), (N * TILES, 4))
+
+
+def forward(spec, x3, gamma, beta, *, eps, cfg, params, knobs=None, out_y=None, out_mean=None, out_rstd=None, ws=None):
     """Launch the native NHWC GroupNorm forward. ``x3`` is ``[N, H*W, C]``."""
     import torch
 
@@ -385,8 +404,9 @@ def forward(spec, x3, gamma, beta, *, eps, cfg, params, knobs=None, out_y=None, 
         y = torch.empty_like(x3) if out_y is None else out_y
         mean = torch.empty(N * G, dtype=torch.float32, device=x3.device) if out_mean is None else out_mean
         rstd = torch.empty(N * G, dtype=torch.float32, device=x3.device) if out_rstd is None else out_rstd
-        pbuf = torch.empty(N * TILES * mparts * 2 * GPT, dtype=torch.float32, device=x3.device)
-        ret = torch.zeros(N * TILES, dtype=torch.int32, device=x3.device)
+        ws_reset(ws)  # this block is retried at a lower occupancy
+        pbuf = ws_empty(ws, N * TILES * mparts * 2 * GPT, torch.float32, x3.device)
+        ret = ws_zeros(ws, N * TILES, torch.int32, x3.device)
         args = (
             dyn(x3.reshape(-1)),
             dyn(y.reshape(-1)),

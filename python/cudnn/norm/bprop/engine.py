@@ -27,18 +27,22 @@ class _FrostNormPlan(CompiledPlan):
     def __init__(self, name: str, run):
         self._name = name
         self._run = run
+        # The lowering sizes its scratch at build time; 0 means the kernels this
+        # graph routes to carve nothing, which is most of them.
+        self._ws_bytes = int(getattr(run, "workspace_bytes", 0) or 0)
 
     def get_workspace_size(self) -> int:
-        return 0
+        return self._ws_bytes
 
     def execute(self, graph, variant_pack, ctx: ExecutionContext) -> None:
-        from cudnn.norm.utils import on_stream
+        from cudnn.norm.utils import Workspace, on_stream
 
         # Both the kernel launches and the output copies follow torch's current
         # stream, so the handle's stream has to be made current for the whole
         # call -- see on_stream().
+        ws = Workspace(getattr(ctx, "workspace", None)) if self._ws_bytes else None
         with on_stream(getattr(ctx, "stream", None)):
-            self._run(variant_pack)
+            self._run(variant_pack, ws)
 
 
 class FrostNormBwdEngine(BaseEngine):

@@ -118,7 +118,7 @@ def lower_norm_fprop(spec: EngineSpec, facts: "ga.NormGraphFacts", requested: Op
     :func:`cudnn.norm.fprop.api.norm_fprop`, which dispatches to the per-flavor
     sm_100 kernel (JIT-compiled + cached on first call) by ``facts.variant``.
     Outputs are copied into the graph's Y / mean / inv_variance buffers."""
-    from cudnn.norm.fprop.api import norm_fprop
+    from cudnn.norm.fprop.api import fprop_workspace_bytes, norm_fprop
 
     binding = ga.NormBinding(
         {
@@ -137,7 +137,7 @@ def lower_norm_fprop(spec: EngineSpec, facts: "ga.NormGraphFacts", requested: Op
         }
     )
 
-    def _execute(variant_pack):
+    def _execute(variant_pack, ws=None):
         resolved = ga.resolve_variant_pack(variant_pack, binding)
         x = resolved[id(facts.x_t)]
         gamma = resolved.get(id(facts.scale_t)) if facts.scale_t is not None else None
@@ -167,13 +167,46 @@ def lower_norm_fprop(spec: EngineSpec, facts: "ga.NormGraphFacts", requested: Op
             running_mean=rm,
             running_var=rv,
             out=(y_buf, mean_buf, rstd_buf),
+            ws=ws,
         )
         _copy_into(y_buf, y)
         _copy_into(mean_buf, mean)
         _copy_into(rstd_buf, rstd)
         return None
 
+    # Sized once, at build: get_workspace_size() is asked before any execute.
+    _execute.workspace_bytes = fprop_workspace_bytes(
+        facts.variant,
+        facts.x_shape,
+        _io_of(facts),
+        normalized_shape=facts.normalized_shape,
+        num_groups=facts.num_groups,
+        nhwc=_is_channels_last(facts),
+    )
     return _execute
+
+
+def _io_of(facts):
+    """The kernels' dtype tag for this graph's X."""
+    from cudnn.norm.dtypes import torch_dtype_to_str
+
+    return torch_dtype_to_str(facts.dtype)
+
+
+def _is_channels_last(facts):
+    """True when X is declared channels-last, which is what picks the NHWC kernels.
+
+    Read off the graph's declared strides rather than a tensor, because sizing
+    happens at build time when no buffer is bound yet.
+    """
+    shape = tuple(int(v) for v in facts.x_shape)
+    if len(shape) != 4 or facts.x_t is None:
+        return False
+    try:
+        n, c, h, w = (int(v) for v in facts.x_t.get_stride())
+    except Exception:  # noqa: BLE001 - a graph that will not describe itself is not NHWC
+        return False
+    return c == 1 and w == shape[1] and h == shape[1] * shape[3]
 
 
 def _running_pair(resolved, next_t, prev_t):

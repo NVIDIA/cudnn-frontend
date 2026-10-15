@@ -26,7 +26,7 @@ import cutlass.cute as cute
 import cutlass.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
-from cudnn.norm.utils import cur_stream, dyn, fake_stream, smem_capacity
+from cudnn.norm.utils import ws_bytes, ws_empty, ws_zeros, cur_stream, dyn, fake_stream, smem_capacity
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 from cudnn.norm._common_sm100 import (
     STAGE_BULK,
@@ -800,7 +800,7 @@ def _pipe_bwd_cap(R, wn, C, cache_xd, eb):
     return min(R, NSM * mult)
 
 
-def _backward_pipe(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, wcfg, out_dx=None, out_dgamma=None, out_dbeta=None):
+def _backward_pipe(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, wcfg, out_dx=None, out_dgamma=None, out_dbeta=None, ws=None):
     import torch
 
     tpr, wn, ldgs, V = wcfg
@@ -818,14 +818,18 @@ def _backward_pipe(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, wcfg
     # dgamma+dbeta in ONE fill (a contiguous [2,gamma_len] buffer, sliced to views) so
     # LN pays a single zeroing-kernel launch instead of two -- the launch overhead is a
     # measurable fraction of the small-N LN backward (gpt3). RMS aliases dbeta->dgamma.
-    if has_beta:
-        _gb = torch.zeros(2, spec.gamma_len, dtype=torch.float32, device=x2d.device)
+    if has_beta and out_dgamma is not None and out_dbeta is not None:
+        # Caller owns both: two small zero_ launches, but it saves the two copies
+        # the engine would otherwise make -- and the allocation.
+        dgamma, dbeta = out_dgamma.zero_(), out_dbeta.zero_()
+    elif has_beta:
+        _gb = ws_zeros(ws, 2 * spec.gamma_len, torch.float32, x2d.device).reshape(2, spec.gamma_len)
         dgamma, dbeta = _gb[0], _gb[1]
     else:
         dgamma = torch.zeros(spec.gamma_len, dtype=torch.float32, device=x2d.device) if out_dgamma is None else out_dgamma.zero_()
         dbeta = dgamma
-    dgp = torch.empty(ctas * C, dtype=torch.float32, device=x2d.device)
-    dbp = torch.empty(ctas * C, dtype=torch.float32, device=x2d.device) if has_beta else dgp
+    dgp = ws_empty(ws, ctas * C, torch.float32, x2d.device)
+    dbp = ws_empty(ws, ctas * C, torch.float32, x2d.device) if has_beta else dgp
 
     et = DTYPE_TO_CUTLASS[params.io_dtype]
     it_ty = _INT_TY[eb]
@@ -853,7 +857,7 @@ def _backward_pipe(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, wcfg
 _KTILED = {}
 
 
-def _backward_tiled(spec, dy2d, x2d, gamma, rstd, *, params, wcfg, out_dx=None, out_dgamma=None, out_dbeta=None):
+def _backward_tiled(spec, dy2d, x2d, gamma, rstd, *, params, wcfg, out_dx=None, out_dgamma=None, out_dbeta=None, ws=None):
     """Tiny-C (wn==1) RMS backward: multi-row tiled bulk-loads. Returns dgamma only
     (RMS has no dbeta)."""
     import torch
@@ -872,7 +876,7 @@ def _backward_tiled(spec, dy2d, x2d, gamma, rstd, *, params, wcfg, out_dx=None, 
 
     dx = torch.empty_like(x2d) if out_dx is None else out_dx
     dgamma = torch.zeros(spec.gamma_len, dtype=torch.float32, device=x2d.device) if out_dgamma is None else out_dgamma.zero_()
-    dgp = torch.empty(ctas * C, dtype=torch.float32, device=x2d.device)
+    dgp = ws_empty(ws, ctas * C, torch.float32, x2d.device)
 
     et = DTYPE_TO_CUTLASS[params.io_dtype]
     it_ty = _INT_TY[DTYPE_BYTES[params.io_dtype]]
@@ -907,7 +911,38 @@ def _sm_count():
 _KCACHE = {}
 
 
-def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params, out_dx=None, out_dgamma=None, out_dbeta=None):
+def scratch_bytes(spec, params, shape=None, has_beta=False, knobs=None):
+    """Upper bound on the workspace this backward may carve.
+
+    Mirrors ``backward``'s own dispatch rather than taking a blanket max over
+    the three routes: the plain route carves no partials at all, and the tiled
+    route's grid cap (sm*12) is far above the pipelined one's, so a blanket max
+    reported 58 MB where the chosen route used 9.7. The conditions live a dozen
+    lines below in this same file, so they cannot drift the way a cross-module
+    guess would.
+    """
+    eb = DTYPE_BYTES[params.io_dtype]
+    C, R = spec.M, spec.R
+    wcfg = _bwd_pipe_cfg(C, eb)
+    if wcfg is None:
+        return ws_bytes((R, 4))  # plain route: only the RMS mean placeholder
+    _tpr, wn, ldgs, V = wcfg
+    if wn == 1 and not spec.has_mean and (R % 2 == 0) and not has_beta:
+        RPT = 1
+        for r in (8, 4, 2):
+            if R % r == 0 and 2 * 2 * r * C * eb <= smem_capacity():
+                RPT = r
+                break
+        ctas = min(R // RPT, _sm_count() * 12)
+        return ws_bytes((ctas * C, 4), (2 * spec.gamma_len, 4))
+    if _pipe_bwd_eligible(C, wn, ldgs, V, R, has_beta, eb):
+        ctas = _pipe_bwd_cap(R, wn, C, _bwd_cache_xd(ldgs, V, R, C, has_beta, wn, eb), eb)
+        parts = [(ctas * C, 4)] * (2 if has_beta else 1)
+        return ws_bytes(*parts, (2 * spec.gamma_len, 4))
+    return ws_bytes((R, 4))  # plain route
+
+
+def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params, out_dx=None, out_dgamma=None, out_dbeta=None, ws=None):
     """Launch LayerNorm/RMSNorm backward. Returns ``(dx, dgamma, dbeta)``."""
     import torch
 
@@ -917,14 +952,14 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params, out_d
         # Only without beta -- this path returns dgamma alone, and selecting it for a
         # bias-carrying RMSNorm silently dropped dbeta to None (the caller then saw an
         # unwritten gradient, not an error). RMSNorm with bias is legal in cuDNN.
-        return _backward_tiled(spec, dy2d, x2d, gamma, rstd, params=params, wcfg=wcfg, out_dx=out_dx, out_dgamma=out_dgamma, out_dbeta=out_dbeta)
+        return _backward_tiled(spec, dy2d, x2d, gamma, rstd, params=params, wcfg=wcfg, out_dx=out_dx, out_dgamma=out_dgamma, out_dbeta=out_dbeta, ws=ws)
     if wcfg is not None and _pipe_bwd_eligible(spec.M, wcfg[1], wcfg[2], wcfg[3], spec.R, has_beta, DTYPE_BYTES[params.io_dtype]):
         return _backward_pipe(
-            spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, params=params, wcfg=wcfg, out_dx=out_dx, out_dgamma=out_dgamma, out_dbeta=out_dbeta
+            spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, params=params, wcfg=wcfg, out_dx=out_dx, out_dgamma=out_dgamma, out_dbeta=out_dbeta, ws=ws
         )
 
     if mean is None:  # RMSNorm has no centering; kernel ignores it when has_mean=False
-        mean = torch.empty(spec.R, dtype=torch.float32, device=x2d.device)
+        mean = ws_empty(ws, spec.R, torch.float32, x2d.device)
 
     dx = torch.empty_like(x2d) if out_dx is None else out_dx
     dgamma = torch.zeros(spec.gamma_len, dtype=torch.float32, device=x2d.device) if out_dgamma is None else out_dgamma.zero_()

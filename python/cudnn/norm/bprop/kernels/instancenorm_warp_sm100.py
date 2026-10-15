@@ -34,7 +34,7 @@ import cutlass.cute as cute
 import cutlass.primitives as nvvm
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
-from cudnn.norm.utils import cur_stream, dyn, fake_stream
+from cudnn.norm.utils import ws_bytes, ws_empty, ws_zeros, cur_stream, dyn, fake_stream
 
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
 _FULL = 0xFFFFFFFF
@@ -303,7 +303,23 @@ def eligible(spec, elem_bytes):
     return (M // V + 31) // 32 <= _MAX_KREG
 
 
-def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params, out_dx=None, out_dgamma=None, out_dbeta=None):
+def scratch_bytes(spec, params, shape=None, has_beta=False, knobs=None):
+    """Upper bound on the workspace this launch may carve.
+
+    Evaluated at the highest occupancy the cooperative probe can pick, because
+    the partial count only grows with it. Over-reporting costs address space;
+    under-reporting would push the carve back onto torch and reintroduce the
+    allocation the workspace exists to remove.
+    """
+    GPS, R, WPB = int(spec.groups_per_sample), int(spec.R), _WPB
+    W = max(GPS, (max(1, min(4 * _nsm() * WPB, R)) // GPS) * GPS)
+    W = ((W + WPB - 1) // WPB) * WPB
+    if W % GPS:
+        W = ((((W + GPS - 1) // GPS) * GPS + WPB - 1) // WPB) * WPB
+    return ws_bytes((W, 4), (W, 4))
+
+
+def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params, out_dx=None, out_dgamma=None, out_dbeta=None, ws=None):
     """Launch the warp-per-row InstanceNorm backward."""
     import torch
 
@@ -331,8 +347,8 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params, out_d
     dx = torch.empty_like(x2d) if out_dx is None else out_dx
     dgamma = torch.empty(spec.gamma_len, dtype=torch.float32, device=x2d.device) if out_dgamma is None else out_dgamma
     dbeta = torch.empty(spec.gamma_len, dtype=torch.float32, device=x2d.device) if out_dbeta is None else out_dbeta
-    dgp = torch.zeros(W, dtype=torch.float32, device=x2d.device)
-    dbp = torch.zeros(W, dtype=torch.float32, device=x2d.device)
+    dgp = ws_zeros(ws, W, torch.float32, x2d.device)
+    dbp = ws_zeros(ws, W, torch.float32, x2d.device)
     if mean is None:
         mean = rstd
     dyf, xf, dxf = dy2d.reshape(-1), x2d.reshape(-1), dx.reshape(-1)

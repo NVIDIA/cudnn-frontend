@@ -195,3 +195,95 @@ def cur_stream():
 
 
 _CU_STREAMS: dict = {}
+
+
+_WS_ALIGN = 256  # keeps every carve-out 16B-vectorisable and dtype-reinterpretable
+
+
+class Workspace:
+    """Bump allocator over a flat uint8 buffer the caller already owns.
+
+    The graph engines must not allocate inside execute (AGENTS.md Rule 1) and
+    must not own device memory (Rule 8), but the cooperative kernels genuinely
+    need scratch -- cross-CTA partials, retired-CTA counters, per-CTA dgamma
+    partials. Those come from here instead, carved from the workspace the graph
+    asked for via ``get_workspace_size()``.
+
+    A ``Workspace`` wrapping ``None`` (or one that runs out of room) hands back
+    ``None`` from :meth:`take`, and the ``ws_*`` helpers then fall back to a
+    fresh tensor. That keeps the direct torch API -- which has no workspace and
+    no Rule 1 to honour -- working unchanged, and makes an under-sized
+    workspace a performance problem rather than a crash.
+    """
+
+    __slots__ = ("_buf", "_off", "peak")
+
+    def __init__(self, buf=None):
+        self._buf = buf if buf is not None and buf.numel() else None
+        self._off = 0
+        self.peak = 0  # high-water mark, so a test can check the reported size covers it
+
+    def reset(self):
+        """Rewind to the start; call once per execute, not per kernel."""
+        self._off = 0
+        return self
+
+    def take(self, nelem, dtype):
+        """``nelem`` elements of ``dtype``, or None when the buffer cannot serve it."""
+        import torch
+
+        if self._buf is None:
+            return None
+        esz = torch.empty(0, dtype=dtype).element_size()
+        off = (self._off + _WS_ALIGN - 1) & ~(_WS_ALIGN - 1)
+        end = off + nelem * esz
+        if end > self._buf.numel():
+            return None
+        self._off = end
+        if end > self.peak:
+            self.peak = end
+        return self._buf[off:end].view(dtype)
+
+
+def ws_empty(ws, nelem, dtype, device):
+    """Uninitialised scratch from ``ws``, or a fresh tensor when it cannot serve."""
+    import torch
+
+    t = ws.take(nelem, dtype) if ws is not None else None
+    return torch.empty(nelem, dtype=dtype, device=device) if t is None else t
+
+
+def ws_zeros(ws, nelem, dtype, device):
+    """Zeroed scratch from ``ws``, or a fresh tensor when it cannot serve.
+
+    Workspace memory is recycled across executes, so the zeroing is not
+    optional here the way it is for a freshly allocated tensor.
+    """
+    import torch
+
+    t = ws.take(nelem, dtype) if ws is not None else None
+    if t is None:
+        return torch.zeros(nelem, dtype=dtype, device=device)
+    return t.zero_()
+
+
+def ws_bytes(*parts):
+    """Total workspace for ``(nelem, element_size)`` parts, with the alignment padding."""
+    total = 0
+    for nelem, esz in parts:
+        total = ((total + _WS_ALIGN - 1) & ~(_WS_ALIGN - 1)) + nelem * esz
+    return total
+
+
+def ws_reset(ws):
+    """Rewind a workspace before a launch attempt that may be retried.
+
+    ``run_coop`` re-runs its closure at a lower occupancy when a cooperative
+    grid is rejected, and the occupancy-stepping BatchNorm loops do the same.
+    Without this the bump allocator would keep advancing across attempts and
+    the retry would fall off the end of the buffer -- correct, because the
+    helpers fall back to torch, but it would allocate exactly where the
+    workspace exists to stop that.
+    """
+    if ws is not None:
+        ws.reset()
