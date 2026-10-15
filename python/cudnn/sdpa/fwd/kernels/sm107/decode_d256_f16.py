@@ -710,7 +710,7 @@ def _softmax_warp_group(
 
     red_ptr = Pointer(red_smem.data_ptr(), dtype=cutlass.Float32)
     mred_ptr = Pointer(mred_smem.data_ptr(), dtype=cutlass.Int32)
-    # The column this lane publishes into the group's max slot (lanes 16..31 repeat 0..15: a duplicate max is idempotent),
+    # The column each thread publishes into its group's max slot (lanes 16..31 repeat 0..15: a duplicate max is idempotent),
     # the group's slot index, and the group's first warp (it re-arms the slot two tiles ahead).
     key_col = (tidx % cutlass.Int32(32)) % cutlass.Int32(COLS)
     grp = col0 // cutlass.Int32(COLS)
@@ -855,7 +855,7 @@ def _softmax_warp_group(
     # The epilogue runs in two 8-column halves: each half derives its columns' inverse sum / dead / live facts, then
     # reads that half of O^T back (the x8 tcgen05.ld shape) and stores it.  The 16-wide per-column lists and the x16
     # O^T readback together were what the 18-warp N_Q = 64 tile spilled at ptxas's 96-register cap; the halves keep
-    # the same arithmetic and the same stores (bitwise).  This lane stores ONE LSE (its own column, lane == j), kept
+    # the same arithmetic and the same stores (bitwise).  Each thread stores ONE LSE (the column its key lane names, lane == j), kept
     # as a per-lane scalar with a liveness bit; the column's token / head are two integer ops on a warp-uniform row
     # index, recomputed at each store site rather than carried in lists.
     O_HALF = COLS // 2

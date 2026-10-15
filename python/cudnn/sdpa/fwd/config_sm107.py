@@ -2354,8 +2354,8 @@ _D256_DECODE_BARRIER_WORDS = 1 + 2 * 3 + 2 * 4 + 1  # q_full, kv_full/empty x ST
 # The widths the Rubin factory COMPILES (the N extent of one token unit): the SM100 pair and the 64-column tile -- four
 # 16-column softmax groups (16 softmax warps + the MMA warp + the TMA warp = 18 warps / 576 threads), ONE unit of up to 64
 # packed rows, so an MTP step of four tokens x 12 / 16 heads (48 / 64 rows) streams the KV range ONCE where the 32-column
-# tile cuts it into two token units (each a second read of the whole KV).  Its budgets (BARRIER_TABLE of the lane that
-# added it): SMEM 259 KiB (the oversized carveout), TMEM 256 columns, the barrier inits scale through SOFTMAX_LANES
+# tile cuts it into two token units (each a second read of the whole KV).  Its budgets (the barrier / SMEM / TMEM / register
+# tables written with the change): SMEM 259 KiB (the oversized carveout), TMEM 256 columns, the barrier inits scale through SOFTMAX_LANES
 # (512), and ptxas caps the 18-warp CTA at 96 registers per thread (16384 per SM sub-partition / (5 warps x 32),
 # 8-granular -- the per-thread work is width-independent and the sm_107a rendering carries no spill).  Whether the ROUTE
 # sends a step to it is decode_d256_q_tile's decision above (the route rule names the widths it routes); a width in this
