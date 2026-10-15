@@ -327,6 +327,9 @@ def _combine_kernel(
     # value before the single cast -- see the module docstring.  None
     # (None-specialized) is the plain reduction; its traced code is unchanged.
     gate: Optional[cute.Tensor] = None,
+    # The wide lean group (G_S up-front splits) is its own specialization: its register footprint (the kernel reaches the 128-register cap and spills)
+    # would slow the serial walk this kernel also runs, so only the few-split decode launch asks for it.
+    lean_wide: cutlass.Constexpr[bool] = False,
 ) -> None:
     tidx, _, _ = cute.arch.thread_idx()
     lane = tidx % cutlass.Int32(32)
@@ -383,7 +386,11 @@ def _combine_kernel(
         # address is a single 64-bit add (the split axis is the leading, batch-stacked mode).
         lean = zero > zero
         if cutlass.const_expr(o_partial.element_type == cutlass.Float32):
-            lean = ((d_v & cutlass.Int32(3)) == cutlass.Int32(0)) & ((o_base & cutlass.Int64(15)) == cutlass.Int64(0)) & (n_splits <= cutlass.Int32(G_S))
+            lean = (
+                ((d_v & cutlass.Int32(3)) == cutlass.Int32(0))
+                & ((o_base & cutlass.Int64(15)) == cutlass.Int64(0))
+                & (n_splits <= cutlass.Int32(G_S if lean_wide else G_LEAN_SMALL))
+            )
         if lean:
             lse_base = lse_partial.iterator.toint() + cutlass.Int64(cute.crd2idx((batch, head, q_row), lse_partial.layout)) * 4
             lse_step = cutlass.Int64(lse_partial.stride[0]) * cutlass.Int64(n_batch) * 4
@@ -415,14 +422,20 @@ def _combine_kernel(
                     acc1 = zero
                     acc2 = zero
                     acc3 = zero
-                    # Two group widths, one per row of splits: the narrow group's loads are the whole axis for the common few splits, the wide one covers up to G_S.
-                    if n_splits <= cutlass.Int32(G_LEAN_SMALL):
-                        all_dead, den, acc0, acc1, acc2, acc3, m_safe = _lean_accumulate(
-                            G_LEAN_SMALL, lse_base, lse_step, o_row_base, o_step, s_last, n_splits, sinks, head
-                        )
+                    # Two group widths on the wide specialization, one per row of splits: the narrow group's loads are the whole axis for the common few
+                    # splits, the wide one covers up to G_S.  The plain specialization has the narrow group only.
+                    if cutlass.const_expr(lean_wide):
+                        if n_splits <= cutlass.Int32(G_LEAN_SMALL):
+                            all_dead, den, acc0, acc1, acc2, acc3, m_safe = _lean_accumulate(
+                                G_LEAN_SMALL, lse_base, lse_step, o_row_base, o_step, s_last, n_splits, sinks, head
+                            )
+                        else:
+                            all_dead, den, acc0, acc1, acc2, acc3, m_safe = _lean_accumulate(
+                                G_S, lse_base, lse_step, o_row_base, o_step, s_last, n_splits, sinks, head
+                            )
                     else:
                         all_dead, den, acc0, acc1, acc2, acc3, m_safe = _lean_accumulate(
-                            G_S, lse_base, lse_step, o_row_base, o_step, s_last, n_splits, sinks, head
+                            G_LEAN_SMALL, lse_base, lse_step, o_row_base, o_step, s_last, n_splits, sinks, head
                         )
                     inv_den = cutlass.Float32(1.0) / cute.math.max(den, cutlass.Float32(1e-30))
                     inv_den = cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), inv_den.ir_value()))
@@ -1242,13 +1255,20 @@ def _launch_combine(
     # the one-warp-per-row form: every load goes out at once, one memory round
     # trip, where the decode form pays three dependent ones (B300, d64 / d128
     # S_q = 1, 2-8 splits: 3.4-4.4 us -> 2.1-2.9 us).
-    if (cutlass.Int32(SQ) <= cutlass.Int32(ROWS_PER_BLOCK // 2)) & (n_splits > cutlass.Int32(G_S)):
-        _combine_decode_kernel(*args).launch(
-            grid=(1, H, B),
-            block=[THREADS, 1, 1],
-            smem=SMEM_BYTES,
-            stream=stream,
-        )
+    if cutlass.Int32(SQ) <= cutlass.Int32(ROWS_PER_BLOCK // 2):
+        if n_splits > cutlass.Int32(G_S):
+            _combine_decode_kernel(*args).launch(
+                grid=(1, H, B),
+                block=[THREADS, 1, 1],
+                smem=SMEM_BYTES,
+                stream=stream,
+            )
+        else:
+            _combine_kernel(*args, lean_wide=True).launch(
+                grid=((SQ + ROWS_PER_BLOCK - 1) // ROWS_PER_BLOCK, H, B),
+                block=[THREADS, 1, 1],
+                stream=stream,
+            )
     else:
         _combine_kernel(*args).launch(
             grid=((SQ + ROWS_PER_BLOCK - 1) // ROWS_PER_BLOCK, H, B),
