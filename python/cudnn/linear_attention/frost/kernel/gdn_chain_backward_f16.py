@@ -35,7 +35,7 @@ from cutlass.cute.runtime import from_dlpack
 
 from cudnn.frost.buffers import DeviceView
 
-from ..common.host import get_dtype
+from ..common.host import get_dtype, family_slots
 from ..common.piece_chain import dtype_name, launch_state_chain
 from . import gdn_bprop_summary_f16, gdn_chain_prologue_f16, gdn_recompute_f16, gdn_summary_f16, gdn_tinv_f16
 
@@ -114,6 +114,8 @@ def chain_backward_head_host(
     state_x_series: Optional[cute.Tensor],
     seed_checkpoints: Optional[cute.Tensor],
     stream: cuda.CUstream,
+    k_slots: cutlass.Constexpr[int] = 1,
+    v_slots: cutlass.Constexpr[int] = 1,
 ) -> None:
     gdn_chain_prologue_f16.chain_prologue(
         pieces,
@@ -160,6 +162,8 @@ def chain_backward_head_host(
         summary_do,
         tinv,
         stream,
+        k_slots,
+        v_slots,
     )
     gdn_tinv_f16.host(tinv_cfg, False, k, tinv_words, gate, a_log, dt_bias, beta, cu_pieces, tinv, tinv_rows, tinv_row_count, stream)
     if cutlass.const_expr(fused_h_m):
@@ -476,9 +480,8 @@ def build_chain_backward(
     """Compile (cached per static config) the head and tail launches of the chain backward over the buffers of one plan;
     ``pieces``, ``heads_out`` and ``num_seqs`` are launch arguments.  The placeholders repeat the marks of the standalone
     modules' builds so every kernel compiles as it does there."""
-    _HQ, DK = q.shape[1], q.shape[2]
-    k.shape[1]
-    _HV, DV = v.shape[1], v.shape[2]
+    DK = q.shape[2]
+    DV = v.shape[-1]
     HO = gate.shape[1]
     if not safe_gate:
         a_log = None
@@ -489,8 +492,12 @@ def build_chain_backward(
     seed_name = dtype_name(seed.dtype) if has_seed else "float32"
     dseed_name = dtype_name(dseed.dtype) if has_dseed else "float32"
     cu_align = 8 if str(cu_seqlens.dtype).endswith("int64") else 4
+    k_slots = family_slots(k, expand_num, 3)
+    v_slots = family_slots(v, expand_num, 3)
+    beta_slots = family_slots(beta, expand_num, 2)
     key = (
         str(q.dtype),
+        str(seed_checkpoints.dtype) if coarse else "none",
         str(cu_seqlens.dtype),
         str(gate.dtype),
         str(beta.dtype),
@@ -524,6 +531,12 @@ def build_chain_backward(
         has_dseed,
         int(chain_rows),
         bprop_module.__name__,
+        len(k.shape),
+        len(v.shape),
+        len(beta.shape),
+        k_slots,
+        v_slots,
+        beta_slots,
     )
     if key not in chain_backward_cache:
         tinv_cfg = gdn_tinv_f16.build_cfg(
@@ -535,6 +548,8 @@ def build_chain_backward(
             allow_neg_eigval=allow_neg_eigval,
             d_k=DK,
             expand_num=expand_num,
+            k_slots=k_slots,
+            beta_slots=beta_slots,
         )
         summary_cfg = None
         transition_cfg = None
@@ -549,6 +564,8 @@ def build_chain_backward(
                 d_k=DK,
                 d_v=DV,
                 expand_num=expand_num,
+                k_slots=k_slots,
+                v_slots=v_slots,
             )
         else:
             transition_cfg = gdn_recompute_f16.build_cfg(
@@ -566,6 +583,8 @@ def build_chain_backward(
                 d_k=DK,
                 d_v=DK,
                 expand_num=expand_num,
+                k_slots=k_slots,
+                v_slots=v_slots,
             )
         series_cfg = None
         if series:
@@ -582,6 +601,8 @@ def build_chain_backward(
                 d_k=DK,
                 d_v=DV,
                 expand_num=expand_num,
+                k_slots=k_slots,
+                v_slots=v_slots,
             )
         bwd_summary_cfg = gdn_bprop_summary_f16.build_cfg(
             io_dtype,
@@ -592,6 +613,7 @@ def build_chain_backward(
             d_k=DK,
             d_v=DV,
             expand_num=expand_num,
+            k_slots=k_slots,
         )
         bprop_cfg = bprop_module.build_cfg(
             io_dtype,
@@ -608,6 +630,9 @@ def build_chain_backward(
             d_v=DV,
             expand_num=expand_num,
             **({} if compact_qdo else dict(tinv_source="gmem")),
+            k_slots=k_slots,
+            v_slots=v_slots,
+            beta_slots=beta_slots,
         )
 
         work_items_placeholder = from_dlpack(work_items, assumed_align=16)
@@ -653,11 +678,11 @@ def build_chain_backward(
             cutlass.Int32(int(b_t)),
             cutlass.Int32(int(seed_every_n_tokens)),
             from_dlpack(q, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=2),
+            from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=len(k.shape) - 1),
+            from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=len(v.shape) - 1),
             from_dlpack(do, assumed_align=16).mark_layout_dynamic(leading_dim=2),
             from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=1),
-            from_dlpack(beta, assumed_align=16).mark_layout_dynamic(leading_dim=1),
+            from_dlpack(beta, assumed_align=16).mark_layout_dynamic(leading_dim=len(beta.shape) - 1),
             from_dlpack(a_log, assumed_align=4).mark_layout_dynamic() if a_log is not None else None,
             from_dlpack(dt_bias, assumed_align=4).mark_layout_dynamic(leading_dim=len(dt_bias.shape) - 1) if dt_bias is not None else None,
             from_dlpack(cu_seqlens, assumed_align=cu_align).mark_layout_dynamic(),
@@ -700,6 +725,8 @@ def build_chain_backward(
             state_x_placeholder,
             from_dlpack(seed_checkpoints, assumed_align=16).mark_layout_dynamic(leading_dim=3) if coarse else None,
             cuda.CUstream(int(stream)),
+            k_slots,
+            v_slots,
             options="--enable-tvm-ffi --opt-level 2",
         )
         tail = cute.compile(
@@ -717,7 +744,7 @@ def build_chain_backward(
             cutlass.Int32(int(num_seqs)),
             float(scale),
             from_dlpack(summary_q, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2),
+            from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=len(k.shape) - 1),
             from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=1),
             from_dlpack(a_log, assumed_align=4).mark_layout_dynamic() if a_log is not None else None,
             from_dlpack(dt_bias, assumed_align=4).mark_layout_dynamic(leading_dim=len(dt_bias.shape) - 1) if dt_bias is not None else None,
@@ -729,8 +756,8 @@ def build_chain_backward(
             from_dlpack(state_dx_end, assumed_align=16).mark_layout_dynamic(leading_dim=3),
             from_dlpack(DeviceView(256, (1, HO, DV, DK), dseed_name, int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3) if has_dseed else None,
             from_dlpack(q, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(beta, assumed_align=16).mark_layout_dynamic(leading_dim=1),
+            from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=len(v.shape) - 1),
+            from_dlpack(beta, assumed_align=16).mark_layout_dynamic(leading_dim=len(beta.shape) - 1),
             from_dlpack(do, assumed_align=16).mark_layout_dynamic(leading_dim=2),
             from_dlpack(dq, assumed_align=16).mark_layout_dynamic(leading_dim=2),
             from_dlpack(dk, assumed_align=16).mark_layout_dynamic(leading_dim=2),

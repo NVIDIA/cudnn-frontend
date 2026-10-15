@@ -54,7 +54,7 @@ NO_BETA_VARIANTS = ("mamba2",)  # the write strength is the gate itself (dt): no
 BETA_VARIANTS = ("gdn", "kda", "gdn2", "gdp")  # the beta modes, the safe gate and the gate domain are theirs
 SUMMARY_VARIANTS = BETA_VARIANTS  # the matrix-transition summaries (H, M, G); Mamba-2's scalar-transition summaries have their own tests
 DEFAULT_V = {"mamba2": 64}  # the Mamba-2 kernels pin d_v = 64 (every other family defaults to 128)
-STATE_DTYPES = (torch.float32, torch.bfloat16)
+STATE_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
 SPLIT_T = 4096
 HOUSEHOLDER = 3
 CHUNK = {"gdn": 64, "kda": 16, "gdn2": 16, "gdp": 64, "mamba2": 128}
@@ -1338,12 +1338,16 @@ def test_bwd_beta_grad_dtype(backend, variant, beta_dtype):
 @pytest.mark.parametrize("state_dtype", STATE_DTYPES, ids=DTYPE_IDS.get)
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_fwd_state_dtype(backend, variant, state_dtype):
-    """A bf16 initial_state; final_state comes back in initial_state's dtype and
-    matches the reference."""
+    """A bf16 or fp16 initial_state; final_state comes back in initial_state's
+    dtype and matches the reference."""
     assert_fwd_parity(backend, make_case(variant, torch.bfloat16, T=256), use_initial_state=True, state_dtype=state_dtype)
 
 
-@pytest.mark.parametrize("state_dtype,V", [(torch.float32, 128), (torch.float32, 64), (torch.bfloat16, 128)], ids=["fp32-128", "fp32-64", "bf16-128"])
+@pytest.mark.parametrize(
+    "state_dtype,V",
+    [(torch.float32, 128), (torch.float32, 64), (torch.bfloat16, 128), (torch.float16, 128)],
+    ids=["fp32-128", "fp32-64", "bf16-128", "fp16-128"],
+)
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_bwd_state_dtype(backend, variant, state_dtype, V):
     """A bf16 state pool drives a bf16 d_final_state into the kernel and a bf16
@@ -1576,7 +1580,7 @@ def test_checkpoints_match_prefix_final_states(backend, variant):
     _, _, state_checkpoints = run_fwd(backend, case, output_final_state=True, checkpoint_every_n_tokens=ckpt * case.n)
     valid = (T - 1) // ckpt + 1
     assert state_checkpoints.shape == (T // ckpt + 1, case.HO, case.V, case.K)
-    assert state_checkpoints.dtype == case.dtype
+    assert state_checkpoints.dtype == (torch.float32 if variant != "mamba2" and ckpt * case.n > CHUNK[variant] else case.dtype)
     # row 0 is the incoming state, zero here since no initial_state was passed
     assert not state_checkpoints[0].any(), "row 0 must be the (zero) incoming state"
     for j in sorted({1, valid - 1}):
@@ -1662,17 +1666,17 @@ def test_checkpoints_varlen_tight_capacity(backend, variant, recipe):
 
 
 @pytest.mark.parametrize("ckpt_mult", [2, 3])
-@pytest.mark.parametrize("K", [64, 128])
+@pytest.mark.parametrize("K,V", [(64, 128), (128, 128), (128, 64)])
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_checkpoints_coarse_cadence(backend, variant, K, ckpt_mult):
-    """Coarser cadences (multiples of the base chunk) keep the prefix contract."""
+def test_checkpoints_coarse_cadence(backend, variant, K, V, ckpt_mult):
+    """Coarser cadences (multiples of the base chunk) keep the prefix contract; the d_v 64 case covers the paired-element row path."""
     ckpt = CHUNK[variant] * ckpt_mult
     T = 5 * ckpt
-    case = make_case(variant, torch.bfloat16, T=T, K=K)
+    case = make_case(variant, torch.bfloat16, T=T, K=K, V=DEFAULT_V.get(variant, V))
     o, fs, state_checkpoints = run_fwd(backend, case, output_final_state=True, checkpoint_every_n_tokens=ckpt * case.n)
     valid = (T - 1) // ckpt + 1
     assert state_checkpoints.shape == (T // ckpt + 1, case.HO, case.V, case.K)
-    assert state_checkpoints.dtype == case.dtype
+    assert state_checkpoints.dtype == (case.dtype if variant == "mamba2" else torch.float32)
     assert not state_checkpoints[0].any(), "row 0 must be the (zero) incoming state"
     for j in sorted({1, valid - 1}):
         n = j * ckpt
@@ -2707,9 +2711,8 @@ def test_bwd_checkpoint_reuse(backend, variant, K):
 @pytest.mark.parametrize("K,ckpt_mult", [(128, 2), (128, 3), (64, 2)])
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_bwd_coarse_checkpoint_seeded_recompute(backend, variant, ckpt_mult, K):
-    """With a coarse checkpoint cadence the backward reconstructs the dense
-    series by checkpoint-seeded recompute; the grads track the zero-seed
-    recompute path within 2e-3, both arms batch-invariant."""
+    """With a coarse checkpoint cadence the backward reconstructs the dense series by recompute started from the coarse
+    rows; the grads match the recompute path from a zero initial state bitwise from fp32 rows, both arms batch-invariant."""
     case = make_case(variant, torch.bfloat16, seq_lens=[497, 16, 1, 480, 0, 253], K=K)
     grads_by_mode = []
     for ckpt in (0, CHUNK[variant] * ckpt_mult):
@@ -2722,8 +2725,40 @@ def test_bwd_coarse_checkpoint_seeded_recompute(backend, variant, ckpt_mult, K):
             dO = torch.randn_like(o)
             grads_by_mode.append(torch.autograd.grad([o], leaves, [dO]))
     for name, gr, gc in zip(("dq", "dk"), grads_by_mode[0], grads_by_mode[1]):
-        assert torch.isfinite(gc.float()).all(), f"coarse-checkpoint {name} is not finite"
-        assert_rms_close(f"coarse-checkpoint {name}", gc, gr, 2e-3)
+        if variant == "mamba2":
+            assert torch.isfinite(gc.float()).all(), f"coarse-checkpoint {name} is not finite"
+            assert_rms_close(f"coarse-checkpoint {name}", gc, gr, 2e-3)
+        else:
+            assert torch.equal(bits(gr), bits(gc)), f"coarse-checkpoint {name} differs from the dense-cadence path"
+
+
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("K", [64, 128])
+@pytest.mark.parametrize("variant", [v for v in VARIANTS if v != "mamba2"])
+def test_fp32_checkpoints_at_chunk_cadence(backend, variant, K):
+    """``checkpoint_dtype=torch.float32`` stores fp32 rows at the chunk cadence: they round to the io-dtype rows bitwise, and
+    the backward, which regenerates the dense series from them instead of reusing them, matches the io-row path bitwise."""
+    case = make_case(variant, torch.bfloat16, seq_lens=[497, 16, 1, 480, 0, 253], K=K)
+    rows, grads_by_mode = [], []
+    for dtype in (None, torch.float32):
+        args = thd_tensors(case)
+        leaves = [args[0].requires_grad_(True), args[1].requires_grad_(True)]
+        with waive_unsupported(backend, variant):
+            out = pinned_op(backend, variant)(*args, *op_tail(case), checkpoint_every_n_tokens=CHUNK[variant], checkpoint_dtype=dtype)
+            rows.append(out[2])
+            o = out[0]
+            set_seed(SEED + 5)
+            dO = torch.randn_like(o)
+            grads_by_mode.append(torch.autograd.grad([o], leaves, [dO]))
+    assert rows[0].dtype == case.dtype and rows[1].dtype == torch.float32
+    # shape[0] is a capacity bound; the valid rows pack first (one per CHUNK kernel rows from each sequence start, end excluded)
+    bounds = case.cu.tolist()
+    valid = sum((sl * case.n - 1) // CHUNK[variant] + 1 for sl in (b - a for a, b in zip(bounds, bounds[1:])) if sl > 0)
+    assert torch.equal(bits(rows[0][:valid]), bits(rows[1][:valid].to(case.dtype))), "fp32 rows do not round to the io-dtype rows"
+    for name, gr, gc in zip(("dq", "dk"), grads_by_mode[0], grads_by_mode[1]):
+        assert torch.equal(bits(gr), bits(gc)), f"fp32-row {name} differs from the io-row path"
+    with pytest.raises(ValueError):
+        pinned_op(backend, variant)(*thd_tensors(case), *op_tail(case), checkpoint_every_n_tokens=2 * CHUNK[variant] * case.n, checkpoint_dtype=case.dtype)
 
 
 @pytest.mark.parametrize("backend", ["cutile"], indirect=True)
@@ -3137,6 +3172,142 @@ def test_gdp_piece_chain_bwd_compact_summary(backend, l2norm, n):
     _, _, grads, dO, _ = chain_grads(backend, case, **kw)
     _, _, grads_uncut, _, _ = chain_grads(backend, case, batch_invariant=True, dO=dO, **kw)
     assert_chain_grads_close(grads, grads_uncut)
+
+
+def token_major_views(case, pad=24, return_buffers=False):
+    """The case's expanded k / v / beta as the per-token column slices of a joint projection buffer: ``[T, pad | n*HV*V |
+    n*HK*K | H*K | pad]`` viewed ``[T, n, HV, V]`` / ``[T, n, HK, K]`` with the joint token stride, beta from a ``[T, pad |
+    n*HO | pad]`` buffer viewed ``[T, n, HO]``.  Same bytes as the expanded leaves, a different row convention.
+    ``return_buffers`` adds the two joint buffers and the column slices of v, k and beta (to differentiate through the
+    buffers: a clone of a strided view is contiguous, so a leaf must be the buffer itself)."""
+    tokens, n = case.T * case.B, case.n
+    k, v, beta = to_thd(case.k), to_thd(case.v), to_thd(case.gates["beta"])
+    widths = (n * case.HV * case.V, n * case.HK * case.K, case.H * case.K)
+    joint = torch.randn(tokens, 2 * pad + sum(widths), device="cuda").to(case.dtype)
+    v_cols = slice(pad, pad + widths[0])
+    k_cols = slice(pad + widths[0], pad + widths[0] + widths[1])
+    v_tm = joint[:, v_cols].view(tokens, n, case.HV, case.V)
+    k_tm = joint[:, k_cols].view(tokens, n, case.HK, case.K)
+    v_tm.copy_(v.view(tokens, n, case.HV, case.V))
+    k_tm.copy_(k.view(tokens, n, case.HK, case.K))
+    beta_joint = torch.randn(tokens, 2 * pad + n * case.HO, device="cuda", dtype=beta.dtype)
+    beta_cols = slice(pad, pad + n * case.HO)
+    beta_tm = beta_joint[:, beta_cols].view(tokens, n, case.HO)
+    beta_tm.copy_(beta.view(tokens, n, case.HO))
+    assert not (k_tm.is_contiguous() or v_tm.is_contiguous() or beta_tm.is_contiguous())
+    if return_buffers:
+        return k_tm, v_tm, beta_tm, joint, beta_joint, k_cols, v_cols, beta_cols
+    return k_tm, v_tm, beta_tm
+
+
+@pytest.mark.parametrize("l2norm", [False, True], ids=["plain", "l2norm"])
+@pytest.mark.parametrize("V", [128, 64])
+@pytest.mark.parametrize("n", (2, 3, 4, 5))
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_gdp_token_major_bitwise(backend, n, V, l2norm):
+    """Token-major k / v / beta (the column slices of a joint projection buffer, the joint token stride) give o, the final
+    state and every gradient bitwise equal to the expanded rows, differentiated through the joint buffers themselves (the
+    gradients land in the slices, the padding columns stay zero), ragged batch with a zero-length sequence included.  At
+    n = 3 (Megatron's default) the dense token-major views of the expanded rows and the mixed form (strided k / v with
+    the expanded beta) are checked too."""
+    case = make_case("gdp", torch.bfloat16, seq_lens=[100, 333, 0, 64], V=V, n=n)
+    state0 = random_state(case)
+    tokens = case.T * case.B
+    q_e, g_e = to_thd(case.q), to_thd(case.gates["g"])
+    k_e, v_e, beta_e = to_thd(case.k), to_thd(case.v), to_thd(case.gates["beta"])
+    _, _, _, joint, beta_joint, k_cols, v_cols, beta_cols = token_major_views(case, return_buffers=True)
+    set_seed(SEED + 2)
+    dO = torch.randn(case.T, case.HO, case.V, device="cuda").to(case.dtype)
+    dFS = torch.randn(case.N, case.HO, case.V, case.K, device="cuda") * 0.1
+
+    def leaf(t):
+        return t.detach().clone().requires_grad_(True)
+
+    def run(k, v, beta, leaves):
+        q, g = leaf(q_e), leaf(g_e)
+        with waive_unsupported(backend, "gdp"):
+            o, fs = pinned_op(backend, "gdp")(q, k, v, g, beta, case.cu, n, initial_state=state0, output_final_state=True, use_qk_l2norm_in_kernel=l2norm)
+            grads = torch.autograd.grad([o, fs], [q, g] + leaves, [dO, dFS])
+        return o, fs, grads[0], grads[1], grads[2:]
+
+    k_l, v_l, beta_l = leaf(k_e), leaf(v_e), leaf(beta_e)
+    o_e, fs_e, dq_e, dg_e, (dk_e, dv_e, dbeta_e) = run(k_l, v_l, beta_l, [k_l, v_l, beta_l])
+
+    def check(label, o, fs, dq, dg, dk, dv, dbeta):
+        assert_bitwise(f"{label} o", o, o_e)
+        assert_bitwise(f"{label} final_state", fs, fs_e)
+        assert_bitwise(f"{label} dq", dq, dq_e)
+        assert_bitwise(f"{label} dg", dg, dg_e)
+        assert_bitwise(f"{label} dk", dk.reshape(dk_e.shape), dk_e)
+        assert_bitwise(f"{label} dv", dv.reshape(dv_e.shape), dv_e)
+        assert_bitwise(f"{label} dbeta", dbeta.reshape(dbeta_e.shape), dbeta_e)
+
+    def strided_grads(djoint, dbeta_joint):
+        dk = djoint[:, k_cols]
+        dv = djoint[:, v_cols]
+        outside = torch.cat([djoint[:, : v_cols.start], djoint[:, k_cols.stop :]], dim=1)
+        assert outside.count_nonzero() == 0, "the strided dk / dv scatter touched columns outside the k / v slices"
+        dbeta = dbeta_joint[:, beta_cols] if dbeta_joint is not None else None
+        if dbeta_joint is not None:
+            outside_beta = torch.cat([dbeta_joint[:, : beta_cols.start], dbeta_joint[:, beta_cols.stop :]], dim=1)
+            assert outside_beta.count_nonzero() == 0, "the strided dbeta scatter touched columns outside the beta slice"
+        return dk, dv, dbeta
+
+    # token-major, strided: differentiate through the joint buffers
+    joint_l, beta_joint_l = leaf(joint), leaf(beta_joint)
+    k_t = joint_l[:, k_cols].view(tokens, n, case.HK, case.K)
+    v_t = joint_l[:, v_cols].view(tokens, n, case.HV, case.V)
+    beta_t = beta_joint_l[:, beta_cols].view(tokens, n, case.HO)
+    o_t, fs_t, dq_t, dg_t, (djoint, dbeta_joint) = run(k_t, v_t, beta_t, [joint_l, beta_joint_l])
+    dk_t, dv_t, dbeta_t = strided_grads(djoint, dbeta_joint)
+    check("token-major", o_t, fs_t, dq_t, dg_t, dk_t, dv_t, dbeta_t)
+
+    if n == 3:
+        # dense token-major views of the expanded rows (the uniform load path through a rank-4 input)
+        k_l, v_l, beta_l = leaf(k_e), leaf(v_e), leaf(beta_e)
+        o_d, fs_d, dq_d, dg_d, (dk_d, dv_d, dbeta_d) = run(
+            k_l.view(tokens, n, case.HK, case.K), v_l.view(tokens, n, case.HV, case.V), beta_l.view(tokens, n, case.HO), [k_l, v_l, beta_l]
+        )
+        check("dense views", o_d, fs_d, dq_d, dg_d, dk_d, dv_d, dbeta_d)
+        # mixed: strided k / v with the expanded beta (Megatron keeps beta contiguous)
+        joint_l, beta_l = leaf(joint), leaf(beta_e)
+        k_t = joint_l[:, k_cols].view(tokens, n, case.HK, case.K)
+        v_t = joint_l[:, v_cols].view(tokens, n, case.HV, case.V)
+        o_m, fs_m, dq_m, dg_m, (djoint, dbeta_m) = run(k_t, v_t, beta_l, [joint_l, beta_l])
+        dk_m, dv_m, _ = strided_grads(djoint, None)
+        check("mixed", o_m, fs_m, dq_m, dg_m, dk_m, dv_m, dbeta_m)
+
+
+@pytest.mark.parametrize("n", (2, 3))
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_gdp_summary_token_major_bitwise(backend, n):
+    """The GDP summaries (H, M and the backward G) read token-major k / v / beta bitwise like the expanded rows."""
+    case = make_case("gdp", torch.bfloat16, seq_lens=[100, 333, 64], n=n)
+    k_tm, v_tm, beta_tm = token_major_views(case)
+    k, v, beta, g, q = to_thd(case.k), to_thd(case.v), to_thd(case.gates["beta"]), to_thd(case.gates["g"]), to_thd(case.q)
+    set_seed(SEED + 2)
+    dO = torch.randn(case.T, case.HO, case.V, device="cuda").to(case.dtype)
+    with waive_unsupported(backend, "gdp"):
+        h_e, m_e = la_ops.gated_delta_product_summary(k, v, g, beta, case.cu, n, use_qk_l2norm_in_kernel=True, plan_name="gdp_summary_frost")
+        h_t, m_t = la_ops.gated_delta_product_summary(k_tm, v_tm, g, beta_tm, case.cu, n, use_qk_l2norm_in_kernel=True, plan_name="gdp_summary_frost")
+        g_e = la_ops.gated_delta_product_summary_bwd(q, k, g, beta, dO, case.cu, n, use_qk_l2norm_in_kernel=True, plan_name="gdp_summary_frost")
+        g_t = la_ops.gated_delta_product_summary_bwd(q, k_tm, g, beta_tm, dO, case.cu, n, use_qk_l2norm_in_kernel=True, plan_name="gdp_summary_frost")
+    assert_bitwise("H", h_t, h_e)
+    assert_bitwise("M", m_t, m_e)
+    assert_bitwise("G", g_t, g_e)
+
+
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_gdp_token_major_rejects_misaligned_and_malformed(backend):
+    """A token-major slice whose column offset is not 16-byte aligned is refused (TMA needs aligned outer strides), as is
+    a token-major tensor whose slot count is not num_householder."""
+    case = make_case("gdp", torch.bfloat16, T=128, n=3)
+    args = [to_thd(case.q), to_thd(case.k), to_thd(case.v), to_thd(case.gates["g"]), to_thd(case.gates["beta"])]
+    k_tm, v_tm, beta_tm = token_major_views(case, pad=3)
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        pinned_op(backend, "gdp")(args[0], k_tm, args[2], args[3], args[4], case.cu, 3)
+    with pytest.raises(ValueError, match="token-major k must be"):
+        pinned_op(backend, "gdp")(args[0], args[1].view(case.T, 3, case.HK, case.K)[:, :2], args[2], args[3], args[4], case.cu, 3)
 
 
 @pytest.mark.parametrize("variant", HOUSEHOLDER_VARIANTS)

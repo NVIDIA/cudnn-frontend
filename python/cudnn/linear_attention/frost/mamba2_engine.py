@@ -56,7 +56,7 @@ def mamba2_support_gates(engine: str, facts) -> None:
         if checkpoint:
             raise NotImplementedError(f"{engine}: 'state_indices' cannot be combined with checkpoint_every_n_tokens")
     io = (cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
-    state_dtypes = (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16)
+    state_dtypes = (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
     param_dtypes = (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
     for port, got in (("a", facts.a_dtype), ("dt_bias", facts.dt_bias_dtype), ("d", facts.d_dtype)):
         if got not in param_dtypes + (None,):
@@ -67,7 +67,7 @@ def mamba2_support_gates(engine: str, facts) -> None:
         raise NotImplementedError(f"{engine}: 'O_pre' must match the io dtype")
     for port, got in (("initial_state", facts.state_dtype), ("final_state", facts.final_state_dtype)):
         if got not in state_dtypes + (None,):
-            raise NotImplementedError(f"{engine}: '{port}' must be fp32/bf16, got {got}")
+            raise NotImplementedError(f"{engine}: '{port}' must be fp32/bf16/fp16, got {got}")
     if not facts.state_pair_match:
         raise NotImplementedError(f"{engine}: initial_state and final_state dtypes must match")
     if facts.is_bwd:

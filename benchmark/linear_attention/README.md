@@ -45,8 +45,8 @@ python benchmark_single_linear_attention.py \
     --la_backend cudnn --variant gdn2 --data_type bfloat16 \
     --skip_ref --profile_pass fwd
 
-# cuDNN Frontend (GDP, n Householder sub-tokens per token; k/v/beta carry
-# seqlen * num_householder rows)
+# cuDNN Frontend (GDP, n Householder sub-tokens per token; q / k / v are column slices of one
+# [V | K | Q] projection buffer, k / v token-major [T, n, H, D], beta [T, n, HO])
 python benchmark_single_linear_attention.py \
     --batch_size 1 --seqlen 8192 \
     --num_q_heads 64 --num_kv_heads 64 --head_dim_qk 128 --head_dim_vo 64 \
