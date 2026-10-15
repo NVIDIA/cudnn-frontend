@@ -1151,9 +1151,9 @@ def test_sdpa_bwd_dsl_sm120_strided_io_rejects_unaligned():
     """Non-16-byte-multiple strides decline at build (Rule 2: never a copy).
     The backend refuses the same stride (#1571), so no plan builds."""
 
+    _require_dsl()
     import cudnn
 
-    _require_dsl()
     batch, h, s, d = 2, 4, 128, 64
     # head stride 68 elems: not a multiple of the 8-element fp16 quantum
     q = torch.randn(batch, s, h, d + 4, dtype=torch.float16, device="cuda").transpose(1, 2)[..., :d]
