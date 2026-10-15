@@ -59,11 +59,35 @@ def _code_lines(src):
     return "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))
 
 
+def _host_runtime_slots(module, values):
+    """The positional argument list of ``module._host``'s raw entry: its runtime parameters in signature order (the ``Constexpr`` ones
+    are baked into the kernel), each read from ``values`` by name.  A slot the kernel does not have is left out -- the d128 kernel
+    appends the score / bias / kv_mask slots, the other flavors have none -- and a slot ``values`` lacks is a KeyError."""
+    import inspect
+
+    return [values[name] for name, p in inspect.signature(module._host).parameters.items() if "Constexpr" not in str(p.annotation)]
+
+
 @pytest.mark.parametrize("flavor", _FLAVORS)
 def test_f16_routes_to_the_sm107_sibling(flavor):
     """Every f16 flavor has a Rubin sibling, and Blackwell keeps the SM100 one."""
     assert "sm107" in _load(flavor, rubin=True).__name__
     assert "sm100" in _load(flavor, rubin=False).__name__
+
+
+@pytest.mark.parametrize("rubin", [True, False], ids=["sm107", "sm100"])
+@pytest.mark.parametrize("flavor", _FLAVORS)
+def test_f16_host_entries_carry_only_record_reproducible_defaults(flavor, rubin):
+    """The compiled-plan cache persists a ``--enable-tvm-ffi`` host only when every default of its calling convention is a value the
+    artifact record carries (None / bool / int / float / str): a tuple default silently leaves the host un-persistable, and the staged
+    artifact JITs again in every process (``TestStagedHalf::test_artifact_reload`` is the GPU detector).  Pinned on the host for every
+    f16 flavor of both arch trees."""
+    import inspect
+    from cudnn.frost.compiled_cache import _json_plain
+
+    sig = inspect.signature(_load(flavor, rubin=rubin)._host)
+    offending = {n: p.default for n, p in sig.parameters.items() if p.default is not inspect.Parameter.empty and not _json_plain(p.default)}
+    assert not offending, f"{flavor} rubin={rubin}: host defaults the artifact record cannot carry: {offending}"
 
 
 # Which flavors' MMA-operand SMEM crosses 256 KiB -- the boundary above which a
@@ -5091,35 +5115,51 @@ def test_sm107_half_split_direct_template_stats_base(d, stats_log2):
     module = _load((d, dv), rubin=True, dtype_qkv=DTYPE_FP16, dtype_o=DTYPE_FP16, split_kv=splits, stats_log2=stats_log2)
     raw = positional_entry(module.compile(d_qk=d, d_v=dv))
     assert raw is not None
-    # This bypasses the adapter, which clears stats_log2 when producing partials.
+    # This bypasses the adapter, which clears stats_log2 when producing partials.  The raw entry takes every runtime slot of the host
+    # entry positionally; the slots the d128 kernel appends (the score / bias / kv_mask operands) are compiled out here: None / zeros.
     raw(
-        q.data_ptr(),
-        k.data_ptr(),
-        v.data_ptr(),
-        partial_o.data_ptr(),
-        partial_lse.data_ptr(),
-        0,
-        0,
-        0,
-        (b, h, 1, sq, skv, 0),
-        tuple(q.stride()[:3]),
-        tuple(k.stride()[:3]),
-        tuple(v.stride()[:3]),
-        tuple(partial_o.stride()[:3]),
-        tuple(partial_lse.stride()),
-        0,
-        math.log2(math.e) / math.sqrt(d),
-        0,
-        0,
-        None,
-        None,
-        None,
-        partial_o.data_ptr(),
-        None,
-        None,
-        (0, 0),
-        0,
-        cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+        *_host_runtime_slots(
+            module,
+            dict(
+                q_ptr=q.data_ptr(),
+                k_ptr=k.data_ptr(),
+                v_ptr=v.data_ptr(),
+                o_ptr=partial_o.data_ptr(),
+                lse_ptr=partial_lse.data_ptr(),
+                sinks_ptr=0,
+                meta_ptr=0,
+                o_desc_ptr=0,
+                problem_size=(b, h, 1, sq, skv, 0),
+                q_strides=tuple(q.stride()[:3]),
+                k_strides=tuple(k.stride()[:3]),
+                v_strides=tuple(v.stride()[:3]),
+                o_strides=tuple(partial_o.stride()[:3]),
+                lse_strides=tuple(partial_lse.stride()),
+                lse_ext=0,
+                scale_softmax_log2=math.log2(math.e) / math.sqrt(d),
+                n_thd_units=0,
+                seq_q_lens_addr=0,
+                thd_q_lens_ptr=None,
+                thd_kv_lens_ptr=None,
+                thd_lens_form=None,
+                o_partial_ptr=partial_o.data_ptr(),
+                block_table_ptr=None,
+                block_table_v_ptr=None,
+                table_strides=(0, 0),
+                n_pages=0,
+                score_max_ptr=None,
+                score_sum_exp_ptr=None,
+                score_max_strides=(0, 0, 0),
+                score_sum_exp_strides=(0, 0, 0),
+                bias_ptr=None,
+                bias_strides=(0, 0, 0),
+                bias_extents=(1, 1),
+                kv_mask_ptr=None,
+                kv_mask_batch_stride=0,
+                inv_scale_softmax=math.sqrt(d),
+                stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+            ),
+        )
     )
     scores = torch.einsum("bqhd,bknd->bhqk", q.double(), k.double()) / math.sqrt(d)
     values = v.double().transpose(1, 2).expand(b, h, skv, dv)

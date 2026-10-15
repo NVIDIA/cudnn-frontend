@@ -4940,23 +4940,23 @@ def _host(
     d_v: cutlass.Constexpr[int],
     lse_kind: cutlass.Constexpr[str],
     paged_hnd: cutlass.Constexpr[bool],
-    # Score side outputs (APPENDED; the prepared binder fills them from the frame template): fp32
+    # Score side outputs (APPENDED, explicit like every other runtime slot; the prepared binder fills them from the frame template): fp32
     # (B, QH, SQ) buffers in their declared (batch, head, row) element strides, None = not requested
     # (the store folds out of the kernel; the stride slots are then unread).
-    score_max_ptr: Optional[cute.Pointer] = None,
-    score_sum_exp_ptr: Optional[cute.Pointer] = None,
-    score_max_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64] = (0, 0, 0),
-    score_sum_exp_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64] = (0, 0, 0),
+    score_max_ptr: Optional[cute.Pointer],
+    score_sum_exp_ptr: Optional[cute.Pointer],
+    score_max_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    score_sum_exp_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     # Additive bias [B_b, H_b, S_q, S_kv] in the io dtype (APPENDED; the prepared binder fills them): pointer, its
     # (batch, head, q-row) element strides and its two broadcast extents (B_b in {1, B}, H_b in {1, QH}); the per-key
     # boolean mask [B_m, S_kv] as bytes with its batch element stride; 1 / softmax_scale for the pre-scale bias add.
     # None / zeros on a plan without the arm (CFG.BIAS_MODE / KV_MASK_FORM fold the paths out; compile() backstops).
-    bias_ptr: Optional[cute.Pointer] = None,
-    bias_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64] = (0, 0, 0),
-    bias_extents: Tuple[int, int] = (1, 1),
-    kv_mask_ptr: Optional[cute.Pointer] = None,
-    kv_mask_batch_stride: cutlass.Int64 = 0,
-    inv_scale_softmax: cutlass.Float32 = 1.0,
+    bias_ptr: Optional[cute.Pointer],
+    bias_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    bias_extents: Tuple[int, int],
+    kv_mask_ptr: Optional[cute.Pointer],
+    kv_mask_batch_stride: cutlass.Int64,
+    inv_scale_softmax: cutlass.Float32,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     """Host entry: device pointers, runtime extents and strides in, TMA encodes and launches out.
