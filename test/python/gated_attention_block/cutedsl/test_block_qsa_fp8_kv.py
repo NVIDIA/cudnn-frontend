@@ -885,3 +885,23 @@ def test_capture_of_the_first_execute_replays_bitwise_and_takes_new_scales_lengt
         ), "the replay over new scales / lengths / tables / lists / slots differs from the eager run over them"
     finally:
         graph.reset()
+
+
+def test_the_write_through_fold_never_serves_the_e4m3_cache():
+    """``fuse_cache_write`` (the paged write-through FOLDED into the fused norm + RoPE projection's epilogue; None = AUTO) composes with the
+    e4m3 cache by staying OFF: the epilogue writes 16-bit rows, the e4m3 write-through QUANTIZES.  AUTO on a ``fuse_norm_rope=True``
+    e4m3 declaration keeps the separate quantizing launch (the fork's pool arm unarmed); an explicit ``True`` is a typed decline naming
+    the attribute; the same declaration over 16-bit pools folds, so the pin reads the composition and not a disabled fold."""
+    kw = dict(
+        kv_source="self", sample_k_cache=None, sample_v_cache=None, sample_block_table=None, geom_over=dict(causal_bottom_right=False), fuse_norm_rope=True
+    )
+    with _no_host_sync():
+        e4, _ = _declare(GEOM_SMALL, 2, 8, **kw)
+    assert e4.kv_cache_e4m3 and e4.fuse_norm_rope and e4.fuse_cache_write is None
+    assert e4.cache_write_fused is False and isinstance(e4._cache_write, _QuantizedCacheWrite) and e4._proj.kv_pool_page_size == 0
+    with _no_host_sync():
+        b16, _ = _declare(GEOM_SMALL, 2, 8, pool_dtype=BF16, kv_cache_dtype=None, **kw)
+    assert not b16.kv_cache_e4m3 and b16.cache_write_fused is True and b16._cache_write is None and b16._proj.kv_pool_page_size == 16
+    with pytest.raises(NotImplementedError, match="fuse_cache_write=True with kv_cache_dtype=torch.float8_e4m3fn"):
+        with _no_host_sync():
+            _declare(GEOM_SMALL, 2, 8, fuse_cache_write=True, **kw)

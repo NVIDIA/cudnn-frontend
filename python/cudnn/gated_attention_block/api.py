@@ -6443,10 +6443,12 @@ class GatedAttentionBlockFwd(APIBase):
         )
         # Where the paged KV-cache write-through runs: the fused projection's epilogue (the arm serves the bf16 / f16 fused norm + RoPE
         # pipeline without an indexer band) or the separate cache-write launch.  `fuse_cache_write` stays what was declared;
-        # `cache_write_fused` is what runs.
+        # `cache_write_fused` is what runs.  Never under kv_cache_dtype=e4m3: the epilogue writes 16-bit rows and the e4m3 write-through
+        # QUANTIZES (the separate _QuantizedCacheWrite launches); AUTO stays off there, an explicit True is the typed decline below.
         self.fuse_cache_write = self._check_fuse_cache_write_declaration(fuse_cache_write, quant)
         self.cache_write_fused = bool(self.paged_kv_page_size) and (
-            self.fuse_cache_write is True or (self.fuse_cache_write is None and self.fuse_norm_rope and quant is None and not geometry.index_band)
+            self.fuse_cache_write is True
+            or (self.fuse_cache_write is None and self.fuse_norm_rope and quant is None and not geometry.index_band and not self.kv_cache_e4m3)
         )
         self._descs = {
             "w_qkvg": self._make_tensor_desc(sample_w_qkvg, name="w_qkvg"),
@@ -6908,8 +6910,8 @@ class GatedAttentionBlockFwd(APIBase):
     def _check_fuse_cache_write_declaration(self, fuse_cache_write, quant) -> Optional[bool]:
         """``fuse_cache_write`` at declaration: None / True / False (``TypeError`` otherwise); True on a pipeline the fused projection's
         write-through arm does not serve is a typed ``NotImplementedError`` naming the feature (the arm: ``paged_kv_page_size > 0``,
-        ``fuse_norm_rope=True``, bf16 / f16 activations, no indexer band -- the bf16 fork's epilogue; the quantizing forks, the unfused
-        chain and the indexer band keep the separate cache-write launch).  Device-free."""
+        ``fuse_norm_rope=True``, bf16 / f16 activations, no indexer band, 16-bit pools -- the bf16 fork's epilogue; the quantizing forks, the
+        unfused chain, the indexer band and the e4m3 KV cache keep the separate cache-write launch).  Device-free."""
         if fuse_cache_write is not None and not isinstance(fuse_cache_write, bool):
             raise TypeError(f"fuse_cache_write must be None (auto), True or False, got {type(fuse_cache_write).__name__}")
         if fuse_cache_write is True:
@@ -6929,6 +6931,11 @@ class GatedAttentionBlockFwd(APIBase):
                 raise NotImplementedError(
                     "fuse_cache_write=True with an indexer band: the fused projection declines the band's 640-column tile, and the raw indexer key's "
                     "pool is the separate cache-write launch's; declare fuse_cache_write=False (or None)"
+                )
+            if self.kv_cache_e4m3:
+                raise NotImplementedError(
+                    "fuse_cache_write=True with kv_cache_dtype=torch.float8_e4m3fn: the fused projection's epilogue writes bf16 / f16 rows, and the e4m3 "
+                    "cache's write-through QUANTIZES (two per-tensor casts + the bit copy through the pools' bf16 views) -- declare fuse_cache_write=False (or None)"
                 )
         return fuse_cache_write
 
