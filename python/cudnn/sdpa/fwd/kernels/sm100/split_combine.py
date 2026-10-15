@@ -86,6 +86,9 @@ ROWS_PER_BLOCK = THREADS // 32
 G_S = 16
 # The narrow group: rows with at most this many splits load only this many (every extra clamped slot costs a load pair and an exp: ~0.4 us at 8 splits).
 G_LEAN_SMALL = 8
+# Unroll depth of the decode form's O pass: this many splits' partial-O loads of one warp are in flight together (B200, S_q = 1, b = 1: 4 -> 8 takes the
+# combine at 32 / 64 / 128 splits from 7.2 / 10.7 / 17.4 us to 5.4 / 7.2 / 10.2; 16 gains nothing at 32 splits, whose warps own only 8 of them).
+_DECODE_UNROLL = 8
 # Unroll depth of the serial combine's split walks (one warp per row): the
 # loads of this many splits are issued together, so the latency of the
 # dependent walk is paid once per group rather than once per split.  Each walk
@@ -933,7 +936,7 @@ def _combine_decode_kernel(
                 e_l = cute.math.exp(lse_l - m_safe, fastmath=True)
                 w_lane = cutlass.Float32(arith.select((lse_l > neg_inf).ir_value(), e_l.ir_value(), zero.ir_value()))
             n_here = _min_i32(cutlass.Int32(32), n_sub - c)
-            for j in cutlass.range(0, n_here, 1, unroll=4):
+            for j in cutlass.range(0, n_here, 1, unroll=_DECODE_UNROLL):
                 # The weight is warp-uniform (one shuffle).  The loads are NOT
                 # predicated on it: a branch per split would serialize the
                 # unrolled loads behind each other's latency (measured: the
