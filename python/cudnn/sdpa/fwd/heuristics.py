@@ -74,7 +74,17 @@ from cudnn.sdpa.fwd.config_sm100 import (
 )
 from cudnn.sdpa.fwd.config_sm107 import SM107_FP32_VECTOR_WITH_BIAS_TILE_N, sm107_bias_auto_cga, sm107_pair_item_active, sm107_tile_n_pick
 from cudnn.sdpa.fwd.config_sm100 import sm100_bias_auto_cga, sm100_tile_n_pick
-from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR, FP8_HEAD_TILE_GRANULE, HEAD_TILE_GRANULE, SMEM_CAPACITY_BYTES, pick_flavor, smem_bytes, tile_domain
+from cudnn.sdpa.fwd.config_sm120 import (
+    D512_FLAVOR,
+    FP8_HEAD_TILE_GRANULE,
+    HEAD_TILE_GRANULE,
+    SMEM_CAPACITY_BYTES,
+    head_tiles,
+    kv_tile_preference,
+    pick_flavor,
+    smem_bytes,
+    tile_domain,
+)
 from cudnn.sdpa.fwd.engines import (
     ENGINE_SPECS,
     Capabilities,
@@ -407,6 +417,19 @@ _DECODE_TILE_WIDE_Q_TILE_COST = 1.6
 # The shared sm100/split_combine pass over a decode-shaped grid: one combine
 # wave, ~6 us measured at b=32 x 32 heads.
 _DECODE_TILE_COMBINE_COST = 3.5
+# What EVERY partial adds to that pass, in KV-tile units.  A decode-shaped grid
+# is one wave of warps with nothing to hide a serial split walk behind, so the
+# combine grows linearly with the split count: measured on the Rubin d256 tile
+# (212 SMs, 2376 MHz lock; batch 1 x 2 KV heads, pack 12:1, kv 4K / 32K / 128K
+# and batch 4 x 128K; splits 4 .. 64 pinned) 3.0-3.4 us + 0.17-0.18 us per
+# split with the grouped-load walk of sm100/split_combine (0.63-0.67 before it,
+# when the pass read one split per memory round trip), against 1.03 us per KV
+# tile for a lone CTA there.  Without this term the model took split 64 at
+# batch 1 wherever the KV was long (the per-wave term is flat in s) and paid a
+# 40 us combine for a 12 us kernel; with it the batch-1 optima measured at
+# kv 4K / 32K / 128K (16 / 32 / 64) and the batch-4 x 128K one (16) all fall
+# out, and every B200 pin below holds (the term is 0.3-2.7 tiles there).
+_DECODE_TILE_COMBINE_PER_PARTIAL = 0.17
 # What the two-launch split path costs an EAGER caller on the host per
 # graph.execute beyond the one-launch path: a second CuTe-DSL launch plus the
 # partial-slab carving. Measured 62 -> 92 us on the b=32 x 2 KV heads x 4096
@@ -426,7 +449,7 @@ def _decode_tile_cost(split: int, *, units: int, kv_tiles: int, sm_count: int, t
     per_tile = max(tile_cost, streams / (_DECODE_TILE_SATURATION_FRACTION * sm_count))
     cost = (_ceil_div(kv_tiles, split) + _DECODE_TILE_CTA_COST) * per_tile
     if split > 1:
-        cost += _DECODE_TILE_COMBINE_COST + launch_cost
+        cost += _DECODE_TILE_COMBINE_COST + split * _DECODE_TILE_COMBINE_PER_PARTIAL + launch_cost
     return cost
 
 
@@ -450,14 +473,17 @@ def choose_decode_tile_split_kv(
         streams(s)  = units * s                                   # concurrent K/V streams
         per_tile(s) = max(TILE_COST(q_tile), streams(s) / (SATURATION * sm_count))
         cost(s)     = (ceil(kv_tiles / s) + CTA_COST) * per_tile(s)
-                    + [s > 1] * (COMBINE_COST + launch_cost)
+                    + [s > 1] * (COMBINE_COST + s * COMBINE_PER_PARTIAL + launch_cost)
 
     A lone CTA streams a KV tile at TILE_COST (1 on the 16-column tile, 1.6 on
     the issue-bound 32-column one); once the streams saturate HBM every CTA
     slows with their count instead.  What falls out: an under-full launch
     splits until its streams saturate HBM; a launch already past it never
     splits (the bytes are the same, only the fixed costs grow); in between,
-    the split must SAVE more than it ADDS.  With the default ``launch_cost``
+    the split must SAVE more than it ADDS -- and every partial it adds costs
+    the one-wave combine a serial step (COMBINE_PER_PARTIAL), which is what
+    stops a few-unit launch from splitting past the point where the combine
+    outweighs the kernel.  With the default ``launch_cost``
     the added part includes the eager caller's second host launch, so on the
     16-column tile the b=32 x 2 KV heads x 4096-key serving shape (6 us of GPU
     saving for 30 us of host time) stays unsplit while a small batch or a
@@ -489,8 +515,7 @@ def _sm120_envelope(facts) -> Tuple[int, int]:
     """(D_QK, D_V) rounded up to the head-tile granule: the ENVELOPE tiles the
     SM120 kernels stage, so a fit check must use them or a tile offered here
     declines at build (and a knob-carried tile skips the adapter's fallback)."""
-    granule = FP8_HEAD_TILE_GRANULE if (facts.is_fp8 or facts.is_mxfp8) else HEAD_TILE_GRANULE
-    return -(-facts.d_qk // granule) * granule, -(-facts.d_v // granule) * granule
+    return head_tiles(facts.d_qk, facts.d_v, FP8_HEAD_TILE_GRANULE if (facts.is_fp8 or facts.is_mxfp8) else HEAD_TILE_GRANULE)
 
 
 def _sm120_fits_smem(facts, tile_m: int, tile_n: int) -> bool:
@@ -507,9 +532,10 @@ def _sm120_tiles(caps: Capabilities, facts) -> Tuple[int, int]:
 
     ``tile_m=64`` when the grid cannot fill the machine AND each CTA has enough
     KV tiles to amortize the extra Q-tile loop; a causal mask counts as a
-    halved grid because it halves the work per CTA. ``tile_n`` is the largest
-    that fits SMEM: 128 is fastest, but a wide head has no room for it (D>=208
-    in half, further out in FP8 -- its KV tile is a byte per element).
+    halved grid because it halves the work per CTA. ``tile_n`` is the first of
+    ``config_sm120.kv_tile_preference`` that fits SMEM: 128 is fastest, but a
+    wide head has no room for it (D>=208 in half, further out in FP8 -- its KV
+    tile is a byte per element).
 
     Fit is a KERNEL property, so ``config_sm120.smem_bytes`` is the one
     implementation and the adapter's check calls it too. So is the tuning: an
@@ -532,10 +558,11 @@ def _sm120_tiles(caps: Capabilities, facts) -> Tuple[int, int]:
     kv_tiles = -(-facts.s_kv // 128)
     fine = sm_count > 0 and (grid * 2 <= sm_count or (grid * 2 <= 3 * sm_count and kv_tiles >= 12))
     preferred_tile_m = 64 if fine else 128
-    # Prefer the selected query tile, then larger query and KV tiles.
+    kv_order = kv_tile_preference(facts.d_qk, mxfp8=facts.is_mxfp8)
+    # Prefer the selected query tile, then larger query tiles and faster KV tiles.
     candidate_tiles = sorted(
         tile_domain(facts.d_qk, facts.d_v, facts.is_fp8 or facts.is_mxfp8),
-        key=lambda tile: (tile[0] == preferred_tile_m, tile[0], tile[1]),
+        key=lambda tile: (tile[0] == preferred_tile_m, tile[0], -kv_order.index(tile[1])),
         reverse=True,
     )
     for m, n in candidate_tiles:
@@ -1376,9 +1403,10 @@ def _sm120_d512_windowed(caps: Capabilities, facts) -> bool:
     instead of ``tile_m`` plus the window, fewer K/V tiles through the L2->SMEM
     path and less masked-out MMA at the same DRAM bytes. And walk the units with
     plain LPT (see :func:`_sched_points`). Without a window the decode rule
-    alone decides the packing. The FP8 flavor takes only the LPT walk: its
-    64-key tile covers a 64-token unit's window in as many tiles as a packed
-    one-token unit, so packing saves no MMA there (measured 8-11% slower).
+    alone decides the packing. The FP8 and MXFP8 flavors take only the LPT
+    walk: their 64-key tile covers a 64-token unit's window in as many tiles as
+    a packed one-token unit, so packing saves no MMA there (measured 8-11%
+    slower on FP8, 1-3% on MXFP8).
     """
     return caps.sm_lo >= 120 and caps.sm_hi < 130 and facts.window_left is not None and pick_flavor(facts.d_qk, facts.d_v, fp8=facts.is_fp8) == D512_FLAVOR
 
@@ -1552,7 +1580,7 @@ def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] 
             # 97.3 at parity.  Packing keeps the lead where no unpacked tile fits (b2 64/8 q256 KV 4k: packed 93.9 vs
             # unpacked 191.2) and under a band (_sm100_banded_gqa_packs below).  The packed set stays listed.
             wins = False
-    if wins or (_sm120_d512_windowed(caps, facts) and not facts.is_fp8) or _sm100_banded_gqa_packs(caps, facts):
+    if wins or (_sm120_d512_windowed(caps, facts) and not (facts.is_fp8 or facts.is_mxfp8)) or _sm100_banded_gqa_packs(caps, facts):
         return (True, False)
     return (False, True)
 
@@ -2050,7 +2078,8 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     scheds = [unsplit_sched] + [policy for policy in generic_scheds if policy != unsplit_sched]
 
     def _pack_choice(cga: Optional[int], split_value: Optional[int] = None):
-        # A packed set rides the largest fitting tile that admits the ratio. The
+        # A packed set rides the largest fitting tile that admits the ratio, on
+        # the rule's KV tile where it can. The
         # decision uses this leg's actual CGA span; D192 CGA1 and CGA2 cover a
         # different number of Q rows.  The leg's split is part of the question on
         # a GATED d256 graph: it packs on the decode tile's split only (the gate
@@ -2058,7 +2087,7 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
         pack_tile = next(
             (
                 (m, n)
-                for m, n in sorted(tiles, key=lambda mn: (-(mn[0] or 0), mn[1] != 128))
+                for m, n in sorted(tiles, key=lambda mn: (-(mn[0] or 0), mn[1] != tiles[0][1]))
                 if True in _pack_gqa_points(caps, facts, m or 128, cga, split_value)
             ),
             None,

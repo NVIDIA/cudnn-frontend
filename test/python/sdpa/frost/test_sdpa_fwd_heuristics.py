@@ -267,7 +267,7 @@ def test_sm120_d192_keeps_sm120_cga_domain(engine_name, dtype, is_fp8):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d_qk,d_v", [(64, 64), (128, 128), (192, 128), (256, 256), (80, 112)], ids=lambda d: str(d))
+@pytest.mark.parametrize("d_qk,d_v", [(64, 64), (128, 128), (192, 128), (256, 256), (80, 112), (384, 320), (512, 512)], ids=lambda d: str(d))
 def test_sm120_mxfp8_proposals_are_admissible_cga1_sets(d_qk, d_v):
     """The SM120 MXFP8 row rides the SM120 tile rule, and no rule measured on another row (the SM100
     MXFP8 d128 cga1 / cga2 choice) hands it a set outside its own domain."""
@@ -289,6 +289,71 @@ def test_sm120_mxfp8_proposals_are_admissible_cga1_sets(d_qk, d_v):
     for plan in plans:
         assert plan.knobs.cga == 1
         assert engines.mismatch(spec.capabilities, facts, plan.knobs) is None
+
+
+@pytest.mark.L0
+def test_sm120_mxfp8_d256_admits_both_kv_tiles():
+    """MXFP8 (256, 256) heads admit an explicit TILE_N of 64 or 128, and every proposal is a kernel-table
+    tile that fits SMEM."""
+    from cudnn.sdpa.fwd.config_sm120 import SMEM_CAPACITY_BYTES, smem_bytes, tile_domain
+
+    name = "sdpa_fwd_prefill_sm120_mxfp8"
+    spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == name)
+    for d_qk, d_v in ((256, 256), (240, 256)):
+        domain = tile_domain(d_qk, d_v, fp8=True)
+        assert {(128, 128), (128, 64), (64, 128), (64, 64)} <= domain, (d_qk, d_v)
+        for s_q, causal in ((2048, True), (16384, False)):
+            facts = _facts(
+                s_q=s_q,
+                s_kv=s_q,
+                h_q=32,
+                h_kv=2,
+                d_qk=d_qk,
+                d_v=d_v,
+                causal=causal,
+                dtype=cudnn.data_type.FP8_E4M3,
+                dtype_o=cudnn.data_type.BFLOAT16,
+                is_mxfp8=True,
+                device_cc=(12, 0),
+                device_sm_count=188,
+            )
+            plans = recommend("A", facts, {name: 20518})
+            assert plans, (d_qk, d_v, s_q)
+            for plan in plans:
+                assert engines.mismatch(spec.capabilities, facts, plan.knobs) is None
+                assert (plan.knobs.tile_m, plan.knobs.tile_n) in domain
+                assert smem_bytes(256, 256, plan.knobs.tile_m, plan.knobs.tile_n, itemsize=1, out_itemsize=2, mxfp8=True) <= SMEM_CAPACITY_BYTES
+            for tile_n in (64, 128):
+                assert engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(tile_m=128, tile_n=tile_n)) is None, (d_qk, d_v, tile_n)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(256, 256), (224, 224), (128, 128)], ids=lambda d: str(d))
+def test_sm120_mxfp8_packed_sets_ride_the_rule_kv_tile(d_qk, d_v):
+    """The packed GQA leg takes the tile rule's KV tile."""
+    from cudnn.sdpa.fwd.heuristics import _sm120_tiles
+
+    name = "sdpa_fwd_prefill_sm120_mxfp8"
+    spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == name)
+    facts = _facts(
+        s_q=32,
+        s_kv=8192,
+        h_q=32,
+        h_kv=4,
+        d_qk=d_qk,
+        d_v=d_v,
+        causal=True,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=cudnn.data_type.BFLOAT16,
+        is_mxfp8=True,
+        device_cc=(12, 0),
+        device_sm_count=188,
+    )
+    plans = recommend("A", facts, {name: 20518})
+    packed = [plan for plan in plans if plan.knobs.pack_gqa]
+    assert packed, "a 32-token GQA-8 graph is packing-eligible"
+    assert packed[0].knobs.tile_n == _sm120_tiles(spec.capabilities, facts)[1]
+    assert all(engines.mismatch(spec.capabilities, facts, plan.knobs) is None for plan in plans)
 
 
 @pytest.mark.L0
@@ -369,6 +434,41 @@ def test_sm120_fp8_d512_flavor_and_tile_contract():
     for dim in (128, 256):
         assert pick_flavor(dim, dim, fp8=True) is None
         assert (128, 128) in tile_domain(dim, dim, fp8=True)
+
+
+@pytest.mark.L0
+def test_sm120_mxfp8_d512_flavor_and_tile_contract():
+    """MXFP8 D512 runs the FP8 d512 CTA tile and adds the V scale tile plus the staged K scale words
+    to its SMEM budget; every plan the ranking proposes, windowed or not, is one the row admits."""
+    from cudnn.sdpa.fwd.config_sm120 import SMEM_CAPACITY_BYTES, pick_flavor, smem_bytes, tile_domain
+
+    assert pick_flavor(512, 512, fp8=True) == (512, 512)
+    assert tile_domain(512, 512, fp8=True) == frozenset({(64, 64)})
+    assert smem_bytes(512, 512, 64, 64, itemsize=1, out_itemsize=2, mxfp8=True) == 101144 <= SMEM_CAPACITY_BYTES
+    assert smem_bytes(272, 496, 64, 64, itemsize=1, out_itemsize=2, mxfp8=True) == 101144
+    name = "sdpa_fwd_prefill_sm120_mxfp8"
+    spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == name)
+
+    def facts(**over):
+        return _facts(
+            **{
+                **dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_mxfp8=True, device_cc=(12, 0), device_sm_count=188),
+                **over,
+            }
+        )
+
+    for d_qk, d_v in ((272, 272), (496, 512), (512, 496), (512, 512), (384, 320)):
+        f = facts(d_qk=d_qk, d_v=d_v)
+        plans = recommend("A", f, {name: 20518})
+        assert plans, (d_qk, d_v)
+        assert {(plan.knobs.tile_m, plan.knobs.tile_n) for plan in plans} == {(64, 64)}
+        assert all(engines.mismatch(spec.capabilities, f, plan.knobs) is None for plan in plans)
+    for d_qk, d_v in ((256, 512), (512, 256), (264, 512), (512, 528)):
+        assert engines.mismatch(spec.capabilities, facts(d_qk=d_qk, d_v=d_v)) is not None, (d_qk, d_v)
+    f = facts(s_q=16384, s_kv=16384, h_q=64, h_kv=1, d_qk=512, d_v=512, window_left=128)
+    windowed = recommend("A", f, {name: 20518})
+    assert windowed and {(plan.knobs.tile_m, plan.knobs.tile_n) for plan in windowed} == {(64, 64)}
+    assert all(engines.mismatch(spec.capabilities, f, plan.knobs) is None for plan in windowed)
 
 
 @pytest.mark.L0

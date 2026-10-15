@@ -3432,8 +3432,14 @@ def _sm120_fp8_spec() -> EngineSpec:
 
 
 def _sm120_mxfp8_spec() -> EngineSpec:
-    """SM120 block-scaled MXFP8 engine (E4M3/E5M2 + per-32-block E8M0 SF, FP16/BF16/FP8 out)."""
-    from cudnn.sdpa.fwd.config_sm120 import FP8_GENERAL_HEAD_TILES
+    """SM120 block-scaled MXFP8 engine (E4M3/E5M2 + per-32-block E8M0 SF, FP16/BF16/FP8 out).
+
+    General head TILES are multiples of 32 up to 256 with the QK^T and P@V sides
+    independent; the D512 flavor serves both head dimensions independently in
+    (256, 512], in multiples of 16, with a 64x64 CTA tile (the block-scaled O
+    is d128 only).
+    """
+    from cudnn.sdpa.fwd.config_sm120 import GENERAL_HEAD_TILE_MAX, FP8_GENERAL_HEAD_TILES
 
     return EngineSpec(
         name="sdpa_fwd_prefill_sm120_mxfp8",
@@ -3441,10 +3447,8 @@ def _sm120_mxfp8_spec() -> EngineSpec:
             sm_lo=_BLACKWELL_GEFORCE[0],
             sm_hi=_BLACKWELL_GEFORCE[1],
             phase="prefill",
-            d_shapes=frozenset((tq, tv) for tq in FP8_GENERAL_HEAD_TILES for tv in FP8_GENERAL_HEAD_TILES),
-            # No floors: the d512 flavor is per-tensor only, and the smallest
-            # covering general tile pads at most 16 columns per side.
-            d_envelope_floors=(),
+            d_shapes=frozenset((tq, tv) for tq in FP8_GENERAL_HEAD_TILES for tv in FP8_GENERAL_HEAD_TILES) | {D512_FLAVOR},
+            d_envelope_floors=((D512_FLAVOR, GENERAL_HEAD_TILE_MAX),),
             d_pad_multiple=16,  # TMA 16-byte global-stride rule at 1 byte/elem
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),

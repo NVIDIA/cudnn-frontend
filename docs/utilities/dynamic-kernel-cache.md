@@ -100,6 +100,6 @@ This runtime workspace query may return a different size than the workspace quer
 Where:
 - `override_uids`: list of tensor UIDs whose shapes are being overridden
 - `override_shapes`: new shape for each tensor in `override_uids` (each element is a `std::vector<int64_t>`)
-- `override_strides`: new stride for each tensor in `override_uids`
+- `override_strides`: new stride for each tensor in `override_uids`. SDPA forward does not use these and keeps the declared strides ([#1570](https://github.com/NVIDIA/cudnn-frontend/issues/1570)); see [Execute-Time Shape Overrides](../operations/Attention.md#execute-time-shape-overrides).
 
 The three vectors must have the same length. Tensors not listed in `override_uids` keep the shapes defined at graph build time.

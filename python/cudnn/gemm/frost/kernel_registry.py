@@ -676,7 +676,7 @@ class Sm120KernelTemplate(KernelTemplate):
     def dsl_cuda_version() -> tuple[int, int] | None:
         try:
             from cutlass.base_dsl.version_info import CUDA_VERSION
-        except Exception:  # noqa: BLE001 -- an absent / broken DSL is reported by probe_cutedsl
+        except Exception:  # noqa: BLE001 -- an absent / unusable DSL is reported by probe_cutedsl
             return None
         return (CUDA_VERSION.major, CUDA_VERSION.minor)
 

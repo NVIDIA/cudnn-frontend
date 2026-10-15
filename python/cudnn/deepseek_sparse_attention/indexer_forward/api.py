@@ -23,6 +23,7 @@ from cudnn.deepseek_sparse_attention.utils.runtime import device_major
 
 from ._interface import TMA_ALIGN_ELEMS, _indexer_fwd_bound, indexer_fwd as indexer_fwd_sm100
 from ._interface_sm90 import indexer_fwd as indexer_fwd_sm90
+from ._support import SUPPORTED_QHEAD_PER_KV_HEAD_BF16
 
 
 class IndexerForward(APIBase):
@@ -113,8 +114,8 @@ class IndexerForward(APIBase):
             f"qhead_per_kv_head * h_kv != h_q ({qhpkv} * {h_kv} != {h_q})",
         )
         self._value_error_if(
-            qhpkv not in (32, 64),
-            f"qhead_per_kv_head must be 32 or 64, got {qhpkv}",
+            qhpkv not in SUPPORTED_QHEAD_PER_KV_HEAD_BF16,
+            f"qhead_per_kv_head must be one of {SUPPORTED_QHEAD_PER_KV_HEAD_BF16}, got {qhpkv}",
         )
         self.qhead_per_kv_head = qhpkv
 

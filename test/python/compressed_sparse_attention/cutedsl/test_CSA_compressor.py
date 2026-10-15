@@ -25,17 +25,19 @@ measurements and numerics in https://github.com/NVIDIA/Megatron-LM/issues/5968).
     every never-consumed slot class is asserted EXACTLY zero, the consumed slots
     match the eager reference per the ratio's contract, and the ``total_comp == 0``
     host fallback still hands back exact zeros;
-  - run-to-run determinism of forward / ``dKV`` / ``dScore`` (``dAPE`` uses fp32 atomics
-    and is exempt by design; the backward refuses to run under
-    ``torch.use_deterministic_algorithms(True)``, and only accumulates into
-    ``grad_ape`` — re-zeroing is the caller's job on the class API);
+  - run-to-run determinism of forward / ``dKV`` / ``dScore`` and the opt-in
+    deterministic dAPE path (CTA-local caller workspace + fixed-order reduction,
+    including strict torch deterministic mode and CUDA-graph overwrite semantics);
+    the default dAPE path keeps fp32 atomics, refuses strict deterministic mode, and
+    only accumulates into ``grad_ape`` — re-zeroing is the class caller's job;
   - the ratio=128 dispatch envelope: schedule selection at every nb_total bucket
     boundary, and (L1) one execution of every shipped (config, schedule) kernel —
     fast-exp, two-phase and vec=1 buckets included — against the contract;
   - CUDA graph capture: warmup -> capture fwd+bwd -> replay (including replay with new
     data and a smaller device-side true row count, checked on all four outputs and
-    bitwise against a direct call), and the loud error when the first call for a
-    configuration would JIT under capture;
+    bitwise against a direct call), deterministic-wrapper scratch lifetime after GC,
+    allocation/synchronization-free deterministic class execution, and the loud error
+    when the first call for a configuration would JIT under capture;
   - ``check_support`` boundaries (validated envelope: compute-capability major >= 10;
     ratio {2, 4} with coff
     {1, 2}, ratio 128 with coff {1, 2} x head_dim {128, 512}; BF16 kv/score, FP32 ape,
@@ -50,6 +52,8 @@ selects the numerics: "upstream" reproduces the eager code exactly
 (softmax weights rounded to bf16, bf16 multiply); "fp32" keeps all intermediates fp32
 with a single final bf16 rounding (the fused kernels' numerics); "fp64" is an oracle.
 """
+
+import gc
 
 import pytest
 import torch
@@ -553,7 +557,8 @@ def test_static_capacity_padding(lens, d, ratio, coff, pad):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("coff", [1, 2])
-def test_empty_output(coff):
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_empty_output(coff, deterministic):
     """total_comp == 0 launches nothing and returns well-formed empty/zero tensors."""
     _require_sm100()
     compressor = _import_compressor()
@@ -566,7 +571,7 @@ def test_empty_output(coff):
     cuc = torch.tensor([0, 0], dtype=torch.int32, device="cuda")
     out = compressor.csa_compressor_forward_wrapper(kv, score, ape, cu, cuc, ratio=ratio, head_dim=d, coff=coff, total_comp=0)["out"]
     assert out.shape == (0, d) and out.dtype == torch.bfloat16
-    grads = compressor.csa_compressor_backward_wrapper(kv, score, ape, cu, cuc, out, ratio=ratio, head_dim=d, coff=coff)
+    grads = compressor.csa_compressor_backward_wrapper(kv, score, ape, cu, cuc, out, ratio=ratio, head_dim=d, coff=coff, deterministic=deterministic)
     assert grads["grad_kv"].abs().sum().item() == 0
     assert grads["grad_score"].abs().sum().item() == 0
     assert grads["grad_ape"].abs().sum().item() == 0
@@ -820,6 +825,370 @@ def test_backward_warns_in_warn_only_deterministic_mode(coff):
     assert len(det_warnings) == 1, f"expected exactly one deterministic-mode warning, got {len(det_warnings)}"
     assert torch.equal(grads["grad_kv"].view_as(r_ref[1]), r_ref[1])
     assert torch.equal(grads["grad_score"].view_as(r_ref[2]), r_ref[2])
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "lens,d,ratio,coff",
+    [
+        pytest.param([1023, 509], 128, 2, 2, id="generic-r2-c2"),
+        pytest.param([1023, 2048, 509], 128, 4, 1, id="generic-c1"),
+        pytest.param([1023, 2048, 509], 128, 4, 2, id="generic-c2"),
+        pytest.param([260], 65, 4, 2, id="generic-odd-d"),
+        pytest.param([1023, 2048, 509], 128, 128, 1, id="r128-c1"),
+        pytest.param([1023, 2048, 509], 128, 128, 2, id="r128-c2"),
+        pytest.param([8192], 512, 128, 2, id="r128-d512-c2"),
+    ],
+)
+def test_backward_deterministic_dape(lens, d, ratio, coff):
+    """The opt-in path is bitwise deterministic, accurate, and accepted by torch's strict mode."""
+    _require_sm100()
+    compressor = _import_compressor()
+    kv, score, ape, cu, cuc, total_comp, go = _make_inputs(lens, d, ratio, coff)
+    r_fp32 = _run_eager(kv, score, ape, cu, cuc, total_comp, ratio, d, coff, go, mode="fp32")
+
+    prev_det = torch.are_deterministic_algorithms_enabled()
+    prev_warn = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(True, warn_only=False)
+    try:
+        runs = [
+            compressor.csa_compressor_backward_wrapper(
+                kv.view(kv.shape[0], -1),
+                score.view(score.shape[0], -1),
+                ape,
+                cu,
+                cuc,
+                go.view(total_comp, d),
+                ratio=ratio,
+                head_dim=d,
+                coff=coff,
+                deterministic=True,
+            )
+            for _ in range(3)
+        ]
+    finally:
+        torch.use_deterministic_algorithms(prev_det, warn_only=prev_warn)
+    torch.cuda.synchronize()
+
+    for other in runs[1:]:
+        assert torch.equal(runs[0]["grad_kv"], other["grad_kv"])
+        assert torch.equal(runs[0]["grad_score"], other["grad_score"])
+        assert torch.equal(runs[0]["grad_ape"], other["grad_ape"])
+    _assert_grads_vs_fp32(
+        runs[0]["grad_kv"].view_as(r_fp32[1]),
+        runs[0]["grad_score"].view_as(r_fp32[2]),
+        r_fp32[1],
+        r_fp32[2],
+        ratio,
+    )
+    assert (runs[0]["grad_ape"] - r_fp32[3]).abs().max().item() <= 1e-3
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("ratio,coff", [(4, 2), (128, 1)])
+def test_backward_deterministic_workspace_contract(ratio, coff):
+    """The class API requires honest caller-owned scratch and fully overwrites dAPE."""
+    _require_sm100()
+    compressor = _import_compressor()
+    d = 128
+    kv, score, ape, cu, cuc, total_comp, go = _make_inputs([1023, 509], d, ratio, coff)
+    total = kv.shape[0]
+    kv2, score2, go2 = kv.view(total, -1), score.view(total, -1), go.view(total_comp, d)
+    bwd = compressor.CSACompressorBackward(
+        sample_kv=kv2,
+        sample_score=score2,
+        sample_ape=ape,
+        sample_cu_seqlens=cu,
+        sample_cu_seqlens_comp=cuc,
+        sample_out=torch.empty(total_comp, d, dtype=torch.bfloat16, device="meta"),
+        ratio=ratio,
+        coff=coff,
+        deterministic=True,
+    )
+    assert bwd.check_support()
+    bwd.compile()
+    required = bwd.scratch_workspace_bytes()
+    assert required > 0 and required % 4 == 0
+
+    grad_kv = torch.empty_like(kv2)
+    grad_score = torch.empty_like(score2)
+    grad_ape = torch.full_like(ape, float("nan"))
+    with pytest.raises(ValueError, match="workspace is required"):
+        bwd.execute(kv2, score2, ape, cu, cuc, go2, grad_kv, grad_score, grad_ape)
+    with pytest.raises(ValueError, match="need"):
+        bwd.execute(
+            kv2,
+            score2,
+            ape,
+            cu,
+            cuc,
+            go2,
+            grad_kv,
+            grad_score,
+            grad_ape,
+            workspace=torch.empty(required - 1, dtype=torch.uint8, device="cuda"),
+        )
+    with pytest.raises(ValueError, match="contiguous uint8"):
+        bwd.execute(
+            kv2,
+            score2,
+            ape,
+            cu,
+            cuc,
+            go2,
+            grad_kv,
+            grad_score,
+            grad_ape,
+            workspace=torch.empty(1, dtype=torch.float32, device="cuda"),
+        )
+    with pytest.raises(ValueError, match="aligned"):
+        bwd.execute(
+            kv2,
+            score2,
+            ape,
+            cu,
+            cuc,
+            go2,
+            grad_kv,
+            grad_score,
+            grad_ape,
+            workspace=torch.empty(required + 1, dtype=torch.uint8, device="cuda")[1:],
+        )
+
+    workspace = torch.empty(required, dtype=torch.uint8, device="cuda")
+    bwd.execute(kv2, score2, ape, cu, cuc, go2, grad_kv, grad_score, grad_ape, workspace=workspace)
+    torch.cuda.synchronize()
+    assert not torch.isnan(grad_ape).any(), "deterministic reduction must overwrite every dAPE element"
+    first = grad_ape.clone()
+    grad_ape.fill_(float("nan"))
+    bwd.execute(kv2, score2, ape, cu, cuc, go2, grad_kv, grad_score, grad_ape, workspace=workspace)
+    torch.cuda.synchronize()
+    assert torch.equal(grad_ape, first)
+
+    # Reject overlap by byte range before any compiled consumer runs, but allow two
+    # disjoint slices of the same allocation (shared storage is not itself aliasing).
+    original_kernel = bwd._compiled_kernel
+    called = False
+
+    def fake_kernel(*_args):
+        nonlocal called
+        called = True
+
+    bwd._compiled_kernel = fake_kernel
+    ape_bytes = ape.numel() * ape.element_size()
+    alias_backing = torch.empty(required, dtype=torch.uint8, device="cuda")
+    alias_grad_ape = alias_backing[:ape_bytes].view(torch.float32).view_as(ape)
+    with pytest.raises(ValueError, match="must not overlap grad_ape"):
+        bwd.execute(kv2, score2, ape, cu, cuc, go2, grad_kv, grad_score, alias_grad_ape, workspace=alias_backing)
+    assert not called
+
+    disjoint_backing = torch.empty(required + ape_bytes, dtype=torch.uint8, device="cuda")
+    disjoint_grad_ape = disjoint_backing[required:].view(torch.float32).view_as(ape)
+    bwd.execute(
+        kv2,
+        score2,
+        ape,
+        cu,
+        cuc,
+        go2,
+        grad_kv,
+        grad_score,
+        disjoint_grad_ape,
+        workspace=disjoint_backing[:required],
+    )
+    assert called
+    bwd._compiled_kernel = original_kernel
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("lens", [[8], [2]], ids=["nonempty", "empty"])
+def test_backward_atomic_rejects_workspace_before_launch(monkeypatch, lens):
+    """An atomic plan rejects deterministic scratch before launch or stream recording."""
+    _require_sm100()
+    compressor = _import_compressor()
+    d, ratio, coff = 128, 4, 2
+    kv, score, ape, cu, cuc, total_comp, go = _make_inputs(lens, d, ratio, coff)
+    total = kv.shape[0]
+    kv2, score2, go2 = kv.view(total, -1), score.view(total, -1), go.view(total_comp, d)
+    bwd = compressor.CSACompressorBackward(
+        sample_kv=kv2,
+        sample_score=score2,
+        sample_ape=ape,
+        sample_cu_seqlens=cu,
+        sample_cu_seqlens_comp=cuc,
+        sample_out=torch.empty(total_comp, d, dtype=torch.bfloat16, device="meta"),
+        ratio=ratio,
+        coff=coff,
+        deterministic=False,
+    )
+    assert bwd.check_support()
+    calls = []
+    monkeypatch.setattr(bwd, "_compiled_kernel", lambda *_args: calls.append("kernel"))
+    monkeypatch.setattr(bwd, "_record_streams", lambda *_args: calls.append("record_streams"))
+
+    with pytest.raises(ValueError, match="atomic dAPE path"):
+        bwd.execute(
+            kv2,
+            score2,
+            ape,
+            cu,
+            cuc,
+            go2,
+            torch.empty_like(kv2),
+            torch.empty_like(score2),
+            torch.zeros_like(ape),
+            workspace=torch.empty(1, dtype=torch.uint8, device="cuda"),
+        )
+    assert calls == []
+
+
+@pytest.mark.L0
+@pytest.mark.filterwarnings("ignore::UserWarning")
+@pytest.mark.parametrize("ratio", [2, 4, 128])
+def test_backward_deterministic_cuda_graph_replay_overwrites_dape(ratio):
+    """Class-API graph replays overwrite dAPE; no external zero-fill is required."""
+    _require_sm100()
+    compressor = _import_compressor()
+    d, coff = 128, 2
+    kv, score, ape, cu, cuc, total_true, go = _make_inputs([1023, 509], d, ratio, coff)
+    total_comp = total_true + 8
+    go_capacity = torch.zeros(total_comp, 1, d, dtype=torch.bfloat16, device="cuda")
+    go_capacity[:total_true] = go
+    go = go_capacity
+    total = kv.shape[0]
+    kv2, score2, go2 = kv.view(total, -1), score.view(total, -1), go.view(total_comp, d)
+    bwd = compressor.CSACompressorBackward(
+        sample_kv=kv2,
+        sample_score=score2,
+        sample_ape=ape,
+        sample_cu_seqlens=cu,
+        sample_cu_seqlens_comp=cuc,
+        sample_out=torch.empty(total_comp, d, dtype=torch.bfloat16, device="meta"),
+        ratio=ratio,
+        coff=coff,
+        deterministic=True,
+    )
+    assert bwd.check_support()
+    bwd.compile()
+    workspace = torch.empty(bwd.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda")
+    grad_kv = torch.empty_like(kv2)
+    grad_score = torch.empty_like(score2)
+    grad_ape = torch.empty_like(ape)
+
+    bwd.execute(kv2, score2, ape, cu, cuc, go2, grad_kv, grad_score, grad_ape, workspace=workspace)
+    torch.cuda.synchronize()
+    reference = grad_ape.clone()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            bwd.execute(kv2, score2, ape, cu, cuc, go2, grad_kv, grad_score, grad_ape, workspace=workspace)
+        graph.replay()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(grad_ape, reference)
+    finally:
+        graph.reset()
+
+
+@pytest.mark.L0
+@pytest.mark.filterwarnings("ignore::UserWarning")
+def test_backward_deterministic_execute_allocates_nothing_and_never_synchronizes():
+    """Warm class execution uses only caller buffers and never blocks the host."""
+    _require_sm100()
+    compressor = _import_compressor()
+    d, ratio, coff = 128, 4, 2
+    kv, score, ape, cu, cuc, total_comp, go = _make_inputs([1023, 509], d, ratio, coff)
+    total = kv.shape[0]
+    kv2, score2, go2 = kv.view(total, -1), score.view(total, -1), go.view(total_comp, d)
+    bwd = compressor.CSACompressorBackward(
+        sample_kv=kv2,
+        sample_score=score2,
+        sample_ape=ape,
+        sample_cu_seqlens=cu,
+        sample_cu_seqlens_comp=cuc,
+        sample_out=torch.empty(total_comp, d, dtype=torch.bfloat16, device="meta"),
+        ratio=ratio,
+        coff=coff,
+        deterministic=True,
+    )
+    assert bwd.check_support()
+    bwd.compile()
+    workspace = torch.empty(bwd.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda")
+    grad_kv = torch.empty_like(kv2)
+    grad_score = torch.empty_like(score2)
+    grad_ape = torch.empty_like(ape)
+
+    def execute():
+        bwd.execute(kv2, score2, ape, cu, cuc, go2, grad_kv, grad_score, grad_ape, workspace=workspace)
+
+    execute()  # populate the cached CuTe-DSL launchers before accounting
+    torch.cuda.synchronize()
+    allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+    sync_debug_mode = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        for _ in range(3):
+            execute()
+    finally:
+        torch.cuda.set_sync_debug_mode(sync_debug_mode)
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+    assert torch.isfinite(grad_ape).all()
+
+
+@pytest.mark.L0
+@pytest.mark.filterwarnings("ignore::UserWarning")
+def test_backward_deterministic_wrapper_cuda_graph_retains_internal_workspace():
+    """Captured wrapper scratch survives local-reference release, GC, and allocator churn."""
+    _require_sm100()
+    compressor = _import_compressor()
+    d, ratio, coff = 128, 4, 2
+    kv, score, ape, cu, cuc, total_comp, go = _make_inputs([1023, 509], d, ratio, coff)
+    total = kv.shape[0]
+    kv2, score2, go2 = kv.view(total, -1), score.view(total, -1), go.view(total_comp, d)
+
+    def execute():
+        return compressor.csa_compressor_backward_wrapper(
+            kv2,
+            score2,
+            ape,
+            cu,
+            cuc,
+            go2,
+            ratio=ratio,
+            head_dim=d,
+            coff=coff,
+            deterministic=True,
+        )
+
+    expected = execute()  # compile and populate both cached launchers before capture
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            captured = execute()
+
+        # The wrapper's workspace is intentionally not returned. Prove that dropping
+        # its local owner cannot make the captured raw pointer available for reuse.
+        gc.collect()
+        junk = [torch.full((256 * 1024,), 0xA5, dtype=torch.uint8, device="cuda") for _ in range(8)]
+        graph.replay()
+        graph.replay()
+        torch.cuda.synchronize()
+        for name in ("grad_kv", "grad_score", "grad_ape"):
+            assert torch.equal(captured[name], expected[name])
+
+        # Replays must read current input storage, not values retained at capture.
+        go2.copy_(torch.randn_like(go2))
+        graph.replay()
+        torch.cuda.synchronize()
+        expected_changed = execute()
+        torch.cuda.synchronize()
+        for name in ("grad_kv", "grad_score", "grad_ape"):
+            assert torch.equal(captured[name], expected_changed[name])
+        assert junk  # retain churn allocations until every replay has completed
+    finally:
+        graph.reset()
 
 
 # ---------------------------------------------------------------------------

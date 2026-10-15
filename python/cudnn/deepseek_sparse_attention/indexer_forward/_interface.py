@@ -21,6 +21,11 @@ import cutlass.cute as cute
 
 from .indexer_fwd_sm100 import IndexerForwardSm100
 from .indexer_fwd_sm100_mxfp8 import IndexerForwardSm100Mxfp8
+from ._support import (
+    check_q_covered_by_k as _check_q_covered_by_k,
+    resolve_m_block_size as _resolve_m_block_size,
+    validate_qhead_per_kv_head as _validate_indexer_qhead_per_kv_head,
+)
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn._torch_stream import copy_into_on_stream
 from cudnn.deepseek_sparse_attention.utils.runtime import (
@@ -80,12 +85,6 @@ def _validate_thd_mxfp8_scale_contract(
             raise ValueError("q_scale/k_scale must be on the same device as q/k")
 
 
-def _validate_indexer_qhead_per_kv_head(qhead_per_kv_head: int, precision: str) -> None:
-    supported = (32, 64)
-    if qhead_per_kv_head not in supported:
-        raise ValueError(f"precision={precision!r} indexer requires " f"qhead_per_kv_head=32 or 64, got {qhead_per_kv_head}")
-
-
 # The score kernel binds ``out`` through a 16-byte-aligned dynamic layout, so
 # the fp32 row stride must be a multiple of 4 elements (and cover ceil4(S_k)).
 TMA_ALIGN_ELEMS = 4
@@ -106,6 +105,10 @@ def _validate_out_view(
         raise ValueError(f"out must be a float32 CUDA tensor on {device}, got {out.dtype} on {out.device}")
     if tuple(out.shape) != out_shape:
         raise ValueError(f"out must have shape {out_shape}, got {tuple(out.shape)}")
+    if seqlen_k_dim == 0:
+        # A query with no compressed key yet (fewer than ``ratio`` tokens: not one complete block, the geometry ``check_q_covered_by_k``
+        # admits): the empty ``out`` IS the result and has no row to stride, so the alignment rule below does not apply to it.
+        return
     strides = tuple(out.stride())
     if (
         strides[-1] != 1
@@ -493,8 +496,7 @@ def _indexer_fwd_bound(
         bs, seqlen_q_dim, n_heads_q, head_dim = q.shape
         _, seqlen_k_dim, n_heads_kv, _ = k.shape
         device = q.device
-        if seqlen_q_dim > seqlen_k_dim * ratio:
-            raise ValueError(f"seqlen_q ({seqlen_q_dim}) must be <= seqlen_k * ratio " f"({seqlen_k_dim * ratio})")
+        _check_q_covered_by_k(seqlen_q_dim, seqlen_k_dim, ratio)
         out_shape = (bs, seqlen_q_dim, seqlen_k_dim)
 
     if n_heads_kv != 1:
@@ -508,15 +510,8 @@ def _indexer_fwd_bound(
 
     q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(bs), q.device, stream=current_stream)
 
-    max_q_tokens_per_tile = 4 if head_dim == 128 and qhead_per_kv_head == 32 else 2
-    if precision == "bf16" and m_block_size // qhead_per_kv_head > max_q_tokens_per_tile:
-        if m_block_size == 128:
-            m_block_size = qhead_per_kv_head * 2
-        else:
-            raise ValueError(
-                f"SM100 indexer_fwd supports at most {max_q_tokens_per_tile} q tokens per tile; got "
-                f"m_block_size={m_block_size}, qhead_per_kv_head={qhead_per_kv_head}"
-            )
+    if precision == "bf16":
+        m_block_size = _resolve_m_block_size(m_block_size, qhead_per_kv_head, head_dim, compressed=False, path="SM100 indexer_fwd")
     if m_block_size % qhead_per_kv_head != 0:
         raise ValueError(f"m_block_size ({m_block_size}) must be divisible by " f"qhead_per_kv_head ({qhead_per_kv_head})")
 
@@ -561,6 +556,10 @@ def _indexer_fwd_bound(
             f"out[..., :{seqlen_k_dim}] (indexer_forward_wrapper allocates it for you)"
         )
     _validate_out_view(out, out_shape, seqlen_k_dim, device)
+    if seqlen_k_dim == 0:
+        # Nothing to score: the compressed-logits path returns its padded result (-1 indices, -inf logits) for this geometry and the dense
+        # path returns the empty scores -- no kernel compiled, nothing launched (a zero-key grid has no tile to run).
+        return out
 
     if precision == "mxfp8":
         assert q_scale is not None and k_scale is not None

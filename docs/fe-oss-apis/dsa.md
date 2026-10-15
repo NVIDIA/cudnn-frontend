@@ -352,7 +352,9 @@ compressed column 0.
     `lse_out`) to compute LSE in the same kernel invocation.
   - SM100 `precision="mxfp8"`: Q/K use E4M3 with block-scaled, packed E8M0
     scale tensors; `sf_vec_size` is currently fixed at 32 and
-    `qhead_per_kv_head ∈ {32, 64}`.
+    `qhead_per_kv_head ∈ {4, 8, 16, 32, 64}` (the tile is always 128 packed
+    rows -- the scale atom -- so a 4-head group packs 32 query tokens per
+    tile; all-ones scale blobs make it a plain E4M3 x E4M3 scorer).
     THD inputs additionally require
     `cu_seqlens_q_scale_padded`/`cu_seqlens_k_scale_padded`: contiguous CUDA
     INT32 prefix tensors of shape `(B + 1,)` on the Q/K device. The interface
@@ -365,8 +367,13 @@ compressed column 0.
 - **Constraints** — `head_dim == 128`. The SM90 direct path supports
   `qhead_per_kv_head ∈ {16, 32, 64}` and currently requires `H_kv == 1`;
   SM100 BF16 dense and combined Top-K paths support
-  `qhead_per_kv_head ∈ {32, 64}`, as do their MXFP8 paths. All currently
-  require `H_kv == 1` (MQA).
+  `qhead_per_kv_head ∈ {4, 8, 16, 32, 64}` (a group packs up to 8 query
+  tokens per MMA tile: 4 heads x 8 tokens = 32 columns, ..., 64 heads x 2
+  tokens = 128), their MXFP8 paths the same set at a fixed 128-row tile
+  (4 heads x 32 tokens, ..., 64 heads x 2 tokens). All currently require
+  `H_kv == 1` (MQA). A query may be up to `ratio - 1` tokens longer than
+  `ratio * seqlen_k` (its trailing tokens have not completed a compressed
+  block and score the complete blocks only); a longer one is refused.
 
 ```python
 result = DSA.indexer_forward_wrapper(
@@ -452,21 +459,39 @@ with variable per-row effective length.
   consumed, so no values output buffer is allocated or written.
 - **Tie policy** — `tie_break=0` (default) permits arbitrary cutoff ties;
   `1` prefers smaller source-column indices and `2` prefers larger indices.
-  The selected set follows this policy, but output order remains unspecified.
+  The selected set follows this policy. When `deterministic=False`, output
+  order remains unspecified.
   Ties use equal radix keys: `+0` ranks before `-0`, as in the existing kernel;
-  NaN ordering is unspecified. The policy matches FlashInfer/CCCL unsorted
-  Top-K selection and applies only to this standalone API.
+  NaN ordering is unspecified. The policy applies only to this standalone API.
+- **Deterministic mode** — `deterministic=True` makes the selected set and
+  output slots repeatable. With the default `tie_break=0`, smaller source
+  indices win a cutoff tie. The returned local indices are canonicalized in
+  ascending order, carrying values with them. Selection and canonicalization
+  are fused into this CuTe DSL kernel rather than launching a separate finalize
+  kernel.
 - **Cost** — nonzero tie policies scan source columns inside the selection
   kernel only when equal cutoff keys compete for the remaining slots. The
-  scan stops once enough ties are found; no extra kernel, device allocation,
-  or host synchronization is introduced. The default specialization retains
-  the existing selection path.
-- **Constraints** — SM90+, `0 < top_k ≤ 2048`
+  scan stops once enough ties are found. Deterministic mode additionally sorts
+  the selected indices in CTA shared memory. The compiled specialization
+  chooses between an index-bitmap scan and an in-place bitonic sort according
+  to the target architecture and shape; on SM100, `top_k < 256` uses bitonic
+  ordering directly. Neither path adds a kernel, device allocation, or host
+  synchronization; the default specialization retains the existing selection
+  path.
+- **Constraints** — SM90+, `0 < top_k ≤ 2048`, nonzero row/column/batch
+  extents, and `next_n > 0`. `seq_lens` is contiguous INT32 on the input CUDA
+  device, and every entry must be in `[0, num_cols]`; the device-resident
+  values are not copied to the host for validation. On SM120,
+  `deterministic=True` supports at most 16,384 columns for FP32 and 32,768
+  columns for FP16/BF16 because of the 99 KiB per-block shared-memory limit;
+  `check_support()` rejects larger deterministic shapes before compilation.
 
 ```python
 result = DSA.indexer_top_k_wrapper(
     scores.reshape(-1, scores.shape[-1]),
-    seq_lens, top_k=512, tie_break=2,  # prefer later columns on ties
+    seq_lens,
+    top_k=512,
+    deterministic=True,
 )
 indices, values = result["indices"], result["values"]
 ```
@@ -480,10 +505,15 @@ device. `out_values` is required when the object was built with
 `workspace`, a CUDA `uint8` tensor of at least `scratch_workspace_bytes()` bytes
 (`n_rows * (2 for FP32, else 1) * num_cols * 4`, rounded up to 128) that is
 32-byte aligned; an absent or undersized workspace raises before launch.
+The writable `out_indices`, optional `out_values`, and carved scratch byte
+ranges must not overlap one another or the read-only inputs. Disjoint views of
+the same backing allocation are valid. The class API also requires a 32-byte
+aligned input base; the eager wrapper copies a contiguous storage-offset view
+when needed to satisfy this alignment.
 `compile()` builds the kernel from fake tensors and allocates nothing.
 `indexer_top_k_wrapper` allocates the outputs and the workspace per call on the
-launch stream. Rows the `next_n` stagger leaves empty receive no writes, so
-`out_indices` keeps whatever the caller stored there.
+launch stream. Rows the `next_n` stagger leaves empty are canonicalized to
+`-1` indices and `-inf` values.
 
 #### Compact vs. non-compact sparse indices
 
@@ -875,13 +905,13 @@ result = DSA.dense_indexer_backward_wrapper(
   descriptor; the issued data movement remains hardware TMA `gather4`.
 - **Indexer Forward only supports `head_dim = 128`**. SM90 supports
   `qhead_per_kv_head ∈ {16, 32, 64}` with `H_kv = 1`; SM100 BF16 and MXFP8
-  support `qhead_per_kv_head ∈ {32, 64}`. Both the dense and combined Top-K
-  paths require `H_kv = 1`.
+  support `qhead_per_kv_head ∈ {4, 8, 16, 32, 64}`. Both the dense and
+  combined Top-K paths require `H_kv = 1`.
 - **Standalone Top-K only up to 2048**; `top_k > 2048` is not supported by
   its radix Top-K kernel. The combined compressed path uses a separate stage-2
   implementation.
 - **Compressed-path limits** — the stage-1 compact score kernel is MQA-only
-  (`H_kv = 1`); MXFP8 requires `qhead_per_kv_head ∈ {32, 64}`; explicit
+  (`H_kv = 1`); MXFP8 keeps its 128-row tile for every head group; explicit
   microbatching cannot be combined with MXFP8, LSE, or explicit per-batch
   causal offsets.
 

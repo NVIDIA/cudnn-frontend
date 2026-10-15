@@ -66,9 +66,12 @@ else()
     find_package(nanobind CONFIG REQUIRED)
 endif()
 
+# Header-only frontend logic is compiled here too; preserve the project's
+# optimization level instead of nanobind's default size optimization.
 nanobind_add_module(
     _compiled_module
     ${binding_options}
+    NOMINSIZE
 
     pycudnn.cpp
     gnn.cpp

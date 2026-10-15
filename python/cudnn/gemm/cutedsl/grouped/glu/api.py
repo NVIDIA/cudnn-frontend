@@ -30,7 +30,7 @@ from ..backend_utils import (
     select_grouped_gemm_backend,
     wrapper_operand_meta,
 )
-from ..canonical import check_canonical_contiguous, check_packed_sf, is_canonical_b, is_flat_sf
+from ..canonical import b_nkl, check_canonical_contiguous, check_packed_sf, is_canonical_b, is_flat_sf
 from ..moe_utils import MoEWeightMode
 from ..scheduler_counter import validate_scheduler_counter
 from cuda.bindings import driver as cuda
@@ -1032,8 +1032,10 @@ def _normalize_glu_call(call: GluCall) -> tuple[GluCall, GroupedGemmBackend]:
     if backend is GroupedGemmBackend.BLOCK_SCALED:
         return normalized, backend
 
-    if len(a_shape) == 2 or is_canonical_b(call.b_tensor):
-        raise ValueError("Canonical layouts require the block-scaled GLU backend")
+    if detect_framework(call.a_tensor) == "torch":
+        check_canonical_contiguous(call.a_tensor, call.b_tensor, call.prob_tensor)
+    elif len(a_shape) == 2:
+        raise ValueError("Canonical BF16 layouts require torch tensors")
     if call.use_single_group_runtime_offsets:
         raise ValueError("use_single_group_runtime_offsets is supported only by the block-scaled kernel")
     if call.prob_tensor is None:
@@ -1052,8 +1054,8 @@ def _normalize_glu_call(call: GluCall) -> tuple[GluCall, GroupedGemmBackend]:
         raise ValueError(f"a_tensor M dimension must be 256-aligned, got {valid_m}")
     if n_full <= 0 or n_full % 64 != 0:
         raise ValueError(f"N must be positive and divisible by 64, got {n_full}")
-    if get_shape(call.prob_tensor) != (valid_m, 1, 1):
-        raise ValueError(f"prob_tensor must have shape {(valid_m, 1, 1)}, got " f"{get_shape(call.prob_tensor)}")
+    if get_shape(call.prob_tensor) not in ((valid_m,), (valid_m, 1, 1)):
+        raise ValueError(f"prob_tensor must have shape {(valid_m,)} or {(valid_m, 1, 1)}, got " f"{get_shape(call.prob_tensor)}")
     if call.bias_tensor is not None and get_shape(call.bias_tensor) != (
         n_full,
         num_experts,
@@ -1119,18 +1121,20 @@ def _glu_tensor_signature(tensor: Optional[torch.Tensor], *, dynamic_m: bool = F
 
 def _grouped_gemm_glu_bf16_call(call: GluCall, memo_key: Optional[tuple] = None) -> TupleDict:
     framework = detect_framework(call.a_tensor)
-    valid_m, k, _ = get_shape(call.a_tensor)
+    a_shape = get_shape(call.a_tensor)
+    valid_m = a_shape[0]
     if call.weight_mode == MoEWeightMode.DENSE:
-        n_full = get_shape(call.b_tensor)[0]
+        n_full = b_nkl(call.b_tensor)[0]
     else:
         n_full = call.n
     n_out = n_full // 2
+    canonical = len(a_shape) == 2
 
-    def _allocate_output(shape, stride, dtype):
-        return _glu_allocate_output(framework, shape, stride, dtype, call.a_tensor.device)
+    def _allocate_output(cols, dtype):
+        return _glu_allocate_output(framework, *row_major_layout(valid_m, cols, canonical), dtype, call.a_tensor.device)
 
-    c_tensor = _allocate_output((valid_m, n_full, 1), (n_full, 1, valid_m * n_full), call.c_dtype)
-    d_tensor = _allocate_output((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), call.d_dtype)
+    c_tensor = _allocate_output(n_full, call.c_dtype)
+    d_tensor = _allocate_output(n_out, call.d_dtype)
 
     overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
     workspace_bytes = (128 * call.num_experts if call.weight_mode == MoEWeightMode.DISCRETE else 0) + (4 if call.use_dynamic_sched else 0)
@@ -1285,7 +1289,7 @@ def grouped_gemm_glu_wrapper_sm100(
     Block-scaled inputs also accept row-major A (m, k), B (experts, n, k),
     prob (m,), and contiguous SFA/SFB buffers containing already MMA-packed bytes.
     A 2-D A selects 2-D C/D/D_col and physical contiguous 6-D SFD outputs.
-    BF16 inputs retain the legacy layout contract.
+    BF16 torch inputs accept the same A, B, and prob layouts.
     Canonical MXFP8 JAX arrays and tracers (dense b_tensor with sfa_tensor)
     dispatch to grouped_gemm_glu_jax_sm100, including under jax.jit. Set
     sf_vec_size=32 and an explicit FP8 d_dtype; unsupported options raise.
@@ -1384,8 +1388,9 @@ def grouped_gemm_glu_wrapper_sm100(
     memo = _glu_wrapper_memo.get(memo_key)
     if memo is not None and memo[0].backend is GroupedGemmBackend.BF16:
         api, framework, valid_m, n_full, n_out, memo_c_dtype, memo_d_dtype = memo
-        c_out = _glu_allocate_output(framework, (valid_m, n_full, 1), (n_full, 1, valid_m * n_full), memo_c_dtype, a_tensor.device)
-        d_out = _glu_allocate_output(framework, (valid_m, n_out, 1), (n_out, 1, valid_m * n_out), memo_d_dtype, a_tensor.device)
+        canonical = len(get_shape(a_tensor)) == 2
+        c_out = _glu_allocate_output(framework, *row_major_layout(valid_m, n_full, canonical), memo_c_dtype, a_tensor.device)
+        d_out = _glu_allocate_output(framework, *row_major_layout(valid_m, n_out, canonical), memo_d_dtype, a_tensor.device)
         api.execute(
             a_tensor=a_tensor,
             c_tensor=c_out,
@@ -1504,6 +1509,7 @@ def grouped_gemm_glu_wrapper_sm100(
 
 
 grouped_gemm_glu_wrapper_sm100.supports_canonical_layouts = True
+grouped_gemm_glu_wrapper_sm100.supports_bf16_canonical_layouts = True
 
 
 __all__ = ["GluCall", "GroupedGemmGluSm100", "grouped_gemm_glu_wrapper_sm100"]

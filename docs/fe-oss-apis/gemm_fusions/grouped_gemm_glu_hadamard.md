@@ -39,6 +39,15 @@ This kernel performs:
 
 `L` is the expert count and `valid_m = padded_offsets[-1]`.
 
+### Canonical layouts
+
+The wrapper and API class also accept contiguous `A` `(valid_m, K)`, dense `B`
+`(L, N, K)`, and `prob` `(valid_m,)` with `torch.float4_e2m1fn_x2` operands. Scale
+buffers may be contiguous tensors of any rank, provided their bytes are already
+packed in the required MMA-tiled physical order. With 2-D `A`, the wrapper returns
+`C` `(valid_m, N)` and a 2-D `D`. Legacy layouts are unchanged. The wrapper
+advertises `supports_canonical_layouts`.
+
 ### Equations
 
 For rows belonging to expert `g`:

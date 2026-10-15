@@ -43,6 +43,15 @@ The arms (``ARMS``; ``Arm`` spells the recipe knobs):
   ``calib_fwd`` / ``calib_bwd`` in its row.  The lagged recipe saturates silently where an activation's amax grows into the top of
   its band, so the harness COUNTS it: ``sat_x = amax_x(t) * scale_x(t) > 448`` and ``n_clip_x`` = the clipped-element count, per step,
   layer and tensor -- reported, never asserted.
+* ``fp8-static-unit`` / ``fp8-delayed16`` / ``fp8-recal1-margin2`` -- the fp8 recipe variants: unit activation scales (the descales
+  of ``h`` / the weights still current), a 16-step amax history on the activations and the gradients (``grad_scaling="delayed"``, the
+  caller's scales), and the "current" recipe at two octaves of gradient-scale headroom on both sides of the record.
+* ``mxfp8+w4`` / ``mxfp8+nvfp4o`` / ``mxfp8+mxfp4o`` / ``mxfp8+w4+nvfp4o`` -- the fp4 weight modes on the MXFP8 pipeline: an MXFP4
+  ``W_qkvg`` (``MxQuantSpec(w_qkvg_dtype=float4_e2m1fn_x2)``) and / or an fp4 gated O with an fp4 ``W_o`` of the same format
+  (``MxQuantSpec(o_fp4=)``), the master weights re-quantized every step row-wise for the forward and column-wise for the dgrad
+  artifacts (``w_qkvg_t`` / ``w_o_t`` + blobs); the row carries their code statistics every ``fp4_stats_every`` steps (``fp4_stats``:
+  the e2m1 zero / saturated shares of the transposed weights and, under an NVFP4 ``W_o``, of the host twin of the backward's
+  two-level ``dy4`` cast plus the share of its all-zero 16-blocks).
 * ``torch-bf16`` -- the pure-torch reference block (``gated_attention_block_reference``) under autograd: the control.
 
 The ``delayed`` recipe (``Arm(grad_scaling="delayed")``) hands the backward the caller's ``scale_dy / scale_do / scale_dqkvg``
@@ -71,17 +80,30 @@ harness VERSION at identical numerics (a new recipe knob = a new digest): a comp
 compares ``grad_sha256`` and the numeric keys -- every row key minus ``NUMERIC_COMPARE_IGNORE`` -- never the digest alone.  Nothing
 here is a performance number: ``wall_ms`` is informational.
 
-Data: ``SyntheticTokens`` -- a copy task (``S / 2`` random tokens followed by their copy: the second half is predictable through
+Data: ``TokenWindows`` -- a uint16 token file (a GPT-2 BPE stream with EOT between documents): windows of ``seq_len + 1`` tokens whose
+starts are a FIXED permutation of the non-overlapping windows drawn once from a CPU generator and consumed in order (exhaustion is an
+error, never a silent repeat; the file's sha256 is the dataset's pin); ``ValidationWindows`` -- the first ``n_windows`` windows of a
+token file, scored every ``val_every`` steps and at the last step with the arm's OWN forward (``val_loss`` in the row, inside the
+digest).  Or ``SyntheticTokens`` -- a copy task (``S / 2`` random tokens followed by their copy: the second half is predictable through
 attention only, so the loss on it falls from ``ln V`` toward 0 as the block learns induction) and a second-order Markov chain with a
 fixed random transition rule (``next = (a * prev + b * prev2 + offset[k]) mod V``, ``k`` drawn from a fixed distribution ``p``) whose
 conditional entropy ``H(p)`` is the analytic loss floor, mixed 1:1 per batch over a 4096 vocabulary.  ``loss_floor_nats`` gives the
 batch's floor.
+
+The tethered gradient-fidelity evaluation: ``ConvergenceRun(model=<another run's decoder>)`` shares that run's fp32 masters;
+``grads_on(inp, tgt, params)`` runs this arm's forward + backward on them at NO-LAG scales (a calibration forward on the batch for the
+fp8 activation scales, the step-0 bootstrap ladder for ``scale_dp`` and the delayed recipe's scales) without an update, and
+``tethered_rows`` compares the result with the reference run's gradients (per-layer cosines and norm ratios of ``dh`` / ``dw_qkvg`` /
+``dw_o``, the whole-master-gradient cosine) -- driven from the reference run's ``on_grads`` hook, called after its backward and
+readback and before its clipping and update.
 
 CLI::
 
     python gated_block_train.py --arm fp8-recal1 --geometry smoke --steps 300 --seed 0 --out <dir> [--name <run>] [--replica 1]
                                 [--grad-scaling delayed --grad-window 16] [--margin-log2 2] [--bwd-knobs fuse_gate_bwd,fuse_wgrad_overlap]
                                 [--replay-scales-from <jsonl of a "current" run>] [--act-window 1] [--dp-scale-rule amax|helper] [--dp-margin-log2 4]
+                                [--tokens train.bin --tokens-sha256 <sha> --max-windows N] [--val-tokens val.bin --val-windows 64 --val-every 500]
+                                [--fp4-stats-every 10] [--log-every 50] [--grad-hash-every 10]
 
 prints the imported ``cudnn`` module and the device, one line per step, and the median ms per step over steps >= 1 (host-bound;
 informational), and writes ``<out>/<name>.jsonl`` + ``<out>/<name>.manifest.json``.  The quantized arms need the Rubin (compute
@@ -128,8 +150,16 @@ from cudnn.gated_attention_block import (  # noqa: E402
     SavedForBackward,
     saved_slab_views,
 )
+from cudnn.gated_attention_block.api import Fp4Format  # noqa: E402
 from cudnn.gated_attention_block.kernels.quantize import grad_scale_from_amax  # noqa: E402
-from gated_block_reference import RefGeometry, build_rope_tables, gated_attention_block_reference, quant_e4m3, quantize_block_inputs_mxfp8  # noqa: E402
+from gated_block_reference import (  # noqa: E402
+    RefGeometry,
+    build_rope_tables,
+    fp4_quantize_rowwise_2d,
+    gated_attention_block_reference,
+    quant_e4m3,
+    quantize_block_inputs_mxfp8,
+)
 from sdpa.helpers import get_fp8_scale_factor  # noqa: E402
 
 __all__ = [
@@ -138,6 +168,7 @@ __all__ = [
     "ConvergenceRun",
     "DETERMINISTIC_CUBLAS_CONFIGS",
     "E4M3_MAX",
+    "FP4_FORMATS",
     "GEOMETRIES",
     "GatedBlockFn",
     "NONDET_KEYS",
@@ -145,18 +176,26 @@ __all__ = [
     "ROW_META_KEYS",
     "RunResult",
     "SyntheticTokens",
+    "TIER_A",
+    "TIER_B",
+    "TokenWindows",
     "ToyDecoder",
     "TrainConfig",
     "TrainGeometry",
+    "ValidationWindows",
     "canonical_json",
+    "cosine",
     "row_digest",
     "run_digest",
     "run_training",
+    "tethered_rows",
 ]
 
 E4M3_MAX = 448.0
 _E4M3 = torch.float8_e4m3fn
+_FP4X2 = torch.float4_e2m1fn_x2
 _BF16 = torch.bfloat16
+FP4_FORMATS = ("nvfp4", "mxfp4")  # Arm.o_fp4: the two fp4 O / W_o formats of MxQuantSpec.o_fp4 (Fp4Format.NVFP4 / MXFP4)
 NONDET_KEYS = frozenset({"wall_ms", "timestamp", "host", "pid"})
 ROW_META_KEYS = frozenset({"replica"})  # written into the row AFTER the digest, like the NONDET keys: two replicas of one seed digest equal
 # The digest is keyed to the harness VERSION as well as to the numerics: ``recipe`` (the arm's knobs, which grow with the harness) sits
@@ -169,6 +208,12 @@ _GRAD_NAMES = ("dh", "dw_qkvg", "dw_o", "dw_q_norm", "dw_k_norm")
 _FP8_GRAD_SCALES = ("scale_dy", "scale_do", "scale_dqkvg")
 _MX_GRAD_SCALES = ("scale_dy",)
 _MX_ARTIFACTS = ("h_t", "h_t_sf", "w_qkvg_t", "w_qkvg_t_sf")
+_FP4_O_ARTIFACTS = ("w_o_t", "w_o_t_sf")  # the fp4 W_o modes' two backward artifacts (appended after the MXFP8 four)
+# The fp4 arms' code statistics (the dynamic-range floor of a 4-bit operand): the share of e2m1 codes at 0 and at +-6 in the
+# re-quantized transposed weights, and -- under an NVFP4 W_o -- in the two-level NVFP4 cast of scale_dy x dY (the host twin of the
+# backward's own cast, bitwise the test tree's oracle) plus the share of its 16-blocks that are all zero.
+_FP4_STAT_KEYS = ("w_qkvg_t_zero", "w_qkvg_t_sat", "w_o_t_zero", "w_o_t_sat", "dy4_zero_blocks", "dy4_zero", "dy4_sat")
+_TETHER_GRADS = ("dh", "dw_qkvg", "dw_o")
 _BWD_KNOBS = ("fuse_gate_bwd", "fuse_wgrad_overlap")
 # The per-layer METRICS tensor (device fp32, one per layer, read back ONCE per step): the activation amax and clipped-element counts
 # of the forward's record (fp8 arms) and the fp32 norms of the five block gradients.
@@ -221,6 +266,8 @@ GEOMETRIES = {
     # the accept suites' head geometry at two model sizes; both satisfy the quantized backward's rules (d_model % 256 == 0, T % 32 == 0)
     "smoke": TrainGeometry(d_model=512, h_q=8, h_kv=2, d_head=256, rope_dim=64, n_layers=2, batch=2, seq_len=1024, vocab=4096),
     "headline": TrainGeometry(d_model=1024, h_q=8, h_kv=2, d_head=256, rope_dim=64, n_layers=4, batch=4, seq_len=2048, vocab=50304),
+    # the smoke model over a GPT-2 BPE token stream (the real-text smoke: the vocabulary of the headline, the model of the smoke)
+    "smoke_text": TrainGeometry(d_model=512, h_q=8, h_kv=2, d_head=256, rope_dim=64, n_layers=2, batch=2, seq_len=1024, vocab=50304),
 }
 
 
@@ -261,7 +308,10 @@ class Arm:
     step's ``scale_dp`` follows this step's ``amax_dp`` -- ``"amax"`` = ``grad_scale_from_amax(amax_dp, dp_margin_log2)`` (the kernels'
     rule: the LAGGED product ``amax_dp(t) * scale_dp(t + 1)`` in ``(448 / 2**(m+1), 448 / 2**m]`` by construction; the same-step
     ``amax_dp(t + 1) * scale_dp(t + 1)`` is off it by the step's amax growth and only reported), ``"helper"`` = the SDPA suites'
-    ``get_fp8_scale_factor`` (a 512 cap below ``amax_dp = 0.0625``)."""
+    ``get_fp8_scale_factor`` (a 512 cap below ``amax_dp = 0.0625``).  ``w_qkvg_fp4`` / ``o_fp4`` (MXFP8 family only): the fp4 weight
+    modes -- an MXFP4 ``W_qkvg`` (``MxQuantSpec(w_qkvg_dtype=float4_e2m1fn_x2)``, the mixed e4m3 x e2m1 projection) and an fp4 gated O
+    with an fp4 ``W_o`` of the same format (``MxQuantSpec(o_fp4=)``, ``"nvfp4"`` = e4m3 scales per 16, ``"mxfp4"`` = E8M0 per 32); the
+    harness re-quantizes the master weights every step, row-wise for the forward and column-wise for the dgrad artifacts."""
 
     name: str
     family: Optional[str]
@@ -272,6 +322,8 @@ class Arm:
     bwd_knobs: Tuple[str, ...] = ()
     dp_scale_rule: str = "amax"
     dp_margin_log2: int = 4
+    w_qkvg_fp4: bool = False
+    o_fp4: Optional[str] = None
 
     def __post_init__(self):
         if self.family not in (None, "fp8", "mxfp8", "torch", "torch_fn"):
@@ -288,6 +340,10 @@ class Arm:
             raise ValueError(f"{self.name}: the torch reference has no backward knobs")
         if self.dp_scale_rule not in ("amax", "helper") or not (0 <= self.dp_margin_log2 <= 8):
             raise ValueError(f"{self.name}: dp_scale_rule must be 'amax' or 'helper' and dp_margin_log2 in [0, 8]")
+        if self.o_fp4 is not None and self.o_fp4 not in FP4_FORMATS:
+            raise ValueError(f"{self.name}: o_fp4 must be one of {FP4_FORMATS} or None, got {self.o_fp4!r}")
+        if (self.w_qkvg_fp4 or self.o_fp4 is not None) and self.family != "mxfp8":
+            raise ValueError(f"{self.name}: the fp4 weight modes ride the MXFP8 pipeline (family 'mxfp8'), got family {self.family!r}")
 
     @property
     def quantized(self) -> bool:
@@ -296,6 +352,14 @@ class Arm:
     @property
     def uses_block(self) -> bool:
         return self.family in (None, "fp8", "mxfp8")
+
+    @property
+    def fp4(self) -> bool:
+        return self.w_qkvg_fp4 or self.o_fp4 is not None
+
+    @property
+    def o_fp4_format(self) -> Optional[Fp4Format]:
+        return None if self.o_fp4 is None else Fp4Format[self.o_fp4.upper()]
 
     @property
     def grad_scale_names(self) -> Tuple[str, ...]:
@@ -312,9 +376,23 @@ ARMS = {
     "bf16": Arm("bf16", None),
     "mxfp8": Arm("mxfp8", "mxfp8"),
     "fp8-recal1": Arm("fp8-recal1", "fp8", act_window=1),
+    # the fp8 recipe variants: unit activation scales (descales still current), a 16-step amax history on the activations and the
+    # gradients (the delayed recipe), and the "current" recipe at two octaves of gradient-scale headroom
+    "fp8-static-unit": Arm("fp8-static-unit", "fp8", act_window=0),
+    "fp8-delayed16": Arm("fp8-delayed16", "fp8", grad_scaling="delayed", grad_window=16, act_window=16),
+    "fp8-recal1-margin2": Arm("fp8-recal1-margin2", "fp8", act_window=1, margin_log2=2),
+    # the fp4 weight modes on the MXFP8 pipeline
+    "mxfp8+w4": Arm("mxfp8+w4", "mxfp8", w_qkvg_fp4=True),
+    "mxfp8+nvfp4o": Arm("mxfp8+nvfp4o", "mxfp8", o_fp4="nvfp4"),
+    "mxfp8+mxfp4o": Arm("mxfp8+mxfp4o", "mxfp8", o_fp4="mxfp4"),
+    "mxfp8+w4+nvfp4o": Arm("mxfp8+w4+nvfp4o", "mxfp8", w_qkvg_fp4=True, o_fp4="nvfp4"),
     "torch-bf16": Arm("torch-bf16", "torch"),
     "torch-bf16-fn": Arm("torch-bf16-fn", "torch_fn"),
 }
+# The trajectory arms of the convergence study: Tier A = the reference, the headline fp8 recipe, MXFP8 and the four fp4 weight modes;
+# Tier B = the fp8 recipe variants (what recalibration buys, the delayed history, the margin A/B).
+TIER_A = ("bf16", "fp8-recal1", "mxfp8", "mxfp8+w4", "mxfp8+nvfp4o", "mxfp8+mxfp4o", "mxfp8+w4+nvfp4o")
+TIER_B = ("fp8-static-unit", "fp8-delayed16", "fp8-recal1-margin2")
 
 
 # ---------------------------------------------------------------------------
@@ -399,6 +477,85 @@ class SyntheticTokens:
         return dict(
             kind="synthetic", seed=self.seed, vocab=self.geom.vocab, markov_entropy_nats=self.markov_entropy_nats, loss_floor_nats=self.loss_floor_nats()
         )
+
+
+def _read_token_file(path: str) -> Tuple[torch.Tensor, str]:
+    """A little-endian uint16 token file -> (the ``uint16`` tensor over its bytes, the sha256 of the bytes -- the dataset's pin)."""
+    with open(path, "rb") as f:
+        raw = f.read()
+    return torch.frombuffer(bytearray(raw), dtype=torch.uint16), hashlib.sha256(raw).hexdigest()
+
+
+class TokenWindows:
+    """Batches of ``[batch, seq_len + 1]`` token ids from a uint16 token file (a GPT-2 BPE stream, EOT between documents): the
+    window starts are a FIXED permutation of the non-overlapping ``seq_len``-strided windows, drawn once from a CPU generator
+    (``seed``) and consumed in order, so no window repeats before the stream is exhausted (``RuntimeError`` then -- never a
+    silent wrap).  ``sha256`` (optional) is checked against the file's bytes: the dataset's pin, recorded in the manifest."""
+
+    def __init__(self, geom: TrainGeometry, seed: int, path: str, *, sha256: Optional[str] = None, max_windows: Optional[int] = None):
+        self.geom, self.seed, self.path = geom, seed, path
+        self.tokens, self.sha256 = _read_token_file(path)
+        if sha256 is not None and sha256 != self.sha256:
+            raise ValueError(f"{path}: sha256 {self.sha256} differs from the expected {sha256}")
+        self.n_tokens = int(self.tokens.numel())
+        vmax = int(self.tokens.to(torch.int32).max())
+        if vmax >= geom.vocab:
+            raise ValueError(f"{path}: token id {vmax} is outside the model's vocabulary of {geom.vocab}")
+        s = geom.seq_len
+        self.n_windows = (self.n_tokens - 1) // s
+        if max_windows is not None:
+            self.n_windows = min(self.n_windows, int(max_windows))
+        if self.n_windows < geom.batch:
+            raise ValueError(f"{path}: {self.n_windows} windows of {s + 1} tokens cannot fill a batch of {geom.batch}")
+        self.perm = torch.randperm(self.n_windows, generator=torch.Generator().manual_seed(seed))
+        self.n_drawn = 0
+
+    def batch(self) -> torch.Tensor:
+        b, s = self.geom.batch, self.geom.seq_len
+        i0 = self.n_drawn * b
+        if i0 + b > self.n_windows:
+            raise RuntimeError(f"{self.path}: the token stream is exhausted after {self.n_drawn} batches ({self.n_windows} windows, batch {b})")
+        rows = [self.tokens[int(w) * s : int(w) * s + s + 1].to(torch.int64) for w in self.perm[i0 : i0 + b]]
+        self.n_drawn += 1
+        return torch.stack(rows)
+
+    def loss_floor_nats(self) -> Optional[float]:
+        return None  # natural text has no analytic floor
+
+    def as_dict(self) -> dict:
+        return dict(
+            kind="tokens",
+            file=os.path.basename(self.path),
+            sha256=self.sha256,
+            n_tokens=self.n_tokens,
+            n_windows=self.n_windows,
+            seed=self.seed,
+            stride=self.geom.seq_len,
+        )
+
+
+class ValidationWindows:
+    """The FIRST ``n_windows`` non-overlapping windows of a token file (no permutation, no seed) in ``geom.batch``-sized batches:
+    every arm's own forward is scored on the same held-out tokens."""
+
+    def __init__(self, geom: TrainGeometry, path: str, *, n_windows: int = 64, sha256: Optional[str] = None):
+        self.geom, self.path, self.n_windows = geom, path, int(n_windows)
+        tokens, self.sha256 = _read_token_file(path)
+        if sha256 is not None and sha256 != self.sha256:
+            raise ValueError(f"{path}: sha256 {self.sha256} differs from the expected {sha256}")
+        vmax = int(tokens.to(torch.int32).max()) if tokens.numel() else -1  # the same check as TokenWindows: the file is this model's stream
+        if vmax >= geom.vocab:
+            raise ValueError(f"{path}: token id {vmax} is outside the model's vocabulary of {geom.vocab}")
+        b, s = geom.batch, geom.seq_len
+        available = (int(tokens.numel()) - 1) // s
+        if self.n_windows < b or self.n_windows > available or self.n_windows % b:
+            raise ValueError(
+                f"{path}: {self.n_windows} validation windows requested, {available} available; the count is at least one batch of {b} and a multiple of it"
+            )
+        self.batches = [torch.stack([tokens[w * s : w * s + s + 1].to(torch.int64) for w in range(i, i + b)]) for i in range(0, self.n_windows, b)]
+
+    def as_dict(self) -> dict:
+        return dict(kind="tokens", file=os.path.basename(self.path), sha256=self.sha256, n_windows=self.n_windows, tokens=self.n_windows * self.geom.seq_len)
 
 
 # ---------------------------------------------------------------------------
@@ -513,6 +670,7 @@ class _LayerState:
         self.inputs: dict = {}
         self.saved: Optional[SavedForBackward] = None
         self.act_scales: Dict[str, float] = {}
+        self.dy_ref: Optional[torch.Tensor] = None  # this step's incoming dY (the fp4 statistics' host twin of the backward's dY cast)
 
     def record(self, h: torch.Tensor) -> SavedForBackward:
         return SavedForBackward(
@@ -545,7 +703,24 @@ class ConvergenceRun:
         name: Optional[str] = None,
         scale_feed: Optional[Callable[[int, int], Dict[str, float]]] = None,
         log: Callable = _print,
+        data=None,
+        val_windows: Optional[ValidationWindows] = None,
+        val_every: int = 500,
+        fp4_stats_every: int = 10,
+        model: Optional[ToyDecoder] = None,
+        on_grads: Optional[Callable[["ConvergenceRun", int, torch.Tensor, torch.Tensor], None]] = None,
+        log_every: int = 1,
+        grad_hash_every: int = 1,
     ):
+        """``data``: a batch source with ``batch()`` / ``as_dict()`` / ``loss_floor_nats()`` (``SyntheticTokens`` of ``data_seed`` by
+        default, or a ``TokenWindows``); ``val_windows``: held-out windows scored with the arm's OWN forward every ``val_every`` steps
+        and at the last step (``val_loss`` in the row, ``null`` elsewhere); ``fp4_stats_every``: the fp4 arms' code statistics every
+        that many steps (0 = never); ``model``: a decoder to SHARE (the tethered evaluation drives another run's masters through this
+        arm's block; the optimizer is then never stepped by this run); ``on_grads(run, step, inp, tgt)``: called after the step's
+        backward and readback, before clipping and the update (the tethered pass's hook); ``log_every``: the step-line cadence;
+        ``grad_hash_every``: ``grad_sha256`` (the bytes of every layer's block weight gradients, ~60 MB a step at the headline geometry,
+        hashed on the host) on every step whose index is a multiple of it, ``null`` elsewhere -- the row's loss, gradient norms and
+        quantization scalars stay digested on every step; a long campaign takes 10, the pins keep 1."""
         self.arm, self.geom, self.cfg, self.seed, self.replica = arm, geom, cfg, seed, replica
         self.data_seed = seed if data_seed is None else data_seed
         self.name = name or f"{arm.name}_r{replica}"
@@ -554,8 +729,13 @@ class ConvergenceRun:
         self.scale_feed = scale_feed
         self.block_geom = geom.block_geometry()
         self.ref_geom = geom.ref_geometry()
-        self.model = ToyDecoder(geom, cfg, seed, self.device)
-        self.data = SyntheticTokens(geom, self.data_seed)
+        self.model = model if model is not None else ToyDecoder(geom, cfg, seed, self.device)
+        self.data = data if data is not None else SyntheticTokens(geom, self.data_seed)
+        self.val_windows, self.val_every, self.fp4_stats_every = val_windows, int(val_every), int(fp4_stats_every)
+        self.on_grads, self.log_every = on_grads, max(1, int(log_every))
+        self.grad_hash_every = max(1, int(grad_hash_every))
+        self.evaluating = False
+        self._fp4_stats: Optional[List[Dict[str, Optional[float]]]] = None
         self.cos, self.sin = build_rope_tables(geom.seq_len, geom.rope_dim, batch=geom.batch, device=self.device, dtype=_BF16)
         self.cos, self.sin = self.cos.contiguous(), self.sin.contiguous()
         self.opt = torch.optim.AdamW(self.model.param_groups(), lr=cfg.lr, betas=cfg.betas, eps=cfg.eps, foreach=True)
@@ -610,12 +790,18 @@ class ConvergenceRun:
             spec = QuantSpec(descale_h=1.0 / s_h, descale_w_qkvg=1.0 / s_wq, descale_w_o=1.0 / s_wo, **act)
             inputs = dict(h=quant_e4m3(h16, s_h), w_qkvg=quant_e4m3(w_qkvg16, s_wq), w_o=quant_e4m3(w_o16, s_wo), sf={}, art={})
         elif fam == "mxfp8":
+            # the MXFP8 arm and the fp4 weight modes on it: the codes + blobs of this step's bf16 tensors (row-wise for the forward,
+            # the transposed artifacts re-quantized along the other axis for the backward, the test tree's builder); under an fp4 W_o
+            # the forward also takes the W_o blob (``sample_w_o_sf`` / ``w_o_sf``) and the backward the two w_o_t artifacts
             src = dict(h=h16.detach(), w_qkvg=w_qkvg16.detach(), w_o=w_o16.detach(), w_q_norm=wq16, w_k_norm=wk16, cos=self.cos, sin=self.sin)
-            mx, desc = quantize_block_inputs_mxfp8(src, backward=True)
-            spec = MxQuantSpec(descale_w_o=desc["descale_w_o"], scale_o=1.0)
-            inputs = dict(
-                h=mx["h"], w_qkvg=mx["w_qkvg"], w_o=mx["w_o"], sf=dict(h_sf=mx["h_sf"], w_qkvg_sf=mx["w_qkvg_sf"]), art={k: mx[k] for k in _MX_ARTIFACTS}
-            )
+            mx, desc = quantize_block_inputs_mxfp8(src, backward=True, o_fp4=self.arm.o_fp4_format, w_qkvg_fp4=self.arm.w_qkvg_fp4)
+            spec = MxQuantSpec(descale_w_o=desc["descale_w_o"], scale_o=1.0, w_qkvg_dtype=_FP4X2 if self.arm.w_qkvg_fp4 else _E4M3, o_fp4=self.arm.o_fp4_format)
+            sf = dict(h_sf=mx["h_sf"], w_qkvg_sf=mx["w_qkvg_sf"])
+            art = {k: mx[k] for k in _MX_ARTIFACTS}
+            if self.arm.o_fp4 is not None:
+                sf["w_o_sf"] = mx["w_o_sf"]
+                art.update({k: mx[k] for k in _FP4_O_ARTIFACTS})
+            inputs = dict(h=mx["h"], w_qkvg=mx["w_qkvg"], w_o=mx["w_o"], sf=sf, art=art)
         else:
             spec = None
             inputs = dict(h=h16, w_qkvg=w_qkvg16, w_o=w_o16, sf={}, art={})
@@ -627,7 +813,7 @@ class ConvergenceRun:
         if spec is not None:
             kw["quant"] = spec
         if self.arm.family == "mxfp8":
-            kw.update(sample_h_sf=inputs["sf"]["h_sf"], sample_w_qkvg_sf=inputs["sf"]["w_qkvg_sf"])
+            kw.update({"sample_" + k: v for k, v in inputs["sf"].items()})  # h_sf / w_qkvg_sf (+ w_o_sf under an fp4 W_o)
         self.fwd = GatedAttentionBlockFwd(
             inputs["h"], inputs["w_qkvg"], inputs["w_q_norm"], inputs["w_k_norm"], self.cos, self.sin, inputs["w_o"], out, self.block_geom, **kw
         )
@@ -660,7 +846,7 @@ class ConvergenceRun:
         if spec is not None:
             self.fwd.update_quant_scales(spec)
         self.fwd.execute(inputs["h"], inputs["w_qkvg"], wq16, wk16, self.cos, self.sin, inputs["w_o"], st.out, self.ws_fwd, saved=st.saved, **inputs["sf"])
-        if self.arm.family == "fp8":
+        if self.arm.family == "fp8" and not self.evaluating:
             self._record_activation_amax(st, wq16, wk16)
         return st.out, spec
 
@@ -749,6 +935,7 @@ class ConvergenceRun:
         if self.arm.family == "torch_fn":
             return self._torch_fn_backward(st, dy)
         dy = dy.contiguous()
+        st.dy_ref = dy
         if self.bwd is None:
             self._declare_bwd(dy, st)
         if spec is not None:
@@ -852,13 +1039,34 @@ class ConvergenceRun:
             for p in self.model.params.values():
                 p.grad.mul_(coef)
 
+    def _fp4_stats_of(self, st: _LayerState, sc: Dict[str, float]) -> Dict[str, Optional[float]]:
+        """The fp4 arms' code statistics of this step and layer (``_FP4_STAT_KEYS``): the e2m1 zero / saturated-code shares of the
+        re-quantized transposed weights, and under an NVFP4 ``W_o`` those of the two-level NVFP4 cast of ``scale_dy x dY`` (the host
+        twin of the backward's own cast: ``fp4_quantize_rowwise_2d(dY, "nvfp4", global_scale=scale_dy)``, bitwise the oracle) plus the
+        share of its 16-blocks that are all zero -- the dynamic-range floor of the 4-bit gradient operand."""
+        out: Dict[str, Optional[float]] = {k: None for k in _FP4_STAT_KEYS}
+        art = st.inputs["art"]
+        if self.arm.w_qkvg_fp4:
+            out["w_qkvg_t_zero"], out["w_qkvg_t_sat"] = _e2m1_shares(art["w_qkvg_t"])
+        if self.arm.o_fp4 is not None:
+            out["w_o_t_zero"], out["w_o_t_sat"] = _e2m1_shares(art["w_o_t"])
+            if self.arm.o_fp4 == "nvfp4" and st.dy_ref is not None:
+                t, dm = self.geom.tokens_per_step, self.geom.d_model
+                packed, _ = fp4_quantize_rowwise_2d(st.dy_ref.reshape(t, dm), "nvfp4", global_scale=sc["scale_dy"])
+                out["dy4_zero"], out["dy4_sat"] = _e2m1_shares(packed)
+                mag = packed.view(torch.uint8) & 0x77  # both nibbles' magnitude bits; a 16-code block is 8 bytes
+                out["dy4_zero_blocks"] = float((mag.reshape(t, dm // 16, 8).amax(-1) == 0).float().mean())
+        return out
+
     def _read_back(self) -> Tuple[List[list], Optional[List[Dict[str, float]]]]:
         """After the step's backward: ONE sync, every layer's metrics and scalar block; the gradient-scale check (asserted under
         "current", counted under "delayed") and the dP check; the next step's ``scale_dp``; the activation and gradient amax
-        histories."""
+        histories; the fp4 arms' code statistics every ``fp4_stats_every`` steps."""
         torch.cuda.synchronize()
         mets = torch.stack([st.met for st in self.layers]).tolist()
         scalars = None
+        self._fp4_stats = None
+        fp4_now = self.arm.fp4 and self.fp4_stats_every > 0 and self.step % self.fp4_stats_every == 0
         if self.arm.quantized:
             scalars = []
             for st, met in zip(self.layers, mets):
@@ -889,15 +1097,20 @@ class ConvergenceRun:
                     for x in _ACTS:
                         st.act_hist[x].append(met[_MET[f"amax_{x}"]])
                 scalars.append(sc)
+            if fp4_now:
+                self._fp4_stats = [self._fp4_stats_of(st, sc) for st, sc in zip(self.layers, scalars)]
         return mets, scalars
 
-    def _row(self, step: int, loss: float, lr: float, grad_norm: float, mets: List[list], scalars, calib_fwd: bool, wall_ms: float) -> dict:
+    def _row(
+        self, step: int, loss: float, lr: float, grad_norm: float, mets: List[list], scalars, calib_fwd: bool, wall_ms: float, val_loss: Optional[float] = None
+    ) -> dict:
         g, arm = self.geom, self.arm
         layers = self.layers
         row: dict = dict(
             step=step,
             tokens_seen=(step + 1) * g.tokens_per_step,
             loss=loss,
+            val_loss=val_loss,
             lr=lr,
             grad_norm_total=grad_norm,
             calib_fwd=calib_fwd,
@@ -913,6 +1126,8 @@ class ConvergenceRun:
                 bwd_knobs=list(arm.bwd_knobs),
                 dp_scale_rule=arm.dp_scale_rule,
                 dp_margin_log2=arm.dp_margin_log2,
+                w_qkvg_fp4=arm.w_qkvg_fp4,
+                o_fp4=arm.o_fp4,
             ),
             geometry=dataclasses.asdict(g),
             seed=self.seed,
@@ -932,17 +1147,78 @@ class ConvergenceRun:
             if arm.grad_scaling == "delayed":
                 row["given_scales"] = {n: [st.grad_scales_host.get(n) for st in layers] for n in arm.grad_scale_names}
                 row["grad_sat"] = dict(self._grad_sat)  # per gradient scale and layer: amax * scale > 448 this step (reported)
-        h = hashlib.sha256()
-        for st in layers:
-            for ten in self._grad_hash_tensors(st):
-                h.update(_tensor_bytes(ten))
-        row["grad_sha256"] = h.hexdigest()
+            if arm.fp4:
+                row["fp4_stats"] = self._fp4_stats  # per layer (``_FP4_STAT_KEYS``) on the sampled steps, null elsewhere
+        if step % self.grad_hash_every == 0:
+            h = hashlib.sha256()
+            for st in layers:
+                for ten in self._grad_hash_tensors(st):
+                    h.update(_tensor_bytes(ten))
+            row["grad_sha256"] = h.hexdigest()
+        else:
+            row["grad_sha256"] = None
         row["grad_sha256_of"] = "master_fp32_w_qkvg_w_o" if arm.family == "torch" else "block_bf16_dw_qkvg_dw_o"
         row["row_digest"] = row_digest(row)
         row.update(
             replica=self.replica, wall_ms=wall_ms, timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), host=socket.gethostname(), pid=os.getpid()
         )
         return row
+
+    # -- evaluation and the tethered gradient evaluation ------------------------------------------------------------------------------
+
+    def evaluate(self) -> Optional[float]:
+        """The mean loss over the validation windows with THIS arm's own forward (its deployed numerics: the current weights
+        quantized the arm's way, the fp8 activation scales as the next training step would use them); no record, history or
+        counter of the trajectory is touched (the forward's amax recording is skipped)."""
+        if self.val_windows is None:
+            return None
+        self.evaluating = True
+        try:
+            with torch.no_grad():
+                losses = []
+                for b in self.val_windows.batches:
+                    tokens = b.to(self.device)
+                    losses.append(self.model.forward(tokens[:, :-1].contiguous(), tokens[:, 1:].contiguous(), self.block))
+                return float(torch.stack(losses).mean().item())
+        finally:
+            self.evaluating = False
+
+    def grads_on(self, inp: torch.Tensor, tgt: torch.Tensor, params: Dict[str, torch.Tensor]):
+        """This arm's forward + backward on ANOTHER run's fp32 masters ``params`` (aliased, never updated) and its batch, with NO lag
+        in any scale -- the tethered gradient-fidelity evaluation: the fp8 activation scales come from a calibration forward on this
+        very batch (window 1 over an emptied history), ``descale_h / descale_w_*`` from the tensors being evaluated, ``scale_dp`` and
+        the delayed recipe's gradient scales from the step-0 bootstrap ladder (discarded passes on this batch).  Returns ``(loss,
+        master gradients by name, per-layer block gradients dh / dw_qkvg / dw_o, the backward's quant_scalars per layer)``; the
+        other run's ``.grad`` tensors are set aside and restored, so its own step is untouched."""
+        own = self.model.params
+        self.model.params = params
+        saved = {k: p.grad for k, p in params.items()}
+        try:
+            for p in params.values():
+                p.grad = None
+            for st in self.layers:
+                for d in list(st.act_hist.values()) + list(st.grad_hist.values()):
+                    d.clear()
+            self.step = 0
+            if self._needs_activation_calibration():
+                self.calibrating = True
+                with torch.no_grad():
+                    self.model.forward(inp, tgt, self.block)
+                self._seed_activation_histories()
+                self.calibrating = False
+            self._begin_step(0)
+            loss = self.model.forward(inp, tgt, self.block)
+            loss.backward()
+            if self.arm.family == "torch":
+                self._torch_arm_metrics()
+            _, scalars = self._read_back()
+            master = {k: p.grad.detach().clone() for k, p in params.items()}
+            block = [{n: st.grads[n].detach().clone() for n in _TETHER_GRADS} for st in self.layers] if self.arm.uses_block else None
+            return float(loss.item()), master, block, scalars
+        finally:
+            for k, p in params.items():
+                p.grad = saved[k]
+            self.model.params = own
 
     def run(self, steps: int, *, jsonl_path: Optional[str] = None, keep_grads_at: Tuple[int, ...] = ()) -> RunResult:
         """Train ``steps`` steps (``steps >= 1``: a run with no step has no row to digest and is refused); returns the rows (and the
@@ -998,6 +1274,8 @@ class ConvergenceRun:
                 for name, vals in ((n, [m[_MET[f"norm_{n}"]] for m in mets]) for n in _GRAD_NAMES):
                     if not all(math.isfinite(v) for v in vals) and not (name == "dh" and self.arm.family == "torch"):
                         raise RuntimeError(f"step {step}: non-finite block gradient {name}: {vals}")
+                if self.on_grads is not None:
+                    self.on_grads(self, step, inp, tgt)
                 if step in keep:
                     kept[step] = {k: p.grad.detach().clone() for k, p in params.items()}
                 self._clip(grad_norm)
@@ -1007,15 +1285,25 @@ class ConvergenceRun:
                 self.opt.step()
                 torch.cuda.synchronize()
                 wall_ms = (time.perf_counter() - t0) * 1e3
+                # The row is built from the TRAINING step's layer state -- its ``spec`` and activation scales -- BEFORE the arm's
+                # evaluation forward, which rewrites every layer's ``spec`` / ``act_scales`` with the validation windows' descales and
+                # the next step's scales; ``val_loss`` is attached afterwards and the digest re-sealed over the row as written.
                 row = self._row(step, loss_val, lr, grad_norm, mets, scalars, calib_fwd, wall_ms)
+                val_loss = None
+                if self.val_windows is not None and ((step + 1) % self.val_every == 0 or step == steps - 1):
+                    val_loss = self.evaluate()
+                    row["val_loss"] = val_loss
+                    row["row_digest"] = row_digest(row)
                 rows.append(row)
                 if f is not None:
                     f.write(json.dumps(row, sort_keys=True) + "\n")
                     f.flush()
-                self.log(
-                    f"[{self.name}] step {step:5d} loss {loss_val:.5f} lr {lr:.3e} |g| {grad_norm:.4f} wall {wall_ms:8.1f} ms"
-                    f"{'  (calib fwd)' if calib_fwd else ''}{f'  (calib bwd x{self._calib_bwd} per layer)' if self._calib_bwd else ''}"
-                )
+                if step % self.log_every == 0 or step == steps - 1 or val_loss is not None or step == 1:
+                    self.log(
+                        f"[{self.name}] step {step:5d} loss {loss_val:.5f} lr {lr:.3e} |g| {grad_norm:.4f} wall {wall_ms:8.1f} ms"
+                        f"{'  (calib fwd)' if calib_fwd else ''}{f'  (calib bwd x{self._calib_bwd} per layer)' if self._calib_bwd else ''}"
+                        f"{f'  val {val_loss:.5f}' if val_loss is not None else ''}"
+                    )
         finally:
             if f is not None:
                 f.close()
@@ -1032,6 +1320,11 @@ class ConvergenceRun:
             steps=steps,
             n_rows=len(rows),
             bootstrap_rungs=self.bootstrap_rungs(),
+            validation=self.val_windows.as_dict() if self.val_windows is not None else None,
+            val_every=self.val_every,
+            fp4_stats_every=self.fp4_stats_every,
+            grad_hash_every=self.grad_hash_every,
+            val_losses={r["step"]: r["val_loss"] for r in rows if r.get("val_loss") is not None},
             run_digest=run_digest(rows),
             first_row_digest=rows[0]["row_digest"] if rows else None,
             last_loss=rows[-1]["loss"] if rows else None,
@@ -1072,6 +1365,50 @@ def scale_feed_from_rows(rows: List[dict], names: Tuple[str, ...]) -> Callable[[
         return {n: rows[step]["quant_scalars"][n][layer] for n in names}
 
     return feed
+
+
+def _e2m1_shares(packed: torch.Tensor) -> Tuple[float, float]:
+    """Packed e2m1 bytes (two codes per byte) -> (the share of codes at +-0, the share at +-6 = the saturated code)."""
+    u8 = packed.view(torch.uint8) if packed.dtype != torch.uint8 else packed
+    lo, hi = u8 & 0x7, (u8 >> 4) & 0x7
+    n = 2 * u8.numel()
+    zero = int((lo == 0).sum()) + int((hi == 0).sum())
+    sat = int((lo == 7).sum()) + int((hi == 7).sum())
+    return zero / n, sat / n
+
+
+def cosine(a: torch.Tensor, b: torch.Tensor) -> float:
+    """The cosine of two tensors (fp64 accumulation over the flattened values); NaN when either is all zero."""
+    x, y = a.detach().double().flatten(), b.detach().double().flatten()
+    return float(torch.dot(x, y) / (x.norm() * y.norm()))
+
+
+def tethered_rows(reference: "ConvergenceRun", evaluators: List["ConvergenceRun"], step: int, inp: torch.Tensor, tgt: torch.Tensor) -> List[dict]:
+    """The tethered gradient-fidelity rows at one step of ``reference`` (its backward done, its gradients still in place): every
+    evaluator's ``grads_on`` the reference's masters and batch, compared with the reference's own gradients -- per layer the cosine
+    and the norm ratio of the block's ``dh`` / ``dw_qkvg`` / ``dw_o``, the cosine of the whole master-gradient vector, and both
+    losses at identical weights."""
+    ref_master = {k: p.grad.detach() for k, p in reference.model.params.items()}
+    ref_block = [{n: st.grads[n].detach() for n in _TETHER_GRADS} for st in reference.layers]
+    ref_vec = torch.cat([g.double().flatten() for g in ref_master.values()])
+    out = []
+    for ev in evaluators:
+        loss, master, block, scalars = ev.grads_on(inp, tgt, reference.model.params)
+        vec = torch.cat([master[k].double().flatten() for k in ref_master])
+        row = dict(
+            step=step,
+            arm=ev.arm.name,
+            reference=reference.arm.name,
+            loss=loss,
+            loss_ref=None,
+            cos_master=float(torch.dot(vec, ref_vec) / (vec.norm() * ref_vec.norm())),
+            norm_ratio_master=float(vec.norm() / ref_vec.norm()),
+            cos={n: [cosine(b[n], r[n]) for b, r in zip(block, ref_block)] for n in _TETHER_GRADS},
+            norm_ratio={n: [float(b[n].float().norm() / r[n].float().norm()) for b, r in zip(block, ref_block)] for n in _TETHER_GRADS},
+            quant_scalars={k: [sc[k] for sc in scalars] for k in scalars[0]} if scalars else None,
+        )
+        out.append(row)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1117,6 +1454,17 @@ def main(argv=None) -> int:
     ap.add_argument("--dp-scale-rule", choices=("amax", "helper"), default=None, help="fp8: how scale_dp follows amax_dp (Arm.dp_scale_rule)")
     ap.add_argument("--dp-margin-log2", type=int, default=None, help="fp8: the octaves of headroom of the 'amax' dP rule (Arm.dp_margin_log2)")
     ap.add_argument("--replay-scales-from", default=None, help="a 'current' run's JSONL whose published gradient scales feed this 'delayed' run")
+    ap.add_argument("--tokens", default=None, help="a uint16 token file (GPT-2 ids) to train on instead of the synthetic stream")
+    ap.add_argument("--tokens-sha256", default=None, help="the expected sha256 of --tokens (refused on a mismatch)")
+    ap.add_argument("--max-windows", type=int, default=None, help="cap the token stream at this many windows (a short real-text smoke)")
+    ap.add_argument("--val-tokens", default=None, help="a uint16 token file whose first --val-windows windows are the held-out set")
+    ap.add_argument("--val-windows", type=int, default=64)
+    ap.add_argument("--val-every", type=int, default=500)
+    ap.add_argument("--fp4-stats-every", type=int, default=10, help="fp4 arms: the code statistics every N steps (0 = never)")
+    ap.add_argument("--log-every", type=int, default=1, help="print a step line every N steps (every row is written regardless)")
+    ap.add_argument(
+        "--grad-hash-every", type=int, default=1, help="grad_sha256 on every N-th step (the host-side hash of ~60 MB of gradients at the headline geometry)"
+    )
     a = ap.parse_args(argv)
     if a.steps < 1:
         ap.error(f"--steps must be >= 1 (a run with no step has no row to digest), got {a.steps}")
@@ -1138,12 +1486,36 @@ def main(argv=None) -> int:
     os.makedirs(a.out, exist_ok=True)
     name = a.name or f"{arm.name}_r{a.replica}"
     jsonl = os.path.join(a.out, name + ".jsonl")
+    data_seed = a.seed if a.data_seed is None else a.data_seed
+    data = TokenWindows(geom, data_seed, a.tokens, sha256=a.tokens_sha256, max_windows=a.max_windows) if a.tokens else None
+    val = ValidationWindows(geom, a.val_tokens, n_windows=a.val_windows) if a.val_tokens else None
+    _print(f"[stage] data ready: {(data or SyntheticTokens(geom, data_seed)).as_dict()} validation {val.as_dict() if val else None}")
     _print(f"arm {arm.as_dict()} geometry {a.geometry} {dataclasses.asdict(geom)} steps {a.steps} seed {a.seed} -> {jsonl}")
-    res = run_training(arm, geom, steps=a.steps, seed=a.seed, data_seed=a.data_seed, replica=a.replica, name=name, scale_feed=feed, jsonl_path=jsonl)
+    res = run_training(
+        arm,
+        geom,
+        steps=a.steps,
+        seed=a.seed,
+        data_seed=data_seed,
+        replica=a.replica,
+        name=name,
+        scale_feed=feed,
+        jsonl_path=jsonl,
+        data=data,
+        val_windows=val,
+        val_every=a.val_every,
+        fp4_stats_every=a.fp4_stats_every,
+        log_every=a.log_every,
+        grad_hash_every=a.grad_hash_every,
+    )
     with open(os.path.join(a.out, name + ".manifest.json"), "w") as f:
         json.dump(res.manifest, f, indent=1, sort_keys=True)
     m = res.manifest
-    _print(f"[{name}] run_digest {m['run_digest']}  rows {m['n_rows']}  last loss {m['last_loss']:.5f}  floor {m['data']['loss_floor_nats']:.4f} nats")
+    floor = m["data"].get("loss_floor_nats")
+    _print(
+        f"[{name}] run_digest {m['run_digest']}  rows {m['n_rows']}  last loss {m['last_loss']:.5f}  "
+        f"{f'floor {floor:.4f} nats' if floor is not None else ''}  val {m['val_losses']}"
+    )
     _print(f"[{name}] median ms/step over steps >= 1: {m['ms_per_step_median_steps_ge_1']} (host-bound, informational -- not a performance number)")
     return 0
 

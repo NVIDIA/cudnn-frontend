@@ -50,6 +50,16 @@ or `b_major="n"` (physical stride `(1,N)`), with `n=N` and
 allocation as the logical `(N,K)` matrix, avoiding a separate weight
 transpose for input gradients. Layout participates in wrapper/plan cache keys.
 
+Torch callers may instead pass the canonical layouts: contiguous `A` `(M, K)`,
+`prob` `(M,)`, and dense `B` `(L, N, K)`, or the N-major `(L, K, N)` buffer with
+`b_major="n"`. With 2-D `A`, `C` and `D` are `(M, N)`, including a caller-provided
+`d_tensor`. The wrapper advertises `supports_bf16_canonical_layouts`.
+
+`padded_offsets` values and `b_ptrs` entries are a **device-data contract**: the kernel
+reads them on device and `execute()` does not copy them to the host. Set
+`CUDNN_FE_GROUPED_GEMM_VALIDATE_DEVICE_VALUES=1` (read once at import) to turn on
+blocking debug checks of those values at `execute()`.
+
 The pointer-array tensor must be contiguous, non-null, eight-byte aligned, and
 on the same device as `A`; each target pointer must satisfy the kernel's
 alignment contract. The API records the pointer-array tensor on the launch

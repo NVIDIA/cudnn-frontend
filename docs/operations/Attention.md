@@ -470,6 +470,7 @@ pair alone, these engines serve any combination of the three. See
 #### Limitations
 
 - Head dimension must be a multiple of 8.
+- Q, K, V and O (and dO, dQ, dK, dV in backward) must meet the tensor's declared alignment, 16 bytes by default. If a non-unit stride is not a whole number of alignments in bytes, the native lowering declines the graph. If a device pointer is misaligned, `execute` refuses it before launching. Without these checks, the native kernels returned wrong output on SM90/SM100 and faulted on SM80/SM89 ([#1571](https://github.com/NVIDIA/cudnn-frontend/issues/1571)).
 - ALiBi requires causal masking (`diagonal_band_right_bound=0`).
 - Block masking is only supported with the UNIFIED implementation.
 - Ampere/Ada architectures are limited to head dimensions up to 256 for prefill, 128 for decode and backward.
@@ -1396,7 +1397,10 @@ g.execute({Q: q, K: k, V: v, O: o}, workspace, **overrides)
 - **Buffers are sized for the declaration.** An override says how much of a
   declared buffer this run uses; it neither shrinks the allocation nor re-packs
   the layout, and the strides describe the declared storage. Allocating only the
-  run's extent leaves the kernel addressing past the buffer.
+  run's extent leaves the kernel addressing past the buffer. `override_strides`
+  that differ from the declared strides are accepted but not used: the kernel
+  reads and writes with the declared strides
+  ([#1570](https://github.com/NVIDIA/cudnn-frontend/issues/1570)).
 - **The plan is chosen at build time.** `override_*` does not re-run the
   heuristic and does not reselect an engine, so grouping lengths into buckets is
   the caller's policy rather than something this feature does. Two graphs
@@ -1423,8 +1427,10 @@ extent, or the larger override for the explicitly oversized probe:
 | 256, `generate_stats=True` | 64 | served, O and Stats both follow the override |
 | 1 (decode), KV declared 256 | `s_q=1`, `s_kv=64` | served |
 | 256 | `s_q = 1` | **rejected**: `CUDNN_STATUS_NOT_SUPPORTED_INVALID_DYNAMIC_SHAPE` |
-| 256 | 96 / 160 (non-causal, off the 64-row tile grid) | **not rejected, wrong output** |
+| 256 | 96 / 160 (non-causal, `s_kv` off the plan's 64-row KV tile) | **not rejected, wrong output**: the KV tail up to the tile boundary is attended ([#1567](https://github.com/NVIDIA/cudnn-frontend/issues/1567)) |
 | 256 | 320 (beyond the declaration, with storage and strides for 320 rows) | **not rejected** on the measured plan; outside the declared envelope |
+| 256 | 256, buffers in BSHD layout with matching `override_strides` | **not rejected, wrong output**: the declared BHSD strides are used ([#1570](https://github.com/NVIDIA/cudnn-frontend/issues/1570)) |
+| `b = 1` | `b = 2` | **not rejected**: batch 1 of O is not written ([#1570](https://github.com/NVIDIA/cudnn-frontend/issues/1570)) |
 | any | `override_uids` and `override_shapes` of different length | rejected at variant-pack finalize (`CUDNN_STATUS_BAD_PARAM`) |
 
 These are observations of this platform and plan, not a portable supported-shape
@@ -1438,12 +1444,20 @@ Two consequences for callers:
 1. **Decode and prefill are different engine classes.** A declared prefill graph
    cannot be overridden to `s_q == 1`, and a graph declared at `s_q == 1` should
    not be expected to serve prefill lengths. Keep one graph per class.
-2. **The legal window is narrower than "anything up to the declaration".** In the
-   non-causal class only multiples of the plan's Q tile were served on the
-   measured configuration; the other lengths produced wrong output without an
-   error. Validate the window you intend to use against your own plan and shapes
-   before relying on it, and prefer run extents that match the declaration's
-   tiling.
+2. **The legal window is narrower than "anything up to the declaration".** When
+   the declared `s_kv` is a multiple of the plan's KV tile, a non-causal run is
+   correct only at `s_kv` overrides that are also multiples of that tile; other
+   lengths attend to the padding rows up to the tile boundary and return wrong
+   output without an error. The `s_q` override is not affected, and the causal
+   mask hides the extra rows. The KV tile is 128 on the first-ranked H100/B200
+   plans (`eng9`/`eng10`), so there even `s_kv = 64` is wrong. Two forms served
+   every override measured, on A100, L40S, H100 and B200 with cuDNN 9.27: a
+   declaration off the KV tile (e.g. 255), and a graph that also carries the
+   real lengths in `seq_len_q` / `seq_len_kv` with `use_padding_mask=True`
+   (dense and ragged)
+   ([#1567](https://github.com/NVIDIA/cudnn-frontend/issues/1567)). Validate the
+   window you intend to use against your own plan and shapes before relying on
+   it.
 
 The `s_q == 1` boundary and the declared-max-length sensitivity of the heuristic
 (an `eng8` -> `eng10` flip between a declared 128 and 256, and 2.0-2.3x cost on

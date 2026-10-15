@@ -160,7 +160,11 @@ class DenseScoreRecomputeSm100:
 
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.tmem_s_stride = self.m_block_size
-        self.num_tmem_slots = SM100_TMEM_CAPACITY_COLUMNS // self.m_block_size
+        # One accumulator slot per m_block_size TMEM columns, at most 16: the
+        # per-slot phase bits live in one Int32 and a 16-deep S ring already
+        # decouples the MMA from the epilogue (a 16-column tile would otherwise
+        # ask for 32 slots and overflow the phase word).
+        self.num_tmem_slots = min(16, SM100_TMEM_CAPACITY_COLUMNS // self.m_block_size)
         if score_type == "attention" and qhead_per_kvhead in (64, 128):
             self.num_tmem_slots = 2
         self.tmem_total = self.tmem_s_stride * self.num_tmem_slots
