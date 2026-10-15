@@ -186,6 +186,7 @@ from cudnn.sdpa.fwd.kernels._common_blackwell import (
     make_split_helpers,
     sdpa_operand_tensors,
     store_fp32_partial_tile as _store_fp32_partial_tile,
+    load_o_chunks_grouped,
     make_classic_bars,
     row_max_for_exp2,
     make_sdpa_helpers,
@@ -1845,10 +1846,14 @@ def _store_o_tile_direct(
     oo = cutlass.make_array_view(o_out)
     d_v = cutlass.const_expr(o_out.shape[3])
     pair_fmt = "bf16x2" if cutlass.const_expr(CFG.DTYPE_QKV == 2) else "f16x2"
+    grouped = load_o_chunks_grouped(tmem_base, tmem_o_off, tile_o, chunk, 4) if cutlass.const_expr(tile_o <= 64) else None
     for blk in cutlass.range_constexpr(tile_o // chunk):
-        addr = tmem_base + cutlass.Int32(tmem_o_off + blk * chunk)
-        vals = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(addr, cutlass.Float32), num=chunk)
-        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+        if cutlass.const_expr(grouped is None):
+            addr = tmem_base + cutlass.Int32(tmem_o_off + blk * chunk)
+            vals = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(addr, cutlass.Float32), num=chunk)
+            nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+        else:
+            vals = grouped[blk]
         scaled = vals * inv_sum
         if row_valid:
             row_ptr = oo.data_ptr((o_batch, q_row, row_head, 0))
@@ -1894,13 +1899,9 @@ def _quad_stage_and_merge_stats(sMerge, quad_buf, tid_in_wg, tmem_base, m_w, l_w
         st_shared_v2(sMerge.subview(row_base + cutlass.Int32(QUAD_O_COLS)).data_ptr(), (m_w, l_w), cutlass.Float32)
     # An empty unit never wrote the accumulator (its sum is 0 in every quadrant, so the merge never reads the staged O).
     if cutlass.const_expr(not MAY_BE_EMPTY) or (bounds.right > bounds.left):
+        quad_loaded = load_o_chunks_grouped(tmem_base, LAYOUT.O0_OFF, QUAD_O_COLS, 16, 4)
         for blk in cutlass.range_constexpr(QUAD_O_COLS // 16):
-            vals = nvvm.tcgen05_ld(
-                "32x32b",
-                nvvm.make_tmem_ptr(tmem_base + cutlass.Int32(LAYOUT.O0_OFF + blk * 16), cutlass.Float32),
-                num=16,
-            )
-            nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+            vals = quad_loaded[blk]
             if lane_live:
                 for j in cutlass.range_constexpr(4):
                     st_shared_v4(
@@ -2299,6 +2300,7 @@ def _correction_warp_group(
                 row_head_idx,
                 CFG.TILE_O,
                 O_CHUNK,
+                load_group=4 if CFG.TILE_O <= 64 else 1,
             )
             if cutlass.const_expr(not EARLY_Q):
                 bars.mb_o_empty[0].wait(o_empty_phase)

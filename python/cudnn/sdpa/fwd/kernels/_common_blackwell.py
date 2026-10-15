@@ -506,6 +506,21 @@ def assert_tile_n_supported(CFG):
         raise NotImplementedError(f"this kernel currently requires TILE_N=128 (got TILE_N={CFG.TILE_N})")
 
 
+def load_o_chunks_grouped(tmem_base, tmem_o_off, tile_o: int, chunk: int, group: int):
+    """Every fp32 O chunk (``tile_o // chunk`` of them, ``chunk`` columns each) of a TMEM accumulator, loaded ``group`` at a time with ONE wait per
+    group -- the per-chunk ``ld`` + ``wait`` of the original schedule pays a serialized TMEM round trip per chunk.  Every chunk stays live until the
+    caller consumes it, so ``tile_o`` fp32 registers per thread must fit the epilogue's budget."""
+    chunks = []
+    for g0 in range(0, tile_o // chunk, group):
+        loaded = [
+            nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(tmem_base + cutlass.Int32(tmem_o_off + (g0 + k) * chunk), cutlass.Float32), num=chunk)
+            for k in range(min(group, tile_o // chunk - g0))
+        ]
+        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+        chunks.extend(loaded)
+    return tuple(chunks)
+
+
 @cute.jit
 def store_fp32_partial_tile(
     o_partial_f32,
@@ -519,6 +534,7 @@ def store_fp32_partial_tile(
     row_head_idx,
     tile_o: cutlass.Constexpr[int],
     chunk: cutlass.Constexpr[int],
+    load_group: cutlass.Constexpr[int] = 1,
 ) -> None:
     """Store one Q row's O tile as fp32, straight from TMEM to the workspace.
 
@@ -531,7 +547,8 @@ def store_fp32_partial_tile(
     ``chunk`` must be the flavor's OWN TMEM read width (its ``O_CHUNK``): the
     O region is not uniformly addressable across flavors, so reading it in a
     different stride than the staged epilogue does silently returns the wrong
-    columns rather than failing.
+    columns rather than failing.  ``load_group`` > 1 loads that many chunks per wait
+    (:func:`load_o_chunks_grouped`: the whole ``tile_o`` is live); 1 is the original wait per chunk.
 
     ``row_dead`` cannot be dropped in favour of the zeroed ``inv_sum`` every
     caller already computes: an empty mainloop never wrote O TMEM, so the load
@@ -548,10 +565,14 @@ def store_fp32_partial_tile(
     d_v = cutlass.const_expr(o_partial_f32.shape[3])
     # Use develop's 16-byte primitive when the current row supports it. Keep
     # the scalar fallback for legal narrow or unaligned caller bindings.
+    grouped = load_o_chunks_grouped(tmem_base, tmem_o_off, tile_o, chunk, load_group) if cutlass.const_expr(load_group > 1) else None
     for blk in cutlass.range_constexpr(tile_o // chunk):
-        addr = tmem_base + cutlass.Int32(tmem_o_off + blk * chunk)
-        vals = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(addr, cutlass.Float32), num=chunk)
-        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+        if cutlass.const_expr(grouped is None):
+            addr = tmem_base + cutlass.Int32(tmem_o_off + blk * chunk)
+            vals = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(addr, cutlass.Float32), num=chunk)
+            nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+        else:
+            vals = grouped[blk]
         scaled = vals * inv_sum
         if row_valid:
             row_out = op[o_batch, q_row_global, row_head_idx, :]
