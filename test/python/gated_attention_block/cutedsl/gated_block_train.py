@@ -543,6 +543,9 @@ class ValidationWindows:
         tokens, self.sha256 = _read_token_file(path)
         if sha256 is not None and sha256 != self.sha256:
             raise ValueError(f"{path}: sha256 {self.sha256} differs from the expected {sha256}")
+        vmax = int(tokens.to(torch.int32).max()) if tokens.numel() else -1  # the same check as TokenWindows: the file is this model's stream
+        if vmax >= geom.vocab:
+            raise ValueError(f"{path}: token id {vmax} is outside the model's vocabulary of {geom.vocab}")
         b, s = geom.batch, geom.seq_len
         available = (int(tokens.numel()) - 1) // s
         if self.n_windows > available or self.n_windows % b:

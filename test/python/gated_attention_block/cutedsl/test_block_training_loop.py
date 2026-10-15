@@ -1164,3 +1164,20 @@ def test_a_validation_step_row_records_the_training_steps_quantization(tmp_path,
         assert r["val_loss"] is not None and math.isfinite(r["val_loss"]), r["step"]
         assert r["spec"] == seen[r["step"]], (r["step"], r["spec"], seen[r["step"]])
         assert r["row_digest"] == gbt.row_digest(r)
+
+
+@_L0
+def test_validation_windows_refuse_an_out_of_vocabulary_id(tmp_path):
+    """``ValidationWindows`` applies ``TokenWindows``' vocabulary check: a window file carrying an id >= ``vocab`` is refused at
+    construction, by the name of the offending id (the embedding table would index out of range at the first validation step);
+    the same file with the id inside the table builds its batches."""
+    geom = _SMOKE
+    flat = gbt.SyntheticTokens(geom, 11).batch().reshape(-1).tolist()
+    flat[5] = geom.vocab  # one id past the table
+    path = tmp_path / "val_tokens_bad.bin"
+    path.write_bytes(array.array("H", flat).tobytes())
+    with pytest.raises(ValueError, match=f"token id {geom.vocab} is outside the model's vocabulary of {geom.vocab}"):
+        gbt.ValidationWindows(geom, str(path), n_windows=geom.batch)
+    flat[5] = geom.vocab - 1
+    path.write_bytes(array.array("H", flat).tobytes())
+    assert len(gbt.ValidationWindows(geom, str(path), n_windows=geom.batch).batches) == 1
