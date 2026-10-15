@@ -30,9 +30,18 @@ import tempfile
 import pytest
 import torch
 
-from cudnn.gated_attention_block.kernels import qsa_kv_upcast as upcast
+from cudnn.frost.buffers import cutedsl_requirement_error
 
 pytestmark = pytest.mark.L0
+
+# Rule 7, the module's own gate: the cast kernel's module imports ``cutlass.experimental`` at import time (like the tile_dsl primitives),
+# which a DSL below FROST's floor (the package floor 4.6.2, the release CI lanes) does not have -- so the version gate runs BEFORE the
+# kernel import and the module SKIPS with a message naming the installed and the required version instead of dying at collection.
+requirement_error = cutedsl_requirement_error("the e4m3 KV-cache cast kernel's tests (kernels/qsa_kv_upcast.py)")
+if requirement_error is not None:
+    pytest.skip(requirement_error, allow_module_level=True)
+
+from cudnn.gated_attention_block.kernels import qsa_kv_upcast as upcast  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
