@@ -1964,6 +1964,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 request=self.dead_subtile_quiet,
                 s_q=int(self.q_desc.shape[2]),
                 cga=int(self.cga) if self.cga is not None else 1,
+                padded=bool(self.seq_kv_lens_present),
+                tile_n=self._effective_tile_n(),
             )
         return _sm107_dead_subtile_quiet_pick(
             self.flavor[0],

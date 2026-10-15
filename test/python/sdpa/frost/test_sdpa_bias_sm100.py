@@ -278,7 +278,10 @@ def test_dead_subtile_quiet_pick_and_request_on_the_inf_body_on_sm100(_sm100_dev
     without a dead sub-tile are 0 (a request on the plain body is a typed decline)."""
     from cudnn.sdpa.fwd import config_sm100 as c0
 
-    assert c0.sm100_dead_subtile_quiet_pick(32, has_bias=True, has_kv_mask=False, s_q=384) == c0.SM100_INF_BODY_DEAD_SUBTILE_QUIET_DEFAULT
+    assert c0.sm100_dead_subtile_quiet_pick(32, has_bias=True, has_kv_mask=False, s_q=384) == c0.SM100_INF_BODY_DEAD_SUBTILE_QUIET_DEFAULT == 1
+    assert c0.sm100_dead_subtile_quiet_pick(32, has_bias=True, has_kv_mask=False, s_q=384, padded=True, tile_n=128) == 0, "the 128-wide padded body keeps the full body (measured a loss)"
+    assert c0.sm100_dead_subtile_quiet_pick(64, has_bias=True, has_kv_mask=False, s_q=384, padded=True, tile_n=64) == 1, "the 64-wide padded body: measured a win"
+    assert c0.sm100_dead_subtile_quiet_pick(32, has_bias=True, has_kv_mask=False, s_q=384, padded=True, tile_n=128, request=1) == 1
     assert c0.sm100_dead_subtile_quiet_pick(32, has_bias=True, has_kv_mask=False, s_q=384, request=1) == 1
     assert c0.sm100_dead_subtile_quiet_pick(64, has_bias=False, has_kv_mask=True, s_q=640, request=1) == 1
     assert c0.sm100_dead_subtile_quiet_pick(32, has_bias=False, has_kv_mask=False, s_q=384, request=1) == 0  # the plain body: not wired here
@@ -296,7 +299,13 @@ def test_dead_subtile_quiet_pick_and_request_on_the_inf_body_on_sm100(_sm100_dev
     assert api.check_support() is True and api.template_params().dead_subtile_quiet == 1 and api.template_params().bias_mode != 0
     monkeypatch.setattr(c0, "_DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS", None)
     api0 = _api(s_q=384, s_kv=384, bias=(1, 4, 384, 384))
-    assert api0.check_support() is True and api0.template_params().dead_subtile_quiet == c0.SM100_INF_BODY_DEAD_SUBTILE_QUIET_DEFAULT
+    assert api0.check_support() is True and api0.template_params().dead_subtile_quiet == c0.SM100_INF_BODY_DEAD_SUBTILE_QUIET_DEFAULT == 1
+    apip = _api(s_q=384, s_kv=384, seq_kv_lens_present=True, bias=(1, 4, 384, 384))
+    assert apip.check_support() is True and apip.template_params().tile_n == 128 and apip.template_params().dead_subtile_quiet == 0, "the 128-wide padded plan keeps the full body"
+    apip64 = _api(d=64, s_q=384, s_kv=384, seq_kv_lens_present=True, bias=(1, 4, 384, 384))
+    assert apip64.check_support() is True and apip64.template_params().tile_n == 64 and apip64.template_params().dead_subtile_quiet == 1, "the 64-wide padded plan takes the quiet body"
+    api256 = _api(s_q=256, s_kv=256, bias=(1, 4, 256, 256))
+    assert api256.check_support() is True and api256.template_params().dead_subtile_quiet == 0, "no dead sub-tile at a 256 multiple"
     apir = _api(s_q=384, s_kv=384, bias=(1, 4, 384, 384), dead_subtile_quiet=1)
     assert apir.check_support() is True and apir.template_params().dead_subtile_quiet == 1
     apim = _api(s_q=640, s_kv=640, kv_mask=(2, 1, 1, 640), dead_subtile_quiet=1)

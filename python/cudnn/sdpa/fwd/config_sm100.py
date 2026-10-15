@@ -2932,22 +2932,35 @@ _PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS: Optional[int] = None
 # The DEAD-SUB-TILE QUIET body on the SM100 small tiles' -inf body (TemplateParams.dead_subtile_quiet; a bias or a kv_mask, the one-batch-entry
 # item): a softmax sub-tile with no live row (the batch entry's S_q ends inside the 256-row item: S_q % (256 x cga) in 1..128 -- S 384 / 640 of the
 # triangle grid) runs the full -inf body on rows nobody stores (0, the legacy form) or the quiet body (1: the live body's barrier sequence, no load,
-# no math).  SERVED behind a request or the sweep seam; the knob-less default is 0 until the GB200 A/B lands a rule (the constant below is that
-# rule's landing place).  The PLAIN body's quiet form is not wired on this line (the kernel refuses it); the Rubin pick (`sm107_dead_subtile_quiet_pick`)
-# serves the OTHER half -- its plain body -- so the two picks are disjoint by construction.
-SM100_INF_BODY_DEAD_SUBTILE_QUIET_DEFAULT = 0
+# no math).  MEASURED on GB200 (152 SMs @ 1830 MHz, cc 10.0, 2026-10-14; in-process A/B beside the shipped default, 3 x 100 graph replays, a control
+# twin, every window at 1830; speed-up = t(full) / t(quiet) - 1): over the spinning bias body D 64 S 640 / 384 B 1 +3.5 / +5.6 %, S 384 B 4 +5.2 %, D 32 S 640 / 384 B 1 +3.7 / +6.9 %, S 384 B 4 +5.9 %; with the kv_mask word D 64 +8.8 / +12.1 / +11.7 %, D 32 +1.1 / +7.1 / +4.1 %; the 64-wide padded D 64 cells +3.5 / +5.7 / +6.3 %; the 128-wide padded D 32 cells a LOSS -7.9 / -7.0 / -9.5 % (S 640 / 384 B 1, S 384 B 4).  So the knob-less default is 1 on the DENSE-length -inf forms
+# (the bias body with or without the kv_mask word) and 0 on the PADDED leg (per-row kv_lengths), where the pick returns 0; wherever every sub-tile is
+# live (S 256 / 512 / 768 / 1024 / 2048 of the grid) the rows rule returns 0 and nothing moves; the 128-wide PADDED body keeps the full body (the pick's
+# width rule: a LOSS there).  The PLAIN body's quiet form is not wired on this line
+# (the kernel refuses it); the Rubin pick (`sm107_dead_subtile_quiet_pick`) serves the OTHER half -- its plain body -- so the two picks are disjoint.
+SM100_INF_BODY_DEAD_SUBTILE_QUIET_DEFAULT = 1
 _DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS: Optional[int] = None
 
 
 def sm100_dead_subtile_quiet_pick(
-    d_flavor: int, *, has_bias: bool, has_kv_mask: bool, request: Optional[int] = None, s_q: Optional[int] = None, cga: int = 1, tile_m: int = 128
+    d_flavor: int,
+    *,
+    has_bias: bool,
+    has_kv_mask: bool,
+    request: Optional[int] = None,
+    s_q: Optional[int] = None,
+    cga: int = 1,
+    tile_m: int = 128,
+    padded: bool = False,
+    tile_n: int = 128,
 ) -> int:
     """The ``TemplateParams.dead_subtile_quiet`` of a plan on the SM100 small tiles: 0 off the eligible set (the plain body -- its quiet form is
     not wired on this line -- the d128 flavor); on the -inf body (``has_bias`` or ``has_kv_mask``) ``request`` when the caller made one (the
     adapter's ``dead_subtile_quiet=``, validated there: honoured or declined, never degraded), else 0 when the plan's S_q (``s_q`` with its cluster
     width ``cga`` and Q tile height ``tile_m``) leaves NO dead sub-tile (the one-batch-entry item's cluster tile is 2 x tile_m x cga rows; a dead
     sub-tile exists iff ``s_q % rows`` is in 1..(rows - tile_m); without one the quiet rendering only costs its code), else the sweep seam, else
-    :data:`SM100_INF_BODY_DEAD_SUBTILE_QUIET_DEFAULT`."""
+    :data:`SM100_INF_BODY_DEAD_SUBTILE_QUIET_DEFAULT` -- except the PADDED leg (``padded``: per-row kv_lengths) at the 128-wide tile (``tile_n``),
+    where the quiet body measured a LOSS and the pick returns 0 (the arm stays reachable by request / the seam)."""
     if not (has_bias or has_kv_mask) or int(d_flavor) not in (32, 64):
         return 0
     if request is not None:
@@ -2959,6 +2972,8 @@ def sm100_dead_subtile_quiet_pick(
             return 0  # every softmax sub-tile of every item holds a live row: nothing to keep quiet
     if _DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS is not None:
         return int(_DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS)
+    if padded and int(tile_n) == 128:
+        return 0
     return SM100_INF_BODY_DEAD_SUBTILE_QUIET_DEFAULT
 
 
