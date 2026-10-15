@@ -105,6 +105,12 @@ unsupported input runnable.
   must address natively (layout-driven offset math, strides encoded in TMA
   descriptors) — acceptance is a promise about the execute path, not about
   what the adapter can patch up.
+- Architecture admission needs a native compile-and-execute detector, not
+  only a mocked capability check. Shared compiler architecture maps may also
+  gate unrelated kernels; qualify a new operation through a scoped compile
+  target instead of widening that shared support gate. The detector is
+  `test_DSA_indexer_top_k_sm120_native_boundary`, including changed-input replay
+  at the documented shared-memory limits.
 
 **Rule 3 — `execute()` never reads device memory to the host.**
 
