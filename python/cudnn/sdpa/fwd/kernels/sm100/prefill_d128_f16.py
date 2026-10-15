@@ -167,6 +167,7 @@ from cudnn.frost.tile_dsl.pointwise import (
     row_max_reduction,
     tmem_load_max_reduction_x64,
     vec_scale_pair,
+    vec_select_zero,
 )
 from cudnn.frost.tile_dsl.regtile import RegTile
 from cudnn.frost.tile_dsl.mma import mma_ss, mma_ts_step
@@ -2759,7 +2760,9 @@ def _softmax_warp_group(
                 sub_dead = (q_row_coord + cutlass.Int32(sub_tile_id * CFG.TILE_M)) >= eff_seqlen_q
                 quiet_hi = cutlass.Int32(arith.select(sub_dead.ir_value(), bounds.right.ir_value(), bounds.left.ir_value()))
                 for kv_loop in cutlass.range(bounds.left, quiet_hi, 1, unroll=1):
-                    bmm1_phase, stat_empty_phase = _softmax_kv_body_inf_quiet(sub_tile_id, tmem_ptr_i32, bars, bmm1_phase, stat_empty_phase, leader_cta_id, bias_ring_state)
+                    bmm1_phase, stat_empty_phase = _softmax_kv_body_inf_quiet(
+                        sub_tile_id, tmem_ptr_i32, bars, bmm1_phase, stat_empty_phase, leader_cta_id, bias_ring_state
+                    )
                     if cutlass.const_expr(_BIAS_STREAMED):
                         # One ring stage consumed per kv tile (the quiet body waited and released it): advance in lockstep with the fill.
                         bias_ring_state = advance(bias_ring_state, CFG.STAGES_BIAS)
@@ -3282,6 +3285,16 @@ def _correction_warp_group(
                         )
                         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                         o_scaled = o_chunk * inv_sum
+                        if cutlass.const_expr(CFG.SEQ_Q_LENS_PRESENT):
+                            # A TRIMMED row (q_row_global >= seq_len_q[b]: row_trim, inv_sum already 0 on it) stores EXACT zeros through a
+                            # per-element SELECT after the scale, never through the scale alone: the O accumulator it multiplies can be a
+                            # NaN / Inf residue -- a dead softmax sub-tile under the QUIET body (every row of it trimmed) arrives mb_bmm2_ready
+                            # without writing P, so its BMM2 multiplied the S slot's fp32 bits read as bf16 pairs, and NaN x 0 = NaN reached
+                            # the stored rows [seq_len_q[b], S_q) where the full body stored 0 (sdpa-invariants s 2).  row_dead (a keyless
+                            # row: total_sum == 0, the value a dead sub-tile's rows publish) rides the same select.  Without per-batch Q
+                            # lengths a dead sub-tile's rows are all >= S_q, which the O descriptor clips and the Stats store guards, so the
+                            # select is confined to this arm: every rendering without it is byte-identical.
+                            o_scaled = vec_select_zero(row_trim | row_dead, o_scaled, O_CHUNK)
                         o_fp16 = o_scaled.to(STORAGE_DTYPE)
 
                     col_offset_const = (chunk_idx * O_CHUNK) % D_BLOCK_SIZE

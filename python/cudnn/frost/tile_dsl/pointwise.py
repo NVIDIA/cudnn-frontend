@@ -554,6 +554,18 @@ def vec_scale_pair(vec, scalar, N):
     return cutlass.Vector(vector.shape_cast(flat_ty, result), dtype=cutlass.Float32)
 
 
+def vec_select_zero(pred, vec, N):
+    """``select(pred, 0, vec)`` on a ``vector<N x f32>``: EXACT +0.0 in every element where the thread's ``pred`` (one i1) holds,
+    ``vec`` unchanged elsewhere -- one ``arith.select`` over the whole vector (a SEL per element in the SASS, no FMUL).
+
+    The substitute for folding a zero into a scale (``vec * 0``): the multiply keeps a NaN / Inf operand (``NaN * 0 = NaN``), and an
+    accumulator can hold exactly that residue (a stage that ran zero iterations, a sub-tile whose body was skipped), so an epilogue
+    that must store zeros SELECTS them after the arithmetic (sdpa-invariants s 2)."""
+    flat_ty = _ir.VectorType.get([N], T_.f32())
+    zeros = vector.broadcast(flat_ty, cutlass.Float32(0.0).ir_value())
+    return cutlass.Vector(arith.select(pred.ir_value(), zeros, vec.ir_value()), dtype=cutlass.Float32)
+
+
 @cutlass.cute.jit
 def f16x2_to_f32(word, *, dtype=cutlass.Float16):
     """Unpack one Int32 (= 2 packed halves) into ``(lo_f32, hi_f32)`` Float32.
