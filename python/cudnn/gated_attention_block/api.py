@@ -562,17 +562,23 @@ DECODE_CLAIMED_MAX_N_Q = 32
 3 .. 5, 32/2 at ``S_q`` 3 / 4) is compiled, tested and bitwise the two-unit form, but unmeasured on the perf class: a cell on it is
 routed and declared, never ``claimed``, until its perf row lands (then this bound moves to 64)."""
 
-DECODE_MAX_S_Q = 8
-"""The DECLARED decode envelope: ``1 <= S_q <= 8`` (one new token plus up to seven speculative ones: an MTP-7 verify step).  Within it
-every step has a route (:func:`decode_route`: the decode tile in one token unit where its single-unit width table holds the packed
-rows, the paged d256 PREFILL tile with the group packed past it wherever that tile packs the group, the decode tile's token-unit and
-unpacked arms where it does not); beyond it, or beyond ``DECODE_MAX_ROWS`` packed rows, the form is a typed decline (the paged d256
-prefill body serves PACKED queries -- the EXTEND form -- never a dense step over the pools)."""
+DECODE_MAX_ROWS = 32
+"""The widest step the DECODE form serves, in tokens per sequence: the 32-column decode tile UNPACKED (one head per CTA, ``S_q`` live
+rows) -- the arm every group falls back to past its packed routes (:func:`decode_route`), as before the table-driven route landed (the
+same name, the same meaning, the same value: a caller's ``served iff S_q <= DECODE_MAX_ROWS`` holds).  A dense step with more new
+tokens per sequence has no kernel over the pools on this part -- a typed decline (the ``decode_rows`` row), the EXTEND form's (packed)
+business."""
 
-DECODE_MAX_ROWS = 128
-"""The widest step the DECODE form serves, in PACKED rows ``S_q x (H_q / H_kv)``: the d256 prefill tile's Q rows (``CfgD256.TILE_M``,
-pinned by the MTP route tests), so the prefill route runs ONE Q tile per sequence and KV head -- the KV streamed once.  A wider dense
-step over the pools is the EXTEND form's (packed) business."""
+DECODE_MAX_S_Q = DECODE_MAX_ROWS
+"""The served decode envelope in tokens: ``1 <= S_q <= 32`` (== :data:`DECODE_MAX_ROWS`, the unpacked arm's widest step).  The CLAIMED
+bound is :data:`DECODE_CLAIMED_MAX_S_Q` (4, the measured cells); an MTP verify step of up to eight tokens rides the one- and two-stream
+routes (the decode tile in one unit, the paged prefill tile with the group packed, two token units -- the routes validated to ``S_q =
+8``); past a group's packed routes the step rides the decode tile UNPACKED (``group`` KV streams: declared, unmeasured) up to 32 tokens."""
+
+DECODE_PREFILL_TILE_ROWS = 128
+"""The packed rows ``S_q x (H_q / H_kv)`` one Q tile of the paged d256 PREFILL tile holds (``CfgD256.TILE_M``, pinned by the MTP route
+tests): the bound of the DECODE form's prefill route (one Q tile per sequence and KV head, the KV streamed once).  Past it a step rides
+the decode tile's token-unit arm or its unpacked arm (:func:`decode_route`) -- never a decline by itself."""
 
 DECODE_TILE = "decode_d256_f16"
 """``kernel_template`` of the Rubin d256 decode tile (``sdpa/fwd/kernels/sm107/decode_d256_f16.py``: the swap-AB tile)."""
@@ -660,9 +666,9 @@ def decode_route(geometry: "GatedAttentionBlockGeometry", s_q: int, policy: Opti
     """The DECODE route of ``s_q`` tokens at ``geometry`` under ``policy`` (``None`` = :data:`DEFAULT_DECODE_ROUTE_POLICY`), read
     here so the block, the envelope and the tests name the kernel BEFORE anything compiles.
 
-    The DECLARED envelope first: ``1 <= s_q <= DECODE_MAX_S_Q`` and ``s_q x group <= DECODE_MAX_ROWS`` packed rows, else NOT served
-    (``tile`` None, ``reason`` set: a longer or wider dense step over the pools is the EXTEND form's packed business); a head dim other
-    than 256 has no paged read (the d256 flavor's).  Then ONE rule per policy over the decode tile's single-unit width table
+    The SERVED envelope first: ``1 <= s_q <= DECODE_MAX_S_Q`` (32 tokens per sequence: the unpacked arm's widest step), else NOT served
+    (``tile`` None, ``reason`` set: a longer dense step over the pools is the EXTEND form's packed business); a head dim other than 256
+    has no paged read (the d256 flavor's).  Then ONE rule per policy over the decode tile's single-unit width table
     (``config_sm107.D256_DECODE_SINGLE_UNIT_Q_TILES`` = (16, 32, 64), read for the DECODE form's facts -- a PAGED cache under the
     bottom-right CAUSAL mask, so the 64-column width's form predicate admits every packed group; ``max_q_tile`` (appended) caps the
     table: 32 = the route before the 64-column width landed, value for value):
@@ -670,16 +676,20 @@ def decode_route(geometry: "GatedAttentionBlockGeometry", s_q: int, policy: Opti
     * ``"single_unit"`` (the default): packed rows within the table ride the narrowest such width in ONE token unit
       (``config_sm107.decode_d256_single_unit_q_tile``: the KV streamed once -- 24/2 at ``S_q`` 3 .. 5 and 32/2 at ``S_q`` 3 / 4 on the
       64-column tile, 36 .. 64 rows); past the table the step rides the paged d256 PREFILL tile with the whole group packed -- one Q
-      tile per (sequence, KV head), the KV streamed once -- wherever that body packs the group (``pack_gqa_group_size(group,
-      DECODE_MAX_ROWS)``: a group dividing its 128 rows; the cc 10.7 paged THD leg takes whole-group PackGQA only); a group it cannot
-      pack (12 = 24 / 2, 6 = 24 / 4) keeps the adapter's token-unit arm (up to two units of the widest width: two streams -- 24/2 at
-      ``S_q`` 6 .. 8 = two units of the 64-column tile) and the unpacked arm past it (one head per CTA: ``group`` streams) -- the fewest
-      streams any kernel offers it today, never more than the ``"token_units"`` route's.
+      tile per (sequence, KV head), the KV streamed once -- wherever that body packs the group within its tile
+      (``pack_gqa_group_size(group, DECODE_PREFILL_TILE_ROWS)``: a group dividing its 128 rows, ``s_q x group <= 128``; the cc 10.7
+      paged THD leg takes whole-group PackGQA only); a group it cannot pack (12 = 24 / 2, 6 = 24 / 4), or a step past its 128 rows,
+      keeps the adapter's token-unit arm (up to two units of the widest width: two streams -- 24/2 at ``S_q`` 6 .. 10 = two units of
+      the 64-column tile) and the UNPACKED arm past it (one head per CTA, ``S_q`` rows on the 16- or 32-column tile: ``group`` streams
+      -- 32 / 2 from ``S_q`` 9, the arm every group had before the table landed) -- the fewest streams any kernel offers it today,
+      never more than the ``"token_units"`` route's.
     * ``"token_units"``: the adapter's own route verbatim (``config_sm107.decode_d256_q_tile``: the single-unit table, then the widest
       width in up to two token units for a packed group), then the unpacked arm -- the A/B's other arm.
 
-    MHA (``h_q == h_kv``) stays the unpacked 16-column tile (the bit-exact unpacked fold, one stream).  ``claimed`` marks the measured
-    cells: the PACKED decode tile at ``s_q <= DECODE_CLAIMED_MAX_S_Q`` on a width up to :data:`DECODE_CLAIMED_MAX_N_Q`."""
+    MHA (``h_q == h_kv``) stays the unpacked tile (the bit-exact unpacked fold, one stream: 16 columns to 16 tokens, 32 past).  A cap
+    below the width an unpacked step needs (``decode_q_tile_max=16`` at 17 .. 32 tokens) is NOT served either -- the cap is honoured,
+    never widened, and the reason names it.  ``claimed`` marks the measured cells: the PACKED decode tile at ``s_q <=
+    DECODE_CLAIMED_MAX_S_Q`` on a width up to :data:`DECODE_CLAIMED_MAX_N_Q`."""
     from cudnn.sdpa.fwd.config_sm100 import decode_d256_q_units, pack_gqa_group_size
     from cudnn.sdpa.fwd.config_sm107 import decode_d256_q_tile, decode_d256_single_unit_q_tile
 
@@ -712,20 +722,21 @@ def decode_route(geometry: "GatedAttentionBlockGeometry", s_q: int, policy: Opti
     if s_q < 1 or g < 1:
         return route(None, 0, 0, False, 0, f"a dense step needs S_q >= 1 and a whole GQA group, got S_q={s_q} at group {g}")
     if s_q > DECODE_MAX_S_Q:
-        return route(None, 0, 0, False, 0, _decode_s_q_decline(s_q))
-    if rows > DECODE_MAX_ROWS:
-        return route(None, 0, 0, False, 0, _decode_rows_decline(s_q, g))
+        return route(None, 0, 0, False, 0, _decode_rows_decline(s_q))
     if g == 1:
-        # MHA: the unpacked fold on the decode tile (S_q <= 8 rows always fit its narrowest width), one stream
+        # MHA: the unpacked fold on the decode tile (S_q <= 32 rows fit its 16- or 32-column width), one stream
         n_q = decode_d256_single_unit_q_tile(s_q, 1, **form)
-        return route(DECODE_TILE, n_q, 1, False, 1)
+        if n_q:
+            return route(DECODE_TILE, n_q, 1, False, 1)
+        return route(None, 0, 0, False, 0, _decode_cap_decline(s_q, g, cap))
     n_q = decode_d256_single_unit_q_tile(s_q, g, **form)
     if n_q:
         return route(DECODE_TILE, n_q, 1, True, 1)
-    if policy == DECODE_ROUTE_SINGLE_UNIT and pack_gqa_group_size(g, DECODE_MAX_ROWS) == g:
-        # past the table: the paged prefill tile with the whole group packed (one Q tile per sequence and KV head; rows <= 128 here)
+    if policy == DECODE_ROUTE_SINGLE_UNIT and rows <= DECODE_PREFILL_TILE_ROWS and pack_gqa_group_size(g, DECODE_PREFILL_TILE_ROWS) == g:
+        # past the table: the paged prefill tile with the whole group packed (one Q tile per sequence and KV head; rows <= 128)
         return route(PREFILL_TILE, 0, 0, True, 1)
-    # the adapter's token-unit arm (the widest width in up to two units), then its unpacked arm (one head per CTA, one unit)
+    # the adapter's token-unit arm (the widest width in up to two units), then its unpacked arm (one head per CTA, one unit: the
+    # fallback every group had before the table landed, up to 32 tokens)
     n_q = decode_d256_q_tile(s_q, g, **form)
     if n_q:
         units = decode_d256_q_units(s_q, g, n_q)
@@ -733,24 +744,31 @@ def decode_route(geometry: "GatedAttentionBlockGeometry", s_q: int, policy: Opti
     n_q = decode_d256_q_tile(s_q, 1, **form)
     if n_q:
         return route(DECODE_TILE, n_q, 1, False, g)
-    # unreachable inside the declared envelope (S_q <= 8 rows fit the 16-column tile unpacked); kept as the honest last word
-    return route(None, 0, 0, False, 0, _decode_s_q_decline(s_q))
+    # reachable under a cap only (decode_q_tile_max=16 holds the table below the 32-column tile a step of 17 .. 32 tokens needs
+    # unpacked): the cap is honoured, never widened -- the honest last word names it
+    return route(None, 0, 0, False, 0, _decode_cap_decline(s_q, g, cap))
 
 
-def _decode_s_q_decline(s_q: int) -> str:
+_DECODE_ROWS_DECLINE = (
+    f"kv_source='paged' on a dense [B, S_q] declaration (the DECODE form) serves S_q <= {DECODE_MAX_ROWS} new tokens per sequence: the Rubin "
+    "d256 decode tile in one token unit, the paged d256 prefill tile with the group packed or two token units of the decode tile (an MTP "
+    f"verify step), then the decode tile UNPACKED (one head per CTA) up to {DECODE_MAX_ROWS} rows; a longer dense step over the pools is the "
+    "EXTEND form's PACKED (thd=True) business (a QsaSpec geometry has no such cap: the sparse core runs one work item per query row)"
+)
+"""The ``decode_rows`` row's message (:data:`_EXTEND_DECLINES`): the one text the declaration raises, the envelope publishes and the
+route's record carries (with the step appended) for a dense step past :data:`DECODE_MAX_ROWS` tokens."""
+
+
+def _decode_rows_decline(s_q: int) -> str:
+    return f"{_DECODE_ROWS_DECLINE} (got S_q={s_q})"
+
+
+def _decode_cap_decline(s_q: int, group: int, cap: Optional[int]) -> str:
     return (
-        f"kv_source='paged' on a dense [B, S_q] declaration (the DECODE form) serves S_q <= {DECODE_MAX_S_Q} (an MTP-7 verify step: the Rubin "
-        f"d256 decode tile in one token unit, else the paged d256 prefill tile with the group packed; got S_q={s_q}); a longer dense step over "
-        "the pools is the EXTEND form's PACKED (thd=True) business (a QsaSpec geometry has no such cap: the sparse core runs one work item "
-        "per query row)"
-    )
-
-
-def _decode_rows_decline(s_q: int, group: int) -> str:
-    return (
-        f"kv_source='paged' on a dense [B, S_q] declaration (the DECODE form) serves S_q x (H_q / H_kv) <= {DECODE_MAX_ROWS} packed rows (one Q "
-        f"tile of the paged d256 prefill tile per sequence and KV head; got S_q={s_q} at group {group} = {s_q * group} rows); a wider dense step "
-        "over the pools is the EXTEND form's PACKED (thd=True) business"
+        f"kv_source='paged' on a dense [B, S_q] declaration (the DECODE form): decode_q_tile_max={cap} holds the Rubin d256 decode tile's "
+        f"width table below the {16 if s_q <= 16 else 32} columns an UNPACKED step of S_q={s_q} tokens needs, and the packed routes of group "
+        f"{group} are past the capped table too; declare decode_q_tile_max=None (the whole table) or a width of at least that, or a shorter "
+        "step -- the cap is honoured, never widened"
     )
 
 
@@ -801,7 +819,8 @@ class DecodeEnvelope:
     """What :meth:`GatedAttentionBlockFwd.serving_envelope` says about the DECODE form (``kv_source="paged"`` on a dense
     ``[B, S_q]`` declaration) for one ``(geometry, dtype, device)`` -- the shape of :class:`ExtendEnvelope`, plus the route per
     ``S_q`` (:func:`decode_route`: the kernel, its packing and token units, whether the cell is inside the CLAIMED envelope
-    ``S_q <= max_s_q``) and the widest dense step served over the pools (``max_rows``; beyond it a typed decline).  ``declines``
+    ``S_q <= claimed_max_s_q``) and the widest dense step served over the pools (``max_rows`` = ``max_s_q`` = 32 tokens per
+    sequence, the decode tile unpacked; beyond it a typed decline).  ``declines``
     maps every typed decline the form raises AT DECLARATION to its message -- the rows of the ONE table the constructor reads
     (:data:`_EXTEND_DECLINES`) that a dense declaration can hit.
 
@@ -820,7 +839,7 @@ class DecodeEnvelope:
     max_rows: int
     routes: Tuple[
         DecodeRoute, ...
-    ]  # S_q = 1 .. max_s_q + 1 at this geometry's group under ``policy`` (the declared envelope and its first decline; empty under QsaSpec)
+    ]  # S_q = 1 .. max_s_q + 1 at this geometry's group under ``policy`` (the served envelope and its first decline; empty under QsaSpec)
     inference_only: bool = True
     writes_lse: bool = False
 
@@ -5993,24 +6012,10 @@ _EXTEND_DECLINES: Tuple[Tuple[str, type, Callable[[_ServingDecl], bool], str], .
         "attends over the pools, so the write-through attribute is part of its declaration",
     ),
     (
-        "decode_s_q",
-        NotImplementedError,
-        lambda d: _is_paged(d) and not d.thd and d.geometry.qsa is None and d.s_q > DECODE_MAX_S_Q,
-        f"kv_source='paged' on a dense [B, S_q] declaration (the DECODE form) serves S_q <= {DECODE_MAX_S_Q} (an MTP-7 verify step: the Rubin "
-        "d256 decode tile in one token unit, else the paged d256 prefill tile with the group packed); a longer dense step over the pools is the "
-        "EXTEND form's PACKED (thd=True) business (a QsaSpec geometry has no such cap: the sparse core runs one work item per query row)",
-    ),
-    (
         "decode_rows",
         NotImplementedError,
-        lambda d: _is_paged(d)
-        and not d.thd
-        and d.geometry.qsa is None
-        and int(d.geometry.h_kv) >= 1
-        and d.s_q * (int(d.geometry.h_q) // int(d.geometry.h_kv)) > DECODE_MAX_ROWS,
-        f"kv_source='paged' on a dense [B, S_q] declaration (the DECODE form) serves S_q x (H_q / H_kv) <= {DECODE_MAX_ROWS} packed rows (one Q "
-        "tile of the paged d256 prefill tile per sequence and KV head); a wider dense step over the pools is the EXTEND form's PACKED (thd=True) "
-        "business",
+        lambda d: _is_paged(d) and not d.thd and d.geometry.qsa is None and d.s_q > DECODE_MAX_ROWS,
+        _DECODE_ROWS_DECLINE,
     ),
     (
         "sparse",
@@ -6100,9 +6105,10 @@ QsaSpec geometry for the EXTEND form.  With the arm claimed, a packed QsaSpec de
 one and meets its ``sparse`` row (the same row the DECODE form reaches)."""
 
 _DECODE_REQUIRES = (
-    "a DENSE declaration: sample_h [B, S_q, d_model] with 1 <= S_q <= DECODE_MAX_S_Q = 8 and S_q x (H_q / H_kv) <= DECODE_MAX_ROWS = 128 packed rows (the "
-    "claimed envelope S_q <= 4 on the packed 16- / 32-column decode tile; decode_route_policy picks the single-unit route or the adapter's token units, "
-    "decode_q_tile_max caps the tile's width table), the batch uniform",
+    "a DENSE declaration: sample_h [B, S_q, d_model] with 1 <= S_q <= DECODE_MAX_S_Q = DECODE_MAX_ROWS = 32 (the claimed envelope S_q <= 4 on the packed "
+    "16- / 32-column decode tile; an MTP verify step to S_q = 8 on the decode tile in one unit, the paged prefill tile with the group packed within its "
+    "DECODE_PREFILL_TILE_ROWS = 128 or two token units; past a group's packed routes the decode tile UNPACKED, one head per CTA, up to 32 tokens; "
+    "decode_route_policy picks the single-unit route or the adapter's token units, decode_q_tile_max caps the tile's width table), the batch uniform",
     "paged_kv_page_size=P (a positive multiple of 16; validated at page_sizes)",
     "kv_source='paged'",
     "geometry.is_causal=True, geometry.causal_bottom_right=True, window_left=-1, window_right in (-1, 0), qsa=None, d_head=256",
@@ -6112,7 +6118,6 @@ _DECODE_REQUIRES = (
 )
 _DECODE_DECLINE_NAMES = (
     "write_through",
-    "decode_s_q",
     "decode_rows",
     "diagonal",
     "window",

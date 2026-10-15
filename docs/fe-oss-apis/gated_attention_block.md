@@ -138,8 +138,9 @@ Every `N` is a whole number of 256-column tiles, so the forced 256-wide GEMM til
 tile (the 3.8 family's 6 / 1 is the one pinned geometry that takes the LDG kernel). A shard's decode route is its GROUP's (the rule
 reads `h_q / h_kv` and `d_head` only, never `d_model` or the KV-head count): 16 / 1 takes the 32 / 2 entries of the table under
 "Serving: the decode form", 8 / 1 its own, 4 / 1 the group-4 entries -- every shard's group divides the prefill tile, so the KV is
-streamed once per sequence and KV head at every `S_q <= 8` (the decode tile in one unit, then the packed prefill tile), a typed
-decline past that.
+streamed once per sequence and KV head at every `S_q <= 8` (the decode tile in one unit, then the packed prefill tile); past a group's
+packed routes (32 / 2 from `S_q` 9) the step rides the decode tile unpacked, one head per CTA, up to `S_q = 32`; a typed decline past
+32 tokens.
 
 **Flash-Next: exact for `<= 2051` visible tokens.** Flash-Next's attention layer is Qwen Sparse Attention (QSA): the same
 gated core restricted, per query, to indexer-selected 4-token blocks under a 2048-token budget -- the top `min(512, n_blocks)`
@@ -870,10 +871,11 @@ head), `DecodeRoute.tile` / `policy` / `q_tile_max` which kernel ran under which
 |---|---|---|
 | `S_q x group` within a width of the table `(16, 32, 64)` | the Rubin d256 **decode tile** (`sm107/decode_d256_f16.py`, the swap-AB tile at that width), the whole group packed, ONE token unit | `tile = "decode_d256_f16"`, `n_q` 16 / 32 / 64, `token_units = 1`, `kv_streams = 1`, `pack_gqa = True` |
 | past the table, a group dividing 128 (16 = 32 / 2 and 16 / 1, 8 = 8 / 1, 4 = 4 / 1, 32 = 64 / 2, ...) with `S_q x group <= 128` | the paged d256 **prefill tile** (the shared `sm100/prefill_d256_f16.py` body on its paged THD arm: the EXTEND form's binding at the dense step's `(B, S_q)` envelope, the whole group packed, unsplit, the gate in its epilogue): one Q tile per (sequence, KV head) | `tile = "prefill_d256_f16"`, `n_q = 0`, `token_units = 0`, `kv_streams = 1`, `pack_gqa = True` |
-| past the table, a group the prefill tile cannot pack (12): up to two TOKEN UNITS of `64 // group` tokens (24 / 2 at `S_q` 6 .. 8) | the 64-column decode tile in token units, `ceil(S_q / (64 // group))` CTAs per (KV head, sequence, split), each streaming the KV range once | `n_q = 64`, `token_units = 2`, `kv_streams = 2`, `pack_gqa = True` |
-| ... and past two units (a group of 17 .. 21 heads at `S_q` 7 / 8; no served geometry) | the decode tile UNPACKED (the SDPA adapter's own rule for a group it does not pack): one Q head per CTA, one token unit, `S_q` live rows of the 16-column tile | `n_q = 16`, `token_units = 1`, `kv_streams = group`, `pack_gqa = False` |
-| MHA (`group = 1`), `S_q <= 8` | the 16-column tile unpacked (the bit-exact unpacked fold) | `n_q = 16`, `kv_streams = 1`, `pack_gqa = False` |
-| `S_q > 8` (`DECODE_MAX_S_Q`), or `S_q x group > 128` (`DECODE_MAX_ROWS`) | NOT served -- a typed `NotImplementedError` at declaration (the `decode_s_q` / `decode_rows` rows): a longer or wider dense step over the pools is the EXTEND form's PACKED (`thd=True`) business | `tile = None`, `reason` set |
+| past the table, a group the prefill tile cannot pack (12), or a step past its 128 rows: up to two TOKEN UNITS of `64 // group` tokens (24 / 2 at `S_q` 6 .. 10) | the 64-column decode tile in token units, `ceil(S_q / (64 // group))` CTAs per (KV head, sequence, split), each streaming the KV range once | `n_q = 64`, `token_units = 2`, `kv_streams = 2`, `pack_gqa = True` |
+| ... and past two units, up to `S_q = DECODE_MAX_ROWS = 32` (32 / 2 from `S_q` 9, 24 / 2 from 11, 8 / 1 from 17, 24 / 4 from 21; 64 / 2 from 5, 128 / 2 from 3) | the decode tile UNPACKED (the SDPA adapter's own rule, the arm every group had before the table landed): one Q head per CTA, one token unit, `S_q` live rows of the 16-column tile (to 16 tokens) or the 32-column tile (17 .. 32) -- declared, unmeasured | `n_q = 16` / `32`, `token_units = 1`, `kv_streams = group`, `pack_gqa = False` |
+| MHA (`group = 1`), `S_q <= 32` | the 16-column tile unpacked (the bit-exact unpacked fold; the 32-column tile from 17 tokens) | `n_q = 16` / `32`, `kv_streams = 1`, `pack_gqa = False` |
+| `S_q > 32` (`DECODE_MAX_ROWS = DECODE_MAX_S_Q`) | NOT served -- a typed `NotImplementedError` at declaration (the `decode_rows` row): a longer dense step over the pools is the EXTEND form's PACKED (`thd=True`) business; `DECODE_PREFILL_TILE_ROWS = 128` bounds the prefill route only (past it the token-unit and unpacked arms, never a decline) | `tile = None`, `reason` set |
+| `decode_q_tile_max=16` at 17 .. 32 tokens | NOT served -- the cap holds the table below the 32-column tile the unpacked step needs: honoured, never widened (a typed decline naming the cap; the envelope's `routes` predict it) | `tile = None`, `reason` names the cap |
 
 Which `S_q` rides which tile at the served geometries (the default policy; `S_q` 1 .. 8):
 
@@ -897,10 +899,10 @@ two units of the 64-column tile, two streams), then the unpacked tile -- the oth
 either policy; `decode_route(geometry, S_q, policy=, max_q_tile=)` and `serving_envelope(..., decode_route_policy=,
 decode_q_tile_max=)` read them. The CLAIMED envelope is `1 <= S_q <= DECODE_CLAIMED_MAX_S_Q = 4` on the PACKED decode tile at a
 width up to `DECODE_CLAIMED_MAX_N_Q = 32` (`DecodeRoute.claimed`: the measured cells -- 24 / 2 and 32 / 2 at `S_q <= 2`, and at
-`S_q` 3 / 4 under `decode_q_tile_max=32`); the declared envelope runs to `S_q = DECODE_MAX_S_Q = 8` (an MTP-7 verify step) and 128
-packed rows, and the 64-column tile's cells, the prefill route, the token-unit cells past `S_q = 4` and the unpacked arm are routed
-and declared, unmeasured (the 64-column tile is bitwise the two-unit 32-column form at the same split: the SDPA suite's cross-form
-pin, repeated at the block level). The tail
+`S_q` 3 / 4 under `decode_q_tile_max=32`); the served envelope runs to `S_q = DECODE_MAX_S_Q = DECODE_MAX_ROWS = 32` (the unpacked
+arm's widest step; an MTP verify step of up to 8 tokens rides the one- and two-stream routes), and the 64-column tile's cells, the
+prefill route, the token-unit cells past `S_q = 4` and the unpacked arm are routed and declared, unmeasured (the 64-column tile is
+bitwise the two-unit 32-column form at the same split: the SDPA suite's cross-form pin, repeated at the block level). The tail
 tile READS the pool rows past `kv_lens[b]` -- the last page's stale rows, and block `0` for the pages a short row does not list
 -- and masks them to `P = 0`: they contribute nothing as long as they are FINITE, as a zero-initialized cache's are (a NaN
 there is `0 x NaN`). On the decode tile the plan is a split-KV plan whenever the SDPA
@@ -931,8 +933,8 @@ the EXTEND form (`gate_fused`, no separate launch).
 reads at construction instead of catching exceptions: the forms served (`forms`, drawn from `extend` / `decode`) and one record
 per form (`extend`: `ExtendEnvelope`, `decode`: `DecodeEnvelope` -- `served`, the `reason` it would decline with, every typed
 decline of the form in `declines`), `page_sizes` (16 / 32 / 64 / 128), `pool_layouts` (the three stride patterns), the decode
-route per `(group, S_q)` (`decode.routes` for `S_q` 1 .. 9 -- the declared envelope and its first decline --, `decode.route(s_q)`
-for any step, `decode.max_s_q` = 8 / `decode.claimed_max_s_q` = 4 / `decode.max_rows` = 128, `decode.policy` / `decode.q_tile_max`; the
+route per `(group, S_q)` (`decode.routes` for `S_q` 1 .. 33 -- the served envelope and its first decline --, `decode.route(s_q)`
+for any step, `decode.max_s_q` = `decode.max_rows` = 32 / `decode.claimed_max_s_q` = 4, `decode.policy` / `decode.q_tile_max`; the
 policy and the width cap the record reads are `serving_envelope(..., decode_route_policy=, decode_q_tile_max=)`'s), the pool dtypes (`dtypes`: bf16 / f16 -- an e4m3 pool is not served), the part and the CuTe DSL facts
 (`device_cc`, `cutedsl_ok` / `cutedsl_reason`) -- derived from the same
 helpers the declaration and `check_support` run, so no decline is reachable at `execute` that the record did not predict (the
@@ -941,8 +943,9 @@ not serve. Typed declines of the form, at declaration: `kv_source="paged"` witho
 declaration (the EXTEND form is its own binding), a quantized `quant`, `save_for_backward`, a head dim other than 256, a sparse
 geometry on the PACKED form (a dense `QsaSpec` declaration is the block-sparse decode mode below), `is_causal` without
 `causal_bottom_right`, a pool or table sample off its contract, `max_kv_len` past the table's reach, a step past
-`DECODE_MAX_S_Q = 8` or `DECODE_MAX_ROWS = 128` packed rows (dense geometries), a pinned `decode_split_kv > 1` on the prefill
-route; `kv_source="self"` refuses every paged-read input rather than ignoring it.
+`DECODE_MAX_ROWS = DECODE_MAX_S_Q = 32` tokens (dense geometries; the `decode_rows` row), a `decode_q_tile_max` held below the width
+an unpacked step needs, a pinned `decode_split_kv > 1` on the prefill route; `kv_source="self"` refuses every paged-read input rather
+than ignoring it.
 
 **On a `QsaSpec` geometry the same declaration is the block-sparse DECODE / extend-with-prefix mode (2026-10-14).**
 `GatedAttentionBlockFwd(sample_h [B, S_q, d_model], ..., geometry_with_qsa (causal_bottom_right=True), paged_kv_page_size=P,
@@ -1360,9 +1363,10 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
   typed decline `serving_envelope` predicts.
 - The serving DECODE form (`kv_source="paged"` on a dense `[B, S_q]` block over `paged_kv_page_size > 0`): bf16 / f16 inference,
   `d_head = 256`, `is_causal` with `causal_bottom_right` (no window), the batch uniform, `block_table` + `kv_lens` at `execute`
-  (`seq_lens` refused), the pools and the table exactly the declared samples; the declared envelope `S_q <= 8` and 128 packed rows
-  (the claimed envelope `S_q <= 4` on the Rubin d256 decode tile; the prefill route, the token-unit cells past it and the unpacked
-  arm declared, unmeasured), a typed decline beyond; `fuse_gate` rides the decode tile's split combine or the paged prefill body's
+  (`seq_lens` refused), the pools and the table exactly the declared samples; the served envelope `S_q <= 32` (the claimed envelope
+  `S_q <= 4` on the Rubin d256 decode tile; the MTP verify step to `S_q = 8` on the one- and two-stream routes; the prefill route, the
+  token-unit cells past `S_q = 4` and the unpacked arm up to 32 tokens declared, unmeasured), a typed decline beyond; `fuse_gate` rides
+  the decode tile's split combine or the paged prefill body's
   epilogue, else its own launch ("Serving: the decode form" above).  On a `QsaSpec` geometry the same
   declaration is the block-sparse DECODE / extend-with-prefix mode: stage (4) the sparse core reading the pools, one list per sequence
   at `S_q <= 4` (`block_ids [B, top_k]`) and one per row past it (any `S_q`), `decode_split_kv` in `[1, ceil((top_k + 1) / 32)]` or the
