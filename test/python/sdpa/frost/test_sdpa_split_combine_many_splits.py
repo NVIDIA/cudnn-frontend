@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""The shared split combine over MANY splits: the grouped tail walk (``G_T`` splits per memory round trip past the ``G_S`` head group)
-reduces every split count -- a group boundary hit exactly, one short of it, one past it, and a decode-shaped row count -- to the float64
-reference, with dead splits and dead rows handled as the three-split tests of ``test_sdpa_split_combine_sm100.py`` pin them -- the
-decode-shaped case keeps its only row LIVE (a dead split inside the tail and a dead LAST split beside live ones), so the grouped tail's
-accumulation on a live decode row is what it checks; the multi-row shape adds the all-dead row.  Runs on any
+"""The shared split combine over MANY splits: the grouped walks (the lean forms' up-front loads of at most ``G_S`` splits, the serial and
+decode forms' walks past them) reduce every split count -- a group boundary hit exactly, one short of it, one past it, and a decode-shaped
+row count -- to the float64 reference, with dead splits and dead rows handled as the three-split tests of ``test_sdpa_split_combine_sm100.py``
+pin them -- the decode-shaped case keeps its only row LIVE (a dead split inside the walk and a dead LAST split beside live ones), so the
+grouped accumulation on a live decode row is what it checks; the multi-row shape adds the all-dead row.  Runs on any
 SM100-line part (the combine has no arch-specific lowering; the Rubin d256 decode tile is its heaviest caller at 64 splits)."""
 
 import pytest
@@ -61,9 +61,11 @@ def test_pointer_combine_many_splits_matches_the_reference(shape, splits):
         assert torch.all(torch.isneginf(lse[:, :, 0]))
 
 
-def test_tail_group_is_wider_than_the_head_group():
-    """The grouped walk is the lever: the tail loads G_T splits per round trip (the serial walk cost ~0.3 us per split per pass on a
-    batch-1 decode launch); the head group stays what the first splits' math needs."""
+def test_the_walks_load_several_splits_per_round_trip():
+    """The grouped walk is the lever (a one-split-per-step walk cost ~0.3 us per split per pass on a batch-1 decode launch): the lean forms
+    load every split of a row up front (``G_LEAN_SMALL`` / ``G_S`` of them), the serial form walks ``_SERIAL_UNROLL`` deep and the decode
+    form's O pass ``_DECODE_UNROLL`` deep."""
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 
-    assert comb.G_T >= 8 and comb.G_T >= comb.G_S
+    assert comb.G_LEAN_SMALL >= 8 and comb.G_S >= comb.G_LEAN_SMALL
+    assert comb._SERIAL_UNROLL >= 8 and comb._DECODE_UNROLL >= 8
