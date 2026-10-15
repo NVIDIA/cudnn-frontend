@@ -81,8 +81,11 @@ THREADS = 128
 ROWS_PER_BLOCK = THREADS // 32
 # Splits whose LSE and partial-O rows the lean form loads up front, before any math.  The lean form serves a launch whose whole split axis fits in
 # this group (n_splits <= G_S): every load goes out at once, one memory round trip, which beats the serial form there (B300, d256 S_q = 4, 6-8 splits:
-# 2.9 us against 4.7).  Past it the serial form's sixteen-deep walks are far ahead.  G_S = 4 saves 0.5 us up to 4 splits but loses 2 us at 5-8.
-G_S = 8
+# 2.9 us against 4.7) and the decode form's three dependent trips (S_q = 1, 16 splits: 4.7 us against 2.9).  Past it the serial / decode forms' walks are
+# far ahead.  A row with at most G_LEAN_SMALL splits loads only that many (the wide group's extra clamped slots cost ~0.4 us at 8 splits).
+G_S = 16
+# The narrow group: rows with at most this many splits load only this many (every extra clamped slot costs a load pair and an exp: ~0.4 us at 8 splits).
+G_LEAN_SMALL = 8
 # Unroll depth of the serial combine's split walks (one warp per row): the
 # loads of this many splits are issued together, so the latency of the
 # dependent walk is paid once per group rather than once per split.  Each walk
@@ -220,6 +223,62 @@ def _ld_global_f32(addr):
     return cutlass.Float32(r[0] if isinstance(r, (tuple, list)) else r)
 
 
+def _lean_accumulate(G, lse_base, lse_step, o_row_base, o_step, s_last, n_splits, sinks, head):
+    """The lean combine's load + weighted accumulate for ONE lane (columns 4l..4l+3) over the first ``G`` splits, as a trace-time function so the kernel
+    can instantiate two group widths and pick one per row: the first group (``G`` = G_LEAN_SMALL) is the cheap one-round-trip form for the common few
+    splits; the wide group (``G`` = G_S) keeps one round trip up to G_S splits at the price of the extra clamped loads.  Returns the dead-row flag, the
+    denominator, the four weighted O sums and the (0-substituted) max the LSE is built from."""
+    neg_inf = cutlass.Float32(NEG_INF)
+    zero = cutlass.Float32(0.0)
+    # Every load of the row goes out first -- the LSE of the first G splits and their partial-O
+    # rows (a clamped split index re-reads the last split for slots past n_splits; those get
+    # weight 0) -- so a warp pays ONE memory round trip instead of one per pass.
+    lse_v = []
+    o_v = []
+    for s in range(G):
+        s_eff64 = cutlass.Int64(cute.math.min(cutlass.Int32(s), s_last))
+        lse_v.append(_ld_global_f32(lse_base + s_eff64 * lse_step))
+        o_v.append(ld_global_v4(o_row_base + s_eff64 * o_step, cutlass.Float32))
+    m = neg_inf
+    for s in range(G):
+        m = cute.math.max(m, lse_v[s])
+    # All splits dead (every row fully masked): emit O := 0 / lse := -inf rather than
+    # exp(-inf - -inf) == NaN.  m_safe only feeds the exponentials.
+    all_dead = m == neg_inf
+    m_safe = cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), m.ir_value()))
+    # With a sink the reference max is max(m, sink), which is finite even on a
+    # keyless row, and the denominator starts with the sink column's weight
+    # exp(sink - M): that row then yields O = 0 and LSE = sink + log(1) = sink,
+    # the unsplit kernels' keyless-row contract.
+    sink_term = zero
+    if cutlass.const_expr(sinks is not None):
+        sink_logit = cutlass.Float32(cutlass.make_array_view(sinks)[head])
+        m_safe = cute.math.max(m, sink_logit)
+        all_dead = m_safe == neg_inf
+        sink_term = cute.math.exp(sink_logit - m_safe, fastmath=True)
+    acc0 = zero
+    acc1 = zero
+    acc2 = zero
+    acc3 = zero
+    den = sink_term
+    for s in range(G):
+        lse_s = lse_v[s]
+        v = o_v[s]
+        live = (lse_s > neg_inf) & (cutlass.Int32(s) < n_splits)
+        e = cute.math.exp(lse_s - m_safe, fastmath=True)
+        w = cutlass.Float32(arith.select(live.ir_value(), e.ir_value(), zero.ir_value()))
+        v0 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[0]).ir_value(), zero.ir_value()))
+        v1 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[1]).ir_value(), zero.ir_value()))
+        v2 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[2]).ir_value(), zero.ir_value()))
+        v3 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[3]).ir_value(), zero.ir_value()))
+        den = den + w
+        acc0 = acc0 + w * v0
+        acc1 = acc1 + w * v1
+        acc2 = acc2 + w * v2
+        acc3 = acc3 + w * v3
+    return all_dead, den, acc0, acc1, acc2, acc3, m_safe
+
+
 @cute.kernel
 def _combine_kernel(
     o_partial: cute.Tensor,  # [S*B, S_q, H, D] — split-major partial O
@@ -351,52 +410,20 @@ def _combine_kernel(
                 d0 = cbase + lane * cutlass.Int32(4)
                 if d0 < d_v:
                     o_row_base = o_base + cutlass.Int64(cute.crd2idx((batch, q_row, head, d0), o_partial.layout)) * 4
-                    # Every load of the row goes out first -- the LSE of the first G_S splits and their partial-O
-                    # rows (a clamped split index re-reads the last split for slots past n_splits; those get
-                    # weight 0) -- so a warp pays ONE memory round trip instead of one per pass.
-                    lse_v = []
-                    o_v = []
-                    for s in cutlass.range_constexpr(G_S):
-                        s_eff64 = cutlass.Int64(cute.math.min(cutlass.Int32(s), s_last))
-                        lse_v.append(_ld_global_f32(lse_base + s_eff64 * lse_step))
-                        o_v.append(ld_global_v4(o_row_base + s_eff64 * o_step, cutlass.Float32))
-                    m = neg_inf
-                    for s in cutlass.range_constexpr(G_S):
-                        m = cute.math.max(m, lse_v[s])
-                    # All splits dead (every row fully masked): emit O := 0 / lse := -inf rather than
-                    # exp(-inf - -inf) == NaN.  m_safe only feeds the exponentials.
-                    all_dead = m == neg_inf
-                    m_safe = cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), m.ir_value()))
-                    # With a sink the reference max is max(m, sink), which is finite even on a
-                    # keyless row, and the denominator starts with the sink column's weight
-                    # exp(sink - M): that row then yields O = 0 and LSE = sink + log(1) = sink,
-                    # the unsplit kernels' keyless-row contract.
-                    sink_term = zero
-                    if cutlass.const_expr(sinks is not None):
-                        sink_logit = cutlass.Float32(cutlass.make_array_view(sinks)[head])
-                        m_safe = cute.math.max(m, sink_logit)
-                        all_dead = m_safe == neg_inf
-                        sink_term = cute.math.exp(sink_logit - m_safe, fastmath=True)
+                    den = zero
                     acc0 = zero
                     acc1 = zero
                     acc2 = zero
                     acc3 = zero
-                    den = sink_term
-                    for s in cutlass.range_constexpr(G_S):
-                        lse_s = lse_v[s]
-                        v = o_v[s]
-                        live = (lse_s > neg_inf) & (cutlass.Int32(s) < n_splits)
-                        e = cute.math.exp(lse_s - m_safe, fastmath=True)
-                        w = cutlass.Float32(arith.select(live.ir_value(), e.ir_value(), zero.ir_value()))
-                        v0 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[0]).ir_value(), zero.ir_value()))
-                        v1 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[1]).ir_value(), zero.ir_value()))
-                        v2 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[2]).ir_value(), zero.ir_value()))
-                        v3 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[3]).ir_value(), zero.ir_value()))
-                        den = den + w
-                        acc0 = acc0 + w * v0
-                        acc1 = acc1 + w * v1
-                        acc2 = acc2 + w * v2
-                        acc3 = acc3 + w * v3
+                    # Two group widths, one per row of splits: the narrow group's loads are the whole axis for the common few splits, the wide one covers up to G_S.
+                    if n_splits <= cutlass.Int32(G_LEAN_SMALL):
+                        all_dead, den, acc0, acc1, acc2, acc3, m_safe = _lean_accumulate(
+                            G_LEAN_SMALL, lse_base, lse_step, o_row_base, o_step, s_last, n_splits, sinks, head
+                        )
+                    else:
+                        all_dead, den, acc0, acc1, acc2, acc3, m_safe = _lean_accumulate(
+                            G_S, lse_base, lse_step, o_row_base, o_step, s_last, n_splits, sinks, head
+                        )
                     inv_den = cutlass.Float32(1.0) / cute.math.max(den, cutlass.Float32(1e-30))
                     inv_den = cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), inv_den.ir_value()))
                     outs = (acc0 * inv_den, acc1 * inv_den, acc2 * inv_den, acc3 * inv_den)
@@ -1204,13 +1231,18 @@ def _launch_combine(
         gate,
     )
     # Two kernels, chosen per launch: decode rows (S_q <= 2, where the block has
-    # at least two warps per row) hand the block's spare warps to the split axis
-    # of the same row (_combine_decode_kernel: B300 128 splits 32.5 -> 12.6 us,
-    # 32 splits 10.5 -> 5.8); S_q = 3 and up keep the serial one-warp-per-row
-    # form, whose lower register footprint matters where the combine is a
-    # throughput problem (b=128 x 16 rows x 2 splits: 41 us against 61 for the
-    # decode form) and which beats the single-warp lane-strided form at S_q = 3.
-    if cutlass.Int32(SQ) <= cutlass.Int32(ROWS_PER_BLOCK // 2):
+    # at least two warps per row) with more splits than the lean form's up-front
+    # group hand the block's spare warps to the split axis of the same row
+    # (_combine_decode_kernel: B300 128 splits 32.5 -> 12.6 us, 32 splits 10.5
+    # -> 5.8); S_q = 3 and up keep the one-warp-per-row form, whose lower
+    # register footprint matters where the combine is a throughput problem
+    # (b=128 x 16 rows x 2 splits: 41 us against 61 for the decode form) and
+    # which beats the single-warp lane-strided form at S_q = 3.  A decode row
+    # whose whole split axis fits the lean group (n_splits <= G_S) also takes
+    # the one-warp-per-row form: every load goes out at once, one memory round
+    # trip, where the decode form pays three dependent ones (B300, d64 / d128
+    # S_q = 1, 2-8 splits: 3.4-4.4 us -> 2.1-2.9 us).
+    if (cutlass.Int32(SQ) <= cutlass.Int32(ROWS_PER_BLOCK // 2)) & (n_splits > cutlass.Int32(G_S)):
         _combine_decode_kernel(*args).launch(
             grid=(1, H, B),
             block=[THREADS, 1, 1],
