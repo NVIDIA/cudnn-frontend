@@ -470,7 +470,7 @@ def test_mxfp8_sm120_head_dims(d_qk, d_v):
 @pytest.mark.parametrize("d_v", [256, 128], ids=lambda d: f"dv{d}")
 @torch_fork_set_rng(seed=18)
 def test_mxfp8_sm120_d256_qk_on_both_kv_tiles(d_v, kv_tile):
-    """A 256-column Q/K head on either KV tile: plane-major Q@K^T at (256, 256) on 64 keys, pair-major otherwise."""
+    """A 256-column Q/K head on either KV tile."""
     _check(_run(1, 4, 2, 256, 384, d_qk=256, d_v=d_v, tiles=(128, kv_tile), sdpa_kwargs=_MASKS["causal"]), d_qk=256)
 
 
@@ -567,17 +567,6 @@ def test_mxfp8_sm120_split_kv_graph_head_dims(d_qk, d_v):
     """Split-KV with two V scale planes (D_V = 256), asymmetric QK^T / P@V tiles and zero-padded envelope
     head dims, over a KV length off the tile grid (split-KV declines padding masks)."""
     _check(_run(1, 4, 1, 96, 1100, d_qk=d_qk, d_v=d_v, out_dt=torch.bfloat16, split_kv=2, sdpa_kwargs=_MASKS["causal"]), d_qk=d_qk)
-
-
-@pytest.mark.L0
-@pytest.mark.parametrize("split_kv", [2, 3])
-@torch_fork_set_rng(seed=66)
-def test_mxfp8_sm120_split_kv_64_key_tiles(split_kv):
-    """(256, 256) 64-key tiles reuse each 128-key K/V scale copy; splits starting mid-span read their own scales."""
-    _check(
-        _run(1, 4, 4, 96, 1100, d_qk=256, d_v=256, tiles=(128, 64), out_dt=torch.bfloat16, split_kv=split_kv, sdpa_kwargs=_MASKS["causal_br"]),
-        d_qk=256,
-    )
 
 
 @pytest.mark.L0

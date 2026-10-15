@@ -76,7 +76,6 @@ from cudnn.sdpa.fwd.kernels.thd_helpers import (
 from cudnn.sdpa.fwd.kernels.sm120._common import (
     SCHED_L2_BUDGET_BYTES,
     ceil_div,
-    mxfp8_sf_coords,
     nvvm_threadquad_reduction_max,
     nvvm_threadquad_reduction_sum,
 )
@@ -1556,8 +1555,43 @@ class SM120FusedMultiHeadAttentionForward:
         if cutlass.const_expr(self.thd_varlen):
             tma_batch_idx = cutlass.Int32(0)
 
-        sf_coords = mxfp8_sf_coords(
-            sf_q, sf_k, sf_v, seq_kv_lens, batch_idx, kv_head_idx, num_heads_q, num_heads_kv, lane, self.v_sf_tile_bytes, self.thd_varlen
+        # Scale-tile coordinates of this (sequence, head). Dense scale tensors
+        # are (B, H, tiles, tile_bytes); THD packs each sequence's tiles along
+        # the tile axis of a batch-1 view, after every earlier sequence's
+        # ceil(len / 128) tiles (Q and K/V each count their own lengths).
+        sf_q_bh0 = batch_idx * num_heads_q
+        sf_kv_bh0 = batch_idx * num_heads_kv
+        sf_q_tile0 = cutlass.Int32(0)
+        sf_kv_tile0 = cutlass.Int32(0)
+        if cutlass.const_expr(self.thd_varlen):
+            sf_q_bh0 = cutlass.Int32(0)
+            sf_kv_bh0 = cutlass.Int32(0)
+            n_batch_meta = (seq_kv_lens.shape[0] - 4) // 4
+            meta_sf = cutlass.make_array_view(seq_kv_lens)
+            # The lanes split the earlier sequences and a butterfly sums their tile counts, so a unit
+            # reads ceil(batch_idx / 32) sequences' lengths per lane rather than batch_idx.
+            for prev in cutlass.range(lane, batch_idx, cute.arch.WARP_SIZE, unroll=1):
+                len_q_prev = cutlass.Int32(meta_sf[n_batch_meta + prev + 1]) - cutlass.Int32(meta_sf[n_batch_meta + prev])
+                len_kv_prev = cutlass.Int32(meta_sf[2 * n_batch_meta + 2 + prev]) - cutlass.Int32(meta_sf[2 * n_batch_meta + 1 + prev])
+                sf_q_tile0 = sf_q_tile0 + ceil_div(len_q_prev, SF_ATOM_ROWS)
+                sf_kv_tile0 = sf_kv_tile0 + ceil_div(len_kv_prev, SF_ATOM_ROWS)
+            for i in cutlass.range_constexpr(5):
+                sf_q_tile0 = sf_q_tile0 + prims.shfl_sync(thread_mask=0xFFFFFFFF, val=sf_q_tile0, offset=16 >> i, mask_and_clamp=0x1F, kind=prims.Shfl.BFLY)
+                sf_kv_tile0 = sf_kv_tile0 + prims.shfl_sync(thread_mask=0xFFFFFFFF, val=sf_kv_tile0, offset=16 >> i, mask_and_clamp=0x1F, kind=prims.Shfl.BFLY)
+        sf_kv_tiles = cutlass.Int32(sf_k.shape[2])
+        # Dense V planes sit a whole plane of B * H_kv * tiles atoms apart;
+        # THD keeps the planes of one tile contiguous.
+        v_sf_tile_stride = self.v_sf_tile_bytes if cutlass.const_expr(self.thd_varlen) else SF_ATOM_BYTES
+        v_sf_plane_stride = cutlass.Int64(SF_ATOM_BYTES)
+        if cutlass.const_expr(not self.thd_varlen):
+            v_sf_plane_stride = cutlass.Int64(sf_v.shape[0]) * cutlass.Int64(sf_v.shape[1]) * cutlass.Int64(sf_v.shape[2]) * SF_ATOM_BYTES
+        sf_coords = SimpleNamespace(
+            k_ptr=sf_k.iterator.raw_ptr(),
+            v_ptr=sf_v.iterator.raw_ptr(),
+            # First K/V scale tile of this (sequence, KV head).
+            kv_tile_base=(cutlass.Int64(sf_kv_bh0) + cutlass.Int64(kv_head_idx)) * sf_kv_tiles + sf_kv_tile0,
+            v_tile_stride=v_sf_tile_stride,
+            v_plane_stride=v_sf_plane_stride,
         )
         # /////////////////////////////////////////////////////////////////////////////
         #  COMPUTE (every warp)
@@ -1631,10 +1665,10 @@ class SM120FusedMultiHeadAttentionForward:
             k_envelope=k_envelope,
             v_envelope=v_envelope,
             q_head_base=q_head_base,
-            sf_q_ptr=sf_coords.q_ptr,
-            sf_q_bh0=sf_coords.q_bh0,
-            sf_q_tiles=sf_coords.q_tiles,
-            sf_q_tile0=sf_coords.q_tile0,
+            sf_q_ptr=sf_q.iterator.raw_ptr(),
+            sf_q_bh0=sf_q_bh0,
+            sf_q_tiles=cutlass.Int32(sf_q.shape[2]),
+            sf_q_tile0=sf_q_tile0,
             sf_coords=sf_coords,
         )
         mma_params = SimpleNamespace(
