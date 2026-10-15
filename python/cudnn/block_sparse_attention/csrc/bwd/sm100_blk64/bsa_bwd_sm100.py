@@ -1413,6 +1413,9 @@ class BlockSparseAttnBackwardSm100Blk64:
                         load_compute_LSE_producer_state.index,
                     ].fill(0.0)
 
+            # Track cp.async without noinc, then publish ordinary zero stores.
+            stats_barrier = load_compute_LSE_pipeline.producer_get_barrier(load_compute_LSE_producer_state)
+            nvvm.cp_async_mbarrier_arrive(stats_barrier.to_llvm_ptr())
             load_compute_LSE_pipeline.producer_commit(load_compute_LSE_producer_state)
             load_compute_LSE_producer_state.advance()
 
@@ -1497,6 +1500,9 @@ class BlockSparseAttnBackwardSm100Blk64:
                         load_compute_sum_OdO_producer_state.index,
                     ].fill(0.0)
 
+            # Track cp.async without noinc, then publish ordinary zero stores.
+            stats_barrier = load_compute_sum_OdO_pipeline.producer_get_barrier(load_compute_sum_OdO_producer_state)
+            nvvm.cp_async_mbarrier_arrive(stats_barrier.to_llvm_ptr())
             load_compute_sum_OdO_pipeline.producer_commit(load_compute_sum_OdO_producer_state)
             load_compute_sum_OdO_producer_state.advance()
 
@@ -1608,6 +1614,9 @@ class BlockSparseAttnBackwardSm100Blk64:
                             load_compute_LSE_producer_state.index,
                         ].fill(0.0)
 
+                # Track cp.async without noinc, then publish ordinary zero stores.
+                stats_barrier = load_compute_LSE_pipeline.producer_get_barrier(load_compute_LSE_producer_state)
+                nvvm.cp_async_mbarrier_arrive(stats_barrier.to_llvm_ptr())
                 load_compute_LSE_pipeline.producer_commit(load_compute_LSE_producer_state)
                 load_compute_LSE_producer_state.advance()
 
@@ -1684,6 +1693,9 @@ class BlockSparseAttnBackwardSm100Blk64:
                             load_compute_sum_OdO_producer_state.index,
                         ].fill(0.0)
 
+                # Track cp.async without noinc, then publish ordinary zero stores.
+                stats_barrier = load_compute_sum_OdO_pipeline.producer_get_barrier(load_compute_sum_OdO_producer_state)
+                nvvm.cp_async_mbarrier_arrive(stats_barrier.to_llvm_ptr())
                 load_compute_sum_OdO_pipeline.producer_commit(load_compute_sum_OdO_producer_state)
                 load_compute_sum_OdO_producer_state.advance()
 
@@ -2558,7 +2570,7 @@ class BlockSparseAttnBackwardSm100Blk64:
             pipeline.Agent.Thread,
             self.threads_per_warp * self.num_compute_warps,
         )
-        return pipeline.PipelineCpAsync.create(
+        return pipeline.PipelineAsync.create(
             barrier_storage=load_compute_lse_mbar_ptr,
             num_stages=self.load_compute_LSE_stage,
             producer_group=load_compute_lse_producer_group,
@@ -2574,7 +2586,7 @@ class BlockSparseAttnBackwardSm100Blk64:
             pipeline.Agent.Thread,
             self.threads_per_warp * self.num_compute_warps,
         )
-        return pipeline.PipelineCpAsync.create(
+        return pipeline.PipelineAsync.create(
             barrier_storage=load_compute_sum_OdO_mbar_ptr,
             num_stages=self.load_compute_sum_OdO_stage,
             producer_group=load_compute_sum_OdO_producer_group,

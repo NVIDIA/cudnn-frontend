@@ -7,6 +7,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.typing import Float32, Int32
 import cutlass.pipeline as pipeline
+from cutlass._mlir.dialects import nvvm
 from cutlass.cute.nvgpu import LoadCacheMode, OperandMajorMode, cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils
 
@@ -638,6 +639,9 @@ class LocalPairedBackwardSm100(BlockSparseAttnBackwardSm100Blk64):
                         load_compute_LSE_producer_state.index,
                     ].fill(0.0)
 
+            # Track cp.async without noinc, then publish ordinary zero stores.
+            stats_barrier = load_compute_LSE_pipeline.producer_get_barrier(load_compute_LSE_producer_state)
+            nvvm.cp_async_mbarrier_arrive(stats_barrier.to_llvm_ptr())
             load_compute_LSE_pipeline.producer_commit(load_compute_LSE_producer_state)
             load_compute_LSE_producer_state.advance()
 
@@ -717,6 +721,9 @@ class LocalPairedBackwardSm100(BlockSparseAttnBackwardSm100Blk64):
                         load_compute_sum_OdO_producer_state.index,
                     ].fill(0.0)
 
+            # Track cp.async without noinc, then publish ordinary zero stores.
+            stats_barrier = load_compute_sum_OdO_pipeline.producer_get_barrier(load_compute_sum_OdO_producer_state)
+            nvvm.cp_async_mbarrier_arrive(stats_barrier.to_llvm_ptr())
             load_compute_sum_OdO_pipeline.producer_commit(load_compute_sum_OdO_producer_state)
             load_compute_sum_OdO_producer_state.advance()
 
@@ -828,6 +835,9 @@ class LocalPairedBackwardSm100(BlockSparseAttnBackwardSm100Blk64):
                             load_compute_LSE_producer_state.index,
                         ].fill(0.0)
 
+                # Track cp.async without noinc, then publish ordinary zero stores.
+                stats_barrier = load_compute_LSE_pipeline.producer_get_barrier(load_compute_LSE_producer_state)
+                nvvm.cp_async_mbarrier_arrive(stats_barrier.to_llvm_ptr())
                 load_compute_LSE_pipeline.producer_commit(load_compute_LSE_producer_state)
                 load_compute_LSE_producer_state.advance()
 
@@ -904,6 +914,9 @@ class LocalPairedBackwardSm100(BlockSparseAttnBackwardSm100Blk64):
                             load_compute_sum_OdO_producer_state.index,
                         ].fill(0.0)
 
+                # Track cp.async without noinc, then publish ordinary zero stores.
+                stats_barrier = load_compute_sum_OdO_pipeline.producer_get_barrier(load_compute_sum_OdO_producer_state)
+                nvvm.cp_async_mbarrier_arrive(stats_barrier.to_llvm_ptr())
                 load_compute_sum_OdO_pipeline.producer_commit(load_compute_sum_OdO_producer_state)
                 load_compute_sum_OdO_producer_state.advance()
 
