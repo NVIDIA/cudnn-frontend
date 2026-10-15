@@ -2286,9 +2286,11 @@ _SM107_DECODE_SPILL_PROBE = textwrap.dedent("""
         kw.update(paged_kv=True, page_size=16)
     if "br" in toks:
         kw.update(bottom_right=True, window_right=0, seq_q_lens_present=True)
+    if "swa" in toks:
+        kw.update(window_left=255)  # a left window: the record's MASK_SWA bit, the other mask the width's predicate admits over pages
     mod = _load_sm100_kernel_module((256, 256), TemplateParams(**kw), rubin=True)
     print("MODULE", mod.N_Q, mod.CFG.SOFTMAX_WARPS, mod.CFG.THREADS_PER_CTA)
-    mod.compile(d_qk=256, d_v=256, has_lse=True, paged_hnd="hnd" in toks)
+    mod.compile(d_qk=256, d_v=256, has_lse=True, paged_hnd="hnd" in toks, **(dict(use_pdl=True) if "pdl" in toks else {}))
     cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
     if not cubins:
         print("FAIL no cubin dumped into", dump, os.listdir(dump)); sys.exit(3)
@@ -2334,15 +2336,22 @@ def _nvdisasm_candidates():
         pytest.param(12, "paged+br+hnd", id="24to2_mtp_paged_hnd"),
         pytest.param(16, "paged+br+split4", id="32to2_mtp_paged_split4"),
         pytest.param(16, "dense", id="32to2_dense_padded"),
+        pytest.param(2, "paged+br", id="g2_paged_br"),
+        pytest.param(2, "paged+swa", id="g2_paged_swa"),
+        pytest.param(12, "paged+br+hnd+pdl", id="24to2_mtp_paged_hnd_pdl"),
     ],
 )
 def test_sm107_decode_wide_tile_renderings_carry_no_spill(tmp_path, g, form):
     """The 64-column tile's register budget, pinned on the SASS (no Rubin GPU: an sm_107a trace-compile in a subprocess, the
     file's SASS-pin recipe): the 18-warp CTA's rendering stays SPILL-FREE at ptxas's 96-register cap on the admitted forms --
-    the 24/2 MTP step over HND pools, the 32/2 MTP step with split partials, a dense padded cache.  The keyed max exchange, the
-    ftz max intrinsics, the x8 O^T readbacks and the two-half epilogue of the shared body exist for this pin; a spill here is
-    a perf regression no numerics test sees (local-memory traffic in the hottest loop).  Skips when no nvdisasm on
-    $CUDA_PATH/bin or $PATH decodes the cubin; a compile failure is a FAIL."""
+    the 24/2 MTP step over HND pools, the 32/2 MTP step with split partials, a dense padded cache, and the admitted forms nearest
+    the spill edge: a packed group of TWO heads over pages (eight distinct causal thresholds per 16-column group) under the
+    bottom-right causal mask and under a left WINDOW (the predicate's other mask), plus the 24/2 step with the programmatic-
+    dependent-launch sites traced (the griddepcontrol pair must add no register pressure).  The keyed max exchange, the ftz max
+    intrinsics, the x8 O^T readbacks and the two-half epilogue of the shared body exist for this pin; a spill here is a perf
+    regression no numerics test sees (local-memory traffic in the hottest loop) -- an arm that spills is a form the config must
+    REFUSE (decode_d256_wide_tile_admits), never a silent admit.  Skips when no nvdisasm on $CUDA_PATH/bin or $PATH decodes the
+    cubin; a compile failure is a FAIL."""
     cands = _nvdisasm_candidates()
     if not cands:
         pytest.skip("no nvdisasm executable to try (CUDA_PATH unset and none on PATH)")
