@@ -131,15 +131,9 @@ def _select_sm100_backend(
     selected only for the Blackwell SM100/SM103 BF16 H128 envelopes validated
     by their kernels (D512, and contiguous D576 with D_v512); every other
     supported configuration retains the established backend.
-    ``deterministic=True`` takes precedence over every tuned variant.
+    Deterministic H128 execution retains the two-CTA Tensor Core kernels;
+    other deterministic envelopes use the established generic M64 kernel.
     """
-    if deterministic:
-        # Deterministic execution always uses the generic M64 kernel: its
-        # bounded-wave dKV shards need one CTA per query token.  Head counts
-        # below 64 use its masked tail, while counts above 64 serialize their
-        # M64 head blocks so each dKV shard retains a single writer.  The
-        # two-CTA path accumulates dKV with FP32 atomics and is never selected.
-        return "generic_m64", 64
     if (
         device_capability in _BLACKWELL_CAPABILITIES
         and dtype == torch.bfloat16
@@ -147,6 +141,7 @@ def _select_sm100_backend(
         and head_dim == 512
         and head_dim_v == 512
         and max_topk in (128, 512, 1024, 1152, 2048)
+        and (not deterministic or is_contiguous)
     ):
         return "h128_2cta_m64", 64
     if (
@@ -161,6 +156,8 @@ def _select_sm100_backend(
         # The D576 two-CTA plan launches without copies, so it only accepts
         # contiguous inputs; strided inputs keep the generic path below.
         return "h128_d576_2cta_m64", 64
+    if deterministic:
+        return "generic_m64", 64
     if num_heads == 16 and head_dim == 576:
         # The H16 KV-major specialization can use the full M128 UMMA tile,
         # halving the top-k loop count while keeping one CTA per query token.
@@ -183,13 +180,13 @@ def _get_sm100_kernel_class(backend: str, deterministic: bool = False):
     of the tuned paths.
     """
     if backend == "h128_2cta_m64":
-        from .dsa_bwd_sm100_h128_2cta import FlashAttentionDSABackwardSm100H128TwoCTA
+        from .dsa_bwd_sm100_h128_2cta import FlashAttentionDSABackwardSm100H128TwoCTA, FlashAttentionDSABackwardSm100H128TwoCTADeterministic
 
-        return FlashAttentionDSABackwardSm100H128TwoCTA
+        return FlashAttentionDSABackwardSm100H128TwoCTADeterministic if deterministic else FlashAttentionDSABackwardSm100H128TwoCTA
     if backend == "h128_d576_2cta_m64":
-        from .dsa_bwd_sm100_h128_d576_2cta import FlashAttentionDSABackwardSm100H128D576TwoCTA
+        from .dsa_bwd_sm100_h128_d576_2cta import FlashAttentionDSABackwardSm100H128D576TwoCTA, FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic
 
-        return FlashAttentionDSABackwardSm100H128D576TwoCTA
+        return FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic if deterministic else FlashAttentionDSABackwardSm100H128D576TwoCTA
     if backend == "h16_m128":
         from .dsa_bwd_sm100_h16 import FlashAttentionDSABackwardSm100H16
 
@@ -245,7 +242,7 @@ def flash_attn_bwd_sm100(
         dq: preallocated (total_S_q, nheads, headdim), same dtype as q
         dkv: preallocated (total_S_kv, headdim), same dtype as kv
         d_sink: preallocated (nheads,) float32
-        deterministic: use the bounded-wave deterministic M64 kernel
+        deterministic: use ordered bounded-wave scratch accumulation
         workspace: reusable uint8 scratch sized by
             ``flash_attn_bwd_sm100_workspace_size``
 
@@ -350,6 +347,7 @@ def flash_attn_bwd_sm100(
             d_sink=d_sink,
             current_stream=current_stream,
             workspace=workspace,
+            deterministic=deterministic,
         )
     kernel_cls = _get_sm100_kernel_class(backend, deterministic)
     uses_h128_two_cta = backend == "h128_2cta_m64"
@@ -376,9 +374,10 @@ def flash_attn_bwd_sm100(
         assert kernel_cls._get_workspace_size_LSE_OdO(total_S_q, head_dim, num_head, batch_size, cutlass.Float32) == tuple(workspace_lse_odo_shape)
         assert kernel_cls._get_workspace_size_dKV(total_S_kv, head_dim, batch_size, cutlass.Float32) == tuple(workspace_dkv_shape)
 
-    # Every route clears its FP32 dKV accumulator in-kernel and its finalizer
-    # overwrites every public dKV element, so dkv needs no reset. d_sink is
-    # atomic-added by sum_dSink; only the H128 two-CTA zero_init clears it (R4).
+    # Every route initializes its FP32 dKV accumulator and overwrites dKV.
+    # The ordinary two-CTA prologue clears d_sink before atomic updates;
+    # its deterministic finalizer overwrites d_sink. Other routes retain
+    # the shared output reset below.
     if not uses_h128_two_cta:
         memset_zero_async(d_sink.data_ptr(), d_sink.numel() * d_sink.element_size(), int(current_stream))
 

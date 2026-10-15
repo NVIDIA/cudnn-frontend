@@ -205,9 +205,12 @@ class SparseAttentionBackward(APIBase):
             )
         if self._backend == _iface_d576.BACKEND:
             self._value_error_if(total_s_q <= 0 or self.kv_desc.shape[0] <= 0, "Q and KV sequence extents must be positive")
-            self._two_cta_split_count = _iface_d576._split_count(
-                total_s_q, self.topk_idxs_desc.shape[1], torch.cuda.get_device_properties(self.q_desc.device).multi_processor_count
-            )
+            if self.deterministic:
+                self._two_cta_split_count = 1
+            else:
+                self._two_cta_split_count = _iface_d576._split_count(
+                    total_s_q, self.topk_idxs_desc.shape[1], torch.cuda.get_device_properties(self.q_desc.device).multi_processor_count
+                )
         else:
             # The kernels read the declared layout natively and execute never
             # repacks (R5); the D576 route already rejects strides at execute.
@@ -249,6 +252,7 @@ class SparseAttentionBackward(APIBase):
                     self.topk_length_desc is not None,
                     self.q_desc.shape[0] == 1,
                     self._two_cta_split_count > 1,
+                    self.deterministic,
                 )
             return
         # The architecture-specific interfaces manage their own compile caches.
@@ -348,6 +352,7 @@ class SparseAttentionBackward(APIBase):
                 scale,
                 self._two_cta_split_count,
                 current_stream,
+                deterministic=self.deterministic,
             )
         if self._qcluster_plan is not None:
             if self._compiled_kernel is None:
