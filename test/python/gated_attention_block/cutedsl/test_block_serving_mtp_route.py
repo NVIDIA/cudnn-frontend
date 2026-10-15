@@ -394,7 +394,7 @@ def test_declaration_facts_on_the_prefill_route_and_the_policy_knob():
         thd=True,
         num_sequences=1,
         max_seq_len=4,
-        decode_route=decode_route(geom, 4),
+        route=decode_route(geom, 4),
         **paged,
     )
     assert st.thd and st.decode_route.prefill_tile and not st.paged_dense
@@ -409,7 +409,7 @@ def test_declaration_facts_on_the_prefill_route_and_the_policy_knob():
             thd=True,
             num_sequences=1,
             max_seq_len=4,
-            decode_route=decode_route(geom, 2),
+            route=decode_route(geom, 4, policy=DECODE_ROUTE_TOKEN_UNITS),
             **paged,
         )
 
@@ -426,7 +426,7 @@ def test_the_envelope_names_the_policy_and_the_claimed_bound(monkeypatch):
     assert not d.route(9).served and "decode_s_q" in d.declines and "decode_rows" in d.declines
     env_t = GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, _DEV, device_cc=_SM107, decode_route_policy=DECODE_ROUTE_TOKEN_UNITS)
     assert env_t.decode.policy == DECODE_ROUTE_TOKEN_UNITS and env_t.decode.route(4).token_units == 2 and env_t.decode.route(4).claimed
-    assert "S_q <= 8" in " ".join(d.requires) and "S_q <= 4" in " ".join(d.requires)
+    assert "DECODE_MAX_S_Q = 8" in " ".join(d.requires) and "S_q <= 4" in " ".join(d.requires)
     with pytest.raises(ValueError, match="decode_route_policy must be one of"):
         GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, _DEV, device_cc=_SM107, decode_route_policy="fastest")
 

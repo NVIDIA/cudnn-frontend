@@ -2,8 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from .api import (
+    DECODE_CLAIMED_MAX_S_Q,
     DECODE_MAX_ROWS,
     DECODE_MAX_S_Q,
+    DECODE_ROUTE_POLICIES,
+    DECODE_ROUTE_SINGLE_UNIT,
+    DECODE_ROUTE_TOKEN_UNITS,
     KV_SOURCE_PAGED,
     KV_SOURCE_SELF,
     QKVG_TILE_ALIGN,
@@ -36,8 +40,12 @@ from .api_bwd import (
 )
 
 __all__ = [
+    "DECODE_CLAIMED_MAX_S_Q",
     "DECODE_MAX_ROWS",
     "DECODE_MAX_S_Q",
+    "DECODE_ROUTE_POLICIES",
+    "DECODE_ROUTE_SINGLE_UNIT",
+    "DECODE_ROUTE_TOKEN_UNITS",
     "KV_SOURCE_PAGED",
     "KV_SOURCE_SELF",
     "QKVG_TILE_ALIGN",

@@ -987,9 +987,9 @@ def test_the_397b_shards_ride_their_groups_routes_and_the_envelope_serves_both_f
                 r,
                 t,
             )
-        for s_q, (n_q, units, packed) in _ROUTE_TABLE[group].items():
+        for s_q, (tile, n_q, units, packed) in _ROUTE_TABLE[group].items():
             r = decode_route(geom, s_q)
-            assert (r.n_q, r.token_units, r.pack_gqa) == (n_q, units, packed), (name, s_q, r)
+            assert (r.tile, r.n_q, r.token_units, r.pack_gqa) == (tile, n_q, units, packed), (name, s_q, r)
         env = GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, _DEV, device_cc=_SM107)
         assert env.forms == ("extend", "decode") and env.extend.served and env.decode.served, (name, env.extend.reason, env.decode.reason)
         assert env.decode.route(1).claimed and env.decode.route(DECODE_MAX_S_Q).served and not env.decode.route(DECODE_MAX_S_Q + 1).served
