@@ -69,6 +69,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     canonicalize_d192_lowering,
     canonicalize_d256_lowering,
     canonicalize_d512_mxfp8_lowering,
+    d256_wide_decode_launch,
     decode_d256_q_tile,
     derive_d192_internal_params,
     derive_d256_internal_params,
@@ -2467,10 +2468,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         self._logger.debug("check_support completed successfully")
         return True
 
-    def _decode_q_tile_for(self, s_q: int, h_q: int, h_kv: int) -> int:
+    def _decode_q_tile_for(self, s_q: int, h_q: int, h_kv: int, b: Optional[int] = None, s_kv: Optional[int] = None) -> int:
         """:meth:`_decode_q_tile` on explicit shapes -- for ``check_support``, which
         reads the sample shapes before it records ``s_q_max`` / ``h_q`` / ``h_kv``
-        (its Rubin paged gate admits the decode-shaped graph the decode tile serves)."""
+        (its Rubin paged gate admits the decode-shaped graph the decode tile serves).
+        ``b`` / ``s_kv`` are the launch size the Blackwell line's wide-tile route reads
+        (config_sm100.d256_wide_decode_launch); without them only the 16-column tile is
+        routed there."""
         if self._fp8 or self.thd or self.flavor != (256, 256):
             return 0
         if self.softmax_scale_prefolded:
@@ -2490,7 +2494,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # two TOKEN UNITS for a packed MTP step (S_q = 4 at 24/2 = two units of two tokens x 12
             # heads); engines.decode_d256_q_tile_for_row is the facts-level twin of this dispatch.
             return _decode_d256_q_tile_sm107(int(s_q), pack_g)
-        return decode_d256_q_tile(int(s_q), pack_g)
+        wide_launch = b is not None and s_kv is not None and d256_wide_decode_launch(int(b), int(h_q) // pack_g, int(s_kv), self.window_left is not None)
+        return decode_d256_q_tile(int(s_q), pack_g, wide_launch=wide_launch)
 
     def _gate_in_combine_for(self, s_q: int, h_q: int, h_kv: int) -> bool:
         """:meth:`_gate_in_combine` on explicit shapes (for ``check_support``, like
@@ -2519,9 +2524,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         bottom-right, SWA, right band, sink, Stats natural or base-2, dense
         padded-Q trim, split-KV partials) for f16/bf16 d256-flavor graphs whose
         S_q x packed-heads rows fit the line's routed envelope -- the 16-wide N
-        tile on SM100 / SM103 (config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS: the
-        32-wide tile compiles but is issue-bound per CTA and stays unrouted
-        there), on cc 10.7 also the 32-wide tile in up to two TOKEN UNITS of the
+        tile on SM100 / SM103 (config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS; the
+        32-wide tile is issue-bound per CTA and is routed there only for a launch
+        big enough to be HBM-bound, config_sm100.d256_wide_decode_launch), on
+        cc 10.7 also the 32-wide tile in up to two TOKEN UNITS of the
         kernel for a packed MTP step (config_sm107.decode_d256_q_tile; the value
         is the rows of ONE unit); everything else (THD, quantized, larger S_q,
         the pre-folded scale, the fused epilogue gate at split_kv == 1) stays on
@@ -2532,7 +2538,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         nothing to schedule).  engines.d256_decode_tile_selected is the
         facts-level twin; keep the two in lockstep.
         """
-        return self._decode_q_tile_for(self.s_q_max, self.h_q, self.h_kv)
+        return self._decode_q_tile_for(self.s_q_max, self.h_q, self.h_kv, self.batch_size, self.s_k_max)
 
     def _fp8_dual_kv_stream(self) -> bool:
         """Whether this per-tensor FP8 d128 plan runs its two Q sub-tiles as two KV

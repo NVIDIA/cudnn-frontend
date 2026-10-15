@@ -96,6 +96,7 @@ from cudnn.sdpa.fwd.engines import (
     _synth_kv_padding,
     _thd_decode_leg,
     d256_decode_tile_selected,
+    d256_wide_decode_launch_for_facts,
     decode_d256_q_tile_for_row,
     effective_cgas,
     effective_sched_policies,
@@ -444,9 +445,9 @@ _DECODE_TILE_CTA_COST = 1.0
 # the 16-column tile is bandwidth-bound): 64 CTAs x 32 tiles ran 90.2 us
 # against the 16-column tile's 57.1 us (B200). HBM saturates at the same byte
 # rate, so a slower stream also needs proportionally more CTAs to reach it.
-# That tile is compiled but not routed on the Blackwell line (the adapter keeps
-# S_q x G in (16, 32] on the prefill tile there,
-# config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS); the Rubin line routes it, in up to
+# The Blackwell line routes that tile only for a launch big enough to be
+# HBM-bound (config_sm100.d256_wide_decode_launch; S_q x G in (16, 32] stays on the
+# prefill tile below it); the Rubin line routes it for every launch, in up to
 # two TOKEN UNITS for a packed MTP step (config_sm107.decode_d256_q_tile), and
 # this B200 fit is the cost its units are modelled with until a cc 10.7 refit.
 _DECODE_TILE_WIDE_Q_TILE_COST = 1.6
@@ -1802,7 +1803,7 @@ def _split_points(
         # (head group, batch) into: every unit is one more CTA streaming the KV range (the MTP step at
         # 24/2 = two units of two tokens), so the model sees them as streams; the KV range of a unit
         # spans its tokens (token_span = tokens per unit).
-        decode_q_tile = decode_d256_q_tile_for_row(caps, facts.s_q, decode_pack_g)
+        decode_q_tile = decode_d256_q_tile_for_row(caps, facts.s_q, decode_pack_g, d256_wide_decode_launch_for_facts(facts, decode_pack_g))
         tok_units = decode_d256_q_units(facts.s_q, decode_pack_g, decode_q_tile)
         geometry = dict(
             units=facts.b * (facts.h_q // decode_pack_g) * tok_units,

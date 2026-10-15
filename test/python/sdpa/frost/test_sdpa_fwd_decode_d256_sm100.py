@@ -448,7 +448,8 @@ def test_decode_graph_deep_split_empty_ranges():
 @pytest.mark.L0
 def test_decode_q_tile_rule():
     """The routing rule: 16 rows ride the decode tile; the 32-column tile is a
-    valid config (D256_DECODE_MAX_Q_ROWS) the adapter does not select."""
+    valid config (D256_DECODE_MAX_Q_ROWS) the adapter selects only for a launch
+    big enough to be HBM-bound (test_decode_q_tile_rule_wide_launch)."""
     from cudnn.sdpa.fwd.config_sm100 import D256_DECODE_MAX_Q_ROWS, D256_DECODE_ROUTED_MAX_Q_ROWS, decode_d256_q_tile
 
     assert (D256_DECODE_ROUTED_MAX_Q_ROWS, D256_DECODE_MAX_Q_ROWS) == (16, 32)
@@ -456,7 +457,7 @@ def test_decode_q_tile_rule():
     assert decode_d256_q_tile(1, 12) == 16  # a group that does not divide the tile still fits it
     assert decode_d256_q_tile(2, 8) == 16
     assert decode_d256_q_tile(16, 1) == 16
-    # (16, 32] rows: the unrouted 32-column tile -- the prefill tile serves these.
+    # (16, 32] rows: the 32-column tile, which a small launch does not take -- the prefill tile serves these.
     assert decode_d256_q_tile(2, 16) == 0
     assert decode_d256_q_tile(1, 32) == 0
     assert decode_d256_q_tile(17, 1) == 0
@@ -465,6 +466,79 @@ def test_decode_q_tile_rule():
     assert decode_d256_q_tile(33, 1) == 0
     assert decode_d256_q_tile(1, 64) == 0
     assert decode_d256_q_tile(0, 16) == 0
+
+
+@pytest.mark.L0
+def test_decode_q_tile_rule_wide_launch():
+    """A launch big enough to be HBM-bound rides the 32-column tile for the (16, 32]
+    row counts the 16-column tile cannot take; one token unit at most on this line."""
+    from cudnn.sdpa.fwd.config_sm100 import decode_d256_q_tile
+
+    assert decode_d256_q_tile(2, 16, wide_launch=True) == 32
+    assert decode_d256_q_tile(1, 32, wide_launch=True) == 32
+    assert decode_d256_q_tile(4, 8, wide_launch=True) == 32
+    assert decode_d256_q_tile(17, 1, wide_launch=True) == 32
+    assert decode_d256_q_tile(2, 12, wide_launch=True) == 32  # 24 rows
+    assert decode_d256_q_tile(1, 16, wide_launch=True) == 16  # what fits the narrow tile keeps it
+    assert decode_d256_q_tile(3, 16, wide_launch=True) == 0  # two token units: not admitted on this line
+    assert decode_d256_q_tile(33, 1, wide_launch=True) == 0
+    assert decode_d256_q_tile(1, 64, wide_launch=True) == 0
+    assert decode_d256_q_tile(0, 16, wide_launch=True) == 0
+    assert decode_d256_q_tile(2, 16) == 0 and decode_d256_q_tile(2, 16, wide_launch=False) == 0
+
+
+@pytest.mark.L0
+def test_decode_wide_launch_boundary():
+    """The launch size the Blackwell line's wide-tile route starts at: units (batch x
+    KV-head groups) and the 128-key KV tiles they stream, never a windowed graph."""
+    from cudnn.sdpa.fwd.config_sm100 import D256_WIDE_DECODE_MIN_KV_TILES, D256_WIDE_DECODE_MIN_UNITS, d256_wide_decode_launch
+
+    assert (D256_WIDE_DECODE_MIN_UNITS, D256_WIDE_DECODE_MIN_KV_TILES) == (8, 4096)
+    assert d256_wide_decode_launch(8, 1, 65536)  # 8 units x 512 tiles
+    assert d256_wide_decode_launch(8, 1, 65535)  # the tail tile counts
+    assert d256_wide_decode_launch(4, 2, 65536)  # units = batch x groups
+    assert d256_wide_decode_launch(128, 2, 2048)  # 256 units x 16 tiles
+    assert not d256_wide_decode_launch(8, 1, 65408)  # 511 tiles: 4088 in all
+    assert not d256_wide_decode_launch(7, 1, 1 << 24)  # too few units however long the KV
+    assert not d256_wide_decode_launch(1, 2, 1 << 24)
+    assert not d256_wide_decode_launch(32, 2, 2048)  # 64 units x 16 tiles
+    assert not d256_wide_decode_launch(32, 2, 4096)  # 64 units x 32 tiles
+    assert not d256_wide_decode_launch(128, 2, 131072, windowed=True)
+    assert not d256_wide_decode_launch(0, 2, 65536) and not d256_wide_decode_launch(8, 0, 65536) and not d256_wide_decode_launch(8, 1, 0)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(("page", "sink"), [(0, False), (64, False), (64, True)], ids=["dense", "paged", "paged_sink"])
+def test_decode_graph_wide_tile_routed_launch(page, sink):
+    """A launch past the wide-tile boundary (8 units x 64K keys) lowers its S_q = 4
+    step at 8:1 (32 packed rows) onto the 32-column decode tile and matches the
+    reference: mixed lengths including a one-key row and a tile-unaligned tail, and
+    (without a sink) per-batch query lengths down to a row with no live query -- the
+    split combine cannot tell a padded row from a keyless one, so with a sink every
+    row is live and the sink logit joins its softmax."""
+    import cudnn.sdpa.fwd.api_dsl as api_dsl
+
+    seen = []
+    real = api_dsl.decode_d256_q_tile
+
+    def spy(*args, **kwargs):
+        seen.append(real(*args, **kwargs))
+        return seen[-1]
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(api_dsl, "decode_d256_q_tile", spy)
+        _run_graph(
+            B=8,
+            H=8,
+            KH=1,
+            s_q=4,
+            lens=[65536, 40000, 1, 129, 65000, 777, 33333, 20000],
+            q_lens=None if sink else [4, 3, 4, 2, 4, 1, 4, 0],
+            page=page,
+            causal_br=True,
+            sink=sink,
+        )
+    assert 32 in seen, seen
 
 
 @pytest.mark.L0

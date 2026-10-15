@@ -678,8 +678,8 @@ plan (`select_plan`), and LEADS when the graph was created with
 `is_cuda_graph_replay_expected=True` (`facts.cuda_graph_replay`: the second launch is
 paid once at capture). On the 16-column tile the b=32 x 2 KV-head x 4096-key
 serving shape runs unsplit, b=8 splits 8 ways, b=128 stays unsplit, s_kv=16384
-splits 2 ways. The unrouted 32-column tile's fit (1.6x the per-tile cost) stays in
-the model for when it is routed.
+splits 2 ways. The 32-column tile's fit (1.6x the per-tile cost) prices the launches that
+route it (`config_sm100.d256_wide_decode_launch`, below).
 
 Measured on B200 (SM100, 148 SMs), bf16, 32/2 heads, d256, page 16, prefill tile
 -> decode tile as the heuristics lead, two numbers per cell: eager back-to-back
@@ -699,7 +699,7 @@ us (split 2, host 96 us per execute; unsplit 199.7 / 199.9); Qwen3-Next 16/2 b=3
 mixed: 209.6-222.7 / 218.9-240.2 -> 137.0-159.2 / 138.6-143.5 us; page 64:
 62.7-64.4 / 62.1-70.0 -> 54.3-59.1 / 53.3 us. S_q=2 bottom-right at 32/2 (32
 packed rows) stays on the prefill tile: 66.1-67.0 / 65.9-66.1 us before and after
-(on the unrouted 32-column decode tile it measured 90.2 / 90.2 unsplit and 96-103 /
+(on the 32-column decode tile it measured 90.2 / 90.2 unsplit and 96-103 /
 58.5 split 2). Dense 16-row graphs the rule newly takes, replay, prefill -> decode:
 MHA 8/8 b=8 S_q=16 s_kv=2048 32.9 -> 29.6; MHA 32/32 b=1 S_q=16 s_kv=32768 243.5 ->
 179.6 (split 4), causal 16.5 -> 12.5; GQA 32/2 b=4 S_q=1 s_kv=32768 68.0 -> 60.6;
@@ -709,6 +709,22 @@ GQA 32/2 b=32 S_q=1 s_kv=4096 61.8 -> 51.2; padded GQA 16/2 b=32 S_q=2 bottom-ri
 alone reaches the 46 us of the TensorRT-LLM decode kernel (via FlashInfer) at split 2;
 the shared combine pass (~6 us) is the remaining captured-path gap. Not a Capabilities change (the row's claims are
 unchanged; this documents the lowering), Rule S2.
+
+**The 32-column tile on big launches (SM100 / SM103).** A lone CTA streams a KV tile of the 32-column
+tile in 2.8 us against the 16-column tile's 1.75 us, so below ~130 concurrent streams the prefill tile
+serves the (16, 32] packed rows better -- the numbers above. A launch that is HBM-bound whatever the
+per-CTA rate is the other regime: the 256-row prefill tile reaches ~78 % of the HBM roofline on
+S_q x G = 32 d256 steps, the 32-column decode tile the roofline. `config_sm100.d256_wide_decode_launch`
+routes the tile for batch x KV-head groups >= 8 units streaming >= 4096 128-key tiles in all (never a
+windowed graph); the heuristics' decode geometry, `engines.d256_decode_tile_selected` and the adapter's
+`_decode_q_tile_for(b, s_kv)` read the same rule. Kernel time on B200, bf16, d256, S_q = 2 / 32 heads
+over 2 KV heads (16 packed rows per group x 2 tokens), prefill tile -> decode tile: b=128 x 128K keys
+5.91 -> 4.75 ms, b=32 1.54 -> 1.21 ms, b=16 0.767 -> 0.621, b=8 0.386 -> 0.332, b=4 0.202 -> 0.179;
+b=128 x 32K 1.50 -> 1.20 ms, x 8K 0.401 -> 0.323, x 2K 0.120 -> 0.101; 8 heads over 1 KV head at
+S_q = 3 / 4 (b=128 x 128K 2.93 -> 2.36 ms, b=16 0.385 -> 0.331, b=8 0.199 -> 0.181). Launches under the
+boundary measured within +-2 % of the prefill tile (b=1 / 2 / 4 at one KV head, b=32 x 2K-8K keys,
+b=8 x 2K-8K keys) and are unchanged: forced onto the wide tile they were +1..+10 % at b=1 (the serial
+combine of its 64-128 splits) and +2..+7 % at 64 units x 16-32 tiles.
 
 ᵐ **PackGQA — partial packing on the d128 and d256 f16/bf16 kernels**
 (`Capabilities.pack_gqa_partial_d_shapes = {(128, 128), (256, 256)}`, `Cfg.PACK_G`).
@@ -1226,8 +1242,9 @@ range streamed once per unit = 2x the bytes of a single stream); anything past t
 unit, an unpacked step above 32 tokens, `G > 32`) -> the d256 prefill kernel, a packed request
 there a typed decline. The decode split model counts the token units as streams
 (`units = B × head groups × units`, the 32-column tile's per-tile cost fit on B200 -- a cc 10.7
-refit is the heuristics owner's). The SM100 line is untouched (`config_sm100.decode_d256_q_tile`
-with its defaults is the former rule verbatim; its 32-column tile stays unrouted). Evidence on
+refit is the heuristics owner's). The SM100 line routes the 32-column tile only for a launch past
+`config_sm100.d256_wide_decode_launch` (`decode_d256_q_tile` with its defaults is the former rule
+verbatim: 16 rows, one unit). Evidence on
 cc 10.7 (204 SMs, `test_sdpa_fwd_decode_d256_sm107.py`): the 24/2 steps `S_q = 2 / 3 / 4` over
 dense padded and paged caches, bottom-right, with per-batch Q lengths below `S_q` (the trim across
 units), the split forms at the token-unit geometry, the 32/2 step at `S_q = 2`; **two token units

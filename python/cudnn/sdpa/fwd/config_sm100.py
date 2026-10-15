@@ -1214,31 +1214,61 @@ def make_cfg_d256_mxfp8(params: TemplateParams) -> Tuple[CfgD256, TmaIters]:
 D256_DECODE_MAX_Q_ROWS = 32
 _D256_DECODE_Q_TILES = (16, 32)
 # Largest packed Q-row count the adapter ROUTES onto the decode tile ON THE
-# BLACKWELL LINE (SM100 / SM103).  The 32-column tile (two softmax column groups
-# over the same 128 TMEM lanes) is compiled and tested at the template level but
-# issue-bound per CTA there: at b=32 x 2 KV heads x 4096 keys (B200) it streams
-# a KV tile in 2.8 us against the 16-column tile's 1.75 us -- 90 us unsplit
-# where the prefill tile takes 66 us -- and its split-2 plan (58 us of GPU time)
-# costs an eager caller 96-103 us per execute for the second launch.  Until its
-# per-CTA issue rate is fixed, S_q x G in (16, 32] stays on the prefill tile on
-# this line, which serves those shapes at its previous numbers in both regimes
-# (eager and CUDA-graph replay).  The Rubin line routes the wide tile, in TOKEN
-# UNITS of two tokens for the MTP step: config_sm107.D256_DECODE_ROUTED_MAX_Q_ROWS
-# (32) / D256_DECODE_ROUTED_MAX_TOKEN_UNITS (2) and config_sm107.decode_d256_q_tile,
-# measured on cc 10.7 against the prefill body at the 24/2 geometry.
+# BLACKWELL LINE (SM100 / SM103) for every launch.  The 32-column tile (two
+# softmax column groups over the same 128 TMEM lanes) is issue-bound per CTA:
+# a lone CTA streams a KV tile in 2.8 us against the 16-column tile's 1.75 us
+# (b=32 x 2 KV heads x 4096 keys on B200: 90 us unsplit where the prefill tile
+# takes 66), so a launch too small to put ~130 of those streams in flight is
+# served better by the prefill tile.  A launch that is big enough saturates HBM
+# whatever the per-CTA rate, and there the wide tile is the faster one -- the
+# 256-row prefill tile reaches ~78 % of the HBM roofline on these shapes, the wide
+# tile the roofline itself (B200, d256 S_q x G = 32: -20 % at b=128 x 128K keys,
+# -12 % at b=4 x 128K).  D256_WIDE_DECODE_MIN_UNITS / D256_WIDE_DECODE_MIN_KV_TILES mark
+# that boundary (d256_wide_decode_launch); the Blackwell line routes S_q x G in
+# (16, 32] onto the wide tile for launches past it.  The Rubin line routes the
+# wide tile for every launch, in TOKEN UNITS of two tokens for the MTP step:
+# config_sm107.D256_DECODE_ROUTED_MAX_Q_ROWS (32) / D256_DECODE_ROUTED_MAX_TOKEN_UNITS
+# (2) and config_sm107.decode_d256_q_tile, measured on cc 10.7 against the prefill
+# body at the 24/2 geometry.
 D256_DECODE_ROUTED_MAX_Q_ROWS = 16
 # The 16-column tile: one unit covers S_q x pack_g <= 16 rows (today's decode step).
 _D256_DECODE_NARROW_Q_TILE = 16
 
 
-def decode_d256_q_tile(s_q: int, pack_g: int, routed_max_rows: int = D256_DECODE_ROUTED_MAX_Q_ROWS, max_token_units: int = 1) -> int:
+# What a launch must stream for the wide tile to pay on the Blackwell line: batch x
+# KV-head groups (the decode tile's units: one CTA each before the split) and the
+# 128-key KV tiles of all of them.  Measured on B200 (S_q x G = 32, qwen3.5-like
+# d256, 2 heads x 16-wide groups and 1 head x 8-wide): wins from 8 units x 512
+# tiles (b=4 x 64K keys) up, loses at one or two units (+1..+10 % at b=1, the
+# serial combine of its 64-128 splits) and at 64 units x 16-32 tiles (+2..+7 %).
+D256_WIDE_DECODE_MIN_UNITS = 8
+D256_WIDE_DECODE_MIN_KV_TILES = 4096
+
+
+def d256_wide_decode_launch(batch: int, groups: int, s_kv: int, windowed: bool = False) -> bool:
+    """Whether a launch of ``batch`` x ``groups`` (KV-head groups, or heads when the
+    graph does not pack) units over ``s_kv`` keys is one the 32-column decode tile
+    serves faster than the prefill tile on the Blackwell line: at least
+    ``D256_WIDE_DECODE_MIN_UNITS`` units streaming at least
+    ``D256_WIDE_DECODE_MIN_KV_TILES`` 128-key tiles between them.  A windowed
+    (SWA) graph never qualifies: its declared ``s_kv`` says nothing about the
+    window's tiles."""
+    if windowed or min(int(batch), int(groups), int(s_kv)) <= 0:
+        return False
+    units = int(batch) * int(groups)
+    return units >= D256_WIDE_DECODE_MIN_UNITS and units * -(-int(s_kv) // 128) >= D256_WIDE_DECODE_MIN_KV_TILES
+
+
+def decode_d256_q_tile(s_q: int, pack_g: int, routed_max_rows: int = D256_DECODE_ROUTED_MAX_Q_ROWS, max_token_units: int = 1, wide_launch: bool = False) -> int:
     """The decode tile's N extent -- the Q rows of ONE TOKEN UNIT -- for ``s_q``
     tokens packed ``pack_g`` heads per token (1 = unpacked), or 0 when the
     prefill tile serves the graph.
 
-    ``routed_max_rows`` is the widest tile the caller's arch line routes (16 on
-    SM100 / SM103, where the 32-column tile is a valid ``make_cfg_d256_decode``
-    record but is not routed; 32 on cc 10.7); ``max_token_units`` how many
+    ``routed_max_rows`` is the widest tile the caller's arch line routes for every
+    launch (16 on SM100 / SM103; 32 on cc 10.7); ``wide_launch`` says the launch is
+    one the 32-column tile pays for even where the line does not route it
+    unconditionally (:func:`d256_wide_decode_launch`: the Blackwell line's
+    boundary); ``max_token_units`` how many
     token units of ``N // pack_g`` consecutive tokens a (head group, batch,
     split) may be cut into (the kernel's ``Q_TOKEN_UNITS`` axis: each unit
     streams the KV range once more, so a line admits it only where it measured
@@ -1246,9 +1276,10 @@ def decode_d256_q_tile(s_q: int, pack_g: int, routed_max_rows: int = D256_DECODE
     admits two units for every packed group the tile holds).  The rule: rows that fit
     the 16-column tile ride it in one unit (the KV streamed once, the cheapest
     per-CTA stream); past 16 rows the 32-column tile serves
-    ``ceil(s_q / (32 // pack_g))`` units when that count is within the cap and
-    the group fits the tile, else 0.  With the defaults this is the SM100 rule
-    verbatim (16 for S_q x G <= 16 rows, 0 above)."""
+    ``ceil(s_q / (32 // pack_g))`` units when that count is within the cap, the
+    line routes it (or the launch qualifies) and the group fits the tile, else 0.
+    With the defaults this is the SM100 rule for a launch too small for the wide
+    tile (16 for S_q x G <= 16 rows, 0 above)."""
     s_q, pack_g = int(s_q), int(pack_g)
     if s_q <= 0 or pack_g <= 0:
         return 0
@@ -1256,7 +1287,7 @@ def decode_d256_q_tile(s_q: int, pack_g: int, routed_max_rows: int = D256_DECODE
     if rows <= _D256_DECODE_NARROW_Q_TILE:
         return _D256_DECODE_NARROW_Q_TILE
     wide = D256_DECODE_MAX_Q_ROWS
-    if wide > int(routed_max_rows) or pack_g > wide:
+    if (wide > int(routed_max_rows) and not wide_launch) or pack_g > wide:
         return 0
     if decode_d256_q_units(s_q, pack_g, wide) > int(max_token_units):
         return 0

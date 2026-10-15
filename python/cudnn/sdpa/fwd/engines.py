@@ -39,6 +39,7 @@ from cudnn.sdpa import graph_analyzer as ga
 from cudnn.sdpa.fwd.config_sm100 import (
     d256_mxfp8_pair_leg,
     SM100_THD_PACK_GQA_SHAPES,
+    d256_wide_decode_launch,
     decode_d256_q_tile,
     pack_gqa_supported,
     supports_paged_prefill_cga1,
@@ -529,17 +530,25 @@ def _thd_decode_leg(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> b
     return len(widths) == 1
 
 
-def decode_d256_q_tile_for_row(capabilities: Capabilities, s_q: int, pack_g: int) -> int:
+def decode_d256_q_tile_for_row(capabilities: Capabilities, s_q: int, pack_g: int, wide_launch: bool = False) -> int:
     """The d256 decode tile's N extent (the Q rows of one token unit) a ROW routes ``s_q``
     tokens packed ``pack_g`` heads per token onto, or 0 for the prefill tile: the Rubin
     row's rule (``config_sm107.decode_d256_q_tile``: the 32-column tile routed, two token
     units for a packed MTP step) on cc 10.7, the Blackwell line's
-    (``config_sm100.decode_d256_q_tile``: 16 rows, one unit) otherwise.  The facts-level
-    twin of ``SdpaFwdDslSm100._decode_q_tile_for``'s arch dispatch; the heuristics' decode
-    geometry reads it too -- keep the three in lockstep."""
+    (``config_sm100.decode_d256_q_tile``: the 16-column tile in one unit, and the
+    32-column one too for a ``wide_launch`` -- :func:`config_sm100.d256_wide_decode_launch`)
+    otherwise.  The facts-level twin of ``SdpaFwdDslSm100._decode_q_tile_for``'s arch
+    dispatch; the heuristics' decode geometry reads it too -- keep the three in lockstep."""
     if capabilities.sm_lo == 107:
         return _config_sm107.decode_d256_q_tile(s_q, pack_g)
-    return decode_d256_q_tile(s_q, pack_g)
+    return decode_d256_q_tile(s_q, pack_g, wide_launch=wide_launch)
+
+
+def d256_wide_decode_launch_for_facts(facts: "ga.SdpaGraphFacts", pack_g: int) -> bool:
+    """:func:`config_sm100.d256_wide_decode_launch` on a graph's declared shape: batch x
+    (heads / ``pack_g``) units over ``s_kv`` keys, never for a windowed graph.  The
+    facts-level twin of ``SdpaFwdDslSm100._decode_q_tile_for``'s launch argument."""
+    return d256_wide_decode_launch(facts.b, facts.h_q // max(1, pack_g), facts.s_kv, facts.window_left is not None)
 
 
 def d256_decode_tile_selected(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", pack_g: int = 1, split_kv: Optional[int] = None) -> bool:
@@ -550,8 +559,9 @@ def d256_decode_tile_selected(capabilities: Capabilities, facts: "ga.SdpaGraphFa
     half inputs, dense (not THD) queries, the (256, 256) flavor, no pre-folded scale
     (not wired on the decode tile), and ``S_q x pack_g`` packed Q rows within the
     row's routed envelope (``decode_d256_q_tile_for_row``: 16 rows in one unit on the
-    Blackwell line; on cc 10.7 also the 32-column tile, in up to two token units for a
-    packed MTP step; ``pack_g`` is the decode tile's WHOLE-group packing when the plan
+    Blackwell line, which also routes the 32-column tile for a launch big enough to be
+    HBM-bound; on cc 10.7 the 32-column tile for every launch, in up to two token units
+    for a packed MTP step; ``pack_g`` is the decode tile's WHOLE-group packing when the plan
     packs, else 1).
 
     The fused epilogue gate: the tile has no gate seams, so a GATED graph rides it only
@@ -576,7 +586,7 @@ def d256_decode_tile_selected(capabilities: Capabilities, facts: "ga.SdpaGraphFa
         and gate_ok
         and not facts.attn_scale_prefolded
         and _selected_d_shape(capabilities, facts) == (256, 256)
-        and decode_d256_q_tile_for_row(capabilities, facts.s_q, pack_g) > 0
+        and decode_d256_q_tile_for_row(capabilities, facts.s_q, pack_g, d256_wide_decode_launch_for_facts(facts, pack_g)) > 0
     )
 
 
