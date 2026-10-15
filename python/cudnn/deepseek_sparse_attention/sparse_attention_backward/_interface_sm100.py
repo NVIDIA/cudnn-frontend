@@ -27,6 +27,11 @@ torch2cute_dtype_map = {
 }
 
 _BLACKWELL_CAPABILITIES = ((10, 0), (10, 3))
+_SM100_FAMILY_ARCH_FLAGS = {
+    (10, 0): "sm_100a",
+    (10, 3): "sm_103a",
+    (10, 7): "sm_107a",
+}
 _WORKSPACE_ALIGNMENT = 128
 _DETERMINISTIC_HEAD_COUNTS = (16, 32, 64, 96, 128)
 _STATIC_TOPK_STRIDE_BACKENDS = ("h16_m128", "h32_m64", "h96_h64_h32")
@@ -235,6 +240,7 @@ def _fake_compact_tensor(dtype, shape, alignment=16):
 
 @lru_cache(maxsize=None)
 def _compile_deterministic_sm100(
+    device_index: int,
     device_capability: Tuple[int, int],
     backend: str,
     dtype: torch.dtype,
@@ -245,8 +251,9 @@ def _compile_deterministic_sm100(
     has_topk_length: bool,
     deterministic_shards: int,
 ):
-    """Compile one shape-dynamic deterministic artifact from plan metadata."""
-    if device_capability[0] != 10:
+    """Compile one device-owned, shape-dynamic artifact from plan metadata."""
+    gpu_arch = _SM100_FAMILY_ARCH_FLAGS.get(device_capability)
+    if gpu_arch is None:
         raise ValueError(f"deterministic SM100 DSA backward requires an SM100-family device, got {device_capability}")
     if dtype not in (torch.float16, torch.bfloat16):
         raise ValueError(f"unsupported deterministic SM100 dtype {dtype}")
@@ -285,26 +292,30 @@ def _compile_deterministic_sm100(
         block_tile=64,
         max_topk=max_topk,
     )
-    return cute.compile(
-        kernel,
-        problem_shape,
-        q,
-        kv,
-        out,
-        out,
-        lse,
-        sink,
-        indices,
-        lengths,
-        q,
-        kv,
-        sink,
-        workspace_lse,
-        workspace_dkv,
-        cutlass.Float32(1.0),
-        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
-        options=compile_options(),
-    )
+    # Compile under the declared plan device. ``device_index`` is also part of
+    # this function's cache key because CuTe launchables belong to the CUDA
+    # context that compiled them.
+    with torch.cuda.device(device_index):
+        return cute.compile(
+            kernel,
+            problem_shape,
+            q,
+            kv,
+            out,
+            out,
+            lse,
+            sink,
+            indices,
+            lengths,
+            q,
+            kv,
+            sink,
+            workspace_lse,
+            workspace_dkv,
+            cutlass.Float32(1.0),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+            options=compile_options(gpu_arch=gpu_arch),
+        )
 
 
 def flash_attn_bwd_sm100(
@@ -481,11 +492,11 @@ def flash_attn_bwd_sm100(
         assert kernel_cls._get_workspace_size_LSE_OdO(total_S_q, head_dim, num_head, batch_size, cutlass.Float32) == tuple(workspace_lse_odo_shape)
         assert kernel_cls._get_workspace_size_dKV(total_S_kv, head_dim, batch_size, cutlass.Float32) == tuple(workspace_dkv_shape)
 
-    # Every route initializes its FP32 dKV accumulator and overwrites dKV.
-    # The ordinary two-CTA prologue clears d_sink before atomic updates;
-    # its deterministic finalizer overwrites d_sink. Other routes retain
-    # the shared output reset below.
-    if not uses_h128_two_cta:
+    # Every route clears its FP32 dKV accumulator in-kernel and its finalizer
+    # overwrites every public dKV element, so dkv needs no reset. Ordinary
+    # sum_dSink uses atomics and needs this reset; deterministic sum_dSink and
+    # the H128 two-CTA zero_init overwrite/clear d_sink themselves.
+    if not uses_h128_two_cta and not deterministic:
         memset_zero_async(d_sink.data_ptr(), d_sink.numel() * d_sink.element_size(), int(current_stream))
 
     problem_shape = (total_S_q, total_S_kv, head_dim, (num_head, batch_size))
@@ -496,7 +507,19 @@ def flash_attn_bwd_sm100(
     # Backend, deterministic mode, and the finite shard specialization select
     # the kernel class. The tail stays ``(max_topk, has_topk_length)`` for the
     # dispatch tests that inspect it.
-    compile_key = (backend, deterministic, dtype, head_dim, head_dim_v, num_head, block_tile, deterministic_shards, max_topk, has_topk_length)
+    compile_key = (
+        backend,
+        deterministic,
+        dtype,
+        head_dim,
+        head_dim_v,
+        num_head,
+        block_tile,
+        deterministic_shards,
+        device.index,
+        max_topk,
+        has_topk_length,
+    )
 
     compiled_kernel = _compiled_kernel
     if compiled_kernel is None and compile_key not in flash_attn_bwd_sm100.compile_cache:

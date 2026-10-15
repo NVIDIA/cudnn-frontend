@@ -70,6 +70,18 @@ class SparseAttentionBackward(APIBase):
         self._two_cta_split_count = 1
         self._qcluster_plan = None
 
+    def _validate_compiled_inputs(self, named_tensors) -> None:
+        """Require execution inputs to match the plan's compiled contract."""
+        for name, tensor, desc in named_tensors:
+            if (tensor is None) != (desc is None):
+                raise ValueError(f"{name} presence must match the compiled plan")
+            if desc is None:
+                continue
+            if not isinstance(tensor, torch.Tensor):
+                raise ValueError(f"{name} must be a torch.Tensor")
+            if tuple(tensor.shape) != desc.shape or tensor.dtype != desc.dtype or tensor.device != desc.device:
+                raise ValueError(f"{name} shape, dtype, and device must match the compiled plan")
+
     def check_support(self) -> bool:
         """Validate the device, dtype, shape, and deterministic contracts."""
         self._value_error_if(self.q_desc.device.type != "cuda", f"Q must live on CUDA, got {self.q_desc.device}")
@@ -266,6 +278,7 @@ class SparseAttentionBackward(APIBase):
             shards = kernel_cls.num_dkv_shards
             with torch.cuda.device(self.q_desc.device):
                 self._compiled_kernel = _iface_sm100._compile_deterministic_sm100(
+                    self.q_desc.device.index,
                     torch.cuda.get_device_capability(self.q_desc.device),
                     self._backend,
                     self.q_desc.dtype,
@@ -340,42 +353,22 @@ class SparseAttentionBackward(APIBase):
             if not isinstance(tensor, torch.Tensor):
                 raise ValueError(f"{name} must be preallocated; use sparse_attention_backward_wrapper for automatic output allocation")
         scale = self.softmax_scale if softmax_scale is None else softmax_scale
-        if self.deterministic:
+        if self.deterministic or self._backend == _iface_d576.BACKEND:
             if self._compiled_kernel is None:
                 raise RuntimeError("call compile() before execute()")
-            for name, tensor, desc in (
-                ("q", q, self.q_desc),
-                ("kv", kv, self.kv_desc),
-                ("out", out, self.out_desc),
-                ("dout", dout, self.dout_desc),
-                ("lse", lse, self.lse_desc),
-                ("attn_sink", attn_sink, self.attn_sink_desc),
-                ("topk_idxs", topk_idxs, self.topk_idxs_desc),
-                ("topk_length", topk_length, self.topk_length_desc),
-            ):
-                if (tensor is None) != (desc is None):
-                    raise ValueError(f"{name} presence must match the compiled plan")
-                if desc is not None and (tuple(tensor.shape) != desc.shape or tensor.dtype != desc.dtype or tensor.device != desc.device):
-                    raise ValueError(f"{name} shape, dtype, and device must match the compiled plan")
+            self._validate_compiled_inputs(
+                (
+                    ("q", q, self.q_desc),
+                    ("kv", kv, self.kv_desc),
+                    ("out", out, self.out_desc),
+                    ("dout", dout, self.dout_desc),
+                    ("lse", lse, self.lse_desc),
+                    ("attn_sink", attn_sink, self.attn_sink_desc),
+                    ("topk_idxs", topk_idxs, self.topk_idxs_desc),
+                    ("topk_length", topk_length, self.topk_length_desc),
+                )
+            )
         if self._backend == _iface_d576.BACKEND:
-            if self._compiled_kernel is None:
-                raise RuntimeError("call compile() before execute()")
-            # Execution must match the declaration used for routing/compilation.
-            # In particular, neither presence nor absence of lengths is ignored.
-            for name, tensor, desc in (
-                ("q", q, self.q_desc),
-                ("kv", kv, self.kv_desc),
-                ("out", out, self.out_desc),
-                ("dout", dout, self.dout_desc),
-                ("lse", lse, self.lse_desc),
-                ("attn_sink", attn_sink, self.attn_sink_desc),
-                ("topk_idxs", topk_idxs, self.topk_idxs_desc),
-                ("topk_length", topk_length, self.topk_length_desc),
-            ):
-                if (tensor is None) != (desc is None):
-                    raise ValueError(f"{name} presence must match the compiled plan")
-                if desc is not None and (tuple(tensor.shape) != desc.shape or tensor.dtype != desc.dtype or tensor.device != desc.device):
-                    raise ValueError(f"{name} shape, dtype, and device must match the compiled plan")
             return _iface_d576._execute_d576_2cta(
                 self._compiled_kernel,
                 q,

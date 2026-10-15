@@ -318,6 +318,67 @@ def test_DSA_sparse_attention_backward_qcluster_compile_key_is_shape_dynamic():
     assert first.shared is second.shared
 
 
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_deterministic_compile_cache_is_device_scoped(monkeypatch):
+    """Same-arch devices must not share context-owned CuTe launchables."""
+    from contextlib import contextmanager
+
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100 as interface
+
+    compiled = []
+    current_device = [None]
+
+    @contextmanager
+    def device_context(device):
+        previous, current_device[0] = current_device[0], device
+        try:
+            yield
+        finally:
+            current_device[0] = previous
+
+    class FakeKernel:
+        def __init__(self, **kwargs):
+            pass
+
+    def fake_compile(*args, **kwargs):
+        artifact = object()
+        compiled.append((current_device[0], kwargs["options"], artifact))
+        return artifact
+
+    compile_artifact = interface._compile_deterministic_sm100
+    compile_artifact.cache_clear()
+    monkeypatch.setattr(interface, "_deterministic_kernel_class_for_shards", lambda shards: FakeKernel)
+    monkeypatch.setattr(interface, "_fake_compact_tensor", lambda *args, **kwargs: object())
+    monkeypatch.setattr(interface.cute, "sym_int", lambda: object())
+    monkeypatch.setattr(interface.cute.runtime, "make_fake_stream", lambda **kwargs: object())
+    monkeypatch.setattr(interface.cute, "compile", fake_compile)
+    monkeypatch.setattr(torch.cuda, "device", device_context)
+
+    def build(device, capability=(10, 0)):
+        return compile_artifact(device, capability, "generic_m64", torch.bfloat16, 512, 512, 64, 64, True, 32)
+
+    try:
+        device0 = build(0)
+        device1 = build(1)
+        device1_again = build(1)
+        sm103 = build(2, (10, 3))
+        sm107 = build(3, (10, 7))
+    finally:
+        compile_artifact.cache_clear()
+
+    assert device0 is not device1
+    assert device1_again is device1
+    assert sm103 is not device1
+    assert sm107 is not sm103
+    assert [(device, options) for device, options, _ in compiled] == [
+        (0, "--enable-tvm-ffi --gpu-arch sm_100a"),
+        (1, "--enable-tvm-ffi --gpu-arch sm_100a"),
+        (2, "--enable-tvm-ffi --gpu-arch sm_103a"),
+        (3, "--enable-tvm-ffi --gpu-arch sm_107a"),
+    ]
+    assert current_device[0] is None
+
+
 @pytest.mark.L1
 @pytest.mark.parametrize("topk", [512, 2048])
 @pytest.mark.parametrize("heads", [16, 32])
@@ -647,9 +708,8 @@ def _exercise_deterministic_sm100_case(num_heads, head_dim, s_q, s_kv, repeats, 
 
     def run():
         """Execute after poisoning caller scratch AND outputs: the launch sequence owns every reset."""
-        # The compiled kernels (plus the R4 memset of d_sink), never an
-        # execute-side torch fill, must establish the accumulator state and
-        # overwrite every dq/dkv element on each reuse.
+        # The compiled deterministic kernels, never an execute-side reset,
+        # must establish accumulator state and overwrite every output.
         for buffer in (workspace, dq, dkv, d_sink):
             buffer.view(torch.uint8).fill_(0xA5)
         result = api.execute(
@@ -757,7 +817,7 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_adaptive_shards_repea
 def test_DSA_sparse_attention_backward_sm100_deterministic_plan_is_cold_capture_safe(
     monkeypatch, num_heads, topk, dtype, expected_backend
 ):
-    """Plan compilation must leave no CuTe JIT work for execute or capture."""
+    """The first execute after plan compilation is capture-safe and JIT-free."""
     try:
         from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100 as interface
     except ImportError:
@@ -794,19 +854,77 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_plan_is_cold_capture_
             d_sink=d_sink,
         )
 
-    reference = run()
-    torch.cuda.synchronize()
-    reference = tuple(tensor.clone() for tensor in reference)
     graph = torch.cuda.CUDAGraph()
     try:
         with torch.cuda.graph(graph):
             captured = run()
         graph.replay()
         torch.cuda.synchronize()
+        reference = tuple(tensor.clone() for tensor in captured)
+        graph.replay()
+        torch.cuda.synchronize()
         for actual, expected in zip(captured, reference):
             assert torch.equal(actual, expected)
+        q, kv, out, dout, lse, attn_sink, topk_idxs = inputs
+        check_ref_dsa_sparse_attention_backward(
+            q,
+            kv,
+            attn_sink,
+            topk_idxs,
+            out,
+            dout,
+            lse,
+            *captured,
+            softmax_scale=softmax_scale,
+            topk_length=topk_length,
+            atol=5e-2,
+            rtol=5e-2,
+        )
     finally:
         graph.reset()
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=423)
+def test_DSA_sparse_attention_backward_sm100_deterministic_artifact_is_shape_dynamic(monkeypatch):
+    """Q/KV extents sharing a shard bucket reuse one compiled artifact."""
+    try:
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100 as interface
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    _require_sm100()
+    compile_artifact = interface._compile_deterministic_sm100
+    compile_artifact.cache_clear()
+    first, *_ = _plan_case(64, 512, 64, s_q=8, s_kv=256, has_topk_length=True, deterministic=True)
+    first_info = compile_artifact.cache_info()
+
+    def forbidden_compile(*args, **kwargs):
+        raise AssertionError("shape-dynamic plan unexpectedly recompiled")
+
+    monkeypatch.setattr(interface.cute, "compile", forbidden_compile)
+    second, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
+        64,
+        512,
+        64,
+        s_q=16,
+        s_kv=320,
+        has_topk_length=True,
+        deterministic=True,
+    )
+    second_info = compile_artifact.cache_info()
+
+    assert second._compiled_kernel is first._compiled_kernel
+    assert first_info.misses == second_info.misses == 1
+    assert second_info.hits == first_info.hits + 1
+    _assert_execute_allocates_nothing_and_never_synchronizes(
+        second,
+        inputs,
+        outputs,
+        topk_length,
+        softmax_scale,
+        workspace,
+    )
 
 
 @pytest.mark.L1
