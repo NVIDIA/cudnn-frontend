@@ -784,6 +784,48 @@ def test_decode_tile_prices_the_combine_by_the_form_its_grid_takes():
     assert heur._decode_tile_combine_cost(64, grid=(4, 24, 4)) > heur._decode_tile_combine_cost(64, grid=(4, 24, 1))
 
 
+def test_decode_combine_form_rule_is_split_aware_at_the_crossover():
+    """Which combine kernel a split launch takes (``decode_combine_grid_selected``), measured on the
+    Rubin performance class with the combine alone at 24 heads: the decode-grid kernel is flat in
+    the split count but costs more blocks per row, so on a SMALL grid (up to 128 rows: B 1 x S_q 1
+    = 24 rows, B 1 x S_q 4 and B 4 x S_q 1 = 96) it wins from split 8 on (2.1-2.5 us against the
+    lean kernel's 3.4-18 us) and loses only at split 4 (by 0.03-0.4 us), while at B 4 x S_q 4
+    (384 rows) its 4.9-5.4 us loses to the lean walk up to split 16 (3.9 us) and wins from
+    split 32 (6.0 us) -- the crossover is near 23.  The rule: the decode-grid kernel when the
+    launch is inside the kernel module's own grid bound (``DECODE_COMBINE_MAX_LEAN_BLOCKS`` lean
+    blocks), the split is at least ``DECODE_COMBINE_MIN_SPLIT`` (8), and the grid is small or the
+    split at least ``DECODE_COMBINE_DEEP_SPLIT`` (32); the lean kernel otherwise.  The kernel
+    module's own entry takes the decode-grid kernel on every launch inside its bound, so
+    ``decode_combine_force_lean`` names exactly the launches the adapter must pin to the lean
+    kernel; a launch outside the bound is the lean kernel's by construction either way."""
+    from cudnn.sdpa.fwd import heuristics as heur
+
+    assert (heur.DECODE_COMBINE_MIN_SPLIT, heur.DECODE_COMBINE_DEEP_SPLIT, heur.DECODE_COMBINE_SMALL_GRID_ROWS) == (8, 32, 128)
+    sel, force = heur.decode_combine_grid_selected, heur.decode_combine_force_lean
+    # the B 4 x S_q 4 crossover (384 rows, 96 lean blocks): lean up to 16, the decode-grid kernel from 32
+    assert [sel(4, 24, 4, s) for s in (4, 8, 16, 32, 64, 128)] == [False, False, False, True, True, True]
+    assert [force(4, 24, 4, s) for s in (4, 8, 16, 32, 64)] == [True, True, True, False, False]
+    # the small grids: B 1 x S_q 1 (24 rows), B 1 x S_q 4 and B 4 x S_q 1 (96 rows): the decode-grid kernel from split 8
+    for grid in ((1, 24, 1), (1, 24, 4), (4, 24, 1), (1, 32, 1), (4, 32, 1)):
+        assert [sel(*grid, s) for s in (2, 4, 8, 16, 32, 64, 128)] == [False, False, True, True, True, True, True], grid
+        assert force(*grid, 4) and not force(*grid, 8) and not force(*grid, 64), grid
+    # the band between (more than 128 rows inside the kernel's bound): the deep splits only
+    for grid in ((2, 32, 4), (4, 32, 4), (2, 24, 8), (4, 32, 2)):
+        assert [sel(*grid, s) for s in (8, 16, 32, 64)] == [False, False, True, True], grid
+        assert force(*grid, 16) and not force(*grid, 32), grid
+    # past the kernel module's bound (B 8 x 32 heads x S_q 1 = 256 lean blocks; a prefill grid): the lean kernel by
+    # construction, nothing to force
+    for grid in ((8, 32, 1), (32, 24, 1), (128, 24, 4), (2, 4, 1024)):
+        assert not any(sel(*grid, s) for s in (8, 32, 64, 128)) and not any(force(*grid, s) for s in (4, 16, 64)), grid
+    # exactly at the bound (B 4 x 32 heads x S_q 1 = 128 lean blocks = 128 rows): a small grid
+    assert sel(4, 32, 1, 8) and sel(4, 32, 1, 16) and not sel(4, 32, 1, 4)
+    # the split model prices the crossover cell by the rule: B 4 x 24/2 x kv 4K x S_q 4 on the 64-column tile stays at 16
+    # (its lean combine) rather than jumping to the decode-grid kernel's deep splits
+    assert _decode_tile(8, 4096, sm_count=212, q_tile=64, combine_grid=(4, 24, 4)) == 16
+    assert heur._decode_tile_combine_cost(16, grid=(4, 24, 4)) == pytest.approx(heur._decode_tile_combine_cost(16, grid=None))
+    assert heur._decode_tile_combine_cost(32, grid=(4, 24, 4)) < heur._decode_tile_combine_cost(32, grid=None)
+
+
 @requires_dsl
 def test_decode_combine_lean_blocks_is_the_combine_modules_own_grid():
     """The heuristics' reading of the lean combine grid (``decode_combine_lean_blocks``) is the kernel module's

@@ -542,11 +542,26 @@ DECODE_COMBINE_LEAN_ROWS_PER_BLOCK = 4
 # change at all.  :func:`decode_combine_grid_selected` is the rule's host
 # reading, the one the split model prices a launch's combine by.
 DECODE_COMBINE_MAX_LEAN_BLOCKS = 128
-# The small-grid bound of the decode-grid combine's price, in the combine's ROWS
-# (S_q x H_q x B): up to this many rows its intercept is the measured in-step
-# 3.1-3.7 us (_DECODE_TILE_COMBINE_COST); the serving decode cells (B 1 and B 4
-# at 24 heads, S_q 1 and 4, up to 96 rows) sit inside it.
+# The split-aware FORM rule the adapter pins a split launch's combine entry to
+# (decode_combine_grid_selected; the kernel module's own entry takes the
+# decode-grid kernel on every launch inside its bound, so the adapter forces the
+# lean kernel where this rule says so: decode_combine_force_lean).  Measured on
+# the Rubin performance class with the combine alone at 24 heads: on a SMALL
+# grid -- up to DECODE_COMBINE_SMALL_GRID_ROWS rows (B 1 x S_q 1 = 24 rows, B 1 x
+# S_q 4 and B 4 x S_q 1 = 96) -- the decode-grid kernel wins from split 8 on
+# (2.1-2.5 us flat against the lean kernel's 3.4-18 us) and loses only at split 4
+# (by 0.03-0.4 us: more blocks for four partials), while at 384 rows (B 4 x
+# S_q 4) its 4.9-5.4 us loses to the lean walk up to split 16 (3.9 us) and wins
+# from split 32 (6.0 us), the crossover near 23.  So: the decode-grid kernel
+# when the split is at least DECODE_COMBINE_MIN_SPLIT and the grid is small or
+# the split at least DECODE_COMBINE_DEEP_SPLIT, always inside the kernel module's
+# own bound; the lean kernel otherwise.  The serving decode cells (B 1 and B 4 at
+# 24 heads, S_q 1 and 4, up to 96 rows) are small grids, and up to the small-grid
+# bound the decode-grid intercept is the measured in-step 3.1-3.7 us
+# (_DECODE_TILE_COMBINE_COST).
 DECODE_COMBINE_SMALL_GRID_ROWS = 128
+DECODE_COMBINE_MIN_SPLIT = 8
+DECODE_COMBINE_DEEP_SPLIT = 32
 
 
 def decode_combine_lean_blocks(b: int, h_q: int, s_q: int) -> int:
@@ -565,10 +580,23 @@ def decode_combine_rows(b: int, h_q: int, s_q: int) -> int:
 
 def decode_combine_grid_selected(b: int, h_q: int, s_q: int, split: int) -> bool:
     """Whether a split launch of a ``(B, H_q, S_q)`` graph takes the DECODE-GRID combine kernel at
-    ``split`` partials (else the lean kernel): the launch rule's host reading, which the split
-    model prices a candidate split's combine by.  Today the kernel module's own bound,
-    ``lean blocks <= DECODE_COMBINE_MAX_LEAN_BLOCKS``, at every split."""
-    return decode_combine_lean_blocks(b, h_q, s_q) <= DECODE_COMBINE_MAX_LEAN_BLOCKS
+    ``split`` partials (else the lean kernel): the split-aware rule (the constants above), which
+    the adapter pins the compiled combine entry to and the split model prices a candidate split's
+    combine by -- inside the kernel module's own grid bound, at a split of at least
+    ``DECODE_COMBINE_MIN_SPLIT``, on a small grid (``DECODE_COMBINE_SMALL_GRID_ROWS`` rows) or from
+    ``DECODE_COMBINE_DEEP_SPLIT`` on."""
+    if decode_combine_lean_blocks(b, h_q, s_q) > DECODE_COMBINE_MAX_LEAN_BLOCKS or int(split) < DECODE_COMBINE_MIN_SPLIT:
+        return False
+    return decode_combine_rows(b, h_q, s_q) <= DECODE_COMBINE_SMALL_GRID_ROWS or int(split) >= DECODE_COMBINE_DEEP_SPLIT
+
+
+def decode_combine_force_lean(b: int, h_q: int, s_q: int, split: int) -> bool:
+    """Whether the adapter must pin a split launch's combine entry to the LEAN kernel: the launch is
+    inside the kernel module's decode-grid bound (its default entry would take the decode-grid
+    kernel) but the split-aware rule says lean.  Outside the bound the module's entry is the lean
+    kernel by construction, so nothing is forced; where the rule says decode-grid the module's
+    entry agrees."""
+    return decode_combine_lean_blocks(b, h_q, s_q) <= DECODE_COMBINE_MAX_LEAN_BLOCKS and not decode_combine_grid_selected(b, h_q, s_q, split)
 
 
 def _decode_tile_combine_cost(split: int, *, grid: Optional[Tuple[int, int, int]]) -> float:
