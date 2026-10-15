@@ -65,6 +65,8 @@ from typing import Callable
 import cutlass.experimental.primitives as nvvm
 from cudnn.gemm.frost.tile_helpers import (
     moe_scatter_row,
+    moe_combine_add,
+    moe_combine_add_vector,
     tma_scatter4,
     moe_swizzle_tile as _moe_swizzle_tile,
     moe_group_at as _moe_group_at,

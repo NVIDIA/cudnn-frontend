@@ -2715,15 +2715,18 @@ def test_gpu_gated_cases_are_narrowed_everywhere():
     rejection. The registry cannot derive this, so it is pinned here."""
     from cudnn.gemm.frost.kernel_registry import GraphType as _GT, MMA_GPU_ARCH_SPECIAL_CASES, MMA_TYPE_SUPPORT, _bs_key
 
+    # sm120 serves fp4 + e4m3 at block 32 on every SM 12.x part (its 4X ue4m3 warp MMA reads each
+    # scale twice), pinned to [120, 130) like all of its block-scale rows.
+    support = {pipeline: by_type for pipeline, by_type in MMA_TYPE_SUPPORT.items() if pipeline != "sm120"}
     gated = [
         (pipeline, _bs_key("fp4_e2m1", sf, "fp4_e2m1", sf, blk))
-        for pipeline, by_type in MMA_TYPE_SUPPORT.items()
+        for pipeline, by_type in support.items()
         for sf, blk in _GPU_GATED_FP4_CASES
         if _bs_key("fp4_e2m1", sf, "fp4_e2m1", sf, blk) in by_type.get(_GT.BLOCK_SCALE_MATMUL, ())
     ]
     carriers = [
         pipeline
-        for pipeline, by_type in MMA_TYPE_SUPPORT.items()
+        for pipeline, by_type in support.items()
         if any(_bs_key("fp4_e2m1", sf, "fp4_e2m1", sf, blk) in by_type.get(_GT.BLOCK_SCALE_MATMUL, ()) for sf, blk in _GPU_GATED_FP4_CASES)
     ]
     assert carriers, "no pipeline carries the GPU-gated fp4 cases — the invariant lost its subject"
@@ -2908,9 +2911,10 @@ def test_sm120_block_scale_registry_wiring():
     assert _bs_key("fp4_e2m1", "fp8_e4m3", "fp4_e2m1", "fp8_e4m3", 16) in cases  # nvfp4
     assert _bs_key("fp4_e2m1", "fp8_e8m0", "fp4_e2m1", "fp8_e8m0", 32) in cases  # mxfp4
     assert _bs_key("fp8_e4m3", "fp8_e8m0", "fp8_e5m2", "fp8_e8m0", 32) in cases  # mxfp8 mix
-    # No warp-MMA kind: fp4 + e8m0 at block 16, fp4 + e4m3 at block 32, e5m3 scales.
-    assert _bs_key("fp4_e2m1", "fp8_e8m0", "fp4_e2m1", "fp8_e8m0", 16) not in cases
-    assert _bs_key("fp4_e2m1", "fp8_e4m3", "fp4_e2m1", "fp8_e4m3", 32) not in cases
+    # fp4 + e8m0 at block 16 (4X ue8m0) and fp4 + e4m3 at block 32 (4X ue4m3, each scale read twice)
+    # are rows too -- the MoE block-scale templates issue them; no warp-MMA kind for e5m3 scales.
+    assert _bs_key("fp4_e2m1", "fp8_e8m0", "fp4_e2m1", "fp8_e8m0", 16) in cases
+    assert _bs_key("fp4_e2m1", "fp8_e4m3", "fp4_e2m1", "fp8_e4m3", 32) in cases
     assert not any(k[1] == "fp8_e5m3" for k in cases)
     # The renderer's instruction table mirrors the support table exactly.
     assert set(C120._SM120_BLOCK_SCALE_MMA) == {(k[0] == "fp4_e2m1", k[2][1], k[1]) for k in cases}
@@ -2940,7 +2944,7 @@ def test_sm120_block_scale_registry_wiring():
     # block-scale MMA special case (100 <= sm < 120) -- never the wiring itself.
     assert reason is None or "runs only on" in reason or "exists only on 120 <= SM < 130" in reason, reason
 
-    # fp4 + e8m0 at block 16 is refused by the MMA-type table ...
+    # fp4 + e8m0 at block 16 is refused for this template (Sm120KernelTemplate.block_scale_form_reject) ...
     chain16 = analyze(_build_nvfp4_graph(256, 256, 512, block_size=16, sf_dt=cudnn.data_type.FP8_E8M0))
     assert "does not support" in mma_arch_reject(chain16, GraphType.BLOCK_SCALE_MATMUL, "sm120")
     # ... MN-major fp4 by the template class (a 4-bit operand has no transposed ldmatrix) ...

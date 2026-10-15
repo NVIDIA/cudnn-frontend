@@ -25,6 +25,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, replace
 from enum import Enum
+from functools import lru_cache
 from pathlib import Path
 
 from . import arch_family
@@ -242,6 +243,12 @@ MMA_TYPE_SUPPORT: dict[str, dict[GraphType, frozenset]] = {
                 _bs_key("fp8_e4m3", "fp8_e8m0", "fp8_e5m2", "fp8_e8m0", 32),
                 _bs_key("fp8_e5m2", "fp8_e8m0", "fp8_e4m3", "fp8_e8m0", 32),
                 _bs_key("fp8_e5m2", "fp8_e8m0", "fp8_e5m2", "fp8_e8m0", 32),
+                _bs_key("fp4_e2m1", "fp8_e8m0", "fp8_e4m3", "fp8_e8m0", 32),
+                _bs_key("fp4_e2m1", "fp8_e8m0", "fp8_e5m2", "fp8_e8m0", 32),
+                _bs_key("fp8_e4m3", "fp8_e8m0", "fp4_e2m1", "fp8_e8m0", 32),
+                _bs_key("fp8_e5m2", "fp8_e8m0", "fp4_e2m1", "fp8_e8m0", 32),
+                _bs_key("fp4_e2m1", "fp8_e8m0", "fp4_e2m1", "fp8_e8m0", 16),
+                _bs_key("fp4_e2m1", "fp8_e4m3", "fp4_e2m1", "fp8_e4m3", 32),
             }
         ),
     },
@@ -266,6 +273,12 @@ MMA_GPU_ARCH_SPECIAL_CASES: dict[tuple[str, tuple], tuple[tuple[int, int], ...]]
     ("sm120", _bs_key("fp8_e4m3", "fp8_e8m0", "fp8_e5m2", "fp8_e8m0", 32)): ((120, 130),),
     ("sm120", _bs_key("fp8_e5m2", "fp8_e8m0", "fp8_e4m3", "fp8_e8m0", 32)): ((120, 130),),
     ("sm120", _bs_key("fp8_e5m2", "fp8_e8m0", "fp8_e5m2", "fp8_e8m0", 32)): ((120, 130),),
+    ("sm120", _bs_key("fp4_e2m1", "fp8_e8m0", "fp8_e4m3", "fp8_e8m0", 32)): ((120, 130),),
+    ("sm120", _bs_key("fp4_e2m1", "fp8_e8m0", "fp8_e5m2", "fp8_e8m0", 32)): ((120, 130),),
+    ("sm120", _bs_key("fp8_e4m3", "fp8_e8m0", "fp4_e2m1", "fp8_e8m0", 32)): ((120, 130),),
+    ("sm120", _bs_key("fp8_e5m2", "fp8_e8m0", "fp4_e2m1", "fp8_e8m0", 32)): ((120, 130),),
+    ("sm120", _bs_key("fp4_e2m1", "fp8_e8m0", "fp4_e2m1", "fp8_e8m0", 16)): ((120, 130),),
+    ("sm120", _bs_key("fp4_e2m1", "fp8_e4m3", "fp4_e2m1", "fp8_e4m3", 32)): ((120, 130),),
 }
 
 
@@ -332,19 +345,13 @@ def mma_arch_reject(chain: FusionChain, graph_type: GraphType, template_pipeline
             mm = chain.matmul
             return f"the {template_pipeline} {graph_type.value} pipeline does not support " f"input/acc dtype combo {mm.a_dtype}x{mm.b_dtype}->{mm.accum_dtype}"
         return f"the {template_pipeline} {graph_type.value} pipeline does not support " f"this configuration: mma type {key}"
-    # One-sided block-scale graphs are normalized to an ordinary two-sided MMA
-    # type, with the raw FP8 operand carrying a fake-dequant marker.  Keep that
-    # marker out of the generic MMA-type key: it is a renderer capability, not a
-    # new instruction combination.  The sm120 renderer does not yet synthesize
-    # the identity scale-factor operand, however, and unconditionally indexes
-    # both TMA descriptor lists.  Reject it here before rendering/compilation.
-    if (
-        template_pipeline == "sm120"
-        and base_type is GraphType.BLOCK_SCALE_MATMUL
-        and chain.block_scale is not None
-        and (chain.block_scale.fake_dequant_a or chain.block_scale.fake_dequant_b)
-    ):
-        return "the sm120 block_scale_matmul pipeline does not support one-sided " "dequantization: fake scale-factor identity handling is not implemented"
+
+    if template_pipeline == "sm120" and base_type is GraphType.BLOCK_SCALE_MATMUL:
+        for tmpl in TEMPLATES:
+            if tmpl.pipeline == template_pipeline and tmpl.graph_type is graph_type and isinstance(tmpl, Sm120KernelTemplate):
+                reason = tmpl.block_scale_form_reject(chain) or tmpl.block_scale_toolchain_reject(chain)
+                if reason is not None:
+                    return reason
     special = MMA_GPU_ARCH_SPECIAL_CASES.get((template_pipeline, key))
     if special is not None:
         arch = C._current_arch()
@@ -488,8 +495,8 @@ class KernelTemplate:
         """``None`` if this template can compile (chain, config); else the first
         stage's rejection reason. Cheapest-first (short-circuits):
         pipeline/graph-type/mainloop → mma-type×arch → tile-config → other."""
-        if chain.has_moe and chain.moe.mode == "combine" and self.pipeline != "sm100":
-            return "MoE COMBINE is supported only by the SM100 pipeline"
+        if chain.has_moe and chain.moe.mode == "combine" and self.pipeline not in ("sm100", "sm120"):
+            return "MoE COMBINE is supported only by the SM100 and SM120 pipelines"
         gt = classify_graph_type(chain)
         return (
             self.arch_active_reject()
@@ -529,82 +536,78 @@ class MainloopKernelTemplate(KernelTemplate):
 
 
 class Sm120KernelTemplate(KernelTemplate):
-    """The sm120 warp-MMA template. Its scope is enforced by render-time
-    asserts in the template source; encoding it here lets the funnel (and the
-    jit paths, via ``active_reject``) reject cleanly instead of faulting
-    mid-render. All eight A/B/output major combinations are served, with two
-    carve-outs: an MN-major operand rides a transposing ldmatrix (the b16 form
-    for 16-bit dtypes, the SM 12x byte-granule ``m16n16.trans.b8`` form for
-    8-bit ones — sub-byte dtypes have no transposed load and must be K-major),
-    and an N-major output stores whole (n, n+1) accumulator pairs (an M-major
-    output scatters per element, so its chunk may narrow freely). Non-fp4
-    output only. Fronts both sm120 templates (dense and block-scale): a packed
-    fp4 operand is 4-bit, so the MN-major gate keeps it K-major."""
-
-    # --- multi-GEMM (dual MoE / SwiGLU) feasibility ---------------------------
-    # The MoE templates (dense and block-scale) keep one register accumulator
-    # per GEMM resident for the whole tile (warp_tile_m x warp_tile_n fp32 / 32
-    # lanes each). How many registers that takes is NOT a support question:
-    # past what the compute warp's grant holds, ptxas spills to local memory
-    # and the plan still computes the same function, only slower -- a perf
-    # trade-off left to the autotuner and the auto pick
-    # (tile_config.select_config's shared 256-wide N budget keeps the auto pick
-    # spill-free), never a reason to reject a plan. The one hard gate is SMEM:
-    # a stage of every distinct operand tile plus the epilogue staging has to fit.
     COMPUTE_WARPS = 8  # WARPS_M * WARPS_N in every sm120 template
 
     def multi_gemm_ab_stages(self, chain: FusionChain, config: TileConfig) -> tuple[int, int, int]:
-        """``(ab_stages, per_stage_bytes, staging_bytes)`` of a multi-GEMM chain on
-        this template: one SMEM tile per DISTINCT operand per stage (+16 B slack,
-        as the template counts), with the transposed-STG epilogue staging taken
-        off the budget in BYTES before the ring is sized. On the dense MoE
-        template that replaces the whole-stage deduction its single-GEMM path
-        keeps (a multi-operand stage is so large that giving one up can leave
-        none): the renderer emits the result verbatim and tells the template not
-        to deduct (``stg_epi_prefunded``). The block-scale templates always take
-        the injected ring depth as is.
-
-        On the block-scale MoE templates (both orientations) an operand's tile
-        is its PACKED K-tile (``cta_tile_k_bytes`` per row) plus its F8_128x4
-        scale-factor box (the whole K-tile of scales for every 128-row block the
-        tile touches), and a GATHER chain also holds the linear token-scale
-        scratch per token operand -- the single-GEMM accounting of the sm120
-        block-scale renderer (``_render_block_scale_tile_constants``), per
-        distinct operand; change the two together. The ``smem_fixed_reserve``
-        covers what this linear count leaves out: the 1024-B block of barriers
-        and scheduler ring in front of the rings, the at most 512-B pad of the SF
-        rings (512-B aligned in both templates) before the 1024-aligned staging,
-        and GATHER's 8-B mbarrier per token operand."""
         from .dtypes import DTYPE_BYTES
-        from .tile_config import _SM120_STG_STAGE_ELEMS, smem_ab_stages
+        from .tile_config import _SM120_STG_STAGE_ELEMS, _sm_smem_budget_bytes, smem_ab_stages
 
         staging = 4 * _SM120_STG_STAGE_ELEMS * self.COMPUTE_WARPS
         if self.block_scale:
             bs = chain.block_scale
+            # The K tile counts fp8 elements unless both operands are e2m1, so an
+            # SMEM K row is one cta_tile_k_bytes span -- except the packed e2m1
+            # side of a mixed pair, whose row holds the fp8 K-tile in half the bytes.
             kb = config.cta_tile_k_bytes
+            a_kb = kb // 2 if bs.mixed_width and bs.a_dtype == "fp4_e2m1" else kb
+            b_kb = kb // 2 if bs.mixed_width and bs.b_dtype == "fp4_e2m1" else kb
             sf_k = kb * 8 // (4 if bs.is_fp4 else 8) // bs.block_size
-            sfa_bytes = -(-config.cta_tile_m // 128) * 128 * sf_k
-            sfb_bytes = -(-config.cta_tile_n // 128) * 128 * sf_k
-            per_stage = chain.num_a_operands * (config.cta_tile_m * kb + sfa_bytes) + chain.num_b_operands * (config.cta_tile_n * kb + sfb_bytes) + 16
-            if chain.has_moe and chain.moe.mode == "gather":
+            # A one-sided graph's raw-FP8 side reads an identity scale register:
+            # no SF box in the stage.
+            sfa_bytes = 0 if bs.fake_dequant_a else -(-config.cta_tile_m // 128) * 128 * sf_k
+            sfb_bytes = 0 if bs.fake_dequant_b else -(-config.cta_tile_n // 128) * 128 * sf_k
+            per_stage = chain.num_a_operands * (config.cta_tile_m * a_kb + sfa_bytes) + chain.num_b_operands * (config.cta_tile_n * b_kb + sfb_bytes) + 16
+            swapped = isinstance(chain.moe, MoeSwapAbSpec)
+            if chain.has_moe and chain.moe.mode == "gather" and not (bs.fake_dequant_b if swapped else bs.fake_dequant_a):
                 # 32 B per routed token row of the tile, per token operand (the
-                # token is B after the swap-AB lowering).
-                swapped = isinstance(chain.moe, MoeSwapAbSpec)
+                # token is B after the swap-AB lowering) -- the linear token
+                # scales' scratch, absent when the token is the raw-FP8 side.
                 staging += (config.cta_tile_n if swapped else config.cta_tile_m) * 32 * (chain.num_b_operands if swapped else chain.num_a_operands)
         else:
             _m, cta_smem_n, _k = config.cta_smem_tile_mnk(DTYPE_BYTES[chain.matmul.a_dtype])
             per_stage = (chain.num_a_operands * config.cta_tile_m + chain.num_b_operands * cta_smem_n) * config.cta_tile_k_bytes + 16
-        return smem_ab_stages(per_stage, smem_fixed_reserve=self.smem_fixed_reserve, extra_smem_bytes=staging), per_stage, staging
+        stages = smem_ab_stages(per_stage, smem_fixed_reserve=self.smem_fixed_reserve, extra_smem_bytes=staging)
+        budget = _sm_smem_budget_bytes()
+        while stages > 0 and self.multi_gemm_smem_bytes(chain, config, stages) > budget:
+            stages -= 1
+        return stages, per_stage, staging
+
+    def multi_gemm_smem_bytes(self, chain: FusionChain, config: TileConfig, stages: int) -> int:
+        from .dtypes import DTYPE_BYTES
+        from .tile_config import _SM120_STG_STAGE_ELEMS
+
+        def up(offset: int, align: int) -> int:
+            return -(-offset // align) * align
+
+        offset = 1024
+        kb = config.cta_tile_k_bytes
+        if self.block_scale:
+            bs = chain.block_scale
+            sf_k = kb * 8 // (4 if bs.is_fp4 else 8) // bs.block_size
+            a_tile, b_tile = config.cta_tile_m * kb, config.cta_tile_n * kb
+            sf_tiles = (-(-config.cta_tile_m // 128) * 128 * sf_k, -(-config.cta_tile_n // 128) * 128 * sf_k)
+        else:
+            cta_smem_m, cta_smem_n, _k = config.cta_smem_tile_mnk(DTYPE_BYTES[chain.matmul.a_dtype])
+            a_tile, b_tile = cta_smem_m * kb, cta_smem_n * kb
+            sf_tiles = None
+        for count, tile in ((chain.num_a_operands, a_tile), (chain.num_b_operands, b_tile)):
+            for _ in range(count):
+                offset = up(offset, 1024) + stages * tile
+        if sf_tiles is not None:
+            for count, tile in zip((chain.num_a_operands, chain.num_b_operands), sf_tiles):
+                for _ in range(count):
+                    offset = up(offset, 512) + stages * tile
+        offset = up(offset, 1024) + 4 * _SM120_STG_STAGE_ELEMS * self.COMPUTE_WARPS
+        if self.block_scale and chain.has_moe and chain.moe.mode == "gather":
+            swapped = isinstance(chain.moe, MoeSwapAbSpec)
+            rows, tokens = (config.cta_tile_n, chain.num_b_operands) if swapped else (config.cta_tile_m, chain.num_a_operands)
+            for _ in range(tokens):
+                offset = up(offset, 128) + rows * 32
+            for _ in range(tokens):
+                offset = up(offset, 8) + 8
+        return offset
 
     def multi_gemm_reject(self, chain: FusionChain, config: TileConfig) -> str | None:
-        """Why a multi-GEMM chain CANNOT run on this template with ``config`` --
-        SMEM only: one stage of every distinct operand tile plus the epilogue
-        staging has to fit. ``None`` when it fits or the chain is a single GEMM.
-        Register pressure is deliberately not a reason here: spilling is a perf
-        trade-off, never grounds to disable a plan. Asked by the funnel
-        (``_extra_reject``), the sm120 MoE prechecks and the sm120 renderers
-        (``_render_tile_constants`` / ``_render_block_scale_tile_constants``),
-        so all of them agree."""
         if not chain.is_multi_gemm:
             return None
         stages, per_stage, staging = self.multi_gemm_ab_stages(chain, config)
@@ -620,22 +623,13 @@ class Sm120KernelTemplate(KernelTemplate):
         return None
 
     def gather_sf_reject(self, chain: FusionChain, config: TileConfig) -> str | None:
-        """Why a block-scale MoE GATHER chain CANNOT run on this template with
-        ``config``: the producer repacks the tile's linear token scales into the
-        F8_128x4 stage in warp-wide passes of 32 SF words (the templates' TMA
-        warp, as ``tile_helpers.moe_gather_scales``), so the token tile's rows
-        times its 4-scale words per row must be a whole number of passes --
-        otherwise the stage is (partly) never written and the MMA reads stale
-        scales (mxfp8 at a 16-row token tile: 16 x 1 words). ``None`` when it
-        holds or the chain is not a block-scale GATHER. Asked by the funnel
-        (``_extra_reject``), the sm120 MoE block-scale precheck and the
-        block-scale renderer, so all of them agree; the templates keep an
-        import-time check as a backstop."""
         if not (self.block_scale and chain.has_moe and chain.moe.mode == "gather"):
             return None
         bs = chain.block_scale
         sf_k4 = config.cta_tile_k_bytes * 8 // (4 if bs.is_fp4 else 8) // bs.block_size // 4
         swapped = isinstance(chain.moe, MoeSwapAbSpec)
+        if bs.fake_dequant_b if swapped else bs.fake_dequant_a:
+            return None  # a raw-FP8 token has no scales to repack
         token_rows, axis = (config.cta_tile_n, "N") if swapped else (config.cta_tile_m, "M")
         if (token_rows * sf_k4) % 32:
             return (
@@ -644,15 +638,65 @@ class Sm120KernelTemplate(KernelTemplate):
             )
         return None
 
+    DENSE_BLOCK_SCALE_FILE = "sm120_block_scale_matmul.py"
+    DENSE_UNISSUED_FP4_SCALES = {
+        (16, "fp8_e8m0"): "kind::mxf4nvf4 scale_vec::4X .ue8m0 as inline PTX",
+        (32, "fp8_e4m3"): "kind::mxf4nvf4 scale_vec::4X .ue4m3 with each block-32 scale byte in both of its block-16 slots",
+    }
+
+    def block_scale_form_reject(self, chain: FusionChain) -> str | None:
+        bs = chain.block_scale
+        if bs is None or self.file != self.DENSE_BLOCK_SCALE_FILE:
+            return None
+        if bs.fake_dequant_a or bs.fake_dequant_b:
+            return (
+                "the sm120 block_scale_matmul pipeline does not support one-sided dequantization: fake scale-factor "
+                f"identity handling is not implemented in {self.file} (the sm120 MoE block-scale templates feed the "
+                "raw FP8 operand an identity scale)"
+            )
+        if bs.mixed_width:
+            return (
+                f"{self.file} does not support mixed-width block-scale operands ({bs.a_dtype} x {bs.b_dtype}): it "
+                "loads A and B in one packed width (the sm120 MoE block-scale templates give each side its own)"
+            )
+        issue = self.DENSE_UNISSUED_FP4_SCALES.get((bs.block_size, bs.sf_dtype)) if bs.both_fp4 else None
+        if issue is not None:
+            return (
+                f"{self.file} does not support fp4_e2m1 data with {bs.sf_dtype} scales at block {bs.block_size}: its "
+                f"warp MMA has no such form yet (the sm120 MoE block-scale templates issue {issue})"
+            )
+        return None
+
+    PTX_ISA_FLOORS = {
+        (16, "fp8_e8m0"): ("kind::mxf4nvf4 scale_vec::4X .ue8m0", (9, 1), (13, 1)),
+    }
+
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def dsl_cuda_version() -> tuple[int, int] | None:
+        try:
+            from cutlass.base_dsl.version_info import CUDA_VERSION
+        except Exception:  # noqa: BLE001 -- an absent / broken DSL is reported by probe_cutedsl
+            return None
+        return (CUDA_VERSION.major, CUDA_VERSION.minor)
+
+    def block_scale_toolchain_reject(self, chain: FusionChain) -> str | None:
+        bs = chain.block_scale
+        if bs is None or not self.block_scale or not bs.both_fp4:
+            return None
+        floor = self.PTX_ISA_FLOORS.get((bs.block_size, bs.sf_dtype))
+        cuda = self.dsl_cuda_version() if floor is not None else None
+        if cuda is None or cuda >= floor[2]:
+            return None
+        form, (isa_major, isa_minor), (need_major, need_minor) = floor
+        return (
+            f"the sm120 block-scale templates issue fp4_e2m1 data with {bs.sf_dtype} scales at block {bs.block_size} "
+            f"as mma.sync {form} (PTX ISA {isa_major}.{isa_minor}), which needs a CUDA {need_major}.{need_minor}+ "
+            f"toolchain, but the installed CuTe DSL compiles with CUDA {cuda[0]}.{cuda[1]} (nvidia-cutlass-dsl uses "
+            f"its cu13 toolchain only under a CUDA 13.x driver)"
+        )
+
     def warp_layout_reject(self, config: TileConfig) -> str | None:
-        """Why this template cannot run ``config``'s warp layout. The producer
-        warps (TMA, scheduler, donors) hand their registers to the compute warps
-        with setmaxnreg, which acts on whole warpgroups, so the compute grid
-        must fill whole warpgroups and leave at least one producer warpgroup: 4
-        or 8 compute warps in the 12-warp block -- the only grids whose
-        232-register compute split also fits the CTA's register pool. Any other
-        grid would hang in setmaxnreg.inc instead of declining. Asked by the
-        funnel (``_extra_reject``) and by every JIT path (``active_reject``)."""
         compute_warps = (config.cta_tile_m // config.warp_tile_m) * (config.cta_tile_n // config.warp_tile_n)
         warps = self.warps_per_cta or config.warps_per_cta
         if compute_warps % 4 or compute_warps + 4 > warps:
@@ -663,11 +707,48 @@ class Sm120KernelTemplate(KernelTemplate):
             )
         return None
 
+    def block_quant_reject(self, chain: FusionChain, config: TileConfig) -> str | None:
+        if not chain.quants:
+            return None
+        from .sm120 import compiler as C120
+
+        if self.block_scale and not chain.has_moe:
+            return C120._DENSE_BLOCK_SCALE_QUANT_DECLINE
+        try:
+            C120._check_block_quant_supported(chain, C120._epi_vec_bytes(chain, config), config)
+        except (NotImplementedError, ValueError) as e:
+            return str(e)
+        return None
+
     def active_reject(self, config: TileConfig, chain: FusionChain | None = None) -> str | None:
         return super().active_reject(config, chain) or self.warp_layout_reject(config)
 
+    @staticmethod
+    def moe_combine_reject(chain: FusionChain) -> str | None:
+        if not (chain.has_moe and chain.moe.mode == "combine"):
+            return None
+        if chain.num_gemms != 1 or chain.ops or chain.quants or chain.reductions or len(chain.output_specs) != 1:
+            return "MoE COMBINE requires one GEMM and one final output without post-combine operations"
+        if chain.matmul.accum_dtype != "fp32" or chain.output_dtype not in ("fp32", "fp16", "bf16"):
+            return "MoE COMBINE requires FP32 MMA accumulation and FP32/FP16/BF16 output"
+        return None
+
+    def _other_reject(self, chain: FusionChain, config: TileConfig) -> str | None:
+        # Last, after the shared alignment / output-width gates -- where the
+        # sm120 prechecks run the quant gates too.
+        return super()._other_reject(chain, config) or self.block_quant_reject(chain, config)
+
+    def output_dtype_reject(self, chain: FusionChain) -> str | None:
+        if chain.output_dtype == "fp4_e2m1" or any(spec.dtype == "fp4_e2m1" for spec in chain.output_specs):
+            return f"{self.file} does not support fp4 output"
+        return None
+
     def _extra_reject(self, chain: FusionChain, config: TileConfig) -> str | None:
         from .dtypes import DTYPE_BITS, DTYPE_BYTES
+
+        _mc = self.moe_combine_reject(chain)
+        if _mc is not None:
+            return f"{self.file}: {_mc}"
 
         _wl = self.warp_layout_reject(config)
         if _wl is not None:
@@ -677,15 +758,7 @@ class Sm120KernelTemplate(KernelTemplate):
             return f"{self.file} loads MN-major operands with ldmatrix.trans (b16) / " f"ldmatrix.m16n16.trans.b8; {mm.a_dtype} A must be K-major"
         if mm.b_major == "n" and DTYPE_BITS[mm.b_dtype] not in (16, 8):
             return f"{self.file} loads MN-major operands with ldmatrix.trans (b16) / " f"ldmatrix.m16n16.trans.b8; {mm.b_dtype} B must be K-major"
-        # (The template also asserts _N_FRAGS is even for an 8-bit N-major B —
-        # one m16n16.b8 tile spans two n-frags. No funnel mirror is needed:
-        # every constructible ConfigSm120 satisfies it, because construction
-        # enforces warp_tile_n % mma_tile_n(=16) == 0.)
         if mm.a_major == "m" or mm.b_major == "n":
-            # Mirror of _render_tile_constants' rule. The sm120 ldmatrix path
-            # has no per-MMA SMEM descriptors (that is a tcgen05 fact), so only
-            # the WHOLE extent must cut into whole swizzle groups -- that is
-            # what the template's TMA group walk needs.
             elem_bytes = DTYPE_BYTES[mm.a_dtype]
             group = config.cta_tile_k_bytes // elem_bytes
             cta_smem_m, cta_smem_n, _ = config.cta_smem_tile_mnk(elem_bytes)
@@ -693,8 +766,9 @@ class Sm120KernelTemplate(KernelTemplate):
                 return f"{self.file}: M-major A SMEM extent {cta_smem_m} is not a " f"whole number of {group}-element swizzle groups"
             if mm.b_major == "n" and (cta_smem_n < group or cta_smem_n % group):
                 return f"{self.file}: N-major B SMEM extent {cta_smem_n} is not a " f"whole number of {group}-element swizzle groups"
-        if chain.output_dtype == "fp4_e2m1":
-            return f"{self.file} does not support fp4 output"
+        _od = self.output_dtype_reject(chain)
+        if _od is not None:
+            return _od
         try:
             _mg = self.multi_gemm_reject(chain, config)
         except NotImplementedError as e:  # no device to size the SMEM ring against (render-only / CI host)
@@ -704,14 +778,6 @@ class Sm120KernelTemplate(KernelTemplate):
         _gs = self.gather_sf_reject(chain, config)
         if _gs is not None:
             return f"{self.file}: {_gs}"
-        from . import compiler as C
-
-        try:
-            vec = C._epi_vec_bytes(chain, config)
-        except ValueError as e:
-            return str(e)
-        if chain.out_major == "n" and vec < 2 * DTYPE_BYTES[chain.output_dtype]:
-            return f"{self.file} stores whole (n, n+1) accumulator pairs; the output " f"layout admits only {vec}-byte epilogue chunks"
         return None
 
 
@@ -786,7 +852,7 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
     ),
     _mm(
         "sm120_matmul.py",
-        supports_multi_gemm=False,
+        supports_multi_gemm=True,
         template_cls=Sm120KernelTemplate,
     ),
     _mm(
@@ -796,44 +862,26 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
         template_cls=Sm120KernelTemplate,
     ),
     _mm(
-        # The warp-MMA MoE kernel: grouped persistent scheduler, A addressed by
-        # coordinate on one global descriptor (no tensormap scratch to reserve).
         "sm120_moe_grouped_matmul_fwd.py",
         graph_type=GraphType.MOE,
-        # Multi-GEMM (SwiGLU-style dual MoE) runs on the same kernel: one register
-        # accumulator per GEMM; SMEM feasibility is `Sm120KernelTemplate.multi_gemm_reject`
-        # (register pressure is a perf trade-off, never a gate).
         supports_multi_gemm=True,
         template_cls=Sm120KernelTemplate,
     ),
     _mm(
-        # Its block-scale sibling: the same scheduler carrying each group's first
-        # SFA block; A and SFA both addressed by coordinate.
         "sm120_moe_grouped_block_scale_matmul_fwd.py",
         graph_type=GraphType.MOE_BLOCK_SCALE,
-        # Multi-GEMM as on the dense MoE kernel: one register accumulator per
-        # GEMM, each distinct operand's packed tile + SF box per stage; SMEM
-        # feasibility is `Sm120KernelTemplate.multi_gemm_reject`.
         supports_multi_gemm=True,
         template_cls=Sm120KernelTemplate,
     ),
     _mm(
-        # The weight-by-token (swap-AB) lowering of the warp-MMA MoE kernel: the
-        # expert's weight is A (batched by expert), the routed token matrix is B
-        # (addressed by coordinate), and the routed groups partition N.
         "sm120_moe_grouped_matmul_fwd_swap_ab.py",
         graph_type=GraphType.MOE_SWAP_AB,
         supports_multi_gemm=True,
         template_cls=Sm120KernelTemplate,
     ),
     _mm(
-        # Its block-scale sibling: the weight and its per-expert SFA are A; the
-        # token and its segmented SFB are B, both addressed by coordinate, with
-        # the scheduler carrying each group's first SFB block.
         "sm120_moe_grouped_block_scale_matmul_fwd_swap_ab.py",
         graph_type=GraphType.MOE_BLOCK_SCALE_SWAP_AB,
-        # Multi-GEMM as on its non-swapped sibling (the weights are the distinct
-        # A operands after the swap); SMEM feasibility is `multi_gemm_reject`.
         supports_multi_gemm=True,
         template_cls=Sm120KernelTemplate,
     ),

@@ -20,6 +20,7 @@ from ..fusion_ir import (
     ReductionSpec,
     TensorRef,
     gemm_index,
+    gemm_source,
     is_gemm_source,
 )
 
@@ -72,7 +73,11 @@ def _compute_literal(dtype: Dtype, value: float | int) -> str:
 def _index_term(var: str, stride: int) -> str:
     if stride == 1:
         return var
-    return f"{var} * {stride}"
+    # The coordinates are Int32 and M/N are symbolic in the kernel, so a strided
+    # term is formed in Int64: `row * I` for an [M, I] aux passes 2^31 once the
+    # tensor holds that many elements (M >= 65536 at I = 32768), and an Int32
+    # product would wrap and read another row's -- or unmapped -- memory.
+    return f"cutlass.Int64({var}) * {stride}"
 
 
 def _aux_index_expr(aux: TensorRef, *, row_var: str = "row", col_var: str = "col_j") -> str:
@@ -612,6 +617,22 @@ def _emit_round(var: str, out_dtype: Dtype, tag: str) -> tuple[list[str], str]:
     return [f"{new} = ({var}).to({DTYPE_TO_CUTLASS[out_dtype]})"], new
 
 
+def _gemm_out_dtype(chain: FusionChain, g: int) -> Dtype:
+    """The declared dtype GEMM ``g``'s accumulator is rounded to before anything
+    reads it: ``matmul.out_dtype``, the one dtype the GEMMs of a fused epilogue
+    share (the sm120 graph gate declines GEMMs that declare different ones) --
+    except on a no-epilogue multi-GEMM chain, whose GEMM outputs ARE its
+    outputs, each declaring its own dtype while ``matmul.out_dtype`` holds GEMM
+    0's. There GEMM ``g`` rounds to its own output's dtype, once: a detour
+    through GEMM 0's dtype cost an fp32 output beside a bf16 one its precision
+    (bf16-rounded values stored as fp32) and double-rounded an fp8 one."""
+    if chain.is_multi_gemm and not chain.ops:
+        for spec in chain.output_specs:
+            if spec.source_ref == gemm_source(g) and spec.quant_idx is None:
+                return spec.dtype
+    return chain.matmul.out_dtype
+
+
 def _store_cast_expr(var: str, dtype: Dtype) -> str:
     if dtype == "uint8":
         # GEMM exposes uint8 tensor raw pointers as Int8; bitcast preserves the byte payload.
@@ -676,6 +697,61 @@ def _tap_vec_bytes(chain: FusionChain, dtype: Dtype, dim, stride, vsize: int) ->
     if dtype == "fp4_e2m1":
         return max(vsize // 2, 4)
     return _tap_store_elems(chain, dtype, dim, stride, vsize) * DTYPE_BYTES[dtype]
+
+
+def _emit_moe_combine_store(tap_idx, i, src, spec, chain, vsize):
+    """COMBINE (sm100 #1380 semantics): routed row ``r`` adds
+    ``top_k_scores[token_index[r], token_ks[r]] * fc2[r]`` into output row
+    ``token_index[r]`` with global reductions in the output precision; a row
+    whose token or top-k slot is out of range adds nothing. The host zero-fills
+    the ``[1, T, N]`` output first.
+
+    The drain hands every arm ONE routed row per lane: the token-by-weight
+    kernel's ``row`` (one token row, ``vsize`` consecutive features) and the
+    swap-AB kernel's ``col_j + e`` (``vsize`` routed rows of one feature).
+    Only the former's destinations are adjacent, so only an N-major output of
+    the token-by-weight kernel packs them into <= 16-byte vector reductions;
+    every other layout adds per element through the output's runtime strides.
+    The token-by-weight kernel loads the row's token, slot and score once per
+    chunk rather than once per element."""
+    swapped = isinstance(chain.moe, MoeSwapAbSpec)
+    dtype = DTYPE_TO_CUTLASS[spec.dtype]
+    valid = "(_combine_token >= 0) & (_combine_token < top_k_scores.shape[0]) & (_combine_slot >= 0) & (_combine_slot < moe_top_k)"
+    if not swapped:
+        lines = [
+            "if row < group_end:",
+            "    _combine_token = token_index[row]",
+            "    _combine_slot = token_ks[row]",
+            f"    if {valid}:",
+            "        _combine_scale = top_k_scores[_combine_token, _combine_slot]",
+            f"        _combine_ptr = gC_tap_{tap_idx}_ptr + cutlass.Int64(_combine_token) * out_stride_m_{i} + cutlass.Int64(col_j) * out_stride_n_{i}",
+        ]
+        if spec.major == "n":
+            width = min(vsize, 16 // DTYPE_BYTES[spec.dtype])
+            lines.append(f"        _combine_values = {src} * cutlass.full_like({src}, _combine_scale)")
+            for e in range(0, vsize, width):
+                lines += [
+                    f"        if col_j + {e + width} <= N:",
+                    f"            moe_combine_add_vector(_combine_ptr + {e}, _combine_values[{e}:{e + width}], {dtype}, {width})",
+                ]
+            return lines
+        for e in range(vsize):
+            lines += [
+                f"        if col_j + {e} < N:",
+                f"            moe_combine_add(_combine_ptr + cutlass.Int64({e}) * out_stride_n_{i}, {src}[{e}] * _combine_scale, {dtype})",
+            ]
+        return lines
+    lines = []
+    for e in range(vsize):
+        lines += [
+            f"if (col_j + {e} < group_end) & (row < M):",
+            f"    _combine_token = token_index[col_j + {e}]",
+            f"    _combine_slot = token_ks[col_j + {e}]",
+            f"    if {valid}:",
+            f"        _combine_value = {src}[{e}] * top_k_scores[_combine_token, _combine_slot]",
+            f"        moe_combine_add(gC_tap_{tap_idx}_ptr + cutlass.Int64(row) * out_stride_m_{i} + cutlass.Int64(_combine_token) * out_stride_n_{i}, _combine_value, {dtype})",
+        ]
+    return lines
 
 
 def _emit_moe_scatter_store(tap_idx, i, src, spec, chain, vsize, row_pred, col_bound):
@@ -966,7 +1042,7 @@ def _emit_reduction_partial_flush(tap_idx: int, red_idx: int, red: ReductionSpec
     return lines
 
 
-def _emit_red_part_module(chain: FusionChain, parts: list) -> list[str]:
+def _emit_red_part_module(chain: FusionChain, parts: list, folds: "list | None" = None, lane_run_tile: "tuple[int, int] | None" = None) -> list[str]:
     """Module-level text for the tile constants: ``red_part_slots`` and the three
     ``red_part_*`` helpers the six sm120 templates call around their tile loop
     (seed before it, flush after each tile's drain and after the loop). They
@@ -974,19 +1050,283 @@ def _emit_red_part_module(chain: FusionChain, parts: list) -> list[str]:
     ``(red_idx, slot, red, tap_idx)``; the helpers read the taps' pointers and
     strides from the kernel-scope ``_red_part_args`` tuple (INJECT_TAP_PTRS) and
     the tile's coordinates from ``_red_part_ctx`` -- ``(tile_l,)`` on the dense
-    templates, ``(group_idx, group_begin, group_end)`` on the MoE ones."""
-    lines = [f"red_part_slots = {max(1, len(parts))}", "", "", "@cute.jit", "def red_part_seed(_red_part):"]
+    templates, ``(group_idx, group_begin, group_end)`` on the MoE ones.
+
+    ``folds`` holds ``(red_idx, red, tap_idx, _LaneRunFold)`` for the per-row /
+    per-col reductions the dense lane-run drain folds (:func:`_plan_lane_run_folds`);
+    their slots follow the partials', and ``red_part_flush_tile`` flushes them
+    after each tile's drain (the drain re-seeds them at the tile's start)."""
+    folds = folds or []
+    fold_slots = max((f.origin + 1 for _ri, _r, _t, f in folds), default=0)
+    lines = [f"red_part_slots = {max(1, len(parts), fold_slots)}", "", "", "@cute.jit", "def red_part_seed(_red_part):"]
     seed = [_reduction_partial_store(red, slot, _reduction_partial_identity(red)) for _ri, slot, red, _t in parts]
     lines += [f"    {ln}" for ln in (seed or ["pass"])]
     ctx = "group_idx, group_begin, group_end" if chain.has_moe else "tile_l,"
-    args = ", ".join(f"gC_tap_{tap}_ptr, red_stride_m_{ri}, red_stride_n_{ri}, red_stride_l_{ri}" for ri, _s, _r, tap in parts)
+    args = ", ".join(f"gC_tap_{tap}_ptr, red_stride_m_{ri}, red_stride_n_{ri}, red_stride_l_{ri}" for ri, tap in _red_part_arg_refs(parts, folds))
     for name, per_cta in (("red_part_flush_tile", False), ("red_part_flush_cta", True)):
         lines += ["", "", "@cute.jit", f"def {name}(_red_part, lane, M, N, _red_part_ctx, _red_part_args):"]
         mine = [part for part in parts if _reduction_partial_per_cta(part[2]) == per_cta]
-        body = [f"{ctx} = _red_part_ctx", f"{args} = _red_part_args"] if mine else ["pass"]
+        my_folds = [] if per_cta else folds
+        body = [f"{ctx} = _red_part_ctx", f"{args} = _red_part_args"] if (mine or my_folds) else ["pass"]
         for ri, slot, red, tap in mine:
             body += _emit_reduction_partial_flush(tap, ri, red, chain, slot, reseed=not per_cta)
+        if my_folds:
+            body += _emit_lane_run_fold_flush(chain, my_folds, lane_run_tile)
         lines += [f"    {ln}" for ln in body]
+    return lines
+
+
+def _red_part_arg_refs(parts: list, folds: list) -> list:
+    """``(red_idx, tap_idx)`` of every reduction the ``red_part_*`` helpers
+    flush, in the order of the ``_red_part_args`` tuple (partials, then folds)."""
+    return [(ri, tap) for ri, _s, _r, tap in parts] + [(ri, tap) for ri, _r, tap, _f in folds]
+
+
+# ---- Lane-run folds: per-row / per-col reductions on the dense lane-run drain ----
+# The transposed-STG ("lane-run") drain of the two dense sm120 templates
+# (sm120_matmul.py, sm120_block_scale_matmul.py) walks a warp tile in trace-time
+# loops -- ``for mf`` (16-row m-fragment) / ``for grp`` (32-column group of four
+# 8-column n-fragments) / ``for half`` (8-row half) / ``for sv`` (``vsize``-wide
+# piece of the lane's 8-column run) -- and gives lane L row ``mf*16 + half*8 + L//4``
+# and the run of n-fragment ``grp*4 + L%4``. The compiler hands the warp tile in
+# (``generate(lane_run_tile=...)``) only for a template whose source carries
+# exactly those lines (``compiler._LANE_RUN_FOLD_CONTRACT``).
+#
+# Unfolded, an M-reduced (per-col) reduction issues one atomic per ELEMENT and the
+# 8 lanes holding a column's rows hit its one address in the same instruction --
+# an nvfp4 4096^3 GEMM + per-col ADD ran 7.2x the first native plan's time, MUL's
+# CAS loop 33x -- and an N-reduced (per-row) one issues one atomic per 8-column
+# run, 4 lanes per row at once (per-row MUL 2.1x). Folded, a lane keeps one register
+# slot per row it drains (2 * M_FRAGS) or per column it drains (8 per 32-column
+# group), the converged ``red_part_flush_tile`` reduce-scatters the slots across
+# the lanes sharing a row (a lane quad) or a column (the 8 lanes with the same
+# L % 4), and each lane issues at most one atomic per slot it ends up owning: one
+# per row / column per warp per tile, a column group's 32 in one coalesced
+# instruction. The slots are re-seeded at the tile's start (INJECT_AUX_VIEWS), so
+# they hold nothing across the mainloop.
+_LANE_RUN_FOLD_MODES = frozenset({"add", "avg", "norm1", "norm2", "amax", "max", "min", "mul", "mul_no_zeros"})
+_LANE_RUN_INT_FOLD_MODES = frozenset({"add", "norm1", "amax", "max", "min"})
+# The origin slot's seed: no drained element yet (real origins are >= 0).
+_LANE_RUN_ORIGIN_SEED = -(1 << 30)
+
+
+@dataclass(frozen=True)
+class _LaneRunFold:
+    kind: str  # "row" (N-reduced) or "col" (M-reduced)
+    base: int  # first value slot in ``_red_part``
+    count: int  # value slots: 2 * M_FRAGS (row) or 8 per 32-column group (col)
+    origin: int  # the kind's warp-tile origin slot (row or column), shared by its folds
+    store_origin: bool  # the kind's first fold stores the origin with each chunk
+
+
+def _lane_run_fold_kind(red: ReductionSpec) -> "str | None":
+    """``"row"`` for a per-row (N-reduced) reduction, ``"col"`` for a per-col
+    (M-reduced) one the lane-run drain folds; ``None`` for anything else (scalar
+    and per-batch reductions take the register partials, a batch-only reduction
+    keeps its per-element atomics)."""
+    if red.mode not in (_LANE_RUN_INT_FOLD_MODES if red.compute_dtype == "int32" else _LANE_RUN_FOLD_MODES):
+        return None
+    if red.dim[2] == 1 and red.dim[1] != 1:
+        return "row"
+    if red.dim[1] == 1 and red.dim[2] != 1:
+        return "col"
+    return None
+
+
+def _plan_lane_run_folds(chain: FusionChain, lane_run_tile: "tuple[int, int]", first_slot: int, taps: "dict[int, int]") -> list:
+    """``(red_idx, red, tap_idx, _LaneRunFold)`` for every reduction the lane-run
+    drain folds, slots allocated from ``first_slot``: each fold's value slots,
+    then one origin slot per kind."""
+    wtm, wtn = lane_run_tile
+    n_values = {"row": 2 * (wtm // 16), "col": 8 * -(-(wtn // 8) // 4)}
+    kinds = {ri: _lane_run_fold_kind(red) for ri, red in enumerate(chain.reductions)}
+    slot = first_slot
+    bases = {}
+    for ri, kind in kinds.items():
+        if kind is not None:
+            bases[ri] = slot
+            slot += n_values[kind]
+    origins = {}
+    for kind in ("row", "col"):
+        if kind in kinds.values():
+            origins[kind] = slot
+            slot += 1
+    folds, seen = [], set()
+    for ri, kind in kinds.items():
+        if kind is None:
+            continue
+        folds.append((ri, chain.reductions[ri], taps[ri], _LaneRunFold(kind, bases[ri], n_values[kind], origins[kind], kind not in seen)))
+        seen.add(kind)
+    return folds
+
+
+def _fold_identity(red: ReductionSpec) -> str:
+    return "cutlass.Float32(1.0)" if red.mode in ("mul", "mul_no_zeros") else _reduction_partial_identity(red)
+
+
+def _fold_combine(red: ReductionSpec, dst: str, a: str, b: str) -> list[str]:
+    """``dst = a (+) b`` in the reduction's monoid."""
+    if red.mode in ("add", "avg", "norm1", "norm2"):
+        return [f"{dst} = {a} + {b}"]
+    if red.mode in ("mul", "mul_no_zeros"):
+        return [f"{dst} = {a} * {b}"]
+    op = "max" if red.mode in ("max", "amax") else "min"
+    if red.compute_dtype == "int32":
+        return [f"{dst} = {a}", f"if {b} {'>' if op == 'max' else '<'} {dst}:", f"    {dst} = {b}"]
+    return [f"{dst} = cute.math.{op}({a}, {b})"]
+
+
+def _fold_elem(red: ReductionSpec, v: str) -> str:
+    """One element's contribution (|x| for AMAX / NORM1, x^2 for NORM2)."""
+    if red.mode in ("amax", "norm1"):
+        return f"cute.math.abs({v})"
+    if red.mode == "norm2":
+        return f"{v} * {v}"
+    return v
+
+
+def _emit_lane_run_fold_seed(folds: list) -> list[str]:
+    """Tile-start seeds (INJECT_AUX_VIEWS): every value slot to its identity,
+    every origin slot to "nothing drained"."""
+    lines = []
+    for _ri, red, _tap, fold in folds:
+        lines += [_reduction_partial_store(red, s, _fold_identity(red)) for s in range(fold.base, fold.base + fold.count)]
+    origins = sorted({fold.origin for _ri, _r, _t, fold in folds})
+    lines += [f"_red_part[{o}] = cutlass.Int32({_LANE_RUN_ORIGIN_SEED}).bitcast(cutlass.Float32)" for o in origins]
+    return lines
+
+
+def _emit_lane_run_fold_chunk(red_idx: int, red: ReductionSpec, source_var: str, vsize: int, fold: _LaneRunFold) -> list[str]:
+    """Fold one drained chunk into the lane's slots (the drain's trace-time ``mf``
+    / ``half`` pick a per-row slot, ``grp`` / ``sv`` a per-col one) and, for the
+    kind's first fold, record the warp tile's origin."""
+    src = f"_red_{red_idx}_src"
+    lines = [f"{src} = ({source_var}).to({DTYPE_TO_CUTLASS[red.compute_dtype]})"]
+    if fold.kind == "row":
+        combine_lines, acc = _emit_reduction_local_combine(red_idx, red, src, vsize)
+        lines.extend(combine_lines)
+        slot = f"{fold.base} + mf * 2 + half"
+        cur = f"_red_{red_idx}_fcur"
+        lines += [f"{cur} = {_reduction_partial_load(red, slot)}", *_fold_combine(red, cur, cur, acc), _reduction_partial_store(red, slot, cur)]
+        if fold.store_origin:
+            lines.append(
+                f"_red_part[{fold.origin}] = (cutlass.Int32(row) - cutlass.Int32(mf * 16 + half * 8) - cutlass.Int32(lane_div4)).bitcast(cutlass.Float32)"
+            )
+        return lines
+    assert 8 % vsize == 0, f"a lane-run chunk of {vsize} elements does not tile the 8-column run"
+    for i in range(vsize):
+        slot = f"{fold.base} + grp * 8 + sv * {vsize} + {i}"
+        cur = f"_red_{red_idx}_fc{i}"
+        upd = [
+            f"{cur} = {_reduction_partial_load(red, slot)}",
+            *_fold_combine(red, cur, cur, _fold_elem(red, f"{src}[{i}]")),
+            _reduction_partial_store(red, slot, cur),
+        ]
+        if red.mode == "mul_no_zeros":
+            lines.append(f"if {src}[{i}] != cutlass.Float32(0.0):")
+            lines += [f"    {ln}" for ln in upd]
+        else:
+            lines += upd
+    if fold.store_origin:
+        lines.append(
+            f"_red_part[{fold.origin}] = (cutlass.Int32(col_j) - cutlass.Int32(grp * 32 + sv * {vsize}) - cutlass.Int32(lane_mod4) * 8).bitcast(cutlass.Float32)"
+        )
+    return lines
+
+
+def _emit_lane_scatter(prefix: str, values: list, steps: tuple, red: ReductionSpec) -> tuple:
+    """Reduce-scatter ``values`` (the same slot list on every lane) across the
+    lanes that differ in the lane-index bits ``steps`` names, as ``(bit,
+    shuffle offset)`` pairs. While the count is even a step keeps the half the
+    lane's bit selects and folds in the partner's copy of that half; an odd count
+    folds every value butterfly-wise (both partners then hold the total, and only
+    the one whose bit is 0 may issue it). Returns the lines, the values the lane
+    ends with, the ``(bit_var, half)`` terms of their slot index (slot =
+    sum(bit * half) + k for the k-th value) and the bits that must be 0."""
+    dt = DTYPE_TO_CUTLASS[red.compute_dtype]
+    lines, terms, zero_bits = [], [], []
+    cur = list(values)
+    for si, (bit, off) in enumerate(steps):
+        b = f"{prefix}_b{si}"
+        lines.append(f"{b} = (lane // {1 << bit}) % 2")
+        nxt = []
+        if len(cur) % 2 == 0:
+            half = len(cur) // 2
+            for k in range(half):
+                snd, kp, rv, nv = (f"{prefix}_{si}_{k}{t}" for t in ("s", "k", "r", "v"))
+                lines += [
+                    f"{snd} = {dt}(cutlass.select_({b} != 0, {cur[k]}, {cur[k + half]}))",
+                    f"{kp} = {dt}(cutlass.select_({b} != 0, {cur[k + half]}, {cur[k]}))",
+                    f"{rv} = cute.arch.shuffle_sync_bfly({snd}, offset={off})",
+                    *_fold_combine(red, nv, kp, rv),
+                ]
+                nxt.append(nv)
+            terms.append((b, half))
+        else:
+            for k, x in enumerate(cur):
+                rv, nv = f"{prefix}_{si}_{k}r", f"{prefix}_{si}_{k}v"
+                lines += [f"{rv} = cute.arch.shuffle_sync_bfly({x}, offset={off})", *_fold_combine(red, nv, x, rv)]
+                nxt.append(nv)
+            zero_bits.append(b)
+        cur = nxt
+    return lines, cur, terms, zero_bits
+
+
+def _emit_lane_run_fold_flush(chain: FusionChain, folds: list, lane_run_tile: "tuple[int, int]") -> list[str]:
+    """``red_part_flush_tile``'s fold half (all 32 lanes converged): each kind's
+    warp-tile origin (a warp max over the lanes that drained something), then per
+    fold the reduce-scatter and one guarded atomic per row / column a lane owns.
+    A row past M, a column past N, the absent fragments of a short last group
+    and a warp tile that drained nothing issue nothing."""
+    wtm, wtn = lane_run_tile
+    m_frags, n_frags = wtm // 16, wtn // 8
+    lines: list[str] = []
+    for kind in ("row", "col"):
+        slot = next((f.origin for _ri, _r, _t, f in folds if f.kind == kind), None)
+        if slot is None:
+            continue
+        o = f"_fold_o_{kind}"
+        lines.append(f"{o} = _red_part[{slot}].bitcast(cutlass.Int32)")
+        for off in (16, 8, 4, 2, 1):
+            t = f"{o}{off}"
+            lines += [f"{t} = cute.arch.shuffle_sync_bfly({o}, offset={off})", f"if {t} > {o}:", f"    {o} = {t}"]
+    for ri, red, tap, fold in folds:
+        o = f"_fold_o_{fold.kind}"
+        avg = _emit_reduction_avg_inverse(ri, red, chain) if red.mode == "avg" else []
+        if fold.kind == "row":
+            vals = []
+            for s in range(2 * m_frags):
+                vals.append(f"_red_{ri}_fv{s}")
+                lines.append(f"{vals[-1]} = {_reduction_partial_load(red, fold.base + s)}")
+            # The 4 lanes of a quad share a row: lane bits 1 and 0.
+            scatter, finals, terms, zero_bits = _emit_lane_scatter(f"_red_{ri}_rs", vals, ((1, 2), (0, 1)), red)
+            lines += scatter
+            for k, val in enumerate(finals):
+                s_expr = " + ".join([f"{b} * {h}" for b, h in terms] + [str(k)])
+                r = f"_red_{ri}_row{k}"
+                lines.append(f"{r} = {o} + 8 * ({s_expr}) + lane // 4")
+                cond = " & ".join([f"({o} >= 0)", f"({r} < M)"] + [f"({b} == 0)" for b in zero_bits])
+                body = [f"row = {r}", *avg, *_emit_reduction_vector_atomic(tap, ri, red, val)]
+                lines.append(f"if {cond}:")
+                lines += [f"    {ln}" for ln in body]
+            continue
+        for g in range(-(-n_frags // 4)):
+            frags = min(4, n_frags - 4 * g)
+            vals = []
+            for j in range(8):
+                vals.append(f"_red_{ri}_fv{g}_{j}")
+                lines.append(f"{vals[-1]} = {_reduction_partial_load(red, fold.base + g * 8 + j)}")
+            # The 8 lanes with the same L % 4 share a column: lane bits 4, 3, 2;
+            # lane L ends with column L // 4 of its run.
+            scatter, finals, _terms, zero_bits = _emit_lane_scatter(f"_red_{ri}_cs{g}", vals, ((4, 16), (3, 8), (2, 4)), red)
+            assert len(finals) == 1 and not zero_bits
+            lines += scatter
+            c = f"_red_{ri}_col{g}"
+            lines.append(f"{c} = {o} + {g * 32} + (lane % 4) * 8 + lane // 4")
+            cond = [f"({o} >= 0)", f"({c} < N)"] + ([f"(lane % 4 < {frags})"] if frags < 4 else [])
+            body = [f"col_j = {c}", *avg, *_emit_reduction_vector_atomic(tap, ri, red, finals[0])]
+            lines.append(f"if {' & '.join(cond)}:")
+            lines += [f"    {ln}" for ln in body]
     return lines
 
 
@@ -1534,6 +1874,10 @@ def _emit_block_quant(
 
 
 def _tap_fake_shape(tap, chain: FusionChain | None = None) -> str:
+    if chain is not None and chain.has_moe and chain.moe.mode == "combine":
+        # COMBINE's output is token-indexed: its token extent T is the routing
+        # table's (top_k_scores), independent of the routed rows the GEMM walks.
+        return "(sym_m, cute.sym_int(), 1)" if isinstance(chain.moe, MoeSwapAbSpec) else "(cute.sym_int(), sym_n, 1)"
     if tap.is_quant_scale:
         if chain is None or not chain.quants:
             raise AssertionError("quant scale tap requires FusionChain context")
@@ -1656,6 +2000,7 @@ def generate(
     split_k_slices: int = 1,
     drain_hooks: bool = False,
     bounded_rows: bool = False,
+    lane_run_tile: "tuple[int, int] | None" = None,
 ) -> EpilogueSnippets:
     """Produce the two hook-site snippets, the extra kernel param list, and
     all per-tap plumbing. ``vec_bytes_epi`` / ``output_elem_bytes`` (from the
@@ -1671,7 +2016,13 @@ def generate(
 
     ``bounded_rows`` (the row-per-lane drain under a col quant, whose template
     row guard is rendered always-taken): every store, scale byte, atomic and
-    row-dependent aux load carries ``row < <row bound>`` itself."""
+    row-dependent aux load carries ``row < <row bound>`` itself.
+
+    ``lane_run_tile`` (the warp tile ``(M, N)``; the compiler passes it for the
+    dense templates' lane-run drain only, see :data:`_LANE_RUN_FOLD_MODES`'s
+    comment): per-row and per-col reductions fold in registers across the rows /
+    columns a lane drains and flush one atomic per row / column per warp per tile
+    from ``red_part_flush_tile``, instead of one atomic per chunk / element."""
     vsize = vec_bytes_epi // output_elem_bytes
     scatter = chain.has_moe and chain.moe.mode == "scatter"
     swapped = isinstance(chain.moe, MoeSwapAbSpec)
@@ -1696,8 +2047,6 @@ def generate(
                 f"{_aux_prefetch_var(aux.name)} = " f"({_aux_ptr_var(aux.name)} + {_aux_index_expr(aux, row_var=aux_row)}).load()"
             )
         # per_col / per_elem load inside the inner loop.
-
-    aux_views = "\n".join(aux_lines) if aux_lines else "pass"
 
     # epilogue snippet (interleaves op chain with tap stores)
     # ANY slot on the TMA surface means the kernel renders the TMA arm, so the
@@ -1732,14 +2081,15 @@ def generate(
     # Per-op result var name lookup (handles `identity` pass-throughs).
     result_var: dict[int, str] = {}
 
-    # Round each GEMM's fp32 accumulator to the matmul out_dtype before any op
-    # reads it (no-op when fp32). GEMM 0 binds legacy ``vec_f32`` (so every
-    # non-multi-GEMM template is unchanged); GEMMs >0 bind ``vec_f32_<g>``.
+    # Round each GEMM's fp32 accumulator to its declared dtype before any op
+    # reads it (no-op when fp32; :func:`_gemm_out_dtype`). GEMM 0 binds legacy
+    # ``vec_f32`` (so every non-multi-GEMM template is unchanged); GEMMs >0 bind
+    # ``vec_f32_<g>``.
     gemm_var: dict[int, str] = {}
     for g in range(chain.num_gemms):
         src = "vec_f32" if g == 0 else f"vec_f32_{g}"
         tag = "mm" if g == 0 else f"mm{g}"
-        round_lines, var = _emit_round(src, chain.matmul.out_dtype, tag)
+        round_lines, var = _emit_round(src, _gemm_out_dtype(chain, g), tag)
         body_lines.extend(round_lines)
         gemm_var[g] = var
 
@@ -1856,6 +2206,9 @@ def generate(
             body_lines.append(tma_out_ready_marker(_tma_j))
             continue
         tap_idx = _tap_of[si]
+        if chain.has_moe and chain.moe.mode == "combine":
+            body_lines.extend(_emit_moe_combine_store(tap_idx, si, src, spec, chain, vsize))
+            continue
         if chain.has_moe and chain.moe.mode == "scatter":
             body_lines.extend(_emit_moe_scatter_store(tap_idx, si, src, spec, chain, vsize, store_row_pred, col_bound))
             continue
@@ -1885,8 +2238,22 @@ def generate(
         for red_idx, red in enumerate(chain.reductions):
             if _reduction_uses_partial(red):
                 part_slot[red_idx] = sum(s is not None for s in part_slot.values())
+    # The lane-run drain folds per-row / per-col reductions (dense templates; the
+    # drain bounds rows and columns itself, so no bounded arm is in play).
+    folds = []
+    if use_partials and lane_run_tile is not None and not chain.has_moe and store_row_pred is None:
+        folds = _plan_lane_run_folds(
+            chain,
+            lane_run_tile,
+            sum(s is not None for s in part_slot.values()),
+            {ri: _tap_of[len(specs) + ri] for ri in range(len(chain.reductions))},
+        )
+    fold_of = {ri: fold for ri, _red, _tap, fold in folds}
     for red_idx, red in enumerate(chain.reductions):
         red_source = _parent_value(red.source_ref)
+        if red_idx in fold_of:
+            body_lines.extend(_emit_lane_run_fold_chunk(red_idx, red, red_source, vsize, fold_of[red_idx]))
+            continue
         body_lines.extend(
             _emit_reduction_atomic(
                 _tap_of[len(specs) + red_idx],
@@ -1902,6 +2269,8 @@ def generate(
             )
         )
     parts = [(ri, slot, chain.reductions[ri], _tap_of[len(specs) + ri]) for ri, slot in part_slot.items() if slot is not None]
+    aux_lines.extend(_emit_lane_run_fold_seed(folds))
+    aux_views = "\n".join(aux_lines) if aux_lines else "pass"
 
     # Split-K partial store handling
     if split_k_slices > 1:
@@ -1958,7 +2327,9 @@ def generate(
         tap_ptr_binds.append(f"VEC_BYTES_TAP_{i} = vec_bytes_tap_{i}")
     # The red_part_* helpers' view of the partials' taps (pointer + strides).
     tap_ptr_binds.append(
-        "_red_part_args = (" + "".join(f"gC_tap_{tap}_ptr, red_stride_m_{ri}, red_stride_n_{ri}, red_stride_l_{ri}, " for ri, _s, _r, tap in parts) + ")"
+        "_red_part_args = ("
+        + "".join(f"gC_tap_{tap}_ptr, red_stride_m_{ri}, red_stride_n_{ri}, red_stride_l_{ri}, " for ri, tap in _red_part_arg_refs(parts, folds))
+        + ")"
     )
     # vsize is the shared COMPUTE chunk; each tap's STORE width is capped at
     # MAX_MEM_ACCESS_BYTES (a wide dtype under a block-quant splits into sub-stores).
@@ -1975,7 +2346,7 @@ def generate(
             _aalign = _aux_align_reqs(chain, vec_bytes=vec_bytes_epi)[aux.name]
             tap_constants.append(f"ALIGN_AUX_{aux.name} = {_aalign}")
 
-    tap_constants.extend(_emit_red_part_module(chain, parts))
+    tap_constants.extend(_emit_red_part_module(chain, parts, folds, lane_run_tile))
 
     mainloop_transform_a = generate_mainloop(chain, "a")
     mainloop_transform_b = generate_mainloop(chain, "b")

@@ -711,8 +711,7 @@ GATHER up to 1.45x slower; each TMA-warp lane now issues its own GATHER4s), and
 accept only warp grids the split fits (`Sm120KernelTemplate.warp_layout_reject`).
 **Detector:** a compile-only SASS pin — one `USETMAXREG.DEALLOC` and one
 `TRY_ALLOC` at the template's counts, plus a spill bound on producer-heavy cases
-(`gemm/frost/sm120/test_sm120_register_split.py`; the SDPA pins in
-`sdpa/frost/test_sdpa_bwd_d256_sm100.py` do the same).
+(the SDPA pins in `sdpa/frost/test_sdpa_bwd_d256_sm100.py` are the pattern).
 
 **Immutable tensor-map reuse is local to a consumer and a launch.** A persistent
 loader or store warp may skip acquisition only while it keeps using an unchanged
