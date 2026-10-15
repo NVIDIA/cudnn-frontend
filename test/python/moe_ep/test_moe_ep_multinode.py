@@ -143,6 +143,13 @@ def torchrun_world():
             id="forward-ep6-world8",
         ),
         pytest.param(
+            8,
+            8,
+            4,
+            tuple(range(8)),
+            id="forward-ep8-world8",
+        ),
+        pytest.param(
             12,
             12,
             4,
@@ -201,18 +208,22 @@ def test_mxfp8_forward_multinode_matches_reference(
             )
         dist.barrier()
     finally:
-        if ep_group is not dist.group.WORLD and is_ep_member:
-            # The runtime manager intentionally remains alive after op.close().
-            # Finalize it while this exact subgroup is still valid so the next
-            # parametrized case may create a fresh ProcessGroup object with the
-            # same membership.
+        if is_ep_member:
+            # The runtime manager intentionally remains alive after op.close(),
+            # bound to this EP group's membership. Finalize it while this exact
+            # group is still valid so the next parametrized case may create a
+            # fresh ProcessGroup object with the same membership, or bind the
+            # runtime to a different one (a subgroup after a WORLD case, or the
+            # reverse). The EP6 case after the EP8 case otherwise finds the
+            # runtime bound to WORLD and never finishes its teardown.
             from cudnn.moe_ep._megamoe_backend._runtime import (
                 get_runtime_manager,
             )
 
             get_runtime_manager().shutdown()
             dist.barrier(group=ep_group)
-            dist.destroy_process_group(ep_group)
+            if ep_group is not dist.group.WORLD:
+                dist.destroy_process_group(ep_group)
         dist.barrier()
 
 
