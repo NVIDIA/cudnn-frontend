@@ -913,6 +913,18 @@ floored at 2 under the gate). On an unsplit decode tile the gate is its own laun
 (`decode_split_kv` must be `None` or 1: a pinned split there is a typed decline) and `fuse_gate=True` rides its epilogue, as on
 the EXTEND form (`gate_fused`, no separate launch).
 
+The decode split model behind `decode_split_kv=None` (`cudnn.sdpa.fwd.heuristics.choose_decode_tile_split_kv`, the same
+function the SDPA graph API uses for a standalone decode graph; the block hands it the route's token units, the declared
+`max_kv_len`, the part's SM count, the tile's width and the step's `(B, H_q, S_q)`) is fitted on the Rubin performance class: it
+prices a CTA's KV stream per tile WIDTH (the 64-column tile streams a KV range in about three quarters of the time of two
+32-column units, which is why the route takes it wherever two units would be needed), charges a launch of more CTAs than SMs
+its tail WAVE in full (a CTA streams its chunk serially, so 256 CTAs on 212 SMs cost two waves, not 1.2) and therefore offers
+the splits that fill one wave -- 3 / 5 / 6 / 7 beside the powers of two -- and prices the combine by the kernel the launch takes:
+the decode-grid combine kernel (flat in the split count) on a small grid from split 8 on and on any grid inside its bound from
+split 32, the lean kernel otherwise, the form pinned at compile. The block reads the model's eager-safe choice (the split path's
+second host launch charged against its saving); `decode_split_kv` stays the one performance knob of the form -- the same function
+under every value, measured or not -- so a replaying stack whose optimum differs pins it.
+
 | input | shape / dtype | contract |
 |---|---|---|
 | `sample_k_cache`, `sample_v_cache` (declaration) | `[num_pages, H_kv, P, D]` views in the activation dtype: HND compact, NHD by strides, or the two halves of a unified `[num_pages, H_kv, P, 2D]` row (K at `+0`, V at `+D`), both of ONE layout kind | REQUIRED under `kv_source="paged"`: the strides are compiled into the SDPA's TMA descriptors; `execute`'s pools must be these views (shape AND strides) |
