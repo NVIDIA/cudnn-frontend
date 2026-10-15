@@ -954,7 +954,7 @@ _SNAPSHOT_ARMS = {
     "mxfp8_unfused": dict(inplace_qkv=True, fp8=True, mxfp8=True),
     "mxfp8_fused": dict(inplace_qkv=True, fp8=True, fp8_fused=True, mxfp8=True),
 }
-_COMMON = dict(gate=-1, o_gated=-1, base_align=256, o4=-1, sf_o=-1)
+_COMMON = dict(gate=-1, o_gated=-1, base_align=256, o4=-1, sf_o=-1, kc8=-1, vc8=-1, kv_inv=-1, kv_gathered=-1, kv_len_t=-1)
 _SNAPSHOT = {
     ("test", "bf16_inplace"): dict(
         proj=0, q=-1, k=-1, v=-1, o=20480000, engine_scratch=28672000, total_bytes=28672000, q8=-1, k8=-1, v8=-1, o8=-1, gate16=-1, sf_q=-1, sf_k=-1, sf_v=-1
