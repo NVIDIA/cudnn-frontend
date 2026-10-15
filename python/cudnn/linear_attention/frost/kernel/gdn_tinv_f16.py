@@ -807,8 +807,8 @@ def host(
 ):
     # ---- grid: one CTA per SM, capped by the tile count ------------------------------
     heads_out = cutlass.Int32(gate.shape[1])
-    k = expanded_view(k, cfg.k_slots)
-    beta = slot_view(beta, cfg.beta_slots)
+    k = expanded_view(k, cfg.k_slots, cfg.expand_num)
+    beta = slot_view(beta, cfg.beta_slots, cfg.expand_num)
     k_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(k.shape[2]))
     num_ctas = cutlass.min(cutlass.Int32(cfg.num_sm), cutlass.Int32(tinv.shape[0]) * heads_out)
 

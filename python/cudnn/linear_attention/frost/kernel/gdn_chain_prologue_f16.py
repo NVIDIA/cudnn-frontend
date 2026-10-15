@@ -425,7 +425,7 @@ def chain_prologue(
 ) -> None:
     swizzle_128b = tma.TensorMapSwizzle.s128b
     # K / V (token, slot, head, dim) views, base maps (dim, head, slot, token) with the full-token-run box; recompute reads K as V
-    k = expanded_view(k, k_slots)
+    k = expanded_view(k, k_slots, expand_num)
     if cutlass.const_expr(k_slots == 1):
         k_rows = cute.make_tensor(k.iterator, cute.make_layout((k.shape[0], k.shape[2], k.shape[3]), stride=(k.stride[0], k.stride[2], 1)))
         base_k = tma.create_tensor_map_tiled_from_view(
@@ -456,7 +456,7 @@ def chain_prologue(
             q_headed, box_dims=(b_t, 1, 128 // (q.element_type.width // 8)), stride_order=(2, 1, 0), swizzle=swizzle_128b
         )
     if cutlass.const_expr(v is not None):
-        v = expanded_view(v, v_slots)
+        v = expanded_view(v, v_slots, expand_num)
         if cutlass.const_expr(v_slots == 1):
             v_rows = cute.make_tensor(v.iterator, cute.make_layout((v.shape[0], v.shape[2], v.shape[3]), stride=(v.stride[0], v.stride[2], 1)))
             base_v = tma.create_tensor_map_tiled_from_view(

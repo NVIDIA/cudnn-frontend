@@ -1114,8 +1114,8 @@ def prologue(
 ):
     """One-launch prologue: order the work items (``run_order``) and build the
     2 per-batch TMA-descriptor arrays (K, V) into ``tensormap_workspace``."""
-    k = expanded_view(k, k_slots)
-    v = expanded_view(v, v_slots)
+    k = expanded_view(k, k_slots, expand_num)
+    v = expanded_view(v, v_slots, expand_num)
     h_k = k.shape[2]
     h_v = v.shape[2]
     batch_size = cu_seqlens.shape[0] - 1
@@ -1202,8 +1202,8 @@ def host(
     heads_out = cutlass.Int32(gate.shape[1])
     if cutlass.const_expr(cfg.tiles_per_head > 1):
         heads_out = heads_out * cutlass.Int32(cfg.tiles_per_head)
-    k = expanded_view(k, cfg.k_slots)
-    v = expanded_view(v, cfg.v_slots)
+    k = expanded_view(k, cfg.k_slots, cfg.expand_num)
+    v = expanded_view(v, cfg.v_slots, cfg.expand_num)
     k_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(k.shape[2]))
     v_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(v.shape[2]))
 

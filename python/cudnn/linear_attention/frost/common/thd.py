@@ -3,7 +3,7 @@
 
 """Shared THD / varlen (packed ``[T,H,D]`` + ``cu_seqlens``) device helpers.
 
-* :data:`TENSOR_MAP_QWORDS`, int64 words per 128-byte TMA descriptor.
+* :data:`TENSOR_MAP_QWORDS` (from :mod:`.host`), int64 words per 128-byte TMA descriptor.
 * :func:`emit_seq_descs`, device helper (one electing thread) that builds
   a per-BATCH TMA-descriptor array in GMEM for varlen loads/stores over a
   packed ``[T,H,D]`` tensor whose head axis is a load coordinate.  Each op
@@ -22,7 +22,8 @@ import cutlass.experimental.cuda.tensor_map as tma
 import cutlass.experimental.primitives as nvvm
 from cutlass.base_dsl.typing import Pointer
 
-TENSOR_MAP_QWORDS = 128 // 8
+from .host import TENSOR_MAP_QWORDS
+
 TENSOR_MAP_BIT21 = 1 << 21  # qword 1: encoder's "tensor >= 128 KiB" flag; tensormap.replace does not update it (issue #1013)
 
 
@@ -209,14 +210,19 @@ def emit_checkpoint_seq_descs(
 
 
 @cute.jit
-def expanded_view(t: cute.Tensor, slots: cutlass.Constexpr[int]):
+def expanded_view(t: cute.Tensor, slots: cutlass.Constexpr[int], expand_num: cutlass.Constexpr[int]):
     """The (token, slot, head, dim) view of a sub-token operand for a load family of ``slots`` slots per token.
     ``slots == 1``: the operand's expanded rows have one uniform stride (expanded ``[token * n, head, dim]``, or a
     token-major ``[token, n, head, dim]`` view whose token stride is ``n`` slot strides), viewed ``(row, 1, head, dim)`` so
-    every chunk is one ``b_t``-row box (the pre-family load path).  ``slots == n``: the token-major operand with its own
-    token stride, ``(token, n, head, dim)`` for the box family (an expanded rank-3 input is folded onto that view)."""
+    every chunk is one ``b_t``-row box (the pre-family load path); at ``expand_num == 1`` the token-major slot axis is a
+    singleton with an arbitrary stride, so the rows take the token stride.  ``slots == n``: the token-major operand with
+    its own token stride, ``(token, n, head, dim)`` for the box family (an expanded rank-3 input is folded onto that view)."""
     if cutlass.const_expr(len(t.shape) == 4):
         if cutlass.const_expr(slots == 1):
+            if cutlass.const_expr(expand_num == 1):
+                return cute.make_tensor(
+                    t.iterator, cute.make_layout((t.shape[0], 1, t.shape[2], t.shape[3]), stride=(t.stride[0], t.stride[0], t.stride[2], t.stride[3]))
+                )
             return cute.make_tensor(
                 t.iterator,
                 cute.make_layout((t.shape[0] * t.shape[1], 1, t.shape[2], t.shape[3]), stride=(t.stride[1], t.stride[1], t.stride[2], t.stride[3])),
@@ -233,12 +239,15 @@ def expanded_view(t: cute.Tensor, slots: cutlass.Constexpr[int]):
 
 
 @cute.jit
-def slot_view(t: cute.Tensor, slots: cutlass.Constexpr[int]):
+def slot_view(t: cute.Tensor, slots: cutlass.Constexpr[int], expand_num: cutlass.Constexpr[int]):
     """The (token, slot, head) view of a per-row scalar operand (beta) for ``slots`` slots per token: ``slots == 1`` the
-    uniform rows as ``(row, 1, head)`` (expanded ``[token * n, head]`` or a dense token-major ``[token, n, head]``), else
-    the token-major ``(token, n, head)`` with its own strides."""
+    uniform rows as ``(row, 1, head)`` (expanded ``[token * n, head]`` or a dense token-major ``[token, n, head]``; at
+    ``expand_num == 1`` the singleton slot axis is skipped and the rows take the token stride), else the token-major
+    ``(token, n, head)`` with its own strides."""
     if cutlass.const_expr(len(t.shape) == 3):
         if cutlass.const_expr(slots == 1):
+            if cutlass.const_expr(expand_num == 1):
+                return cute.make_tensor(t.iterator, cute.make_layout((t.shape[0], 1, t.shape[2]), stride=(t.stride[0], t.stride[0], t.stride[2])))
             return cute.make_tensor(t.iterator, cute.make_layout((t.shape[0] * t.shape[1], 1, t.shape[2]), stride=(t.stride[1], t.stride[1], t.stride[2])))
         return t
     if cutlass.const_expr(slots == 1):
@@ -266,7 +275,7 @@ def emit_family_descs(
     ``s * n_batch * TENSOR_MAP_QWORDS``), the box re-patched per slot (BOX_DIM ord 3 = tokens, ord 2 = slots) and every
     descriptor patched per sequence over the TOKEN axis (GLOBAL_ADDRESS by ``cu[b] * base_ptr.stride[0]``, GLOBAL_DIM[3] =
     the sequence's tokens, bit 21 recomputed).  ``lanes`` as in :func:`emit_seq_descs`."""
-    base_ptr = expanded_view(base_ptr, slots)
+    base_ptr = expanded_view(base_ptr, slots, expand_num)
     if cutlass.const_expr(slots == 1):
         emit_seq_descs(base_desc, desc_words, cu_seqlens, base_ptr, n_batch, 2, expand_num, lanes)
     else:

@@ -2568,8 +2568,8 @@ def prologue(
     """One-launch prologue: LPT-order the work items and build the per-(b,h)
     TMA-descriptor arrays (Q, K, V, O, checkpoints) into
     ``tensormap_workspace``."""
-    k = expanded_view(k, k_slots)
-    v = expanded_view(v, v_slots)
+    k = expanded_view(k, k_slots, expand_num)
+    v = expanded_view(v, v_slots, expand_num)
     h_q = q.shape[1]
     h_k = k.shape[2]
     h_v = v.shape[2]
@@ -2697,10 +2697,10 @@ def host(
     if cutlass.const_expr(cfg.tiles_per_head > 1):
         heads_out = heads_out * cutlass.Int32(cfg.tiles_per_head)
     # ---- (token, slot, head, dim) K / V and (token, slot, head) beta, from the expanded or the token-major input ----
-    k = expanded_view(k, cfg.k_slots)
-    v = expanded_view(v, cfg.v_slots)
+    k = expanded_view(k, cfg.k_slots, cfg.expand_num)
+    v = expanded_view(v, cfg.v_slots, cfg.expand_num)
     if cutlass.const_expr(beta is not None):
-        beta = slot_view(beta, cfg.beta_slots)
+        beta = slot_view(beta, cfg.beta_slots, cfg.expand_num)
     q_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(q.shape[1]))
     k_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(k.shape[2]))
     v_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(v.shape[2]))

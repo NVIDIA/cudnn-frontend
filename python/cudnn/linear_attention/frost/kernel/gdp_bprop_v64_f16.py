@@ -3490,8 +3490,8 @@ def base_descriptors(
 ):
     """The whole-tensor TMA descriptors (Q, K, V, dO, checkpoints, dQ, dK, dV) the prologue's per-batch arrays are built from;
     K and V as the (dim, head, slot, token) family base maps over their (token, slot, head, dim) views."""
-    k = expanded_view(k, k_slots)
-    v = expanded_view(v, v_slots)
+    k = expanded_view(k, k_slots, expand_num)
+    v = expanded_view(v, v_slots, expand_num)
     h_q = q.shape[1]
     h_k = k.shape[2]
     h_v = v.shape[2]
@@ -3650,9 +3650,9 @@ def host(
 ):
     batch_size = cu_seqlens.shape[0] - 1
     heads_out = cutlass.Int32(gate.shape[1])
-    k = expanded_view(k, cfg.k_slots)
-    v = expanded_view(v, cfg.v_slots)
-    beta = slot_view(beta, cfg.beta_slots)
+    k = expanded_view(k, cfg.k_slots, cfg.expand_num)
+    v = expanded_view(v, cfg.v_slots, cfg.expand_num)
+    beta = slot_view(beta, cfg.beta_slots, cfg.expand_num)
     q_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(q.shape[1]))
     k_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(k.shape[2]))
     v_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(v.shape[2]))

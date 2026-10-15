@@ -1,15 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Host-side helpers shared by the FROST LA kernel modules (engine-invoked)."""
+"""Host-side helpers shared by the FROST LA kernel modules (engine-invoked).  Importable without the CuTe DSL: the engines
+and the semantic ops call :func:`family_slots` before the DSL version gate runs, so ``cutlass`` is imported inside
+:func:`get_dtype` only."""
 
-import cutlass
-
-from .thd import TENSOR_MAP_QWORDS
+TENSOR_MAP_QWORDS = 128 // 8
 
 
 def get_dtype(dtype):
     """dtype string -> cutlass DSL type (bf16/fp16 io, fp32/bf16/fp16 states)."""
+    import cutlass
+
     name = str(dtype)
     if "bfloat16" in name:
         return cutlass.BFloat16

@@ -1698,7 +1698,7 @@ def prologue(
 ):
     """One-launch prologue: LPT-order the work items (``run_order``, when this kernel is the backward pair's first table
     consumer) and build the per-(b,h) TMA-descriptor arrays (Q, K, dO) into ``tensormap_workspace``."""
-    k = expanded_view(k, k_slots)
+    k = expanded_view(k, k_slots, expand_num)
     h_q = q.shape[1]
     h_k = k.shape[2]
     h_v = do_.shape[1]
@@ -1789,7 +1789,7 @@ def host(
 ):
     batch_size = cu_seqlens.shape[0] - 1
     heads_out = cutlass.Int32(gate.shape[1])
-    k = expanded_view(k, cfg.k_slots)
+    k = expanded_view(k, cfg.k_slots, cfg.expand_num)
     q_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(q.shape[1]))
     k_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(k.shape[2]))
 

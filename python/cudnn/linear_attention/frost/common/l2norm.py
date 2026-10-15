@@ -158,9 +158,10 @@ def l2norm_qk_launch(
     expand_phase: cutlass.Constexpr[int],
     expand_fill: cutlass.Constexpr[bool],
     k_slots: cutlass.Constexpr[int],
+    k_expand_num: cutlass.Constexpr[int],
     stream: cuda.CUstream,
 ):
-    k = expanded_view(k, k_slots)
+    k = expanded_view(k, k_slots, k_expand_num)
     frost_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, n_q_rows, n_rows, h_q, h_k, d, expand_num, expand_phase, expand_fill, k_slots).launch(
         grid=(n_blocks, 1, 1), block=(THREADS_PER_CTA, 1, 1), stream=stream, use_pdl=USE_PDL
     )
@@ -200,7 +201,8 @@ def build_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, *, expand_num=1, expand_phase=
     alone (the state summaries take no q); q, q_n and inv_q are then never
     read and may alias the k buffers.  ``k_slots`` is :func:`common.host.family_slots` of ``k``: 1 for uniform rows
     (expanded ``[rows, HK, K]`` or a dense token-major view), else the token-major ``[token, k_slots, HK, K]`` with its
-    own strides; ``k_n`` is always the dense expanded copy."""
+    own strides; a rank-4 ``k`` carries its rows per token (``num_householder``) as the slot extent, which the view takes
+    its row stride from (the ``expand_num`` here is the q-row expansion alone); ``k_n`` is always the dense expanded copy."""
     assert (inv_q is None) == (inv_k is None), "inv_q and inv_k are given together or both None"
     if skip_q:
         q = q_n
@@ -212,7 +214,20 @@ def build_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, *, expand_num=1, expand_phase=
     n_rows = n_q_rows + total_k * h_k
     args = (n_q_rows, n_rows, h_q, h_k, (n_rows + ROWS - 1) // ROWS)
     cu_stream = cuda.CUstream(int(stream))
-    key = ("fwd", str(q.dtype), int(expand_num), int(expand_phase), bool(expand_fill), inv_k is not None, d, current_device(), int(k_slots), len(k.shape))
+    k_expand_num = int(k.shape[1]) if len(k.shape) == 4 else 1
+    key = (
+        "fwd",
+        str(q.dtype),
+        int(expand_num),
+        int(expand_phase),
+        bool(expand_fill),
+        inv_k is not None,
+        d,
+        current_device(),
+        int(k_slots),
+        len(k.shape),
+        k_expand_num,
+    )
     if key not in compiled_cache:
         tensors = (q, k, q_n, k_n, inv_q, inv_k)
         compiled_cache[key] = cute.compile(
@@ -227,6 +242,7 @@ def build_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, *, expand_num=1, expand_phase=
             int(expand_phase),
             bool(expand_fill),
             int(k_slots),
+            k_expand_num,
             cu_stream,
             options="--enable-tvm-ffi",
         )
