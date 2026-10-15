@@ -196,7 +196,7 @@ def _bn_nchw_kernel(
     # contributes a partial for channel c must subtract the SAME value, and this
     # one is reachable by all of them with a single broadcast scalar load. See
     # shifted_stats() in _common_sm100 for why E[x^2]-E[x]^2 is not usable.
-    ks = [mX[cutlass.Int64(c0 + cw * WPB + w) * S].to(cutlass.Float32) for cw in range(CPW)]
+    kshift = [mX[cutlass.Int64(c0 + cw * WPB + w) * S].to(cutlass.Float32) for cw in range(CPW)]
     per = (N + mparts - 1) // mparts
     n0 = my * per
     n1 = n0 + per
@@ -237,7 +237,7 @@ def _bn_nchw_kernel(
                         fs = [tin[e].to(cutlass.Float32) for e in range(VS)]
                     if kv < NV:
                         for e in cutlass.range_constexpr(VS):
-                            dz = fs[e] - ks[cw]
+                            dz = fs[e] - kshift[cw]
                             acc[cw] = acc[cw] + dz
                             accsq[cw] = accsq[cw] + dz * dz
                     col = wcol + (((r * CPW + cw) * LPT) + j) * VS
@@ -275,7 +275,7 @@ def _bn_nchw_kernel(
                         if cutlass.const_expr(VS == 1):
                             sc[cbs[cw] + o] = raws[i]
                             x = raws[i].to(cutlass.Float32)
-                            dz = x - ks[cw]
+                            dz = x - kshift[cw]
                             acc[cw] = acc[cw] + dz
                             accsq[cw] = accsq[cw] + dz * dz
                         else:
@@ -283,7 +283,7 @@ def _bn_nchw_kernel(
                             xv = raws[i].bitcast(et)
                             for e in cutlass.range_constexpr(VS):
                                 x = xv[e].to(cutlass.Float32)
-                                dz = x - ks[cw]
+                                dz = x - kshift[cw]
                                 acc[cw] = acc[cw] + dz
                                 accsq[cw] = accsq[cw] + dz * dz
                         i = i + 1
@@ -295,7 +295,7 @@ def _bn_nchw_kernel(
                         raw = mX[bs[cw] + kv]
                         sc[cbs[cw] + kv] = raw
                         x = raw.to(cutlass.Float32)
-                        dz = x - ks[cw]
+                        dz = x - kshift[cw]
                         acc[cw] = acc[cw] + dz
                         accsq[cw] = accsq[cw] + dz * dz
                     else:
@@ -304,7 +304,7 @@ def _bn_nchw_kernel(
                         xv = raw.bitcast(et)
                         for e in cutlass.range_constexpr(VS):
                             x = xv[e].to(cutlass.Float32)
-                            dz = x - ks[cw]
+                            dz = x - kshift[cw]
                             acc[cw] = acc[cw] + dz
                             accsq[cw] = accsq[cw] + dz * dz
                 kv = kv + 32
@@ -329,13 +329,13 @@ def _bn_nchw_kernel(
             for j in cutlass.range_constexpr(UF):
                 for cw in cutlass.range_constexpr(CPW):
                     if cutlass.const_expr(VS == 1):
-                        dz = raws[i] - ks[cw]
+                        dz = raws[i] - kshift[cw]
                         acc[cw] = acc[cw] + dz
                         accsq[cw] = accsq[cw] + dz * dz
                     else:
                         for e in cutlass.range_constexpr(VS):
                             x = raws[i][e].to(cutlass.Float32)
-                            dz = x - ks[cw]
+                            dz = x - kshift[cw]
                             acc[cw] = acc[cw] + dz
                             accsq[cw] = accsq[cw] + dz * dz
                     i = i + 1
@@ -345,14 +345,14 @@ def _bn_nchw_kernel(
             for cw in cutlass.range_constexpr(CPW):
                 if cutlass.const_expr(VS == 1):
                     x = mX[bs[cw] + kv].to(cutlass.Float32)
-                    dz = x - ks[cw]
+                    dz = x - kshift[cw]
                     acc[cw] = acc[cw] + dz
                     accsq[cw] = accsq[cw] + dz * dz
                 else:
                     xv = nvvm.load_ext(mXi.iterator + (bs[cw] + kv * VS), dtype=it_ty, count=VS).bitcast(et)
                     for e in cutlass.range_constexpr(VS):
                         x = xv[e].to(cutlass.Float32)
-                        dz = x - ks[cw]
+                        dz = x - kshift[cw]
                         acc[cw] = acc[cw] + dz
                         accsq[cw] = accsq[cw] + dz * dz
             kv = kv + 32

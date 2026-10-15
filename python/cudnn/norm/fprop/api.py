@@ -72,6 +72,81 @@ def _as_variant(v) -> NormVariant:
 _NHWC_NATIVE = (NormVariant.BATCH_NORM, NormVariant.INSTANCE_NORM, NormVariant.GROUP_NORM)
 
 
+def _nhwc_kernel_serves(variant, shape, io, num_groups):
+    """True when a NATIVE channels-last kernel will actually take this shape.
+
+    Keeping an NHWC input un-``contiguous()``-ed is only sound if one of those
+    kernels runs. When none does, the fall-through views the tensor as the
+    rowwise or (N, C, S) shape the contiguous kernels expect -- and for
+    BatchNorm that view EXISTS in channels-last memory (merging H and W is
+    legal there), so reshape silently returns a strided tensor instead of
+    copying. The kernel then addresses it as if it were contiguous. fp32
+    [4,24,8,8], whose C=24 no NHWC tile accepts, came back as 6144 untouched
+    NaNs that way.
+
+    So the layout decision has to ask the kernels, not just the variant.
+    """
+    from cudnn.norm.dtypes import DTYPE_BYTES
+
+    from .kernels import batchnorm_nhwc_sm100, groupnorm_nhwc_sm100, instancenorm_nhwc_sm100
+
+    if len(shape) != 4:
+        return False
+    eb = DTYPE_BYTES[io]
+    C = int(shape[1])
+    if variant == NormVariant.BATCH_NORM:
+        return batchnorm_nhwc_sm100.nhwc_cfg(C, eb) is not None
+    if variant == NormVariant.INSTANCE_NORM:
+        return instancenorm_nhwc_sm100.nhwc_cfg(C, eb) is not None
+    if variant == NormVariant.GROUP_NORM:
+        if not num_groups or C % int(num_groups):
+            return False
+        return groupnorm_nhwc_sm100.eligible(C, C // int(num_groups), eb)
+    return False
+
+
+def _deliver(y, mean, rstd, out_y, out_mean, out_rstd):
+    """Return the results, landing them in the caller's buffers if the kernel could not.
+
+    ``out=`` is honoured either way. The kernels write those buffers directly
+    when the layout allows; when it does not -- an NHWC input that no native
+    kernel serves has to be made contiguous first, and the caller's
+    channels-last buffer then no longer matches -- the copy happens here
+    instead. Silently leaving an ``out=`` buffer untouched is exactly the kind
+    of result that looks fine until someone reads the buffer.
+
+    Returning the caller's own tensor keeps the engine's copy a no-op rather
+    than a second one.
+    """
+    out = []
+    for got, want in ((y, out_y), (mean, out_mean), (rstd, out_rstd)):
+        if want is None or got is None or want.data_ptr() == got.data_ptr():
+            out.append(got)
+        else:
+            want.copy_(got.reshape(want.shape))
+            out.append(want)
+    return tuple(out)
+
+
+def _require_io_dtype(x, **operands):
+    """Reject operands the kernels would reinterpret rather than convert.
+
+    gamma/beta/DY are read AS the I/O dtype. The graph engines already decline
+    mixed precision at check time; the torch API had no such gate, so an fp32
+    gamma against a bf16 input was read bit-for-bit as bf16. It was worse than a
+    local mistake: the compile cache keys on the INPUT dtype, not the
+    parameter's, so a shape first compiled with matching operands would serve a
+    later mismatched call out of cache and return garbage (measured 3.1
+    absolute against an fp64 reference). Failing here makes that diagnosable.
+    """
+    for name, t in operands.items():
+        if t is not None and t.dtype != x.dtype:
+            raise ValueError(
+                f"cudnn.norm: {name} is {t.dtype} but the input is {x.dtype}; these kernels "
+                f"read {name} at the input dtype rather than converting it. Cast {name} first."
+            )
+
+
 def _stat_out(t, n):
     """Flat view of a caller's mean/rstd buffer, or None when it is not usable.
 
@@ -167,19 +242,26 @@ def norm_fprop(
     # BN/IN/GN have dedicated channels-last kernels, so preserve NHWC inputs
     # instead of paying a transpose in ``.contiguous()``. The output keeps the
     # input's layout, which is what makes a channels-last forward -> backward
-    # chain stay on the native NHWC kernels end to end.
-    if not (_as_variant(variant) in _NHWC_NATIVE and _is_nhwc(x)):
+    # chain stay on the native NHWC kernels end to end. Only when one of those
+    # kernels will actually run, though -- see _nhwc_kernel_serves.
+    _io = torch_dtype_to_str(x.dtype)
+    if not (variant in _NHWC_NATIVE and _is_nhwc(x) and _nhwc_kernel_serves(variant, x.shape, _io, num_groups)):
         x = x.contiguous()
     gamma, beta = _flat(gamma), _flat(beta)
     running_mean, running_var = _flat(running_mean), _flat(running_var)
+    _require_io_dtype(x, gamma=gamma, beta=beta)
     io = torch_dtype_to_str(x.dtype)
 
     # Every route below views the output with the SAME expression it views x, so
     # a y buffer is usable exactly when it is laid out like the (already
     # normalised) x. Checked once here rather than per route.
     out_y, out_mean, out_rstd = out if out is not None else (None, None, None)
-    if out_y is not None and (tuple(out_y.shape) != tuple(x.shape) or out_y.stride() != x.stride() or out_y.dtype != x.dtype):
-        out_y = None
+    # ``w_y`` is what the kernels may write IN PLACE; ``out_y`` stays the caller's
+    # buffer so _deliver can still copy into it when they cannot. Keeping only the
+    # validated one would silently leave an out= buffer untouched.
+    w_y = out_y
+    if w_y is not None and (tuple(w_y.shape) != tuple(x.shape) or w_y.stride() != x.stride() or w_y.dtype != x.dtype):
+        w_y = None
 
     if variant in ROWWISE_VARIANTS:
         spec = rowwise_spec(variant, x.shape, normalized_shape=normalized_shape, num_groups=num_groups)
@@ -193,7 +275,7 @@ def norm_fprop(
             N, C, H, W = (int(v) for v in x.shape)
             if groupnorm_nhwc_sm100.eligible(C, int(spec.channels_per_group), DTYPE_BYTES[io]):
                 x3 = x.permute(0, 2, 3, 1).reshape(N, H * W, C)  # view, no copy
-                o3 = out_y.permute(0, 2, 3, 1).reshape(N, H * W, C) if out_y is not None else None
+                o3 = w_y.permute(0, 2, 3, 1).reshape(N, H * W, C) if w_y is not None else None
                 y3, mean, rstd = groupnorm_nhwc_sm100.forward(
                     spec,
                     x3,
@@ -207,12 +289,12 @@ def norm_fprop(
                     out_rstd=_stat_out(out_rstd, spec.R),
                     ws=ws,
                 )
-                return y3.reshape(N, H, W, C).permute(0, 3, 1, 2), mean, rstd
+                return _deliver(y3.reshape(N, H, W, C).permute(0, 3, 1, 2), mean, rstd, out_y, out_mean, out_rstd)
         if variant == NormVariant.INSTANCE_NORM and _is_nhwc(x):
             N, C, H, W = (int(v) for v in x.shape)
             if instancenorm_nhwc_sm100.nhwc_cfg(C, DTYPE_BYTES[io]) is not None:
                 x3 = x.permute(0, 2, 3, 1).reshape(N, H * W, C)  # view, no copy
-                o3 = out_y.permute(0, 2, 3, 1).reshape(N, H * W, C) if out_y is not None else None
+                o3 = w_y.permute(0, 2, 3, 1).reshape(N, H * W, C) if w_y is not None else None
                 y3, mean, rstd = instancenorm_nhwc_sm100.forward(
                     spec,
                     x3,
@@ -226,10 +308,10 @@ def norm_fprop(
                     out_rstd=_stat_out(out_rstd, spec.R),
                     ws=ws,
                 )
-                return y3.reshape(N, H, W, C).permute(0, 3, 1, 2), mean, rstd
+                return _deliver(y3.reshape(N, H, W, C).permute(0, 3, 1, 2), mean, rstd, out_y, out_mean, out_rstd)
 
         x2d = x.reshape(spec.R, spec.M)
-        o2d = out_y.reshape(spec.R, spec.M) if out_y is not None else None
+        o2d = w_y.reshape(spec.R, spec.M) if w_y is not None else None
         om, orstd = _stat_out(out_mean, spec.R), _stat_out(out_rstd, spec.R)
 
         # Warp-per-row kernel for LN/RMS when the row fits the register budget.
@@ -242,7 +324,7 @@ def norm_fprop(
 
             if layernorm_cga_sm100.should_use(spec.M, spec.R, DTYPE_BYTES[io]):
                 y2, mean, rstd = layernorm_cga_sm100.forward(spec, x2d, gamma, beta, eps=eps, params=params, out_y=o2d, out_mean=om, out_rstd=orstd)
-                return y2.reshape(x.shape), mean, rstd
+                return _deliver(y2.reshape(x.shape), mean, rstd, out_y, out_mean, out_rstd)
 
             wcfg = make_warp_cfg(params, spec.M)
             if wcfg is not None:
@@ -256,7 +338,7 @@ def norm_fprop(
                     y2, mean, rstd = layernorm_warp_sm100.forward(
                         spec, x2d, gamma, beta, eps=eps, wcfg=wcfg, params=params, out_y=o2d, out_mean=om, out_rstd=orstd
                     )
-                    return y2.reshape(x.shape), mean, rstd
+                    return _deliver(y2.reshape(x.shape), mean, rstd, out_y, out_mean, out_rstd)
 
         # GN/IN with too few (sample, group) rows to fill the machine: the rowwise
         # kernel is one CTA per row, so N=2/C=256/G=2 puts four CTAs on 148 SMs.
@@ -266,11 +348,11 @@ def norm_fprop(
 
             if groupnorm_cga_sm100.eligible(spec.M, spec.R, DTYPE_BYTES[io]):
                 y2, mean, rstd = groupnorm_cga_sm100.forward(spec, x2d, gamma, beta, eps=eps, params=params, out_y=o2d, out_mean=om, out_rstd=orstd)
-                return y2.reshape(x.shape), mean, rstd
+                return _deliver(y2.reshape(x.shape), mean, rstd, out_y, out_mean, out_rstd)
 
         cfg = make_cfg(params, spec.M)
         y2, mean, rstd = _ROWWISE_KERNEL[variant].forward(spec, x2d, gamma, beta, eps=eps, cfg=cfg, params=params, out_y=o2d, out_mean=om, out_rstd=orstd)
-        return y2.reshape(x.shape), mean, rstd
+        return _deliver(y2.reshape(x.shape), mean, rstd, out_y, out_mean, out_rstd)
 
     if variant == NormVariant.BATCH_NORM:
         spec = batchnorm_spec(x.shape)
@@ -290,7 +372,7 @@ def norm_fprop(
         if _is_nhwc(x) and batchnorm_nhwc_sm100.nhwc_cfg(spec.C, eb) is not None:
             N, C, H, W = (int(v) for v in x.shape)
             x2d = x.permute(0, 2, 3, 1).reshape(N * H * W, C)  # view, no copy
-            o2d = out_y.permute(0, 2, 3, 1).reshape(N * H * W, C) if out_y is not None else None
+            o2d = out_y.permute(0, 2, 3, 1).reshape(N * H * W, C) if w_y is not None else None
             y2d, sm, sr = batchnorm_nhwc_sm100.forward(
                 spec,
                 x2d,
@@ -309,12 +391,12 @@ def norm_fprop(
                 out_rstd=_stat_out(out_rstd, spec.C),
             )
             y = y2d.reshape(N, H, W, C).permute(0, 3, 1, 2)
-            return y, sm, sr
+            return _deliver(y, sm, sr, out_y, out_mean, out_rstd)
 
         # --- NCHW: split-K over the (n, c) rows, each of S contiguous elements ---
         if batchnorm_nchw_sm100.nchw_cfg(spec.C, spec.N, spec.S, eb) is not None:
             x3d = x.reshape(spec.N, spec.C, spec.S)
-            o3d = out_y.reshape(spec.N, spec.C, spec.S) if out_y is not None else None
+            o3d = w_y.reshape(spec.N, spec.C, spec.S) if w_y is not None else None
             y3, sm, sr = batchnorm_nchw_sm100.forward(
                 spec,
                 x3d,
@@ -332,11 +414,11 @@ def norm_fprop(
                 out_mean=_stat_out(out_mean, spec.C),
                 out_rstd=_stat_out(out_rstd, spec.C),
             )
-            return y3.reshape(x.shape), sm, sr
+            return _deliver(y3.reshape(x.shape), sm, sr, out_y, out_mean, out_rstd)
 
         cfg = Cfg(block_threads=choose_block_threads(spec.count), V=vector_width(eb), stage_mode=STAGE_NONE, vec=False, elem_bytes=eb)
         x3d = x.reshape(spec.N, spec.C, spec.S)
-        o3d = out_y.reshape(spec.N, spec.C, spec.S) if out_y is not None else None
+        o3d = w_y.reshape(spec.N, spec.C, spec.S) if w_y is not None else None
         y3, sm, sr = batchnorm_sm100.forward(
             spec,
             x3d,
@@ -353,6 +435,6 @@ def norm_fprop(
             out_mean=_stat_out(out_mean, spec.C),
             out_rstd=_stat_out(out_rstd, spec.C),
         )
-        return y3.reshape(x.shape), sm, sr
+        return _deliver(y3.reshape(x.shape), sm, sr, out_y, out_mean, out_rstd)
 
     raise ValueError(f"unknown norm variant {variant}")

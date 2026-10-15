@@ -193,3 +193,60 @@ def test_cuda_graph_replay_recomputes_from_changed_inputs():
         torch.cuda.synchronize()
         err = (y - ref).abs().max().item()
         assert err < 1e-4, f"replay {i} returned stale normalization (max err {err:.5f})"
+
+
+@pytest.mark.L0
+def test_explicitly_requested_default_stream_is_entered():
+    """Handle stream 0 is a REQUEST, not "unspecified".
+
+    The two look identical at the call site and behave oppositely. A context
+    carrying no stream means torch's current one is already right; a context
+    carrying handle 0 means the caller asked for the legacy default stream, and
+    whatever side stream happens to be current must be stepped out of. Treating
+    the second as the first leaves the side stream in force, so a producer
+    queued on the requested default stream goes unwaited for.
+
+    The probe therefore inverts the one above: the producer is on the DEFAULT
+    stream and a side stream is current when execute is called.
+    """
+    B, S, D = 4, 8, 256
+    torch.manual_seed(3)
+    x = torch.randn(B, S, D, device="cuda", dtype=torch.float32)
+    fresh = torch.randn(B, S, D, device="cuda", dtype=torch.float32)
+    scale = torch.ones(1, 1, D, device="cuda", dtype=torch.float32)
+    bias = torch.zeros(1, 1, D, device="cuda", dtype=torch.float32)
+    eps_cpu = torch.full((1, 1, 1), 1e-5, dtype=torch.float32)
+
+    default = torch.cuda.default_stream()
+    handle = cudnn.create_handle()
+    cudnn.set_stream(handle=handle, stream=default.cuda_stream)
+    assert default.cuda_stream == 0, "this probe needs the legacy default stream handle"
+    g, (X, SC, BI, EP, Y, MEAN, IVAR) = _build(handle, x, scale, bias)
+
+    y = torch.empty_like(x)
+    mean = torch.empty(B, S, 1, device="cuda", dtype=torch.float32)
+    ivar = torch.empty_like(mean)
+    ws = torch.empty(g.get_workspace_size(), device="cuda", dtype=torch.uint8)
+    pack = {X: x, SC: scale, BI: bias, EP: eps_cpu, Y: y, MEAN: mean, IVAR: ivar}
+
+    g.execute(pack, ws, handle=handle)  # warm
+    torch.cuda.synchronize()
+
+    # Producer on the stream the handle names (the default one).
+    with torch.cuda.stream(default):
+        torch.cuda._sleep(_SLEEP_CYCLES)
+        x.copy_(fresh)
+
+    # ...and a DIFFERENT stream current when execute is called.
+    side = torch.cuda.Stream()
+    with torch.cuda.stream(side):
+        assert torch.cuda.current_stream() != default
+        g.execute(pack, ws, handle=handle)
+    torch.cuda.synchronize()
+
+    ref = torch.nn.functional.layer_norm(fresh, [D], scale.reshape(-1), bias.reshape(-1), 1e-5)
+    err = (y - ref).abs().max().item()
+    assert err < 1e-4, (
+        f"execute stayed on the ambient side stream instead of the requested default one "
+        f"(max err {err:.5f}); handle 0 is being read as 'no stream requested'"
+    )

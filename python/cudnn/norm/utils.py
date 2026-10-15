@@ -146,16 +146,23 @@ def on_stream(raw):
     read the pre-producer input.
 
     ``None`` means the context carried no stream, and torch's current one is
-    already the right answer. ``ExternalStream`` objects are cached because
-    building one per execute is pure overhead on the hot path.
+    already the right answer. Handle 0 does NOT mean that: it is an explicit
+    request for the legacy default stream, and treating it as "unspecified"
+    leaves whatever side stream happens to be current in force -- a producer
+    queued on the requested default stream then goes unwaited for and the norm
+    reads the stale input. The two cases look identical and behave oppositely,
+    so they are kept apart here.
+
+    ``ExternalStream`` objects are cached because building one per execute is
+    pure overhead on the hot path.
     """
     import torch
 
     if raw is None:
-        return torch.cuda.stream(None)  # no-op context
+        return torch.cuda.stream(None)  # no stream requested: leave the current one alone
     handle = int(raw)
     if handle == 0:
-        return torch.cuda.stream(None)  # legacy default stream: torch's default already
+        return torch.cuda.stream(torch.cuda.default_stream())  # explicitly the default stream
     s = _EXT_STREAMS.get(handle)
     if s is None:
         s = _EXT_STREAMS[handle] = torch.cuda.ExternalStream(handle)

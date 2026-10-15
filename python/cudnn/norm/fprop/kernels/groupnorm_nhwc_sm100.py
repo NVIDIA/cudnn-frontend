@@ -158,10 +158,10 @@ def _gn_fwd_nhwc_kernel(
     #    V-aligned, so every one of them can load it directly.
     if cutlass.const_expr(GPL > 1):
         _k0 = nvvm.load_ext(mXi.iterator + (img * C + c0), dtype=it_ty, count=V).bitcast(et)
-        ks = [_k0[sub * CPG].to(cutlass.Float32) for sub in range(GPL)]
+        kshift = [_k0[sub * CPG].to(cutlass.Float32) for sub in range(GPL)]
     else:
         _gs = cutlass.Int64(gx * GPT + gb) * CPG
-        ks = [nvvm.load_ext(mXi.iterator + (img * C + _gs), dtype=it_ty, count=V).bitcast(et)[0].to(cutlass.Float32)]
+        kshift = [nvvm.load_ext(mXi.iterator + (img * C + _gs), dtype=it_ty, count=V).bitcast(et)[0].to(cutlass.Float32)]
 
     for kk in cutlass.range_constexpr(KC):
         p = p0 + tp + kk * PPL
@@ -169,7 +169,7 @@ def _gn_fwd_nhwc_kernel(
             xv = nvvm.load_ext(mXi.iterator + ((img + p) * C + c0), dtype=it_ty, count=V).bitcast(et)
             for e in cutlass.range_constexpr(V):
                 x = xv[e].to(cutlass.Float32)
-                dz = x - ks[e // CPG]
+                dz = x - kshift[e // CPG]
                 a1[e // CPG] = a1[e // CPG] + dz
                 a2[e // CPG] = a2[e // CPG] + dz * dz
                 xc[kk * V + e] = x
@@ -178,7 +178,7 @@ def _gn_fwd_nhwc_kernel(
         xv = nvvm.load_ext(mXi.iterator + ((img + p) * C + c0), dtype=it_ty, count=V).bitcast(et)
         for e in cutlass.range_constexpr(V):
             x = xv[e].to(cutlass.Float32)
-            dz = x - ks[e // CPG]
+            dz = x - kshift[e // CPG]
             a1[e // CPG] = a1[e // CPG] + dz
             a2[e // CPG] = a2[e // CPG] + dz * dz
         p = p + PPL
@@ -232,7 +232,7 @@ def _gn_fwd_nhwc_kernel(
     rs = []
     for sub in cutlass.range_constexpr(GPL):
         m_ = seg[(gb + sub) * SEGLEN] / Mf
-        mn.append(ks[sub] + m_)
+        mn.append(kshift[sub] + m_)
         rs.append(cute.math.rsqrt(seg[NS + (gb + sub) * SEGLEN] / Mf - m_ * m_ + eps))
     if pos == 0 and my == 0:
         for sub in cutlass.range_constexpr(GPL):

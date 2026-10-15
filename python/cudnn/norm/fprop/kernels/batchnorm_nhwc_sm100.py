@@ -160,7 +160,7 @@ def _bn_nhwc_kernel(
     # partials stay combinable; see shifted_stats() in _common_sm100 for why
     # E[x^2]-E[x]^2 cannot be used here.
     _k0 = nvvm.load_ext(mXi.iterator + c0, dtype=it_ty, count=V).bitcast(et)
-    ks = [_k0[e].to(cutlass.Float32) for e in range(V)]
+    kshift = [_k0[e].to(cutlass.Float32) for e in range(V)]
     per = (M + mparts - 1) // mparts
     r0 = my * per
     r1 = r0 + per
@@ -177,7 +177,7 @@ def _bn_nhwc_kernel(
             xv = nvvm.load_ext(mXi.iterator + (cutlass.Int64(rk) * C + c0), dtype=it_ty, count=V).bitcast(et)
             for e in cutlass.range_constexpr(V):
                 x = xv[e].to(cutlass.Float32)
-                dz = x - ks[e]
+                dz = x - kshift[e]
                 s[e] = s[e] + dz
                 sq[e] = sq[e] + dz * dz
                 cache[kk * V + e] = x
@@ -188,7 +188,7 @@ def _bn_nhwc_kernel(
             xv = raw.bitcast(et)
             for e in cutlass.range_constexpr(V):
                 x = xv[e].to(cutlass.Float32)
-                dz = x - ks[e]
+                dz = x - kshift[e]
                 s[e] = s[e] + dz
                 sq[e] = sq[e] + dz * dz
             nvvm.store_ext(raw, sc.iterator + (tid * KS + ks) * V, shared_space=_CTA_SS)
@@ -213,7 +213,7 @@ def _bn_nhwc_kernel(
                 fs.append(tvin[e].to(cutlass.Float32))
             if rk < r1:
                 for e in cutlass.range_constexpr(V):
-                    dz = fs[e] - ks[e]
+                    dz = fs[e] - kshift[e]
                     s[e] = s[e] + dz
                     sq[e] = sq[e] + dz * dz
             tp_kt = nvvm.make_tmem_ptr_from_warp_row_col(tptr[0], warp % 4, wcol + kt * CPP, cutlass.Float32)
@@ -233,7 +233,7 @@ def _bn_nhwc_kernel(
         for u in cutlass.range_constexpr(UR):
             for e in cutlass.range_constexpr(V):
                 x = raws[u][e].to(cutlass.Float32)
-                dz = x - ks[e]
+                dz = x - kshift[e]
                 s[e] = s[e] + dz
                 sq[e] = sq[e] + dz * dz
         jb = jb + UR
@@ -242,7 +242,7 @@ def _bn_nhwc_kernel(
         xv = nvvm.load_ext(mXi.iterator + (cutlass.Int64(row) * C + c0), dtype=it_ty, count=V).bitcast(et)
         for e in cutlass.range_constexpr(V):
             x = xv[e].to(cutlass.Float32)
-            dz = x - ks[e]
+            dz = x - kshift[e]
             s[e] = s[e] + dz
             sq[e] = sq[e] + dz * dz
         row = row + PPL
@@ -310,7 +310,7 @@ def _bn_nhwc_kernel(
     if tp == 0:
         for e in cutlass.range_constexpr(V):
             m = facc[e] / Mf
-            mn = ks[e] + m
+            mn = kshift[e] + m
             var = faccsq[e] / Mf - m * m
             rs = cute.math.rsqrt(var + eps)
             stat[lane * V + e] = mn

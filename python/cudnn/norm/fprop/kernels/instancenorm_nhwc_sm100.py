@@ -93,7 +93,7 @@ def _in_fwd_nhwc_kernel(
     # by every CTA that reduces this instance, so the partials stay combinable.
     # See shifted_stats() in _common_sm100 -- E[x^2]-E[x]^2 is not usable.
     _k0 = nvvm.load_ext(mXi.iterator + (img * C + c0), dtype=it_ty, count=V).bitcast(et)
-    ks = [_k0[e].to(cutlass.Float32) for e in range(V)]
+    kshift = [_k0[e].to(cutlass.Float32) for e in range(V)]
     per = (HW + mparts - 1) // mparts
     r0 = my * per
     r1 = r0 + per
@@ -110,7 +110,7 @@ def _in_fwd_nhwc_kernel(
             xv = nvvm.load_ext(mXi.iterator + ((img + p) * C + c0), dtype=it_ty, count=V).bitcast(et)
             for e in cutlass.range_constexpr(V):
                 x = xv[e].to(cutlass.Float32)
-                dz = x - ks[e]
+                dz = x - kshift[e]
                 s[e] = s[e] + dz
                 sq[e] = sq[e] + dz * dz
                 xc[kk * V + e] = x
@@ -119,7 +119,7 @@ def _in_fwd_nhwc_kernel(
         xv = nvvm.load_ext(mXi.iterator + ((img + p) * C + c0), dtype=it_ty, count=V).bitcast(et)
         for e in cutlass.range_constexpr(V):
             x = xv[e].to(cutlass.Float32)
-            dz = x - ks[e]
+            dz = x - kshift[e]
             s[e] = s[e] + dz
             sq[e] = sq[e] + dz * dz
         p = p + PPL
@@ -182,7 +182,7 @@ def _in_fwd_nhwc_kernel(
     if tp == 0:
         for e in cutlass.range_constexpr(V):
             mz = s[e] / Mf
-            mnv = ks[e] + mz
+            mnv = kshift[e] + mz
             rsv = cute.math.rsqrt(sq[e] / Mf - mz * mz + eps)
             stat[lane * V + e] = mnv
             stat[CPC + lane * V + e] = rsv
