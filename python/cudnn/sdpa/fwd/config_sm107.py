@@ -107,6 +107,7 @@ __all__ = [
     "D256_DECODE_SINGLE_UNIT_Q_TILES",
     "D256_DECODE_ROUTED_MAX_Q_ROWS",
     "D256_DECODE_ROUTED_MAX_TOKEN_UNITS",
+    "D256_DECODE_MAX_Q_ROWS_SM107",
     "decode_d256_single_unit_q_tile",
     "decode_d256_q_tile",
     "SMEM_CAP_BYTES",
@@ -2294,19 +2295,26 @@ def make_cfg_d256_sparse(params: TemplateParams, *, gather_warps: int = 8, softm
 # ---------------------------------------------------------------------------
 # d256 DECODE flavor on Rubin -- the swap-AB decode tile (sm107/decode_d256_f16.py)
 # ---------------------------------------------------------------------------
-# The decode tile's body is arch-agnostic (cta_group::1, 6 warps at N_Q = 16, f16/bf16
-# TILE_K_HW = 16 on both arch lines, 64 TMEM columns) and its record is the SM100
-# CfgD256Decode built by config_sm100.make_cfg_d256_decode, re-validated here against the
-# two Rubin facts a port can get wrong silently:
+# The decode tile's body is arch-agnostic (cta_group::1, 6 / 10 / 18 warps at N_Q = 16 / 32 /
+# 64, f16/bf16 TILE_K_HW = 16 on both arch lines, 4 x N_Q TMEM columns) and its record is the
+# SM100 CfgD256Decode built by config_sm100.make_cfg_d256_decode -- with the Rubin width set
+# (_D256_DECODE_Q_TILES_SM107 below: the SM100 pair plus the 64-column tile) -- re-validated
+# here against the two Rubin facts a port can get wrong silently:
 #   * the SMEM budget is checked against SMEM_USABLE_BYTES (320 KiB), never the 327 KiB
 #     capacity (the d192 f16 50 %-zeros lesson above).  The tile's slabs -- Q^T, the
 #     3-slot 64 KiB K/V ring, two P^T tiles, the reduction scratch -- sum to ~209 KiB at
-#     N_Q = 16 and ~226 KiB at N_Q = 32, so BOTH widths fit the STANDARD 227 KiB
-#     carveout: no ALLOW_OVERSIZED_SHARED_MEMORY launch, no L1 shrink, on this tile.
+#     N_Q = 16 and ~226 KiB at N_Q = 32, so those two widths fit the STANDARD 227 KiB
+#     carveout (no oversized-SMEM launch, no L1 shrink); the 64-column tile's ~259 KiB take
+#     the OVERSIZED carveout (L1 -> 8 kB, which costs this TMA-fed tile nothing it uses) --
+#     the one width in _D256_DECODE_OVERSIZED_Q_TILES, admitted after its launch was VERIFIED
+#     on cc 10.7 (the DSL sets the dynamic-SMEM attribute from the module's own total, the
+#     way the 320 KiB d512 bodies launch).
 #   * DESC_VERSION is DERIVED from the layout: every MMA-operand slab (Q^T, the K/V ring,
 #     P^T) must START under TCGEN05_V0_ADDR_LIMIT for the version-0 tcgen05 descriptor the
-#     kernel pins; the highest start is P^T at Q + ring = 200 / 208 KiB, so the answer is 0
-#     at every admitted record -- asserted, not assumed (the 2026-09-04 silent-zero class).
+#     kernel pins; the highest start is P^T at Q + ring = 200 / 208 / 224 KiB, and at N_Q = 64
+#     the slab ENDS exactly at the line (224 + 32 KiB), so every address a version-0
+#     descriptor forms stays inside the window -- the answer is 0 at every admitted record,
+#     asserted on the start AND the end, not assumed (the 2026-09-04 silent-zero class).
 
 _D256_DECODE_FLAVOR = "sm107 d256 decode"
 
@@ -2384,26 +2392,56 @@ def decode_d256_q_tile(s_q: int, pack_g: int, max_token_units: Optional[int] = N
     return wide if 0 < units <= cap else 0
 
 
-_D256_DECODE_RED_SLOTS = 3  # the kernel's cross-warp reduction scratch: [2 tile parities + 1 epilogue][softmax warp][16 columns]
-_D256_DECODE_COLS = 16  # S^T / O^T columns one 4-warp softmax group owns
+_D256_DECODE_MAX_RED_SLOTS = 3  # the kernel's per-tile column-max slots: [3 rotating slots][column group][16 columns] of Int32 keys (red.shared.max)
+_D256_DECODE_COLS = 16  # S^T / O^T columns one 4-warp softmax group owns; the epilogue's sum scratch is [softmax warp][16 columns] fp32
 _D256_DECODE_BARRIER_WORDS = 1 + 2 * 3 + 2 * 4 + 1  # q_full, kv_full/empty x STAGES (3), s_full/s_empty/p_full/bmm2_done x 2, tmem_dealloc -- Int64 each
+# The widths the Rubin factory COMPILES (the N extent of one token unit): the SM100 pair and the 64-column tile -- four
+# 16-column softmax groups (16 softmax warps + the MMA warp + the TMA warp = 18 warps / 576 threads), ONE unit of up to 64
+# packed rows, so an MTP step of four tokens x 12 / 16 heads (48 / 64 rows) streams the KV range ONCE where the 32-column
+# tile cuts it into two token units (each a second read of the whole KV).  Its budgets (the barrier / SMEM / TMEM / register
+# tables written with the change): SMEM 259 KiB (the oversized carveout), TMEM 256 columns, the barrier inits scale through SOFTMAX_LANES
+# (512), and ptxas caps the 18-warp CTA at 96 registers per thread (16384 per SM sub-partition / (5 warps x 32),
+# 8-granular -- the per-thread work is width-independent and the sm_107a rendering carries no spill).  Whether the ROUTE
+# sends a step to it is decode_d256_q_tile's decision above (the route rule names the widths it routes); a width in this
+# tuple is compiled and template-tested, nothing more.  The SM100 factory keeps (16, 32): the 64-column tile does not
+# fit the 227 KiB Blackwell carveout.
+_D256_DECODE_Q_TILES_SM107 = (16, 32, 64)
+D256_DECODE_MAX_Q_ROWS_SM107 = max(
+    _D256_DECODE_Q_TILES_SM107
+)  # the widest tile the Rubin line compiles (64); the SM100 line's is config_sm100.D256_DECODE_MAX_Q_ROWS
+# The widths whose SMEM exceeds the standard 227 KiB carveout and launch in the oversized mode (L1 -> 8 kB).  A width is
+# added here only after its launch ran on cc 10.7 (the carveout is a launch attribute the DSL derives, never a knob this
+# config sets; the validator below refuses a record past 227 KiB that is not in this tuple).
+_D256_DECODE_OVERSIZED_Q_TILES = (64,)
+# The FORMS the 64-column tile is admitted for -- the ones whose sm_107a rendering stays SPILL-FREE at ptxas's 96-register
+# cap (MEASURED by host trace-compile over 30 arms, cuobjdump -res-usage STACK 0 / nvdisasm STL+LDL 0, 2026-10-15): a PACKED
+# group of at least _D256_DECODE_WIDE_PACK_MIN heads (2 .. 16 measured; the unpacked 64-token step carries 16 per-column
+# mask thresholds and spills 236 STL/LDL), and over a PAGED cache the causal / window mask (the serving MTP step: bottom-right
+# causal; the padded-only paged arms spill 8-16 B of stack).  A dense cache compiles clean with or without a mask.  Everything
+# else keeps the 32-column tile (two token units) or the prefill tile.  Pinned by the host spill probe in
+# test_sdpa_fwd_decode_d256_sm107.py; a width or form added here is added there.
+_D256_DECODE_WIDE_PACK_MIN = 2
 
 
 def d256_decode_smem_layout(cfg: CfgD256Decode) -> dict:
     """Byte offsets of the decode tile's SMEM slabs in the kernel's DECLARATION order
-    (``sQ_raw | sKV_raw | sP_raw | red_smem | tmem_ptr | mbarriers``), every slab
+    (``sQ_raw | sKV_raw | sP_raw | mred_smem | red_smem | tmem_ptr | mbarriers``), every slab
     1024-aligned like the kernel's ``cutlass.Array(..., alignment=1024)`` (the small
-    trailing arrays at their 16-B alignment), plus the total and the standard-carveout
-    verdict.  The MMA-operand slabs are the first three; ``p_start`` is the highest
-    operand start and is what the descriptor-version derivation reads."""
+    trailing arrays at their 16-B alignment), plus the total, the standard-carveout
+    verdict and the carveout the launch needs (227 KiB standard, else the 320 KiB
+    oversized one).  The MMA-operand slabs are the first three; ``p_start`` is the
+    highest operand start and is what the descriptor-version derivation reads;
+    ``p_end`` is the last operand byte + 1 (the version-0 window check reads both)."""
     q_bytes = cfg.N_Q * cfg.TILE_K * cfg.BPE
     kv_bytes = cfg.STAGES_KV * cfg.TILE_N * cfg.TILE_K * cfg.BPE
     p_bytes = 2 * (cfg.TILE_N * cfg.N_Q // 2) * 4  # two P^T tiles of TILE_N key rows x N_Q/2 packed-half Int32 words
-    red_bytes = _D256_DECODE_RED_SLOTS * cfg.SOFTMAX_WARPS * _D256_DECODE_COLS * 4
+    mred_bytes = _D256_DECODE_MAX_RED_SLOTS * (cfg.N_Q // _D256_DECODE_COLS) * _D256_DECODE_COLS * 4  # the max-key slots, one per group per rotating slot
+    red_bytes = cfg.SOFTMAX_WARPS * _D256_DECODE_COLS * 4  # the epilogue's per-warp column sums
     q_start = 0
     kv_start = _align_slab(q_start + q_bytes)
     p_start = _align_slab(kv_start + kv_bytes)
-    red_start = _align_slab(p_start + p_bytes)
+    mred_start = _align_slab(p_start + p_bytes)
+    red_start = -(-(mred_start + mred_bytes) // 16) * 16
     tmem_ptr_start = -(-(red_start + red_bytes) // 16) * 16
     bars_start = -(-(tmem_ptr_start + 4) // 16) * 16
     total = bars_start + 8 * _D256_DECODE_BARRIER_WORDS
@@ -2411,11 +2449,14 @@ def d256_decode_smem_layout(cfg: CfgD256Decode) -> dict:
         "q_start": q_start,
         "kv_start": kv_start,
         "p_start": p_start,
+        "mred_start": mred_start,
         "red_start": red_start,
         "tmem_ptr_start": tmem_ptr_start,
         "bars_start": bars_start,
+        "p_end": p_start + p_bytes,
         "total": total,
-        "fits_standard_carveout": total <= 227 * 1024,
+        "fits_standard_carveout": total <= SMEM_STANDARD_CARVEOUT_BYTES,
+        "carveout": SMEM_STANDARD_CARVEOUT_BYTES if total <= SMEM_STANDARD_CARVEOUT_BYTES else SMEM_USABLE_BYTES,
     }
 
 
@@ -2447,16 +2488,33 @@ def _validate_cfg_d256_decode_sm107(cfg: CfgD256Decode, flavor: str) -> None:
                 f"with an exact LSE), so this must raise here",
             ),
             (
-                smem["fits_standard_carveout"],
-                f"{flavor}: SMEM {smem['total']} B no longer fits the standard 227 KiB per-CTA carveout at N_Q={cfg.N_Q}, "
-                f"STAGES_KV={cfg.STAGES_KV}; this tile is launched WITHOUT the oversized-SMEM mode (no L1 shrink), so a record past "
-                f"227 KiB needs the launcher's ALLOW_OVERSIZED_SHARED_MEMORY arm before it can be admitted",
+                cfg.N_Q in _D256_DECODE_Q_TILES_SM107,
+                f"{flavor}: N_Q must be one of {_D256_DECODE_Q_TILES_SM107} (the widths this line compiles); got {cfg.N_Q}",
             ),
             (
-                smem["p_start"] < TCGEN05_V0_ADDR_LIMIT,
-                f"{flavor}: the P^T operand slab starts at {smem['p_start']} B, at or past the {TCGEN05_V0_ADDR_LIMIT} B version-0 tcgen05 "
-                f"descriptor window (N_Q={cfg.N_Q}, STAGES_KV={cfg.STAGES_KV}); the kernel derives DESC_VERSION from this layout "
-                f"(d256_decode_desc_version), so an operand past the line must be validated under version 1 before the record is admitted",
+                cfg.N_Q not in _D256_DECODE_OVERSIZED_Q_TILES or (cfg.PACK_GQA == 1 and cfg.QH_PER_KH >= _D256_DECODE_WIDE_PACK_MIN),
+                f"{flavor}: the {cfg.N_Q}-column tile serves PACKED groups of at least {_D256_DECODE_WIDE_PACK_MIN} heads only (got pack_gqa="
+                f"{cfg.PACK_GQA}, qh_per_kh={cfg.QH_PER_KH}): its unpacked rendering spills at ptxas's register cap for 18 warps; an unpacked"
+                f" step of more than 32 tokens rides the 32-column tile or the prefill kernel",
+            ),
+            (
+                cfg.N_Q not in _D256_DECODE_OVERSIZED_Q_TILES or not cfg.PAGED_KV or (cfg.MASK_FLAGS & (MASK_CAUSAL | MASK_SWA)) != 0,
+                f"{flavor}: the {cfg.N_Q}-column tile over a PAGED cache needs the causal / window mask (the MTP step's bottom-right causal"
+                f" mask; got MASK_FLAGS={cfg.MASK_FLAGS}): its padded-only paged rendering spills at ptxas's register cap for 18 warps; a"
+                f" mask-free paged step of that width rides the 32-column tile in two token units",
+            ),
+            (
+                smem["fits_standard_carveout"] or cfg.N_Q in _D256_DECODE_OVERSIZED_Q_TILES,
+                f"{flavor}: SMEM {smem['total']} B no longer fits the standard 227 KiB per-CTA carveout at N_Q={cfg.N_Q}, "
+                f"STAGES_KV={cfg.STAGES_KV}, and this width is not in _D256_DECODE_OVERSIZED_Q_TILES ({_D256_DECODE_OVERSIZED_Q_TILES}: the "
+                f"widths whose oversized-carveout launch (L1 -> 8 kB) was verified on cc 10.7); verify the launch before admitting it",
+            ),
+            (
+                smem["p_start"] < TCGEN05_V0_ADDR_LIMIT and smem["p_end"] <= TCGEN05_V0_ADDR_LIMIT,
+                f"{flavor}: the P^T operand slab spans [{smem['p_start']}, {smem['p_end']}) B, reaching past the {TCGEN05_V0_ADDR_LIMIT} B version-0 "
+                f"tcgen05 descriptor window (N_Q={cfg.N_Q}, STAGES_KV={cfg.STAGES_KV}); the kernel derives DESC_VERSION from the slab START "
+                f"(d256_decode_desc_version) and the descriptor's per-k-step advances must stay inside the window too, so an operand past "
+                f"the line must be validated under version 1 before the record is admitted",
             ),
         ]
     )
@@ -2464,8 +2522,9 @@ def _validate_cfg_d256_decode_sm107(cfg: CfgD256Decode, flavor: str) -> None:
 
 def make_cfg_d256_decode(params: TemplateParams) -> Tuple[CfgD256Decode, TmaIters]:
     """Config for sm107/decode_d256_f16.py: the SM100 decode record (config_sm100.make_cfg_d256_decode,
-    whose predicates are arch-neutral) re-validated against the Rubin SMEM carveout and the version-0
-    tcgen05 descriptor window.
+    whose predicates are arch-neutral, built here over the Rubin width set _D256_DECODE_Q_TILES_SM107 --
+    the SM100 pair plus the 64-column tile) re-validated against the Rubin SMEM carveout (standard or
+    oversized) and the version-0 tcgen05 descriptor window.
 
     Backstop only (see TemplateParams): the adapter routes decode-shaped f16/bf16 d256 graphs here
     (``_decode_q_tile``) and keeps every other graph on the prefill tile, so a ValueError is an adapter
@@ -2482,6 +2541,6 @@ def make_cfg_d256_decode(params: TemplateParams) -> Tuple[CfgD256Decode, TmaIter
         raise ValueError(f"{flavor}: softmax_scale_prefolded is not wired on the decode tile (it applies the scale in-kernel)")
     if getattr(params, "mma_2x2", False) or params.decode_tile or params.ragged_q:
         raise ValueError(f"{flavor}: mma_2x2 / decode_tile / ragged_q select other templates; the d256 decode tile does not consume them")
-    cfg, tma = _make_cfg_d256_decode_record(params)
+    cfg, tma = _make_cfg_d256_decode_record(params, _D256_DECODE_Q_TILES_SM107)
     _validate_cfg_d256_decode_sm107(cfg, flavor)
     return cfg, tma

@@ -51,7 +51,12 @@ ring waits, the config twin's backstops, and the CuTe DSL version gate (Rule 7).
 """
 
 import math
+import os
 import re
+import shutil
+import subprocess
+import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -186,21 +191,35 @@ def test_sm107_decode_body_matches_the_sm100_body():
     )
 
 
-@pytest.mark.parametrize("n_q", [16, 32])
+@pytest.mark.parametrize("n_q", [16, 32, 64])
 def test_sm107_decode_descriptor_version_matches_the_smem_budget(n_q):
-    """DESC_VERSION is derived from the layout (config_sm107.d256_decode_desc_version) and
-    is 0 at both tile widths: the highest MMA-operand slab (P^T) starts at 200 / 208 KiB,
-    under the 256 KiB version-0 window, and the whole tile (209 / 226 KiB) fits the
-    STANDARD 227 KiB carveout (no oversized-SMEM launch, no L1 shrink).  A record that
-    moved an operand past the line must flip the module constant, never a tile literal."""
-    from cudnn.sdpa.fwd.config_sm107 import d256_decode_desc_version, d256_decode_smem_layout
+    """DESC_VERSION is derived from the layout (config_sm107.d256_decode_desc_version) and is 0 at
+    every tile width: the highest MMA-operand slab (P^T) starts at 200 / 208 / 224 KiB, under the
+    256 KiB version-0 window, and at N_Q = 64 ENDS exactly at it.  The 16- and 32-column tiles (209 /
+    226 KiB) fit the STANDARD 227 KiB carveout (no oversized-SMEM launch, no L1 shrink); the 64-column
+    tile (259 KiB) takes the oversized carveout, inside the 320 KiB usable one.  A record that moved an
+    operand past the line must flip the module constant, never a tile literal.  The role / TMEM /
+    scratch geometry the config and the module agree on at each width is pinned beside it."""
+    from cudnn.sdpa.fwd.config_sm107 import (
+        SMEM_STANDARD_CARVEOUT_BYTES,
+        SMEM_USABLE_BYTES,
+        TCGEN05_V0_ADDR_LIMIT,
+        d256_decode_desc_version,
+        d256_decode_smem_layout,
+    )
 
-    mod = _load(decode_q_tile=n_q, seq_kv_lens_present=True)
+    wide = dict(pack_gqa=True, qh_per_kh=16) if n_q == 64 else {}  # the 64-column tile is admitted for packed groups only
+    mod = _load(decode_q_tile=n_q, seq_kv_lens_present=True, **wide)
     lay = d256_decode_smem_layout(mod.CFG)
     assert mod.DESC_VERSION == d256_decode_desc_version(mod.CFG) == 0, (mod.DESC_VERSION, lay)
-    assert lay["p_start"] == (200 if n_q == 16 else 208) * 1024 and lay["p_start"] < 256 * 1024, lay
-    assert lay["fits_standard_carveout"] and lay["total"] <= 227 * 1024, lay
+    assert lay["p_start"] == {16: 200, 32: 208, 64: 224}[n_q] * 1024 and lay["p_start"] < TCGEN05_V0_ADDR_LIMIT, lay
+    assert lay["p_end"] == lay["p_start"] + 2 * 128 * n_q * 2 and lay["p_end"] <= TCGEN05_V0_ADDR_LIMIT, lay
+    assert lay["fits_standard_carveout"] is (n_q < 64) and lay["total"] <= lay["carveout"], lay
+    assert lay["carveout"] == (SMEM_STANDARD_CARVEOUT_BYTES if n_q < 64 else SMEM_USABLE_BYTES), lay
     assert (mod.CFG.N_Q, mod.CFG.SOFTMAX_WARPS, mod.CFG.TOTAL_WARPS, mod.CFG.STAGES_KV, mod.CFG.TILE_K_HW) == (n_q, n_q // 4, n_q // 4 + 2, 3, 16)
+    assert (mod.CFG.THREADS_PER_CTA, mod.COL_GROUPS, mod.TMEM_COLS, mod.CFG.P_SWZ_BYTES) == (32 * (n_q // 4 + 2), n_q // 16, 4 * n_q, 2 * n_q)
+    assert (mod.MAX_RED_SLOTS, mod.MAX_RED_WORDS, mod.RED_WORDS) == (3, 3 * (n_q // 16) * 16, (n_q // 4) * 16) and mod.MAX_RED_WORDS <= mod.SOFTMAX_LANES
+    assert lay["red_start"] - lay["mred_start"] >= 4 * mod.MAX_RED_WORDS and lay["tmem_ptr_start"] - lay["red_start"] >= 4 * mod.RED_WORDS, lay
 
 
 def test_sm107_decode_every_smem_tile_takes_the_module_desc_version():
@@ -259,6 +278,41 @@ def test_sm107_decode_config_twin_backstops():
     assert (cfg.N_Q, cfg.TILE_N, cfg.STAGES_KV, cfg.TILE_K_HW, d256_decode_desc_version(cfg)) == (16, 128, 3, 16, 0)
     wide, _ = make_cfg_d256_decode(TemplateParams(decode_q_tile=32, seq_kv_lens_present=True, dtype_qkv=2))
     assert (wide.N_Q, wide.SOFTMAX_WARPS, wide.TOTAL_WARPS, wide.P_SWZ_BYTES, d256_decode_desc_version(wide)) == (32, 8, 10, 64, 0)
+    # The 64-column tile: four softmax groups, 18 warps, a 128 B P^T atom, descriptor version 0 -- built over the Rubin width
+    # set only (the SM100 factory keeps (16, 32): the tile does not fit the 227 KiB Blackwell carveout) and admitted for the
+    # forms whose rendering stays spill-free at the 18-warp register cap: a packed group of >= 2 heads, and over a paged
+    # cache the causal / window mask (the MTP step); the unpacked and the mask-free paged forms are typed refusals.
+    from cudnn.sdpa.fwd.config_sm100 import make_cfg_d256_decode as sm100_make_cfg_d256_decode
+    from cudnn.sdpa.fwd import config_sm107
+
+    mtp = dict(decode_q_tile=64, seq_kv_lens_present=True, dtype_qkv=2, pack_gqa=True, paged_kv=True, page_size=16, bottom_right=True, window_right=0)
+    for g in (2, 6, 8, 12, 16):
+        w64, _ = make_cfg_d256_decode(TemplateParams(**mtp, qh_per_kh=g))
+        assert (w64.N_Q, w64.SOFTMAX_WARPS, w64.TOTAL_WARPS, w64.THREADS_PER_CTA, w64.P_SWZ_BYTES, d256_decode_desc_version(w64)) == (64, 16, 18, 576, 128, 0)
+    w64s, _ = make_cfg_d256_decode(TemplateParams(**mtp, qh_per_kh=16, split_kv=4))  # split partials ride it too
+    w64k, _ = make_cfg_d256_decode(TemplateParams(**mtp, qh_per_kh=16, has_sink=True))  # and a sink (unsplit: the shared no-split rule)
+    assert w64s.SPLIT_KV == 4 and w64k.HAS_SINK == 1
+    w64d, _ = make_cfg_d256_decode(TemplateParams(decode_q_tile=64, seq_kv_lens_present=True, pack_gqa=True, qh_per_kh=16))  # a dense padded cache, no mask
+    assert (w64d.PAGED_KV, w64d.N_Q) == (0, 64)
+    with pytest.raises(ValueError, match=r"must be one of \(16, 32\)"):
+        sm100_make_cfg_d256_decode(TemplateParams(**mtp, qh_per_kh=16))
+    with pytest.raises(ValueError, match=r"must be one of \(16, 32, 64\)"):
+        make_cfg_d256_decode(TemplateParams(**{**mtp, "decode_q_tile": 48}, qh_per_kh=16))
+    with pytest.raises(ValueError, match="PACKED groups of at least 2 heads"):
+        make_cfg_d256_decode(TemplateParams(**{**mtp, "pack_gqa": False}, qh_per_kh=1))  # the unpacked 64-token step
+    with pytest.raises(ValueError, match="PACKED groups of at least 2 heads"):
+        make_cfg_d256_decode(TemplateParams(**mtp, qh_per_kh=1))
+    with pytest.raises(ValueError, match="needs the causal / window mask"):
+        make_cfg_d256_decode(TemplateParams(decode_q_tile=64, seq_kv_lens_present=True, pack_gqa=True, qh_per_kh=16, paged_kv=True, page_size=16))
+    assert (config_sm107._D256_DECODE_Q_TILES_SM107, config_sm107.D256_DECODE_MAX_Q_ROWS_SM107, config_sm107._D256_DECODE_OVERSIZED_Q_TILES) == (
+        (16, 32, 64),
+        64,
+        (64,),
+    )
+    # Compiled, template-tested, NOT routed at this commit: the production rule keeps the 24/2 and 32/2 MTP steps at S_q = 4
+    # on the 32-column tile in two token units (D256_DECODE_ROUTED_MAX_Q_ROWS stays 32); pointing the route at the width is the
+    # route rule's own change, measured first.
+    assert config_sm107.D256_DECODE_ROUTED_MAX_Q_ROWS == 32 and config_sm107.decode_d256_q_tile(4, 12) == config_sm107.decode_d256_q_tile(4, 16) == 32
 
 
 def test_sm107_decode_module_declines_below_the_dsl_floor(monkeypatch):
@@ -799,15 +853,33 @@ def test_decode_graph_mtp_qwen_24_2_splits_in_token_units(s_q):
         assert (plan.knobs.split_kv or 1) == 4, plan.knobs
 
 
+def _pin_route_64(monkeypatch, cells):
+    """Point the Rubin decode route at the 64-column tile for the (S_q, pack_g) ``cells`` -- for the tests of that width
+    only (at this commit the production rule, config_sm107.decode_d256_q_tile, keeps those cells on the 32-column tile in
+    two token units; routing them is the route rule's own change).  Both readers of the rule are pinned: the adapter's
+    bound name in api_dsl (the lowering) and config_sm107's attribute, which engines.decode_d256_q_tile_for_row and the
+    heuristics read at call time (the facts-level twin and the split model's unit count stay in lockstep with the lowering)."""
+    from cudnn.sdpa.fwd import api_dsl, config_sm107
+
+    real = config_sm107.decode_d256_q_tile
+
+    def patched(s_q, pack_g):
+        return 64 if (int(s_q), int(pack_g)) in cells else real(s_q, pack_g)
+
+    monkeypatch.setattr(config_sm107, "decode_d256_q_tile", patched)
+    monkeypatch.setattr(api_dsl, "_decode_d256_q_tile_sm107", patched)
+
+
 @_gpu
 def test_decode_graph_mtp_token_unit_forms_equal_each_other_and_the_unpacked_form_bitwise(monkeypatch):
-    """S_q = 4 at 24/2 over pages, three lowerings of ONE graph: (a) the Rubin route -- two token
+    """S_q = 4 at 24/2 over pages, four lowerings of ONE graph: (a) the Rubin route -- two token
     units of two tokens on the 32-column tile, (b) four single-token units of the 16-column tile
     (the route pinned to the narrow tile for this test), (c) the unpacked plan (one unit of four
-    tokens per (batch, Q head), the pre-route lead).  A column of S^T does not depend on which N
-    column, which unit or which tile width it occupies, and every unit streams the same KV tiles in
-    the same order, so O and LSE are BITWISE equal across the three -- the token-unit axis moves
-    rows between CTAs, it never changes the arithmetic.  All pinned unsplit."""
+    tokens per (batch, Q head), the pre-route lead), (d) ONE unit of the 64-column tile (four
+    softmax groups; the route pinned to the wide tile for this test).  A column of S^T does not
+    depend on which N column, which unit or which tile width it occupies, and every unit streams
+    the same KV tiles in the same order, so O and LSE are BITWISE equal across the four -- the
+    token-unit axis moves rows between CTAs, it never changes the arithmetic.  All pinned unsplit."""
     from cudnn.sdpa.fwd import api_dsl, config_sm107
 
     kw = dict(B=3, H=24, KH=2, s_q=4, lens=[1000, 129, 640], page=32, dtype=torch.bfloat16, seed=5, causal_br=True)
@@ -824,7 +896,14 @@ def test_decode_graph_mtp_token_unit_forms_equal_each_other_and_the_unpacked_for
     assert pn.knobs.pack_gqa is True and _mtp_module_facts(narrow["module"])[:4] == (16, 12, 1, 12), _mtp_module_facts(narrow["module"])
     pu = _run_graph(**kw, pack_gqa=False, split_kv=1, capture=unpacked)
     assert pu.knobs.pack_gqa is not True and _mtp_module_facts(unpacked["module"])[:4] == (16, 1, 16, 16)
-    for name, other in (("four single-token units (N = 16)", narrow), ("unpacked", unpacked)):
+    # (d): the 64-column tile in ONE unit -- 48 live rows, the 12 rows of a fifth, dead token (the Q box covers 5 tokens; the
+    # TMA zero-fills past S_q) and 4 zero tail rows; the KV range streamed once per (batch, KV head).
+    wide64 = {}
+    _pin_route_64(monkeypatch, {(4, 12)})
+    p64 = _run_graph(**kw, pack_gqa=True, split_kv=1, capture=wide64)
+    monkeypatch.undo()
+    assert p64.knobs.pack_gqa is True and _mtp_module_facts(wide64["module"]) == (64, 12, 5, 60, True, 16, 18), _mtp_module_facts(wide64["module"])
+    for name, other in (("four single-token units (N = 16)", narrow), ("unpacked", unpacked), ("one 64-column unit (N = 64)", wide64)):
         assert torch.equal(wide["o"], other["o"]), f"two token units != {name}: max |diff| {(wide['o'] - other['o']).abs().max().item():.3e}"
         assert torch.equal(wide["lse"], other["lse"]), f"two token units != {name} LSE: max |diff| {(wide['lse'] - other['lse']).abs().max().item():.3e}"
 
@@ -2038,5 +2117,306 @@ def test_decode_adapter_gated_split_cuda_graph_replay_no_host_sync():
             if dead.any():
                 assert (o_gpu.transpose(1, 2)[dead].float() == 0).all(), "a keyless row must be EXACTLY 0 under the gate, every replay"
             torch.testing.assert_close(lse.view(B, H, 1)[live], ref_lse[live], atol=5e-3, rtol=0)
+    finally:
+        g.reset()
+
+
+# --- the 64-column tile: four softmax groups, one unit of up to 64 packed rows -----------------------
+#
+# The third width of the swap-AB tile (config_sm107._D256_DECODE_Q_TILES_SM107): 16 softmax warps + the MMA warp + the TMA
+# warp = 576 threads, 259 KiB of SMEM (the oversized Rubin carveout), 256 TMEM columns, and ptxas's 96-register cap for an
+# 18-warp CTA (16,384 registers per SM sub-partition over 5 warps x 32 lanes, 8-granular, from the .reqntid the DSL emits).
+# It takes the MTP step of four tokens x 12 / 16 heads (48 / 64 rows) in ONE token unit, streaming the KV range once where the
+# 32-column tile cuts it into two units.  At this commit it is compiled and template-tested, not routed: the graph-level cells
+# below pin the route at it for the test (``_pin_route_64``); the production rule stays the route rule's own change.
+
+_SM107_DECODE_SPILL_PROBE = textwrap.dedent("""
+    import glob, os, re, subprocess, sys
+    dump, n_q, g, form, cands = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4], sys.argv[5:]
+    os.environ["CUTE_DSL_DUMP_DIR"] = dump          # read once, at the first cutlass import
+    os.environ["CUTE_DSL_KEEP"] = "cubin"            # keep the cubin, disassemble it ourselves
+    os.environ["CUTE_DSL_ARCH"] = "sm_107a"       # unconditional: an inherited value would pin the wrong target's SASS
+    os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"  # a compiled-plan cache HIT skips ptxas and dumps no cubin
+    from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+    toks = form.split("+")
+    kw = dict(decode_q_tile=n_q, dtype_qkv=2, seq_kv_lens_present=True, pack_gqa=g > 1, qh_per_kh=g)
+    kw["split_kv"] = next((int(t[5:]) for t in toks if t.startswith("split")), 1)
+    if "paged" in toks:
+        kw.update(paged_kv=True, page_size=16)
+    if "br" in toks:
+        kw.update(bottom_right=True, window_right=0, seq_q_lens_present=True)
+    mod = _load_sm100_kernel_module((256, 256), TemplateParams(**kw), rubin=True)
+    print("MODULE", mod.N_Q, mod.CFG.SOFTMAX_WARPS, mod.CFG.THREADS_PER_CTA)
+    mod.compile(d_qk=256, d_v=256, has_lse=True, paged_hnd="hnd" in toks)
+    cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
+    if not cubins:
+        print("FAIL no cubin dumped into", dump, os.listdir(dump)); sys.exit(3)
+    nvd = None
+    for c in cands:
+        try:
+            proc = subprocess.run([c, "-c", cubins[-1]], capture_output=True, text=True, timeout=300)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print("REJECT", c, "->", repr(exc)); continue
+        if proc.returncode == 0 and proc.stdout.strip():
+            nvd = c; print("NVDISASM", c); break
+        print("REJECT", c, "->", (proc.stderr.strip().splitlines() or [str(proc.returncode)])[-1])
+    if nvd is None:
+        print("SKIP no nvdisasm candidate decodes the cubin"); sys.exit(0)
+    sass = subprocess.run([nvd, "-c", cubins[-1]], capture_output=True, text=True, check=True).stdout.splitlines()
+    print("SASS STL", sum(1 for ln in sass if "STL" in ln))
+    print("SASS LDL", sum(1 for ln in sass if "LDL" in ln))
+    print("SASS LINES", len(sass))
+    cuobj = os.path.join(os.path.dirname(nvd), "cuobjdump")
+    if os.path.isfile(cuobj):
+        res = subprocess.run([cuobj, "-res-usage", cubins[-1]], capture_output=True, text=True).stdout
+        regs = [int(m) for m in re.findall(r"REG:(\\d+)", res)]
+        stacks = [int(m) for m in re.findall(r"STACK:(\\d+)", res)]
+        if regs:
+            print("RES REG", max(regs))
+            print("RES STACK", max(stacks))
+    """)
+
+
+def _nvdisasm_candidates():
+    cands = []
+    if os.environ.get("CUDA_PATH"):
+        cands.append(os.path.join(os.environ["CUDA_PATH"], "bin", "nvdisasm"))
+    on_path = shutil.which("nvdisasm")
+    if on_path:
+        cands.append(on_path)
+    return [c for c in dict.fromkeys(cands) if os.path.isfile(c) and os.access(c, os.X_OK)]
+
+
+@pytest.mark.parametrize(
+    ("g", "form"),
+    [
+        pytest.param(12, "paged+br+hnd", id="24to2_mtp_paged_hnd"),
+        pytest.param(16, "paged+br+split4", id="32to2_mtp_paged_split4"),
+        pytest.param(16, "dense", id="32to2_dense_padded"),
+    ],
+)
+def test_sm107_decode_wide_tile_renderings_carry_no_spill(tmp_path, g, form):
+    """The 64-column tile's register budget, pinned on the SASS (no Rubin GPU: an sm_107a trace-compile in a subprocess, the
+    file's SASS-pin recipe): the 18-warp CTA's rendering stays SPILL-FREE at ptxas's 96-register cap on the admitted forms --
+    the 24/2 MTP step over HND pools, the 32/2 MTP step with split partials, a dense padded cache.  The keyed max exchange, the
+    ftz max intrinsics, the x8 O^T readbacks and the two-half epilogue of the shared body exist for this pin; a spill here is
+    a perf regression no numerics test sees (local-memory traffic in the hottest loop).  Skips when no nvdisasm on
+    $CUDA_PATH/bin or $PATH decodes the cubin; a compile failure is a FAIL."""
+    cands = _nvdisasm_candidates()
+    if not cands:
+        pytest.skip("no nvdisasm executable to try (CUDA_PATH unset and none on PATH)")
+    argv = [sys.executable, "-c", _SM107_DECODE_SPILL_PROBE, str(tmp_path), "64", str(g), form, *cands]
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=1500, env={**os.environ, "CUDNN_FRONTEND_ENABLE_FROST_ENGINES": "1"})
+    assert proc.returncode == 0, f"sm_107a trace-compile of the 64-column decode tile (G={g}, {form}) failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
+    out = proc.stdout.splitlines()
+    if any(ln.startswith("SKIP") for ln in out):
+        pytest.skip(str([ln for ln in out if ln.startswith(("SKIP", "REJECT"))]))
+    assert any(ln.startswith("MODULE 64 16 576") for ln in out), out[:5]
+    counts = {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith(("SASS ", "RES ")) and len(ln.split()) == 3 and ln.split()[2].isdigit()}
+    print(f"64-column tile G={g} {form}: {counts}")
+    assert counts["STL"] == 0 and counts["LDL"] == 0, f"the 64-column tile spills (G={g}, {form}): {counts}"
+    if "STACK" in counts:
+        assert counts["STACK"] == 0 and counts["REG"] <= 96, counts  # the 18-warp cap: 16384 / (5 warps x 32 lanes), 8-granular
+
+
+@_gpu
+@pytest.mark.parametrize("splits", [1, 2], ids=["unsplit", "split2"])
+@pytest.mark.parametrize(
+    ("H", "KH", "facts"),
+    [(24, 2, (64, 12, 5, 60)), (32, 2, (64, 16, 4, 64))],
+    ids=["24to2_48_rows_one_unit", "32to2_64_rows_one_unit"],
+)
+def test_decode_kernel_four_column_groups(H, KH, facts, splits):
+    """The 64-column tile at the template level (the module loader + launch_f16): the MTP step S_q = 4 of the 24/2 geometry
+    (48 live rows + the 12 rows of a fifth, dead token + 4 zero tail rows: Q_BOX_TOKENS 5, Q_BOX_ROWS 60) and of the 32/2
+    geometry (64 live rows, no tail) in ONE token unit, bottom-right causal over a paged cache (page 16, HND), 16 softmax warps
+    over the same 128 TMEM lanes -- against the fp32 reference, unsplit and split 2 with the fp32 partials recombined.  The
+    lengths cover the degenerate inputs: 700 (the last page 12 of 16 rows live, 6 tiles), 130 (a tail tile), 5 (n_kv = 1), 0 (no
+    key at all: O := 0, LSE := -inf, an empty split range in BOTH splits), 384 (exactly the ring depth) and 500 (ring + a tail)."""
+    B, P, s_q = 6, 16, 4
+    lens = [700, 130, 5, 0, 384, 500]
+    dtype = torch.bfloat16
+    torch.manual_seed(17 + H)
+    S = max(lens)
+    q = torch.randn(B, s_q, H, D, device="cuda", dtype=dtype)
+    k_dense = torch.randn(B, S, KH, D, device="cuda", dtype=dtype)
+    v_dense = torch.randn(B, S, KH, D, device="cuda", dtype=dtype)
+    k_c, v_c, bt4 = _pools(k_dense, v_dense, P, True, seed=17)
+    mod = _load(
+        dtype_qkv=2,
+        seq_kv_lens_present=True,
+        paged_kv=True,
+        page_size=P,
+        split_kv=splits,
+        pack_gqa=True,
+        qh_per_kh=H // KH,
+        decode_q_tile=64,
+        bottom_right=True,
+        window_right=0,
+    )
+    assert (mod.N_Q, mod.HEADS_PER_TILE, mod.Q_BOX_TOKENS, mod.Q_BOX_ROWS) == facts, (mod.N_Q, mod.HEADS_PER_TILE, mod.Q_BOX_TOKENS, mod.Q_BOX_ROWS)
+    assert (mod.CFG.SOFTMAX_WARPS, mod.CFG.TOTAL_WARPS, mod.CFG.THREADS_PER_CTA, mod.COL_GROUPS, mod.TMEM_COLS, mod.DESC_VERSION, mod.Q_TOKEN_UNITS) == (
+        16,
+        18,
+        576,
+        4,
+        256,
+        0,
+        True,
+    )
+    assert -(-s_q // mod.Q_BOX_TOKENS) == 1, "the whole step is ONE token unit on this width"
+    o, lse = _launch_template(
+        mod,
+        q=q,
+        k_view=k_c.permute(0, 2, 1, 3),
+        v_view=v_c.permute(0, 2, 1, 3),
+        lens=lens,
+        scale=1.0 / math.sqrt(D),
+        splits=splits,
+        dtype=dtype,
+        bt=bt4.view(B, -1),
+        page=P,
+    )
+    ref_o, ref_lse = _ref(q, k_dense, v_dense, lens, None, 1.0 / math.sqrt(D), causal_br=True)
+    assert not torch.isnan(o.float()).any(), "NaN in O"
+    torch.testing.assert_close(o.float(), ref_o, atol=5e-2, rtol=0)
+    dead = torch.isinf(ref_lse)
+    torch.testing.assert_close(lse[~dead], ref_lse[~dead], atol=5e-3, rtol=0)
+    assert dead[3].all() and torch.isneginf(lse[3]).all() and (o[3] == 0).all(), "the keyless batch: LSE := -inf, O := 0 exactly"
+    assert not dead[:3].any() and not dead[4:].any()
+
+
+@_gpu
+@pytest.mark.parametrize("page", [0, 16], ids=["dense_padded", "page16_HND"])
+def test_decode_graph_mtp_32_2_s_q_four_rides_the_64_column_tile_in_one_unit(monkeypatch, page):
+    """32/2 at S_q = 4 (64 packed rows) with the route pinned at the 64-column tile: ONE unit of four tokens x 16 heads (no
+    tail rows), bottom-right causal over a dense padded and a paged cache with per-batch Q lengths below S_q (the dense
+    padded-Q trim on the wide tile: O := 0 / LSE := -inf past them, the diagonal anchored at seq_len_kv[b] - seq_len_q[b]);
+    the plan is PACKED 16:1 and the module the executor loaded is the 64-column tile (N_Q 64, HEADS_PER_TILE 16, Q_BOX_TOKENS 4,
+    64 live rows, 16 softmax warps, 18 warps).  The per-batch Q lengths bind the shared no-split rule (unsplit)."""
+    _pin_route_64(monkeypatch, {(4, 16)})
+    cap = {}
+    plan = _run_graph(B=3, H=32, KH=2, s_q=4, lens=[700, 130, 5], q_lens=[4, 3, 1], page=page, hnd=True, causal_br=True, dtype=torch.bfloat16, capture=cap)
+    _assert_decode_tile_plan(plan, G=16)
+    assert (plan.knobs.split_kv or 1) == 1, plan.knobs
+    assert _mtp_module_facts(cap["module"]) == (64, 16, 4, 64, True, 16, 18), _mtp_module_facts(cap["module"])
+    assert cap["module"].__file__.endswith("/sm107/decode_d256_f16.py")
+
+
+@_gpu
+def test_decode_graph_mtp_s_q_four_on_the_64_column_tile_paged_equals_dense_bitwise(monkeypatch):
+    """The one-unit 64-column form over a dense padded cache and over page pools (S_q = 4, 24/2 packed 12:1 and 32/2 packed
+    16:1, both unsplit): the paged specialization only redirects the K/V tile loads, so O and LSE are BITWISE equal."""
+    _pin_route_64(monkeypatch, {(4, 12), (4, 16)})
+    for H, G in ((24, 12), (32, 16)):
+        kw = dict(B=3, H=H, KH=2, s_q=4, lens=[700, 130, 5], dtype=torch.bfloat16, seed=3 + H, causal_br=True)
+        dense, paged = {}, {}
+        pd = _run_graph(**kw, page=0, capture=dense)
+        pp = _run_graph(**kw, page=16, hnd=True, split_kv=1, capture=paged)
+        _assert_decode_tile_plan(pd, G=G)
+        _assert_decode_tile_plan(pp, G=G)
+        assert _mtp_module_facts(dense["module"])[:2] == (64, G) == _mtp_module_facts(paged["module"])[:2]
+        assert torch.equal(dense["o"], paged["o"]), f"{H}/2: paged != dense: max |diff| {(dense['o'] - paged['o']).abs().max().item():.3e}"
+        assert torch.equal(dense["lse"], paged["lse"]), f"{H}/2: paged != dense LSE: max |diff| {(dense['lse'] - paged['lse']).abs().max().item():.3e}"
+
+
+@_gpu
+@pytest.mark.parametrize(("H", "G"), [(24, 12), (32, 16)], ids=["24to2", "32to2"])
+def test_decode_graph_mtp_s_q_four_on_the_64_column_tile_splits_and_recombines(monkeypatch, H, G):
+    """The split form of the one-unit 64-column step over pages (the form the split rules admit): the plan is packed on the
+    64-column tile and its split is the decode model's at the ONE-unit geometry (B x 2 KV heads x 1 unit, the wide tile's
+    cost), the fp32 partials recombined by the shared combine against the reference; pinned to split 4 when the model picks
+    unsplit, so the split path of this width always runs."""
+    _pin_route_64(monkeypatch, {(4, G)})
+    cap = {}
+    plan = _run_graph(B=2, H=H, KH=2, s_q=4, lens=[4000, 1000], page=16, causal_br=True, dtype=torch.bfloat16, capture=cap)
+    _assert_decode_tile_plan(plan, G=G, units=2 * 2 * 1, kv_tiles=32, q_tile=64)
+    assert _mtp_module_facts(cap["module"])[:2] == (64, G), _mtp_module_facts(cap["module"])
+    if (plan.knobs.split_kv or 1) == 1:
+        cap = {}
+        plan = _run_graph(B=2, H=H, KH=2, s_q=4, lens=[4000, 1000], page=16, causal_br=True, dtype=torch.bfloat16, split_kv=4, capture=cap)
+        assert (plan.knobs.split_kv or 1) == 4 and _mtp_module_facts(cap["module"])[:2] == (64, G), plan.knobs
+
+
+@_gpu
+def test_decode_adapter_64_column_tile_cuda_graph_replay_no_host_sync(monkeypatch):
+    """Capture + replay on the 64-column tile (the adapter's execute path captured once at fixed B, Rule 3): the 32/2 MTP step
+    (S_q = 4 packed 16:1, bottom-right causal over pages, split 4 -- the two launches: the tile's partials, the combine);
+    seq_kv_lens AND seq_q_lens CONTENT change between replays (keyless batches, one-key batches, trimmed Q rows) and every
+    replay matches the reference."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    _pin_route_64(monkeypatch, {(4, 16)})
+    B, H, KH, P, S, s_q = 8, 32, 2, 16, 1024, 4
+    dev, dtype = "cuda", torch.bfloat16
+    torch.manual_seed(2)
+    k_dense = torch.randn(B, S, KH, D, device=dev, dtype=dtype)
+    v_dense = torch.randn(B, S, KH, D, device=dev, dtype=dtype)
+    k_c, v_c, bt4 = _pools(k_dense, v_dense, P, False, seed=2)
+    bt = bt4.view(B, -1)
+    q_gpu = torch.randn(B, s_q, H, D, device=dev, dtype=dtype).transpose(1, 2)
+    o_gpu = torch.empty(B, s_q, H, D, device=dev, dtype=dtype).transpose(1, 2)
+    lse = torch.empty(B, H, s_q, device=dev, dtype=torch.float32)
+    seq_lens = torch.full((B,), 1000, dtype=torch.int32, device=dev)
+    seq_q = torch.full((B,), s_q, dtype=torch.int32, device=dev)
+    api = SdpaFwdDslSm100(
+        sample_q=q_gpu,
+        sample_k=k_c,
+        sample_v=v_c,
+        sample_o=o_gpu,
+        sample_lse=lse,
+        is_causal=True,
+        causal_bottom_right=True,
+        seq_kv_lens_present=True,
+        seq_q_lens_present=True,
+        paged_page_size=P,
+        paged_max_seq_len_kv=S,
+        split_kv=4,
+        pack_gqa=True,
+    )
+    api.check_support()
+    api.compile()
+    assert api.kernel_template == DECODE and "sm107" in type(api._k_mod).__module__ + api._k_mod.__name__
+    assert (api._k_mod.N_Q, api._k_mod.HEADS_PER_TILE, api._k_mod.CFG.TOTAL_WARPS, api._k_mod.CFG.SPLIT_KV, api.split_kv) == (64, 16, 18, 4, 4)
+    ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device=dev, dtype=torch.uint8)
+    s = torch.cuda.Stream()
+    kw = dict(lse_tensor=lse, seq_kv_lens=seq_lens, seq_q_lens=seq_q, block_table=bt, workspace=ws)
+    with torch.cuda.stream(s):
+        api.execute(q_gpu, k_c, v_c, o_gpu, **kw)
+    torch.cuda.synchronize()
+    first = o_gpu.clone()
+    with torch.cuda.stream(s):
+        api.execute(q_gpu, k_c, v_c, o_gpu, **kw)
+    torch.cuda.synchronize()
+    assert torch.equal(o_gpu, first), "two-launch delta on O"
+    g = torch.cuda.CUDAGraph()
+    try:
+        prev = torch.cuda.get_sync_debug_mode()
+        with torch.cuda.graph(g, stream=s):
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                api.execute(q_gpu, k_c, v_c, o_gpu, **kw)
+            finally:
+                torch.cuda.set_sync_debug_mode(prev)
+        scale = 1.0 / math.sqrt(D)
+        for new_lens, new_q in (
+            ([5, 1024, 77, 128, 129, 4, 512, 1000], [4] * B),
+            ([1024] * B, [4, 3, 2, 1, 4, 3, 2, 1]),
+            ([0, 1, 2, 3, 4, 5, 6, 7], [1, 1, 2, 3, 4, 4, 4, 4]),
+        ):
+            seq_lens.copy_(torch.tensor(new_lens, dtype=torch.int32))
+            seq_q.copy_(torch.tensor(new_q, dtype=torch.int32))
+            g.replay()
+            torch.cuda.synchronize()
+            ref_o, ref_lse = _ref(q_gpu.transpose(1, 2), k_dense, v_dense, new_lens, new_q, scale, causal_br=True)
+            live = ~torch.isinf(ref_lse)
+            out = o_gpu.transpose(1, 2).float()
+            assert not torch.isnan(out).any(), (new_lens, new_q)
+            torch.testing.assert_close(out, ref_o, atol=5e-2, rtol=0)
+            dead = ~live  # [B, H, S_q]
+            if dead.any():
+                assert (out.permute(0, 2, 1, 3)[dead] == 0).all(), "a keyless or trimmed row must be EXACTLY 0 on every replay"
+            torch.testing.assert_close(lse.view(B, H, s_q)[live], ref_lse[live], atol=5e-3, rtol=0)
     finally:
         g.reset()

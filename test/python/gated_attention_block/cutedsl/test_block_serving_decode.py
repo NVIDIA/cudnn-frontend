@@ -1436,3 +1436,149 @@ def test_capture_of_the_first_execute_replays_bitwise_and_takes_new_lengths_tabl
         assert torch.equal(case.out, replayed2), "the replay over new lengths / tables / slots differs from the eager run over them"
     finally:
         graph.reset()
+
+
+# ---------------------------------------------------------------------------
+# The 64-column decode tile: the MTP step (S_q = 4) of the 24/2 and 32/2 groups in ONE token unit
+# ---------------------------------------------------------------------------
+#
+# The swap-AB decode tile's third width (config_sm107._D256_DECODE_Q_TILES_SM107: 16 softmax warps, 576 threads, 259 KiB SMEM)
+# takes 4 tokens x 12 / 16 heads = 48 / 64 packed rows in one unit, so the KV range is streamed ONCE per (sequence, KV head)
+# where the production route (the 32-column tile) cuts the step into two token units.  At this commit the width is compiled and
+# tested, not routed: these cells point the route at it for the test (both readers of the rule: the block's decode_route reads
+# config_sm107 at call time, the adapter its bound name in api_dsl); routing it in production is the route rule's own change.
+
+
+@contextlib.contextmanager
+def _route_64(cells=((4, 12), (4, 16))):
+    from cudnn.sdpa.fwd import api_dsl, config_sm107
+
+    real = config_sm107.decode_d256_q_tile
+
+    def patched(s_q, pack_g):
+        return 64 if (int(s_q), int(pack_g)) in cells else real(s_q, pack_g)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(config_sm107, "decode_d256_q_tile", patched)
+        mp.setattr(api_dsl, "_decode_d256_q_tile_sm107", patched)
+        yield
+
+
+def _w64_case(group, s_q=4, **kw):
+    """The S_q = 4 cell of ``group`` declared and compiled under the 64-column route (memoized like the standard cells; the
+    route is read at declaration, so a memoized case keeps its width without the patch)."""
+    key = ("w64", group, s_q, repr(sorted(kw.items())))
+    if key not in _CASES:
+        with _route_64():
+            _CASES[key] = _Case(group, s_q, _LENS, **kw).compile()
+    return _CASES[key]
+
+
+@requires_rubin
+@pytest.mark.parametrize("group", [16, 12])
+def test_decode_s_q_four_on_the_64_column_tile_matches_the_oracle(group):
+    """The MTP step (S_q = 4) of the 32/2 (64 rows) and 24/2 (48 rows + 16 never-stored rows) groups on the 64-column tile in
+    ONE token unit, against the per-sequence fp32 oracle (cos > 0.999 on ``out``), the padded entry EXACTLY 0 with block 0
+    untouched, the route the block declared and the module the adapter compiled agreeing on the width (N_Q 64, the whole group
+    per tile, one unit, the gate OUT of the kernel: in the combine)."""
+    case = _w64_case(group)
+    r, rb = case.blk.decode_route, case.route_readback()
+    assert (r.n_q, r.token_units, r.pack_gqa, r.served, r.tile) == (64, 1, True, True, DECODE_TILE), r
+    assert rb["template"] == DECODE_TILE and rb["file"].endswith("/sm107/decode_d256_f16.py"), rb
+    assert (rb["n_q"], rb["heads_per_tile"], rb["adapter_pack"]) == (64, group, True), rb
+    assert rb["epilogue_gate"] is False and case.blk.gate_fused and case.blk.decode_split_kv >= 2 and rb["split"] == case.blk.decode_split_kv, rb
+    case.run()
+    case.check_against_oracle()
+    k0, v0 = case.block0_bits
+    assert torch.equal(_bits(case.k_cache[0]), k0) and torch.equal(_bits(case.v_cache[0]), v0), "block 0 (the NULL block) must never be written"
+
+
+@requires_rubin
+@pytest.mark.parametrize("group", [16, 12])
+def test_decode_s_q_four_on_the_64_column_tile_equals_the_two_unit_route_bitwise(group):
+    """The same step through the production route (the 32-column tile in two token units) and through the 64-column tile in
+    one unit, at the SAME split (pinned to 2 on both: the split's KV ranges do not depend on the token unit, so every row's
+    partials are the same values and the combine sums them in the same order): the block's ``out`` is BITWISE equal -- the
+    width moves rows between CTAs, it never changes the arithmetic (the SDPA suite's cross-form pin, at the block level)."""
+    wide = _w64_case(group, blk_kw={"decode_split_kv": 2})
+    narrow = _case(("s2", group, 4), group, 4, _LENS, blk_kw={"decode_split_kv": 2})
+    assert (wide.blk.decode_route.n_q, wide.blk.decode_route.token_units) == (64, 1) and (narrow.blk.decode_route.n_q, narrow.blk.decode_route.token_units) == (
+        32,
+        2,
+    )
+    assert wide.blk.decode_split_kv == narrow.blk.decode_split_kv == 2
+    a = wide.run().clone()
+    b = narrow.run().clone()
+    wide.check_against_oracle(a, what="64-column one unit")
+    narrow.check_against_oracle(b, what="32-column two units")
+    assert torch.equal(a, b), f"64-column one unit != 32-column two units: max |diff| {(a.float() - b.float()).abs().max().item():.3e}"
+
+
+@requires_rubin
+def test_decode_s_q_four_on_the_64_column_tile_capture_of_the_first_execute_replays_bitwise_and_takes_new_lengths():
+    """The serving stack's defaults on the 64-column tile: the FIRST execute of a fresh S_q = 4 declaration (32/2, one 64-row
+    unit) captured on a NEW stream with no eager warm-up under ``set_sync_debug_mode("error")``; the capture launches nothing,
+    the replay is BITWISE a fresh eager run; a padded batch replays correctly; new ``kv_lens`` / ``block_table`` /
+    ``slot_mapping`` / ``h`` through the captured tensors replay bitwise the eager run over them."""
+    lens = (300, 0, 1000, 77)
+    with _route_64():
+        case = _Case(16, 4, lens, seed=23)  # fresh: never executed
+        sib = _Case(16, 4, (301, 0, 1000, 77), seed=29, table_row_stride=case.block_table.shape[1])
+        assert (case.blk.decode_route.n_q, case.blk.decode_route.token_units) == (64, 1)
+        # The adapter reads the rule again at compile (its own _decode_q_tile), so the pin covers the compile too: declared at
+        # 64 and compiled outside the pin, the block lowered at 32 while its decode_route said 64 -- a drift the block's
+        # kernel_template pin (both widths are decode_d256_f16) does not see.
+        case.blk.check_support()
+        case.blk.compile()
+    assert case.route_readback()["n_q"] == 64, case.route_readback()
+    case.ws = torch.empty(case.blk.get_workspace_size(), dtype=torch.uint8, device=_DEV)
+    case.out.fill_(float("nan"))
+    k_before = _written(case.k_cache)
+    torch.cuda.synchronize()
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            prev = torch.cuda.get_sync_debug_mode()
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                case.execute()  # the FIRST execute of this declaration, captured
+            finally:
+                torch.cuda.set_sync_debug_mode(prev)
+        torch.cuda.synchronize()
+        assert torch.isnan(case.out).all() and _written(case.k_cache) == k_before, "the capture launched work"
+        graph.replay()
+        torch.cuda.synchronize()
+        replayed = case.out.clone()
+        case.check_against_oracle(replayed, what="replay (64-column tile)")
+        case.out.fill_(float("nan"))
+        case.execute()
+        torch.cuda.synchronize()
+        assert torch.equal(case.out, replayed), "the replay of the captured first execute differs from the eager run"
+        # a NEW step through the captured tensors (the sibling's oracle prefix, a table with pages swapped, new slots / h)
+        assert sib.block_table.shape[1] == case.block_table.shape[1]
+        case.k_cache.copy_(sib.k_cache)
+        case.v_cache.copy_(sib.v_cache)
+        case.block_table.copy_(sib.block_table)
+        case.kv_lens_t.copy_(sib.kv_lens_t)
+        case.slot_mapping.copy_(sib.slot_mapping)
+        case.h.copy_(sib.h)
+        case.cos.copy_(sib.cos)
+        case.sin.copy_(sib.sin)
+        case.w["w_qkvg"].copy_(sib.w["w_qkvg"])
+        case.w["w_o"].copy_(sib.w["w_o"])
+        case.out.fill_(float("nan"))
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        replayed2 = case.out.clone()
+        assert torch.isfinite(replayed2.float()).all() and (replayed2[1] == 0).all()
+        c = _cos(replayed2[sib.live], sib.ref_out[sib.live])
+        print(f"64-column tile: replay over new lengths / table / slots / inputs vs the new step's oracle: cos {c:.6f}")
+        assert c > 0.999
+        case.out.fill_(float("nan"))
+        case.execute()
+        torch.cuda.synchronize()
+        assert torch.equal(case.out, replayed2), "the replay over new lengths / tables / slots differs from the eager run over them"
+    finally:
+        graph.reset()
