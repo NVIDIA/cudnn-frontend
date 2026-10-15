@@ -197,8 +197,8 @@ def flash_attn_bwd_sm100_h128_d576(
     """Direct entry point: allocate omitted outputs and scratch, then launch.
 
     ``SparseAttentionBackward`` keeps compilation at plan time and forbids
-    allocation in ``execute()``; this function offers ``flash_attn_bwd_sm100``
-    callers the same kernel with that interface's allocate-on-demand behavior.
+    allocation in ``execute()``. This direct entry point can allocate omitted
+    outputs and scratch and is also used by ``flash_attn_bwd_sm100``.
     """
     sq, skv = q.shape[0], kv.shape[0]
     max_topk = topk_idxs.shape[1]

@@ -2089,8 +2089,9 @@ def test_DSA_sparse_attention_backward_sm100_specialized_handles_sink_limits(num
 @pytest.mark.parametrize(
     "s_q,topk",
     [
-        # s_q=1 takes the single-query dSink path, s_q=9 the split-cluster
-        # regime, and s_q=129 the single-cluster regime of long sequences.
+        # D576 uses its single-query dSink path for s_q=1. Ordinary D576
+        # splits s_q=9 across clusters and uses one pair per query at s_q=129;
+        # deterministic execution always uses one pair per query.
         pytest.param(1, 128, id="q1-k128"),
         pytest.param(9, 512, id="q9-k512"),
         pytest.param(129, 128, id="q129-k128"),

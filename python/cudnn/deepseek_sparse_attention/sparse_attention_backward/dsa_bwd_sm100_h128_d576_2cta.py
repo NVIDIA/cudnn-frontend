@@ -1066,8 +1066,8 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
                 self.zero_dKV_shards(mdKV_acc, mKV.shape[0]).launch(
                     grid=[cute.ceil_div(mKV.shape[0], 4), active_dkv_shards, 1], block=[128, 1, 1], stream=stream
                 )
-            for token_begin in cutlass.range(0, problem_shape[0], self.q_wave_ctas):
-                main_grid_x = 2 * min(Int32(self.q_wave_ctas), problem_shape[0] - token_begin)
+            for token_begin in cutlass.range(0, problem_shape[0], self.max_query_pairs_per_wave):
+                main_grid_x = 2 * min(Int32(self.max_query_pairs_per_wave), problem_shape[0] - token_begin)
                 self.kernel(
                     tma_atom_q,
                     tma_tensor_q,
@@ -3883,6 +3883,8 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
 class FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic(TwoCTADeterministicReduction, FlashAttentionDSABackwardSm100H128D576TwoCTA):
     """D576 two-CTA arithmetic with fixed query-slot and rank reduction order."""
 
+    # Each per-KV-row record holds 512 core values and two rank-private 64-value tails.
+    # Compact records and fold buffers fit inside the public 128-plane capacity.
     COMPACT_SLOTS = 74
     COMPACT_RECORD = 640
     COMPACT_QUERIES_PER_GROUP = 8
@@ -3890,9 +3892,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic(TwoCTADeterminis
     COMPACT_PUBLIC_PLANES = 128
     num_dkv_shards = COMPACT_SLOTS
     dkv_shards_per_query = 1
-    q_wave_ctas = COMPACT_SLOTS
-    dkv_fold_group_size = COMPACT_QUERIES_PER_GROUP
-    num_dkv_fold_groups = COMPACT_GROUPS
+    max_query_pairs_per_wave = COMPACT_SLOTS
 
     @cute.jit
     def make_dKV_accumulator(self, workspace_dKV: cute.Tensor, total_seqlen_KV: Int32):
@@ -4035,7 +4035,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic(TwoCTADeterminis
         total_q: Int32,
         active_groups: Int32,
     ):
-        """Fold group planes while 16 leading blocks reduce dSink with 32 fixed query chains."""
+        """Fold group planes; for multiple queries, 16 leading blocks reduce dSink with 32 fixed chains."""
         physical_block, _, _ = cute.arch.block_idx()
         row = physical_block
         if cutlass.const_expr(not self.SINGLE_QUERY):

@@ -225,9 +225,10 @@ def flash_attn_bwd_sm100(
     """FlashAttention (DSA) Backward Pass for Blackwell (SM100), with K=V.
 
     Accepts flat (unbatched) contiguous tensors with global topk indices.
-    Internally wraps as batch=1 for the CuTe DSL kernel. Never allocates or
-    repacks: ``dq``/``dkv``/``d_sink`` are caller-provided (``None`` raises
-    ``ValueError``) and a strided input raises ``ValueError``.
+    Internally wraps as batch=1 for the CuTe DSL kernel and never repacks.
+    ``dq``/``dkv``/``d_sink`` must be caller-provided (``None`` raises
+    ``ValueError``). The D576 direct entry point may allocate omitted scratch;
+    other routes require caller-provided workspace.
 
     Args:
         q: (total_S_q, nheads, headdim) float16 or bfloat16

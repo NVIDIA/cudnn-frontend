@@ -1182,9 +1182,9 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         if cutlass.const_expr(self.deterministic):
             # Each query wave reuses the same bounded scratch shards. Launches on
             # this stream order successive waves before the final reduction.
-            num_q_waves = cute.ceil_div(problem_shape[0], self.q_wave_ctas)
+            num_q_waves = cute.ceil_div(problem_shape[0], self.max_query_pairs_per_wave)
             q_wave_size = cute.ceil_div(problem_shape[0], num_q_waves)
-            active_shards = q_wave_size + min(q_wave_size, Int32(self.split_wg_query_ctas))
+            active_shards = q_wave_size + min(q_wave_size, Int32(self.split_wg_queries_per_wave))
             mdKV_acc = self.make_dKV_accumulator(workspace_dKV, mKV.shape[0])
             self.zero_dKV_shards(mdKV_acc, mKV.shape[0]).launch(grid=[cute.ceil_div(mKV.shape[0], 4), active_shards, 1], block=[128, 1, 1], stream=stream)
         else:
@@ -2540,7 +2540,7 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
             for loop_iter in cutlass.range(tile_count):
                 tile_index = tile_count - Int32(1) - loop_iter
                 if cutlass.const_expr(self.deterministic):
-                    if cutlass.const_expr(self.split_wg_query_ctas > 0):
+                    if cutlass.const_expr(self.split_wg_queries_per_wave > 0):
                         dkv_wait, dkv_rel = self._drain_dkv_deterministic(
                             t_dkv[0], t_dkv[1], mdKV_acc, index_row, tile_index, topk, batch_idx, rtx, rank, split_wg_shard, pipe_dkv_done, dkv_wait, dkv_rel
                         )
@@ -3080,7 +3080,7 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
 
 
 class FlashAttentionDSABackwardSm100H128TwoCTADeterministic(TwoCTADeterministicReduction, FlashAttentionDSABackwardSm100H128TwoCTA):
-    """The H128 D512 CG2 kernel with ordered scratch scatter and reduction."""
+    """The H128 D512 two-CTA kernel with ordered scratch scatter and reduction."""
 
     FUSED_FOLD_MIN_ROWS = 1024
     USE_P_LOW = True
@@ -3092,12 +3092,10 @@ class FlashAttentionDSABackwardSm100H128TwoCTADeterministic(TwoCTADeterministicR
         # planes. The remaining queries share a plane and serialize its writers.
         if max_topk >= 1024:
             self.num_dkv_shards = 112
-            self.dkv_shards_per_query = 2
-            self.split_wg_query_ctas = 38
+            self.split_wg_queries_per_wave = 38
         else:
             self.num_dkv_shards = 74
-            self.dkv_shards_per_query = 1
-            self.split_wg_query_ctas = 0
+            self.split_wg_queries_per_wave = 0
 
     @cute.jit
     def postprocess_deterministic(
@@ -3339,7 +3337,7 @@ class FlashAttentionDSABackwardSm100H128TwoCTADeterministic(TwoCTADeterministicR
         dkv_acquire_state: pipeline.PipelineState,
         dkv_commit_state: pipeline.PipelineState,
     ):
-        """Accumulate BF16 high+low dV/dK products into FP32 TMEM."""
+        """Accumulate high/residual P products for dV and BF16 dS products for dK into FP32 TMEM."""
         _mbarrier_wait_acquire_cluster(relay_mbars, relay_phase)
         dkv_done_pipeline.producer_acquire(dkv_acquire_state)
         dkv_acquire_state.advance()

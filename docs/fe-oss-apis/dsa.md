@@ -256,7 +256,7 @@ between waves, and fixed-order reductions produce `dKV` and `d_sink`. Both
 specializations keep the public workspace capacity of 128 FP32 dKV planes.
 
 Other deterministic envelopes with H16/H32/H64/H96/H128 keep the bounded-wave
-M64 implementation. Queries run in same-stream waves of 128 CTAs; CTA lane
+M64 implementation. Queries run in same-stream waves of 128 CTAs; CTA
 `i` is the sole writer of FP32 dKV shard `i` in each wave. H16/H32 use a masked
 M64 head tile. H96/H128 split each query wave into ordered M64 head-block
 launches, preserving single-writer ownership without multiplying the number

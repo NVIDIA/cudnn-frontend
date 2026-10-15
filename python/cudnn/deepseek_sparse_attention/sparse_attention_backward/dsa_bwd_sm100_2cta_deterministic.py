@@ -1,13 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Bounded scratch and ordered reductions shared by deterministic CG2 DSA.
+"""Bounded scratch and ordered reductions for deterministic D512 two-CTA DSA.
 
-The main Tensor Core kernels retain their own accumulator layouts. Folding
-therefore happens in that layout, before their ordinary output conversion.
-Query waves and, when needed, cluster ranks own distinct scratch shards.
-The main kernels also serialize duplicate-slot writers within each shard;
-sharding alone would not make a scatter deterministic.
+Wave-local queries own separate scratch shards, with additional shards for
+some warp-group writers. Cluster ranks own disjoint columns within each shard.
+The main kernel orders duplicate-index writers, and fixed-order folds combine
+the FP32 shards before BF16 output conversion.
 """
 
 import math
@@ -53,17 +52,15 @@ def ordered_dkv_quad(target: cute.Tensor, values: cute.Tensor):
 
 
 class TwoCTADeterministicReduction:
-    """Reduction mixin; the subclass supplies the unchanged CG2 arithmetic."""
+    """Scratch layout and dSink reductions for deterministic D512 two-CTA DSA."""
 
     deterministic = True
     # The public workspace reserves 128 planes. Subclasses may use fewer
     # active planes while keeping that caller-visible capacity unchanged.
     num_dkv_shards = 128
-    dkv_shards_per_query = 2
-    q_wave_ctas = 74
-    split_wg_query_ctas = num_dkv_shards - q_wave_ctas
+    max_query_pairs_per_wave = 74
+    split_wg_queries_per_wave = num_dkv_shards - max_query_pairs_per_wave
     dkv_fold_group_size = 8
-    num_dkv_fold_groups = 16
 
     @staticmethod
     def _get_workspace_size_dKV(k: int, d: int, b: int, acc_dtype: Type[cutlass.Numeric]):
@@ -82,8 +79,8 @@ class TwoCTADeterministicReduction:
         # The wave-local query ordinal selects its plane; the first queries
         # reserve an adjacent second plane for a separate warp-group writer.
         query_shard = token_idx
-        split_wg_shard = query_shard < Int32(self.split_wg_query_ctas)
-        shard = query_shard + min(query_shard, Int32(self.split_wg_query_ctas))
+        split_wg_shard = query_shard < Int32(self.split_wg_queries_per_wave)
+        shard = query_shard + min(query_shard, Int32(self.split_wg_queries_per_wave))
         pitch = cute.round_up(total_seqlen_KV, 8)
         offset = Int64(shard) * Int64(pitch) * Int64(self.head_dim)
         accumulator = cute.make_tensor(
