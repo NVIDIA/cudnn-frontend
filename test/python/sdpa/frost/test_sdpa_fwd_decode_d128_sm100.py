@@ -193,6 +193,42 @@ def test_standalone_cga_domain_cga1_is_a_decode_tile_only_on_d128_f16():
     assert supported_cgas_for((256, 256), fp8=False, device_cc=(10, 0)) == (2,)
 
 
+@pytest.mark.L0
+def test_adapter_d64_decode_quad_gate():
+    """The d64 decode tile runs its quadrant softmax exactly when the live rows -- S_q x the packed group -- fit one 32-row lane quadrant, on a plan that
+    lowers onto the decode tile at all and is not THD (whose legs keep the staged O store the merge replaces).  Host-only: the method reads five attributes."""
+    from types import SimpleNamespace
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    def quad(h_q, h_kv, s_q, *, pack_gqa=True, thd=False, decode_tile=True):
+        me = SimpleNamespace(h_q=h_q, h_kv=h_kv, s_q_max=s_q, pack_gqa=pack_gqa, thd=thd, _d64_decode_tile=lambda: decode_tile)
+        return SdpaFwdDslSm100._d64_decode_quad(me)
+
+    assert quad(64, 8, 1) and quad(64, 8, 4), "G = 8: one to four tokens fit 32 rows"
+    assert not quad(64, 8, 5) and not quad(64, 8, 16), "past 32 rows the 128-row tile's single-quadrant softmax stays"
+    assert quad(16, 1, 2) and not quad(16, 1, 3), "G = 16: two tokens"
+    assert quad(64, 8, 32, pack_gqa=False) and not quad(64, 8, 33, pack_gqa=False), "unpacked: one row per token"
+    assert not quad(64, 8, 1, decode_tile=False), "a plan that is not the decode tile never carries the quadrant record"
+    assert not quad(64, 8, 1, thd=True)
+
+
+@pytest.mark.L0
+def test_decode_quad_record_is_validated():
+    """``decode_quad`` is the d64 decode tile's field: it needs ``decode_tile``, and the kernel declines the combinations its merge cannot serve
+    (THD keeps the staged O store; a packed group must divide the 32-row quadrant)."""
+    from dataclasses import replace
+
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d64_decode
+
+    base = TemplateParams(
+        cta_mma=1, d_flavor=64, decode_tile=True, dtype_qkv=2, qh_per_kh=8, pack_gqa=True, paged_kv=True, page_size=16, seq_kv_lens_present=True
+    )
+    make_cfg_d64_decode(replace(base, decode_quad=True))
+    with pytest.raises(ValueError, match="needs decode_tile"):
+        make_cfg_d64_decode(replace(base, decode_tile=False, decode_quad=True))
+
+
 def _facts(**over):
     import cudnn
     from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
@@ -385,6 +421,7 @@ def _run_kernel(
     expect_pack_g=None,
     native_d64=False,
     exp2_split=False,
+    quad=False,
 ):
     """Drive sm100/decode_d128_f16.py directly (the split-KV suite's idiom).
 
@@ -397,7 +434,7 @@ def _run_kernel(
     ``pack=None`` packs whenever the group shares a factor with the 128-row
     tile (the partial-PackGQA contract the kernel carries); ``expect_pack_g``
     pins the config's packed group.  ``native_d64`` runs the d64 flavor of the tile (``d_flavor=64, decode_tile``; ``d`` must be 64) instead of
-    the d128 envelope, with the exp2 MUFU / FMA split switched by ``exp2_split`` (what the adapter's cc 10.0 build sets).
+    the d128 envelope, with the exp2 MUFU / FMA split switched by ``exp2_split`` (what the adapter's cc 10.0 build sets) and the quadrant softmax by ``quad``.
     """
     import cutlass
     import cuda.bindings.driver as cuda_driver
@@ -458,16 +495,17 @@ def _run_kernel(
         **paged_kw,
     )
     if native_d64:
-        assert d == 64
-        params = replace(params, d_flavor=64, decode_tile=True, exp2_fma_split=exp2_split)
+        assert d <= 64
+        params = replace(params, d_flavor=64, decode_tile=True, exp2_fma_split=exp2_split, decode_quad=quad)
     if expect_pack_g is not None:
         cfg, _ = make_cfg_d128_decode(params)
         assert cfg.PACK_G == expect_pack_g, f"PACK_G={cfg.PACK_G} for G={G}, expected {expect_pack_g}"
     mod = _load_decode(
         params,
-        tag=f"decode_test_{'p' + str(P) if paged else 'dense'}_s{splits}_g{G if pack else 1}_{dtype}_br{int(causal_br)}_w{window_left}_sk{int(has_sink)}_l2{int(stats_log2)}_q{int(q_lens is not None)}_sc{sched}_lse{int(has_lse)}_n64{int(native_d64)}_e{int(exp2_split)}",
+        tag=f"decode_test_{'p' + str(P) if paged else 'dense'}_s{splits}_g{G if pack else 1}_{dtype}_br{int(causal_br)}_w{window_left}_sk{int(has_sink)}_l2{int(stats_log2)}_q{int(q_lens is not None)}_sc{sched}_lse{int(has_lse)}_n64{int(native_d64)}_e{int(exp2_split)}_qd{int(quad)}",
     )
     assert mod.CGA_TILE_M == 128 and mod.CFG.STAGES_KV == 3 and mod.CFG.TOTAL_WARPS == 12
+    assert mod.QUAD is bool(quad), "the quadrant softmax must fold in exactly when asked for"
     fn = mod.compile(d_qk=d, d_v=d, has_lse=has_lse, paged_hnd=paged and hnd)
     o_p = torch.zeros(splits * B, s_q, H, d, device=dev, dtype=torch.float32 if splits > 1 else dtype)
     lse_p = torch.zeros(splits * B, H, s_q, device=dev, dtype=torch.float32)
@@ -739,6 +777,42 @@ def test_decode_kernel_native_d64_exp2_split(splits, s_q, window, exp2_split):
     emulated = exp2_split and window is None
     assert mod._E2E_ENABLED is emulated
     assert 2 * sum(len(pairs) for pairs in mod._E2E_PAIRS) == (32 if emulated else 0)
+
+
+_QUAD_CASES = [
+    dict(id="unsplit", B=3, H=8, KH=1, P=16, max_pages=40, lens=[600, 77, 1], splits=1),
+    dict(id="split4", B=3, H=8, KH=2, P=16, max_pages=40, lens=[600, 77, 129], splits=4),
+    dict(id="sink", B=3, H=8, KH=1, P=16, max_pages=40, lens=[600, 77, 1], splits=1, sink=True),
+    dict(id="sink_underflow", B=3, H=8, KH=1, P=16, max_pages=40, lens=[600, 0, 77], splits=1, sink=-120.0),
+    dict(id="sink_split2", B=3, H=8, KH=1, P=16, max_pages=40, lens=[600, 77, 1], splits=2, sink=True),
+    dict(id="mtp4_bottom_right", B=3, H=8, KH=2, P=16, max_pages=40, lens=[600, 30, 129], splits=1, s_q=4, causal_br=True),
+    dict(id="mtp2_g16", B=3, H=16, KH=1, P=16, max_pages=40, lens=[600, 30, 129], splits=1, s_q=2, causal_br=True),
+    dict(id="mtp4_split2", B=2, H=8, KH=2, P=16, max_pages=64, lens=[1000, 513], splits=2, s_q=4, causal_br=True),
+    dict(id="sliding_window", B=3, H=8, KH=2, P=16, max_pages=40, lens=[600, 30, 129], splits=1, s_q=2, causal_br=True, window_left=100),
+    dict(id="q_trim", B=4, H=16, KH=4, P=16, max_pages=30, lens=[400, 77, 1, 129], splits=1, s_q=2, q_lens=[2, 1, 2, 1], causal_br=True),
+    dict(id="no_lse", B=3, H=8, KH=1, P=16, max_pages=40, lens=[600, 77, 1], splits=1, has_lse=False),
+    dict(id="stats_log2", B=3, H=8, KH=1, P=16, max_pages=40, lens=[600, 77, 1], splits=1, stats_log2=True),
+    dict(id="dense_lengths", B=3, H=8, KH=1, P=16, max_pages=40, lens=[600, 77, 0], splits=1, paged=False),
+    dict(id="unpacked", B=2, H=8, KH=2, P=16, max_pages=40, lens=[300, 129], splits=1, s_q=4, causal_br=True, pack=False),
+    dict(id="d48_envelope", B=3, H=8, KH=1, P=16, max_pages=40, lens=[600, 77, 1], splits=1, d=48),
+    dict(id="d48_envelope_split", B=3, H=8, KH=1, P=16, max_pages=40, lens=[600, 77, 129], splits=2, d=48),
+    dict(id="empty_ranges_many_units", B=3, H=8, KH=8, P=128, max_pages=33, lens=[4000, 1, 129], splits=8),
+]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("case", _QUAD_CASES, ids=lambda c: c["id"])
+def test_decode_kernel_native_d64_quad_softmax(case):
+    """The quadrant-cooperative softmax of the d64 decode tile (``decode_quad``: the live rows replicated into all four TMEM lane quadrants, each softmax
+    warp owning a quarter of the keys, the correction warps merging the four partials per unit) against the same fp32 reference as every other form of the
+    tile: unsplit and split (fp32 partials), with and without a sink -- including the underflow sink and an empty sequence -- bottom-right MTP, a sliding
+    window, the padded-Q trim, the Stats variants, dense and paged, unpacked heads, a head dim under the tile width (the envelope), and a many-units
+    launch whose empty split ranges interleave with live units under the persistent scheduler."""
+    case = dict(case)
+    case.pop("id")
+    B, H, KH, P, max_pages, lens, splits = (case.pop(k) for k in ("B", "H", "KH", "P", "max_pages", "lens", "splits"))
+    d = case.pop("d", 64)
+    _run_kernel(B, H, KH, P, max_pages, lens, True, splits, d=d, dtype=torch.bfloat16, native_d64=True, quad=True, **case)
 
 
 @pytest.mark.L0

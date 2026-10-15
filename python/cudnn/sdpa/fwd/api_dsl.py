@@ -158,6 +158,8 @@ _SM100_DECODE_KERNEL_FILE = "sm100/decode_d128_f16.py"
 _SM100_DECODE_FLAVOR = (128, 128)
 # Q rows one d64 decode tile covers (CfgD64Decode: TILES_Q=1 x TILE_M=128).
 _D64_DECODE_TILE_ROWS = 128
+# Live Q rows one TMEM lane quadrant holds: the d64 decode tile's quadrant softmax (TemplateParams.decode_quad) serves up to this many.
+_D64_QUAD_ROWS = 32
 # Decode-shaped alternates selected by a TemplateParams field instead of a knob
 # (TemplateParams.decode_q_tile != 0, set by SdpaFwdDslSm100._decode_q_tile when
 # S_q * pack_g rows fit the tile's N extent): the d256 flavor's swap-AB tile.
@@ -2574,6 +2576,19 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         pack_g = (self.h_q // self.h_kv) if self.pack_gqa else 1
         return int(self.s_q_max) * pack_g <= _D64_DECODE_TILE_ROWS
 
+    def _d64_decode_quad(self) -> bool:
+        """Whether the d64 decode tile runs its quadrant-cooperative softmax (``TemplateParams.decode_quad``).
+
+        The live Q rows -- S_q x the packed group -- must fit one 32-row quadrant: the tile loads them into all four TMEM lane quadrants and each
+        softmax warp owns a quarter of the key columns, which is what lifts the one-warp-owns-all-live-rows bound of a decode step.  A larger S_q
+        keeps the 128-row tile's single-quadrant softmax.  Dense / paged, split or not, with or without a sink (not THD: the tile's THD legs keep the staged
+        O store the merge replaces).
+        """
+        if not self._d64_decode_tile() or self.thd:
+            return False
+        pack_g = (self.h_q // self.h_kv) if self.pack_gqa else 1
+        return int(self.s_q_max) * pack_g <= _D64_QUAD_ROWS
+
     def template_params(self) -> Sm100TemplateParams:
         """The compile-time record ``compile()`` loads the kernel module with.
 
@@ -2789,7 +2804,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 ),
             )
         if self._d64_decode_tile():
-            params = replace(params, decode_tile=True)
+            params = replace(params, decode_tile=True, decode_quad=self._d64_decode_quad())
         if self._fp8_dual_kv_stream():
             params = replace(params, dual_kv_stream=True)
         elif self._device_cc != (10, 7) and self.flavor == (512, 512) and self._fp8 and not self._pertensor:
