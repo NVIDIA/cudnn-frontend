@@ -671,9 +671,15 @@ def test_declaration_facts(group, s_q):
     assert not blk_s.cache_write_fused and [st.name for st in blk_s._stages] == ["qkv_gate_proj_norm_rope", "cache_write", "sdpa"] + (
         [] if blk_s.gate_fused else ["sigmoid_gate"]
     ) + ["out_proj"]
-    # the knob and the write-through arm under the lowering: typed
-    with pytest.raises(NotImplementedError, match="fuse_cache_write=True at decode row counts"):
-        _make_block(group, 4, s_q, fuse_norm_rope=True, fuse_cache_write=True)
+    # an explicit fuse_cache_write=True is a REQUEST only the fused fork honours (the write-through arm lives in its epilogue): under the
+    # AUTO lowering the request outranks the heuristic and the fork runs -- never the separate write, never a decline
+    blk_w, _ = _make_block(group, 4, s_q, fuse_gate=True, fuse_norm_rope=True, decode_split_kv=None if torch.cuda.is_available() else 2, fuse_cache_write=True)
+    assert blk_w.fuse_cache_write is True and blk_w.fuse_norm_rope_small_m is None and blk_w.small_m_decode and blk_w.fuse_norm_rope_effective
+    assert blk_w.cache_write_fused and blk_w._cache_write is None and blk_w._norm_rope is None and blk_w._proj.kv_pool_page_size == blk_w.paged_kv_page_size
+    assert [st.name for st in blk_w._stages] == [st.name for st in blk_f._stages]
+    # the explicit contradiction -- the lowering asked for by name AND the arm that lives in the fork -- is the typed decline, naming both
+    with pytest.raises(NotImplementedError, match="fuse_cache_write=True with fuse_norm_rope_small_m=False"):
+        _make_block(group, 4, s_q, fuse_norm_rope=True, fuse_cache_write=True, fuse_norm_rope_small_m=False)
     with pytest.raises(ValueError, match="fuse_norm_rope_small_m=True: the knob decides"):
         _make_block(group, 4, s_q, fuse_norm_rope=False, fuse_norm_rope_small_m=True)
     with pytest.raises(TypeError, match="fuse_norm_rope_small_m must be None"):
@@ -713,6 +719,12 @@ def test_the_small_m_lowering_follows_the_row_count_and_leaves_the_other_forms_a
     assert ctl.small_m_decode and ctl.fuse_norm_rope_effective and ctl.cache_write_fused and ctl._norm_rope is None
     explicit = at(32, 4, fuse_norm_rope_small_m=False)
     assert explicit.fuse_norm_rope_small_m is False and not explicit.fuse_norm_rope_effective
+    # an explicit write-through request keeps the fork under AUTO (user request > heuristic proposal); past the bound it changes nothing
+    asked = at(32, 4, fuse_cache_write=True)
+    assert asked.small_m_decode and asked.fuse_norm_rope_effective and asked.cache_write_fused and asked._norm_rope is None and asked._cache_write is None
+    assert at(129, 1, fuse_cache_write=True).fuse_norm_rope_effective and at(32, 4, fuse_cache_write=False).fuse_norm_rope_effective is False
+    with pytest.raises(NotImplementedError, match="fuse_cache_write=True with fuse_norm_rope_small_m=False"):
+        at(32, 4, fuse_cache_write=True, fuse_norm_rope_small_m=False)
     assert at(129, 1, fuse_norm_rope_small_m=False).fuse_norm_rope_effective, "False lowers at decode row counts only; past the bound the fork stays"
     unfused = _make_block(12, 4, 4, fuse_norm_rope=False)[0]
     assert not unfused.fuse_norm_rope and not unfused.fuse_norm_rope_effective and unfused._norm_rope is not None
@@ -1119,6 +1131,14 @@ def test_the_fused_fork_control_arm_matches_the_oracle_at_decode_row_counts(s_q)
     dflt.check_against_oracle(b, what="the lowered chain (default)")
     assert torch.equal(a[~ctl.live], b[~dflt.live]) and (a[~ctl.live] == 0).all()
     assert _cos(a[ctl.live], b[dflt.live]) > 0.9999
+    # the explicit write-through request (fuse_cache_write=True under AUTO) runs the same fork: the same stage list, BITWISE the control arm
+    asked = _case(("asked", 12, s_q), 12, s_q, _LENS, blk_kw=dict(fuse_cache_write=True))
+    assert asked.blk.fuse_norm_rope_small_m is None and asked.blk.fuse_norm_rope_effective and asked.blk.cache_write_fused
+    assert [st.name for st in asked.blk._stages] == [st.name for st in ctl.blk._stages]
+    c = asked.run().clone()
+    asked.check_against_oracle(c, what="the fused fork (the explicit write-through request)")
+    assert torch.equal(c, a), "the explicit request and the control arm run the same kernels: bitwise"
+    assert torch.equal(_bits(asked.k_cache), _bits(ctl.k_cache)) and torch.equal(_bits(asked.v_cache), _bits(ctl.v_cache))
 
 
 @requires_rubin

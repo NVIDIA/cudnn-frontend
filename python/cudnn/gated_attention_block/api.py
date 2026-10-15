@@ -6265,7 +6265,8 @@ class GatedAttentionBlockFwd(APIBase):
     the pipeline is ``(1)+(2)+(3) -> (4w) -> (4) [+ combine] -> (5) -> (6)``, five launches with ``fuse_norm_rope`` -- past decode row
     counts: at ``B x S_q <= 128`` (``kernels.proj_gemm.SMALL_M_MAX``) the declaration LOWERS stage (1) to the unfused chain, ``(1) -> (2)+(3)
     -> (4w) -> (4) [+ combine] -> (5) -> (6)`` (the small-M route's slab GEMM, the norm + RoPE pass, the separate cache write: the measured
-    faster step; ``fuse_norm_rope_effective`` reads it back, ``fuse_norm_rope_small_m=True`` keeps the fused fork for the A/B).
+    faster step; ``fuse_norm_rope_effective`` reads it back, ``fuse_norm_rope_small_m=True`` keeps the fused fork for the A/B, as does an
+    explicit ``fuse_cache_write=True`` -- the write-through arm lives in the fork and the request outranks the lowering).
     ``fuse_gate`` then rides the split COMBINE on the decode tile (``gate_fused``; the tile has no gate seams, the combine
     multiplies the merged fp32 value by ``sigmoid(G)`` before the single cast) and is its own launch on an unsplit tile.
     The pools' and the table's strides are the same declaration samples as the EXTEND form's (a row-sliced table at any row
@@ -6472,7 +6473,9 @@ class GatedAttentionBlockFwd(APIBase):
         # projection's epilogue wherever that arm serves (fuse_norm_rope=True, bf16 / f16 activations, no indexer band -- both serving forms as
         # declared today: EXTEND 4 -> 3 stages with fuse_gate, DECODE 5 -> 4), the separate cache-write launch everywhere else; False = the
         # separate launch always (the A/B control and the fallback); True = the fused arm, a typed decline on a form it cannot serve.  A
-        # performance-only knob: the pools hold the SAME bytes either way (the pool row is the slab row, bitwise).
+        # performance-only knob: the pools hold the SAME bytes either way (the pool row is the slab row, bitwise).  At decode row counts
+        # an explicit True is the REQUEST that keeps the fused fork the AUTO lowering (fuse_norm_rope_small_m=None) would otherwise replace
+        # (user request > heuristic proposal); only the explicit contradiction fuse_norm_rope_small_m=False + fuse_cache_write=True declines.
         fuse_cache_write: Optional[bool] = None,
         # APPENDED (serving, the e4m3 KV cache): the POOLS' dtype.  None = the activation dtype (the pools as before).  torch.float8_e4m3fn =
         # the serving stacks' fp8 KV cache: the write-through quantizes the post-RoPE K / V into e4m3 codes under per-tensor fp32 DEscales
@@ -6509,7 +6512,8 @@ class GatedAttentionBlockFwd(APIBase):
         # fuse_norm_rope=True.  None = AUTO = False: stage (1) is LOWERED to the unfused chain there -- the small-M route's slab GEMM, the
         # norm + RoPE pass, the separate cache write (seven launches with the split combine) -- because the 256-wide fused fork pads one
         # token tile and streams its weight at a fraction of the machine (the measured "route + unfused" step is the faster one at B 1 ..
-        # 32); True = the fused fork as declared (the former behaviour; the A/B's control arm).  `fuse_norm_rope` stays what was declared,
+        # 32), unless an explicit fuse_cache_write=True asks for the fork's write-through arm (the request outranks the lowering);
+        # True = the fused fork as declared (the former behaviour; the A/B's control arm).  `fuse_norm_rope` stays what was declared,
         # `fuse_norm_rope_effective` reads back what runs (`cache_write_fused` follows it: the write-through arm lives in the fork).  Refused
         # (typed) with fuse_norm_rope=False and off the dense DECODE form.  Module docstring, "The DECODE form".
         fuse_norm_rope_small_m: Optional[bool] = None,
@@ -6774,8 +6778,11 @@ class GatedAttentionBlockFwd(APIBase):
         # kernels), so the fewer launches lose; the unfused chain is what the route measured as the faster decode step.  The lowering is a
         # declaration fact (`fuse_norm_rope_effective`), decided here from the dense DECODE form's facts -- the dense paged route
         # (`decode_route`), bf16 / f16 (no quant), no indexer band, 16-bit pools, T = B x S_q within the small-M route's bound -- and kept
-        # OFF by `fuse_norm_rope_small_m=True` (the fused fork as declared: the A/B's control arm).  The EXTEND form, the packed form and
-        # the quantized pipelines are untouched (`fuse_norm_rope` runs as declared there).
+        # OFF by `fuse_norm_rope_small_m=True` (the fused fork as declared: the A/B's control arm) and by an explicit `fuse_cache_write=True`
+        # (the RAW argument, read before its own validator runs below: the write-through arm lives in the fork, so the request outranks the
+        # lowering -- user request > heuristic proposal; the contradiction `fuse_norm_rope_small_m=False` + `fuse_cache_write=True` is that
+        # validator's typed decline).  The EXTEND form, the packed form and the quantized pipelines are untouched (`fuse_norm_rope` runs as
+        # declared there).
         if fuse_norm_rope_small_m is not None and not isinstance(fuse_norm_rope_small_m, bool):
             raise TypeError(f"fuse_norm_rope_small_m must be None (auto), True or False, got {type(fuse_norm_rope_small_m).__name__}")
         self.fuse_norm_rope_small_m: Optional[bool] = fuse_norm_rope_small_m
@@ -6788,13 +6795,14 @@ class GatedAttentionBlockFwd(APIBase):
         from .kernels.proj_gemm import SMALL_M_MAX
 
         self.small_m_decode = self.decode_route is not None and self.batch * self.seq_len <= SMALL_M_MAX
+        lowering_applies = (
+            self.small_m_decode and quant is None and not geometry.index_band and not self.kv_cache_e4m3 and self.dtype in (torch.bfloat16, torch.float16)
+        )
+        # the knob's three readings where the lowering applies: None = AUTO, the lowering -- unless an explicit fuse_cache_write=True asks for
+        # the fork's write-through arm (the request outranks the proposal); True = the fork as declared; False = the lowering by name (with
+        # fuse_cache_write=True the contradiction the write-through validator declines below)
         self.fuse_norm_rope_effective = self.fuse_norm_rope and not (
-            self.small_m_decode
-            and self.fuse_norm_rope_small_m is not True
-            and quant is None
-            and not geometry.index_band
-            and not self.kv_cache_e4m3
-            and self.dtype in (torch.bfloat16, torch.float16)
+            lowering_applies and (self.fuse_norm_rope_small_m is False or (self.fuse_norm_rope_small_m is None and fuse_cache_write is not True))
         )
         # The BLOCK-SPARSE decode / extend-with-prefix mode (a QsaSpec geometry over the pools; the packed form met the table's
         # `sparse` row above): stage (4) is the sparse core reading the pools, and the LIST FORM is a declaration fact derived from
@@ -7324,10 +7332,13 @@ class GatedAttentionBlockFwd(APIBase):
                     "unfused chain norms the slab in place after the GEMM and keeps the separate cache-write launch"
                 )
             if not self.fuse_norm_rope_effective:
+                # reachable through fuse_norm_rope_small_m=False only: under AUTO the explicit request keeps the fork (the effective flag reads
+                # the raw argument), so the one way to ask for the arm AND for the chain it does not live in is to spell both
                 raise NotImplementedError(
-                    "fuse_cache_write=True at decode row counts: fuse_norm_rope=True lowers stage (1) to the unfused chain there (T = B x S_q within the "
-                    "small-M route's bound; fuse_norm_rope_small_m=None), which keeps the separate cache-write launch -- declare fuse_norm_rope_small_m=True "
-                    "to run the fused projection and its write-through arm, or fuse_cache_write=None / False"
+                    "fuse_cache_write=True with fuse_norm_rope_small_m=False: the write-through arm lives in the fused norm + RoPE projection's epilogue, "
+                    "and fuse_norm_rope_small_m=False lowers stage (1) to the unfused chain at decode row counts (T = B x S_q within the small-M route's "
+                    "bound), which keeps the separate cache-write launch -- declare fuse_norm_rope_small_m=None (the request keeps the fork) or True, or "
+                    "fuse_cache_write=None / False"
                 )
             if self.geom.index_band:
                 raise NotImplementedError(
