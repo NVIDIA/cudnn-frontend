@@ -280,6 +280,7 @@ class SparseAttentionBackward(APIBase):
             head_dim,
             num_heads,
             self.deterministic,
+            backend=self._backend,
         )
 
     def execute(

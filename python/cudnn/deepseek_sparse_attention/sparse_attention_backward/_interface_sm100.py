@@ -13,7 +13,7 @@ from cudnn.deepseek_sparse_attention.utils.runtime import device_capability as _
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 from cudnn.frost.buffers import memset_zero_async
 from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
-from .dsa_bwd_sm100_deterministic import FlashAttentionDSABackwardSm100Deterministic
+from .dsa_bwd_sm100_deterministic import FlashAttentionDSABackwardSm100Deterministic, deterministic_kernel_class
 
 torch2cute_dtype_map = {
     torch.float16: cutlass.Float16,
@@ -45,8 +45,14 @@ def _workspace_shapes_sm100(
     head_dim: int,
     num_heads: int,
     deterministic: bool,
+    backend: Optional[str] = None,
 ) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
-    """Return byte-shaped LSE/OdO and dKV scratch layouts for one launch."""
+    """Return byte-shaped LSE/OdO and dKV scratch layouts for one launch.
+
+    Generic deterministic M64 launches use the adaptive shard specialization.
+    An unspecified backend remains conservative because the deterministic
+    H128 two-CTA kernels retain their fixed 128-plane public workspace.
+    """
     acc_dtype = cutlass.Float32
     workspace_lse_odo_shape = FlashAttentionDSABackwardSm100._get_workspace_size_LSE_OdO(
         total_s_q,
@@ -55,7 +61,10 @@ def _workspace_shapes_sm100(
         1,
         acc_dtype,
     )
-    dkv_kernel_cls = FlashAttentionDSABackwardSm100Deterministic if deterministic else FlashAttentionDSABackwardSm100
+    if deterministic:
+        dkv_kernel_cls = deterministic_kernel_class(total_s_q) if backend == "generic_m64" else FlashAttentionDSABackwardSm100Deterministic
+    else:
+        dkv_kernel_cls = FlashAttentionDSABackwardSm100
     workspace_dkv_shape = dkv_kernel_cls._get_workspace_size_dKV(
         total_s_kv,
         head_dim,
@@ -71,14 +80,17 @@ def flash_attn_bwd_sm100_workspace_size(
     head_dim: int,
     num_heads: int,
     deterministic: bool = False,
+    *,
+    backend: Optional[str] = None,
 ) -> int:
-    """Return the reusable caller scratch required by the SM100 launch."""
+    """Return reusable caller scratch, conservatively if the backend is unknown."""
     workspace_lse_odo_shape, workspace_dkv_shape = _workspace_shapes_sm100(
         total_s_q,
         total_s_kv,
         head_dim,
         num_heads,
         deterministic,
+        backend,
     )
     return _align_workspace_bytes(math.prod(workspace_lse_odo_shape)) + _align_workspace_bytes(math.prod(workspace_dkv_shape))
 
@@ -172,7 +184,7 @@ def _select_sm100_backend(
     return "generic_m64", 64
 
 
-def _get_sm100_kernel_class(backend: str, deterministic: bool = False):
+def _get_sm100_kernel_class(backend: str, deterministic: bool = False, total_s_q: Optional[int] = None):
     """Load the selected implementation without perturbing other variants.
 
     Each variant lives in its own CuTe DSL class: embedding variant
@@ -200,7 +212,9 @@ def _get_sm100_kernel_class(backend: str, deterministic: bool = False):
 
         return FlashAttentionDSABackwardSm100H96
     if deterministic:
-        return FlashAttentionDSABackwardSm100Deterministic
+        if total_s_q is None:
+            raise ValueError("deterministic SM100 kernel selection requires total_s_q")
+        return deterministic_kernel_class(total_s_q)
     return FlashAttentionDSABackwardSm100
 
 
@@ -350,7 +364,8 @@ def flash_attn_bwd_sm100(
             workspace=workspace,
             deterministic=deterministic,
         )
-    kernel_cls = _get_sm100_kernel_class(backend, deterministic)
+    kernel_cls = _get_sm100_kernel_class(backend, deterministic, total_S_q)
+    deterministic_shards = kernel_cls.num_dkv_shards if deterministic else 0
     uses_h128_two_cta = backend == "h128_2cta_m64"
     batch_size = 1
 
@@ -362,6 +377,7 @@ def flash_attn_bwd_sm100(
         head_dim,
         num_head,
         deterministic,
+        backend,
     )
     workspace_LSE_OdO, workspace_dKV = _carve_workspace_sm100(
         workspace,
@@ -387,10 +403,10 @@ def flash_attn_bwd_sm100(
     dtype = torch2cute_dtype_map[q.dtype]
 
     has_topk_length = topk_length is not None
-    # ``backend`` and ``deterministic`` together select the kernel class, so
-    # both belong in the key.  The tail stays ``(max_topk, has_topk_length)``
-    # for the dispatch tests that inspect it.
-    compile_key = (backend, deterministic, dtype, head_dim, head_dim_v, num_head, block_tile, max_topk, has_topk_length)
+    # Backend, deterministic mode, and the finite shard specialization select
+    # the kernel class. The tail stays ``(max_topk, has_topk_length)`` for the
+    # dispatch tests that inspect it.
+    compile_key = (backend, deterministic, dtype, head_dim, head_dim_v, num_head, block_tile, deterministic_shards, max_topk, has_topk_length)
 
     if compile_key not in flash_attn_bwd_sm100.compile_cache:
         q_tensor = to_cute_tensor(q, divisibility=head_dim)

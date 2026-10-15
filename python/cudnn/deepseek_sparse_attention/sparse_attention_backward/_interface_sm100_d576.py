@@ -20,12 +20,12 @@ BACKEND = "h128_d576_2cta_m64"
 
 def _workspace_sizes(total_s_q: int, total_s_kv: int, deterministic: bool = False) -> tuple[int, int]:
     """Byte sizes of the FP32 LSE/OdO and dKV planes, shared with the generic kernel."""
-    return tuple(math.prod(shape) for shape in _workspace_shapes_sm100(total_s_q, total_s_kv, 576, 128, deterministic))
+    return tuple(math.prod(shape) for shape in _workspace_shapes_sm100(total_s_q, total_s_kv, 576, 128, deterministic, BACKEND))
 
 
 def _workspace_bytes(total_s_q: int, total_s_kv: int, deterministic: bool = False) -> int:
     """Caller scratch bytes for this shape; identical to the generic SM100 formula."""
-    return flash_attn_bwd_sm100_workspace_size(total_s_q, total_s_kv, 576, 128, deterministic)
+    return flash_attn_bwd_sm100_workspace_size(total_s_q, total_s_kv, 576, 128, deterministic, backend=BACKEND)
 
 
 def _split_count(total_s_q: int, max_topk: int, sm_count: int) -> int:

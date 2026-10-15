@@ -511,6 +511,10 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
         from cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
         from cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_deterministic import (
             FlashAttentionDSABackwardSm100Deterministic,
+            FlashAttentionDSABackwardSm100Deterministic32,
+            FlashAttentionDSABackwardSm100Deterministic64,
+            deterministic_dkv_shards,
+            deterministic_kernel_class,
         )
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
@@ -520,6 +524,23 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
     assert FlashAttentionDSABackwardSm100Deterministic.q_wave_ctas == FlashAttentionDSABackwardSm100Deterministic.num_dkv_shards
     assert FlashAttentionDSABackwardSm100Deterministic.dkv_fold_group_size == 8
     assert FlashAttentionDSABackwardSm100Deterministic.serialize_head_blocks
+    assert deterministic_dkv_shards(1) == 32
+    assert deterministic_dkv_shards(128) == 32
+    assert deterministic_dkv_shards(129) == 64
+    assert deterministic_dkv_shards(256) == 64
+    assert deterministic_dkv_shards(257) == 128
+    assert deterministic_dkv_shards(1024) == 128
+    assert deterministic_kernel_class(128) is FlashAttentionDSABackwardSm100Deterministic32
+    assert deterministic_kernel_class(256) is FlashAttentionDSABackwardSm100Deterministic64
+    assert deterministic_kernel_class(257) is FlashAttentionDSABackwardSm100Deterministic
+    assert not FlashAttentionDSABackwardSm100Deterministic32.run_dkv_prefold
+    assert FlashAttentionDSABackwardSm100Deterministic32.num_dkv_fold_groups == 4
+    assert FlashAttentionDSABackwardSm100Deterministic32.num_dkv_final_terms == 32
+    assert FlashAttentionDSABackwardSm100Deterministic64.run_dkv_prefold
+    assert FlashAttentionDSABackwardSm100Deterministic64.num_dkv_fold_groups == 8
+    assert FlashAttentionDSABackwardSm100Deterministic64.num_dkv_final_terms == 8
+    with pytest.raises(ValueError, match="at least one query row"):
+        deterministic_dkv_shards(0)
     assert FlashAttentionDSABackwardSm100.q_wave_ctas == 0
     assert not FlashAttentionDSABackwardSm100.serialize_head_blocks
 
@@ -540,8 +561,25 @@ def test_DSA_sparse_attention_backward_sm100_d576_workspace_uses_compact_rows(nu
     expected = lse_odo_bytes + padded_s_kv * head_dim * torch.float32.itemsize
     assert flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads) == expected
 
-    deterministic_dkv_bytes = 128 * padded_s_kv * head_dim * torch.float32.itemsize
-    assert flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True) == lse_odo_bytes + deterministic_dkv_bytes
+    deterministic_dkv_bytes = 32 * padded_s_kv * head_dim * torch.float32.itemsize
+    assert flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True, backend="generic_m64") == lse_odo_bytes + deterministic_dkv_bytes
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm100_deterministic_workspace_respects_backend():
+    """Adaptive M64 scratch must not undersize either deterministic H128 two-CTA route."""
+    try:
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100 import flash_attn_bwd_sm100_workspace_size
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    s_q, s_kv, num_heads = 7, 1025, 128
+    for head_dim, backend in ((512, "h128_2cta_m64"), (576, "h128_d576_2cta_m64")):
+        fixed = flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True)
+        two_cta = flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True, backend=backend)
+        adaptive = flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True, backend="generic_m64")
+        assert two_cta == fixed
+        assert adaptive < fixed
 
 
 def _exercise_deterministic_sm100_case(num_heads, head_dim, s_q, s_kv, repeats, check_short_workspace=False):
@@ -571,7 +609,7 @@ def _exercise_deterministic_sm100_case(num_heads, head_dim, s_q, s_kv, repeats, 
         softmax_scale=softmax_scale,
     )
     dout = torch.randn_like(out)
-    workspace_bytes = flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True)
+    workspace_bytes = flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True, backend="generic_m64")
     api = DSA.SparseAttentionBackward(
         sample_q=q,
         sample_kv=kv,
@@ -588,7 +626,9 @@ def _exercise_deterministic_sm100_case(num_heads, head_dim, s_q, s_kv, repeats, 
     api.compile()
     assert api.scratch_workspace_bytes() == workspace_bytes
     expected_lse_odo_bytes = num_heads * math.ceil(s_q / 8) * 8 * 2 * torch.float32.itemsize
-    expected_dkv_bytes = 128 * math.ceil(s_kv / 8) * 8 * math.ceil(head_dim / 8) * 8 * torch.float32.itemsize
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_deterministic import deterministic_dkv_shards
+
+    expected_dkv_bytes = deterministic_dkv_shards(s_q) * math.ceil(s_kv / 8) * 8 * math.ceil(head_dim / 8) * 8 * torch.float32.itemsize
     assert workspace_bytes == expected_lse_odo_bytes + expected_dkv_bytes
     workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=device)
     dq, dkv, d_sink = torch.empty_like(q), torch.empty_like(kv), torch.empty_like(attn_sink)
@@ -678,6 +718,17 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_bounded_waves(num_hea
     """Masked and multi-block heads must be bitwise reproducible."""
     try:
         _exercise_deterministic_sm100_case(num_heads, head_dim, 257, 256, repeats)
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=420)
+@pytest.mark.parametrize("s_q", [128, 129], ids=["shards32", "shards64"])
+def test_DSA_sparse_attention_backward_sm100_deterministic_adaptive_shards_repeat100(s_q):
+    """Every adaptive specialization remains bitwise stable across reuse."""
+    try:
+        _exercise_deterministic_sm100_case(64, 512, s_q, 130, repeats=100)
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
