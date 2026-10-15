@@ -35,6 +35,15 @@ def sm100_bwd_auto_bucketed_k2q_size_blocks(num_q_blocks: int) -> int | None:
     return None
 
 
+def _cp_async_copy_or_zero_fill(atom: cute.CopyAtom, src: cute.Tensor, dst: cute.Tensor, valid: Boolean):
+    # A predicated CopyG2SOp copy lowers to `cp.async ... cp-size, src-size` with src-size = valid ? cp-size : 0,
+    # so an invalid element is zero-filled by the cp.async itself. A plain smem store (`.fill(0.0)`) is not covered
+    # by PipelineCpAsync.producer_commit (cp.async.mbarrier.arrive), which tracks only this thread's cp.async ops.
+    pred = cute.make_rmem_tensor(cute.make_layout(1), Boolean)
+    pred[0] = valid
+    cute.copy(atom, src, dst, pred=pred)
+
+
 class BlockSparseAttnBackwardSm100Blk64:
     def __init__(
         self,
@@ -1148,7 +1157,9 @@ class BlockSparseAttnBackwardSm100Blk64:
 
         q_block_idx_0 = bucketed_k2q_indices[k2q_begin + iter_index, (blk_coord_h, blk_coord_b)]
         iter_index += 1
-        q_block_idx_1 = seqlen_q // self.sparse_block_size  # out of box, tma can fill zeros automatically
+        # Pad an odd-length Q list with the first block past seqlen_q (ceil, not floor: with a Q tail, floor is the
+        # real partial last block): TMA zero-fills its Q / dO, cp.async zero-fills its LSE / sum_OdO.
+        q_block_idx_1 = (seqlen_q + self.sparse_block_size - 1) // self.sparse_block_size
         if iter_index < total_iter_count:
             q_block_idx_1 = bucketed_k2q_indices[k2q_begin + iter_index, (blk_coord_h, blk_coord_b)]
         q_block_0_full = (q_block_idx_0 + 1) * self.sparse_block_size <= seqlen_q
@@ -1210,8 +1221,8 @@ class BlockSparseAttnBackwardSm100Blk64:
                         load_compute_LSE_producer_state.index,
                     ],
                 )
-            elif cute.elem_less(LSE_idx + i, seqlen_q):
-                cute.copy(
+            else:
+                _cp_async_copy_or_zero_fill(
                     atom_async_copy,
                     LSE_for_copy[None, LSE_idx + i, (blk_coord_h, blk_coord_b)],
                     sLSE_for_copy[
@@ -1219,32 +1230,21 @@ class BlockSparseAttnBackwardSm100Blk64:
                         thread_idx * async_copy_num_elts + i,
                         load_compute_LSE_producer_state.index,
                     ],
+                    cute.elem_less(LSE_idx + i, seqlen_q),
                 )
-            else:
-                sLSE_for_copy[
-                    None,
-                    thread_idx * async_copy_num_elts + i,
-                    load_compute_LSE_producer_state.index,
-                ].fill(0.0)
 
         for i in cutlass.range_constexpr(async_copy_num_elts):
             LSE_idx = q_block_idx_1 * self.sparse_block_size + thread_idx * async_copy_num_elts
-            if cute.elem_less(LSE_idx + i, seqlen_q):
-                cute.copy(
-                    atom_async_copy,
-                    LSE_for_copy[None, LSE_idx + i, (blk_coord_h, blk_coord_b)],
-                    sLSE_for_copy[
-                        None,
-                        self.sparse_block_size + thread_idx * async_copy_num_elts + i,
-                        load_compute_LSE_producer_state.index,
-                    ],
-                )
-            else:
+            _cp_async_copy_or_zero_fill(
+                atom_async_copy,
+                LSE_for_copy[None, LSE_idx + i, (blk_coord_h, blk_coord_b)],
                 sLSE_for_copy[
                     None,
                     self.sparse_block_size + thread_idx * async_copy_num_elts + i,
                     load_compute_LSE_producer_state.index,
-                ].fill(0.0)
+                ],
+                cute.elem_less(LSE_idx + i, seqlen_q),
+            )
 
         load_compute_LSE_pipeline.producer_commit(load_compute_LSE_producer_state)
         load_compute_LSE_producer_state.advance()
@@ -1295,8 +1295,8 @@ class BlockSparseAttnBackwardSm100Blk64:
                         load_compute_sum_OdO_producer_state.index,
                     ],
                 )
-            elif cute.elem_less(sum_OdO_idx + i, seqlen_q):
-                cute.copy(
+            else:
+                _cp_async_copy_or_zero_fill(
                     atom_async_copy,
                     sum_OdO_for_copy[None, sum_OdO_idx + i, (blk_coord_h, blk_coord_b)],
                     sSum_OdO_for_copy[
@@ -1304,31 +1304,20 @@ class BlockSparseAttnBackwardSm100Blk64:
                         thread_idx * async_copy_num_elts + i,
                         load_compute_sum_OdO_producer_state.index,
                     ],
+                    cute.elem_less(sum_OdO_idx + i, seqlen_q),
                 )
-            else:
-                sSum_OdO_for_copy[
-                    None,
-                    thread_idx * async_copy_num_elts + i,
-                    load_compute_sum_OdO_producer_state.index,
-                ].fill(0.0)
         for i in cutlass.range_constexpr(async_copy_num_elts):
             sum_OdO_idx = q_block_idx_1 * self.sparse_block_size + thread_idx * async_copy_num_elts
-            if cute.elem_less(sum_OdO_idx + i, seqlen_q):
-                cute.copy(
-                    atom_async_copy,
-                    sum_OdO_for_copy[None, sum_OdO_idx + i, (blk_coord_h, blk_coord_b)],
-                    sSum_OdO_for_copy[
-                        None,
-                        self.sparse_block_size + thread_idx * async_copy_num_elts + i,
-                        load_compute_sum_OdO_producer_state.index,
-                    ],
-                )
-            else:
+            _cp_async_copy_or_zero_fill(
+                atom_async_copy,
+                sum_OdO_for_copy[None, sum_OdO_idx + i, (blk_coord_h, blk_coord_b)],
                 sSum_OdO_for_copy[
                     None,
                     self.sparse_block_size + thread_idx * async_copy_num_elts + i,
                     load_compute_sum_OdO_producer_state.index,
-                ].fill(0.0)
+                ],
+                cute.elem_less(sum_OdO_idx + i, seqlen_q),
+            )
 
         load_compute_sum_OdO_pipeline.producer_commit(load_compute_sum_OdO_producer_state)
         load_compute_sum_OdO_producer_state.advance()
@@ -1362,7 +1351,9 @@ class BlockSparseAttnBackwardSm100Blk64:
 
             q_block_idx_0 = bucketed_k2q_indices[k2q_begin + iter_index, (blk_coord_h, blk_coord_b)]
             iter_index += 1
-            q_block_idx_1 = seqlen_q // self.sparse_block_size  # out of box, tma can fill zeros automatically
+            # Pad an odd-length Q list with the first block past seqlen_q (ceil, not floor: with a Q tail, floor is the
+            # real partial last block): TMA zero-fills its Q / dO, cp.async zero-fills its LSE / sum_OdO.
+            q_block_idx_1 = (seqlen_q + self.sparse_block_size - 1) // self.sparse_block_size
             if iter_index < total_iter_count:
                 q_block_idx_1 = bucketed_k2q_indices[k2q_begin + iter_index, (blk_coord_h, blk_coord_b)]
             q_block_0_full = (q_block_idx_0 + 1) * self.sparse_block_size <= seqlen_q
@@ -1403,8 +1394,8 @@ class BlockSparseAttnBackwardSm100Blk64:
                             load_compute_LSE_producer_state.index,
                         ],
                     )
-                elif cute.elem_less(LSE_idx + i, seqlen_q):
-                    cute.copy(
+                else:
+                    _cp_async_copy_or_zero_fill(
                         atom_async_copy,
                         LSE_for_copy[None, LSE_idx + i, (blk_coord_h, blk_coord_b)],
                         sLSE_for_copy[
@@ -1412,32 +1403,21 @@ class BlockSparseAttnBackwardSm100Blk64:
                             thread_idx * async_copy_num_elts + i,
                             load_compute_LSE_producer_state.index,
                         ],
+                        cute.elem_less(LSE_idx + i, seqlen_q),
                     )
-                else:
-                    sLSE_for_copy[
-                        None,
-                        thread_idx * async_copy_num_elts + i,
-                        load_compute_LSE_producer_state.index,
-                    ].fill(0.0)
 
             for i in cutlass.range_constexpr(async_copy_num_elts):
                 LSE_idx = q_block_idx_1 * self.sparse_block_size + thread_idx * async_copy_num_elts
-                if cute.elem_less(LSE_idx + i, seqlen_q):
-                    cute.copy(
-                        atom_async_copy,
-                        LSE_for_copy[None, LSE_idx + i, (blk_coord_h, blk_coord_b)],
-                        sLSE_for_copy[
-                            None,
-                            self.sparse_block_size + thread_idx * async_copy_num_elts + i,
-                            load_compute_LSE_producer_state.index,
-                        ],
-                    )
-                else:
+                _cp_async_copy_or_zero_fill(
+                    atom_async_copy,
+                    LSE_for_copy[None, LSE_idx + i, (blk_coord_h, blk_coord_b)],
                     sLSE_for_copy[
                         None,
                         self.sparse_block_size + thread_idx * async_copy_num_elts + i,
                         load_compute_LSE_producer_state.index,
-                    ].fill(0.0)
+                    ],
+                    cute.elem_less(LSE_idx + i, seqlen_q),
+                )
 
             load_compute_LSE_pipeline.producer_commit(load_compute_LSE_producer_state)
             load_compute_LSE_producer_state.advance()
@@ -1480,8 +1460,8 @@ class BlockSparseAttnBackwardSm100Blk64:
                             load_compute_sum_OdO_producer_state.index,
                         ],
                     )
-                elif cute.elem_less(sum_OdO_idx + i, seqlen_q):
-                    cute.copy(
+                else:
+                    _cp_async_copy_or_zero_fill(
                         atom_async_copy,
                         sum_OdO_for_copy[None, sum_OdO_idx + i, (blk_coord_h, blk_coord_b)],
                         sSum_OdO_for_copy[
@@ -1489,31 +1469,20 @@ class BlockSparseAttnBackwardSm100Blk64:
                             thread_idx * async_copy_num_elts + i,
                             load_compute_sum_OdO_producer_state.index,
                         ],
+                        cute.elem_less(sum_OdO_idx + i, seqlen_q),
                     )
-                else:
-                    sSum_OdO_for_copy[
-                        None,
-                        thread_idx * async_copy_num_elts + i,
-                        load_compute_sum_OdO_producer_state.index,
-                    ].fill(0.0)
             for i in cutlass.range_constexpr(async_copy_num_elts):
                 sum_OdO_idx = q_block_idx_1 * self.sparse_block_size + thread_idx * async_copy_num_elts
-                if cute.elem_less(sum_OdO_idx + i, seqlen_q):
-                    cute.copy(
-                        atom_async_copy,
-                        sum_OdO_for_copy[None, sum_OdO_idx + i, (blk_coord_h, blk_coord_b)],
-                        sSum_OdO_for_copy[
-                            None,
-                            self.sparse_block_size + thread_idx * async_copy_num_elts + i,
-                            load_compute_sum_OdO_producer_state.index,
-                        ],
-                    )
-                else:
+                _cp_async_copy_or_zero_fill(
+                    atom_async_copy,
+                    sum_OdO_for_copy[None, sum_OdO_idx + i, (blk_coord_h, blk_coord_b)],
                     sSum_OdO_for_copy[
                         None,
                         self.sparse_block_size + thread_idx * async_copy_num_elts + i,
                         load_compute_sum_OdO_producer_state.index,
-                    ].fill(0.0)
+                    ],
+                    cute.elem_less(sum_OdO_idx + i, seqlen_q),
+                )
 
             load_compute_sum_OdO_pipeline.producer_commit(load_compute_sum_OdO_producer_state)
             load_compute_sum_OdO_producer_state.advance()
@@ -2022,7 +1991,8 @@ class BlockSparseAttnBackwardSm100Blk64:
 
             q_block_idx_0 = bucketed_k2q_indices[k2q_begin + iter_index, (blk_coord_h, blk_coord_b)]
             iter_index += 1
-            q_block_idx_1 = Q // self.sparse_block_size
+            # Same pad block as load(): past the dQ accumulator's rows, so its TMA reduce is dropped.
+            q_block_idx_1 = (Q + self.sparse_block_size - 1) // self.sparse_block_size
             if iter_index < total_iter_count:
                 q_block_idx_1 = bucketed_k2q_indices[k2q_begin + iter_index, (blk_coord_h, blk_coord_b)]
 
