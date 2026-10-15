@@ -66,6 +66,13 @@ class FrostNormBwdEngine(BaseEngine):
         facts = analyze_for(graph)
         if facts is None:
             return "graph is not a single norm node this engine serves"
+        if facts.scale_t is None:
+            # layernorm_backward / rmsnorm_backward take an OPTIONAL scale upstream
+            # (#188); without it the node has no DScale or DBias either. These
+            # kernels read gamma per channel rather than assuming ones, and
+            # synthesising a gamma here would allocate inside execute (Rule 1), so
+            # the graph goes to an engine that serves it natively.
+            return "backward without a scale input is not served"
         if not facts.uniform_dtype:
             # These kernels read scale/bias/DY at the I/O dtype; a mixed-precision
             # graph would be read wrong rather than merely be slow.

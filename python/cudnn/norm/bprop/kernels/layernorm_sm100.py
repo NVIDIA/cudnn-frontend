@@ -402,17 +402,31 @@ def _ln_bwd_pipe_kernel(
             row = row + stride
         # flush register partials -> [ctas, C] (compute warps only)
         pbase = cutlass.Int64(bid) * C
-        # 128-bit stores rather than one STG.32 per element: the [ctas, C] partials are
+        # Wide stores rather than one STG.32 per element: the [ctas, C] partials are
         # fp32 and C is large, so this flush is a real fraction of the kernel.
-        NSEG: cutlass.Constexpr = V // 4
+        #
+        # SEG is the widest store V divides by, NOT a fixed 4. ``_bwd_pipe_cfg``
+        # hands back V=2 for fp32 at small C, and a hard-coded ``V // 4`` made NSEG
+        # zero there -- the loop body never ran, so the partials were never written
+        # and the finalize summed whatever the allocator last left in them. dgamma
+        # and dbeta came back as garbage for C=64 fp32 while dx stayed correct,
+        # which is exactly the shape that hides: the gradient that IS checked by
+        # most tests was fine.
+        SEG: cutlass.Constexpr = 4 if V % 4 == 0 else (2 if V % 2 == 0 else 1)
+        NSEG: cutlass.Constexpr = V // SEG
         for it in cutlass.range_constexpr(ldgs):
             col0 = (it * tpr + tid) * V
             for h in cutlass.range_constexpr(NSEG):
-                gseg = cutlass.Vector.from_elements(tuple(dgp[it * V + h * 4 + j] for j in range(4)), cutlass.Float32)
-                nvvm.store_ext(gseg, mDGp.iterator + (pbase + col0 + h * 4))
-                if cutlass.const_expr(has_beta):
-                    bseg = cutlass.Vector.from_elements(tuple(dbp[it * V + h * 4 + j] for j in range(4)), cutlass.Float32)
-                    nvvm.store_ext(bseg, mDBp.iterator + (pbase + col0 + h * 4))
+                if cutlass.const_expr(SEG == 1):
+                    mDGp[pbase + col0 + h] = dgp[it * V + h]
+                    if cutlass.const_expr(has_beta):
+                        mDBp[pbase + col0 + h] = dbp[it * V + h]
+                else:
+                    gseg = cutlass.Vector.from_elements(tuple(dgp[it * V + h * SEG + j] for j in range(SEG)), cutlass.Float32)
+                    nvvm.store_ext(gseg, mDGp.iterator + (pbase + col0 + h * SEG))
+                    if cutlass.const_expr(has_beta):
+                        bseg = cutlass.Vector.from_elements(tuple(dbp[it * V + h * SEG + j] for j in range(SEG)), cutlass.Float32)
+                        nvvm.store_ext(bseg, mDBp.iterator + (pbase + col0 + h * SEG))
 
 
 _ln_bwd_pipe_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -767,7 +781,12 @@ def _pipe_bwd_eligible(C, wn, ldgs, V, R, has_beta, eb):
     # allocates -- a fixed STAGES=3 bound would wrongly reject non-cached large C
     # (llama31 C=16384 actually runs at 2 = 160KB, but 3 = 229KB > cap).
     STAGES = _pipe_bwd_actual_stages(_bwd_cache_xd(ldgs, V, R, C, has_beta, wn, eb))
-    return wn >= 1 and _pipe_bwd_smem(C, wn, STAGES, eb) <= smem_capacity()
+    # V == 1 cannot be compiled by this kernel at all: it stages through
+    # ``load_ext``, whose count must be one of {2, 4, 8} (PTX .v2/.v4/.v8), so a
+    # one-wide vector raises at trace time rather than running slowly. C=32 and
+    # C=96 fp32 land there. The plain route below has no such constraint and is
+    # correct for them, so decline instead of failing the compile.
+    return wn >= 1 and V >= 2 and _pipe_bwd_smem(C, wn, STAGES, eb) <= smem_capacity()
 
 
 def _pipe_bwd_cap(R, wn, C, cache_xd, eb):
@@ -927,7 +946,7 @@ def scratch_bytes(spec, params, shape=None, has_beta=False, knobs=None):
     if wcfg is None:
         return ws_bytes((R, 4))  # plain route: only the RMS mean placeholder
     _tpr, wn, ldgs, V = wcfg
-    if wn == 1 and not spec.has_mean and (R % 2 == 0) and not has_beta:
+    if wn == 1 and V >= 2 and not spec.has_mean and (R % 2 == 0) and not has_beta:
         RPT = 1
         for r in (8, 4, 2):
             if R % r == 0 and 2 * 2 * r * C * eb <= smem_capacity():
@@ -947,8 +966,10 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params, out_d
     import torch
 
     wcfg = _bwd_pipe_cfg(spec.M, DTYPE_BYTES[params.io_dtype])
-    if wcfg is not None and wcfg[1] == 1 and not spec.has_mean and (spec.R % 2 == 0) and not has_beta:
+    if wcfg is not None and wcfg[1] == 1 and wcfg[3] >= 2 and not spec.has_mean and (spec.R % 2 == 0) and not has_beta:
         # tiny C (single warp per row) RMS: multi-row tiling beats the per-row pipeline.
+        # V >= 2 because this route stages through ``load_ext`` too, whose count must
+        # be one of {2, 4, 8}; C=32 and C=96 fp32 give V=1 and would fail the compile.
         # Only without beta -- this path returns dgamma alone, and selecting it for a
         # bias-carrying RMSNorm silently dropped dbeta to None (the caller then saw an
         # unwritten gradient, not an error). RMSNorm with bias is legal in cuDNN.

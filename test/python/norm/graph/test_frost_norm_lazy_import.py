@@ -38,7 +38,7 @@ _COLD = [
     ("the subpackage", "import cudnn.norm.fprop"),
     (
         "constructing the engine objects",
-        "import cudnn.norm.fprop.engine as e; e.FrostNormFwdEngines({'norm_fprop_sm100': 20900})",
+        "import cudnn.norm.fprop.engine as e; e.FrostNormFwdEngines({'norm_fprop_sm100': 21000})",
     ),
 ]
 

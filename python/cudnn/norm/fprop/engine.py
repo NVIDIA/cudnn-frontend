@@ -66,6 +66,14 @@ class FrostNormFwdEngine(BaseEngine):
         facts = analyze_for(graph)
         if facts is None:
             return "graph is not a single norm node this engine serves"
+        if facts.scale_t is None:
+            # A norm with no affine at all is legal upstream: the normalization axes
+            # come from the MEAN / INV_VARIANCE dims instead of from scale's. These
+            # kernels take the axes FROM scale and read gamma per channel, so there is
+            # nothing to infer them from here and nothing to read -- and synthesising
+            # a unit gamma would allocate inside execute (Rule 1). Let an engine that
+            # serves it natively have the graph.
+            return "a norm without a scale input is not served"
         if not facts.uniform_dtype:
             # These kernels read scale/bias/DY at the I/O dtype; a mixed-precision
             # graph would be read wrong rather than merely be slow.
