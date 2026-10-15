@@ -360,11 +360,27 @@ def _ln_bwd_pipe_kernel(
                     c1 = cutlass.Float32(0.0)
                     for j in cutlass.range_constexpr(wn):
                         c1 = c1 + red[wn + j]
+                # Fence the READS before the next row writes ``red`` again. The
+                # barrier above orders the writes against the reads WITHIN a row and
+                # does nothing for the row after it. The non-cached path happens to be
+                # covered by the barrier it takes before freeing the staging buffer;
+                # the cached path frees that buffer immediately and then touches only
+                # registers, so nothing stood between this row's reads and the next
+                # row's writes (racecheck: WAR on __shared__ 0xe404, 21024 errors).
+                nvvm.barrier_cta_sync(1, thread_count=tpr)
             # With caching, pass2 reads registers (not smem), so the buffer is free
             # right after pass1 -> signal empty now so the DMA warp prefetches the next
             # row *during* pass2 (freeing after pass2 would kill the overlap large N
-            # depends on). The wn>1 cross-warp barrier above already fenced pass1 reads.
+            # depends on). The barrier just above fenced this row's reduction reads.
             if cutlass.const_expr(cache_xd):
+                # Fence BEFORE releasing the buffer. ``mbarrier_arrive`` does not order
+                # the shared loads pass1 just issued, and only thread 0 arrives -- so
+                # without this the DMA warp can start refilling the stage while this
+                # warp's loads are still outstanding. wn==1 is not exempt: one warp is
+                # issue-synchronous but its loads are not COMPLETE, which is what
+                # racecheck caught (WAR on __shared__ 0x410, compute warp reading while
+                # the DMA warp wrote, 2.3M errors at C=512 fp32).
+                nvvm.barrier_cta_sync(1, thread_count=tpr)
                 if tid == 0:
                     nvvm.mbarrier_arrive(mbar.iterator + (STAGES + s))
             a = c1 * rn if cutlass.const_expr(has_mean) else cutlass.Float32(0.0)
@@ -389,13 +405,13 @@ def _ln_bwd_pipe_kernel(
                         dxhat = dy * g
                     ys.append((rstd * (dxhat - a - xhat * b)).to(et))
                 nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty), mDXi.iterator + (base + col0))
-            # Non-cached pass2 RE-READS smem, so all compute warps must finish before the
-            # buffer is freed. wn==1 is a single warp (SIMT-synchronous) and needs no
-            # barrier; wn>1 does (else the DMA reloads the buffer mid-read -> garbage dx).
-            # (Cached path already freed the buffer after pass1.)
+            # Non-cached pass2 RE-READS smem, so every compute warp must finish before
+            # the buffer is freed -- else the DMA reloads it mid-read and dx is garbage.
+            # This barrier is NOT conditional on wn>1: a single warp is issue-synchronous
+            # but its loads still have to complete, and thread 0 arriving says nothing
+            # about the other 31. (Cached path freed the buffer after pass1.)
             if cutlass.const_expr(not cache_xd):
-                if cutlass.const_expr(wn > 1):
-                    nvvm.barrier_cta_sync(1, thread_count=tpr)
+                nvvm.barrier_cta_sync(1, thread_count=tpr)
                 if tid == 0:
                     nvvm.mbarrier_arrive(mbar.iterator + (STAGES + s))
             i = i + 1

@@ -286,6 +286,12 @@ def _in_bwd_warp_host(
 _KCACHE = {}
 
 
+def _gcd(a, b):
+    while b:
+        a, b = b, a % b
+    return a
+
+
 def _vec_for(M, eb):
     v = 16 // eb
     while v > 1 and M % v != 0:
@@ -312,10 +318,8 @@ def scratch_bytes(spec, params, shape=None, has_beta=False, knobs=None):
     allocation the workspace exists to remove.
     """
     GPS, R, WPB = int(spec.groups_per_sample), int(spec.R), _WPB
-    W = max(GPS, (max(1, min(4 * _nsm() * WPB, R)) // GPS) * GPS)
-    W = ((W + WPB - 1) // WPB) * WPB
-    if W % GPS:
-        W = ((((W + GPS - 1) // GPS) * GPS + WPB - 1) // WPB) * WPB
+    step = GPS * WPB // _gcd(GPS, WPB)  # same LCM step as backward(); see there
+    W = max(step, (max(1, min(4 * _nsm() * WPB, R)) // step) * step)
     return ws_bytes((W, 4), (W, 4))
 
 
@@ -334,15 +338,17 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params, out_d
     KREG = min(_MAX_KREG, (NV + 31) // 32)
     WPB = _WPB
 
-    # Total warps must be a multiple of gps so each warp's channel is fixed.
+    # Total warps must be a multiple of gps so each warp's channel is FIXED across
+    # the grid stride, and a multiple of WPB so it is a whole number of CTAs. One
+    # multiple at a time does not hold both: rounding up to gps and then up to WPB
+    # breaks the gps divisibility again, which silently remapped channels on every
+    # row past the first wave -- gps=5 at 68 SMs gave W=2184 (2184 % 5 == 4), and
+    # dx was off by 8.1 with dgamma off by 179. Step by the LCM instead, so a
+    # single rounding satisfies both.
+    step = GPS * WPB // _gcd(GPS, WPB)
     want = max(1, min(4 * _nsm() * WPB, R))
-    W = max(GPS, (want // GPS) * GPS)
-    ctas = (W + WPB - 1) // WPB
-    W = ctas * WPB
-    if W % GPS:
-        W = ((W + GPS - 1) // GPS) * GPS
-        ctas = (W + WPB - 1) // WPB
-        W = ctas * WPB
+    W = max(step, (want // step) * step)
+    ctas = W // WPB
 
     dx = torch.empty_like(x2d) if out_dx is None else out_dx
     dgamma = torch.empty(spec.gamma_len, dtype=torch.float32, device=x2d.device) if out_dgamma is None else out_dgamma

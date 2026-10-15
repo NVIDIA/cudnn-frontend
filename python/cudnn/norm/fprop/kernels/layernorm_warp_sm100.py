@@ -300,7 +300,11 @@ def _warp_fwd_pipe_kernel(
     sB = smem.allocate_tensor(it_ty, cute.make_layout(C), byte_alignment=16) if cutlass.const_expr(has_beta) else None
     red = None
     if cutlass.const_expr(wn > 1):
-        red = smem.allocate_tensor(cutlass.Float32, cute.make_layout(wn * (2 if has_mean else 1)), byte_alignment=8)
+        # DOUBLE-buffered: row i uses half (i % 2). The alternative is a barrier
+        # after the reads to stop the next row overwriting them, and that barrier
+        # measured -9% on RMS 8192x1024. This costs wn*8 more bytes of a buffer
+        # that is tens of bytes to begin with.
+        red = smem.allocate_tensor(cutlass.Float32, cute.make_layout(2 * wn * (2 if has_mean else 1)), byte_alignment=8)
     npb: cutlass.Constexpr = 2 if has_beta else 1
     mbar = smem.allocate_tensor(cutlass.Int64, cute.make_layout(2 * STAGES + npb), byte_alignment=8)
     GBAR: cutlass.Constexpr = 2 * STAGES
@@ -348,6 +352,7 @@ def _warp_fwd_pipe_kernel(
                 pass
             boff = s * C
 
+            rb = (i % 2) * (wn * (2 if has_mean else 1))  # this row's half of ``red``
             xs = [cutlass.Float32(0.0)] * (ldgs * V)
             s2 = cutlass.Float32(0.0)
             if cutlass.const_expr(has_mean):
@@ -367,11 +372,11 @@ def _warp_fwd_pipe_kernel(
                 s1 = _row_reduce1(s1, True, 32, 5)
                 if cutlass.const_expr(wn > 1):
                     if lane == 0:
-                        red[wn + warp] = s1
+                        red[rb + wn + warp] = s1
                     nvvm.barrier_cta_sync(1, thread_count=tpr)  # compute warps only (excl. DMA)
                     s1 = cutlass.Float32(0.0)
                     for j in cutlass.range_constexpr(wn):
-                        s1 = s1 + red[wn + j]
+                        s1 = s1 + red[rb + wn + j]
                 # Centered second pass over the registers we already hold -- see the
                 # note in the non-pipelined kernel above. E[x^2]-E[x]^2 loses the
                 # variance of offset data entirely; xs stays un-centered for pass 2.
@@ -383,11 +388,11 @@ def _warp_fwd_pipe_kernel(
             s2 = _row_reduce1(s2, True, 32, 5)
             if cutlass.const_expr(wn > 1):
                 if lane == 0:
-                    red[warp] = s2
+                    red[rb + warp] = s2
                 nvvm.barrier_cta_sync(1, thread_count=tpr)
                 s2 = cutlass.Float32(0.0)
                 for j in cutlass.range_constexpr(wn):
-                    s2 = s2 + red[j]
+                    s2 = s2 + red[rb + j]
 
             rstd = cute.math.rsqrt(s2 * rn + eps)
             if cutlass.const_expr(has_mean):
@@ -529,7 +534,7 @@ def _smem_max():
 
 
 def _pipe_smem(C, has_beta, wn, STAGES, eb):
-    return STAGES * C * eb + (2 if has_beta else 1) * C * eb + wn * 8 + (2 * STAGES + (2 if has_beta else 1)) * 8 + 64
+    return STAGES * C * eb + (2 if has_beta else 1) * C * eb + wn * 16 + (2 * STAGES + (2 if has_beta else 1)) * 8 + 64  # red is double-buffered
 
 
 def _warp_smem(C, has_beta, wn, rpc, has_mean, eb):
