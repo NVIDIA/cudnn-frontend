@@ -88,7 +88,8 @@ _LAYOUTS = SERVING_POOL_LAYOUTS
 # that tile packs the group (a group dividing its 128 rows: 16, 8, 4), else -- 12 = 24 / 2 and 6 = 24 / 4 -- the decode tile's
 # token-unit arm (up to two units) and its UNPACKED arm (one head per CTA) past that.  "token_units": the adapter's own route
 # verbatim (the 32-column tile in up to two units, then the unpacked arm).  Past S_q 8 NOTHING under either policy: the DECODE form's
-# declared envelope ends there (and at 128 packed rows), a longer dense step is the EXTEND form's packed business.
+# declared envelope ends there (and at 128 packed rows), a longer dense step is the EXTEND form's packed business.  Every group
+# carries S_q 1 .. 5 (the oracle matrix indexes the table there), 8 and 9.
 _P, _T = PREFILL_TILE, DECODE_TILE
 _ROUTE_TABLES = {
     DECODE_ROUTE_SINGLE_UNIT: {
@@ -123,12 +124,21 @@ _ROUTE_TABLES = {
             1: (_T, 16, 1, True),
             2: (_T, 16, 1, True),
             3: (_T, 32, 1, True),
+            4: (_T, 32, 1, True),
             5: (_T, 32, 1, True),
             6: (_T, 32, 2, True),
             8: (_T, 32, 2, True),
             9: (None, 0, 0, False),
         },
-        4: {1: (_T, 16, 1, True), 4: (_T, 16, 1, True), 5: (_T, 32, 1, True), 8: (_T, 32, 1, True), 9: (None, 0, 0, False)},
+        4: {
+            1: (_T, 16, 1, True),
+            2: (_T, 16, 1, True),
+            3: (_T, 16, 1, True),
+            4: (_T, 16, 1, True),
+            5: (_T, 32, 1, True),
+            8: (_T, 32, 1, True),
+            9: (None, 0, 0, False),
+        },
     },
     DECODE_ROUTE_TOKEN_UNITS: {
         16: {
@@ -162,12 +172,21 @@ _ROUTE_TABLES = {
             1: (_T, 16, 1, True),
             2: (_T, 16, 1, True),
             3: (_T, 32, 1, True),
+            4: (_T, 32, 1, True),
             5: (_T, 32, 1, True),
             6: (_T, 32, 2, True),
             8: (_T, 32, 2, True),
             9: (None, 0, 0, False),
         },
-        4: {1: (_T, 16, 1, True), 4: (_T, 16, 1, True), 5: (_T, 32, 1, True), 8: (_T, 32, 1, True), 9: (None, 0, 0, False)},
+        4: {
+            1: (_T, 16, 1, True),
+            2: (_T, 16, 1, True),
+            3: (_T, 16, 1, True),
+            4: (_T, 16, 1, True),
+            5: (_T, 32, 1, True),
+            8: (_T, 32, 1, True),
+            9: (None, 0, 0, False),
+        },
     },
 }
 _ROUTE_TABLE = _ROUTE_TABLES[DECODE_ROUTE_SINGLE_UNIT]
