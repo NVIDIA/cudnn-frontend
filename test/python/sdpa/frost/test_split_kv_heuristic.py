@@ -625,12 +625,91 @@ def test_decode_tile_short_kv_does_not_split():
 
 @pytest.mark.parametrize("q_tile", [16, 32, 64])
 @pytest.mark.parametrize("units", [2, 16, 64, 128])
-def test_decode_tile_longer_kv_never_splits_less(units, q_tile):
-    """On tile-aligned KV lengths the choice is monotone in the length and a
-    power of two (split_kv is a kernel-module cache key)."""
-    got = [_decode_tile(units, 128 << i, q_tile=q_tile) for i in range(12)]
+@pytest.mark.parametrize("grid", [None, (1, 24, 1), (4, 24, 4)], ids=["lean", "grid_b1", "grid_b4_sq4"])
+def test_decode_tile_longer_kv_never_splits_less(units, q_tile, grid):
+    """On tile-aligned KV lengths the choice is monotone in the length and a member of the
+    decode ladder (the powers of two plus the wave-filling 3 / 5 / 6 / 7: split_kv is a
+    kernel-module cache key, so the ladder is a closed list), under the lean and the
+    decode-grid combine forms alike."""
+    from cudnn.sdpa.fwd.heuristics import decode_tile_split_candidates
+
+    got = [_decode_tile(units, 128 << i, q_tile=q_tile, combine_grid=grid) for i in range(12)]
     assert all(a <= b for a, b in zip(got, got[1:])), got
-    assert all(s & (s - 1) == 0 for s in got), got
+    for i, s in enumerate(got):
+        assert s in decode_tile_split_candidates(sm_count=B200_SMS, kv_tiles=1 << i), (i, s, got)
+
+
+def test_decode_tile_ladder_fills_the_machine_and_reaches_one_tile_per_cta():
+    """The decode tile's own candidate list: the powers of two up to the device's (the shared
+    ladder) PLUS the splits that fill a wave of SMs that no power of two fills -- 3 / 5 / 6 / 7
+    -- and, unlike the prefill ladder, down to ONE KV tile per CTA (the tile handles any
+    chunking, empty ranges included; a batch-1 step on a 4K cache measured its optimum at
+    32 splits x 1 tile).  Bounded by the tile count, ascending, starting at 1."""
+    from cudnn.sdpa.fwd.heuristics import _DECODE_TILE_ODD_SPLITS, decode_tile_split_candidates
+
+    assert _DECODE_TILE_ODD_SPLITS == (3, 5, 6, 7)
+    assert decode_tile_split_candidates(sm_count=212, kv_tiles=256) == [1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64, 128, 256]
+    assert decode_tile_split_candidates(sm_count=148, kv_tiles=32) == [1, 2, 3, 4, 5, 6, 7, 8, 16, 32]
+    assert decode_tile_split_candidates(sm_count=212, kv_tiles=4) == [1, 2, 3, 4]
+    assert decode_tile_split_candidates(sm_count=212, kv_tiles=1) == [1]
+    assert decode_tile_split_candidates(sm_count=0, kv_tiles=32) == [1] and decode_tile_split_candidates(sm_count=212, kv_tiles=0) == [1]
+    for sm in (148, 152, 204, 212):
+        lad = decode_tile_split_candidates(sm_count=sm, kv_tiles=1 << 12)
+        assert lad == sorted(set(lad)) and lad[0] == 1 and lad[-1] == 256, (sm, lad)
+        assert set(split_kv_candidates(sm_count=sm, kv_tiles=1 << 12)) <= set(lad)
+
+
+def test_decode_tile_wave_term_takes_the_one_wave_split_on_the_mtp_step():
+    """The wave term.  A CTA streams its KV range serially, so a launch of more CTAs than SMs
+    pays its tail wave in full: 256 CTAs on 212 SMs is two waves' worth of time, not 1.2.  The
+    model charges every full wave at the HBM-saturated rate and the tail wave at its own stream
+    count, and offers the splits that fill ONE wave (3 / 5 / 6 / 7 beside the powers of two).
+
+    Measured on the Rubin performance class (212 SMs), the S_q 4 MTP step of the 24/2 geometry
+    at B 32 x kv 32K on the 64-column tile (64 units x 256 tiles) at forced splits: split 3
+    (192 CTAs, one wave) streams in 166.3 us -- the attention term 170.4 -- where the former
+    pick, split 4 (256 CTAs, a full wave plus a 44-CTA tail), takes 245.8 and split 2 219.2,
+    6 181.2, 8 207.6.  So the model picks 3 at 212 and 204 SMs; on a 148 / 152-SM part 192
+    CTAs is itself a tail wave and the one-wave pick is 2 (128 CTAs).  A non-power-of-two
+    split is taken only when it beats the best power of two by more than
+    _DECODE_TILE_ODD_SPLIT_MARGIN (the fits' own scatter; it mints another specialization):
+    the Blackwell 16-unit serving shape keeps 8 over 5, which the model prices 1 % apart.
+    Many waves of SHORT CTAs are worse than the stream term alone says (the fixed cost
+    of a CTA scales with its rows: at B 128 x kv 4K the 64-column tile ran 111.5 / 115.6 /
+    147.6 us at splits 2 / 4 / 8, 16 / 8 / 4 tiles per CTA), so the per-CTA cost is one tile
+    per 16 rows: 1 / 2 / 4 on the 16- / 32- / 64-column tiles -- and that cell stays at the
+    measured floor (unsplit for an eager caller, 2 for a replaying one)."""
+    import cudnn.sdpa.fwd.heuristics as heur
+
+    mtp = dict(units=64, s_kv=32768, q_tile=64, combine_grid=(32, 24, 4))  # 768 lean blocks: the lean combine
+    assert _decode_tile(sm_count=212, **mtp) == 3 and _decode_tile(sm_count=212, launch_cost=0.0, **mtp) == 3
+    assert _decode_tile(sm_count=204, **mtp) == 3 and _decode_tile(sm_count=204, launch_cost=0.0, **mtp) == 3
+    assert _decode_tile(sm_count=152, **mtp) == 2 and _decode_tile(sm_count=148, **mtp) == 2
+    # the costs the pick rests on, at 212 SMs: one wave of 3 beats the two-wave 4 by more than the margin
+    kw = dict(units=64, kv_tiles=256, sm_count=212, tile_cost=1.65, launch_cost=0.0, grid=(32, 24, 4), q_tile=64)
+    c = {s: heur._decode_tile_cost(s, **kw) for s in (2, 3, 4, 6, 8)}
+    assert c[3] < c[6] < c[8] < c[2] < c[4], c
+    assert c[3] < (1 - heur._DECODE_TILE_ODD_SPLIT_MARGIN) * min(c[2], c[4], c[8])
+    # the per-width CTA cost and the deep-split cell it governs: B 128 x kv 4K x S_q 4 (256 units of the 64-column tile)
+    assert [heur._decode_tile_cta_cost_for(w) for w in (16, 32, 64)] == [1.0, 2.0, 4.0]
+    big = dict(units=256, s_kv=4096, q_tile=64, combine_grid=(128, 24, 4))
+    assert _decode_tile(sm_count=212, **big) == 1 and _decode_tile(sm_count=212, launch_cost=0.0, **big) == 2
+    # the margin: the Blackwell 16-unit shape stays on 8 (5 is cheaper by ~1 %, inside the margin); the margin is small
+    assert 0.0 < heur._DECODE_TILE_ODD_SPLIT_MARGIN <= 0.1
+    assert _decode_tile(16, 4096) == 8
+    assert heur._decode_tile_cost(5, units=16, kv_tiles=32, sm_count=B200_SMS, tile_cost=1.0, launch_cost=17.0, q_tile=16) < heur._decode_tile_cost(
+        8, units=16, kv_tiles=32, sm_count=B200_SMS, tile_cost=1.0, launch_cost=17.0, q_tile=16
+    )
+    # the B 1 and B 4 serving cells with the decode-grid combine (the picks the measured optima name), at 212 / 204 / 152 SMs
+    for sm in (212, 204, 152):
+        assert _decode_tile(2, 4096, sm_count=sm, combine_grid=(1, 24, 1)) == 32, sm  # 32 x 1 tile: measured 10.5 us against 11.5 at 16
+        assert _decode_tile(2, 32768, sm_count=sm, combine_grid=(1, 24, 1)) == 64, sm
+        assert _decode_tile(2, 131072, sm_count=sm, combine_grid=(1, 24, 1)) == 64, sm  # 128 = 256 CTAs: the two-wave trap (measured 36.5 vs 30.6 us)
+        assert _decode_tile(8, 131072, sm_count=sm, combine_grid=(4, 24, 1)) == 16, sm  # 32 = 256 CTAs likewise (107.4 vs 94.1 us)
+        for kv, want in ((4096, 32), (32768, 64), (131072, 64)):
+            assert _decode_tile(2, kv, sm_count=sm, launch_cost=0.0, combine_grid=(1, 24, 1)) == want, (sm, kv)
+    # the lean form keeps the lean picks (the ladder's new 32 at kv 4K does not pay for a lean combine of 32 partials)
+    assert _decode_tile(2, 4096, sm_count=212) == 16
 
 
 def test_decode_tile_batch_one_prices_every_partial_of_the_combine(monkeypatch):

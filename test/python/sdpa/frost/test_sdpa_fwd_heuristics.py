@@ -1592,7 +1592,12 @@ def test_rubin_decode_tile_packs_the_whole_group_and_takes_the_decode_split_mode
     small = sets(b=8)
     assert small[0].pack_gqa is True and small[0].split_kv == 8 and any(k.split_kv == 1 for k in small[1:]), small
     assert sets(b=3)[0].split_kv == 16
-    assert all(k.split_kv == 1 for k in sets(b=128))
+    # b = 128: 256 units on 204 SMs are a wave and a quarter -- the eager lead stays unsplit (the second launch costs more
+    # than the tail wave it would halve), the replaying caller's runner-up splits once (the wave term: measured on the
+    # Rubin performance class at B 128 x kv 4K on the 64-column tile, split 2 ran the tile 11 % faster than unsplit).
+    saturated = sets(b=128)
+    assert saturated[0].split_kv == 1 and [k.split_kv for k in saturated if k.split_kv > 1] == [2], saturated
+    assert sets(b=128, cuda_graph_replay=True)[0].split_kv == 2
     # The 24/2 geometry: the whole group, dense or paged.
     q24 = facts(h_q=24, b=3, s_kv=1000)
     assert _pack_gqa_eligible(row, q24, 128) and _pack_gqa_group(row, q24, 128, True) == 12
