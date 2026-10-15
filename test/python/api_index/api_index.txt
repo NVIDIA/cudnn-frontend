@@ -391,6 +391,7 @@ cudnn.gated_attention_block.DECODE_MAX_ROWS
 cudnn.gated_attention_block.DECODE_MAX_S_Q
 cudnn.gated_attention_block.DecodeEnvelope
 cudnn.gated_attention_block.DecodeEnvelope.inference_only
+cudnn.gated_attention_block.DecodeEnvelope.kv_cache_dtypes
 cudnn.gated_attention_block.DecodeEnvelope.route
 cudnn.gated_attention_block.DecodeEnvelope.sparse_core
 cudnn.gated_attention_block.DecodeEnvelope.writes_lse
