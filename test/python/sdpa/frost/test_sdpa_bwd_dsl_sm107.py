@@ -3688,8 +3688,21 @@ _SASS_PROBE = textwrap.dedent(r"""
         return sum(1 for ln in sass if all(sb in ln for sb in subs))
     # The main kernel's section only: a THD build's cubin also carries the one-shot setup kernel (descriptor patching, whose
     # GENERIC->TENSORMAP release fence lowers to MEMBAR.ALL.GPU + CGAERRBAR), which the per-tile drain pin must not read.
-    main_end = next((i for i, ln in enumerate(sass) if ".text." in ln and "setup_kernel" in ln), len(sass))
-    main_sass = sass[:main_end]
+    # Select by section symbol rather than assuming main precedes setup in the disassembly.
+    sections = [(i, ln) for i, ln in enumerate(sass) if re.match(r"^\s*\.section\s+", ln)]
+    sections.append((len(sass), ""))
+    main_sass = []
+    setup_lines = 0
+    for (start, header), (stop, _) in zip(sections, sections[1:]):
+        section = re.match(r"^\s*\.section\s+\.text\.([^,\s]+)", header)
+        if section is None:
+            continue
+        symbol = section.group(1)
+        if "setup_kernel" in symbol:
+            setup_lines += stop - start
+        elif "cudnn_kernel__kernel_" in symbol:
+            main_sass.extend(sass[start:stop])
+    assert main_sass, "No main kernel .text section found in the disassembly"
     def cnt_main(*subs):
         return sum(1 for ln in main_sass if all(sb in ln for sb in subs))
     print("SASS USETMAXREG", cnt_main("USETMAXREG"))
@@ -3697,7 +3710,7 @@ _SASS_PROBE = textwrap.dedent(r"""
     print("SASS LDL", cnt_main("LDL"))
     print("SASS MEMBAR_GPU", cnt_main("MEMBAR.ALL.GPU"))
     print("SASS CGAERRBAR", cnt_main("CGAERRBAR"))
-    print("SASS SETUP_KERNEL_LINES", len(sass) - main_end)
+    print("SASS SETUP_KERNEL_LINES", setup_lines)
     print("SASS SYNCS_PHASECHK", sum(1 for ln in sass if "SYNCS.PHASECHK" in ln and "USYNCS.PHASECHK" not in ln))
     print("SASS USYNCS_PHASECHK", cnt("USYNCS.PHASECHK"))
     print("SASS NANOSLEEP", cnt("NANOSLEEP"))
