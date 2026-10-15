@@ -1050,13 +1050,16 @@ def test_small_m_route_names_a_swap_ab_tile_for_decode_row_counts(m, n, k, expec
     assert cfg.cta_tile_n >= min(m, 128) or not cfg.swap_ab  # the token tile covers the step
 
 
-def test_small_m_route_leaves_prefill_rows_on_the_forced_tile():
-    """Past SMALL_M_MAX nothing changes: the 256-wide forced tile is the prefill / training plan it always was."""
+def test_small_m_route_leaves_prefill_rows_on_the_forced_tile(monkeypatch):
+    """Past SMALL_M_MAX nothing changes: the 256-wide forced tile is the prefill / training plan it always was (on the route's
+    own compiler family; an ``sm120`` process keeps the forced tile at every row count -- its own cell below)."""
     n, k = _FLASH_NEXT_24_2["n_qkvg"], _FLASH_NEXT_24_2["d_model"]
     assert small_m_tile_config(SMALL_M_MAX + 1, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS) is None
     assert small_m_tile_config(8192, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS) is None
+    from cudnn.gemm.frost import arch_family
     from cudnn.gated_attention_block.kernels.proj_gemm import _auto_tile_name
 
+    monkeypatch.setattr(arch_family, "active_family", lambda: "sm100")
     assert _auto_tile_name(8192, n, k, dtype=torch.bfloat16, a_major="k", b_major="k", block_scale=False, alpha=False) == _FORCED_TILE_NAME
     assert _auto_tile_name(1, n, k, dtype=torch.bfloat16, a_major="k", b_major="k", block_scale=False, alpha=False) != _FORCED_TILE_NAME
 
