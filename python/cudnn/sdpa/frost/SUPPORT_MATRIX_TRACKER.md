@@ -630,10 +630,16 @@ sink entries fold the per-head logit once -- `M = max(max_s lse_s, sink)`, `den 
 exp(sink − M)`, `LSE = M + log(den)`, keyless rows O := 0 / LSE := sink, the unsplit kernels' contract --
 on dense and paged graphs, the d128 decode tile's ragged-Q legʳᵠ and the d256 decode tileᵈ; the native dense
 binder hands the fp32 [H] logits to the combine, so a sink decode graph is no longer pinned to one cluster
-per (batch, KV head). Validated on B200 (SM100): `test_sdpa_fwd_split_kv_sm100.py::test_split_kv_sink_matches_reference_dense`,
+per (batch, KV head). A PADDED query row (past its batch's `seq_len_q`, the dense padded-Q trim) keeps O := 0 /
+LSE := −inf whatever the sink -- its partials equal a valid keyless row's, so a plan carrying `seq_len_q` also
+hands the combine the int32 Q lengths (`split_combine.compile_ptr(has_q_lens=True)`, the binder's
+`supports_combine_q_lens`) and the lean, serial and decode forms drop the sink for those rows. Validated on B200 (SM100): `test_sdpa_fwd_split_kv_sm100.py::test_split_kv_sink_matches_reference_dense`,
 `test_sdpa_fwd_decode_d128_sm100.py::test_decode_kernel_sink_split_kv` (dense and paged) /
 `test_graph_small_batch_decode_sink_splits_kv`, `test_sdpa_fwd_decode_d256_sm100.py::test_decode_graph_sink_small_batch_splits_and_recombines`
-/ `test_decode_graph_sink_deep_split_keyless_rows`, `test_sdpa_split_combine_sm100.py::test_pointer_combine_folds_the_sink_once`.
+/ `test_decode_graph_sink_deep_split_keyless_rows`, `test_sdpa_split_combine_sm100.py::test_pointer_combine_folds_the_sink_once`;
+the padded rows: `test_pointer_combine_sink_keeps_padded_query_rows_dead` (every combine form),
+`test_decode_kernel_sink_split_kv_keeps_padded_query_rows_dead` (d128 direct / d64 quadrant) and
+`test_split_sink_keeps_padded_query_rows_dead` (graph API: the d256 / d128 / d64 decode tiles and the d256 prefill tile).
 Still unsplit with a sink: the per-tensor FP8 and MXFP8 rows (per-tile epilogue fold), a gated split (its
 combine carries no sink) and the cc 10.7 dense legs (`test_mhas_v2.py::test_sdpa_fwd_cc107_sink_split_declines_L0`;
 the Rubin exception stays the packed D128 half paged THD Q>1 combine ᵖˢ).

@@ -513,9 +513,8 @@ def test_decode_graph_wide_tile_routed_launch(page, sink):
     """A launch past the wide-tile boundary (8 units x 64K keys) lowers its S_q = 4
     step at 8:1 (32 packed rows) onto the 32-column decode tile and matches the
     reference: mixed lengths including a one-key row and a tile-unaligned tail, and
-    (without a sink) per-batch query lengths down to a row with no live query -- the
-    split combine cannot tell a padded row from a keyless one, so with a sink every
-    row is live and the sink logit joins its softmax."""
+    per-batch query lengths down to a row with no live query (with a sink too: the
+    padded rows stay O := 0 / LSE := -inf, the live ones fold the sink logit)."""
     import cudnn.sdpa.fwd.api_dsl as api_dsl
 
     seen = []
@@ -533,12 +532,33 @@ def test_decode_graph_wide_tile_routed_launch(page, sink):
             KH=1,
             s_q=4,
             lens=[65536, 40000, 1, 129, 65000, 777, 33333, 20000],
-            q_lens=None if sink else [4, 3, 4, 2, 4, 1, 4, 0],
+            q_lens=[4, 3, 4, 2, 4, 1, 4, 0],
             page=page,
             causal_br=True,
             sink=sink,
         )
     assert 32 in seen, seen
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "case",
+    [
+        dict(B=8, H=32, KH=2, s_q=1, lens=[4096, 4000, 129, 0, 2048, 4096, 300, 77], q_lens=[1, 0, 1, 1, 1, 1, 1, 1], page=16, sink=0.7),
+        dict(B=4, H=16, KH=2, s_q=2, lens=[4096, 600, 0, 129], q_lens=[2, 1, 0, 2], page=16, causal_br=True, sink=True),
+        dict(B=2, H=32, KH=2, s_q=3, lens=[16384, 9000], q_lens=[3, 1], page=16, causal_br=True, sink=0.7, expect=PREFILL),
+        dict(B=3, H=8, KH=2, s_q=2, lens=[600, 77, 0], q_lens=[2, 1, 0], page=16, sink=0.7, d=128, expect="decode_d128_f16", split_kv=2),
+        dict(B=3, H=8, KH=2, s_q=2, lens=[600, 77, 0], q_lens=[2, 1, 0], page=16, sink=0.7, d=64, expect="decode_d128_f16", split_kv=2),
+    ],
+    ids=["d256_decode_empty_batch", "d256_decode_mtp2_trim", "d256_prefill_tile_trim", "d128_decode_split2", "d64_decode_split2"],
+)
+def test_split_sink_keeps_padded_query_rows_dead(case):
+    """Through the graph API on a SPLIT plan with a sink: a batch entry with no live query (Q length 0) or a row past its batch's Q length
+    keeps O := 0 / LSE := -inf, while a VALID row with no key in range (the empty-cache batch) lands on O := 0 / LSE := sink -- the split
+    partials of the two are the same (every split dead), so the combine takes the per-batch Q lengths.  The d256 and d128 / d64 decode
+    tiles and the d256 prefill tile (S_q x G = 48 rows) all feed it, with an auto-selected or a pinned split."""
+    plan = _run_graph(dtype=torch.bfloat16, **case)
+    assert plan.knobs.split_kv > 1, plan.knobs
 
 
 @pytest.mark.L0

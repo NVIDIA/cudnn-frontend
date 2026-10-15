@@ -357,3 +357,97 @@ def test_pointer_combine_walks_many_splits(sq, splits, d, sink):
     torch.testing.assert_close(lse_out[:, :, 0].cpu(), sinks.cpu().view(1, h).expand(b, h), atol=1e-6, rtol=0)
     assert torch.all(ostorage.float().cpu()[~oused] == -31.0)
     assert torch.all(lstorage.cpu()[~lused] == -31.0)
+
+
+def _sink_partials_with_padding(b, h, sq, d, splits, q_lens, sinks):
+    """Split partials of a sink launch whose batch ``i`` has only ``q_lens[i]`` live query rows: a PADDED row (r >= q_lens[i]) carries every split dead,
+    exactly as the split kernels write it, and so does row 0 of every batch (a valid row with no key in range for q_lens[i] > 0).  Returns the device
+    partials and the float64 reference of the unsplit contract: valid rows fold the sink once (a keyless one lands on O = 0 / LSE = sink), padded rows
+    stay O = 0 / LSE = -inf whatever the sink."""
+    generator = torch.Generator().manual_seed(20261015 + splits)
+    o = torch.randn(splits, b, sq, h, d, generator=generator) * 0.4
+    lse = torch.randn(splits, b, h, sq, generator=generator) * 2.0 + 0.7
+    lse[:, :, :, 0] = -torch.inf
+    if sq > 1:
+        lse[1, :, :, 1] = -torch.inf  # a dead split beside live ones
+    padded = torch.zeros(b, sq, dtype=torch.bool)
+    for i, n in enumerate(q_lens):
+        padded[i, n:] = True
+        lse[:, i, :, n:] = -torch.inf
+    dead = torch.isneginf(lse).permute(0, 1, 3, 2).unsqueeze(-1)
+    o.masked_fill_(dead, torch.nan)  # a dead payload must never enter the arithmetic
+    scores = lse.double()
+    sink_col = sinks.double().cpu().view(1, h, 1).expand(b, h, sq)
+    maximum = torch.maximum(scores.amax(0), sink_col)
+    weights = torch.where(torch.isneginf(scores), torch.zeros_like(scores), (scores - maximum).exp())
+    denominator = weights.sum(0) + (sink_col - maximum).exp()
+    safe_o = o.double().masked_fill(dead, 0)
+    ref_o = (weights.permute(0, 1, 3, 2).unsqueeze(-1) * safe_o).sum(0) / denominator.permute(0, 2, 1).unsqueeze(-1)
+    ref_lse = maximum + denominator.log()
+    pad_o = padded.view(b, sq, 1, 1).expand(b, sq, h, d)
+    pad_lse = padded.view(b, 1, sq).expand(b, h, sq)
+    ref_o = ref_o.masked_fill(pad_o, 0.0)
+    ref_lse = ref_lse.masked_fill(pad_lse, -torch.inf)
+    return o.reshape(splits * b, sq, h, d).cuda(), lse.reshape(splits * b, h, sq).cuda(), ref_o, ref_lse, pad_o, pad_lse
+
+
+@pytest.mark.parametrize(
+    "sq, splits, d, q_lens",
+    [
+        (1, 4, 128, [1, 0, 1]),
+        (1, 12, 128, [0, 1, 1]),
+        (1, 64, 128, [1, 1, 0]),
+        (2, 33, 128, [2, 1, 0]),
+        (5, 4, 128, [5, 2, 0]),
+        (5, 21, 128, [3, 0, 5]),
+        (1, 33, 66, [0, 1, 1]),
+        (5, 21, 66, [2, 5, 0]),
+    ],
+    ids=["lean_narrow", "lean_wide", "decode_64", "decode_33_sq2", "lean_sq5", "serial_21", "decode_d66", "serial_d66"],
+)
+def test_pointer_combine_sink_keeps_padded_query_rows_dead(sq, splits, d, q_lens):
+    """A padded query row (past its batch's Q length: the dense padded-Q trim) and a valid row whose every key is masked reach the combine with the
+    same partials (every split dead).  Folding the sink unconditionally gave both LSE = sink; the sink entry that takes the per-batch Q lengths
+    drops the sink for the padded rows (O := 0 / LSE := -inf) and keeps the unsplit contract for the valid keyless one (O := 0 / LSE := sink) --
+    in the lean, serial and decode forms alike, with the fp32 rows and the element-load rows."""
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
+
+    b, h = 3, 3
+    sinks = torch.tensor([-120.0, 0.7, 4.0], device="cuda")
+    op, lp, ref_o, ref_lse, pad_o, pad_lse = _sink_partials_with_padding(b, h, sq, d, splits, q_lens, sinks)
+    q_lens_t = torch.tensor(q_lens, dtype=torch.int32, device="cuda")
+    o_out = torch.full((b, sq, h, d), -31.0, device="cuda", dtype=torch.bfloat16)
+    lse_out = torch.full((b, h, sq), -31.0, device="cuda", dtype=torch.float32)
+    fn = positional_entry(comb.compile_ptr(dtype_o="bf16", has_lse=True, has_sink=True, has_q_lens=True))
+    assert fn is not None
+    fn(
+        op.data_ptr(),
+        lp.data_ptr(),
+        o_out.data_ptr(),
+        lse_out.data_ptr(),
+        (b, h, sq, d),
+        splits,
+        o_out.stride(),
+        lse_out.stride(),
+        sinks.data_ptr(),
+        q_lens_t.data_ptr(),
+        torch.cuda.current_stream().cuda_stream,
+    )
+    torch.cuda.synchronize()
+    o_cpu, lse_cpu = o_out.cpu().double(), lse_out.cpu().double()
+    torch.testing.assert_close(o_cpu, ref_o, atol=0.004, rtol=0.004)
+    assert torch.all(o_cpu[pad_o] == 0.0), "a padded row must write O := 0"
+    assert torch.all(torch.isneginf(lse_cpu[pad_lse])), "a padded row must write LSE := -inf whatever the sink"
+    torch.testing.assert_close(lse_cpu[~pad_lse], ref_lse[~pad_lse], atol=2e-5, rtol=2e-5)
+    keyless = ~pad_lse & torch.isneginf(lp.view(splits, b, h, sq).cpu().amax(0))
+    assert keyless.any(), "the case needs a valid keyless row"
+    torch.testing.assert_close(lse_cpu[keyless], sinks.cpu().double().view(1, h, 1).expand(b, h, sq)[keyless], atol=1e-6, rtol=0)
+
+
+def test_pointer_combine_q_lens_is_a_dense_sink_specialization():
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
+
+    with pytest.raises(ValueError, match="sink"):
+        comb.compile_ptr(dtype_o="bf16", has_lse=True, has_q_lens=True)
+    with pytest.raises(ValueError, match="dense"):
+        comb.compile_ptr(dtype_o="bf16", has_lse=True, has_sink=True, has_q_lens=True, ragged=True)

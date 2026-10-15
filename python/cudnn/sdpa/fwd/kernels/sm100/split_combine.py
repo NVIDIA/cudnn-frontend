@@ -15,7 +15,10 @@ partials (its epilogue fold is compiled out), and this pass folds the per-head
 sink logit in exactly once: ``M = max(max_s lse_s, sink)``, ``den = sum_s
 exp(lse_s - M) + exp(sink - M)``, ``O = sum_s w_s O_s / den`` (the sink column
 has no V row) and ``LSE = M + log(den)``.  A keyless row (every split dead)
-therefore lands on the unsplit kernels' contract, ``O := 0 / LSE := sink``.
+therefore lands on the unsplit kernels' contract, ``O := 0 / LSE := sink``.  A PADDED query row of
+the dense padded-Q trim (a row at or past its batch's Q length) keeps the unsplit contract too, ``O := 0 / LSE := -inf`` whatever the sink, but its
+partials are the same as a valid keyless row's, so the dense sink entry takes the per-batch Q lengths (``compile_ptr(has_q_lens=True)``) and drops the
+sink for those rows.
 
 One block of four warps per four (q_row, head, batch) rows, a lane owning four
 columns of d_v and walking the split axis; rows shorter than a block (decode,
@@ -226,11 +229,36 @@ def _ld_global_f32(addr):
     return cutlass.Float32(r[0] if isinstance(r, (tuple, list)) else r)
 
 
-def _lean_accumulate(G, lse_base, lse_step, o_row_base, o_step, s_last, n_splits, sinks, head):
+def _row_sink_logit(sinks, q_lens, head, batch, q_row):
+    """The sink logit one row folds: its head's, or -inf (no sink at all) on a PADDED row -- a query row at or past its batch's Q length
+    ``q_lens[batch]`` (the dense padded-Q trim), whose O / Stats stay 0 / -inf whatever the sink.  The partials of such a row and of a valid row whose
+    every key is masked are the same (every split dead), so the reduction cannot tell them apart without the length."""
+    sink_logit = cutlass.Float32(cutlass.make_array_view(sinks)[head])
+    if cutlass.const_expr(q_lens is not None):
+        padded = cutlass.Int32(q_row) >= cutlass.Int32(cutlass.make_array_view(q_lens)[batch])
+        sink_logit = cutlass.Float32(arith.select(padded.ir_value(), cutlass.Float32(NEG_INF).ir_value(), sink_logit.ir_value()))
+    return sink_logit
+
+
+def _fold_sink(m, sink_logit):
+    """(all_dead, m_safe, sink_term) of a row whose partial max is ``m``: the reference max is max(m, sink) -- finite on a keyless row, which lands on
+    O = 0 / LSE = sink, and -inf only where there is neither a live split nor a sink (a padded row), which stays dead.  m_safe only feeds the
+    exponentials, and the sink column's weight is dropped with a select on a row without a sink (exp(-inf - -inf) would be NaN)."""
+    neg_inf = cutlass.Float32(NEG_INF)
+    zero = cutlass.Float32(0.0)
+    m_all = cute.math.max(m, sink_logit)
+    all_dead = m_all == neg_inf
+    m_safe = cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), m_all.ir_value()))
+    sink_term = cutlass.Float32(arith.select((sink_logit > neg_inf).ir_value(), cute.math.exp(sink_logit - m_safe, fastmath=True).ir_value(), zero.ir_value()))
+    return all_dead, m_safe, sink_term
+
+
+def _lean_accumulate(G, lse_base, lse_step, o_row_base, o_step, s_last, n_splits, sink_logit):
     """The lean combine's load + weighted accumulate for ONE lane (columns 4l..4l+3) over the first ``G`` splits, as a trace-time function so the kernel
     can instantiate two group widths and pick one per row: the first group (``G`` = G_LEAN_SMALL) is the cheap one-round-trip form for the common few
     splits; the wide group (``G`` = G_S) keeps one round trip up to G_S splits at the price of the extra clamped loads.  Returns the dead-row flag, the
-    denominator, the four weighted O sums and the (0-substituted) max the LSE is built from."""
+    denominator, the four weighted O sums and the (0-substituted) max the LSE is built from.  ``sink_logit`` is the row's sink logit (:func:`_row_sink_logit`)
+    or None without a sink."""
     neg_inf = cutlass.Float32(NEG_INF)
     zero = cutlass.Float32(0.0)
     # Every load of the row goes out first -- the LSE of the first G splits and their partial-O
@@ -252,13 +280,10 @@ def _lean_accumulate(G, lse_base, lse_step, o_row_base, o_step, s_last, n_splits
     # With a sink the reference max is max(m, sink), which is finite even on a
     # keyless row, and the denominator starts with the sink column's weight
     # exp(sink - M): that row then yields O = 0 and LSE = sink + log(1) = sink,
-    # the unsplit kernels' keyless-row contract.
+    # the unsplit kernels' keyless-row contract (a padded row has no sink: it stays dead).
     sink_term = zero
-    if cutlass.const_expr(sinks is not None):
-        sink_logit = cutlass.Float32(cutlass.make_array_view(sinks)[head])
-        m_safe = cute.math.max(m, sink_logit)
-        all_dead = m_safe == neg_inf
-        sink_term = cute.math.exp(sink_logit - m_safe, fastmath=True)
+    if cutlass.const_expr(sink_logit is not None):
+        all_dead, m_safe, sink_term = _fold_sink(m, sink_logit)
     acc0 = zero
     acc1 = zero
     acc2 = zero
@@ -330,6 +355,9 @@ def _combine_kernel(
     # value before the single cast -- see the module docstring.  None
     # (None-specialized) is the plain reduction; its traced code is unchanged.
     gate: Optional[cute.Tensor] = None,
+    # int32 (B,) per-batch Q lengths of the dense padded-Q trim, present only on the sink entry that carries them: a row at or past its batch's
+    # length folds no sink (see _row_sink_logit).  None (None-specialized) folds the head's sink on every row.
+    q_lens: Optional[cute.Tensor] = None,
     # The wide lean group (G_S up-front splits) is its own specialization: its register footprint (the kernel reaches the 128-register cap and spills)
     # would slow the serial walk this kernel also runs, so only the few-split decode launch asks for it.
     lean_wide: cutlass.Constexpr[bool] = False,
@@ -399,6 +427,9 @@ def _combine_kernel(
             lse_step = cutlass.Int64(lse_partial.stride[0]) * cutlass.Int64(n_batch) * 4
             o_step = cutlass.Int64(o_partial.stride[0]) * cutlass.Int64(n_batch) * 4
             s_last = n_splits - cutlass.Int32(1)
+            sink_row = None
+            if cutlass.const_expr(sinks is not None):
+                sink_row = _row_sink_logit(sinks, q_lens, head, batch, q_row)
             out_base = o_out.iterator.toint()
             st_ok = zero > zero
             if cutlass.const_expr(o_out.element_type in (cutlass.Float16, cutlass.BFloat16)):
@@ -430,15 +461,15 @@ def _combine_kernel(
                     if cutlass.const_expr(lean_wide):
                         if n_splits <= cutlass.Int32(G_LEAN_SMALL):
                             all_dead, den, acc0, acc1, acc2, acc3, m_safe = _lean_accumulate(
-                                G_LEAN_SMALL, lse_base, lse_step, o_row_base, o_step, s_last, n_splits, sinks, head
+                                G_LEAN_SMALL, lse_base, lse_step, o_row_base, o_step, s_last, n_splits, sink_row
                             )
                         else:
                             all_dead, den, acc0, acc1, acc2, acc3, m_safe = _lean_accumulate(
-                                G_S, lse_base, lse_step, o_row_base, o_step, s_last, n_splits, sinks, head
+                                G_S, lse_base, lse_step, o_row_base, o_step, s_last, n_splits, sink_row
                             )
                     else:
                         all_dead, den, acc0, acc1, acc2, acc3, m_safe = _lean_accumulate(
-                            G_LEAN_SMALL, lse_base, lse_step, o_row_base, o_step, s_last, n_splits, sinks, head
+                            G_LEAN_SMALL, lse_base, lse_step, o_row_base, o_step, s_last, n_splits, sink_row
                         )
                     inv_den = cutlass.Float32(1.0) / cute.math.max(den, cutlass.Float32(1e-30))
                     inv_den = cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), inv_den.ir_value()))
@@ -533,15 +564,12 @@ def _combine_kernel(
             # With a sink the reference max is max(m, sink), which is finite even on a
             # keyless row, and the denominator starts with the sink column's weight
             # exp(sink - M): that row then yields O = 0 and LSE = sink + log(1) = sink,
-            # the unsplit kernels' keyless-row contract.
+            # the unsplit kernels' keyless-row contract (a padded row has no sink: it stays dead).
             all_dead = m == cutlass.Float32(NEG_INF)
             m_safe = cutlass.Float32(arith.select(all_dead.ir_value(), cutlass.Float32(0.0).ir_value(), m.ir_value()))
             den = cutlass.Float32(0.0)
             if cutlass.const_expr(sinks is not None):
-                sink_logit = cutlass.Float32(cutlass.make_array_view(sinks)[head])
-                m_safe = cute.math.max(m, sink_logit)
-                all_dead = m_safe == cutlass.Float32(NEG_INF)
-                den = cute.math.exp(sink_logit - m_safe, fastmath=True)
+                all_dead, m_safe, den = _fold_sink(m, _row_sink_logit(sinks, q_lens, head, batch, q_row))
 
             # A dead split (empty KV range) carries lse_s = -inf and must contribute
             # nothing.  Its weight is dropped with a SELECT, not by trusting the
@@ -766,6 +794,8 @@ def _combine_decode_kernel(
     # caller's strides (dense placement only): the serial form's arithmetic, applied by
     # the storing warp to the fp32 merged value.  None (None-specialized) is the plain reduction.
     gate: Optional[cute.Tensor] = None,
+    # The per-batch Q lengths of the sink entry that carries them (see _combine_kernel).
+    q_lens: Optional[cute.Tensor] = None,
 ) -> None:
     """The decode form (S_q < 4): one block of four warps per row set.
 
@@ -862,15 +892,12 @@ def _combine_decode_kernel(
     # With a sink the reference max is max(m, sink), which is finite even on a
     # keyless row, and the denominator starts with the sink column's weight
     # exp(sink - M): that row then yields O = 0 and LSE = sink + log(1) = sink,
-    # the unsplit kernels' keyless-row contract.
+    # the unsplit kernels' keyless-row contract (a padded row has no sink: it stays dead).
     all_dead = m == neg_inf
     m_safe = cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), m.ir_value()))
     sink_term = zero
     if cutlass.const_expr(sinks is not None):
-        sink_logit = cutlass.Float32(cutlass.make_array_view(sinks)[head])
-        m_safe = cute.math.max(m, sink_logit)
-        all_dead = m_safe == neg_inf
-        sink_term = cute.math.exp(sink_logit - m_safe, fastmath=True)
+        all_dead, m_safe, sink_term = _fold_sink(m, _row_sink_logit(sinks, q_lens, head, batch, q_row))
 
     # --- pass 2: den = sum_s exp(lse_s - M) (lane-strided, warp sum, row sum) ---
     # A dead split (empty KV range) carries lse_s = -inf and must contribute
@@ -1213,11 +1240,13 @@ def _launch_combine(
     gate: Optional[cute.Tensor],
     stream: _cuda_driver.CUstream = None,
     sinks: Optional[cute.Tensor] = None,
+    q_lens: Optional[cute.Tensor] = None,
 ) -> None:
     """One launch for every ABI: dense placement (ragged tensors None) or the
     ragged-Q leg's placement at the offsets, bounded by the (O, Stats) packed
-    token capacities; ``gate`` (dense placement only) is the gated entry's G and
-    ``sinks`` (fp32 [H]) folds the attention sink once."""
+    token capacities; ``gate`` (dense placement only) is the gated entry's G,
+    ``sinks`` (fp32 [H]) folds the attention sink once and ``q_lens`` (int32 [B],
+    with a sink, dense placement only) keeps the padded rows of the Q trim dead."""
     B, H, SQ, D = problem_size
     # Lane l reads columns 4l..4l+3 of the compact fp32 partial rows as one
     # 16-byte load when d_v % 4 == 0 and the slab is 16-byte aligned; any other
@@ -1245,6 +1274,7 @@ def _launch_combine(
         cutlass.Int32(ragged_caps[0]),
         cutlass.Int32(ragged_caps[1]),
         gate,
+        q_lens,
     )
     # Two kernels, chosen per launch: decode rows (S_q <= 2, where the block has
     # at least two warps per row) with more splits than the lean form's up-front
@@ -1487,6 +1517,34 @@ def _host_ptr_sink(
 
 
 @cute.jit
+def _host_ptr_sink_q_lens(
+    o_partial_ptr: cute.Pointer,
+    lse_partial_ptr: cute.Pointer,
+    o_out_ptr: cute.Pointer,
+    lse_out_ptr: Optional[cute.Pointer],
+    problem_size: Tuple[int, int, int, int],
+    n_splits: cutlass.Int32,
+    o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    sinks_ptr: cute.Pointer,
+    q_lens_ptr: cute.Pointer,
+    stats_log2: cutlass.Constexpr[bool],
+    stream: _cuda_driver.CUstream = None,
+) -> None:
+    """:func:`_host_ptr_sink` plus the (B,) int32 per-batch Q lengths of the dense padded-Q trim: a query row at or past its batch's length is a
+    PADDED row and keeps ``O := 0 / LSE := -inf`` whatever the sink, which the reduction cannot tell from a valid row whose every key is masked (the
+    partials of both are dead).  A separate entry so the sink entry's ABI stays what its callers pass."""
+    o_partial, lse_partial, o_out, lse_out = _ptr_operands(
+        o_partial_ptr, lse_partial_ptr, o_out_ptr, lse_out_ptr, problem_size, n_splits, o_strides, lse_strides
+    )
+    sinks = _sink_operand(sinks_ptr, problem_size)
+    q_lens = cute.make_tensor(q_lens_ptr, cute.make_layout((problem_size[0],), stride=(1,)))
+    _launch_combine(
+        o_partial, lse_partial, o_out, lse_out, None, None, problem_size, n_splits, stats_log2, None, None, None, (1, 1, 1), (0, 0), None, stream, sinks, q_lens
+    )
+
+
+@cute.jit
 def _host_ptr_ragged_sink(
     o_partial_ptr: cute.Pointer,
     lse_partial_ptr: cute.Pointer,
@@ -1569,6 +1627,7 @@ def compile_ptr(
     has_sink: bool = False,
     gate: bool = False,
     dtype_gate: Optional[str] = None,
+    has_q_lens: bool = False,
 ) -> Callable:
     """Compile a shape-generic pointer entry for prepared split execution.
 
@@ -1591,6 +1650,8 @@ def compile_ptr(
     folds the attention sink once (the partials are sink-free).  The dense and
     ragged entries append the fp32 [H] sink-logit pointer right before
     ``stats_log2``; the packed entry takes it as its trailing ``sinks_ptr``.
+    ``has_q_lens`` (the dense sink entry only) appends the int32 (B,) per-batch Q-length pointer after the sink pointer: the rows of the padded-Q trim
+    past their batch's length keep ``O := 0 / LSE := -inf`` instead of folding the sink.
     """
     if dtype_o not in ("f16", "bf16", "e4m3", "e5m2") or dtype_partial not in ("f16", "bf16", "f32"):
         raise ValueError("prepared split combine requires half/FP8 O and f16/bf16/f32 partials")
@@ -1614,6 +1675,10 @@ def compile_ptr(
         raise ValueError("the sink fold is wired for the half combine entries only (FP8 split + sink stays declined)")
     if has_sink and gate:
         raise ValueError("the gate-in-combine entry carries no sink fold (a gated split with a sink is declined)")
+    if has_q_lens and not has_sink:
+        raise ValueError("has_q_lens is a sink specialization: the Q lengths only decide which rows fold the sink")
+    if has_q_lens and (ragged or packed):
+        raise ValueError("has_q_lens serves the dense sink entry (the ragged and packed placements have no padded rows)")
     _cache_key = _template_key(globals(), locals(), "compile_ptr")
     gmem = cute.AddressSpace.gmem
 
@@ -1650,9 +1715,11 @@ def compile_ptr(
         # dense entry's positional ABI stays exactly what its callers pass.
         entry, extra = _host_ptr_gated, (P(_ELEM[dtype_gate]), (cutlass.Int64(0),) * 4)
     else:
-        entry, extra = (_host_ptr_sink if has_sink else _host_ptr), ()
+        entry, extra = (_host_ptr_sink_q_lens if has_q_lens else _host_ptr_sink if has_sink else _host_ptr), ()
     if has_sink and not packed:
         extra = (*extra, P(cutlass.Float32))  # the fp32 [H] sink logits, right before stats_log2 (the packed entry's ride as its trailing sinks_ptr)
+        if has_q_lens:
+            extra = (*extra, P(cutlass.Int32))  # the int32 (B,) per-batch Q lengths of the padded-Q trim, right after the sinks
     return _compile_cached(
         entry,
         *common,

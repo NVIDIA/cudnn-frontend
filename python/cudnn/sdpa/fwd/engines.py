@@ -1041,6 +1041,16 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 or (facts.has_sink and not packed_split and (facts.is_fp8 or facts.is_mxfp8 or facts.has_epilogue_gate or capabilities.sm_lo != 100))
                 or (facts.padded and not facts.has_paged_kv and not packed_split)
                 or facts.seq_q_trim
+                # A split sink over padded query lengths also needs the native dense binder that hands the combine the Q lengths (a padded
+                # row must stay O := 0 / LSE := -inf): an older extension declines it here rather than at the spec build.
+                or (
+                    facts.has_sink
+                    and not packed_split
+                    and not facts.thd
+                    and facts.padded
+                    and facts.seq_q_t is not None
+                    and not getattr(cudnn._pybind_module._SdpaDenseBinder, "supports_combine_q_lens", False)
+                )
             ):
                 return "split_kv > 1 serves sink-free dense graphs (a sink splits on the SM100 half flavors only), the decode tile's ragged-Q leg, or native D128/D256 or nonpaged D192 packed split"
             if _synth_kv_padding(capabilities, facts) and not supports_scalar_kv_tail_split(

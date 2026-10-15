@@ -578,10 +578,19 @@ def _run_kernel(
         # Under a split the kernel's partials are sink-free; the sink entry of the
         # combine takes the fp32 [H] logits right before the stream and folds them once.
         split_sink = has_sink and splits > 1
+        # The dense padded-Q trim: the combine takes the per-batch Q lengths after the sinks, so a padded row keeps O := 0 / LSE := -inf.
+        qlens_sink = split_sink and q_lens is not None
         cfn = positional_entry(
-            comb.compile_ptr(dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=True, dtype_partial="f32", stats_log2=stats_log2, has_sink=split_sink)
+            comb.compile_ptr(
+                dtype_o="f16" if dtype == torch.float16 else "bf16",
+                has_lse=True,
+                dtype_partial="f32",
+                stats_log2=stats_log2,
+                has_sink=split_sink,
+                has_q_lens=qlens_sink,
+            )
         )
-        sink_args = (sinks.data_ptr(),) if split_sink else ()
+        sink_args = ((sinks.data_ptr(), seq_q.data_ptr()) if qlens_sink else (sinks.data_ptr(),)) if split_sink else ()
         cfn(
             o_p.data_ptr(),
             lse_p.data_ptr(),
@@ -762,6 +771,36 @@ def test_decode_kernel_sink_split_kv(paged):
     and base 2, S_q = 1 and a bottom-right causal S_q = 4."""
     _run_kernel(4, 8, 2, 16, 20, [300, 77, 0, 129], hnd=True, splits=4, paged=paged, sink=True, dtype=torch.bfloat16)
     _run_kernel(3, 8, 2, 16, 20, [300, 77, 1], hnd=False, splits=8, paged=paged, s_q=4, causal_br=True, sink=True, stats_log2=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("flavor", ["d128_direct", "d64_quad"])
+@pytest.mark.parametrize("paged", [True, False], ids=["paged", "dense"])
+def test_decode_kernel_sink_split_kv_keeps_padded_query_rows_dead(paged, flavor):
+    """The dense padded-Q trim under a split sink: a row past its batch's Q length (every row of a batch with Q length 0) must land on O := 0 /
+    LSE := -inf, not on the sink the combine folds into a VALID keyless row (the batch with no keys keeps LSE = sink) -- the partials of the two are the
+    same (every split dead), so the combine takes the Q lengths.  The direct O store of the d128 form and the quadrant softmax of the d64 form both
+    feed it; the second case runs the bottom-right causal MTP step with Stats in base 2."""
+    kw = dict(d=64, native_d64=True, quad=True) if flavor == "d64_quad" else {}
+    _run_kernel(3, 8, 2, 16, 40, [600, 77, 0], hnd=False, splits=4, paged=paged, s_q=2, q_lens=[2, 1, 0], sink=0.7, dtype=torch.bfloat16, **kw)
+    _run_kernel(
+        3,
+        8,
+        2,
+        16,
+        40,
+        [300, 0, 129],
+        hnd=False,
+        splits=4,
+        paged=paged,
+        s_q=4,
+        causal_br=True,
+        q_lens=[0, 4, 2],
+        sink=True,
+        stats_log2=True,
+        dtype=torch.bfloat16,
+        **kw,
+    )
 
 
 @pytest.mark.L0
