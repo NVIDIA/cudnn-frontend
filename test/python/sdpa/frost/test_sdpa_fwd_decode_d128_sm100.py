@@ -815,6 +815,19 @@ def test_decode_kernel_native_d64_exp2_split(splits, s_q, window, exp2_split):
     assert 2 * sum(len(pairs) for pairs in mod._E2E_PAIRS) == (32 if emulated else 0)
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "splits,s_q,lens",
+    [(1, 1, [600, 0, 77]), (4, 1, [600, 0, 77]), (1, 6, [600, 1, 129])],
+    ids=["empty_sequence", "empty_sequence_split4", "mtp6_rows_above_the_diagonal"],
+)
+def test_decode_kernel_native_d64_exp2_split_keeps_dead_rows_dead(splits, s_q, lens):
+    """A fully masked row (an empty sequence; MTP rows above the bottom-right diagonal) must still land on O := 0 / LSE := -inf with the exp2 split on:
+    the emulation clamps a masked input at -127, where the exponent insert yields exactly 0 (bit pattern 0), so the row's sum stays 0 and the dead-row
+    test holds.  S_q = 6 x G = 8 is past the 32-row quadrant, so this is the single-quadrant form the split serves."""
+    _run_kernel(3, 8, 1, 16, 40, lens, True, splits, s_q=s_q, causal_br=s_q > 1, d=64, dtype=torch.bfloat16, native_d64=True, exp2_split=True, sink=False)
+
+
 _QUAD_CASES = [
     dict(id="unsplit", B=3, H=8, KH=1, P=16, max_pages=40, lens=[600, 77, 1], splits=1),
     dict(id="split4", B=3, H=8, KH=2, P=16, max_pages=40, lens=[600, 77, 129], splits=4),
