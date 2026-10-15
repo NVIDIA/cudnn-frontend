@@ -551,85 +551,173 @@ SERVING_POOL_LAYOUTS = ("hnd", "nhd", "unified")
 """The three pool stride patterns the serving forms are validated on: HND compact ``(H*P*D, P*D, D, 1)``, NHD by strides
 ``(P*H*D, D, H*D, 1)``, and a unified ``[num_pages, H_kv, P, 2D]`` content row (K at ``+0``, V at ``+D``) bound as its two halves."""
 
-DECODE_MAX_S_Q = 4
-"""The CLAIMED decode envelope: ``1 <= S_q <= 4`` (one new token plus up to three speculative ones) rides the Rubin d256 decode
-tile PACKED (the whole GQA group in one tile) at every served group.  Above it the route still applies (:func:`decode_route`,
-the adapter's own rule): a group may ride the packed tile further (8 / 1 to ``S_q = 8``, 24 / 4 to ``S_q = 10``); past the
-packed route the adapter's UNPACKED arm still rides the tile -- one head per CTA, up to ``DECODE_MAX_ROWS`` rows.  Every arm is
-declared (``DecodeRoute.tile`` / ``pack_gqa``) and unmeasured until its perf cell; beyond ``DECODE_MAX_ROWS`` the form is a
-typed decline (the paged d256 prefill body serves PACKED queries -- the EXTEND form -- never a dense step over the pools)."""
+DECODE_CLAIMED_MAX_S_Q = 4
+"""The CLAIMED decode envelope: ``1 <= S_q <= 4`` (one new token plus up to three speculative ones) on the Rubin d256 decode tile
+PACKED (the whole GQA group in one tile) -- the measured cells (``DecodeRoute.claimed``).  Every other served cell is routed and
+declared (``DecodeRoute.tile`` / ``pack_gqa`` / ``kv_streams``) and unmeasured until its perf cell."""
 
-DECODE_MAX_ROWS = 32
-"""The widest step the DECODE form serves: the 32-column decode tile unpacked (one head per CTA).  A dense step with more new tokens
-per sequence has no kernel over the pools on this part (the adapter's own decline) -- it is the EXTEND form's (packed) business."""
+DECODE_MAX_S_Q = 8
+"""The DECLARED decode envelope: ``1 <= S_q <= 8`` (one new token plus up to seven speculative ones: an MTP-7 verify step).  Within it
+every step has a route (:func:`decode_route`: the decode tile in one token unit where its single-unit width table holds the packed
+rows, the paged d256 PREFILL tile with the group packed past it wherever that tile packs the group, the decode tile's token-unit and
+unpacked arms where it does not); beyond it, or beyond ``DECODE_MAX_ROWS`` packed rows, the form is a typed decline (the paged d256
+prefill body serves PACKED queries -- the EXTEND form -- never a dense step over the pools)."""
+
+DECODE_MAX_ROWS = 128
+"""The widest step the DECODE form serves, in PACKED rows ``S_q x (H_q / H_kv)``: the d256 prefill tile's Q rows (``CfgD256.TILE_M``,
+pinned by the MTP route tests), so the prefill route runs ONE Q tile per sequence and KV head -- the KV streamed once.  A wider dense
+step over the pools is the EXTEND form's (packed) business."""
 
 DECODE_TILE = "decode_d256_f16"
 """``kernel_template`` of the Rubin d256 decode tile (``sdpa/fwd/kernels/sm107/decode_d256_f16.py``: the swap-AB tile)."""
 
+PREFILL_TILE = "prefill_d256_f16"
+"""``kernel_template`` of the paged d256 prefill tile the DECODE form's prefill route runs: the shared SM100 half d256 body
+(``sdpa/fwd/kernels/sm100/prefill_d256_f16.py``) on its paged THD arm with PackGQA -- the EXTEND form's kernel."""
+
+DECODE_ROUTE_SINGLE_UNIT = "single_unit"
+"""The default route policy: one KV stream per sequence and KV head wherever a kernel offers it -- the decode tile in ONE token unit
+(``config_sm107.D256_DECODE_SINGLE_UNIT_Q_TILES``), else the paged prefill tile with the group packed (a group dividing its 128 rows);
+a group the prefill tile cannot pack keeps the token-unit arm (two streams) and the unpacked arm, the fewest streams available to it."""
+
+DECODE_ROUTE_TOKEN_UNITS = "token_units"
+"""The SDPA adapter's own route, verbatim (``config_sm107.decode_d256_q_tile``): the widest decode tile in up to two TOKEN UNITS for a
+packed group past the 16-column tile (each unit one more KV stream), then the unpacked tile -- the other arm of the two routes' A/B."""
+
+DECODE_ROUTE_POLICIES = (DECODE_ROUTE_SINGLE_UNIT, DECODE_ROUTE_TOKEN_UNITS)
+DEFAULT_DECODE_ROUTE_POLICY = DECODE_ROUTE_SINGLE_UNIT
+
+
+def _resolve_decode_route_policy(policy: Optional[str]) -> str:
+    """``None`` = the default policy; a known policy name as is; anything else a typed ``ValueError`` naming the vocabulary."""
+    if policy is None:
+        return DEFAULT_DECODE_ROUTE_POLICY
+    if not isinstance(policy, str) or policy not in DECODE_ROUTE_POLICIES:
+        raise ValueError(f"decode_route_policy must be one of {DECODE_ROUTE_POLICIES} or None (= {DEFAULT_DECODE_ROUTE_POLICY!r}), got {policy!r}")
+    return policy
+
 
 @dataclass(frozen=True)
 class DecodeRoute:
-    """Which SDPA kernel serves a DECODE step of ``s_q`` tokens at a geometry -- derived from the Rubin route the SDPA
-    adapter itself applies (``cudnn.sdpa.fwd.config_sm107.decode_d256_q_tile``: the 32-column swap-AB decode tile, up to
-    two TOKEN UNITS of ``n_q // group`` consecutive tokens for a packed GQA group; the adapter's ``_decode_q_tile_for`` is
-    the same rule on its own shapes, and ``_Sdpa.compile`` pins the compiled ``kernel_template`` against this record)."""
+    """Which SDPA kernel serves a DECODE step of ``s_q`` tokens at a geometry under a route policy -- the Rubin decode tile
+    (``sdpa/fwd/kernels/sm107/decode_d256_f16.py``, the swap-AB tile: ``config_sm107.D256_DECODE_SINGLE_UNIT_Q_TILES`` names the
+    widths it takes in ONE token unit, ``config_sm107.decode_d256_q_tile`` the adapter's token-unit arm past them) or the paged d256
+    PREFILL tile with the group packed (the EXTEND form's kernel at the dense step's envelope); ``_Sdpa.compile`` pins the compiled
+    ``kernel_template`` against this record.  ``kv_streams`` is the figure the HBM-bound decode step is priced by: how many times the
+    KV range of a (sequence, KV head) is streamed -- the token units on the packed decode tile, the group on the unpacked arm (one
+    head per CTA), one on the prefill tile and on the single-unit decode tile."""
 
     s_q: int
-    group: int  # h_q // h_kv: the heads the decode tile packs per token (1 = MHA, unpacked)
-    tile: Optional[str]  # DECODE_TILE (the ``kernel_template`` the adapter compiles), or None: the step is not served over the pools
-    n_q: int  # the decode tile's N extent (the packed Q rows of ONE token unit: 16 or 32); 0 when not served
-    token_units: int  # CTAs per (KV-head group, batch, split): ceil(s_q / (n_q // group)); 0 when not served
-    pack_gqa: bool  # the whole group packed into the tile (the packed route); False = MHA or the unpacked arm past the packed route
-    claimed: bool  # inside the CLAIMED envelope (the PACKED decode tile at s_q <= DECODE_MAX_S_Q); False = routed, declared, unmeasured
+    group: int  # h_q // h_kv: the heads a tile packs per token (1 = MHA, unpacked)
+    tile: Optional[str]  # DECODE_TILE / PREFILL_TILE (the ``kernel_template`` the adapter compiles), or None: the step is not served over the pools
+    n_q: int  # the decode tile's N extent (the packed Q rows of ONE token unit: 16 or 32); 0 on the prefill tile and when not served
+    token_units: int  # the decode tile's CTAs per (KV-head group, batch, split): ceil(s_q / (n_q // group)); 0 on the prefill tile / not served
+    pack_gqa: bool  # the whole group packed into the tile; False = MHA or the decode tile's unpacked arm
+    claimed: bool  # inside the CLAIMED envelope (the PACKED decode tile at s_q <= DECODE_CLAIMED_MAX_S_Q); False = routed, declared, unmeasured
     reason: str = ""  # why the step is not served (``tile`` None); empty when served
+    # APPENDED (2026-10-15): the KV streams per (sequence, KV head) -- 1 on a single-unit decode tile and on the prefill tile, the token
+    # units on the packed decode tile, the group on the unpacked arm; 0 when not served -- and the policy the route was read under.
+    kv_streams: int = 0
+    policy: str = ""
 
     @property
     def decode_tile(self) -> bool:
-        return self.n_q > 0
+        return self.tile == DECODE_TILE
+
+    @property
+    def prefill_tile(self) -> bool:
+        return self.tile == PREFILL_TILE
 
     @property
     def served(self) -> bool:
-        return self.n_q > 0
+        return self.tile is not None
 
 
-def decode_route(geometry: "GatedAttentionBlockGeometry", s_q: int) -> DecodeRoute:
-    """The DECODE route of ``s_q`` tokens at ``geometry``: the adapter's own rule, read here so the block, the envelope and the
-    tests name the kernel BEFORE anything compiles.  MHA (``h_q == h_kv``) stays unpacked (the bit-exact unpacked fold); past
-    the packed route a group rides the adapter's UNPACKED arm (one head per CTA) up to ``DECODE_MAX_ROWS`` rows; beyond that
-    the step is NOT served over the pools (``tile`` None, ``reason`` set: the adapter serves dense half queries over paged K / V
-    on the decode tile only -- a longer dense step is the EXTEND form's packed business); a head dim other than 256 has no
-    decode tile (the paged read is the d256 flavor's)."""
-    from cudnn.sdpa.fwd.config_sm100 import decode_d256_q_units
-    from cudnn.sdpa.fwd.config_sm107 import decode_d256_q_tile
+def decode_route(geometry: "GatedAttentionBlockGeometry", s_q: int, policy: Optional[str] = None) -> DecodeRoute:
+    """The DECODE route of ``s_q`` tokens at ``geometry`` under ``policy`` (``None`` = :data:`DEFAULT_DECODE_ROUTE_POLICY`), read
+    here so the block, the envelope and the tests name the kernel BEFORE anything compiles.
 
+    The DECLARED envelope first: ``1 <= s_q <= DECODE_MAX_S_Q`` and ``s_q x group <= DECODE_MAX_ROWS`` packed rows, else NOT served
+    (``tile`` None, ``reason`` set: a longer or wider dense step over the pools is the EXTEND form's packed business); a head dim other
+    than 256 has no paged read (the d256 flavor's).  Then ONE rule per policy:
+
+    * ``"single_unit"`` (the default): packed rows within the decode tile's single-unit width table ride the narrowest such width in
+      ONE token unit (``config_sm107.decode_d256_single_unit_q_tile``: the KV streamed once); past the table the step rides the paged
+      d256 PREFILL tile with the whole group packed -- one Q tile per (sequence, KV head), the KV streamed once -- wherever that body
+      packs the group (``pack_gqa_group_size(group, DECODE_MAX_ROWS)``: a group dividing its 128 rows; the cc 10.7 paged THD leg takes
+      whole-group PackGQA only); a group it cannot pack (12 = 24 / 2, 6 = 24 / 4) keeps the adapter's token-unit arm (up to two units
+      of the widest width: two streams, the measured MTP form) and the unpacked arm past it (one head per CTA: ``group`` streams) --
+      the fewest streams any kernel offers it today, never more than the ``"token_units"`` route's.
+    * ``"token_units"``: the adapter's own route verbatim (``config_sm107.decode_d256_q_tile``: the single-unit table, then the widest
+      width in up to two token units for a packed group), then the unpacked arm -- the A/B's other arm.
+
+    MHA (``h_q == h_kv``) stays the unpacked 16-column tile (the bit-exact unpacked fold, one stream)."""
+    from cudnn.sdpa.fwd.config_sm100 import decode_d256_q_units, pack_gqa_group_size
+    from cudnn.sdpa.fwd.config_sm107 import decode_d256_q_tile, decode_d256_single_unit_q_tile
+
+    policy = _resolve_decode_route_policy(policy)
     g = int(geometry.h_q) // int(geometry.h_kv)
     s_q = int(s_q)
-    d256 = int(geometry.d_head) == 256 and s_q >= 1 and g >= 1
-    # the PACKED route first (the whole group in one tile, up to two token units); past it the adapter's UNPACKED arm (pack_g = 1:
-    # one head per CTA, one unit, S_q <= 32 rows), exactly as SdpaFwdDslSm100._decode_q_tile_for reads pack_gqa; 0 = not served
-    n_q = decode_d256_q_tile(s_q, g) if (d256 and g > 1) else 0
-    packed = bool(n_q)
-    if d256 and not n_q:
-        n_q = decode_d256_q_tile(s_q, 1)
-    units = decode_d256_q_units(s_q, g if packed else 1, n_q) if n_q else 0
-    reason = ""
-    if not n_q:
-        reason = (
-            f"a dense step of S_q={s_q} tokens at group {g} has no kernel over the pools: the Rubin SDPA adapter serves dense half d256 queries "
-            f"over paged K / V on the decode tile only (the packed route, then one head per CTA up to {DECODE_MAX_ROWS} rows); the paged d256 "
-            "prefill body serves PACKED (thd=True) queries -- the EXTEND form"
-            if d256
-            else f"the paged read rides the Rubin d256 SDPA flavor; got d_head={geometry.d_head}"
+    rows = s_q * g
+
+    def route(tile, n_q, units, packed, streams, reason=""):
+        return DecodeRoute(
+            s_q=s_q,
+            group=g,
+            tile=tile,
+            n_q=int(n_q),
+            token_units=int(units),
+            pack_gqa=bool(packed),
+            claimed=(tile == DECODE_TILE) and bool(packed) and s_q <= DECODE_CLAIMED_MAX_S_Q,
+            reason=reason,
+            kv_streams=int(streams),
+            policy=policy,
         )
-    return DecodeRoute(
-        s_q=s_q,
-        group=g,
-        tile=DECODE_TILE if n_q else None,
-        n_q=int(n_q),
-        token_units=int(units),
-        pack_gqa=packed,
-        claimed=packed and s_q <= DECODE_MAX_S_Q,
-        reason=reason,
+
+    if int(geometry.d_head) != 256:
+        return route(None, 0, 0, False, 0, f"the paged read rides the Rubin d256 SDPA flavor; got d_head={geometry.d_head}")
+    if s_q < 1 or g < 1:
+        return route(None, 0, 0, False, 0, f"a dense step needs S_q >= 1 and a whole GQA group, got S_q={s_q} at group {g}")
+    if s_q > DECODE_MAX_S_Q:
+        return route(None, 0, 0, False, 0, _decode_s_q_decline(s_q))
+    if rows > DECODE_MAX_ROWS:
+        return route(None, 0, 0, False, 0, _decode_rows_decline(s_q, g))
+    if g == 1:
+        # MHA: the unpacked fold on the decode tile (S_q <= 8 rows always fit its narrowest width), one stream
+        n_q = decode_d256_single_unit_q_tile(s_q, 1)
+        return route(DECODE_TILE, n_q, 1, False, 1)
+    n_q = decode_d256_single_unit_q_tile(s_q, g)
+    if n_q:
+        return route(DECODE_TILE, n_q, 1, True, 1)
+    if policy == DECODE_ROUTE_SINGLE_UNIT and pack_gqa_group_size(g, DECODE_MAX_ROWS) == g:
+        # past the table: the paged prefill tile with the whole group packed (one Q tile per sequence and KV head; rows <= 128 here)
+        return route(PREFILL_TILE, 0, 0, True, 1)
+    # the adapter's token-unit arm (the widest width in up to two units), then its unpacked arm (one head per CTA, one unit)
+    n_q = decode_d256_q_tile(s_q, g)
+    if n_q:
+        units = decode_d256_q_units(s_q, g, n_q)
+        return route(DECODE_TILE, n_q, units, True, units)
+    n_q = decode_d256_q_tile(s_q, 1)
+    if n_q:
+        return route(DECODE_TILE, n_q, 1, False, g)
+    # unreachable inside the declared envelope (S_q <= 8 rows fit the 16-column tile unpacked); kept as the honest last word
+    return route(None, 0, 0, False, 0, _decode_s_q_decline(s_q))
+
+
+def _decode_s_q_decline(s_q: int) -> str:
+    return (
+        f"kv_source='paged' on a dense [B, S_q] declaration (the DECODE form) serves S_q <= {DECODE_MAX_S_Q} (an MTP-7 verify step: the Rubin "
+        f"d256 decode tile in one token unit, else the paged d256 prefill tile with the group packed; got S_q={s_q}); a longer dense step over "
+        "the pools is the EXTEND form's PACKED (thd=True) business (a QsaSpec geometry has no such cap: the sparse core runs one work item "
+        "per query row)"
+    )
+
+
+def _decode_rows_decline(s_q: int, group: int) -> str:
+    return (
+        f"kv_source='paged' on a dense [B, S_q] declaration (the DECODE form) serves S_q x (H_q / H_kv) <= {DECODE_MAX_ROWS} packed rows (one Q "
+        f"tile of the paged d256 prefill tile per sequence and KV head; got S_q={s_q} at group {group} = {s_q * group} rows); a wider dense step "
+        "over the pools is the EXTEND form's PACKED (thd=True) business"
     )
 
 
@@ -697,14 +785,16 @@ class DecodeEnvelope:
     declines: Dict[str, str]
     max_s_q: int
     max_rows: int
-    routes: Tuple[DecodeRoute, ...]  # S_q = 1 .. 2 * max_s_q at this geometry's group (the dense tile's; empty under QsaSpec)
+    routes: Tuple[
+        DecodeRoute, ...
+    ]  # S_q = 1 .. max_s_q + 1 at this geometry's group under ``policy`` (the declared envelope and its first decline; empty under QsaSpec)
     inference_only: bool = True
     writes_lse: bool = False
 
     def route(self, s_q: int) -> DecodeRoute:
-        """The route of an ``s_q``-token step at this geometry (any ``s_q >= 1``; ``routes`` holds 1 .. 2 x ``max_s_q``) -- the
-        DENSE decode tile's rule; under ``sparse_core`` the step runs the sparse core whatever this says."""
-        return decode_route(self._geometry, s_q)
+        """The route of an ``s_q``-token step at this geometry under this record's ``policy`` (any ``s_q >= 1``; ``routes`` holds
+        1 .. ``max_s_q`` + 1) -- the DENSE form's rule; under ``sparse_core`` the step runs the sparse core whatever this says."""
+        return decode_route(self._geometry, s_q, policy=self.policy or None)
 
     _geometry: Optional["GatedAttentionBlockGeometry"] = None
     sparse_core: bool = False  # appended: stage (4) is the index-list sparse core over the pools (a QsaSpec geometry)
@@ -712,6 +802,10 @@ class DecodeEnvelope:
     # torch.float8_e4m3fn (``kv_cache_dtype``: the gathered cast + the decode tile, S_q <= 4, no LSE) on a QsaSpec geometry with bf16
     # activations.  An e4m3 pool on a DENSE geometry is a typed decline (the decode tile reads bf16 / f16 pools).
     kv_cache_dtypes: Tuple[torch.dtype, ...] = ()
+    # appended (2026-10-15): the route policy ``routes`` / ``route()`` were read under (``serving_envelope(decode_route_policy=)``) and
+    # the CLAIMED bound (``DECODE_CLAIMED_MAX_S_Q``; ``max_s_q`` is the DECLARED one).
+    policy: str = ""
+    claimed_max_s_q: int = 0
 
 
 @dataclass(frozen=True)
@@ -1551,6 +1645,10 @@ class _Intermediates:
     kv_inv: int = -1  # [2] fp32: 1 / k_scale, 1 / v_scale
     kv_gathered: int = -1  # [B x S_q x H_kv, 2, 2176, 256] bf16
     kv_len_t: int = -1  # [B x S_q x H_kv] int32
+    # the DECODE form's PREFILL route only (-1 otherwise): the paged THD leg's per-sequence Q lengths -- the constant S_q of every
+    # sequence of the dense step -- a [B] int32 slot the block FILLS on the launch stream at every execute (Rule 8 / R2 + R4: never a
+    # plan-owned tensor, never written once behind a flag)
+    decode_q_lens: int = -1  # [B] int32
 
 
 _SF_TILE_ROWS = 128  # rows of one F8_128x4 scale-factor atom == the SDPA's Q / KV tile height (keep in step with kernels/quantize_mxfp8.py SF_TILE_ROWS)
@@ -1604,6 +1702,7 @@ def _plan_workspace(
     thd_num_sequences: int = 0,
     kv_cache_e4m3: bool = False,
     upcast_items: int = 0,
+    decode_q_lens: int = 0,
 ) -> _Intermediates:
     """Reserve every intermediate, in stage order, and report the total.
 
@@ -1649,6 +1748,15 @@ def _plan_workspace(
     is not reserved); on the fused arm the bf16 ``o`` the gated SDPA then writes
     takes ``o8``'s place.  Every layout with ``o_fp4=None`` is byte-identical to
     before (pinned by ``test_workspace_layout_is_byte_identical_without_fp4``).
+
+    ``decode_q_lens`` (appended; 0 = none) reserves, at the very END, the DECODE
+    form's PREFILL route's per-sequence Q lengths: ``decode_q_lens`` (= ``B``)
+    int32 words the block fills with the constant ``S_q`` on the launch stream
+    at every execute (Rule 8 recipes R2 + R4: the paged THD leg reads them on
+    device, the caller never hands them over, and a plan-owned tensor written
+    once behind a flag would leave an eager execute after a captured first
+    execute reading an unwritten vector).  Every layout with ``decode_q_lens=0``
+    is byte-identical to before.
 
     Reserved in the order the stages write them, so a future fusion that deletes
     one leaves a contiguous prefix rather than a hole — forking stage (1) to
@@ -1803,6 +1911,10 @@ def _plan_workspace(
         slots += [("kc8", t * geom.h_kv * geom.d_head), ("vc8", t * geom.h_kv * geom.d_head), ("kv_inv", 2 * 4)]
         if upcast_items:
             slots += [("kv_gathered", int(upcast_items) * 2 * _UPCAST_ROWS * _UPCAST_D * 2), ("kv_len_t", int(upcast_items) * 4)]
+    if decode_q_lens:
+        # The DECODE form's PREFILL route: the paged THD leg's per-sequence Q lengths ([B] int32, the constant S_q), carved here and
+        # filled on the launch stream by every execute (_fill_decode_q_lens).  At the END: every other layout is byte-identical to before.
+        slots += [("decode_q_lens", int(decode_q_lens) * 4)]
     for name, nbytes in slots:
         offsets[name] = off
         off += _align_up(nbytes)
@@ -1832,6 +1944,7 @@ def _plan_workspace(
         kv_inv=offsets.get("kv_inv", -1),
         kv_gathered=offsets.get("kv_gathered", -1),
         kv_len_t=offsets.get("kv_len_t", -1),
+        decode_q_lens=offsets.get("decode_q_lens", -1),
     )
 
 
@@ -3997,6 +4110,11 @@ class _Sdpa(_Stage):
         # and the split-KV the form lowers with (>= 2 on the decode tile routes fuse_gate into the split combine).
         max_kv_len: int = 0,
         decode_split_kv: int = 1,
+        # APPENDED (the DECODE form's route): the record the block read (decode_route under its policy).  On a dense paged stage it
+        # replaces the stage's own reading (the default policy); on a THD paged stage it declares the DECODE form's PREFILL route --
+        # the EXTEND form's binding at the dense step's (B, S_q) envelope with the group packed -- and the compiled template is pinned
+        # against it either way.
+        route: Optional[DecodeRoute] = None,
     ) -> None:
         # token_stride != 0 => Q/K/V are column slices of the fused projection
         # and are read in place at that stride (the adapter compiles its TMA
@@ -4067,7 +4185,7 @@ class _Sdpa(_Stage):
         # gates in its own launch, which the block decides (GatedAttentionBlockFwd.gate_fused) -- fuse_gate=True here = the combine.
         self.max_kv_len = int(max_kv_len)
         self.decode_split_kv = int(decode_split_kv)
-        self.decode_route: Optional[DecodeRoute] = None
+        self.decode_route: Optional[DecodeRoute] = route
         self.paged_dense = self.kv_source == KV_SOURCE_PAGED and not self.thd
         if self.kv_source == KV_SOURCE_PAGED:
             if self.paged_page_size <= 0 or k_cache_desc is None or v_cache_desc is None or block_table_desc is None:
@@ -4076,25 +4194,58 @@ class _Sdpa(_Stage):
                 raise NotImplementedError(f"{self.name}: kv_source='paged' writes no LSE (the serving forms over the pools are inference forms)")
             if self.fp8:
                 raise NotImplementedError(f"{self.name}: kv_source='paged' serves bf16 / f16 operands and pools only (no quantized paged leg)")
+            if self.decode_route is not None and self.decode_route.s_q != self.seq_len:
+                raise ValueError(f"{self.name}: route is the record of S_q={self.decode_route.s_q}, this stage's step is S_q={self.seq_len}")
             if self.thd:
                 # fuse_gate rides the paged THD leg: the gate is declared at the SAME (B_env, H, S_max, D) envelope as O at the
                 # slab's GATE column stride and bound as the packed (T, H, D) view at execute -- the dense THD arm's contract.
-                pass
+                if self.decode_route is not None:
+                    # The DECODE form on the PREFILL route: the EXTEND form's binding (packed queries over the pools) at the dense step's
+                    # own envelope -- num_sequences = B, max_seq_len = S_q, the group packed, unsplit -- with the route pinned at compile.
+                    if not self.decode_route.prefill_tile:
+                        raise ValueError(
+                            f"{self.name}: a THD paged stage carries the DECODE form on its prefill route only; the route of S_q={self.seq_len} at group "
+                            f"{self.decode_route.group} is {self.decode_route.tile!r} (declare the dense paged stage for the decode tile)"
+                        )
+                    if (self.num_sequences, self.max_seq_len) != (self.batch, self.seq_len):
+                        raise ValueError(
+                            f"{self.name}: the prefill route binds the dense step's own envelope (num_sequences=B={self.batch}, max_seq_len=S_q={self.seq_len}), "
+                            f"got ({self.num_sequences}, {self.max_seq_len})"
+                        )
+                    if self.decode_split_kv != 1:
+                        raise NotImplementedError(
+                            f"{self.name}: the prefill route runs the paged d256 body unsplit; got decode_split_kv={self.decode_split_kv}"
+                        )
             else:
                 if self.decode_split_kv < 1:
                     raise ValueError(f"{self.name}: decode_split_kv must be >= 1, got {decode_split_kv}")
                 self.seq_lens_present = True  # the per-sequence KV lengths are mandatory over pools (the adapter's paged contract)
-                self.decode_route = decode_route(geometry, self.seq_len)
+                if self.decode_route is None:
+                    self.decode_route = decode_route(geometry, self.seq_len)
                 if not self.decode_route.served:
                     raise NotImplementedError(f"{self.name}: {self.decode_route.reason}")
+                if self.decode_route.prefill_tile:
+                    raise NotImplementedError(
+                        f"{self.name}: the DECODE route of S_q={self.seq_len} at group {self.decode_route.group} is the paged d256 prefill tile (packed "
+                        "queries): a dense paged stage cannot bind it -- declare the stage thd=True at (num_sequences=B, max_seq_len=S_q) with this "
+                        "route, as GatedAttentionBlockFwd does"
+                    )
                 if self.fuse_gate and not (self.decode_route.decode_tile and self.decode_split_kv >= 2):
                     raise NotImplementedError(
                         f"{self.name}: fuse_gate=True over the pools rides the decode tile's split combine only (split_kv >= 2; got split_kv="
                         f"{self.decode_split_kv}); the block gates in its own launch when the tile runs unsplit"
                     )
-        elif self.paged_page_size or k_cache_desc is not None or v_cache_desc is not None or block_table_desc is not None or max_kv_len or decode_split_kv != 1:
+        elif (
+            self.paged_page_size
+            or k_cache_desc is not None
+            or v_cache_desc is not None
+            or block_table_desc is not None
+            or max_kv_len
+            or decode_split_kv != 1
+            or route is not None
+        ):
             raise ValueError(
-                f"{self.name}: paged_page_size / k_cache_desc / v_cache_desc / block_table_desc / max_kv_len / decode_split_kv belong to kv_source='paged'"
+                f"{self.name}: paged_page_size / k_cache_desc / v_cache_desc / block_table_desc / max_kv_len / decode_split_kv / route belong to kv_source='paged'"
             )
         self._impl = None
 
@@ -4146,6 +4297,10 @@ class _Sdpa(_Stage):
                     paged_table_stride=table_stride,
                     paged_table_v_stride=table_stride,
                 )
+                if self.decode_route is not None and self.decode_route.pack_gqa:
+                    # The DECODE form on the PREFILL route: the whole group packed into the body's 128-row Q tile (HEADS_PER_TILE = the
+                    # group: one Q tile per sequence and KV head, the KV streamed once); the EXTEND form keeps the adapter's default.
+                    kw["pack_gqa"] = True
                 if self.fuse_gate:
                     # The gate descriptor selects the epilogue_gate specialization of the paged body (template_params().epilogue_gate):
                     # G at the slab's GATE column stride, the (B_env, H, S_max, D) envelope O takes, mapped by the adapter through the
@@ -4361,16 +4516,21 @@ class _Sdpa(_Stage):
         if self._impl is None:
             raise RuntimeError("call check_support() before compile()")
         self._impl.compile()
-        if self.paged_dense:
-            # The route this stage DECLARED (decode_route: the adapter's rule on the block's shapes) against the module the
-            # adapter COMPILED -- two readings of one rule; a drift is the "config and body must agree" class, so it raises
-            # rather than letting an envelope name a tile the plan does not run.
+        if self.decode_route is not None:
+            # The route this stage DECLARED (decode_route: the block's rule on its shapes -- the decode tile, or the prefill tile through
+            # the THD paged binding) against the module the adapter COMPILED -- two readings of one rule; a drift is the "config and body
+            # must agree" class, so it raises rather than letting an envelope name a tile the plan does not run.
             got = getattr(self._impl, "kernel_template", None)
             if got != self.decode_route.tile:
                 raise RuntimeError(
                     f"{self.name}: the DECODE route named {self.decode_route.tile} for S_q={self.seq_len} at group {self.decode_route.group} "
-                    f"(split_kv={self.decode_split_kv}, pack_gqa={self.decode_route.pack_gqa}) but the adapter compiled {got!r}: decode_route and "
-                    "SdpaFwdDslSm100._decode_q_tile disagree -- fix the drift, neither reading is the truth alone"
+                    f"(policy={self.decode_route.policy}, split_kv={self.decode_split_kv}, pack_gqa={self.decode_route.pack_gqa}, thd={self.thd}) but the "
+                    f"adapter compiled {got!r}: decode_route and SdpaFwdDslSm100._decode_q_tile disagree -- fix the drift, neither reading is the truth alone"
+                )
+            if self.decode_route.pack_gqa != bool(getattr(self._impl, "pack_gqa", False)):
+                raise RuntimeError(
+                    f"{self.name}: the DECODE route of S_q={self.seq_len} at group {self.decode_route.group} packs the group ({self.decode_route.pack_gqa}) but the "
+                    f"adapter compiled pack_gqa={getattr(self._impl, 'pack_gqa', None)}"
                 )
 
     def scratch_workspace_bytes(self) -> int:
@@ -5762,13 +5922,24 @@ _EXTEND_DECLINES: Tuple[Tuple[str, type, Callable[[_ServingDecl], bool], str], .
         "attends over the pools, so the write-through attribute is part of its declaration",
     ),
     (
+        "decode_s_q",
+        NotImplementedError,
+        lambda d: _is_paged(d) and not d.thd and d.geometry.qsa is None and d.s_q > DECODE_MAX_S_Q,
+        f"kv_source='paged' on a dense [B, S_q] declaration (the DECODE form) serves S_q <= {DECODE_MAX_S_Q} (an MTP-7 verify step: the Rubin "
+        "d256 decode tile in one token unit, else the paged d256 prefill tile with the group packed); a longer dense step over the pools is the "
+        "EXTEND form's PACKED (thd=True) business (a QsaSpec geometry has no such cap: the sparse core runs one work item per query row)",
+    ),
+    (
         "decode_rows",
         NotImplementedError,
-        lambda d: _is_paged(d) and not d.thd and d.geometry.qsa is None and d.s_q > DECODE_MAX_ROWS,
-        f"kv_source='paged' on a dense [B, S_q] declaration (the DECODE form) serves S_q <= {DECODE_MAX_ROWS}: the Rubin SDPA adapter serves "
-        "dense half d256 queries over paged K / V on the decode tile only (the packed route, then one head per CTA up to 32 rows); a longer "
-        "dense step has no kernel over the pools -- the paged d256 prefill body serves PACKED (thd=True) queries, the EXTEND form (a QsaSpec "
-        "geometry has no such cap: the sparse core runs one work item per query row)",
+        lambda d: _is_paged(d)
+        and not d.thd
+        and d.geometry.qsa is None
+        and int(d.geometry.h_kv) >= 1
+        and d.s_q * (int(d.geometry.h_q) // int(d.geometry.h_kv)) > DECODE_MAX_ROWS,
+        f"kv_source='paged' on a dense [B, S_q] declaration (the DECODE form) serves S_q x (H_q / H_kv) <= {DECODE_MAX_ROWS} packed rows (one Q "
+        "tile of the paged d256 prefill tile per sequence and KV head); a wider dense step over the pools is the EXTEND form's PACKED (thd=True) "
+        "business",
     ),
     (
         "sparse",
@@ -5858,7 +6029,8 @@ QsaSpec geometry for the EXTEND form.  With the arm claimed, a packed QsaSpec de
 one and meets its ``sparse`` row (the same row the DECODE form reaches)."""
 
 _DECODE_REQUIRES = (
-    "a DENSE declaration: sample_h [B, S_q, d_model] with 1 <= S_q <= DECODE_MAX_ROWS (the claimed envelope S_q <= DECODE_MAX_S_Q), the batch uniform",
+    "a DENSE declaration: sample_h [B, S_q, d_model] with 1 <= S_q <= DECODE_MAX_S_Q = 8 and S_q x (H_q / H_kv) <= DECODE_MAX_ROWS = 128 packed rows (the "
+    "claimed envelope S_q <= 4 on the packed decode tile; decode_route_policy picks the single-unit route or the adapter's token units), the batch uniform",
     "paged_kv_page_size=P (a positive multiple of 16; validated at page_sizes)",
     "kv_source='paged'",
     "geometry.is_causal=True, geometry.causal_bottom_right=True, window_left=-1, window_right in (-1, 0), qsa=None, d_head=256",
@@ -5868,6 +6040,7 @@ _DECODE_REQUIRES = (
 )
 _DECODE_DECLINE_NAMES = (
     "write_through",
+    "decode_s_q",
     "decode_rows",
     "diagonal",
     "window",
@@ -6191,6 +6364,12 @@ class GatedAttentionBlockFwd(APIBase):
         # through kernels/qsa_kv_upcast.py + the bf16 d256 decode tile.  Needs paged_kv_page_size > 0 and bf16 activations.  A declaration
         # ATTRIBUTE (numerics-changing), never a knob.  Class docstring, "The e4m3 KV cache".
         kv_cache_dtype: Optional[torch.dtype] = None,
+        # APPENDED (the DECODE form's route policy; refused on the packed form and under "self"): None = DECODE_ROUTE_SINGLE_UNIT -- the
+        # decode tile in ONE token unit where its width table holds the packed rows, else the paged d256 prefill tile with the group
+        # packed (the KV streamed once) wherever that tile packs the group; DECODE_ROUTE_TOKEN_UNITS = the SDPA adapter's own route (the
+        # widest tile in up to two token units, then the unpacked tile).  A PERFORMANCE-ONLY knob: the same function under either (the
+        # two routes' A/B); `decode_route` / `DecodeRoute.policy` read it back.  Module docstring, "The DECODE form".
+        decode_route_policy: Optional[str] = None,
     ):
         """Validate the declaration -- the dtype / ``quant`` / scale-blob halves, the fusion and save-mode knobs against
         ``save_for_backward``, the THD envelope, the paged-cache write-through -- normalise the samples, record the knobs and
@@ -6415,8 +6594,18 @@ class GatedAttentionBlockFwd(APIBase):
         self.kv_cache_e4m3 = self.kv_cache_dtype == KV_CACHE_E4M3
         # THE EXTEND FORM (kv_source) and the BOUNDED token form (token_capacity): the typed declines of the table every caller's
         # dispatch predicate can read back (serving_envelope), then the three samples' contract -- device-free, before any descriptor.
+        self.decode_route_policy = _resolve_decode_route_policy(decode_route_policy)
         self.kv_source, self.token_capacity, self.decode_route, self.max_kv_len, self.decode_split_kv = self._check_serving_declaration(
-            kv_source, token_capacity, quant, sample_k_cache, sample_v_cache, sample_block_table, sample_h.device, max_kv_len, decode_split_kv
+            kv_source,
+            token_capacity,
+            quant,
+            sample_k_cache,
+            sample_v_cache,
+            sample_block_table,
+            sample_h.device,
+            max_kv_len,
+            decode_split_kv,
+            decode_route_policy=decode_route_policy,
         )
         if self.kv_source == KV_SOURCE_PAGED and not self.thd:
             # The DECODE form: over the pools the per-sequence KV length (kv_lens) is mandatory, so the declaration reads
@@ -6439,7 +6628,9 @@ class GatedAttentionBlockFwd(APIBase):
         # (fuse_gate on the DECODE form with split >= 2: the tile has no gate seams), or its own launch, stage (5), everywhere
         # else (an unsplit decode tile).  `fuse_gate` stays what was declared; `gate_fused` is what runs.
         self.gate_fused = (
-            self.fuse_gate and not self.upcast_decode and (self.decode_route is None or (self.decode_route.decode_tile and self.decode_split_kv >= 2))
+            self.fuse_gate
+            and not self.upcast_decode
+            and (self.decode_route is None or self.decode_route.prefill_tile or (self.decode_route.decode_tile and self.decode_split_kv >= 2))
         )
         # Where the paged KV-cache write-through runs: the fused projection's epilogue (the arm serves the bf16 / f16 fused norm + RoPE
         # pipeline without an indexer band) or the separate cache-write launch.  `fuse_cache_write` stays what was declared;
@@ -6489,6 +6680,10 @@ class GatedAttentionBlockFwd(APIBase):
         # The allocation itself is stream work under torch.use_deterministic_algorithms(True) (torch.empty enqueues a NaN fill on
         # the ambient stream): compile() records an event behind it and every writer waits on that event first.
         self._quant_dev_ready = None
+        # The DECODE form's prefill route: the per-sequence Q lengths of the paged THD leg -- the constant S_q for every sequence of the
+        # dense step -- are NOT plan-owned memory (Rule 8 recipes R2 + R4): a [B] int32 slot of the caller's workspace
+        # (_Intermediates.decode_q_lens, reserved by _plan_workspace on that route only) that EVERY execute fills on its launch stream
+        # (_fill_decode_q_lens) -- no first-execute flag, so an eager execute after a captured first execute reads its own fill.
         # rstd exists only where a norm exists: under qk_norm=False a training
         # block saves lse / q_pre / k_pre but no rstd (SavedForBackward.rstd_*
         # are None -- required, both directions, at execute).
@@ -6622,6 +6817,10 @@ class GatedAttentionBlockFwd(APIBase):
                 split_kv=self.decode_split_kv if self.sparse_decode else 1,
             )
         else:
+            # The DECODE form's PREFILL route: stage (4) is the EXTEND form's binding -- the adapter's paged THD leg with the group packed
+            # -- at the dense step's own envelope (num_sequences = B, max_seq_len = S_q, [B] int32 lengths all S_q: a workspace slot the
+            # block fills on the launch stream at every execute, _fill_decode_q_lens), unsplit, the gate in the body's epilogue.
+            prefill_route = self.decode_route is not None and self.decode_route.prefill_tile
             self._sdpa = _Sdpa(
                 geometry,
                 batch=self.batch,
@@ -6629,7 +6828,7 @@ class GatedAttentionBlockFwd(APIBase):
                 dtype=self.dtype,
                 device=self.device,
                 want_lse=self.return_lse,
-                seq_lens_present=self.seq_lens_present,
+                seq_lens_present=self.seq_lens_present and not prefill_route,
                 token_stride=sdpa_token_stride,
                 fuse_gate=self.gate_fused,  # the SDPA gates (epilogue, or the decode tile's split combine over the pools); else stage (5)
                 gate_token_stride=sdpa_gate_token_stride,
@@ -6637,19 +6836,20 @@ class GatedAttentionBlockFwd(APIBase):
                 gate_dtype=act,  # gate16 / the slab's GATE columns are the activation dtype (bf16 under FP8 / MXFP8)
                 mxfp8=mxfp8,  # pertensor_fp8=False -> the production block-scale kernel; NATURAL read off the MXFP8 row (D5)
                 # THD: the (num_sequences, max_seq_len) envelope, the packed total T = batch * seq_len, the lengths' form.
-                thd=self.thd,
-                num_sequences=self.num_sequences,
-                max_seq_len=self.max_seq_len,
-                cu_seqlens=self.cu_seqlens,
+                thd=self.thd or prefill_route,
+                num_sequences=self.batch if prefill_route else self.num_sequences,
+                max_seq_len=self.seq_len if prefill_route else self.max_seq_len,
+                cu_seqlens=False if prefill_route else self.cu_seqlens,
                 # The EXTEND form: K / V from the pools (their descriptors as declared), the block table's strides, the page size.
                 kv_source=self.kv_source,
                 paged_page_size=self.paged_kv_page_size if self.kv_source == KV_SOURCE_PAGED else 0,
                 k_cache_desc=self._descs["k_cache"],
                 v_cache_desc=self._descs["v_cache"],
                 block_table_desc=self._descs["block_table"],
-                # The DECODE form: the KV bound and the split the form lowers with (the defaults otherwise).
+                # The DECODE form: the KV bound and the split the form lowers with (the defaults otherwise), the route read under the policy.
                 max_kv_len=self.max_kv_len if self.decode_route is not None else 0,
                 decode_split_kv=self.decode_split_kv if self.decode_route is not None else 1,
+                route=self.decode_route,
             )
         # Stage (5) lives in the SDPA kernel's gate epilogue under fuse_gate --
         # not built rather than built and skipped (it would still compile).
@@ -7248,7 +7448,17 @@ class GatedAttentionBlockFwd(APIBase):
     # -- the serving forms: the declaration table and the envelope ------------
 
     def _check_serving_declaration(
-        self, kv_source, token_capacity, quant, sample_k_cache, sample_v_cache, sample_block_table, device, max_kv_len=None, decode_split_kv=None
+        self,
+        kv_source,
+        token_capacity,
+        quant,
+        sample_k_cache,
+        sample_v_cache,
+        sample_block_table,
+        device,
+        max_kv_len=None,
+        decode_split_kv=None,
+        decode_route_policy=None,
     ):
         """``kv_source`` / ``token_capacity`` at declaration -- the argument contract first (``kv_source`` one of
         :data:`_KV_SOURCES`; ``token_capacity`` None or a positive int equal to the samples' packed row count), then the
@@ -7294,7 +7504,9 @@ class GatedAttentionBlockFwd(APIBase):
                 f"token_capacity={token_capacity} must equal the samples' packed token rows T={t}: the samples ARE the capacity (declare sample_h / "
                 "sample_cos / sample_sin / sample_out with T_max rows); a step then hands lengths summing to T_live <= T_max"
             )
-        decode_extras = [nm for nm, x in (("max_kv_len", max_kv_len), ("decode_split_kv", decode_split_kv)) if x is not None]
+        decode_extras = [
+            nm for nm, x in (("max_kv_len", max_kv_len), ("decode_split_kv", decode_split_kv), ("decode_route_policy", decode_route_policy)) if x is not None
+        ]
         samples = (("sample_k_cache", sample_k_cache), ("sample_v_cache", sample_v_cache), ("sample_block_table", sample_block_table))
         if kv_source != KV_SOURCE_PAGED:
             given = [nm for nm, x in samples if x is not None] + decode_extras
@@ -7381,9 +7593,15 @@ class GatedAttentionBlockFwd(APIBase):
                         "split has an empty chunk (a dead work item) on every item -- pass a split in [1, that count], or None for the fill rule"
                     )
             return kv_source, token_capacity, None, int(max_kv_len), split
-        route = decode_route(g, self.seq_len)
+        route = decode_route(g, self.seq_len, policy=self.decode_route_policy)
         if not route.served:
             raise NotImplementedError(f"kv_source='paged': {route.reason}")
+        if route.prefill_tile and decode_split_kv is not None and int(decode_split_kv) > 1:
+            raise NotImplementedError(
+                f"decode_split_kv={decode_split_kv} on the DECODE form's prefill route (S_q={self.seq_len} at group {route.group} rides the paged d256 "
+                f"prefill tile with the group packed, which runs unsplit): the split-KV plan is the decode tile's -- pass decode_split_kv=None or 1, or "
+                f"declare decode_route_policy={DECODE_ROUTE_TOKEN_UNITS!r} for the decode tile in token units"
+            )
         if decode_split_kv is None:
             dev = torch.device(device)
             sm = torch.cuda.get_device_properties(dev).multi_processor_count if (dev.type == "cuda" and torch.cuda.is_available()) else 0
@@ -7394,7 +7612,13 @@ class GatedAttentionBlockFwd(APIBase):
 
     @classmethod
     def serving_envelope(
-        cls, geometry: GatedAttentionBlockGeometry, dtype: torch.dtype, device, *, device_cc: Optional[Tuple[int, int]] = None
+        cls,
+        geometry: GatedAttentionBlockGeometry,
+        dtype: torch.dtype,
+        device,
+        *,
+        device_cc: Optional[Tuple[int, int]] = None,
+        decode_route_policy: Optional[str] = None,
     ) -> ServingEnvelope:
         """The static serving envelope for ``(geometry, dtype, device)`` -- what a serving stack's INIT-time dispatch predicate
         reads instead of catching the block's exceptions.  Derived from the SAME code the constructor and ``check_support`` run:
@@ -7408,9 +7632,12 @@ class GatedAttentionBlockFwd(APIBase):
         ``check_support`` here, and each form's ``declines`` lists every typed decline it raises at declaration with its message;
         ``decode.routes`` names the kernel per ``S_q`` (:func:`decode_route`).  ``forms`` holds the served forms.  No allocation, no
         launch; safe to call on any device (``served`` is simply False off Rubin; a non-CUDA ``device`` reads as no CUDA device).
-        ``device_cc`` (appended) overrides the device's compute capability for a host-side reading of another part's envelope."""
+        ``device_cc`` (appended) overrides the device's compute capability for a host-side reading of another part's envelope;
+        ``decode_route_policy`` (appended) is the policy ``decode.routes`` / ``decode.route()`` are read under (``None`` = the default,
+        :data:`DEFAULT_DECODE_ROUTE_POLICY`; ``decode.policy`` names it)."""
         from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
 
+        policy = _resolve_decode_route_policy(decode_route_policy)
         cc = tuple(int(x) for x in device_cc) if device_cc is not None else _device_cc_of(device)
         dsl_reason = cutedsl_requirement_error("the gated attention block's serving forms")
         if dsl_reason is None and cc == _SM107_CC:
@@ -7469,11 +7696,14 @@ class GatedAttentionBlockFwd(APIBase):
             declines={name: msg for name, _exc, _pred, msg in _EXTEND_DECLINES if name in _DECODE_DECLINE_NAMES},
             max_s_q=DECODE_MAX_S_Q,
             max_rows=DECODE_MAX_ROWS,
-            routes=tuple(decode_route(geometry, s) for s in range(1, 2 * DECODE_MAX_S_Q + 1)) if (has_group and not sparse) else (),
+            # the declared envelope and its first decline, under the policy asked for
+            routes=tuple(decode_route(geometry, s, policy=policy) for s in range(1, DECODE_MAX_S_Q + 2)) if (has_group and not sparse) else (),
             _geometry=geometry,
             sparse_core=sparse,
             # the e4m3 cache (the gathered cast + the decode tile) is a form of the block-sparse decode mode with bf16 activations only
             kv_cache_dtypes=(dtype,) + ((KV_CACHE_E4M3,) if (sparse and dtype == torch.bfloat16) else ()),
+            policy=policy,
+            claimed_max_s_q=DECODE_CLAIMED_MAX_S_Q,
         )
         forms = tuple(nm for nm, env in (("extend", extend), ("decode", decode)) if env.served)
         return ServingEnvelope(
@@ -7673,6 +7903,9 @@ class GatedAttentionBlockFwd(APIBase):
             thd_num_sequences=self.num_sequences if self.thd else 0,
             kv_cache_e4m3=self.kv_cache_e4m3,
             upcast_items=(self.batch * self.seq_len * self.geom.h_kv) if self.upcast_decode else 0,
+            # the prefill route's [B] int32 Q lengths (a declaration fact: the route is read at declaration, so get_workspace_size()
+            # before compile() already counts the slot)
+            decode_q_lens=self.batch if (self.decode_route is not None and self.decode_route.prefill_tile) else 0,
         )
 
     def get_workspace_size(self) -> int:
@@ -7704,6 +7937,8 @@ class GatedAttentionBlockFwd(APIBase):
             # deterministic mode a NaN fill -- is behind this event; _write_quant_dev waits on it before writing on any stream
             self._quant_dev_ready = torch.cuda.Event()
             self._quant_dev_ready.record(torch.cuda.current_stream(self.device))
+        # The DECODE form's PREFILL route's per-sequence Q lengths are a workspace slot (_Intermediates.decode_q_lens, in self._ws above),
+        # filled by every execute on its launch stream (_fill_decode_q_lens): nothing to allocate or to record here.
 
     def _quant_dev_values(self, spec: Optional[Union[QuantSpec, MxQuantSpec]]) -> Optional[dict]:
         """The per-tensor scalars of ``spec`` the block holds as 1-element fp32 device tensors, as ``{name: float}`` -- the ONE
@@ -7773,6 +8008,18 @@ class GatedAttentionBlockFwd(APIBase):
             spec.validate()
         if self._ws is None:
             raise RuntimeError("call compile() before update_quant_scales(): the device scalars it rewrites are materialised there")
+
+    def _fill_decode_q_lens(self, workspace: torch.Tensor, stream: int) -> torch.Tensor:
+        """The prefill route's per-sequence Q lengths -- the constant ``S_q`` of every sequence of the dense step -- as the ``[B]`` int32
+        VIEW of the caller's workspace slot ``_Intermediates.decode_q_lens`` (Rule 8 recipe R2: carved, never allocated), FILLED on
+        ``stream`` (a raw CUstream handle: the launch stream, so the SDPA that reads them is ordered behind the fill by construction,
+        Rule 5) on EVERY execute (recipe R4: one fill of ``4 x B`` bytes, nothing read back, no first-execute flag).  A stream capture
+        of an execute records the fill WITH its value and every replay re-fills the slot before the attention kernel; an eager execute
+        after a capture -- replayed or not -- fills its own, so no execute ever hands the paged THD leg an unwritten vector."""
+        q_lens = _view(workspace, self._ws.decode_q_lens, (self.batch,), torch.int32)
+        with torch.cuda.stream(as_torch_stream(stream, self.device)):
+            q_lens.fill_(self.seq_len)
+        return q_lens
 
     def _write_quant_dev(self, spec, stream: int) -> None:
         """Write ``spec``'s scalars into the device tensors of :meth:`_make_quant_dev` -- and, on the fully fused fp8 pipeline, into
@@ -8276,6 +8523,10 @@ class GatedAttentionBlockFwd(APIBase):
             # (update_quant_scales's docstring).
             self._write_quant_dev(self.quant, stream)
             self._quant_dev_on_launch_stream = True
+        # The prefill route's Q lengths (the constant S_q per sequence): the workspace slot, filled on this launch stream on EVERY execute
+        # before the SDPA that reads it (Rule 5; a capture records the fill with its value, an eager execute fills its own).  None on
+        # every other form (no slot reserved).
+        decode_q_lens = self._fill_decode_q_lens(workspace, stream) if ws.decode_q_lens >= 0 else None
 
         fp8 = self.quant is not None
         mxfp8 = self.mxfp8
@@ -8521,7 +8772,9 @@ class GatedAttentionBlockFwd(APIBase):
                 v_c.view(self.batch, self.seq_len, g.h_kv, g.d_head),
                 o.view(self.batch, self.seq_len, g.h_q, g.d_head),
                 lse=lse,
-                seq_lens=seq_lens,
+                # the prefill route hands the paged THD leg the block's own constant Q lengths (the workspace slot, [B] int32, all S_q);
+                # every other form the caller's
+                seq_lens=decode_q_lens if decode_q_lens is not None else seq_lens,
                 workspace=engine_ws,
                 current_stream=cuda.CUstream(stream),
                 gate=gate_src.view(self.batch, self.seq_len, g.h_q, g.d_head) if self.gate_fused else None,

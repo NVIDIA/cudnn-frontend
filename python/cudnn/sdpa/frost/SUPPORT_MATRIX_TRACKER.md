@@ -2758,10 +2758,12 @@ under the lengths form, and a block table WIDER than `max_pages` (`[2, 40]` at t
 the step's tokens written through, then stage (4) over the first `kv_lens[b]` keys of every sequence's `block_table` row --
 `seq_kv_lens = kv_lens`, `seq_q_lens = None`, the batch uniform, bottom-right causal -- on the Rubin d256 DECODE tile
 (`sm107/decode_d256_f16.py`: PackGQA over the whole group, the decode split model's split-KV with fp32 partials in the block's
-workspace and one combine launch, `fuse_gate` applied IN THE COMBINE), the same tile unpacked past the packed route (one head per
-CTA, `S_q <= 32`); a wider dense step is a typed decline at declaration (the adapter serves dense half queries over paged K / V
-on the decode tile only -- the paged prefill body is the EXTEND form's). `GatedAttentionBlockFwd.serving_envelope()` is the static record
-(forms, page sizes, pool layouts, the route per `(group, S_q)`). Validated on a Rubin development node (cc 10.7, 204 SMs;
+workspace and one combine launch, `fuse_gate` applied IN THE COMBINE) in ONE token unit where its single-unit width table holds the
+packed rows; past the table on the paged d256 PREFILL tile with the group packed where that tile packs the group, else the decode
+tile's token-unit and unpacked arms (the 2026-10-15 paragraph below: the table-driven route, the declared envelope `S_q <= 8` and 128
+packed rows, the `decode_route_policy` knob); a step past the declared envelope is a typed decline at declaration (a longer or wider
+dense step over the pools is the EXTEND form's packed business). `GatedAttentionBlockFwd.serving_envelope()` is the static record
+(forms, page sizes, pool layouts, the route per `(group, S_q)` and policy). Validated on a Rubin development node (cc 10.7, 204 SMs;
 functional cells, no perf claim; `test/python/gated_attention_block/cutedsl/test_block_serving_decode.py`) at a shrunk
 `d_model = 512` with `B = 4` batches holding one KV tile with a tail (`kv_lens` 100), the ring depth exactly (384), four tiles
 with a tail (500) and a PADDED entry (`kv_lens = 0`, block table row 0, slot -1) -- `out` within the dense suite's budget of the
@@ -2769,18 +2771,19 @@ per-sequence fp32 oracle (the block on the full sequence, its last `S_q` rows; t
 rows; cos > 0.999 on every live row, the padded entry's rows EXACTLY 0, block 0's bytes untouched), the compiled kernel pinned
 against the declared route (template, packing, split, `epilogue_gate` False):
 
-| group (`H_q / H_kv`) | `S_q = 1` | `S_q = 2` | `S_q = 3` | `S_q = 4` | `S_q = 5` | `S_q > 32` |
-|---|---|---|---|---|---|---|
-| 16 (32 / 2) | tile 16, packed, 1 unit ✅ | tile 32, packed, 1 unit ✅ | tile 32, packed, 2 units ✅ | tile 32, packed, 2 units ✅ | tile 16, UNPACKED (declared, unmeasured) ✅ | typed decline (the EXTEND form) |
-| 12 (24 / 2) | tile 16, packed, 1 unit ✅ | tile 32, packed, 1 unit ✅ | tile 32, packed, 2 units ✅ | tile 32, packed, 2 units ✅ | tile 16, UNPACKED (declared, unmeasured) ✅ | typed decline |
-| 8 (8 / 1) | tile 16, packed, 1 unit ✅ | tile 16, packed, 1 unit ✅ | tile 32, packed, 1 unit ✅ | tile 32, packed, 1 unit ✅ | tile 32, packed, 2 units (declared, unmeasured) ✅ | typed decline |
-| 6 (24 / 4) | tile 16, packed, 1 unit ✅ | tile 16, packed, 1 unit ✅ | tile 32, packed, 1 unit ✅ | tile 32, packed, 1 unit ✅ | tile 32, packed, 1 unit (declared, unmeasured) ✅ | typed decline |
-| 4 (4 / 1, the 397B TP 8 shard; 2026-10-13) | tile 16, packed, 1 unit ✅ (also at `d_model` 4096, page 64) | tile 16, packed, 1 unit ✅ | tile 16, packed, 1 unit ✅ | tile 16, packed, 1 unit ✅ | tile 32, packed, 1 unit (declared, unmeasured) ✅ | typed decline |
-| 16 (16 / 1, the 397B TP 2 shard, ONE KV head; 2026-10-13) | tile 16, packed, 1 unit ✅ (at `d_model` 4096, page 16) | the 32 / 2 row's route (declared; not re-run at 16 / 1) | same | same | same | typed decline |
+| group (`H_q / H_kv`) | `S_q = 1` | `S_q = 2` | `S_q = 3` | `S_q = 4` | `S_q = 5` | `S_q = 8` | `S_q > 8`, or `S_q x group > 128` |
+|---|---|---|---|---|---|---|---|
+| 16 (32 / 2) | tile 16, packed, 1 unit ✅ | tile 32, packed, 1 unit ✅ | PREFILL tile, packed (2026-10-15; `token_units` policy: tile 32, 2 units ✅) ✅ | PREFILL tile, packed (`token_units`: tile 32, 2 units ✅) ✅ | PREFILL tile, packed ✅ | PREFILL tile, packed, 128 rows ✅ | typed decline (the EXTEND form) |
+| 12 (24 / 2) | tile 16, packed, 1 unit ✅ | tile 32, packed, 1 unit ✅ | tile 32, packed, 2 units ✅ | tile 32, packed, 2 units ✅ | tile 16, UNPACKED (declared, unmeasured) ✅ | tile 16, UNPACKED (declared, unmeasured) ✅ | typed decline |
+| 8 (8 / 1) | tile 16, packed, 1 unit ✅ | tile 16, packed, 1 unit ✅ | tile 32, packed, 1 unit ✅ | tile 32, packed, 1 unit ✅ | PREFILL tile, packed (`token_units`: tile 32, 2 units ✅) ✅ | PREFILL tile, packed ✅ | typed decline |
+| 6 (24 / 4) | tile 16, packed, 1 unit ✅ | tile 16, packed, 1 unit ✅ | tile 32, packed, 1 unit ✅ | tile 32, packed, 1 unit ✅ | tile 32, packed, 1 unit (declared, unmeasured) ✅ | tile 32, packed, 2 units (declared, not re-run) | typed decline |
+| 4 (4 / 1, the 397B TP 8 shard; 2026-10-13) | tile 16, packed, 1 unit ✅ (also at `d_model` 4096, page 64) | tile 16, packed, 1 unit ✅ | tile 16, packed, 1 unit ✅ | tile 16, packed, 1 unit ✅ | tile 32, packed, 1 unit (declared, unmeasured) ✅ | tile 32, packed, 1 unit (declared, not re-run) | typed decline |
+| 16 (16 / 1, the 397B TP 2 shard, ONE KV head; 2026-10-13) | tile 16, packed, 1 unit ✅ (at `d_model` 4096, page 16) | the 32 / 2 row's route (declared; not re-run at 16 / 1) | same | same | same | same | typed decline |
 
-The CLAIMED envelope (`DecodeRoute.claimed`) is the packed tile at `S_q <= 4`; the packed route reaches `S_q = 8` at 8 / 1,
-`S_q = 10` at 24 / 4 and `S_q = 16` at 4 / 1 and the unpacked tile `S_q = 32` at every group -- routed, declared by the envelope,
-correct on the cells run, unmeasured (the serving perf cells). The pool matrix on the decode tile (the three stride patterns holding the
+The CLAIMED envelope (`DecodeRoute.claimed`) is the packed DECODE tile at `S_q <= 4` -- the measured cells (24 / 2 at every `S_q <= 4`
+under both policies, 32 / 2 at `S_q <= 2` under the default policy); every PREFILL-tile cell, the token-unit cells past `S_q = 4` and the
+unpacked arm are routed, declared by the envelope, correct on the cells run, unmeasured (the serving perf cells; the two routes' A/B is
+the MTP perf plan's). The pool matrix on the decode tile (the three stride patterns holding the
 same values BITWISE on `out`, each within the oracle's budget; `kv_lens` 200 / 0 / 77 / 1000 at 24 / 2, `S_q = 2`):
 
 | form | pool layout | page 16 | page 32 | page 64 | page 128 |
@@ -2823,7 +2826,33 @@ the route table -- its rows of the route table); 16 / 1 rides group 16's route w
 `S_q`, pinned on the CPU. The shards' `S_q > 1` decode steps and every page / layout cell beyond the ones named are functional
 claims only -- no perf claim before the serving perf cells land.
 
-Not served (typed declines by name; each lands with its accept cell and flips this section in the same change): an LSE / a sliding window or a right band / a `QsaSpec` / another head dim on the paged forms, a dense step wider than 32 rows (the DECODE form's `decode_rows` row: the EXTEND form's packed business), `save_for_backward` / `quant` on the paged forms, e4m3 pools (`kv_cache_dtype`) on the DENSE paged forms (served on the block-sparse decode mode at `S_q <= 4` and as the quantizing write-through on the dense prefill forms -- the e4m3 paragraph below), the write-through folded into the projection epilogue, `quant` / `save_for_backward` together with the write-through attribute; the DECODE form's `S_q > 4` arms and every page / layout cell above are functional claims only -- no perf claim before the serving perf cells land.
+**Changed 2026-10-15 -- the DECODE route is TABLE-DRIVEN and the declared envelope runs to `S_q = 8` (an MTP-7 verify step) and 128
+packed rows** (`decode_route(geometry, S_q, policy=)`, `GatedAttentionBlockFwd(..., decode_route_policy=)`, `serving_envelope(...,
+decode_route_policy=)`; `DecodeRoute.kv_streams` / `.policy` / `.prefill_tile` appended; `DECODE_MAX_S_Q` 4 -> 8, `DECODE_CLAIMED_MAX_S_Q`
+= 4, `DECODE_MAX_ROWS` 32 -> 128 = the prefill tile's Q rows). ONE table, `config_sm107.D256_DECODE_SINGLE_UNIT_Q_TILES = (16, 32)` --
+the decode tile's single-unit widths, a wider tile slots in --, and ONE rule under the default policy `"single_unit"`: packed rows within
+the widest width ride that width in ONE token unit (the KV streamed once per sequence and KV head); past the table the step rides the
+paged d256 PREFILL tile with the whole group packed (the EXTEND form's binding at the dense step's `(B, S_q)` envelope: the shared
+`sm100/prefill_d256_f16.py` body, paged THD, PackGQA, unsplit, `fuse_gate` in its epilogue -- one Q tile per sequence and KV head, the KV
+streamed once) wherever that body packs the group, i.e. a group dividing 128 (16, 8, 4, 32, ...; the cc 10.7 paged THD leg takes
+whole-group PackGQA only); a group it cannot pack (12 = 24 / 2, 6 = 24 / 4 and 6 / 1) keeps the decode tile's token-unit arm (two units,
+two streams: the measured MTP form) and the unpacked tile past it -- the fewest KV streams any kernel offers it today (a partial packing
+of the paged THD leg, gcd(group, 128) heads per row group, would cut 24 / 2 at `S_q` 5 .. 8 from 12 streams to 3; not wired on cc 10.7).
+The policy `"token_units"` is the SDPA adapter's own route verbatim (the 32-column tile in up to two units for every packed group past
+the 16-column tile, then the unpacked tile) -- the other arm of the A/B the MTP perf plan runs; the adapter's own placement
+(`config_sm107.decode_d256_q_tile`, re-expressed on the table) is unchanged at every `(S_q, group)` (pinned against the shared SM100
+rule with the Rubin constants). Typed declines: `S_q > 8` (`decode_s_q`), `S_q x group > 128` (`decode_rows`), a pinned
+`decode_split_kv > 1` on the prefill route (the paged body runs unsplit). Validated on a Rubin development node (cc 10.7, 204 SMs;
+functional cells, no perf claim; `test_block_serving_mtp_route.py` + the decode module): the prefill route vs the per-sequence fp32
+oracle at 32 / 2 `S_q` 4 / 5 / 8 (64 / 80 / 128 rows) and 8 / 1 `S_q` 5 / 8 with a padded entry (`out` rows exactly 0, block 0 untouched),
+the compiled body pinned (the shared d256 body, `PACK_GQA` / `THD_VARLEN` / `PAGED_KV` / `EPILOGUE_GATE` 1, `HEADS_PER_TILE` = the group);
+the prefill route vs the two-unit route at 32 / 2 `S_q = 4` on IDENTICAL inputs (both within the oracle's budget, cos > 0.9999 between
+them); the unpacked arm at 24 / 2 `S_q = 8`; the gate in the body vs the separate launch; two launches bitwise; the workspace honest (the
+THD metadata inside); the FIRST execute of an `S_q = 8` step captured on a new stream with no warm-up under `set_sync_debug_mode("error")`,
+the replay bitwise the eager run and over new lengths / tables / slots / inputs; the host cells (the table, a 64 entry slotted in, the rule,
+the route per policy at every served group and the corner groups, the two reject rows, the declaration facts, the envelope per policy).
+
+Not served (typed declines by name; each lands with its accept cell and flips this section in the same change): an LSE / a sliding window or a right band / a `QsaSpec` / another head dim on the paged forms, a dense step past `S_q = 8` or 128 packed rows (the DECODE form's `decode_s_q` / `decode_rows` rows: the EXTEND form's packed business), a pinned split on the prefill route, `save_for_backward` / `quant` on the paged forms, e4m3 pools (`kv_cache_dtype`) on the DENSE paged forms (served on the block-sparse decode mode at `S_q <= 4` and as the quantizing write-through on the dense prefill forms -- the e4m3 paragraph below), the write-through folded into the projection epilogue, `quant` / `save_for_backward` together with the write-through attribute; the DECODE form's `S_q > 4` arms and every page / layout cell above are functional claims only -- no perf claim before the serving perf cells land.
 
 **Served since 2026-10-14 -- the BLOCK-SPARSE DECODE / extend-with-prefix mode** (`kv_source="paged"` on a dense `[B, S_q]`
 declaration of a `QsaSpec` geometry with `geometry.causal_bottom_right=True` + the pools' and the block table's samples, the table

@@ -1417,8 +1417,10 @@ def test_extend_typed_declines_match_the_envelope_row_by_row(monkeypatch):
     d128 = dict(_EXTEND_GEOM, d_head=128, d_model=256)
     trips = {
         "write_through": lambda: _declare_extend_with(2, 128, good, page=0),
-        # a dense paged declaration IS the DECODE form now (test_block_serving_decode.py); past the decode tile's 32 rows it is this row
-        "decode_rows": lambda: _make_block(_EXTEND_GEOM, 1, 64, paged_kv_page_size=16, kv_source=KV_SOURCE_PAGED),
+        # a dense paged declaration IS the DECODE form now (test_block_serving_decode.py): past S_q 8 it is the decode_s_q row (heard
+        # first), and within S_q 8 but past the prefill tile's 128 packed rows (64 / 2 = group 32 at S_q 5: 160 rows) the decode_rows row
+        "decode_s_q": lambda: _make_block(_EXTEND_GEOM, 1, 9, paged_kv_page_size=16, kv_source=KV_SOURCE_PAGED),
+        "decode_rows": lambda: _make_block(dict(_EXTEND_GEOM, h_q=64, h_kv=2), 1, 5, paged_kv_page_size=16, kv_source=KV_SOURCE_PAGED),
         "diagonal": lambda: _declare_extend(2, 128, max_kv_len=128, geom_kw=_SMALL_D256),
         # the PACKED form over the pools on a QsaSpec geometry (a dense one is the block-sparse decode mode since 2026-10-14: _declare_dense_sparse_paged)
         "sparse": lambda: _declare_extend(2, 128, max_kv_len=128, geom_kw=dict(_SMALL_D256, qsa=QsaSpec())),
