@@ -94,6 +94,7 @@ from cudnn.sdpa.fwd.engines import (
     _synth_kv_padding,
     _thd_decode_leg,
     d256_decode_tile_selected,
+    _facts_decode_form,
     decode_d256_q_tile_for_row,
     effective_cgas,
     effective_sched_policies,
@@ -1680,7 +1681,7 @@ def _split_points(
         # (head group, batch) into: every unit is one more CTA streaming the KV range (the MTP step at
         # 24/2 = two units of two tokens), so the model sees them as streams; the KV range of a unit
         # spans its tokens (token_span = tokens per unit).
-        decode_q_tile = decode_d256_q_tile_for_row(caps, facts.s_q, decode_pack_g)
+        decode_q_tile = decode_d256_q_tile_for_row(caps, facts.s_q, decode_pack_g, *_facts_decode_form(facts))
         tok_units = decode_d256_q_units(facts.s_q, decode_pack_g, decode_q_tile)
         geometry = dict(
             units=facts.b * (facts.h_q // decode_pack_g) * tok_units,

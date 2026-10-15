@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from .api import (
+    DECODE_CLAIMED_MAX_N_Q,
     DECODE_CLAIMED_MAX_S_Q,
     DECODE_MAX_ROWS,
     DECODE_MAX_S_Q,
@@ -40,6 +41,7 @@ from .api_bwd import (
 )
 
 __all__ = [
+    "DECODE_CLAIMED_MAX_N_Q",
     "DECODE_CLAIMED_MAX_S_Q",
     "DECODE_MAX_ROWS",
     "DECODE_MAX_S_Q",

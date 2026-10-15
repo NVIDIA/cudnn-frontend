@@ -309,10 +309,31 @@ def test_sm107_decode_config_twin_backstops():
         64,
         (64,),
     )
-    # Compiled, template-tested, NOT routed at this commit: the production rule keeps the 24/2 and 32/2 MTP steps at S_q = 4
-    # on the 32-column tile in two token units (D256_DECODE_ROUTED_MAX_Q_ROWS stays 32); pointing the route at the width is the
-    # route rule's own change, measured first.
-    assert config_sm107.D256_DECODE_ROUTED_MAX_Q_ROWS == 32 and config_sm107.decode_d256_q_tile(4, 12) == config_sm107.decode_d256_q_tile(4, 16) == 32
+    # ROUTED: the width is the last entry of the single-unit table, so the 24/2 and 32/2 MTP steps at S_q = 4 ride it in ONE unit
+    # wherever its form predicate admits the step; the cap decode_q_tile_max=32 restores the two-unit 32-column route, value for value.
+    assert config_sm107.D256_DECODE_SINGLE_UNIT_Q_TILES == (16, 32, 64) and config_sm107.D256_DECODE_ROUTED_MAX_Q_ROWS == 64
+    assert config_sm107.decode_d256_q_tile(4, 12) == config_sm107.decode_d256_q_tile(4, 16) == 64
+    assert config_sm107.decode_d256_q_tile(4, 12, max_q_tile=32) == config_sm107.decode_d256_q_tile(4, 16, max_q_tile=32) == 32
+    # The form predicate (the route's reading) agrees with the validator (the record's reading) on every form of the width: a packed
+    # group of >= 2 heads; over pages the causal / window mask.  Two readings of one rule, pinned cell by cell.
+    for pack, paged, masked in ((1, False, True), (1, True, True), (2, False, False), (2, True, False), (2, True, True), (12, True, True), (16, False, False)):
+        params = TemplateParams(
+            decode_q_tile=64,
+            seq_kv_lens_present=True,
+            dtype_qkv=2,
+            pack_gqa=pack > 1,
+            qh_per_kh=pack,
+            paged_kv=paged,
+            page_size=16 if paged else 0,
+            **({"bottom_right": True, "window_right": 0} if masked else {}),
+        )
+        admits = config_sm107.decode_d256_wide_tile_admits(pack, paged, masked)
+        if admits:
+            assert make_cfg_d256_decode(params)[0].N_Q == 64, (pack, paged, masked)
+        else:
+            with pytest.raises(ValueError, match="PACKED groups of at least 2 heads|needs the causal / window mask"):
+                make_cfg_d256_decode(params)
+        assert (config_sm107.decode_d256_route_widths(pack, paged=paged, masked=masked) == (16, 32, 64)) is admits, (pack, paged, masked)
 
 
 def test_sm107_decode_module_declines_below_the_dsl_floor(monkeypatch):
@@ -335,10 +356,13 @@ def test_sm107_decode_module_declines_below_the_dsl_floor(monkeypatch):
 def test_decode_q_tile_rule():
     """The SM100 routing rule is untouched (16 rows ride the decode tile; the 32-column tile is a
     valid config, D256_DECODE_MAX_Q_ROWS, that line does not select) and the Rubin rule
-    (config_sm107.decode_d256_q_tile) extends it: rows in (16, 32] ride the 32-column tile in one
-    unit, a PACKED group may take two TOKEN UNITS of it (the MTP step), an unpacked / MHA step one
-    unit only; past that (a third unit, a group wider than the tile) the prefill kernel.  The unit
-    count is the kernel's own derivation (ceil(S_q / (N_Q // G)), decode_d256_q_units)."""
+    (config_sm107.decode_d256_q_tile) is TABLE-DRIVEN over (16, 32, 64): rows within a width ride the
+    narrowest such width in one unit -- the 64-column width for the forms its predicate admits (a
+    packed group of >= 2 heads; over pages the causal / window mask) --, a PACKED group past the table
+    takes two TOKEN UNITS of the widest admitted width, an unpacked / MHA step one unit of up to 32
+    rows; past that the prefill kernel.  ``max_q_tile=32`` is the route before the 64-column width
+    landed, value for value.  The unit count is the kernel's own derivation (ceil(S_q / (N_Q // G)),
+    decode_d256_q_units)."""
     from cudnn.sdpa.fwd import config_sm107
     from cudnn.sdpa.fwd.config_sm100 import D256_DECODE_MAX_Q_ROWS, D256_DECODE_ROUTED_MAX_Q_ROWS, decode_d256_q_tile, decode_d256_q_units
 
@@ -347,23 +371,48 @@ def test_decode_q_tile_rule():
     assert decode_d256_q_tile(1, 16) == decode_d256_q_tile(2, 8) == decode_d256_q_tile(16, 1) == 16
     for s_q, g in ((2, 16), (1, 32), (17, 1), (32, 1), (3, 16), (33, 1), (1, 64), (0, 16), (2, 12), (4, 12)):
         assert decode_d256_q_tile(s_q, g) == 0, (s_q, g)
-    # The Rubin route.
+    # The Rubin route: the serving form (packed, over pages, bottom-right causal) and a dense cache admit the 64-column width.
     rubin = config_sm107.decode_d256_q_tile
-    assert (config_sm107.D256_DECODE_ROUTED_MAX_Q_ROWS, config_sm107.D256_DECODE_ROUTED_MAX_TOKEN_UNITS) == (32, 2)
+    assert (config_sm107.D256_DECODE_ROUTED_MAX_Q_ROWS, config_sm107.D256_DECODE_ROUTED_MAX_TOKEN_UNITS) == (64, 2)
+    assert config_sm107.D256_DECODE_SINGLE_UNIT_Q_TILES == (16, 32, 64) == config_sm107._D256_DECODE_Q_TILES_SM107
     for s_q, g in ((1, 12), (1, 16), (2, 8), (16, 1), (2, 6), (1, 1)):
         assert rubin(s_q, g) == 16 and decode_d256_q_units(s_q, g, 16) == 1, (s_q, g)  # one unit of the 16-column tile, as on SM100
-    for s_q, g, units in ((2, 12, 1), (3, 12, 2), (4, 12, 2), (2, 16, 1), (4, 16, 2), (4, 8, 1), (8, 8, 2), (1, 32, 1), (2, 32, 2), (4, 6, 1), (10, 6, 2)):
-        assert rubin(s_q, g) == 32 and decode_d256_q_units(s_q, g, 32) == units, (s_q, g, units)  # the 32-column tile, packed
+    for s_q, g in ((2, 12), (2, 16), (4, 8), (1, 32), (4, 6), (5, 4)):
+        assert rubin(s_q, g) == 32 and decode_d256_q_units(s_q, g, 32) == 1, (s_q, g)  # the 32-column tile, packed, one unit
     for s_q in (17, 24, 32):
         assert rubin(s_q, 1) == 32 and decode_d256_q_units(s_q, 1, 32) == 1, s_q  # an unpacked / MHA step of up to 32 tokens: one unit
-    for s_q, g in ((5, 12), (5, 16), (9, 8), (3, 32), (11, 6), (33, 1), (64, 1), (1, 64), (0, 16), (4, 0)):
+    for s_q, g, units in ((3, 12, 1), (4, 12, 1), (5, 12, 1), (6, 12, 2), (8, 12, 2), (3, 16, 1), (4, 16, 1), (5, 16, 2), (8, 16, 2), (8, 8, 1), (9, 8, 2)):
+        assert rubin(s_q, g) == 64 and decode_d256_q_units(s_q, g, 64) == units, (s_q, g, units)  # the 64-column tile, packed
+    for s_q, g, units in ((2, 32, 1), (3, 32, 2), (4, 32, 2), (1, 64, 1), (2, 64, 2), (6, 6, 1), (10, 6, 1), (11, 6, 2)):
+        assert rubin(s_q, g) == 64 and decode_d256_q_units(s_q, g, 64) == units, (s_q, g, units)
+    for s_q, g in ((11, 12), (9, 16), (5, 32), (3, 64), (33, 1), (64, 1), (1, 65), (0, 16), (4, 0)):
         assert rubin(s_q, g) == 0, (s_q, g)  # past the route: a third unit, an unpacked step above 32 tokens, a group wider than the tile
+    # The forms the 64-column width declines keep the (16, 32) table: an unpacked step (the predicate reads pack_g), a mask-free PAGED step.
+    for s_q, g in ((3, 12), (4, 12), (4, 16), (2, 32)):
+        assert rubin(s_q, g, paged=True, masked=False) == 32 and rubin(s_q, g, paged=False, masked=False) == 64, (s_q, g)
+    assert rubin(5, 12, paged=True, masked=False) == 0 and rubin(5, 16, paged=True, masked=False) == 0 and rubin(6, 16, paged=True, masked=False) == 0
+    assert config_sm107.decode_d256_route_widths(1) == config_sm107.decode_d256_route_widths(12, paged=True, masked=False) == (16, 32)
+    assert (
+        config_sm107.decode_d256_route_widths(12, paged=True, masked=True)
+        == (16, 32, 64)
+        == config_sm107.decode_d256_route_widths(2, paged=False, masked=False)
+    )
+    assert config_sm107.decode_d256_route_widths(12, max_q_tile=16) == (16,) and config_sm107.decode_d256_route_widths(12, max_q_tile=32) == (16, 32)
+    # The cap: the route before the width landed, value for value (the former shared rule with the Rubin constants).
+    from cudnn.sdpa.fwd.config_sm100 import decode_d256_q_tile as shared_rule
+
+    for s_q in range(0, 70):
+        for g in (0, 1, 2, 3, 4, 5, 6, 8, 12, 16, 24, 32, 33, 64):
+            assert rubin(s_q, g, max_q_tile=32) == shared_rule(s_q, g, 32, 2 if g > 1 else 1), (s_q, g)
+            assert rubin(s_q, g, max_token_units=1) == config_sm107.decode_d256_single_unit_q_tile(s_q, g), (s_q, g)
     assert decode_d256_q_units(4, 12, 0) == 0 and decode_d256_q_units(1, 64, 32) == 0
     from cudnn.sdpa.fwd import engines
 
     caps107 = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _engine())
     caps100 = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name(arch="sm100"))
-    assert engines.decode_d256_q_tile_for_row(caps107, 4, 12) == 32 and engines.decode_d256_q_tile_for_row(caps100, 4, 12) == 0
+    assert engines.decode_d256_q_tile_for_row(caps107, 4, 12) == 64 and engines.decode_d256_q_tile_for_row(caps100, 4, 12) == 0
+    assert engines.decode_d256_q_tile_for_row(caps107, 4, 12, paged=True, masked=False) == 32  # the facts twin reads the form too
+    assert engines.decode_d256_q_tile_for_row(caps107, 4, 12, paged=True, masked=True) == 64
 
 
 def test_sm107_row_and_predicate_agree_on_the_decode_tile():
@@ -398,8 +447,15 @@ def test_sm107_row_and_predicate_agree_on_the_decode_tile():
         reason = engines.mismatch(caps, g, None)
         assert reason and "Rubin paged KV requires THD" in reason, (change, reason)
     assert engines.d256_decode_tile_selected(caps, SdpaGraphFacts(**{**base, "s_q": 2}), 16)  # 32 packed rows: the 32-column tile, one unit
-    assert engines.d256_decode_tile_selected(caps, SdpaGraphFacts(**{**base, "s_q": 4}), 12)  # 48 packed rows: two token units
+    # base is a PADDED, mask-free paged graph: the 64-column width's predicate declines it, so the (16, 32) table rules here
+    assert engines.d256_decode_tile_selected(caps, SdpaGraphFacts(**{**base, "s_q": 4}), 12)  # 48 packed rows: two token units of the 32-column tile
     assert not engines.d256_decode_tile_selected(caps, SdpaGraphFacts(**{**base, "s_q": 5}), 12)  # 60 packed rows: a third unit, past the route
+    assert engines._facts_decode_form(SdpaGraphFacts(**base)) == (True, False)
+    causal = {**base, "causal": True, "right_bound": 0}  # the serving MTP form: bottom-right causal over pages -> the 64-column width
+    assert engines._facts_decode_form(SdpaGraphFacts(**causal)) == (True, True)
+    assert engines.d256_decode_tile_selected(caps, SdpaGraphFacts(**{**causal, "s_q": 5}), 12)  # 60 rows: ONE unit of the 64-column tile
+    assert engines.d256_decode_tile_selected(caps, SdpaGraphFacts(**{**causal, "s_q": 8}), 12)  # 96 rows: two units of it
+    assert not engines.d256_decode_tile_selected(caps, SdpaGraphFacts(**{**causal, "s_q": 11}), 12)  # 132 rows: a third unit, past the route
 
 
 def test_sm107_row_predicate_and_heuristics_agree_on_the_gated_decode_tile():
@@ -818,15 +874,18 @@ def _mtp_module_facts(mod):
 @_gpu
 @pytest.mark.parametrize("s_q", [2, 3, 4], ids=["sq2_one_unit", "sq3_two_units_half_filled", "sq4_two_units"])
 @pytest.mark.parametrize("page", [0, 16], ids=["dense_padded", "page16_HND"])
-def test_decode_graph_mtp_qwen_24_2_rides_the_32_column_tile_in_token_units(s_q, page):
-    """The MTP step of the 24/2 geometry (G = 12) on the Rubin route: S_q = 2 (24 rows) rides the
-    32-column tile in ONE unit, S_q = 3 / 4 (36 / 48 rows) in TWO token units of two tokens x 12
-    heads (the second unit half-filled at S_q = 3), bottom-right causal over a dense padded or a
+def test_decode_graph_mtp_qwen_24_2_rides_the_32_column_tile_in_token_units(monkeypatch, s_q, page):
+    """The MTP step of the 24/2 geometry (G = 12) with the route held at the MEASURED widths (16, 32)
+    -- the route before the 64-column width landed, the decode_q_tile_max=32 arm of the gated
+    attention block's A/B: S_q = 2 (24 rows) rides the 32-column tile in ONE unit, S_q = 3 / 4 (36 /
+    48 rows) in TWO token units of two tokens x 12 heads (the second unit half-filled at S_q = 3;
+    the production route takes them on the 64-column tile in one unit: the cell below), bottom-right causal over a dense padded or a
     paged cache with per-batch Q lengths below S_q (dense padded-Q trim across the units: O := 0 /
     LSE := -inf past them, the diagonal anchored at seq_len_kv[b] - seq_len_q[b]); the plan is
     PACKED 12:1 and the module the executor loaded is the 32-column tile with the token-unit axis
     (N_Q = 32, HEADS_PER_TILE = 12, Q_BOX_TOKENS = 2, 24 live + 8 zero tail rows per unit, 10 warps).
     The per-batch Q lengths bind the shared no-split rule (unsplit)."""
+    _pin_route_max_32(monkeypatch)
     cap = {}
     plan = _run_graph(
         B=3, H=24, KH=2, s_q=s_q, lens=[700, 130, 5], q_lens=[s_q, max(1, s_q - 1), 1], page=page, hnd=True, causal_br=True, dtype=torch.bfloat16, capture=cap
@@ -837,12 +896,34 @@ def test_decode_graph_mtp_qwen_24_2_rides_the_32_column_tile_in_token_units(s_q,
 
 
 @_gpu
+@pytest.mark.parametrize("s_q", [3, 4, 5], ids=["sq3", "sq4", "sq5"])
+@pytest.mark.parametrize("page", [0, 16], ids=["dense_padded", "page16_HND"])
+def test_decode_graph_mtp_qwen_24_2_s_q_three_to_five_ride_the_64_column_tile_in_one_unit(s_q, page):
+    """The PRODUCTION route of the 24/2 MTP steps since the 64-column width landed: S_q = 3 / 4 / 5 (36 / 48 / 60 packed rows)
+    ride the 64-column tile in ONE unit (a Q box of five tokens x 12 heads: 60 live rows, the tokens past S_q zero-filled by the
+    TMA, 4 zero tail rows), bottom-right causal over a dense padded or a paged cache with per-batch Q lengths below S_q (the
+    padded-Q trim on the wide tile); the plan is PACKED 12:1 and the module the executor loaded is the 64-column tile (16
+    softmax warps, 18 warps).  The per-batch Q lengths bind the shared no-split rule (unsplit)."""
+    _assert_route_64({(s_q, 12)})
+    cap = {}
+    plan = _run_graph(
+        B=3, H=24, KH=2, s_q=s_q, lens=[700, 130, 5], q_lens=[s_q, max(1, s_q - 1), 1], page=page, hnd=True, causal_br=True, dtype=torch.bfloat16, capture=cap
+    )
+    _assert_decode_tile_plan(plan, G=12)
+    assert (plan.knobs.split_kv or 1) == 1, plan.knobs
+    assert _mtp_module_facts(cap["module"]) == (64, 12, 5, 60, True, 16, 18), _mtp_module_facts(cap["module"])
+    assert cap["module"].__file__.endswith("/sm107/decode_d256_f16.py")
+
+
+@_gpu
 @pytest.mark.parametrize("s_q", [2, 4], ids=["sq2", "sq4"])
-def test_decode_graph_mtp_qwen_24_2_splits_in_token_units(s_q):
-    """The MTP step over an UNPADDED dense cache and over pages (the forms the split rules admit):
-    the plan is packed 12:1 on the 32-column tile and its split is the decode model's at the
-    token-unit geometry -- B x 2 KV heads x ceil(S_q / 2) units, the 32-column tile's cost -- the
-    fp32 partials of every token unit recombined by the shared combine against the reference."""
+def test_decode_graph_mtp_qwen_24_2_splits_in_token_units(monkeypatch, s_q):
+    """The MTP step over an UNPADDED dense cache and over pages (the forms the split rules admit),
+    the route held at the measured widths: the plan is packed 12:1 on the 32-column tile and its
+    split is the decode model's at the token-unit geometry -- B x 2 KV heads x ceil(S_q / 2) units,
+    the 32-column tile's cost -- the fp32 partials of every token unit recombined by the shared
+    combine against the reference."""
+    _pin_route_max_32(monkeypatch)
     units = 2 * 2 * -(-s_q // 2)
     plan = _run_graph(B=2, H=24, KH=2, s_q=s_q, lens=[4096, 4096], page=0, padded=False, causal_br=True, dtype=torch.bfloat16)
     _assert_decode_tile_plan(plan, G=12, units=units, kv_tiles=32, q_tile=32)
@@ -853,30 +934,44 @@ def test_decode_graph_mtp_qwen_24_2_splits_in_token_units(s_q):
         assert (plan.knobs.split_kv or 1) == 4, plan.knobs
 
 
-def _pin_route_64(monkeypatch, cells):
-    """Point the Rubin decode route at the 64-column tile for the (S_q, pack_g) ``cells`` -- for the tests of that width
-    only (at this commit the production rule, config_sm107.decode_d256_q_tile, keeps those cells on the 32-column tile in
-    two token units; routing them is the route rule's own change).  Both readers of the rule are pinned: the adapter's
-    bound name in api_dsl (the lowering) and config_sm107's attribute, which engines.decode_d256_q_tile_for_row and the
-    heuristics read at call time (the facts-level twin and the split model's unit count stay in lockstep with the lowering)."""
+def _pin_route_max_32(monkeypatch):
+    """Hold the Rubin decode route at the MEASURED widths (16, 32) for a graph-level cell of the 32-column tile's two-unit forms:
+    the route before the 64-column width landed (``config_sm107.decode_d256_q_tile(max_q_tile=32)``, value for value).  The
+    production route sends those cells to the 64-column tile in one unit now, and the graph path has no declaration knob for
+    the cap (the standalone adapter has one, ``SdpaFwdDslSm100(decode_q_tile_max=32)``; the gated attention block
+    ``decode_q_tile_max=32``).  Both readers of the rule are pinned: the adapter's bound name in api_dsl (the lowering) and
+    config_sm107's attribute, which engines.decode_d256_q_tile_for_row and the heuristics read at call time (the facts-level
+    twin and the split model's unit count stay in lockstep with the lowering)."""
     from cudnn.sdpa.fwd import api_dsl, config_sm107
 
     real = config_sm107.decode_d256_q_tile
 
-    def patched(s_q, pack_g):
-        return 64 if (int(s_q), int(pack_g)) in cells else real(s_q, pack_g)
+    def capped(s_q, pack_g, max_token_units=None, **kw):
+        return real(s_q, pack_g, max_token_units, **{**kw, "max_q_tile": 32})
 
-    monkeypatch.setattr(config_sm107, "decode_d256_q_tile", patched)
-    monkeypatch.setattr(api_dsl, "_decode_d256_q_tile_sm107", patched)
+    monkeypatch.setattr(config_sm107, "decode_d256_q_tile", capped)
+    monkeypatch.setattr(api_dsl, "_decode_d256_q_tile_sm107", capped)
+
+
+def _assert_route_64(cells):
+    """The PRODUCTION route sends the (S_q, pack_g) ``cells`` -- packed, over pages under the causal mask (the serving MTP form)
+    and over a dense cache -- to the 64-column tile in ONE unit, through both readers of the rule (no pin: the width landed)."""
+    from cudnn.sdpa.fwd import api_dsl, config_sm107
+    from cudnn.sdpa.fwd.config_sm100 import decode_d256_q_units
+
+    for s_q, g in cells:
+        for paged in (False, True):
+            got = (config_sm107.decode_d256_q_tile(s_q, g, paged=paged, masked=True), api_dsl._decode_d256_q_tile_sm107(s_q, g, paged=paged, masked=True))
+            assert got == (64, 64) and decode_d256_q_units(s_q, g, 64) == 1, (s_q, g, paged, got)
 
 
 @_gpu
 def test_decode_graph_mtp_token_unit_forms_equal_each_other_and_the_unpacked_form_bitwise(monkeypatch):
-    """S_q = 4 at 24/2 over pages, four lowerings of ONE graph: (a) the Rubin route -- two token
-    units of two tokens on the 32-column tile, (b) four single-token units of the 16-column tile
-    (the route pinned to the narrow tile for this test), (c) the unpacked plan (one unit of four
-    tokens per (batch, Q head), the pre-route lead), (d) ONE unit of the 64-column tile (four
-    softmax groups; the route pinned to the wide tile for this test).  A column of S^T does not
+    """S_q = 4 at 24/2 over pages, four lowerings of ONE graph: (a) the route held at the measured
+    widths -- two token units of two tokens on the 32-column tile, (b) four single-token units of
+    the 16-column tile (the route pinned to the narrow tile for this test), (c) the unpacked plan
+    (one unit of four tokens per (batch, Q head), the pre-route lead), (d) ONE unit of the 64-column
+    tile (four softmax groups; the PRODUCTION route since the width landed).  A column of S^T does not
     depend on which N column, which unit or which tile width it occupies, and every unit streams
     the same KV tiles in the same order, so O and LSE are BITWISE equal across the four -- the
     token-unit axis moves rows between CTAs, it never changes the arithmetic.  All pinned unsplit."""
@@ -884,12 +979,16 @@ def test_decode_graph_mtp_token_unit_forms_equal_each_other_and_the_unpacked_for
 
     kw = dict(B=3, H=24, KH=2, s_q=4, lens=[1000, 129, 640], page=32, dtype=torch.bfloat16, seed=5, causal_br=True)
     wide, narrow, unpacked = {}, {}, {}
+    _pin_route_max_32(monkeypatch)
     pw = _run_graph(**kw, pack_gqa=True, split_kv=1, capture=wide)
+    monkeypatch.undo()
     assert pw.knobs.pack_gqa is True and _mtp_module_facts(wide["module"])[:4] == (32, 12, 2, 24)
     # (b): the narrow tile in four token units -- the adapter's route pinned to N = 16 for this geometry (the engine's
     # row rule and the heuristics keep the real route: the packed set is eligible either way, the lowering decides the width).
     monkeypatch.setattr(
-        api_dsl, "_decode_d256_q_tile_sm107", lambda s_q, pack_g: 16 if (s_q, pack_g) == (4, 12) else config_sm107.decode_d256_q_tile(s_q, pack_g)
+        api_dsl,
+        "_decode_d256_q_tile_sm107",
+        lambda s_q, pack_g, *a, **k: 16 if (s_q, pack_g) == (4, 12) else config_sm107.decode_d256_q_tile(s_q, pack_g, *a, **k),
     )
     pn = _run_graph(**kw, pack_gqa=True, split_kv=1, capture=narrow)
     monkeypatch.undo()
@@ -899,9 +998,8 @@ def test_decode_graph_mtp_token_unit_forms_equal_each_other_and_the_unpacked_for
     # (d): the 64-column tile in ONE unit -- 48 live rows, the 12 rows of a fifth, dead token (the Q box covers 5 tokens; the
     # TMA zero-fills past S_q) and 4 zero tail rows; the KV range streamed once per (batch, KV head).
     wide64 = {}
-    _pin_route_64(monkeypatch, {(4, 12)})
+    _assert_route_64({(4, 12)})
     p64 = _run_graph(**kw, pack_gqa=True, split_kv=1, capture=wide64)
-    monkeypatch.undo()
     assert p64.knobs.pack_gqa is True and _mtp_module_facts(wide64["module"]) == (64, 12, 5, 60, True, 16, 18), _mtp_module_facts(wide64["module"])
     for name, other in (("four single-token units (N = 16)", narrow), ("unpacked", unpacked), ("one 64-column unit (N = 64)", wide64)):
         assert torch.equal(wide["o"], other["o"]), f"two token units != {name}: max |diff| {(wide['o'] - other['o']).abs().max().item():.3e}"
@@ -909,10 +1007,11 @@ def test_decode_graph_mtp_token_unit_forms_equal_each_other_and_the_unpacked_for
 
 
 @_gpu
-def test_decode_graph_mtp_qwen_24_2_paged_equals_dense_bitwise():
+def test_decode_graph_mtp_qwen_24_2_paged_equals_dense_bitwise(monkeypatch):
     """The two-token-unit form over a dense padded cache and over page pools (S_q = 4, 24/2, packed
-    12:1, both unsplit): the paged specialization only redirects the K/V tile loads, so O and LSE
-    are BITWISE equal across the units."""
+    12:1, both unsplit; the route held at the measured widths): the paged specialization only
+    redirects the K/V tile loads, so O and LSE are BITWISE equal across the units."""
+    _pin_route_max_32(monkeypatch)
     kw = dict(B=3, H=24, KH=2, s_q=4, lens=[700, 130, 5], dtype=torch.bfloat16, seed=3, causal_br=True)
     dense, paged = {}, {}
     pd = _run_graph(**kw, page=0, capture=dense)
@@ -941,8 +1040,9 @@ def test_decode_graph_mtp_32_2_rides_the_32_column_tile_in_one_unit():
     [(8, 1, 6, (32, 8, 4, 32, True, 8, 10)), (12, 2, 10, (32, 6, 5, 30, True, 8, 10)), (4, 4, 24, (32, 1, 32, 32, True, 8, 10))],
     ids=["8to1_sq6_two_units_half_filled", "12to2_sq10_two_units_tail_rows", "mha_sq24_one_wide_unit"],
 )
-def test_decode_graph_token_units_at_the_other_geometries_inside_the_route(H, KH, s_q, facts, page):
-    """The route admits more geometries than the 24/2 steps the MTP perf table measured, and each
+def test_decode_graph_token_units_at_the_other_geometries_inside_the_route(monkeypatch, H, KH, s_q, facts, page):
+    """The route (held at the measured widths (16, 32): the 8:1 and 12:2 cells ride the 64-column
+    tile in one unit on the production route) admits more geometries than the 24/2 steps the MTP perf table measured, and each
     class needs a GPU cell of its own: 8:1 at S_q = 6 (G = 8 divides the tile: two units of four
     tokens x 8 heads, the second half-filled, no tail rows -- the liveness guard folds out), 12:2 at
     S_q = 10 (G = 6: two units of five tokens x 6 heads with TWO zero tail rows per unit -- the
@@ -953,6 +1053,7 @@ def test_decode_graph_token_units_at_the_other_geometries_inside_the_route(H, KH
     Q length and must write O := 0 / LSE := -inf).  Correctness only -- these forms are the same tile
     with the same stream count per group as the measured 24/2 form, but their perf is not in the
     table.  The per-batch Q lengths bind the shared no-split rule (unsplit)."""
+    _pin_route_max_32(monkeypatch)
     cap = {}
     plan = _run_graph(
         B=3, H=H, KH=KH, s_q=s_q, lens=[700, 130, 5], q_lens=[s_q, max(1, s_q - 1), 1], page=page, hnd=True, causal_br=True, dtype=torch.bfloat16, capture=cap
@@ -964,12 +1065,13 @@ def test_decode_graph_token_units_at_the_other_geometries_inside_the_route(H, KH
 
 @_gpu
 @pytest.mark.parametrize(("H", "KH", "s_q"), [(8, 1, 6), (12, 2, 10)], ids=["8to1_sq6", "12to2_sq10"])
-def test_decode_graph_token_units_at_the_other_geometries_split_in_token_units(H, KH, s_q):
+def test_decode_graph_token_units_at_the_other_geometries_split_in_token_units(monkeypatch, H, KH, s_q):
     """The split forms of the two-unit geometries above over pages (the form the split rules
-    admit): the plan is packed on the 32-column tile and its split is the decode model's at the
+    admit; the route held at the measured widths): the plan is packed on the 32-column tile and its split is the decode model's at the
     token-unit geometry -- B x KH head groups x 2 units, the 32-column tile's cost -- the fp32
     partials of every token unit (the G = 6 units with their tail rows included) recombined by the
     shared combine against the reference; pinned to split 4 when the model picks unsplit."""
+    _pin_route_max_32(monkeypatch)
     units = 2 * KH * 2
     plan = _run_graph(B=2, H=H, KH=KH, s_q=s_q, lens=[4000, 1000], page=16, causal_br=True, dtype=torch.bfloat16)
     _assert_decode_tile_plan(plan, G=H // KH, units=units, kv_tiles=32, q_tile=32)
@@ -1457,7 +1559,7 @@ def test_decode_adapter_routes_decode_shaped_graphs_only():
     row serves at all (its paged prefill pipeline is THD-only) -- asserted as the typed decline."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
-    def api(*, s_q, H, KH, pack):
+    def api(*, s_q, H, KH, pack, causal=False, **extra):
         B, P, S = 2, 16, 256
         dtype = torch.bfloat16
         k_dense = torch.randn(B, S, KH, D, device="cuda", dtype=dtype)
@@ -1471,10 +1573,13 @@ def test_decode_adapter_routes_decode_shaped_graphs_only():
             sample_v=v_c,
             sample_o=o_gpu,
             sample_lse=lse,
+            is_causal=causal,
+            causal_bottom_right=causal,
             seq_kv_lens_present=True,
             paged_page_size=P,
             paged_max_seq_len_kv=S,
             pack_gqa=pack,
+            **extra,
         )
         a.check_support()
         return a
@@ -1498,6 +1603,17 @@ def test_decode_adapter_routes_decode_shaped_graphs_only():
         packed._decode_q_tile_for(9, 16, 2) == 0 and packed._decode_q_tile_for(3, 32, 1) == 0 and packed._decode_q_tile_for(1, 64, 1) == 0
     )  # 9 tokens x 8 heads: 3 units
     assert packed._decode_q_tile_for(5, 16, 2) == 32  # 5 tokens x 8 heads = 40 rows: two units of 4 tokens
+    # Everything above is the MASK-FREE paged form, which the 64-column width's predicate declines (a padded-only paged step spills
+    # at the 18-warp register cap): the (16, 32) table rules it.  The serving MTP form -- bottom-right CAUSAL over pages -- takes the
+    # width: one unit of 48 / 60 rows at 24/2, two units of it at S_q 6 .. 8; the cap holds the route at the measured widths.
+    mtp = api(s_q=4, H=24, KH=2, pack=True, causal=True)
+    assert mtp._decode_q_tile() == 64 and mtp._decode_q_tile_for(5, 24, 2) == 64 and mtp._decode_q_tile_for(8, 24, 2) == 64
+    assert mtp._decode_q_tile_for(4, 32, 2) == 64 and mtp._decode_q_tile_for(5, 32, 2) == 64 and mtp._decode_q_tile_for(9, 32, 2) == 0
+    assert mtp._decode_q_tile_for(11, 24, 2) == 0 and mtp._decode_q_tile_for(33, 4, 4) == 0  # a third unit; an unpacked step of 33 tokens
+    capped = api(s_q=4, H=24, KH=2, pack=True, causal=True, decode_q_tile_max=32)
+    assert capped.decode_q_tile_max == 32 and capped._decode_q_tile() == 32 and capped._decode_q_tile_for(5, 24, 2) == 0
+    with pytest.raises(ValueError, match="decode_q_tile_max must be one of"):
+        api(s_q=4, H=24, KH=2, pack=True, causal=True, decode_q_tile_max=48)
     unpacked = api(s_q=1, H=32, KH=2, pack=False)
     assert unpacked._decode_q_tile_for(17, 4, 4) == 32 and unpacked._decode_q_tile_for(16, 4, 4) == 16  # 17 MHA rows: the wide tile; 16: the narrow one
     assert unpacked._decode_q_tile_for(32, 4, 4) == 32 and unpacked._decode_q_tile_for(33, 4, 4) == 0  # an unpacked step above 32 tokens: past the route
@@ -1517,7 +1633,7 @@ def test_decode_adapter_dense_pack_and_split_follow_the_tile():
     (never a silent unpacked / unsplit run)."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
-    def api(*, s_q, H, KH, pack, split=1, seq_lens=True):
+    def api(*, s_q, H, KH, pack, split=1, seq_lens=True, **extra):
         B, S = 2, 256
         dtype = torch.bfloat16
         q_gpu = torch.randn(B, s_q, H, D, device="cuda", dtype=dtype).transpose(1, 2)
@@ -1532,6 +1648,7 @@ def test_decode_adapter_dense_pack_and_split_follow_the_tile():
             seq_kv_lens_present=seq_lens,
             pack_gqa=pack,
             split_kv=split,
+            **extra,
         )
         a.check_support()
         return a
@@ -1543,12 +1660,16 @@ def test_decode_adapter_dense_pack_and_split_follow_the_tile():
     a = api(s_q=16, H=4, KH=4, pack=False, split=4, seq_lens=False)  # 16 MHA rows, unpacked split
     assert a._decode_q_tile() == 16 and a.split_kv == 4
     assert api(s_q=2, H=32, KH=2, pack=True)._decode_q_tile() == 32  # 32 packed rows: one unit of the 32-column tile
-    a = api(s_q=4, H=24, KH=2, pack=True, split=2, seq_lens=False)  # the 24/2 MTP step: two token units, the dense (unpadded) split
+    a = api(s_q=4, H=24, KH=2, pack=True, split=2, seq_lens=False)  # the 24/2 MTP step over a DENSE cache: one unit of the 64-column tile, split
+    assert a._decode_q_tile() == 64 and a.split_kv == 2
+    a = api(s_q=4, H=24, KH=2, pack=True, split=2, seq_lens=False, decode_q_tile_max=32)  # the cap: two token units of the 32-column tile
     assert a._decode_q_tile() == 32 and a.split_kv == 2
     a = api(s_q=17, H=4, KH=4, pack=False, split=2, seq_lens=False)  # 17 MHA rows: one unit of the 32-column tile, split
     assert a._decode_q_tile() == 32 and a.split_kv == 2
     with pytest.raises(NotImplementedError, match="d256 decode tile"):
-        api(s_q=5, H=24, KH=2, pack=True)  # 60 packed rows (a third token unit): no Rubin d256 kernel packs them
+        api(s_q=11, H=24, KH=2, pack=True)  # 132 packed rows (a third token unit of the 64-column tile): no Rubin d256 kernel packs them
+    with pytest.raises(NotImplementedError, match="d256 decode tile"):
+        api(s_q=5, H=24, KH=2, pack=True, decode_q_tile_max=32)  # 60 packed rows under the cap: a third unit of the 32-column tile
     with pytest.raises(NotImplementedError, match="d256 decode tile"):
         api(s_q=33, H=4, KH=4, pack=False, split=2, seq_lens=False)  # 33 MHA rows: the prefill kernel, no dense split
     with pytest.raises(ValueError, match="unpadded dense graphs only"):
@@ -1614,18 +1735,31 @@ def test_decode_routing_boundary():
     _run_graph(B=2, H=4, KH=4, s_q=33, lens=[700, 130], page=0, expect=PREFILL)  # dense, 33 MHA rows: past the route
     mtp5 = _run_graph(
         B=2, H=24, KH=2, s_q=5, lens=[700, 130], page=0, causal_br=True, expect=DECODE
-    )  # dense, 24/2 at S_q = 5: packed would need a third unit, so it rides the tile UNPACKED (5 rows per Q head)
-    assert mtp5.knobs.pack_gqa is not True, mtp5.knobs
+    )  # dense, 24/2 at S_q = 5: 60 packed rows, ONE unit of the 64-column tile (the former unpacked pin inverted with the width)
+    assert mtp5.knobs.pack_gqa is True, mtp5.knobs
+    mtp8 = _run_graph(B=2, H=24, KH=2, s_q=8, lens=[700, 130], page=0, causal_br=True, expect=DECODE)  # 96 rows: two units of the 64-column tile
+    assert mtp8.knobs.pack_gqa is True, mtp8.knobs
+    mtp11 = _run_graph(
+        B=2, H=24, KH=2, s_q=11, lens=[700, 130], page=0, causal_br=True, expect=DECODE
+    )  # 132 rows: a third unit, so the step rides the tile UNPACKED (11 rows per Q head, one unit of the 16-column tile)
+    assert mtp11.knobs.pack_gqa is not True, mtp11.knobs
     _run_graph(B=2, H=8, KH=2, s_q=65, lens=[700, 130], page=0, causal_br=True, expect=PREFILL)  # dense, 65 tokens per head: past the route either way
     assert _paged_graph_offers_engine(B=2, H=8, KH=2, s_q=1, d=D, lens=[700, 130]), "the decode-shaped paged d256 graph IS served (the decode tile)"
     assert _paged_graph_offers_engine(B=2, H=4, KH=4, s_q=17, d=D, lens=[700, 130]), "17 MHA rows over a paged cache: one unit of the 32-column tile"
-    assert _paged_graph_offers_engine(B=2, H=24, KH=2, s_q=4, d=D, lens=[700, 130], causal_br=True), "the 24/2 MTP step over a paged cache: two token units"
+    assert _paged_graph_offers_engine(B=2, H=24, KH=2, s_q=4, d=D, lens=[700, 130], causal_br=True), "the 24/2 MTP step over a paged cache: one 64-column unit"
     assert not _paged_graph_offers_engine(
         B=2, H=4, KH=4, s_q=33, d=D, lens=[700, 130]
     ), "33 MHA rows over a paged cache: past the route, THD-only paged prefill"
     assert _paged_graph_offers_engine(
         B=2, H=24, KH=2, s_q=5, d=D, lens=[700, 130], causal_br=True
-    ), "24/2 at S_q = 5 over a paged cache: decode-shaped unpacked (5 rows per head)"
+    ), "24/2 at S_q = 5 over a paged cache: one 64-column unit (60 packed rows)"
+    assert _paged_graph_offers_engine(
+        B=2, H=24, KH=2, s_q=11, d=D, lens=[700, 130], causal_br=True
+    ), "24/2 at S_q = 11 over a paged cache: decode-shaped unpacked (11 rows per head)"
+    assert _paged_graph_offers_engine(B=2, H=24, KH=2, s_q=4, d=D, lens=[700, 130]), "24/2 at S_q = 4 over a paged cache WITHOUT a mask: two 32-column units"
+    assert not _paged_graph_offers_engine(
+        B=2, H=32, KH=2, s_q=5, d=D, lens=[700, 130]
+    ), "32/2 at S_q = 5 over a paged cache WITHOUT a mask: 80 rows, a third 32-column unit (the 64-column width declines the mask-free paged form)"
     assert not _paged_graph_offers_engine(B=2, H=8, KH=2, s_q=65, d=D, lens=[700, 130], causal_br=True), "65 tokens per head over a paged cache"
     assert not _paged_graph_offers_engine(B=2, H=8, KH=2, s_q=1, d=128, lens=[700, 130]), "paged d128 decode graph: no Rubin d128 decode tile"
 
@@ -2127,8 +2261,9 @@ def test_decode_adapter_gated_split_cuda_graph_replay_no_host_sync():
 # warp = 576 threads, 259 KiB of SMEM (the oversized Rubin carveout), 256 TMEM columns, and ptxas's 96-register cap for an
 # 18-warp CTA (16,384 registers per SM sub-partition over 5 warps x 32 lanes, 8-granular, from the .reqntid the DSL emits).
 # It takes the MTP step of four tokens x 12 / 16 heads (48 / 64 rows) in ONE token unit, streaming the KV range once where the
-# 32-column tile cuts it into two units.  At this commit it is compiled and template-tested, not routed: the graph-level cells
-# below pin the route at it for the test (``_pin_route_64``); the production rule stays the route rule's own change.
+# 32-column tile cuts it into two units.  ROUTED (the last entry of config_sm107.D256_DECODE_SINGLE_UNIT_Q_TILES): the graph-level
+# cells below run the production route (``_assert_route_64`` pins both readers); the two-unit 32-column forms keep their cells
+# above under ``_pin_route_max_32`` (the decode_q_tile_max=32 arm).
 
 _SM107_DECODE_SPILL_PROBE = textwrap.dedent("""
     import glob, os, re, subprocess, sys
@@ -2289,13 +2424,13 @@ def test_decode_kernel_four_column_groups(H, KH, facts, splits):
 
 @_gpu
 @pytest.mark.parametrize("page", [0, 16], ids=["dense_padded", "page16_HND"])
-def test_decode_graph_mtp_32_2_s_q_four_rides_the_64_column_tile_in_one_unit(monkeypatch, page):
-    """32/2 at S_q = 4 (64 packed rows) with the route pinned at the 64-column tile: ONE unit of four tokens x 16 heads (no
+def test_decode_graph_mtp_32_2_s_q_four_rides_the_64_column_tile_in_one_unit(page):
+    """32/2 at S_q = 4 (64 packed rows) on the PRODUCTION route: ONE unit of the 64-column tile, four tokens x 16 heads (no
     tail rows), bottom-right causal over a dense padded and a paged cache with per-batch Q lengths below S_q (the dense
     padded-Q trim on the wide tile: O := 0 / LSE := -inf past them, the diagonal anchored at seq_len_kv[b] - seq_len_q[b]);
     the plan is PACKED 16:1 and the module the executor loaded is the 64-column tile (N_Q 64, HEADS_PER_TILE 16, Q_BOX_TOKENS 4,
     64 live rows, 16 softmax warps, 18 warps).  The per-batch Q lengths bind the shared no-split rule (unsplit)."""
-    _pin_route_64(monkeypatch, {(4, 16)})
+    _assert_route_64({(4, 16)})
     cap = {}
     plan = _run_graph(B=3, H=32, KH=2, s_q=4, lens=[700, 130, 5], q_lens=[4, 3, 1], page=page, hnd=True, causal_br=True, dtype=torch.bfloat16, capture=cap)
     _assert_decode_tile_plan(plan, G=16)
@@ -2305,10 +2440,11 @@ def test_decode_graph_mtp_32_2_s_q_four_rides_the_64_column_tile_in_one_unit(mon
 
 
 @_gpu
-def test_decode_graph_mtp_s_q_four_on_the_64_column_tile_paged_equals_dense_bitwise(monkeypatch):
+def test_decode_graph_mtp_s_q_four_on_the_64_column_tile_paged_equals_dense_bitwise():
     """The one-unit 64-column form over a dense padded cache and over page pools (S_q = 4, 24/2 packed 12:1 and 32/2 packed
-    16:1, both unsplit): the paged specialization only redirects the K/V tile loads, so O and LSE are BITWISE equal."""
-    _pin_route_64(monkeypatch, {(4, 12), (4, 16)})
+    16:1, both unsplit; the production route): the paged specialization only redirects the K/V tile loads, so O and LSE are
+    BITWISE equal."""
+    _assert_route_64({(4, 12), (4, 16)})
     for H, G in ((24, 12), (32, 16)):
         kw = dict(B=3, H=H, KH=2, s_q=4, lens=[700, 130, 5], dtype=torch.bfloat16, seed=3 + H, causal_br=True)
         dense, paged = {}, {}
@@ -2323,12 +2459,12 @@ def test_decode_graph_mtp_s_q_four_on_the_64_column_tile_paged_equals_dense_bitw
 
 @_gpu
 @pytest.mark.parametrize(("H", "G"), [(24, 12), (32, 16)], ids=["24to2", "32to2"])
-def test_decode_graph_mtp_s_q_four_on_the_64_column_tile_splits_and_recombines(monkeypatch, H, G):
+def test_decode_graph_mtp_s_q_four_on_the_64_column_tile_splits_and_recombines(H, G):
     """The split form of the one-unit 64-column step over pages (the form the split rules admit): the plan is packed on the
     64-column tile and its split is the decode model's at the ONE-unit geometry (B x 2 KV heads x 1 unit, the wide tile's
     cost), the fp32 partials recombined by the shared combine against the reference; pinned to split 4 when the model picks
     unsplit, so the split path of this width always runs."""
-    _pin_route_64(monkeypatch, {(4, G)})
+    _assert_route_64({(4, G)})
     cap = {}
     plan = _run_graph(B=2, H=H, KH=2, s_q=4, lens=[4000, 1000], page=16, causal_br=True, dtype=torch.bfloat16, capture=cap)
     _assert_decode_tile_plan(plan, G=G, units=2 * 2 * 1, kv_tiles=32, q_tile=64)
@@ -2340,14 +2476,14 @@ def test_decode_graph_mtp_s_q_four_on_the_64_column_tile_splits_and_recombines(m
 
 
 @_gpu
-def test_decode_adapter_64_column_tile_cuda_graph_replay_no_host_sync(monkeypatch):
+def test_decode_adapter_64_column_tile_cuda_graph_replay_no_host_sync():
     """Capture + replay on the 64-column tile (the adapter's execute path captured once at fixed B, Rule 3): the 32/2 MTP step
     (S_q = 4 packed 16:1, bottom-right causal over pages, split 4 -- the two launches: the tile's partials, the combine);
     seq_kv_lens AND seq_q_lens CONTENT change between replays (keyless batches, one-key batches, trimmed Q rows) and every
     replay matches the reference."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
-    _pin_route_64(monkeypatch, {(4, 16)})
+    _assert_route_64({(4, 16)})
     B, H, KH, P, S, s_q = 8, 32, 2, 16, 1024, 4
     dev, dtype = "cuda", torch.bfloat16
     torch.manual_seed(2)

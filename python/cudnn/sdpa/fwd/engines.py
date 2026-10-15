@@ -29,7 +29,7 @@ import inspect
 import logging
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Tuple
 
 import cudnn
 
@@ -529,17 +529,28 @@ def _thd_decode_leg(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> b
     return len(widths) == 1
 
 
-def decode_d256_q_tile_for_row(capabilities: Capabilities, s_q: int, pack_g: int) -> int:
+def decode_d256_q_tile_for_row(capabilities: Capabilities, s_q: int, pack_g: int, paged: bool = False, masked: bool = True) -> int:
     """The d256 decode tile's N extent (the Q rows of one token unit) a ROW routes ``s_q``
     tokens packed ``pack_g`` heads per token onto, or 0 for the prefill tile: the Rubin
-    row's rule (``config_sm107.decode_d256_q_tile``: the 32-column tile routed, two token
-    units for a packed MTP step) on cc 10.7, the Blackwell line's
-    (``config_sm100.decode_d256_q_tile``: 16 rows, one unit) otherwise.  The facts-level
-    twin of ``SdpaFwdDslSm100._decode_q_tile_for``'s arch dispatch; the heuristics' decode
-    geometry reads it too -- keep the three in lockstep."""
+    row's rule (``config_sm107.decode_d256_q_tile``, table-driven: the 32- and 64-column
+    tiles routed in one unit, then two token units of the widest admitted width for a packed
+    MTP step) on cc 10.7, the Blackwell line's (``config_sm100.decode_d256_q_tile``: 16
+    rows, one unit) otherwise.  ``paged`` / ``masked`` (appended) are the graph's cache kind
+    and causal / window mask -- the 64-column width's form predicate
+    (``config_sm107.decode_d256_wide_tile_admits``) declines a mask-free PAGED step, which
+    keeps the (16, 32) table.  The facts-level twin of ``SdpaFwdDslSm100._decode_q_tile_for``'s
+    arch dispatch; the heuristics' decode geometry reads it too -- keep the three in lockstep
+    (:func:`_facts_decode_form` reads the two facts off ``SdpaGraphFacts``)."""
     if capabilities.sm_lo == 107:
-        return _config_sm107.decode_d256_q_tile(s_q, pack_g)
+        return _config_sm107.decode_d256_q_tile(s_q, pack_g, paged=bool(paged), masked=bool(masked))
     return decode_d256_q_tile(s_q, pack_g)
+
+
+def _facts_decode_form(facts: "ga.SdpaGraphFacts") -> Tuple[bool, bool]:
+    """``(paged, masked)`` of a graph for :func:`decode_d256_q_tile_for_row`: the paged KV cache, and the causal /
+    window mask exactly as the kernels' MASK_CAUSAL / MASK_SWA bits derive (``config_sm100._mask_flags_from``: a right
+    band resolved -- ``right_bound`` 0 = causal, ``causal`` its effective reading -- or a left window)."""
+    return bool(facts.has_paged_kv), bool(facts.causal) or facts.right_bound is not None or facts.window_left is not None
 
 
 def d256_decode_tile_selected(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", pack_g: int = 1, split_kv: Optional[int] = None) -> bool:
@@ -576,7 +587,7 @@ def d256_decode_tile_selected(capabilities: Capabilities, facts: "ga.SdpaGraphFa
         and gate_ok
         and not facts.attn_scale_prefolded
         and _selected_d_shape(capabilities, facts) == (256, 256)
-        and decode_d256_q_tile_for_row(capabilities, facts.s_q, pack_g) > 0
+        and decode_d256_q_tile_for_row(capabilities, facts.s_q, pack_g, *_facts_decode_form(facts)) > 0
     )
 
 

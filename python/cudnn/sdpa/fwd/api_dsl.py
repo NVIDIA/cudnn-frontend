@@ -731,6 +731,11 @@ class SdpaFwdDsl(APIBase):
         sample_scale_o: Optional[torch.Tensor | TensorDesc] = None,
         ragged_divisors: Optional[tuple[int, int, int]] = None,
         ragged_offsets_int64: bool = False,
+        # APPENDED (2026-10-15): a CAP on the Rubin d256 decode tile's single-unit width table (config_sm107.D256_DECODE_SINGLE_UNIT_Q_TILES =
+        # (16, 32, 64)) for this plan -- None = the whole table; 32 = the route before the 64-column width landed (value for value).  A
+        # PERFORMANCE-ONLY knob (the same function under every width); read by _decode_q_tile_for.  Refused off the Rubin route (any other
+        # arch line, where the table is not the lowering's).
+        decode_q_tile_max: Optional[int] = None,
     ) -> None:
         """Capture the common SDPA operation and tuning contract.
 
@@ -874,6 +879,14 @@ class SdpaFwdDsl(APIBase):
         self.thd = bool(thd)
         self.ragged_divisors = (1, 1, 1) if ragged_divisors is None else tuple(int(m) for m in ragged_divisors)
         self.ragged_offsets_int64 = bool(ragged_offsets_int64)
+        self.decode_q_tile_max: Optional[int] = None if decode_q_tile_max is None else int(decode_q_tile_max)
+        if self.decode_q_tile_max is not None:
+            from cudnn.sdpa.fwd.config_sm107 import D256_DECODE_SINGLE_UNIT_Q_TILES as _widths
+
+            if self.decode_q_tile_max not in _widths:
+                raise ValueError(
+                    f"decode_q_tile_max must be one of {_widths} (the Rubin d256 decode tile's single-unit widths) or None; got {decode_q_tile_max}"
+                )
         # THD Stats declared WITHOUT ragged offsets: per-batch padded (b, s_max, h)
         # rows (FlashInfer's form). The kernel stores per batch; the adapter fills
         # the rows past each sequence's length with -inf, as the backend does.
@@ -2461,10 +2474,24 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             return 0
         pack_g = (int(h_q) // int(h_kv)) if self.pack_gqa else 1
         if self._device_cc == (10, 7):
-            # The Rubin route (config_sm107.decode_d256_q_tile): the 32-column tile is routed, in up to
-            # two TOKEN UNITS for a packed MTP step (S_q = 4 at 24/2 = two units of two tokens x 12
-            # heads); engines.decode_d256_q_tile_for_row is the facts-level twin of this dispatch.
-            return _decode_d256_q_tile_sm107(int(s_q), pack_g)
+            # The Rubin route (config_sm107.decode_d256_q_tile, table-driven): the 32- and 64-column tiles are routed in
+            # one token unit (the 64-column width for the forms its predicate admits -- a packed group over a dense cache,
+            # or over pages under the causal / window mask: the record's MASK_CAUSAL / MASK_SWA bits, read here off the
+            # declared band exactly as config_sm100._mask_flags_from derives them), then up to two TOKEN UNITS of the
+            # widest admitted width for a packed MTP step; decode_q_tile_max caps the table for this plan.
+            # engines.decode_d256_q_tile_for_row is the facts-level twin of this dispatch.
+            return _decode_d256_q_tile_sm107(
+                int(s_q),
+                pack_g,
+                paged=bool(self.paged),
+                masked=self.window_right is not None or self.window_left is not None,
+                max_q_tile=self.decode_q_tile_max,
+            )
+        if self.decode_q_tile_max is not None:
+            raise NotImplementedError(
+                f"decode_q_tile_max={self.decode_q_tile_max} caps the Rubin (cc 10.7) d256 decode route's width table; this plan lowers for "
+                f"cc {self._device_cc[0]}.{self._device_cc[1]}, whose decode tile has one routed width"
+            )
         return decode_d256_q_tile(int(s_q), pack_g)
 
     def _gate_in_combine_for(self, s_q: int, h_q: int, h_kv: int) -> bool:

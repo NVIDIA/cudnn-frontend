@@ -108,6 +108,8 @@ __all__ = [
     "D256_DECODE_ROUTED_MAX_Q_ROWS",
     "D256_DECODE_ROUTED_MAX_TOKEN_UNITS",
     "D256_DECODE_MAX_Q_ROWS_SM107",
+    "decode_d256_wide_tile_admits",
+    "decode_d256_route_widths",
     "decode_d256_single_unit_q_tile",
     "decode_d256_q_tile",
     "SMEM_CAP_BYTES",
@@ -2318,80 +2320,6 @@ def make_cfg_d256_sparse(params: TemplateParams, *, gather_warps: int = 8, softm
 
 _D256_DECODE_FLAVOR = "sm107 d256 decode"
 
-# The Rubin ROUTE onto the decode tile (the cc 10.7 twin of config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS /
-# decode_d256_q_tile; read by SdpaFwdDslSm100._decode_q_tile_for, engines.d256_decode_tile_selected and the
-# heuristics' decode geometry through engines.decode_d256_q_tile_for_row -- keep the three in lockstep), TABLE-DRIVEN
-# (2026-10-15):
-#   * D256_DECODE_SINGLE_UNIT_Q_TILES is THE table -- the tile's N extents this line routes in ONE token unit, ordered
-#     narrow to wide: a step whose packed rows S_q x G fit a width rides the narrowest such width, the KV streamed ONCE
-#     per (sequence, KV head).  The 32-column tile IS routed here (rows in (16, 32]: 24/2 at S_q = 2 = 24 live rows,
-#     32/2 at S_q = 2, an MHA step of 17-32 tokens), unlike the Blackwell line.  A wider width (a 64-column tile) slots
-#     into the tuple; the rule below reads the table and nothing else, and the gated attention block's decode route
-#     (gated_attention_block.decode_route) reads the same table.
-#   * past the table a PACKED group may be cut into up to D256_DECODE_ROUTED_MAX_TOKEN_UNITS TOKEN UNITS of the WIDEST
-#     width (the kernel's Q_TOKEN_UNITS axis: S_q = 4 at 24/2 = two units of two tokens x 12 heads, each streaming the KV
-#     range once -- 2x the KV bytes of a single stream), the MTP step of the 24/2 and 32/2 geometries (S_q <= 4) -- the
-#     ADAPTER's route for a dense paged graph on this line, where the d256 prefill kernel serves no dense paged query.
-# MEASURED on cc 10.7 (212 SMs) at the 24/2 geometry ONLY -- G = 12: the one-unit 32-column form at S_q = 2 and
-# the two-unit form at S_q = 3 / 4, against the prefill body and against the 16-column tile in single-token
-# units, B in {1, 4, 32}, S_kv 2K..128K.  The envelope is WIDER than that: an unpacked / MHA step of 17-32
-# tokens and a packed group with 16 < S_q x G <= 32 at G != 12 ride one unit of the 32-column tile, and a packed
-# group with ceil(S_q / (32 // G)) = 2 at G in {2, 4, 6, 8, 16, 32} two units of it -- all UNMEASURED on a perf
-# GPU, routed by the same rule because each is the same tile with the same stream count per (head group, batch,
-# split) as the measured form (the byte model does not see G), and each class has a GPU correctness cell in
-# test_sdpa_fwd_decode_d256_sm107.py (the rule, the forms' agreement, the two-unit forms at G = 8 and at G = 6
-# with tail rows, an MHA step of 24 tokens).  A perf cell per class is owed before any of them is quoted.  Past
-# the envelope (a third token unit, an unpacked step above 32 tokens, a group wider than the tile) the d256
-# prefill kernel serves the graph as before.
-D256_DECODE_SINGLE_UNIT_Q_TILES: Tuple[int, ...] = (16, 32)
-D256_DECODE_ROUTED_MAX_Q_ROWS = D256_DECODE_SINGLE_UNIT_Q_TILES[-1]
-D256_DECODE_ROUTED_MAX_TOKEN_UNITS = 2
-# The table is sorted, positive, and never wider than the record make_cfg_d256_decode compiles (config_sm100.D256_DECODE_MAX_Q_ROWS):
-# a new width lands in both places or this tripwire names the compile-side bound.
-assert (
-    list(D256_DECODE_SINGLE_UNIT_Q_TILES) == sorted(set(D256_DECODE_SINGLE_UNIT_Q_TILES)) and D256_DECODE_SINGLE_UNIT_Q_TILES[0] > 0
-), D256_DECODE_SINGLE_UNIT_Q_TILES
-assert D256_DECODE_ROUTED_MAX_Q_ROWS <= D256_DECODE_MAX_Q_ROWS, (
-    f"the single-unit table's widest width {D256_DECODE_ROUTED_MAX_Q_ROWS} exceeds the width the decode tile compiles for, "
-    f"config_sm100.D256_DECODE_MAX_Q_ROWS = {D256_DECODE_MAX_Q_ROWS}"
-)
-
-
-def decode_d256_single_unit_q_tile(s_q: int, pack_g: int) -> int:
-    """THE single-unit rule: the narrowest width of :data:`D256_DECODE_SINGLE_UNIT_Q_TILES` holding ``s_q x pack_g`` packed
-    rows (``pack_g`` = the heads packed per token, 1 = unpacked / MHA) in ONE token unit -- the KV streamed once per
-    (sequence, KV head) -- or 0 when the step is past the table (the callers decide: the adapter's token-unit arm below,
-    the gated attention block's prefill route).  Reads the table and nothing else."""
-    s_q, pack_g = int(s_q), int(pack_g)
-    if s_q <= 0 or pack_g <= 0:
-        return 0
-    rows = s_q * pack_g
-    for width in D256_DECODE_SINGLE_UNIT_Q_TILES:
-        if rows <= width:
-            return width
-    return 0
-
-
-def decode_d256_q_tile(s_q: int, pack_g: int, max_token_units: Optional[int] = None) -> int:
-    """The Rubin ADAPTER's route: the decode tile's N extent for ``s_q`` tokens packed ``pack_g`` heads per token (1 =
-    unpacked), or 0 when the d256 prefill kernel serves the graph.  The single-unit rule first
-    (:func:`decode_d256_single_unit_q_tile`); past the table a PACKED group rides the WIDEST width in
-    ``ceil(s_q / (width // pack_g))`` token units (:func:`config_sm100.decode_d256_q_units`: each unit one more KV stream)
-    when that count is within ``max_token_units`` (default :data:`D256_DECODE_ROUTED_MAX_TOKEN_UNITS`; 1 = the single-unit
-    rule alone) and the group fits the width; an unpacked / MHA step takes one unit only.  Value for value the former shared
-    rule (``config_sm100.decode_d256_q_tile`` with the Rubin constants), pinned by the block's MTP route tests."""
-    s_q, pack_g = int(s_q), int(pack_g)
-    width = decode_d256_single_unit_q_tile(s_q, pack_g)
-    if width or s_q <= 0 or pack_g <= 1:
-        return width
-    cap = D256_DECODE_ROUTED_MAX_TOKEN_UNITS if max_token_units is None else int(max_token_units)
-    wide = D256_DECODE_ROUTED_MAX_Q_ROWS
-    if pack_g > wide:
-        return 0
-    units = decode_d256_q_units(s_q, pack_g, wide)
-    return wide if 0 < units <= cap else 0
-
-
 _D256_DECODE_MAX_RED_SLOTS = 3  # the kernel's per-tile column-max slots: [3 rotating slots][column group][16 columns] of Int32 keys (red.shared.max)
 _D256_DECODE_COLS = 16  # S^T / O^T columns one 4-warp softmax group owns; the epilogue's sum scratch is [softmax warp][16 columns] fp32
 _D256_DECODE_BARRIER_WORDS = 1 + 2 * 3 + 2 * 4 + 1  # q_full, kv_full/empty x STAGES (3), s_full/s_empty/p_full/bmm2_done x 2, tmem_dealloc -- Int64 each
@@ -2402,9 +2330,9 @@ _D256_DECODE_BARRIER_WORDS = 1 + 2 * 3 + 2 * 4 + 1  # q_full, kv_full/empty x ST
 # tables written with the change): SMEM 259 KiB (the oversized carveout), TMEM 256 columns, the barrier inits scale through SOFTMAX_LANES
 # (512), and ptxas caps the 18-warp CTA at 96 registers per thread (16384 per SM sub-partition / (5 warps x 32),
 # 8-granular -- the per-thread work is width-independent and the sm_107a rendering carries no spill).  Whether the ROUTE
-# sends a step to it is decode_d256_q_tile's decision above (the route rule names the widths it routes); a width in this
-# tuple is compiled and template-tested, nothing more.  The SM100 factory keeps (16, 32): the 64-column tile does not
-# fit the 227 KiB Blackwell carveout.
+# sends a step to it is the route table's decision below (D256_DECODE_SINGLE_UNIT_Q_TILES names the widths it routes); a
+# width in this tuple is compiled and template-tested.  The SM100 factory keeps (16, 32): the 64-column tile does not fit
+# the 227 KiB Blackwell carveout.
 _D256_DECODE_Q_TILES_SM107 = (16, 32, 64)
 D256_DECODE_MAX_Q_ROWS_SM107 = max(
     _D256_DECODE_Q_TILES_SM107
@@ -2421,6 +2349,126 @@ _D256_DECODE_OVERSIZED_Q_TILES = (64,)
 # else keeps the 32-column tile (two token units) or the prefill tile.  Pinned by the host spill probe in
 # test_sdpa_fwd_decode_d256_sm107.py; a width or form added here is added there.
 _D256_DECODE_WIDE_PACK_MIN = 2
+
+
+def decode_d256_wide_tile_admits(pack_g: int, paged: bool, masked: bool) -> bool:
+    """THE form predicate of the oversized widths (_D256_DECODE_OVERSIZED_Q_TILES: the 64-column tile) -- the facts the record
+    validator (``_validate_cfg_d256_decode_sm107``) checks on the compiled record, read here on a DECLARATION so the route
+    never names a width the record declines: a PACKED group of at least :data:`_D256_DECODE_WIDE_PACK_MIN` heads (``pack_g``
+    = the heads packed per token; 1 = unpacked / MHA), and over a PAGED cache the causal / window mask (``masked``: the record's
+    MASK_CAUSAL or MASK_SWA bit -- a right band (causal) or a left window declared; a dense cache takes any mask).  The
+    adapter reads it on its own declaration (``SdpaFwdDslSm100._decode_q_tile_for``), the facts twins on the graph facts
+    (``engines.decode_d256_q_tile_for_row``), the gated attention block on its always paged, always bottom-right-causal DECODE
+    form; the route functions below take the same three facts.  Two readings of one rule: the validator keeps its own
+    wording and ``test_sdpa_fwd_decode_d256_sm107.py`` pins their agreement over the form matrix."""
+    return int(pack_g) >= _D256_DECODE_WIDE_PACK_MIN and (not bool(paged) or bool(masked))
+
+
+# The Rubin ROUTE onto the decode tile (the cc 10.7 twin of config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS /
+# decode_d256_q_tile; read by SdpaFwdDslSm100._decode_q_tile_for, engines.d256_decode_tile_selected and the
+# heuristics' decode geometry through engines.decode_d256_q_tile_for_row -- keep the three in lockstep), TABLE-DRIVEN
+# (2026-10-15):
+#   * D256_DECODE_SINGLE_UNIT_Q_TILES is THE table -- the tile's N extents this line routes in ONE token unit, ordered
+#     narrow to wide: a step whose packed rows S_q x G fit a width rides the narrowest such width, the KV streamed ONCE
+#     per (sequence, KV head).  The 32-column tile IS routed here (rows in (16, 32]: 24/2 at S_q = 2 = 24 live rows,
+#     32/2 at S_q = 2, an MHA step of 17-32 tokens), unlike the Blackwell line; the 64-column tile takes a packed step of
+#     up to 64 rows in ONE unit (24/2 at S_q = 3 .. 5 = 36 / 48 / 60 rows, 32/2 at S_q = 3 / 4 = 48 / 64, 8/1 at S_q 5 .. 8,
+#     64/2 at S_q = 2) wherever its form predicate admits the step (decode_d256_wide_tile_admits: a packed group of >= 2
+#     heads; over pages the causal / window mask) -- the forms it declines (an unpacked step of 33-64 tokens, a mask-free
+#     paged packed step) keep the (16, 32) table and its arms below, as before the width landed.  The rule reads the table
+#     through decode_d256_route_widths and nothing else, and the gated attention block's decode route
+#     (gated_attention_block.decode_route) reads the same table.
+#   * past the table a PACKED group may be cut into up to D256_DECODE_ROUTED_MAX_TOKEN_UNITS TOKEN UNITS of the WIDEST
+#     admitted width (the kernel's Q_TOKEN_UNITS axis: S_q = 6 .. 8 at 24/2 = two units of up to five tokens x 12 heads on
+#     the 64-column tile, each streaming the KV range once -- 2x the KV bytes of a single stream; S_q = 3 / 4 at 24/2 ran
+#     two units of the 32-column tile before the 64-column width landed, the measured MTP form) -- the ADAPTER's route for
+#     a dense paged graph on this line, where the d256 prefill kernel serves no dense paged query.
+#   * ``max_q_tile`` (every route function): a caller's CAP on the table -- the gated attention block's ``decode_q_tile_max``
+#     and the adapter's ``decode_q_tile_max`` -- so a declaration can hold the route at the MEASURED widths (32: the route
+#     before the 64-column width landed, value for value) beside the default; a performance-only knob (the same function
+#     under every width: the SDPA suite's cross-form bitwise pins).
+# MEASURED on cc 10.7 (212 SMs) at the 24/2 geometry ONLY -- G = 12: the one-unit 32-column form at S_q = 2 and
+# the two-unit form at S_q = 3 / 4, against the prefill body and against the 16-column tile in single-token
+# units, B in {1, 4, 32}, S_kv 2K..128K.  The envelope is WIDER than that: an unpacked / MHA step of 17-32
+# tokens and a packed group with 16 < S_q x G <= 32 at G != 12 ride one unit of the 32-column tile, a packed
+# group with 32 < S_q x G <= 64 one unit of the 64-column tile (UNMEASURED on a perf GPU: the width is compiled,
+# template-tested and bitwise the two-unit form on the SDPA suite's cross-form pin), and a packed group with
+# ceil(S_q / (64 // G)) = 2 two units of it -- all routed by the same rule because each is the same tile with the same
+# stream count per (head group, batch, split) as the measured form (the byte model does not see G), and each class has
+# a GPU correctness cell in test_sdpa_fwd_decode_d256_sm107.py (the rule, the forms' agreement, the two-unit forms, an
+# MHA step of 24 tokens, the 64-column one-unit forms).  A perf cell per class is owed before any of them is quoted.
+# Past the envelope (a third token unit, an unpacked step above 32 tokens, a group wider than the tile) the d256
+# prefill kernel serves the graph as before.
+D256_DECODE_SINGLE_UNIT_Q_TILES: Tuple[int, ...] = (16, 32, 64)
+D256_DECODE_ROUTED_MAX_Q_ROWS = D256_DECODE_SINGLE_UNIT_Q_TILES[-1]
+D256_DECODE_ROUTED_MAX_TOKEN_UNITS = 2
+# The table is sorted, positive, a subset of the widths this line COMPILES (_D256_DECODE_Q_TILES_SM107), never wider than
+# D256_DECODE_MAX_Q_ROWS_SM107, and its oversized widths sit at the wide end (the admitted table of a form is a PREFIX): a
+# new width lands in both places or this tripwire names the compile-side bound.
+assert (
+    list(D256_DECODE_SINGLE_UNIT_Q_TILES) == sorted(set(D256_DECODE_SINGLE_UNIT_Q_TILES)) and D256_DECODE_SINGLE_UNIT_Q_TILES[0] > 0
+), D256_DECODE_SINGLE_UNIT_Q_TILES
+assert all(
+    w in _D256_DECODE_Q_TILES_SM107 for w in D256_DECODE_SINGLE_UNIT_Q_TILES
+), f"the single-unit table {D256_DECODE_SINGLE_UNIT_Q_TILES} routes a width the Rubin factory does not compile ({_D256_DECODE_Q_TILES_SM107})"
+assert D256_DECODE_ROUTED_MAX_Q_ROWS <= D256_DECODE_MAX_Q_ROWS_SM107, (
+    f"the single-unit table's widest width {D256_DECODE_ROUTED_MAX_Q_ROWS} exceeds the width the decode tile compiles for, "
+    f"D256_DECODE_MAX_Q_ROWS_SM107 = {D256_DECODE_MAX_Q_ROWS_SM107}"
+)
+assert all(w > n for w in _D256_DECODE_OVERSIZED_Q_TILES for n in D256_DECODE_SINGLE_UNIT_Q_TILES if n not in _D256_DECODE_OVERSIZED_Q_TILES), (
+    D256_DECODE_SINGLE_UNIT_Q_TILES,
+    _D256_DECODE_OVERSIZED_Q_TILES,
+)
+
+
+def decode_d256_route_widths(pack_g: int, *, paged: bool = False, masked: bool = True, max_q_tile: Optional[int] = None) -> Tuple[int, ...]:
+    """The single-unit table a FORM may ride, narrow to wide: :data:`D256_DECODE_SINGLE_UNIT_Q_TILES` without the oversized
+    widths wherever :func:`decode_d256_wide_tile_admits` declines the form (``pack_g`` the heads packed per token, ``paged``
+    the cache kind, ``masked`` the causal / window mask), and without the widths past ``max_q_tile`` (a caller's cap; ``None``
+    = the whole table).  Always a prefix of the table (the oversized widths are its wide end)."""
+    cap = D256_DECODE_ROUTED_MAX_Q_ROWS if max_q_tile is None else int(max_q_tile)
+    wide_ok = decode_d256_wide_tile_admits(pack_g, paged, masked)
+    return tuple(w for w in D256_DECODE_SINGLE_UNIT_Q_TILES if w <= cap and (wide_ok or w not in _D256_DECODE_OVERSIZED_Q_TILES))
+
+
+def decode_d256_single_unit_q_tile(s_q: int, pack_g: int, *, paged: bool = False, masked: bool = True, max_q_tile: Optional[int] = None) -> int:
+    """THE single-unit rule: the narrowest width of the form's table (:func:`decode_d256_route_widths`) holding ``s_q x pack_g``
+    packed rows (``pack_g`` = the heads packed per token, 1 = unpacked / MHA) in ONE token unit -- the KV streamed once per
+    (sequence, KV head) -- or 0 when the step is past the table (the callers decide: the adapter's token-unit arm below, the
+    gated attention block's prefill route).  Reads the table and nothing else."""
+    s_q, pack_g = int(s_q), int(pack_g)
+    if s_q <= 0 or pack_g <= 0:
+        return 0
+    rows = s_q * pack_g
+    for width in decode_d256_route_widths(pack_g, paged=paged, masked=masked, max_q_tile=max_q_tile):
+        if rows <= width:
+            return width
+    return 0
+
+
+def decode_d256_q_tile(
+    s_q: int, pack_g: int, max_token_units: Optional[int] = None, *, paged: bool = False, masked: bool = True, max_q_tile: Optional[int] = None
+) -> int:
+    """The Rubin ADAPTER's route: the decode tile's N extent for ``s_q`` tokens packed ``pack_g`` heads per token (1 =
+    unpacked), or 0 when the d256 prefill kernel serves the graph.  The single-unit rule first
+    (:func:`decode_d256_single_unit_q_tile`); past the table a PACKED group rides the WIDEST width of the form's table in
+    ``ceil(s_q / (width // pack_g))`` token units (:func:`config_sm100.decode_d256_q_units`: each unit one more KV stream)
+    when that count is within ``max_token_units`` (default :data:`D256_DECODE_ROUTED_MAX_TOKEN_UNITS`; 1 = the single-unit
+    rule alone) and the group fits the width; an unpacked / MHA step takes one unit only.  ``paged`` / ``masked`` /
+    ``max_q_tile`` select the form's table (:func:`decode_d256_route_widths`); with ``max_q_tile=32`` this is, value for value,
+    the route before the 64-column width landed (the former shared rule ``config_sm100.decode_d256_q_tile`` with the Rubin
+    constants), pinned by the block's MTP route tests."""
+    s_q, pack_g = int(s_q), int(pack_g)
+    width = decode_d256_single_unit_q_tile(s_q, pack_g, paged=paged, masked=masked, max_q_tile=max_q_tile)
+    if width or s_q <= 0 or pack_g <= 1:
+        return width
+    cap = D256_DECODE_ROUTED_MAX_TOKEN_UNITS if max_token_units is None else int(max_token_units)
+    widths = decode_d256_route_widths(pack_g, paged=paged, masked=masked, max_q_tile=max_q_tile)
+    if not widths or pack_g > widths[-1]:
+        return 0
+    wide = widths[-1]
+    units = decode_d256_q_units(s_q, pack_g, wide)
+    return wide if 0 < units <= cap else 0
 
 
 def d256_decode_smem_layout(cfg: CfgD256Decode) -> dict:
@@ -2491,6 +2539,8 @@ def _validate_cfg_d256_decode_sm107(cfg: CfgD256Decode, flavor: str) -> None:
                 cfg.N_Q in _D256_DECODE_Q_TILES_SM107,
                 f"{flavor}: N_Q must be one of {_D256_DECODE_Q_TILES_SM107} (the widths this line compiles); got {cfg.N_Q}",
             ),
+            # The two FORM checks below are decode_d256_wide_tile_admits read on the compiled record (the route reads it on the
+            # declaration); their wording is pinned by the config backstop test, their agreement with the predicate by the form-matrix test.
             (
                 cfg.N_Q not in _D256_DECODE_OVERSIZED_Q_TILES or (cfg.PACK_GQA == 1 and cfg.QH_PER_KH >= _D256_DECODE_WIDE_PACK_MIN),
                 f"{flavor}: the {cfg.N_Q}-column tile serves PACKED groups of at least {_D256_DECODE_WIDE_PACK_MIN} heads only (got pack_gqa="

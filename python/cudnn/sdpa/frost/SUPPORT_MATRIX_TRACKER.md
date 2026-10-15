@@ -1199,7 +1199,8 @@ queries, the fused gate, a paged decode without per-request KV lengths (no paddi
 (the frontier cells per geometry in both regimes, RED on the pre-arm tree).
 
 ᵐᵗᵖ **The MTP form on the Rubin decode tile: the 32-column tile in TOKEN UNITS
-(`config_sm107.decode_d256_q_tile`, `D256_DECODE_ROUTED_MAX_Q_ROWS = 32`,
+(`config_sm107.decode_d256_q_tile`, `D256_DECODE_ROUTED_MAX_Q_ROWS = 32` at the time -- 64 since the
+table-driven route of 2026-10-15 took the 64-column tile, see the block's DECODE section --,
 `D256_DECODE_ROUTED_MAX_TOKEN_UNITS = 2`).** The body of both decode twins gained a token-unit
 axis (`Q_TOKEN_UNITS`): a unit covers one Q box of `Q_BOX_TOKENS = N_Q // HEADS_PER_TILE`
 consecutive tokens, the host entry derives `ceil(S_q / Q_BOX_TOKENS)` units per (head group,
@@ -2846,11 +2847,50 @@ rule with the Rubin constants). Typed declines: `S_q > 8` (`decode_s_q`), `S_q x
 functional cells, no perf claim; `test_block_serving_mtp_route.py` + the decode module): the prefill route vs the per-sequence fp32
 oracle at 32 / 2 `S_q` 4 / 5 / 8 (64 / 80 / 128 rows) and 8 / 1 `S_q` 5 / 8 with a padded entry (`out` rows exactly 0, block 0 untouched),
 the compiled body pinned (the shared d256 body, `PACK_GQA` / `THD_VARLEN` / `PAGED_KV` / `EPILOGUE_GATE` 1, `HEADS_PER_TILE` = the group);
+(the cells named in this paragraph are the route BEFORE the 64-column tile joined the table the same day; the paragraph below has the
+route of record)
 the prefill route vs the two-unit route at 32 / 2 `S_q = 4` on IDENTICAL inputs (both within the oracle's budget, cos > 0.9999 between
 them); the unpacked arm at 24 / 2 `S_q = 8`; the gate in the body vs the separate launch; two launches bitwise; the workspace honest (the
 THD metadata inside); the FIRST execute of an `S_q = 8` step captured on a new stream with no warm-up under `set_sync_debug_mode("error")`,
 the replay bitwise the eager run and over new lengths / tables / slots / inputs; the host cells (the table, a 64 entry slotted in, the rule,
 the route per policy at every served group and the corner groups, the two reject rows, the declaration facts, the envelope per policy).
+
+**Changed 2026-10-15 (later the same day) -- the 64-column decode tile joined the table and is ROUTED: `config_sm107.D256_DECODE_SINGLE_UNIT_Q_TILES
+= (16, 32, 64)`, `D256_DECODE_ROUTED_MAX_Q_ROWS = 64`.** The swap-AB decode tile's third width (`sm107/decode_d256_f16.py`: four 16-column
+softmax groups, 18 warps / 576 threads, 259 KiB of SMEM in the oversized carveout, 256 TMEM columns, spill-free at ptxas's 96-register cap on
+the admitted forms; `config_sm100.make_cfg_d256_decode(q_tiles=)` appended so the Rubin factory builds over its own width set, the SM100
+factory unchanged at (16, 32)) takes a PACKED step of 33 .. 64 rows in ONE token unit where the 32-column tile cut it into two (24 / 2 at `S_q`
+3 .. 5, 32 / 2 at `S_q` 3 / 4, 8 / 1 at `S_q` 5 .. 8, 24 / 4 at `S_q` 6 .. 8, 64 / 2 at `S_q` 2, 128 / 2 at `S_q` 1), and past the table a packed
+group rides up to two units of it (24 / 2 at `S_q` 6 .. 8 = 72 .. 96 rows, two streams, where the unpacked 16-column arm streamed the KV 12
+times; 32 / 2 at `S_q` 5 .. 8 under `token_units`). **Eligibility (the adapter, every reader): the width's FORM predicate is ONE function,
+`config_sm107.decode_d256_wide_tile_admits(pack_g, paged, masked)` -- a packed group of >= 2 heads, and over a PAGED cache the causal / window
+mask (`MASK_CAUSAL | MASK_SWA`) -- read on the declaration by `SdpaFwdDslSm100._decode_q_tile_for` (`paged=self.paged`, `masked` = a right
+band or a left window declared, exactly `_mask_flags_from`), by the facts twins (`engines.decode_d256_q_tile_for_row(..., paged, masked)` /
+`_facts_decode_form`) and by the gated attention block's `decode_route` (always paged + bottom-right causal), and on the compiled record by
+`_validate_cfg_d256_decode_sm107` (the typed refusals of an unpacked / G 1 step and of a mask-free paged step stay; the form-matrix test pins
+the two readings' agreement).** So the dense paged d256 envelope of the Rubin row WIDENS for packed, masked steps only: 33 .. 64 packed rows
+in one unit and 65 .. 128 in two (24 / 2 at `S_q` 5 .. 8, 32 / 2 at `S_q` 5 .. 8 and 64 / 2 at `S_q` 3 / 4 over a paged cache are served where
+they were a typed decline or the unpacked arm); a mask-free paged packed step and an unpacked step of 33 .. 64 tokens keep the (16, 32)
+route value for value; a dense (unpaged) packed step of 33 .. 64 rows rides the width with any mask. The route functions take the form
+(`decode_d256_q_tile(s_q, pack_g, max_token_units=None, *, paged=False, masked=True, max_q_tile=None)`, `decode_d256_single_unit_q_tile`,
+`decode_d256_route_widths`) and a CAP: `max_q_tile=32` is the route before the width landed, value for value (pinned against the shared
+SM100 rule with the Rubin constants at every `(S_q, group)`) -- surfaced as `SdpaFwdDslSm100(decode_q_tile_max=)` (appended; refused off
+cc 10.7) and `GatedAttentionBlockFwd(decode_q_tile_max=)` / `decode_route(max_q_tile=)` / `serving_envelope(decode_q_tile_max=)`
+(`DecodeRoute.q_tile_max` / `DecodeEnvelope.q_tile_max` read it back), a performance-only knob (the same function under every width: the
+SDPA suite's four-way bitwise pin -- one 64-column unit == two 32-column units == four 16-column units == the unpacked form, O and LSE -- and
+the block-level bitwise pin at the same split). The block's route table of record (the default policy; `token_units` differs at 32 / 2
+`S_q` 5 .. 8 and 64 / 2 `S_q` 3 / 4 only: two units of the 64-column tile instead of the prefill tile): 32 / 2 and 16 / 1 -- tile 16 / 32 / 64 /
+64 / prefill x 4 at `S_q` 1 .. 8; 24 / 2 -- 16 / 32 / 64 / 64 / 64 / 64 x 2 / 64 x 2 / 64 x 2; 8 / 1 -- 16 / 16 / 32 / 32 / 64 x 4; 24 / 4 -- 16 /
+16 / 32 / 32 / 32 / 64 x 3; 4 / 1 -- 16 x 4 / 32 x 4; 64 / 2 -- 32 / 64 / prefill / prefill / decline. `claimed` (the measured cells) is now
+bounded by `DECODE_CLAIMED_MAX_N_Q = 32` too: a 64-column cell is routed and declared, never claimed, until its perf row lands (the
+`_Sdpa` stage pins the compiled WIDTH against the route at `compile()`, a drift the `kernel_template` pin could not see). Validated on a
+Rubin development node (cc 10.7, 204 SMs; functional, no perf claim; `test_sdpa_fwd_decode_d256_sm107.py`, `test_block_serving_decode.py`,
+`test_block_serving_mtp_route.py`): the 64-column one-unit forms at 24 / 2 `S_q` 3 .. 5 and 32 / 2 `S_q` 4 over dense padded and paged
+caches with per-batch Q lengths (the trim on the wide tile), paged == dense bitwise, the split forms recombining, capture + replay with new
+lengths, the block's oracle cells at every served group x `S_q` 1 .. 5 and the MTP cells (24 / 2 `S_q` 4 / 8 -- the two-unit 64-column form --,
+32 / 2 `S_q` 4, 8 / 1 `S_q` 5 / 8) with a padded entry, the `decode_q_tile_max=32` arm bitwise the production route at the same split. The SM100
+decode twin carries the shared body's register trims (bitwise, except the FTZ max on a sub-normal score) and its cc 10.0 suite run is owed
+(Rule S6).
 
 Not served (typed declines by name; each lands with its accept cell and flips this section in the same change): an LSE / a sliding window or a right band / a `QsaSpec` / another head dim on the paged forms, a dense step past `S_q = 8` or 128 packed rows (the DECODE form's `decode_s_q` / `decode_rows` rows: the EXTEND form's packed business), a pinned split on the prefill route, `save_for_backward` / `quant` on the paged forms, e4m3 pools (`kv_cache_dtype`) on the DENSE paged forms (served on the block-sparse decode mode at `S_q <= 4` and as the quantizing write-through on the dense prefill forms -- the e4m3 paragraph below), the write-through folded into the projection epilogue, `quant` / `save_for_backward` together with the write-through attribute; the DECODE form's `S_q > 4` arms and every page / layout cell above are functional claims only -- no perf claim before the serving perf cells land.
 

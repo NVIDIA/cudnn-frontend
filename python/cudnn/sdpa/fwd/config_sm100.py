@@ -208,13 +208,13 @@ class TemplateParams:
     # specializations of one template, and an ungated module traces byte-identically to before the field existed.
     epilogue_gate: bool = False
     # Decode-shaped d256 f16/bf16 graphs (S_q * pack_g within the arch line's routed
-    # rows: D256_DECODE_ROUTED_MAX_Q_ROWS here, config_sm107's on cc 10.7, where the
-    # 32-column tile serves the MTP step in token units) lower onto
+    # rows: D256_DECODE_ROUTED_MAX_Q_ROWS here, config_sm107's table (16, 32, 64) on
+    # cc 10.7, where the 32- and 64-column tiles serve the MTP step in token units) lower onto
     # sm100/decode_d256_f16.py, the swap-AB tile: the KV tokens ride the MMA M axis
     # and the packed Q rows ride N, so the MMA and exp work scale with the LIVE
     # rows instead of a 128-row Q tile.  The value is the N extent the kernel is
-    # compiled for -- the rows of ONE token unit (16, or 32 at the template level
-    # and on the Rubin route, from decode_d256_q_tile); 0 = the prefill tile.
+    # compiled for -- the rows of ONE token unit (16; 32 at the template level, 32
+    # and 64 on the Rubin route, from decode_d256_q_tile); 0 = the prefill tile.
     # Plan-time only (S_q is a declared shape).
     decode_q_tile: int = 0
     # The 128-row DECODE tile (sm100/decode_d128_f16.py) for flavors that do not
@@ -1176,10 +1176,13 @@ _D256_DECODE_Q_TILES = (16, 32)
 # costs an eager caller 96-103 us per execute for the second launch.  Until its
 # per-CTA issue rate is fixed, S_q x G in (16, 32] stays on the prefill tile on
 # this line, which serves those shapes at its previous numbers in both regimes
-# (eager and CUDA-graph replay).  The Rubin line routes the wide tile, in TOKEN
-# UNITS of two tokens for the MTP step: config_sm107.D256_DECODE_ROUTED_MAX_Q_ROWS
-# (32) / D256_DECODE_ROUTED_MAX_TOKEN_UNITS (2) and config_sm107.decode_d256_q_tile,
-# measured on cc 10.7 against the prefill body at the 24/2 geometry.
+# (eager and CUDA-graph replay).  The Rubin line routes the wide tile and its own
+# 64-column tile, table-driven (config_sm107.D256_DECODE_SINGLE_UNIT_Q_TILES =
+# (16, 32, 64), D256_DECODE_ROUTED_MAX_Q_ROWS = 64), in up to two TOKEN UNITS of
+# the widest admitted width for a packed MTP step past the table
+# (D256_DECODE_ROUTED_MAX_TOKEN_UNITS = 2, config_sm107.decode_d256_q_tile);
+# the 32-column two-unit form was measured on cc 10.7 against the prefill body
+# at the 24/2 geometry, the 64-column form is compiled and tested, unmeasured.
 D256_DECODE_ROUTED_MAX_Q_ROWS = 16
 # The 16-column tile: one unit covers S_q x pack_g <= 16 rows (today's decode step).
 _D256_DECODE_NARROW_Q_TILE = 16

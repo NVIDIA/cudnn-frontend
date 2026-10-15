@@ -556,6 +556,12 @@ DECODE_CLAIMED_MAX_S_Q = 4
 PACKED (the whole GQA group in one tile) -- the measured cells (``DecodeRoute.claimed``).  Every other served cell is routed and
 declared (``DecodeRoute.tile`` / ``pack_gqa`` / ``kv_streams``) and unmeasured until its perf cell."""
 
+DECODE_CLAIMED_MAX_N_Q = 32
+"""The widest decode-tile width inside the CLAIMED envelope: the 16- and 32-column tiles are the measured ones; the 64-column tile
+(``config_sm107.D256_DECODE_SINGLE_UNIT_Q_TILES[-1]``, routed since 2026-10-15 for a packed step of 33 .. 64 rows -- 24/2 at ``S_q``
+3 .. 5, 32/2 at ``S_q`` 3 / 4) is compiled, tested and bitwise the two-unit form, but unmeasured on the perf class: a cell on it is
+routed and declared, never ``claimed``, until its perf row lands (then this bound moves to 64)."""
+
 DECODE_MAX_S_Q = 8
 """The DECLARED decode envelope: ``1 <= S_q <= 8`` (one new token plus up to seven speculative ones: an MTP-7 verify step).  Within it
 every step has a route (:func:`decode_route`: the decode tile in one token unit where its single-unit width table holds the packed
@@ -619,6 +625,10 @@ class DecodeRoute:
     # units on the packed decode tile, the group on the unpacked arm; 0 when not served -- and the policy the route was read under.
     kv_streams: int = 0
     policy: str = ""
+    # APPENDED (2026-10-15): the cap the route was read under (``decode_route(max_q_tile=)`` / ``GatedAttentionBlockFwd(decode_q_tile_max=)``):
+    # None = the whole single-unit table (16, 32, 64); 32 = the route before the 64-column width landed.  ``_Sdpa`` hands it to the adapter
+    # (``SdpaFwdDslSm100(decode_q_tile_max=)``) so the compiled width is the declared one.
+    q_tile_max: Optional[int] = None
 
     @property
     def decode_tile(self) -> bool:
@@ -633,32 +643,54 @@ class DecodeRoute:
         return self.tile is not None
 
 
-def decode_route(geometry: "GatedAttentionBlockGeometry", s_q: int, policy: Optional[str] = None) -> DecodeRoute:
+def _resolve_decode_q_tile_max(max_q_tile: Optional[int]) -> Optional[int]:
+    """``None`` = the whole single-unit table; a width of the table as is; anything else a typed ``ValueError`` naming the table."""
+    if max_q_tile is None:
+        return None
+    from cudnn.sdpa.fwd.config_sm107 import D256_DECODE_SINGLE_UNIT_Q_TILES
+
+    if isinstance(max_q_tile, bool) or not isinstance(max_q_tile, int) or max_q_tile not in D256_DECODE_SINGLE_UNIT_Q_TILES:
+        raise ValueError(
+            f"decode_q_tile_max must be one of {D256_DECODE_SINGLE_UNIT_Q_TILES} (the Rubin d256 decode tile's single-unit widths) or None, got {max_q_tile!r}"
+        )
+    return int(max_q_tile)
+
+
+def decode_route(geometry: "GatedAttentionBlockGeometry", s_q: int, policy: Optional[str] = None, max_q_tile: Optional[int] = None) -> DecodeRoute:
     """The DECODE route of ``s_q`` tokens at ``geometry`` under ``policy`` (``None`` = :data:`DEFAULT_DECODE_ROUTE_POLICY`), read
     here so the block, the envelope and the tests name the kernel BEFORE anything compiles.
 
     The DECLARED envelope first: ``1 <= s_q <= DECODE_MAX_S_Q`` and ``s_q x group <= DECODE_MAX_ROWS`` packed rows, else NOT served
     (``tile`` None, ``reason`` set: a longer or wider dense step over the pools is the EXTEND form's packed business); a head dim other
-    than 256 has no paged read (the d256 flavor's).  Then ONE rule per policy:
+    than 256 has no paged read (the d256 flavor's).  Then ONE rule per policy over the decode tile's single-unit width table
+    (``config_sm107.D256_DECODE_SINGLE_UNIT_Q_TILES`` = (16, 32, 64), read for the DECODE form's facts -- a PAGED cache under the
+    bottom-right CAUSAL mask, so the 64-column width's form predicate admits every packed group; ``max_q_tile`` (appended) caps the
+    table: 32 = the route before the 64-column width landed, value for value):
 
-    * ``"single_unit"`` (the default): packed rows within the decode tile's single-unit width table ride the narrowest such width in
-      ONE token unit (``config_sm107.decode_d256_single_unit_q_tile``: the KV streamed once); past the table the step rides the paged
-      d256 PREFILL tile with the whole group packed -- one Q tile per (sequence, KV head), the KV streamed once -- wherever that body
-      packs the group (``pack_gqa_group_size(group, DECODE_MAX_ROWS)``: a group dividing its 128 rows; the cc 10.7 paged THD leg takes
-      whole-group PackGQA only); a group it cannot pack (12 = 24 / 2, 6 = 24 / 4) keeps the adapter's token-unit arm (up to two units
-      of the widest width: two streams, the measured MTP form) and the unpacked arm past it (one head per CTA: ``group`` streams) --
-      the fewest streams any kernel offers it today, never more than the ``"token_units"`` route's.
+    * ``"single_unit"`` (the default): packed rows within the table ride the narrowest such width in ONE token unit
+      (``config_sm107.decode_d256_single_unit_q_tile``: the KV streamed once -- 24/2 at ``S_q`` 3 .. 5 and 32/2 at ``S_q`` 3 / 4 on the
+      64-column tile, 36 .. 64 rows); past the table the step rides the paged d256 PREFILL tile with the whole group packed -- one Q
+      tile per (sequence, KV head), the KV streamed once -- wherever that body packs the group (``pack_gqa_group_size(group,
+      DECODE_MAX_ROWS)``: a group dividing its 128 rows; the cc 10.7 paged THD leg takes whole-group PackGQA only); a group it cannot
+      pack (12 = 24 / 2, 6 = 24 / 4) keeps the adapter's token-unit arm (up to two units of the widest width: two streams -- 24/2 at
+      ``S_q`` 6 .. 8 = two units of the 64-column tile) and the unpacked arm past it (one head per CTA: ``group`` streams) -- the fewest
+      streams any kernel offers it today, never more than the ``"token_units"`` route's.
     * ``"token_units"``: the adapter's own route verbatim (``config_sm107.decode_d256_q_tile``: the single-unit table, then the widest
       width in up to two token units for a packed group), then the unpacked arm -- the A/B's other arm.
 
-    MHA (``h_q == h_kv``) stays the unpacked 16-column tile (the bit-exact unpacked fold, one stream)."""
+    MHA (``h_q == h_kv``) stays the unpacked 16-column tile (the bit-exact unpacked fold, one stream).  ``claimed`` marks the measured
+    cells: the PACKED decode tile at ``s_q <= DECODE_CLAIMED_MAX_S_Q`` on a width up to :data:`DECODE_CLAIMED_MAX_N_Q`."""
     from cudnn.sdpa.fwd.config_sm100 import decode_d256_q_units, pack_gqa_group_size
     from cudnn.sdpa.fwd.config_sm107 import decode_d256_q_tile, decode_d256_single_unit_q_tile
 
     policy = _resolve_decode_route_policy(policy)
+    cap = _resolve_decode_q_tile_max(max_q_tile)
     g = int(geometry.h_q) // int(geometry.h_kv)
     s_q = int(s_q)
     rows = s_q * g
+    # The DECODE form's facts for the width table: the pools (paged) under the bottom-right causal mask (masked) -- the constructor
+    # refuses the form without them, so the 64-column width's predicate turns on the packing alone.
+    form = dict(paged=True, masked=True, max_q_tile=cap)
 
     def route(tile, n_q, units, packed, streams, reason=""):
         return DecodeRoute(
@@ -668,10 +700,11 @@ def decode_route(geometry: "GatedAttentionBlockGeometry", s_q: int, policy: Opti
             n_q=int(n_q),
             token_units=int(units),
             pack_gqa=bool(packed),
-            claimed=(tile == DECODE_TILE) and bool(packed) and s_q <= DECODE_CLAIMED_MAX_S_Q,
+            claimed=(tile == DECODE_TILE) and bool(packed) and s_q <= DECODE_CLAIMED_MAX_S_Q and int(n_q) <= DECODE_CLAIMED_MAX_N_Q,
             reason=reason,
             kv_streams=int(streams),
             policy=policy,
+            q_tile_max=cap,
         )
 
     if int(geometry.d_head) != 256:
@@ -684,20 +717,20 @@ def decode_route(geometry: "GatedAttentionBlockGeometry", s_q: int, policy: Opti
         return route(None, 0, 0, False, 0, _decode_rows_decline(s_q, g))
     if g == 1:
         # MHA: the unpacked fold on the decode tile (S_q <= 8 rows always fit its narrowest width), one stream
-        n_q = decode_d256_single_unit_q_tile(s_q, 1)
+        n_q = decode_d256_single_unit_q_tile(s_q, 1, **form)
         return route(DECODE_TILE, n_q, 1, False, 1)
-    n_q = decode_d256_single_unit_q_tile(s_q, g)
+    n_q = decode_d256_single_unit_q_tile(s_q, g, **form)
     if n_q:
         return route(DECODE_TILE, n_q, 1, True, 1)
     if policy == DECODE_ROUTE_SINGLE_UNIT and pack_gqa_group_size(g, DECODE_MAX_ROWS) == g:
         # past the table: the paged prefill tile with the whole group packed (one Q tile per sequence and KV head; rows <= 128 here)
         return route(PREFILL_TILE, 0, 0, True, 1)
     # the adapter's token-unit arm (the widest width in up to two units), then its unpacked arm (one head per CTA, one unit)
-    n_q = decode_d256_q_tile(s_q, g)
+    n_q = decode_d256_q_tile(s_q, g, **form)
     if n_q:
         units = decode_d256_q_units(s_q, g, n_q)
         return route(DECODE_TILE, n_q, units, True, units)
-    n_q = decode_d256_q_tile(s_q, 1)
+    n_q = decode_d256_q_tile(s_q, 1, **form)
     if n_q:
         return route(DECODE_TILE, n_q, 1, False, g)
     # unreachable inside the declared envelope (S_q <= 8 rows fit the 16-column tile unpacked); kept as the honest last word
@@ -794,7 +827,7 @@ class DecodeEnvelope:
     def route(self, s_q: int) -> DecodeRoute:
         """The route of an ``s_q``-token step at this geometry under this record's ``policy`` (any ``s_q >= 1``; ``routes`` holds
         1 .. ``max_s_q`` + 1) -- the DENSE form's rule; under ``sparse_core`` the step runs the sparse core whatever this says."""
-        return decode_route(self._geometry, s_q, policy=self.policy or None)
+        return decode_route(self._geometry, s_q, policy=self.policy or None, max_q_tile=self.q_tile_max)
 
     _geometry: Optional["GatedAttentionBlockGeometry"] = None
     sparse_core: bool = False  # appended: stage (4) is the index-list sparse core over the pools (a QsaSpec geometry)
@@ -806,6 +839,8 @@ class DecodeEnvelope:
     # the CLAIMED bound (``DECODE_CLAIMED_MAX_S_Q``; ``max_s_q`` is the DECLARED one).
     policy: str = ""
     claimed_max_s_q: int = 0
+    # appended (2026-10-15): the width cap ``routes`` / ``route()`` were read under (``serving_envelope(decode_q_tile_max=)``; None = the whole table).
+    q_tile_max: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -4343,6 +4378,9 @@ class _Sdpa(_Stage):
                 paged_table_v_stride=table_stride,
                 split_kv=self.decode_split_kv,
                 pack_gqa=True if self.decode_route.pack_gqa else None,
+                # the route's width cap (decode_q_tile_max): the adapter re-reads the route rule at compile, so the cap it was read under
+                # travels with it -- the compiled width is the declared one (pinned in compile() below)
+                decode_q_tile_max=self.decode_route.q_tile_max,
             )
         else:
             k_desc = _bhsd_desc(b_env, g.h_kv, s_env, d, self.dtype, self.device, "k", token_stride=ts)
@@ -4532,6 +4570,16 @@ class _Sdpa(_Stage):
                     f"{self.name}: the DECODE route of S_q={self.seq_len} at group {self.decode_route.group} packs the group ({self.decode_route.pack_gqa}) but the "
                     f"adapter compiled pack_gqa={getattr(self._impl, 'pack_gqa', None)}"
                 )
+            if self.decode_route.decode_tile:
+                # The WIDTH too: every width of the swap-AB tile is the same kernel_template, so the template pin cannot see the route
+                # naming 64 columns while the adapter compiled 32 (the adapter re-reads the rule at compile with its own facts).
+                got_n_q = getattr(getattr(getattr(self._impl, "_k_mod", None), "CFG", None), "N_Q", None)
+                if got_n_q is not None and int(got_n_q) != int(self.decode_route.n_q):
+                    raise RuntimeError(
+                        f"{self.name}: the DECODE route of S_q={self.seq_len} at group {self.decode_route.group} names the {self.decode_route.n_q}-column decode "
+                        f"tile (policy={self.decode_route.policy}, q_tile_max={self.decode_route.q_tile_max}) but the adapter compiled N_Q={got_n_q}: decode_route "
+                        "and SdpaFwdDslSm100._decode_q_tile disagree on the width -- fix the drift, neither reading is the truth alone"
+                    )
 
     def scratch_workspace_bytes(self) -> int:
         """Per-execute scratch the SDPA carves from the block's workspace.
@@ -6030,7 +6078,8 @@ one and meets its ``sparse`` row (the same row the DECODE form reaches)."""
 
 _DECODE_REQUIRES = (
     "a DENSE declaration: sample_h [B, S_q, d_model] with 1 <= S_q <= DECODE_MAX_S_Q = 8 and S_q x (H_q / H_kv) <= DECODE_MAX_ROWS = 128 packed rows (the "
-    "claimed envelope S_q <= 4 on the packed decode tile; decode_route_policy picks the single-unit route or the adapter's token units), the batch uniform",
+    "claimed envelope S_q <= 4 on the packed 16- / 32-column decode tile; decode_route_policy picks the single-unit route or the adapter's token units, "
+    "decode_q_tile_max caps the tile's width table), the batch uniform",
     "paged_kv_page_size=P (a positive multiple of 16; validated at page_sizes)",
     "kv_source='paged'",
     "geometry.is_causal=True, geometry.causal_bottom_right=True, window_left=-1, window_right in (-1, 0), qsa=None, d_head=256",
@@ -6370,6 +6419,12 @@ class GatedAttentionBlockFwd(APIBase):
         # widest tile in up to two token units, then the unpacked tile).  A PERFORMANCE-ONLY knob: the same function under either (the
         # two routes' A/B); `decode_route` / `DecodeRoute.policy` read it back.  Module docstring, "The DECODE form".
         decode_route_policy: Optional[str] = None,
+        # APPENDED (2026-10-15; the DECODE form's width cap; refused on the packed form and under "self"): None = the decode tile's whole
+        # single-unit width table (config_sm107.D256_DECODE_SINGLE_UNIT_Q_TILES = (16, 32, 64)); 32 = the route before the 64-column width
+        # landed (the measured widths: 24/2 at S_q 3 / 4 in two units of the 32-column tile), value for value.  A PERFORMANCE-ONLY knob
+        # (the same function under every width -- the SDPA suite's cross-form bitwise pins); `DecodeRoute.q_tile_max` reads it back and
+        # the stage hands it to the adapter so the compiled width is the declared one.  Module docstring, "The DECODE form".
+        decode_q_tile_max: Optional[int] = None,
     ):
         """Validate the declaration -- the dtype / ``quant`` / scale-blob halves, the fusion and save-mode knobs against
         ``save_for_backward``, the THD envelope, the paged-cache write-through -- normalise the samples, record the knobs and
@@ -6595,6 +6650,7 @@ class GatedAttentionBlockFwd(APIBase):
         # THE EXTEND FORM (kv_source) and the BOUNDED token form (token_capacity): the typed declines of the table every caller's
         # dispatch predicate can read back (serving_envelope), then the three samples' contract -- device-free, before any descriptor.
         self.decode_route_policy = _resolve_decode_route_policy(decode_route_policy)
+        self.decode_q_tile_max = _resolve_decode_q_tile_max(decode_q_tile_max)
         self.kv_source, self.token_capacity, self.decode_route, self.max_kv_len, self.decode_split_kv = self._check_serving_declaration(
             kv_source,
             token_capacity,
@@ -6606,6 +6662,7 @@ class GatedAttentionBlockFwd(APIBase):
             max_kv_len,
             decode_split_kv,
             decode_route_policy=decode_route_policy,
+            decode_q_tile_max=decode_q_tile_max,
         )
         if self.kv_source == KV_SOURCE_PAGED and not self.thd:
             # The DECODE form: over the pools the per-sequence KV length (kv_lens) is mandatory, so the declaration reads
@@ -7459,6 +7516,7 @@ class GatedAttentionBlockFwd(APIBase):
         max_kv_len=None,
         decode_split_kv=None,
         decode_route_policy=None,
+        decode_q_tile_max=None,
     ):
         """``kv_source`` / ``token_capacity`` at declaration -- the argument contract first (``kv_source`` one of
         :data:`_KV_SOURCES`; ``token_capacity`` None or a positive int equal to the samples' packed row count), then the
@@ -7505,7 +7563,14 @@ class GatedAttentionBlockFwd(APIBase):
                 "sample_cos / sample_sin / sample_out with T_max rows); a step then hands lengths summing to T_live <= T_max"
             )
         decode_extras = [
-            nm for nm, x in (("max_kv_len", max_kv_len), ("decode_split_kv", decode_split_kv), ("decode_route_policy", decode_route_policy)) if x is not None
+            nm
+            for nm, x in (
+                ("max_kv_len", max_kv_len),
+                ("decode_split_kv", decode_split_kv),
+                ("decode_route_policy", decode_route_policy),
+                ("decode_q_tile_max", decode_q_tile_max),
+            )
+            if x is not None
         ]
         samples = (("sample_k_cache", sample_k_cache), ("sample_v_cache", sample_v_cache), ("sample_block_table", sample_block_table))
         if kv_source != KV_SOURCE_PAGED:
@@ -7593,7 +7658,7 @@ class GatedAttentionBlockFwd(APIBase):
                         "split has an empty chunk (a dead work item) on every item -- pass a split in [1, that count], or None for the fill rule"
                     )
             return kv_source, token_capacity, None, int(max_kv_len), split
-        route = decode_route(g, self.seq_len, policy=self.decode_route_policy)
+        route = decode_route(g, self.seq_len, policy=self.decode_route_policy, max_q_tile=self.decode_q_tile_max)
         if not route.served:
             raise NotImplementedError(f"kv_source='paged': {route.reason}")
         if route.prefill_tile and decode_split_kv is not None and int(decode_split_kv) > 1:
@@ -7619,6 +7684,7 @@ class GatedAttentionBlockFwd(APIBase):
         *,
         device_cc: Optional[Tuple[int, int]] = None,
         decode_route_policy: Optional[str] = None,
+        decode_q_tile_max: Optional[int] = None,
     ) -> ServingEnvelope:
         """The static serving envelope for ``(geometry, dtype, device)`` -- what a serving stack's INIT-time dispatch predicate
         reads instead of catching the block's exceptions.  Derived from the SAME code the constructor and ``check_support`` run:
@@ -7634,10 +7700,12 @@ class GatedAttentionBlockFwd(APIBase):
         launch; safe to call on any device (``served`` is simply False off Rubin; a non-CUDA ``device`` reads as no CUDA device).
         ``device_cc`` (appended) overrides the device's compute capability for a host-side reading of another part's envelope;
         ``decode_route_policy`` (appended) is the policy ``decode.routes`` / ``decode.route()`` are read under (``None`` = the default,
-        :data:`DEFAULT_DECODE_ROUTE_POLICY`; ``decode.policy`` names it)."""
+        :data:`DEFAULT_DECODE_ROUTE_POLICY`; ``decode.policy`` names it); ``decode_q_tile_max`` (appended) the width cap they are read
+        under (``None`` = the whole single-unit table; ``decode.q_tile_max`` names it)."""
         from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
 
         policy = _resolve_decode_route_policy(decode_route_policy)
+        q_tile_max = _resolve_decode_q_tile_max(decode_q_tile_max)
         cc = tuple(int(x) for x in device_cc) if device_cc is not None else _device_cc_of(device)
         dsl_reason = cutedsl_requirement_error("the gated attention block's serving forms")
         if dsl_reason is None and cc == _SM107_CC:
@@ -7697,13 +7765,18 @@ class GatedAttentionBlockFwd(APIBase):
             max_s_q=DECODE_MAX_S_Q,
             max_rows=DECODE_MAX_ROWS,
             # the declared envelope and its first decline, under the policy asked for
-            routes=tuple(decode_route(geometry, s, policy=policy) for s in range(1, DECODE_MAX_S_Q + 2)) if (has_group and not sparse) else (),
+            routes=(
+                tuple(decode_route(geometry, s, policy=policy, max_q_tile=q_tile_max) for s in range(1, DECODE_MAX_S_Q + 2))
+                if (has_group and not sparse)
+                else ()
+            ),
             _geometry=geometry,
             sparse_core=sparse,
             # the e4m3 cache (the gathered cast + the decode tile) is a form of the block-sparse decode mode with bf16 activations only
             kv_cache_dtypes=(dtype,) + ((KV_CACHE_E4M3,) if (sparse and dtype == torch.bfloat16) else ()),
             policy=policy,
             claimed_max_s_q=DECODE_CLAIMED_MAX_S_Q,
+            q_tile_max=q_tile_max,
         )
         forms = tuple(nm for nm, env in (("extend", extend), ("decode", decode)) if env.served)
         return ServingEnvelope(
