@@ -80,6 +80,7 @@ import cutlass.cute as cute
 from cutlass._mlir.dialects import arith
 from cutlass.base_dsl.typing import Pointer
 from cutlass.experimental import primitives as nvvm
+from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
 from cudnn.frost.tile_dsl.pointwise import ffma2, fmul2, opaque_f32_zero
 from cudnn.frost.tile_dsl.tma import ld_global_v4, st_global_v2
 import cuda.bindings.driver as _cuda_driver  # noqa: F401  (cute.compile pulls cuda)
@@ -226,7 +227,14 @@ def _combine_kernel(
     # value before the single cast -- see the module docstring.  None
     # (None-specialized) is the plain reduction; its traced code is unchanged.
     gate: Optional[cute.Tensor] = None,
+    # Programmatic dependent launch (the launch attribute is set by _launch_combine under the same flag): the partial slabs are
+    # the split tile's output, so nothing is read above the wait; the pass has no prologue to overlap, so the dependent grid (the
+    # out projection in the gated block) is released right after it and stages its own while this pass runs.
+    use_pdl: cutlass.Constexpr[bool] = False,
 ) -> None:
+    if cutlass.const_expr(use_pdl):
+        wait_on_dependent_grids()
+        launch_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
     lane = tidx % cutlass.Int32(32)
     q_row = cute.arch.block_idx()[0] * cutlass.Int32(ROWS_PER_BLOCK) + tidx // cutlass.Int32(32)
@@ -669,6 +677,11 @@ def _combine_decode_kernel(
     ragged_o_cap: cutlass.Int32,
     ragged_lse_cap: cutlass.Int32,
     gate: Optional[cute.Tensor],
+    # Programmatic dependent launch (the launch attribute is set by _launch_combine under the same flag): the partial slabs are
+    # the split tile's output, so nothing is read above the wait; the pass has no prologue to overlap, so the dependent grid (the
+    # out projection in the gated block) is released right after it -- the lean kernel's pair, on the kernel the served decode
+    # plans run (a chain whose combine lacked the sites would silently serialize here).
+    use_pdl: cutlass.Constexpr[bool] = False,
 ) -> None:
     """The decode-grid form of the lean fp32-partial combine (module constants ``DECODE_*``; the layout
     + barrier / SMEM notes are in the module docstring).  One block per (q_row, head, batch,
@@ -680,6 +693,9 @@ def _combine_decode_kernel(
     exp(lse - m_safe), 0)``, ``v = SELECT(live, v, 0)``, ``den += w``, ``acc += w * v`` in split order
     from +0): for ``n_splits <= 16`` only chain 0 holds splits and the output is bitwise the lean
     kernel's; past 16 the sum is associated differently (fp32-rounding-level differences)."""
+    if cutlass.const_expr(use_pdl):
+        wait_on_dependent_grids()
+        launch_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
     lane = tidx % cutlass.Int32(32)
     warp = tidx // cutlass.Int32(32)
@@ -1070,10 +1086,13 @@ def _launch_combine(
     gate: Optional[cute.Tensor],
     decode_grid: cutlass.Constexpr[int],
     stream: _cuda_driver.CUstream = None,
+    use_pdl: cutlass.Constexpr[bool] = False,
 ) -> None:
     """One launch for every ABI: dense placement (ragged tensors None) or the
     ragged-Q leg's placement at the offsets, bounded by the (O, Stats) packed
-    token capacities; ``gate`` (dense placement only) is the gated entry's G.
+    token capacities; ``gate`` (dense placement only) is the gated entry's G;
+    ``use_pdl`` launches with the programmatic-stream-serialization attribute
+    (either kernel's griddepcontrol pair is traced under the same flag).
 
     ``decode_grid`` picks the kernel: ``DECODE_GRID_AUTO`` launches the decode-grid
     kernel when the lean kernel's grid holds at most
@@ -1119,10 +1138,12 @@ def _launch_combine(
             cutlass.Int32(ragged_caps[0]),
             cutlass.Int32(ragged_caps[1]),
             gate,
+            use_pdl,
         ).launch(
             grid=(cutlass.Int32(SQ) * n_chunks, H, B),
             block=[DECODE_THREADS, 1, 1],
             stream=stream,
+            use_pdl=use_pdl,
         )
     else:
         _combine_kernel(
@@ -1146,10 +1167,12 @@ def _launch_combine(
             cutlass.Int32(ragged_caps[0]),
             cutlass.Int32(ragged_caps[1]),
             gate,
+            use_pdl,
         ).launch(
             grid=((SQ + ROWS_PER_BLOCK - 1) // ROWS_PER_BLOCK, H, B),
             block=[THREADS, 1, 1],
             stream=stream,
+            use_pdl=use_pdl,
         )
 
 
@@ -1166,6 +1189,7 @@ def _host_ptr(
     stats_log2: cutlass.Constexpr[bool],
     decode_grid: cutlass.Constexpr[int],
     stream: _cuda_driver.CUstream = None,
+    use_pdl: cutlass.Constexpr[bool] = False,
 ) -> None:
     """Bind prepared f16/bf16 pointers to the same reduction as tensor callers.
 
@@ -1178,7 +1202,24 @@ def _host_ptr(
         o_partial_ptr, lse_partial_ptr, o_out_ptr, lse_out_ptr, problem_size, n_splits, o_strides, lse_strides
     )
     _launch_combine(
-        o_partial, lse_partial, o_out, lse_out, None, None, problem_size, n_splits, stats_log2, None, None, None, (1, 1, 1), (0, 0), None, decode_grid, stream
+        o_partial,
+        lse_partial,
+        o_out,
+        lse_out,
+        None,
+        None,
+        problem_size,
+        n_splits,
+        stats_log2,
+        None,
+        None,
+        None,
+        (1, 1, 1),
+        (0, 0),
+        None,
+        decode_grid,
+        stream,
+        use_pdl,
     )
 
 
@@ -1197,6 +1238,7 @@ def _host_ptr_gated(
     stats_log2: cutlass.Constexpr[bool],
     decode_grid: cutlass.Constexpr[int],
     stream: _cuda_driver.CUstream = None,
+    use_pdl: cutlass.Constexpr[bool] = False,
 ) -> None:
     """:func:`_host_ptr` plus the gate: ``gate_ptr`` / ``gate_strides`` describe G
     as a ``[B, S_q, H, D_v]`` view in BSHD stride order (like ``o_strides``), read
@@ -1209,7 +1251,24 @@ def _host_ptr_gated(
     B, H, SQ, D = problem_size
     gate = cute.make_tensor(gate_ptr, cute.make_layout((B, SQ, H, D), stride=gate_strides))
     _launch_combine(
-        o_partial, lse_partial, o_out, lse_out, None, None, problem_size, n_splits, stats_log2, None, None, None, (1, 1, 1), (0, 0), gate, decode_grid, stream
+        o_partial,
+        lse_partial,
+        o_out,
+        lse_out,
+        None,
+        None,
+        problem_size,
+        n_splits,
+        stats_log2,
+        None,
+        None,
+        None,
+        (1, 1, 1),
+        (0, 0),
+        gate,
+        decode_grid,
+        stream,
+        use_pdl,
     )
 
 
@@ -1383,6 +1442,7 @@ def compile_ptr(
     gate: bool = False,
     dtype_gate: Optional[str] = None,
     decode_grid: int = DECODE_GRID_AUTO,
+    use_pdl: bool = False,
 ) -> Callable:
     """Compile a shape-generic pointer entry for prepared split execution.
 
@@ -1410,6 +1470,10 @@ def compile_ptr(
     / ``DECODE_GRID_OFF`` force one form (tests, an explicit decode flag, a kill
     switch).  The quantized and packed entries ignore it (always their own
     kernel).
+    ``use_pdl=True`` (appended; in the key; the dense half entries ``_host_ptr`` /
+    ``_host_ptr_gated`` only) traces the programmatic-dependent-launch form of the
+    same reduction: the launch attribute plus the kernel's ``griddepcontrol`` wait
+    before its first read and release right after -- the same math, bitwise.
     """
     if dtype_o not in ("f16", "bf16", "e4m3", "e5m2") or dtype_partial not in ("f16", "bf16", "f32"):
         raise ValueError("prepared split combine requires half/FP8 O and f16/bf16/f32 partials")
@@ -1433,6 +1497,8 @@ def compile_ptr(
         raise ValueError("dtype_gate is a gate=True specialization")
     if decode_grid not in (DECODE_GRID_AUTO, DECODE_GRID_ON, DECODE_GRID_OFF):
         raise ValueError("decode_grid must be DECODE_GRID_AUTO, DECODE_GRID_ON or DECODE_GRID_OFF")
+    if use_pdl and (packed or quantized or ragged):
+        raise ValueError("use_pdl=True is served by the dense half entries only (no packed partials, no quantized O, no ragged placement)")
     _cache_key = _template_key(globals(), locals(), "compile_ptr")
     gmem = cute.AddressSpace.gmem
 
@@ -1482,4 +1548,5 @@ def compile_ptr(
         cache_key=_cache_key,
         symbol="frost_sdpa_fwd_combine_ptr",
         **({"sinks_ptr": P(cutlass.Float32)} if has_sink else {}),
+        **({"use_pdl": True} if use_pdl else {}),
     )

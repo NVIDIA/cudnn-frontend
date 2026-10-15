@@ -763,6 +763,9 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
             has_scale_o_input=not (s.quant is not None and s.quant.sf_sizes),
             gate=gate_in_combine,
             dtype_gate=({"bfloat16": "bf16", "float16": "f16"}[gate_dtype] if gate_in_combine else None),
+            # The plan's programmatic-dependent-launch form reaches the combine too (the dense half entries; a split tile
+            # compiled with its griddepcontrol sites releases this pass early, and this pass waits before its first read).
+            **({"use_pdl": True} if getattr(api, "use_pdl", False) else {}),
         )
         fn = positional_entry(owner)
         if fn is None:

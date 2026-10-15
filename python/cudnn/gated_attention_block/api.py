@@ -3860,6 +3860,7 @@ class _QkNormRope(_Stage):
                 stages=self.stages,
                 threads_per_cta=self.threads_per_cta,
                 apply_norm=g.qk_norm,
+                use_pdl=self.use_pdl,
             )
             return
         from .kernels.qk_norm_rope import compile_qk_norm_rope
@@ -4150,6 +4151,9 @@ class _Sdpa(_Stage):
         # the EXTEND form's binding at the dense step's (B, S_q) envelope with the group packed -- and the compiled template is pinned
         # against it either way.
         route: Optional[DecodeRoute] = None,
+        # APPENDED: the adapter's programmatic-dependent-launch form (SdpaFwdDslSm100(use_pdl=True): the decode tile and its split combine
+        # launch with the attribute and carry the griddepcontrol pair).  Performance-only; a kernel without the sites declines at compile.
+        use_pdl: bool = False,
     ) -> None:
         # token_stride != 0 => Q/K/V are column slices of the fused projection
         # and are read in place at that stride (the adapter compiles its TMA
@@ -4220,6 +4224,7 @@ class _Sdpa(_Stage):
         # gates in its own launch, which the block decides (GatedAttentionBlockFwd.gate_fused) -- fuse_gate=True here = the combine.
         self.max_kv_len = int(max_kv_len)
         self.decode_split_kv = int(decode_split_kv)
+        self.use_pdl = bool(use_pdl)
         self.decode_route: Optional[DecodeRoute] = route
         self.paged_dense = self.kv_source == KV_SOURCE_PAGED and not self.thd
         if self.kv_source == KV_SOURCE_PAGED:
@@ -4296,6 +4301,8 @@ class _Sdpa(_Stage):
         # pertensor_fp8 picks the kernel FAMILY: True -> prefill_d256_fp8.py
         # (scalar descales), False -> prefill_d256_mxfp8.py (block scales).
         kw = dict(pertensor_fp8=self.pertensor, dtype_o=self.o_dtype, has_amax_o=False) if self.fp8 else {}
+        if self.use_pdl:
+            kw["use_pdl"] = True  # the adapter declines at compile() when the routed kernel carries no griddepcontrol sites
         if self.thd:
             # THD: the adapter takes the (B_env, H, S_max, D) ENVELOPE at the block's token strides -- the same `_bhsd_desc`
             # the dense arm declares, at (num_sequences, max_seq_len) instead of (1, T); its (d, h, s) stride order is what
@@ -5503,7 +5510,18 @@ class _ElementwiseStage(_Stage):
     and should sit closest to the HBM ceiling.
     """
 
-    def __init__(self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, dtype: torch.dtype, heads: int, has_gate: bool, name: str) -> None:
+    def __init__(
+        self,
+        geometry: GatedAttentionBlockGeometry,
+        *,
+        batch: int,
+        seq_len: int,
+        dtype: torch.dtype,
+        heads: int,
+        has_gate: bool,
+        name: str,
+        use_pdl: bool = False,
+    ) -> None:
         self.name = name
         self.geom = geometry
         self.batch = int(batch)
@@ -5511,6 +5529,7 @@ class _ElementwiseStage(_Stage):
         self.dtype = dtype
         self.heads = int(heads)
         self.has_gate = bool(has_gate)
+        self.use_pdl = bool(use_pdl)  # the kernel's programmatic-dependent-launch form (kernels/elementwise.py: the launch attribute + the griddepcontrol pair)
         self._recipe = None
 
     def check_support(self) -> None:
@@ -5531,6 +5550,7 @@ class _ElementwiseStage(_Stage):
             threads_per_cta=_ELEMENTWISE_THREADS,
             rows_per_group=_ELEMENTWISE_ROWS_PER_GROUP,
             const_head_count=_ELEMENTWISE_CONST_HEAD_COUNT,
+            use_pdl=self.use_pdl,
         )
 
     def moved_bytes(self) -> int:
@@ -5572,8 +5592,8 @@ class _SigmoidGate(_ElementwiseStage):
     or training keeps this stage split. Decide that deliberately.
     """
 
-    def __init__(self, geometry, *, batch, seq_len, dtype):
-        super().__init__(geometry, batch=batch, seq_len=seq_len, dtype=dtype, heads=geometry.h_q, has_gate=True, name="sigmoid_gate")
+    def __init__(self, geometry, *, batch, seq_len, dtype, use_pdl: bool = False):
+        super().__init__(geometry, batch=batch, seq_len=seq_len, dtype=dtype, heads=geometry.h_q, has_gate=True, name="sigmoid_gate", use_pdl=use_pdl)
 
     def execute(self, o: torch.Tensor, gate: torch.Tensor, out: torch.Tensor, current_stream=None) -> None:
         self._run(o, gate, out, current_stream)
@@ -5656,13 +5676,14 @@ class _CacheWrite(_Stage):
     capacity writes nothing either (the kernel range-checks on device; slot VALUES are never read on the host).
     """
 
-    def __init__(self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, dtype: torch.dtype, page_size: int) -> None:
+    def __init__(self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, dtype: torch.dtype, page_size: int, use_pdl: bool = False) -> None:
         self.name = "cache_write"
         self.geom = geometry
         self.batch = int(batch)
         self.seq_len = int(seq_len)
         self.dtype = dtype
         self.page_size = int(page_size)
+        self.use_pdl = bool(use_pdl)  # the kernel's programmatic-dependent-launch form (kernels/cache_write.py: the launch attribute + the griddepcontrol pair)
         self.index_band = bool(geometry.index_band)
         self._recipes = None  # {slot dtype: (K / V recipe, indexer recipe or None)}
 
@@ -5699,6 +5720,7 @@ class _CacheWrite(_Stage):
                 threads_per_cta=_ELEMENTWISE_THREADS,
                 rows_per_group=_ELEMENTWISE_ROWS_PER_GROUP,
                 const_head_count=_ELEMENTWISE_CONST_HEAD_COUNT,
+                use_pdl=self.use_pdl,
             )
             idx = (
                 compile_cache_write(
@@ -5711,6 +5733,7 @@ class _CacheWrite(_Stage):
                     threads_per_cta=_ELEMENTWISE_THREADS,
                     rows_per_group=_ELEMENTWISE_ROWS_PER_GROUP,
                     const_head_count=_ELEMENTWISE_CONST_HEAD_COUNT,
+                    use_pdl=self.use_pdl,
                 )
                 if self.index_band
                 else None
@@ -6425,6 +6448,13 @@ class GatedAttentionBlockFwd(APIBase):
         # (the same function under every width -- the SDPA suite's cross-form bitwise pins); `DecodeRoute.q_tile_max` reads it back and
         # the stage hands it to the adapter so the compiled width is the declared one.  Module docstring, "The DECODE form".
         decode_q_tile_max: Optional[int] = None,
+        # APPENDED (MEASUREMENT PROTOTYPE, performance-only): programmatic dependent launch over the block's own launch chain.  True launches
+        # the norm + RoPE, cache-write, sigmoid-gate, d256 decode-tile and split-combine kernels with the programmatic-stream-serialization
+        # attribute and traces their griddepcontrol pair (a wait before the first global read of a predecessor's output, a release after the
+        # prologue); the FROST GEMM templates already launch that way (their module constant USE_PDL).  The same kernels, the same math:
+        # `out` is BITWISE the use_pdl=False block's, eagerly and under CUDA-graph capture.  Served for the bf16 / f16 block (no quant, no e4m3
+        # KV cache, no QsaSpec); a declaration whose chain routes to a kernel without the sites is a typed decline at compile.
+        use_pdl: bool = False,
     ):
         """Validate the declaration -- the dtype / ``quant`` / scale-blob halves, the fusion and save-mode knobs against
         ``save_for_backward``, the THD envelope, the paged-cache write-through -- normalise the samples, record the knobs and
@@ -6434,6 +6464,16 @@ class GatedAttentionBlockFwd(APIBase):
         self.geom = geometry
         self.dtype = sample_h.dtype
         self.device = sample_h.device
+        # Programmatic dependent launch over the chain (the constructor's note): the bf16 / f16 block only -- the quantized pipelines'
+        # quantize stages, the e4m3 write-through and the sparse core carry no griddepcontrol sites yet, and a chain with one
+        # attribute-less link in the middle would silently serialize there while the links after it believe they overlap.  The
+        # FIRST decline of such a declaration, so the message names the switch rather than a later check's vocabulary.
+        self.use_pdl = bool(use_pdl)
+        if self.use_pdl and (quant is not None or kv_cache_dtype is not None or geometry.qsa is not None):
+            raise NotImplementedError(
+                "use_pdl=True is served for the bf16 / f16 block only (no quant / QuantSpec, no kv_cache_dtype, no QsaSpec): those pipelines' "
+                "stages carry no programmatic-dependent-launch sites; declare use_pdl=False"
+            )
         # FP8: `h` and both weights arrive as e4m3 with a QuantSpec; every
         # activation the block's own kernels touch (slab, O, out, cos/sin, norm
         # weights) is bf16 -- the "activation dtype".  bf16/f16: the two coincide.
@@ -6776,7 +6816,7 @@ class GatedAttentionBlockFwd(APIBase):
                 block_scale=mxfp8,
                 w_dtype=quant.w_qkvg_dtype if mxfp8 else None,
             )
-            self._norm_rope = _QkNormRope(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act, want_rstd=want_rstd)
+            self._norm_rope = _QkNormRope(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act, want_rstd=want_rstd, use_pdl=self.use_pdl)
         # Stage (3b) exists ONLY to give the SDPA a compact V. In-place needs no
         # such thing, so the stage is not built at all rather than built and
         # skipped -- a stage that is never run should not be in `_stages`,
@@ -6907,11 +6947,12 @@ class GatedAttentionBlockFwd(APIBase):
                 max_kv_len=self.max_kv_len if self.decode_route is not None else 0,
                 decode_split_kv=self.decode_split_kv if self.decode_route is not None else 1,
                 route=self.decode_route,
+                use_pdl=self.use_pdl,
             )
         # Stage (5) lives in the SDPA kernel's gate epilogue under fuse_gate --
         # not built rather than built and skipped (it would still compile).
         # gate_fused, not fuse_gate: on the DECODE form a declared fuse_gate runs as this launch when the tile runs unsplit.
-        self._gate = None if self.gate_fused else _SigmoidGate(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act)
+        self._gate = None if self.gate_fused else _SigmoidGate(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act, use_pdl=self.use_pdl)
         # (4w) SERVING write-through of the post-RoPE K / V (+ the raw indexer key) into paged pools -- built only when
         # the declaration carries a page size; not built rather than built and skipped (it would still compile).
         # Not built when the fused projection's epilogue writes the pools (cache_write_fused): a stage that never runs is not in `_stages`.
@@ -6921,7 +6962,9 @@ class GatedAttentionBlockFwd(APIBase):
         elif self.kv_cache_e4m3:
             self._cache_write = _QuantizedCacheWrite(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act, page_size=self.paged_kv_page_size)
         else:
-            self._cache_write = _CacheWrite(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act, page_size=self.paged_kv_page_size)
+            self._cache_write = _CacheWrite(
+                geometry, batch=self.batch, seq_len=self.seq_len, dtype=act, page_size=self.paged_kv_page_size, use_pdl=self.use_pdl
+            )
         # (3g) TRAINING, gate-copy save mode only: ONE strided copy of the slab's
         # GATE band into the compact caller `saved.gate` (the elementwise kernel's
         # has_gate=False arm at h_q heads; the same artifact serves an optional

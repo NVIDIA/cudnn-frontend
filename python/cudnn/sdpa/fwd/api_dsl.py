@@ -736,6 +736,11 @@ class SdpaFwdDsl(APIBase):
         # PERFORMANCE-ONLY knob (the same function under every width); read by _decode_q_tile_for.  Refused off the Rubin route (any other
         # arch line, where the table is not the lowering's).
         decode_q_tile_max: Optional[int] = None,
+        # APPENDED: programmatic dependent launch -- the plan's kernels launch with the programmatic-stream-serialization attribute and
+        # carry the griddepcontrol pair (a wait before their first global read, a release after their prologue).  Performance-only:
+        # the same math, bitwise.  Served where the loaded kernel's compile() carries the knob (the cc 10.7 d256 decode tile and its
+        # split combine); a kernel without it is a typed decline at compile().
+        use_pdl: bool = False,
     ) -> None:
         """Capture the common SDPA operation and tuning contract.
 
@@ -887,6 +892,7 @@ class SdpaFwdDsl(APIBase):
                 raise ValueError(
                     f"decode_q_tile_max must be one of {_widths} (the Rubin d256 decode tile's single-unit widths) or None; got {decode_q_tile_max}"
                 )
+        self.use_pdl = bool(use_pdl)
         # THD Stats declared WITHOUT ragged offsets: per-batch padded (b, s_max, h)
         # rows (FlashInfer's form). The kernel stores per batch; the adapter fills
         # the rows past each sequence's length with -inf, as the backend does.
@@ -2824,6 +2830,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # plan agrees on `has_amax`.
         self._kernel_accepts = None  # a (re)loaded module: re-read its signature
         _kc = self._kernel_compile_accepts()
+        if self.use_pdl and "use_pdl" not in _kc:
+            # Rule 1: a plan declared with the programmatic-dependent-launch form never runs a kernel that silently lacks it.
+            raise NotImplementedError(
+                f"use_pdl=True: the {self.kernel_template} kernel carries no programmatic-dependent-launch sites (served by the cc 10.7 "
+                "d256 decode tile and its split combine); declare use_pdl=False for this plan"
+            )
         # Explicit pointer/int host entry (the f16/bf16 SM100 / SM107 prefill templates): every
         # extent and stride is a runtime argument, so the compile key is layout-only and the
         # dense / THD launches bind pointers through cudnn.sdpa.fwd.prepared.
@@ -2957,6 +2969,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         if "ragged_i64" in accepted and self.thd_decode_leg:
             # The ragged-Q leg's offset read width (int32 or int64 offsets).
             kw["ragged_i64"] = self.ragged_offsets_int64
+        if "use_pdl" in accepted and self.use_pdl:
+            # The programmatic-dependent-launch form (the launch attribute + the griddepcontrol pair); compile() declined a kernel without the knob.
+            kw["use_pdl"] = True
         return kw
 
     def _build_prepared_specs(self) -> None:

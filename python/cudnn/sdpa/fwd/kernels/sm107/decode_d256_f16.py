@@ -155,7 +155,7 @@ DESC_VERSION: int = d256_decode_desc_version(CFG)
 # constant IS the whole experiment (test_sm107_decode_ring_waits_take_the_module_spin_constant).
 SPIN_RING_WAITS: bool = False
 
-from cudnn.frost.tile_dsl.barrier import MBarrier, PipelineState, Producer, advance
+from cudnn.frost.tile_dsl.barrier import MBarrier, PipelineState, Producer, advance, launch_dependent_grids, wait_on_dependent_grids
 from cudnn.frost.tile_dsl.mma import mma_ss
 from cudnn.frost.tile_dsl.tma import tma_load_tile
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, GmemTileTma
@@ -450,6 +450,7 @@ def _tmaldg_warp_group(
     block_table_tensor=None,
     block_table_v_tensor=None,
     paged_hnd: cutlass.Constexpr[bool] = False,
+    use_pdl: cutlass.Constexpr[bool] = False,
 ):
     tma_q = GmemTileTma(tma_q_desc)
     if cutlass.const_expr(PAGED_KV and paged_hnd):
@@ -461,6 +462,15 @@ def _tmaldg_warp_group(
     else:
         tma_k = GmemTileTma(tma_k_desc)
         tma_v = GmemTileTma(tma_v_desc)
+
+    if cutlass.const_expr(use_pdl):
+        # Programmatic dependent launch: every global read of this role -- the lengths and the table (a serving stack's own
+        # earlier kernels write them), the Q box (the slab a projection / norm-RoPE launch wrote), the K / V pages (the
+        # write-through filled them) -- sits BELOW this wait; the descriptor prefetches above it are the prologue it overlaps.
+        wait_on_dependent_grids()
+        # The prologue is behind this CTA: release the dependent grid so it stages its own while the mainloop runs (its wait
+        # still blocks on this grid's completion and memory flush, wherever this trigger sits).
+        launch_dependent_grids()
 
     lo, hi, eff_seqlen_kv, _eq, _ql = _unit_bounds(seq_kv_lens_tensor, seq_q_lens_addr, batch_idx, split_idx, seqlen_q, seqlen_kv, tok0)
     n_tiles = hi - lo
@@ -521,6 +531,7 @@ def _mma_warp_group(
     batch_idx,
     split_idx,
     tok0,
+    use_pdl: cutlass.Constexpr[bool] = False,
 ):
     tmem_alloc(tmem_ptr_i32, TMEM_COLS, CTA_GROUP_KIND)
     nvvm.barrier_cta_arrive(_BAR_TMEM, 32 * (SOFTMAX_WARPS + 1))
@@ -575,6 +586,9 @@ def _mma_warp_group(
         kind=MMA_KIND,
     )
 
+    if cutlass.const_expr(use_pdl):
+        # PDL: the TMEM allocation and the descriptor builds above are this role's prologue; its first global read (the lengths) is below.
+        wait_on_dependent_grids()
     lo, hi, _ek, _eq, _ql = _unit_bounds(seq_kv_lens_tensor, seq_q_lens_addr, batch_idx, split_idx, seqlen_q, seqlen_kv, tok0)
     n_tiles = hi - lo
 
@@ -680,6 +694,7 @@ def _softmax_warp_group(
     split_idx,
     tok0,
     scale_log2: cutlass.Float32,
+    use_pdl: cutlass.Constexpr[bool] = False,
 ):
     nvvm.barrier_cta_sync(barrier_id=_BAR_TMEM, thread_count=32 * (SOFTMAX_WARPS + 1))
     tidx = cute.arch.thread_idx()[0]
@@ -694,6 +709,9 @@ def _softmax_warp_group(
     G = cutlass.Int32(HEADS_PER_TILE)
     tmem_base = tmem_ptr_i32.load()
 
+    if cutlass.const_expr(use_pdl):
+        # PDL: the TMEM handshake above is this role's prologue; its first global read (the lengths) is below.
+        wait_on_dependent_grids()
     lo, hi, eff_seqlen_kv, eff_seqlen_q, q_len_b = _unit_bounds(seq_kv_lens_tensor, seq_q_lens_addr, batch_idx, split_idx, seqlen_q, seqlen_kv, tok0)
     n_tiles = hi - lo
     causal_diag = cutlass.Int32(0)
@@ -971,6 +989,9 @@ def _kernel(
     block_table_tensor: Optional[cute.Tensor] = None,
     block_table_v_tensor: Optional[cute.Tensor] = None,
     paged_hnd: cutlass.Constexpr[bool] = False,
+    # Programmatic dependent launch (the launch attribute is set by the host entry under the same flag): each role waits on the
+    # dependent grid right after its own prologue and before its first global read, and the TMA role releases the dependent grid.
+    use_pdl: cutlass.Constexpr[bool] = False,
 ) -> None:
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx, _, _ = cute.arch.thread_idx()
@@ -1098,6 +1119,7 @@ def _kernel(
             split_idx=split_idx,
             tok0=tok0,
             scale_log2=scale_softmax_log2,
+            use_pdl=use_pdl,
         )
     elif warp_idx == MMA_WARP_ID:
         _mma_warp_group(
@@ -1114,6 +1136,7 @@ def _kernel(
             batch_idx=batch_idx,
             split_idx=split_idx,
             tok0=tok0,
+            use_pdl=use_pdl,
         )
     elif warp_idx == TMALDG_WARP_ID:
         nvvm.prefetch_tensormap(tma_q_desc.get_ptr())
@@ -1137,6 +1160,7 @@ def _kernel(
             block_table_tensor=block_table_tensor,
             block_table_v_tensor=block_table_v_tensor,
             paged_hnd=paged_hnd,
+            use_pdl=use_pdl,
         )
 
 
@@ -1175,6 +1199,7 @@ def _host(
     d_v: cutlass.Constexpr[int],
     lse_kind: cutlass.Constexpr[str],
     paged_hnd: cutlass.Constexpr[bool],
+    use_pdl: cutlass.Constexpr[bool] = False,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     """Bind the shared explicit SDPA ABI and launch the existing decode kernel.
@@ -1278,23 +1303,26 @@ def _host(
         n_tok_units,
     )
 
-    def launch(args, k_table, v_table, hnd, grid, current_stream):
-        _kernel(*args, k_table, v_table, hnd).launch(
+    # `pdl` is an explicit argument of both helpers (like `hnd`): the DSL refuses a closure capture inside a staged `if`.
+    def launch(args, k_table, v_table, hnd, pdl, grid, current_stream):
+        # pdl: the programmatic-stream-serialization launch attribute, paired with the kernel's griddepcontrol sites.
+        _kernel(*args, k_table, v_table, hnd, pdl).launch(
             grid=grid,
             block=[CFG.THREADS_PER_CTA, 1, 1],
             stream=current_stream,
+            use_pdl=pdl,
         )
 
-    def launch_tables(args, kt, vt, kp, vp, strides, batch, kv_extent, hnd, grid, current_stream):
+    def launch_tables(args, kt, vt, kp, vp, strides, batch, kv_extent, hnd, pdl, grid, current_stream):
         if cutlass.const_expr(PAGED_KV):
             # Keep the common unit page-column stride static in the device code.
             if strides[1] == cutlass.Int64(1):
                 layout = cute.make_layout((batch, kv_extent // cutlass.Int32(PAGE_SIZE)), stride=(strides[0], 1))
-                launch(args, cute.make_tensor(kp, layout), cute.make_tensor(vp, layout), hnd, grid, current_stream)
+                launch(args, cute.make_tensor(kp, layout), cute.make_tensor(vp, layout), hnd, pdl, grid, current_stream)
             else:
-                launch(args, kt, vt, hnd, grid, current_stream)
+                launch(args, kt, vt, hnd, pdl, grid, current_stream)
         else:
-            launch(args, kt, vt, hnd, grid, current_stream)
+            launch(args, kt, vt, hnd, pdl, grid, current_stream)
 
     compact_inner = o_strides[2] == cutlass.Int64(d_v)
     if cutlass.const_expr(lse_ptr is not None):
@@ -1305,10 +1333,23 @@ def _host(
         if cutlass.const_expr(lse_ptr is not None):
             stats = cute.make_tensor(lse_ptr, cute.make_layout((B * SPLIT_KV, QH, SQ), stride=(lse_strides[0], lse_strides[1], 1)))
         args = kernel_args[:3] + (output, stats) + kernel_args[5:]
-        launch_tables(args, block_table_tensor, block_table_v_tensor, block_table_ptr, block_table_v_ptr, table_strides, B, SKV, paged_hnd, grid_shape, stream)
+        launch_tables(
+            args, block_table_tensor, block_table_v_tensor, block_table_ptr, block_table_v_ptr, table_strides, B, SKV, paged_hnd, use_pdl, grid_shape, stream
+        )
     else:
         launch_tables(
-            kernel_args, block_table_tensor, block_table_v_tensor, block_table_ptr, block_table_v_ptr, table_strides, B, SKV, paged_hnd, grid_shape, stream
+            kernel_args,
+            block_table_tensor,
+            block_table_v_tensor,
+            block_table_ptr,
+            block_table_v_ptr,
+            table_strides,
+            B,
+            SKV,
+            paged_hnd,
+            use_pdl,
+            grid_shape,
+            stream,
         )
 
 
@@ -1323,10 +1364,13 @@ def compile(  # noqa: A001
     has_lse: bool = True,
     lse_kind: str = "dense",
     paged_hnd: bool = False,
+    use_pdl: bool = False,
 ) -> Callable:
     """Compile the shared pointer ABI for dense or paged decode. Shapes and strides
     are runtime arguments; head-dim envelopes, Stats presence and pool layout
-    are specializations. All stride fakes, including page tables, are Int64."""
+    are specializations. All stride fakes, including page tables, are Int64.
+    ``use_pdl`` (appended; in the key) traces the programmatic-dependent-launch form: the launch attribute plus the per-role
+    ``griddepcontrol`` wait before the first global read and the release after the prologue -- the same math, bitwise."""
     _cache_key = _template_key(globals(), locals(), "compile")
     if not (0 < d_qk <= CFG.TILE_K and 0 < d_v <= CFG.TILE_O):
         raise ValueError(f"d256 envelope: need 0 < d_qk <= {CFG.TILE_K} and 0 < d_v <= {CFG.TILE_O}; got ({d_qk}, {d_v})")
@@ -1377,6 +1421,7 @@ def compile(  # noqa: A001
         d_v,
         lse_kind,
         paged_hnd,
+        bool(use_pdl),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
         cache_key=_cache_key,
