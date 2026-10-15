@@ -378,6 +378,41 @@ def test_DSA_indexer_forward_wrapper_qh16_causal_block_boundary():
 
 
 @pytest.mark.L0
+@torch_fork_set_rng(seed=5)
+def test_DSA_indexer_forward_wrapper_zero_key_query_tail_returns_empty_scores():
+    """The geometry the trailing-query rule admits at its edge: a query shorter than one compressed block (S_q 3 at ratio 4) has NO
+    compressed key yet (S_k 0).  The dense wrapper returns the empty (B, S_q, 0) scores -- nothing to score, nothing compiled or launched,
+    the empty buffer has no row stride to hold to the 16-byte rule -- the compressed top-k wrapper returns its padded result (-1 indices,
+    -inf logits) for the same input, and one query token more (S_q 4 = a complete block with no key) is still refused by name."""
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("the SM100-family dense indexer forward")
+    device = torch.device("cuda")
+    b, s_q, s_k, h_q, h_kv, d, ratio = 1, 3, 0, 4, 1, 128, 4
+    q = torch.randn(b, s_q, h_q, d, dtype=torch.bfloat16, device=device)
+    k = torch.empty(b, s_k, h_kv, d, dtype=torch.bfloat16, device=device)
+    w = torch.randn(b, s_q, h_q, dtype=torch.bfloat16, device=device)
+
+    scores = DSA.indexer_forward_wrapper(q, k, w, ratio=ratio, qhead_per_kv_head=h_q)["scores"]
+    torch.cuda.synchronize()
+    assert tuple(scores.shape) == (b, s_q, 0), tuple(scores.shape)
+    assert scores.dtype == torch.float32 and scores.is_cuda
+
+    topk = DSA.indexer_forward_top_k_wrapper(q, k, w, top_k=8, ratio=ratio, qhead_per_kv_head=h_q, return_softmax=False)
+    torch.cuda.synchronize()
+    assert tuple(topk["indices"].shape) == (b, s_q, 8), tuple(topk["indices"].shape)
+    assert bool((topk["indices"] == -1).all()) and bool(torch.isneginf(topk["logits"]).all())
+
+    q4 = torch.randn(b, ratio, h_q, d, dtype=torch.bfloat16, device=device)
+    w4 = torch.randn(b, ratio, h_q, dtype=torch.bfloat16, device=device)
+    with pytest.raises(ValueError, match=r"must be <= seqlen_k \* ratio \+ \(ratio - 1\)"):
+        DSA.indexer_forward_wrapper(q4, k, w4, ratio=ratio, qhead_per_kv_head=h_q)
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=11)
 @pytest.mark.parametrize(
     "qhead_per_kv_head,s_q_default,ratio",

@@ -105,6 +105,10 @@ def _validate_out_view(
         raise ValueError(f"out must be a float32 CUDA tensor on {device}, got {out.dtype} on {out.device}")
     if tuple(out.shape) != out_shape:
         raise ValueError(f"out must have shape {out_shape}, got {tuple(out.shape)}")
+    if seqlen_k_dim == 0:
+        # A query with no compressed key yet (fewer than ``ratio`` tokens: not one complete block, the geometry ``check_q_covered_by_k``
+        # admits): the empty ``out`` IS the result and has no row to stride, so the alignment rule below does not apply to it.
+        return
     strides = tuple(out.stride())
     if (
         strides[-1] != 1
@@ -552,6 +556,10 @@ def _indexer_fwd_bound(
             f"out[..., :{seqlen_k_dim}] (indexer_forward_wrapper allocates it for you)"
         )
     _validate_out_view(out, out_shape, seqlen_k_dim, device)
+    if seqlen_k_dim == 0:
+        # Nothing to score: the compressed-logits path returns its padded result (-1 indices, -inf logits) for this geometry and the dense
+        # path returns the empty scores -- no kernel compiled, nothing launched (a zero-key grid has no tile to run).
+        return out
 
     if precision == "mxfp8":
         assert q_scale is not None and k_scale is not None
