@@ -2370,12 +2370,14 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
             r_score = cute.make_rmem_tensor(score_coordinates.shape, self.acc_dtype)
             r_dp = cute.make_rmem_tensor(score_coordinates.shape, self.acc_dtype)
             r_p = cute.make_rmem_tensor(score_coordinates.shape, self.element_dtype)
+            r_valid_band = cute.make_rmem_tensor((8,), cutlass.Boolean)
             r_ds = r_p
             r_delta = cute.make_rmem_tensor((4,), self.acc_dtype)
             softmax_scale_log2_e = scale_softmax * Float32(math.log2(math.e))
             hoist_group_bases = [2 * (h_group % 2) + 16 * (h_group // 2) for h_group in range(4)]
             hoist_group_local_h = [Int32(cute.get(score_coordinates[group_base], mode=[0])) % Int32(self.H_TILE_CTA) for group_base in hoist_group_bases]
             hoist_band_indices = [[group_base + j % 2 + 4 * (j // 2) for j in range(8)] for group_base in hoist_group_bases]
+            hoist_band_n = [Int32(cute.get(score_coordinates[hoist_band_indices[0][band]], mode=[1])) for band in range(8)]
             hoist_lse = [softmax_stats[hoist_group_local_h[h_group], 0] for h_group in range(4)]
             math_owns_local_half = cute.arch.make_warp_uniform(mtx // Int32(self.H_TILE_CTA)) == rank
             for loop_iter in cutlass.range(tile_count):
@@ -2387,6 +2389,14 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
                 cute.arch.fence_view_async_tmem_load()
                 pipe_s_done.consumer_release(s_state)
                 s_state.advance()
+                # Score tiles visit the sparse row in reverse order.
+                tile_index = tile_count - Int32(1) - loop_iter
+                for band in cutlass.range_constexpr(8):
+                    slot = tile_index * Int32(self.N_TILE) + hoist_band_n[band]
+                    r_valid_band[band] = False
+                    if slot < topk:
+                        row = staged_indices[hoist_band_n[band], loop_iter & Int32(1)]
+                        r_valid_band[band] = row >= Int32(0) and row < mKV.shape[0]
                 assert cute.size(r_score) == self.N_TILE_CTA
                 for h_group in cutlass.range_constexpr(4):
                     lse = hoist_lse[h_group]
@@ -2398,6 +2408,11 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
                         v1 = cute.arch.fmin(v1, Float32(64.0), nan=True)
                         v0 = cute.math.exp2(v0, fastmath=True)
                         v1 = cute.math.exp2(v1, fastmath=True)
+                        # Zero-filled K/V cannot mask an overflowing dS product.
+                        if not r_valid_band[2 * pair]:
+                            v0 = Float32(0.0)
+                        if not r_valid_band[2 * pair + 1]:
+                            v1 = Float32(0.0)
                         r_score[i0] = v0
                         r_score[i1] = v1
                         r_p[i0] = self.element_dtype(v0)
@@ -2451,6 +2466,10 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
                         d0, d1 = cute.arch.add_packed_f32x2((r_dp[i0], r_dp[i1]), (delta, delta))
                         d0, d1 = cute.arch.mul_packed_f32x2((d0, d1), (r_score[i0], r_score[i1]))
                         d0, d1 = cute.arch.mul_packed_f32x2((d0, d1), (scale_softmax, scale_softmax))
+                        if not r_valid_band[2 * pair]:
+                            d0 = Float32(0.0)
+                        if not r_valid_band[2 * pair + 1]:
+                            d1 = Float32(0.0)
                         if cutlass.const_expr(self.deterministic and self.USE_DS_LOW):
                             r_dp[i0] = d0
                             r_dp[i1] = d1

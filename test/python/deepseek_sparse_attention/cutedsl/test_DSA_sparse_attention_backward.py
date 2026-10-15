@@ -2098,7 +2098,8 @@ def test_DSA_sparse_attention_backward_sm100_specialized_handles_sink_limits(num
 )
 @pytest.mark.parametrize("has_topk_length", [False, True], ids=["sentinel-padding", "lengths"])
 @pytest.mark.parametrize("head_dim,expected_backend", [(512, "h128_2cta_m64"), (576, "h128_d576_2cta_m64")], ids=["d512", "d576"])
-def test_DSA_sparse_attention_backward_h128_two_cta_handles_sink_limits(head_dim, expected_backend, s_q, topk, has_topk_length, monkeypatch):
+@pytest.mark.parametrize("deterministic", [False, True], ids=["ordinary", "deterministic"])
+def test_DSA_sparse_attention_backward_h128_two_cta_handles_sink_limits(head_dim, expected_backend, s_q, topk, has_topk_length, deterministic, monkeypatch):
     """Both H128 two-CTA routes must implement the empty and saturating softmax limits.
 
     A finite sink such as 2.4e38 overflows to +inf when rescaled by log2(e);
@@ -2153,6 +2154,7 @@ def test_DSA_sparse_attention_backward_h128_two_cta_handles_sink_limits(head_dim
             topk_idxs,
             softmax_scale=softmax_scale,
             topk_length=topk_length,
+            deterministic=deterministic,
         )
         torch.cuda.synchronize()
 
@@ -2163,13 +2165,110 @@ def test_DSA_sparse_attention_backward_h128_two_cta_handles_sink_limits(head_dim
     if head_dim == 576:
         assert two_cta_calls, "the wrapper did not execute the H128/D576 two-CTA backend"
     else:
-        assert any(key[0] == expected_backend and key[5] == num_heads for key in _interface_sm100.flash_attn_bwd_sm100.compile_cache)
+        assert any(
+            key[0] == expected_backend and key[1] == deterministic and key[5] == num_heads for key in _interface_sm100.flash_attn_bwd_sm100.compile_cache
+        )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("head_dim", [512, 576], ids=["d512", "d576"])
+@pytest.mark.parametrize("deterministic", [False, True], ids=["ordinary", "deterministic"])
+@pytest.mark.parametrize(
+    "dout_value,softmax_scale",
+    [
+        pytest.param(1.0, None, id="unit-dout"),
+        pytest.param(float(2**60), None, id="large-dout"),
+        pytest.param(float(2**118), 4.0, id="large-dout-positive-scale"),
+    ],
+)
+def test_DSA_sparse_attention_backward_h128_two_cta_one_key_padded_gradients(head_dim, deterministic, dout_value, softmax_scale, monkeypatch):
+    """Padded slots must not poison an exactly solvable one-key backward pass.
+
+    With no sink and one selected key, P=1 and O=V, so dS, dQ, and dSink
+    are zero. All 128 heads and four queries contribute dO to the same dV.
+    The custom-scale case keeps the correct dV=2**127 finite in BF16, while
+    an unmasked padded slot's dS can overflow before its BF16 conversion.
+    """
+    _require_sm100()
+    if torch.cuda.get_device_capability() not in _TWO_CTA_CAPABILITIES:
+        pytest.skip("H128 two-CTA requires compute capability 10.0 or 10.3")
+    try:
+        from cuda.bindings import driver as cuda
+        from cudnn import DSA
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    s_q, num_heads, head_dim_v, topk = 4, 128, 512, 128
+    device = torch.device("cuda")
+    scale = head_dim**-0.5 if softmax_scale is None else softmax_scale
+    q = torch.full((s_q, num_heads, head_dim), 16.0, dtype=torch.bfloat16, device=device)
+    kv = torch.full((1, head_dim), -1.0, dtype=torch.bfloat16, device=device)
+    out = torch.full((s_q, num_heads, head_dim_v), -1.0, dtype=torch.bfloat16, device=device)
+    dout = torch.full_like(out, dout_value)
+    lse = torch.full((s_q, num_heads), -16.0 * head_dim * scale, dtype=torch.float32, device=device)
+    attn_sink = torch.full((num_heads,), -math.inf, dtype=torch.float32, device=device)
+    topk_idxs = torch.full((s_q, topk), -1, dtype=torch.int32, device=device)
+    topk_idxs[:, 0] = 0
+    expected = (torch.zeros_like(q), torch.zeros_like(kv), torch.zeros_like(attn_sink))
+    expected[1][:, :head_dim_v] = num_heads * s_q * dout_value
+    assert torch.isfinite(expected[1]).all(), "the analytic dKV must be representable in BF16"
+
+    plan = DSA.SparseAttentionBackward(q, kv, out, dout, lse, attn_sink, topk_idxs, softmax_scale=scale, deterministic=deterministic)
+    assert plan.check_support()
+    expected_backend = "h128_2cta_m64" if head_dim == 512 else "h128_d576_2cta_m64"
+    assert plan._backend == expected_backend
+    plan.compile()
+    workspace = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device=device)
+    outputs = (torch.empty_like(q), torch.empty_like(kv), torch.empty_like(attn_sink))
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    two_cta_calls = _spy_d576_two_cta_execute(monkeypatch) if head_dim == 576 else None
+
+    def check_gradients(actual, path):
+        assert len(actual) == 3
+        for name, value, reference in zip(("dq", "dkv", "d_sink"), actual, expected, strict=True):
+            torch.testing.assert_close(value, reference, atol=0, rtol=0, msg=f"{path} {name}: exact one-key gradient")
+
+    workspace.fill_(0xA5)
+    for output in outputs:
+        output.fill_(math.nan)
+    result = DSA.sparse_attention_backward_wrapper(
+        q,
+        kv,
+        out,
+        dout,
+        lse,
+        attn_sink,
+        topk_idxs,
+        softmax_scale=scale,
+        deterministic=deterministic,
+        dq=outputs[0],
+        dkv=outputs[1],
+        stream=stream,
+        workspace=workspace,
+    )
+    assert len(result) == 3
+    check_gradients(tuple(result[name] for name in ("dq", "dkv", "d_sink")), "wrapper")
+
+    workspace.fill_(0xA5)
+    for output in outputs:
+        output.fill_(math.nan)
+    result = plan.execute(q, kv, out, dout, lse, attn_sink, topk_idxs, outputs[0], outputs[1], current_stream=stream, workspace=workspace, d_sink=outputs[2])
+    assert all(actual is original for actual, original in zip(result, outputs, strict=True))
+    check_gradients(result, "plan")
+    if head_dim == 576:
+        assert len(two_cta_calls) == 2, "both wrapper and plan must execute the H128/D576 two-CTA backend"
+    else:
+        assert any(
+            key[0] == expected_backend and key[1] == deterministic and key[5] == num_heads for key in _interface_sm100.flash_attn_bwd_sm100.compile_cache
+        )
 
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=676)
 @pytest.mark.parametrize("head_dim,expected_backend", [(512, "h128_2cta_m64"), (576, "h128_d576_2cta_m64")], ids=["d512", "d576"])
-def test_DSA_sparse_attention_backward_h128_two_cta_padded_slots_under_very_negative_lse(head_dim, expected_backend, monkeypatch):
+@pytest.mark.parametrize("deterministic", [False, True], ids=["ordinary", "deterministic"])
+def test_DSA_sparse_attention_backward_h128_two_cta_padded_slots_under_very_negative_lse(head_dim, expected_backend, deterministic, monkeypatch):
     """Padded slots must not overflow when every valid logit and the sink are far below zero.
 
     The two-CTA kernels zero-fill K and V for invalid slots, so those scores are
@@ -2203,7 +2302,7 @@ def test_DSA_sparse_attention_backward_h128_two_cta_padded_slots_under_very_nega
     assert lse.max().item() < -88.0, "the test relies on exp2(-lse * log2(e)) overflowing FP32"
     dout = torch.randn_like(out)
 
-    result = DSA.sparse_attention_backward_wrapper(q, kv, out, dout, lse, attn_sink, topk_idxs, softmax_scale=softmax_scale)
+    result = DSA.sparse_attention_backward_wrapper(q, kv, out, dout, lse, attn_sink, topk_idxs, softmax_scale=softmax_scale, deterministic=deterministic)
     torch.cuda.synchronize()
 
     for name in ("dq", "dkv", "d_sink"):
@@ -2215,7 +2314,9 @@ def test_DSA_sparse_attention_backward_h128_two_cta_padded_slots_under_very_nega
     if head_dim == 576:
         assert two_cta_calls, "the wrapper did not execute the H128/D576 two-CTA backend"
     else:
-        assert any(key[0] == expected_backend and key[5] == num_heads for key in _interface_sm100.flash_attn_bwd_sm100.compile_cache)
+        assert any(
+            key[0] == expected_backend and key[1] == deterministic and key[5] == num_heads for key in _interface_sm100.flash_attn_bwd_sm100.compile_cache
+        )
 
 
 @pytest.mark.L0
