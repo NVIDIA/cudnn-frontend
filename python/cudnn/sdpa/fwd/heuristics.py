@@ -72,7 +72,17 @@ from cudnn.sdpa.fwd.config_sm100 import (
     supports_paged_d256_pack_gqa,
     supports_paged_prefill_cga1,
 )
-from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR, FP8_HEAD_TILE_GRANULE, HEAD_TILE_GRANULE, SMEM_CAPACITY_BYTES, pick_flavor, smem_bytes, tile_domain
+from cudnn.sdpa.fwd.config_sm120 import (
+    D512_FLAVOR,
+    FP8_HEAD_TILE_GRANULE,
+    HEAD_TILE_GRANULE,
+    SMEM_CAPACITY_BYTES,
+    head_tiles,
+    kv_tile_preference,
+    pick_flavor,
+    smem_bytes,
+    tile_domain,
+)
 from cudnn.sdpa.fwd.engines import (
     ENGINE_SPECS,
     Capabilities,
@@ -503,8 +513,7 @@ def _sm120_envelope(facts) -> Tuple[int, int]:
     """(D_QK, D_V) rounded up to the head-tile granule: the ENVELOPE tiles the
     SM120 kernels stage, so a fit check must use them or a tile offered here
     declines at build (and a knob-carried tile skips the adapter's fallback)."""
-    granule = FP8_HEAD_TILE_GRANULE if (facts.is_fp8 or facts.is_mxfp8) else HEAD_TILE_GRANULE
-    return -(-facts.d_qk // granule) * granule, -(-facts.d_v // granule) * granule
+    return head_tiles(facts.d_qk, facts.d_v, FP8_HEAD_TILE_GRANULE if (facts.is_fp8 or facts.is_mxfp8) else HEAD_TILE_GRANULE)
 
 
 def _sm120_fits_smem(facts, tile_m: int, tile_n: int) -> bool:
@@ -521,9 +530,10 @@ def _sm120_tiles(caps: Capabilities, facts) -> Tuple[int, int]:
 
     ``tile_m=64`` when the grid cannot fill the machine AND each CTA has enough
     KV tiles to amortize the extra Q-tile loop; a causal mask counts as a
-    halved grid because it halves the work per CTA. ``tile_n`` is the largest
-    that fits SMEM: 128 is fastest, but a wide head has no room for it (D>=208
-    in half, further out in FP8 -- its KV tile is a byte per element).
+    halved grid because it halves the work per CTA. ``tile_n`` is the first of
+    ``config_sm120.kv_tile_preference`` that fits SMEM: 128 is fastest, but a
+    wide head has no room for it (D>=208 in half, further out in FP8 -- its KV
+    tile is a byte per element).
 
     Fit is a KERNEL property, so ``config_sm120.smem_bytes`` is the one
     implementation and the adapter's check calls it too. So is the tuning: an
@@ -546,10 +556,11 @@ def _sm120_tiles(caps: Capabilities, facts) -> Tuple[int, int]:
     kv_tiles = -(-facts.s_kv // 128)
     fine = sm_count > 0 and (grid * 2 <= sm_count or (grid * 2 <= 3 * sm_count and kv_tiles >= 12))
     preferred_tile_m = 64 if fine else 128
-    # Prefer the selected query tile, then larger query and KV tiles.
+    kv_order = kv_tile_preference(facts.d_qk, mxfp8=facts.is_mxfp8)
+    # Prefer the selected query tile, then larger query tiles and faster KV tiles.
     candidate_tiles = sorted(
         tile_domain(facts.d_qk, facts.d_v, facts.is_fp8 or facts.is_mxfp8),
-        key=lambda tile: (tile[0] == preferred_tile_m, tile[0], tile[1]),
+        key=lambda tile: (tile[0] == preferred_tile_m, tile[0], -kv_order.index(tile[1])),
         reverse=True,
     )
     for m, n in candidate_tiles:
@@ -1329,9 +1340,10 @@ def _sm120_d512_windowed(caps: Capabilities, facts) -> bool:
     instead of ``tile_m`` plus the window, fewer K/V tiles through the L2->SMEM
     path and less masked-out MMA at the same DRAM bytes. And walk the units with
     plain LPT (see :func:`_sched_points`). Without a window the decode rule
-    alone decides the packing. The FP8 flavor takes only the LPT walk: its
-    64-key tile covers a 64-token unit's window in as many tiles as a packed
-    one-token unit, so packing saves no MMA there (measured 8-11% slower).
+    alone decides the packing. The FP8 and MXFP8 flavors take only the LPT
+    walk: their 64-key tile covers a 64-token unit's window in as many tiles as
+    a packed one-token unit, so packing saves no MMA there (measured 8-11%
+    slower on FP8, 1-3% on MXFP8).
     """
     return caps.sm_lo >= 120 and caps.sm_hi < 130 and facts.window_left is not None and pick_flavor(facts.d_qk, facts.d_v, fp8=facts.is_fp8) == D512_FLAVOR
 
@@ -1505,7 +1517,7 @@ def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] 
             # 97.3 at parity.  Packing keeps the lead where no unpacked tile fits (b2 64/8 q256 KV 4k: packed 93.9 vs
             # unpacked 191.2) and under a band (_sm100_banded_gqa_packs below).  The packed set stays listed.
             wins = False
-    if wins or (_sm120_d512_windowed(caps, facts) and not facts.is_fp8) or _sm100_banded_gqa_packs(caps, facts):
+    if wins or (_sm120_d512_windowed(caps, facts) and not (facts.is_fp8 or facts.is_mxfp8)) or _sm100_banded_gqa_packs(caps, facts):
         return (True, False)
     return (False, True)
 
@@ -2003,7 +2015,8 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     scheds = [unsplit_sched] + [policy for policy in generic_scheds if policy != unsplit_sched]
 
     def _pack_choice(cga: Optional[int], split_value: Optional[int] = None):
-        # A packed set rides the largest fitting tile that admits the ratio. The
+        # A packed set rides the largest fitting tile that admits the ratio, on
+        # the rule's KV tile where it can. The
         # decision uses this leg's actual CGA span; D192 CGA1 and CGA2 cover a
         # different number of Q rows.  The leg's split is part of the question on
         # a GATED d256 graph: it packs on the decode tile's split only (the gate
@@ -2011,7 +2024,7 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
         pack_tile = next(
             (
                 (m, n)
-                for m, n in sorted(tiles, key=lambda mn: (-(mn[0] or 0), mn[1] != 128))
+                for m, n in sorted(tiles, key=lambda mn: (-(mn[0] or 0), mn[1] != tiles[0][1]))
                 if True in _pack_gqa_points(caps, facts, m or 128, cga, split_value)
             ),
             None,
