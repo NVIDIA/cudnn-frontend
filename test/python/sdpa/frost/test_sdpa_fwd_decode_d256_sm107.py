@@ -2366,6 +2366,7 @@ def test_decode_adapter_64_column_tile_cuda_graph_replay_no_host_sync(monkeypatc
         sample_v=v_c,
         sample_o=o_gpu,
         sample_lse=lse,
+        is_causal=True,
         causal_bottom_right=True,
         seq_kv_lens_present=True,
         seq_q_lens_present=True,
