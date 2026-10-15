@@ -777,7 +777,6 @@ _TRIM_DEAD_ROWS = (1, 384, 512)  # (batch, lo, hi): the quiet sub-tile's STORED 
 
 
 @requires_sm100_line
-@pytest.mark.xfail(strict=True, reason="N1: the quiet body's residue reaches the stored trimmed rows (NaN x 0) until the select-after-the-scale fix lands")
 def test_quiet_body_under_per_batch_q_lengths_stores_zero_on_trimmed_rows(monkeypatch):
     """RED on the tree whose trim folds its zero into the scale, GREEN with the select after it.  Asserted most specific first -- the quiet
     sub-tile's stored rows finite and exactly +0, every trimmed row 0 / -inf, the whole tensor against the fp64 oracle, two launches bitwise --
