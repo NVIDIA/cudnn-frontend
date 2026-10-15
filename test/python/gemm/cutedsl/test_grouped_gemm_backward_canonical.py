@@ -18,7 +18,7 @@ def require_sm100():
         pytest.skip("SM100 is required")
 
 
-def run_dglu(cfg, inputs, canonical, b_major="k", flat_sf=False, deterministic=False, sfa_override=None):
+def run_dglu(cfg, inputs, canonical, b_major="k", flat_sf=False, deterministic=False, sfa_override=None, discrete_col_sfd=True):
     from cudnn import grouped_gemm_dglu_wrapper_sm100
 
     m = inputs["tensor_m"]
@@ -52,7 +52,7 @@ def run_dglu(cfg, inputs, canonical, b_major="k", flat_sf=False, deterministic=F
         norm_const_tensor=inputs.get("norm_const_tensor"),
         d_dtype=cfg["d_dtype"],
         sf_vec_size=cfg["sf_vec_size"],
-        discrete_col_sfd=True,
+        discrete_col_sfd=discrete_col_sfd,
         use_dynamic_sched=True,
         deterministic=deterministic,
     )
@@ -95,6 +95,24 @@ def test_dglu_canonical_deterministic_dprob(request):
     legacy = run_dglu(cfg, inputs, canonical=False, b_major="n", deterministic=True)
     canonical = run_dglu(cfg, inputs, canonical=True, b_major="n", flat_sf=True, deterministic=True)
     assert_dglu_outputs_equal(canonical, legacy, inputs["tensor_m"], cfg["n"] * 2, exact_dprob=True)
+
+
+NVFP4 = dict(ab_dtype=torch.float4_e2m1fn_x2, d_dtype=torch.bfloat16, sf_vec_size=16, sf_dtype=torch.float8_e4m3fn)
+NVFP4_WGRAD = dict(ab_dtype=torch.float4_e2m1fn_x2, sf_vec_size=16, sf_dtype=torch.float8_e4m3fn)
+
+
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize("flat_sf", [False, True], ids=["physical_sf", "flat_sf"])
+def test_dglu_canonical_nvfp4_matches_legacy(request, flat_sf):
+    cfg, inputs = dswiglu_case(request, **NVFP4)
+    legacy = run_dglu(cfg, inputs, canonical=False, discrete_col_sfd=False)
+    for _ in range(2):
+        canonical = run_dglu(cfg, inputs, canonical=True, flat_sf=flat_sf, discrete_col_sfd=False)
+        assert canonical["d_row_tensor"].shape == (inputs["tensor_m"], cfg["n"] * 2)
+        assert_same("d_row", canonical["d_row_tensor"], legacy["d_row_tensor"])
+        assert_same("amax", canonical["amax_tensor"], legacy["amax_tensor"])
+        # dprob accumulates with atomic float adds; ordering differs between launches.
+        torch.testing.assert_close(canonical["dprob_tensor"].reshape(-1), legacy["dprob_tensor"].reshape(-1), rtol=1e-4, atol=1e-4)
 
 
 def test_dglu_canonical_rejects_short_scale_buffer(request):
@@ -145,36 +163,39 @@ def wgrad_call(inputs, sfa, sfb):
         sfa_tensor=sfa,
         sfb_tensor=sfb,
         offsets_tensor=inputs["offsets_tensor"],
+        global_scale_a=inputs.get("global_scale_a"),
+        global_scale_b=inputs.get("global_scale_b"),
         output_mode="dense",
         acc_dtype=torch.float32,
         wgrad_dtype=torch.bfloat16,
         mma_tiler_mn=(128, 128),
         cluster_shape_mn=(1, 1),
-        sf_vec_size=32,
+        sf_vec_size=inputs["sf_vec_size"],
     )
 
 
-def wgrad_inputs(group_k_list):
+def wgrad_inputs(group_k_list, ab_dtype=torch.float8_e4m3fn, sf_vec_size=32, sf_dtype=torch.float8_e8m0fnu):
     from gemm.cutedsl.test_grouped_gemm_wgrad_utils import allocate_grouped_gemm_wgrad_tensors, grouped_gemm_wgrad_init
 
-    cfg = grouped_gemm_wgrad_init(torch.float8_e4m3fn, torch.bfloat16, torch.float32, (128, 128), (1, 1), 32, torch.float8_e8m0fnu)
+    cfg = grouped_gemm_wgrad_init(ab_dtype, torch.bfloat16, torch.float32, (128, 128), (1, 1), sf_vec_size, sf_dtype)
     cfg["group_k_list"] = group_k_list
-    return allocate_grouped_gemm_wgrad_tensors(cfg)
+    return {**allocate_grouped_gemm_wgrad_tensors(cfg), "sf_vec_size": sf_vec_size}
 
 
 @torch_fork_set_rng(seed=0)
-def test_wgrad_flat_scale_factors(monkeypatch):
+@pytest.mark.parametrize("recipe", [{}, NVFP4_WGRAD], ids=["mxfp8", "nvfp4"])
+def test_wgrad_flat_scale_factors(monkeypatch, recipe):
     from cudnn.gemm.cutedsl.grouped.wgrad import api
 
     monkeypatch.setattr(api, "_cache_of_GroupedGemmWgradSm100Objects", {})
     monkeypatch.setattr(api, "_wgrad_wrapper_memo", {})
-    inputs = wgrad_inputs([256, 384])
+    inputs = wgrad_inputs([256, 384], **recipe)
     legacy = wgrad_call(inputs, inputs["sfa_tensor"], inputs["sfb_tensor"])
     flat = wgrad_call(inputs, inputs["sfa_tensor"].reshape(-1), inputs["sfb_tensor"].reshape(-1))
     assert_same("wgrad", flat["wgrad_tensor"], legacy["wgrad_tensor"])
 
     entries = len(api._cache_of_GroupedGemmWgradSm100Objects)
-    other = wgrad_inputs([512, 384])
+    other = wgrad_inputs([512, 384], **recipe)
     legacy = wgrad_call(other, other["sfa_tensor"], other["sfb_tensor"])
     flat = wgrad_call(other, other["sfa_tensor"].reshape(-1), other["sfb_tensor"].reshape(-1))
     assert_same("wgrad", flat["wgrad_tensor"], legacy["wgrad_tensor"])
