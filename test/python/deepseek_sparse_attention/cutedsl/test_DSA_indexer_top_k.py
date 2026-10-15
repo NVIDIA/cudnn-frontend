@@ -288,6 +288,79 @@ def test_DSA_indexer_top_k_sm120_deterministic_smem_limit(monkeypatch, dtype, ma
 
 
 @pytest.mark.L0
+@torch_fork_set_rng(seed=48)
+@pytest.mark.parametrize("dtype,num_cols", [(torch.float32, 16384), (torch.float16, 32768), (torch.bfloat16, 32768)])
+@pytest.mark.parametrize("top_k", [129, 2048])
+def test_DSA_indexer_top_k_sm120_native_boundary(dtype, num_cols, top_k):
+    """Admission must reach native compilation, execution, and changed-input replay."""
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("Native SM120 boundary qualification")
+    DSA = _import_dsa()
+    n_rows = 6
+    columns = torch.arange(num_cols, device="cuda")
+    input_values = torch.randn(n_rows, num_cols, dtype=dtype, device="cuda")
+    input_values[-1].copy_(((columns % 31) - 15).to(dtype))
+    seq_lens = torch.tensor([0, 1, top_k - 1, top_k, num_cols, num_cols], dtype=torch.int32, device="cuda")
+    op = DSA.IndexerTopK(input_values, seq_lens, top_k, deterministic=True)
+    assert op.check_support()
+    op.compile()
+    indices, values, workspace = _allocate_outputs(op, input_values)
+
+    def execute():
+        op.execute(input_values, seq_lens, out_indices=indices, out_values=values, workspace=workspace)
+
+    def check():
+        check_ref_indexer_top_k(input_values, seq_lens, top_k, 1, indices, values, True, tie_break=1)
+        for row, length in enumerate(seq_lens.tolist()):
+            valid = min(length, top_k)
+            assert torch.all(indices[row, 1:valid] >= indices[row, : max(0, valid - 1)])
+            assert torch.all(indices[row, valid:] == -1)
+            assert torch.all(torch.isneginf(values[row, valid:]))
+
+    execute()
+    check()
+    baseline_indices, baseline_values = indices.clone(), values.clone()
+    for _ in range(3):
+        workspace.fill_(0xA5)
+        indices.fill_(-99)
+        values.fill_(123)
+        execute()
+        assert torch.equal(indices.view(torch.uint8), baseline_indices.view(torch.uint8))
+        assert torch.equal(values.view(torch.uint8), baseline_values.view(torch.uint8))
+
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            execute()
+        input_values.copy_(torch.randn_like(input_values))
+        input_values[0].copy_(((columns * 13 % 37) - 18).to(dtype))
+        seq_lens.copy_(torch.tensor([num_cols, num_cols, top_k + 1, top_k, 1, 0], dtype=torch.int32, device="cuda"))
+        workspace.fill_(0x5A)
+        indices.fill_(-98)
+        values.fill_(456)
+        graph.replay()
+        torch.cuda.synchronize()
+        check()
+    finally:
+        graph.reset()
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=49)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_DSA_indexer_top_k_sm120_default_spill(dtype):
+    """Small row counts must still fit the SM120 shared-memory budget."""
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("Native SM120 spill qualification")
+    DSA = _import_dsa()
+    num_cols, top_k = 131072, 2048
+    input_values = torch.randn(3, num_cols, dtype=dtype, device="cuda")
+    seq_lens = torch.tensor([top_k - 1, top_k + 1, num_cols], dtype=torch.int32, device="cuda")
+    result = DSA.indexer_top_k_wrapper(input_values, seq_lens, top_k, return_val=True, tie_break=1)
+    check_ref_indexer_top_k(input_values, seq_lens, top_k, 1, result["indices"], result["values"], True, tie_break=1)
+
+
+@pytest.mark.L0
 def test_DSA_indexer_top_k_deterministic_compact_index_storage():
     """Determinism widens indices only for a colliding bitonic sentinel."""
     import cutlass
@@ -728,6 +801,11 @@ def test_DSA_indexer_top_k_deterministic_random_exact(dtype, n_rows, num_cols, t
     DSA = _import_dsa()
     input_values = torch.randn(n_rows, num_cols, dtype=dtype, device="cuda")
     seq_lens = torch.full((n_rows,), num_cols, dtype=torch.int32, device="cuda")
+
+    if torch.cuda.get_device_capability() == (12, 0) and num_cols > (16384 if dtype == torch.float32 else 32768):
+        with pytest.raises(RuntimeError, match="SM120 supports at most"):
+            DSA.IndexerTopK(input_values, seq_lens, top_k, return_val=return_val, deterministic=True).check_support()
+        return
 
     result = DSA.indexer_top_k_wrapper(
         input_values,

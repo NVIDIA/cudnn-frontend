@@ -674,6 +674,11 @@ def compile_topk_kernel(
     bucketed_num_cols = _bucket_num_cols(num_cols)
 
     large_occupancy = num_rows > 148
+    if torch.cuda.get_device_capability() == (12, 0):
+        # SM120 cannot hold the large shared-memory radix buffer even for
+        # a small row count. Reuse the existing spilling specialization.
+        sm120_smem_cols = 16384 if torch_dtype == torch.float32 else 32768
+        large_occupancy = large_occupancy or bucketed_num_cols > sm120_smem_cols
     if deterministic and deterministic_ordering == "auto" and torch.cuda.get_device_capability() == (10, 0):
         bitmap_limit = _sm100_deterministic_bitmap_max_cols(dtype, top_k, large_occupancy)
         deterministic_ordering = "bitmap" if bucketed_num_cols <= bitmap_limit else "bitonic"
@@ -751,7 +756,9 @@ def compile_topk_kernel(
             stream=fake_stream,
             enable_persistent_dynamic_scheduling=load_balance,
             min_blocks_per_mp=1,
-            options=compile_options(),
+            # Qualify standalone Top-K on SM120 without enabling unrelated
+            # DSA kernels through the shared architecture/support map.
+            options=compile_options(gpu_arch="sm_120a" if torch.cuda.get_device_capability() == (12, 0) else None),
         )
         _compile_cache[key] = compiled_kernel
     return _compile_cache[key]
