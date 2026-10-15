@@ -1181,3 +1181,17 @@ def test_validation_windows_refuse_an_out_of_vocabulary_id(tmp_path):
     flat[5] = geom.vocab - 1
     path.write_bytes(array.array("H", flat).tobytes())
     assert len(gbt.ValidationWindows(geom, str(path), n_windows=geom.batch).batches) == 1
+
+
+@_L0
+def test_validation_windows_refuse_fewer_windows_than_a_batch(tmp_path):
+    """A window count below one batch (``0``, or a negative multiple of the batch) is refused at construction: an empty window
+    set has no batch to score, and the first validation step would otherwise fail on the mean of nothing."""
+    geom = _SMOKE
+    flat = gbt.SyntheticTokens(geom, 13).batch().reshape(-1).tolist()
+    path = tmp_path / "val_tokens.bin"
+    path.write_bytes(array.array("H", flat).tobytes())
+    for n in (0, -geom.batch):
+        with pytest.raises(ValueError, match="at least one batch"):
+            gbt.ValidationWindows(geom, str(path), n_windows=n)
+    assert len(gbt.ValidationWindows(geom, str(path), n_windows=geom.batch).batches) == 1

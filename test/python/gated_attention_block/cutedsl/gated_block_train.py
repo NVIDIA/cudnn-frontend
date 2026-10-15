@@ -548,8 +548,10 @@ class ValidationWindows:
             raise ValueError(f"{path}: token id {vmax} is outside the model's vocabulary of {geom.vocab}")
         b, s = geom.batch, geom.seq_len
         available = (int(tokens.numel()) - 1) // s
-        if self.n_windows > available or self.n_windows % b:
-            raise ValueError(f"{path}: {self.n_windows} validation windows requested, {available} available, batch {b} must divide the count")
+        if self.n_windows < b or self.n_windows > available or self.n_windows % b:
+            raise ValueError(
+                f"{path}: {self.n_windows} validation windows requested, {available} available; the count is at least one batch of {b} and a multiple of it"
+            )
         self.batches = [torch.stack([tokens[w * s : w * s + s + 1].to(torch.int64) for w in range(i, i + b)]) for i in range(0, self.n_windows, b)]
 
     def as_dict(self) -> dict:
