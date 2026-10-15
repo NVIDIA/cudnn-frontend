@@ -776,7 +776,11 @@ def _stage3(
     # kv_n x (S_q / 256) x group clusters instead of kv_n x (S_q / 256), `group` times).  The per-head rendering
     # (`dq_b_head_group == 1`, the `DQ_SINGLE_LAUNCH = False` twin) runs once per group MEMBER over every `group`-th Q head, so
     # each launch's A / out heads line up with its B heads.  Both walk the same k tiles per output tile: bitwise-equal dQ.
-    kv_n = hc // group
+    if cutlass.const_expr(hc < group):
+        assert group % hc == 0 and dq_b_head_group == group, "head subgroups require grouped dQ and must evenly divide the GQA group"
+    # A subgroup still reads its one complete K head. Global per-Q-head dK/dV
+    # partials are folded only after every chunk has completed.
+    kv_n = max(1, hc // group)
     n_launch = _dq_launches(group, dq_b_head_group)
     heads = hc // n_launch  # Q heads per dQ launch: kv_n * dq_b_head_group
     k_c = _window(_window(k, 0, bb, bc), 2, hb // group, kv_n)  # [bc, S_kv, kv_n, D]

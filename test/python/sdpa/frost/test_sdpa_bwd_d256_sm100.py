@@ -655,6 +655,154 @@ def test_prepared_backward_artifact_reloads_in_fresh_process(dtype, tmp_path):
 # =========================================================================== adapter host pins
 
 
+def test_head_subgroups_preserve_whole_group_choices_and_cover_each_kv_group():
+    from cudnn.sdpa.bwd.api_dsl_sm107 import _sm107_chunks
+    from cudnn.sdpa.bwd.config_sm107 import validate_head_chunk
+
+    per_head = 256 * 512 * 2
+    for group in (1, 2, 3, 4, 8):
+        hq, hkv = 2 * group, 2
+        for batch in (1, 2, 5):
+            for budget in (0, per_head // 2, per_head, 2 * per_head, group * per_head - 1, group * per_head, 2 * batch * group * per_head):
+                old = _sm107_chunks(batch, hq, group, 256, 512, 2, budget=budget)
+                new = _sm107_chunks(batch, hq, group, 256, 512, 2, budget=budget, allow_subgroups=True)
+                if group * per_head <= budget:
+                    assert new == old, (group, batch, budget, old, new)
+                else:
+                    assert new[0] == 1
+                    fitting = [n for n in range(1, group + 1) if group % n == 0 and n * per_head <= budget]
+                    assert new[1] == max(fitting, default=1)
+                bc, hc = new
+                validate_head_chunk(hq, hkv, hc, allow_subgroups=True)
+                assert batch % bc == hq % hc == 0
+                assert _sm107_chunks(batch, hq, group, 256, 512, 2, budget=budget, batch_chunking=False, allow_subgroups=True) == _sm107_chunks(
+                    batch, hq, group, 256, 512, 2, budget=budget, batch_chunking=False
+                ), "packed/non-batch-chunking rows retain whole groups"
+                visited = []
+                for hb in range(0, hq, hc):
+                    for local in range(hc):
+                        qh = hb + local
+                        assert hb // group + local // group == qh // group
+                        visited.append(qh)
+                assert visited == list(range(hq)), "all global per-Q-head partials must be written before the single fold"
+
+
+@pytest.mark.parametrize("h_q,h_kv,chunk", [(0, 1, 1), (8, 0, 1), (7, 2, 1), (8, 2, 0), (8, 2, 3), (12, 2, 4)])
+def test_head_subgroups_reject_invalid_or_crossing_chunks(h_q, h_kv, chunk):
+    from cudnn.sdpa.bwd.config_sm107 import validate_head_chunk
+
+    with pytest.raises(ValueError):
+        validate_head_chunk(h_q, h_kv, chunk, allow_subgroups=True)
+
+
+def test_head_subgroups_remain_an_explicit_validation_contract():
+    from cudnn.sdpa.bwd.config_sm107 import validate_head_chunk
+
+    for chunk in (1, 2):
+        with pytest.raises(ValueError, match="multiple of the GQA group"):
+            validate_head_chunk(8, 2, chunk)
+        validate_head_chunk(8, 2, chunk, allow_subgroups=True)
+
+
+def test_head_subgroup_rule_is_scoped_and_workspace_is_honest(monkeypatch):
+    from cudnn.sdpa.bwd import api_dsl_sm107 as sm107, prepared_sm107 as prepared
+    from cudnn.sdpa.bwd.api_dsl_sm100_d256 import SdpaBwdDslSm100D256
+
+    def plan(sequence=131072, **kwargs):
+        return _adapter(SdpaBwdDslSm100D256, b=4, hq=8, hkv=2, sq=sequence, skv=sequence, **kwargs)
+
+    for cc in (100, 103, 106):
+        monkeypatch.setattr(prepared, "_sm", lambda _api, value=cc: value)
+        candidate = plan()
+        assert (candidate._b_chunk, candidate._qh_chunk) == (1, 1)
+        with monkeypatch.context() as old:
+            old.setattr(SdpaBwdDslSm100D256, "_allow_head_subgroups", lambda _api: False)
+            baseline = plan()
+        assert (baseline._b_chunk, baseline._qh_chunk) == (1, 4)
+        assert baseline.scratch_workspace_bytes() - candidate.scratch_workspace_bytes() == 96 * 2**30
+        for sequence in (2048, 4096, 8192, 16384, 32768):
+            api = plan(sequence)
+            with monkeypatch.context() as old:
+                old.setattr(SdpaBwdDslSm100D256, "_allow_head_subgroups", lambda _api: False)
+                original = plan(sequence)
+            assert (api._b_chunk, api._qh_chunk, api.scratch_workspace_bytes()) == (original._b_chunk, original._qh_chunk, original.scratch_workspace_bytes())
+        assert plan(dt=torch.float16)._qh_chunk == 4
+        with monkeypatch.context() as per_member:
+            per_member.setattr(sm107, "DQ_SINGLE_LAUNCH", False)
+            assert plan()._qh_chunk == 4
+        assert not plan(thd=True)._allow_head_subgroups()
+    for cc in (90, 107, 110, 120):
+        monkeypatch.setattr(prepared, "_sm", lambda _api, value=cc: value)
+        assert plan()._qh_chunk == 4
+    monkeypatch.setattr(prepared, "_sm", lambda _api: 100)
+    assert not _adapter(sm107.SdpaBwdDslSm107, hq=8, hkv=2)._allow_head_subgroups()
+
+
+@requires_pre_rubin_blackwell
+@pytest.mark.parametrize("group,chunk", [(2, 1), (3, 1), (4, 1), (4, 2), (8, 1), (8, 2), (8, 4)], ids=["g2c1", "g3c1", "g4c1", "g4c2", "g8c1", "g8c2", "g8c4"])
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+def test_head_subgroups_match_full_group_gradients(monkeypatch, group, chunk, causal):
+    """The same CPU-seeded inputs, all Q-head partials, poisoned workspace and a second launch."""
+    from cudnn.sdpa.bwd import api_dsl_sm107 as sm107
+    from cudnn.sdpa.bwd.api_dsl_sm100_d256 import SdpaBwdDslSm100D256
+
+    sq, skv = 256, 512
+    kwargs = dict(b=2, hq=2 * group, hkv=2, sq=sq, skv=skv, poison=float("nan"), ws_poison=0xBD, runs=2)
+    if causal:
+        kwargs.update(keep=_causal_keep(sq, skv), use_causal_mask=True)
+    original = _run(**kwargs).check()
+    seen = []
+    compile_plan = SdpaBwdDslSm100D256.compile
+
+    def compile_and_record(api):
+        result = compile_plan(api)
+        seen.append((api._b_chunk, api._qh_chunk, api._dq_b_head_group))
+        return result
+
+    monkeypatch.setattr(SdpaBwdDslSm100D256, "compile", compile_and_record)
+    monkeypatch.setattr(sm107, "_SM107_WS_BUDGET_BYTES", chunk * sq * skv * 2)
+    candidate = _run(**kwargs).check()
+    assert seen and set(seen) == {(1, chunk, group)}, seen
+    for reference, actual in zip(original.outs, candidate.outs):
+        for a, b in zip(reference, actual):
+            assert torch.equal(a.view(torch.int16), b.view(torch.int16))
+
+
+@requires_pre_rubin_blackwell
+@pytest.mark.parametrize("case", list(_MASK_POISON_CASES), ids=list(_MASK_POISON_CASES))
+def test_head_subgroups_preserve_mask_and_tail_gradients(monkeypatch, case):
+    from cudnn.sdpa.bwd import api_dsl_sm107 as sm107
+
+    shape, kwargs, keep = _mask_case_kw(_MASK_POISON_CASES[case])
+    shape.update(hq=8, hkv=2)
+    original = _run(**shape, **kwargs, keep=keep, poison=float("nan"), ws_poison=0xBD).check()
+    sq_pad = (shape["sq"] + 127) // 128 * 128
+    skv_pad = (shape["skv"] + 255) // 256 * 256
+    monkeypatch.setattr(sm107, "_SM107_WS_BUDGET_BYTES", sq_pad * skv_pad * 2)
+    candidate = _run(**shape, **kwargs, keep=keep, poison=float("nan"), ws_poison=0xBD).check()
+    for reference, actual in zip(original.outs[0], candidate.outs[0]):
+        assert torch.equal(reference.view(torch.int16), actual.view(torch.int16))
+
+
+@requires_pre_rubin_blackwell
+def test_head_subgroups_rebind_stream_replay_and_launch_count(monkeypatch):
+    from collections import Counter
+    from cudnn.sdpa.bwd import api_dsl_sm107 as sm107
+
+    # Force one Q head per chunk at small storage sizes through the real chooser.
+    monkeypatch.setattr(sm107, "_SM107_WS_BUDGET_BYTES", 512 * 512 * 2)
+    test_prepared_rebind_stream_and_replay(torch.bfloat16, True)
+    case = _prepared_case(b=2, hq=8, hkv=2, sq=512, skv=512)
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as profile:
+        case.graph.execute(case.pack, case.workspace)
+        torch.cuda.synchronize()
+    kernels = Counter(e.name for e in profile.events() if e.device_type == torch.autograd.DeviceType.CUDA)
+    for pattern, expected in (("cudnn_kernel__kernel", 16), ("bprop_matmul_bh_sm100_kernel", 32), ("dkv_reduce_kernel", 1)):
+        count = sum(n for name, n in kernels.items() if pattern in name)
+        assert count == expected, f"{pattern}: expected {expected}, observed {count}; {kernels}"
+    _check_prepared(case)
+
+
 @pytest.mark.parametrize(
     "kw",
     [
