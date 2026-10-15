@@ -6013,8 +6013,8 @@ class GatedAttentionBlockFwd(APIBase):
     (value = code x scale), a bf16 Q attends over the dequantized rows.  A declaration ATTRIBUTE beside ``paged_kv_page_size``
     (it changes the write-through's numerics), never a knob.  The WRITE-THROUGH then quantizes the post-RoPE K / V
     (:class:`_QuantizedCacheWrite`: two per-tensor casts ``sat_e4m3(row x (1 / scale))`` + the bit copy through the pools' bf16
-    views; the raw indexer key keeps its bf16 pool) on every form that writes through over the block's own K / V (dense or
-    packed, QsaSpec or dense).  OVER THE POOLS it is served on the block-sparse DECODE mode at ``S_q <= 4`` (the shared list):
+    views; the raw indexer key keeps its bf16 pool) on every DENSE form that writes through over the block's own K / V (QsaSpec or
+    dense; the packed prefill's quantizing write-through is a typed decline until its accept cell lands).  OVER THE POOLS it is served on the block-sparse DECODE mode at ``S_q <= 4`` (the shared list):
     stage (4) is :class:`_UpcastSparseSdpa` -- ``kernels/qsa_kv_upcast.py`` gathers the listed rows and the open tail, casts them
     to bf16 into the workspace scratch (``[B x S_q x H_kv, 2, 2176, 256]`` + ``kv_len_t``), and the Rubin d256 DECODE tile runs
     over it as a plain padded dense SDPA (no causal mask, ``seq_kv_lens = kv_len_t``, the group packed, unsplit); the mode
@@ -6411,7 +6411,7 @@ class GatedAttentionBlockFwd(APIBase):
         self.paged_kv_page_size = self._check_cache_write_declaration(paged_kv_page_size, quant)
         # THE e4m3 KV CACHE (kv_cache_dtype): the attribute's own rows (type, e5m2 by name, the write-through it belongs to, bf16
         # activations), typed and naming the feature -- device-free; the pools' samples below are checked in THIS dtype.
-        self.kv_cache_dtype = self._check_kv_cache_dtype_declaration(kv_cache_dtype, quant)
+        self.kv_cache_dtype = self._check_kv_cache_dtype_declaration(kv_cache_dtype, quant, kv_source)
         self.kv_cache_e4m3 = self.kv_cache_dtype == KV_CACHE_E4M3
         # THE EXTEND FORM (kv_source) and the BOUNDED token form (token_capacity): the typed declines of the table every caller's
         # dispatch predicate can read back (serving_envelope), then the three samples' contract -- device-free, before any descriptor.
@@ -6941,12 +6941,14 @@ class GatedAttentionBlockFwd(APIBase):
 
     # -- the e4m3 KV cache (kv_cache_dtype) ---------------------------------
 
-    def _check_kv_cache_dtype_declaration(self, kv_cache_dtype, quant) -> torch.dtype:
+    def _check_kv_cache_dtype_declaration(self, kv_cache_dtype, quant, kv_source=KV_SOURCE_SELF) -> torch.dtype:
         """``kv_cache_dtype`` at declaration, device-free: ``None`` / the activation dtype = the pools as before; ``torch.float8_e4m3fn``
         = the e4m3 KV cache, which needs the write-through attribute (``paged_kv_page_size > 0``: the attribute changes what the
         write-through writes) and bf16 activations (the cast writes bf16 rows, the decode tile reads a bf16 Q); ``quant`` and
         ``save_for_backward`` with the write-through are the write-through's own declines (heard first).  e5m2 is declined BY NAME; any
-        other dtype is a ``ValueError``.  Returns the pools' dtype.  Runs AFTER ``_check_cache_write_declaration``."""
+        other dtype is a ``ValueError``; the packed (``thd=True``) PREFILL (``kv_source="self"``) with the attribute is a typed decline (its
+        quantizing write-through has no accept cell yet) -- a packed declaration OVER THE POOLS is the serving table's EXTEND row, which
+        speaks for itself later.  Returns the pools' dtype.  Runs AFTER ``_check_cache_write_declaration`` and before the serving table."""
         act = self.act_dtype
         if kv_cache_dtype is None:
             return act
@@ -6983,6 +6985,12 @@ class GatedAttentionBlockFwd(APIBase):
             raise NotImplementedError(
                 f"kv_cache_dtype=torch.float8_e4m3fn with {act} activations: the gathered cast writes bf16 rows and the d256 decode tile over them reads a "
                 "bf16 Q (one dtype per plan) -- declare bf16 activations (f16 activations over an e4m3 cache are a follow-up)"
+            )
+        if self.thd and kv_source != KV_SOURCE_PAGED:
+            raise NotImplementedError(
+                "kv_cache_dtype=torch.float8_e4m3fn with thd=True: the packed prefill's quantizing write-through (the same token-addressed launches over "
+                "the packed slab) has no accept cell yet, so it is declared as a typed decline rather than claimed -- run the dense prefill over e4m3 "
+                "pools, or the packed prefill over bf16 / f16 pools (kv_cache_dtype=None)"
             )
         return KV_CACHE_E4M3
 
@@ -8458,15 +8466,15 @@ class GatedAttentionBlockFwd(APIBase):
                     torch.reciprocal(k_scale.reshape(1), out=inv[0:1])
                     torch.reciprocal(v_scale.reshape(1), out=inv[1:2])
                 self._cache_write.execute(
-                    k_c,
-                    v_c,
-                    _view(workspace, ws.kc8, (t, g.h_kv, g.d_head), KV_CACHE_E4M3),
-                    _view(workspace, ws.vc8, (t, g.h_kv, g.d_head), KV_CACHE_E4M3),
+                    k_c[:rows],
+                    v_c[:rows],
+                    _view(workspace, ws.kc8, (t, g.h_kv, g.d_head), KV_CACHE_E4M3)[:rows],
+                    _view(workspace, ws.vc8, (t, g.h_kv, g.d_head), KV_CACHE_E4M3)[:rows],
                     inv[0:1],
                     inv[1:2],
                     k_cache,
                     v_cache,
-                    slot_mapping,
+                    slot_live,
                     **cw_kw,
                 )
             else:

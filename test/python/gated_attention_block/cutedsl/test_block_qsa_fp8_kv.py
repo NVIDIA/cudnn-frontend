@@ -905,3 +905,39 @@ def test_the_write_through_fold_never_serves_the_e4m3_cache():
     with pytest.raises(NotImplementedError, match="fuse_cache_write=True with kv_cache_dtype=torch.float8_e4m3fn"):
         with _no_host_sync():
             _declare(GEOM_SMALL, 2, 8, fuse_cache_write=True, **kw)
+
+
+def test_the_packed_prefill_over_e4m3_pools_is_declined_by_name():
+    """The packed (``thd=True``) prefill's quantizing write-through is a TYPED DECLINE until its accept cell lands (the doc page and the
+    tracker say so; a review found the constructor accepting it): a packed ``kv_source="self"`` declaration with the attribute raises
+    ``NotImplementedError`` naming ``thd`` and the attribute, before any stage is built; the same packing over bf16 pools is served
+    (the bf16 write-through addresses tokens), so the pin reads the e4m3 row and not a disabled packing."""
+    geom = GatedAttentionBlockGeometry(**GEOM_SMALL)
+    T = 32
+    mk = lambda *shape: torch.empty(*shape, dtype=BF16, device=_DEV)  # noqa: E731
+
+    def declare(**kw):
+        return GatedAttentionBlockFwd(
+            mk(T, geom.d_model),
+            mk(geom.n_qkvg, geom.d_model),
+            torch.ones(D, dtype=BF16, device=_DEV),
+            torch.ones(D, dtype=BF16, device=_DEV),
+            mk(T, ROPE),
+            mk(T, ROPE),
+            mk(geom.d_model, geom.h_q * D),
+            mk(T, geom.d_model),
+            geom,
+            thd=True,
+            num_sequences=2,
+            max_seq_len=T,
+            paged_kv_page_size=16,
+            **kw,
+        )
+
+    with pytest.raises(NotImplementedError, match="kv_cache_dtype=torch.float8_e4m3fn with thd=True"):
+        with _no_host_sync():
+            declare(kv_cache_dtype=E4M3)
+    with _no_host_sync():
+        b16 = declare()
+    assert b16.thd and not b16.kv_cache_e4m3 and b16.paged_kv_page_size == 16 and b16._cache_write is not None
+    assert not isinstance(b16._cache_write, _QuantizedCacheWrite)
