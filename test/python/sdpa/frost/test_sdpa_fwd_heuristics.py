@@ -1652,6 +1652,50 @@ def test_rubin_decode_tile_packs_the_whole_group_and_takes_the_decode_split_mode
 
 
 @pytest.mark.L0
+def test_rubin_decode_width_is_64_exactly_when_two_32_column_units_would_be_needed():
+    """The Rubin route's width pick, stated as the MEASURED rule rather than as a table lookup: a packed step rides
+    the 64-column tile exactly when it would otherwise need two or more token units of the 32-column tile, one
+    32-column unit when its rows fit one, the 16-column tile below that -- always ONE token unit inside the table.
+    Measured on the Rubin performance class (212 SMs) at the 24/2 and 32/2 geometries: at S_q 2 (one 32-column
+    unit) the 32-column tile is the faster kernel, at S_q 3 (two units) the 64-column one, because one 64-column
+    unit streams a KV tile in about three quarters of the time of two 32-column units.  The table-driven rule
+    (config_sm107.decode_d256_single_unit_q_tile: the narrowest width holding S_q x G rows) is the same statement,
+    since ``S_q x G > 32`` is exactly ``ceil(S_q / (32 // G)) >= 2``; the cap at 32 (``max_q_tile=32``, the route
+    before the 64-column width landed) is the negative control: two 32-column units at S_q 3 / 4."""
+    from cudnn.sdpa.fwd.config_sm100 import decode_d256_q_units
+    from cudnn.sdpa.fwd.config_sm107 import D256_DECODE_SINGLE_UNIT_Q_TILES, decode_d256_q_tile, decode_d256_single_unit_q_tile
+
+    assert D256_DECODE_SINGLE_UNIT_Q_TILES == (16, 32, 64)
+    for g in (2, 3, 4, 5, 6, 8, 12, 16, 24, 32):
+        for s_q in range(1, 65):
+            if s_q * g > 64:
+                break  # past the one-unit table: the token-unit arm, pinned by the Rubin decode-tile test above
+            got = decode_d256_q_tile(s_q, g, paged=True, masked=True)
+            assert got == decode_d256_single_unit_q_tile(s_q, g, paged=True, masked=True), (g, s_q, got)
+            assert decode_d256_q_units(s_q, g, got) == 1, (g, s_q, got)
+            if s_q * g <= 16:
+                assert got == 16, (g, s_q, got)
+            else:
+                units_of_32 = decode_d256_q_units(s_q, g, 32)
+                assert got == (64 if units_of_32 >= 2 else 32), (g, s_q, got, units_of_32)
+    # the measured cells by name: 24/2 (G 12) and 32/2 (G 16), S_q 1 .. 4
+    assert [decode_d256_q_tile(s, 12, paged=True, masked=True) for s in (1, 2, 3, 4)] == [16, 32, 64, 64]
+    assert [decode_d256_q_tile(s, 16, paged=True, masked=True) for s in (1, 2, 3, 4)] == [16, 32, 64, 64]
+    assert decode_d256_q_units(2, 12, 32) == decode_d256_q_units(2, 16, 32) == 1
+    assert decode_d256_q_units(3, 12, 32) == decode_d256_q_units(3, 16, 32) == decode_d256_q_units(4, 12, 32) == decode_d256_q_units(4, 16, 32) == 2
+    # the negative control: capped at 32 the same steps run two 32-column units (the former route, value for value)
+    for g in (12, 16):
+        for s_q in (3, 4):
+            assert decode_d256_q_tile(s_q, g, paged=True, masked=True, max_q_tile=32) == 32, (g, s_q)
+    assert decode_d256_q_tile(2, 12, paged=True, masked=True, max_q_tile=32) == 32 and decode_d256_q_units(2, 12, 32) == 1
+    # the facts-level twin the heuristics read agrees on the Rubin row and is 0 past 16 rows on the Blackwell row
+    caps107 = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16)
+    caps100 = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _F16)
+    assert [engines.decode_d256_q_tile_for_row(caps107, s, 12, paged=True, masked=True) for s in (1, 2, 3, 4)] == [16, 32, 64, 64]
+    assert [engines.decode_d256_q_tile_for_row(caps100, s, 12, paged=True, masked=True) for s in (1, 2, 3, 4)] == [16, 0, 0, 0]
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("s_q", [1, 4, 128, 512])
 def test_rubin_paged_thd_d256_keeps_its_packed_candidate(sm107_metadata_target, s_q):
     """The paged half THD d256 graph on cc 10.7 packs on the paged prefill pipeline (CGA2, unsplit;
