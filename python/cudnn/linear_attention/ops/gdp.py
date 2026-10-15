@@ -1124,11 +1124,11 @@ def gdp_bwd_fake(
     d_a_log = torch.empty_like(a_log) if a_log is not None else q.new_empty(0, dtype=torch.float32)
     d_dt_bias = torch.empty_like(dt_bias) if dt_bias is not None else q.new_empty(0, dtype=torch.float32)
     return (
-        torch.empty_like(q),
-        torch.empty_like(k),
-        torch.empty_like(v),
-        torch.empty_like(g),
-        torch.empty_like(beta),
+        q.new_empty(q.shape),
+        q.new_empty(k.shape),
+        q.new_empty(v.shape),
+        g.new_empty(g.shape),
+        beta.new_empty(beta.shape),
         dstate0,
         d_a_log,
         d_dt_bias,

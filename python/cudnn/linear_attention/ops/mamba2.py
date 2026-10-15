@@ -852,7 +852,7 @@ def mamba2_bwd_op(
     dD = torch.empty(0, dtype=torch.float32, device=device)
     if D is not None:
         variant_pack[t["d"]] = D
-        dD = torch.empty_like(D)
+        dD = torch.empty(D.shape, dtype=D.dtype, device=device)
         variant_pack[t["dD"]] = dD
     dz = torch.empty(0, dtype=x.dtype, device=device)
     if z is not None:

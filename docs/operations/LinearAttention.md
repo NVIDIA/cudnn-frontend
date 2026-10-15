@@ -58,7 +58,7 @@ GDP runs on two timelines: `q` and `g` have one row per real token, while `k`, `
 They come either expanded (`[T * n, ...]`, update-major: the `n` updates of token `t` are rows `t * n` to `t * n + n - 1`)
 or token-major (`k` `[T, n, HK, K]`, `v` `[T, n, HV, V]`, `beta` `[T, n, HO]`, with the caller's token stride), so the
 per-token column slices of a joint `[V | K | Q]` projection (`[T, n * H * D]` viewed as `[T, n, H, D]`) are consumed in
-place; `dk`, `dv` and `dbeta` come back in the input's shape. `num_householder == 1`is exactly GDN.
+place; `dk`, `dv` and `dbeta` come back in the input's shape. `num_householder == 1` is exactly GDN.
 
 Mamba-2 uses the SSD vocabulary: `x` plays `v`, `B` plays `k`, `C` plays `q`, `dt` is the gate. The output is
 `y = C^T S + D x`, gated by `z sigmoid(z)` when `z` is given.
