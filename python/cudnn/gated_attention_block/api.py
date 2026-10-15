@@ -562,17 +562,23 @@ DECODE_CLAIMED_MAX_N_Q = 32
 3 .. 5, 32/2 at ``S_q`` 3 / 4) is compiled, tested and bitwise the two-unit form, but unmeasured on the perf class: a cell on it is
 routed and declared, never ``claimed``, until its perf row lands (then this bound moves to 64)."""
 
-DECODE_MAX_S_Q = 8
-"""The DECLARED decode envelope: ``1 <= S_q <= 8`` (one new token plus up to seven speculative ones: an MTP-7 verify step).  Within it
-every step has a route (:func:`decode_route`: the decode tile in one token unit where its single-unit width table holds the packed
-rows, the paged d256 PREFILL tile with the group packed past it wherever that tile packs the group, the decode tile's token-unit and
-unpacked arms where it does not); beyond it, or beyond ``DECODE_MAX_ROWS`` packed rows, the form is a typed decline (the paged d256
-prefill body serves PACKED queries -- the EXTEND form -- never a dense step over the pools)."""
+DECODE_MAX_ROWS = 32
+"""The widest step the DECODE form serves, in tokens per sequence: the 32-column decode tile UNPACKED (one head per CTA, ``S_q`` live
+rows) -- the arm every group falls back to past its packed routes (:func:`decode_route`), as before the table-driven route landed (the
+same name, the same meaning, the same value: a caller's ``served iff S_q <= DECODE_MAX_ROWS`` holds).  A dense step with more new
+tokens per sequence has no kernel over the pools on this part -- a typed decline (the ``decode_rows`` row), the EXTEND form's (packed)
+business."""
 
-DECODE_MAX_ROWS = 128
-"""The widest step the DECODE form serves, in PACKED rows ``S_q x (H_q / H_kv)``: the d256 prefill tile's Q rows (``CfgD256.TILE_M``,
-pinned by the MTP route tests), so the prefill route runs ONE Q tile per sequence and KV head -- the KV streamed once.  A wider dense
-step over the pools is the EXTEND form's (packed) business."""
+DECODE_MAX_S_Q = DECODE_MAX_ROWS
+"""The served decode envelope in tokens: ``1 <= S_q <= 32`` (== :data:`DECODE_MAX_ROWS`, the unpacked arm's widest step).  The CLAIMED
+bound is :data:`DECODE_CLAIMED_MAX_S_Q` (4, the measured cells); an MTP verify step of up to eight tokens rides the one- and two-stream
+routes (the decode tile in one unit, the paged prefill tile with the group packed, two token units -- the routes validated to ``S_q =
+8``); past a group's packed routes the step rides the decode tile UNPACKED (``group`` KV streams: declared, unmeasured) up to 32 tokens."""
+
+DECODE_PREFILL_TILE_ROWS = 128
+"""The packed rows ``S_q x (H_q / H_kv)`` one Q tile of the paged d256 PREFILL tile holds (``CfgD256.TILE_M``, pinned by the MTP route
+tests): the bound of the DECODE form's prefill route (one Q tile per sequence and KV head, the KV streamed once).  Past it a step rides
+the decode tile's token-unit arm or its unpacked arm (:func:`decode_route`) -- never a decline by itself."""
 
 DECODE_TILE = "decode_d256_f16"
 """``kernel_template`` of the Rubin d256 decode tile (``sdpa/fwd/kernels/sm107/decode_d256_f16.py``: the swap-AB tile)."""
@@ -592,6 +598,18 @@ packed group past the 16-column tile (each unit one more KV stream), then the un
 
 DECODE_ROUTE_POLICIES = (DECODE_ROUTE_SINGLE_UNIT, DECODE_ROUTE_TOKEN_UNITS)
 DEFAULT_DECODE_ROUTE_POLICY = DECODE_ROUTE_SINGLE_UNIT
+
+DECODE_PDL_STAGES = ("qk_norm_rope", "cache_write", "sigmoid_gate", "sdpa")
+"""The DECODE form's stages that take the ``use_pdl`` switch (by stage name): the norm + RoPE pass (the unfused chain), the separate
+cache write, the sigmoid gate when it is its own launch, and stage (4) on a DECODE-TILE route only (``DecodeRoute.pdl_capable``: the
+tile and its split combine carry the griddepcontrol pair; the prefill route's paged d256 prefill tile does not and launches plain --
+the link serializes, which PDL's semantics keep correct).  The FROST GEMM stages launch with the attribute by their own constant and
+are not switched.  Per declaration ``GatedAttentionBlockFwd.pdl_stages`` names the ones the chain holds and ``use_pdl_effective``
+whether every switched stage took it; ``DecodeEnvelope.pdl_stages`` carries this tuple."""
+
+EXTEND_PDL_STAGES = ("qk_norm_rope", "cache_write", "sigmoid_gate")
+"""The EXTEND form's stages that take the switch: stage (4), the paged d256 prefill tile, carries no sites and launches plain (the
+link serializes; the chain stays correct); ``ExtendEnvelope.pdl_stages`` carries this tuple."""
 
 
 def _resolve_decode_route_policy(policy: Optional[str]) -> str:
@@ -616,7 +634,7 @@ class DecodeRoute:
     s_q: int
     group: int  # h_q // h_kv: the heads a tile packs per token (1 = MHA, unpacked)
     tile: Optional[str]  # DECODE_TILE / PREFILL_TILE (the ``kernel_template`` the adapter compiles), or None: the step is not served over the pools
-    n_q: int  # the decode tile's N extent (the packed Q rows of ONE token unit: 16 or 32); 0 on the prefill tile and when not served
+    n_q: int  # the decode tile's N extent (the packed Q rows of ONE token unit: 16, 32 or 64); 0 on the prefill tile and when not served
     token_units: int  # the decode tile's CTAs per (KV-head group, batch, split): ceil(s_q / (n_q // group)); 0 on the prefill tile / not served
     pack_gqa: bool  # the whole group packed into the tile; False = MHA or the decode tile's unpacked arm
     claimed: bool  # inside the CLAIMED envelope (the PACKED decode tile at s_q <= DECODE_CLAIMED_MAX_S_Q); False = routed, declared, unmeasured
@@ -629,6 +647,10 @@ class DecodeRoute:
     # None = the whole single-unit table (16, 32, 64); 32 = the route before the 64-column width landed.  ``_Sdpa`` hands it to the adapter
     # (``SdpaFwdDslSm100(decode_q_tile_max=)``) so the compiled width is the declared one.
     q_tile_max: Optional[int] = None
+    # APPENDED (2026-10-15): whether stage (4) takes the programmatic-dependent-launch switch (``GatedAttentionBlockFwd(use_pdl=True)``)
+    # on this route -- the decode tile and its split combine carry the griddepcontrol pair (True); the paged d256 prefill tile does not
+    # (False: the block launches it plain and the link serializes, correct by PDL's semantics).  ``_Sdpa.pdl_capable`` is the same rule.
+    pdl_capable: bool = False
 
     @property
     def decode_tile(self) -> bool:
@@ -660,9 +682,9 @@ def decode_route(geometry: "GatedAttentionBlockGeometry", s_q: int, policy: Opti
     """The DECODE route of ``s_q`` tokens at ``geometry`` under ``policy`` (``None`` = :data:`DEFAULT_DECODE_ROUTE_POLICY`), read
     here so the block, the envelope and the tests name the kernel BEFORE anything compiles.
 
-    The DECLARED envelope first: ``1 <= s_q <= DECODE_MAX_S_Q`` and ``s_q x group <= DECODE_MAX_ROWS`` packed rows, else NOT served
-    (``tile`` None, ``reason`` set: a longer or wider dense step over the pools is the EXTEND form's packed business); a head dim other
-    than 256 has no paged read (the d256 flavor's).  Then ONE rule per policy over the decode tile's single-unit width table
+    The SERVED envelope first: ``1 <= s_q <= DECODE_MAX_S_Q`` (32 tokens per sequence: the unpacked arm's widest step), else NOT served
+    (``tile`` None, ``reason`` set: a longer dense step over the pools is the EXTEND form's packed business); a head dim other than 256
+    has no paged read (the d256 flavor's).  Then ONE rule per policy over the decode tile's single-unit width table
     (``config_sm107.D256_DECODE_SINGLE_UNIT_Q_TILES`` = (16, 32, 64), read for the DECODE form's facts -- a PAGED cache under the
     bottom-right CAUSAL mask, so the 64-column width's form predicate admits every packed group; ``max_q_tile`` (appended) caps the
     table: 32 = the route before the 64-column width landed, value for value):
@@ -670,16 +692,20 @@ def decode_route(geometry: "GatedAttentionBlockGeometry", s_q: int, policy: Opti
     * ``"single_unit"`` (the default): packed rows within the table ride the narrowest such width in ONE token unit
       (``config_sm107.decode_d256_single_unit_q_tile``: the KV streamed once -- 24/2 at ``S_q`` 3 .. 5 and 32/2 at ``S_q`` 3 / 4 on the
       64-column tile, 36 .. 64 rows); past the table the step rides the paged d256 PREFILL tile with the whole group packed -- one Q
-      tile per (sequence, KV head), the KV streamed once -- wherever that body packs the group (``pack_gqa_group_size(group,
-      DECODE_MAX_ROWS)``: a group dividing its 128 rows; the cc 10.7 paged THD leg takes whole-group PackGQA only); a group it cannot
-      pack (12 = 24 / 2, 6 = 24 / 4) keeps the adapter's token-unit arm (up to two units of the widest width: two streams -- 24/2 at
-      ``S_q`` 6 .. 8 = two units of the 64-column tile) and the unpacked arm past it (one head per CTA: ``group`` streams) -- the fewest
-      streams any kernel offers it today, never more than the ``"token_units"`` route's.
+      tile per (sequence, KV head), the KV streamed once -- wherever that body packs the group within its tile
+      (``pack_gqa_group_size(group, DECODE_PREFILL_TILE_ROWS)``: a group dividing its 128 rows, ``s_q x group <= 128``; the cc 10.7
+      paged THD leg takes whole-group PackGQA only); a group it cannot pack (12 = 24 / 2, 6 = 24 / 4), or a step past its 128 rows,
+      keeps the adapter's token-unit arm (up to two units of the widest width: two streams -- 24/2 at ``S_q`` 6 .. 10 = two units of
+      the 64-column tile) and the UNPACKED arm past it (one head per CTA, ``S_q`` rows on the 16- or 32-column tile: ``group`` streams
+      -- 32 / 2 from ``S_q`` 9, the arm every group had before the table landed) -- the fewest streams any kernel offers it today,
+      never more than the ``"token_units"`` route's.
     * ``"token_units"``: the adapter's own route verbatim (``config_sm107.decode_d256_q_tile``: the single-unit table, then the widest
       width in up to two token units for a packed group), then the unpacked arm -- the A/B's other arm.
 
-    MHA (``h_q == h_kv``) stays the unpacked 16-column tile (the bit-exact unpacked fold, one stream).  ``claimed`` marks the measured
-    cells: the PACKED decode tile at ``s_q <= DECODE_CLAIMED_MAX_S_Q`` on a width up to :data:`DECODE_CLAIMED_MAX_N_Q`."""
+    MHA (``h_q == h_kv``) stays the unpacked tile (the bit-exact unpacked fold, one stream: 16 columns to 16 tokens, 32 past).  A cap
+    below the width an unpacked step needs (``decode_q_tile_max=16`` at 17 .. 32 tokens) is NOT served either -- the cap is honoured,
+    never widened, and the reason names it.  ``claimed`` marks the measured cells: the PACKED decode tile at ``s_q <=
+    DECODE_CLAIMED_MAX_S_Q`` on a width up to :data:`DECODE_CLAIMED_MAX_N_Q`."""
     from cudnn.sdpa.fwd.config_sm100 import decode_d256_q_units, pack_gqa_group_size
     from cudnn.sdpa.fwd.config_sm107 import decode_d256_q_tile, decode_d256_single_unit_q_tile
 
@@ -705,6 +731,7 @@ def decode_route(geometry: "GatedAttentionBlockGeometry", s_q: int, policy: Opti
             kv_streams=int(streams),
             policy=policy,
             q_tile_max=cap,
+            pdl_capable=(tile == DECODE_TILE),
         )
 
     if int(geometry.d_head) != 256:
@@ -712,20 +739,21 @@ def decode_route(geometry: "GatedAttentionBlockGeometry", s_q: int, policy: Opti
     if s_q < 1 or g < 1:
         return route(None, 0, 0, False, 0, f"a dense step needs S_q >= 1 and a whole GQA group, got S_q={s_q} at group {g}")
     if s_q > DECODE_MAX_S_Q:
-        return route(None, 0, 0, False, 0, _decode_s_q_decline(s_q))
-    if rows > DECODE_MAX_ROWS:
-        return route(None, 0, 0, False, 0, _decode_rows_decline(s_q, g))
+        return route(None, 0, 0, False, 0, _decode_rows_decline(s_q))
     if g == 1:
-        # MHA: the unpacked fold on the decode tile (S_q <= 8 rows always fit its narrowest width), one stream
+        # MHA: the unpacked fold on the decode tile (S_q <= 32 rows fit its 16- or 32-column width), one stream
         n_q = decode_d256_single_unit_q_tile(s_q, 1, **form)
-        return route(DECODE_TILE, n_q, 1, False, 1)
+        if n_q:
+            return route(DECODE_TILE, n_q, 1, False, 1)
+        return route(None, 0, 0, False, 0, _decode_cap_decline(s_q, g, cap))
     n_q = decode_d256_single_unit_q_tile(s_q, g, **form)
     if n_q:
         return route(DECODE_TILE, n_q, 1, True, 1)
-    if policy == DECODE_ROUTE_SINGLE_UNIT and pack_gqa_group_size(g, DECODE_MAX_ROWS) == g:
-        # past the table: the paged prefill tile with the whole group packed (one Q tile per sequence and KV head; rows <= 128 here)
+    if policy == DECODE_ROUTE_SINGLE_UNIT and rows <= DECODE_PREFILL_TILE_ROWS and pack_gqa_group_size(g, DECODE_PREFILL_TILE_ROWS) == g:
+        # past the table: the paged prefill tile with the whole group packed (one Q tile per sequence and KV head; rows <= 128)
         return route(PREFILL_TILE, 0, 0, True, 1)
-    # the adapter's token-unit arm (the widest width in up to two units), then its unpacked arm (one head per CTA, one unit)
+    # the adapter's token-unit arm (the widest width in up to two units), then its unpacked arm (one head per CTA, one unit: the
+    # fallback every group had before the table landed, up to 32 tokens)
     n_q = decode_d256_q_tile(s_q, g, **form)
     if n_q:
         units = decode_d256_q_units(s_q, g, n_q)
@@ -733,24 +761,31 @@ def decode_route(geometry: "GatedAttentionBlockGeometry", s_q: int, policy: Opti
     n_q = decode_d256_q_tile(s_q, 1, **form)
     if n_q:
         return route(DECODE_TILE, n_q, 1, False, g)
-    # unreachable inside the declared envelope (S_q <= 8 rows fit the 16-column tile unpacked); kept as the honest last word
-    return route(None, 0, 0, False, 0, _decode_s_q_decline(s_q))
+    # reachable under a cap only (decode_q_tile_max=16 holds the table below the 32-column tile a step of 17 .. 32 tokens needs
+    # unpacked): the cap is honoured, never widened -- the honest last word names it
+    return route(None, 0, 0, False, 0, _decode_cap_decline(s_q, g, cap))
 
 
-def _decode_s_q_decline(s_q: int) -> str:
+_DECODE_ROWS_DECLINE = (
+    f"kv_source='paged' on a dense [B, S_q] declaration (the DECODE form) serves S_q <= {DECODE_MAX_ROWS} new tokens per sequence: the Rubin "
+    "d256 decode tile in one token unit, the paged d256 prefill tile with the group packed or two token units of the decode tile (an MTP "
+    f"verify step), then the decode tile UNPACKED (one head per CTA) up to {DECODE_MAX_ROWS} rows; a longer dense step over the pools is the "
+    "EXTEND form's PACKED (thd=True) business (a QsaSpec geometry has no such cap: the sparse core runs one work item per query row)"
+)
+"""The ``decode_rows`` row's message (:data:`_EXTEND_DECLINES`): the one text the declaration raises, the envelope publishes and the
+route's record carries (with the step appended) for a dense step past :data:`DECODE_MAX_ROWS` tokens."""
+
+
+def _decode_rows_decline(s_q: int) -> str:
+    return f"{_DECODE_ROWS_DECLINE} (got S_q={s_q})"
+
+
+def _decode_cap_decline(s_q: int, group: int, cap: Optional[int]) -> str:
     return (
-        f"kv_source='paged' on a dense [B, S_q] declaration (the DECODE form) serves S_q <= {DECODE_MAX_S_Q} (an MTP-7 verify step: the Rubin "
-        f"d256 decode tile in one token unit, else the paged d256 prefill tile with the group packed; got S_q={s_q}); a longer dense step over "
-        "the pools is the EXTEND form's PACKED (thd=True) business (a QsaSpec geometry has no such cap: the sparse core runs one work item "
-        "per query row)"
-    )
-
-
-def _decode_rows_decline(s_q: int, group: int) -> str:
-    return (
-        f"kv_source='paged' on a dense [B, S_q] declaration (the DECODE form) serves S_q x (H_q / H_kv) <= {DECODE_MAX_ROWS} packed rows (one Q "
-        f"tile of the paged d256 prefill tile per sequence and KV head; got S_q={s_q} at group {group} = {s_q * group} rows); a wider dense step "
-        "over the pools is the EXTEND form's PACKED (thd=True) business"
+        f"kv_source='paged' on a dense [B, S_q] declaration (the DECODE form): decode_q_tile_max={cap} holds the Rubin d256 decode tile's "
+        f"width table below the {16 if s_q <= 16 else 32} columns an UNPACKED step of S_q={s_q} tokens needs, and the packed routes of group "
+        f"{group} are past the capped table too; declare decode_q_tile_max=None (the whole table) or a width of at least that, or a shorter "
+        "step -- the cap is honoured, never widened"
     )
 
 
@@ -801,7 +836,8 @@ class DecodeEnvelope:
     """What :meth:`GatedAttentionBlockFwd.serving_envelope` says about the DECODE form (``kv_source="paged"`` on a dense
     ``[B, S_q]`` declaration) for one ``(geometry, dtype, device)`` -- the shape of :class:`ExtendEnvelope`, plus the route per
     ``S_q`` (:func:`decode_route`: the kernel, its packing and token units, whether the cell is inside the CLAIMED envelope
-    ``S_q <= max_s_q``) and the widest dense step served over the pools (``max_rows``; beyond it a typed decline).  ``declines``
+    ``S_q <= claimed_max_s_q``) and the widest dense step served over the pools (``max_rows`` = ``max_s_q`` = 32 tokens per
+    sequence, the decode tile unpacked; beyond it a typed decline).  ``declines``
     maps every typed decline the form raises AT DECLARATION to its message -- the rows of the ONE table the constructor reads
     (:data:`_EXTEND_DECLINES`) that a dense declaration can hit.
 
@@ -820,7 +856,7 @@ class DecodeEnvelope:
     max_rows: int
     routes: Tuple[
         DecodeRoute, ...
-    ]  # S_q = 1 .. max_s_q + 1 at this geometry's group under ``policy`` (the declared envelope and its first decline; empty under QsaSpec)
+    ]  # S_q = 1 .. max_s_q + 1 at this geometry's group under ``policy`` (the served envelope and its first decline; empty under QsaSpec)
     inference_only: bool = True
     writes_lse: bool = False
 
@@ -841,6 +877,9 @@ class DecodeEnvelope:
     claimed_max_s_q: int = 0
     # appended (2026-10-15): the width cap ``routes`` / ``route()`` were read under (``serving_envelope(decode_q_tile_max=)``; None = the whole table).
     q_tile_max: Optional[int] = None
+    # appended (2026-10-15): the stage kinds that take the ``use_pdl`` switch on this form (:data:`DECODE_PDL_STAGES`; stage (4) on a
+    # decode-tile route only -- ``DecodeRoute.pdl_capable`` per route); empty under ``sparse_core`` (the switch is a typed decline there).
+    pdl_stages: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -865,6 +904,9 @@ class ExtendEnvelope:
     declines: Dict[str, str]
     inference_only: bool = True
     writes_lse: bool = False
+    # appended (2026-10-15): the stage kinds that take the ``use_pdl`` switch on this form (:data:`EXTEND_PDL_STAGES`: never stage (4), the
+    # paged prefill tile launches plain and the link serializes).
+    pdl_stages: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -4152,7 +4194,9 @@ class _Sdpa(_Stage):
         # against it either way.
         route: Optional[DecodeRoute] = None,
         # APPENDED: the adapter's programmatic-dependent-launch form (SdpaFwdDslSm100(use_pdl=True): the decode tile and its split combine
-        # launch with the attribute and carry the griddepcontrol pair).  Performance-only; a kernel without the sites declines at compile.
+        # launch with the attribute and carry the griddepcontrol pair).  Performance-only.  The block hands it to a decode-tile route only
+        # (``pdl_capable``); a standalone stage that forces it onto a kernel without the sites (the prefill tiles) hears the adapter's
+        # typed decline at compile().
         use_pdl: bool = False,
     ) -> None:
         # token_stride != 0 => Q/K/V are column slices of the fused projection
@@ -4289,6 +4333,15 @@ class _Sdpa(_Stage):
             )
         self._impl = None
 
+    @staticmethod
+    def pdl_capable(route: Optional[DecodeRoute]) -> bool:
+        """Whether stage (4) takes the programmatic-dependent-launch switch on ``route``: the Rubin d256 decode tile and its split
+        combine carry the griddepcontrol pair (``DecodeRoute.decode_tile``); the paged d256 prefill tile (the DECODE form's prefill
+        route, the EXTEND form -- ``route`` None) and the dense prefill tiles (``kv_source="self"``: no route) do not, so the block
+        launches them plain and the link serializes -- correct by PDL's semantics (the successor's wait blocks on full completion).
+        ``DecodeRoute.pdl_capable`` is the same fact on the record."""
+        return route is not None and route.decode_tile
+
     def _build_impl(self):
 
         from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
@@ -4302,7 +4355,9 @@ class _Sdpa(_Stage):
         # (scalar descales), False -> prefill_d256_mxfp8.py (block scales).
         kw = dict(pertensor_fp8=self.pertensor, dtype_o=self.o_dtype, has_amax_o=False) if self.fp8 else {}
         if self.use_pdl:
-            kw["use_pdl"] = True  # the adapter declines at compile() when the routed kernel carries no griddepcontrol sites
+            # a decode-tile route (the block never hands the switch to a prefill tile: pdl_capable); the adapter declines at compile()
+            # when a standalone stage forces it onto a kernel without the griddepcontrol sites
+            kw["use_pdl"] = True
         if self.thd:
             # THD: the adapter takes the (B_env, H, S_max, D) ENVELOPE at the block's token strides -- the same `_bhsd_desc`
             # the dense arm declares, at (num_sequences, max_seq_len) instead of (1, T); its (d, h, s) stride order is what
@@ -5993,24 +6048,10 @@ _EXTEND_DECLINES: Tuple[Tuple[str, type, Callable[[_ServingDecl], bool], str], .
         "attends over the pools, so the write-through attribute is part of its declaration",
     ),
     (
-        "decode_s_q",
-        NotImplementedError,
-        lambda d: _is_paged(d) and not d.thd and d.geometry.qsa is None and d.s_q > DECODE_MAX_S_Q,
-        f"kv_source='paged' on a dense [B, S_q] declaration (the DECODE form) serves S_q <= {DECODE_MAX_S_Q} (an MTP-7 verify step: the Rubin "
-        "d256 decode tile in one token unit, else the paged d256 prefill tile with the group packed); a longer dense step over the pools is the "
-        "EXTEND form's PACKED (thd=True) business (a QsaSpec geometry has no such cap: the sparse core runs one work item per query row)",
-    ),
-    (
         "decode_rows",
         NotImplementedError,
-        lambda d: _is_paged(d)
-        and not d.thd
-        and d.geometry.qsa is None
-        and int(d.geometry.h_kv) >= 1
-        and d.s_q * (int(d.geometry.h_q) // int(d.geometry.h_kv)) > DECODE_MAX_ROWS,
-        f"kv_source='paged' on a dense [B, S_q] declaration (the DECODE form) serves S_q x (H_q / H_kv) <= {DECODE_MAX_ROWS} packed rows (one Q "
-        "tile of the paged d256 prefill tile per sequence and KV head); a wider dense step over the pools is the EXTEND form's PACKED (thd=True) "
-        "business",
+        lambda d: _is_paged(d) and not d.thd and d.geometry.qsa is None and d.s_q > DECODE_MAX_ROWS,
+        _DECODE_ROWS_DECLINE,
     ),
     (
         "sparse",
@@ -6100,9 +6141,10 @@ QsaSpec geometry for the EXTEND form.  With the arm claimed, a packed QsaSpec de
 one and meets its ``sparse`` row (the same row the DECODE form reaches)."""
 
 _DECODE_REQUIRES = (
-    "a DENSE declaration: sample_h [B, S_q, d_model] with 1 <= S_q <= DECODE_MAX_S_Q = 8 and S_q x (H_q / H_kv) <= DECODE_MAX_ROWS = 128 packed rows (the "
-    "claimed envelope S_q <= 4 on the packed 16- / 32-column decode tile; decode_route_policy picks the single-unit route or the adapter's token units, "
-    "decode_q_tile_max caps the tile's width table), the batch uniform",
+    "a DENSE declaration: sample_h [B, S_q, d_model] with 1 <= S_q <= DECODE_MAX_S_Q = DECODE_MAX_ROWS = 32 (the claimed envelope S_q <= 4 on the packed "
+    "16- / 32-column decode tile; an MTP verify step to S_q = 8 on the decode tile in one unit, the paged prefill tile with the group packed within its "
+    "DECODE_PREFILL_TILE_ROWS = 128 or two token units; past a group's packed routes the decode tile UNPACKED, one head per CTA, up to 32 tokens; "
+    "decode_route_policy picks the single-unit route or the adapter's token units, decode_q_tile_max caps the tile's width table), the batch uniform",
     "paged_kv_page_size=P (a positive multiple of 16; validated at page_sizes)",
     "kv_source='paged'",
     "geometry.is_causal=True, geometry.causal_bottom_right=True, window_left=-1, window_right in (-1, 0), qsa=None, d_head=256",
@@ -6112,7 +6154,6 @@ _DECODE_REQUIRES = (
 )
 _DECODE_DECLINE_NAMES = (
     "write_through",
-    "decode_s_q",
     "decode_rows",
     "diagonal",
     "window",
@@ -6224,7 +6265,8 @@ class GatedAttentionBlockFwd(APIBase):
     the pipeline is ``(1)+(2)+(3) -> (4w) -> (4) [+ combine] -> (5) -> (6)``, five launches with ``fuse_norm_rope`` -- past decode row
     counts: at ``B x S_q <= 128`` (``kernels.proj_gemm.SMALL_M_MAX``) the declaration LOWERS stage (1) to the unfused chain, ``(1) -> (2)+(3)
     -> (4w) -> (4) [+ combine] -> (5) -> (6)`` (the small-M route's slab GEMM, the norm + RoPE pass, the separate cache write: the measured
-    faster step; ``fuse_norm_rope_effective`` reads it back, ``fuse_norm_rope_small_m=True`` keeps the fused fork for the A/B).
+    faster step; ``fuse_norm_rope_effective`` reads it back, ``fuse_norm_rope_small_m=True`` keeps the fused fork for the A/B, as does an
+    explicit ``fuse_cache_write=True`` -- the write-through arm lives in the fork and the request outranks the lowering).
     ``fuse_gate`` then rides the split COMBINE on the decode tile (``gate_fused``; the tile has no gate seams, the combine
     multiplies the merged fp32 value by ``sigmoid(G)`` before the single cast) and is its own launch on an unsplit tile.
     The pools' and the table's strides are the same declaration samples as the EXTEND form's (a row-sliced table at any row
@@ -6431,7 +6473,9 @@ class GatedAttentionBlockFwd(APIBase):
         # projection's epilogue wherever that arm serves (fuse_norm_rope=True, bf16 / f16 activations, no indexer band -- both serving forms as
         # declared today: EXTEND 4 -> 3 stages with fuse_gate, DECODE 5 -> 4), the separate cache-write launch everywhere else; False = the
         # separate launch always (the A/B control and the fallback); True = the fused arm, a typed decline on a form it cannot serve.  A
-        # performance-only knob: the pools hold the SAME bytes either way (the pool row is the slab row, bitwise).
+        # performance-only knob: the pools hold the SAME bytes either way (the pool row is the slab row, bitwise).  At decode row counts
+        # an explicit True is the REQUEST that keeps the fused fork the AUTO lowering (fuse_norm_rope_small_m=None) would otherwise replace
+        # (user request > heuristic proposal); only the explicit contradiction fuse_norm_rope_small_m=False + fuse_cache_write=True declines.
         fuse_cache_write: Optional[bool] = None,
         # APPENDED (serving, the e4m3 KV cache): the POOLS' dtype.  None = the activation dtype (the pools as before).  torch.float8_e4m3fn =
         # the serving stacks' fp8 KV cache: the write-through quantizes the post-RoPE K / V into e4m3 codes under per-tensor fp32 DEscales
@@ -6456,14 +6500,20 @@ class GatedAttentionBlockFwd(APIBase):
         # attribute and traces their griddepcontrol pair (a wait before the first global read of a predecessor's output, a release after the
         # prologue); the FROST GEMM templates already launch that way (their module constant USE_PDL).  The same kernels, the same math:
         # `out` is BITWISE the use_pdl=False block's, eagerly and under CUDA-graph capture.  Served for the bf16 / f16 block (no quant, no e4m3
-        # KV cache, no QsaSpec); a declaration whose chain routes to a kernel without the sites is a typed decline at compile.
+        # KV cache, no QsaSpec: a typed decline).  A PER-STAGE fact (2026-10-15): a stage whose kernel carries no sites -- the paged d256
+        # prefill tile of the DECODE form's prefill route and of the EXTEND form, the dense prefill tiles under kv_source="self" -- launches
+        # plain and the link serializes there (correct by PDL's semantics: its successor's wait blocks on full completion); the switch is
+        # never forwarded to such a kernel.  `pdl_stages` reads back the stages launching with the attribute, `use_pdl_effective` whether
+        # every switched stage of the chain does; `DecodeRoute.pdl_capable`, `DecodeEnvelope.pdl_stages` and `ExtendEnvelope.pdl_stages`
+        # say so before anything is declared.
         use_pdl: bool = False,
         # APPENDED (2026-10-15; the DECODE form only; performance-only): WHETHER the fused norm + RoPE projection runs at DECODE ROW COUNTS
         # (T = B x S_q <= kernels.proj_gemm.SMALL_M_MAX = 128 on the dense DECODE form, bf16 / f16, no indexer band, 16-bit pools) when
         # fuse_norm_rope=True.  None = AUTO = False: stage (1) is LOWERED to the unfused chain there -- the small-M route's slab GEMM, the
         # norm + RoPE pass, the separate cache write (seven launches with the split combine) -- because the 256-wide fused fork pads one
         # token tile and streams its weight at a fraction of the machine (the measured "route + unfused" step is the faster one at B 1 ..
-        # 32); True = the fused fork as declared (the former behaviour; the A/B's control arm).  `fuse_norm_rope` stays what was declared,
+        # 32), unless an explicit fuse_cache_write=True asks for the fork's write-through arm (the request outranks the lowering);
+        # True = the fused fork as declared (the former behaviour; the A/B's control arm).  `fuse_norm_rope` stays what was declared,
         # `fuse_norm_rope_effective` reads back what runs (`cache_write_fused` follows it: the write-through arm lives in the fork).  Refused
         # (typed) with fuse_norm_rope=False and off the dense DECODE form.  Module docstring, "The DECODE form".
         fuse_norm_rope_small_m: Optional[bool] = None,
@@ -6477,9 +6527,10 @@ class GatedAttentionBlockFwd(APIBase):
         self.dtype = sample_h.dtype
         self.device = sample_h.device
         # Programmatic dependent launch over the chain (the constructor's note): the bf16 / f16 block only -- the quantized pipelines'
-        # quantize stages, the e4m3 write-through and the sparse core carry no griddepcontrol sites yet, and a chain with one
-        # attribute-less link in the middle would silently serialize there while the links after it believe they overlap.  The
-        # FIRST decline of such a declaration, so the message names the switch rather than a later check's vocabulary.
+        # quantize stages, the e4m3 write-through and the sparse core carry no griddepcontrol sites yet, so none of those chains overlaps
+        # at its attention link and the switch is a typed decline there (the per-stage form below is the bf16 / f16 chains', whose one
+        # site-less link is a prefill tile).  The FIRST decline of such a declaration, so the message names the switch rather than a
+        # later check's vocabulary.
         self.use_pdl = bool(use_pdl)
         if self.use_pdl and (quant is not None or kv_cache_dtype is not None or geometry.qsa is not None):
             raise NotImplementedError(
@@ -6727,8 +6778,11 @@ class GatedAttentionBlockFwd(APIBase):
         # kernels), so the fewer launches lose; the unfused chain is what the route measured as the faster decode step.  The lowering is a
         # declaration fact (`fuse_norm_rope_effective`), decided here from the dense DECODE form's facts -- the dense paged route
         # (`decode_route`), bf16 / f16 (no quant), no indexer band, 16-bit pools, T = B x S_q within the small-M route's bound -- and kept
-        # OFF by `fuse_norm_rope_small_m=True` (the fused fork as declared: the A/B's control arm).  The EXTEND form, the packed form and
-        # the quantized pipelines are untouched (`fuse_norm_rope` runs as declared there).
+        # OFF by `fuse_norm_rope_small_m=True` (the fused fork as declared: the A/B's control arm) and by an explicit `fuse_cache_write=True`
+        # (the RAW argument, read before its own validator runs below: the write-through arm lives in the fork, so the request outranks the
+        # lowering -- user request > heuristic proposal; the contradiction `fuse_norm_rope_small_m=False` + `fuse_cache_write=True` is that
+        # validator's typed decline).  The EXTEND form, the packed form and the quantized pipelines are untouched (`fuse_norm_rope` runs as
+        # declared there).
         if fuse_norm_rope_small_m is not None and not isinstance(fuse_norm_rope_small_m, bool):
             raise TypeError(f"fuse_norm_rope_small_m must be None (auto), True or False, got {type(fuse_norm_rope_small_m).__name__}")
         self.fuse_norm_rope_small_m: Optional[bool] = fuse_norm_rope_small_m
@@ -6741,13 +6795,14 @@ class GatedAttentionBlockFwd(APIBase):
         from .kernels.proj_gemm import SMALL_M_MAX
 
         self.small_m_decode = self.decode_route is not None and self.batch * self.seq_len <= SMALL_M_MAX
+        lowering_applies = (
+            self.small_m_decode and quant is None and not geometry.index_band and not self.kv_cache_e4m3 and self.dtype in (torch.bfloat16, torch.float16)
+        )
+        # the knob's three readings where the lowering applies: None = AUTO, the lowering -- unless an explicit fuse_cache_write=True asks for
+        # the fork's write-through arm (the request outranks the proposal); True = the fork as declared; False = the lowering by name (with
+        # fuse_cache_write=True the contradiction the write-through validator declines below)
         self.fuse_norm_rope_effective = self.fuse_norm_rope and not (
-            self.small_m_decode
-            and self.fuse_norm_rope_small_m is not True
-            and quant is None
-            and not geometry.index_band
-            and not self.kv_cache_e4m3
-            and self.dtype in (torch.bfloat16, torch.float16)
+            lowering_applies and (self.fuse_norm_rope_small_m is False or (self.fuse_norm_rope_small_m is None and fuse_cache_write is not True))
         )
         # The BLOCK-SPARSE decode / extend-with-prefix mode (a QsaSpec geometry over the pools; the packed form met the table's
         # `sparse` row above): stage (4) is the sparse core reading the pools, and the LIST FORM is a declaration fact derived from
@@ -6987,7 +7042,9 @@ class GatedAttentionBlockFwd(APIBase):
                 max_kv_len=self.max_kv_len if self.decode_route is not None else 0,
                 decode_split_kv=self.decode_split_kv if self.decode_route is not None else 1,
                 route=self.decode_route,
-                use_pdl=self.use_pdl,
+                # the switch reaches stage (4) on a decode-tile route only (_Sdpa.pdl_capable): the prefill tiles carry no sites and
+                # launch plain -- the link serializes, the chain stays correct; `pdl_stages` reads it back
+                use_pdl=self.use_pdl and _Sdpa.pdl_capable(self.decode_route),
             )
         # Stage (5) lives in the SDPA kernel's gate epilogue under fuse_gate --
         # not built rather than built and skipped (it would still compile).
@@ -7089,6 +7146,13 @@ class GatedAttentionBlockFwd(APIBase):
             )
             if st is not None
         )
+        # The programmatic-dependent-launch readback (the switch is per stage): the stages that launch with the attribute, and whether
+        # every switched stage of the chain does (False with a plain link: the prefill tile of the DECODE form's prefill route or of the
+        # EXTEND form, or a stage the switch is not threaded to -- the V compaction of inplace_qkv=False, the training copies).  The
+        # FROST GEMM stages launch with the attribute by their own constant and are not switched: neither listed nor counted.
+        switched = tuple(st for st in self._stages if hasattr(st, "use_pdl"))
+        self.pdl_stages: Tuple[str, ...] = tuple(st.name for st in switched if st.use_pdl)
+        self.use_pdl_effective: bool = self.use_pdl and bool(switched) and all(st.use_pdl for st in switched)
         self._ws = None
 
     # -- block-sparse attention (QsaSpec) -----------------------------------
@@ -7268,10 +7332,13 @@ class GatedAttentionBlockFwd(APIBase):
                     "unfused chain norms the slab in place after the GEMM and keeps the separate cache-write launch"
                 )
             if not self.fuse_norm_rope_effective:
+                # reachable through fuse_norm_rope_small_m=False only: under AUTO the explicit request keeps the fork (the effective flag reads
+                # the raw argument), so the one way to ask for the arm AND for the chain it does not live in is to spell both
                 raise NotImplementedError(
-                    "fuse_cache_write=True at decode row counts: fuse_norm_rope=True lowers stage (1) to the unfused chain there (T = B x S_q within the "
-                    "small-M route's bound; fuse_norm_rope_small_m=None), which keeps the separate cache-write launch -- declare fuse_norm_rope_small_m=True "
-                    "to run the fused projection and its write-through arm, or fuse_cache_write=None / False"
+                    "fuse_cache_write=True with fuse_norm_rope_small_m=False: the write-through arm lives in the fused norm + RoPE projection's epilogue, "
+                    "and fuse_norm_rope_small_m=False lowers stage (1) to the unfused chain at decode row counts (T = B x S_q within the small-M route's "
+                    "bound), which keeps the separate cache-write launch -- declare fuse_norm_rope_small_m=None (the request keeps the fork) or True, or "
+                    "fuse_cache_write=None / False"
                 )
             if self.geom.index_band:
                 raise NotImplementedError(
@@ -7839,6 +7906,7 @@ class GatedAttentionBlockFwd(APIBase):
             page_sizes=SERVING_PAGE_SIZES,
             pool_layouts=SERVING_POOL_LAYOUTS,
             declines={name: msg for name, _exc, _pred, msg in _EXTEND_DECLINES},  # the whole table: every row a declaration can hit
+            pdl_stages=EXTEND_PDL_STAGES,
         )
         decode_reason = probe(False, 1)
         has_group = int(geometry.h_kv) >= 1 and int(geometry.h_q) % int(geometry.h_kv) == 0
@@ -7866,6 +7934,7 @@ class GatedAttentionBlockFwd(APIBase):
             policy=policy,
             claimed_max_s_q=DECODE_CLAIMED_MAX_S_Q,
             q_tile_max=q_tile_max,
+            pdl_stages=() if sparse else DECODE_PDL_STAGES,
         )
         forms = tuple(nm for nm, env in (("extend", extend), ("decode", decode)) if env.served)
         return ServingEnvelope(
@@ -8900,9 +8969,10 @@ class GatedAttentionBlockFwd(APIBase):
         sparse_kw = dict(block_ids=block_ids, block_lens=block_lens) if self.qsa is not None else {}
         # The EXTEND form (kv_source="paged"): K / V are read from the POOLS the write-through just filled -- every sequence's
         # prefix and this step's tokens -- through the block table over [0, kv_lens[b]); the slab's K / V bands are unread by
-        # the SDPA.  Stream order is the ONLY ordering between the write and the read: the cache write launches without
-        # programmatic dependent launch (no PDL attribute on its launch; the SDPA bodies wait on no dependent grid), so a
-        # later kernel that adopts PDL after a pool write must wait on its dependent grid before its first K / V load.
+        # the SDPA.  On the plain chain stream order is the ONLY ordering between the write and the read (the cache write launches
+        # without the PDL attribute; the prefill bodies wait on no dependent grid); under use_pdl=True the cache write launches with
+        # the attribute and the decode tile waits on its dependent grid before its first K / V load, while a prefill tile -- which
+        # carries no sites -- launches plain, so the link serializes and the read still follows the write either way.
         paged = self.kv_source == KV_SOURCE_PAGED
         # The pools and the table reach the stage that reads them: the dense SDPA stage (the EXTEND / DECODE forms) or, on a QsaSpec
         # geometry, the sparse stage (the block-sparse DECODE / extend-with-prefix mode: the same paged read through the sparse core,

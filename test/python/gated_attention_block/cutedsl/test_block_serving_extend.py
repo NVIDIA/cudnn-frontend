@@ -1417,10 +1417,9 @@ def test_extend_typed_declines_match_the_envelope_row_by_row(monkeypatch):
     d128 = dict(_EXTEND_GEOM, d_head=128, d_model=256)
     trips = {
         "write_through": lambda: _declare_extend_with(2, 128, good, page=0),
-        # a dense paged declaration IS the DECODE form now (test_block_serving_decode.py): past S_q 8 it is the decode_s_q row (heard
-        # first), and within S_q 8 but past the prefill tile's 128 packed rows (64 / 2 = group 32 at S_q 5: 160 rows) the decode_rows row
-        "decode_s_q": lambda: _make_block(_EXTEND_GEOM, 1, 9, paged_kv_page_size=16, kv_source=KV_SOURCE_PAGED),
-        "decode_rows": lambda: _make_block(dict(_EXTEND_GEOM, h_q=64, h_kv=2), 1, 5, paged_kv_page_size=16, kv_source=KV_SOURCE_PAGED),
+        # a dense paged declaration IS the DECODE form now (test_block_serving_decode.py): past 32 tokens per sequence (the decode tile
+        # unpacked, its widest step) it is the decode_rows row; 160 packed rows (64 / 2 = group 32 at S_q 5) ride the unpacked arm
+        "decode_rows": lambda: _make_block(_EXTEND_GEOM, 1, 33, paged_kv_page_size=16, kv_source=KV_SOURCE_PAGED),
         "diagonal": lambda: _declare_extend(2, 128, max_kv_len=128, geom_kw=_SMALL_D256),
         # the PACKED form over the pools on a QsaSpec geometry (a dense one is the block-sparse decode mode since 2026-10-14: _declare_dense_sparse_paged)
         "sparse": lambda: _declare_extend(2, 128, max_kv_len=128, geom_kw=dict(_SMALL_D256, qsa=QsaSpec())),
@@ -1607,9 +1606,11 @@ def test_extend_pipelines_launch_without_pdl_and_the_sdpa_bodies_wait_on_no_depe
     SDPA body the EXTEND form can run -- the shared d256 paged body compiled for Rubin and the Rubin sibling -- waits on a
     dependent grid or launches with PDL (a static detector over their SOURCE TEXT: a kernel adopting PDL after a pool write must
     wait before its first K / V load); (3) therefore an EXTEND declaration with ``use_pdl=True`` threads the switch to the
-    write-through AND is a typed decline at the SDPA stage's compile (on Rubin, where the stage's arch check lets it reach the
-    adapter): the write-through never launches with the attribute ahead of a body that does not wait; (4) the runner's compile
-    entry defaults ``use_pdl`` to False."""
+    write-through and NEVER to stage (4): the paged body launches plain and the link serializes (its stream-ordered launch
+    follows the write-through's completion, so the read still follows the write -- correct by PDL's semantics), read back by
+    ``pdl_stages`` (the write-through, not ``"sdpa"``) and ``use_pdl_effective`` False; on Rubin the stage compiles, and a stage
+    FORCED to carry the switch onto the paged body is the adapter's typed decline; (4) the runner's compile entry defaults
+    ``use_pdl`` to False."""
     import inspect
 
     import cudnn.gated_attention_block.kernels.cache_write as cw
@@ -1645,11 +1646,21 @@ def test_extend_pipelines_launch_without_pdl_and_the_sdpa_bodies_wait_on_no_depe
         src = _kernel_source(mod)
         for token in ("griddepcontrol", "wait_on_dependent_grids", "launch_dependent_grids", "use_pdl=True"):
             assert token not in src, (mod, token)
-    # (3) the EXTEND form's SDPA body carries no sites, so the switched-on declaration is a typed decline at the stage's compile
+    # (3) the EXTEND form's SDPA body carries no sites, so the block never hands it the switch: stage (4) launches plain (the link
+    # serializes), the readback says which stages took the attribute, and the form's envelope names stage (4) among neither form's
+    assert blk_on._sdpa.use_pdl is False and blk_on.decode_route is None and _Sdpa.pdl_capable(None) is False
+    assert blk_on.pdl_stages == tuple(st.name for st in blk_on._stages if getattr(st, "use_pdl", False)) and "cache_write" in blk_on.pdl_stages
+    assert "sdpa" not in blk_on.pdl_stages and blk_on.use_pdl_effective is False and blk.pdl_stages == ()
+    env_on = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**_EXTEND_GEOM), torch.bfloat16, _DEV)
+    assert env_on.extend.pdl_stages == ("qk_norm_rope", "cache_write", "sigmoid_gate") and "sdpa" not in env_on.extend.pdl_stages
     if torch.cuda.is_available() and tuple(torch.cuda.get_device_capability()) == (10, 7):
         blk_on._sdpa.check_support()
+        blk_on._sdpa.compile()  # the paged body, plain: no decline
+        forced, *_ = _declare_extend(2, 128, max_kv_len=128, use_pdl=True)
+        forced._sdpa.use_pdl = True  # a stage forced to carry the switch onto a kernel without the sites: the adapter's typed decline
+        forced._sdpa.check_support()
         with pytest.raises(NotImplementedError, match="programmatic-dependent-launch sites"):
-            blk_on._sdpa.compile()
+            forced._sdpa.compile()
 
 
 # ---------------------------------------------------------------------------

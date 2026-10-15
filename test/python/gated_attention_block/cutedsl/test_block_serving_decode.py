@@ -1,13 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The gated attention block's DECODE (serving) form: a dense ``[B, S_q <= 8]`` declaration with ``kv_source="paged"`` over a
+"""The gated attention block's DECODE (serving) form: a dense ``[B, S_q <= 32]`` declaration with ``kv_source="paged"`` over a
 paged KV cache -- the step's tokens written through, then stage (4) over the first ``kv_lens[b]`` keys of every sequence's
 ``block_table`` row on the Rubin d256 decode tile in ONE token unit where its width table holds the packed rows (PackGQA over
 the whole group, the decode split model's split-KV with fp32 partials in the workspace, the sigmoid gate in the split COMBINE
 under ``fuse_gate``), past the table on the paged d256 PREFILL tile with the group packed (the KV streamed once; the gate in
 that body's epilogue) wherever that tile packs the group, else the decode tile's token-unit and unpacked arms (the route per
-policy is ``test_block_serving_mtp_route.py``'s business), and a typed decline past ``S_q = 8`` or 128 packed rows.
+policy is ``test_block_serving_mtp_route.py``'s business), the decode tile UNPACKED past the packed routes up to ``S_q = 32``, and a
+typed decline past 32 tokens.
 
 Host cells (any device, the declaration cells even on the CPU): the constants and the route table per ``(group, S_q)`` at the
 four served groups (16 = 32 / 2, 12 = 24 / 2, 8 = 8 / 1, 6 = 24 / 4) against the module's route table; the static
@@ -88,10 +89,11 @@ _LAYOUTS = SERVING_POOL_LAYOUTS
 # single-unit widths (16, 32, 64) hold the packed rows in ONE unit (the 64-column width for every packed group of the DECODE form:
 # paged under the bottom-right causal mask); past them the paged d256 PREFILL tile with the group packed wherever that tile packs
 # the group (a group dividing its 128 rows: 16 at S_q 5 .. 8), else -- 12 = 24 / 2 at S_q 6 .. 8 -- the decode tile's token-unit arm
-# (up to two units of the 64-column tile) and its UNPACKED arm (one head per CTA) past that (unreachable at these groups inside
-# S_q <= 8).  "token_units": the adapter's own route verbatim (the widest width in up to two units, then the unpacked arm).  Past
-# S_q 8 NOTHING under either policy: the DECODE form's declared envelope ends there (and at 128 packed rows), a longer dense step
-# is the EXTEND form's packed business.  Every group carries S_q 1 .. 5 (the oracle matrix indexes the table there), 8 and 9.
+# (up to two units of the 64-column tile) and its UNPACKED arm (one head per CTA, ``group`` streams) past that -- the arm every
+# group falls back to up to 32 tokens (32 / 2 from S_q 9: 144 packed rows, past the prefill tile and a third unit).  "token_units":
+# the adapter's own route verbatim (the widest width in up to two units, then the unpacked arm).  Past S_q 32 NOTHING under either
+# policy: the DECODE form's served envelope ends there (``DECODE_MAX_ROWS``), a longer dense step is the EXTEND form's packed
+# business.  Every group carries S_q 1 .. 5 (the oracle matrix indexes the table there), 8, 9 and 33.
 _P, _T = PREFILL_TILE, DECODE_TILE
 _ROUTE_TABLES = {
     DECODE_ROUTE_SINGLE_UNIT: {
@@ -102,7 +104,8 @@ _ROUTE_TABLES = {
             4: (_T, 64, 1, True),
             5: (_P, 0, 0, True),
             8: (_P, 0, 0, True),
-            9: (None, 0, 0, False),
+            9: (_T, 16, 1, False),
+            33: (None, 0, 0, False),
         },
         12: {
             1: (_T, 16, 1, True),
@@ -112,7 +115,9 @@ _ROUTE_TABLES = {
             5: (_T, 64, 1, True),
             6: (_T, 64, 2, True),
             8: (_T, 64, 2, True),
-            9: (None, 0, 0, False),
+            9: (_T, 64, 2, True),
+            11: (_T, 16, 1, False),
+            33: (None, 0, 0, False),
         },
         8: {
             1: (_T, 16, 1, True),
@@ -121,7 +126,9 @@ _ROUTE_TABLES = {
             4: (_T, 32, 1, True),
             5: (_T, 64, 1, True),
             8: (_T, 64, 1, True),
-            9: (None, 0, 0, False),
+            9: (_P, 0, 0, True),
+            17: (_T, 32, 1, False),
+            33: (None, 0, 0, False),
         },
         6: {
             1: (_T, 16, 1, True),
@@ -131,7 +138,9 @@ _ROUTE_TABLES = {
             5: (_T, 32, 1, True),
             6: (_T, 64, 1, True),
             8: (_T, 64, 1, True),
-            9: (None, 0, 0, False),
+            9: (_T, 64, 1, True),
+            21: (_T, 32, 1, False),
+            33: (None, 0, 0, False),
         },
         4: {
             1: (_T, 16, 1, True),
@@ -140,7 +149,9 @@ _ROUTE_TABLES = {
             4: (_T, 16, 1, True),
             5: (_T, 32, 1, True),
             8: (_T, 32, 1, True),
-            9: (None, 0, 0, False),
+            9: (_T, 64, 1, True),
+            17: (_P, 0, 0, True),
+            33: (None, 0, 0, False),
         },
     },
     DECODE_ROUTE_TOKEN_UNITS: {
@@ -151,7 +162,8 @@ _ROUTE_TABLES = {
             4: (_T, 64, 1, True),
             5: (_T, 64, 2, True),
             8: (_T, 64, 2, True),
-            9: (None, 0, 0, False),
+            9: (_T, 16, 1, False),
+            33: (None, 0, 0, False),
         },
         12: {
             1: (_T, 16, 1, True),
@@ -161,7 +173,9 @@ _ROUTE_TABLES = {
             5: (_T, 64, 1, True),
             6: (_T, 64, 2, True),
             8: (_T, 64, 2, True),
-            9: (None, 0, 0, False),
+            9: (_T, 64, 2, True),
+            11: (_T, 16, 1, False),
+            33: (None, 0, 0, False),
         },
         8: {
             1: (_T, 16, 1, True),
@@ -170,7 +184,9 @@ _ROUTE_TABLES = {
             4: (_T, 32, 1, True),
             5: (_T, 64, 1, True),
             8: (_T, 64, 1, True),
-            9: (None, 0, 0, False),
+            9: (_T, 64, 2, True),
+            17: (_T, 32, 1, False),
+            33: (None, 0, 0, False),
         },
         6: {
             1: (_T, 16, 1, True),
@@ -180,7 +196,9 @@ _ROUTE_TABLES = {
             5: (_T, 32, 1, True),
             6: (_T, 64, 1, True),
             8: (_T, 64, 1, True),
-            9: (None, 0, 0, False),
+            9: (_T, 64, 1, True),
+            21: (_T, 32, 1, False),
+            33: (None, 0, 0, False),
         },
         4: {
             1: (_T, 16, 1, True),
@@ -189,7 +207,9 @@ _ROUTE_TABLES = {
             4: (_T, 16, 1, True),
             5: (_T, 32, 1, True),
             8: (_T, 32, 1, True),
-            9: (None, 0, 0, False),
+            9: (_T, 64, 1, True),
+            17: (_T, 64, 2, True),
+            33: (None, 0, 0, False),
         },
     },
 }
@@ -207,15 +227,18 @@ _ROUTE_TABLE_CAP_32 = {
             5: (_T, 16, 1, False),
             6: (_T, 16, 1, False),
             8: (_T, 16, 1, False),
+            9: (_T, 16, 1, False),
         },
         8: {3: (_T, 32, 1, True), 4: (_T, 32, 1, True), 5: (_P, 0, 0, True), 8: (_P, 0, 0, True)},
-        6: {5: (_T, 32, 1, True), 6: (_T, 32, 2, True), 8: (_T, 32, 2, True)},
+        6: {5: (_T, 32, 1, True), 6: (_T, 32, 2, True), 8: (_T, 32, 2, True), 9: (_T, 32, 2, True)},
+        4: {9: (_P, 0, 0, True)},
     },
     DECODE_ROUTE_TOKEN_UNITS: {
         16: {3: (_T, 32, 2, True), 4: (_T, 32, 2, True), 5: (_T, 16, 1, False), 8: (_T, 16, 1, False)},
-        12: {3: (_T, 32, 2, True), 4: (_T, 32, 2, True), 5: (_T, 16, 1, False), 6: (_T, 16, 1, False), 8: (_T, 16, 1, False)},
-        8: {5: (_T, 32, 2, True), 8: (_T, 32, 2, True)},
-        6: {6: (_T, 32, 2, True), 8: (_T, 32, 2, True)},
+        12: {3: (_T, 32, 2, True), 4: (_T, 32, 2, True), 5: (_T, 16, 1, False), 6: (_T, 16, 1, False), 8: (_T, 16, 1, False), 9: (_T, 16, 1, False)},
+        8: {5: (_T, 32, 2, True), 8: (_T, 32, 2, True), 9: (_T, 16, 1, False)},
+        6: {6: (_T, 32, 2, True), 8: (_T, 32, 2, True), 9: (_T, 32, 2, True)},
+        4: {9: (_T, 32, 2, True), 17: (_T, 32, 1, False)},
     },
 }
 _ROUTE_TABLE = _ROUTE_TABLES[DECODE_ROUTE_SINGLE_UNIT]
@@ -313,8 +336,8 @@ def test_constants():
     assert (KV_SOURCE_SELF, KV_SOURCE_PAGED) == ("self", "paged")
     assert SERVING_PAGE_SIZES == (16, 32, 64, 128) and all(p % 16 == 0 for p in SERVING_PAGE_SIZES)
     assert SERVING_POOL_LAYOUTS == ("hnd", "nhd", "unified")
-    assert (DECODE_CLAIMED_MAX_S_Q, DECODE_MAX_S_Q, DECODE_CLAIMED_MAX_N_Q) == (4, 8, 32)
-    assert DECODE_TILE == "decode_d256_f16" and PREFILL_TILE == "prefill_d256_f16" and DECODE_MAX_ROWS == 128
+    assert (DECODE_CLAIMED_MAX_S_Q, DECODE_MAX_S_Q, DECODE_CLAIMED_MAX_N_Q) == (4, 32, 32)
+    assert DECODE_TILE == "decode_d256_f16" and PREFILL_TILE == "prefill_d256_f16" and DECODE_MAX_ROWS == DECODE_MAX_S_Q == 32
 
 
 @pytest.mark.parametrize("policy", [DECODE_ROUTE_SINGLE_UNIT, DECODE_ROUTE_TOKEN_UNITS])
@@ -323,7 +346,7 @@ def test_the_route_table_per_group_and_s_q_is_the_adapters_rule(group, policy):
     """The decode route at every served group per policy: the 16- / 32- / 64-column tile in one unit for the packed rows they hold;
     past them the packed PREFILL tile where the group divides its 128 rows (the default policy), else -- and under
     ``token_units`` everywhere -- the 64-column tile in ``ceil(S_q / (64 // G))`` token units up to two, then the UNPACKED arm
-    (one head per CTA); NOT SERVED past ``S_q = 8`` (the reason names the EXTEND form); the CLAIMED envelope is the packed DECODE
+    (one head per CTA) up to ``S_q = 32``; NOT SERVED past that (the reason names the EXTEND form); the CLAIMED envelope is the packed DECODE
     tile at ``S_q <= 4`` on the measured widths (16 / 32: ``DECODE_CLAIMED_MAX_N_Q``), the other cells -- the 64-column tile among
     them -- routed but not claimed.  MHA stays unpacked.  ``decode_q_tile_max=32`` (the cap) restores the route before the 64-column
     width landed, value for value, and reads back on the record."""
@@ -394,16 +417,26 @@ def test_the_envelope_on_a_rubin_reading_serves_the_decode_form_and_names_every_
     assert (
         [r.s_q for r in d.routes] == list(range(1, DECODE_MAX_S_Q + 2)) and d.claimed_max_s_q == DECODE_CLAIMED_MAX_S_Q and d.policy == DECODE_ROUTE_SINGLE_UNIT
     )
-    # 24 / 2: the prefill tile cannot pack a 12-head group, so the decode tile serves every S_q <= 8, PACKED throughout since the 64-column
-    # width landed (one unit at S_q 3 .. 5, two units of it at 6 .. 8; the former unpacked arm past S_q 4 is the decode_q_tile_max=32 route)
-    assert [r.tile for r in d.routes] == [DECODE_TILE] * 8 + [None] and [r.pack_gqa for r in d.routes] == [True] * 8 + [False]
-    assert [r.n_q for r in d.routes] == [16, 32, 64, 64, 64, 64, 64, 64, 0] and [r.token_units for r in d.routes] == [1, 1, 1, 1, 1, 2, 2, 2, 0]
-    assert d.route(3).token_units == 1 and d.route(6).token_units == 2 and d.route(8).served and not d.route(9).served and "EXTEND form" in d.route(9).reason
+    # 24 / 2: the prefill tile cannot pack a 12-head group, so the decode tile serves every S_q <= 32: PACKED to S_q 10 since the 64-column
+    # width landed (one unit at S_q 3 .. 5, two units of it at 6 .. 10; the former unpacked arm past S_q 4 is the decode_q_tile_max=32 route),
+    # UNPACKED (12 streams) from S_q 11 to 32 -- the 16-column tile to 16 tokens, the 32-column tile past it -- and declined at 33
+    assert [r.tile for r in d.routes] == [DECODE_TILE] * 32 + [None] and [r.pack_gqa for r in d.routes] == [True] * 10 + [False] * 23
+    assert [r.n_q for r in d.routes] == [16, 32, 64, 64, 64, 64, 64, 64, 64, 64] + [16] * 6 + [32] * 16 + [0]
+    assert [r.token_units for r in d.routes] == [1, 1, 1, 1, 1, 2, 2, 2, 2, 2] + [1] * 22 + [0]
+    assert [r.kv_streams for r in d.routes] == [1, 1, 1, 1, 1, 2, 2, 2, 2, 2] + [12] * 22 + [0]
+    assert d.route(3).token_units == 1 and d.route(6).token_units == 2 and d.route(8).served and d.route(32).served and not d.route(33).served
+    assert "EXTEND form" in d.route(33).reason
     capped = GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, _DEV, device_cc=_SM107, decode_q_tile_max=32).decode
-    assert capped.q_tile_max == 32 and [r.pack_gqa for r in capped.routes] == [True] * 4 + [False] * 5 and capped.route(3).token_units == 2
-    assert not d.route(32).served and not d.route(33).served
+    assert capped.q_tile_max == 32 and [r.pack_gqa for r in capped.routes] == [True] * 4 + [False] * 29 and capped.route(3).token_units == 2
+    assert all(r.served for r in capped.routes[:-1]) and not capped.routes[-1].served
+    # the programmatic-dependent-launch readbacks: the switched stage kinds per form, stage (4) on a decode-tile route only
+    assert d.pdl_stages == ("qk_norm_rope", "cache_write", "sigmoid_gate", "sdpa") and env.extend.pdl_stages == ("qk_norm_rope", "cache_write", "sigmoid_gate")
+    assert all(r.pdl_capable is r.decode_tile for r in d.routes) and d.route(1).pdl_capable and not d.route(33).pdl_capable
+    g16, _ = _geom(16)
+    e16 = GatedAttentionBlockFwd.serving_envelope(g16, torch.bfloat16, _DEV, device_cc=_SM107).decode
+    assert e16.route(4).pdl_capable and not e16.route(5).pdl_capable and e16.route(5).prefill_tile and e16.route(9).pdl_capable
     # (the table's `sparse` row is the PACKED form's since 2026-10-14: a dense QsaSpec declaration over the pools is the block-sparse decode mode)
-    assert set(d.declines) == {"write_through", "decode_s_q", "decode_rows", "diagonal", "window", "head_dim", "return_lse", "token_capacity_dense"}
+    assert set(d.declines) == {"write_through", "decode_rows", "diagonal", "window", "head_dim", "return_lse", "token_capacity_dense"}
     f16 = GatedAttentionBlockFwd.serving_envelope(geom, torch.float16, _DEV, device_cc=_SM107)
     assert f16.decode.served and f16.extend.served
 
@@ -552,13 +585,17 @@ def test_declaration_rows_are_typed_and_name_the_feature():
         _make_block(16, 2, 1, max_kv_len=0)
     with pytest.raises(ValueError, match="decode_split_kv must be None"):
         _make_block(16, 2, 1, decode_split_kv=0)
-    # past the declared envelope (S_q 8) a dense step over the pools is the EXTEND form's packed business: raised at declaration
-    with pytest.raises(NotImplementedError, match=f"serves S_q <= {DECODE_MAX_S_Q}.*EXTEND form"):
-        _make_block(16, 2, 33)
+    # past the served envelope (S_q 32: the unpacked arm's widest step) a dense step over the pools is the EXTEND form's packed business:
+    # raised at declaration; S_q 8 rides the prefill tile at this group, S_q 9 .. 32 the decode tile unpacked (16 streams)
     with pytest.raises(NotImplementedError, match=f"serves S_q <= {DECODE_MAX_S_Q}.*EXTEND form"):
         _make_block(16, 2, DECODE_MAX_S_Q + 1)
-    blk8, _ = _make_block(16, 2, DECODE_MAX_S_Q)
+    with pytest.raises(NotImplementedError, match=f"serves S_q <= {DECODE_MAX_S_Q}.*EXTEND form"):
+        _make_block(16, 2, 100)
+    blk8, _ = _make_block(16, 2, 8)
     assert blk8.decode_route.served and blk8.decode_route.prefill_tile and blk8.decode_route.pack_gqa and blk8.decode_route.kv_streams == 1
+    blk32, _ = _make_block(16, 2, DECODE_MAX_S_Q)
+    assert blk32.decode_route.served and blk32.decode_route.decode_tile and not blk32.decode_route.pack_gqa and blk32.decode_route.kv_streams == 16
+    assert blk32.decode_route.n_q == 32 and _make_block(16, 2, 9)[0].decode_route.n_q == 16
     # quant and save_for_backward with the attribute stay the write-through's own typed declines (named in the extend module)
     with pytest.raises(NotImplementedError, match="save_for_backward"):
         _make_block(16, 2, 1, save_for_backward=True, inplace_qkv=False, return_lse=True)
@@ -634,9 +671,15 @@ def test_declaration_facts(group, s_q):
     assert not blk_s.cache_write_fused and [st.name for st in blk_s._stages] == ["qkv_gate_proj_norm_rope", "cache_write", "sdpa"] + (
         [] if blk_s.gate_fused else ["sigmoid_gate"]
     ) + ["out_proj"]
-    # the knob and the write-through arm under the lowering: typed
-    with pytest.raises(NotImplementedError, match="fuse_cache_write=True at decode row counts"):
-        _make_block(group, 4, s_q, fuse_norm_rope=True, fuse_cache_write=True)
+    # an explicit fuse_cache_write=True is a REQUEST only the fused fork honours (the write-through arm lives in its epilogue): under the
+    # AUTO lowering the request outranks the heuristic and the fork runs -- never the separate write, never a decline
+    blk_w, _ = _make_block(group, 4, s_q, fuse_gate=True, fuse_norm_rope=True, decode_split_kv=None if torch.cuda.is_available() else 2, fuse_cache_write=True)
+    assert blk_w.fuse_cache_write is True and blk_w.fuse_norm_rope_small_m is None and blk_w.small_m_decode and blk_w.fuse_norm_rope_effective
+    assert blk_w.cache_write_fused and blk_w._cache_write is None and blk_w._norm_rope is None and blk_w._proj.kv_pool_page_size == blk_w.paged_kv_page_size
+    assert [st.name for st in blk_w._stages] == [st.name for st in blk_f._stages]
+    # the explicit contradiction -- the lowering asked for by name AND the arm that lives in the fork -- is the typed decline, naming both
+    with pytest.raises(NotImplementedError, match="fuse_cache_write=True with fuse_norm_rope_small_m=False"):
+        _make_block(group, 4, s_q, fuse_norm_rope=True, fuse_cache_write=True, fuse_norm_rope_small_m=False)
     with pytest.raises(ValueError, match="fuse_norm_rope_small_m=True: the knob decides"):
         _make_block(group, 4, s_q, fuse_norm_rope=False, fuse_norm_rope_small_m=True)
     with pytest.raises(TypeError, match="fuse_norm_rope_small_m must be None"):
@@ -676,6 +719,12 @@ def test_the_small_m_lowering_follows_the_row_count_and_leaves_the_other_forms_a
     assert ctl.small_m_decode and ctl.fuse_norm_rope_effective and ctl.cache_write_fused and ctl._norm_rope is None
     explicit = at(32, 4, fuse_norm_rope_small_m=False)
     assert explicit.fuse_norm_rope_small_m is False and not explicit.fuse_norm_rope_effective
+    # an explicit write-through request keeps the fork under AUTO (user request > heuristic proposal); past the bound it changes nothing
+    asked = at(32, 4, fuse_cache_write=True)
+    assert asked.small_m_decode and asked.fuse_norm_rope_effective and asked.cache_write_fused and asked._norm_rope is None and asked._cache_write is None
+    assert at(129, 1, fuse_cache_write=True).fuse_norm_rope_effective and at(32, 4, fuse_cache_write=False).fuse_norm_rope_effective is False
+    with pytest.raises(NotImplementedError, match="fuse_cache_write=True with fuse_norm_rope_small_m=False"):
+        at(32, 4, fuse_cache_write=True, fuse_norm_rope_small_m=False)
     assert at(129, 1, fuse_norm_rope_small_m=False).fuse_norm_rope_effective, "False lowers at decode row counts only; past the bound the fork stays"
     unfused = _make_block(12, 4, 4, fuse_norm_rope=False)[0]
     assert not unfused.fuse_norm_rope and not unfused.fuse_norm_rope_effective and unfused._norm_rope is not None
@@ -1082,6 +1131,14 @@ def test_the_fused_fork_control_arm_matches_the_oracle_at_decode_row_counts(s_q)
     dflt.check_against_oracle(b, what="the lowered chain (default)")
     assert torch.equal(a[~ctl.live], b[~dflt.live]) and (a[~ctl.live] == 0).all()
     assert _cos(a[ctl.live], b[dflt.live]) > 0.9999
+    # the explicit write-through request (fuse_cache_write=True under AUTO) runs the same fork: the same stage list, BITWISE the control arm
+    asked = _case(("asked", 12, s_q), 12, s_q, _LENS, blk_kw=dict(fuse_cache_write=True))
+    assert asked.blk.fuse_norm_rope_small_m is None and asked.blk.fuse_norm_rope_effective and asked.blk.cache_write_fused
+    assert [st.name for st in asked.blk._stages] == [st.name for st in ctl.blk._stages]
+    c = asked.run().clone()
+    asked.check_against_oracle(c, what="the fused fork (the explicit write-through request)")
+    assert torch.equal(c, a), "the explicit request and the control arm run the same kernels: bitwise"
+    assert torch.equal(_bits(asked.k_cache), _bits(ctl.k_cache)) and torch.equal(_bits(asked.v_cache), _bits(ctl.v_cache))
 
 
 @requires_rubin
@@ -1098,19 +1155,20 @@ def test_s_q_five_rides_the_prefill_tile_at_sixteen_the_64_column_tile_at_twelve
         assert r.n_q == {16: 0, 12: 64, 8: 64, 6: 32, 4: 32}[group] and (r.n_q == 0 or rb["n_q"] == r.n_q), (group, r, rb)
 
 
-def test_past_s_q_eight_the_step_is_a_typed_decline_the_envelope_predicts():
-    """A dense step past the DECLARED envelope (``S_q = 9``: beyond the MTP-7 verify step) is the EXTEND form's packed business over
-    the pools: the route says not served with the reason (the EXTEND form), the declaration raises it, the envelope predicts it --
-    no silent fall-through; ``S_q = 8`` is served at every group."""
+def test_past_s_q_32_the_step_is_a_typed_decline_the_envelope_predicts():
+    """A dense step past the SERVED envelope (``S_q = 33``: past the unpacked arm's 32-column tile) is the EXTEND form's packed business
+    over the pools: the route says not served with the reason (the EXTEND form), the declaration raises it, the envelope predicts it --
+    no silent fall-through; ``S_q = 32`` is served at every group (the decode tile, unpacked or packed, or the prefill tile)."""
     for group in sorted(_GROUPS):
         geom, _ = _geom(group)
         r = decode_route(geom, DECODE_MAX_S_Q + 1)
         assert not r.served and r.tile is None and "EXTEND form" in r.reason and r.n_q == 0 and r.kv_streams == 0
-        assert decode_route(geom, DECODE_MAX_S_Q).served and decode_route(geom, DECODE_MAX_S_Q).s_q * group <= DECODE_MAX_ROWS
+        assert decode_route(geom, DECODE_MAX_S_Q).served and decode_route(geom, DECODE_MAX_S_Q).s_q <= DECODE_MAX_ROWS
         with pytest.raises(NotImplementedError, match=f"serves S_q <= {DECODE_MAX_S_Q}.*EXTEND form"):
             _make_block(group, 2, DECODE_MAX_S_Q + 1)
         env = GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, _DEV, device_cc=_SM107)
         assert not env.decode.route(DECODE_MAX_S_Q + 1).served and env.decode.max_rows == DECODE_MAX_ROWS and env.decode.max_s_q == DECODE_MAX_S_Q
+        assert env.decode.route(DECODE_MAX_S_Q).served and env.decode.route(9).served
 
 
 # The 397B shards at their REAL width (d_model 4096; the layout contract pins n_qkvg 8704 / 4608 / 2560): 16 / 1 (TP 2) rides group
@@ -1146,7 +1204,7 @@ def test_the_397b_shards_ride_their_groups_routes_and_the_envelope_serves_both_f
         env = GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, _DEV, device_cc=_SM107)
         assert env.forms == ("extend", "decode") and env.extend.served and env.decode.served, (name, env.extend.reason, env.decode.reason)
         assert env.decode.route(1).claimed and env.decode.route(DECODE_MAX_S_Q).served and not env.decode.route(DECODE_MAX_S_Q + 1).served
-        assert env.decode.route(DECODE_MAX_S_Q).kv_streams == 1, "every shard's group divides the prefill tile: one KV stream at every S_q <= 8"
+        assert all(env.decode.route(s).kv_streams == 1 for s in range(1, 9)), "every shard's group divides the prefill tile: one KV stream at every S_q <= 8"
 
 
 @requires_rubin

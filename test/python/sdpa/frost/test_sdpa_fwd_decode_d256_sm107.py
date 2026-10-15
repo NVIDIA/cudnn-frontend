@@ -458,6 +458,61 @@ def test_sm107_row_and_predicate_agree_on_the_decode_tile():
     assert not engines.d256_decode_tile_selected(caps, SdpaGraphFacts(**{**causal, "s_q": 11}), 12)  # 132 rows: a third unit, past the route
 
 
+def test_sm107_facts_twin_rule_and_ranked_list_agree_on_the_packed_decode_tile():
+    """The three readings of the Rubin d256 decode route agree over a grid of (group, S_q, paged, masked): the facts twin
+    (``engines.decode_d256_q_tile_for_row`` + ``_facts_decode_form``) equals the config's rule (``config_sm107.decode_d256_q_tile`` --
+    what the adapter's ``_decode_q_tile_for`` calls with its own facts, pinned on a device by
+    ``test_decode_adapter_routes_decode_shaped_graphs_only``), and for a PAGED dense-Q graph the row's facts-only admission and the
+    RANKED LIST follow that rule: the row is eligible iff SOME packing rides the tile, the list holds a packed set iff the packed twin
+    is non-zero and an unpacked set iff the unpacked twin is -- so the heuristics never price a form the list cannot offer.  The gate
+    this pins: the facts-only question (no knob set) asked the unpacked packing alone, which dropped the row at 4 / 2, ``S_q`` 33 under
+    the causal mask (66 packed rows = two 64-column units; 33 unpacked rows past the 32-column tile) while the twins routed it; the
+    graph-level pin in ``test_decode_routing_boundary`` is its GPU twin."""
+    import cudnn
+    from cudnn.sdpa.fwd import config_sm107, engines, heuristics
+    from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
+
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _engine())
+    caps = spec.capabilities
+    offered = {spec.name: 20700}
+
+    def facts(group, s_q, paged, masked):
+        kw = dict(b=2, h_q=2 * group, h_kv=2, s_q=s_q, s_kv=700, d_qk=D, d_v=D, dtype=cudnn.data_type.HALF, padded=True, device_cc=(10, 7), device_sm_count=204)
+        if paged:
+            kw.update(has_paged_kv=True, page_size=16)
+        if masked:
+            kw.update(causal=True, bottom_right=True, right_bound=0)
+        return SdpaGraphFacts(**kw)
+
+    checked = 0
+    for group in (1, 2, 3, 4, 8, 12, 16):
+        for s_q in (1, 2, 4, 5, 8, 9, 11, 16, 17, 32, 33, 40, 48, 64, 65):
+            for paged in (False, True):
+                for masked in (False, True):
+                    f = facts(group, s_q, paged, masked)
+                    assert engines._facts_decode_form(f) == (paged, masked)
+                    for pack_g in {1, group}:
+                        twin = engines.decode_d256_q_tile_for_row(caps, s_q, pack_g, *engines._facts_decode_form(f))
+                        assert twin == config_sm107.decode_d256_q_tile(s_q, pack_g, paged=paged, masked=masked), (group, s_q, paged, masked, pack_g, twin)
+                    if not paged:
+                        continue  # over a dense cache the d256 prefill kernel serves every graph: the row is eligible whatever the tile says
+                    packed_rides = group > 1 and engines.d256_decode_tile_selected(caps, f, group)
+                    unpacked_rides = engines.d256_decode_tile_selected(caps, f, 1)
+                    reason = engines.mismatch(caps, f, None)
+                    assert (reason is None) is (packed_rides or unpacked_rides), (group, s_q, masked, reason)
+                    plans = heuristics.recommend("A", f, offered) if reason is None else []
+                    assert all(engines.mismatch(caps, f, p.knobs) is None for p in plans)
+                    assert any(p.knobs.pack_gqa is True for p in plans) is packed_rides, (group, s_q, masked, [p.knobs for p in plans])
+                    assert any(not p.knobs.pack_gqa for p in plans) is unpacked_rides, (group, s_q, masked, [p.knobs for p in plans])
+                    checked += 1
+    assert checked == 7 * 15 * 2
+    # the cell of record: 4 / 2 at S_q 33 over pages under the causal mask -- the packed set alone
+    f = facts(2, 33, True, True)
+    assert engines.decode_d256_q_tile_for_row(caps, 33, 2, True, True) == 64 and engines.mismatch(caps, f, None) is None
+    plans = heuristics.recommend("A", f, offered)
+    assert plans and all(p.knobs.pack_gqa is True for p in plans), [p.knobs for p in plans]
+
+
 def test_sm107_row_predicate_and_heuristics_agree_on_the_gated_decode_tile():
     """The gate-in-combine contract at the facts level, on the Rubin row: a GATED decode-shaped half
     d256 graph (the ``mul(O_v, sigmoid(G))`` tail) is served on the decode tile through its SPLIT --
@@ -1676,9 +1731,10 @@ def test_decode_adapter_dense_pack_and_split_follow_the_tile():
         api(s_q=1, H=24, KH=2, pack=True, split=2, seq_lens=True)  # a PADDED dense split: the shared structural rule
 
 
-def _paged_graph_offers_engine(*, B, H, KH, s_q, d, lens, page=16, causal_br=False):
+def _paged_graph_offers_engine(*, B, H, KH, s_q, d, lens, page=16, causal_br=False, packed=None):
     """Build a paged dense-Q graph and report whether the Rubin FROST engine lists ANY plan for it
-    (a typed absence at plan creation, never a bare error)."""
+    (a typed absence at plan creation, never a bare error); ``packed=True`` asks whether a PACKED plan
+    (``PACK_GQA=1`` in the plan name) is among them, ``packed=False`` whether the engine's plans are all unpacked."""
     import cudnn
 
     torch.manual_seed(0)
@@ -1711,7 +1767,11 @@ def _paged_graph_offers_engine(*, B, H, KH, s_q, d, lens, page=16, causal_br=Fal
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    return offers_engine(g, _engine())
+    if packed is None:
+        return offers_engine(g, _engine())
+    ours = [g.get_plan_name_at_index(i) for i in range(len(g.plans)) if _is_plan_for(g.get_plan_name_at_index(i), _engine())]
+    has_packed = [n for n in ours if "PACK_GQA=1" in n]
+    return bool(has_packed) if packed else (bool(ours) and not has_packed)
 
 
 @_gpu
@@ -1760,11 +1820,17 @@ def test_decode_routing_boundary():
     assert _paged_graph_offers_engine(
         B=2, H=32, KH=2, s_q=5, d=D, lens=[700, 130]
     ), "32/2 at S_q = 5 over a paged cache WITHOUT a mask: the packed 80 rows are past the (16, 32) table, but the UNPACKED arm serves 5 rows per head"
-    # (the width's form predicate -- a mask-free PAGED packed step keeps the (16, 32) table -- is pinned at the adapter level above
-    # (test_decode_adapter_routes_decode_shaped_graphs_only) and at the facts level (test_sm107_row_and_predicate_agree_on_the_decode_tile);
-    # a graph-level twin needs a packed step the unpacked arm cannot serve, i.e. S_q > 32, where the plan list offered no packed set for
-    # 4/2 at S_q 33 under the causal mask on the development node -- which gate keeps the two-unit 64-column form off the ranked list there
-    # is an open item, not a pin)
+    # the width's form predicate at the GRAPH level: a packed step the unpacked arm cannot serve (S_q > 32) is offered under the causal
+    # mask -- 4/2 at S_q 33: 66 packed rows = two 64-column units, the PACKED plan the only one (the row's facts-only admission asks whether
+    # SOME packing rides the tile; until 2026-10-15 it asked the unpacked question alone and the ranked list offered nothing here) -- and
+    # not without the mask (the predicate declines the width over pages, and 33 unpacked rows are past the 32-column tile)
+    assert _paged_graph_offers_engine(
+        B=2, H=4, KH=2, s_q=33, d=D, lens=[700, 130], causal_br=True, packed=True
+    ), "4/2 at S_q = 33 over a paged cache under the causal mask: the packed two-unit 64-column form is the plan"
+    assert not _paged_graph_offers_engine(B=2, H=4, KH=2, s_q=33, d=D, lens=[700, 130]), "4/2 at S_q = 33 over a paged cache WITHOUT a mask: nothing"
+    assert (
+        _paged_graph_offers_engine(B=2, H=4, KH=2, s_q=32, d=D, lens=[700, 130], causal_br=True, packed=False) is False
+    ), "4/2 at S_q = 32 under the mask lists the packed 64-column unit (and the unpacked 32-column tile)"
     assert not _paged_graph_offers_engine(B=2, H=8, KH=2, s_q=65, d=D, lens=[700, 130], causal_br=True), "65 tokens per head over a paged cache"
     assert not _paged_graph_offers_engine(B=2, H=8, KH=2, s_q=1, d=128, lens=[700, 130]), "paged d128 decode graph: no Rubin d128 decode tile"
 
@@ -2286,9 +2352,11 @@ _SM107_DECODE_SPILL_PROBE = textwrap.dedent("""
         kw.update(paged_kv=True, page_size=16)
     if "br" in toks:
         kw.update(bottom_right=True, window_right=0, seq_q_lens_present=True)
+    if "swa" in toks:
+        kw.update(window_left=255)  # a left window: the record's MASK_SWA bit, the other mask the width's predicate admits over pages
     mod = _load_sm100_kernel_module((256, 256), TemplateParams(**kw), rubin=True)
     print("MODULE", mod.N_Q, mod.CFG.SOFTMAX_WARPS, mod.CFG.THREADS_PER_CTA)
-    mod.compile(d_qk=256, d_v=256, has_lse=True, paged_hnd="hnd" in toks)
+    mod.compile(d_qk=256, d_v=256, has_lse=True, paged_hnd="hnd" in toks, **(dict(use_pdl=True) if "pdl" in toks else {}))
     cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
     if not cubins:
         print("FAIL no cubin dumped into", dump, os.listdir(dump)); sys.exit(3)
@@ -2334,15 +2402,22 @@ def _nvdisasm_candidates():
         pytest.param(12, "paged+br+hnd", id="24to2_mtp_paged_hnd"),
         pytest.param(16, "paged+br+split4", id="32to2_mtp_paged_split4"),
         pytest.param(16, "dense", id="32to2_dense_padded"),
+        pytest.param(2, "paged+br", id="g2_paged_br"),
+        pytest.param(2, "paged+swa", id="g2_paged_swa"),
+        pytest.param(12, "paged+br+hnd+pdl", id="24to2_mtp_paged_hnd_pdl"),
     ],
 )
 def test_sm107_decode_wide_tile_renderings_carry_no_spill(tmp_path, g, form):
     """The 64-column tile's register budget, pinned on the SASS (no Rubin GPU: an sm_107a trace-compile in a subprocess, the
     file's SASS-pin recipe): the 18-warp CTA's rendering stays SPILL-FREE at ptxas's 96-register cap on the admitted forms --
-    the 24/2 MTP step over HND pools, the 32/2 MTP step with split partials, a dense padded cache.  The keyed max exchange, the
-    ftz max intrinsics, the x8 O^T readbacks and the two-half epilogue of the shared body exist for this pin; a spill here is
-    a perf regression no numerics test sees (local-memory traffic in the hottest loop).  Skips when no nvdisasm on
-    $CUDA_PATH/bin or $PATH decodes the cubin; a compile failure is a FAIL."""
+    the 24/2 MTP step over HND pools, the 32/2 MTP step with split partials, a dense padded cache, and the admitted forms nearest
+    the spill edge: a packed group of TWO heads over pages (eight distinct causal thresholds per 16-column group) under the
+    bottom-right causal mask and under a left WINDOW (the predicate's other mask), plus the 24/2 step with the programmatic-
+    dependent-launch sites traced (the griddepcontrol pair must add no register pressure).  The keyed max exchange, the ftz max
+    intrinsics, the x8 O^T readbacks and the two-half epilogue of the shared body exist for this pin; a spill here is a perf
+    regression no numerics test sees (local-memory traffic in the hottest loop) -- an arm that spills is a form the config must
+    REFUSE (decode_d256_wide_tile_admits), never a silent admit.  Skips when no nvdisasm on $CUDA_PATH/bin or $PATH decodes the
+    cubin; a compile failure is a FAIL."""
     cands = _nvdisasm_candidates()
     if not cands:
         pytest.skip("no nvdisasm executable to try (CUDA_PATH unset and none on PATH)")

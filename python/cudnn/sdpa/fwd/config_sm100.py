@@ -1332,7 +1332,7 @@ def make_cfg_d256_decode(params: TemplateParams, q_tiles: Tuple[int, ...] = _D25
     ``q_tiles`` (appended): the tile widths the calling arch line compiles.
     The default is this line's ``_D256_DECODE_Q_TILES`` (16, 32: what 227 KiB
     holds); ``config_sm107.make_cfg_d256_decode`` passes the Rubin set, which
-    adds the 64-column tile (four softmax groups, 259 KiB of SMEM under the
+    adds the 64-column tile (four softmax groups, 258 KiB of SMEM under the
     320 KiB Rubin carveout) and re-validates the record against its own facts.
     """
     if params.qsa_block_topk or params.qsa_block_size or params.qsa_softmax_groups:

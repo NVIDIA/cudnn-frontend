@@ -2306,7 +2306,7 @@ def make_cfg_d256_sparse(params: TemplateParams, *, gather_warps: int = 8, softm
 #     capacity (the d192 f16 50 %-zeros lesson above).  The tile's slabs -- Q^T, the
 #     3-slot 64 KiB K/V ring, two P^T tiles, the reduction scratch -- sum to ~209 KiB at
 #     N_Q = 16 and ~226 KiB at N_Q = 32, so those two widths fit the STANDARD 227 KiB
-#     carveout (no oversized-SMEM launch, no L1 shrink); the 64-column tile's ~259 KiB take
+#     carveout (no oversized-SMEM launch, no L1 shrink); the 64-column tile's 258 KiB (264,080 B) take
 #     the OVERSIZED carveout (L1 -> 8 kB, which costs this TMA-fed tile nothing it uses) --
 #     the one width in _D256_DECODE_OVERSIZED_Q_TILES, admitted after its launch was VERIFIED
 #     on cc 10.7 (the DSL sets the dynamic-SMEM attribute from the module's own total, the
@@ -2327,7 +2327,7 @@ _D256_DECODE_BARRIER_WORDS = 1 + 2 * 3 + 2 * 4 + 1  # q_full, kv_full/empty x ST
 # 16-column softmax groups (16 softmax warps + the MMA warp + the TMA warp = 18 warps / 576 threads), ONE unit of up to 64
 # packed rows, so an MTP step of four tokens x 12 / 16 heads (48 / 64 rows) streams the KV range ONCE where the 32-column
 # tile cuts it into two token units (each a second read of the whole KV).  Its budgets (the barrier / SMEM / TMEM / register
-# tables written with the change): SMEM 259 KiB (the oversized carveout), TMEM 256 columns, the barrier inits scale through SOFTMAX_LANES
+# tables written with the change): SMEM 258 KiB = 264,080 B (the oversized carveout), TMEM 256 columns, the barrier inits scale through SOFTMAX_LANES
 # (512), and ptxas caps the 18-warp CTA at 96 registers per thread (16384 per SM sub-partition / (5 warps x 32),
 # 8-granular -- the per-thread work is width-independent and the sm_107a rendering carries no spill).  Whether the ROUTE
 # sends a step to it is the route table's decision below (D256_DECODE_SINGLE_UNIT_Q_TILES names the widths it routes); a
