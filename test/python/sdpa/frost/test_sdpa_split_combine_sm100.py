@@ -301,14 +301,14 @@ def test_pointer_combine_folds_the_sink_once():
 
 @pytest.mark.parametrize("sink", [False, True], ids=["plain", "sink"])
 @pytest.mark.parametrize("d", [128, 66], ids=["fp32_rows_d128", "elementwise_d66"])
-@pytest.mark.parametrize("splits", [2, 4, 5, 8, 9, 12, 16, 17, 21, 37], ids=lambda s: f"split{s}")
+@pytest.mark.parametrize("splits", [2, 4, 5, 8, 9, 12, 16, 17, 21, 37, 64, 100, 128], ids=lambda s: f"split{s}")
 @pytest.mark.parametrize("sq", [1, 2, 5], ids=lambda s: f"sq{s}")
 def test_pointer_combine_walks_many_splits(sq, splits, d, sink):
     """Both forms of the one-warp-per-row kernel across the split axis.  The lean form (aligned fp32 rows, d % 4 == 0) serves
     n_splits <= G_S: every split's LSE and partial-O row is loaded up front through a clamped index, in a group of G_LEAN_SMALL (8) for the common few
     splits and of G_S (16) beyond that.  Past G_S -- and always for d = 66, whose rows take bounded element loads -- the serial form walks the splits in
     two legs, sixteen deep and then four deep (``_serial_legs`` and the ``_accumulate_splits`` helper).  2 to 17 splits stay below a full serial group
-    (tail leg only; 2 to 8 are the narrow lean group for d = 128, 9 to 16 the wide one), 21 takes one group plus a remainder, 37 two; row 0 has every
+    (tail leg only; 2 to 8 are the narrow lean group for d = 128, 9 to 16 the wide one), 21 takes one group plus a remainder, 37 two; 64 to 128 are the long walks of a b = 1 long-KV decode (the decode form's O pass keeps eight splits in flight per warp); row 0 has every
     split dead and split 1 is dead on row 1, so the dead-split select runs inside every form.  The sink arm seeds the denominator with the sink column
     and lands the keyless row on ``O := 0 / LSE := sink``.
     S_q = 1 and 2 are the decode rows: past G_S splits they take the decode form (the block's warps share the split axis), within G_S the
