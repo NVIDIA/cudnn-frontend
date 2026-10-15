@@ -1057,7 +1057,9 @@ def test_decode_matches_the_oracle_at_every_group_and_s_q(group, s_q):
     else:
         assert r.prefill_tile and rb["file"].endswith("/sm100/prefill_d256_f16.py") and rb["heads_per_tile"] == group and rb["n_q"] is None, rb
         assert rb["epilogue_gate"] is True and case.blk.gate_fused and case.blk.decode_split_kv == 1, "the gate rides the paged body's epilogue"
-    assert r.claimed is (s_q <= DECODE_CLAIMED_MAX_S_Q and r.pack_gqa and r.decode_tile)
+    assert r.claimed is (
+        s_q <= DECODE_CLAIMED_MAX_S_Q and r.pack_gqa and r.decode_tile and r.n_q <= DECODE_CLAIMED_MAX_N_Q
+    )  # the 64-column cells: routed, not claimed
     k0, v0 = case.block0_bits
     assert torch.equal(_bits(case.k_cache[0]), k0) and torch.equal(_bits(case.v_cache[0]), v0), "block 0 (the NULL block) must never be written"
 
@@ -1620,7 +1622,11 @@ def test_decode_s_q_four_on_the_64_column_tile_equals_the_two_unit_route_bitwise
     the same order): the block's ``out`` is BITWISE equal -- the width moves rows between CTAs, it never changes the arithmetic
     (the SDPA suite's cross-form pin, at the block level); the cap reads back on the route and on the compiled module."""
     wide = _w64_case(group, blk_kw={"decode_split_kv": 2})
-    narrow = _case(("s2cap32", group, 4), group, 4, _LENS, blk_kw={"decode_split_kv": 2, "decode_q_tile_max": 32})
+    # the cap alone sends 32 / 2 at S_q 4 (64 rows) to the PREFILL tile under the default policy; the two-unit 32-column route is the cap
+    # under token_units (the adapter's route before the width landed) -- at 24 / 2 the policies coincide
+    narrow = _case(
+        ("s2cap32", group, 4), group, 4, _LENS, blk_kw={"decode_split_kv": 2, "decode_q_tile_max": 32, "decode_route_policy": DECODE_ROUTE_TOKEN_UNITS}
+    )
     assert (wide.blk.decode_route.n_q, wide.blk.decode_route.token_units) == (64, 1) and (narrow.blk.decode_route.n_q, narrow.blk.decode_route.token_units) == (
         32,
         2,

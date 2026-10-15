@@ -1757,9 +1757,17 @@ def test_decode_routing_boundary():
         B=2, H=24, KH=2, s_q=11, d=D, lens=[700, 130], causal_br=True
     ), "24/2 at S_q = 11 over a paged cache: decode-shaped unpacked (11 rows per head)"
     assert _paged_graph_offers_engine(B=2, H=24, KH=2, s_q=4, d=D, lens=[700, 130]), "24/2 at S_q = 4 over a paged cache WITHOUT a mask: two 32-column units"
-    assert not _paged_graph_offers_engine(
+    assert _paged_graph_offers_engine(
         B=2, H=32, KH=2, s_q=5, d=D, lens=[700, 130]
-    ), "32/2 at S_q = 5 over a paged cache WITHOUT a mask: 80 rows, a third 32-column unit (the 64-column width declines the mask-free paged form)"
+    ), "32/2 at S_q = 5 over a paged cache WITHOUT a mask: the packed 80 rows are past the (16, 32) table, but the UNPACKED arm serves 5 rows per head"
+    # the width's form predicate at the graph level: 4/2 at S_q 33 (66 packed rows) rides two units of the 64-column tile under the causal
+    # mask; WITHOUT a mask over pages the width is declined (a third 32-column unit) and the unpacked arm cannot take 33 rows either
+    assert _paged_graph_offers_engine(
+        B=2, H=4, KH=2, s_q=33, d=D, lens=[700, 130], causal_br=True
+    ), "4/2 at S_q 33 over a paged cache, causal: two 64-column units"
+    assert not _paged_graph_offers_engine(
+        B=2, H=4, KH=2, s_q=33, d=D, lens=[700, 130]
+    ), "4/2 at S_q 33 over a paged cache WITHOUT a mask: the 64-column width declines the mask-free paged form, 33 rows exceed the unpacked tile"
     assert not _paged_graph_offers_engine(B=2, H=8, KH=2, s_q=65, d=D, lens=[700, 130], causal_br=True), "65 tokens per head over a paged cache"
     assert not _paged_graph_offers_engine(B=2, H=8, KH=2, s_q=1, d=128, lens=[700, 130]), "paged d128 decode graph: no Rubin d128 decode tile"
 
