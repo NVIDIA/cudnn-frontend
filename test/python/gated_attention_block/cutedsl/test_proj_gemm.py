@@ -1076,6 +1076,16 @@ def test_small_m_route_is_dense_k_major_bf16_only(kwargs):
     assert small_m_tile_config(4, _FLASH_NEXT_24_2["n_qkvg"], _FLASH_NEXT_24_2["d_model"], sm_count=_RUBIN_SMS, **kwargs) is None
 
 
+@pytest.mark.parametrize("m, n, k", [(1, 0, 32 * 256), (0, 2560, 6144), (1, 2560, 0), (-1, 2560, 6144)], ids=["n0_deep_k", "m0", "k0", "m_negative"])
+def test_small_m_route_declines_non_positive_extents(m, n, k):
+    """A non-positive extent never reaches the route's one-wave arithmetic (``n = 0`` with a deep K divided by a zero CTA count
+    before the driver's own extent check could name it; ``m = 0`` or ``k = 0`` spelled a tile): the route declines, and
+    ``build_proj_gemm`` names the extent as it always did."""
+    assert small_m_tile_config(m, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS) is None
+    with pytest.raises(ValueError, match="must be > 0"):
+        build_proj_gemm(m=m, k=k, n=n, dtype=torch.bfloat16, label="extent")
+
+
 @requires_rubin
 @pytest.mark.parametrize("m", [1, 4, 32, 128])
 @pytest.mark.parametrize("shape", ["qkvg", "out"])

@@ -1324,9 +1324,13 @@ def small_m_tile_config(
     sm_count: Optional[int] = None,
 ) -> Optional[str]:
     """The catalog config name of the small-M route for a ``[m, k] x [k, n]`` projection, or None when the route does not
-    apply (``m > SMALL_M_MAX``, a dtype other than bf16 / f16, a block-scale or fp8 plan, an MN-major operand, an extent the
-    TMA 16-byte rule refuses).  ``sm_count`` is the target's SM count (the active device when None); the SAME shape resolves
+    apply (a non-positive extent, ``m > SMALL_M_MAX``, a dtype other than bf16 / f16, a block-scale or fp8 plan, an MN-major
+    operand, an extent the TMA 16-byte rule refuses).  ``sm_count`` is the target's SM count (the active device when None); the SAME shape resolves
     to the same name on every part of one SM-count class, so a recorded plan name replays."""
+    if m <= 0 or n <= 0 or k <= 0:
+        # a non-positive extent never reaches the one-wave arithmetic below (``n = 0`` would divide by a zero CTA count, ``m`` or
+        # ``k`` at 0 would still spell a tile): the route declines and ``build_proj_gemm``'s own extent check names the extent
+        return None
     if m > SMALL_M_MAX or block_scale or alpha:
         return None
     if dtype not in (torch.bfloat16, torch.float16):
