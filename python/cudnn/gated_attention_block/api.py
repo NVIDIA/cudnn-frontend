@@ -1645,6 +1645,10 @@ class _Intermediates:
     kv_inv: int = -1  # [2] fp32: 1 / k_scale, 1 / v_scale
     kv_gathered: int = -1  # [B x S_q x H_kv, 2, 2176, 256] bf16
     kv_len_t: int = -1  # [B x S_q x H_kv] int32
+    # the DECODE form's PREFILL route only (-1 otherwise): the paged THD leg's per-sequence Q lengths -- the constant S_q of every
+    # sequence of the dense step -- a [B] int32 slot the block FILLS on the launch stream at every execute (Rule 8 / R2 + R4: never a
+    # plan-owned tensor, never written once behind a flag)
+    decode_q_lens: int = -1  # [B] int32
 
 
 _SF_TILE_ROWS = 128  # rows of one F8_128x4 scale-factor atom == the SDPA's Q / KV tile height (keep in step with kernels/quantize_mxfp8.py SF_TILE_ROWS)
@@ -1698,6 +1702,7 @@ def _plan_workspace(
     thd_num_sequences: int = 0,
     kv_cache_e4m3: bool = False,
     upcast_items: int = 0,
+    decode_q_lens: int = 0,
 ) -> _Intermediates:
     """Reserve every intermediate, in stage order, and report the total.
 
@@ -1743,6 +1748,15 @@ def _plan_workspace(
     is not reserved); on the fused arm the bf16 ``o`` the gated SDPA then writes
     takes ``o8``'s place.  Every layout with ``o_fp4=None`` is byte-identical to
     before (pinned by ``test_workspace_layout_is_byte_identical_without_fp4``).
+
+    ``decode_q_lens`` (appended; 0 = none) reserves, at the very END, the DECODE
+    form's PREFILL route's per-sequence Q lengths: ``decode_q_lens`` (= ``B``)
+    int32 words the block fills with the constant ``S_q`` on the launch stream
+    at every execute (Rule 8 recipes R2 + R4: the paged THD leg reads them on
+    device, the caller never hands them over, and a plan-owned tensor written
+    once behind a flag would leave an eager execute after a captured first
+    execute reading an unwritten vector).  Every layout with ``decode_q_lens=0``
+    is byte-identical to before.
 
     Reserved in the order the stages write them, so a future fusion that deletes
     one leaves a contiguous prefix rather than a hole — forking stage (1) to
@@ -1897,6 +1911,10 @@ def _plan_workspace(
         slots += [("kc8", t * geom.h_kv * geom.d_head), ("vc8", t * geom.h_kv * geom.d_head), ("kv_inv", 2 * 4)]
         if upcast_items:
             slots += [("kv_gathered", int(upcast_items) * 2 * _UPCAST_ROWS * _UPCAST_D * 2), ("kv_len_t", int(upcast_items) * 4)]
+    if decode_q_lens:
+        # The DECODE form's PREFILL route: the paged THD leg's per-sequence Q lengths ([B] int32, the constant S_q), carved here and
+        # filled on the launch stream by every execute (_fill_decode_q_lens).  At the END: every other layout is byte-identical to before.
+        slots += [("decode_q_lens", int(decode_q_lens) * 4)]
     for name, nbytes in slots:
         offsets[name] = off
         off += _align_up(nbytes)
@@ -1926,6 +1944,7 @@ def _plan_workspace(
         kv_inv=offsets.get("kv_inv", -1),
         kv_gathered=offsets.get("kv_gathered", -1),
         kv_len_t=offsets.get("kv_len_t", -1),
+        decode_q_lens=offsets.get("decode_q_lens", -1),
     )
 
 
@@ -6662,11 +6681,9 @@ class GatedAttentionBlockFwd(APIBase):
         # the ambient stream): compile() records an event behind it and every writer waits on that event first.
         self._quant_dev_ready = None
         # The DECODE form's prefill route: the per-sequence Q lengths of the paged THD leg -- the constant S_q for every sequence of the
-        # dense step -- as a [B] int32 device tensor: ALLOCATED in compile(), WRITTEN on the launch stream by the first execute
-        # (_write_decode_q_lens), the same discipline as the quant scalars above.  None on every other form.
-        self._decode_q_lens = None
-        self._decode_q_lens_written = False
-        self._decode_q_lens_ready = None
+        # dense step -- are NOT plan-owned memory (Rule 8 recipes R2 + R4): a [B] int32 slot of the caller's workspace
+        # (_Intermediates.decode_q_lens, reserved by _plan_workspace on that route only) that EVERY execute fills on its launch stream
+        # (_fill_decode_q_lens) -- no first-execute flag, so an eager execute after a captured first execute reads its own fill.
         # rstd exists only where a norm exists: under qk_norm=False a training
         # block saves lse / q_pre / k_pre but no rstd (SavedForBackward.rstd_*
         # are None -- required, both directions, at execute).
@@ -6801,8 +6818,8 @@ class GatedAttentionBlockFwd(APIBase):
             )
         else:
             # The DECODE form's PREFILL route: stage (4) is the EXTEND form's binding -- the adapter's paged THD leg with the group packed
-            # -- at the dense step's own envelope (num_sequences = B, max_seq_len = S_q, [B] int32 lengths all S_q: a plan-time constant the
-            # block writes on the launch stream, compile() / _write_decode_q_lens), unsplit, the gate in the body's epilogue.
+            # -- at the dense step's own envelope (num_sequences = B, max_seq_len = S_q, [B] int32 lengths all S_q: a workspace slot the
+            # block fills on the launch stream at every execute, _fill_decode_q_lens), unsplit, the gate in the body's epilogue.
             prefill_route = self.decode_route is not None and self.decode_route.prefill_tile
             self._sdpa = _Sdpa(
                 geometry,
@@ -7886,6 +7903,9 @@ class GatedAttentionBlockFwd(APIBase):
             thd_num_sequences=self.num_sequences if self.thd else 0,
             kv_cache_e4m3=self.kv_cache_e4m3,
             upcast_items=(self.batch * self.seq_len * self.geom.h_kv) if self.upcast_decode else 0,
+            # the prefill route's [B] int32 Q lengths (a declaration fact: the route is read at declaration, so get_workspace_size()
+            # before compile() already counts the slot)
+            decode_q_lens=self.batch if (self.decode_route is not None and self.decode_route.prefill_tile) else 0,
         )
 
     def get_workspace_size(self) -> int:
@@ -7917,17 +7937,8 @@ class GatedAttentionBlockFwd(APIBase):
             # deterministic mode a NaN fill -- is behind this event; _write_quant_dev waits on it before writing on any stream
             self._quant_dev_ready = torch.cuda.Event()
             self._quant_dev_ready.record(torch.cuda.current_stream(self.device))
-        # The DECODE form's PREFILL route: the paged THD leg reads the per-sequence Q lengths on device; on a dense step they are the
-        # constant S_q for every sequence -- ALLOCATED here (plan time; the execute path never allocates), never filled here: the FIRST
-        # execute writes the value on ITS launch stream (_write_decode_q_lens; a capture of that execute records the fill WITH its value
-        # and every replay re-writes the same constant), the event below orders the write behind the allocation's own stream work.
-        self._decode_q_lens = None
-        self._decode_q_lens_written = False
-        self._decode_q_lens_ready = None
-        if self.decode_route is not None and self.decode_route.prefill_tile:
-            self._decode_q_lens = torch.empty((self.batch,), dtype=torch.int32, device=self.device)
-            self._decode_q_lens_ready = torch.cuda.Event()
-            self._decode_q_lens_ready.record(torch.cuda.current_stream(self.device))
+        # The DECODE form's PREFILL route's per-sequence Q lengths are a workspace slot (_Intermediates.decode_q_lens, in self._ws above),
+        # filled by every execute on its launch stream (_fill_decode_q_lens): nothing to allocate or to record here.
 
     def _quant_dev_values(self, spec: Optional[Union[QuantSpec, MxQuantSpec]]) -> Optional[dict]:
         """The per-tensor scalars of ``spec`` the block holds as 1-element fp32 device tensors, as ``{name: float}`` -- the ONE
@@ -7998,18 +8009,17 @@ class GatedAttentionBlockFwd(APIBase):
         if self._ws is None:
             raise RuntimeError("call compile() before update_quant_scales(): the device scalars it rewrites are materialised there")
 
-    def _write_decode_q_lens(self, stream: int) -> None:
-        """Fill the prefill route's per-sequence Q lengths -- the constant ``S_q`` of every sequence of the dense step -- IN PLACE on
-        ``stream`` (a raw CUstream handle: the launch stream, so the SDPA that reads them is ordered behind the write by construction,
-        Rule 5).  One fill, nothing allocated, nothing read back.  The write first waits on the event ``compile()`` recorded behind the
-        allocation (under ``torch.use_deterministic_algorithms(True)`` ``torch.empty`` fills with NaN on the ambient stream); inside a
-        stream capture the wait is skipped (an external event cannot be waited on there) and the fill itself is captured WITH its value,
-        so every replay re-writes the same constant before the attention kernel -- the serving stacks' capture of a FIRST execute."""
-        ts = as_torch_stream(stream, self.device)
-        with torch.cuda.stream(ts):
-            if self._decode_q_lens_ready is not None and not torch.cuda.is_current_stream_capturing():
-                ts.wait_event(self._decode_q_lens_ready)
-            self._decode_q_lens.fill_(self.seq_len)
+    def _fill_decode_q_lens(self, workspace: torch.Tensor, stream: int) -> torch.Tensor:
+        """The prefill route's per-sequence Q lengths -- the constant ``S_q`` of every sequence of the dense step -- as the ``[B]`` int32
+        VIEW of the caller's workspace slot ``_Intermediates.decode_q_lens`` (Rule 8 recipe R2: carved, never allocated), FILLED on
+        ``stream`` (a raw CUstream handle: the launch stream, so the SDPA that reads them is ordered behind the fill by construction,
+        Rule 5) on EVERY execute (recipe R4: one fill of ``4 x B`` bytes, nothing read back, no first-execute flag).  A stream capture
+        of an execute records the fill WITH its value and every replay re-fills the slot before the attention kernel; an eager execute
+        after a capture -- replayed or not -- fills its own, so no execute ever hands the paged THD leg an unwritten vector."""
+        q_lens = _view(workspace, self._ws.decode_q_lens, (self.batch,), torch.int32)
+        with torch.cuda.stream(as_torch_stream(stream, self.device)):
+            q_lens.fill_(self.seq_len)
+        return q_lens
 
     def _write_quant_dev(self, spec, stream: int) -> None:
         """Write ``spec``'s scalars into the device tensors of :meth:`_make_quant_dev` -- and, on the fully fused fp8 pipeline, into
@@ -8513,11 +8523,10 @@ class GatedAttentionBlockFwd(APIBase):
             # (update_quant_scales's docstring).
             self._write_quant_dev(self.quant, stream)
             self._quant_dev_on_launch_stream = True
-        if self._decode_q_lens is not None and not self._decode_q_lens_written:
-            # The prefill route's Q lengths (the constant S_q per sequence): written ONCE per compile(), on this launch stream, before the
-            # SDPA that reads them (Rule 5); a capture of this first execute records the fill with its value.
-            self._write_decode_q_lens(stream)
-            self._decode_q_lens_written = True
+        # The prefill route's Q lengths (the constant S_q per sequence): the workspace slot, filled on this launch stream on EVERY execute
+        # before the SDPA that reads it (Rule 5; a capture records the fill with its value, an eager execute fills its own).  None on
+        # every other form (no slot reserved).
+        decode_q_lens = self._fill_decode_q_lens(workspace, stream) if ws.decode_q_lens >= 0 else None
 
         fp8 = self.quant is not None
         mxfp8 = self.mxfp8
@@ -8763,8 +8772,9 @@ class GatedAttentionBlockFwd(APIBase):
                 v_c.view(self.batch, self.seq_len, g.h_kv, g.d_head),
                 o.view(self.batch, self.seq_len, g.h_q, g.d_head),
                 lse=lse,
-                # the prefill route hands the paged THD leg the block's own constant Q lengths ([B] int32, all S_q); every other form the caller's
-                seq_lens=self._decode_q_lens if self._decode_q_lens is not None else seq_lens,
+                # the prefill route hands the paged THD leg the block's own constant Q lengths (the workspace slot, [B] int32, all S_q);
+                # every other form the caller's
+                seq_lens=decode_q_lens if decode_q_lens is not None else seq_lens,
                 workspace=engine_ws,
                 current_stream=cuda.CUstream(stream),
                 gate=gate_src.view(self.batch, self.seq_len, g.h_q, g.d_head) if self.gate_fused else None,

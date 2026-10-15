@@ -17,10 +17,11 @@ A/B's other arm.  Past ``S_q = 8`` (``DECODE_MAX_S_Q``) or 128 packed rows (``DE
 Host cells (any device): the table and the rule, a wider width slotted into the table without touching the rule, the adapter's
 route unchanged by the re-expression (every ``(S_q, group)`` against the shared SM100 rule with the Rubin constants), the route
 per policy at the three serving geometries of the MTP cells (24 / 2, 32 / 2, 8 / 1) and the corner groups, the two reject rows,
-the declaration facts on the prefill route (the THD stage, the split, the gate in the paged body's epilogue), the envelope per
-policy.  Rubin cells: the prefill route vs the per-sequence fp32 oracle at ``S_q`` 4 / 5 / 8 with a padded entry, the prefill route
-vs the two-unit route on IDENTICAL inputs at ``S_q = 4``, the unpacked arm at 24 / 2 ``S_q = 8``, two launches bitwise, the
-workspace honest, CUDA-graph capture of the FIRST execute at ``S_q = 8`` and its replay over new lengths / tables / slots / inputs.
+the declaration facts on the prefill route (the THD stage, the split, the gate in the paged body's epilogue), the prefill route's
+Q lengths as a workspace slot (no plan-owned tensor), the envelope per policy.  Rubin cells: the prefill route vs the per-sequence
+fp32 oracle at ``S_q`` 4 / 5 / 8 with a padded entry, the prefill route vs the two-unit route on IDENTICAL inputs at ``S_q = 4``, the
+unpacked arm at 24 / 2 ``S_q = 8``, two launches bitwise, the workspace honest, CUDA-graph capture of the FIRST execute at ``S_q = 8``
+and its replay over new lengths / tables / slots / inputs, an EAGER execute after a captured first execute with no replay in between.
 """
 
 import os
@@ -177,7 +178,7 @@ def test_the_single_unit_table_and_the_rule():
 
 
 def test_a_wider_width_slots_into_the_table_without_touching_the_rule(monkeypatch):
-    """A 64-column entry (another lane's tile) appended to the table routes the 24 / 2 step at ``S_q = 4`` -- 48 rows -- in ONE unit
+    """A 64-column entry (a wider tile built elsewhere) appended to the table routes the 24 / 2 step at ``S_q = 4`` -- 48 rows -- in ONE unit
     of it, through the unchanged rule and the unchanged adapter route; the block's route follows."""
     from cudnn.sdpa.fwd import config_sm107
 
@@ -414,6 +415,33 @@ def test_declaration_facts_on_the_prefill_route_and_the_policy_knob():
         )
 
 
+def test_the_prefill_routes_q_lengths_are_a_workspace_slot_not_plan_owned_memory():
+    """The paged THD leg's per-sequence Q lengths on the prefill route (the constant ``S_q`` of every sequence) are a ``[B]`` int32 slot
+    of the caller's workspace (Rule 8 recipes R2 + R4), reserved by the carve at the very END and only on that route: the layout with
+    ``decode_q_lens=0`` is byte-identical to before, a block on the decode tile reserves none, a block on the prefill tile reserves it
+    at declaration (before ``compile()``); the block holds no plan-owned device tensor for them and no first-execute flag -- the fill
+    rides every execute."""
+    import dataclasses
+
+    from cudnn.gated_attention_block.api import _WS_ALIGN, _align_up, _plan_workspace
+
+    geom, _ = _geom(16)
+    base = _plan_workspace(geom, 4, 8, torch.bfloat16, False, False, True)
+    assert base == _plan_workspace(geom, 4, 8, torch.bfloat16, False, False, True, decode_q_lens=0) and base.decode_q_lens == -1
+    lay = _plan_workspace(geom, 4, 8, torch.bfloat16, False, False, True, decode_q_lens=4)
+    assert lay.decode_q_lens == base.total_bytes and lay.decode_q_lens % _WS_ALIGN == 0, "the slot is appended, aligned"
+    assert lay.total_bytes == lay.engine_scratch == base.total_bytes + _align_up(4 * 4)
+    assert dataclasses.replace(lay, decode_q_lens=-1, total_bytes=base.total_bytes, engine_scratch=base.engine_scratch) == base
+    on, _ = _make_block(16, 4, 8)  # 32 / 2 at S_q 8: the prefill tile
+    off, _ = _make_block(16, 4, 2)  # 32 / 2 at S_q 2: the decode tile
+    assert on.decode_route.prefill_tile and off.decode_route.decode_tile
+    lay_on, lay_off = on._layout(), off._layout()
+    assert lay_on.decode_q_lens == lay_on.total_bytes - _align_up(4 * 4) >= 0 and lay_off.decode_q_lens == -1
+    for blk in (on, off):
+        assert not any(k.startswith("_decode_q_lens") for k in vars(blk)), "no plan-owned Q-length tensor, no write-once flag"
+    assert callable(getattr(on, "_fill_decode_q_lens", None))
+
+
 def test_the_envelope_names_the_policy_and_the_claimed_bound(monkeypatch):
     from cudnn.frost import buffers
 
@@ -618,5 +646,47 @@ def test_capture_of_the_first_execute_at_s_q_eight_replays_bitwise_and_takes_new
         case.execute()
         torch.cuda.synchronize()
         assert torch.equal(case.out, replayed2), "the replay over new lengths / tables / slots differs from the eager run over them"
+    finally:
+        graph.reset()
+
+
+@requires_rubin
+def test_an_eager_execute_after_a_captured_first_execute_with_no_replay_reads_its_own_q_lengths():
+    """The prefill route fills the paged THD leg's Q lengths on EVERY execute (a workspace slot, Rule 8 recipes R2 + R4): the FIRST
+    execute of a fresh declaration is CAPTURED (nothing runs) and the block is then run EAGERLY before any replay -- the eager run
+    matches the oracle (a write-once flag flipped by the capture would have handed the leg an unwritten vector), the slot reads ``S_q``
+    on every row afterwards, a fresh workspace whose slot is poisoned is served the same way (the fill rides the execute, not the plan),
+    and the later replay of the captured first execute is bitwise the eager run."""
+    lens = (300, 0, 1000, 77)
+    case = _Case(16, 8, lens, seed=47)  # fresh: never executed
+    assert case.blk.decode_route.prefill_tile
+    case.blk.check_support()
+    case.blk.compile()
+    case.ws = torch.empty(case.blk.get_workspace_size(), dtype=torch.uint8, device=_DEV)
+    case.out.fill_(float("nan"))
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, stream=torch.cuda.Stream()):
+            case.execute()  # the FIRST execute of this declaration, captured: nothing runs
+        torch.cuda.synchronize()
+        assert torch.isnan(case.out).all(), "the capture launched work"
+        case.execute()  # EAGER, before any replay
+        torch.cuda.synchronize()
+        eager = case.out.clone()
+        case.check_against_oracle(eager, what="eager execute after a captured first execute, no replay")
+        lay = case.blk._layout()
+        slot = slice(lay.decode_q_lens, lay.decode_q_lens + 4 * len(lens))
+        assert case.ws[slot].view(torch.int32).tolist() == [8] * len(lens)
+        ws2 = torch.empty_like(case.ws)
+        ws2[slot].fill_(0xFF)  # the slot poisoned (-1 per row): the execute must fill it itself
+        out2 = torch.empty_like(case.out)
+        case.execute(out=out2, ws=ws2)
+        torch.cuda.synchronize()
+        assert ws2[slot].view(torch.int32).tolist() == [8] * len(lens) and torch.equal(out2, eager)
+        case.out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(case.out, eager), "the replay of the captured first execute differs from the eager run"
     finally:
         graph.reset()
