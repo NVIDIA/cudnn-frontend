@@ -150,7 +150,7 @@ from cudnn.frost.tile_dsl.pointwise import (
 )
 from cudnn.frost.tile_dsl.regtile import RegTile, vec_concat
 from cudnn.frost.tile_dsl.mma import mma_ss, mma_ts_step
-from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_tile, tma_store_commit, tma_store_wait, tma_tensormap_acquire
+from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_tile, tma_store_commit, tma_store_wait, tma_tensormap_acquire, st_global_v4
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, GmemTileTma, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 from cudnn.frost.tile_dsl.mask import (
@@ -204,6 +204,8 @@ oBufferElems = CFG.TILE_M * CFG.TILE_O
 # Q u O alias: O reuses Q's SMEM slab once BMM1 has consumed Q (the slab is
 # sized to the larger; d_qk == d_v here so both are qBufferElems).  TMA-STG
 # arrives mb_q_o_alias after O drains; TMA-LDG waits it before reloading Q.
+# Under EARLY_Q (below) O never enters the slab and the reload gate is the MMA's
+# mb_q_empty instead.
 QO_SLAB_ELEMS = max(qBufferElems, oBufferElems)
 
 qTmaTransactionBytes = qBufferElems * CFG.BPE
@@ -252,6 +254,13 @@ _split_h = make_split_helpers(
 )
 SPLIT_KV = _split_h.SPLIT_KV
 _FP32_PARTIALS = SPLIT_KV > 1
+# Early Q release: the Q slab is released by the MMA's last BMM1 of a tile (its commit), not by the O store's return edge (the Q u O alias
+# handshake), so the TMA-LDG warp loads the NEXT tile's Q while this tile is still in its tail -- a tile of one or two KV steps (a sliding window,
+# a short cache at batch) no longer pays the O drain + alias round trip + Q load latency in series.  It needs O out of the slab: the fp32 split
+# partials already go straight from TMEM to the workspace, and the dense / paged half output is stored directly by the correction warps
+# (DIRECT_O).  The THD legs keep the staged TMA store: their per-batch runtime descriptors place the rows.
+EARLY_Q = (not CFG.THD_VARLEN) and (not RAGGED_Q)
+DIRECT_O = EARLY_Q and not _FP32_PARTIALS
 # exp2 split MUFU / FMA (``_E2E_*``), the d128 prefill kernel's pattern (sm100/prefill_d128_f16.py): of every _E2E_FREQ P columns the LAST _E2E_RES are
 # evaluated on the FMA pipe (``exp2_emul_pair``), the rest on MUFU.EX2.  On cc 10.0 the d64 tile's one softmax warpgroup is MUFU-bound at a long KV (16
 # EX2 per clk per SM, and the 128 rows of a tile exponentiate whether live or not), so the FMA pipe takes a quarter of every row's columns.  Gate:
@@ -355,6 +364,8 @@ def _kernel(
     # (D, row, H_kv, page); derived by _host from the bound strides.
     paged_hnd: cutlass.Constexpr[bool] = False,
     ragged_q_i64: cutlass.Constexpr[bool] = False,
+    # The final O under DIRECT_O (None-specialized otherwise): the correction warps store the half output straight from TMEM.
+    o_direct: Optional[cute.Tensor] = None,
 ) -> None:
     if cutlass.const_expr(PARAMS.thd_batch_one):
         # Fold the generic batch scan and split-index quotient/remainder.
@@ -453,7 +464,12 @@ def _kernel(
             bars.mb_stat_empty[0].init()
             bars.mb_stats_read[0].init()
             bars.mb_o_full[0].init()
-            bars.mb_o_empty[0].init()
+            # Early Q: the correction warps release the TMEM accumulators themselves (their lanes arrive after the last TMEM read of a tile),
+            # where the staged path has the TMA-STG warp arrive after the O store drained.
+            if cutlass.const_expr(EARLY_Q):
+                bars.mb_o_empty[0].init(override_count=CFG.CORR_LANES)
+            else:
+                bars.mb_o_empty[0].init()
             bars.mb_q_o_alias[0].init()
             bars.mb_qo_slab_free[0].init()
             for ss in cutlass.range_constexpr(LAYOUT.S_STAGES):
@@ -520,6 +536,7 @@ def _kernel(
             cta_in_pair=cta_in_pair,
             qh_per_kh=qh_per_kh,
             o_partial_f32=o_partial_f32,
+            o_direct=o_direct,
         )
 
     elif warp_idx == CFG.MMA_WARP_ID:
@@ -692,7 +709,7 @@ def _tmaldg_warp_group(
     # Q-reload gate: the next tile's Q load waits for the prior tile's O
     # (sharing the slab) to drain — TMA-STG fires mb_q_o_alias, strictly after
     # MMA consumed Q.  Bootstraps consumer-side via q_empty_phase=1.
-    mb_q_reload = bars.mb_q_o_alias
+    mb_q_reload = bars.mb_q_empty if cutlass.const_expr(EARLY_Q) else bars.mb_q_o_alias
 
     tma_q = GmemTileTma(tma_q_desc)
     if cutlass.const_expr(CFG.THD_VARLEN and not PAGED_KV):
@@ -774,12 +791,15 @@ def _tmaldg_warp_group(
             # Consume that phase even though no Q reload is needed, or the next
             # live tile's wait passes on stale parity and its Q load races the
             # previous tile's O drain.  mb_qo_slab_free is the return edge.
-            mb_q_reload[0].wait(q_empty_phase)
-            bars.mb_qo_slab_free[0].arrive()
-            q_empty_phase = q_empty_phase ^ 1
+            if cutlass.const_expr(not EARLY_Q):
+                mb_q_reload[0].wait(q_empty_phase)
+                bars.mb_qo_slab_free[0].arrive()
+                q_empty_phase = q_empty_phase ^ 1
         else:
+            # Early Q: the MMA's mb_q_empty is the gate (an empty tile loads no Q and neither side touches it).
             mb_q_reload[0].wait(q_empty_phase)
-            bars.mb_qo_slab_free[0].arrive()
+            if cutlass.const_expr(not EARLY_Q):
+                bars.mb_qo_slab_free[0].arrive()
             bars.mb_q_full[0].arrive(n_bytes=qTmaTransactionBytes, pred=nvvm.elect_sync())
             # Ragged Q: the batch's first token row is its ragged offset over
             # the packed [1, T, H, D] view (batch coord 0); a sequence past the
@@ -950,30 +970,33 @@ def _tmastg_warp_group(
         # only a shifted batch coord.  Folds to batch_idx at SPLIT_KV == 1.
         o_batch = _partial_batch(batch_idx, split_idx, n_batch)
 
-        bars.mb_o_full[0].wait(o_full_phase)
-        # fp32 partials wrote the workspace directly, so there is nothing staged
-        # to copy.  Skip ONLY the store: the arrive below and the alias handshake
-        # after it must still run, or this warp laps the loader and the parity
-        # waits deadlock.
-        if cutlass.const_expr(not _FP32_PARTIALS):
-            if cutlass.const_expr(CFG.THD_VARLEN):
-                if batch_idx < n_batch:
-                    ptr = (o_desc_words.iterator.raw_ptr() + batch_idx * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
-                    tma_store_tile(sO[0], tma_slice_runtime_desc(ptr, cutlass.Int32(0), q_head_idx, q_row_base, cutlass.Int32(0)))
-            else:
-                tma_store_tile(sO[0], tma_o(cutlass.Int32(0), q_head_idx, q_row_base, o_batch))
-            tma_store_commit()
-            tma_store_wait(0)
+        # Early Q: nothing is staged in the slab (the correction warps write O / the partials straight to global, and arrive mb_o_empty
+        # themselves) and the MMA's mb_q_empty gates the Q reload, so this warp keeps only the scheduler credit and payload advance below.
+        if cutlass.const_expr(not EARLY_Q):
+            bars.mb_o_full[0].wait(o_full_phase)
+            # fp32 partials wrote the workspace directly, so there is nothing staged
+            # to copy.  Skip ONLY the store: the arrive below and the alias handshake
+            # after it must still run, or this warp laps the loader and the parity
+            # waits deadlock.
+            if cutlass.const_expr(not _FP32_PARTIALS):
+                if cutlass.const_expr(CFG.THD_VARLEN):
+                    if batch_idx < n_batch:
+                        ptr = (o_desc_words.iterator.raw_ptr() + batch_idx * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
+                        tma_store_tile(sO[0], tma_slice_runtime_desc(ptr, cutlass.Int32(0), q_head_idx, q_row_base, cutlass.Int32(0)))
+                else:
+                    tma_store_tile(sO[0], tma_o(cutlass.Int32(0), q_head_idx, q_row_base, o_batch))
+                tma_store_commit()
+                tma_store_wait(0)
 
-        bars.mb_o_empty[0].arrive()
-        # O has drained to GMEM → the shared Q u O slab is free for TMA-LDG to
-        # clobber with the next tile's Q.  Throttled by the return edge: at most
-        # ONE alias phase ahead of LDG.
-        bars.mb_qo_slab_free[0].wait(slab_free_phase)
-        bars.mb_q_o_alias[0].arrive()
+            bars.mb_o_empty[0].arrive()
+            # O has drained to GMEM → the shared Q u O slab is free for TMA-LDG to
+            # clobber with the next tile's Q.  Throttled by the return edge: at most
+            # ONE alias phase ahead of LDG.
+            bars.mb_qo_slab_free[0].wait(slab_free_phase)
+            bars.mb_q_o_alias[0].arrive()
 
-        o_full_phase = o_full_phase ^ 1
-        slab_free_phase = slab_free_phase ^ 1
+            o_full_phase = o_full_phase ^ 1
+            slab_free_phase = slab_free_phase ^ 1
 
         wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
         nxt_q, nxt_hb, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
@@ -1219,9 +1242,14 @@ def _mma_warp_group(
                 bars.mb_v_empty[old_state.idx].arrive(mcast_mask=mcast_mask, cta_group=1, pred=elect_p)
                 s_cons = advance(s_cons, LAYOUT.S_STAGES)
 
-            # Epilogue: BMM2 for the last kv tile (always runs — n_kv >= 1).  The
-            # Q-reload gate is mb_q_o_alias (fired by TMA-STG after O drains), so
-            # MMA does NOT fire mb_q_empty.
+            # Every BMM1 of this tile is issued: under early Q its commit releases the Q slab to the TMA-LDG warp (the next tile's Q load
+            # then overlaps this tile's remaining BMM2 / softmax / epilogue).  Otherwise the Q-reload gate is mb_q_o_alias (fired by TMA-STG
+            # after O drains) and MMA does NOT fire mb_q_empty.
+            if cutlass.const_expr(EARLY_Q):
+                elect_q = nvvm.elect_sync()
+                bars.mb_q_empty[0].arrive(mcast_mask=mcast_mask, cta_group=1, pred=elect_q)
+
+            # Epilogue: BMM2 for the last kv tile (always runs — n_kv >= 1).
             bars.mb_v_full[kv_state.idx].wait(kv_state.phase)
             desc_V = sV[kv_state.idx].desc()
             is_not_first_bmm2_epi = cutlass.Boolean((kv_right - kv_left) != cutlass.Int32(1))
@@ -1621,6 +1649,67 @@ def _softmax_warp_group(
 
 
 @cute.jit
+def _store_o_tile_direct(
+    o_out,
+    tmem_base,
+    tmem_o_off,
+    inv_sum,
+    row_zero,
+    row_valid,
+    o_batch,
+    q_row,
+    row_head,
+    tile_o: cutlass.Constexpr[int],
+    chunk: cutlass.Constexpr[int],
+) -> None:
+    """Store one Q row's FINAL half-precision O straight from TMEM to the output tensor (one lane = one row).
+
+    The staged path casts into the SMEM O tile and TMA-stores it, which holds the Q u O slab until the store drained; here the accumulator
+    goes to global by itself so the slab is free as soon as BMM1 consumed Q (early Q release).  A tile row is 128 B (d64) or 256 B (d128):
+    sixteen-byte vector stores when the row address is aligned, bounded scalar stores otherwise (an envelope flavor's tile is wider than
+    the tensor's d_v, and a caller's strides may be unaligned -- legal for the TMA path only when 16-byte aligned too, but this helper
+    does not rely on it).  ``row_zero`` selects zeros instead of the scaled accumulator (a dead / trimmed / empty-tile row).
+    """
+    oo = cutlass.make_array_view(o_out)
+    d_v = cutlass.const_expr(o_out.shape[3])
+    pair_fmt = "bf16x2" if cutlass.const_expr(CFG.DTYPE_QKV == 2) else "f16x2"
+    for blk in cutlass.range_constexpr(tile_o // chunk):
+        addr = tmem_base + cutlass.Int32(tmem_o_off + blk * chunk)
+        vals = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(addr, cutlass.Float32), num=chunk)
+        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+        scaled = vals * inv_sum
+        if row_valid:
+            row_ptr = oo.data_ptr((o_batch, q_row, row_head, 0))
+            vec_ok = cutlass.Boolean(False)
+            if cutlass.const_expr(d_v % 8 == 0 and chunk % 8 == 0 and o_out.stride[3] == 1):
+                vec_ok = (row_ptr.toint(cutlass.Int64) & cutlass.Int64(15)) == cutlass.Int64(0)
+            if vec_ok:
+                for group in cutlass.range_constexpr(chunk // 8):
+                    if cutlass.const_expr(blk * chunk + group * 8 < d_v):
+                        v = [
+                            cutlass.Float32(arith.select(row_zero.ir_value(), cutlass.Float32(0.0).ir_value(), scaled[group * 8 + j].ir_value()))
+                            for j in range(8)
+                        ]
+                        w01, w23 = nvvm.inline_ptx(
+                            f"cvt.rn.{pair_fmt}.f32 $0, $3, $2;\ncvt.rn.{pair_fmt}.f32 $1, $5, $4;",
+                            write_only_types=[cutlass.Int32, cutlass.Int32],
+                            read_only_args=[v[0], v[1], v[2], v[3]],
+                        )
+                        w45, w67 = nvvm.inline_ptx(
+                            f"cvt.rn.{pair_fmt}.f32 $0, $3, $2;\ncvt.rn.{pair_fmt}.f32 $1, $5, $4;",
+                            write_only_types=[cutlass.Int32, cutlass.Int32],
+                            read_only_args=[v[4], v[5], v[6], v[7]],
+                        )
+                        st_global_v4(row_ptr.toint(cutlass.Int64) + cutlass.Int64((blk * chunk + group * 8) * 2), (w01, w23, w45, w67), cutlass.Int32)
+            else:
+                for j in cutlass.range_constexpr(chunk):
+                    if cutlass.const_expr(blk * chunk + j < d_v):
+                        oo[o_batch, q_row, row_head, cutlass.Int32(blk * chunk + j)] = cutlass.Float32(
+                            arith.select(row_zero.ir_value(), cutlass.Float32(0.0).ir_value(), scaled[j].ir_value())
+                        ).to(STORAGE_DTYPE)
+
+
+@cute.jit
 def _correction_warp_group(
     seqlen_q,
     seqlen_kv,
@@ -1639,6 +1728,7 @@ def _correction_warp_group(
     cta_in_pair,
     qh_per_kh,
     o_partial_f32=None,
+    o_direct=None,
 ):
     """Correction warp group: 4 warps x 32 lanes = 128 lanes, 1 lane per O row.
 
@@ -1877,7 +1967,29 @@ def _correction_warp_group(
                 CFG.TILE_O,
                 O_CHUNK,
             )
-            bars.mb_o_empty[0].wait(o_empty_phase)
+            if cutlass.const_expr(not EARLY_Q):
+                bars.mb_o_empty[0].wait(o_empty_phase)
+        elif cutlass.const_expr(DIRECT_O):
+            # A row that is dead, trimmed, or in a tile with no live key stores zeros without reading O (an empty mainloop never wrote the
+            # accumulator: NaN * 0 would be NaN).
+            row_zero = row_dead
+            if cutlass.const_expr(MAY_BE_EMPTY):
+                row_zero = row_zero | (bounds.right <= bounds.left)
+            if cutlass.const_expr(CFG.SEQ_Q_LENS_PRESENT):
+                row_zero = row_zero | row_trim
+            _store_o_tile_direct(
+                o_direct,
+                tmem_base_epi,
+                LAYOUT.O0_OFF,
+                inv_sum,
+                row_zero,
+                q_row_global < seqlen_q,
+                batch_idx,
+                q_row_global,
+                row_head_idx,
+                CFG.TILE_O,
+                O_CHUNK,
+            )
         else:
             for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O):
                 o_fp16 = cutlass.Vector.from_elements(
@@ -1911,7 +2023,12 @@ def _correction_warp_group(
             # fence_proxy needed before TMA reads SMEM written by generic-proxy stores.
             nvvm.fence_proxy("async.shared", space="cta")
 
-        bars.mb_o_full[0].arrive()
+        # The softmax's top-of-tile wait on mb_o_empty is also what keeps the next tile's first PV (which overwrites the TMEM O accumulator)
+        # behind this tile's TMEM reads, so under early Q the correction lanes arrive it here, after their last tcgen05.ld has completed.
+        if cutlass.const_expr(EARLY_Q):
+            bars.mb_o_empty[0].arrive()
+        else:
+            bars.mb_o_full[0].arrive()
 
         stat_full_phase = stat_full_phase ^ 1
         o_empty_phase = o_empty_phase ^ 1
@@ -2088,6 +2205,7 @@ def _launch(
         ragged_q_div,
         paged_hnd,
         ragged_q_i64,
+        o_tensor if cutlass.const_expr(DIRECT_O) else None,
     ).launch(
         grid=grid_shape,
         block=[CFG.THREADS_PER_CTA, 1, 1],
