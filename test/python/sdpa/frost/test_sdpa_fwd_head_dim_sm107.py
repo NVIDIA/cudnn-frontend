@@ -22,29 +22,32 @@ implementations agreeing on every cell (the row's envelope walk, the adapter's f
 the one constant feeding the row's cga domain, the adapter's cga twin and the config factory, the factories' derived facts and
 raising couplings, the loader binding ``d_flavor`` to the flavor, the static expect_tx pin; (2) host rendering pins -- an sm_107a
 trace-compile of each new rendering keeps the register split (``USETMAXREG`` > 0) and spills no more than the d128 rendering of
-the same mask arm; (3) GPU cells on a Rubin device -- the fp64 oracle over the degenerate-input matrix at every served D (8 .. 64
-on the small tiles, 128 on the d128 tile of the same file, both dtypes), the bitwise pin D = 24 vs an explicitly zero-padded D =
-32 (48 vs 64), the d64 tile at cga2, the routed legs (split-KV and the score outputs at D = 24 / 64 on the d128 flavor, cga2 at
+the same mask arm; (3) GPU cells on a Rubin device -- the fp64 oracle over the degenerate-input matrix (the shared ``small_tile_cells``,
+one matrix for both arch lines) on the 32- and 64-wide tiles in bf16 with the fp16 member on the degenerate trio, one accept cell at
+D = 16 and at D = 56, the bitwise pin D = 8 / 24 vs an explicitly zero-padded D = 32 (40 / 48 vs 64: the zero-fill contract, one
+TMA mechanism), the d64 tile at cga2, the routed legs (split-KV and the score outputs at D = 24 / 64 on the d128 flavor, cga2 at
 D = 24 / 32 on the 64-wide tile -- bitwise the zero-padded D = 64 cga2 run), optional and base-2 Stats.  A D = 24 cell that
 completes under the runner's timeout IS the expect_tx pin: a byte count short of the full box would hang the consumer on the
-first tile.
+first tile.  The d128 geometry of the same file is byte-pinned to its one-geometry past (``test_sdpa_fwd_score_stats.py``), so
+it is not re-oracled here.
 """
 
 import dataclasses
 import math
 import re
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import torch
 
-from frost_test_utils import _SM, assert_no_new_spills, make_dense_stats, requires_dsl, requires_rubin, run_sass_probe, sass_probe_source
+from frost_test_utils import assert_no_new_spills, requires_dsl, requires_rubin, run_sass_probe, sass_probe_source
+from small_tile_cells import CASES, TOL_O, case_inputs, check, check_degenerate_rows, run_graph
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 
 _ROW = "sdpa_fwd_prefill_sm107"
-# D -> the tile width the row serves it on (config_sm107.sm107_f16_tile_width); every member is a GPU oracle cell below.
+# D -> the tile width the row serves it on (config_sm107.sm107_f16_tile_width); every member is a GPU cell below (an oracle cell or
+# the bitwise zero-fill pin).
 _SERVED = {8: 32, 16: 32, 24: 32, 32: 32, 40: 64, 48: 64, 56: 64, 64: 64}
 _DECLINED = (4, 12, 20, 36, 60)  # D % 8 != 0: the TMA 16-byte global-stride rule, a typed decline
 _KERNEL = Path(__file__).resolve().parents[4] / "python" / "cudnn" / "sdpa" / "fwd" / "kernels" / "sm107" / "prefill_d128_f16.py"
@@ -474,203 +477,13 @@ def test_small_tile_renderings_keep_the_register_split_and_spill_no_more(tmp_pat
 
 # --------------------------------------------------------------------------- tier 3: GPU cells (a Rubin device)
 
-_DTYPES = [torch.float16, torch.bfloat16]
-_DTYPE_IDS = ["fp16", "bf16"]
-# Tolerances DERIVED from the kernel's arithmetic (the score-side-output suite's analysis, test_sdpa_fwd_score_stats.py):
-#   O: the suite's half-precision O bound (an fp32 accumulation over <= 1024 keys, one bf16 / f16 rounding at the store).
-#   LSE: max * ln 2 + ln(sum) in fp32 from the fp32 S accumulation (|err| <= D * 2^-24 * sum|q k| ~ 2e-4 at these magnitudes, one
-#        FMUL + one lg2.approx + one FADD) and a row-sum of <= 1024 ex2.approx terms (< 4e-4 relative -> < 4e-4 absolute in the
-#        log): atol 1e-3 is >= 2x the bound; the measured cells sit at ~1e-6.
-_TOL_O = dict(atol=5e-2, rtol=3e-2)
-# The existing f16 row tolerances (test_sdpa_fwd_dsl_sm107.py: the O pair of its oracle cells, the 1e-4 / 1e-4 LSE pair of its
-# log-sum-exp pins); the small tiles' cells measure max|dLSE| ~1e-6 against the fp64 oracle.
-_TOL_LSE = dict(atol=1e-4, rtol=1e-4)
+# The degenerate-input matrix (``CASES``), the fp64 oracle, the pinned graph run and the output checks are the shared
+# ``small_tile_cells`` -- one matrix for both arch lines (``test_sdpa_small_d_sm100.py`` runs the same cases on its 32-wide tile).
+_DT_IDS = {torch.float16: "fp16", torch.bfloat16: "bf16"}
 
 
-def _bhsd(b, h, s, d, dtype):
-    return torch.randn(b, s, h, d, device="cuda", dtype=dtype).transpose(1, 2)
-
-
-def _ref(q, k, v, *, scale, causal=False, bottom_right=False, seq_q_lens=None, seq_kv_lens=None, sinks=None, window_left=None, right_bound=None):
-    """fp64 oracle of the whole contract: O and the natural-log LSE per row class (keyless rows -inf / 0)."""
-    b, h_q, s_q, _ = q.shape
-    _, h_kv, s_kv, _ = v.shape
-    dev = q.device
-    g = h_q // h_kv
-    k_ref = k.repeat_interleave(g, dim=1).double()
-    v_ref = v.repeat_interleave(g, dim=1).double()
-    scores = torch.matmul(q.double(), k_ref.transpose(-1, -2)) * scale
-    q_lens = seq_q_lens.flatten().to(device=dev, dtype=torch.int64) if seq_q_lens is not None else torch.full((b,), s_q, dtype=torch.int64, device=dev)
-    kv_lens = seq_kv_lens.flatten().to(device=dev, dtype=torch.int64) if seq_kv_lens is not None else torch.full((b,), s_kv, dtype=torch.int64, device=dev)
-    i = torch.arange(s_q, device=dev).view(1, 1, s_q, 1)
-    j = torch.arange(s_kv, device=dev).view(1, 1, 1, s_kv)
-    diag = i + (kv_lens - q_lens).view(b, 1, 1, 1) if bottom_right else i
-    dead_q = i >= q_lens.view(b, 1, 1, 1)
-    masked = dead_q | (j >= kv_lens.view(b, 1, 1, 1))
-    if causal:
-        masked = masked | (j > diag)
-    if right_bound is not None:
-        masked = masked | (j > diag + right_bound)
-    if window_left is not None:
-        masked = masked | (j < diag - window_left)
-    scores = scores.masked_fill(masked, float("-inf"))
-    full = scores if sinks is None else torch.cat([scores, sinks.view(1, h_q, 1, 1).double().expand(b, h_q, s_q, 1)], dim=-1)
-    smax = full.max(dim=-1).values
-    ssum = torch.exp(full - smax.unsqueeze(-1)).sum(dim=-1).nan_to_num(0.0)
-    lse = smax + torch.log(ssum)
-    o = torch.matmul(torch.softmax(full, dim=-1).nan_to_num(0.0)[..., :s_kv], v_ref)
-    dead = dead_q.squeeze(-1)
-    return dict(o=o, lse=lse.masked_fill(dead, float("-inf")), smax=smax.masked_fill(dead, float("-inf")), empty=torch.isneginf(lse) | dead)
-
-
-def _run(
-    q, k, v, *, scale, sdpa_kwargs=None, seq_len_kv=None, seq_len_q=None, sink=None, stats=True, stats_log2=False, cga=None, split_kv=None, score_outputs=False
-):
-    """Build the graph, pin the Rubin f16 row (optionally a cga / split_kv knob through the public autotune record, optionally
-    the two score side outputs), launch TWICE on sentinel-filled outputs (the two-launch delta) and return O, Stats, the side
-    outputs and the plan's knobs."""
-    import cudnn
-
-    b, h_q, s_q, _ = q.shape
-    d_v = v.shape[-1]
-    dtype = q.dtype
-    o_gpu = torch.empty(b, s_q, h_q, d_v, device="cuda", dtype=dtype).transpose(1, 2)
-    io = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
-    g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
-    tq, tk, tv = g.tensor_like(q), g.tensor_like(k), g.tensor_like(v)
-    kw = dict(name="sdpa", q=tq, k=tk, v=tv, generate_stats=stats, attn_scale=scale, stats_use_log2=stats_log2)
-    vp = {tq: q, tk: k, tv: v}
-    side = {}
-    if score_outputs:  # the graph's two optional ports, declared like Stats (b, h, s, 1) fp32
-        for name in ("score_max", "score_sum_exp"):
-            buf = make_dense_stats(b, h_q, s_q, "contiguous")
-            t = g.tensor(dim=list(buf.shape), stride=list(buf.stride()), data_type=cudnn.data_type.FLOAT, name=name)
-            kw[name] = t
-            vp[t] = buf
-            side[name] = buf
-    if seq_len_kv is not None:
-        slk = g.tensor_like(seq_len_kv)
-        kw.update(seq_len_kv=slk, use_padding_mask=True)
-        vp[slk] = seq_len_kv
-        slq_t = seq_len_q if seq_len_q is not None else torch.full((b, 1, 1, 1), s_q, dtype=torch.int32, device="cuda")
-        slq = g.tensor_like(slq_t)
-        kw["seq_len_q"] = slq
-        vp[slq] = slq_t
-    if sink is not None:
-        st = g.tensor_like(sink)
-        kw["sink_token"] = st
-        vp[st] = sink
-    kw.update(sdpa_kwargs or {})
-    o, stats_t = g.sdpa(**kw)
-    o.set_output(True).set_dim(o_gpu.shape).set_stride(o_gpu.stride())
-    stats_gpu = None
-    if stats:
-        stats_gpu = make_dense_stats(b, h_q, s_q, "contiguous")
-        stats_t.set_output(True).set_dim(stats_gpu.shape).set_stride(stats_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
-        vp[stats_t] = stats_gpu
-    g.validate()
-    g.build_operation_graph()
-    g.create_execution_plans([cudnn.heur_mode.A])
-    names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    ours = [i for i, n in enumerate(names) if n == _ROW or n.startswith(_ROW + "[")]
-    idx = next((i for i in ours if g.plans[i].knobs.split_kv in (None, 1)), None)
-    assert idx is not None, f"no unsplit {_ROW} plan in {names}"
-    picked_cga, picked_split = g.plans[idx].knobs.cga, g.plans[idx].knobs.split_kv or 1
-    if (cga is not None and picked_cga != cga) or (split_kv is not None and picked_split != split_kv):
-        # The heuristics rank ONE knob point per row (the auto pick); another member of the row's cga / split domain is requested
-        # the way an autotuner replays it -- the public record (engine_id, {knob_type: int}) through create_execution_plan.
-        engine_id, record = g.get_engine_and_knobs_at_index(idx)
-        record = dict(record)
-        if cga is not None:
-            record[cudnn.knob_type.TILE_CGA_M] = cga
-            picked_cga = cga
-        if split_kv is not None:
-            record[cudnn.knob_type.SPLIT_KV] = split_kv
-            picked_split = split_kv
-        g.create_execution_plan(engine_id, record)
-        idx = g.get_execution_plan_count() - 1
-    g.select_plan(idx)
-    knobs = SimpleNamespace(cga=picked_cga, split_kv=picked_split)
-    g.check_support()
-    g.build_plans()
-    vp[o] = o_gpu
-    ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
-
-    def launch():
-        o_gpu.fill_(float("nan"))  # sentinel: an unwritten live row stays NaN
-        if stats_gpu is not None:
-            stats_gpu.fill_(float("nan"))
-        for buf in side.values():
-            buf.fill_(float("nan"))
-        g.execute(vp, ws)
-        torch.cuda.synchronize()
-        return o_gpu.clone(), (stats_gpu.clone() if stats_gpu is not None else None), {n: buf.clone() for n, buf in side.items()}
-
-    o1, st1, side1 = launch()
-    o2, st2, side2 = launch()
-    assert torch.equal(o1, o2) and (st1 is None or torch.equal(st1, st2)), "two-launch delta on O / Stats"
-    assert all(torch.equal(side1[n], side2[n]) for n in side), "two-launch delta on the score side outputs"
-    return dict(o=o_gpu, stats=stats_gpu, knobs=knobs, **side)
-
-
-def _check(out, ref, *, has_stats=True, stats_log2=False):
-    """Keyless rows EXACTLY 0 / -inf (never NaN, never a residue); live rows against the fp64 oracle."""
-    empty = ref["empty"]
-    o = out["o"]
-    assert torch.isfinite(o).all(), "O has a non-finite (an unwritten sentinel or a NaN residue)"
-    assert (o[empty] == 0).all(), "a keyless row's O must be exactly 0 (a SELECT, never a multiply by zero)"
-    torch.testing.assert_close(o[~empty].double(), ref["o"][~empty], **_TOL_O)
-    if has_stats:
-        lse = out["stats"].squeeze(-1)
-        assert torch.isneginf(lse[empty]).all(), "a keyless row's Stats must be exactly -inf"
-        ref_lse = ref["lse"][~empty] * (math.log2(math.e) if stats_log2 else 1.0)
-        torch.testing.assert_close(lse[~empty].double(), ref_lse, **_TOL_LSE)
-
-
-_CASES = {
-    # the degenerate-input matrix (sdpa-invariants.md s9): the KV ring sweep n_kv = 1 (the P14 phase-drift shape), 2, 3, 4 (the ring
-    # depth), 5 (depth + 1), 8 -- every one with B*H > 1; tail tiles (S not a multiple of 128; the row's synthesized KV padding on the
-    # dense one, whose Q tail also exercises the OOB-row store guard); GQA; a zero-length KV batch; keyless bottom-right rows with a
-    # sink and padded-Q trim; keyless rows past a left window; a right band; ONE CTA / one tile in the whole launch (B*H = 1, n_kv = 1)
-    "dense_one_tile_bh1": dict(b=1, h=1, h_kv=1, s_q=128, s_kv=128),
-    "dense_nkv1": dict(b=2, h=2, h_kv=2, s_q=128, s_kv=128),
-    "dense_nkv2": dict(b=2, h=4, h_kv=4, s_q=256, s_kv=256),
-    "dense_nkv3_tail_300": dict(b=2, h=2, h_kv=2, s_q=300, s_kv=300),
-    "dense_nkv4_512": dict(b=2, h=2, h_kv=2, s_q=512, s_kv=512),
-    "dense_nkv5_640": dict(b=2, h=2, h_kv=2, s_q=640, s_kv=640),
-    "dense_nkv8_1024": dict(b=2, h=2, h_kv=2, s_q=1024, s_kv=1024),
-    "causal_tail_385": dict(b=1, h=4, h_kv=4, s_q=385, s_kv=385, causal=True),
-    "right_band_64_tail_300": dict(b=2, h=2, h_kv=2, s_q=300, s_kv=300, right_bound=64),
-    "causal_swa128_padded_385": dict(b=2, h=2, h_kv=2, s_q=385, s_kv=385, causal=True, window_left=128, kv_lens=[385, 200]),
-    "causal_gqa_8_2": dict(b=2, h=8, h_kv=2, s_q=256, s_kv=256, causal=True),
-    "padded_kv_zero_batch": dict(b=3, h=4, h_kv=4, s_q=256, s_kv=256, kv_lens=[256, 0, 100]),
-    "bottom_right_keyless_sink": dict(b=3, h=8, h_kv=4, s_q=256, s_kv=256, bottom_right=True, q_lens=[256, 129, 0], kv_lens=[200, 256, 128], sink=True),
-}
-
-
-def _case_inputs(case, d, dtype, *, seed=0):
-    torch.manual_seed(seed)
-    c = _CASES[case]
-    q = _bhsd(c["b"], c["h"], c["s_q"], d, dtype)
-    k = _bhsd(c["b"], c["h_kv"], c["s_kv"], d, dtype)
-    v = _bhsd(c["b"], c["h_kv"], c["s_kv"], d, dtype)
-    kv_lens = torch.tensor(c["kv_lens"], dtype=torch.int32, device="cuda").view(c["b"], 1, 1, 1) if "kv_lens" in c else None
-    q_lens = torch.tensor(c["q_lens"], dtype=torch.int32, device="cuda").view(c["b"], 1, 1, 1) if "q_lens" in c else None
-    sink = torch.randn(1, c["h"], 1, 1, dtype=torch.float32, device="cuda") if c.get("sink") else None
-    causal = bool(c.get("causal") or c.get("bottom_right"))
-    sdpa_kwargs = dict(use_causal_mask_bottom_right=True) if c.get("bottom_right") else (dict(use_causal_mask=True) if causal else {})
-    window_left = c.get("window_left")
-    if window_left is not None:
-        sdpa_kwargs["sliding_window_length"] = window_left + 1  # the graph's length L keeps L keys up to the diagonal: W = L - 1
-    right_bound = c.get("right_bound")
-    if right_bound is not None:
-        sdpa_kwargs["diagonal_band_right_bound"] = right_bound  # alone: with use_causal_mask the bound is forced back to 0
-    scale = 1.0 / math.sqrt(d) if not c.get("bottom_right") else 0.75
-    ref = _ref(
-        q, k, v, scale=scale, causal=causal, bottom_right=bool(c.get("bottom_right")), seq_q_lens=q_lens, seq_kv_lens=kv_lens,
-        sinks=sink.flatten() if sink is not None else None, window_left=window_left, right_bound=right_bound,
-    )  # fmt: skip
-    return q, k, v, dict(scale=scale, sdpa_kwargs=sdpa_kwargs, seq_len_kv=kv_lens, seq_len_q=q_lens, sink=sink), ref
+def _run(q, k, v, **kw):
+    return run_graph(q, k, v, row=_ROW, **kw)
 
 
 def _assert_small_tile_plan(out, d):
@@ -680,100 +493,103 @@ def _assert_small_tile_plan(out, d):
     assert out["knobs"].split_kv == 1, (d, out["knobs"])
 
 
+# One oracle per served tile over the whole matrix in bf16; the fp16 member on the cells where the dtype enters the io loads and the
+# P / O casts of a degenerate row (the dense base, a zero-length KV batch, keyless bottom-right rows with a sink and the padded-Q
+# trim) on both tiles; D 16 as the one served width of the 32-wide tile that neither the grid nor the bitwise zero-fill pin below names
+# (D 8 / 24 / 40 / 48 ARE that pin: one TMA zero fill, one mechanism).
+_FP16_CASES = ("dense_nkv2", "padded_kv_zero_batch", "bottom_right_keyless_sink")
+_ORACLE_CELLS = (
+    [(case, d, torch.bfloat16) for d in (32, 64) for case in CASES]
+    + [(case, d, torch.float16) for d in (32, 64) for case in _FP16_CASES]
+    + [("dense_nkv2", 16, torch.bfloat16)]
+)
+
+
 @requires_rubin
-@pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
-@pytest.mark.parametrize("d", [8, 16, 24, 32, 48, 64, 128])
-@pytest.mark.parametrize("case", list(_CASES))
+@pytest.mark.parametrize("case, d, dtype", _ORACLE_CELLS, ids=[f"{c}-{d}-{_DT_IDS[t]}" for c, d, t in _ORACLE_CELLS])
 def test_small_tiles_match_the_fp64_oracle(case, d, dtype):
-    """Every served head dim of the file's three geometries -- 8 / 16 / 24 / 32 on the 32-wide tile, 48 / 64 on the 64-wide one,
-    128 on the d128 tile (the same file, byte-identical to its one-geometry past) -- over the degenerate-input matrix, both dtypes."""
-    q, k, v, kw, ref = _case_inputs(case, d, dtype)
+    """The two small geometries of the file -- the 32-wide tile at D 32 (and 16), the 64-wide tile at D 64 -- over the degenerate-input
+    matrix: every case in bf16, the degenerate trio in fp16 too."""
+    q, k, v, kw, ref = case_inputs(case, d, dtype)
     out = _run(q, k, v, **kw)
     _assert_small_tile_plan(out, d)
-    _check(out, ref)
-    c = _CASES[case]
-    if "kv_lens" in c and 0 in c["kv_lens"]:
-        empty_b = c["kv_lens"].index(0)
-        assert (out["o"][empty_b] == 0).all() and torch.isneginf(out["stats"][empty_b]).all(), "a zero-length KV batch: O = 0, Stats = -inf"
-    if "window_left" in c:
-        first_dead = c["kv_lens"][1] + c["window_left"]
-        lse = out["stats"].squeeze(-1)
-        assert torch.isneginf(lse[1, :, first_dead:]).all() and (out["o"][1, :, first_dead:] == 0).all(), "rows past the window are keyless"
-        assert torch.isfinite(lse[1, :, :first_dead]).all() and torch.isfinite(lse[0]).all()
+    check(out, ref)
+    check_degenerate_rows(out, case)
 
 
 @requires_rubin
-@pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
-@pytest.mark.parametrize("d", [40, 56])
-@pytest.mark.parametrize("case", ["dense_nkv2", "causal_tail_385", "padded_kv_zero_batch"])
-def test_every_other_served_head_dim_matches_the_fp64_oracle(case, d, dtype):
-    """The remaining members of the served set (40 / 56 on the 64-wide tile), both dtypes, three arms."""
-    q, k, v, kw, ref = _case_inputs(case, d, dtype)
+def test_every_other_served_head_dim_matches_the_fp64_oracle():
+    """D 56: the one served width of the 64-wide tile that neither the grid above (32 / 64) nor the bitwise zero-fill pin below (40 /
+    48) names -- one accept cell, the only one that would catch a TMA box / stride fault specific to that width."""
+    q, k, v, kw, ref = case_inputs("dense_nkv2", 56, torch.bfloat16)
     out = _run(q, k, v, **kw)
-    _assert_small_tile_plan(out, d)
-    _check(out, ref)
+    _assert_small_tile_plan(out, 56)
+    check(out, ref)
+
+
+_SPLIT_CELLS = [("dense_nkv2", 24), ("dense_nkv8_1024", 64)]
 
 
 @requires_rubin
-@pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
-@pytest.mark.parametrize("d", [24, 64])
-@pytest.mark.parametrize("case", ["dense_nkv2", "causal_gqa_8_2", "dense_nkv8_1024"])
-def test_split_kv_at_small_d_rides_the_d128_flavor(case, d, dtype):
+@pytest.mark.parametrize("case, d", _SPLIT_CELLS, ids=[f"{c}-{d}" for c, d in _SPLIT_CELLS])
+def test_split_kv_at_small_d_rides_the_d128_flavor(case, d):
     """A split_kv = 2 request at D <= 64 -- the pre-tile autotune record {TILE_CGA_M: 2, SPLIT_KV: 2} -- is SERVED on the d128 flavor
     the graph rode before the small tiles (only that flavor admits cga2 with a split at D <= 64; the small tiles carry the dense leg
     only) and matches the oracle and the unsplit small-tile run.  Dense, sink-free, tile-multiple S: the split leg's own envelope
-    (padded / synthesized-tail graphs are its typed declines on every flavor)."""
-    q, k, v, kw, ref = _case_inputs(case, d, dtype)
+    (padded / synthesized-tail graphs are its typed declines on every flavor).  The routing is the claim; the split body's own oracle
+    is the pre-existing d128 suite's."""
+    q, k, v, kw, ref = case_inputs(case, d, torch.bfloat16)
     out = _run(q, k, v, split_kv=2, cga=2, **kw)
     assert out["knobs"].split_kv == 2 and out["knobs"].cga == 2, out["knobs"]
-    _check(out, ref)
+    check(out, ref)
     plain = _run(q, k, v, **kw)
     _assert_small_tile_plan(plain, d)
-    torch.testing.assert_close(out["o"].double(), plain["o"].double(), **_TOL_O)
+    torch.testing.assert_close(out["o"].double(), plain["o"].double(), **TOL_O)
+
+
+_SCORE_CELLS = [("dense_nkv2", 24), ("bottom_right_keyless_sink", 64)]
 
 
 @requires_rubin
-@pytest.mark.parametrize("d", [24, 64])
-@pytest.mark.parametrize("case", ["dense_nkv2", "causal_tail_385", "padded_kv_zero_batch", "bottom_right_keyless_sink"])
+@pytest.mark.parametrize("case, d", _SCORE_CELLS, ids=[f"{c}-{d}" for c, d in _SCORE_CELLS])
 def test_score_outputs_at_small_d_ride_the_d128_flavor(case, d):
     """A graph with the score side outputs at D <= 64 is SERVED on the d128 flavor that stores them (the pre-tile route; TILE_CGA_M =
     2): O / Stats against the oracle, ``score_max`` = the scaled row max of the oracle (the sink folded in), ``Stats == score_max +
-    ln(score_sum_exp)`` to fp32 rounding, keyless rows (-inf, 0)."""
-    q, k, v, kw, ref = _case_inputs(case, d, torch.bfloat16)
+    ln(score_sum_exp)`` to fp32 rounding, keyless rows (-inf, 0).  The score arm's own oracle is ``test_sdpa_fwd_score_stats.py``."""
+    q, k, v, kw, ref = case_inputs(case, d, torch.bfloat16)
     out = _run(q, k, v, score_outputs=True, **kw)
     assert out["knobs"].cga == 2 and out["knobs"].split_kv == 1, out["knobs"]
-    _check(out, ref)
+    check(out, ref)
     smax, ssum, lse = (out[n].squeeze(-1) for n in ("score_max", "score_sum_exp", "stats"))
     empty = ref["empty"]
     assert torch.isneginf(smax[empty]).all() and (ssum[empty] == 0).all(), "a keyless row reads (-inf, 0)"
-    torch.testing.assert_close(smax[~empty].double(), ref["smax"][~empty], **_TOL_LSE)
+    torch.testing.assert_close(smax[~empty].double(), ref["smax"][~empty], atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(lse[~empty], smax[~empty] + torch.log(ssum[~empty]), atol=1e-4, rtol=1e-5)
 
 
 @requires_rubin
-@pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
 @pytest.mark.parametrize("d", [24, 32])
-def test_cga2_at_d_le_32_lands_on_the_64_wide_tile(d, dtype):
+def test_cga2_at_d_le_32_lands_on_the_64_wide_tile(d):
     """A cga2 request at D <= 32 (the persisted record {TILE_CGA_M: 2} of the pre-tile d128 route) is SERVED on the 64-wide tile,
     the smallest covering one validated at cga2 -- the d32 tile is cga1-only -- and is BITWISE the D = 64 cga2 run on the same
-    data zero-padded to 64 columns (the zero-fill contract at the second width)."""
-    q, k, v, kw, ref = _case_inputs("causal_gqa_8_2", d, dtype)
+    data zero-padded to 64 columns (the zero-fill contract at the second width; the routing does not read the dtype)."""
+    q, k, v, kw, ref = case_inputs("causal_gqa_8_2", d, torch.bfloat16)
     out = _run(q, k, v, cga=2, **kw)
     assert out["knobs"].cga == 2, out["knobs"]
-    _check(out, ref)
+    check(out, ref)
     qp, kp, vp = (torch.nn.functional.pad(t.transpose(1, 2), (0, 64 - d)).transpose(1, 2) for t in (q, k, v))
     wide = _run(qp, kp, vp, cga=2, **kw)
     assert torch.equal(wide["o"][..., :d], out["o"]) and torch.equal(wide["stats"], out["stats"]), "bitwise the zero-padded d64 cga2 run"
 
 
 @requires_rubin
-@pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
-@pytest.mark.parametrize("d, width", [(24, 32), (48, 64), (8, 32), (40, 64)])
-def test_padded_head_dim_is_bitwise_the_explicitly_zero_padded_tile(d, width, dtype):
+@pytest.mark.parametrize("d, width", [(24, 32), (48, 64), (8, 32), (40, 64)], ids=["24-32", "48-64", "8-32", "40-64"])
+def test_padded_head_dim_is_bitwise_the_explicitly_zero_padded_tile(d, width):
     """The zero-fill contract (plan risk 5): a D = 24 graph is BITWISE the D = 32 graph on the same data zero-padded to 32 columns
     -- O's first 24 columns and the Stats -- because the TMA's OOB zero fill and an explicit zero are the same operand (exact zero
-    terms in QK^T; the padded V columns' O is never stored at D = 24).  Both runs land on the same tile."""
-    q, k, v, kw, _ = _case_inputs("causal_gqa_8_2", d, dtype)
+    terms in QK^T; the padded V columns' O is never stored at D = 24).  Both runs land on the same tile; the TMA zero fill is
+    dtype-blind, so bf16 carries the pin."""
+    q, k, v, kw, _ = case_inputs("causal_gqa_8_2", d, torch.bfloat16)
     narrow = _run(q, k, v, **kw)
     pad = width - d
     qp, kp, vp = (torch.nn.functional.pad(t.transpose(1, 2), (0, pad)).transpose(1, 2) for t in (q, k, v))
@@ -785,26 +601,27 @@ def test_padded_head_dim_is_bitwise_the_explicitly_zero_padded_tile(d, width, dt
 
 
 @requires_rubin
-@pytest.mark.parametrize("case", ["dense_nkv2", "causal_tail_385", "padded_kv_zero_batch", "bottom_right_keyless_sink"])
+@pytest.mark.parametrize("case", ["causal_tail_385", "bottom_right_keyless_sink"])
 def test_d64_tile_at_cga2_matches_the_oracle(case):
     """The 64-wide tile's second validated width: the cga2 plan pinned through its knob (the per-CTA V operand is the 64-byte
-    MN-major atom the SM100 d64 cga2 build runs)."""
-    q, k, v, kw, ref = _case_inputs(case, 64, torch.bfloat16)
+    MN-major atom the SM100 d64 cga2 build runs) on the causal tail and on keyless bottom-right rows with a sink -- the dense cga2
+    tile runs under ``test_cga2_at_d_le_32_lands_on_the_64_wide_tile``."""
+    q, k, v, kw, ref = case_inputs(case, 64, torch.bfloat16)
     out = _run(q, k, v, cga=2, **kw)
     assert out["knobs"].cga == 2
-    _check(out, ref)
+    check(out, ref)
     out1 = _run(q, k, v, cga=1, **kw)
-    torch.testing.assert_close(out["o"].double(), out1["o"].double(), **_TOL_O)
+    torch.testing.assert_close(out["o"].double(), out1["o"].double(), **TOL_O)
 
 
 @requires_rubin
 @pytest.mark.parametrize("d", [32, 64])
 def test_optional_and_base2_stats_on_the_small_tiles(d):
     """Stats compiled out leaves O bitwise; stats_use_log2 scales the Stats alone."""
-    q, k, v, kw, ref = _case_inputs("causal_gqa_8_2", d, torch.bfloat16)
+    q, k, v, kw, ref = case_inputs("causal_gqa_8_2", d, torch.bfloat16)
     with_stats = _run(q, k, v, **kw)
     without = _run(q, k, v, stats=False, **kw)
     assert without["stats"] is None and torch.equal(without["o"], with_stats["o"])
     log2 = _run(q, k, v, stats_log2=True, **kw)
-    _check(log2, ref, stats_log2=True)
+    check(log2, ref, stats_log2=True)
     torch.testing.assert_close(log2["stats"], with_stats["stats"] * math.log2(math.e), atol=1e-4, rtol=1e-5)

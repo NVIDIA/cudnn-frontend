@@ -17,8 +17,9 @@ no-score arm must stay byte-identical to the committed pre-edit cubin md5 record
 adds exactly the stores; (3) GPU cells on the Blackwell-line device present (sm100 or sm107 row): the fp64 oracle over the
 degenerate-input matrix (the KV ring sweep n_kv = 1, 2, 3, 4, 5, 8 -- the sm107 KV ring depth 4 and the sm100 depth 2, each
 with its depth + 1 -- all with B*H > 1; tail tiles; a zero-length KV batch; keyless bottom-right rows with and without a sink;
-keyless rows past a left window under padding; GQA), the base-2 Stats interaction, each output alone, strided layouts, and
-the bitwise identity of O / Stats with the outputs off.
+keyless rows past a left window under padding; GQA) in bf16 with the fp16 member on the dense base and on the ports' documented
+degenerate contract (the keyless row -inf / 0, the sink sink_logit / 1), the base-2 Stats interaction, each output alone,
+strided layouts, and the bitwise identity of O / Stats with the outputs off -- each once, on the 2-CTA tile the arm is wired on.
 """
 
 import inspect
@@ -31,7 +32,6 @@ import pytest
 import torch
 
 from frost_test_utils import _SM, assert_no_new_spills, make_dense_stats, offers_engine, requires_blackwell, requires_dsl, run_sass_probe, sass_probe_source
-from frost_test_utils import select_engine as _select_engine
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 
@@ -412,8 +412,6 @@ def test_score_arm_adds_exactly_the_stores(tmp_path, arch):
 
 # --------------------------------------------------------------------------- tier 3: GPU cells (the row of the device present)
 
-_DTYPES = [torch.float16, torch.bfloat16]
-_DTYPE_IDS = ["fp16", "bf16"]
 # Tolerances DERIVED from the kernel's arithmetic, not from the first passing run:
 #   score_max: S is the fp32 tcgen05 accumulation of exact bf16/f16 products over d = 128 (|err| <= 128 * 2^-24 * sum|q k|,
 #              ~2e-4 at these magnitudes), then one FMUL by scale*log2(e) and one by ln 2 (2 roundings, ~1e-7 relative):
@@ -522,8 +520,30 @@ def _run(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    plan = _select_engine(g, _ROW)
-    assert plan.knobs.split_kv in (None, 1) and plan.knobs.cga in (None, 2), plan.knobs
+    # The plan: the row's unsplit, unpacked 2-CTA prefill tile -- the tile the score arm is wired on -- PINNED, never inferred from the
+    # ranking: with the ports off the heuristics may rank another tile of the row first (the PackGQA cga1 plan on a 148 / 152-SM part for
+    # the GQA shapes), and the bitwise comparisons below must be like for like.  A cga2 plan not in the ranked list is replayed through the
+    # public autotune record (the way an autotuner replays it).
+    names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
+    ours = [i for i, n in enumerate(names) if n == _ROW or n.startswith(_ROW + "[")]
+    assert ours, f"no {_ROW} plan in {names}"
+
+    def _prefill_tile(i):
+        kn = g.plans[i].knobs
+        return (kn.split_kv or 1) == 1 and not kn.pack_gqa and kn.cga in (None, 2)
+
+    idx = next((i for i in ours if _prefill_tile(i)), None)
+    if idx is None:
+        engine_id, record = g.get_engine_and_knobs_at_index(ours[0])
+        record = dict(record)
+        record[cudnn.knob_type.TILE_CGA_M] = 2
+        record[cudnn.knob_type.PACK_GQA] = 0
+        record[cudnn.knob_type.SPLIT_KV] = 1
+        g.create_execution_plan(engine_id, record)
+        idx = g.get_execution_plan_count() - 1
+    g.select_plan(idx)
+    plan = g.plans[idx]
+    assert (plan.knobs.split_kv or 1) == 1 and not plan.knobs.pack_gqa and plan.knobs.cga in (None, 2), plan.knobs
     g.check_support()
     g.build_plans()
     vp[o] = o_gpu
@@ -615,9 +635,14 @@ def _case_inputs(case, dtype, *, seed=0):
     return q, k, v, dict(scale=scale, sdpa_kwargs=sdpa_kwargs, seq_len_kv=kv_lens, seq_len_q=q_lens, sink=sink), ref
 
 
+# every case in bf16; the fp16 member on the dense base and on the ports' documented degenerate contract (the keyless row -inf / 0, the sink
+# sink_logit / 1) -- the fp16 O cast is the only place the dtype enters
+_DT_IDS = {torch.float16: "fp16", torch.bfloat16: "bf16"}
+_ORACLE_CELLS = [(c, torch.bfloat16) for c in _CASES] + [("dense_nkv2", torch.float16), ("bottom_right_keyless_sink", torch.float16)]
+
+
 @requires_blackwell
-@pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
-@pytest.mark.parametrize("case", list(_CASES))
+@pytest.mark.parametrize("case, dtype", _ORACLE_CELLS, ids=[f"{c}-{_DT_IDS[t]}" for c, t in _ORACLE_CELLS])
 def test_score_stats_match_the_fp64_oracle(case, dtype):
     q, k, v, kw, ref = _case_inputs(case, dtype)
     out = _run(q, k, v, **kw)
@@ -644,10 +669,9 @@ def test_score_stats_match_the_fp64_oracle(case, dtype):
 
 
 @requires_blackwell
-@pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
-def test_score_stats_without_stats_and_each_output_alone(dtype):
+def test_score_stats_without_stats_and_each_output_alone():
     """The ports are independent of generate_stats and of each other (each store is its own compile-time arm)."""
-    q, k, v, kw, ref = _case_inputs("dense_nkv2", dtype)
+    q, k, v, kw, ref = _case_inputs("dense_nkv2", torch.bfloat16)
     both = _run(q, k, v, stats=False, **kw)
     assert both["stats"] is None
     _check(both, ref, has_stats=False)
@@ -658,11 +682,10 @@ def test_score_stats_without_stats_and_each_output_alone(dtype):
 
 
 @requires_blackwell
-@pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
-def test_score_stats_stay_natural_under_base2_stats(dtype):
+def test_score_stats_stay_natural_under_base2_stats():
     """stats_use_log2 scales the Stats alone: score_max / score_sum_exp keep their natural units, and Stats ==
     log2(e) * (score_max + ln score_sum_exp) from the kernel's own outputs."""
-    q, k, v, kw, ref = _case_inputs("causal_gqa_8_2", dtype)
+    q, k, v, kw, ref = _case_inputs("causal_gqa_8_2", torch.bfloat16)
     out = _run(q, k, v, stats_log2=True, **kw)
     _check(out, ref, has_stats=False)
     smax, ssum, lse2 = out["score_max"].squeeze(-1), out["score_sum_exp"].squeeze(-1), out["stats"].squeeze(-1)
@@ -682,12 +705,12 @@ def test_score_stats_strided_layouts_are_bitwise_the_contiguous_ones():
 
 
 @requires_blackwell
-@pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
-def test_score_stats_leave_o_bitwise_and_stats_within_one_rounding(dtype):
-    """O is bitwise the plan without the outputs (the P / O arithmetic is untouched).  Stats is the same expression,
-    max * ln2 + ln(sum), but the score arm materialises the product (it is stored), so ptxas can no longer contract it
-    into the add: one fp32 rounding (a few ulp at |Stats| ~ 8), never more -- the pin is 4 ulp of that magnitude."""
-    q, k, v, kw, _ = _case_inputs("causal_gqa_8_2", dtype)
+def test_score_stats_leave_o_bitwise_and_stats_within_one_rounding():
+    """O is bitwise the plan without the outputs (the P / O arithmetic is untouched; both plans on the same 2-CTA tile -- ``_run``
+    pins it with the ports off too).  Stats is the same expression, max * ln2 + ln(sum), but the score arm materialises the product
+    (it is stored), so ptxas can no longer contract it into the add: one fp32 rounding (a few ulp at |Stats| ~ 8), never more -- the
+    pin is 4 ulp of that magnitude."""
+    q, k, v, kw, _ = _case_inputs("causal_gqa_8_2", torch.bfloat16)
     with_outputs = _run(q, k, v, **kw)
     without = _run(q, k, v, outputs=(), **kw)
     assert torch.equal(with_outputs["o"], without["o"]), "O must not depend on the side outputs"

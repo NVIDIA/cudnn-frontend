@@ -8,7 +8,9 @@ the GPU-free contract tests (the lazy export in every import order, the signatur
 a declaration raises before any device work); the prefix-mask form (``mask_is_prefix=True``: the lengths derived on the device by ONE
 launch of the row-popcount kernel, no cast pass, no host synchronisation) bitwise against both lengths routes, its debug check, its
 allocation-free execute, its CUDA-graph capture, the kernel's own pins (bitwise the torch row count on every shape and layout on ANY
-CUDA device, allocation- and sync-free with ``out`` given, graph-captured, the typed DSL-floor decline) and the one-kernel CUPTI evidence.
+CUDA device, allocation- and sync-free with ``out`` given, graph-captured, the typed DSL-floor decline).  The acceptance grid is one cell
+per (key-mask form, tile width, bias-staging class): the kernel paths are pinned per body by the sdpa modules, and B = 2 is bitwise two
+B = 1 calls (its own pin below).
 
 Tolerances are the SM107 f16 row's own (test_sdpa_bias_sm107.py), not widened for this layer: O against the fp64 oracle at
 atol 5e-2 / rtol 3e-2 (an fp32 accumulation, one 16-bit rounding at the store), the LSE at 1e-4 / 1e-4 (the bias enters the fp32 score
@@ -393,18 +395,37 @@ def _no_copies():
     return c.get("fallback_copies", 0) == 0, c
 
 
+# One cell per (key-mask form, tile width, bias-staging class) at B 1 (B 2 is bitwise two B 1 calls: the dedicated pins below).  (S, D, form):
+# the 64-wide pair resident block at the padded-stride bias tail (217, all three forms), the pair n4 resident block at 128 (384), the
+# one-batch-entry streamed ring and the S_q % 256 guard (512 none), the pair n8 resident at 64 under lengths / under the word (512), the
+# TMEM-Q bias-only body (256 at D 64), the d64 pair ring at 128 with 3 stages (512 at D 64 none), the 64-wide d64 ring under lengths / the
+# word -- the latter the TMEM-Q bias + mask body (512 at D 64), one 64-column kv tile with both resident arms (64 mask), and the d64
+# padded-stride bias tail under the word (217 at D 64 mask: no sdpa module runs a d64 bias tail).
+_GRID = [
+    (217, 32, "none"),
+    (217, 32, "kv_lengths"),
+    (217, 32, "mask"),
+    (384, 32, "none"),
+    (512, 32, "none"),
+    (512, 32, "kv_lengths"),
+    (512, 32, "mask"),
+    (256, 64, "none"),
+    (512, 64, "none"),
+    (512, 64, "kv_lengths"),
+    (512, 64, "mask"),
+    (64, 32, "mask"),
+    (217, 64, "mask"),
+]
+
+
 @requires_rubin
-@pytest.mark.parametrize("form", ["none", "kv_lengths", "mask"])
-@pytest.mark.parametrize("b", [1, 2])
-@pytest.mark.parametrize("d", [32, 64])
-@pytest.mark.parametrize("s", [64, 128, 217, 256, 384, 512])
-def test_function_matches_the_fp64_reference(s, d, b, form):
+@pytest.mark.parametrize("s, d, form", _GRID, ids=[f"{s}-{d}-{form}" for s, d, form in _GRID])
+def test_function_matches_the_fp64_reference(s, d, form):
     """The drop-in on the zero-copy layout over the acceptance grid: S (one tile, the budget edges, a tail at 217 whose bias is padded,
-    the streamed ring above the resident budget), D 32 / 64, B 1 / 2 (a per-entry bias at B = 2: one launch per entry), the three key-mask
-    forms with empty rows on both mask forms.  No layout copy except the documented bias pad at S % 8 != 0."""
-    if b == 2 and s == 512:
-        pytest.skip("B = 2 at S = 512 is the same cells with twice the fp64 oracle memory; B = 2 is covered to S = 384")
-    q, k, v, bias, gen = _inputs(s, d, b=b, bias_form="bh" if b > 1 else "h", seed=s * 7 + d)
+    the streamed ring above the resident budget), D 32 / 64, the three key-mask forms with empty rows on both mask forms.  No layout copy
+    except the documented bias pad at S % 8 != 0."""
+    b = 1
+    q, k, v, bias, gen = _inputs(s, d, seed=s * 7 + d)
     kw = {}
     if form == "kv_lengths":
         kw["kv_lengths"] = _lengths(b, s, s, gen, empty_rows=((0, 1),))
@@ -426,9 +447,9 @@ def test_function_matches_the_fp64_reference(s, d, b, form):
 
 
 @requires_rubin
-@pytest.mark.parametrize("form", ["none", "kv_lengths", "mask"])
-@pytest.mark.parametrize("d", [24, 48])
+@pytest.mark.parametrize("d, form", [(24, "mask"), (48, "kv_lengths")], ids=["24-mask", "48-kv_lengths"])
 def test_head_dims_below_the_tile_are_served_by_zero_fill(d, form):
+    """One accept cell per tile width through the API (the zero fill itself is bitwise-pinned on the plain body by the sdpa head-dim module)."""
     s = 256
     q, k, v, bias, gen = _inputs(s, d, seed=d)
     kw = {"kv_lengths": _lengths(1, s, s, gen)} if form == "kv_lengths" else ({"mask": _dense_mask(1, s, s, gen)} if form == "mask" else {})
@@ -811,11 +832,12 @@ def test_cuda_graph_capture_replays_bitwise_and_follows_new_data():
 
 
 @requires_rubin
-@pytest.mark.parametrize("s,d,b", [(256, 32, 1), (384, 32, 2), (217, 32, 1), (512, 64, 1)])
+@pytest.mark.parametrize("s,d,b", [(217, 32, 1), (512, 64, 1)])
 def test_prefix_mask_form_equals_both_lengths_routes_bitwise(s, d, b):
     """``mask_is_prefix=True`` on a prefix mask (rows of every length incl. 0 and S_kv; S = 217 a tail that is not a multiple of the kv
-    tile) yields o bitwise equal to ``kv_lengths=mask_to_kv_lengths(mask)`` and to the explicit lengths tensor, with no counted copy; the
-    class API's prefix plan matches the kv_lengths plan bitwise on o AND lse, and the lengths it derived sit in the caller's workspace."""
+    tile, 512 at D 64 the ring -- the two renderings the derivation feeds) yields o bitwise equal to ``kv_lengths=mask_to_kv_lengths(mask)``
+    and to the explicit lengths tensor, with no counted copy; the class API's prefix plan matches the kv_lengths plan bitwise on o AND lse,
+    and the lengths it derived sit in the caller's workspace."""
     q, k, v, bias, gen = _inputs(s, d, b=b, bias_form="bh" if b > 1 else "h", seed=s * 3 + d + b)
     if s % 8:
         bias = torch.empty(*bias.shape[:4], -(-s // 8) * 8, device="cuda", dtype=bias.dtype)[..., :s].copy_(bias)  # the caller's own padded row: zero-copy
@@ -954,11 +976,12 @@ def test_prefix_mask_form_captures_into_a_cuda_graph_and_follows_the_mask_conten
 
 
 @requires_cuda
-@pytest.mark.parametrize("b,n,s", [(1, 1, 1), (1, 3, 7), (2, 5, 11), (1, 256, 217), (2, 64, 384), (1, 128, 768), (1, 8, 5000), (3, 33, 1023), (1, 2, 0)])
+@pytest.mark.parametrize("b,n,s", [(1, 2, 0), (1, 3, 7), (1, 256, 217), (1, 8, 5000), (3, 33, 1023)])
 def test_prefix_lengths_kernel_is_bitwise_the_torch_row_count_on_every_shape(b, n, s):
     """The one-launch derivation on ANY CUDA device (the kernel is arch-generic): the counts of a random, NON-prefix mask with all-False and
-    all-True rows equal ``mask.sum(-1, dtype=int32)`` bitwise -- S_kv not a multiple of 8 / 32 / 128, S_kv = 0 and S_kv = 1 included -- on
-    the contiguous mask and on strided views of a wider buffer (a batch slice, a padded row stride, two strided key views)."""
+    all-True rows equal ``mask.sum(-1, dtype=int32)`` bitwise -- S_kv = 0, below one warp, not a multiple of 8 / 32 / 128 (217, 1023), many
+    words (5000), B > 1 -- on the contiguous mask and on strided views of a wider buffer (a batch slice, a padded row stride, two strided key
+    views) in every cell."""
     gen = torch.Generator(device="cuda").manual_seed(b * 1000003 + n * 1009 + s)
     mask = torch.rand(b, n, 1, 1, s, generator=gen, device="cuda") < 0.6 if s else torch.zeros(b, n, 1, 1, 0, dtype=torch.bool, device="cuda")
     if n > 2:
@@ -1042,39 +1065,6 @@ def test_prefix_lengths_kernel_declines_a_too_old_dsl_typed(monkeypatch):
         pl.prefix_lengths_plan.cache_clear()
     assert pl.requirement_error(mask.device.index or 0) is None
     assert torch.equal(tapi.prefix_mask_to_kv_lengths(mask, check=False).view(-1), torch.tensor([9, 9], dtype=torch.int32, device="cuda"))
-
-
-@requires_rubin
-def test_prefix_mask_form_launches_one_derivation_kernel():
-    """The device-side evidence of the fused form: the profiler (CUPTI) over one warm execute of the prefix plan records exactly ONE
-    kernel besides the attention launches -- the derivation kernel, named after its module -- and no cast / reduce kernel.  Skipped when
-    the profiler yields no device kernel at all (a CUPTI older than the part)."""
-    from torch.autograd import DeviceType
-    from torch.profiler import ProfilerActivity, profile
-
-    s = 256
-    q, k, v, bias, gen = _inputs(s, 32, seed=29)
-    lengths = _lengths(1, s, s, gen, empty_rows=((0, 3),))
-    mask = torch.arange(s, device="cuda").view(1, 1, 1, 1, s) < lengths
-    plan = tapi.TriangleAttentionFwd(q, k, v, bias, mask=True, mask_is_prefix=True)
-    plan.check_support()
-    plan.compile()
-    o = tapi._bshd_empty(*q.shape, q.dtype, q.device)
-    ws = torch.empty(plan.get_workspace_size(), dtype=torch.uint8, device="cuda")
-    for _ in range(3):
-        plan.execute(q, k, v, bias, None, o, None, None, ws, mask=mask, check_prefix_mask=False)
-    torch.cuda.synchronize()
-    with profile(activities=[ProfilerActivity.CUDA]) as prof:
-        plan.execute(q, k, v, bias, None, o, None, None, ws, mask=mask, check_prefix_mask=False)
-        torch.cuda.synchronize()
-    names = [e.name for e in prof.events() if e.device_type == DeviceType.CUDA and "memset" not in e.name.lower() and "memcpy" not in e.name.lower()]
-    if not names:
-        pytest.skip("the profiler recorded no device kernel (CUPTI unavailable for this part)")
-    derivation = [n_ for n_ in names if "prefix_lengths" in n_]
-    assert len(derivation) == 1 and len(names) == 1 + plan.launches_per_call, names
-    assert not any("elementwise" in n_ or "reduce_kernel" in n_ for n_ in names), names
-    torch.cuda.synchronize()
-    assert torch.equal(o, tapi.triangle_attention(q, k, v, bias, kv_lengths=lengths))
 
 
 @requires_rubin

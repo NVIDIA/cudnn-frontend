@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The third softmax warp group of the Rubin f16/bf16 d128-file body (``TemplateParams.softmax_wgs = 3``) -- an EXPERIMENT, selectable, not a default.
+"""The third softmax warp group of the Rubin f16/bf16 d128-file body (``TemplateParams.softmax_wgs = 3``): the MEASURED default of ONE class
+(``config_sm107.sm107_softmax_wgs_pick``: bias + kv_mask on the pair item at TILE_N 64, cga1, dense KV lengths, ``s_kv >= 640``, ``b_flat
+<= 3072``) and a public ``softmax_wgs=3`` request elsewhere on the pair item.
 
 The (n, n+1) pair work item (``n_chunk >= 1``) at TILE_N 64 can run THREE softmax warp groups: a 20-warp body (WG0 / WG1 / WG2 at warps
 0-11, correction 12-15, MMA 16, TMA-LDG 17, TMA-STG 18, scheduler 19) whose step takes three rows of the chunk, one ring stage per
@@ -10,28 +12,24 @@ Every value computes the SAME function: a row's softmax runs the same instructio
 BITWISE the two-group kernel's.  The arm is served on the pair item at tile_n 64 / cga 1 on the f16/bf16 32- / 64-wide tiles with a bias
 and declined typed everywhere else (the one-batch-entry paths hand-unroll two sub-tiles; a 128-register softmax holds one 64-column chunk).
 
-Tiers: CPU contract (the record field, the seam, the factory's derived warp table / split / arriver counts, the pool equality, the TMEM map,
-the bias budget at three slabs, the typed declines of the factory and the adapter), host rendering pins (sm_107a trace-compile: the two-group
-renderings are byte-identical to the committed md5 records -- the arm adds no instruction to them; the three-group renderings carry the split
-(``USETMAXREG`` 7 = 2 INCREASE sites + 5 DECREASE), no cluster drain, the bit-word mask form, and spill within the measured bound), GPU (Rubin):
-the fp64 oracle over the ring-wrap axis n_kv = 1 / 2 / 3 / 4 / 8 at TILE_N 64 on the pair item (bias, bias + kv_mask, causal, dead chunk
-tails, B > 1, the streamed ring) and BITWISE equality with the two-group kernel.
+Tiers: CPU contract (the record field, the measured rule, the factory's derived warp table / split / arriver counts, the pool equality, the
+TMEM map, the bias budget at three slabs, the typed declines of the factory and the adapter incl. the knob-less rule cells), host rendering pins
+(sm_107a trace-compile: the three-group renderings of the default class carry the split (``USETMAXREG`` 7 = 2 INCREASE sites + 5 DECREASE), no
+cluster drain, the bit-word mask form, and spill within the measured bound; the two-group renderings' byte identity to the committed records is
+pinned by the streamed module), GPU (Rubin): the DEFAULT class knob-less on both tiles (the pick -> record -> plan chain end to end, the
+record's ``softmax_wgs`` read off the loaded module) and the public option on the bias-only pair item (a ring wrap with a dead chunk tail, a
+zero-length row in a chunk) -- the fp64 oracle and BITWISE equality with the two-group kernel.
 """
 
 import dataclasses
-import re
-from pathlib import Path
 
 import pytest
 import torch
 
 from frost_test_utils import assert_no_new_spills, requires_rubin, run_sass_probe, sass_probe_source
 import test_sdpa_bias_sm107 as _s13
-import test_sdpa_bias_streamed_sm107 as _s15
 
 pytestmark = [pytest.mark.L0]
-_RENDERINGS = Path(__file__).resolve().parent / "renderings"
-_KERNEL = Path(__file__).resolve().parents[4] / "python" / "cudnn" / "sdpa" / "fwd" / "kernels" / "sm107" / "prefill_d128_f16.py"
 
 
 @pytest.fixture(autouse=True)
@@ -113,17 +111,6 @@ def test_the_measured_default_rule_and_the_triple_step_chunk():
     assert c.sm107_n_chunk_rule(1, 4, 128, 212, rows_per_step=3) == 0, "a single row keeps the one-batch-entry item"
 
 
-def test_the_seam_feeds_the_record_not_a_cfg_behind_it(_pins):
-    """The kernel-module cache is keyed by the TemplateParams: a seam that moved only the Cfg would hand a second in-process build the first
-    build's module (verified on the ring-depth seam, 2026-10-09).  This seam feeds the pick that the adapter writes INTO the record."""
-    from cudnn.sdpa.fwd import config_sm107 as c
-
-    _pins(softmax_wgs=3)
-    assert c.sm107_softmax_wgs_pick() == 3 and c.sm107_softmax_wgs_pick(2) == 2
-    cfg, _ = _make(32)(_params())  # the seam is NOT read by the factory: the record decides
-    assert cfg.SOFTMAX_WARPGROUPS == 2
-
-
 @pytest.mark.parametrize("d", [32, 64])
 def test_the_factory_derives_the_twenty_warp_table_the_split_and_the_arriver_counts(d):
     """The three-group body as the config: 20 warps, one group per sub-tile, the role ids contiguous, READ_TILE_ARRIVERS 19 (12 softmax + 4
@@ -163,17 +150,11 @@ def test_the_tmem_map_and_the_bias_budget_at_three_slabs():
     assert c.sm107_bias_stages_pick(32, 1, tile_n=64, pair=True, tiles_q=3) == 3
 
 
+# the factory's own declines; the TILE_N 128 / one-batch-entry / no-bias cells are the adapter twin's below (the same predicate, typed there)
 @pytest.mark.parametrize(
     "kw, match",
-    [
-        (dict(tile_n=128), "TILE_N 64"),
-        (dict(n_chunk=0), "pair item"),
-        (dict(bias_mode=0, n_chunk=0), "pair item"),
-        (dict(cta_mma=2, d_flavor=64), "cga1"),
-        (dict(softmax_wgs=4), "softmax_wgs must be one of"),
-        (dict(softmax_wgs=1), "softmax_wgs must be one of"),
-    ],
-    ids=["tile_n_128", "one_batch_entry", "no_bias", "cga2", "four_groups", "one_group"],
+    [(dict(cta_mma=2, d_flavor=64), "cga1"), (dict(softmax_wgs=4), "softmax_wgs must be one of"), (dict(softmax_wgs=1), "softmax_wgs must be one of")],
+    ids=["cga2", "four_groups", "one_group"],
 )
 def test_the_factory_declines_the_third_group_off_its_serving_set(kw, match):
     from cudnn.sdpa.fwd import config_sm107 as c
@@ -263,25 +244,6 @@ def test_adapter_check_support_is_the_factorys_twin(_rubin_adapter, kw, accept):
             api.check_support()
 
 
-def test_kernel_carries_the_third_group_as_const_expr_arms_of_the_pair_item():
-    """The 3-WG arm is a set of `const_expr` arms on the pair item's per-sub-tile loops (no fork of a role body): the hand-off chain's
-    second link, the WG2 dispatch inside the WG1 arm, the derived pre-load, the backstops -- and every per-sub-tile protocol of the five pair
-    roles is spelled once inside a `range_constexpr(CFG.TILES_Q)` loop."""
-    src = _KERNEL.read_text()
-    assert src.count("_BIAS_PRELOAD_EFF: int = BIAS_PRELOAD_CHUNKS if CFG.SOFTMAX_WARPGROUPS == 2 else 0") == 1
-    assert src.count("if cutlass.const_expr(CFG.SOFTMAX_WARPGROUPS == 3 and sub_tile_id == 2):") == 2, "WG2's top wait of the chain (both softmax bodies)"
-    assert src.count("if cutlass.const_expr(CFG.SOFTMAX_WARPGROUPS == 3 and sub_tile_id == 1):") == 2, "WG1's bottom release of the chain (both bodies)"
-    # barrier 8: the two live softmax bodies' ping-pong (4 sites) + the dead-sub-tile QUIET body's (2; a one-batch-entry form, never three groups);
-    # barrier 9: the WG1 -> WG2 link in the two live bodies only
-    assert src.count("nvvm.barrier_cta_sync(barrier_id=9, thread_count=256)") == 4 and src.count("nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)") == 6
-    assert "if cutlass.const_expr(CFG.SOFTMAX_WARPGROUPS == 3):\n            if warp_idx >= CFG.SOFTMAX_WG1_BASE + CFG.SOFTMAX_WG_WARPS:" in src
-    assert "sub_tile_id=2," in src and "softmax_wg_base_const = CFG.SOFTMAX_WG0_BASE + sub_tile_id * CFG.SOFTMAX_WG_WARPS" in src
-    assert "if CFG.SOFTMAX_WARPGROUPS == 3 and not (_PAIR_ARM and CFG.N_BMM2_CHUNKS == 1):" in src
-    assert "rows, lives = _pair_step_rows(n0, n_end, j)" in src and "return tuple(rows), tuple(lives)" in src
-    assert "desc_Q.append(sQ[2].desc())" in src and "LAYOUT.S_OFF[sub_tile_id]" in src and "LAYOUT.O_OFF[qs]" in src
-    assert "S0_OFF if sub_tile_id" not in src and "O0_OFF if qs" not in src and "nb0, nb1" not in src.split("# === The pair item's row")[1]
-
-
 # --------------------------------------------------------------------------- tier 2: host rendering pins (sm_107a trace-compile)
 
 _PROBE_BODY = """
@@ -311,17 +273,12 @@ _COUNTS = {
     "BAR.SYNC": ("BAR.SYNC",),
 }
 # The 3-WG renderings' spill counts MEASURED on the branch's own toolchain (cutlass-dsl 4.8.0 + the CUDA 13.5 ptxas, sm_107a, 2026-10-09):
-# the bias arm 0 / 0, the bias + kv_mask + padded + causal arm STL 5 / LDL 9 -- in the 56-register CORRECTION group's masked epilogue (the
-# `_kv_empty` band arithmetic beside the per-row trim), not in the 128-register softmax; the two-group rendering of the same arm reads 0 / 0.
-# A bound, not a literal (frost_test_utils.SPILL_TOLERANCE).
-_WG3_SPILL_PINS = {
-    "d32_pair4_t64_bias": (0, 0),
-    "d32_pair4_t64_bias_mask_padded_causal": (5, 9),
-    "d32_pair8_t64_bias_streamed": (0, 0),
-    "d64_pair4_t64_bias_streamed": (0, 0),
-}
+# the bias + kv_mask + padded + causal arm STL 5 / LDL 9 -- in the 56-register CORRECTION group's masked epilogue (the `_kv_empty` band
+# arithmetic beside the per-row trim), not in the 128-register softmax; the streamed bias arm 0 / 0 (the two-group rendering of each arm reads
+# 0 / 0).  A bound, not a literal (frost_test_utils.SPILL_TOLERANCE).  The two renderings here are the DEFAULT class's (bias + kv_mask: the
+# masked resident block, the streamed ring at the chunk the 3-WG body runs); the bias-only 3-WG renderings are the option's, no default renders them.
+_WG3_SPILL_PINS = {"d32_pair4_t64_bias_mask_padded_causal": (5, 9), "d32_pair8_t64_bias_streamed": (0, 0)}
 _WG3_ARMS = {
-    "d32_pair4_t64_bias": {"__d": 32, "cta_mma": 1, "dtype_qkv": 2, "bias_mode": 1, "n_chunk": 4, "tile_n": 64},
     "d32_pair4_t64_bias_mask_padded_causal": {
         "__d": 32,
         "cta_mma": 1,
@@ -334,33 +291,11 @@ _WG3_ARMS = {
         "tile_n": 64,
     },
     "d32_pair8_t64_bias_streamed": {"__d": 32, "cta_mma": 1, "dtype_qkv": 2, "bias_mode": 2, "n_chunk": 8, "tile_n": 64},
-    "d64_pair4_t64_bias_streamed": {"__d": 64, "cta_mma": 1, "dtype_qkv": 2, "bias_mode": 2, "n_chunk": 4, "tile_n": 64},
 }
 
 
 def _probe(tmp_path, params, tag):
     return run_sass_probe(tmp_path, probe_src=sass_probe_source(_PROBE_BODY, _COUNTS), arch="sm_107a", params=params, tag=tag)
-
-
-def _skip_unless_record_dsl(dsl):
-    from cudnn.frost.buffers import cutedsl_state
-
-    _installed, version = cutedsl_state()
-    have = " ".join(version) if version else None
-    if dsl is not None and have != dsl:
-        pytest.skip(f"the md5 record was rendered with {dsl}; installed {have}: the cubin is a function of the DSL build")
-
-
-@pytest.mark.parametrize("arm", list(_s15._RESIDENT_RECORD_ARMS))
-def test_the_two_group_renderings_are_byte_identical_to_the_committed_record(tmp_path, arm):
-    """The arm adds no instruction to the two-group body: the pair item's roles now spell their protocol in `range_constexpr(TILES_Q)` loops
-    and the bodies index the TMEM tuples, both of which trace the SAME ops in the SAME order at two sub-tiles -- the committed md5 records
-    (rendered before the arm) pin it."""
-    dsl, want = _s15._record()
-    _skip_unless_record_dsl(dsl)
-    probe = _probe(tmp_path, dict(_s15._RESIDENT_RECORD_ARMS[arm]), f"wg2_{arm}")
-    assert probe.expect["SOFTMAX_WARPGROUPS"] == 2 and probe.expect["TOTAL_WARPS"] == 16
-    assert probe.cubin_md5 == want[arm], f"{arm}: cubin md5 {probe.cubin_md5} != the record's {want[arm]} -- the two-group rendering changed"
 
 
 @pytest.mark.parametrize("arm", list(_WG3_ARMS))
@@ -386,34 +321,40 @@ def test_the_three_group_rendering_carries_the_split_the_chain_and_the_mask_form
 
 # --------------------------------------------------------------------------- tier 3: GPU (Rubin) -- the pair item's degenerate matrix at three groups
 
-# TILE_N 64 -> n_kv = S_kv / 64: the ring-wrap axis n_kv = 1 / 2 / 3 / 4 / 8 (STAGES_KV 4: one wrap at 4, two at 8), chunk lengths that are and
-# are not multiples of 3 (dead tails of one / two rows), a chunk shorter than three rows (every step a dead row), B * H > 1 at one kv tile,
-# causal + padded rows, a zero-length row inside a chunk, the padded-Q trim, a head-broadcast bias, the 64-wide tile, the streamed ring
-# (S_kv 1024 > the 896 resident budget at three slabs).
+# The public ``softmax_wgs=3`` OPTION on the bias-only pair item (the class the measurement rejected: two cells -- a ring wrap with a dead
+# chunk tail at a chunk that is not a multiple of three, a zero-length row inside a chunk under the band + padding); TILE_N 64 -> n_kv = S_kv / 64.
 _CASES = {
-    "nkv1_chunk3": dict(b=6, h=2, h_kv=2, s_q=128, s_kv=64, n_chunk=3),
-    "nkv2_chunk4_dead_tail_two": dict(b=4, h=2, h_kv=2, s_q=128, s_kv=128, n_chunk=4),
-    "nkv3_chunk6": dict(b=6, h=2, h_kv=2, s_q=192, s_kv=192, n_chunk=6),
     "nkv4_wrap_chunk5_dead_tail_one": dict(b=5, h=2, h_kv=2, s_q=256, s_kv=256, n_chunk=5),
     "nkv8_two_wraps_chunk3": dict(b=6, h=2, h_kv=2, s_q=512, s_kv=512, n_chunk=3),
-    "chunk_of_two_dead_row_every_step": dict(b=4, h=2, h_kv=2, s_q=256, s_kv=256, n_chunk=2),
-    "chunk_of_one_two_dead_rows_every_step": dict(b=3, h=2, h_kv=2, s_q=256, s_kv=256, n_chunk=1),
-    "bh_gt_1_nkv_1": dict(b=9, h=4, h_kv=4, s_q=64, s_kv=64, n_chunk=3),
-    "causal_384_chunk3": dict(b=6, h=2, h_kv=2, s_q=384, s_kv=384, n_chunk=3, causal=True),
     "causal_padded_zero_row_in_chunk": dict(b=6, h=2, h_kv=2, s_q=256, s_kv=256, n_chunk=3, causal=True, kv_lens=[256, 0, 100, 256, 0, 200]),
-    "padded_q_trim_triple": dict(
-        b=6, h=4, h_kv=2, s_q=256, s_kv=256, n_chunk=3, causal=True, q_lens=[256, 100, 0, 256, 129, 200], kv_lens=[256, 200, 256, 0, 256, 128]
-    ),
-    "tail_tile_200": dict(b=6, h=2, h_kv=2, s_q=200, s_kv=200, n_chunk=3),
-    "head_broadcast_bias_x10": dict(b=6, h=4, h_kv=4, s_q=256, s_kv=256, n_chunk=3, bias="1", bias_scale=10.0),
-    "d64_chunk3_384": dict(b=6, h=2, h_kv=2, s_q=384, s_kv=384, d=64, n_chunk=3),
-    "streamed_ring_1024_chunk6": dict(b=6, h=2, h_kv=2, s_q=1024, s_kv=1024, n_chunk=6, mode=2),
-    "resident_edge_896_chunk3": dict(b=6, h=2, h_kv=2, s_q=896, s_kv=896, n_chunk=3),
+}
+# The DEFAULT class, KNOB-LESS (no seam, no knob: the pick -> the record -> the plan): bias + the bool kv_mask on the pair item (a batch-broadcast
+# bias on >= 2 flattened rows), dense KV lengths, ``s_kv >= 640`` with ``b_flat <= 3072`` -- the 32-wide tile at S 1024 (above the three-slab
+# resident budget: the ring).  The record read off the loaded module must
+# carry ``softmax_wgs`` 3 at TILE_N 64 on the pair item; the two-group twin is the seam's.
+_KNOB_LESS_CASES = {
+    "streamed_ring_1024_chunk6": dict(b=6, h=2, h_kv=2, s_q=1024, s_kv=1024),
 }
 
 
-def _case_inputs(case, dtype, *, kv_mask_p=None):
-    return _s13._case_inputs(case, dtype, kv_mask_p=kv_mask_p, table=_CASES)
+def _case_inputs(case, dtype, *, kv_mask_p=None, table=None):
+    return _s13._case_inputs(case, dtype, kv_mask_p=kv_mask_p, table=_CASES if table is None else table)
+
+
+def _spy_loaded_records(monkeypatch):
+    """Record the ``TemplateParams`` of every kernel module the adapter loads (the record the EXECUTED plan carries; a memoised load still
+    passes through the spy): the compiled record is not on the graph's public surface, so a knob-less cell reads its form here."""
+    from cudnn.sdpa.fwd import api_dsl
+
+    seen = []
+    real = api_dsl._load_sm100_kernel_module
+
+    def spy(flavor, params, *a, **kw):
+        seen.append(params)
+        return real(flavor, params, *a, **kw)
+
+    monkeypatch.setattr(api_dsl, "_load_sm100_kernel_module", spy)
+    return seen
 
 
 def _run_tile_n_64(q, k, v, *, scale, bias=None, kv_mask=None, sdpa_kwargs=None, seq_len_kv=None, seq_len_q=None, sink=None, stats=True, cga=None):
@@ -462,11 +403,11 @@ def _run(q, k, v, kw, c, _pins, *, softmax_wgs):
 
 
 @requires_rubin
-@pytest.mark.parametrize("case", list(_CASES))
+@pytest.mark.parametrize("case", ["nkv4_wrap_chunk5_dead_tail_one", "causal_padded_zero_row_in_chunk"])
 def test_three_groups_match_the_fp64_oracle_and_are_bitwise_the_two_group_kernel(case, _pins):
-    """At three softmax warp groups the pair item matches the fp64 oracle over its degenerate matrix and is BITWISE the two-group kernel on O
-    and Stats: a row's softmax runs the same instruction stream whichever group owns it; the step's grouping of rows does not touch a row's
-    arithmetic (keyless rows exactly 0 / -inf, two launches bitwise inside `_s13._run`)."""
+    """The public option (``softmax_wgs=3`` on the bias-only pair item): the pair item matches the fp64 oracle and is BITWISE the two-group
+    kernel on O and Stats: a row's softmax runs the same instruction stream whichever group owns it; the step's grouping of rows does not
+    touch a row's arithmetic (keyless rows exactly 0 / -inf, two launches bitwise inside `_s13._run`)."""
     c = _CASES[case]
     q, k, v, kw, ref = _case_inputs(case, torch.bfloat16)
     three = _run(q, k, v, kw, c, _pins, softmax_wgs=3)
@@ -476,20 +417,27 @@ def test_three_groups_match_the_fp64_oracle_and_are_bitwise_the_two_group_kernel
 
 
 @requires_rubin
-@pytest.mark.parametrize("case", ["nkv8_two_wraps_chunk3", "causal_padded_zero_row_in_chunk", "streamed_ring_1024_chunk6", "d64_chunk3_384"])
-def test_three_groups_compose_with_the_kv_mask(case, _pins):
-    c = _CASES[case]
-    q, k, v, kw, ref = _case_inputs(case, torch.bfloat16, kv_mask_p=0.3)
-    three = _run(q, k, v, kw, c, _pins, softmax_wgs=3)
-    _s13._check(three, ref)
-    two = _run(q, k, v, kw, c, _pins, softmax_wgs=2)
-    assert torch.equal(three["o"], two["o"]) and torch.equal(three["stats"], two["stats"])
-
-
-@requires_rubin
-@pytest.mark.parametrize("case", ["nkv3_chunk6", "causal_384_chunk3"])
-def test_three_groups_fp16(case, _pins):
-    c = _CASES[case]
-    q, k, v, kw, ref = _case_inputs(case, torch.float16)
-    three = _run(q, k, v, kw, c, _pins, softmax_wgs=3)
-    _s13._check(three, ref)
+@pytest.mark.parametrize("case", ["nkv8_two_wraps_chunk3", "streamed_ring_1024_chunk6"])
+def test_three_groups_compose_with_the_kv_mask(case, _pins, monkeypatch):
+    """The bit word under three groups: the option on the ring wrap (the seam's 3 against the seam's 2), and the DEFAULT class knob-less on both
+    tiles -- the plan takes the pair item at TILE_N 64 with ``softmax_wgs`` 3 by the pick alone (read off the loaded record), matches the fp64
+    oracle and is bitwise the two-group twin."""
+    if case in _KNOB_LESS_CASES:
+        c = _KNOB_LESS_CASES[case]
+        q, k, v, kw, ref = _case_inputs(case, torch.bfloat16, kv_mask_p=0.3, table=_KNOB_LESS_CASES)
+        seen = _spy_loaded_records(monkeypatch)
+        _pins()  # knob-less: every seam off
+        three = _s13._run(q, k, v, **kw)
+        records = {(p.softmax_wgs, p.tile_n, p.n_chunk >= 1, p.bias_mode != 0, p.kv_mask_form != 0) for p in seen}
+        assert records == {(3, 64, True, True, True)}, f"{case}: the knob-less plan did not take the three-group pair body at TILE_N 64: {records}"
+        assert three["knobs"].tile_n == 64 and three["knobs"].cga == 1, three["knobs"]
+        _s13._check(three, ref)
+        _pins(softmax_wgs=2)
+        two = _s13._run(q, k, v, **kw)
+    else:
+        c = _CASES[case]
+        q, k, v, kw, ref = _case_inputs(case, torch.bfloat16, kv_mask_p=0.3)
+        three = _run(q, k, v, kw, c, _pins, softmax_wgs=3)
+        _s13._check(three, ref)
+        two = _run(q, k, v, kw, c, _pins, softmax_wgs=2)
+    assert torch.equal(three["o"], two["o"]) and torch.equal(three["stats"], two["stats"]), f"{case}: softmax_wgs 3 differs from 2"

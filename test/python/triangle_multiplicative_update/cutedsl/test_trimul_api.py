@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """``cudnn.triangle_multiplicative_update`` -- the three-launch API behind cuEquivariance's signature -- against the fp64 reference, the
 hand-chained kernels (bitwise), CUDA-graph capture, the execute-path contract (no allocation, no synchronisation), and its typed declines;
-plus the GPU-free contract tests (lazy export in every import order, the signature pin, the padded contraction graph, the weight layouts,
-the traffic model).
+plus the GPU-free contract tests (lazy export in every import order, the signature pin, the weight layouts, the traffic model; the padded
+contraction graph and the K2 operand views are pinned in ``test_contraction_graph.py``).  The module is named ``test_trimul_api.py`` so a
+whole-tree session can hold it beside ``triangle_attention/cutedsl/test_api.py`` (two ``test_api.py`` basenames under directories without
+``__init__.py`` make pytest drop whichever is collected second).
 
 Tolerance of the end-to-end oracle (derived, stated).  The reference inserts the kernels' bf16 rounding points (``rounding="kernel"``:
 ``z_in``, ``a``, ``b``, ``y``, ``u`` each rounded once), so what remains is (i) the fp32 accumulation of K1 / K2 / K3 against fp64 (K1 / K3:
@@ -43,7 +45,6 @@ if requirement_error:
 
 pytestmark = pytest.mark.L0
 
-import cudnn  # noqa: E402
 from cudnn.api_base import TensorDesc  # noqa: E402
 from cudnn.triangle_multiplicative_update import api as tapi  # noqa: E402
 from cudnn.triangle_multiplicative_update import reference as tref  # noqa: E402
@@ -245,7 +246,6 @@ def test_heuristics_sm100_column_is_the_measured_gb200_table():
         (128, 129, 1, "outgoing", {"ln_once": "block", "k1_pass_order": "major"}),
         (128, 129, 4, None, {"ln_once": "block", "k1_pass_order": "major"}),
         (128, 0, 4, None, {"ln_once": "block", "k1_pass_order": "major"}),
-
         (128, 256, 1, "incoming", {"ln_pass_form": "smem_rolled_pf"}),
         (128, 256, 4, None, {"ln_pass_form": "registers"}),
         (128, 384, 4, None, {"ln_pass_form": "registers"}),
@@ -336,50 +336,6 @@ def test_workspace_and_traffic_models():
     assert p217.get_workspace_size() == tapi._align_up(2 * 2 * 128 * 434 * 224) + tapi._align_up(k2.k2_slack_bytes(217)) + tapi._align_up(2 * 128 * 434 * 224)
     assert k2.k2_slack_bytes(217) == 7 * 224 * 2 and k2.k2_slack_bytes(256) == 0
     assert plan.flop() == k1.proj_flop(128, 128, 1, 512) + k2.contraction_flop(128, 512) + k3.tail_flop(128, 128, 1, 512)
-
-
-def test_padded_contraction_graph_analyzes_to_the_direction_majors_and_the_folded_batch():
-    import cudnn.gemm.frost  # noqa: F401  -- the pygraph recorder hook
-    from cudnn.gemm.frost.graph_analyzer import analyze
-
-    mm = analyze(k2.contraction_graph(cudnn, 128, 217, "outgoing", batch=2, padded=True)).matmul
-    assert (mm.a_major, mm.b_major) == ("k", "k") and (mm.batch, mm.M, mm.N, mm.K) == (256, 217, 217, 224)
-    mm = analyze(k2.contraction_graph(cudnn, 128, 256, "incoming", batch=2, padded=True)).matmul
-    assert (mm.a_major, mm.b_major) == ("m", "n") and (mm.batch, mm.M, mm.N, mm.K) == (256, 256, 256, 256)
-    with pytest.raises(ValueError, match="multiple of 8"):
-        k2.contraction_graph(cudnn, 128, 217, "incoming", batch=1, padded=True)
-    assert k2.operand_strides(217, "outgoing", padded=True) == ((217 * 224, 224, 1), (217 * 224, 1, 224))
-    assert k2.operand_strides(64, "outgoing") == ((64 * 64, 64, 1), (64 * 64, 1, 64))  # the dense prototype's form is unchanged
-
-
-def test_k2_operand_views_carry_the_kernel_order_contiguity():
-    C, B, N = 4, 2, 217
-    npd = k2.n_pad(N)
-    pa = torch.zeros(C, B * N, npd, dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="k2_slack_bytes"):  # a standalone b plane has no room for the over-read
-        k2.k2_operand_views(pa, pa.clone(), pa.clone(), channels=C, batch=B, n_res=N, direction="outgoing")
-    flat = torch.zeros(C * B * N * npd + k2.k2_slack_bytes(N) // 2, dtype=torch.bfloat16)  # the plane followed by the slack (the API's carve)
-    pb = flat[: C * B * N * npd].view(C, B * N, npd)
-    y = torch.zeros_like(pa)
-    A, Bv, Y = k2.k2_operand_views(pa, pb, y, channels=C, batch=B, n_res=N, direction="outgoing")
-    assert tuple(A.shape) == (C * B, N, npd) and tuple(A.stride()) == (N * npd, npd, 1)
-    # N % 8 != 0: B spans n_pad ROWS per block (the over-read whose products land in the pad columns) and Y spans the n_pad columns
-    assert tuple(Bv.shape) == (C * B, npd, npd) and tuple(Bv.stride()) == (N * npd, npd, 1)
-    assert tuple(Y.shape) == (C * B, N, npd) and tuple(Y.stride()) == (N * npd, npd, 1)
-    assert Bv.data_ptr() == pb.data_ptr() and Y.data_ptr() == y.data_ptr()
-    pa8 = torch.zeros(C, B * 64, 64, dtype=torch.bfloat16)
-    A8, B8, Y8 = k2.k2_operand_views(pa8, pa8.clone(), pa8.clone(), channels=C, batch=B, n_res=64, direction="outgoing")
-    assert tuple(B8.shape) == (C * B, 64, 64) and tuple(Y8.shape) == (C * B, 64, 64)  # N % 8 == 0: no over-read, no pad
-    N2 = 256
-    pa = torch.zeros(C, B * N2, N2, dtype=torch.bfloat16)
-    A, Bv, Y = k2.k2_operand_views(pa, pa.clone(), pa.clone(), channels=C, batch=B, n_res=N2, direction="incoming")
-    assert A.stride(1) == 1 and Bv.stride(1) == 1 and tuple(Y.stride()) == (N2 * N2, N2, 1)
-    pa217 = torch.zeros(C, B * N, npd, dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="multiple of 8|% 8"):
-        k2.k2_operand_views(pa217, pa217, pa217, channels=C, batch=B, n_res=N, direction="incoming")
-    assert k2.tile_config_for(384) == k2.SMALL_N_TILE_CONFIG and k2.tile_config_for(512) == k2.MULTICAST_A2_TILE_CONFIG
-    assert k2.tile_config_for(768) == k2.DESIGN_TILE_CONFIG and k2.tile_config_for(2048) == k2.MULTICAST_A4_TILE_CONFIG
-    assert k2.tile_config_for(217) == k2.DESIGN_TILE_CONFIG and k2.tile_config_for(217, "X") == "X"
 
 
 def _params(c_z, c, with_in_bias, with_out_bias, seed, device="cpu", dtype=torch.bfloat16):

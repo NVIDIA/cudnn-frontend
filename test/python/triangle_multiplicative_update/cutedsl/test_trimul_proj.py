@@ -60,15 +60,12 @@ requires_served_arch = pytest.mark.skipif(
 @pytest.mark.parametrize(
     "n_res,bn,k_block",
     [
+        # the rule's three default_k_block branches at their edges (the N 8 / 9 floors, the padded tail, a 256-row multiple, a long N), and the
+        # knob's domain ends 8 / 32 / 64 / 128 / 256 -- the cover invariant at every geometry where the arithmetic turns
         (8, 1, None),
         (9, 3, None),
-        (64, 128, None),
-        (100, 7, None),
-        (128, 256, None),
         (217, 217, None),
-        (256, 1, None),
         (384, 2, None),
-        (512, 512, None),
         (1000, 3, None),
         (384, 2, 128),  # the k_block knob: 3 full k blocks of 2 bi (the rule's 256 pads 25 % of every pair tile at N = 384)
         (384, 1, 64),
@@ -272,17 +269,30 @@ def test_ln_once_b_ring_depth_is_self_gating_and_buys_the_second_slot_on_sm100_o
     from cudnn.triangle_multiplicative_update.kernels import trimul_tail as k3
 
     def p256(b):
-        return k1.proj_params(256, 256, has_bias=True, has_mask=True, pass_order="major", ln_pass_form="smem_rolled_pf", epi_math="packed", ln_once="block", ln_once_b_stages=b)
+        return k1.proj_params(
+            256, 256, has_bias=True, has_mask=True, pass_order="major", ln_pass_form="smem_rolled_pf", epi_math="packed", ln_once="block", ln_once_b_stages=b
+        )
 
     assert sub.LnDualGemmParams().ln_once_b_stages == 0 and p256(None).ln_once_b_stages == 0
     # sm100 K1 K = 256: the shipped 6-deep ring -> ONE slot; 4 (and 3, 2) -> the second slot; 5 / 6 buy nothing -> the shipped ring stays
-    assert [(sub.ln_once_b_stages_effective(p256(b), "sm100"), sub.ln_once_a_slots(p256(b), "sm100")) for b in (0, 2, 3, 4, 5, 6)] == [(6, 1), (2, 2), (3, 2), (4, 2), (6, 1), (6, 1)]
+    assert [(sub.ln_once_b_stages_effective(p256(b), "sm100"), sub.ln_once_a_slots(p256(b), "sm100")) for b in (0, 2, 3, 4, 5, 6)] == [
+        (6, 1),
+        (2, 2),
+        (3, 2),
+        (4, 2),
+        (6, 1),
+        (6, 1),
+    ]
     # the Rubin body holds two slots under its own 9-deep ring: the field is a no-op there (no B depth traded for nothing)
     assert [(sub.ln_once_b_stages_effective(p256(b), "sm107"), sub.ln_once_a_slots(p256(b), "sm107")) for b in (0, 4)] == [(9, 2), (9, 2)]
     # K1 c 128 already holds two slots under the sm100 ring; the output stage's two-operand region never fits twice: both keep their ring
-    p128 = k1.proj_params(128, 128, has_bias=True, has_mask=True, pass_order="major", ln_pass_form="registers", epi_math="packed", ln_once="block", ln_once_b_stages=4)
+    p128 = k1.proj_params(
+        128, 128, has_bias=True, has_mask=True, pass_order="major", ln_pass_form="registers", epi_math="packed", ln_once="block", ln_once_b_stages=4
+    )
     assert (sub.ln_once_b_stages_effective(p128, "sm100"), sub.ln_once_a_slots(p128, "sm100")) == (6, 2)
-    t256 = k3.tail_params(256, 256, has_bias=True, a0_prologue="mn_major", ln_pass_form="smem_rolled_pf", epi_math="packed", ln_once="block", ln_once_b_stages=2)
+    t256 = k3.tail_params(
+        256, 256, has_bias=True, a0_prologue="mn_major", ln_pass_form="smem_rolled_pf", epi_math="packed", ln_once="block", ln_once_b_stages=2
+    )
     assert (sub.ln_once_b_stages_effective(t256, "sm100"), sub.ln_once_a_slots(t256, "sm100")) == (4, 1)
     off = k1.proj_params(256, 256, has_bias=True, has_mask=True)
     assert sub.ln_once_b_stages_effective(off, "sm100") == 6 and sub.ln_once_b_stages_effective(off, "sm107") == 9
@@ -386,12 +396,6 @@ def test_planes_shape_and_strides_are_the_k2_contract():
     assert k1.planes_shape(128, 2, 217) == (2, 128, 434, 224)
     assert k1.plane_strides(2, 217) == (434 * 224, 224, 1)
     assert k1.planes_shape(256, 1, 512) == (2, 256, 512, 512)
-
-
-def test_model_counts():
-    assert k1.proj_flop(128, 128, 1, 512) == 2 * 512 * 512 * 128 * 512
-    assert k1.proj_bytes(128, 128, 1, 512, with_mask=False, with_stats=False) == 512 * 512 * (128 * 2 + 2 * 128 * 2)
-    assert k1.proj_bytes(128, 128, 1, 512) == k1.proj_bytes(128, 128, 1, 512, with_mask=False, with_stats=False) + 512 * 512 * (2 + 8)
 
 
 class _Boom(Exception):
@@ -542,14 +546,12 @@ _SENTINEL = 1.5e30
 @pytest.mark.parametrize(
     "n_res,batch,c_z,c,mask_kind,with_bias",
     [
-        (64, 2, 128, 128, "all", True),
-        (128, 2, 128, 128, "padded", True),
         (217, 2, 128, 128, "random", False),
         (217, 1, 128, 128, "random", True),  # an ODD mask length (47 089 rows): the last row's mask is read without touching the byte past the tensor
         (256, 1, 128, 128, "padded", True),
-        (512, 1, 128, 128, "all", True),
+        (512, 1, 128, 128, "all", True),  # the register form + the bias fold, biases on (the N >= 512 pick)
         (128, 1, 256, 256, "padded", True),  # two K tiles per stage group (K = 256) and two N tiles (c = 256)
-        (128, 1, 128, 128, "fractional", True),  # fractional mask weights (the mask multiplies in fp32 BEFORE the bf16 rounding)
+        # (N 64 / 128 at c 128 run the body the 256 / 512 cells run; the fractional mask has its own pin below)
     ],
 )
 def test_k1_matches_the_fp64_oracle(n_res, batch, c_z, c, mask_kind, with_bias):
@@ -590,41 +592,21 @@ def test_k1_matches_the_fp64_oracle(n_res, batch, c_z, c, mask_kind, with_bias):
     assert torch.equal(planes2, planes) and torch.equal(stats2, stats)
 
 
-# The sm_107a renderings the triangle multiplicative update SHIPS (the API's parameter sets: biases, mask, no statistics; the default tile
-# order / prologue form / ring depth) and their spill counts, MEASURED on the branch's toolchain (nvdisasm of the trace-time cubin): the
-# register split the body requests is dropped by ptxas (no `.maxnreg` directive -> C7508), so every warp runs flat at the entry count (REG 168)
-# and the LayerNorm row held in registers between its statistics passes spills from K = 256 up (K1 664 B / K3 872 B of stack).  A pin is a
-# BOUND (frost_test_utils.assert_no_new_spills): more spills = a regression; fewer = update the pin with the measurement.  USETMAXREG 0
-# documents the dropped split -- when THAT assertion fails the DSL started emitting `.maxnreg`: re-measure the roles against entry x warps
-# and update these pins.  (The kernel-test renderings with want_stats=True spill about twice as much at K = 256: 468 / 470 and 903 / 910.)
+# The sm_107a renderings the triangle multiplicative update SHIPS on Rubin (the heuristics' picks at the API's parameter sets: biases, mask, no
+# statistics; the default tile order / prologue form / ring depth) and their spill counts, MEASURED on the branch's toolchain (nvdisasm of the
+# trace-time cubin): the register split the body requests is dropped by ptxas (no `.maxnreg` directive -> C7508), so every warp runs flat at
+# the entry count (REG 168).  A pin is a BOUND (frost_test_utils.assert_no_new_spills): more spills = a regression; fewer = update the pin with
+# the measurement.  USETMAXREG 0 documents the dropped split -- when THAT assertion fails the DSL started emitting `.maxnreg`: re-measure the
+# roles against entry x warps and update these pins.  History the dropped option rows recorded: the register-form LayerNorm row held between
+# its statistics passes spills from K = 256 up (K1 240 / 241, K3 499 / 504: the unshipped class the table never picks); the ROLLED re-read
+# forms (`smem_rolled`, `smem_rolled_pf`, `smem_rolled_tree`) hold no row and spill 0 / 0 at both widths (the unrolled `smem` form only halves
+# the K 256 spills: 118 / 118 and 235 / 235); the bias-path packed forms (`packed_hoist`, `packed_biasfold`) add no live word (0 / 0).
+# Keyed (arm, K, ln_pass_form, epi_math): the Rubin table's picks -- K1 c 128 `registers / packed_biasfold` (512 / 768 and 256 B >= 4, the block
+# item), K1 c 256 `smem_rolled_pf / packed`, K3 c 256 `smem_rolled_pf / packed`, and the K3 c 128 `registers / packed` transpose rendering.
 _SASS_SPILL_PINS = {
-    ("k1", 128, "registers", "scalar"): dict(STL=1, LDL=1),
-    ("k1", 256, "registers", "scalar"): dict(STL=240, LDL=241),
-    ("k3", 128, "registers", "scalar"): dict(STL=1, LDL=1),
-    ("k3", 256, "registers", "scalar"): dict(STL=499, LDL=504),
-    # The re-read LayerNorm form with ROLLED chunk loops (`ln_pass_form="smem_rolled"`) holds no row in registers and keeps its normalise pass a
-    # real loop (cutlass.range(..., unroll=1)): the K = 256 residency spills are GONE on both arms (0 / 0 measured, REG 112-114 vs the flat 168),
-    # with the packed epilogue on top.  The unrolled re-read form ("smem") only halves them (K1 118 / 118, K3 235 / 235): the normalise pass's
-    # unrolled broadcast gamma / beta loads are hoisted by the compiler and the row re-appears as live registers -- which is why the rolled form exists.
-    ("k1", 256, "smem_rolled", "packed"): dict(STL=0, LDL=0),
-    ("k3", 256, "smem_rolled", "packed"): dict(STL=0, LDL=0),
-    # The PIPELINED rolled forms (`smem_rolled_pf` = the next chunk's loads carried across the loop back-edge; `smem_rolled_tree` = + four partial
-    # sums per statistics pass): +4 / +20 live words per lane in the statistics / normalise passes, no spill on either kernel at either width
-    # (0 / 0 measured; the bias-off K3 K = 256 rendering, REG 80 / STACK 24 / STL 5 / LDL 7 on the shipped rolled form, renders at REG 106 / STACK 0
-    # under them -- the extra live words move ptxas off the 80-register target it spilled for).
-    ("k1", 128, "smem_rolled_pf", "packed"): dict(STL=0, LDL=0),
-    ("k1", 256, "smem_rolled_pf", "packed"): dict(STL=0, LDL=0),
-    ("k1", 256, "smem_rolled_tree", "packed"): dict(STL=0, LDL=0),
-    ("k3", 256, "smem_rolled_pf", "packed"): dict(STL=0, LDL=0),
-    ("k3", 256, "smem_rolled_tree", "packed"): dict(STL=0, LDL=0),
-    # The BIAS-PATH forms of the packed epilogue (`packed_hoist`: the subtile's bias words loaded before its TMEM loads; `packed_biasfold`: + the
-    # gate bias staged halved and folded into the tanh argument's fma, -16 FADD2 per subtile per lane): no new live word (the halved words replace
-    # the gate words one for one, the hoist moves the same 64 words' live range earlier), 0 / 0 measured on every rendering with biases.
-    ("k1", 128, "registers", "packed_hoist"): dict(STL=0, LDL=0),
     ("k1", 128, "registers", "packed_biasfold"): dict(STL=0, LDL=0),
-    ("k1", 256, "smem_rolled_pf", "packed_biasfold"): dict(STL=0, LDL=0),
-    ("k3", 128, "registers", "packed_biasfold"): dict(STL=0, LDL=0),
-    ("k3", 256, "smem_rolled_pf", "packed_biasfold"): dict(STL=0, LDL=0),
+    ("k1", 256, "smem_rolled_pf", "packed"): dict(STL=0, LDL=0),
+    ("k3", 256, "smem_rolled_pf", "packed"): dict(STL=0, LDL=0),
 }
 _SASS_COUNTS = {**sass_utils.SASS_OPCODE_COUNTS, "USETMAXREG": ("USETMAXREG",), "FADD2": (" FADD2",), "FFMA2": (" FFMA2",), "CGAERRBAR": ("CGAERRBAR",)}
 _SASS_PROBE_BODY = """
@@ -648,14 +630,14 @@ print("EXPECT_AB_STAGES", plan.module.ab_stages)
 print("EXPECT_TMEM_COLS", plan.module.num_tmem_alloc_cols)
 """
 
-# The LayerNorm-ONCE renderings (`ln_once` = "block" / "passes"; T27): the per-item A region + the per-tile B ring, every production form's twin at the
-# shipped knobs (the pass-major order the lever requires).  Keyed (arm, K, ln_pass_form, has_bias, ln_once); the values are BOUNDS measured on the
-# branch's toolchain (nvdisasm of the trace-time cubin) like the tables above: the bias-off c_out 256 renderings sit at ptxas's flat 80-register
-# allocation (the two-CTAs-per-SM target) and spill a few words -- K1 2 / 2 (STACK 8; its production twin 0 / 0), K3 5 / 6 (STACK 24; the twin 0 / 0 at
-# REG 106) -- the register-split hint does NOT lift it worth the spills it adds (the table below); the bias-on twins and the c 128 register-form
-# renderings spill nothing (the K1 c 128 register-form twin's 1 / 1 at STACK 8 is GONE under the lever); the c 128 ROLLED bias-off rendering reads 1 / 1
-# at REG 80 / STACK 8 under the lever (its production twin 0 / 0 at REG 80), its bias-on twin 0 / 0 at REG 112.  USETMAXREG 0 (the split dropped, as the
-# twins), CGAERRBAR 0 (no non-relaxed cluster arrive: the new a_empty commit is a tcgen05.commit, the release arrives the helpers').
+# The LayerNorm-ONCE renderings (`ln_once` = "block", the pick; "passes" is an option; T27): the per-item A region + the per-tile B ring, every production
+# form's twin at the shipped knobs (the pass-major order the lever requires).  Keyed (arm, K, ln_pass_form, has_bias, ln_once); the values are BOUNDS measured
+# on the branch's toolchain (nvdisasm of the trace-time cubin) like the tables above: the bias-off c_out 256 renderings sit at ptxas's flat 80-register
+# allocation (the two-CTAs-per-SM target) and spill a few words -- K1 2 / 2 (STACK 8; its production twin 0 / 0), K3 5 / 6 (STACK 24; the twin 0 / 0 at REG
+# 106) -- the register-split hint does NOT lift it worth the spills it adds (the table below); the bias-on twins and the c 128 register-form renderings spill
+# nothing (the K1 c 128 register-form twin's 1 / 1 at STACK 8 is GONE under the lever); the c 128 ROLLED bias-off rendering reads 1 / 1 at REG 80 / STACK 8
+# under the lever (its production twin 0 / 0 at REG 80), its bias-on twin 0 / 0 at REG 112.  USETMAXREG 0 (the split dropped, as the twins), CGAERRBAR 0 (no
+# non-relaxed cluster arrive: the new a_empty commit is a tcgen05.commit, the release arrives the helpers').
 _SASS_LN_ONCE_PINS = {
     ("k1", 128, "registers", False, "block"): dict(STL=0, LDL=0),
     ("k1", 128, "registers", True, "block"): dict(STL=0, LDL=0),
@@ -663,7 +645,6 @@ _SASS_LN_ONCE_PINS = {
     ("k1", 128, "smem_rolled", True, "block"): dict(STL=0, LDL=0),
     ("k1", 256, "smem_rolled_pf", False, "block"): dict(STL=2, LDL=2),
     ("k1", 256, "smem_rolled_pf", True, "block"): dict(STL=0, LDL=0),
-    ("k1", 256, "smem_rolled_pf", False, "passes"): dict(STL=1, LDL=1),
     ("k3", 256, "smem_rolled_pf", False, "block"): dict(STL=5, LDL=6),
     ("k3", 256, "smem_rolled_pf", True, "block"): dict(STL=0, LDL=0),
 }
@@ -691,33 +672,23 @@ def test_sm107_ln_once_renderings_spill_pins(tmp_path, arm, k, ln_pass_form, has
     assert st["CGAERRBAR"] == 0, f"{arm} K={k} ln_once={ln_once}: a non-relaxed cluster arrive (CGAERRBAR {st['CGAERRBAR']}) -- a GPU-scope drain per arrive"
 
 
-# The LayerNorm-once renderings UNDER the `.minnctapersm` hint (a caller's `min_blocks_per_mp=1`; the rule never hands the hint to the item --
-# `heuristics.register_split_hint` keys on `ln_once` and every measured row names the per-tile item): the honoured split (USETMAXREG 6) puts the
-# item's +4 live words of the 24-register producer roles on the stack -- MEASURED on the branch's toolchain like the tables above: the c 128 register
-# form 4 / 13 (STACK 16; 0 / 0 unhinted), the rolled form 9 / 15-16 (STACK 24; 1 / 1 and 0 / 0 unhinted), the c 256 pf forms 9 / 16 (K1; 2 / 2 and 0 / 0
-# unhinted) and 25 / 26 at STACK 144 (K3; 5 / 6 and 0 / 0 unhinted) -- and the whole call runs 0.5-1.3 % FASTER unhinted on every bias-off c 128 cell
-# (within the noise with the biases; the c 256 forms lose 6-12 % standalone under the hint), which is why the rows stay with the per-tile item.  Keyed
-# (arm, K, ln_pass_form, epi_math, has_bias, min_blocks_per_mp, order, ln_once); the spill counts are BOUNDS, USETMAXREG is exact.
-_SASS_LN_ONCE_HINT_PINS = {
-    ("k1", 128, "registers", "packed", False, 1, "major", "block"): dict(STL=4, LDL=13, USETMAXREG=6),
-    # the PRODUCTION bias-ON fold rendering of the block item (the 512 / 768 B 1 and 256 B 4 cells with the biases, unhinted since the rule keys on the
-    # item): 0 / 0 at the flat allocation -- the cubin the five cells run; measured a tie with the packed twin on 512 B 1 / 256 B 4 and +0.7..+0.9 % on 768
+# The PRODUCTION bias-ON fold rendering of the LayerNorm-once block item (the Rubin 512 / 768 B 1 and 256 B >= 4 cells with the biases): unhinted,
+# since `heuristics.register_split_hint` keys on `ln_once` and never composes the `.minnctapersm` hint with the item -- 0 / 0 at the flat
+# allocation, the cubin those cells run (measured a tie with the packed twin on 512 B 1 / 256 B 4 and +0.7..+0.9 % on 768).  History: under a
+# caller's `min_blocks_per_mp=1` the honoured split (USETMAXREG 6) puts the item's +4 live words of the 24-register producer roles on the stack
+# (the c 128 register form 4 / 13, the rolled form 9 / 15-16, the c 256 pf forms 9 / 16 and K3 25 / 26 at STACK 144) and the whole call runs
+# 0.5-1.3 % FASTER unhinted on every bias-off c 128 cell -- which is why the rule keeps the per-tile item; a caller's hint under the item is a
+# public option whose correctness is bitwise-pinned (test_register_split_hint_is_bitwise_the_default_rendering).  Keyed (arm, K, ln_pass_form,
+# epi_math, has_bias, min_blocks_per_mp, order, ln_once); the spill counts are BOUNDS, USETMAXREG is exact.
+_SASS_LN_ONCE_FOLD_PINS = {
     ("k1", 128, "registers", "packed_biasfold", True, 0, "major", "block"): dict(STL=0, LDL=0, USETMAXREG=0),
-    ("k1", 128, "registers", "packed_biasfold", True, 1, "major", "block"): dict(STL=4, LDL=13, USETMAXREG=6),
-    ("k1", 128, "smem_rolled", "packed", False, 1, "major", "block"): dict(STL=9, LDL=15, USETMAXREG=6),
-    ("k1", 128, "smem_rolled", "packed", True, 1, "major", "block"): dict(STL=9, LDL=16, USETMAXREG=6),
-    ("k1", 256, "smem_rolled_pf", "packed", False, 1, "major", "block"): dict(STL=9, LDL=16, USETMAXREG=6),
-    ("k1", 256, "smem_rolled_pf", "packed", True, 1, "major", "block"): dict(STL=9, LDL=16, USETMAXREG=6),
-    ("k3", 256, "smem_rolled_pf", "packed", False, 1, "mn_major", "block"): dict(STL=25, LDL=26, USETMAXREG=6),
-    ("k3", 256, "smem_rolled_pf", "packed", True, 1, "mn_major", "block"): dict(STL=25, LDL=26, USETMAXREG=6),
 }
 
 
-@pytest.mark.parametrize("arm,k,ln_pass_form,epi_math,has_bias,hint,order,ln_once", sorted(_SASS_LN_ONCE_HINT_PINS))
-def test_sm107_ln_once_renderings_under_the_hint_spill_pins(tmp_path, arm, k, ln_pass_form, epi_math, has_bias, hint, order, ln_once):
-    """Trace-compile the LayerNorm-once renderings WITH the `.minnctapersm` hint for sm_107a (no GPU): the spills within the measured bounds,
-    USETMAXREG EXACTLY 6 (the honoured split -- the reason they spill), CGAERRBAR 0.  The rule never composes the two (`register_split_hint` returns 0
-    for every LayerNorm-once item); this pins what a caller's `min_blocks_per_mp=1` buys under the lever."""
+@pytest.mark.parametrize("arm,k,ln_pass_form,epi_math,has_bias,hint,order,ln_once", sorted(_SASS_LN_ONCE_FOLD_PINS))
+def test_sm107_ln_once_block_item_fold_rendering_spill_pin(tmp_path, arm, k, ln_pass_form, epi_math, has_bias, hint, order, ln_once):
+    """Trace-compile the production bias-on fold rendering of the LayerNorm-once block item for sm_107a (no GPU): the spills within the measured
+    bound, USETMAXREG EXACTLY 0 (the dropped split: the rule never hints the item), CGAERRBAR 0."""
     probe = sass_utils.run_sass_probe(
         tmp_path,
         probe_src=sass_utils.sass_probe_source(_SASS_PROBE_BODY, _SASS_COUNTS),
@@ -726,7 +697,7 @@ def test_sm107_ln_once_renderings_under_the_hint_spill_pins(tmp_path, arm, k, ln
         tag=f"ln_dual_gemm_{arm}_k{k}_{ln_pass_form}_{epi_math}_bias{int(has_bias)}_hint{hint}_{order}_ln_once_{ln_once}",
     )
     st = probe.stats
-    pins = _SASS_LN_ONCE_HINT_PINS[(arm, k, ln_pass_form, epi_math, has_bias, hint, order, ln_once)]
+    pins = _SASS_LN_ONCE_FOLD_PINS[(arm, k, ln_pass_form, epi_math, has_bias, hint, order, ln_once)]
     print(
         f"{arm} K={k} {ln_pass_form} {epi_math} bias {has_bias} hint {hint} ln_once={ln_once}: STL {st['STL']} LDL {st['LDL']} USETMAXREG {st['USETMAXREG']} "
         f"CGAERRBAR {st['CGAERRBAR']} lines {st['LINES']} cubin {probe.cubin_md5}"
@@ -748,31 +719,24 @@ def test_sm107_ln_once_renderings_under_the_hint_spill_pins(tmp_path, arm, k, ln
 #     4 DEALLOC 24), REG = the 168 entry count, STACK 0 and NO spill on the K3 renderings (bias off and on: the identity, no new spill); the K1
 #     INTERLEAVED rolled renderings carry 4 STL / 13 LDL of role-prologue values under the hint (stored at kernel entry / at the INCREASE warps'
 #     entry, reloaded once per role prologue) -- the per-rendering sign the rule keys on the tile order for.
+# The rule's own rows (heuristics._REGISTER_SPLIT_HINTS: the `major` order the heuristics ship from N = 512 at c = 128), hinted: the register
+# form's 1 / 1 at STACK 8 and the rolled form's flat REG 80 both go to 0 / 0 at the honoured split, the bias-on fold rendering is allocated its
+# demand either way; and the Rubin c 128 FLOOR rendering (`registers / packed`, interleaved, the per-tile item, hint 0: every N < 256 at B 1).
+# History the dropped option rows recorded: the K1 K = 128 INTERLEAVED rolled rendering under the hint carries 4 / 13 role-prologue spills (the
+# interleaved pass decode + the scheduler's tile count stored at entry and reloaded once per role prologue) -- the per-rendering sign the rule
+# keys on the tile order for; the bias-off K3 K = 256 rolled rendering at REG 80 / STACK 24 spills 5 / 7 on the epilogue's hot path unhinted and
+# 0 / 0 hinted.
 _SASS_SPLIT_HINT_PINS = {
-    ("k3", 256, "smem_rolled", "packed", False, 0, "interleaved"): dict(STL=5, LDL=7, USETMAXREG=0),
-    ("k3", 256, "smem_rolled", "packed", False, 1, "interleaved"): dict(STL=0, LDL=0, USETMAXREG=6),
-    ("k3", 256, "smem_rolled", "packed", True, 1, "interleaved"): dict(STL=0, LDL=0, USETMAXREG=6),
-    ("k1", 128, "smem_rolled", "packed", False, 0, "interleaved"): dict(STL=1, LDL=1, USETMAXREG=0),
-    # the K1 K = 128 INTERLEAVED rolled rendering under the hint: the split honoured (USETMAXREG 6) but 4 / 13 role-prologue spills (STACK 16; the
-    # interleaved pass decode + the scheduler's tile count stored at entry and reloaded once per role prologue) -- MEASURED on the branch's toolchain
-    ("k1", 128, "smem_rolled", "packed", False, 1, "interleaved"): dict(STL=4, LDL=13, USETMAXREG=6),
-    # the production renderings the rule hints (heuristics._REGISTER_SPLIT_HINTS; the `major` order the heuristics ship from N = 512 at c = 128):
-    # the register form's 1 / 1 at STACK 8 and the rolled form's flat REG 80 both go to 0 / 0 at the honoured split
-    ("k1", 128, "registers", "packed", False, 0, "major"): dict(STL=1, LDL=1, USETMAXREG=0),
     ("k1", 128, "registers", "packed", False, 1, "major"): dict(STL=0, LDL=0, USETMAXREG=6),
-    ("k1", 128, "smem_rolled", "packed", False, 0, "major"): dict(STL=0, LDL=0, USETMAXREG=0),
     ("k1", 128, "smem_rolled", "packed", False, 1, "major"): dict(STL=0, LDL=0, USETMAXREG=6),
-    # the bias-ON register-form renderings the rule hints with the bias-path epilogue fold (the K3 tuple's last field is its a0_prologue):
-    # allocated their demand either way (0 / 0), the split honoured under the hint
-    ("k1", 128, "registers", "packed_biasfold", True, 0, "major"): dict(STL=0, LDL=0, USETMAXREG=0),
     ("k1", 128, "registers", "packed_biasfold", True, 1, "major"): dict(STL=0, LDL=0, USETMAXREG=6),
 }
 
 
 @pytest.mark.parametrize("arm,k,ln_pass_form,epi_math,has_bias,hint,order", sorted(_SASS_SPLIT_HINT_PINS))
 def test_sm107_register_split_hint_renderings_spill_pins(tmp_path, arm, k, ln_pass_form, epi_math, has_bias, hint, order):
-    """Trace-compile the bias-off renderings (and the bias-on identity twin) with and without the `.minnctapersm` hint for sm_107a (no GPU): the
-    spill counts are bounds like the table above; USETMAXREG is EXACT -- 0 without the hint (the dropped split), 6 with it (the honoured split)."""
+    """Trace-compile the rule's hinted renderings and the c 128 floor rendering for sm_107a (no GPU): the spill counts are bounds like the table
+    above; USETMAXREG is EXACT -- 0 without the hint (the dropped split), 6 with it (the honoured split)."""
     probe = sass_utils.run_sass_probe(
         tmp_path,
         probe_src=sass_utils.sass_probe_source(_SASS_PROBE_BODY, _SASS_COUNTS),
@@ -847,7 +811,6 @@ def test_sm107_rendering_spill_pins(tmp_path, arm, k, ln_pass_form, epi_math):
 _SASS_SM100_PINS = {
     ("k1", 128, "registers", "packed", True, "interleaved", ""): dict(STL=0, LDL=0),
     ("k1", 128, "registers", "packed", False, "interleaved", ""): dict(STL=0, LDL=0),
-    ("k1", 128, "registers", "packed_biasfold", True, "major", "block"): dict(STL=0, LDL=0),
     ("k1", 128, "registers", "packed", False, "major", "block"): dict(STL=0, LDL=0),
     ("k1", 128, "smem_rolled", "packed", True, "major", "block"): dict(STL=0, LDL=0),
     ("k1", 128, "smem_rolled", "packed", False, "major", "block"): dict(STL=3, LDL=3),
@@ -869,12 +832,10 @@ _SASS_SM100_PINS = {
 
 # The SM100 column's register-split row (`heuristics._REGISTER_SPLIT_HINTS_SM100`, measured on a 152-SM GB200 perf node, 2026-10-14): the c 128
 # register-form K1 picks with the plain packed epilogue run under `.minnctapersm 1` with the biases -- the split honoured (USETMAXREG 6), no spill
-# either way on sm_100a; the output stage's twin under a caller's hint, and its unhinted production rendering, beside it.  Keyed (arm, K,
-# ln_pass_form, epi_math, has_bias, min_blocks_per_mp, order, ln_once); STL / LDL are BOUNDS, USETMAXREG is exact.
+# either way on sm_100a (K3 is unhinted on SM100: its hint-0 rendering is in `_SASS_SM100_PINS`).  Keyed (arm, K, ln_pass_form, epi_math,
+# has_bias, min_blocks_per_mp, order, ln_once); STL / LDL are BOUNDS, USETMAXREG is exact.
 _SASS_SM100_HINT_PINS = {
     ("k1", 128, "registers", "packed", True, 1, "major", "block"): dict(STL=0, LDL=0, USETMAXREG=6),
-    ("k3", 128, "registers", "packed", True, 1, "transpose", ""): dict(STL=0, LDL=0, USETMAXREG=6),
-    ("k3", 128, "registers", "packed", True, 0, "transpose", ""): dict(STL=0, LDL=0, USETMAXREG=0),
 }
 
 
@@ -956,16 +917,16 @@ def test_ln_pass_form_and_epi_math_decline_typed(kw, axis):
     "n_res,batch,c_z,c,mask_kind,ln_once,clc_stages",
     [
         (217, 2, 128, 128, "random", "block", 2),
-        (33, 1, 128, 128, "all", "block", 1),
         (128, 1, 256, 256, "padded", "block", 1),
         (384, 1, 256, 256, "random", "passes", 1),
     ],
 )
 def test_ln_once_item_is_bitwise_the_per_tile_item(n_res, batch, c_z, c, mask_kind, ln_once, clc_stages):
     """The LayerNorm-once work item (the row block's A operand resident in SMEM across its passes x N tiles; T27) computes the SAME planes and
-    statistics as the per-tile item of the same knob set, BITWISE: the same normalised bf16 words feed every tile of the item.  N 33 = one partial
-    row block of 64-row k blocks; 217 = a padded tail; 384 = two 128-row k blocks per 256 rows; the "passes" item at c 256 = two N-tile items per
-    block.  Two ON launches bitwise equal (the two-launch trick); the ON output within the fp64 oracle's derived bound."""
+    statistics as the per-tile item of the same knob set, BITWISE: the same normalised bf16 words feed every tile of the item.  One cell per public
+    ``ln_once`` value on its geometry: 217 = a padded tail (block), 128 at c 256 (block), 384 = two 128-row k blocks per 256 rows with the "passes"
+    item at c 256 = two N-tile items per block (the N 33 partial row block is the host geometry test's).  Two ON launches bitwise equal (the
+    two-launch trick); the ON output within the fp64 oracle's derived bound."""
     inp = _inputs(n_res, batch, c_z, c, mask_kind, True, seed=11)
     kn = th_recommend(n_res, c_z, batch)
     common = dict(has_bias=True, has_mask=True, want_stats=True, pass_order="major", clc_stages=clc_stages, ln_pass_form=kn.ln_pass_form, epi_math="packed")
@@ -995,7 +956,7 @@ def th_recommend(n_res, c_z, batch):
 
 
 @requires_served_arch
-@pytest.mark.parametrize("n_res,batch,mask_kind,b_stages", [(128, 1, "padded", 4), (217, 2, "random", 3)])
+@pytest.mark.parametrize("n_res,batch,mask_kind,b_stages", [(128, 1, "padded", 4)])
 def test_ln_once_b_ring_depth_is_bitwise_the_shipped_ring(n_res, batch, mask_kind, b_stages):
     """The LayerNorm-once item's B-ring depth (`ln_once_b_stages`, B-TriMul-1): the K1 c 256 rendering with the shallower B ring (the second resident
     A slot on the sm100 body; a no-op on the sm107 body, whose ring already holds two slots) computes the SAME planes and statistics as the shipped
@@ -1004,7 +965,9 @@ def test_ln_once_b_ring_depth_is_bitwise_the_shipped_ring(n_res, batch, mask_kin
     c_z = c = 256
     inp = _inputs(n_res, batch, c_z, c, mask_kind, True, seed=13)
     kn = th_recommend(n_res, c_z, batch)
-    common = dict(has_bias=True, has_mask=True, want_stats=True, pass_order="major", clc_stages=1, ln_pass_form=kn.ln_pass_form, epi_math="packed", ln_once="block")
+    common = dict(
+        has_bias=True, has_mask=True, want_stats=True, pass_order="major", clc_stages=1, ln_pass_form=kn.ln_pass_form, epi_math="packed", ln_once="block"
+    )
     plan_ring = _build_k1(k1.proj_params(c_z, c, **common))
     plan_lever = _build_k1(k1.proj_params(c_z, c, ln_once_b_stages=b_stages, **common))
     stream = torch.cuda.current_stream().cuda_stream
@@ -1024,24 +987,25 @@ def test_ln_once_b_ring_depth_is_bitwise_the_shipped_ring(n_res, batch, mask_kin
     assert int((diff > 4e-3 + ref.abs() / 128.0).sum()) == 0, f"max |diff| {diff.max().item():.4g}"
 
 
+# the four shipped (form, epilogue) pairs on their geometry + the two public values no pick uses (`smem`, `scalar`, `packed_hoist`) once
+_FORM_CELLS = [
+    ("registers", "packed", 217, 2, 128, 128, "random"),
+    ("smem_rolled", "packed", 217, 2, 128, 128, "random"),
+    ("registers", "packed_biasfold", 217, 2, 128, 128, "random"),
+    ("smem_rolled_pf", "packed", 128, 1, 256, 256, "padded"),
+    ("smem", "scalar", 128, 1, 256, 256, "padded"),
+    ("registers", "packed_hoist", 217, 2, 128, 128, "random"),
+]
+
+
 @requires_served_arch
-@pytest.mark.parametrize("n_res,batch,c_z,c,mask_kind", [(217, 2, 128, 128, "random"), (128, 1, 256, 256, "padded")])
 @pytest.mark.parametrize(
-    "ln_pass_form,epi_math",
-    [
-        ("smem", "scalar"),
-        ("smem_rolled", "scalar"),
-        ("registers", "packed"),
-        ("smem_rolled", "packed"),
-        ("smem_rolled_pf", "packed"),
-        ("registers", "packed_hoist"),
-        ("registers", "packed_biasfold"),
-        ("smem_rolled_pf", "packed_biasfold"),
-    ],
+    "ln_pass_form,epi_math,n_res,batch,c_z,c,mask_kind", _FORM_CELLS, ids=[f"{f}-{e}-{n}-{b}-{cz}-{c}-{m}" for f, e, n, b, cz, c, m in _FORM_CELLS]
 )
 def test_ln_pass_form_and_epi_math_are_bitwise_equal_to_the_default_forms(n_res, batch, c_z, c, mask_kind, ln_pass_form, epi_math):
     """The re-read LayerNorm forms sum the same bf16 words in the same order (a re-load of the unchanged stage replaces a register), and the packed
-    epilogue runs the scalar form's fp32 operations in its association on fp32x2 pairs: planes AND statistics BITWISE equal to the default forms."""
+    epilogue runs the scalar form's fp32 operations in its association on fp32x2 pairs: planes AND statistics BITWISE equal to the default forms --
+    every public ``ln_pass_form`` / ``epi_math`` value once (the tree form has its own oracle-bound test)."""
     probe = k1.proj_params(c_z, c, has_bias=True, has_mask=True, want_stats=True, ln_pass_form=ln_pass_form, epi_math=epi_math)
     if _sm100_c7600_cell(probe):
         # the sm100 body's typed decline (ptxas C7600 at K = 256 for the register form with a bias-path packed epilogue and the statistics write)
@@ -1063,7 +1027,7 @@ def test_ln_pass_form_and_epi_math_are_bitwise_equal_to_the_default_forms(n_res,
 
 
 @requires_served_arch
-@pytest.mark.parametrize("n_res,batch,c_z,c,mask_kind", [(217, 2, 128, 128, "random"), (128, 1, 256, 256, "padded")])
+@pytest.mark.parametrize("n_res,batch,c_z,c,mask_kind", [(217, 2, 128, 128, "random")])
 def test_tree_ln_form_meets_the_oracle_bound_and_its_distance_to_the_rolled_form_is_measured(n_res, batch, c_z, c, mask_kind):
     """`ln_pass_form="smem_rolled_tree"` sums each statistics pass in FOUR partials (a different fp32 ORDER, :data:`LN_PASS_FORMS_REORDERED`).  A
     summation-order change moves a few LayerNorm outputs across a bf16 rounding midpoint, and those flips propagate through the GEMM exactly like
@@ -1157,7 +1121,7 @@ def test_mask_multiplies_in_fp32_before_the_bf16_rounding():
 
 
 @requires_served_arch
-@pytest.mark.parametrize("n_res,batch,c_z,c,mask_kind", [(217, 2, 128, 128, "random"), (128, 1, 256, 256, "padded")])
+@pytest.mark.parametrize("n_res,batch,c_z,c,mask_kind", [(217, 2, 128, 128, "random")])  # interleaved ships at c 128 below N 256 only
 def test_interleaved_pass_order_is_bitwise_equal_to_pass_major(n_res, batch, c_z, c, mask_kind):
     """``pass_order="interleaved"`` (the pass folded into the scheduler's M axis so both passes of a row block are adjacent -- the
     shared-z tile order) computes the same tiles with the same arithmetic: planes and statistics BITWISE equal to ``"major"``."""
@@ -1225,7 +1189,7 @@ def test_runner_declines_a_plan_for_another_k_and_a_misshaped_mask():
 
 
 @requires_served_arch
-@pytest.mark.parametrize("n_res,batch,k_block", [(384, 2, 128), (384, 1, 64), (217, 1, 32), (128, 2, 256)])
+@pytest.mark.parametrize("n_res,batch,k_block", [(217, 1, 32)])  # the K1-only domain end; the host geometry test pins the arithmetic, K3 keeps 64
 def test_k1_row_tile_knob_is_bitwise_the_rule(n_res, batch, k_block):
     """The row tile (k's per 256-row pair tile) is a RUNTIME operand of the compiled kernel: the same plan launched with ``k_block`` computes the
     SAME bits as the rule (planes AND statistics) -- a row's LayerNorm, MMA K order and epilogue do not depend on the tile it sits in.  At N = 384

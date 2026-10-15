@@ -42,11 +42,11 @@ PARTS = [
 
 @pytest.mark.parametrize("arch,smem_budget,stages,tmem_cols,exclusive", PARTS)
 @pytest.mark.parametrize("config_name", K2_TILE_CONFIGS)
-@pytest.mark.parametrize("direction", k2.DIRECTIONS)
-def test_k2_pipeline_depth_and_tmem_follow_the_part(monkeypatch, arch, smem_budget, stages, tmem_cols, exclusive, config_name, direction):
+def test_k2_pipeline_depth_and_tmem_follow_the_part(monkeypatch, arch, smem_budget, stages, tmem_cols, exclusive, config_name):
+    """One direction: the operand majors do not enter the ring-depth / TMEM arithmetic (``test_contraction_graph.py`` pins the majors)."""
     monkeypatch.setattr(tile_config, "_sm_smem_budget_bytes", lambda device=None: smem_budget)
     cfg = tile_config.by_name(config_name)
-    chain = analyze(k2.contraction_graph(cudnn, 128, 512, direction))
+    chain = analyze(k2.contraction_graph(cudnn, 128, 512, "outgoing"))
     # Every K2 config stages A 16 KiB + B 16 KiB per K tile: 128 A rows + 128 B rows (B's N is halved per CTA under the pair MMA) x 128 B.
     per_stage = (cfg.cta_tile_m + cfg.cta_smem_tile_n) * cfg.cta_tile_k_bytes
     assert per_stage == 32 * 1024

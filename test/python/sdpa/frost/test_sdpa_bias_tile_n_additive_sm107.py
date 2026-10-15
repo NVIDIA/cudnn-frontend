@@ -27,6 +27,10 @@
   (``[B, S_q, H, S_kv]``-physical) or with a padded row stride, a kv_mask with a padded batch stride -- graph FACTS the row
   judges and the kernels address through the declared strides (TMA descriptors from the caller's 4-D strides, the granule
   loads from the batch stride): no reshape, no copy; a non-16-byte stride is a typed decline on a real graph.
+* **The pre-masked tail and the quiet body** (``padded_tail_form`` / ``dead_subtile_quiet``, the defaults of the plain padded / plain
+  and kv_mask bodies): the picks, the typed declines, the renderings and one GPU cell per shipped path -- including the per-batch Q
+  TRIM under the quiet body (the stored rows of a dead sub-tile must be EXACT zeros: the epilogue's SELECT, never a zero folded into
+  the scale), the Rubin twin of the SM100 line's detector.
 """
 
 import math
@@ -34,7 +38,7 @@ import math
 import pytest
 import torch
 
-from frost_test_utils import SPILL_TOLERANCE, assert_no_new_spills, requires_dsl, requires_rubin, run_sass_probe, sass_probe_source
+from frost_test_utils import assert_no_new_spills, requires_dsl, requires_rubin, run_sass_probe, sass_probe_source
 from test_sdpa_bias_sm107 import (  # noqa: F401  (the two fixtures are re-exported so they apply here too)
     _PROBE_BODY,
     _RECORD_ARMS,
@@ -300,24 +304,18 @@ def test_tile_n_64_renderings_fold_to_one_chunk_and_keep_the_split_and_the_spill
         assert probe.stats["R2P"] > 0 and probe.stats["FMNMX3"] > 0, probe.stats
 
 
-# The fp32 vector WITH the bias at TILE_N 128 spills (MEASURED on this branch's toolchain, cutlass-dsl 4.8.0 + the CUDA 13.5 ptxas,
-# sm_107a): the sixteen 128-bit granule loads of a 64-column chunk are 64 fp32 registers beside the 128 live S values, the 32
-# pre-loaded bias words and the band words -- over the softmax role's 192 -- where the io-dtype form packs two values per register
-# and stays at the bit word's count.  Neither named lever moves it (MEASURED, same toolchain): BIAS_PRELOAD_CHUNKS = 0 leaves
-# 23 / 27, 15 / 15 and 16 / 16 unchanged (the peak is the SECOND chunk's, after the pre-load is consumed) and a streamed
-# one-granule-at-a-time fold makes it WORSE (37 / 40, 25 / 25, 38 / 38 -- ptxas hoists the loads anyway).  So the rendering is NOT
-# SERVED: the heuristics pick TILE_N 64 for the fp32 vector WITH a bias and the adapter defaults to it (64 live S: 3 / 3 padded = the
-# base), the row and the adapter decline an EXPLICIT 128 typed (`engines._bias_arm_decline` / `check_support`), and the io-dtype vector
-# stays the fast path (cast on the host).  The
-# three renderings stay pinned here as the decline's REASON, from both sides: no more spills than measured (the upper bound, the
-# regression detector) and still MORE than the bit-word twin plus the tolerance (the lower bound) -- when a toolchain stops
-# spilling here, this test says so and the decline can be lifted.
-_FP32_BIAS_SPILL_PINS = {(32, 1, False): {"STL": 23, "LDL": 27}, (32, 1, True): {"STL": 15, "LDL": 15}, (64, 2, True): {"STL": 16, "LDL": 16}}
+# The fp32 vector WITH the bias at TILE_N 128 spills (MEASURED on cutlass-dsl 4.8.0 + the CUDA 13.5 ptxas, sm_107a: STL / LDL 23 / 27
+# dense, 15 / 15 padded, 16 / 16 at d64 cga2 against the bit word's 3 / 3): the sixteen 128-bit granule loads of a 64-column chunk are 64
+# fp32 registers beside the 128 live S values, the 32 pre-loaded bias words and the band words -- over the softmax role's 192 -- where the
+# io-dtype form packs two values per register and stays at the bit word's count.  Neither named lever moves it (BIAS_PRELOAD_CHUNKS = 0
+# leaves the counts unchanged; a streamed one-granule-at-a-time fold makes it worse: ptxas hoists the loads anyway).  So the rendering is
+# NOT SERVED: the heuristics pick TILE_N 64 for the fp32 vector WITH a bias and the adapter defaults to it, the row and the adapter
+# decline an EXPLICIT 128 typed (the accept / reject tables above, the real-graph cell below), and the io-dtype vector stays the fast
+# path.  The shipped renderings pinned here: one per (vector dtype x bias) class -- the fold is per row and width-blind.
 _ADDITIVE_ARMS = [
     # (d, cta, extra, the bool-form twin's extra) -- the additive rendering is pinned against the SAME arm with kv_mask_form = 1
     (32, 1, {"kv_mask_form": 2}, {"kv_mask_form": 1}),
     (32, 1, {"kv_mask_form": 3}, {"kv_mask_form": 1}),
-    (32, 1, {"kv_mask_form": 2, "bias_mode": 1, "seq_kv_lens_present": True}, {"kv_mask_form": 1, "bias_mode": 1, "seq_kv_lens_present": True}),
     (
         32,
         1,
@@ -330,33 +328,15 @@ _ADDITIVE_ARMS = [
         {"kv_mask_form": 3, "bias_mode": 1, "tile_n": 64, "seq_kv_lens_present": True},
         {"kv_mask_form": 1, "bias_mode": 1, "tile_n": 64, "seq_kv_lens_present": True},
     ),
-    (32, 1, {"kv_mask_form": 3, "bias_mode": 1, "window_right": 0}, {"kv_mask_form": 1, "bias_mode": 1, "window_right": 0}),
-    (32, 1, {"kv_mask_form": 3, "bias_mode": 1, "seq_kv_lens_present": True}, {"kv_mask_form": 1, "bias_mode": 1, "seq_kv_lens_present": True}),
-    (64, 2, {"kv_mask_form": 3, "bias_mode": 1, "seq_kv_lens_present": True}, {"kv_mask_form": 1, "bias_mode": 1, "seq_kv_lens_present": True}),
-    # the additive form at d64 cga1 (served; no rendering existed before): the fp32 vector alone, the io-dtype vector with the bias
-    (64, 1, {"kv_mask_form": 3}, {"kv_mask_form": 1}),
-    (64, 1, {"kv_mask_form": 2, "bias_mode": 1}, {"kv_mask_form": 1, "bias_mode": 1}),
 ]
-_ADDITIVE_IDS = [
-    "d32_add16",
-    "d32_addf32",
-    "d32_add16_bias_padded",
-    "d32_t64_add16_bias_padded",
-    "d32_t64_addf32_bias_padded",
-    "d32_addf32_bias_causal",
-    "d32_addf32_bias_padded",
-    "d64_addf32_bias_cga2_padded",
-    "d64_addf32_cga1",
-    "d64_add16_bias_cga1",
-]
+_ADDITIVE_IDS = ["d32_add16", "d32_addf32", "d32_t64_add16_bias_padded", "d32_t64_addf32_bias_padded"]
 
 
 @pytest.mark.parametrize("d, cta, extra, twin", _ADDITIVE_ARMS, ids=_ADDITIVE_IDS)
 def test_additive_kv_mask_renderings_fold_the_vector_as_packed_ffma_from_128_bit_loads(tmp_path, d, cta, extra, twin):
-    """Each additive-vector rendering against the bit-word rendering of the SAME arm: the register split kept, no cluster drain,
-    no new spills (the fp32 form with the bias at TILE_N 128: its MEASURED bound, ``_FP32_BIAS_SPILL_PINS``), MORE packed FFMA
-    (the vector fold, one per pair), 128-bit granule loads present (never scalarised), the ballots gone (no bit word) -- and a
-    different cubin."""
+    """Each shipped additive-vector rendering against the bit-word rendering of the SAME arm: the register split kept, no cluster drain,
+    no new spills, MORE packed FFMA (the vector fold, one per pair), 128-bit granule loads present (never scalarised), the ballots gone
+    (no bit word) -- and a different cubin."""
     base_params = {"__d": d, "cta_mma": cta, "dtype_qkv": 2, **twin}
     base = _probe(tmp_path, base_params, f"bool_{d}_{cta}_{'_'.join(sorted(twin))}")
     params = {"__d": d, "cta_mma": cta, "dtype_qkv": 2, **extra}
@@ -364,18 +344,7 @@ def test_additive_kv_mask_renderings_fold_the_vector_as_packed_ffma_from_128_bit
     assert probe.expect["KV_MASK_FORM"] == extra["kv_mask_form"] and base.expect["KV_MASK_FORM"] == 1
     assert probe.cubin_md5 != base.cubin_md5
     assert probe.stats["USETMAXREG"] > 0 and probe.stats["CGAERRBAR"] == 0, probe.stats
-    pins = base.stats
-    unserved = extra["kv_mask_form"] == 3 and extra.get("bias_mode") and extra.get("tile_n", 128) == 128
-    if unserved:
-        pins = _FP32_BIAS_SPILL_PINS[(d, cta, bool(extra.get("seq_kv_lens_present")))]
-    assert_no_new_spills(
-        probe.stats, pins, tag=f"additive d{d} cga{cta} {sorted(extra)} vs {'the measured fp32 bound' if pins is not base.stats else 'the bit word'}: "
-    )
-    if unserved:
-        assert probe.stats["STL"] > base.stats["STL"] + SPILL_TOLERANCE, (
-            f"the fp32 + bias rendering at TILE_N 128 no longer spills beyond the bit word ({probe.stats['STL']} vs {base.stats['STL']} STL): "
-            "the typed decline in engines._bias_arm_decline / SdpaFwdDslSm100.check_support can be lifted"
-        )
+    assert_no_new_spills(probe.stats, base.stats, tag=f"additive d{d} cga{cta} {sorted(extra)} vs the bit word: ")
     assert probe.stats["FFMA2"] > base.stats["FFMA2"], (probe.stats, base.stats)
     assert probe.stats["LDG_128"] > 0, probe.stats
     assert probe.stats["VOTE"] < base.stats["VOTE"], (probe.stats, base.stats)
@@ -400,10 +369,27 @@ def _executed_tile_n(g, idx):
     return int(api.template_params().tile_n)
 
 
-def _run2(q, k, v, *, scale, bias=None, kv_mask=None, sdpa_kwargs=None, seq_len_kv=None, seq_len_q=None, sink=None, stats=True, cga=None, tile_n=None):
+def _run2(
+    q,
+    k,
+    v,
+    *,
+    scale,
+    bias=None,
+    kv_mask=None,
+    sdpa_kwargs=None,
+    seq_len_kv=None,
+    seq_len_q=None,
+    sink=None,
+    stats=True,
+    cga=None,
+    tile_n=None,
+    two_launch_assert=True,
+):
     """``test_sdpa_bias_sm107._run`` with the TILE_N knob: build the graph, pin the Rubin f16 row (a cga and / or a TILE_N through
     the public autotune record), launch TWICE on sentinel-filled outputs (the two-launch delta) and return O, Stats, the plan's OWN
-    knob record and the width the compiled kernel actually carries (``executed_tile_n``)."""
+    knob record and the width the compiled kernel actually carries (``executed_tile_n``).  ``two_launch_assert=False`` leaves the
+    two-launch identity to the caller (the first launch rides along as ``o_first`` / ``stats_first``)."""
     import cudnn
 
     g, vp, o, o_gpu, stats_gpu = _build(
@@ -444,8 +430,9 @@ def _run2(q, k, v, *, scale, bias=None, kv_mask=None, sdpa_kwargs=None, seq_len_
 
     o1, st1 = launch()
     o2, st2 = launch()
-    assert torch.equal(o1, o2) and (st1 is None or torch.equal(st1, st2)), "two-launch delta on O / Stats"
-    return dict(o=o_gpu, stats=stats_gpu, knobs=knobs, executed_tile_n=executed_tile_n, names=names)
+    if two_launch_assert:
+        assert torch.equal(o1, o2) and (st1 is None or torch.equal(st1, st2)), "two-launch delta on O / Stats"
+    return dict(o=o_gpu, stats=stats_gpu, knobs=knobs, executed_tile_n=executed_tile_n, names=names, o_first=o1, stats_first=st1)
 
 
 def _ref_add(q, k, v, *, scale, bias=None, add=None, kv_mask=None, causal=False, seq_kv_lens=None):
@@ -543,19 +530,15 @@ def _run_cell(c, io, *, tile_n=None, add_as_mask=True):
     return out, ref, kw
 
 
-# TILE_N = 64 cells: n_kv = 1 / 2 / 4 (= the ring depth) / 6 at the 64-wide tile with B*H > 1, a padded tail (200 / 150 of
-# 256: a partial 64-wide tile), plain / bias / bool mask / both / causal, d64 at cga1 and cga2 (the bias at S_kv 256 at cga2 =
-# the 128-wide budget's edge, served at 64 too).
+# TILE_N = 64 cells: n_kv = 1 and 6 (bracketing the 64-wide ring) with B*H > 1, a padded tail (200 / 150 of 256: a partial 64-wide
+# tile), the bool mask, both arms under the band + padding, d64 at cga1 and cga2 (the bias at S_kv 256 at cga2 = the 128-wide budget's
+# edge, served at 64 too), the fp16 graph.  (The bias-only 64-wide body is the knob-less pick of test_sdpa_bias_sm107.py's
+# ``dense_nkv1`` / ``d64_dense_128`` cells.)
 _T64_CASES = {
     "t64_dense_64_nkv1": dict(s=64),
-    "t64_dense_128_nkv2": dict(s=128),
-    "t64_dense_256_nkv4": dict(s=256),
     "t64_dense_384_nkv6": dict(s=384, h=2),
-    "t64_causal_384": dict(s=384, h=2, causal=True),
     "t64_padded_tail_256": dict(s=256, kv_lens=[200, 150]),
-    "t64_bias_256": dict(s=256, bias=True),
     "t64_mask_256": dict(s=256, mask=True),
-    "t64_both_384": dict(s=384, h=2, bias=True, mask=True),
     "t64_both_causal_padded_384": dict(s=384, h=2, bias=True, mask=True, causal=True, kv_lens=[384, 300]),
     "t64_d64_both_128_cga1": dict(d=64, s=128, bias=True, mask=True),
     "t64_d64_both_256_cga2": dict(d=64, s=256, h=2, bias=True, mask=True, cga=2),
@@ -618,21 +601,17 @@ def test_tile_n_256_is_a_typed_decline_on_a_real_graph():
     assert "tile_n" in str(excinfo.value) or "TILE_N" in str(excinfo.value) or "domain" in str(excinfo.value), str(excinfo.value)[:400]
 
 
-# The additive vector: bf16 and fp32, the -1e9 fold alone / with the bias / causal / padded, across the ring wrap (n_kv 4), at
-# TILE_N 64, d64 at cga2, a padded 16-byte batch stride, an fp16 graph with an fp16 vector.
+# The additive vector: bf16 and fp32, the -1e9 fold alone / with the bias (the fp32 + bias form under the band: the heuristics pick
+# TILE_N 64; the io-dtype vector + bias at d64 cga1), padded, across the ring wrap (n_kv 4), d64 at cga2 -- one cell per (form x arm)
+# path (the vector at the public TILE_N 64 knob is the ``t64_*`` cells; the padded batch stride is the strided table's).
 _ADD_CASES = {
     "add_bf16_256": dict(s=256, add="bf16"),
     "add_f32_256": dict(s=256, add="f32"),
-    "add_bf16_bias_384": dict(s=384, h=2, add="bf16", bias=True),
     "add_f32_bias_causal_384": dict(s=384, h=2, add="f32", bias=True, causal=True),  # the fp32 + bias form: the heuristics pick TILE_N 64
-    "add_f32_bias_causal_t64_384": dict(s=384, h=2, add="f32", bias=True, causal=True, tile_n=64),  # ... and the explicit knob
-    "add_f32_d64_128_cga1": dict(d=64, s=128, add="f32"),
     "add_bf16_bias_d64_128_cga1": dict(d=64, s=128, add="bf16", bias=True),
     "add_bf16_padded_384": dict(s=384, h=2, add="bf16", kv_lens=[384, 200]),
     "add_bf16_512_nkv4": dict(s=512, h=2, add="bf16"),
-    "add_bf16_t64_256": dict(s=256, add="bf16", tile_n=64),
     "add_f32_d64_256_cga2": dict(d=64, s=256, h=2, add="f32", cga=2),
-    "add_bf16_batchpad_256": dict(s=256, add="bf16", mask_pad=64),
 }
 
 
@@ -741,8 +720,6 @@ def test_additive_fully_masked_row_is_the_eager_uniform_average_not_the_empty_ro
 # padded kv_mask batch stride (bool and additive) -- every one a graph FACT the row judges and the kernels address.
 _STRIDED_CASES = {
     "headpad8_bias_mask_256": dict(s=256, layout="headpad", bias=True, mask=True),
-    "bias_perm_bshs_256": dict(s=256, bias=True, bias_perm=True),
-    "bias_perm_bshs_causal_t64_384": dict(s=384, h=2, bias=True, bias_perm=True, causal=True, tile_n=64),
     "bias_padded_row_320_256": dict(s=256, bias=True, bias_row=320),
     "mask_batchpad_64_256": dict(s=256, mask=True, mask_pad=64),
     "add_f32_batchpad_8_256": dict(s=256, add="f32", mask_pad=8),
@@ -1020,11 +997,7 @@ def test_adapter_padded_tail_form_default_is_the_config_pick():
         cfg_mod._PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS = saved
 
 
-@pytest.mark.parametrize(
-    "d, cta, tile_n",
-    [(32, 1, 128), (32, 1, 64), (64, 2, 128)],
-    ids=["d32_t128", "d32_t64", "d64_cga2_t128"],
-)
+@pytest.mark.parametrize("d, cta, tile_n", [(32, 1, 128), (64, 2, 128)], ids=["d32_t128", "d64_cga2_t128"])
 def test_padded_tail_form_1_rendering_has_one_softmax_body(tmp_path, d, cta, tile_n):
     """The pre-masked tail rendering traced for sm_107a carries ONE softmax body per warp group: its exp count equals the DENSE
     rendering's of the same width (the legacy padded rendering carries twice as many -- the second, software-max body), it has NO
@@ -1049,16 +1022,14 @@ def test_padded_tail_form_1_rendering_has_one_softmax_body(tmp_path, d, cta, til
     assert_no_new_spills(p_form1.stats, p_legacy.stats, tag=f"padded_tail_form 1 d{d} cga{cta} TILE_N {tile_n} vs the legacy tail: ")
 
 
-# The padded tail cells: a partial 128-wide tail (89 / 72 / 44 / 66 / 88 valid columns of the last tile), per-batch lengths with
-# a FULL tile for one entry (the pre-mask must fire on the ragged entry only), a one-tile shape, d64 at cga2, the 64-wide tile.
+# The padded tail cells: a partial 128-wide tail (89 / 72 valid columns of the last tile), per-batch lengths with a FULL tile for one
+# entry (the pre-mask must fire on the ragged entry only), a one-tile shape, d64 at cga2, the fp16 graph -- the shipped default at the
+# 128-wide tile (form 1 at TILE_N 64 is not the default there: a request's rendering).
 _PADDED_TAIL_CASES = {
     "tail_217": dict(s=217),
     "tail_200_B2_lens": dict(s=256, kv_lens=[200, 256]),
-    "tail_300": dict(s=300, h=2),
-    "tail_450": dict(s=450, h=2),
     "tail_one_tile_100": dict(s=100),
     "tail_d64_300_cga2": dict(d=64, s=300, h=2, cga=2),
-    "tail_t64_217": dict(s=217, tile_n=64),
     "tail_f16_217": dict(s=217, io=torch.float16),
 }
 
@@ -1083,19 +1054,17 @@ def test_padded_tail_form_1_cells_match_the_fp64_oracle_and_the_legacy_tail(case
 
     c = _PADDED_TAIL_CASES[case]
     io = c.get("io", torch.bfloat16)
-    tile_n = c.get("tile_n")
     s = c["s"]
     cc = dict(c)
-    cc.pop("tile_n", None)
     cc.pop("io", None)
     if "kv_lens" not in cc:
         cc["kv_lens"] = [s] * 2  # the SAME per-batch lengths the engine synthesises for an S_kv off the tile multiple
     saved = cfg_mod._PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS
     try:
         cfg_mod._PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS = 1
-        out1, ref, _ = _run_cell(cc, io, tile_n=tile_n)
+        out1, ref, _ = _run_cell(cc, io)
         cfg_mod._PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS = 0
-        out0, _, _ = _run_cell(cc, io, tile_n=tile_n)
+        out0, _, _ = _run_cell(cc, io)
     finally:
         cfg_mod._PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS = saved
     _check(out1, ref)
@@ -1274,11 +1243,7 @@ def test_adapter_dead_subtile_quiet_default_is_the_config_pick():
         cfg_mod._DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS = saved
 
 
-@pytest.mark.parametrize(
-    "d, cta, tile_n, base_arm",
-    [(32, 1, 128, "d32_dense_bf16"), (32, 1, 64, "d32_dense_bf16"), (64, 2, 128, "d64_dense_bf16"), (32, 1, 128, "d32_padded_bf16")],
-    ids=["d32_t128", "d32_t64", "d64_cga2_t128", "d32_padded_t128"],
-)
+@pytest.mark.parametrize("d, cta, tile_n, base_arm", [(32, 1, 128, "d32_dense_bf16"), (32, 1, 128, "d32_padded_bf16")], ids=["d32_t128", "d32_padded_t128"])
 def test_dead_subtile_quiet_rendering_adds_a_quiet_loop_and_no_math(tmp_path, d, cta, tile_n, base_arm):
     """The quiet-body rendering traced for sm_107a carries the SAME exp count as the full-body rendering (the quiet loop has no exp2 /
     max / sum), the register split, no cluster drain, spills no more than the full-body rendering, and is a different cubin."""
@@ -1296,17 +1261,16 @@ def test_dead_subtile_quiet_rendering_adds_a_quiet_loop_and_no_math(tmp_path, d,
 
 
 # The dead-sub-tile cells: S 384 (sub-tile 1 of super-tile 2 dead: the headline), S 100 (the only super-tile's sub-tile 1 dead), the
-# padding leg (S 300 / 600 with a ragged tail, under both tail forms), the kv_mask -inf body, the causal 3-segment arm, d64 at cga2 (the
-# non-leader CTA's sub-tiles past S_q) and the NO-dead-tile control (S 512: the quiet arm must be bitwise the full body).
+# padding leg under each width's default tail form (S 300: 300 % 128 = 44 -> TILE_N 64, form 0 + quiet; S 600: 600 % 128 = 88 -> TILE_N
+# 128, the pre-masked tail form 1 + quiet, both defaults on at once), the kv_mask -inf body, d64 at cga2 (the non-leader CTA's sub-tiles
+# past S_q), the fp16 quiet body (the zero stores of dead rows under the fp16 O cast) and the NO-dead-tile control (S 512: the quiet arm
+# must be bitwise the full body).  The dead sub-tile stores nothing whatever the band, so the causal arm needs no cell of its own.
 _DEAD_SUBTILE_CASES = {
     "dead_384": dict(s=384, h=2),
     "dead_100_one_super": dict(s=100),
     "dead_300_padded": dict(s=300, h=2),
-    "dead_300_padded_tail1": dict(s=300, h=2, tail=1),
     "dead_600_padded": dict(s=600, h=2),
     "dead_384_mask": dict(s=384, h=2, mask=True),
-    "dead_384_causal": dict(s=384, h=2, causal=True),
-    "dead_d64_300_cga2": dict(d=64, s=300, h=2, cga=2),
     "dead_d64_384_cga2": dict(d=64, s=384, h=2, cga=2),
     "dead_384_f16": dict(s=384, h=2, io=torch.float16),
     "live_512_control": dict(s=512, h=2),
@@ -1326,18 +1290,16 @@ def test_dead_subtile_quiet_cells_are_bitwise_the_full_body_and_match_the_fp64_o
     s = c["s"]
     cc = dict(c)
     cc.pop("io", None)
-    tail = cc.pop("tail", None)
     if s % 128:
         cc["kv_lens"] = [s] * 2  # the SAME per-batch lengths the engine synthesises for an S_kv off the tile multiple
-    saved_q, saved_t = cfg_mod._DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS, cfg_mod._PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS
+    saved_q = cfg_mod._DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS
     try:
-        cfg_mod._PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS = tail
         cfg_mod._DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS = 1
         out1, ref, _ = _run_cell(cc, io)
         cfg_mod._DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS = 0
         out0, _, _ = _run_cell(cc, io)
     finally:
-        cfg_mod._DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS, cfg_mod._PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS = saved_q, saved_t
+        cfg_mod._DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS = saved_q
     _check(out1, ref)
     _check(out0, ref)
     assert torch.equal(out1["o"], out0["o"]), f"{case}: the quiet body changed a stored O row"

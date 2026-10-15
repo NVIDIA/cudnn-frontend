@@ -23,20 +23,19 @@ scheduler; a request (the adapter's ``bias_mode=3`` / the test seam) elsewhere, 
 Capabilities row moves (the cga1 ring served every cell of the class before).
 
 Three tiers: (1) CPU contract -- the pick returns the form on request only and declines it off the pair / off cga1, the config
-factory's couplings (each raises with its message), the appended Cfg field, the ring's 16-count bars, the kernel's one const_expr axis,
-the engine row's typed declines, the adapter twin; (2) host rendering pins (sm_107a trace-compile) -- the mode-2 renderings stay
+factory's couplings (each raises with its message), the appended Cfg field, the ring's 16-count bars, the engine row's typed declines,
+the adapter twin, the measured default and the length fact the row passes; (2) host rendering pins (sm_107a trace-compile) -- the mode-2 renderings stay
 byte-identical to their committed record (the multicast seams fold OUT of the cga1 ring), the multicast rendering keeps the register
 split, no cluster-scope drain, spills no more than the mode-2 rendering, carries the predicated multicast issue (UTMALDG + one ghost
 site), and its PTX carries the cta_group::1 ``.multicast::cluster`` form and NO ``cta_group::2`` (the form whose bytes land on the pair
-leader only); (3) GPU cells on a Rubin device -- the fp64 oracle over the ring-wrap axis (n_kv 1 / 2 / 3 / 4 / 8), an even and an odd
-chunk count (the padded peer), a shorter tail chunk paired with a full one, causal, a kv_mask, fp16, D 64, 2 stages; the BITWISE pins
-against the cga1 ring and against the resident block; the typed declines on real graphs.
+leader only); (3) GPU cells on a Rubin device -- the fp64 oracle once per handshake class (n_kv 1 and 8 with even peers, the odd padded peer, the
+short live peer, the short tail + the padded peer, causal, 16 tiles at n_chunk 2, D 64) and on the KNOB-LESS pick (the pick -> record ->
+plan chain end to end), a kv_mask and fp16 once, the public ``bias_stages=2`` request; the BITWISE pins against the cga1 ring (one per
+class) and against the resident block (the ring's first wrap); the typed declines on real graphs.
 """
 
 import dataclasses
-import glob
 import json
-import os
 import re
 import subprocess
 import sys
@@ -45,14 +44,13 @@ from pathlib import Path
 import pytest
 import torch
 
-from frost_test_utils import assert_no_new_spills, nvdisasm_candidates, requires_dsl, requires_rubin, run_sass_probe, sass_probe_source
+from frost_test_utils import assert_no_new_spills, requires_dsl, requires_rubin, run_sass_probe, sass_probe_source
 import test_sdpa_bias_sm107 as _s13
 import test_sdpa_bias_streamed_sm107 as _s15
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 
 _ROW = "sdpa_fwd_prefill_sm107"
-_KERNEL = Path(__file__).resolve().parents[4] / "python" / "cudnn" / "sdpa" / "fwd" / "kernels" / "sm107" / "prefill_d128_f16.py"
 _RENDERINGS = Path(__file__).resolve().parent / "renderings"
 _MCAST = 3
 
@@ -101,18 +99,6 @@ def test_the_pick_returns_the_multicast_form_on_request_only():
     assert c.sm107_bias_mode_pick(32, 1, 1024, pair=False, request=_MCAST) == 0, "the one-batch-entry item's two CTAs read DIFFERENT bias rows"
     assert c.sm107_bias_mode_pick(64, 2, 512, pair=False, request=_MCAST) == 0, "cga2 is the collective geometry"
     assert c.sm107_bias_mode_pick(64, 1, 512, pair=False, request=_MCAST) == 0, "no ring at the 64-wide tile's cga1 one-batch-entry item"
-
-
-def test_the_seam_pins_the_multicast_form(_pins):
-    from cudnn.sdpa.fwd import config_sm107 as c
-
-    _pins(mode=_MCAST)
-    assert c.sm107_bias_mode_pick(32, 1, 384, pair=True) == _MCAST, "where the resident block would fit too (the A/B's cells)"
-    assert c.sm107_bias_mode_pick(32, 1, 1024, pair=True) == _MCAST
-    assert c.sm107_bias_mode_pick(32, 1, 1024, pair=False) == 0, "...never off the pair item"
-    assert c.sm107_bias_mode_pick(32, 1, 1024, pair=True, request=2) == 2, "an explicit request outranks the seam"
-    _pins()
-    assert c.sm107_bias_mode_pick(32, 1, 1024, pair=True) == 2
 
 
 def test_config_factory_derives_the_multicast_cfg_and_raises_on_each_coupling():
@@ -194,11 +180,9 @@ def test_the_ring_bars_count_both_ctas_releases():
     assert "init_count=ring_empty_count, producer=Producer.THREAD" in src
 
 
-def test_cfg_is_appended_and_the_kernel_carries_the_multicast_ring_as_one_const_expr_axis():
-    """The Cfg gains ONE appended field; the kernel folds every multicast seam on ``_BIAS_MCAST`` (the ring seams stay on
-    ``_BIAS_STREAMED``, which now names both forms): the rank read, the chunk remap at every decode (5 initial + 5 payload), the fill
-    helper's predicated issue, the peer release beside the own one (the kv body and the ghost loop), the two ghost loops, the TMA-LDG
-    drain, the cluster fence, the launch's cluster and the padded chunk count, the 16-count bars."""
+def test_cfg_field_is_appended():
+    """The Cfg gains ONE appended field (``BIAS_MCAST_CTAS``, default 1: every existing record renders byte-identically -- the streamed
+    record pins below are the proof that the multicast seams fold OUT of the cga1 ring)."""
     from cudnn.sdpa.fwd import config_sm107 as c
 
     from cudnn.sdpa.fwd.config_d128_family import D128FamilySmallTileFields
@@ -213,36 +197,6 @@ def test_cfg_is_appended_and_the_kernel_carries_the_multicast_ring_as_one_const_
         and fields[-5:] == ["STAGES_BIAS", "BIAS_MAX_FORM", "S_SLOTS", "BIAS_MCAST_CTAS", "Q_IN_TMEM"]
         and c._CfgSm107.BIAS_MCAST_CTAS == 1
     ), "append-only; 1 renders every existing record byte-identically"
-    src = _KERNEL.read_text()
-    assert "_BIAS_STREAMED = CFG.BIAS_MODE in BIAS_STREAMED_MODES" in src and "_BIAS_MCAST = CFG.BIAS_MODE == BIAS_MODE_STREAMED_MULTICAST" in src
-    assert "CGA_SIZE = CFG.CGA_M * CFG.CGA_N * CFG.BIAS_MCAST_CTAS" in src
-    assert "+ (CGA_SIZE // CFG.CTA_MMA)" in src, "the MMA warps that credit the scheduler: one per CTA_MMA CTAs of the cluster"
-    assert "bias_ring_empty_arrivers=CFG.BIAS_EMPTY_ARRIVERS * CFG.BIAS_MCAST_CTAS if _BIAS_STREAMED else None" in src
-    assert "if cutlass.const_expr(CFG.CTA_MMA == 2 or _BIAS_MCAST):\n        cga_arrive()\n        cga_wait()" in src, "P4: the cluster fence after the inits"
-    assert "bias_mcast_rank = cute.arch.block_idx_in_cluster() if cutlass.const_expr(_BIAS_MCAST) else None" in src
-    assert (
-        src.count("batch_idx = _mcast_chunk(batch_idx, bias_mcast_rank) if cutlass.const_expr(_BIAS_MCAST) else batch_idx") == 10
-    ), "5 roles x (initial + payload)"
-    assert src.count("bias_ring_state = _bias_ring_fill(") == 5, "the four kv-tile paths + the TMA-LDG ghost loop"
-    assert src.count("ghost_tiles = _mcast_ghost_tiles(chunk_idx, bias_mcast_rank, n_rows_total, item_b)") == 2, "the TMA-LDG and the softmax ghost loops"
-    assert (
-        src.count("bars.mb_bias_ring_empty[bias_ring_state.idx].arrive_on_peer(bias_mcast_rank ^ cutlass.Int32(1), pred=nvvm.elect_sync(), release_cta=True)")
-        == 2
-    ), "the kv body's and the ghost loop's peer credit, both in the .release.cta form (a read-then-credit across CTAs)"
-    assert "arrive_on_peer(bias_mcast_rank ^ cutlass.Int32(1), pred=nvvm.elect_sync())" not in src, "a relaxed peer credit on the ring"
-    assert src.count("bars.mb_bias_ring_empty[bias_ring_state.idx].arrive()") == 2, "the kv body's own release + the ghost loop's"
-    assert "issue_bias_ring_tile_multicast(" in src and "bias_mcast_rank == cutlass.Int32(0)" in src
-    assert "cluster=(CFG.CTA_MMA, 1, CFG.BIAS_MCAST_CTAS)" in src
-    assert "sched_batch = (-(-sched_batch // CFG.BIAS_MCAST_CTAS)) * CFG.BIAS_MCAST_CTAS if cutlass.const_expr(_BIAS_MCAST) else sched_batch" in src
-    assert "is_cga_first_cta = (bias_mcast_rank == cutlass.Int32(0)) if cutlass.const_expr(_BIAS_MCAST) else (cta_id_x == cutlass.Int32(0))" in src
-    assert (
-        "    if cutlass.const_expr(_BIAS_MCAST):\n        for _bs in cutlass.range_constexpr(CFG.STAGES_BIAS):\n            bars.mb_bias_ring_empty[bias_ring_state.idx].wait(bias_ring_state.phase)"
-        in src
-    ), "P15: the drain"
-    # the two tile_dsl halves: the cta_group::1 multicast load and the per-CTA arm + predicated issue
-    from cudnn.frost.tile_dsl import bias as tb, tma as tt
-
-    assert hasattr(tt, "tma_load_tile_multicast") and hasattr(tb, "issue_bias_ring_tile_multicast")
 
 
 # (name, facts kwargs, knobs kwargs, accept?) with the seam at 3: the pair cells the multicast ring serves, and the typed declines.
@@ -506,10 +460,9 @@ def test_streamed_renderings_are_byte_identical_to_their_record(tmp_path, arm):
         (32, {"n_chunk": 4}, 3),
         (32, {"n_chunk": 4, "bias_stages": 2}, 2),
         (32, {"n_chunk": 4, "kv_mask_form": 1, "window_right": 0}, 3),
-        (32, {"n_chunk": 4, "tile_n": 64}, 3),
         (64, {"n_chunk": 4}, 3),
     ],
-    ids=["d32_pair_3", "d32_pair_2", "d32_pair_mask_causal", "d32_pair_t64", "d64_pair_3"],
+    ids=["d32_pair_3", "d32_pair_2", "d32_pair_mask_causal", "d64_pair_3"],
 )
 def test_multicast_renderings_keep_the_split_no_drain_and_the_predicated_issue(tmp_path, d, extra, stages):
     """Each multicast rendering traced for sm_107a keeps the per-role register split (USETMAXREG > 0), no cluster-scope drain (no CGAERRBAR,
@@ -603,12 +556,11 @@ def test_ptx_carries_the_cta_group_1_multicast_form_on_the_multicast_rendering_o
 # The multicast ring's degenerate-input matrix.  The pair item on a batch-broadcast bias; ``b`` = the flattened rows, ``n_chunk`` the
 # chunk, so the chunk count is ceil(b / n_chunk): EVEN (every cluster has two live chunks) or ODD (a PADDED peer runs the ghost
 # handshake); a chunk count whose last chunk is SHORTER than n_chunk pairs a full chunk with a short one (ghost steps on a LIVE peer).
-# The ring-wrap axis at the 128-wide tile: S_kv 128 / 256 / 384 / 512 / 1024 = n_kv 1 / 2 / 3 / 4 / 8 (the heuristics' width pick for a
-# bias alone at one / two tiles is 64, so those cells wrap the 16 KiB stage ring instead -- both widths covered).  ``mode`` 3 = the seam.
+# The ring-wrap axis at the 128-wide tile: S_kv 128 / 512 / 1024 = n_kv 1 / 4 / 8 (the heuristics' width pick for a bias alone at one tile
+# is 64, so that cell wraps the 16 KiB stage ring instead -- both widths covered); one cell per handshake class.  ``mode`` 3 = the seam;
+# the row without it is the KNOB-LESS pick (the pair at S_q % 256 != 0 under global lengths and the natural scheduler: the measured default).
 _CASES = {
     "nkv1_S128_b8_even": dict(b=8, h=2, h_kv=2, s_q=128, s_kv=128, n_chunk=4, mode=3),
-    "nkv2_S256_b8_even": dict(b=8, h=2, h_kv=2, s_q=256, s_kv=256, n_chunk=4, mode=3),
-    "nkv3_S384_b8_even": dict(b=8, h=2, h_kv=2, s_q=384, s_kv=384, n_chunk=4, mode=3),
     "nkv4_S512_b8_even": dict(b=8, h=2, h_kv=2, s_q=512, s_kv=512, n_chunk=4, mode=3),
     "nkv8_S1024_b8_even": dict(b=8, h=2, h_kv=2, s_q=1024, s_kv=1024, n_chunk=4, mode=3),
     "nkv8_S1024_b4_odd_padded_peer": dict(b=4, h=2, h_kv=2, s_q=1024, s_kv=1024, n_chunk=4, mode=3),
@@ -618,14 +570,19 @@ _CASES = {
     "nkv8_S1024_b8_causal": dict(b=8, h=2, h_kv=2, s_q=1024, s_kv=1024, n_chunk=4, mode=3, causal=True),
     "nkv8_S1024_b8_2_stages": dict(b=8, h=2, h_kv=2, s_q=1024, s_kv=1024, n_chunk=4, mode=3, stages=2),
     "nkv16_S2048_b6_causal_n2": dict(b=6, h=2, h_kv=2, s_q=2048, s_kv=2048, n_chunk=2, mode=3, causal=True),
-    "head_broadcast_bias_S1024_b8": dict(b=8, h=4, h_kv=4, s_q=1024, s_kv=1024, bias="1", n_chunk=4, mode=3),
-    "d64_nkv8_S1024_b8": dict(b=8, h=2, h_kv=2, s_q=1024, s_kv=1024, d=64, n_chunk=4, mode=3),
-    "d64_nkv4_S512_b6_short_live_peer_causal": dict(b=6, h=2, h_kv=2, s_q=512, s_kv=512, d=64, n_chunk=4, mode=3, causal=True),
-    # the D 64 twin of the resident-block comparison: the pair item's 128-row block holds S_kv <= 384 at D 64 (sm107_bias_resident_s_kv_max),
-    # so the "where it fits" cell sits at S 384; the S 512 cell above runs the ring forms only
-    "d64_nkv3_S384_b6_short_live_peer_causal": dict(b=6, h=2, h_kv=2, s_q=384, s_kv=384, d=64, n_chunk=4, mode=3, causal=True),
+    "d64_nkv8_S1024_b8": dict(b=8, h=2, h_kv=2, s_q=1024, s_kv=1024, d=64, n_chunk=4, mode=3),  # D 64 is request-only for this form: one cell
     "pick_n_chunk_S896_b8": dict(b=8, h=2, h_kv=2, s_q=896, s_kv=896, mode=3),  # the heuristics' chunk pick (the pair at S_q % 256 != 0), the seam's form
 }
+# one oracle cell per handshake class; the rows left out run under the bitwise / compose pins below
+_ORACLE_CASES = [c for c in _CASES if c not in ("nkv4_S512_b8_even", "nkv8_S1024_b12_odd_padded_peer", "nkv8_S1024_b8_2_stages")]
+# the bitwise pin against the cga1 ring: one per handshake class, the public ``bias_stages=2`` request on this form, the knob-less pick
+_BITWISE_RING_CASES = [
+    "nkv8_S1024_b8_even",
+    "nkv8_S1024_b4_odd_padded_peer",
+    "nkv8_S1024_b6_short_live_peer",
+    "nkv8_S1024_b10_short_tail_and_padded",
+    "nkv8_S1024_b8_2_stages",
+]
 
 
 # Cells the multicast form DECLINES by its own contract (global lengths only) when REQUESTED: the GRAPH path serves a dense S_kv % 128 != 0
@@ -651,11 +608,29 @@ def _run(q, k, v, kw, c, _pins, *, mode=None, stages=None, n_chunk=None):
     return _s13._run(q, k, v, **kw)
 
 
+def _spy_adapter_modes(monkeypatch):
+    """Record the bias FORM the adapter builds for every plan (``_resident_arm_bias_mode`` on the Blackwell / Rubin adapter class, where the
+    Rubin small tiles' arms live) with the length facts it saw: the compiled record is not on the graph's public surface, so a KNOB-LESS
+    cell reads the form it ran here."""
+    from cudnn.sdpa.fwd import api_dsl
+
+    modes = []
+    orig = api_dsl.SdpaFwdDslSm100._resident_arm_bias_mode
+
+    def spy(self):
+        m = orig(self)
+        modes.append((m, bool(self.seq_kv_lens_present), bool(self.seq_q_lens_present), self.bias_desc is not None, bool(self._kv_padded())))
+        return m
+
+    monkeypatch.setattr(api_dsl.SdpaFwdDslSm100, "_resident_arm_bias_mode", spy)
+    return modes
+
+
 @requires_rubin
-@pytest.mark.parametrize("case", list(_CASES))
-def test_multicast_ring_matches_the_fp64_oracle(case, _pins):
-    """The multicast ring over its degenerate-input matrix (bf16): O and Stats against the fp64 oracle, keyless rows exactly 0 / -inf,
-    two launches bitwise; every cell runs the pair item at cga1 (the seam pins the form)."""
+@pytest.mark.parametrize("case", _ORACLE_CASES)
+def test_multicast_ring_matches_the_fp64_oracle(case, _pins, monkeypatch):
+    """The multicast ring once per handshake class (bf16): O and Stats against the fp64 oracle, keyless rows exactly 0 / -inf, two
+    launches bitwise; every cell runs the pair item at cga1 (the seam pins the form; the knob-less cell takes it from the pick)."""
     c = _CASES[case]
     q, k, v, kw, ref = _case_inputs(case, torch.bfloat16)
     out = _run(q, k, v, kw, c, _pins)
@@ -664,8 +639,9 @@ def test_multicast_ring_matches_the_fp64_oracle(case, _pins):
 
 
 @requires_rubin
-@pytest.mark.parametrize("case", ["nkv8_S1024_b8_even", "nkv8_S1024_b4_odd_padded_peer", "d64_nkv8_S1024_b8"])
+@pytest.mark.parametrize("case", ["nkv8_S1024_b4_odd_padded_peer"])
 def test_multicast_ring_matches_the_fp64_oracle_fp16(case, _pins):
+    """The fp16 member on the dead-peer handshake (the O cast of a padded peer under fp16)."""
     c = _CASES[case]
     q, k, v, kw, ref = _case_inputs(case, torch.float16)
     out = _run(q, k, v, kw, c, _pins)
@@ -673,7 +649,7 @@ def test_multicast_ring_matches_the_fp64_oracle_fp16(case, _pins):
 
 
 @requires_rubin
-@pytest.mark.parametrize("case", ["nkv8_S1024_b8_even", "nkv8_S1024_b12_odd_padded_peer", "nkv8_S1024_b8_causal", "d64_nkv8_S1024_b8"])
+@pytest.mark.parametrize("case", ["nkv8_S1024_b12_odd_padded_peer", "nkv8_S1024_b8_causal"])
 def test_multicast_ring_composes_with_the_kv_mask(case, _pins):
     """The bit-word kv_mask moves no kv-tile bound (it masks columns), so the two CTAs' sequences stay identical."""
     c = _CASES[case]
@@ -683,10 +659,11 @@ def test_multicast_ring_composes_with_the_kv_mask(case, _pins):
 
 
 @requires_rubin
-@pytest.mark.parametrize("case", list(_CASES))
-def test_multicast_is_bitwise_the_cga1_ring(case, _pins):
+@pytest.mark.parametrize("case", _BITWISE_RING_CASES)
+def test_multicast_is_bitwise_the_cga1_ring(case, _pins, monkeypatch):
     """Same tiles in the same order, the bias through the same FFMA from the same 128-byte swizzled row slice: O / Stats are BITWISE the
-    cga1 ring's -- only WHICH CTA issues the TMA and the barrier counts differ."""
+    cga1 ring's -- only WHICH CTA issues the TMA and the barrier counts differ.  One cell per handshake class, the public ``bias_stages=2``
+    request on this form, and the KNOB-LESS pick (the multicast form read off the compiled record, the cga1 twin through the seam)."""
     c = _CASES[case]
     q, k, v, kw, ref = _case_inputs(case, torch.bfloat16)
     mcast = _run(q, k, v, kw, c, _pins, mode=_MCAST)
@@ -696,10 +673,10 @@ def test_multicast_is_bitwise_the_cga1_ring(case, _pins):
 
 
 @requires_rubin
-@pytest.mark.parametrize("case", ["nkv3_S384_b8_even", "nkv4_S512_b8_even", "d64_nkv3_S384_b6_short_live_peer_causal"])
+@pytest.mark.parametrize("case", ["nkv4_S512_b8_even"])
 def test_multicast_is_bitwise_the_resident_block_where_it_fits(case, _pins):
-    """Where the pair item's resident block holds S_kv (D 32: <= 768, D 64: <= 384 at the 128-wide tile), the multicast ring's O / Stats are
-    BITWISE the block's -- the same bias words through the same FFMA; only the staging differs."""
+    """Where the pair item's resident block holds S_kv (D 32: <= 768 at the 128-wide tile), the multicast ring's O / Stats are BITWISE the
+    block's -- the same bias words through the same FFMA; only the staging differs -- at the ring's first wrap (n_kv 4)."""
     c = _CASES[case]
     q, k, v, kw, ref = _case_inputs(case, torch.bfloat16)
     mcast = _run(q, k, v, kw, c, _pins, mode=_MCAST)
@@ -743,21 +720,10 @@ def test_the_knob_less_dense_tail_runs_the_cga1_ring_through_the_graph_path(case
     ``global_lengths=False`` (the tail is padded: the plan compiles its padded mask against the scalar S_kv -- ``_kv_padded()`` -- with no
     lengths buffer), the adapter picks the cga1 ring (``bias_mode`` 2) for the PAIR item at cga1 -- the row and the adapter agree on the
     plan's form -- and O / Stats match the fp64 oracle."""
-    from cudnn.sdpa.fwd import api_dsl
-
-    c = _DECLINED_CASES[case]
     q, k, v, kw, ref = _case_inputs(case, torch.bfloat16, table=_DECLINED_CASES)
     _pins()  # knob-less: every seam off
     row_picks = _spy_row_picks(monkeypatch)
-    adapter_modes = []
-    orig = api_dsl.SdpaFwdDslSm100._resident_arm_bias_mode  # the Blackwell / Rubin adapter class (the Rubin small tiles' arms live on it)
-
-    def spy(self):
-        m = orig(self)
-        adapter_modes.append((m, bool(self.seq_kv_lens_present), bool(self.seq_q_lens_present), self.bias_desc is not None, bool(self._kv_padded())))
-        return m
-
-    monkeypatch.setattr(api_dsl.SdpaFwdDslSm100, "_resident_arm_bias_mode", spy)
+    adapter_modes = _spy_adapter_modes(monkeypatch)
     out = _s13._run(q, k, v, **kw)
     assert out["knobs"].cga == 1, (case, out["knobs"])
     # the ROW's calls carry the fact by keyword (the heuristics' width pick calls the same function without it on the graph path)

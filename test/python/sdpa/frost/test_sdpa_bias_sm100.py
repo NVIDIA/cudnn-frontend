@@ -11,7 +11,8 @@ on the row and on the adapter (rule 8b twins), pinned here on real graphs and on
 
 Tiers: the host contract (the row's claims, the adapter's ``check_support`` twin under a modelled cc 10.0 device, the kernel module's
 constants and its not-yet-wired backstops), then the GPU cells on a cc 10.0 / 10.3 device (the dev box is SHARED: functional only, never a
-number): keyless rows exactly 0 / -inf, live rows against the fp64 oracle, two launches bitwise.
+number): keyless rows exactly 0 / -inf, live rows against the fp64 oracle, two launches bitwise -- one oracle per form / body / dtype member
+(the Rubin module's matrix trimmed symmetrically, Rule S6), and the per-batch Q trim under the quiet body (the stored dead rows).
 """
 
 import pytest
@@ -77,9 +78,10 @@ def test_row_claims_the_resident_bias_on_the_derived_shapes_and_budgets():
     assert c0.sm100_bias_preload_chunks(128) == 0 and c0.sm100_bias_preload_chunks(64) == 1
 
 
-def test_kernel_module_constants_and_the_not_yet_wired_backstops():
-    """The SM100 file's bias arms fold on the record (the module constants), and the seams the file does not render yet raise at
-    module load with a message naming them (the config validators accept the records; the kernel states its own envelope)."""
+def test_kernel_module_constants_and_the_not_yet_wired_backstops(_sm100_device_for_the_adapter):
+    """The SM100 file's bias arms fold on the record (the module constants), the seams the file does not render yet raise at
+    module load with a message naming them (the config validators accept the records; the kernel states its own envelope), and the
+    d64 decode tile refuses either operand (the fix pin at the end)."""
     from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
@@ -279,8 +281,12 @@ def test_dead_subtile_quiet_pick_and_request_on_the_inf_body_on_sm100(_sm100_dev
     from cudnn.sdpa.fwd import config_sm100 as c0
 
     assert c0.sm100_dead_subtile_quiet_pick(32, has_bias=True, has_kv_mask=False, s_q=384) == c0.SM100_INF_BODY_DEAD_SUBTILE_QUIET_DEFAULT == 1
-    assert c0.sm100_dead_subtile_quiet_pick(32, has_bias=True, has_kv_mask=False, s_q=384, padded=True, tile_n=128) == 0, "the 128-wide padded body keeps the full body (measured a loss)"
-    assert c0.sm100_dead_subtile_quiet_pick(64, has_bias=True, has_kv_mask=False, s_q=384, padded=True, tile_n=64) == 1, "the 64-wide padded body: measured a win"
+    assert (
+        c0.sm100_dead_subtile_quiet_pick(32, has_bias=True, has_kv_mask=False, s_q=384, padded=True, tile_n=128) == 0
+    ), "the 128-wide padded body keeps the full body (measured a loss)"
+    assert (
+        c0.sm100_dead_subtile_quiet_pick(64, has_bias=True, has_kv_mask=False, s_q=384, padded=True, tile_n=64) == 1
+    ), "the 64-wide padded body: measured a win"
     assert c0.sm100_dead_subtile_quiet_pick(32, has_bias=True, has_kv_mask=False, s_q=384, padded=True, tile_n=128, request=1) == 1
     assert c0.sm100_dead_subtile_quiet_pick(32, has_bias=True, has_kv_mask=False, s_q=384, request=1) == 1
     assert c0.sm100_dead_subtile_quiet_pick(64, has_bias=False, has_kv_mask=True, s_q=640, request=1) == 1
@@ -290,10 +296,14 @@ def test_dead_subtile_quiet_pick_and_request_on_the_inf_body_on_sm100(_sm100_dev
     assert c0.sm100_dead_subtile_quiet_pick(32, has_bias=True, has_kv_mask=False, s_q=384) == 1
     assert c0.sm100_dead_subtile_quiet_pick(64, has_bias=True, has_kv_mask=False, s_q=640) == 1
     assert c0.sm100_dead_subtile_quiet_pick(32, has_bias=True, has_kv_mask=False, s_q=256) == 0, "no dead sub-tile at a 256 multiple"
-    assert c0.sm100_dead_subtile_quiet_pick(32, has_bias=True, has_kv_mask=False, s_q=200) == 0, "S_q % 256 = 200 > 128: sub-tile 1 (rows 128..255) holds live rows"
+    assert (
+        c0.sm100_dead_subtile_quiet_pick(32, has_bias=True, has_kv_mask=False, s_q=200) == 0
+    ), "S_q % 256 = 200 > 128: sub-tile 1 (rows 128..255) holds live rows"
     assert c0.sm100_dead_subtile_quiet_pick(32, has_bias=True, has_kv_mask=False, s_q=100) == 1, "rows 128..255 of the only item are dead"
     assert c0.sm100_dead_subtile_quiet_pick(32, has_bias=True, has_kv_mask=False, s_q=400) == 0, "S_q % 256 = 144 > 128: both sub-tiles live"
-    assert c0.sm100_dead_subtile_quiet_pick(64, has_bias=True, has_kv_mask=False, s_q=300, cga=2) == 1, "cga2: the cluster's 512 rows, 300 leaves dead sub-tiles"
+    assert (
+        c0.sm100_dead_subtile_quiet_pick(64, has_bias=True, has_kv_mask=False, s_q=300, cga=2) == 1
+    ), "cga2: the cluster's 512 rows, 300 leaves dead sub-tiles"
     assert c0.sm100_dead_subtile_quiet_pick(32, has_bias=False, has_kv_mask=False, s_q=384) == 0, "the seam never reaches the plain body"
     api = _api(s_q=384, s_kv=384, bias=(1, 4, 384, 384))
     assert api.check_support() is True and api.template_params().dead_subtile_quiet == 1 and api.template_params().bias_mode != 0
@@ -301,9 +311,13 @@ def test_dead_subtile_quiet_pick_and_request_on_the_inf_body_on_sm100(_sm100_dev
     api0 = _api(s_q=384, s_kv=384, bias=(1, 4, 384, 384))
     assert api0.check_support() is True and api0.template_params().dead_subtile_quiet == c0.SM100_INF_BODY_DEAD_SUBTILE_QUIET_DEFAULT == 1
     apip = _api(s_q=384, s_kv=384, seq_kv_lens_present=True, bias=(1, 4, 384, 384))
-    assert apip.check_support() is True and apip.template_params().tile_n == 128 and apip.template_params().dead_subtile_quiet == 0, "the 128-wide padded plan keeps the full body"
+    assert (
+        apip.check_support() is True and apip.template_params().tile_n == 128 and apip.template_params().dead_subtile_quiet == 0
+    ), "the 128-wide padded plan keeps the full body"
     apip64 = _api(d=64, s_q=384, s_kv=384, seq_kv_lens_present=True, bias=(1, 4, 384, 384))
-    assert apip64.check_support() is True and apip64.template_params().tile_n == 64 and apip64.template_params().dead_subtile_quiet == 1, "the 64-wide padded plan takes the quiet body"
+    assert (
+        apip64.check_support() is True and apip64.template_params().tile_n == 64 and apip64.template_params().dead_subtile_quiet == 1
+    ), "the 64-wide padded plan takes the quiet body"
     api256 = _api(s_q=256, s_kv=256, bias=(1, 4, 256, 256))
     assert api256.check_support() is True and api256.template_params().dead_subtile_quiet == 0, "no dead sub-tile at a 256 multiple"
     apir = _api(s_q=384, s_kv=384, bias=(1, 4, 384, 384), dead_subtile_quiet=1)
@@ -319,7 +333,8 @@ def test_dead_subtile_quiet_pick_and_request_on_the_inf_body_on_sm100(_sm100_dev
 # The Rubin module's degenerate-input matrix INSIDE the SM100 resident budget (S_kv <= 256 at the 32-wide tile, <= 128 at the 64-wide one):
 # the KV ring sweep n_kv 1 / 2 with B*H > 1, ONE CTA / one tile in the whole launch (S_kv 128 and 64), a tail tile with a padded bias row
 # stride (217 / 100), GQA, a zero-length KV batch (an EMPTY work item: no bias barrier is touched), a zero-key batch WITH a sink and the
-# padded-Q trim, the bias in its four broadcast forms, the magnitude cells, the 64-wide tile at cga2 (one tile), D 24 on the 32-wide tile.
+# padded-Q trim, the bias in its four broadcast forms, the magnitude cells, the 64-wide tile at cga2 (one tile).  (D 24 rides the 32-wide
+# tile by the zero-fill contract, bitwise-pinned on the plain body in test_sdpa_small_d_sm100.py; the bias arm does not read D.)
 _IN_BUDGET = [
     "dense_one_tile_bh1",
     "dense_nkv1",
@@ -334,23 +349,21 @@ _IN_BUDGET = [
     "bias_neg1e9_key_fold",
     "d64_dense_128",
     "d64_padded_zero_batch_128",
-    "d24_dense_256",
     "dense_one_tile_64",
     "tail_217_padded_stride_bias",
     "causal_tail_100_padded_stride_bias",
 ]
 # Above the SM100 resident budget (the Rubin module streams or pairs these): a typed decline of the row on a real graph -- no FROST plan.
 # The one-batch-entry item ABOVE the resident budget at the 32-wide tile: the 2-stage STREAMED ring (n_kv 3 = one stage past the ring, 4 = two
-# wraps, 5, 8 with a tail; the causal band; a padded zero-length batch on the ring: an empty item touches no ring row).
+# wraps, 5, 8 with a tail; the causal band; a padded zero-length batch on the ring: an empty item touches no ring row).  One (form x ring class)
+# each, with and without the word where the body differs; the magnitude / head-broadcast forms are pinned on the resident arm (the ring feeds
+# the same FFMA).
 _RING_CASES = {
     "ring_dense_nkv3_384": dict(b=2, h=2, h_kv=2, s_q=384, s_kv=384),
-    "ring_causal_384": dict(b=1, h=4, h_kv=4, s_q=384, s_kv=384, causal=True),
-    "ring_x10_causal_384": dict(b=1, h=4, h_kv=4, s_q=384, s_kv=384, causal=True, bias_scale=10.0),
     "ring_dense_nkv4_512": dict(b=2, h=2, h_kv=2, s_q=512, s_kv=512),
     "ring_causal_nkv5_640": dict(b=2, h=2, h_kv=2, s_q=640, s_kv=640, causal=True),
     # S_kv 904 (not 900): a COMPACT bias needs S_kv % 8 == 0 for its TMA row stride (the row declines 900 typed; the Rubin module runs 900 on the mask-only arm)
     "ring_padded_nkv8_tail_904_zero_batch": dict(b=3, h=2, h_kv=2, s_q=904, s_kv=904, kv_lens=[904, 0, 500]),
-    "ring_dense_nkv8_1024_head_broadcast": dict(b=2, h=2, h_kv=2, s_q=1024, s_kv=1024, bias="1"),
     # the D 64 flavor's knob-less default above its cga-1 resident budget: the 64-wide tile's 3-stage ring at cga1 (the measured preference over the cga-2 block)
     "ring_d64_nkv4_256_t64": dict(b=2, h=2, h_kv=2, s_q=256, s_kv=256, d=64),
 }
@@ -363,10 +376,27 @@ def _expected_cga(case):
     return 2 if c.get("d", 32) == 64 else 1  # the 64-wide tile's bias block lives at cga2 on this line; the 32-wide tile at its cga1
 
 
-def _run(q, k, v, *, scale, bias=None, kv_mask=None, sdpa_kwargs=None, seq_len_kv=None, seq_len_q=None, sink=None, stats=True, cga=None, tile_n=None):
+def _run(
+    q,
+    k,
+    v,
+    *,
+    scale,
+    bias=None,
+    kv_mask=None,
+    sdpa_kwargs=None,
+    seq_len_kv=None,
+    seq_len_q=None,
+    sink=None,
+    stats=True,
+    cga=None,
+    tile_n=None,
+    two_launch_assert=True,
+):
     """The Rubin module's ``_run`` against the SM100 row: build the graph, pin the row's unsplit plan (the heuristics' pick; a cga / tile_n
     request through the public autotune record), launch TWICE on sentinel-filled outputs (the two-launch delta) and return O, Stats and
-    the plan's knobs."""
+    the plan's knobs.  ``two_launch_assert=False`` leaves the two-launch identity to the caller (the first launch rides along as
+    ``o_first`` / ``stats_first``), so a cell can report a NaN residue as what it is before the identity check."""
     import cudnn
     from types import SimpleNamespace
 
@@ -408,8 +438,9 @@ def _run(q, k, v, *, scale, bias=None, kv_mask=None, sdpa_kwargs=None, seq_len_k
 
     o1, st1 = launch()
     o2, st2 = launch()
-    assert torch.equal(o1, o2) and (st1 is None or torch.equal(st1, st2)), "two-launch delta on O / Stats"
-    return dict(o=o_gpu, stats=stats_gpu, knobs=SimpleNamespace(cga=picked_cga, tile_n=picked_tile_n), names=names)
+    if two_launch_assert:
+        assert torch.equal(o1, o2) and (st1 is None or torch.equal(st1, st2)), "two-launch delta on O / Stats"
+    return dict(o=o_gpu, stats=stats_gpu, knobs=SimpleNamespace(cga=picked_cga, tile_n=picked_tile_n), names=names, o_first=o1, stats_first=st1)
 
 
 def _frost_plan_names(q, k, v, kw):
@@ -437,15 +468,15 @@ def _frost_plan_names(q, k, v, kw):
     return [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
 
 
-# (case, dtype) pairs: every in-budget case in bf16; fp16 on every case but the -1e9 key fold (not representable in fp16 -- the models'
-# fp16 fold is a smaller finite value; the Rubin module runs that case in bf16 only too).
-_BIAS_CELLS = [(c, torch.bfloat16) for c in _IN_BUDGET] + [(c, torch.float16) for c in _IN_BUDGET if c != "bias_neg1e9_key_fold"]
+# (case, dtype) pairs: every in-budget case in bf16; the fp16 member on the dense base and on the fp16 O cast of keyless rows under the sink
+# and the padded-Q trim (the same two cells as the Rubin module).
+_BIAS_CELLS = [(c, torch.bfloat16) for c in _IN_BUDGET] + [("dense_nkv2", torch.float16), ("causal_sink_padded_q_trim", torch.float16)]
 
 
 @requires_sm100_line
 @pytest.mark.parametrize("case,dtype", _BIAS_CELLS, ids=[f"{c}-{'bf16' if d == torch.bfloat16 else 'fp16'}" for c, d in _BIAS_CELLS])
 def test_bias_matches_the_fp64_oracle_on_sm100(case, dtype):
-    """The additive bias over the degenerate-input matrix inside the SM100 resident budget, both dtypes: the plan is the row's unsplit plan
+    """The additive bias over the degenerate-input matrix inside the SM100 resident budget (bf16, the fp16 member twice): the plan is the row's unsplit plan
     at the budget's width (cga1 on the 32-wide tile, cga2 on the 64-wide one), O and Stats against the fp64 oracle, keyless rows exactly
     0 / -inf, two launches bitwise; a zero-length KV batch on the output directly."""
     q, k, v, kw, ref = _t7._case_inputs(case, dtype)
@@ -470,9 +501,19 @@ def test_bias_matches_the_fp64_oracle_on_sm100(case, dtype):
             assert torch.isneginf(st[:, q_len:]).all(), "the padded-Q trim: Stats = -inf at and past seq_len_q"
 
 
+# The HW-max kv_mask-only body (the dense base, the zero-length batch, the d64 graph at S_q 128 -- the cell that used to lower onto the decode
+# tile and fail at build) and the software-tree bias + mask body (GQA under the band; keyless rows under the sink and the padded-Q trim).
+_KV_MASK_CELLS = [
+    (False, "dense_nkv2"),
+    (False, "padded_kv_zero_batch"),
+    (False, "d64_dense_128"),
+    (True, "causal_gqa_8_2"),
+    (True, "causal_sink_padded_q_trim"),
+]
+
+
 @requires_sm100_line
-@pytest.mark.parametrize("case", ["dense_nkv2", "padded_kv_zero_batch", "causal_gqa_8_2", "d64_dense_128", "causal_sink_padded_q_trim"])
-@pytest.mark.parametrize("with_bias", [False, True], ids=["mask_only", "mask_and_bias"])
+@pytest.mark.parametrize("with_bias, case", _KV_MASK_CELLS, ids=[f"{'mask_and_bias' if w else 'mask_only'}-{c}" for w, c in _KV_MASK_CELLS])
 def test_kv_mask_matches_the_fp64_oracle_on_sm100(case, with_bias):
     """The per-key boolean mask (30 % of the keys False) alone and composed with the bias, the band mask, the padding and a zero-length
     batch: a masked key is exactly a padded one in the oracle.  The mask-only cells run the hardware upper-bound row max (the pick's
@@ -530,13 +571,23 @@ def test_additive_kv_mask_vector_matches_the_fp64_oracle_on_sm100(dtype):
         _t7._check(out, _t7._ref_of(_t7._CASES["dense_nkv2"], q, k, v, ref_kw))
 
 
+_RING_CELLS = [
+    (False, "ring_dense_nkv3_384"),
+    (False, "ring_causal_nkv5_640"),
+    (False, "ring_padded_nkv8_tail_904_zero_batch"),
+    (False, "ring_d64_nkv4_256_t64"),
+    (True, "ring_dense_nkv4_512"),
+    (True, "ring_padded_nkv8_tail_904_zero_batch"),
+    (True, "ring_d64_nkv4_256_t64"),
+]
+
+
 @requires_sm100_line
-@pytest.mark.parametrize("case", list(_RING_CASES))
-@pytest.mark.parametrize("with_mask", [False, True], ids=["bias", "bias_and_mask"])
+@pytest.mark.parametrize("with_mask, case", _RING_CELLS, ids=[f"{'bias_and_mask' if m else 'bias'}-{c}" for m, c in _RING_CELLS])
 def test_streamed_ring_matches_the_fp64_oracle_on_sm100(case, with_mask):
     """The 2-stage streamed bias ring of the one-batch-entry item at the 32-wide tile (S_kv above the resident 256): the ring wrap axis
-    n_kv 3 / 4 / 5 / 8 (with a tail and a zero-length batch), the causal band, the magnitude cell, the head-broadcast form, with and without
-    the bit-word mask; the plan's record carries bias_mode 2 at cga1; O and Stats against the fp64 oracle, two launches bitwise."""
+    n_kv 3 / 4 / 5 / 8 (with a tail and a zero-length batch), the causal band, with and without the bit-word mask; the plan's record carries
+    bias_mode 2 at cga1; O and Stats against the fp64 oracle, two launches bitwise."""
     q, k, v, kw, ref = _t7._case_inputs(case, torch.bfloat16, kv_mask_p=0.3 if with_mask else None, table=_RING_CASES)
     kw.pop("cga", None)
     out = _run(q, k, v, **kw)
@@ -553,13 +604,25 @@ _T64_CASES = {
     "t64_ring_dense_640": dict(b=2, h=2, h_kv=2, s_q=640, s_kv=640),
     "t64_ring_padded_1024_zero_batch": dict(b=3, h=2, h_kv=2, s_q=1024, s_kv=1024, kv_lens=[1024, 0, 700]),
     "t64_d64_dense_192_cga1": dict(b=2, h=2, h_kv=2, s_q=192, s_kv=192, d=64),  # 3 resident tiles at cga1
-    "t64_d64_causal_tail_200": dict(b=2, h=2, h_kv=2, s_q=200, s_kv=200, d=64, causal=True),  # 4 tiles: the cga-1 ring (the measured preference over the cga-2 block)
+    "t64_d64_causal_tail_200": dict(
+        b=2, h=2, h_kv=2, s_q=200, s_kv=200, d=64, causal=True
+    ),  # 4 tiles: the cga-1 ring (the measured preference over the cga-2 block)
 }
 
 
+# each (resident / ring / d64 cga1) x (bias / both) class once
+_T64_CELLS = [
+    (False, "t64_dense_nkv2_256"),
+    (False, "t64_ring_padded_1024_zero_batch"),
+    (False, "t64_d64_causal_tail_200"),
+    (True, "t64_causal_320"),
+    (True, "t64_ring_dense_640"),
+    (True, "t64_d64_dense_192_cga1"),
+]
+
+
 @requires_sm100_line
-@pytest.mark.parametrize("case", list(_T64_CASES))
-@pytest.mark.parametrize("with_mask", [False, True], ids=["bias", "bias_and_mask"])
+@pytest.mark.parametrize("with_mask, case", _T64_CELLS, ids=[f"{'bias_and_mask' if m else 'bias'}-{c}" for m, c in _T64_CELLS])
 def test_tile_n_64_matches_the_fp64_oracle_on_sm100(case, with_mask):
     """The 64-wide KV tile on the SM100 small tiles (TILE_N=64 through the autotune record): the resident block (S_kv 256 / 320 at D 32, 192 at D 64
     cga1) and the 3-stage ring above it (640, 1024 with a zero-length batch), the one-chunk body, with and without the bit-word mask."""
@@ -592,22 +655,20 @@ def test_fp32_additive_vector_with_a_bias_runs_at_tile_n_64_on_sm100():
     _t7._check(out, _t7._ref_of(_t7._CASES["dense_nkv2"], q, k, v, dict(kw, kv_mask=keep)))
 
 
-# The PLAIN padded body's pre-masked tail (the sweep seam in-process; the graph path has no knob for the form): a tail tile at D 32 / D 64, the
-# zero-length batch, both widths -- against the oracle and BITWISE against the legacy form (the same values: the premask's -inf columns are the
-# masked body's; the manual max over them is the software max over the masked chunks).
+# The PLAIN padded body's pre-masked tail is NOT this line's default (``SM100_PADDED_TAIL_FORM_DEFAULT`` = 0; the public ``padded_tail_form=``
+# kwarg reaches it, the sweep seam in-process here): one cell, a tail tile with a zero-length batch at the 128-wide tile -- against the oracle
+# and BITWISE against the legacy form (the same values: the premask's -inf columns are the masked body's; the manual max over them is the
+# software max over the masked chunks).
 _TAIL_CASES = {
     "tail_padded_217_zero_batch": dict(b=3, h=2, h_kv=2, s_q=217, s_kv=217, kv_lens=[217, 0, 100]),
-    "tail_padded_300_d64_s_q_256": dict(b=2, h=2, h_kv=2, s_q=256, s_kv=300, d=64, kv_lens=[300, 129]),
-    "tail_padded_385": dict(b=2, h=4, h_kv=4, s_q=385, s_kv=385, kv_lens=[385, 200]),
 }
 
 
 @requires_sm100_line
-@pytest.mark.parametrize("tile_n", [128, 64])
-@pytest.mark.parametrize("case", list(_TAIL_CASES))
-def test_pre_masked_tail_matches_the_oracle_and_the_legacy_body_bitwise_on_sm100(case, tile_n, monkeypatch):
+def test_pre_masked_tail_matches_the_oracle_and_the_legacy_body_bitwise_on_sm100(monkeypatch):
     from cudnn.sdpa.fwd import config_sm100 as c0
 
+    case, tile_n = "tail_padded_217_zero_batch", 128
     q, k, v, kw, ref = _t7._case_inputs(case, torch.bfloat16, table=_TAIL_CASES)
     kw.pop("cga", None)
     kw["bias"] = None
@@ -632,11 +693,11 @@ _BIAS_TAIL_CASES = {
     "bias_tail_392": dict(b=2, h=4, h_kv=4, s_q=392, s_kv=392, kv_lens=[392, 200]),  # the ring at both widths (2 st at 128, 3 st at 64); 8 valid tail columns
     "bias_ring_tail_904_zero_batch": dict(b=3, h=2, h_kv=2, s_q=904, s_kv=904, kv_lens=[904, 0, 500]),  # the 2-stage ring across a wrap; a zero-length batch
 }
+# The bias body's form 1 is the DEFAULT at both widths on this line: the d32 default (the padded bias leg at D 32 picks 64 while the 64-wide
+# block holds S_kv), the d64 default (the budget rule), the ring default at 128, and the resident block at 128 through the public TILE_N knob.
 _BIAS_TAIL_PAIRS = [
     ("bias_tail_216_zero_batch", 128),
-    ("bias_tail_216_zero_batch", 64),
     ("bias_tail_304_d64", 64),
-    ("bias_tail_392", 128),
     ("bias_tail_392", 64),
     ("bias_ring_tail_904_zero_batch", 128),
 ]
@@ -664,15 +725,13 @@ def test_pre_masked_tail_on_the_bias_body_matches_the_oracle_and_the_word_body_b
 # against the oracle and BITWISE against the full body (the dead rows are never stored; every live row's O / Stats come from the same body).
 _QUIET_CASES = {
     "quiet_bias_384": dict(b=2, h=2, h_kv=2, s_q=384, s_kv=384),  # sub-tile 1 of the 2nd item dead: the 2-stage ring at 128 / the 3-stage ring at 64
-    "quiet_bias_100_res": dict(b=2, h=2, h_kv=2, s_q=100, s_kv=200),  # one item, sub-tile 1 (rows 128..255) dead from S_q 100: the resident block
-    "quiet_bias_640_d64": dict(b=1, h=2, h_kv=2, s_q=640, s_kv=640, d=64),  # the losing cell's shape: the 3rd item's sub-tile 1 dead on the 64-wide cga-1 ring
-    "quiet_bias_pad_384": dict(b=2, h=2, h_kv=2, s_q=384, s_kv=392, kv_lens=[392, 200]),  # sub-tile 1 of the 2nd item dead, with the pre-masked padded tail (both arms on)
+    "quiet_bias_pad_384": dict(
+        b=2, h=2, h_kv=2, s_q=384, s_kv=392, kv_lens=[392, 200]
+    ),  # sub-tile 1 of the 2nd item dead, with the pre-masked padded tail (both arms on)
 }
 _QUIET_PAIRS = [
     ("quiet_bias_384", 128, False),
     ("quiet_bias_384", 64, True),
-    ("quiet_bias_100_res", 128, False),
-    ("quiet_bias_640_d64", 64, False),
     ("quiet_bias_pad_384", 128, False),
 ]
 

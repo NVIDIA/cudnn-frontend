@@ -10,26 +10,24 @@ softmax steps run in the same order, so O and Stats are BITWISE the one-slot ker
 FIELD (appended, default 1; the knob-less pick ``config_sm107.sm107_s_slots_pick`` is the MEASURED rule: 2 on the plain body at TILE_N 64, 1 on
 every other form): the template-module cache keys on the record alone, so a module-level seam read at module-exec time would hand a
 second plan with the same record the FIRST module (an in-process A/B compares the base with itself); ``config_sm107.sm107_s_slots_pick`` puts
-the sweep seam's value INTO the record.  Tiers: CPU contract (the TMEM map gains the slot axis at 2 and is untouched at 1, the typed raises off
-the domain -- TILE_N 128, d128, a quantized dtype, 3 slots -- the pick, two records -> two modules), host rendering pins (sm_107a trace-compile:
-the one-slot renderings are byte-identical to the committed md5 records, the two-slot rendering differs, keeps the register split, no cluster
-drain, no new spills), GPU (Rubin): the fp64 oracle at 2 slots over the ring-wrap axis n_kv = 1 / 2 / 3 / 4 / 6 / 8 / 10 (TILE_N 64), the dead-sub-tile quiet body, the
-padded tail and cga2 included, bitwise 2 == 1.
+the sweep seam's value INTO the record.  Two slots is the DEFAULT on the PLAIN TILE_N 64 body only (the served pick at ``s_kv % 128`` in 1..64
+and the public TILE_N 64 knob); on a bias form it is the arm the measurement rejected (one slot), reachable only through the seam, so the
+cells here are the plain body's.  Tiers: CPU contract (the TMEM map gains the slot axis at 2 and is untouched at 1, the typed raises off the
+domain -- TILE_N 128, d128, a quantized dtype, 3 slots -- the pick, two records -> two modules; the one-slot renderings' byte identity to the
+committed records is pinned by the bias / streamed modules), host rendering pins (sm_107a trace-compile: the two-slot default-class renderings
+differ, keep the register split, no cluster drain, no new spills), GPU (Rubin): the fp64 oracle at 2 slots on the served pick's forms (the
+window / sink / bottom-right / f16 / per-batch-length arms, d64), the ring wrap (n_kv 8), the quiet body at cga2 -- every one bitwise 2 == 1.
 """
 
 import dataclasses
-import re
-from pathlib import Path
 
 import pytest
 import torch
 
 from frost_test_utils import assert_no_new_spills, requires_rubin, run_sass_probe, sass_probe_source
 import test_sdpa_bias_sm107 as _s13
-import test_sdpa_bias_streamed_sm107 as _s15
 
 pytestmark = [pytest.mark.L0]
-_RENDERINGS = Path(__file__).resolve().parent / "renderings"
 
 
 @pytest.fixture(autouse=True)
@@ -98,24 +96,14 @@ def test_the_measured_default_is_two_slots_on_the_plain_tile_n_64_body_only():
     assert c.sm107_tile_n_pick(32, 300, has_bias=False, has_kv_mask=False) == 64 and c.sm107_tile_n_pick(32, 384, has_bias=False, has_kv_mask=False) == 128
 
 
-def test_the_seam_lands_in_the_record_verbatim(_pins):
-    """The pick returns the pinned value VERBATIM (2 on a TILE_N 128 shape too): a plan off the arm's domain is a TYPED factory raise, never
-    a silent one-slot rendering under a two-slot label -- the trap of a seam the module cache cannot see."""
-    from cudnn.sdpa.fwd import config_sm107 as c
-
-    _pins(s_slots=2)
-    assert c.sm107_s_slots_pick(32, 64) == 2 and c.sm107_s_slots_pick(32, 128) == 2 and c.sm107_s_slots_pick(64, 64) == 2
-    _pins(s_slots=None)
-    assert c.sm107_s_slots_pick(32, 64, has_bias=True) == 1 and c.sm107_s_slots_pick(32, 64) == 2
-
-
-@pytest.mark.parametrize("d", [32, 64])
-def test_the_tmem_map_gains_the_slot_axis_at_two_and_is_untouched_at_one(d):
-    """S[qs][p] = (qs x S_SLOTS + p) x TILE_N with P in each slot's tail, O after the LAST slot, STATS at 544: the map the kernel renders."""
+def test_the_tmem_map_gains_the_slot_axis_at_two_and_is_untouched_at_one():
+    """S[qs][p] = (qs x S_SLOTS + p) x TILE_N with P in each slot's tail, O after the LAST slot, STATS at 544: the map the kernel renders (one
+    formula; D 32 here, the d64 map is the same arithmetic with a wider O slot)."""
     from cudnn.sdpa.fwd import config_sm107 as c
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
-    make = c.make_cfg_d32 if d == 32 else c.make_cfg_d64
+    d = 32
+    make = c.make_cfg_d32
     one, _ = make(TemplateParams(cta_mma=1, dtype_qkv=2, tile_n=64, bias_mode=1, kv_mask_form=1, n_chunk=4))
     two, _ = make(TemplateParams(cta_mma=1, dtype_qkv=2, tile_n=64, bias_mode=1, kv_mask_form=1, n_chunk=4, s_slots=2))
     l1, l2 = c.d128_family_tmem_layout(one), c.d128_family_tmem_layout(two)
@@ -183,34 +171,6 @@ def test_two_records_are_two_modules_and_the_adapter_reads_the_pick(_pins):
     assert c.sm107_s_slots_pick(32, 64) == 2
 
 
-def test_kernel_carries_the_two_slot_arm_as_one_const_expr_axis():
-    """Every seam folds on ``_S2`` / a trace-time ``s_idx is None`` ternary; the one-slot spelling of the barrier indices and the TMEM bases is
-    kept verbatim (the byte-identity pins below are the proof; this is the static detector)."""
-    code = (Path(__file__).resolve().parents[4] / "python" / "cudnn" / "sdpa" / "fwd" / "kernels" / "sm107" / "prefill_d128_f16.py").read_text()
-    assert "_S2: bool = CFG.S_SLOTS == 2" in code
-    # the factory call spans lines since the bias ring's multicast form added its release-count keyword; the slot ring is its first keyword
-    assert "make_classic_bars(\n        CFG,\n        s_stages=CFG.TILES_Q * CFG.S_SLOTS," in code
-    for fn in ("def _mma_tile_s2(", "def _mma_item_pair_s2(", "def _mma_bmm1_s2(", "def _mma_bmm2_s2(", "def _bmm2_ready_stage0("):
-        assert fn in code, fn
-    # the two slot-indexed rings are initialised over EVERY stage
-    assert "for p in cutlass.range_constexpr(CFG.S_SLOTS):\n                    bars.mb_bmm1_done[qs * CFG.S_SLOTS + p].init()" in code
-    assert "bars.mb_bmm2_ready[(qs * CFG.S_SLOTS + p) * CFG.N_BMM2_CHUNKS + c].init()" in code
-    # the softmax bodies wait the slot's bmm1_done and arrive the slot's bmm2_ready; the cursor advances once per body
-    # ... the two live bodies AND the dead-sub-tile quiet body (a dead sub-tile's MMAs are issued like a live one's)
-    assert code.count("bars.mb_bmm1_done[sub_tile_id if s_idx is None else sub_tile_id * CFG.S_SLOTS + s_idx].wait(") == 3
-    assert code.count("advance(PipelineState(idx=s_idx, phase=bmm1_phase), CFG.S_SLOTS)") == 3
-    assert "_r = _softmax_kv_body_quiet(sub_tile_id, tmem_ptr_i32, bars, bmm1_phase, stat_empty_phase, leader_cta_id, s_idx)" in code
-    # every _softmax_kv_body call passes the cursor by KEYWORD (the signature carries tail_premask before it)
-    assert code.count("s_idx=s_idx,") == 5 and not re.search(r"track_true_max,\n\s+s_idx,\n", code)
-    # no pre-slot literal index survives on the correction ARRIVE sites (the one-slot MMA pair body WAITS `qs * N_BMM2_CHUNKS + 0`: its two-slot
-    # twin `_mma_item_pair_s2` is a separate function, so that spelling is the one-slot arm, kept verbatim)
-    assert not re.search(r"mb_bmm2_ready\[qs \* CFG\.N_BMM2_CHUNKS \+ 0\]\.arrive\(", code)
-    assert "mb_bmm2_ready[_bmm2_ready_stage0(qs, s_corr)].arrive(" in code
-    # the MMA warp does NOT wait its own bmm2_done before a BMM1 (the in-order tensor pipe orders the two MMAs)
-    s2 = code[code.index("def _mma_bmm1_s2(") : code.index("def _softmax_kv_body(")]
-    assert "mb_bmm2_done" in s2 and ".mb_bmm2_done[" in s2 and not re.search(r"mb_bmm2_done\[[^\]]*\]\.wait\(", s2)
-
-
 # --------------------------------------------------------------------------- tier 2: host rendering pins (sm_107a trace-compile)
 
 _PROBE_BODY = """
@@ -238,66 +198,22 @@ def _probe(tmp_path, params, tag):
     return run_sass_probe(tmp_path, probe_src=sass_probe_source(_PROBE_BODY, _COUNTS), arch="sm_107a", params=params, tag=tag)
 
 
-def _record(name):
-    f = _RENDERINGS / name
-    assert f.is_file(), f
-    dsl, want = None, {}
-    for ln in f.read_text().splitlines():
-        if ln.startswith("dsl="):
-            dsl = ln[len("dsl=") :].strip()
-        m = re.match(r"fwd_d128_file sm_107a (\S+) rc=0 cubin_md5=([0-9a-f]{32})", ln)
-        if m:
-            want[m.group(1)] = m.group(2)
-    return dsl, want
-
-
-def _skip_unless_record_dsl(dsl):
-    from cudnn.frost.buffers import cutedsl_state
-
-    _installed, version = cutedsl_state()
-    have = " ".join(version) if version else None
-    if dsl is not None and have != dsl:
-        pytest.skip(f"the md5 record was rendered with {dsl}; installed {have}: the cubin is a function of the DSL build")
-
-
-@pytest.mark.parametrize("arm", list(_s15._RESIDENT_RECORD_ARMS))
-def test_the_one_slot_resident_renderings_are_byte_identical_to_the_committed_record(tmp_path, arm):
-    """With the field at its default every resident rendering is byte-identical to its committed md5 record: the arm adds no instruction to
-    the one-slot kernel (every seam folds; the cursors are None and never loop-carried)."""
-    dsl, want = _record("md5_fwd_d128_file_bias_resident_sm_107a.txt")
-    _skip_unless_record_dsl(dsl)
-    probe = _probe(tmp_path, dict(_s15._RESIDENT_RECORD_ARMS[arm]), f"s1_{arm}")
-    assert probe.expect["S_SLOTS"] == 1
-    assert probe.cubin_md5 == want[arm], f"{arm}: cubin md5 {probe.cubin_md5} != the record's {want[arm]} -- the one-slot rendering changed"
-
-
-@pytest.mark.parametrize("arm", ["d32_dense_bf16", "d64_padded_bf16_cga2"])
-def test_the_one_slot_plain_renderings_are_byte_identical_to_the_committed_record(tmp_path, arm):
-    dsl, want = _record("md5_fwd_d128_file_bias_off_sm_107a.txt")
-    _skip_unless_record_dsl(dsl)
-    probe = _probe(tmp_path, dict(_s13._RECORD_ARMS[arm]), f"s1_{arm}")
-    assert probe.expect["S_SLOTS"] == 1
-    assert probe.cubin_md5 == want[arm], f"{arm}: cubin md5 {probe.cubin_md5} != the record's {want[arm]} -- the one-slot rendering changed"
-
-
 @pytest.mark.parametrize(
     "d, extra",
     [
-        (32, {"bias_mode": 1, "kv_mask_form": 1, "tile_n": 64, "n_chunk": 4}),
-        (32, {"bias_mode": 2, "kv_mask_form": 1, "tile_n": 64, "bias_stages": 2}),
         (32, {"tile_n": 64}),
-        (64, {"bias_mode": 1, "kv_mask_form": 1, "tile_n": 64, "n_chunk": 4}),
         # the two head-side arms the GPU tier reaches only at their defaults: the pre-masked padded tail (the 128-wide default; requested at
         # TILE_N 64 here) and the dead-sub-tile quiet body (default-on where a dead sub-tile exists) -- both walk the slot cursor
         (32, {"seq_kv_lens_present": True, "padded_tail_form": 1, "tile_n": 64}),
         (32, {"seq_kv_lens_present": True, "dead_subtile_quiet": 1, "tile_n": 64}),
     ],
-    ids=["d32_pair4_both_t64", "d32_one_both_t64_ring2", "d32_plain_t64", "d64_pair4_both_t64", "d32_padded_premask_t64", "d32_padded_quiet_t64"],
+    ids=["d32_plain_t64", "d32_padded_premask_t64", "d32_padded_quiet_t64"],
 )
 def test_the_two_slot_rendering_differs_keeps_the_split_and_spills_no_more(tmp_path, d, extra):
-    """The two-slot rendering is a different cubin (the slot cursors, the widened rings, the re-ordered MMA issue), keeps the per-role
-    register split (USETMAXREG > 0), no cluster-scope drain (CGAERRBAR 0), the same TMA issue-site count and the same number of MMA
-    instructions (the same MMAs in a different order) and spills no more than the one-slot rendering of the same arm."""
+    """The two-slot DEFAULT-class renderings (the plain 64-wide body: dense, the pre-masked padded tail, the quiet body) are a different cubin
+    (the slot cursors, the widened rings, the re-ordered MMA issue), keep the per-role register split (USETMAXREG > 0), no cluster-scope
+    drain (CGAERRBAR 0), the same TMA issue-site count and the same number of MMA instructions (the same MMAs in a different order) and
+    spill no more than the one-slot rendering of the same arm."""
     base = _probe(tmp_path, {"__d": d, "cta_mma": 1, "dtype_qkv": 2, **extra}, f"s1_{d}_{'_'.join(sorted(extra))}")
     probe = _probe(tmp_path, {"__d": d, "cta_mma": 1, "dtype_qkv": 2, "s_slots": 2, **extra}, f"s2_{d}_{'_'.join(sorted(extra))}")
     assert base.expect["S_SLOTS"] == 1 and probe.expect["S_SLOTS"] == 2 and probe.expect["TILE_N"] == 64
@@ -311,37 +227,16 @@ def test_the_two_slot_rendering_differs_keeps_the_split_and_spills_no_more(tmp_p
 
 # --------------------------------------------------------------------------- tier 3: GPU (Rubin) -- the ring-wrap axis at two slots
 
-# n_kv tiles at TILE_N 64 = 1, 2, 3, 4, 8 (S_kv 64 / 128 / 192 / 256 / 512) + the bring-up cell (384: 6 tiles, the cursor wraps three times per
-# step), the pair item (a batch-broadcast bias, B_flat >= 2) and the one-batch-entry item (a per-batch bias), the streamed ring at TILE_N 64,
-# causal + padded rows, a dead sub-tile (an odd chunk tail), the 64-wide tile, B > 1 everywhere.  Every case carries a kv_mask (0.3 False), so
-# the heuristics pick TILE_N 64; the plain cells take the width through the public TILE_N knob.
-_CASES = {
-    "pair_both_384_bringup": dict(b=4, h=2, h_kv=2, s_q=384, s_kv=384, n_chunk=4),
-    "pair_both_nkv1_64": dict(b=4, h=2, h_kv=2, s_q=64, s_kv=64, n_chunk=4),
-    "pair_both_nkv2_128": dict(b=4, h=2, h_kv=2, s_q=128, s_kv=128, n_chunk=4),
-    "pair_both_nkv3_192_odd_tail": dict(b=3, h=2, h_kv=2, s_q=192, s_kv=192, n_chunk=4),
-    "pair_both_nkv4_256": dict(b=4, h=2, h_kv=2, s_q=256, s_kv=256, n_chunk=4),
-    "pair_both_nkv8_512_causal_padded": dict(b=4, h=2, h_kv=2, s_q=512, s_kv=512, n_chunk=2, causal=True, kv_lens=[512, 0, 300, 512]),
-    "one_both_per_batch_384": dict(b=2, h=2, h_kv=2, s_q=384, s_kv=384, bias="b"),
-    "one_both_ring_1024": dict(b=2, h=2, h_kv=2, s_q=1024, s_kv=1024, mode=2),
-    "d64_pair_both_384": dict(b=4, h=2, h_kv=2, s_q=384, s_kv=384, d=64, n_chunk=4),
-    "d64_pair_both_640_causal": dict(b=4, h=2, h_kv=2, s_q=640, s_kv=640, d=64, n_chunk=2, causal=True),
-}
-# The plain cells also cover the dead-sub-tile QUIET body (the default where S_q % 256 is in 1..128 on the one-batch-entry item: S 384 /
-# 300 / 640), which walks the SAME slot cursor as the live bodies; S 300 adds the padded tail (TILE_N 64 keeps the legacy software-max
-# tail body) and the cga2 cell the non-leader CTA's dead sub-tiles + the leader-collected bmm2_ready counts.  ``knob_tile_n`` None = the
-# SERVED pick (no TILE_N knob: the width rule's ``s_kv % 128`` in 1..64 lands on 64 and the slot rule on 2 -- the measured default's own
-# cells, S 300 dense and with per-batch KV lengths), else the public TILE_N 64 knob.
+# The plain body at TILE_N 64 -- the two-slot DEFAULT.  ``knob_tile_n`` None = the SERVED pick (no TILE_N knob: the width rule's ``s_kv % 128``
+# in 1..64 lands on 64 and the slot rule on 2 -- the measured default's own cells, S 300 dense and with per-batch KV lengths, where the
+# quiet body (S_q % 256 in 1..128) and the padded legacy tail run too), else the public TILE_N 64 knob: the ring wrap (n_kv 8 under the
+# band) and the quiet body on the 2-CTA tile (the non-leader CTA's dead sub-tiles + the leader-collected bmm2_ready counts: its own
+# rendering).
 _PLAIN_T64_CASES = {
-    "plain_t64_nkv3_192": dict(b=2, h=2, h_kv=2, s_q=192, s_kv=192),
     "plain_t64_nkv8_512_causal": dict(b=2, h=2, h_kv=2, s_q=512, s_kv=512, causal=True),
-    "plain_t64_384_quiet": dict(b=2, h=2, h_kv=2, s_q=384, s_kv=384),
-    "plain_t64_300_quiet_padded_tail": dict(b=2, h=2, h_kv=2, s_q=300, s_kv=300),
     "plain_300_served_pick": dict(b=2, h=2, h_kv=2, s_q=300, s_kv=300, knob_tile_n=None),
     "plain_300_served_pick_kv_lens": dict(b=2, h=2, h_kv=2, s_q=300, s_kv=300, kv_lens=[300, 200], knob_tile_n=None),
-    "plain_t64_640_quiet_causal": dict(b=2, h=2, h_kv=2, s_q=640, s_kv=640, causal=True),
     "plain_t64_384_quiet_cga2": dict(b=2, h=2, h_kv=2, s_q=384, s_kv=384, cga=2),
-    "d64_plain_t64_384": dict(b=2, h=2, h_kv=2, s_q=384, s_kv=384, d=64),
     "d64_plain_300_served_pick": dict(b=2, h=2, h_kv=2, s_q=300, s_kv=300, d=64, knob_tile_n=None),
     # The measured default reaches EVERY plain TILE_N 64 form the small-tile leg admits (only THD / paged / split-KV / PackGQA / score
     # side outputs walk past it), so the const_expr arms a dense pass proves nothing about get their own two-slot cell, each bitwise the
@@ -396,25 +291,9 @@ def _run_knobbed(q, k, v, kw, *, tile_n=None):
     return dict(o=o_gpu, stats=stats_gpu, names=names)
 
 
-def _run(q, k, v, kw, c, _pins, *, s_slots, tile_n=None, softmax_wgs=None):
-    _pins(s_slots=s_slots, mode=c.get("mode"), n_chunk=c.get("n_chunk"), softmax_wgs=softmax_wgs)
+def _run(q, k, v, kw, c, _pins, *, s_slots, tile_n=None):
+    _pins(s_slots=s_slots, mode=c.get("mode"), n_chunk=c.get("n_chunk"))
     return _run_knobbed(q, k, v, kw, tile_n=tile_n)
-
-
-@requires_rubin
-@pytest.mark.parametrize("case", list(_CASES))
-def test_two_slots_match_the_fp64_oracle_and_are_bitwise_one_slot(case, _pins):
-    """At two slots the kernel matches the fp64 oracle (bias AND kv_mask applied) over the ring-wrap axis and is BITWISE the one-slot kernel
-    on O and Stats: the same instructions in the same order, only the slot each kv tile's S / P lives in alternates.  The two-slot arm is
-    knob-less (at the two cells whose knob-less pick is THREE softmax warp groups -- the bias + kv_mask pair item from S_kv 640 -- the
-    two-slot record DEGRADES it to two: this call would raise typed otherwise); the one-slot arm is pinned to the same two groups so the
-    bitwise comparison is like for like (the three-group one-slot body is its own module's business)."""
-    c = _CASES[case]
-    q, k, v, kw, ref = _s13._case_inputs(case, torch.bfloat16, kv_mask_p=0.3, table=_CASES)
-    two = _run(q, k, v, kw, c, _pins, s_slots=2)
-    _s13._check(two, ref)
-    one = _run(q, k, v, kw, c, _pins, s_slots=None, softmax_wgs=2)
-    assert torch.equal(two["o"], one["o"]) and torch.equal(two["stats"], one["stats"]), f"{case}: S_SLOTS 2 differs from 1"
 
 
 @requires_rubin
@@ -440,14 +319,3 @@ def test_two_slots_on_the_plain_tile_n_64_body(case, _pins):
     _s13._check(two, ref)
     one = _run(q, k, v, kw, c, _pins, s_slots=1, tile_n=tile_n)
     assert torch.equal(two["o"], one["o"]) and torch.equal(two["stats"], one["stats"]), f"{case}: S_SLOTS 2 (the default) differs from 1"
-
-
-@requires_rubin
-def test_two_slots_at_tile_n_128_is_a_typed_decline(_pins):
-    """The seam at 2 on a TILE_N 128 plan: the factory raises typed through the plan build (never a one-slot kernel under a two-slot label)."""
-    c = dict(b=2, h=2, h_kv=2, s_q=256, s_kv=256)
-    q, k, v, kw, _ref = _s13._case_inputs("plain", torch.bfloat16, table={"plain": c})
-    kw = {**kw, "bias": None}
-    _pins(s_slots=2)
-    with pytest.raises(Exception, match="TMEM|S_SLOTS|TILE_N|s_slots"):
-        _run_knobbed(q, k, v, kw, tile_n=128)

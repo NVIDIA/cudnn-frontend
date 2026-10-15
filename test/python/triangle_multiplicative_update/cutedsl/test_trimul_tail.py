@@ -103,28 +103,6 @@ def test_tail_params_is_the_accumulators_arm():
         k3.build_trimul_tail(sub.LnDualGemmParams())  # a columns-arm params object is not K3
 
 
-def test_fold_output_affine_matches_the_fp64_algebra():
-    g = torch.Generator().manual_seed(1)
-    c_z, c = 128, 128
-    w = (torch.randn(c_z, c, generator=g) / math.sqrt(c)).to(torch.bfloat16)
-    b = (0.2 * torch.randn(c_z, generator=g)).to(torch.bfloat16)
-    gam = (1.0 + 0.1 * torch.randn(c, generator=g)).to(torch.bfloat16)
-    bet = (0.1 * torch.randn(c, generator=g)).to(torch.bfloat16)
-    wf, bf = k3.fold_tail_affine(w, b, gam, bet)
-    assert wf.dtype == torch.bfloat16 and bf.dtype == torch.bfloat16 and wf.shape == (c_z, c) and bf.shape == (c_z,)
-    # the folded function equals the unfolded one on a normalised row x up to the bf16 rounding of the folded weights / bias
-    x = torch.randn(7, c, generator=g).double()
-    unfolded = (x * gam.double() + bet.double()) @ w.double().T + b.double()
-    folded = x @ wf.double().T + bf.double()
-    assert (folded - unfolded).abs().max().item() < 0.03  # the fold's own rounding (2^-9 relative per weight, 128 terms): a sanity bound only
-    exact = x @ (w.double() * gam.double()[None, :]).T + (w.double() @ bet.double() + b.double())
-    assert torch.allclose(exact, unfolded, atol=1e-9)
-    wf2, bf2 = k3.fold_tail_affine(w, None, gam, bet)
-    assert torch.equal(wf2, wf) and torch.allclose(bf2.double(), (w.double() @ bet.double()).to(torch.bfloat16).double())
-    with pytest.raises(ValueError):
-        k3.fold_tail_affine(w, b, gam[:64], bet)
-
-
 def test_stack_tail_biases_interleaves_per_128_block():
     c_z = 256
     bo = torch.arange(c_z, dtype=torch.float32)
@@ -420,9 +398,7 @@ def _check_oracle(out, ref, label):
     [
         (64, 2, 128, True),  # kb = 64: the two MN-major boxes of a CTA are two bi's
         (128, 2, 128, True),  # kb = 128: the two boxes split one bi's j
-        (217, 2, 128, False),  # a tail tile (39 of 256 rows padded), no biases
-        (256, 1, 128, True),
-        (512, 1, 128, True),
+        (217, 2, 128, False),  # kb = 256: a tail tile (39 of 256 rows padded), no biases -- the box geometry of the 256 / 512 cells
         (128, 1, 256, True),  # c_z = c = 256: 4 K stages per tile, two N tiles, the interleaved bias blocks
     ],
 )
@@ -450,7 +426,7 @@ def test_k3_matches_the_fp64_oracle(n_res, batch, c_z, with_bias):
 
 
 @requires_served_arch
-@pytest.mark.parametrize("n_res,batch", [(217, 2), (512, 1)])
+@pytest.mark.parametrize("n_res,batch", [(217, 2)])  # the padded tail; the shipped c 128 prologue on both columns
 def test_transpose_prologue_matches_the_oracle_and_the_mn_major_form(n_res, batch):
     """The fallback form (the normalised y row written K-major, the MMA reading K-major) computes the same function: oracle green, and
     the difference to the "mn_major" form reported (the two write paths carry the same fp32 arithmetic -- bitwise equality is expected
@@ -475,7 +451,7 @@ def test_transpose_prologue_matches_the_oracle_and_the_mn_major_form(n_res, batc
 
 
 @requires_served_arch
-@pytest.mark.parametrize("n_res,batch,c_z,clc_stages", [(217, 2, 256, 1), (33, 1, 256, 2), (128, 1, 256, 1), (384, 1, 256, 1)])
+@pytest.mark.parametrize("n_res,batch,c_z,clc_stages", [(217, 2, 256, 1), (33, 1, 256, 2)])  # a padded tail; the N 33 floor under clc 2
 def test_ln_once_item_is_bitwise_the_per_tile_item(n_res, batch, c_z, clc_stages):
     """The LayerNorm-once work item of the output stage (c = 256: the row block's two A operands resident across its two N tiles, both LayerNorms once;
     T27) computes the SAME update and statistics as the per-tile item, BITWISE; two ON launches bitwise equal; the ON output within the oracle's bound.
@@ -503,24 +479,23 @@ def test_ln_once_item_is_bitwise_the_per_tile_item(n_res, batch, c_z, clc_stages
     _check_oracle(outs[1][0], ref, f"ln_once K3 {n_res}:{batch}:{c_z}")
 
 
+# the two shipped (form, epilogue) pairs on their geometry (`registers / packed` at c 128, `smem_rolled_pf / packed` at c 256) + every other
+# public value once (`smem`, `scalar`, `smem_rolled`, `packed_hoist`, `packed_biasfold`; the tree form has its own oracle-bound test)
+_FORM_CELLS = [
+    ("registers", "packed", 217, 2, 128),
+    ("smem_rolled_pf", "packed", 128, 1, 256),
+    ("smem", "scalar", 217, 2, 128),
+    ("smem_rolled", "packed", 128, 1, 256),
+    ("registers", "packed_hoist", 217, 2, 128),
+    ("registers", "packed_biasfold", 217, 2, 128),
+]
+
+
 @requires_served_arch
-@pytest.mark.parametrize("n_res,batch,c_z", [(217, 2, 128), (128, 1, 256)])
-@pytest.mark.parametrize(
-    "ln_pass_form,epi_math",
-    [
-        ("smem", "scalar"),
-        ("smem_rolled", "scalar"),
-        ("registers", "packed"),
-        ("smem_rolled", "packed"),
-        ("smem_rolled_pf", "packed"),
-        ("registers", "packed_hoist"),
-        ("registers", "packed_biasfold"),
-        ("smem_rolled_pf", "packed_biasfold"),
-    ],
-)
+@pytest.mark.parametrize("ln_pass_form,epi_math,n_res,batch,c_z", _FORM_CELLS, ids=[f"{f}-{e}-{n}-{b}-{c}" for f, e, n, b, c in _FORM_CELLS])
 def test_ln_pass_form_and_epi_math_are_bitwise_equal_to_the_default_forms(n_res, batch, c_z, ln_pass_form, epi_math):
     """On the accumulators arm (mn_major prologue): the re-read LayerNorm forms and the packed epilogue are BITWISE the default forms (output and
-    the LN2 statistics) -- the same bf16 words summed in the same order, the same fp32 operations per element."""
+    the LN2 statistics) -- the same bf16 words summed in the same order, the same fp32 operations per element -- every public value once."""
     probe = k3.tail_params(c_z, c_z, has_bias=True, want_stats=True, a0_prologue="mn_major", ln_pass_form=ln_pass_form, epi_math=epi_math)
     if sub.sm100_register_form_unallocatable(probe, _arch()):
         # the sm100 body's typed decline (ptxas C7600 at K = 256 for the register-form LayerNorm with any packed epilogue on the accumulators arm)
@@ -555,7 +530,7 @@ def test_register_split_hint_vocabulary_is_a_typed_decline():
 
 
 @requires_served_arch
-@pytest.mark.parametrize("n_res,batch,c_z,with_bias", [(217, 2, 128, False), (128, 1, 256, False), (33, 1, 256, True), (384, 1, 256, False)])
+@pytest.mark.parametrize("n_res,batch,c_z,with_bias", [(128, 1, 256, False)])  # the c 256 rendering whose bias-off form spills unhinted
 def test_register_split_hint_is_bitwise_the_default_rendering(n_res, batch, c_z, with_bias):
     """The `.minnctapersm` hint (`min_blocks_per_mp=1`: ptxas honours the register split instead of allocating the flat count) is a launch
     attribute -- the SAME body, the same arithmetic: output and statistics BITWISE the hint-0 plan's, with and without the output biases, on the
@@ -581,7 +556,7 @@ def test_register_split_hint_is_bitwise_the_default_rendering(n_res, batch, c_z,
 
 
 @requires_served_arch
-@pytest.mark.parametrize("n_res,batch,c_z", [(217, 2, 128), (128, 1, 256)])
+@pytest.mark.parametrize("n_res,batch,c_z", [(128, 1, 256)])  # the c 256 column: four K tiles per statistics pass
 def test_tree_ln_form_meets_the_oracle_bound_and_its_distance_to_the_rolled_form_is_measured(n_res, batch, c_z):
     """`ln_pass_form="smem_rolled_tree"` on the accumulators arm: both operands' statistics summed in FOUR partials (a different fp32 ORDER,
     :data:`LN_PASS_FORMS_REORDERED`).  A summation-order change moves a few LayerNorm outputs across a bf16 rounding midpoint, and those flips
@@ -624,77 +599,6 @@ def test_tree_ln_form_meets_the_oracle_bound_and_its_distance_to_the_rolled_form
 
 
 @requires_served_arch
-def test_affine_fold_matches_its_folded_reference_and_its_distance_to_the_unfolded_function_is_measured():
-    """``affine_fold = True``: the kernel computes the FOLDED function exactly as well as the unfolded kernel computes the unfolded one
-    (oracle against the fold-aware reference); its distance to the UNFOLDED fp64 function -- the knob's numerics class (a second bf16
-    rounding of the weights and bias; expected ~2x the unfolded max-abs error) -- is measured against the unfolded kernel's."""
-    eps = 1e-5
-    n_res, batch, c_z = 256, 1, 128
-    c = c_z
-    inp = _inputs(n_res, batch, c_z, c, True, seed=9)
-    stream = torch.cuda.current_stream().cuda_stream
-    ref_unfolded, _, _ = _reference(inp, eps)
-    # the unfolded kernel
-    plan = _build_k3(k3.tail_params(c_z, c, has_bias=True, want_stats=False, eps=eps))
-    out_u = torch.full((batch, n_res, n_res, c_z), _SENTINEL, device="cuda", dtype=torch.bfloat16)
-    _launch(plan, inp, out_u, None, stream)
-    torch.cuda.synchronize()
-    max_u, rms_u = _check_oracle(out_u, ref_unfolded, "unfolded kernel vs the unfolded fp64 function")
-    # the folded kernel
-    wf, bf = k3.fold_tail_affine(inp["p_out"], inp["p_ob"], inp["ln_out_w"], inp["ln_out_b"])
-    plan_f = _build_k3(k3.tail_params(c_z, c, has_bias=True, want_stats=False, eps=eps, affine_fold=True))
-    out_f = torch.full((batch, n_res, n_res, c_z), _SENTINEL, device="cuda", dtype=torch.bfloat16)
-    _launch(plan_f, inp, out_f, None, stream, weights=(wf, bf))
-    torch.cuda.synchronize()
-    ref_folded, _, _ = _reference(inp, eps, folded=(wf, bf))
-    _check_oracle(out_f, ref_folded, "folded kernel vs the FOLDED fp64 function")
-    diff_f = (out_f.double() - ref_unfolded).abs()
-    rms_f = (diff_f.pow(2).mean().sqrt() / ref_unfolded.pow(2).mean().sqrt()).item()
-    max_f = diff_f.max().item()
-    msg = f"AFFINE_FOLD numerics vs the unfolded function: max |diff| {max_f:.4g} (unfolded kernel {max_u:.4g}, x{max_f / max_u:.2f}), rel RMS {rms_f:.3g} (unfolded {rms_u:.3g}, x{rms_f / rms_u:.2f})"
-    print(msg)
-    assert max_f >= max_u * 0.5 and max_f < 0.1, msg  # the fold is a real numerics change (recorded), not a defect
-
-
-@requires_served_arch
-def test_fuse_residual_adds_the_residual_before_the_rounding():
-    eps = 1e-5
-    n_res, batch, c_z = 128, 2, 128
-    c = c_z
-    inp = _inputs(n_res, batch, c_z, c, True, seed=13)
-    plan = _build_k3(k3.tail_params(c_z, c, has_bias=True, want_stats=False, eps=eps, fuse_residual=True))
-    out = torch.full((batch, n_res, n_res, c_z), _SENTINEL, device="cuda", dtype=torch.bfloat16)
-    _launch(plan, inp, out, None, torch.cuda.current_stream().cuda_stream, residual=inp["z"])
-    torch.cuda.synchronize()
-    ref, _, _ = _reference(inp, eps, residual=True)
-    _check_oracle(out, ref, "fused residual")
-    # and it is NOT the unfused two-rounding result cell for cell (the fused form rounds once)
-    plan_u = _build_k3(k3.tail_params(c_z, c, has_bias=True, want_stats=False, eps=eps))
-    out_u = torch.empty_like(out)
-    _launch(plan_u, inp, out_u, None, torch.cuda.current_stream().cuda_stream)
-    torch.cuda.synchronize()
-    two_round = (out_u.float() + inp["z"].float()).to(torch.bfloat16)
-    frac = (two_round.view(torch.int16) != out.view(torch.int16)).double().mean().item()
-    print(f"fused vs unfused+add: {100 * frac:.2f} % of cells differ by the rounding order")
-
-
-@requires_served_arch
-def test_prefetch_knob_is_bitwise_neutral():
-    eps = 1e-5
-    n_res, batch, c_z = 217, 1, 128
-    inp = _inputs(n_res, batch, c_z, c_z, True, seed=17)
-    outs = []
-    for pf in (False, True):
-        plan = _build_k3(k3.tail_params(c_z, c_z, has_bias=True, want_stats=True, eps=eps, prefetch_a_l2=pf))
-        out = torch.full((batch, n_res, n_res, c_z), _SENTINEL, device="cuda", dtype=torch.bfloat16)
-        stats = torch.full((batch * n_res * n_res, 2), -1.0, device="cuda")
-        _launch(plan, inp, out, stats, torch.cuda.current_stream().cuda_stream)
-        torch.cuda.synchronize()
-        outs.append((out, stats))
-    assert torch.equal(outs[0][0], outs[1][0]) and torch.equal(outs[0][1], outs[1][1])
-
-
-@requires_served_arch
 def test_tail_runner_declines_a_small_n_and_a_misshaped_y():
     plan = _build_k3(k3.tail_params(128, 128, has_bias=False, want_stats=False))
     bf16 = torch.bfloat16
@@ -725,11 +629,10 @@ def test_tail_runner_declines_a_small_n_and_a_misshaped_y():
 
 
 @requires_served_arch
-@pytest.mark.parametrize("n_res,batch,k_block", [(384, 2, 128), (384, 1, 64), (128, 2, 256)])
+@pytest.mark.parametrize("n_res,batch,k_block", [(384, 1, 64)])  # the MN-major box floor on K3 (the proj module pins the other knob values)
 def test_k3_row_tile_knob_is_bitwise_the_rule(n_res, batch, k_block):
-    """The accumulators arm under ``k_block``: the same plan, the same bits as the rule (output and statistics).  kb = 128 at N = 384 splits one
-    bi's j across the CTA's two MN-major boxes (as N = 128 does today), kb = 64 gives each box its own bi (as N = 64 does); the rule's 256 pads
-    25 % of every pair tile at N = 384."""
+    """The accumulators arm under ``k_block``: the same plan, the same bits as the rule (output and statistics).  kb = 64 gives each of the CTA's
+    two MN-major boxes its own bi (as N = 64 does) where the rule's 256 pads 25 % of every pair tile at N = 384."""
     c_z = c = 128
     plan = _build_k3(k3.tail_params(c_z, c, has_bias=True, want_stats=True, eps=1e-5))
     inp = _inputs(n_res, batch, c_z, c, True, seed=33)

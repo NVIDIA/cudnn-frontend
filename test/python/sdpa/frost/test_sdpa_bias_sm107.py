@@ -20,13 +20,15 @@ S_kv % 8 == 0 -- the acceptance-grid cells S = 100 / 217 take a padded row strid
 (a python-only ``sdpa`` input the backend has no field for).
 
 Three tiers: (1) CPU contract -- the row's accept / decline table (budgets, dtypes, legs, shapes) and the adapter twin agreeing on
-every cell, the config factory's derived block geometry and raising couplings, the analyzer's bias / kv_mask facts and the
-malformed-shape rejections, the append-only records; (2) host rendering pins -- the no-bias renderings of every served arm
+every cell, the config factory's derived block geometry and raising couplings, the append-only records (the analyzer's bias /
+kv_mask facts and the malformed-shape rejections live in ``test_sdpa_graph_analyzer.py``); (2) host rendering pins -- the no-bias renderings of every served arm
 byte-identical to the committed pre-bias cubin records, the bias / kv_mask renderings keeping the register split, the bit-word
 mask form, no cluster drain and no new spills; (3) GPU cells on a Rubin device -- the fp64 oracle (softmax of scale * q.k + bias
 with the padded / banded / per-key masks) over the degenerate-input matrix within the resident budget, the bias-magnitude cells,
 the fully masked kv_mask row against the zero-length sequence, the IDENTITY check (bias = 0, mask = all True) BITWISE against the
-plain kernel, and the typed declines on real graphs.
+plain kernel, and the typed declines on real graphs.  One oracle cell per form / body / dtype member: the composed cells stand for
+their pure twins (the causal tail for the plain band, the x10 magnitude under the band for the dense one), the sibling modules
+pin the other widths and forms.
 """
 
 import dataclasses
@@ -457,58 +459,11 @@ def test_template_params_and_capabilities_are_appended():
     assert [f.name for f in dataclasses.fields(Capabilities)][-5:] == ["bias_d_shapes", "bias_io_dtype_only", "kv_mask", "kv_mask_dtypes", "tile_ns_by_d_shape"]
 
 
-def _graph(b=2, h=4, s_q=256, s_kv=256, d=32, *, bias_dims=None, bias_dtype=None, kv_mask_dims=None, kv_mask_dtype=None):
-    import cudnn
-
-    io = cudnn.data_type.BFLOAT16
-    g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
-
-    def t(dims, dt, name):
-        stride = tuple(int(x) for x in torch.empty(dims).stride())
-        return g.tensor(dim=list(dims), stride=list(stride), data_type=dt, name=name)
-
-    kw = dict(name="sdpa", q=t((b, h, s_q, d), io, "q"), k=t((b, h, s_kv, d), io, "k"), v=t((b, h, s_kv, d), io, "v"), generate_stats=True, attn_scale=0.25)
-    if bias_dims is not None:
-        kw["bias"] = t(bias_dims, bias_dtype or io, "bias")
-    if kv_mask_dims is not None:
-        kw["kv_mask"] = t(kv_mask_dims, kv_mask_dtype or cudnn.data_type.BOOLEAN, "kv_mask")
-    o, stats = g.sdpa(**kw)
-    o.set_output(True).set_dim([b, h, s_q, d]).set_stride([h * s_q * d, d, h * d, 1])
-    stats.set_output(True).set_dim([b, h, s_q, 1]).set_stride([h * s_q, s_q, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
-    return g
-
-
-def test_analyzer_describes_the_bias_and_kv_mask_and_rejects_malformed_shapes():
-    """The forward bias-shape validation the graph layer lacked: a bias whose rank is not 4 or whose score extent is not
-    (S_q, S_kv) is ``invalid`` (malformed for every engine); the four broadcast forms are described as facts.  ``kv_mask`` is a
-    python-only ``sdpa`` input (the node is python-engines-only once bound) described with its dims / dtype."""
-    import cudnn
-    from cudnn import _pygraph
-    from cudnn.sdpa import graph_analyzer as ga
-
-    assert _pygraph._CAPTURED_OPS["sdpa"]["python_only_in_kwargs"] == ("kv_mask",)
-    for dims in ((1, 4, 256, 256), (2, 4, 256, 256), (1, 1, 256, 256), (2, 1, 256, 256)):
-        f = ga.analyze(_graph(bias_dims=dims))
-        assert f.invalid is None and f.has_bias and f.bias_dim == dims and f.bias_dtype == cudnn.data_type.BFLOAT16 and f.bias_stride[3] == 1, dims
-    for dims in ((1, 4, 256, 128), (1, 4, 128, 256), (3, 4, 256, 256), (1, 3, 256, 256)):
-        f = ga.analyze(_graph(bias_dims=dims))
-        assert f.invalid is not None and "bias" in f.invalid, (dims, f.invalid)
-    g = _graph(kv_mask_dims=(2, 1, 1, 256))
-    assert g._unlowerable_node() is not None, "a bound kv_mask makes the sdpa node python-engines-only"
-    f = ga.analyze(g)
-    assert f.invalid is None and f.has_kv_mask and f.kv_mask_dim == (2, 1, 1, 256) and f.kv_mask_dtype == cudnn.data_type.BOOLEAN and f.kv_mask_stride[3] == 1
-    f = ga.analyze(_graph(kv_mask_dims=(1, 1, 1, 256)))
-    assert f.invalid is None and f.has_kv_mask and f.kv_mask_dim[0] == 1
-    for dims in ((2, 1, 1, 128), (2, 4, 1, 256), (3, 1, 1, 256)):
-        f = ga.analyze(_graph(kv_mask_dims=dims))
-        assert f.invalid is not None and "kv_mask" in f.invalid, (dims, f.invalid)
-    assert ga.analyze(_graph()).has_kv_mask is False
-
-
-def test_kernel_module_constants_and_mask_sites():
+def test_kernel_module_constants_and_mask_sites(monkeypatch):
     """The per-kernel constant ``BIAS_PRELOAD_CHUNKS`` is in its domain, the bias barriers ride ``make_classic_bars(bias_resident=,
-    bias_ring_stages=)`` (the two bias FORMS fold on CFG.BIAS_MODE), and every mask site of the file calls ``apply_mask_chunk`` directly
-    (the one bit-word form; no ``form=``)."""
+    bias_ring_stages=)`` (the two bias FORMS fold on CFG.BIAS_MODE), every mask site of the file calls ``apply_mask_chunk`` directly
+    (the one bit-word form; no ``form=``), and the shared factory builds the bars of a Cfg record WITHOUT the bias fields (the fix pin
+    below)."""
     src = _KERNEL.read_text()
     assert (
         "BIAS_PRELOAD_CHUNKS: int = sm107_bias_preload_chunks(CFG.TILE_N)" in src
@@ -833,16 +788,16 @@ def _check(out, ref, *, has_stats=True):
 # the band masks (causal, right band, SWA + padding), GQA, a zero-length KV batch (an EMPTY work item: no bias barrier is touched),
 # a zero-key batch WITH a sink (Stats = sink_logit, O = 0) and the padded-Q trim (bottom-right causal + bias is refused by the
 # graph contract -- `_MASK_ONLY_CASES` carries the bottom-right keyless rows on the kv_mask arm alone); the bias in its four
-# broadcast forms; the bias-MAGNITUDE cells (N(0, 1)
-# x {1, 10} and the models' finite -1e9 key fold, which is NOT an empty row by contract); the 64-wide tile at cga1 (1 tile) and
-# cga2 (2 tiles).  ``bias``: the form -- "h" = [1, H, S, S], "1" = [1, 1, S, S], "b" = [B, H, S, S], "b1" = [B, 1, S, S].
+# broadcast forms (four TMA descriptors); the bias-MAGNITUDE cells (N(0, 1) x {1, 10} and the models' finite -1e9 key fold, which is
+# NOT an empty row by contract); the 64-wide tile at cga1 (1 tile) and cga2 (2 tiles).  ``bias``: the form -- "h" = [1, H, S, S],
+# "1" = [1, 1, S, S], "b" = [B, H, S, S], "b1" = [B, 1, S, S].  The table is shared with ``test_sdpa_bias_sm100.py`` (Rule S6: one
+# matrix per body on both arch lines); ``bias_x10`` is run there, here the magnitude cell is the one composed with the band.
 _CASES = {
     "dense_one_tile_bh1": dict(b=1, h=1, h_kv=1, s_q=128, s_kv=128),
     "dense_nkv1": dict(b=2, h=2, h_kv=2, s_q=128, s_kv=128),
     "dense_nkv2": dict(b=2, h=4, h_kv=4, s_q=256, s_kv=256),
     "dense_nkv3_384": dict(b=2, h=2, h_kv=2, s_q=384, s_kv=384),
     "dense_tail_304": dict(b=2, h=2, h_kv=2, s_q=304, s_kv=304),
-    "causal_384": dict(b=1, h=4, h_kv=4, s_q=384, s_kv=384, causal=True),
     "causal_tail_376": dict(b=2, h=2, h_kv=2, s_q=376, s_kv=376, causal=True),
     "right_band_64_tail_304": dict(b=2, h=2, h_kv=2, s_q=304, s_kv=304, right_bound=64),
     "causal_swa128_padded_384": dict(b=2, h=2, h_kv=2, s_q=384, s_kv=384, causal=True, window_left=128, kv_lens=[384, 200]),
@@ -858,8 +813,6 @@ _CASES = {
     "d64_dense_128": dict(b=2, h=4, h_kv=4, s_q=128, s_kv=128, d=64),
     "d64_padded_zero_batch_128": dict(b=3, h=2, h_kv=2, s_q=128, s_kv=128, d=64, kv_lens=[128, 0, 77]),
     "d64_dense_256_cga2": dict(b=2, h=2, h_kv=2, s_q=256, s_kv=256, d=64, cga=2),
-    "d64_causal_256_cga2": dict(b=2, h=2, h_kv=2, s_q=256, s_kv=256, d=64, cga=2, causal=True),
-    "d24_dense_256": dict(b=2, h=4, h_kv=4, s_q=256, s_kv=256, d=24),
     "dense_one_tile_64": dict(b=2, h=2, h_kv=2, s_q=64, s_kv=64),
     "tail_217_padded_stride_bias": dict(b=2, h=2, h_kv=2, s_q=217, s_kv=217, bias_row_stride=224),
     "causal_tail_100_padded_stride_bias": dict(b=2, h=2, h_kv=2, s_q=100, s_kv=100, causal=True, bias_row_stride=104),
@@ -935,11 +888,14 @@ def _assert_plan(out, case):
     assert out["knobs"].cga == c.get("cga", 1), (case, out["knobs"])
 
 
+_RUBIN_ORACLE_CASES = tuple(c for c in _CASES if c != "bias_x10")  # the SM100 module runs bias_x10; here bias_x10_causal_384 composes it with the band
+
+
 @requires_rubin
-@pytest.mark.parametrize("case", list(_CASES))
+@pytest.mark.parametrize("case", _RUBIN_ORACLE_CASES)
 def test_bias_matches_the_fp64_oracle(case):
     """The additive bias over the degenerate-input matrix inside the resident budget (bf16), every broadcast form and the
-    magnitude cells: O and Stats against the fp64 oracle, keyless rows exactly 0 / -inf, two launches bitwise."""
+    magnitude cell: O and Stats against the fp64 oracle, keyless rows exactly 0 / -inf, two launches bitwise."""
     q, k, v, kw, ref = _case_inputs(case, torch.bfloat16)
     out = _run(q, k, v, **kw)
     _assert_plan(out, case)
@@ -961,20 +917,32 @@ def test_bias_matches_the_fp64_oracle(case):
 
 
 @requires_rubin
-@pytest.mark.parametrize("case", ["dense_nkv2", "causal_swa128_padded_384", "causal_sink_padded_q_trim", "bias_x10", "d64_dense_256_cga2"])
+@pytest.mark.parametrize("case", ["dense_nkv2", "causal_sink_padded_q_trim"])
 def test_bias_matches_the_fp64_oracle_fp16(case):
-    """The fp16 member of the row's dtype set (an fp16 bias with fp16 activations), five arms."""
+    """The fp16 member of the row's dtype set (an fp16 bias with fp16 activations): the dense base and the fp16 O cast on keyless
+    rows under the sink and the padded-Q trim (the same two cells on the SM100 twin)."""
     q, k, v, kw, ref = _case_inputs(case, torch.float16)
     out = _run(q, k, v, **kw)
     _assert_plan(out, case)
     _check(out, ref)
 
 
+# Two bodies -- the HW-max kv_mask-only body and the software-tree bias + mask body -- each at the dense base, the band + padding,
+# the zero-length batch, and the body's other geometry (d64 at cga2 / GQA).
+_KV_MASK_CELLS = [
+    (False, "dense_nkv2"),
+    (False, "causal_swa128_padded_384"),
+    (False, "padded_kv_zero_batch"),
+    (False, "d64_dense_256_cga2"),
+    (True, "dense_nkv2"),
+    (True, "causal_swa128_padded_384"),
+    (True, "padded_kv_zero_batch"),
+    (True, "causal_gqa_8_2"),
+]
+
+
 @requires_rubin
-@pytest.mark.parametrize(
-    "case", ["dense_nkv2", "dense_nkv3_384", "causal_384", "causal_swa128_padded_384", "padded_kv_zero_batch", "causal_gqa_8_2", "d64_dense_256_cga2"]
-)
-@pytest.mark.parametrize("with_bias", [False, True], ids=["mask_only", "mask_and_bias"])
+@pytest.mark.parametrize("with_bias, case", _KV_MASK_CELLS, ids=[f"{'mask_and_bias' if w else 'mask_only'}-{c}" for w, c in _KV_MASK_CELLS])
 def test_kv_mask_matches_the_fp64_oracle(case, with_bias):
     """The per-key boolean mask (30 % of the keys False) alone and composed with the bias, the band masks, the padding and a
     zero-length batch: a masked key is exactly a padded one in the oracle."""
@@ -1048,9 +1016,12 @@ def test_kv_mask_fully_masked_row_equals_the_zero_length_sequence():
     _check(out_b, _ref(q, k, v, scale=scale, kv_mask=one))
 
 
+# One bf16 cell per tile width + the padded leg + one fp16 cell on the 128-wide tile: every (width, dtype) pair compares like with like.
+_IDENTITY_CELLS = [("dense_nkv2", torch.bfloat16), ("padded_kv_zero_batch", torch.bfloat16), ("d64_dense_128", torch.bfloat16), ("dense_nkv2", torch.float16)]
+
+
 @requires_rubin
-@pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
-@pytest.mark.parametrize("case", ["dense_nkv2", "dense_nkv3_384", "causal_384", "padded_kv_zero_batch", "d64_dense_128"])
+@pytest.mark.parametrize("case, dtype", _IDENTITY_CELLS, ids=[f"{c}-{_DTYPE_IDS[_DTYPES.index(t)]}" for c, t in _IDENTITY_CELLS])
 def test_identity_bias_zero_and_mask_all_true_is_bitwise_the_plain_kernel(case, dtype, monkeypatch):
     """bias = 0 and kv_mask = all True change no value: the biased rendering (the -inf masked body on every tile, the software
     row max, fma(0, 1/scale, s) == s, a keep word of all ones) is BITWISE the plain kernel on O and Stats -- as is each arm

@@ -620,6 +620,72 @@ def sm107_dead_subtile_quiet_pick(
     return SM107_DEAD_SUBTILE_QUIET_DEFAULT
 
 
+# The knob sweep's INTERIOR rows (bf16, H 4, B x S flattened rows, the bias [1, H, S, S], the kv_mask [B_flat, 1, 1, S] bool, a padding
+# mask with per-batch KV lengths of 0.75 S; a 212-SM cc 10.7 node at the 2376 MHz lock, CUDA-graph replay 100 x 3 with a control twin
+# per process, the kernel-only CUPTI time where the replay is launch-bound): the measured record of the rows that sit INSIDE a constant
+# run of the picks below -- test_sdpa_heuristics_small_tile_sm107.py pins the rows at which the picks turn, these document WHY the
+# picks are what they are at the points in between.  Columns: (D, S, B, form, padded) -> (TILE_N, TILE_CGA_M, n_chunk, bias_mode,
+# bias_stages) | the best measured arm | the margin % over the pre-table pick (POSITIVE = faster) | the metric.
+#   (32, 256, 1, 'mask', False) -> (128, 1, 0, 0, 0) | mask | +0.0 % | CUPTI
+#   (32, 384, 1, 'mask', False) -> (128, 1, 0, 0, 0) | mask | +0.0 % | replay
+#   (32, 512, 1, 'plain', False) -> (128, 1, 0, 0, 0) | plain | +0.0 % | replay
+#   (32, 512, 1, 'mask', False) -> (128, 1, 0, 0, 0) | mask | +0.0 % | replay
+#   (32, 768, 1, 'plain', False) -> (128, 1, 0, 0, 0) | plain | +0.0 % | replay
+#   (32, 1024, 1, 'plain', False) -> (128, 1, 0, 0, 0) | plain | +0.0 % | replay
+#   (32, 1024, 1, 'bias', False) -> (128, 1, 0, 2, 2) | one-batch-entry ring, 2 stages | +1.5 % | replay
+#   (32, 2048, 1, 'plain', False) -> (128, 1, 0, 0, 0) | plain | +0.0 % | replay
+#   (32, 2048, 1, 'both', False) -> (64, 1, 8, 2, 3) | pair n8 ring / TILE_N 64 (n16 -1.5 %, the one-batch-entry 64-wide ring -4 %) | +1.4 % | replay
+#   (32, 2048, 1, 'mask', False) -> (128, 1, 0, 0, 0) | mask | +0.0 % | replay
+#   (32, 2048, 1, 'bias', False) -> (128, 1, 0, 2, 2) | one-batch-entry ring, 2 stages | +2.1 % | replay
+#   (32, 128, 4, 'mask', False) -> (64, 1, 0, 0, 0) | mask@TILE_N 64 (+10.2 % CUPTI, whose twin spread was 18.6 % on this sub-20 us cell; the replay margin
+#      carries it) | +8.5 % | replay
+#   (32, 512, 4, 'both', False) -> (64, 1, 8, 1, 0) | pair n8 resident / TILE_N 64 | +17.7 % | replay
+#   (32, 768, 4, 'bias', False) -> (128, 1, 0, 2, 2) | one-batch-entry ring, 2 stages | +2.1 % | replay
+#   (32, 1024, 4, 'bias', False) -> (128, 1, 0, 2, 2) | one-batch-entry ring, 2 stages | +1.6 % | replay
+#   (32, 2048, 4, 'bias', False) -> (128, 1, 0, 2, 2) | one-batch-entry ring, 2 stages | +2.0 % | replay
+#   (32, 2048, 4, 'plain', True) -> (128, 1, 0, 0, 0) | plain with per-batch KV lengths (TILE_N 64 -19 %) | +0.0 % | replay
+#   (32, 200, 1, 'plain', False) -> (128, 1, 0, 0, 0) | plain / TILE_N 128 + the pre-masked tail (the half tile +1.8 % behind) | +39.2 % | replay
+#   (32, 217, 1, 'plain', False) -> (128, 1, 0, 0, 0) | plain / TILE_N 128 + the pre-masked tail (the half tile +3.9 % behind) | +39.2 % | replay
+#   (32, 600, 1, 'plain', False) -> (128, 1, 0, 0, 0) | plain / TILE_N 128 + the pre-masked tail (the half tile +13.7 % behind) | +17.1 % | replay
+#   (32, 600, 1, 'both', False) -> (64, 1, 8, 1, 0) | pair / TILE_N 64 (n16 measured +23.2 %) | +23.2 % | replay
+#   (64, 256, 1, 'plain', False) -> (128, 1, 0, 0, 0) | plain, cga1 (cga2 -31 %) | +0.0 % | CUPTI
+#   (64, 384, 1, 'plain', False) -> (128, 1, 0, 0, 0) | plain, cga1 (cga2 a tie) | +0.0 % | replay
+#   (64, 512, 1, 'plain', False) -> (128, 1, 0, 0, 0) | plain, cga1 (cga2 a tie) | +0.0 % | replay
+#   (64, 768, 1, 'bias', False) -> (128, 1, 8, 2, 3) | pair ring n8 (n4 +3.8 %, n8 +3.0 % over the rule's n16) | +3.0 % | replay
+#   (64, 768, 1, 'both', False) -> (64, 1, 8, 2, 3) | pair n8 ring / TILE_N 64 | +37.8 % | replay
+#   (64, 1024, 1, 'bias', False) -> (128, 1, 8, 2, 3) | pair ring (n16 +1.0 % over the rule's n32; the cga2 one-batch-entry ring +4.0 % is an isolated point,
+#      not a rule) | +1.0 % | replay
+#   (64, 1024, 1, 'both', False) -> (64, 1, 8, 2, 3) | pair ring / TILE_N 64 (n32 measured +39 %) | +39.0 % | replay
+#   (64, 2048, 1, 'plain', False) -> (128, 1, 0, 0, 0) | plain, cga1 (cga2 -2.7 % replay, -2.4 % CUPTI) | +0.0 % | replay
+#   (64, 2048, 1, 'bias', False) -> (128, 1, 8, 2, 3) | pair ring n8 (+3.8 % over the rule's n128; n4 / n16 within 0.3 %) | +3.8 % | replay
+#   (64, 2048, 1, 'both', False) -> (64, 1, 8, 2, 3) | pair n8 ring / TILE_N 64 | +50.8 % | replay
+#   (64, 128, 4, 'mask', False) -> (64, 1, 0, 0, 0) | mask@TILE_N 64 (the additive vector alone +31 % too) | +17.7 % | CUPTI
+#   (64, 1024, 4, 'both', False) -> (64, 1, 8, 2, 3) | pair ring / TILE_N 64 (n128 measured +31.6 %) | +31.6 % | replay
+#   (64, 2048, 4, 'bias', False) -> (128, 1, 8, 2, 3) | pair ring n8 (+4.3 % over the rule's n512, 8192 rows; lower-bound process) | +4.3 % | replay
+#   (64, 2048, 4, 'both', False) -> (64, 1, 8, 2, 3) | pair ring / TILE_N 64 (n512 measured +39 %; lower-bound process) | +39.1 % | replay
+#   (32, 256, 1, 'plain', True) -> (128, 1, 0, 0, 0) | plain with per-batch KV lengths 0.75 S (TILE_N 64 +94.4 %: kv_len 192 ends mid-tile, the padded dense
+#      body's pathology -- the pick sees S_kv = 256, a tile multiple, and cannot follow the lengths; an open kernel item) | +94.4 % | CUPTI
+#   (32, 512, 1, 'plain', True) -> (128, 1, 0, 0, 0) | plain with per-batch KV lengths 0.75 S (TILE_N 64 -11.5 %) | +0.0 % | replay
+#   (32, 1024, 1, 'plain', True) -> (128, 1, 0, 0, 0) | plain with per-batch KV lengths 0.75 S (TILE_N 64 -16.3 %) | +0.0 % | replay
+#   (32, 2048, 1, 'bias', True) -> (64, 1, 8, 2, 3) | bias + per-batch KV lengths 0.75 S: one-batch-entry / ring 3 st / TILE_N 64 +14.3 % (the table's pair n8
+#      ring at 64 unmeasured here) | +14.3 % | replay
+#   (32, 256, 4, 'plain', True) -> (128, 1, 0, 0, 0) | plain with per-batch KV lengths 0.75 S (TILE_N 64 +107.0 %: kv_len 192 ends mid-tile, the padded dense
+#      body's pathology -- the pick sees S_kv = 256, a tile multiple, and cannot follow the lengths; an open kernel item) | +107.0 % | replay
+#   (32, 512, 4, 'plain', True) -> (128, 1, 0, 0, 0) | plain with per-batch KV lengths 0.75 S (TILE_N 64 -13.1 %) | +0.0 % | replay
+#   (32, 1024, 4, 'plain', True) -> (128, 1, 0, 0, 0) | plain with per-batch KV lengths 0.75 S (TILE_N 64 -16.6 %) | +0.0 % | replay
+#   (64, 256, 1, 'plain', True) -> (128, 1, 0, 0, 0) | plain with per-batch KV lengths 0.75 S (TILE_N 64 +66.6 %: kv_len 192 ends mid-tile, the padded dense
+#      body's pathology -- the pick sees S_kv = 256, a tile multiple, and cannot follow the lengths; an open kernel item) | +66.6 % | CUPTI
+#   (64, 512, 1, 'plain', True) -> (128, 1, 0, 0, 0) | plain with per-batch KV lengths 0.75 S (TILE_N 64 -12.8 %) | +0.0 % | replay
+#   (64, 1024, 1, 'bias', True) -> (64, 1, 8, 2, 3) | bias + per-batch KV lengths 0.75 S: the table's pair n8 / ring 3 st / TILE_N 64 +29.8 %; the pair n2 /
+#      ring 3 st / TILE_N 64 +31.6 % -- a 2-row chunk 1.8 points ahead of the capped n8 here (one process; the cap at 8 stays) | +31.6 % | replay
+#   (64, 1024, 1, 'plain', True) -> (128, 1, 0, 0, 0) | plain with per-batch KV lengths 0.75 S (TILE_N 64 -17.6 %) | +0.0 % | replay
+#   (64, 256, 4, 'plain', True) -> (128, 1, 0, 0, 0) | plain with per-batch KV lengths 0.75 S (TILE_N 64 +86.4 %: kv_len 192 ends mid-tile, the padded dense
+#      body's pathology -- the pick sees S_kv = 256, a tile multiple, and cannot follow the lengths; an open kernel item) | +86.4 % | replay
+#   (64, 512, 4, 'plain', True) -> (128, 1, 0, 0, 0) | plain with per-batch KV lengths 0.75 S (TILE_N 64 -14.9 %) | +0.0 % | replay
+#   (64, 1024, 4, 'bias', True) -> (64, 1, 8, 2, 3) | bias + per-batch KV lengths 0.75 S: pair n8 / ring 3 st / TILE_N 64 +38.5 % | +38.5 % | replay
+#   (64, 1024, 4, 'plain', True) -> (128, 1, 0, 0, 0) | plain with per-batch KV lengths 0.75 S (TILE_N 64 -17.7 %) | +0.0 % | replay
+
+
 def sm107_tile_n_pick(d_flavor: int, s_kv: int, *, has_bias: bool, has_kv_mask: bool, padded: bool = False, request: Optional[int] = None, domain=None) -> int:
     """The ``TemplateParams.tile_n`` a knob-less plan on the Rubin 32- / 64-wide tiles gets (the table above): ``request`` when the
     caller made one (the ``TILE_N`` knob / the adapter's ``tile_n=``: honoured or declined by the row / adapter, never degraded);

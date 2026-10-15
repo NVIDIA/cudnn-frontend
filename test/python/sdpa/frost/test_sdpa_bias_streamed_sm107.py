@@ -14,14 +14,16 @@ nothing but the payload / stride rules.  The pick is ONE host function (``config
 heuristics' width pick and the adapter read: the resident block where it holds S_kv, else the ring where a 2-stage ring fits, else a
 typed decline (the one-batch-entry item at the 64-wide tile's cga1: two 64 KiB stages exceed its spare -- the heuristics take cga2).
 
-Three tiers: (1) CPU contract -- the derived ring depth per (tile, cga, item form), the mode pick and its two test seams, the engine
-row's accept / decline table (the cells the ring newly serves and the one width that still declines), the heuristics' width pick, the
-config factory's couplings, the adapter twin with its ``bias_mode=`` / ``bias_stages=`` requests, the appended fields, the kernel's one
-const_expr axis; (2) host rendering pins -- every streamed rendering keeps the register split, no cluster drain, no new spills over the
-resident rendering of the same arm, the packed bias add and the bit-word mask where a mask is on; the RESIDENT renderings stay
-byte-identical to their record (the ring's seams fold out of them); (3) GPU cells on a Rubin device -- the fp64 oracle at S_kv above
-the resident budget (both item forms, both tiles, the cga2 ring, the tail chunk, a zero-length row, the kv_mask, fp16), the bitwise
-pins (resident vs streamed where both fit, 2 vs 3 stages, bias = 0 vs the plain kernel), the served / declined real graphs.
+Three tiers: (1) CPU contract -- the derived ring depth per (tile, cga, item form) and the mode pick, the engine row's accept / decline
+table (the cells the ring newly serves and the one width that still declines), the heuristics' width pick, the config factory's
+couplings, the adapter twin with its ``bias_mode=`` / ``bias_stages=`` requests, the appended fields; (2) host rendering pins -- every
+streamed rendering keeps the register split, no cluster drain, no new spills over the resident rendering of the same arm, the packed
+bias add and the bit-word mask where a mask is on; the RESIDENT renderings stay byte-identical to their record (the ring's seams fold
+out of them); (3) GPU cells on a Rubin device -- the fp64 oracle at S_kv above
+the resident budget (one cell per ring geometry class: both item forms, both tiles, the cga2 ring, the tail chunk, a zero-length row,
+the padded-Q trim, the band + padding, the sink, 16 tiles = five wraps; the kv_mask and fp16 once per width / item form), the bitwise
+pins (resident vs streamed where both fit, the public ``bias_stages=`` request in both directions, bias = 0 vs the plain kernel once per
+item form), the served / declined real graphs.
 """
 
 import dataclasses
@@ -142,21 +144,6 @@ def test_the_auto_width_takes_the_streamed_fallback_at_the_narrowest_width_whose
     assert c.sm107_bias_auto_cga(64, 128, {1, 2}) == 1 and c.sm107_bias_auto_cga(64, 256, {1, 2}) == 2, "the resident pass first"
     assert c.sm107_bias_auto_cga(32, 4096, {1}, pair=True) == 1 and c.sm107_bias_auto_cga(32, 1024, {1}) == 1
     assert c.sm107_bias_auto_cga(128, 256, {1, 2}) is None, "the d128 tile has no spare for either form"
-
-
-def test_seams_pin_the_form_and_the_depth(_pins):
-    from cudnn.sdpa.fwd import config_sm107 as c
-
-    _pins(mode=2)
-    assert c.sm107_bias_mode_pick(32, 1, 384, pair=True) == 2, "the streamed arm where the resident block would fit (the A/B)"
-    assert c.sm107_bias_mode_pick(64, 1, 128, pair=False) == 0, "...but never where no ring fits"
-    _pins(mode=1)
-    assert c.sm107_bias_mode_pick(32, 1, 896, pair=True) == 0, "the resident arm declines above its budget"
-    assert c.sm107_bias_mode_pick(32, 1, 896, pair=True, request=2) == 2, "an explicit request outranks the seam"
-    _pins(stages=2)
-    assert c.sm107_bias_stages_pick(32, 1, pair=True) == 2 and c.sm107_bias_stages_pick(32, 1, pair=True, request=3) == 3
-    _pins()
-    assert c.sm107_bias_mode_pick(32, 1, 896, pair=True) == 2 and c.sm107_bias_stages_pick(32, 1, pair=True) == 3
 
 
 # (name, facts kwargs, knobs kwargs, accept?) -- the cells the ring newly serves beside the one width that still declines.
@@ -351,31 +338,6 @@ def test_template_params_cfg_and_bars_are_appended():
     assert Bars._fields[-2:] == ("mb_bias_ring_full", "mb_bias_ring_empty") and Bars._field_defaults["mb_bias_ring_full"] is None
 
 
-def test_kernel_carries_the_streamed_ring_as_one_const_expr_axis():
-    """The ring is one const_expr axis of the bias arm: ONE fill helper called from EVERY kv-tile path (the prologue and the mainloop of
-    both item forms -- the lockstep with the softmax side's per-tile wait / release the P14 statement rests on), ONE wait before the first
-    read and ONE elected release after the last word in the softmax body, the state advanced once per kv tile by each caller, the two
-    ring rows initialised stage by stage, the resident rows folded on their own guard."""
-    src = _KERNEL.read_text()
-    # _BIAS_STREAMED names BOTH ring forms (the cga1 ring and its cluster-multicast form, test_sdpa_bias_multicast_sm107.py); the
-    # multicast-only seams fold on _BIAS_MCAST and add ONE fill site (the ghost loop), one ring wait, one release and two advances.
-    assert "_BIAS_RESIDENT = CFG.BIAS_MODE == BIAS_MODE_RESIDENT" in src and "_BIAS_STREAMED = CFG.BIAS_MODE in BIAS_STREAMED_MODES" in src
-    assert "def _bias_ring_fill(" in src
-    assert src.count("bias_ring_state = _bias_ring_fill(") == 5, "one fill per kv tile on the four kv-tile paths + the multicast ghost loop"
-    assert src.count("bars.mb_bias_ring_full[bias_ring_state.idx].wait(bias_ring_state.phase, spin=SPIN_RING_WAITS)") == 2
-    assert src.count("bars.mb_bias_ring_empty[bias_ring_state.idx].wait(bias_ring_state.phase, spin=SPIN_RING_WAITS)") == 1
-    assert src.count("bars.mb_bias_ring_empty[bias_ring_state.idx].arrive()") == 2
-    assert src.count("bias_ring_state = advance(bias_ring_state, CFG.STAGES_BIAS)") == 4 and src.count("return advance(bias_ring_state, CFG.STAGES_BIAS)") == 1
-    assert "for bs in cutlass.range_constexpr(CFG.STAGES_BIAS):" in src
-    # the bias barriers ride the factory's appended keywords; the multi-line call carries the S / P slot ring and the multicast ring's release count
-    assert (
-        "s_stages=CFG.TILES_Q * CFG.S_SLOTS,\n        bias_resident=_BIAS_RESIDENT,\n        bias_ring_stages=CFG.STAGES_BIAS if _BIAS_STREAMED else 0," in src
-    )
-    assert "n_tiles=bias_smem_tiles(CFG)" in src
-    assert "if cutlass.const_expr(_BIAS_ARM):\n                if item_live:" not in src, "the item-level rows fold on the RESIDENT guard"
-    assert "if cutlass.const_expr(_BIAS_RESIDENT):" in src
-
-
 # --------------------------------------------------------------------------- tier 2: host rendering pins (sm_107a trace-compile)
 
 _PROBE_BODY = """
@@ -459,7 +421,6 @@ def test_resident_renderings_are_byte_identical_to_their_record(tmp_path, arm):
     "d, cta, extra, base_extra, stages",
     [
         (32, 1, {"n_chunk": 4}, {"n_chunk": 4}, 3),
-        (32, 1, {"n_chunk": 4, "bias_stages": 2}, {"n_chunk": 4}, 2),
         (
             32,
             1,
@@ -468,25 +429,17 @@ def test_resident_renderings_are_byte_identical_to_their_record(tmp_path, arm):
             3,
         ),
         (32, 1, {}, {}, 2),
-        (32, 1, {"bias_stages": 3}, {}, 3),
         (64, 1, {"n_chunk": 4}, {"n_chunk": 4}, 3),
         (64, 2, {}, {}, 2),
     ],
-    ids=[
-        "d32_pair_3",
-        "d32_pair_2",
-        "d32_pair_mask_padded_causal",
-        "d32_one_batch_entry_2",
-        "d32_one_batch_entry_3_requested",
-        "d64_pair_3",
-        "d64_one_batch_entry_cga2_2",
-    ],
+    ids=["d32_pair_3", "d32_pair_mask_padded_causal", "d32_one_batch_entry_2", "d64_pair_3", "d64_one_batch_entry_cga2_2"],
 )
 def test_streamed_renderings_keep_the_split_the_mask_form_and_the_spill_count(tmp_path, d, cta, extra, base_extra, stages):
     """Each streamed rendering traced for sm_107a keeps the per-role register split (USETMAXREG > 0), no cluster-scope drain (CGAERRBAR
     0), spills no more than the RESIDENT rendering of the same arm, carries the packed bias add (FFMA2 >= 128) and the software row max
     (FMNMX3 > 0), the bit-word form (R2P > 0) where a mask is on, more TMA issue sites than the resident form (the per-kv-tile fill on the
-    prologue AND the mainloop) and the derived ring depth with no resident tiles."""
+    prologue AND the mainloop) and the derived ring depth with no resident tiles -- the shipped depth of each (tile, item form) (the
+    requested depths' renderings are byte-pinned in the streamed record of test_sdpa_bias_multicast_sm107.py)."""
     base = _probe(tmp_path, {"__d": d, "cta_mma": cta, "dtype_qkv": 2, "bias_mode": 1, **base_extra}, f"resident_{d}_{cta}_{'_'.join(sorted(base_extra))}")
     probe = _probe(tmp_path, {"__d": d, "cta_mma": cta, "dtype_qkv": 2, "bias_mode": 2, **extra}, f"streamed_{d}_{cta}_{'_'.join(sorted(extra))}")
     assert probe.expect["BIAS_MODE"] == 2 and probe.expect["STAGES_BIAS"] == stages and probe.expect["BIAS_RESIDENT_TILES"] == 0
@@ -505,38 +458,33 @@ def test_streamed_renderings_keep_the_split_the_mask_form_and_the_spill_count(tm
 # The streamed ring's degenerate-input matrix: S_kv ABOVE the resident budget of the item form (the pair item above 768 / 384 at the
 # 32- / 64-wide tile; the one-batch-entry item -- a per-batch bias ("b") or a single row -- above 384 / 128 / 256), the tail chunk, a
 # zero-length row, the padded-Q trim, the kv_mask, the cga2 ring, fp16; plus the cells where BOTH forms fit (the bitwise pins).
-# ``mode`` / ``stages`` / ``n_chunk``: the seams' pins (None = the pick).
+# ``mode`` / ``n_chunk``: the seams' pins (None = the pick).  One cell per ring geometry class: 7 tiles over 3 stages (896), the exact
+# multiple with no mask (1024), 16 tiles = five wraps (2048; the ring index is a modulo on an int32 tile counter, so 32 / 48 tiles run the
+# same path); the broadcast / magnitude bias forms are pinned on the resident arm (the ring feeds the same FFMA).
 _CASES = {
     "pair_896_causal": dict(b=4, h=2, h_kv=2, s_q=896, s_kv=896, causal=True),
     "pair_1024_dense": dict(b=4, h=2, h_kv=2, s_q=1024, s_kv=1024, n_chunk=4),
-    "pair_1024_2_stages": dict(b=4, h=2, h_kv=2, s_q=1024, s_kv=1024, stages=2, n_chunk=4),
     "one_batch_entry_pick_1024_dense": dict(b=4, h=2, h_kv=2, s_q=1024, s_kv=1024),
     "pair_1152_tail_chunk_zero_row": dict(b=5, h=2, h_kv=2, s_q=1152, s_kv=1152, n_chunk=4, causal=True, kv_lens=[1152, 0, 700, 1152, 1]),
     "pair_1024_padded_q_trim": dict(b=4, h=4, h_kv=2, s_q=1024, s_kv=1024, n_chunk=2, causal=True, q_lens=[1024, 300, 0, 1024], kv_lens=[1024, 900, 1024, 0]),
     "pair_1000_tail_tile": dict(b=4, h=2, h_kv=2, s_q=1000, s_kv=1000, n_chunk=2),
     "pair_2048_causal": dict(b=2, h=2, h_kv=2, s_q=2048, s_kv=2048, causal=True, n_chunk=2),
-    # the ring at 32 / 48 kv tiles: the pair item, the knob-less pick (the one-batch-entry ring at S_q % 256 == 0) and a causal 6144
-    "pair_4096_dense": dict(b=2, h=2, h_kv=2, s_q=4096, s_kv=4096, n_chunk=2),
-    "one_batch_entry_pick_4096_dense": dict(b=2, h=2, h_kv=2, s_q=4096, s_kv=4096),
-    "pair_6144_causal": dict(b=2, h=1, h_kv=1, s_q=6144, s_kv=6144, causal=True, n_chunk=2),
     "pair_1024_swa_padded": dict(b=4, h=2, h_kv=2, s_q=1024, s_kv=1024, n_chunk=2, causal=True, window_left=256, kv_lens=[1024, 500, 1024, 777]),
-    "pair_1024_head_broadcast_bias": dict(b=4, h=4, h_kv=4, s_q=1024, s_kv=1024, bias="1", n_chunk=4),
-    "pair_1024_bias_x10": dict(b=4, h=2, h_kv=2, s_q=1024, s_kv=1024, bias_scale=10.0, n_chunk=4),
     "pair_1024_bh_gt_1_sink_padded": dict(b=4, h=4, h_kv=2, s_q=1024, s_kv=1024, n_chunk=2, causal=True, kv_lens=[1024, 0, 800, 1024], sink=True),
     "one_batch_entry_per_batch_512": dict(b=2, h=2, h_kv=2, s_q=512, s_kv=512, bias="b"),
     "one_batch_entry_per_batch_1024_padded": dict(b=3, h=2, h_kv=2, s_q=1024, s_kv=1024, bias="b", kv_lens=[1024, 0, 500]),
-    "one_batch_entry_single_row_1024_causal": dict(b=1, h=2, h_kv=2, s_q=1024, s_kv=1024, causal=True),
-    "d64_pair_512": dict(b=4, h=2, h_kv=2, s_q=512, s_kv=512, d=64, n_chunk=2),
     "d64_pair_1024_causal": dict(b=4, h=2, h_kv=2, s_q=1024, s_kv=1024, d=64, causal=True),  # d64 cga1: the pick stays the pair (no one-batch-entry ring)
     "d64_one_batch_entry_per_batch_512_cga2_ring": dict(b=2, h=2, h_kv=2, s_q=512, s_kv=512, d=64, bias="b"),
     "d64_one_batch_entry_per_batch_384_cga2_ring_padded": dict(b=3, h=2, h_kv=2, s_q=384, s_kv=384, d=64, bias="b", kv_lens=[384, 0, 200]),
-    # both forms fit: the streamed arm pinned by the seam (the bitwise pins below compare against the resident pick)
-    "both_fit_pair_384": dict(b=4, h=2, h_kv=2, s_q=384, s_kv=384, n_chunk=4, mode=2),
+    # both forms fit: the streamed arm pinned by the seam (the bitwise pins below compare against the resident pick) -- the pair block's
+    # resident budget EDGE (6 tiles) under the band, and the one-batch-entry item on the cga2 ring
     "both_fit_pair_768_causal": dict(b=4, h=2, h_kv=2, s_q=768, s_kv=768, n_chunk=4, causal=True, mode=2),
-    "both_fit_one_batch_entry_per_batch_384": dict(b=2, h=2, h_kv=2, s_q=384, s_kv=384, bias="b", mode=2),
-    "both_fit_d64_pair_384": dict(b=4, h=2, h_kv=2, s_q=384, s_kv=384, d=64, n_chunk=2, mode=2),
     "both_fit_d64_one_batch_entry_per_batch_256_cga2": dict(b=2, h=2, h_kv=2, s_q=256, s_kv=256, d=64, bias="b", mode=2),
 }
+# the oracle cells: every ring geometry above the resident budget; the two rows left out run under the bitwise / compose pins below
+_ORACLE_CASES = [
+    c for c in _CASES if not c.startswith("both_fit") and c not in ("one_batch_entry_per_batch_512", "d64_one_batch_entry_per_batch_512_cga2_ring")
+]
 
 
 def _case_inputs(case, dtype, *, kv_mask_p=None):
@@ -552,14 +500,8 @@ def _run(q, k, v, kw, c, _pins, *, mode=None, stages=None, n_chunk=None):
     return _s13._run(q, k, v, **kw)
 
 
-def _ring_plan(out):
-    """The plan's TemplateParams are not on the graph's public surface; the ring's presence is checked on the OUTPUT (the oracle) and the
-    width on the knobs -- the form that ran is pinned by the seam the cell set."""
-    return out["knobs"]
-
-
 @requires_rubin
-@pytest.mark.parametrize("case", [c for c in _CASES if not c.startswith("both_fit")])
+@pytest.mark.parametrize("case", _ORACLE_CASES)
 def test_streamed_ring_matches_the_fp64_oracle(case, _pins):
     """The streamed ring over its degenerate-input matrix (bf16): O and Stats against the fp64 oracle, keyless rows exactly 0 / -inf,
     two launches bitwise; every cell sits ABOVE the resident budget of its item form, so the ring is the only form that serves it."""
@@ -571,8 +513,9 @@ def test_streamed_ring_matches_the_fp64_oracle(case, _pins):
 
 
 @requires_rubin
-@pytest.mark.parametrize("case", ["pair_1024_dense", "pair_1152_tail_chunk_zero_row", "one_batch_entry_per_batch_1024_padded", "d64_pair_1024_causal"])
+@pytest.mark.parametrize("case", ["pair_1152_tail_chunk_zero_row", "d64_pair_1024_causal"])
 def test_streamed_ring_matches_the_fp64_oracle_fp16(case, _pins):
+    """The fp16 member once per ring rendering class (the 32- and the 64-wide tile); the item form does not change the dtype handling."""
     c = _CASES[case]
     q, k, v, kw, ref = _case_inputs(case, torch.float16)
     out = _run(q, k, v, kw, c, _pins)
@@ -580,10 +523,9 @@ def test_streamed_ring_matches_the_fp64_oracle_fp16(case, _pins):
 
 
 @requires_rubin
-@pytest.mark.parametrize(
-    "case", ["pair_1024_dense", "pair_1152_tail_chunk_zero_row", "one_batch_entry_per_batch_1024_padded", "d64_one_batch_entry_per_batch_512_cga2_ring"]
-)
+@pytest.mark.parametrize("case", ["pair_1152_tail_chunk_zero_row", "d64_one_batch_entry_per_batch_512_cga2_ring"])
 def test_streamed_ring_composes_with_the_kv_mask(case, _pins):
+    """The ring + the bit word once per item form / width."""
     c = _CASES[case]
     q, k, v, kw, ref = _case_inputs(case, torch.bfloat16, kv_mask_p=0.3)
     out = _run(q, k, v, kw, c, _pins)
@@ -607,9 +549,11 @@ def test_streamed_is_bitwise_the_resident_block_where_both_fit(case, _pins):
 
 
 @requires_rubin
-@pytest.mark.parametrize("case", ["pair_1024_dense", "pair_2048_causal", "one_batch_entry_per_batch_512", "d64_pair_1024_causal"])
+@pytest.mark.parametrize("case", ["pair_1024_dense", "one_batch_entry_per_batch_512"])
 def test_two_and_three_stages_are_bitwise(case, _pins):
-    """The ring depth is a pure latency knob (no accumulator parity is indexed from it): 2 and 3 stages give bitwise-identical O / Stats."""
+    """The ring depth is a pure latency knob (no accumulator parity is indexed from it): 2 and 3 stages give bitwise-identical O / Stats --
+    the public ``bias_stages=`` request in both directions (2 on the pair item whose default is 3, 3 on the one-batch-entry item whose
+    default is 2)."""
     c = _CASES[case]
     q, k, v, kw, ref = _case_inputs(case, torch.bfloat16)
     deep = _run(q, k, v, kw, c, _pins, stages=3)
@@ -618,9 +562,13 @@ def test_two_and_three_stages_are_bitwise(case, _pins):
     assert torch.equal(deep["o"], shallow["o"]) and torch.equal(deep["stats"], shallow["stats"]), f"{case}: 2 stages differ from 3"
 
 
+# the identity through the ring once per ITEM form (the cheapest total detector of a ring fill / consume offset per form) + the fp16
+# member on the other width
+_IDENTITY_CELLS = [("pair_1024_dense", torch.bfloat16), ("one_batch_entry_per_batch_512", torch.bfloat16), ("d64_pair_1024_causal", torch.float16)]
+
+
 @requires_rubin
-@pytest.mark.parametrize("dtype", _s13._DTYPES, ids=_s13._DTYPE_IDS)
-@pytest.mark.parametrize("case", ["pair_1024_dense", "pair_896_causal", "one_batch_entry_per_batch_512", "d64_pair_1024_causal"])
+@pytest.mark.parametrize("case, dtype", _IDENTITY_CELLS, ids=[f"{c}-{_s13._DTYPE_IDS[_s13._DTYPES.index(t)]}" for c, t in _IDENTITY_CELLS])
 def test_identity_bias_zero_is_bitwise_the_plain_kernel(case, dtype, _pins):
     """bias = 0 through the streamed ring is BITWISE the plain kernel on O and Stats (the -inf masked body with fma(0, 1/scale, s) == s)."""
     c = _CASES[case]

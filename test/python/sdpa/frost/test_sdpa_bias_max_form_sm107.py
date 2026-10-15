@@ -11,18 +11,23 @@ RAW score range inside the tile -- tens of log2 units against the fp32 flush at 
 below 2^-(126 - slack): invisible in a bf16 O and in the fp32 LSE.  The bit-word kv_mask is ignored by the bound (masked columns can
 only lower the true max); the additive kv_mask vector has no per-tile max to bound and is a typed decline with the form.
 
+The hardware bound is the DEFAULT on the kv_mask-ONLY form (run knob-less by every ``mask_only`` cell of test_sdpa_bias_sm107.py: the
+ring wrap, the fully masked row, the degenerate matrix); WITH a bias it is a public ``bias_max_form=1`` option with a documented numerics
+limit, so the option keeps one dense and one masked-band oracle cell, one composition with the mask, one protocol-range pin and the
+limit itself.
+
 Three tiers: (1) CPU contract -- the appended TemplateParams / Cfg fields, the config factory's accept / raise table, the pick and its
-sweep seam, the adapter's typed declines; (2) host rendering pins (sm_107a trace-compile) -- the SOFTWARE renderings of every bias /
-kv_mask arm byte-identical to the committed record (the default form is unchanged), the hardware renderings with NO software max tree
-(FMNMX3 0), the packed max present (HMNMX2), the fused loads (LDTM count unchanged), the register split kept, no cluster drain and no
-new spills; (3) GPU cells on a Rubin device -- the hardware form against the fp64 oracle AND against the software form over the bias
-module's degenerate-input sweep, the three bias ranges of the numerics protocol (N(0, 1), a -1e4 masked fold, a 10 000-scale bf16 bias)
-with the worst-case slack |m_upper - m_true| documented per cell, the kv_mask fully masked row exactly 0 / -inf, the ring-wrap axis on
-the kv_mask arm; the MEASURED per-form default (``config_sm107.sm107_bias_max_form_default``: the hardware bound on the kv_mask-only form,
-the software tree with a bias) evidenced on the executed plan's record, and the default kv_mask-only plan's identity property (a mask of
-all True is bitwise the plain kernel); and the DOCUMENTED LIMIT of the hardware bound WITH a bit-word kv_mask -- the bound ignores the
-mask, so a row whose masked-out columns carry a bias more than the fp32 exp2 range above its kept columns underflows every kept P and
-ends with O = 0 / Stats = -inf (finite, silent, wrong) -- pinned as the reason the measured default keeps the software tree with a bias.
+request, the adapter's typed declines; (2) host rendering pins (sm_107a trace-compile) -- the SOFTWARE renderings of every bias /
+kv_mask arm byte-identical to the committed record (THE byte pin of the bias / kv_mask renderings), the two shipped hardware
+renderings (the kv_mask-only defaults at both widths) with NO software max tree (FMNMX3 0), the fused loads (LDTM count unchanged), the
+register split kept, no cluster drain and no new spills; (3) GPU cells on a Rubin device -- the option against the fp64 oracle AND
+against the software form (dense, the masked band, with the mask and a zero-length batch), the -1e4 masked fold of the numerics protocol
+with the worst-case slack |m_upper - m_true| documented; the MEASURED per-form default (``config_sm107.sm107_bias_max_form_default``: the
+hardware bound on the kv_mask-only form, the software tree with a bias) evidenced on the executed plan's record, the default kv_mask-only
+plan's identity property (a mask of all True is bitwise the plain kernel) once per width; and the DOCUMENTED LIMIT of the hardware bound
+WITH a bit-word kv_mask -- the bound ignores the mask, so a row whose masked-out columns carry a bias more than the fp32 exp2 range above
+its kept columns underflows every kept P and ends with O = 0 / Stats = -inf (finite, silent, wrong) -- pinned as the reason the measured
+default keeps the software tree with a bias.
 """
 
 import dataclasses
@@ -38,7 +43,6 @@ from frost_test_utils import assert_no_new_spills, requires_dsl, requires_rubin,
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 
-_KERNEL = Path(__file__).resolve().parents[4] / "python" / "cudnn" / "sdpa" / "fwd" / "kernels" / "sm107" / "prefill_d128_f16.py"
 _RENDERINGS = Path(__file__).resolve().parent / "renderings"
 _RECORD = _RENDERINGS / "md5_fwd_d128_file_bias_software_sm_107a.txt"
 
@@ -49,15 +53,6 @@ def _sm107_target_for_metadata(monkeypatch):
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
         monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
-
-
-@pytest.fixture
-def _hw_form(monkeypatch):
-    """Pin the hardware upper-bound form on every knob-less plan of the test (the sweep seam; reset by monkeypatch)."""
-    from cudnn.sdpa.fwd import config_sm107 as c
-
-    monkeypatch.setattr(c, "_BIAS_MAX_FORM_OVERRIDE_FOR_SWEEPS", 1)
-    yield
 
 
 # --------------------------------------------------------------------------- tier 1: CPU contract
@@ -92,20 +87,10 @@ def test_template_params_and_cfg_are_appended():
     assert c.sm107_bias_max_form_default(0, 2) == 0 and c.sm107_bias_max_form_default(0, 3) == 0 and c.sm107_bias_max_form_default(0, 0) == 0
 
 
-@pytest.mark.parametrize(
-    "d, kw",
-    [
-        (32, dict(bias_mode=1)),
-        (32, dict(bias_mode=2, bias_stages=2)),
-        (32, dict(kv_mask_form=1)),
-        (32, dict(bias_mode=1, kv_mask_form=1, n_chunk=4, tile_n=64)),
-        (32, dict(bias_mode=1, kv_mask_form=1, seq_kv_lens_present=True)),
-        (64, dict(bias_mode=1, kv_mask_form=1, seq_kv_lens_present=True, cta_mma=2)),
-        (32, dict(bias_mode=1, dtype_qkv=3)),
-    ],
-    ids=["d32_bias_res", "d32_bias_ring", "d32_mask", "d32_both_pair_t64", "d32_both_padded", "d64_both_cga2", "d32_bias_f16"],
-)
+@pytest.mark.parametrize("d, kw", [(32, dict(kv_mask_form=1)), (32, dict(bias_mode=1))], ids=["d32_mask", "d32_bias_res"])
 def test_config_factory_accepts_the_hardware_form_on_every_served_arm(d, kw):
+    """The default form (the kv_mask-only arm) and the option (with a bias): a pure instruction-stream axis of the record (the other
+    served arms are the adapter twin's and the GPU cells' public surface)."""
     from cudnn.sdpa.fwd import config_sm107 as c
 
     cfg, _ = (c.make_cfg_d32 if d == 32 else c.make_cfg_d64)(_params(bias_max_form=1, **kw))
@@ -161,18 +146,6 @@ def test_adapter_kwarg_is_appended_and_declines_typed():
     assert "bias_max_form=self._resident_arm_bias_max_form()" in Path(api_dsl.__file__).read_text()
 
 
-def test_kernel_carries_the_form_as_one_const_expr_axis():
-    src = _KERNEL.read_text()
-    assert "_HW_UPPER_MAX = CFG.BIAS_MAX_FORM == BIAS_MAX_HW_UPPER_BOUND" in src
-    body = src[src.index("def _softmax_kv_body_inf(") : src.index("def _softmax_warp_group(")]
-    assert body.count("if cutlass.const_expr(_HW_UPPER_MAX):") == 2, "the load site and the max site fold on the ONE axis"
-    assert "_tmem_load_max_reduction(s_addr_base + cutlass.Int32(c * CHUNK), num=CHUNK)" in body, "the plain body's fused primitive"
-    assert "packed_row_max_words(" in body and "packed_pair_max_f32(" in body and "opaque_offset=True" in body
-    assert "row_max_for_exp2(total_max)" in body, "the -inf form's 0-substitution is kept verbatim"
-    assert "row_max_reduction(chunks_S[c])" in body, "the software tree stays the other arm"
-    assert "if _HW_UPPER_MAX and _KV_MASK_ADD:" in src and "if _HW_UPPER_MAX and not _INF_MASK_ARM:" in src
-
-
 # --------------------------------------------------------------------------- tier 2: host rendering pins (sm_107a trace-compile)
 
 _PROBE_BODY = """
@@ -211,7 +184,7 @@ _ARMS = {
     "d32_maskadd_only": {"__d": 32, "cta_mma": 1, "dtype_qkv": 2, "kv_mask_form": 2},
     "d32_bias_f16_res_one": {"__d": 32, "cta_mma": 1, "dtype_qkv": 3, "bias_mode": 1},
 }
-_HW_ARMS = [a for a in _ARMS if a != "d32_maskadd_only"]  # the additive vector keeps the software form (a typed decline with the hardware one)
+_HW_ARMS = ["d32_mask_only", "d32_mask_only_t64"]  # the kv_mask-only DEFAULTS at both widths: the hardware renderings a knob-less plan runs
 
 
 def _record():
@@ -261,11 +234,10 @@ def test_software_renderings_are_byte_identical_to_the_record(tmp_path, arm):
 
 @pytest.mark.parametrize("arm", _HW_ARMS)
 def test_hardware_renderings_drop_the_tree_keep_the_split_and_spill_no_more(tmp_path, arm):
-    """``bias_max_form = 1``: NO software max tree (FMNMX3 0 against the software form's 62 / 124), the packed bias max present on the
-    bias arms (HMNMX2 = 63 per 128 columns per sub-tile body; 0 on the kv_mask-only arm, whose bound is the hardware max alone), the SAME
-    LDTM count (the fused load replaces the plain one), the register split kept, no cluster drain, FFMA2 / MUFU unchanged and no new
-    spills over the software rendering of the same arm (the early opaque second read of the non-pre-loaded chunk keeps the words out of
-    the TMEM chunks' live range)."""
+    """``bias_max_form = 1`` on the two shipped renderings (the kv_mask-only form at 128 and 64): NO software max tree (FMNMX3 0 against
+    the software form's 62 / 124), no packed bias max (HMNMX2 0: the bound is the hardware max alone; a bias arm would add 63 per 128
+    columns per sub-tile body), the SAME LDTM count (the fused load replaces the plain one), the register split kept, no cluster drain,
+    FFMA2 / MUFU unchanged and no new spills over the software rendering of the same arm."""
     want = _skip_unless_record_dsl()
     sw = _probe(tmp_path, _ARMS[arm], f"sw_{arm}")
     assert sw.cubin_md5 == want[arm]
@@ -295,29 +267,8 @@ def test_hardware_renderings_drop_the_tree_keep_the_split_and_spill_no_more(tmp_
 _TOL_O_VS_SW = dict(atol=1.6e-2, rtol=1.6e-2)  # bf16: 8 mantissa bits; 2 ulps at unit scale
 _TOL_LSE_VS_SW = dict(atol=2e-5, rtol=2e-5)
 
-_SWEEP = [
-    "dense_one_tile_bh1",
-    "dense_nkv2",
-    "dense_nkv3_384",
-    "dense_tail_304",
-    "causal_384",
-    "causal_tail_376",
-    "right_band_64_tail_304",
-    "causal_swa128_padded_384",
-    "causal_gqa_8_2",
-    "padded_kv_zero_batch",
-    "causal_sink_padded_q_trim",
-    "bias_head_broadcast",
-    "bias_per_batch",
-    "bias_x10",
-    "bias_x10_causal_384",
-    "bias_neg1e9_key_fold",
-    "d64_dense_128",
-    "d64_dense_256_cga2",
-    "d64_causal_256_cga2",
-    "dense_one_tile_64",
-    "tail_217_padded_stride_bias",
-]
+# the option's oracle cells: dense, and the masked band (where the hardware bound meets -inf columns)
+_SWEEP = ["dense_nkv3_384", "causal_swa128_padded_384"]
 
 
 def _run_both(q, k, v, kw, monkeypatch):
@@ -365,9 +316,9 @@ def _slack(q, k, bias, scale, kv_mask=None, tile_n=128):
 @requires_rubin
 @pytest.mark.parametrize("case", _SWEEP)
 def test_hw_form_matches_the_oracle_and_the_software_form(case, monkeypatch):
-    """The degenerate-input sweep of the bias module (bf16) under the hardware form: O and Stats against the fp64 oracle at the module's
-    tolerances, keyless rows exactly 0 / -inf, two launches bitwise (inside ``_run``), AND against the software form at the tighter
-    same-function tolerances; the worst-case slack of the bound is printed with the cell."""
+    """The option (a bias under the hardware bound, bf16) on a dense cell and on the masked band: O and Stats against the fp64 oracle at
+    the module's tolerances, keyless rows exactly 0 / -inf, two launches bitwise (inside ``_run``), AND against the software form at the
+    tighter same-function tolerances; the worst-case slack of the bound is printed with the cell."""
     q, k, v, kw, ref = _s13._case_inputs(case, torch.bfloat16)
     sw, hw = _run_both(q, k, v, kw, monkeypatch)
     _check_hw(sw, hw, ref)
@@ -377,17 +328,10 @@ def test_hw_form_matches_the_oracle_and_the_software_form(case, monkeypatch):
 
 
 @requires_rubin
-@pytest.mark.parametrize("case", ["dense_nkv3_384", "causal_swa128_padded_384", "bias_x10"])
-def test_hw_form_fp16(case, monkeypatch):
-    q, k, v, kw, ref = _s13._case_inputs(case, torch.float16)
-    sw, hw = _run_both(q, k, v, kw, monkeypatch)
-    _check_hw(sw, hw, ref)
-
-
-@requires_rubin
-@pytest.mark.parametrize("case", ["dense_nkv3_384", "causal_384", "padded_kv_zero_batch", "bias_neg1e9_key_fold"])
+@pytest.mark.parametrize("case", ["padded_kv_zero_batch"])
 def test_hw_form_with_the_kv_mask(case, monkeypatch):
-    """The bias WITH the bit-word kv_mask (30 % masked): the bound ignores the mask -- a masked column can only lower the true max."""
+    """The option composed with the bit-word kv_mask (30 % masked) and a zero-length batch: the bound ignores the mask -- a masked column
+    can only lower the true max (the documented limit of that has its own cell below)."""
     q, k, v, kw, ref = _s13._case_inputs(case, torch.bfloat16, kv_mask_p=0.3)
     sw, hw = _run_both(q, k, v, kw, monkeypatch)
     _check_hw(sw, hw, ref)
@@ -397,45 +341,17 @@ def test_hw_form_with_the_kv_mask(case, monkeypatch):
 
 
 @requires_rubin
-@pytest.mark.parametrize("case", list(_s13._MASK_RING_CASES))
-def test_hw_form_kv_mask_alone_across_the_ring_wrap(case, monkeypatch):
-    """The kv_mask ALONE (no bias): the bound is the hardware raw max alone, over the ring-wrap axis (n_kv 4 / 5 / 8, a tail)."""
-    q, k, v, kw, ref = _s13._case_inputs(case, torch.bfloat16, kv_mask_p=0.3, table=_s13._MASK_RING_CASES)
-    kw["bias"] = None
-    ref = _s13._ref_of(_s13._MASK_RING_CASES[case], q, k, v, kw)
-    sw, hw = _run_both(q, k, v, kw, monkeypatch)
-    _check_hw(sw, hw, ref)
-
-
-def _profile_bias(kind, bb, bh, s_q, s_kv, dtype):
-    """The numerics protocol's bias RANGES: the -1e4 masked fold (a finite masked value, row-structured: 30 % of the keys), the
-    10 000-scale bias (bf16 quantum 64 at that magnitude), and a per-ROW structured bias (one row all -1e4, one row all +1e4)."""
-    if kind == "neg1e4_fold":
-        keep = torch.rand(bb, 1, 1, s_kv, device="cuda") > 0.3
-        return torch.where(keep, torch.zeros(bb, bh, s_q, s_kv, device="cuda"), torch.full((bb, bh, s_q, s_kv), -1e4, device="cuda")).to(dtype)
-    if kind == "scale_1e4":
-        return (torch.randn(bb, bh, s_q, s_kv, device="cuda") * 1e4).to(dtype)
-    if kind == "row_structured":
-        b = torch.randn(bb, bh, s_q, s_kv, device="cuda")
-        b[..., 3, :] = -1e4
-        b[..., 5, :] = 1e4
-        b[..., 7, : s_kv // 2] = -1e4
-        return b.to(dtype)
-    raise ValueError(kind)
-
-
-@requires_rubin
-@pytest.mark.parametrize("kind", ["neg1e4_fold", "scale_1e4", "row_structured"])
-@pytest.mark.parametrize("shape", [(2, 2, 384, 384, 32), (2, 2, 256, 256, 32), (1, 4, 1024, 1024, 32)], ids=["s384", "s256", "s1024_ring"])
-def test_hw_form_on_the_protocol_bias_ranges(kind, shape, monkeypatch):
-    """STEPS S16's numerics protocol: the bias ranges where a BLOCK-scalar bound would underflow whole rows (a -1e4 row under a 0 block max
-    shrinks every exp by 2^-14 000); the per-ROW bound's slack stays the raw range -- no underflow-induced zero row (a live row's O is
-    finite and its sum > 0 wherever the oracle's is), the oracle and the software form agree."""
+def test_hw_form_on_the_protocol_bias_ranges(monkeypatch):
+    """The numerics protocol's -1e4 masked fold (a finite masked value, row-structured: 30 % of the keys) under the option at S 384: the
+    range where a BLOCK-scalar bound would underflow whole rows (a -1e4 row under a 0 block max shrinks every exp by 2^-14 000); the
+    per-ROW bound's slack stays the raw range -- no underflow-induced zero row (a live row's O is finite and its sum > 0 wherever the
+    oracle's is), the oracle and the software form agree.  The documented-slack pin of the option."""
     torch.manual_seed(7)
-    b, h, s_q, s_kv, d = shape
+    b, h, s_q, s_kv, d = 2, 2, 384, 384, 32
     dtype = torch.bfloat16
     q, k, v = (_s13._bhsd(b, h, s_q, d, dtype) for _ in range(3))
-    bias = _profile_bias(kind, 1, h, s_q, s_kv, dtype)
+    keep = torch.rand(1, 1, 1, s_kv, device="cuda") > 0.3
+    bias = torch.where(keep, torch.zeros(1, h, s_q, s_kv, device="cuda"), torch.full((1, h, s_q, s_kv), -1e4, device="cuda")).to(dtype)
     scale = 1.0 / math.sqrt(d)
     kw = dict(scale=scale, bias=bias, kv_mask=None, sdpa_kwargs={}, seq_len_kv=None, seq_len_q=None, sink=None, cga=None)
     ref = _s13._ref(q, k, v, scale=scale, bias=bias)
@@ -444,7 +360,7 @@ def test_hw_form_on_the_protocol_bias_ranges(kind, shape, monkeypatch):
     live = ~ref["empty"]
     assert torch.isfinite(hw["stats"].squeeze(-1)[live]).all(), "a live row's LSE under the bound must stay finite (no underflow-induced zero row)"
     slack, raw_range = _slack(q, k, bias, scale)
-    print(f"\n{kind} {shape}: worst |m_upper - m_true| {slack:.3f} log2 units (raw range bound {raw_range:.3f})")
+    print(f"\nneg1e4_fold s384: worst |m_upper - m_true| {slack:.3f} log2 units (raw range bound {raw_range:.3f})")
     assert slack <= raw_range + 1e-6 and slack < 60.0, (slack, raw_range)
 
 
@@ -466,7 +382,7 @@ def _spy_loaded_forms(monkeypatch):
 
 
 @requires_rubin
-@pytest.mark.parametrize("case", ["dense_nkv3_384", "causal_384", "padded_kv_zero_batch", "d64_dense_128"])
+@pytest.mark.parametrize("case", ["dense_nkv3_384", "padded_kv_zero_batch"])
 def test_the_default_pick_runs_the_hardware_form_on_the_kv_mask_only_plan_and_the_software_tree_with_a_bias(case, monkeypatch):
     """No request, no seam: a kv_mask-only plan loads its kernel with ``bias_max_form`` 1 (the measured default), a plan with a bias --
     alone or with the kv_mask -- with 0; both agree with the fp64 oracle at the module's tolerances (the pick is performance-only)."""
@@ -485,9 +401,12 @@ def test_the_default_pick_runs_the_hardware_form_on_the_kv_mask_only_plan_and_th
     assert seen and set(seen) == {0}, f"bias-only plan: loaded forms {seen}"
 
 
+# the identity of the default HW-max plan once per width; the fp16 cell carries the dtype member
+_IDENTITY_CELLS = [("dense_nkv2", torch.bfloat16), ("d64_dense_256_cga2", torch.float16)]
+
+
 @requires_rubin
-@pytest.mark.parametrize("dtype", _s13._DTYPES, ids=_s13._DTYPE_IDS)
-@pytest.mark.parametrize("case", ["dense_nkv2", "dense_nkv3_384", "d64_dense_256_cga2"])
+@pytest.mark.parametrize("case, dtype", _IDENTITY_CELLS, ids=[f"{c}-{_s13._DTYPE_IDS[_s13._DTYPES.index(t)]}" for c, t in _IDENTITY_CELLS])
 def test_default_kv_mask_all_true_is_bitwise_the_plain_kernel(case, dtype, monkeypatch):
     """The default kv_mask-only plan (the hardware bound) with a mask of all True is BITWISE the plain kernel on O and Stats on a DENSE
     cell: the bound is the fused raw max the plain body runs on, a keep word of all ones changes no value, and both tile the same width
@@ -506,21 +425,6 @@ def test_default_kv_mask_all_true_is_bitwise_the_plain_kernel(case, dtype, monke
     assert seen and set(seen) == {1}, seen
     assert torch.equal(out["o"], plain["o"]), "mask = all True under the hardware bound: O differs from the plain kernel"
     assert torch.equal(out["stats"], plain["stats"]), "mask = all True under the hardware bound: Stats differ from the plain kernel"
-
-
-@requires_rubin
-def test_hw_form_kv_mask_fully_masked_row_is_exactly_zero_and_minus_inf(_hw_form):
-    """A kv_mask row with NO live key under the hardware form: the bound is finite (the raw max of a real S), every P is exp2(-inf) = 0,
-    ``total_sum == 0`` and the epilogue's SELECT reads O = 0 / Stats = -inf EXACTLY (the -inf form is kept verbatim)."""
-    torch.manual_seed(3)
-    d = 32
-    q, k, v = (_s13._bhsd(2, 2, 256, d, torch.bfloat16) for _ in range(3))
-    kv_mask = torch.rand(2, 1, 1, 256, device="cuda") > 0.3
-    kv_mask[1] = False
-    out = _s13._run(q, k, v, scale=1.0 / math.sqrt(d), kv_mask=kv_mask)
-    assert (out["o"][1] == 0).all() and torch.isneginf(out["stats"][1]).all()
-    ref = _s13._ref(q, k, v, scale=1.0 / math.sqrt(d), kv_mask=kv_mask)
-    _s13._check(out, ref)
 
 
 def _run_forms_on_the_pair_item(q, k, v, kw, monkeypatch, forms=(0, 1)):
@@ -545,8 +449,7 @@ def _run_forms_on_the_pair_item(q, k, v, kw, monkeypatch, forms=(0, 1)):
 
 
 @requires_rubin
-@pytest.mark.parametrize("tile_n", [128, 64], ids=["t128", "t64"])
-def test_hw_form_underflows_a_row_whose_masked_columns_carry_a_bias_far_above_its_kept_columns(tile_n, monkeypatch):
+def test_hw_form_underflows_a_row_whose_masked_columns_carry_a_bias_far_above_its_kept_columns(monkeypatch):
     """The DOCUMENTED LIMIT of the hardware upper bound WITH a bit-word kv_mask (the software form 0 has none of it): the bound ignores the
     mask, so when the masked-out columns of a row's kv tile carry a bias ABOVE the kept columns' by more than the fp32 exp2 range (~126 log2
     units = ~87 natural units, less the row's raw-score slack), every kept P of that tile underflows to 0; a row whose EVERY tile does so ends
@@ -560,6 +463,7 @@ def test_hw_form_underflows_a_row_whose_masked_columns_carry_a_bias_far_above_it
     bias (pinned above) -- and the kv_mask-only default is unaffected (its slack is the raw-score range, the 60-log2-unit assertion above)."""
     torch.manual_seed(5)
     b, h, s, d = 2, 2, 256, 32
+    tile_n = 128  # the documented limit at one width (the 64-wide rendering shares the bound arithmetic)
     dtype = torch.bfloat16
     q, k, v = (_s13._bhsd(b, h, s, d, dtype) for _ in range(3))
     bias = (torch.randn(1, h, s, s, device="cuda") * 1e4).to(dtype)

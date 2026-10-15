@@ -1215,7 +1215,12 @@ def test_fwd_bias_of_another_rank_or_score_extent_is_invalid_for_every_engine(na
 )
 def test_kv_mask_is_described_with_its_dtype_and_makes_the_node_python_only(dtype_name, dt):
     """``kv_mask`` is a python-only ``sdpa`` input: described with dims / strides / dtype (BOOLEAN = the bit word; a 16-bit or
-    fp32 tensor = the additive per-key vector) and the node is python-engines-only once bound (the backend has no field)."""
+    fp32 tensor = the additive per-key vector) and the node is python-engines-only once bound (the backend has no field); it is
+    the ONE python-only ``sdpa`` input registered, and a graph without it reads ``has_kv_mask`` False."""
+    from cudnn import _pygraph
+
+    assert _pygraph._CAPTURED_OPS["sdpa"]["python_only_in_kwargs"] == ("kv_mask",)
+    assert _facts(_mk_small_d_graph()).has_kv_mask is False
     for dims in ((B, 1, 1, S), (1, 1, 1, S)):
         g = _mk_small_d_graph(kv_mask=(dims, _compact(dims), dt))
         assert g._unlowerable_node() is not None

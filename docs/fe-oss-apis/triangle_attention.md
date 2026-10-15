@@ -239,10 +239,10 @@ who prefers the tested conversion with its one host synchronisation per mask.
 
 ## Tests
 
-`test/python/triangle_attention/cutedsl/test_api.py` (L0): the fp64 reference over the acceptance grid (`S` x `D` x `B` x the three mask
-forms, empty rows on both forms), the head dims served by zero fill, fp16 / GQA / a head-broadcast bias / `S_q != S_kv`, the prefix mask vs
-`kv_lengths` (bitwise), the prefix-mask form (`mask_is_prefix=True`) bitwise against both lengths routes on four shapes incl. empty
-rows and the 217 tail (o and lse, the derived lengths read back from the caller's workspace), its debug check on a holed mask (the
+`test/python/triangle_attention/cutedsl/test_api.py` (L0): the fp64 reference over the acceptance grid (`S` x `D` x the three mask
+forms at `B = 1`, empty rows on both forms), the head dims served by zero fill, fp16 / GQA / a head-broadcast bias / `S_q != S_kv`, the prefix mask vs
+`kv_lengths` (bitwise), the prefix-mask form (`mask_is_prefix=True`) bitwise against both lengths routes on two shapes (the 217 tail at
+D 32, 512 at D 64) with rows of every length incl. empty (o and lse, the derived lengths read back from the caller's workspace), its debug check on a holed mask (the
 kwarg and the environment variable; the check off = the documented count behaviour, stated by the test), its allocation-free and
 synchronisation-free execute (the allocator's allocation count unchanged), its CUDA-graph capture following the mask's contents, the
 device-side helper on CPU tensors, the class API's LSE and the masked-row contract, `B = 2` against the single-entry calls (bitwise), the

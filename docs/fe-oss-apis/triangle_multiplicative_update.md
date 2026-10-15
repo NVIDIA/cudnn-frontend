@@ -256,9 +256,10 @@ wrong -- the chain had PDL on all along, and the PDL-off column was the baseline
 
 ## Tests
 
-`test/python/triangle_multiplicative_update/cutedsl/test_api.py` (the lazy export in every import order, the signature pin, the
-typed declines, the padded contraction graph, the workspace and traffic models, the fp64 reference against the formula; on Rubin: the
+`test/python/triangle_multiplicative_update/cutedsl/test_trimul_api.py` (the lazy export in every import order, the signature pin, the
+typed declines, the workspace and traffic models, the fp64 reference against the formula; on Rubin: the
 end-to-end oracle, the API bitwise equal to the hand-chained kernels, the wrapper bitwise equal to the class API with a plan-cache
 hit, `execute` allocating nothing and never synchronising, CUDA-graph capture and replay, bool / fp32 masks and batchless inputs,
 `precision='bfloat16'`, the live-device declines, the stock-caller invocation shape hitting both caches, a plan declared on a
-non-current device, the autograd decline). The three kernels have their own modules beside it.
+non-current device, the autograd decline). The three kernels have their own modules beside it; the padded contraction graph is
+`test_contraction_graph.py`'s.

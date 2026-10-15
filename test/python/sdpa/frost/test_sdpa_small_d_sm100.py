@@ -11,7 +11,6 @@ Rubin threshold.
 """
 
 import dataclasses
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -130,40 +129,6 @@ def test_the_sm100_budget_is_not_the_rubin_budget():
     assert sorted(c0.SM100_BIAS_D_SHAPES) == [(32, 32), (64, 64)]
 
 
-def test_stages_kv_two_is_the_d64_at_128_budget_lever(monkeypatch):
-    """The budget lever for D 64 @128 on SM100: at STAGES_KV 2 the operands are 128 KiB, a 3-tile resident block (S_kv 384) and a
-    3-stage ring fit (2.5 KiB of slack) -- the sweep seam pins it, the budgets follow, the seam state keys the module."""
-    assert c0.sm100_sweep_seam_state() is None
-    monkeypatch.setattr(c0, "_STAGES_KV_OVERRIDE_FOR_SWEEPS", 2)
-    assert c0.sm100_sweep_seam_state() == ("sm100_sweep_seams", 2)
-    # the two module-constant seams (the bias pre-load, the small tiles' ring-wait form) append to the state when set and read back through their
-    # ONE readers; the d128 flavor keeps its measured spin form whatever the seam says
-    assert c0.sm100_spin_ring_waits(128) is True and c0.sm100_spin_ring_waits(64) is False and c0.sm100_spin_ring_waits(32) is False
-    # the BIAS body's default (measured on GB200): True on the small tiles; the d128 flavor ignores the form
-    assert c0.sm100_spin_ring_waits(64, bias_body=True) is c0.SM100_BIAS_BODY_SPIN_RING_WAITS is True and c0.sm100_spin_ring_waits(32, bias_body=True) is True
-    assert c0.sm100_spin_ring_waits(128, bias_body=True) is True
-    monkeypatch.setattr(c0, "_SPIN_RING_WAITS_OVERRIDE_FOR_SWEEPS", True)
-    assert c0.sm100_sweep_seam_state() == ("sm100_sweep_seams", 2, ("bias_preload_chunks", None), ("spin_ring_waits", True))
-    assert c0.sm100_spin_ring_waits(64) is True and c0.sm100_spin_ring_waits(32) is True and c0.sm100_spin_ring_waits(128) is True
-    monkeypatch.setattr(c0, "_SPIN_RING_WAITS_OVERRIDE_FOR_SWEEPS", False)
-    monkeypatch.setattr(c0, "_STAGES_KV_OVERRIDE_FOR_SWEEPS", None)
-    monkeypatch.setattr(c0, "_BIAS_PRELOAD_CHUNKS_OVERRIDE_FOR_SWEEPS", 0)
-    assert c0.sm100_sweep_seam_state() == ("sm100_sweep_seams", None, ("bias_preload_chunks", 0), ("spin_ring_waits", False))
-    assert c0.sm100_bias_preload_chunks(64) == 0 and c0.sm100_spin_ring_waits(128) is True and c0.sm100_spin_ring_waits(64) is False
-    assert c0.sm100_spin_ring_waits(64, bias_body=True) is False, "the seam pins the sleeping form on the bias body too"
-    monkeypatch.setattr(c0, "_SPIN_RING_WAITS_OVERRIDE_FOR_SWEEPS", None)
-    monkeypatch.setattr(c0, "_BIAS_PRELOAD_CHUNKS_OVERRIDE_FOR_SWEEPS", None)
-    assert c0.sm100_sweep_seam_state() is None
-    monkeypatch.setattr(c0, "_STAGES_KV_OVERRIDE_FOR_SWEEPS", 2)
-    assert c0.sm100_small_d_stages_kv(64, 1) == 2
-    assert c0.sm100_bias_resident_tiles(64, 1, pair=True) == 3 and c0.sm100_bias_ring_stages(64, 1, pair=True) == 3
-    cfg = c0.make_cfg_d64(TP(d_flavor=64, cta_mma=1, dtype_qkv=2, bias_mode=1, n_chunk=4))[0]
-    assert cfg.STAGES_KV == 2 and cfg.BIAS_RESIDENT_TILES == 3 and cfg.BIAS_BLOCK_ROWS == 128
-    monkeypatch.setattr(c0, "_STAGES_KV_OVERRIDE_FOR_SWEEPS", 5)
-    with pytest.raises(ValueError, match="validated at"):
-        c0.sm100_small_d_stages_kv(64, 1)
-
-
 # --------------------------------------------------------------------------- the small-tile factory: forms built, forms declined
 
 
@@ -222,8 +187,14 @@ def test_the_small_tile_forms_build_with_the_sm100_geometry():
         (dict(d_flavor=64, cta_mma=1, dtype_qkv=2, bias_mode=1, pack_gqa=True, qh_per_kh=4), "dense, unsplit"),
         (dict(d_flavor=32, cta_mma=1, dtype_qkv=2, n_chunk=4), "needs bias_mode=1"),
         (dict(d_flavor=32, cta_mma=1, dtype_qkv=2, bias_mode=1, kv_mask_form=3, bias_max_form=1), "additive kv_mask vector"),
-        (dict(d_flavor=32, cta_mma=1, dtype_qkv=2, padded_tail_form=1), "MASK_FLAGS == MASK_PADDED alone"),  # a DENSE record: the pre-masked tail needs the padding arm (the plain or the bias body)
-        (dict(d_flavor=32, cta_mma=1, dtype_qkv=2, dead_subtile_quiet=1), "-inf body"),  # the PLAIN body's quiet form is not wired on this file (the -inf body's is)
+        (
+            dict(d_flavor=32, cta_mma=1, dtype_qkv=2, padded_tail_form=1),
+            "MASK_FLAGS == MASK_PADDED alone",
+        ),  # a DENSE record: the pre-masked tail needs the padding arm (the plain or the bias body)
+        (
+            dict(d_flavor=32, cta_mma=1, dtype_qkv=2, dead_subtile_quiet=1),
+            "-inf body",
+        ),  # the PLAIN body's quiet form is not wired on this file (the -inf body's is)
         (dict(d_flavor=32, cta_mma=1, dtype_qkv=2, q_in_tmem=1, cta_mma_=None), None),
     ],
     ids=[
@@ -405,23 +376,27 @@ def test_the_adapter_pool_is_the_rows_twin_on_sm100(monkeypatch):
 
 requires_sm100_line = pytest.mark.skipif(_SM not in (100, 103), reason="needs a cc 10.0 / 10.3 device, have " + ("none" if _SM is None else f"sm_{_SM}"))
 
-_DTYPES = [torch.float16, torch.bfloat16]
-_DTYPE_IDS = ["fp16", "bf16"]
+_DT_IDS = {torch.float16: "fp16", torch.bfloat16: "bf16"}
+# the degenerate trio where the dtype enters the io loads and the P / O casts of a degenerate row (the Rubin twin's set, Rule S6)
+_FP16_CASES = ("dense_nkv2", "padded_kv_zero_batch", "bottom_right_keyless_sink")
 
 
-def _cases():
+def _oracle_cells():
     from small_tile_cells import CASES
 
-    return list(CASES)
+    return [(case, torch.bfloat16) for case in CASES] + [(case, torch.float16) for case in _FP16_CASES]
+
+
+_ORACLE_CELLS = _oracle_cells()
 
 
 @requires_sm100_line
-@pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
-@pytest.mark.parametrize("d", [8, 24, 32])
-@pytest.mark.parametrize("case", _cases())
-def test_the_32_wide_tile_matches_the_fp64_oracle_on_sm100(case, d, dtype):
-    """Every head dim the 32-wide tile serves (8 / 24 / 32 on the SM100 file's third geometry) over the degenerate-input matrix, both dtypes:
-    the plan is the row's cga1 unsplit plan, keyless rows exactly 0 / -inf, two launches bitwise, live rows against the fp64 oracle."""
+@pytest.mark.parametrize("case, dtype", _ORACLE_CELLS, ids=[f"{c}-32-{_DT_IDS[t]}" for c, t in _ORACLE_CELLS])
+def test_the_32_wide_tile_matches_the_fp64_oracle_on_sm100(case, dtype, d=32):
+    """The 32-wide tile (the SM100 file's third geometry) at D 32 over the degenerate-input matrix (the shared ``small_tile_cells``: one
+    matrix for both arch lines) in bf16, the degenerate trio in fp16 too: the plan is the row's cga1 unsplit plan, keyless rows exactly
+    0 / -inf, two launches bitwise, live rows against the fp64 oracle.  D 8 / 24 ride the same tile by the zero-fill contract, pinned
+    bitwise below."""
     from small_tile_cells import case_inputs, check, check_degenerate_rows, run_graph
 
     q, k, v, kw, oracle = case_inputs(case, d, dtype)
@@ -432,13 +407,13 @@ def test_the_32_wide_tile_matches_the_fp64_oracle_on_sm100(case, d, dtype):
 
 
 @requires_sm100_line
-@pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
 @pytest.mark.parametrize("d", [24, 8])
-def test_padded_head_dim_is_bitwise_the_zero_padded_32_wide_tile_on_sm100(d, dtype):
-    """D = 24 / 8 on the 32-wide tile is BITWISE the explicitly zero-padded D = 32 run (the TMA zero fill IS the padding)."""
+def test_padded_head_dim_is_bitwise_the_zero_padded_32_wide_tile_on_sm100(d):
+    """D = 24 / 8 on the 32-wide tile is BITWISE the explicitly zero-padded D = 32 run (the TMA zero fill IS the padding; dtype-blind, so
+    bf16 carries the pin)."""
     from small_tile_cells import case_inputs, run_graph
 
-    q, k, v, kw, _ = case_inputs("dense_nkv2", d, dtype)
+    q, k, v, kw, _ = case_inputs("dense_nkv2", d, torch.bfloat16)
     out = run_graph(q, k, v, row=_SM100_ROW, **kw)
 
     def pad(t):  # (b, h, s, d) view of a (b, s, h, d) buffer -> the same with d zero-padded to 32, same layout

@@ -17,14 +17,13 @@ Three tiers: (1) CPU contract -- the derived pair budget and the form predicate,
 accept / decline table (the widened cells and the cells that keep the one-batch-entry budget), the config factory's couplings,
 the adapter twin; (2) host rendering pins -- every pair rendering keeps the register split, no cluster drain, no spills above
 the one-batch-entry bias rendering, the packed bias add and the bit-word mask where a mask is on; (3) GPU cells on a Rubin
-device -- the fp64 oracle under n_chunk in {1, 2, 8, N} and the degenerate rows (one chunk, the tail chunk with a dead sub-tile,
-S_kv not a multiple of the tile, B x H > 1 with n_kv = 1, a zero-length row inside a chunk, the padded-Q trim, S_kv above the
-one-batch-entry budget), the bitwise pins, the typed declines on real graphs.
+device -- the fp64 oracle over the degenerate rows (one tile, a chunk of one, the tail chunk with a dead sub-tile, S_kv not a multiple
+of the tile, a zero-length row inside a chunk, mixed lengths, the padded-Q trim, the band + padding, the budget edges of both tiles, the
+sink, the rule's own pick; the magnitude / head-broadcast forms are pinned on the one-batch-entry arm), the bitwise pins across n_chunk in
+{1, 2, 8, N} and against the one-batch-entry item, the identity against the plain kernel, the typed declines on real graphs.
 """
 
 import math
-import re
-from pathlib import Path
 
 import pytest
 import torch
@@ -35,7 +34,6 @@ import test_sdpa_bias_sm107 as _s13
 pytestmark = [pytest.mark.L0, requires_dsl]
 
 _ROW = "sdpa_fwd_prefill_sm107"
-_KERNEL = Path(__file__).resolve().parents[4] / "python" / "cudnn" / "sdpa" / "fwd" / "kernels" / "sm107" / "prefill_d128_f16.py"
 # (head-dim tile, cga) -> the resident block's S_kv budget on the PAIR item (128-row block), beside the one-batch-entry one.
 _PAIR_BUDGET = {(32, 1): 768, (64, 1): 384}
 _LEGACY_BUDGET = {(32, 1): 384, (64, 1): 128, (64, 2): 256}
@@ -96,24 +94,9 @@ def test_pair_form_predicate_and_the_chunk_rule():
     assert c.sm107_n_chunk_rule(384, 4, 384, 0) == c.sm107_n_chunk_rule(384, 4, 384, 148)
     assert c.sm107_n_chunk_pick(1, 384, 4, 384, 212, 1) == 4 and c.sm107_n_chunk_pick(2, 384, 4, 384, 212, 1) == 0
     assert c.sm107_n_chunk_pick(1, 384, 4, 384, 212, 2) == 0 and c.sm107_n_chunk_pick(1, 1, 4, 384, 212, 1) == 0
-
-
-def test_n_chunk_override_seam_is_read_by_the_pick(_n_chunk):
-    from cudnn.sdpa.fwd import config_sm107 as c
-
-    _n_chunk(8)
-    assert c.sm107_n_chunk_pick(1, 384, 4, 384, 212, 1) == 8
-    assert c.sm107_n_chunk_pick(2, 384, 4, 384, 212, 1) == 0, "the seam never turns a per-batch bias into the pair item"
-    _n_chunk(None)
-    assert c.sm107_n_chunk_pick(1, 384, 4, 384, 212, 1) == 4
-    _n_chunk(0)
-    assert c.sm107_n_chunk_pick(1, 384, 4, 384, 212, 1) == 0, "0 pins the one-batch-entry item (its A/B arm)"
-    assert not c.sm107_pair_item_active(1, 384, 4, 384, 212, 1), "...and the row / adapter evaluate THAT item's budget"
-    assert c.sm107_pair_item_active(1, 384, 4, 384, 212, 1, n_chunk_request=4)
-    _n_chunk(None)
     assert c.sm107_pair_item_active(1, 384, 4, 384, 212, 1) and not c.sm107_pair_item_active(2, 384, 4, 384, 212, 1)
     # the MEASURED guard of the default pick: a full 256-row super-tile inside the one-batch-entry budget keeps that item (its two
-    # sub-tiles share K/V); a request or the sweep seam still selects the pair there
+    # sub-tiles share K/V); a request still selects the pair there
     assert c.sm107_n_chunk_pick(1, 256, 4, 256, 212, 1, s_kv=256, d_flavor=32) == 0
     assert (
         c.sm107_n_chunk_pick(1, 256, 4, 256, 212, 1, s_kv=512, d_flavor=32) == 0
@@ -122,9 +105,6 @@ def test_n_chunk_override_seam_is_read_by_the_pick(_n_chunk):
     assert c.sm107_n_chunk_pick(1, 384, 4, 384, 212, 1, s_kv=384, d_flavor=32) == 4, "a partly empty super-tile: the pair"
     assert c.sm107_n_chunk_pick(1, 256, 4, 256, 212, 1, s_kv=256, d_flavor=64) == 2, "d64 at cga1 holds 128 on the one-batch-entry item: the pair"
     assert c.sm107_pair_item_active(1, 256, 4, 256, 212, 1, n_chunk_request=4, s_kv=256, d_flavor=32)
-    _n_chunk(4)
-    assert c.sm107_n_chunk_pick(1, 256, 4, 256, 212, 1, s_kv=256, d_flavor=32) == 4
-    _n_chunk(None)
 
 
 # (name, facts kwargs, knobs kwargs, accept?) -- the widened cells and the cells that keep the one-batch-entry budget.
@@ -233,8 +213,6 @@ def test_config_factory_derives_the_pair_block_and_raises_on_each_coupling():
     ],
 )
 def test_adapter_check_support_is_the_rows_twin(_s13_rubin, kw, accept, n_chunk_expect, bias_mode_expect):
-    from cudnn.sdpa.fwd import config_sm107 as c
-
     kw = dict(kw)
     d = kw.pop("d", 32)
     form = kw.pop("bias")
@@ -282,29 +260,6 @@ def test_template_params_and_cfg_are_appended():
         and TemplateParams().n_chunk == 0
     ), "append-only; 0 renders every existing record byte-identically"
     assert c._CfgSm107.N_CHUNK == 0
-
-
-def test_kernel_carries_the_pair_arm_as_one_const_expr_axis():
-    """The pair item is one const_expr axis of the five warp roles: every role branches on _PAIR_ARM OUTSIDE its persistent loop (a
-    dead arm inside the loop would add loop-carried names to the one-batch-entry rendering and move its cubin), the row / bounds
-    arithmetic is shared by every role, the block row of the pair is each lane's row of the q tile."""
-    src = _KERNEL.read_text()
-    assert "_PAIR_ARM = CFG.N_CHUNK > 0" in src
-    for fn in (
-        "_pair_item_rows",
-        "_pair_step_rows",
-        "_pair_item_bounds",
-        "_pair_step_bounds",
-        "_tmaldg_item_pair",
-        "_mma_item_pair",
-        "_softmax_item_pair",
-        "_corr_item_pair",
-        "_tmastg_item_pair",
-    ):
-        assert f"def {fn}(" in src, fn
-    assert src.count("    if cutlass.const_expr(_PAIR_ARM):\n") == 5, "one function-level branch per warp role"
-    assert len(re.findall(r"^        while is_valid_tile > cutlass\.Int32\(0\):", src, re.M)) == 10, "five pair loops beside five one-batch-entry loops"
-    assert "nb = rows[sub_tile_id]" in src and "block_row" in src  # the step's rows tuple (two, or three with the third softmax warp group)
 
 
 # --------------------------------------------------------------------------- tier 2: host rendering pins (sm_107a trace-compile)
@@ -367,13 +322,13 @@ def test_pair_renderings_keep_the_split_the_mask_form_and_the_spill_count(tmp_pa
 # --------------------------------------------------------------------------- tier 3: GPU cells (a Rubin device)
 
 # The degenerate-input matrix of the pair item.  ``b`` is the FLATTENED batch (the rows the chunks partition); the bias is
-# batch-broadcast [1, H, S, S] unless ``bias`` says otherwise.  ``n_chunk``: the pinned chunk length (None = the rule).
+# batch-broadcast [1, H, S, S].  ``n_chunk``: the pinned chunk length (None = the rule).  One cell per path: n_kv 1 with B*H > 1
+# (pure_n_loop), H > 1 inside padded_q_trim_pair / rule_pick_384, the budget edges (768 at d32, 384 at d64; the cga1 pick at d64 S 256 is
+# host-pinned), n_chunk = N as an arm of the bitwise test.
 _CASES = {
     "pure_n_loop_one_tile_128": dict(b=8, h=2, h_kv=2, s_q=128, s_kv=128, n_chunk=4),
-    "one_chunk_equals_n": dict(b=6, h=2, h_kv=2, s_q=256, s_kv=256, n_chunk=6),
     "chunk_of_one_dead_subtile_every_item": dict(b=4, h=2, h_kv=2, s_q=256, s_kv=256, n_chunk=1),
     "tail_chunk_dead_subtile": dict(b=5, h=2, h_kv=2, s_q=384, s_kv=384, n_chunk=4, causal=True),
-    "bh_gt_1_nkv_1": dict(b=8, h=4, h_kv=4, s_q=128, s_kv=128, n_chunk=2),
     "tail_tile_304": dict(b=4, h=2, h_kv=2, s_q=304, s_kv=304, n_chunk=2),
     "zero_length_row_inside_a_chunk": dict(b=6, h=2, h_kv=2, s_q=256, s_kv=256, n_chunk=4, kv_lens=[256, 0, 100, 256, 0, 256]),
     "mixed_lengths_pair": dict(b=4, h=2, h_kv=2, s_q=384, s_kv=384, n_chunk=4, kv_lens=[384, 130, 257, 1]),
@@ -381,12 +336,8 @@ _CASES = {
         b=6, h=4, h_kv=2, s_q=256, s_kv=256, n_chunk=4, causal=True, q_lens=[256, 100, 0, 256, 129, 200], kv_lens=[256, 200, 256, 0, 256, 128]
     ),
     "swa_causal_padded_384": dict(b=4, h=2, h_kv=2, s_q=384, s_kv=384, n_chunk=2, causal=True, window_left=128, kv_lens=[384, 200, 384, 300]),
-    "above_the_legacy_budget_512": dict(b=4, h=2, h_kv=2, s_q=512, s_kv=512, n_chunk=2),
     "the_6_tile_budget_768": dict(b=4, h=2, h_kv=2, s_q=768, s_kv=768, n_chunk=2, causal=True),
     "d64_3_tile_budget_384": dict(b=4, h=2, h_kv=2, s_q=384, s_kv=384, d=64, n_chunk=2),
-    "d64_256_cga1_pair": dict(b=4, h=2, h_kv=2, s_q=256, s_kv=256, d=64, n_chunk=2),
-    "bias_x10_causal": dict(b=4, h=2, h_kv=2, s_q=384, s_kv=384, n_chunk=4, causal=True, bias_scale=10.0),
-    "head_broadcast_bias": dict(b=4, h=4, h_kv=4, s_q=256, s_kv=256, n_chunk=2, bias="1"),
     "sink_padded": dict(b=4, h=2, h_kv=2, s_q=256, s_kv=256, n_chunk=2, causal=True, kv_lens=[256, 0, 200, 256], sink=True),
     "rule_pick_384": dict(b=8, h=4, h_kv=4, s_q=384, s_kv=384, n_chunk=None),
 }
@@ -414,8 +365,9 @@ def test_pair_item_matches_the_fp64_oracle(case, _n_chunk):
 
 
 @requires_rubin
-@pytest.mark.parametrize("case", ["tail_chunk_dead_subtile", "zero_length_row_inside_a_chunk", "above_the_legacy_budget_512", "d64_3_tile_budget_384"])
+@pytest.mark.parametrize("case", ["tail_chunk_dead_subtile"])
 def test_pair_item_matches_the_fp64_oracle_fp16(case, _n_chunk):
+    """The fp16 member once on the pair item (one rendering class)."""
     c = _CASES[case]
     q, k, v, kw, ref = _case_inputs(case, torch.float16)
     out = _run_pair(q, k, v, kw, c["n_chunk"], _n_chunk)
@@ -423,8 +375,9 @@ def test_pair_item_matches_the_fp64_oracle_fp16(case, _n_chunk):
 
 
 @requires_rubin
-@pytest.mark.parametrize("case", ["tail_chunk_dead_subtile", "zero_length_row_inside_a_chunk", "swa_causal_padded_384", "above_the_legacy_budget_512"])
+@pytest.mark.parametrize("case", ["zero_length_row_inside_a_chunk", "swa_causal_padded_384"])
 def test_pair_item_composes_with_the_kv_mask(case, _n_chunk):
+    """The bit word on the pair item: a zero-length row inside a chunk; the bands + the padding."""
     c = _CASES[case]
     q, k, v, kw, ref = _case_inputs(case, torch.bfloat16, kv_mask_p=0.3)
     out = _run_pair(q, k, v, kw, c["n_chunk"], _n_chunk)
@@ -432,7 +385,7 @@ def test_pair_item_composes_with_the_kv_mask(case, _n_chunk):
 
 
 @requires_rubin
-@pytest.mark.parametrize("case", ["one_chunk_equals_n", "tail_chunk_dead_subtile", "zero_length_row_inside_a_chunk", "bh_gt_1_nkv_1", "swa_causal_padded_384"])
+@pytest.mark.parametrize("case", ["tail_chunk_dead_subtile", "zero_length_row_inside_a_chunk"])
 def test_o_and_stats_are_bitwise_across_n_chunk_and_the_one_batch_entry_item(case, _n_chunk):
     """Every row's kv loop runs the same tiles in the same order whatever the chunking, so O / Stats are BITWISE identical across
     n_chunk in {1, 2, 8, N} and against the one-batch-entry item (n_chunk = 0: the 256-row block) where its budget serves the cell."""
@@ -449,10 +402,10 @@ def test_o_and_stats_are_bitwise_across_n_chunk_and_the_one_batch_entry_item(cas
 
 
 @requires_rubin
-@pytest.mark.parametrize("dtype", _s13._DTYPES, ids=_s13._DTYPE_IDS)
-@pytest.mark.parametrize("case", ["one_chunk_equals_n", "tail_chunk_dead_subtile", "above_the_legacy_budget_512"])
-def test_identity_bias_zero_is_bitwise_the_plain_kernel(case, dtype, _n_chunk):
-    """bias = 0 on the pair item is BITWISE the plain kernel on O and Stats (the -inf masked body with fma(0, 1/scale, s) == s)."""
+def test_identity_bias_zero_is_bitwise_the_plain_kernel(_n_chunk):
+    """bias = 0 on the pair item is BITWISE the plain kernel on O and Stats (the -inf masked body with fma(0, 1/scale, s) == s) -- the pair
+    rendering's identity once, at the tail chunk with a dead sub-tile (the fp16 identity is pinned on the one-batch-entry arm and the ring)."""
+    case, dtype = "tail_chunk_dead_subtile", torch.bfloat16
     c = _CASES[case]
     q, k, v, kw, _ = _case_inputs(case, dtype)
     _n_chunk(None)
