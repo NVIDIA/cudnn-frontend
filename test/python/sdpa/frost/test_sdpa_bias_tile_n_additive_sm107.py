@@ -1304,3 +1304,52 @@ def test_dead_subtile_quiet_cells_are_bitwise_the_full_body_and_match_the_fp64_o
     _check(out0, ref)
     assert torch.equal(out1["o"], out0["o"]), f"{case}: the quiet body changed a stored O row"
     assert torch.equal(out1["stats"], out0["stats"]), f"{case}: the quiet body changed a stored Stats row"
+
+
+# The per-batch Q TRIM under the quiet body, knob-less (the Rubin twin of the SM100 line's detector, test_sdpa_bias_sm100.py).  Under
+# bottom-right causal -- the one form under which the per-batch Q length reaches the softmax's dead-sub-tile decision -- the rows in
+# [seq_len_q[b], S_q) of a dead sub-tile ARE stored, and the trim must write them as EXACT zeros through a SELECT after the scale (this
+# file's epilogue selects ``_kv_empty | row_trim``; a zero folded into ``inv_sum`` would be ``NaN x 0 = NaN`` wherever the quiet sub-tile's
+# BMM2 read a NaN residue out of the S slot).  On this line the quiet body is the PLAIN padded body's default (the kv_mask + padded
+# 128-wide plan keeps the full body: ``SM107_DEAD_SUBTILE_QUIET_DEFAULT_KV_MASK_PADDED_WIDE``), so the cell is the plain body at the
+# heuristics' own width and pick: D 32, S_q = S_kv = 640, per-batch Q = KV lengths [640, 300] -- item 1 (rows 256..511) keeps sub-tile 0
+# live and sub-tile 1 (rows 384..511) dead AND stored; item 2 collapses.
+_TRIM_CASE = dict(b=2, h=2, s=640, q_lens=[640, 300], kv_lens=[640, 300])
+_TRIM_DEAD_ROWS = (1, 384, 512)  # (batch, lo, hi): the quiet sub-tile's STORED rows
+
+
+@requires_rubin
+def test_quiet_body_under_per_batch_q_lengths_stores_zero_on_trimmed_rows_sm107(monkeypatch):
+    """The knob-less plan takes the quiet body (the spy on the pick reads 1 for the executed width) and the quiet sub-tile's stored rows
+    read finite, exactly +0 / -inf; every trimmed row 0 / -inf; the whole tensor against the fp64 oracle; two launches bitwise --
+    asserted in that order, so a residue would be reported as what it is."""
+    from cudnn.sdpa.fwd import api_dsl
+
+    calls = []
+    real = api_dsl._sm107_dead_subtile_quiet_pick
+
+    def spy(*a, **kw):
+        r = real(*a, **kw)
+        calls.append((int(kw.get("tile_n", 128)), int(r)))
+        return r
+
+    monkeypatch.setattr(api_dsl, "_sm107_dead_subtile_quiet_pick", spy)
+    c = _TRIM_CASE
+    torch.manual_seed(0)
+    b, h, s, d = c["b"], c["h"], c["s"], 32
+    q, k, v = (_bhsd(b, h, s, d, torch.bfloat16) for _ in range(3))
+    q_lens = torch.tensor(c["q_lens"], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
+    kv_lens = torch.tensor(c["kv_lens"], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
+    scale = 1.0 / math.sqrt(d)
+    out = _run2(q, k, v, scale=scale, sdpa_kwargs=dict(use_causal_mask_bottom_right=True), seq_len_kv=kv_lens, seq_len_q=q_lens, two_launch_assert=False)
+    assert any(r == 1 and t == out["executed_tile_n"] for t, r in calls), f"the knob-less plan did not take the quiet body: {calls}"
+    o, st = out["o"], out["stats"].squeeze(-1)
+    bb, lo, hi = _TRIM_DEAD_ROWS
+    rows = o[bb, :, lo:hi, :]
+    n_bad = int((~torch.isfinite(rows)).sum())
+    assert n_bad == 0, f"{n_bad} non-finite elements in the quiet sub-tile's stored rows O[{bb}, :, {lo}:{hi}] (a residue reached the store)"
+    assert bool((rows.view(torch.int16) == 0).all()), f"the quiet sub-tile's stored rows O[{bb}, :, {lo}:{hi}] are not exactly +0"
+    q_len = c["q_lens"][bb]
+    assert bool((o[bb, :, q_len:, :].view(torch.int16) == 0).all()) and bool(torch.isneginf(st[bb, :, q_len:]).all()), "the trimmed rows: O = +0, Stats = -inf"
+    _check(out, _ref(q, k, v, scale=scale, causal=True, bottom_right=True, seq_q_lens=q_lens, seq_kv_lens=kv_lens))
+    assert torch.equal(out["o"], out["o_first"]) and torch.equal(out["stats"], out["stats_first"]), "two-launch delta on O / Stats"

@@ -606,6 +606,7 @@ def test_k1_matches_the_fp64_oracle(n_res, batch, c_z, c, mask_kind, with_bias):
 _SASS_SPILL_PINS = {
     ("k1", 128, "registers", "packed_biasfold"): dict(STL=0, LDL=0),
     ("k1", 256, "smem_rolled_pf", "packed"): dict(STL=0, LDL=0),
+    ("k3", 128, "registers", "packed"): dict(STL=1, LDL=1),  # the K3 c 128 transpose rendering: 1 / 1 at STACK 8, measured like the rows above
     ("k3", 256, "smem_rolled_pf", "packed"): dict(STL=0, LDL=0),
 }
 _SASS_COUNTS = {**sass_utils.SASS_OPCODE_COUNTS, "USETMAXREG": ("USETMAXREG",), "FADD2": (" FADD2",), "FFMA2": (" FFMA2",), "CGAERRBAR": ("CGAERRBAR",)}
@@ -730,6 +731,7 @@ _SASS_SPLIT_HINT_PINS = {
     ("k1", 128, "registers", "packed", False, 1, "major"): dict(STL=0, LDL=0, USETMAXREG=6),
     ("k1", 128, "smem_rolled", "packed", False, 1, "major"): dict(STL=0, LDL=0, USETMAXREG=6),
     ("k1", 128, "registers", "packed_biasfold", True, 1, "major"): dict(STL=0, LDL=0, USETMAXREG=6),
+    ("k1", 128, "registers", "packed", False, 0, "interleaved"): dict(STL=1, LDL=1, USETMAXREG=0),  # the floor rendering: 1 / 1 at STACK 8 unhinted
 }
 
 

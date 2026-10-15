@@ -1069,10 +1069,15 @@ def test_prefix_lengths_kernel_declines_a_too_old_dsl_typed(monkeypatch):
 
 @requires_rubin
 def test_return_aux_is_a_typed_decline_quoting_the_engine():
-    """The row max is a side output the engine row's bias arm does not store: return_aux=True is declined with the ENGINE's reason."""
+    """The row max is a side output the engine row's bias arm does not store: return_aux=True is declined with the ENGINE's reason; so is
+    a head dim the bias arm is not wired on (D 128 with a bias: the row names its d32 / d64 flavors) through the drop-in function."""
     q, k, v, bias, gen = _inputs(128, 32, seed=20)
     with pytest.raises(NotImplementedError, match="score side outputs") as info:
         tapi.triangle_attention(q, k, v, bias, return_aux=True)
+    assert tapi.ENGINE_ROW in str(info.value)
+    q128, k128, v128, bias128, _ = _inputs(128, 128, seed=20)
+    with pytest.raises(NotImplementedError, match="d32, d64") as info:
+        tapi.triangle_attention(q128, k128, v128, bias128)
     assert tapi.ENGINE_ROW in str(info.value)
 
 

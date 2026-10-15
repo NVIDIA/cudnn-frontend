@@ -571,7 +571,7 @@ _CASES = {
     "nkv8_S1024_b8_2_stages": dict(b=8, h=2, h_kv=2, s_q=1024, s_kv=1024, n_chunk=4, mode=3, stages=2),
     "nkv16_S2048_b6_causal_n2": dict(b=6, h=2, h_kv=2, s_q=2048, s_kv=2048, n_chunk=2, mode=3, causal=True),
     "d64_nkv8_S1024_b8": dict(b=8, h=2, h_kv=2, s_q=1024, s_kv=1024, d=64, n_chunk=4, mode=3),  # D 64 is request-only for this form: one cell
-    "pick_n_chunk_S896_b8": dict(b=8, h=2, h_kv=2, s_q=896, s_kv=896, mode=3),  # the heuristics' chunk pick (the pair at S_q % 256 != 0), the seam's form
+    "pick_n_chunk_S896_b8": dict(b=8, h=2, h_kv=2, s_q=896, s_kv=896),  # KNOB-LESS: the heuristics' chunk pick AND the pick's form (multicast)
 }
 # one oracle cell per handshake class; the rows left out run under the bitwise / compose pins below
 _ORACLE_CASES = [c for c in _CASES if c not in ("nkv4_S512_b8_even", "nkv8_S1024_b12_odd_padded_peer", "nkv8_S1024_b8_2_stages")]
@@ -582,6 +582,7 @@ _BITWISE_RING_CASES = [
     "nkv8_S1024_b6_short_live_peer",
     "nkv8_S1024_b10_short_tail_and_padded",
     "nkv8_S1024_b8_2_stages",
+    "pick_n_chunk_S896_b8",
 ]
 
 
@@ -626,6 +627,15 @@ def _spy_adapter_modes(monkeypatch):
     return modes
 
 
+def _run_knob_less_multicast(q, k, v, kw, c, _pins, monkeypatch):
+    """The knob-less chain end to end (every seam off): the pick -> the adapter's record -> the plan; the record must read the multicast form."""
+    assert c.get("mode") is None and c.get("n_chunk") is None, "a knob-less cell carries no seam pin"
+    modes = _spy_adapter_modes(monkeypatch)
+    out = _run(q, k, v, kw, c, _pins)
+    assert modes and {m for m, *_ in modes} == {_MCAST}, ("the knob-less plan did not take the multicast ring", modes)
+    return out
+
+
 @requires_rubin
 @pytest.mark.parametrize("case", _ORACLE_CASES)
 def test_multicast_ring_matches_the_fp64_oracle(case, _pins, monkeypatch):
@@ -633,7 +643,7 @@ def test_multicast_ring_matches_the_fp64_oracle(case, _pins, monkeypatch):
     launches bitwise; every cell runs the pair item at cga1 (the seam pins the form; the knob-less cell takes it from the pick)."""
     c = _CASES[case]
     q, k, v, kw, ref = _case_inputs(case, torch.bfloat16)
-    out = _run(q, k, v, kw, c, _pins)
+    out = _run_knob_less_multicast(q, k, v, kw, c, _pins, monkeypatch) if c.get("mode") is None else _run(q, k, v, kw, c, _pins)
     assert out["knobs"].cga == 1, (case, out["knobs"])
     _s13._check(out, ref)
 
@@ -666,7 +676,7 @@ def test_multicast_is_bitwise_the_cga1_ring(case, _pins, monkeypatch):
     request on this form, and the KNOB-LESS pick (the multicast form read off the compiled record, the cga1 twin through the seam)."""
     c = _CASES[case]
     q, k, v, kw, ref = _case_inputs(case, torch.bfloat16)
-    mcast = _run(q, k, v, kw, c, _pins, mode=_MCAST)
+    mcast = _run_knob_less_multicast(q, k, v, kw, c, _pins, monkeypatch) if c.get("mode") is None else _run(q, k, v, kw, c, _pins, mode=_MCAST)
     _s13._check(mcast, ref)
     ring = _run(q, k, v, kw, c, _pins, mode=2)
     assert torch.equal(mcast["o"], ring["o"]) and torch.equal(mcast["stats"], ring["stats"]), f"{case}: the multicast ring differs from the cga1 ring"

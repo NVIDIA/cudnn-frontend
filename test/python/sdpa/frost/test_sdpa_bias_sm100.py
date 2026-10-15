@@ -129,6 +129,12 @@ def test_kernel_module_constants_and_the_not_yet_wired_backstops(_sm100_device_f
     t64 = _mod(bias_mode=1, tile_n=64)
     assert t64.CFG.TILE_N == 64 and t64.CFG.N_BMM2_CHUNKS == 1 and t64._BIAS_GG.boxes_per_tile == 1 and t64.BIAS_PRELOAD_CHUNKS == 1
     assert t64.CFG.BIAS_RESIDENT_TILES == 5  # the 32-wide tile holds 5 x 64 = 320 kv columns resident at the 64-wide KV tile
+    # The fix pin: ``_d64_decode_tile`` refuses the 128-row decode tile with a bias / kv_mask bound (the tile carries neither arm; a kv_mask-only
+    # d64 graph at S_q 128 used to lower onto it and fail at build on cc 10.0): the adapter at d64, S_q 128 takes the decode tile plain and stays
+    # on the prefill tile with either operand.
+    for operands, decode in ((dict(), True), (dict(kv_mask=(2, 1, 1, 128)), False), (dict(bias=(1, 4, 128, 128)), False)):
+        api = _api(d=64, s_q=128, s_kv=128, **operands)
+        assert api.check_support() is True and api._d64_decode_tile() is decode, (operands, api.template_params())
 
 
 # --------------------------------------------------------------------------- tier 2: the adapter's check_support twin (host, a modelled cc 10.0 device)
@@ -754,6 +760,59 @@ def test_quiet_dead_sub_tile_on_the_inf_body_matches_the_oracle_and_the_full_bod
     assert full["knobs"].tile_n == quiet["knobs"].tile_n == tile_n, (case, full["knobs"], quiet["knobs"])
     _t7._check(quiet, ref)
     assert torch.equal(quiet["o"], full["o"]) and torch.equal(quiet["stats"], full["stats"]), (case, tile_n, with_mask)
+
+
+# The per-batch Q TRIM under the quiet body (the line's knob-less default on every -inf body).  Under bottom-right causal -- the one form under
+# which the per-batch length reaches the softmax's dead-sub-tile decision (``_resolve_seqlen_q`` folds to S_q otherwise) -- the rows in
+# [seq_len_q[b], S_q) of a dead sub-tile ARE stored, and the trim must write them as EXACT zeros through a SELECT after the scale: a zero folded
+# into ``inv_sum`` is ``NaN x 0 = NaN`` wherever the quiet sub-tile's BMM2 read a NaN residue out of the S slot (the quiet body arrives
+# ``mb_bmm2_ready`` without writing P).  The route a caller takes there: a bottom-right graph with the kv_mask word (a bias is not a graph under
+# bottom-right), per-batch Q = KV lengths, D 32, S_q 640 (640 % 256 = 128: the pick admits the quiet body) at the 64-wide KV tile through the
+# public TILE_N record (the knob-less padded kv_mask width is 128, where the pick keeps the full body); batch 1 ends at 300, so item 1 (rows
+# 256..511) keeps sub-tile 0 live and sub-tile 1 (rows 384..511) dead AND stored.
+_TRIM_CASES = {
+    "mask_br_640_q300": dict(b=2, h=2, h_kv=2, s_q=640, s_kv=640, bottom_right=True, q_lens=[640, 300], kv_lens=[640, 300]),
+}
+_TRIM_DEAD_ROWS = (1, 384, 512)  # (batch, lo, hi): the quiet sub-tile's STORED rows
+
+
+@requires_sm100_line
+@pytest.mark.xfail(strict=True, reason="N1: the quiet body's residue reaches the stored trimmed rows (NaN x 0) until the select-after-the-scale fix lands")
+def test_quiet_body_under_per_batch_q_lengths_stores_zero_on_trimmed_rows(monkeypatch):
+    """RED on the tree whose trim folds its zero into the scale, GREEN with the select after it.  Asserted most specific first -- the quiet
+    sub-tile's stored rows finite and exactly +0, every trimmed row 0 / -inf, the whole tensor against the fp64 oracle, two launches bitwise --
+    so a NaN residue is reported as what it is; the plan is the row's unsplit plan at the 64-wide tile and the pick's answer for it is the
+    quiet body (the spy on the pick)."""
+    from cudnn.sdpa.fwd import api_dsl
+
+    calls = []
+    real = api_dsl._sm100_dead_subtile_quiet_pick
+
+    def spy(*a, **kw):
+        r = real(*a, **kw)
+        calls.append((int(kw.get("tile_n", 128)), int(r)))
+        return r
+
+    monkeypatch.setattr(api_dsl, "_sm100_dead_subtile_quiet_pick", spy)
+    case = "mask_br_640_q300"
+    c = _TRIM_CASES[case]
+    q, k, v, kw, _ = _t7._case_inputs(case, torch.bfloat16, kv_mask_p=0.3, table=_TRIM_CASES)
+    kw["bias"] = None  # bottom-right causal + a bias is not a graph: the kv_mask word alone carries the -inf body
+    kw.pop("cga", None)
+    ref = _t7._ref_of(c, q, k, v, kw)
+    out = _run(q, k, v, tile_n=64, two_launch_assert=False, **kw)
+    assert out["knobs"].tile_n == 64 and out["knobs"].cga == 1, out["knobs"]
+    assert (64, 1) in calls, f"the plan did not take the quiet body: {calls}"
+    o, st = out["o"], out["stats"].squeeze(-1)
+    b, lo, hi = _TRIM_DEAD_ROWS
+    rows = o[b, :, lo:hi, :]
+    n_bad = int((~torch.isfinite(rows)).sum())
+    assert n_bad == 0, f"{n_bad} non-finite elements in the quiet sub-tile's stored rows O[{b}, :, {lo}:{hi}] (a residue reached the store)"
+    assert bool((rows.view(torch.int16) == 0).all()), f"the quiet sub-tile's stored rows O[{b}, :, {lo}:{hi}] are not exactly +0"
+    q_len = c["q_lens"][b]
+    assert bool((o[b, :, q_len:, :].view(torch.int16) == 0).all()) and bool(torch.isneginf(st[b, :, q_len:]).all()), "the trimmed rows: O = +0, Stats = -inf"
+    _t7._check(out, ref)
+    assert torch.equal(out["o"], out["o_first"]) and torch.equal(out["stats"], out["stats_first"]), "two-launch delta on O / Stats"
 
 
 @requires_sm100_line

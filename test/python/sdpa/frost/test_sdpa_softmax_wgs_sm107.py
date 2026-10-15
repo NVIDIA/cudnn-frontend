@@ -330,10 +330,11 @@ _CASES = {
 }
 # The DEFAULT class, KNOB-LESS (no seam, no knob: the pick -> the record -> the plan): bias + the bool kv_mask on the pair item (a batch-broadcast
 # bias on >= 2 flattened rows), dense KV lengths, ``s_kv >= 640`` with ``b_flat <= 3072`` -- the 32-wide tile at S 1024 (above the three-slab
-# resident budget: the ring).  The record read off the loaded module must
+# resident budget: the ring) and the 64-wide tile at S 768 (no cell ran the d64 default before).  The record read off the loaded module must
 # carry ``softmax_wgs`` 3 at TILE_N 64 on the pair item; the two-group twin is the seam's.
 _KNOB_LESS_CASES = {
     "streamed_ring_1024_chunk6": dict(b=6, h=2, h_kv=2, s_q=1024, s_kv=1024),
+    "d64_pair_both_768_dense": dict(b=6, h=2, h_kv=2, s_q=768, s_kv=768, d=64),
 }
 
 
@@ -417,7 +418,7 @@ def test_three_groups_match_the_fp64_oracle_and_are_bitwise_the_two_group_kernel
 
 
 @requires_rubin
-@pytest.mark.parametrize("case", ["nkv8_two_wraps_chunk3", "streamed_ring_1024_chunk6"])
+@pytest.mark.parametrize("case", ["nkv8_two_wraps_chunk3", "streamed_ring_1024_chunk6", "d64_pair_both_768_dense"])
 def test_three_groups_compose_with_the_kv_mask(case, _pins, monkeypatch):
     """The bit word under three groups: the option on the ring wrap (the seam's 3 against the seam's 2), and the DEFAULT class knob-less on both
     tiles -- the plan takes the pair item at TILE_N 64 with ``softmax_wgs`` 3 by the pick alone (read off the loaded record), matches the fp64

@@ -493,6 +493,23 @@ def test_kernel_module_constants_and_mask_sites(monkeypatch):
     assert "_E2E_ENABLED = bool(PARAMS.exp2_fma_split) or EXP2_FMA_SPLIT" in src
     sites = [ln for ln in src.splitlines() if "cute.math.exp2(chunk_S_" in ln]
     assert len(sites) == 4 and all("exp2_mixed(" in ln and "if _E2E_ENABLED else" in ln for ln in sites), sites
+    # The fix pin: ``make_classic_bars`` reads ``CFG.BIAS_EMPTY_ARRIVERS`` only when a bias form asks for it.  The shared SM100 bodies
+    # (the d128 decode tile, the SM100 prefill files) build their bars through the same factory with Cfg records that carried no bias
+    # fields, and the factory raised AttributeError at plan build while deriving the ring's release count.  The record under test is the
+    # d128 decode Cfg with every BIAS_* field removed; the SMEM allocations exist only inside a kernel, so the allocator is stubbed and
+    # the factory's own arithmetic runs on the host: no raise, the four bias rows None -- and the field IS read when a ring is asked for.
+    from cudnn.sdpa.fwd import config_sm100 as cfg100
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+    from cudnn.sdpa.fwd.kernels import _common_blackwell as cb
+
+    decode, _ = cfg100.make_cfg_d128_decode(TemplateParams(dtype_qkv=2, cta_mma=1))
+    bias_less = SimpleNamespace(**{f.name: getattr(decode, f.name) for f in dataclasses.fields(decode) if not f.name.startswith("BIAS_")})
+    assert not hasattr(bias_less, "BIAS_EMPTY_ARRIVERS")
+    monkeypatch.setattr(cb.cutlass, "Array", lambda *a, **k: ("smem", a[1]))
+    bars = cb.make_classic_bars(bias_less, s_stages=2)
+    assert all(getattr(bars, n) is None for n in ("mb_bias_full", "mb_bias_empty", "mb_bias_ring_full", "mb_bias_ring_empty")), bars
+    with pytest.raises(AttributeError):
+        cb.make_classic_bars(bias_less, bias_ring_stages=2)
 
 
 # --------------------------------------------------------------------------- tier 2: host rendering pins (sm_107a trace-compile)
