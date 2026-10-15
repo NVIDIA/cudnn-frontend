@@ -305,19 +305,23 @@ class SdpaThdBinder {
             if (geometry[0] <= 0 || geometry[1] <= 0 || geometry[2] <= 0 || geometry[3] <= 0 || geometry[4] != 1)
                 invalid("invalid native THD operand declaration");
         }
-        // The kernel's epilogue gate (O := O * sigmoid(G)) on a THD plan: the f16/bf16 d256 prefill is the only THD
-        // body with the gate seams, and it maps G through the same packed [1, T, H, D] form as Q / O.  G is a PER-CALL
-        // operand outside the fixed role pack (the gate's pack index arrives as its own argument, -1 = no gate), bound
-        // like Q / O: declared (token, head, elem) strides, Q's dtype, a 16-byte-aligned base, and a capacity that
-        // covers every packed Q token.  The dense binder's gate block is the twin.
+        // The kernel's epilogue gate (O := O * sigmoid(G)) on a THD plan: the f16/bf16 d256 prefills -- the Rubin
+        // sibling over dense K/V and the shared SM100 body over PAGED pools (the serving EXTEND form, with or without
+        // PackGQA) -- are the THD bodies with the gate seams, and both map G through the same packed [1, T, H, D] form
+        // as Q / O.  G is a PER-CALL operand outside the fixed role pack (the gate's pack index arrives as its own
+        // argument, -1 = no gate), bound like Q / O: declared (token, head, elem) strides, Q's dtype, a 16-byte-aligned
+        // base, and a capacity that covers every packed Q token.  A split keeps refusing the gate (the partials bypass
+        // the gated epilogue). The dense binder's gate block is the twin.
         has_gate_ = py::hasattr(spec, "gate_expect") && !spec.attr("gate_expect").is_none();
         if (has_gate_) {
             const auto dtype   = py::cast<std::string>(spec.attr("gate_expect"));
             const int64_t g_dq = integer(spec, "d_qk"), g_dv = integer(spec, "d_v");
             if ((dtype != "float16" && dtype != "bfloat16") || dtype != py::cast<std::string>(expect["q"]) ||
-                quantized_ || paged_ || splits_ != 1 || g_dq != 256 || g_dv != 256)
+                quantized_ || splits_ != 1 || g_dq != 256 || g_dv != 256)
                 invalid(
-                    "native THD epilogue gate requires a nonpaged, unsplit half D256 plan with the gate in Q's dtype");
+                    "native THD epilogue gate requires an unsplit half D256 plan (dense K/V or paged pools) with the "
+                    "gate "
+                    "in Q's dtype");
             gate_code_ = dtype == "float16" ? kDLFloat : kDLBfloat;
             if (!decl.contains("gate")) invalid("native THD epilogue gate plan declares no gate geometry");
             gate_decl_ = py::cast<std::array<int64_t, 6>>(decl["gate"]);
@@ -877,6 +881,10 @@ init_sdpa_thd_binding(py::module_ &m) {
         // this property and declines typed on an older extension instead of launching a gated kernel with a null gate
         // pointer.
         .def_prop_ro_static("supports_epilogue_gate", [](py::object) { return true; })
+        // The gate over PAGED pools (the shared SM100 d256 body compiled for cc 10.7, the serving EXTEND form): the
+        // adapter's paged x gate admission reads this property and declines typed on an older extension, whose
+        // constructor above refused a gated paged plan.
+        .def_prop_ro_static("supports_paged_epilogue_gate", [](py::object) { return true; })
         .def("bind",
              &SdpaThdBinder::bind,
              py::arg("pack"),

@@ -129,14 +129,6 @@ _PROFILES = {
         coefficients=CostFeatures(3.716719, 1.445248, 0.127218, 0.092622, 0.080023, 0.145638, 0.148422, 4.498155, 0.0, 0.568267, 6.559288),
         extra_geometries=_SM100_EXTRA_GEOMETRIES,
     ),
-    # sm120 (RTX PRO 6000 Blackwell Server Edition). Coefficients fitted by
-    # non-negative least squares on the weekly exhaustive sweep's measured
-    # kernel times (every eligible config built and timed per layer), rows
-    # weighted by the layer's best time so small and large layers count
-    # equally; selection validated by replaying the full candidate ranking
-    # against the same measurements. The fp16 and block-scale fp4 entries
-    # carry a wider switch margin: at the default margin the model overrides
-    # baselines it cannot beat on this part.
     (120, "sm120", "fp32", 16, 16, 16, False): CostProfile(
         name="rtx_pro_6000_f16",
         b_n_major_ok=True,
@@ -177,6 +169,20 @@ _PROFILES = {
             "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps2x4",
         ),
         switch_margin=0.15,
+    ),
+    (120, "sm120", "fp32", 8, 8, 16, True): CostProfile(
+        name="rtx_pro_6000_block_f8",
+        b_n_major_ok=True,
+        scalar_scale_epilogue_ok=True,
+        device_name="NVIDIA RTX PRO 6000 Blackwell Server Edition",
+        coefficients=CostFeatures(
+            0.000000, 0.035038, 0.137006, 0.817486, 0.000000, 0.277948, 0.694882, 2.379944, 0.000000, 2.737760, 4.149503, 6.818484, 0.000000
+        ),
+        extra_geometries=(
+            "CONFIG_sm120_64x64x128_16x16x32_cluster1x1_warps4x2",
+            "CONFIG_sm120_64x128x128_16x16x32_cluster1x1_warps2x4",
+        ),
+        switch_margin=0.12,
     ),
 }
 
@@ -302,6 +308,7 @@ def candidate_configs(chain: FusionChain, baseline: TileConfig, device: DevicePr
             # Strict-gate graphs (B k-major) always swap to a k-major A, so
             # existing architectures never take this branch.
             continue
+        family = {"_pipeline": "sm120", "_batch": mm.batch} if baseline.pipeline == "sm120" else {}
         auto = (
             select_config(
                 mm.M,
@@ -312,6 +319,7 @@ def candidate_configs(chain: FusionChain, baseline: TileConfig, device: DevicePr
                 b_n_major=mm.b_major == "n",
                 b_elem_bytes=max(1, DTYPE_BITS[mm.b_dtype] // 8),
                 sm_count=device.sm_count,
+                **family,
             )
             if swapped
             else replace(baseline, split_k_slices=1)
@@ -410,6 +418,8 @@ def select_strategies(
 
     best = next(((cost, config) for cost, config in ranked if accepted(config)), None)
     if best is None:
+        if baseline.pipeline == "sm120":
+            probe(chain, baseline)
         raise NotImplementedError("frost_gemm: no supported joint strategy candidate")
     best_cost, _ = best
     baseline_cost = next(cost for cost, config in ranked if config == baseline)

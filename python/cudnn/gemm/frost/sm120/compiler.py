@@ -748,18 +748,21 @@ _EPI_CHUNK_ELEMS_BY_PIPELINE = {
 # (row quant: thread-local amax over the chunk) and a warp to own 32 consecutive
 # rows of the same columns (col quant: warp redux) -- the sm100 TMEM-drain view
 # the quant emitters are written for. The transposed-STG drain gives a lane an
-# 8-column run instead, so quant chains on the MoE templates take their
-# ROW-PER-LANE drain (selected by the `row_per_lane_drain` tile constant): the
-# staging buffer is re-read row-major so lane l owns row l of a 32-row slab and
-# a run of up to 32 columns, and the chunk may grow to the quant block.
+# 8-column run instead, so quant chains on the MoE templates and on the plain
+# dense template take their ROW-PER-LANE drain (selected by the
+# `row_per_lane_drain` tile constant): the staging buffer is re-read row-major so
+# lane l owns row l of a 32-row slab and a run of up to 32 columns, and the
+# chunk may grow to the quant block.
 _ROW_PER_LANE_CHUNK_ELEMS = 32
 
 
 def _row_per_lane_drain(chain: FusionChain, config: TileConfig) -> bool:
     """Whether this (chain, config) renders the row-per-lane drain: block-scale
-    quantize chains on the four sm120 MoE templates (dense and block-scaled,
-    plain and swap-AB), the templates that carry the drain."""
-    return config.pipeline == "sm120" and bool(chain.quants) and chain.has_moe
+    quantize chains on the templates that carry the drain -- the four sm120 MoE
+    templates (dense and block-scaled, plain and swap-AB) and the plain dense
+    ``sm120_matmul.py``. The dense block-scale template has no such drain (its
+    precheck declines a quant epilogue)."""
+    return config.pipeline == "sm120" and bool(chain.quants) and (chain.has_moe or not chain.has_block_scale)
 
 
 def _row_per_lane_bounded_rows(chain: FusionChain, config: TileConfig) -> bool:
@@ -771,14 +774,61 @@ def _row_per_lane_bounded_rows(chain: FusionChain, config: TileConfig) -> bool:
     away from that (half-)warp redux on ``row < group_end``: the stores, scale
     bytes, reduction atomics and row-dependent aux loads carry the bound
     instead. A first_token_offset that breaks the col-quant alignment contract
-    then yields wrong values rather than a hung redux. Swap-AB rows are bounded
-    by M, which a col block never straddles (``M % block_size == 0`` is gated)."""
+    then yields wrong values rather than a hung redux. The plain dense kernel's
+    rows are bounded by M, a runtime extent of the compiled kernel that the
+    build gate (``M % block_size == 0``) checks only at the declared shape, so
+    its col quant takes the same unconditional guard (the plan's call path
+    re-runs the gate at the call's extents, :func:`_check_runtime_quant`).
+    Swap-AB rows are bounded by M, which a col block never straddles
+    (``M % block_size == 0`` is gated)."""
     return _row_per_lane_drain(chain, config) and not isinstance(chain.moe, MoeSwapAbSpec) and any(q.axis == 1 for q in chain.quants)
 
 
+# The templates whose lane-run (transposed-STG) drain the codegen's per-row /
+# per-col reduction folds (epilogue_codegen ``generate(lane_run_tile=...)``) are
+# validated on, and the drain lines the folds are written against: the trace-time
+# ``mf`` / ``grp`` / ``half`` / ``sv`` loops, the lane -> (row, column run) map, the
+# 4-fragment column group, and the converged post-drain flush call. A template
+# not listed, or whose source lacks any of the lines, keeps the per-chunk atomics
+# (correct, unfolded); the sm120 tests pin that both listed templates carry them.
+# Another template with the same drain (a fork of sm120_matmul.py) opts in by
+# joining the list once the fold tests run against it.
+_LANE_RUN_FOLD_TEMPLATES = frozenset({"sm120_matmul.py", "sm120_block_scale_matmul.py"})
+_LANE_RUN_FOLD_CONTRACT = (
+    "_STG_EPI_GROUP_FRAGS = 4",
+    "for mf in cutlass.range_constexpr(_M_FRAGS):",
+    "for grp in cutlass.range_constexpr(_STG_EPI_NGRP):",
+    "for half in cutlass.range_constexpr(2):",
+    "row_in_cta = warp_row * _WARP_TILE_M + mf * 16 + half * 8 + lane_div4",
+    "for sv in cutlass.range_constexpr(8 // _STG_V):",
+    "col = coord_n + warp_col * _WARP_TILE_N + (_nf0 + lane_mod4) * 8 + sv * _STG_V",
+    "red_part_flush_tile(_red_part, lane, M, N, (tile_l,), _red_part_args)",
+)
+
+
+@functools.lru_cache(maxsize=None)
+def _template_honours_lane_run_folds(path) -> bool:
+    text = path.read_text()
+    return all(line in text for line in _LANE_RUN_FOLD_CONTRACT)
+
+
+def _lane_run_tile(chain: FusionChain, config: TileConfig, tmpl) -> "tuple[int, int] | None":
+    """The warp tile the codegen folds per-row / per-col reductions over
+    (``generate(lane_run_tile=...)``), or ``None`` to keep their per-chunk atomics:
+    only the dense templates' lane-run drain (no MoE, not the row-per-lane quant
+    drain, not split-K -- the shared reducer takes the reductions there), and only
+    for a listed template that carries the drain lines the folds rely on."""
+    if config.split_k_slices != 1 or chain.has_moe or _row_per_lane_drain(chain, config) or not chain.reductions:
+        return None
+    if tmpl.file not in _LANE_RUN_FOLD_TEMPLATES or not _template_honours_lane_run_folds(tmpl.path):
+        return None
+    return (config.mma_size_m * 16, config.mma_size_n * 16)
+
+
 def _row_per_lane_tile_constants(chain: FusionChain, config: TileConfig) -> str:
-    """The tile constants the MoE templates' drains switch on (``cutlass.const_expr``):
-    which drain renders, and whether its routed-group row guard is bounded."""
+    """The tile constants the drains of the plain dense and MoE templates switch
+    on (``cutlass.const_expr``): which drain renders, and whether its row guard
+    (the routed group's end on MoE, M on the plain dense kernel) is bounded."""
     return f"row_per_lane_drain = {_row_per_lane_drain(chain, config)}\nrpl_bounded_rows = {_row_per_lane_bounded_rows(chain, config)}"
 
 
@@ -790,9 +840,19 @@ def _epi_vec_bytes(
     width additionally clamped so it divides every power-of-2 subtile span of
     this config's N-tile (see ``_compute_output_vec_bytes``), capped at the
     pipeline's widest store run (:data:`_EPI_CHUNK_ELEMS_BY_PIPELINE`), or at
-    :data:`_ROW_PER_LANE_CHUNK_ELEMS` when the row-per-lane drain is rendered."""
+    :data:`_ROW_PER_LANE_CHUNK_ELEMS` when the row-per-lane drain is rendered.
+
+    The chunk walks N, and the compiled call bakes N's divisibility by it
+    (the template's ``sym_n``), so it never exceeds N's own power-of-two floor.
+    Only N == 1 needs saying so: an N-major (B, M, 1) output's unit stride is
+    also its M axis, which its layout alignment then measures instead -- a
+    GEMV output came out with 2-element chunks and every call was refused
+    ("problem_size[1] ... expected to be divisible by 2"). A quant pins the
+    chunk to its block, which N is gated to be a multiple of."""
     vec = _compute_output_vec_bytes(chain, tile_cols=_epi_tile_cols(config))
     cap = _ROW_PER_LANE_CHUNK_ELEMS if _row_per_lane_drain(chain, config) else _EPI_CHUNK_ELEMS_BY_PIPELINE[config.pipeline]
+    if not chain.quants:
+        cap = min(cap, _pow2_floor(chain.matmul.N, cap=MAX_EPI_CHUNK_ELEMS))
     return min(vec, cap * DTYPE_BYTES[chain.output_dtype])
 
 
@@ -885,7 +945,10 @@ def _render_tile_constants(
     if chain.has_mainloop_fusion or chain.has_block_scale:
         raise NotImplementedError(f"{tmpl.file} renders plain matmul chains only (no mainloop fusion, no block scaling)")
     if chain.is_multi_gemm and not tmpl.supports_multi_gemm:
-        raise NotImplementedError(f"{tmpl.file} renders single-GEMM chains only; multi-GEMM ({chain.num_gemms} GEMMs) is served by the MoE template")
+        raise NotImplementedError(
+            f"{tmpl.file} renders single-GEMM chains only; multi-GEMM ({chain.num_gemms} GEMMs) is served by "
+            "the plain dense template (sm120_matmul.py) and the MoE templates"
+        )
     if chain.is_multi_gemm:
         # Sm120KernelTemplate owns the multi-GEMM feasibility rule (SMEM); the
         # funnel's _extra_reject asks the same method, so both agree. Register
@@ -998,6 +1061,7 @@ def _render_tile_constants(
         lines.append(f"moe_gather = {chain.moe.mode == 'gather'}")
         lines.append(f"moe_scatter = {chain.moe.mode == 'scatter'}")
         lines.append(f"moe_top_k = {chain.moe.top_k}")
+        lines.append(f"moe_combine = {chain.moe.mode == 'combine'}")
         # Swap-AB: the routed token axis is N, and the STG chunk was clamped to
         # the first_token_offset alignment the graph promises (dtypes'
         # _compute_output_vec_bytes); runtime S must keep it.
@@ -1308,14 +1372,24 @@ def _mixed_cga_constants(cfg: TileConfig, fallback_cluster: tuple[int, int, int]
 # nvvm.BlockScaleFormat) of the sm120 warp MMA. These are the combos the
 # instruction has a ``.kind::mx*`` for: nvfp4 (block 16 + e4m3 scales) rides
 # ``mxf4nvf4`` at scale_vec::4X, mxfp4 (block 32 + e8m0) ``mxf4`` at 2X and
-# mxfp8 (block 32 + e8m0) ``mxf8f6f4`` at 1X. fp4 + e8m0 at block 16 (4X with
-# a ue8m0 scale) is PTX ISA 9.1, above what the DSL's toolchain emits today,
-# fp4 + e4m3 at block 32 has no 2X ue4m3 form, and e5m3 scales are SM 10.7
-# silicon -- all three are absent from MMA_TYPE_SUPPORT["sm120"] too.
+# mxfp8 (block 32 + e8m0) ``mxf8f6f4`` at 1X -- as does a mixed MXFP4 x MXFP8
+# pair (``is_fp4`` is both sides e2m1), the per-side .e2m1 / .e4m3 / .e5m2
+# types telling its operands apart. fp4 + e8m0 at block 16 is ``mxf4nvf4`` at
+# 4X with a ue8m0 scale (PTX ISA 9.1): the DSL's nvvm.mma.block_scale verifier
+# rejects that pairing, so the templates issue it as inline PTX. fp4 + e4m3 at
+# block 32 has no warp-MMA form (.ue4m3 is 4X only, one scale per 16 K): it
+# rides the nvfp4 4X .ue4m3 instruction with every block-32 scale byte read
+# twice -- its instruction scale vector (4X) holds twice the scales one MMA
+# consumes (sf_scales_per_inst = 2), which the templates fill by duplicating
+# each SF byte into both of its block-16 slots (one PRMT per SF word and
+# k-block; exact).
+# e5m3 scales are SM 10.7 silicon, absent from MMA_TYPE_SUPPORT["sm120"] too.
 _SM120_BLOCK_SCALE_MMA: dict[tuple[bool, int, str], tuple[str, str, str]] = {
     (True, 16, "fp8_e4m3"): ("MXF4NVF4", "X4", "UE4M3"),
     (True, 32, "fp8_e8m0"): ("MXF4", "X2", "UE8M0"),
     (False, 32, "fp8_e8m0"): ("MXF8F6F4", "X1", "UE8M0"),
+    (True, 16, "fp8_e8m0"): ("MXF4NVF4", "X4", "UE8M0"),
+    (True, 32, "fp8_e4m3"): ("MXF4NVF4", "X4", "UE4M3"),
 }
 # The instruction's ``.<atype>.<btype>`` qualifiers (nvvm.MMATypes member names).
 _SM120_MMA_PTX_TYPE: dict[str, str] = {"fp4_e2m1": "e2m1", "fp8_e4m3": "e4m3", "fp8_e5m2": "e5m2"}
@@ -1333,9 +1407,12 @@ def _check_block_scale_geometry(chain: FusionChain, cfg: TileConfig) -> None:
     bs = chain.block_scale
     validate_block_scale_config_sm120(cfg, bs.block_size, cfg.cta_tile_k_bytes * 8 // (4 if bs.is_fp4 else 8))
     a_major, b_major = chain.matmul.a_major, chain.matmul.b_major
-    # A packed sub-byte operand has no transposed ldmatrix; fp8 (1 B/elem) rides
-    # the dense template's m16n16.trans.b8 path.
-    if bs.is_fp4 and (a_major != "k" or b_major != "k"):
+    # Every e2m1 side is K-major -- the parent's scope (it declines an MN-major
+    # fp4 operand on all its paths), and the only layout the e2m1 loads here
+    # read: ldmatrix of packed fp4 pairs, and a mixed pair's packed words built
+    # into registers. An fp8 side (1 B/elem) may be MN-major and rides the dense
+    # template's m16n16.trans.b8 path.
+    if (bs.a_dtype == "fp4_e2m1" and a_major != "k") or (bs.b_dtype == "fp4_e2m1" and b_major != "k"):
         raise ValueError(f"FP4 block-scaled inputs must be K-major (got A={a_major}-major, " f"B={b_major}-major); only mxfp8 supports M/N-major operands.")
     group_elems = cfg.cta_tile_k_bytes  # 1 B/elem
     for is_mn_major, mn_extent, operand_name in ((a_major == "m", cfg.cta_tile_m, "M"), (b_major == "n", cfg.cta_tile_n, "N")):
@@ -1389,11 +1466,18 @@ def _render_block_scale_tile_constants(
     assert isinstance(cfg, ConfigSm120), f"{cfg.pipeline} is not the sm120 config family"
     bs = chain.block_scale
     assert bs is not None
-    # sA/sB bytes and B's TMA stride encoding take ONE packed width, read off A.
-    if DTYPE_BITS[bs.a_dtype] != DTYPE_BITS[bs.b_dtype]:
-        raise NotImplementedError(
-            f"block-scale A and B must share an element width; got {bs.a_dtype} " f"({DTYPE_BITS[bs.a_dtype]}b) x {bs.b_dtype} ({DTYPE_BITS[bs.b_dtype]}b)"
-        )
+    # The operand forms the MoE templates render per side (mixed widths, a
+    # one-sided graph's identity scale) and the dense template does not yet; and
+    # a warp MMA newer than the CuTe DSL's toolchain assembles.
+    _form = tmpl.block_scale_form_reject(chain) or tmpl.block_scale_toolchain_reject(chain)
+    if _form is not None:
+        raise NotImplementedError(_form)
+    # is_fp4: both operands e2m1 -- the packed 4-bit MMA kinds (mxf4nvf4 / mxf4),
+    # 64 elements per 32-byte K. Anything else runs kind::mxf8f6f4 at the fp8 K
+    # (32 elements, a 128-element K-tile): the e2m1 operand of a mixed MXFP4 x
+    # MXFP8 pair stays packed in SMEM (TMA .b4x16, the parent's native packed
+    # form) in a 64-byte row, and the template builds its 8-bit-container
+    # fragment registers from the packed words.
     is_fp4 = bs.is_fp4
     data_elem_bits = 4 if is_fp4 else 8
     cta_k_elems = cfg.cta_tile_k_bytes * 8 // data_elem_bits
@@ -1406,8 +1490,8 @@ def _render_block_scale_tile_constants(
     except KeyError:
         raise NotImplementedError(
             f"the sm120 warp MMA has no block-scale kind for {bs.a_dtype} data with "
-            f"{bs.sf_dtype} scales at block {bs.block_size} (nvfp4: block 16 + e4m3; "
-            f"mxfp4 / mxfp8: block 32 + e8m0)"
+            f"{bs.sf_dtype} scales at block {bs.block_size} (fp4: e4m3 or e8m0 scales at block 16 or 32; "
+            f"fp8 and mixed fp4 x fp8: block 32 + e8m0)"
         ) from None
     a_major = chain.matmul.a_major
     b_major = chain.matmul.b_major
@@ -1420,11 +1504,32 @@ def _render_block_scale_tile_constants(
     a_tma_group_elems = group_elems if a_major == "m" else 1
     b_tma_group_elems = group_elems if b_major == "n" else 1
 
-    # Packed (Float4E2M1FNx2 / Float8) element count per K row in SMEM.
-    pack = 2 if is_fp4 else 1
-    ab_packed_per_row = cta_k_elems // pack
-    sA_packed_elems = cta_m * ab_packed_per_row
-    sB_packed_elems = cta_n * ab_packed_per_row
+    # Packed (Float4E2M1FNx2 / Float8) element count per K row in SMEM, per side
+    # (the parent's a/b_packed_per_row): 128 B, but 64 B for the e2m1 side of a
+    # mixed pair -- 128 packed values at the fp8 K-tile.
+    a_packed_per_row = cta_k_elems * DTYPE_BITS[bs.a_dtype] // 8
+    b_packed_per_row = cta_k_elems * DTYPE_BITS[bs.b_dtype] // 8
+    sA_packed_elems = cta_m * a_packed_per_row
+    sB_packed_elems = cta_n * b_packed_per_row
+
+    # Per-side TMA facts. An e2m1 side is native packed e2m1 (Float4E2M1FN + the
+    # explicit B4X16 format, two values a byte); fp8 auto-derives. Each K row is
+    # one swizzle span: s128b for a 128-byte row, s64b for a 64-byte one.
+    def _tma_side(dtype: str) -> tuple[str, str]:
+        if dtype == "fp4_e2m1":
+            return "cutlass.Float4E2M1FN", "_tma.TensorMapDataFormat.B4X16"
+        return DTYPE_TO_CUTLASS[dtype], "None"
+
+    a_tma_desc_dtype, a_tma_format = _tma_side(bs.a_dtype)
+    b_tma_desc_dtype, b_tma_format = _tma_side(bs.b_dtype)
+    _row_swizzle = {128: "s128b", 64: "s64b"}
+    a_tma_swizzle = _row_swizzle[a_packed_per_row]
+    b_tma_swizzle = _row_swizzle[b_packed_per_row]
+    a_smem_dtype = DTYPE_TO_CUTLASS[bs.a_dtype]
+    b_smem_dtype = DTYPE_TO_CUTLASS[bs.b_dtype]
+    # GMEM payload bytes per stage = the SMEM tile (every side lands as stored).
+    sA_tma_bytes = sA_packed_elems
+    sB_tma_bytes = sB_packed_elems
 
     # --- Scale factors ---------------------------------------------------------
     # F8_128x4 atoms: 128 rows x 4 K-scales = 512 B. The per-stage TMA box holds
@@ -1437,7 +1542,13 @@ def _render_block_scale_tile_constants(
     nb_n = -(-cta_n // 128)
     sfa_smem_bytes = nb_m * 128 * sf_k
     sfb_smem_bytes = nb_n * 128 * sf_k
-    # The warp MMA's K is 32 bytes: 64 fp4 / 32 fp8 elements -> scales per instruction.
+    # A one-sided graph's raw-FP8 side has no scale-factor tensor: the template
+    # feeds its MMAs a constant identity scale register (four packed 1.0 bytes of
+    # the scale format) and keeps no SF descriptor, TMA box or SMEM ring for it.
+    num_sfa_operands = 0 if bs.fake_dequant_a else chain.num_a_operands
+    num_sfb_operands = 0 if bs.fake_dequant_b else chain.num_b_operands
+    # The warp MMA's K is 32 bytes: 64 fp4 / 32 fp8 elements -> scales per instruction
+    # (2 for fp4 + e4m3 at block 32, whose 4X instruction reads each scale twice).
     mma_k_elems = 32 * 8 // data_elem_bits
     scales_per_inst = mma_k_elems // bs.block_size
 
@@ -1461,13 +1572,14 @@ def _render_block_scale_tile_constants(
     else:
         # Sm120KernelTemplate.multi_gemm_ab_stages counts the same per distinct
         # operand; change the two together.
-        per_stage = sA_packed_elems + sB_packed_elems + sfa_smem_bytes + sfb_smem_bytes + 16
+        per_stage = sA_packed_elems + sB_packed_elems + num_sfa_operands * sfa_smem_bytes + num_sfb_operands * sfb_smem_bytes + 16
         compute_warps = (cta_m // cfg.warp_tile_m) * (cta_n // cfg.warp_tile_n)
         staging_bytes = 4 * _SM120_STG_STAGE_ELEMS * compute_warps
         if chain.has_moe and chain.moe.mode == "gather":
             # GATHER's linear-scale scratch: 32 B per routed token row of the tile,
-            # per token operand -- the token is B after the swap-AB lowering.
-            token_rows, token_operands = (cta_n, chain.num_b_operands) if isinstance(chain.moe, MoeSwapAbSpec) else (cta_m, chain.num_a_operands)
+            # per token operand with scales -- the token is B after the swap-AB
+            # lowering (a raw-FP8 token gathers no scales).
+            token_rows, token_operands = (cta_n, num_sfb_operands) if isinstance(chain.moe, MoeSwapAbSpec) else (cta_m, num_sfa_operands)
             staging_bytes += token_rows * 32 * token_operands
         ab_stages = smem_ab_stages(per_stage, smem_fixed_reserve=tmpl.smem_fixed_reserve, extra_smem_bytes=staging_bytes)
         if ab_stages < 1:
@@ -1502,24 +1614,45 @@ def _render_block_scale_tile_constants(
         # out of these (WARPS_M = cta_tile_m / (mma_size_m * 16)).
         f"mma_size_m = {cfg.mma_size_m}",
         f"mma_size_n = {cfg.mma_size_n}",
-        # A packed K row is one 128-byte swizzle span (validate_block_scale_config_sm120).
-        "ab_tma_swizzle = _tma.TensorMapSwizzle.s128b",
+        # Each side's packed K row is one swizzle span (validate_block_scale_config_sm120):
+        # 128 B, or 64 B for the e2m1 side of a mixed pair.
+        f"a_tma_swizzle = _tma.TensorMapSwizzle.{a_tma_swizzle}",
+        f"b_tma_swizzle = _tma.TensorMapSwizzle.{b_tma_swizzle}",
         "",
         "# packed data",
-        # ab_dtype is the one-byte PACKED carrier both operands are sized by
-        # (sA/sB bytes, B's TMA stride encoding, ab_stride_elems); spelled as A's dtype.
-        f"ab_dtype = {DTYPE_TO_CUTLASS[bs.a_dtype]}",
-        # Fake-tensor dtypes: A and B may differ (mxfp8 e4m3 x e5m2).
+        # Fake-tensor (GMEM storage) dtypes: A and B may differ (mxfp8 e4m3 x e5m2,
+        # mixed mxfp4 x mxfp8). Both are one byte wide, the unit the host strides
+        # arrive in.
         f"a_fake_dtype = {DTYPE_TO_CUTLASS[bs.a_dtype]}",
         f"b_fake_dtype = {DTYPE_TO_CUTLASS[bs.b_dtype]}",
-        f"ab_packed_per_row = {ab_packed_per_row}",
+        # SMEM element dtype per side: the one-byte packed carrier.
+        f"a_smem_dtype = {a_smem_dtype}",
+        f"b_smem_dtype = {b_smem_dtype}",
+        # The widest operand's GMEM element bits (the L2 raster's row bytes).
+        f"ab_max_data_bits = {max(DTYPE_BITS[bs.a_dtype], DTYPE_BITS[bs.b_dtype])}",
+        f"a_packed_per_row = {a_packed_per_row}",
+        f"b_packed_per_row = {b_packed_per_row}",
         f"sA_packed_elems = {sA_packed_elems}",
         f"sB_packed_elems = {sB_packed_elems}",
-        # TMA-descriptor element dtype: the NATIVE 4-bit Float4E2M1FN (not the
-        # packed pair) so cute scales the descriptor by width=4 itself; fp8 as is.
-        f"ab_tma_desc_dtype = {'cutlass.Float4E2M1FN' if is_fp4 else DTYPE_TO_CUTLASS[bs.a_dtype]}",
-        # FP4 needs the explicit B4X16 (4-bit packed) TMA format; FP8 auto-derives.
-        f"ab_tma_format = {'_tma.TensorMapDataFormat.B4X16' if is_fp4 else 'None'}",
+        # GMEM payload bytes one stage's TMA box of each operand delivers.
+        f"sA_tma_bytes = {sA_tma_bytes}",
+        f"sB_tma_bytes = {sB_tma_bytes}",
+        # TMA-descriptor element dtype + format per side: e2m1 is the 4-bit
+        # Float4E2M1FN (cute scales the descriptor by width=4 itself) with the
+        # explicit B4X16 format; fp8 auto-derives.
+        f"a_tma_desc_dtype = {a_tma_desc_dtype}",
+        f"b_tma_desc_dtype = {b_tma_desc_dtype}",
+        f"a_tma_format = {a_tma_format}",
+        f"b_tma_format = {b_tma_format}",
+        # The dense sm120_block_scale_matmul.py still reads one packed form for both
+        # operands (it declines mixed widths and one-sided graphs:
+        # Sm120KernelTemplate.block_scale_form_reject), so the shared names carry
+        # A's side; the MoE templates read the per-side names.
+        f"ab_dtype = {a_smem_dtype}",
+        f"ab_packed_per_row = {a_packed_per_row}",
+        f"ab_tma_desc_dtype = {a_tma_desc_dtype}",
+        f"ab_tma_format = {a_tma_format}",
+        f"ab_tma_swizzle = _tma.TensorMapSwizzle.{a_tma_swizzle}",
         "",
         "# output",
         f"cd_dtype = {'cutlass.Int8' if out_dt == 'fp4_e2m1' else DTYPE_TO_CUTLASS[out_dt]}",
@@ -1553,6 +1686,10 @@ def _render_block_scale_tile_constants(
         "# scale factors (F8_128x4: 512-byte atoms of 128 rows x 4 K-scales)",
         f"block_size = {bs.block_size}",
         f"sf_cutlass_dtype = {DTYPE_TO_CUTLASS[bs.sf_dtype]}",
+        # The scales one MMA consumes along K (its 32-byte K / block_size). Fewer
+        # than the instruction's scale-vector slots (mma_scale_vec_size) only for
+        # fp4 + e4m3 at block 32 on the 4X .ue4m3 MMA: the template fills each
+        # scale's two block-16 slots with the same byte.
         f"sf_scales_per_inst = {scales_per_inst}",
         f"sfa_smem_bytes = {sfa_smem_bytes}",
         f"sfb_smem_bytes = {sfb_smem_bytes}",
@@ -1561,6 +1698,14 @@ def _render_block_scale_tile_constants(
         f"sf_tma_box_k = {sf_k4}",
         f"sfa_tma_box_mn = {nb_m}",
         f"sfb_tma_box_mn = {nb_n}",
+        # One-sided dequant: the raw-FP8 side keeps no SF descriptor, TMA box or
+        # SMEM ring (its operand count is 0) and its MMAs read sf_one_word -- four
+        # packed copies of the scale format's 1.0 (e4m3 0x38, e8m0 0x7F).
+        f"num_sfa_operands = {num_sfa_operands}",
+        f"num_sfb_operands = {num_sfb_operands}",
+        f"fake_dequant_a = {bs.fake_dequant_a}",
+        f"fake_dequant_b = {bs.fake_dequant_b}",
+        f"sf_one_word = { {'fp8_e4m3': 0x38383838, 'fp8_e8m0': 0x7F7F7F7F}[bs.sf_dtype] }",
     ]
     if chain.has_moe:
         # MoE grouped block-scale matmul: the grouped persistent scheduler
@@ -1658,8 +1803,8 @@ def _render_template(
     elif splitk:
         raise NotImplementedError(f"split_k_slices={config.split_k_slices}: template {tmpl.file} has no split-K support")
     # Row-per-lane drain (block-scale quantize chains) vs the transposed-STG
-    # lane-run drain: the MoE templates carry both, as the two arms of
-    # `if cutlass.const_expr(not row_per_lane_drain):` (a tile constant rendered below).
+    # lane-run drain: the plain dense and MoE templates carry both, as the two
+    # arms of `if cutlass.const_expr(not row_per_lane_drain):` (a tile constant rendered below).
     if _row_per_lane_drain(chain, config) and "cutlass.const_expr(not row_per_lane_drain)" not in src:
         raise NotImplementedError(f"{tmpl.file} has no row-per-lane drain for a block_scale_quantize epilogue")
     # For splitK, `snippets` is is kernel 1's partials store. Re-generate epilogue for reduce kernel
@@ -1667,7 +1812,7 @@ def _render_template(
 
     aux_tensors = chain.aux_tensors
 
-    # ---- Multi-GEMM A/B operand plumbing (1ctamma only) ------------------
+    # ---- Multi-GEMM A/B operand plumbing (the multi-GEMM-capable templates) --
     # One TMA descriptor + SMEM buffer + runtime tensor per DISTINCT operand.
     # Single-GEMM = 1 A + 1 B (suffix _0) → length-1 loops == legacy behavior.
     na, nb = chain.num_a_operands, chain.num_b_operands
@@ -1694,7 +1839,7 @@ def _render_template(
     # SM120 uses global token descriptors. GATHER additionally needs the index
     # vector and source extent, independently of the routed output extent.
     moe_kernel_ma_params = moe_ma_list = moe_host_ma_pass = ""
-    if chain.has_moe and chain.moe.mode in ("gather", "scatter"):
+    if chain.has_moe and chain.moe.mode in ("gather", "scatter", "combine"):
         # The routed rows are M on the ordinary MoE kernel and N after the
         # swap-AB lowering, where the token (and its source extent) is B.
         swapped = isinstance(chain.moe, MoeSwapAbSpec)
@@ -1714,6 +1859,16 @@ def _render_template(
             compile_ab_pass = "fake_token_ks,\n" + compile_ab_pass
             moe_kernel_ma_params += "\ntoken_ks: cute.Tensor,"
             moe_host_ma_pass += "\ntoken_ks,"
+        if chain.moe.mode == "combine":
+            # The routing scores, compact [T, top_k] FP32; T (the token count of
+            # the combined output) is independent of the routed rows.
+            host_ab_params = "top_k_scores: cute.Tensor,\n" + host_ab_params
+            compile_ab_fakes += (
+                f"\nfake_top_k_scores = make_fake_compact_tensor(cutlass.Float32, (cute.sym_int(), {chain.moe.top_k}), stride_order=(1, 0), assumed_align=4)"
+            )
+            compile_ab_pass = "fake_top_k_scores,\n" + compile_ab_pass
+            moe_kernel_ma_params += "\ntop_k_scores: cute.Tensor,"
+            moe_host_ma_pass += "\ntop_k_scores,"
 
     # Indentation matches the marker's column in the template (8 spaces inside
     # _kernel/_host signatures, 4 inside compile() body).
@@ -1878,6 +2033,7 @@ def _render_block_scale_template(
     compile_aux_pass = _aux_call_block(aux_tensors, prefix="fake_")
     tile_constants = _render_block_scale_tile_constants(config, chain, tmpl)
     tile_constants += f"\nmoe_gather = {chain.has_moe and chain.moe.mode == 'gather'}\nmoe_scatter = {chain.has_moe and chain.moe.mode == 'scatter'}\nmoe_top_k = {chain.moe.top_k if chain.has_moe else 1}"
+    tile_constants += f"\nmoe_combine = {chain.has_moe and chain.moe.mode == 'combine'}"
     tile_constants += "\n" + _row_per_lane_tile_constants(chain, config)
     if plumb.tap_constants:
         tile_constants += "\n" + "\n".join(plumb.tap_constants)
@@ -1973,10 +2129,10 @@ def _render_block_scale_template(
     # sm120 STG arm builds one vsize-wide fp32 vector per GEMM, so the binding is
     # the whole vector -- no sub-slicing by chunk index as on the tcgen05 arm.
     stg_vec_bindings = "\n".join(f"vec_f32_{g} = c_rmem_vecs[{g}]" for g in range(1, chain.num_gemms)) or "pass"
-    # SM120 reads grouped data/scales through global descriptors. GATHER and
-    # SCATTER add routing metadata to the device signature.
+    # SM120 reads grouped data/scales through global descriptors. GATHER,
+    # SCATTER and COMBINE add routing metadata to the device signature.
     moe_kernel_ma_params = moe_host_ma_pass = ""
-    if chain.has_moe and chain.moe.mode in ("gather", "scatter"):
+    if chain.has_moe and chain.moe.mode in ("gather", "scatter", "combine"):
         # The routed rows are M on the ordinary MoE kernel and N after the
         # swap-AB lowering, where the token (and its source extent) is B.
         swapped = isinstance(chain.moe, MoeSwapAbSpec)
@@ -1990,12 +2146,21 @@ def _render_block_scale_template(
         compile_ab_pass = "fake_token_index,\n" + compile_ab_pass
         moe_kernel_ma_params += "\ntoken_index: cute.Tensor,"
         moe_host_ma_pass += "\ntoken_index,"
-        if chain.moe.mode == "scatter":
+        if chain.moe.mode in ("scatter", "combine"):
             host_ab_params = "token_ks: cute.Tensor,\n" + host_ab_params
             compile_ab_fakes += f"\nfake_token_ks = make_fake_compact_tensor(cutlass.Int32, ({routed_rows},), stride_order=(0,), assumed_align=4)"
             compile_ab_pass = "fake_token_ks,\n" + compile_ab_pass
             moe_kernel_ma_params += "\ntoken_ks: cute.Tensor,"
             moe_host_ma_pass += "\ntoken_ks,"
+        if chain.moe.mode == "combine":
+            # The routing scores, compact [T, top_k] FP32 (as in _render_template).
+            host_ab_params = "top_k_scores: cute.Tensor,\n" + host_ab_params
+            compile_ab_fakes += (
+                f"\nfake_top_k_scores = make_fake_compact_tensor(cutlass.Float32, (cute.sym_int(), {chain.moe.top_k}), stride_order=(1, 0), assumed_align=4)"
+            )
+            compile_ab_pass = "fake_top_k_scores,\n" + compile_ab_pass
+            moe_kernel_ma_params += "\ntop_k_scores: cute.Tensor,"
+            moe_host_ma_pass += "\ntop_k_scores,"
 
     replacements = {
         "INJECT_TILE_CONSTANTS": tile_constants,
@@ -2283,8 +2448,30 @@ def _moe_num_groups(offsets, num_experts: int) -> int:
     return count
 
 
-def _expected_output_shape(spec, chain: FusionChain, mnk) -> tuple[int, int, int]:
+def _expected_output_shape(spec, chain: FusionChain, mnk, top_k_scores=None) -> tuple[int, int, int]:
+    if chain.has_moe and chain.moe.mode == "combine":
+        # One row per TOKEN (the routing table's extent), not per routed row.
+        tokens = int(top_k_scores.shape[0])
+        return (1, int(mnk[0]), tokens) if isinstance(chain.moe, MoeSwapAbSpec) else (1, tokens, int(mnk[1]))
     return expected_shape(_output_rule(spec, chain), int(mnk[0]), int(mnk[1]))
+
+
+def _initialize_combine_output(chain: FusionChain, outputs, stream=None) -> None:
+    """Zero COMBINE's final output on the launch stream after runtime checks:
+    the kernel only ever adds into it. Padding outside the logical extent is
+    left untouched (a byte memset per row run, so 2-byte outputs and pitches
+    with only natural element alignment are covered)."""
+    if chain.moe.mode != "combine":
+        return
+    output = outputs[0]  # COMBINE accepts exactly one final output.
+    shape, strides = tuple(output.shape), tuple(output.stride())
+    major = chain.output_specs[0].major
+    if strides[-1 if major == "n" else -2] != 1:
+        raise ValueError(f"MoE COMBINE output must match the compiled {major.upper()}-major layout")
+    plan = buffers.strided_fill_plan(shape, strides)
+    if plan is None:
+        raise ValueError("MoE COMBINE output must have non-overlapping positive strides")
+    buffers.apply_zero_fill_plan(output.data_ptr(), plan, DTYPE_BYTES[chain.outputs[0].dtype], stream)
 
 
 def _initialize_reduction_outputs(chain: FusionChain, outputs, stream=None) -> None:
@@ -2514,6 +2701,11 @@ class CompiledFusedGemm:
         if needs_workspace:
             cta_k_elems = _cta_k_elems(self.chain, self.config)
             reduce_elems = _splitk_reduce_elems(self.chain)
+        # A quant scale output keeps the shape the build declared while the
+        # kernel writes the scales of every runtime row and column: a call at
+        # other extents re-runs the quant gates (the MoE launchers' rule).
+        quant_mn = (self.chain.matmul.M, self.chain.matmul.N) if self.chain.quants else None
+        quant_chain, quant_cfg = self.chain, self.config
         # Named so a test can assert which rule refused a call, and that a legal
         # call trips none. Incremented only on the path that is already raising.
         gave_up = self.deferrals
@@ -2566,6 +2758,9 @@ class CompiledFusedGemm:
                     return refuse(operands, graph_order)
                 if takes_stride:
                     problem += (st[1], st[2], st[0])
+            if quant_mn is not None and (m, n) != quant_mn and _runtime_quant_reason(quant_chain, quant_cfg, m, n) is not None:
+                gave_up["quant extents"] += 1
+                return refuse(operands, graph_order)
             # Each output axis is a constant, M, or N over a divisor (fp4 packs
             # two along N) -- the rule the build recorded, read back per axis.
             for idx, k0, v0, k1, v1, k2, v2, align in outs:
@@ -2694,6 +2889,31 @@ class CompiledFusedGemm:
         mnk, axes = recipe.problem(operands, graph_order)
         check_shapes(recipe, operands, mnk, axes)
         check_alignment(recipe, operands, axes)
+        m, n = int(mnk[0]), int(mnk[1])
+        if self.config.swap_ab and self.chain.quants:
+            # A swap-AB plan's chain is the graph transposed: name a scale layout
+            # the call breaks in the GRAPH's frame (swapping back is the inverse
+            # lowering), where the caller declared the scale tensor.
+            from ..fusion_ir import swap_ab
+
+            try:
+                graph_chain = swap_ab(self.chain)
+            except (NotImplementedError, ValueError, AssertionError):
+                graph_chain = None  # no graph-frame reading: the kernel-frame reason below says it
+            if graph_chain is not None:
+                try:
+                    _check_block_quant_semantics(replace(graph_chain, matmul=replace(graph_chain.matmul, M=n, N=m)))
+                except NotImplementedError as exc:
+                    raise ValueError(str(exc)) from exc
+        try:
+            _check_runtime_quant(self.chain, self.config, m, n)
+        except ValueError as exc:
+            if not self.config.swap_ab:
+                raise
+            raise ValueError(
+                f"{exc} [in the kernel frame of this swap-AB plan, which runs the graph transposed: its M = {m} and "
+                f"N = {n} are the graph's N and M, and its row / col quant axes the graph's col / row]"
+            ) from exc
         raise RuntimeError(
             "cudnn.frost gemm: the launch path refused this call and no rule explains why -- its "
             "per-call guards and the diagnostics here have drifted apart. Guards that fired: "
@@ -2943,6 +3163,33 @@ def _alignment_reject(named_buffers) -> "str | None":
             bad.append(f"{role}: alignment {align}B < required {required}B (ptr=0x{ptr:x})")
     if bad:
         return "runtime tensor alignment is below the kernel's compiled requirement: " + "; ".join(bad)
+    return None
+
+
+def _mixed_width_operand_reject(chain: FusionChain, a_bufs, b_bufs) -> "str | None":
+    """Runtime K rule of a mixed fp4 x fp8 block-scale pair (MoE; the buffers in
+    kernel orientation, ``(batch, rows, packed K)``, K-major for the fp4 side).
+    Its two sides pack K differently, so the compiled call binds one packed-K
+    extent per side and no longer cross-checks them: every token and weight
+    operand must unpack to the same K here (the kernel runs the K of its first A
+    operand, so a shorter one would be read past its rows). The message names
+    the operands as the caller binds them -- token[i] / weight[j] with each
+    one's dtype and K, the swap-AB kernel A being the weights -- so one mistake
+    reads the same in either orientation. The e2m1 side is an ordinary packed
+    TMA operand otherwise -- the 16-byte base / stride / K rules every operand
+    meets. ``None`` when it holds or the pair is not mixed."""
+    bs = chain.block_scale
+    if bs is None or not bs.mixed_width:
+        return None
+    a_role, b_role = ("weight", "token") if isinstance(chain.moe, MoeSwapAbSpec) else ("token", "weight")
+    sides = {a_role: (chain.matmul.a_dtype, a_bufs), b_role: (chain.matmul.b_dtype, b_bufs)}
+    packed = []
+    for role in ("token", "weight"):
+        dtype, bufs = sides[role]
+        per_elem = 2 if dtype == "fp4_e2m1" else 1
+        packed += [(f"{role}[{i}] ({dtype})", int(buf.shape[-1]) * per_elem) for i, buf in enumerate(bufs)]
+    if len({k for _, k in packed}) > 1:
+        return "mixed fp4 x fp8 block-scale operands must unpack to one K: " + ", ".join(f"{name} K={k}" for name, k in packed)
     return None
 
 
@@ -3455,7 +3702,13 @@ def _check_executable(chain: FusionChain) -> None:
     if any(red.mode == "norm2" for red in chain.reductions):
         raise NotImplementedError("a norm2 reduction takes a square root after the kernel, which is a device operation this engine does not own")
     if chain.has_moe and chain.moe.mode == "combine":
-        raise NotImplementedError("MoE COMBINE is supported only by the FROST SM100 source family")
+        # The sm100 admitted set (#1380): the epilogue is the weighted scatter-add
+        # and nothing else. One rule for the build and the registry funnel.
+        from ..kernel_registry import Sm120KernelTemplate
+
+        _combine_reason = Sm120KernelTemplate.moe_combine_reject(chain)
+        if _combine_reason is not None:
+            raise NotImplementedError(_combine_reason)
     if chain.has_moe and chain.moe.mode == "scatter":
         if chain.quants or chain.reductions:
             raise NotImplementedError("MoE SCATTER currently supports dense pointwise outputs without quantization or reduction")
@@ -3482,6 +3735,63 @@ def _splitk_workspace_bytes(chain: FusionChain, config: TileConfig) -> int:
     return align_up(config.split_k_slices * chain.matmul.batch * chain.matmul.M * chain.matmul.N * 4)
 
 
+# Same-address atomics per output row the split-K reducer may issue for an
+# N-reduced fp32 sum before the automatic pick stops splitting, and the output
+# elements per byte of K (the MMA A operand's) up to which it splits a GEMM with an
+# M-reduced (per-col) reduction (see _splitk_reduction_serializes).
+_SPLITK_ROW_SUM_MAX_ATOMICS = 256
+_SPLITK_COL_FOLD_MAX_OUTPUTS_PER_K_BYTE = 128
+
+
+def _splitk_reduction_serializes(chain: FusionChain, red) -> bool:
+    """Whether the split-K reducer would fold ``red`` through atomics that cost
+    more than the split saves.
+
+    The reducer folds an N-reduced reduction (per row, or per batch) with one
+    atomic per ``_splitk_reduce_elems``-wide vector into the row's ONE address,
+    with no register partial, and all of a row's atomics land at once, after
+    kernel 1 -- they serialize. Max-type modes ride integer atomics and keep the
+    split's gain; fp32 sums serialize at ~40 ns per atomic (N / 4 of them per
+    row), MUL's CAS loop far worse. Measured on the RTX PRO 6000 (CUPTI, split
+    vs the same tile at S=1): per-row ADD / AVG / NORM1 nvfp4 64x8192x4096 S2
+    106.2 vs 26.3 us, mxfp8 128x7168x2048 S2 93.1 vs 24.8, nvfp4 128x4096x7168
+    S4 60.9 vs 32.7, bf16 128x4096x8192 S4 95.7 vs 44.9, bf16 256x2048x8192 S2
+    82.9 vs 67.2, mxfp8 256x2048x8192 S4 64.8 vs 66.7 -- but bf16 64x1024x16384
+    S4 31.9 vs 49.9 (256 atomics a row: the split wins); per-row MUL 2.0-9.0x
+    slower split on every shape. Per-row AMAX / MIN gain up to 2.8x from the same
+    splits.
+
+    An M-reduced (per-col) reduction reaches the reducer as one atomic per
+    output ELEMENT, while the unsplit kernel folds it in registers first (one
+    atomic per column per warp tile, epilogue_codegen's lane-run folds), so the
+    split pays only for a GEMM deep enough per output. Measured with the folds
+    (same method; x = K bytes per 1024 outputs, ADD / MAX ratio split : unsplit):
+    x = 2.3-4 lose 1.17-1.49x / 1.32-1.96x (nvfp4 64x8192x4096, 128x7168x6144;
+    mxfp8 128x7168x2048..3584); x = 5-6 ADD 0.85-0.95x but MAX 0.98-1.16x
+    (nvfp4 64x8192x5120 / 6144, 128x4096x5120 / 6144; mxfp8 64x8192x3072); x = 7
+    0.78-0.80x / 0.95-0.97x; x >= 8 gain 0.45-0.82x / 0.48-0.96x (mxfp8
+    128x4096x4096, 256x2048x8192; nvfp4 64x4096x8192; bf16 128x2048x3072,
+    256x2048x8192, 64x1024x16384). Per-col MUL loses 1.13-6.56x on every shape.
+
+    So split-K stays off for an M- or N-reduced MUL, for an N-reduced fp32 sum
+    past :data:`_SPLITK_ROW_SUM_MAX_ATOMICS` atomics a row, and for a per-col
+    reduction past :data:`_SPLITK_COL_FOLD_MAX_OUTPUTS_PER_K_BYTE` outputs per
+    byte of K; an explicit split-K config is honored as given."""
+    if red.dim[1] == 1 and red.dim[2] != 1:
+        if red.mode in ("mul", "mul_no_zeros"):
+            return True
+        mm = chain.matmul
+        k_bytes = mm.K * DTYPE_BITS[_mma_a_dtype(chain)] // 8
+        return mm.batch * mm.M * mm.N > _SPLITK_COL_FOLD_MAX_OUTPUTS_PER_K_BYTE * k_bytes
+    if red.dim[2] != 1:
+        return False
+    if red.mode in ("mul", "mul_no_zeros"):
+        return True
+    if red.mode not in ("add", "avg", "norm1", "norm2") or red.compute_dtype != "fp32":
+        return False
+    return chain.matmul.N // _splitk_reduce_elems(chain) > _SPLITK_ROW_SUM_MAX_ATOMICS
+
+
 def _auto_split_k(chain: FusionChain, config: TileConfig, sm_count: "int | None" = None) -> TileConfig:
     """Layer split-K onto the selected config when the output grid underfills
     the GPU and K is deep.
@@ -3506,6 +3816,8 @@ def _auto_split_k(chain: FusionChain, config: TileConfig, sm_count: "int | None"
         # count (AVG 2.8% off at 3000x3000x1024 split 2, 1.8e-5 unsplit). Modes
         # exact under atomics (max/min/amax, int32 sums) keep the split's gain;
         # an explicit split-K config is honored as given.
+        return config
+    if any(_splitk_reduction_serializes(chain, r) for r in chain.reductions):
         return config
     mm = chain.matmul
     if mm.K * DTYPE_BITS[_mma_a_dtype(chain)] < 2048 * 8:
@@ -3574,25 +3886,37 @@ def _baseline_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=
         # select_config still scores the cluster after this strategy choice;
         # no cluster shape is pinned here.
         force_cta_group = 1
-    config = select_config(
-        tile_m,
-        chain.matmul.N,
-        chain.num_gemms,
-        K=chain.matmul.K,
-        block_scale=chain.has_block_scale,
-        b_n_major=chain.matmul.b_major == "n",
-        b_elem_bytes=DTYPE_BYTES[chain.matmul.b_dtype],
-        force_cta_group=force_cta_group,
-        m_is_group_average=chain.moe is not None,
-        _pipeline="sm120",
-        _batch=chain.matmul.batch,
-    )
-    # Re-target at the preferred family and MMA-inst K width; cta_group rides
-    # the geometry and only moves when the family cannot serve it (sm120 is
-    # warp-scoped MMA, 1-CTA only).
-    config = preferred_strategy(chain, config)
-    config = _multi_gemm_stage_config(chain, config)
+    try:
+        config = select_config(
+            tile_m,
+            chain.matmul.N,
+            chain.num_gemms,
+            K=chain.matmul.K,
+            block_scale=chain.has_block_scale,
+            b_n_major=chain.matmul.b_major == "n",
+            b_elem_bytes=DTYPE_BYTES[chain.matmul.b_dtype],
+            force_cta_group=force_cta_group,
+            m_is_group_average=chain.moe is not None,
+            _pipeline="sm120",
+            _batch=chain.matmul.batch,
+        )
+    except NotImplementedError:
+        # select_config rounds an N-major B tile up to a 128-byte swizzle group (the
+        # tcgen05 rule) and declines when the parallel GEMMs' N budget is narrower
+        # (e4m3 with 3+ GEMMs, bf16 with 5+). The sm120 MN-major group is the CTA K
+        # tile's width (_render_tile_constants), so 32/64-byte-K tiles serve those
+        # chains: a plain dense multi-GEMM chain takes its own pick instead.
+        config = _dense_multi_gemm_config(chain) if chain.is_multi_gemm and not chain.has_moe else None
+        if config is None:
+            raise
+    else:
+        # Re-target at the preferred family and MMA-inst K width; cta_group rides
+        # the geometry and only moves when the family cannot serve it (sm120 is
+        # warp-scoped MMA, 1-CTA only).
+        config = preferred_strategy(chain, config)
+        config = _multi_gemm_stage_config(chain, config)
     config = _row_per_lane_quant_config(chain, config)
+    config = _dense_plain_config(chain, config)
     # skip splitK for MoE and dynamic shapes
     if chain.has_moe or dynamic_shapes:
         return config
@@ -3614,13 +3938,21 @@ def _multi_gemm_stage_config(chain: FusionChain, config: TileConfig) -> TileConf
     stage: at two GEMMs one 128x128 stage already fills the SMEM next to the
     epilogue staging. On 24 measured MoE layers (bf16 and block-scaled, NONE
     and GATHER, 2 and 3 GEMMs) this re-cut beat the one-stage pick by 1.19x
-    geomean (0.97x-1.67x). Keep the pick when its ring holds
+    geomean (0.97x-1.67x); on the plain dense template a dual SwiGLU's
+    one-stage 128x128x128 tile ran 1.19-1.36x slower than the re-cut 128x96x128
+    on four shapes (4096^3: 984 vs 726 us). A plain dense chain takes the
+    measured wave-cost pick (:func:`_dense_multi_gemm_config`) where one serves
+    it. Otherwise keep the pick when its ring holds
     :data:`_MULTI_GEMM_MIN_AB_STAGES`; else keep the CTA height and narrow the N
     tile (preferred warp grid first) until a cataloged geometry holds them and
     the full probe accepts it. A chain no narrower tile serves keeps the pick,
     so the decline keeps its reason."""
     if chain.num_gemms < 2 or config.swap_ab or config.pipeline != "sm120":
         return config
+    if not chain.has_moe:
+        dense = _dense_multi_gemm_config(chain)
+        if dense is not None:
+            return dense
     from ..kernel_registry import select_template
     from ..tile_config import CATALOG
 
@@ -3661,54 +3993,221 @@ def _multi_gemm_stage_config(chain: FusionChain, config: TileConfig) -> TileConf
     return config
 
 
-# Per-thread accumulator registers (all GEMMs of the chain) the auto pick keeps a
-# quant chain under, and how many re-cut candidates it probes at most.
+# The plain dense multi-GEMM pick (:func:`_dense_multi_gemm_config`). A dense
+# GEMM's time is its wave count (CTA tiles over the SMs, one CTA per SM) times
+# the time of one full wave of its tile, which the tile's own speed sets -- MMA
+# work per warp, AB ring depth (the operands share the SMEM) and the K tile.
+# Per GEMM count (3 stands for three or more), fastest wave first: the measured
+# time of one full wave at K = 4096, in microseconds, of the tiles that are the
+# best or near it on some measured shape, each holding >= 2 AB stages at that
+# count. RTX PRO 6000 (188 SMs), bf16 dual SwiGLU / triple gated product,
+# round-robin CUPTI timing, the wave times from the many-wave (M >= 512) shapes.
+# Against the per-shape best tile this pick ran 1.005x / 1.007x geomean (dual:
+# 28 shapes with the weights in L2, 23 with them streamed from DRAM; 1.064x
+# worst) and 1.034x / 1.006x (triple), 1.05x on 12 held-out dual shapes (1.21x
+# worst); the select_config pick it replaces ran 1.36x / 1.28x (4.9x worst at
+# 1x4096x4096), 1.33x / 1.17x and 1.66x (3.9x worst).
+_DENSE_MULTI_GEMM_WAVE_US: "dict[int, tuple[tuple[str, float], ...]]" = {
+    2: (
+        ("CONFIG_sm120_64x32x128_16x16x32_cluster1x1_warps4x2", 24.8),
+        ("CONFIG_sm120_32x64x128_16x16x32_cluster1x1_warps2x4", 30.5),
+        ("CONFIG_sm120_64x64x128_16x16x32_cluster1x1_warps2x4", 37.9),
+        ("CONFIG_sm120_64x64x64_16x16x32_cluster1x1_warps2x4", 38.4),
+        ("CONFIG_sm120_128x48x64_16x16x32_cluster1x1_warps8x1", 49.9),
+        ("CONFIG_sm120_128x48x128_16x16x32_cluster1x1_warps8x1", 51.9),
+        ("CONFIG_sm120_64x96x64_16x16x32_cluster1x1_warps4x2", 53.2),
+        ("CONFIG_sm120_32x128x128_16x16x32_cluster1x1_warps2x4", 61.0),
+        ("CONFIG_sm120_128x64x128_16x16x32_cluster1x1_warps4x2", 61.7),
+        ("CONFIG_sm120_64x128x128_16x16x32_cluster1x1_warps4x2", 68.7),
+        ("CONFIG_sm120_128x80x128_16x16x32_cluster1x1_warps8x1", 78.7),
+        ("CONFIG_sm120_128x96x128_16x16x32_cluster1x1_warps4x2", 92.4),
+        ("CONFIG_sm120_128x128x64_16x16x32_cluster1x1_warps2x4", 117.7),
+        ("CONFIG_sm120_256x96x64_16x16x32_cluster1x1_warps4x2", 176.6),
+    ),
+    3: (
+        ("CONFIG_sm120_64x32x128_16x16x32_cluster1x1_warps4x2", 31.6),
+        ("CONFIG_sm120_32x64x128_16x16x32_cluster1x1_warps2x4", 46.5),
+        ("CONFIG_sm120_128x32x64_16x16x32_cluster1x1_warps4x2", 48.2),
+        ("CONFIG_sm120_128x32x128_16x16x32_cluster1x1_warps4x2", 49.9),
+        ("CONFIG_sm120_64x64x64_16x16x32_cluster1x1_warps2x4", 52.0),
+        ("CONFIG_sm120_128x48x128_16x16x32_cluster1x1_warps8x1", 70.1),
+        ("CONFIG_sm120_64x96x64_16x16x32_cluster1x1_warps4x2", 74.0),
+        ("CONFIG_sm120_128x64x64_16x16x32_cluster1x1_warps2x4", 88.8),
+        ("CONFIG_sm120_128x64x128_16x16x32_cluster1x1_warps2x4", 90.3),
+        ("CONFIG_sm120_256x48x64_16x16x32_cluster1x1_warps8x1", 131.8),
+        ("CONFIG_sm120_256x64x64_16x16x32_cluster1x1_warps4x2", 170.7),
+    ),
+}
+# Up to this M a multi-GEMM streams its weights -- ~M FLOPs per weight byte, below
+# the part's balance -- and a 64-byte K tile halves every TMA row of the streamed
+# operand: with the weights streamed from DRAM the best 64-byte tile ran 1.10-1.45x
+# the best 128-byte one on all 40 measured dual / triple shapes up to M = 256 (only
+# from M = 384 on do the two draw even).
+_DENSE_MULTI_GEMM_STREAMING_M = 256
+
+
+def _dense_multi_gemm_config(chain: FusionChain) -> "TileConfig | None":
+    """The automatic pick for a plain dense multi-GEMM chain, or ``None`` when no
+    listed tile serves it (the caller keeps its re-cut).
+
+    Of the tiles :data:`_DENSE_MULTI_GEMM_WAVE_US` lists for the chain's GEMM
+    count, the lowest ``ceil(tiles / SMs) x one-wave time`` that keeps
+    :data:`_MULTI_GEMM_MIN_AB_STAGES` AB stages and the full probe accepts
+    wins; a tie goes to fewer waves, then to the faster wave. Tiles that fit
+    the problem are tried first: no taller than ``max(32, M rounded up to a
+    power of two)`` -- CTA rows past M are idle MMA work and, at decode sizes,
+    more CTAs re-reading the same few A rows -- and, while the GEMM streams its
+    weights (M <= :data:`_DENSE_MULTI_GEMM_STREAMING_M`), with a 128-byte K
+    tile. The select_config pick it replaces (an M-blind 128-row 1-CTA
+    geometry) ran a decode-shaped dual SwiGLU up to 4.9x slower than the best
+    tile (1x4096x4096: 125.9 vs 25.4 us) and a skinny long-K one up to 2.7x
+    (one wave of a few CTAs, where the tile's own speed is all there is --
+    multi-GEMM has no split-K)."""
+    from ..kernel_registry import select_template
+    from ..tile_config import by_name
+
+    table = _DENSE_MULTI_GEMM_WAVE_US.get(min(chain.num_gemms, 3), ())
+    mm = chain.matmul
+    rows = max(32, 1 << max(0, mm.M - 1).bit_length())
+    streaming = mm.M <= _DENSE_MULTI_GEMM_STREAMING_M
+    sm = _sm_count()
+    scored = []
+    for rank, (name, wave_us) in enumerate(table):
+        cfg = by_name(name)
+        waves = -(-(mm.batch * -(-mm.M // cfg.cta_tile_m) * -(-mm.N // cfg.cta_tile_n)) // sm)
+        fits = cfg.cta_tile_m <= rows and (not streaming or cfg.cta_tile_k_bytes == 128)
+        scored.append((not fits, waves * wave_us, waves, rank, cfg))
+    for *_key, cfg in sorted(scored, key=lambda t: t[:4]):
+        try:
+            if select_template(chain, cfg).multi_gemm_ab_stages(chain, cfg)[0] < _MULTI_GEMM_MIN_AB_STAGES:
+                continue
+            probe_chain(chain, cfg)
+        except (NotImplementedError, ValueError, KeyError):
+            continue
+        return cfg
+    return None
+
+
+# Per-thread accumulator registers (all GEMMs of the chain) the auto pick prefers
+# to keep a quant chain under -- a speed preference, never a support gate (see
+# _row_per_lane_quant_config) -- and how many candidates one pick probes at most,
+# over all of its passes.
 _ROW_PER_LANE_QUANT_ACC_REGS = 64
 _ROW_PER_LANE_PICK_PROBES = 64
 
 
 def _row_per_lane_quant_config(chain: FusionChain, config: TileConfig) -> TileConfig:
-    """The automatic pick for a block-quantized MoE chain.
+    """The automatic pick for a block-quantized chain (MoE or plain dense).
 
     ``tile_config.select_config`` orders warp grids without the row-per-lane
     drain's gates (:func:`_row_per_lane_gate_reason`), and the MoE planner
     offers no alternative to its one pick -- so a quant graph would be declined
     outright (64x32 warps4x2, a 16x16 warp tile, is the common pick). The quant
-    epilogue also needs register room: past
+    epilogue also wants register room: past
     :data:`_ROW_PER_LANE_QUANT_ACC_REGS` accumulator registers per thread the
     kernel spills inside the MMA loop (a 64x64 warp tile ran 2.3x slower than
-    its bf16-output twin; 64 accumulators cost about 4%). Keep the pick when it
-    passes both; else re-cut it -- same CTA height and K width first, then the
-    nearest CTA shape (the same tile re-gridded is nearest; the wider wins a
-    tie), then 32-row warp tiles, whose slabs keep all 32 lanes draining -- and
-    take the first config the full probe accepts. A chain no geometry can serve
-    keeps the pick, so the decline keeps its reason."""
+    its bf16-output twin; 64 accumulators cost about 4%). A plain dense chain
+    takes the measured wave-cost pick (:func:`_dense_quant_config`). A MoE
+    chain keeps the pick when it passes both; else re-cut it -- same CTA
+    height and K width first, then the nearest CTA shape (the same tile
+    re-gridded is nearest; the wider wins a tie), then 32-row warp tiles, whose
+    slabs keep all 32 lanes draining -- and take the first config the full
+    probe accepts.
+
+    The register budget is a speed preference, never a support gate (a spill
+    is a perf trade-off; the plan computes the same function). Where no
+    geometry the drain can walk fits it -- three or more GEMMs with a 32-row
+    col block, whose smallest drainable warp tile is 32x32 (96 registers at
+    three GEMMs); five or more with a row block (16x32: 80 at five) -- the same
+    passes run again over the next-smallest footprints that drain, smallest
+    first, so the engine lists a plan wherever the registry funnel lists one.
+    Those passes run only then: when geometries within the budget drain and the
+    probe declined them, more registers clear no gate.
+
+    A chain no geometry can serve keeps the pick, so the decline keeps its
+    reason -- without a search when no tile geometry could change it (a
+    semantic quant decline, the dtype x arch gate, the template's output-dtype
+    scope such as a packed fp4 data output), and otherwise within ONE budget of
+    :data:`_ROW_PER_LANE_PICK_PROBES` probes for all passes (they once probed
+    ~400 configs, ~85 ms, per plan request for such a chain)."""
     if not _row_per_lane_drain(chain, config):
         return config
-
-    def fits(cfg: TileConfig) -> bool:
-        if chain.num_gemms * cfg.warp_tile_m * cfg.warp_tile_n > 32 * _ROW_PER_LANE_QUANT_ACC_REGS:
-            return False
-        try:
-            vsize = _epi_vec_bytes(chain, cfg) // DTYPE_BYTES[chain.output_dtype]
-        except (NotImplementedError, ValueError):
-            return False
-        return _row_per_lane_gate_reason(chain, vsize, cfg) is None
-
-    if fits(config):
-        return config
+    # A semantic decline no geometry clears keeps the pick (and its reason).
     try:
         _check_block_quant_semantics(chain)
     except NotImplementedError:
         return config
+    from ..kernel_registry import select_template
+
+    if dtype_arch_reject(chain, _current_arch()) is not None:
+        return config
+    _output_rule = getattr(select_template(chain, config), "output_dtype_reject", None)
+    if _output_rule is not None and _output_rule(chain) is not None:
+        return config
+
+    def drains(cfg: TileConfig) -> bool:
+        # The drain's whole gate at the chunk this config renders (what the
+        # funnel's block_quant_reject asks; ~4 us against ~60 us for a probe):
+        # a geometry failing it would only be probed to the same decline.
+        try:
+            _check_block_quant_supported(chain, _epi_vec_bytes(chain, cfg), cfg)
+        except (NotImplementedError, ValueError):
+            return False
+        return True
+
+    def acc_regs(cfg: TileConfig) -> int:
+        return chain.num_gemms * cfg.warp_tile_m * cfg.warp_tile_n // 32
+
+    def in_budget(cfg: TileConfig) -> bool:
+        return acc_regs(cfg) <= _ROW_PER_LANE_QUANT_ACC_REGS and drains(cfg)
+
+    probes = [_ROW_PER_LANE_PICK_PROBES]
+    pick = _row_per_lane_quant_pick(chain, config, in_budget, probes)
+    if pick is not None:
+        return pick
+    from ..tile_config import CATALOG
+
+    family = [c for c in CATALOG if c.pipeline == config.pipeline and c.split_k_slices == 1]
+    if any(in_budget(c) for c in family):
+        return config
+    over_budget = sorted({acc_regs(c) for c in family if acc_regs(c) > _ROW_PER_LANE_QUANT_ACC_REGS and drains(c)})
+    for regs in over_budget:
+        if probes[0] <= 0:
+            break
+        pick = _row_per_lane_quant_pick(chain, config, lambda c, regs=regs: acc_regs(c) == regs and drains(c), probes)
+        if pick is not None:
+            return pick
+    return config
+
+
+def _row_per_lane_quant_pick(
+    chain: FusionChain, config: TileConfig, fits: Callable[[TileConfig], bool], probes: "list[int] | None" = None
+) -> "TileConfig | None":
+    """One pass of :func:`_row_per_lane_quant_config` over the geometries
+    ``fits`` admits: a plain dense chain's wave-cost pick; else ``config``
+    itself when it fits; else the nearest re-cut -- each only once the full
+    probe accepts it; ``None`` when no admitted geometry serves the chain.
+    ``probes`` (a one-element list) is the probe budget the caller's passes
+    share; every probe spends one, and a spent budget accepts nothing."""
+    budget = probes if probes is not None else [_ROW_PER_LANE_PICK_PROBES]
 
     def accepted(cfg: TileConfig) -> bool:
+        if budget[0] <= 0:
+            return False
+        budget[0] -= 1
         try:
             probe_chain(chain, cfg)
         except (NotImplementedError, ValueError):
             return False
         return True
 
+    if not chain.has_moe:
+        dense = _dense_quant_config(chain, config, fits, accepted)
+        if dense is not None:
+            return dense
+
+    if fits(config) and accepted(config):
+        return config
     from ..tile_config import CATALOG
 
     def distance(c: TileConfig) -> tuple:
@@ -3722,8 +4221,117 @@ def _row_per_lane_quant_config(chain: FusionChain, config: TileConfig) -> TileCo
 
     family = sorted((c for c in CATALOG if c.pipeline == config.pipeline and c.split_k_slices == 1 and fits(c)), key=distance)
     # Bounded: a chain every geometry declines for a config-specific reason
-    # should not probe the whole catalog on each plan request.
-    return next((c for c in family[:_ROW_PER_LANE_PICK_PROBES] if accepted(c)), config)
+    # should not probe the whole catalog on each plan request -- the shared
+    # budget ``accepted`` spends stops the walk.
+    return next((c for c in family if budget[0] > 0 and accepted(c)), None)
+
+
+# The plain dense quant pick (:func:`_dense_quant_config`). Measured on the RTX PRO
+# 6000 (188 SMs; bf16 and fp8 operands, row/col/dual MXFP8 and block-16 quant,
+# M 32..8192, N and K 1024..14336, every config within the quant accumulator
+# budget): a dense GEMM's time is its wave count times the time of one full wave
+# of its CTA tile, and that wave's rate follows the TILE (the warp grid moves it
+# a few percent). Relative rate of one full wave per CTA tile (128x128 = 1), and
+# the warp grids to try, most preferred first. The MoE-style re-cut of the
+# select_config pick (scored for a bf16 output) ran 1.10x / 1.16x / 1.13x
+# geomean (row bf16 / col bf16 / row fp8; 1.95x worst) of the per-shape best on
+# 39 shapes; this model 1.005x over all 60 measured shapes, 1.06x worst (the
+# fp8 64- vs 128-byte K tile, which it keeps from select_config).
+_DENSE_QUANT_WARP_GRIDS = ((4, 2), (2, 4), (8, 1), (1, 8))
+_DENSE_QUANT_TILE_RATES = (
+    ((128, 128), 1.00, _DENSE_QUANT_WARP_GRIDS),
+    ((128, 112), 0.96, _DENSE_QUANT_WARP_GRIDS),
+    ((128, 96), 0.88, ((8, 1),) + _DENSE_QUANT_WARP_GRIDS),
+    ((128, 80), 0.85, _DENSE_QUANT_WARP_GRIDS),
+    ((64, 192), 0.83, _DENSE_QUANT_WARP_GRIDS),
+    ((64, 160), 0.81, _DENSE_QUANT_WARP_GRIDS),
+    ((128, 64), 0.79, _DENSE_QUANT_WARP_GRIDS),
+    ((64, 128), 0.79, ((2, 4),) + _DENSE_QUANT_WARP_GRIDS),
+    ((64, 96), 0.75, _DENSE_QUANT_WARP_GRIDS),
+    ((128, 48), 0.69, _DENSE_QUANT_WARP_GRIDS),
+    ((64, 64), 0.62, _DENSE_QUANT_WARP_GRIDS),
+    ((64, 256), 0.56, _DENSE_QUANT_WARP_GRIDS),
+    ((256, 64), 0.56, _DENSE_QUANT_WARP_GRIDS),
+    ((32, 128), 0.51, _DENSE_QUANT_WARP_GRIDS),
+    ((128, 32), 0.50, _DENSE_QUANT_WARP_GRIDS),
+    ((32, 64), 0.44, _DENSE_QUANT_WARP_GRIDS),
+    ((64, 32), 0.43, _DENSE_QUANT_WARP_GRIDS),
+    ((32, 256), 0.37, _DENSE_QUANT_WARP_GRIDS),
+    ((256, 32), 0.37, _DENSE_QUANT_WARP_GRIDS),
+)
+
+
+def _dense_quant_config(
+    chain: FusionChain, config: TileConfig, fits: Callable[[TileConfig], bool], accepted: "Callable[[TileConfig], bool] | None" = None
+) -> "TileConfig | None":
+    """The automatic pick for a block-quantized plain dense chain, or ``None``
+    when no tile of :data:`_DENSE_QUANT_TILE_RATES` serves it: per tile, the
+    first of its warp grids that ``fits`` (the row-per-lane drain's gates and
+    the accumulator budget), at the K width ``select_config`` picked; the lowest
+    ``waves x tile area / rate`` the full probe (or ``accepted``, the caller's
+    budgeted probe) accepts wins (the faster tile on a tie)."""
+    from ..tile_config import CATALOG
+
+    by_tile: dict = {}
+    for c in CATALOG:
+        if c.pipeline != config.pipeline or c.split_k_slices != 1 or c.swap_ab or c.cta_tile_k_bytes != config.cta_tile_k_bytes:
+            continue
+        by_tile.setdefault((c.cta_tile_m, c.cta_tile_n), {})[(c.cta_tile_m // c.warp_tile_m, c.cta_tile_n // c.warp_tile_n)] = c
+    sm = _sm_count()
+    mm = chain.matmul
+    scored = []
+    for rank, ((tm, tn), rate, order) in enumerate(_DENSE_QUANT_TILE_RATES):
+        grids = by_tile.get((tm, tn), {})
+        cfg = next((grids[g] for g in order if g in grids and fits(grids[g])), None)
+        if cfg is None:
+            continue
+        waves = -(-(mm.batch * -(-mm.M // tm) * -(-mm.N // tn)) // sm)
+        scored.append((waves * tm * tn / rate, rank, cfg))
+    for _cost, _rank, cfg in sorted(scored, key=lambda t: t[:2]):
+        if accepted is not None:
+            if accepted(cfg):
+                return cfg
+            continue
+        try:
+            probe_chain(chain, cfg)
+        except (NotImplementedError, ValueError):
+            continue
+        return cfg
+    return None
+
+
+def _dense_plain_config(chain: FusionChain, config: TileConfig) -> TileConfig:
+    """The automatic pick for a plain dense single-GEMM chain (no MoE, no block
+    scaling, no block quantize -- those have their own picks): the wave-cost
+    model of :func:`_dense_quant_config` over the tiles whose warp tile holds at
+    most :data:`_ROW_PER_LANE_QUANT_ACC_REGS` accumulators per thread, at the K
+    width ``select_config`` picked; the pick is kept when no listed tile serves.
+
+    ``select_config`` scores tiles for the tcgen05 kernels and hands this
+    template 128x256 / 64x256 / 128x224 warps2x4 (128-accumulator warp tiles) on
+    large problems, which the warp-MMA kernel runs well below the 64-accumulator
+    tiles: the model's rates (measured on the quant epilogue, whose drain costs
+    next to nothing) hold for the plain one. Round-robin CUPTI on the RTX PRO 6000
+    (bf16 operands; bf16 / e4m3 / fp32 outputs), model pick vs the old pick:
+    0.64-0.77x on every shape from 2048x2047x2048 to 8192x14336x4096 (4096^3 bf16
+    382.8 vs 505.5 us, e4m3 376.1 vs 505.9; odd N 4096x4095x4096 e4m3 427.3 vs
+    575.5; 512x32001x4096 487.6 vs 745.9), 0.33x at 1x4096x4096 (20.4 vs 62.2),
+    and within 1-3% where the old pick already was such a tile (256x4096x4096,
+    8192x8192x1024, 16384x1024x1024).
+
+    A problem no wider than the table's narrowest tile (N <= 32) keeps the pick:
+    every tile then runs mostly empty columns, which its full-tile rate does not
+    see, and select_config's 128x32 tile with split-K wins (4096xNx4096, N = 1 / 8
+    / 16 / 32: 12.5 / 11.8 / 10.8 / 10.7 us vs the model's 62.3 / 56.1 / 18.9 /
+    12.3; from N = 40 the model wins, 12.3 vs 16.8 us)."""
+    if chain.num_gemms != 1 or chain.has_moe or chain.has_block_scale or chain.quants:
+        return config
+    if config.pipeline != "sm120" or config.swap_ab or config.split_k_slices != 1:
+        return config
+    if chain.matmul.N <= min(tn for (_tm, tn), _rate, _grids in _DENSE_QUANT_TILE_RATES):
+        return config
+    pick = _dense_quant_config(chain, config, lambda c: c.warp_tile_m * c.warp_tile_n // 32 <= _ROW_PER_LANE_QUANT_ACC_REGS)
+    return pick if pick is not None else config
 
 
 def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None) -> TileConfig:
@@ -3810,6 +4418,32 @@ def _precheck_moe(
     _compute_output_vec_bytes(chain)
     _check_block_quant_supported(chain, _epi_vec_bytes(chain, config), config)
     _check_own_family(_tmpl)
+    _check_registry_funnel(_tmpl, chain, config)
+
+
+def _check_registry_funnel(tmpl, chain: FusionChain, config: TileConfig) -> None:
+    """The registry's whole accept funnel (``KernelTemplate.accepts``: the arch
+    range, the template axes, MMA type x arch, the tile-config gates and the
+    template's own scope -- ``Sm120KernelTemplate._extra_reject``, which a
+    chain-less ``active_reject(config)`` skips), run as the LAST gate of the MoE
+    and block-scale prechecks, as the sm100 MoE prechecks run it since #1090. A
+    plan ``kernel_registry.accepts()`` / ``candidates()`` declines is then one
+    ``probe_chain`` / ``check_support`` and the build decline too, and every
+    future funnel rule gates these paths with no copy here. Last, so the precise
+    per-rule messages the prechecks raise first keep precedence."""
+    reason = tmpl.accepts(chain, config)
+    if reason is not None:
+        raise NotImplementedError(reason)
+
+
+# The dense block-scale template has no row-per-lane drain, so it declines every
+# block_scale_quantize epilogue -- in its precheck and, through
+# ``Sm120KernelTemplate.block_quant_reject``, in the registry funnel (one text).
+_DENSE_BLOCK_SCALE_QUANT_DECLINE = (
+    "block-scale quant epilogue is not supported on the sm120 dense block-scale template yet: the "
+    "block-quantize emitters need the row-per-lane drain (a thread owns a quant block of a row, a warp "
+    "32 rows), which only the plain dense and MoE sm120 templates carry"
+)
 
 
 def _precheck_block_scale(
@@ -3820,15 +4454,21 @@ def _precheck_block_scale(
 
     _check_block_scale_supported(chain, config.pipeline)
     _check_input_alignment(chain)
-    _epi_pipelines = ("sm100",)
+    # The sm120 block-scale template drains through the transposed-STG epilogue,
+    # whose reduction emitters (register folds + global red/atom f32, a CAS loop
+    # for MUL) are plain sm_120 PTX: every fp32 reduction runs on it, through the
+    # split-K reducer too. No pipeline gate here: the ("sm100",) one this tree
+    # copied belongs to the sm100 tree's templates. A config of another family
+    # is declined below -- by the arch gate (active_reject: the template's SM
+    # range) on a GPU, by _check_own_family where there is none to ask.
     if chain.reductions:
-        if config.pipeline not in _epi_pipelines:
-            raise NotImplementedError(f"block-scale reduction is not supported on {config.pipeline} templates")
         for red in chain.reductions:
             if red.compute_dtype != "fp32" or red.dtype != "fp32":
                 raise NotImplementedError("block-scale reduction supports only fp32 compute/output")
-    if chain.quants and config.pipeline not in _epi_pipelines:
-        raise NotImplementedError(f"block-scale quant epilogue is not supported on {config.pipeline} " "templates (not yet validated on sm103)")
+    # This template's own decline, so only for its own configs: another
+    # family's config goes on to the arch / family reason below.
+    if chain.quants and config.pipeline == "sm120":
+        raise NotImplementedError(_DENSE_BLOCK_SCALE_QUANT_DECLINE)
     _tmpl = select_template(chain, config)
     if chain.is_multi_gemm and not _tmpl.supports_multi_gemm:
         raise NotImplementedError(f"block-scale multi-GEMM ({chain.num_gemms} GEMMs) is not supported by " f"{_tmpl.file}.")
@@ -3839,6 +4479,7 @@ def _precheck_block_scale(
     _check_block_quant_supported(chain, _epi_vec_bytes(chain, config), config)
     _check_own_family(select_template(chain, config))
     _check_block_scale_geometry(chain, config)
+    _check_registry_funnel(_tmpl, chain, config)
 
 
 def _precheck_moe_block_scale(
@@ -3890,6 +4531,7 @@ def _precheck_moe_block_scale(
         _gs = _tmpl.gather_sf_reject(chain, config)
         if _gs is not None:
             raise NotImplementedError(f"{_tmpl.file}: {_gs}")
+    _check_registry_funnel(_tmpl, chain, config)
 
 
 def precheck_path(
@@ -3910,6 +4552,136 @@ def precheck_path(
         _precheck_plain(chain, config)
 
 
+def _analyze_graph(graph: cudnn.pygraph) -> "tuple[FusionChain, GemmBinding | None]":
+    """The shared analyzer's ``(chain, binding)`` for ``graph``, checked against
+    the graph itself (:func:`_check_graph_lowered`) and given the output layouts
+    the analyzer leaves out (:func:`_with_declared_output_layouts`). The one way
+    :func:`probe_supported` (``check_support``) and :func:`jit_from_cudnn_graph`
+    (the build) read a graph, so the two agree."""
+    from ..graph_analyzer import _ANALYZE_LOCK, _state_from_graph
+
+    with _ANALYZE_LOCK:
+        chain, binding = analyze_with_binding(graph)
+        # The analyzer's own reading of the graph (ops, tensor metadata and the
+        # declared-dtype side tables), taken under the same lock so it is this
+        # graph's and not a concurrent analysis'.
+        _check_graph_lowered(_state_from_graph(graph), chain, binding)
+    return _with_declared_output_layouts(chain, binding), binding
+
+
+_GEMM_NODE_KINDS = ("matmul", "moe_grouped_matmul")
+
+
+def _check_graph_lowered(state: dict, chain: FusionChain, binding: "GemmBinding | None") -> None:
+    """Decline a graph the shared analyzer lowered only in part.
+
+    The analyzer builds a multi-GEMM chain (K > 1 parallel GEMMs) with no
+    mainloop fusion, no per-GEMM output beside a fused epilogue and ONE declared
+    dtype for every GEMM output (GEMM 0's) -- and a graph asking for more is not
+    declined: the extra output is dropped, an operand some node computes is
+    bound as if the caller supplied it, a GEMM is rounded with another GEMM's
+    dtype. The kernel built from that chain runs, and the graph's contract is
+    silently not met: an output left unwritten, a GEMM over a buffer the graph
+    was to compute, results rounded unlike the graph (and native cuDNN). So both
+    sm120 graph entry points hold the binding to the graph, and decline:
+
+    - (multi-GEMM) a materialized tensor some node produces that the kernel
+      does not write;
+    - an operand the kernel reads (A / B and their scale factors, aux, MoE
+      routing) that a node computes rather than the caller supplies -- never
+      right for any chain (a single-GEMM chain's mainloop fusion walks its
+      operands back to graph inputs, so it meets this by construction);
+    - GEMM outputs of a fused multi-GEMM epilogue that declare different dtypes
+      (the epilogue rounds every accumulator to ``matmul.out_dtype``).
+
+    The first rule stays with multi-GEMM chains, the scope it was found in: a
+    single-GEMM MoE graph whose raw grouped-GEMM output is marked as an output
+    beside a fused epilogue is served today with that output unbound (the
+    shared MoE builder drops it, on both arch trees, and existing graphs rely
+    on it) -- a separate, pre-existing analyzer question."""
+    if binding is None:
+        return
+    from ..graph_analyzer import _TENSOR_OUTPUT_FLAG, _resolve_out_dtype
+
+    ops, meta = state["ops"], state["tensor_meta"]
+    producer = {}
+    for op in ops:
+        producer[op.output] = op
+        if op.scale_output is not None:
+            producer[op.scale_output] = op
+
+    def _name(tid: int) -> str:
+        m = meta.get(tid)
+        return m.name if m is not None else str(tid)
+
+    written = {id(t) for t in binding.outputs}
+    for tid, materialized in _TENSOR_OUTPUT_FLAG.items():
+        if not chain.is_multi_gemm or not materialized or tid in written:
+            continue
+        op = producer.get(tid)
+        if op is not None and op.cudnn_name in _GEMM_NODE_KINDS:
+            what = f"the raw result of GEMM {op.op_name!r}"
+            why = "a multi-GEMM graph lowers no per-GEMM output beside its fused epilogue"
+        else:
+            what = f"the result of {op.cudnn_name} {op.op_name!r}" if op is not None else "a graph tensor"
+            why = "the analyzer lowered no store for it"
+        raise NotImplementedError(
+            f"frost_gemm: graph output {_name(tid)!r} ({what}) is not written by the fused kernel -- {why}, " "so the plan would leave it unwritten"
+        )
+    reads = [*binding.a_operands, *binding.b_operands, *binding.sfa_operands, *binding.sfb_operands, *binding.aux]
+    reads += [t for t in (binding.first_token_offset, binding.token_index, binding.token_ks, binding.top_k_scores) if t is not None]
+    for t in reads:
+        m = meta.get(id(t))
+        if m is None or m.is_input:
+            continue
+        op = producer.get(id(t))
+        by = f"{op.cudnn_name} {op.op_name!r}" if op is not None else "a graph node"
+        raise NotImplementedError(
+            f"frost_gemm: GEMM operand {m.name!r} is computed inside the graph (by {by}); the fused kernel reads "
+            "its operands straight from graph inputs -- a multi-GEMM graph has no mainloop fusion, and no GEMM "
+            "consumes another GEMM's result"
+        )
+    if chain.is_multi_gemm and chain.ops:
+        io_dtype, intermediate_dtype = state["io_dtype"], state["intermediate_dtype"]
+        declared = [_resolve_out_dtype(op.output, op.output_tensor, io_dtype, intermediate_dtype) for op in ops if op.cudnn_name in _GEMM_NODE_KINDS]
+        if len(set(declared)) > 1:
+            raise NotImplementedError(
+                f"frost_gemm: the parallel GEMMs' outputs declare different dtypes {declared}; the fused multi-GEMM "
+                f"epilogue rounds every GEMM's accumulator to one ({chain.matmul.out_dtype}), so it would not "
+                "compute this graph"
+            )
+
+
+def _with_declared_output_layouts(chain: FusionChain, binding: "GemmBinding | None") -> FusionChain:
+    """``chain`` with each dense output spec that records no layout given the one
+    its bound tensor declares, where that differs from the compact N-major
+    default.
+
+    The analyzer reads every dense output's ``dim`` / ``stride`` off its tensor
+    -- except the per-GEMM outputs of a no-epilogue multi-GEMM graph, which it
+    models as compact N-major whatever the graph declared: an M-major (or
+    padded) per-GEMM output then built a kernel whose call refused the very
+    buffer the graph declared ("Mismatched c_tap_0.strides[1]"). Recording the
+    declared layout here, off the same tensor the epilogue path reads, renders
+    that output's store (an M-major output scatters per element, a padded one
+    keeps its row stride) and sizes the call's checks to it."""
+    if binding is None or len(binding.outputs) < len(chain.output_specs):
+        return chain
+    specs = list(chain.output_specs)
+    for i, spec in enumerate(specs):
+        if spec.dim is not None or spec.stride is not None or spec.quant_idx is not None:
+            continue
+        try:
+            dim = tuple(int(d) for d in binding.outputs[i].get_dim())
+            stride = tuple(int(s) for s in binding.outputs[i].get_stride())
+        except Exception:  # noqa: BLE001 -- a tensor without a layout keeps the default
+            continue
+        if len(dim) != 3 or len(stride) != 3 or (dim, stride) == dense_output_layout(chain, spec.dtype, None, None):
+            continue
+        specs[i] = replace(spec, dim=dim, stride=stride)
+    return chain if specs == list(chain.output_specs) else replace(chain, output_specs=specs)
+
+
 def probe_supported(graph: cudnn.pygraph, config: "TileConfig | None" = None) -> None:
     """Cheap eligibility check — the :func:`jit_from_cudnn_graph` gates WITHOUT
     ``cute.compile``. Raises if the engine can't run the graph. This is
@@ -3927,7 +4699,7 @@ def probe_supported(graph: cudnn.pygraph, config: "TileConfig | None" = None) ->
     # cutedsl at the floor, is always available by the time a plan compiles. An
     # internal RC passes: cutedsl_too_old judges only the public wheel.
     probe_cutedsl()
-    chain, _binding = analyze_with_binding(graph)
+    chain, _binding = _analyze_graph(graph)
     if config is None:
         config = plan_config(chain, dynamic_shapes=_graph_dynamic_shapes(graph))
     probe_chain(chain, config)
@@ -3962,9 +4734,9 @@ def probe_chain(chain: FusionChain, config: TileConfig) -> None:
         tmpl = select_template(chain, config)
         if not tmpl.supports_multi_gemm:
             raise NotImplementedError(
-                f"multi-GEMM ({chain.num_gemms} parallel GEMMs) is only supported "
-                f"by the 1-CTA-MMA CLC template this pass; got {config.name!r}, "
-                f"→ {tmpl.file}."
+                f"{tmpl.file} renders single-GEMM chains only (config {config.name!r}); multi-GEMM "
+                f"({chain.num_gemms} parallel GEMMs) is served by the plain dense template (sm120_matmul.py) "
+                "and the MoE templates"
             )
     precheck_path(chain, config)
 
@@ -4022,7 +4794,7 @@ def jit_from_cudnn_graph(
     fills the SMs a wide fixed cluster leaves idle (:func:`_mixed_cga_fallback`).
     Everywhere else the launch is the plain fixed cluster it always was.
     """
-    chain, binding = analyze_with_binding(graph)
+    chain, binding = _analyze_graph(graph)
     if config.swap_ab:
         from ..fusion_ir import swap_ab
 
@@ -4045,18 +4817,19 @@ def jit_from_cudnn_graph(
     # A TMA descriptor replacement).
     if chain.has_moe:
         return _jit_moe(chain, config, binding=binding)
-    # Multi-GEMM is only in the 1ctamma CLC template. select_template skips
-    # capability gates, so reject unsupported strategy here with a clear message
-    # rather than fault deep in cute on a missing vec_f32_<g> binding.
+    # Multi-GEMM is served by the plain dense template (sm120_matmul.py) and the
+    # MoE templates. select_template skips capability gates, so decline any other
+    # template here with a clear message rather than fault deep in cute on a
+    # missing vec_f32_<g> binding.
     if chain.is_multi_gemm:
         from ..kernel_registry import select_template
 
         tmpl = select_template(chain, config)
         if not tmpl.supports_multi_gemm:
             raise NotImplementedError(
-                f"multi-GEMM ({chain.num_gemms} parallel GEMMs) is only supported "
-                f"by the 1-CTA-MMA CLC template this pass; got {config.name!r}, "
-                f"→ {tmpl.file}. Use cta_group=1."
+                f"{tmpl.file} renders single-GEMM chains only (config {config.name!r}); multi-GEMM "
+                f"({chain.num_gemms} parallel GEMMs) is served by the plain dense template (sm120_matmul.py) "
+                "and the MoE templates"
             )
     # Plain-matmul (pipeline × input/acc dtype combo [× GPU for the rare
     # special-case combos]) gate, then the template family's active-GPU gate.
@@ -4064,6 +4837,8 @@ def jit_from_cudnn_graph(
     store_modes = _store_modes(chain, config)
     use_tma = _use_tma_store_epi(chain, config)
     splitk = config.split_k_slices > 1
+    from ..kernel_registry import select_template
+
     snippets = generate(
         chain,
         vec_bytes_epi=_epi_chunk_bytes(chain, config, use_tma),
@@ -4073,6 +4848,8 @@ def jit_from_cudnn_graph(
         packed_lanes=_epi_packed_lanes(config),
         split_k_slices=config.split_k_slices,
         drain_hooks=True,
+        bounded_rows=_row_per_lane_bounded_rows(chain, config),
+        lane_run_tile=_lane_run_tile(chain, config, select_template(chain, config)),
     )
     src = _render_template(chain, snippets, config)
     mod = _import_kernel(src)
@@ -4149,10 +4926,127 @@ def _kernel_order(buf, t, memo: "dict | None" = None):
     return buf
 
 
+def _check_moe_combine_n(compiled, n: int) -> None:
+    """Enforce the compiled N divisibility contract before the output memset:
+    the drain skips a chunk that straddles the kernel's N (``col_j + vsize <= N``
+    on the token-by-weight kernel; the routed-group alignment after swap-AB)."""
+    chain = compiled.chain
+    if chain.moe.mode != "combine":
+        return
+    multiple = compiled.vec_bytes_epi // DTYPE_BYTES[chain.output_dtype]
+    if isinstance(chain.moe, MoeSwapAbSpec):
+        multiple = min(multiple, chain.moe.offset_multiple)
+    if n % multiple:
+        raise ValueError(f"MoE COMBINE runtime kernel N must be divisible by {multiple} for the compiled epilogue; got N={n}")
+
+
+# The buffer dtype (torch / DLPack spelling, as buffers.dtype_name reads it) that
+# each FROST dtype's compile() fake binds -- the fakes are DTYPE_TO_CUTLASS of the
+# chain dtypes; e5m3 scale factors ride the Uint8 carrier.
+_FAKE_BUFFER_DTYPE = {
+    "bf16": "bfloat16",
+    "fp16": "float16",
+    "fp32": "float32",
+    "int8": "int8",
+    "uint8": "uint8",
+    "fp8_e4m3": "float8_e4m3fn",
+    "fp8_e5m2": "float8_e5m2",
+    "fp8_e8m0": "float8_e8m0fnu",
+    "fp8_e5m3": "uint8",
+    "fp4_e2m1": "float4_e2m1fn_x2",
+    "int32": "int32",
+    "int64": "int64",
+}
+# The launch binding takes an integer fake's signed and unsigned spellings alike.
+_SIGNLESS_INT = {"uint8": "int8", "uint16": "int16", "uint32": "int32", "uint64": "int64"}
+
+
+def _buffer_device(buf) -> "str | None":
+    """Where a buffer lives, as ``"cuda:<i>"`` / ``"cpu"`` / ``"dlpack device <type>"``;
+    ``None`` when it does not say (the launch binding then has the last word)."""
+    device = getattr(buf, "device", None)  # torch and torch-like tensors
+    if getattr(device, "type", None) is not None:
+        return f"cuda:{device.index}" if device.type == "cuda" else str(device.type)
+    probe = getattr(buf, "__dlpack_device__", None)  # DeviceView and other DLPack producers
+    if probe is None:
+        return None
+    kind, index = (int(v) for v in probe())
+    return f"cuda:{index}" if kind == 2 else ("cpu" if kind == 1 else f"dlpack device {kind}")  # kDLCUDA / kDLCPU
+
+
+def _check_moe_combine_operands(chain: FusionChain, a_bufs, b_bufs, fto, sfa, sfb, routing, outputs, k: int, workspace) -> None:
+    """COMBINE zero-fills the caller's output right before the launch, and some
+    operand facts only the launch binding checks -- so the launchers ask this
+    first, after every other check of theirs: a call the binding would refuse then
+    raises here, by the binding's own rules, with the output untouched.
+
+    * dtypes: a float type exactly, an integer by its width (signed or not);
+    * the shared K extent: every token and kernel-order weight spans ``k``
+      elements (an fp4 operand two per storage byte);
+    * strides: every non-unit token / weight stride a multiple of 16 bytes of the
+      compiled ``ab_dtype`` (the problem_size stride symbols' divisibility -- an
+      fp4 operand counts in its x2 carrier, the unit the buffer's strides use);
+    * placement: every tensor argument a CUDA buffer, all on one device (the
+      binding gives every tensor parameter one device index -- the carved
+      workspace view included).
+
+    Buffers as the launchers hold them: (batch, M|N, K) operands, the offsets
+    vector, ``routing`` = (token_index, token_ks, top_k_scores). Kernel frame:
+    after the swap-AB lowering A is the weight and B the token."""
+    if chain.moe.mode != "combine":
+        return
+    a_role, b_role = ("weight", "token") if isinstance(chain.moe, MoeSwapAbSpec) else ("token", "weight")
+    bs = chain.block_scale if chain.has_block_scale else None
+    roles = (
+        (a_role, a_bufs, _mma_a_dtype(chain) if bs is None else bs.a_dtype),
+        (b_role, b_bufs, _mma_b_dtype(chain) if bs is None else bs.b_dtype),
+        ("first_token_offset", [fto], chain.moe.offset_dtype),
+        (f"{a_role} SF", sfa, None if bs is None else bs.sf_dtype),
+        (f"{b_role} SF", sfb, None if bs is None else bs.sf_dtype),
+    )
+    for role, bufs, dtype in roles:
+        want = _FAKE_BUFFER_DTYPE.get(dtype)
+        for buf in bufs if want is not None else ():
+            got = buffers.dtype_name(buf)
+            if _SIGNLESS_INT.get(got, got) != _SIGNLESS_INT.get(want, want):
+                raise ValueError(f"MoE COMBINE {role} must be {want} (the compiled {dtype}); got {got}")
+    mm = chain.matmul
+    for role, bufs, dtype in ((a_role, a_bufs, mm.a_dtype), (b_role, b_bufs, mm.b_dtype)):
+        for buf in bufs:
+            if len(buf.shape) == 3 and int(buf.shape[2]) * (2 if dtype == "fp4_e2m1" else 1) != k:
+                raise ValueError(f"MoE COMBINE {role} operands must share the K={k} of the call ([..., K] in kernel order); got shape {tuple(buf.shape)}")
+    # ab_stride_elems of the templates' compile(): 128 // ab_dtype.width, ab_dtype
+    # = the kernel-frame A dtype (fp4: the 8-bit x2 carrier), for both operands.
+    ab = roles[0][2]
+    multiple = 128 // (8 if ab == "fp4_e2m1" else DTYPE_BITS[ab])
+    for role, bufs, major in ((a_role, a_bufs, mm.a_major), (b_role, b_bufs, mm.b_major)):
+        unit = 2 if major == "k" else 1  # (batch, M|N, K) buffers, as _moe_operand_layout_bad reads them
+        for buf in bufs:
+            strides = tuple(buf.stride())
+            if len(strides) == 3 and any(strides[d] % multiple for d in range(3) if d != unit):
+                raise ValueError(
+                    f"MoE COMBINE {role} strides must be multiples of 16 bytes ({multiple} storage elements) "
+                    f"outside the contiguous dimension; got stride {strides}"
+                )
+    placed = [(a_role, x) for x in a_bufs] + [(b_role, x) for x in b_bufs] + [("first_token_offset", fto)]
+    placed += [(f"{a_role} SF", x) for x in sfa] + [(f"{b_role} SF", x) for x in sfb]
+    placed += [(role, x) for role, x in zip(("token_index", "token_ks", "top_k_scores"), routing)] + [("output", x) for x in outputs]
+    placed.append(("workspace", workspace))
+    first = None
+    for role, buf in placed:
+        where = _buffer_device(buf)
+        if where is None:
+            continue
+        if not where.startswith("cuda:") or (first is not None and where != first[1]):
+            other = f" (the {first[0]} is on {first[1]})" if first is not None and where.startswith("cuda:") else ""
+            raise ValueError(f"MoE COMBINE {role} must be a CUDA buffer on the same device as every other operand; got {where}{other}")
+        first = first or (role, where)
+
+
 def _resolve_moe_variant_pack(compiled, variant_pack: dict):
     """Resolve a MoE variant-pack dict into the positional-call buffers,
     inferring (S, N, K) from shapes. Returns ``(a_bufs, b_bufs, out_bufs,
-    aux_bufs, fto, sfa, sfb, token_index, token_ks, (S, N, K))``."""
+    aux_bufs, fto, sfa, sfb, token_index, token_ks, top_k_scores, (S, N, K))``."""
     b = compiled.binding
     if b is None:
         raise NotImplementedError("variant-pack call is not yet wired up for this graph type")
@@ -4171,24 +5065,41 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
             raise KeyError(f"variant pack is missing a buffer for {role}")
         return resolved[id(t)]
 
+    top_k_scores = None
+    if compiled.chain.moe.mode == "combine":
+        scores = pull(b.top_k_scores, "top_k_scores")
+        shape = tuple(scores.shape)
+        top_k = compiled.chain.moe.top_k
+        if len(shape) != 3 or shape[0] != 1 or shape[1] < 1 or shape[2] != top_k:
+            raise ValueError("MoE COMBINE top_k_scores must have shape [1, tokens, top_k]")
+        if buffers.dtype_name(scores) != "float32" or tuple(scores.stride())[1:] != (top_k, 1) or scores.data_ptr() % 4:
+            raise ValueError("MoE COMBINE top_k_scores must be aligned compact FP32")
+        top_k_scores = scores.reshape([shape[1], shape[2]])
+        for spec, tensor in zip(compiled.chain.outputs, b.outputs):
+            output = pull(tensor, "output")
+            if buffers.dtype_name(output) != {"bf16": "bfloat16", "fp16": "float16", "fp32": "float32"}[spec.dtype]:
+                raise ValueError(f"MoE COMBINE output requires {spec.dtype}")
+            if buffers.strided_fill_plan(tuple(output.shape), tuple(output.stride())) is None:
+                raise ValueError("MoE COMBINE output must have non-overlapping positive strides")
+
     def routing_indices(tokens):
         mode = compiled.chain.moe.mode
         if mode == "none":
             return None, None
         indices = []
-        for tensor, role in [(b.token_index, "token_index")] + ([(b.token_ks, "token_ks")] if mode == "scatter" else []):
+        for tensor, role in [(b.token_index, "token_index")] + ([(b.token_ks, "token_ks")] if mode in ("scatter", "combine") else []):
             buf = pull(tensor, role)
             shape = tuple(buf.shape)
             if len(shape) != 3 or shape[0] != 1 or shape[2] != 1 or shape[1] < 1:
                 raise ValueError(f"MoE {mode.upper()} {role} must have shape [1, routed_rows, 1]")
             if buffers.dtype_name(buf) != "int32" or buf.stride(1) != 1 or buffers.data_ptr(buf) % 4:
                 raise ValueError(f"MoE {mode.upper()} {role} must be aligned INT32 with contiguous routed rows")
-            if mode == "scatter" and (shape[1] != tokens[0].shape[1] or shape[1] % compiled.chain.moe.top_k):
-                raise ValueError(f"MoE SCATTER {role} must match token rows divisible by top_k")
+            if mode in ("scatter", "combine") and (shape[1] != tokens[0].shape[1] or (mode == "scatter" and shape[1] % compiled.chain.moe.top_k)):
+                raise ValueError(f"MoE {mode.upper()} {role} must match token rows" + (" divisible by top_k" if mode == "scatter" else ""))
             indices.append(buf.reshape([shape[1]]))
         if any(len(t.shape) != 3 or t.shape[0] != 1 or tuple(t.shape) != tuple(tokens[0].shape) for t in tokens):
             raise ValueError(f"MoE {mode.upper()} token operands must share shape [1, rows, K]")
-        return indices[0], indices[1] if mode == "scatter" else None
+        return indices[0], indices[1] if mode in ("scatter", "combine") else None
 
     if isinstance(compiled.chain.moe, MoeSwapAbSpec):
         a_bufs = [_kernel_order(pull(t, "weight"), t, memo) for t in b.a_operands]
@@ -4213,7 +5124,8 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
         reason = _tma_alignment_reject(mm.a_dtype, mm.b_dtype, mm.a_major, mm.b_major, m, n, k)
         if reason is not None:
             raise ValueError(reason)
-        return a_bufs, b_bufs, out_bufs, aux_bufs, fto, sfa, sfb, token_index, token_ks, (m, n, k)
+        _check_moe_combine_n(compiled, n)
+        return a_bufs, b_bufs, out_bufs, aux_bufs, fto, sfa, sfb, token_index, token_ks, top_k_scores, (m, n, k)
 
     a_bufs = [pull(t, "token") for t in b.a_operands]
     b_bufs = [_kernel_order(pull(t, "weight"), t, memo) for t in b.b_operands]
@@ -4235,7 +5147,8 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
     _align_reason = _tma_alignment_reject(mm.a_dtype, mm.b_dtype, mm.a_major, mm.b_major, S, N, K)
     if _align_reason is not None:
         raise ValueError(_align_reason)
-    return a_bufs, b_bufs, out_bufs, aux_bufs, fto, sfa, sfb, token_index, token_ks, (S, N, K)
+    _check_moe_combine_n(compiled, N)
+    return a_bufs, b_bufs, out_bufs, aux_bufs, fto, sfa, sfb, token_index, token_ks, top_k_scores, (S, N, K)
 
 
 # One 128-byte TMA tensormap slot per CTA per distinct A operand.
@@ -4268,21 +5181,6 @@ def _register_legacy_device_view_adapter() -> None:
         # 128-byte tensormap slot the MoE workspace fake declares.
         ptr = view.data_ptr()
         return from_dlpack(view, assumed_align=min(ptr & -ptr, _MOE_DESC_SLOT_BYTES))
-
-
-def _moe_reset_sched_counter(workspace, desc_slots: int, stream) -> None:
-    """Zero the dynamic tile scheduler's global counter, stream-ordered.
-
-    It lives in the slot past the per-CTA descriptor scratch, so it rides the
-    same buffer and the same stable pointer that makes the plan graph-safe.
-    A 4-byte D32 memset, not a kernel. Only the non-swapped block-scale MoE
-    launchers need it: the dense MoE templates and both swap-AB templates zero
-    their own counter in the host (``_launch_moe_swap_ab`` issues no memset)."""
-    buffers.memset_zero_async(
-        workspace.data_ptr() + desc_slots * _MOE_DESC_SLOT_BYTES,
-        4,
-        _as_custream(stream),
-    )
 
 
 def _moe_carve_workspace(caller, n_slots: int, plan: str):
@@ -4366,7 +5264,7 @@ class CompiledMoeGemm:
         _check_plan_device(self.device)
         return self._call_variant_pack(variant_pack, workspace, stream)
 
-    def _launch_single(self, token, weight, first_token_offset, output, snke, workspace=None, stream=None, token_index=None, token_ks=None):
+    def _launch_single(self, token, weight, first_token_offset, output, snke, workspace=None, stream=None, token_index=None, token_ks=None, top_k_scores=None):
         first_token_offset = _offset_vector(first_token_offset)
         if len(snke) < 3:
             raise ValueError("MoE call needs problem_size (S, N, K[, ...]); " f"got {snke!r}")
@@ -4386,9 +5284,11 @@ class CompiledMoeGemm:
             if len(t.shape) != rank:
                 raise ValueError(f"MoE {name} must be rank-{rank}; got shape {tuple(t.shape)}")
         for spec, t in zip(outputs_spec, outputs):
-            if len(t.shape) != 3 or tuple(t.shape) != _expected_output_shape(spec, self.chain, (S, N, K)):
+            if len(t.shape) != 3 or tuple(t.shape) != _expected_output_shape(spec, self.chain, (S, N, K), top_k_scores):
                 raise ValueError(
-                    f"MoE output {spec.source!r} must have shape " f"{_expected_output_shape(spec, self.chain, (S, N, K))}; " f"got {tuple(t.shape)}"
+                    f"MoE output {spec.source!r} must have shape "
+                    f"{_expected_output_shape(spec, self.chain, (S, N, K), top_k_scores)}; "
+                    f"got {tuple(t.shape)}"
                 )
         num_experts = int(weight.shape[0])
         num_groups = _moe_num_groups(first_token_offset, num_experts)
@@ -4425,10 +5325,13 @@ class CompiledMoeGemm:
         # Tensormap workspace: one 128-byte slot per CTA per patched descriptor.
         # The template's host zeroes the scheduler counter before its launch.
         workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta + _MOE_SCHED_COUNTER_SLOTS, workspace)
+        _check_moe_combine_operands(self.chain, [token], [weight], first_token_offset, [], [], (token_index, token_ks, top_k_scores), outputs, K, workspace)
+        _initialize_combine_output(self.chain, outputs, stream)
         return self._launchable(
             problem_size,
             first_token_offset,
             workspace,
+            *((top_k_scores,) if top_k_scores is not None else ()),
             *((token_ks,) if token_ks is not None else ()),
             *((token_index,) if token_index is not None else ()),
             a,
@@ -4438,7 +5341,7 @@ class CompiledMoeGemm:
         )
 
     def _call_variant_pack(self, variant_pack: dict, workspace=None, stream=None):
-        a_bufs, b_bufs, out_bufs, aux_bufs, fto, _sfa, _sfb, token_index, token_ks, snk = _resolve_moe_variant_pack(self, variant_pack)
+        a_bufs, b_bufs, out_bufs, aux_bufs, fto, _sfa, _sfb, token_index, token_ks, top_k_scores, snk = _resolve_moe_variant_pack(self, variant_pack)
         _out_reqs = _output_align_reqs(self.chain, self.tma_slots, vec_bytes=self.vec_bytes_epi)
         _aux_reqs = _aux_align_reqs(self.chain, vec_bytes=self.vec_bytes_epi)
         _named = (
@@ -4452,15 +5355,34 @@ class CompiledMoeGemm:
             raise ValueError(_r)
         if isinstance(self.chain.moe, MoeSwapAbSpec):
             return _launch_moe_swap_ab(
-                self, a_bufs, b_bufs, out_bufs, aux_bufs, fto, [], [], snk, workspace, stream, token_index=token_index, token_ks=token_ks
+                self,
+                a_bufs,
+                b_bufs,
+                out_bufs,
+                aux_bufs,
+                fto,
+                [],
+                [],
+                snk,
+                workspace,
+                stream,
+                token_index=token_index,
+                token_ks=token_ks,
+                top_k_scores=top_k_scores,
             )
         out = out_bufs if len(out_bufs) > 1 else out_bufs[0]
         if self.chain.is_multi_gemm or self.chain.ops:
             pairs = [(a_bufs[ai], b_bufs[bi]) for ai, bi in self.chain.gemm_operands]
-            return self._call_multi_gemm(pairs, fto, out, snk, *aux_bufs, workspace=workspace, stream=stream, token_index=token_index, token_ks=token_ks)
-        return self._launch_single(a_bufs[0], b_bufs[0], fto, out, snk, workspace=workspace, stream=stream, token_index=token_index, token_ks=token_ks)
+            return self._call_multi_gemm(
+                pairs, fto, out, snk, *aux_bufs, workspace=workspace, stream=stream, token_index=token_index, token_ks=token_ks, top_k_scores=top_k_scores
+            )
+        return self._launch_single(
+            a_bufs[0], b_bufs[0], fto, out, snk, workspace=workspace, stream=stream, token_index=token_index, token_ks=token_ks, top_k_scores=top_k_scores
+        )
 
-    def _call_multi_gemm(self, gemm_pairs, first_token_offset, output, snke, *aux, workspace=None, stream=None, token_index=None, token_ks=None):
+    def _call_multi_gemm(
+        self, gemm_pairs, first_token_offset, output, snke, *aux, workspace=None, stream=None, token_index=None, token_ks=None, top_k_scores=None
+    ):
         """Multi-GEMM MoE call:
         ``compiled([(tok, w0), (tok, w1), ...], fto, out, (S, N, K[, ...]), *aux)``.
 
@@ -4523,9 +5445,10 @@ class CompiledMoeGemm:
         if _moe_dense_layout_bad(out):
             raise ValueError("multi-GEMM MoE output requires contiguous innermost dim")
         for spec, ci in zip(outputs_spec, outs):
-            if len(ci.shape) != 3 or tuple(ci.shape) != _expected_output_shape(spec, chain, (S, N, K)):
+            if len(ci.shape) != 3 or tuple(ci.shape) != _expected_output_shape(spec, chain, (S, N, K), top_k_scores):
                 raise ValueError(
-                    f"multi-GEMM MoE output {spec.source!r} must have shape " f"{_expected_output_shape(spec, chain, (S, N, K))}; got {tuple(ci.shape)}"
+                    f"multi-GEMM MoE output {spec.source!r} must have shape "
+                    f"{_expected_output_shape(spec, chain, (S, N, K), top_k_scores)}; got {tuple(ci.shape)}"
                 )
         num_experts = int(b_slots[0].shape[0])
         num_groups = _moe_num_groups(first_token_offset, num_experts)
@@ -4559,10 +5482,13 @@ class CompiledMoeGemm:
         # Workspace: one 128-B tensormap slot per patched descriptor per CTA.
         # The template's host zeroes the scheduler counter before its launch.
         workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta + _MOE_SCHED_COUNTER_SLOTS, workspace)
+        _check_moe_combine_operands(chain, a_slots, b_slots, first_token_offset, [], [], (token_index, token_ks, top_k_scores), outs, K, workspace)
+        _initialize_combine_output(chain, outs, stream)
         return self._launchable(
             problem_size,
             first_token_offset,
             workspace,
+            *((top_k_scores,) if top_k_scores is not None else ()),
             *((token_ks,) if token_ks is not None else ()),
             *((token_index,) if token_index is not None else ()),
             *a_wrapped,
@@ -4600,11 +5526,26 @@ def _check_runtime_quant(chain: FusionChain, cfg: TileConfig, m: int, n: int) ->
         raise ValueError(str(exc)) from exc
 
 
-def _launch_moe_swap_ab(compiled, weights, tokens, outputs, aux, offsets, weight_sf, token_sf, mnk, workspace, stream, token_index=None, token_ks=None):
+def _runtime_quant_reason(chain: FusionChain, cfg: TileConfig, m: int, n: int) -> "str | None":
+    """:func:`_check_runtime_quant` as a reason (``None`` when the call's extents
+    keep the quant contract) -- the dense call path's fused guard, which must not
+    raise (``CompiledFusedGemm.explain`` raises it instead)."""
+    try:
+        _check_runtime_quant(chain, cfg, m, n)
+    except ValueError as exc:
+        return str(exc)
+    return None
+
+
+def _launch_moe_swap_ab(
+    compiled, weights, tokens, outputs, aux, offsets, weight_sf, token_sf, mnk, workspace, stream, token_index=None, token_ks=None, top_k_scores=None
+):
     chain, cfg = compiled.chain, compiled.config
     m, n, k = map(int, mnk)
     e = int(weights[0].shape[0])
     offsets = _offset_vector(offsets)
+    if len(offsets.shape) != 1:  # the binding's rank; the token-by-weight launchers check it too
+        raise ValueError(f"MoE first_token_offset must be rank-1; got shape {tuple(offsets.shape)}")
     g = _moe_num_groups(offsets, e)
     _check_runtime_quant(chain, cfg, m, n)
     if n % math.gcd(_epi_vec_bytes(chain, cfg) // DTYPE_BYTES[chain.output_dtype], chain.moe.offset_multiple, chain.matmul.N):
@@ -4613,7 +5554,7 @@ def _launch_moe_swap_ab(compiled, weights, tokens, outputs, aux, offsets, weight
         if (m if quant.axis == 1 else n) % quant.block_size:
             raise ValueError("MoE weight-by-token quantization axis must contain whole runtime blocks")
     for spec, out in zip(chain.outputs, outputs):
-        expected = _expected_output_shape(spec, chain, (m, n, k))
+        expected = _expected_output_shape(spec, chain, (m, n, k), top_k_scores)
         if tuple(out.shape) != expected:
             raise ValueError(f"MoE weight-by-token output {spec.source!r} must have lowered shape {expected}; got {tuple(out.shape)}")
         if not spec.is_reduction and not spec.is_quant_scale and out.stride(-1 if spec.major == "n" else -2) != 1:
@@ -4655,10 +5596,13 @@ def _launch_moe_swap_ab(compiled, weights, tokens, outputs, aux, offsets, weight
     slots = compiled._grid_ctas * compiled._desc_slots_per_cta
     workspace = compiled._make_workspace(slots + _MOE_SCHED_COUNTER_SLOTS, workspace)
     _initialize_reduction_outputs(chain, outputs, stream)
+    _check_moe_combine_operands(chain, weights, tokens, offsets, weight_sf, token_sf, (token_index, token_ks, top_k_scores), outputs, k, workspace)
+    _initialize_combine_output(chain, outputs, stream)
     return compiled._launchable(
         problem,
         offsets,
         workspace,
+        *((top_k_scores,) if top_k_scores is not None else ()),
         *((token_ks,) if token_ks is not None else ()),
         *((token_index,) if token_index is not None else ()),
         *a,
@@ -4739,6 +5683,7 @@ def _jit_block_scale(
         packed_lanes=_epi_packed_lanes(config),
         split_k_slices=config.split_k_slices,
         drain_hooks=True,
+        lane_run_tile=_lane_run_tile(chain, config, select_template(chain, config)),
     )
     src = _render_block_scale_template(chain, snippets, config)
     mod = _import_kernel(src)
@@ -4834,7 +5779,9 @@ class CompiledMoeBlockScaleGemm:
         _check_plan_device(self.device)
         return self._call_variant_pack(variant_pack, workspace, stream)
 
-    def _launch_single(self, token, weight, sfa, sfb, first_token_offset, output, snke, workspace=None, stream=None, token_index=None, token_ks=None):
+    def _launch_single(
+        self, token, weight, sfa, sfb, first_token_offset, output, snke, workspace=None, stream=None, token_index=None, token_ks=None, top_k_scores=None
+    ):
         first_token_offset = _offset_vector(first_token_offset)
         if len(snke) < 3:
             raise ValueError("MoE block-scale call needs problem_size (S, N, K[, ...]); " f"got {snke!r}")
@@ -4861,10 +5808,10 @@ class CompiledMoeBlockScaleGemm:
             if len(t.shape) != rank:
                 raise ValueError(f"MoE block-scale {name} must be rank-{rank}; " f"got shape {tuple(t.shape)}")
         for spec, t in zip(outputs_spec, outputs):
-            if len(t.shape) != 3 or tuple(t.shape) != _expected_output_shape(spec, self.chain, (S, N, K)):
+            if len(t.shape) != 3 or tuple(t.shape) != _expected_output_shape(spec, self.chain, (S, N, K), top_k_scores):
                 raise ValueError(
                     f"MoE block-scale output {spec.source!r} must have shape "
-                    f"{_expected_output_shape(spec, self.chain, (S, N, K))}; "
+                    f"{_expected_output_shape(spec, self.chain, (S, N, K), top_k_scores)}; "
                     f"got {tuple(t.shape)}"
                 )
         num_experts = int(weight.shape[0])
@@ -4914,12 +5861,16 @@ class CompiledMoeBlockScaleGemm:
             sf_args.append(_maybe_wrap_layout(sfa.permute(1, 2, 0), _LEADING_DIM_AUX))
         if sfb is not None:
             sf_args.append(_maybe_wrap_layout(sfb.permute(1, 2, 0), _LEADING_DIM_AUX))
+        # The template's host zeroes the scheduler counter before its launch.
         workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta + _MOE_SCHED_COUNTER_SLOTS, workspace)
-        _moe_reset_sched_counter(workspace, self._grid_ctas * self._desc_slots_per_cta, stream)
+        sfs = ([sfa] if sfa is not None else [], [sfb] if sfb is not None else [])
+        _check_moe_combine_operands(self.chain, [token], [weight], first_token_offset, *sfs, (token_index, token_ks, top_k_scores), outputs, K, workspace)
+        _initialize_combine_output(self.chain, outputs, stream)
         return self._launchable(
             problem_size,
             first_token_offset,
             workspace,
+            *((top_k_scores,) if top_k_scores is not None else ()),
             *((token_ks,) if token_ks is not None else ()),
             *((token_index,) if token_index is not None else ()),
             a,
@@ -4930,9 +5881,12 @@ class CompiledMoeBlockScaleGemm:
         )
 
     def _call_variant_pack(self, variant_pack: dict, workspace=None, stream=None):
-        a_bufs, b_bufs, out_bufs, aux_bufs, fto, sfa, sfb, token_index, token_ks, snk = _resolve_moe_variant_pack(self, variant_pack)
+        a_bufs, b_bufs, out_bufs, aux_bufs, fto, sfa, sfb, token_index, token_ks, top_k_scores, snk = _resolve_moe_variant_pack(self, variant_pack)
         _out_reqs = _output_align_reqs(self.chain, self.tma_slots, vec_bytes=self.vec_bytes_epi)
         _aux_reqs = _aux_align_reqs(self.chain, vec_bytes=self.vec_bytes_epi)
+        _mixed = _mixed_width_operand_reject(self.chain, a_bufs, b_bufs)
+        if _mixed is not None:
+            raise ValueError(_mixed)
         _named = (
             [("token", x, 16, "ptr") for x in a_bufs]
             + [("weight", x, 16, "ptr") for x in b_bufs]
@@ -4969,7 +5923,20 @@ class CompiledMoeBlockScaleGemm:
         if isinstance(self.chain.moe, MoeSwapAbSpec):
             # The swapped binding's SFA is the weight's, its SFB the token's.
             return _launch_moe_swap_ab(
-                self, a_bufs, b_bufs, out_bufs, aux_bufs, fto, sfa, sfb, snk, workspace, stream, token_index=token_index, token_ks=token_ks
+                self,
+                a_bufs,
+                b_bufs,
+                out_bufs,
+                aux_bufs,
+                fto,
+                sfa,
+                sfb,
+                snk,
+                workspace,
+                stream,
+                token_index=token_index,
+                token_ks=token_ks,
+                top_k_scores=top_k_scores,
             )
         out = out_bufs if len(out_bufs) > 1 else out_bufs[0]
         fake_a = self.chain.block_scale.fake_dequant_a
@@ -4982,7 +5949,9 @@ class CompiledMoeBlockScaleGemm:
                 )
                 for ai, bi in self.chain.gemm_operands
             ]
-            return self._call_multi_gemm(pairs, fto, out, snk, *aux_bufs, workspace=workspace, stream=stream, token_index=token_index, token_ks=token_ks)
+            return self._call_multi_gemm(
+                pairs, fto, out, snk, *aux_bufs, workspace=workspace, stream=stream, token_index=token_index, token_ks=token_ks, top_k_scores=top_k_scores
+            )
         return self._launch_single(
             a_bufs[0],
             b_bufs[0],
@@ -4995,9 +5964,12 @@ class CompiledMoeBlockScaleGemm:
             stream=stream,
             token_index=token_index,
             token_ks=token_ks,
+            top_k_scores=top_k_scores,
         )
 
-    def _call_multi_gemm(self, gemm_pairs, first_token_offset, output, snke, *aux, workspace=None, stream=None, token_index=None, token_ks=None):
+    def _call_multi_gemm(
+        self, gemm_pairs, first_token_offset, output, snke, *aux, workspace=None, stream=None, token_index=None, token_ks=None, top_k_scores=None
+    ):
         """Multi-GEMM MoE block-scale call:
         ``compiled([((tok,sfa),(w0,sfb0)), ((tok,sfa),(w1,sfb1)), ...], fto,
         out, (S, N, K[, ...]), *aux)``.
@@ -5048,10 +6020,10 @@ class CompiledMoeBlockScaleGemm:
             if len(t.shape) != rank:
                 raise ValueError(f"MoE block-scale {name} must be rank-{rank}; got {tuple(t.shape)}")
         for spec, ci in zip(outputs_spec, outs):
-            if len(ci.shape) != 3 or tuple(ci.shape) != _expected_output_shape(spec, chain, (S, N, K)):
+            if len(ci.shape) != 3 or tuple(ci.shape) != _expected_output_shape(spec, chain, (S, N, K), top_k_scores):
                 raise ValueError(
                     f"multi-GEMM MoE block-scale output {spec.source!r} must have shape "
-                    f"{_expected_output_shape(spec, chain, (S, N, K))}; got {tuple(ci.shape)}"
+                    f"{_expected_output_shape(spec, chain, (S, N, K), top_k_scores)}; got {tuple(ci.shape)}"
                 )
         num_experts = int(b_slots[0][0].shape[0])
         num_groups = _moe_num_groups(first_token_offset, num_experts)
@@ -5100,12 +6072,17 @@ class CompiledMoeBlockScaleGemm:
                     f"per-group aux {ref.name!r} must be rank-3 with leading dim " f"{num_groups} (the number of groups); got shape {tuple(t.shape)}"
                 )
         aux = tuple(_maybe_wrap_layout(_reshape_aux_to_fake(t, ref), _LEADING_DIM_AUX) for ref, t in zip(chain.aux_tensors, aux))
+        # The template's host zeroes the scheduler counter before its launch.
         workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta + _MOE_SCHED_COUNTER_SLOTS, workspace)
-        _moe_reset_sched_counter(workspace, self._grid_ctas * self._desc_slots_per_cta, stream)
+        tokens, weights = [t for t, _sf in a_slots], [w for w, _sf in b_slots]
+        sfs = ([sf for _t, sf in a_slots if sf is not None], [sf for _w, sf in b_slots if sf is not None])
+        _check_moe_combine_operands(chain, tokens, weights, first_token_offset, *sfs, (token_index, token_ks, top_k_scores), outs, K, workspace)
+        _initialize_combine_output(chain, outs, stream)
         return self._launchable(
             problem_size,
             first_token_offset,
             workspace,
+            *((top_k_scores,) if top_k_scores is not None else ()),
             *((token_ks,) if token_ks is not None else ()),
             *((token_index,) if token_index is not None else ()),
             *a_wrapped,

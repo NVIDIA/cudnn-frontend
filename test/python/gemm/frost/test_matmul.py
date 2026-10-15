@@ -3283,8 +3283,8 @@ def test_sm120_registry_wiring() -> None:
     (tmpl,) = [t for t in TEMPLATES if t.pipeline == "sm120" and t.graph_type is GraphType.MATMUL]
     assert tmpl.file == "sm120_matmul.py"
     assert isinstance(tmpl, Sm120KernelTemplate)
-    # Warp-scoped MMA: 1-CTA only, no multi-GEMM (no per-GEMM operand indexing).
-    assert not tmpl.supports_multi_gemm
+    # Warp-scoped MMA: 1-CTA only; multi-GEMM keeps one register accumulator per GEMM.
+    assert tmpl.supports_multi_gemm
     assert tmpl.graph_type is GraphType.MATMUL and not tmpl.supports_mainloop_fusion
 
     # dtype support mirrors the sm100 matmul pipeline (incl. int8 and fp8 mixes)

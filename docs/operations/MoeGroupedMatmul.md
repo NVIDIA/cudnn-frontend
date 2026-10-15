@@ -4,7 +4,7 @@
 
 The MoE Grouped Matmul operation computes a grouped matrix multiplication across experts, as used in Mixture-of-Experts (MoE) layers. Each expert has its own weight matrix, and tokens are routed to experts via `first_token_offset`.
 
-Four routing modes are defined; COMBINE currently requires the FROST SM100 engine:
+Four routing modes are defined; COMBINE currently requires the FROST `frost_gemm` engine (see FROST COMBINE support below):
 
 **None mode** (tokens already routed per expert):
 
@@ -169,9 +169,9 @@ the final `[1,S,N]` result.
 ### FROST COMBINE support
 
 `cudnn.moe_grouped_matmul_mode.COMBINE` fuses FC2 with weighted scatter-add.
-It is supported only by the opt-in `frost_gemm` SM100 source family, for
-ordinary and block-scaled inputs and both `SWAP_AB=0/1` orientations. Native
-cuDNN engines and the SM120 source family decline this mode.
+It is supported only by the opt-in `frost_gemm` engine, whose SM100 and SM120
+source families both run it for ordinary and block-scaled inputs and both
+`SWAP_AB=0/1` orientations. Native cuDNN engines decline this mode.
 
 Let `R` be routed input capacity, `T` the original token count, and `k=top_k`.
 Supply token `[1,R,K]`, weight `[E,K,N]`, contiguous INT32 `token_index` and

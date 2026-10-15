@@ -13,6 +13,19 @@ for 8-bit dtypes (sub-byte dtypes have no transposed load and must be
 K-major; enforced upstream and by the render guard below). The output may be
 N- or M-major; the M-major store is the per-element scatter
 ``epilogue_codegen`` emits, so the epilogue loop here is layout-agnostic.
+
+Multi-GEMM (e.g. SwiGLU: ``silu(A @ B0) * (A @ B1)``): one SMEM tile per
+DISTINCT operand per stage and one register accumulator per GEMM
+(``gemm_a_idx`` / ``gemm_b_idx`` pick each GEMM's operands; an operand's
+fragments are loaded once per k-block and reused by every GEMM that reads it),
+as in the sm120 MoE template. Every GEMM's accumulators stay resident for the
+whole tile (``num_gemms * _ACC_REGS`` fp32 per lane); past the compute warp's
+register grant ptxas spills them -- a perf trade-off, never a reject. The one
+hard gate is SMEM: the renderer sizes the ring with the epilogue staging
+pre-funded (``Sm120KernelTemplate.multi_gemm_reject`` / ``.multi_gemm_ab_stages``).
+Both drains stage the GEMMs' fragments through the same warp-private buffer one
+after another and hand the fused epilogue one vector per GEMM (``vec_f32``,
+``vec_f32_1``, ...).
 """
 
 from __future__ import annotations
@@ -110,9 +123,32 @@ _STG_EPI_WARP_ELEMS = _STG_EPI_GROUP_FRAGS * _STG_EPI_BATCH_STRIDE  # 528
 _STG_EPI_NGRP = (_N_FRAGS + _STG_EPI_GROUP_FRAGS - 1) // _STG_EPI_GROUP_FRAGS
 _STG_V = (vec_bytes_epi * 8) // cd_dtype.width
 
+# Row-per-lane drain (block-scale quantize chains; the row_per_lane_drain tile
+# constant picks it over the lane-run drain). A 32-row slab is two 16-row m-fragments staged
+# in two sub-passes; a warp tile of one 16-row fragment gives a 16-row slab
+# owned by lanes 0..15.
+_RPL_SUBPASSES = 2 if _M_FRAGS % 2 == 0 else 1
+_RPL_SLABS = _M_FRAGS // _RPL_SUBPASSES
+
+
+def _rpl_swz(r):
+    """XOR key of the 16-byte granules of row-major staging row ``r``: keeps
+    the drain's STS.64 writes and LDS.128 reads of a 16x32 fp32 tile at the
+    two-words-per-bank minimum (an unswizzled tile hits eight)."""
+    rr = r % 8
+    return ((rr & 3) << 1) | (rr >> 2)
+
+
 _STG_EPI_BYTES = 4 * _STG_EPI_WARP_ELEMS * NUM_COMPUTE_WARPS
-_AB_STAGE_BYTES = (cta_tile_mnk[0] + cta_tile_mnk[1]) * _CTA_K_ELEMS * _ELEM_BYTES + 16
-ab_stages = ab_stages - -(-_STG_EPI_BYTES // _AB_STAGE_BYTES)
+# One SMEM tile per DISTINCT operand per stage (multi-GEMM holds several A / B tiles).
+_AB_STAGE_BYTES = (num_a_operands * cta_tile_mnk[0] + num_b_operands * cta_tile_mnk[1]) * _CTA_K_ELEMS * _ELEM_BYTES + 16
+# Single-GEMM: the staging is funded by giving up whole AB stages (the catalog's
+# _sm120_smem_feasible sweep counts the same way). Multi-GEMM: the renderer took
+# the staging off the budget in BYTES before sizing the ring
+# (Sm120KernelTemplate.multi_gemm_ab_stages) -- a whole multi-operand stage may
+# be all that fits -- so nothing is deducted here.
+if not stg_epi_prefunded:
+    ab_stages = ab_stages - -(-_STG_EPI_BYTES // _AB_STAGE_BYTES)
 
 
 # ---------------------------------------------------------------------------
@@ -555,7 +591,9 @@ def _kernel(
         bt_ldm_k = (lane % 8) + 8 * ((lane // 8) % 2)
         bt_ldm_n8 = lane // 16
 
-        acc = cutlass.Array(mma_c_dtype, _ACC_REGS, alignment=16)
+        # One register accumulator per GEMM of the chain (multi-GEMM: past the
+        # warp's register grant ptxas spills -- a perf trade-off, never a gate).
+        acc_list = [cutlass.Array(mma_c_dtype, _ACC_REGS, alignment=16) for _g in range(num_gemms)]
 
         ab_full_phase_bit = cutlass.Int32(0)
         ab_iter = cutlass.Int32(0)
@@ -585,8 +623,10 @@ def _kernel(
                 k_begin = cutlass.Int64(0)
                 k_end = num_k_tiles
 
-            for _z in cutlass.range_constexpr(_ACC_REGS):
-                acc[_z] = mma_c_dtype(0)
+            for _g in cutlass.range_constexpr(num_gemms):
+                _acc_g = acc_list[_g]
+                for _z in cutlass.range_constexpr(_ACC_REGS):
+                    _acc_g[_z] = mma_c_dtype(0)
 
             for k_tile_idx in range(k_begin, k_end):
                 stage = ab_iter % ab_stages
@@ -596,148 +636,166 @@ def _kernel(
                 while not nvvm.mbarrier_try_wait_parity(ab_full_mbar_ptr.subview(stage), ab_full_phase_bit, time_limit=10_000_000):
                     pass
 
-                sA_ptr = smem_a_list[0].subview(sA_elems * stage).data_ptr()
-                sB_ptr = smem_b_list[0].subview(sB_elems * stage).data_ptr()
+                # One SMEM tile per DISTINCT operand (multi-GEMM: gemm_a_idx /
+                # gemm_b_idx pick each GEMM's); each operand's fragments are loaded
+                # once per k-block and reused by every GEMM that reads it.
+                sA_ptrs = [smem_a_list[_ai].subview(sA_elems * stage).data_ptr() for _ai in range(num_a_operands)]
+                sB_ptrs = [smem_b_list[_bj].subview(sB_elems * stage).data_ptr() for _bj in range(num_b_operands)]
 
                 for k_blk in cutlass.range_constexpr(_NUM_K_BLOCKS):
                     kb_base = k_blk * _K_BLK_ELEMS
-                    a_frags = []
-                    if cutlass.const_expr(a_is_m_major and _ELEM_BITS == 8):
-                        # Byte-granule transpose (ldmatrix.m16n16.x2.trans.b8): both
-                        # tiles are 16 k-rows x 16 m-bytes at the frag's M base —
-                        # lanes 0-15 address the k half kb..kb+15, lanes 16-31 the
-                        # half kb+16..kb+31 (k = kb_base + lane for every lane) —
-                        # and the four result regs land directly as mma.sync a0..a3.
-                        for mf in cutlass.range_constexpr(_M_FRAGS):
-                            a_m = warp_row * _WARP_TILE_M + mf * 16
-                            a_off = (
-                                (a_m // a_tma_group_elems) * (a_tma_group_elems * _CTA_K_ELEMS) + (kb_base + lane) * a_tma_group_elems + a_m % a_tma_group_elems
-                            )
-                            a_frags.append(
-                                nvvm.ldmatrix(
-                                    _apply_smem_swizzle(sA_ptr + a_off, _AB_SWIZZLE),
+                    a_frags_list = []
+                    for _ai in cutlass.range_constexpr(num_a_operands):
+                        sA_ptr = sA_ptrs[_ai]
+                        a_frags = []
+                        if cutlass.const_expr(a_is_m_major and _ELEM_BITS == 8):
+                            # Byte-granule transpose (ldmatrix.m16n16.x2.trans.b8): both
+                            # tiles are 16 k-rows x 16 m-bytes at the frag's M base —
+                            # lanes 0-15 address the k half kb..kb+15, lanes 16-31 the
+                            # half kb+16..kb+31 (k = kb_base + lane for every lane) —
+                            # and the four result regs land directly as mma.sync a0..a3.
+                            for mf in cutlass.range_constexpr(_M_FRAGS):
+                                a_m = warp_row * _WARP_TILE_M + mf * 16
+                                a_off = (
+                                    (a_m // a_tma_group_elems) * (a_tma_group_elems * _CTA_K_ELEMS)
+                                    + (kb_base + lane) * a_tma_group_elems
+                                    + a_m % a_tma_group_elems
+                                )
+                                a_frags.append(
+                                    nvvm.ldmatrix(
+                                        _apply_smem_swizzle(sA_ptr + a_off, _AB_SWIZZLE),
+                                        4,
+                                        nvvm.MMALayout.COL,
+                                        shape=nvvm.LoadShape.M16N16,
+                                        src_format=nvvm.LoadSrcFormat.B8,
+                                    )
+                                )
+                        elif cutlass.const_expr(a_is_m_major):
+                            # M-major SMEM: group g holds K_tile rows of
+                            # a_tma_group_elems M elements; ldmatrix.trans transposes
+                            # each (k x m) 8x8 b16 tile back into the (m x k) fragment.
+                            for mf in cutlass.range_constexpr(_M_FRAGS):
+                                a_m = warp_row * _WARP_TILE_M + mf * 16 + at_ldm_m8 * 8
+                                a_off = (
+                                    (a_m // a_tma_group_elems) * (a_tma_group_elems * _CTA_K_ELEMS)
+                                    + (kb_base + at_ldm_k) * a_tma_group_elems
+                                    + a_m % a_tma_group_elems
+                                )
+                                a_frags.append(
+                                    nvvm.ldmatrix(
+                                        _apply_smem_swizzle(sA_ptr + a_off, _AB_SWIZZLE),
+                                        4,
+                                        nvvm.MMALayout.COL,
+                                    )
+                                )
+                        else:
+                            for mf in cutlass.range_constexpr(_M_FRAGS):
+                                a_row = warp_row * _WARP_TILE_M + mf * 16 + a_ldm_row
+                                a_off = a_row * _CTA_K_ELEMS + kb_base + a_ldm_col16 * _ELEMS_16B
+                                a_frags.append(
+                                    nvvm.ldmatrix(
+                                        _apply_smem_swizzle(sA_ptr + a_off, _AB_SWIZZLE),
+                                        4,
+                                        nvvm.MMALayout.ROW,
+                                    )
+                                )
+                        a_frags_list.append(a_frags)
+                    for _bj in cutlass.range_constexpr(num_b_operands):
+                        sB_ptr = sB_ptrs[_bj]
+                        b_frags = []
+                        if cutlass.const_expr(b_is_n_major and _ELEM_BITS == 8):
+                            # ldmatrix.m16n16.x2.trans.b8 per n-frag pair: the tile's 16
+                            # transposed columns span n-frags (2p, 2p+1), so the result
+                            # regs are [b0(2p), b0(2p+1), b1(2p), b1(2p+1)]. Addresses
+                            # mirror the A-side b8 form: k = kb_base + lane, no lane map.
+                            # (_N_FRAGS is even here — asserted at render.)
+                            for npair in cutlass.range_constexpr(_N_FRAG_PAIRS):
+                                b_n = warp_col * _WARP_TILE_N + npair * 16
+                                b_off = (
+                                    (b_n // b_tma_group_elems) * (b_tma_group_elems * _CTA_K_ELEMS)
+                                    + (kb_base + lane) * b_tma_group_elems
+                                    + b_n % b_tma_group_elems
+                                )
+                                bv = nvvm.ldmatrix(
+                                    _apply_smem_swizzle(sB_ptr + b_off, _AB_SWIZZLE),
                                     4,
                                     nvvm.MMALayout.COL,
                                     shape=nvvm.LoadShape.M16N16,
                                     src_format=nvvm.LoadSrcFormat.B8,
                                 )
-                            )
-                    elif cutlass.const_expr(a_is_m_major):
-                        # M-major SMEM: group g holds K_tile rows of
-                        # a_tma_group_elems M elements; ldmatrix.trans transposes
-                        # each (k x m) 8x8 b16 tile back into the (m x k) fragment.
-                        for mf in cutlass.range_constexpr(_M_FRAGS):
-                            a_m = warp_row * _WARP_TILE_M + mf * 16 + at_ldm_m8 * 8
-                            a_off = (
-                                (a_m // a_tma_group_elems) * (a_tma_group_elems * _CTA_K_ELEMS)
-                                + (kb_base + at_ldm_k) * a_tma_group_elems
-                                + a_m % a_tma_group_elems
-                            )
-                            a_frags.append(
-                                nvvm.ldmatrix(
-                                    _apply_smem_swizzle(sA_ptr + a_off, _AB_SWIZZLE),
+                                b_frags.append((bv[0], bv[2]))
+                                b_frags.append((bv[1], bv[3]))
+                        elif cutlass.const_expr(b_is_n_major):
+                            for npair in cutlass.range_constexpr(_N_FRAG_PAIRS):
+                                b_n = warp_col * _WARP_TILE_N + npair * 16 + bt_ldm_n8 * 8
+                                b_off = (
+                                    (b_n // b_tma_group_elems) * (b_tma_group_elems * _CTA_K_ELEMS)
+                                    + (kb_base + bt_ldm_k) * b_tma_group_elems
+                                    + b_n % b_tma_group_elems
+                                )
+                                bv = nvvm.ldmatrix(
+                                    _apply_smem_swizzle(sB_ptr + b_off, _AB_SWIZZLE),
                                     4,
                                     nvvm.MMALayout.COL,
                                 )
-                            )
-                    else:
-                        for mf in cutlass.range_constexpr(_M_FRAGS):
-                            a_row = warp_row * _WARP_TILE_M + mf * 16 + a_ldm_row
-                            a_off = a_row * _CTA_K_ELEMS + kb_base + a_ldm_col16 * _ELEMS_16B
-                            a_frags.append(
-                                nvvm.ldmatrix(
-                                    _apply_smem_swizzle(sA_ptr + a_off, _AB_SWIZZLE),
+                                b_frags.append((bv[0], bv[1]))
+                                b_frags.append((bv[2], bv[3]))
+                            if cutlass.const_expr(_N_FRAGS % 2 == 1):
+                                b_n = warp_col * _WARP_TILE_N + (_N_FRAGS - 1) * 8
+                                b_off = (
+                                    (b_n // b_tma_group_elems) * (b_tma_group_elems * _CTA_K_ELEMS)
+                                    + (kb_base + bt_ldm_k) * b_tma_group_elems
+                                    + b_n % b_tma_group_elems
+                                )
+                                bt = nvvm.ldmatrix(
+                                    _apply_smem_swizzle(sB_ptr + b_off, _AB_SWIZZLE),
+                                    2,
+                                    nvvm.MMALayout.COL,
+                                )
+                                b_frags.append((bt[0], bt[1]))
+                        else:
+                            for npair in cutlass.range_constexpr(_N_FRAG_PAIRS):
+                                b_row = warp_col * _WARP_TILE_N + npair * 16 + b_ldm_pair_row
+                                b_off = b_row * _CTA_K_ELEMS + kb_base + b_ldm_pair_col16 * _ELEMS_16B
+                                bv = nvvm.ldmatrix(
+                                    _apply_smem_swizzle(sB_ptr + b_off, _AB_SWIZZLE),
                                     4,
                                     nvvm.MMALayout.ROW,
                                 )
-                            )
-                    b_frags = []
-                    if cutlass.const_expr(b_is_n_major and _ELEM_BITS == 8):
-                        # ldmatrix.m16n16.x2.trans.b8 per n-frag pair: the tile's 16
-                        # transposed columns span n-frags (2p, 2p+1), so the result
-                        # regs are [b0(2p), b0(2p+1), b1(2p), b1(2p+1)]. Addresses
-                        # mirror the A-side b8 form: k = kb_base + lane, no lane map.
-                        # (_N_FRAGS is even here — asserted at render.)
-                        for npair in cutlass.range_constexpr(_N_FRAG_PAIRS):
-                            b_n = warp_col * _WARP_TILE_N + npair * 16
-                            b_off = (
-                                (b_n // b_tma_group_elems) * (b_tma_group_elems * _CTA_K_ELEMS) + (kb_base + lane) * b_tma_group_elems + b_n % b_tma_group_elems
-                            )
-                            bv = nvvm.ldmatrix(
-                                _apply_smem_swizzle(sB_ptr + b_off, _AB_SWIZZLE),
-                                4,
-                                nvvm.MMALayout.COL,
-                                shape=nvvm.LoadShape.M16N16,
-                                src_format=nvvm.LoadSrcFormat.B8,
-                            )
-                            b_frags.append((bv[0], bv[2]))
-                            b_frags.append((bv[1], bv[3]))
-                    elif cutlass.const_expr(b_is_n_major):
-                        for npair in cutlass.range_constexpr(_N_FRAG_PAIRS):
-                            b_n = warp_col * _WARP_TILE_N + npair * 16 + bt_ldm_n8 * 8
-                            b_off = (
-                                (b_n // b_tma_group_elems) * (b_tma_group_elems * _CTA_K_ELEMS)
-                                + (kb_base + bt_ldm_k) * b_tma_group_elems
-                                + b_n % b_tma_group_elems
-                            )
-                            bv = nvvm.ldmatrix(
-                                _apply_smem_swizzle(sB_ptr + b_off, _AB_SWIZZLE),
-                                4,
-                                nvvm.MMALayout.COL,
-                            )
-                            b_frags.append((bv[0], bv[1]))
-                            b_frags.append((bv[2], bv[3]))
-                        if cutlass.const_expr(_N_FRAGS % 2 == 1):
-                            b_n = warp_col * _WARP_TILE_N + (_N_FRAGS - 1) * 8
-                            b_off = (
-                                (b_n // b_tma_group_elems) * (b_tma_group_elems * _CTA_K_ELEMS)
-                                + (kb_base + bt_ldm_k) * b_tma_group_elems
-                                + b_n % b_tma_group_elems
-                            )
-                            bt = nvvm.ldmatrix(
-                                _apply_smem_swizzle(sB_ptr + b_off, _AB_SWIZZLE),
-                                2,
-                                nvvm.MMALayout.COL,
-                            )
-                            b_frags.append((bt[0], bt[1]))
-                    else:
-                        for npair in cutlass.range_constexpr(_N_FRAG_PAIRS):
-                            b_row = warp_col * _WARP_TILE_N + npair * 16 + b_ldm_pair_row
-                            b_off = b_row * _CTA_K_ELEMS + kb_base + b_ldm_pair_col16 * _ELEMS_16B
-                            bv = nvvm.ldmatrix(
-                                _apply_smem_swizzle(sB_ptr + b_off, _AB_SWIZZLE),
-                                4,
-                                nvvm.MMALayout.ROW,
-                            )
-                            b_frags.append((bv[0], bv[1]))
-                            b_frags.append((bv[2], bv[3]))
-                        if cutlass.const_expr(_N_FRAGS % 2 == 1):
-                            b_row = warp_col * _WARP_TILE_N + (_N_FRAGS - 1) * 8 + b_ldm_tail_row
-                            b_off = b_row * _CTA_K_ELEMS + kb_base + b_ldm_tail_col16 * _ELEMS_16B
-                            bt = nvvm.ldmatrix(
-                                _apply_smem_swizzle(sB_ptr + b_off, _AB_SWIZZLE),
-                                2,
-                                nvvm.MMALayout.ROW,
-                            )
-                            b_frags.append((bt[0], bt[1]))
+                                b_frags.append((bv[0], bv[1]))
+                                b_frags.append((bv[2], bv[3]))
+                            if cutlass.const_expr(_N_FRAGS % 2 == 1):
+                                b_row = warp_col * _WARP_TILE_N + (_N_FRAGS - 1) * 8 + b_ldm_tail_row
+                                b_off = b_row * _CTA_K_ELEMS + kb_base + b_ldm_tail_col16 * _ELEMS_16B
+                                bt = nvvm.ldmatrix(
+                                    _apply_smem_swizzle(sB_ptr + b_off, _AB_SWIZZLE),
+                                    2,
+                                    nvvm.MMALayout.ROW,
+                                )
+                                b_frags.append((bt[0], bt[1]))
 
-                    for mf in cutlass.range_constexpr(_M_FRAGS):
-                        av = a_frags[mf]
-                        for nf in cutlass.range_constexpr(_N_FRAGS):
-                            b0, b1 = b_frags[nf]
-                            _o = (mf * _N_FRAGS + nf) * 4
-                            acc[_o:4] = _mma_16x8_k32b(
-                                av[0],
-                                av[1],
-                                av[2],
-                                av[3],
-                                b0,
-                                b1,
-                                acc[_o + 0],
-                                acc[_o + 1],
-                                acc[_o + 2],
-                                acc[_o + 3],
-                            )
+                        # Every GEMM fed by this B operand (trace-time selection).
+                        for _g in cutlass.range_constexpr(num_gemms):
+                            if cutlass.const_expr(gemm_b_idx[_g] == _bj):
+                                _acc_g = acc_list[_g]
+                                a_frags = a_frags_list[gemm_a_idx[_g]]
+                                for mf in cutlass.range_constexpr(_M_FRAGS):
+                                    av = a_frags[mf]
+                                    for nf in cutlass.range_constexpr(_N_FRAGS):
+                                        b0, b1 = b_frags[nf]
+                                        _o = (mf * _N_FRAGS + nf) * 4
+                                        _acc_g[_o:4] = _mma_16x8_k32b(
+                                            av[0],
+                                            av[1],
+                                            av[2],
+                                            av[3],
+                                            b0,
+                                            b1,
+                                            _acc_g[_o + 0],
+                                            _acc_g[_o + 1],
+                                            _acc_g[_o + 2],
+                                            _acc_g[_o + 3],
+                                        )
 
                 nvvm.bar_warp_sync(0xFFFFFFFF)
                 cute.arch.fence_proxy("async.shared", space="cta")
@@ -750,49 +808,138 @@ def _kernel(
             # @@INJECT_AUX_VIEWS@@
 
             _stg_stage = smem_stg_epi.subview(warp_idx * _STG_EPI_WARP_ELEMS)
-            for mf in cutlass.range_constexpr(_M_FRAGS):
-                for grp in cutlass.range_constexpr(_STG_EPI_NGRP):
-                    _nf0 = grp * _STG_EPI_GROUP_FRAGS
-                    _grp_frags = min(_STG_EPI_GROUP_FRAGS, _N_FRAGS - _nf0)
-                    # -- STS_128: reg-index-order dump, one batch per fragment --
-                    for b in cutlass.range_constexpr(_grp_frags):
-                        _o = (mf * _N_FRAGS + _nf0 + b) * 4
-                        _s_off = b * _STG_EPI_BATCH_STRIDE + lane * _STG_EPI_LANE_QUAD
-                        (_stg_stage.data_ptr() + _s_off).store(acc[_o:4], alignment=16)
-                    nvvm.bar_warp_sync(0xFFFFFFFF)
-                    # -- LDS: 16 contiguous elems = both row-halves of one frag --
-                    _seg = (_stg_stage.data_ptr() + lane_mod4 * _STG_EPI_BATCH_STRIDE + lane_div4 * 16).load(alignment=16, count=16)
-                    # Short tail group: trailing lanes own no fragment there
-                    # (True at trace time for full groups — no guard emitted).
-                    _lane_active = True if _grp_frags == _STG_EPI_GROUP_FRAGS else lane_mod4 < _grp_frags
-                    if _lane_active:
-                        for half in cutlass.range_constexpr(2):
-                            row_in_cta = warp_row * _WARP_TILE_M + mf * 16 + half * 8 + lane_div4
+            if cutlass.const_expr(not row_per_lane_drain):
+                for mf in cutlass.range_constexpr(_M_FRAGS):
+                    for grp in cutlass.range_constexpr(_STG_EPI_NGRP):
+                        _nf0 = grp * _STG_EPI_GROUP_FRAGS
+                        _grp_frags = min(_STG_EPI_GROUP_FRAGS, _N_FRAGS - _nf0)
+                        # -- STS_128: reg-index-order dump, one batch per fragment; then
+                        # LDS: 16 contiguous elems = both row-halves of one frag. One GEMM
+                        # at a time through the same warp-private buffer (multi-GEMM keeps
+                        # every GEMM's segment in registers, not extra SMEM).
+                        _seg_list = []
+                        for _g in cutlass.range_constexpr(num_gemms):
+                            _acc_g = acc_list[_g]
+                            for b in cutlass.range_constexpr(_grp_frags):
+                                _o = (mf * _N_FRAGS + _nf0 + b) * 4
+                                _s_off = b * _STG_EPI_BATCH_STRIDE + lane * _STG_EPI_LANE_QUAD
+                                (_stg_stage.data_ptr() + _s_off).store(_acc_g[_o:4], alignment=16)
+                            nvvm.bar_warp_sync(0xFFFFFFFF)
+                            _seg_list.append((_stg_stage.data_ptr() + lane_mod4 * _STG_EPI_BATCH_STRIDE + lane_div4 * 16).load(alignment=16, count=16))
+                            if cutlass.const_expr(_g + 1 < num_gemms):
+                                nvvm.bar_warp_sync(0xFFFFFFFF)  # every lane has its segment before the buffer is reused
+                        # Short tail group: trailing lanes own no fragment there
+                        # (True at trace time for full groups — no guard emitted).
+                        _lane_active = True if _grp_frags == _STG_EPI_GROUP_FRAGS else lane_mod4 < _grp_frags
+                        if _lane_active:
+                            for half in cutlass.range_constexpr(2):
+                                row_in_cta = warp_row * _WARP_TILE_M + mf * 16 + half * 8 + lane_div4
+                                row = coord_m + row_in_cta
+                                if row < M:
+                                    _row_list = []
+                                    for _g in cutlass.range_constexpr(num_gemms):
+                                        _seg = _seg_list[_g]
+                                        _row = cutlass.Array(mma_c_dtype, 8, alignment=16)
+                                        for sj in cutlass.range_constexpr(4):
+                                            _row[2 * sj] = _seg[4 * sj + 2 * half]
+                                            _row[2 * sj + 1] = _seg[4 * sj + 2 * half + 1]
+                                        _row_list.append(_row)
+                                    for sv in cutlass.range_constexpr(8 // _STG_V):
+                                        col = coord_n + warp_col * _WARP_TILE_N + (_nf0 + lane_mod4) * 8 + sv * _STG_V
+                                        col_j = col
+                                        if col_j + vsize <= N:
+                                            # One epilogue input vector per GEMM: GEMM 0 is the
+                                            # template's `vec_f32`, GEMMs > 0 are bound as
+                                            # `vec_f32_<g>` by the injected STG bindings below.
+                                            # NB: Array slices are [start:COUNT], not
+                                            # [start:stop] (matches _acc_g[_o:4] above).
+                                            c_rmem_vecs = []
+                                            for _g in cutlass.range_constexpr(num_gemms):
+                                                _vec = _row_list[_g][sv * _STG_V : _STG_V]
+                                                if cutlass.const_expr(acc_widen_to_fp32):
+                                                    _pf = _vec.to(cutlass.Float32)
+                                                    c_rmem_vecs.append(_pf + cutlass.full_like(_pf, 0.0))
+                                                else:
+                                                    c_rmem_vecs.append(_vec)
+                                            vec_f32 = c_rmem_vecs[0]
+                                            # Every store carries its own output's offset: no template-level
+                                            # linear_idx, so a reduction-only chain (no output 0) renders.
+
+                                            # @@INJECT_STG_VEC_BINDINGS@@
+
+                                            # @@INJECT_EPILOGUE@@
+                        nvvm.bar_warp_sync(0xFFFFFFFF)
+            else:
+                # Row-per-lane drain: re-read the warp's accumulators row-major through the
+                # warp-private staging buffer so lane l owns row l of a 32-row slab (lanes
+                # 0..15 of a 16-row slab when the warp tile is one m-fragment) and a
+                # contiguous run of the slab's 32-column group -- the thread-owns-a-row
+                # view (warp = 32 consecutive rows) the block-quantize emitters are
+                # written for: a row block's amax is thread-local, a column block's is a
+                # (half-)warp redux. Each 16x32 sub-pass uses 512 of the warp's 528
+                # staging floats, so the drain needs no SMEM beyond the lane-run one.
+                for slab in cutlass.range_constexpr(_RPL_SLABS):
+                    for grp in cutlass.range_constexpr(_STG_EPI_NGRP):
+                        _nf0 = grp * _STG_EPI_GROUP_FRAGS
+                        _grp_frags = min(_STG_EPI_GROUP_FRAGS, _N_FRAGS - _nf0)
+                        _run_list = []
+                        for _g in cutlass.range_constexpr(num_gemms):
+                            _acc_g = acc_list[_g]
+                            _run = cutlass.Array(mma_c_dtype, 32, alignment=16)
+                            for _sp in cutlass.range_constexpr(_RPL_SUBPASSES):
+                                _mf = slab * _RPL_SUBPASSES + _sp
+                                # STS.64: regs (0,1) are row lane//4, regs (2,3) row lane//4 + 8,
+                                # columns 8b + 2*(lane%4) of n-fragment b.
+                                for b in cutlass.range_constexpr(_grp_frags):
+                                    for _hr in cutlass.range_constexpr(2):
+                                        _rr = lane_div4 + 8 * _hr
+                                        _off = _rr * 32 + ((2 * b + lane_mod4 // 2) ^ _rpl_swz(_rr)) * 4 + (lane_mod4 % 2) * 2
+                                        _o = (_mf * _N_FRAGS + _nf0 + b) * 4 + 2 * _hr
+                                        (_stg_stage.data_ptr() + _off).store(_acc_g[_o:2], alignment=8)
+                                nvvm.bar_warp_sync(0xFFFFFFFF)
+                                # LDS.128: lanes 16*_sp .. 16*_sp + 15 take this fragment's rows.
+                                if lane // 16 == _sp:
+                                    _r = lane % 16
+                                    for _j in cutlass.range_constexpr(2 * _grp_frags):
+                                        _run[_j * 4 : 4] = (_stg_stage.data_ptr() + _r * 32 + (_j ^ _rpl_swz(_r)) * 4).load(alignment=16, count=4)
+                                nvvm.bar_warp_sync(0xFFFFFFFF)  # the next sub-pass / GEMM reuses the buffer
+                            _run_list.append(_run)
+                        # Lanes 16..31 own no row when the slab is a single 16-row fragment.
+                        _rows_owned = True if _RPL_SUBPASSES == 2 else lane < 16
+                        if _rows_owned:
+                            row_in_cta = warp_row * _WARP_TILE_M + slab * (16 * _RPL_SUBPASSES) + lane
                             row = coord_m + row_in_cta
-                            if row < M:
-                                _row = cutlass.Array(mma_c_dtype, 8, alignment=16)
-                                for sj in cutlass.range_constexpr(4):
-                                    _row[2 * sj] = _seg[4 * sj + 2 * half]
-                                    _row[2 * sj + 1] = _seg[4 * sj + 2 * half + 1]
-                                for sv in cutlass.range_constexpr(8 // _STG_V):
-                                    col = coord_n + warp_col * _WARP_TILE_N + (_nf0 + lane_mod4) * 8 + sv * _STG_V
+                            # A col quant reduces a block's amax across the lanes that hold
+                            # its rows, so under rpl_bounded_rows every lane reaches the
+                            # redux: the guard is always taken and each store carries
+                            # row < M itself (generate(..., bounded_rows=True)). A runtime
+                            # M that splits a column block can then give wrong values for
+                            # that block, never a hung warp.
+                            if cutlass.const_expr(rpl_bounded_rows):
+                                _row_live = True
+                            else:
+                                _row_live = row < M
+                            if _row_live:
+                                for _jv in cutlass.range_constexpr((_grp_frags * 8) // vsize):
+                                    col = coord_n + warp_col * _WARP_TILE_N + _nf0 * 8 + _jv * vsize
                                     col_j = col
                                     if col_j + vsize <= N:
-                                        # NB: Array slices are [start:COUNT], not
-                                        # [start:stop] (matches acc[_o:2] above).
-                                        _vec = _row[sv * _STG_V : _STG_V]
-                                        if cutlass.const_expr(acc_widen_to_fp32):
-                                            _pf = _vec.to(cutlass.Float32)
-                                            vec_f32 = _pf + cutlass.full_like(_pf, 0.0)
-                                        else:
-                                            vec_f32 = _vec
-                                        # Every store carries its own output's offset: no template-level
-                                        # linear_idx, so a reduction-only chain (no output 0) renders.
+                                        # One vsize-wide epilogue vector per GEMM (GEMM 0 is
+                                        # `vec_f32`; the injected bindings name the others).
+                                        # NB: Array slices are [start:COUNT], not [start:stop].
+                                        c_rmem_vecs = []
+                                        for _g in cutlass.range_constexpr(num_gemms):
+                                            _vec = _run_list[_g][_jv * vsize : vsize]
+                                            if cutlass.const_expr(acc_widen_to_fp32):
+                                                _pf = _vec.to(cutlass.Float32)
+                                                c_rmem_vecs.append(_pf + cutlass.full_like(_pf, 0.0))
+                                            else:
+                                                c_rmem_vecs.append(_vec)
+                                        vec_f32 = c_rmem_vecs[0]
 
                                         # @@INJECT_STG_VEC_BINDINGS@@
 
                                         # @@INJECT_EPILOGUE@@
-                    nvvm.bar_warp_sync(0xFFFFFFFF)
             red_part_flush_tile(_red_part, lane, M, N, (tile_l,), _red_part_args)
 
             consumer_stage = tile_iter % CLC_SCHED_STAGES

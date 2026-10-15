@@ -676,15 +676,16 @@ def test_mxfp8_ragged_padded_entries_match_the_oracle():
 
 
 @requires_rubin
-def test_mxfp8_block_second_execute_agrees_bitwise_and_runs_natural_cga1():
+def test_mxfp8_block_second_execute_agrees_bitwise_and_runs_natural_pair():
     """Same plan, fresh output + workspace, bit-identical (no per-execute compile / allocation; a cold-cache race
-    probe); the compiled record is the MXFP8 row's NATURAL policy at cta_mma 1 (the adapter's quantized d256 rule),
+    probe); the compiled record is the MXFP8 row's NATURAL policy at cta_mma 2 (a dense, unsplit d256 MXFP8 leg runs the
+    2-CTA pair on cc 10.7, config_sm100.d256_mxfp8_pair_leg, #1608),
     the block-scale kernel (pertensor False), amax folded out."""
     from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
 
     out, _, blk, mx, _ = _run_mx_block(_GEOM, batch=1, seq_len=512)
     tp = blk._sdpa._impl.template_params()
-    assert tp.sched_policy == SCHED_NATURAL and tp.cta_mma == 1 and tp.epilogue_gate is False
+    assert tp.sched_policy == SCHED_NATURAL and tp.cta_mma == 2 and tp.epilogue_gate is False
     assert blk._sdpa._impl._pertensor is False and blk._sdpa._impl.has_amax_o is False
     # The compiled record folded the amax OUT (kernel carries `has_amax`, caller asked for none): the adapter then
     # binds None in the amax slot and issues NO per-execute `amax_o.zero_()` memset -- the CUPTI-free half of the

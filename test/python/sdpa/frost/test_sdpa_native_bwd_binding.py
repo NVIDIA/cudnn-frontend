@@ -213,6 +213,28 @@ def test_backward_raw_storage_and_explicit_geometry(arch, role):
 
 
 @pytest.mark.parametrize("arch", _ARCHES)
+def test_backward_native_binder_converts_sequence_geometry(arch):
+    # The standalone adapters hand ``bind`` their per-call geometry as a LIST of (shape, strides) pairs
+    # (``prepared_sm100.execute_standalone`` / ``prepared_sm107.execute_standalone``); the graph path builds tuples.  The native
+    # binder converts any sequence, as the Python binder does, instead of refusing a list with a C++ cast error before the
+    # geometry check runs.
+    spec, _, facts, declared, _ = _fixture(arch)
+    spec = replace(spec, native_binding=True)
+    expected = prep.bind(spec, facts, _WORKSPACE, 17, geometry=declared, raw_storage=True)
+    as_lists = [None if g is None else [list(g[0]), list(g[1])] for g in declared]
+    assert prep.bind(spec, facts, _WORKSPACE, 17, geometry=list(declared), raw_storage=True) == expected
+    assert prep.bind(spec, facts, _WORKSPACE, 17, geometry=as_lists, raw_storage=True) == expected
+    changed = dict(facts, q=facts["q"]._replace(shape=(facts["q"].span,), strides=(1,)))
+    with pytest.raises(ValueError, match="runtime geometry"):
+        prep.bind(spec, changed, _WORKSPACE, 17, geometry=as_lists, raw_storage=True)
+    with pytest.raises(ValueError, match="geometry count"):
+        prep.bind(spec, facts, _WORKSPACE, 17, geometry=as_lists[:-1], raw_storage=True)
+    # Something that is not a sequence is refused by Python's own TypeError, not by a C++ cast error.
+    with pytest.raises(TypeError):
+        prep.bind(spec, facts, _WORKSPACE, 17, geometry=7, raw_storage=True)
+
+
+@pytest.mark.parametrize("arch", _ARCHES)
 def test_backward_optional_and_unknown_raw_addresses(arch):
     spec, native, facts, _, frames = _fixture(arch, features=False)
     unknown = {role: f._replace(dtype="", device=(-1, -1), span=-1, shape=(), strides=()) for role, f in facts.items()}

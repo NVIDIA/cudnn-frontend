@@ -347,6 +347,12 @@ LSE_s = -inf, exactly the combine's identity), so every ring advances exactly as
 MAX_TILES_PER_ITEM (a larger split has an empty chunk on every item).  No barrier init count, ring depth, SMEM buffer or TMEM
 column changes: the per-sequence list is a SOURCE change of barrier row 3, the split a tile-range change of rows 5-10 plus the
 epilogue's store target.  THD never composes with the three arms (the config refuses each pair).
+MTP rows as single-token items (the shared list at S_q <= 4): every row is its OWN work item re-gathering the sequence's list --
+per item IDS_TX_BYTES of ids (2 KiB at top_k 512; the copy runs for every item, dead ones included) plus (count + n_tail) x 4 rows x
+2 operands x 512 B of K / V (514 blocks = 2056 KiB at a saturated list with two tail ids; 17 tiles x 128 KiB credited with the
+zero-fill), so a step's bytes are S_q x the single-row step's: 2 KV heads x 4 rows x ~2.1 MiB = ~16 MiB per sequence per layer at
+S_q = 4 (~4 MiB at S_q = 1), and the sequence's list row is copied S_q x H_kv x SPLIT_KV times.  The 64-wide single-item form
+that would gather the shared list once is not built.
 
 DEGENERATE-INPUT MATRIX (every row names its handling site): empty selection / pos < 0 -> dead -> one -1 tile -> the
 row_dead SELECT; a query with 0 complete blocks (pos in {0, 1, 2}) -> count 0, has_open 1, the key_abs <= pos term;

@@ -363,6 +363,25 @@ def test_nonpaged_d128_rubin_split_obeys_physical_wave_budget(monkeypatch, batch
         assert mismatch(spec.capabilities, facts, heur.SdpaFwdKnobs(cga=1, split_kv=splits, pack_gqa=packed)) is None
 
 
+@requires_dsl
+def test_nonpaged_d128_rubin_short_kv_split_needs_the_cache_ratio(monkeypatch):
+    """Below 2048 tokens the cc 10.7 D128 nonpaged split is proposed only above the module's KV floor and only when the
+    cache holds the module's ratio of query rows; the SM100 line keeps its 2048 floor.  Bounds are read from the module,
+    so no measured boundary is pinned here."""
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    rubin = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    kv = (heur._SM107_THD_SPLIT_MIN_KV + 2048) // 2
+    fits = kv // heur._SM107_THD_SPLIT_SHORT_KV_RATIO
+    facts = lambda q, cc, sms: _mla_split_facts(d_qk=128, b=1, h_q=8, h_kv=2, s_q=q, s_kv=kv, device_cc=cc, device_sm_count=sms)
+    splits, packed = heur.nonpaged_thd_split_choice(rubin.capabilities, facts(fits, (10, 7), 204))
+    assert splits > 1, "an underfilled short-cache launch inside the ratio splits"
+    assert mismatch(rubin.capabilities, facts(fits, (10, 7), 204), heur.SdpaFwdKnobs(cga=1, split_kv=splits, pack_gqa=packed)) is None
+    assert heur.nonpaged_thd_split_choice(rubin.capabilities, facts(fits * 2, (10, 7), 204)) == (1, False), "past the ratio it does not"
+    assert heur.nonpaged_thd_split_choice(SPEC.capabilities, facts(fits, (10, 0), 148)) == (1, False), "SM100 keeps 2048"
+
+
 @pytest.mark.parametrize("split", [1, 2])
 @requires_dsl
 def test_sm107_paged_d128_cga1_geometry_matches_selected_template(split):

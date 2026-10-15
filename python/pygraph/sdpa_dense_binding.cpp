@@ -247,13 +247,19 @@ class SdpaDenseBinder {
                                       : (dtype == "float16" ? kDLFloat : kDLBfloat);
             dtype_bits_[i] = packed_o || fp8 ? 8 : 16;
         }
+        // The epilogue gate: the Rubin d256 bodies over dense K/V (half, per-tensor FP8 with a bf16 G, MXFP8) and the
+        // shared SM100 d256 half body over PAGED pools (dense queries past the decode tile; the paged gate).  A split
+        // (the gate rides the combine there), a ragged-Q leg and a block-scaled O keep refusing it.
         has_gate_ = !spec.attr("gate_expect").is_none();
         if (has_gate_) {
             const auto dtype = py::cast<std::string>(spec.attr("gate_expect"));
             if ((dtype != "float16" && dtype != "bfloat16") ||
                 (quantized_ ? dtype != "bfloat16" : dtype != py::cast<std::string>(expect["q"])) || split_ != 1 ||
-                paged_ || ragged_ || block_output_ || dq != 256 || dv != 256)
-                invalid("native epilogue gate requires an existing dense unsplit D256 half/BF16-gate plan");
+                ragged_ || block_output_ || dq != 256 || dv != 256 || (paged_ && quantized_))
+                invalid(
+                    "native epilogue gate requires an unsplit D256 half/BF16-gate plan (dense K/V, or paged pools with "
+                    "half "
+                    "operands)");
             gate_code_ = dtype == "float16" ? kDLFloat : kDLBfloat;
         }
         auto order = py::cast<std::vector<std::string>>(spec.attr("order"));
@@ -857,6 +863,11 @@ void
 init_sdpa_dense_binding(py::module_ &m) {
     py::class_<SdpaDenseBinder>(m, "_SdpaDenseBinder")
         .def(py::init<const py::object &>(), py::arg("spec"))
+        // The epilogue gate roles the Python side reads before building a gated spec (typed declines on an older
+        // extension): the gate over dense K/V, and the gate over PAGED pools (the shared SM100 d256 half body compiled
+        // for cc 10.7).
+        .def_prop_ro_static("supports_epilogue_gate", [](py::object) { return true; })
+        .def_prop_ro_static("supports_paged_epilogue_gate", [](py::object) { return true; })
         .def("bind", &SdpaDenseBinder::bind, py::arg("pack"), py::arg("indices"), py::arg("stream"))
         .def("bind_split",
              &SdpaDenseBinder::bind_split,

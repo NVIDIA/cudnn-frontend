@@ -296,6 +296,15 @@ class NormRopeFusionParams:
     weight_fp4: bool = (
         False  # e2m1 W_qkvg (torch.float4_e2m1fn_x2) on the MXFP8 fork: the catalog's mixed row at K32, the padded E2M1 SMEM form; appended, keys unchanged
     )
+    # The paged KV-cache WRITE-THROUGH arm of the bf16 fork (appended; 0 = every existing key spelled identically): the epilogue
+    # also stores every K / V tile's post-norm, post-RoPE row into the pools ``[P, H_kv, kv_pool_page_size, D]`` at
+    # ``slot_mapping[token]`` (a negative slot or one past the pools writes nothing) -- the gated attention block's serving
+    # cache write folded into stage (1): one more st.global.v4 stream per row from the registers the slab store reads, a
+    # per-row slot read before the accumulator wait; no new barrier, no new SMEM.  The page size is a compile key (the
+    # in-kernel divide), the slot dtype too (``kv_slot_i64``: int64 slots as two 32-bit halves), exactly as in the separate
+    # ``cache_write.py`` kernel the arm replaces bitwise.  bf16 fork only, ``norm_source`` in ("ldg", "ldg_early").
+    kv_pool_page_size: int = 0
+    kv_slot_i64: bool = False
 
     @property
     def offsets(self) -> tuple[int, int, int, int]:
@@ -373,6 +382,16 @@ def validate_norm_rope_params(p: NormRopeFusionParams) -> None:
             raise ValueError(
                 "quant_mxfp8: norm_source='off' has no meaning on the MXFP8 fork (no single bf16 slab to degenerate to); use 'const' for the floor"
             )
+    if p.kv_pool_page_size or p.kv_slot_i64:
+        if p.kv_pool_page_size < 1:
+            raise ValueError(f"kv_slot_i64 belongs to the write-through arm; set kv_pool_page_size > 0 (got {p.kv_pool_page_size})")
+        if p.quant_fp8 or p.quant_mxfp8:
+            raise NotImplementedError(
+                "kv_pool_page_size: the paged KV-cache write-through arm is wired on the bf16 fork only (the pools are bf16 / f16, the activation dtype); the "
+                "quantizing forks keep the separate cache-write launch"
+            )
+        if p.norm_source not in ("ldg", "ldg_early"):
+            raise ValueError(f"kv_pool_page_size needs the production epilogue arm (norm_source 'ldg' / 'ldg_early'), got {p.norm_source!r}")
     if p.weight_fp4:
         if p.quant_fp8:
             raise ValueError(
@@ -481,6 +500,12 @@ def run_fused_proj_gemm(
     rstd_k: Optional[torch.Tensor] = None,  # [M, H_kv] fp32
     *,
     stream,
+    # APPENDED (the write-through arm, params.kv_pool_page_size > 0 -- all three REQUIRED there, REFUSED otherwise): the K / V pools
+    # [P, H_kv, page_size, D] (D contiguous, the other three strides free: HND compact, NHD, a unified row's half) and the [M] int32 /
+    # int64 slot map (its dtype = the artifact's kv_slot_i64).
+    k_cache: Optional[torch.Tensor] = None,
+    v_cache: Optional[torch.Tensor] = None,
+    slot_mapping: Optional[torch.Tensor] = None,
 ) -> None:
     """Launch.  No allocation, no conversion; every check is cheap host arithmetic.
 
@@ -495,6 +520,23 @@ def run_fused_proj_gemm(
     if plan.mxfp8:
         raise ValueError("this plan is the MXFP8 fork (q8/k8/v8/gate16 + sf_q/sf_k/sf_v outputs); launch it with run_fused_proj_gemm_mxfp8")
     p = plan.params
+    pools = (k_cache, v_cache, slot_mapping)
+    if p.kv_pool_page_size:
+        from cudnn.gated_attention_block.cache_write_contract import check_pool, check_slot_mapping
+
+        if any(x is None for x in pools):
+            raise ValueError(
+                "this artifact folds the paged KV-cache write-through into its epilogue: k_cache, v_cache and slot_mapping are required (Rule 1: no silent fallback)"
+            )
+        m_rows = int(_rank3(a, "a").shape[1])
+        check_pool(k_cache, "k_cache", h=p.h_kv, page_size=p.kv_pool_page_size, d=p.d_head, dtype=a.dtype)
+        check_pool(v_cache, "v_cache", h=p.h_kv, page_size=p.kv_pool_page_size, d=p.d_head, dtype=a.dtype)
+        check_slot_mapping(slot_mapping, "slot_mapping", t=m_rows)
+        want = torch.int64 if p.kv_slot_i64 else torch.int32
+        if slot_mapping.dtype != want:
+            raise ValueError(f"slot_mapping is {slot_mapping.dtype} but this artifact was compiled for {want}; the slot dtype is a compile key (kv_slot_i64)")
+    elif any(x is not None for x in pools):
+        raise ValueError("k_cache / v_cache / slot_mapping are consumed by the write-through arm only (params.kv_pool_page_size > 0); this artifact has none")
     a3, w3, o3 = _rank3(a, "a"), _rank3(w, "w"), _rank3(out, "out")
     m, k = int(a3.shape[1]), int(a3.shape[2])
     n = int(w3.shape[1])
@@ -532,6 +574,7 @@ def run_fused_proj_gemm(
         rstd_q,
         rstd_k,
         cuda.CUstream(int(stream)),
+        *((k_cache, v_cache, slot_mapping) if p.kv_pool_page_size else ()),
     )
 
 
