@@ -2872,7 +2872,12 @@ band or a left window declared, exactly `_mask_flags_from`), by the facts twins 
 the two readings' agreement).** So the dense paged d256 envelope of the Rubin row WIDENS for packed, masked steps only: 33 .. 64 packed rows
 in one unit and 65 .. 128 in two (24 / 2 at `S_q` 5 .. 8, 32 / 2 at `S_q` 5 .. 8 and 64 / 2 at `S_q` 3 / 4 over a paged cache are served where
 they were a typed decline or the unpacked arm); a mask-free paged packed step and an unpacked step of 33 .. 64 tokens keep the (16, 32)
-route value for value; a dense (unpaged) packed step of 33 .. 64 rows rides the width with any mask. The route functions take the form
+route value for value; a dense (unpaged) packed step of 33 .. 64 rows rides the width with any mask. On the GRAPH path the cells past 32
+unpacked rows (4 / 2 at `S_q` 33 .. 64, 6 / 2 at 33 .. 42 over pages under a mask: the packed two-unit form, the unpacked arm past the
+32-column tile) are offered since the row's facts-only admission asks whether SOME packing rides the tile (`engines.mismatch(caps, facts,
+None)`; it asked the unpacked question alone until 2026-10-15 and dropped the row, so the ranked list offered nothing there while the
+adapter and the facts twins routed the packed form -- the packed knob set itself always passed); the list holds the packed set alone
+there, pinned host-side over a (group, S_q, paged, masked) grid and at the graph level in the Rubin decode suite. The route functions take the form
 (`decode_d256_q_tile(s_q, pack_g, max_token_units=None, *, paged=False, masked=True, max_q_tile=None)`, `decode_d256_single_unit_q_tile`,
 `decode_d256_route_widths`) and a CAP: `max_q_tile=32` is the route before the width landed, value for value (pinned against the shared
 SM100 rule with the Rubin constants at every `(S_q, group)`) -- surfaced as `SdpaFwdDslSm100(decode_q_tile_max=)` (appended; refused off
