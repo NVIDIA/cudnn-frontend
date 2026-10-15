@@ -496,10 +496,10 @@ TEST_CASE("Precompiled plans need no retention by the CUDA graph", "[cudagraph][
 }
 
 /*
-Execution plans whose CUDA graphs are all gone are released lazily, on a later
-execute() that is not being captured. That release frees device resources,
-which must not disturb a capture that is active at that moment on ANOTHER
-stream in global mode (from this or any other thread).
+Execution plans whose CUDA graphs are all gone are released lazily, when the
+frontend next destroys an execution plan or graph. That release frees device
+resources, which must not disturb a capture that is active at that moment on
+ANOTHER stream in global mode (from this or any other thread).
 */
 TEST_CASE("Releasing retained plans does not disturb another stream's capture", "[cudagraph][graph]") {
 #if (CUDART_VERSION < 12000)
@@ -566,9 +566,9 @@ TEST_CASE("Releasing retained plans does not disturb another stream's capture", 
     CUDA_CHECK(cudaStreamBeginCapture(stream_a, cudaStreamCaptureModeGlobal));
     REQUIRE(captured->execute(handle, variant_pack, captured_workspace.devPtr).is_good());
 
-    // 3. While the capture is active, release the queued plan from step 1. This is what an
-    //    execute() on a stream that is not capturing does; it frees the plan's device
-    //    resources and must not invalidate stream A's capture.
+    // 3. While the capture is active, release the queued plan from step 1. This is what
+    //    destroying a frontend plan or graph does; it frees the plan's device resources and
+    //    must not invalidate stream A's capture.
     cudnn_frontend::detail::CudaGraphRetainedResource::drain_deferred_releases();
 
     // 4. Stream A's capture is still valid and replays correctly.
@@ -598,6 +598,143 @@ memcpy that is part of the recorded CUDA graph. That memcpy reads its host sourc
 replay, so the source must live as long as the CUDA graph, even after the frontend graph that
 computed it is destroyed.
 */
+namespace {
+// Counts the payloads of CudaGraphRetainedResource that have been released.
+int released_payloads = 0;
+
+std::shared_ptr<void>
+make_counted_payload() {
+    return std::shared_ptr<void>(new int(0), [](void *p) {
+        delete static_cast<int *>(p);
+        ++released_payloads;
+    });
+}
+
+// Queue one payload for release: an owner records it into a CUDA graph, the owner goes away, then
+// the graph does.
+void
+queue_one_release() {
+    cudaGraph_t graph;
+    CUDA_CHECK(cudaGraphCreate(&graph, 0));
+    {
+        cudnn_frontend::detail::CudaGraphRetainedResource owner;
+        REQUIRE(owner.retain_on_graph(graph, make_counted_payload) == cudaSuccess);
+    }
+    CUDA_CHECK(cudaGraphDestroy(graph));
+    CUDA_CHECK(cudaDeviceSynchronize());  // user-object destructors may run asynchronously
+}
+}  // namespace
+
+/*
+What a CUDA graph keeps alive is released only once no CUDA graph holds it, and then only when
+the frontend destroys an owner (an execution plan, a graph's host-copy storage, ...). Never
+during an execution: releasing frees memory or unloads code, which waits for all work on the
+device, so an execute would block on, or deadlock with, unrelated streams.
+*/
+TEST_CASE("Retained resources are released when an owner is destroyed", "[cudagraph]") {
+#if (CUDART_VERSION < 12000)
+    SKIP("Test requires cuda toolkit 12.0 or above");
+#else
+    if (cudnnGetCudartVersion() < 12000) {
+        SKIP("Test requires cuda toolkit 12.0 or above");
+    }
+    using cudnn_frontend::detail::CudaGraphRetainedResource;
+    CudaGraphRetainedResource::drain_deferred_releases();
+    released_payloads = 0;
+
+    SECTION("a graph that outlives its owner keeps the payload until the graph and an owner are gone") {
+        cudaGraph_t graph;
+        CUDA_CHECK(cudaGraphCreate(&graph, 0));
+        {
+            CudaGraphRetainedResource owner;
+            REQUIRE(owner.retain_on_graph(graph, make_counted_payload) == cudaSuccess);
+        }
+        REQUIRE(released_payloads == 0);  // the graph still holds it
+
+        auto other_owner = std::make_unique<CudaGraphRetainedResource>();
+        CUDA_CHECK(cudaGraphDestroy(graph));
+        CUDA_CHECK(cudaDeviceSynchronize());
+        REQUIRE(CudaGraphRetainedResource::has_deferred_releases());
+        REQUIRE(released_payloads == 0);
+
+        // Recording work on a stream that is not being captured, as execute() does, releases nothing.
+        cudaStream_t stream;
+        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        REQUIRE(other_owner->retain_on_capturing_stream(stream, make_counted_payload) == cudaSuccess);
+        CUDA_CHECK(cudaStreamDestroy(stream));
+        REQUIRE(released_payloads == 0);
+
+        // Destroying any owner does.
+        other_owner.reset();
+        REQUIRE(released_payloads == 1);
+        REQUIRE_FALSE(CudaGraphRetainedResource::has_deferred_releases());
+    }
+
+    SECTION("an owner that outlives its graphs releases the payload when it is destroyed") {
+        cudaGraph_t graph;
+        CUDA_CHECK(cudaGraphCreate(&graph, 0));
+        {
+            CudaGraphRetainedResource owner;
+            REQUIRE(owner.retain_on_graph(graph, make_counted_payload) == cudaSuccess);
+            CUDA_CHECK(cudaGraphDestroy(graph));
+            CUDA_CHECK(cudaDeviceSynchronize());
+            REQUIRE(released_payloads == 0);  // the owner still holds it
+        }
+        REQUIRE(released_payloads == 1);
+        REQUIRE_FALSE(CudaGraphRetainedResource::has_deferred_releases());
+    }
+#endif
+}
+
+TEST_CASE("Executing a frontend graph does not release what CUDA graphs handed back", "[cudagraph][graph]") {
+#if (CUDART_VERSION < 12000)
+    SKIP("Test requires cuda toolkit 12.0 or above");
+#else
+    if (cudnnGetCudartVersion() < 12000) {
+        SKIP("Test requires cuda toolkit 12.0 or above");
+    }
+    using cudnn_frontend::detail::CudaGraphRetainedResource;
+    CudaGraphRetainedResource::drain_deferred_releases();
+    released_payloads = 0;
+
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
+
+    int64_t b = 8, m = 32, n = 16, k = 8;
+    float scale_value  = .5f;
+    half starter_value = __float2half(1.f);
+    half bias_value    = __float2half(2.f);
+    Surface<half> a_gpu(b * m * k, starter_value);
+    Surface<half> b_gpu(b * k * n, starter_value);
+    Surface<half> d_gpu(b * m * n);
+    std::unordered_map<cudnn_frontend::graph::Tensor_attributes::uid_t, void *> variant_pack = {
+        {A_UID, a_gpu.devPtr}, {B_UID, b_gpu.devPtr}, {C_UID, &bias_value}, {D_UID, d_gpu.devPtr}};
+
+    // Built before anything is queued: building creates and drops plans, and dropping one releases.
+    auto graph = create_graph(b, m, n, k, scale_value);
+    REQUIRE(graph->validate().is_good());
+    REQUIRE(graph->build_operation_graph(handle).is_good());
+    REQUIRE(graph->create_execution_plans({cudnn_frontend::HeurMode_t::A}).is_good());
+    REQUIRE(graph->check_support().is_good());
+    REQUIRE(graph->build_plans().is_good());
+    Surface<int8_t> workspace(graph->get_workspace_size());
+
+    queue_one_release();
+    REQUIRE(CudaGraphRetainedResource::has_deferred_releases());
+
+    for (int i = 0; i < 3; ++i) {
+        REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    REQUIRE(released_payloads == 0);
+    REQUIRE(CudaGraphRetainedResource::has_deferred_releases());
+
+    graph.reset();
+    REQUIRE(released_payloads == 1);
+    REQUIRE_FALSE(CudaGraphRetainedResource::has_deferred_releases());
+#endif
+}
+
 namespace {
 std::shared_ptr<cudnn_frontend::graph::Graph>
 create_alibi_sdpa_graph(int64_t b, int64_t h, int64_t s, int64_t d) {
