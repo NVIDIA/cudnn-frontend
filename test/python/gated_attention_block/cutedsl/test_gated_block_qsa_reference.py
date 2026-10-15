@@ -520,7 +520,10 @@ class TestInputs:
         r_ids, r_lens = random_block_ids(pos, 512, BS, generator=gen)
         assert torch.equal(r_lens, lens)
         assert block_ids_contract_violations(r_ids, pos, 2060, block_size=BS, block_lens=r_lens, top_k=512) == []
-        assert sorted(r_ids[2051].tolist()) != list(range(512))  # a random 512-subset of 513 in random order ...
+        # a random 512-subset of 513 in random order ... (one row drops its LAST block with p = 1/513, hit on Rubin; check rows 2051-2059)
+        past = [sorted(r_ids[row].tolist()) for row in range(2051, 2060)]
+        assert all(len(set(ids_row)) == 512 and ids_row[-1] < (row + 1) // BS for row, ids_row in zip(range(2051, 2060), past))
+        assert any(ids_row != list(range(512)) for ids_row in past)
         assert sorted(r_ids[2047].tolist()) == list(range(512))  # ... and the full set below the bound
         assert r_ids[2047].tolist() != list(range(512))  # in random order
         gen2 = torch.Generator(device=DEV).manual_seed(0)
