@@ -557,17 +557,42 @@ def test_decode_tile_small_batch_splits_to_fill_the_machine():
 
 
 def test_decode_tile_wide_q_tile_splits_the_serving_shape():
-    """The same 64 units on the 32-column tile (S_q=2 x 16:1, the MTP step):
-    a lone CTA there streams a tile 1.6x slower (90.2 vs 57.1 us unsplit), so
-    split 2 saves ~32 us of GPU time -- enough to pay for the launch -- and
-    leads in both regimes; a saturated launch still does not split.  The
-    adapter does not route that tile today (config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS
-    keeps (16, 32] rows on the prefill tile: even split, 96-103 us eager against
-    the prefill tile's 66 us); its fit stays pinned for when it is routed."""
-    assert _decode_tile(64, 4096, q_tile=32) == 2
-    assert _decode_tile(64, 4096, q_tile=32, launch_cost=0.0) == 2
-    assert _decode_tile(16, 4096, q_tile=32) == 8
-    assert _decode_tile(256, 4096, q_tile=32) == 1
+    """The same 64 units on the 32-column tile (S_q=2 x 16:1, the MTP step) ON THE
+    BLACKWELL LINE (``device_cc=(10, 0)``): a lone CTA there streams a tile 1.6x
+    slower (90.2 vs 57.1 us unsplit), so split 2 saves ~32 us of GPU time --
+    enough to pay for the launch -- and leads in both regimes; a saturated launch
+    still does not split.  The adapter does not route that tile on that line
+    (config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS keeps (16, 32] rows on the prefill
+    tile: even split, 96-103 us eager against the prefill tile's 66 us); its fit
+    stays pinned for when it is routed.  The Rubin line's sibling kernel has its
+    own, measured, per-width table (the test below)."""
+    assert _decode_tile(64, 4096, q_tile=32, device_cc=(10, 0)) == 2
+    assert _decode_tile(64, 4096, q_tile=32, device_cc=(10, 0), launch_cost=0.0) == 2
+    assert _decode_tile(16, 4096, q_tile=32, device_cc=(10, 0)) == 8
+    assert _decode_tile(256, 4096, q_tile=32, device_cc=(10, 0)) == 1
+
+
+def test_decode_tile_rubin_widths_are_priced_by_their_measured_stream_rates():
+    """The cc 10.7 decode tile's per-CTA time per 128-key KV tile, measured on the Rubin
+    performance class (212 SMs, device time): 16-column 0.90-1.00 us, 32-column 1.03-1.07,
+    64-column 1.55-1.60 -- so the model prices a lone CTA's tile at 1.0 / 1.1 / 1.65 by
+    width there (the 32-column tile is NOT the Blackwell line's issue-bound 1.6x), and one
+    64-column unit costs three quarters of two 32-column units on the same KV range.  What
+    the 32-column price decides: the two-unit 32-column route of the B 32 x kv 32K MTP step
+    (128 units x 256 tiles) stays UNSPLIT -- measured 277.6 us unsplit against 307.8 at
+    split 2 -- where the Blackwell constant split it; the B 128 x kv 4K two-unit form
+    (512 units) likewise.  ``device_cc=None`` reads the Rubin table (the only line that
+    routes a width past 16; the 16-column tile costs 1.0 on both)."""
+    from cudnn.sdpa.fwd.heuristics import _decode_tile_cost_for
+
+    assert [_decode_tile_cost_for(w, (10, 7)) for w in (16, 32, 64)] == [1.0, 1.1, 1.65]
+    assert [_decode_tile_cost_for(w, None) for w in (16, 32, 64)] == [1.0, 1.1, 1.65]
+    assert _decode_tile_cost_for(16, (10, 0)) == 1.0 and _decode_tile_cost_for(32, (10, 0)) == 1.6 and _decode_tile_cost_for(32, (10, 3)) == 1.6
+    assert _decode_tile(128, 32768, sm_count=212, q_tile=32) == 1
+    assert _decode_tile(128, 32768, sm_count=212, q_tile=32, launch_cost=0.0) == 1
+    assert _decode_tile(512, 4096, sm_count=212, q_tile=32) == 1
+    # the serving shape's 32-column one-unit form (S_q 2 x 16:1 at B 32) still splits once -- on the stream rate, not the launch
+    assert _decode_tile(64, 4096, sm_count=212, q_tile=32, launch_cost=0.0) == 2
 
 
 def test_decode_tile_saturated_launch_never_splits():
@@ -598,7 +623,7 @@ def test_decode_tile_short_kv_does_not_split():
     assert _decode_tile(2, 1024, launch_cost=0.0) > 1
 
 
-@pytest.mark.parametrize("q_tile", [16, 32])
+@pytest.mark.parametrize("q_tile", [16, 32, 64])
 @pytest.mark.parametrize("units", [2, 16, 64, 128])
 def test_decode_tile_longer_kv_never_splits_less(units, q_tile):
     """On tile-aligned KV lengths the choice is monotone in the length and a

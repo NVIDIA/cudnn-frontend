@@ -402,17 +402,41 @@ def choose_split_kv(
 _DECODE_TILE_SATURATION_FRACTION = 0.55
 # What a CTA costs beyond its KV loop (Q^T load, prologue, a 16/32-row epilogue).
 _DECODE_TILE_CTA_COST = 1.0
-# A KV tile's cost to a lone CTA on the 32-column tile (S_q x G in (16, 32]:
-# two softmax column groups over the same 128 TMEM lanes, issue-bound where
-# the 16-column tile is bandwidth-bound): 64 CTAs x 32 tiles ran 90.2 us
-# against the 16-column tile's 57.1 us (B200). HBM saturates at the same byte
-# rate, so a slower stream also needs proportionally more CTAs to reach it.
-# That tile is compiled but not routed on the Blackwell line (the adapter keeps
-# S_q x G in (16, 32] on the prefill tile there,
-# config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS); the Rubin line routes it, in up to
-# two TOKEN UNITS for a packed MTP step (config_sm107.decode_d256_q_tile), and
-# this B200 fit is the cost its units are modelled with until a cc 10.7 refit.
-_DECODE_TILE_WIDE_Q_TILE_COST = 1.6
+# A KV tile's cost to a lone CTA by the tile's N extent (its packed Q rows), in
+# units of the 16-column tile's, PER ARCH LINE -- the two lines' decode tiles are
+# sibling kernels (sm100/ and sm107/decode_d256_f16.py), so each carries its own
+# fit and the model reads the caller's ``device_cc``:
+#   * the Blackwell line (B200 fit): the 32-column tile (two softmax column groups
+#     over the same 128 TMEM lanes) is issue-bound where the 16-column tile is
+#     bandwidth-bound -- 64 CTAs x 32 tiles ran 90.2 us against the 16-column
+#     tile's 57.1 us.  It is compiled but not routed there (the adapter keeps
+#     S_q x G in (16, 32] on the prefill tile, config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS);
+#     the fit stays for when it is.
+#   * cc 10.7 (measured on the Rubin performance class, 212 SMs, per-CTA device
+#     time per 128-key tile): 16-column 0.90-1.00 us, 32-column 1.03-1.07 (x1.07-1.14),
+#     64-column 1.55-1.60 (x1.60-1.74) -- so one 64-column unit streams a KV range in
+#     three quarters of the time of two 32-column units, which is why the route takes
+#     the 64-column tile wherever two 32-column units would be needed
+#     (config_sm107.decode_d256_q_tile).  The Rubin line routes all three widths.
+# HBM saturates at the same byte rate whatever the width, so a slower stream also
+# needs proportionally more CTAs to reach it.  ``device_cc=None`` reads the cc 10.7
+# table: it is the only line that routes a width past 16, and the 16-column tile
+# costs 1.0 on both.
+_DECODE_TILE_COST_BY_Q_TILE_SM100 = {16: 1.0, 32: 1.6}
+_DECODE_TILE_COST_BY_Q_TILE_SM107 = {16: 1.0, 32: 1.1, 64: 1.65}
+
+
+def _decode_tile_cost_for(q_tile: int, device_cc: Optional[Tuple[int, int]]) -> float:
+    """The per-tile cost of a lone CTA at ``q_tile`` packed rows on the line ``device_cc`` names
+    (``None`` / cc 10.7 = the Rubin table; cc 10.0 / 10.3 = the Blackwell fit); a width the
+    line's table does not price falls back to the Rubin table (the line that compiles it)."""
+    blackwell = device_cc is not None and tuple(device_cc)[:2] in ((10, 0), (10, 3))
+    table = _DECODE_TILE_COST_BY_Q_TILE_SM100 if blackwell else _DECODE_TILE_COST_BY_Q_TILE_SM107
+    if int(q_tile) in table:
+        return table[int(q_tile)]
+    return _DECODE_TILE_COST_BY_Q_TILE_SM107.get(int(q_tile), 1.0)
+
+
 # The shared sm100/split_combine pass over a decode-shaped grid: one combine
 # wave, ~6 us measured at b=32 x 32 heads.
 _DECODE_TILE_COMBINE_COST = 3.5
@@ -478,6 +502,7 @@ def choose_decode_tile_split_kv(
     sm_count: int,
     q_tile: int = 16,
     launch_cost: float = _DECODE_TILE_SPLIT_LAUNCH_COST,
+    device_cc: Optional[Tuple[int, int]] = None,
 ) -> int:
     """How many KV chunks the d256 decode tile cuts each unit into; 1 = do not split.
 
@@ -485,16 +510,20 @@ def choose_decode_tile_split_kv(
     groups (a packed group is one unit, an unpacked head one each) x the token
     units a group is cut into (:func:`config_sm100.decode_d256_q_units`: one,
     or two for the Rubin MTP step); ``kv_tiles`` the 128-key tiles of the
-    declared S_kv; ``q_tile`` the tile's N extent (16 or 32 packed Q rows,
-    :func:`config_sm100.decode_d256_q_tile`).
+    declared S_kv; ``q_tile`` the tile's N extent (16, 32 or 64 packed Q rows,
+    :func:`config_sm107.decode_d256_q_tile`); ``device_cc`` (appended) the
+    arch line whose per-width tile costs apply (``None`` = the Rubin table,
+    see :func:`_decode_tile_cost_for`).
 
         streams(s)  = units * s                                   # concurrent K/V streams
-        per_tile(s) = max(TILE_COST(q_tile), streams(s) / (SATURATION * sm_count))
+        per_tile(s) = max(TILE_COST(q_tile, line), streams(s) / (SATURATION * sm_count))
         cost(s)     = (ceil(kv_tiles / s) + CTA_COST) * per_tile(s)
                     + [s > 1] * (COMBINE_COST + s * COMBINE_PER_PARTIAL + launch_cost)
 
-    A lone CTA streams a KV tile at TILE_COST (1 on the 16-column tile, 1.6 on
-    the issue-bound 32-column one); once the streams saturate HBM every CTA
+    A lone CTA streams a KV tile at TILE_COST (1 on the 16-column tile; on the
+    Rubin line 1.1 on the 32-column and 1.65 on the 64-column tile, measured on
+    the Rubin performance class; 1.6 on the Blackwell line's issue-bound 32-column
+    tile); once the streams saturate HBM every CTA
     slows with their count instead.  What falls out: an under-full launch
     splits until its streams saturate HBM; a launch already past it never
     splits (the bytes are the same, only the fixed costs grow); in between,
@@ -505,9 +534,11 @@ def choose_decode_tile_split_kv(
     the added part includes the eager caller's second host launch, so on the
     16-column tile the b=32 x 2 KV heads x 4096-key serving shape (6 us of GPU
     saving for 30 us of host time) stays unsplit while a small batch or a
-    long KV (b=8; s_kv=16384 at b=32) still splits, and the 32-column tile --
-    whose lone CTA is slow enough that the same shape saves ~32 us -- would
-    split (routed on cc 10.7 only; see _DECODE_TILE_WIDE_Q_TILE_COST).
+    long KV (b=8; s_kv=16384 at b=32) still splits, and the Blackwell line's
+    32-column tile -- whose lone CTA is slow enough that the same shape saves
+    ~32 us -- would split (it is routed on cc 10.7 only, where its measured
+    stream rate keeps that shape unsplit for an eager caller; see
+    :func:`_decode_tile_cost_for`).
     ``launch_cost=0`` is the optimum of a caller replaying a captured CUDA
     graph (the LEADING entry of a graph created with
     ``is_cuda_graph_replay_expected=True``, see :func:`_split_points`).
@@ -517,7 +548,7 @@ def choose_decode_tile_split_kv(
     """
     if min(units, kv_tiles, sm_count) <= 0:
         return 1
-    tile_cost = _DECODE_TILE_WIDE_Q_TILE_COST if q_tile > 16 else 1.0
+    tile_cost = _decode_tile_cost_for(q_tile, device_cc)
     kw = dict(units=units, kv_tiles=kv_tiles, sm_count=sm_count, tile_cost=tile_cost, launch_cost=launch_cost)
     best, best_cost = 1, _decode_tile_cost(1, **kw)
     for split in split_kv_candidates(sm_count=sm_count, kv_tiles=kv_tiles):
@@ -1707,6 +1738,8 @@ def _split_points(
             kv_tiles=_swa_kv_tiles(facts, token_span=decode_q_tile // decode_pack_g, tile_n=tile_n or 128),
             sm_count=sm_count,
             q_tile=decode_q_tile,
+            # the arch line's per-width tile costs (the Rubin and Blackwell decode tiles are sibling kernels with their own fits)
+            device_cc=tuple(facts.device_cc) if facts.device_cc else None,
         )
         eager = choose_decode_tile_split_kv(**geometry)
         captured = choose_decode_tile_split_kv(**geometry, launch_cost=0.0)
