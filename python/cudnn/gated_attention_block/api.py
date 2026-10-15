@@ -634,7 +634,7 @@ class DecodeRoute:
     s_q: int
     group: int  # h_q // h_kv: the heads a tile packs per token (1 = MHA, unpacked)
     tile: Optional[str]  # DECODE_TILE / PREFILL_TILE (the ``kernel_template`` the adapter compiles), or None: the step is not served over the pools
-    n_q: int  # the decode tile's N extent (the packed Q rows of ONE token unit: 16 or 32); 0 on the prefill tile and when not served
+    n_q: int  # the decode tile's N extent (the packed Q rows of ONE token unit: 16, 32 or 64); 0 on the prefill tile and when not served
     token_units: int  # the decode tile's CTAs per (KV-head group, batch, split): ceil(s_q / (n_q // group)); 0 on the prefill tile / not served
     pack_gqa: bool  # the whole group packed into the tile; False = MHA or the decode tile's unpacked arm
     claimed: bool  # inside the CLAIMED envelope (the PACKED decode tile at s_q <= DECODE_CLAIMED_MAX_S_Q); False = routed, declared, unmeasured

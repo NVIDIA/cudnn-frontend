@@ -733,8 +733,9 @@ class SdpaFwdDsl(APIBase):
         ragged_offsets_int64: bool = False,
         # APPENDED (2026-10-15): a CAP on the Rubin d256 decode tile's single-unit width table (config_sm107.D256_DECODE_SINGLE_UNIT_Q_TILES =
         # (16, 32, 64)) for this plan -- None = the whole table; 32 = the route before the 64-column width landed (value for value).  A
-        # PERFORMANCE-ONLY knob (the same function under every width); read by _decode_q_tile_for.  Refused off the Rubin route (any other
-        # arch line, where the table is not the lowering's).
+        # PERFORMANCE-ONLY knob (the same function under every width); read by _decode_q_tile_for.  Refused off cc 10.7 at check_support,
+        # whatever the graph (the table it caps is the Rubin lowering's); on cc 10.7 it has no effect on a graph that never consults the
+        # decode route (a prefill-shaped or THD graph, a quantized one) -- documented, not a decline.
         decode_q_tile_max: Optional[int] = None,
         # APPENDED: programmatic dependent launch -- the plan's kernels launch with the programmatic-stream-serialization attribute and
         # carry the griddepcontrol pair (a wait before their first global read, a release after their prologue).  Performance-only:
@@ -1731,6 +1732,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # cc10.0 (SM100) and cc10.3 (Blackwell-class) both run these kernels; cc10.3
         # additionally has the fused LDTM.STAT row-max, auto-enabled for MXFP8 in compile().
         self._device_cc = (major, minor)
+        # The Rubin route's width cap is validated ONCE, here, before the early returns of _decode_q_tile_for: a cap on another arch line
+        # is a typed decline whatever the graph (the table it caps is the cc 10.7 lowering's), while on cc 10.7 a graph that never consults
+        # the decode route (prefill-shaped, THD, quantized) simply does not read it.
+        self._not_implemented_error_if(
+            self.decode_q_tile_max is not None and self._device_cc != (10, 7),
+            f"decode_q_tile_max={self.decode_q_tile_max} caps the Rubin (cc 10.7) d256 decode route's width table; this plan lowers for "
+            f"cc {major}.{minor}, whose decode tile has one routed width",
+        )
         paged_prefill_cga1 = supports_paged_prefill_cga1(
             (int(d_qk), int(d_v)),
             device_cc=self._device_cc,
@@ -2493,11 +2502,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 masked=self.window_right is not None or self.window_left is not None,
                 max_q_tile=self.decode_q_tile_max,
             )
-        if self.decode_q_tile_max is not None:
-            raise NotImplementedError(
-                f"decode_q_tile_max={self.decode_q_tile_max} caps the Rubin (cc 10.7) d256 decode route's width table; this plan lowers for "
-                f"cc {self._device_cc[0]}.{self._device_cc[1]}, whose decode tile has one routed width"
-            )
+        # (a cap off cc 10.7 was refused once, in check_support, before this dispatch is reached)
         return decode_d256_q_tile(int(s_q), pack_g)
 
     def _gate_in_combine_for(self, s_q: int, h_q: int, h_kv: int) -> bool:
