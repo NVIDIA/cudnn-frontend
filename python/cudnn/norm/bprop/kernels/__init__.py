@@ -15,18 +15,7 @@ live in :mod:`cudnn.norm._common_sm100`.
 Each module exposes ``backward(spec, dy, x, gamma, mean, rstd, *, has_beta, cfg, params)``.
 """
 
-from . import (  # noqa: F401
-    batchnorm_nchw_sm100,
-    batchnorm_nhwc_sm100,
-    batchnorm_sm100,
-    groupnorm_cga_sm100,
-    groupnorm_fast_sm100,
-    groupnorm_nhwc_sm100,
-    groupnorm_sm100,
-    instancenorm_sm100,
-    instancenorm_nhwc_sm100,
-    instancenorm_warp_sm100,
-    layernorm_cga_sm100,
-    layernorm_sm100,
-    rmsnorm_sm100,
-)
+# Deliberately NOT imported here. Each kernel module imports ``cutlass.primitives``
+# at its top, so a package-level fan-out would load the CuTe DSL for anything that
+# merely touches this package -- including the engine, before its gate runs.
+# Callers import the one module they need; the tests enumerate with pkgutil.

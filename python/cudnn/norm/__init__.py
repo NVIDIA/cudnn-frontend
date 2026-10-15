@@ -22,7 +22,7 @@ kernels live in :mod:`cudnn.norm.fprop.engines` / :mod:`cudnn.norm.bprop.engines
 and register with :mod:`cudnn.frost`.
 """
 
-from typing import Any
+from ._lazy import lazy_exports
 
 _LAZY_EXPORTS = {
     "NormVariant": ("cudnn.norm.config_sm100", "NormVariant"),
@@ -30,31 +30,7 @@ _LAZY_EXPORTS = {
     "norm_bprop": ("cudnn.norm.bprop.api", "norm_bprop"),
 }
 
-
-def __getattr__(name: str) -> Any:
-    try:
-        module_name, attr_name = _LAZY_EXPORTS[name]
-    except KeyError:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
-    # AGENTS.md Rule 7: gate the CuTe DSL version HERE, before the kernel modules are
-    # imported. pyproject's floor is the downstream one (4.6.2) and is below what these
-    # kernels need, so an install that satisfies pip can still be too old -- and the
-    # failure must read as a version problem, not as a missing dependency.
-    from cudnn.frost.buffers import cutedsl_primitives_error, cutedsl_requirement_error
-
-    error = cutedsl_requirement_error("cudnn.norm")
-    # A DSL can clear the version floor and still not export cutlass.primitives
-    # (public wheels have carried it as cutlass.experimental.primitives). Say so
-    # here rather than letting the kernel import raise a bare "No module named".
-    if error is None:
-        error = cutedsl_primitives_error("cudnn.norm")
-    if error is not None:
-        raise ImportError(error)
-    import importlib
-
-    value = getattr(importlib.import_module(module_name), attr_name)
-    globals()[name] = value
-    return value
-
+# AGENTS.md Rule 7: the DSL is gated HERE, before any kernel module is imported.
+__getattr__ = lazy_exports(__name__, _LAZY_EXPORTS, globals())
 
 __all__ = list(_LAZY_EXPORTS)

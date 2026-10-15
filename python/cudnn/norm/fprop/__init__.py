@@ -10,6 +10,13 @@ Kernels live under :mod:`cudnn.norm.fprop.kernels`; the cuDNN graph engine that
 lowers onto them lives in :mod:`cudnn.norm.fprop.engines`.
 """
 
-from .api import norm_fprop
+from .._lazy import lazy_exports
+
+# Imported lazily: the graph engine lives in this package, and importing it used
+# to drag ``api`` -- and every kernel, and the CuTe DSL -- in before the engine
+# had a chance to decline. See cudnn.norm._lazy.
+_LAZY_EXPORTS = {"norm_fprop": ("cudnn.norm.fprop.api", "norm_fprop")}
+
+__getattr__ = lazy_exports(__name__, _LAZY_EXPORTS, globals())
 
 __all__ = ["norm_fprop"]
