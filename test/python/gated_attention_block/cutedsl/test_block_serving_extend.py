@@ -2287,14 +2287,15 @@ def test_extend_capture_of_the_first_execute_replays_with_new_lengths_tables_and
 
 @pytest.mark.L0
 def test_num_tokens_live_is_the_last_execute_parameter_with_default_none():
-    """The append-only rule on the public ``execute`` signature: ``num_tokens_live`` is the LAST parameter with default ``None`` (= the
-    declared capacity), so every positional caller of the serving forms is unchanged; the slot-mapping form check gained its second
-    admitted count the same way (``t_live``, appended, default None)."""
+    """The append-only rule on the public ``execute`` signature: ``num_tokens_live`` (default ``None`` = the declared capacity) was appended
+    after ``slot_mapping`` / ``index_k_raw``, and the e4m3 KV cache's ``k_scale`` / ``v_scale`` (default ``None`` = pools of the activation
+    dtype) after IT, so every positional caller of the serving forms is unchanged; the slot-mapping form check gained its second admitted
+    count the same way (``t_live``, appended, default None)."""
     from cudnn.gated_attention_block.cache_write_contract import check_slot_mapping
 
     params = list(inspect.signature(GatedAttentionBlockFwd.execute).parameters.values())
-    assert params[-1].name == "num_tokens_live" and params[-1].default is None
-    assert [p.name for p in params[-3:]] == ["slot_mapping", "index_k_raw", "num_tokens_live"]
+    assert [p.name for p in params[-5:]] == ["slot_mapping", "index_k_raw", "num_tokens_live", "k_scale", "v_scale"]
+    assert all(p.default is None for p in params[-3:])
     slot_params = inspect.signature(check_slot_mapping).parameters
     assert list(slot_params)[-1] == "t_live" and slot_params["t_live"].default is None
 

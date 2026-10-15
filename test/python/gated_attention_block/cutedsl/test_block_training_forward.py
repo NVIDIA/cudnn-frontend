@@ -229,7 +229,9 @@ _SNAPSHOT_ARMS = {
     "mxfp8_unfused": dict(inplace_qkv=True, fp8=True, mxfp8=True),
     "mxfp8_fused": dict(inplace_qkv=True, fp8=True, fp8_fused=True, mxfp8=True),
 }
-_ABSENT = dict(gate=-1, o_gated=-1, base_align=256, o4=-1, sf_o=-1)
+_ABSENT = dict(
+    gate=-1, o_gated=-1, base_align=256, o4=-1, sf_o=-1, kc8=-1, vc8=-1, kv_inv=-1, kv_gathered=-1, kv_len_t=-1
+)  # the e4m3 KV cache's five appended slots
 _NO_Q8 = dict(q8=-1, k8=-1, v8=-1, o8=-1, gate16=-1)
 _NO_SF = dict(sf_q=-1, sf_k=-1, sf_v=-1)
 _SNAPSHOT = {
