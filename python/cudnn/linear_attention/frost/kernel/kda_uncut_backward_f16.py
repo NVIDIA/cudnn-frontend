@@ -443,6 +443,7 @@ def build_uncut_backward(
     gate_main = not log_gate and not safe_gate
     key = (
         str(q.dtype),
+        str(seed_checkpoints.dtype) if coarse else "none",
         str(cu_seqlens.dtype),
         str(gate.dtype),
         str(beta.dtype),

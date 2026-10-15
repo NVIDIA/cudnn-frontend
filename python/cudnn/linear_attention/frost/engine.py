@@ -56,12 +56,12 @@ def summary_support_gates(engine: str, facts, graph) -> None:
         if got not in gate_param_dtypes + (None,):
             raise NotImplementedError(f"{engine}: '{port}' must be fp32/bf16/fp16, got {got}")
     (node,) = list(graph.nodes)
-    state_dtypes = (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16)
+    state_dtypes = (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
     state_ports = [(name, node.inputs.get(name)) for name in ("initial_state", "d_final_state")]
     state_ports += [(name, node.outputs.get(name)) for name in ("final_state", "transition", "d_initial_state")]
     for port, tensor in state_ports:
         if tensor is not None and tensor.get_data_type() not in state_dtypes:
-            raise NotImplementedError(f"{engine}: '{port}' must be fp32/bf16, got {tensor.get_data_type()}")
+            raise NotImplementedError(f"{engine}: '{port}' must be fp32/bf16/fp16, got {tensor.get_data_type()}")
     if not facts.state_pair_match:
         raise NotImplementedError(f"{engine}: initial_state and final_state dtypes must match")
     d_final_state = node.inputs.get("d_final_state")

@@ -91,6 +91,12 @@ Contributor credits for these OSS CuTe DSL kernels are listed in [Acknowledgemen
   <img src="https://github.com/NVIDIA/cudnn-frontend/blob/develop/benchmark/linear_attention/results/gdp/gb300/gdp_fixed_batch_flops.webp" alt="GDP Linear Attention Benchmark on GB300" width="600"/>
 </p>
 
+#### Mamba-2 Forward and Bprop (GB300)
+
+<p align="center">
+  <img src="https://github.com/NVIDIA/cudnn-frontend/blob/develop/benchmark/linear_attention/results/mamba2/gb300/mamba2_fixed_batch_flops.webp" alt="Mamba-2 Linear Attention Benchmark on GB300" width="600"/>
+</p>
+
 ## Key Features
 
 *   **Unified Graph API:** Create reusable, persistent `cudnn_frontend::graph::Graph` objects to describe complex subgraphs.

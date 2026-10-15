@@ -160,6 +160,7 @@ def make_summary_cache_key(
     do_dtype=None,
     do_shape=None,
     q_shape=None,
+    beta_shape=None,
 ):
     """Return the complete plan-cache identity for a linear-attention summary."""
     return (
@@ -200,6 +201,7 @@ def make_summary_cache_key(
         q_shape,
         device,
         plan_name,
+        beta_shape,
     )
 
 
