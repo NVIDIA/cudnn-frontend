@@ -1086,6 +1086,20 @@ def test_small_m_route_declines_non_positive_extents(m, n, k):
         build_proj_gemm(m=m, k=k, n=n, dtype=torch.bfloat16, label="extent")
 
 
+def test_small_m_route_is_an_sm100_family_selection(monkeypatch):
+    """The route's names are the tcgen05 tree's: a process on the ``sm120`` compiler family (SM 12.x) keeps the family-aware
+    automatic tile for a small-M projection whose N the forced tile does not divide, instead of a name its compiler would
+    refuse; the ``sm100`` family takes the route."""
+    from cudnn.gemm.frost import arch_family
+    from cudnn.gated_attention_block.kernels.proj_gemm import _auto_tile_name
+
+    kw = dict(dtype=torch.bfloat16, a_major="k", b_major="k", block_scale=False, alpha=False)
+    monkeypatch.setattr(arch_family, "active_family", lambda: "sm120")
+    assert _auto_tile_name(32, 248, 4096, **kw) is None  # 256 does not divide 248: the graph heuristic's own tile, as before the route
+    monkeypatch.setattr(arch_family, "active_family", lambda: "sm100")
+    assert _auto_tile_name(32, 248, 4096, **kw) == small_m_tile_config(32, 248, 4096, dtype=torch.bfloat16)
+
+
 @requires_rubin
 @pytest.mark.parametrize("m", [1, 4, 32, 128])
 @pytest.mark.parametrize("shape", ["qkvg", "out"])

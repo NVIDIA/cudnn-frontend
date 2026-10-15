@@ -1383,9 +1383,16 @@ def small_m_tile_config(
 
 
 def _auto_tile_name(m: int, n: int, k: int, *, dtype: torch.dtype, a_major: str, b_major: str, block_scale: bool, alpha: bool) -> Optional[str]:
-    """``tile_config="auto"``: the small-M route where it applies (:func:`small_m_tile_config`), else the forced 256-wide
-    tile where 256 divides N (:func:`_forced_tile_config`), else None (the graph heuristic's own tile)."""
-    name = small_m_tile_config(m, n, k, dtype=dtype, a_major=a_major, b_major=b_major, block_scale=block_scale, alpha=alpha)
+    """``tile_config="auto"``: the small-M route where it applies (:func:`small_m_tile_config`; on the ``sm100`` compiler family
+    only -- its names are the tcgen05 tree's catalog, so a process on the ``sm120`` family keeps the family-aware fallback below),
+    else the forced 256-wide tile where 256 divides N (:func:`_forced_tile_config`), else None (the graph heuristic's own tile)."""
+    from cudnn.gemm.frost import arch_family
+
+    name = (
+        small_m_tile_config(m, n, k, dtype=dtype, a_major=a_major, b_major=b_major, block_scale=block_scale, alpha=alpha)
+        if arch_family.active_family() == "sm100"
+        else None
+    )
     return name if name is not None else _forced_tile_config(n)
 
 
