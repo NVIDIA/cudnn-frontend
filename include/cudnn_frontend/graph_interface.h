@@ -603,9 +603,13 @@ class Graph : public ICudnn, public INode {
         // Detect SM version and instantiate the appropriate OSS engine
         int oss_device_ordinal = 0;
         experimental::detail::cuda_get_device(&oss_device_ordinal);
-        cudaDeviceProp oss_dev_prop;
-        experimental::detail::cuda_get_device_properties(&oss_dev_prop, oss_device_ordinal);
-        int oss_sm = oss_dev_prop.major * 10 + oss_dev_prop.minor;
+        int oss_major = 0;
+        int oss_minor = 0;
+        cudnn_frontend::detail::cuda_device_get_attribute(
+            &oss_major, cudaDevAttrComputeCapabilityMajor, oss_device_ordinal);
+        cudnn_frontend::detail::cuda_device_get_attribute(
+            &oss_minor, cudaDevAttrComputeCapabilityMinor, oss_device_ordinal);
+        int oss_sm = oss_major * 10 + oss_minor;
 
         std::shared_ptr<experimental::IOssNormEngine> engine;
         if (oss_sm >= 80) {

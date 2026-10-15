@@ -176,14 +176,13 @@ class Sm100RmsNormSiluEngine : public IOssNormEngine {
         is_cooperative_ = (ctas_per_row_ > 1);
 
         // Cache SM count
-        cudaDeviceProp devProp;
         int device_ordinal   = 0;
         cudaError_t cuda_err = detail::cuda_get_device(&device_ordinal);
         RETURN_CUDNN_FRONTEND_ERROR_IF(cuda_err != cudaSuccess, error_code_t::CUDA_API_FAILED, "cudaGetDevice failed");
-        cuda_err = detail::cuda_get_device_properties(&devProp, device_ordinal);
+        cuda_err = cudnn_frontend::detail::cuda_device_get_attribute(
+            &sm_count_, cudaDevAttrMultiProcessorCount, device_ordinal);
         RETURN_CUDNN_FRONTEND_ERROR_IF(
-            cuda_err != cudaSuccess, error_code_t::CUDA_API_FAILED, "cudaGetDeviceProperties failed");
-        sm_count_ = devProp.multiProcessorCount;
+            cuda_err != cudaSuccess, error_code_t::CUDA_API_FAILED, "cudaDeviceGetAttribute failed");
 
         support_checked_ = true;
         return {error_code_t::OK, ""};
