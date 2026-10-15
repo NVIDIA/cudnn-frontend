@@ -76,8 +76,11 @@ def test_the_switch_is_recorded_on_every_stage_defaults_off_and_declines_the_uns
     on = _Case(16, 1, (100,), seed=1, blk_kw=dict(use_pdl=True))
     assert off.blk.use_pdl is False and on.blk.use_pdl is True
     assert off.blk._sdpa.use_pdl is False and on.blk._sdpa.use_pdl is True
-    # the fused declaration: the fused projection (its template launches with PDL unconditionally) and the SDPA stage carry the chain
-    assert on.blk._norm_rope is None and on.blk._cache_write is None and on.blk._gate is None
+    # the default declaration (fuse_norm_rope=True, lowered to the unfused chain at decode row counts): the norm + RoPE pass and the
+    # write-through carry the switch; the fused fork (its template launches with PDL unconditionally) under the control knob carries none
+    assert isinstance(on.blk._norm_rope, _QkNormRope) and on.blk._norm_rope.use_pdl is True and on.blk._cache_write.use_pdl is True and on.blk._gate is None
+    fork = _Case(16, 1, (100,), seed=1, blk_kw=dict(use_pdl=True, fuse_norm_rope_small_m=True))
+    assert fork.blk._norm_rope is None and fork.blk._cache_write is None and fork.blk._gate is None and fork.blk.use_pdl is True
     # the unfused, unsplit declaration reaches every stage with its own kernel
     on1 = _Case(16, 1, (100,), seed=1, blk_kw=dict(use_pdl=True, fuse_norm_rope=False, decode_split_kv=1))
     assert isinstance(on1.blk._norm_rope, _QkNormRope) and on1.blk._norm_rope.use_pdl is True
@@ -96,19 +99,22 @@ def test_the_switch_is_recorded_on_every_stage_defaults_off_and_declines_the_uns
 # -- the Rubin cells: bitwise with and without the switch ----------------------------------------------------------------------
 
 # The declarations of the DECODE form the switch reaches, each a different chain:
-#   fused-auto:      fused projection + norm/RoPE + the write-through folded in | decode tile | gated combine | out proj
+#   auto:            the production default -- fuse_norm_rope=True LOWERED at decode row counts: slab GEMM | norm + RoPE (TMA) | write-through
+#                    | decode tile | gated combine | out proj (+ the split-K reducer)
+#   fused-auto:      fused projection + norm/RoPE + the write-through folded in | decode tile | gated combine | out proj (the control knob)
 #   fused-cachewrite: the same with the write-through as its own launch between the projection and the tile
 #   fused-unsplit:   fused projection | unsplit tile | sigmoid gate | out proj
-#   unfused-auto:    slab GEMM | norm + RoPE (TMA) | write-through | decode tile | gated combine | out proj
+#   unfused-auto:    slab GEMM | norm + RoPE (TMA) | write-through | decode tile | gated combine | out proj (declared unfused)
 #   unfused-unsplit: slab GEMM | norm + RoPE (TMA) | write-through | unsplit tile | sigmoid gate | out proj
 _DECLARATIONS = {
-    "fused-auto": dict(),
-    "fused-cachewrite": dict(fuse_cache_write=False),
-    "fused-unsplit": dict(decode_split_kv=1),
+    "auto": dict(),
+    "fused-auto": dict(fuse_norm_rope_small_m=True),
+    "fused-cachewrite": dict(fuse_norm_rope_small_m=True, fuse_cache_write=False),
+    "fused-unsplit": dict(fuse_norm_rope_small_m=True, decode_split_kv=1),
     "unfused-auto": dict(fuse_norm_rope=False),
     "unfused-unsplit": dict(fuse_norm_rope=False, decode_split_kv=1),
 }
-_CELLS = [(name, s_q) for name in _DECLARATIONS for s_q in ((1, 4) if name in ("fused-auto", "unfused-unsplit") else (1,))]
+_CELLS = [(name, s_q) for name in _DECLARATIONS for s_q in ((1, 4) if name in ("auto", "fused-auto", "unfused-unsplit") else (1,))]
 
 
 @requires_rubin

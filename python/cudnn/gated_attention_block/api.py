@@ -6221,7 +6221,10 @@ class GatedAttentionBlockFwd(APIBase):
     a split-KV plan with fp32 partials in the workspace and one combine launch when the decode split model splits) inside
     its packed route, the same tile UNPACKED (one head per CTA) up to ``DECODE_MAX_ROWS`` rows past it (:func:`decode_route`
     names the kernel per ``(group, S_q)``; a wider dense step is a typed decline -- the EXTEND form's packed business) -- so
-    the pipeline is ``(1)+(2)+(3) -> (4w) -> (4) [+ combine] -> (5) -> (6)``, five launches with ``fuse_norm_rope``.
+    the pipeline is ``(1)+(2)+(3) -> (4w) -> (4) [+ combine] -> (5) -> (6)``, five launches with ``fuse_norm_rope`` -- past decode row
+    counts: at ``B x S_q <= 128`` (``kernels.proj_gemm.SMALL_M_MAX``) the declaration LOWERS stage (1) to the unfused chain, ``(1) -> (2)+(3)
+    -> (4w) -> (4) [+ combine] -> (5) -> (6)`` (the small-M route's slab GEMM, the norm + RoPE pass, the separate cache write: the measured
+    faster step; ``fuse_norm_rope_effective`` reads it back, ``fuse_norm_rope_small_m=True`` keeps the fused fork for the A/B).
     ``fuse_gate`` then rides the split COMBINE on the decode tile (``gate_fused``; the tile has no gate seams, the combine
     multiplies the merged fp32 value by ``sigmoid(G)`` before the single cast) and is its own launch on an unsplit tile.
     The pools' and the table's strides are the same declaration samples as the EXTEND form's (a row-sliced table at any row
@@ -6455,6 +6458,15 @@ class GatedAttentionBlockFwd(APIBase):
         # `out` is BITWISE the use_pdl=False block's, eagerly and under CUDA-graph capture.  Served for the bf16 / f16 block (no quant, no e4m3
         # KV cache, no QsaSpec); a declaration whose chain routes to a kernel without the sites is a typed decline at compile.
         use_pdl: bool = False,
+        # APPENDED (2026-10-15; the DECODE form only; performance-only): WHETHER the fused norm + RoPE projection runs at DECODE ROW COUNTS
+        # (T = B x S_q <= kernels.proj_gemm.SMALL_M_MAX = 128 on the dense DECODE form, bf16 / f16, no indexer band, 16-bit pools) when
+        # fuse_norm_rope=True.  None = AUTO = False: stage (1) is LOWERED to the unfused chain there -- the small-M route's slab GEMM, the
+        # norm + RoPE pass, the separate cache write (seven launches with the split combine) -- because the 256-wide fused fork pads one
+        # token tile and streams its weight at a fraction of the machine (the measured "route + unfused" step is the faster one at B 1 ..
+        # 32); True = the fused fork as declared (the former behaviour; the A/B's control arm).  `fuse_norm_rope` stays what was declared,
+        # `fuse_norm_rope_effective` reads back what runs (`cache_write_fused` follows it: the write-through arm lives in the fork).  Refused
+        # (typed) with fuse_norm_rope=False and off the dense DECODE form.  Module docstring, "The DECODE form".
+        fuse_norm_rope_small_m: Optional[bool] = None,
     ):
         """Validate the declaration -- the dtype / ``quant`` / scale-blob halves, the fusion and save-mode knobs against
         ``save_for_backward``, the THD envelope, the paged-cache write-through -- normalise the samples, record the knobs and
@@ -6709,6 +6721,34 @@ class GatedAttentionBlockFwd(APIBase):
             # seq_lens_present=True whatever was passed (the dense padding mask it names IS the per-sequence KV length -- bound to
             # the KV side only here).
             self.seq_lens_present = True
+        # C0 (2026-10-15): at DECODE ROW COUNTS the declaration `fuse_norm_rope=True` LOWERS stage (1) to the unfused chain.  The 256-wide
+        # fused fork pads a decode step's handful of rows to one 256-row token tile and streams the slab weight from a quarter of the SMs
+        # (the measured step at B 1 x KV 4K: the fork ~25 us against the small-M route's slab GEMM + norm / RoPE + cache write ~12 us of
+        # kernels), so the fewer launches lose; the unfused chain is what the route measured as the faster decode step.  The lowering is a
+        # declaration fact (`fuse_norm_rope_effective`), decided here from the dense DECODE form's facts -- the dense paged route
+        # (`decode_route`), bf16 / f16 (no quant), no indexer band, 16-bit pools, T = B x S_q within the small-M route's bound -- and kept
+        # OFF by `fuse_norm_rope_small_m=True` (the fused fork as declared: the A/B's control arm).  The EXTEND form, the packed form and
+        # the quantized pipelines are untouched (`fuse_norm_rope` runs as declared there).
+        if fuse_norm_rope_small_m is not None and not isinstance(fuse_norm_rope_small_m, bool):
+            raise TypeError(f"fuse_norm_rope_small_m must be None (auto), True or False, got {type(fuse_norm_rope_small_m).__name__}")
+        self.fuse_norm_rope_small_m: Optional[bool] = fuse_norm_rope_small_m
+        if fuse_norm_rope_small_m is not None and (self.decode_route is None or not self.fuse_norm_rope):
+            raise ValueError(
+                f"fuse_norm_rope_small_m={fuse_norm_rope_small_m}: the knob decides whether the FUSED norm + RoPE projection runs at decode row counts on "
+                f"the dense DECODE form (kv_source='paged' on a dense declaration with fuse_norm_rope=True); got kv_source={kv_source!r}, "
+                f"thd={self.thd}, fuse_norm_rope={self.fuse_norm_rope}, qsa={'set' if geometry.qsa is not None else None}"
+            )
+        from .kernels.proj_gemm import SMALL_M_MAX
+
+        self.small_m_decode = self.decode_route is not None and self.batch * self.seq_len <= SMALL_M_MAX
+        self.fuse_norm_rope_effective = self.fuse_norm_rope and not (
+            self.small_m_decode
+            and self.fuse_norm_rope_small_m is not True
+            and quant is None
+            and not geometry.index_band
+            and not self.kv_cache_e4m3
+            and self.dtype in (torch.bfloat16, torch.float16)
+        )
         # The BLOCK-SPARSE decode / extend-with-prefix mode (a QsaSpec geometry over the pools; the packed form met the table's
         # `sparse` row above): stage (4) is the sparse core reading the pools, and the LIST FORM is a declaration fact derived from
         # S_q -- ONE list per sequence at S_q <= the record's shared-list cap (the MTP form, anchored at the step-0 position), one
@@ -6736,7 +6776,7 @@ class GatedAttentionBlockFwd(APIBase):
         self.fuse_cache_write = self._check_fuse_cache_write_declaration(fuse_cache_write, quant)
         self.cache_write_fused = bool(self.paged_kv_page_size) and (
             self.fuse_cache_write is True
-            or (self.fuse_cache_write is None and self.fuse_norm_rope and quant is None and not geometry.index_band and not self.kv_cache_e4m3)
+            or (self.fuse_cache_write is None and self.fuse_norm_rope_effective and quant is None and not geometry.index_band and not self.kv_cache_e4m3)
         )
         self._descs = {
             "w_qkvg": self._make_tensor_desc(sample_w_qkvg, name="w_qkvg"),
@@ -6785,7 +6825,7 @@ class GatedAttentionBlockFwd(APIBase):
         # block saves lse / q_pre / k_pre but no rstd (SavedForBackward.rstd_*
         # are None -- required, both directions, at execute).
         want_rstd = self.save_for_backward and geometry.qk_norm
-        if self.fuse_norm_rope:
+        if self.fuse_norm_rope_effective:
             # bf16: writes the [T, N] slab.  FP8: the second rendering writes the
             # compact e4m3 q8/k8/v8 + the bf16 gate16 buffer, quantizing in its
             # epilogue.  MXFP8: the block-scale twin (typed decline until S6 lands).
@@ -7226,6 +7266,12 @@ class GatedAttentionBlockFwd(APIBase):
                 raise NotImplementedError(
                     "fuse_cache_write=True needs fuse_norm_rope=True: the write-through is an epilogue arm of the fused norm + RoPE projection; the "
                     "unfused chain norms the slab in place after the GEMM and keeps the separate cache-write launch"
+                )
+            if not self.fuse_norm_rope_effective:
+                raise NotImplementedError(
+                    "fuse_cache_write=True at decode row counts: fuse_norm_rope=True lowers stage (1) to the unfused chain there (T = B x S_q within the "
+                    "small-M route's bound; fuse_norm_rope_small_m=None), which keeps the separate cache-write launch -- declare fuse_norm_rope_small_m=True "
+                    "to run the fused projection and its write-through arm, or fuse_cache_write=None / False"
                 )
             if self.geom.index_band:
                 raise NotImplementedError(
@@ -8717,10 +8763,11 @@ class GatedAttentionBlockFwd(APIBase):
         k_src = _cols(proj, o_k, g.h_kv, g.d_head)
         v_src = _cols(proj, o_v, g.h_kv, g.d_head)
 
-        if self.fuse_norm_rope:
+        if self.fuse_norm_rope_effective:
             # (1)+(2)+(3): the fork norms + rotates the Q/K tiles in its
             # epilogue and writes the slab; rstd (if wanted) comes out of the
-            # same launch.
+            # same launch (at decode row counts the declaration lowers to the
+            # unfused chain below: fuse_norm_rope_effective, the constructor's C0 note).
             self._proj.execute(
                 h_live,
                 w_qkvg,

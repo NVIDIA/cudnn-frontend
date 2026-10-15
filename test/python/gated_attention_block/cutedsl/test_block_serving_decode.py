@@ -60,7 +60,7 @@ from cudnn.gated_attention_block import (
     ServingEnvelope,
     decode_route,
 )
-from cudnn.gated_attention_block.api import DECODE_TILE, PREFILL_TILE, _cols, _Projection, _Sdpa, _SigmoidGate, _view, decode_split_choice
+from cudnn.gated_attention_block.api import DECODE_TILE, PREFILL_TILE, _CacheWrite, _cols, _Projection, _Sdpa, _SigmoidGate, _view, decode_split_choice
 
 requirement_error = cutedsl_requirement_error("the gated attention block's serving tests")
 if requirement_error:
@@ -609,13 +609,38 @@ def test_declaration_facts(group, s_q):
         assert r.prefill_tile and blk._sdpa.thd and not blk._sdpa.paged_dense and not blk._sdpa.seq_lens_present and blk.decode_split_kv == 1
         assert (blk._sdpa.num_sequences, blk._sdpa.max_seq_len, blk._sdpa.cu_seqlens) == (4, s_q, False)
     names = [st.name for st in blk._stages]
-    # the write-through is FOLDED into the fused projection's epilogue under AUTO (fuse_cache_write=None): no cache_write stage
-    assert blk.cache_write_fused and blk._cache_write is None and blk._proj.kv_pool_page_size == blk.paged_kv_page_size
-    assert names == ["qkv_gate_proj_norm_rope", "sdpa"] + ([] if blk.gate_fused else ["sigmoid_gate"]) + ["out_proj"], names
-    blk_s, _ = _make_block(group, 4, s_q, fuse_gate=True, fuse_norm_rope=True, decode_split_kv=None if torch.cuda.is_available() else 2, fuse_cache_write=False)
+    # C0: at decode row counts (B x S_q = 4 x s_q <= 128) the declaration fuse_norm_rope=True LOWERS stage (1) to the unfused chain --
+    # the slab GEMM, the norm + RoPE pass, the SEPARATE cache write (no write-through arm to fold into) -- and reads it back
+    assert blk.fuse_norm_rope and not blk.fuse_norm_rope_effective and blk.small_m_decode and blk.fuse_norm_rope_small_m is None
+    assert not blk.cache_write_fused and isinstance(blk._cache_write, _CacheWrite) and blk._norm_rope is not None
+    assert names == ["qkv_gate_proj", "qk_norm_rope", "cache_write", "sdpa"] + ([] if blk.gate_fused else ["sigmoid_gate"]) + ["out_proj"], names
+    # the A/B's control arm: fuse_norm_rope_small_m=True keeps the fused fork, the write-through FOLDED into its epilogue under AUTO
+    blk_f, _ = _make_block(
+        group, 4, s_q, fuse_gate=True, fuse_norm_rope=True, decode_split_kv=None if torch.cuda.is_available() else 2, fuse_norm_rope_small_m=True
+    )
+    assert blk_f.fuse_norm_rope_effective and blk_f.fuse_norm_rope_small_m is True and blk_f._norm_rope is None
+    assert blk_f.cache_write_fused and blk_f._cache_write is None and blk_f._proj.kv_pool_page_size == blk_f.paged_kv_page_size
+    assert [st.name for st in blk_f._stages] == ["qkv_gate_proj_norm_rope", "sdpa"] + ([] if blk_f.gate_fused else ["sigmoid_gate"]) + ["out_proj"]
+    blk_s, _ = _make_block(
+        group,
+        4,
+        s_q,
+        fuse_gate=True,
+        fuse_norm_rope=True,
+        decode_split_kv=None if torch.cuda.is_available() else 2,
+        fuse_cache_write=False,
+        fuse_norm_rope_small_m=True,
+    )
     assert not blk_s.cache_write_fused and [st.name for st in blk_s._stages] == ["qkv_gate_proj_norm_rope", "cache_write", "sdpa"] + (
         [] if blk_s.gate_fused else ["sigmoid_gate"]
     ) + ["out_proj"]
+    # the knob and the write-through arm under the lowering: typed
+    with pytest.raises(NotImplementedError, match="fuse_cache_write=True at decode row counts"):
+        _make_block(group, 4, s_q, fuse_norm_rope=True, fuse_cache_write=True)
+    with pytest.raises(ValueError, match="fuse_norm_rope_small_m=True: the knob decides"):
+        _make_block(group, 4, s_q, fuse_norm_rope=False, fuse_norm_rope_small_m=True)
+    with pytest.raises(TypeError, match="fuse_norm_rope_small_m must be None"):
+        _make_block(group, 4, s_q, fuse_norm_rope=True, fuse_norm_rope_small_m=1)
     assert blk._out_proj.capture_safe is True and (not isinstance(blk._proj, _Projection) or blk._proj.capture_safe is True)
     # the pinned split, the unfused gate, the unfused norm + RoPE
     blk1, _ = _make_block(group, 4, s_q, fuse_gate=True, decode_split_kv=1)
@@ -631,6 +656,47 @@ def test_declaration_facts(group, s_q):
         assert [st.name for st in blk1._stages] == ["qkv_gate_proj", "qk_norm_rope", "cache_write", "sdpa", "out_proj"]
         with pytest.raises(NotImplementedError, match="prefill route.*unsplit"):
             _make_block(group, 4, s_q, fuse_gate=False, decode_split_kv=4)
+
+
+def test_the_small_m_lowering_follows_the_row_count_and_leaves_the_other_forms_alone():
+    """C0's envelope: the dense DECODE form with ``fuse_norm_rope=True`` lowers stage (1) to the unfused chain exactly when
+    ``B x S_q <= SMALL_M_MAX`` (the small-M route's bound), bf16 / f16, no indexer band, 16-bit pools; past the bound, and under
+    ``fuse_norm_rope_small_m=True``, the fused fork runs as declared; ``fuse_norm_rope=False`` has nothing to lower (the knob is
+    refused there and on a ``kv_source="self"`` block); the workspace layout does not read the fusion, so the carve is one either way."""
+    from cudnn.gated_attention_block.kernels.proj_gemm import SMALL_M_MAX
+
+    assert SMALL_M_MAX == 128
+    geom, _ = _geom(12)
+    at = lambda b, s_q, **kw: _make_block(12, b, s_q, fuse_norm_rope=True, **kw)[0]  # noqa: E731
+    low = at(32, 4)  # 128 rows: the bound, lowered
+    assert low.small_m_decode and not low.fuse_norm_rope_effective and not low.cache_write_fused and low._norm_rope is not None
+    high = at(129, 1)  # 129 rows: past the bound, the fused fork as declared
+    assert not high.small_m_decode and high.fuse_norm_rope_effective and high.cache_write_fused and high._norm_rope is None
+    ctl = at(32, 4, fuse_norm_rope_small_m=True)
+    assert ctl.small_m_decode and ctl.fuse_norm_rope_effective and ctl.cache_write_fused and ctl._norm_rope is None
+    explicit = at(32, 4, fuse_norm_rope_small_m=False)
+    assert explicit.fuse_norm_rope_small_m is False and not explicit.fuse_norm_rope_effective
+    assert at(129, 1, fuse_norm_rope_small_m=False).fuse_norm_rope_effective, "False lowers at decode row counts only; past the bound the fork stays"
+    unfused = _make_block(12, 4, 4, fuse_norm_rope=False)[0]
+    assert not unfused.fuse_norm_rope and not unfused.fuse_norm_rope_effective and unfused._norm_rope is not None
+    assert low._layout() == ctl._layout(), "the carve does not read the fusion"
+    with pytest.raises(ValueError, match="fuse_norm_rope_small_m=False: the knob decides"):
+        _make_block(12, 4, 4, fuse_norm_rope=False, fuse_norm_rope_small_m=False)
+    mk = lambda *shape: torch.empty(*shape, dtype=torch.bfloat16, device=_DEV)  # noqa: E731
+    with pytest.raises(ValueError, match="fuse_norm_rope_small_m=True: the knob decides"):
+        GatedAttentionBlockFwd(
+            mk(1, 4, _D_MODEL),
+            mk(geom.n_qkvg, _D_MODEL),
+            mk(_D),
+            mk(_D),
+            mk(1, 4, _ROPE),
+            mk(1, 4, _ROPE),
+            mk(_D_MODEL, 24 * _D),
+            mk(1, 4, _D_MODEL),
+            geom,
+            fuse_norm_rope=True,
+            fuse_norm_rope_small_m=True,
+        )
 
 
 def test_a_self_block_keeps_its_contract_and_refuses_the_paged_read_inputs():
@@ -994,6 +1060,26 @@ def test_decode_matches_the_oracle_at_every_group_and_s_q(group, s_q):
     assert r.claimed is (s_q <= DECODE_CLAIMED_MAX_S_Q and r.pack_gqa and r.decode_tile)
     k0, v0 = case.block0_bits
     assert torch.equal(_bits(case.k_cache[0]), k0) and torch.equal(_bits(case.v_cache[0]), v0), "block 0 (the NULL block) must never be written"
+
+
+@requires_rubin
+@pytest.mark.parametrize("s_q", [1, 4], ids=["sq1", "sq4"])
+def test_the_fused_fork_control_arm_matches_the_oracle_at_decode_row_counts(s_q):
+    """``fuse_norm_rope_small_m=True`` (the A/B's control arm) runs the fused norm + RoPE projection with the write-through folded in at
+    decode row counts, where the default declaration lowers to the unfused chain: both within the oracle's budget (two kernels for
+    stage (1), two roundings -- not bitwise), the pools' step rows and the padded entry exactly as on the default chain, the stage
+    lists the two chains'."""
+    ctl = _case(("ctl", 12, s_q), 12, s_q, _LENS, blk_kw=dict(fuse_norm_rope_small_m=True))
+    dflt = _std_case(12, s_q)
+    assert ctl.blk.fuse_norm_rope_effective and ctl.blk.cache_write_fused and not dflt.blk.fuse_norm_rope_effective and not dflt.blk.cache_write_fused
+    assert [st.name for st in ctl.blk._stages] == ["qkv_gate_proj_norm_rope", "sdpa", "out_proj"]
+    assert [st.name for st in dflt.blk._stages] == ["qkv_gate_proj", "qk_norm_rope", "cache_write", "sdpa", "out_proj"]
+    a = ctl.run().clone()
+    b = dflt.run().clone()
+    ctl.check_against_oracle(a, what="the fused fork (control)")
+    dflt.check_against_oracle(b, what="the lowered chain (default)")
+    assert torch.equal(a[~ctl.live], b[~dflt.live]) and (a[~ctl.live] == 0).all()
+    assert _cos(a[ctl.live], b[dflt.live]) > 0.9999
 
 
 @requires_rubin

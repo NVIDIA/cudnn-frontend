@@ -375,7 +375,10 @@ def test_declaration_facts_on_the_prefill_route_and_the_policy_knob():
     assert isinstance(st, _Sdpa) and st.thd and not st.paged_dense and st.decode_route == r and st.decode_split_kv == 1 and not st.seq_lens_present
     assert (st.num_sequences, st.max_seq_len, st.cu_seqlens, st.batch, st.seq_len) == (4, 5, False, 4, 5)
     assert blk.gate_fused and blk._gate is None and st.fuse_gate, "the gate rides the paged prefill body's epilogue"
-    assert [s.name for s in blk._stages] == ["qkv_gate_proj_norm_rope", "sdpa", "out_proj"]
+    # C0: at decode row counts (4 x 5 rows) the fused declaration lowers stage (1) to the unfused chain; the control knob keeps the fork
+    assert [s.name for s in blk._stages] == ["qkv_gate_proj", "qk_norm_rope", "cache_write", "sdpa", "out_proj"] and not blk.fuse_norm_rope_effective
+    blk_f, _ = _make_block(16, 4, 5, fuse_gate=True, fuse_norm_rope=True, fuse_norm_rope_small_m=True)
+    assert [s.name for s in blk_f._stages] == ["qkv_gate_proj_norm_rope", "sdpa", "out_proj"] and blk_f.fuse_norm_rope_effective
     assert decode_split_choice(r, batch=4, h_kv=2, max_kv_len=1024, sm_count=204, gated=True, h_q=32) == 1
     # a pinned split on the prefill route: typed; 1 is the unsplit prefill body
     with pytest.raises(NotImplementedError, match="prefill route.*unsplit"):

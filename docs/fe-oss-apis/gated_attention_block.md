@@ -451,6 +451,7 @@ blk = GatedAttentionBlockFwd(
     kv_cache_dtype=None,         # serving: None = the activation dtype; torch.float8_e4m3fn = the e4m3 KV cache (per-tensor k_scale / v_scale at execute) -- "Serving: the e4m3 KV cache"
     decode_route_policy=None,    # the DECODE form: None = "single_unit" (the decode tile in one unit, else the packed prefill tile); "token_units" = the adapter's route -- "Serving: the decode form"
     decode_q_tile_max=None,      # the DECODE form: None = the decode tile's whole width table (16, 32, 64); 32 = the route before the 64-column width landed (a performance-only cap)
+    fuse_norm_rope_small_m=None, # the DECODE form: None = fuse_norm_rope=True LOWERS stage (1) to the unfused chain at B x S_q <= 128 (the measured faster step); True = the fused fork as declared
 )
 workspace = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device=h.device)
 blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace,
@@ -844,7 +845,16 @@ step's tokens are written through (4w) and stage (4) attends, per sequence, over
 the LAST rows of a `kv_lens[b]`-key sequence; `geometry.is_causal=True` therefore needs `geometry.causal_bottom_right=True`;
 `geometry.window_*` are not served). The batch is UNIFORM (`S_q` rows per sequence; a serving stack's padded entry is
 `kv_lens = 0` + block table row `0` + slot `-1` and yields `out` rows exactly `0`, nothing written to block `0`). The
-pipeline is `(1)+(2)+(3) -> (4w) -> (4) [+ combine] -> (5) -> (6)`; the fused kernel the stage runs is a declaration fact:
+pipeline is `(1)+(2)+(3) -> (4w) -> (4) [+ combine] -> (5) -> (6)` -- past decode row counts. **At decode row counts (`B x S_q <= 128`,
+the small-M projection route's bound) a `fuse_norm_rope=True` declaration LOWERS stage (1) to the unfused chain**, `(1) -> (2)+(3) -> (4w)
+-> (4) [+ combine] -> (5) -> (6)`: the small-M route's slab GEMM, the norm + RoPE pass and the separate cache write (seven launches with
+the split combine) instead of the 256-wide fused fork, which pads the step's handful of rows to one token tile and streams the slab weight
+from a quarter of the SMs (the measured B 1 .. 32 decode step is faster on the unfused chain). `fuse_norm_rope` stays what was declared,
+`blk.fuse_norm_rope_effective` reads back what runs (`cache_write_fused` follows it: the write-through arm lives in the fork), and
+`fuse_norm_rope_small_m=True` (a declaration knob, appended; performance-only, the same function either way within the fp32 roundings of two
+kernels) keeps the fused fork as declared -- the A/B's control arm; `fuse_cache_write=True` under the lowering is a typed decline naming the
+knob. bf16 / f16, no indexer band, 16-bit pools, the dense DECODE form only: the EXTEND form, the block-sparse mode and the quantized pipelines
+run `fuse_norm_rope` as declared. The fused kernel the stage runs is a declaration fact:
 
 The route is TABLE-DRIVEN (the default policy, `decode_route_policy="single_unit"`): ONE ordered table of the Rubin decode tile's
 single-unit widths, `config_sm107.D256_DECODE_SINGLE_UNIT_Q_TILES = (16, 32, 64)` (the 64-column tile landed 2026-10-15: four
@@ -910,6 +920,7 @@ the EXTEND form (`gate_fused`, no separate launch).
 | `max_kv_len` (declaration) | int, `kv_lens[b] <= max_kv_len <= max_pages * P` | optional; the masks' clamp and the split model's extent; `None` = `max_pages * P` |
 | `decode_split_kv` (declaration) | `None` or an int `>= 1` (`> 1` on the decode tile only; the prefill route runs unsplit) | the one performance knob of the form: the same function under every value |
 | `decode_route_policy` (declaration) | `None` (= `"single_unit"`) or `"token_units"` | the route policy (the table above / the adapter's token-unit route): a performance-only knob, the same function under either; `DecodeRoute.policy` reads it back |
+| `fuse_norm_rope_small_m` (declaration) | `None` (= the lowering at `B x S_q <= 128`), `True` (the fused fork as declared) or `False` (the lowering, explicit) | whether the fused norm + RoPE projection runs at decode row counts when `fuse_norm_rope=True`: a performance-only knob; `blk.fuse_norm_rope_effective` reads back what runs; refused with `fuse_norm_rope=False` and off the dense DECODE form |
 | `decode_q_tile_max` (declaration) | `None` (= the whole table `(16, 32, 64)`) or a width of it (`32` = the route before the 64-column tile landed) | the width cap on the decode tile's single-unit table: a performance-only knob, the same function under every width; `DecodeRoute.q_tile_max` reads it back and the compiled width is pinned against the route at `compile()` |
 | `block_table` (execute) | `[B, max_pages]` int32 at the declared strides; `0` = the NULL block of a padded entry | REQUIRED; page ids are device data |
 | `kv_lens` (execute) | `[B]` int32 contiguous: the LOGICAL KV length of every sequence INCLUDING the step's tokens; `0` = a padded entry | REQUIRED; bound to the SDPA's KV side ONLY (`seq_kv_lens = kv_lens`, `seq_q_lens = None`: every Q row of the step is live) |
