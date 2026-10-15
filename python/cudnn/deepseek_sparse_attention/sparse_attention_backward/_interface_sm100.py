@@ -1,6 +1,7 @@
 # Copyright (c) 2026, Jerry Chen
 # SPDX-License-Identifier: MIT
 import math
+from functools import lru_cache
 from typing import Optional, Tuple
 
 import torch
@@ -13,7 +14,11 @@ from cudnn.deepseek_sparse_attention.utils.runtime import device_capability as _
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 from cudnn.frost.buffers import memset_zero_async
 from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
-from .dsa_bwd_sm100_deterministic import FlashAttentionDSABackwardSm100Deterministic, deterministic_kernel_class
+from .dsa_bwd_sm100_deterministic import (
+    FlashAttentionDSABackwardSm100Deterministic,
+    _deterministic_kernel_class_for_shards,
+    deterministic_kernel_class,
+)
 
 torch2cute_dtype_map = {
     torch.float16: cutlass.Float16,
@@ -218,6 +223,90 @@ def _get_sm100_kernel_class(backend: str, deterministic: bool = False, total_s_q
     return FlashAttentionDSABackwardSm100
 
 
+def _fake_compact_tensor(dtype, shape, alignment=16):
+    """Construct a storage-free row-major tensor for plan-time compilation."""
+    return cute.runtime.make_fake_compact_tensor(
+        dtype,
+        shape,
+        stride_order=tuple(reversed(range(len(shape)))),
+        assumed_align=alignment,
+    )
+
+
+@lru_cache(maxsize=None)
+def _compile_deterministic_sm100(
+    device_capability: Tuple[int, int],
+    backend: str,
+    dtype: torch.dtype,
+    head_dim: int,
+    head_dim_v: int,
+    num_heads: int,
+    max_topk: int,
+    has_topk_length: bool,
+    deterministic_shards: int,
+):
+    """Compile one shape-dynamic deterministic artifact from plan metadata."""
+    if device_capability[0] != 10:
+        raise ValueError(f"deterministic SM100 DSA backward requires an SM100-family device, got {device_capability}")
+    if dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(f"unsupported deterministic SM100 dtype {dtype}")
+
+    if backend == "generic_m64":
+        kernel_cls = _deterministic_kernel_class_for_shards(deterministic_shards)
+    else:
+        kernel_cls = _get_sm100_kernel_class(backend, True)
+        if kernel_cls.num_dkv_shards != deterministic_shards:
+            raise ValueError(
+                f"deterministic backend {backend!r} requires {kernel_cls.num_dkv_shards} "
+                f"workspace planes, got {deterministic_shards}"
+            )
+
+    element_dtype = torch2cute_dtype_map[dtype]
+    total_s_q, total_s_kv = cute.sym_int(), cute.sym_int()
+    q = _fake_compact_tensor(element_dtype, (total_s_q, num_heads, head_dim))
+    kv = _fake_compact_tensor(element_dtype, (total_s_kv, head_dim))
+    out = _fake_compact_tensor(element_dtype, (total_s_q, num_heads, head_dim_v))
+    lse = _fake_compact_tensor(cutlass.Float32, (total_s_q, num_heads), alignment=8)
+    sink = _fake_compact_tensor(cutlass.Float32, (num_heads,))
+    indices = _fake_compact_tensor(cutlass.Int32, (total_s_q, max_topk))
+    lengths = _fake_compact_tensor(cutlass.Int32, (total_s_q,), alignment=4) if has_topk_length else None
+    workspace_lse = _fake_compact_tensor(cutlass.Uint8, (1, num_heads, cute.sym_int(), 8))
+    workspace_dkv = _fake_compact_tensor(cutlass.Uint8, (1, deterministic_shards, cute.sym_int(), head_dim * 4))
+    problem_shape = (
+        cutlass.Int32(1),
+        cutlass.Int32(1),
+        cutlass.Int32(head_dim),
+        (cutlass.Int32(num_heads), cutlass.Int32(1)),
+    )
+    kernel = kernel_cls(
+        element_dtype=element_dtype,
+        head_dim=head_dim,
+        head_dim_v=head_dim_v,
+        block_tile=64,
+        max_topk=max_topk,
+    )
+    return cute.compile(
+        kernel,
+        problem_shape,
+        q,
+        kv,
+        out,
+        out,
+        lse,
+        sink,
+        indices,
+        lengths,
+        q,
+        kv,
+        sink,
+        workspace_lse,
+        workspace_dkv,
+        cutlass.Float32(1.0),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+        options=compile_options(),
+    )
+
+
 def flash_attn_bwd_sm100(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -235,6 +324,7 @@ def flash_attn_bwd_sm100(
     workspace: Optional[torch.Tensor] = None,
     *,
     d_sink: Optional[torch.Tensor] = None,
+    _compiled_kernel=None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """FlashAttention (DSA) Backward Pass for Blackwell (SM100), with K=V.
 
@@ -408,7 +498,8 @@ def flash_attn_bwd_sm100(
     # dispatch tests that inspect it.
     compile_key = (backend, deterministic, dtype, head_dim, head_dim_v, num_head, block_tile, deterministic_shards, max_topk, has_topk_length)
 
-    if compile_key not in flash_attn_bwd_sm100.compile_cache:
+    compiled_kernel = _compiled_kernel
+    if compiled_kernel is None and compile_key not in flash_attn_bwd_sm100.compile_cache:
         q_tensor = to_cute_tensor(q, divisibility=head_dim)
         kv_tensor = to_cute_tensor(kv, divisibility=head_dim)
         out_tensor = to_cute_tensor(out, divisibility=head_dim_v)
@@ -456,9 +547,11 @@ def flash_attn_bwd_sm100(
                 current_stream,
                 options=compile_options(),
             )
+    if compiled_kernel is None:
+        compiled_kernel = flash_attn_bwd_sm100.compile_cache[compile_key]
 
     with torch.cuda.nvtx.range(f"flash_attn_bwd_sm100_kernel[{backend}]"):
-        flash_attn_bwd_sm100.compile_cache[compile_key](
+        compiled_kernel(
             problem_shape,
             q,
             kv,

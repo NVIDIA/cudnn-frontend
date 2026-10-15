@@ -224,7 +224,11 @@ class SparseAttentionBackward(APIBase):
         return True
 
     def compile(self) -> None:
-        """Compile the selected backend, including every adaptive-pair stage."""
+        """Compile every artifact required by the selected prepared plan.
+
+        Deterministic SM100 compilation uses only stored tensor metadata and
+        must complete before ``execute()`` or CUDA Graph capture.
+        """
         self._ensure_support_checked()
         if self.q_cluster_mode == "adaptive_pair":
             from ._qcluster_sm100 import compile_plan
@@ -253,6 +257,24 @@ class SparseAttentionBackward(APIBase):
                     self.q_desc.shape[0] == 1,
                     self._two_cta_split_count > 1,
                     self.deterministic,
+                )
+            return
+        if self.deterministic:
+            total_s_q, num_heads, head_dim = self.q_desc.shape
+            head_dim_v = self.out_desc.shape[2]
+            kernel_cls = _iface_sm100._get_sm100_kernel_class(self._backend, True, total_s_q)
+            shards = kernel_cls.num_dkv_shards
+            with torch.cuda.device(self.q_desc.device):
+                self._compiled_kernel = _iface_sm100._compile_deterministic_sm100(
+                    torch.cuda.get_device_capability(self.q_desc.device),
+                    self._backend,
+                    self.q_desc.dtype,
+                    head_dim,
+                    head_dim_v,
+                    num_heads,
+                    self.topk_idxs_desc.shape[1],
+                    self.topk_length_desc is not None,
+                    shards,
                 )
             return
         # The architecture-specific interfaces manage their own compile caches.
@@ -307,9 +329,10 @@ class SparseAttentionBackward(APIBase):
         ``scratch_workspace_bytes()`` is non-zero) ``workspace`` to be
         caller-provided; execute never allocates. ``d_sink`` is keyword-only so
         the positional order of the pre-existing parameters is unchanged. The
-        H128/D576 two-CTA route additionally never compiles here. Adaptive
-        pairing makes its overlap decision on device and launches only stages
-        compiled by ``compile()``, so replay needs no host branch or D2H read.
+        H128/D576 two-CTA and deterministic SM100 routes additionally never
+        compile here. Adaptive pairing makes its overlap decision on device
+        and launches only stages compiled by ``compile()``, so replay needs no
+        host branch or D2H read.
         Inputs, outputs, and the live workspace must not overlap; concurrent
         executions need distinct output and workspace storage.
         """
@@ -317,6 +340,23 @@ class SparseAttentionBackward(APIBase):
             if not isinstance(tensor, torch.Tensor):
                 raise ValueError(f"{name} must be preallocated; use sparse_attention_backward_wrapper for automatic output allocation")
         scale = self.softmax_scale if softmax_scale is None else softmax_scale
+        if self.deterministic:
+            if self._compiled_kernel is None:
+                raise RuntimeError("call compile() before execute()")
+            for name, tensor, desc in (
+                ("q", q, self.q_desc),
+                ("kv", kv, self.kv_desc),
+                ("out", out, self.out_desc),
+                ("dout", dout, self.dout_desc),
+                ("lse", lse, self.lse_desc),
+                ("attn_sink", attn_sink, self.attn_sink_desc),
+                ("topk_idxs", topk_idxs, self.topk_idxs_desc),
+                ("topk_length", topk_length, self.topk_length_desc),
+            ):
+                if (tensor is None) != (desc is None):
+                    raise ValueError(f"{name} presence must match the compiled plan")
+                if desc is not None and (tuple(tensor.shape) != desc.shape or tensor.dtype != desc.dtype or tensor.device != desc.device):
+                    raise ValueError(f"{name} shape, dtype, and device must match the compiled plan")
         if self._backend == _iface_d576.BACKEND:
             if self._compiled_kernel is None:
                 raise RuntimeError("call compile() before execute()")
@@ -415,6 +455,7 @@ class SparseAttentionBackward(APIBase):
                 deterministic=self.deterministic,
                 workspace=workspace,
                 current_stream=current_stream,
+                _compiled_kernel=self._compiled_kernel if self.deterministic else None,
             )
 
 
@@ -447,6 +488,10 @@ def sparse_attention_backward_wrapper(
     H16/H32/H64/H96/H128 gradients on SM100. The optional reusable uint8
     ``workspace`` must hold at least
     ``SparseAttentionBackward.scratch_workspace_bytes()`` bytes.
+
+    A deterministic ``SparseAttentionBackward.execute()`` is capture-safe
+    after ``compile()``. Warm this convenience wrapper before capture so its
+    cached plan has already been constructed and compiled.
 
     ``q_cluster_mode='adaptive_pair'`` partitions each adjacent query pair on
     the GPU and evaluates a profitable shared KV segment once. The opt-in

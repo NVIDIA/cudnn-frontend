@@ -80,14 +80,25 @@ def _allocate(cfg, has_topk_length: bool):
     return q, kv, attn_sink, topk_idxs, topk_length
 
 
-def _plan_case(num_heads, head_dim, topk, *, s_q=8, s_kv=256, has_topk_length=False, deterministic=False, q_cluster_mode="off"):
+def _plan_case(
+    num_heads,
+    head_dim,
+    topk,
+    *,
+    s_q=8,
+    s_kv=256,
+    dtype=torch.bfloat16,
+    has_topk_length=False,
+    deterministic=False,
+    q_cluster_mode="off",
+):
     """Inputs, a checked and compiled plan, caller-owned outputs, and scratch for one route."""
     from cudnn import DSA
 
     device = torch.device("cuda")
     softmax_scale = 1.0 / math.sqrt(head_dim)
-    q = torch.randn(s_q, num_heads, head_dim, dtype=torch.bfloat16, device=device) / 10
-    kv = torch.randn(s_kv, head_dim, dtype=torch.bfloat16, device=device) / 10
+    q = torch.randn(s_q, num_heads, head_dim, dtype=dtype, device=device) / 10
+    kv = torch.randn(s_kv, head_dim, dtype=dtype, device=device) / 10
     attn_sink = torch.randn(num_heads, dtype=torch.float32, device=device)
     topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
     topk_length = torch.randint(1, topk + 1, (s_q,), dtype=torch.int32, device=device) if has_topk_length else None
@@ -126,7 +137,7 @@ def _assert_execute_allocates_nothing_and_never_synchronizes(plan, inputs, outpu
         dq, dkv, d_sink = outputs
         return plan.execute(*inputs, dq, dkv, topk_length=topk_length, softmax_scale=softmax_scale, workspace=workspace, current_stream=stream, d_sink=d_sink)
 
-    execute()  # warm: the non-D576 routes compile on their first execute
+    execute()  # warm ordinary SM90/SM100 routes that still compile on first execute
     torch.cuda.synchronize()
     before = torch.cuda.memory_stats()["allocation.all.allocated"]
     previous = torch.cuda.get_sync_debug_mode()
@@ -731,6 +742,71 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_adaptive_shards_repea
         _exercise_deterministic_sm100_case(64, 512, s_q, 130, repeats=100)
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=422)
+@pytest.mark.parametrize(
+    "num_heads,topk,dtype,expected_backend",
+    [
+        pytest.param(64, 64, torch.bfloat16, "generic_m64", id="generic-bf16"),
+        pytest.param(64, 64, torch.float16, "generic_m64", id="generic-fp16"),
+        pytest.param(128, 128, torch.bfloat16, "h128_2cta_m64", id="h128-two-cta-bf16"),
+    ],
+)
+def test_DSA_sparse_attention_backward_sm100_deterministic_plan_is_cold_capture_safe(
+    monkeypatch, num_heads, topk, dtype, expected_backend
+):
+    """Plan compilation must leave no CuTe JIT work for execute or capture."""
+    try:
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100 as interface
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    _require_sm100()
+    plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
+        num_heads,
+        512,
+        topk,
+        s_q=8,
+        s_kv=256,
+        dtype=dtype,
+        has_topk_length=True,
+        deterministic=True,
+    )
+    assert plan._backend == expected_backend
+    assert callable(plan._compiled_kernel)
+
+    def forbidden_compile(*args, **kwargs):
+        raise AssertionError("execute() attempted CuTe compilation")
+
+    monkeypatch.setattr(interface.cute, "compile", forbidden_compile)
+    dq, dkv, d_sink = outputs
+
+    def run():
+        return plan.execute(
+            *inputs,
+            dq,
+            dkv,
+            topk_length=topk_length,
+            softmax_scale=softmax_scale,
+            workspace=workspace,
+            d_sink=d_sink,
+        )
+
+    reference = run()
+    torch.cuda.synchronize()
+    reference = tuple(tensor.clone() for tensor in reference)
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            captured = run()
+        graph.replay()
+        torch.cuda.synchronize()
+        for actual, expected in zip(captured, reference):
+            assert torch.equal(actual, expected)
+    finally:
+        graph.reset()
 
 
 @pytest.mark.L1

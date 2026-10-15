@@ -238,3 +238,11 @@ _DETERMINISTIC_KERNELS = {
 def deterministic_kernel_class(total_seqlen_q: int):
     """Return the compile-time shard specialization for a query extent."""
     return _DETERMINISTIC_KERNELS[deterministic_dkv_shards(total_seqlen_q)]
+
+
+def _deterministic_kernel_class_for_shards(num_shards: int):
+    """Return the deterministic specialization for an already selected shard count."""
+    try:
+        return _DETERMINISTIC_KERNELS[num_shards]
+    except KeyError as exc:
+        raise ValueError(f"unsupported deterministic dKV shard count {num_shards}") from exc
