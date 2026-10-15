@@ -617,7 +617,10 @@ def gated_attention_block_qsa_reference(
     rep = geom.h_q // geom.h_kv
 
     # (1) fused QKV+GATE(+INDEX) projection, fp32 accumulate, one rounding.
-    proj = (h.to(acc_dtype) @ w_qkvg.to(acc_dtype).t()).to(out_dtype)
+    # Dense columns and the band are separate GEMMs: cuBLAS may reduce in a different order at another N (A100 / L40S do),
+    # and the dense columns must match the dense oracle's N = n_dense GEMM bitwise.
+    h_acc = h.to(acc_dtype)
+    proj = torch.cat([h_acc @ w_qkvg[:n_dense].to(acc_dtype).t(), h_acc @ w_qkvg[n_dense:].to(acc_dtype).t()], dim=-1).to(out_dtype)
     q_pre, gate, k_pre, v, band = split_qkvg_qsa(proj, geom, spec)
     index_q_raw = index_k_raw = None
     if band is not None:

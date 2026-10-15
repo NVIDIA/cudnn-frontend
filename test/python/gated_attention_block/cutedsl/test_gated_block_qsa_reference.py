@@ -503,7 +503,7 @@ class TestInputs:
         _assert_oracles_equal(qsa, dense)  # S = 64 < 2051: the band changes nothing of out / O / LSE
         assert qsa.index_k_raw.shape == (1, 64, 128) and qsa.index_q_raw.shape == (1, 64, 4, 128)
         # the band is the slab's last 640 columns, raw: the indexer's own k_raw (pre-norm, un-rotated) within one bf16
-        # rounding -- the same linear map, but a 1408-column GEMM and a 640-column one accumulate in a different order
+        # rounding -- the same linear map; the oracle now runs the band as its own 640-column GEMM, so bitwise in practice
         _s, _ids, _lens, k_raw, _kc = _indexer(inp, g, g.qsa)
         torch.testing.assert_close(qsa.index_k_raw.float(), k_raw.float(), rtol=2**-7, atol=1e-3)
         n_bitwise = int((qsa.index_k_raw == k_raw).sum())
