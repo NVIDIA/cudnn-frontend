@@ -1267,6 +1267,139 @@ def _forced_tile_config(n: int) -> Optional[str]:
     return None
 
 
+# The SMALL-M route: the serving DECODE / MTP projections (T = B x S_q <= SMALL_M_MAX rows).
+#
+# At T <= 128 a projection GEMM is a weight-streaming problem, not an MMA one: the forced 256-wide tile pads every M tile to
+# 256 rows (128 per CTA of the pair), launches ONE M tile (N / 256 cluster pairs: 52 for the 24/2 fused slab, 10 for its
+# out projection) and spends 4-5x cuBLAS's time at T 1..128 (measured on the Rubin perf class, 212 SMs: 25.2 vs 8.4 us at
+# T 1 on the 24/2 fused slab).  The catalog already carries the two axes that fix it, so no new kernel: ``swap_ab``
+# computes ``C^T = W A^T`` with the WEIGHT rows on the MMA M axis (every 64- or 128-row weight tile is a CTA, so the
+# machine is filled by N / tile_m CTAs) and the TOKENS on the MMA N axis, sized to T (the catalog's N tiles run 8..256 in
+# steps of 8, so an 8-token step issues 64x8 / 128x8 MMAs instead of 256x256 ones); the two-kernel ``split_k_slices``
+# fills the machine where the weight has too few rows for one wave (the out projection).  Measured on the Rubin perf
+# class (one process, shuffled A/B/A x 3 x 100, CUPTI device time, control pair <= 0.6 %):
+#
+#   24/2 fused slab (N 13312, K 2560):    T 1   cuBLAS 8.4 | forced 25.3 | 64x8 cluster2x1 swapAB   6.1 us
+#                                         T 4          7.1 |        16.1 | 64x8 cluster2x1 swapAB   6.1
+#                                         T 32         7.2 |        13.5 | 64x32 cluster2x1 swapAB  6.3
+#                                         T 128        9.7 |        13.7 | 128x64 (plain)           9.0
+#   24/2 out projection (N 2560, K 6144): T 1   cuBLAS 7.3 | forced 24.6 | 128x8 splitK8 swapAB    6.3
+#                                         T 4          7.2 |        24.6 | 128x8 splitK8 swapAB    6.4
+#                                         T 32         7.6 |        24.5 | 128x32 splitK8 swapAB   7.0
+#                                         T 128        8.4 |        24.5 | 64x32 (plain)           9.3
+#
+#   32/2 fused slab (N 17408, K 4096):    T 1   cuBLAS 13.3 | forced 45.6 | 128x8 swapAB            13.1
+#                                         T 32        15.8 |        19.9 | 128x32 swapAB           13.3
+#                                         T 128       21+  |        20.3 | 128x128 swapAB          15.5
+#   32/2 out projection (N 4096, K 8192): T 1   cuBLAS 9.5  | forced 32.2 | 128x8 splitK6 swapAB    7.7
+#                                         T 128       14.1 |        32.1 | 128x128 splitK6 swapAB  16.1
+#   8/1 fused slab (N 4608, K 4096):      T 1   cuBLAS 5.8  | forced 21.4 | 64x8 cluster1x1 swapAB  6.6
+#   8/1 out projection (N 4096, K 2048):  T 1   cuBLAS 3.9  | forced 11.2 | 64x8 swapAB (no split)  4.9   (cuBLAS stays ahead on this shard)
+#
+# The rule below spells those picks from the shape and the SM count alone (one-wave arithmetic, no measurement at plan
+# time): the token tile is the power of two >= T; a NARROW weight (fewer than a third of a wave of 64-row tiles) takes
+# 128-row weight tiles with the split-K slice count that fills one wave (capped at 8, every slice at least eight K tiles) up to
+# 64 tokens and the plain 64x32 tile past it while that grid fits one wave -- a shallow K (fewer than 64 K tiles) takes the
+# 64-row swap-AB tile instead of any split; a weight whose 64-row tiles fit one wave takes
+# them (in a 2x1 cluster on a full machine) up to 64 tokens and the plain 128x64 tile past it; a weight whose 64-row tiles
+# overflow a wave takes 128-row weight tiles (one wave).  Dense bf16 / f16, K-major A and B, no epilogue -- the forward's two
+# projections; everything else keeps today's resolution.
+SMALL_M_MAX = 128
+_SMALL_M_SPLIT_K_MAX = 8
+_SMALL_M_CTA_K_ELEMS = 64  # the catalog's 128-byte K tile at 2 bytes per element
+_SMALL_M_SPLIT_K_MIN_K_TILES = 64  # split K only past this depth (K 4096 at 2 bytes): below it the reducer costs more than it buys
+_SMALL_M_MIN_K_TILES_PER_SLICE = 8
+
+
+def small_m_tile_config(
+    m: int,
+    n: int,
+    k: int,
+    *,
+    dtype: torch.dtype,
+    a_major: str = "k",
+    b_major: str = "k",
+    block_scale: bool = False,
+    alpha: bool = False,
+    sm_count: Optional[int] = None,
+) -> Optional[str]:
+    """The catalog config name of the small-M route for a ``[m, k] x [k, n]`` projection, or None when the route does not
+    apply (a non-positive extent, ``m > SMALL_M_MAX``, a dtype other than bf16 / f16, a block-scale or fp8 plan, an MN-major
+    operand, an extent the TMA 16-byte rule refuses, an N that 256 does not divide).  ``sm_count`` is the target's SM count (the active device when None); the SAME shape resolves
+    to the same name on every part of one SM-count class, so a recorded plan name replays."""
+    if m <= 0 or n <= 0 or k <= 0:
+        # a non-positive extent never reaches the one-wave arithmetic below (``n = 0`` would divide by a zero CTA count, ``m`` or
+        # ``k`` at 0 would still spell a tile): the route declines and ``build_proj_gemm``'s own extent check names the extent
+        return None
+    if m > SMALL_M_MAX or block_scale or alpha:
+        return None
+    if dtype not in (torch.bfloat16, torch.float16):
+        return None
+    if a_major != "k" or b_major != "k":
+        return None
+    if n % 8 or k % 8:
+        # The swapped problem reads the weight as the K-contiguous A operand and stores the output M-major: both extents
+        # fall under TMA's 16-byte contiguous-extent rule at 2 bytes per element.
+        return None
+    if n % 256:
+        # An N the forced tile never existed for keeps today's resolution (the graph route; under ``capture_safe`` the typed
+        # refusal at the first capture): the indexer band's + 640 columns (``QsaSpec.index_band``) are the serving case.
+        return None
+    if sm_count is None:
+        from cudnn.gemm.frost.tile_config import _sm_count
+
+        sm_count = _sm_count()
+    tn = 8
+    while tn < m:
+        tn *= 2
+    ctas_64 = -(-n // 64)
+    ctas_128 = -(-n // 128)
+    if 3 * ctas_64 < sm_count:
+        # NARROW weight (fewer than a third of a wave of 64-row tiles).  With a DEEP K (>= 64 K tiles) 128-row weight tiles
+        # and the split-K slice count that fills ONE wave (a slice count that overflows the wave loses its tail: 32/2 out
+        # projection, 32 tiles, S 6 = 192 CTAs 7.7 us vs S 7 = 224 CTAs 9.0 us; every slice at least 8 K tiles); past 64
+        # tokens the plain 64x32 tile where its grid fits one wave, else the same 128x128 split.  With a SHALLOW K the reducer's
+        # fixed cost outweighs the split (8/1 out projection, K 2048: 4.9 us unsplit vs 5.9 split) -- the 64-row swap-AB tile.
+        k_tiles = -(-k // _SMALL_M_CTA_K_ELEMS)
+        slices = (
+            max(1, min(_SMALL_M_SPLIT_K_MAX, sm_count // ctas_128, k_tiles // _SMALL_M_MIN_K_TILES_PER_SLICE)) if k_tiles >= _SMALL_M_SPLIT_K_MIN_K_TILES else 1
+        )
+        if m > 64 and (slices == 1 or -(-m // 64) * -(-n // 32) <= sm_count):
+            return "CONFIG_sm100_64x32x128_64x32x32_cluster1x1_1ctamma"
+        if slices > 1:
+            return f"CONFIG_sm100_128x{tn}x128_128x{tn}x32_cluster1x1_1ctamma_splitK{slices}_swapAB"
+        cluster = "2x1" if 2 * ctas_64 >= sm_count else "1x1"
+        return f"CONFIG_sm100_64x{tn}x128_64x{tn}x32_cluster{cluster}_1ctamma_swapAB"
+    if ctas_64 <= sm_count:
+        # The 64-row weight tile fits one wave.  The 2x1 cluster (the token tile multicast across the pair) pays on a FULL
+        # machine only (24/2 slab, 208 CTAs: +18 %; 8/1 slab, 72 CTAs: -10 %).
+        if m <= 64:
+            cluster = "2x1" if 2 * ctas_64 >= sm_count else "1x1"
+            return f"CONFIG_sm100_64x{tn}x128_64x{tn}x32_cluster{cluster}_1ctamma_swapAB"
+        # 65..128 tokens: the plain 128-token x 64-weight tile (full-rate MMA M) while its grid fits one wave.
+        if -(-m // 128) * ctas_64 <= sm_count:
+            return "CONFIG_sm100_128x64x128_128x64x32_cluster1x1_1ctamma"
+        return "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_swapAB"
+    # The 64-row tiles overflow a wave: 128-row weight tiles (one wave up to N = 128 x SMs; 32/2 slab, 136 CTAs).
+    if m <= 64:
+        return f"CONFIG_sm100_128x{tn}x128_128x{tn}x32_cluster1x1_1ctamma_swapAB"
+    return "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_swapAB"
+
+
+def _auto_tile_name(m: int, n: int, k: int, *, dtype: torch.dtype, a_major: str, b_major: str, block_scale: bool, alpha: bool) -> Optional[str]:
+    """``tile_config="auto"``: the small-M route where it applies (:func:`small_m_tile_config`; on the ``sm100`` compiler family
+    only -- its names are the tcgen05 tree's catalog, so a process on the ``sm120`` family keeps the family-aware fallback below),
+    else the forced 256-wide tile where 256 divides N (:func:`_forced_tile_config`), else None (the graph heuristic's own tile)."""
+    from cudnn.gemm.frost import arch_family
+
+    name = (
+        small_m_tile_config(m, n, k, dtype=dtype, a_major=a_major, b_major=b_major, block_scale=block_scale, alpha=alpha)
+        if arch_family.active_family() == "sm100"
+        else None
+    )
+    return name if name is not None else _forced_tile_config(n)
+
+
 def build_proj_gemm(
     *,
     m: int,
@@ -1469,9 +1602,12 @@ def build_proj_gemm(
             f"{label}: capture_safe=True needs the forced-tile JIT route, and pin_frost=False is the graph route by request (its first execute "
             "per stream creates a cuDNN handle, which cannot happen inside a CUDA-graph capture); drop one of the two"
         )
-    # The tile the JIT route runs: the forced 256-wide config when it divides N, an explicit name as given, else None (the
-    # graph heuristic's own tile -- no JIT unless a split or an MMA K width is pinned below).
-    name = _forced_tile_config(n) if tile_config == "auto" else tile_config
+    # The tile the JIT route runs: the small-M route at m <= SMALL_M_MAX on a dense bf16 / f16 K-major plan, else the forced
+    # 256-wide config when it divides N, an explicit name as given, else None (the graph heuristic's own tile -- no JIT
+    # unless a split or an MMA K width is pinned below).
+    name = (
+        _auto_tile_name(m, n, k, dtype=dtype, a_major=a_major, b_major=b_major, block_scale=block_scale, alpha=alpha) if tile_config == "auto" else tile_config
+    )
     if capture_safe and name is None and not (block_scale or split_k >= 1 or mma_tile_k_bytes is not None):
         # No JIT would be built: the plan would run the GRAPH route, whose first execute per (device, stream) creates a cuDNN
         # handle -- inside the capture a serving stack records with no warm-up.  Typed, before any graph or backend call.
