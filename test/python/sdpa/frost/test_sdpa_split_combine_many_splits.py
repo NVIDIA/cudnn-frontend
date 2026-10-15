@@ -3,7 +3,9 @@
 
 """The shared split combine over MANY splits: the grouped tail walk (``G_T`` splits per memory round trip past the ``G_S`` head group)
 reduces every split count -- a group boundary hit exactly, one short of it, one past it, and a decode-shaped row count -- to the float64
-reference, with dead splits and dead rows handled as the three-split tests of ``test_sdpa_split_combine_sm100.py`` pin them.  Runs on any
+reference, with dead splits and dead rows handled as the three-split tests of ``test_sdpa_split_combine_sm100.py`` pin them -- the
+decode-shaped case keeps its only row LIVE (a dead split inside the tail and a dead LAST split beside live ones), so the grouped tail's
+accumulation on a live decode row is what it checks; the multi-row shape adds the all-dead row.  Runs on any
 SM100-line part (the combine has no arch-specific lowering; the Rubin d256 decode tile is its heaviest caller at 64 splits)."""
 
 import pytest
@@ -21,7 +23,8 @@ def _partials(b, h, sq, d, splits):
     generator = torch.Generator().manual_seed(20261014 + splits)
     o = torch.randn(splits, b, sq, h, d, generator=generator) * 0.4
     lse = torch.randn(splits, b, h, sq, generator=generator) * 2.0 + 0.7
-    lse[:, :, :, 0] = -torch.inf  # every split dead on one row
+    if sq > 1:
+        lse[:, :, :, 0] = -torch.inf  # every split dead on one row (a multi-row shape); the decode shape keeps its ONLY row live
     lse[1, :, :, min(1, sq - 1)] = -torch.inf  # a dead split beside live ones
     lse[splits - 1, :, 0, :] = -torch.inf  # the LAST split dead on one head: the clamped tail slots re-read it
     dead = torch.isneginf(lse).permute(0, 1, 3, 2).unsqueeze(-1)
@@ -51,9 +54,11 @@ def test_pointer_combine_many_splits_matches_the_reference(shape, splits):
     fn(op.data_ptr(), lp.data_ptr(), o.data_ptr(), lse.data_ptr(), (b, h, sq, d), splits, o.stride(), lse.stride(), torch.cuda.current_stream().cuda_stream)
     torch.cuda.synchronize()
     torch.testing.assert_close(o.cpu().float(), ref_o.float(), atol=0.004, rtol=0.004)
-    assert torch.count_nonzero(o[:, 0]).item() == 0  # the all-dead row is exactly 0
+    if sq > 1:
+        assert torch.count_nonzero(o[:, 0]).item() == 0  # the all-dead row is exactly 0
     torch.testing.assert_close(lse.cpu().double(), ref_lse, atol=2e-5, rtol=2e-5)
-    assert torch.all(torch.isneginf(lse[:, :, 0]))
+    if sq > 1:
+        assert torch.all(torch.isneginf(lse[:, :, 0]))
 
 
 def test_tail_group_is_wider_than_the_head_group():
