@@ -28,7 +28,8 @@ included.  Rubin cells: the whole block, dense AND packed, bf16 AND f16, on ever
 rows bitwise the slab's post-RoPE K / V bands attention consumed and within the suite's bars of the per-sequence oracle,
 padded tokens unwritten on a NaN-poisoned pool, ``out`` bitwise the block's without write-through, the workspace size
 unchanged -- plus the other bf16 pipelines (fused norm + RoPE, dense and packed; out-of-place Q / K / V; the fused gate) and
-the indexer band's raw-key pool.
+the indexer band's raw-key pool on the sparse block (the stage walk, then the whole block with the full caller list against the
+fp32 QSA oracle).
 """
 
 import contextlib
@@ -57,7 +58,6 @@ from cudnn.gated_attention_block import (
 from cudnn.gated_attention_block.api import (
     _EXTEND_DECLINES,
     PAGED_KV_PAGE_ALIGN,
-    _align_up,
     _CacheWrite,
     _cols,
     _FusedQkvProjection,
@@ -86,6 +86,12 @@ requires_capture_safe_gemm_route = pytest.mark.skipif(
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from gated_block_qsa_reference import (  # noqa: E402
+    RefQsaGeometry,
+    RefQsaSpec,
+    full_block_ids,
+    gated_attention_block_qsa_reference,
+)
 from gated_block_reference import (  # noqa: E402
     RefGeometry,
     build_rope_tables,
@@ -1113,11 +1119,15 @@ def test_two_launches_are_bitwise_on_the_pools_and_the_output():
 @pytest.mark.L1
 @requires_rubin
 def test_raw_indexer_key_pool_at_flash_next():
-    """The band geometry's write-through stages -- the unfused projection over the five-band slab, norm + RoPE, the cache
-    write -- are the stages AHEAD of the sparse attention core in the block's walk (``check_support`` accepts them and
-    then declines at the sparse stage, which has not landed), so they run through the block's own stage objects: the raw
+    """The band geometry's write-through on the sparse block: ``check_support`` accepts the whole walk -- the unfused projection
+    over the five-band slab, norm + RoPE, the cache write AND the sparse attention core (stage (4) of a ``QsaSpec`` block is the
+    index-list sparse d256 forward; the core declined here before it landed) -- so the cell walks the stages AHEAD of the core
+    through the block's own stage objects (the only way to read the slab between the projection and norm + RoPE): the raw
     indexer key's pool is bitwise ``index_k_raw_view`` at every slot, the K / V pools bitwise the post-RoPE bands, and the
-    pre-norm raw key is untouched by norm + RoPE."""
+    pre-norm raw key is untouched by norm + RoPE.  Then the WHOLE block runs on the same inputs with the full caller list
+    (every complete block of the row's own sequence, below the identity bound: dense causal attention through the sparse core)
+    on fresh NaN pools: its three pools bitwise the walk's, its slab's raw key (``index_k_raw(workspace)``) bitwise the walk's,
+    ``out`` and the gated O within the suite's bars of the fp32 QSA oracle."""
     geom = GatedAttentionBlockGeometry(**_FLASH_NEXT, qsa=QsaSpec(index_band=True))
     b, s = 1, 512
     t, dm, ps = b * s, geom.d_model, 16
@@ -1134,12 +1144,11 @@ def test_raw_indexer_key_pool_at_flash_next():
     assert isinstance(blk._sdpa, _SparseSdpa) and blk._cache_write.index_band
     stages = list(blk._stages)
     assert stages.index(blk._cache_write) < stages.index(blk._sdpa)
-    with pytest.raises(NotImplementedError, match="sparse attention core"):
-        blk.check_support()  # the stages ahead of the sparse core -- the write-through included -- accepted the band geometry
-    for st in (blk._proj, blk._norm_rope, blk._cache_write):
-        st.compile()
+    assert blk.check_support()  # every stage accepts the band geometry -- the write-through and the sparse core included
+    blk.compile()
     lay = blk._layout()
-    ws = torch.full((lay.total_bytes + _align_up(max(blk._proj.workspace_bytes(), 1)),), 0x7F, dtype=torch.uint8, device="cuda")
+    ws = torch.full((blk.get_workspace_size(),), 0x7F, dtype=torch.uint8, device="cuda")
+    # The stages AHEAD of the sparse core, one by one through the block's own (compiled) stage objects.
     proj = _view(ws, lay.proj, (t, geom.n_qkvg), torch.bfloat16)
     blk._proj.execute(h.view(t, dm), w_qkvg, proj, ws[lay.engine_scratch :], stream=stream)
     o_q, _o_g, o_k, o_v = geom.qkvg_offsets[:4]
@@ -1163,6 +1172,28 @@ def test_raw_indexer_key_pool_at_flash_next():
     assert torch.equal(_bits(pooled), _bits(raw[0, live, 0])), "the raw-key pool is not the slab's raw indexer key"
     assert _written_rows(index_cache) == int(live.sum())
     assert blk._cache_write.moved_bytes() == 2 * 2 * t * geom.h_kv * geom.d_head * 2 + t * 4 + 2 * t * 128 * 2 + t * 4
+    # The WHOLE block on the same inputs -- the landed walk runs on through the sparse core, the gate and the out projection: the
+    # full caller list (``block_ids`` [T, top_k] int32, every complete block of the row's own sequence then -1; ``block_lens`` the
+    # count), fresh NaN pools with the raw-key pool handed in as ``index_k_raw``, ``out`` NaN-poisoned (a row never written stays NaN).
+    ids, lens = full_block_ids(torch.arange(s, device="cuda"), geom.qsa.top_k, geom.qsa.block_size)
+    k_blk, v_blk = _pools(n_pages, geom.h_kv, ps, geom.d_head, "unified", device="cuda")
+    index_blk = torch.full_like(index_cache, float("nan"))
+    out.fill_(float("nan"))
+    blk.execute(
+        h, w_qkvg, wn, wn, cos, sin, w_o, out, ws, block_ids=ids, block_lens=lens, k_cache=k_blk, v_cache=v_blk, slot_mapping=slot, index_k_raw=index_blk
+    )
+    torch.cuda.synchronize()
+    for walk, whole, nm in ((k_cache, k_blk, "k_cache"), (v_cache, v_blk, "v_cache"), (index_cache, index_blk, "index_k_raw")):
+        assert torch.equal(_bits(walk), _bits(whole)), f"the whole block's {nm} is not bitwise the stage walk's"
+    assert torch.equal(_bits(blk.index_k_raw(ws)), _bits(raw_before)), "the whole block's slab holds another raw indexer key than the stage walk's"
+    assert torch.isfinite(out.float()).all(), "a row of out was never written (NaN survived)"
+    ref = gated_attention_block_qsa_reference(
+        h, w_qkvg, wn, wn, cos, sin, w_o, RefQsaGeometry(**_FLASH_NEXT, qsa=RefQsaSpec(index_band=True)), block_ids=ids, block_lens=lens
+    )
+    o_gated = _view(ws, lay.o, (t, geom.h_q, geom.d_head), torch.bfloat16).view(b, s, geom.h_q, geom.d_head)  # gated in place under inference
+    cos_out, d_o = _cos(out, ref.out), float((o_gated.float() - ref.o_gated.float()).abs().max())
+    print(f"\nband geometry S={s}, the whole block vs the fp32 QSA oracle (full list): cos(out) {cos_out:.6f} max|d O_gated| {d_o:.4e}")
+    assert cos_out > 0.999 and d_o <= 2e-2, f"off the oracle: cos(out) {cos_out}, max|d O_gated| {d_o}"  # the dense block suites' budget, as every QSA cell
 
 
 # ===========================================================================
