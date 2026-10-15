@@ -50,6 +50,45 @@ _AXIS_DEFAULTS = {"component": "core", "phase": "context", "kv_dtype": "bfloat16
 
 # Height of a hatched blank marker as a fraction of the panel's tallest bar.
 _BLANK_FRACTION = 0.04
+_BLANK_LABEL = "skipped / failed"
+
+# Extended-figure variant encoding, stable across panels and configs and never
+# cycled: colour = KV dtype (a second tone for a config's second model), lighter
+# tint = paged, dotted hatch = hierarchical indexer, dashed edge = deterministic
+# bwd. The "///" blanks are the skipped or failed cells.
+_DTYPE_COLORS = (
+    {"bfloat16": "#76B900", "float16": "#76B900", "mxfp8": "#5B8DEF", "nvfp4": "#B8860B"},
+    {"bfloat16": "#2E8B57", "float16": "#2E8B57", "mxfp8": "#1F3F8F", "nvfp4": "#8B0000"},
+)
+_FALLBACK_COLOR = "#777777"
+_PAGED_TINT = 0.45
+_HIERARCHICAL_HATCH = "..."
+
+
+def _tint(hex_color: str, fraction: float) -> str:
+    """Mix `fraction` of white into a #RRGGBB colour."""
+    channels = (int(hex_color[i : i + 2], 16) for i in (1, 3, 5))
+    return "#" + "".join(f"{int(round(c + (255 - c) * fraction)):02X}" for c in channels)
+
+
+def _variant_style(row, model_index: int = 0) -> dict:
+    """Bar style of one variant row; a third model would share the second tone (no config has one)."""
+    palette = _DTYPE_COLORS[min(model_index, len(_DTYPE_COLORS) - 1)]
+    color = palette.get(row["kv_dtype"], _FALLBACK_COLOR)
+    if bool(row["paged"]):
+        color = _tint(color, _PAGED_TINT)
+    mode = row["indexer_mode"]
+    hierarchical = isinstance(mode, str) and mode not in ("", "dense")
+    deterministic = str(row["deterministic_bwd"]).lower() == "true"
+    return {"color": color, "hatch": _HIERARCHICAL_HATCH if hierarchical else None, "linestyle": "--" if deterministic else "-"}
+
+
+def _legend_labels(hues, served, any_blank: bool) -> list:
+    """Legend entries: the variants with at least one served bar, then one hatched entry for the blanks."""
+    labels = [hue for hue in hues if hue in served]
+    if any_blank:
+        labels.append(_BLANK_LABEL)
+    return labels
 
 
 def _fmt_len(s: int) -> str:
@@ -229,9 +268,11 @@ def _extended_figure(df: "pd.DataFrame", beyond: "pd.DataFrame", config: "DsaBen
     """One panel per (component, phase) with any case beyond the legacy set; skipped cells hatched."""
     import matplotlib.pyplot as plt
     import numpy as np
+    from matplotlib.patches import Patch
 
     if beyond.empty:
         return None
+    model_order = {model.name: i for i, model in enumerate(config.models)}
     panel_keys = sorted(
         {(c, p) for c, p in zip(beyond["component"], beyond["phase"])}, key=lambda k: (_COMPONENT_ORDER.get(k[0], 9), _PHASE_ORDER.get(k[1], 9))
     )
@@ -260,18 +301,25 @@ def _extended_figure(df: "pd.DataFrame", beyond: "pd.DataFrame", config: "DsaBen
 
         xs = np.arange(len(shapes), dtype=float)
         width = 0.8 / max(1, len(hues))
+        containers, served, any_blank = {}, set(), False
         for j, hue in enumerate(hues):
-            color = SERIES_COLORS[j % len(SERIES_COLORS)]
+            representative = pdf[pdf["hue"] == hue].iloc[0]
+            style = _variant_style(representative, model_order.get(str(representative["model_name"]), 0))
             vals, blanks = [], []
             for shape in shapes:
                 cell_ok = ok[(ok["hue"] == hue) & (ok["shape"] == shape)]
                 cell_any = pdf[(pdf["hue"] == hue) & (pdf["shape"] == shape)]
                 vals.append(float(cell_ok[metric].median()) if len(cell_ok) else np.nan)
                 blanks.append(_BLANK_FRACTION * ymax if (len(cell_any) and not len(cell_ok)) else np.nan)
-            bars = ax.bar(xs + j * width, vals, width, label=hue, color=color, edgecolor="black", linewidth=0.5)
+            if not all(np.isnan(v) for v in vals):
+                served.add(hue)
+            any_blank = any_blank or not all(np.isnan(b) for b in blanks)
+            containers[hue] = ax.bar(
+                xs + j * width, vals, width, color=style["color"], hatch=style["hatch"], edgecolor="black", linestyle=style["linestyle"], linewidth=0.5
+            )
             ax.bar(xs + j * width, blanks, width, fill=False, hatch="///", edgecolor="#888888", linewidth=0.5)
             fmt = "%.0f" if metric == "tflops" else "%.2f"
-            ax.bar_label(bars, labels=["" if np.isnan(v) else fmt % v for v in vals], fontsize=BAR_LABEL_FONT_SIZE, rotation=90, padding=1)
+            ax.bar_label(containers[hue], labels=["" if np.isnan(v) else fmt % v for v in vals], fontsize=BAR_LABEL_FONT_SIZE, rotation=90, padding=1)
 
         ax.set_xticks(xs + width * (len(hues) - 1) / 2)
         ax.set_xticklabels(shapes, fontsize=7)
@@ -281,7 +329,11 @@ def _extended_figure(df: "pd.DataFrame", beyond: "pd.DataFrame", config: "DsaBen
         ax.set_title(f"{component} / {phase}", fontsize=TITLE_FONT_SIZE)
         # Headroom above the tallest bar for the legend and the rotated bar labels.
         ax.set_ylim(0, ymax * 1.6 if ymax > 0 else 1.0)
-        ax.legend(title="Variant", fontsize=LEGEND_FONT_SIZE, loc="upper left", ncol=2 if len(hues) > 6 else 1)  # kv_dtype [paged] [mode] [det]
+        # Only variants with a served bar are listed (kv_dtype [paged] [mode] [det]); the blanks share one entry.
+        labels = _legend_labels(hues, served, any_blank)
+        handles = [containers[label] if label in containers else Patch(facecolor="none", edgecolor="#888888", hatch="///") for label in labels]
+        if labels:
+            ax.legend(handles, labels, title="Variant", fontsize=LEGEND_FONT_SIZE, loc="upper left", ncol=2 if len(labels) > 6 else 1)
         ax.grid(axis="y", alpha=0.3)
         ax.set_axisbelow(True)
 

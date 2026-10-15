@@ -1063,6 +1063,50 @@ class ChartTest(unittest.TestCase):
             rows.append(asdict(row))
         return rows
 
+    def test_variant_styles_are_stable_and_never_cycled(self):
+        # The extended figure encodes a variant structurally (colour = KV dtype per model, tint = paged,
+        # hatch = hierarchical, edge = deterministic) so two variants never share a style and a variant
+        # keeps its style across panels and configs — a cycled palette wrapped at 6 and drew
+        # "MXFP8 paged" in the BF16 green.
+        import pandas as pd
+
+        from benchmark.dsa import charts
+
+        for name in ("deepseek_v41", "glm53"):
+            config = load_config(name)
+            model_order = {m.name: i for i, m in enumerate(config.models)}
+            df = charts._with_axis_defaults(pd.DataFrame(self.rows(_cases(name), lambda c: True)))
+            with_model = df["model_name"].nunique() > 1
+            styles = {}
+            for _, row in df.iterrows():
+                style = charts._variant_style(row, model_order[str(row["model_name"])])
+                key = (style["color"], style["hatch"], style["linestyle"])
+                hue = charts._hue_label(row, with_model)
+                self.assertEqual(styles.setdefault(hue, key), key, f"{name}: variant {hue!r} changed style between rows")
+                if row["paged"]:
+                    self.assertNotEqual(style["color"], charts._variant_style({**row, "paged": False}, model_order[str(row["model_name"])])["color"])
+                self.assertEqual(style["hatch"] is not None, isinstance(row["indexer_mode"], str) and row["indexer_mode"] not in ("", "dense"), hue)
+            by_style = {}
+            for hue, key in styles.items():
+                self.assertNotIn(key, by_style, f"{name}: {hue!r} and {by_style.get(key)!r} share a style")
+                by_style[key] = hue
+            first_model = config.models[0].name
+            not_det = df["deterministic_bwd"].astype(str).str.lower() == "false"
+            base = df[(df["model_name"] == first_model) & (df["kv_dtype"] == "bfloat16") & ~df["paged"].astype(bool) & not_det].iloc[0]
+            self.assertEqual(charts._variant_style(base, 0)["color"], "#76B900", f"{name}: the base BF16 colour must not depend on the config")
+
+        self.assertEqual(charts._tint("#000000", 1.0), "#FFFFFF")
+        self.assertEqual(charts._tint("#76B900", 0.0), "#76B900")
+
+    def test_legend_lists_served_variants_and_one_blank_entry(self):
+        from benchmark.dsa import charts
+
+        hues = ["BF16", "BF16 paged", "BF16 hierarchical", "MXFP8", "MXFP8 paged", "NVFP4"]
+        served = {"BF16", "BF16 paged", "MXFP8", "BF16 hierarchical"}
+        self.assertEqual(charts._legend_labels(hues, served, True), ["BF16", "BF16 paged", "BF16 hierarchical", "MXFP8", charts._BLANK_LABEL])
+        self.assertEqual(charts._legend_labels(hues, served, False), ["BF16", "BF16 paged", "BF16 hierarchical", "MXFP8"])
+        self.assertEqual(charts._legend_labels(hues, set(), True), [charts._BLANK_LABEL])
+
     def test_legacy_and_extended_figures(self):
         import pandas as pd
 
