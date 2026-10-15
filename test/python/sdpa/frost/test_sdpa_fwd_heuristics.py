@@ -1621,12 +1621,13 @@ def test_rubin_decode_tile_packs_the_whole_group_and_takes_the_decode_split_mode
     assert rubin_q_tile(4, 12, paged=True, masked=False) == 32 and decode_d256_q_units(4, 12, 32) == 2  # mask-free over pages: two 32-column units
     assert engines._facts_decode_form(mtp4) == (True, True)
     assert _pack_gqa_eligible(row, mtp4, 128) and _pack_gqa_group(row, mtp4, 128, True) == 12
-    want = choose_decode_tile_split_kv(units=32 * 2 * 1, kv_tiles=4096 // 128, sm_count=204, q_tile=64)
+    # the model's inputs as _split_points passes them: the arch line and the combine grid (B 32 x 24 heads x S_q 4 = 768 lean blocks)
+    want = choose_decode_tile_split_kv(units=32 * 2 * 1, kv_tiles=4096 // 128, sm_count=204, q_tile=64, device_cc=(10, 7), combine_grid=(32, 24, 4))
     assert _split_points(row, mtp4, 128, 128, 2, pack_g=12)[0] == want, (_split_points(row, mtp4, 128, 128, 2, pack_g=12), want)
     assert sets(h_q=24, s_q=4, causal=True, bottom_right=True)[0].pack_gqa is True
     mtp8 = facts(h_q=24, s_q=8, causal=True, bottom_right=True)  # 96 rows: two units of the 64-column tile, the model's streams
     assert rubin_q_tile(8, 12, paged=True, masked=True) == 64 and decode_d256_q_units(8, 12, 64) == 2 and _pack_gqa_eligible(row, mtp8, 128)
-    want8 = choose_decode_tile_split_kv(units=32 * 2 * 2, kv_tiles=4096 // 128, sm_count=204, q_tile=64)
+    want8 = choose_decode_tile_split_kv(units=32 * 2 * 2, kv_tiles=4096 // 128, sm_count=204, q_tile=64, device_cc=(10, 7), combine_grid=(32, 24, 8))
     assert _split_points(row, mtp8, 128, 128, 2, pack_g=12)[0] == want8, (_split_points(row, mtp8, 128, 128, 2, pack_g=12), want8)
     # Past the route (a third token unit of the 64-column tile): no packed set, the packed request a typed decline.
     mtp11 = facts(h_q=24, s_q=11, causal=True, bottom_right=True)

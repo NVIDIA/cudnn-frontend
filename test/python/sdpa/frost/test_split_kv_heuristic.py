@@ -634,8 +634,9 @@ def test_decode_tile_longer_kv_never_splits_less(units, q_tile):
 
 
 def test_decode_tile_batch_one_prices_every_partial_of_the_combine(monkeypatch):
-    """Batch 1 x 2 KV heads (2 units) on a 212-SM part: the combine is one wave of
-    warps walking the split axis serially, so every partial costs it a step
+    """Batch 1 x 2 KV heads (2 units) on a 212-SM part under the LEAN combine kernel
+    (no combine grid given, or a grid the lean kernel serves): the combine is one wave
+    of warps walking the split axis serially, so every partial costs it a step
     (COMBINE_PER_PARTIAL). Measured optima of kernel + combine (grouped-load
     combine, 2376 MHz lock): kv 4K 16 (14.6 us), kv 32K 32 (24.1), kv 128K 64
     (41.6); 8 units (batch 4) x 128K 16 (96.8). Without the term the model took
@@ -645,6 +646,8 @@ def test_decode_tile_batch_one_prices_every_partial_of_the_combine(monkeypatch):
     assert _decode_tile(2, 32768, sm_count=212) == 32
     assert _decode_tile(2, 131072, sm_count=212) == 64
     assert _decode_tile(8, 131072, sm_count=212) == 16
+    # a grid the lean kernel serves (a large-batch decode: B 32 x 24 heads = 768 lean blocks) prices the same way
+    assert _decode_tile(2, 32768, sm_count=212, combine_grid=(32, 24, 1)) == 32
     # the captured caller (no launch term) keeps the same splits at these shapes
     assert _decode_tile(2, 32768, sm_count=212, launch_cost=0.0) == 32
     assert _decode_tile(2, 131072, sm_count=212, launch_cost=0.0) == 64
@@ -655,6 +658,66 @@ def test_decode_tile_batch_one_prices_every_partial_of_the_combine(monkeypatch):
     monkeypatch.setattr(heur, "_DECODE_TILE_COMBINE_PER_PARTIAL", 0.0)
     assert _decode_tile(2, 32768, sm_count=212) == 64
     assert _decode_tile(2, 131072, sm_count=212) == 64
+
+
+def test_decode_tile_prices_the_combine_by_the_form_its_grid_takes():
+    """The combine's per-partial price depends on which kernel the launch takes, and that is
+    decided by the combine GRID (``combine_grid`` = the graph's (B, H_q, S_q): the lean kernel's
+    ceil(S_q / 4) x H_q x B blocks, :func:`decode_combine_lean_blocks`, bound which launches
+    change at all; the rows S_q x H_q x B, :func:`decode_combine_rows`, are what the decode-grid
+    kernel's own time grows with): the DECODE-GRID kernel spreads the
+    split axis over eight lane chains, so its time is FLAT in the split count -- measured on
+    the Rubin performance class at B 1 x 24 heads: 2.0-2.1 us (S_q 1) / 2.4-2.7 (S_q 4)
+    standalone from 4 to 128 splits, 3.1-3.7 us in the step, a slope of 0.0004-0.009 us per
+    partial against the lean kernel's 0.127-0.177 -- so a batch-1 launch on it splits as deep
+    as the stream saturation allows.  Measured step optima with the decode-grid combine at
+    B 1 x 24 heads: kv 32K 64 (14.4 us against 23.4 at the lean split 32), kv 128K 64 (30.6),
+    B 4 x kv 128K 16 (94.1); the lean form's picks (the test above) are unchanged.  The
+    decode-grid intercept grows with the ROWS (standalone 2.08 / 2.4 / 4.93 us at 24 / 96 / 384
+    rows: B 1 x S_q 1, B 1 x S_q 4 = B 4 x S_q 1, B 4 x S_q 4 at 24 heads), which keeps a
+    mid-sized grid from splitting past what its combine saves."""
+    import cudnn.sdpa.fwd.heuristics as heur
+
+    assert (
+        heur.decode_combine_lean_blocks(1, 24, 1) == 24  # one row per block at S_q 1: the lean grid is per (head, batch)
+        and heur.decode_combine_lean_blocks(4, 24, 4) == 96
+        and heur.decode_combine_lean_blocks(2, 4, 1024) == 2048
+        and heur.decode_combine_rows(1, 24, 1) == 24
+        and heur.decode_combine_rows(1, 24, 4) == heur.decode_combine_rows(4, 24, 1) == 96
+        and heur.decode_combine_rows(4, 24, 4) == 384
+    )
+    assert heur._DECODE_TILE_COMBINE_PER_PARTIAL_DECODE_GRID < heur._DECODE_TILE_COMBINE_PER_PARTIAL
+    six = dict(sm_count=212, combine_grid=(1, 24, 1))
+    assert _decode_tile(2, 32768, **six) == 64 and _decode_tile(2, 32768, launch_cost=0.0, **six) == 64
+    assert _decode_tile(2, 131072, **six) == 64 and _decode_tile(2, 131072, launch_cost=0.0, **six) == 64
+    assert _decode_tile(8, 131072, sm_count=212, combine_grid=(4, 24, 1)) == 16
+    # the price is the form's, not the batch's: the lean form at the same shapes keeps the lean picks
+    assert _decode_tile(2, 32768, sm_count=212, combine_grid=(128, 32, 1)) == 32
+    # the combine price per partial is what the form changes: the decode-grid intercept at a small grid is the lean one
+    assert heur._decode_tile_combine_cost(64, grid=(1, 24, 1)) < heur._decode_tile_combine_cost(64, grid=None)
+    assert heur._decode_tile_combine_cost(64, grid=(1, 24, 1)) == pytest.approx(
+        heur._DECODE_TILE_COMBINE_COST + 64 * heur._DECODE_TILE_COMBINE_PER_PARTIAL_DECODE_GRID
+    )
+    assert heur._decode_tile_combine_cost(64, grid=None) == pytest.approx(heur._DECODE_TILE_COMBINE_COST + 64 * heur._DECODE_TILE_COMBINE_PER_PARTIAL)
+    # the row-count term of the decode-grid intercept: flat up to the small-grid bound (96 rows either way), growing past it
+    assert heur._decode_tile_combine_cost(64, grid=(4, 24, 1)) == pytest.approx(heur._decode_tile_combine_cost(64, grid=(1, 24, 4)))
+    assert heur._decode_tile_combine_cost(64, grid=(1, 24, 4)) == pytest.approx(heur._decode_tile_combine_cost(64, grid=(1, 24, 1)))
+    assert heur._decode_tile_combine_cost(64, grid=(4, 24, 4)) > heur._decode_tile_combine_cost(64, grid=(4, 24, 1))
+
+
+@requires_dsl
+def test_decode_combine_lean_blocks_is_the_combine_modules_own_grid():
+    """The heuristics' reading of the lean combine grid (``decode_combine_lean_blocks``) is the kernel module's
+    ``lean_grid_blocks`` -- the host twin of what ``_launch_combine`` computes -- over a grid of shapes, so the split
+    model and the launch agree on which form a launch takes."""
+    from cudnn.sdpa.fwd.heuristics import DECODE_COMBINE_LEAN_ROWS_PER_BLOCK, decode_combine_lean_blocks
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
+
+    assert DECODE_COMBINE_LEAN_ROWS_PER_BLOCK == comb.ROWS_PER_BLOCK
+    for b in (1, 2, 3, 4, 32, 128):
+        for h in (1, 4, 24, 32, 34):
+            for s_q in (1, 2, 3, 4, 5, 8, 17, 1024):
+                assert decode_combine_lean_blocks(b, h, s_q) == comb.lean_grid_blocks(b, h, s_q), (b, h, s_q)
 
 
 def test_decode_tile_degenerate_inputs_do_not_split():

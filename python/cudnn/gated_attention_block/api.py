@@ -769,7 +769,19 @@ def decode_split_choice(route: DecodeRoute, *, batch: int, h_kv: int, max_kv_len
     heads = int(h_kv) if (route.pack_gqa or h_q is None) else int(h_q)
     units = int(batch) * heads * int(route.token_units)
     kv_tiles = -(-int(max_kv_len) // 128)
-    split = int(choose_decode_tile_split_kv(units=units, kv_tiles=kv_tiles, sm_count=int(sm_count), q_tile=route.n_q))
+    # The combine's grid (B, H_q, S_q) over the REAL Q heads (the group x h_kv when the caller passes no h_q): it decides which
+    # combine kernel the split launch takes (the decode-grid form on a small grid, flat in the split count) and so the model's
+    # price for the combine -- the same input the SDPA heuristics hand the model for the standalone graph.
+    real_heads = int(h_q) if h_q is not None else int(route.group) * int(h_kv)
+    split = int(
+        choose_decode_tile_split_kv(
+            units=units,
+            kv_tiles=kv_tiles,
+            sm_count=int(sm_count),
+            q_tile=route.n_q,
+            combine_grid=(int(batch), real_heads, int(route.s_q)),
+        )
+    )
     return max(split, 2) if gated else split
 
 

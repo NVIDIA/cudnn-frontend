@@ -452,7 +452,36 @@ _DECODE_TILE_COMBINE_COST = 3.5
 # 40 us combine for a 12 us kernel; with it the batch-1 optima measured at
 # kv 4K / 32K / 128K (16 / 32 / 64) and the batch-4 x 128K one (16) all fall
 # out, and every B200 pin below holds (the term is 0.3-2.7 tiles there).
+# This is the LEAN kernel's price; the decode-grid kernel's is below.
 _DECODE_TILE_COMBINE_PER_PARTIAL = 0.17
+# What every partial adds to the DECODE-GRID form of the combine, in KV-tile
+# units: that kernel spreads the split axis over a block's eight lane chains and
+# merges them once, so its time is flat in the split count -- measured on the
+# Rubin performance class (212 SMs) at B 1 x 24 heads: 2.0-2.1 us (S_q 1) and
+# 2.4-2.7 us (S_q 4) standalone from 4 to 128 splits, 3.1-3.7 us inside the step,
+# a slope of 0.0004-0.0026 us per partial at B 1 and 0.009 at B 4 (the lean
+# kernel re-measured at 0.127-0.177 us per partial there, today's constant
+# above); 0.01 tiles is the conservative end of the in-step slopes.  With it a
+# batch-1 launch splits as deep as its stream saturation allows: the measured
+# step optima move to 64 at kv 32K (14.4 us against 23.4 at the lean split 32)
+# and stay at 64 / 16 at kv 128K / B 4 x 128K.
+_DECODE_TILE_COMBINE_PER_PARTIAL_DECODE_GRID = 0.01
+# The decode-grid combine's intercept grows with the combine's ROWS (S_q x H_q
+# x B: one block per (row, 64-column chunk), four blocks per row at d 256), not
+# with the lean kernel's block count -- B 4 x S_q 1 and B 1 x S_q 4 are the same
+# 96 rows and measured alike; measured standalone 2.08 / 2.41-2.45 / 4.93 us at
+# 24 / 96 / 384 rows (B 1 x 24 heads x S_q 1; B 1 x S_q 4 and B 4 x S_q 1;
+# B 4 x S_q 4).  Flat at the in-step intercept (_DECODE_TILE_COMBINE_COST) up to
+# DECODE_COMBINE_SMALL_GRID_ROWS, then this many tiles more per row (0.0085 x 256
+# = 2.2 tiles at 384 rows: the measured 2.5-us standalone rise).  It keeps a
+# mid-sized grid from splitting past what its combine actually saves.
+_DECODE_TILE_COMBINE_COST_PER_ROW = 0.0085
+# The lean combine kernel's grid: one warp per (q_row, head, batch) and this
+# many rows per block (sm100/split_combine.ROWS_PER_BLOCK = THREADS // 32; the
+# kernel module cannot be imported here -- it imports this one -- so the test
+# suite pins the two equal), read by the form rule below and by the split model
+# through :func:`decode_combine_lean_blocks`.
+DECODE_COMBINE_LEAN_ROWS_PER_BLOCK = 4
 # Which FORM of the shared sm100/split_combine serves a launch (the selection
 # constant; the kernel module reads it).  The lean fp32-partial path has two
 # kernels: the LEAN one (one warp per output row, four rows per block, the split
@@ -469,9 +498,49 @@ _DECODE_TILE_COMBINE_PER_PARTIAL = 0.17
 # large-batch decode keep the lean kernel by construction.  The constant is
 # GEOMETRY, not a fit: both kernels move the same bytes and the decode-grid
 # kernel is never the longer chain, so the threshold only bounds which launches
-# change at all.  The per-partial price above was fitted on the lean kernel's
-# grouped walk and is REFIT after the decode-grid kernel is measured (owed).
+# change at all.  :func:`decode_combine_grid_selected` is the rule's host
+# reading, the one the split model prices a launch's combine by.
 DECODE_COMBINE_MAX_LEAN_BLOCKS = 128
+# The small-grid bound of the decode-grid combine's price, in the combine's ROWS
+# (S_q x H_q x B): up to this many rows its intercept is the measured in-step
+# 3.1-3.7 us (_DECODE_TILE_COMBINE_COST); the serving decode cells (B 1 and B 4
+# at 24 heads, S_q 1 and 4, up to 96 rows) sit inside it.
+DECODE_COMBINE_SMALL_GRID_ROWS = 128
+
+
+def decode_combine_lean_blocks(b: int, h_q: int, s_q: int) -> int:
+    """The lean combine kernel's grid in blocks, ``ceil(S_q / 4) x H_q x B`` -- the quantity the
+    form rule reads (the REAL head count: the combine reduces one row per (q_row, head, batch) of
+    the graph's own output, packing or not).  The kernel module's ``lean_grid_blocks`` is the same
+    arithmetic; the test suite pins them equal."""
+    return _ceil_div(int(s_q), DECODE_COMBINE_LEAN_ROWS_PER_BLOCK) * int(h_q) * int(b)
+
+
+def decode_combine_rows(b: int, h_q: int, s_q: int) -> int:
+    """The combine's output rows, ``S_q x H_q x B`` -- the decode-grid kernel's blocks per 64-column chunk
+    (four per row at d 256), the quantity its time grows with."""
+    return int(s_q) * int(h_q) * int(b)
+
+
+def decode_combine_grid_selected(b: int, h_q: int, s_q: int, split: int) -> bool:
+    """Whether a split launch of a ``(B, H_q, S_q)`` graph takes the DECODE-GRID combine kernel at
+    ``split`` partials (else the lean kernel): the launch rule's host reading, which the split
+    model prices a candidate split's combine by.  Today the kernel module's own bound,
+    ``lean blocks <= DECODE_COMBINE_MAX_LEAN_BLOCKS``, at every split."""
+    return decode_combine_lean_blocks(b, h_q, s_q) <= DECODE_COMBINE_MAX_LEAN_BLOCKS
+
+
+def _decode_tile_combine_cost(split: int, *, grid: Optional[Tuple[int, int, int]]) -> float:
+    """The combine's cost at ``split`` partials, in KV-tile units, for the form the launch takes:
+    ``grid`` = the graph's ``(B, H_q, S_q)``, None = the lean kernel (a caller that cannot name the
+    grid prices the conservative form); the decode-grid kernel's price carries its row-count
+    intercept term."""
+    if grid is not None and decode_combine_grid_selected(*grid, split):
+        over = max(0, decode_combine_rows(*grid) - DECODE_COMBINE_SMALL_GRID_ROWS)
+        return _DECODE_TILE_COMBINE_COST + over * _DECODE_TILE_COMBINE_COST_PER_ROW + split * _DECODE_TILE_COMBINE_PER_PARTIAL_DECODE_GRID
+    return _DECODE_TILE_COMBINE_COST + split * _DECODE_TILE_COMBINE_PER_PARTIAL
+
+
 # What the two-launch split path costs an EAGER caller on the host per
 # graph.execute beyond the one-launch path: a second CuTe-DSL launch plus the
 # partial-slab carving. Measured 62 -> 92 us on the b=32 x 2 KV heads x 4096
@@ -486,12 +555,14 @@ DECODE_COMBINE_MAX_LEAN_BLOCKS = 128
 _DECODE_TILE_SPLIT_LAUNCH_COST = 17.0
 
 
-def _decode_tile_cost(split: int, *, units: int, kv_tiles: int, sm_count: int, tile_cost: float, launch_cost: float) -> float:
+def _decode_tile_cost(
+    split: int, *, units: int, kv_tiles: int, sm_count: int, tile_cost: float, launch_cost: float, grid: Optional[Tuple[int, int, int]] = None
+) -> float:
     streams = units * split
     per_tile = max(tile_cost, streams / (_DECODE_TILE_SATURATION_FRACTION * sm_count))
     cost = (_ceil_div(kv_tiles, split) + _DECODE_TILE_CTA_COST) * per_tile
     if split > 1:
-        cost += _DECODE_TILE_COMBINE_COST + split * _DECODE_TILE_COMBINE_PER_PARTIAL + launch_cost
+        cost += _decode_tile_combine_cost(split, grid=grid) + launch_cost
     return cost
 
 
@@ -503,6 +574,7 @@ def choose_decode_tile_split_kv(
     q_tile: int = 16,
     launch_cost: float = _DECODE_TILE_SPLIT_LAUNCH_COST,
     device_cc: Optional[Tuple[int, int]] = None,
+    combine_grid: Optional[Tuple[int, int, int]] = None,
 ) -> int:
     """How many KV chunks the d256 decode tile cuts each unit into; 1 = do not split.
 
@@ -513,12 +585,18 @@ def choose_decode_tile_split_kv(
     declared S_kv; ``q_tile`` the tile's N extent (16, 32 or 64 packed Q rows,
     :func:`config_sm107.decode_d256_q_tile`); ``device_cc`` (appended) the
     arch line whose per-width tile costs apply (``None`` = the Rubin table,
-    see :func:`_decode_tile_cost_for`).
+    see :func:`_decode_tile_cost_for`); ``combine_grid`` (appended) the graph's
+    ``(B, H_q, S_q)`` over its REAL heads -- the combine's grid, from which the
+    lean kernel's blocks (:func:`decode_combine_lean_blocks`) and the rows
+    (:func:`decode_combine_rows`) follow -- which decides the combine kernel the
+    launch takes and so the combine's price
+    (:func:`decode_combine_grid_selected`, :func:`_decode_tile_combine_cost`);
+    ``None`` prices the lean kernel, the conservative form.
 
         streams(s)  = units * s                                   # concurrent K/V streams
         per_tile(s) = max(TILE_COST(q_tile, line), streams(s) / (SATURATION * sm_count))
         cost(s)     = (ceil(kv_tiles / s) + CTA_COST) * per_tile(s)
-                    + [s > 1] * (COMBINE_COST + s * COMBINE_PER_PARTIAL + launch_cost)
+                    + [s > 1] * (COMBINE_COST(form, grid) + s * COMBINE_PER_PARTIAL(form) + launch_cost)
 
     A lone CTA streams a KV tile at TILE_COST (1 on the 16-column tile; on the
     Rubin line 1.1 on the 32-column and 1.65 on the 64-column tile, measured on
@@ -549,7 +627,7 @@ def choose_decode_tile_split_kv(
     if min(units, kv_tiles, sm_count) <= 0:
         return 1
     tile_cost = _decode_tile_cost_for(q_tile, device_cc)
-    kw = dict(units=units, kv_tiles=kv_tiles, sm_count=sm_count, tile_cost=tile_cost, launch_cost=launch_cost)
+    kw = dict(units=units, kv_tiles=kv_tiles, sm_count=sm_count, tile_cost=tile_cost, launch_cost=launch_cost, grid=combine_grid)
     best, best_cost = 1, _decode_tile_cost(1, **kw)
     for split in split_kv_candidates(sm_count=sm_count, kv_tiles=kv_tiles):
         if split <= 1:
@@ -1740,6 +1818,9 @@ def _split_points(
             q_tile=decode_q_tile,
             # the arch line's per-width tile costs (the Rubin and Blackwell decode tiles are sibling kernels with their own fits)
             device_cc=tuple(facts.device_cc) if facts.device_cc else None,
+            # the combine's grid over the graph's REAL heads (the combine reduces one row per (q_row, head, batch)
+            # whatever the packing): it decides the combine kernel the launch takes and so the combine's price
+            combine_grid=(int(facts.b), int(facts.h_q), int(facts.s_q)),
         )
         eager = choose_decode_tile_split_kv(**geometry)
         captured = choose_decode_tile_split_kv(**geometry, launch_cost=0.0)
