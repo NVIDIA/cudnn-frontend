@@ -429,6 +429,12 @@ def test_the_envelope_on_a_rubin_reading_serves_the_decode_form_and_names_every_
     capped = GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, _DEV, device_cc=_SM107, decode_q_tile_max=32).decode
     assert capped.q_tile_max == 32 and [r.pack_gqa for r in capped.routes] == [True] * 4 + [False] * 29 and capped.route(3).token_units == 2
     assert all(r.served for r in capped.routes[:-1]) and not capped.routes[-1].served
+    # the programmatic-dependent-launch readbacks: the switched stage kinds per form, stage (4) on a decode-tile route only
+    assert d.pdl_stages == ("qk_norm_rope", "cache_write", "sigmoid_gate", "sdpa") and env.extend.pdl_stages == ("qk_norm_rope", "cache_write", "sigmoid_gate")
+    assert all(r.pdl_capable is r.decode_tile for r in d.routes) and d.route(1).pdl_capable and not d.route(33).pdl_capable
+    g16, _ = _geom(16)
+    e16 = GatedAttentionBlockFwd.serving_envelope(g16, torch.bfloat16, _DEV, device_cc=_SM107).decode
+    assert e16.route(4).pdl_capable and not e16.route(5).pdl_capable and e16.route(5).prefill_tile and e16.route(9).pdl_capable
     # (the table's `sparse` row is the PACKED form's since 2026-10-14: a dense QsaSpec declaration over the pools is the block-sparse decode mode)
     assert set(d.declines) == {"write_through", "decode_rows", "diagonal", "window", "head_dim", "return_lse", "token_capacity_dense"}
     f16 = GatedAttentionBlockFwd.serving_envelope(geom, torch.float16, _DEV, device_cc=_SM107)

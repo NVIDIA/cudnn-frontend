@@ -599,6 +599,18 @@ packed group past the 16-column tile (each unit one more KV stream), then the un
 DECODE_ROUTE_POLICIES = (DECODE_ROUTE_SINGLE_UNIT, DECODE_ROUTE_TOKEN_UNITS)
 DEFAULT_DECODE_ROUTE_POLICY = DECODE_ROUTE_SINGLE_UNIT
 
+DECODE_PDL_STAGES = ("qk_norm_rope", "cache_write", "sigmoid_gate", "sdpa")
+"""The DECODE form's stages that take the ``use_pdl`` switch (by stage name): the norm + RoPE pass (the unfused chain), the separate
+cache write, the sigmoid gate when it is its own launch, and stage (4) on a DECODE-TILE route only (``DecodeRoute.pdl_capable``: the
+tile and its split combine carry the griddepcontrol pair; the prefill route's paged d256 prefill tile does not and launches plain --
+the link serializes, which PDL's semantics keep correct).  The FROST GEMM stages launch with the attribute by their own constant and
+are not switched.  Per declaration ``GatedAttentionBlockFwd.pdl_stages`` names the ones the chain holds and ``use_pdl_effective``
+whether every switched stage took it; ``DecodeEnvelope.pdl_stages`` carries this tuple."""
+
+EXTEND_PDL_STAGES = ("qk_norm_rope", "cache_write", "sigmoid_gate")
+"""The EXTEND form's stages that take the switch: stage (4), the paged d256 prefill tile, carries no sites and launches plain (the
+link serializes; the chain stays correct); ``ExtendEnvelope.pdl_stages`` carries this tuple."""
+
 
 def _resolve_decode_route_policy(policy: Optional[str]) -> str:
     """``None`` = the default policy; a known policy name as is; anything else a typed ``ValueError`` naming the vocabulary."""
@@ -635,6 +647,10 @@ class DecodeRoute:
     # None = the whole single-unit table (16, 32, 64); 32 = the route before the 64-column width landed.  ``_Sdpa`` hands it to the adapter
     # (``SdpaFwdDslSm100(decode_q_tile_max=)``) so the compiled width is the declared one.
     q_tile_max: Optional[int] = None
+    # APPENDED (2026-10-15): whether stage (4) takes the programmatic-dependent-launch switch (``GatedAttentionBlockFwd(use_pdl=True)``)
+    # on this route -- the decode tile and its split combine carry the griddepcontrol pair (True); the paged d256 prefill tile does not
+    # (False: the block launches it plain and the link serializes, correct by PDL's semantics).  ``_Sdpa.pdl_capable`` is the same rule.
+    pdl_capable: bool = False
 
     @property
     def decode_tile(self) -> bool:
@@ -715,6 +731,7 @@ def decode_route(geometry: "GatedAttentionBlockGeometry", s_q: int, policy: Opti
             kv_streams=int(streams),
             policy=policy,
             q_tile_max=cap,
+            pdl_capable=(tile == DECODE_TILE),
         )
 
     if int(geometry.d_head) != 256:
@@ -860,6 +877,9 @@ class DecodeEnvelope:
     claimed_max_s_q: int = 0
     # appended (2026-10-15): the width cap ``routes`` / ``route()`` were read under (``serving_envelope(decode_q_tile_max=)``; None = the whole table).
     q_tile_max: Optional[int] = None
+    # appended (2026-10-15): the stage kinds that take the ``use_pdl`` switch on this form (:data:`DECODE_PDL_STAGES`; stage (4) on a
+    # decode-tile route only -- ``DecodeRoute.pdl_capable`` per route); empty under ``sparse_core`` (the switch is a typed decline there).
+    pdl_stages: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -884,6 +904,9 @@ class ExtendEnvelope:
     declines: Dict[str, str]
     inference_only: bool = True
     writes_lse: bool = False
+    # appended (2026-10-15): the stage kinds that take the ``use_pdl`` switch on this form (:data:`EXTEND_PDL_STAGES`: never stage (4), the
+    # paged prefill tile launches plain and the link serializes).
+    pdl_stages: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -4171,7 +4194,9 @@ class _Sdpa(_Stage):
         # against it either way.
         route: Optional[DecodeRoute] = None,
         # APPENDED: the adapter's programmatic-dependent-launch form (SdpaFwdDslSm100(use_pdl=True): the decode tile and its split combine
-        # launch with the attribute and carry the griddepcontrol pair).  Performance-only; a kernel without the sites declines at compile.
+        # launch with the attribute and carry the griddepcontrol pair).  Performance-only.  The block hands it to a decode-tile route only
+        # (``pdl_capable``); a standalone stage that forces it onto a kernel without the sites (the prefill tiles) hears the adapter's
+        # typed decline at compile().
         use_pdl: bool = False,
     ) -> None:
         # token_stride != 0 => Q/K/V are column slices of the fused projection
@@ -4308,6 +4333,15 @@ class _Sdpa(_Stage):
             )
         self._impl = None
 
+    @staticmethod
+    def pdl_capable(route: Optional[DecodeRoute]) -> bool:
+        """Whether stage (4) takes the programmatic-dependent-launch switch on ``route``: the Rubin d256 decode tile and its split
+        combine carry the griddepcontrol pair (``DecodeRoute.decode_tile``); the paged d256 prefill tile (the DECODE form's prefill
+        route, the EXTEND form -- ``route`` None) and the dense prefill tiles (``kv_source="self"``: no route) do not, so the block
+        launches them plain and the link serializes -- correct by PDL's semantics (the successor's wait blocks on full completion).
+        ``DecodeRoute.pdl_capable`` is the same fact on the record."""
+        return route is not None and route.decode_tile
+
     def _build_impl(self):
 
         from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
@@ -4321,7 +4355,9 @@ class _Sdpa(_Stage):
         # (scalar descales), False -> prefill_d256_mxfp8.py (block scales).
         kw = dict(pertensor_fp8=self.pertensor, dtype_o=self.o_dtype, has_amax_o=False) if self.fp8 else {}
         if self.use_pdl:
-            kw["use_pdl"] = True  # the adapter declines at compile() when the routed kernel carries no griddepcontrol sites
+            # a decode-tile route (the block never hands the switch to a prefill tile: pdl_capable); the adapter declines at compile()
+            # when a standalone stage forces it onto a kernel without the griddepcontrol sites
+            kw["use_pdl"] = True
         if self.thd:
             # THD: the adapter takes the (B_env, H, S_max, D) ENVELOPE at the block's token strides -- the same `_bhsd_desc`
             # the dense arm declares, at (num_sequences, max_seq_len) instead of (1, T); its (d, h, s) stride order is what
@@ -6461,7 +6497,12 @@ class GatedAttentionBlockFwd(APIBase):
         # attribute and traces their griddepcontrol pair (a wait before the first global read of a predecessor's output, a release after the
         # prologue); the FROST GEMM templates already launch that way (their module constant USE_PDL).  The same kernels, the same math:
         # `out` is BITWISE the use_pdl=False block's, eagerly and under CUDA-graph capture.  Served for the bf16 / f16 block (no quant, no e4m3
-        # KV cache, no QsaSpec); a declaration whose chain routes to a kernel without the sites is a typed decline at compile.
+        # KV cache, no QsaSpec: a typed decline).  A PER-STAGE fact (2026-10-15): a stage whose kernel carries no sites -- the paged d256
+        # prefill tile of the DECODE form's prefill route and of the EXTEND form, the dense prefill tiles under kv_source="self" -- launches
+        # plain and the link serializes there (correct by PDL's semantics: its successor's wait blocks on full completion); the switch is
+        # never forwarded to such a kernel.  `pdl_stages` reads back the stages launching with the attribute, `use_pdl_effective` whether
+        # every switched stage of the chain does; `DecodeRoute.pdl_capable`, `DecodeEnvelope.pdl_stages` and `ExtendEnvelope.pdl_stages`
+        # say so before anything is declared.
         use_pdl: bool = False,
         # APPENDED (2026-10-15; the DECODE form only; performance-only): WHETHER the fused norm + RoPE projection runs at DECODE ROW COUNTS
         # (T = B x S_q <= kernels.proj_gemm.SMALL_M_MAX = 128 on the dense DECODE form, bf16 / f16, no indexer band, 16-bit pools) when
@@ -6482,9 +6523,10 @@ class GatedAttentionBlockFwd(APIBase):
         self.dtype = sample_h.dtype
         self.device = sample_h.device
         # Programmatic dependent launch over the chain (the constructor's note): the bf16 / f16 block only -- the quantized pipelines'
-        # quantize stages, the e4m3 write-through and the sparse core carry no griddepcontrol sites yet, and a chain with one
-        # attribute-less link in the middle would silently serialize there while the links after it believe they overlap.  The
-        # FIRST decline of such a declaration, so the message names the switch rather than a later check's vocabulary.
+        # quantize stages, the e4m3 write-through and the sparse core carry no griddepcontrol sites yet, so none of those chains overlaps
+        # at its attention link and the switch is a typed decline there (the per-stage form below is the bf16 / f16 chains', whose one
+        # site-less link is a prefill tile).  The FIRST decline of such a declaration, so the message names the switch rather than a
+        # later check's vocabulary.
         self.use_pdl = bool(use_pdl)
         if self.use_pdl and (quant is not None or kv_cache_dtype is not None or geometry.qsa is not None):
             raise NotImplementedError(
@@ -6992,7 +7034,9 @@ class GatedAttentionBlockFwd(APIBase):
                 max_kv_len=self.max_kv_len if self.decode_route is not None else 0,
                 decode_split_kv=self.decode_split_kv if self.decode_route is not None else 1,
                 route=self.decode_route,
-                use_pdl=self.use_pdl,
+                # the switch reaches stage (4) on a decode-tile route only (_Sdpa.pdl_capable): the prefill tiles carry no sites and
+                # launch plain -- the link serializes, the chain stays correct; `pdl_stages` reads it back
+                use_pdl=self.use_pdl and _Sdpa.pdl_capable(self.decode_route),
             )
         # Stage (5) lives in the SDPA kernel's gate epilogue under fuse_gate --
         # not built rather than built and skipped (it would still compile).
@@ -7094,6 +7138,13 @@ class GatedAttentionBlockFwd(APIBase):
             )
             if st is not None
         )
+        # The programmatic-dependent-launch readback (the switch is per stage): the stages that launch with the attribute, and whether
+        # every switched stage of the chain does (False with a plain link: the prefill tile of the DECODE form's prefill route or of the
+        # EXTEND form, or a stage the switch is not threaded to -- the V compaction of inplace_qkv=False, the training copies).  The
+        # FROST GEMM stages launch with the attribute by their own constant and are not switched: neither listed nor counted.
+        switched = tuple(st for st in self._stages if hasattr(st, "use_pdl"))
+        self.pdl_stages: Tuple[str, ...] = tuple(st.name for st in switched if st.use_pdl)
+        self.use_pdl_effective: bool = self.use_pdl and bool(switched) and all(st.use_pdl for st in switched)
         self._ws = None
 
     # -- block-sparse attention (QsaSpec) -----------------------------------
@@ -7844,6 +7895,7 @@ class GatedAttentionBlockFwd(APIBase):
             page_sizes=SERVING_PAGE_SIZES,
             pool_layouts=SERVING_POOL_LAYOUTS,
             declines={name: msg for name, _exc, _pred, msg in _EXTEND_DECLINES},  # the whole table: every row a declaration can hit
+            pdl_stages=EXTEND_PDL_STAGES,
         )
         decode_reason = probe(False, 1)
         has_group = int(geometry.h_kv) >= 1 and int(geometry.h_q) % int(geometry.h_kv) == 0
@@ -7871,6 +7923,7 @@ class GatedAttentionBlockFwd(APIBase):
             policy=policy,
             claimed_max_s_q=DECODE_CLAIMED_MAX_S_Q,
             q_tile_max=q_tile_max,
+            pdl_stages=() if sparse else DECODE_PDL_STAGES,
         )
         forms = tuple(nm for nm, env in (("extend", extend), ("decode", decode)) if env.served)
         return ServingEnvelope(
@@ -8905,9 +8958,10 @@ class GatedAttentionBlockFwd(APIBase):
         sparse_kw = dict(block_ids=block_ids, block_lens=block_lens) if self.qsa is not None else {}
         # The EXTEND form (kv_source="paged"): K / V are read from the POOLS the write-through just filled -- every sequence's
         # prefix and this step's tokens -- through the block table over [0, kv_lens[b]); the slab's K / V bands are unread by
-        # the SDPA.  Stream order is the ONLY ordering between the write and the read: the cache write launches without
-        # programmatic dependent launch (no PDL attribute on its launch; the SDPA bodies wait on no dependent grid), so a
-        # later kernel that adopts PDL after a pool write must wait on its dependent grid before its first K / V load.
+        # the SDPA.  On the plain chain stream order is the ONLY ordering between the write and the read (the cache write launches
+        # without the PDL attribute; the prefill bodies wait on no dependent grid); under use_pdl=True the cache write launches with
+        # the attribute and the decode tile waits on its dependent grid before its first K / V load, while a prefill tile -- which
+        # carries no sites -- launches plain, so the link serializes and the read still follows the write either way.
         paged = self.kv_source == KV_SOURCE_PAGED
         # The pools and the table reach the stage that reads them: the dense SDPA stage (the EXTEND / DECODE forms) or, on a QsaSpec
         # geometry, the sparse stage (the block-sparse DECODE / extend-with-prefix mode: the same paged read through the sparse core,

@@ -400,6 +400,7 @@ cudnn.gated_attention_block.DecodeEnvelope
 cudnn.gated_attention_block.DecodeEnvelope.claimed_max_s_q
 cudnn.gated_attention_block.DecodeEnvelope.inference_only
 cudnn.gated_attention_block.DecodeEnvelope.kv_cache_dtypes
+cudnn.gated_attention_block.DecodeEnvelope.pdl_stages
 cudnn.gated_attention_block.DecodeEnvelope.policy
 cudnn.gated_attention_block.DecodeEnvelope.q_tile_max
 cudnn.gated_attention_block.DecodeEnvelope.route
@@ -408,6 +409,7 @@ cudnn.gated_attention_block.DecodeEnvelope.writes_lse
 cudnn.gated_attention_block.DecodeRoute
 cudnn.gated_attention_block.DecodeRoute.decode_tile
 cudnn.gated_attention_block.DecodeRoute.kv_streams
+cudnn.gated_attention_block.DecodeRoute.pdl_capable
 cudnn.gated_attention_block.DecodeRoute.policy
 cudnn.gated_attention_block.DecodeRoute.prefill_tile
 cudnn.gated_attention_block.DecodeRoute.q_tile_max
@@ -415,6 +417,7 @@ cudnn.gated_attention_block.DecodeRoute.reason
 cudnn.gated_attention_block.DecodeRoute.served
 cudnn.gated_attention_block.ExtendEnvelope
 cudnn.gated_attention_block.ExtendEnvelope.inference_only
+cudnn.gated_attention_block.ExtendEnvelope.pdl_stages
 cudnn.gated_attention_block.ExtendEnvelope.writes_lse
 cudnn.gated_attention_block.Fp4Format
 cudnn.gated_attention_block.Fp4Format.MXFP4

@@ -802,9 +802,13 @@ over the `T_live` rows of `num_tokens_live` -- (or `(1)` then `(2+3)`), `(4w)` t
 `slot_mapping`, `(4)` the SDPA over the pools -- query row `i` of a sequence with `q_len` new tokens and logical length `kv_len`
 attends keys `k <= i + kv_len - q_len` of `block_table[b]`'s pages; under `fuse_gate=True` its epilogue applies `O *= sigmoid(GATE)`
 (the paged body carries the Rubin d256 gate seams, so stage `(5)` is not launched) -- then `(5)` the gate (unfused only) and `(6)`
-the out projection. The write is ordered before the read by STREAM order alone: no kernel on the chain
+the out projection. On the plain chain the write is ordered before the read by STREAM order alone: no kernel on the chain
 launches as a programmatic dependent launch (pinned by `test_block_serving_extend.py`), so a kernel that adopts PDL after a pool
-write must wait on its dependent grid before its first K / V load.
+write must wait on its dependent grid before its first K / V load. Under `use_pdl=True` the switch is PER STAGE: the write-through
+(and the norm + RoPE pass, the separate gate) launch with the programmatic-stream-serialization attribute and their `griddepcontrol`
+pair, while the paged prefill tile -- which carries no sites -- launches plain, so that link serializes and the read still follows the
+write; `blk.pdl_stages` names the stages that took the attribute (never `"sdpa"` on this form), `blk.use_pdl_effective` is False,
+and `serving_envelope().extend.pdl_stages` says so before anything is declared.
 
 | appended | contract |
 |---|---|
@@ -923,7 +927,8 @@ the EXTEND form (`gate_fused`, no separate launch).
 | `decode_split_kv` (declaration) | `None` or an int `>= 1` (`> 1` on the decode tile only; the prefill route runs unsplit) | the one performance knob of the form: the same function under every value |
 | `decode_route_policy` (declaration) | `None` (= `"single_unit"`) or `"token_units"` | the route policy (the table above / the adapter's token-unit route): a performance-only knob, the same function under either; `DecodeRoute.policy` reads it back |
 | `fuse_norm_rope_small_m` (declaration) | `None` (= the lowering at `B x S_q <= 128`), `True` (the fused fork as declared) or `False` (the lowering, explicit) | whether the fused norm + RoPE projection runs at decode row counts when `fuse_norm_rope=True`: a performance-only knob; `blk.fuse_norm_rope_effective` reads back what runs; refused with `fuse_norm_rope=False` and off the dense DECODE form |
-| `decode_q_tile_max` (declaration) | `None` (= the whole table `(16, 32, 64)`) or a width of it (`32` = the route before the 64-column tile landed) | the width cap on the decode tile's single-unit table: a performance-only knob, the same function under every width; `DecodeRoute.q_tile_max` reads it back and the compiled width is pinned against the route at `compile()` |
+| `decode_q_tile_max` (declaration) | `None` (= the whole table `(16, 32, 64)`) or a width of it (`32` = the route before the 64-column tile landed) | the width cap on the decode tile's single-unit table: a performance-only knob, the same function under every width; `DecodeRoute.q_tile_max` reads it back and the compiled width is pinned against the route at `compile()`; a cap held below the width an unpacked step needs is a typed decline naming it |
+| `use_pdl` (declaration) | `False` (default) or `True` | programmatic dependent launch over the chain: a performance-only knob (bitwise the plain chain, eagerly and under capture), bf16 / f16 only (a typed decline with `quant`, `kv_cache_dtype` or a `QsaSpec`). PER STAGE: the norm + RoPE pass, the separate cache write, the separate sigmoid gate and the decode tile with its split combine take it; the paged prefill tile of the prefill route carries no sites and launches plain (the link serializes, correct by PDL's semantics). `blk.pdl_stages` / `blk.use_pdl_effective` read back what launched with the attribute, `DecodeRoute.pdl_capable` says it per route, `serving_envelope().decode.pdl_stages` / `.extend.pdl_stages` per form |
 | `block_table` (execute) | `[B, max_pages]` int32 at the declared strides; `0` = the NULL block of a padded entry | REQUIRED; page ids are device data |
 | `kv_lens` (execute) | `[B]` int32 contiguous: the LOGICAL KV length of every sequence INCLUDING the step's tokens; `0` = a padded entry | REQUIRED; bound to the SDPA's KV side ONLY (`seq_kv_lens = kv_lens`, `seq_q_lens = None`: every Q row of the step is live) |
 | `seq_lens` (execute) | -- | REFUSED under `kv_source="paged"` (the dense block's self-attention length is a Q-side length; the KV length is `kv_lens`) |

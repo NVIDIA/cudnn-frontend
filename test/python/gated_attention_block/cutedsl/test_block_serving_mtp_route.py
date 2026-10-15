@@ -179,6 +179,7 @@ def _check_route(r: DecodeRoute, want, *, group, s_q, policy):
     assert isinstance(r, DecodeRoute) and (r.s_q, r.group, r.policy) == (s_q, group, policy), r
     assert (r.tile, r.n_q, r.token_units, r.pack_gqa, r.kv_streams, r.claimed) == want, (group, s_q, policy, r)
     assert r.served is (tile is not None) and r.decode_tile is (tile == _T) and r.prefill_tile is (tile == _P), r
+    assert r.pdl_capable is (tile == _T), ("stage (4) takes the programmatic-dependent-launch switch on the decode tile only", r)
     assert (r.reason == "") is r.served and (r.served or "EXTEND form" in r.reason), r
     if tile == _T and packed:
         assert units == -(-s_q // (n_q // group)) and streams == units, r

@@ -2895,8 +2895,10 @@ lengths, the block's oracle cells at every served group x `S_q` 1 .. 5 and the M
 decode twin carries the shared body's register trims (bitwise, except the FTZ max on a sub-normal score) and its cc 10.0 suite run is owed
 (Rule S6). Two more declaration knobs of the block's DECODE form the same day, neither an eligibility fact (Rule S2 exempt): `use_pdl=True`
 (programmatic dependent launch over the chain: the TMA norm + RoPE pass, the cache write, the sigmoid gate, the d256 decode tile and BOTH
-forms of the split combine take the launch attribute with their `griddepcontrol` pair; bitwise the plain chain; a chain with a kernel
-lacking the sites is a typed decline at compile) and `fuse_norm_rope_small_m` (at `B x S_q <= 128` a `fuse_norm_rope=True` declaration
+forms of the split combine take the launch attribute with their `griddepcontrol` pair; bitwise the plain chain; PER STAGE: a kernel
+without the sites -- the paged d256 prefill tile of the DECODE form's prefill route and of the EXTEND form -- launches plain and the
+link serializes, read back by `pdl_stages` / `use_pdl_effective` on the block, `DecodeRoute.pdl_capable` per route and `pdl_stages` on
+each form's envelope; the quantized, e4m3 and sparse pipelines decline the switch, typed) and `fuse_norm_rope_small_m` (at `B x S_q <= 128` a `fuse_norm_rope=True` declaration
 LOWERS stage (1) to the unfused chain -- `fuse_norm_rope_effective` reads it back; `True` keeps the fused fork for the A/B).
 
 Not served (typed declines by name; each lands with its accept cell and flips this section in the same change): an LSE / a sliding window or a right band / a `QsaSpec` / another head dim on the paged forms, a dense step past `S_q = 32` tokens (the DECODE form's `decode_rows` row: the EXTEND form's packed business), a pinned split on the prefill route, `save_for_backward` / `quant` on the paged forms, e4m3 pools (`kv_cache_dtype`) on the DENSE paged forms (served on the block-sparse decode mode at `S_q <= 4` and as the quantizing write-through on the dense prefill forms -- the e4m3 paragraph below), the write-through folded into the projection epilogue, `quant` / `save_for_backward` together with the write-through attribute; the DECODE form's `S_q > 4` arms and every page / layout cell above are functional claims only -- no perf claim before the serving perf cells land.
