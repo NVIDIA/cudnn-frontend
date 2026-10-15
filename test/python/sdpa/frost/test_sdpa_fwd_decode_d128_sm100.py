@@ -194,6 +194,16 @@ def test_standalone_cga_domain_cga1_is_a_decode_tile_only_on_d128_f16():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("native_d64", [False, True], ids=["d128", "d64"])
+@pytest.mark.parametrize("splits", [1, 4], ids=["unsplit", "split4"])
+def test_decode_kernel_staged_o_store_without_early_q(splits, native_d64):
+    """The staged TMA O store (O through the Q u O slab, the store warp's return edge) is what a part without the early-Q claim runs -- cc 10.7 loads
+    this tile too -- so it keeps its own coverage: dense lengths incl. an empty one, and a paged cache that splits, on both head dims."""
+    d = 64 if native_d64 else 128
+    _run_kernel(3, 8, 2, 16, 40, [600, 77, 0], True, splits, d=d, dtype=torch.bfloat16, native_d64=native_d64, early_q=False, paged=splits > 1)
+
+
+@pytest.mark.L0
 def test_adapter_d64_decode_quad_gate():
     """The d64 decode tile runs its quadrant softmax exactly when the live rows -- S_q x the packed group -- fit one 32-row lane quadrant, on a plan that
     lowers onto the decode tile at all and is not THD (whose legs keep the staged O store the merge replaces).  Host-only: the method reads five attributes."""
@@ -201,8 +211,8 @@ def test_adapter_d64_decode_quad_gate():
 
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
-    def quad(h_q, h_kv, s_q, *, pack_gqa=True, thd=False, decode_tile=True):
-        me = SimpleNamespace(h_q=h_q, h_kv=h_kv, s_q_max=s_q, pack_gqa=pack_gqa, thd=thd, _d64_decode_tile=lambda: decode_tile)
+    def quad(h_q, h_kv, s_q, *, pack_gqa=True, thd=False, decode_tile=True, cc=(10, 0)):
+        me = SimpleNamespace(h_q=h_q, h_kv=h_kv, s_q_max=s_q, pack_gqa=pack_gqa, thd=thd, _device_cc=cc, _d64_decode_tile=lambda: decode_tile)
         return SdpaFwdDslSm100._d64_decode_quad(me)
 
     assert quad(64, 8, 1) and quad(64, 8, 4), "G = 8: one to four tokens fit 32 rows"
@@ -211,22 +221,44 @@ def test_adapter_d64_decode_quad_gate():
     assert quad(64, 8, 32, pack_gqa=False) and not quad(64, 8, 33, pack_gqa=False), "unpacked: one row per token"
     assert not quad(64, 8, 1, decode_tile=False), "a plan that is not the decode tile never carries the quadrant record"
     assert not quad(64, 8, 1, thd=True)
+    assert quad(64, 8, 1, cc=(10, 3)) and not quad(64, 8, 1, cc=(10, 7)), "early Q is claimed on the measured cc only; the quadrant softmax needs it"
+
+
+@pytest.mark.L0
+def test_adapter_decode_early_q_is_claimed_on_the_measured_cc_only():
+    """Early Q (``TemplateParams.early_q``) is a positive per-arch claim like the exp2 split: cc 10.0 / 10.3 take it on the decode tile (the d64 decode tile
+    and the d128 cga1 tile), cc 10.7 -- which loads the same tile -- and every unmeasured part keep the staged TMA store, as do THD and FP8 plans."""
+    from types import SimpleNamespace
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    def early_q(cc, *, flavor=(128, 128), cta_mma=1, decode_tile=False, thd=False, fp8=False):
+        me = SimpleNamespace(_device_cc=cc, flavor=flavor, thd=thd, _fp8=fp8)
+        return SdpaFwdDslSm100._decode_early_q(me, SimpleNamespace(decode_tile=decode_tile, cta_mma=cta_mma))
+
+    assert early_q((10, 0)) and early_q((10, 3)) and early_q((10, 0), flavor=(64, 64), decode_tile=True)
+    assert not early_q((10, 7)) and not early_q((11, 0)) and not early_q((12, 0))
+    assert not early_q((10, 0), cta_mma=2), "the d128 cga2 prefill body is not the decode tile"
+    assert not early_q((10, 0), flavor=(64, 64)), "d64 off the decode tile is the prefill body"
+    assert not early_q((10, 0), thd=True) and not early_q((10, 0), fp8=True)
 
 
 @pytest.mark.L0
 def test_decode_quad_record_is_validated():
-    """``decode_quad`` is the d64 decode tile's field: it needs ``decode_tile``, and the kernel declines the combinations its merge cannot serve
-    (THD keeps the staged O store; a packed group must divide the 32-row quadrant)."""
+    """``decode_quad`` is the d64 decode tile's field: it needs ``decode_tile`` and ``early_q`` (the merge replaces the staged O store), and the kernel
+    declines the combinations its merge cannot serve (a packed group must divide the 32-row quadrant)."""
     from dataclasses import replace
 
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d64_decode
 
     base = TemplateParams(
-        cta_mma=1, d_flavor=64, decode_tile=True, dtype_qkv=2, qh_per_kh=8, pack_gqa=True, paged_kv=True, page_size=16, seq_kv_lens_present=True
+        cta_mma=1, d_flavor=64, decode_tile=True, early_q=True, dtype_qkv=2, qh_per_kh=8, pack_gqa=True, paged_kv=True, page_size=16, seq_kv_lens_present=True
     )
     make_cfg_d64_decode(replace(base, decode_quad=True))
-    with pytest.raises(ValueError, match="needs decode_tile"):
+    with pytest.raises(ValueError, match="needs decode_tile and early_q"):
         make_cfg_d64_decode(replace(base, decode_tile=False, decode_quad=True))
+    with pytest.raises(ValueError, match="needs decode_tile and early_q"):
+        make_cfg_d64_decode(replace(base, early_q=False, decode_quad=True))
 
 
 def _facts(**over):
@@ -422,6 +454,7 @@ def _run_kernel(
     native_d64=False,
     exp2_split=False,
     quad=False,
+    early_q=True,
 ):
     """Drive sm100/decode_d128_f16.py directly (the split-KV suite's idiom).
 
@@ -435,6 +468,7 @@ def _run_kernel(
     tile (the partial-PackGQA contract the kernel carries); ``expect_pack_g``
     pins the config's packed group.  ``native_d64`` runs the d64 flavor of the tile (``d_flavor=64, decode_tile``; ``d`` must be 64) instead of
     the d128 envelope, with the exp2 MUFU / FMA split switched by ``exp2_split`` (what the adapter's cc 10.0 build sets) and the quadrant softmax by ``quad``.
+    ``early_q`` is the adapter's measured-cc claim (cc 10.0 / 10.3): on by default here, off to drive the staged TMA O store an unmeasured part keeps.
     """
     import cutlass
     import cuda.bindings.driver as cuda_driver
@@ -490,6 +524,7 @@ def _run_kernel(
         sched_policy=sched,
         split_kv=splits,
         cta_mma=1,
+        early_q=early_q,
         pack_gqa=pack,
         qh_per_kh=G if pack else 1,
         **paged_kw,
@@ -506,6 +541,7 @@ def _run_kernel(
     )
     assert mod.CGA_TILE_M == 128 and mod.CFG.STAGES_KV == 3 and mod.CFG.TOTAL_WARPS == 12
     assert mod.QUAD is bool(quad), "the quadrant softmax must fold in exactly when asked for"
+    assert mod.EARLY_Q is bool(early_q), "early Q must fold in exactly when the record claims it"
     fn = mod.compile(d_qk=d, d_v=d, has_lse=has_lse, paged_hnd=paged and hnd)
     o_p = torch.zeros(splits * B, s_q, H, d, device=dev, dtype=torch.float32 if splits > 1 else dtype)
     lse_p = torch.zeros(splits * B, H, s_q, device=dev, dtype=torch.float32)
@@ -797,6 +833,8 @@ _QUAD_CASES = [
     dict(id="d48_envelope", B=3, H=8, KH=1, P=16, max_pages=40, lens=[600, 77, 1], splits=1, d=48),
     dict(id="d48_envelope_split", B=3, H=8, KH=1, P=16, max_pages=40, lens=[600, 77, 129], splits=2, d=48),
     dict(id="empty_ranges_many_units", B=3, H=8, KH=8, P=128, max_pages=33, lens=[4000, 1, 129], splits=8),
+    dict(id="fp16", B=3, H=8, KH=1, P=16, max_pages=40, lens=[600, 77, 1], splits=1, sink=True, dtype=torch.float16),
+    dict(id="fp16_split", B=3, H=8, KH=2, P=16, max_pages=40, lens=[600, 77, 129], splits=4, dtype=torch.float16),
 ]
 
 
@@ -812,7 +850,8 @@ def test_decode_kernel_native_d64_quad_softmax(case):
     case.pop("id")
     B, H, KH, P, max_pages, lens, splits = (case.pop(k) for k in ("B", "H", "KH", "P", "max_pages", "lens", "splits"))
     d = case.pop("d", 64)
-    _run_kernel(B, H, KH, P, max_pages, lens, True, splits, d=d, dtype=torch.bfloat16, native_d64=True, quad=True, **case)
+    dtype = case.pop("dtype", torch.bfloat16)
+    _run_kernel(B, H, KH, P, max_pages, lens, True, splits, d=d, dtype=dtype, native_d64=True, quad=True, **case)
 
 
 @pytest.mark.L0

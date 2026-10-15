@@ -270,8 +270,9 @@ _FP32_PARTIALS = SPLIT_KV > 1
 # handshake), so the TMA-LDG warp loads the NEXT tile's Q while this tile is still in its tail -- a tile of one or two KV steps (a sliding window,
 # a short cache at batch) no longer pays the O drain + alias round trip + Q load latency in series.  It needs O out of the slab: the fp32 split
 # partials already go straight from TMEM to the workspace, and the dense / paged half output is stored directly by the correction warps
-# (DIRECT_O).  The THD legs keep the staged TMA store: their per-batch runtime descriptors place the rows.
-EARLY_Q = (not CFG.THD_VARLEN) and (not RAGGED_Q)
+# (DIRECT_O).  The THD legs keep the staged TMA store: their per-batch runtime descriptors place the rows.  ``PARAMS.early_q`` (the adapter's claim of
+# the measured cc) gates it: a part nobody measured keeps the staged store.
+EARLY_Q = bool(PARAMS.early_q) and (not CFG.THD_VARLEN) and (not RAGGED_Q)
 DIRECT_O = EARLY_Q and not _FP32_PARTIALS
 # Quadrant-cooperative softmax (``PARAMS.decode_quad``, the d64 flavor).  A decode step has at most QUAD_ROWS = 32 live Q rows (S_q x PACK_G), a quarter
 # of the tile's 128 TMEM lanes, yet each of the four softmax warps -- one per lane quadrant -- exponentiates all 128 key columns of its 32 lanes, so the

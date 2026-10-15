@@ -160,6 +160,9 @@ _SM100_DECODE_FLAVOR = (128, 128)
 _D64_DECODE_TILE_ROWS = 128
 # Live Q rows one TMEM lane quadrant holds: the d64 decode tile's quadrant softmax (TemplateParams.decode_quad) serves up to this many.
 _D64_QUAD_ROWS = 32
+# The cc the decode tile's early-Q form (TemplateParams.early_q) was measured on.  Positive gate: cc 10.7 loads the same tile (dense d128 decode, issue
+# #1472) and keeps the staged O store until a Rubin run says otherwise.
+_EARLY_Q_CC: frozenset[tuple[int, int]] = frozenset({(10, 0), (10, 3)})
 # Decode-shaped alternates selected by a TemplateParams field instead of a knob
 # (TemplateParams.decode_q_tile != 0, set by SdpaFwdDslSm100._decode_q_tile when
 # S_q * pack_g rows fit the tile's N extent): the d256 flavor's swap-AB tile.
@@ -2584,10 +2587,17 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         keeps the 128-row tile's single-quadrant softmax.  Dense / paged, split or not, with or without a sink (not THD: the tile's THD legs keep the staged
         O store the merge replaces).
         """
-        if not self._d64_decode_tile() or self.thd:
+        if not self._d64_decode_tile() or self.thd or tuple(self._device_cc) not in _EARLY_Q_CC:
             return False
         pack_g = (self.h_q // self.h_kv) if self.pack_gqa else 1
         return int(self.s_q_max) * pack_g <= _D64_QUAD_ROWS
+
+    def _decode_early_q(self, params) -> bool:
+        """Whether the decode tile (sm100/decode_d128_f16.py: the d64 decode tile, the d128 cga1 tile) takes its early-Q form (``TemplateParams.early_q``)
+        on this build: the measured cc, and a dense / paged plan -- the THD legs keep the staged O store their per-batch runtime descriptors place."""
+        if tuple(self._device_cc) not in _EARLY_Q_CC or self.thd or self._fp8:
+            return False
+        return bool(params.decode_tile) or (tuple(self.flavor) == _SM100_DECODE_FLAVOR and params.cta_mma == 1)
 
     def template_params(self) -> Sm100TemplateParams:
         """The compile-time record ``compile()`` loads the kernel module with.
@@ -2804,7 +2814,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 ),
             )
         if self._d64_decode_tile():
-            params = replace(params, decode_tile=True, decode_quad=self._d64_decode_quad())
+            params = replace(params, decode_tile=True)
+        if self._decode_early_q(params):
+            params = replace(params, early_q=True)
+        if self._d64_decode_tile():
+            params = replace(params, decode_quad=self._d64_decode_quad())
         if self._fp8_dual_kv_stream():
             params = replace(params, dual_kv_stream=True)
         elif self._device_cc != (10, 7) and self.flavor == (512, 512) and self._fp8 and not self._pertensor:

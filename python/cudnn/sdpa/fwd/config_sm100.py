@@ -248,6 +248,11 @@ class TemplateParams:
     # all four TMEM lane quadrants and each softmax warp owns a quarter of the key columns, the correction warps merging the four partials per unit.
     # Needs decode_tile; set by SdpaFwdDslSm100._d64_decode_quad.
     decode_quad: bool = False
+    # The decode tile's early-Q form (sm100/decode_d128_f16.py EARLY_Q): the Q slab is released by the last BMM1 of a unit instead of the O store's
+    # return edge, and the correction warps store the half output straight from TMEM.  Claimed per arch, like exp2_fma_split: set by
+    # SdpaFwdDslSm100._decode_early_q on the cc it was measured on (10.0, 10.3); an unmeasured part (cc 10.7 loads the same tile) keeps the staged
+    # TMA store.  The THD / ragged legs keep it whatever the field says.
+    early_q: bool = False
     # Per-tensor FP8 d128 decode: the two Q sub-tiles of sm100/prefill_d128_fp8.py
     # become two KV STREAMS over one 128-row Q tile (even KV tiles on sub-tile 0,
     # odd on sub-tile 1, each with its own running max / sum, merged once in
@@ -435,8 +440,8 @@ def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: b
         # The loader routes a decode_tile record to sm100/decode_d128_f16.py at
         # d_flavor=64 (make_cfg_d64_decode); no other template consumes it.
         raise ValueError(f"{flavor}: decode_tile selects the d64 decode tile; this template does not consume it")
-    if k.decode_quad and not k.decode_tile:
-        raise ValueError(f"{flavor}: decode_quad is the d64 decode tile's quadrant softmax; it needs decode_tile")
+    if k.decode_quad and not (k.decode_tile and k.early_q):
+        raise ValueError(f"{flavor}: decode_quad is the d64 decode tile's quadrant softmax; it needs decode_tile and early_q")
     if k.dual_kv_stream and (flavor != "d128" or k.dtype_qkv > 1 or k.cta_mma != 1 or k.thd_varlen or k.pv_bf16):
         # Two KV streams over one Q tile: the per-tensor FP8 d128 pipeline at cga1
         # on a dense or paged graph (sm100/prefill_d128_fp8.py); nothing else
