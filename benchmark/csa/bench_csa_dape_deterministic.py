@@ -7,8 +7,8 @@ The two variants share all input/output addresses. Each round reverses measureme
 order (AB, then BA) to suppress boost-clock/order bias; ``--construct-order`` also
 reverses which independently compiled plan is built first. ``kernel_us`` measures
 only ``execute`` (the atomic dAPE buffer is cleared before its event); ``operation_us``
-includes the atomic path's required dAPE clear and the deterministic path's two kernel
-launches. Allocations and JIT are outside both measurements.
+includes the atomic path's required dAPE clear and every deterministic reduction
+launch. Allocations and JIT are outside both measurements.
 
 Run this script against an unchanged-source checkout with ``--atomic-only`` to record
 the independent upstream control. The atomic constructor deliberately omits the new
@@ -31,6 +31,23 @@ SHAPES = (
     ("r128-c2-d128-3x8192", [8192] * 3, 128, 128, 2),
     ("r128-c1-d512-1x8192", [8192], 512, 128, 1),
     ("r128-c2-d512-3x8192", [8192] * 3, 512, 128, 2),
+)
+
+LONG_CONTEXT_SHAPES = (
+    (
+        "r4-c1-d128-packed256k-cp32-or64",
+        [1024, 3072, 8192, 16384, 32768, 65536, 135168],
+        128,
+        4,
+        1,
+    ),
+    (
+        "r4-c1-d128-packed1m-cp64",
+        [4096, 12288, 32768, 65536, 131072, 262144, 540672],
+        128,
+        4,
+        1,
+    ),
 )
 
 
@@ -164,9 +181,15 @@ def main():
     parser.add_argument("--warmup", type=int, default=30)
     parser.add_argument("--construct-order", choices=("atomic-first", "deterministic-first"), default="atomic-first")
     parser.add_argument("--atomic-only", action="store_true")
-    parser.add_argument("--quick", action="store_true", help="Run one generic and one ratio=128 shape")
+    shape_group = parser.add_mutually_exclusive_group()
+    shape_group.add_argument("--quick", action="store_true", help="Run one generic and one ratio=128 shape")
+    shape_group.add_argument(
+        "--long-context",
+        action="store_true",
+        help="Run the unequal packed 256K/CP32-or-64 and 1M/CP64 production shapes",
+    )
     args = parser.parse_args()
-    shapes = SHAPES[::4] if args.quick else SHAPES
+    shapes = LONG_CONTEXT_SHAPES if args.long_context else (SHAPES[::4] if args.quick else SHAPES)
     results = [_bench_shape(*shape, args) for shape in shapes]
     print(json.dumps({"construct_order": args.construct_order, "results": results}, indent=2))
 
