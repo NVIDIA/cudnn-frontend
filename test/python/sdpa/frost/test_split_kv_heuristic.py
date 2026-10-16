@@ -656,6 +656,49 @@ def test_decode_tile_two_unit_routes_share_one_kv_stream_per_split():
         )
 
 
+def test_decode_tile_keeps_the_previous_pick_past_the_measured_waves():
+    """Past the regime the wave term was measured in -- a pick that puts a single-unit launch past one
+    wave of SMs (many waves of short CTAs), except the measured floor of a launch that is past one wave
+    unsplit -- the model is an extrapolation: the per-width CTA cost was fitted on ONE row (B 128 x kv 4K)
+    and the only measured analog of the cells it moves, B 4 x kv 128K at S_q 1 on the 16-column tile,
+    ordered the splits 16 < 64 < 128 < 32 while the wave arithmetic ranks the S_q 3 / 4 twins on the
+    64-column tile 64 < 128 < 16 < 32.  Until those cells are measured the model returns the
+    saturation-only pricing's pick there (the pricing before the wave term: a lone CTA's rate or the
+    stream count against the saturation point, one tile of fixed cost per CTA; the candidate list is the
+    same), so B 4 x kv 128K at S_q 3 / 4 stays at 32 (the wave arithmetic said 64 = 512 CTAs) and B 128
+    at kv 32K / 128K stays unsplit on a 212-SM part (it said 4 = 1024 CTAs), both regimes -- while every
+    pick inside the regime is the wave term's: the one-wave split 3, the B 1 / B 4 optima, the
+    B 128 x kv 4K floor (eager 1, replay 2) and, on a 204-SM part where 256 units are a wave and a
+    quarter, the floor's split 2 at kv 32K."""
+    import cudnn.sdpa.fwd.heuristics as heur
+
+    inside = heur.decode_tile_split_inside_measured_waves
+    for sm in (212, 204):
+        for s_q in (3, 4):
+            for hq in (24, 32):
+                for lc in (17.0, 0.0):
+                    assert _decode_tile(8, 131072, sm_count=sm, q_tile=64, combine_grid=(4, hq, s_q), launch_cost=lc) == 32, (sm, s_q, hq, lc)
+    for kv in (32768, 131072):
+        for s_q, q_tile in ((1, 16), (2, 32), (3, 64), (4, 64)):
+            for lc in (17.0, 0.0):
+                assert _decode_tile(256, kv, sm_count=212, q_tile=q_tile, combine_grid=(128, 24, s_q), launch_cost=lc) == 1, (kv, s_q, lc)
+    # what the wave arithmetic says there (outside the regime) and what the saturation-only pricing says: the record of the fallback
+    kw = dict(units=8, kv_tiles=1024, sm_count=212, tile_cost=1.65, launch_cost=0.0, grid=(4, 24, 4), q_tile=64)
+    c = {s: heur._decode_tile_cost(s, **kw) for s in (16, 32, 64, 128)}
+    assert min(c, key=c.get) == 64 and not inside(64, units=8, sm_count=212) and inside(16, units=8, sm_count=212), c
+    sat = {s: heur._decode_tile_saturation_cost(s, **kw) for s in (16, 32, 64, 128)}
+    assert min(sat, key=sat.get) == 32, sat
+    assert heur._decode_tile_saturation_cost(1, **kw) == pytest.approx((1024 + heur._DECODE_TILE_UNIT_CTA_COST) * 1.65)
+    # inside the regime the wave term decides: the measured cells
+    assert _decode_tile(64, 32768, sm_count=212, q_tile=64, combine_grid=(32, 24, 4)) == 3
+    assert _decode_tile(8, 131072, sm_count=212, combine_grid=(4, 24, 1)) == 16  # the measured analog: the one-wave split
+    big = dict(units=256, s_kv=4096, q_tile=64, combine_grid=(128, 24, 4))
+    assert _decode_tile(sm_count=212, **big) == 1 and _decode_tile(sm_count=212, launch_cost=0.0, **big) == 2
+    assert inside(2, units=256, sm_count=204) and not inside(4, units=256, sm_count=204)
+    for lc in (17.0, 0.0):
+        assert _decode_tile(256, 32768, sm_count=204, combine_grid=(128, 24, 1), launch_cost=lc) == 2, lc
+
+
 def test_decode_tile_saturated_launch_never_splits():
     """256 units (b=128) already saturate HBM twice over, 128 once: the bytes
     do not change with the split, only the fixed costs, so neither regime

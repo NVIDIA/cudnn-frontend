@@ -681,16 +681,48 @@ def decode_tile_split_inside_measured_waves(split: int, *, units: int, sm_count:
     return units > sm_count and int(split) <= DECODE_TILE_MEASURED_WAVE_FLOOR
 
 
-def _decode_tile_argmin(candidates: List[int], kw: dict) -> int:
-    """The cheapest split of ``candidates`` under :func:`_decode_tile_cost`: the best power of two
-    (1 is one) unless a wave-filling odd split beats it by more than _DECODE_TILE_ODD_SPLIT_MARGIN;
-    ties go to the smaller split."""
-    best, best_cost = 1, _decode_tile_cost(1, **kw)
+# The fixed cost of a CTA in the saturation-only pricing below: one KV tile whatever its rows (the
+# B200 fit of the 16-column tile), the figure the model carried before the per-width CTA cost.
+_DECODE_TILE_UNIT_CTA_COST = 1.0
+
+
+def _decode_tile_saturation_cost(
+    split: int,
+    *,
+    units: int,
+    kv_tiles: int,
+    sm_count: int,
+    tile_cost: float,
+    launch_cost: float,
+    grid: Optional[Tuple[int, int, int]] = None,
+    q_tile: int = 16,
+    token_units: int = 1,
+) -> float:
+    """The pricing WITHOUT the wave term and the per-width CTA cost -- the two terms fitted on the
+    fewest measured rows: every CTA streams at a lone CTA's rate or at the rate the launch's unique
+    KV streams set against the saturation point, whatever the wave count, plus one tile of fixed
+    cost; the per-width stream rates and the combine's form prices (measured broadly) stay.  This is
+    the model's reading before the wave term landed, and what :func:`choose_decode_tile_split_kv`
+    returns to where the wave term is an extrapolation (:func:`decode_tile_split_inside_measured_waves`)."""
+    streams = units * split / max(1, int(token_units))
+    per_tile = max(tile_cost, streams / (_DECODE_TILE_SATURATION_FRACTION * sm_count))
+    cost = (_ceil_div(kv_tiles, split) + _DECODE_TILE_UNIT_CTA_COST) * per_tile
+    if split > 1:
+        cost += _decode_tile_combine_cost(split, grid=grid) + launch_cost
+    return cost
+
+
+def _decode_tile_argmin(candidates: List[int], kw: dict, cost_of=None) -> int:
+    """The cheapest split of ``candidates`` under ``cost_of`` (:func:`_decode_tile_cost` by default):
+    the best power of two (1 is one) unless a wave-filling odd split beats it by more than
+    _DECODE_TILE_ODD_SPLIT_MARGIN; ties go to the smaller split."""
+    cost_of = _decode_tile_cost if cost_of is None else cost_of
+    best, best_cost = 1, cost_of(1, **kw)
     odd, odd_cost = None, None  # the best wave-filling non-power-of-two split
     for split in candidates:
         if split <= 1:
             continue
-        cost = _decode_tile_cost(split, **kw)
+        cost = cost_of(split, **kw)
         if split & (split - 1) == 0:
             if cost < best_cost:
                 best, best_cost = split, cost
@@ -782,6 +814,18 @@ def choose_decode_tile_split_kv(
     (:func:`decode_tile_split_inside_measured_waves`) rather than the wave
     arithmetic's extrapolation to many waves of short CTAs.
 
+    The wave term's measured regime is bounded the same way for a single-unit
+    launch: within one wave of SMs, or the measured floor (a split up to 2) of
+    a launch that is past one wave unsplit.  A pick beyond it -- many waves of
+    short CTAs: B 4 x kv 128K at S_q 3 / 4 on the 64-column tile (512 CTAs),
+    B 128 at kv 32K / 128K (1024) -- rests on the per-width CTA cost fitted on
+    one row, and the one measured analog (B 4 x kv 128K at S_q 1, 16-column:
+    16 < 64 < 128 < 32) orders the splits unlike the wave arithmetic does for
+    the S_q 4 twin (64 < 128 < 16 < 32); until those cells are measured the
+    model returns the saturation-only pricing's pick there
+    (:func:`_decode_tile_saturation_cost`: the reading before the wave term,
+    32 and unsplit on those cells), the candidate list unchanged.
+
     Candidates come from :func:`decode_tile_split_candidates`; ties go to the
     smaller split, and a non-power-of-two split is taken only when it beats the
     best power of two by more than _DECODE_TILE_ODD_SPLIT_MARGIN.  Returns 1 for
@@ -803,10 +847,14 @@ def choose_decode_tile_split_kv(
     )
     candidates = decode_tile_split_candidates(sm_count=sm_count, kv_tiles=kv_tiles)
     pick = _decode_tile_argmin(candidates, kw)
-    if token_units > 1 and not decode_tile_split_inside_measured_waves(pick, units=units, sm_count=sm_count, token_units=token_units):
-        # a multi-unit route past one wave of its unique streams: unmeasured -- the best split inside the measured regime
-        inside = [s for s in candidates if decode_tile_split_inside_measured_waves(s, units=units, sm_count=sm_count, token_units=token_units)]
-        pick = _decode_tile_argmin(inside, kw)
+    if not decode_tile_split_inside_measured_waves(pick, units=units, sm_count=sm_count, token_units=token_units):
+        if token_units > 1:
+            # a multi-unit route past one wave of its unique streams: unmeasured -- the best split inside the measured regime
+            inside = [s for s in candidates if decode_tile_split_inside_measured_waves(s, units=units, sm_count=sm_count, token_units=token_units)]
+            pick = _decode_tile_argmin(inside, kw)
+        else:
+            # a single-unit launch cut into many waves of short CTAs: unmeasured -- the pick of the pricing before the wave term
+            pick = _decode_tile_argmin(candidates, kw, _decode_tile_saturation_cost)
     return pick
 
 
