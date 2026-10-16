@@ -17,6 +17,15 @@ pytestmark = pytest.mark.L0
 AMAX_S_REASON = "graph requests the Amax_S output, which the FROST engines do not produce"
 
 
+@pytest.fixture(autouse=True)
+def _dsl_ready(monkeypatch):
+    # The CuTe DSL install / version / target checks sit between the arch check and the Amax_S rule; they depend on
+    # the lane's wheel (e.g. 4.7.0 has no sm_107a), not on the rule under test.
+    monkeypatch.setattr(engines, "cutedsl_state", lambda: (True, None))
+    monkeypatch.setattr(engines, "cutedsl_too_old", lambda version: False)
+    monkeypatch.setattr(engines, "cutedsl_arch_requirement_error", lambda cc: None)
+
+
 def _fp8_facts(**kw):
     base = dict(
         b=1,
