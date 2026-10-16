@@ -233,7 +233,7 @@ It is intended for high-overlap workloads; the device-side partition still
 runs when a pair falls back to ordinary work. H16 `topk_max <= 256` and H32
 `topk_max <= 128` accept the mode but compile the ordinary backend directly.
 
-The H128 specialization keeps the five tensor-core products in one
+With the default `deterministic=False`, the H128 specialization keeps the five tensor-core products in one
 two-CTA main kernel. It publishes FP32 O-dot-dO and folded-LSE statistics to the
 caller-provided scratch workspace, converts the FP32 dKV workspace to the public BF16
 output, and completes dSink with a separate FP32 reduction kernel. The helper
@@ -241,27 +241,35 @@ launches do not change the two-CTA topology of the core computation.
 
 The H128/D576 specialization applies the same two-CTA topology to the MLA
 layout (`head_dim = 576`, `head_dim_v = 512`). Its compiled sequence
-initializes the FP32 dKV workspace and the dSink output on the launch stream,
+with `deterministic=False` initializes the FP32 dKV workspace and the dSink output on the launch stream,
 accumulates dKV in that workspace, and converts it to the public BF16 output
-with a helper kernel. Short query batches split each query's top-k range
-across otherwise idle two-SM clusters; the split count is fixed when the plan
-is compiled.
+with a helper kernel. With the default `deterministic=False`, short query
+batches split each query's top-k range across otherwise idle two-SM clusters;
+the split count is fixed when the plan is compiled.
 
-On SM100 with H16/H32/H64/H96/H128, `deterministic=True` selects a bounded-wave
-M64 implementation. Queries run in same-stream waves of 128 CTAs; CTA lane
-`i` is the sole writer of FP32 dKV shard `i` in each wave. H16/H32 use a masked
-M64 head tile. H96/H128 split each query wave into ordered M64 head-block
-launches, preserving single-writer ownership without multiplying the number
-of shards. Kernel launch ordering serializes both head blocks and shard reuse
-across waves, so the protocol needs neither semaphores nor cooperative launch.
-A fixed-order two-stage reduction combines the 128 shards, and one CTA per
-head reduces `d_sink`. The additional dKV workspace is
-`128 * round_up(total_S_kv, 8) * round_up(D, 8) * sizeof(float)` bytes. Use
-`scratch_workspace_bytes()` as the authoritative full scratch size.
-`deterministic=True` takes precedence over the two-CTA selection: the BF16
-H128/D512 and H128/D576 envelopes also run the bounded-wave M64 kernel when
-determinism is requested, because the two-CTA paths accumulate dKV with FP32
-atomics.
+On SM100/SM103, `deterministic=True` retains the two-CTA Tensor Core kernels
+for the supported BF16 H128/D512 and H128/D576 envelopes above. Queries run in
+same-stream waves of at most 74 query tokens, with one two-CTA pair per query.
+Private FP32 accumulator slots and ordered duplicate-index writers give each
+update a fixed accumulation order. Stream ordering serializes slot reuse
+between waves, and fixed-order reductions produce `dKV` and `d_sink`. Both
+specializations keep the public workspace capacity of 128 FP32 dKV planes.
+
+Other deterministic envelopes with H16/H32/H64/H96/H128 keep the bounded-wave
+M64 implementation. It selects 32 dKV shards for `total_S_q <= 128`, 64 for
+`129..256`, and 128 for larger query batches. Queries run in same-stream waves
+with one CTA per shard; CTA lane `i` is the sole writer of FP32 dKV shard `i`
+in each wave. H16/H32 use a masked M64 head tile. H96/H128 split each query
+wave into ordered M64 head-block launches, preserving single-writer ownership
+without multiplying the number of shards. Kernel launch ordering serializes
+both head blocks and shard reuse across waves, so the protocol needs neither
+semaphores nor cooperative launch. The 32-shard specialization converts with
+one fixed-order reduction; the 64- and 128-shard specializations first fold
+groups of eight and then combine those groups in fixed order. One CTA per head
+reduces `d_sink`. The additional dKV workspace is
+`selected_shards * round_up(total_S_kv, 8) * round_up(D, 8) * sizeof(float)`
+bytes. Use `scratch_workspace_bytes()` as the authoritative full scratch size;
+a larger reusable workspace remains valid.
 Treat this as a reproducibility requirement rather than a performance-tuning
 knob: keep the default `False` when bitwise run-to-run stability is not needed.
 

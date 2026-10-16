@@ -81,14 +81,16 @@ def test_mxfp8_omitted_scale_o_is_compiled_out_not_a_cached_dummy(monkeypatch):
     assert arguments["sf_o_ptr"] is not None
     assert arguments["scale_o_ptr"] is None
     # Append-only public signature: sample_scale_o closes the block-scale tail; the
-    # ragged-Q decode leg's plan-time facts (defaulted) follow it, then the score side
-    # outputs (sample_score_max / sample_score_sum_exp), then the Rubin small tiles'
-    # resident-block operands and their knobs in landing order -- the newest tail.
+    # ragged-Q decode leg's plan-time facts (defaulted) follow it, then the Rubin decode
+    # route's width cap and the programmatic-dependent-launch switch (the public tree's
+    # tail), then the score side outputs (sample_score_max / sample_score_sum_exp), then
+    # the Rubin small tiles' resident-block operands and their knobs in landing order --
+    # the newest tail.
     params = list(inspect.signature(SdpaFwdDsl.__init__).parameters)
     i = params.index("sample_scale_o")
-    assert params[i : i + 3] == ["sample_scale_o", "ragged_divisors", "ragged_offsets_int64"], params[i : i + 4]
+    assert params[i : i + 5] == ["sample_scale_o", "ragged_divisors", "ragged_offsets_int64", "decode_q_tile_max", "use_pdl"], params[i : i + 6]
     j = params.index("sample_score_max")
-    assert params[j - 1] == "ragged_offsets_int64" and params[j : j + 2] == ["sample_score_max", "sample_score_sum_exp"], params[j - 1 : j + 2]
+    assert params[j - 1] == "use_pdl" and params[j : j + 2] == ["sample_score_max", "sample_score_sum_exp"], params[j - 1 : j + 2]
     assert params[j + 2 :] == [
         "sample_bias",
         "sample_kv_mask",

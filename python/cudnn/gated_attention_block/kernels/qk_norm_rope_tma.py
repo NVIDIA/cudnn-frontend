@@ -77,7 +77,7 @@ from cutlass.experimental.cuda import tensor_map as tmap
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.frost.compiled_cache import compile_cached, template_key
 from cudnn.frost.device import current_device, multiprocessor_count
-from cudnn.frost.tile_dsl.barrier import PipelineState, advance, arrive_expect_tx, wait
+from cudnn.frost.tile_dsl.barrier import PipelineState, advance, arrive_expect_tx, launch_dependent_grids, wait, wait_on_dependent_grids
 from cudnn.frost.tile_dsl.handles import GmemTileTma, SmemTile
 from cudnn.frost.tile_dsl.pointwise import (
     abs_max_tree,
@@ -1273,6 +1273,9 @@ def frost_qk_norm_rope_tma(
     batch: cutlass.Int32,
     n_blk: cutlass.Int32,
     n_sft: cutlass.Int32,
+    # APPENDED: programmatic dependent launch (the launch attribute is set by qk_norm_rope_tma_launch under the same flag): the wait
+    # precedes the bodies' ring fill (their first global read: the slab bands a projection launch wrote), the release follows it.
+    use_pdl: cutlass.Constexpr[bool] = False,
 ) -> None:
     """The standalone launch shape of :func:`qk_norm_rope_tma_body` (the SMEM rings allocated here -- the SMEM buffer table --,
     ``cta = blockIdx.x`` over a grid of ``n_ctas``) and, with the MX operands bound, of :func:`qk_norm_rope_tma_mx_body` (the
@@ -1294,6 +1297,12 @@ def frost_qk_norm_rope_tma(
     # const_expr(want_rstd), so the RoPE-only / no-rstd trace keeps the SMEM too.
     sRstd = cutlass.Array(cutlass.Float32, stages * tile_rows, alignment=16, space=cutlass.AddressSpace.smem) if cutlass.const_expr(want_rstd) else None
     mb_full = cutlass.Array(cutlass.Int64, stages, alignment=16, space=cutlass.AddressSpace.smem)
+    if cutlass.const_expr(use_pdl):
+        # Every global read of both arms (the TMA ring fill, the weights, the RoPE tables, the scale slots) sits below this wait; the
+        # SMEM carve above it is the prologue it overlaps.  The dependent grid is released right away: a streaming pass has nothing
+        # a later release would protect (its wait still blocks on this grid's completion and memory flush).
+        wait_on_dependent_grids()
+        launch_dependent_grids()
     if cutlass.const_expr(mx_out):
         # the MX arm: the per-warp column maxima (warps x D fp32, the SMEM table's sRedCol); the descriptors are the 4-D band views
         sRedCol = cutlass.Array(cutlass.Float32, (threads_per_cta // WARP) * d, alignment=16, space=cutlass.AddressSpace.smem)
@@ -1417,6 +1426,7 @@ def qk_norm_rope_tma_launch(
     n_blk: cutlass.Int32,
     n_sft: cutlass.Int32,
     stream: cuda.CUstream,
+    use_pdl: cutlass.Constexpr[bool] = False,  # APPENDED: the programmatic-dependent-launch form (attribute + the kernel's griddepcontrol pair)
 ):
     """Build the four descriptors, then launch.
 
@@ -1503,7 +1513,8 @@ def qk_norm_rope_tma_launch(
         batch,
         n_blk,
         n_sft,
-    ).launch(grid=(n_ctas, 1, 1), block=(threads_per_cta, 1, 1), stream=stream)
+        use_pdl,
+    ).launch(grid=(n_ctas, 1, 1), block=(threads_per_cta, 1, 1), stream=stream, use_pdl=use_pdl)
 
 
 compiled_cache = {}
@@ -1534,6 +1545,8 @@ class QkNormRopeTmaRecipe(NamedTuple):
     # q_T8 / sf_q_T / k8 / sf_k / k_T8 / sf_k_T`` + ``batch`` / ``seq_len`` REQUIRED at execute, the bf16 outputs and the per-tensor
     # scales refused); ``tile_rows`` / ``stages_o`` of the recipe are not used by this arm.
     mx_out: bool = False
+    # Appended (default = today's artifact): the programmatic-dependent-launch form traced (the launch attribute + the griddepcontrol pair).
+    use_pdl: bool = False
 
 
 def _fake(dtype, shape, stride_order):
@@ -1598,6 +1611,7 @@ def compile_qk_norm_rope_tma(
     apply_norm: bool = True,
     fp8_out: bool = False,
     mx_out: bool = False,
+    use_pdl: bool = False,
 ) -> QkNormRopeTmaRecipe:
     """Build the TMA artifact from shapes alone. ``apply_norm=False`` traces the
     RoPE-only kernel (weights traced as ``None``, no rstd allowed) and is part
@@ -1668,6 +1682,7 @@ def compile_qk_norm_rope_tma(
         bool(apply_norm),
         bool(fp8_out),
         bool(mx_out),
+        bool(use_pdl),
     )
     if key not in compiled_cache:
         # The dict stays the in-process memo; behind it sits the persistent compiled-plan cache (``cudnn.frost.compiled_cache``),
@@ -1725,6 +1740,7 @@ def compile_qk_norm_rope_tma(
             cutlass.Int32(0),  # n_blk    )
             cutlass.Int32(0),  # n_sft    )
             _FAKE_STREAM,
+            bool(use_pdl),
             options="--enable-tvm-ffi",
             cache_key=cache_key,
             symbol="cudnn_block_qk_norm_rope_tma",
@@ -1744,6 +1760,7 @@ def compile_qk_norm_rope_tma(
         apply_norm=bool(apply_norm),
         fp8_out=bool(fp8_out),
         mx_out=bool(mx_out),
+        use_pdl=bool(use_pdl),
     )
 
 

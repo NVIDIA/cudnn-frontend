@@ -357,8 +357,8 @@ def test_decode_graph_serving_shape_leads_unsplit_with_the_split_as_runner_up():
     sm = torch.cuda.get_device_properties(0).multi_processor_count
     shape = dict(B=32, H=32, KH=2, s_q=1, lens=[4096] * 32, page=16, stats=False, dtype=torch.bfloat16)
     lead = _run_graph(**shape)
-    assert lead.knobs.split_kv == choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm), lead.knobs
-    captured = choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm, launch_cost=0.0)
+    assert lead.knobs.split_kv == choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm, device_cc=(10, 0)), lead.knobs
+    captured = choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm, launch_cost=0.0, device_cc=(10, 0))
     runner = _run_graph(**shape, split_kv=captured)
     assert runner.knobs.split_kv == captured, runner.knobs
     if sm == 148:
@@ -373,7 +373,7 @@ def test_decode_graph_serving_shape_leads_unsplit_with_the_split_as_runner_up():
     # Its 16-row sibling (Qwen3-Next 16/2: 8:1 packing at S_q=2) is decode-shaped
     # and follows the serving shape's policy: unsplit lead, split-2 runner-up.
     mtp16 = _run_graph(B=32, H=16, KH=2, s_q=2, lens=[4096] * 32, page=16, stats=False, dtype=torch.bfloat16, causal_br=True)
-    assert mtp16.knobs.split_kv == choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm), mtp16.knobs
+    assert mtp16.knobs.split_kv == choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm, device_cc=(10, 0)), mtp16.knobs
 
 
 @pytest.mark.L0
@@ -387,9 +387,9 @@ def test_decode_graph_serving_shape_leads_with_the_split_when_replay_is_expected
     sm = torch.cuda.get_device_properties(0).multi_processor_count
     shape = dict(B=32, H=32, KH=2, s_q=1, lens=[4096] * 32, page=16, stats=False, dtype=torch.bfloat16, graph_kwargs=dict(is_cuda_graph_replay_expected=True))
     lead = _run_graph(**shape)
-    captured = choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm, launch_cost=0.0)
+    captured = choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm, launch_cost=0.0, device_cc=(10, 0))
     assert lead.knobs.split_kv == captured, lead.knobs
-    eager = choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm)
+    eager = choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm, device_cc=(10, 0))
     runner = _run_graph(**shape, split_kv=eager)
     assert runner.knobs.split_kv == eager, runner.knobs
     if sm == 148:
@@ -406,7 +406,7 @@ def test_decode_graph_small_batch_splits_and_recombines():
 
     sm = torch.cuda.get_device_properties(0).multi_processor_count
     plan = _run_graph(B=8, H=32, KH=2, s_q=1, lens=[4096, 4000, 129, 1, 2048, 4096, 300, 77], page=16, dtype=torch.bfloat16)
-    assert plan.knobs.split_kv == choose_decode_tile_split_kv(units=16, kv_tiles=32, sm_count=sm), plan.knobs
+    assert plan.knobs.split_kv == choose_decode_tile_split_kv(units=16, kv_tiles=32, sm_count=sm, device_cc=(10, 0)), plan.knobs
     if sm == 148:
         assert plan.knobs.split_kv == 8, plan.knobs
 

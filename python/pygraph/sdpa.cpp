@@ -1444,7 +1444,7 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                 Returns:
                     o (cudnn_tensor): The output data.
                     stats (Optional[cudnn_tensor]): The softmax statistics in case the operation is in a training step.
-                    amax_s (cudnn_tensor): The absolute maximum of S tensor.
+                    amax_s (cudnn_tensor): Deprecated; leave it virtual and set scale_s from the bounds in docs/operations/Attention.md, "Amax S" (448 for E4M3 without dropout). Declaring it as an output restricts the graph to backend engines.
                     amax_o (cudnn_tensor): The absolute maximum of output tensor.
             )pbdoc");
     m.def("sdpa_mxfp8",

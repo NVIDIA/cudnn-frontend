@@ -128,7 +128,7 @@ envelope, random hold-out); develop led none of them (mean regret 116%):
   prefill body, before the Rubin decode tile) -- the PAGED d256 decode-tile band below is the exception.
 New mean regret 3.2%, no lead slower than 1.03x warm or cold. The board's timing is noisy for the
 first arm measured (FROST), which biases these ratios against FROST. The per-tensor FP8
-Rubin row remains opt-in.
+Rubin row has its own arm ("SM107 per-tensor FP8 row" below).
 
 - dense d128 half (the d64 envelope included) decode / verify WITH an attention sink, bottom-right
   causal ``1 <= s_q <= 16`` or mask-free ``s_q == 1``, GQA 4 / 8 / 16, ``b * h_kv >= 32`` units, caches
@@ -239,6 +239,21 @@ kernel follow-up -- an MXFP8 decode tile for cc 10.7, recorded in SUPPORT_MATRIX
 -- not a backend-relative placement rule. Devices other than exact cc 10.7 (10.8-11.9 are in the row's
 arch range) TRAIL until measured.
 
+SM107 per-tensor FP8 row (``sdpa_fwd_prefill_sm107_fp8``, offered by default since 2026-10-16): LEAD on exact
+cc 10.7 at exact d256 / d512, dense, E4M3, causal (top-left or bottom-right) or mask-free, Stats on or off; TRAIL
+for one KV tile with at most 8 Q tiles, for d128 / d192, and for every feature the A/B did not cover (THD, paged
+KV, padding mask, window, right band, sink, block-scaled O, fused gate, E5M2). Measured 2026-10-16 on a 216-SM
+cc 10.7 board, cuDNN 9.27.0.42 GA, ab.py (same graph, Amax_S virtual), CUDA-graph replay, two rounds with the
+arm order swapped, warm and cold L2; FROST time over backend time on the led graphs:
+  d256: 0.24-0.96 (75 cases), hold-out 0.16-0.84 (12); eager, S_kv < 1024: 0.45-0.96 (35)
+  d512: 0.13-0.81 (75 cases), hold-out 0.17-0.73 (13); eager, S_kv < 1024: 0.31-0.80 (35)
+  trailed, one KV tile with <= 8 Q tiles (13 cases): 0.82-0.98, except d512 b1 8/1 q32 kv128 mask-free 1.07-1.11
+  d128: squares 1.08-1.09 (median, tails to 1.58), chunks 0.82-0.87 (tails to 1.25); d192: 0.88-1.14, tails to 1.88
+  s_q == 1, mask-free, KV 8k / 128k: the backend builds no plan (NVRTC compile failure) at d128 / d192 / d256 / d512
+Mean regret against the faster provider on d256 / d512: 67-152 % (backend only) -> 0-1.3 %, no lead slower than
+1.03x warm or cold. The hold-out set was visible when the head-dim split was chosen; the KV-tile floor was fitted
+on the other sets.
+
 Rows with no measurement (SM80, SM100 mxfp8) keep the historical order (LEAD); they are still
 opt-in, so the order is only observable with ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``.
 """
@@ -337,6 +352,8 @@ FP8_MIN_KV_TOKENS = 1024  # below, a single-wave launch is host-bound: FROST's ~
 FP8_D192_MAX_Q_TILES = 64  # d192 chunks: 16-64 tiles win 0.34-0.90; 128 tiles lose 1.19-1.72
 FP8_D128_ANY_TILES_MAX_S_Q = 128  # d128 chunks with s_q <= 128 win at 64-512 tiles (0.21-0.68)
 FP8_SYNTH_KV_MIN_TILE_KV = 2**21  # S_kv off the KV tile, mask-free: Q tiles * s_kv from which FROST wins (0.41-0.89)
+SM107_FP8_TINY_MAX_KV = 128  # cc 10.7 FP8 d256 / d512: a single KV tile ...
+SM107_FP8_TINY_MAX_Q_TILES = 8  # ... and at most 8 Q tiles is launch-bound; the backend keeps it
 
 
 def _q_tiles(facts) -> int:
@@ -350,8 +367,9 @@ def place(spec, facts) -> str:
     their measured shard table. The SM107 half row leads for a selected native THD split,
     qualified packed paged prefill, the measured dense shards, or dense d128 decode / verify with an
     attention sink inside its measured band; the SM107 MXFP8 row leads on exact cc 10.7 for every graph it
-    admits (a qualification verdict, module docstring). Every unmeasured row (SM80, SM100 mxfp8, the
-    fp8 rows of SM107 / SM120, SM120 mxfp8) keeps the historical order -- those stay opt-in, so the order
+    admits (a qualification verdict, module docstring); the SM107 per-tensor FP8 row leads at d256 / d512 on exact
+    cc 10.7 (module docstring). Every unmeasured row (SM80, SM100 mxfp8, the
+    fp8 row of SM120, SM120 mxfp8) keeps the historical order -- those stay opt-in, so the order
     is only observable with the flag set, which ranks ours first anyway."""
     if spec.name == "sdpa_fwd_prefill_sm107":
         return _place_sm107_f16(spec.capabilities, facts)
@@ -365,6 +383,8 @@ def place(spec, facts) -> str:
         return _place_sm90_f16(spec.capabilities, facts)
     if spec.name == "sdpa_fwd_prefill_sm100_fp8":
         return _place_sm100_fp8(spec.capabilities, facts)
+    if spec.name == "sdpa_fwd_prefill_sm107_fp8":
+        return _place_sm107_fp8(spec.capabilities, facts)
     return LEAD
 
 
@@ -552,6 +572,28 @@ def _place_sm100_fp8(caps: Capabilities, facts) -> str:
     if flavor == (192, 128):
         return LEAD if tiles <= FP8_D192_MAX_Q_TILES else TRAIL
     return LEAD if tiles <= CHUNKED_MAX_Q_TILES or facts.s_q <= FP8_D128_ANY_TILES_MAX_S_Q else TRAIL
+
+
+def _place_sm107_fp8(caps: Capabilities, facts) -> str:
+    # Measured: exact cc 10.7, dense per-tensor E4M3, causal (TL / BR) or mask-free, Stats on or off.
+    if (
+        facts.device_cc != (10, 7)
+        or facts.thd
+        or facts.has_paged_kv
+        or facts.padded
+        or facts.window_left is not None
+        or facts.right_band_widening
+        or facts.has_sink
+        or facts.o_block_scale
+        or facts.has_epilogue_gate
+        or facts.dtype != cudnn.data_type.FP8_E4M3
+    ):
+        return TRAIL
+    if (facts.d_qk, facts.d_v) not in ((256, 256), (512, 512)):
+        return TRAIL  # d128 squares 1.08-1.09 (median), d192 0.88-1.14 with tails to 1.88
+    if facts.s_kv <= SM107_FP8_TINY_MAX_KV and _q_tiles(facts) <= SM107_FP8_TINY_MAX_Q_TILES:
+        return TRAIL  # one KV tile, <= 8 Q tiles: both ~7 us; d512 b1 8/1 q32 kv128 loses 1.07-1.12 (graph and eager)
+    return LEAD  # d256 0.16-0.96, d512 0.13-0.81 (module docstring); the backend does not build s_q == 1 here (NVRTC)
 
 
 def _place_sm90_f16(caps: Capabilities, facts) -> str:
