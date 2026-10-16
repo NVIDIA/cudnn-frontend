@@ -58,7 +58,7 @@ def _reorder_host(source, target, permutation, scatter: cutlass.Constexpr, strea
 def reorder(source, target, permutation, *, scatter):
     # Cache by geometry, never sparse data or pointer. The shared cache also
     # keys the active CUDA device/context; do not wrap this in an lru_cache.
-    key = f"bsa_grouped_reorder:{tuple(source.shape)}:{tuple(source.stride())}:{tuple(permutation.shape)}:{scatter}"
+    key = f"bsa_blk64_reorder:{tuple(source.shape)}:{tuple(source.stride())}:{tuple(permutation.shape)}:{scatter}"
     args = [from_dlpack(t.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic() for t in (source, target, permutation)]
     fn = compile_cached(
         _reorder_host,

@@ -29,10 +29,8 @@ from cudnn.torch.sdpa_provider import calls, install, served_plan_names  # noqa:
 _BSA_EXPORTS = (
     "block_sparse_attention_forward",
     "block_sparse_attention_backward",
+    "block_sparse_attention_blk64_prepare",
     "block_sparse_attention_fp8_forward",
-    "block_sparse_attention_grouped_prepare",
-    "block_sparse_attention_grouped_forward",
-    "block_sparse_attention_grouped_backward",
 )
 
 
