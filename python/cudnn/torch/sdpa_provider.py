@@ -18,7 +18,7 @@ outputs and routes grad through the (also overridden) aten backward, so vanilla
     with sdpa_kernel([SDPBackend.CUDNN_ATTENTION]):
         F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
-transparently runs on the Python API after ``install()``.
+transparently runs on the Python API after ``install_sdpa_overrides()``.
 
 Conveniently, aten's logsumexp convention for this op is (B, H, S, 1) float32
 (keepdim) — bit-identical in layout to cuDNN's Stats tensor, so tensors cross
@@ -271,29 +271,46 @@ def _varlen_bwd(grad_out, query, key, value, out, lse, cu_seq_q, cu_seq_k, max_q
 
 
 # ---------------------------------------------------------------------------
-# torch.nn.attention flash-impl registry integration (PyTorch 2.13+)
+# Installing the overrides
 #
-# The same mechanism FA3/FA4 use: activation registers python overrides of
-# existing CUDA kernels; restore drops the Library handles to deregister.
+# install_sdpa_overrides() is the entry point PyTorch calls from
+# torch.backends.cuda.enable_cudnn_sdp_python(True); it keeps the returned
+# handle and calls remove() on disable. Each call installs a fresh set of
+# Library registrations, so a handle owns exactly what it installed.
 #
-#     import cudnn.torch  # registers "CUDNN" (no activation)
+# On torch versions without that switch, importing this module instead
+# registers "CUDNN" in torch.nn.attention's flash-impl registry (the
+# mechanism FA3/FA4 use):
+#
+#     import cudnn.torch
 #     torch.nn.attention.activate_flash_attention_impl("CUDNN")
+#
+# Where the switch exists, registering there too would give two switches with
+# separate records of whether cuDNN is on, so the registry is left alone.
 # ---------------------------------------------------------------------------
 
 
-class _RegistryHandle:
+class SdpaOverrides:
+    """Handle to one installation of the overrides; ``remove()`` undoes it."""
+
     def __init__(self, *libs: torch.library.Library):
         self._libs = list(libs)
 
     def remove(self) -> None:
+        """Deregister the overrides. Calling it again is a no-op."""
         for lib in self._libs:
             lib._destroy()
         self._libs = []
 
 
-def _registry_register() -> _RegistryHandle:
-    import cudnn.sdpa.fwd.torch_op  # noqa: F401 — registers cudnn::sdpa_fwd / sdpa_bwd
+def install_sdpa_overrides() -> SdpaOverrides:
+    """Serve PyTorch's cuDNN SDPA ops from the cuDNN Python API.
 
+    Overrides the CUDA kernels of ``aten::_scaled_dot_product_cudnn_attention``
+    and its backward, and of ``torch_attn::_varlen_attn``,
+    ``_varlen_attn_out`` and ``_varlen_attn_backward``. Returns the handle that
+    removes them.
+    """
     lib = torch.library.Library("aten", "IMPL")
     lib.impl("_scaled_dot_product_cudnn_attention", _fwd, "CUDA")
     lib.impl("_scaled_dot_product_cudnn_attention_backward", _bwd, "CUDA")
@@ -303,15 +320,17 @@ def _registry_register() -> _RegistryHandle:
     vlib.impl("_varlen_attn", _varlen_fwd, "CUDA")
     vlib.impl("_varlen_attn_out", _varlen_fwd_out, "CUDA")
     vlib.impl("_varlen_attn_backward", _varlen_bwd, "CUDA")
-    return _RegistryHandle(lib, vlib)
+    return SdpaOverrides(lib, vlib)
 
 
 def _register_with_torch() -> None:
+    if hasattr(torch.backends.cuda, "enable_cudnn_sdp_python"):
+        return  # torch owns the switch; see above
     try:
         from torch.nn.attention import register_flash_attention_impl
     except ImportError:
-        return  # torch < 2.13: use install() directly
-    register_flash_attention_impl("CUDNN", register_fn=_registry_register)
+        return  # torch < 2.13: use install_sdpa_overrides() directly
+    register_flash_attention_impl("CUDNN", register_fn=install_sdpa_overrides)
 
 
 _register_with_torch()
