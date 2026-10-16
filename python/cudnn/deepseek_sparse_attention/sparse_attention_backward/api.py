@@ -239,7 +239,9 @@ class SparseAttentionBackward(APIBase):
         """Compile every artifact required by the selected prepared plan.
 
         Deterministic SM100 compilation uses only stored tensor metadata and
-        must complete before ``execute()`` or CUDA Graph capture.
+        must complete before ``execute()`` or CUDA Graph capture. The compiled
+        artifact belongs to the sample tensors' CUDA device; keep this plan
+        alive while a graph that launches it may replay.
         """
         self._ensure_support_checked()
         if self.q_cluster_mode == "adaptive_pair":
@@ -295,7 +297,14 @@ class SparseAttentionBackward(APIBase):
         self._compiled_kernel = True
 
     def scratch_workspace_bytes(self) -> int:
-        """Return reusable per-execution scratch for the selected backend."""
+        """Return the minimum reusable per-execution workspace in bytes.
+
+        Generic deterministic SM100 plans include a query-dependent 32-, 64-,
+        or 128-plane FP32 dKV accumulator; deterministic H128 two-CTA plans
+        retain their fixed 128-plane capacity. The returned size is
+        authoritative for this plan; ``execute()`` accepts a larger contiguous
+        uint8 buffer on the plan device but never allocates one.
+        """
         self._ensure_support_checked()
         major, _ = device_capability(self.q_desc.device)
         total_s_q, num_heads, head_dim = self.q_desc.shape
@@ -345,7 +354,9 @@ class SparseAttentionBackward(APIBase):
         H128/D576 two-CTA and deterministic SM100 routes additionally never
         compile here. Adaptive pairing makes its overlap decision on device
         and launches only stages compiled by ``compile()``, so replay needs no
-        host branch or D2H read.
+        host branch or D2H read. Deterministic and H128/D576 executions require
+        each runtime input's presence, shape, dtype, and device to match the
+        sample contract used to compile the plan.
         Inputs, outputs, and the live workspace must not overlap; concurrent
         executions need distinct output and workspace storage.
         """

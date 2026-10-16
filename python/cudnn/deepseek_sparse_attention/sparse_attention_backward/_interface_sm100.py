@@ -93,7 +93,14 @@ def flash_attn_bwd_sm100_workspace_size(
     *,
     backend: Optional[str] = None,
 ) -> int:
-    """Return reusable caller scratch, conservatively if the backend is unknown."""
+    """Return the reusable caller scratch required by one SM100 launch.
+
+    The generic deterministic M64 backend selects a 32-, 64-, or 128-plane
+    dKV layout from ``total_s_q``. H128 two-CTA and unspecified backends use
+    the conservative fixed 128-plane layout. The result includes alignment
+    padding and is the minimum byte count for a contiguous ``torch.uint8``
+    workspace; :func:`flash_attn_bwd_sm100` also accepts a larger buffer.
+    """
     workspace_lse_odo_shape, workspace_dkv_shape = _workspace_shapes_sm100(
         total_s_q,
         total_s_kv,
@@ -251,7 +258,13 @@ def _compile_deterministic_sm100(
     has_topk_length: bool,
     deterministic_shards: int,
 ):
-    """Compile one device-owned, shape-dynamic artifact from plan metadata."""
+    """Compile one device-owned, shape-dynamic artifact from plan metadata.
+
+    Query and KV extents remain symbolic, while dtype, head geometry, top-k
+    width, optional-length presence, and shard count are compile-time facts.
+    The returned launchable belongs to ``device_index``'s CUDA context and may
+    be reused only for plans with the same cached signature.
+    """
     gpu_arch = _SM100_FAMILY_ARCH_FLAGS.get(device_capability)
     if gpu_arch is None:
         raise ValueError(f"deterministic SM100 DSA backward requires an SM100-family device, got {device_capability}")
@@ -262,11 +275,9 @@ def _compile_deterministic_sm100(
         kernel_cls = _deterministic_kernel_class_for_shards(deterministic_shards)
     else:
         kernel_cls = _get_sm100_kernel_class(backend, True)
-        if kernel_cls.num_dkv_shards != deterministic_shards:
-            raise ValueError(
-                f"deterministic backend {backend!r} requires {kernel_cls.num_dkv_shards} "
-                f"workspace planes, got {deterministic_shards}"
-            )
+        required_shards = kernel_cls.num_dkv_shards
+        if required_shards != deterministic_shards:
+            raise ValueError(f"deterministic backend {backend!r} requires {required_shards} workspace planes, got {deterministic_shards}")
 
     element_dtype = torch2cute_dtype_map[dtype]
     total_s_q, total_s_kv = cute.sym_int(), cute.sym_int()
@@ -358,9 +369,16 @@ def flash_attn_bwd_sm100(
         dq: preallocated (total_S_q, nheads, headdim), same dtype as q
         dkv: preallocated (total_S_kv, headdim), same dtype as kv
         d_sink: preallocated (nheads,) float32
-        deterministic: use ordered bounded-wave scratch accumulation
+        deterministic: use ordered bounded-wave scratch accumulation; the
+            supported BF16 H128 envelopes retain their two-CTA kernels
+        current_stream: CUDA stream handle for all initialization, main, and
+            reduction launches; defaults to the current CUDA stream (the plan
+            API selects Q's device context before entering this function)
         workspace: reusable uint8 scratch sized by
             ``flash_attn_bwd_sm100_workspace_size``
+        _compiled_kernel: internal plan-owned launchable whose compile-time
+            metadata must match the runtime tensors; direct callers should
+            leave this unset to use the lazy compile cache
 
     Returns:
         (dq, dkv, d_sink) -- flat layout gradients

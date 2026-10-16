@@ -330,6 +330,7 @@ def test_DSA_sparse_attention_backward_deterministic_compile_cache_is_device_sco
 
     @contextmanager
     def device_context(device):
+        """Emulate a restoring CUDA device guard for the host-only cache test."""
         previous, current_device[0] = current_device[0], device
         try:
             yield
@@ -337,10 +338,14 @@ def test_DSA_sparse_attention_backward_deterministic_compile_cache_is_device_sco
             current_device[0] = previous
 
     class FakeKernel:
+        """Accept production kernel-constructor arguments without codegen."""
+
         def __init__(self, **kwargs):
+            """Construct a storage-free stand-in for a deterministic kernel."""
             pass
 
     def fake_compile(*args, **kwargs):
+        """Record the guarded device and return a unique launchable stand-in."""
         artifact = object()
         compiled.append((current_device[0], kwargs["options"], artifact))
         return artifact
@@ -355,6 +360,7 @@ def test_DSA_sparse_attention_backward_deterministic_compile_cache_is_device_sco
     monkeypatch.setattr(torch.cuda, "device", device_context)
 
     def build(device, capability=(10, 0)):
+        """Compile one representative signature for a device and capability."""
         return compile_artifact(device, capability, "generic_m64", torch.bfloat16, 512, 512, 64, 64, True, 32)
 
     try:
@@ -634,7 +640,10 @@ def test_DSA_sparse_attention_backward_sm100_d576_workspace_uses_compact_rows(nu
     assert flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads) == expected
 
     deterministic_dkv_bytes = 32 * padded_s_kv * head_dim * torch.float32.itemsize
-    assert flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True, backend="generic_m64") == lse_odo_bytes + deterministic_dkv_bytes
+    assert (
+        flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True, backend="generic_m64")
+        == lse_odo_bytes + deterministic_dkv_bytes
+    )
 
 
 @pytest.mark.L0
@@ -814,9 +823,7 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_adaptive_shards_repea
         pytest.param(128, 128, torch.bfloat16, "h128_2cta_m64", id="h128-two-cta-bf16"),
     ],
 )
-def test_DSA_sparse_attention_backward_sm100_deterministic_plan_is_cold_capture_safe(
-    monkeypatch, num_heads, topk, dtype, expected_backend
-):
+def test_DSA_sparse_attention_backward_sm100_deterministic_plan_is_cold_capture_safe(monkeypatch, num_heads, topk, dtype, expected_backend):
     """The first execute after plan compilation is capture-safe and JIT-free."""
     try:
         from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100 as interface
@@ -838,12 +845,14 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_plan_is_cold_capture_
     assert callable(plan._compiled_kernel)
 
     def forbidden_compile(*args, **kwargs):
+        """Fail if the first post-plan execute attempts CuTe compilation."""
         raise AssertionError("execute() attempted CuTe compilation")
 
     monkeypatch.setattr(interface.cute, "compile", forbidden_compile)
     dq, dkv, d_sink = outputs
 
     def run():
+        """Launch the prepared plan into its caller-owned outputs and scratch."""
         return plan.execute(
             *inputs,
             dq,
@@ -900,6 +909,7 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_artifact_is_shape_dyn
     first_info = compile_artifact.cache_info()
 
     def forbidden_compile(*args, **kwargs):
+        """Fail when a dynamic-extent cache hit unexpectedly recompiles."""
         raise AssertionError("shape-dynamic plan unexpectedly recompiled")
 
     monkeypatch.setattr(interface.cute, "compile", forbidden_compile)
