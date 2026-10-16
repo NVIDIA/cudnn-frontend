@@ -913,7 +913,10 @@ def test_DSA_sparse_attention_backward_sm100_plan_is_cold_capture_safe(
         graph.replay()
         torch.cuda.synchronize()
         for actual, expected in zip(captured, reference):
-            assert torch.equal(actual, expected)
+            if deterministic:
+                assert torch.equal(actual, expected)
+            else:
+                torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
         q, kv, out, dout, lse, attn_sink, topk_idxs = inputs
         check_ref_dsa_sparse_attention_backward(
             q,
