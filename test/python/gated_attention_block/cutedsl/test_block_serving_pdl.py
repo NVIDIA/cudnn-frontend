@@ -122,28 +122,40 @@ def test_the_prefill_route_keeps_the_switch_off_stage_four_and_reads_back_which_
     write-through, never to stage (4) (it launches plain and the link serializes: correct by PDL's semantics), and reads it back:
     ``pdl_stages`` names the two, ``use_pdl_effective`` is False, ``DecodeRoute.pdl_capable`` is False on that route and True on a
     decode-tile route, and the envelopes name the switched stage kinds per form before anything is declared."""
-    case = _Case(16, 5, (100,), seed=1, blk_kw=dict(use_pdl=True))
+    # 32 sequences x 2 KV heads = 64 CTAs: the prefill route's fill; 32 x 5 = 160 rows is past the small-M lowering's band (the fused
+    # declaration keeps its fork there), so the unfused chain -- the stages the switch reaches -- is the fuse_norm_rope=False declaration
+    case = _Case(16, 5, (100,) * 32, seed=1, blk_kw=dict(use_pdl=True, fuse_norm_rope=False))
     blk = case.blk
-    assert blk.use_pdl is True and blk.decode_route.prefill_tile and blk.decode_route.pdl_capable is False and blk._sdpa.thd
+    assert blk.use_pdl is True and blk.decode_route.prefill_tile and blk.decode_route.pdl_capable is False and blk._sdpa.thd and blk.decode_route.batch == 32
     assert blk._sdpa.use_pdl is False, "the switch never reaches a kernel without the sites"
     assert isinstance(blk._norm_rope, _QkNormRope) and blk._norm_rope.use_pdl is True and blk._cache_write.use_pdl is True and blk._gate is None
     assert _stage_names(case) == ["qkv_gate_proj", "qk_norm_rope", "cache_write", "sdpa", "out_proj"]
     assert blk.pdl_stages == ("qk_norm_rope", "cache_write") and blk.use_pdl_effective is False
-    plain = _Case(16, 5, (100,), seed=1)
+    plain = _Case(16, 5, (100,) * 32, seed=1, blk_kw=dict(fuse_norm_rope=False))
     assert plain.blk.pdl_stages == () and plain.blk.use_pdl_effective is False and _stage_names(plain) == _stage_names(case)
     # the stage's own rule and the record's fact agree: a decode-tile route takes the switch, the prefill route and no route do not
     geom = blk.geom
-    assert _Sdpa.pdl_capable(None) is False and _Sdpa.pdl_capable(decode_route(geom, 4)) is True and _Sdpa.pdl_capable(decode_route(geom, 5)) is False
-    assert decode_route(geom, 4).pdl_capable is True and decode_route(geom, 5).pdl_capable is False and decode_route(geom, 33).pdl_capable is False
+    assert _Sdpa.pdl_capable(None) is False and _Sdpa.pdl_capable(decode_route(geom, 4)) is True and _Sdpa.pdl_capable(decode_route(geom, 5, batch=32)) is False
+    assert decode_route(geom, 4).pdl_capable is True and decode_route(geom, 5, batch=32).pdl_capable is False and decode_route(geom, 33).pdl_capable is False
+    assert (
+        decode_route(geom, 5).pdl_capable is True and decode_route(geom, 5, batch=4).decode_tile
+    ), "below the fill the step rides the decode tile: the switch reaches stage (4)"
     # the envelopes: the switched stage KINDS per form (stage (4) on a decode-tile route only), the route's own flag per S_q
     env = GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, _DEV)
     assert env.decode.pdl_stages == DECODE_PDL_STAGES == ("qk_norm_rope", "cache_write", "sigmoid_gate", "sdpa")
     assert env.extend.pdl_stages == EXTEND_PDL_STAGES == ("qk_norm_rope", "cache_write", "sigmoid_gate")
-    assert all(r.pdl_capable is r.decode_tile for r in env.decode.routes) and env.decode.route(5).pdl_capable is False and env.decode.route(4).pdl_capable
-    # the token-unit policy takes the same step on the decode tile, where the switch reaches stage (4)
-    tu = _Case(16, 5, (100,), seed=1, blk_kw=dict(use_pdl=True, decode_route_policy="token_units"))
-    assert tu.blk.decode_route.decode_tile and tu.blk.decode_route.pdl_capable and tu.blk._sdpa.use_pdl is True and tu.blk.use_pdl_effective is True
-    assert tu.blk.pdl_stages == ("qk_norm_rope", "cache_write", "sdpa")
+    assert (
+        all(r.pdl_capable is r.decode_tile for r in env.decode.routes)
+        and env.decode.route(5, batch=32).pdl_capable is False
+        and env.decode.route(4).pdl_capable
+    )
+    assert env.decode.route(5).pdl_capable is True
+    # the token-unit policy takes the same step on the decode tile at any batch, where the switch reaches stage (4); so does the default
+    # policy below the fill
+    for extra in (dict(decode_route_policy="token_units"), dict()):
+        tu = _Case(16, 5, (100,), seed=1, blk_kw=dict(use_pdl=True, **extra))
+        assert tu.blk.decode_route.decode_tile and tu.blk.decode_route.pdl_capable and tu.blk._sdpa.use_pdl is True and tu.blk.use_pdl_effective is True
+        assert tu.blk.pdl_stages == ("qk_norm_rope", "cache_write", "sdpa"), extra
 
 
 # -- the Rubin cells: bitwise with and without the switch ----------------------------------------------------------------------
@@ -261,9 +273,12 @@ def test_the_prefill_route_step_is_bitwise_with_the_switch_and_its_first_execute
     stages; a stage FORCED to carry the switch onto the prefill tile is the adapter's typed decline at compile (the block never does
     it); and the FIRST execute of a fresh switched declaration captured on a new stream under ``set_sync_debug_mode("error")`` replays
     BITWISE the eager plain chain, stable over repeated replays."""
-    off = _case(16, 5, pdl=False)
-    on = _case(16, 5, pdl=True)
+    # 32 sequences x 2 KV heads = 64 CTAs: the prefill route's fill; 160 rows is past the small-M lowering's band (the fused declaration
+    # keeps its fork there), so the unfused chain -- the two switched stages before stage (4) -- is the fuse_norm_rope=False declaration
+    off = _case(16, 5, _LENS * 8, pdl=False, fuse_norm_rope=False)
+    on = _case(16, 5, _LENS * 8, pdl=True, fuse_norm_rope=False)
     assert on.route_readback() == off.route_readback() and on.route_readback()["template"] == PREFILL_TILE, on.route_readback()
+    assert on.blk.decode_route.prefill_tile and on.blk.decode_route.batch == 32
     assert on.blk.pdl_stages == ("qk_norm_rope", "cache_write") and on.blk.use_pdl_effective is False and off.blk.pdl_stages == ()
     assert on.blk._sdpa.use_pdl is False and _stage_names(on) == _stage_names(off)
     a = off.run().clone()

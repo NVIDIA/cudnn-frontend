@@ -392,6 +392,7 @@ cudnn.gated_attention_block.DECODE_CLAIMED_MAX_N_Q
 cudnn.gated_attention_block.DECODE_CLAIMED_MAX_S_Q
 cudnn.gated_attention_block.DECODE_MAX_ROWS
 cudnn.gated_attention_block.DECODE_MAX_S_Q
+cudnn.gated_attention_block.DECODE_PREFILL_ROUTE_MIN_CTAS
 cudnn.gated_attention_block.DECODE_PREFILL_TILE_ROWS
 cudnn.gated_attention_block.DECODE_ROUTE_POLICIES
 cudnn.gated_attention_block.DECODE_ROUTE_SINGLE_UNIT
@@ -407,6 +408,7 @@ cudnn.gated_attention_block.DecodeEnvelope.route
 cudnn.gated_attention_block.DecodeEnvelope.sparse_core
 cudnn.gated_attention_block.DecodeEnvelope.writes_lse
 cudnn.gated_attention_block.DecodeRoute
+cudnn.gated_attention_block.DecodeRoute.batch
 cudnn.gated_attention_block.DecodeRoute.decode_tile
 cudnn.gated_attention_block.DecodeRoute.kv_streams
 cudnn.gated_attention_block.DecodeRoute.pdl_capable

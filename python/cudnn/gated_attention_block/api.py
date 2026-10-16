@@ -580,6 +580,16 @@ DECODE_PREFILL_TILE_ROWS = 128
 tests): the bound of the DECODE form's prefill route (one Q tile per sequence and KV head, the KV streamed once).  Past it a step rides
 the decode tile's token-unit arm or its unpacked arm (:func:`decode_route`) -- never a decline by itself."""
 
+DECODE_PREFILL_ROUTE_MIN_CTAS = 64
+"""The fill the DECODE form's prefill route needs before the default policy takes it: ``batch x H_kv`` CTAs.  The paged d256 prefill
+tile runs ONE unsplit CTA per (sequence, KV head), so a step of fewer CTAs than this leaves most of the part idle while the decode
+tile's token-unit arm (two units of the 64-column tile, split over the part by the decode split model) streams the same KV twice but
+fills it -- measured on the Rubin performance class (212 SMs) at 32 / 2, ``S_q = 8``, kv 32K: at B 1 the prefill route's step took
+330.6 us against the two-unit route's 58.7; at B 32 (64 CTAs) the prefill route's 389.9 beat the two-unit route's 472.6.  So below
+this fill the default policy rides the two-unit arm wherever it holds the step (:func:`decode_route`), the prefill tile at or above
+it (and wherever no two-unit route holds the step, whatever the batch).  ``decode_route(batch=)`` / ``DecodeRoute.batch`` read the
+batch the route was decided at; without a batch (the envelope's ``routes``) the route is the small-batch one."""
+
 DECODE_TILE = "decode_d256_f16"
 """``kernel_template`` of the Rubin d256 decode tile (``sdpa/fwd/kernels/sm107/decode_d256_f16.py``: the swap-AB tile)."""
 
@@ -588,9 +598,11 @@ PREFILL_TILE = "prefill_d256_f16"
 (``sdpa/fwd/kernels/sm100/prefill_d256_f16.py``) on its paged THD arm with PackGQA -- the EXTEND form's kernel."""
 
 DECODE_ROUTE_SINGLE_UNIT = "single_unit"
-"""The default route policy: one KV stream per sequence and KV head wherever a kernel offers it -- the decode tile in ONE token unit
-(``config_sm107.D256_DECODE_SINGLE_UNIT_Q_TILES``), else the paged prefill tile with the group packed (a group dividing its 128 rows);
-a group the prefill tile cannot pack keeps the token-unit arm (two streams) and the unpacked arm, the fewest streams available to it."""
+"""The default route policy: one KV stream per sequence and KV head wherever a kernel offers it AND the step fills the part -- the
+decode tile in ONE token unit (``config_sm107.D256_DECODE_SINGLE_UNIT_Q_TILES``), else the paged prefill tile with the group packed (a
+group dividing its 128 rows) where the step fills :data:`DECODE_PREFILL_ROUTE_MIN_CTAS` CTAs or no two-unit decode route holds it;
+below that fill, and for a group the prefill tile cannot pack, the token-unit arm (two streams, split over the part) and the unpacked
+arm past it -- the fewest streams available to a step that keeps the part busy."""
 
 DECODE_ROUTE_TOKEN_UNITS = "token_units"
 """The SDPA adapter's own route, verbatim (``config_sm107.decode_d256_q_tile``): the widest decode tile in up to two TOKEN UNITS for a
@@ -651,6 +663,12 @@ class DecodeRoute:
     # on this route -- the decode tile and its split combine carry the griddepcontrol pair (True); the paged d256 prefill tile does not
     # (False: the block launches it plain and the link serializes, correct by PDL's semantics).  ``_Sdpa.pdl_capable`` is the same rule.
     pdl_capable: bool = False
+    # APPENDED (2026-10-16): the batch the route was decided at (``decode_route(batch=)``: the block passes its declared batch, the
+    # envelope's ``routes`` none) -- the prefill route needs the step to fill the part, ``batch x H_kv >= DECODE_PREFILL_ROUTE_MIN_CTAS``,
+    # so a step past the single-unit table rides two token units of the decode tile below that fill and the paged prefill tile at or
+    # above it; ``None`` = no batch given, the small-batch reading.  A readback, not part of the route's identity (``compare=False``):
+    # two records of one route read at different batches are equal when they name the same kernel.
+    batch: Optional[int] = dataclasses.field(default=None, compare=False)
 
     @property
     def decode_tile(self) -> bool:
@@ -678,9 +696,12 @@ def _resolve_decode_q_tile_max(max_q_tile: Optional[int]) -> Optional[int]:
     return int(max_q_tile)
 
 
-def decode_route(geometry: "GatedAttentionBlockGeometry", s_q: int, policy: Optional[str] = None, max_q_tile: Optional[int] = None) -> DecodeRoute:
+def decode_route(
+    geometry: "GatedAttentionBlockGeometry", s_q: int, policy: Optional[str] = None, max_q_tile: Optional[int] = None, batch: Optional[int] = None
+) -> DecodeRoute:
     """The DECODE route of ``s_q`` tokens at ``geometry`` under ``policy`` (``None`` = :data:`DEFAULT_DECODE_ROUTE_POLICY`), read
-    here so the block, the envelope and the tests name the kernel BEFORE anything compiles.
+    here so the block, the envelope and the tests name the kernel BEFORE anything compiles; ``batch`` (appended) the step's sequences,
+    which the default policy's prefill route needs to fill the part (``None`` = no batch given: the small-batch reading).
 
     The SERVED envelope first: ``1 <= s_q <= DECODE_MAX_S_Q`` (32 tokens per sequence: the unpacked arm's widest step), else NOT served
     (``tile`` None, ``reason`` set: a longer dense step over the pools is the EXTEND form's packed business); a head dim other than 256
@@ -694,11 +715,15 @@ def decode_route(geometry: "GatedAttentionBlockGeometry", s_q: int, policy: Opti
       64-column tile, 36 .. 64 rows); past the table the step rides the paged d256 PREFILL tile with the whole group packed -- one Q
       tile per (sequence, KV head), the KV streamed once -- wherever that body packs the group within its tile
       (``pack_gqa_group_size(group, DECODE_PREFILL_TILE_ROWS)``: a group dividing its 128 rows, ``s_q x group <= 128``; the cc 10.7
-      paged THD leg takes whole-group PackGQA only); a group it cannot pack (12 = 24 / 2, 6 = 24 / 4), or a step past its 128 rows,
-      keeps the adapter's token-unit arm (up to two units of the widest width: two streams -- 24/2 at ``S_q`` 6 .. 10 = two units of
-      the 64-column tile) and the UNPACKED arm past it (one head per CTA, ``S_q`` rows on the 16- or 32-column tile: ``group`` streams
-      -- 32 / 2 from ``S_q`` 9, the arm every group had before the table landed) -- the fewest streams any kernel offers it today,
-      never more than the ``"token_units"`` route's.
+      paged THD leg takes whole-group PackGQA only) AND the step fills the part: that tile is one UNSPLIT CTA per (sequence, KV head),
+      so it needs ``batch x H_kv >= DECODE_PREFILL_ROUTE_MIN_CTAS`` (64) CTAs -- measured at 32 / 2, ``S_q = 8``, kv 32K on the Rubin
+      performance class: 330.6 us at B 1 against 58.7 on two 64-column units, 389.9 at B 32 against the two units' 472.6 -- or no
+      two-unit decode route to hold the step; below the fill, and for a group it cannot pack (12 = 24 / 2, 6 = 24 / 4) or a step past
+      its 128 rows, the step keeps the adapter's token-unit arm (up to two units of the widest width: two streams, split over the part
+      by the decode split model -- 24/2 at ``S_q`` 6 .. 10 and 32/2 at ``S_q`` 5 .. 8 = two units of the 64-column tile) and the
+      UNPACKED arm past it (one head per CTA, ``S_q`` rows on the 16- or 32-column tile: ``group`` streams -- 32 / 2 from ``S_q`` 9,
+      the arm every group had before the table landed) -- the fewest streams any kernel offers a step that keeps the part busy, never
+      more than the ``"token_units"`` route's.
     * ``"token_units"``: the adapter's own route verbatim (``config_sm107.decode_d256_q_tile``: the single-unit table, then the widest
       width in up to two token units for a packed group), then the unpacked arm -- the A/B's other arm.
 
@@ -711,6 +736,10 @@ def decode_route(geometry: "GatedAttentionBlockGeometry", s_q: int, policy: Opti
 
     policy = _resolve_decode_route_policy(policy)
     cap = _resolve_decode_q_tile_max(max_q_tile)
+    if batch is not None:
+        if isinstance(batch, bool) or not isinstance(batch, int) or batch < 1:
+            raise ValueError(f"decode_route: batch must be >= 1 (the step's sequences) or None (no batch: the small-batch reading), got {batch!r}")
+        batch = int(batch)
     g = int(geometry.h_q) // int(geometry.h_kv)
     s_q = int(s_q)
     rows = s_q * g
@@ -732,6 +761,7 @@ def decode_route(geometry: "GatedAttentionBlockGeometry", s_q: int, policy: Opti
             policy=policy,
             q_tile_max=cap,
             pdl_capable=(tile == DECODE_TILE),
+            batch=batch,
         )
 
     if int(geometry.d_head) != 256:
@@ -750,8 +780,12 @@ def decode_route(geometry: "GatedAttentionBlockGeometry", s_q: int, policy: Opti
     if n_q:
         return route(DECODE_TILE, n_q, 1, True, 1)
     if policy == DECODE_ROUTE_SINGLE_UNIT and rows <= DECODE_PREFILL_TILE_ROWS and pack_gqa_group_size(g, DECODE_PREFILL_TILE_ROWS) == g:
-        # past the table: the paged prefill tile with the whole group packed (one Q tile per sequence and KV head; rows <= 128)
-        return route(PREFILL_TILE, 0, 0, True, 1)
+        # past the table: the paged prefill tile with the whole group packed (one Q tile per sequence and KV head; rows <= 128) -- ONE
+        # unsplit CTA per (sequence, KV head), so only where the step fills the part (DECODE_PREFILL_ROUTE_MIN_CTAS CTAs) or where no
+        # two-unit decode route holds it; below the fill the token-unit arm streams the KV twice but splits it over the part
+        filled = batch is not None and batch * int(geometry.h_kv) >= DECODE_PREFILL_ROUTE_MIN_CTAS
+        if filled or not decode_d256_q_tile(s_q, g, **form):
+            return route(PREFILL_TILE, 0, 0, True, 1)
     # the adapter's token-unit arm (the widest width in up to two units), then its unpacked arm (one head per CTA, one unit: the
     # fallback every group had before the table landed, up to 32 tokens)
     n_q = decode_d256_q_tile(s_q, g, **form)
@@ -874,10 +908,12 @@ class DecodeEnvelope:
     inference_only: bool = True
     writes_lse: bool = False
 
-    def route(self, s_q: int) -> DecodeRoute:
+    def route(self, s_q: int, batch: Optional[int] = None) -> DecodeRoute:
         """The route of an ``s_q``-token step at this geometry under this record's ``policy`` (any ``s_q >= 1``; ``routes`` holds
-        1 .. ``max_s_q`` + 1) -- the DENSE form's rule; under ``sparse_core`` the step runs the sparse core whatever this says."""
-        return decode_route(self._geometry, s_q, policy=self.policy or None, max_q_tile=self.q_tile_max)
+        1 .. ``max_s_q`` + 1) -- the DENSE form's rule; under ``sparse_core`` the step runs the sparse core whatever this says.
+        ``batch`` (appended) is the step's sequences: the default policy's prefill route needs the step to fill the part
+        (``DECODE_PREFILL_ROUTE_MIN_CTAS``), and ``routes`` is the reading without one (the small-batch route)."""
+        return decode_route(self._geometry, s_q, policy=self.policy or None, max_q_tile=self.q_tile_max, batch=batch)
 
     _geometry: Optional["GatedAttentionBlockGeometry"] = None
     sparse_core: bool = False  # appended: stage (4) is the index-list sparse core over the pools (a QsaSpec geometry)
@@ -4319,7 +4355,7 @@ class _Sdpa(_Stage):
                     raise ValueError(f"{self.name}: decode_split_kv must be >= 1, got {decode_split_kv}")
                 self.seq_lens_present = True  # the per-sequence KV lengths are mandatory over pools (the adapter's paged contract)
                 if self.decode_route is None:
-                    self.decode_route = decode_route(geometry, self.seq_len)
+                    self.decode_route = decode_route(geometry, self.seq_len, batch=self.batch)
                 if not self.decode_route.served:
                     raise NotImplementedError(f"{self.name}: {self.decode_route.reason}")
                 if self.decode_route.prefill_tile:
@@ -7828,7 +7864,7 @@ class GatedAttentionBlockFwd(APIBase):
                         "split has an empty chunk (a dead work item) on every item -- pass a split in [1, that count], or None for the fill rule"
                     )
             return kv_source, token_capacity, None, int(max_kv_len), split
-        route = decode_route(g, self.seq_len, policy=self.decode_route_policy, max_q_tile=self.decode_q_tile_max)
+        route = decode_route(g, self.seq_len, policy=self.decode_route_policy, max_q_tile=self.decode_q_tile_max, batch=self.batch)
         if not route.served:
             raise NotImplementedError(f"kv_source='paged': {route.reason}")
         if route.prefill_tile and decode_split_kv is not None and int(decode_split_kv) > 1:
