@@ -295,7 +295,7 @@ def build_fprop_graph(
         name="gdp",
     )
     if state_checkpoints_t is not None:
-        state_checkpoints_t.set_data_type(cudnn.data_type.FLOAT if (checkpoint_dtype == torch.float32 or checkpoint > CHECKPOINT_CHUNK) else io_dtype)
+        state_checkpoints_t.set_data_type(cudnn.data_type.FLOAT if checkpoint_dtype == torch.float32 else io_dtype)
     return graph, dict(
         q=q_t,
         k=k_t,
@@ -424,10 +424,10 @@ def run_gdp_fwd(
     state0 = initial_state if initial_state is not None else None
     state_out_dtype = state0.dtype if state0 is not None else torch.float32
     checkpoint = int(checkpoint_every_n_tokens)
-    if checkpoint_dtype not in (None, torch.float32, q.dtype) or (checkpoint_dtype == q.dtype and checkpoint > CHECKPOINT_CHUNK):
-        raise ValueError(
-            f"gated_delta_product: checkpoint_dtype must be None, torch.float32 or the io dtype at the chunk cadence ({CHECKPOINT_CHUNK}), got {checkpoint_dtype} at {checkpoint}"
-        )
+    if checkpoint_dtype not in (None, torch.float32, q.dtype):
+        raise ValueError(f"gated_delta_product: checkpoint_dtype must be None, torch.float32 or the io dtype ({q.dtype}), got {checkpoint_dtype}")
+    if checkpoint_dtype is None:
+        checkpoint_dtype = q.dtype
 
     from ..frost.common.host import family_slots
 
@@ -532,9 +532,7 @@ def run_gdp_fwd(
     state_checkpoints = torch.empty(0, dtype=q.dtype, device=device)
     if checkpoint > 0:
         total_checkpoints = max(total * n // checkpoint + N, 1)
-        state_checkpoints = torch.empty(
-            total_checkpoints, HO, V, K, dtype=torch.float32 if (checkpoint_dtype == torch.float32 or checkpoint > CHECKPOINT_CHUNK) else q.dtype, device=device
-        )
+        state_checkpoints = torch.empty(total_checkpoints, HO, V, K, dtype=checkpoint_dtype, device=device)
         variant_pack[t["state_checkpoints"]] = state_checkpoints
     workspace, handle = make_execution_resources(graph, device)
     execute_graph(graph, variant_pack, workspace, handle)
@@ -699,7 +697,7 @@ def gdp_fwd_fake(
             HO,
             V,
             K,
-            dtype=torch.float32 if (checkpoint_dtype == torch.float32 or int(checkpoint_every_n_tokens) > CHECKPOINT_CHUNK) else q.dtype,
+            dtype=torch.float32 if checkpoint_dtype == torch.float32 else q.dtype,
         )
     else:
         state_checkpoints = q.new_empty(0)
@@ -1357,9 +1355,8 @@ def gated_delta_product(
             positive multiple of the kernel chunk size, 64. ``64`` lets the
             backward reuse the series; a multiple of ``lcm(64, n)`` puts every
             checkpoint on a real-token boundary.
-        checkpoint_dtype: ``None`` keeps the default (io-dtype rows at the chunk cadence, fp32 past it); ``torch.float32`` stores fp32 rows at
-            any cadence (the backward then
-            regenerates the dense series from them, as it does past the chunk cadence).
+        checkpoint_dtype: ``None`` stores io-dtype rows; ``torch.float32`` stores fp32 rows (the backward reuses io rows at the
+            chunk cadence and regenerates the dense series from any other rows).
         overwrite_initial_state: if ``True``, ``final_state`` is written
             into the ``initial_state`` buffer, which is required and
             returned as the final state; the engine runs the chain or the

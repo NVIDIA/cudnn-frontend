@@ -61,7 +61,7 @@ class Gdn2FrostEngine(BaseEngine):
         if facts.gate_channels != facts.d_qk:
             raise NotImplementedError(f"Gdn2FrostEngine: g must carry d_qk = {facts.d_qk} channels, got {facts.gate_channels}")
         checkpoint = facts.checkpoint_every_n_tokens
-        checkpoint_dtypes = (cudnn.data_type.FLOAT,) if checkpoint > 16 else (cudnn.data_type.FLOAT, facts.io_dtype)
+        checkpoint_dtypes = (cudnn.data_type.FLOAT, facts.io_dtype)
         if checkpoint and checkpoint % 16 != 0:
             raise NotImplementedError(f"Gdn2FrostEngine: checkpoint_every_n_tokens must be a positive multiple of 16 (got {checkpoint})")
         if not facts.gates_at_ho:
@@ -106,11 +106,11 @@ class Gdn2FrostEngine(BaseEngine):
                     raise NotImplementedError(f"Gdn2FrostEngine: '{port}' must match the io dtype, got {got}")
             if facts.io_dtype is not None and facts.state_checkpoints_dtype not in checkpoint_dtypes + (None,):
                 raise NotImplementedError(
-                    f"Gdn2FrostEngine: 'state_checkpoints' must be {' or '.join(str(w) for w in checkpoint_dtypes)} at checkpoint_every_n_tokens {checkpoint}"
+                    f"Gdn2FrostEngine: 'state_checkpoints' must be {' or '.join(str(w) for w in checkpoint_dtypes)}, got {facts.state_checkpoints_dtype}"
                 )
         elif facts.io_dtype is not None and facts.state_checkpoints_out_dtype not in checkpoint_dtypes + (None,):
             raise NotImplementedError(
-                f"Gdn2FrostEngine: 'state_checkpoints' must be {' or '.join(str(w) for w in checkpoint_dtypes)} at checkpoint_every_n_tokens {checkpoint}"
+                f"Gdn2FrostEngine: 'state_checkpoints' must be {' or '.join(str(w) for w in checkpoint_dtypes)}, got {facts.state_checkpoints_out_dtype}"
             )
         if not facts.state_pair_match:
             raise NotImplementedError("Gdn2FrostEngine: initial_state and final_state dtypes must match")

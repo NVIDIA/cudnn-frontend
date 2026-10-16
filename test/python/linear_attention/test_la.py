@@ -1580,7 +1580,7 @@ def test_checkpoints_match_prefix_final_states(backend, variant):
     _, _, state_checkpoints = run_fwd(backend, case, output_final_state=True, checkpoint_every_n_tokens=ckpt * case.n)
     valid = (T - 1) // ckpt + 1
     assert state_checkpoints.shape == (T // ckpt + 1, case.HO, case.V, case.K)
-    assert state_checkpoints.dtype == (torch.float32 if variant != "mamba2" and ckpt * case.n > CHUNK[variant] else case.dtype)
+    assert state_checkpoints.dtype == case.dtype
     # row 0 is the incoming state, zero here since no initial_state was passed
     assert not state_checkpoints[0].any(), "row 0 must be the (zero) incoming state"
     for j in sorted({1, valid - 1}):
@@ -1665,18 +1665,26 @@ def test_checkpoints_varlen_tight_capacity(backend, variant, recipe):
         assert torch.equal(bits(gr), bits(gc)), "checkpoint-reuse grads differ from the recompute path"
 
 
+@pytest.mark.parametrize("rows", ["fp32", "io"])
 @pytest.mark.parametrize("ckpt_mult", [2, 3])
 @pytest.mark.parametrize("K,V", [(64, 128), (128, 128), (128, 64)])
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_checkpoints_coarse_cadence(backend, variant, K, V, ckpt_mult):
-    """Coarser cadences (multiples of the base chunk) keep the prefix contract; the d_v 64 case covers the paired-element row path."""
+def test_checkpoints_coarse_cadence(backend, variant, K, V, ckpt_mult, rows):
+    """Coarser cadences (multiples of the base chunk) keep the prefix contract in io-dtype rows (the default) and in fp32
+    rows (``checkpoint_dtype``), which the io rows round from bitwise; the d_v 64 case covers the paired-element row path."""
+    if rows == "fp32" and variant == "mamba2":
+        pytest.skip("mamba2 has no fp32 rows")
     ckpt = CHUNK[variant] * ckpt_mult
     T = 5 * ckpt
     case = make_case(variant, torch.bfloat16, T=T, K=K, V=DEFAULT_V.get(variant, V))
-    o, fs, state_checkpoints = run_fwd(backend, case, output_final_state=True, checkpoint_every_n_tokens=ckpt * case.n)
+    row_dtype = dict(checkpoint_dtype=torch.float32) if rows == "fp32" else {}
+    o, fs, state_checkpoints = run_fwd(backend, case, output_final_state=True, checkpoint_every_n_tokens=ckpt * case.n, **row_dtype)
     valid = (T - 1) // ckpt + 1
     assert state_checkpoints.shape == (T // ckpt + 1, case.HO, case.V, case.K)
-    assert state_checkpoints.dtype == (case.dtype if variant == "mamba2" else torch.float32)
+    assert state_checkpoints.dtype == (torch.float32 if rows == "fp32" else case.dtype)
+    if rows == "fp32":
+        _, _, io_rows = run_fwd(backend, case, output_final_state=True, checkpoint_every_n_tokens=ckpt * case.n)
+        assert torch.equal(bits(io_rows[:valid]), bits(state_checkpoints[:valid].to(case.dtype))), "io rows do not round from the fp32 rows"
     assert not state_checkpoints[0].any(), "row 0 must be the (zero) incoming state"
     for j in sorted({1, valid - 1}):
         n = j * ckpt
@@ -2708,24 +2716,29 @@ def test_bwd_checkpoint_reuse(backend, variant, K):
 
 
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("rows", ["fp32", "io"])
 @pytest.mark.parametrize("K,ckpt_mult", [(128, 2), (128, 3), (64, 2)])
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_bwd_coarse_checkpoint_seeded_recompute(backend, variant, ckpt_mult, K):
+def test_bwd_coarse_checkpoint_seeded_recompute(backend, variant, ckpt_mult, K, rows):
     """With a coarse checkpoint cadence the backward reconstructs the dense series by recompute started from the coarse
-    rows; the grads match the recompute path from a zero initial state bitwise from fp32 rows, both arms batch-invariant."""
+    rows: from io-dtype rows (the default) the grads track the recompute path from a zero initial state within 2e-3, from
+    fp32 rows (``checkpoint_dtype``) they match it bitwise; both arms batch-invariant."""
+    if rows == "fp32" and variant == "mamba2":
+        pytest.skip("mamba2 has no fp32 rows")
     case = make_case(variant, torch.bfloat16, seq_lens=[497, 16, 1, 480, 0, 253], K=K)
+    row_dtype = dict(checkpoint_dtype=torch.float32) if rows == "fp32" else {}
     grads_by_mode = []
     for ckpt in (0, CHUNK[variant] * ckpt_mult):
         args = thd_tensors(case)
         leaves = [args[0].requires_grad_(True), args[1].requires_grad_(True)]
         with waive_unsupported(backend, variant):
-            out = pinned_op(backend, variant)(*args, *op_tail(case), checkpoint_every_n_tokens=ckpt * case.n, batch_invariant=True)
+            out = pinned_op(backend, variant)(*args, *op_tail(case), checkpoint_every_n_tokens=ckpt * case.n, batch_invariant=True, **row_dtype)
             o = out[0]
             set_seed(SEED + 5)
             dO = torch.randn_like(o)
             grads_by_mode.append(torch.autograd.grad([o], leaves, [dO]))
     for name, gr, gc in zip(("dq", "dk"), grads_by_mode[0], grads_by_mode[1]):
-        if variant == "mamba2":
+        if rows == "io":
             assert torch.isfinite(gc.float()).all(), f"coarse-checkpoint {name} is not finite"
             assert_rms_close(f"coarse-checkpoint {name}", gc, gr, 2e-3)
         else:
@@ -2757,8 +2770,6 @@ def test_fp32_checkpoints_at_chunk_cadence(backend, variant, K):
     assert torch.equal(bits(rows[0][:valid]), bits(rows[1][:valid].to(case.dtype))), "fp32 rows do not round to the io-dtype rows"
     for name, gr, gc in zip(("dq", "dk"), grads_by_mode[0], grads_by_mode[1]):
         assert torch.equal(bits(gr), bits(gc)), f"fp32-row {name} differs from the io-row path"
-    with pytest.raises(ValueError):
-        pinned_op(backend, variant)(*thd_tensors(case), *op_tail(case), checkpoint_every_n_tokens=2 * CHUNK[variant] * case.n, checkpoint_dtype=case.dtype)
 
 
 @pytest.mark.parametrize("backend", ["cutile"], indirect=True)
