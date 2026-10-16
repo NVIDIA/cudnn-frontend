@@ -618,9 +618,10 @@ DECODE_COMBINE_LEAN_ROWS_PER_BLOCK = 4
 # grid, ceil(S_q / 4) x H_q x B blocks, holds at most this many blocks: fewer
 # blocks than SMs on every SM100-line part (148 .. 212), i.e. a launch the lean
 # kernel could not fill one wave with (B 1 x 24 Q heads = 24 blocks; B 4 x 24 =
-# 96; B 4 x 32 = 128), where nothing hides a serial walk; a prefill grid
-# (thousands of blocks) and a large-batch decode keep the module's own forms by
-# construction.  The constant is GEOMETRY, not a fit: both kernels move the same
+# 96; B 4 x 32 = 128), where nothing hides a serial walk; the decode-grid kernel
+# never serves a prefill grid (thousands of blocks) or a large-batch decode: on
+# cc 10.7 those take the lean group walk up to its split bound (below), else the
+# module's own forms.  The constant is GEOMETRY, not a fit: both kernels move the same
 # bytes and the decode-grid kernel is never the longer chain, so the threshold
 # only bounds which launches change at all.  :func:`decode_combine_grid_selected`
 # is the rule's host reading, the one the split model prices a launch's combine

@@ -2120,10 +2120,13 @@ def _launch_combine(
     drops the grid bound; ``DECODE_GRID_OFF`` never launches it;
     ``DECODE_GRID_LEAN_WALK`` (appended) launches the LEAN GROUP WALK
     (``_combine_lean_walk_kernel``) when the launch is a sink-free fp32-partial
-    one whose lean geometry holds (quantized or not) and never the decode-grid
-    kernel.  Every other launch -- a sink, an amax or an output scale, half
-    partials, an unaligned slab, a grid past the bound, or OFF -- takes the
-    module's own three-way rule (``_launch_own_forms``)."""
+    one whose lean geometry holds -- an amax or an output scale included (the
+    kernel's own arms; ``compile_ptr``'s quantized entries name no form, so only
+    a direct call reaches them) -- and never the decode-grid kernel.  Every
+    other launch takes the module's own three-way rule (``_launch_own_forms``):
+    under AUTO / ON / OFF a sink, an amax or an output scale, half partials, an
+    unaligned slab, a grid past the bound (AUTO) or OFF itself; under LEAN_WALK
+    a sink, half partials or an unaligned slab."""
     B, H, SQ, D = problem_size
     if cutlass.const_expr(decode_grid == DECODE_GRID_LEAN_WALK and o_partial.element_type == cutlass.Float32 and sinks is None and q_lens is None):
         # The LEAN GROUP WALK entry (the cc 10.7 adapter's on a lean-grid-overflow plan): the walk where the lean geometry holds -- the
