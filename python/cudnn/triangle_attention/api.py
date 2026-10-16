@@ -1012,14 +1012,22 @@ def _bias_zero_copy(bias: torch.Tensor, dtype: torch.dtype) -> bool:
 
 
 def _cached_plan(q, k, v, bias, mask_form: str, want_lse: bool, score_max: bool, scale: float) -> TriangleAttentionFwd:
+    """ONE compiled plan per declaration: everything the constructor specializes on -- the q / k / v shapes AND strides (the k / v shapes
+    carry H_kv and S_kv: a KV head slice of the same buffer has the strides of the full tensor and a different shape, and a plan compiled for
+    H_kv = 4 declined the H_kv = 2 call at execute when the key held the strides alone), the bias shape, strides and dtype, the activations'
+    dtype, the device, the mask form, the outputs and the scale.  The mask / lengths tensors are not plan facts beyond the form (execute checks
+    their contiguity per call)."""
     key = (
         tuple(q.shape),
         tuple(q.stride()),
+        tuple(k.shape),
         tuple(k.stride()),
+        tuple(v.shape),
         tuple(v.stride()),
         tuple(bias.shape),
         tuple(bias.stride()),
         q.dtype,
+        bias.dtype,
         str(q.device),
         mask_form,
         bool(want_lse),

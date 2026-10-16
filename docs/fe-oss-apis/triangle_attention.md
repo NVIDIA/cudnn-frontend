@@ -110,7 +110,8 @@ triangle_attention(q, k, v, bias, mask=None, scale=None, return_aux=False, kv_le
 
 `out` writes the result into a caller-provided tensor (stable addresses for CUDA-graph users; copied into when it is not in the
 kernel's layout, counted); `stream` is a raw CUDA stream handle the allocations, copies and launches are ordered on (None = torch's
-current stream). The function caches one compiled plan per `(shape, dtype, strides, mask form, outputs, scale)` in the process,
+current stream). The function caches one compiled plan per `(the q / k / v / bias shapes and strides, dtype, mask form, outputs, scale)` in the process
+(the `k` / `v` shapes carry `H_kv` and `S_kv`: a KV head slice of the same buffer is its own plan),
 allocates the output per call (and the workspace `get_workspace_size()` names: the plan's own bytes plus, on the `kv_lengths` form, the
 Q-side lengths below -- the torch allocator recycles it), and launches. Warm a shape once before capturing a
 `torch.cuda.graph` around the call; the captured graph replays the kernel and follows the inputs' contents.

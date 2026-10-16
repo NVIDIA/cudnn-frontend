@@ -352,6 +352,59 @@ def test_execute_declines_an_output_whose_byte_range_intersects_an_operand_befor
         plan._check_execute_args(q, k, v, bias, None, o_l, lse_v, None, None, None)
 
 
+def test_plan_cache_keys_on_the_kv_geometry(monkeypatch):
+    """GPU-free: two drop-in signatures with the same q geometry and strides but H_kv 4 -> 2 -- a head slice of the same (B, N, S, H, D) buffer:
+    identical physical strides, a different shape (it binds zero-copy, so the route stages it as it is) -- are two plans: the plan key carries
+    the k / v shapes (and the bias dtype), not their strides alone.  The second call used to receive the first call's plan and fail execute's
+    shape check.  A stub plan class counts constructions; the module's cache is swapped for an empty one."""
+    built = []
+
+    class _Stub:
+        def __init__(self, q, k, v, bias, **kw):
+            built.append((tuple(k.shape), tuple(v.shape), kw))
+
+        def check_support(self):
+            return True
+
+        def compile(self):
+            pass
+
+    monkeypatch.setattr(tapi, "TriangleAttentionFwd", _Stub)
+    monkeypatch.setattr(tapi, "_PLANS", {})
+    b, n, h, s, d = 1, 8, 4, 32, 32
+    left = lambda hh: torch.empty(b, n, s, hh, d, dtype=torch.bfloat16).permute(0, 1, 3, 2, 4)  # noqa: E731
+    q, k4, v4 = left(h), left(h), left(h)
+    bias = torch.empty(1, 1, h, s, s, dtype=torch.bfloat16)
+    k2, v2 = k4[:, :, :2], v4[:, :, :2]
+    assert k2.stride() == k4.stride() and v2.stride() == v4.stride() and tapi._activation_zero_copy(k2)
+    p1 = tapi._cached_plan(q, k4, v4, bias, "none", False, False, 0.125)
+    p2 = tapi._cached_plan(q, k2, v2, bias, "none", False, False, 0.125)
+    assert p2 is not p1 and len(built) == 2 and built[1][:2] == ((b, n, 2, s, d), (b, n, 2, s, d)), "H_kv 4 -> 2 with identical strides is a second plan"
+    assert tapi._cached_plan(q, k2, v2, bias, "none", False, False, 0.125) is p2 and len(built) == 2  # the second geometry is cached in turn
+    assert tapi._cached_plan(q, k4, v4, bias, "none", False, False, 0.125) is p1 and len(built) == 2
+    # S_kv is already distinguished by the bias shape; a different bias dtype (the plan records it) is its own plan as well
+    p3 = tapi._cached_plan(q, k4, v4, bias.float(), "none", False, False, 0.125)
+    assert p3 is not p1 and len(built) == 3
+
+
+@requires_rubin
+def test_a_kv_head_slice_after_the_full_head_count_runs_its_own_plan():
+    """The review's repro on the device: H_kv 4 and then 2 (a head slice of the same buffers -- identical physical strides, zero-copy), the
+    same q and bias; the second call used to be served the first call's plan and fail execute's shape check.  Both calls run and match the
+    fp64 reference (the GQA fold repeats the KV heads), and they differ from each other."""
+    s = 128
+    q, k, v, bias, gen = _inputs(s, 32, h=4, bias_form="1", seed=61)
+    mask = _dense_mask(1, s, s, gen)
+    o4 = tapi.triangle_attention(q, k, v, bias, mask=mask)
+    k2, v2 = k[:, :, :2], v[:, :, :2]
+    assert k2.stride() == k.stride() and v2.stride() == v.stride()
+    o2 = tapi.triangle_attention(q, k2, v2, bias, mask=mask)
+    torch.cuda.synchronize()
+    _check(o4, _reference(q, k, v, bias, mask=mask))
+    _check(o2, _reference(q, k2, v2, bias, mask=mask))
+    assert not torch.equal(o4, o2)
+
+
 # ---------------------------------------------------------------------------
 # Rubin: the acceptance grid, the layouts, the masked rows, CUDA graphs, autograd, the live declines
 # ---------------------------------------------------------------------------
