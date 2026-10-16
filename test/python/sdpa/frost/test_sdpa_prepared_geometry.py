@@ -330,9 +330,11 @@ def test_split_combine_form_pin_reads_the_plan_device_per_line(adapter, expect_c
     """``build_dense_spec`` pins a split plan's combine entry to a kernel FORM through ``_split_combine_decode_grid``, which
     reads the device the adapter recorded at check_support (``_plan_device_cc``: the SM100 / SM90 adapters' ``_device_cc``,
     the SM120 adapter's ``compute_capability``) -- on cc 10.7 the split-aware rule (AUTO where it selects the decode-grid
-    kernel, OFF where it pins the module's own forms inside the kernel module's bound), on every other device OFF on every
-    launch inside the bound; outside the bound the AUTO entry is the module's own forms by construction on every line.
-    RED before the seam existed: the SM120 adapter's plan read ``tuple(None)``."""
+    kernel, OFF where it pins the module's own forms inside the kernel module's bound, and the LEAN GROUP WALK on every
+    launch past the bound: ``heuristics.decode_combine_lean_walk_selected``), on every other device OFF on every launch inside
+    the bound; outside the bound the AUTO entry is the module's own forms by construction on every line off cc 10.7.
+    RED before the seam existed: the SM120 adapter's plan read ``tuple(None)``; RED before the walk's restore: the cc 10.7
+    plan past the bound read AUTO."""
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 
     assert prep._plan_device_cc(adapter) == expect_cc
@@ -345,7 +347,10 @@ def test_split_combine_form_pin_reads_the_plan_device_per_line(adapter, expect_c
         assert grid(4, 24, 4, 16) == comb.DECODE_GRID_OFF and grid(4, 24, 4, 32) == comb.DECODE_GRID_AUTO
     else:
         assert all(grid(*g, s) == comb.DECODE_GRID_OFF for g in ((1, 24, 1), (4, 24, 4), (4, 32, 1)) for s in (4, 8, 16, 32, 128))
-    assert grid(8, 32, 1, 32) == comb.DECODE_GRID_AUTO  # 256 lean blocks: past the bound, nothing to force on any line
+    # 256 lean blocks: past the bound nothing is forced on any line -- the cc 10.7 plan names the restored lean group walk there
+    # (the measured B 32 / B 128 cells: 768 / 3072 blocks), every other line the AUTO entry (= the module's own forms by construction)
+    past = comb.DECODE_GRID_LEAN_WALK if rule_line else comb.DECODE_GRID_AUTO
+    assert grid(8, 32, 1, 32) == past and grid(32, 24, 1, 2) == past and grid(128, 24, 4, 2) == past
 
 
 def test_split_combine_form_pin_reads_the_device_when_the_adapter_recorded_none(monkeypatch):
