@@ -79,8 +79,8 @@ layout. The output follows the input layout, while `lse` is always the FP32
 natural-log log-sum-exp with shape `(B, H_q, S_q)`.
 
 For explicit Blackwell blk64 calls, TMA-aligned BSHD inputs are read through
-strided views and unsplit outputs are written directly in BSHD order.
-Misaligned inputs and split-KV outputs retain their existing staging behavior.
+strided views. Both unsplit outputs and split-KV combined outputs are written
+directly in the requested layout. Misaligned inputs retain their staging fallback.
 
 ### Sparse metadata
 
@@ -275,6 +275,8 @@ With contiguous per-row count metadata and at least two KV blocks, backward
 can pair KV neighborhoods to reuse common Q/dO loads and dQ accumulation.
 Pairing metadata is limited to 64 MiB; fixed counts or unsupported metadata
 layouts use regular tasks. Duplicate sparse edges retain their multiplicity.
+Paired tasks retain FP32 dK/dV accumulation even with a single query bucket;
+regular tasks can use the direct dK/dV epilogue when its alignment requirements hold.
 The initial eight-KV matching is refined within 32-KV windows, with refinement
 skipped above 1024 bitset words. Metadata construction is included in the
 wrapper's work and is rebuilt for each call.
