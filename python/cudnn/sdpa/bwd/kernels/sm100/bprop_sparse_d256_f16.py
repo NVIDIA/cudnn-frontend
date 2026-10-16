@@ -1,10 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Qwen Sparse Attention (QSA) backward for SM100, written with the CuTe DSL primitives.
-
-docs/fe-oss-apis/qsa.md describes the index contract and the six kernels of the launch sequence.
-"""
+"""Qwen Sparse Attention (QSA) backward for SM100, written with the CuTe DSL primitives."""
 
 import math
 

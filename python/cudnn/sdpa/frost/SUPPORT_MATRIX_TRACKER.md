@@ -356,6 +356,7 @@ MMA as d=512.
 | **Decode tile** (decode + MTP; f16/bf16, dense or paged: d128 `S_q · PACK_G ≤ 128`ᵈᵗ, d256 `S_q · G` within the routed rowsᵈ) | ✅ᵈ⁶⁴ **native** (f16/bf16; an explicit cga2 runs the prefill tile) | ✅ᵈᵗ **native** | ❌ (prefill tile) | ✅ᵈ (d256 decode tile, swap-AB) | ❌ (prefill tile) | — |  —  |
 | Paged KV cache (`paged_attention_k/v_table` + padding mask)ᵖ | ✅ᵖ f16 + fp8 (native d64; mxfp8 d64 is unpaged) | ✅ᵖ f16 + fp8 + mxfp8 | ✅ᵖ f16 + mxfp8 (native (192, 128)) | ✅ᵖ ᵈ f16 + mxfp8 | ✅ᵖ f16 + mxfp8 (native 512; (256, 512] envelope) | ❌ |  ❌  |
 | Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`; the SM107 rows serve it, see the SM107 table) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |  ❌  |
+| Index-list sparse attention (QSA: per-query `(T, 2051)` token lists of 4-token blocks + the open tail; frontend-only, the standalone `sparse_gqa_sm100` backward adapter, no graph form) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | bf16 ✅ (SM100 / cc 10.0 only, SM103 declined; 24 Q / 2 KV heads, softmax scale 1/16, one sequence of `T <= 349525`; no batch, THD, context parallel or deterministic mode) |
 
 ᵈ⁶⁴ **d64 decode tile.** The same `sm100/decode_d128_f16.py` tile at
 `d_flavor=64` (`config_sm100.CfgD64Decode`: the d128 reshape — one 128-row Q

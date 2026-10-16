@@ -41,7 +41,6 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. New A
 - [HSTU Attention (Blackwell SM100/SM103)](hstu/hstu_attention.md)
 - [HSTU LayerNorm-Multiply-SiLU-Dropout (LMSD)](hstu/hstu_lmsd.md)
 - [Native Sparse Attention (NSA)](nsa.md)
-- [Qwen Sparse Attention (QSA)](qsa.md)
 - [CSA Fused Compressor](csa.md)
 - [Aligned HCA Backward](attention/aligned_hca_backward.md)
 - [DSv4.1 Vision RoPE Backward](attention/vision_rope_backward.md)
