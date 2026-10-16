@@ -103,6 +103,7 @@ from cudnn.sdpa.fwd.engines import (
     launch_grid_mismatch,
     mismatch,
     pack_gqa_partial,
+    pack_gqa_tail,
     rubin_dense_d128_shared_leg,
 )
 
@@ -223,6 +224,14 @@ _SPLIT_KV_COMBINE_FLOOR = 0.35
 # regret 5.3% -> 0.5%, worst 43% -> 21%; any floor in [0.02, 0.1] makes the same choices.
 _SM120_SPLIT_KV_MIN_TILES = 1
 _SM120_SPLIT_KV_COMBINE_FLOOR = 0.1
+# The per-wave combine price in the same units. A KV tile costs an mma.sync CTA several times what it
+# costs a tcgen05 one, so _SPLIT_KV_COMBINE_COST (B200) charged a verify step's combine -- S_q * H_q
+# rows, several waves -- up to a whole tile per partial and stopped splitting early: b=1 h=32/8 d128
+# S_q=32 S_kv=1k took split 2 at 31.7 us where split 8 runs 13.0 us (RTX 5080, 84 SMs). Fitted on a
+# 180-case ladder there (d64-d256, S_q 1-32, b 1/4/16, S_kv 1k-64k, 2026-10-14): mean regret 12.8% ->
+# 2.9%; any value in [0.0025, 0.0175] makes the same choices, and each of the 27 it moves lands on the
+# measured best. The batched shapes' remaining regret is the wave term's per-CTA cost, untouched here.
+_SM120_SPLIT_KV_COMBINE_COST = 0.01
 # What ONE split adds to the combine's LATENCY, in the same units, when the
 # combine runs its serial one-warp-per-row form -- sm100/split_combine routes
 # S_q of _SERIAL_COMBINE_MIN_SQ and up there. That kernel walks the split axis
@@ -308,6 +317,7 @@ def choose_split_kv(
     combine_floor: Optional[float] = None,
     serial_combine: bool = False,
     serial_combine_cost: float = _SPLIT_KV_SERIAL_COMBINE_COST,
+    combine_cost: Optional[float] = None,
 ) -> int:
     """How many KV chunks to cut each Q tile into; 1 = do not split.
 
@@ -383,6 +393,10 @@ def choose_split_kv(
 
     Returns 1 when there is nothing to split or nothing beats not splitting.
     ``candidates`` defaults to :func:`split_kv_candidates` for the device.
+    ``min_tiles`` / ``combine_floor`` / ``combine_cost`` default to
+    ``_SPLIT_KV_MIN_TILES`` / ``_SPLIT_KV_COMBINE_FLOOR`` / ``_SPLIT_KV_COMBINE_COST``;
+    a row whose kernels were fitted separately passes its own (the SM120 half
+    row: ``_SM120_SPLIT_KV_*``).
     """
     split_launch = _SplitKvLaunch(q_tiles, heads_q, kv_tiles, ctas_per_tile)
     if unsplit_launch is None:
@@ -400,7 +414,10 @@ def choose_split_kv(
     # ... and that one wave costs no less than a lone block's serial walk of
     # its partials: with fewer rows than the machine holds at once there is
     # nothing to hide the chain behind (_SPLIT_KV_COMBINE_FLOOR).
-    per_partial = max(combine_waves * _SPLIT_KV_COMBINE_COST, _SPLIT_KV_COMBINE_FLOOR if combine_floor is None else combine_floor)
+    per_partial = max(
+        combine_waves * (_SPLIT_KV_COMBINE_COST if combine_cost is None else combine_cost),
+        _SPLIT_KV_COMBINE_FLOOR if combine_floor is None else combine_floor,
+    )
 
     best_split, best_cost = 1, None
     for split in candidates:
@@ -1498,7 +1515,10 @@ def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int, split_kv: Optiona
     SPLIT, whose combine applies the gate (``split_kv``: the set's split, None =
     some plan) -- there is a group to pack and the ratio divides
     the tile -- or, on a flavor with partial PackGQA, shares a factor with it
-    (96/8 packs 4 of its 12 heads; 24/8 has nothing to pack and stays unpacked).
+    (96/8 packs 4 of its 12 heads; 24/8 has nothing to pack and stays unpacked),
+    or, on a flavor with whole-group tail packing (``pack_gqa_tail_d_shapes``:
+    the SM120 general and d256 f16 templates), fits it (24/8 packs whole there,
+    ``tile_m // 3`` tokens per tile with the remaining rows dead).
     THD prefill packs only on a flavor advertising token-unit worklists and
     packed-head Stats stores; the decode tile's ragged-Q leg remains separate.
     cc 10.7 half packs dense D128 on the shared SM100 bodies (issue #1472) and dense d256
@@ -1542,16 +1562,18 @@ def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int, split_kv: Optiona
         and not (facts.thd and not _thd_decode_leg(caps, facts) and (facts.d_qk, facts.d_v) not in caps.thd_pack_gqa_d_shapes)
         and not (facts.has_epilogue_gate and not rubin_decode_tile)
         and facts.h_q != facts.h_kv
-        and (rubin_decode_tile or pack_gqa_supported(facts.h_q, facts.h_kv, tile_m, partial=pack_gqa_partial(caps, facts)))
+        and (rubin_decode_tile or pack_gqa_supported(facts.h_q, facts.h_kv, tile_m, partial=pack_gqa_partial(caps, facts), tail=pack_gqa_tail(caps, facts)))
     )
 
 
 def _pack_gqa_group(caps: Capabilities, facts, tile_m: Optional[int], packed: Optional[bool], split_kv: Optional[int] = None) -> int:
     """The heads one packed Q tile row-group holds for a ``pack_gqa=packed``
     set: 1 unpacked, else ``Cfg.PACK_G`` -- the whole ratio G when it divides
-    the tile, its largest divisor that does on a partial-PackGQA flavor (96/8
-    -> 4).  The launch geometry the wave-cost model must see is the PACKED
-    one: ``h_q // p`` packed heads of ``s_q * p`` rows each -- feeding it G
+    the tile or, on a tail-packing flavor, whenever it fits the tile; its
+    largest divisor that does on a partial-PackGQA flavor (96/8 -> 4).  The
+    launch geometry the wave-cost model must see is the PACKED one:
+    ``h_q // p`` packed heads of ``ceil(s_q / (tile_m // p))`` Q tiles each
+    (``_split_launch``) -- feeding it G
     where the kernel packs p (96/8: 8 heads instead of 24) shrinks the
     apparent grid 3x and over-proposes the split at mid batch sizes.
 
@@ -1564,7 +1586,7 @@ def _pack_gqa_group(caps: Capabilities, facts, tile_m: Optional[int], packed: Op
     if not packed:
         return 1
     g = facts.h_q // facts.h_kv
-    p = pack_gqa_group_size(g, tile_m or 128, partial=pack_gqa_partial(caps, facts))
+    p = pack_gqa_group_size(g, tile_m or 128, partial=pack_gqa_partial(caps, facts), tail=pack_gqa_tail(caps, facts))
     if p == 0 and _d256_decode_tile_selected(caps, facts, g, split_kv):
         return g
     return p
@@ -1702,7 +1724,8 @@ def _split_launch(caps: Capabilities, facts, tile_m, tile_n, cga, pack_g: int, *
         kv_tiles = _swa_kv_tiles(facts, token_span=rows // pack_g, tile_n=tile_n or 128)
         if physical:
             ctas = cga_ctas(_selected_d_shape(caps, facts)[0], cga)
-    return _SplitKvLaunch(_ceil_div(facts.s_q * pack_g, rows), facts.h_q // pack_g, kv_tiles, ctas)
+    # A packed tile holds rows // pack_g tokens (a tail-packed group leaves the remainder dead).
+    return _SplitKvLaunch(_ceil_div(facts.s_q, max(1, rows // pack_g)), facts.h_q // pack_g, kv_tiles, ctas)
 
 
 def _split_points(
@@ -1730,8 +1753,8 @@ def _split_points(
     ``unsplit_knobs`` lets the no-split candidate carry a different complete
     geometry; D192 requires this because split-KV is CGA2-only while its tuned
     unsplit assignment may use CGA1. The generator respects structural limits
-    (dense-only, no sink — mismatch() enforces the same, so an emitted >1
-    never reaches a kernel that cannot honor it).
+    (dense-only; a sink only on a ``split_sink`` row's half flavors — mismatch() enforces the
+    same, so an emitted >1 never reaches a kernel that cannot honor it).
 
     A split the model asks for LEADS, with no-split behind it as the runner-up
     — so a plain ``build_plans()`` runs the split, and autotune / select_plan
@@ -1756,11 +1779,11 @@ def _split_points(
         return [no_split]
     # Paged KV is padded by construction and the split composes with the
     # per-batch lengths (it IS the decode lever there) — see mismatch().
-    # A sink splits on the half flavors (the combine folds it once); FP8 keeps the per-tile
-    # fold, and a gated graph's split (the gate rides its combine) carries no sink.
+    # A sink splits on a split_sink row's half flavors (the combine folds it once); FP8 keeps
+    # the per-tile fold, and a gated graph's split (the gate rides its combine) carries no sink.
     if (
         (facts.thd and not ragged_decode)
-        or (facts.has_sink and (facts.is_fp8 or facts.is_mxfp8 or facts.has_epilogue_gate or not (caps.sm_lo == 100 and caps.sm_hi < 107)))
+        or (facts.has_sink and (facts.is_fp8 or facts.is_mxfp8 or facts.has_epilogue_gate or not caps.split_sink))
         or (facts.padded and not facts.has_paged_kv)
         or facts.seq_q_trim
     ):
@@ -1853,7 +1876,7 @@ def _split_points(
             ctas_per_tile=split_launch.ctas_per_tile,
             unsplit_launch=unsplit_launch,
             **(
-                dict(min_tiles=_SM120_SPLIT_KV_MIN_TILES, combine_floor=_SM120_SPLIT_KV_COMBINE_FLOOR)
+                dict(min_tiles=_SM120_SPLIT_KV_MIN_TILES, combine_floor=_SM120_SPLIT_KV_COMBINE_FLOOR, combine_cost=_SM120_SPLIT_KV_COMBINE_COST)
                 if caps.sm_lo == 120 and not (caps.is_fp8 or caps.is_mxfp8)
                 else {}
             ),

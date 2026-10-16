@@ -384,8 +384,8 @@ class Capabilities:
     # Flavors whose kernel packs a PROPER DIVISOR of the GQA group when the
     # group does not divide tile_m (partial PackGQA: 96/8 packs 4 of its 12
     # heads per token row-group, 48/8 packs 2; config_sm100.pack_gqa_group_size).
-    # None = every flavor keeps the full-ratio contract (the group must divide
-    # tile_m, or PACK_GQA=1 is declined).  Native on the SM100 d128 / d256 f16
+    # None (and pack_gqa_tail_d_shapes None) = every flavor keeps the full-ratio
+    # contract (the group must divide tile_m, or PACK_GQA=1 is declined).  Native on the SM100 d128 / d256 f16
     # kernels; the d192x128 / d512 kernels pack HEADS_PER_TILE = G.
     # APPENDED after the epilogue-gate fields (append-only contract above):
     # test_capabilities_positional_prefix_is_append_only pins the tail.
@@ -417,6 +417,20 @@ class Capabilities:
     # by rule in mismatch().  APPENDED after zero_scale (append-only
     # contract above; the same test pins it).
     attn_scale_prefolded_d_shapes: Optional[frozenset] = None
+    # A split_kv > 1 of the row's half flavors may carry an attention sink:
+    # those kernels write sink-free partials under a split and the combine
+    # folds the sink once (sm100/split_combine) -- dense graphs, and on the
+    # SM100 row also paged caches and the decode tile's ragged-Q leg (mismatch
+    # holds the per-layout conditions).  The FP8 / MXFP8 epilogues fold it per
+    # tile, so a quantized sink graph never splits.
+    # APPENDED after attn_scale_prefolded_d_shapes (append-only contract above).
+    split_sink: bool = False
+    # Flavors whose kernel packs a WHOLE GQA group that does not divide tile_m:
+    # tile_m // G tokens per Q tile, the remaining rows dead (no Q load, no
+    # store).  None = the full-ratio / partial contracts above.  Matched on the
+    # flavor the lowering SELECTS (_selected_d_shape).  APPENDED after
+    # split_sink (append-only contract above).
+    pack_gqa_tail_d_shapes: Optional[frozenset] = None
 
 
 def _band_covers_kv_tail(facts: "ga.SdpaGraphFacts") -> bool:
@@ -757,6 +771,12 @@ def _selected_d_shape(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") ->
     return min(covering, key=lambda shape: (shape[0], shape[1])) if covering else None
 
 
+def pack_gqa_tail(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> bool:
+    """Whether the flavor this graph lowers onto packs a whole GQA group that
+    does not divide tile_m, with dead tail rows (``pack_gqa_tail_d_shapes``)."""
+    return capabilities.pack_gqa_tail_d_shapes is not None and _selected_d_shape(capabilities, facts) in capabilities.pack_gqa_tail_d_shapes
+
+
 def pack_gqa_partial(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> bool:
     """Whether the flavor this graph lowers onto packs a proper divisor of a
     GQA group that does not divide tile_m (``pack_gqa_partial_d_shapes``)."""
@@ -1025,20 +1045,20 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 # (sm100/split_combine gate=True; api_dsl._gate_in_combine).
                 return "split_kv > 1 cannot ride the fused epilogue gate (the combine would write the un-gated O); only the d256 decode tile's split applies the gate in its combine"
             # Facts x knobs: the split path is structurally dense-only (the
-            # per-split LSE is the combine weight; the THD/sink/padded paths
-            # do not produce per-split partials). Declined HERE so a split
-            # request never reaches a kernel that cannot honor it.
+            # per-split LSE is the combine weight; THD and padded graphs do
+            # not produce per-split partials). Declined HERE so a split request
+            # never reaches a kernel that cannot honor it.
             # Paged KV is padded by construction and its split composes with
             # the per-batch lengths (the decode lever when B*H_kv leaves the
             # machine underfilled), so it is exempt from the padded exclusion.
             if (
                 (facts.thd and not (ragged_decode or packed_split))
-                # The SM100 half flavors write sink-free partials and fold the sink
-                # once in the combine; the FP8 epilogues and the Rubin kernels still
-                # fold it per tile, a gated split's combine carries no sink, and the
-                # packed THD split carries one only where thd_split_domain admits it
-                # (supports_paged_split_sink).
-                or (facts.has_sink and not packed_split and (facts.is_fp8 or facts.is_mxfp8 or facts.has_epilogue_gate or capabilities.sm_lo != 100))
+                # The half flavors of a split_sink row (SM100 / SM103, SM120) write
+                # sink-free partials and fold the sink once in the combine; the FP8
+                # epilogues and the Rubin kernels still fold it per tile, a gated
+                # split's combine carries no sink, and the packed THD split carries
+                # one only where thd_split_domain admits it (supports_paged_split_sink).
+                or (facts.has_sink and not packed_split and (facts.is_fp8 or facts.is_mxfp8 or facts.has_epilogue_gate or not capabilities.split_sink))
                 or (facts.padded and not facts.has_paged_kv and not packed_split)
                 or facts.seq_q_trim
                 # A split sink over padded query lengths also needs the native dense binder that hands the combine the Q lengths (a padded
@@ -1052,7 +1072,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                     and not getattr(cudnn._pybind_module._SdpaDenseBinder, "supports_combine_q_lens", False)
                 )
             ):
-                return "split_kv > 1 serves sink-free dense graphs (a sink splits on the SM100 half flavors only), the decode tile's ragged-Q leg, or native D128/D256 or nonpaged D192 packed split"
+                return "split_kv > 1 serves sink-free dense graphs (a sink splits on the SM100 and SM120 half flavors only), the decode tile's ragged-Q leg, or native D128/D256 or nonpaged D192 packed split"
             if _synth_kv_padding(capabilities, facts) and not supports_scalar_kv_tail_split(
                 (facts.d_qk, facts.d_v),
                 device_cc=facts.device_cc,
@@ -1137,14 +1157,15 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 return "PackGQA cannot ride the fused epilogue gate (only the d256 decode tile's split applies the gate in its combine)"
             _pg_tile_m = knobs.tile_m if knobs.tile_m is not None else max(capabilities.tile_ms)
             _partial = pack_gqa_partial(capabilities, facts)
+            _tail = pack_gqa_tail(capabilities, facts)
             # The decode tile packs the WHOLE group into its 16-row Q tile whatever tile_m (24/2: 12 live
             # rows + 4 zero tail rows), so the prefill tiles' divisibility rule does not apply to a Rubin
             # graph that lowers onto it (api_dsl.check_support exempts the same graphs).  The SM100 line
             # keeps the rule as is: its partial PackGQA already admits such groups on the prefill tile.
             _decode_packs_whole_group = capabilities.sm_lo == 107 and decode_tile and facts.h_kv > 0 and facts.h_q % facts.h_kv == 0
-            if not pack_gqa_supported(facts.h_q, facts.h_kv, _pg_tile_m, partial=_partial) and not _decode_packs_whole_group:
+            if not pack_gqa_supported(facts.h_q, facts.h_kv, _pg_tile_m, partial=_partial, tail=_tail) and not _decode_packs_whole_group:
                 return (
-                    f"PackGQA requires h_q/h_kv to {'share a factor with' if _partial else 'divide'} tile_m: "
+                    f"PackGQA requires h_q/h_kv to {'not exceed' if _tail else 'share a factor with' if _partial else 'divide'} tile_m: "
                     f"h_q/h_kv = {facts.h_q}/{facts.h_kv} does not pack at tile_m={_pg_tile_m}"
                 )
     cc = facts.device_cc
@@ -1573,6 +1594,8 @@ def _sm100_spec() -> EngineSpec:
             # fp32 partial store has no surplus columns to clip.
             split_kv_supported=True,
             pack_gqas=frozenset({False, True}),
+            # Every flavor writes sink-free split partials; the combine folds the sink.
+            split_sink=True,
             # The d128 / d256 f16 kernels pack a GQA group that does not divide
             # the 128-row tile by its largest divisor that does (Cfg.PACK_G:
             # 96/8 -> 4 heads per token row-group); d192x128 / d512 pack the
@@ -2367,6 +2390,11 @@ def _sm120_spec() -> EngineSpec:
             tile_ns=frozenset({32, 64, 128}),
             cgas=frozenset({1}),
             pack_gqas=frozenset({False, True}),
+            # The f16/bf16 templates write sink-free split partials; the combine folds the sink.
+            split_sink=True,
+            # The general and d256 templates pack a whole group that does not
+            # divide tile_m (the d512 template's Q TMA box needs the full ratio).
+            pack_gqa_tail_d_shapes=frozenset((tq, tv) for tq in GENERAL_HEAD_TILES for tv in GENERAL_HEAD_TILES),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM120),
     )

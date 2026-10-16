@@ -577,3 +577,4 @@ def test_split_chooser_receives_the_row_cost_profile(monkeypatch, row, device_cc
     for kw in seen:
         assert kw.get("min_tiles") == (heur._SM120_SPLIT_KV_MIN_TILES if sm120 else None)
         assert kw.get("combine_floor") == (heur._SM120_SPLIT_KV_COMBINE_FLOOR if sm120 else None)
+        assert kw.get("combine_cost") == (heur._SM120_SPLIT_KV_COMBINE_COST if sm120 else None)

@@ -379,6 +379,88 @@ def test_sm120_split_keeps_half_partials():
     assert api._partial_dtype_tag() == "f16"
 
 
+@pytest.mark.parametrize(
+    "d,causal,pack_gqa,s_q,split_kv",
+    [(d, True, True, 1, 4) for d in (64, 128, 256, 512)]
+    + [(d, False, False, 4, 4) for d in (64, 128, 256, 512)]
+    + [(128, True, True, 4, 1), (256, False, True, 1, 1)],
+)
+def test_sm120_split_folds_the_sink_once(d, causal, pack_gqa, s_q, split_kv):
+    """A sink rides a KV split: the partials are sink-free and the combine
+    folds the sink once, on every half template, decode and verify rows,
+    packed and unpacked. Under top-left causal every split but split 0 is
+    empty. The unsplit cases pin the kernel's own fold. Rows whose keys all
+    miss split 0, or that have no key at all, are pinned by
+    test_sdpa_fwd_dsl_sm120.test_sm120_sink_rows_without_keys."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+
+    if torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("SM120 part required")
+    b, h_q, h_kv, s_kv, dev = 2, 8, 2, 1000, "cuda"
+    torch.manual_seed(0)
+    q = torch.randn(b, s_q, h_q, d, device=dev, dtype=torch.float16).transpose(1, 2)
+    k = torch.randn(b, s_kv, h_kv, d, device=dev, dtype=torch.float16).transpose(1, 2)
+    v = torch.randn(b, s_kv, h_kv, d, device=dev, dtype=torch.float16).transpose(1, 2)
+    sinks = torch.randn(1, h_q, 1, 1, device=dev, dtype=torch.float32) * 4
+    o = torch.zeros(b, s_q, h_q, d, device=dev, dtype=torch.float16).transpose(1, 2)
+    lse = torch.zeros(b, h_q, s_q, device=dev, dtype=torch.float32)
+    api = SdpaFwdDslSm120(
+        sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, has_sink=True, is_causal=causal, split_kv=split_kv, sched_policy=0, pack_gqa=pack_gqa
+    )
+    assert api.check_support()
+    assert api.split_kv == split_kv
+    api.compile()
+    ws_bytes = api.scratch_workspace_bytes()
+    ws = torch.empty(ws_bytes, dtype=torch.uint8, device=dev) if ws_bytes else None
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse, sinks=sinks, workspace=ws)
+    torch.cuda.synchronize()
+
+    kf, vf = (x.float().repeat_interleave(h_q // h_kv, dim=1) for x in (k, v))
+    scores = q.float() @ kf.transpose(-1, -2) / math.sqrt(d)
+    if causal:
+        scores.masked_fill_(torch.arange(s_kv, device=dev)[None, :] > torch.arange(s_q, device=dev)[:, None], float("-inf"))
+    sink_col = sinks.view(1, h_q, 1, 1).expand(b, h_q, s_q, 1)
+    ref_lse = torch.logsumexp(torch.cat([scores, sink_col], dim=-1), dim=-1)
+    ref_o = torch.exp(scores - ref_lse[..., None]) @ vf
+    torch.testing.assert_close(o.float(), ref_o, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(lse, ref_lse, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("split_kv", [33, 64])
+@pytest.mark.parametrize("d", [64, 256])
+def test_sm120_split_past_one_warp_of_splits(d, split_kv):
+    """More splits than the lean combine group and than a warp has lanes: a
+    one-token row takes the combine's decode form, which strides the split axis
+    over warps and lanes.  gpt-oss decode: a packed GQA-8 group with a sink the
+    combine folds, over a long cache."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+
+    if torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("SM120 part required")
+    b, h_q, h_kv, s_q, s_kv, dev = 1, 16, 2, 1, 16384, "cuda"
+    torch.manual_seed(0)
+    q = torch.randn(b, s_q, h_q, d, device=dev, dtype=torch.bfloat16).transpose(1, 2)
+    k = torch.randn(b, s_kv, h_kv, d, device=dev, dtype=torch.bfloat16).transpose(1, 2)
+    v = torch.randn(b, s_kv, h_kv, d, device=dev, dtype=torch.bfloat16).transpose(1, 2)
+    sinks = torch.randn(1, h_q, 1, 1, device=dev, dtype=torch.float32) * 4
+    o = torch.full((b, s_q, h_q, d), float("nan"), device=dev, dtype=torch.bfloat16).transpose(1, 2)
+    lse = torch.full((b, h_q, s_q), float("nan"), device=dev, dtype=torch.float32)
+    api = SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, has_sink=True, split_kv=split_kv, sched_policy=0, pack_gqa=True)
+    assert api.check_support()
+    assert api.split_kv == split_kv
+    api.compile()
+    ws = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device=dev)
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse, sinks=sinks, workspace=ws)
+    torch.cuda.synchronize()
+
+    kf, vf = (x.float().repeat_interleave(h_q // h_kv, dim=1) for x in (k, v))
+    scores = q.float() @ kf.transpose(-1, -2) / math.sqrt(d)
+    ref_lse = torch.logsumexp(torch.cat([scores, sinks.view(1, h_q, 1, 1).expand(b, h_q, s_q, 1)], dim=-1), dim=-1)
+    ref_o = torch.exp(scores - ref_lse[..., None]) @ vf
+    torch.testing.assert_close(o.float(), ref_o, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(lse, ref_lse, atol=2e-2, rtol=2e-2)
+
+
 @pytest.mark.parametrize("stats_log2", [False, True], ids=["ln", "log2"])
 @pytest.mark.parametrize("d", [128, 256, 512])
 def test_sm120_split_stats_base(d, stats_log2):
@@ -388,25 +470,30 @@ def test_sm120_split_stats_base(d, stats_log2):
 
 
 @requires_blackwell_geforce
-@pytest.mark.parametrize("fp8", [False, True], ids=["f16", "fp8"])
+@pytest.mark.parametrize(
+    "fp8,flavor,d,tiles",
+    [(False, None, 128, (64, 128)), (True, None, 128, (64, 128)), (False, "d256", 256, (64, 64)), (False, "d512", 512, (64, 32))],
+    ids=["f16", "fp8", "f16_d256", "f16_d512"],
+)
 @pytest.mark.parametrize("splits", [1, 4], ids=["unsplit", "split4"])
 @pytest.mark.parametrize("stats_log2", [False, True], ids=["ln", "log2"])
-def test_sm120_direct_template_stats_base(fp8, splits, stats_log2):
+def test_sm120_direct_template_stats_base(fp8, flavor, d, tiles, splits, stats_log2):
     """Direct callers may enable log2 even on a partial-producing template.
 
     The adapter clears that flag before compiling partials, so going through
     it cannot detect a missing kernel-entry guard. Check the actual partial
-    LSE units here, then feed them to the real natural-log combiner.
+    LSE units of every half template here, then feed them to the real
+    natural-log combiner.
     """
     import cutlass
     import cuda.bindings.driver as cuda
 
     from cudnn.frost.compiled_cache import positional_entry
     from cudnn.sdpa.fwd.api_dsl import _load_sm120_kernel_module
-    from cudnn.sdpa.fwd.config_sm120 import DTYPE_E4M3, DTYPE_FP16, TemplateParams
+    from cudnn.sdpa.fwd.config_sm120 import D256_FLAVOR, D512_FLAVOR, DTYPE_E4M3, DTYPE_FP16, TemplateParams
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine
 
-    b, h, sq, skv, d = 1, 2, 64, 512, 128
+    b, h, sq, skv = 1, 2, 64, 512
     dtype = torch.float8_e4m3fn if fp8 else torch.float16
     q = torch.full((b, sq, h, d), 0.5, device="cuda", dtype=dtype)
     # Different nonzero maxima per 128-key chunk make both a wrong log base
@@ -421,12 +508,12 @@ def test_sm120_direct_template_stats_base(fp8, splits, stats_log2):
     params = TemplateParams(
         dtype_qkv=DTYPE_E4M3 if fp8 else DTYPE_FP16,
         dtype_o=DTYPE_FP16,
-        q_tile=64,
-        kv_tile=128,
+        q_tile=tiles[0],
+        kv_tile=tiles[1],
         split_kv=splits,
         stats_log2=stats_log2,
     )
-    module = _load_sm120_kernel_module(None, params, fp8=fp8, pertensor=True)
+    module = _load_sm120_kernel_module({None: None, "d256": D256_FLAVOR, "d512": D512_FLAVOR}[flavor], params, fp8=fp8, pertensor=True)
     kernel = module.compile(torch.cuda.get_device_capability(), b=b, qh=h, kh=1, sq=sq, skv=skv, d_qk=d, d_v=d)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     # Compile PARAMS.stats_log2 directly, including split > 1. The adapter

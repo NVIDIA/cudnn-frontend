@@ -45,6 +45,7 @@ The kernel implements key optimizations including:
 - Top-left or bottom-right causal masks, sliding windows, and per-batch lengths
 - Per-row natural-log LSE (softmax stats) output
 - Optional per-Q-head attention-sink logits folded into the softmax denominator
+  (unsplit; a split's partials are sink-free and the split combine folds the sink)
 - THD (ragged / packed variable-length) batches via cu_seqlens token offsets,
   with no per-sequence descriptors: Q/O use direct addressing and K/V bias a
   single TMA descriptor's seq coordinate
@@ -116,7 +117,7 @@ from cudnn.sdpa.fwd.kernels.sm120.prepared_host import host as _host, compile_ho
 PREPARED_KV_TAIL_NATIVE = True
 
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
-validate_params(PARAMS)
+validate_params(PARAMS, split_sink=True)
 
 STORAGE_DTYPE = {DTYPE_FP16: cutlass.Float16, DTYPE_BF16: cutlass.BFloat16}[PARAMS.dtype_qkv]
 
@@ -226,8 +227,9 @@ class SM120FusedMultiHeadAttentionForward:
         :param seq_q_lens_present: Read per-batch query lengths at runtime.
         :param seq_kv_lens_present: Read per-batch key/value lengths at runtime.
         :param has_sink: Fold the per-Q-head sink logit from the ``sinks``
-            tensor into the softmax denominator; when ``False`` the ``sinks``
-            argument is an unused dummy.
+            tensor into the softmax denominator of an unsplit launch; at
+            ``split_kv > 1`` the partials stay sink-free and the split combine
+            folds it.  When ``False`` the ``sinks`` argument is an unused dummy.
         :param thd_varlen: THD (ragged) mode — Q/K/V/O and LSE are fully
             packed batch-1 views, ``seq_kv_lens`` is the
             ``[seq_kv(B) | cu_q(B+1) | cu_k(B+1)]`` metadata tensor, and the
@@ -1466,23 +1468,34 @@ class SM120FusedMultiHeadAttentionForward:
         # With has_sink, the per-head sink logit joins the softmax denominator
         # as a virtual column with no V row: it rescales O, enters the LSE,
         # and gives a row with no visible key a finite LSE (the sink alone).
+        # A split partial is sink-free (SPLIT_KV > 1 compiles the fold out): the
+        # combine folds the sink once over the merged partials.
         LN2 = cutlass.Float32(0.6931471805599453)
         row_sum_inv = cutlass.Array(cutlass.Float32, 2, alignment=8)
         row_lse = cutlass.Array(cutlass.Float32, 2, alignment=8)
         for row_half in cutlass.range_constexpr(2):
             row_max_nat = row_max[row_half] * softmax_scale_log2 * LN2
-            if cutlass.const_expr(self.has_sink):
+            if cutlass.const_expr(self.has_sink and self.split_kv == 1):
                 sinks_arr = cutlass.make_array_view(sinks)
                 _sink_head = q_head_base if cutlass.const_expr(not self.pack_gqa) else q_head_base + (q_warp_row0 + (lane // 4) + row_half * 8) % self.qh_per_kh
                 sink_logit = cutlass.Float32(sinks_arr[_sink_head])
                 new_max = cute.arch.fmax(row_max_nat, sink_logit)
+                # A row with no visible key and a -inf sink has nothing to
+                # normalize: it keeps O := 0, LSE := -inf rather than exp(-inf - -inf).
+                if new_max == -cutlass.Float32.inf:
+                    new_max = cutlass.Float32(0.0)
                 # alpha re-normalizes the loop's accumulator and sum from
                 # row_max_nat to the sink-extended max; it is 0 for a row
                 # with no visible key, so O := 0 falls out.
                 alpha = cute.math.exp(row_max_nat - new_max, fastmath=True)
                 new_sum = row_sum[row_half] * alpha + cute.math.exp(sink_logit - new_max, fastmath=True)
-                row_sum_inv[row_half] = alpha / new_sum
-                row_lse[row_half] = new_max + cute.math.log(new_sum, fastmath=True)
+                inv = cutlass.Float32(0.0)
+                lse_val = -cutlass.Float32.inf
+                if new_sum > 0.0:
+                    inv = alpha / new_sum
+                    lse_val = new_max + cute.math.log(new_sum, fastmath=True)
+                row_sum_inv[row_half] = inv
+                row_lse[row_half] = lse_val
             else:
                 inv = cutlass.Float32(0.0)
                 if row_sum[row_half] > 0.0:
@@ -1506,7 +1519,8 @@ class SM120FusedMultiHeadAttentionForward:
                     lse_q_idx = q_seq_idx + (_lse_row_in_cta if cutlass.const_expr(not self.pack_gqa) else _lse_row_in_cta // self.qh_per_kh)
                     _lse_head = q_head_base if cutlass.const_expr(not self.pack_gqa) else q_head_base + _lse_row_in_cta % self.qh_per_kh
                     lse_out = cutlass.Float32(row_lse[row_half])
-                    if cutlass.const_expr(self.stats_log2):
+                    # Split partials stay natural-log for the combine, which converts the merged LSE.
+                    if cutlass.const_expr(self.stats_log2 and self.split_kv == 1):
                         lse_out = lse_out * cutlass.Float32(1.4426950408889634)
                     if cutlass.const_expr(self.thd_varlen):
                         # Packed ragged-Stats LSE, written directly in the

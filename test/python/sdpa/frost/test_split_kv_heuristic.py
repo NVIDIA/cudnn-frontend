@@ -601,6 +601,33 @@ def test_serial_combine_threshold_matches_the_kernel_routing():
     assert _SERIAL_COMBINE_MIN_SQ == split_combine.ROWS_PER_BLOCK // 2 + 1
 
 
+def test_sm120_prices_a_verify_combine_per_sm120_tile():
+    """An SM120 KV tile costs several times a B200 one, so the combine of a
+    verify step (S_q * H_q rows, several combine waves) is cheap next to it.
+    Priced per wave at the B200 coefficient it stopped these launches at split
+    2-4; the SM120 half row's own coefficient takes the measured best, still
+    stopping where the main grid would spill a wave (RTX 5080, 84 SMs, f16,
+    b=1, kernel time incl. the combine, default plan re-timed per split):
+
+        d128 h=32/8 S_q=32 S_kv=1k, packed 4 (1 Q tile x 8 units, 1024 rows):  split 2 31.7 us, split 8 13.0 us
+        d128 h=24/4 S_q=32 S_kv=1k, tail-packed 6 (2 Q tiles x 4 units, 768 rows):  split 2 31.4 us, split 8 12.8 us
+        d256 h=16/2 S_q=32 S_kv=4k, packed 8 (2 x 2, 512 rows, 64-key tiles):  split 8 59.8 us, split 16 35.5 us
+        d64 h=64/8 S_q=32 S_kv=1k, sink, packed 8 (2 x 8, 2048 rows):  split 4 12.2 us (split 8, two waves, 14.8 us)
+        d128 h=32/8 S_q=32 S_kv=16k (1 x 8, 1024 rows):  split 8 111.0 us (split 16 120.4 us)
+    """
+    from cudnn.sdpa.fwd.heuristics import _SM120_SPLIT_KV_COMBINE_COST, _SM120_SPLIT_KV_COMBINE_FLOOR, _SM120_SPLIT_KV_MIN_TILES
+
+    sm120 = dict(batch=1, sm_count=84, min_tiles=_SM120_SPLIT_KV_MIN_TILES, combine_floor=_SM120_SPLIT_KV_COMBINE_FLOOR)
+    per_sm120_tile = dict(sm120, combine_cost=_SM120_SPLIT_KV_COMBINE_COST)
+    assert choose_split_kv(q_tiles=1, heads_q=8, kv_tiles=8, combine_rows=1024, **sm120) == 2
+    assert choose_split_kv(q_tiles=1, heads_q=8, kv_tiles=8, combine_rows=1024, **per_sm120_tile) == 8
+    assert choose_split_kv(q_tiles=2, heads_q=4, kv_tiles=8, combine_rows=768, **sm120) == 2
+    assert choose_split_kv(q_tiles=2, heads_q=4, kv_tiles=8, combine_rows=768, **per_sm120_tile) == 8
+    assert choose_split_kv(q_tiles=2, heads_q=2, kv_tiles=64, combine_rows=512, **per_sm120_tile) == 16
+    assert choose_split_kv(q_tiles=2, heads_q=8, kv_tiles=8, combine_rows=2048, **per_sm120_tile) == 4
+    assert choose_split_kv(q_tiles=1, heads_q=8, kv_tiles=128, combine_rows=1024, **per_sm120_tile) == 8
+
+
 # --- the d256 decode tile's own model ----------------------------------------
 #
 # sm100/decode_d256_f16.py runs one cta_group::1 CTA per (KV-head group, batch,

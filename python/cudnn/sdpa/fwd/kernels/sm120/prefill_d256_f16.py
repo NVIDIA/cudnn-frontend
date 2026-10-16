@@ -25,6 +25,7 @@ The kernel implements key optimizations including:
 - Top-left or bottom-right causal masks, sliding windows, and per-batch lengths
 - Per-row natural-log LSE (softmax stats) output
 - Optional per-Q-head attention-sink logits folded into the softmax denominator
+  (unsplit; a split's partials are sink-free and the split combine folds the sink)
 - THD (ragged / packed variable-length) batches via cu_seqlens token offsets,
   with no per-sequence descriptors: Q/O use direct addressing and K/V bias a
   single TMA descriptor's seq coordinate
@@ -95,7 +96,7 @@ from cudnn.sdpa.fwd.kernels.sm120.prepared_host import host as _host, compile_ho
 PREPARED_KV_TAIL_NATIVE = True
 
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
-validate_params(PARAMS)
+validate_params(PARAMS, split_sink=True)
 
 STORAGE_DTYPE = {DTYPE_FP16: cutlass.Float16, DTYPE_BF16: cutlass.BFloat16}[PARAMS.dtype_qkv]
 
@@ -203,8 +204,9 @@ class SM120FusedMultiHeadAttentionForward:
         :param seq_q_lens_present: Read per-batch query lengths at runtime.
         :param seq_kv_lens_present: Read per-batch key/value lengths at runtime.
         :param has_sink: Fold the per-Q-head sink logit from the ``sinks``
-            tensor into the softmax denominator; when ``False`` the ``sinks``
-            argument is an unused dummy.
+            tensor into the softmax denominator of an unsplit launch; at
+            ``split_kv > 1`` the partials stay sink-free and the split combine
+            folds it.  When ``False`` the ``sinks`` argument is an unused dummy.
         :param thd_varlen: THD (ragged) mode — Q/K/V/O and LSE are fully
             packed batch-1 views, ``seq_kv_lens`` is the
             ``[seq_kv(B) | cu_q(B+1) | cu_k(B+1)]`` metadata tensor, and the
@@ -223,20 +225,22 @@ class SM120FusedMultiHeadAttentionForward:
             constraint as ``head_tile_qk``.
         :param q_tile: Query sequence tile size.
         :param kv_tile: Key/value sequence tile size.
-        :param pack_gqa: Enable PackGQA: each Q tile holds ``q_tile/qh_per_kh``
+        :param pack_gqa: Enable PackGQA: each Q tile holds ``q_tile // qh_per_kh``
             tokens x qh_per_kh query heads sharing one KV head, token-major
             (row r ↔ token ``r // G``, head ``r % G``).
-        :param qh_per_kh: The graph's GQA ratio ``h_q // h_kv``; must divide
-            ``q_tile`` when ``pack_gqa`` is enabled, and is validated against
-            the runtime Q/K head extents at ``__call__``.
+        :param qh_per_kh: The graph's GQA ratio ``h_q // h_kv``; at most
+            ``q_tile`` when ``pack_gqa`` is enabled, and validated against the
+            runtime Q/K head extents at ``__call__``. A ratio that does not
+            divide ``q_tile`` packs ``q_tile // G`` tokens per tile and leaves
+            the remaining rows dead: they load no Q and store nothing.
         """
 
         if out_dtype != in_dtype:
             raise ValueError("out_dtype must match in_dtype")
         if qh_per_kh < 1:
             raise ValueError(f"qh_per_kh ({qh_per_kh}) must be >= 1")
-        if pack_gqa and q_tile % qh_per_kh != 0:
-            raise ValueError(f"qh_per_kh ({qh_per_kh}) must divide q_tile ({q_tile}) when pack_gqa is enabled")
+        if pack_gqa and qh_per_kh > q_tile:
+            raise ValueError(f"qh_per_kh ({qh_per_kh}) must not exceed q_tile ({q_tile}) when pack_gqa is enabled")
         if pack_gqa and thd_varlen:
             raise ValueError("PackGQA is dense-only (THD keeps the unpacked path)")
         if thd_varlen and thd_batch < 1:
@@ -269,6 +273,10 @@ class SM120FusedMultiHeadAttentionForward:
         self.kv_tile = kv_tile
         self.pack_gqa = pack_gqa
         self.qh_per_kh = qh_per_kh
+        # Tokens per Q tile and the rows they fill. Under PackGQA a group that
+        # does not divide q_tile leaves q_tile - q_tile_rows dead tail rows.
+        self.q_tile_tokens = q_tile // qh_per_kh if pack_gqa else q_tile
+        self.q_tile_rows = self.q_tile_tokens * qh_per_kh if pack_gqa else q_tile
         # KV split: SPLIT_KV CTAs per (q_tile, batch, head), each covering a
         # contiguous slice of that tile's KV-tile range.  1 = off (folds away).
         self.split_kv = split_kv
@@ -323,6 +331,23 @@ class SM120FusedMultiHeadAttentionForward:
 
         self.k_tma_swizzle, self.k_tma_swizzle_chunks, self.k_swizzle_chunk_elems = get_swizzle(self.head_tile_qk)
         self.v_tma_swizzle, self.v_tma_swizzle_chunks, self.v_swizzle_chunk_elems = get_swizzle(self.head_tile_v)
+
+    @cute.jit
+    def _packed_token(self, row):
+        """Token offset within its Q tile of the row ``row`` of a CTA's Q tile.
+
+        Unpacked rows are tokens. A packed row holds token ``row // G``. A dead
+        tail row (a group that does not divide q_tile) maps past every
+        sequence, so the Q-length guards skip its Q load, Stats and O store.
+        """
+        if cutlass.const_expr(not self.pack_gqa):
+            return row
+        if cutlass.const_expr(self.q_tile_rows == self.q_tile):
+            return row // self.qh_per_kh
+        token = row // self.qh_per_kh
+        if row >= self.q_tile_rows:
+            token = cutlass.Int32(1 << 30)
+        return token
 
     @cute.jit
     def load_one_kv_tile(
@@ -437,7 +462,7 @@ class SM120FusedMultiHeadAttentionForward:
             )
             for i in cutlass.range_constexpr(4):
                 row_in_cta, col_in_cta = mma_offsets_in_cta[i]
-                cur_q_seq_idx = basic_params.q_seq_idx + (row_in_cta if cutlass.const_expr(not self.pack_gqa) else row_in_cta // self.qh_per_kh)
+                cur_q_seq_idx = basic_params.q_seq_idx + self._packed_token(row_in_cta)
                 q_row_off = cur_q_seq_idx * basic_params.q_seq_stride
                 if cutlass.const_expr(self.pack_gqa and self.qh_per_kh != 1):
                     q_row_off = q_row_off + (row_in_cta % self.qh_per_kh) * basic_params.q_head_stride
@@ -580,7 +605,7 @@ class SM120FusedMultiHeadAttentionForward:
 
             # Resolve mask bounds for this query row. ``valid_cols`` is an
             # exclusive upper bound; ``first_valid_col`` is inclusive.
-            q_position = basic_params.q_seq_idx + (q_row_in_cta if cutlass.const_expr(not self.pack_gqa) else q_row_in_cta // self.qh_per_kh)
+            q_position = basic_params.q_seq_idx + self._packed_token(q_row_in_cta)
             diagonal_offset = cutlass.Int32(0)
             if cutlass.const_expr(self.bottom_right):
                 diagonal_offset = basic_params.seqlen_k - basic_params.seqlen_q
@@ -899,7 +924,7 @@ class SM120FusedMultiHeadAttentionForward:
         claimed unit. SMEM belongs to the CTA, not to the unit, so it stays in
         the caller and arrives here as arguments.
         """
-        q_seq_idx = q_tile_idx * (self.q_tile // self.qh_per_kh if self.pack_gqa else self.q_tile)
+        q_seq_idx = q_tile_idx * self.q_tile_tokens
 
         seqlen_q = cutlass.Int32(q.shape[1])
         seqlen_k = cutlass.Int32(k.shape[1])
@@ -964,7 +989,7 @@ class SM120FusedMultiHeadAttentionForward:
             if q_seq_idx >= seqlen_q:
                 num_kv_tiles = cutlass.Int32(0)
         if cutlass.const_expr(self.is_causal):
-            causal_k_end = q_seq_idx + (self.q_tile // self.qh_per_kh if self.pack_gqa else self.q_tile) + self.window_right
+            causal_k_end = q_seq_idx + self.q_tile_tokens + self.window_right
             if cutlass.const_expr(self.bottom_right):
                 causal_k_end += seqlen_k - seqlen_q
             causal_k_end = cute.math.max(cutlass.Int32(0), cute.math.min(causal_k_end, seqlen_k))
@@ -1088,16 +1113,17 @@ class SM120FusedMultiHeadAttentionForward:
         # Main attention loop.
         mask_steps = 1
         if cutlass.const_expr(self.is_causal):
-            mask_steps = ceil_div(self.q_tile // self.qh_per_kh if self.pack_gqa else self.q_tile, self.kv_tile)
-            if cutlass.const_expr(self.diag_shifted):
+            mask_steps = ceil_div(self.q_tile_tokens, self.kv_tile)
+            if cutlass.const_expr(self.diag_shifted or self.q_tile_rows != self.q_tile):
                 # A translated diagonal (bottom-right anchoring or a right
                 # band) can straddle one additional KV tile; the frontier
                 # width itself is R-independent — the band only translates
-                # the diagonal.
-                mask_steps = ceil_div((self.q_tile // self.qh_per_kh if self.pack_gqa else self.q_tile) + self.kv_tile - 1, self.kv_tile)
+                # the diagonal.  A tail-packed tile's q_tile // G tokens
+                # start off the KV-tile grid, so its frontier can too.
+                mask_steps = ceil_div(self.q_tile_tokens + self.kv_tile - 1, self.kv_tile)
         left_mask_steps = 1
         if cutlass.const_expr(self.window_size_left is not None):
-            left_mask_steps = ceil_div((self.q_tile // self.qh_per_kh if self.pack_gqa else self.q_tile) + self.kv_tile - 1, self.kv_tile)
+            left_mask_steps = ceil_div(self.q_tile_tokens + self.kv_tile - 1, self.kv_tile)
 
         kv_tile_idx = num_kv_tiles - 1
         # Phase 1: potentially masked iterations.
@@ -1170,23 +1196,34 @@ class SM120FusedMultiHeadAttentionForward:
         # With has_sink, the per-head sink logit joins the softmax denominator
         # as a virtual column with no V row: it rescales O, enters the LSE,
         # and gives a row with no visible key a finite LSE (the sink alone).
+        # A split partial is sink-free (SPLIT_KV > 1 compiles the fold out): the
+        # combine folds the sink once over the merged partials.
         LN2 = cutlass.Float32(0.6931471805599453)
         row_sum_inv = cutlass.Array(cutlass.Float32, 2, alignment=8)
         row_lse = cutlass.Array(cutlass.Float32, 2, alignment=8)
         for row_half in cutlass.range_constexpr(2):
             row_max_nat = row_max[row_half] * softmax_scale_log2 * LN2
-            if cutlass.const_expr(self.has_sink):
+            if cutlass.const_expr(self.has_sink and self.split_kv == 1):
                 sinks_arr = cutlass.make_array_view(sinks)
                 _sink_head = q_head_base if cutlass.const_expr(not self.pack_gqa) else q_head_base + (q_warp_row0 + (lane // 4) + row_half * 8) % self.qh_per_kh
                 sink_logit = cutlass.Float32(sinks_arr[_sink_head])
                 new_max = cute.arch.fmax(row_max_nat, sink_logit)
+                # A row with no visible key and a -inf sink has nothing to
+                # normalize: it keeps O := 0, LSE := -inf rather than exp(-inf - -inf).
+                if new_max == -cutlass.Float32.inf:
+                    new_max = cutlass.Float32(0.0)
                 # alpha re-normalizes the loop's accumulator and sum from
                 # row_max_nat to the sink-extended max; it is 0 for a row
                 # with no visible key, so O := 0 falls out.
                 alpha = cute.math.exp(row_max_nat - new_max, fastmath=True)
                 new_sum = row_sum[row_half] * alpha + cute.math.exp(sink_logit - new_max, fastmath=True)
-                row_sum_inv[row_half] = alpha / new_sum
-                row_lse[row_half] = new_max + cute.math.log(new_sum, fastmath=True)
+                inv = cutlass.Float32(0.0)
+                lse_val = -cutlass.Float32.inf
+                if new_sum > 0.0:
+                    inv = alpha / new_sum
+                    lse_val = new_max + cute.math.log(new_sum, fastmath=True)
+                row_sum_inv[row_half] = inv
+                row_lse[row_half] = lse_val
             else:
                 inv = cutlass.Float32(0.0)
                 if row_sum[row_half] > 0.0:
@@ -1206,10 +1243,11 @@ class SM120FusedMultiHeadAttentionForward:
                 lse_arr = cutlass.make_array_view(lse)
                 for row_half in cutlass.range_constexpr(2):
                     _lse_row_in_cta = q_warp_row0 + (lane // 4) + row_half * 8
-                    lse_q_idx = q_seq_idx + (_lse_row_in_cta if cutlass.const_expr(not self.pack_gqa) else _lse_row_in_cta // self.qh_per_kh)
+                    lse_q_idx = q_seq_idx + self._packed_token(_lse_row_in_cta)
                     _lse_head = q_head_base if cutlass.const_expr(not self.pack_gqa) else q_head_base + _lse_row_in_cta % self.qh_per_kh
                     lse_out = cutlass.Float32(row_lse[row_half])
-                    if cutlass.const_expr(self.stats_log2):
+                    # Split partials stay natural-log for the combine, which converts the merged LSE.
+                    if cutlass.const_expr(self.stats_log2 and self.split_kv == 1):
                         lse_out = lse_out * cutlass.Float32(1.4426950408889634)
                     if cutlass.const_expr(self.thd_varlen):
                         # Packed ragged-Stats LSE, written directly in the
@@ -1265,7 +1303,7 @@ class SM120FusedMultiHeadAttentionForward:
         store_row = lane_mod8 + ((lane_div8) % 2) * 8
         store_col = lane_div16 * 8
         _store_row_in_cta = q_warp_row0 + store_row
-        store_q_seq_idx = q_seq_idx + (_store_row_in_cta if cutlass.const_expr(not self.pack_gqa) else _store_row_in_cta // self.qh_per_kh)
+        store_q_seq_idx = q_seq_idx + self._packed_token(_store_row_in_cta)
         store_head_off = o_head_off
         if cutlass.const_expr(self.pack_gqa and self.qh_per_kh != 1):
             store_head_off = store_head_off + (_store_row_in_cta % self.qh_per_kh) * o_head_stride
@@ -1691,13 +1729,10 @@ class SM120FusedMultiHeadAttentionForward:
         # REAL batch count (the packed view's batch mode is 1); tiles past a shorter
         # sequence's length drain without work. NOTE thd_max_sq is a __call__
         # argument in this base, not a member.
-        # PackGQA: S_q*G packed rows per packed head, H_q/G packed heads on the
+        # PackGQA: q_tile // G tokens per Q tile (a group that does not divide
+        # q_tile leaves the tile's tail rows dead), H_q/G packed heads on the
         # head axis (THD is always unpacked).
-        n_q_tiles = (
-            ceil_div(thd_max_sq, self.q_tile)
-            if cutlass.const_expr(self.thd_varlen)
-            else ceil_div((q.shape[1] * self.qh_per_kh if self.pack_gqa else q.shape[1]), self.q_tile)
-        )
+        n_q_tiles = ceil_div(thd_max_sq, self.q_tile) if cutlass.const_expr(self.thd_varlen) else ceil_div(q.shape[1], self.q_tile_tokens)
         n_batch = thd_batch if cutlass.const_expr(self.thd_varlen) else q.shape[0]
         n_head = q.shape[2] // self.qh_per_kh if self.pack_gqa else q.shape[2]
         # LPT / LPT_L2 flatten the 3-D grid so the decode can order the whole tile

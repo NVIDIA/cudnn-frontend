@@ -1087,7 +1087,15 @@ def test_capabilities_positional_prefix_is_append_only():
             return f.default_factory()
         return required[name]
 
-    appended = ["pack_gqa_partial_d_shapes", "paged_d_shapes", "thd_pack_gqa_d_shapes", "zero_scale", "attn_scale_prefolded_d_shapes"]
+    appended = [
+        "pack_gqa_partial_d_shapes",
+        "paged_d_shapes",
+        "thd_pack_gqa_d_shapes",
+        "zero_scale",
+        "attn_scale_prefolded_d_shapes",
+        "split_sink",
+        "pack_gqa_tail_d_shapes",
+    ]
     legacy_order = [n for n in names if n not in appended]
     caps = engines.Capabilities(*[legacy_value(n) for n in legacy_order])
     assert caps.thd_padded_stats is True

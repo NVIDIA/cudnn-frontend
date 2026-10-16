@@ -1637,8 +1637,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # Stats (a per-batch padded Stats has no ragged base), int32 offsets
         # whose multiplier divides the row (checked with the ragged tensors
         # in engines.mismatch), per-batch KV lengths (the dense kernel's
-        # SEQ_KV read; the cu form is not plumbed) and no sink (sink + split is
-        # declined everywhere).  Twin of engines._thd_decode_leg; keep in lockstep.
+        # SEQ_KV read; the cu form is not plumbed); a sink rides it (the combine
+        # folds it once).  Twin of engines._thd_decode_leg; keep in lockstep.
         self.thd_decode_leg = bool(
             self.thd
             and self.paged
@@ -4512,9 +4512,12 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 self.thd,
                 "PackGQA is dense-only (THD/ragged runs unpacked)",
             )
+            # The general and d256 f16 templates pack a whole group that does not divide
+            # q_tile (dead tail rows); the d512 and FP8 templates keep the full ratio.
+            _tail = not self._fp8 and self.flavor != _SM120_D512_FLAVOR
             self._value_error_if(
-                not pack_gqa_supported(int(h_q), int(h_kv), int(self.q_tile)),
-                f"PackGQA requires h_q/h_kv to divide q_tile ({self.q_tile}); got h_q/h_kv = {int(h_q)}/{int(h_kv)}",
+                not pack_gqa_supported(int(h_q), int(h_kv), int(self.q_tile), tail=_tail),
+                f"PackGQA requires h_q/h_kv to {'not exceed' if _tail else 'divide'} q_tile ({self.q_tile}); got h_q/h_kv = {int(h_q)}/{int(h_kv)}",
             )
         for desc in (self.k_desc, self.v_desc, self.o_desc):
             if self._fp8 and desc is self.o_desc:
@@ -4639,7 +4642,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             # on this arch, so there is no room to widen the O tile the way the
             # SM100 kernels do.
             self._not_implemented_error_if(self.thd, "split_kv > 1 is dense-only (THD packs its own flat grid)")
-            self._value_error_if(self.has_sink, "split_kv > 1 with an attention sink is not supported")
+            # The f16/bf16 templates write sink-free partials and the combine folds
+            # the sink once; the FP8 templates fold it into every split's partial.
+            self._value_error_if(self.has_sink and self._fp8, "split_kv > 1 with an attention sink is served by the f16/bf16 templates only")
             self._value_error_if(
                 self.seq_kv_lens_present or self.seq_q_lens_present,
                 "split_kv > 1 serves unpadded dense graphs only",

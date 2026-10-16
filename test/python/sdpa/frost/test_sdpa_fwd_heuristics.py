@@ -13,6 +13,7 @@ workspace, recombines correctly (O and Stats), and its (engine_id, knobs)
 record replays on a fresh graph.
 """
 
+import dataclasses
 import math
 
 import pytest
@@ -23,7 +24,7 @@ from cudnn.engines import manifest
 from cudnn.engines.base import PlanConfig
 from cudnn.sdpa.fwd import engines
 from cudnn.engines.heuristics import _assemble
-from cudnn.sdpa.fwd.heuristics import _MAX_SETS_PER_ENGINE, recommend
+from cudnn.sdpa.fwd.heuristics import _MAX_SETS_PER_ENGINE, _knob_sets, recommend
 from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
 from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
 
@@ -410,6 +411,58 @@ def test_sm120_d512_sliding_window_packs_gqa():
     full_causal = primary()  # full causal prefill: decode rule only, L2 rule for the scheduler
     assert (full_causal.pack_gqa, full_causal.sched_policy) == (False, SCHED_LPT_L2)
     assert primary(window_left=128, d_qk=128, d_v=128).pack_gqa is False  # the rule is the d512 flavor's
+
+
+@pytest.mark.L0
+def test_sm120_half_decode_splits_a_sink_and_packs_a_whole_group():
+    """SM120 f16/bf16 decode: a sink graph splits its KV (the templates write
+    sink-free partials and the combine folds the sink once: the row's
+    ``split_sink``), and a GQA group that does not divide the Q tile (G = 6)
+    packs whole, its tail rows dead.  The per-tensor FP8 row keeps both
+    declines, and so does the half row without ``split_sink``."""
+    name = "sdpa_fwd_prefill_sm120"
+    spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == name)
+
+    def primary(**over):
+        facts = _facts(**{**dict(s_q=1, s_kv=65536, h_q=64, h_kv=8, d_qk=64, d_v=64, causal=False, device_cc=(12, 0), device_sm_count=188), **over})
+        plans = recommend("A", facts, {name: 20504})
+        assert plans and all(engines.mismatch(spec.capabilities, facts, p.knobs) is None for p in plans)
+        return facts, plans[0].knobs
+
+    facts, sink = primary(has_sink=True)
+    assert sink.split_kv > 1 and sink.pack_gqa is True
+    _, g6 = primary(h_q=24, h_kv=4, d_qk=128, d_v=128)
+    assert g6.pack_gqa is True
+    g6_facts = _facts(s_q=1, s_kv=65536, h_q=24, h_kv=4, causal=False, device_cc=(12, 0), device_sm_count=188)
+    for tile_m in (64, 128):
+        assert engines.mismatch(spec.capabilities, g6_facts, dataclasses.replace(g6, tile_m=tile_m, tile_n=64)) is None
+
+    fp8_name = "sdpa_fwd_prefill_sm120_fp8"
+    fp8 = next(spec for spec in engines.ENGINE_SPECS if spec.name == fp8_name).capabilities
+    fp8_facts = dataclasses.replace(facts, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.HALF, is_fp8=True)
+    assert all(p.knobs.split_kv in (None, 1) for p in recommend("A", fp8_facts, {fp8_name: 20505}))
+    g6_fp8 = dataclasses.replace(g6_facts, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.HALF, is_fp8=True)
+    assert "PackGQA" in (engines.mismatch(fp8, g6_fp8, dataclasses.replace(g6, tile_m=128, tile_n=64, split_kv=1)) or "")
+
+    no_split_sink = dataclasses.replace(spec, capabilities=dataclasses.replace(spec.capabilities, split_sink=False))
+    assert all(knobs.split_kv in (None, 1) for knobs in _knob_sets(no_split_sink, facts))
+    assert "a sink splits on the SM100 and SM120 half flavors only" in (engines.mismatch(no_split_sink.capabilities, facts, sink) or "")
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("tile_m", [64, 128])
+@pytest.mark.parametrize("s_q", [1, 21, 51, 64])
+def test_sm120_tail_packed_launch_counts_token_tiles(tile_m, s_q):
+    """A tail-packed tile holds tile_m // G tokens, so the split model sees
+    ceil(S_q / (tile_m // G)) Q tiles per packed head -- the grid the kernel
+    launches -- not ceil(S_q * G / tile_m) (G = 5: 51 tokens over 12-token
+    tiles are 5 tiles, not 4)."""
+    from cudnn.sdpa.fwd.heuristics import _split_launch
+
+    spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm120")
+    facts = _facts(s_q=s_q, s_kv=32768, h_q=40, h_kv=8, causal=True, bottom_right=True, device_cc=(12, 0), device_sm_count=188)
+    launch = _split_launch(spec.capabilities, facts, tile_m, 128, 1, 5)
+    assert (launch.q_tiles, launch.heads_q) == (math.ceil(s_q / (tile_m // 5)), 8)
 
 
 @pytest.mark.L0

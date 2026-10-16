@@ -202,6 +202,7 @@ def validate_params(
     allowed_dtypes: tuple[int, ...] = (DTYPE_BF16, DTYPE_FP16),
     allowed_o_dtypes: tuple[int, ...] = (DTYPE_BF16, DTYPE_FP16),
     allow_right_band: bool = True,
+    split_sink: bool = False,
 ) -> None:
     """Validate the SM120 template specialization.
 
@@ -211,7 +212,9 @@ def validate_params(
     FP16/BF16 template's sets (which stores O at the input dtype and plumbs no
     quantizing epilogue); the FP8 template passes its own — FP8 in, any of its
     four quantizing-store epilogues out. ``allow_right_band=False`` rejects a
-    widened right band for templates that do not plumb one.
+    widened right band for templates that do not plumb one. ``split_sink=True``
+    admits an attention sink under a KV split, for templates whose split
+    partials are sink-free (the combine folds the sink once).
     """
 
     if params.dtype_qkv not in allowed_dtypes:
@@ -224,10 +227,11 @@ def validate_params(
         # Each of these would need extra machinery in the combine pass.
         if params.thd_varlen:
             raise ValueError("SM120 SDPA: split_kv > 1 is dense-only (THD packs its own flat grid)")
-        if params.has_sink:
-            # The sink logit is folded into the softmax denominator per tile, so
-            # every split would add its own copy of it.
-            raise ValueError("SM120 SDPA: split_kv > 1 with an attention sink is not supported")
+        if params.has_sink and not split_sink:
+            # A template that folds the sink into every split's partial would add
+            # one copy of it per split to the merged denominator; the sink-free
+            # templates leave the fold to the combine.
+            raise ValueError("SM120 SDPA: split_kv > 1 with an attention sink is not supported by this template")
         if params.sched_policy != SCHED_NATURAL:
             # The split index rides the NATURAL grid's batch axis (y = batch +
             # split*B); LPT / LPT_L2 flatten the grid to 1-D and derive the batch

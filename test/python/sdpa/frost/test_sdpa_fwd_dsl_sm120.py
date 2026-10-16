@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import math
+from typing import NamedTuple
 
 import pytest
 import torch
@@ -171,6 +172,7 @@ def _run_case(
     stats_use_log2: bool = False,
     pack_gqa: bool | None = None,
     stats_layout: str = "contiguous",
+    poison: bool = False,
 ) -> None:
     q = _bhsd(batch, h_q, s_q, head_dim, dtype)
     k = _bhsd(batch, h_kv, s_kv, head_dim, dtype)
@@ -197,6 +199,7 @@ def _run_case(
         return_stats=check_stats,
         stats_use_log2=stats_use_log2,
         stats_layout=stats_layout,
+        poison=poison,
         **mask_kwargs,
     )
     if check_stats:
@@ -252,12 +255,14 @@ def _run_dsl_graph(
     return_stats: bool = False,
     stats_use_log2: bool = False,
     stats_layout: str = "contiguous",
+    poison: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Build, select, and execute the SM120 FROST graph engine.
 
     Returns O, or ``(O, stats)`` with a ``(B, H, Sq, 1)`` fp32 stats tensor
     when ``return_stats`` is set. ``sinks`` is a ``(1, H, 1, 1)`` fp32
-    per-Q-head sink-logit tensor.
+    per-Q-head sink-logit tensor. ``poison`` fills O and Stats with NaN
+    before the launch, so a live row the kernel leaves unwritten fails.
     """
 
     _require_dsl()
@@ -350,6 +355,10 @@ def _run_dsl_graph(
     assert graph.get_workspace_size() == expected_workspace, (split_kv, graph.get_workspace_size(), expected_workspace)
 
     variant_pack[o] = o_gpu
+    if poison:
+        o_gpu.fill_(float("nan"))
+        if stats_gpu is not None:
+            stats_gpu.fill_(float("nan"))
     graph.execute(
         variant_pack,
         torch.empty(max(expected_workspace, 1), dtype=torch.uint8, device="cuda"),
@@ -1595,8 +1604,238 @@ def test_dsl_sm120_pack_gqa_tiles(s_q: int):
 @pytest.mark.L0
 @torch_fork_set_rng(seed=2)
 def test_dsl_sm120_pack_gqa_tile64():
-    """Packed at q_tile=64 (G must divide the smaller tile: 8/2 -> G=4)."""
+    """Packed at q_tile=64 (8/2 -> G=4 divides the smaller tile)."""
     _run_case(batch=2, h_q=8, h_kv=2, s_q=24, s_kv=192, head_dim=64, is_causal=True, q_tile=64, kv_tile=64, pack_gqa=True, check_stats=True)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("q_tile", [64, 128])
+@pytest.mark.parametrize("h_q,h_kv", [(6, 1), (12, 2), (20, 4), (21, 3)], ids=["g6", "g6x2", "g5", "g7"])
+@pytest.mark.parametrize("s_q", [1, 5, 23], ids=["decode", "mtp", "multi_tile"])
+@pytest.mark.parametrize("mask", ["causal_br", "swa_sink"])
+@torch_fork_set_rng(seed=5)
+def test_dsl_sm120_pack_gqa_whole_group_tail(q_tile: int, h_q: int, h_kv: int, s_q: int, mask: str):
+    """A group that does not divide q_tile packs q_tile // G tokens per tile
+    through the graph path (the plan the heuristics rank), every live row
+    written: O and Stats start as NaN."""
+    kw: dict = dict(batch=2, h_q=h_q, h_kv=h_kv, s_q=s_q, s_kv=300, head_dim=128, q_tile=q_tile, pack_gqa=True, check_stats=True, poison=True)
+    if mask == "causal_br":
+        kw.update(is_causal=True, causal_bottom_right=True, window_size_right=0)
+    else:
+        kw.update(is_causal=True, causal_bottom_right=True, window_size_right=0, window_size_left=40, with_sink=True)
+    _run_case(**kw)
+
+
+def _run_direct(
+    *,
+    d: int,
+    h_q: int,
+    h_kv: int,
+    s_q: int,
+    s_kv: int,
+    tile_m: int,
+    tile_n: int,
+    pack_gqa: bool,
+    split_kv: int = 1,
+    batch: int = 1,
+    dtype: torch.dtype = torch.float16,
+    is_causal: bool = True,
+    causal_bottom_right: bool = False,
+    window_size_left: int | None = None,
+    sinks: torch.Tensor | None = None,
+    stats_log2: bool = False,
+) -> None:
+    """Run one pinned SM120 plan through the adapter (q_tile, kv_tile, packing
+    and split exactly as given) with NaN-poisoned O and Stats, and compare
+    both against the fp32 reference."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+
+    q = _bhsd(batch, h_q, s_q, d, dtype)
+    k = _bhsd(batch, h_kv, s_kv, d, dtype)
+    v = _bhsd(batch, h_kv, s_kv, d, dtype)
+    o = torch.full((batch, s_q, h_q, d), float("nan"), device="cuda", dtype=dtype).transpose(1, 2)
+    lse = torch.full((batch, h_q, s_q), float("nan"), device="cuda", dtype=torch.float32)
+    scale = 1.0 / math.sqrt(d)
+    mask = dict(is_causal=is_causal, causal_bottom_right=causal_bottom_right, window_size_left=window_size_left)
+    if is_causal:
+        mask["window_size_right"] = 0
+    api = SdpaFwdDslSm120(
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_o=o,
+        sample_lse=lse,
+        has_sink=sinks is not None,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        pack_gqa=pack_gqa,
+        split_kv=split_kv,
+        sched_policy=0,
+        scale_softmax=scale,
+        stats_log2=stats_log2,
+        **mask,
+    )
+    assert api.check_support()
+    assert (api.q_tile, api.split_kv) == (tile_m, split_kv)
+    api.compile()
+    ws_bytes = api.scratch_workspace_bytes()
+    ws = torch.empty(ws_bytes, dtype=torch.uint8, device="cuda") if ws_bytes else None
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse, sinks=sinks, workspace=ws)
+    torch.cuda.synchronize()
+    ref_o, ref_lse = _ref_sdpa_full(q, k, v, scale=scale, sinks=sinks, return_stats=True, **mask)
+    torch.testing.assert_close(o.float(), ref_o, atol=0.1, rtol=5e-2)
+    torch.testing.assert_close(lse, ref_lse * (math.log2(math.e) if stats_log2 else 1.0), atol=2e-2, rtol=2e-2)
+
+
+class _TailCase(NamedTuple):
+    d: int
+    h_q: int
+    h_kv: int
+    s_q: int
+    s_kv: int
+    tile_m: int
+    tile_n: int
+    causal_bottom_right: bool = False
+    window_size_left: int | None = None
+    split_kv: int = 1
+    sink: bool = False
+    dtype: torch.dtype = torch.float16
+
+
+_TAIL_CASES = {
+    # Top-left causal: a tail-packed tile's tokens start off the KV-tile grid, so
+    # its causal frontier straddles one more KV tile than a dividing group's
+    # (G = 3 at 128 rows: 42-token tiles whose low rows would see many future keys).
+    "g3_tl_q128_kv64": _TailCase(128, 12, 4, 128, 128, 128, 64),
+    "g3_tl_swa_split2": _TailCase(128, 12, 4, 1024, 1024, 128, 64, window_size_left=500, split_kv=2),
+    # Top-left geometry at a 128-key tile, d64 and bf16.
+    "g6_tl_q128_kv128": _TailCase(128, 24, 4, 200, 200, 128, 128),
+    "g7_tl_d64_bf16": _TailCase(64, 21, 3, 150, 150, 64, 128, dtype=torch.bfloat16),
+    # Bottom-right: S_q values where ceil(S_q / (q_tile // G)) differs from
+    # ceil(S_q * G / q_tile), so a short Q-tile count leaves tokens unwritten.
+    "g6_br_q64_sq21": _TailCase(128, 24, 4, 21, 300, 64, 64, causal_bottom_right=True),
+    "g5_br_q64_sq64_split2_sink": _TailCase(128, 20, 4, 64, 700, 64, 128, causal_bottom_right=True, split_kv=2, sink=True),
+    # The d256 template at both Q tiles.
+    "d256_g3_tl_q128": _TailCase(256, 12, 4, 200, 200, 128, 64),
+    "d256_g6_tl_q64": _TailCase(256, 12, 2, 200, 200, 64, 64),
+    "d256_g6_br_q64_sq21_split2_sink": _TailCase(256, 12, 2, 21, 300, 64, 64, causal_bottom_right=True, split_kv=2, sink=True),
+}
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("case", list(_TAIL_CASES.values()), ids=list(_TAIL_CASES))
+@torch_fork_set_rng(seed=7)
+def test_sm120_tail_packed_tiles(case: _TailCase):
+    """Whole-group PackGQA on pinned tiles: q_tile // G tokens per tile, the
+    tail rows dead.  Every live row's causal frontier is masked (top-left
+    tiles start off the KV-tile grid), every token's Q tile is launched, and
+    Stats come back with the rows' O."""
+    sinks = torch.randn(1, case.h_q, 1, 1, device="cuda", dtype=torch.float32) * 2 if case.sink else None
+    _run_direct(
+        d=case.d,
+        h_q=case.h_q,
+        h_kv=case.h_kv,
+        s_q=case.s_q,
+        s_kv=case.s_kv,
+        tile_m=case.tile_m,
+        tile_n=case.tile_n,
+        pack_gqa=True,
+        split_kv=case.split_kv,
+        dtype=case.dtype,
+        causal_bottom_right=case.causal_bottom_right,
+        window_size_left=case.window_size_left,
+        sinks=sinks,
+    )
+
+
+def _split0_geometry(*, h_q, h_kv, s_q, s_kv, tile_m, tile_n, split_kv, pack_gqa, causal_bottom_right, window_size_left=None, **_):
+    """(rows whose visible keys all miss split 0, rows with no visible key) for a
+    bottom-right causal case, from the template's per-Q-tile KV range: the
+    masked tiles [first valid key's tile, causal end's tile) cut into
+    ``split_kv`` near-equal chunks, the first ``rem`` taking one extra tile."""
+    assert causal_bottom_right
+    tokens = tile_m // (h_q // h_kv) if pack_gqa else tile_m
+    shift = s_kv - s_q
+    missing = keyless = 0
+    for q0 in range(0, s_q, tokens):
+        k_end = max(0, min(q0 + tokens + shift, s_kv))
+        hi = -(-k_end // tile_n)
+        lo = max(0, q0 + shift - window_size_left) // tile_n if window_size_left is not None else 0
+        per, rem = divmod(hi - lo, split_kv)
+        split0_end = (lo + per + (1 if rem else 0)) * tile_n
+        for row in range(q0, min(q0 + tokens, s_q)):
+            last = row + shift
+            first = max(0, last - window_size_left) if window_size_left is not None else 0
+            if last < 0:
+                keyless += 1
+            elif first >= split0_end:
+                missing += 1
+    return missing, keyless
+
+
+_KEYLESS_CASES = {
+    # Unpacked 64-token tiles whose windows reach back 33 keys: the later rows'
+    # windows start past split 0's tile, so split 0 holds none of their keys (a
+    # dead partial beside a live split) and the combine still folds their sink.
+    "window_past_split0": dict(
+        d=128, h_q=8, h_kv=2, s_q=128, s_kv=1024, tile_m=64, tile_n=64, split_kv=8, causal_bottom_right=True, window_size_left=32, pack_gqa=False
+    ),
+    "window_past_split0_d512": dict(
+        d=512, h_q=8, h_kv=2, s_q=64, s_kv=512, tile_m=64, tile_n=32, split_kv=4, causal_bottom_right=True, window_size_left=16, pack_gqa=False
+    ),
+    # S_q > S_kv bottom-right: the leading rows see no key at all, on every
+    # template split and unsplit (the unsplit fold has no combine to drop a NaN).
+    "rows_without_keys": dict(d=128, h_q=8, h_kv=2, s_q=64, s_kv=16, tile_m=64, tile_n=64, split_kv=2, causal_bottom_right=True, pack_gqa=True),
+    "rows_without_keys_unsplit": dict(d=128, h_q=8, h_kv=2, s_q=64, s_kv=16, tile_m=64, tile_n=64, split_kv=1, causal_bottom_right=True, pack_gqa=True),
+    "rows_without_keys_d256_log2": dict(
+        d=256, h_q=8, h_kv=2, s_q=64, s_kv=16, tile_m=64, tile_n=64, split_kv=2, causal_bottom_right=True, stats_log2=True, pack_gqa=True
+    ),
+    "rows_without_keys_d256_unsplit": dict(d=256, h_q=8, h_kv=2, s_q=64, s_kv=16, tile_m=64, tile_n=64, split_kv=1, causal_bottom_right=True, pack_gqa=True),
+    "rows_without_keys_d512_unsplit": dict(d=512, h_q=8, h_kv=2, s_q=64, s_kv=16, tile_m=64, tile_n=32, split_kv=1, causal_bottom_right=True, pack_gqa=True),
+}
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("neg_inf_sink", [False, True], ids=["finite", "neg_inf"])
+@pytest.mark.parametrize("case", list(_KEYLESS_CASES.values()), ids=list(_KEYLESS_CASES))
+@torch_fork_set_rng(seed=8)
+def test_sm120_sink_rows_without_keys(case: dict, neg_inf_sink: bool):
+    """Split partials are sink-free and the combine folds the sink once, also
+    for a row whose keys all miss split 0; a row with no key at all ends with
+    O := 0 and LSE := sink, split (the combine's fold) and unsplit (the
+    kernel's); a -inf sink leaves such a row at O := 0, LSE := -inf.  Every
+    head has its own sink."""
+    missing, keyless = _split0_geometry(**case)
+    assert (missing if case.get("window_size_left") is not None else keyless) > 0, "the case no longer produces the rows it is named for"
+    sinks = torch.randn(1, case["h_q"], 1, 1, device="cuda", dtype=torch.float32) * 2
+    if neg_inf_sink:
+        sinks[0, ::3] = float("-inf")
+    _run_direct(sinks=sinks, **case)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("h_q,h_kv", [(12, 2), (20, 4)], ids=["g6", "g5"])
+@pytest.mark.parametrize("s_q", [5, 23], ids=["mtp", "multi_tile"])
+@torch_fork_set_rng(seed=6)
+def test_dsl_sm120_d256_pack_gqa_whole_group_tail(h_q: int, h_kv: int, s_q: int):
+    """The d256 template's whole-group packing with dead tail rows, on the
+    128-row tile its packed plans ride (the 64-row tail tile is pinned by
+    test_sm120_tail_packed_tiles)."""
+    _run_case(
+        batch=2,
+        h_q=h_q,
+        h_kv=h_kv,
+        s_q=s_q,
+        s_kv=300,
+        head_dim=256,
+        q_tile=128,
+        pack_gqa=True,
+        check_stats=True,
+        is_causal=True,
+        causal_bottom_right=True,
+        window_size_right=0,
+        poison=True,
+    )
 
 
 @pytest.mark.L0
