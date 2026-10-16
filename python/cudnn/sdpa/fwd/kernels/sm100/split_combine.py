@@ -1679,12 +1679,7 @@ def _launch_combine(
     # runtime-shape entry) takes the module's forms, whose bounded element loads and stores serve it.
     use_decode_grid = cutlass.Int32(0) == cutlass.Int32(1)
     if cutlass.const_expr(
-        decode_grid != DECODE_GRID_OFF
-        and o_partial.element_type == cutlass.Float32
-        and amax_o is None
-        and scale_o is None
-        and sinks is None
-        and q_lens is None
+        decode_grid != DECODE_GRID_OFF and o_partial.element_type == cutlass.Float32 and amax_o is None and scale_o is None and sinks is None and q_lens is None
     ):
         d32 = cutlass.Int32(D)
         o_base = o_partial.iterator.toint()
@@ -1812,7 +1807,26 @@ def _host_ptr(
         o_partial_ptr, lse_partial_ptr, o_out_ptr, lse_out_ptr, problem_size, n_splits, o_strides, lse_strides
     )
     _launch_combine(
-        o_partial, lse_partial, o_out, lse_out, None, None, problem_size, n_splits, stats_log2, None, None, None, (1, 1, 1), (0, 0), None, decode_grid, stream, None, None, use_pdl
+        o_partial,
+        lse_partial,
+        o_out,
+        lse_out,
+        None,
+        None,
+        problem_size,
+        n_splits,
+        stats_log2,
+        None,
+        None,
+        None,
+        (1, 1, 1),
+        (0, 0),
+        None,
+        decode_grid,
+        stream,
+        None,
+        None,
+        use_pdl,
     )
 
 
@@ -1844,7 +1858,26 @@ def _host_ptr_gated(
     B, H, SQ, D = problem_size
     gate = cute.make_tensor(gate_ptr, cute.make_layout((B, SQ, H, D), stride=gate_strides))
     _launch_combine(
-        o_partial, lse_partial, o_out, lse_out, None, None, problem_size, n_splits, stats_log2, None, None, None, (1, 1, 1), (0, 0), gate, decode_grid, stream, None, None, use_pdl
+        o_partial,
+        lse_partial,
+        o_out,
+        lse_out,
+        None,
+        None,
+        problem_size,
+        n_splits,
+        stats_log2,
+        None,
+        None,
+        None,
+        (1, 1, 1),
+        (0, 0),
+        gate,
+        decode_grid,
+        stream,
+        None,
+        None,
+        use_pdl,
     )
 
 
@@ -1908,7 +1941,23 @@ def _host_ptr_quantized(
     if cutlass.const_expr(has_scale_o):
         scale_o = cute.make_tensor(scale_o_ptr, cute.make_layout((1,), stride=(1,)))
     _launch_combine(
-        o_partial, lse_partial, o_out, lse_out, amax_o, scale_o, problem_size, n_splits, stats_log2, None, None, None, (1, 1, 1), (0, 0), None, DECODE_GRID_OFF, stream
+        o_partial,
+        lse_partial,
+        o_out,
+        lse_out,
+        amax_o,
+        scale_o,
+        problem_size,
+        n_splits,
+        stats_log2,
+        None,
+        None,
+        None,
+        (1, 1, 1),
+        (0, 0),
+        None,
+        DECODE_GRID_OFF,
+        stream,
     )
     if cutlass.const_expr(amax_o_ptr is not None and not has_scale_o and scale_o_ptr is not None):
         _unscale_amax_kernel(amax_o_ptr, scale_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
@@ -1999,7 +2048,24 @@ def _host_ptr_sink(
     )
     sinks = _sink_operand(sinks_ptr, problem_size)
     _launch_combine(
-        o_partial, lse_partial, o_out, lse_out, None, None, problem_size, n_splits, stats_log2, None, None, None, (1, 1, 1), (0, 0), None, decode_grid, stream, sinks
+        o_partial,
+        lse_partial,
+        o_out,
+        lse_out,
+        None,
+        None,
+        problem_size,
+        n_splits,
+        stats_log2,
+        None,
+        None,
+        None,
+        (1, 1, 1),
+        (0, 0),
+        None,
+        decode_grid,
+        stream,
+        sinks,
     )
 
 
@@ -2028,7 +2094,25 @@ def _host_ptr_sink_q_lens(
     sinks = _sink_operand(sinks_ptr, problem_size)
     q_lens = cute.make_tensor(q_lens_ptr, cute.make_layout((problem_size[0],), stride=(1,)))
     _launch_combine(
-        o_partial, lse_partial, o_out, lse_out, None, None, problem_size, n_splits, stats_log2, None, None, None, (1, 1, 1), (0, 0), None, decode_grid, stream, sinks, q_lens
+        o_partial,
+        lse_partial,
+        o_out,
+        lse_out,
+        None,
+        None,
+        problem_size,
+        n_splits,
+        stats_log2,
+        None,
+        None,
+        None,
+        (1, 1, 1),
+        (0, 0),
+        None,
+        decode_grid,
+        stream,
+        sinks,
+        q_lens,
     )
 
 

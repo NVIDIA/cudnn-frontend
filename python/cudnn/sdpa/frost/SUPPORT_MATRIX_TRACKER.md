@@ -2809,6 +2809,8 @@ per-sequence fp32 oracle (the block on the full sequence, its last `S_q` rows; t
 rows; cos > 0.999 on every live row, the padded entry's rows EXACTLY 0, block 0's bytes untouched), the compiled kernel pinned
 against the declared route (template, packing, split, `epilogue_gate` False):
 
+2026-10-16: the DECODE-GRID combine form (`sm100/split_combine._combine_decode_grid_kernel`, the split-aware form rule `heuristics.decode_combine_grid_selected` and the adapter's plan-time pin in `fwd/prepared.py`) is the cc 10.7 row's: off cc 10.7 the rule answers False and the plan pins the combine module's own three-way rule (the lean group, the serial walk and its decode form, with the attention-sink fold), measured on its own line; no capability field changes.
+
 The route of record (2026-10-15, the fill 2026-10-16; the default policy `single_unit`; `tile N` = the Rubin d256 decode tile at N
 columns with the whole group packed, `T64 x 2` = two token units of the 64-column tile, `PREFILL` = the paged d256 prefill tile with the
 group packed -- taken where the step FILLS the part, `B x H_kv >= DECODE_PREFILL_ROUTE_MIN_CTAS` = 64 CTAs, with `T64 x 2` below that

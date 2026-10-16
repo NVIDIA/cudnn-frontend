@@ -1147,7 +1147,10 @@ def test_decode_tile_lines_are_named_by_the_device_cc_and_the_row():
     assert [heur._decode_tile_blackwell_line(cc) for cc in ((10, 0), (10, 3), (10, 7), None, (8, 0), (12, 0))] == [True, True, False, False, False, False]
     rows = {s.capabilities.sm_lo: heur.decode_tile_line_cc(s.capabilities) for s in ENGINE_SPECS}
     assert rows[107] == (10, 7) and rows[100] == (10, 0)
-    assert heur.decode_tile_split_launch_cost(next(s.capabilities for s in ENGINE_SPECS if s.capabilities.sm_lo == 107)) == heur._DECODE_TILE_SPLIT_LAUNCH_COST_CC107
+    assert (
+        heur.decode_tile_split_launch_cost(next(s.capabilities for s in ENGINE_SPECS if s.capabilities.sm_lo == 107))
+        == heur._DECODE_TILE_SPLIT_LAUNCH_COST_CC107
+    )
     assert heur.decode_tile_split_launch_cost(next(s.capabilities for s in ENGINE_SPECS if s.capabilities.sm_lo == 100)) == heur._DECODE_TILE_SPLIT_LAUNCH_COST
     # the default charge is the line's: naming it changes nothing
     for units, s_kv in ((64, 4096), (64, 8192), (2, 2048), (2, 1024)):

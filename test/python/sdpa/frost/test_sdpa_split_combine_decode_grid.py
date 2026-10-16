@@ -1,23 +1,28 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""The shared split combine's DECODE-GRID form (``sm100/split_combine._combine_decode_kernel``): one block per (row, head,
-batch, 64-column chunk) with the split axis spread over the block's eight 16-lane chains and merged once, in a fixed order,
-through SMEM -- against the lean kernel (``_combine_kernel``) it replaces on decode-shaped grids.
+"""The shared split combine's DECODE-GRID form (``sm100/split_combine._combine_decode_grid_kernel``): one block per (row,
+head, batch, 64-column chunk) with the split axis spread over the block's eight 16-lane chains and merged once, in a fixed
+order, through SMEM -- against the module's own forms (``_combine_kernel``'s lean group and serial walk, and its decode form
+``_combine_decode_kernel`` past 16 splits at S_q <= 2) it replaces on decode-shaped grids.  ``DECODE_GRID_OFF`` is the
+module's own three-way rule: at <= 16 splits that is the lean group (``lean_wide``) or the serial walk, whose arithmetic
+is the decode-grid kernel's own sequence, so the BITWISE pins below hold against it; past 16 splits at S_q <= 2 it is the
+decode form, another fp32 association, so there the reference bound is the only claim (and what the cells assert).
 
 What this module pins: (1) the SELECTION -- the host twin ``decode_grid_selected`` reads the lean kernel's grid against
 ``heuristics.DECODE_COMBINE_MAX_LEAN_BLOCKS`` (a decode step's tens of blocks take the decode-grid kernel, a prefill's
-thousands keep the lean one), the ``decode_grid`` keyword of ``compile_ptr`` is validated, and a decode-shaped launch of
-the default entry runs the decode-grid kernel while a prefill-shaped launch runs the lean kernel (the kernel NAMES, from
-the profiler); (2) the NUMERICS on decode cells (B 1 / B 4, 24 Q heads, S_q 1 / 4, d 256, plus the suite's d 160 shape
-and the small head dims) at splits 2 .. 130: the float64 reference at the suite's tolerances, dead splits and dead rows,
-the LSE in both bases, two launches bitwise (every reduction is in a fixed order), and -- where the summation order is
-UNCHANGED, ``n_splits <= 16`` (only chain 0 holds splits) -- the decode-grid output BITWISE the lean kernel's on the same
-inputs; past 16 splits the sum is associated differently and only the reference bound holds; (3) the gate-in-combine
-entry on the decode grid (the fp32 merged value times sigmoid(G) before the one rounding, the dead-row SELECT under a NaN
-gate, bitwise the lean kernel at <= 16 splits); (4) the ragged-Q placement (packed O / Stats at the per-sequence offsets,
-a zero-length sequence, the capacity bound, int32 and int64 offsets).  Runs on any SM100-line part (the kernel has no
-arch-specific lowering; the gate entry's packed f32x2 arithmetic is Blackwell-only like the fused kernels')."""
+thousands keep the module's own forms), the ``decode_grid`` keyword of ``compile_ptr`` is validated, and a decode-shaped
+launch of the default entry runs the decode-grid kernel while a prefill-shaped launch runs the module's lean / serial
+kernel (the kernel NAMES, from the profiler); (2) the NUMERICS on decode cells (B 1 / B 4, 24 Q heads, S_q 1 / 4, d 256,
+plus the suite's d 160 shape and the small head dims) at splits 2 .. 130: the float64 reference at the suite's
+tolerances, dead splits and dead rows, the LSE in both bases, two launches bitwise (every reduction is in a fixed order),
+and -- where the summation order is UNCHANGED, ``n_splits <= 16`` (only chain 0 holds splits) -- the decode-grid output
+BITWISE the OFF form's on the same inputs; past 16 splits the sum is associated differently and only the reference bound
+holds; (3) the gate-in-combine entry on the decode grid (the fp32 merged value times sigmoid(G) before the one rounding,
+the dead-row SELECT under a NaN gate, bitwise the OFF form at <= 16 splits); (4) the ragged-Q placement (packed O / Stats
+at the per-sequence offsets, a zero-length sequence, the capacity bound, int32 and int64 offsets).  Runs on any SM100-line
+part (the kernel has no arch-specific lowering; the gate entry's packed f32x2 arithmetic is Blackwell-only like the fused
+kernels'); the graph-level cells are the Rubin adapter's, which pins the form per plan (the Blackwell adapter pins OFF)."""
 
 import math
 
@@ -101,6 +106,16 @@ def _same(a, b):
     return all((x is None and y is None) or (x is not None and y is not None and torch.equal(x, y)) for x, y in zip(a, b))
 
 
+# The kernel names the profiler reports: the decode-grid kernel, and the module's own forms (``_combine_kernel`` -- the lean
+# group and the serial walk -- and its decode form ``_combine_decode_kernel``, a different prefix from the decode-grid kernel's).
+_DECODE_GRID_KERNEL = "cudnn_kernel__combine_decode_grid_kernel"
+_OWN_FORM_KERNELS = ("cudnn_kernel__combine_kernel", "cudnn_kernel__combine_decode_kernel")
+
+
+def _own_form(name):
+    return name.startswith(_OWN_FORM_KERNELS) and not name.startswith(_DECODE_GRID_KERNEL)
+
+
 # --- (1) the selection ---------------------------------------------------------------------------------------------
 
 
@@ -133,13 +148,13 @@ def test_selection_rule_reads_the_lean_grid_against_the_heuristics_constant():
 @requires_dsl
 def test_decode_grid_geometry_constants():
     """The chain geometry is derived: 16 lanes x 4 columns = the 64-column chunk, eight chains per 128-thread block, the
-    per-chain slot count is the lean kernel's group width (so <= 16 splits sit in ONE chain: the bitwise window), and the
+    per-chain slot count is 16, the lean wide group's width (``G_S``; the former group walk's ``G_T``), so <= 16 splits sit in ONE chain: the bitwise window, and the
     SMEM exchange holds a max + a sum per chain plus four columns per lane."""
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 
     assert comb.DECODE_LANES_PER_CHAIN * 4 == comb.DECODE_CHUNK_COLS == 64
     assert comb.DECODE_CHAINS * comb.DECODE_LANES_PER_CHAIN == comb.DECODE_THREADS == 128
-    assert comb.DECODE_SPLITS_PER_CHAIN == comb.G_T == 16
+    assert comb.DECODE_SPLITS_PER_CHAIN == comb.G_S == 16
     assert comb.DECODE_SPLITS_PER_ROUND == 128
     assert comb.DECODE_RED_WORDS == 2 * comb.DECODE_CHAINS + comb.DECODE_CHAINS * comb.DECODE_LANES_PER_CHAIN * 4
     assert len({comb.DECODE_GRID_AUTO, comb.DECODE_GRID_ON, comb.DECODE_GRID_OFF}) == 3
@@ -173,10 +188,10 @@ def test_decode_shaped_launch_runs_the_decode_grid_kernel_and_a_prefill_shaped_o
 
     decode = names(1, 24, 1, 256, 16)
     prefill = names(2, 4, 1024, 256, 4)
-    assert any(n.startswith("cudnn_kernel__combine_decode_kernel") for n in decode), decode
-    assert not any(n.startswith("cudnn_kernel__combine_kernel") for n in decode), decode
-    assert any(n.startswith("cudnn_kernel__combine_kernel") for n in prefill), prefill
-    assert not any(n.startswith("cudnn_kernel__combine_decode_kernel") for n in prefill), prefill
+    assert any(n.startswith(_DECODE_GRID_KERNEL) for n in decode), decode
+    assert not any(_own_form(n) for n in decode), decode
+    assert any(_own_form(n) for n in prefill), prefill
+    assert not any(n.startswith(_DECODE_GRID_KERNEL) for n in prefill), prefill
 
 
 # --- (2) the numerics ----------------------------------------------------------------------------------------------
@@ -464,6 +479,6 @@ def test_decode_graph_combine_kernel_follows_the_split_aware_rule(B, s_q, split,
     names = _combine_kernels_of(
         lambda: _run_graph(B=B, H=24, KH=2, s_q=s_q, lens=[8192] * B, page=16, hnd=True, dtype=torch.bfloat16, split_kv=split, causal_br=s_q > 1, seed=split)
     )
-    ran_decode = any(n.startswith("cudnn_kernel__combine_decode_kernel") for n in names)
-    ran_lean = any(n.startswith("cudnn_kernel__combine_kernel") for n in names)
+    ran_decode = any(n.startswith(_DECODE_GRID_KERNEL) for n in names)
+    ran_lean = any(_own_form(n) for n in names)
     assert (ran_decode, ran_lean) == (decode_grid, not decode_grid), (names, decode_grid)

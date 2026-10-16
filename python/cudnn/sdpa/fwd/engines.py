@@ -530,9 +530,7 @@ def _thd_decode_leg(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> b
     return len(widths) == 1
 
 
-def decode_d256_q_tile_for_row(
-    capabilities: Capabilities, s_q: int, pack_g: int, wide_launch: bool = False, paged: bool = False, masked: bool = True
-) -> int:
+def decode_d256_q_tile_for_row(capabilities: Capabilities, s_q: int, pack_g: int, wide_launch: bool = False, paged: bool = False, masked: bool = True) -> int:
     """The d256 decode tile's N extent (the Q rows of one token unit) a ROW routes ``s_q``
     tokens packed ``pack_g`` heads per token onto, or 0 for the prefill tile: the Rubin
     row's rule (``config_sm107.decode_d256_q_tile``, table-driven: the 32- and 64-column
