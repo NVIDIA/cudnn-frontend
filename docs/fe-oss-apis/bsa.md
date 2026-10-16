@@ -25,6 +25,10 @@ pipeline.
 
 BSA is implemented with Python CuTe DSL/JIT kernels.
 
+An opt-in [exact grouped blk64 -> blk128 API](bsa_grouped.md) supports fully
+pairable Q/KV neighborhoods on SM100/SM103, with explicit preparation and
+forward/backward GPU permutations.
+
 ## Installation
 
 The CuTe DSL runtime is a required dependency, so the base install is enough:

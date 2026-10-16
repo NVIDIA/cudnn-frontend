@@ -26,7 +26,14 @@ from importlib import import_module
 
 from cudnn.torch.sdpa_provider import calls, install, served_plan_names  # noqa: F401
 
-_BSA_EXPORTS = ("block_sparse_attention_forward", "block_sparse_attention_backward", "block_sparse_attention_fp8_forward")
+_BSA_EXPORTS = (
+    "block_sparse_attention_forward",
+    "block_sparse_attention_backward",
+    "block_sparse_attention_fp8_forward",
+    "block_sparse_attention_grouped_prepare",
+    "block_sparse_attention_grouped_forward",
+    "block_sparse_attention_grouped_backward",
+)
 
 
 def __getattr__(name):

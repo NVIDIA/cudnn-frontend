@@ -488,8 +488,86 @@ def block_sparse_attention_backward(
     return TupleDict(dq_tensor=dq, dk_tensor=dk, dv_tensor=dv)
 
 
+def block_sparse_attention_grouped_prepare(
+    q2k_block_index: torch.Tensor,
+    block_sparse_num: Optional[int] = None,
+    *,
+    num_kv_blocks: int,
+    q2k_block_nums: Optional[torch.Tensor] = None,
+    bucket_size_blocks: Optional[int] = None,
+):
+    """Snapshot and exactly coarsen a fully pairable blk64 graph to blk128.
+
+    Q blocks pair by identical valid KV sets; KV blocks pair by identical
+    reverse Q neighborhoods. No attention edges are added or dropped. Rejects
+    partial pairing, empty Q rows, duplicate valid indices and partial blocks.
+    ``num_kv_blocks`` is the full KV64 block count; ``bucket_size_blocks`` is
+    the backward bucket size in *Q128* blocks (None uses the native default).
+
+    Explicit CPU preprocessing with device transfers: not capturable. Build
+    once per unchanged sparse graph, before forward/backward or CUDA Graph
+    capture. The returned metadata is caller-owned and must not be mutated.
+    This is a standalone Torch utility, not a cuDNN graph execution plan.
+    """
+    from ._grouped import prepare
+
+    return prepare(
+        q2k_block_index,
+        block_sparse_num,
+        num_kv_blocks=num_kv_blocks,
+        q2k_block_nums=q2k_block_nums,
+        bucket_size_blocks=bucket_size_blocks,
+    )
+
+
+def block_sparse_attention_grouped_forward(
+    q_tensor: torch.Tensor,
+    k_tensor: torch.Tensor,
+    v_tensor: torch.Tensor,
+    grouping,
+    *,
+    softmax_scale: Optional[float] = None,
+) -> TupleDict:
+    """Explicit grouped FWD, returning O and natural-log LSE in original order.
+
+    Contiguous CUDA BSHD, BF16, MHA, D128, full Q/KV blocks, SM100/SM103,
+    CuTe DSL >= 4.7.0. ``grouping`` comes from grouped_prepare. This allocating
+    Torch wrapper runs on the operand device's current stream and includes
+    all GPU permutations. Warm before CUDA Graph capture. No autograd wrapper.
+    """
+    from ._grouped import forward
+
+    return forward(q_tensor, k_tensor, v_tensor, grouping, softmax_scale)
+
+
+def block_sparse_attention_grouped_backward(
+    dout_tensor: torch.Tensor,
+    q_tensor: torch.Tensor,
+    k_tensor: torch.Tensor,
+    v_tensor: torch.Tensor,
+    out_tensor: torch.Tensor,
+    lse_tensor: torch.Tensor,
+    grouping,
+    *,
+    softmax_scale: Optional[float] = None,
+) -> TupleDict:
+    """Explicit grouped BWD, returning dQ/dK/dV in original BSHD order.
+
+    Same contract as grouped_forward. Pass its O and LSE and the same scale
+    and metadata. Includes packing Q/K/V/O/dO/LSE, native blk128 backward
+    (all resets/preprocessing/conversion), and unpacking every gradient.
+    Uses the precomputed CSR; never rebuilds the graph or reads it to the CPU.
+    """
+    from ._grouped import backward
+
+    return backward(dout_tensor, q_tensor, k_tensor, v_tensor, out_tensor, lse_tensor, grouping, softmax_scale)
+
+
 __all__ = [
     "block_sparse_attention_forward",
     "block_sparse_attention_fp8_forward",
     "block_sparse_attention_backward",
+    "block_sparse_attention_grouped_prepare",
+    "block_sparse_attention_grouped_forward",
+    "block_sparse_attention_grouped_backward",
 ]
