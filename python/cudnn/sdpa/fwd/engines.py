@@ -885,8 +885,8 @@ def _warn_amax_s_declared_once() -> None:
     _amax_s_warned = True
     logging.getLogger(__name__).warning(
         "sdpa_fp8: the graph declares the deprecated Amax_S output, which the FROST engines do not produce, so it runs on "
-        "cuDNN backend engines only (up to ~2x slower on some shapes). Leave Amax_S virtual and use scale_s = 448 "
-        "(docs/operations/Attention.md, 'Amax S')."
+        "cuDNN backend engines only (up to ~2x slower on some shapes). Leave Amax_S virtual and set scale_s from the bounds in "
+        "docs/operations/Attention.md, 'Amax S' (448 for E4M3 without dropout)."
     )
 
 
