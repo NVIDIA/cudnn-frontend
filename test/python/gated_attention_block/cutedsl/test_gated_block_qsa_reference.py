@@ -280,7 +280,9 @@ class TestIdentityBound:
             w[o_q + hq * g.d_head : o_q + (hq + 1) * g.d_head] = w[o_k + (hq // rep) * g.d_head : o_k + (hq // rep + 1) * g.d_head]
         inp["w_qkvg"] = w
         h = inp["h"].clone()
-        h[0, 2049] = (h[0, 2051].float() * 30).to(h.dtype)  # token 2049 is in block 512, the block row 2051 loses
+        # token 2049 is in block 512, the block row 2051 loses; its score scales with the drawn |W_k h_2051|^2, so x30 fell short of
+        # 8 nats on ~5% of datasets (one is B200 seed 6)
+        h[0, 2049] = (h[0, 2051].float() * 60).to(h.dtype)
         inp["h"] = h
         qsa = _run_qsa(inp, g, block_lens=inp["block_lens"])
         dense = _run_dense(inp, g)
