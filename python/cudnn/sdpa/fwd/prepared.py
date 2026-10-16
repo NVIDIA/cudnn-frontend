@@ -907,9 +907,13 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     put("bias_extents", (1, 1))
     put("kv_mask_ptr", None)
     put("kv_mask_batch_stride", 0)
-    put("inv_scale_softmax", 1.0 / scale if scale != 0.0 else 1.0)
-    # Plans with negate_scores (SM100/SM107/SM120) run at |scale| (#1435).
-    put("scale_softmax_log2", (-scale if getattr(api, "_score_negated", False) else scale) * math.log2(math.e))
+    # Plans with negate_scores (SM100/SM107/SM120) run at |scale| (#1435): BMM1 negates S, and EVERY per-score constant of the kernel is
+    # bound at that one effective positive magnitude -- the exp2 scale and the additive arms' 1 / scale alike.  The bias / additive kv_mask
+    # arms fold their operand pre-scale as ``S_raw + bias * inv_scale``; with S_raw = -(Q.K) and inv_scale = 1 / |scale| that is
+    # |scale| * (-(Q.K) + bias / |scale|) = scale * Q.K + bias, while the SIGNED 1 / scale would enter the bias with its sign flipped.
+    effective_scale = -scale if getattr(api, "_score_negated", False) else scale
+    put("inv_scale_softmax", 1.0 / effective_scale if effective_scale != 0.0 else 1.0)
+    put("scale_softmax_log2", effective_scale * math.log2(math.e))
     put("scale_softmax", scale)  # SM90 retains natural units, including literal zero.
     put("thd_max_sq", int(api.s_q_max))
     put("n_thd_units", 0)
