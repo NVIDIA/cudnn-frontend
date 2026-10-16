@@ -162,7 +162,7 @@ _PROBE_SRC = textwrap.dedent('''
         print("SASS ARRIVE", sum(1 for ln in sass if "SYNCS.ARRIVE" in ln))
         print("SASS LINES", len(sass))
         import re
-        mnem = sorted({m.group(0) for ln in sass for m in [re.search(r"U?SYNCS\.ARRIVE[\w.]*", ln)] if m})
+        mnem = sorted({m.group(0) for ln in sass for m in [re.search(r"U?SYNCS\\.ARRIVE[\\w.]*", ln)] if m})
         print("SASS_ARRIVE_MNEMONICS", " ".join(mnem) if mnem else "none")
     ''')
 
