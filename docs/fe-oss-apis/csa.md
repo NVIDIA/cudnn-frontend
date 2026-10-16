@@ -91,7 +91,10 @@ assume the ratio \{2, 4\} guarantees at ratio=128):
      fp32 max — its forward chunk partials are un-normalized (up to `2 · ratio ×`
      the reference's normalized weighted sums), so e.g. uniform-score inputs with
      `|kv|` within a factor `~2 · ratio` of fp32 max return ±Inf where the eager
-     reference is still finite.
+     reference is still finite. Non-finite inputs follow the same rule wherever
+     they fall in the forward's window chunks: a NaN or +Inf `score + ape` at one
+     window position makes that output NaN, and a -Inf position (a masked one)
+     gets weight 0 (`test_r128_forward_special_values_match_eager`).
 
   On inputs whose fp32 intermediates stay finite in BOTH evaluation orders — the
   eager reference's and the fused kernels' (which saturate earlier, see 3.) —
