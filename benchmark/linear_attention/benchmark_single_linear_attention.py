@@ -218,7 +218,7 @@ def parse_args():
     parser.add_argument(
         "--fp32_checkpoints",
         action="store_true",
-        help="With --store_on, store the per-chunk states in fp32 instead of the io dtype (cudnn backend, GDN / GDP / KDA / GDN-2)",
+        help="With --store_on, store the per-chunk states in fp32 instead of the io dtype (cudnn backend)",
     )
     parser.add_argument(
         "--checkpoint_chunk_mult",
