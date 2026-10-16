@@ -196,6 +196,10 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
     num_householder = 1 if num_householder is None else int(num_householder)
     batch_invariant = bool(params.get("batch_invariant", False))
     overwrite_initial_state = bool(params.get("overwrite_initial_state", False))
+    # The sub-token families (GDP) take k / v / beta either expanded ([T*n, H, D] / [T*n, HO]) or token-major
+    # ([T, n, H, D] / [T, n, HO] with any token stride); every other family keeps the rank-3 / rank-2 forms.
+    sub_token = op in ("GDP", "GDP_SUMMARY")
+
     invalid = None
     missing_in = [p for p in required_in if p not in ins]
     missing_out = [p for p in required_out if p not in outs]
@@ -260,16 +264,40 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         params.get("dt_max", float("inf")) if params.get("dt_max") is not None else float("inf")
     ):
         invalid = "dt_min must not exceed dt_max"
-    elif op == "GDP" and ins["q"].dim and any(t.dim and int(t.dim[0]) != int(ins["q"].dim[0]) * num_householder for t in (ins["k"], ins["v"], ins["beta"])):
-        invalid = "GDP k/v/beta rows must equal q rows * num_householder (the sub-token expansion)"
+    elif (
+        op == "GDP"
+        and ins["q"].dim
+        and not all(
+            t is None
+            or not t.dim
+            or (
+                (int(t.dim[0]) == int(ins["q"].dim[0]) and int(t.dim[1]) == num_householder)
+                if len(t.dim) == r
+                else int(t.dim[0]) == int(ins["q"].dim[0]) * num_householder
+            )
+            for t, r in ((ins["k"], 4), (ins["v"], 4), (ins["beta"], 3))
+        )
+    ):
+        invalid = "GDP k/v/beta must carry q rows * num_householder expanded rows ([T*n, H, D] / [T*n, HO]) or be token-major ([T, n, H, D] / [T, n, HO])"
     elif op == "GDP" and ins["q"].dim and any(t is not None and t.dim and int(t.dim[0]) != int(ins["q"].dim[0]) for t in (ins["g"], ins.get("dO"))):
         invalid = "GDP g and dO rows must equal q rows (real tokens)"
     elif (
         op == "GDP_SUMMARY"
         and ins["g"].dim
-        and any(t is not None and t.dim and int(t.dim[0]) != int(ins["g"].dim[0]) * num_householder for t in (ins["k"], ins.get("v"), ins["beta"]))
+        and not all(
+            t is None
+            or not t.dim
+            or (
+                (int(t.dim[0]) == int(ins["g"].dim[0]) and int(t.dim[1]) == num_householder)
+                if len(t.dim) == r
+                else int(t.dim[0]) == int(ins["g"].dim[0]) * num_householder
+            )
+            for t, r in ((ins["k"], 4), (ins.get("v"), 4), (ins["beta"], 3))
+        )
     ):
-        invalid = "GDP_SUMMARY k/v/beta rows must equal g rows * num_householder (the sub-token expansion)"
+        invalid = (
+            "GDP_SUMMARY k/v/beta must carry g rows * num_householder expanded rows ([T*n, H, D] / [T*n, HO]) or be token-major ([T, n, H, D] / [T, n, HO])"
+        )
     elif op == "GDP_SUMMARY" and is_bwd and ins["g"].dim and any(t.dim and int(t.dim[0]) != int(ins["g"].dim[0]) for t in (ins["q"], ins["dO"])):
         invalid = "GDP_SUMMARY q and dO rows must equal g rows (real tokens)"
     if invalid is not None:
@@ -281,10 +309,10 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
 
     if is_summary and is_bwd:
         g, do = ins["g"], ins["dO"]
-        thd_layout = all(t.dim and len(t.dim) == 3 for t in (q, k, do))
+        thd_layout = all(t.dim and len(t.dim) == 3 for t in (q, do)) and bool(k.dim) and (len(k.dim) == 3 or (sub_token and len(k.dim) == 4))
         if thd_layout:
             _, h_q, d_qk = (int(d) for d in q.dim)
-            h_k = int(k.dim[1])
+            h_k = int(k.dim[-2])
             h_v, d_v = int(do.dim[1]), int(do.dim[2])
         else:
             h_q = h_k = h_v = d_qk = d_v = 0
@@ -292,20 +320,29 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         total_t = int(g.dim[0]) if g.dim else 0
     elif is_summary:
         g = ins["g"]
-        thd_layout = all(t.dim and len(t.dim) == 3 for t in (k, v))
+        thd_layout = (
+            bool(k.dim) and (len(k.dim) == 3 or (sub_token and len(k.dim) == 4)) and bool(v.dim) and (len(v.dim) == 3 or (sub_token and len(v.dim) == 4))
+        )
         if thd_layout:
-            h_k, d_qk = int(k.dim[1]), int(k.dim[2])
-            h_v, d_v = int(v.dim[1]), int(v.dim[2])
+            h_k, d_qk = int(k.dim[-2]), int(k.dim[-1])
+            h_v, d_v = int(v.dim[-2]), int(v.dim[-1])
         else:
             h_k = h_v = d_qk = d_v = 0
         h_q = h_k
         h_o = int(g.dim[1]) if g.dim and len(g.dim) > 1 else max(h_q, h_v)
         total_t = int(g.dim[0]) if g.dim else 0
     else:
-        thd_layout = all(t.dim and len(t.dim) == 3 for t in (q, k, v))
+        thd_layout = (
+            bool(q.dim)
+            and len(q.dim) == 3
+            and bool(k.dim)
+            and (len(k.dim) == 3 or (sub_token and len(k.dim) == 4))
+            and bool(v.dim)
+            and (len(v.dim) == 3 or (sub_token and len(v.dim) == 4))
+        )
         if thd_layout:
             _, h_q, d_qk = (int(d) for d in q.dim)
-            h_k, h_v, d_v = int(k.dim[1]), int(v.dim[1]), int(v.dim[2])
+            h_k, h_v, d_v = int(k.dim[-2]), int(v.dim[-2]), int(v.dim[-1])
         else:
             h_q = h_k = h_v = d_qk = d_v = 0
         h_o = max(h_q, h_v)
@@ -316,7 +353,10 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
     if checkpoint_port is None:
         checkpoint_port = outs.get("state_checkpoints")
     state_checkpoint_rows = int(checkpoint_port.dim[0]) if checkpoint_port is not None and checkpoint_port.dim else 0
-    gates_at_ho = all(t is None or not t.dim or (len(t.dim) > 1 and int(t.dim[1]) == h_o) for t in (ins["g"], ins.get("beta"), ins.get("w")))
+    gates_at_ho = all(
+        t is None or not t.dim or (len(t.dim) > 1 and int(t.dim[-1] if (name == "beta" and sub_token and len(t.dim) == 3) else t.dim[1]) == h_o)
+        for name, t in (("g", ins["g"]), ("beta", ins.get("beta")), ("w", ins.get("w")))
+    )
     gate_channels = int(ins["g"].dim[2]) if ins["g"].dim and len(ins["g"].dim) == 3 else 0
     if is_summary:
         io_dtypes = ({in_dt["q"], in_dt["k"]} if is_bwd else {in_dt["k"], in_dt["v"]}) - {None}

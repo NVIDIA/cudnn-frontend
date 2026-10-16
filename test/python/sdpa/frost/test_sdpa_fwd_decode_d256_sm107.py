@@ -64,7 +64,7 @@ import pytest
 import torch
 
 from cudnn.frost.compiled_cache import positional_entry
-from cudnn.sdpa.fwd.heuristics import choose_decode_tile_split_kv
+from cudnn.sdpa.fwd.heuristics import _DECODE_TILE_SPLIT_LAUNCH_COST_CC107, choose_decode_tile_split_kv
 
 from frost_test_utils import _is_plan_for, launch_f16, offers_engine, requires_dsl, requires_rubin, select_engine
 from test_sdpa_fwd_decode_d256_sm100 import _pools, _ref, _served_by
@@ -811,9 +811,10 @@ def _assert_decode_tile_plan(plan, *, G, units=None, kv_tiles=None, replay=False
             kv_tiles=kv_tiles,
             sm_count=_sm_count(),
             q_tile=q_tile,
+            launch_cost=0.0 if replay else _DECODE_TILE_SPLIT_LAUNCH_COST_CC107,
+            device_cc=(10, 7),
             combine_grid=tuple(grid),
             token_units=token_units,
-            **({"launch_cost": 0.0} if replay else {}),
         )
         if gated:
             want = max(want, 2)
@@ -1226,7 +1227,7 @@ def test_decode_graph_serving_shape_leads_unsplit_with_the_split_as_runner_up():
     shape = dict(B=32, H=32, KH=2, s_q=1, lens=[4096] * 32, page=16, stats=False, dtype=torch.bfloat16)
     lead = _run_graph(**shape)
     _assert_decode_tile_plan(lead, G=16, units=64, kv_tiles=32, grid=(32, 32, 1))
-    captured = choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm, launch_cost=0.0, combine_grid=(32, 32, 1))
+    captured = choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm, launch_cost=0.0, device_cc=(10, 7), combine_grid=(32, 32, 1))
     runner = _run_graph(**shape, split_kv=captured)
     assert runner.knobs.split_kv == captured and runner.knobs.pack_gqa is True, runner.knobs
     if sm in (148, 204, 212):
@@ -1285,7 +1286,9 @@ def test_decode_graph_serving_shape_leads_with_the_split_when_replay_is_expected
     shape = dict(B=32, H=32, KH=2, s_q=1, lens=[4096] * 32, page=16, stats=False, dtype=torch.bfloat16, graph_kwargs=dict(is_cuda_graph_replay_expected=True))
     lead = _run_graph(**shape)
     _assert_decode_tile_plan(lead, G=16, units=64, kv_tiles=32, replay=True, grid=(32, 32, 1))
-    eager = choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm, combine_grid=(32, 32, 1))
+    eager = choose_decode_tile_split_kv(
+        units=64, kv_tiles=32, sm_count=sm, launch_cost=_DECODE_TILE_SPLIT_LAUNCH_COST_CC107, device_cc=(10, 7), combine_grid=(32, 32, 1)
+    )
     runner = _run_graph(**shape, split_kv=eager)
     assert runner.knobs.split_kv == eager and runner.knobs.pack_gqa is True, runner.knobs
     if sm in (148, 204, 212):

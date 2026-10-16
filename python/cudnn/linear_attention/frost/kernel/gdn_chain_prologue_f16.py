@@ -39,6 +39,8 @@ from cutlass.cute.runtime import from_dlpack
 from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
 
 from ..common.piece_chain import piece_table_body
+from ..common.host import family_slots
+from ..common.thd import expanded_view
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, gen_interval_items, order_body
 from . import gdn_bprop_f16, gdn_bprop_summary_f16, gdn_prefill_f16, gdn_recompute_f16, gdn_summary_f16, gdn_tinv_f16, gdp_bprop_v64_f16
 
@@ -104,6 +106,8 @@ def frost_gdn_chain_prologue(
     summary_q: Optional[cute.Tensor],
     summary_do: Optional[cute.Tensor],
     tinv: Optional[cute.Tensor],
+    k_slots: cutlass.Constexpr[int] = 1,
+    v_slots: cutlass.Constexpr[int] = 1,
 ) -> None:
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
@@ -186,13 +190,26 @@ def frost_gdn_chain_prologue(
     else:
         # ---- descriptor arrays -------------------------------------------------------
         if cutlass.const_expr(tinv_words is not None):
-            gdn_tinv_f16.build_descs_body(widx, base_k, base_tinv, tinv_words, cu_pieces, k, tinv, n_pieces, b_t, expand_num)
+            gdn_tinv_f16.build_descs_body(widx, base_k, base_tinv, tinv_words, cu_pieces, k, tinv, n_pieces, b_t, expand_num, k_slots=k_slots)
         if cutlass.const_expr(tinv_rows is not None):
             if widx == 26:
                 gdn_tinv_f16.emit_tinv_rows(b_t, expand_num, cu_pieces, tinv_rows, tinv_row_count, tidx % cutlass.Int32(32))
         if cutlass.const_expr(summary_words is not None):
             gdn_summary_f16.build_descs_body(
-                widx - cutlass.Int32(1), base_k, base_v, base_tinv, summary_words, cu_pieces, k, v, tinv, n_pieces, b_t, expand_num
+                widx - cutlass.Int32(1),
+                base_k,
+                base_v,
+                base_tinv,
+                summary_words,
+                cu_pieces,
+                k,
+                v,
+                tinv,
+                n_pieces,
+                b_t,
+                expand_num,
+                k_slots=k_slots,
+                v_slots=v_slots,
             )
         if cutlass.const_expr(recompute_h_words is not None):
             gdn_recompute_f16.build_descs_body(
@@ -211,6 +228,8 @@ def frost_gdn_chain_prologue(
                 cutlass.Int32(0),
                 b_t,
                 expand_num,
+                k_slots=k_slots,
+                v_slots=v_slots,
             )
         if cutlass.const_expr(recompute_m_words is not None):
             gdn_recompute_f16.build_descs_body(
@@ -229,6 +248,8 @@ def frost_gdn_chain_prologue(
                 cutlass.Int32(0),
                 b_t,
                 expand_num,
+                k_slots=k_slots,
+                v_slots=k_slots,
             )
         if cutlass.const_expr(series_words is not None):
             gdn_recompute_f16.build_descs_body(
@@ -247,6 +268,8 @@ def frost_gdn_chain_prologue(
                 checkpoint_every_n,
                 b_t,
                 expand_num,
+                k_slots=k_slots,
+                v_slots=v_slots,
             )
         if cutlass.const_expr(prefill_words is not None):
             gdn_prefill_f16.build_descs_body(
@@ -269,6 +292,8 @@ def frost_gdn_chain_prologue(
                 checkpoint_every_n,
                 b_t,
                 expand_num,
+                k_slots=k_slots,
+                v_slots=v_slots,
             )
         if cutlass.const_expr(bprop_summary_words is not None):
             gdn_bprop_summary_f16.build_descs_body(
@@ -287,6 +312,7 @@ def frost_gdn_chain_prologue(
                 b_t,
                 expand_num,
                 summary_q_step,
+                k_slots=k_slots,
             )
         if cutlass.const_expr(bprop_words is not None):
             if cutlass.const_expr(compact_qdo):
@@ -313,6 +339,8 @@ def frost_gdn_chain_prologue(
                     n_pieces,
                     checkpoint_every_n,
                     expand_num,
+                    k_slots=k_slots,
+                    v_slots=v_slots,
                 )
             else:
                 gdn_bprop_f16.build_descs_body(
@@ -341,6 +369,8 @@ def frost_gdn_chain_prologue(
                     checkpoint_every_n,
                     b_t,
                     expand_num,
+                    k_slots=k_slots,
+                    v_slots=v_slots,
                 )
 
 
@@ -390,16 +420,25 @@ def chain_prologue(
     summary_do: Optional[cute.Tensor],
     tinv: Optional[cute.Tensor],
     stream: cuda.CUstream,
+    k_slots: cutlass.Constexpr[int] = 1,
+    v_slots: cutlass.Constexpr[int] = 1,
 ) -> None:
     swizzle_128b = tma.TensorMapSwizzle.s128b
-    k_headed = cute.make_tensor(k.iterator, cute.make_layout((k.shape[0], k.shape[1], k.shape[2]), stride=(k.stride[0], k.stride[1], 1)))
-    base_k = tma.create_tensor_map_tiled_from_view(
-        k_headed, box_dims=(b_t, 1, 128 // (k.element_type.width // 8)), stride_order=(2, 1, 0), swizzle=swizzle_128b
-    )
-    vk_headed = cute.make_tensor(k.iterator, cute.make_layout((k.shape[2], k.shape[1], k.shape[0]), stride=(1, k.stride[1], k.stride[0])))
-    base_vk = tma.create_tensor_map_tiled_from_view(
-        vk_headed, box_dims=(128 // (k.element_type.width // 8), 1, b_t), stride_order=(0, 1, 2), swizzle=swizzle_128b
-    )
+    # K / V (token, slot, head, dim) views, base maps (dim, head, slot, token) with the full-token-run box; recompute reads K as V
+    k = expanded_view(k, k_slots, expand_num)
+    if cutlass.const_expr(k_slots == 1):
+        k_rows = cute.make_tensor(k.iterator, cute.make_layout((k.shape[0], k.shape[2], k.shape[3]), stride=(k.stride[0], k.stride[2], 1)))
+        base_k = tma.create_tensor_map_tiled_from_view(
+            k_rows, box_dims=(b_t, 1, 128 // (k.element_type.width // 8)), stride_order=(2, 1, 0), swizzle=swizzle_128b
+        )
+    else:
+        k_headed = cute.make_tensor(
+            k.iterator, cute.make_layout((k.shape[0], k_slots, k.shape[2], k.shape[3]), stride=(k.stride[0], k.stride[1], k.stride[2], 1))
+        )
+        base_k = tma.create_tensor_map_tiled_from_view(
+            k_headed, box_dims=(b_t // k_slots, k_slots, 1, 128 // (k.element_type.width // 8)), stride_order=(3, 2, 1, 0), swizzle=swizzle_128b
+        )
+    base_vk = base_k
     base_q = base_k
     base_v = base_k
     base_o = base_k
@@ -417,10 +456,19 @@ def chain_prologue(
             q_headed, box_dims=(b_t, 1, 128 // (q.element_type.width // 8)), stride_order=(2, 1, 0), swizzle=swizzle_128b
         )
     if cutlass.const_expr(v is not None):
-        v_headed = cute.make_tensor(v.iterator, cute.make_layout((v.shape[2], v.shape[1], v.shape[0]), stride=(1, v.stride[1], v.stride[0])))
-        base_v = tma.create_tensor_map_tiled_from_view(
-            v_headed, box_dims=(128 // (v.element_type.width // 8), 1, b_t), stride_order=(0, 1, 2), swizzle=swizzle_128b
-        )
+        v = expanded_view(v, v_slots, expand_num)
+        if cutlass.const_expr(v_slots == 1):
+            v_rows = cute.make_tensor(v.iterator, cute.make_layout((v.shape[0], v.shape[2], v.shape[3]), stride=(v.stride[0], v.stride[2], 1)))
+            base_v = tma.create_tensor_map_tiled_from_view(
+                v_rows, box_dims=(b_t, 1, 128 // (v.element_type.width // 8)), stride_order=(2, 1, 0), swizzle=swizzle_128b
+            )
+        else:
+            v_headed = cute.make_tensor(
+                v.iterator, cute.make_layout((v.shape[0], v_slots, v.shape[2], v.shape[3]), stride=(v.stride[0], v.stride[1], v.stride[2], 1))
+            )
+            base_v = tma.create_tensor_map_tiled_from_view(
+                v_headed, box_dims=(b_t // v_slots, v_slots, 1, 128 // (v.element_type.width // 8)), stride_order=(3, 2, 1, 0), swizzle=swizzle_128b
+            )
     if cutlass.const_expr(o is not None):
         o_headed = cute.make_tensor(o.iterator, cute.make_layout((o.shape[2], o.shape[1], o.shape[0]), stride=(1, o.stride[1], o.stride[0])))
         base_o = tma.create_tensor_map_tiled_from_view(
@@ -549,6 +597,8 @@ def chain_prologue(
         summary_q,
         summary_do,
         tinv,
+        k_slots,
+        v_slots,
     ).launch(grid=(2, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 
@@ -606,6 +656,8 @@ def run_chain_prologue(
     checkpoint-seeded series items of ``series_span_tokens`` per item."""
     cu_stream = cuda.CUstream(int(stream))
     series_span_chunks = int(series_span_tokens) // int(b_t)
+    k_slots = family_slots(k, expand_num, 3)
+    v_slots = family_slots(v, expand_num, 3) if v is not None else 1
     if "compiled" not in cache:
         work_items_placeholder = from_dlpack(work_items, assumed_align=16)
         work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
@@ -651,8 +703,8 @@ def run_chain_prologue(
             from_dlpack(bprop_summary_words, assumed_align=128).mark_layout_dynamic() if bprop_summary_words is not None else None,
             from_dlpack(bprop_words, assumed_align=128).mark_layout_dynamic() if bprop_words is not None else None,
             from_dlpack(q, assumed_align=16).mark_layout_dynamic(leading_dim=2) if q is not None else None,
-            from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=2) if v is not None else None,
+            from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=len(k.shape) - 1),
+            from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=len(v.shape) - 1) if v is not None else None,
             from_dlpack(o, assumed_align=16).mark_layout_dynamic(leading_dim=2) if o is not None else None,
             from_dlpack(do, assumed_align=16).mark_layout_dynamic(leading_dim=2) if do is not None else None,
             from_dlpack(checkpoints, assumed_align=16).mark_layout_dynamic(leading_dim=3) if checkpoints is not None else None,
@@ -663,6 +715,8 @@ def run_chain_prologue(
             from_dlpack(summary_do, assumed_align=16).mark_layout_dynamic(leading_dim=2) if summary_do is not None else None,
             from_dlpack(tinv, assumed_align=128).mark_layout_dynamic(leading_dim=3) if tinv is not None else None,
             cu_stream,
+            k_slots,
+            v_slots,
             options="--enable-tvm-ffi --opt-level 2",
         )
     cache["compiled"](

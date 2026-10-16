@@ -1158,16 +1158,16 @@ def _bprop_kernel(
                             _atomic_add_f32(dQ_view.data_ptr() + g, va)
                             _atomic_add_f32(dQ_view.data_ptr() + g + cutlass.Int32(1), vb)
 
-        # ---- Deterministic relay (release): all of this kv-tile's dQ atomicAdds
-        #      to the slot have completed (atom.global.add returns → done at L2);
-        #      the CTA barrier orders all 256 threads' adds before we publish, and
-        #      the GPU acq_rel fence makes them visible before the next kv-tile's
-        #      acquire returns.  Hand the token to the next lower kv-tile. -------
+        # ---- Deterministic relay (release): the CTA barrier orders all 256
+        #      threads' dQ atomicAdds before thread 0 (CTA scope), and the GPU-scope
+        #      release store is cumulative over them, so they are visible before
+        #      the next kv-tile's acquire returns.  No separate fence: it drains
+        #      the adds a second time (dropping it cut deterministic d128 time
+        #      ~6-7 %, A100).  Hand the token to the next lower kv-tile. ---------
         if cutlass.const_expr(deterministic):
             nvvm.barrier_cta_sync()
-            cute.arch.fence_acq_rel_gpu()
             if tidx == cutlass.Int32(0):
-                cute.arch.atomic_exch(sem_ptr, relay_turn + cutlass.Int32(1), sem="release", scope="gpu")
+                nvvm.store_ext((relay_turn + cutlass.Int32(1)).ir_value(), sem_ptr, order=nvvm.MemOrder.RELEASE, scope=nvvm.MemScope.GPU)
 
         # ---- B3: before next Q-iter overwrites the ring stage ---------------
         # Direct-atomic path only.  On the staged path B2b already follows every

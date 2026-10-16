@@ -649,6 +649,10 @@ class DenseLaunchSpec:
         "split",
         "fp32_partial",
         "combine",
+        # The split sink combine takes the per-batch Q lengths (int32 (B,)) after the sink pointer: a plan with a split sink AND the dense padded-Q
+        # trim (``seq_q_present``).  The combine cannot tell a padded query row from a valid keyless one without them (the native binder appends the
+        # bound Q-length address to the combine frame).
+        "combine_q_lens",
         "tile_n",
         "kv_tail_native",
         "causal",
@@ -746,16 +750,30 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     if s.ragged and (s.split < 2 or not s.paged or not getattr(cfg, "RAGGED_Q", 0)):
         raise NotImplementedError("cudnn.sdpa: the ragged-Q decode leg needs a split, paged launch of a RAGGED_Q-compiled decode tile")
     s.combine = None
+    s.combine_q_lens = False
     if s.split > 1:
         from cudnn.sdpa.fwd.api_dsl import ws_align
         from cudnn.sdpa.fwd.heuristics import decode_combine_force_lean
         from cudnn.sdpa.fwd.kernels.sm100 import split_combine
+        from cudnn import _pybind_module
+
+        s.combine_q_lens = bool(s.has_sink) and s.quant is None and s.seq_q_present and not s.ragged
+        if s.combine_q_lens and not getattr(_pybind_module._SdpaDenseBinder, "supports_combine_q_lens", False):
+            raise NotImplementedError(
+                "cudnn.sdpa: a split attention sink over padded query lengths needs the native binder that passes them to the combine; rebuild the extension"
+            )
 
         # The combine kernel's FORM (a plan-time specialization: the declared B / H_q / S_q and the split, never a runtime
-        # value).  The module's default entry takes the decode-grid kernel on every launch inside its grid bound; the
-        # split-aware rule (heuristics.decode_combine_grid_selected -- measured: that kernel loses to the lean walk on a
-        # mid-sized grid below 32 splits and on any grid at 4) pins the lean kernel where the two disagree.
-        decode_grid = split_combine.DECODE_GRID_OFF if decode_combine_force_lean(s.b, s.qh, s.s_q_max, s.split) else split_combine.DECODE_GRID_AUTO
+        # value).  The module's default entry takes the decode-grid kernel on every sink-free launch inside its grid bound;
+        # the split-aware rule (heuristics.decode_combine_grid_selected -- measured on the Rubin performance class: that
+        # kernel loses to the lean walk on a mid-sized grid below 32 splits and on any grid at 4) pins the module's own
+        # forms where the two disagree, and on every launch off cc 10.7 (the Blackwell line keeps the module's own
+        # three-way rule, measured on B200 / B300; the rule reads the plan's device).
+        decode_grid = (
+            split_combine.DECODE_GRID_OFF
+            if decode_combine_force_lean(s.b, s.qh, s.s_q_max, s.split, device_cc=tuple(api._device_cc))
+            else split_combine.DECODE_GRID_AUTO
+        )
         owner = split_combine.compile_ptr(
             dtype_o=api._combine_dtype_tag(),
             dtype_partial=api._partial_dtype_tag(),
@@ -773,6 +791,9 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
             # compiled with its griddepcontrol sites releases this pass early, and this pass waits before its first read).
             **({"use_pdl": True} if getattr(api, "use_pdl", False) else {}),
             decode_grid=decode_grid,
+            # Half flavors fold the attention sink in the combine (sink-free partials).
+            has_sink=bool(s.has_sink) and s.quant is None,
+            has_q_lens=s.combine_q_lens,
         )
         fn = positional_entry(owner)
         if fn is None:

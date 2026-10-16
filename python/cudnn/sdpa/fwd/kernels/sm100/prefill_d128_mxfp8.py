@@ -65,6 +65,8 @@ _MAKE_CFG = {64: make_cfg_d64, 128: lambda p: make_cfg_d128(p, cga1_kv_stages=3)
 if PARAMS.d_flavor not in _MAKE_CFG:
     raise ValueError(f"prefill_d128_mxfp8: d_flavor must be 64 or 128; got {PARAMS.d_flavor}")
 CFG, _TMA = _MAKE_CFG[PARAMS.d_flavor](PARAMS)
+if PARAMS.dual_kv_stream:
+    raise ValueError("sm100/prefill_d128_mxfp8: dual_kv_stream (two KV streams over one Q tile) is served by sm100/prefill_d128_fp8.py only")
 # Lowering of the CLC scheduler's credit arrive (``tile_dsl.scheduler.read_tile_id_arrive``, every call site below): False =
 # the lane-compare BRANCH form, True = the single predicated arrive of PR #1169.  Both land the same arrives from the same
 # lanes (READ_TILE_ARRIVERS unchanged), so this is a per-SPECIALIZATION tuning constant, keyed on the compile-time mask bits

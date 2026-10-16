@@ -55,6 +55,8 @@ from cudnn.sdpa.fwd.config_sm107 import epilogue_gate_layout_declarable as _epil
 from cudnn.sdpa.fwd.config_sm107 import decode_d256_q_tile as _decode_d256_q_tile_sm107
 from cudnn.sdpa.fwd.config_sm100 import (
     d256_mxfp8_pair_leg,
+    FP8_DUAL_KV_STREAM_MAX_ROWS,
+    fp8_dual_kv_stream_routed,
     supports_thd_split,
     supports_scalar_kv_tail_split,
     supports_paged_split_sink,
@@ -67,6 +69,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     canonicalize_d192_lowering,
     canonicalize_d256_lowering,
     canonicalize_d512_mxfp8_lowering,
+    d256_wide_decode_launch,
     decode_d256_q_tile,
     derive_d192_internal_params,
     derive_d256_internal_params,
@@ -156,6 +159,11 @@ _SM100_DECODE_KERNEL_FILE = "sm100/decode_d128_f16.py"
 _SM100_DECODE_FLAVOR = (128, 128)
 # Q rows one d64 decode tile covers (CfgD64Decode: TILES_Q=1 x TILE_M=128).
 _D64_DECODE_TILE_ROWS = 128
+# Live Q rows one TMEM lane quadrant holds: the d64 decode tile's quadrant softmax (TemplateParams.decode_quad) serves up to this many.
+_D64_QUAD_ROWS = 32
+# The cc the decode tile's early-Q form (TemplateParams.early_q) was measured on.  Positive gate: cc 10.7 loads the same tile (dense d128 decode, issue
+# #1472) and keeps the staged O store until a Rubin run says otherwise.
+_EARLY_Q_CC: frozenset[tuple[int, int]] = frozenset({(10, 0), (10, 3)})
 # Decode-shaped alternates selected by a TemplateParams field instead of a knob
 # (TemplateParams.decode_q_tile != 0, set by SdpaFwdDslSm100._decode_q_tile when
 # S_q * pack_g rows fit the tile's N extent): the d256 flavor's swap-AB tile.
@@ -480,11 +488,22 @@ def _quant_kind(fp8: bool, pertensor: bool) -> str:
     return ("fp8" if pertensor else "mxfp8") if fp8 else "f16"
 
 
-def _exp2_fma_split_for(device_cc: tuple[int, int], *, kind: str, flavor: tuple[int, int]) -> bool:
+# The d64 decode tile (``TemplateParams.decode_tile``: sm100/decode_d128_f16.py at d_flavor 64) shares its (kind, flavor) key with the d64 prefill
+# tile but is another kernel, so it claims the split in its own set: the tile's one softmax warpgroup is MUFU-bound at a long KV on cc 10.0, and the
+# FMA pipe takes a quarter of every row's exp2 columns.  MEASURED on B200 (same-node A/B/A/B, kernel time, gpt-oss d64 full attention with a sink,
+# all four tp shards): -8..-9 % from 8 sequences x 32K keys up (b=128 x 128K keys 919 -> 841 us at tp8), -3..-6 % at 2K keys, 0 at b=1 x 2K; S_q = 4
+# -4..-5 %.  The kernel folds the split out of the sliding-window builds (a unit there is one or two KV tiles: +2..+5 % at S_q >= 2).  The d128 decode
+# tile is not listed (it is HBM-bound where it is measured); the d64 prefill tile stays off (unmeasured).
+_EXP2_FMA_SPLIT_DECODE_KERNELS: frozenset[tuple[str, tuple[int, int]]] = frozenset({("f16", (64, 64))})
+
+
+def _exp2_fma_split_for(device_cc: tuple[int, int], *, kind: str, flavor: tuple[int, int], decode_tile: bool = False) -> bool:
     """``TemplateParams.exp2_fma_split`` for one build: the (quantization kind, flavor) kernels that carry the split
     AND measured a win, on a cc where it was measured (``_EXP2_FMA_SPLIT_KERNELS`` x ``_EXP2_FMA_SPLIT_CC``); False
-    everywhere else.  ``kind`` is ``_quant_kind(fp8, pertensor)``."""
-    return bool((kind, tuple(flavor)) in _EXP2_FMA_SPLIT_KERNELS and tuple(device_cc) in _EXP2_FMA_SPLIT_CC)
+    everywhere else.  ``kind`` is ``_quant_kind(fp8, pertensor)``; ``decode_tile`` selects the decode tile's own set
+    (``_EXP2_FMA_SPLIT_DECODE_KERNELS``) in place of the prefill kernels'."""
+    kernels = _EXP2_FMA_SPLIT_DECODE_KERNELS if decode_tile else _EXP2_FMA_SPLIT_KERNELS
+    return bool((kind, tuple(flavor)) in kernels and tuple(device_cc) in _EXP2_FMA_SPLIT_CC)
 
 
 def supported_cgas_for(flavor: tuple[int, int], *, fp8: bool, device_cc: tuple[int, int], pertensor: bool = True) -> tuple[int, ...]:
@@ -1648,7 +1667,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and int(s_qo) == 1
             and (int(d_qk), int(d_v)) == _SM100_DECODE_FLAVOR
             and not self.thd_stats_padded
-            and not self.has_sink
             and not self.cu_seq_kv_lens
         )
 
@@ -2155,22 +2173,30 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 self.thd and not (self.thd_decode_leg or self.packed_thd_split),
                 "split_kv > 1 is dense-only, except the decode tile's ragged-Q leg and native D128/D256 or nonpaged D192 packed split",
             )
+            # Half flavors: the split partials are sink-free and the combine folds
+            # the sink once.  The FP8 epilogues still fold it per tile, and the
+            # packed THD split carries a sink only where its native binder folds it
+            # (supports_paged_split_sink).
             self._value_error_if(
                 self.has_sink
-                and not (
-                    self.packed_thd_split
-                    and supports_paged_split_sink(
-                        (int(d_qk), int(d_v)),
-                        device_cc=self._device_cc,
-                        fp8=self._fp8,
-                        thd=self.thd,
-                        paged=self.paged,
-                        max_q=int(s_qo),
+                and (
+                    self._fp8
+                    or (
+                        self.packed_thd_split
+                        and not supports_paged_split_sink(
+                            (int(d_qk), int(d_v)),
+                            device_cc=self._device_cc,
+                            fp8=self._fp8,
+                            thd=self.thd,
+                            paged=self.paged,
+                            max_q=int(s_qo),
+                        )
                     )
+                    or (not self.packed_thd_split and self._device_cc == (10, 7))
                 ),
-                "split_kv > 1 with an attention sink requires Rubin paged D128 half packed Q>1",
+                "split_kv > 1 with an attention sink is served by the SM100 half kernels and Rubin paged D128 half packed Q>1 only; FP8 and cc 10.7 dense keep the sink-free split contract",
             )
-            if self.has_sink:
+            if self.has_sink and self.packed_thd_split:
                 from cudnn import _pybind_module
 
                 self._not_implemented_error_if(
@@ -2470,10 +2496,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         self._logger.debug("check_support completed successfully")
         return True
 
-    def _decode_q_tile_for(self, s_q: int, h_q: int, h_kv: int) -> int:
+    def _decode_q_tile_for(self, s_q: int, h_q: int, h_kv: int, b: Optional[int] = None, s_kv: Optional[int] = None) -> int:
         """:meth:`_decode_q_tile` on explicit shapes -- for ``check_support``, which
         reads the sample shapes before it records ``s_q_max`` / ``h_q`` / ``h_kv``
-        (its Rubin paged gate admits the decode-shaped graph the decode tile serves)."""
+        (its Rubin paged gate admits the decode-shaped graph the decode tile serves).
+        ``b`` / ``s_kv`` are the launch size the Blackwell line's wide-tile route reads
+        (config_sm100.d256_wide_decode_launch); without them only the 16-column tile is
+        routed there."""
         if self._fp8 or self.thd or self.flavor != (256, 256):
             return 0
         if self.softmax_scale_prefolded:
@@ -2503,7 +2532,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 max_q_tile=self.decode_q_tile_max,
             )
         # (a cap off cc 10.7 was refused once, in check_support, before this dispatch is reached)
-        return decode_d256_q_tile(int(s_q), pack_g)
+        wide_launch = b is not None and s_kv is not None and d256_wide_decode_launch(int(b), int(h_q) // pack_g, int(s_kv), self.window_left is not None)
+        return decode_d256_q_tile(int(s_q), pack_g, wide_launch=wide_launch)
 
     def _gate_in_combine_for(self, s_q: int, h_q: int, h_kv: int) -> bool:
         """:meth:`_gate_in_combine` on explicit shapes (for ``check_support``, like
@@ -2532,9 +2562,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         bottom-right, SWA, right band, sink, Stats natural or base-2, dense
         padded-Q trim, split-KV partials) for f16/bf16 d256-flavor graphs whose
         S_q x packed-heads rows fit the line's routed envelope -- the 16-wide N
-        tile on SM100 / SM103 (config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS: the
-        32-wide tile compiles but is issue-bound per CTA and stays unrouted
-        there), on cc 10.7 also the 32-wide tile in up to two TOKEN UNITS of the
+        tile on SM100 / SM103 (config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS; the
+        32-wide tile is issue-bound per CTA and is routed there only for a launch
+        big enough to be HBM-bound, config_sm100.d256_wide_decode_launch), on
+        cc 10.7 also the 32-wide tile in up to two TOKEN UNITS of the
         kernel for a packed MTP step (config_sm107.decode_d256_q_tile; the value
         is the rows of ONE unit); everything else (THD, quantized, larger S_q,
         the pre-folded scale, the fused epilogue gate at split_kv == 1) stays on
@@ -2545,7 +2576,28 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         nothing to schedule).  engines.d256_decode_tile_selected is the
         facts-level twin; keep the two in lockstep.
         """
-        return self._decode_q_tile_for(self.s_q_max, self.h_q, self.h_kv)
+        return self._decode_q_tile_for(self.s_q_max, self.h_q, self.h_kv, self.batch_size, self.s_k_max)
+
+    def _fp8_dual_kv_stream(self) -> bool:
+        """Whether this per-tensor FP8 d128 plan runs its two Q sub-tiles as two KV
+        streams over one 128-row Q tile (TemplateParams.dual_kv_stream).
+
+        The same LOWERING choice as the f16 decode tiles: the decode-shaped step
+        of sm100/prefill_d128_fp8.py is bound by its per-KV-tile chain, not by
+        the MMA, so a 128-row graph gains nothing from the second Q sub-tile's
+        rows and everything from a second KV tile per step.  cga1 only (the pair
+        shares no K/V ring), dense or paged K/V, not THD; off while
+        config_sm100.FP8_DUAL_KV_STREAM_ROUTED is False.
+        """
+        if not fp8_dual_kv_stream_routed() or not (self._fp8 and self._pertensor) or self.thd or self.flavor != (128, 128) or self._device_cc == (10, 7):
+            return False
+        if self.cga != 1:
+            # The width must be NAMED: an unset knob resolves to this flavor's
+            # cga2 default below (template_params), and the pair shares no ring.
+            # The heuristics name cga1 for every dense / paged fp8 d128 plan.
+            return False
+        pack_g = (self.h_q // self.h_kv) if self.pack_gqa else 1
+        return int(self.s_q_max) * pack_g <= FP8_DUAL_KV_STREAM_MAX_ROWS
 
     def _d64_decode_tile(self) -> bool:
         """Whether this d64 plan lowers onto the 128-row decode tile.
@@ -2571,6 +2623,26 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         pack_g = (self.h_q // self.h_kv) if self.pack_gqa else 1
         return int(self.s_q_max) * pack_g <= _D64_DECODE_TILE_ROWS
 
+    def _d64_decode_quad(self) -> bool:
+        """Whether the d64 decode tile runs its quadrant-cooperative softmax (``TemplateParams.decode_quad``).
+
+        The live Q rows -- S_q x the packed group -- must fit one 32-row quadrant: the tile loads them into all four TMEM lane quadrants and each
+        softmax warp owns a quarter of the key columns, which is what lifts the one-warp-owns-all-live-rows bound of a decode step.  A larger S_q
+        keeps the 128-row tile's single-quadrant softmax.  Dense / paged, split or not, with or without a sink (not THD: the tile's THD legs keep the staged
+        O store the merge replaces).
+        """
+        if not self._d64_decode_tile() or self.thd or tuple(self._device_cc) not in _EARLY_Q_CC:
+            return False
+        pack_g = (self.h_q // self.h_kv) if self.pack_gqa else 1
+        return int(self.s_q_max) * pack_g <= _D64_QUAD_ROWS
+
+    def _decode_early_q(self, params) -> bool:
+        """Whether the decode tile (sm100/decode_d128_f16.py: the d64 decode tile, the d128 cga1 tile) takes its early-Q form (``TemplateParams.early_q``)
+        on this build: the measured cc, and a dense / paged plan -- the THD legs keep the staged O store their per-batch runtime descriptors place."""
+        if tuple(self._device_cc) not in _EARLY_Q_CC or self.thd or self._fp8:
+            return False
+        return bool(params.decode_tile) or (tuple(self.flavor) == _SM100_DECODE_FLAVOR and params.cta_mma == 1)
+
     def template_params(self) -> Sm100TemplateParams:
         """The compile-time record ``compile()`` loads the kernel module with.
 
@@ -2594,7 +2666,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # The exp2 MUFU / FMA split is on ONLY where it was measured (cc 10.0 x the d128 MXFP8 / d128 FP8 /
         # d192x128 f16 / d192x128 FP8 kernels) -- see _exp2_fma_split_for; the kernels not listed there never
         # read the field.
-        exp2_fma_split = _exp2_fma_split_for(self._device_cc, kind=_quant_kind(self._fp8, self._pertensor), flavor=self.flavor)
+        exp2_fma_split = _exp2_fma_split_for(
+            self._device_cc, kind=_quant_kind(self._fp8, self._pertensor), flavor=self.flavor, decode_tile=self._d64_decode_tile()
+        )
         # None = the standalone-wrapper tier stated no preference: derive the
         # causal-balancing policy here. The graph path never hits this branch —
         # the heuristic emits an explicit policy (the same primary this
@@ -2785,6 +2859,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             )
         if self._d64_decode_tile():
             params = replace(params, decode_tile=True)
+        if self._decode_early_q(params):
+            params = replace(params, early_q=True)
+        if self._d64_decode_tile():
+            params = replace(params, decode_quad=self._d64_decode_quad())
+        if self._fp8_dual_kv_stream():
+            params = replace(params, dual_kv_stream=True)
         elif self._device_cc != (10, 7) and self.flavor == (512, 512) and self._fp8 and not self._pertensor:
             from cudnn.sdpa.fwd.heuristics import select_d512_auto_knobs
 

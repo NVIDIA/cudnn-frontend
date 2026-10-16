@@ -862,7 +862,8 @@ def _softmax_warp_group(
 
     LN2_F = cutlass.Float32(LN2)
     TINY = cutlass.Float32(1e-30)
-    if cutlass.const_expr(CFG.HAS_SINK):
+    # Under a KV split the fold moves to the combine pass (split_combine), which adds the sink column exactly once; the partials stay sink-free.
+    if cutlass.const_expr(CFG.HAS_SINK and SPLIT_KV == 1):
         sinks_arr = cutlass.make_array_view(sinks_tensor)
     # Split partials stack split-major on the workspace batch axis (b + s*B).
     o_batch = batch_idx + split_idx * n_batch
@@ -896,7 +897,7 @@ def _softmax_warp_group(
             m_raw = cutlass.Float32(m_vec[j])  # -inf while the row has no live key
             m_nat = row_max_for_exp2(m_raw) * LN2_F
             row_dead = l_tot <= ZERO
-            if cutlass.const_expr(CFG.HAS_SINK):
+            if cutlass.const_expr(CFG.HAS_SINK and SPLIT_KV == 1):
                 # The sink folds against the row's ACTUAL max (what the prefill tile
                 # does with its published max), -inf on a keyless row: new_max is
                 # then the sink logit itself, scale = exp(-inf) = 0 and new_sum = 1,
