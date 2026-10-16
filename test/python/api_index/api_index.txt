@@ -660,12 +660,16 @@ cudnn.gemm.cutedsl.grouped.grouped_gemm_dglu_wrapper_sm100
 cudnn.gemm.cutedsl.grouped.grouped_gemm_dsrelu_jax_sm100
 cudnn.gemm.cutedsl.grouped.grouped_gemm_dsrelu_wrapper_sm100
 cudnn.gemm.cutedsl.grouped.grouped_gemm_dswiglu_wrapper_sm100
+cudnn.gemm.cutedsl.grouped.grouped_gemm_glu_hadamard_jax_forward
+cudnn.gemm.cutedsl.grouped.grouped_gemm_glu_hadamard_quant_jax_forward
 cudnn.gemm.cutedsl.grouped.grouped_gemm_glu_hadamard_quant_wrapper_sm100
 cudnn.gemm.cutedsl.grouped.grouped_gemm_glu_hadamard_wrapper_sm100
 cudnn.gemm.cutedsl.grouped.grouped_gemm_glu_jax_sm100
 cudnn.gemm.cutedsl.grouped.grouped_gemm_glu_wrapper_sm100
 cudnn.gemm.cutedsl.grouped.grouped_gemm_jax_sm100
+cudnn.gemm.cutedsl.grouped.grouped_gemm_quant_jax_forward
 cudnn.gemm.cutedsl.grouped.grouped_gemm_quant_wrapper_sm100
+cudnn.gemm.cutedsl.grouped.grouped_gemm_srelu_jax_forward
 cudnn.gemm.cutedsl.grouped.grouped_gemm_srelu_wrapper_sm100
 cudnn.gemm.cutedsl.grouped.grouped_gemm_swiglu_wrapper_sm100
 cudnn.gemm.cutedsl.grouped.grouped_gemm_wgrad_jax_sm100

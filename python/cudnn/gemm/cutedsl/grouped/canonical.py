@@ -26,6 +26,7 @@ from __future__ import annotations
 from dataclasses import replace
 import math
 
+import cutlass
 import cutlass.cute as cute
 
 # Host side: classify sample tensors and derive the kernel-facing views for the descriptors.
@@ -227,6 +228,16 @@ def kernel_facing_wgrad_sf(tensor, rows, tokens, sf_vec_size):
         return tensor
     cols = (tokens + sf_vec_size * 4 - 1) // (sf_vec_size * 4) * 4
     return cute.make_tensor(tensor.iterator, cute.make_layout(((rows + 127) // 128 * 128, cols), stride=(cols, 1)))
+
+
+def kernel_facing_fp4(tensor):
+    """Packed FP4 carried as uint8 -> 4-bit elements with twice the innermost extent; other element types pass through.
+
+    The JAX bridge presents uint8 arrays as Int8.
+    """
+    if tensor is None or tensor.element_type not in (cutlass.Uint8, cutlass.Int8):
+        return tensor
+    return cute.make_tensor(cute.recast_ptr(tensor.iterator, dtype=cutlass.Float4E2M1FN), cute.recast_layout(4, 8, tensor.layout))
 
 
 def kernel_facing_prob(tensor):

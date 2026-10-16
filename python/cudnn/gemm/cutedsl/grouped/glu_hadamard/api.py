@@ -731,7 +731,44 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
 ) -> TupleDict:
     """High-level wrapper for grouped GEMM GLU + Hadamard forward fusion."""
     from cudnn.gemm.cutedsl.discrete_grouped.discrete_kernel_utils import _require_pointer_tensor
+    from cudnn.tensor_adapter import detect_framework
 
+    if b_tensor is not None and detect_framework(a_tensor) == "jax":
+        from ..canonical_jax import check_jax_wrapper_options
+        from .jax_api import grouped_gemm_glu_hadamard_jax_forward
+
+        check_jax_wrapper_options(
+            acc_dtype=acc_dtype,
+            cd_major=cd_major,
+            sf_vec_size=sf_vec_size,
+            vector_f32=vector_f32,
+            m_aligned=m_aligned,
+            current_stream=current_stream,
+            bias_tensor=bias_tensor,
+            b_ptrs=b_ptrs,
+            sfb_ptrs=sfb_ptrs,
+            b_major=b_major,
+            use_dynamic_sched=use_dynamic_sched,
+            sf_vec_sizes=(16, 32),
+        )
+        for name, rejected in (("n", n is not None), ("b_dtype", b_dtype is not None), ("use_tmem_post_rht_amax", use_tmem_post_rht_amax)):
+            if rejected:
+                raise ValueError(f"{name} is unsupported for the JAX block-scaled path")
+        return grouped_gemm_glu_hadamard_jax_forward(
+            a_tensor,
+            b_tensor,
+            sfa_tensor,
+            sfb_tensor,
+            padded_offsets,
+            alpha_tensor,
+            prob_tensor,
+            c_dtype=c_dtype if c_dtype is not None else cutlass.BFloat16,
+            d_dtype=d_dtype if d_dtype is not None else cutlass.BFloat16,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            sf_vec_size=sf_vec_size,
+            act_func=act_func,
+        )
     if a_tensor is not None:
         _require_torch_inputs(a_tensor, "grouped_gemm_glu_hadamard_wrapper_sm100")
     import torch
