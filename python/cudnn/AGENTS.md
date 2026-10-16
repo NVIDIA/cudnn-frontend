@@ -789,9 +789,33 @@ with fp16 operands (`k * 2^-g` overflows). Both lie inside the documented gate r
   a -1e8 gate erases the following -1 gates from both.
 - Reduce corrections in a fixed order, including when several channels are steep.
 - Use `encode_gate_exchange` for scan classification and exchange encoding. Keep stage selection and
-  barriers in each schedule. Share gate scans and recompute/summary operand construction through
-  the `@cute.jit` stages in `common/gdn2_operands.py`. Size scratch with `common/steep_scratch.py` for both separate forward
-  arrays and backward bank-fill regions; check bank-fill capacity before compilation.
+  barriers in each schedule. All six chunk schedules share gate conditioning, scans, row normalization
+  and operand packing through the `@cute.jit` stages in `common/gdn2_operands.py`. The rolled FP32
+  backward scan retains its local load/store schedule. Read exchange scales before releasing a raw
+  stage; register-only packing may follow that release. `encode_gate_exchange` accepts log2 prefixes
+  only, and returns exponentials or exact token logs according to the channel ballot. Size scratch
+  with `common/steep_scratch.py` for both separate forward arrays and backward bank-fill regions;
+  check bank-fill capacity before compilation.
+- Range tests must vary state-gradient magnitude independently of gate magnitude. A large finite
+  FP32 seed, or a carry accumulated from finite FP16 output gradients, can overflow an undecayed
+  FP16 state operand even when the decayed carry and all returned gradients fit. The large-seed
+  and large-carry regressions in `test_gdn2_steep_decay.py` cover both backward implementations.
+- Keep steep state gradients and bounded key operands in FP32 through their projections
+  (`common/gdn2_state_grad.py`). Narrowing a bounded key first can erase a term that becomes
+  representable after multiplication by the state gradient. The caller-owned per-CTA workspace
+  uses `state_gradient_scratch_layout`; state publication uses `mb_dstate_input_ready`, and the
+  key ring uses `mb_k_decay_inv_ready` / `mb_decay_done`. Scalar readers acquire these
+  thread-produced barriers directly, including `mb_u_smem_ready` for restored dK; tensor-core
+  completion only orders the async tensor-core operations. Full backward's
+  CG2 release protects both that workspace and U until the restored-key projection finishes,
+  including the last chunk before the persistent CTA takes another work item.
+- Check mild state-operand range independently: FP16 inputs, `g=0`, zero Q/K/V/initial
+  state and an FP32 final-state gradient of 70000 isolate overflow in the mild path
+  at `e4896ef2`, with finite FP64 reference gradients. Steep-gate coverage does not
+  establish arbitrary FP32 state-gradient support for that path.
+- Replay the same CUDA graph and workspace through mild, steep and mild gates. Replaying fixed
+  inputs does not check whether the steep flag and scheduler tickets reset. Check finiteness before
+  bitwise equality; matching NaN bit patterns are not a successful numerical replay.
 - An exact relaunch must not read what the fast launch wrote. Seed overwrite-capable plans
   from a state snapshot (`common/state_snapshot.py`), chosen from the graph contract, never
   from first-call pointer equality: a graph can bind separate state buffers at warmup and

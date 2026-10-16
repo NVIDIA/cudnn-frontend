@@ -261,6 +261,7 @@ def uncut_backward_host(
     scheduler_bwd: cute.Tensor,
     recompute_words: Optional[cute.Tensor],
     bprop_words: cute.Tensor,
+    dstate_scratch: cute.Tensor,
     dstate_snapshot: Optional[cute.Tensor],
     stream: cuda.CUstream,
 ) -> None:
@@ -399,6 +400,7 @@ def uncut_backward_host(
         work_count,
         scheduler_bwd,
         bprop_words,
+        dstate_scratch,
         scale,
         stream,
     )
@@ -437,6 +439,7 @@ def build_uncut_backward(
     scheduler_bwd,
     recompute_words,
     bprop_words,
+    dstate_scratch,
     num_sm,
     b_t,
     recompute,
@@ -591,6 +594,7 @@ def build_uncut_backward(
             from_dlpack(scheduler_bwd, assumed_align=4).mark_layout_dynamic(),
             from_dlpack(recompute_words, assumed_align=128).mark_layout_dynamic() if recompute else None,
             from_dlpack(bprop_words, assumed_align=128).mark_layout_dynamic(),
+            from_dlpack(dstate_scratch, assumed_align=16).mark_layout_dynamic(),
             from_dlpack(dstate_snapshot, assumed_align=16).mark_layout_dynamic(leading_dim=3) if dstate_snapshot is not None else None,
             cuda.CUstream(int(stream)),
             options="--enable-tvm-ffi --opt-level 2",
@@ -633,6 +637,7 @@ def run_uncut_backward(
     scheduler_bwd,
     recompute_words,
     bprop_words,
+    dstate_scratch,
     b_t,
     recompute,
     recompute_orders,
@@ -688,6 +693,7 @@ def run_uncut_backward(
         scheduler_bwd,
         recompute_words if recompute else None,
         bprop_words,
+        dstate_scratch,
         dstate_snapshot,
         cuda.CUstream(int(stream)),
     )

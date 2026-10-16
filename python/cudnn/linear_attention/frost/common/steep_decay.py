@@ -58,7 +58,10 @@ The steep path (``STEEP_EXACT``):
   accumulators;
 - the backward picks bounded per-channel scales before it assembles gradients (``gradient_operand_scales``), so it
   never reads token logs as prefix exponentials and repairs those lanes afterwards; ``steep_grad_corrections`` adds the
-  exact intra-tile terms.
+  exact intra-tile terms;
+- ``common/gdn2_state_grad.py`` retains the steep channels' original state gradients in FP32 scratch. Their tensor-core
+  operand is zero; bounded FP32 projections supply dU, restored dK and dGate. Decay is applied before the gate dot
+  product. This avoids overflowing a finite FP32 seed or carry when it is packed into FP16.
 
 Synchronisation invariants of the steep path:
 
@@ -81,7 +84,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
 
-from cudnn.frost.tile_dsl.pointwise import sigmoid, fp32_to_fp16
+from cudnn.frost.tile_dsl.pointwise import sigmoid
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor_128b
 
 STEEP_LOG2_PREFIX: float = -120.0
@@ -214,13 +217,12 @@ def encode_gate_exchange(
     values,
     words_ptr,
     log_last_ptr,
-    exponentiate: cutlass.Constexpr,
     channel_active=True,
 ):
     """Classify a channel and encode its exchange registers and scan metadata.
 
-    ``values`` holds log prefixes when ``exponentiate`` is true, otherwise their
-    exponentials. Exact steep channels retain token logs except in the last row,
+    ``values`` always holds inclusive log2 prefixes on entry. Exact steep
+    channels retain token logs except in the last row,
     which always holds the state-decay exponential. Callers own exchange stores,
     stage selection and publication barriers; this helper never synchronizes.
     """
@@ -233,8 +235,7 @@ def encode_gate_exchange(
                 if channel_active:
                     (log_last_ptr + channel).store(token_logs[cfg.b_t - 1])
     for row in cutlass.range_constexpr(cfg.b_t):
-        if cutlass.const_expr(exponentiate):
-            values[row] = cute.math.exp2(values[row], fastmath=True)
+        values[row] = cute.math.exp2(values[row], fastmath=True)
         if cutlass.const_expr(has_exact_path(cfg) and row < cfg.b_t - 1):
             if channel_steep:
                 values[row] = token_logs[row]
@@ -503,26 +504,3 @@ def store_steep_beta(cfg: cutlass.Constexpr, bits, beta_regs, beta_ptr, row, lan
         if ((bits >> reg_idx) & 1) != 0:
             channel = (reg_idx // 8) * 64 + lane_in_row_group * 8 + reg_idx % 8
             (beta_ptr + raw_offset(cfg, row, channel)).store(beta_regs[reg_idx].to(cfg.io_dtype))
-
-
-@cute.jit
-def pack_dstate_operand(cfg: cutlass.Constexpr, original, decayed, first_channel, words_ptr, steep_any, width: cutlass.Constexpr[int] = 32):
-    """Pack a state fragment. Steep channels use the original because K inv carries their decay.
-
-    Both inputs are already in registers. Leave the decayed FP32 accumulator
-    unchanged and let the caller publish the packed operand under its barriers.
-    Seeds use 16 channels. Later carries use 32 channels.
-    """
-    operand = cutlass.Array(cutlass.Float32, width, alignment=16)
-    for channel in cutlass.range_constexpr(width):
-        operand[channel] = decayed[channel]
-    if cutlass.const_expr(has_exact_path(cfg)):
-        if steep_any != 0:
-            steep_rows = cutlass.const_expr(cfg.d_k // len(cfg.compute_group_0_warp_ids))
-            for channel in cutlass.range_constexpr(width):
-                if steep_channel_bit(words_ptr, first_channel + channel, steep_rows) != 0:
-                    operand[channel] = original[channel]
-    packed = cutlass.Array(cutlass.Int32, width // 2, alignment=16)
-    for pc in cutlass.range_constexpr(width // 2):
-        packed[pc] = fp32_to_fp16(operand[2 * pc], operand[2 * pc + 1], dtype=cfg.io_dtype)
-    return packed

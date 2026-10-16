@@ -7,7 +7,7 @@ import dataclasses
 
 import pytest
 
-from cudnn.linear_attention.frost.common.steep_scratch import steep_scratch_layout
+from cudnn.linear_attention.frost.common.steep_scratch import steep_scratch_layout, state_gradient_scratch_layout
 
 pytestmark = pytest.mark.L0
 
@@ -43,3 +43,20 @@ def test_steep_scratch_regions(d_k, stages, gradients):
     layout.check_capacity(layout.nbytes)
     with pytest.raises(ValueError, match="steep scratch needs"):
         layout.check_capacity(layout.nbytes - 1)
+
+
+@pytest.mark.parametrize("d_k", [64, 128])
+@pytest.mark.parametrize("d_v", [64, 128])
+@pytest.mark.parametrize("stages", [1, 2, 3])
+def test_state_gradient_scratch_is_disjoint(d_k, d_v, stages):
+    layout = state_gradient_scratch_layout(d_k=d_k, d_v=d_v, b_t=16, decay_stages=stages)
+    occupied = set()
+    # Model the actual producer indices across adjacent persistent CTAs.
+    for cta in range(2):
+        base = cta * layout.nbytes
+        for offset, rows in [(layout.state.offset, d_v), (layout.keys.offset, stages * 16)]:
+            assert offset % 16 == 0
+            addresses = {base + offset + (row * d_k + channel) * 4 for row in range(rows) for channel in range(d_k)}
+            assert not occupied.intersection(addresses)
+            assert max(addresses) + 4 <= base + layout.nbytes
+            occupied.update(addresses)

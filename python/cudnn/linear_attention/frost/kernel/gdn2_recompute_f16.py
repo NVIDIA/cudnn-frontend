@@ -83,7 +83,7 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 from ..common.beta_guard import beta_guard
-from ..common.gdn2_operands import scan_gate_prefixes, load_key_beta_row, key_operand_half
+from ..common.gdn2_operands import scan_gate_prefixes, load_qk_beta_row, load_operand_scales, key_operand_half
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, decode_work_item, gen_interval_items, expanded_cu_seqlen, order_body
 from ..common.host import get_dtype
 from ..common.blockwise_inverse import invert_unit_lower_16x16_fragments
@@ -945,7 +945,6 @@ def compute0_warp_group(
                 g_prefix_regs,
                 steep_scan_ptr,
                 steep_last_ptr,
-                True,
             )
             for row_off in cutlass.range_constexpr(store_rows):
                 if cutlass.const_expr(channel_rows < cfg.threads_per_warp):
@@ -965,7 +964,7 @@ def compute0_warp_group(
                 steep_bits = lane_steep_bits(cfg, steep_scan_ptr, lane_in_row_group, channel_rows)
 
             k_restore_pack = cutlass.Array(cutlass.Int32, dk_halves * 4, alignment=16)
-            raw_k_regs, raw_beta_regs, k_inv_norm = load_key_beta_row(cfg, sK_ptr, sBeta_ptr, decay_row, lane_in_row_group, opaque_one)
+            _, raw_k_regs, raw_beta_regs, _, k_inv_norm = load_qk_beta_row(cfg, None, sK_ptr, sBeta_ptr, decay_row, lane_in_row_group, opaque_one)
             if cutlass.const_expr(cfg.l2norm):
                 if steep_any != 0:
                     if lane_in_row_group == 0:
@@ -986,22 +985,16 @@ def compute0_warp_group(
                 )
 
             # ---- decay/restore operands ---------------------------------------------
+            exp_g_regs, inverse_g_regs, restore_g_regs = load_operand_scales(
+                cfg, decay_row, lane_in_row_group, steep_bits, sGate_exchange_ptr, steep_last_ptr, True
+            )
             for dim_half in cutlass.range_constexpr(dk_halves):
+                dim_base = dim_half * 64 + lane_in_row_group * 8
                 k_inv_vec, k_decay_vec, k_restore_half = key_operand_half(
-                    cfg,
-                    dim_half,
-                    raw_k_regs,
-                    raw_beta_regs,
-                    k_inv_norm,
-                    decay_row,
-                    lane_in_row_group,
-                    steep_bits,
-                    sGate_exchange_ptr,
-                    steep_last_ptr,
+                    cfg, dim_half, raw_k_regs, raw_beta_regs, k_inv_norm, exp_g_regs, inverse_g_regs, restore_g_regs
                 )
                 for j in cutlass.range_constexpr(4):
                     k_restore_pack[dim_half * 4 + j] = k_restore_half[j]
-                dim_base = dim_half * 64 + lane_in_row_group * 8
                 if cutlass.const_expr(dim_half == 0):
                     bars.mb_decay_register_mma_done[decay_stage].wait(decay_free_parity)
                     bars.mb_decay_tcgen05_done[decay_stage].wait(decay_free_parity)

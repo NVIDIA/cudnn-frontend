@@ -11,6 +11,7 @@ torch = pytest.importorskip("torch")
 cudnn = pytest.importorskip("cudnn")
 
 from .test_la import (
+    BWD_TOL,
     CUDNN_DTYPE,
     H_TOL,
     LEAF_NAMES,
@@ -20,16 +21,22 @@ from .test_la import (
     assert_bitwise,
     assert_bwd_parity,
     assert_fwd_parity,
+    assert_rms_close,
     assert_state_close,
     build_and_pin,
     chain_grads,
+    chain_reference_grads,
     clear_caches,
     make_case,
     op_args,
+    op_tail,
+    pinned_op,
     oracle_m,
     random_state,
     reference,
     run_fwd,
+    run_summary_bwd,
+    thd_tensors,
     state_pool,
 )
 
@@ -381,3 +388,105 @@ def test_forward_state_alias_after_graph_warmup(backend, K):
     torch.cuda.synchronize()
     assert_bitwise("rebound output", o, o_ref)
     assert_bitwise("rebound state", state, fs_ref)
+
+
+@pytest.mark.parametrize("K", [64, 128])
+@pytest.mark.parametrize("T,key_value", [(16, 0.0), (17, 0.0), (32, 0.0), (16, 1.0e-4), (17, 1.0e-4), (32, 1.0e-3)])
+@pytest.mark.parametrize("V", [64, 128])
+def test_fp16_steep_large_final_state_gradient(backend, K, T, key_value, V):
+    """A finite FP32 seed may exceed FP16 even when every returned gradient fits.
+
+    The old decayed state operand is about 0.96 after a full tile; storing its
+    undecayed 70000 seed as FP16 produces inf, including inf * 0 for zero keys.
+    Small keys also exercise nonzero state-to-token gradient contractions.
+    The larger initial state and 32-token key keep beta gradients above the
+    FP16 rounding floor, while the 16-token key exposes premature K narrowing.
+    """
+    case = make_case("gdn2", torch.float16, B=1, T=T, H=1, K=K, V=V)
+    gates = {name: value.clone() for name, value in case.gates.items()}
+    gates["g"].fill_(-0.7)
+    gates["beta"].zero_()
+    gates["w"].fill_(1.0)
+    case = case.clone(q=torch.zeros_like(case.q), k=torch.full_like(case.k, key_value), v=torch.full_like(case.v, 1.0e-4), gates=gates)
+    state0 = random_state(case, scale=50.0)
+    d_final = torch.full_like(state0, 70000.0)
+    d_o = torch.zeros(case.T, case.HO, case.V, device="cuda", dtype=case.dtype)
+    _, _, got, _, _ = chain_grads(backend, case, initial_state=state0, d_final_state=d_final, dO=d_o, batch_invariant=True)
+    expected = chain_reference_grads(case, state0, d_o, d_final)
+    for name in expected:
+        assert_rms_close(f"large final-state seed d{name}", got[name], expected[name], BWD_TOL[case.dtype])
+    summary = run_summary_bwd(case, d_o, d_final_state=d_final, batch_invariant=True)
+    assert_rms_close("large final-state seed summary", summary, expected["initial_state"], BWD_TOL[case.dtype])
+
+
+@pytest.mark.parametrize("K", [64, 128])
+@pytest.mark.parametrize("V", [64, 128])
+def test_fp16_steep_large_state_gradient_carry(backend, K, V):
+    """Finite FP16 output gradients can accumulate a carry above FP16's range."""
+    case = make_case("gdn2", torch.float16, B=1, T=32, H=1, K=K, V=V)
+    gates = {name: value.clone() for name, value in case.gates.items()}
+    gates["g"].zero_()
+    gates["g"][:, :16].fill_(-0.7)
+    gates["beta"].zero_()
+    gates["w"].fill_(1.0)
+    q = torch.zeros_like(case.q)
+    q[:, 16:, :, 0] = 1.0
+    case = case.clone(q=q, k=torch.zeros_like(case.k), v=torch.zeros_like(case.v), gates=gates)
+    state0 = torch.zeros_like(random_state(case))
+    d_o = torch.zeros(case.T, case.HO, case.V, device="cuda", dtype=case.dtype)
+    d_o[16:].fill_(60000.0)
+    _, _, got, _, _ = chain_grads(backend, case, initial_state=state0, dO=d_o, batch_invariant=True)
+    expected = chain_reference_grads(case, state0, d_o, torch.zeros_like(state0))
+    for name in expected:
+        assert_rms_close(f"large inter-tile carry d{name}", got[name], expected[name], BWD_TOL[case.dtype])
+    summary = run_summary_bwd(case, d_o, batch_invariant=True)
+    assert_rms_close("large inter-tile carry summary", summary, expected["initial_state"], BWD_TOL[case.dtype])
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("K", [64, 128])
+@pytest.mark.parametrize("shape", list(STEEP_SHAPES))
+def test_steep_cuda_graph_gate_transitions(backend, built_plans, dtype, K, shape, schedule_shape):
+    """One captured forward/backward workspace must reset dispatch on every replay."""
+    case = make_case("gdn2", dtype, K=K, **schedule_shape)
+    leaves = [t.requires_grad_(True) for t in thd_tensors(case)]
+    gate = leaves[LEAF_NAMES["gdn2"].index("g")]
+    patterns = [case, steep_gate(case, "steady"), case, steep_gate(case, "alternating"), steep_gate(case, "huge_spike"), case]
+    gate_inputs = [item.gates["g"].reshape_as(gate).clone() for item in patterns]
+    state0 = random_state(case).requires_grad_(True)
+    d_final = random_state(case, scale=0.1, seed=SEED + 3)
+    d_o = torch.randn(case.T, case.HO, case.V, device="cuda", dtype=dtype)
+
+    def launch():
+        o, fs = pinned_op(backend, "gdn2")(*leaves, *op_tail(case), initial_state=state0, output_final_state=True)
+        return [o, fs, *torch.autograd.grad([o, fs], leaves + [state0], [d_o, d_final])]
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(3):
+            launch()
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=side):
+        captured = launch()
+    for index, values in enumerate(gate_inputs):
+        with torch.no_grad():
+            gate.copy_(values)
+        eager = launch()
+        graph.replay()
+        torch.cuda.synchronize()
+        for output_index, (got, expected) in enumerate(zip(captured, eager)):
+            assert torch.isfinite(got).all(), f"gate transition {index}, output {output_index} is nonfinite"
+            assert_bitwise(f"gate transition {index}, output {output_index}", got, expected)
+    assert_schedules(built_plans, shape)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("gate_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("K", [64, 128])
+def test_steep_narrow_gate_ragged_tail(backend, dtype, gate_dtype, K):
+    """Low-precision gate loads and padded scan rows share the exact-path contract."""
+    case = steep_gate(make_case("gdn2", dtype, K=K, gate_dtype=gate_dtype, seq_lens=[17, 0, 33, 1]), "steady")
+    assert_bwd_parity(backend, case, use_initial_state=True, use_dfs=True, l2norm=True)

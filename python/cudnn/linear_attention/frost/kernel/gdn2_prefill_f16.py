@@ -87,7 +87,7 @@ import cutlass.experimental.primitives as nvvm
 import cutlass.cute as cute
 
 from ..common.beta_guard import beta_guard
-from ..common.gdn2_operands import scan_gate_prefixes
+from ..common.gdn2_operands import scan_gate_prefixes, load_qk_beta_row, load_operand_scales, key_operand_half, query_operand_half
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, WORK_ITEM_FINAL_DST, decode_head, decode_work_item, order_body
 from ..common.blockwise_inverse import invert_unit_lower_16x16_fragments
 from ..common.steep_scratch import SteepScratchLayout, steep_scratch_layout
@@ -100,7 +100,6 @@ from ..common.steep_decay import (
     steep_launch_cfg,
     steep_exit_unless_flagged,
     steep_row_corrections,
-    row_operand_scales,
     steep_ticket,
     steep_tile_mask,
     store_steep_beta,
@@ -121,9 +120,7 @@ from cudnn.frost.tile_dsl.swizzle import swizzle_xor_128b, swizzle_xor_32b
 from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait, tma_tensormap_acquire
 from cudnn.frost.tile_dsl.pointwise import (
     opaque_i32,
-    sigmoid,
     fmul2,
-    ffma2,
     mul_f16x2,
     opaque_f32_zero,
     fp32_to_fp16,
@@ -134,7 +131,6 @@ USE_PDL = True
 
 LOG2_E: float = 1.4426950408889634
 DEFAULT_GATE_LOWER_BOUND: float = -5.0
-L2_NORM_EPS: float = 1.0e-6
 
 
 class Gdn2PrefillBars(NamedTuple):
@@ -1163,7 +1159,6 @@ def compute0_warp_group(
                 g_prefix_regs,
                 steep_scan_ptr,
                 steep_last_ptr,
-                True,
             )
             for row_off in cutlass.range_constexpr(store_rows):
                 if cutlass.const_expr(channel_rows < cfg.threads_per_warp):
@@ -1182,59 +1177,11 @@ def compute0_warp_group(
             if steep_any != 0:
                 steep_bits = lane_steep_bits(cfg, steep_scan_ptr, lane_in_row_group, channel_rows)
 
-            k_inv_pack = cutlass.Array(cutlass.Int32, dk_halves * 4, alignment=16)
             k_restore_pack = cutlass.Array(cutlass.Int32, dk_halves * 4, alignment=16)
-            raw_q_regs = cutlass.Array(cutlass.Float32, dk_halves * 8, alignment=16)
-            raw_k_regs = cutlass.Array(cutlass.Float32, dk_halves * 8, alignment=16)
-            raw_beta_regs = cutlass.Array(cutlass.Float32, dk_halves * 8, alignment=16)
-
-            # ---- optional Q/K L2-norm ------------------------------------------------
+            raw_q_regs, raw_k_regs, raw_beta_regs, q_inv_norm, k_inv_norm = load_qk_beta_row(
+                cfg, sQ_ptr, sK_ptr, sBeta_ptr, decay_row, lane_in_row_group, opaque_one
+            )
             if cutlass.const_expr(cfg.l2norm):
-                qk0_lo = opaque_f32_zero()
-                qk0_hi = opaque_f32_zero()
-                qk1_lo = opaque_f32_zero()
-                qk1_hi = opaque_f32_zero()
-            for dim_half in cutlass.range_constexpr(dk_halves):
-                dim_base = dim_half * 64 + lane_in_row_group * 8
-                reg_base = dim_half * 8
-                f16_segment = dim_base // 64
-                f16_segment_dim = dim_base - f16_segment * 64
-                raw_f16_idx = f16_segment * (cfg.b_t * 64) + decay_row * 64 + swizzle_xor_128b(decay_row, f16_segment_dim, elem_bytes=2)
-                raw_q_frag = (sQ_ptr + raw_f16_idx).load(count=8, alignment=16)
-                raw_k_frag = (sK_ptr + raw_f16_idx).load(count=8, alignment=16)
-                raw_beta_frag = (sBeta_ptr + raw_f16_idx).load(count=8, alignment=16)
-                raw_q_vec_f32 = raw_q_frag.to(cutlass.Float32)
-                raw_k_vec_f32 = raw_k_frag.to(cutlass.Float32)
-                raw_beta_vec_f32 = raw_beta_frag.to(cutlass.Float32)
-                for dim_offset in cutlass.range_constexpr(8):
-                    raw_q_regs[reg_base + dim_offset] = raw_q_vec_f32[dim_offset]
-                    raw_k_regs[reg_base + dim_offset] = raw_k_vec_f32[dim_offset]
-                    beta_val = raw_beta_vec_f32[dim_offset]
-                    if cutlass.const_expr(cfg.beta_sigmoid):
-                        beta_val = (sigmoid(beta_val) * (2.0 if cfg.allow_neg_eigval else 1.0)).to(cfg.io_dtype).to(cutlass.Float32)
-                    raw_beta_regs[reg_base + dim_offset] = beta_val
-                if cutlass.const_expr(cfg.l2norm):
-                    for pair_idx in cutlass.range_constexpr(4):
-                        q_val0 = raw_q_vec_f32[2 * pair_idx]
-                        q_val1 = raw_q_vec_f32[2 * pair_idx + 1]
-                        k_val0 = raw_k_vec_f32[2 * pair_idx]
-                        k_val1 = raw_k_vec_f32[2 * pair_idx + 1]
-                        qk0_lo, qk1_lo = ffma2(q_val0, q_val1, q_val0, q_val1, qk0_lo, qk1_lo)
-                        qk0_hi, qk1_hi = ffma2(k_val0, k_val1, k_val0, k_val1, qk0_hi, qk1_hi)
-
-            q_inv_norm = opaque_one
-            k_inv_norm = opaque_one
-            if cutlass.const_expr(cfg.l2norm):
-                q_sum_sq = qk0_lo + qk1_lo
-                k_sum_sq = qk0_hi + qk1_hi
-                q_sum_sq = q_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, q_sum_sq, 4, 31, kind=nvvm.Shfl.BFLY))
-                q_sum_sq = q_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, q_sum_sq, 2, 31, kind=nvvm.Shfl.BFLY))
-                q_sum_sq = q_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, q_sum_sq, 1, 31, kind=nvvm.Shfl.BFLY))
-                k_sum_sq = k_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 4, 31, kind=nvvm.Shfl.BFLY))
-                k_sum_sq = k_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 2, 31, kind=nvvm.Shfl.BFLY))
-                k_sum_sq = k_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 1, 31, kind=nvvm.Shfl.BFLY))
-                q_inv_norm = cute.math.rsqrt(q_sum_sq + cutlass.Float32(L2_NORM_EPS), fastmath=True)
-                k_inv_norm = cute.math.rsqrt(k_sum_sq + cutlass.Float32(L2_NORM_EPS), fastmath=True)
                 if steep_any != 0:
                     if lane_in_row_group == 0:
                         (sSteepNorm.data_ptr() + cg0_group_id * cfg.b_t + decay_row).store(k_inv_norm)
@@ -1253,77 +1200,17 @@ def compute0_warp_group(
                     log_last_ptr=steep_last_ptr,
                 )
 
-            # ---- decay/restore operands: exp2(+-g) applied per key channel -----------
-            exp_g_regs = cutlass.Array(cutlass.Float32, dk_halves * 8, alignment=16)
-            exp_g_last_regs = cutlass.Array(cutlass.Float32, dk_halves * 8, alignment=16)
+            # ---- decay/restore operands ---------------------------------------------
+            exp_g_regs, inverse_g_regs, restore_g_regs = load_operand_scales(
+                cfg, decay_row, lane_in_row_group, steep_bits, sGate_exchange_ptr, steep_last_ptr, True
+            )
             for dim_half in cutlass.range_constexpr(dk_halves):
                 dim_base = dim_half * 64 + lane_in_row_group * 8
-                reg_base = dim_half * 8
-                exp_neg_g_regs = cutlass.Array(cutlass.Float32, 8, alignment=16)
-                for f32_group in cutlass.range_constexpr(2):
-                    f32_dim_base = dim_base + f32_group * 4
-                    f32_segment = f32_dim_base // 32
-                    f32_segment_dim = f32_dim_base - f32_segment * 32
-                    g_prefix_idx = f32_segment * (cfg.b_t * 32) + decay_row * 32 + swizzle_xor_128b(decay_row ^ f32_segment, f32_segment_dim, elem_bytes=4)
-                    exp_g_frag = (sGate_exchange_ptr + g_prefix_idx).load(count=4, alignment=16)
-                    f32_segment = f32_dim_base // 32
-                    f32_segment_dim = f32_dim_base - f32_segment * 32
-                    exp_g_last_idx = (
-                        f32_segment * (cfg.b_t * 32) + (cfg.b_t - 1) * 32 + swizzle_xor_128b(cfg.b_t - 1 ^ f32_segment, f32_segment_dim, elem_bytes=4)
-                    )
-                    exp_g_last_frag = (sGate_exchange_ptr + exp_g_last_idx).load(count=4, alignment=16)
-                    half_reg_base = f32_group * 4
-                    f32_reg_base = reg_base + half_reg_base
-                    for elem in cutlass.range_constexpr(4):
-                        decay, inverse, restore = row_operand_scales(
-                            cfg,
-                            steep_bits,
-                            f32_reg_base + elem,
-                            decay_row,
-                            f32_dim_base + elem,
-                            exp_g_frag[elem],
-                            exp_g_last_frag[elem],
-                            sGate_exchange_ptr,
-                            steep_last_ptr,
-                        )
-                        exp_g_regs[f32_reg_base + elem] = decay
-                        exp_neg_g_regs[half_reg_base + elem] = inverse
-                        exp_g_last_regs[f32_reg_base + elem] = restore
-
-                # ---- K decay + K inv + K restore operands: Beta * K * exp2(+g), K * exp2(-g), K * exp2(g last - g) ----
-                k_decay_pack = cutlass.Array(cutlass.Int32, 4, alignment=16)
-                for pair_idx in cutlass.range_constexpr(4):
-                    dim0 = pair_idx * 2
-                    dim1 = dim0 + 1
-                    raw_reg_idx0 = reg_base + dim0
-                    raw_reg_idx1 = reg_base + dim1
-                    k_value0, k_value1 = fmul2(raw_k_regs[raw_reg_idx0], raw_k_regs[raw_reg_idx1], k_inv_norm, k_inv_norm)
-                    k_beta0, k_beta1 = fmul2(k_value0, k_value1, raw_beta_regs[raw_reg_idx0], raw_beta_regs[raw_reg_idx1])
-                    k_decay0, k_decay1 = fmul2(k_beta0, k_beta1, exp_g_regs[raw_reg_idx0], exp_g_regs[raw_reg_idx1])
-                    k_decay_pack[pair_idx] = fp32_to_fp16(k_decay0, k_decay1, dtype=cfg.io_dtype)
-                    k_inv0, k_inv1 = fmul2(k_value0, k_value1, exp_neg_g_regs[dim0], exp_neg_g_regs[dim1])
-                    k_inv_pack[dim_half * 4 + pair_idx] = fp32_to_fp16(k_inv0, k_inv1, dtype=cfg.io_dtype)
-                    k_restore0, k_restore1 = fmul2(k_inv0, k_inv1, exp_g_last_regs[raw_reg_idx0], exp_g_last_regs[raw_reg_idx1])
-                    k_restore_pack[dim_half * 4 + pair_idx] = fp32_to_fp16(k_restore0, k_restore1, dtype=cfg.io_dtype)
-
-                k_inv_vec = cutlass.Vector.from_elements(
-                    (
-                        k_inv_pack[dim_half * 4],
-                        k_inv_pack[dim_half * 4 + 1],
-                        k_inv_pack[dim_half * 4 + 2],
-                        k_inv_pack[dim_half * 4 + 3],
-                    ),
-                    cutlass.Int32,
-                ).bitcast(cfg.io_dtype)
-                k_decay_vec = cutlass.Vector.from_elements(
-                    (
-                        k_decay_pack[0],
-                        k_decay_pack[1],
-                        k_decay_pack[2],
-                        k_decay_pack[3],
-                    ),
-                    cutlass.Int32,
-                ).bitcast(cfg.io_dtype)
+                k_inv_vec, k_decay_vec, k_restore_half = key_operand_half(
+                    cfg, dim_half, raw_k_regs, raw_beta_regs, k_inv_norm, exp_g_regs, inverse_g_regs, restore_g_regs
+                )
+                for j in cutlass.range_constexpr(4):
+                    k_restore_pack[dim_half * 4 + j] = k_restore_half[j]
                 if cutlass.const_expr(dim_half == 0):
                     bars.mb_decay_register_mma_done[decay_stage].wait(decay_free_parity)
                     bars.mb_decay_tcgen05_done[decay_stage].wait(decay_free_parity)
@@ -1349,25 +1236,7 @@ def compute0_warp_group(
             for dim_half in cutlass.range_constexpr(dk_halves):
                 dim_base = dim_half * 64 + lane_in_row_group * 8
                 reg_base = dim_half * 8
-                q_decay_pack = cutlass.Array(cutlass.Int32, 4, alignment=16)
-                for pair_idx in cutlass.range_constexpr(4):
-                    dim0 = pair_idx * 2
-                    dim1 = dim0 + 1
-                    raw_reg_idx0 = reg_base + dim0
-                    raw_reg_idx1 = reg_base + dim1
-                    q_value0, q_value1 = fmul2(raw_q_regs[raw_reg_idx0], raw_q_regs[raw_reg_idx1], q_inv_norm, q_inv_norm)
-                    q_decay0, q_decay1 = fmul2(q_value0, q_value1, exp_g_regs[raw_reg_idx0], exp_g_regs[raw_reg_idx1])
-                    q_decay_pack[pair_idx] = fp32_to_fp16(q_decay0, q_decay1, dtype=cfg.io_dtype)
-
-                q_decay_vec = cutlass.Vector.from_elements(
-                    (
-                        q_decay_pack[0],
-                        q_decay_pack[1],
-                        q_decay_pack[2],
-                        q_decay_pack[3],
-                    ),
-                    cutlass.Int32,
-                ).bitcast(cfg.io_dtype)
+                q_decay_vec = query_operand_half(cfg, dim_half, raw_q_regs, q_inv_norm, exp_g_regs)
                 decay_col = dim_base
                 decay_segment = decay_col // 64
                 decay_swizzled_idx = decay_segment * (cfg.b_t * 64) + swizzle_xor_128b(decay_row, decay_row * 64 + decay_col - decay_segment * 64, elem_bytes=2)

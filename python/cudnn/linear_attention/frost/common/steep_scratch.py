@@ -33,6 +33,21 @@ class SteepScratchLayout:
             raise ValueError(f"steep scratch needs {self.nbytes} bytes, bank fill has {capacity}")
 
 
+@dataclass(frozen=True)
+class StateGradientScratchLayout:
+    """Per-CTA global workspace: an FP32 state and a ring of bounded FP32 keys."""
+
+    state: ScratchRegion
+    keys: ScratchRegion
+    nbytes: int
+
+
+def state_gradient_scratch_layout(*, d_k: int, d_v: int, b_t: int, decay_stages: int) -> StateGradientScratchLayout:
+    state = ScratchRegion(0, d_v * d_k, d_v * d_k * 4)
+    keys = ScratchRegion(state.nbytes, decay_stages * b_t * d_k, decay_stages * b_t * d_k * 4)
+    return StateGradientScratchLayout(state, keys, state.nbytes + keys.nbytes)
+
+
 def steep_scratch_layout(
     *,
     b_t: int,

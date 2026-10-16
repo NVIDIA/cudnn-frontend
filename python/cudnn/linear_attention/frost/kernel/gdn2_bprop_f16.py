@@ -108,7 +108,9 @@ import cutlass.cute as cute
 from ..common.beta_guard import beta_guard
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, WORK_ITEM_DSTATE_DST, decode_work_item, order_body
 from ..common.blockwise_inverse import invert_unit_lower_16x16_fragments
-from ..common.steep_scratch import SteepScratchLayout, steep_scratch_layout
+from ..common.steep_scratch import SteepScratchLayout, steep_scratch_layout, StateGradientScratchLayout, state_gradient_scratch_layout
+from ..common.gdn2_operands import gate_scale, scan_gate_prefixes, load_qk_beta_row, load_operand_scales, key_operand_half, query_operand_half
+from ..common.gdn2_state_grad import pack_dstate_operand, store_steep_keys, add_steep_du, steep_dk_restore
 from ..common.steep_decay import (
     has_exact_path,
     encode_gate_exchange,
@@ -122,9 +124,7 @@ from ..common.steep_decay import (
     steep_launch_cfg,
     steep_exit_unless_flagged,
     steep_grad_corrections,
-    pack_dstate_operand,
     steep_row_corrections,
-    row_operand_scales,
     steep_ticket,
     steep_tile_mask,
 )
@@ -145,7 +145,6 @@ from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_commit, tma_store_
 from cudnn.frost.tile_dsl.pointwise import (
     sigmoid,
     fadd2,
-    ffma2,
     fmul2,
     fp32_to_fp16,
     mul_f16x2,
@@ -158,7 +157,6 @@ USE_PDL = True
 
 LOG2_E: float = 1.4426950408889634
 DEFAULT_GATE_LOWER_BOUND: float = -5.0
-L2_NORM_EPS: float = 1.0e-6
 
 
 class Gdn2BpropBars(NamedTuple):
@@ -1712,17 +1710,6 @@ def tmaldg_warp(
 
 
 @cute.jit
-def gate_scale(cfg, raw_gate: cutlass.Float32) -> cutlass.Float32:
-    """Map raw gate to the log2-domain decay increment."""
-
-    if cutlass.const_expr(cfg.safe_gate):
-        return cfg.gate_scale_log2 * sigmoid(raw_gate)
-    if cutlass.const_expr(cfg.log_gate):
-        return raw_gate * cutlass.Float32(LOG2_E)
-    return cute.math.log2(raw_gate + cutlass.Float32(1e-10), fastmath=True)
-
-
-@cute.jit
 def compute0_warp_group(
     cfg,
     total_tiles,
@@ -1756,6 +1743,7 @@ def compute0_warp_group(
     sSteepTile_ptr,
     sSteepCorr_ptr,
     mSteepSlot,
+    mDstateScratch,
     bars,
 ) -> None:
     """WG0 warp role (warps 0-3). Persistent tile-scheduler loop, gate prefix
@@ -1889,41 +1877,19 @@ def compute0_warp_group(
                 steep_last_ptr = sSteepLast_ptr + raw_stage * cfg.d_k
                 channel_steep, steep_word = classify_steep_channel(cfg, prefix_acc, sK_ptr, channel_dim, channel_rows, mSteepSlot, lane_idx)
             else:
-                gate_conditioned = cutlass.Array(cutlass.Float32, cfg.b_t, alignment=16)
-                g_prefix_regs = cutlass.Array(cutlass.Float32, cfg.b_t, alignment=16)
+                gate_raw = cutlass.Array(cutlass.Float32, cfg.b_t, alignment=16)
                 for row in cutlass.range_constexpr(cfg.b_t):
                     if cutlass.const_expr(cfg.gate_dtype == cutlass.Float32):
                         raw_idx = f32_segment * (cfg.b_t * 32) + row * 32 + swizzle_xor_128b(row, f32_segment_dim, elem_bytes=4)
                     else:
                         raw_idx = raw_seg_base + swizzle_xor_128b(row, row * 64 + raw_col, elem_bytes=2)
                     gate_row = (sGate_ptr + raw_idx).load().to(cutlass.Float32)
-                    if chunk_idx * cutlass.Int32(cfg.b_t) + row < batch_seqlen:
-                        if cutlass.const_expr(cfg.safe_gate):
-                            gate_row = gate_scale(cfg, cg0_a_log_exp * (gate_row + cg0_dt_bias_value))
-                        else:
-                            gate_row = gate_scale(cfg, gate_row)
-                    else:
-                        gate_row = cutlass.Float32(0.0)
-                    gate_conditioned[row] = gate_row
+                    gate_raw[row] = gate_row
                 # The raw input and exchange share storage; all reads precede writes.
                 nvvm.barrier_cta_sync(cfg.cg0_sync_barrier_id, thread_count=cfg.cg0_threads)
-                prefix_acc = cutlass.Float32(0.0)
-                for row_pair in cutlass.range_constexpr(cfg.b_t // 2):
-                    row0 = row_pair * 2
-                    row1 = row0 + 1
-                    gate0 = gate_conditioned[row0]
-                    gate1 = gate_conditioned[row1]
-                    pair_vec = nvvm.add_packed_f32x2(
-                        cutlass.Vector.from_elements((prefix_acc, gate0), cutlass.Float32),
-                        cutlass.Vector.from_elements((gate0, gate1), cutlass.Float32),
-                        ftz=False,
-                        rnd="rn",
-                    )
-                    prefix0, row_pair_sum = cutlass.Float32(pair_vec[0]), cutlass.Float32(pair_vec[1])
-                    prefix_acc = prefix_acc + row_pair_sum
-                    g_prefix_regs[row0] = cute.math.exp2(prefix0, fastmath=True)
-                    g_prefix_regs[row1] = cute.math.exp2(prefix_acc, fastmath=True)
-                exp_g_last = g_prefix_regs[cfg.b_t - 1]
+                prefix_acc, g_prefix_regs = scan_gate_prefixes(
+                    cfg, gate_raw, chunk_idx * cutlass.Int32(cfg.b_t), batch_seqlen, cg0_a_log_exp, cg0_dt_bias_value
+                )
 
                 # ---- steep channels: an in-tile log2 prefix below the steep threshold (a gate in (0, 1] never raises the
                 # prefix, so the last row holds its minimum) ----
@@ -1938,13 +1904,14 @@ def compute0_warp_group(
                     mSteepSlot,
                     lane_idx,
                     cg0_warp,
-                    gate_conditioned,
+                    gate_raw,
                     g_prefix_regs,
                     steep_scan_ptr,
                     steep_last_ptr,
-                    False,
                     channel_active,
                 )
+
+                exp_g_last = g_prefix_regs[cfg.b_t - 1]
 
                 for row in cutlass.range_constexpr(cfg.b_t):
                     value = g_prefix_regs[row]
@@ -1999,60 +1966,11 @@ def compute0_warp_group(
             if steep_any != 0:
                 steep_bits = lane_steep_bits(cfg, steep_scan_ptr, lane_in_row_group, channel_rows)
 
-            k_inv_pack = cutlass.Array(cutlass.Int32, dk_halves * 4, alignment=16)
-            raw_q_regs = cutlass.Array(cutlass.Float32, dk_halves * 8, alignment=16)
-            raw_k_regs = cutlass.Array(cutlass.Float32, dk_halves * 8, alignment=16)
-            raw_beta_regs = cutlass.Array(cutlass.Float32, dk_halves * 8, alignment=16)
-
-            # ---- optional Q/K L2-norm ------------------------------------------------
-            if cutlass.const_expr(cfg.l2norm):
-                qk0_lo = opaque_f32_zero()
-                qk0_hi = opaque_f32_zero()
-                qk1_lo = opaque_f32_zero()
-                qk1_hi = opaque_f32_zero()
-            for dim_half in cutlass.range_constexpr(dk_halves):
-                dim_base = dim_half * 64 + lane_in_row_group * 8
-                reg_base = dim_half * 8
-                f16_segment = dim_base // 64
-                f16_segment_dim = dim_base - f16_segment * 64
-                raw_f16_idx = f16_segment * (cfg.b_t * 64) + decay_row * 64 + swizzle_xor_128b(decay_row, f16_segment_dim, elem_bytes=2)
-                raw_q_frag = (sQ_ptr + raw_f16_idx).load(count=8, alignment=16)
-                raw_k_frag = (sK_ptr + raw_f16_idx).load(count=8, alignment=16)
-                raw_beta_frag = (sBetaP_ptr + raw_f16_idx).load(count=8, alignment=16)
-                raw_q_frag_f32 = raw_q_frag.to(cutlass.Float32)
-                raw_k_frag_f32 = raw_k_frag.to(cutlass.Float32)
-                raw_beta_frag_f32 = raw_beta_frag.to(cutlass.Float32)
-                for dim_offset in cutlass.range_constexpr(8):
-                    q_val = raw_q_frag_f32[dim_offset]
-                    k_val = raw_k_frag_f32[dim_offset]
-                    if cutlass.const_expr(not cfg.beta_guard):
-                        raw_q_regs[reg_base + dim_offset] = q_val
-                    raw_k_regs[reg_base + dim_offset] = k_val
-                    beta_val = raw_beta_frag_f32[dim_offset]
-                    if cutlass.const_expr(cfg.beta_sigmoid):
-                        beta_val = (sigmoid(beta_val) * (2.0 if cfg.allow_neg_eigval else 1.0)).to(cfg.io_dtype).to(cutlass.Float32)
-                    raw_beta_regs[reg_base + dim_offset] = beta_val
-                    if cutlass.const_expr(cfg.l2norm):
-                        if cutlass.const_expr(dim_offset % 2 == 0):
-                            qk0_lo, qk0_hi = ffma2(q_val, k_val, q_val, k_val, qk0_lo, qk0_hi)
-                        else:
-                            qk1_lo, qk1_hi = ffma2(q_val, k_val, q_val, k_val, qk1_lo, qk1_hi)
-
+            raw_q_regs, raw_k_regs, raw_beta_regs, q_inv_norm, k_inv_norm = load_qk_beta_row(
+                cfg, sQ_ptr, sK_ptr, sBetaP_ptr, decay_row, lane_in_row_group, opaque_f32_zero() + cutlass.Float32(1.0)
+            )
             nvvm.fence_proxy("async.shared", space="cta")
-
-            q_inv_norm = opaque_f32_zero() + cutlass.Float32(1.0)
-            k_inv_norm = opaque_f32_zero() + cutlass.Float32(1.0)
             if cutlass.const_expr(cfg.l2norm):
-                q_sum_sq = qk0_lo + qk1_lo
-                k_sum_sq = qk0_hi + qk1_hi
-                q_sum_sq = q_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, q_sum_sq, 4, 31, kind=nvvm.Shfl.BFLY))
-                q_sum_sq = q_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, q_sum_sq, 2, 31, kind=nvvm.Shfl.BFLY))
-                q_sum_sq = q_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, q_sum_sq, 1, 31, kind=nvvm.Shfl.BFLY))
-                k_sum_sq = k_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 4, 31, kind=nvvm.Shfl.BFLY))
-                k_sum_sq = k_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 2, 31, kind=nvvm.Shfl.BFLY))
-                k_sum_sq = k_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 1, 31, kind=nvvm.Shfl.BFLY))
-                q_inv_norm = cute.math.rsqrt(q_sum_sq + cutlass.Float32(L2_NORM_EPS), fastmath=True)
-                k_inv_norm = cute.math.rsqrt(k_sum_sq + cutlass.Float32(L2_NORM_EPS), fastmath=True)
                 if lane_in_row_group == 0:
                     sNorm_raw[(gc % cfg.tmem_qk_raw_stages) * (2 * cfg.b_t) + decay_row] = q_inv_norm
                     sNorm_raw[(gc % cfg.tmem_qk_raw_stages) * (2 * cfg.b_t) + cfg.b_t + decay_row] = k_inv_norm
@@ -2087,33 +2005,13 @@ def compute0_warp_group(
                     raw_f16_idx = f16_segment * (cfg.b_t * 64) + decay_row * 64 + swizzle_xor_128b(decay_row, f16_segment_dim, elem_bytes=2)
                     (sBetaP_ptr + raw_f16_idx).store(beta_eff_vec, alignment=16)
 
-            # ---- decay/restore operands: exp2(+-g) applied per key channel -----------
-            exp_g_regs = cutlass.Array(cutlass.Float32, dk_halves * 8, alignment=16)
-            inverse_g_regs = cutlass.Array(cutlass.Float32, dk_halves * 8, alignment=16)
-            for dim_half in cutlass.range_constexpr(dk_halves):
-                dim_base = dim_half * 64 + lane_in_row_group * 8
-                reg_base = dim_half * 8
-                for f32_group in cutlass.range_constexpr(2):
-                    f32_dim_base = dim_base + f32_group * 4
-                    f32_segment = f32_dim_base // 32
-                    f32_segment_dim = f32_dim_base - f32_segment * 32
-                    g_prefix_idx = f32_segment * (cfg.b_t * 32) + decay_row * 32 + swizzle_xor_128b(decay_row ^ f32_segment, f32_segment_dim, elem_bytes=4)
-                    exp_g_frag = (gate_prefix_ptr + g_prefix_idx).load(count=4, alignment=16)
-                    f32_reg_base = reg_base + f32_group * 4
-                    for elem in cutlass.range_constexpr(4):
-                        decay, inverse, _ = row_operand_scales(
-                            cfg,
-                            steep_bits,
-                            f32_reg_base + elem,
-                            decay_row,
-                            f32_dim_base + elem,
-                            exp_g_frag[elem],
-                            cutlass.Float32(1.0),
-                            sGate_exchange_ptr,
-                            steep_last_ptr,
-                        )
-                        exp_g_regs[f32_reg_base + elem] = decay
-                        inverse_g_regs[f32_reg_base + elem] = inverse
+            # ---- decay/restore operands ---------------------------------------------
+            exp_g_regs, inverse_g_regs, restore_g_regs = load_operand_scales(
+                cfg, decay_row, lane_in_row_group, steep_bits, sGate_exchange_ptr, steep_last_ptr, False
+            )
+            if cutlass.const_expr(has_exact_path(cfg)):
+                keys = mDstateScratch.iterator + bidx * (cfg.state_grad_scratch.nbytes // 4) + cfg.state_grad_scratch.keys.offset // 4
+                store_steep_keys(cfg, raw_k_regs, k_inv_norm, inverse_g_regs, steep_bits, decay_row, lane_in_row_group, keys + decay_stage * cfg.b_t * cfg.d_k)
             nvvm.fence_proxy("async.shared", space="cta")
             if cutlass.const_expr(not cfg.beta_guard):
                 # a steep tile's correction still reads the raw stage: it arrives after the Q decay store instead
@@ -2122,37 +2020,9 @@ def compute0_warp_group(
 
             for dim_half in cutlass.range_constexpr(dk_halves):
                 dim_base = dim_half * 64 + lane_in_row_group * 8
-                reg_base = dim_half * 8
-
-                # ---- K decay + K inv operands: Beta * K * exp2(+g), K * exp2(-g) -----
-                k_decay_pack = cutlass.Array(cutlass.Int32, 4, alignment=16)
-                for pair_idx in cutlass.range_constexpr(4):
-                    dim0 = pair_idx * 2
-                    dim1 = dim0 + 1
-                    raw_reg_idx0 = reg_base + dim0
-                    raw_reg_idx1 = reg_base + dim1
-                    k_value0, k_value1 = fmul2(raw_k_regs[raw_reg_idx0], raw_k_regs[raw_reg_idx1], k_inv_norm, k_inv_norm)
-                    k_beta0, k_beta1 = fmul2(k_value0, k_value1, raw_beta_regs[raw_reg_idx0], raw_beta_regs[raw_reg_idx1])
-                    k_decay0, k_decay1 = fmul2(k_beta0, k_beta1, exp_g_regs[raw_reg_idx0], exp_g_regs[raw_reg_idx1])
-                    k_decay_pack[pair_idx] = fp32_to_fp16(k_decay0, k_decay1, dtype=cfg.io_dtype)
-                    exp_neg_g0 = inverse_g_regs[raw_reg_idx0]
-                    exp_neg_g1 = inverse_g_regs[raw_reg_idx1]
-                    k_inv0, k_inv1 = fmul2(k_value0, k_value1, exp_neg_g0, exp_neg_g1)
-                    k_inv_pack[dim_half * 4 + pair_idx] = fp32_to_fp16(k_inv0, k_inv1, dtype=cfg.io_dtype)
-
-                k_inv_vec = cutlass.Vector.from_elements(
-                    (
-                        k_inv_pack[dim_half * 4],
-                        k_inv_pack[dim_half * 4 + 1],
-                        k_inv_pack[dim_half * 4 + 2],
-                        k_inv_pack[dim_half * 4 + 3],
-                    ),
-                    cutlass.Int32,
-                ).bitcast(cfg.io_dtype)
-                k_decay_vec = cutlass.Vector.from_elements(
-                    (k_decay_pack[0], k_decay_pack[1], k_decay_pack[2], k_decay_pack[3]),
-                    cutlass.Int32,
-                ).bitcast(cfg.io_dtype)
+                k_inv_vec, k_decay_vec, k_restore_half = key_operand_half(
+                    cfg, dim_half, raw_k_regs, raw_beta_regs, k_inv_norm, exp_g_regs, inverse_g_regs, restore_g_regs
+                )
                 f16_segment = dim_base // 64
                 f16_segment_dim = dim_base - f16_segment * 64
                 op_idx = f16_segment * (cfg.b_t * 64) + decay_row * 64 + swizzle_xor_128b(decay_row, f16_segment_dim, elem_bytes=2)
@@ -2175,20 +2045,7 @@ def compute0_warp_group(
                     raw_q_frag_f32 = raw_q_frag.to(cutlass.Float32)
                     for dim_offset in cutlass.range_constexpr(8):
                         raw_q_regs[reg_base + dim_offset] = raw_q_frag_f32[dim_offset]
-                q_decay_pack = cutlass.Array(cutlass.Int32, 4, alignment=16)
-                for pair_idx in cutlass.range_constexpr(4):
-                    dim0 = pair_idx * 2
-                    dim1 = dim0 + 1
-                    raw_reg_idx0 = reg_base + dim0
-                    raw_reg_idx1 = reg_base + dim1
-                    q_value0, q_value1 = fmul2(raw_q_regs[raw_reg_idx0], raw_q_regs[raw_reg_idx1], q_stage_norm, q_stage_norm)
-                    q_decay0, q_decay1 = fmul2(q_value0, q_value1, exp_g_regs[raw_reg_idx0], exp_g_regs[raw_reg_idx1])
-                    q_decay_pack[pair_idx] = fp32_to_fp16(q_decay0, q_decay1, dtype=cfg.io_dtype)
-
-                q_decay_vec = cutlass.Vector.from_elements(
-                    (q_decay_pack[0], q_decay_pack[1], q_decay_pack[2], q_decay_pack[3]),
-                    cutlass.Int32,
-                ).bitcast(cfg.io_dtype)
+                q_decay_vec = query_operand_half(cfg, dim_half, raw_q_regs, q_stage_norm, exp_g_regs)
                 f16_segment = dim_base // 64
                 f16_segment_dim = dim_base - f16_segment * 64
                 op_idx = f16_segment * (cfg.b_t * 64) + decay_row * 64 + swizzle_xor_128b(decay_row, f16_segment_dim, elem_bytes=2)
@@ -2277,6 +2134,7 @@ def compute1_warp_group(
     warp_idx,
     mDstate0,
     mDstate_in,
+    mDstateScratch,
     sV_raw,
     sW_raw,
     sDo_raw,
@@ -2312,6 +2170,11 @@ def compute1_warp_group(
         state_gmem_row = tmem_sp * 16 + lane_idx % 16
         state_row_valid = lane_idx < 16
 
+    dstate_scratch = mDstateScratch.iterator + bidx * (cfg.state_grad_scratch.nbytes // 4)
+    scratch_row = dstate_scratch + state_gmem_row * cfg.d_k
+    dstate_acquire_index = PipelineState.start(phase=0)
+    cg2_release_index = PipelineState.start(phase=0)
+
     raw_index = PipelineState.start(phase=0)
     state_k_index = PipelineState.start(phase=0)
     u_acc_index = PipelineState.start(phase=0)
@@ -2338,7 +2201,8 @@ def compute1_warp_group(
             if sk_nt > 0:
                 seed_true = compute_end == batch_num_chunks
                 bars.mb_dstate_smem_done.wait(dstate_smem_done_index.phase)
-                bars.mb_dstate_smem_cg2_done.wait(dstate_smem_done_index.phase)
+                if cutlass.const_expr(not has_exact_path(cfg)):
+                    bars.mb_dstate_smem_cg2_done.wait(dstate_smem_done_index.phase)
                 dstate_smem_done_index = advance(dstate_smem_done_index, 1)
                 seed_stage = gbase % cfg.smem_decay_stages
                 seed_phase = (gbase // cfg.smem_decay_stages) % 2
@@ -2373,7 +2237,9 @@ def compute1_warp_group(
                         nvvm.make_tmem_ptr(row_lo_addr + (tmem_col + cfg.tmem_dstate_acc_offset + i * 16), cutlass.Float32),
                         seed_block[0:16],
                     )
-                    seed_pack = pack_dstate_operand(cfg, seed_undecayed, seed_block, i * 16, seed_steep_ptr, seed_steep_any, width=16)
+                    seed_pack = pack_dstate_operand(
+                        cfg, seed_undecayed, seed_block, i * 16, seed_steep_ptr, seed_steep_any, scratch_row, state_row_valid, width=16
+                    )
                     nvvm.tcgen05_st(
                         "32x32b",
                         nvvm.make_tmem_ptr(row_lo_addr + (tmem_col + cfg.tmem_dstate_input_offset + i * 8), cutlass.Int8),
@@ -2488,6 +2354,22 @@ def compute1_warp_group(
             du_vec_lo = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_lo_addr + du_col_id, cutlass.Float32), num=2)
             if cutlass.const_expr(dv_halves == 2):
                 du_vec_hi = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_hi_addr + du_col_id, cutlass.Float32), num=2)
+
+            if cutlass.const_expr(has_exact_path(cfg)):
+                has_dstate = cutlass.Boolean(rev_idx > 0)
+                if cutlass.const_expr(cfg.use_dstate_in):
+                    has_dstate = cutlass.Boolean(True)
+                if has_dstate:
+                    decay_stage = gc % cfg.smem_decay_stages
+                    # Acquire generic-memory writes directly, independently of MMA completion.
+                    bars.mb_dstate_input_ready.wait(dstate_acquire_index.phase)
+                    dstate_acquire_index = advance(dstate_acquire_index, 1)
+                    bars.mb_k_decay_inv_ready[decay_stage].wait((gc // cfg.smem_decay_stages) % 2)
+                    words = sSteepTile_ptr + decay_stage * len(cfg.compute_group_0_warp_ids)
+                    keys = dstate_scratch + cfg.state_grad_scratch.keys.offset // 4 + decay_stage * cfg.b_t * cfg.d_k
+                    du_vec_lo = add_steep_du(cfg, du_vec_lo, dstate_scratch, keys, words, tmem_sp * (cfg.d_v // 4), lane_idx)
+                    if cutlass.const_expr(dv_halves == 2):
+                        du_vec_hi = add_steep_du(cfg, du_vec_hi, dstate_scratch, keys, words, tmem_sp * (cfg.d_v // 4) + 16, lane_idx)
 
             du_pack_lo = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.rmem)
             du_pack_hi = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.rmem)
@@ -2684,9 +2566,14 @@ def compute1_warp_group(
             # ---- dstate capture for the next chunk -----------------------------------
             bars.mb_dstate_acc_ready.wait(dstate_ready_index.phase)
             dstate_ready_index = advance(dstate_ready_index, 1)
+            if cutlass.const_expr(has_exact_path(cfg)):
+                if has_dstate:
+                    bars.mb_dstate_smem_cg2_done.wait(cg2_release_index.phase)
+                    cg2_release_index = advance(cg2_release_index, 1)
             if rev_idx + cutlass.Int32(1) < sk_nt:
                 bars.mb_dstate_smem_done.wait(dstate_smem_done_index.phase)
-                bars.mb_dstate_smem_cg2_done.wait(dstate_smem_done_index.phase)
+                if cutlass.const_expr(not has_exact_path(cfg)):
+                    bars.mb_dstate_smem_cg2_done.wait(dstate_smem_done_index.phase)
                 dstate_smem_done_index = advance(dstate_smem_done_index, 1)
                 next_serial = gc + cutlass.Int32(1)
                 scale_stage = next_serial % cfg.smem_decay_stages
@@ -2709,7 +2596,7 @@ def compute1_warp_group(
                             dstate_decayed[group * 4 + 2 * pair], dstate_decayed[group * 4 + 2 * pair + 1] = fmul2(
                                 dstate_vec[group * 4 + 2 * pair], dstate_vec[group * 4 + 2 * pair + 1], decay_frag[2 * pair], decay_frag[2 * pair + 1]
                             )
-                    dstate_pack = pack_dstate_operand(cfg, dstate_vec, dstate_decayed, i * 32, next_steep_ptr, next_steep_any)
+                    dstate_pack = pack_dstate_operand(cfg, dstate_vec, dstate_decayed, i * 32, next_steep_ptr, next_steep_any, scratch_row, state_row_valid)
                     nvvm.tcgen05_st(
                         "32x32b",
                         nvvm.make_tmem_ptr(row_lo_addr + (tmem_col + cfg.tmem_dstate_input_offset + i * 16), cutlass.Int8),
@@ -2803,6 +2690,8 @@ def compute2_warp_group(
     sDk_raw,
     sRed1_raw,
     sDstate_raw,
+    mDstateScratch,
+    sU_raw,
     sDgate_raw,
     sDb_raw,
     sQ_raw,
@@ -2839,6 +2728,7 @@ def compute2_warp_group(
         channel_lo = cg2_warp * channel_rows + lane_idx // 4
         channel_hi = channel_lo + cutlass.Int32(8)
     row_lo_addr = tmem_row << 16
+    dstate_scratch = mDstateScratch.iterator + bidx * (cfg.state_grad_scratch.nbytes // 4)
 
     raw_index = PipelineState.start(phase=0)
     dq_acc_index = PipelineState.start(phase=0)
@@ -2952,6 +2842,11 @@ def compute2_warp_group(
                                 dstate_addr1 = (v0 + 1) * 64 + swizzle_xor_128b(v0 + 1, channel_cs, elem_bytes=2)
                                 hval0 = (sDstate_raw.data_ptr() + dstate_addr0).load().to(cutlass.Float32)
                                 hval1 = (sDstate_raw.data_ptr() + dstate_addr1).load().to(cutlass.Float32)
+                                if cutlass.const_expr(has_exact_path(cfg)):
+                                    if steep_channels[cs] != 0:
+                                        decay = (sGate_exchange_ptr + exchange_offset(cfg, cfg.b_t - 1, channel_cs)).load()
+                                        hval0 = (dstate_scratch + v0 * cfg.d_k + channel_cs).load() * decay
+                                        hval1 = (dstate_scratch + (v0 + 1) * cfg.d_k + channel_cs).load() * decay
                                 bucket = cs * 4 + (rep % 2) * 2 + n
                                 hacc[bucket] = hacc[bucket] + hval0 * state_pair[0].to(cutlass.Float32)
                                 hacc[bucket] = hacc[bucket] + hval1 * state_pair[1].to(cutlass.Float32)
@@ -2977,22 +2872,19 @@ def compute2_warp_group(
                             dstate_addr1 = (channel // 64) * (cfg.d_v * 64) + (v0 + 1) * 64 + swizzle_xor_128b(2 * j + 1, channel % 64, elem_bytes=2)
                             hval0 = (sDstate_raw.data_ptr() + dstate_addr0).load().to(cutlass.Float32)
                             hval1 = (sDstate_raw.data_ptr() + dstate_addr1).load().to(cutlass.Float32)
+                            if cutlass.const_expr(has_exact_path(cfg)):
+                                if steep_channel != 0:
+                                    decay = (sGate_exchange_ptr + exchange_offset(cfg, cfg.b_t - 1, channel)).load()
+                                    hval0 = (dstate_scratch + v0 * cfg.d_k + channel).load() * decay
+                                    hval1 = (dstate_scratch + (v0 + 1) * cfg.d_k + channel).load() * decay
                             hacc[(2 * j) % 8] = hacc[(2 * j) % 8] + hval0 * state_pair[0].to(cutlass.Float32)
                             hacc[(2 * j + 1) % 8] = hacc[(2 * j + 1) % 8] + hval1 * state_pair[1].to(cutlass.Float32)
                         pa0, pb0 = fadd2(hacc[0], hacc[2], hacc[4], hacc[6])
                         pa1, pb1 = fadd2(hacc[1], hacc[3], hacc[5], hacc[7])
                         part_a, part_b = fadd2(pa0, pb0, pa1, pb1)
                         dgate_last_val = dgate_last_val + (part_a + part_b)
-                if cutlass.const_expr(has_exact_path(cfg)):
-                    if cutlass.const_expr(split_channels):
-                        for cs in cutlass.range_constexpr(2):
-                            if steep_channels[cs] != 0:
-                                channel_cs = channel_lo if cs == 0 else channel_hi
-                                dgate_last_frag[cs] = dgate_last_frag[cs] * (sGate_exchange_ptr + exchange_offset(cfg, cfg.b_t - 1, channel_cs)).load()
-                    else:
-                        if steep_channel != 0:
-                            dgate_last_val = dgate_last_val * (sGate_exchange_ptr + exchange_offset(cfg, cfg.b_t - 1, channel)).load()
-                bars.mb_dstate_smem_cg2_done.arrive()
+                if cutlass.const_expr(not has_exact_path(cfg)):
+                    bars.mb_dstate_smem_cg2_done.arrive()
             bars.mb_state_input_cg2_done[gc % 2].arrive()
 
             # ---- part-store accumulators ---------------------------------------------
@@ -3019,6 +2911,8 @@ def compute2_warp_group(
 
             # ---- dK restore part store: 1/eG scale + dGate last K-dot ----------------
             if has_dstate:
+                if cutlass.const_expr(has_exact_path(cfg)):
+                    bars.mb_u_smem_ready.wait(gc % 2)
                 bars.mb_dk_restore_part_acc_ready.wait(dk_restore_part_index.phase)
                 dk_restore_part_index = advance(dk_restore_part_index, 1)
                 if cutlass.const_expr(split_channels):
@@ -3038,6 +2932,10 @@ def compute2_warp_group(
                                 token = fragment_quad * 2 + cutlass.Int32(rep * 8 + n)
                                 restore_scale = restore_frag[k] if cutlass.const_expr(has_exact_path(cfg)) else cute.math.rcp(eg_frag[k], approx=True, ftz=True)
                                 dk_hat = restore_scale * dk_restore_vec[k]
+                                if cutlass.const_expr(has_exact_path(cfg)):
+                                    if steep_channels[cs] != 0:
+                                        channel_cs = channel_lo if cs == 0 else channel_hi
+                                        dk_hat = steep_dk_restore(cfg, dstate_scratch, sU_raw.data_ptr(), channel_cs, token, restore_scale)
                                 dk_frag[k] = dk_hat
                                 k_v = k_pair[n].to(cutlass.Float32)
                                 if cutlass.const_expr(cfg.l2norm):
@@ -3051,12 +2949,20 @@ def compute2_warp_group(
                     for t in cutlass.range_constexpr(cfg.b_t):
                         restore_scale = restore[t] if cutlass.const_expr(has_exact_path(cfg)) else cute.math.rcp(eg[t], approx=True, ftz=True)
                         dk_hat = restore_scale * dk_restore_part_vec[t]
+                        if cutlass.const_expr(has_exact_path(cfg)):
+                            if steep_channel != 0:
+                                dk_hat = steep_dk_restore(cfg, dstate_scratch, sU_raw.data_ptr(), channel, t, restore_scale)
                         dk_n[t] = dk_hat
                         k_pair = cutlass.Vector.from_elements((kr_words[t // 2],), cutlass.Float32).bitcast(cfg.io_dtype)
                         k_v = k_pair[t % 2].to(cutlass.Float32)
                         if cutlass.const_expr(cfg.l2norm):
                             k_v = k_v * sNorm_raw[norm_base + cfg.b_t + t]
                         dgate_last_acc[t % 4] = dgate_last_acc[t % 4] + k_v * dk_hat
+
+            if cutlass.const_expr(has_exact_path(cfg)):
+                if has_dstate:
+                    # Release original FP32 dstate and U only after both projections.
+                    bars.mb_dstate_smem_cg2_done.arrive()
 
             # ---- dQ acc store: eG.scale ----------------------------------------------
             bars.mb_dq_acc_ready.wait(dq_acc_index.phase)
@@ -3898,6 +3804,7 @@ def host(
     work_count: cute.Tensor | None,
     scheduler_counter: cute.Tensor,
     tensormap_workspace: cute.Tensor,
+    dstate_scratch: cute.Tensor,
     scale: cutlass.Float32,
     stream,
 ) -> None:
@@ -3930,6 +3837,7 @@ def host(
             work_items,
             work_count,
             scheduler_counter,
+            dstate_scratch,
             scale,
         ).launch(
             grid=grid_shape,
@@ -3961,6 +3869,7 @@ def frost_gdn2_bprop(
     mWorkItems: cute.Tensor,
     mCount: cute.Tensor,
     mScheduler: cute.Tensor,
+    mDstateScratch: cute.Tensor,
     scale: cutlass.Float32,
 ) -> None:
     """BT=16 GDN-2 backward kernel (persistent, 16 warps)."""
@@ -4397,6 +4306,7 @@ def frost_gdn2_bprop(
             sSteepTile_ptr,
             sSteepCorr_ptr,
             mScheduler,
+            mDstateScratch,
             bars,
         )
     elif warp_idx >= cfg.compute_group_2_warp_ids[0] and warp_idx <= cfg.compute_group_2_warp_ids[-1]:
@@ -4421,6 +4331,8 @@ def frost_gdn2_bprop(
             sDk_raw,
             sRed1_raw,
             sDstate_raw,
+            mDstateScratch,
+            sU_raw,
             sDgate_raw,
             sDb_raw,
             sQ_raw,
@@ -4445,6 +4357,7 @@ def frost_gdn2_bprop(
             warp_idx,
             mDstate0,
             mDstate_in,
+            mDstateScratch,
             sV_raw,
             sW_raw,
             sDo_raw,
@@ -4557,6 +4470,7 @@ class Gdn2BpropCfg:
     dwo_cosize: int = 0
     tma_state_bytes: int = 0
     steep_scratch: SteepScratchLayout | None = None
+    state_grad_scratch: StateGradientScratchLayout | None = None
     steep_mode: int = STEEP_FAST  # common/steep_decay.py: STEEP_FAST / STEEP_EXACT
 
 
@@ -4627,6 +4541,7 @@ def build_cfg(
     cfg.raw_gate_cosize = cfg.smem_raw_stages * cfg.d_k * cfg.b_t
     cfg.gate_stage_elems = (cfg.d_k * cfg.b_t) * (4 // (cfg.gate_dtype.width // 8))
     cfg.operand_cosize = cfg.smem_decay_stages * cfg.b_t * cfg.d_k
+    cfg.state_grad_scratch = state_gradient_scratch_layout(d_k=cfg.d_k, d_v=cfg.d_v, b_t=cfg.b_t, decay_stages=cfg.smem_decay_stages)
 
     # ---- sub-bank fill: 1024 B plus two operand rings keeps the high group at 128KB ----
     cfg.bank_fill_cosize = 1024 // (io_dtype.width // 8) + 2 * cfg.operand_cosize
