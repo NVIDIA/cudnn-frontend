@@ -799,6 +799,13 @@ the actual host signature, then run output/Stats numerics and changed-input
 replay for FP16 and BF16; `test_sdpa_native_sm120_binding.py` is the detector.
 ### Native backward binding
 
+Exercise the actual standalone adapter as well as the prepared binder. A lower-level
+frame test can miss an incompatible metadata container built by the adapter.
+`test_shared_standalone_adapter_uses_current_native_storage` calls that boundary
+with the native and Python binders, optional external delta, changed storage and
+invalid current inputs; the native geometry transport must accept the adapter
+without falling back to Python.
+
 Derive the runtime frame from each actual host signature: SM80 has a partial
 that binds four launch bounds, SM107 dense and THD have different optional
 slots, and some chains use one scale while others use two. Compare native and

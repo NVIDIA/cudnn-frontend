@@ -112,6 +112,70 @@ def test_standalone_uses_the_native_host_contract(arch, scale, monkeypatch):
     assert rebound[-1] == 31
 
 
+@pytest.mark.parametrize("native_binding", [False, True])
+@pytest.mark.parametrize("external_delta", [False, True])
+@pytest.mark.parametrize("scale", [None, 0.0, -0.0, 0.375])
+def test_shared_standalone_adapter_uses_current_native_storage(native_binding, external_delta, scale, monkeypatch):
+    from types import SimpleNamespace
+
+    import torch
+    import cudnn._device as device
+    from cudnn.sdpa.bwd import prepared_sm107
+    from cudnn.sdpa.fwd import prepared as fwd_prep
+
+    spec, _, facts, _, frames = _fixture("sm107", features=False)
+    ops = list(spec.operands)
+    # Kernel operands use BSHD; standalone carriers declare logical BHSD.
+    for i, role in enumerate(spec.roles[:9]):
+        op = ops[i]
+        if role == "stats":
+            ops[i] = replace(op, shape=(2, 3, 5), strides=(15, 5, 1), span=30)
+            facts[role] = facts[role]._replace(shape=(30,), strides=(1,), span=30)
+        else:
+            facts[role] = facts[role]._replace(shape=tuple(op.shape[j] for j in (0, 2, 1, 3)), strides=tuple(op.strides[j] for j in (0, 2, 1, 3)))
+    if external_delta:
+        i = spec.roles.index("delta")
+        ops[i] = prep.Operand("float32", (2, 3, 5), (15, 5, 1), 30, 4, 4)
+        facts["delta"] = BufferFacts(0x100000000000 + i * 2**40, "float32", (2, 0), 30, (2, 3, 5), (15, 5, 1))
+    spec = replace(spec, operands=tuple(ops), native_binding=native_binding)
+    api = SimpleNamespace(_prepared=spec, q_desc=SimpleNamespace(device=torch.device("cuda", 0)))
+    workspace = BufferFacts(_WORKSPACE, "uint8", (2, 0), 4096, (4096,), (1,))
+    contexts = []
+    monkeypatch.setattr(fwd_prep, "facts_of_tensor", lambda tensor: tensor)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda dev: SimpleNamespace(cuda_stream=17))
+    monkeypatch.setattr(device, "ensure_current_context", lambda stream, dev: contexts.append((stream, dev)))
+    expected_bind = prep._bind_python
+    if native_binding:
+        monkeypatch.setattr(prep, "_bind_python", lambda *a, **kw: pytest.fail("standalone adapter fell back to Python binding"))
+
+    def execute(current, ws=workspace, stream=None):
+        prepared_sm107.execute_standalone(api, [current.get(role) for role in spec.roles], ws, stream, scale)
+
+    for offset, stream in ((0, None), (0x10000, 29)):
+        current = {role: f._replace(ptr=f.ptr + offset) for role, f in facts.items()}
+        expected = expected_bind(spec, current, workspace.ptr, 17 if stream is None else stream, scale=scale)
+        execute(current, stream=stream)
+        assert frames[-1] == tuple(expected)
+        scale_slot = len(spec.operands) + 1 + spec.scale_log2
+        assert frames[-1][scale_slot].hex() == float(spec.scale if scale is None else scale).hex()
+    assert contexts == [(17, 0), (29, 0)]
+    # Reject current storage before entry, including the optional external delta.
+    bad_facts = [
+        dict(current, q=current["q"]._replace(shape=(current["q"].span,), strides=(1,))),
+        dict(current, stats=current["stats"]._replace(shape=(29,), span=29)),
+        dict(current, dq=current["dq"]._replace(ptr=current["dq"].ptr + 1)),
+    ]
+    if external_delta:
+        bad_facts.extend([dict(current, delta=None), dict(current, delta=current["delta"]._replace(dtype="bfloat16"))])
+    for bad in bad_facts:
+        with pytest.raises(ValueError):
+            execute(bad)
+    with pytest.raises(ValueError, match="workspace"):
+        execute(current, ws=workspace._replace(span=4095))
+    assert len(frames) == 2
+
+
 @pytest.mark.parametrize("arch", ["sm80", "sm100", "sm107_thd"])
 @pytest.mark.parametrize("q_prefix,kv_prefix", [(False, False), (True, False), (False, True), (True, True)])
 def test_native_standalone_prefix_form_and_storage(arch, q_prefix, kv_prefix):
