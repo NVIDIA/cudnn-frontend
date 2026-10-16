@@ -320,6 +320,9 @@ def _pools(n_pages, h, page_size, d, layout, dtype, device=_DEV, fill=None):
         return tuple(torch.full((n_pages, h, page_size, d), fill, device=device, dtype=dtype) for _ in range(2))
     if layout == "nhd":
         return tuple(torch.full((n_pages, page_size, h, d), fill, device=device, dtype=dtype).permute(0, 2, 1, 3) for _ in range(2))
+    if layout == "hnd_padded":
+        # HND with a PADDED page stride (8 spare token rows per page): covering and 16-B aligned, so the contract admits it; not compact
+        return tuple(torch.full((n_pages, h, page_size + 8, d), fill, device=device, dtype=dtype)[:, :, :page_size] for _ in range(2))
     assert layout == "unified"
     row = torch.full((n_pages, h, page_size, 2 * d), fill, device=device, dtype=dtype)
     return row[..., :d], row[..., d:]
@@ -1716,14 +1719,13 @@ def test_two_launches_are_bitwise():
     assert torch.equal(a, b)
 
 
-@requires_rubin
-def test_capture_of_the_first_execute_replays_bitwise_and_takes_new_lengths_tables_slots_and_inputs():
+def _capture_replay_cell(**blk_kw):
     """The serving stack's defaults: the FIRST execute of a fresh declaration captured on a NEW stream with no eager warm-up
     under ``set_sync_debug_mode("error")`` (no host sync in the DECODE path: lengths, tables and slots are device data); the
     capture launches nothing, the replay is BITWISE a fresh eager run; a padded batch replays correctly; new ``kv_lens`` /
     ``block_table`` / ``slot_mapping`` / ``h`` through the captured tensors replay bitwise the eager run over them."""
     lens = (300, 0, 1000, 77)
-    case = _Case(16, 2, lens, seed=23)  # fresh: never executed
+    case = _Case(16, 2, lens, seed=23, blk_kw=blk_kw or None)  # fresh: never executed
     case.blk.check_support()
     case.blk.compile()
     case.ws = torch.empty(case.blk.get_workspace_size(), dtype=torch.uint8, device=_DEV)
@@ -1780,6 +1782,18 @@ def test_capture_of_the_first_execute_replays_bitwise_and_takes_new_lengths_tabl
         assert torch.equal(case.out, replayed2), "the replay over new lengths / tables / slots differs from the eager run over them"
     finally:
         graph.reset()
+
+
+@requires_rubin
+def test_capture_of_the_first_execute_replays_bitwise_and_takes_new_lengths_tables_slots_and_inputs():
+    _capture_replay_cell()
+
+
+@requires_rubin
+def test_capture_of_the_first_execute_replays_bitwise_with_the_write_through_in_the_norm_rope_launch():
+    """The same cell with the paged write-through folded into the norm + RoPE launch (``fuse_cache_write_small_m=True``): the arm's slot
+    loads and pool stores are device-side like the separate kernel's, so the first execute captures with no host sync and replays bitwise."""
+    _capture_replay_cell(fuse_cache_write_small_m=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1948,3 +1962,200 @@ def test_decode_split_ladder_recombines_on_the_decode_grid(batch, s_q, split):
     assert rb["template"] == case.blk.decode_route.tile and rb["split"] == split and rb["epilogue_gate"] is False, rb
     if 0 in lens:
         assert (case.out[lens.index(0)] == 0).all(), "the padded entry writes exactly 0"
+
+
+# ---------------------------------------------------------------------------
+# The paged write-through folded into the norm + RoPE launch (fuse_cache_write_small_m): one launch fewer, the pools bitwise
+# ---------------------------------------------------------------------------
+#
+# kernels/qk_norm_rope_tma.py's pool-write arm: the slab's V band rides the launch as a third tile band and the post-RoPE K / V rows go
+# to the pools from the same tiles (the K words the slab's own, the V words a bit copy); the separate cache-write stage is not built.
+# The control is the chain as measured (the separate launch).  The two must leave BITWISE pools, slab bands and `out` on every pool
+# layout (the three served stride patterns + an HND pool with a padded page stride), both slot widths, with a padded entry (slot -1)
+# and with a slot pushed past the pools' capacity (a contract violation neither arm may write).  RED on a tree without the arm: the
+# declaration knob does not exist there (TypeError), and the V band is not part of the norm + RoPE launch.
+
+_POOL_LAYOUTS_PW = _LAYOUTS + ("hnd_padded",)
+_PW_LENS = (200, 0, 77, 1000)  # three live entries (a tail page each) around a PADDED one (block 0, slot -1)
+
+
+def _cupti_kernels(fn):
+    """The CUDA kernel names of one call under torch.profiler (CUPTI) after one warm call, memsets / memcpys split out; ``(None, None)``
+    when the node records nothing."""
+    from torch.profiler import ProfilerActivity, profile
+
+    fn()
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        fn()
+        torch.cuda.synchronize()
+    names = [e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA]
+    if not names:
+        return None, None
+    kernels = [n for n in names if "memset" not in n.lower() and "memcpy" not in n.lower()]
+    return kernels, [n for n in names if n not in kernels]
+
+
+def _slab_bands(case):
+    """The slab's Q, GATE, K and V bands after an execute, as the block's ``[T, H, D]`` column views (K and Q post-norm + RoPE)."""
+    g, lay = case.geom, case.blk._ws
+    t = case.blk.batch * case.blk.seq_len
+    proj = _view(case.ws, lay.proj, (t, g.n_qkvg), case.dtype)
+    o_q, o_g, o_k, o_v = g.qkvg_offsets[:4]
+    return tuple(_cols(proj, off, h, g.d_head) for off, h in ((o_q, g.h_q), (o_g, g.h_q), (o_k, g.h_kv), (o_v, g.h_kv)))
+
+
+def _pw_pair(layout, *, group=12, s_q=2, page=16, seed=3, dtype=torch.bfloat16):
+    """The control (the separate cache-write launch) and the arm (the write-through in the norm + RoPE launch) of one cell: identical
+    inputs, prefixes and pools, compiled once per layout (the stage compiles BOTH slot widths); each keeps a pristine copy of its pools
+    (the oracle prefix + the sentinel) to restore before every run."""
+    key = ("pw", layout, group, s_q, page, seed, dtype)
+    if key not in _CASES:
+        pair = []
+        for arm in (False, True):
+            c = _Case(group, s_q, _PW_LENS, page=page, layout=layout, seed=seed, dtype=dtype, blk_kw=dict(fuse_cache_write_small_m=arm)).compile()
+            c.pristine = (c.k_cache.clone(), c.v_cache.clone())
+            pair.append(c)
+        _CASES[key] = tuple(pair)
+    return _CASES[key]
+
+
+def _pw_run(case, slot_mapping):
+    case.k_cache.copy_(case.pristine[0])
+    case.v_cache.copy_(case.pristine[1])
+    case.out.fill_(float("nan"))
+    case.execute(slot_mapping=slot_mapping)
+    torch.cuda.synchronize()
+
+
+@requires_rubin
+@pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64], ids=["i32", "i64"])
+@pytest.mark.parametrize("layout", _POOL_LAYOUTS_PW)
+def test_the_write_through_in_the_norm_rope_launch_leaves_bitwise_pools_bands_and_out(layout, slot_dtype):
+    """The pools (K and V), the slab's four bands and ``out`` of the arm are BITWISE the separate launch's on ``layout`` with ``slot_dtype``
+    slots: (i) the padded cell (three live entries, one padded: slot -1 writes nothing, block 0 untouched, ``out`` vs the oracle), (ii) the
+    same cell with one live token's slot past BOTH pools' capacity (neither arm writes it: exactly ``H_kv`` rows fewer per pool)."""
+    ctl, arm = _pw_pair(layout)
+    h_kv = _GROUPS[12][1]
+    assert arm.blk.cache_write_in_norm_rope is True and arm.blk._cache_write is None and "cache_write" not in [st.name for st in arm.blk._stages]
+    assert ctl.blk.cache_write_in_norm_rope is False and isinstance(ctl.blk._cache_write, _CacheWrite)
+    assert arm.blk._norm_rope.page_size == 16 and ctl.blk._norm_rope.page_size == 0 and arm.blk._norm_rope._impl == "tma"
+    slots = ctl.slot_mapping.to(slot_dtype)
+    oor = slots.clone()
+    first_live = int(torch.nonzero(slots >= 0)[0].item())
+    oor[first_live] = ctl.n_pages * ctl.page + 3  # past both pools' capacity (n_pages x page slots): a contract violation, never written
+    written = {}
+    for tag, sm in (("padded", slots), ("out-of-range", oor)):
+        for c in (ctl, arm):
+            _pw_run(c, sm)
+        what = f"{layout} {slot_dtype} {tag}"
+        for name, a, b in (("K pool", arm.k_cache, ctl.k_cache), ("V pool", arm.v_cache, ctl.v_cache)):
+            assert torch.equal(_bits(a), _bits(b)), f"{what}: the {name} of the arm differs from the separate launch's"
+        assert torch.equal(_bits(arm.out), _bits(ctl.out)), f"{what}: out differs"
+        for name, a, b in zip(("Q", "GATE", "K", "V"), _slab_bands(arm), _slab_bands(ctl)):
+            assert torch.equal(_bits(a), _bits(b)), f"{what}: the slab's {name} band differs"
+        k0, v0 = arm.block0_bits
+        assert torch.equal(_bits(arm.k_cache[0]), k0) and torch.equal(_bits(arm.v_cache[0]), v0), f"{what}: block 0 written"
+        written[tag] = (_written(arm.k_cache), _written(arm.v_cache))
+        if tag == "padded":
+            arm.check_against_oracle(what=f"{what} (arm)")
+            assert written[tag][0] == _written(ctl.pristine[0]) + sum(2 for L in _PW_LENS if L) * h_kv, "the step's rows alone were written"
+    assert written["out-of-range"] == tuple(w - h_kv for w in written["padded"]), "the out-of-range token's rows must not land anywhere"
+
+
+@requires_rubin
+def test_the_write_through_in_the_norm_rope_launch_serves_f16_pools_bitwise():
+    """f16 activations (the unfused chain by declaration): the arm's pools and ``out`` bitwise the separate launch's on the compact layout."""
+    ctl, arm = _pw_pair("hnd", dtype=torch.float16, seed=5)
+    for c in (ctl, arm):
+        _pw_run(c, c.slot_mapping)
+    assert (
+        torch.equal(_bits(arm.k_cache), _bits(ctl.k_cache))
+        and torch.equal(_bits(arm.v_cache), _bits(ctl.v_cache))
+        and torch.equal(_bits(arm.out), _bits(ctl.out))
+    )
+    arm.check_against_oracle(what="f16 arm")
+
+
+@requires_rubin
+def test_the_write_through_in_the_norm_rope_launch_drops_the_cache_write_launch_seven_to_six():
+    """The DECODE chain's CUPTI census at the 24/2 shard's geometry (d_model 2560, B 1 x KV 4096, S_q 1, use_pdl): the separate-launch
+    chain is 7 kernels (slab GEMM, norm + RoPE, cache write, decode tile, split combine, out-proj GEMM, split-K reduce); with the
+    write-through in the norm + RoPE launch it is 6 -- the dropped name is the cache write's, `out` bitwise.  The pin names THIS tree's
+    chain (the two-kernel split-K reduce); a tree with the in-GEMM split-K reduce reads 6 / 5."""
+    cells = {}
+    for arm in (False, True):
+        cells[arm] = _Case(12, 1, (4096,), seed=1, d_model=2560, blk_kw=dict(use_pdl=True, fuse_cache_write_small_m=arm)).compile()
+    k_off, m_off = _cupti_kernels(lambda: cells[False].execute())
+    k_on, m_on = _cupti_kernels(lambda: cells[True].execute())
+    if k_off is None or k_on is None:
+        pytest.skip("torch.profiler recorded no CUDA events (CUPTI unavailable on this node); the launch count is unverified here")
+    print(f"\nseparate launch: {len(k_off)} kernels + {len(m_off)} memset/memcpy:\n  " + "\n  ".join(n[:120] for n in k_off))
+    print(f"in the norm + RoPE launch: {len(k_on)} kernels + {len(m_on)} memset/memcpy:\n  " + "\n  ".join(n[:120] for n in k_on))
+    assert any("frost_cache_write" in n for n in k_off) and not any("frost_cache_write" in n for n in k_on)
+    assert any("frost_qk_norm_rope_tma" in n for n in k_on)
+    assert not [n for n in m_on if "memcpy" in n.lower()], "a hidden copy on the arm's execute path"
+    assert (len(k_off), len(k_on)) == (7, 6), (len(k_off), len(k_on))
+    torch.cuda.synchronize()
+    cells[True].check_against_oracle(what="six launches")
+    assert torch.equal(_bits(cells[True].out), _bits(cells[False].out))
+    assert torch.equal(_bits(cells[True].k_cache), _bits(cells[False].k_cache)) and torch.equal(_bits(cells[True].v_cache), _bits(cells[False].v_cache))
+
+
+def test_fuse_cache_write_small_m_rows_are_typed_and_the_arm_owns_the_write(monkeypatch):
+    """``fuse_cache_write_small_m`` (appended; None = AUTO): where the paged write-through runs on the DECODE form's unfused chain.  AUTO =
+    the environment switch when set, else the separate launch; True folds it into the norm + RoPE launch (the stage carries the page size,
+    the separate stage is not built, the stage list loses ``cache_write``); False = the separate launch; the C0-lowered ``fuse_norm_rope=True``
+    declaration and f16 pools take the arm too; the typed declines (the fused fork, a self block, a non-bool); the carve does not read it."""
+    from cudnn.gated_attention_block.api import CACHE_WRITE_SMALL_M_ENV, CACHE_WRITE_SMALL_M_MODES
+
+    assert CACHE_WRITE_SMALL_M_MODES == ("launch", "norm_rope")
+    monkeypatch.delenv(CACHE_WRITE_SMALL_M_ENV, raising=False)
+    at = lambda **kw: _make_block(12, 1, 1, **kw)[0]  # noqa: E731
+    names = lambda blk: [st.name for st in blk._stages]  # noqa: E731
+    auto = at()
+    assert auto.fuse_cache_write_small_m is None and auto.cache_write_in_norm_rope is False and isinstance(auto._cache_write, _CacheWrite)
+    assert auto._norm_rope.page_size == 0 and "cache_write" in names(auto)
+    on = at(fuse_cache_write_small_m=True)
+    assert on.fuse_cache_write_small_m is True and on.cache_write_in_norm_rope is True and on._cache_write is None
+    assert on._norm_rope.page_size == 16 and "cache_write" not in names(on) and "qk_norm_rope" in names(on)
+    assert names(on) == [n for n in names(auto) if n != "cache_write"], "the arm drops exactly the cache-write stage"
+    assert at(fuse_cache_write_small_m=False).cache_write_in_norm_rope is False
+    low = at(fuse_norm_rope=True, fuse_cache_write_small_m=True)  # the C0 lowering: the unfused chain at decode row counts
+    assert low.small_m_decode and not low.fuse_norm_rope_effective and low.cache_write_in_norm_rope and low._cache_write is None
+    assert at(dtype=torch.float16, fuse_cache_write_small_m=True).cache_write_in_norm_rope is True
+    assert auto._layout() == on._layout(), "the carve does not read the knob"
+    # the environment is the AUTO reading's switch; an explicit value outranks it
+    monkeypatch.setenv(CACHE_WRITE_SMALL_M_ENV, "norm_rope")
+    assert at().cache_write_in_norm_rope is True and at(fuse_cache_write_small_m=False).cache_write_in_norm_rope is False
+    monkeypatch.setenv(CACHE_WRITE_SMALL_M_ENV, "launch")
+    assert at().cache_write_in_norm_rope is False and at(fuse_cache_write_small_m=True).cache_write_in_norm_rope is True
+    monkeypatch.setenv(CACHE_WRITE_SMALL_M_ENV, "bogus")
+    with pytest.raises(ValueError, match=CACHE_WRITE_SMALL_M_ENV):
+        at()
+    monkeypatch.delenv(CACHE_WRITE_SMALL_M_ENV)
+    # the typed declines
+    with pytest.raises(TypeError, match="fuse_cache_write_small_m must be None"):
+        at(fuse_cache_write_small_m=1)
+    with pytest.raises(NotImplementedError, match="fused projection fork"):
+        at(fuse_norm_rope=True, fuse_norm_rope_small_m=True, fuse_cache_write_small_m=True)
+    # under AUTO the fork keeps its own write-through and the environment asks for nothing it cannot have
+    monkeypatch.setenv(CACHE_WRITE_SMALL_M_ENV, "norm_rope")
+    fork = at(fuse_norm_rope=True, fuse_norm_rope_small_m=True)
+    assert fork.cache_write_in_norm_rope is False and fork.cache_write_fused and fork._norm_rope is None
+    monkeypatch.delenv(CACHE_WRITE_SMALL_M_ENV)
+    geom, _ = _geom(12)
+    mk = lambda *shape: torch.empty(*shape, dtype=torch.bfloat16, device=_DEV)  # noqa: E731
+    with pytest.raises(NotImplementedError, match="needs paged_kv_page_size > 0"):
+        GatedAttentionBlockFwd(
+            mk(1, 1, _D_MODEL),
+            mk(geom.n_qkvg, _D_MODEL),
+            mk(_D),
+            mk(_D),
+            mk(1, 1, _ROPE),
+            mk(1, 1, _ROPE),
+            mk(_D_MODEL, 24 * _D),
+            mk(1, 1, _D_MODEL),
+            geom,
+            fuse_cache_write_small_m=True,
+        )

@@ -612,6 +612,14 @@ DECODE_ROUTE_POLICIES = (DECODE_ROUTE_SINGLE_UNIT, DECODE_ROUTE_TOKEN_UNITS)
 DEFAULT_DECODE_ROUTE_POLICY = DECODE_ROUTE_SINGLE_UNIT
 
 DECODE_PDL_STAGES = ("qk_norm_rope", "cache_write", "sigmoid_gate", "sdpa")
+# Where the paged KV-cache write-through runs on the UNFUSED chain at decode row counts (`fuse_cache_write_small_m`; the constructor's
+# note): "launch" = the separate cache-write kernel after the norm + RoPE pass (the chain as measured), "norm_rope" = folded INTO the
+# norm + RoPE launch (kernels/qk_norm_rope_tma.py, the pool-write arm: the V band copied and the post-RoPE K / V rows written to the
+# pools from the same tiles -- one launch fewer, the pools bitwise the separate write).  The AUTO reading (None) is the environment
+# variable CACHE_WRITE_SMALL_M_ENV when set (the A/B switch of a serving chain that declares through the block), else "launch" until the
+# arm is measured on the perf node; the knob is performance-only (the same bytes land in the pools and the slab either way).
+CACHE_WRITE_SMALL_M_MODES = ("launch", "norm_rope")
+CACHE_WRITE_SMALL_M_ENV = "CUDNN_FRONTEND_BLOCK_CACHE_WRITE_SMALL_M"
 """The DECODE form's stages that take the ``use_pdl`` switch (by stage name): the norm + RoPE pass (the unfused chain), the separate
 cache write, the sigmoid gate when it is its own launch, and stage (4) on a DECODE-TILE route only (``DecodeRoute.pdl_capable``: the
 tile and its split combine carry the griddepcontrol pair; the prefill route's paged d256 prefill tile does not and launches plain --
@@ -3820,12 +3828,15 @@ class _QkNormRope(_Stage):
         stages: int = _QK_NORM_ROPE_STAGES,
         use_pdl: bool = False,
         dynamic_token_stride: bool = True,
+        page_size: int = 0,  # APPENDED: > 0 = the pool-write arm (the paged K / V write-through folded into this launch; the TMA kernel only)
     ) -> None:
         self.geom = geometry
         self.batch = int(batch)
         self.seq_len = int(seq_len)
         self.dtype = dtype
         self.want_rstd = bool(want_rstd)
+        self.page_size = int(page_size)
+        self._recipes = None  # the pool-write arm: {slot dtype: recipe} (both slot widths compiled, Rule 4)
         self.threads_per_cta = int(threads_per_cta)
         self.rows_per_group = int(rows_per_group)
         self.defer_secondary_loads = bool(defer_secondary_loads)
@@ -3929,6 +3940,15 @@ class _QkNormRope(_Stage):
 
             g = self.geom
             _tma_validate(g.d_head, g.rope_dim, g.h_q, g.h_kv, self.resolve_tile_rows(), self.threads_per_cta)
+            if self.page_size:
+                from .kernels.cache_write import validate_cache_write_shape
+
+                validate_cache_write_shape(g.d_head, self.page_size, self.threads_per_cta)
+        elif self.page_size:
+            raise NotImplementedError(
+                f"{self.name}: the paged write-through folded into the norm + RoPE launch is an arm of the TMA kernel (sm_90+, a geometry its tiling "
+                f"fits); this device / geometry resolves to the LDG kernel, which has no such arm -- declare fuse_cache_write_small_m=False (or None)"
+            )
         else:
             from .kernels.qk_norm_rope import validate_shape
 
@@ -3940,7 +3960,7 @@ class _QkNormRope(_Stage):
         if self._impl == "tma":
             from .kernels.qk_norm_rope_tma import compile_qk_norm_rope_tma
 
-            self._recipe = compile_qk_norm_rope_tma(
+            common = dict(
                 dtype=self.dtype,
                 h_q=g.h_q,
                 h_kv=g.h_kv,
@@ -3954,7 +3974,18 @@ class _QkNormRope(_Stage):
                 apply_norm=g.qk_norm,
                 use_pdl=self.use_pdl,
             )
+            if self.page_size:
+                # the pool-write arm: both slot widths compiled (int32 and int64 are the two the serving stacks hand over; the dtype is a
+                # compile key), so execute dispatches on a guaranteed cache hit whichever one arrives (the separate stage's rule)
+                self._recipes = {
+                    dt: compile_qk_norm_rope_tma(pool_write=True, page_size=self.page_size, slot_dtype=dt, **common) for dt in (torch.int32, torch.int64)
+                }
+                self._recipe = self._recipes[torch.int32]
+            else:
+                self._recipe = compile_qk_norm_rope_tma(**common)
             return
+        if self.page_size:
+            raise NotImplementedError(f"{self.name}: the pool-write arm exists on the TMA kernel only (check_support names it); impl={self._impl!r}")
         from .kernels.qk_norm_rope import compile_qk_norm_rope
 
         self._recipe = compile_qk_norm_rope(
@@ -3979,7 +4010,12 @@ class _QkNormRope(_Stage):
         from .kernels.qk_norm_rope import moved_bytes
 
         g = self.geom
-        return moved_bytes(self.batch * self.seq_len, g.h_q, g.h_kv, g.d_head, elem_bytes=2, want_rstd=self.want_rstd)
+        t = self.batch * self.seq_len
+        total = moved_bytes(t, g.h_q, g.h_kv, g.d_head, elem_bytes=2, want_rstd=self.want_rstd)
+        if self.page_size:
+            # the pool-write arm: the V band read once, the K and V rows written to the pools, one slot per token (int32 counted)
+            total += 3 * t * g.h_kv * g.d_head * 2 + t * 4
+        return total
 
     def execute(
         self,
@@ -3995,6 +4031,12 @@ class _QkNormRope(_Stage):
         rstd_k: Optional[torch.Tensor] = None,  # [B, S, H_kv] fp32
         current_stream=None,
         flat: bool = False,  # accepted and ignored: rank decides
+        # APPENDED (the pool-write arm, page_size > 0): the V band [B, S, H_kv, D] / [T, H_kv, D], the two pools [P, H_kv, page_size, D]
+        # and the slot map [T] -- REQUIRED there, refused otherwise (both directions typed).
+        v: Optional[torch.Tensor] = None,
+        k_cache: Optional[torch.Tensor] = None,
+        v_cache: Optional[torch.Tensor] = None,
+        slot_mapping: Optional[torch.Tensor] = None,
     ) -> None:
         """Flatten ``[B, S, ...]`` to ``[T, ...]`` and launch.
 
@@ -4028,9 +4070,22 @@ class _QkNormRope(_Stage):
                 return None
             return x if x.ndim == 3 else x.view(t, h, g.d_head)
 
+        pool_kw = {}
+        recipe = self._recipe
+        if self.page_size:
+            if v is None or k_cache is None or v_cache is None or slot_mapping is None:
+                raise ValueError(f"{self.name}: the pool-write arm needs v, k_cache, v_cache and slot_mapping at every execute (Rule 1: no silent fallback)")
+            if slot_mapping.dtype not in self._recipes:
+                raise ValueError(f"{self.name}: slot_mapping must be int32 or int64, got {slot_mapping.dtype}")
+            recipe = self._recipes[slot_mapping.dtype]
+            pool_kw = dict(v=_flat(v, g.h_kv), k_cache=k_cache, v_cache=v_cache, slot_mapping=slot_mapping)
+        elif v is not None or k_cache is not None or v_cache is not None or slot_mapping is not None:
+            raise ValueError(
+                f"{self.name}: v / k_cache / v_cache / slot_mapping belong to the pool-write arm (page_size > 0); this stage would silently ignore them"
+            )
         runner = run_qk_norm_rope_tma if self._impl == "tma" else run_qk_norm_rope
         runner(
-            self._recipe,
+            recipe,
             _flat(q, g.h_q),
             _flat(k, g.h_kv),
             _flat(q if q_out is None else q_out, g.h_q),
@@ -4042,6 +4097,7 @@ class _QkNormRope(_Stage):
             None if rstd_q is None else rstd_q.view(t, g.h_q),
             None if rstd_k is None else rstd_k.view(t, g.h_kv),
             stream=stream,
+            **pool_kw,
         )
 
 
@@ -6567,6 +6623,16 @@ class GatedAttentionBlockFwd(APIBase):
         # `fuse_norm_rope_effective` reads back what runs (`cache_write_fused` follows it: the write-through arm lives in the fork).  Refused
         # (typed) with fuse_norm_rope=False and off the dense DECODE form.  Module docstring, "The DECODE form".
         fuse_norm_rope_small_m: Optional[bool] = None,
+        # APPENDED (2026-10-16; the DECODE form's unfused chain; performance-only): WHERE the paged KV-cache write-through runs when stage (1)
+        # is the unfused chain at decode row counts (the C0 lowering above, or fuse_norm_rope=False) on the dense DECODE form, bf16 / f16,
+        # no quant, no indexer band, 16-bit pools, the TMA norm + RoPE kernel.  None = AUTO: CACHE_WRITE_SMALL_M_ENV when set, else the
+        # separate cache-write launch ("launch": the chain as measured -- seven launches with the split combine); True = "norm_rope": the
+        # write-through FOLDED INTO the norm + RoPE launch (kernels/qk_norm_rope_tma.py's pool-write arm: the slab's V band copied and the
+        # post-RoPE K / V rows written to the pools from the same tiles, the separate cache-write stage not built -- six launches), a typed
+        # decline on a form that cannot serve it (the fused fork, a quantized pipeline, the e4m3 cache, the indexer band, the EXTEND / packed
+        # forms, a geometry the TMA tiling does not fit); False = the separate launch always.  The same bytes land in the pools and the slab
+        # either way (the pools bitwise the separate write).  `cache_write_in_norm_rope` reads back what runs.
+        fuse_cache_write_small_m: Optional[bool] = None,
     ):
         """Validate the declaration -- the dtype / ``quant`` / scale-blob halves, the fusion and save-mode knobs against
         ``save_for_backward``, the THD envelope, the paged-cache write-through -- normalise the samples, record the knobs and
@@ -6962,6 +7028,13 @@ class GatedAttentionBlockFwd(APIBase):
                 w_dtype=quant.w_qkvg_dtype if mxfp8 else None,
             )
             self._norm_rope = _QkNormRope(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act, want_rstd=want_rstd, use_pdl=self.use_pdl)
+        # (4w) on the unfused chain at decode row counts: the paged write-through folded into the norm + RoPE launch (the constructor's
+        # `fuse_cache_write_small_m` note).  Decided here, after the norm + RoPE stage exists (its TMA tiling must fit the geometry) and
+        # before the separate cache-write stage is built (not built when this arm runs: a stage that never runs is not in `_stages`).
+        self.fuse_cache_write_small_m: Optional[bool] = fuse_cache_write_small_m
+        self.cache_write_in_norm_rope: bool = self._resolve_cache_write_small_m(fuse_cache_write_small_m, quant)
+        if self.cache_write_in_norm_rope:
+            self._norm_rope.page_size = self.paged_kv_page_size
         # Stage (3b) exists ONLY to give the SDPA a compact V. In-place needs no
         # such thing, so the stage is not built at all rather than built and
         # skipped -- a stage that is never run should not be in `_stages`,
@@ -7104,7 +7177,8 @@ class GatedAttentionBlockFwd(APIBase):
         # the declaration carries a page size; not built rather than built and skipped (it would still compile).
         # Not built when the fused projection's epilogue writes the pools (cache_write_fused): a stage that never runs is not in `_stages`.
         # Under kv_cache_dtype=e4m3 the write-through QUANTIZES (two per-tensor casts + the bit copy through the pools' bf16 views).
-        if not self.paged_kv_page_size or self.cache_write_fused:
+        # Nor when the norm + RoPE launch writes them (cache_write_in_norm_rope).
+        if not self.paged_kv_page_size or self.cache_write_fused or self.cache_write_in_norm_rope:
             self._cache_write = None
         elif self.kv_cache_e4m3:
             self._cache_write = _QuantizedCacheWrite(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act, page_size=self.paged_kv_page_size)
@@ -7360,6 +7434,52 @@ class GatedAttentionBlockFwd(APIBase):
                 "forward keeps its K / V in the SavedForBackward record, not in a paged pool"
             )
         return page_size
+
+    def _resolve_cache_write_small_m(self, requested: Optional[bool], quant) -> bool:
+        """Whether the paged write-through runs INSIDE the norm + RoPE launch (``fuse_cache_write_small_m``: None = AUTO -- the environment
+        variable ``CACHE_WRITE_SMALL_M_ENV`` when set, else "launch" --, True / False by name; ``TypeError`` otherwise).  Served on the dense
+        DECODE form's UNFUSED chain with paged pools in the activation dtype (bf16 / f16, no quant, no indexer band, no e4m3 cache) when the
+        TMA norm + RoPE kernel tiles the geometry; AUTO reads False everywhere else and an explicit True is a typed decline naming the
+        reason.  Device-free (the arch half -- sm_90+ for the TMA kernel -- is the stage's ``check_support``)."""
+        if requested is not None and not isinstance(requested, bool):
+            raise TypeError(f"fuse_cache_write_small_m must be None (auto), True or False, got {type(requested).__name__}")
+        if requested is None:
+            env = os.environ.get(CACHE_WRITE_SMALL_M_ENV, "").strip()
+            if env and env not in CACHE_WRITE_SMALL_M_MODES:
+                raise ValueError(f"{CACHE_WRITE_SMALL_M_ENV}={env!r} is not one of {CACHE_WRITE_SMALL_M_MODES}")
+            want = env == "norm_rope"
+        else:
+            want = requested
+        if not want:
+            return False
+        why = None
+        if not self.paged_kv_page_size:
+            why = "needs paged_kv_page_size > 0 (there is no write-through to fold)"
+        elif self.decode_route is None:
+            why = "is the dense DECODE form's arm (kv_source='paged' on a dense declaration); the EXTEND / packed forms keep their write-through"
+        elif self._norm_rope is None:
+            why = "folds the write-through into the UNFUSED chain's norm + RoPE launch, and this declaration runs the fused projection fork (which owns the write-through: fuse_cache_write)"
+        elif quant is not None:
+            why = f"serves the bf16 / f16 pipeline only, got quant={type(quant).__name__}"
+        elif self.geom.index_band:
+            why = "with an indexer band the raw indexer key's pool is the separate cache-write launch's; declare fuse_cache_write_small_m=False (or None)"
+        elif self.kv_cache_e4m3:
+            why = "with kv_cache_dtype=torch.float8_e4m3fn the write-through QUANTIZES (its own stage); declare fuse_cache_write_small_m=False (or None)"
+        elif self.act_dtype not in (torch.bfloat16, torch.float16):
+            why = f"serves bf16 / f16 activations, got {self.act_dtype}"
+        else:
+            from .kernels.qk_norm_rope_tma import validate_shape as _tma_validate
+
+            g = self.geom
+            try:
+                _tma_validate(g.d_head, g.rope_dim, g.h_q, g.h_kv, self._norm_rope.resolve_tile_rows(), self._norm_rope.threads_per_cta)
+            except (ValueError, NotImplementedError) as exc:
+                why = f"is an arm of the TMA norm + RoPE kernel, whose tiling does not fit this geometry ({exc}); the LDG kernel has no such arm"
+        if why is None:
+            return True
+        if requested is True:
+            raise NotImplementedError(f"fuse_cache_write_small_m=True {why}")
+        return False  # AUTO (the environment asked): the separate launch where the arm is not served
 
     def _check_fuse_cache_write_declaration(self, fuse_cache_write, quant) -> Optional[bool]:
         """``fuse_cache_write`` at declaration: None / True / False (``TypeError`` otherwise); True on a pipeline the fused projection's
@@ -8933,6 +9053,10 @@ class GatedAttentionBlockFwd(APIBase):
                 rstd_k=rstd_k,
                 current_stream=stream,
                 flat=True,
+                # (4w) folded in (cache_write_in_norm_rope): the slab's V band is copied and the post-RoPE K / V rows are written to the
+                # pools from the same tiles -- the pool row is bitwise the slab row stage (4) reads; the slot map is the LIVE-ROW view, as
+                # the separate stage takes it.
+                **({"v": v_src[:rows], "k_cache": k_cache, "v_cache": v_cache, "slot_mapping": slot_live} if self.cache_write_in_norm_rope else {}),
             )
         if sv is not None and sv.gate_dst is not None:
             # (3g) TRAINING, gate-copy save mode: the slab's GATE band -> the compact
