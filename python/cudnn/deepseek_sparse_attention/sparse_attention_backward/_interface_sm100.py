@@ -444,9 +444,9 @@ def flash_attn_bwd_sm100(
             API selects Q's device context before entering this function)
         workspace: reusable uint8 scratch sized by
             ``flash_attn_bwd_sm100_workspace_size``
-        _compiled_kernel: internal plan-owned launchable whose compile-time
-            metadata must match the runtime tensors; direct callers should
-            leave this unset to use the lazy compile cache
+        _compiled_kernel: internal plan-owned launchable passed only after the
+            plan validates its runtime tensor contract; direct callers leave
+            this unset to retain low-level validation and lazy compilation
 
     Returns:
         (dq, dkv, d_sink) -- flat layout gradients
@@ -462,37 +462,45 @@ def flash_attn_bwd_sm100(
     ), f"deterministic SM100 DSA backward supports heads in {_DETERMINISTIC_HEAD_COUNTS}, got H{num_head}"
     head_dim_v = 512 if head_dim == 576 else head_dim
     device = q.device
+    # Prepared plans validate their exact runtime contract before passing the
+    # launchable; direct low-level calls retain the checks below.
+    plan_inputs_validated = _compiled_kernel is not None
 
-    assert q.dtype in [torch.float16, torch.bfloat16]
-    assert q.dtype == kv.dtype == out.dtype == dout.dtype
-    assert lse.dtype == torch.float32
-    assert attn_sink.dtype == torch.float32
-    assert topk_idxs.dtype == torch.int32
-    tensors_to_check = [q, kv, out, dout, lse, attn_sink, topk_idxs]
-    if topk_length is not None:
-        tensors_to_check.append(topk_length)
-    assert all(t.is_cuda and t.device == device for t in tensors_to_check), f"all inputs must be CUDA tensors on {device}"
+    if not plan_inputs_validated:
+        assert q.dtype in [torch.float16, torch.bfloat16]
+        assert q.dtype == kv.dtype == out.dtype == dout.dtype
+        assert lse.dtype == torch.float32
+        assert attn_sink.dtype == torch.float32
+        assert topk_idxs.dtype == torch.int32
+        tensors_to_check = [q, kv, out, dout, lse, attn_sink, topk_idxs]
+        if topk_length is not None:
+            tensors_to_check.append(topk_length)
+        assert all(t.is_cuda and t.device == device for t in tensors_to_check), f"all inputs must be CUDA tensors on {device}"
 
     # Cross-tensor shape validation: every tensor below is indexed with
     # coordinates derived from q, so a mismatched shape silently reads or
     # writes out of place instead of failing.
-    assert kv.ndim == 2 and kv.shape[1] == head_dim, f"kv shape mismatch: expected (total_S_kv, {head_dim}), got {tuple(kv.shape)}"
-    expected_o_shape = (total_S_q, num_head, head_dim_v)
-    assert out.shape == expected_o_shape, f"out shape mismatch: expected {expected_o_shape}, got {tuple(out.shape)}"
-    assert dout.shape == expected_o_shape, f"dout shape mismatch: expected {expected_o_shape}, got {tuple(dout.shape)}"
-    assert lse.shape == (total_S_q, num_head), f"lse shape mismatch: expected {(total_S_q, num_head)}, got {tuple(lse.shape)}"
-    assert attn_sink.shape == (num_head,), f"attn_sink shape mismatch: expected {(num_head,)}, got {tuple(attn_sink.shape)}"
-    assert topk_idxs.ndim == 2 and topk_idxs.shape[0] == total_S_q, f"topk_idxs shape mismatch: expected ({total_S_q}, topk_max), got {tuple(topk_idxs.shape)}"
-    if topk_length is not None:
-        assert topk_length.dtype == torch.int32, f"topk_length dtype mismatch: expected torch.int32, got {topk_length.dtype}"
-        assert topk_length.shape == (total_S_q,), f"topk_length shape mismatch: expected {(total_S_q,)}, got {tuple(topk_length.shape)}"
+    if not plan_inputs_validated:
+        assert kv.ndim == 2 and kv.shape[1] == head_dim, f"kv shape mismatch: expected (total_S_kv, {head_dim}), got {tuple(kv.shape)}"
+        expected_o_shape = (total_S_q, num_head, head_dim_v)
+        assert out.shape == expected_o_shape, f"out shape mismatch: expected {expected_o_shape}, got {tuple(out.shape)}"
+        assert dout.shape == expected_o_shape, f"dout shape mismatch: expected {expected_o_shape}, got {tuple(dout.shape)}"
+        assert lse.shape == (total_S_q, num_head), f"lse shape mismatch: expected {(total_S_q, num_head)}, got {tuple(lse.shape)}"
+        assert attn_sink.shape == (num_head,), f"attn_sink shape mismatch: expected {(num_head,)}, got {tuple(attn_sink.shape)}"
+        assert (
+            topk_idxs.ndim == 2 and topk_idxs.shape[0] == total_S_q
+        ), f"topk_idxs shape mismatch: expected ({total_S_q}, topk_max), got {tuple(topk_idxs.shape)}"
+        if topk_length is not None:
+            assert topk_length.dtype == torch.int32, f"topk_length dtype mismatch: expected torch.int32, got {topk_length.dtype}"
+            assert topk_length.shape == (total_S_q,), f"topk_length shape mismatch: expected {(total_S_q,)}, got {tuple(topk_length.shape)}"
 
     # check_support() declines strided inputs; execute re-validates (Rule 1) and never repacks (Rule 2).
-    for name, tensor in zip(("q", "kv", "out", "dout", "lse", "attn_sink", "topk_idxs", "topk_length"), tensors_to_check):
-        if not tensor.is_contiguous():
-            raise ValueError(f"{name} must be contiguous; got shape {tuple(tensor.shape)} strides {tuple(tensor.stride())}")
-    if lse.data_ptr() % 8 != 0:
-        raise ValueError(f"lse must be 8-byte aligned for the SM100 FP32 pair-copy path; got data_ptr=0x{lse.data_ptr():x}")
+    if not plan_inputs_validated:
+        for name, tensor in zip(("q", "kv", "out", "dout", "lse", "attn_sink", "topk_idxs", "topk_length"), tensors_to_check):
+            if not tensor.is_contiguous():
+                raise ValueError(f"{name} must be contiguous; got shape {tuple(tensor.shape)} strides {tuple(tensor.stride())}")
+        if lse.data_ptr() % 8 != 0:
+            raise ValueError(f"lse must be 8-byte aligned for the SM100 FP32 pair-copy path; got data_ptr=0x{lse.data_ptr():x}")
 
     # The compile cache is keyed without output strides, so a caller-provided
     # output must match the contiguous layout the kernel was compiled for (it

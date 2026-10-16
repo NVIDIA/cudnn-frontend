@@ -990,6 +990,43 @@ def test_DSA_sparse_attention_backward_sm100_execute_requires_compile(monkeypatc
         unchecked_plan.execute(*inputs, dq, dkv, **execute_args)
 
 
+@pytest.mark.L1
+@torch_fork_set_rng(seed=428)
+def test_DSA_sparse_attention_backward_sm100_plan_revalidates_runtime_layout():
+    """Prepared plans reject runtime layouts that the low-level fast path skips."""
+    _require_sm100()
+    plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
+        64,
+        512,
+        64,
+        s_q=8,
+        s_kv=256,
+        has_topk_length=True,
+    )
+    dq, dkv, d_sink = outputs
+    execute_args = dict(
+        topk_length=topk_length,
+        softmax_scale=softmax_scale,
+        workspace=workspace,
+        d_sink=d_sink,
+    )
+
+    q = inputs[0]
+    q_storage = torch.empty((*q.shape[:-1], 2 * q.shape[-1]), dtype=q.dtype, device=q.device)
+    strided_q = q_storage[..., ::2]
+    assert strided_q.shape == q.shape and not strided_q.is_contiguous()
+    with pytest.raises(ValueError, match="q must be contiguous"):
+        plan.execute(strided_q, *inputs[1:], dq, dkv, **execute_args)
+
+    lse = inputs[4]
+    lse_storage = torch.empty(lse.numel() + 1, dtype=lse.dtype, device=lse.device)
+    misaligned_lse = lse_storage[1:].view_as(lse)
+    assert misaligned_lse.is_contiguous() and misaligned_lse.data_ptr() % 8 == 4
+    misaligned_inputs = (*inputs[:4], misaligned_lse, *inputs[5:])
+    with pytest.raises(ValueError, match="lse must be 8-byte aligned"):
+        plan.execute(*misaligned_inputs, dq, dkv, **execute_args)
+
+
 @pytest.mark.L0
 def test_DSA_sparse_attention_backward_sm100_ordinary_compile_cache_is_device_scoped(monkeypatch):
     """Ordinary launchables compiled in one CUDA context are not reused by another."""
