@@ -2811,6 +2811,8 @@ against the declared route (template, packing, split, `epilogue_gate` False):
 
 2026-10-16: the DECODE-GRID combine form (`sm100/split_combine._combine_decode_grid_kernel`, the split-aware form rule `heuristics.decode_combine_grid_selected` and the adapter's plan-time pin in `fwd/prepared.py`) is the cc 10.7 row's: off cc 10.7 the rule answers False and the plan pins the combine module's own three-way rule (the lean group, the serial walk and its decode form, with the attention-sink fold), measured on its own line; no capability field changes.
 
+2026-10-16 (later): the cc 10.7 row's lean-grid-OVERFLOW split launches (a lean combine grid past `heuristics.DECODE_COMBINE_MAX_LEAN_BLOCKS`: the B 32 / B 128 x 24 heads serving cells) at a split of at most 4 (`heuristics.DECODE_COMBINE_LEAN_WALK_MAX_SPLIT`: the measured regime; a deeper split keeps the module's own forms) take the combine module's restored LEAN GROUP WALK (`sm100/split_combine._combine_lean_walk_kernel`, the module's former lean kernel; the rule `heuristics.decode_combine_lean_walk_selected`, the plan-time pin in `fwd/prepared.py`), measured on the Rubin performance class at 3.3-8.9 us per launch against the module's wide lean group / serial walk's 5.3-12.4 there; inside the bound, off cc 10.7 and on every quantized / packed / sink entry nothing changes; no capability field changes.
+
 The route of record (2026-10-15, the fill 2026-10-16; the default policy `single_unit`; `tile N` = the Rubin d256 decode tile at N
 columns with the whole group packed, `T64 x 2` = two token units of the 64-column tile, `PREFILL` = the paged d256 prefill tile with the
 group packed -- taken where the step FILLS the part, `B x H_kv >= DECODE_PREFILL_ROUTE_MIN_CTAS` = 64 CTAs, with `T64 x 2` below that

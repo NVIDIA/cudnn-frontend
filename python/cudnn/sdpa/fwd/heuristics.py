@@ -556,7 +556,13 @@ _DECODE_TILE_COMBINE_COST = 3.5
 # is the cc 10.7 row's price of a partial on the LEAN forms of the combine
 # (decode_tile_combine_per_partial); the DECODE-GRID form's own price follows,
 # and the Blackwell line's fit, which prices the decode and the serial form of
-# the combine apart, after it.
+# the combine apart, after it.  The grouped-load walk this was measured on IS
+# the combine module's LEAN GROUP WALK (split_combine._combine_lean_walk_kernel),
+# the form the cc 10.7 line's lean-grid-overflow launches run again up to the
+# walk's split bound (decode_combine_lean_walk_selected); inside the grid bound,
+# and past the split bound, the module's own forms run (measured faster than the
+# walk on the small grids) and keep this price, conservative for them there --
+# so the restore of the walk moves no pick.
 _DECODE_TILE_COMBINE_PER_PARTIAL = 0.17
 # What every partial adds to the DECODE-GRID form of the combine, in KV-tile
 # units: that kernel spreads the split axis over a block's eight lane chains and
@@ -601,8 +607,9 @@ _DECODE_TILE_SERIAL_COMBINE_PER_SPLIT = 0.15
 DECODE_COMBINE_LEAN_ROWS_PER_BLOCK = 4
 # Which FORM of the shared sm100/split_combine serves a launch ON THE cc 10.7
 # LINE (the selection constant; the kernel module reads it).  The lean
-# fp32-partial path has, beside the module's own three forms (the lean group
-# walk, the serial walk and its decode form, which the Blackwell line keeps),
+# fp32-partial path has, beside the module's own three forms (the wide lean
+# group, the serial walk and its decode form, which the Blackwell line keeps)
+# and the lean group walk of the overflow launches (below),
 # the DECODE-GRID kernel (one block per (row, head, batch, 64-column chunk) --
 # 4x the blocks at d 256 -- with the split axis spread over the block's eight
 # 16-lane chains and merged once through SMEM in a fixed order, so a lane's
@@ -611,9 +618,10 @@ DECODE_COMBINE_LEAN_ROWS_PER_BLOCK = 4
 # grid, ceil(S_q / 4) x H_q x B blocks, holds at most this many blocks: fewer
 # blocks than SMs on every SM100-line part (148 .. 212), i.e. a launch the lean
 # kernel could not fill one wave with (B 1 x 24 Q heads = 24 blocks; B 4 x 24 =
-# 96; B 4 x 32 = 128), where nothing hides a serial walk; a prefill grid
-# (thousands of blocks) and a large-batch decode keep the module's own forms by
-# construction.  The constant is GEOMETRY, not a fit: both kernels move the same
+# 96; B 4 x 32 = 128), where nothing hides a serial walk; the decode-grid kernel
+# never serves a prefill grid (thousands of blocks) or a large-batch decode: on
+# cc 10.7 those take the lean group walk up to its split bound (below), else the
+# module's own forms.  The constant is GEOMETRY, not a fit: both kernels move the same
 # bytes and the decode-grid kernel is never the longer chain, so the threshold
 # only bounds which launches change at all.  :func:`decode_combine_grid_selected`
 # is the rule's host reading, the one the split model prices a launch's combine
@@ -644,6 +652,34 @@ DECODE_COMBINE_DEEP_SPLIT = 32
 # Blackwell line, measured on B200 / B300 by the combine module's author, and any line the rule was never
 # run on) keeps the combine module's own forms on every launch.
 _DECODE_COMBINE_RULE_CC = (10, 7)
+# The LEAN GROUP WALK (``split_combine.DECODE_GRID_LEAN_WALK``: the combine module's FORMER lean kernel -- one warp per
+# (q_row, head, batch), four splits loaded up front, then sixteen per memory round trip, the row accumulated in split order --
+# restored as the module's fifth form) serves the lean-grid OVERFLOW launches of the cc 10.7 line: a lean grid of at least
+# this many blocks, one past DECODE_COMBINE_MAX_LEAN_BLOCKS, so the two rules partition the grid axis and the decode-grid
+# kernel is never eligible where the walk is -- at a split of at most DECODE_COMBINE_LEAN_WALK_MAX_SPLIT (below).  Measured on
+# the Rubin performance class (212 SMs, 24 Q heads, d 256, the combine inside the serving step; device us per launch, the
+# module's form -> the walk): at B 32 (768 lean blocks) and B 128 (3072) the wide lean group costs 5.9 / 12.4 us at split 2
+# where the walk costs 3.3-3.4 / 5.9, and at S_q 4 (split 2-3) the serial walk 5.3-5.5 / 11.7 where the walk costs 4.0 / 8.9
+# -- the serving step +0.7 .. +6.2 % (geomean +3.4 %) on the six B 32 / B 128 cells with the module's forms (B 32 x 4K 53.3 ->
+# 55.7 us, B 128 x 4K 121.5 -> 127.7, B 32 x 32 heads 62.0 -> 65.9; S_q 4: 196.8 -> 199.5, 169.2 -> 173.7, 208.9 -> 210.4).
+# The counter-evidence that bounds the rule from below, same class, the SMALL grids inside the bound (24-96 rows): the
+# module's forms are the faster ones -- the wide lean group 4.1 us against the walk's 5.6 at B 1 x 4K x 16 splits (4.7 against
+# 6.0 at B 4 x 128K x 16), the decode form past 16 splits 5.8 / 8.1 / 6.1 against 8.4 / 14.0 / 8.5 at B 1 x 32K / 128K -- so
+# inside the bound nothing changes, and the eight decode-grid cells (the B 1 class, B 4 x 128K) keep their kernels.  A refit
+# moves this one line.  The split model prices the lean forms at _DECODE_TILE_COMBINE_PER_PARTIAL, measured on this walk, so
+# no pick moves with the restore.
+DECODE_COMBINE_LEAN_WALK_MIN_LEAN_BLOCKS = DECODE_COMBINE_MAX_LEAN_BLOCKS + 1
+# The walk's SPLIT bound: the measured regime above (split 2-3) is the one where the walk's up-front group holds the whole
+# split axis (split_combine.LEAN_WALK_G_S = 4 splits' LSE and partial-O rows; the kernel module cannot be imported here -- it
+# imports this one -- so the test suite pins the two equal): ONE memory round trip of at most 4 slot pairs where the module's
+# own forms issue 8 (their narrow lean group, split_combine.G_LEAN_SMALL, up to 8 splits -- the wide lean group at S_q <= 2 and
+# the one-warp-per-row form at S_q >= 3 alike).  From split 5 the walk pays two more DEPENDENT round trips per 16 splits (the
+# tail groups' max pass, then their weighted pass) where the module's forms still issue every load in one trip up to 8 splits
+# (16 at S_q <= 2), and past 16 splits the decode form beat the walk 1.4-1.7x on the small grids (above); the one-warp-per-row
+# form's deep split walk (S_q >= 3, past 8 splits) is unmeasured against the walk on an overflow grid.  So past this bound an
+# overflow launch keeps the module's own forms (the forms it ran before the restore), and widening the bound takes a measurement
+# at a mid-overflow grid (B 8-16 x 24 heads at kv 32K-128K, where the split model picks 8-16) -- a refit of this one line.
+DECODE_COMBINE_LEAN_WALK_MAX_SPLIT = 4
 
 
 def decode_combine_lean_blocks(b: int, h_q: int, s_q: int) -> int:
@@ -676,6 +712,20 @@ def decode_combine_grid_selected(b: int, h_q: int, s_q: int, split: int, device_
     if decode_combine_lean_blocks(b, h_q, s_q) > DECODE_COMBINE_MAX_LEAN_BLOCKS or int(split) < DECODE_COMBINE_MIN_SPLIT:
         return False
     return decode_combine_rows(b, h_q, s_q) <= DECODE_COMBINE_SMALL_GRID_ROWS or int(split) >= DECODE_COMBINE_DEEP_SPLIT
+
+
+def decode_combine_lean_walk_selected(b: int, h_q: int, s_q: int, split: int, device_cc: Optional[Tuple[int, int]] = None) -> bool:
+    """Whether a split launch of a ``(B, H_q, S_q)`` graph takes the combine module's LEAN GROUP WALK
+    (``split_combine.DECODE_GRID_LEAN_WALK``) at ``split`` partials: the lean-grid-overflow rule above -- the lean grid
+    (:func:`decode_combine_lean_blocks`) at least ``DECODE_COMBINE_LEAN_WALK_MIN_LEAN_BLOCKS`` blocks, i.e. past the
+    decode-grid kernel's bound, at a split of at most ``DECODE_COMBINE_LEAN_WALK_MAX_SPLIT`` (the measured regime: the whole
+    split axis in the walk's up-front group; a deeper split keeps the module's own forms until a measurement widens the
+    bound) -- on the cc 10.7 line only: ``device_cc`` has :func:`decode_combine_grid_selected`'s semantics (None reads the
+    cc 10.7 rule, the line it was measured on, ``_DECODE_COMBINE_RULE_CC``; every other device answers False and keeps the
+    module's own forms).  Where it answers True, :func:`decode_combine_grid_selected` answers False by construction."""
+    if device_cc is not None and tuple(device_cc)[:2] != _DECODE_COMBINE_RULE_CC:
+        return False
+    return decode_combine_lean_blocks(b, h_q, s_q) >= DECODE_COMBINE_LEAN_WALK_MIN_LEAN_BLOCKS and int(split) <= DECODE_COMBINE_LEAN_WALK_MAX_SPLIT
 
 
 def decode_combine_force_lean(b: int, h_q: int, s_q: int, split: int, device_cc: Optional[Tuple[int, int]] = None) -> bool:
