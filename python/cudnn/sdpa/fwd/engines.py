@@ -874,6 +874,22 @@ def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split
     return domain
 
 
+_amax_s_warned = False
+
+
+def _warn_amax_s_declared_once() -> None:
+    """Reached only past the device-arch check, so it fires where a FROST FP8 row would otherwise consider the graph."""
+    global _amax_s_warned
+    if _amax_s_warned:
+        return
+    _amax_s_warned = True
+    logging.getLogger(__name__).warning(
+        "sdpa_fp8: the graph declares the deprecated Amax_S output, which the FROST engines do not produce, so it runs on "
+        "cuDNN backend engines only (up to ~2x slower on some shapes). Leave Amax_S virtual and set scale_s from the bounds in "
+        "docs/operations/Attention.md, 'Amax S' (448 for E4M3 without dropout)."
+    )
+
+
 def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs] = None) -> Optional[str]:
     """First reason this engine is not a candidate for these facts and tuning
     knobs, or ``None`` when lowering should perform the final feasibility check.
@@ -1423,6 +1439,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         # The FROST FP8 kernels no longer compute Amax_S (dropped: nothing
         # consumed it and the atomicMax serialized the epilogue); a graph that
         # DECLARES the output must go to an engine that writes it.
+        _warn_amax_s_declared_once()
         return "graph requests the Amax_S output, which the FROST engines do not produce"
 
     if facts.bottom_right:
