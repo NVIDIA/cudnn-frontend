@@ -49,7 +49,7 @@ def gdn_support_gates(engine: str, facts) -> None:
     import cudnn
 
     checkpoint = facts.checkpoint_every_n_tokens
-    checkpoint_dtypes = (cudnn.data_type.FLOAT,) if checkpoint > 64 else (cudnn.data_type.FLOAT, facts.io_dtype)
+    checkpoint_dtypes = (cudnn.data_type.FLOAT, facts.io_dtype)
     if checkpoint and checkpoint % 64 != 0:
         raise NotImplementedError(f"{engine}: checkpoint_every_n_tokens must be a positive multiple of 64 (got {checkpoint})")
     if not facts.gates_at_ho:
@@ -91,13 +91,13 @@ def gdn_support_gates(engine: str, facts) -> None:
             raise NotImplementedError(f"{engine}: 'dO' must be fp16/bf16, got {facts.do_dtype}")
         if facts.io_dtype is not None and facts.state_checkpoints_dtype not in checkpoint_dtypes + (None,):
             raise NotImplementedError(
-                f"{engine}: 'state_checkpoints' must be {' or '.join(str(w) for w in checkpoint_dtypes)} at checkpoint_every_n_tokens {checkpoint}"
+                f"{engine}: 'state_checkpoints' must be {' or '.join(str(w) for w in checkpoint_dtypes)}, got {facts.state_checkpoints_dtype}"
             )
         if facts.dbeta_dtype not in (facts.beta_dtype, None):
             raise NotImplementedError(f"{engine}: 'dBeta' must match 'beta' ({facts.beta_dtype}), got {facts.dbeta_dtype}")
     elif facts.io_dtype is not None and facts.state_checkpoints_out_dtype not in checkpoint_dtypes + (None,):
         raise NotImplementedError(
-            f"{engine}: 'state_checkpoints' must be {' or '.join(str(w) for w in checkpoint_dtypes)} at checkpoint_every_n_tokens {checkpoint}"
+            f"{engine}: 'state_checkpoints' must be {' or '.join(str(w) for w in checkpoint_dtypes)}, got {facts.state_checkpoints_out_dtype}"
         )
 
 

@@ -293,7 +293,7 @@ def build_fprop_graph(
         name="gdn2",
     )
     if state_checkpoints_t is not None:
-        state_checkpoints_t.set_data_type(cudnn.data_type.FLOAT if (checkpoint_dtype == torch.float32 or checkpoint > CHECKPOINT_CHUNK) else io_dtype)
+        state_checkpoints_t.set_data_type(cudnn.data_type.FLOAT if checkpoint_dtype == torch.float32 else io_dtype)
     return graph, dict(
         q=q_t,
         k=k_t,
@@ -418,10 +418,10 @@ def run_gdn2_fwd(
             raise ValueError(f"gated_delta_net_v2: {tensor_name} must be on q's device ({device}); got {tensor.device}")
     state0 = initial_state if initial_state is not None else None
     checkpoint = int(checkpoint_every_n_tokens)
-    if checkpoint_dtype not in (None, torch.float32, q.dtype) or (checkpoint_dtype == q.dtype and checkpoint > CHECKPOINT_CHUNK):
-        raise ValueError(
-            f"gated_delta_net_v2: checkpoint_dtype must be None, torch.float32 or the io dtype at the chunk cadence ({CHECKPOINT_CHUNK}), got {checkpoint_dtype} at {checkpoint}"
-        )
+    if checkpoint_dtype not in (None, torch.float32, q.dtype):
+        raise ValueError(f"gated_delta_net_v2: checkpoint_dtype must be None, torch.float32 or the io dtype ({q.dtype}), got {checkpoint_dtype}")
+    if checkpoint_dtype is None:
+        checkpoint_dtype = q.dtype
 
     cache_key = make_fprop_cache_key(
         total,
@@ -524,9 +524,7 @@ def run_gdn2_fwd(
     state_checkpoints = torch.empty(0, dtype=q.dtype, device=device)
     if checkpoint > 0:
         total_checkpoints = max(total // checkpoint + N, 1)
-        state_checkpoints = torch.empty(
-            total_checkpoints, HO, V, K, dtype=torch.float32 if (checkpoint_dtype == torch.float32 or checkpoint > CHECKPOINT_CHUNK) else q.dtype, device=device
-        )
+        state_checkpoints = torch.empty(total_checkpoints, HO, V, K, dtype=checkpoint_dtype, device=device)
         variant_pack[t["state_checkpoints"]] = state_checkpoints
     workspace, handle = make_execution_resources(graph, device)
     execute_graph(graph, variant_pack, workspace, handle)
@@ -701,7 +699,7 @@ def gdn2_fwd_fake(
             HO,
             V,
             K,
-            dtype=torch.float32 if (checkpoint_dtype == torch.float32 or int(checkpoint_every_n_tokens) > CHECKPOINT_CHUNK) else q.dtype,
+            dtype=torch.float32 if checkpoint_dtype == torch.float32 else q.dtype,
         )
     else:
         state_checkpoints = q.new_empty(0)
@@ -908,9 +906,9 @@ def gdn2_bwd(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Internal GDN-2 backward over a cached single-node GDN2_BWD pygraph in THD layout.
 
-    ``state_checkpoints`` is the forward's per-chunk state series (io dtype at the chunk cadence and fp32 past it, or fp32 at any cadence with ``checkpoint_dtype=torch.float32``,
-    chunk cadence); when given, the engine consumes it instead of running
-    the checkpoint recompute pass. Returns ``(dq, dk, dv, dg, dbeta, dw,
+    ``state_checkpoints`` is the forward's state series (io dtype or fp32 at the forward's cadence); when given, the
+    engine reuses io-dtype rows at the chunk cadence and regenerates the dense series from any other rows instead of
+    running the checkpoint recompute pass. Returns ``(dq, dk, dv, dg, dbeta, dw,
     d_initial_state, d_a_log, d_dt_bias)``.
     """
     total, H, K = q.shape
@@ -1378,13 +1376,12 @@ def gated_delta_net_v2(
             float16; ``d_dt_bias`` comes back in the same dtype), or ``None``
             for zero bias.
         checkpoint_every_n_tokens: if ``> 0``, also return the per-chunk
-            recurrent state series ``state_checkpoints`` (``[total_checkpoints, HO, V, K]`` io dtype at the chunk cadence and fp32 past it, or fp32 at any cadence with ``checkpoint_dtype=torch.float32``,
+            recurrent state series ``state_checkpoints`` (``[total_checkpoints, HO, V, K]``, dtype per ``checkpoint_dtype``,
             one entry per N tokens strictly before each sequence end; the
             FROST engine requires a positive multiple of the kernel chunk size, 16). The series is
             a non-differentiable dump.
-        checkpoint_dtype: ``None`` keeps the default (io-dtype rows at the chunk cadence, fp32 past it); ``torch.float32`` stores fp32 rows at
-            any cadence (the backward then
-            regenerates the dense series from them, as it does past the chunk cadence).
+        checkpoint_dtype: ``None`` stores io-dtype rows; ``torch.float32`` stores fp32 rows (the backward reuses io rows at the
+            chunk cadence and regenerates the dense series from any other rows).
 
         plan_name: optionally pin one execution plan by name (the plan
             API's ``get_plan_name_at_index`` names, e.g. ``gdn2_frost``); a
