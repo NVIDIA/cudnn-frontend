@@ -26,7 +26,7 @@ from cudnn.api_base import TupleDict, ceil_div
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.jax import zeros_init
 from cudnn.tensor_adapter import get_compute_capability
-from ..canonical import kernel_facing_b, kernel_facing_fp4, kernel_facing_mx, kernel_facing_prob
+from ..canonical import kernel_facing_fp4
 from ..canonical_jax import check_block_scaled_operands, check_jax_inputs, check_packed_sf_size, grouped_call, output_type, sf_array
 from ..moe_utils import MoEWeightMode
 from .hadamard_utils import HADAMARD_SIZE
@@ -47,8 +47,8 @@ def hadamard_array():
 @cute.jit
 def grouped_glu_hadamard_adapter(stream, a, b, sfa, sfb, padded_offsets, alpha, prob, hadamard, c, d, amax, post_rht_amax, *, kernel, mac, linear_offset):
     kernel(
-        a=kernel_facing_mx(kernel_facing_fp4(a)),
-        b=kernel_facing_b(kernel_facing_fp4(b)),
+        a=kernel_facing_fp4(a),
+        b=kernel_facing_fp4(b),
         sfa=sfa,
         sfb=sfb,
         n=cutlass.Int32(0),
@@ -56,13 +56,13 @@ def grouped_glu_hadamard_adapter(stream, a, b, sfa, sfb, padded_offsets, alpha, 
         b_stride_size=cutlass.Int64(0),
         b_major_mode=OperandMajorMode.K,
         workspace_ptr=cute.make_ptr(cutlass.Uint8, 0, cute.AddressSpace.gmem, assumed_align=128),
-        c=kernel_facing_mx(c),
-        d=kernel_facing_mx(d),
+        c=c,
+        d=d,
         amax_tensor=amax,
         post_rht_amax_tensor=post_rht_amax,
         padded_offsets=padded_offsets,
         alpha=alpha,
-        prob=kernel_facing_prob(prob),
+        prob=prob,
         hadamard_tensor=hadamard,
         bias=None,
         max_active_clusters=mac,

@@ -33,7 +33,7 @@ from cudnn.api_base import TupleDict, ceil_div, get_device_type
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.tensor_adapter import framework_dtype, get_compute_capability
 from cudnn.jax import call, gemm_operand_spec, neg_inf_init, zeros_init
-from ..canonical import kernel_facing_b, kernel_facing_fp4, kernel_facing_mx, kernel_facing_prob
+from ..canonical import kernel_facing_fp4
 from ..canonical_jax import (
     check_bf16_dense_inputs,
     check_grouped_shapes,
@@ -575,22 +575,21 @@ def blockscaled_dglu_jax(
 
 @cute.jit
 def grouped_dglu_bf16_dense_adapter(stream, a, b, c, padded_offsets, alpha, beta, prob, d, dprob, *, kernel, mac, linear_offset):
-    # The BF16 kernel takes the kernel-facing views of the canonical buffers.
     kernel(
-        a=kernel_facing_mx(a),
-        b=kernel_facing_b(b),
+        a=a,
+        b=b,
         n=cutlass.Int32(0),
         k=cutlass.Int32(0),
         b_stride_size=cutlass.Int64(0),
         b_major_mode=OperandMajorMode.K,
         workspace_ptr=cute.make_ptr(cutlass.Uint8, 0, cute.AddressSpace.gmem, assumed_align=128),
-        c=kernel_facing_mx(c),
-        d=kernel_facing_mx(d),
+        c=c,
+        d=d,
         padded_offsets=padded_offsets,
         alpha=alpha,
         beta=beta,
-        prob=kernel_facing_prob(prob),
-        dprob=kernel_facing_prob(dprob),
+        prob=prob,
+        dprob=dprob,
         linear_offset=cutlass.Float32(linear_offset),
         dbias_tensor=None,
         max_active_clusters=mac,

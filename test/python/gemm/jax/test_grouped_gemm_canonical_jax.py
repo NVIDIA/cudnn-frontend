@@ -162,7 +162,8 @@ def test_canonical_jax_glu_parity(act_func, experts, shared_wrapper):
 
 
 def kernel_facing_torch(arrays):
-    """Kernel-facing views of the canonical buffers, for torch wrappers without canonical-layout support."""
+    """Kernel-facing views of the canonical buffers, for the torch SReLU, dSReLU and GLU + Hadamard + quant wrappers,
+    which take only those layouts."""
     tensors = torch_inputs(arrays)
     for name in {"a_tensor", "c_tensor"} & tensors.keys():
         tensor = tensors[name]
@@ -188,14 +189,8 @@ def canonical_reference(result):
 def dglu_reference(arrays, **options):
     import cudnn
 
-    m = arrays["a_tensor"].shape[0]
-    dprob = torch.zeros((m, 1, 1), device="cuda")
-    result = cudnn.grouped_gemm_dglu_wrapper_sm100(**kernel_facing_torch(arrays), dprob_tensor=dprob, d_dtype=torch.float8_e4m3fn, sf_vec_size=32, **options)
-    for name in ("d_row_tensor", "d_col_tensor", "dprob_tensor"):
-        result[name] = result[name].reshape(result[name].shape[:-1] if name != "dprob_tensor" else (m,))
-    for name in ("sfd_row_tensor", "sfd_col_tensor"):
-        result[name] = result[name].permute(5, 2, 4, 0, 1, 3)
-    return result
+    dprob = torch.zeros((arrays["a_tensor"].shape[0],), device="cuda")
+    return cudnn.grouped_gemm_dglu_wrapper_sm100(**torch_inputs(arrays), dprob_tensor=dprob, d_dtype=torch.float8_e4m3fn, sf_vec_size=32, **options)
 
 
 @pytest.mark.parametrize("act_func", ["dswiglu", "dgeglu"])
@@ -410,7 +405,7 @@ def test_canonical_jax_glu_bf16(act_func, shared_wrapper):
 
     arrays = bf16_problem(4)
     eager = partial(cudnn.grouped_gemm_glu_wrapper_sm100, sfa_tensor=None, act_func=act_func, generate_c=True)
-    reference = canonical_reference(eager(**kernel_facing_torch(arrays)))
+    reference = eager(**torch_inputs(arrays))
     bridge = eager if shared_wrapper else partial(cudnn.grouped_gemm_glu_jax_sm100, act_func=act_func, generate_c=True)
     inputs = {name: jnp.asarray(array) for name, array in arrays.items()}
     poison_allocator()
@@ -428,8 +423,7 @@ def test_canonical_jax_dglu_bf16(act_func, shared_wrapper):
     arrays = bf16_problem(4, backward=True)
     m = arrays["a_tensor"].shape[0]
     eager = partial(cudnn.grouped_gemm_dglu_wrapper_sm100, sfa_tensor=None, act_func=act_func)
-    reference = canonical_reference(eager(**kernel_facing_torch(arrays), dprob_tensor=torch.zeros((m, 1, 1), device="cuda")))
-    reference["dprob_tensor"] = reference["dprob_tensor"].reshape(m)
+    reference = eager(**torch_inputs(arrays), dprob_tensor=torch.zeros((m,), device="cuda"))
     bridge = partial(eager, dprob_tensor=None) if shared_wrapper else partial(cudnn.grouped_gemm_dglu_jax_sm100, act_func=act_func)
     inputs = {name: jnp.asarray(array) for name, array in arrays.items()}
     poison_allocator()
@@ -464,14 +458,10 @@ def test_canonical_jax_glu_hadamard_parity(data_format, act_func, shared_wrapper
     import cudnn
 
     arrays, sf_vec_size = block_scaled_problem(data_format, 4)
-    m, (experts, n) = arrays["a_tensor"].shape[0], arrays["b_tensor"].shape[:2]
-    arrays["sfa_tensor"] = arrays["sfa_tensor"].reshape(1, m // 128, -1, 32, 4, 4)
-    arrays["sfb_tensor"] = arrays["sfb_tensor"].reshape(experts, n // 128, -1, 32, 4, 4)
     eager = partial(cudnn.grouped_gemm_glu_hadamard_wrapper_sm100, sf_vec_size=sf_vec_size, act_func=act_func)
-    reference = canonical_reference(eager(**kernel_facing_torch(arrays)))
+    reference = eager(**torch_inputs(arrays))
     bridge = eager if shared_wrapper else partial(cudnn.grouped_gemm_glu_hadamard_jax_forward, sf_vec_size=sf_vec_size, act_func=act_func)
     inputs = {name: jnp.asarray(array) for name, array in arrays.items()}
-    inputs["sfa_tensor"] = inputs["sfa_tensor"].reshape(-1)
     poison_allocator()
     assert_outputs(bridge(**inputs), reference)
     compiled = jax.jit(bridge, compiler_options={"xla_gpu_enable_command_buffer": "FUSION,CUSTOM_CALL"})
