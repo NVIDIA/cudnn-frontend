@@ -610,10 +610,13 @@ def _stage3_trim_window(window: Optional[int], causal: bool, bottom_right: bool,
     return window
 
 
-def _bshd_physical_ok(desc: TensorDesc) -> bool:
-    """True when a logical-BHSD desc sits on compact BSHD storage (the rows' layout claim)."""
+def _bshd_physical_ok(desc: TensorDesc, *, allow_batch_padding: bool = False) -> bool:
+    """Compact BSHD rows, optionally separated by a nonoverlapping, 16-byte aligned batch pitch."""
     b, h, s, d = (int(x) for x in desc.shape)
-    return tuple(int(x) for x in desc.stride) == (s * h * d, d, h * d, 1)
+    bs, hs, ss, ds = (int(x) for x in desc.stride)
+    if (hs, ss, ds) != (d, h * d, 1):
+        return False
+    return bs >= s * h * d and bs % 8 == 0 if allow_batch_padding else bs == s * h * d
 
 
 def _thd_packed_ok(desc: TensorDesc) -> bool:
@@ -635,6 +638,7 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
     _FAMILY = _cfg.FAMILY_F16
     _NAME = "sdpa_bwd_sm107"
     _BATCH_CHUNKING = True
+    _BATCH_PADDED_BSHD = False
     _IO_DTYPES = (torch.bfloat16, torch.float16)
     # The body reads ``seq_kv_lens[batch]`` under its padded-mask arm (``_resolve_seqlen_kv``), so the caller's per-batch kv
     # lengths are served (module doc) -- on all three rows.
@@ -778,7 +782,10 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
                     f"elements); got stride {tuple(desc.stride)}",
                 )
             else:
-                self._value_error_if(not _bshd_physical_ok(desc), f"{n}: {name} must be BSHD-physical (stride order 3,1,2,0); got stride {tuple(desc.stride)}")
+                self._value_error_if(
+                    not _bshd_physical_ok(desc, allow_batch_padding=self._BATCH_PADDED_BSHD),
+                    f"{n}: {name} must be BSHD-physical (stride order 3,1,2,0); got stride {tuple(desc.stride)}",
+                )
         st_shape, st_stride = tuple(int(x) for x in self.stats_desc.shape), tuple(int(x) for x in self.stats_desc.stride)
         if self.thd:
             # Packed Stats: the ctor's packing flags (token-major (T, H) / head-major (1, QH, head_stride)) decide how the kernel

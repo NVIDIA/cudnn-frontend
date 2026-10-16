@@ -186,6 +186,13 @@ stay Int64. Widen operands before multiplication. The physical detector is
 separated above 2**32 and checks capture/replay. A wide fake extent alone only
 fixes binding; deliberately narrowing the plane stride must fail numerically.
 
+Padding helpers must preserve strides too: reinterpreting data as 32-bit words
+changes stride units, not physical layout. Both the input address and output store
+must use those strides. Pitched BSHD can look correct at batch zero and silently
+read the wrong K/V at batch one. The detector is
+`test_sdpa_bwd_d256_sm100.py::test_batch_pitch_rebind_and_replay`, including
+both source padding and output copy-out with canaries in unused physical rows.
+
 **Rule S6 — A kernel feature lands on every arch line's test file, and its
 other-arch lowerings are smoke-compiled from whatever GPU you have.**
 
