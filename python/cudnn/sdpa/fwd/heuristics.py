@@ -635,7 +635,7 @@ def _sm120_fits_smem(facts, tile_m: int, tile_n: int) -> bool:
     return smem_bytes(d_qp, d_vp, tile_m, tile_n, 1 if quantized else 2, 2, mxfp8=facts.is_mxfp8) <= SMEM_CAPACITY_BYTES
 
 
-def _sm120_tiles(caps: Capabilities, facts) -> Tuple[int, int]:
+def _sm120_tiles(caps: Capabilities, facts, pack_g: int = 1) -> Tuple[int, int]:
     """(tile_m, tile_n) for the SM120 SDPA-forward prefill cell.
 
     ``tile_m=64`` when the grid cannot fill the machine AND each CTA has enough
@@ -644,6 +644,24 @@ def _sm120_tiles(caps: Capabilities, facts) -> Tuple[int, int]:
     ``config_sm120.kv_tile_preference`` that fits SMEM: 128 is fastest, but a
     wide head has no room for it (D>=208 in half, further out in FP8 -- its KV
     tile is a byte per element).
+
+    A packed set (``pack_g`` > 1, the half row's decode and verify launches: a
+    128-row tile holds ``128 // pack_g`` tokens of ``pack_g`` heads) has a split
+    to fill the machine with, so the question is per-row cost instead.  The
+    64-row tile carries fewer dead rows (``S_q * G`` live rows in 64, not 128)
+    and, past 64 live rows, twice the units; the 128-row tile streams each K/V
+    tile once for twice the rows.  It takes 128 rows when they are full
+    (``S_q * G >= 128``) AND its units fill the machine with splits of two or
+    more KV tiles.  MEASURED (b=1 f16, every packed tile x split timed, kernel
+    sums, warm L2, 2026-10-14) over 80 decode/verify shapes -- d64 to d256, G 4
+    to 8, S_q 1 to 32, S_kv 1k to 64k: against the largest admitting tile, the
+    geomean regret falls from 1.28 to 1.04 (worst 1.72 to 1.22) on RTX PRO 6000
+    (188 SMs) and from 1.30 to 1.02 (worst 1.84 to 1.29) on RTX 5080 (84 SMs).
+    On the RTX PRO 6000, h=24/4 d128 S_q 32 S_kv 1k runs 7.2 us on 64 rows
+    against 9.5 us on 128, and h=32/4 S_q 1 S_kv 4k 8.0 us against 11.3 us;
+    h=64/8 d64 S_q 32 S_kv 64k takes 128 rows at 122 us, against 144 us for 64
+    rows at the split the model gives each.  Batched decode follows the same
+    rule unmeasured: the tile choice there is the wave rule's, not a fit.
 
     Fit is a KERNEL property, so ``config_sm120.smem_bytes`` is the one
     implementation and the adapter's check calls it too. So is the tuning: an
@@ -660,12 +678,18 @@ def _sm120_tiles(caps: Capabilities, facts) -> Tuple[int, int]:
     the per-CTA balance in a way `grid` alone does not capture.
     """
     sm_count = facts.device_sm_count or 0
-    grid = -(-facts.s_q // 128) * facts.h_q * facts.b
-    if facts.causal:
-        grid //= 2
-    kv_tiles = -(-facts.s_kv // 128)
-    fine = sm_count > 0 and (grid * 2 <= sm_count or (grid * 2 <= 3 * sm_count and kv_tiles >= 12))
-    preferred_tile_m = 64 if fine else 128
+    if pack_g > 1:
+        wide_launch = _split_launch(caps, facts, 128, 128, 1, pack_g)
+        units = wide_launch.q_tiles * wide_launch.heads_q * facts.b
+        wide = facts.s_q * pack_g >= 128 and units * max(1, wide_launch.kv_tiles // 2) >= sm_count
+        preferred_tile_m = 128 if wide else 64
+    else:
+        grid = -(-facts.s_q // 128) * facts.h_q * facts.b
+        if facts.causal:
+            grid //= 2
+        kv_tiles = -(-facts.s_kv // 128)
+        fine = sm_count > 0 and (grid * 2 <= sm_count or (grid * 2 <= 3 * sm_count and kv_tiles >= 12))
+        preferred_tile_m = 64 if fine else 128
     kv_order = kv_tile_preference(facts.d_qk, mxfp8=facts.is_mxfp8)
     # Prefer the selected query tile, then larger query tiles and faster KV tiles.
     candidate_tiles = sorted(
@@ -1667,6 +1691,13 @@ def _sm100_f16(caps: Capabilities, facts) -> bool:
     return 100 <= caps.sm_lo and caps.sm_hi < 107 and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
 
 
+def _sm120_half_row(caps: Capabilities) -> bool:
+    """The SM120 f16/bf16 row (not its per-tensor FP8 or MXFP8 siblings): its
+    decode geometry -- split prices, packed tile, rescored runners -- was fitted
+    on its own kernels."""
+    return caps.sm_lo == 120 and not (caps.is_fp8 or caps.is_mxfp8)
+
+
 def _swa_kv_tiles(facts, *, token_span: int, tile_n: int) -> int:
     """Maximum issued KV range of this candidate's Q clusters under SWA.
 
@@ -1877,7 +1908,7 @@ def _split_points(
             unsplit_launch=unsplit_launch,
             **(
                 dict(min_tiles=_SM120_SPLIT_KV_MIN_TILES, combine_floor=_SM120_SPLIT_KV_COMBINE_FLOOR, combine_cost=_SM120_SPLIT_KV_COMBINE_COST)
-                if caps.sm_lo == 120 and not (caps.is_fp8 or caps.is_mxfp8)
+                if _sm120_half_row(caps)
                 else {}
             ),
             serial_combine=facts.s_q >= _SERIAL_COMBINE_MIN_SQ,
@@ -2144,11 +2175,13 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
 
     The baseline takes the best value on every axis; runners-up deviate on ONE
     geometry at a time (tiles, sched, pack_gqa, split), recomputing split for
-    SM100 f16 geometry runners, capped at ``_MAX_SETS_PER_ENGINE``. Two
-    axes carry a structural coupling: a packed set rides the largest tile
-    that admits the ratio, and a split set rides the plain scheduler. Axis
-    interactions the kernels cannot serve are the generators'/mismatch's job
-    — nothing here multiplies domains together.
+    SM100 f16 and SM120 half geometry runners, capped at ``_MAX_SETS_PER_ENGINE``.
+    Two axes carry a structural coupling: a packed set rides a tile that admits
+    the ratio -- the largest, except on the SM120 half row, where the tile rule
+    judges the packed launch (:func:`_sm120_tiles` with ``pack_g``) -- and a
+    split set rides the plain scheduler. Axis interactions the kernels cannot
+    serve are the generators'/mismatch's job — nothing here multiplies domains
+    together.
     """
     caps = spec.capabilities
     tiles = _tile_points(spec, facts)
@@ -2165,8 +2198,9 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     scheds = [unsplit_sched] + [policy for policy in generic_scheds if policy != unsplit_sched]
 
     def _pack_choice(cga: Optional[int], split_value: Optional[int] = None):
-        # A packed set rides the largest fitting tile that admits the ratio, on
-        # the rule's KV tile where it can. The
+        # Whether to pack is judged on the largest fitting tile that admits the
+        # ratio, on the rule's KV tile where it can; a packed set rides that
+        # tile everywhere but the SM120 half row. The
         # decision uses this leg's actual CGA span; D192 CGA1 and CGA2 cover a
         # different number of Q rows.  The leg's split is part of the question on
         # a GATED d256 graph: it packs on the decode tile's split only (the gate
@@ -2180,6 +2214,15 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
             None,
         )
         packed_first = pack_tile is not None and _pack_gqa_points(caps, facts, pack_tile[0] or 128, cga, split_value)[0]
+        if pack_tile is not None and _sm120_half_row(caps):
+            # The tile rule judges the PACKED launch here (_sm120_tiles with pack_g), choosing among the
+            # tiles where packing still leads when it does: at 64 <= S_q < 128 only the 128-row tile does.
+            points = {mn: _pack_gqa_points(caps, facts, mn[0] or 128, cga, split_value) for mn in tiles}
+            best = _sm120_tiles(caps, facts, _pack_gqa_group(caps, facts, pack_tile[0], True))
+            pack_tile = min(
+                (mn for mn in tiles if (points[mn][0] if packed_first else True in points[mn])),
+                key=lambda mn: (mn != best, mn[1] != best[1], -(mn[0] or 0)),
+            )
         return (pack_tile if packed_first else tiles[0]), packed_first, pack_tile
 
     def _leg(split_value: int) -> SdpaFwdKnobs:
@@ -2222,7 +2265,7 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
         # A runner's changed packing/tile/CGA is a different launch, not just
         # a label on the baseline's split. Keep other architecture policies
         # unchanged until they have their own geometry validation.
-        if not _sm100_f16(caps, facts):
+        if not (_sm100_f16(caps, facts) or _sm120_half_row(caps)):
             return knobs
 
         def leg(split):
@@ -2244,10 +2287,13 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
 
     base = _leg(splits[0])
     out = [base]
-    for tile_m, tile_n in tiles[1:]:
-        # A packed baseline's tile runners keep the packing, so tiles the
-        # ratio cannot ride are skipped — emitted, they would only spend
+    for tile_m, tile_n in tiles:
+        # Every tile but the baseline's own (a packed baseline need not ride
+        # tiles[0]). A packed baseline's tile runners keep the packing, so tiles
+        # the ratio cannot ride are skipped — emitted, they would only spend
         # set-cap slots for mismatch to drop.
+        if (tile_m, tile_n) == (base.tile_m, base.tile_n):
+            continue
         if base.pack_gqa is True and True not in _pack_gqa_points(caps, facts, tile_m or 128, base.cga, base.split_kv):
             continue
         out.append(_resplit(replace(base, tile_m=tile_m, tile_n=tile_n)))
@@ -2258,8 +2304,8 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     sched_host = unsplit_leg
     for policy in scheds[1:]:
         out.append(replace(sched_host, sched_policy=policy))
-    # The opposite pack_gqa leg, riding its own tile (packed: the largest
-    # admitting tile; unpacked: the tile rule's best) and its own CGA width:
+    # The opposite pack_gqa leg, riding its own tile (packed: _pack_choice's
+    # tile; unpacked: the tile rule's best) and its own CGA width:
     # on the d128 f16 SM100 flavor a packed leg that overflows one 128-row
     # tile (S_q * G > 128 >= S_q) keeps the prefill tile while its unpacked
     # runner-up fits the decode tile.  The other flavors' width rules do not

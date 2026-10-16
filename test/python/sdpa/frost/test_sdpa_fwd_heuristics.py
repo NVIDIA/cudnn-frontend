@@ -450,6 +450,74 @@ def test_sm120_half_decode_splits_a_sink_and_packs_a_whole_group():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("sm_count", [84, 188])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        # (h_q, h_kv, d, S_q, S_kv, sink)
+        (24, 4, 128, 32, 1024, False),  # G = 6: a tail-packed group
+        (32, 8, 128, 8, 16384, False),
+        (16, 2, 256, 16, 1024, False),  # the d256 flavor's 64-column KV tiles
+        (64, 8, 64, 32, 65536, True),  # d64 with a sink
+        (32, 8, 128, 96, 4096, False),  # 64 <= S_q < 128: packing leads only on 128 rows
+    ],
+)
+def test_sm120_packed_set_rides_the_packed_launch_tile_rule(monkeypatch, sm_count, shape):
+    """The SM120 half row's packed lead rides the tile the tile rule picks for
+    the PACKED launch (``_sm120_tiles`` with ``pack_g``), asked with the group
+    the kernel packs, among the tiles where packing still leads (S_q below one
+    Q tile).  Every packed width the ratio admits stays a candidate, each at the
+    split the model gives it when it leads, and the per-tensor FP8 / MXFP8 rows
+    never consult the packed rule.  The rule's measured boundary is the
+    docstring's; here a stub stands in for it."""
+    from cudnn.sdpa.fwd import heuristics as fwd_heuristics
+
+    h_q, h_kv, d, s_q, s_kv, sink = shape
+    facts = _facts(
+        s_q=s_q, s_kv=s_kv, h_q=h_q, h_kv=h_kv, d_qk=d, d_v=d, has_sink=sink, causal=True, bottom_right=True, device_cc=(12, 0), device_sm_count=sm_count
+    )
+    name = "sdpa_fwd_prefill_sm120"
+    spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == name)
+    real = fwd_heuristics._sm120_tiles
+    asked = []
+
+    def plans_with(tile_m):
+        def stub(caps, f, pack_g=1):
+            m, n = real(caps, f, pack_g)
+            if pack_g == 1:
+                return m, n
+            asked.append((caps.is_fp8 or caps.is_mxfp8, pack_g))
+            return tile_m, n
+
+        monkeypatch.setattr(fwd_heuristics, "_sm120_tiles", stub)
+        return [p.knobs for p in recommend("A", facts, {name: 20504})]
+
+    leads = {}
+    for tile_m in (64, 128):
+        plans = plans_with(tile_m)
+        assert all(engines.mismatch(spec.capabilities, facts, k) is None for k in plans)
+        lead = plans[0]
+        assert lead.pack_gqa is True and s_q < lead.tile_m, "a packed lead rides a tile where packing leads"
+        assert lead.tile_m == (tile_m if s_q < tile_m else 128)
+        assert {k.tile_m for k in plans if k.pack_gqa is True} == {64, 128}, "both packed widths stay candidates"
+        leads[lead.tile_m, lead.tile_n] = (lead.split_kv, plans)
+    assert asked and {g for _, g in asked} == {h_q // h_kv}, "the rule sees the whole group"
+    for (tile_m, tile_n), (split, plans) in leads.items():
+        for other, (other_split, _) in leads.items():
+            if other != (tile_m, tile_n):
+                runner = next(k for k in plans if k.pack_gqa is True and (k.tile_m, k.tile_n) == other and k.split_kv > 1)
+                assert runner.split_kv == other_split, "a packed runner is rescored at its own tile"
+
+    asked.clear()
+    quantized = dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.HALF, has_sink=False)
+    for row, eid, flag in (("sdpa_fwd_prefill_sm120_fp8", 20505, "is_fp8"), ("sdpa_fwd_prefill_sm120_mxfp8", 20506, "is_mxfp8")):
+        q_facts = dataclasses.replace(facts, **quantized, **{flag: True})
+        q_caps = next(spec for spec in engines.ENGINE_SPECS if spec.name == row).capabilities
+        assert all(engines.mismatch(q_caps, q_facts, p.knobs) is None for p in recommend("A", q_facts, {row: eid}))
+    assert not asked, "the quantized rows keep the largest admitting tile"
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("tile_m", [64, 128])
 @pytest.mark.parametrize("s_q", [1, 21, 51, 64])
 def test_sm120_tail_packed_launch_counts_token_tiles(tile_m, s_q):
