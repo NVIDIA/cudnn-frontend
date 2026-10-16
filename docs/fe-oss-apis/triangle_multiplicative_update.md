@@ -1,4 +1,4 @@
-# Triangle Multiplicative Update (SM107)
+# Triangle Multiplicative Update (SM100 / SM103 / SM107)
 
 **This is an experimental API and subject to change.**
 
