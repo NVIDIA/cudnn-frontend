@@ -280,6 +280,37 @@ def test_padded_tail_form_pick_and_request_on_sm100(_sm100_device_for_the_adapte
         _api(d=64, s_q=128, s_kv=128, seq_kv_lens_present=True, padded_tail_form=1).check_support()  # the d64 decode tile's plan
 
 
+def _paged_d64_api(**kw):
+    """A paged (64, 64) plan on the standalone adapter: K / V as page pools (pages, H_kv, page, D), the padding mask on (paged KV requires it)."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    page, pages = 128, 4
+    q, o = (_t7._desc((2, 4, 256, 64), torch.bfloat16, n) for n in ("q", "o"))
+    k, v = (_t7._desc((pages, 4, page, 64), torch.bfloat16, n) for n in ("k", "v"))
+    return SdpaFwdDslSm100(q, k, v, o, None, seq_kv_lens_present=True, paged_page_size=page, paged_max_seq_len_kv=pages * page, **kw)
+
+
+def test_padded_tail_form_request_declines_typed_on_the_d64_flavors_other_legs_on_sm100(_sm100_device_for_the_adapter):
+    """``check_support`` asks the SM100 branch of ``_padded_tail_form_eligible`` for an explicit ``padded_tail_form=`` on every leg of the
+    (64, 64) flavor and BEFORE it resolves the GQA group: a PackGQA, paged or split-KV padded d64 plan is declined TYPED there (the
+    small-tile factory refuses those legs, so an admitted request failed at compile() instead) -- RED on the tree whose predicate reached
+    ``_d64_decode_tile``'s ``h_q // h_kv`` with both still None (a raw TypeError) and admitted the paged request; the knob-less paged plan
+    keeps its plain d64 record (``padded_tail_form`` 0, the d64 factory accepts it), so no served rendering moves."""
+    from cudnn.sdpa.fwd import config_sm100 as c0
+
+    with pytest.raises(NotImplementedError, match="padded_tail_form=1"):
+        _api(d=64, s_q=256, s_kv=256, h=8, h_kv=2, pack_gqa=True, seq_kv_lens_present=True, padded_tail_form=1).check_support()
+    with pytest.raises(NotImplementedError, match="padded_tail_form=1"):
+        _paged_d64_api(padded_tail_form=1).check_support()
+    with pytest.raises((NotImplementedError, ValueError)):
+        _api(d=64, s_q=256, s_kv=256, seq_kv_lens_present=True, split_kv=2, padded_tail_form=1).check_support()
+    api = _paged_d64_api()
+    assert api.check_support() is True
+    params = api.template_params()
+    assert params.padded_tail_form == 0 and params.paged_kv is True and params.d_flavor == 64, params
+    c0.make_cfg_d64(params)  # the plain d64 record: accepted by the factory (the small-tile one would refuse a paged record)
+
+
 def test_dead_subtile_quiet_pick_and_request_on_the_inf_body_on_sm100(_sm100_device_for_the_adapter, monkeypatch):
     """The dead-sub-tile quiet body is served on the SM100 small tiles' -inf body (a bias or a kv_mask) by request or by the sweep seam when the
     plan's S_q leaves a dead sub-tile; the knob-less default is 0 until measured; the plain body (its quiet form is not wired here) and a plan

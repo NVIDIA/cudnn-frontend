@@ -1931,12 +1931,17 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         if self._device_cc in _SM100_BIAS_CCS:
             # The SM100 small tiles' padded body WITHOUT a kv_mask -- the plain body, or the bias body (whose -inf loop renders at MASK_NONE under
             # the pre-masked tail); a d64 plan the DECODE tile would take (S_q <= 128 at cga1) is not eligible: the decode tile has no tail form
-            # and the small-tile factory refuses a decode record.
+            # and the small-tile factory refuses a decode record.  The (64, 64) flavor's other legs -- paged KV, PackGQA, split-KV -- ride the
+            # plain d64 record, which the small-tile factory refuses too, so they are not eligible either; they are excluded BEFORE
+            # ``_d64_decode_tile``, which reads the GQA group (``h_q // h_kv``) that ``check_support`` resolves after it asks this predicate.
             return (
                 not self._fp8
                 and self.flavor in _SM100_BIAS_D_SHAPES
                 and bool(self.seq_kv_lens_present)
                 and not self.thd
+                and not self.paged
+                and not self.pack_gqa
+                and self.split_kv == 1
                 and self.kv_mask_desc is None
                 and not self.is_causal
                 and self.window_size_left is None
@@ -2681,8 +2686,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         self._not_implemented_error_if(
             self.padded_tail_form is not None and not self._padded_tail_form_eligible(),
             f"padded_tail_form={self.padded_tail_form} selects the tail form of the f16/bf16 32- / 64-wide tiles' padded body (per-batch KV "
-            f"lengths or an S_kv off the tile multiple, no kv_mask, no causal / sliding-window band; the PLAIN body on cc 10.7, the plain or the bias "
-            f"body on cc 10.0 / 10.3); head dims ({d_qk}, {d_v}) select {self.flavor} on cc {self._device_cc}, padded={bool(self.seq_kv_lens_present)}, "
+            f"lengths or an S_kv off the tile multiple, no kv_mask, no causal / sliding-window band; dense, unpaged, unsplit, non-PackGQA; the PLAIN "
+            f"body on cc 10.7, the plain or the bias body on cc 10.0 / 10.3); head dims ({d_qk}, {d_v}) select {self.flavor} on cc {self._device_cc}, "
+            f"padded={bool(self.seq_kv_lens_present)}, paged={self.paged}, pack_gqa={self.pack_gqa}, split_kv={self.split_kv}, "
             f"bias={self.bias_desc is not None}, "
             f"kv_mask={self.kv_mask_desc is not None}, causal={self.is_causal}, window=({self.window_size_left}, {self.window_size_right})",
         )
