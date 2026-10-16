@@ -12,9 +12,11 @@ bound keep the module's forms (faster there).
 What this module pins.  HOST: (1) the selector and the walk's group constants are APPENDED (the three existing values keep their
 numbers; the walk's group of 16 is the bitwise window shared with the wide lean group and the decode-grid chain); (2) the rule
 ``heuristics.decode_combine_lean_walk_selected`` is the lean-grid-overflow rule on the cc 10.7 line only (``device_cc`` with
-``decode_combine_grid_selected``'s semantics), partitions the grid axis with the decode-grid rule (one past its bound), and names
-the six measured cells; (3) the adapter's plan-time pin (``prepared._split_combine_decode_grid``) answers ``DECODE_GRID_LEAN_WALK``
-for the six measured cells on cc 10.7, keeps AUTO on the eight decode-grid cells, and never names the walk off cc 10.7; (4)
+``decode_combine_grid_selected``'s semantics), partitions the grid axis with the decode-grid rule (one past its bound), is bounded to
+the walk's up-front group (split <= 4: the measured regime; a deeper split keeps the module's own forms until a measurement widens
+it), and names the six measured cells; (3) the adapter's plan-time pin (``prepared._split_combine_decode_grid``) answers
+``DECODE_GRID_LEAN_WALK`` for the six measured cells on cc 10.7, keeps AUTO on the eight decode-grid cells, and never names the walk
+off cc 10.7; (4)
 ``compile_ptr`` accepts the value, refuses the next one, hands it to the half / gated / ragged / sink entries as their trailing
 form constexpr and drops it for the quantized and packed entries (their form is ``()``).  DEVICE (any SM100-line part; the kernel
 has no arch-specific lowering): the walk's O / LSE BITWISE the module's serial walk at every split count (S_q >= 3) and its wide
@@ -79,6 +81,9 @@ def test_selector_and_group_constants_are_appended():
     assert comb.LEAN_WALK_G_S == 4, "the walk's up-front group (the former lean kernel's G_S)"
     assert comb.LEAN_WALK_G_T == comb.DECODE_SPLITS_PER_CHAIN == comb.G_S == 16, "the group per round trip is the forms' shared bitwise window"
     assert heur.DECODE_COMBINE_LEAN_WALK_MIN_LEAN_BLOCKS == heur.DECODE_COMBINE_MAX_LEAN_BLOCKS + 1 == 129, "one past the decode-grid bound: a partition"
+    assert (
+        heur.DECODE_COMBINE_LEAN_WALK_MAX_SPLIT == comb.LEAN_WALK_G_S == 4
+    ), "the walk's split bound is its up-front group: the measured one-round-trip regime"
     assert comb._combine_lean_walk_kernel is not comb._combine_kernel
 
 
@@ -87,9 +92,11 @@ def test_selector_and_group_constants_are_appended():
 
 @pytest.mark.parametrize("device_cc", [None, (10, 7), *_OTHER_LINES], ids=lambda cc: "default" if cc is None else f"cc{cc[0]}_{cc[1]}")
 def test_lean_walk_rule_is_the_overflow_launches_on_the_cc_10_7_line_only(device_cc):
-    """``decode_combine_lean_walk_selected``: True exactly where the lean grid is past the decode-grid kernel's bound, at every
-    split, on the cc 10.7 line (and the model's default line, ``device_cc=None``); False on every other device, where the module's
-    own forms serve every launch (the Blackwell line measured on B200 / B300, and any line the rule was never run on)."""
+    """``decode_combine_lean_walk_selected``: True exactly where the lean grid is past the decode-grid kernel's bound AND the
+    split is at most the walk's up-front group (4: the measured regime), on the cc 10.7 line (and the model's default line,
+    ``device_cc=None``); False past that split on every line (the module's own forms, as before the restore) and False on every
+    other device, where the module's own forms serve every launch (the Blackwell line measured on B200 / B300, and any line the
+    rule was never run on)."""
     from cudnn.sdpa.fwd import heuristics as heur
 
     rule_line = device_cc is None or tuple(device_cc) == (10, 7)
@@ -98,10 +105,11 @@ def test_lean_walk_rule_is_the_overflow_launches_on_the_cc_10_7_line_only(device
         assert heur.decode_combine_lean_blocks(b, h, s_q) > heur.DECODE_COMBINE_MAX_LEAN_BLOCKS
         assert walk(b, h, s_q, split) is rule_line, (b, h, s_q, split)
         assert not heur.decode_combine_grid_selected(b, h, s_q, split, device_cc=device_cc)
-    # the smallest overflow grid (129 lean blocks) and a prefill grid, at every split
+    # the smallest overflow grid (129 lean blocks) and a prefill grid: the walk up to split 4 on the rule line, never past it
     for grid in ((129, 1, 1), (43, 3, 1), (6, 24, 1), (8, 32, 1), (2, 4, 1024), (1, 8, 512)):
         assert heur.decode_combine_lean_blocks(*grid) >= heur.DECODE_COMBINE_LEAN_WALK_MIN_LEAN_BLOCKS
-        assert all(walk(*grid, s) is rule_line for s in (2, 3, 4, 8, 16, 32, 64, 128)), grid
+        assert all(walk(*grid, s) is rule_line for s in (2, 3, 4)), grid
+        assert not any(walk(*grid, s) for s in (5, 8, 16, 32, 64, 128)), grid
     # inside the bound -- the eight decode-grid cells, the bound itself (B 4 x 32 heads = 128 blocks), the crossover grid -- never
     for b, h, s_q, split in _DECODE_GRID_CELLS:
         assert not walk(b, h, s_q, split), (b, h, s_q, split)
@@ -111,9 +119,9 @@ def test_lean_walk_rule_is_the_overflow_launches_on_the_cc_10_7_line_only(device
 
 
 def test_lean_walk_rule_partitions_the_grid_axis_with_the_decode_grid_rule():
-    """At no (B, H_q, S_q, split) are both rules True; past the bound the decode-grid rule is False and the walk rule True (cc
-    10.7); inside it the walk rule is False.  So the plan-time pin has one answer per launch and the decode-grid kernel is never
-    eligible where the walk is."""
+    """At no (B, H_q, S_q, split) are both rules True; past the bound the decode-grid rule is False and the walk rule True up to
+    the walk's split bound (cc 10.7) and False past it; inside the bound the walk rule is False.  So the plan-time pin has one
+    answer per launch and the decode-grid kernel is never eligible where the walk is."""
     from cudnn.sdpa.fwd import heuristics as heur
 
     for b in (1, 2, 4, 5, 6, 8, 16, 32, 128):
@@ -124,7 +132,7 @@ def test_lean_walk_rule_partitions_the_grid_axis_with_the_decode_grid_rule():
                     grid = heur.decode_combine_grid_selected(b, h, s_q, split)
                     walk = heur.decode_combine_lean_walk_selected(b, h, s_q, split)
                     assert not (grid and walk), (b, h, s_q, split)
-                    assert walk is over, (b, h, s_q, split)
+                    assert walk is (over and split <= heur.DECODE_COMBINE_LEAN_WALK_MAX_SPLIT), (b, h, s_q, split)
                     if over:
                         assert not grid and not heur.decode_combine_force_lean(b, h, s_q, split)
 
@@ -161,6 +169,8 @@ def test_prepared_form_pin_names_the_walk_for_the_measured_cells_on_cc_10_7_only
     assert form(1, 24, 1, 4) == comb.DECODE_GRID_OFF and form(4, 24, 4, 16) == comb.DECODE_GRID_OFF
     # a prefill grid: the walk on cc 10.7, AUTO (= the module's own forms past the bound) elsewhere
     assert form(2, 4, 1024, 4) == (comb.DECODE_GRID_LEAN_WALK if rule_line else comb.DECODE_GRID_AUTO)
+    # past the walk's split bound an overflow grid keeps AUTO (= the module's own forms there, as before the restore) on every line
+    assert form(2, 4, 1024, 5) == comb.DECODE_GRID_AUTO and form(32, 24, 1, 16) == comb.DECODE_GRID_AUTO and form(8, 32, 1, 32) == comb.DECODE_GRID_AUTO
 
 
 # --- (4) compile_ptr: the value, the entries that carry it, the entries that drop it --------------------------------
@@ -503,6 +513,7 @@ def test_sink_entry_keeps_the_three_way_rule_under_the_walk_value(_m):
         pytest.param(32, 4, 4096, 2, "walk", id="b32_sq4_kv4k_split2_walk"),  # the measured S_q 4 geometry (its kv shortened)
         pytest.param(6, 1, 4096, 2, "walk", id="b6_sq1_kv4k_split2_walk"),  # the smallest overflow grid at 24 heads: 144 blocks
         pytest.param(4, 1, 4096, 2, "own", id="b4_sq1_kv4k_split2_own_forms"),  # 96 blocks, split 2: the module's own forms, as before
+        pytest.param(32, 1, 4096, 8, "own", id="b32_sq1_kv4k_split8_own_forms"),  # 768 blocks past the walk's split bound: the module's own forms, as before
         pytest.param(1, 1, 4096, 16, "decode_grid", id="b1_sq1_kv4k_split16_decode_grid"),  # the decode-grid cell, as before
     ],
 )

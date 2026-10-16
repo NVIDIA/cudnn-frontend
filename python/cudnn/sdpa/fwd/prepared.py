@@ -690,9 +690,11 @@ def _split_combine_decode_grid(api, b: int, qh: int, s_q_max: int, split: int) -
     """The split combine entry's kernel FORM for a plan (``split_combine.DECODE_GRID_AUTO`` / ``DECODE_GRID_OFF`` /
     ``DECODE_GRID_LEAN_WALK``): a plan-time specialization on the declared B / H_q / S_q, the split and the plan's DEVICE, never
     a runtime value.  On cc 10.7 a lean-grid-OVERFLOW launch (``heuristics.decode_combine_lean_walk_selected``: the lean grid
-    past the decode-grid kernel's bound, where that kernel is never eligible) names the module's LEAN GROUP WALK, its former lean
-    kernel, measured there against the module's own forms (B 32 / B 128 x 24 heads at split 2-3: 3.3-8.9 us against 5.3-12.4
-    per launch on the Rubin performance class); inside the bound the AUTO entry takes the decode-grid kernel on every sink-free
+    past the decode-grid kernel's bound, where that kernel is never eligible, at a split of at most
+    ``heuristics.DECODE_COMBINE_LEAN_WALK_MAX_SPLIT``) names the module's LEAN GROUP WALK, its former lean kernel, measured there
+    against the module's own forms (B 32 / B 128 x 24 heads at split 2-3: 3.3-8.9 us against 5.3-12.4 per launch on the Rubin
+    performance class); a deeper split past the grid bound keeps the AUTO entry (= the module's own forms there, as before the
+    restore); inside the bound the AUTO entry takes the decode-grid kernel on every sink-free
     launch and the split-aware rule (``heuristics.decode_combine_grid_selected`` -- measured on the same class: that kernel
     loses to the module's forms on a mid-sized grid below 32 splits and on any grid at 4) pins the module's own forms where the
     two disagree.  Off cc 10.7 (the Blackwell line keeps the module's own three-way rule, measured on B200 / B300; a line the

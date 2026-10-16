@@ -87,7 +87,11 @@ It is reached through ``compile_ptr(decode_grid=DECODE_GRID_LEAN_WALK)`` alone:
 the cc 10.7 adapter names it per plan where
 ``heuristics.decode_combine_lean_walk_selected`` says so -- a lean grid PAST
 ``heuristics.DECODE_COMBINE_MAX_LEAN_BLOCKS`` (where the decode-grid kernel is
-never eligible), measured on the Rubin performance class: at B 32 / B 128 x 24
+never eligible) at a split of at most ``LEAN_WALK_G_S``
+(``heuristics.DECODE_COMBINE_LEAN_WALK_MAX_SPLIT``: the whole split axis in the
+up-front group, one memory round trip -- the measured regime; a deeper split
+keeps the module's own forms until a measurement widens the bound), measured on
+the Rubin performance class: at B 32 / B 128 x 24
 heads (768 / 3072 lean blocks) the walk costs 3.3-3.4 / 5.9 us at split 2 where
 the wide lean group costs 5.9 / 12.4, and 4.0 / 8.9 us at S_q 4 (split 2-3) where
 the serial walk costs 5.3-5.5 / 11.7; on the small grids inside the bound the
@@ -212,8 +216,9 @@ DECODE_RED_WORDS = DECODE_RED_ACC_OFF + DECODE_CHAINS * DECODE_LANES_PER_CHAIN *
 DECODE_GRID_AUTO = 0  # the grid rule (the cc 10.7 adapters' entry): the decode-grid kernel inside the lean-grid bound, else the module's own forms
 DECODE_GRID_ON = 1  # always the decode-grid kernel where its geometry holds (tests; an explicit decode flag)
 DECODE_GRID_OFF = 2  # never the decode-grid kernel: the module's own three-way rule (compile_ptr's default; the Blackwell line's entry; tests; a kill switch)
-# Appended 2026-10-16: the LEAN GROUP WALK (the cc 10.7 adapter's entry on a lean-grid-OVERFLOW plan, heuristics.decode_combine_lean_walk_selected): the
-# module's former lean kernel on a sink-free fp32-partial launch whose lean geometry holds, else the three-way rule; never the decode-grid kernel.
+# Appended 2026-10-16: the LEAN GROUP WALK (the cc 10.7 adapter's entry on a lean-grid-OVERFLOW plan at a split of at most LEAN_WALK_G_S,
+# heuristics.decode_combine_lean_walk_selected): the module's former lean kernel on a sink-free fp32-partial launch whose lean geometry holds, else the
+# three-way rule; never the decode-grid kernel.
 DECODE_GRID_LEAN_WALK = 3
 # The lean group walk's two group widths (the former lean kernel's G_S / G_T).  LEAN_WALK_G_S splits' LSE and partial-O rows are loaded up front,
 # before any math; splits past them are walked in GROUPS of LEAN_WALK_G_T: every group's rows are loaded before any of its math, so a warp
@@ -2716,7 +2721,8 @@ def compile_ptr(
     (appended) = the module's LEAN GROUP WALK (``_combine_lean_walk_kernel``) on a
     sink-free fp32-partial launch whose lean geometry holds, else the three-way
     rule, never the decode-grid kernel -- the cc 10.7 adapter names it on a
-    lean-grid-overflow plan (``heuristics.decode_combine_lean_walk_selected``).
+    lean-grid-overflow plan at a split of at most ``LEAN_WALK_G_S``
+    (``heuristics.decode_combine_lean_walk_selected``).
     The quantized and packed entries ignore every value (always their own kernel).
     ``use_pdl=True`` (appended; in the key; the sink-free dense half entries
     ``_host_ptr`` / ``_host_ptr_gated`` only) traces the programmatic-dependent-launch

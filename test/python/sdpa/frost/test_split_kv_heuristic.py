@@ -1386,10 +1386,13 @@ def test_decode_combine_form_rule_holds_on_the_cc_10_7_line_only(device_cc):
     # past the kernel module's bound (B 8 x 32 heads x S_q 1 = 256 lean blocks) nothing is selected or forced on any line
     assert not any(sel(8, 32, 1, s) or force(8, 32, 1, s) for s in (8, 32, 128))
     # ... and there the LEAN GROUP WALK (decode_combine_lean_walk_selected, the module's restored former lean kernel) serves
-    # the launch on the cc 10.7 line -- the measured B 32 / B 128 x 24 heads cells at split 2-3 (768 / 3072 lean blocks) and every
-    # split -- and never inside the bound (the small grids keep the decode-grid kernel or the module's own forms) nor on any other line
+    # the launch on the cc 10.7 line -- the measured B 32 / B 128 x 24 heads cells at split 2-3 (768 / 3072 lean blocks), up to
+    # the walk's up-front group (split 4: the measured regime; a deeper split keeps the module's own forms on every line) -- and
+    # never inside the bound (the small grids keep the decode-grid kernel or the module's own forms) nor on any other line
     walk = lambda *grid_and_split: heur.decode_combine_lean_walk_selected(*grid_and_split, device_cc=device_cc)
-    assert all(walk(8, 32, 1, s) is rule_line for s in (2, 8, 32, 128))
+    assert all(walk(8, 32, 1, s) is rule_line for s in (2, 3, 4))
+    assert not any(walk(8, 32, 1, s) for s in (5, 8, 32, 128))
+    assert heur.DECODE_COMBINE_LEAN_WALK_MAX_SPLIT == 4
     assert all(walk(*cell) is rule_line for cell in ((32, 24, 1, 2), (128, 24, 1, 2), (32, 24, 4, 3), (128, 24, 4, 2), (32, 32, 4, 3)))
     assert not any(walk(*grid, s) for grid in ((1, 24, 1), (4, 24, 4), (4, 32, 1)) for s in (2, 4, 8, 16, 32, 128))
     assert heur.DECODE_COMBINE_LEAN_WALK_MIN_LEAN_BLOCKS == heur.DECODE_COMBINE_MAX_LEAN_BLOCKS + 1
