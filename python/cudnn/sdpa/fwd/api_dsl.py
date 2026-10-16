@@ -1758,6 +1758,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             f"decode_q_tile_max={self.decode_q_tile_max} caps the Rubin (cc 10.7) d256 decode route's width table; this plan lowers for "
             f"cc {major}.{minor}, whose decode tile has one routed width",
         )
+        # The split combine's programmatic-dependent-launch form is wired on its sink-free dense half entries only (the sink entries
+        # carry no use_pdl): a split plan with an attention sink declares use_pdl=False -- refused HERE, before any entry is compiled,
+        # on every arch line (the same knob combination compile_ptr refuses; this is the typed decline a ranked plan must see).
+        self._not_implemented_error_if(
+            self.use_pdl and self.has_sink and self.split_kv > 1,
+            "use_pdl=True with an attention sink and split_kv > 1: the split combine's sink entries carry no programmatic-dependent-launch "
+            "form; declare use_pdl=False for this plan",
+        )
         paged_prefill_cga1 = supports_paged_prefill_cga1(
             (int(d_qk), int(d_v)),
             device_cc=self._device_cc,

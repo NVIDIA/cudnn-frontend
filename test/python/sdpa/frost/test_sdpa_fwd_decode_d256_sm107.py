@@ -1740,6 +1740,43 @@ def test_decode_q_tile_max_is_refused_off_cc_10_7_in_check_support_whatever_the_
         assert "decode_q_tile_max" not in str(other), other
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="check_support reads the device's compute capability")
+def test_use_pdl_with_a_sink_and_a_split_is_refused_in_check_support(monkeypatch):
+    """The split combine's programmatic-dependent-launch form is wired on its sink-free dense half entries only (the sink entries
+    carry no ``use_pdl``), so a split plan with an attention sink that declares ``use_pdl=True`` is a typed decline at
+    ``check_support`` -- before any entry is compiled, on every arch line (the device is read through
+    ``torch.cuda.get_device_capability``, monkeypatched to cc 10.0 here, the line that admits a sink under a split, so the cell
+    runs on any CUDA device).  Without the sink, unsplit, or without the knob, check_support never names the combination."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 0))
+    B, S, H, KH, s_q = 1, 4096, 24, 2, 1
+    dtype = torch.bfloat16
+
+    def api(**extra):
+        q_gpu = torch.randn(B, s_q, H, D, device="cuda", dtype=dtype).transpose(1, 2)
+        k_c = torch.randn(B, S, KH, D, device="cuda", dtype=dtype).transpose(1, 2)
+        v_c = torch.randn(B, S, KH, D, device="cuda", dtype=dtype).transpose(1, 2)
+        return SdpaFwdDslSm100(
+            sample_q=q_gpu,
+            sample_k=k_c,
+            sample_v=v_c,
+            sample_o=torch.empty_like(q_gpu),
+            sample_lse=torch.empty(B, H, s_q, device="cuda", dtype=torch.float32),
+            seq_kv_lens_present=False,
+            pack_gqa=True,
+            **extra,
+        )
+
+    with pytest.raises(NotImplementedError, match=r"use_pdl=True with an attention sink and split_kv > 1"):
+        api(has_sink=True, split_kv=8, use_pdl=True).check_support()
+    for extra in (dict(has_sink=True, split_kv=1, use_pdl=True), dict(has_sink=False, split_kv=8, use_pdl=True), dict(has_sink=True, split_kv=8)):
+        try:
+            api(**extra).check_support()
+        except Exception as other:  # noqa: BLE001 -- the host under test may not be a cc 10.0 part; only this refusal's absence is pinned
+            assert "use_pdl=True with an attention sink" not in str(other), (extra, other)
+
+
 @_gpu
 def test_decode_adapter_dense_pack_and_split_follow_the_tile():
     """The standalone adapter on cc 10.7, DENSE cache (the form its former 'Rubin half PackGQA

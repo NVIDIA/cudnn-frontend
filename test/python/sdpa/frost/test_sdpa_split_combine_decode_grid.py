@@ -11,9 +11,10 @@ decode form, another fp32 association, so there the reference bound is the only 
 
 What this module pins: (1) the SELECTION -- the host twin ``decode_grid_selected`` reads the lean kernel's grid against
 ``heuristics.DECODE_COMBINE_MAX_LEAN_BLOCKS`` (a decode step's tens of blocks take the decode-grid kernel, a prefill's
-thousands keep the module's own forms), the ``decode_grid`` keyword of ``compile_ptr`` is validated, and a decode-shaped
-launch of the default entry runs the decode-grid kernel while a prefill-shaped launch runs the module's lean / serial
-kernel (the kernel NAMES, from the profiler); (2) the NUMERICS on decode cells (B 1 / B 4, 24 Q heads, S_q 1 / 4, d 256,
+thousands keep the module's own forms), the ``decode_grid`` keyword of ``compile_ptr`` is validated (its default is
+``DECODE_GRID_OFF``: an entry that names no form is the module's own rule on every device, and only the cc 10.7 adapter
+names AUTO), and a decode-shaped launch of the AUTO entry runs the decode-grid kernel while a prefill-shaped launch runs
+the module's lean / serial kernel (the kernel NAMES, from the profiler); (2) the NUMERICS on decode cells (B 1 / B 4, 24 Q heads, S_q 1 / 4, d 256,
 plus the suite's d 160 shape and the small head dims) at splits 2 .. 130: the float64 reference at the suite's
 tolerances, dead splits and dead rows, the LSE in both bases, two launches bitwise (every reduction is in a fixed order),
 and -- where the summation order is UNCHANGED, ``n_splits <= 16`` (only chain 0 holds splits) -- the decode-grid output
@@ -170,14 +171,31 @@ def test_compile_ptr_validates_the_decode_grid_keyword():
 
 
 @L0
+@requires_dsl
+def test_compile_ptr_names_no_form_by_default_and_declines_pdl_on_a_sink_entry():
+    """An entry that names no ``decode_grid`` is the module's own three-way rule (``DECODE_GRID_OFF``) on every device: the
+    decode-grid kernel is reached only where a caller names AUTO / ON -- the cc 10.7 adapter per plan, this module's cells --
+    so the combine module's own pointer-level tests run the forms their ids name on every line.  And ``use_pdl=True`` on a
+    sink entry is a typed decline (the sink entries carry no programmatic-dependent-launch form; the adapter refuses the
+    same combination at check_support)."""
+    import inspect
+
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
+
+    assert inspect.signature(comb.compile_ptr).parameters["decode_grid"].default == comb.DECODE_GRID_OFF
+    with pytest.raises(ValueError, match="sink entries"):
+        comb.compile_ptr(dtype_o="bf16", has_lse=True, has_sink=True, use_pdl=True)
+
+
+@L0
 @pytest.mark.parametrize("_m", [pytest.param(None, marks=_gpu)])
 def test_decode_shaped_launch_runs_the_decode_grid_kernel_and_a_prefill_shaped_one_the_lean_kernel(_m):
-    """The default entry (AUTO) picks per launch from the runtime geometry: the kernel names from the profiler."""
+    """The AUTO entry (the cc 10.7 adapter's) picks per launch from the runtime geometry: the kernel names from the profiler."""
     from torch.profiler import ProfilerActivity, profile
 
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 
-    fn = positional_entry(comb.compile_ptr(dtype_o="bf16", has_lse=True))
+    fn = positional_entry(comb.compile_ptr(dtype_o="bf16", has_lse=True, decode_grid=comb.DECODE_GRID_AUTO))
 
     def names(b, h, sq, d, splits):
         op, lp, _, _ = _partials(b, h, sq, d, splits)

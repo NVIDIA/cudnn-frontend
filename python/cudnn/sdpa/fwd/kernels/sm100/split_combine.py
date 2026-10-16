@@ -38,7 +38,7 @@ chain is one DRAM round trip for up to 128 splits, and a decode step (B 1 x 24 Q
 heads = 24 lean blocks on 148 .. 212 SMs) fills 96 SMs instead of 24.  Which
 kernel runs is decided per launch in ``_launch_combine`` from the runtime
 geometry: the decode-grid kernel when the entry's ``decode_grid`` form selector
-(``compile_ptr(decode_grid=)``; the cc 10.7 adapter pins it per plan through
+(``compile_ptr(decode_grid=)``, ``DECODE_GRID_OFF`` unless named; the cc 10.7 adapter pins it per plan through
 ``heuristics.decode_combine_grid_selected``) is not ``DECODE_GRID_OFF``, the
 launch is a sink-free, unquantized fp32-partial one whose lean geometry holds
 (``d_v % 4 == 0``, a 16-byte aligned slab) and -- under ``DECODE_GRID_AUTO`` --
@@ -178,7 +178,7 @@ DECODE_RED_WORDS = DECODE_RED_ACC_OFF + DECODE_CHAINS * DECODE_LANES_PER_CHAIN *
 # ``compile_ptr(decode_grid=...)``: which form a pointer entry launches.
 DECODE_GRID_AUTO = 0  # the grid rule (the cc 10.7 adapters' entry): the decode-grid kernel inside the lean-grid bound, else the module's own forms
 DECODE_GRID_ON = 1  # always the decode-grid kernel where its geometry holds (tests; an explicit decode flag)
-DECODE_GRID_OFF = 2  # never the decode-grid kernel: the module's own three-way rule (the Blackwell line's entry; tests; a kill switch)
+DECODE_GRID_OFF = 2  # never the decode-grid kernel: the module's own three-way rule (compile_ptr's default; the Blackwell line's entry; tests; a kill switch)
 
 
 def lean_grid_blocks(b: int, h: int, s_q: int) -> int:
@@ -2202,7 +2202,7 @@ def compile_ptr(
     gate: bool = False,
     dtype_gate: Optional[str] = None,
     has_q_lens: bool = False,
-    decode_grid: int = DECODE_GRID_AUTO,
+    decode_grid: int = DECODE_GRID_OFF,
     use_pdl: bool = False,
 ) -> Callable:
     """Compile a shape-generic pointer entry for prepared split execution.
@@ -2228,7 +2228,9 @@ def compile_ptr(
     ``stats_log2``; the packed entry takes it as its trailing ``sinks_ptr``.
     ``has_q_lens`` (the dense sink entry only) appends the int32 (B,) per-batch Q-length pointer after the sink pointer: the rows of the padded-Q trim
     past their batch's length keep ``O := 0 / LSE := -inf`` instead of folding the sink.
-    ``decode_grid`` (appended; ``DECODE_GRID_AUTO`` by default) selects the kernel
+    ``decode_grid`` (appended; ``DECODE_GRID_OFF`` by default: an entry that names no
+    form is the module's own three-way rule on every device, and the cc 10.7 adapter
+    names AUTO / OFF per plan from its split-aware rule) selects the kernel
     FORM of the half / gated / ragged / sink entries, a compile-time specialization
     that leaves every positional ABI unchanged: AUTO = the DECODE-GRID kernel when
     the lean grid holds at most ``heuristics.DECODE_COMBINE_MAX_LEAN_BLOCKS``
