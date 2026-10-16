@@ -75,6 +75,7 @@ unrounded fp64 formula below 2e-2.
 | `precision` | `None` / `'default'` / `'none'` / `'bfloat16'` (`'bf16'`) | `'mxfp8'`, `'ieee'`, `'tf32'`: `NotImplementedError` |
 | parameters | the eight weights are required (no implicit initialisation); biases optional | `ValueError` |
 | layout | contiguous `x` (and `out`) | `ValueError` (never a hidden copy) |
+| aliasing | `out` and the workspace disjoint, as byte ranges, from every tensor the kernels read (`x`, the mask, the parameters) and from each other -- two views over one allocation whose ranges intersect are declined, pointer inequality is not enough (the output stage reads `x` while it writes `out`) | `ValueError` naming the two operands, before any launch |
 | tensor extent | `B*N*N*c_z` and `2*c*B*N*n_pad` below 2^31 (32-bit element offsets in the kernels) | `NotImplementedError` |
 | device | every `execute` tensor on the device the plan was declared on | `ValueError` |
 | performance knobs | `k2_tile` / `knobs=TriMulKnobs(...)` within the measured domains of `cudnn.triangle_multiplicative_update.heuristics` (contraction tile, projection tile order, output-stage prologue form, scheduler ring depth, row tile, LayerNorm pass form, epilogue arithmetic form, the two stages' `.minnctapersm` register-split hint) -- every value computes the same function | `ValueError` on an unknown name; `NotImplementedError` when the contraction tile cannot serve the geometry on this device |
@@ -108,7 +109,10 @@ triangle_multiplicative_update(x, direction="outgoing", mask=None,
                                eps=1e-5, precision=None, *, out=None, stream=None) -> torch.Tensor
 ```
 
-`out` writes into a caller-provided bf16 tensor (stable addresses for CUDA-graph users); `stream` is a raw CUDA stream handle the
+`out` writes into a caller-provided bf16 tensor (stable addresses for CUDA-graph users): `[B, N, N, c_z]`, or `[N, N, c_z]` at `B = 1`,
+contiguous, its bytes disjoint from `x`, the mask, every parameter and the workspace (an intersecting byte range is a typed
+`ValueError` before any launch); it is returned as given, whatever its rank -- only an output the function allocated follows `x`'s rank.
+`stream` is a raw CUDA stream handle the
 allocations and launches are ordered on (`None` = torch's current stream). The function caches one compiled plan per
 `(shape, direction, mask present, biases present, eps)` and one prepared parameter set per parameter identity (address, shape,
 strides, dtype, device, in-place version counter; a bounded LRU), allocates the output and the workspace per call, and launches.

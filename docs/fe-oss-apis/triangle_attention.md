@@ -195,7 +195,9 @@ and served through the `kv_lengths` graph form -- the same compiled plan as `kv_
 log-sum-exp), `score_max=True` (declined today, see the table), `scale`, `sample_o` (the output's layout; None = the compact
 `(B, N, S, H, D)` form). `execute` validates every tensor against the declaration -- device, dtype, shape,
 strides, the base alignment each operand's reader needs (16 bytes for the TMA-read `q` / `k` / `v` / `bias` / `o`, 4 bytes for the
-int32 lengths and the fp32 `lse`, none for the byte mask), the mask form -- and launches once per outer batch entry
+int32 lengths and the fp32 `lse`, none for the byte mask), the mask form, and that `o`, the `lse` and the workspace intersect, as byte
+ranges, no tensor the kernel reads and not each other (`ValueError` naming the two operands; inputs may overlap one another) -- and
+launches once per outer batch entry
 (`launches_per_call`); its keyword `check_prefix_mask` (the prefix-mask form only; True / False / None = the environment decides) is the
 debug check above. A plan is bound to the device it was declared on; declare and compile one per device. The prepared API owns
 no device memory. The graph's padding contract takes a length tensor on both sides and the kernel bounds the live Q rows by `seq_len_q`;

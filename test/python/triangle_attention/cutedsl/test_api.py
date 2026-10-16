@@ -320,6 +320,38 @@ def test_execute_declines_tensors_on_another_device_than_the_plan():
     plan0._check_execute_args(q, q, q, bias, None, o, None, None, None, None)
 
 
+@requires_cuda
+def test_execute_declines_an_output_whose_byte_range_intersects_an_operand_before_any_launch():
+    """`o` and the lse (the kernel writes them) must be disjoint from every tensor it reads, as BYTE RANGES, not by pointer equality: an `o`
+    view starting inside q (two views over one allocation) has a distinct data_ptr and the kernel would overwrite rows it has still to read.
+    Host-side on any CUDA device (the check precedes compile and launch); inputs may overlap each other (q / k / v as slices of one buffer are
+    read-only); a disjoint `o` of the same allocation passes."""
+    b, n, h, s, d = 1, 16, 4, 64, 32
+    plan = tapi.TriangleAttentionFwd(_left_desc(b, n, h, s, d), _left_desc(b, n, h, s, d), _left_desc(b, n, h, s, d), _bias_desc(1, h, s, s), lse=True)
+    numel = n * s * h * d
+    buf = torch.empty(3 * numel, device="cuda", dtype=torch.bfloat16)
+    view = lambda start: buf[start : start + numel].view(b, n, s, h, d).permute(0, 1, 3, 2, 4)  # noqa: E731
+    q, k, v = view(0), view(0), view(0)  # q, k, v over ONE buffer: read-only, admitted
+    bias = torch.empty(1, 1, h, s, s, device="cuda", dtype=torch.bfloat16)
+    lse = torch.empty(b, n, h, s, device="cuda", dtype=torch.float32)
+    plan._check_execute_args(q, k, v, bias, None, view(numel), lse, None, None, None)  # a disjoint o of the same allocation
+    o_half = view(numel // 2)
+    assert o_half.data_ptr() != q.data_ptr()  # the old pointer-equality test saw distinct pointers
+    with pytest.raises(ValueError, match=r"o must not alias q: their byte ranges intersect"):
+        plan._check_execute_args(q, k, v, bias, None, o_half, lse, None, None, None)
+    # o over the bias, and o over the lse (two outputs)
+    bbuf = torch.empty(numel + h * s * s // 2, device="cuda", dtype=torch.bfloat16)
+    bias_v = bbuf[: h * s * s].view(1, 1, h, s, s)
+    o_b = bbuf[h * s * s // 2 : h * s * s // 2 + numel].view(b, n, s, h, d).permute(0, 1, 3, 2, 4)
+    with pytest.raises(ValueError, match="o must not alias bias"):
+        plan._check_execute_args(q, k, v, bias_v, None, o_b, lse, None, None, None)
+    lbuf = torch.empty(2 * numel, device="cuda", dtype=torch.bfloat16)
+    lse_v = lbuf[: 2 * n * h * s].view(torch.float32).view(b, n, h, s)
+    o_l = lbuf[n * h * s : n * h * s + numel].view(b, n, s, h, d).permute(0, 1, 3, 2, 4)
+    with pytest.raises(ValueError, match="o must not alias lse"):
+        plan._check_execute_args(q, k, v, bias, None, o_l, lse_v, None, None, None)
+
+
 # ---------------------------------------------------------------------------
 # Rubin: the acceptance grid, the layouts, the masked rows, CUDA graphs, autograd, the live declines
 # ---------------------------------------------------------------------------

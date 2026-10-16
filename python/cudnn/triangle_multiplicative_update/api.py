@@ -52,7 +52,7 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 from cuda.bindings import driver as cuda
 
-from cudnn.api_base import APIBase, TensorDesc
+from cudnn.api_base import APIBase, TensorDesc, check_buffers_disjoint
 from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
 from cudnn.gemm.frost.ln_prologue import ARCHS_BY_CC as _ARCHS_BY_CC
 from cudnn.gemm.frost.ln_prologue import body_arch_for_cc as _body_arch_for_cc
@@ -169,6 +169,10 @@ class TriMulWeights:
     @property
     def device(self) -> torch.device:
         return self.w_in.device
+
+
+#: The tensor fields of :class:`TriMulWeights`, in order -- the parameters the kernels READ (the autograd gate and the aliasing check walk them).
+_WEIGHT_FIELDS = ("w_in", "b_in", "norm_in_weight", "norm_in_bias", "norm_out_weight", "norm_out_bias", "p_out_weight", "g_out_weight", "b_out")
 
 
 def _bf16_contiguous(t: torch.Tensor, name: str, shape: Tuple[int, ...], *, cast: bool) -> torch.Tensor:
@@ -556,13 +560,7 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
         b, n, c_z, c = self.batch, self.n_res, self.c_z, self.c
         bf16 = torch.bfloat16
         if isinstance(weights, TriMulWeights):
-            _autograd_decline(
-                [("x", x), ("mask", mask), ("out", out)]
-                + [
-                    (f"weights.{f}", getattr(weights, f))
-                    for f in ("w_in", "b_in", "norm_in_weight", "norm_in_bias", "norm_out_weight", "norm_out_bias", "p_out_weight", "g_out_weight", "b_out")
-                ]
-            )
+            _autograd_decline([("x", x), ("mask", mask), ("out", out)] + [(f"weights.{f}", getattr(weights, f)) for f in _WEIGHT_FIELDS])
         else:
             _autograd_decline([("x", x), ("mask", mask), ("out", out)])
         # the PLAN's device first: its kernels are loaded on cuda:<device_index> and launched there -- tensors on another device would pass
@@ -607,8 +605,15 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
             raise ValueError(f"weights must live on x's device {x.device}, got {weights.device}")
         if workspace.data_ptr() % _WS_ALIGN:
             raise ValueError(f"workspace must be {_WS_ALIGN}-byte aligned")
-        if out.data_ptr() == x.data_ptr():
-            raise ValueError("out must not alias x (the output stage reads x while it writes out)")
+        # The buffers the kernels WRITE -- `out` (the output stage, while it reads x) and the workspace (the projection stage's planes while x,
+        # the mask and the parameters are read; the contraction's y) -- must not intersect any buffer they READ, nor each other, as BYTE RANGES:
+        # pointer equality is not that test.  An `out` view starting inside x (two views over one allocation) has a distinct data_ptr, and the
+        # output stage overwrote rows of x it had still to read (measured at N = 512: 16.7 M differing elements, max |diff| 2.56; smaller N and
+        # offsets happened to pass).  A typed ValueError naming both operands, before any launch (the parameters may overlap each other).
+        check_buffers_disjoint(
+            (("out", out), ("workspace", workspace)),
+            [("x", x), ("mask", mask)] + [(f"weights.{f}", getattr(weights, f)) for f in _WEIGHT_FIELDS],
+        )
 
     def _carve(self, workspace: torch.Tensor):
         """``(plane_a, plane_b, y)`` views over the workspace (no allocation)."""
@@ -827,8 +832,11 @@ def triangle_multiplicative_update(
 ) -> torch.Tensor:
     """The triangle multiplicative update of ``x`` (``[B, N, N, c_z]`` or ``[N, N, c_z]`` bf16) -- cuEquivariance's signature
     (``cuequivariance_ops_torch.triangle_multiplicative_update``, 0.12.0) with two keyword-only additions: ``out`` (write into this
-    bf16 tensor instead of allocating) and ``stream`` (a raw CUDA stream handle the allocations and launches are ordered on; None = torch's
-    current stream).  Returns the update (the caller adds the residual), shaped like ``x``.
+    bf16 tensor instead of allocating: ``[B, N, N, c_z]``, or ``[N, N, c_z]`` at ``B = 1``, contiguous, its bytes disjoint from ``x``, the
+    mask, every parameter and the workspace -- an intersecting byte range is a typed ``ValueError`` before any launch, since the output
+    stage reads ``x`` while it writes ``out``; a caller's ``out`` is returned AS GIVEN, whatever its rank) and ``stream`` (a raw CUDA
+    stream handle the allocations and launches are ordered on; None = torch's current stream).  Returns the update (the caller adds the
+    residual), shaped like ``x`` when the function allocated it.
 
     Differences from cuEquivariance, all typed: the eight weights are REQUIRED (no implicit random initialisation); ``precision`` is
     None / ``'default'`` (bf16 inputs required) or ``'bfloat16'`` (wider inputs cast once per call, as cuEquivariance does), ``'mxfp8'`` and
@@ -850,6 +858,13 @@ def triangle_multiplicative_update(
     x4 = x.unsqueeze(0) if squeeze else x
     if x4.ndim != 4 or x4.shape[1] != x4.shape[2]:
         raise ValueError(f"x must be [B, N, N, c_z] or [N, N, c_z], got {tuple(x.shape)}")
+    # `out` is validated BEFORE anything is done with it (a non-tensor used to fail at its unsqueeze, after the plan was built): tensor-ness and
+    # rank here, dtype / shape / contiguity / device / aliasing by execute's argument check; it is returned as given (squeezed never).
+    if out is not None:
+        if not isinstance(out, torch.Tensor):
+            raise TypeError(f"out must be a torch.Tensor (bf16, shaped like x) or None, got {type(out).__name__}")
+        if out.ndim not in (3, 4):
+            raise ValueError(f"out must be [B, N, N, c_z] (or [N, N, c_z] at B = 1) like x, got shape {tuple(out.shape)}")
     if p_in_weight is None or p_in_weight.ndim != 2 or p_in_weight.shape[0] % 2:
         raise ValueError("p_in_weight is required and must be [2 c, c_z] (rows [a; b])")
     for name, w in (
@@ -927,9 +942,11 @@ def triangle_multiplicative_update(
         if out is None:
             out4 = torch.empty_like(x4)
         else:
-            out4 = out.unsqueeze(0) if out.ndim == 3 else out
+            out4 = out.unsqueeze(0) if out.ndim == 3 else out  # execute checks the 4-D view: dtype, [B, N, N, c_z], contiguity, device, aliasing
         workspace = torch.empty(plan.get_workspace_size(), dtype=torch.uint8, device=device)
         plan.execute(x4, m, weights, out4, workspace, current_stream=cuda.CUstream(_stream_handle(stream, device)))
+    if out is not None:
+        return out  # the caller's tensor, as given: only an output this function allocated follows x's rank
     return out4.squeeze(0) if squeeze else out4
 
 

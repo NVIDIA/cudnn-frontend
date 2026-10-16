@@ -70,7 +70,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
-from cudnn.api_base import APIBase, TensorDesc
+from cudnn.api_base import APIBase, TensorDesc, check_buffers_disjoint
 from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
 from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver, ws_align
 
@@ -721,8 +721,15 @@ class TriangleAttentionFwd(APIBase):
                 raise ValueError(
                     f"workspace must be contiguous (its chunks are carved as views of the caller's bytes), got strides {tuple(workspace.stride())}"
                 )
-        if o.data_ptr() in (q.data_ptr(), k.data_ptr(), v.data_ptr()):
-            raise ValueError("o must not alias q, k or v")
+        # The buffers the kernel WRITES (o, the lse, the workspace's lengths / scratch) must not intersect any buffer it READS (q, k, v, the
+        # bias, the lengths, the mask), nor each other -- as BYTE RANGES, never by pointer equality: an `o` view starting inside q (two views
+        # over one allocation) has a distinct data_ptr and the kernel overwrites rows it has still to read.  Inputs may overlap each other
+        # (q / k / v as slices of one projection buffer are read-only).  A typed ValueError naming both operands, before any launch.
+        check_buffers_disjoint(
+            (("o", o), ("lse", lse), ("workspace", workspace if self._workspace_bytes and isinstance(workspace, torch.Tensor) else None)),
+            (("q", q), ("k", k), ("v", v), ("bias", bias), ("kv_lengths", kv_lengths), ("mask", mask)),
+            what="the kernel",
+        )
 
     def execute(
         self,

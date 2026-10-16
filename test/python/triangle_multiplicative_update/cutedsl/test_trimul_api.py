@@ -1104,6 +1104,148 @@ def test_execute_declines_tensors_on_another_device_than_the_plan():
     plan0._check_execute_args(x, mask, w, out, ws)  # the same tensors on the plan's device pass every host check
 
 
+def _aligned_u8(nbytes: int, align: int = 256):
+    """A ``nbytes`` uint8 CPU buffer whose base is ``align``-byte aligned (the CPU allocator aligns to 64 B; the workspace check wants 256), plus
+    the backing allocation (kept alive by the caller) and the offset of the aligned base inside it."""
+    backing = torch.empty(nbytes + align, dtype=torch.uint8)
+    off = (-backing.data_ptr()) % align
+    return backing[off : off + nbytes], backing, off
+
+
+def test_out_and_workspace_byte_ranges_intersecting_an_operand_are_a_typed_decline_before_any_launch():
+    """`out` (the output stage writes it while reading x) and the workspace (the projection stage writes the planes while reading x, the mask
+    and the parameters; the contraction writes y) must be disjoint from every tensor the kernels read -- as BYTE RANGES, never by pointer
+    equality: a caller-provided `out` whose range starts inside x (two views over one allocation) passed the old `data_ptr() ==` test and the
+    output stage overwrote rows of x it had still to read (reproduced on hardware at N = 512: 16.7 M differing elements, max |diff| 2.56).
+    The check runs on the host (CPU tensors suffice), names both operands and fires before any launch; disjoint views of the same allocation
+    pass it.  Pinned per operand class: out over x (half-way and by ONE element), out over the mask, out over a parameter, out inside the
+    workspace, the workspace over x."""
+    n, c = 64, 128
+    plan = tapi.TriangleMultiplicativeUpdateFwd(_desc(N=n, device="cpu"), "outgoing", c_hidden=c, has_mask=True, has_in_bias=True, has_out_bias=True)
+    p = _params(c, c, True, True, seed=41)
+    w = tapi.prepare_weights(*[p[k] for k in CUEQ_PARAMS[3:15]])
+    mask = torch.ones(1, n, n, dtype=torch.bfloat16)
+    numel = n * n * c
+    ws_bytes = plan.get_workspace_size()
+    ws, _keep, _ = _aligned_u8(ws_bytes)
+    buf = torch.empty(3 * numel, dtype=torch.bfloat16)  # ONE allocation: x, an out starting half-way through x, a disjoint out after x
+    x = buf[:numel].view(1, n, n, c)
+    out_half = buf[numel // 2 : numel // 2 + numel].view(1, n, n, c)
+    out_one = buf[numel - 1 : 2 * numel - 1].view(1, n, n, c)  # shares exactly x's last element
+    out_disjoint = buf[numel : 2 * numel].view(1, n, n, c)
+    out_far = buf[2 * numel :].view(1, n, n, c)
+    assert out_half.data_ptr() != x.data_ptr() and out_one.data_ptr() != x.data_ptr()  # the old test saw distinct pointers
+    with pytest.raises(ValueError, match=r"out must not alias x.*byte ranges intersect") as info:
+        plan._check_execute_args(x, mask, w, out_half, ws)
+    assert "out" in str(info.value) and " x" in str(info.value)
+    with pytest.raises(ValueError, match="out must not alias x"):
+        plan._check_execute_args(x, mask, w, out_one, ws)
+    plan._check_execute_args(x, mask, w, out_disjoint, ws)  # distinct ranges of one allocation pass (the hardware control is bitwise the baseline)
+    plan._check_execute_args(x, mask, w, out_far, ws)
+    with pytest.raises(ValueError, match="out must not alias x"):  # full aliasing is the degenerate intersection, still named
+        plan._check_execute_args(x, mask, w, x, ws)
+    # out over the MASK (the projection stage reads it while the output stage... no: K1 reads the mask, K3 writes out -- a later launch, but the
+    # two overlap under PDL and a CUDA graph replays them back to back: declined like any read buffer)
+    mbuf = torch.empty(numel + n * n // 2, dtype=torch.bfloat16)
+    mask_v = mbuf[: n * n].view(1, n, n).fill_(1.0)
+    out_m = mbuf[n * n // 2 : n * n // 2 + numel].view(1, n, n, c)
+    with pytest.raises(ValueError, match="out must not alias mask"):
+        plan._check_execute_args(x, mask_v, w, out_m, ws)
+    # out over a PARAMETER (the output gate's weight)
+    wbuf = torch.empty(numel + c * c // 2, dtype=torch.bfloat16)
+    g_out = wbuf[: c * c].view(c, c).copy_(w.g_out_weight)
+    out_w = wbuf[c * c // 2 : c * c // 2 + numel].view(1, n, n, c)
+    w_al = tapi.TriMulWeights(**{**{f: getattr(w, f) for f in w.__dataclass_fields__}, "g_out_weight": g_out})
+    with pytest.raises(ValueError, match=r"out must not alias weights\.g_out_weight"):
+        plan._check_execute_args(x, mask, w_al, out_w, ws)
+    plan._check_execute_args(x, mask, w_al, out_far, ws)  # the relocated weight itself is fine
+    # out INSIDE the workspace, and the workspace over x
+    big, _keep2, off = _aligned_u8(ws_bytes + 512 + 2 * numel)
+    ws2 = big[:ws_bytes]
+    out_in_ws = big[512 : 512 + 2 * numel].view(torch.bfloat16).view(1, n, n, c)
+    with pytest.raises(ValueError, match="out must not alias workspace"):
+        plan._check_execute_args(x, mask, w, out_in_ws, ws2)
+    x_in_ws = big[256 : 256 + 2 * numel].view(torch.bfloat16).view(1, n, n, c)
+    with pytest.raises(ValueError, match="workspace must not alias x"):
+        plan._check_execute_args(x_in_ws, mask, w, out_far, ws2)
+    # the span helper itself: a view's range is [base, last element + itemsize), an empty tensor spans nothing, a stride-0 broadcast one element
+    from cudnn.api_base import tensor_byte_span
+
+    t = torch.empty(10, dtype=torch.bfloat16)
+    assert tensor_byte_span(t[2:5]) == (t.data_ptr() + 4, t.data_ptr() + 10)
+    assert tensor_byte_span(t[::3]) == (t.data_ptr(), t.data_ptr() + 2 * 9 + 2)
+    lo, hi = tensor_byte_span(t[:0])
+    assert lo == hi, "an empty tensor spans nothing (its base may read 0)"
+    assert tensor_byte_span(t[3].expand(7)) == (t.data_ptr() + 6, t.data_ptr() + 8)
+
+
+def test_drop_in_validates_out_before_use_and_returns_it_as_given(monkeypatch):
+    """`out` is checked for tensor-ness and rank BEFORE anything is done with it (a non-tensor used to die with AttributeError at the
+    unsqueeze, after the plan was built), and a caller's `out` is returned AS GIVEN -- the function squeezes only an output it allocated: a
+    4-D out with a 3-D x comes back as the caller's 4-D object, a 3-D out with a 3-D x as that same 3-D object (execute sees its 4-D view).
+    GPU-free: the plan is a stub recording what execute received (the launches are the device cells'), the stream handle a constant."""
+    c, n = 128, 64
+    x3 = torch.randn(n, n, c).to(torch.bfloat16)
+    p = _params(c, c, False, False, seed=43)
+    kw = {k: p[k] for k in CUEQ_PARAMS[3:15]}
+    received = []
+
+    class _StubPlan:
+        def get_workspace_size(self):
+            return 0
+
+        def execute(self, x4, m, weights, out4, workspace, current_stream=None):
+            received.append((x4, out4))
+
+    monkeypatch.setattr(tapi, "_cached_plan", lambda *a, **k: _StubPlan())
+    monkeypatch.setattr(tapi, "_stream_handle", lambda stream, device=None: 0)
+    with pytest.raises(TypeError, match="out must be a torch.Tensor"):
+        tapi.triangle_multiplicative_update(x3, "outgoing", None, **kw, out=[1.0])
+    with pytest.raises(ValueError, match=r"out must be \[B, N, N, c_z\]"):
+        tapi.triangle_multiplicative_update(x3, "outgoing", None, **kw, out=torch.empty(n * n * c, dtype=torch.bfloat16))
+    assert received == [], "a malformed out is declined before the plan runs"
+    out4 = torch.empty(1, n, n, c, dtype=torch.bfloat16)
+    got = tapi.triangle_multiplicative_update(x3, "outgoing", None, **kw, out=out4)
+    assert got is out4 and received[-1][1] is out4 and tuple(received[-1][0].shape) == (1, n, n, c)
+    out3 = torch.empty(n, n, c, dtype=torch.bfloat16)
+    got = tapi.triangle_multiplicative_update(x3, "outgoing", None, **kw, out=out3)
+    assert got is out3 and received[-1][1].data_ptr() == out3.data_ptr() and tuple(received[-1][1].shape) == (1, n, n, c)
+    got = tapi.triangle_multiplicative_update(x3.unsqueeze(0), "outgoing", None, **kw, out=out3)  # a 4-D x with a 3-D out at B = 1
+    assert got is out3
+    got = tapi.triangle_multiplicative_update(x3, "outgoing", None, **kw)  # allocated by the function: squeezed back to x's rank
+    assert tuple(got.shape) == (n, n, c) and tuple(received[-1][1].shape) == (1, n, n, c)
+    got = tapi.triangle_multiplicative_update(x3.unsqueeze(0), "outgoing", None, **kw)
+    assert tuple(got.shape) == (1, n, n, c)
+
+
+@requires_served_arch
+def test_out_views_of_one_allocation_on_the_device_disjoint_runs_intersecting_declines_before_any_launch():
+    """The review's hardware recipe (N = 512, c = 128, contiguous bf16 views over ONE allocation, `out` beginning half-way through x): the call
+    is declined before any launch -- x, which the overlapping `out` would have overwritten, is intact -- while a disjoint `out` of the same
+    allocation is served and equals the separately allocated baseline bitwise; a 4-D `out` with a 3-D x comes back as the caller's object."""
+    n_res, c = 512, 128
+    x_src, mask, p = _inputs(n_res, 1, c, c, "all", False, False, seed=45)
+    numel = x_src.numel()
+    buf = torch.empty(2 * numel + numel // 2, dtype=torch.bfloat16, device="cuda")
+    x = buf[:numel].view(1, n_res, n_res, c)
+    x.copy_(x_src)
+    base = _call(x, "outgoing", mask, p)
+    out_half = buf[numel // 2 : numel // 2 + numel].view(1, n_res, n_res, c)
+    out_disjoint = buf[numel + numel // 2 :].view(1, n_res, n_res, c)
+    torch.cuda.synchronize()
+    with pytest.raises(ValueError, match="out must not alias x"):
+        _call(x, "outgoing", mask, p, out=out_half)
+    torch.cuda.synchronize()
+    assert torch.equal(x, x_src), "the declined call launched nothing: x is intact"
+    got = _call(x, "outgoing", mask, p, out=out_disjoint)
+    torch.cuda.synchronize()
+    assert got is out_disjoint and torch.equal(out_disjoint, base)
+    out4 = torch.empty_like(x)
+    got = _call(x[0], "outgoing", mask[0], p, out=out4)
+    torch.cuda.synchronize()
+    assert got is out4 and torch.equal(out4, base)
+
+
 @requires_served_arch
 def test_knobs_are_performance_only_bitwise_and_the_unfit_tile_is_a_typed_decline():
     """Review-grade accept + reject for the knob surface: a non-default contraction tile, the pass-major projection order, the transpose
