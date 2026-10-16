@@ -689,6 +689,47 @@ def _empty_bwd_workspace_with_zeroed_accum(
     return workspace
 
 
+def _sm90_blk64_auto_kv_splits(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    fixed_block_sparse_num: int,
+    max_kv_splits: int = 16,
+) -> int:
+    """Choose SM90 blk64 splits so one split's K/V region of a head fits in L2.
+
+    The non-split kernel walks each Q tile's list in lockstep only while a wave starts together; once CTAs
+    retire and refill, the resident CTAs sit at random list positions and together touch the whole head's
+    K/V. When that exceeds L2 the kernel turns DRAM-bound (BF16 H100, 128K: L2 hit 40%, DRAM 85%). Lists are
+    ascending, so a split is a KV range, and the split grid orders all Q tiles of one split before the next:
+    the resident working set becomes kv_bytes_per_head / splits.
+
+    Measured on H100 BF16 MHA D128 with independent random indices, Sq == Sk, 12.5% density: 64 MB/head
+    -> 2 splits (+20%), 128 MB -> 4 (+70%), 256 MB -> 8 (+94%); more splits plateau. Dense lists (100%) lose
+    12%; 3% density gains 8% at 2 splits and loses at 4. This metadata-only policy cannot see shared or local
+    KV neighborhoods, which need explicitly benchmarked split counts. Unmeasured regimes return 1: GQA,
+    variable counts, Q tiles per head below the resident CTA count, density above 25%.
+    """
+    if not q.is_cuda or q.dtype not in (torch.float16, torch.bfloat16):
+        return 1
+    kv_blocks = int(fixed_block_sparse_num)
+    batch, heads, seqlen_q, _ = q.shape
+    num_kv_blocks = _ceil_div_int(k.shape[2], 64)
+    if kv_blocks < 32 or k.shape[1] != heads or kv_blocks * 4 > num_kv_blocks:
+        return 1
+    props = torch.cuda.get_device_properties(q.device)
+    l2_bytes = getattr(props, "L2_cache_size", 0)
+    # SM90 blk64 keeps up to 3 CTAs resident per SM (min_blocks_per_mp); fewer Q tiles per head would put
+    # several heads in one wave, a footprint this policy does not model.
+    if l2_bytes <= 0 or _ceil_div_int(seqlen_q, 64) < 3 * props.multi_processor_count:
+        return 1
+    kv_bytes_per_head = k.shape[2] * k.shape[-1] * k.element_size() + v.shape[2] * v.shape[-1] * v.element_size()
+    splits = 1
+    while kv_bytes_per_head > splits * l2_bytes * 3 // 4 and splits < max_kv_splits and kv_blocks // (splits * 2) >= 16:
+        splits *= 2
+    return splits
+
+
 def _bsa_attn_fwd_sm90_blk64(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2537,7 +2578,21 @@ def bsa_attn_fwd(
         assert q2k_block_index.shape[:3] == (batch_size, num_head, num_q_blocks_sm90), (
             f"SM90 blk64 fwd expects q2k_block_index shape prefix " f"{(batch_size, num_head, num_q_blocks_sm90)}, got {tuple(q2k_block_index.shape[:3])}"
         )
-        assert not isinstance(kv_splits, str), "SM90 kv_splits must be an integer"
+        if layout == "bhsd":
+            q_bhsd, k_bhsd, v_bhsd = q, k, v
+        else:
+            q_bhsd, k_bhsd, v_bhsd = (
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+            )
+        if isinstance(kv_splits, str):
+            assert kv_splits == "auto", "SM90 kv_splits string value must be 'auto'"
+            kv_splits = 1
+            # Split-KV writes FP32 partials, so it cannot honor a caller-provided output.
+            if out is None and q2k_block_nums is None:
+                kv_splits = _sm90_blk64_auto_kv_splits(q_bhsd, k_bhsd, v_bhsd, block_sparse_num)
+                kv_splits = _resolve_blk64_split_workspace(q_bhsd, head_dim_v, kv_splits, allow_fallback=True)
         sm90_is_split_kv = int(kv_splits) > 1
         if out is None and not sm90_is_split_kv:
             out_shape = (batch_size, num_head, seqlen_q, head_dim_v) if layout == "bhsd" else (batch_size, seqlen_q, num_head, head_dim_v)
@@ -2548,14 +2603,6 @@ def bsa_attn_fwd(
             assert out.shape == expected_out_shape
             assert out.dtype == q.dtype and out.is_cuda
             assert out.stride(-1) == 1, "SM90 blk64 fwd requires output head_dim to be contiguous"
-        if layout == "bhsd":
-            q_bhsd, k_bhsd, v_bhsd = q, k, v
-        else:
-            q_bhsd, k_bhsd, v_bhsd = (
-                q.transpose(1, 2),
-                k.transpose(1, 2),
-                v.transpose(1, 2),
-            )
         out_bhsd = None if sm90_is_split_kv else (out if layout == "bhsd" else out.transpose(1, 2))
         _out_bhsd, lse_sm90 = _bsa_attn_fwd_sm90_blk64(
             q_bhsd,

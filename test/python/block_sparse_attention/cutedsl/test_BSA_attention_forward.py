@@ -1147,6 +1147,64 @@ def test_bsa_attention_forward_sm100_blk64_auto_split_counts_stay_valid(monkeypa
 
 @pytest.mark.L0
 @pytest.mark.parametrize(
+    ("heads", "seqlen", "count", "expected_splits"),
+    (
+        (40, 131072, 256, 2),  # 64 MiB of K/V per head vs 50 MiB L2
+        (20, 262144, 512, 4),
+        (10, 524288, 1024, 8),
+        (40, 65536, 128, 1),  # 32 MiB per head fits in L2
+        (40, 131072, 2048, 1),  # dense lists lost 12% when split
+        (40, 8192, 64, 1),  # fewer Q tiles per head than resident CTAs
+        (40, 131072, 16, 1),  # too few blocks per split
+    ),
+)
+def test_bsa_attention_forward_sm90_blk64_auto_split_policy(monkeypatch, heads, seqlen, count, expected_splits):
+    """The SM90 policy sizes a split's per-head K/V to L2 and declines unmeasured regimes (metadata only)."""
+    if not torch.cuda.is_available():
+        pytest.skip("block sparse attention tests require CUDA")
+    _import_bsa()
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(L2_cache_size=50 * 1024**2, multi_processor_count=132))
+    q = SimpleNamespace(is_cuda=True, device=torch.device("cuda"), dtype=torch.bfloat16, shape=(1, heads, seqlen, 128))
+    kv = SimpleNamespace(shape=(1, heads, seqlen, 128), element_size=lambda: 2)
+    assert interface._sm90_blk64_auto_kv_splits(q, kv, kv, count) == expected_splits
+    # Unmeasured regimes: GQA, non-16-bit dtype.
+    gqa_kv = SimpleNamespace(shape=(1, max(heads // 2, 1), seqlen, 128), element_size=lambda: 2)
+    assert interface._sm90_blk64_auto_kv_splits(q, gqa_kv, gqa_kv, count) == 1
+    q_fp32 = SimpleNamespace(is_cuda=True, device=q.device, dtype=torch.float32, shape=q.shape)
+    assert interface._sm90_blk64_auto_kv_splits(q_fp32, kv, kv, count) == 1
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=7)
+def test_bsa_attention_forward_sm90_blk64_auto_kv_splits_matches_unsplit(monkeypatch):
+    """kv_splits="auto" resolves to a split count before the output is allocated and matches the unsplit result."""
+    if not torch.cuda.is_available():
+        pytest.skip("block sparse attention tests require CUDA")
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("SM90 blk64 split policy")
+    BSA = _import_bsa()
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    q = torch.randn((1, 2, 256, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 2, 1024, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    ids = torch.arange(0, 16, device="cuda", dtype=torch.int32).expand(1, 2, 4, 16).contiguous()
+    expected = BSA.block_sparse_attention_forward(q, k, v, ids, 16, sparse_block_size=64, kv_splits=1)
+    seen = []
+
+    def choose(q_arg, k_arg, v_arg, count):
+        seen.append(count)
+        return 2
+
+    monkeypatch.setattr(interface, "_sm90_blk64_auto_kv_splits", choose)
+    result = BSA.block_sparse_attention_forward(q, k, v, ids, 16, sparse_block_size=64, kv_splits="auto")
+    assert seen == [16]
+    torch.testing.assert_close(result["o_tensor"], expected["o_tensor"], atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(result["lse_tensor"], expected["lse_tensor"], atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
     ("sparse_block_size", "dtype", "q_value", "k_value"),
     [
         pytest.param(128, torch.float16, 10000.0, 10008.0, id="blk128-fp16-p-underflow"),

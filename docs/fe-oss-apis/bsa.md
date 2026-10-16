@@ -152,7 +152,15 @@ package-wide downstream dependency floor is unchanged.
 
 `kv_splits=2..256` computes FP32 partial outputs and combines them, with
 workspace growing linearly in the split count. SM90 accepts an explicit integer
-split count. The SM100/SM103 blk64 path also accepts `kv_splits="auto"`; CLC is
+split count or `kv_splits="auto"` (the default stays 1). On SM90 the split
+count is chosen so one split's K/V region of a head fits in about 3/4 of L2:
+once a head's K/V exceeds L2 the unsplit kernel turns DRAM-bound, and a split
+grid orders every Q tile of one KV range before the next. The BF16/FP16 MHA
+policy applies at one head per wave (`ceil(S_q / 64)` at least `3 * SMs`), at most 25% density and fixed
+counts, and declines (one split) otherwise; it was measured on H100 with
+independent random indices (64 MiB K/V per head: 2 splits, +20%; 128 MiB: 4,
++70%; 256 MiB: 8, +94%; dense lists lose 12%). A caller-provided output
+also resolves to one split. The SM100/SM103 blk64 path also accepts `kv_splits="auto"`; CLC is
 compatible with split execution. Pass `use_clc=True` to use persistent CLC
 scheduling with `kv_splits>1`, or `use_clc=False` to use one tile per CTA. The
 default `use_clc=None` keeps CLC disabled for split execution because the

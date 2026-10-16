@@ -212,8 +212,8 @@ def block_sparse_attention_forward(
     if sparse_block_size not in {64, 128}:
         raise ValueError("sparse_block_size must be 64 or 128")
     if arch_family == 9:
-        if isinstance(kv_splits, str) or not 1 <= int(kv_splits) <= 256:
-            raise ValueError("SM90 kv_splits must be an integer in [1, 256]")
+        if kv_splits != "auto" and (isinstance(kv_splits, str) or not 1 <= int(kv_splits) <= 256):
+            raise ValueError("SM90 kv_splits must be 'auto' or an integer in [1, 256]")
 
     if arch_family == 9:
         if head_dim not in {64, 96, 128} or value_dim not in {64, 96, 128}:
