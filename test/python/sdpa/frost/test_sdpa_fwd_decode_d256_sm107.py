@@ -1694,6 +1694,48 @@ def test_decode_adapter_routes_decode_shaped_graphs_only():
         api(s_q=5, H=24, KH=2, pack=True)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="check_support reads the device's compute capability")
+@pytest.mark.parametrize("shape", ["decode", "prefill"])
+def test_decode_q_tile_max_is_refused_off_cc_10_7_in_check_support_whatever_the_graph(monkeypatch, shape):
+    """``decode_q_tile_max`` caps the Rubin (cc 10.7) d256 decode route's width table, so on any other arch line it is a typed decline
+    at ``check_support`` -- once, before the decode route is consulted, whatever the graph.  The former refusal sat inside the route's
+    width lookup, after its early returns, so a graph that never consults the route on cc 10.7 (prefill-shaped, THD, quantized) carried
+    the knob silently on another line while a decode-shaped one declined.  The arch line is read through
+    ``torch.cuda.get_device_capability``, monkeypatched to cc 10.0 here so the cell runs on any CUDA device (the refusal is the first
+    check after that read): the decode-shaped graph (the 24/2 step, packed) and the prefill-shaped one (128 unpacked rows) both decline
+    naming the cap; without the cap neither names it."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 0))
+    B, S, H, KH = 2, 256, 24, 2
+    s_q, pack = (1, True) if shape == "decode" else (128, False)
+    dtype = torch.bfloat16
+
+    def api(**extra):
+        q_gpu = torch.randn(B, s_q, H, D, device="cuda", dtype=dtype).transpose(1, 2)
+        k_c = torch.randn(B, S, KH, D, device="cuda", dtype=dtype).transpose(1, 2)
+        v_c = torch.randn(B, S, KH, D, device="cuda", dtype=dtype).transpose(1, 2)
+        return SdpaFwdDslSm100(
+            sample_q=q_gpu,
+            sample_k=k_c,
+            sample_v=v_c,
+            sample_o=torch.empty_like(q_gpu),
+            sample_lse=torch.empty(B, H, s_q, device="cuda", dtype=torch.float32),
+            seq_kv_lens_present=False,
+            pack_gqa=pack,
+            **extra,
+        )
+
+    with pytest.raises(NotImplementedError, match=r"decode_q_tile_max=32 caps the Rubin \(cc 10.7\) d256 decode route") as e:
+        api(decode_q_tile_max=32).check_support()
+    assert "cc 10.0" in str(e.value), e.value
+    # without the cap the same graph's check_support never mentions the knob (whatever else the device's own checks say)
+    try:
+        api().check_support()
+    except Exception as other:  # noqa: BLE001 -- the host under test may not be a cc 10.0 part; only the cap's absence is pinned here
+        assert "decode_q_tile_max" not in str(other), other
+
+
 @_gpu
 def test_decode_adapter_dense_pack_and_split_follow_the_tile():
     """The standalone adapter on cc 10.7, DENSE cache (the form its former 'Rubin half PackGQA
