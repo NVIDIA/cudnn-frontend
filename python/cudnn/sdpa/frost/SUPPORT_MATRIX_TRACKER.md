@@ -2918,7 +2918,7 @@ past the table a packed group rides up to two units of it (24 / 2 at `S_q` 6 .. 
 16-column arm streamed the KV 12 times; 32 / 2 at `S_q` 5 .. 8 under `token_units`). **Eligibility (the adapter, every reader): the width's FORM predicate is ONE function,
 `config_sm107.decode_d256_wide_tile_admits(pack_g, paged, masked)` -- a packed group of >= 2 heads, and over a PAGED cache the causal / window
 mask (`MASK_CAUSAL | MASK_SWA`) -- read on the declaration by `SdpaFwdDslSm100._decode_q_tile_for` (`paged=self.paged`, `masked` = a right
-band or a left window declared, exactly `_mask_flags_from`), by the facts twins (`engines.decode_d256_q_tile_for_row(..., paged, masked)` /
+band or a left window declared, exactly `_mask_flags_from`), by the facts twins (`engines.decode_d256_q_tile_for_row(..., paged=, masked=)` /
 `_facts_decode_form`) and by the gated attention block's `decode_route` (always paged + bottom-right causal), and on the compiled record by
 `_validate_cfg_d256_decode_sm107` (the typed refusals of an unpacked / G 1 step and of a mask-free paged step stay; the form-matrix test pins
 the two readings' agreement).** So the dense paged d256 envelope of the Rubin row WIDENS for packed, masked steps only: 33 .. 64 packed rows
