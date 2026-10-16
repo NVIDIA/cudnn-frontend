@@ -1021,6 +1021,16 @@ def _bind_paged_kv(spec, frame: List[Any], ix: Dict[str, int], facts: Dict[str, 
     return t_kv
 
 
+def _capacity(f: BufferFacts, geo: Tuple[int, int, int, int], name: str) -> int:
+    """Token capacity of a packed operand under the resolved (ts, hs, es, row_span) geometry: the largest token whose row ends inside
+    the producer's span (0 when the span holds no whole row); a bare address (span unknown) is a typed decline -- the ragged legs
+    bound every row by the capacity, so an unsized buffer cannot be bound."""
+    if f.span < 0:
+        raise ValueError(f"cudnn.sdpa: {name} was passed as a bare address; a ragged operand needs a sized buffer")
+    ts, row = geo[0], geo[3]
+    return 0 if f.span < row else (f.span - row) // ts + 1
+
+
 def _packed_role(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], name: str, heads: int, d: int, expect: str, *, tma: bool):
     """One PACKED (THD) operand of the ragged-Q leg -- the graph's (B, H, S_max, D) declaration or a
     (T, H, D) buffer -- as ``(ptr, token_stride, head_stride, token_capacity)``.  The batch stride is
