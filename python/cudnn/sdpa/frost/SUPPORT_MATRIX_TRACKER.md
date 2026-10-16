@@ -1232,7 +1232,8 @@ queries, the fused gate, a paged decode without per-request KV lengths (no paddi
 (the frontier cells per geometry in both regimes, RED on the pre-arm tree).
 
 ᵐᵗᵖ **The MTP form on the Rubin decode tile: the 32-column tile in TOKEN UNITS
-(`config_sm107.decode_d256_q_tile`, `D256_DECODE_ROUTED_MAX_Q_ROWS = 32`,
+(`config_sm107.decode_d256_q_tile`, `D256_DECODE_ROUTED_MAX_Q_ROWS = 32` at the time -- 64 since the
+table-driven route of 2026-10-15 took the 64-column tile, see the block's DECODE section --,
 `D256_DECODE_ROUTED_MAX_TOKEN_UNITS = 2`).** The body of both decode twins gained a token-unit
 axis (`Q_TOKEN_UNITS`): a unit covers one Q box of `Q_BOX_TOKENS = N_Q // HEADS_PER_TILE`
 consecutive tokens, the host entry derives `ceil(S_q / Q_BOX_TOKENS)` units per (head group,
@@ -2792,10 +2793,15 @@ under the lengths form, and a block table WIDER than `max_pages` (`[2, 40]` at t
 the step's tokens written through, then stage (4) over the first `kv_lens[b]` keys of every sequence's `block_table` row --
 `seq_kv_lens = kv_lens`, `seq_q_lens = None`, the batch uniform, bottom-right causal -- on the Rubin d256 DECODE tile
 (`sm107/decode_d256_f16.py`: PackGQA over the whole group, the decode split model's split-KV with fp32 partials in the block's
-workspace and one combine launch, `fuse_gate` applied IN THE COMBINE), the same tile unpacked past the packed route (one head per
-CTA, `S_q <= 32`); a wider dense step is a typed decline at declaration (the adapter serves dense half queries over paged K / V
-on the decode tile only -- the paged prefill body is the EXTEND form's). `GatedAttentionBlockFwd.serving_envelope()` is the static record
-(forms, page sizes, pool layouts, the route per `(group, S_q)`). Validated on a Rubin development node (cc 10.7, 204 SMs;
+workspace and one combine launch, `fuse_gate` applied IN THE COMBINE) in ONE token unit where its single-unit width table holds the
+packed rows; past the table on the paged d256 PREFILL tile with the group packed where that tile packs the group AND the step fills
+the part (`B x H_kv >= DECODE_PREFILL_ROUTE_MIN_CTAS` = 64 CTAs: the prefill tile is one unsplit CTA per sequence and KV head, a
+5.6x loss at B 1 on the measured 32 / 2 `S_q` 8 cell), else the decode tile's token-unit and unpacked arms (the 2026-10-15 paragraph
+below: the table-driven route, the `decode_route_policy` knob; the 2026-10-16 sentence: the prefill route's fill; the served
+envelope `S_q <= 32` = `DECODE_MAX_ROWS` as before -- an MTP verify step of up to 8 tokens on the one- and two-stream routes, the decode
+tile UNPACKED past a group's packed routes, one head per CTA, up to 32 tokens); a step past 32 tokens is a typed decline at declaration
+(the `decode_rows` row: a longer dense step over the pools is the EXTEND form's packed business). `GatedAttentionBlockFwd.serving_envelope()` is the static record
+(forms, page sizes, pool layouts, the route per `(group, S_q)` and policy). Validated on a Rubin development node (cc 10.7, 204 SMs;
 functional cells, no perf claim; `test/python/gated_attention_block/cutedsl/test_block_serving_decode.py`) at a shrunk
 `d_model = 512` with `B = 4` batches holding one KV tile with a tail (`kv_lens` 100), the ring depth exactly (384), four tiles
 with a tail (500) and a PADDED entry (`kv_lens = 0`, block table row 0, slot -1) -- `out` within the dense suite's budget of the
@@ -2803,18 +2809,33 @@ per-sequence fp32 oracle (the block on the full sequence, its last `S_q` rows; t
 rows; cos > 0.999 on every live row, the padded entry's rows EXACTLY 0, block 0's bytes untouched), the compiled kernel pinned
 against the declared route (template, packing, split, `epilogue_gate` False):
 
-| group (`H_q / H_kv`) | `S_q = 1` | `S_q = 2` | `S_q = 3` | `S_q = 4` | `S_q = 5` | `S_q > 32` |
-|---|---|---|---|---|---|---|
-| 16 (32 / 2) | tile 16, packed, 1 unit ✅ | tile 32, packed, 1 unit ✅ | tile 32, packed, 2 units ✅ | tile 32, packed, 2 units ✅ | tile 16, UNPACKED (declared, unmeasured) ✅ | typed decline (the EXTEND form) |
-| 12 (24 / 2) | tile 16, packed, 1 unit ✅ | tile 32, packed, 1 unit ✅ | tile 32, packed, 2 units ✅ | tile 32, packed, 2 units ✅ | tile 16, UNPACKED (declared, unmeasured) ✅ | typed decline |
-| 8 (8 / 1) | tile 16, packed, 1 unit ✅ | tile 16, packed, 1 unit ✅ | tile 32, packed, 1 unit ✅ | tile 32, packed, 1 unit ✅ | tile 32, packed, 2 units (declared, unmeasured) ✅ | typed decline |
-| 6 (24 / 4) | tile 16, packed, 1 unit ✅ | tile 16, packed, 1 unit ✅ | tile 32, packed, 1 unit ✅ | tile 32, packed, 1 unit ✅ | tile 32, packed, 1 unit (declared, unmeasured) ✅ | typed decline |
-| 4 (4 / 1, the 397B TP 8 shard; 2026-10-13) | tile 16, packed, 1 unit ✅ (also at `d_model` 4096, page 64) | tile 16, packed, 1 unit ✅ | tile 16, packed, 1 unit ✅ | tile 16, packed, 1 unit ✅ | tile 32, packed, 1 unit (declared, unmeasured) ✅ | typed decline |
-| 16 (16 / 1, the 397B TP 2 shard, ONE KV head; 2026-10-13) | tile 16, packed, 1 unit ✅ (at `d_model` 4096, page 16) | the 32 / 2 row's route (declared; not re-run at 16 / 1) | same | same | same | typed decline |
+2026-10-16: the DECODE-GRID combine form (`sm100/split_combine._combine_decode_grid_kernel`, the split-aware form rule `heuristics.decode_combine_grid_selected` and the adapter's plan-time pin in `fwd/prepared.py`) is the cc 10.7 row's: off cc 10.7 the rule answers False and the plan pins the combine module's own three-way rule (the lean group, the serial walk and its decode form, with the attention-sink fold), measured on its own line; no capability field changes.
 
-The CLAIMED envelope (`DecodeRoute.claimed`) is the packed tile at `S_q <= 4`; the packed route reaches `S_q = 8` at 8 / 1,
-`S_q = 10` at 24 / 4 and `S_q = 16` at 4 / 1 and the unpacked tile `S_q = 32` at every group -- routed, declared by the envelope,
-correct on the cells run, unmeasured (the serving perf cells). The pool matrix on the decode tile (the three stride patterns holding the
+The route of record (2026-10-15, the fill 2026-10-16; the default policy `single_unit`; `tile N` = the Rubin d256 decode tile at N
+columns with the whole group packed, `T64 x 2` = two token units of the 64-column tile, `PREFILL` = the paged d256 prefill tile with the
+group packed -- taken where the step FILLS the part, `B x H_kv >= DECODE_PREFILL_ROUTE_MIN_CTAS` = 64 CTAs, with `T64 x 2` below that
+fill (written `PREFILL | T64 x 2`), `U16` / `U32` = the decode tile UNPACKED, one head per CTA; ✅ = a cell run against the per-sequence
+fp32 oracle on the development node, the PREFILL cells at 32 sequences and the two-unit cells at 4):
+
+| group (`H_q / H_kv`) | `S_q = 1` | `S_q = 2` | `S_q = 3` | `S_q = 4` | `S_q = 5` | `S_q = 6 .. 8` | `S_q = 9 .. 32` | `S_q > 32` |
+|---|---|---|---|---|---|---|---|---|
+| 16 (32 / 2) | tile 16 ✅ | tile 32 ✅ | tile 64 (`token_units`: tile 32 x 2 ✅) | tile 64 ✅ (`token_units`: tile 32 x 2 ✅) | PREFILL ✅ \| T64 x 2 ✅ (`token_units`: T64 x 2) | PREFILL ✅ at 8 (128 rows) \| T64 x 2 ✅ at 8 (`token_units`: T64 x 2) | U16 to 16 tokens ✅ at 12, U32 past (✅ at 32); 16 KV streams | typed decline (`decode_rows`: the EXTEND form) |
+| 12 (24 / 2) | tile 16 ✅ | tile 32 ✅ | tile 64 ✅ | tile 64 ✅ | tile 64 ✅ | T64 x 2 ✅ at 8 (2 streams) | T64 x 2 at 9 / 10, U16 / U32 past (12 streams) | typed decline |
+| 8 (8 / 1) | tile 16 ✅ | tile 16 ✅ | tile 32 ✅ | tile 32 ✅ | tile 64 ✅ | tile 64 ✅ at 8 | PREFILL to 16 \| T64 x 2 ✅ at 9 / 16 (`token_units`: T64 x 2), U32 past (8 streams) | typed decline |
+| 6 (24 / 4) | tile 16 ✅ | tile 16 ✅ | tile 32 ✅ | tile 32 ✅ | tile 32 ✅ | tile 64 (declared) | tile 64 to 10, T64 x 2 to 20, U32 past (6 streams) | typed decline |
+| 4 (4 / 1, the 397B TP 8 shard; 2026-10-13) | tile 16 ✅ (also at `d_model` 4096, page 64) | tile 16 ✅ | tile 16 ✅ | tile 16 ✅ | tile 32 ✅ | tile 32 (declared) | tile 64 to 16, PREFILL 17 .. 32 \| T64 x 2 ✅ at 17 / 32 (`token_units`: T64 x 2) | typed decline |
+| 16 (16 / 1, the 397B TP 2 shard, ONE KV head; 2026-10-13) | tile 16 ✅ (at `d_model` 4096, page 16) | the 32 / 2 row's route (declared; not re-run at 16 / 1; the fill at 64 sequences) | same | same | same | same | same | typed decline |
+| 32 (64 / 2) and 64 (128 / 2): no named model | tile 32 / tile 64 | tile 64 / PREFILL \| T64 x 2 | PREFILL \| T64 x 2 / U16 | PREFILL (128 rows) \| T64 x 2 / U16 | U16 (32 / 64 streams) | U16 | U16 / U32 | typed decline |
+
+`decode_q_tile_max=32` (the A/B's former-route arm) reads the same table without the 64-column width: 32 / 2 -- tile 16, tile 32,
+PREFILL x 6 (below the fill tile 32 x 2 at 3 / 4; `token_units`: tile 32 x 2 at 3 / 4, U16 at 5 .. 8); 24 / 2 -- tile 16, tile 32, tile 32 x 2,
+tile 32 x 2, U16 x 4 (12 streams); 8 / 1 -- tile 16, tile 16, tile 32, tile 32, PREFILL x 4 (below the fill tile 32 x 2; `token_units`: tile
+32 x 2); 24 / 4 -- tile 16, tile 16, tile 32, tile 32, tile 32, tile 32 x 2 x 3 -- at the fill the former rule value for value at every
+`(group, S_q <= 32)` (pinned host-side). The CLAIMED envelope
+(`DecodeRoute.claimed`) is the packed DECODE tile at `S_q <= 4` on a width up to 32 -- the measured cells (24 / 2 at every `S_q <= 4`
+under both policies, 32 / 2 at `S_q <= 2` under the default policy); every 64-column cell, every PREFILL-tile cell, the token-unit cells
+past `S_q = 4` and the unpacked arm are routed, declared by the envelope, correct on the cells run, unmeasured (the serving perf cells;
+the two routes' A/B is the MTP perf plan's). The pool matrix on the decode tile (the three stride patterns holding the
 same values BITWISE on `out`, each within the oracle's budget; `kv_lens` 200 / 0 / 77 / 1000 at 24 / 2, `S_q = 2`):
 
 | form | pool layout | page 16 | page 32 | page 64 | page 128 |
@@ -2857,7 +2878,88 @@ the route table -- its rows of the route table); 16 / 1 rides group 16's route w
 `S_q`, pinned on the CPU. The shards' `S_q > 1` decode steps and every page / layout cell beyond the ones named are functional
 claims only -- no perf claim before the serving perf cells land.
 
-Not served (typed declines by name; each lands with its accept cell and flips this section in the same change): an LSE / a sliding window or a right band / a `QsaSpec` / another head dim on the paged forms, a dense step wider than 32 rows (the DECODE form's `decode_rows` row: the EXTEND form's packed business), `save_for_backward` / `quant` on the paged forms, e4m3 pools (`kv_cache_dtype`) on the DENSE paged forms (served on the block-sparse decode mode at `S_q <= 4` and as the quantizing write-through on the dense prefill forms -- the e4m3 paragraph below), the write-through folded into the projection epilogue, `quant` / `save_for_backward` together with the write-through attribute; the DECODE form's `S_q > 4` arms and every page / layout cell above are functional claims only -- no perf claim before the serving perf cells land.
+**Changed 2026-10-16 -- the prefill route needs the step to FILL the part.**  The paged d256 prefill tile is ONE unsplit CTA per
+(sequence, KV head), so the default policy takes it only where `B x H_kv >= DECODE_PREFILL_ROUTE_MIN_CTAS` = 64 CTAs (or where no
+two-unit decode route holds the step: a cap that leaves none, 64 / 2 at `S_q` 1 under `decode_q_tile_max=32`); below the fill the step
+rides two token units of the decode tile, split over the part by the decode split model (which now prices the two units' shared KV
+stream once per split).  Measured on the Rubin performance class (212 SMs) at 32 / 2, `S_q = 8`, kv 32K: B 1 330.6 us on the prefill
+route against 58.7 on two 64-column units; B 32 (64 CTAs) 389.9 against 472.6.  `decode_route(batch=)` (appended) / `DecodeRoute.batch`
+(appended, a readback) carry the batch the route was decided at; the envelope's `routes` are the reading without a batch,
+`serving_envelope().decode.route(S_q, batch=)` the one at a batch.  No eligibility changes: every cell served before is served, on one
+of the two kernels that served it (the table above is the route of record; the 2026-10-15 paragraph below describes the rule without
+the fill).
+
+**Changed 2026-10-15 -- the DECODE route is TABLE-DRIVEN and the 64-column decode tile joined the table and is ROUTED** (one change in
+two steps the same day; the table above is the route of record).  The route (`decode_route(geometry, S_q, policy=, max_q_tile=)`,
+`GatedAttentionBlockFwd(..., decode_route_policy=, decode_q_tile_max=)`, `serving_envelope(..., decode_route_policy=, decode_q_tile_max=)`;
+`DecodeRoute.kv_streams` / `.policy` / `.prefill_tile` / `.q_tile_max` / `.pdl_capable` appended) reads ONE table,
+`config_sm107.D256_DECODE_SINGLE_UNIT_Q_TILES = (16, 32, 64)` -- the decode tile's single-unit widths, `D256_DECODE_ROUTED_MAX_Q_ROWS = 64`
+--, under ONE rule per policy.  `"single_unit"` (the default): packed rows `S_q x group` within a width ride the narrowest such width in ONE
+token unit (the KV streamed once per sequence and KV head); past the table the step rides the paged d256 PREFILL tile with the whole group
+packed (the EXTEND form's binding at the dense step's `(B, S_q)` envelope: the shared `sm100/prefill_d256_f16.py` body, paged THD, PackGQA,
+unsplit, `fuse_gate` in its epilogue -- one Q tile per sequence and KV head, the KV streamed once) wherever that body packs the group within
+its 128 rows (`DECODE_PREFILL_TILE_ROWS`: a group dividing 128 -- 16, 8, 4, 32, ...; the cc 10.7 paged THD leg takes whole-group PackGQA
+only); a group it cannot pack (12 = 24 / 2, 6 = 24 / 4 and 6 / 1), or a step past its 128 rows, keeps the decode tile's token-unit arm (up to
+two units of the 64-column tile: two streams) and the decode tile UNPACKED past that (one head per CTA, `group` streams; the 16-column tile
+to 16 tokens, the 32-column tile to 32) -- the fewest KV streams any kernel offers it today (a partial packing of the paged THD leg,
+gcd(group, 128) heads per row group, would cut 24 / 2 at `S_q` 11 .. 32 from 12 streams to 3; not wired on cc 10.7).  `"token_units"` is the
+SDPA adapter's own route verbatim (the widest admitted width in up to two token units for every packed group past the table, then the
+unpacked tile) -- the other arm of the A/B the MTP perf plan runs.  The served envelope is the former one, `1 <= S_q <= DECODE_MAX_ROWS =
+DECODE_MAX_S_Q = 32` (the unpacked arm's widest step; for part of the day the route declined `S_q > 8` and 128 packed rows, and the two
+constants read 8 and 128 -- restored the same day, the prefill route's bound renamed `DECODE_PREFILL_TILE_ROWS`); the claimed bound is
+`DECODE_CLAIMED_MAX_S_Q = 4` on a width up to `DECODE_CLAIMED_MAX_N_Q = 32`.  Typed declines: `S_q > 32` (`decode_rows`), a pinned
+`decode_split_kv > 1` on the prefill route (the paged body runs unsplit), a `decode_q_tile_max` held below the width an unpacked step
+needs (16 at 17 .. 32 tokens: the cap is honoured, never widened).  The 64-column width itself (`sm107/decode_d256_f16.py`: four 16-column
+softmax groups, 18 warps / 576 threads, 258 KiB of SMEM (264,080 B) in the oversized carveout, 256 TMEM columns, spill-free at ptxas's
+96-register cap on the admitted forms; `config_sm100.make_cfg_d256_decode(q_tiles=)` appended so the Rubin factory builds over its own
+width set, the SM100 factory unchanged at (16, 32)) takes a PACKED step of 33 .. 64 rows in ONE token unit where the 32-column tile cut it
+into two (24 / 2 at `S_q` 3 .. 5, 32 / 2 at `S_q` 3 / 4, 8 / 1 at `S_q` 5 .. 8, 24 / 4 at `S_q` 6 .. 10, 64 / 2 at `S_q` 2, 128 / 2 at `S_q` 1), and
+past the table a packed group rides up to two units of it (24 / 2 at `S_q` 6 .. 10 = 72 .. 120 rows, two streams, where the unpacked
+16-column arm streamed the KV 12 times; 32 / 2 at `S_q` 5 .. 8 under `token_units`). **Eligibility (the adapter, every reader): the width's FORM predicate is ONE function,
+`config_sm107.decode_d256_wide_tile_admits(pack_g, paged, masked)` -- a packed group of >= 2 heads, and over a PAGED cache the causal / window
+mask (`MASK_CAUSAL | MASK_SWA`) -- read on the declaration by `SdpaFwdDslSm100._decode_q_tile_for` (`paged=self.paged`, `masked` = a right
+band or a left window declared, exactly `_mask_flags_from`), by the facts twins (`engines.decode_d256_q_tile_for_row(..., paged=, masked=)` /
+`_facts_decode_form`) and by the gated attention block's `decode_route` (always paged + bottom-right causal), and on the compiled record by
+`_validate_cfg_d256_decode_sm107` (the typed refusals of an unpacked / G 1 step and of a mask-free paged step stay; the form-matrix test pins
+the two readings' agreement).** So the dense paged d256 envelope of the Rubin row WIDENS for packed, masked steps only: 33 .. 64 packed rows
+in one unit and 65 .. 128 in two (24 / 2 at `S_q` 5 .. 8, 32 / 2 at `S_q` 5 .. 8 and 64 / 2 at `S_q` 3 / 4 over a paged cache are served where
+they were a typed decline or the unpacked arm); a mask-free paged packed step and an unpacked step of 33 .. 64 tokens keep the (16, 32)
+route value for value; a dense (unpaged) packed step of 33 .. 64 rows rides the width with any mask. On the GRAPH path the cells past 32
+unpacked rows (4 / 2 at `S_q` 33 .. 64, 6 / 2 at 33 .. 42 over pages under a mask: the packed two-unit form, the unpacked arm past the
+32-column tile) are offered since the row's facts-only admission asks whether SOME packing rides the tile (`engines.mismatch(caps, facts,
+None)`; it asked the unpacked question alone until 2026-10-15 and dropped the row, so the ranked list offered nothing there while the
+adapter and the facts twins routed the packed form -- the packed knob set itself always passed); the list holds the packed set alone
+there, pinned host-side over a (group, S_q, paged, masked) grid and at the graph level in the Rubin decode suite. The route functions take the form
+(`decode_d256_q_tile(s_q, pack_g, max_token_units=None, *, paged=False, masked=True, max_q_tile=None)`, `decode_d256_single_unit_q_tile`,
+`decode_d256_route_widths`) and a CAP: `max_q_tile=32` is the route before the width landed, value for value (pinned against the shared
+SM100 rule with the Rubin constants at every `(S_q, group)`) -- surfaced as `SdpaFwdDslSm100(decode_q_tile_max=)` (appended; refused off
+cc 10.7) and `GatedAttentionBlockFwd(decode_q_tile_max=)` / `decode_route(max_q_tile=)` / `serving_envelope(decode_q_tile_max=)`
+(`DecodeRoute.q_tile_max` / `DecodeEnvelope.q_tile_max` read it back), a performance-only knob (the same function under every width: the
+SDPA suite's four-way bitwise pin -- one 64-column unit == two 32-column units == four 16-column units == the unpacked form, O and LSE -- and
+the block-level bitwise pin at the same split). `claimed` (the measured cells) is bounded by `DECODE_CLAIMED_MAX_N_Q = 32` too: a 64-column
+cell is routed and declared, never claimed, until its perf row lands (the `_Sdpa` stage pins the compiled WIDTH against the route at
+`compile()`, a drift the `kernel_template` pin could not see). Validated on a Rubin development node (cc 10.7, 204 SMs; functional, no
+perf claim; `test_sdpa_fwd_decode_d256_sm107.py`, `test_block_serving_decode.py`, `test_block_serving_mtp_route.py`): the 64-column
+one-unit forms at 24 / 2 `S_q` 3 .. 5 and 32 / 2 `S_q` 4 over dense padded and paged caches with per-batch Q lengths (the trim on the wide
+tile), paged == dense bitwise, the split forms recombining, capture + replay with new lengths, the block's oracle cells at every served
+group x `S_q` 1 .. 5 and the MTP cells (24 / 2 `S_q` 4 / 8 -- the two-unit 64-column form --, 32 / 2 `S_q` 4 / 5 / 8 -- the prefill route at 5
+and 8 --, 8 / 1 `S_q` 5 / 8, the unpacked arm at 32 / 2 `S_q` 12 and 32) with a padded entry, the prefill route vs the two-unit route at 32 / 2
+`S_q = 5` on IDENTICAL inputs (cos > 0.9999 between them), the gate in the paged body vs the separate launch, two launches bitwise, the
+workspace honest (the THD metadata inside), the FIRST execute of an `S_q = 8` step captured on a new stream with no warm-up under
+`set_sync_debug_mode("error")` and replayed bitwise over new lengths / tables / slots / inputs, the `decode_q_tile_max=32` arm bitwise
+the production route at the same split; host cells: the table, the rule, the route per policy at every served group and the corner
+groups, the unpacked fallback to 32 tokens and the decline past it, the declaration facts, the envelope per policy. The SM100
+decode twin carries the shared body's register trims (bitwise, except the FTZ max on a sub-normal score) and its cc 10.0 suite run is owed
+(Rule S6). Two more declaration knobs of the block's DECODE form the same day, neither an eligibility fact (Rule S2 exempt): `use_pdl=True`
+(programmatic dependent launch over the chain: the TMA norm + RoPE pass, the cache write, the sigmoid gate, the d256 decode tile and BOTH
+forms of the split combine take the launch attribute with their `griddepcontrol` pair; bitwise the plain chain; PER STAGE: a kernel
+without the sites -- the paged d256 prefill tile of the DECODE form's prefill route and of the EXTEND form -- launches plain and the
+link serializes, read back by `pdl_stages` / `use_pdl_effective` on the block, `DecodeRoute.pdl_capable` per route and `pdl_stages` on
+each form's envelope; the quantized, e4m3 and sparse pipelines decline the switch, typed) and `fuse_norm_rope_small_m` (at `B x S_q <= 128` a `fuse_norm_rope=True` declaration
+LOWERS stage (1) to the unfused chain -- `fuse_norm_rope_effective` reads it back; `True` keeps the fused fork for the A/B, and so does an
+explicit `fuse_cache_write=True`, the request for the arm that lives in the fork; `False` + `fuse_cache_write=True` is the typed decline).
+
+Not served (typed declines by name; each lands with its accept cell and flips this section in the same change): an LSE / a sliding window or a right band / a `QsaSpec` / another head dim on the paged forms, a dense step past `S_q = 32` tokens (the DECODE form's `decode_rows` row: the EXTEND form's packed business), a pinned split on the prefill route, `save_for_backward` / `quant` on the paged forms, e4m3 pools (`kv_cache_dtype`) on the DENSE paged forms (served on the block-sparse decode mode at `S_q <= 4` and as the quantizing write-through on the dense prefill forms -- the e4m3 paragraph below), the write-through folded into the projection epilogue, `quant` / `save_for_backward` together with the write-through attribute; the DECODE form's `S_q > 4` arms and every page / layout cell above are functional claims only -- no perf claim before the serving perf cells land.
 
 **Served since 2026-10-14 -- the BLOCK-SPARSE DECODE / extend-with-prefix mode** (`kv_source="paged"` on a dense `[B, S_q]`
 declaration of a `QsaSpec` geometry with `geometry.causal_bottom_right=True` + the pools' and the block table's samples, the table

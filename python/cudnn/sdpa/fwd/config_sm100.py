@@ -227,13 +227,13 @@ class TemplateParams:
     # specializations of one template, and an ungated module traces byte-identically to before the field existed.
     epilogue_gate: bool = False
     # Decode-shaped d256 f16/bf16 graphs (S_q * pack_g within the arch line's routed
-    # rows: D256_DECODE_ROUTED_MAX_Q_ROWS here, config_sm107's on cc 10.7, where the
-    # 32-column tile serves the MTP step in token units) lower onto
+    # rows: D256_DECODE_ROUTED_MAX_Q_ROWS here, config_sm107's table (16, 32, 64) on
+    # cc 10.7, where the 32- and 64-column tiles serve the MTP step in token units) lower onto
     # sm100/decode_d256_f16.py, the swap-AB tile: the KV tokens ride the MMA M axis
     # and the packed Q rows ride N, so the MMA and exp work scale with the LIVE
     # rows instead of a 128-row Q tile.  The value is the N extent the kernel is
-    # compiled for -- the rows of ONE token unit (16, or 32 at the template level
-    # and on the Rubin route, from decode_d256_q_tile); 0 = the prefill tile.
+    # compiled for -- the rows of ONE token unit (16; 32 at the template level, 32
+    # and 64 on the Rubin route, from decode_d256_q_tile); 0 = the prefill tile.
     # Plan-time only (S_q is a declared shape).
     decode_q_tile: int = 0
     # The 128-row DECODE tile (sm100/decode_d128_f16.py) for flavors that do not
@@ -1226,10 +1226,14 @@ _D256_DECODE_Q_TILES = (16, 32)
 # -12 % at b=4 x 128K).  D256_WIDE_DECODE_MIN_UNITS / D256_WIDE_DECODE_MIN_KV_TILES mark
 # that boundary (d256_wide_decode_launch); the Blackwell line routes S_q x G in
 # (16, 32] onto the wide tile for launches past it.  The Rubin line routes the
-# wide tile for every launch, in TOKEN UNITS of two tokens for the MTP step:
-# config_sm107.D256_DECODE_ROUTED_MAX_Q_ROWS (32) / D256_DECODE_ROUTED_MAX_TOKEN_UNITS
-# (2) and config_sm107.decode_d256_q_tile, measured on cc 10.7 against the prefill
-# body at the 24/2 geometry.
+# wide tile for every launch and its own 64-column tile, table-driven
+# (config_sm107.D256_DECODE_SINGLE_UNIT_Q_TILES = (16, 32, 64),
+# D256_DECODE_ROUTED_MAX_Q_ROWS = 64), in up to two TOKEN UNITS of the widest
+# admitted width for a packed MTP step past the table
+# (D256_DECODE_ROUTED_MAX_TOKEN_UNITS = 2, config_sm107.decode_d256_q_tile); the
+# 32-column two-unit form was measured on cc 10.7 against the prefill body at the
+# 24/2 geometry, the 64-column form on the Rubin performance class (its
+# per-width stream rates: heuristics._DECODE_TILE_COST_BY_Q_TILE_SM107).
 D256_DECODE_ROUTED_MAX_Q_ROWS = 16
 # The 16-column tile: one unit covers S_q x pack_g <= 16 rows (today's decode step).
 _D256_DECODE_NARROW_Q_TILE = 16
@@ -1358,12 +1362,15 @@ class CfgD256Decode:
     THREADS_PER_CTA: int = 6 * 32
 
 
-def _validate_cfg_d256_decode(cfg: CfgD256Decode) -> None:
+def _validate_cfg_d256_decode(cfg: CfgD256Decode, q_tiles: Tuple[int, ...] = _D256_DECODE_Q_TILES) -> None:
+    """``q_tiles`` (appended): the tile widths the CALLING arch line compiles -- the Blackwell set by default; the
+    cc 10.7 factory passes its own (config_sm107._D256_DECODE_Q_TILES_SM107, which adds the 64-column tile the 320 KiB
+    Rubin carveout holds).  Every other predicate is arch-neutral."""
     fp8 = cfg.DTYPE_QKV in (DTYPE_E4M3, DTYPE_E5M2)
     checks = (
         (not fp8, "d256 decode: f16/bf16 inputs only"),
         (cfg.DTYPE_O == cfg.DTYPE_QKV, "d256 decode: half input requires DTYPE_O == DTYPE_QKV"),
-        (cfg.N_Q in _D256_DECODE_Q_TILES, f"d256 decode: N_Q must be one of {_D256_DECODE_Q_TILES}"),
+        (cfg.N_Q in q_tiles, f"d256 decode: N_Q must be one of {q_tiles}"),
         (cfg.SOFTMAX_WARPS == 4 * (cfg.N_Q // 16), "d256 decode: 4 softmax warps per 16 Q columns"),
         (
             cfg.MMA_WARP_ID == cfg.SOFTMAX_WARPS and cfg.TMALDG_WARP_ID == cfg.SOFTMAX_WARPS + 1 and cfg.TOTAL_WARPS == cfg.SOFTMAX_WARPS + 2,
@@ -1372,7 +1379,10 @@ def _validate_cfg_d256_decode(cfg: CfgD256Decode) -> None:
         (cfg.THREADS_PER_CTA == 32 * cfg.TOTAL_WARPS, "d256 decode: THREADS_PER_CTA must be 32 * TOTAL_WARPS"),
         (cfg.TILE_N == 128, "d256 decode: the KV tile is the 128-lane TMEM layout"),
         (cfg.STAGES_KV >= 2, "d256 decode: the K/V ring needs at least K(t) and V(t) resident"),
-        (cfg.P_SWZ_BYTES == cfg.N_Q * cfg.BPE and cfg.P_SWZ_BYTES in (32, 64), "d256 decode: P^T row bytes must be the 32 B or 64 B swizzle atom"),
+        (
+            cfg.P_SWZ_BYTES == cfg.N_Q * cfg.BPE and cfg.P_SWZ_BYTES in (32, 64, 128),
+            "d256 decode: P^T row bytes must be the 32 B, 64 B or 128 B swizzle atom (N_Q x BPE)",
+        ),
         (not cfg.PACK_GQA or cfg.QH_PER_KH <= cfg.N_Q, "d256 decode: a packed head group must fit the Q tile"),
         (cfg.QH_PER_KH >= 1, "d256 decode: qh_per_kh must be >= 1"),
         (cfg.SPLIT_KV >= 1, "d256 decode: split_kv must be >= 1"),
@@ -1387,7 +1397,7 @@ def _validate_cfg_d256_decode(cfg: CfgD256Decode) -> None:
             raise ValueError(msg)
 
 
-def make_cfg_d256_decode(params: TemplateParams) -> Tuple[CfgD256Decode, TmaIters]:
+def make_cfg_d256_decode(params: TemplateParams, q_tiles: Tuple[int, ...] = _D256_DECODE_Q_TILES) -> Tuple[CfgD256Decode, TmaIters]:
     """Config for sm100/decode_d256_f16.py from the adapter's TemplateParams.
 
     Backstop only (see TemplateParams): the adapter selects this tile for
@@ -1395,6 +1405,12 @@ def make_cfg_d256_decode(params: TemplateParams) -> Tuple[CfgD256Decode, TmaIter
     prefill tile, so a ValueError here is an adapter gap, not a user error.
     ``cta_mma`` / ``sched_policy`` are accepted and unused — the decode tile
     is one cta_group::1 CTA per unit with nothing to schedule.
+
+    ``q_tiles`` (appended): the tile widths the calling arch line compiles.
+    The default is this line's ``_D256_DECODE_Q_TILES`` (16, 32: what 227 KiB
+    holds); ``config_sm107.make_cfg_d256_decode`` passes the Rubin set, which
+    adds the 64-column tile (four softmax groups, 258 KiB of SMEM under the
+    320 KiB Rubin carveout) and re-validates the record against its own facts.
     """
     if params.qsa_block_topk or params.qsa_block_size or params.qsa_softmax_groups:
         # Same decline as the prefill templates' _validate_params: an index-list record belongs to the cc 10.7 sparse
@@ -1403,8 +1419,8 @@ def make_cfg_d256_decode(params: TemplateParams) -> Tuple[CfgD256Decode, TmaIter
             f"d256 decode: qsa_block_topk={params.qsa_block_topk} / qsa_block_size={params.qsa_block_size} / qsa_softmax_groups={params.qsa_softmax_groups} "
             f"select the index-list sparse kernel; the decode tile does not consume them"
         )
-    if params.decode_q_tile not in _D256_DECODE_Q_TILES:
-        raise ValueError(f"d256 decode: decode_q_tile must be one of {_D256_DECODE_Q_TILES}; got {params.decode_q_tile}")
+    if params.decode_q_tile not in q_tiles:
+        raise ValueError(f"d256 decode: decode_q_tile must be one of {q_tiles}; got {params.decode_q_tile}")
     if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
         raise ValueError("d256 decode: f16/bf16 inputs only")
     if params.thd_varlen:
@@ -1448,7 +1464,7 @@ def make_cfg_d256_decode(params: TemplateParams) -> Tuple[CfgD256Decode, TmaIter
         PAGED_KV=int(params.paged_kv),
         PAGE_SIZE=int(params.page_size),
     )
-    _validate_cfg_d256_decode(cfg)
+    _validate_cfg_d256_decode(cfg, q_tiles)
     return cfg, _tma_iters(cfg)
 
 

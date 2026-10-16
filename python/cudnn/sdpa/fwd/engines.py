@@ -29,7 +29,7 @@ import inspect
 import logging
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Tuple
 
 import cudnn
 
@@ -530,17 +530,23 @@ def _thd_decode_leg(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> b
     return len(widths) == 1
 
 
-def decode_d256_q_tile_for_row(capabilities: Capabilities, s_q: int, pack_g: int, wide_launch: bool = False) -> int:
+def decode_d256_q_tile_for_row(capabilities: Capabilities, s_q: int, pack_g: int, wide_launch: bool = False, paged: bool = False, masked: bool = True) -> int:
     """The d256 decode tile's N extent (the Q rows of one token unit) a ROW routes ``s_q``
     tokens packed ``pack_g`` heads per token onto, or 0 for the prefill tile: the Rubin
-    row's rule (``config_sm107.decode_d256_q_tile``: the 32-column tile routed, two token
-    units for a packed MTP step) on cc 10.7, the Blackwell line's
-    (``config_sm100.decode_d256_q_tile``: the 16-column tile in one unit, and the
-    32-column one too for a ``wide_launch`` -- :func:`config_sm100.d256_wide_decode_launch`)
-    otherwise.  The facts-level twin of ``SdpaFwdDslSm100._decode_q_tile_for``'s arch
-    dispatch; the heuristics' decode geometry reads it too -- keep the three in lockstep."""
+    row's rule (``config_sm107.decode_d256_q_tile``, table-driven: the 32- and 64-column
+    tiles routed in one unit, then two token units of the widest admitted width for a packed
+    MTP step) on cc 10.7, the Blackwell line's (``config_sm100.decode_d256_q_tile``: the
+    16-column tile in one unit, and the 32-column one too for a ``wide_launch`` --
+    :func:`config_sm100.d256_wide_decode_launch`) otherwise.  ``wide_launch`` (appended) is
+    the Blackwell line's launch-size reading (:func:`d256_wide_decode_launch_for_facts`);
+    ``paged`` / ``masked`` (appended) are the graph's cache kind and causal / window mask --
+    the Rubin 64-column width's form predicate (``config_sm107.decode_d256_wide_tile_admits``)
+    declines a mask-free PAGED step, which keeps the (16, 32) table.  Each line reads its own
+    arguments only.  The facts-level twin of ``SdpaFwdDslSm100._decode_q_tile_for``'s arch
+    dispatch; the heuristics' decode geometry reads it too -- keep the three in lockstep
+    (:func:`_facts_decode_form` reads the two Rubin facts off ``SdpaGraphFacts``)."""
     if capabilities.sm_lo == 107:
-        return _config_sm107.decode_d256_q_tile(s_q, pack_g)
+        return _config_sm107.decode_d256_q_tile(s_q, pack_g, paged=bool(paged), masked=bool(masked))
     return decode_d256_q_tile(s_q, pack_g, wide_launch=wide_launch)
 
 
@@ -549,6 +555,19 @@ def d256_wide_decode_launch_for_facts(facts: "ga.SdpaGraphFacts", pack_g: int) -
     (heads / ``pack_g``) units over ``s_kv`` keys, never for a windowed graph.  The
     facts-level twin of ``SdpaFwdDslSm100._decode_q_tile_for``'s launch argument."""
     return d256_wide_decode_launch(facts.b, facts.h_q // max(1, pack_g), facts.s_kv, facts.window_left is not None)
+
+
+def _facts_decode_form(facts: "ga.SdpaGraphFacts") -> Tuple[bool, bool]:
+    """``(paged, masked)`` of a graph for :func:`decode_d256_q_tile_for_row`: the paged KV cache, and the causal /
+    window mask exactly as the kernels' MASK_CAUSAL / MASK_SWA bits derive (``config_sm100._mask_flags_from``: a right
+    band resolved -- ``right_bound`` 0 = causal, ``causal`` its effective reading -- or a left window)."""
+    return bool(facts.has_paged_kv), bool(facts.causal) or facts.right_bound is not None or facts.window_left is not None
+
+
+def _facts_decode_form_kw(facts: "ga.SdpaGraphFacts") -> dict:
+    """:func:`_facts_decode_form` as the ``paged`` / ``masked`` keywords of :func:`decode_d256_q_tile_for_row`."""
+    paged, masked = _facts_decode_form(facts)
+    return dict(paged=paged, masked=masked)
 
 
 def d256_decode_tile_selected(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", pack_g: int = 1, split_kv: Optional[int] = None) -> bool:
@@ -586,13 +605,37 @@ def d256_decode_tile_selected(capabilities: Capabilities, facts: "ga.SdpaGraphFa
         and gate_ok
         and not facts.attn_scale_prefolded
         and _selected_d_shape(capabilities, facts) == (256, 256)
-        and decode_d256_q_tile_for_row(capabilities, facts.s_q, pack_g, d256_wide_decode_launch_for_facts(facts, pack_g)) > 0
+        and decode_d256_q_tile_for_row(
+            capabilities, facts.s_q, pack_g, wide_launch=d256_wide_decode_launch_for_facts(facts, pack_g), **_facts_decode_form_kw(facts)
+        )
+        > 0
     )
 
 
 def _decode_tile_pack_g(facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs]) -> int:
     """The decode tile's packing for a knob set: the whole GQA ratio when it packs, else 1."""
     return (facts.h_q // facts.h_kv) if (knobs is not None and knobs.pack_gqa and facts.h_kv) else 1
+
+
+def _decode_tile_pack_g_choices(facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs]) -> Tuple[int, ...]:
+    """The packings a decode-tile question may assume: a knob set's own (:func:`_decode_tile_pack_g`); with NO knob set -- the
+    facts-only question the heuristics' ``_eligible`` asks before any set is built -- every packing SOME plan may carry: unpacked,
+    and the whole group where there is one.  A graph only the packed form serves (4 / 2 at ``S_q`` 33 over pages under the causal
+    mask: 66 packed rows = two 64-column units, while 33 unpacked rows are past the 32-column tile) therefore keeps its row on the
+    ranked list, where the heuristics propose the packed set (``_pack_gqa_eligible`` reads the same group) and ``mismatch`` declines
+    the unpacked one.  Until 2026-10-15 the facts-only reading asked the unpacked question alone and dropped the row, so the ranked
+    list offered nothing where the adapter and the facts twins routed the packed form -- the gate behind the graph-level pin of the
+    Rubin decode suite (``test_decode_routing_boundary``), which the host twin test there now pins over a grid."""
+    if knobs is not None:
+        return (_decode_tile_pack_g(facts, knobs),)
+    group = (facts.h_q // facts.h_kv) if facts.h_kv else 0
+    return (1, group) if (group > 1 and facts.h_q % facts.h_kv == 0) else (1,)
+
+
+def d256_decode_tile_served(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs], split_kv: Optional[int] = None) -> bool:
+    """:func:`d256_decode_tile_selected` for a knob set's own packing, or -- with no knob set -- for SOME plan: any packing of
+    :func:`_decode_tile_pack_g_choices` the row routes onto the tile."""
+    return any(d256_decode_tile_selected(capabilities, facts, pack_g, split_kv) for pack_g in _decode_tile_pack_g_choices(facts, knobs))
 
 
 def _decode_tile_split_kv(knobs: Optional[SdpaFwdKnobs]) -> Optional[int]:
@@ -1310,7 +1353,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         _gate_split = _decode_tile_split_kv(knobs)
         if _gate_split is None and facts.has_sink:
             _gate_split = 1
-        if facts.has_paged_kv and not d256_decode_tile_selected(capabilities, facts, _decode_tile_pack_g(facts, knobs), _gate_split):
+        if facts.has_paged_kv and not d256_decode_tile_served(capabilities, facts, knobs, _gate_split):
             return "the fused epilogue gate is not wired on the paged-KV flavor (only the d256 decode tile's split applies the gate in its combine; a sink never splits)"
         if not facts.epilogue_gate_shape_ok:
             return "the gate G must have exactly O's shape (B, H_q, S_q, D_v); a broadcast G is not fused"
@@ -1354,12 +1397,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         # graph is served paged whatever its THD-ness or sink.  Dense (non-THD) paged queries are
         # otherwise not wired on cc 10.7; the MXFP8 row answers through its own flags above.
         # api_dsl.check_support mirrors this (rule 8b).
-        if (
-            capabilities.sm_lo == 107
-            and not capabilities.is_mxfp8
-            and not facts.thd
-            and not d256_decode_tile_selected(capabilities, facts, _decode_tile_pack_g(facts, knobs))
-        ):
+        if capabilities.sm_lo == 107 and not capabilities.is_mxfp8 and not facts.thd and not d256_decode_tile_served(capabilities, facts, knobs):
+            # knobs None = the facts-only question: SOME packing rides the tile (the packed form alone past 32 unpacked rows)
             return "Rubin paged KV requires THD queries or a decode-shaped half D256 graph (the decode tile); dense paged queries are not wired on cc 10.7 otherwise"
         # Served by the PAGED_KV specialization of the f16/bf16 kernels on the
         # flavors in paged_d_shapes and of the d128 per-tensor FP8 kernel (the

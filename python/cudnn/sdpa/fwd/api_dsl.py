@@ -750,6 +750,17 @@ class SdpaFwdDsl(APIBase):
         sample_scale_o: Optional[torch.Tensor | TensorDesc] = None,
         ragged_divisors: Optional[tuple[int, int, int]] = None,
         ragged_offsets_int64: bool = False,
+        # APPENDED (2026-10-15): a CAP on the Rubin d256 decode tile's single-unit width table (config_sm107.D256_DECODE_SINGLE_UNIT_Q_TILES =
+        # (16, 32, 64)) for this plan -- None = the whole table; 32 = the route before the 64-column width landed (value for value).  A
+        # PERFORMANCE-ONLY knob (the same function under every width); read by _decode_q_tile_for.  Refused off cc 10.7 at check_support,
+        # whatever the graph (the table it caps is the Rubin lowering's); on cc 10.7 it has no effect on a graph that never consults the
+        # decode route (a prefill-shaped or THD graph, a quantized one) -- documented, not a decline.
+        decode_q_tile_max: Optional[int] = None,
+        # APPENDED: programmatic dependent launch -- the plan's kernels launch with the programmatic-stream-serialization attribute and
+        # carry the griddepcontrol pair (a wait before their first global read, a release after their prologue).  Performance-only:
+        # the same math, bitwise.  Served where the loaded kernel's compile() carries the knob (the cc 10.7 d256 decode tile and its
+        # split combine); a kernel without it is a typed decline at compile().
+        use_pdl: bool = False,
     ) -> None:
         """Capture the common SDPA operation and tuning contract.
 
@@ -893,6 +904,15 @@ class SdpaFwdDsl(APIBase):
         self.thd = bool(thd)
         self.ragged_divisors = (1, 1, 1) if ragged_divisors is None else tuple(int(m) for m in ragged_divisors)
         self.ragged_offsets_int64 = bool(ragged_offsets_int64)
+        self.decode_q_tile_max: Optional[int] = None if decode_q_tile_max is None else int(decode_q_tile_max)
+        if self.decode_q_tile_max is not None:
+            from cudnn.sdpa.fwd.config_sm107 import D256_DECODE_SINGLE_UNIT_Q_TILES as _widths
+
+            if self.decode_q_tile_max not in _widths:
+                raise ValueError(
+                    f"decode_q_tile_max must be one of {_widths} (the Rubin d256 decode tile's single-unit widths) or None; got {decode_q_tile_max}"
+                )
+        self.use_pdl = bool(use_pdl)
         # THD Stats declared WITHOUT ragged offsets: per-batch padded (b, s_max, h)
         # rows (FlashInfer's form). The kernel stores per batch; the adapter fills
         # the rows past each sequence's length with -inf, as the backend does.
@@ -1730,6 +1750,22 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # cc10.0 (SM100) and cc10.3 (Blackwell-class) both run these kernels; cc10.3
         # additionally has the fused LDTM.STAT row-max, auto-enabled for MXFP8 in compile().
         self._device_cc = (major, minor)
+        # The Rubin route's width cap is validated ONCE, here, before the early returns of _decode_q_tile_for: a cap on another arch line
+        # is a typed decline whatever the graph (the table it caps is the cc 10.7 lowering's), while on cc 10.7 a graph that never consults
+        # the decode route (prefill-shaped, THD, quantized) simply does not read it.
+        self._not_implemented_error_if(
+            self.decode_q_tile_max is not None and self._device_cc != (10, 7),
+            f"decode_q_tile_max={self.decode_q_tile_max} caps the Rubin (cc 10.7) d256 decode route's width table; this plan lowers for "
+            f"cc {major}.{minor}, whose decode tile has one routed width",
+        )
+        # The split combine's programmatic-dependent-launch form is wired on its sink-free dense half entries only (the sink entries
+        # carry no use_pdl): a split plan with an attention sink declares use_pdl=False -- refused HERE, before any entry is compiled,
+        # on every arch line (the same knob combination compile_ptr refuses; this is the typed decline a ranked plan must see).
+        self._not_implemented_error_if(
+            self.use_pdl and self.has_sink and self.split_kv > 1,
+            "use_pdl=True with an attention sink and split_kv > 1: the split combine's sink entries carry no programmatic-dependent-launch "
+            "form; declare use_pdl=False for this plan",
+        )
         paged_prefill_cga1 = supports_paged_prefill_cga1(
             (int(d_qk), int(d_v)),
             device_cc=self._device_cc,
@@ -2490,10 +2526,20 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             return 0
         pack_g = (int(h_q) // int(h_kv)) if self.pack_gqa else 1
         if self._device_cc == (10, 7):
-            # The Rubin route (config_sm107.decode_d256_q_tile): the 32-column tile is routed, in up to
-            # two TOKEN UNITS for a packed MTP step (S_q = 4 at 24/2 = two units of two tokens x 12
-            # heads); engines.decode_d256_q_tile_for_row is the facts-level twin of this dispatch.
-            return _decode_d256_q_tile_sm107(int(s_q), pack_g)
+            # The Rubin route (config_sm107.decode_d256_q_tile, table-driven): the 32- and 64-column tiles are routed in
+            # one token unit (the 64-column width for the forms its predicate admits -- a packed group over a dense cache,
+            # or over pages under the causal / window mask: the record's MASK_CAUSAL / MASK_SWA bits, read here off the
+            # declared band exactly as config_sm100._mask_flags_from derives them), then up to two TOKEN UNITS of the
+            # widest admitted width for a packed MTP step; decode_q_tile_max caps the table for this plan.
+            # engines.decode_d256_q_tile_for_row is the facts-level twin of this dispatch.
+            return _decode_d256_q_tile_sm107(
+                int(s_q),
+                pack_g,
+                paged=bool(self.paged),
+                masked=self.window_right is not None or self.window_left is not None,
+                max_q_tile=self.decode_q_tile_max,
+            )
+        # (a cap off cc 10.7 was refused once, in check_support, before this dispatch is reached)
         wide_launch = b is not None and s_kv is not None and d256_wide_decode_launch(int(b), int(h_q) // pack_g, int(s_kv), self.window_left is not None)
         return decode_d256_q_tile(int(s_q), pack_g, wide_launch=wide_launch)
 
@@ -2877,6 +2923,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # plan agrees on `has_amax`.
         self._kernel_accepts = None  # a (re)loaded module: re-read its signature
         _kc = self._kernel_compile_accepts()
+        if self.use_pdl and "use_pdl" not in _kc:
+            # Rule 1: a plan declared with the programmatic-dependent-launch form never runs a kernel that silently lacks it.
+            raise NotImplementedError(
+                f"use_pdl=True: the {self.kernel_template} kernel carries no programmatic-dependent-launch sites (served by the cc 10.7 "
+                "d256 decode tile and its split combine); declare use_pdl=False for this plan"
+            )
         # Explicit pointer/int host entry (the f16/bf16 SM100 / SM107 prefill templates): every
         # extent and stride is a runtime argument, so the compile key is layout-only and the
         # dense / THD launches bind pointers through cudnn.sdpa.fwd.prepared.
@@ -3010,6 +3062,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         if "ragged_i64" in accepted and self.thd_decode_leg:
             # The ragged-Q leg's offset read width (int32 or int64 offsets).
             kw["ragged_i64"] = self.ragged_offsets_int64
+        if "use_pdl" in accepted and self.use_pdl:
+            # The programmatic-dependent-launch form (the launch attribute + the griddepcontrol pair); compile() declined a kernel without the knob.
+            kw["use_pdl"] = True
         return kw
 
     def _build_prepared_specs(self) -> None:
