@@ -287,14 +287,18 @@ def test_the_prefill_route_step_is_bitwise_with_the_switch_and_its_first_execute
     assert torch.equal(a, b), f"out differs with use_pdl on the prefill route (max|diff| {(a.float() - b.float()).abs().max().item():.3e})"
     assert torch.equal(_bits(on.k_cache), _bits(off.k_cache)) and torch.equal(_bits(on.v_cache), _bits(off.v_cache)), "the write-through differs"
     assert torch.equal(b, on.run().clone()), "a second switched step is not bitwise the first"
-    # a stage forced to carry the switch onto a kernel without the sites: the adapter's typed decline, never a silent plain launch
-    forced = _Case(16, 5, _LENS, seed=0, blk_kw=dict(use_pdl=True))
+    # a stage forced to carry the switch onto a kernel without the sites: the adapter's typed decline, never a silent plain launch (at the
+    # fill: below it the same step rides the decode tile, which carries the sites, and the forced switch is simply the switch)
+    forced = _Case(16, 5, _LENS * 8, seed=0, blk_kw=dict(use_pdl=True, fuse_norm_rope=False))
+    assert forced.blk.decode_route.prefill_tile
     forced.blk._sdpa.use_pdl = True
     forced.blk._sdpa.check_support()
     with pytest.raises(NotImplementedError, match="programmatic-dependent-launch sites"):
         forced.blk._sdpa.compile()
-    # capture + replay of the FIRST execute of a fresh switched declaration (the same seed as `off`: identical inputs, pages, slots)
-    case = _Case(16, 5, _LENS, seed=0, blk_kw=dict(use_pdl=True))
+    # capture + replay of the FIRST execute of a fresh switched declaration (the same seed, lengths and declaration as `off`: identical
+    # inputs, pages, slots)
+    case = _Case(16, 5, _LENS * 8, seed=0, blk_kw=dict(use_pdl=True, fuse_norm_rope=False))
+    assert case.blk.decode_route.prefill_tile
     case.blk.check_support()
     case.blk.compile()
     case.ws = torch.empty(case.blk.get_workspace_size(), dtype=torch.uint8, device=_DEV)
