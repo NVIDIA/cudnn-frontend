@@ -59,6 +59,12 @@ requires_blackwell_geforce = pytest.mark.skipif(
     _SM is None or not (120 <= _SM <= 129),
     reason="needs an SM120-line GPU, have " + ("none" if _SM is None else f"sm_{_SM}"),
 )
+# The shared split combine (sm100/split_combine) has no arch-specific lowering:
+# the SM100 line and the SM120 split both launch it.
+requires_split_combine = pytest.mark.skipif(
+    _SM is None or not (100 <= _SM <= 129),
+    reason="needs an SM100- or SM120-line GPU, have " + ("none" if _SM is None else f"sm_{_SM}"),
+)
 # Rubin gate for the suites whose lowerings exist ONLY from cc 10.7 up (the
 # sm107 kernel trees; their engine rows declare sm_lo=107 / sm_hi=119, so the
 # marker mirrors that range rather than pinning (10, 7)).

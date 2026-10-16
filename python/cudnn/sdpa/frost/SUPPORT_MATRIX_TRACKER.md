@@ -633,7 +633,7 @@ binder hands the fp32 [H] logits to the combine, so a sink decode graph is no lo
 per (batch, KV head). A PADDED query row (past its batch's `seq_len_q`, the dense padded-Q trim) keeps O := 0 /
 LSE := −inf whatever the sink -- its partials equal a valid keyless row's, so a plan carrying `seq_len_q` also
 hands the combine the int32 Q lengths (`split_combine.compile_ptr(has_q_lens=True)`, the binder's
-`supports_combine_q_lens`) and the lean, serial and decode forms drop the sink for those rows. Validated on B200 (SM100): `test_sdpa_fwd_split_kv_sm100.py::test_split_kv_sink_matches_reference_dense`,
+`supports_combine_q_lens`) and the lean, serial, decode and half forms drop the sink for those rows. Validated on B200 (SM100): `test_sdpa_fwd_split_kv_sm100.py::test_split_kv_sink_matches_reference_dense`,
 `test_sdpa_fwd_decode_d128_sm100.py::test_decode_kernel_sink_split_kv` (dense and paged) /
 `test_graph_small_batch_decode_sink_splits_kv`, `test_sdpa_fwd_decode_d256_sm100.py::test_decode_graph_sink_small_batch_splits_and_recombines`
 / `test_decode_graph_sink_deep_split_keyless_rows`, `test_sdpa_split_combine_sm100.py::test_pointer_combine_folds_the_sink_once`;

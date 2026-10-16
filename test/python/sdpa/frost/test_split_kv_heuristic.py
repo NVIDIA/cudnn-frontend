@@ -628,6 +628,33 @@ def test_sm120_prices_a_verify_combine_per_sm120_tile():
     assert choose_split_kv(q_tiles=1, heads_q=8, kv_tiles=128, combine_rows=1024, **per_sm120_tile) == 8
 
 
+def test_sm120_half_row_prices_no_serial_combine_walk():
+    """The SM120 half row's partials take the combine's half form at every S_q, so the B200 serial-walk term
+    (``_SPLIT_KV_SERIAL_COMBINE_COST``) is not its price: charged, it stopped these verify steps a split short
+    (RTX 5080, 84 SMs, f16, b=1, d256 h=16/2 packed 8 -- one Q tile x 2 units over 64-key tiles, 64 combine
+    rows -- kernel time incl. the combine, warm L2):
+
+        S_q=4 S_kv=1k (16 tiles):  split 8 12.1 us, split 16 9.4 us
+        S_q=4 S_kv=4k (64 tiles):  split 16 19.7 us, split 32 14.1 us (split 64 19.0 us)
+    """
+    from cudnn.sdpa.fwd.heuristics import _SM120_SPLIT_KV_COMBINE_COST, _SM120_SPLIT_KV_COMBINE_FLOOR, _SM120_SPLIT_KV_MIN_TILES
+
+    sm120 = dict(
+        q_tiles=1,
+        heads_q=2,
+        batch=1,
+        sm_count=84,
+        combine_rows=64,
+        min_tiles=_SM120_SPLIT_KV_MIN_TILES,
+        combine_floor=_SM120_SPLIT_KV_COMBINE_FLOOR,
+        combine_cost=_SM120_SPLIT_KV_COMBINE_COST,
+    )
+    assert choose_split_kv(kv_tiles=16, **sm120) == 16
+    assert choose_split_kv(kv_tiles=64, **sm120) == 32
+    assert choose_split_kv(kv_tiles=16, serial_combine=True, **sm120) == 8
+    assert choose_split_kv(kv_tiles=64, serial_combine=True, **sm120) == 16
+
+
 # --- the d256 decode tile's own model ----------------------------------------
 #
 # sm100/decode_d256_f16.py runs one cta_group::1 CTA per (KV-head group, batch,

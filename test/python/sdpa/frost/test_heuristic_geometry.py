@@ -551,7 +551,9 @@ def test_paged_split_empty_declared_capacity_has_no_division():
     ],
 )
 def test_split_chooser_receives_the_row_cost_profile(monkeypatch, row, device_cc, sm_count, dtype):
-    """SM120 half hands its own split floor/coefficient to the shared chooser; FP8 and other rows keep the defaults."""
+    """SM120 half hands its own split floor/coefficient to the shared chooser and prices no serial combine walk (its half
+    partials take the combine's half form at every S_q); FP8 and other rows keep the defaults, the serial term included
+    at this S_q."""
     spec = next(s for s in ENGINE_SPECS if s.name == row)
     seen = []
     real = heur.choose_split_kv
@@ -578,3 +580,4 @@ def test_split_chooser_receives_the_row_cost_profile(monkeypatch, row, device_cc
         assert kw.get("min_tiles") == (heur._SM120_SPLIT_KV_MIN_TILES if sm120 else None)
         assert kw.get("combine_floor") == (heur._SM120_SPLIT_KV_COMBINE_FLOOR if sm120 else None)
         assert kw.get("combine_cost") == (heur._SM120_SPLIT_KV_COMBINE_COST if sm120 else None)
+        assert kw.get("serial_combine") is (not sm120)

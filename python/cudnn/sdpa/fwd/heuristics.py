@@ -228,9 +228,10 @@ _SM120_SPLIT_KV_COMBINE_FLOOR = 0.1
 # costs a tcgen05 one, so _SPLIT_KV_COMBINE_COST (B200) charged a verify step's combine -- S_q * H_q
 # rows, several waves -- up to a whole tile per partial and stopped splitting early: b=1 h=32/8 d128
 # S_q=32 S_kv=1k took split 2 at 31.7 us where split 8 runs 13.0 us (RTX 5080, 84 SMs). Fitted on a
-# 180-case ladder there (d64-d256, S_q 1-32, b 1/4/16, S_kv 1k-64k, 2026-10-14): mean regret 12.8% ->
-# 2.9%; any value in [0.0025, 0.0175] makes the same choices, and each of the 27 it moves lands on the
-# measured best. The batched shapes' remaining regret is the wave term's per-CTA cost, untouched here.
+# 180-case ladder there (d64-d256, S_q 1-32, b 1/4/16, S_kv 1k-64k, the combine's half form, no serial
+# term, 2026-10-15): mean regret 5.8% -> 0.9%; any value in [0.0025, 0.03] makes the same choices, and
+# each of the 23 it moves lands within 3% of the measured best. The remaining regret is the batched
+# shapes' (b 4/16, S_q 32): the wave term's per-CTA cost, untouched here.
 _SM120_SPLIT_KV_COMBINE_COST = 0.01
 # What ONE split adds to the combine's LATENCY, in the same units, when the
 # combine runs its serial one-warp-per-row form -- sm100/split_combine routes
@@ -255,7 +256,12 @@ _SPLIT_KV_SERIAL_COMBINE_COST = 0.1
 # split of serial combine is a third as many tile units.
 _SPLIT_KV_SERIAL_COMBINE_COST_QUANTIZED = 0.03
 # The S_q from which sm100/split_combine launches the serial combine; mirrors
-# its ``SQ <= ROWS_PER_BLOCK // 2`` routing (pinned by test_split_kv_heuristic).
+# its ``SQ <= ROWS_PER_BLOCK // 2`` routing of fp32 partials (pinned by
+# test_split_kv_heuristic).  Half partials take the half form at every S_q: the
+# SM120 half row prices no serial walk (_split_points); the other rows with half
+# partials -- the SM120 FP8 / MXFP8 splits, the SM100 MXFP8 d512 split, the
+# cc 10.7 flavors without an fp32 partial slot -- keep the serial price,
+# unmeasured against the half form.
 _SERIAL_COMBINE_MIN_SQ = 3
 
 
@@ -1911,7 +1917,12 @@ def _split_points(
                 if _sm120_half_row(caps)
                 else {}
             ),
-            serial_combine=facts.s_q >= _SERIAL_COMBINE_MIN_SQ,
+            # The SM120 half row's half partials take the combine's half form at every S_q
+            # (sm100/split_combine), never the serial walk this term prices; its per-wave price
+            # already carries the per-split growth.  The B200 term moved d256 S_q 4-16 at 1K-4K
+            # KV a split short of the measured best (1.13-1.39x slower, RTX 5080 split ladder;
+            # any serial price up to 0.02 KV tiles leaves every choice where it is without it).
+            serial_combine=facts.s_q >= _SERIAL_COMBINE_MIN_SQ and not _sm120_half_row(caps),
             serial_combine_cost=_SPLIT_KV_SERIAL_COMBINE_COST_QUANTIZED if (facts.is_fp8 or facts.is_mxfp8) else _SPLIT_KV_SERIAL_COMBINE_COST,
         )
 

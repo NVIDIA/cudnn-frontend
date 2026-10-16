@@ -429,10 +429,9 @@ def test_sm120_split_folds_the_sink_once(d, causal, pack_gqa, s_q, split_kv):
 @pytest.mark.parametrize("split_kv", [33, 64])
 @pytest.mark.parametrize("d", [64, 256])
 def test_sm120_split_past_one_warp_of_splits(d, split_kv):
-    """More splits than the lean combine group and than a warp has lanes: a
-    one-token row takes the combine's decode form, which strides the split axis
-    over warps and lanes.  gpt-oss decode: a packed GQA-8 group with a sink the
-    combine folds, over a long cache."""
+    """More splits than a warp has lanes: the combine's half form walks the
+    split axis in 32-split rounds.  gpt-oss decode: a packed GQA-8 group with a
+    sink the combine folds, over a long cache."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
 
     if torch.cuda.get_device_capability()[0] != 12:
