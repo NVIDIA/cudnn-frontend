@@ -949,7 +949,9 @@ def mamba2_setup_context(ctx, inputs, output):
         checkpoint_dtype,
     ) = inputs
     saved = [x, dt, A, B, C, cu_seqlens]
-    ctx.checkpoint_reuse = checkpoint_every_n_tokens > 0 and checkpoint_every_n_tokens % 128 == 0 and output[2].numel() > 0
+    ctx.checkpoint_reuse = (
+        checkpoint_every_n_tokens > 0 and checkpoint_every_n_tokens % 128 == 0 and output[2].numel() > 0 and checkpoint_dtype != torch.float32
+    )
     ctx.checkpoint_every_n_tokens = checkpoint_every_n_tokens if ctx.checkpoint_reuse else 0
     if ctx.checkpoint_reuse:
         saved.append(output[2])
@@ -1103,8 +1105,8 @@ def mamba2(
             ``final_state``, one entry per N tokens strictly before each sequence end; the FROST
             engine requires a positive multiple of the kernel chunk size, 128).  The series is a
             non-differentiable dump.
-        checkpoint_dtype: ``None`` stores io-dtype rows; ``torch.float32`` stores fp32 rows (the backward reuses io rows
-            at the chunk cadence and regenerates the dense series from any other rows).
+        checkpoint_dtype: ``None`` stores io-dtype rows; ``torch.float32`` stores fp32 rows for the caller.  The backward
+            reuses io rows at the chunk cadence, regenerates the dense series from coarser io rows and never keeps fp32 rows.
         dt_softplus: apply the softplus to ``dt + dt_bias`` (``False`` takes ``dt + dt_bias`` as is).
         dt_min, dt_max: clamp range for the transformed ``dt`` (``dt_max=None`` is unbounded); the
             gradient is zero where the clamp is active.

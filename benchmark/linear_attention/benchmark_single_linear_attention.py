@@ -726,6 +726,7 @@ else:
                     initial_state=state0,
                     output_final_state=output_final_state,
                     checkpoint_every_n_tokens=ckpt_tokens,
+                    checkpoint_dtype=torch.float32 if args.fp32_checkpoints else None,
                     batch_invariant=args.batch_invariant,
                 )
             else:  # gdn2

@@ -2721,9 +2721,9 @@ def test_bwd_checkpoint_reuse(backend, variant, K):
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_bwd_coarse_checkpoint_seeded_recompute(backend, variant, ckpt_mult, K, rows):
     """With a coarse checkpoint cadence the backward reconstructs the dense series by recompute started from the coarse
-    rows: from io-dtype rows (the default) the grads track the recompute path from a zero initial state within 2e-3, from
-    fp32 rows (``checkpoint_dtype``) they match it bitwise (Mamba-2 regenerates from the sequence start in both arms); both
-    arms batch-invariant."""
+    rows: from io-dtype rows (the default) the grads track the recompute path from a zero initial state within 2e-3; fp32
+    rows (``checkpoint_dtype``) are never kept for the backward, so that arm recomputes from the sequence start and matches
+    the dense path bitwise; both arms batch-invariant."""
     case = make_case(variant, torch.bfloat16, seq_lens=[497, 16, 1, 480, 0, 253], K=K)
     row_dtype = dict(checkpoint_dtype=torch.float32) if rows == "fp32" else {}
     grads_by_mode = []
@@ -2749,7 +2749,7 @@ def test_bwd_coarse_checkpoint_seeded_recompute(backend, variant, ckpt_mult, K, 
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_fp32_checkpoints_at_chunk_cadence(backend, variant, K):
     """``checkpoint_dtype=torch.float32`` stores fp32 rows at the chunk cadence: they round to the io-dtype rows bitwise, and
-    the backward, which regenerates the dense series from them instead of reusing them, matches the io-row path bitwise."""
+    the backward, which never keeps them and recomputes the dense series instead, matches the io-row path bitwise."""
     case = make_case(variant, torch.bfloat16, seq_lens=[497, 16, 1, 480, 0, 253], K=K)
     rows, grads_by_mode = [], []
     for dtype in (None, torch.float32):
