@@ -80,3 +80,10 @@ def test_frost_kernels_have_cudnn_name_prefix():
 def test_prefix_guard_covers_called_decorator_and_nested_kernel():
     tree = ast.parse("def outer():\n    @cute.kernel()\n    def missing():\n        pass\n")
     assert _missing_prefixes(tree) == ["3:outer.missing"]
+
+
+@pytest.mark.L0
+def test_state_snapshot_has_cudnn_name_prefix():
+    path = _REPO_ROOT / "python" / "cudnn" / "linear_attention" / "frost" / "common" / "state_snapshot.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    assert not _missing_prefixes(tree), "The state snapshot kernel needs its cuDNN name prefix"

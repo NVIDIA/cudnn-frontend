@@ -100,6 +100,12 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 
 ### Conventions for new tests
 
+- Coverage-shape selectors raise when they cannot select the requested schedule.
+  Only the device-dependent fixture may convert that error into a skip.
+  Fixed supported-device geometry tests must fail if a schedule becomes unavailable.
+  `linear_attention/test_gdn2_steep_decay.py::test_steep_schedule_geometry_rejects_missing_schedule`
+  disables DV splitting to check this boundary.
+
 - MXFP8 input does not imply three scale-factor buffers or one-byte V.
   The existing PV-BF16 specialization consumes only SF_Q/SF_K, keeps BF16
   V/O, and binds `sf_v_ptr=None` with a zero third SF tile count. Preserve

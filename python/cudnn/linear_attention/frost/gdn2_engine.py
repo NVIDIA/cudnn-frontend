@@ -265,6 +265,12 @@ class CompiledGdn2:
                 prefill_module = kernel_module
             self.tensormap_bytes = tensormap_workspace_bytes(prefill_module, B)
             regions.append(("tensormaps", layout.add(self.tensormap_bytes, align=128), "int64", (self.tensormap_bytes // 8,)))
+            seed = node.inputs.get("initial_state")
+            if self.has_final_state and not self.prep and seed is not None and (self.overwrite_initial_state or "state_indices" in node.inputs):
+                # The final state may overwrite the seeds (the graph contract, not this call's pointers: buffers can alias
+                # after warmup), so the prefill seeds from a copy its exact twin can reread (common/state_snapshot.py).
+                seed_name, seed_bytes = ("bfloat16", 2) if seed.get_data_type().name == "BFLOAT16" else ("float32", 4)
+                regions.append(("state_snapshot", layout.add(B * HO * V * K * seed_bytes, align=128), seed_name, (B, HO, V, K)))
         self.workspace_size = layout.size
         self.carve_names = [name for name, off, dt, shape in regions]
         self.carve = carve_plan(self.plan_name, [(off, dt, shape) for name, off, dt, shape in regions])
@@ -371,6 +377,7 @@ class CompiledGdn2:
             prep_words=region.get("prep_tensormaps"),
             prep_rows=region.get("prep_rows"),
             prep_row_count=region.get("prep_row_count"),
+            state_snapshot=region.get("state_snapshot"),
         )
         if self.uncut_launch is None:
             self.uncut_launch = self.build_uncut_forward(
@@ -634,6 +641,11 @@ class CompiledGdn2Bwd:
             if not self.has_state_checkpoints:
                 regions.append(("state_h", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape))
                 regions.append(("state_x", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape))
+        d_final = node.inputs.get("d_final_state")
+        if not self.chain and self.overwrite_initial_state and d_final is not None:
+            # d_initial_state overwrites d_final_state: the bprop reads a copy so its exact twin can redo it.
+            d_name, d_bytes = ("bfloat16", 2) if d_final.get_data_type().name == "BFLOAT16" else ("float32", 4)
+            regions.append(("dstate_snapshot", layout.add(B * HO * V * K * d_bytes, align=128), d_name, (B, HO, V, K)))
         self.order_in_recompute = not self.has_state_checkpoints
         self.workspace_size = layout.size
         self.carve_names = [name for name, off, dt, shape in regions]
@@ -759,6 +771,7 @@ class CompiledGdn2Bwd:
                 scheduler_bwd=region["scheduler_bwd"],
                 recompute_words=region.get("recompute_tensormaps"),
                 bprop_words=region["bwd_tensormaps"],
+                dstate_snapshot=region.get("dstate_snapshot"),
             )
             schedule = dict(
                 b_t=self.b_t,

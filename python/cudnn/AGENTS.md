@@ -768,3 +768,40 @@ entries, and normalize over retained slots after summing heads. Never reuse
 compacted training indices as the caller-visible target order. Detector:
 `deepseek_sparse_attention/cutedsl/test_DSA_training.py::test_native_training_and_original_score_slots`
 checks holes, duplicates, bounded lengths, all-masked rows and target alignment.
+
+## Linear-attention decay factorisation range
+
+A chunk kernel that splits a decay `2^(g[t] - g[s])` into `exp2(+g[t])` on one MMA
+operand and `rcp(exp2(g[s]))` on the other is exact only while each factor stays
+in the operand's range: an in-tile log2 prefix of -126 with bf16 operands (`exp2`
+goes subnormal, `rcp(..., ftz=True)` returns inf, `0 * inf` is NaN), and about -16
+with fp16 operands (`k * 2^-g` overflows). Both lie inside the documented gate range,
+`alpha = exp(g)` in (0, 1], and a test drawing `alpha` from `uniform(0.5, 1)` misses them.
+
+- Route such tiles through `linear_attention/frost/common/steep_decay.py`, which keeps every
+  exponent at `g[t] - g[s] <= 0`. Its module docstring holds the dispatch and
+  synchronisation invariants.
+- Keep the exact path out of the fast kernel. Compiled in behind a never-taken branch,
+  it cost the backward 13%.
+- Bound the inverse operand with the key magnitude as well as the gate prefix:
+  unnormalized `k=5` overflows fp16 at a prefix of -13.75.
+- Sum individual token logs over the interval. Never subtract inclusive fp32 prefixes:
+  a -1e8 gate erases the following -1 gates from both.
+- Reduce corrections in a fixed order, including when several channels are steep.
+- Use `encode_gate_exchange` for scan classification and exchange encoding. Keep stage selection and
+  barriers in each schedule. Share gate scans and recompute/summary operand construction through
+  the `@cute.jit` stages in `common/gdn2_operands.py`. Size scratch with `common/steep_scratch.py` for both separate forward
+  arrays and backward bank-fill regions; check bank-fill capacity before compilation.
+- An exact relaunch must not read what the fast launch wrote. Seed overwrite-capable plans
+  from a state snapshot (`common/state_snapshot.py`), chosen from the graph contract, never
+  from first-call pointer equality: a graph can bind separate state buffers at warmup and
+  alias them later. A forward graph without a final-state output cannot overwrite its seeds;
+  indexed input pools in such graphs need no snapshot.
+
+Detectors, all in `linear_attention/test_gdn2_steep_decay.py`: `test_fwd_bwd_steep_channel_decay`
+(and its fp16 twin), `test_fp16_inverse_range_without_normalization`,
+`test_multiple_steep_channels_are_repeatable`, `test_forward_state_alias_after_graph_warmup`,
+`test_steep_channel_decay_overwrite_initial_state`, `test_read_only_state_pool_needs_no_snapshot`, `test_strided_state_overwrite` and
+`test_steep_summary_matches_reference`. Scratch bounds are checked by
+`linear_attention/test_gdn2_steep_scratch.py`; `test_steep_schedule_geometry` checks schedule case
+selection across SM counts without changing the kernel launch limits.
