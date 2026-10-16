@@ -578,11 +578,13 @@ def test_decode_tile_rubin_widths_are_priced_by_their_measured_stream_rates():
     64-column 1.55-1.60 -- so the model prices a lone CTA's tile at 1.0 / 1.1 / 1.65 by
     width there (the 32-column tile is NOT the Blackwell line's issue-bound 1.6x), and one
     64-column unit costs three quarters of two 32-column units on the same KV range.  What
-    the 32-column price decides: the two-unit 32-column route of the B 32 x kv 32K MTP step
-    (128 units x 256 tiles) stays UNSPLIT -- measured 277.6 us unsplit against 307.8 at
-    split 2 -- where the Blackwell constant split it; the B 128 x kv 4K two-unit form
-    (512 units) likewise.  ``device_cc=None`` reads the Rubin table (the only line that
-    routes a width past 16; the 16-column tile costs 1.0 on both)."""
+    the 32-column price decides: 128 CTAs of the 32-column tile over 256 tiles, priced as
+    128 single units, stay UNSPLIT -- the Blackwell constant split them -- and so do 512 of
+    them over 32 tiles.  (The B 32 x kv 32K MTP step's two-unit 32-column route IS those 128
+    CTAs, but its two units per (sequence, KV head) share one KV stream per split: priced
+    that way, the test below, it splits to the measured optimum.)  ``device_cc=None`` reads
+    the Rubin table (the only line that routes a width past 16; the 16-column tile costs 1.0
+    on both)."""
     from cudnn.sdpa.fwd.heuristics import _decode_tile_cost_for
 
     assert [_decode_tile_cost_for(w, (10, 7)) for w in (16, 32, 64)] == [1.0, 1.1, 1.65]
@@ -593,6 +595,65 @@ def test_decode_tile_rubin_widths_are_priced_by_their_measured_stream_rates():
     assert _decode_tile(512, 4096, sm_count=212, q_tile=32) == 1
     # the serving shape's 32-column one-unit form (S_q 2 x 16:1 at B 32) still splits once -- on the stream rate, not the launch
     assert _decode_tile(64, 4096, sm_count=212, q_tile=32, launch_cost=0.0) == 2
+
+
+def test_decode_tile_two_unit_routes_share_one_kv_stream_per_split():
+    """A route in TWO token units (the MTP step past a width's packed rows: two CTAs per (sequence,
+    KV head, split), each a slice of the tokens) streams the SAME KV range from both units, so a
+    wave of its CTAs carries half as many HBM streams as it has CTAs -- the model prices a wave by
+    its UNIQUE streams (``token_units``, the units of one (sequence, KV head) counted once per
+    split), never below a lone CTA's rate, and the CTA waves themselves stay what they are.
+
+    Measured on the Rubin performance class (212 SMs), the B 32 x kv 32K MTP step on the two-unit
+    32-column route (128 CTAs x 256 tiles, two units per KV head) at forced splits: 277.6 us unsplit,
+    307.8 at 2, 219.4 at 3, 249.1 at 4 -- the order 3 < 4 < 1 < 2.  Priced as 128 single units the
+    model had unsplit leading (283.8 against 293.8 at 3 and 383.2 at 2): the cost of a wave of
+    shared streams was counted as two waves' worth of HBM.  With the sharing the costs order as the
+    measurement does and the pick is 3 (one wave of UNIQUE streams: 384 CTAs, 192 streams) in both
+    regimes; a deeper split, whose unique streams spill past one wave of SMs, is outside what was
+    measured for a two-unit route and is not taken until it is.  ``token_units=1`` (the default) is
+    the single-unit pricing exactly: every single-unit pick is unchanged by naming it."""
+    import cudnn.sdpa.fwd.heuristics as heur
+
+    two = dict(units=128, kv_tiles=256, sm_count=212, tile_cost=1.1, launch_cost=0.0, grid=(32, 24, 4), q_tile=32)
+    c = {s: heur._decode_tile_cost(s, token_units=2, **two) for s in (1, 2, 3, 4)}
+    assert c[3] < c[4] < c[1] < c[2], c  # measured 219.4 < 249.1 < 277.6 < 307.8 us
+    one = {s: heur._decode_tile_cost(s, **two) for s in (1, 2, 3, 4)}  # the same CTAs priced as 128 single units: unsplit leads
+    assert one[1] < one[3] < one[4] < one[2] and one[1] == heur._decode_tile_cost(1, token_units=1, **two), one
+    cell = dict(units=128, s_kv=32768, sm_count=212, q_tile=32, combine_grid=(32, 24, 4))
+    assert _decode_tile(token_units=2, **cell) == 3 and _decode_tile(token_units=2, launch_cost=0.0, **cell) == 3
+    assert _decode_tile(**cell) == 1 and _decode_tile(launch_cost=0.0, **cell) == 1  # priced single-unit: the former reading
+    assert _decode_tile(token_units=2, sm_count=204, units=128, s_kv=32768, q_tile=32, combine_grid=(32, 24, 4)) == 3
+    # the measured regime of a two-unit route: its unique streams within one wave of SMs
+    inside = heur.decode_tile_split_inside_measured_waves
+    assert inside(3, units=128, sm_count=212, token_units=2) and not inside(4, units=128, sm_count=212, token_units=2)
+    assert inside(1, units=128, sm_count=212, token_units=1) and not inside(2, units=128, sm_count=212, token_units=1)
+    assert inside(2, units=256, sm_count=212, token_units=1) and not inside(
+        4, units=256, sm_count=212, token_units=1
+    )  # the measured floor of a launch past one wave
+    assert inside(1, units=0, sm_count=212, token_units=1)
+    # the single-unit picks are untouched by the parameter (its default): a sweep of the measured cells, both regimes
+    for units, s_kv, q_tile, grid in (
+        (64, 32768, 64, (32, 24, 4)),
+        (2, 32768, 16, (1, 24, 1)),
+        (8, 131072, 16, (4, 24, 1)),
+        (256, 4096, 64, (128, 24, 4)),
+        (64, 4096, 16, (32, 32, 1)),
+    ):
+        for lc in (17.0, 0.0):
+            kw = dict(sm_count=212, q_tile=q_tile, combine_grid=grid, launch_cost=lc)
+            assert _decode_tile(units, s_kv, token_units=1, **kw) == _decode_tile(units, s_kv, **kw) == _decode_tile(units, s_kv, token_units=0, **kw), (
+                units,
+                s_kv,
+            )
+    # the 24/2 MTP steps in two units of the 64-column tile (S_q 6 .. 8: 128 CTAs at B 32) price the same way at 212 SMs: the pick
+    # is within one wave of unique streams and a member of the ladder
+    for s_kv in (4096, 32768, 131072):
+        pick = _decode_tile(128, s_kv, sm_count=212, q_tile=64, combine_grid=(32, 24, 8), token_units=2)
+        assert inside(pick, units=128, sm_count=212, token_units=2) and pick in heur.decode_tile_split_candidates(sm_count=212, kv_tiles=s_kv // 128), (
+            s_kv,
+            pick,
+        )
 
 
 def test_decode_tile_saturated_launch_never_splits():

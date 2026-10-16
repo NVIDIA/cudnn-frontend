@@ -788,7 +788,7 @@ def _sm_count():
     return torch.cuda.get_device_properties(0).multi_processor_count
 
 
-def _assert_decode_tile_plan(plan, *, G, units=None, kv_tiles=None, replay=False, gated=False, q_tile=16, grid=None):
+def _assert_decode_tile_plan(plan, *, G, units=None, kv_tiles=None, replay=False, gated=False, q_tile=16, grid=None, token_units=1):
     """The SM100 suite's policy on the Rubin row, now that it claims PackGQA + split-KV on the tile
     (the inversion of the former unpacked / unsplit pin): the plan is PACKED exactly when there is a
     group to pack (``G > 1``; MHA stays the bit-exact unpacked fold) and, for a shape the decode split
@@ -801,12 +801,19 @@ def _assert_decode_tile_plan(plan, *, G, units=None, kv_tiles=None, replay=False
     (batch x head groups x units per group); ``q_tile`` is the tile's N extent the model costs (32 on
     the Rubin MTP forms); ``grid`` = ``(B, H_q, S_q)`` of the graph, REQUIRED with ``units``: the
     combine's grid decides which combine kernel the launch takes and so the model's price for the
-    combine -- the adapter passes it, so the readback must."""
+    combine -- the adapter passes it, so the readback must; ``token_units`` the units per (head group, batch) that ``units``
+    counts (the adapter passes it too: the units of one (sequence, KV head) share one KV stream per split)."""
     assert (plan.knobs.pack_gqa is True) == (G > 1), (G, plan.knobs)
     if units is not None:
         assert grid is not None, "a model-evaluating pin names the graph's (B, H_q, S_q): the combine grid is a model input"
         want = choose_decode_tile_split_kv(
-            units=units, kv_tiles=kv_tiles, sm_count=_sm_count(), q_tile=q_tile, combine_grid=tuple(grid), **({"launch_cost": 0.0} if replay else {})
+            units=units,
+            kv_tiles=kv_tiles,
+            sm_count=_sm_count(),
+            q_tile=q_tile,
+            combine_grid=tuple(grid),
+            token_units=token_units,
+            **({"launch_cost": 0.0} if replay else {}),
         )
         if gated:
             want = max(want, 2)
@@ -986,11 +993,12 @@ def test_decode_graph_mtp_qwen_24_2_splits_in_token_units(monkeypatch, s_q):
     the 32-column tile's cost -- the fp32 partials of every token unit recombined by the shared
     combine against the reference."""
     _pin_route_max_32(monkeypatch)
-    units = 2 * 2 * -(-s_q // 2)
+    tok_units = -(-s_q // 2)
+    units = 2 * 2 * tok_units
     plan = _run_graph(B=2, H=24, KH=2, s_q=s_q, lens=[4096, 4096], page=0, padded=False, causal_br=True, dtype=torch.bfloat16)
-    _assert_decode_tile_plan(plan, G=12, units=units, kv_tiles=32, q_tile=32, grid=(2, 24, s_q))
+    _assert_decode_tile_plan(plan, G=12, units=units, kv_tiles=32, q_tile=32, grid=(2, 24, s_q), token_units=tok_units)
     plan = _run_graph(B=2, H=24, KH=2, s_q=s_q, lens=[4000, 1000], page=16, causal_br=True, dtype=torch.bfloat16)
-    _assert_decode_tile_plan(plan, G=12, units=units, kv_tiles=32, q_tile=32, grid=(2, 24, s_q))
+    _assert_decode_tile_plan(plan, G=12, units=units, kv_tiles=32, q_tile=32, grid=(2, 24, s_q), token_units=tok_units)
     if (plan.knobs.split_kv or 1) == 1:
         plan = _run_graph(B=2, H=24, KH=2, s_q=s_q, lens=[4000, 1000], page=16, causal_br=True, dtype=torch.bfloat16, split_kv=4)
         assert (plan.knobs.split_kv or 1) == 4, plan.knobs
@@ -1136,7 +1144,7 @@ def test_decode_graph_token_units_at_the_other_geometries_split_in_token_units(m
     _pin_route_max_32(monkeypatch)
     units = 2 * KH * 2
     plan = _run_graph(B=2, H=H, KH=KH, s_q=s_q, lens=[4000, 1000], page=16, causal_br=True, dtype=torch.bfloat16)
-    _assert_decode_tile_plan(plan, G=H // KH, units=units, kv_tiles=32, q_tile=32, grid=(2, H, s_q))
+    _assert_decode_tile_plan(plan, G=H // KH, units=units, kv_tiles=32, q_tile=32, grid=(2, H, s_q), token_units=2)
     if (plan.knobs.split_kv or 1) == 1:
         plan = _run_graph(B=2, H=H, KH=KH, s_q=s_q, lens=[4000, 1000], page=16, causal_br=True, dtype=torch.bfloat16, split_kv=4)
         assert (plan.knobs.split_kv or 1) == 4, plan.knobs

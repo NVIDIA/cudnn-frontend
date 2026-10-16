@@ -634,20 +634,71 @@ def _decode_tile_cost(
     launch_cost: float,
     grid: Optional[Tuple[int, int, int]] = None,
     q_tile: int = 16,
+    token_units: int = 1,
 ) -> float:
-    streams = units * split
+    ctas = units * split
+    shared = max(1, int(token_units))
     saturation = _DECODE_TILE_SATURATION_FRACTION * sm_count
     # The wave term: a CTA streams its KV chunk serially, so the launch takes every FULL wave of
-    # sm_count streams at the HBM-saturated rate (1 / SATURATION per tile) plus its TAIL wave at
-    # the tail's own stream count -- never below a lone CTA's rate.  Within one wave this is the
-    # saturation term alone; past it, the tail is charged as the wave it is (256 CTAs on 212 SMs
-    # cost two waves of streaming, not 1.2), which is what the measured two-wave trap shows.
-    full_waves, tail = divmod(streams, sm_count)
-    per_cta = full_waves / _DECODE_TILE_SATURATION_FRACTION + (max(tile_cost, tail / saturation) if tail else 0.0)
+    # sm_count CTAs plus its TAIL wave, each wave at the rate its UNIQUE KV streams set against the
+    # saturation point -- never below a lone CTA's rate.  The token units of one (sequence, KV
+    # head) read the SAME KV range (one HBM stream per split for the pair; the twin's reads are
+    # L2 hits), so a wave of sm_count CTAs on a two-unit route carries sm_count / 2 streams: a
+    # single-unit wave past the saturation point runs at 1 / SATURATION per tile (the measured
+    # two-wave trap: 256 CTAs on 212 SMs cost two waves of streaming, not 1.2), a two-unit wave of
+    # 212 CTAs at 106 streams runs at the lone rate (the measured two-unit MTP step: 384 CTAs at
+    # split 3, 192 streams, in 219 us where the single-unit pricing of the same CTAs said 294).
+    full_waves, tail = divmod(ctas, sm_count)
+    full_rate = max(tile_cost, (sm_count / shared) / saturation)
+    tail_rate = max(tile_cost, (tail / shared) / saturation)
+    per_cta = full_waves * full_rate + (tail_rate if tail else 0.0)
     cost = (_ceil_div(kv_tiles, split) + _decode_tile_cta_cost_for(q_tile)) * per_cta
     if split > 1:
         cost += _decode_tile_combine_cost(split, grid=grid) + launch_cost
     return cost
+
+
+# The measured floor of a launch that is already past one wave of SMs unsplit (256 units on a
+# 212-SM part): the Rubin performance class ran the B 128 x kv 4K MTP step on the 64-column tile
+# at splits 1 / 2 / 3 / 4 / 6 / 8 and found the floor at 2-3 (120.8 us at 2 against 125.9 unsplit,
+# 156 and 169 at 6 / 8), so a split up to this many is inside the measured regime there.
+DECODE_TILE_MEASURED_WAVE_FLOOR = 2
+
+
+def decode_tile_split_inside_measured_waves(split: int, *, units: int, sm_count: int, token_units: int = 1) -> bool:
+    """Whether ``split`` keeps a launch of ``units`` CTAs (before the split) inside the regime the
+    wave term was measured in: within one wave of SMs (``units x split <= sm_count``: the
+    saturation regime, every B 1 / B 4 / B 32 optimum), or -- on a route in several token units --
+    within one wave of UNIQUE KV streams (the two-unit MTP step's optimum, 384 CTAs sharing 192
+    streams), or, for a launch already past one wave unsplit, up to the measured floor
+    :data:`DECODE_TILE_MEASURED_WAVE_FLOOR`.  Past it the model's wave arithmetic extrapolates:
+    many waves of short CTAs, which no row has measured yet."""
+    if units <= 0 or sm_count <= 0:
+        return True
+    ctas = int(units) * int(split)
+    if ctas <= sm_count or ctas / max(1, int(token_units)) <= sm_count:
+        return True
+    return units > sm_count and int(split) <= DECODE_TILE_MEASURED_WAVE_FLOOR
+
+
+def _decode_tile_argmin(candidates: List[int], kw: dict) -> int:
+    """The cheapest split of ``candidates`` under :func:`_decode_tile_cost`: the best power of two
+    (1 is one) unless a wave-filling odd split beats it by more than _DECODE_TILE_ODD_SPLIT_MARGIN;
+    ties go to the smaller split."""
+    best, best_cost = 1, _decode_tile_cost(1, **kw)
+    odd, odd_cost = None, None  # the best wave-filling non-power-of-two split
+    for split in candidates:
+        if split <= 1:
+            continue
+        cost = _decode_tile_cost(split, **kw)
+        if split & (split - 1) == 0:
+            if cost < best_cost:
+                best, best_cost = split, cost
+        elif odd_cost is None or cost < odd_cost:
+            odd, odd_cost = split, cost
+    if odd is not None and odd_cost < (1.0 - _DECODE_TILE_ODD_SPLIT_MARGIN) * best_cost:
+        return odd
+    return best
 
 
 def choose_decode_tile_split_kv(
@@ -659,6 +710,7 @@ def choose_decode_tile_split_kv(
     launch_cost: float = _DECODE_TILE_SPLIT_LAUNCH_COST,
     device_cc: Optional[Tuple[int, int]] = None,
     combine_grid: Optional[Tuple[int, int, int]] = None,
+    token_units: int = 1,
 ) -> int:
     """How many KV chunks the d256 decode tile cuts each unit into; 1 = do not split.
 
@@ -675,12 +727,16 @@ def choose_decode_tile_split_kv(
     (:func:`decode_combine_rows`) follow -- which decides the combine kernel the
     launch takes and so the combine's price
     (:func:`decode_combine_grid_selected`, :func:`_decode_tile_combine_cost`);
-    ``None`` prices the lean kernel, the conservative form.
+    ``None`` prices the lean kernel, the conservative form; ``token_units``
+    (appended) the token units ``units`` counts per (head group, batch): the
+    units of one (sequence, KV head) stream the SAME KV range, so a wave of
+    their CTAs carries ``1 / token_units`` as many HBM streams as CTAs (1, the
+    default, is the single-unit pricing exactly).
 
-        streams(s)   = units * s                                  # concurrent K/V streams
-        waves, tail  = divmod(streams(s), sm_count)               # full waves of SMs, and the tail wave
-        per_tile(n)  = max(TILE_COST(q_tile, line), n / (SATURATION * sm_count))
-        per_cta(s)   = waves / SATURATION + [tail > 0] * per_tile(tail)
+        ctas(s)      = units * s                                  # CTAs; unique K/V streams = ctas / token_units
+        waves, tail  = divmod(ctas(s), sm_count)                  # full waves of SMs, and the tail wave
+        rate(n)      = max(TILE_COST(q_tile, line), (n / token_units) / (SATURATION * sm_count))   # a wave of n CTAs, per tile
+        per_cta(s)   = waves * rate(sm_count) + [tail > 0] * rate(tail)
         cost(s)      = (ceil(kv_tiles / s) + CTA_COST(q_tile)) * per_cta(s)
                      + [s > 1] * (COMBINE_COST(form, grid) + s * COMBINE_PER_PARTIAL(form) + launch_cost)
 
@@ -715,6 +771,17 @@ def choose_decode_tile_split_kv(
     graph (the LEADING entry of a graph created with
     ``is_cuda_graph_replay_expected=True``, see :func:`_split_points`).
 
+    A route in several token units (the two-unit MTP step) is priced on its
+    shared streams: measured on the Rubin performance class, the B 32 x kv 32K
+    step on the two-unit 32-column route ran 219.4 us at split 3 (384 CTAs,
+    192 unique streams: one wave of streams) against 277.6 unsplit, 249.1 at
+    4 and 307.8 at 2 -- the order the shared pricing gives, where the
+    single-unit pricing of the same CTAs had unsplit leading.  Past one wave
+    of unique streams no two-unit cell is measured, so such a route takes
+    the best split that keeps its streams within one wave
+    (:func:`decode_tile_split_inside_measured_waves`) rather than the wave
+    arithmetic's extrapolation to many waves of short CTAs.
+
     Candidates come from :func:`decode_tile_split_candidates`; ties go to the
     smaller split, and a non-power-of-two split is taken only when it beats the
     best power of two by more than _DECODE_TILE_ODD_SPLIT_MARGIN.  Returns 1 for
@@ -722,22 +789,25 @@ def choose_decode_tile_split_kv(
     """
     if min(units, kv_tiles, sm_count) <= 0:
         return 1
+    token_units = max(1, int(token_units))
     tile_cost = _decode_tile_cost_for(q_tile, device_cc)
-    kw = dict(units=units, kv_tiles=kv_tiles, sm_count=sm_count, tile_cost=tile_cost, launch_cost=launch_cost, grid=combine_grid, q_tile=q_tile)
-    best, best_cost = 1, _decode_tile_cost(1, **kw)  # the best power of two (1 is one)
-    odd, odd_cost = None, None  # the best wave-filling non-power-of-two split
-    for split in decode_tile_split_candidates(sm_count=sm_count, kv_tiles=kv_tiles):
-        if split <= 1:
-            continue
-        cost = _decode_tile_cost(split, **kw)
-        if split & (split - 1) == 0:
-            if cost < best_cost:
-                best, best_cost = split, cost
-        elif odd_cost is None or cost < odd_cost:
-            odd, odd_cost = split, cost
-    if odd is not None and odd_cost < (1.0 - _DECODE_TILE_ODD_SPLIT_MARGIN) * best_cost:
-        return odd
-    return best
+    kw = dict(
+        units=units,
+        kv_tiles=kv_tiles,
+        sm_count=sm_count,
+        tile_cost=tile_cost,
+        launch_cost=launch_cost,
+        grid=combine_grid,
+        q_tile=q_tile,
+        token_units=token_units,
+    )
+    candidates = decode_tile_split_candidates(sm_count=sm_count, kv_tiles=kv_tiles)
+    pick = _decode_tile_argmin(candidates, kw)
+    if token_units > 1 and not decode_tile_split_inside_measured_waves(pick, units=units, sm_count=sm_count, token_units=token_units):
+        # a multi-unit route past one wave of its unique streams: unmeasured -- the best split inside the measured regime
+        inside = [s for s in candidates if decode_tile_split_inside_measured_waves(s, units=units, sm_count=sm_count, token_units=token_units)]
+        pick = _decode_tile_argmin(inside, kw)
+    return pick
 
 
 def _sm120_envelope(facts) -> Tuple[int, int]:
@@ -1923,6 +1993,8 @@ def _split_points(
             # the combine's grid over the graph's REAL heads (the combine reduces one row per (q_row, head, batch)
             # whatever the packing): it decides the combine kernel the launch takes and so the combine's price
             combine_grid=(int(facts.b), int(facts.h_q), int(facts.s_q)),
+            # the token units of one (head group, batch) stream the same KV range: one HBM stream per split for the pair
+            token_units=tok_units,
         )
         eager = choose_decode_tile_split_kv(**geometry)
         captured = choose_decode_tile_split_kv(**geometry, launch_cost=0.0)

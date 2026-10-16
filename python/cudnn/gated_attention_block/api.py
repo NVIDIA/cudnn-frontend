@@ -794,9 +794,10 @@ def decode_split_choice(route: DecodeRoute, *, batch: int, h_kv: int, max_kv_len
     split model (``cudnn.sdpa.fwd.heuristics.choose_decode_tile_split_kv`` -- an under-full launch splits until its K / V streams
     saturate HBM, a launch past that never splits, the eager caller's second launch counted against the saving) over
     ``batch x KV-head groups x token units`` CTAs (``batch x Q heads x token units`` on the unpacked arm: one head per CTA)
-    and the declared ``max_kv_len`` in 128-key tiles at this part's SM count; floored at 2 under ``gated`` (the gate rides the
-    split COMBINE -- the tile has no gate seams); 1 for a route that is not served (declined at declaration) and when
-    ``sm_count`` is 0 (a non-CUDA declaration, declined at ``check_support`` anyway)."""
+    and the declared ``max_kv_len`` in 128-key tiles at this part's SM count, the route's token units named so the model counts
+    ONE KV stream per split for the units of a (sequence, KV head) (they stream the same range); floored at 2 under ``gated``
+    (the gate rides the split COMBINE -- the tile has no gate seams); 1 for a route that is not served (declined at declaration)
+    and when ``sm_count`` is 0 (a non-CUDA declaration, declined at ``check_support`` anyway)."""
     if not route.decode_tile or int(sm_count) <= 0:
         return 1
     from cudnn.sdpa.fwd.heuristics import choose_decode_tile_split_kv
@@ -815,6 +816,7 @@ def decode_split_choice(route: DecodeRoute, *, batch: int, h_kv: int, max_kv_len
             sm_count=int(sm_count),
             q_tile=route.n_q,
             combine_grid=(int(batch), real_heads, int(route.s_q)),
+            token_units=int(route.token_units),
         )
     )
     return max(split, 2) if gated else split

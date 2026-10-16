@@ -394,7 +394,7 @@ def test_the_split_choice_is_the_decode_split_model_floored_at_two_under_the_gat
         assert decode_split_choice(r, batch=4, h_kv=2, max_kv_len=1000, sm_count=sm, gated=True, h_q=32) == max(want, 2)
     t = decode_route(geom, 5, policy=DECODE_ROUTE_TOKEN_UNITS)  # the token-unit arm: two units of the 64-column tile, each a stream
     assert t.pack_gqa and t.decode_tile and (t.n_q, t.token_units) == (64, 2)
-    want_t = choose_decode_tile_split_kv(units=4 * 2 * 2, kv_tiles=8, sm_count=204, q_tile=64, combine_grid=(4, 32, 5))
+    want_t = choose_decode_tile_split_kv(units=4 * 2 * 2, kv_tiles=8, sm_count=204, q_tile=64, combine_grid=(4, 32, 5), token_units=2)
     assert decode_split_choice(t, batch=4, h_kv=2, max_kv_len=1000, sm_count=204, gated=False, h_q=32) == want_t
     odd = GatedAttentionBlockGeometry(d_model=_D_MODEL, h_q=34, h_kv=2, d_head=_D, rope_dim=_ROPE, causal_bottom_right=True)
     u = decode_route(odd, 7, policy=DECODE_ROUTE_TOKEN_UNITS)  # group 17 at S_q 7 = 119 rows: three units of 64, so the UNPACKED arm, one Q head per CTA
@@ -412,6 +412,34 @@ def test_the_split_choice_is_the_decode_split_model_floored_at_two_under_the_gat
     assert p.prefill_tile and decode_split_choice(p, batch=4, h_kv=2, max_kv_len=1000, sm_count=204, gated=True, h_q=32) == 1
     assert decode_split_choice(decode_route(geom, 33), batch=4, h_kv=2, max_kv_len=1000, sm_count=204, gated=True, h_q=32) == 1  # an unserved route
     assert decode_split_choice(r, batch=4, h_kv=2, max_kv_len=1000, sm_count=0, gated=True) == 1  # no device: declined later anyway
+
+
+def test_the_two_unit_routes_split_choice_prices_one_kv_stream_per_split():
+    """The two token units of one (sequence, KV head) stream the SAME KV range, so the block hands the model the route's token
+    units and the model counts one KV stream per split for the pair.  Measured on the Rubin performance class (212 SMs) at
+    B 32 x kv 32K, S_q 4 on the two-unit 32-column route (the width cap's arm at 24 / 2): 219.4 us at split 3 against 277.6
+    unsplit, 249.1 at 4 and 307.8 at 2 -- the block's choice is 3, where the same 128 CTAs priced as single units read unsplit.
+    The one-unit 64-column route of the same step keeps its one-wave split 3 (the single-unit pricing)."""
+    from cudnn.sdpa.fwd.heuristics import choose_decode_tile_split_kv
+
+    geom, _ = _geom(12)
+    r = decode_route(geom, 4, max_q_tile=32)
+    assert r.decode_tile and r.pack_gqa and (r.n_q, r.token_units) == (32, 2)
+    got = decode_split_choice(r, batch=32, h_kv=2, max_kv_len=32768, sm_count=212, gated=False, h_q=24)
+    assert got == 3, got
+    assert got == choose_decode_tile_split_kv(units=32 * 2 * 2, kv_tiles=256, sm_count=212, q_tile=32, combine_grid=(32, 24, 4), token_units=2)
+    assert decode_split_choice(r, batch=32, h_kv=2, max_kv_len=32768, sm_count=212, gated=True, h_q=24) == 3
+    r64 = decode_route(geom, 4)
+    assert (r64.n_q, r64.token_units) == (64, 1) and decode_split_choice(r64, batch=32, h_kv=2, max_kv_len=32768, sm_count=212, gated=False, h_q=24) == 3
+    # the 24 / 2 MTP step at S_q 8 (two units of the 64-column tile) and the 32 / 2 one under ``token_units``: the model's own pick
+    # on the shared streams, equal to the model called with the route's units
+    for g, s_q, policy in ((12, 8, None), (16, 8, DECODE_ROUTE_TOKEN_UNITS)):
+        gm, _ = _geom(g)
+        rt = decode_route(gm, s_q, policy=policy)
+        assert (rt.n_q, rt.token_units) == (64, 2), rt
+        h_q = _GROUPS[g][0]
+        want = choose_decode_tile_split_kv(units=32 * 2 * 2, kv_tiles=256, sm_count=212, q_tile=64, combine_grid=(32, h_q, s_q), token_units=2)
+        assert decode_split_choice(rt, batch=32, h_kv=2, max_kv_len=32768, sm_count=212, gated=False, h_q=h_q) == want
 
 
 def test_the_envelope_on_a_rubin_reading_serves_the_decode_form_and_names_every_route(monkeypatch):
