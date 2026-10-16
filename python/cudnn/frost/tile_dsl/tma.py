@@ -253,6 +253,36 @@ def tma_store_subtile(smem_tile, gmem_slice, subtile: cutlass.Constexpr[int], *,
 
 
 @cute.jit
+def tma_reduce_add_subtile(smem_tile, gmem_slice, subtile: cutlass.Constexpr[int], *, acquire: cutlass.Constexpr[bool] = True):
+    """One elected tensor-map add from a source-sized SMEM subtile.
+
+    Both grid-constant and runtime maps follow the load/store slice contract.
+    The caller supplies a full issuing warp, publishes generic SMEM writes to
+    the async proxy, and owns bulk commit/wait plus source-reuse credits.
+    Runtime maps can be acquired once by the caller and passed with
+    ``acquire=False`` for subsequent subtiles of the same work item.
+    """
+    if cutlass.const_expr(subtile < 0 or subtile >= smem_tile.tma_loads_per_tile):
+        raise ValueError("tma_reduce_add_subtile: subtile outside the source tile")
+    if cutlass.const_expr(gmem_slice.desc_ptr is not None):
+        desc = gmem_slice.desc_ptr
+        if cutlass.const_expr(acquire):
+            nvvm.fence_proxy_acquire(
+                nvvm.MemScope.GPU,
+                desc,
+                128,
+                from_proxy=nvvm.Proxy.GENERIC,
+                to_proxy=nvvm.Proxy.TENSORMAP,
+            )
+    else:
+        desc = gmem_slice.tma_desc.get_ptr()
+    coords = [gmem_slice.coord_d + cutlass.Int32(subtile * smem_tile.tma_granu_elems)] + list(gmem_slice.coords[1:])
+    source = smem_tile.base.subview(subtile * smem_tile.tma_subtile_stride_elems)
+    if nvvm.elect_sync():
+        nvvm.cp_async_bulk_tensor_reduce(desc, source, "add", coords)
+
+
+@cute.jit
 def bulk_copy(smem_dst, gmem_src, n_bytes, mbar):
     if nvvm.elect_sync():
         nvvm.cp_async_bulk_shared_cluster_global(

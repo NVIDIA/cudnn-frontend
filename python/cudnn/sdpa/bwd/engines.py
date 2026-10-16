@@ -40,9 +40,14 @@ _SM107_FP8 = "SdpaBwdDslSm107Fp8"
 _SM107_MXFP8 = "SdpaBwdDslSm107Mxfp8"
 _SM100_D256 = "SdpaBwdDslSm100D256"
 _SM107_D512 = "SdpaBwdDslSm107D512"
+_SM100_D128 = "SdpaBwdDslSm100D128"
 
 
 def _adapter(name: str):
+    if name == _SM100_D128:
+        from cudnn.sdpa.bwd.api_dsl_sm100_d128 import SdpaBwdDslSm100D128
+
+        return SdpaBwdDslSm100D128
     if name == _SM100_MXFP8:
         # Its own module: the MXFP8 lowering's imports stay out of the
         # half-precision adapters' way.
@@ -263,6 +268,13 @@ class Capabilities:
     # token origins, whole tokens by precondition), not at prefix(lengths).
     # Appended last: Capabilities is positional-append-only.
     thd_ragged_offsets: bool = False
+    # A stricter subset of BSHD-physical: no padding between rows, heads or
+    # batches. The single-launch d128 body reconstructs compact tensor maps.
+    compact_bshd: bool = False
+    # Declaration-only constraints shared by a row's implementation variants.
+    # Appended for positional compatibility; no graph parsing, kernel imports,
+    # allocation or compilation. The row supplies the verdict from pure facts.
+    declaration_check: Optional[Callable[["ga.SdpaGraphFacts", Any], Optional[str]]] = None
 
 
 def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: Any = None) -> Optional[str]:
@@ -350,6 +362,18 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
     elif not facts.bshd_layout:
         ports = "Q/K/V/O/dO/dQ/dK/dV" + ("/q_T/k_T/dO_T/dO_f16" if facts.is_mxfp8 else "")
         return f"{ports} must be BSHD-physical (stride order 3,1,2,0)"
+    if capabilities.compact_bshd:
+        for name, dim, stride in facts.port_layouts:
+            b, h, s, d = (int(n) for n in dim)
+            expected = (s * h * d, d, h * d, 1)
+            if facts.thd:
+                # Ragged offsets own sequence origins, so batch pitch is not
+                # addressed. Token pitch still matters for S_max == 1.
+                compact = int(stride[2]) == h * d and (h == 1 or int(stride[1]) == d) and int(stride[3]) == 1
+            else:
+                compact = not any(int(n) != 1 and int(st) != want for n, st, want in zip(dim, stride, expected))
+            if not compact:
+                return f"{name} must use compact BSHD storage; got stride {tuple(stride)}"
 
     for fact, cap, label in (
         # Row-neutral reason: the sm120 / sm80 rows accumulate dQ through fp32 atomics, but the sm107 chains have no atomics at
@@ -428,6 +452,11 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         # dense one. Dense-only on every THD row.
         if facts.has_bias or facts.has_dbias:
             return "bias / dBias is dense-only under THD (a packed graph has no [B, H, S_q, S_kv] bias)"
+
+    if capabilities.declaration_check is not None:
+        reason = capabilities.declaration_check(facts, version)
+        if reason is not None:
+            return reason
 
     if facts.has_dsink and not facts.has_sink:
         return "dSink_token output requires a sink_token input"
@@ -1648,6 +1677,121 @@ def _sm107_d512_spec() -> EngineSpec:
     )
 
 
+def _sm100_d128_declaration_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
+    """Pure declaration bounds shared with the dense, THD and grouped adapters."""
+    grouped = facts.h_q != facts.h_kv
+    if not facts.thd and not grouped:
+        from .d128_contract import validate_dense_bounds
+
+        try:
+            validate_dense_bounds(facts.b, facts.h_q, facts.s_q, facts.s_kv)
+        except ValueError as error:
+            return str(error)
+        return None
+    label = "d128 grouped" if grouped else "d128 THD"
+    import re
+
+    from .d128_contract import validate_accumulation_scale
+
+    if facts.device_cc != (10, 0):
+        return f"{label} requires SM100 (cc 10.0)"
+    match = re.match(r"^(\d+)\.(\d+)\.(\d+)", version[1]) if version and version[0] == "nvidia-cutlass-dsl" else None
+    if match is None or tuple(map(int, match.groups())) < (4, 8, 0):
+        return f"{label} requires nvidia-cutlass-dsl >= 4.8.0; found {version}"
+    try:
+        validate_accumulation_scale(128**-0.5 if facts.scale is None else facts.scale)
+    except ValueError as error:
+        return label + ": " + str(error)
+    b, h, sq, sk = facts.b, facts.h_q, facts.s_q, facts.s_kv
+    if grouped:
+        if facts.dtype != cudnn.data_type.BFLOAT16:
+            return "d128 supports BF16 grouped attention only; FP16 requires wider dK/dV partial storage"
+        # These helpers contain only declaration arithmetic, and are also
+        # called by standalone check_support. Keep heavy host/kernel imports lazy.
+        from .d128_grouped_contract import validate_dense_bounds, validate_thd_bounds
+
+        try:
+            if facts.thd:
+                validate_thd_bounds(
+                    b,
+                    h,
+                    facts.h_kv,
+                    sq,
+                    sk,
+                    min(b * sq, facts.max_total_seq_len_q),
+                    min(b * sk, facts.max_total_seq_len_kv),
+                    facts.max_total_seq_len_q,
+                    facts.max_total_seq_len_kv,
+                )
+            else:
+                validate_dense_bounds(b, h, facts.h_kv, sq, sk)
+        except ValueError as error:
+            return label + ": " + str(error)
+        if not facts.thd:
+            return None
+    if not grouped:
+        if max(sq, sk) > 2**31 - 128:
+            return "d128 THD sequence envelope exceeds safe Int32 tile rounding"
+        if b > 65535 or h > 65535 or b * h * ((sk + 127) // 128) > 2**31 - 1:
+            return "d128 THD launch envelope exceeds the grid or Int32 work-id range"
+        tq, tk = min(b * sq, facts.max_total_seq_len_q), min(b * sk, facts.max_total_seq_len_kv)
+        if max(tq, tk) > 2**31 - 1:
+            return "d128 THD compact packed capacity exceeds the Int32 prefix ABI"
+        # A THD graph has explicit Q/K/V origins. Its physical spans use the
+        # declared capacities, including gaps beyond the compact B*S envelope.
+        physical = max(facts.max_total_seq_len_q, facts.max_total_seq_len_kv)
+        if physical > 2**32 - 1:
+            return "d128 THD physical token capacity exceeds the tensor-map dimension range"
+        if physical * h * 128 * 2 >= 2**40:
+            return "d128 THD physical BSHD byte stride exceeds the tensor-map stride range"
+        if ((tq + 127) // 128 * 128) * h * 128 * 4 >= 2**40:
+            return "d128 THD FP32 dQ byte stride exceeds the tensor-map stride range"
+    if facts.stats_t is not None:
+        # Shared validation below owns the logical Stats shape error. Do not
+        # index a malformed descriptor before it can report that typed decline.
+        if tuple(facts.stats_t.get_dim()) != (b, h, sq, 1):
+            return None
+        stride = tuple(facts.stats_t.get_stride())
+        if len(stride) != 4:
+            return "d128 THD Stats strides must have rank 4"
+        packing = ga.thd_stats_packing(stride[1], stride[2], h)
+        if packing == "head_major" and stride[1] < facts.max_total_seq_len_q:
+            return "d128 THD Stats head stride must cover the physical Q-token capacity"
+        if packing is not None:
+            from .d128_thd_contract import validate_stats_span
+
+            try:
+                validate_stats_span(h, facts.max_total_seq_len_q if packing == "token_major" else stride[1])
+            except ValueError as error:
+                return label + ": " + str(error)
+    return None
+
+
+def _sm100_d128_spec() -> EngineSpec:
+    """Dense and packed d128 with plan-time prepared implementation selection.
+
+    Dense MHA declarations retain the SM100-106 envelope. Packed or grouped
+    accumulation requires exact SM100, DSL >= 4.8 and positive FP32 scale.
+    Grouped variants fold native per-Q-head dK/dV partials in FP32.
+    """
+    return EngineSpec(
+        name="sdpa_bwd_sm100_d128",
+        capabilities=Capabilities(
+            sm_lo=100,
+            sm_hi=106,
+            d=frozenset({128}),
+            causal=True,
+            compact_bshd=True,
+            thd=True,
+            thd_declared_totals=True,
+            thd_ragged_offsets=True,
+            gqa=True,
+            declaration_check=_sm100_d128_declaration_mismatch,
+        ),
+        lower=partial(lower_dsl_bwd, api_type=_SM100_D128),
+    )
+
+
 # Append-only: a row's position in this tuple is its rank in the ranked plan list, never its id (the manifest slot is).
 ENGINE_SPECS = (
     _sm120_spec(),
@@ -1659,6 +1803,7 @@ ENGINE_SPECS = (
     _sm107_mxfp8_spec(),
     _sm100_d256_spec(),
     _sm107_d512_spec(),
+    _sm100_d128_spec(),
 )
 
 __all__ = [

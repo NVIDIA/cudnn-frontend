@@ -147,6 +147,19 @@ ordered after that read.**
   is `ref == 0, gpu != 0` elements on masked configs with `key mod TILE_N`
   in the aliased range — recover the leaked keys by matching
   `O_gpu - O_ref` against `V` rows.
+- Prove completion and inter-thread ordering separately for every TMEM reuse
+  edge. The specialized synchronization route uses the applicable
+  `tcgen05.wait::ld/st`, producer `before_thread_sync`, synchronization, and
+  consumer `after_thread_sync`; `tcgen05.commit` supplies its implicit
+  producer fence. A standard memory-model alternative needs a complete
+  ordering proof. Detector: enumerate the `tcgen05` load/store/MMA,
+  completion, fence, and mbarrier sites in each emitted PTX flavor, then
+  trace each dependency in its actual cubin. A STORE-completion
+  `FENCE.VIEW.ASYNC.T` or numerical pass alone does not establish inter-thread
+  ordering. Specialized fences may constrain code motion without a distinct
+  SASS opcode. See [PTX ISA, specialized synchronization and canonical
+  patterns](https://docs.nvidia.com/cuda/parallel-thread-execution/),
+  sections 9.7.18.6.3–6.4 and 9.7.18.11.1 in PTX 9.4.
 
 
 **Rule S4 — Split-K partial Stats keep the combiner's log base.**

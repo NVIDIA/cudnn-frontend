@@ -433,6 +433,8 @@ def emit_seq_descs(
     slot_base=0,
     first_batch=0,
     batch_step=1,
+    origins=None,
+    origin_row: cutlass.Constexpr[int] = -1,
 ) -> None:
     """Build a per-BATCH descriptor array over a packed ``[T, H, D]`` tensor.
 
@@ -442,15 +444,23 @@ def emit_seq_descs(
     buffer (``cu0 = THD cu_q / cu_k offset``).  ``row_stride`` is in ELEMENTS of
     the tensor's dtype (``.raw_ptr()`` is element-addressed). Keep it Int64
     through the caller and setup-kernel ABI: widening after an Int32 cast
-    cannot recover a legal strided output's high bits.  ``seq_ord`` is
-    innermost-first, so for ``[1, T, H, D]`` with D contiguous the sequence axis
-    is **2**, not 1.  ``slot_base`` (a RUNTIME value -- the arrays are B slots long and B is not
+    cannot recover a legal strided output's high bits. ``seq_ord`` follows the
+    consuming descriptor's innermost-first coordinate order, not the logical
+    tensor's rank: ``(D, H, T, B)`` uses **2**, whereas an explicit
+    ``(D, T, H, B)`` order (the d128 accumulation body) uses **1**.
+    ``slot_base`` (a RUNTIME value -- the arrays are B slots long and B is not
     a compile-time constant) lets several arrays share one buffer.
 
     Each participating warp elects one writer for batches
     ``first_batch, first_batch + batch_step, ...``. These ranges must be
     disjoint; defaults preserve the single-writer contract. The caller must
     issue a ``GENERIC -> TENSORMAP`` release fence on every writer afterwards.
+
+    ``origins`` / ``origin_row`` optionally select an independent caller-port
+    token origin.  The compact prefix still determines the sequence LENGTH;
+    a caller's gaps change only its base address.  Negative ``origin_row``
+    preserves the compact-prefix path and never reads ``origins``.  Explicit
+    origins are absolute within the bound port: do not subtract origin zero.
     """
     desc_base = desc_words.iterator.raw_ptr()
     src_words = Pointer(base_desc.get_ptr(), dtype=cutlass.Int64)
@@ -465,7 +475,8 @@ def emit_seq_descs(
         # more than 2^31 of them (128k tokens x 128 heads x 128 lanes already
         # does), so the Int32 form the inlined SDPA-forward version used was a
         # latent overflow. Matches the linear-attention sibling.
-        row_base = base + cutlass.Int64(cu_b) * cutlass.Int64(row_stride)
+        origin = thd_port_origin(origins, origin_row, b, cu_b)
+        row_base = base + origin * cutlass.Int64(row_stride)
         nvvm.tensormap_replace(
             nvvm.TensormapField.GLOBAL_ADDRESS,
             dptr,

@@ -94,8 +94,8 @@ class SdpaBwdBinder : private FixedSdpaOperands {
          const py::object &scale    = py::none(),
          bool raw_storage           = true,
          const py::object &declared = py::none()) const {
-        if (workspace <= 0 || workspace % 16) invalid("needs an aligned caller workspace");
-        const auto workspace_end = end(workspace, workspace_bytes_);
+        if (workspace_bytes_ > 0 && (workspace <= 0 || workspace % 16)) invalid("needs an aligned caller workspace");
+        const auto workspace_end = workspace_bytes_ > 0 ? end(workspace, workspace_bytes_) : 0;
         if (indices.size() != operands_.size()) invalid("incorrect native backward role indices");
         const auto facts            = read_native_operand_views(pack, indices);
         const auto runtime_geometry = declared.is_none() ? py::tuple() : py::tuple(declared);  // any sequence (#1631)
@@ -145,7 +145,8 @@ class SdpaBwdBinder : private FixedSdpaOperands {
                                    : op.bytes;
             if (f.observed_bytes >= 0 && f.observed_bytes < bytes)
                 invalid(op.name + " backing storage is too small for the bound length form");
-            if (workspace < end(f.pointer, bytes) && f.pointer < workspace_end)
+            const auto operand_end = end(f.pointer, bytes);
+            if (workspace_bytes_ > 0 && workspace < operand_end && f.pointer < workspace_end)
                 invalid("caller workspace overlaps " + op.name);
             frame.append(py::int_(f.pointer));
         }
@@ -177,6 +178,7 @@ void
 init_sdpa_bwd_binding(py::module_ &m) {
     py::class_<SdpaBwdBinder>(m, "_SdpaBwdBinder")
         .def(py::init<const py::object &, const py::tuple &>())
+        .def_prop_ro_static("supports_zero_workspace", [](py::object) { return true; })
         .def("bind",
              &SdpaBwdBinder::bind,
              py::arg("pack"),
