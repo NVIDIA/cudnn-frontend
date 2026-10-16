@@ -1355,3 +1355,33 @@ def test_candidates_and_choice_respect_a_supplied_min_tiles(min_tiles):
         assert all(kv_tiles // s >= min_tiles for s in split_kv_candidates(sm_count=188, kv_tiles=kv_tiles, min_tiles=min_tiles) if s > 1)
         s = choose_split_kv(q_tiles=1, heads_q=1, batch=1, kv_tiles=kv_tiles, sm_count=188, combine_rows=8, min_tiles=min_tiles, combine_floor=0.1)
         assert s == 1 or kv_tiles // s >= min_tiles
+
+
+@pytest.mark.parametrize(
+    "device_cc", [None, (10, 7), (10, 0), (10, 3), (12, 0), (12, 1), (9, 0), (8, 0)], ids=lambda cc: "default" if cc is None else f"cc{cc[0]}_{cc[1]}"
+)
+def test_decode_combine_form_rule_holds_on_the_cc_10_7_line_only(device_cc):
+    """``decode_combine_grid_selected`` / ``decode_combine_force_lean`` read the plan's DEVICE: the split-aware rule is the cc 10.7
+    line's (measured on the Rubin performance class), so on cc 10.7 -- and on the model's default line, ``device_cc=None`` -- it
+    answers the measured rule, while on EVERY other device (the Blackwell line, whose combine module's own forms are measured on
+    B200 / B300 by their author, and any line the rule was never run on: SM120, Hopper, Ampere) it answers False and the adapter
+    forces the module's own forms on every launch inside the kernel module's bound, and nothing outside it, where the module's
+    entry is its own forms by construction.  The adapter's plan-time pin is pinned per line beside this
+    (test_sdpa_prepared_geometry.py)."""
+    from cudnn.sdpa.fwd import heuristics as heur
+
+    def sel(*grid_and_split):
+        return heur.decode_combine_grid_selected(*grid_and_split, device_cc=device_cc)
+
+    def force(*grid_and_split):
+        return heur.decode_combine_force_lean(*grid_and_split, device_cc=device_cc)
+
+    rule_line = device_cc is None or tuple(device_cc) == (10, 7)
+    # the small serving grid (B 1 x 24 heads x S_q 1 = 24 lean blocks, 24 rows): the rule takes the decode-grid kernel from split 8
+    assert [sel(1, 24, 1, s) for s in (4, 8, 16, 32, 128)] == ([False, True, True, True, True] if rule_line else [False] * 5)
+    assert [force(1, 24, 1, s) for s in (4, 8, 16, 32, 128)] == ([True, False, False, False, False] if rule_line else [True] * 5)
+    # the B 4 x S_q 4 crossover (96 lean blocks, 384 rows): the rule takes the decode-grid kernel from split 32
+    assert [sel(4, 24, 4, s) for s in (16, 32, 64)] == ([False, True, True] if rule_line else [False] * 3)
+    assert [force(4, 24, 4, s) for s in (16, 32, 64)] == ([True, False, False] if rule_line else [True] * 3)
+    # past the kernel module's bound (B 8 x 32 heads x S_q 1 = 256 lean blocks) nothing is selected or forced on any line
+    assert not any(sel(8, 32, 1, s) or force(8, 32, 1, s) for s in (8, 32, 128))

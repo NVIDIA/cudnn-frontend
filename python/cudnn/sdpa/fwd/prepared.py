@@ -674,6 +674,36 @@ class DenseLaunchSpec:
     )
 
 
+def _plan_device_cc(api) -> Tuple[int, int]:
+    """The compute capability a plan lowers for, as its adapter recorded it at ``check_support``: the SM100 and SM90
+    adapters keep ``_device_cc``, the SM120 adapter ``compute_capability``; a plan that recorded neither reads its Q
+    tensor's device once more (the read the adapters make).  Never None: the split combine's form pin keys on it."""
+    cc = getattr(api, "_device_cc", None) or getattr(api, "compute_capability", None)
+    if cc is None:
+        import torch
+
+        cc = torch.cuda.get_device_capability(api.q_desc.device)
+    return (int(cc[0]), int(cc[1]))
+
+
+def _split_combine_decode_grid(api, b: int, qh: int, s_q_max: int, split: int) -> int:
+    """The split combine entry's kernel FORM for a plan (``split_combine.DECODE_GRID_AUTO`` / ``DECODE_GRID_OFF``): a
+    plan-time specialization on the declared B / H_q / S_q, the split and the plan's DEVICE, never a runtime value.
+    The AUTO entry takes the decode-grid kernel on every sink-free launch inside the kernel module's grid bound; the
+    split-aware rule (``heuristics.decode_combine_grid_selected`` -- measured on the Rubin performance class: that
+    kernel loses to the lean walk on a mid-sized grid below 32 splits and on any grid at 4) pins the module's own
+    forms where the two disagree, and on every launch off cc 10.7 (the Blackwell line keeps the module's own
+    three-way rule, measured on B200 / B300; a line the rule was never measured on likewise), so a plan off cc 10.7
+    never compiles the AUTO entry inside the bound (outside it the AUTO entry is the module's own forms by
+    construction)."""
+    from cudnn.sdpa.fwd.heuristics import decode_combine_force_lean
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine
+
+    if decode_combine_force_lean(b, qh, s_q_max, split, device_cc=_plan_device_cc(api)):
+        return split_combine.DECODE_GRID_OFF
+    return split_combine.DECODE_GRID_AUTO
+
+
 def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     """The adapter's plan-time facts for a dense (padded) launch: the positional entry, the argument
     template with every constant filled, the fixed specialization the binder checks each call against,
@@ -753,7 +783,6 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     s.combine_q_lens = False
     if s.split > 1:
         from cudnn.sdpa.fwd.api_dsl import ws_align
-        from cudnn.sdpa.fwd.heuristics import decode_combine_force_lean
         from cudnn.sdpa.fwd.kernels.sm100 import split_combine
         from cudnn import _pybind_module
 
@@ -763,17 +792,9 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
                 "cudnn.sdpa: a split attention sink over padded query lengths needs the native binder that passes them to the combine; rebuild the extension"
             )
 
-        # The combine kernel's FORM (a plan-time specialization: the declared B / H_q / S_q and the split, never a runtime
-        # value).  The module's default entry takes the decode-grid kernel on every sink-free launch inside its grid bound;
-        # the split-aware rule (heuristics.decode_combine_grid_selected -- measured on the Rubin performance class: that
-        # kernel loses to the lean walk on a mid-sized grid below 32 splits and on any grid at 4) pins the module's own
-        # forms where the two disagree, and on every launch off cc 10.7 (the Blackwell line keeps the module's own
-        # three-way rule, measured on B200 / B300; the rule reads the plan's device).
-        decode_grid = (
-            split_combine.DECODE_GRID_OFF
-            if decode_combine_force_lean(s.b, s.qh, s.s_q_max, s.split, device_cc=tuple(api._device_cc))
-            else split_combine.DECODE_GRID_AUTO
-        )
+        # The combine kernel's FORM (a plan-time specialization: the declared B / H_q / S_q, the split and the plan's device,
+        # never a runtime value; _split_combine_decode_grid states the rule and reads the device the adapter recorded).
+        decode_grid = _split_combine_decode_grid(api, s.b, s.qh, s.s_q_max, s.split)
         owner = split_combine.compile_ptr(
             dtype_o=api._combine_dtype_tag(),
             dtype_partial=api._partial_dtype_tag(),

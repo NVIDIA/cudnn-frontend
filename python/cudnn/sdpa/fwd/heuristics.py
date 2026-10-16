@@ -640,6 +640,10 @@ DECODE_COMBINE_MAX_LEAN_BLOCKS = 128
 DECODE_COMBINE_SMALL_GRID_ROWS = 128
 DECODE_COMBINE_MIN_SPLIT = 8
 DECODE_COMBINE_DEEP_SPLIT = 32
+# The ONE device line the split-aware form rule was measured on and holds for; every other device (the
+# Blackwell line, measured on B200 / B300 by the combine module's author, and any line the rule was never
+# run on) keeps the combine module's own forms on every launch.
+_DECODE_COMBINE_RULE_CC = (10, 7)
 
 
 def decode_combine_lean_blocks(b: int, h_q: int, s_q: int) -> int:
@@ -662,10 +666,12 @@ def decode_combine_grid_selected(b: int, h_q: int, s_q: int, split: int, device_
     which the adapter pins the compiled combine entry to and the split model prices a candidate split's
     combine by -- inside the kernel module's own grid bound, at a split of at least
     ``DECODE_COMBINE_MIN_SPLIT``, on a small grid (``DECODE_COMBINE_SMALL_GRID_ROWS`` rows) or from
-    ``DECODE_COMBINE_DEEP_SPLIT`` on.  ``device_cc`` (appended) names the arch line: the rule is the
-    cc 10.7 line's (measured on the Rubin performance class), so it answers False on the Blackwell
-    line (cc 10.0 / 10.3), whose launches keep the module's own forms; ``None`` reads the cc 10.7 rule."""
-    if _decode_tile_blackwell_line(device_cc):
+    ``DECODE_COMBINE_DEEP_SPLIT`` on.  ``device_cc`` (appended) names the device: the rule is the cc 10.7
+    line's (measured on the Rubin performance class), so it answers False on EVERY other device -- the
+    Blackwell line (cc 10.0 / 10.3), whose launches keep the module's own forms, and any line the rule was
+    never measured on (``_DECODE_COMBINE_RULE_CC`` is the one line it holds for); ``None`` reads the cc 10.7
+    rule (the model's direct callers; a plan always names its device)."""
+    if device_cc is not None and tuple(device_cc)[:2] != _DECODE_COMBINE_RULE_CC:
         return False
     if decode_combine_lean_blocks(b, h_q, s_q) > DECODE_COMBINE_MAX_LEAN_BLOCKS or int(split) < DECODE_COMBINE_MIN_SPLIT:
         return False
@@ -676,7 +682,7 @@ def decode_combine_force_lean(b: int, h_q: int, s_q: int, split: int, device_cc:
     """Whether the adapter must pin a split launch's combine entry OFF the decode-grid kernel
     (``split_combine.DECODE_GRID_OFF``: the module's own forms): the launch is inside the kernel
     module's decode-grid bound (its default entry would take the decode-grid kernel) but the
-    split-aware rule says otherwise -- on the Blackwell line (``device_cc``) every such launch.
+    split-aware rule says otherwise -- on every device off cc 10.7 (``device_cc``) every such launch.
     Outside the bound the module's entry is its own forms by construction, so nothing is forced;
     where the rule says decode-grid the module's entry agrees."""
     return decode_combine_lean_blocks(b, h_q, s_q) <= DECODE_COMBINE_MAX_LEAN_BLOCKS and not decode_combine_grid_selected(b, h_q, s_q, split, device_cc)
