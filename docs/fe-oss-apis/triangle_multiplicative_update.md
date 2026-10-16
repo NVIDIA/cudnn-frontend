@@ -116,6 +116,9 @@ contiguous, its bytes disjoint from `x`, the mask, every parameter and the works
 allocations and launches are ordered on (`None` = torch's current stream). The function caches one compiled plan per
 `(shape, direction, mask present, biases present, eps)` and one prepared parameter set per parameter identity (address, shape,
 strides, dtype, device, in-place version counter; a bounded LRU), allocates the output and the workspace per call, and launches.
+Parameters created under `torch.inference_mode()` carry no version counter and bypass that cache: they are prepared on every call
+(an in-place update of such a parameter could not be tracked) -- create them outside inference mode, or prepare them once with
+`prepare_weights` and use the class API, to pay the interleave once.
 Warm a shape once before capturing a `torch.cuda.graph` around the call; the captured graph replays the three kernels and follows
 the inputs' contents.
 

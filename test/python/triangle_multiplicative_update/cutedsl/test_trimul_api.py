@@ -379,6 +379,40 @@ def test_prepare_weights_builds_the_kernel_layouts_once():
     assert w32.w_in.dtype == torch.bfloat16
 
 
+def test_inference_mode_parameters_bypass_the_version_keyed_weight_cache(monkeypatch):
+    """Parameters created under torch.inference_mode() carry no version counter (`t._version` raises RuntimeError), so they have no identity
+    the drop-in's weight cache can key on: such a parameter set is prepared on every call and never cached (documented; the prepared class API's
+    one-time `prepare_weights` is the remedy) -- a constant version would miss an in-place update made inside inference mode.  Ordinary
+    parameters hit the cache as before, also when the CALL runs under inference mode (one preparation for two lookups), and an in-place update
+    of one of them still misses once (the version counter is part of the identity).  GPU-free (CPU bf16 parameters)."""
+    c = 128
+    p = _params(c, c, True, True, seed=47)
+    with torch.inference_mode():
+        pi = _params(c, c, True, True, seed=47)
+    assert all(t.is_inference() for t in pi.values() if t is not None) and not any(t.is_inference() for t in p.values() if t is not None)
+    calls = []
+    real = tapi.prepare_weights
+    monkeypatch.setattr(tapi, "prepare_weights", lambda *a, **k: (calls.append(1), real(*a, **k))[1])
+    params_i = tuple(pi[n] for n in CUEQ_PARAMS[3:15])
+    n_cached = len(tapi._WEIGHTS)
+    w1 = tapi._cached_weights(params_i, False)  # the head: RuntimeError 'Inference tensors do not track version counter'
+    w2 = tapi._cached_weights(params_i, False)
+    assert len(calls) == 2 and w1 is not w2 and len(tapi._WEIGHTS) == n_cached, "inference tensors are prepared per call, never cached"
+    assert torch.equal(w1.w_in, w2.w_in) and torch.equal(w1.w_in, tapi.prepare_weights(*params_i).w_in)
+    params = tuple(p[n] for n in CUEQ_PARAMS[3:15])
+    calls.clear()
+    w3 = tapi._cached_weights(params, False)
+    with torch.inference_mode():  # inference MODE alone does not bypass: these tensors keep their version counters
+        w4 = tapi._cached_weights(params, False)
+    assert len(calls) == 1 and w3 is w4 and len(tapi._WEIGHTS) == n_cached + 1
+    p["p_in_weight"].mul_(1.0)  # an in-place update bumps the version counter: the identity changes and the cache misses once
+    assert tapi._cached_weights(params, False) is not w3 and len(calls) == 2
+    # one inference tensor among ordinary ones is enough to bypass (the set has no complete identity)
+    mixed = tuple(pi[n] if n == "g_out_weight" else p[n] for n in CUEQ_PARAMS[3:15])
+    calls.clear()
+    assert tapi._cached_weights(mixed, False) is not tapi._cached_weights(mixed, False) and len(calls) == 2
+
+
 def test_parse_precision_mirrors_cueq_spellings():
     for spelling in (None, "default", "none", "DEFAULT", -1, 0):
         assert tapi._parse_precision(spelling) == "default"

@@ -771,15 +771,29 @@ def _parse_precision(precision) -> str:
 
 
 def _tensor_identity(t: Optional[torch.Tensor]):
+    """A parameter's identity for the weight cache: address, storage offset, shape, strides, dtype, device and torch's in-place version
+    counter.  An INFERENCE tensor (created under ``torch.inference_mode()``) has no version counter -- ``t._version`` raises -- so
+    :func:`_cached_weights` bypasses the cache for a set that holds one; this is reached for ordinary tensors only."""
     if t is None:
         return None
     return (t.data_ptr(), t.storage_offset(), tuple(t.shape), tuple(t.stride()), t.dtype, str(t.device), t._version)
 
 
+def _has_inference_tensor(params: tuple) -> bool:
+    return any(t is not None and t.is_inference() for t in params)
+
+
 def _cached_weights(params: tuple, cast: bool) -> TriMulWeights:
     """One prepared weight set per PARAMETER IDENTITY (address, shape, strides, dtype, device and torch's in-place version counter
     of each of the twelve tensors); the entry keeps a reference to the source tensors so an address cannot be recycled under it.
-    A bounded LRU: a model switches parameter sets rarely, a training loop bumps the version counter and misses (one re-interleave)."""
+    A bounded LRU: a model switches parameter sets rarely, a training loop bumps the version counter and misses (one re-interleave).
+
+    A set holding an INFERENCE tensor (``t.is_inference()``: created under ``torch.inference_mode()``, which keeps no version counter)
+    has no identity an in-place update would change, so it is prepared on EVERY call and never cached -- the documented cost of
+    inference-mode parameters (a constant version in the key would serve stale weights after an in-place update made inside inference
+    mode).  Create the parameters outside inference mode, or prepare them once with :func:`prepare_weights` and the class API."""
+    if _has_inference_tensor(params):
+        return prepare_weights(*params, cast_to_bf16=cast)
     key = (cast,) + tuple(_tensor_identity(t) for t in params)
     with _PLAN_LOCK:
         hit = _WEIGHTS.get(key)
@@ -843,8 +857,10 @@ def triangle_multiplicative_update(
     the IEEE / TF32 modes decline; a non-contiguous ``x`` declines; autograd is not registered yet, so under grad mode an input or
     parameter with ``requires_grad`` is a typed decline (``NotImplementedError``), never a tensor without a ``grad_fn`` -- call under
     ``torch.no_grad()`` or detach for inference.  A mask of any real or bool dtype is cast once per call to the kernels' bf16 ``[B, N, N]`` (no copy when
-    it already is).  One compiled plan per (shape, direction, flags) and one prepared weight set per parameter identity are cached in
-    the process; warm a shape before capturing a CUDA graph around this call.
+    it already is).  One compiled plan per (shape, direction, flags) and one prepared weight set per parameter identity (address, shape,
+    strides, dtype, device, in-place version counter) are cached in the process; parameters created under ``torch.inference_mode()``
+    carry no version counter and are prepared on every call instead (create them outside inference mode, or prepare them once with
+    :func:`prepare_weights` and the class API); warm a shape before capturing a CUDA graph around this call.
     """
     from cudnn._torch_stream import stream_context
 
