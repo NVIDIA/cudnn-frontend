@@ -114,8 +114,9 @@ def _plan_case(
     has_topk_length=False,
     deterministic=False,
     q_cluster_mode="off",
+    compile_plan=True,
 ):
-    """Inputs, a checked and compiled plan, caller-owned outputs, and scratch for one route."""
+    """Inputs, a checked plan, caller-owned outputs, and scratch for one route."""
     from cudnn import DSA
 
     device = torch.device("cuda")
@@ -141,7 +142,8 @@ def _plan_case(
         q_cluster_mode=q_cluster_mode,
     )
     assert plan.check_support()
-    plan.compile()
+    if compile_plan:
+        plan.compile()
     workspace_bytes = plan.scratch_workspace_bytes()
     assert workspace_bytes > 0
     workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=device)
@@ -160,7 +162,7 @@ def _assert_execute_allocates_nothing_and_never_synchronizes(plan, inputs, outpu
         dq, dkv, d_sink = outputs
         return plan.execute(*inputs, dq, dkv, topk_length=topk_length, softmax_scale=softmax_scale, workspace=workspace, current_stream=stream, d_sink=d_sink)
 
-    execute()  # warm ordinary SM90/SM100 routes that still compile on first execute
+    execute()  # warm the legacy SM90 route and establish steady-state allocator counters
     torch.cuda.synchronize()
     before = torch.cuda.memory_stats()["allocation.all.allocated"]
     previous = torch.cuda.get_sync_debug_mode()
@@ -839,30 +841,45 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_adaptive_shards_repea
 @pytest.mark.L1
 @torch_fork_set_rng(seed=422)
 @pytest.mark.parametrize(
-    "num_heads,topk,dtype,expected_backend",
+    "num_heads,head_dim,topk,dtype,deterministic,expected_backend",
     [
-        pytest.param(64, 64, torch.bfloat16, "generic_m64", id="generic-bf16"),
-        pytest.param(64, 64, torch.float16, "generic_m64", id="generic-fp16"),
-        pytest.param(128, 128, torch.bfloat16, "h128_2cta_m64", id="h128-two-cta-bf16"),
+        pytest.param(16, 576, 64, torch.bfloat16, False, "h16_m128", id="h16"),
+        pytest.param(32, 576, 64, torch.bfloat16, False, "h32_m64", id="h32"),
+        pytest.param(64, 512, 64, torch.bfloat16, False, "generic_m64", id="generic"),
+        pytest.param(96, 576, 64, torch.bfloat16, False, "h96_h64_h32", id="h96"),
+        pytest.param(128, 512, 128, torch.bfloat16, False, "h128_2cta_m64", id="h128-two-cta"),
+        pytest.param(64, 512, 64, torch.bfloat16, True, "generic_m64", id="deterministic-generic-bf16"),
+        pytest.param(64, 512, 64, torch.float16, True, "generic_m64", id="deterministic-generic-fp16"),
+        pytest.param(128, 512, 128, torch.bfloat16, True, "h128_2cta_m64", id="deterministic-h128-two-cta"),
     ],
 )
-def test_DSA_sparse_attention_backward_sm100_deterministic_plan_is_cold_capture_safe(monkeypatch, num_heads, topk, dtype, expected_backend):
-    """The first execute after plan compilation is capture-safe and JIT-free."""
+def test_DSA_sparse_attention_backward_sm100_plan_is_cold_capture_safe(
+    monkeypatch,
+    num_heads,
+    head_dim,
+    topk,
+    dtype,
+    deterministic,
+    expected_backend,
+):
+    """Every non-D576 SM100 plan compiles before its first captured execute."""
     try:
         from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100 as interface
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     _require_sm100()
+    if expected_backend == "h128_2cta_m64":
+        _require_exact_sm100()
     plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
         num_heads,
-        512,
+        head_dim,
         topk,
         s_q=8,
-        s_kv=256,
+        s_kv=max(256, 2 * topk),
         dtype=dtype,
         has_topk_length=True,
-        deterministic=True,
+        deterministic=deterministic,
     )
     assert plan._backend == expected_backend
     assert callable(plan._compiled_kernel)
@@ -916,19 +933,116 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_plan_is_cold_capture_
         graph.reset()
 
 
+@pytest.mark.L0
+@torch_fork_set_rng(seed=426)
+def test_DSA_sparse_attention_backward_sm100_execute_requires_compile(monkeypatch):
+    """An SM100 plan validates support but never compiles implicitly in execute()."""
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    _require_sm100()
+    plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
+        64,
+        512,
+        64,
+        s_q=8,
+        s_kv=256,
+        has_topk_length=True,
+        compile_plan=False,
+    )
+    assert plan._compiled_kernel is None
+    dq, dkv, d_sink = outputs
+    execute_args = dict(
+        topk_length=topk_length,
+        softmax_scale=softmax_scale,
+        workspace=workspace,
+        d_sink=d_sink,
+    )
+    with pytest.raises(RuntimeError, match=r"call compile\(\) before execute\(\)"):
+        plan.execute(*inputs, dq, dkv, **execute_args)
+
+    q, kv, out, dout, lse, attn_sink, topk_idxs = inputs
+    unchecked_plan = DSA.SparseAttentionBackward(
+        q,
+        kv,
+        out,
+        dout,
+        lse,
+        attn_sink,
+        topk_idxs,
+        sample_topk_length=topk_length,
+        softmax_scale=softmax_scale,
+    )
+    assert unchecked_plan._device_major is None
+    with pytest.raises(RuntimeError, match=r"call compile\(\) before execute\(\)"):
+        unchecked_plan.execute(*inputs, dq, dkv, **execute_args)
+
+    unchecked_plan._is_supported = False
+
+    def rejected_support():
+        """Prove execute revalidates a stale support state before dispatch."""
+        raise NotImplementedError("support state must be revalidated")
+
+    monkeypatch.setattr(unchecked_plan, "check_support", rejected_support)
+    with pytest.raises(NotImplementedError, match="support state must be revalidated"):
+        unchecked_plan.execute(*inputs, dq, dkv, **execute_args)
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm100_ordinary_compile_cache_is_device_scoped(monkeypatch):
+    """Ordinary launchables compiled in one CUDA context are not reused by another."""
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100 as interface
+
+    compile_artifact = interface._compile_nondeterministic_sm100
+    compiled_devices = []
+
+    def fake_compile(device_index, *args, **kwargs):
+        """Return a unique launchable stand-in and record its owning device."""
+        compiled_devices.append(device_index)
+        return object()
+
+    compile_artifact.cache_clear()
+    monkeypatch.setattr(interface, "_compile_sm100_artifact", fake_compile)
+    args = ((10, 0), "generic_m64", torch.bfloat16, 512, 512, 64, 64, True, 64)
+    try:
+        device0 = compile_artifact(0, *args)
+        assert compile_artifact(0, *args) is device0
+        device1 = compile_artifact(1, *args)
+    finally:
+        compile_artifact.cache_clear()
+
+    assert device1 is not device0
+    assert compiled_devices == [0, 1]
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm100_compile_targets_cover_supported_family():
+    """Plan-time compilation preserves each supported SM100-family target."""
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100 as interface
+
+    assert interface._sm100_gpu_arch_flag((10, 0)) == "sm_100a"
+    assert interface._sm100_gpu_arch_flag((10, 3)) == "sm_103a"
+    assert interface._sm100_gpu_arch_flag((10, 7)) == "sm_107a"
+    with pytest.raises(ValueError, match="does not support compute capability"):
+        interface._sm100_gpu_arch_flag((10, 1))
+
+
 @pytest.mark.L1
 @torch_fork_set_rng(seed=423)
-def test_DSA_sparse_attention_backward_sm100_deterministic_artifact_is_shape_dynamic(monkeypatch):
-    """Q/KV extents sharing a shard bucket reuse one compiled artifact."""
+@pytest.mark.parametrize("deterministic", [False, True], ids=["ordinary", "deterministic"])
+def test_DSA_sparse_attention_backward_sm100_artifact_is_shape_dynamic(monkeypatch, deterministic):
+    """Compatible plans reuse one compiled artifact across Q and KV extents."""
     try:
         from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100 as interface
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     _require_sm100()
-    compile_artifact = interface._compile_deterministic_sm100
+    compile_artifact = interface._compile_deterministic_sm100 if deterministic else interface._compile_nondeterministic_sm100
     compile_artifact.cache_clear()
-    first, *_ = _plan_case(64, 512, 64, s_q=8, s_kv=256, has_topk_length=True, deterministic=True)
+    first, *_ = _plan_case(64, 512, 64, s_q=8, s_kv=256, has_topk_length=True, deterministic=deterministic)
     first_info = compile_artifact.cache_info()
 
     def forbidden_compile(*args, **kwargs):
@@ -943,7 +1057,7 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_artifact_is_shape_dyn
         s_q=16,
         s_kv=320,
         has_topk_length=True,
-        deterministic=True,
+        deterministic=deterministic,
     )
     second_info = compile_artifact.cache_info()
 
@@ -958,6 +1072,58 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_artifact_is_shape_dyn
         softmax_scale,
         workspace,
     )
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=427)
+def test_DSA_sparse_attention_backward_sm100_direct_interface_stays_lazy(monkeypatch):
+    """Direct low-level callers compile once on first use and reuse the lazy cache."""
+    try:
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100 as interface
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    _require_sm100()
+    _, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
+        64,
+        512,
+        64,
+        s_q=8,
+        s_kv=256,
+        has_topk_length=True,
+        compile_plan=False,
+    )
+    compile_cache = interface.flash_attn_bwd_sm100.compile_cache
+    saved_cache = compile_cache.copy()
+    compile_cache.clear()
+    compile_calls = 0
+    original_compile = interface.cute.compile
+
+    def tracked_compile(*args, **kwargs):
+        """Count actual CuTe compilation while forwarding to the compiler."""
+        nonlocal compile_calls
+        compile_calls += 1
+        return original_compile(*args, **kwargs)
+
+    monkeypatch.setattr(interface.cute, "compile", tracked_compile)
+    dq, dkv, d_sink = outputs
+    try:
+        for _ in range(2):
+            result = interface.flash_attn_bwd_sm100(
+                *inputs,
+                softmax_scale=softmax_scale,
+                topk_length=topk_length,
+                dq=dq,
+                dkv=dkv,
+                d_sink=d_sink,
+                workspace=workspace,
+            )
+            assert all(actual is expected for actual, expected in zip(result, outputs))
+    finally:
+        compile_cache.clear()
+        compile_cache.update(saved_cache)
+
+    assert compile_calls == 1
 
 
 @pytest.mark.L1

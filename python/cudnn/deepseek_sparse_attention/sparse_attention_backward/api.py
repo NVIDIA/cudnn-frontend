@@ -67,6 +67,8 @@ class SparseAttentionBackward(APIBase):
         self.deterministic = bool(deterministic)
         self.q_cluster_mode = q_cluster_mode
         self._backend = None
+        self._backend_block_tile = None
+        self._device_major = None
         self._two_cta_split_count = 1
         self._qcluster_plan = None
 
@@ -87,6 +89,7 @@ class SparseAttentionBackward(APIBase):
         self._value_error_if(self.q_desc.device.type != "cuda", f"Q must live on CUDA, got {self.q_desc.device}")
         capability = torch.cuda.get_device_capability(self.q_desc.device)
         major, _ = capability
+        self._device_major = major
         self._runtime_error_if(
             major < 9,
             f"SparseAttentionBackward requires SM90+, found SM{major}",
@@ -204,8 +207,9 @@ class SparseAttentionBackward(APIBase):
         # agree on the route; the interface repeats the selection for direct
         # callers of ``flash_attn_bwd_sm100``.
         self._backend = None
+        self._backend_block_tile = None
         if major == 10:
-            self._backend, _ = _iface_sm100._select_sm100_backend(
+            self._backend, self._backend_block_tile = _iface_sm100._select_sm100_backend(
                 num_heads,
                 head_dim,
                 head_dim_v=head_dim_v,
@@ -238,10 +242,11 @@ class SparseAttentionBackward(APIBase):
     def compile(self) -> None:
         """Compile every artifact required by the selected prepared plan.
 
-        Deterministic SM100 compilation uses only stored tensor metadata and
-        must complete before ``execute()`` or CUDA Graph capture. The compiled
-        artifact belongs to the sample tensors' CUDA device; keep this plan
-        alive while a graph that launches it may replay.
+        SM100 compilation uses only stored tensor metadata and completes before
+        ``execute()`` or CUDA Graph capture. The compiled artifact belongs to
+        the sample tensors' CUDA device; keep this plan alive while a graph
+        that launches it may replay. The legacy SM90 interface still compiles
+        from concrete tensors on its first execution.
         """
         self._ensure_support_checked()
         if self.q_cluster_mode == "adaptive_pair":
@@ -292,8 +297,23 @@ class SparseAttentionBackward(APIBase):
                     shards,
                 )
             return
-        # The architecture-specific interfaces manage their own compile caches.
-        # Priming requires real tensors, so compilation is deferred to execute().
+        if self._device_major == 10:
+            _, num_heads, head_dim = self.q_desc.shape
+            with torch.cuda.device(self.q_desc.device):
+                self._compiled_kernel = _iface_sm100._compile_nondeterministic_sm100(
+                    self.q_desc.device.index,
+                    torch.cuda.get_device_capability(self.q_desc.device),
+                    self._backend,
+                    self.q_desc.dtype,
+                    head_dim,
+                    self.out_desc.shape[2],
+                    num_heads,
+                    self.topk_idxs_desc.shape[1],
+                    self.topk_length_desc is not None,
+                    self._backend_block_tile,
+                )
+            return
+        # SM90 owns concrete-tensor caches and retains first-execute JIT.
         self._compiled_kernel = True
 
     def scratch_workspace_bytes(self) -> int:
@@ -350,21 +370,21 @@ class SparseAttentionBackward(APIBase):
         Every backend requires ``dq``, ``dkv``, ``d_sink`` and (when
         ``scratch_workspace_bytes()`` is non-zero) ``workspace`` to be
         caller-provided; execute never allocates. ``d_sink`` is keyword-only so
-        the positional order of the pre-existing parameters is unchanged. The
-        H128/D576 two-CTA and deterministic SM100 routes additionally never
-        compile here. Adaptive pairing makes its overlap decision on device
-        and launches only stages compiled by ``compile()``, so replay needs no
-        host branch or D2H read. Deterministic and H128/D576 executions require
-        each runtime input's presence, shape, dtype, and device to match the
-        sample contract used to compile the plan.
+        the positional order of the pre-existing parameters is unchanged.
+        Every prepared SM100 route additionally never compiles here. Adaptive
+        pairing makes its overlap decision on device and launches only stages
+        compiled by ``compile()``, so replay needs no host branch or D2H read.
+        SM100 runtime inputs must match the sample contract used to compile the
+        plan. SM90 retains its legacy first-execute compilation behavior.
         Inputs, outputs, and the live workspace must not overlap; concurrent
         executions need distinct output and workspace storage.
         """
+        self._ensure_support_checked()
         for name, tensor in (("dq", dq), ("dkv", dkv), ("d_sink", d_sink)):
             if not isinstance(tensor, torch.Tensor):
                 raise ValueError(f"{name} must be preallocated; use sparse_attention_backward_wrapper for automatic output allocation")
         scale = self.softmax_scale if softmax_scale is None else softmax_scale
-        if self.deterministic or self._backend == _iface_d576.BACKEND:
+        if self._device_major == 10:
             if self._compiled_kernel is None:
                 raise RuntimeError("call compile() before execute()")
             self._validate_compiled_inputs(
@@ -400,8 +420,6 @@ class SparseAttentionBackward(APIBase):
                 deterministic=self.deterministic,
             )
         if self._qcluster_plan is not None:
-            if self._compiled_kernel is None:
-                raise RuntimeError("call compile() before execute()")
             scale = 1.0 / math.sqrt(self.q_desc.shape[2]) if scale is None else scale
             with torch.cuda.device(q.device):
                 return self._qcluster_plan.execute(
@@ -459,7 +477,7 @@ class SparseAttentionBackward(APIBase):
                 deterministic=self.deterministic,
                 workspace=workspace,
                 current_stream=current_stream,
-                _compiled_kernel=self._compiled_kernel if self.deterministic else None,
+                _compiled_kernel=self._compiled_kernel,
             )
 
 
@@ -493,9 +511,10 @@ def sparse_attention_backward_wrapper(
     ``workspace`` must hold at least
     ``SparseAttentionBackward.scratch_workspace_bytes()`` bytes.
 
-    A deterministic ``SparseAttentionBackward.execute()`` is capture-safe
-    after ``compile()``. Warm this convenience wrapper before capture so its
-    cached plan has already been constructed and compiled.
+    An SM100 ``SparseAttentionBackward.execute()`` is capture-safe after
+    ``compile()``. Warm this convenience wrapper before capture so its cached
+    plan has already been constructed and compiled. SM90 still requires one
+    eager execution to populate its concrete-tensor compile caches.
 
     ``q_cluster_mode='adaptive_pair'`` partitions each adjacent query pair on
     the GPU and evaluates a profitable shared KV segment once. The opt-in
