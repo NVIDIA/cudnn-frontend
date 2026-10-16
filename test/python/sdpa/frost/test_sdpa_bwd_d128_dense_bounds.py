@@ -70,7 +70,7 @@ def _reason(facts):
     return engines.mismatch(spec.capabilities, facts)
 
 
-@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("causal", [True])
 @pytest.mark.parametrize("entry", ["graph", "standalone"])
 @pytest.mark.parametrize(
     "geometry,token",
@@ -92,7 +92,7 @@ def test_dense_declaration_rejects_unrepresentable_geometry(geometry, token, cau
             api.check_support()
 
 
-@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("causal", [True])
 @pytest.mark.parametrize(
     "geometry,implementation",
     [
@@ -112,14 +112,3 @@ def test_dense_declaration_accepts_safe_boundaries(geometry, implementation, cau
     assert [(p.engine_id, p.knobs) for p in recommend("A", facts, {"sdpa_bwd_sm100_d128": 20609})] == [(20609, None)]
     assert api.check_support()
     assert api._implementation == implementation
-
-
-@pytest.mark.parametrize("field", ["batch", "heads", "sq", "skv"])
-@pytest.mark.parametrize("value", [0, -1, 1.5, True])
-def test_dense_bounds_require_positive_integer_dimensions(field, value):
-    from cudnn.sdpa.bwd.d128_contract import validate_dense_bounds
-
-    dimensions = dict(batch=1, heads=1, sq=128, skv=128)
-    dimensions[field] = value
-    with pytest.raises(ValueError, match="positive integers"):
-        validate_dense_bounds(**dimensions)

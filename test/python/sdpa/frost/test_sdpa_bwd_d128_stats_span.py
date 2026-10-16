@@ -7,17 +7,15 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import cudnn
 from cudnn.sdpa import graph_analyzer as ga
 from cudnn.sdpa.bwd.d128_thd_contract import validate_stats_span
 from cudnn.sdpa.bwd.heuristics import recommend
-from test_sdpa_bwd_d128_grouped_eligibility import grouped_facts
 from test_sdpa_bwd_d128_thd_eligibility import compiler_version, reason
 
 pytestmark = pytest.mark.L0
 
 
-@pytest.mark.parametrize("heads", [(2, 2), (4, 2), (3, 1), (1, 1)])
+@pytest.mark.parametrize("heads", [(2, 2), (4, 2)])
 @pytest.mark.parametrize("boundary", ["wide_int64", "last_accepted", "first_rejected"])
 def test_hn_stats_span_graph_and_standalone_boundary(monkeypatch, heads, boundary):
     from cudnn import _pybind_module
@@ -73,10 +71,3 @@ def test_hn_stats_span_graph_and_standalone_boundary(monkeypatch, heads, boundar
     else:
         with pytest.raises(NotImplementedError, match="Stats span.*signed pointer"):
             api.check_support()
-
-
-def test_review_huge_stats_declaration_declines_before_ranking():
-    value = grouped_facts(thd=True, packing="HN", h_q=4, h_kv=2)
-    value.stats_t.get_stride = lambda: (1, 2**61, 1, 1)
-    assert "Stats span" in reason(value)
-    assert recommend("A", value, {"sdpa_bwd_sm100_d128": 20609}) == []

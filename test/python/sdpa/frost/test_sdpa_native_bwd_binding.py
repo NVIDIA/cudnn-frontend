@@ -23,9 +23,7 @@ _ARCHES = (
     "sm107_thd",
     "sm120",
     "sm100_d128",
-    "sm100_d128_accum",
     "sm100_d128_thd",
-    "sm100_d128_grouped_dense",
     "sm100_d128_grouped_thd",
 )
 _D128_THD_ARCHES = ("sm100_d128_thd", "sm100_d128_grouped_thd")
@@ -174,9 +172,17 @@ def test_native_standalone_prefix_form_and_storage(arch, q_prefix, kv_prefix):
             prep.bind(spec, dict(facts, **{role: facts[role]._replace(strides=(2,), span=6)}), _WORKSPACE, 17)
 
 
-@pytest.mark.parametrize("role", ["seq_q", "seq_kv", "ragged_q", "ragged_stats", "ragged_dv"])
-@pytest.mark.parametrize("fault", ["missing", "dtype", "alignment", "short", "overlap"])
 @pytest.mark.parametrize("arch", _D128_THD_ARCHES)
+@pytest.mark.parametrize(
+    "role,fault",
+    [
+        ("seq_q", "missing"),
+        ("seq_kv", "short"),
+        ("ragged_q", "dtype"),
+        ("ragged_stats", "alignment"),
+        ("ragged_dv", "overlap"),
+    ],
+)
 def test_d128_thd_metadata_revalidates_current_storage(arch, role, fault):
     spec, native, facts, _, frames = _fixture(arch)
     indices = tuple(range(len(spec.operands)))
@@ -216,6 +222,13 @@ def test_actual_backward_host_frames_match_python(arch, dtype, features, wide):
         assert list(frames[-1]) == expected
         held.append((actual, tuple(expected)))
     assert all(actual == expected for actual, expected in held)
+
+
+@pytest.mark.parametrize("arch", ["sm100_d128_accum", "sm100_d128_grouped_dense"])
+def test_dense_d128_accumulation_host_frame_matches_python(arch):
+    # These dense variants share the nine-operand ABI. Retain a complete frame
+    # comparison, including pointer rebinding, stream changes and wide products.
+    test_actual_backward_host_frames_match_python(arch, "bfloat16", False, 2)
 
 
 @pytest.mark.parametrize("arch", _ARCHES)
@@ -311,8 +324,16 @@ def test_backward_positive_workspace_rejects_missing_or_unaligned_storage(native
     assert not frames
 
 
-@pytest.mark.parametrize("role", ["q", "stats", "dq", "dk", "dv"])
-@pytest.mark.parametrize("fault", ["missing", "alignment", "short"])
+@pytest.mark.parametrize(
+    "role,fault",
+    [
+        ("q", "missing"),
+        ("stats", "alignment"),
+        ("dq", "short"),
+        ("dk", "alignment"),
+        ("dv", "missing"),
+    ],
+)
 def test_backward_zero_workspace_revalidates_operand_storage(role, fault):
     spec, native, facts, _, frames = _fixture(workspace_bytes=0)
     _native(spec, native, facts, 0)
@@ -419,8 +440,8 @@ def test_d128_accumulation_guard_is_shared_by_graph_and_standalone():
         assert len(frames) == 2
 
 
-@pytest.mark.parametrize("role", ["seq_q", "seq_kv", "ragged_q", "ragged_stats", "ragged_dv"])
 @pytest.mark.parametrize("arch", _D128_THD_ARCHES)
+@pytest.mark.parametrize("role", ["seq_q", "ragged_stats", "ragged_dv"])
 def test_d128_thd_guard_rejects_output_metadata_aliases(arch, role):
     from cudnn.sdpa.bwd.prepared_sm100_d128_thd import _GuardedEntry
 

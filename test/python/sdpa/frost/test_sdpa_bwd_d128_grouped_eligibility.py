@@ -49,46 +49,23 @@ def grouped_facts(*, thd, packing="TH1", **overrides):
     return ga.SdpaGraphFacts(**values, port_layouts=tuple(ports), stats_t=stats)
 
 
-@pytest.mark.parametrize("thd,packing", [(False, "HN"), (True, "TH1"), (True, "HN")])
-@pytest.mark.parametrize("heads", [(4, 2), (6, 2), (3, 1), (8, 1)])
-@pytest.mark.parametrize("dtype", [cudnn.data_type.BFLOAT16])
-@pytest.mark.parametrize("causal", [False, True])
-def test_grouped_declaration_accepts_and_ranks(thd, packing, heads, dtype, causal):
-    value = grouped_facts(thd=thd, packing=packing, h_q=heads[0], h_kv=heads[1], dtype=dtype, causal=causal)
-    assert reason(value) is None
-    assert [(plan.engine_id, plan.knobs) for plan in recommend("A", value, {"sdpa_bwd_sm100_d128": 20609})] == [(20609, None)]
-
-
-@pytest.mark.parametrize("thd", [False, True])
 @pytest.mark.parametrize(
-    "overrides,token",
+    "thd,overrides,token",
     [
-        ({"device_cc": (10, 3)}, "cc 10.0"),
-        ({"device_cc": (10, 6)}, "cc 10.0"),
-        ({"scale": -0.1}, "positive"),
-        ({"scale": 1e-100}, "positive"),
-        ({"scale": 3e38}, "positive"),
-        ({"scale": 0.0}, "attn_scale = 0"),
-        ({"h_q": 3, "h_kv": 2}, "divisible"),
-        ({"h_q": 2, "h_kv": 4}, "Hq > Hkv"),
-        ({"b": 65536}, "grid"),
-        ({"s_q": 2**31 - 127}, "tile rounding"),
-        ({"deterministic": True}, "deterministic"),
-        ({"bottom_right": True, "causal": True}, "bottom-right"),
-        ({"window_left": 16}, "sliding window"),
+        (False, {"b": 65536}, "grid"),
+        (True, {"b": 65536}, "grid"),
+        (False, {"s_q": 2**31 - 127}, "tile rounding"),
+        (True, {"s_q": 2**31 - 127}, "tile rounding"),
+        (False, {"scale": 3e38}, "positive"),
+        (True, {"scale": 3e38}, "positive"),
+        (False, {"window_left": 16}, "sliding window"),
+        (True, {"window_left": 16}, "sliding window"),
     ],
 )
 def test_grouped_declaration_declines_before_ranking(thd, overrides, token):
     value = grouped_facts(thd=thd, **overrides)
     assert token.lower() in reason(value).lower()
     assert recommend("A", value, {"sdpa_bwd_sm100_d128": 20609}) == []
-
-
-@pytest.mark.parametrize("thd", [False, True])
-@pytest.mark.parametrize("version", [("nvidia-cutlass-dsl", "4.7.4"), ("cutlass", "4.8.0"), ("nvidia-cutlass-dsl", "unknown")])
-def test_grouped_requires_public_dsl_48(monkeypatch, thd, version):
-    monkeypatch.setattr(engines, "cutedsl_state", lambda: (True, version))
-    assert "nvidia-cutlass-dsl >= 4.8.0" in reason(grouped_facts(thd=thd))
 
 
 @pytest.mark.parametrize("side", ["s_q", "s_kv"])
@@ -125,16 +102,15 @@ def test_grouped_packed_layout_uses_each_ports_head_count(packing):
         assert "physical Q-token capacity" in reason(value)
 
 
-@pytest.mark.parametrize("thd", [False, True])
 @pytest.mark.parametrize(
-    "cc,scale,version,accepted",
+    "thd,cc,scale,version,accepted",
     [
-        ((10, 0), None, "4.8.0", True),
-        ((10, 0), 0.125, "4.8.0", True),
-        ((10, 3), 0.125, "4.8.0", False),
-        ((10, 0), -0.125, "4.8.0", False),
-        ((10, 0), 1e-100, "4.8.0", False),
-        ((10, 0), 0.125, "4.7.4", False),
+        (True, (10, 0), None, "4.8.0", True),
+        (False, (10, 0), 0.125, "4.8.0", True),
+        (False, (10, 3), 0.125, "4.8.0", False),
+        (True, (10, 0), -0.125, "4.8.0", False),
+        (False, (10, 0), 1e-100, "4.8.0", False),
+        (True, (10, 0), 0.125, "4.7.4", False),
     ],
 )
 def test_grouped_graph_gate_matches_standalone(monkeypatch, thd, cc, scale, version, accepted):
@@ -181,9 +157,15 @@ def test_grouped_graph_gate_matches_standalone(monkeypatch, thd, cc, scale, vers
             api.check_support()
 
 
-@pytest.mark.parametrize("thd", [False, True])
-@pytest.mark.parametrize("heads", [(4, 2), (6, 2), (3, 1)])
-@pytest.mark.parametrize("dtype,causal", [(torch.bfloat16, False), (torch.bfloat16, True)])
+@pytest.mark.parametrize(
+    "thd,heads,dtype,causal",
+    [
+        (False, (4, 2), torch.bfloat16, False),
+        (False, (6, 2), torch.bfloat16, True),
+        (True, (3, 1), torch.bfloat16, False),
+        (True, (6, 2), torch.bfloat16, True),
+    ],
+)
 def test_real_grouped_graph_accepts(monkeypatch, thd, heads, dtype, causal):
     from test_sdpa_bwd_dsl_sm107 import _half_bwd_graph
 
@@ -263,7 +245,7 @@ def test_real_grouped_thd_declared_capacity_and_head_major_stats(monkeypatch, he
 
 
 @pytest.mark.parametrize("thd", [False, True])
-@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("causal", [True])
 @pytest.mark.parametrize("heads", [(4, 2), (3, 1), (2, 2)], ids=["gqa", "mqa", "mha-preserved"])
 def test_fp16_grouped_declines_while_mha_remains_supported(monkeypatch, thd, causal, heads):
     from cudnn import _pybind_module

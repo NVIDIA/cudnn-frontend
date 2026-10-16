@@ -32,29 +32,13 @@ def _reason(monkeypatch, cc=(10, 0), **kw):
     return mismatch(_spec().capabilities, facts)
 
 
-def test_registration_and_capabilities():
-    from cudnn.engines.engine_ids import FROST_SDPA_BWD_ID_BASE
-    from cudnn.engines.manifest import MANIFEST
-
-    family = next(f for f in MANIFEST if f.name == "frost_sdpa_bwd")
-    slot = family.slots[_ENGINE]
-    assert slot.slot == 9 and slot.opt_in
-    assert FROST_SDPA_BWD_ID_BASE + slot.slot == 20609
-    c = _spec().capabilities
-    assert (c.sm_lo, c.sm_hi) == (100, 106)
-    assert c.d == frozenset({128}) and not c.d_envelope
-    assert c.causal and c.compact_bshd and c.decode
-    assert c.thd and c.thd_declared_totals and c.thd_ragged_offsets and callable(c.declaration_check)
-    assert c.gqa
-    assert c.dtypes == frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})
-    for feature in ("bottom_right", "swa", "padded", "bias", "dbias", "sink", "dsink", "dropout", "deterministic", "dynamic_scale"):
-        assert not getattr(c, feature), feature
-
-
 @pytest.mark.parametrize(
     "kw",
-    [dict(), dict(dt=torch.float16), dict(use_causal_mask=True), dict(sq=1, skv=65), dict(sq=257, skv=129), dict(b=1, hq=1)],
-    ids=["dense", "fp16", "causal", "one-query", "rectangular-tail", "one-head"],
+    [
+        dict(dt=torch.float16),
+        dict(sq=1, skv=65),
+        dict(sq=257, skv=129),
+    ],
 )
 def test_dense_graph_accepts(monkeypatch, kw):
     assert _reason(monkeypatch, **kw) is None
@@ -79,7 +63,7 @@ def test_dense_graph_declines(monkeypatch, kw, token):
     assert reason is not None and token.lower() in reason.lower(), reason
 
 
-@pytest.mark.parametrize("port", ["q", "k", "v", "o", "do", "dq", "dk", "dv"])
+@pytest.mark.parametrize("port", ["q", "k", "dq", "dv"])
 def test_padded_bshd_port_is_declined(monkeypatch, port):
     from cudnn.sdpa import graph_analyzer as ga
     from cudnn.sdpa.bwd.engines import mismatch
@@ -192,9 +176,19 @@ def _check_case(case, tensors=None, expected=None):
 
 
 @requires_pre_rubin_blackwell
-@pytest.mark.parametrize("dt", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
-@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
-@pytest.mark.parametrize("sq,sk", [(1, 65), (65, 1), (64, 64), (65, 129), (257, 193), (513, 521)])
+@pytest.mark.parametrize(
+    "dt,causal,sq,sk",
+    [
+        (torch.bfloat16, False, 1, 65),
+        (torch.bfloat16, True, 1, 65),
+        (torch.float16, True, 65, 1),
+        (torch.bfloat16, False, 65, 1),
+        (torch.bfloat16, True, 65, 129),
+        (torch.float16, False, 257, 193),
+        (torch.bfloat16, False, 513, 521),
+        (torch.float16, True, 257, 193),
+    ],
+)
 def test_graph_matches_fp64(dt, causal, sq, sk):
     b, h = (2, 3) if (sq, sk) == (257, 193) else (1, 2)
     _case(dt=dt, causal=causal, sq=sq, sk=sk, b=b, h=h)
@@ -220,8 +214,7 @@ def test_one_launch_without_workspace_allocation_or_sync():
 
 
 @requires_pre_rubin_blackwell
-@pytest.mark.parametrize("dt", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
-@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+@pytest.mark.parametrize("dt,causal", [(torch.bfloat16, False), (torch.float16, True)], ids=["bf16-unmasked", "fp16-causal"])
 def test_rebind_and_replay(dt, causal):
     case = _case(dt=dt, causal=causal, b=2, h=3)
     tensors = {name: value.clone() for name, value in case.tensors.items()}

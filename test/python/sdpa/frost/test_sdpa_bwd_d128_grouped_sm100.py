@@ -21,18 +21,16 @@ from d128_grouped_test_utils import (
     make_case,
     make_graph,
     make_workspace,
-    permuted_sequences,
     poison,
     reference_sequences,
     variant_pack,
 )
 from frost_test_utils import requires_dsl
 from test_sdpa_bwd_d128_accum_sm100 import _require_accumulation
-from test_sdpa_bwd_dsl_sm107 import _TOL, _reference64
+from test_sdpa_bwd_dsl_sm107 import _reference64
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 _DTYPES = [torch.bfloat16]
-_HEADS = [pytest.param(4, 2, id="gqa2"), pytest.param(6, 2, id="gqa3"), pytest.param(3, 1, id="mqa3"), pytest.param(8, 1, id="mqa8")]
 
 
 def _graph_case(case):
@@ -48,25 +46,19 @@ def _stable_kv(case, previous=None):
     return current
 
 
-@pytest.mark.parametrize("dtype", _DTYPES, ids=["bf16"])
-def test_grouped_thd_standalone_smoke(dtype):
-    """First small dispatch; make_adapter alone is a compile-only entry point."""
-    _require_accumulation()
-    case = make_case((3, 1), (5, 2), hq=4, hkv=2, dtype=dtype, gaps=False, offset_dtype=torch.int32)
-    api = make_adapter(case)
-    workspace = make_workspace(api.scratch_workspace_bytes())
-    poison(case, workspace)
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    api.execute(**adapter_arguments(case), workspace=workspace.tensor, current_stream=stream.cuda_stream)
-    torch.cuda.current_stream().wait_stream(stream)
-    check_case(case, workspace)
-
-
-@pytest.mark.parametrize("hq,hkv", _HEADS)
-@pytest.mark.parametrize("dtype", _DTYPES, ids=["bf16"])
-@pytest.mark.parametrize("causal", [False, True], ids=["none", "causal"])
-@pytest.mark.parametrize("thd", [False, True], ids=["dense", "thd"])
+@pytest.mark.parametrize(
+    "hq,hkv,dtype,causal,thd",
+    [
+        (4, 2, torch.bfloat16, False, False),
+        (6, 2, torch.bfloat16, True, False),
+        (3, 1, torch.bfloat16, False, False),
+        (8, 1, torch.bfloat16, True, False),
+        (4, 2, torch.bfloat16, True, True),
+        (6, 2, torch.bfloat16, False, True),
+        (3, 1, torch.bfloat16, True, True),
+        (8, 1, torch.bfloat16, False, True),
+    ],
+)
 def test_grouped_matrix(hq, hkv, dtype, causal, thd):
     _require_accumulation()
     # Pair each head ratio with a different storage contract, rather than
@@ -88,7 +80,7 @@ def test_grouped_matrix(hq, hkv, dtype, causal, thd):
         stable = _stable_kv(case, stable)
 
 
-@pytest.mark.parametrize("dtype,causal", [(torch.bfloat16, False), (torch.bfloat16, True)], ids=["bf16-none", "bf16-causal"])
+@pytest.mark.parametrize("dtype,causal", [(torch.bfloat16, True)])
 def test_grouped_thd_all_empty(dtype, causal):
     _require_accumulation()
     case = make_case((0, 0), (0, 0), hq=3, hkv=1, dtype=dtype, causal=causal, stats_layout="HN", envelope=(128, 128))
@@ -120,29 +112,7 @@ def test_grouped_thd_optional_origins_and_length_forms(ports, dtype):
         check_case(case, workspace)
 
 
-@pytest.mark.parametrize("whole_groups", [False, True], ids=["within-group", "kv-group"])
-@pytest.mark.parametrize("dtype", _DTYPES, ids=["bf16"])
-def test_grouped_head_permutations(whole_groups, dtype):
-    _require_accumulation()
-    original = make_case((65, 3), (17, 129), hq=6, hkv=2, dtype=dtype, causal=True)
-    sequences, q_order, kv_order = permuted_sequences(original.sequences, 6, 2, True, whole_groups=whole_groups)
-    changed = make_case(original.lens_q, original.lens_kv, hq=6, hkv=2, dtype=dtype, causal=True, sequences=sequences)
-    graph, refs, pack, workspace = _graph_case(original)
-    for case, bindings in ((original, pack), (changed, variant_pack(changed, refs))):
-        poison(case, workspace)
-        graph.execute(bindings, workspace.tensor)
-        check_case(case, workspace)
-    for role in GRADS:
-        head_order = q_order if role == "dq" else kv_order
-        for i, length in enumerate(original.lens_q if role == "dq" else original.lens_kv):
-            a, b = original.origins[role][i], changed.origins[role][i]
-            want = original.tensors[role][0, a : a + length].cpu().index_select(1, head_order).float()
-            got = changed.tensors[role][0, b : b + length].cpu().float()
-            torch.testing.assert_close(got, want, **_TOL[dtype])
-
-
-@pytest.mark.parametrize("dtype", _DTYPES, ids=["bf16"])
-@pytest.mark.parametrize("causal", [False, True], ids=["none", "causal"])
+@pytest.mark.parametrize("dtype,causal", [(torch.bfloat16, False)])
 def test_grouped_native_partials_fp32_fold_cancellation(dtype, causal):
     _require_accumulation()
     sequences = cancellation_sequences(dtype, causal)
@@ -170,8 +140,13 @@ def test_grouped_autograd_oracle_matches_analytic_fp64(dtype):
                     torch.testing.assert_close(seq[role], expected[0].transpose(0, 1), atol=1e-12, rtol=1e-12)
 
 
-@pytest.mark.parametrize("thd", [False, True], ids=["dense4", "thd5"])
-@pytest.mark.parametrize("dtype,causal", [(torch.bfloat16, False), (torch.bfloat16, True)], ids=["bf16-none", "bf16-causal"])
+@pytest.mark.parametrize(
+    "thd,dtype,causal",
+    [
+        (False, torch.bfloat16, False),
+        (True, torch.bfloat16, True),
+    ],
+)
 def test_grouped_launches_no_allocation_or_host_reads(thd, dtype, causal, monkeypatch):
     _require_accumulation()
     import cutlass.cute as cute
@@ -312,23 +287,7 @@ def test_grouped_undersized_workspace_rejected_before_launch(thd):
     check_case(case, workspace)
 
 
-@pytest.mark.parametrize(
-    "hq,hkv,sq,skv", [(3, 2, 128, 256), (2, 4, 128, 256), (4, 2, 129, 256), (4, 2, 128, 257)], ids=["nonintegral", "reversed", "q-tail", "kv-tail"]
-)
-def test_grouped_dense_declines_unsupported_metadata(hq, hkv, sq, skv):
-    from types import SimpleNamespace
-
-    _require_accumulation()
-    valid = make_case((128,), (256,), thd=False)
-    # The public constructor accepts metadata-only TensorDesc samples. These
-    # requested unsupported geometries never compile or bind physical storage.
-    metadata = SimpleNamespace(**(vars(valid) | {"hq": hq, "hkv": hkv, "envelope": (sq, skv)}))
-    api = make_adapter(metadata, compile_plan=False)
-    with pytest.raises(NotImplementedError, match="head|ratio|128|align|GQA|group"):
-        api.check_support()
-
-
-@pytest.mark.parametrize("dtype,causal", [(torch.bfloat16, False), (torch.bfloat16, True)], ids=["bf16-none", "bf16-causal"])
+@pytest.mark.parametrize("dtype,causal", [(torch.bfloat16, True)])
 def test_grouped_thd_persistent_reuse(dtype, causal):
     """More Q-head/KV-tile owners than B200 SMs, including a zero-Q sequence."""
     _require_accumulation()

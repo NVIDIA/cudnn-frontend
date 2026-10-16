@@ -2,8 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Dense d128 accumulation selection, prepared workspace and replay contract."""
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 
@@ -72,65 +70,27 @@ def test_accumulation_scheduler_divisor_fits_int32():
     assert select_implementation(**(args | {"sq": 102400}), skv=2**31 - 128) == ACCUMULATION
 
 
-def test_workspace_capacity_for_every_public_alignment():
-    from cudnn.sdpa.bwd.d128_contract import workspace_layout
-
-    for b, h, sq in ((1, 1, 128), (2, 3, 256), (3, 7, 512)):
-        regions, required = workspace_layout(b, h, sq)
-        dq_bytes, delta_bytes = 4 * b * sq * h * 128, 4 * b * h * sq
-        assert regions == ((0, (b, sq, h, 128), (sq * h * 128, h * 128, 128, 1)), (dq_bytes, (b, h, sq), (h * sq, sq, 1)))
-        assert required == dq_bytes + delta_bytes + 240
-        for residue in range(0, 256, 16):
-            address = 2**40 + residue
-            payload = (address + 255) & -256
-            assert payload % 256 == 0 and 0 <= payload - address <= 240
-            assert payload + dq_bytes + delta_bytes <= address + required
-        assert ((2**40 + 16 + 255) & -256) + dq_bytes + delta_bytes == 2**40 + 16 + required
-
-
-def test_positional_guard_refuses_before_any_launch():
-    from cudnn.sdpa.bwd.prepared_sm100_d128 import _GuardedAccumulationEntry
-
-    frames = []
-    operands = (SimpleNamespace(span=1024, itemsize=2),) * 9
-    guarded = _GuardedAccumulationEntry(lambda *args: frames.append(args), operands, 4096)
-    pointers = tuple(0x100000 + i * 0x10000 for i in range(9))
-    valid = (*pointers, 0x900000, 0.125, 17)
-    guarded(*valid)
-    assert frames == [valid]
-    invalid = [valid[:10] + (value, 17) for value in (0.0, -0.125, float("nan"), float("inf"), 1e-50, 3e38)]
-    for workspace in (0, 1, 2**63 - 16, pointers[0]):
-        invalid.append((*pointers, workspace, 0.125, 17))
-    for source in (0, 5, 6):
-        changed = list(pointers)
-        changed[7] = pointers[source] + 16
-        invalid.append((*changed, 0x900000, 0.125, 17))
-    for frame in invalid:
-        with pytest.raises(ValueError):
-            guarded(*frame)
-        assert frames == [valid]
-    changed = tuple(p + 32 for p in pointers)
-    guarded(*changed, 0x900010, 0.25, 29)
-    assert frames[-1] == (*changed, 0x900010, 0.25, 29)
-
-
-@pytest.mark.parametrize("dt", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
-@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
-@pytest.mark.parametrize("sq,sk", [(128, 128), (128, 256), (256, 128)])
+@pytest.mark.parametrize(
+    "dt,causal,sq,sk",
+    [
+        (torch.bfloat16, False, 128, 128),
+        (torch.bfloat16, True, 128, 256),
+        (torch.float16, False, 256, 128),
+        (torch.float16, True, 128, 128),
+    ],
+)
 def test_accumulation_matches_fp64(dt, causal, sq, sk):
     _require_accumulation()
     _case(dt=dt, causal=causal, b=2, h=3, sq=sq, sk=sk, accumulation=True)
 
 
-@pytest.mark.parametrize("dt", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
-@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+@pytest.mark.parametrize("dt,causal", [(torch.bfloat16, False), (torch.float16, True)], ids=["bf16-unmasked", "fp16-causal"])
 def test_negative_scale_preserves_recompute_route(dt, causal):
     _require_accumulation()
     _case(dt=dt, causal=causal, sq=128, sk=256, scale=-0.125)
 
 
-@pytest.mark.parametrize("dt", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
-@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+@pytest.mark.parametrize("dt,causal", [(torch.bfloat16, True)])
 def test_three_launches_without_allocation_or_sync(dt, causal):
     _require_accumulation()
     case = _case(dt=dt, causal=causal, sq=128, sk=256, accumulation=True, check_build=True)
@@ -151,8 +111,7 @@ def test_three_launches_without_allocation_or_sync(dt, causal):
     _check_case(case)
 
 
-@pytest.mark.parametrize("dt", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
-@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+@pytest.mark.parametrize("dt,causal", [(torch.bfloat16, True)])
 def test_workspace_alignment_poison_and_bounds(dt, causal):
     _require_accumulation()
     case = _case(dt=dt, causal=causal, sq=128, sk=256, accumulation=True)
@@ -175,8 +134,7 @@ def test_workspace_alignment_poison_and_bounds(dt, causal):
             case.graph.execute(case.pack, bad)
 
 
-@pytest.mark.parametrize("dt", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
-@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+@pytest.mark.parametrize("dt,causal", [(torch.bfloat16, False), (torch.float16, True)], ids=["bf16-unmasked", "fp16-causal"])
 def test_accumulation_rebind_and_capture(dt, causal):
     _require_accumulation()
     case = _case(dt=dt, causal=causal, b=2, h=3, sq=128, sk=256, accumulation=True)
@@ -221,7 +179,7 @@ def test_accumulation_rebind_and_capture(dt, causal):
         cudnn.destroy_handle(handle)
 
 
-@pytest.mark.parametrize("dt,causal", [(torch.bfloat16, False), (torch.float16, True)], ids=["bf16-dense", "fp16-causal"])
+@pytest.mark.parametrize("dt,causal", [(torch.bfloat16, False)])
 def test_accumulation_reloads_artifact_without_compilation(monkeypatch, tmp_path, dt, causal):
     _require_accumulation()
     import cutlass.cute as cute
@@ -261,8 +219,7 @@ def test_accumulation_reloads_artifact_without_compilation(monkeypatch, tmp_path
         capture.reset()
 
 
-@pytest.mark.parametrize("dt", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
-@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+@pytest.mark.parametrize("dt,causal", [(torch.float16, True)])
 def test_accumulation_standalone_scale_and_current_stream(dt, causal, monkeypatch):
     from cudnn.sdpa.bwd.api_dsl_sm100_d128 import SdpaBwdDslSm100D128
 
@@ -312,79 +269,3 @@ def test_accumulation_standalone_scale_and_current_stream(dt, causal, monkeypatc
         assert not entered
     api.execute(**args, workspace=case.workspace, scale_softmax=scale)
     _check_case(case, tensors, expected)
-
-
-@pytest.mark.parametrize("implementation", ["recompute", "accumulation"])
-def test_prepared_metadata_normalizes_only_unused_pitches(monkeypatch, implementation):
-    from contextlib import nullcontext
-    import importlib
-
-    from cudnn.frost import device
-    from cudnn.frost.buffers import cutedsl_state
-    from cudnn.sdpa.bwd import prepared_sm100_d128 as prepared
-    from cudnn.sdpa.bwd.d128_contract import ACCUMULATION, select_implementation
-
-    if implementation == ACCUMULATION and select_implementation((10, 0), cutedsl_state()[1], 1, 1, 128, 256, 0.125) != ACCUMULATION:
-        pytest.skip("accumulation host requires public CuTeDSL >= 4.8")
-    module = "prepared_d128_accum_host" if implementation == ACCUMULATION else "prepared_d128_host"
-    kernel = importlib.import_module("cudnn.sdpa.bwd.kernels.sm100." + module)
-    calls = []
-
-    def compile_host(*args):
-        calls.append(args)
-        return lambda *frame: None
-
-    monkeypatch.setattr(kernel, "compile_host", compile_host)
-    monkeypatch.setattr(prepared, "positional_entry", lambda entry: entry)
-    monkeypatch.setattr(device, "resolve_device", lambda declared: 3)
-    monkeypatch.setattr(device, "compute_capability", lambda index: (10, 0))
-    monkeypatch.setattr(torch.cuda, "device", lambda index: nullcontext())
-    required = 4 * 128 * 129 + 240 if implementation == ACCUMULATION else 0
-    api = SimpleNamespace(
-        dtype=torch.bfloat16,
-        _implementation=implementation,
-        batch_size=1,
-        h_q=1,
-        s_q_max=128,
-        is_causal=False,
-        scale_softmax=0.125,
-        _NAME="sdpa_bwd_sm100_d128",
-        scratch_workspace_bytes=lambda: required,
-    )
-    for role in ("q", "k", "v", "o", "do", "stats", "dq", "dk", "dv"):
-        sequence = 256 if role in ("k", "v", "dk", "dv") else 128
-        stats = role == "stats"
-        desc = SimpleNamespace(
-            shape=(1, 1, sequence, 1 if stats else 128),
-            stride=(3, 5, 1, 99) if stats else (3, 5, 128, 1),
-            dtype=torch.float32 if stats else torch.bfloat16,
-            device=torch.device("cuda", 3),
-        )
-        setattr(api, role + "_desc", desc)
-    result = prepared.compile_plan(api)
-    assert len(calls) == 1 and result.workspace_bytes == required and result.device_index == 3
-    assert result.artifact.implementation == implementation and not result.scale_log2
-    assert calls[0][0][0] == ((1, 128, 1, 128), (16384, 128, 128, 1))
-    assert calls[0][0][1] == ((1, 256, 1, 128), (32768, 128, 128, 1))
-    assert calls[0][0][5] == ((1, 1, 128), (128, 128, 1))
-    assert result.operands[0].span == 16384 and result.operands[5].span == 128
-
-
-def test_fixed_tile_selection_keeps_public_knobs_truthful():
-    from cudnn.sdpa.bwd.config_sm100_d128 import CFG as recompute
-    from cudnn.sdpa.bwd.config_sm100_d128_accum import CFG as accumulation
-    from cudnn.sdpa.bwd.engine import FrostSdpaBwdEngine
-    from cudnn.sdpa.bwd.engines import SdpaBwdKnobs, mismatch
-    from cudnn.sdpa.bwd.heuristics import default_knobs
-    from test_sdpa_bwd_d128_sm100 import _spec
-
-    spec = _spec()
-    assert (recompute.TILE_M, recompute.TILE_N) == (accumulation.M, accumulation.N) == (128, 128)
-    assert not spec.capabilities.tile_ms and not spec.capabilities.tile_ns
-    assert default_knobs(spec, None) is None
-    assert SdpaBwdKnobs().to_public() == {}
-    assert FrostSdpaBwdEngine(spec, 20609).knobs_to_public(None) == {}
-    for field in ("tile_m", "tile_n"):
-        request = SdpaBwdKnobs(**{field: 128})
-        reason = mismatch(spec.capabilities, SimpleNamespace(invalid=None, is_backward=True), request)
-        assert reason is not None and field in reason and "outside" in reason

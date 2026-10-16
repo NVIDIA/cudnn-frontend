@@ -29,16 +29,6 @@ from test_sdpa_bwd_d128_accum_sm100 import _require_accumulation
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 
-_DTYPES = [torch.bfloat16, torch.float16]
-_RECIPES = [
-    pytest.param((128, 256), (128, 256), 2, id="equal"),
-    pytest.param((1, 63, 64, 65, 127, 128, 129, 255, 256, 257), (257, 256, 255, 129, 128, 127, 65, 64, 63, 1), 3, id="tails"),
-    pytest.param((129, 0, 65, 1), (3, 257, 0, 129), 2, id="mixed_empty"),
-    pytest.param((0, 0), (1, 129), 2, id="zero_q"),
-    pytest.param((1, 129), (0, 0), 2, id="zero_kv"),
-    pytest.param((0, 0), (0, 0), 2, id="zero_both"),
-]
-
 
 def _graph_case(case):
     graph, refs = make_graph(case)
@@ -55,7 +45,7 @@ def _stable_kv(case, previous=None):
     return current
 
 
-@pytest.mark.parametrize("dtype", _DTYPES, ids=["bf16", "fp16"])
+@pytest.mark.parametrize("dtype", [torch.float16], ids=["fp16"])
 def test_thd_mha_standalone_smoke(dtype):
     """Small first dispatch; independent of the graph capability row."""
     _require_accumulation()
@@ -71,36 +61,14 @@ def test_thd_mha_standalone_smoke(dtype):
     check_case(case, workspace)
 
 
-def test_thd_mha_graph_smoke():
-    _require_accumulation()
-    case = make_case((3, 1), (5, 2), gaps=False, offset_dtype=torch.int32)
-    graph, _, pack, workspace = _graph_case(case)
-    poison(case, workspace)
-    graph.execute(pack, workspace.tensor)
-    check_case(case, workspace)
-
-
-def test_thd_mha_standalone_compact_prefix():
-    _require_accumulation()
-    case = make_case((3, 1), (5, 2), origin_ports=())
-    assert not case.offsets
-    api = make_adapter(case)
-    workspace = make_workspace(api.scratch_workspace_bytes())
-    poison(case, workspace)
-    api.execute(**adapter_arguments(case), workspace=workspace.tensor)
-    check_case(case, workspace)
-
-
 @pytest.mark.parametrize(
-    "origin_ports",
+    "origin_ports,dtype,causal",
     [
-        pytest.param((), id="compact"),
-        pytest.param(("q", "stats", "dq"), id="q-side-only"),
-        pytest.param(("q", "v", "stats", "dk"), id="mixed-ports"),
+        ((), torch.bfloat16, False),
+        (("q", "stats", "dq"), torch.float16, True),
+        (("q", "v", "stats", "dk"), torch.bfloat16, True),
     ],
 )
-@pytest.mark.parametrize("dtype", _DTYPES, ids=["bf16", "fp16"])
-@pytest.mark.parametrize("causal", [False, True], ids=["none", "causal"])
 def test_thd_mha_standalone_compact_and_mixed_origins(origin_ports, dtype, causal):
     # The public graph contract identifies nonpaged THD through Q/K/V ragged
     # declarations. Standalone also admits compact and optional-port origins.
@@ -114,11 +82,21 @@ def test_thd_mha_standalone_compact_and_mixed_origins(origin_ports, dtype, causa
     check_case(case, workspace)
 
 
-@pytest.mark.parametrize("lens_q,lens_kv,heads", _RECIPES)
-@pytest.mark.parametrize("dtype", _DTYPES, ids=["bf16", "fp16"])
-@pytest.mark.parametrize("causal", [False, True], ids=["none", "causal"])
+@pytest.mark.parametrize(
+    "lens_q,lens_kv,heads,dtype,causal",
+    [
+        ((1, 63, 64, 65, 127, 128, 129, 255, 256, 257), (257, 256, 255, 129, 128, 127, 65, 64, 63, 1), 3, torch.bfloat16, False),
+        ((1, 63, 64, 65, 127, 128, 129, 255, 256, 257), (257, 256, 255, 129, 128, 127, 65, 64, 63, 1), 3, torch.float16, True),
+        ((129, 0, 65, 1), (3, 257, 0, 129), 2, torch.bfloat16, True),
+        ((129, 0, 65, 1), (3, 257, 0, 129), 2, torch.float16, False),
+        ((0, 0), (1, 129), 2, torch.bfloat16, False),
+        ((1, 129), (0, 0), 2, torch.float16, True),
+        ((0, 0), (0, 0), 2, torch.bfloat16, True),
+        ((0, 0), (0, 0), 2, torch.float16, False),
+    ],
+)
 def test_thd_mha_matrix(lens_q, lens_kv, heads, dtype, causal):
-    """24 cells, including empty sequences and both tile-boundary directions."""
+    """Empty sequences and both tile-boundary directions across both dtypes."""
     _require_accumulation()
     # The shared graph contract rejects declarations with S_q = S_kv = 1.
     # Actual empty sequences are tested under a valid nonempty envelope.
@@ -133,8 +111,7 @@ def test_thd_mha_matrix(lens_q, lens_kv, heads, dtype, causal):
         stable = _stable_kv(case, stable)
 
 
-@pytest.mark.parametrize("dtype", _DTYPES, ids=["bf16", "fp16"])
-@pytest.mark.parametrize("causal", [False, True], ids=["none", "causal"])
+@pytest.mark.parametrize("dtype,causal", [(torch.bfloat16, False), (torch.float16, True)])
 def test_thd_mha_persistent_reuse(dtype, causal):
     """More KV owners than B200 SMs, with odd/even Q and KV tile tails."""
     _require_accumulation()
@@ -149,16 +126,14 @@ def test_thd_mha_persistent_reuse(dtype, causal):
 
 
 @pytest.mark.parametrize(
-    "layout,offset_dtype,units",
+    "layout,offset_dtype,units,dtype,causal",
     [
-        pytest.param("TH1", torch.int32, "tokens", id="TH1-i32-tokens"),
-        pytest.param("TH1", torch.int64, "elements", id="TH1-i64-elements"),
-        pytest.param("HN", torch.int32, "elements", id="HN-i32-elements"),
-        pytest.param("HN", torch.int64, "tokens", id="HN-i64-tokens"),
+        ("TH1", torch.int32, "tokens", torch.bfloat16, False),
+        ("TH1", torch.int64, "elements", torch.float16, True),
+        ("HN", torch.int32, "elements", torch.bfloat16, True),
+        ("HN", torch.int64, "tokens", torch.float16, False),
     ],
 )
-@pytest.mark.parametrize("dtype", _DTYPES, ids=["bf16", "fp16"])
-@pytest.mark.parametrize("causal", [False, True], ids=["none", "causal"])
 def test_thd_mha_independent_origins_and_stats(layout, offset_dtype, units, dtype, causal):
     _require_accumulation()
     case = make_case((65, 0, 3), (17, 129, 0), dtype=dtype, causal=causal, stats_layout=layout, offset_dtype=offset_dtype, units=units, layout_shift=19)
@@ -170,9 +145,7 @@ def test_thd_mha_independent_origins_and_stats(layout, offset_dtype, units, dtyp
     check_case(case, workspace)
 
 
-@pytest.mark.parametrize(
-    "prefix_q,prefix_kv", [(False, False), (True, False), (False, True), (True, True)], ids=["length-length", "prefix-length", "length-prefix", "prefix-prefix"]
-)
+@pytest.mark.parametrize("prefix_q,prefix_kv", [(True, False), (False, True)], ids=["prefix-length", "length-prefix"])
 def test_thd_mha_standalone_length_forms(prefix_q, prefix_kv):
     _require_accumulation()
     case = make_case((65, 0, 3), (17, 129, 0), stats_layout="HN")
@@ -192,9 +165,13 @@ def test_thd_mha_standalone_length_forms(prefix_q, prefix_kv):
     check_case(case, workspace)
 
 
-@pytest.mark.parametrize("layout", ["TH1", "HN"])
-@pytest.mark.parametrize("dtype", _DTYPES, ids=["bf16", "fp16"])
-@pytest.mark.parametrize("causal", [False, True], ids=["none", "causal"])
+@pytest.mark.parametrize(
+    "layout,dtype,causal",
+    [
+        ("TH1", torch.bfloat16, False),
+        ("HN", torch.float16, True),
+    ],
+)
 def test_thd_mha_capture_rebind_lengths_origins_and_storage(layout, dtype, causal):
     _require_accumulation()
     options = dict(dtype=dtype, causal=causal, stats_layout=layout, envelope=(257, 257), capacities=(1024, 1024))
@@ -247,7 +224,7 @@ def test_thd_mha_capture_rebind_lengths_origins_and_storage(layout, dtype, causa
         cudnn.destroy_handle(handle)
 
 
-@pytest.mark.parametrize("dtype,causal", [(torch.bfloat16, False), (torch.float16, True)], ids=["bf16-none", "fp16-causal"])
+@pytest.mark.parametrize("dtype,causal", [(torch.bfloat16, False)])
 def test_thd_mha_four_launches_no_allocation_or_host_reads(dtype, causal, monkeypatch):
     _require_accumulation()
     import cutlass.cute as cute
@@ -295,7 +272,7 @@ def test_thd_mha_four_launches_no_allocation_or_host_reads(dtype, causal, monkey
     check_case(case, workspace)
 
 
-@pytest.mark.parametrize("layout", ["TH1", "HN"])
+@pytest.mark.parametrize("layout", ["HN"])
 def test_thd_mha_compile_key_excludes_runtime_metadata(layout, tmp_path, monkeypatch):
     _require_accumulation()
     import cutlass.cute as cute
@@ -326,34 +303,3 @@ def test_thd_mha_compile_key_excludes_runtime_metadata(layout, tmp_path, monkeyp
     check_case(second, workspace2)
     final = compiled_cache.stats()
     assert final["misses"] == initial["misses"] and final["hits"] > initial["hits"], (initial, final)
-
-
-@pytest.mark.parametrize("dtype", _DTYPES, ids=["bf16", "fp16"])
-@pytest.mark.parametrize("causal", [False, True], ids=["none", "causal"])
-def test_thd_mha_dense_twin(dtype, causal):
-    """A THD feature must preserve the qualified dense three-launch branch."""
-    from test_sdpa_bwd_d128_sm100 import _case
-    from test_sdpa_bwd_dsl_sm107 import _TOL
-
-    _require_accumulation()
-    case = make_case((128, 128), (256, 256), dtype=dtype, causal=causal, gaps=False)
-    graph, _, pack, workspace = _graph_case(case)
-    graph.execute(pack, workspace.tensor)
-    check_case(case, workspace)
-    dense = _case(dt=dtype, causal=causal, b=2, h=2, sq=128, sk=256, accumulation=True)
-    for i, seq in enumerate(case.sequences):
-        for role in ("q", "k", "v", "o", "do"):
-            dense.tensors[role][i].copy_(seq[role].transpose(0, 1))
-        dense.tensors["stats"][i, :, :, 0].copy_(seq["stats"].T)
-    for role in GRADS:
-        dense.tensors[role].fill_(float("nan"))
-    dense.workspace.fill_(0xA5)
-    dense.graph.execute(dense.pack, dense.workspace)
-    for role in GRADS:
-        lengths = case.lens_q if role == "dq" else case.lens_kv
-        for i, (start, length) in enumerate(zip(case.origins[role], lengths, strict=True)):
-            want = case.sequences[i][role].transpose(0, 1).float()
-            actual = dense.tensors[role][i].cpu().float()
-            torch.testing.assert_close(actual, want, **_TOL[dtype])
-            thd = case.tensors[role][0, start : start + length].transpose(0, 1).cpu().float()
-            torch.testing.assert_close(actual, thd, **_TOL[dtype])

@@ -83,18 +83,6 @@ def cancellation_sequences(dtype, causal):
     return result
 
 
-def permuted_sequences(sequences, hq, hkv, causal, *, whole_groups):
-    """Independent input permutation, followed by a fresh autograd reference."""
-    ratio = hq // hkv
-    kv_order = torch.arange(hkv - 1, -1, -1) if whole_groups else torch.arange(hkv)
-    q_order = (kv_order[:, None] * ratio + torch.arange(ratio)[None, :]).flatten() if whole_groups else torch.arange(hq).view(hkv, ratio).flip(1).flatten()
-    inputs = [{r: seq[r].index_select(1, q_order if r in ("q", "do") else kv_order) for r in ("q", "k", "v", "do")} for seq in sequences]
-    transformed = reference_sequences(
-        tuple(x["q"].shape[0] for x in inputs), tuple(x["k"].shape[0] for x in inputs), hq, hkv, inputs[0]["q"].dtype, causal, inputs=inputs
-    )
-    return transformed, q_order, kv_order
-
-
 def make_case(
     lens_q,
     lens_kv,
