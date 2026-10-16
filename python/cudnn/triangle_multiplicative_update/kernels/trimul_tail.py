@@ -87,7 +87,9 @@ def tail_params(
     if ln_once is not None:
         kw["ln_once"] = str(ln_once)
     if ln_once_b_stages is not None:
-        kw["ln_once_b_stages"] = ln_once_b_stages if isinstance(ln_once_b_stages, bool) else int(ln_once_b_stages)  # the LN-once item's B-ring depth (appended; a bool reaches the typed decline as itself)  # the LayerNorm-once-per-row-block lever (performance only, bitwise; the substrate's typed vocabulary)
+        kw["ln_once_b_stages"] = (
+            ln_once_b_stages if isinstance(ln_once_b_stages, bool) else int(ln_once_b_stages)
+        )  # the LN-once item's B-ring depth (appended; a bool reaches the typed decline as itself)  # the LayerNorm-once-per-row-block lever (performance only, bitwise; the substrate's typed vocabulary)
     return LnDualGemmParams(
         k=int(c),
         c_out=int(c_z),

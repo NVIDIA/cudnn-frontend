@@ -240,7 +240,14 @@ def validate_knobs(knobs: TriMulKnobs) -> None:
 #            and 384 floors take ("major", ln_once="block"); the 129 and 0 floors (N < 256: 0.6-1.2 tile-waves at B 1, the coarser item most exposed)
 #            stay as shipped until measured.
 def _pick(
-    k2_tile: str, k1_pass_order: str, k3_prologue: str, clc_stages: int, ln_pass_form: str, epi_math: str, ln_once: str = "", ln_once_b_stages: Optional[int] = None
+    k2_tile: str,
+    k1_pass_order: str,
+    k3_prologue: str,
+    clc_stages: int,
+    ln_pass_form: str,
+    epi_math: str,
+    ln_once: str = "",
+    ln_once_b_stages: Optional[int] = None,
 ) -> TriMulKnobs:
     """One COMPLETE bucket pick in axis order (the row tile ``k_block`` is left to :func:`default_k_block`; the LayerNorm-once item ``ln_once`` is OFF
     unless a bucket's A/B/A set it; ``ln_once_b_stages`` (appended) = the item's B-ring depth where a bucket's A/B/A set it, else the shipped ring)."""
@@ -395,7 +402,6 @@ _REFINEMENTS_SM100: Dict[int, Tuple[Tuple[int, int, Optional[str], TriMulKnobs],
         (129, 1, "outgoing", TriMulKnobs(ln_once="block", k1_pass_order="major")),
         (129, 4, None, TriMulKnobs(ln_once="block", k1_pass_order="major")),
         (0, 4, None, TriMulKnobs(ln_once="block", k1_pass_order="major")),
-
         (256, 1, "incoming", TriMulKnobs(ln_pass_form="smem_rolled_pf")),
         (256, 4, None, TriMulKnobs(ln_pass_form="registers")),
         (384, 4, None, TriMulKnobs(ln_pass_form="registers")),

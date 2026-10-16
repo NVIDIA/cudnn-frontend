@@ -2948,12 +2948,17 @@ def sm100_tile_n_pick(d_flavor: int, s_kv: int, *, has_bias: bool, has_kv_mask: 
     ``tile_ns_by_d_shape`` entry) falls back to the domain's minimum; a shape without a domain keeps 128."""
     dom = frozenset(domain) if domain is not None else frozenset({128})
     pick = SM100_FP32_VECTOR_WITH_BIAS_TILE_N if (has_bias and has_kv_mask and kv_mask_fp32) else 128
-    if has_bias and padded and SM100_PADDED_BIAS_TILE_N in dom and int(d_flavor) == 32:  # the measured flavor; at D 64 the 64-wide tile is the budget default above S_kv 128 already
+    if (
+        has_bias and padded and SM100_PADDED_BIAS_TILE_N in dom and int(d_flavor) == 32
+    ):  # the measured flavor; at D 64 the 64-wide tile is the budget default above S_kv 128 already
         # MEASURED (GB200, 152 SMs @ 1830 MHz, cc 10.0, 2026-10-14; both widths in one process, A/B/A x 3 x 100 with a control twin): the bias body on
         # the PADDING leg (per-row kv_lengths) runs faster at the 64-wide KV tile WHILE ITS RESIDENT BLOCK HOLDS S_kv -- the 128-wide form pays a
         # half-empty tail tile off the 128 multiple (D 32, S 256, kv_len 192: 49.15 -> 40.34 us = +21.8 %); above the 64-wide resident budget the
         # 64-wide RING loses to the 128-wide one (D 32, S 384, kv_len 288: -2.3 %; S 512, kv_len 384: -15.5 %), so the ring forms keep the 128-wide tile.
-        if any(sm100_bias_resident_s_kv_max(int(d_flavor), cga, tile_n=SM100_PADDED_BIAS_TILE_N) >= int(s_kv) for cga in SM100_SMALL_D_CGAS[(int(d_flavor), int(d_flavor))]):
+        if any(
+            sm100_bias_resident_s_kv_max(int(d_flavor), cga, tile_n=SM100_PADDED_BIAS_TILE_N) >= int(s_kv)
+            for cga in SM100_SMALL_D_CGAS[(int(d_flavor), int(d_flavor))]
+        ):
             pick = SM100_PADDED_BIAS_TILE_N
     if has_bias and pick == 128 and 64 in dom and (int(d_flavor), int(d_flavor)) in SM100_SMALL_D_CGAS:
         # The BUDGET rule (the only non-default pick without a measurement): when no bias form -- the resident block or a >= 2-stage ring --
