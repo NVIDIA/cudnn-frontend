@@ -60,6 +60,8 @@ from cudnn.frost.tile_dsl.constants import (
 )
 from cudnn.sdpa.fwd.config_sm100 import (
     d256_mxfp8_pair_leg,
+    FP8_DUAL_KV_STREAM_MAX_ROWS,
+    fp8_dual_kv_stream_routed,
     TemplateParams as Sm100TemplateParams,
     cga_tile_m,
     cga_ctas,
@@ -96,6 +98,7 @@ from cudnn.sdpa.fwd.engines import (
     _synth_kv_padding,
     _thd_decode_leg,
     d256_decode_tile_selected,
+    d256_wide_decode_launch_for_facts,
     decode_d256_q_tile_for_row,
     effective_cgas,
     effective_sched_policies,
@@ -222,6 +225,31 @@ _SPLIT_KV_COMBINE_FLOOR = 0.35
 # regret 5.3% -> 0.5%, worst 43% -> 21%; any floor in [0.02, 0.1] makes the same choices.
 _SM120_SPLIT_KV_MIN_TILES = 1
 _SM120_SPLIT_KV_COMBINE_FLOOR = 0.1
+# What ONE split adds to the combine's LATENCY, in the same units, when the
+# combine runs its serial one-warp-per-row form -- sm100/split_combine routes
+# S_q of _SERIAL_COMBINE_MIN_SQ and up there. That kernel walks the split axis
+# in a dependent-load loop, so every block pays the walk however few rows the
+# launch has: a term the per-row COMBINE_COST, fitted on one-row decode shapes,
+# cannot carry. The decode form (S_q <= 2) spreads the split axis over the
+# block's spare warps and keeps its per-split cost near COMBINE_COST, so it adds
+# nothing here.
+#
+# Fitted to the 16-deep walk (split_combine._SERIAL_UNROLL): B200, d128, one Q
+# tile x 2 KV heads x b=1, S_q=16, the serial combine takes 3.4 / 4.1 / 5.4 us
+# at 4 / 8 / 32 splits, ~0.055 us a split against a 0.36 us KV tile (0.27 us a
+# split before the deep walk, when this term was 0.4).  At 0.1 the measured
+# optima hold -- kv2048 split 8 (11.8 us against 12.5 at 4), kv8192 16-32 (14.1
+# at 32 against 17.2 at 8) -- and one KV head at 128k keys with S_q=3 stops at
+# 64 splits (d64: 27.4 us at 64 and 128 against 37.3 at 32).
+_SPLIT_KV_SERIAL_COMBINE_COST = 0.1
+# The same latency against the per-tensor fp8 / mxfp8 d128 tile, which is
+# MMA-bound on a decode shape (256 rows per CTA whatever the live row count:
+# ~1.1 us a 128-key tile on B300 against the bf16 decode tile's 0.36), so one
+# split of serial combine is a third as many tile units.
+_SPLIT_KV_SERIAL_COMBINE_COST_QUANTIZED = 0.03
+# The S_q from which sm100/split_combine launches the serial combine; mirrors
+# its ``SQ <= ROWS_PER_BLOCK // 2`` routing (pinned by test_split_kv_heuristic).
+_SERIAL_COMBINE_MIN_SQ = 3
 
 
 class _SplitKvLaunch(NamedTuple):
@@ -280,6 +308,8 @@ def choose_split_kv(
     unsplit_launch: Optional[_SplitKvLaunch] = None,
     min_tiles: Optional[int] = None,
     combine_floor: Optional[float] = None,
+    serial_combine: bool = False,
+    serial_combine_cost: float = _SPLIT_KV_SERIAL_COMBINE_COST,
 ) -> int:
     """How many KV chunks to cut each Q tile into; 1 = do not split.
 
@@ -341,6 +371,13 @@ def choose_split_kv(
     and never splits; and a long-S_q chunk splits less than a short one, because
     its combine has more rows to reduce.
 
+    ``serial_combine`` says the combine will run its serial one-warp-per-row
+    kernel (S_q >= _SERIAL_COMBINE_MIN_SQ), whose latency grows with ``s`` on
+    every block alike; it adds ``s * serial_combine_cost`` outside the wave
+    terms (the bf16 constant by default, the quantized one where the main
+    tile is MMA-bound), so a long-KV multi-row decode stops splitting where
+    the serial walk, not the main kernel, sets the time.
+
     ``q_tiles`` / ``heads_q`` / ``kv_tiles`` / ``ctas_per_tile`` describe the
     split leg. ``unsplit_launch`` may describe a different complete no-split
     assignment, as happens when D192 uses CGA1 unsplit but requires CGA2 for a
@@ -382,6 +419,8 @@ def choose_split_kv(
         # No combine runs unsplit: the single-pass kernel writes O itself.
         combine = split * per_partial if split > 1 else 0.0
         cost = waves * (_ceil_div(launch.kv_tiles, split) + _SPLIT_KV_CTA_COST) + combine
+        if serial_combine and split > 1:
+            cost += split * serial_combine_cost
         if best_cost is None or cost < best_cost:
             best_split, best_cost = split, cost
     return best_split
@@ -408,14 +447,15 @@ _DECODE_TILE_CTA_COST = 1.0
 # the 16-column tile is bandwidth-bound): 64 CTAs x 32 tiles ran 90.2 us
 # against the 16-column tile's 57.1 us (B200). HBM saturates at the same byte
 # rate, so a slower stream also needs proportionally more CTAs to reach it.
-# That tile is compiled but not routed on the Blackwell line (the adapter keeps
-# S_q x G in (16, 32] on the prefill tile there,
-# config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS); the Rubin line routes it, in up to
+# The Blackwell line routes that tile only for a launch big enough to be
+# HBM-bound (config_sm100.d256_wide_decode_launch; S_q x G in (16, 32] stays on the
+# prefill tile below it); the Rubin line routes it for every launch, in up to
 # two TOKEN UNITS for a packed MTP step (config_sm107.decode_d256_q_tile), and
 # this B200 fit is the cost its units are modelled with until a cc 10.7 refit.
 _DECODE_TILE_WIDE_Q_TILE_COST = 1.6
 # The shared sm100/split_combine pass over a decode-shaped grid: one combine
-# wave, ~6 us measured at b=32 x 32 heads.
+# wave.  Measured on B200/B300: 5.1-5.8 us at b=32 x 2 KV heads x 2 splits and
+# 4.0-5.2 us at b=1 (8-32 splits, the decode form of the combine).
 _DECODE_TILE_COMBINE_COST = 3.5
 # What EVERY partial adds to that pass, in KV-tile units.  A decode-shaped grid
 # is one wave of warps with nothing to hide a serial split walk behind, so the
@@ -428,28 +468,68 @@ _DECODE_TILE_COMBINE_COST = 3.5
 # batch 1 wherever the KV was long (the per-wave term is flat in s) and paid a
 # 40 us combine for a 12 us kernel; with it the batch-1 optima measured at
 # kv 4K / 32K / 128K (16 / 32 / 64) and the batch-4 x 128K one (16) all fall
-# out, and every B200 pin below holds (the term is 0.3-2.7 tiles there).
+# out, and every B200 pin below holds (the term is 0.3-2.7 tiles there).  This is the
+# cc 10.7 row's price of a partial (decode_tile_combine_per_partial); the Blackwell
+# line's own fit, which prices the decode and the serial form of the combine apart,
+# follows.
 _DECODE_TILE_COMBINE_PER_PARTIAL = 0.17
-# What the two-launch split path costs an EAGER caller on the host per
-# graph.execute beyond the one-launch path: a second CuTe-DSL launch plus the
-# partial-slab carving. Measured 62 -> 92 us on the b=32 x 2 KV heads x 4096
-# keys serving shape (Python launch path, B200 host), against a 6 us GPU
-# saving. A CUDA-graph replay pays none of it, but a plan cannot know whether
-# it will be captured unless the caller says so (pygraph(
-# is_cuda_graph_replay_expected=True) -> facts.cuda_graph_replay), so the
-# default CHARGES it -- a split leads only where its GPU saving also covers
-# the eager caller's extra host time -- and the captured caller's optimum
-# (this term at 0) is listed as the runner-up plan; a caller that declared
-# the replay gets the two in the other order.
-_DECODE_TILE_SPLIT_LAUNCH_COST = 17.0
+# What each split adds to that pass, in the same units (one d256 KV tile,
+# 1.75 us).  The decode form (S_q <= 2) spreads the split axis over the
+# block's warps and grows slowly (~0.15 us a split on the 256-wide rows); the
+# serial one-warp-per-row form (S_q >= _SERIAL_COMBINE_MIN_SQ) walks the
+# splits 16 at a time (split_combine._SERIAL_UNROLL) and pays ~0.135 us a
+# split (B200, d256, S_q=4: 6.5 / 11.1 / 19.4 us at 32 / 64 / 128 splits; 0.45
+# us a split before the deep walk).  Without the term the model took 128
+# splits for one KV head at 128k keys at every S_q (qwen3.5-tp8 b=1: 50 us at
+# q=1 against 45 at 64 splits, 79 against 59 at q=4 before the deep walk, 51
+# against 45 after it).  0.15 keeps 64 there for q=1..4 and 32 for two KV
+# heads at q=4 (64.8 us against 67.4 at 64).
+_DECODE_TILE_COMBINE_PER_SPLIT = 0.09
+_DECODE_TILE_SERIAL_COMBINE_PER_SPLIT = 0.15
+# What the two-launch split path costs an EAGER caller per graph.execute
+# beyond the one-launch path.  On the Python launch path this was a second
+# CuTe-DSL launch plus the partial-slab carving (62 -> 92 us host on the
+# b=32 x 2 KV heads x 4096 keys serving shape, B200 host); the native dense
+# binder issues both launches from C++ and shows NO extra host time (17.6 us
+# per execute split 8 vs 20.9 us unsplit, b=1 x 2 KV heads x 2048 keys), so
+# what remains is the second kernel's own launch latency on the device.  The
+# default charges that; the captured caller's optimum (this term at 0) is
+# still listed as the runner-up plan where it differs, and a caller that
+# declared the replay (pygraph(is_cuda_graph_replay_expected=True) ->
+# facts.cuda_graph_replay) gets the two in the other order.  Pinned on the
+# b=32 x 2 KV heads x 4096 keys serving shape, where split 2 measured 8 %
+# SLOWER than unsplit on B200 (58.0 -> 62.9 us) and must not lead, while
+# b=1 x 2048 keys (25 -> 14 us split 8) and b=8 x 2048 keys (50 -> 19 us) must.
+_DECODE_TILE_SPLIT_LAUNCH_COST = 3.0
+# The cc 10.7 row keeps the Python-launch-era charge: the Rubin decode tile's split
+# was not re-measured with the native binder, and its row pins the b=32 serving
+# shape unsplit on this charge, so its eager choices stay put until a cc 10.7 refit
+# (decode_tile_split_launch_cost picks per row; the Blackwell line takes the
+# measured charge above).
+_DECODE_TILE_SPLIT_LAUNCH_COST_CC107 = 17.0
 
 
-def _decode_tile_cost(split: int, *, units: int, kv_tiles: int, sm_count: int, tile_cost: float, launch_cost: float) -> float:
+def decode_tile_split_launch_cost(caps: Capabilities) -> float:
+    """The eager second-launch charge a row's decode-tile split model carries
+    (_DECODE_TILE_SPLIT_LAUNCH_COST, or the cc 10.7 row's unrefit one)."""
+    return _DECODE_TILE_SPLIT_LAUNCH_COST_CC107 if caps.sm_lo == 107 else _DECODE_TILE_SPLIT_LAUNCH_COST
+
+
+def decode_tile_combine_per_partial(caps: Capabilities) -> Optional[float]:
+    """What every partial adds to the decode-shaped combine pass on a row that measured
+    its own price -- the cc 10.7 row, whatever the combine's form
+    (_DECODE_TILE_COMBINE_PER_PARTIAL) -- else None: the Blackwell line's fit
+    (_DECODE_TILE_COMBINE_PER_SPLIT / _DECODE_TILE_SERIAL_COMBINE_PER_SPLIT) prices the
+    decode form and the serial form of the combine apart."""
+    return _DECODE_TILE_COMBINE_PER_PARTIAL if caps.sm_lo == 107 else None
+
+
+def _decode_tile_cost(split: int, *, units: int, kv_tiles: int, sm_count: int, tile_cost: float, launch_cost: float, per_split: float) -> float:
     streams = units * split
     per_tile = max(tile_cost, streams / (_DECODE_TILE_SATURATION_FRACTION * sm_count))
     cost = (_ceil_div(kv_tiles, split) + _DECODE_TILE_CTA_COST) * per_tile
     if split > 1:
-        cost += _DECODE_TILE_COMBINE_COST + split * _DECODE_TILE_COMBINE_PER_PARTIAL + launch_cost
+        cost += _DECODE_TILE_COMBINE_COST + launch_cost + split * per_split
     return cost
 
 
@@ -460,6 +540,8 @@ def choose_decode_tile_split_kv(
     sm_count: int,
     q_tile: int = 16,
     launch_cost: float = _DECODE_TILE_SPLIT_LAUNCH_COST,
+    serial_combine: bool = False,
+    per_split: Optional[float] = None,
 ) -> int:
     """How many KV chunks the d256 decode tile cuts each unit into; 1 = do not split.
 
@@ -473,7 +555,13 @@ def choose_decode_tile_split_kv(
         streams(s)  = units * s                                   # concurrent K/V streams
         per_tile(s) = max(TILE_COST(q_tile), streams(s) / (SATURATION * sm_count))
         cost(s)     = (ceil(kv_tiles / s) + CTA_COST) * per_tile(s)
-                    + [s > 1] * (COMBINE_COST + s * COMBINE_PER_PARTIAL + launch_cost)
+                    + [s > 1] * (COMBINE_COST + launch_cost + s * PER_SPLIT)
+
+    ``PER_SPLIT`` is the combine's growth with the split count: the decode
+    form's small one by default, the serial form's when ``serial_combine``
+    says S_q routes there (S_q >= _SERIAL_COMBINE_MIN_SQ); ``per_split`` is a
+    row's own measured price (:func:`decode_tile_combine_per_partial`) and
+    replaces both.
 
     A lone CTA streams a KV tile at TILE_COST (1 on the 16-column tile, 1.6 on
     the issue-bound 32-column one); once the streams saturate HBM every CTA
@@ -483,16 +571,19 @@ def choose_decode_tile_split_kv(
     the split must SAVE more than it ADDS -- and every partial it adds costs
     the one-wave combine a serial step (COMBINE_PER_PARTIAL), which is what
     stops a few-unit launch from splitting past the point where the combine
-    outweighs the kernel.  With the default ``launch_cost``
-    the added part includes the eager caller's second host launch, so on the
-    16-column tile the b=32 x 2 KV heads x 4096-key serving shape (6 us of GPU
-    saving for 30 us of host time) stays unsplit while a small batch or a
-    long KV (b=8; s_kv=16384 at b=32) still splits, and the 32-column tile --
-    whose lone CTA is slow enough that the same shape saves ~32 us -- would
-    split (routed on cc 10.7 only; see _DECODE_TILE_WIDE_Q_TILE_COST).
+    outweighs the kernel.  The default ``launch_cost`` is the
+    second kernel's device-side launch latency (the native binder adds no host
+    time, see _DECODE_TILE_SPLIT_LAUNCH_COST), so on the 16-column tile the
+    b=32 x 2 KV heads x 4096-key serving shape stays unsplit (split 2 measured
+    8 % slower there), a longer KV at b=32 (8192+) splits 2 ways, a small
+    batch or a short KV at b=1 splits deeper (b=1 x 2048 keys: 8 ways,
+    25 -> 14 us), and a saturated launch (b=128) never splits; the 32-column
+    tile (routed on cc 10.7 only; see _DECODE_TILE_WIDE_Q_TILE_COST) is costed
+    the same way with its slower lone CTA.
     ``launch_cost=0`` is the optimum of a caller replaying a captured CUDA
     graph (the LEADING entry of a graph created with
-    ``is_cuda_graph_replay_expected=True``, see :func:`_split_points`).
+    ``is_cuda_graph_replay_expected=True``, see :func:`_split_points`; the
+    serving shape's runner-up is its split 2).
 
     Candidates come from :func:`split_kv_candidates`; ties go to the smaller
     split. Returns 1 for degenerate inputs.
@@ -500,7 +591,9 @@ def choose_decode_tile_split_kv(
     if min(units, kv_tiles, sm_count) <= 0:
         return 1
     tile_cost = _DECODE_TILE_WIDE_Q_TILE_COST if q_tile > 16 else 1.0
-    kw = dict(units=units, kv_tiles=kv_tiles, sm_count=sm_count, tile_cost=tile_cost, launch_cost=launch_cost)
+    if per_split is None:
+        per_split = _DECODE_TILE_SERIAL_COMBINE_PER_SPLIT if serial_combine else _DECODE_TILE_COMBINE_PER_SPLIT
+    kw = dict(units=units, kv_tiles=kv_tiles, sm_count=sm_count, tile_cost=tile_cost, launch_cost=launch_cost, per_split=per_split)
     best, best_cost = 1, _decode_tile_cost(1, **kw)
     for split in split_kv_candidates(sm_count=sm_count, kv_tiles=kv_tiles):
         if split <= 1:
@@ -1216,13 +1309,20 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
         # of a narrow diagonal band) and the decode tile's width. The two are
         # told apart by TemplateParams.decode_tile, not by this knob.
         return sched_policy, 1
-    if selected_shape == (128, 128) and facts.is_fp8 and not facts.is_mxfp8 and 1 in domain and not facts.thd and not facts.has_paged_kv:
-        # Per-tensor FP8 d128 on a dense graph: one 256-row CTA (cga1) for the
-        # unsplit leg, the geometry cuDNN's own fp8 kernel runs.  MEASURED on
-        # B200 (cuDNN 9.30 yardstick, 2026-09-28): llama 64/8 e4m3 causal S=2K
-        # 1.18x -> 1.14x, S=8K 1.09x -> 1.07x, 64/64 S=2K 1.49x -> 1.33x, AR-DiT
-        # no-split 1.07x -> 1.05x, dense S=2K unchanged.  The split leg keeps
-        # cga2 (split_cgas_by_d_shape); the THD and paged legs are cga2-only.
+    if selected_shape == (128, 128) and facts.is_fp8 and not facts.is_mxfp8 and 1 in domain and not facts.thd:
+        # Per-tensor FP8 d128 on a dense or paged graph: one 256-row CTA (cga1)
+        # on BOTH legs, the geometry cuDNN's own fp8 kernel runs.  Unsplit,
+        # MEASURED on B200 (cuDNN 9.30 yardstick, 2026-09-28): llama 64/8 e4m3
+        # causal S=2K 1.18x -> 1.14x, S=8K 1.09x -> 1.07x, 64/64 S=2K 1.49x ->
+        # 1.33x, AR-DiT no-split 1.07x -> 1.05x, dense S=2K unchanged.  The
+        # split leg follows: a decode-shaped split at cga2 runs the 256-row tile
+        # on both CTAs of the pair against the same keys, twice the MMA of cga1
+        # for the same bytes, and the kernel is MMA-bound there (B300, llama
+        # 64/8, 128k keys, b=1: 134 us at cga2, flat from split 8 to 32).  The
+        # paged K/V walk is the same TMA path at either width (checked against
+        # a gathered reference at cga1 x split 8 / unsplit, HND pools, page 16
+        # and 128); the THD leg keeps the row default (cga2) -- its packed
+        # descriptors are not wired at cga1.
         return sched_policy, 1
     if selected_shape == (128, 128) and facts.is_mxfp8 and caps.sm_lo == 100 and 1 in domain and not facts.thd and not facts.has_paged_kv:
         # MXFP8 d128 on a dense graph.  cga1 = one 256-row CTA of the prefill body (the geometry cuDNN's own MXFP8
@@ -1348,6 +1448,18 @@ def _sm100_banded_gqa_packs(caps: Capabilities, facts) -> bool:
     return banded and ((caps.sm_lo == 100 and caps.sm_hi < 107) or rubin_dense_d128_shared_leg(caps, facts))
 
 
+def _sm100_fp8_dual_kv_stream(caps: Capabilities, facts, cga: Optional[int]) -> bool:
+    """Mirror of api_dsl.SdpaFwdDslSm100._fp8_dual_kv_stream for the heuristics'
+    row-count model: per-tensor fp8 d128 at cga1 on a dense or paged (not THD)
+    SM100 graph whose S_q x packed heads fit one 128-row Q tile."""
+    if not fp8_dual_kv_stream_routed() or not facts.is_fp8 or facts.is_mxfp8 or facts.thd or cga != 1:
+        return False
+    if not (caps.sm_lo == 100 and caps.sm_hi < 107) or _selected_d_shape(caps, facts) != (128, 128):
+        return False
+    pack_g = facts.h_q // facts.h_kv if _sm100_banded_gqa_packs(caps, facts) or facts.s_q < 256 else 1
+    return facts.s_q * pack_g <= FP8_DUAL_KV_STREAM_MAX_ROWS
+
+
 def _pack_gqa_tile_q(caps: Capabilities, facts, tile_m: Optional[int], cga: Optional[int] = None, *, split_kv: int = 1) -> int:
     """The Q rows one grid tile covers, for :func:`_pack_gqa_wins`.
 
@@ -1372,8 +1484,12 @@ def _pack_gqa_tile_q(caps: Capabilities, facts, tile_m: Optional[int], cga: Opti
             # pack decision is the same either way (S_q x G <= 128 is < 256).
             return cga_tile_m(64, 1 if cga is None else cga)
         if (facts.is_fp8 or facts.is_mxfp8) and cga == 1:
-            # Quantized d128 prefill at cga1 keeps TILES_Q=2 (256 rows),
-            # unlike the half decode/split tile that cga_tile_m models.
+            # The quantized d128 prefill at cga1 keeps TILES_Q=2 (256 rows), unlike
+            # the half decode/split tile that cga_tile_m models.  The per-tensor
+            # fp8 two-KV-stream decode (api_dsl._fp8_dual_kv_stream) is the
+            # exception: its second sub-tile re-uses the first's rows.
+            if _sm100_fp8_dual_kv_stream(caps, facts, cga):
+                return FP8_DUAL_KV_STREAM_MAX_ROWS
             return 256
         if cga == 1 and supports_paged_prefill_cga1(
             (facts.d_qk, facts.d_v),
@@ -1703,7 +1819,14 @@ def _split_points(
         return [no_split]
     # Paged KV is padded by construction and the split composes with the
     # per-batch lengths (it IS the decode lever there) — see mismatch().
-    if (facts.thd and not ragged_decode) or facts.has_sink or (facts.padded and not facts.has_paged_kv) or facts.seq_q_trim:
+    # A sink splits on the half flavors (the combine folds it once); FP8 keeps the per-tile
+    # fold, and a gated graph's split (the gate rides its combine) carries no sink.
+    if (
+        (facts.thd and not ragged_decode)
+        or (facts.has_sink and (facts.is_fp8 or facts.is_mxfp8 or facts.has_epilogue_gate or not (caps.sm_lo == 100 and caps.sm_hi < 107)))
+        or (facts.padded and not facts.has_paged_kv)
+        or facts.seq_q_trim
+    ):
         return [no_split]
     decode_pack_g = _decode_tile_pack_g(facts, pack_g)
     # A gated graph's split exists on the d256 decode tile only (its combine applies
@@ -1743,15 +1866,17 @@ def _split_points(
         # (head group, batch) into: every unit is one more CTA streaming the KV range (the MTP step at
         # 24/2 = two units of two tokens), so the model sees them as streams; the KV range of a unit
         # spans its tokens (token_span = tokens per unit).
-        decode_q_tile = decode_d256_q_tile_for_row(caps, facts.s_q, decode_pack_g)
+        decode_q_tile = decode_d256_q_tile_for_row(caps, facts.s_q, decode_pack_g, d256_wide_decode_launch_for_facts(facts, decode_pack_g))
         tok_units = decode_d256_q_units(facts.s_q, decode_pack_g, decode_q_tile)
         geometry = dict(
             units=facts.b * (facts.h_q // decode_pack_g) * tok_units,
             kv_tiles=_swa_kv_tiles(facts, token_span=decode_q_tile // decode_pack_g, tile_n=tile_n or 128),
             sm_count=sm_count,
             q_tile=decode_q_tile,
+            serial_combine=facts.s_q >= _SERIAL_COMBINE_MIN_SQ,
+            per_split=decode_tile_combine_per_partial(caps),
         )
-        eager = choose_decode_tile_split_kv(**geometry)
+        eager = choose_decode_tile_split_kv(**geometry, launch_cost=decode_tile_split_launch_cost(caps))
         captured = choose_decode_tile_split_kv(**geometry, launch_cost=0.0)
         if gated_decode_tile:
             # The gate rides the split COMBINE: the tile's unsplit form cannot carry
@@ -1795,6 +1920,8 @@ def _split_points(
                 if caps.sm_lo == 120 and not (caps.is_fp8 or caps.is_mxfp8)
                 else {}
             ),
+            serial_combine=facts.s_q >= _SERIAL_COMBINE_MIN_SQ,
+            serial_combine_cost=_SPLIT_KV_SERIAL_COMBINE_COST_QUANTIZED if (facts.is_fp8 or facts.is_mxfp8) else _SPLIT_KV_SERIAL_COMBINE_COST,
         )
 
     split = _choose(physical=True)

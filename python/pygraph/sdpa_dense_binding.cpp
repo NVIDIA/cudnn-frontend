@@ -157,8 +157,14 @@ class SdpaDenseBinder {
             has_amax_  = py::cast<bool>(quant.attr("has_amax"));
             fill_word_ = py::module_::import_("cudnn.frost.buffers").attr("fill_word_async");
         }
-        if (integer("split") < 1 || (integer("split") > 1 && flag("has_sink")))
-            invalid("native dense binding requires attention without split sinks");
+        if (integer("split") < 1) invalid("native dense binding requires split >= 1");
+        // The half flavors fold an attention sink once in the combine pass (the
+        // sink combine entries take the fp32 [H] pointer); the FP8 epilogues
+        // still fold it per tile, so a quantized sink cannot split.
+        if (integer("split") > 1 && flag("has_sink") && quantized_)
+            invalid(
+                "native dense binding does not split FP8 attention with a sink (the FP8 epilogues fold the sink per "
+                "tile)");
         const auto dq = integer("d_qk"), dv = integer("d_v");
         if (dq <= 0 || dv <= 0 || dq > 512 || dv > 512 || dq % 8 || dv % 8)
             invalid("native dense binding requires a supported half attention head dimension pair");
@@ -182,6 +188,14 @@ class SdpaDenseBinder {
         has_sink_     = flag("has_sink");
         seq_kv_       = flag("seq_kv_present");
         seq_q_        = flag("seq_q_present");
+        // A split sink over padded query lengths: the combine folds the sink and needs the per-batch Q lengths to
+        // keep the padded rows dead (O := 0 / LSE := -inf), so its frame carries their address after the sink's.
+        combine_q_lens_ = py::hasattr(spec, "combine_q_lens") && flag("combine_q_lens");
+        if (combine_q_lens_ && (split_ < 2 || !has_sink_ || !seq_q_ || ragged_ || quantized_))
+            invalid(
+                "native dense binding passes the Q lengths to the combine only for a split sink over padded queries");
+        if (!combine_q_lens_ && split_ > 1 && has_sink_ && seq_q_ && !ragged_ && !quantized_)
+            invalid("a split sink over padded query lengths needs the combine specialization that takes them");
         dense_flex_   = py::hasattr(spec, "dense_flex") && flag("dense_flex");
         shape_fixed_  = flag("shape_fixed");
         lpt_fixed_    = flag("lpt_grid_fixed");
@@ -465,40 +479,38 @@ class SdpaDenseBinder {
         }
         put(frame, ODescPtr, py::int_(0));
         put(frame, MetaPtr, py::int_(seq_kv_ ? lengths(facts[KVLens], KVLens, b) : 0));
-        if (seq_q_) put(frame, QLensPtr, py::int_(lengths(facts[QLens], QLens, b)));
+        const int64_t q_lens_address = seq_q_ ? lengths(facts[QLens], QLens, b) : 0;
+        if (seq_q_) put(frame, QLensPtr, py::int_(q_lens_address));
         put(frame, Stream, stream);
         py::tuple combine_frame;
         if (split_ > 1) {
             const auto partial_lse = add(workspace, lse_offset_);
             auto os                = py::cast<std::array<int64_t, 3>>(o.bound);
+            // The combine entry's positional frame (split_combine.compile_ptr): the
+            // dense base, the ragged-Q leg's offsets / divisors / capacities, the
+            // half flavors' fp32 [H] sink pointer (has_sink entries), the int32 [B] Q lengths of a split sink over
+            // padded queries, then the stream.
+            py::list cf;
+            cf.append(workspace);
+            cf.append(partial_lse);
+            cf.append(facts[O].pointer);
+            cf.append(frame[index_[LSEPtr]]);
+            cf.append(py::make_tuple(b_, qh_, sq_, d_v_));
+            cf.append(split_);
+            cf.append(py::make_tuple(os[0], os[1], os[2], 1));
+            cf.append(frame[index_[LSEStrides]]);
             if (ragged_) {
                 const int64_t max_tokens = std::numeric_limits<int32_t>::max();
-                combine_frame =
-                    py::make_tuple(workspace,
-                                   partial_lse,
-                                   facts[O].pointer,
-                                   frame[index_[LSEPtr]],
-                                   py::make_tuple(b_, qh_, sq_, d_v_),
-                                   split_,
-                                   py::make_tuple(os[0], os[1], os[2], 1),
-                                   frame[index_[LSEStrides]],
-                                   ragged_offsets[0],
-                                   ragged_offsets[1],
-                                   ragged_offsets[2],
-                                   ragged_divs_,
-                                   py::make_tuple(std::min(o_cap, max_tokens), std::min(lse_cap, max_tokens)),
-                                   stream);
-            } else {
-                combine_frame = py::make_tuple(workspace,
-                                               partial_lse,
-                                               facts[O].pointer,
-                                               frame[index_[LSEPtr]],
-                                               py::make_tuple(b_, qh_, sq_, d_v_),
-                                               split_,
-                                               py::make_tuple(os[0], os[1], os[2], 1),
-                                               frame[index_[LSEStrides]],
-                                               stream);
+                cf.append(ragged_offsets[0]);
+                cf.append(ragged_offsets[1]);
+                cf.append(ragged_offsets[2]);
+                cf.append(ragged_divs_);
+                cf.append(py::make_tuple(std::min(o_cap, max_tokens), std::min(lse_cap, max_tokens)));
             }
+            if (has_sink_) cf.append(facts[Sinks].pointer);
+            if (combine_q_lens_) cf.append(q_lens_address);
+            cf.append(stream);
+            combine_frame = py::tuple(cf);
             put(frame, OPtr, py::int_(workspace));
             if (fp32_partial_) put(frame, PartialOPtr, py::int_(workspace));
             put(frame, OStrides, partial_o_strides_);
@@ -857,6 +869,7 @@ class SdpaDenseBinder {
     bool ragged_, has_total_q_ = false, ragged_lse_head_major_ = false;
     bool paged_, hnd_, has_lse_, has_sink_, seq_kv_, seq_q_, shape_fixed_, lpt_fixed_, tail_native_, causal_,
         bottom_right_, fp32_partial_, dense_flex_;
+    bool combine_q_lens_ = false;
 };
 }  // namespace
 void
@@ -868,6 +881,9 @@ init_sdpa_dense_binding(py::module_ &m) {
         // for cc 10.7).
         .def_prop_ro_static("supports_epilogue_gate", [](py::object) { return true; })
         .def_prop_ro_static("supports_paged_epilogue_gate", [](py::object) { return true; })
+        // The split sink combine takes the per-batch Q lengths (python: SplitCombineSpec /
+        // DenseLaunchSpec.combine_q_lens).
+        .def_prop_ro_static("supports_combine_q_lens", [](py::object) { return true; })
         .def("bind", &SdpaDenseBinder::bind, py::arg("pack"), py::arg("indices"), py::arg("stream"))
         .def("bind_split",
              &SdpaDenseBinder::bind_split,

@@ -125,6 +125,8 @@ _MAKE_CFG = {32: make_cfg_d32, 64: make_cfg_d64, 128: make_cfg_d128}
 if PARAMS.d_flavor not in _MAKE_CFG:
     raise ValueError(f"prefill_d128_f16: d_flavor must be 32, 64 or 128; got {PARAMS.d_flavor}")
 CFG, _TMA = _MAKE_CFG[PARAMS.d_flavor](PARAMS)
+if PARAMS.dual_kv_stream:
+    raise ValueError("sm100/prefill_d128_f16: dual_kv_stream (two KV streams over one Q tile) is served by sm100/prefill_d128_fp8.py only")
 Cfg = type(CFG)
 TMA_QK_ITERS = _TMA.QK_ITERS
 TMA_VO_ITERS = _TMA.VO_ITERS
@@ -3134,7 +3136,8 @@ def _correction_warp_group(
             # With sinks: fold the lift-the-max rescale into threshold_beta so O is scaled by scale/new_sum in one FMUL.
             LN2 = cutlass.Float32(0.6931471805599453)
             total_max_nat = total_max_scaled * LN2
-            if cutlass.const_expr(CFG.HAS_SINK):
+            # Under a KV split the fold moves to the combine pass (split_combine), which adds the sink column exactly once; the partials stay sink-free.
+            if cutlass.const_expr(CFG.HAS_SINK and SPLIT_KV == 1):
                 sinks_arr = cutlass.make_array_view(sinks_tensor)
                 sink_logit = cutlass.Float32(sinks_arr[row_head_idx])
                 # A keyless row -- no live key at all: an empty sequence, a row above the
@@ -3151,8 +3154,8 @@ def _correction_warp_group(
                 # sink and inv_sum = 0 follow.  A row with keys takes the fold unchanged.
                 # The padded-Q trim below still turns a trimmed row into O = 0 / LSE =
                 # -inf, sink or not; row_dead stays False here -- it is the fp32-partial
-                # store's flag, and sink + split-KV is declined, so it is never read with
-                # a sink.  Same idiom as the sm107 f16 / sm100 mxfp8 kernels' _kv_empty.
+                # store's flag, and this branch is compiled only for SPLIT_KV == 1, so it
+                # is never read with a sink.  Same idiom as the sm107 f16 / sm100 mxfp8 kernels' _kv_empty.
                 kv_empty = total_sum <= cutlass.Float32(0.0)
                 new_max = cutlass.Float32(arith.select(kv_empty.ir_value(), sink_logit.ir_value(), cute.math.max(total_max_nat, sink_logit).ir_value()))
                 scale = cutlass.Float32(

@@ -46,8 +46,9 @@ class _ApiCaseResult(NamedTuple):
     stats: Optional[torch.Tensor]
 
 
-def _ref_sdpa(q, k, v, scale, is_causal, kh):
-    """fp32 reference over BSHD inputs; returns BSHD."""
+def _ref_sdpa(q, k, v, scale, is_causal, kh, sinks=None):
+    """fp32 reference over BSHD inputs; returns BSHD.  ``sinks`` ([H] fp32) adds the
+    per-head attention sink as one extra softmax column with no V row."""
     if kh != q.shape[2]:
         rep = q.shape[2] // kh
         k = k.repeat_interleave(rep, dim=2)
@@ -59,7 +60,11 @@ def _ref_sdpa(q, k, v, scale, is_causal, kh):
         i = torch.arange(s_q, device=q.device).view(s_q, 1)
         j = torch.arange(s_kv, device=q.device).view(1, s_kv)
         s = s.masked_fill(j > i, float("-inf"))  # top-left causal
+    if sinks is not None:
+        s = torch.cat([s, sinks.float().view(1, -1, 1, 1).expand(s.shape[0], s.shape[1], s.shape[2], 1)], dim=-1)
     p = torch.softmax(s, dim=-1)
+    if sinks is not None:
+        p = p[..., :-1]
     return torch.matmul(p, vb).permute(0, 2, 1, 3)
 
 
@@ -94,20 +99,32 @@ def _partial_tag(splits, o_dtype):
     return "f16" if o_dtype == torch.float16 else "bf16"
 
 
-def _kernel_module(splits, dtype_qkv, causal, cta_mma=2, pack_gqa=False, qh_per_kh=1, stats_log2=False):
+def _kernel_module(splits, dtype_qkv, causal, cta_mma=2, pack_gqa=False, qh_per_kh=1, stats_log2=False, has_sink=False):
     from cudnn.frost.template_loader import load_template
     from cudnn.sdpa.fwd import api_dsl
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
     path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", "sm100/prefill_d128_f16.py")
-    kw = {"dtype_qkv": dtype_qkv, "split_kv": splits, "cta_mma": cta_mma, "pack_gqa": pack_gqa, "qh_per_kh": qh_per_kh, "stats_log2": stats_log2}
+    kw = {
+        "dtype_qkv": dtype_qkv,
+        "split_kv": splits,
+        "cta_mma": cta_mma,
+        "pack_gqa": pack_gqa,
+        "qh_per_kh": qh_per_kh,
+        "stats_log2": stats_log2,
+        "has_sink": has_sink,
+    }
     if causal:
         kw["window_right"] = 0
-    tag = f"splitkv{splits}_d{dtype_qkv}_{'caus' if causal else 'dense'}_cga{cta_mma}_pg{int(pack_gqa)}" + ("_log2" if stats_log2 else "")
+    tag = (
+        f"splitkv{splits}_d{dtype_qkv}_{'caus' if causal else 'dense'}_cga{cta_mma}_pg{int(pack_gqa)}"
+        + ("_log2" if stats_log2 else "")
+        + ("_sink" if has_sink else "")
+    )
     return load_template(path, TemplateParams(**kw), tag=tag)
 
 
-def _run(splits, B, H, KH, SQ, SKV, dtype, causal, cta_mma=2, pack_gqa=False):
+def _run(splits, B, H, KH, SQ, SKV, dtype, causal, cta_mma=2, pack_gqa=False, sinks=None):
     """Launch the split kernel + DSL combine; returns the recombined O (BSHD fp32)."""
     import cutlass
     import cuda.bindings.driver as cuda_driver
@@ -121,7 +138,7 @@ def _run(splits, B, H, KH, SQ, SKV, dtype, causal, cta_mma=2, pack_gqa=False):
     k = torch.randn(B, SKV, KH, D, device=dev, dtype=dtype)
     v = torch.randn(B, SKV, KH, D, device=dev, dtype=dtype)
 
-    mod = _kernel_module(splits, 3 if dtype == torch.float16 else 2, causal, cta_mma=cta_mma, pack_gqa=pack_gqa, qh_per_kh=H // KH)
+    mod = _kernel_module(splits, 3 if dtype == torch.float16 else 2, causal, cta_mma=cta_mma, pack_gqa=pack_gqa, qh_per_kh=H // KH, has_sink=sinks is not None)
     fn = mod.compile(d_qk=D, d_v=D, has_lse=True, lse_kind="dense")
 
     o_p = torch.zeros(splits * B, SQ, H, D, device=dev, dtype=_partial_o_dtype(splits, dtype))
@@ -134,7 +151,7 @@ def _run(splits, B, H, KH, SQ, SKV, dtype, causal, cta_mma=2, pack_gqa=False):
         v,
         o_p,
         lse_p,
-        torch.zeros(H, dtype=torch.float32, device=dev),  # sinks (ABI slot)
+        sinks if sinks is not None else torch.zeros(H, dtype=torch.float32, device=dev),  # sinks (ABI slot)
         torch.zeros(B, dtype=torch.int32, device=dev),  # seq_kv_lens (unused)
         torch.zeros(1, dtype=torch.int64, device=dev),  # o_desc (THD only)
         (B, H, KH, SQ, SKV, 0),
@@ -143,6 +160,9 @@ def _run(splits, B, H, KH, SQ, SKV, dtype, causal, cta_mma=2, pack_gqa=False):
         0,  # seq_q_lens_addr: no per-batch Q lengths
         **_partial_kwargs(splits, o_p),
         stream=stream,
+        # The compiled callable's generic signature hides the pointer arguments from launch_f16's
+        # inspection on the released DSL (4.7.x); the host entry carries the real one.
+        host=mod._host,
     )
     if splits == 1:
         torch.cuda.synchronize()
@@ -150,8 +170,16 @@ def _run(splits, B, H, KH, SQ, SKV, dtype, causal, cta_mma=2, pack_gqa=False):
 
     o_out = torch.zeros(B, SQ, H, D, device=dev, dtype=dtype)
     lse_out = torch.zeros(B, H, SQ, device=dev, dtype=torch.float32)
-    cfn = positional_entry(comb.compile_ptr(dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=True, dtype_partial=_partial_tag(splits, dtype)))
-    cfn(o_p.data_ptr(), lse_p.data_ptr(), o_out.data_ptr(), lse_out.data_ptr(), (B, H, SQ, D), splits, o_out.stride(), lse_out.stride(), int(stream))
+    # Under a split the partials are sink-free; the combine's sink entry folds the logits once.
+    cfn = positional_entry(
+        comb.compile_ptr(
+            dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=True, dtype_partial=_partial_tag(splits, dtype), has_sink=sinks is not None
+        )
+    )
+    sink_args = (sinks.data_ptr(),) if sinks is not None else ()
+    cfn(
+        o_p.data_ptr(), lse_p.data_ptr(), o_out.data_ptr(), lse_out.data_ptr(), (B, H, SQ, D), splits, o_out.stride(), lse_out.stride(), *sink_args, int(stream)
+    )
     torch.cuda.synchronize()
     assert not torch.isnan(o_out).any(), "NaN in combined O"
     return o_out.float(), (q, k, v, scale)
@@ -249,10 +277,27 @@ def test_split_kv_rejects_unsupported_combos():
     # Both scheduler policies are supported: NATURAL carries the split on the
     # batch axis, LPT on the flattened x axis (make_split_helpers._lpt_split_of).
     assert make_cfg_d128(TemplateParams(split_kv=4, sched_policy=SCHED_LPT))[0].SPLIT_KV == 4
+    # A sink rides the half split (sink-free partials, the combine folds it once);
+    # the FP8 epilogues still fold it per tile, so FP8 keeps the rejection.
+    assert make_cfg_d128(TemplateParams(split_kv=4, has_sink=True))[0].SPLIT_KV == 4
     with pytest.raises(ValueError, match="sink"):
-        make_cfg_d128(TemplateParams(split_kv=4, has_sink=True))
+        make_cfg_d128(TemplateParams(split_kv=4, has_sink=True, dtype_qkv=0))
     with pytest.raises(ValueError, match="dense-only"):
         make_cfg_d128(TemplateParams(split_kv=4, thd_varlen=True, seq_kv_lens_present=True))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("splits", [1, 4, 8])
+def test_split_kv_sink_matches_reference_dense(splits):
+    """Sink + split on the prefill tile: the split kernel's partials are sink-free
+    and the combine folds the per-head sink once; splits=1 is the in-kernel fold
+    the split must reproduce.  Sinks straddle the score range."""
+    B, H, SQ, SKV = 2, 4, 128, 2048
+    torch.manual_seed(1)
+    sinks = torch.tensor([-50.0, -3.0, 0.5, 6.0], device="cuda")
+    got, (q, k, v, scale) = _run(splits, B, H, H, SQ, SKV, torch.bfloat16, causal=False, sinks=sinks)
+    ref = _ref_sdpa(q, k, v, scale, is_causal=False, kh=H, sinks=sinks)
+    assert (got - ref).abs().max().item() <= 1e-1
 
 
 @pytest.mark.L0
@@ -847,6 +892,9 @@ def test_combine_lse_matches_reference(splits, stats_log2):
         0,  # seq_q_lens_addr: no per-batch Q lengths
         **_partial_kwargs(splits, o_p),
         stream=stream,
+        # The compiled callable's generic signature hides the pointer arguments from launch_f16's
+        # inspection on the released DSL (4.7.x); the host entry carries the real one.
+        host=mod._host,
     )
 
     # Reference LSE = logsumexp of the scaled scores, in natural log.
