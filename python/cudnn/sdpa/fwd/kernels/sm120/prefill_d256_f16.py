@@ -223,11 +223,12 @@ class SM120FusedMultiHeadAttentionForward:
             constraint as ``head_tile_qk``.
         :param q_tile: Query sequence tile size.
         :param kv_tile: Key/value sequence tile size.
-        :param pack_gqa: Enable PackGQA: each Q tile holds ``q_tile/qh_per_kh``
-            tokens x qh_per_kh query heads sharing one KV head, token-major
-            (row r ↔ token ``r // G``, head ``r % G``).
-        :param qh_per_kh: The graph's GQA ratio ``h_q // h_kv``; must divide
-            ``q_tile`` when ``pack_gqa`` is enabled, and is validated against
+        :param pack_gqa: Enable PackGQA: each Q tile holds ``q_tile // qh_per_kh``
+            whole tokens x qh_per_kh query heads sharing one KV head, token-major
+            (row r ↔ token ``r // G``, head ``r % G``); rows past
+            ``(q_tile // G) * G`` are dead (zero Q, never stored).
+        :param qh_per_kh: The graph's GQA ratio ``h_q // h_kv``; at most
+            ``q_tile`` when ``pack_gqa`` is enabled, and validated against
             the runtime Q/K head extents at ``__call__``.
         """
 
@@ -235,8 +236,8 @@ class SM120FusedMultiHeadAttentionForward:
             raise ValueError("out_dtype must match in_dtype")
         if qh_per_kh < 1:
             raise ValueError(f"qh_per_kh ({qh_per_kh}) must be >= 1")
-        if pack_gqa and q_tile % qh_per_kh != 0:
-            raise ValueError(f"qh_per_kh ({qh_per_kh}) must divide q_tile ({q_tile}) when pack_gqa is enabled")
+        if pack_gqa and qh_per_kh > q_tile:
+            raise ValueError(f"qh_per_kh ({qh_per_kh}) must not exceed q_tile ({q_tile}) when pack_gqa is enabled")
         if pack_gqa and thd_varlen:
             raise ValueError("PackGQA is dense-only (THD keeps the unpacked path)")
         if thd_varlen and thd_batch < 1:
@@ -269,6 +270,11 @@ class SM120FusedMultiHeadAttentionForward:
         self.kv_tile = kv_tile
         self.pack_gqa = pack_gqa
         self.qh_per_kh = qh_per_kh
+        # A packed tile holds q_tile // G whole tokens; when G does not divide
+        # the tile, its rows past that many tokens x G are dead: zero Q, never
+        # stored (G = 6 at 64 rows: 10 tokens, 60 live rows).
+        self.live_rows = (q_tile // qh_per_kh) * qh_per_kh if pack_gqa else q_tile
+        self.dead_rows = self.live_rows != q_tile
         # KV split: SPLIT_KV CTAs per (q_tile, batch, head), each covering a
         # contiguous slice of that tile's KV-tile range.  1 = off (folds away).
         self.split_kv = split_kv
@@ -442,7 +448,10 @@ class SM120FusedMultiHeadAttentionForward:
                 if cutlass.const_expr(self.pack_gqa and self.qh_per_kh != 1):
                     q_row_off = q_row_off + (row_in_cta % self.qh_per_kh) * basic_params.q_head_stride
                 q_packed = cutlass.Int32(0)
-                if cur_q_seq_idx < basic_params.seqlen_q and col_in_cta < basic_params.head_dim_qk:
+                q_live = cur_q_seq_idx < basic_params.seqlen_q
+                if cutlass.const_expr(self.dead_rows):
+                    q_live = q_live and row_in_cta < self.live_rows
+                if q_live and col_in_cta < basic_params.head_dim_qk:
                     q_pair = (basic_params.q_ptr + basic_params.q_head_off + q_row_off + col_in_cta).load(count=2, alignment=4)
                     q_packed = q_pair.bitcast(cutlass.Int32)[0]
                 if cutlass.const_expr(d_frag >= self.q_reg_frags):
@@ -1170,12 +1179,13 @@ class SM120FusedMultiHeadAttentionForward:
         # With has_sink, the per-head sink logit joins the softmax denominator
         # as a virtual column with no V row: it rescales O, enters the LSE,
         # and gives a row with no visible key a finite LSE (the sink alone).
+        # A split writes sink-free partials: the combine folds the sink once.
         LN2 = cutlass.Float32(0.6931471805599453)
         row_sum_inv = cutlass.Array(cutlass.Float32, 2, alignment=8)
         row_lse = cutlass.Array(cutlass.Float32, 2, alignment=8)
         for row_half in cutlass.range_constexpr(2):
             row_max_nat = row_max[row_half] * softmax_scale_log2 * LN2
-            if cutlass.const_expr(self.has_sink):
+            if cutlass.const_expr(self.has_sink and self.split_kv == 1):
                 sinks_arr = cutlass.make_array_view(sinks)
                 _sink_head = q_head_base if cutlass.const_expr(not self.pack_gqa) else q_head_base + (q_warp_row0 + (lane // 4) + row_half * 8) % self.qh_per_kh
                 sink_logit = cutlass.Float32(sinks_arr[_sink_head])
@@ -1230,7 +1240,10 @@ class SM120FusedMultiHeadAttentionForward:
                         # Rows at/past this batch's Q length trim to -inf.
                         if lse_q_idx >= seqlen_q:
                             lse_out = -cutlass.Float32.inf
-                        if lse_q_idx < q.shape[1]:
+                        lse_row_live = lse_q_idx < q.shape[1]
+                        if cutlass.const_expr(self.dead_rows):
+                            lse_row_live = lse_row_live and _lse_row_in_cta < self.live_rows
+                        if lse_row_live:
                             lse_arr[o_batch_idx, _lse_head, lse_q_idx] = lse_out
 
         prims.barrier_cta_sync(self.bar_compute_sync, thread_count=self.threads_compute)
@@ -1280,7 +1293,10 @@ class SM120FusedMultiHeadAttentionForward:
                     sO_ptr = sO.data_ptr() + (compute_warp_idx * (self.pv_d_frags // 2) + d_frag_pair) * (16 * 16) + lane * 8
                     gO_ptr.store(sO_ptr.load(count=8, alignment=16), alignment=16)
             else:
-                if store_q_seq_idx < q.shape[1] and store_col_in_cta < head_dim_v:
+                store_row_live = store_q_seq_idx < q.shape[1]
+                if cutlass.const_expr(self.dead_rows):
+                    store_row_live = store_row_live and _store_row_in_cta < self.live_rows
+                if store_row_live and store_col_in_cta < head_dim_v:
                     gO_ptr = o_ptr + store_head_off + store_q_seq_idx * o_seq_stride + store_col_in_cta
                     if store_q_seq_idx < seqlen_q:
                         sO_ptr = sO.data_ptr() + (compute_warp_idx * (self.pv_d_frags // 2) + d_frag_pair) * (16 * 16) + lane * 8
@@ -1696,7 +1712,7 @@ class SM120FusedMultiHeadAttentionForward:
         n_q_tiles = (
             ceil_div(thd_max_sq, self.q_tile)
             if cutlass.const_expr(self.thd_varlen)
-            else ceil_div((q.shape[1] * self.qh_per_kh if self.pack_gqa else q.shape[1]), self.q_tile)
+            else (ceil_div(q.shape[1], self.q_tile // self.qh_per_kh) if self.pack_gqa else ceil_div(q.shape[1], self.q_tile))
         )
         n_batch = thd_batch if cutlass.const_expr(self.thd_varlen) else q.shape[0]
         n_head = q.shape[2] // self.qh_per_kh if self.pack_gqa else q.shape[2]

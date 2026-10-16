@@ -76,10 +76,16 @@ from cudnn.sdpa.fwd.config_sm100 import (
 )
 from cudnn.sdpa.fwd.config_sm120 import (
     D512_FLAVOR,
+    DECODE_Q_TILES as _SM120_DECODE_Q_TILES,
     FP8_HEAD_TILE_GRANULE,
+    GENERAL_HEAD_TILE_MAX as _SM120_GENERAL_HEAD_TILE_MAX,
     HEAD_TILE_GRANULE,
     SMEM_CAPACITY_BYTES,
+    decode_kv_stage as _sm120_decode_kv_stage,
+    whole_group_pack_supported as _sm120_whole_group_pack_supported,
+    decode_stage_bytes as _sm120_decode_stage_bytes,
     head_tiles,
+    is_decode_tile as _sm120_is_decode_tile,
     kv_tile_preference,
     pick_flavor,
     smem_bytes,
@@ -104,6 +110,8 @@ from cudnn.sdpa.fwd.engines import (
     mismatch,
     pack_gqa_partial,
     rubin_dense_d128_shared_leg,
+    sm120_decode_tile,
+    sm120_whole_group_pack,
 )
 
 # Cells whose (tile_m, tile_n) choice _sm120_tiles makes.
@@ -602,6 +610,71 @@ def choose_decode_tile_split_kv(
     return best
 
 
+# --- KV split on the SM120 decode tile (see choose_sm120_decode_split_kv) ----
+# sm120/decode_f16.py is one CTA per (Q tile, batch, KV-head group, split) unit
+# streaming ~8-16 KB K/V stages through a TMA ring, one CTA per SM (the ring fills
+# the SMEM). Its main kernel is the slower of two bounds: the longest unit's stage
+# chain run by a lone CTA, and every unit's bytes over the DRAM bandwidth; the
+# split path adds the combine. Fitted on RTX PRO 6000 Blackwell Workstation
+# (188 SMs, SM 2400 / memory 14001 MHz locks) over 72 split ladders -- S_q 1 / 2 /
+# 4 x GQA 32/8, 32/4, 24/4 d256, 16/2 d256, 32/16, 64/8 d64 + sink x KV 4K-128K x
+# splits 1-128: mean regret 0.3 %, worst 5 %. The DRAM saturates near 64-128 CTAs
+# (1.54-1.59 TB/s at 128K keys); past that a split only grows the combine.
+#
+# The rate one CTA streams its stages at when it is the only stream, bytes / us
+# (63 GB/s measured unsplit at d64 / d128, 50 at d256; the fit prefers 40).
+_SM120_DECODE_LONE_BYTES_PER_US = 4.0e4
+# The DRAM read rate the streams share, bytes / us.
+_SM120_DECODE_BYTES_PER_US = 1.55e6
+# What a CTA costs beyond its stage chain (launch ramp, Q load, merge, epilogue), us.
+_SM120_DECODE_CTA_US = 3.0
+# The split path's combine launch, us, and what each partial adds to it per 128 O
+# columns (2.8 / 4.2 / 5.8 / 9.1 us at 16 / 32 / 64 / 128 splits, d128).
+_SM120_DECODE_COMBINE_US = 2.0
+_SM120_DECODE_COMBINE_PER_SPLIT_US = 0.055
+
+
+def _sm120_decode_cost(split: int, *, units: int, kv_stages: int, stage_bytes: int, d_v: int, sm_count: int) -> float:
+    waves = _ceil_div(units * split, sm_count)
+    chain = waves * _ceil_div(kv_stages, split) * stage_bytes / _SM120_DECODE_LONE_BYTES_PER_US
+    bandwidth = units * kv_stages * stage_bytes / _SM120_DECODE_BYTES_PER_US
+    cost = max(chain, bandwidth) + _SM120_DECODE_CTA_US
+    if split > 1:
+        cost += _SM120_DECODE_COMBINE_US + split * _SM120_DECODE_COMBINE_PER_SPLIT_US * d_v / 128
+    return cost
+
+
+def choose_sm120_decode_split_kv(*, units: int, kv_stages: int, stage_bytes: int, d_v: int, sm_count: int) -> int:
+    """How many KV chunks the SM120 decode tile cuts each unit into; 1 = do not split.
+
+    ``units`` is the launch's CTA count before splitting (Q tiles x batch x
+    packed KV-head groups, or query heads unpacked); ``kv_stages`` the K/V
+    stages of the longest unit (``config_sm120.decode_kv_stage`` keys each,
+    ``stage_bytes`` of K and V); ``d_v`` the O width the combine reduces.
+
+        chain(s)     = ceil(units * s / sm_count) * ceil(kv_stages / s) * stage_bytes / LONE_BYTES_PER_US
+        bandwidth    = units * kv_stages * stage_bytes / BYTES_PER_US
+        cost(s)      = max(chain(s), bandwidth) + CTA_US
+                     + [s > 1] * (COMBINE_US + s * COMBINE_PER_SPLIT_US * d_v / 128)
+
+    An under-filled launch splits until the bandwidth bound takes over from the
+    stage chain; past it a split only adds to the combine. Candidates are the
+    powers of two of :func:`split_kv_candidates` (``split_kv`` is a compile
+    specialization) bounded by the stage count; ties go to the smaller split.
+    """
+    if min(units, kv_stages, stage_bytes, d_v, sm_count) <= 0:
+        return 1
+    kw = dict(units=units, kv_stages=kv_stages, stage_bytes=stage_bytes, d_v=d_v, sm_count=sm_count)
+    best, best_cost = 1, _sm120_decode_cost(1, **kw)
+    for split in split_kv_candidates(sm_count=sm_count, kv_tiles=kv_stages, min_tiles=1):
+        if split <= 1:
+            continue
+        cost = _sm120_decode_cost(split, **kw)
+        if cost < best_cost:
+            best, best_cost = split, cost
+    return best
+
+
 def _sm120_envelope(facts) -> Tuple[int, int]:
     """(D_QK, D_V) rounded up to the head-tile granule: the ENVELOPE tiles the
     SM120 kernels stage, so a fit check must use them or a tile offered here
@@ -618,8 +691,34 @@ def _sm120_fits_smem(facts, tile_m: int, tile_n: int) -> bool:
     return smem_bytes(d_qp, d_vp, tile_m, tile_n, 1 if quantized else 2, 2, mxfp8=facts.is_mxfp8) <= SMEM_CAPACITY_BYTES
 
 
+def _sm120_decode_tile_m(caps: Capabilities, facts) -> int:
+    """The decode tile's Q tile (16 or 32) for a decode-shaped graph on the SM120
+    half row, else 0.
+
+    Decode-shaped: one KV head's packed rows, ``S_q x G``, fit 32 rows with the
+    whole group packed (``config_sm120.whole_group_pack_supported``). Such a unit
+    leaves most rows of a 64- or 128-row prefill tile dead while every compute
+    warp still runs its MMAs, and the prefill templates single-buffer K/V; the
+    decode tile puts its warps on the key axis and rings the K/V stages. Wider
+    units and groups too large to pack keep the prefill rule (MQA at 64 heads:
+    the 128-row packed tile reads the shared KV head once per 128 rows).
+    """
+    if not any(m in caps.tile_ms for m in _SM120_DECODE_Q_TILES) or facts.is_fp8 or facts.is_mxfp8 or facts.thd:
+        return 0
+    if max(facts.d_qk, facts.d_v) > _SM120_GENERAL_HEAD_TILE_MAX or facts.h_kv <= 0:
+        return 0
+    rows = facts.s_q * (facts.h_q // facts.h_kv)
+    for tile_m in _SM120_DECODE_Q_TILES:
+        if tile_m in caps.tile_ms and rows <= tile_m and _sm120_whole_group_pack_supported(facts.h_q, facts.h_kv, tile_m):
+            return tile_m
+    return 0
+
+
 def _sm120_tiles(caps: Capabilities, facts) -> Tuple[int, int]:
     """(tile_m, tile_n) for the SM120 SDPA-forward prefill cell.
+
+    A decode-shaped half graph (:func:`_sm120_decode_tile_m`) takes the decode
+    tile at its stage width (``config_sm120.decode_kv_stage``).
 
     ``tile_m=64`` when the grid cannot fill the machine AND each CTA has enough
     KV tiles to amortize the extra Q-tile loop; a causal mask counts as a
@@ -642,6 +741,9 @@ def _sm120_tiles(caps: Capabilities, facts) -> Tuple[int, int]:
     that the misses cluster on CAUSAL shapes, where the triangular mask shifts
     the per-CTA balance in a way `grid` alone does not capture.
     """
+    decode_tile_m = _sm120_decode_tile_m(caps, facts)
+    if decode_tile_m:
+        return decode_tile_m, _sm120_decode_kv_stage(*_sm120_envelope(facts))
     sm_count = facts.device_sm_count or 0
     grid = -(-facts.s_q // 128) * facts.h_q * facts.b
     if facts.causal:
@@ -652,7 +754,7 @@ def _sm120_tiles(caps: Capabilities, facts) -> Tuple[int, int]:
     kv_order = kv_tile_preference(facts.d_qk, mxfp8=facts.is_mxfp8)
     # Prefer the selected query tile, then larger query tiles and faster KV tiles.
     candidate_tiles = sorted(
-        tile_domain(facts.d_qk, facts.d_v, facts.is_fp8 or facts.is_mxfp8),
+        (tile for tile in tile_domain(facts.d_qk, facts.d_v, facts.is_fp8 or facts.is_mxfp8) if not _sm120_is_decode_tile(tile[0])),
         key=lambda tile: (tile[0] == preferred_tile_m, tile[0], -kv_order.index(tile[1])),
         reverse=True,
     )
@@ -679,7 +781,15 @@ def _tile_points(spec: EngineSpec, facts) -> List[Tuple[Optional[int], Optional[
         return [(_sole(caps.tile_ms), _sole(caps.tile_ns))]
     best = _sm120_tiles(caps, facts)
     tile_choices = tile_domain(facts.d_qk, facts.d_v, facts.is_fp8 or facts.is_mxfp8)
-    domain = [(m, n) for m in caps.tile_ms for n in caps.tile_ns if (m, n) in tile_choices and _sm120_fits_smem(facts, m, n)]
+    # The decode tiles are candidates on decode-shaped graphs only: past 32 packed
+    # rows they would only spend set-cap slots on a 16-row tile over a prefill grid.
+    decode_shaped = _sm120_decode_tile_m(caps, facts) > 0
+    domain = [
+        (m, n)
+        for m in caps.tile_ms
+        for n in caps.tile_ns
+        if (m, n) in tile_choices and _sm120_fits_smem(facts, m, n) and (decode_shaped or not _sm120_is_decode_tile(m))
+    ]
     return sorted(domain or [best], key=lambda mn: (mn != best, mn[1] != best[1], -mn[0]))
 
 
@@ -1490,6 +1600,12 @@ def _decode_tile_pack_g(facts, pack_g: int) -> int:
     return (facts.h_q // facts.h_kv) if pack_g > 1 else 1
 
 
+def _sm120_whole_group_pack(caps: Capabilities, facts, tile_m: Optional[int]) -> bool:
+    """Whether the SM120 half templates pack this graph's GQA group at ``tile_m``:
+    a whole group per tile, no divisibility (engines.sm120_whole_group_pack)."""
+    return tile_m is not None and facts.h_q != facts.h_kv and sm120_whole_group_pack(caps, facts, tile_m)
+
+
 def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int, split_kv: Optional[int] = None, cga: Optional[int] = None) -> bool:
     """Whether a packed set can be built at ``tile_m``: the row offers packing,
     the graph carries no fused epilogue gate (its per-head
@@ -1542,7 +1658,11 @@ def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int, split_kv: Optiona
         and not (facts.thd and not _thd_decode_leg(caps, facts) and (facts.d_qk, facts.d_v) not in caps.thd_pack_gqa_d_shapes)
         and not (facts.has_epilogue_gate and not rubin_decode_tile)
         and facts.h_q != facts.h_kv
-        and (rubin_decode_tile or pack_gqa_supported(facts.h_q, facts.h_kv, tile_m, partial=pack_gqa_partial(caps, facts)))
+        and (
+            rubin_decode_tile
+            or _sm120_whole_group_pack(caps, facts, tile_m)
+            or pack_gqa_supported(facts.h_q, facts.h_kv, tile_m, partial=pack_gqa_partial(caps, facts))
+        )
     )
 
 
@@ -1564,6 +1684,9 @@ def _pack_gqa_group(caps: Capabilities, facts, tile_m: Optional[int], packed: Op
     if not packed:
         return 1
     g = facts.h_q // facts.h_kv
+    if _sm120_whole_group_pack(caps, facts, tile_m or 128):
+        # The SM120 half templates pack the whole group (dead tail rows past (tile_m // G) * G).
+        return g
     p = pack_gqa_group_size(g, tile_m or 128, partial=pack_gqa_partial(caps, facts))
     if p == 0 and _d256_decode_tile_selected(caps, facts, g, split_kv):
         return g
@@ -1702,7 +1825,9 @@ def _split_launch(caps: Capabilities, facts, tile_m, tile_n, cga, pack_g: int, *
         kv_tiles = _swa_kv_tiles(facts, token_span=rows // pack_g, tile_n=tile_n or 128)
         if physical:
             ctas = cga_ctas(_selected_d_shape(caps, facts)[0], cga)
-    return _SplitKvLaunch(_ceil_div(facts.s_q * pack_g, rows), facts.h_q // pack_g, kv_tiles, ctas)
+    # Whole tokens per tile (rows // pack_g): the same count as ceil(S_q * pack_g / rows) when the group divides
+    # the tile, and the true one when an SM120 half tile packs a whole group with dead tail rows.
+    return _SplitKvLaunch(_ceil_div(facts.s_q, rows // pack_g), facts.h_q // pack_g, kv_tiles, ctas)
 
 
 def _split_points(
@@ -1756,11 +1881,14 @@ def _split_points(
         return [no_split]
     # Paged KV is padded by construction and the split composes with the
     # per-batch lengths (it IS the decode lever there) — see mismatch().
-    # A sink splits on the half flavors (the combine folds it once); FP8 keeps the per-tile
-    # fold, and a gated graph's split (the gate rides its combine) carries no sink.
+    # A sink splits on the SM100 / SM120 half flavors (the combine folds it once); FP8 keeps
+    # the per-tile fold, and a gated graph's split (the gate rides its combine) carries no sink.
     if (
         (facts.thd and not ragged_decode)
-        or (facts.has_sink and (facts.is_fp8 or facts.is_mxfp8 or facts.has_epilogue_gate or not (caps.sm_lo == 100 and caps.sm_hi < 107)))
+        or (
+            facts.has_sink
+            and (facts.is_fp8 or facts.is_mxfp8 or facts.has_epilogue_gate or not ((caps.sm_lo == 100 and caps.sm_hi < 107) or caps.sm_lo == 120))
+        )
         or (facts.padded and not facts.has_paged_kv)
         or facts.seq_q_trim
     ):
@@ -1830,6 +1958,18 @@ def _split_points(
             if split not in points:
                 points.append(split)
         return points
+    if sm120_decode_tile(caps, tile_m):
+        # The SM120 decode tile streams stages through a ring, one CTA per SM: its own model.
+        tokens = tile_m // pack_g
+        envelope = _sm120_envelope(facts)
+        split = choose_sm120_decode_split_kv(
+            units=_ceil_div(facts.s_q, tokens) * facts.b * (facts.h_q // pack_g),
+            kv_stages=_swa_kv_tiles(facts, token_span=tokens, tile_n=_sm120_decode_kv_stage(*envelope)),
+            stage_bytes=_sm120_decode_stage_bytes(*envelope),
+            d_v=envelope[1],
+            sm_count=sm_count,
+        )
+        return [split, no_split] if split > 1 else [no_split]
     unsplit_pack_g = None
     if unsplit_knobs is not None:
         unsplit_pack_g = _pack_gqa_group(caps, facts, unsplit_knobs.tile_m, unsplit_knobs.pack_gqa)
@@ -2148,12 +2288,17 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
         # different number of Q rows.  The leg's split is part of the question on
         # a GATED d256 graph: it packs on the decode tile's split only (the gate
         # rides that split's combine), never on the unsplit fused-gate kernel.
+        order = sorted(tiles, key=lambda mn: (-(mn[0] or 0), mn[1] != tiles[0][1]))
+        if caps.sm_lo == 120 and not (caps.is_fp8 or caps.is_mxfp8):
+            # SM120 half: the SMALLEST tile that holds a KV head's packed rows in one
+            # Q tile (each KV byte read once, fewest dead rows), else the largest.
+            # RTX PRO 6000, 33-64 rows: the 64-row tile beats the 128-row one at each
+            # tile's best split by 9-15 % at 4K keys (32/8 q12, 32/4 q9, 24/4 d256 q8)
+            # and by 32 % for 16/2 d256 q8 at 64K; the decode tiles lead below 33 rows.
+            rows = facts.s_q * (facts.h_q // facts.h_kv if facts.h_kv else 1)
+            order = sorted(tiles, key=lambda mn: ((mn[0] or 0) < rows, (mn[0] or 0) if (mn[0] or 0) >= rows else -(mn[0] or 0), mn[1] != tiles[0][1]))
         pack_tile = next(
-            (
-                (m, n)
-                for m, n in sorted(tiles, key=lambda mn: (-(mn[0] or 0), mn[1] != tiles[0][1]))
-                if True in _pack_gqa_points(caps, facts, m or 128, cga, split_value)
-            ),
+            ((m, n) for m, n in order if True in _pack_gqa_points(caps, facts, m or 128, cga, split_value)),
             None,
         )
         packed_first = pack_tile is not None and _pack_gqa_points(caps, facts, pack_tile[0] or 128, cga, split_value)[0]
@@ -2198,8 +2343,10 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     def _resplit(knobs: SdpaFwdKnobs) -> SdpaFwdKnobs:
         # A runner's changed packing/tile/CGA is a different launch, not just
         # a label on the baseline's split. Keep other architecture policies
-        # unchanged until they have their own geometry validation.
-        if not _sm100_f16(caps, facts):
+        # unchanged until they have their own geometry validation -- except an
+        # SM120 runner that crosses between the decode tile and a prefill tile,
+        # whose split comes from a different model.
+        if not _sm100_f16(caps, facts) and sm120_decode_tile(caps, knobs.tile_m) == sm120_decode_tile(caps, base.tile_m):
             return knobs
 
         def leg(split):
@@ -2254,6 +2401,9 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     if _d128_dense_two_widths(caps, facts) and not _d128_decode_tile_fits(caps, facts, base.pack_gqa):
         # Past one decode tile both widths serve a dense d128 graph; the wave rule picks the lead.
         out.insert(1, _resplit(replace(base, cga=3 - base.cga)))
+    # The SM120 decode tile walks its units in launch order: a set on it rides SCHED_NATURAL whatever the graph's
+    # preferred remap (the causal LPT_L2 of the prefill tiles), or mismatch() would drop it.
+    out = [replace(knobs, sched_policy=SCHED_NATURAL) if sm120_decode_tile(caps, knobs.tile_m) else knobs for knobs in out]
     seen, unique = set(), []
     for knobs in out:
         if knobs not in seen:
@@ -2293,10 +2443,15 @@ def _fallback_knobs(spec: EngineSpec, facts) -> SdpaFwdKnobs:
     # is also the least-demanding width: one CTA, no cluster); a row that only
     # packs leaves the graph-level question to the rule.
     sched_policy, cga = _auto_sched_cga(spec, facts, split_kv=1, sched_policy=sched_policy, pack_gqa=False if pack_gqa is False else None)
+    tile_m, tile_n = min(caps.tile_ms, default=None), min(caps.tile_ns, default=None)
+    if caps.sm_lo == 120:
+        # The SM120 templates take only their kernel table's (tile_m, tile_n) pairs; the smallest prefill pair builds
+        # for every graph the row admits (the decode tile is dense-only and sized to fill the SM).
+        tile_m, tile_n = min((m, n) for m, n in tile_domain(facts.d_qk, facts.d_v, facts.is_fp8 or facts.is_mxfp8) if not _sm120_is_decode_tile(m))
     return SdpaFwdKnobs(
         sched_policy=sched_policy,
-        tile_m=min(caps.tile_ms, default=None),
-        tile_n=min(caps.tile_ns, default=None),
+        tile_m=tile_m,
+        tile_n=tile_n,
         cga=cga,
         pack_gqa=pack_gqa,
         split_kv=1,  # the fallback never splits: least-demanding means one kernel, no partial workspace
