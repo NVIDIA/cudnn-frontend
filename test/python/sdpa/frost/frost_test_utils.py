@@ -296,6 +296,22 @@ def launch_f16(
         # do not carry them.
         gate_ptr=None,
         gate_strides=(0, 0, 0),
+        # The d128 prefill hosts' ten APPENDED operand slots (both arch trees): the score side outputs, the additive bias, the
+        # per-key kv_mask and the pre-scale bias divisor.  They are explicit on the production ABI (the prepared binder fills
+        # them from the frame, compile()'s fakes shape them; a Python default would leave the compiled host un-persistable), so
+        # a direct launch fills them too -- with the values of a plan WITHOUT the arms: None pointers, zero strides, unit
+        # broadcast extents, inv_scale 1.0 (CFG.BIAS_MODE / KV_MASK_FORM fold the paths out of every direct test's rendering;
+        # the stride / divisor slots are then unread).  Filtered out for hosts that do not carry them.
+        score_max_ptr=None,
+        score_sum_exp_ptr=None,
+        score_max_strides=(0, 0, 0),
+        score_sum_exp_strides=(0, 0, 0),
+        bias_ptr=None,
+        bias_strides=(0, 0, 0),
+        bias_extents=(1, 1),
+        kv_mask_ptr=None,
+        kv_mask_batch_stride=0,
+        inv_scale_softmax=1.0,
     )
     params = set(inspect.signature(host if host is not None else fn).parameters)
     fn(**{name: value for name, value in kw.items() if name in params}, stream=stream)
