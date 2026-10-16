@@ -460,7 +460,8 @@ def test_sm107_row_and_predicate_agree_on_the_decode_tile():
 
 def test_sm107_facts_twin_rule_and_ranked_list_agree_on_the_packed_decode_tile():
     """The three readings of the Rubin d256 decode route agree over a grid of (group, S_q, paged, masked): the facts twin
-    (``engines.decode_d256_q_tile_for_row`` + ``_facts_decode_form``) equals the config's rule (``config_sm107.decode_d256_q_tile`` --
+    (``engines.decode_d256_q_tile_for_row`` + ``_facts_decode_form_kw``: the Rubin arguments by keyword, behind the Blackwell
+    line's ``wide_launch``) equals the config's rule (``config_sm107.decode_d256_q_tile`` --
     what the adapter's ``_decode_q_tile_for`` calls with its own facts, pinned on a device by
     ``test_decode_adapter_routes_decode_shaped_graphs_only``), and for a PAGED dense-Q graph the row's facts-only admission and the
     RANKED LIST follow that rule: the row is eligible iff SOME packing rides the tile, the list holds a packed set iff the packed twin
@@ -492,7 +493,7 @@ def test_sm107_facts_twin_rule_and_ranked_list_agree_on_the_packed_decode_tile()
                     f = facts(group, s_q, paged, masked)
                     assert engines._facts_decode_form(f) == (paged, masked)
                     for pack_g in {1, group}:
-                        twin = engines.decode_d256_q_tile_for_row(caps, s_q, pack_g, *engines._facts_decode_form(f))
+                        twin = engines.decode_d256_q_tile_for_row(caps, s_q, pack_g, **engines._facts_decode_form_kw(f))
                         assert twin == config_sm107.decode_d256_q_tile(s_q, pack_g, paged=paged, masked=masked), (group, s_q, paged, masked, pack_g, twin)
                     if not paged:
                         continue  # over a dense cache the d256 prefill kernel serves every graph: the row is eligible whatever the tile says
@@ -508,7 +509,7 @@ def test_sm107_facts_twin_rule_and_ranked_list_agree_on_the_packed_decode_tile()
     assert checked == 7 * 15 * 2
     # the cell of record: 4 / 2 at S_q 33 over pages under the causal mask -- the packed set alone
     f = facts(2, 33, True, True)
-    assert engines.decode_d256_q_tile_for_row(caps, 33, 2, True, True) == 64 and engines.mismatch(caps, f, None) is None
+    assert engines.decode_d256_q_tile_for_row(caps, 33, 2, paged=True, masked=True) == 64 and engines.mismatch(caps, f, None) is None
     plans = heuristics.recommend("A", f, offered)
     assert plans and all(p.knobs.pack_gqa is True for p in plans), [p.knobs for p in plans]
 
