@@ -55,6 +55,29 @@ def _spy_d576_two_cta_execute(monkeypatch):
     return calls
 
 
+def _spy_deterministic_sm100_compile(monkeypatch):
+    """Record (backend, num_heads) of each deterministic SM100 plan compile.
+
+    Deterministic plans compile their own artifact in ``compile()`` and launch it
+    through ``_compiled_kernel``, so the route never appears in
+    ``flash_attn_bwd_sm100.compile_cache``. The wrapper's plan cache is emptied
+    for the test so an identical plan built by an earlier test still reaches
+    ``compile()``; the artifact itself stays cached below it.
+    """
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100, api
+
+    monkeypatch.setattr(api, "_cache_of_SparseAttentionBackwardObjects", {})
+    compiles = []
+    real_compile = _interface_sm100._compile_deterministic_sm100
+
+    def recorded_compile(device_index, device_capability, backend, dtype, head_dim, head_dim_v, num_heads, *args, **kwargs):
+        compiles.append((backend, num_heads))
+        return real_compile(device_index, device_capability, backend, dtype, head_dim, head_dim_v, num_heads, *args, **kwargs)
+
+    monkeypatch.setattr(_interface_sm100, "_compile_deterministic_sm100", recorded_compile)
+    return compiles
+
+
 def _allocate(cfg, has_topk_length: bool):
     total_s_q = cfg["s_q"]
     total_s_kv = cfg["s_kv"]
@@ -2378,6 +2401,7 @@ def test_DSA_sparse_attention_backward_h128_two_cta_handles_sink_limits(head_dim
     num_heads, head_dim_v = 128, 512
     softmax_scale = 192**-0.5
     two_cta_calls = _spy_d576_two_cta_execute(monkeypatch) if head_dim == 576 else None
+    deterministic_compiles = _spy_deterministic_sm100_compile(monkeypatch)
 
     q = torch.randn(s_q, num_heads, head_dim, dtype=torch.bfloat16, device=device)
     kv = torch.randn(1, head_dim, dtype=torch.bfloat16, device=device)
@@ -2421,9 +2445,12 @@ def test_DSA_sparse_attention_backward_h128_two_cta_handles_sink_limits(head_dim
     if head_dim == 576:
         assert two_cta_calls, "the wrapper did not execute the H128/D576 two-CTA backend"
     else:
-        assert any(
-            key[0] == expected_backend and key[1] == deterministic and key[5] == num_heads for key in _interface_sm100.flash_attn_bwd_sm100.compile_cache
-        )
+        if deterministic:
+            assert (expected_backend, num_heads) in deterministic_compiles
+        else:
+            assert any(
+                key[0] == expected_backend and key[1] == deterministic and key[5] == num_heads for key in _interface_sm100.flash_attn_bwd_sm100.compile_cache
+            )
 
 
 @pytest.mark.L0
@@ -2479,6 +2506,7 @@ def test_DSA_sparse_attention_backward_h128_two_cta_one_key_padded_gradients(hea
     outputs = (torch.empty_like(q), torch.empty_like(kv), torch.empty_like(attn_sink))
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     two_cta_calls = _spy_d576_two_cta_execute(monkeypatch) if head_dim == 576 else None
+    deterministic_compiles = _spy_deterministic_sm100_compile(monkeypatch)
 
     def check_gradients(actual, path):
         assert len(actual) == 3
@@ -2515,9 +2543,12 @@ def test_DSA_sparse_attention_backward_h128_two_cta_one_key_padded_gradients(hea
     if head_dim == 576:
         assert len(two_cta_calls) == 2, "both wrapper and plan must execute the H128/D576 two-CTA backend"
     else:
-        assert any(
-            key[0] == expected_backend and key[1] == deterministic and key[5] == num_heads for key in _interface_sm100.flash_attn_bwd_sm100.compile_cache
-        )
+        if deterministic:
+            assert (expected_backend, num_heads) in deterministic_compiles
+        else:
+            assert any(
+                key[0] == expected_backend and key[1] == deterministic and key[5] == num_heads for key in _interface_sm100.flash_attn_bwd_sm100.compile_cache
+            )
 
 
 @pytest.mark.L0
@@ -2547,6 +2578,7 @@ def test_DSA_sparse_attention_backward_h128_two_cta_padded_slots_under_very_nega
     s_q, s_kv, topk, num_heads, valid_slots = 4, 300, 128, 128, 3
     softmax_scale = head_dim**-0.5
     two_cta_calls = _spy_d576_two_cta_execute(monkeypatch) if head_dim == 576 else None
+    deterministic_compiles = _spy_deterministic_sm100_compile(monkeypatch)
 
     # Every logit is about -10 * head_dim * softmax_scale (below -200 nats) and the sink is disabled.
     q = torch.full((s_q, num_heads, head_dim), 10.0, dtype=torch.bfloat16, device=device)
@@ -2570,9 +2602,12 @@ def test_DSA_sparse_attention_backward_h128_two_cta_padded_slots_under_very_nega
     if head_dim == 576:
         assert two_cta_calls, "the wrapper did not execute the H128/D576 two-CTA backend"
     else:
-        assert any(
-            key[0] == expected_backend and key[1] == deterministic and key[5] == num_heads for key in _interface_sm100.flash_attn_bwd_sm100.compile_cache
-        )
+        if deterministic:
+            assert (expected_backend, num_heads) in deterministic_compiles
+        else:
+            assert any(
+                key[0] == expected_backend and key[1] == deterministic and key[5] == num_heads for key in _interface_sm100.flash_attn_bwd_sm100.compile_cache
+            )
 
 
 @pytest.mark.L0
