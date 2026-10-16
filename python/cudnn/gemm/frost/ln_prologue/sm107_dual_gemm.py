@@ -230,6 +230,7 @@ from cudnn.gemm.frost.ln_prologue import (
     ln_once_n_tiles_per_item,
     ln_once_tiles_per_item,
     ring_stages,
+    tcgen05_smem_desc_builder,
     validate_ln_dual_gemm_params,
 )
 from cudnn.gemm.frost.tile_helpers import (
@@ -332,12 +333,14 @@ PARAMS: LnDualGemmParams = globals().get("FROST_TEMPLATE_PARAMS", LnDualGemmPara
 validate_ln_dual_gemm_params(PARAMS, BODY_ARCH)
 _K: int = PARAMS.k  # the LayerNorm width = GEMM K
 _NK: int = PARAMS.k_stages  # K stages per tile (64 wide); the LN warps hold a whole row = all of them at once
-# The tcgen05 SMEM-descriptor VERSION, declared ONCE and passed at EVERY ``Tcgen05SmemDesc.build`` below -- never a literal, never the
-# DSL default.  Both arms' operand rings end at 288 KiB (9 x 32 KiB; 6 x 48 KiB), so the last stages start past 256 KiB = 262144 B: a
-# version-0 descriptor's 14-bit start-address field (16-B units) wraps there and the MMA reads stage 0 instead -- EXACTLY zero
-# accumulators, no fault.  Version 1 carries the wide field.  (The DSL's build() defaults to 1 today; a default change would
-# otherwise break this body silently.)
-DESC_VERSION: int = 1
+# The tcgen05 SMEM-descriptor builder for this body's operand ring ROOTS, resolved ONCE at load against the installed DSL
+# (``ln_prologue.tcgen05_smem_desc_builder``): ``Tcgen05SmemDesc.build(..., version=1)`` where the DSL's build() takes a version (never the
+# DSL default -- the wide 15-bit start-address field; the Rubin body's rings end at 288 KiB, past the 256 KiB = 262144 B line where the
+# non-versioned builder's 14-bit field wraps and the MMA reads stage 0 instead: EXACTLY zero accumulators, no fault), the non-versioned build()
+# of the 4.7.0 floor on a body whose part cannot place a root past the line (the 227 KiB Blackwell carveout; bit-identical encodings there),
+# and a typed decline on first use where the wide field is needed and the DSL has no versioned builder (``build_ln_dual_gemm`` declines the same
+# way before loading this module).  Per-stage / per-k-step offsets ride ``advance_start_address`` either way.
+_DESC_BUILD = tcgen05_smem_desc_builder(BODY_ARCH)
 _C_OUT: int = PARAMS.c_out  # output channels per pass; N = 2 * c_out, interleaved [value block | gate block] per 256
 _N_OUT: int = PARAMS.n_out  # the GEMM N per tile: 2 c_out (value | gate interleaved) in the columns arm, c_out per GEMM in the accumulators arm
 _BIAS_PER_PASS: int = 2 * _C_OUT  # the interleaved [value block | gate block] bias entries per pass (BOTH arms: value + gate per output channel)
@@ -1504,21 +1507,19 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
                 clc_full_phase_mma = cutlass.Int32(0)
                 acc_stage = cutlass.Int32(0)
                 desc_a_roots = [
-                    cutlass.experimental.primitives.Tcgen05SmemDesc.build(
-                        start_address=smem_a_list[i],
+                    _DESC_BUILD(
+                        smem_a_list[i],
                         leading_byte_offset=_A_LBO[i],
                         stride_byte_offset=_A_SBO[i],
-                        version=DESC_VERSION,
                         layout=ab_smem_swizzle,
                     )
                     for i in range(num_a_operands)
                 ]
                 desc_b_roots = [
-                    cutlass.experimental.primitives.Tcgen05SmemDesc.build(
-                        start_address=smem_b_list[j],
+                    _DESC_BUILD(
+                        smem_b_list[j],
                         leading_byte_offset=b_smem_desc_leading_byte_offset,
                         stride_byte_offset=b_smem_desc_stride_byte_offset,
-                        version=DESC_VERSION,
                         layout=ab_smem_swizzle,
                     )
                     for j in range(num_b_operands)
@@ -1634,21 +1635,19 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
                 # across persistent tiles.  Only the encoded start address advances.
                 # K3 ARM: per-operand descriptor constants (an MN-major operand: LBO 8192 / SBO 1024, the FROST GEMM compiler's values)
                 desc_a_roots = [
-                    cutlass.experimental.primitives.Tcgen05SmemDesc.build(
-                        start_address=smem_a_list[i],
+                    _DESC_BUILD(
+                        smem_a_list[i],
                         leading_byte_offset=_A_LBO[i],
                         stride_byte_offset=_A_SBO[i],
-                        version=DESC_VERSION,
                         layout=ab_smem_swizzle,
                     )
                     for i in range(num_a_operands)
                 ]
                 desc_b_roots = [
-                    cutlass.experimental.primitives.Tcgen05SmemDesc.build(
-                        start_address=smem_b_list[j],
+                    _DESC_BUILD(
+                        smem_b_list[j],
                         leading_byte_offset=b_smem_desc_leading_byte_offset,
                         stride_byte_offset=b_smem_desc_stride_byte_offset,
-                        version=DESC_VERSION,
                         layout=ab_smem_swizzle,
                     )
                     for j in range(num_b_operands)

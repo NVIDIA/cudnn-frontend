@@ -125,20 +125,25 @@ def test_y_shape_and_model_counts():
 
 
 def test_every_tcgen05_smem_descriptor_of_the_body_takes_the_module_desc_version_and_it_is_v1():
-    """Both arms' operand rings end at 288 KiB (9 x 32 KiB; 6 x 48 KiB), so the last stages start past 262144 B -- a version-0 tcgen05 SMEM
-    descriptor's 14-bit start-address field wraps there (EXACTLY zero accumulators, no fault).  The body declares ``DESC_VERSION = 1`` once
-    and passes it at every ``Tcgen05SmemDesc.build``; a re-literalled ``version=`` or a build site relying on the DSL default fails here."""
+    """Both arms' operand rings end at 288 KiB (9 x 32 KiB; 6 x 48 KiB), so the last stages start past 262144 B, where a tcgen05 SMEM
+    descriptor without the wide (15-bit) start-address field wraps (EXACTLY zero accumulators, no fault).  The body builds every ring-root
+    descriptor through the module-level ``_DESC_BUILD`` (``ln_prologue.tcgen05_smem_desc_builder``), which passes ``version=1`` where the
+    DSL's build() takes it and declines this body on a DSL without it; a raw ``Tcgen05SmemDesc.build`` site, a ``version=`` literal or a
+    build relying on the DSL default fails here."""
     import re
 
     src = open(sub.body_path("sm107")).read()
     code = "\n".join(line for line in src.splitlines() if not line.lstrip().startswith("#"))
-    m = re.search(r"^DESC_VERSION: int = (\d)$", code, flags=re.M)
-    assert m is not None, "the body must declare the module-level DESC_VERSION"
-    assert int(m.group(1)) == 1, f"DESC_VERSION = {m.group(1)}: the operand rings cross 256 KiB, the descriptor must carry the wide start-address field"
-    builds = len(re.findall(r"Tcgen05SmemDesc\.build\(", code))
-    pinned = len(re.findall(r"\bversion=DESC_VERSION\b", code))
-    assert builds >= 2 and pinned == builds, f"{builds} Tcgen05SmemDesc.build sites, {pinned} take version=DESC_VERSION"
-    assert not re.search(r"\bversion=[0-3]\b", code), "a descriptor build re-literals its version"
+    assert re.search(
+        r"^_DESC_BUILD = tcgen05_smem_desc_builder\(BODY_ARCH\)$", code, flags=re.M
+    ), "the body must build its descriptors through the module-level builder"
+    builds = len(re.findall(r"\b_DESC_BUILD\(", code))
+    assert builds >= 2, f"{builds} _DESC_BUILD sites"
+    assert "Tcgen05SmemDesc.build(" not in code and not re.search(r"\bversion=", code), "a descriptor build bypasses the builder or re-literals its version"
+    assert sub.TCGEN05_SMEM_DESC_VERSION == 1, "the operand rings cross 256 KiB, the descriptor must carry the wide start-address field"
+    assert sub.smem_desc_wide_start_address_required(
+        "sm107"
+    ), "the sm107 body must require the wide start-address field (a non-versioned build() declines, it does not wrap)"
 
 
 class _Boom(Exception):

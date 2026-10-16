@@ -56,6 +56,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+import inspect
 import os
 from typing import Any, Optional
 
@@ -134,6 +135,17 @@ RING_STAGES = RING_STAGES_BY_ARCH["sm107"]
 #: carveout (the body's ~309 KiB fits), Blackwell's 227 KiB opt-in limit (the ~220 KiB sm100 body fits; the overflow of either would not fail
 #: the launch visibly -- sdpa-invariants S 6).
 SMEM_BUDGET_BYTES_BY_ARCH = {"sm107": 320 * 1024, "sm100": 227 * 1024}
+#: The address window of the NON-versioned tcgen05 SMEM-descriptor builder: ``Tcgen05SmemDesc.build`` WITHOUT a ``version`` argument (the
+#: released nvidia-cutlass-dsl 4.7.0 = :data:`cudnn.frost.buffers.CUTEDSL_MIN_VERSION`, admitted on cc 10.0 / 10.3) lowers to the NVVM op that
+#: keeps 14 bits of ``start_address >> 4``, so an operand ring ROOT at or above this many bytes wraps to the bottom of SMEM and the MMA reads
+#: stage 0 -- EXACTLY zero accumulators, no fault.  The versioned builder (4.8.0+, ``version=1``) keeps 15 bits.  Both write the SAME version
+#: field (bits 46-48 = 1) and the same LBO / SBO / swizzle bits, so BELOW the line the two encodings are bit-identical (the K1 test module's
+#: descriptor-identity probe pins it on the installed DSL); per-stage / per-k-step offsets ride ``advance_start_address`` (an unmasked encoded
+#: add) either way.  Only the bodies' ring roots go through the builder (:func:`tcgen05_smem_desc_builder`).
+TCGEN05_SMEM_DESC_LEGACY_ADDR_LIMIT = 262144
+#: The descriptor version every ring-root descriptor is built with where the installed builder takes one -- never the DSL default (a default
+#: change would otherwise move the Rubin body's descriptors silently).
+TCGEN05_SMEM_DESC_VERSION = 1
 A_STAGE_BYTES = (PAIR_TILE_ROWS // 2) * K_STAGE * 2  #: one 128-row x 64-channel bf16 A stage per operand (16 KiB)
 B_STAGE_BYTES = {
     "columns": (PAIR_TILE_ROWS // 2) * K_STAGE * 2,
@@ -177,6 +189,83 @@ def body_path(arch: str = "sm107") -> str:
     if arch not in BODIES:
         raise ValueError(f"the LayerNorm-prologue dual GEMM has a rendered body for {sorted(BODIES)} only, not {arch!r}")
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), BODIES[arch])
+
+
+def smem_desc_wide_start_address_required(arch: str) -> bool:
+    """Whether the ``arch`` body can place an operand ring root at or above :data:`TCGEN05_SMEM_DESC_LEGACY_ADDR_LIMIT`: its part's per-CTA
+    SMEM (:data:`SMEM_BUDGET_BYTES_BY_ARCH`) reaches past the line.  Rubin's 320 KiB carveout does (the sm107 body's rings end at 288 KiB);
+    Blackwell's 227 KiB opt-in limit does not (no address a cc 10.0 / 10.3 CTA holds can reach the line, whatever the layout)."""
+    if arch not in SMEM_BUDGET_BYTES_BY_ARCH:
+        raise ValueError(f"the LayerNorm-prologue dual GEMM has a rendered body for {sorted(SMEM_BUDGET_BYTES_BY_ARCH)} only, not {arch!r}")
+    return SMEM_BUDGET_BYTES_BY_ARCH[arch] > TCGEN05_SMEM_DESC_LEGACY_ADDR_LIMIT
+
+
+def _tcgen05_smem_desc_build_is_versioned() -> bool:
+    """Whether the installed DSL's ``Tcgen05SmemDesc.build`` takes ``version`` (nvidia-cutlass-dsl 4.8.0+; the released 4.7.0 does not)."""
+    from cutlass.experimental.primitives import Tcgen05SmemDesc
+
+    return "version" in inspect.signature(Tcgen05SmemDesc.build).parameters
+
+
+def tcgen05_smem_desc_requirement_error(arch: str) -> Optional[str]:
+    """Message naming the installed DSL when the ``arch`` body needs the wide start-address field (:func:`smem_desc_wide_start_address_required`)
+    and the installed ``Tcgen05SmemDesc.build`` has no ``version`` parameter (the released 4.7.0: 14 address bits, a root past the line wraps);
+    None when the installed builder serves the body -- the versioned 4.8.0+ builder, or a body whose part cannot place a root past the line.
+    One of the CuTe-DSL gates of :func:`build_ln_dual_gemm` (AGENTS.md Rule 7: a typed decline naming the version, never the DSL's own error
+    out of ``cute.compile``); the sm_107a target gate already holds the sm107 body at 4.8.0+, this states the descriptor requirement where it
+    is built.  Imports the DSL, so it runs after the floor gate like the target gate."""
+    if not smem_desc_wide_start_address_required(arch) or _tcgen05_smem_desc_build_is_versioned():
+        return None
+    from cudnn.frost.buffers import cutedsl_state
+
+    _, version = cutedsl_state()
+    found = "unknown version" if version is None else " ".join(version)
+    return (
+        f"the LayerNorm-prologue dual GEMM's {arch} body places operand ring roots at or above {TCGEN05_SMEM_DESC_LEGACY_ADDR_LIMIT} B of SMEM "
+        f"and needs the CuTe DSL's versioned tcgen05 SMEM-descriptor builder (Tcgen05SmemDesc.build with a 'version' parameter: "
+        f"nvidia-cutlass-dsl >= 4.8.0); found {found}"
+    )
+
+
+class Tcgen05SmemDescBuilder:
+    """The tcgen05 SMEM-descriptor constructor one body builds its operand ring-root descriptors with, resolved ONCE per body load against the
+    installed DSL (:func:`tcgen05_smem_desc_builder`).  ``path`` names the resolution: ``"versioned"`` = ``Tcgen05SmemDesc.build(...,
+    version=TCGEN05_SMEM_DESC_VERSION)`` (a build() with the parameter, 4.8.0+ -- explicit, never the default); ``"legacy"`` = the
+    non-versioned build() of the 4.7.0 floor on a body whose roots cannot reach the 256 KiB line (bit-identical encodings there);
+    ``"declined"`` = a body that needs the wide field on a DSL without the versioned builder -- every call raises the typed decline of
+    :func:`tcgen05_smem_desc_requirement_error` (the body module still LOADS: the host tests execute it without compiling)."""
+
+    __slots__ = ("arch", "path", "_decline")
+
+    def __init__(self, arch: str, path: str, decline: Optional[str] = None):
+        self.arch, self.path, self._decline = arch, path, decline
+
+    def __call__(self, start_address, *, leading_byte_offset: int, stride_byte_offset: int, layout):
+        if self.path == "declined":
+            raise NotImplementedError(self._decline)
+        from cutlass.experimental.primitives import Tcgen05SmemDesc
+
+        if self.path == "versioned":
+            return Tcgen05SmemDesc.build(
+                start_address=start_address,
+                leading_byte_offset=leading_byte_offset,
+                stride_byte_offset=stride_byte_offset,
+                version=TCGEN05_SMEM_DESC_VERSION,
+                layout=layout,
+            )
+        return Tcgen05SmemDesc.build(start_address=start_address, leading_byte_offset=leading_byte_offset, stride_byte_offset=stride_byte_offset, layout=layout)
+
+    def __repr__(self) -> str:
+        return f"Tcgen05SmemDescBuilder(arch={self.arch!r}, path={self.path!r})"
+
+
+def tcgen05_smem_desc_builder(arch: str) -> Tcgen05SmemDescBuilder:
+    """Resolve the ``arch`` body's ring-root descriptor builder against the installed DSL (:class:`Tcgen05SmemDescBuilder`): the versioned
+    build() where it exists, the floor DSL's non-versioned build() on a body whose roots stay below the line, a declining builder otherwise."""
+    if _tcgen05_smem_desc_build_is_versioned():
+        return Tcgen05SmemDescBuilder(arch, "versioned")
+    msg = tcgen05_smem_desc_requirement_error(arch)
+    return Tcgen05SmemDescBuilder(arch, "legacy") if msg is None else Tcgen05SmemDescBuilder(arch, "declined", msg)
 
 
 @dataclass(frozen=True)
@@ -578,13 +667,19 @@ def build_ln_dual_gemm(params: LnDualGemmParams, arch: str = "sm107") -> LnDualG
     triangle-attention projection build on it): below the DSL floor, or -- for the sm107 body -- on a DSL without the sm_107a target, the
     failure is a typed ``NotImplementedError`` naming the version -- never the DSL's own ``KeyError: 'sm_107a'`` out of ``cute.compile``.
     The target gate is asked about the BODY's arch (:data:`ARCH_GATE_CC`), not the device's: the sm100 body compiles on every DSL above the
-    floor."""
+    floor.  The third gate is the descriptor builder's (:func:`tcgen05_smem_desc_requirement_error`): a body whose ring roots can sit past the
+    256 KiB line needs the versioned ``Tcgen05SmemDesc.build`` -- the sm107 body, which the target gate already holds at 4.8.0+; the sm100
+    body builds its roots through the floor DSL's non-versioned builder (bit-identical below the line)."""
     from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
     from cudnn.frost.template_loader import load_template
 
     if arch not in BODIES:
         raise ValueError(f"the LayerNorm-prologue dual GEMM has a rendered body for {sorted(BODIES)} only, not {arch!r}")
-    msg = cutedsl_requirement_error("the LayerNorm-prologue dual GEMM") or cutedsl_arch_requirement_error(ARCH_GATE_CC[arch])
+    msg = (
+        cutedsl_requirement_error("the LayerNorm-prologue dual GEMM")
+        or cutedsl_arch_requirement_error(ARCH_GATE_CC[arch])
+        or tcgen05_smem_desc_requirement_error(arch)
+    )
     if msg:
         raise NotImplementedError(msg)
     validate_ln_dual_gemm_params(params, arch)
