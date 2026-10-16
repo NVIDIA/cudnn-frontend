@@ -17,9 +17,7 @@ TEST_CASE("Compile-time constant scalar multiply and add", "[compile_time_const]
     return;
 #endif
 
-    if (!is_blackwell_computing_arch()) {
-        SKIP("Compile-time constant scalar graph (TensorIR) is only supported on Blackwell (data center Blackwell)");
-    }
+    skip_if_membound_arch_unsupported();
 
 #if (CUDNN_VERSION < 92200)
     SKIP("Compile-time constant graph sample requires cuDNN 9.22.0 or newer (compiled CUDNN_VERSION >= 92200).");
