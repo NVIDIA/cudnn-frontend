@@ -1684,7 +1684,7 @@ contiguous or whose live strides are not 16-byte multiples (TMA; S_kv % 8 == 0
 for a COMPACT bias -- the acceptance-grid cells S = 100 / 217 are therefore typed
 declines for a compact bias and SERVED with a padded row stride, 104 / 224,
 validated at both; a wrapper that owns the bias allocation pads the stride), a
-a kv_mask in a dtype the arm has no form for (int8 / uint8 on the graph path, a 16-bit vector that is not the
+kv_mask in a dtype the arm has no form for (int8 / uint8 on the graph path, a 16-bit vector that is not the
 Q/K/V dtype), an ADDITIVE kv_mask vector at S_kv % 8 != 0 or with a batch stride that is not a 16-byte multiple (its
 16-byte granule loads), an EXPLICIT TILE_N 128 for an fp32 additive vector TOGETHER WITH a bias (that rendering spills on the softmax
 role -- STL / LDL 23 / 27 causal, 15 / 15 padded, 16 / 16 at d64 cga2, sm_107a; neither `BIAS_PRELOAD_CHUNKS = 0` nor a streamed granule
