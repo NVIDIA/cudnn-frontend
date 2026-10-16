@@ -80,14 +80,25 @@ def _allocate(cfg, has_topk_length: bool):
     return q, kv, attn_sink, topk_idxs, topk_length
 
 
-def _plan_case(num_heads, head_dim, topk, *, s_q=8, s_kv=256, has_topk_length=False, deterministic=False, q_cluster_mode="off"):
+def _plan_case(
+    num_heads,
+    head_dim,
+    topk,
+    *,
+    s_q=8,
+    s_kv=256,
+    dtype=torch.bfloat16,
+    has_topk_length=False,
+    deterministic=False,
+    q_cluster_mode="off",
+):
     """Inputs, a checked and compiled plan, caller-owned outputs, and scratch for one route."""
     from cudnn import DSA
 
     device = torch.device("cuda")
     softmax_scale = 1.0 / math.sqrt(head_dim)
-    q = torch.randn(s_q, num_heads, head_dim, dtype=torch.bfloat16, device=device) / 10
-    kv = torch.randn(s_kv, head_dim, dtype=torch.bfloat16, device=device) / 10
+    q = torch.randn(s_q, num_heads, head_dim, dtype=dtype, device=device) / 10
+    kv = torch.randn(s_kv, head_dim, dtype=dtype, device=device) / 10
     attn_sink = torch.randn(num_heads, dtype=torch.float32, device=device)
     topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
     topk_length = torch.randint(1, topk + 1, (s_q,), dtype=torch.int32, device=device) if has_topk_length else None
@@ -126,7 +137,7 @@ def _assert_execute_allocates_nothing_and_never_synchronizes(plan, inputs, outpu
         dq, dkv, d_sink = outputs
         return plan.execute(*inputs, dq, dkv, topk_length=topk_length, softmax_scale=softmax_scale, workspace=workspace, current_stream=stream, d_sink=d_sink)
 
-    execute()  # warm: the non-D576 routes compile on their first execute
+    execute()  # warm ordinary SM90/SM100 routes that still compile on first execute
     torch.cuda.synchronize()
     before = torch.cuda.memory_stats()["allocation.all.allocated"]
     previous = torch.cuda.get_sync_debug_mode()
@@ -305,6 +316,73 @@ def test_DSA_sparse_attention_backward_qcluster_compile_key_is_shape_dynamic():
     assert second_info.hits == first_info.hits + 1
     assert first.transform is second.transform
     assert first.shared is second.shared
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_deterministic_compile_cache_is_device_scoped(monkeypatch):
+    """Same-arch devices must not share context-owned CuTe launchables."""
+    from contextlib import contextmanager
+
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100 as interface
+
+    compiled = []
+    current_device = [None]
+
+    @contextmanager
+    def device_context(device):
+        """Emulate a restoring CUDA device guard for the host-only cache test."""
+        previous, current_device[0] = current_device[0], device
+        try:
+            yield
+        finally:
+            current_device[0] = previous
+
+    class FakeKernel:
+        """Accept production kernel-constructor arguments without codegen."""
+
+        def __init__(self, **kwargs):
+            """Construct a storage-free stand-in for a deterministic kernel."""
+            pass
+
+    def fake_compile(*args, **kwargs):
+        """Record the guarded device and return a unique launchable stand-in."""
+        artifact = object()
+        compiled.append((current_device[0], kwargs["options"], artifact))
+        return artifact
+
+    compile_artifact = interface._compile_deterministic_sm100
+    compile_artifact.cache_clear()
+    monkeypatch.setattr(interface, "_deterministic_kernel_class_for_shards", lambda shards: FakeKernel)
+    monkeypatch.setattr(interface, "_fake_compact_tensor", lambda *args, **kwargs: object())
+    monkeypatch.setattr(interface.cute, "sym_int", lambda: object())
+    monkeypatch.setattr(interface.cute.runtime, "make_fake_stream", lambda **kwargs: object())
+    monkeypatch.setattr(interface.cute, "compile", fake_compile)
+    monkeypatch.setattr(torch.cuda, "device", device_context)
+
+    def build(device, capability=(10, 0)):
+        """Compile one representative signature for a device and capability."""
+        return compile_artifact(device, capability, "generic_m64", torch.bfloat16, 512, 512, 64, 64, True, 32)
+
+    try:
+        device0 = build(0)
+        device1 = build(1)
+        device1_again = build(1)
+        sm103 = build(2, (10, 3))
+        sm107 = build(3, (10, 7))
+    finally:
+        compile_artifact.cache_clear()
+
+    assert device0 is not device1
+    assert device1_again is device1
+    assert sm103 is not device1
+    assert sm107 is not sm103
+    assert [(device, options) for device, options, _ in compiled] == [
+        (0, "--enable-tvm-ffi --gpu-arch sm_100a"),
+        (1, "--enable-tvm-ffi --gpu-arch sm_100a"),
+        (2, "--enable-tvm-ffi --gpu-arch sm_103a"),
+        (3, "--enable-tvm-ffi --gpu-arch sm_107a"),
+    ]
+    assert current_device[0] is None
 
 
 @pytest.mark.L1
@@ -511,6 +589,10 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
         from cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
         from cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_deterministic import (
             FlashAttentionDSABackwardSm100Deterministic,
+            FlashAttentionDSABackwardSm100Deterministic32,
+            FlashAttentionDSABackwardSm100Deterministic64,
+            deterministic_dkv_shards,
+            deterministic_kernel_class,
         )
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
@@ -520,6 +602,23 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
     assert FlashAttentionDSABackwardSm100Deterministic.q_wave_ctas == FlashAttentionDSABackwardSm100Deterministic.num_dkv_shards
     assert FlashAttentionDSABackwardSm100Deterministic.dkv_fold_group_size == 8
     assert FlashAttentionDSABackwardSm100Deterministic.serialize_head_blocks
+    assert deterministic_dkv_shards(1) == 32
+    assert deterministic_dkv_shards(128) == 32
+    assert deterministic_dkv_shards(129) == 64
+    assert deterministic_dkv_shards(256) == 64
+    assert deterministic_dkv_shards(257) == 128
+    assert deterministic_dkv_shards(1024) == 128
+    assert deterministic_kernel_class(128) is FlashAttentionDSABackwardSm100Deterministic32
+    assert deterministic_kernel_class(256) is FlashAttentionDSABackwardSm100Deterministic64
+    assert deterministic_kernel_class(257) is FlashAttentionDSABackwardSm100Deterministic
+    assert not FlashAttentionDSABackwardSm100Deterministic32.run_dkv_prefold
+    assert FlashAttentionDSABackwardSm100Deterministic32.num_dkv_fold_groups == 4
+    assert FlashAttentionDSABackwardSm100Deterministic32.num_dkv_final_terms == 32
+    assert FlashAttentionDSABackwardSm100Deterministic64.run_dkv_prefold
+    assert FlashAttentionDSABackwardSm100Deterministic64.num_dkv_fold_groups == 8
+    assert FlashAttentionDSABackwardSm100Deterministic64.num_dkv_final_terms == 8
+    with pytest.raises(ValueError, match="at least one query row"):
+        deterministic_dkv_shards(0)
     assert FlashAttentionDSABackwardSm100.q_wave_ctas == 0
     assert not FlashAttentionDSABackwardSm100.serialize_head_blocks
 
@@ -540,8 +639,28 @@ def test_DSA_sparse_attention_backward_sm100_d576_workspace_uses_compact_rows(nu
     expected = lse_odo_bytes + padded_s_kv * head_dim * torch.float32.itemsize
     assert flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads) == expected
 
-    deterministic_dkv_bytes = 128 * padded_s_kv * head_dim * torch.float32.itemsize
-    assert flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True) == lse_odo_bytes + deterministic_dkv_bytes
+    deterministic_dkv_bytes = 32 * padded_s_kv * head_dim * torch.float32.itemsize
+    assert (
+        flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True, backend="generic_m64")
+        == lse_odo_bytes + deterministic_dkv_bytes
+    )
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm100_deterministic_workspace_respects_backend():
+    """Adaptive M64 scratch must not undersize either deterministic H128 two-CTA route."""
+    try:
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100 import flash_attn_bwd_sm100_workspace_size
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    s_q, s_kv, num_heads = 7, 1025, 128
+    for head_dim, backend in ((512, "h128_2cta_m64"), (576, "h128_d576_2cta_m64")):
+        fixed = flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True)
+        two_cta = flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True, backend=backend)
+        adaptive = flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True, backend="generic_m64")
+        assert two_cta == fixed
+        assert adaptive < fixed
 
 
 def _exercise_deterministic_sm100_case(num_heads, head_dim, s_q, s_kv, repeats, check_short_workspace=False):
@@ -571,7 +690,7 @@ def _exercise_deterministic_sm100_case(num_heads, head_dim, s_q, s_kv, repeats, 
         softmax_scale=softmax_scale,
     )
     dout = torch.randn_like(out)
-    workspace_bytes = flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True)
+    workspace_bytes = flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True, backend="generic_m64")
     api = DSA.SparseAttentionBackward(
         sample_q=q,
         sample_kv=kv,
@@ -588,7 +707,9 @@ def _exercise_deterministic_sm100_case(num_heads, head_dim, s_q, s_kv, repeats, 
     api.compile()
     assert api.scratch_workspace_bytes() == workspace_bytes
     expected_lse_odo_bytes = num_heads * math.ceil(s_q / 8) * 8 * 2 * torch.float32.itemsize
-    expected_dkv_bytes = 128 * math.ceil(s_kv / 8) * 8 * math.ceil(head_dim / 8) * 8 * torch.float32.itemsize
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_deterministic import deterministic_dkv_shards
+
+    expected_dkv_bytes = deterministic_dkv_shards(s_q) * math.ceil(s_kv / 8) * 8 * math.ceil(head_dim / 8) * 8 * torch.float32.itemsize
     assert workspace_bytes == expected_lse_odo_bytes + expected_dkv_bytes
     workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=device)
     dq, dkv, d_sink = torch.empty_like(q), torch.empty_like(kv), torch.empty_like(attn_sink)
@@ -596,9 +717,8 @@ def _exercise_deterministic_sm100_case(num_heads, head_dim, s_q, s_kv, repeats, 
 
     def run():
         """Execute after poisoning caller scratch AND outputs: the launch sequence owns every reset."""
-        # The compiled kernels (plus the R4 memset of d_sink), never an
-        # execute-side torch fill, must establish the accumulator state and
-        # overwrite every dq/dkv element on each reuse.
+        # The compiled deterministic kernels, never an execute-side reset,
+        # must establish accumulator state and overwrite every output.
         for buffer in (workspace, dq, dkv, d_sink):
             buffer.view(torch.uint8).fill_(0xA5)
         result = api.execute(
@@ -680,6 +800,141 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_bounded_waves(num_hea
         _exercise_deterministic_sm100_case(num_heads, head_dim, 257, 256, repeats)
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=420)
+@pytest.mark.parametrize("s_q", [128, 129], ids=["shards32", "shards64"])
+def test_DSA_sparse_attention_backward_sm100_deterministic_adaptive_shards_repeat100(s_q):
+    """Every adaptive specialization remains bitwise stable across reuse."""
+    try:
+        _exercise_deterministic_sm100_case(64, 512, s_q, 130, repeats=100)
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=422)
+@pytest.mark.parametrize(
+    "num_heads,topk,dtype,expected_backend",
+    [
+        pytest.param(64, 64, torch.bfloat16, "generic_m64", id="generic-bf16"),
+        pytest.param(64, 64, torch.float16, "generic_m64", id="generic-fp16"),
+        pytest.param(128, 128, torch.bfloat16, "h128_2cta_m64", id="h128-two-cta-bf16"),
+    ],
+)
+def test_DSA_sparse_attention_backward_sm100_deterministic_plan_is_cold_capture_safe(monkeypatch, num_heads, topk, dtype, expected_backend):
+    """The first execute after plan compilation is capture-safe and JIT-free."""
+    try:
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100 as interface
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    _require_sm100()
+    plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
+        num_heads,
+        512,
+        topk,
+        s_q=8,
+        s_kv=256,
+        dtype=dtype,
+        has_topk_length=True,
+        deterministic=True,
+    )
+    assert plan._backend == expected_backend
+    assert callable(plan._compiled_kernel)
+
+    def forbidden_compile(*args, **kwargs):
+        """Fail if the first post-plan execute attempts CuTe compilation."""
+        raise AssertionError("execute() attempted CuTe compilation")
+
+    monkeypatch.setattr(interface.cute, "compile", forbidden_compile)
+    dq, dkv, d_sink = outputs
+
+    def run():
+        """Launch the prepared plan into its caller-owned outputs and scratch."""
+        return plan.execute(
+            *inputs,
+            dq,
+            dkv,
+            topk_length=topk_length,
+            softmax_scale=softmax_scale,
+            workspace=workspace,
+            d_sink=d_sink,
+        )
+
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            captured = run()
+        graph.replay()
+        torch.cuda.synchronize()
+        reference = tuple(tensor.clone() for tensor in captured)
+        graph.replay()
+        torch.cuda.synchronize()
+        for actual, expected in zip(captured, reference):
+            assert torch.equal(actual, expected)
+        q, kv, out, dout, lse, attn_sink, topk_idxs = inputs
+        check_ref_dsa_sparse_attention_backward(
+            q,
+            kv,
+            attn_sink,
+            topk_idxs,
+            out,
+            dout,
+            lse,
+            *captured,
+            softmax_scale=softmax_scale,
+            topk_length=topk_length,
+            atol=5e-2,
+            rtol=5e-2,
+        )
+    finally:
+        graph.reset()
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=423)
+def test_DSA_sparse_attention_backward_sm100_deterministic_artifact_is_shape_dynamic(monkeypatch):
+    """Q/KV extents sharing a shard bucket reuse one compiled artifact."""
+    try:
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100 as interface
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    _require_sm100()
+    compile_artifact = interface._compile_deterministic_sm100
+    compile_artifact.cache_clear()
+    first, *_ = _plan_case(64, 512, 64, s_q=8, s_kv=256, has_topk_length=True, deterministic=True)
+    first_info = compile_artifact.cache_info()
+
+    def forbidden_compile(*args, **kwargs):
+        """Fail when a dynamic-extent cache hit unexpectedly recompiles."""
+        raise AssertionError("shape-dynamic plan unexpectedly recompiled")
+
+    monkeypatch.setattr(interface.cute, "compile", forbidden_compile)
+    second, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
+        64,
+        512,
+        64,
+        s_q=16,
+        s_kv=320,
+        has_topk_length=True,
+        deterministic=True,
+    )
+    second_info = compile_artifact.cache_info()
+
+    assert second._compiled_kernel is first._compiled_kernel
+    assert first_info.misses == second_info.misses == 1
+    assert second_info.hits == first_info.hits + 1
+    _assert_execute_allocates_nothing_and_never_synchronizes(
+        second,
+        inputs,
+        outputs,
+        topk_length,
+        softmax_scale,
+        workspace,
+    )
 
 
 @pytest.mark.L1
