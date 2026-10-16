@@ -788,7 +788,7 @@ def _sm_count():
     return torch.cuda.get_device_properties(0).multi_processor_count
 
 
-def _assert_decode_tile_plan(plan, *, G, units=None, kv_tiles=None, replay=False, gated=False, q_tile=16):
+def _assert_decode_tile_plan(plan, *, G, units=None, kv_tiles=None, replay=False, gated=False, q_tile=16, grid=None):
     """The SM100 suite's policy on the Rubin row, now that it claims PackGQA + split-KV on the tile
     (the inversion of the former unpacked / unsplit pin): the plan is PACKED exactly when there is a
     group to pack (``G > 1``; MHA stays the bit-exact unpacked fold) and, for a shape the decode split
@@ -799,10 +799,15 @@ def _assert_decode_tile_plan(plan, *, G, units=None, kv_tiles=None, replay=False
     fused-gate tail, which rides the tile through its split only (the combine applies the gate), so
     the model's "do not split" reads as the smallest split, 2.  ``units`` counts the TOKEN units too
     (batch x head groups x units per group); ``q_tile`` is the tile's N extent the model costs (32 on
-    the Rubin MTP forms)."""
+    the Rubin MTP forms); ``grid`` = ``(B, H_q, S_q)`` of the graph, REQUIRED with ``units``: the
+    combine's grid decides which combine kernel the launch takes and so the model's price for the
+    combine -- the adapter passes it, so the readback must."""
     assert (plan.knobs.pack_gqa is True) == (G > 1), (G, plan.knobs)
     if units is not None:
-        want = choose_decode_tile_split_kv(units=units, kv_tiles=kv_tiles, sm_count=_sm_count(), q_tile=q_tile, **({"launch_cost": 0.0} if replay else {}))
+        assert grid is not None, "a model-evaluating pin names the graph's (B, H_q, S_q): the combine grid is a model input"
+        want = choose_decode_tile_split_kv(
+            units=units, kv_tiles=kv_tiles, sm_count=_sm_count(), q_tile=q_tile, combine_grid=tuple(grid), **({"launch_cost": 0.0} if replay else {})
+        )
         if gated:
             want = max(want, 2)
         assert (plan.knobs.split_kv or 1) == want, (plan.knobs, want)
@@ -896,7 +901,7 @@ def test_decode_graph_paged_page_sizes(page, hnd):
     """32/2-head decode (PackGQA 16:1 on the tile) over pages of every admitted size: mixed lengths
     incl. 0 and 1, a tile-unaligned tail, a length ending on a page/tile boundary; Stats out; the
     split is the decode model's at 10 units x 8 tiles."""
-    _assert_decode_tile_plan(_run_graph(B=5, H=32, KH=2, s_q=1, lens=[300, 77, 0, 1, 1024], page=page, hnd=hnd), G=16, units=5 * 2, kv_tiles=8)
+    _assert_decode_tile_plan(_run_graph(B=5, H=32, KH=2, s_q=1, lens=[300, 77, 0, 1, 1024], page=page, hnd=hnd), G=16, units=5 * 2, kv_tiles=8, grid=(5, 32, 1))
 
 
 @_gpu
@@ -907,7 +912,9 @@ def test_decode_graph_head_groups(H, KH):
     per unit -- the whole-group packing no prefill tile has) -- every one decode-shaped on the Rubin
     row, packed exactly when there is a group, split by the decode model (3 x KH units x 8 tiles)."""
     G = H // KH
-    _assert_decode_tile_plan(_run_graph(B=3, H=H, KH=KH, s_q=1, lens=[1000, 129, 640], page=32, dtype=torch.bfloat16), G=G, units=3 * (H // G), kv_tiles=8)
+    _assert_decode_tile_plan(
+        _run_graph(B=3, H=H, KH=KH, s_q=1, lens=[1000, 129, 640], page=32, dtype=torch.bfloat16), G=G, units=3 * (H // G), kv_tiles=8, grid=(3, H, 1)
+    )
 
 
 @_gpu
@@ -981,9 +988,9 @@ def test_decode_graph_mtp_qwen_24_2_splits_in_token_units(monkeypatch, s_q):
     _pin_route_max_32(monkeypatch)
     units = 2 * 2 * -(-s_q // 2)
     plan = _run_graph(B=2, H=24, KH=2, s_q=s_q, lens=[4096, 4096], page=0, padded=False, causal_br=True, dtype=torch.bfloat16)
-    _assert_decode_tile_plan(plan, G=12, units=units, kv_tiles=32, q_tile=32)
+    _assert_decode_tile_plan(plan, G=12, units=units, kv_tiles=32, q_tile=32, grid=(2, 24, s_q))
     plan = _run_graph(B=2, H=24, KH=2, s_q=s_q, lens=[4000, 1000], page=16, causal_br=True, dtype=torch.bfloat16)
-    _assert_decode_tile_plan(plan, G=12, units=units, kv_tiles=32, q_tile=32)
+    _assert_decode_tile_plan(plan, G=12, units=units, kv_tiles=32, q_tile=32, grid=(2, 24, s_q))
     if (plan.knobs.split_kv or 1) == 1:
         plan = _run_graph(B=2, H=24, KH=2, s_q=s_q, lens=[4000, 1000], page=16, causal_br=True, dtype=torch.bfloat16, split_kv=4)
         assert (plan.knobs.split_kv or 1) == 4, plan.knobs
@@ -1129,7 +1136,7 @@ def test_decode_graph_token_units_at_the_other_geometries_split_in_token_units(m
     _pin_route_max_32(monkeypatch)
     units = 2 * KH * 2
     plan = _run_graph(B=2, H=H, KH=KH, s_q=s_q, lens=[4000, 1000], page=16, causal_br=True, dtype=torch.bfloat16)
-    _assert_decode_tile_plan(plan, G=H // KH, units=units, kv_tiles=32, q_tile=32)
+    _assert_decode_tile_plan(plan, G=H // KH, units=units, kv_tiles=32, q_tile=32, grid=(2, H, s_q))
     if (plan.knobs.split_kv or 1) == 1:
         plan = _run_graph(B=2, H=H, KH=KH, s_q=s_q, lens=[4000, 1000], page=16, causal_br=True, dtype=torch.bfloat16, split_kv=4)
         assert (plan.knobs.split_kv or 1) == 4, plan.knobs
@@ -1184,7 +1191,9 @@ def test_decode_graph_sink_keyless_rows_keep_the_sink_logit(sink_logit):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["f16", "bf16"])
 def test_decode_graph_stats_log2(dtype):
     """Base-2 Stats (stats_use_log2) on the decode tile, both half dtypes, packed 16:1."""
-    _assert_decode_tile_plan(_run_graph(B=2, H=32, KH=2, s_q=1, lens=[700, 130], page=16, dtype=dtype, stats_log2=True), G=16, units=4, kv_tiles=6)
+    _assert_decode_tile_plan(
+        _run_graph(B=2, H=32, KH=2, s_q=1, lens=[700, 130], page=16, dtype=dtype, stats_log2=True), G=16, units=4, kv_tiles=6, grid=(2, 32, 1)
+    )
 
 
 @_gpu
@@ -1208,8 +1217,8 @@ def test_decode_graph_serving_shape_leads_unsplit_with_the_split_as_runner_up():
     sm = _sm_count()
     shape = dict(B=32, H=32, KH=2, s_q=1, lens=[4096] * 32, page=16, stats=False, dtype=torch.bfloat16)
     lead = _run_graph(**shape)
-    _assert_decode_tile_plan(lead, G=16, units=64, kv_tiles=32)
-    captured = choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm, launch_cost=0.0)
+    _assert_decode_tile_plan(lead, G=16, units=64, kv_tiles=32, grid=(32, 32, 1))
+    captured = choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm, launch_cost=0.0, combine_grid=(32, 32, 1))
     runner = _run_graph(**shape, split_kv=captured)
     assert runner.knobs.split_kv == captured and runner.knobs.pack_gqa is True, runner.knobs
     if sm in (148, 204, 212):
@@ -1252,11 +1261,11 @@ def test_decode_graph_serving_shape_leads_unsplit_with_the_split_as_runner_up():
     # model's choice at that tile's cost (64 units x 32 tiles, q_tile 32).  The former pin ("rides the
     # tile UNPACKED, unsplit") inverted with the route, as announced.
     mtp = _run_graph(B=32, H=32, KH=2, s_q=2, lens=[4096] * 32, page=16, stats=False, dtype=torch.bfloat16, causal_br=True)
-    _assert_decode_tile_plan(mtp, G=16, units=64, kv_tiles=32, q_tile=32)
+    _assert_decode_tile_plan(mtp, G=16, units=64, kv_tiles=32, q_tile=32, grid=(32, 32, 2))
     # Its 16-row sibling (16/2 at S_q=2: 8:1 packing) is decode-shaped PACKED and follows the serving
     # shape's policy: unsplit lead, split-2 runner-up.
     mtp16 = _run_graph(B=32, H=16, KH=2, s_q=2, lens=[4096] * 32, page=16, stats=False, dtype=torch.bfloat16, causal_br=True)
-    _assert_decode_tile_plan(mtp16, G=8, units=64, kv_tiles=32)
+    _assert_decode_tile_plan(mtp16, G=8, units=64, kv_tiles=32, grid=(32, 16, 2))
 
 
 @_gpu
@@ -1267,8 +1276,8 @@ def test_decode_graph_serving_shape_leads_with_the_split_when_replay_is_expected
     sm = _sm_count()
     shape = dict(B=32, H=32, KH=2, s_q=1, lens=[4096] * 32, page=16, stats=False, dtype=torch.bfloat16, graph_kwargs=dict(is_cuda_graph_replay_expected=True))
     lead = _run_graph(**shape)
-    _assert_decode_tile_plan(lead, G=16, units=64, kv_tiles=32, replay=True)
-    eager = choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm)
+    _assert_decode_tile_plan(lead, G=16, units=64, kv_tiles=32, replay=True, grid=(32, 32, 1))
+    eager = choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm, combine_grid=(32, 32, 1))
     runner = _run_graph(**shape, split_kv=eager)
     assert runner.knobs.split_kv == eager and runner.knobs.pack_gqa is True, runner.knobs
     if sm in (148, 204, 212):
@@ -1281,7 +1290,7 @@ def test_decode_graph_small_batch_splits_and_recombines():
     the decode model splits (8 ways: 128 CTAs, and the GPU saving covers the second launch) and the
     recombined O / LSE over mixed lengths (incl. 1 and 77) match the reference."""
     plan = _run_graph(B=8, H=32, KH=2, s_q=1, lens=[4096, 4000, 129, 1, 2048, 4096, 300, 77], page=16, dtype=torch.bfloat16)
-    _assert_decode_tile_plan(plan, G=16, units=16, kv_tiles=32)
+    _assert_decode_tile_plan(plan, G=16, units=16, kv_tiles=32, grid=(8, 32, 1))
     if _sm_count() in (148, 204, 212):
         assert plan.knobs.split_kv == 8, plan.knobs
 
@@ -1292,7 +1301,7 @@ def test_decode_graph_deep_split_empty_ranges():
     129-key batches leave most split ranges empty next to live ones; those must yield -inf / 0
     partials the combine ignores."""
     plan = _run_graph(B=3, H=32, KH=2, s_q=1, lens=[4096, 1, 129], page=16)
-    _assert_decode_tile_plan(plan, G=16, units=6, kv_tiles=32)
+    _assert_decode_tile_plan(plan, G=16, units=6, kv_tiles=32, grid=(3, 32, 1))
     assert plan.knobs.split_kv >= (8 if _sm_count() >= 96 else 2), plan.knobs
 
 
@@ -1303,7 +1312,7 @@ def test_decode_graph_mha_unpacked_split_recombines():
     recombines to the reference: the kernel / adapter partial-dtype and workspace agreement a
     template-level split test cannot see, on the unpacked form."""
     plan = _run_graph(B=2, H=4, KH=4, s_q=1, lens=[4096, 3000], page=16, dtype=torch.bfloat16)
-    _assert_decode_tile_plan(plan, G=1, units=8, kv_tiles=32)
+    _assert_decode_tile_plan(plan, G=1, units=8, kv_tiles=32, grid=(2, 4, 1))
     assert plan.knobs.pack_gqa is not True and plan.knobs.split_kv >= 2, plan.knobs
     if _sm_count() in (148, 204, 212):
         assert plan.knobs.split_kv == 16, plan.knobs
@@ -1320,7 +1329,7 @@ def test_decode_graph_qwen_24_2_packs_twelve_rows_into_the_tile():
     twelve; the output matches the reference and the split is the decode model's (8 units x 8 tiles)."""
     cap = {}
     plan = _run_graph(B=4, H=24, KH=2, s_q=1, lens=[700, 130, 5, 1024], page=16, dtype=torch.bfloat16, capture=cap)
-    _assert_decode_tile_plan(plan, G=12, units=4 * 2, kv_tiles=8)
+    _assert_decode_tile_plan(plan, G=12, units=4 * 2, kv_tiles=8, grid=(4, 24, 1))
     mod = cap["module"]
     assert "sm107" in mod.__name__ and mod.__file__.endswith("/sm107/decode_d256_f16.py"), mod.__name__
     assert (mod.HEADS_PER_TILE, mod.Q_BOX_TOKENS, mod.Q_BOX_ROWS, mod.N_Q - mod.Q_BOX_ROWS, mod.N_Q, mod.CFG.SPLIT_KV) == (
@@ -1391,7 +1400,7 @@ def test_decode_graph_split_equals_unsplit_within_the_combine_rounding(form, dty
         G, units, kv_tiles = 12, 6, 32
     split, unsplit = {}, {}
     ps = _run_graph(**kw, capture=split)
-    _assert_decode_tile_plan(ps, G=G, units=units, kv_tiles=kv_tiles)
+    _assert_decode_tile_plan(ps, G=G, units=units, kv_tiles=kv_tiles, grid=(kw["B"], kw["H"], kw["s_q"]))
     assert ps.knobs.split_kv > 1, ps.knobs
     pu = _run_graph(**kw, split_kv=1, capture=unsplit)
     assert pu.knobs.pack_gqa is True and (pu.knobs.split_kv or 1) == 1, pu.knobs
@@ -1989,7 +1998,7 @@ def test_decode_graph_gated_qwen_24_2_splits_with_the_gate_in_the_combine():
     plain one, and a keyless batch's rows are EXACTLY 0 under a random gate."""
     cap = {}
     plan = _run_graph(B=4, H=24, KH=2, s_q=1, lens=[4096, 130, 0, 1024], page=16, dtype=torch.bfloat16, gate="random", capture=cap)
-    _assert_decode_tile_plan(plan, G=12, units=8, kv_tiles=32, gated=True)
+    _assert_decode_tile_plan(plan, G=12, units=8, kv_tiles=32, gated=True, grid=(4, 24, 1))
     assert plan.knobs.split_kv >= 2, plan.knobs
     mod = cap["module"]
     assert mod.__file__.endswith("/sm107/decode_d256_f16.py"), mod.__name__
@@ -2015,7 +2024,7 @@ def test_decode_graph_gated_paged_split_matches_the_reference(dtype, page, hnd):
     batch is exactly 0 and the 1-key batch gates one key's row."""
     cap = {}
     plan = _run_graph(B=8, H=32, KH=2, s_q=1, lens=[4096, 4000, 129, 1, 2048, 0, 300, 77], page=page, hnd=hnd, dtype=dtype, gate="random", capture=cap)
-    _assert_decode_tile_plan(plan, G=16, units=16, kv_tiles=32, gated=True)
+    _assert_decode_tile_plan(plan, G=16, units=16, kv_tiles=32, gated=True, grid=(8, 32, 1))
     assert plan.knobs.split_kv >= 2 and cap["module"].PARAMS.epilogue_gate is False, (plan.knobs, cap["module"].PARAMS)
     assert (cap["o"][5] == 0).all() and torch.isneginf(cap["lse"][5]).all(), "the keyless batch: exactly 0 / -inf under a random gate"
 
@@ -2036,7 +2045,7 @@ def test_decode_graph_gated_split_matches_the_fused_unsplit_gate_within_the_budg
     kw = dict(B=3, H=24, KH=2, s_q=1, lens=[4096] * 3, page=0, padded=False, dtype=dtype, seed=29)
     split, fused = {}, {}
     ps = _run_graph(**kw, gate="random", capture=split)
-    _assert_decode_tile_plan(ps, G=12, units=6, kv_tiles=32, gated=True)
+    _assert_decode_tile_plan(ps, G=12, units=6, kv_tiles=32, gated=True, grid=(3, 24, 1))
     assert ps.knobs.split_kv >= 2 and split["module"].PARAMS.epilogue_gate is False, (ps.knobs, split["module"].PARAMS)
     pu = _run_graph(**kw, gate="random", split_kv=1, expect=PREFILL, capture=fused)
     assert pu.knobs.pack_gqa is not True and (pu.knobs.split_kv or 1) == 1 and fused["module"].PARAMS.epilogue_gate is True, (pu.knobs, fused["module"].PARAMS)
@@ -2076,7 +2085,7 @@ def test_decode_graph_gate_in_combine_is_bitwise_the_ungated_plan_at_exact_sigmo
     kw = dict(B=8, H=32, KH=2, s_q=1, lens=[4096, 4000, 129, 1, 2048, 4096, 300, 77], page=16, dtype=torch.bfloat16, seed=17)
     plain = {}
     pp = _run_graph(**kw, capture=plain)
-    _assert_decode_tile_plan(pp, G=16, units=16, kv_tiles=32)
+    _assert_decode_tile_plan(pp, G=16, units=16, kv_tiles=32, grid=(8, 32, 1))
     assert pp.knobs.split_kv > 1, pp.knobs
     for logit, want in ((1e4, plain["o"]), (0.0, plain["o"] * 0.5), (-1e4, torch.zeros_like(plain["o"]))):
         cap = {}
@@ -2140,7 +2149,7 @@ def test_decode_graph_gated_packed_equals_unpacked_bitwise():
     kw = dict(B=3, H=24, KH=2, s_q=1, lens=[1000, 129, 640], page=32, dtype=torch.bfloat16, seed=5)
     packed, unpacked = {}, {}
     pp = _run_graph(**kw, gate="random", pack_gqa=True, capture=packed)
-    _assert_decode_tile_plan(pp, G=12, units=6, kv_tiles=8, gated=True)
+    _assert_decode_tile_plan(pp, G=12, units=6, kv_tiles=8, gated=True, grid=(3, 24, 1))
     pu = _run_graph(**kw, gate="random", pack_gqa=False, split_kv=pp.knobs.split_kv, capture=unpacked)
     assert pp.knobs.pack_gqa is True and pu.knobs.pack_gqa is not True and pu.knobs.split_kv == pp.knobs.split_kv >= 2, (pp.knobs, pu.knobs)
     assert (packed["module"].HEADS_PER_TILE, unpacked["module"].HEADS_PER_TILE) == (12, 1)
@@ -2547,7 +2556,7 @@ def test_decode_graph_mtp_s_q_four_on_the_64_column_tile_splits_and_recombines(H
     _assert_route_64({(4, G)})
     cap = {}
     plan = _run_graph(B=2, H=H, KH=2, s_q=4, lens=[4000, 1000], page=16, causal_br=True, dtype=torch.bfloat16, capture=cap)
-    _assert_decode_tile_plan(plan, G=G, units=2 * 2 * 1, kv_tiles=32, q_tile=64)
+    _assert_decode_tile_plan(plan, G=G, units=2 * 2 * 1, kv_tiles=32, q_tile=64, grid=(2, H, 4))
     assert _mtp_module_facts(cap["module"])[:2] == (64, G), _mtp_module_facts(cap["module"])
     if (plan.knobs.split_kv or 1) == 1:
         cap = {}

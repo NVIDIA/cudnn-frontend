@@ -748,8 +748,14 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     s.combine = None
     if s.split > 1:
         from cudnn.sdpa.fwd.api_dsl import ws_align
+        from cudnn.sdpa.fwd.heuristics import decode_combine_force_lean
         from cudnn.sdpa.fwd.kernels.sm100 import split_combine
 
+        # The combine kernel's FORM (a plan-time specialization: the declared B / H_q / S_q and the split, never a runtime
+        # value).  The module's default entry takes the decode-grid kernel on every launch inside its grid bound; the
+        # split-aware rule (heuristics.decode_combine_grid_selected -- measured: that kernel loses to the lean walk on a
+        # mid-sized grid below 32 splits and on any grid at 4) pins the lean kernel where the two disagree.
+        decode_grid = split_combine.DECODE_GRID_OFF if decode_combine_force_lean(s.b, s.qh, s.s_q_max, s.split) else split_combine.DECODE_GRID_AUTO
         owner = split_combine.compile_ptr(
             dtype_o=api._combine_dtype_tag(),
             dtype_partial=api._partial_dtype_tag(),
@@ -766,6 +772,7 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
             # The plan's programmatic-dependent-launch form reaches the combine too (the dense half entries; a split tile
             # compiled with its griddepcontrol sites releases this pass early, and this pass waits before its first read).
             **({"use_pdl": True} if getattr(api, "use_pdl", False) else {}),
+            decode_grid=decode_grid,
         )
         fn = positional_entry(owner)
         if fn is None:

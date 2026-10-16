@@ -397,7 +397,10 @@ def _run_graph_ladder_cell(B, s_q, kv, split, monkeypatch):
     from cudnn.sdpa.fwd import heuristics
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 
-    assert comb.decode_grid_selected(B, 24, s_q, 256), "every cell of the ladder is a decode-grid launch of the combine"
+    assert comb.decode_grid_selected(B, 24, s_q, 256), "every cell of the ladder is inside the combine module's decode-grid bound"
+    # The kernel the graph's launch takes is the split-aware rule's (heuristics.decode_combine_grid_selected, which the adapter
+    # pins the compiled entry to): the decode-grid kernel on the B 1 cells and on B 4 x S_q 1 from split 8, the lean kernel on
+    # B 4 x S_q 4 below split 32 and at split 4 everywhere -- both forms are equivalent to the reference and to each other.
     assert split <= (kv // 128) // 2, "a split the candidate list offers (kv_tiles // 2)"
     # The ranked list of a decode graph holds the model's choice and its runner-up only, so the ladder's split is PINNED through the
     # model's own entry point: the decode split chooser answers ``split`` for this graph (the lever a serving stack pins through the
@@ -424,5 +427,43 @@ def test_decode_graph_pinned_split_ladder_core(cell, monkeypatch):
 @pytest.mark.parametrize("cell", _ladder_params(True))
 def test_decode_graph_pinned_split_ladder_full(cell, monkeypatch):
     """The whole ladder: splits 4 / 8 / 16 / 32 / 64 (where the graph offers them) on B 1 and B 4, S_q 1 and 4, kv 4K / 32K /
-    128K -- every combine launch of it is the decode-grid kernel."""
+    128K -- every combine launch inside the module's decode-grid bound, the kernel per cell the split-aware rule's."""
     _run_graph_ladder_cell(*cell, monkeypatch)
+
+
+def _combine_kernels_of(fn):
+    """The combine kernel names (``cudnn_kernel__combine*``) the CUDA profiler sees while ``fn`` runs."""
+    from torch.profiler import ProfilerActivity, profile
+
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        fn()
+    return {e.name for e in prof.events() if e.device_type.name == "CUDA" and e.name.startswith("cudnn_kernel__combine")}
+
+
+@L0
+@pytest.mark.parametrize(
+    ("B", "s_q", "split", "decode_grid"),
+    [
+        pytest.param(1, 1, 16, True, id="b1_sq1_split16_decode_grid"),
+        pytest.param(1, 1, 4, False, id="b1_sq1_split4_lean"),
+        pytest.param(4, 1, 16, True, id="b4_sq1_split16_decode_grid"),
+        pytest.param(4, 4, 16, False, id="b4_sq4_split16_lean"),
+        pytest.param(4, 4, 32, True, id="b4_sq4_split32_decode_grid"),
+    ],
+)
+@pytest.mark.parametrize("_m", [pytest.param(None, marks=[requires_dsl, requires_rubin, requires_sm107_dsl])])
+def test_decode_graph_combine_kernel_follows_the_split_aware_rule(B, s_q, split, decode_grid, monkeypatch, _m):
+    """The adapter pins the combine entry's kernel FORM to the split-aware rule (``heuristics.decode_combine_grid_selected``):
+    a graph-level launch at the B 4 x S_q 4 crossover takes the lean kernel at split 16 and the decode-grid kernel at 32,
+    a small grid the decode-grid kernel from split 8 and the lean kernel at 4 -- read off the CUDA profiler's kernel names
+    around the graph's execute (the kernel module's own entry would take the decode-grid kernel on every one of these)."""
+    from cudnn.sdpa.fwd import heuristics
+
+    assert heuristics.decode_combine_grid_selected(B, 24, s_q, split) is decode_grid
+    monkeypatch.setattr(heuristics, "choose_decode_tile_split_kv", lambda **kw: split)
+    names = _combine_kernels_of(
+        lambda: _run_graph(B=B, H=24, KH=2, s_q=s_q, lens=[8192] * B, page=16, hnd=True, dtype=torch.bfloat16, split_kv=split, causal_br=s_q > 1, seed=split)
+    )
+    ran_decode = any(n.startswith("cudnn_kernel__combine_decode_kernel") for n in names)
+    ran_lean = any(n.startswith("cudnn_kernel__combine_kernel") for n in names)
+    assert (ran_decode, ran_lean) == (decode_grid, not decode_grid), (names, decode_grid)

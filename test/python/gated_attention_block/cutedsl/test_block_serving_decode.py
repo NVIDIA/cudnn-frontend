@@ -379,23 +379,35 @@ def test_the_route_table_per_group_and_s_q_is_the_adapters_rule(group, policy):
 
 
 def test_the_split_choice_is_the_decode_split_model_floored_at_two_under_the_gate():
+    """The block's split is the SDPA decode split model's on the same inputs -- the launch's units, KV tiles, SM count, the
+    tile's width and the COMBINE GRID (``combine_grid`` = (B, H_q, S_q): the lean combine kernel's ceil(S_q / 4) x H_q x B blocks, which
+    decides the form the combine launch takes and so its price per partial) -- floored at 2 under the gate.  A block at batch 1
+    on a long cache is where the grid matters (the decode-grid combine's flat price lets the model split deeper than the lean
+    kernel's walk would pay for): pinned against the model with and without the grid."""
     from cudnn.sdpa.fwd.heuristics import choose_decode_tile_split_kv
 
     geom, _ = _geom(16)
     r = decode_route(geom, 2)
     for sm in (108, 148, 204, 212):
-        want = choose_decode_tile_split_kv(units=4 * 2 * r.token_units, kv_tiles=8, sm_count=sm, q_tile=r.n_q)
+        want = choose_decode_tile_split_kv(units=4 * 2 * r.token_units, kv_tiles=8, sm_count=sm, q_tile=r.n_q, combine_grid=(4, 32, 2))
         assert decode_split_choice(r, batch=4, h_kv=2, max_kv_len=1000, sm_count=sm, gated=False, h_q=32) == want
         assert decode_split_choice(r, batch=4, h_kv=2, max_kv_len=1000, sm_count=sm, gated=True, h_q=32) == max(want, 2)
     t = decode_route(geom, 5, policy=DECODE_ROUTE_TOKEN_UNITS)  # the token-unit arm: two units of the 64-column tile, each a stream
     assert t.pack_gqa and t.decode_tile and (t.n_q, t.token_units) == (64, 2)
-    want_t = choose_decode_tile_split_kv(units=4 * 2 * 2, kv_tiles=8, sm_count=204, q_tile=64)
+    want_t = choose_decode_tile_split_kv(units=4 * 2 * 2, kv_tiles=8, sm_count=204, q_tile=64, combine_grid=(4, 32, 5))
     assert decode_split_choice(t, batch=4, h_kv=2, max_kv_len=1000, sm_count=204, gated=False, h_q=32) == want_t
     odd = GatedAttentionBlockGeometry(d_model=_D_MODEL, h_q=34, h_kv=2, d_head=_D, rope_dim=_ROPE, causal_bottom_right=True)
     u = decode_route(odd, 7, policy=DECODE_ROUTE_TOKEN_UNITS)  # group 17 at S_q 7 = 119 rows: three units of 64, so the UNPACKED arm, one Q head per CTA
     assert not u.pack_gqa and u.decode_tile and (u.n_q, u.token_units, u.kv_streams) == (16, 1, 17)
-    want_u = choose_decode_tile_split_kv(units=4 * 34, kv_tiles=8, sm_count=204, q_tile=16)
+    want_u = choose_decode_tile_split_kv(units=4 * 34, kv_tiles=8, sm_count=204, q_tile=16, combine_grid=(4, 34, 7))
     assert decode_split_choice(u, batch=4, h_kv=2, max_kv_len=1000, sm_count=204, gated=False, h_q=34) == want_u
+    # batch 1 on a 32K cache at 212 SMs: the block's launch is a 32-block lean grid, so the combine runs on the decode-grid kernel
+    # and the model's split is the grid-aware one (deeper than the lean price allows); without h_q the group x h_kv stands in
+    one = decode_route(geom, 1)
+    with_grid = choose_decode_tile_split_kv(units=2, kv_tiles=256, sm_count=212, q_tile=16, combine_grid=(1, 32, 1))
+    without = choose_decode_tile_split_kv(units=2, kv_tiles=256, sm_count=212, q_tile=16)
+    assert with_grid > without and decode_split_choice(one, batch=1, h_kv=2, max_kv_len=32768, sm_count=212, gated=False, h_q=32) == with_grid
+    assert decode_split_choice(one, batch=1, h_kv=2, max_kv_len=32768, sm_count=212, gated=False) == with_grid
     p = decode_route(geom, 5)  # the prefill route: the paged THD body runs unsplit
     assert p.prefill_tile and decode_split_choice(p, batch=4, h_kv=2, max_kv_len=1000, sm_count=204, gated=True, h_q=32) == 1
     assert decode_split_choice(decode_route(geom, 33), batch=4, h_kv=2, max_kv_len=1000, sm_count=204, gated=True, h_q=32) == 1  # an unserved route
