@@ -59,7 +59,7 @@ import pytest
 import torch
 
 from cudnn.frost.compiled_cache import positional_entry
-from cudnn.sdpa.fwd.heuristics import choose_decode_tile_split_kv
+from cudnn.sdpa.fwd.heuristics import _DECODE_TILE_SPLIT_LAUNCH_COST_CC107, choose_decode_tile_split_kv
 
 from frost_test_utils import _is_plan_for, launch_f16, offers_engine, requires_dsl, requires_rubin, select_engine
 from test_sdpa_fwd_decode_d256_sm100 import _pools, _ref, _served_by
@@ -637,7 +637,9 @@ def _assert_decode_tile_plan(plan, *, G, units=None, kv_tiles=None, replay=False
     the Rubin MTP forms)."""
     assert (plan.knobs.pack_gqa is True) == (G > 1), (G, plan.knobs)
     if units is not None:
-        want = choose_decode_tile_split_kv(units=units, kv_tiles=kv_tiles, sm_count=_sm_count(), q_tile=q_tile, **({"launch_cost": 0.0} if replay else {}))
+        want = choose_decode_tile_split_kv(
+            units=units, kv_tiles=kv_tiles, sm_count=_sm_count(), q_tile=q_tile, launch_cost=0.0 if replay else _DECODE_TILE_SPLIT_LAUNCH_COST_CC107
+        )
         if gated:
             want = max(want, 2)
         assert (plan.knobs.split_kv or 1) == want, (plan.knobs, want)
@@ -1032,7 +1034,7 @@ def test_decode_graph_serving_shape_leads_with_the_split_when_replay_is_expected
     shape = dict(B=32, H=32, KH=2, s_q=1, lens=[4096] * 32, page=16, stats=False, dtype=torch.bfloat16, graph_kwargs=dict(is_cuda_graph_replay_expected=True))
     lead = _run_graph(**shape)
     _assert_decode_tile_plan(lead, G=16, units=64, kv_tiles=32, replay=True)
-    eager = choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm)
+    eager = choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm, launch_cost=_DECODE_TILE_SPLIT_LAUNCH_COST_CC107)
     runner = _run_graph(**shape, split_kv=eager)
     assert runner.knobs.split_kv == eager and runner.knobs.pack_gqa is True, runner.knobs
     if sm in (148, 204, 212):

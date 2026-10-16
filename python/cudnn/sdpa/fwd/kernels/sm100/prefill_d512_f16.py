@@ -1236,7 +1236,8 @@ def _compute_warp_group(
             q_row_global = q_super_idx * cutlass.Int32(CFG.TILES_Q * TOKENS_PER_TILE) + (tid_in_wg // cutlass.Int32(HEADS_PER_TILE))
             row_head_idx = head_idx * cutlass.Int32(HEADS_PER_TILE) + (tid_in_wg % cutlass.Int32(HEADS_PER_TILE))
             LN2 = cutlass.Float32(0.6931471805599453)
-            if cutlass.const_expr(CFG.HAS_SINK):
+            # Under a KV split the fold moves to the combine pass (split_combine), which adds the sink column exactly once; the partials stay sink-free.
+            if cutlass.const_expr(CFG.HAS_SINK and SPLIT_KV == 1):
                 sinks_arr = cutlass.make_array_view(sinks_tensor)
                 sink_logit = cutlass.Float32(sinks_arr[row_head_idx])
                 final_max_nat = final_max * LN2

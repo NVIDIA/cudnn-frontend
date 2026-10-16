@@ -40,7 +40,7 @@ import cudnn
 import pytest
 import torch
 
-from sdpa.fp8 import _MIDPOINT_WINDOW, _fp8_codes_around, assert_close_fp8_grad
+from sdpa.fp8 import _MIDPOINT_WINDOW, _fp8_codes_around, assert_close_fp8_grad, describe_flip, flip_evidence
 from sdpa.fp8_ref import compute_ref, compute_ref_backward, gqa_kv_head
 from sdpa.helpers import create_sparse_int_tensor, get_fp8_descale_factor, get_fp8_scale_factor, inject_negative_score_rows
 
@@ -1036,3 +1036,37 @@ def test_a_packed_layout_keeps_the_plain_cap(capsys):
         )
     out = capsys.readouterr().out
     assert "needs a dense [b, s, h, d] output" in out and "the row-budget cap applies" in out
+
+
+@pytest.mark.parametrize("itype", DTYPES, ids=IDS)
+def test_flip_evidence_public_entry_matches_assert_close_fp8_grad(itype, capsys):
+    """``flip_evidence`` is the proof ``assert_close_fp8_grad`` runs, exposed for a caller with ANOTHER tolerance (the gated attention
+    block's SDPA-stage pin holds the stage's bf16 gradients to the bf16 block's bound): on the one-flip dK problem it returns the SAME
+    single attribution -- position, operand row, codes, fit -- from the caller's own bad-row mask, and ``describe_flip`` is the line
+    ``assert_close_fp8_grad`` printed for it.  A ``kind`` outside ``_FLIP_KINDS``, a packed ``[T, h, d]`` output and a bad-row mask of
+    the wrong length are refused as ``ValueError`` -- the recipe prints and keeps its cap there, a caller of the bare proof has no cap
+    to fall back on."""
+    prob, stats, out, pos, (x, c_ref, c_alt, u), dP_descale = _ds_midpoint_case(itype, accept=_accept_bad(_atol(itype)))
+    expected, actual, row = _dk_flip(out, prob, pos, u, dP_descale)
+    bwd = prob.bwd_intermediates(stats)
+    atol = _atol(itype)
+    fits_recipe = assert_close_fp8_grad(
+        actual, expected, atol, RTOL, tag="dK", keys=S, operand=prob.q, flip_unit=dP_descale, intermediates=bwd, fp8_dtype=itype
+    )
+    printed = capsys.readouterr().out
+    bad_rows = ((actual - expected).abs() > atol + RTOL * expected.abs()).reshape(-1, D).any(dim=-1)
+    assert bad_rows.sum().item() == 1
+    fits = flip_evidence(actual, expected, bad_rows, atol, RTOL, tag="dK", kind="dK", operand=prob.q, flip_unit=dP_descale, fp8_dtype=itype, intermediates=bwd)
+    assert fits_recipe is not None and fits is not None and len(fits) == len(fits_recipe) == 1
+    assert fits[0] == fits_recipe[0], (fits[0], fits_recipe[0])
+    assert fits[0]["row"] == row and fits[0]["position"] == pos and fits[0]["operand_row"] == (pos[0], pos[2], pos[1])
+    assert (fits[0]["c_ref"], fits[0]["c_alt"], fits[0]["u"], fits[0]["x"]) == (c_ref, c_alt, u, x)
+    line = describe_flip("dK", fits[0], itype, dP_descale)
+    assert line.startswith("%%%% 'dK': d-row") and "is ONE flipped fp8 intermediate" in line and line in printed, (line, printed)
+    kw = dict(tag="dK", operand=prob.q, flip_unit=dP_descale, fp8_dtype=itype, intermediates=bwd)
+    with pytest.raises(ValueError, match="kind="):
+        flip_evidence(actual, expected, bad_rows, atol, RTOL, kind="grad", **kw)
+    with pytest.raises(ValueError, match=r"dense \[b, s, h, d\]"):
+        flip_evidence(actual.reshape(B * S, HKV, D), expected.reshape(B * S, HKV, D), bad_rows, atol, RTOL, kind="dK", **kw)
+    with pytest.raises(ValueError, match="bad_rows"):
+        flip_evidence(actual, expected, bad_rows[:-1], atol, RTOL, kind="dK", **kw)

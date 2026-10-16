@@ -10,6 +10,7 @@ cudnn.engram
 cudnn.experimental.ops
 cudnn.fla
 cudnn.flex_attention
+cudnn.frost
 cudnn.gated_attention_block
 cudnn.gemm
 cudnn.gemm.cutedsl.dense.amax

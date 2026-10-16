@@ -1,5 +1,13 @@
 # test — Agent Guide
 
+For deterministic DSA indexer backward, cover large TopK with more than twice
+as many query rows as producer planes, so persistent CTAs consume at least
+three rows. Restore score inputs and poison workspace/outputs before each run;
+use `assert_bitwise_runs` to compare raw bytes, including signed zero, and retain
+an independent gradient reference. The L1
+`test_DSA_indexer_backward_deterministic_topk2048_boundary` covers both backends
+at 193 rows, 96 planes, and TopK 896/2048.
+
 Recurrent FP64 autograd references can retain a K x V state for every token
 and head. When a production stress case scales heads with the GPU SM count,
 bound the reference by independent head chunks while keeping the full kernel
@@ -144,6 +152,11 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
   Exact expectations belong to semantic/API contracts, with the invariant stated
   in the test. Performance rankings and tuning boundaries belong in reproducible
   offline benchmarks with source/hardware attribution, not CI golden assertions.
+- Benchmark labels must describe the executed backend layout. Apply route-specific
+  page-size constraints before deduplicating cases, and check the subprocess
+  arguments against result metadata. The CPU-only tests in
+  `benchmark/attention_inference/tests/test_runner.py` cover b12x's distinct
+  paged, absorbed-MLA and contiguous routes without launching kernels.
 - Memo-key regression tests should observe the actual lookup and the selected plan, rather than relying on positional offsets in private key tuples. Appending an independent cache axis must not break an unrelated test; keep the miss count, selected configuration, and A-B-A identity checks. `test_block_scaled_memo_respects_overlap_margin` records the lookup key through its test memo.
 - Workspace device checks compare storage with the declared launch device, not a fixed CUDA ordinal or the ambient current device. Match the diagnostic's actual expected/observed ordinals; the wrong-device message need not contain the word "device". `core/cutedsl/test_workspace_device.py` covers the diagnostic with one GPU and both storage-device directions when two are visible, including DLPack-only and CUDA-array-interface-only buffers.
 - **A regression test must be seen RED.** Before trusting one, run it against the unfixed code — restore the old line, confirm it fails, restore the fix. `test_dsl_sm100_thd_interleaved_kv_views` and `test_varlen_backward_does_not_sync` were both checked this way, and both were genuinely red beforehand; a test written for a bug and never seen to fail is asserting an unknown.
@@ -188,6 +201,16 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 - **Wide host strides must stay wide through device setup arguments.** An Int64 pointer host can still truncate a stride while launching a descriptor-setup kernel. Check casts at the launch site and the setup parameter, not just the host signature. Exercise two live sequences with a physical row stride above `2**32` and poisoned output; a singleton-axis or binder-only probe never steps the truncated address. `test_thd_output_row_stride_above_int32_reaches_device_descriptors` checks numerical output and replay. Cover every served arch/flavor: a pre-Rubin-only marker hid narrowing in all four SM107 half hosts. `test_mhas_v2.py::test_sdpa_thd_output_stride_int64` is collected by both CI arch selections and checks native and Python binding independently, including D192/D128.
 - **Unchanged device-function ASTs do not imply unchanged generated code.** Replacing static layout constants with runtime strides can change device address calculations; compare GPU time for the affected cases. A unit-stride fast path must also exercise nonunit strides through the same compiled host; `test_d256_paged_host_rebinds_table_column_stride` checks this contract.
 - **When you remove a fallback, invert its counter assertion — do not delete it.** Tests that asserted `calls["bwd_cpp"]` incremented had to become "`calls["bwd"]` increments **and** `bwd_cpp` does not", so a silent regression to the old path fails the suite instead of passing it.
+- **A standalone FROST adapter is compiled at plan time, so every test driver calls `compile()` before `execute()`.** The sparse d256 adapter refuses to compile on the execute path (plan-time keys only), and the helpers that still relied on an execute-time compile failed every GPU cell of two modules while the host tier, where those cells skip, stayed green — so a change to an adapter's execute contract re-runs the GPU tier of every suite that drives it, and the detector is an `.execute(` with no preceding `.compile(` in the same driver (`sdpa/frost/test_sdpa_fwd_sparse_sm107.py`, `sdpa/frost/sparse_item_sequences.py`).
+
+### Binding introspection
+
+Binding migrations can change introspection without changing the public API.
+Python Enum hides instance properties such as `name` and `value` from
+`dir(enum_class)`; the API-index scanner must inspect their descriptors without
+evaluating them (`api_index/test_api_index.py` covers Enum, IntEnum and aliases).
+Signature tests should accept both `object` and `object | None` for an argument
+defaulting to `None`, while retaining argument order and default checks.
 
 ### Confirm you are testing the code you edited
 

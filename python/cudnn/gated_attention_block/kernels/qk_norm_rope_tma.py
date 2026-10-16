@@ -62,6 +62,8 @@ wavefronts) because a 512-byte row stride is a multiple of the 128-byte bank
 cycle.
 """
 
+import hashlib
+from pathlib import Path
 from typing import NamedTuple, Optional
 
 import cuda.bindings.driver as cuda
@@ -73,6 +75,7 @@ from cutlass.experimental import primitives as nvvm
 from cutlass.experimental.cuda import tensor_map as tmap
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.frost.compiled_cache import compile_cached, template_key
 from cudnn.frost.device import current_device, multiprocessor_count
 from cudnn.frost.tile_dsl.barrier import PipelineState, advance, arrive_expect_tx, wait
 from cudnn.frost.tile_dsl.handles import GmemTileTma, SmemTile
@@ -268,6 +271,10 @@ Re-measure per arch and per node: the two Rubin boxes here differ by 2.4x on the
 copy ceiling alone. Reproduce with ``frost_dev/probe_norm_rope_tma.py``."""
 
 _FAKE_STREAM = make_fake_stream(use_tvm_ffi_env_stream=False)
+# Imported normally (not through the template loader), so the module names its own source identity: ``template_key`` joins
+# it with a compile site's key to name the persistent object (``compiled_cache``); the cache's environment manifest covers
+# every other ``.py`` the kernel is traced from.
+FROST_SOURCE_DIGEST = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
 
 
 # ---------------------------------------------------------------------------
@@ -1663,6 +1670,9 @@ def compile_qk_norm_rope_tma(
         bool(mx_out),
     )
     if key not in compiled_cache:
+        # The dict stays the in-process memo; behind it sits the persistent compiled-plan cache (``cudnn.frost.compiled_cache``),
+        # keyed by this file's digest + the dict key's plain values: a second process reloads the object instead of re-tracing.
+        cache_key = template_key(globals(), {"key": key}, "compile_qk_norm_rope_tma")
         tok = cute.sym_int()
         if mx_out:
             # the MX arm reads the bands through 4-D (B, S, H, D) views (symbolic batch / token strides: a slab band or a compact
@@ -1687,7 +1697,7 @@ def compile_qk_norm_rope_tma(
             if mx_out
             else [None] * 6
         )
-        compiled_cache[key] = cute.compile(
+        compiled_cache[key] = compile_cached(
             qk_norm_rope_tma_launch,
             *dense,
             *weights,
@@ -1716,6 +1726,8 @@ def compile_qk_norm_rope_tma(
             cutlass.Int32(0),  # n_sft    )
             _FAKE_STREAM,
             options="--enable-tvm-ffi",
+            cache_key=cache_key,
+            symbol="cudnn_block_qk_norm_rope_tma",
         )
     return QkNormRopeTmaRecipe(
         compiled=compiled_cache[key],

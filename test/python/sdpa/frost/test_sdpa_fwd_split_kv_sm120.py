@@ -426,7 +426,7 @@ def test_sm120_direct_template_stats_base(fp8, splits, stats_log2):
         split_kv=splits,
         stats_log2=stats_log2,
     )
-    module = _load_sm120_kernel_module(None, params, fp8=fp8)
+    module = _load_sm120_kernel_module(None, params, fp8=fp8, pertensor=True)
     kernel = module.compile(torch.cuda.get_device_capability(), b=b, qh=h, kh=1, sq=sq, skv=skv, d_qk=d, d_v=d)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     # Compile PARAMS.stats_log2 directly, including split > 1. The adapter

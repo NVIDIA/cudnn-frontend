@@ -623,6 +623,11 @@ def test_tma_compile_cache_keys_on_the_output_ring_depth(monkeypatch):
         return object()  # a fresh, distinct artifact per compile
 
     monkeypatch.setattr(kern_tma, "compiled_cache", {})
+    # The module dict is only the FIRST memo: behind it the site goes through ``compile_cached``, whose in-process memo and on-disk
+    # cache would hand this key an EARLIER test's real artifact without a trace -- a trace-time spy switches both off
+    # (test/AGENTS.md, the two documented switches).
+    monkeypatch.setenv("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", "1")
+    monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO", "0")
     monkeypatch.setattr(kern_tma, "current_device", lambda: 0)
     monkeypatch.setattr(kern_tma.cute, "compile", fake_compile)
     common = dict(dtype=torch.bfloat16, h_q=32, h_kv=2, d=256, rope_dim=64, eps=1e-6, want_rstd=False, fused_store_wait=False)

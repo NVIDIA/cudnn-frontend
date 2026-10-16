@@ -968,6 +968,9 @@ class Execution_plan_list {
         if (status.is_good()) {
             oss_rms_norm_silu_built_ = true;
             candidate                = OSS_RMS_NORM_SILU_ENGINE_CANDIDATE;
+        } else if (candidate == OSS_RMS_NORM_SILU_ENGINE_CANDIDATE) {
+            // Unselect it, so build_plans() tries the cuDNN configs instead of reporting a plan it does not have.
+            candidate = -1;
         }
         return status;
     }

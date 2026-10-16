@@ -30,7 +30,7 @@ from cudnn.frost.tile_dsl.mask import (  # noqa: F401
 )
 from cudnn.frost.tile_dsl.barrier import MBarrier, Producer, Scope
 from cudnn.frost.tile_dsl.pointwise import fmul2, ffma2, opaque_f32_zero, fmax_f32
-from cudnn.frost.tile_dsl.tma import st_global_v4, tma_load_tile
+from cudnn.frost.tile_dsl.tma import ld_shared_v4, st_global_v4, st_shared_v4, tma_load_tile
 
 # The O-swizzle selector lives on the base config line (config_sm107 carries a
 # byte-identical copy).  Importing it from config_sm100 keeps this cross-arch
@@ -349,7 +349,7 @@ def make_d512_2x2_bars(CFG, *, N_O_CHUNKS: int, STAT_STAGES: int = 2, cross_pair
     )
 
 
-def make_classic_bars(CFG, s_stages: Optional[int] = None, *, epilogue_gate: bool = False, q_full_arrivers: int = 1) -> Bars:
+def make_classic_bars(CFG, s_stages: Optional[int] = None, *, epilogue_gate: bool = False, q_full_arrivers: int = 1, o_parts: int = 1) -> Bars:
     """The classic pipeline's barrier set.
 
     ``s_stages`` is the S/P TMEM slot ring depth the BMM1-done / BMM2-ready
@@ -397,7 +397,8 @@ def make_classic_bars(CFG, s_stages: Optional[int] = None, *, epilogue_gate: boo
         mb_stat_full=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.SOFTMAX_LANES, producer=Producer.THREAD),
         mb_stat_empty=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.CORR_LANES, producer=Producer.THREAD),
         mb_stats_read=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CORR_LANES_TOTAL, producer=Producer.LEADER, scope=Scope.LEADER),
-        mb_o_full=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.CORR_LANES, producer=Producer.THREAD),
+        # ``o_parts`` > 1: the O slab of each sub-tile is published (and TMA-stored) per column block.
+        mb_o_full=MBarrier(_alloc(CFG.TILES_Q * o_parts), stages=CFG.TILES_Q * o_parts, init_count=CFG.CORR_LANES, producer=Producer.THREAD),
         mb_o_empty=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.ONE_WARP, producer=Producer.THREAD),
         mb_tmem_dealloc=MBarrier(_alloc(1), stages=1, init_count=CORR_LANES_TOTAL, producer=Producer.THREAD),
         mb_empty_mainloop=MBarrier(_alloc(1), stages=1, init_count=CORR_LANES_TOTAL, producer=Producer.LEADER, scope=Scope.LEADER),
@@ -505,6 +506,21 @@ def assert_tile_n_supported(CFG):
         raise NotImplementedError(f"this kernel currently requires TILE_N=128 (got TILE_N={CFG.TILE_N})")
 
 
+def load_o_chunks_grouped(tmem_base, tmem_o_off, tile_o: int, chunk: int, group: int):
+    """Every fp32 O chunk (``tile_o // chunk`` of them, ``chunk`` columns each) of a TMEM accumulator, loaded ``group`` at a time with ONE wait per
+    group -- the per-chunk ``ld`` + ``wait`` of the original schedule pays a serialized TMEM round trip per chunk.  Every chunk stays live until the
+    caller consumes it, so ``tile_o`` fp32 registers per thread must fit the epilogue's budget."""
+    chunks = []
+    for g0 in range(0, tile_o // chunk, group):
+        loaded = [
+            nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(tmem_base + cutlass.Int32(tmem_o_off + (g0 + k) * chunk), cutlass.Float32), num=chunk)
+            for k in range(min(group, tile_o // chunk - g0))
+        ]
+        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+        chunks.extend(loaded)
+    return tuple(chunks)
+
+
 @cute.jit
 def store_fp32_partial_tile(
     o_partial_f32,
@@ -518,6 +534,7 @@ def store_fp32_partial_tile(
     row_head_idx,
     tile_o: cutlass.Constexpr[int],
     chunk: cutlass.Constexpr[int],
+    load_group: cutlass.Constexpr[int] = 1,
 ) -> None:
     """Store one Q row's O tile as fp32, straight from TMEM to the workspace.
 
@@ -530,7 +547,8 @@ def store_fp32_partial_tile(
     ``chunk`` must be the flavor's OWN TMEM read width (its ``O_CHUNK``): the
     O region is not uniformly addressable across flavors, so reading it in a
     different stride than the staged epilogue does silently returns the wrong
-    columns rather than failing.
+    columns rather than failing.  ``load_group`` > 1 loads that many chunks per wait
+    (:func:`load_o_chunks_grouped`: the whole ``tile_o`` is live); 1 is the original wait per chunk.
 
     ``row_dead`` cannot be dropped in favour of the zeroed ``inv_sum`` every
     caller already computes: an empty mainloop never wrote O TMEM, so the load
@@ -547,10 +565,14 @@ def store_fp32_partial_tile(
     d_v = cutlass.const_expr(o_partial_f32.shape[3])
     # Use develop's 16-byte primitive when the current row supports it. Keep
     # the scalar fallback for legal narrow or unaligned caller bindings.
+    grouped = load_o_chunks_grouped(tmem_base, tmem_o_off, tile_o, chunk, load_group) if cutlass.const_expr(load_group > 1) else None
     for blk in cutlass.range_constexpr(tile_o // chunk):
-        addr = tmem_base + cutlass.Int32(tmem_o_off + blk * chunk)
-        vals = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(addr, cutlass.Float32), num=chunk)
-        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+        if cutlass.const_expr(grouped is None):
+            addr = tmem_base + cutlass.Int32(tmem_o_off + blk * chunk)
+            vals = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(addr, cutlass.Float32), num=chunk)
+            nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+        else:
+            vals = grouped[blk]
         scaled = vals * inv_sum
         if row_valid:
             row_out = op[o_batch, q_row_global, row_head_idx, :]
@@ -576,6 +598,81 @@ def store_fp32_partial_tile(
                         row_out[cutlass.Int32(blk * chunk + j)] = cutlass.Float32(
                             arith.select(row_dead.ir_value(), cutlass.Float32(0.0).ir_value(), scaled[j].ir_value())
                         )
+
+
+@cute.jit
+def store_fp32_partial_tile_coalesced(
+    o_partial_f32,
+    tmem_base,
+    tmem_o_off,
+    inv_sum,
+    row_dead,
+    row_valid,
+    o_batch,
+    q_row_global,
+    row_head_idx,
+    tile_o: cutlass.Constexpr[int],
+    chunk: cutlass.Constexpr[int],
+    scratch_addr,
+    lane,
+) -> None:
+    """:func:`store_fp32_partial_tile` with whole-line global stores.
+
+    The direct store writes one 16-byte piece of 32 DIFFERENT rows per warp
+    instruction (rows are D*4 or H*D*4 bytes apart), so every instruction is a
+    32-sector request with half of each sector unused, and a 256-row CTA's
+    128 KiB of partials costs ~8k sector writes.  Here each warp first parks
+    its 32-row x ``chunk``-column fp32 block in SMEM (``scratch_addr``: this
+    WARP's 32 * chunk * 4 bytes in the shared window, idle under the split
+    epilogue -- the O tile is never staged there), then reads it back
+    column-major: lane l stores 16-byte segment ``l % SEGS`` of row
+    ``l // SEGS``, so one instruction writes ``32 / SEGS`` complete rows of
+    ``chunk * 4`` contiguous bytes (whole 128-byte lines at chunk 32).  The
+    target row's coordinates come from the lane that owns it (three warp
+    shuffles); invalid rows (past S_q) are skipped, dead rows store zeros as
+    before.  The 16-byte segments are rotated by the row inside each 128-byte
+    bank row so both the row-major write and the column-major read are
+    bank-conflict free.  Requires the 16-byte-store conditions of the direct
+    path (d_v % 4 == 0, chunk % 4 == 0, unit D stride, 16-byte aligned slab);
+    the caller falls back to :func:`store_fp32_partial_tile` otherwise.
+    """
+    op = cutlass.make_array_view(o_partial_f32)
+    d_v = cutlass.const_expr(o_partial_f32.shape[3])
+    SEGS = chunk // 4
+    RPI = 32 // SEGS
+    ROW_BYTES = chunk * 4
+    ROWS_PER_BANKROW = max(1, 128 // ROW_BYTES)
+    zero = cutlass.Float32(0.0)
+    valid_i = cutlass.Int32(arith.select(row_valid.ir_value(), cutlass.Int32(1).ir_value(), cutlass.Int32(0).ir_value()))
+    my_seg_rot = lane // cutlass.Int32(ROWS_PER_BANKROW)
+    rd_row0 = lane // cutlass.Int32(SEGS)
+    rd_seg = lane % cutlass.Int32(SEGS)
+    for blk in cutlass.range_constexpr(tile_o // chunk):
+        addr = tmem_base + cutlass.Int32(tmem_o_off + blk * chunk)
+        vals = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(addr, cutlass.Float32), num=chunk)
+        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+        scaled = vals * inv_sum
+        for seg in cutlass.range_constexpr(SEGS):
+            values = [cutlass.Float32(arith.select(row_dead.ir_value(), zero.ir_value(), scaled[seg * 4 + j].ir_value())) for j in range(4)]
+            rot = (cutlass.Int32(seg) + my_seg_rot) % cutlass.Int32(SEGS)
+            st_shared_v4(scratch_addr + lane * cutlass.Int32(ROW_BYTES) + rot * cutlass.Int32(16), values, cutlass.Float32)
+        nvvm.bar_warp_sync(cute.arch.FULL_MASK)
+        for k in cutlass.range_constexpr(SEGS):
+            row = rd_row0 + cutlass.Int32(k * RPI)
+            rot = (rd_seg + row // cutlass.Int32(ROWS_PER_BANKROW)) % cutlass.Int32(SEGS)
+            v = ld_shared_v4(scratch_addr + row * cutlass.Int32(ROW_BYTES) + rot * cutlass.Int32(16), cutlass.Float32)
+            q_t = nvvm.shfl_sync(0xFFFFFFFF, q_row_global, row, 31, kind=nvvm.Shfl.IDX)
+            h_t = nvvm.shfl_sync(0xFFFFFFFF, row_head_idx, row, 31, kind=nvvm.Shfl.IDX)
+            ok_t = nvvm.shfl_sync(0xFFFFFFFF, valid_i, row, 31, kind=nvvm.Shfl.IDX)
+            col = cutlass.Int32(blk * chunk) + rd_seg * cutlass.Int32(4)
+            if (ok_t != cutlass.Int32(0)) & (col < cutlass.Int32(d_v)):
+                row_ptr = op.data_ptr((o_batch, q_t, h_t, 0))
+                st_global_v4(
+                    row_ptr.toint(cutlass.Int64) + cutlass.Int64(col) * cutlass.Int64(4),
+                    [cutlass.Float32(v[0]), cutlass.Float32(v[1]), cutlass.Float32(v[2]), cutlass.Float32(v[3])],
+                    cutlass.Float32,
+                )
+        nvvm.bar_warp_sync(cute.arch.FULL_MASK)
 
 
 class SplitHelpers(NamedTuple):
@@ -839,7 +936,12 @@ def make_sdpa_helpers(
     # Q super-tiles (TILES_Q * TILE_M-row CTA tiles) per cluster: the unit the blocked NATURAL
     # decode, the LPT q_super expansion, the THD unit decode and the bounds height all share.
     _q_supers_per_cluster = (_cga_m * getattr(CFG, "CGA_N", 1)) if kv_shared_cluster else _cta_mma
-    cga_tile_m = CFG.TILES_Q * CFG.TILE_M * _q_supers_per_cluster
+    # Live Q sub-tiles: TILES_Q, or CfgD128.Q_TILES_LIVE (1) under the two-KV-stream
+    # mode, where sub-tile 1 re-uses sub-tile 0's rows; the Q span, row bases and
+    # bounds follow it.  Read only when that mode is on: the decode-tile configs
+    # inherit CfgD128's field defaults with a TILES_Q of their own.
+    q_tiles_live = CFG.Q_TILES_LIVE if getattr(CFG, "DUAL_KV_STREAM", 0) else CFG.TILES_Q
+    cga_tile_m = q_tiles_live * CFG.TILE_M * _q_supers_per_cluster
     # PackGQA head grouping for the LPT_L2 decode: the grid's head axis is in
     # PACKED heads (QH / PACK_G) and QH_PER_KH // PACK_G of them read one KV
     # head -- 1 under full packing, G / p under partial packing (d128 / d256
@@ -958,7 +1060,7 @@ def make_sdpa_helpers(
         # Token capacity of one CGA super-tile: TILES_Q * TILE_M rows hold
         # rows / p tokens when packing (CFG.PACK_GQA; ``qh_per_kh`` is the
         # caller's packed group p = HEADS_PER_TILE), else one token per row.
-        tokens_per_super = (CFG.TILES_Q * CFG.TILE_M) // qh_per_kh if CFG.PACK_GQA else CFG.TILES_Q * CFG.TILE_M
+        tokens_per_super = (q_tiles_live * CFG.TILE_M) // qh_per_kh if CFG.PACK_GQA else q_tiles_live * CFG.TILE_M
         cga_base_super = q_super_idx - cta_in_pair
         q_row_coord = cga_base_super * cutlass.Int32(tokens_per_super)
         return compute_kv_loop_bounds(
@@ -998,7 +1100,7 @@ def make_sdpa_helpers(
         """
         b = _bounds_for_tile(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, qh_per_kh)
         if cutlass.const_expr(int(getattr(CFG, "SEQ_Q_LENS_PRESENT", 0)) == 1):
-            tokens_per_super = (CFG.TILES_Q * CFG.TILE_M) // qh_per_kh if CFG.PACK_GQA else CFG.TILES_Q * CFG.TILE_M
+            tokens_per_super = (q_tiles_live * CFG.TILE_M) // qh_per_kh if CFG.PACK_GQA else q_tiles_live * CFG.TILE_M
             cga_base_super = q_super_idx - cta_in_pair
             q_row_coord = cga_base_super * cutlass.Int32(tokens_per_super)
             arr = cute.make_tensor(cute.make_ptr(cutlass.Int32, seq_q_lens_addr, cute.AddressSpace.gmem, assumed_align=4), cute.make_layout(1 << 24))
@@ -1486,10 +1588,16 @@ def sdpa_operand_tensors(
     return SdpaOperandTensors(q, k, v, o, lse, sinks, meta, o_desc, q_lens, kv_lens, o_partial, table, table_v)
 
 
-def sdpa_gate_tensor(gate_ptr, problem_size, d_v, gate_strides):
+def sdpa_gate_tensor(gate_ptr, problem_size, d_v, gate_strides, thd=False):
     """The fused epilogue gate G (O's (B, SQ, QH, d_v) shape) over the caller's (batch, seq, head)
-    strides; None folds the gate path out (the module's CFG.EPILOGUE_GATE must agree)."""
+    strides; None folds the gate path out (the module's CFG.EPILOGUE_GATE must agree).
+
+    ``thd`` (appended; the kernel passes its ``CFG.THD_VARLEN``): under THD the gate is the SAME packed
+    ``[1, T, QH, d_v]`` map Q / O take (``_bshd(..., thd=True)``: batch extent 1 binding the token stride,
+    never stepped), so the TMA-LDG warp's ``issue_gate_load(..., q_row_base + q_seq_off, tma_batch=0)``
+    addresses the gate rows of each sequence exactly as it addresses its Q rows.  The dense form is
+    unchanged (the default keeps every caller's trace byte-identical)."""
     if gate_ptr is None:
         return None
     B, QH, _, SQ, _, _ = problem_size
-    return _bshd(gate_ptr, B, SQ, QH, d_v, gate_strides, False)
+    return _bshd(gate_ptr, B, SQ, QH, d_v, gate_strides, thd)

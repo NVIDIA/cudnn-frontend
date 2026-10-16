@@ -14,7 +14,9 @@ From the repository root:
     (cd test/python && CUDA_VISIBLE_DEVICES=0 python -m pytest -q block_sparse_attention/cutedsl)
 
 The full directory also contains other BSA tests. Unsupported configurations
-skip.
+skip. SM100/SM110 large-logit regressions use the same operation/backend layout:
+
+    (cd test/python && python -m pytest -q block_sparse_attention/cutedsl/test_BSA_attention_forward.py -k sm100_large)
 
 For a fresh single-GPU comparison with PyTorch's cuDNN dense SDPA backend:
 
@@ -35,6 +37,7 @@ These are single-GPU tests; multi-GPU overlap prototypes are not in this PR.
 
 import builtins
 import importlib
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -474,6 +477,213 @@ def test_bsa_attention_forward_gqa_without_block_sizes():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize(
+    ("q_value", "k_value"),
+    [
+        pytest.param(10000.0, 10008.0, id="fp16-p-underflow"),
+        pytest.param(30000.0, 30128.0, id="fp16-exp-overflow"),
+    ],
+)
+def test_bsa_attention_forward_sm90_blk64_large_equal_logits(q_value, k_value):
+    """Equal ~1e10 logits with V = 1 weight every key equally, so O is exactly 1.
+
+    P must stay max-centered through its 16-bit conversion: an exponent offset by the rounding residual of
+    max * softmax_scale overflows or underflows there (O = NaN or 0).
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("block sparse attention tests require CUDA")
+    major, _ = torch.cuda.get_device_capability()
+    if major != 9:
+        pytest.skip("the blk64 forward kernel under test is specific to SM90")
+
+    BSA = _import_bsa()
+    q = torch.full((1, 1, 64, 128), q_value, device="cuda", dtype=torch.float16)
+    k = torch.full((1, 1, 128, 128), k_value, device="cuda", dtype=torch.float16)
+    v = torch.ones_like(k)
+    q2k = torch.tensor([[[[0, 1]]]], device="cuda", dtype=torch.int32)
+
+    result = BSA.block_sparse_attention_forward(q, k, v, q2k, 2, sparse_block_size=64)
+    torch.testing.assert_close(result["o_tensor"], torch.ones_like(q), atol=0, rtol=0)
+    assert torch.isfinite(result["lse_tensor"]).all()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("dtype", "q_value", "k_low", "k_high"),
+    [
+        pytest.param(torch.float16, 10000.0, 10000.0, 10048.0, id="fp16-p-overflow"),
+        pytest.param(torch.bfloat16, 30000.0, 30000.0, 30208.0, id="bf16-exp-overflow"),
+    ],
+)
+def test_bsa_attention_forward_sm90_blk64_large_logits_max_rises(dtype, q_value, k_low, k_high):
+    """The list is walked from its last slot: KV block 0 sets the running max, then KV block 1, larger by far more
+    than the softmax range, rescales it to zero. V is 1 on block 0 and 2 on block 1, so O is exactly 2."""
+    if not torch.cuda.is_available():
+        pytest.skip("block sparse attention tests require CUDA")
+    major, _ = torch.cuda.get_device_capability()
+    if major != 9:
+        pytest.skip("the blk64 forward kernel under test is specific to SM90")
+
+    BSA = _import_bsa()
+    q = torch.full((1, 1, 64, 128), q_value, device="cuda", dtype=dtype)
+    k = torch.full((1, 1, 128, 128), k_high, device="cuda", dtype=dtype)
+    k[:, :, :64] = k_low
+    v = torch.full_like(k, 2.0)
+    v[:, :, :64] = 1.0
+    q2k = torch.tensor([[[[1, 0]]]], device="cuda", dtype=torch.int32)
+
+    result = BSA.block_sparse_attention_forward(q, k, v, q2k, 2, sparse_block_size=64)
+    torch.testing.assert_close(result["o_tensor"], torch.full_like(q, 2.0), atol=0, rtol=0)
+    assert torch.isfinite(result["lse_tensor"]).all()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+@torch_fork_set_rng(seed=5)
+def test_bsa_attention_forward_sm90_blk64_large_logits_mixed_warp(dtype, monkeypatch):
+    """Even query rows see equal ~1e10 logits on every key (O = mean V); odd rows are ordinary attention. Every warp
+    holds both kinds, so centering the large rows must leave the ordinary rows as accurate as before."""
+    # A TF32 reference is off by ~7e4 on the even-row LSE (~5.7e8), past the 1e3 bound; the kernel is within ~10.
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    if not torch.cuda.is_available():
+        pytest.skip("block sparse attention tests require CUDA")
+    major, _ = torch.cuda.get_device_capability()
+    if major != 9:
+        pytest.skip("the blk64 forward kernel under test is specific to SM90")
+
+    BSA = _import_bsa()
+    q = torch.zeros((1, 1, 64, 128), device="cuda", dtype=dtype)
+    q[..., 0::2, :64] = 10000.0
+    q[..., 1::2, 64:] = torch.randn((1, 1, 32, 64), device="cuda", dtype=dtype)
+    k = torch.randn((1, 1, 128, 128), device="cuda", dtype=dtype)
+    k[..., :64] = 10008.0
+    v = torch.randn_like(k)
+    q2k = torch.tensor([[[[0, 1]]]], device="cuda", dtype=torch.int32)
+
+    result = BSA.block_sparse_attention_forward(q, k, v, q2k, 2, sparse_block_size=64)
+    mask = torch.zeros((64, 128), device="cuda", dtype=torch.float32)
+    o_ref, lse_ref = attention_reference(q, k, v, mask)
+    torch.testing.assert_close(result["o_tensor"].float(), o_ref, atol=3e-2, rtol=3e-2)
+    # Even rows: LSE ~5.7e8, so bound it absolutely; the FP32 reference alone is off by a few hundred.
+    torch.testing.assert_close(result["lse_tensor"][..., 0::2], lse_ref[..., 0::2], atol=1e3, rtol=0)
+    torch.testing.assert_close(result["lse_tensor"][..., 1::2], lse_ref[..., 1::2], atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("kv_splits", (1, 2))
+@pytest.mark.parametrize("with_block_sizes", (True, False), ids=("block_sizes", "short_last_tile"))
+@torch_fork_set_rng(seed=6)
+def test_bsa_attention_forward_sm90_blk64_partial_kv_blocks(with_block_sizes, kv_splits):
+    """Partial KV blocks are masked, full ones skip the mask. They come from block_sizes or, without it, from a short
+    last KV tile. Each list is walked from its last slot, so row 0 masks in the prologue and row 1 in the loop."""
+    if not torch.cuda.is_available():
+        pytest.skip("block sparse attention tests require CUDA")
+    major, _ = torch.cuda.get_device_capability()
+    if major != 9:
+        pytest.skip("the blk64 forward kernel under test is specific to SM90")
+
+    BSA = _import_bsa()
+    seqlen_q, seqlen_k = 2 * 64, 4 * 64 - (0 if with_block_sizes else 17)
+    q = torch.randn((1, 2, seqlen_q, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 2, seqlen_k, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    q2k = torch.tensor([[0, 1, 3], [3, 2, 0]], device="cuda", dtype=torch.int32).expand(1, 2, 2, 3).contiguous()
+    block_sizes = torch.tensor([64, 40, 64, 23], device="cuda", dtype=torch.int32) if with_block_sizes else None
+
+    result = BSA.block_sparse_attention_forward(q, k, v, q2k, 3, block_sizes, sparse_block_size=64, kv_splits=kv_splits)
+    reference_sizes = block_sizes if with_block_sizes else torch.full((4,), 64, device="cuda", dtype=torch.int32)
+    mask = block_sparse_mask(q2k, 3, reference_sizes, seqlen_q, seqlen_k, 64)
+    o_ref, lse_ref = attention_reference(q, k, v, mask)
+    torch.testing.assert_close(result["o_tensor"].float(), o_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(result["lse_tensor"], lse_ref, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+@pytest.mark.parametrize("head_dim", (64, 96, 128))
+@pytest.mark.parametrize("value_dim", (96, 128))
+@pytest.mark.parametrize("with_block_sizes", (False, True))
+@torch_fork_set_rng(seed=28)
+def test_bsa_attention_forward_sm90_blk64_ring_head_dims(dtype, head_dim, value_dim, with_block_sizes):
+    """Exercise real K-ring dispatch, short lists, wraparound, empty rows, and both partial-block paths.
+
+    Repeat five query tiles to cross the large-grid gate without constructing a large dense reference.
+    Counts 0/1/2/3/8 cover first fill, first reuse, multiple barrier phases, and drain.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("block sparse attention tests require CUDA")
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("the blk64 forward kernel under test is specific to SM90")
+
+    BSA = _import_bsa()
+    copies, seqlen_q, seqlen_k = 256, 5 * 64, 16 * 64 - 17
+    q = torch.randn((1, 1, seqlen_q, head_dim), device="cuda", dtype=dtype)
+    k = torch.randn((1, 1, seqlen_k, head_dim), device="cuda", dtype=dtype)
+    v = torch.randn((1, 1, seqlen_k, value_dim), device="cuda", dtype=dtype)
+    counts = torch.tensor([[[0, 1, 2, 3, 8]]], device="cuda", dtype=torch.int32)
+    indices = torch.tensor([15, 1, 4, 6, 8, 10, 12, 14], device="cuda", dtype=torch.int32).repeat(1, 1, 5, 1)
+    indices[:, :, 4] = indices[:, :, 4].flip(-1)  # The tail occurs in both prologue and steady state.
+    indices.masked_fill_(torch.arange(8, device="cuda") >= counts[..., None], 2147483647)
+    sizes = torch.full((16,), 64, device="cuda", dtype=torch.int32)
+    if with_block_sizes:
+        sizes[1::2] = 23
+    mask = block_sparse_mask(indices, 8, sizes, seqlen_q, seqlen_k, 64, counts)
+    o_ref, lse_ref = attention_reference(q, k, v, mask)
+
+    result = BSA.block_sparse_attention_forward(
+        q.repeat(1, 1, copies, 1),
+        k,
+        v,
+        indices.repeat(1, 1, copies, 1),
+        8,
+        sizes if with_block_sizes else None,
+        q2k_block_nums=counts.repeat(1, 1, copies),
+        sparse_block_size=64,
+        kv_splits=1,
+        allow_empty_block_nums=True,
+    )
+    torch.testing.assert_close(result["o_tensor"].float(), o_ref.repeat(1, 1, copies, 1), atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(result["lse_tensor"], lse_ref.repeat(1, 1, copies), atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+@pytest.mark.parametrize("head_dim", (64, 96, 128))
+@pytest.mark.parametrize("value_dim", (64, 96, 128))
+@pytest.mark.parametrize("with_block_sizes", (False, True))
+@torch_fork_set_rng(seed=29)
+def test_bsa_attention_forward_sm90_blk64_rescale_row_slots(dtype, head_dim, value_dim, with_block_sizes):
+    """Cover unchanged/increasing maxima, different row slots, and mixed rows within a warp vote."""
+    if not torch.cuda.is_available():
+        pytest.skip("block sparse attention tests require CUDA")
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("the blk64 forward kernel under test is specific to SM90")
+
+    BSA = _import_bsa()
+    seqlen_q, seqlen_k = 5 * 64, 16 * 64 - 17
+    q = torch.zeros((1, 1, seqlen_q, head_dim), device="cuda", dtype=dtype)
+    row = torch.arange(64, device="cuda")
+    q[0, 0, 64:128, 0] = 8
+    q[0, 0, 128:192, 0] = torch.where(row % 16 < 8, -8, 8)
+    q[0, 0, 192:256, 0] = torch.where(row % 16 < 8, 8, -8)
+    q[0, 0, 256:320, 0] = torch.where(row % 2 == 0, 8, -8)
+    k = torch.zeros((1, 1, seqlen_k, head_dim), device="cuda", dtype=dtype)
+    k[0, 0, :, 0] = (torch.arange(seqlen_k, device="cuda") // 64).to(dtype) * 0.5
+    v = torch.randn((1, 1, seqlen_k, value_dim), device="cuda", dtype=dtype)
+    # Reverse traversal visits blocks in increasing logit order for positive Q rows.
+    indices = torch.tensor([15, 6, 5, 4, 3, 2, 1, 0], device="cuda", dtype=torch.int32).repeat(1, 1, 5, 1)
+    sizes = torch.full((16,), 64, device="cuda", dtype=torch.int32)
+    if with_block_sizes:
+        sizes[:2] = 0  # Two fully masked blocks before the first finite maximum.
+        sizes[15] = 23
+    result = BSA.block_sparse_attention_forward(q, k, v, indices, 8, sizes if with_block_sizes else None, sparse_block_size=64, kv_splits=1)
+    mask = block_sparse_mask(indices, 8, sizes, seqlen_q, seqlen_k, 64)
+    o_ref, lse_ref = attention_reference(q, k, v, mask)
+    torch.testing.assert_close(result["o_tensor"].float(), o_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(result["lse_tensor"], lse_ref, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=4)
 def test_bsa_attention_forward_sm100_blk64():
     if not torch.cuda.is_available():
@@ -553,6 +763,91 @@ def test_bsa_attention_forward_sm100_blk64():
     assert result_bshd["o_tensor"].is_contiguous()
     assert split_result_bshd["o_tensor"].is_contiguous()
     assert split_result_bshd["o_tensor"].stride() == result_bshd["o_tensor"].stride()
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("use_clc", (False, True))
+@pytest.mark.parametrize("layout", ("bhsd", "bshd"))
+@pytest.mark.parametrize("variable_counts", (False, True), ids=("fixed", "variable_with_empty"))
+@pytest.mark.parametrize("with_block_sizes", (False, True), ids=("full_blocks", "partial_blocks"))
+@torch_fork_set_rng(seed=4593)
+def test_bsa_attention_forward_sm100_blk64_persistent_query_replay(use_clc, layout, variable_counts, with_block_sizes, monkeypatch):
+    """Multiple persistent waves exercise KV-ring rotation, empty queries and changed-input replay.
+
+    Repeat distinct query tiles to bound the independent dense reference while
+    forcing each SM to process several tiles. Counts cross the 8-block padding
+    boundary and different ring phases. Q always has a partial final tile;
+    partial KV blocks use explicit block_sizes, as required by the API.
+    """
+    if torch.cuda.get_device_capability()[0] not in {10, 11}:
+        pytest.skip("persistent blk64 forward requires SM100/SM110")
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    BSA = _import_bsa()
+    batch, heads, pattern_tiles, capacity = 2, 4, 9, 32
+    copies = max(2, math.ceil(4 * torch.cuda.get_device_properties(0).multi_processor_count / (batch * heads * pattern_tiles)))
+    length_q = pattern_tiles * 64 * copies - 17
+    length_k = capacity * 64 - (17 if with_block_sizes else 0)
+    q_base = torch.randn((batch, heads, pattern_tiles * 64, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, heads, length_k, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    # The final KV block occurs in every active list, with no duplicates.
+    other_indices = torch.rand((batch, heads, pattern_tiles, capacity - 1), device="cuda").argsort(-1).to(torch.int32)
+    indices_base = torch.cat((torch.full_like(other_indices[..., :1], capacity - 1), other_indices), -1)
+    counts_base = torch.tensor([0, 1, 3, 7, 8, 9, 16, 17, 32], device="cuda", dtype=torch.int32).expand(batch, heads, -1).clone()
+    if not variable_counts:
+        counts_base.fill_(8)
+    indices = indices_base.repeat(1, 1, copies, 1)
+    counts = counts_base.repeat(1, 1, copies)
+    q = q_base.repeat(1, 1, copies, 1)[..., :length_q, :].contiguous()
+    reference_sizes = torch.full((capacity,), 64, device="cuda", dtype=torch.int32)
+    if with_block_sizes:
+        reference_sizes[1::2] = 23
+        reference_sizes[2] = 0
+        reference_sizes[-1] = 47
+    inputs = [q, k, v] if layout == "bhsd" else [t.transpose(1, 2).contiguous() for t in (q, k, v)]
+
+    def invoke():
+        return BSA.block_sparse_attention_forward(
+            *inputs,
+            indices,
+            block_sparse_num=capacity if variable_counts else 8,
+            block_sizes=reference_sizes if with_block_sizes else None,
+            q2k_block_nums=counts if variable_counts else None,
+            sparse_block_size=64,
+            layout=layout,
+            use_clc=use_clc,
+            kv_splits=1,
+            allow_empty_block_nums=variable_counts,
+        )
+
+    invoke()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            result = invoke()
+        for replay in range(2):
+            if replay:
+                q_base.mul_(0.75)
+                inputs[0].mul_(0.75)
+                inputs[2].neg_()
+                counts_base = counts_base.flip(-1)
+            counts.copy_(counts_base.repeat(1, 1, copies))
+            indices.copy_(indices_base.repeat(1, 1, copies, 1))
+            indices.masked_fill_(torch.arange(capacity, device="cuda") >= counts[..., None], torch.iinfo(torch.int32).max)
+            result["o_tensor"].fill_(float("nan"))
+            result["lse_tensor"].fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            mask = block_sparse_mask(indices_base, capacity, reference_sizes, pattern_tiles * 64, length_k, 64, counts_base)
+            k_ref, v_ref = inputs[1:] if layout == "bhsd" else [t.transpose(1, 2) for t in inputs[1:]]
+            o_ref, lse_ref = attention_reference(q_base, k_ref, v_ref, mask)
+            expected_o = o_ref.repeat(1, 1, copies, 1)[..., :length_q, :]
+            actual_o = result["o_tensor"] if layout == "bhsd" else result["o_tensor"].transpose(1, 2)
+            torch.testing.assert_close(actual_o.float(), expected_o, atol=3e-2, rtol=3e-2)
+            torch.testing.assert_close(result["lse_tensor"], lse_ref.repeat(1, 1, copies)[..., :length_q], atol=2e-3, rtol=2e-3)
+    finally:
+        graph.reset()
 
 
 @pytest.mark.L0
@@ -786,7 +1081,14 @@ def test_bsa_attention_forward_sm100_blk64_auto_uses_workspace_fallback(monkeypa
     class WorkspaceFallbackCalled(Exception):
         pass
 
-    monkeypatch.setattr(interface, "_sm100_blk64_auto_kv_splits", lambda *args, **kwargs: 2)
+    def choose_splits(q_arg, index_arg, count_arg, *, k, v):
+        assert q_arg is q
+        assert index_arg is q2k
+        assert count_arg == 2
+        assert k.shape == v.shape == (1, 1, 256, 128)
+        return 2
+
+    monkeypatch.setattr(interface, "_sm100_blk64_auto_kv_splits", choose_splits)
 
     def workspace_fallback(q_arg, value_dim, kv_splits, allow_fallback, output_dtype=None):
         assert q_arg is not None
@@ -811,7 +1113,8 @@ def test_bsa_attention_forward_sm100_blk64_auto_uses_workspace_fallback(monkeypa
 
 
 @pytest.mark.L0
-def test_bsa_attention_forward_sm100_blk64_large_q_auto_scheduler_policy():
+def test_bsa_attention_forward_sm100_blk64_auto_split_counts_stay_valid(monkeypatch):
+    """Automatic counts stay within the supported domain and the caller's cap."""
     if not torch.cuda.is_available():
         pytest.skip("block sparse attention tests require CUDA")
     major, _ = torch.cuda.get_device_capability()
@@ -824,10 +1127,132 @@ def test_bsa_attention_forward_sm100_blk64_large_q_auto_scheduler_policy():
     q_small = torch.empty((1, 4, 128, 1), device="cuda", dtype=torch.int8)
     q2k_block_index = torch.empty((1, 1, 1, 2048), device="cuda", dtype=torch.int32)
 
-    assert interface._sm100_blk64_auto_kv_splits(q_large, q2k_block_index, 2048) == 1
-    assert interface._sm100_blk64_auto_kv_splits(q_small, q2k_block_index, 2048) == 8
-    assert interface.choose_blk64_use_clc(q_large, 256)
-    assert interface.choose_blk64_use_clc(q_large, 2048)
+    for q in (q_large, q_small):
+        for count in (0, 1, 256, 2048):
+            for cap in (1, 2, 4, 8):
+                splits = interface._sm100_blk64_auto_kv_splits(q, q2k_block_index, count, max_kv_splits=cap)
+                assert 1 <= splits <= min(cap, count or q2k_block_index.shape[-1])
+                assert splits in {1, 2, 4, 8, 16}
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(L2_cache_size=126 * 1024**2))
+    for heads in (1, 2, 4, 8):
+        q_metadata = SimpleNamespace(is_cuda=True, device=torch.device("cuda"), dtype=torch.bfloat16, shape=(1, heads, 349440, 128))
+        for count in (548, 900, 1089):
+            kv_metadata = SimpleNamespace(shape=(1, heads, count * 10 * 64, 128), element_size=lambda: 2)
+            for cap in (1, 2, 4, 8):
+                splits = interface._sm100_blk64_auto_kv_splits(q_metadata, q2k_block_index, count, cap, k=kv_metadata, v=kv_metadata)
+                assert 1 <= splits <= min(cap, count)
+                assert splits in {1, 2, 4, 8, 16}
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("sparse_block_size", "dtype", "q_value", "k_value"),
+    [
+        pytest.param(128, torch.float16, 10000.0, 10008.0, id="blk128-fp16-p-underflow"),
+        pytest.param(128, torch.float16, 30000.0, 30128.0, id="blk128-fp16-exp-overflow"),
+        pytest.param(64, torch.bfloat16, 16384.0, 16896.0, id="blk64-bf16-exp-overflow"),
+        pytest.param(64, torch.bfloat16, 16384.0, 16640.0, id="blk64-bf16-exp-underflow"),
+    ],
+)
+def test_bsa_attention_forward_sm100_large_equal_logits(sparse_block_size, dtype, q_value, k_value):
+    """Equal ~1e10 logits with V = 1 weight every key equally, so O is exactly 1. Offsetting the exponent by the rounding
+    residual of max * softmax_scale * log2(e) instead overflows or underflows P (O = NaN or 0)."""
+    if not torch.cuda.is_available():
+        pytest.skip("block sparse attention tests require CUDA")
+    major, _ = torch.cuda.get_device_capability()
+    if major not in {10, 11}:
+        pytest.skip("the forward kernels under test are specific to SM100/SM110")
+
+    BSA = _import_bsa()
+    seqlen_q, seqlen_k, dim = 128, 256, 128
+    q = torch.full((1, 1, seqlen_q, dim), q_value, device="cuda", dtype=dtype)
+    k = torch.full((1, 1, seqlen_k, dim), k_value, device="cuda", dtype=dtype)
+    v = torch.ones_like(k)
+    num_kv_blocks = seqlen_k // sparse_block_size
+    q2k = torch.arange(num_kv_blocks, device="cuda", dtype=torch.int32).expand(1, 1, seqlen_q // sparse_block_size, -1).contiguous()
+
+    result = BSA.block_sparse_attention_forward(q, k, v, q2k, num_kv_blocks, sparse_block_size=sparse_block_size)
+    torch.testing.assert_close(result["o_tensor"], torch.ones_like(q), atol=0, rtol=0)
+    lse_ref = torch.full_like(result["lse_tensor"], q_value * k_value * math.sqrt(dim) + math.log(seqlen_k), dtype=torch.float64)
+    torch.testing.assert_close(result["lse_tensor"].double(), lse_ref, atol=0, rtol=2e-6)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("max_order", ("rises", "falls"))
+@pytest.mark.parametrize(
+    ("sparse_block_size", "dtype", "q_value", "k_low", "k_high"),
+    [
+        pytest.param(128, torch.float16, 30000.0, 30000.0, 30128.0, id="blk128-fp16"),
+        pytest.param(64, torch.bfloat16, 16384.0, 16640.0, 16896.0, id="blk64-bf16"),
+    ],
+)
+def test_bsa_attention_forward_sm100_large_logits_max_rises_and_falls(sparse_block_size, dtype, q_value, k_low, k_high, max_order):
+    """Half of the KV blocks score far below the other half; V is 1 there and 2 on the high blocks, so O is exactly 2.
+    Each softmax warpgroup walks its share of the list from the end (blk128 alternates slots, blk64 takes groups of
+    four), so "rises" lists the high blocks first and "falls" lists them last."""
+    if not torch.cuda.is_available():
+        pytest.skip("block sparse attention tests require CUDA")
+    major, _ = torch.cuda.get_device_capability()
+    if major not in {10, 11}:
+        pytest.skip("the forward kernels under test are specific to SM100/SM110")
+
+    BSA = _import_bsa()
+    seqlen_q, dim = 128, 128
+    num_kv_blocks = 4 if sparse_block_size == 128 else 16
+    seqlen_k = num_kv_blocks * sparse_block_size
+    num_low_keys = num_kv_blocks // 2 * sparse_block_size
+    q = torch.full((1, 1, seqlen_q, dim), q_value, device="cuda", dtype=dtype)
+    k = torch.full((1, 1, seqlen_k, dim), k_high, device="cuda", dtype=dtype)
+    k[:, :, :num_low_keys] = k_low
+    v = torch.full_like(k, 2.0)
+    v[:, :, :num_low_keys] = 1.0
+    low = torch.arange(num_kv_blocks // 2, device="cuda", dtype=torch.int32)
+    high = low + num_kv_blocks // 2
+    order = torch.cat((high, low) if max_order == "rises" else (low, high))
+    q2k = order.expand(1, 1, seqlen_q // sparse_block_size, -1).contiguous()
+
+    result = BSA.block_sparse_attention_forward(q, k, v, q2k, num_kv_blocks, sparse_block_size=sparse_block_size)
+    torch.testing.assert_close(result["o_tensor"], torch.full_like(q, 2.0), atol=0, rtol=0)
+    num_high_keys = seqlen_k - num_low_keys
+    lse_ref = torch.full_like(result["lse_tensor"], q_value * k_high * math.sqrt(dim) + math.log(num_high_keys), dtype=torch.float64)
+    torch.testing.assert_close(result["lse_tensor"].double(), lse_ref, atol=0, rtol=2e-6)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("sparse_block_size", "dtype", "q_value", "k_value"),
+    [
+        pytest.param(128, torch.float16, 20000.0, 20016.0, id="blk128-fp16"),
+        pytest.param(64, torch.bfloat16, 32768.0, 16896.0, id="blk64-bf16"),
+    ],
+)
+@torch_fork_set_rng(seed=5)
+def test_bsa_attention_forward_sm100_large_logits_mixed_warp(sparse_block_size, dtype, q_value, k_value):
+    """Even query rows see equal ~1e10 logits on every key (O = mean V); odd rows are ordinary attention. Every warp
+    holds both kinds, so centering the large rows must leave the ordinary rows as accurate as before."""
+    if not torch.cuda.is_available():
+        pytest.skip("block sparse attention tests require CUDA")
+    major, _ = torch.cuda.get_device_capability()
+    if major not in {10, 11}:
+        pytest.skip("the forward kernels under test are specific to SM100/SM110")
+
+    BSA = _import_bsa()
+    seqlen_q, seqlen_k, dim = 128, 256, 128
+    q = torch.zeros((1, 1, seqlen_q, dim), device="cuda", dtype=dtype)
+    q[..., 0::2, : dim // 2] = q_value
+    q[..., 1::2, dim // 2 :] = torch.randn((1, 1, seqlen_q // 2, dim // 2), device="cuda", dtype=dtype)
+    k = torch.randn((1, 1, seqlen_k, dim), device="cuda", dtype=dtype)
+    k[..., : dim // 2] = k_value
+    v = torch.randn_like(k)
+    num_kv_blocks = seqlen_k // sparse_block_size
+    q2k = torch.arange(num_kv_blocks, device="cuda", dtype=torch.int32).expand(1, 1, seqlen_q // sparse_block_size, -1).contiguous()
+
+    result = BSA.block_sparse_attention_forward(q, k, v, q2k, num_kv_blocks, sparse_block_size=sparse_block_size)
+    mask = torch.zeros((seqlen_q, seqlen_k), device="cuda", dtype=torch.float32)
+    o_ref, lse_ref = attention_reference(q, k, v, mask)
+    torch.testing.assert_close(result["o_tensor"].float(), o_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(result["lse_tensor"], lse_ref, atol=2e-3, rtol=2e-3)
 
 
 @pytest.mark.L0

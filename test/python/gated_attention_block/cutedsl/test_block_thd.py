@@ -435,12 +435,21 @@ def test_thd_declines_the_fully_fused_quantized_pipeline(mxfp8):
 
 
 @requires_cuda
-def test_thd_declines_fuse_gate():
-    """``fuse_gate=True`` is dense-only (the Rubin d256 SDPA's epilogue gate has no THD gate descriptor); the message
-    names the knob to flip and that stage (5) then runs as its own launch."""
+def test_thd_serves_fuse_gate():
+    """``fuse_gate=True`` is SERVED under THD (the former "fuse_gate=True is dense-only" decline is INVERTED, not deleted):
+    the SDPA stage declares the gated d256 THD specialization with G at the slab's gate column stride, and the separate
+    sigmoid-gate stage is gone from the pipeline -- one launch fewer than the packed block without the knob."""
     args, _inp, meta = _decl_thd_args()
-    with _no_device_sync(), pytest.raises(NotImplementedError, match="fuse_gate=True is dense-only"):
-        GatedAttentionBlockFwd(*args, fuse_gate=True, **_thd_kw(meta))
+    with _no_device_sync():
+        blk = GatedAttentionBlockFwd(*args, fuse_gate=True, **_thd_kw(meta))
+        plain = GatedAttentionBlockFwd(*args, **_thd_kw(meta))
+    assert blk.thd and blk.fuse_gate and blk._gate is None and blk._sdpa.thd and blk._sdpa.fuse_gate
+    assert blk._sdpa.gate_token_stride == blk.geom.n_qkvg, "G is the slab's gate column slice (token stride n_qkvg), never a copy"
+    names, plain_names = [st.name for st in blk._stages], [st.name for st in plain._stages]
+    assert "sigmoid_gate" in plain_names and "sigmoid_gate" not in names and len(names) == len(plain_names) - 1, (names, plain_names)
+    # (the gated SDPA specialization's envelope -- G declared like O at (B_env, H, S_max, D), at the slab stride -- is
+    # pinned on the compiled block in test_thd_fuse_gate_matches_the_oracle_and_the_unfused_packed_block: the adapter
+    # is built on a Rubin device only)
 
 
 @requires_cuda
@@ -1152,6 +1161,127 @@ def test_thd_launch_count_is_dense_plus_one():
     print(f"dense:  {len(k_dense)} kernels + {len(m_dense)} memset/memcpy:\n  " + "\n  ".join(k_dense))
     assert not [n for n in m_thd if "memcpy" in n.lower()], "a hidden copy on the packed execute path"
     assert len(k_thd) == len(k_dense) + 1, (len(k_thd), len(k_dense))
+
+
+# ---------------------------------------------------------------------------
+# fuse_gate under THD -- the SDPA's THD gate descriptor (the gate rides the packed d256 prefill's epilogue)
+# ---------------------------------------------------------------------------
+
+
+@requires_rubin
+@pytest.mark.parametrize("arm", ["causal", "dense_mask", "fp16", "fused_norm_rope"])
+def test_thd_fuse_gate_matches_the_oracle_and_the_unfused_packed_block(arm):
+    """``(300, 128, 200)`` packed with ``fuse_gate=True``: ``out`` per sequence against the per-sequence oracle at the dense
+    suite's bar (cos > 0.999), and against the SAME packed block WITHOUT the knob at the dense suite's fused-vs-unfused bar
+    (``test_fuse_gate_matches_the_fp32_oracle_causal``: the gated O inside is one rounding from "SDPA, then the separate
+    stage" -- the SDPA suite pins that at exactly one output ulp -- and the out projection carries it as cos > 0.999);
+    the sentinel-filled output has no survivor."""
+    geom_kw, kw = {
+        "causal": (_COMMON, {}),
+        "dense_mask": ({**_COMMON, "is_causal": False}, {}),
+        "fp16": (_COMMON, dict(dtype=torch.float16)),
+        "fused_norm_rope": (_COMMON, dict(fuse_norm_rope=True)),
+    }[arm]
+    res = _run_thd(geom_kw, _LENS, sentinel=_SENTINEL, fuse_gate=True, **kw)
+    assert res.blk.thd and res.blk.fuse_gate and res.blk._gate is None
+    # the gated SDPA specialization is declared at the SAME (B_env, H, S_max, D) envelope as O, with G at the slab stride
+    impl, g, meta = res.blk._sdpa._impl, res.blk.geom, res.meta
+    assert impl.thd and impl.gate_desc is not None and impl._k_mod.CFG.THD_VARLEN == 1 and impl._k_mod.CFG.EPILOGUE_GATE == 1
+    assert tuple(impl.gate_desc.shape) == (meta["b"], g.h_q, meta["max_seq_len"], g.d_head) == tuple(impl.o_desc.shape)
+    assert impl.gate_desc.stride[2] == g.n_qkvg and impl.gate_desc.stride[1] == g.d_head and impl.gate_desc.stride[3] == 1
+    _assert_empty_sequences_leave_no_rows(res)
+    _check_forward_per_sequence(res, check_record=False)
+    plain = _run_thd(geom_kw, _LENS, refs=False, **kw)
+    c = _cos(res.out, plain.out)
+    assert c > 0.999, f"fused-gate packed block vs the unfused packed block: out cos {c:.6f}"
+
+
+@requires_rubin
+def test_thd_fuse_gate_b1_is_bitwise_the_dense_fused_block():
+    """``B = 1`` packed ``(512,)`` with ``fuse_gate=True`` against the dense ``B=1, S=512`` ``fuse_gate=True`` block over the
+    SAME bytes: ``out`` BITWISE -- the packed gated SDPA runs the dense gated body on the same tiles (the SDPA suite pins O
+    and LSE bitwise); a difference here is a finding, never a tolerance."""
+    t = 512
+    res = _run_thd(_COMMON, (t,), refs=False, fuse_gate=True)
+    dinp = make_inputs(RefGeometry(**_COMMON), batch=1, seq_len=t)
+    for k in ("h", "w_qkvg", "w_o", "cos", "sin"):
+        assert torch.equal(dinp[k], res.inp[k]), k
+    g = res.blk.geom
+    out_d = torch.empty(1, t, g.d_model, device="cuda", dtype=torch.bfloat16)
+    dense = GatedAttentionBlockFwd(
+        dinp["h"], dinp["w_qkvg"], dinp["w_q_norm"], dinp["w_k_norm"], dinp["cos"], dinp["sin"], dinp["w_o"], out_d, g, fuse_gate=True
+    )
+    dense.check_support()
+    dense.compile()
+    ws = torch.empty(dense.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    dense.execute(dinp["h"], dinp["w_qkvg"], dinp["w_q_norm"], dinp["w_k_norm"], dinp["cos"], dinp["sin"], dinp["w_o"], out_d, ws)
+    torch.cuda.synchronize()
+    d = (res.out.float() - out_d.float()).abs().max().item()
+    assert torch.equal(res.out, out_d), f"packed B=1 fuse_gate differs from the dense fuse_gate block (max|diff| {d:.3e}) -- a finding, not a tolerance"
+
+
+@requires_rubin
+def test_thd_fuse_gate_with_lse_is_bitwise_the_unfused_packed_block():
+    """``return_lse=True`` under THD with the fused gate: the LSE is a softmax statistic the gate cannot touch, and gate-on /
+    gate-off are the SAME packed kernel differing only in the epilogue, so the head-major packed LSE must be BIT-IDENTICAL
+    to the unfused packed block's."""
+    g = GatedAttentionBlockGeometry(**_COMMON)
+    outs = {}
+    for fused in (True, False):
+        blk, inp, out, meta = _declare_thd(_COMMON, _LENS, return_lse=True, fuse_gate=fused)
+        lse = torch.full((1, g.h_q, meta["t"]), float("nan"), device="cuda", dtype=torch.float32)
+        blk.check_support()
+        blk.compile()
+        ws = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
+        _execute(blk, inp, out, ws, seq_lens=_lens(meta), lse=lse)
+        torch.cuda.synchronize()
+        outs[fused] = (out, lse)
+    assert torch.isfinite(outs[True][1]).all() and torch.equal(outs[True][1], outs[False][1]), "the packed LSE must not depend on the fused gate"
+    assert _cos(outs[True][0], outs[False][0]) > 0.999
+
+
+@requires_rubin
+@pytest.mark.parametrize("lens, s_max", [((256, 0, 128), 256), ((0, 256, 128), 256)], ids=["middle_empty", "first_empty"])
+def test_thd_fuse_gate_zero_length_sequence(lens, s_max):
+    """A zero-length sequence in the packing with the fused gate: it owns no rows, its neighbours' rows are on the oracle,
+    the sentinel-filled output carries no survivor (the SDPA suite pins the keyless-row select under a +-1e4 gate on the
+    packed gated plan; the block's one lengths tensor serves both sides, so no block-level row is keyless)."""
+    res = _run_thd(_COMMON, lens, sentinel=_SENTINEL, max_seq_len=s_max, fuse_gate=True)
+    assert res.meta["lens"] == list(lens) and 0 in res.meta["lens"]
+    _assert_empty_sequences_leave_no_rows(res)
+    _check_forward_per_sequence(res, check_record=False)
+
+
+@requires_rubin
+def test_thd_fuse_gate_launch_count_is_one_fewer():
+    """CUPTI kernel records: the packed block with ``fuse_norm_rope + fuse_gate`` issues ONE kernel fewer than the packed
+    block with ``fuse_norm_rope`` alone (the separate sigmoid gate is gone: proj(+norm+RoPE) -> sdpa(+gate) -> out_proj,
+    plus the packed SDPA's setup launch), and exactly the dense ``fuse_norm_rope + fuse_gate`` block's count + 1 (the setup).
+    MEASURED, the names printed; a typed skip when CUPTI records nothing on this node.  No hidden memcpy."""
+    fused = _run_thd(_COMMON, _LENS, refs=False, fuse_norm_rope=True, fuse_gate=True)
+    plain = _run_thd(_COMMON, _LENS, refs=False, fuse_norm_rope=True)
+    t, g = fused.meta["t"], fused.blk.geom
+    dinp = make_inputs(RefGeometry(**_COMMON), batch=1, seq_len=t)
+    out_d = torch.empty(1, t, g.d_model, device="cuda", dtype=torch.bfloat16)
+    dense = GatedAttentionBlockFwd(
+        dinp["h"], dinp["w_qkvg"], dinp["w_q_norm"], dinp["w_k_norm"], dinp["cos"], dinp["sin"], dinp["w_o"], out_d, g, fuse_norm_rope=True, fuse_gate=True
+    )
+    dense.check_support()
+    dense.compile()
+    ws_d = torch.empty(dense.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    k_f, m_f = _cupti_kernels(lambda: _execute(fused.blk, fused.inp, fused.out, fused.ws, seq_lens=fused.seq_lens))
+    k_p, m_p = _cupti_kernels(lambda: _execute(plain.blk, plain.inp, plain.out, plain.ws, seq_lens=plain.seq_lens))
+    k_d, m_d = _cupti_kernels(
+        lambda: dense.execute(dinp["h"], dinp["w_qkvg"], dinp["w_q_norm"], dinp["w_k_norm"], dinp["cos"], dinp["sin"], dinp["w_o"], out_d, ws_d)
+    )
+    if k_f is None or k_p is None or k_d is None:
+        pytest.skip("torch.profiler recorded no CUDA events (CUPTI unavailable on this node); the launch count is unverified here")
+    print(f"\npacked fuse_norm_rope + fuse_gate: {len(k_f)} kernels + {len(m_f)} memset/memcpy:\n  " + "\n  ".join(k_f))
+    print(f"packed fuse_norm_rope: {len(k_p)} kernels + {len(m_p)} memset/memcpy:\n  " + "\n  ".join(k_p))
+    print(f"dense fuse_norm_rope + fuse_gate: {len(k_d)} kernels + {len(m_d)} memset/memcpy:\n  " + "\n  ".join(k_d))
+    assert not [n for n in m_f if "memcpy" in n.lower()], "a hidden copy on the packed fused-gate execute path"
+    assert len(k_f) == len(k_p) - 1, (len(k_f), len(k_p))
+    assert len(k_f) == len(k_d) + 1, (len(k_f), len(k_d))
 
 
 @requires_rubin

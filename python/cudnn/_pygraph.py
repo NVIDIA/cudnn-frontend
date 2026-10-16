@@ -192,6 +192,16 @@ class pygraph:
     All graph structure and attributes are kept in Python. C++ is only
     used for execution via lazy lowering.
 
+    Two constructor arguments are statements about the CALLER, not graph
+    properties, and integrations pass them: ``is_override_shape_enabled``
+    (the graph will execute with shape / stride overrides; forwarded to the
+    backend graph) and the keyword-only ``is_cuda_graph_replay_expected``
+    (``execute`` is captured into a CUDA graph and replayed, so the python
+    engines' heuristics may lead with the plan that is fastest on the GPU
+    alone; never forwarded to the backend, changes no numerics). After
+    planning, ``selected_engine`` and ``backend_plan_entries()`` report which
+    side serves the graph -- see their docstrings.
+
     Example:
         >>> graph = pygraph(io_data_type=cudnn.data_type.HALF)
         >>> A = graph.tensor(dim=[8, 64, 128], name="A")
@@ -368,6 +378,15 @@ class pygraph:
     def selected_engine(self) -> Optional["BaseEngine"]:
         """The python engine for the currently selected plan entry, or None for
         the backend path. Populated after create_execution_plans().
+
+        Public API, read by integrations after planning: ``None`` means the
+        cuDNN backend serves the selected entry; otherwise ``.name`` is the
+        engine's manifest name (``sdpa_fwd_prefill_sm100`` /
+        ``sdpa_fwd_prefill_sm107`` / ``sdpa_fwd_prefill_sm120``, ...), a stable
+        identifier -- manifest names and slots are append-only, never renamed
+        or reused -- so a caller may compare against one.
+        ``get_plan_name_at_index`` reports the same name with the plan's
+        public knobs appended in brackets.
 
         Cached, because ``execute()`` asks on every call and answering means
         walking every registered engine for the one declaring this id, re-deriving
@@ -1261,6 +1280,13 @@ class pygraph:
     def backend_plan_entries(self) -> List[Any]:
         """The backend's own ranked ``(engine_id, knobs)`` recommendation, as
         PlanConfig entries carrying their C++ plan index.
+
+        Public API: an integration that must keep the cuDNN backend reachable
+        for a graph (a Stats layout only the backend serves everywhere) asks
+        this after ``create_execution_plans()`` and reads ``[]`` as "the
+        backend does not serve it" -- the answer is the backend's own (or the
+        family's recorded backend guard), independent of which python engines
+        are offered.
 
         Returns [] for the two things that legitimately mean "no backend entries":
         the backend DECLINED the graph (``cudnnGraphNotSupportedError``) or is not
@@ -2969,7 +2995,7 @@ def _linear_attention_final_state_dims(node):
     state0 = node.inputs.get("initial_state")
     if node.inputs.get("state_indices") is not None and state0 is not None and state0.dim:
         rows = state0.dim[0]
-    return [rows, max(q[1], v[1]), v[2], q[2]]
+    return [rows, max(q[-2], v[-2]), v[-1], q[-1]]
 
 
 def _linear_attention_summary_final_dims(node):
@@ -2978,7 +3004,7 @@ def _linear_attention_summary_final_dims(node):
     cu = node.inputs.get("cu_seqlens")
     if cu is None or not cu.dim:
         return None
-    return [cu.dim[0] - 1, g[1], v[2], k[2]]
+    return [cu.dim[0] - 1, g[1], v[-1], k[-1]]
 
 
 def _linear_attention_transition_dims(node):
@@ -2987,7 +3013,7 @@ def _linear_attention_transition_dims(node):
     cu = node.inputs.get("cu_seqlens")
     if cu is None or not cu.dim:
         return None
-    return [cu.dim[0] - 1, g[1], k[2], k[2]]
+    return [cu.dim[0] - 1, g[1], k[-1], k[-1]]
 
 
 def linear_attention_summary_bwd_dims(node):
@@ -2996,7 +3022,7 @@ def linear_attention_summary_bwd_dims(node):
     cu = node.inputs.get("cu_seqlens")
     if cu is None or not cu.dim:
         return None
-    return [cu.dim[0] - 1, g[1], do[2], k[2]]
+    return [cu.dim[0] - 1, g[1], do[-1], k[-1]]
 
 
 def _linear_attention_state_checkpoints_dims(node):
@@ -3005,19 +3031,28 @@ def _linear_attention_state_checkpoints_dims(node):
     cu = node.inputs["cu_seqlens"].dim if node.inputs.get("cu_seqlens") is not None else None
     if not n or not q or not v or not cu:
         return None
-    return [max(v[0] // n + (cu[0] - 1), 1), max(q[1], v[1]), v[2], q[2]]
+    return [max((v[0] * v[1] if len(v) == 4 else v[0]) // n + (cu[0] - 1), 1), max(q[-2], v[-2]), v[-1], q[-1]]
 
 
 def _linear_attention_o_dims(node):
     # [total_T, HO, V]: the output lives at the gate heads (HO = max(q, v))
     q, v = node.inputs["q"].dim, node.inputs["v"].dim
-    return [v[0], max(q[1], v[1]), v[2]]
+    return [v[0] * v[1] if len(v) == 4 else v[0], max(q[-2], v[-2]), v[-1]]
 
 
 def _gdp_o_dims(node):
-    # [total_T, HO, V]: O follows q's rows; k/v carry the num_householder expansion
+    # [total_T, HO, V]: O follows q's rows; k/v carry the num_householder expansion (expanded rows or token-major)
     q, v = node.inputs["q"].dim, node.inputs["v"].dim
-    return [q[0], max(q[1], v[1]), v[2]]
+    return [q[0], max(q[-2], v[-2]), v[-1]]
+
+
+def _mamba2_transition_dims(node):
+    # [N, HO]: the Mamba-2 piece transition is one scalar (log2 of the decay product) per sequence and head
+    g = node.inputs["g"].dim
+    cu = node.inputs.get("cu_seqlens")
+    if cu is None or not cu.dim:
+        return None
+    return [cu.dim[0] - 1, g[1]]
 
 
 def _block_quant_scale_dims(node):
@@ -3290,6 +3325,83 @@ _STRUCTURED_OPS = {
         outputs=("d_initial_state", "transition"),
         maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
         infer={"d_initial_state": linear_attention_summary_bwd_dims, "transition": _linear_attention_transition_dims},
+        python_only=True,
+    ),
+    "mamba2": dict(
+        node_type=NodeType.MAMBA2,
+        inputs=("q", "k", "v", "g", "a", "cu_seqlens", "initial_state", "dt_bias", "d", "z", "state_indices"),
+        attrs=(
+            "output_final_state",
+            "checkpoint_every_n_tokens",
+            "dt_softplus",
+            "dt_min",
+            "dt_max",
+            "output_pre_gate",
+            "batch_invariant",
+            "overwrite_initial_state",
+        ),
+        outputs=("O", "final_state", "state_checkpoints", "O_pre"),
+        maybe={
+            "final_state": lambda n: bool(n.params.get("output_final_state", False)),
+            "state_checkpoints": lambda n: bool(n.params.get("checkpoint_every_n_tokens") or 0),
+            "O_pre": lambda n: bool(n.params.get("output_pre_gate", False)) and "z" in n.inputs,
+        },
+        infer={
+            "O": _linear_attention_o_dims,
+            "final_state": _linear_attention_final_state_dims,
+            "state_checkpoints": _linear_attention_state_checkpoints_dims,
+            "O_pre": _linear_attention_o_dims,
+        },
+        python_only=True,
+    ),
+    "mamba2_bwd": dict(
+        node_type=NodeType.MAMBA2_BWD,
+        inputs=("q", "k", "v", "g", "a", "cu_seqlens", "dO", "state_checkpoints", "initial_state", "d_final_state", "dt_bias", "d", "z", "O_pre"),
+        attrs=(
+            "checkpoint_every_n_tokens",
+            "dt_softplus",
+            "dt_min",
+            "dt_max",
+            "batch_invariant",
+            "overwrite_initial_state",
+        ),
+        outputs=("dQ", "dK", "dV", "dG", "dA", "d_initial_state", "d_dt_bias", "dD", "dZ"),
+        maybe={
+            "d_initial_state": lambda n: "initial_state" in n.inputs,
+            "d_dt_bias": lambda n: "dt_bias" in n.inputs,
+            "dD": lambda n: "d" in n.inputs,
+            "dZ": lambda n: "z" in n.inputs,
+        },
+        infer={
+            "dQ": _like("q"),
+            "dK": _like("k"),
+            "dV": _like("v"),
+            "dG": _like("g"),
+            "dA": _like("a"),
+            "d_initial_state": _like("initial_state"),
+            "d_dt_bias": _like("dt_bias"),
+            "dD": _like("d"),
+            "dZ": _like("z"),
+        },
+        dtype_like={"d_initial_state": "initial_state", "dA": "a", "d_dt_bias": "dt_bias", "dD": "d", "dZ": "z"},
+        python_only=True,
+    ),
+    "mamba2_summary": dict(
+        node_type=NodeType.MAMBA2_SUMMARY,
+        inputs=("k", "v", "g", "a", "cu_seqlens", "initial_state", "dt_bias"),
+        attrs=("output_transition", "dt_softplus", "dt_min", "dt_max", "batch_invariant"),
+        outputs=("final_state", "transition"),
+        maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
+        infer={"final_state": _linear_attention_summary_final_dims, "transition": _mamba2_transition_dims},
+        python_only=True,
+    ),
+    "mamba2_summary_bwd": dict(
+        node_type=NodeType.MAMBA2_SUMMARY_BWD,
+        inputs=("q", "k", "g", "a", "cu_seqlens", "dO", "d_final_state", "dt_bias"),
+        attrs=("output_transition", "dt_softplus", "dt_min", "dt_max", "batch_invariant"),
+        outputs=("d_initial_state", "transition"),
+        maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
+        infer={"d_initial_state": linear_attention_summary_bwd_dims, "transition": _mamba2_transition_dims},
         python_only=True,
     ),
     "gdp": dict(

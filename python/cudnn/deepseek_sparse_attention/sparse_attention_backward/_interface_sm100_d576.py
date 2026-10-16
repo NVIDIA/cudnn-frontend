@@ -18,14 +18,14 @@ from ._interface_sm100 import _BLACKWELL_CAPABILITIES, _align_workspace_bytes, _
 BACKEND = "h128_d576_2cta_m64"
 
 
-def _workspace_sizes(total_s_q: int, total_s_kv: int) -> tuple[int, int]:
+def _workspace_sizes(total_s_q: int, total_s_kv: int, deterministic: bool = False) -> tuple[int, int]:
     """Byte sizes of the FP32 LSE/OdO and dKV planes, shared with the generic kernel."""
-    return tuple(math.prod(shape) for shape in _workspace_shapes_sm100(total_s_q, total_s_kv, 576, 128, False))
+    return tuple(math.prod(shape) for shape in _workspace_shapes_sm100(total_s_q, total_s_kv, 576, 128, deterministic, BACKEND))
 
 
-def _workspace_bytes(total_s_q: int, total_s_kv: int) -> int:
+def _workspace_bytes(total_s_q: int, total_s_kv: int, deterministic: bool = False) -> int:
     """Caller scratch bytes for this shape; identical to the generic SM100 formula."""
-    return flash_attn_bwd_sm100_workspace_size(total_s_q, total_s_kv, 576, 128, False)
+    return flash_attn_bwd_sm100_workspace_size(total_s_q, total_s_kv, 576, 128, deterministic, backend=BACKEND)
 
 
 def _split_count(total_s_q: int, max_topk: int, sm_count: int) -> int:
@@ -35,12 +35,12 @@ def _split_count(total_s_q: int, max_topk: int, sm_count: int) -> int:
 
 
 @lru_cache(maxsize=None)
-def _compile_d576_2cta(device_capability, max_topk: int, has_topk_length: bool, single_query: bool, split_regime: bool):
+def _compile_d576_2cta(device_capability, max_topk: int, has_topk_length: bool, single_query: bool, split_regime: bool, deterministic: bool = False):
     """Compile from metadata; sequence extents and scale remain runtime inputs."""
     if device_capability not in _BLACKWELL_CAPABILITIES:
         raise ValueError(f"the H128 D576 two-CTA backend requires an SM100-class device with compute capability in {_BLACKWELL_CAPABILITIES}")
 
-    from .dsa_bwd_sm100_h128_d576_2cta import FlashAttentionDSABackwardSm100H128D576TwoCTA
+    from .dsa_bwd_sm100_h128_d576_2cta import FlashAttentionDSABackwardSm100H128D576TwoCTA, FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic
 
     sq, skv = cute.sym_int(), cute.sym_int()
 
@@ -55,9 +55,12 @@ def _compile_d576_2cta(device_capability, max_topk: int, has_topk_length: bool, 
     sink = tensor(cutlass.Float32, (128,))
     indices = tensor(cutlass.Int32, (sq, max_topk))
     lengths = tensor(cutlass.Int32, (sq,), 4) if has_topk_length else None
-    stats_workspace = tensor(cutlass.Uint8, (cute.sym_int(),))
-    dkv_workspace = tensor(cutlass.Uint8, (cute.sym_int(),))
-    kernel = FlashAttentionDSABackwardSm100H128D576TwoCTA(
+    # Deterministic dKV scratch exceeds 2 GiB for long sequences. Its byte
+    # extent must remain wide when TVM-FFI binds the caller-owned workspace.
+    stats_workspace = tensor(cutlass.Uint8, (cute.sym_int64(),))
+    dkv_workspace = tensor(cutlass.Uint8, (cute.sym_int64(),))
+    kernel_cls = FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic if deterministic else FlashAttentionDSABackwardSm100H128D576TwoCTA
+    kernel = kernel_cls(
         element_dtype=cutlass.BFloat16,
         head_dim=576,
         head_dim_v=512,
@@ -84,7 +87,7 @@ def _compile_d576_2cta(device_capability, max_topk: int, has_topk_length: bool, 
         cutlass.Float32(1.0),
         cutlass.Int32(1),
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
-        split_regime,
+        split_regime and not deterministic,
         options=compile_options(),
     )
 
@@ -106,6 +109,7 @@ def _execute_d576_2cta(
     softmax_scale,
     split_count,
     current_stream,
+    deterministic=False,
 ):
     """Validate preallocated arguments and launch without allocation or copies."""
     sq, skv = q.shape[0], kv.shape[0]
@@ -131,14 +135,14 @@ def _execute_d576_2cta(
         if not value.is_contiguous() or value.data_ptr() % alignment:
             raise ValueError(f"{name} must be contiguous and {alignment}-byte aligned")
 
-    required = _workspace_bytes(sq, skv)
+    required = _workspace_bytes(sq, skv, deterministic)
     if not isinstance(workspace, torch.Tensor):
         raise ValueError(f"the H128 D576 two-CTA backend requires a {required}-byte caller workspace")
     if workspace.dtype != torch.uint8 or workspace.device != q.device or not workspace.is_contiguous():
         raise ValueError("workspace must be a contiguous uint8 tensor on Q's device")
     if workspace.numel() < required or workspace.data_ptr() % 16:
         raise ValueError(f"workspace must contain at least {required} bytes and be 16-byte aligned")
-    stats_bytes, dkv_bytes = _workspace_sizes(sq, skv)
+    stats_bytes, dkv_bytes = _workspace_sizes(sq, skv, deterministic)
     flat = workspace.view(-1)
     dkv_begin = _align_workspace_bytes(stats_bytes)
     stats_workspace = flat[:stats_bytes]
@@ -166,7 +170,7 @@ def _execute_d576_2cta(
                 stats_workspace,
                 dkv_workspace,
                 scale,
-                split_count,
+                1 if deterministic else split_count,
                 current_stream,
             )
     return dq, dkv, d_sink
@@ -188,18 +192,21 @@ def flash_attn_bwd_sm100_h128_d576(
     workspace=None,
     *,
     d_sink=None,
+    deterministic=False,
 ):
     """Direct entry point: allocate omitted outputs and scratch, then launch.
 
     ``SparseAttentionBackward`` keeps compilation at plan time and forbids
-    allocation in ``execute()``; this function offers ``flash_attn_bwd_sm100``
-    callers the same kernel with that interface's allocate-on-demand behavior.
+    allocation in ``execute()``. This direct entry point can allocate omitted
+    outputs and scratch and is also used by ``flash_attn_bwd_sm100``.
     """
     sq, skv = q.shape[0], kv.shape[0]
     max_topk = topk_idxs.shape[1]
     with torch.cuda.device(q.device):
-        split_count = _split_count(sq, max_topk, torch.cuda.get_device_properties(q.device).multi_processor_count)
-        compiled_kernel = _compile_d576_2cta(torch.cuda.get_device_capability(q.device), max_topk, topk_length is not None, sq == 1, split_count > 1)
+        split_count = 1 if deterministic else _split_count(sq, max_topk, torch.cuda.get_device_properties(q.device).multi_processor_count)
+        compiled_kernel = _compile_d576_2cta(
+            torch.cuda.get_device_capability(q.device), max_topk, topk_length is not None, sq == 1, split_count > 1, deterministic
+        )
         current_stream = resolve_stream(current_stream)
         with torch_stream_context(current_stream):
             if dq is None:
@@ -209,7 +216,7 @@ def flash_attn_bwd_sm100_h128_d576(
             if d_sink is None:
                 d_sink = torch.empty_like(attn_sink)
             if workspace is None:
-                workspace = torch.empty(_workspace_bytes(sq, skv), dtype=torch.uint8, device=q.device)
+                workspace = torch.empty(_workspace_bytes(sq, skv, deterministic), dtype=torch.uint8, device=q.device)
     return _execute_d576_2cta(
         compiled_kernel,
         q,
@@ -227,4 +234,5 @@ def flash_attn_bwd_sm100_h128_d576(
         softmax_scale,
         split_count,
         current_stream,
+        deterministic,
     )

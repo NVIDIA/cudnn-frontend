@@ -1594,9 +1594,9 @@ def _quantize_seq(t_1hsd, h, s, d, fp8, *, columnwise):
     if columnwise:
         # Columnwise F8_128x4 is plane-major for D > 128. THD's packed
         # contract keeps every sequence tile contiguous, so transpose
-        # [D/128, H, tile, 512] into [H, tile, D/128, 512] before sequences
-        # are concatenated in cu_seqlens order.
-        planes = d // 128
+        # [ceil(D/128), H, tile, 512] into [H, tile, ceil(D/128), 512] before
+        # sequences are concatenated in cu_seqlens order.
+        planes = _cdiv(d, 128)
         sf = swz_s.view(torch.uint8).reshape(planes, h, n_tiles, 512).permute(1, 2, 0, 3).contiguous().reshape(h, n_tiles, -1)
         return data_s, dq_s.reshape(1, h, s, d), sf
     return data_d, dq_d.reshape(1, h, s, d), swz_d.view(torch.uint8).reshape(h, n_tiles, -1)
@@ -2636,7 +2636,8 @@ _SM100_D128_MXFP8_SASS_PROBE = sass_probe_source("""
     # The PRODUCTION geometry from the adapter itself (cga2), E4M3 in, BF16 out, GQA 24/8, Stats + Amax_O -- the shape
     # the split was tuned and measured on (B=1 H=24/8 S=16K dense); the per-cc fields (fused_ldtm_stat, exp2_fma_split)
     # come from the caller as the record api_dsl.template_params() builds for that device.
-    (cta_mma,) = supported_cgas_for((128, 128), fp8=True, device_cc=(10, 0), pertensor=False)
+    cta_mma = 2
+    assert cta_mma in supported_cgas_for((128, 128), fp8=True, device_cc=(10, 0), pertensor=False)
     params = TemplateParams(dtype_qkv=0, dtype_o=2, cta_mma=cta_mma, qh_per_kh=3, sched_policy=0, emit_amax_o=True, **params_kw)
     mod = _load_sm100_kernel_module((128, 128), params, fp8=True, pertensor=False, rubin=False)
     # MUFU.EX2 the kernel must carry: per softmax body one alpha exp2 plus the non-emulated columns, traced once per
@@ -2743,10 +2744,13 @@ def test_sm103_d128_mxfp8_exp2_split_is_folded_out_sass_pins(tmp_path):
 # develop's).  No other sm100 kernel passes the kwarg.  Three tripwires: the source scan (this exact expression, defined once,
 # every site passes it, no literal, no leak into a sibling); the module VALUE under a dense, a causal and a padded
 # TemplateParams; and the sm_100a SASS of BOTH d128 specializations -- the branch form costs one BSSY reconverge and `cga_size`
-# (= 2) per-lane SYNCS.ARRIVE per site against the predicated form's 0 and 1, so the 7 sites read BSSY 15 / SYNCS.ARRIVE 55 on
-# the dense cubin (8 / 48 with the predicated form) and BSSY 8 / SYNCS.ARRIVE 56 on the causal one (15 / 63 with the branch
-# form), MEASURED 2026-09-22 on the trace-compiled cubins: one site taking the other form moves both counts by one.  Exact pins,
-# like the sm107 wait-form pins: deterministic for a given DSL + ptxas, re-pinned deliberately on a toolchain move.
+# (= 2) per-lane SYNCS.ARRIVE per site against the predicated form's 0 and 1, so the 7 sites read BSSY 15 on the dense cubin
+# (8 with the predicated form) and BSSY 8 on the causal one (15 with the branch form), MEASURED 2026-09-22 on the
+# trace-compiled cubins: one site taking the other form moves both counts by one.  SYNCS.ARRIVE is a WHOLE-KERNEL total, so
+# the pipeline's own arrives sit under it: the streamed O store and the phantom-step handshakes (gap-2pct branch) moved it from
+# 55 / 56 to 62 / 75 (dense / causal, re-pinned 2026-10-12) with BSSY unchanged -- the branch-vs-predicated check lives in BSSY
+# plus the 7-per-form SYNCS.ARRIVE delta, not in the absolute count.  Exact pins, like the sm107 wait-form pins: deterministic
+# for a given DSL + ptxas, re-pinned deliberately on a toolchain or protocol move.
 _CREDIT_ARRIVE_SITES = {
     (128, 128): 6,
     (192, 128): 7,
@@ -2757,8 +2761,8 @@ _PREDICATED_CREDIT_ARRIVE_DEF = "PREDICATED_CREDIT_ARRIVE: bool = CFG.MASK_FLAGS
 _CREDIT_ARRIVE_SPECIALIZATIONS = {"dense": ({}, False), "causal": ({"window_right": 0}, True), "padded": ({"seq_kv_lens_present": True}, True)}
 # d128 sm_100a pins per specialization: (TemplateParams fields on top of _CC100_D128_MXFP8_PARAMS, the exact opcode counts).
 _SM100_D128_MXFP8_CREDIT_ARRIVE_SASS_PINS = {
-    "dense": ({}, {"BSSY": 15, "SYNCS_ARRIVE": 55}),  # the branch form; the predicated form read 8 / 48 here
-    "causal": ({"window_right": 0}, {"BSSY": 8, "SYNCS_ARRIVE": 56}),  # the predicated form (develop's cubin); the branch form read 15 / 63 here
+    "dense": ({}, {"BSSY": 15, "SYNCS_ARRIVE": 62}),  # the branch form; the predicated form reads 8 / 55 here (7 fewer of each)
+    "causal": ({"window_right": 0}, {"BSSY": 8, "SYNCS_ARRIVE": 75}),  # the predicated form; the branch form reads 15 / 82 here (7 more of each)
 }
 
 
@@ -2856,9 +2860,9 @@ def test_sm100_only_the_mxfp8_kernels_opt_out_of_the_predicated_credit_arrive():
 @pytest.mark.parametrize("specialization", sorted(_SM100_D128_MXFP8_CREDIT_ARRIVE_SASS_PINS))
 def test_sm100_d128_mxfp8_credit_arrive_sass_pins(tmp_path, specialization):
     """On the sm_100a cubin at the production geometry the credit arrives lower to the form the specialization selects: the
-    DENSE cubin carries the BRANCH form (BSSY == 15, per-lane SYNCS.ARRIVE == 55 exactly; the predicated form reads 8 / 48)
-    and the CAUSAL cubin (`window_right=0`, the same shape) develop's PREDICATED form (BSSY == 8, SYNCS.ARRIVE == 56; the branch
-    form reads 15 / 63), while the exp2 split stays where the sibling pin holds it -- MUFU.EX2 == 194 on the dense cubin
+    DENSE cubin carries the BRANCH form (BSSY == 15, per-lane SYNCS.ARRIVE == 62 exactly; the predicated form reads 8 / 55)
+    and the CAUSAL cubin (`window_right=0`, the same shape) develop's PREDICATED form (BSSY == 8, SYNCS.ARRIVE == 75; the branch
+    form reads 15 / 82), while the exp2 split stays where the sibling pin holds it -- MUFU.EX2 == 194 on the dense cubin
     (derived from the module) and 2 x 194 == 388 on the causal one, whose warpgroups each trace the softmax body twice (the
     unmasked segment's and the masked one's, shared by the left- and right-masked segments).  The dense case reads the SAME
     cubin as test_sm100_d128_mxfp8_exp2_split_and_amax_fold_sass_pins (memoized probe); the causal one is a second compile."""
@@ -2914,7 +2918,7 @@ def test_mxfp8_d128_stats_is_the_exact_softmax_lse_sm100(causal):
     q8, q_deq, sfq = mx(qf, hq, False)
     k8, k_deq, sfk = mx(kf, hkv, False)
     v8, v_deq, sfv = mx(vf, hkv, True)
-    (cga,) = supported_cgas_for((d, d), fp8=True, device_cc=torch.cuda.get_device_capability(), pertensor=False)
+    cga = max(supported_cgas_for((d, d), fp8=True, device_cc=torch.cuda.get_device_capability(), pertensor=False))
     outs = {}
     lse = torch.full((b, hq, s), float("nan"), device=dev, dtype=torch.float32)
     for with_stats in (True, False):
@@ -2947,6 +2951,83 @@ def test_mxfp8_d128_stats_is_the_exact_softmax_lse_sm100(causal):
     assert (
         err.max().item() <= 1e-4
     ), f"Stats is not the exact log-sum-exp: max |dLSE| {err.max().item():.3e}, rms {err.pow(2).mean().sqrt().item():.3e} (the exp2 emulation reads ~6e-6 dense / ~2e-5 causal; a quantized-sum LSE ~1e-3..1e-2)"
+
+
+# ============================================================================ sm100 d128 MXFP8: a whole Q-tile pair with no key must not enter the phantom tail protocol
+@pytest.mark.L0
+@pytest.mark.skipif(
+    _SM is None or not (100 <= _SM <= 106),
+    reason="the sm100 MXFP8 d128 kernel serves cc 10.0-10.6",
+)
+@pytest.mark.parametrize("cga", [1, 2], ids=["cga1", "cga2"])
+def test_mxfp8_d128_bottom_right_empty_leading_q_tiles_sm100(cga):
+    """Bottom-right causal S_q=640 > S_kv=128 through the STANDALONE adapter (the graph API pads such a rectangle away): the
+    first 512 query rows lie above the first key, so the first whole q super-tile (one pair under cga2) has the EMPTY KV
+    interval [0, 0).  Its softmax tail test ``phantom_kv == kv_last`` reads -1 == -1 there, and the phantom step would wait
+    on a BMM1 commit the MMA warp's empty-mainloop branch never issues -- a hang, not a wrong number -- so the tail phantom
+    is gated on a real step index.  Keyless rows read O = 0 / Stats = -inf exactly, the rest match the fp64 reference of the
+    dequantized inputs within the e4m3-P quantization floor (same budget as the suite's d128 bottom-right cases)."""
+    from sdpa.mxfp8_quant import quantize_to_mxfp8
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100, supported_cgas_for
+
+    b, hq, hkv, s_q, s_kv, d = 1, 1, 1, 640, 128, 128
+    if cga not in supported_cgas_for((d, d), fp8=True, device_cc=torch.cuda.get_device_capability(), pertensor=False):
+        pytest.skip(f"cga={cga} is not served for the MXFP8 d128 flavor on this device")
+    torch.manual_seed(0)
+    dev = "cuda"
+
+    def mx(x, h, s, columnwise):
+        data_d, sf_d, swz_d, data_s, sf_s, swz_s = quantize_to_mxfp8(x.contiguous(), b, h, s, d, 32, torch.float8_e4m3fn, with_ref=True)
+        data, sf, swz = (data_s, sf_s, swz_s) if columnwise else (data_d, sf_d, swz_d)
+        deq = data.double().reshape(b, h, s, d) * sf.double().reshape(b, h, s, d)
+        return data.permute(0, 2, 1, 3).contiguous().transpose(1, 2), deq, swz.contiguous()
+
+    q8, q_deq, sfq = mx(torch.randn(b, hq, s_q, d, device=dev) * 0.5, hq, s_q, False)
+    k8, k_deq, sfk = mx(torch.randn(b, hkv, s_kv, d, device=dev) * 0.5, hkv, s_kv, False)
+    v8, v_deq, sfv = mx(torch.randn(b, hkv, s_kv, d, device=dev) * 0.5, hkv, s_kv, True)
+    out = torch.full((b, s_q, hq, d), 6.0e4, device=dev, dtype=torch.float16).transpose(1, 2)
+    lse = torch.full((b, hq, s_q), float("nan"), device=dev, dtype=torch.float32)
+    api = SdpaFwdDslSm100(
+        q8,
+        k8,
+        v8,
+        out,
+        lse,
+        scale_softmax=d**-0.5,
+        is_causal=True,
+        causal_bottom_right=True,
+        pertensor_fp8=False,
+        dtype_o=torch.float16,
+        cga=cga,
+        split_kv=1,
+        sched_policy=0,
+    )
+    assert api.check_support(), "the standalone adapter must admit the unpadded bottom-right rectangle"
+    api.compile()
+    workspace = torch.empty(api.scratch_workspace_bytes(), device=dev, dtype=torch.uint8)
+    api.execute(q8, k8, v8, out, lse_tensor=lse, sf_q=sfq, sf_k=sfk, sf_v=sfv, workspace=workspace)
+    torch.cuda.synchronize()
+
+    diag = s_kv - s_q
+    qi = torch.arange(s_q, device=dev)[:, None]
+    ki = torch.arange(s_kv, device=dev)[None, :]
+    allowed = ki <= qi + diag
+    keyless = ~allowed.any(dim=-1)
+    assert keyless.sum().item() == s_q - s_kv == 512, "the test geometry must leave the first 512 rows without a key"
+    logits = (q_deq @ k_deq.transpose(-1, -2) * d**-0.5).masked_fill(~allowed, float("-inf"))
+    lse_ref = torch.logsumexp(logits, dim=-1)
+    o_ref = torch.softmax(logits[..., ~keyless, :], dim=-1) @ v_deq
+    o = out.float()
+    assert not (o == 6.0e4).any(), "sentinel survived: O rows never written"
+    assert torch.equal(o[..., keyless, :], torch.zeros_like(o[..., keyless, :])), "keyless rows must read O = 0 exactly"
+    assert torch.isinf(lse[..., keyless]).all() and (lse[..., keyless] < 0).all(), "keyless rows must publish Stats = -inf"
+    assert torch.isfinite(o[..., ~keyless, :]).all() and torch.isfinite(lse[..., ~keyless]).all()
+    d_o = (o[..., ~keyless, :].double() - o_ref).abs().max().item()
+    d_lse = (lse[..., ~keyless].double() - lse_ref[..., ~keyless]).abs().max().item()
+    print(f"\nsm100 d128 mxfp8 bottom-right empty-leading cga{cga}: max|dO| {d_o:.3e}, max|dLSE| {d_lse:.3e}")
+    assert d_o <= 5e-2, f"O off the fp64 reference of the dequantized inputs by {d_o:.3e} (e4m3-P floor ~2e-2)"
+    assert d_lse <= 1e-3, f"Stats off the fp64 log-sum-exp by {d_lse:.3e}"
 
 
 # Explicit architecture CI entry; wide physical-stride probes remain opt-in L1.

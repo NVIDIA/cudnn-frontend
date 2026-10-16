@@ -72,6 +72,25 @@ for _optional_symbol in [
         globals()[_optional_symbol] = getattr(_pybind_module, _optional_symbol)
 
 
+def sdpa_capabilities() -> frozenset:
+    """Names of the SDPA binding capabilities this build of cudnn-frontend provides, as a frozenset of ``str``.
+
+    Each name ``<cap>`` is a ``supports_<cap>`` flag of the native SDPA binder (``_SdpaThdBinder``): a packed (THD)
+    split or stride contract the compiled extension honors -- ``"stats_stride_override"``, ``"nonpaged_packed_split"``,
+    ``"paged_split_sink"``, ... A caller that needs one asks ``"<cap>" in cudnn.sdpa_capabilities()``; the binder's
+    flags stay as they are, so a caller written against them keeps working. The set is append-only: a capability is
+    never renamed or removed. Empty on a build without the binder. Host Python only: no device, no framework import.
+    """
+    binder = getattr(_pybind_module, "_SdpaThdBinder", None)
+    if binder is None:
+        return frozenset()
+    names = []
+    for attr in dir(binder):
+        if attr.startswith("supports_") and getattr(binder, attr, False) is True:
+            names.append(attr[len("supports_") :])
+    return frozenset(names)
+
+
 from ._handle import Handle, DeviceInfo
 
 # Type alias for the annotations that reference ``cudnn.handle`` (a supplied handle
@@ -314,6 +333,7 @@ _EAGER_PUBLIC_NAMES = (
     "graph",
     "jit",
     "graph_cache",
+    "sdpa_capabilities",
 )
 __all__ = [*_EAGER_PUBLIC_NAMES, "Graph", "wrapper"]
 
@@ -364,6 +384,7 @@ _OPTIONAL_DEPENDENCY_INSTALL_HINTS = {
     "engram_gate_saved_backward": "Install nvidia-cudnn-frontend[triton] and a CUDA-enabled torch build",
     "Nvfp4AttentionQatBackward": "Install with 'pip install nvidia-cudnn-frontend[cutedsl,triton]' and install a CUDA-enabled torch build",
     "nvfp4_attention_qat_backward": "Install with 'pip install nvidia-cudnn-frontend[cutedsl,triton]' and install a CUDA-enabled torch build",
+    "gated_attention_block": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
 }
 _OPTIONAL_DEPENDENCY_INSTALL_HINTS.update({name: _MOE_EP_INSTALL_HINT for name in _MOE_EP_OPTIONAL_IMPORTS})
 
@@ -380,6 +401,9 @@ _LAZY_OPTIONAL_IMPORTS = {
     "EngramGateSavedBackward": (".engram", "EngramGateSavedBackward"),
     "engram_gate_saved_forward": (".engram", "engram_gate_saved_forward"),
     "engram_gate_saved_backward": (".engram", "engram_gate_saved_backward"),
+    # The gated attention block (a model-level FROST API): `import cudnn; cudnn.gated_attention_block.<name>` resolves the
+    # package on first attribute access, like `gnn` / `moe_ep` below; it imports torch and cuda-python, so never eagerly here.
+    "gated_attention_block": (".gated_attention_block", None),
     "gnn": (".gnn", None),
     "moe_ep": (".moe_ep", None),
     "BlockScaledTensor": (".moe_ep", "BlockScaledTensor"),

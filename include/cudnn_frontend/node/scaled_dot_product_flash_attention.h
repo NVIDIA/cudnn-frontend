@@ -599,6 +599,20 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
                 "max_total_seq_len_q/kv is only supported with packed (ragged) layout");
         }
 
+        CHECK_CUDNN_FRONTEND_ERROR(validate_sdpa_operand_stride_alignment(attributes.inputs.at(input_names::Q), "Q"));
+        CHECK_CUDNN_FRONTEND_ERROR(validate_sdpa_operand_stride_alignment(attributes.inputs.at(input_names::K), "K"));
+        CHECK_CUDNN_FRONTEND_ERROR(validate_sdpa_operand_stride_alignment(attributes.inputs.at(input_names::V), "V"));
+        CHECK_CUDNN_FRONTEND_ERROR(validate_sdpa_operand_stride_alignment(attributes.outputs.at(output_names::O), "O"));
+
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    collect_aligned_operands_node(AlignedOperands& aligned_operands) const override final {
+        add_sdpa_aligned_operand(attributes.inputs.at(input_names::Q), aligned_operands);
+        add_sdpa_aligned_operand(attributes.inputs.at(input_names::K), aligned_operands);
+        add_sdpa_aligned_operand(attributes.inputs.at(input_names::V), aligned_operands);
+        add_sdpa_aligned_operand(attributes.outputs.at(output_names::O), aligned_operands);
         return {error_code_t::OK, ""};
     }
 
@@ -1638,6 +1652,34 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
         }
         // clang-format on
 
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    post_validate_node() const override final {
+        for (auto const& [port, name] : {std::make_pair(input_names::Q, "Q"),
+                                         std::make_pair(input_names::K, "K"),
+                                         std::make_pair(input_names::V, "V"),
+                                         std::make_pair(input_names::O, "O"),
+                                         std::make_pair(input_names::dO, "dO")}) {
+            CHECK_CUDNN_FRONTEND_ERROR(validate_sdpa_operand_stride_alignment(attributes.inputs.at(port), name));
+        }
+        for (auto const& [port, name] : {std::make_pair(output_names::dQ, "dQ"),
+                                         std::make_pair(output_names::dK, "dK"),
+                                         std::make_pair(output_names::dV, "dV")}) {
+            CHECK_CUDNN_FRONTEND_ERROR(validate_sdpa_operand_stride_alignment(attributes.outputs.at(port), name));
+        }
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    collect_aligned_operands_node(AlignedOperands& aligned_operands) const override final {
+        for (auto port : {input_names::Q, input_names::K, input_names::V, input_names::O, input_names::dO}) {
+            add_sdpa_aligned_operand(attributes.inputs.at(port), aligned_operands);
+        }
+        for (auto port : {output_names::dQ, output_names::dK, output_names::dV}) {
+            add_sdpa_aligned_operand(attributes.outputs.at(port), aligned_operands);
+        }
         return {error_code_t::OK, ""};
     }
 

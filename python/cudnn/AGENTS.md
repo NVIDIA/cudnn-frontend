@@ -1,6 +1,6 @@
 # python/cudnn — Agent Guide
 
-The `cudnn` Python package: pybind11-backed graph API plus pure-Python **frontend-only OSS kernels** (CuTeDSL). See `README.md` in this directory for the package inventory and [../../AGENTS.md](../../AGENTS.md) for build/test commands.
+The `cudnn` Python package: nanobind-backed graph API plus pure-Python **frontend-only OSS kernels** (CuTeDSL). See `README.md` in this directory for the package inventory and [../../AGENTS.md](../../AGENTS.md) for build/test commands.
 
 ## Import-time rules (the most common way to break this package)
 
@@ -9,7 +9,7 @@ The `cudnn` Python package: pybind11-backed graph API plus pure-Python **fronten
   submodule directly on its parent, bypassing module `__getattr__`. Check direct-submodule,
   sibling-symbol, and public-symbol import orders in fresh interpreters; the detector is
   `test_ops_callable_exports_survive_import_order` in `test/python/core/test_import_boundaries.py`.
-- Never add an eager `import torch` / `import cutlass` to `__init__.py` or anything it imports transitively. `api_base.py` itself imports them at top level, which is why kernel classes must only be reachable through the lazy table.
+- Never add an eager `import torch` / `import cutlass` to `__init__.py` or anything it imports transitively. Kernel modules import them at top level, which is why they must only be reachable through the lazy table.
 - Reuse the existing required CuTeDSL dependencies (`pyproject.toml` `[project] dependencies`) unless a kernel truly needs a new package. The `[cutedsl]` extra now holds only `cuda-python`.
 
 ## Hard rules
@@ -58,6 +58,13 @@ Numbered so reviews can cite them; the list grows — append, never renumber.
   inputs against their observed span as well as their effective shape, and check
   pointer alignment for the element type. The host-only detector is
   `test_dense_metadata_rejects_short_observed_storage_and_misalignment`.
+- **A runtime SF expert stride needs a per-plane contract.** FROST MoE weight
+  scales in `F8_128x4` require E outermost, dense byte storage within each expert
+  plane, sufficient blocked capacity per plane, and a non-overlapping 16-byte
+  aligned expert pitch. Whole-blob density does not establish this: an
+  interleaved expert view can pass it and silently select the wrong scales.
+  Detector: `gemm/frost/test_moe_grouped_block_scale_matmul_fwd.py`'s
+  `test_moe_weight_sf_plane_binding` and `test_moe_weight_sf_runtime_stride`.
 - **Native geometry caches retain no storage observations.** A geometry hit must
   still check the current dtype, device, address alignment and observed byte span.
   Mark an uninitialized cache entry explicitly: an empty shape is an input to
@@ -98,6 +105,12 @@ unsupported input runnable.
   must address natively (layout-driven offset math, strides encoded in TMA
   descriptors) — acceptance is a promise about the execute path, not about
   what the adapter can patch up.
+- Architecture admission needs a native compile-and-execute detector, not
+  only a mocked capability check. Shared compiler architecture maps may also
+  gate unrelated kernels; qualify a new operation through a scoped compile
+  target instead of widening that shared support gate. The detector is
+  `test_DSA_indexer_top_k_sm120_native_boundary`, including changed-input replay
+  at the documented shared-memory limits.
 
 **Rule 3 — `execute()` never reads device memory to the host.**
 
@@ -202,6 +215,16 @@ not become a compile key.
   hit (`stats()["memo_hits"]` grows, `hits` does not) and a key compiled by
   an earlier test in the same process would turn the first build into a memo
   hit too, leaving nothing on disk to reload.
+- **Compiled CuTe launchables belong to their CUDA context.** Pin a plan's device
+  when compiling storage-free declarations; compile and execute under that device,
+  and reject differently placed bindings before lowering pointers. An outer
+  argument-only `functools.lru_cache` can bypass `compiled_cache`'s device/context
+  key and return another GPU's launchable: delegate reuse to the device-aware
+  cache. Detector: intercept device contexts and compilation, build identical
+  plans for two device ordinals, and verify each reaches compilation in its own
+  context; no invalid cross-device GPU launch is needed. See the sparse SDPA
+  tests `test_compilation_and_launch_preserve_the_declared_or_resolved_device`
+  and `test_compilation_bypasses_argument_only_caches_across_devices`.
 - **Issue #604 is closed**: SM80 THD compiles use symbolic packed extents.
   The prepared backward host takes Int64 capacities and launch bounds at
   runtime, including the compact Stats head pitch and deterministic-counter
@@ -332,6 +355,12 @@ DSL satisfies your kernel.**
   they do not fail. CI runs the `oss:` lanes across the supported DSL versions
   (`ci/stages/oss_tests/jobs.yml` in internal CI); a lane below your floor
   must show skips, not errors.
+- Keep declaration and execute-preflight metadata validators outside modules
+  that import newer DSL kernel APIs. A correctly gated stage cannot protect
+  an earlier constructor import of its validator. Exercise the public
+  constructor and preflight in a fresh process on the real dependency-floor
+  wheel; `test_gated_block_declaration_and_execute_preflight_do_not_import_cache_kernel`
+  is the detector for the gated block's paged-cache validation.
 - **MLIR argument widths are part of a DSL API migration.**
   `FastDivmodDivisorV2` carries two MLIR values (encoded divisor and scalar),
   while its predecessor carried one. Custom `__new_from_mlir_values__` methods
@@ -453,7 +482,7 @@ def execute(self, graph, variant_pack, ctx):
     ws = Workspace.over(variant_pack, self.get_workspace_size(), type(self).__name__)  # frost/workspace.py
     meta = ws.take(4 * b + 4, "int32"); desc = ws.view(off, "int64", (slots * 16,))
 ```
-(APIBase adapters: `scratch_workspace_bytes()` + `WorkspaceCarver(workspace, bytes, label).take(numel, dtype)`
+(Adapters: `scratch_workspace_bytes()` + `WorkspaceCarver(workspace, bytes, label).take(numel, dtype)`
 in `sdpa/fwd/api_dsl.py`.) `Workspace(None, ...)` already raises
 `"<owner> requires a N-byte workspace but execute() received none; allocate
 graph.get_workspace_size() bytes and pass the buffer to execute()"` — reuse
@@ -608,13 +637,25 @@ treatment at the caller boundary.**
   (host-only, cc 10.7 modelled, a `_lower_backend_graph` tripwire), seen RED on
   the first guard. A version-bounded guard also needs the detector that
   re-measures its bound (test/AGENTS.md).
+- **The names FlashInfer reads are pinned.** `cudnn.sdpa_capabilities()`,
+  `cudnn.frost.cutedsl_runtime_available(device_cc=None)`,
+  `cudnn.datatypes.torch_to_cudnn_data_type`, `pygraph.selected_engine` /
+  `.backend_plan_entries()` and the private spellings FlashInfer still uses
+  (`_SdpaThdBinder.supports_*`, `datatypes._torch_to_cudnn_data_type`) are a
+  caller boundary: `test/python/sdpa/frost/test_flashinfer_consumed_surface.py`
+  (host-only) pins each with its signature, including the cc 10.7 + 4.7.x DSL
+  -> False cell of the arch-aware probe. Renaming one means updating
+  FlashInfer's fallbacks first; that test failing is the reminder. The runtime
+  probe takes the part because the DSL floor is 4.7.0 everywhere and 4.8.0 on
+  cc 10.7 (Rule 7): a device-blind "available" is the blind spot that routes a
+  cc 10.7 graph to the backend engine.
 
 ## Frontend-only kernel package layout
 
 ```
 python/cudnn/<operation>/            # or sdpa/<direction>/, gemm/cutedsl/<layout>/<fusion>/
-├── __init__.py                      # exports API class + wrapper via __all__
-├── api.py                           # APIBase subclass + <operation>_wrapper() function
+├── __init__.py                      # exports the public functions via __all__
+├── api.py                           # <op>_<direction>() / <op>_<direction>_jax() functions
 └── <kernel_module>.py               # CuTeDSL kernel implementation(s); some families use csrc/ per-arch trees
 ```
 
@@ -661,6 +702,23 @@ rewritten into a dynamic `ir_loop` and cannot iterate heterogeneous objects
 and `pytest --collect-only` both stay green. After any refactor of a kernel
 body, run that flavor's own tests.
 
+**A `setmaxnreg` register split needs `min_blocks_per_mp=1` on the launch.**
+With `.reqntid` alone (what `block=` emits) ptxas cannot bound the register
+count at entry: it prints C7508 and drops every `setmaxnreg`. The SASS then has
+no `USETMAXREG`, the consumer warps never get their raised budget, and ptxas may
+size every warp for several CTAs per SM — the sm120 dual MoE GEMM fell to 40
+registers with 11 KB of spills and ran 4-6x slower. `.launch(...,
+min_blocks_per_mp=1)` emits `.minnctapersm 1` and makes the split live. The DSL
+never surfaces C7508 (not even under `CUTE_DSL_COMPILER_OPT=warnings`), so the
+numerics tests cannot see a lost split. Once the split is live, the producer
+budget is a hard limit: keep per-lane producer state small (one elected lane
+holding a tile's worth of GATHER rows spilled at 24 registers and made sm120 MoE
+GATHER up to 1.45x slower; each TMA-warp lane now issues its own GATHER4s), and
+accept only warp grids the split fits (`Sm120KernelTemplate.warp_layout_reject`).
+**Detector:** a compile-only SASS pin — one `USETMAXREG.DEALLOC` and one
+`TRY_ALLOC` at the template's counts, plus a spill bound on producer-heavy cases
+(the SDPA pins in `sdpa/frost/test_sdpa_bwd_d256_sm100.py` are the pattern).
+
 **Immutable tensor-map reuse is local to a consumer and a launch.** A persistent
 loader or store warp may skip acquisition only while it keeps using an unchanged
 map it already acquired. Track the sequence/expert per consuming warp, reacquire
@@ -681,24 +739,18 @@ repository benchmark shapes or a documented target workload. A favorable
 synthetic shape establishes a local effect, not representative benefit; it does
 not by itself justify another compile-cache specialization.
 
-## The APIBase contract (`api_base.py`)
+## The public function contract
 
-Every OSS kernel API extends `APIBase` and implements:
-
-- `check_support() -> bool` — validate dtype/shape/stride/arch/config via the `_check_tensor_*` / `_value_error_if` helpers; must set `self._is_supported`. Works on `TensorDesc` (metadata-only tensors), so it runs without GPU storage.
-- `compile()` — calls `self._ensure_support_checked()`, builds and `cute.compile`s the kernel, caches in `self._compiled_kernel`.
-- `execute(..., current_stream=None)` — runs the cached kernel.
-
-`__call__` = compile-if-needed + execute. High-level wrappers (`<op>_wrapper_sm100(...)`) allocate outputs and return a **`TupleDict`** (dict that also unpacks as a tuple) with stable, documented key order. FP4x2 packing: use `_tensor_shape`/`_tensor_stride`, which double the innermost dim when `interpret_uint8_as_fp4x2` is set.
+Public functions (`<op>_<direction>(...)` / `<op>_<direction>_jax(...)`, see `docs/fe-oss-apis/api_conventions.md`) allocate outputs and return them in a stable, documented order. PyTorch functions return a **`TupleDict`** (dict that also unpacks as a tuple). JAX functions return a plain tuple or dict: `jax.jit` rejects `TupleDict`, which is not a registered pytree.
 
 ## Adding a new frontend-only API — required checklist
 
 1. Kernel package under the closest existing family (layout above).
-2. `APIBase` subclass + wrapper in `api.py`.
+2. Public functions in `api.py`.
 3. Exports: family `__init__.py` `__all__` **and** `_LAZY_OPTIONAL_IMPORTS` in `python/cudnn/__init__.py`; register any new package dir in `pyproject.toml` packages list.
 4. Docs: page under `docs/fe-oss-apis/` (family subdir) + link it from `docs/fe-oss-apis/overview.md`.
-5. Tests: `test/python/<op>/cutedsl/test_<op>.py` (+ `_utils.py`/reference), covering check_support pass/fail and numerical reference comparison.
-6. DSL version gate (Rule 7): the route/`check_support` declines with a version-naming error below `CUTEDSL_MIN_VERSION`, and the tests skip there instead of failing.
+5. Tests: `test/python/<op>/cutedsl/test_<op>.py` (+ `_utils.py`/reference), covering supported and unsupported configurations and numerical reference comparison.
+6. DSL version gate (Rule 7): the route declines with a version-naming error below `CUTEDSL_MIN_VERSION`, and the tests skip there instead of failing.
 
 The `cutedsl-kernel-integration` skill (`skills/cutedsl-kernel-integration/`) documents this workflow in detail, including how to classify a kernel into a family — follow it for any kernel integration.
 

@@ -8,6 +8,7 @@ carries none.  Long sequences on few (sequence, head) tiles run as an exact piec
 from __future__ import annotations
 
 import math
+from operator import itemgetter
 
 from cudnn import behavior_note
 from cudnn.engines.base import BaseEngine, CompiledPlan
@@ -60,6 +61,7 @@ class Gdn2FrostEngine(BaseEngine):
         if facts.gate_channels != facts.d_qk:
             raise NotImplementedError(f"Gdn2FrostEngine: g must carry d_qk = {facts.d_qk} channels, got {facts.gate_channels}")
         checkpoint = facts.checkpoint_every_n_tokens
+        checkpoint_dtypes = (cudnn.data_type.FLOAT,) if checkpoint > 16 else (cudnn.data_type.FLOAT, facts.io_dtype)
         if checkpoint and checkpoint % 16 != 0:
             raise NotImplementedError(f"Gdn2FrostEngine: checkpoint_every_n_tokens must be a positive multiple of 16 (got {checkpoint})")
         if not facts.gates_at_ho:
@@ -81,10 +83,10 @@ class Gdn2FrostEngine(BaseEngine):
         for port, got in (("a_log", facts.a_log_dtype), ("dt_bias", facts.dt_bias_dtype)):
             if got not in gate_param_dtypes + (None,):
                 raise NotImplementedError(f"Gdn2FrostEngine: '{port}' must be fp32/bf16/fp16, got {got}")
-        state_dtypes = (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16)
+        state_dtypes = (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
         for port, got in (("initial_state", facts.state_dtype), ("final_state", facts.final_state_dtype)):
             if got not in state_dtypes + (None,):
-                raise NotImplementedError(f"Gdn2FrostEngine: '{port}' must be fp32/bf16, got {got}")
+                raise NotImplementedError(f"Gdn2FrostEngine: '{port}' must be fp32/bf16/fp16, got {got}")
         if facts.is_bwd:
             for port, got, want in (("d_a_log", facts.d_a_log_dtype, facts.a_log_dtype), ("d_dt_bias", facts.d_dt_bias_dtype, facts.dt_bias_dtype)):
                 if want is None and got is not None:
@@ -99,16 +101,17 @@ class Gdn2FrostEngine(BaseEngine):
                 raise NotImplementedError(f"Gdn2FrostEngine: 'd_initial_state' must mirror initial_state ({state_grad_want}), got an unset dtype")
             if facts.dg_dtype not in (facts.g_dtype, None):
                 raise NotImplementedError(f"Gdn2FrostEngine: 'dG' must match 'g' ({facts.g_dtype}), got {facts.dg_dtype}")
-            for port, got in (
-                ("dO", facts.do_dtype),
-                ("state_checkpoints", facts.state_checkpoints_dtype),
-                ("dBeta", facts.dbeta_dtype),
-                ("dW", facts.dw_dtype),
-            ):
+            for port, got in (("dO", facts.do_dtype), ("dBeta", facts.dbeta_dtype), ("dW", facts.dw_dtype)):
                 if facts.io_dtype is not None and got not in (facts.io_dtype, None):
                     raise NotImplementedError(f"Gdn2FrostEngine: '{port}' must match the io dtype, got {got}")
-        elif facts.io_dtype is not None and facts.state_checkpoints_out_dtype not in (facts.io_dtype, None):
-            raise NotImplementedError("Gdn2FrostEngine: 'state_checkpoints' must match the io dtype")
+            if facts.io_dtype is not None and facts.state_checkpoints_dtype not in checkpoint_dtypes + (None,):
+                raise NotImplementedError(
+                    f"Gdn2FrostEngine: 'state_checkpoints' must be {' or '.join(str(w) for w in checkpoint_dtypes)} at checkpoint_every_n_tokens {checkpoint}"
+                )
+        elif facts.io_dtype is not None and facts.state_checkpoints_out_dtype not in checkpoint_dtypes + (None,):
+            raise NotImplementedError(
+                f"Gdn2FrostEngine: 'state_checkpoints' must be {' or '.join(str(w) for w in checkpoint_dtypes)} at checkpoint_every_n_tokens {checkpoint}"
+            )
         if not facts.state_pair_match:
             raise NotImplementedError("Gdn2FrostEngine: initial_state and final_state dtypes must match")
 
@@ -129,7 +132,9 @@ class CompiledGdn2:
 
     def __init__(self, node, kernel_module):
         from .common.piece_chain import DV_SPLIT_TILES, chain_rows_per_cta, choose_pieces, is_dv_split, piece_table_layout
-        from .kernel.gdn2_chain_forward_f16 import build_chain_forward, run_chain_forward
+        from cuda.bindings.driver import CUstream
+
+        from .kernel.gdn2_chain_forward_f16 import CHAIN_FORWARD_BUFFERS, build_chain_forward, run_chain_forward
         from .kernel.gdn2_uncut_forward_f16 import build_uncut_forward, run_uncut_forward
         from .common.split_k import WORK_ITEM_FIELDS
 
@@ -141,6 +146,8 @@ class CompiledGdn2:
         self.build_chain_forward = build_chain_forward
         self.run_chain_forward = run_chain_forward
         self.chain_launch = None
+        self.chain_buffer_names = CHAIN_FORWARD_BUFFERS
+        self.stream_type = CUstream
         self.plan_name = "Gdn2FrostEngine (GDN2)"
         self.device = current_device()
         scale = node.params.get("scale")
@@ -283,9 +290,41 @@ class CompiledGdn2:
         self.index_state_checkpoints = pos.get("state_checkpoints")
         self.index_a_log = pos.get("a_log")
         self.index_dt_bias = pos.get("dt_bias")
+        if self.chain:
+            positions = pos | {name: len(names) + i for i, name in enumerate(self.carve_names)}
+            aliases = {
+                "gate": "g",
+                "o": "O",
+                "seed": "initial_state",
+                "seed_indices": "state_indices",
+                "final_indices": "state_indices",
+                "checkpoints": "state_checkpoints",
+                "scheduler_summary": "scheduler_h",
+                "summary_words": "fused_tensormaps",
+                "prefill_words": "tensormaps",
+            }
+            absent = len(names) + len(self.carve_names)
+            if not self.safe_gate:
+                positions.pop("a_log", None)
+                positions.pop("dt_bias", None)
+            if not self.has_state_checkpoints:
+                positions.pop("state_checkpoints", None)
+            indices = [positions.get(aliases.get(name, name), absent) for name in self.chain_buffer_names]
+            self.chain_buffers = itemgetter(*indices)
+            self.chain_scalars = (
+                int(self.pieces),
+                int(self.n_heads_out),
+                int(self.num_seqs),
+                int(self.checkpoint if self.has_state_checkpoints else 0),
+                float(self.scale),
+            )
 
     def run(self, views, workspace, stream) -> None:
         q = views[self.index_q]
+        if self.chain and self.chain_launch is not None:
+            carved = workspace.carve(self.carve)
+            self.chain_launch(*self.chain_scalars, *self.chain_buffers((*views, *carved, None)), self.stream_type(int(stream or 0)))
+            return
         k = views[self.index_k]
         v = views[self.index_v]
         g = views[self.index_g]
@@ -475,7 +514,9 @@ class CompiledGdn2Bwd:
         q, g, v = node.inputs["q"], node.inputs["g"], node.inputs["v"]
         self.b_t = bwd_module.CFG.B_T
         self.checkpoint_cadence = int(node.params.get("checkpoint_every_n_tokens", 0) or 0)
-        self.coarse_checkpoints = self.has_state_checkpoints and self.checkpoint_cadence > self.b_t
+        self.coarse_checkpoints = self.has_state_checkpoints and (
+            self.checkpoint_cadence > self.b_t or node.inputs["state_checkpoints"].get_data_type().name == "FLOAT"
+        )
         self.needs_recompute = not self.has_state_checkpoints or self.coarse_checkpoints
         total = q.dim[0]
         HQ, HV = q.dim[1], v.dim[1]

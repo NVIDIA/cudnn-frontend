@@ -396,8 +396,14 @@ def _sm100_blk64_auto_kv_splits(
     q2k_block_index: torch.Tensor,
     fixed_block_sparse_num: int,
     max_kv_splits: int = 16,
+    k: Optional[torch.Tensor] = None,
+    v: Optional[torch.Tensor] = None,
 ) -> int:
-    """Choose KV splits for the SM100 blk64 KV-bucketed target cases."""
+    """Choose splits assuming approximately uniform, independent KV indices across Q blocks.
+
+    This metadata-only policy cannot detect shared or local KV neighborhoods.
+    Such high-reuse masks should use explicitly benchmarked split counts.
+    """
     if not q.is_cuda:
         return 1
 
@@ -407,13 +413,40 @@ def _sm100_blk64_auto_kv_splits(
     if kv_blocks <= 1:
         return 1
 
-    # Large-Q workloads already expose enough independent Q tiles to fill the
-    # GPU. Splitting KV adds FP32 partial output traffic and a combine launch
-    # without providing useful extra parallelism.
     batch, heads, seqlen_q, _ = q.shape
     total_q_tiles = batch * heads * _ceil_div_int(seqlen_q, 64)
     if total_q_tiles >= 512:
-        return 1
+        # The large-Q region was measured on BF16 MHA D128 with random indices.
+        # Capacity is not row work for variable counts. Small Q extents, dense
+        # masks and cache-sized per-head K/V regressed despite long KV rows.
+        if (
+            fixed_block_sparse_num <= 0
+            or kv_blocks < 512
+            or seqlen_q < 262144
+            or q.dtype != torch.bfloat16
+            or q.shape[-1] != 128
+            or k is None
+            or v is None
+            or k.shape[1] != heads
+            or v.shape[1] != heads
+            or k.shape[-1] != 128
+            or v.shape[-1] != 128
+            or kv_blocks * 8 > _ceil_div_int(k.shape[2], 64)
+        ):
+            return 1
+        # Device properties are host metadata; never inspect device indices or
+        # counts to estimate reuse. Unknown cache size keeps the conservative path.
+        l2_bytes = getattr(torch.cuda.get_device_properties(q.device), "L2_cache_size", 0)
+        kv_bytes_per_head = k.shape[2] * k.shape[-1] * k.element_size() + v.shape[2] * v.shape[-1] * v.element_size()
+        if l2_bytes <= 0:
+            return 1
+        if kv_blocks >= 900 and kv_bytes_per_head > 2 * l2_bytes and (heads >= 4 or (heads == 1 and kv_blocks >= 1024)):
+            splits = 8
+        elif heads >= 4 and kv_bytes_per_head > l2_bytes:
+            splits = 4
+        else:
+            return 1
+        return max(1, min(splits, int(max_kv_splits), kv_blocks))
 
     if kv_blocks >= 900:
         splits = 8
@@ -590,11 +623,14 @@ def _empty_bwd_workspace_with_zeroed_accum(
     zero_dq_accum: bool,
     device: torch.device,
     zero_kv_accum: bool = True,
+    include_dkv_accum: bool = True,
 ) -> torch.Tensor:
     q_rounded = ((seqlen_q + round_q_to - 1) // round_q_to) * round_q_to
     k_rounded = ((seqlen_k + round_k_to - 1) // round_k_to) * round_k_to
     d_rounded = ((head_dim + round_d_to - 1) // round_d_to) * round_d_to
-    elems_per_bh = 2 * q_rounded + q_rounded * d_rounded + 2 * k_rounded * d_rounded
+    elems_per_bh = 2 * q_rounded + q_rounded * d_rounded
+    if include_dkv_accum:
+        elems_per_bh += 2 * k_rounded * d_rounded
     workspace = torch.empty(
         (
             batch_size,
@@ -606,7 +642,8 @@ def _empty_bwd_workspace_with_zeroed_accum(
     )
     # The (B, H, elems_per_bh) allocation shape is NOT how the kernels read this
     # buffer. They split the raw pointer field-major across all N = B * H entries:
-    #   [all N dPsum][all N LSE][all N dQ accum][all N dK accum][all N dV accum]
+    #   [all N dPsum][all N LSE][all N dQ accum]
+    # followed by dK/dV accumulators when include_dkv_accum is true.
     # so the flat start of each field is N * (per-BH elements of the preceding
     # fields), and the accumulator tail must be zeroed on the flattened view.
     # Rewriting this as workspace[..., accum_offset:].zero_() (per-(B,H) rows)
@@ -1239,6 +1276,7 @@ def _combine_blk64_kv_bucketed_partials(
     lse_partial_phys: torch.Tensor,
     kv_splits: int,
     output_dtype: Optional[torch.dtype] = None,
+    layout: str = "bhsd",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Combine KV-bucketed partial outputs using the shared CuTeDSL combine kernel."""
     if BlockSparseAttnForwardCombine is None:
@@ -1273,16 +1311,19 @@ def _combine_blk64_kv_bucketed_partials(
             seqlen_q,
         ),
     )
-    out_bshd = torch.empty(
-        (batch, seqlen_q, num_heads, head_dim),
+    out_shape = (batch, num_heads, seqlen_q, head_dim) if layout == "bhsd" else (batch, seqlen_q, num_heads, head_dim)
+    out = torch.empty(
+        out_shape,
         dtype=output_dtype,
         device=q.device,
     )
-    lse_bsh = torch.empty(
-        (batch, seqlen_q, num_heads),
+    out_bshd = out.transpose(1, 2) if layout == "bhsd" else out
+    lse = torch.empty(
+        (batch, num_heads, seqlen_q),
         dtype=torch.float32,
         device=q.device,
     )
+    lse_bsh = lse.transpose(1, 2)
     dtype = torch2cute_dtype_map[output_dtype]
     log_max_splits = _ceil_log2_int(kv_splits)
     # Baseline combine geometry; a single configuration is easier to maintain.
@@ -1301,7 +1342,7 @@ def _combine_blk64_kv_bucketed_partials(
         log_max_splits,
         combine_num_threads,
         combine_stages,
-    )
+    ) + (layout,)
     if compile_key not in _combine_blk64_kv_bucketed_partials.compile_cache:
         combine_kernel = BlockSparseAttnForwardCombine(
             dtype=dtype,
@@ -1328,13 +1369,14 @@ def _combine_blk64_kv_bucketed_partials(
             _to_cute_tensor_dynamic_compact_shape(
                 out_bshd,
                 mode=(0, 1, 2),
-                stride_order=(0, 1, 2, 3),
+                stride_order=(0, 2, 1, 3) if layout == "bhsd" else (0, 1, 2, 3),
             ),
             _to_cute_tensor_dynamic_compact_shape(
                 lse_bsh,
                 mode=(0, 1, 2),
                 assumed_align=4,
-                stride_order=(0, 1, 2),
+                leading_dim=1,
+                stride_order=(0, 2, 1),
             ),
             None,
             None,
@@ -1362,9 +1404,6 @@ def _combine_blk64_kv_bucketed_partials(
         current_stream,
     )
 
-    # Match the non-split BHSD/BHS output stride contract.
-    out = out_bshd.transpose(1, 2).contiguous()
-    lse = lse_bsh.transpose(1, 2).contiguous()
     return out, lse
 
 
@@ -1460,9 +1499,7 @@ def bsa_attn_fwd_blk64_cutedsl(
         q_bhsd, k_bhsd, v_bhsd = [maybe_contiguous(t) for t in (q, k, v)]
     else:
         assert layout == "bshd", f"layout must be 'bhsd' or 'bshd', got {layout!r}"
-        q_bhsd = q.transpose(1, 2).contiguous()
-        k_bhsd = k.transpose(1, 2).contiguous()
-        v_bhsd = v.transpose(1, 2).contiguous()
+        q_bhsd, k_bhsd, v_bhsd = [maybe_contiguous(t).transpose(1, 2) for t in (q, k, v)]
 
     batch_size, num_head, seqlen_q, head_dim = q_bhsd.shape
     seqlen_k = k_bhsd.shape[2]
@@ -1547,6 +1584,8 @@ def bsa_attn_fwd_blk64_cutedsl(
                 q_bhsd,
                 q2k_block_index,
                 uniform_block_sparse_num,
+                k=k_bhsd,
+                v=v_bhsd,
             )
     kv_splits_i = _resolve_blk64_split_workspace(
         q_bhsd,
@@ -1597,11 +1636,13 @@ def bsa_attn_fwd_blk64_cutedsl(
             device=q_bhsd.device,
         )
     else:
-        out_bhsd = torch.empty(
-            (batch_size, num_head, seqlen_q, head_dim_v),
+        out_shape = (batch_size, num_head, seqlen_q, head_dim_v) if layout == "bhsd" else (batch_size, seqlen_q, num_head, head_dim_v)
+        out = torch.empty(
+            out_shape,
             dtype=output_dtype,
             device=q_bhsd.device,
         )
+        out_bhsd = out if layout == "bhsd" else out.transpose(1, 2)
         lse = torch.empty(
             (batch_size, num_head, seqlen_q),
             dtype=torch.float32,
@@ -1718,17 +1759,17 @@ def bsa_attn_fwd_blk64_cutedsl(
         )
 
     if kv_splits_i > 1:
-        out_bhsd, lse = _combine_blk64_kv_bucketed_partials(
+        out, lse = _combine_blk64_kv_bucketed_partials(
             q_bhsd,
             out_bhsd,
             lse,
             kv_splits_i,
             output_dtype=output_dtype,
+            layout=layout,
         )
         # Keep split_offsets alive through the combine launch on the same stream.
         _ = split_offsets
 
-    out = out_bhsd if layout == "bhsd" else out_bhsd.transpose(1, 2).contiguous()
     return out, lse
 
 
@@ -2549,7 +2590,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
         assert q2k_block_nums.dtype == torch.int32
         assert q2k_block_nums.shape == (batch_size, num_heads, num_q_blocks)
 
-    bucketed_k2q_offsets, bucketed_k2q_indices, _num_q_groups, _max_k2q_rows_per_group = _build_bucketed_k2q_csr(
+    bucketed_k2q_offsets, bucketed_k2q_indices, num_q_groups, _max_k2q_rows_per_group = _build_bucketed_k2q_csr(
         q2k_block_index,
         block_sparse_num,
         num_kv_blocks,
@@ -2663,6 +2704,10 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
     if dv is None:
         dv = torch.empty_like(v)
 
+    # One Q group gives every KV block one unique CTA owner. For aligned
+    # physical KV64 tiles, that owner can scale/convert dK and dV directly
+    # instead of using FP32 atomic workspaces and postprocessing.
+    use_dkv_postprocess = num_q_groups > 1 or seqlen_k % sparse_block_size != 0
     workspace = _empty_bwd_workspace_with_zeroed_accum(
         batch_size=batch_size,
         num_heads=num_heads,
@@ -2674,6 +2719,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
         round_d_to=8,
         zero_dq_accum=True,
         device=q.device,
+        include_dkv_accum=use_dkv_postprocess,
     )
 
     problem_shape = (seqlen_q, seqlen_k, head_dim, (num_heads, batch_size))
@@ -2686,6 +2732,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
         sparse_block_size,
         arch,
         has_block_sizes,
+        use_dkv_postprocess,
         _tensor_layout_compile_key(dout),
         _tensor_layout_compile_key(out),
         _tensor_layout_compile_key(q),
@@ -2722,6 +2769,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
         bwd_kernel = BlockSparseAttnBackwardSm100Blk64(
             sparse_block_size=sparse_block_size,
             has_block_sizes=has_block_sizes,
+            force_dkv_postprocess=use_dkv_postprocess,
         )
 
         _bsa_attn_bwd_bucketed_k2q_csr.compile_cache[compile_key] = cute.compile(

@@ -14,6 +14,7 @@ Published documentation: https://docs.nvidia.com/deeplearning/cudnn/latest/devel
 ## Graph operation reference
 
 - [Attention (SDPA fwd/bwd, FP8)](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/Attention.md)
+- [Linear Attention (GDN, KDA, GDN-2, GDP, Mamba-2 fwd/bwd, summaries)](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/LinearAttention.md)
 - [Matmul](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/Matmul.md)
 - [Convolutions](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/Convolutions.md)
 - [Normalizations (LayerNorm, RMSNorm, BatchNorm, InstanceNorm)](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/Normalizations.md)
