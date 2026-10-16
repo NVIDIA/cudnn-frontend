@@ -577,6 +577,18 @@ def test_additive_kv_mask_vector_matches_the_fp64_oracle_on_sm100(dtype):
         _t7._check(out, _t7._ref_of(_t7._CASES["dense_nkv2"], q, k, v, ref_kw))
 
 
+@requires_sm100_line
+@pytest.mark.parametrize("form", _t7._SIGNED_SCALE_FORMS)
+@pytest.mark.parametrize("sign", [1.0, -1.0], ids=["positive_scale", "negative_scale"])
+def test_signed_attn_scale_keeps_the_additive_arms_sign_on_sm100(sign, form):
+    """attn_scale = +0.125 and -0.125 on the SM100 row's resident bias and on its additive kv_mask vector, on the public graph route (the
+    review's repro: zero Q / K, S 128, D 32, +2 / -2 by key half, V +1 / -1): the negated plan (BMM1 negates S, |scale| in the kernel) must
+    bind the additive arms' 1 / scale at the same effective magnitude -- O = tanh(2) on every lane at either sign; the positive cell is the
+    control.  The Rubin twin runs the same cells on its row, and the host pin of the template itself lives in the Rubin module."""
+    q, k, v, kw, ref = _t7._signed_scale_inputs(sign, form, torch.bfloat16)
+    _t7._check_signed_scale(_run(q, k, v, **kw), ref)
+
+
 _RING_CELLS = [
     (False, "ring_dense_nkv3_384"),
     (False, "ring_causal_nkv5_640"),

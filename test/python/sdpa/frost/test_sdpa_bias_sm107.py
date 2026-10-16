@@ -944,6 +944,118 @@ def test_bias_matches_the_fp64_oracle_fp16(case):
     _check(out, ref)
 
 
+# The SIGN of attn_scale against the additive arms: a plan with a NEGATIVE attn_scale runs with
+# negate_scores (#1435) -- BMM1 negates S and the kernel runs at |scale| -- and the pre-scale additive FMA of the bias / kv_mask arms
+# (``S_raw + bias * inv_scale``, then the exp2 scale) must take the SAME effective positive magnitude.  The prepared dense template used to
+# bind the SIGNED 1 / scale in that slot, so on such a plan the bias entered with its sign flipped (scale * Q.K - bias) on the graph route
+# (the standalone adapter re-derives the slot per call from |scale| and was right).  The inputs make the whole answer one number: Q = K = 0
+# (the scale multiplies nothing but the additive term), +2 on the first half of the keys and -2 on the other half -- per key, in the io
+# dtype, as the resident [1, H, S, S] block or as the ADDITIVE kv_mask vector [1, 1, 1, S] -- and V = +1 / -1 on the same halves, so
+# softmax_k(bias) . V = tanh(2) on every row and lane at EITHER sign of the scale; the flipped binding reads -tanh(2).  The signed fp64
+# oracle is the detector, and the NEGATED oracle (what the flipped binding computes) is pinned to be what the plan does NOT compute.  Both
+# arch modules run the cells on their row; the HOST pin below reads the template itself off ``build_dense_spec`` without a device.
+_SIGNED_SCALE_S, _SIGNED_SCALE_D, _SIGNED_SCALE_MAG = 128, 32, 0.125
+_SIGNED_SCALE_FORMS = ("bias", "additive_kv_mask")
+
+
+def _signed_scale_inputs(sign, form, dtype):
+    """``(q, k, v, run_kw, ref)`` of the signed-scale cell: ``form`` = "bias" (the resident block) or "additive_kv_mask" (the per-key additive
+    vector through the python-only kv_mask input); ``sign`` = +1 / -1 picks attn_scale = sign * 0.125."""
+    assert form in _SIGNED_SCALE_FORMS, form
+    b, h, s, d = 1, 2, _SIGNED_SCALE_S, _SIGNED_SCALE_D
+    q = torch.zeros(b, s, h, d, device="cuda", dtype=dtype).transpose(1, 2)
+    k = torch.zeros(b, s, h, d, device="cuda", dtype=dtype).transpose(1, 2)
+    v = torch.empty(b, s, h, d, device="cuda", dtype=dtype).transpose(1, 2)
+    v[:, :, : s // 2] = 1.0
+    v[:, :, s // 2 :] = -1.0
+    additive = torch.full((1, h, s, s) if form == "bias" else (b, 1, 1, s), -2.0, device="cuda", dtype=dtype)
+    additive[..., : s // 2] = 2.0
+    scale = sign * _SIGNED_SCALE_MAG
+    run_kw = dict(
+        scale=scale,
+        bias=additive if form == "bias" else None,
+        kv_mask=None if form == "bias" else additive,
+        sdpa_kwargs={},
+        seq_len_kv=None,
+        seq_len_q=None,
+        sink=None,
+    )
+    return q, k, v, run_kw, _ref(q, k, v, scale=scale, bias=additive)  # the vector broadcasts over (B, H, S_q) in the oracle like a bias
+
+
+def _check_signed_scale(out, ref):
+    """O and Stats against the signed oracle, the closed form tanh(2) on every lane, and the negated oracle rejected."""
+    _check(out, ref)
+    o = out["o"].double()
+    torch.testing.assert_close(o, torch.full_like(o, math.tanh(2.0)), **_TOL_O)
+    assert not torch.allclose(
+        o, -ref["o"], **_TOL_O
+    ), "the NEGATED oracle (the flipped-bias binding, scale * Q.K - bias) must be what the plan does NOT compute"
+
+
+@requires_rubin
+@pytest.mark.parametrize("form", _SIGNED_SCALE_FORMS)
+@pytest.mark.parametrize("sign", [1.0, -1.0], ids=["positive_scale", "negative_scale"])
+def test_signed_attn_scale_keeps_the_additive_arms_sign(sign, form):
+    """attn_scale = +0.125 and -0.125 on the Rubin row's resident bias and on its additive kv_mask vector, on the public graph route: the
+    negated plan (BMM1 negates S, |scale| in the kernel) must bind the additive arms' 1 / scale at the same effective magnitude -- O = tanh(2)
+    on every lane at either sign; the positive cell is the control."""
+    q, k, v, kw, ref = _signed_scale_inputs(sign, form, torch.bfloat16)
+    _check_signed_scale(_run(q, k, v, **kw), ref)
+
+
+_D128_HOST_FILES = {"sm100": _KERNEL.parents[1] / "sm100" / "prefill_d128_f16.py", "sm107": _KERNEL}
+
+
+def _dense_plan_stand_in(kernel_file, *, scale):
+    """A device-free stand-in for what ``prepared.build_dense_spec`` reads off an adapter: the host slot order parsed from the kernel file's
+    ``_host`` signature (as the native-binding fixtures read it), a positional entry that launches nothing, and the declared facts of a dense
+    unsplit bf16 [1, 2, 128, 32] plan with the resident bias; ``_score_negated`` follows the scale's sign exactly as the adapter sets it."""
+    import ast
+    import inspect
+    import types
+
+    host = next(n for n in ast.parse(kernel_file.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == "_host")
+    order = [a.arg for a in host.args.args if "Constexpr" not in ast.unparse(a.annotation)]
+
+    def entry(*args):
+        raise AssertionError("the host pin never launches")
+
+    entry.__signature__ = inspect.Signature([inspect.Parameter(n, inspect.Parameter.POSITIONAL_OR_KEYWORD) for n in order])
+    km = types.ModuleType(f"stand_in_{kernel_file.parent.name}_prefill_d128_f16")
+    km._host = entry
+
+    def desc():
+        return SimpleNamespace(dtype="torch.bfloat16", device=SimpleNamespace(index=0))
+
+    return SimpleNamespace(
+        _k_mod=km, _compiled_kernel=SimpleNamespace(_compiled_cache_raw=entry),
+        batch_size=1, h_q=2, h_kv=2, head_dim_qk=_SIGNED_SCALE_D, head_dim_v=_SIGNED_SCALE_D, s_q_max=_SIGNED_SCALE_S, s_k_max=_SIGNED_SCALE_S,
+        paged=False, paged_page_size=None, split_kv=1, q_desc=desc(), k_desc=desc(), v_desc=desc(), o_desc=desc(), lse_desc=None, has_sink=False,
+        bias_desc=desc(), kv_mask_desc=None, seq_kv_lens_present=False, seq_q_lens_present=False, gate_desc=None,
+        is_causal=False, window_size_right=0, causal_bottom_right=False, scale_softmax=float(scale), _score_negated=float(scale) < 0,
+    )  # fmt: skip
+
+
+@pytest.mark.parametrize("arch", sorted(_D128_HOST_FILES))
+@pytest.mark.parametrize("sign", [1.0, -1.0], ids=["positive_scale", "negative_scale"])
+def test_prepared_dense_template_binds_the_additive_arms_inverse_scale_at_the_effective_magnitude(arch, sign):
+    """HOST pin, no device: the argument template ``build_dense_spec`` writes for a resident-bias plan at attn_scale = sign * 0.125 -- the
+    template every graph-route launch copies (``PreparedDenseLaunch.execute`` -> ``bind_dense`` -> ``spec.frame()``).  On the negated plan
+    ``scale_softmax_log2`` AND ``inv_scale_softmax`` are both bound at |scale| -- the exp2 scale 0.125 log2 e and the FMA's 1 / 0.125 = +8 --
+    so the kernel's ``S_raw + bias * inv_scale`` keeps the bias's sign; the signed 1 / scale (-8) is pinned absent."""
+    from cudnn.sdpa.fwd import prepared as prep
+
+    scale = sign * _SIGNED_SCALE_MAG
+    spec = prep.build_dense_spec(_dense_plan_stand_in(_D128_HOST_FILES[arch], scale=scale), scale_softmax=None)
+    assert spec.has_bias and spec.native is None, "a bias plan binds through the python frame (no native binder): the template IS the launch's constants"
+    t, ix = spec.template, spec.index
+    assert t[ix["scale_softmax_log2"]] == pytest.approx(abs(scale) * math.log2(math.e))
+    assert t[ix["inv_scale_softmax"]] == pytest.approx(1.0 / abs(scale)), (arch, sign, t[ix["inv_scale_softmax"]])
+    # the per-call frame copies the slot unchanged: the graph route binds no scale of its own
+    assert spec.frame()[ix["inv_scale_softmax"]] == t[ix["inv_scale_softmax"]]
+
+
 # Two bodies -- the HW-max kv_mask-only body and the software-tree bias + mask body -- each at the dense base, the band + padding,
 # the zero-length batch, and the body's other geometry (d64 at cga2 / GQA).
 _KV_MASK_CELLS = [
