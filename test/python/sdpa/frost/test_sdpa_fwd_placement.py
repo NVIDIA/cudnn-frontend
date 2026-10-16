@@ -61,8 +61,16 @@ def recommendations(monkeypatch):
 
 @pytest.mark.L0
 def test_known_default_and_opt_in_rows_are_offered(monkeypatch):
-    default_rows = {_SM100, _SM120, "sdpa_fwd_prefill_sm107", "sdpa_fwd_prefill_sm90", "sdpa_fwd_prefill_sm100_fp8", "sdpa_fwd_prefill_sm107_mxfp8"}
-    opt_in_rows = {"sdpa_fwd_prefill_sm80", "sdpa_fwd_prefill_sm100_mxfp8", "sdpa_fwd_prefill_sm107_fp8", "sdpa_fwd_prefill_sm120_mxfp8"}
+    default_rows = {
+        _SM100,
+        _SM120,
+        "sdpa_fwd_prefill_sm107",
+        "sdpa_fwd_prefill_sm90",
+        "sdpa_fwd_prefill_sm100_fp8",
+        "sdpa_fwd_prefill_sm107_fp8",
+        "sdpa_fwd_prefill_sm107_mxfp8",
+    }
+    opt_in_rows = {"sdpa_fwd_prefill_sm80", "sdpa_fwd_prefill_sm100_mxfp8", "sdpa_fwd_prefill_sm120_mxfp8"}
     offered = _FAMILY.offered_ids()
     assert default_rows <= offered.keys()
     assert opt_in_rows.isdisjoint(offered)
@@ -384,6 +392,79 @@ def test_propose_ranks_the_rubin_mxfp8_row_first_without_the_flag(monkeypatch, k
     quant = dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_mxfp8=True, s_q=4096)
     assert heuristics.propose(kind, _facts(device_cc=(10, 7), **quant), {name: _OFFERED[name]}) == plans + [BACKEND]
     assert heuristics.propose(kind, _facts(device_cc=(10, 0), **quant), {name: _OFFERED[name]}) == [BACKEND] + plans
+
+
+_SM107_FP8_DENSE = dict(b=1, h_q=16, h_kv=2, s_q=4096, s_kv=4096, d_qk=256, d_v=256, causal=True, bottom_right=True)
+_SM107_FP8_QUANT = dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_fp8=True, device_sm_count=216)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over",
+    [dict(), dict(d_qk=512, d_v=512), dict(causal=False, bottom_right=False), dict(bottom_right=False, wants_stats=True), dict(s_q=1, causal=False)],
+)
+def test_sm107_fp8_placement_leads_d256_d512_on_exact_cc107(over):
+    """The cc 10.7 per-tensor FP8 row leads at exact d256 / d512 on exact cc 10.7, and trails on any other device."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107_fp8")
+    values = {**_SM107_FP8_DENSE, **_SM107_FP8_QUANT, **over}
+    assert placement.place(spec, _facts(device_cc=(10, 7), **values)) == placement.LEAD
+    for cc in ((10, 8), (11, 0)):
+        assert placement.place(spec, _facts(device_cc=cc, **values)) == placement.TRAIL, cc
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over",
+    [
+        dict(d_qk=128, d_v=128),
+        dict(d_qk=192, d_v=128),
+        dict(dtype=cudnn.data_type.FP8_E5M2),
+        dict(thd=True),
+        dict(has_paged_kv=True),
+        dict(padded=True),
+        dict(window_left=127),
+        dict(right_band_widening=True, right_bound=16),
+        dict(has_sink=True),
+        dict(o_block_scale=32),
+        dict(has_epilogue_gate=True),
+    ],
+)
+def test_sm107_fp8_placement_trails_outside_the_measured_domain(over):
+    """d128 / d192 and every graph feature the A/B did not cover keep the backend first."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107_fp8")
+    values = {**_SM107_FP8_DENSE, **_SM107_FP8_QUANT, **over}
+    assert placement.place(spec, _facts(device_cc=(10, 7), **values)) == placement.TRAIL
+
+
+@pytest.mark.L0
+def test_sm107_fp8_placement_trails_one_kv_tile_with_few_q_tiles():
+    """The launch-bound floor reads its bounds from the module, so it pins the gate's structure, not a measured boundary."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107_fp8")
+    kv, tiles = placement.SM107_FP8_TINY_MAX_KV, placement.SM107_FP8_TINY_MAX_Q_TILES
+    values = {**_SM107_FP8_DENSE, **_SM107_FP8_QUANT, "b": 1, "h_q": tiles, "h_kv": 1, "s_q": 32, "s_kv": kv, "causal": False, "bottom_right": False}
+    assert placement.place(spec, _facts(device_cc=(10, 7), **values)) == placement.TRAIL
+    assert placement.place(spec, _facts(device_cc=(10, 7), **{**values, "s_kv": kv + 1})) == placement.LEAD
+    assert placement.place(spec, _facts(device_cc=(10, 7), **{**values, "h_q": tiles + 1, "h_kv": 1})) == placement.LEAD
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("kind", ["A", "FALLBACK"])
+def test_propose_ranks_the_rubin_fp8_row_first_without_the_flag(monkeypatch, kind):
+    """The arm is wired into place(): with recommend mocked and the flag deleted, propose puts the row ahead of the backend
+    block on cc 10.7 at d256 and behind it at d128."""
+    name = "sdpa_fwd_prefill_sm107_fp8"
+    plans = [PlanConfig(_OFFERED[name], object())]
+    monkeypatch.setattr(heuristics, "recommend", Mock(return_value=plans))
+    values = {**_SM107_FP8_DENSE, **_SM107_FP8_QUANT}
+    offered = {name: _OFFERED[name]}
+    assert heuristics.propose(kind, _facts(device_cc=(10, 7), **values), offered) == plans + [BACKEND]
+    assert heuristics.propose(kind, _facts(device_cc=(10, 7), **{**values, "d_qk": 128, "d_v": 128}), offered) == [BACKEND] + plans
 
 
 @pytest.mark.L0

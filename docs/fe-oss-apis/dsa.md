@@ -256,17 +256,20 @@ between waves, and fixed-order reductions produce `dKV` and `d_sink`. Both
 specializations keep the public workspace capacity of 128 FP32 dKV planes.
 
 Other deterministic envelopes with H16/H32/H64/H96/H128 keep the bounded-wave
-M64 implementation. Queries run in same-stream waves of 128 CTAs; CTA
-`i` is the sole writer of FP32 dKV shard `i` in each wave. H16/H32 use a masked
-M64 head tile. H96/H128 split each query wave into ordered M64 head-block
-launches, preserving single-writer ownership without multiplying the number
-of shards. Kernel launch ordering serializes both head blocks and shard reuse
-across waves. A fixed-order two-stage reduction combines the shards, and one
-CTA per head reduces `d_sink`.
-
-The deterministic dKV workspace capacity on either path is
-`128 * round_up(total_S_kv, 8) * round_up(D, 8) * sizeof(float)` bytes. Use
-`scratch_workspace_bytes()` as the authoritative full scratch size.
+M64 implementation. It selects 32 dKV shards for `total_S_q <= 128`, 64 for
+`129..256`, and 128 for larger query batches. Queries run in same-stream waves
+with one CTA per shard; CTA lane `i` is the sole writer of FP32 dKV shard `i`
+in each wave. H16/H32 use a masked M64 head tile. H96/H128 split each query
+wave into ordered M64 head-block launches, preserving single-writer ownership
+without multiplying the number of shards. Kernel launch ordering serializes
+both head blocks and shard reuse across waves, so the protocol needs neither
+semaphores nor cooperative launch. The 32-shard specialization converts with
+one fixed-order reduction; the 64- and 128-shard specializations first fold
+groups of eight and then combine those groups in fixed order. One CTA per head
+reduces `d_sink`. The additional dKV workspace is
+`selected_shards * round_up(total_S_kv, 8) * round_up(D, 8) * sizeof(float)`
+bytes. Use `scratch_workspace_bytes()` as the authoritative full scratch size;
+a larger reusable workspace remains valid.
 Treat this as a reproducibility requirement rather than a performance-tuning
 knob: keep the default `False` when bitwise run-to-run stability is not needed.
 

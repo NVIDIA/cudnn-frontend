@@ -1086,12 +1086,14 @@ Where:
 - $D_{qk}$ is the embedding dimension per head of query and key
 - $D_{v}$ is the embedding dimension per head of value
 
-##### Amax S
+##### Amax S (deprecated)
 
-`Amax_S` is the maximum of $S = \text{softmax}(P)$ over the whole tensor, before `scale_s`. Without dropout, every entry of $S$ is at most 1, so deriving `scale_s` from the E4M3 maximum and an amax of 1 (`448.f`) never saturates $S$, whatever the previous step's value was. With dropout probability $p$, the graph scales kept entries by $1/(1-p)$ before `scale_s`, so `scale_s` = $448(1-p)$ is a conservative choice that keeps the same guarantee. If, in addition, there is no `sink_token` and every row has at least one unmasked key, every row of $S$ sums to 1 and the value is at least $1/S_{kv}$; for example, row 0 of a top-left causal mask (one key) gives exactly 1.
+`Amax_S` is deprecated. Leave it virtual (do not call `set_output(True)` on it) and set `scale_s` from the bounds below: `448.f` (the E4M3 maximum) without dropout, $448(1-p)$ with dropout probability $p$, and $448 / (|c| \cdot \max |m|)$ with a custom dropout mask $m$ and scale $c$ ($448/c$ for a 0/1 mask and $c > 0$; when $c = 0$ or $m$ is all zero, kept entries are 0 and any finite `scale_s`, such as `448.f`, is safe). Declaring it as an output restricts the graph to cuDNN backend engines, because the FROST engines do not produce it. On some shapes that costs about 2x: on Rubin, a d256 GQA causal FP8 prefill runs 1.7-2.3x slower on the backend than on the FROST FP8 row. FE logs a warning, once per process, when a graph declares it on a device where a FROST FP8 row would otherwise consider the graph.
 
-- `Amax_S` is optional: leave the output virtual (do not call `set_output(True)` on it) if you do not consume it.
-- The FROST engines do not produce `Amax_S`. A graph that declares it as an output is declined by every FROST FP8 row, so it runs only if a cuDNN backend engine supports it; otherwise the graph has no supported plan (for example the FP8 decode cases in [#1415](https://github.com/NVIDIA/cudnn-frontend/issues/1415)).
+A data-derived `scale_s` gains nothing over `448.f`. `Amax_S` is the maximum of $S = \text{softmax}(P)$ over the whole tensor, before `scale_s`. Without dropout, every entry of $S$ is at most 1, so deriving `scale_s` from the E4M3 maximum and an amax of 1 (`448.f`) never saturates $S$, whatever the previous step's value was. With dropout probability $p$, the graph scales kept entries by $1/(1-p)$ before `scale_s`, so `scale_s` = $448(1-p)$ is a conservative choice that keeps the same guarantee. A custom dropout mask $m$ with scale $c$ multiplies kept entries by $c \cdot m$, so $448 / (|c| \cdot \max |m|)$ keeps it. If, in addition, there is no `sink_token` and every row has at least one unmasked key, every row of $S$ sums to 1 and the value is at least $1/S_{kv}$; for example, row 0 of a top-left causal mask (one key) gives exactly 1.
+
+- E4M3 is a floating-point format, so a `scale_s` above `448.f` (from an `Amax_S` below 1) does not change the relative precision of $S$; it only moves the underflow threshold lower.
+- A graph that declares `Amax_S` is declined by every FROST FP8 row, so it runs only if a cuDNN backend engine supports it; otherwise the graph has no supported plan (for example the FP8 decode cases in [#1415](https://github.com/NVIDIA/cudnn-frontend/issues/1415)).
 - On SM100, the backend currently reports a value below the true maximum when $S_{q}$ is short ([#1613](https://github.com/NVIDIA/cudnn-frontend/issues/1613)).
 
 #### Samples and tests

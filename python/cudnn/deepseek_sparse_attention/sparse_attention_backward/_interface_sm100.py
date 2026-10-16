@@ -1,6 +1,7 @@
 # Copyright (c) 2026, Jerry Chen
 # SPDX-License-Identifier: MIT
 import math
+from functools import lru_cache
 from typing import Optional, Tuple
 
 import torch
@@ -13,7 +14,11 @@ from cudnn.deepseek_sparse_attention.utils.runtime import device_capability as _
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 from cudnn.frost.buffers import memset_zero_async
 from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
-from .dsa_bwd_sm100_deterministic import FlashAttentionDSABackwardSm100Deterministic
+from .dsa_bwd_sm100_deterministic import (
+    FlashAttentionDSABackwardSm100Deterministic,
+    _deterministic_kernel_class_for_shards,
+    deterministic_kernel_class,
+)
 
 torch2cute_dtype_map = {
     torch.float16: cutlass.Float16,
@@ -22,6 +27,11 @@ torch2cute_dtype_map = {
 }
 
 _BLACKWELL_CAPABILITIES = ((10, 0), (10, 3))
+_SM100_FAMILY_ARCH_FLAGS = {
+    (10, 0): "sm_100a",
+    (10, 3): "sm_103a",
+    (10, 7): "sm_107a",
+}
 _WORKSPACE_ALIGNMENT = 128
 _DETERMINISTIC_HEAD_COUNTS = (16, 32, 64, 96, 128)
 _STATIC_TOPK_STRIDE_BACKENDS = ("h16_m128", "h32_m64", "h96_h64_h32")
@@ -45,8 +55,14 @@ def _workspace_shapes_sm100(
     head_dim: int,
     num_heads: int,
     deterministic: bool,
+    backend: Optional[str] = None,
 ) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
-    """Return byte-shaped LSE/OdO and dKV scratch layouts for one launch."""
+    """Return byte-shaped LSE/OdO and dKV scratch layouts for one launch.
+
+    Generic deterministic M64 launches use the adaptive shard specialization.
+    An unspecified backend remains conservative because the deterministic
+    H128 two-CTA kernels retain their fixed 128-plane public workspace.
+    """
     acc_dtype = cutlass.Float32
     workspace_lse_odo_shape = FlashAttentionDSABackwardSm100._get_workspace_size_LSE_OdO(
         total_s_q,
@@ -55,7 +71,10 @@ def _workspace_shapes_sm100(
         1,
         acc_dtype,
     )
-    dkv_kernel_cls = FlashAttentionDSABackwardSm100Deterministic if deterministic else FlashAttentionDSABackwardSm100
+    if deterministic:
+        dkv_kernel_cls = deterministic_kernel_class(total_s_q) if backend == "generic_m64" else FlashAttentionDSABackwardSm100Deterministic
+    else:
+        dkv_kernel_cls = FlashAttentionDSABackwardSm100
     workspace_dkv_shape = dkv_kernel_cls._get_workspace_size_dKV(
         total_s_kv,
         head_dim,
@@ -71,14 +90,24 @@ def flash_attn_bwd_sm100_workspace_size(
     head_dim: int,
     num_heads: int,
     deterministic: bool = False,
+    *,
+    backend: Optional[str] = None,
 ) -> int:
-    """Return the reusable caller scratch required by the SM100 launch."""
+    """Return the reusable caller scratch required by one SM100 launch.
+
+    The generic deterministic M64 backend selects a 32-, 64-, or 128-plane
+    dKV layout from ``total_s_q``. H128 two-CTA and unspecified backends use
+    the conservative fixed 128-plane layout. The result includes alignment
+    padding and is the minimum byte count for a contiguous ``torch.uint8``
+    workspace; :func:`flash_attn_bwd_sm100` also accepts a larger buffer.
+    """
     workspace_lse_odo_shape, workspace_dkv_shape = _workspace_shapes_sm100(
         total_s_q,
         total_s_kv,
         head_dim,
         num_heads,
         deterministic,
+        backend,
     )
     return _align_workspace_bytes(math.prod(workspace_lse_odo_shape)) + _align_workspace_bytes(math.prod(workspace_dkv_shape))
 
@@ -172,7 +201,7 @@ def _select_sm100_backend(
     return "generic_m64", 64
 
 
-def _get_sm100_kernel_class(backend: str, deterministic: bool = False):
+def _get_sm100_kernel_class(backend: str, deterministic: bool = False, total_s_q: Optional[int] = None):
     """Load the selected implementation without perturbing other variants.
 
     Each variant lives in its own CuTe DSL class: embedding variant
@@ -200,8 +229,104 @@ def _get_sm100_kernel_class(backend: str, deterministic: bool = False):
 
         return FlashAttentionDSABackwardSm100H96
     if deterministic:
-        return FlashAttentionDSABackwardSm100Deterministic
+        if total_s_q is None:
+            raise ValueError("deterministic SM100 kernel selection requires total_s_q")
+        return deterministic_kernel_class(total_s_q)
     return FlashAttentionDSABackwardSm100
+
+
+def _fake_compact_tensor(dtype, shape, alignment=16):
+    """Construct a storage-free row-major tensor for plan-time compilation."""
+    return cute.runtime.make_fake_compact_tensor(
+        dtype,
+        shape,
+        stride_order=tuple(reversed(range(len(shape)))),
+        assumed_align=alignment,
+    )
+
+
+@lru_cache(maxsize=None)
+def _compile_deterministic_sm100(
+    device_index: int,
+    device_capability: Tuple[int, int],
+    backend: str,
+    dtype: torch.dtype,
+    head_dim: int,
+    head_dim_v: int,
+    num_heads: int,
+    max_topk: int,
+    has_topk_length: bool,
+    deterministic_shards: int,
+):
+    """Compile one device-owned, shape-dynamic artifact from plan metadata.
+
+    Query and KV extents remain symbolic, while dtype, head geometry, top-k
+    width, optional-length presence, and shard count are compile-time facts.
+    The returned launchable belongs to ``device_index``'s CUDA context and may
+    be reused only for plans with the same cached signature.
+    """
+    gpu_arch = _SM100_FAMILY_ARCH_FLAGS.get(device_capability)
+    if gpu_arch is None:
+        raise ValueError(f"deterministic SM100 DSA backward requires an SM100-family device, got {device_capability}")
+    if dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(f"unsupported deterministic SM100 dtype {dtype}")
+
+    if backend == "generic_m64":
+        kernel_cls = _deterministic_kernel_class_for_shards(deterministic_shards)
+    else:
+        kernel_cls = _get_sm100_kernel_class(backend, True)
+        required_shards = kernel_cls.num_dkv_shards
+        if required_shards != deterministic_shards:
+            raise ValueError(f"deterministic backend {backend!r} requires {required_shards} workspace planes, got {deterministic_shards}")
+
+    element_dtype = torch2cute_dtype_map[dtype]
+    total_s_q, total_s_kv = cute.sym_int(), cute.sym_int()
+    q = _fake_compact_tensor(element_dtype, (total_s_q, num_heads, head_dim))
+    kv = _fake_compact_tensor(element_dtype, (total_s_kv, head_dim))
+    out = _fake_compact_tensor(element_dtype, (total_s_q, num_heads, head_dim_v))
+    lse = _fake_compact_tensor(cutlass.Float32, (total_s_q, num_heads), alignment=8)
+    sink = _fake_compact_tensor(cutlass.Float32, (num_heads,))
+    indices = _fake_compact_tensor(cutlass.Int32, (total_s_q, max_topk))
+    lengths = _fake_compact_tensor(cutlass.Int32, (total_s_q,), alignment=4) if has_topk_length else None
+    workspace_lse = _fake_compact_tensor(cutlass.Uint8, (1, num_heads, cute.sym_int(), 8))
+    workspace_dkv = _fake_compact_tensor(cutlass.Uint8, (1, deterministic_shards, cute.sym_int(), head_dim * 4))
+    problem_shape = (
+        cutlass.Int32(1),
+        cutlass.Int32(1),
+        cutlass.Int32(head_dim),
+        (cutlass.Int32(num_heads), cutlass.Int32(1)),
+    )
+    kernel = kernel_cls(
+        element_dtype=element_dtype,
+        head_dim=head_dim,
+        head_dim_v=head_dim_v,
+        block_tile=64,
+        max_topk=max_topk,
+    )
+    # Compile under the declared plan device. ``device_index`` is also part of
+    # this function's cache key because CuTe launchables belong to the CUDA
+    # context that compiled them.
+    with torch.cuda.device(device_index):
+        return cute.compile(
+            kernel,
+            problem_shape,
+            q,
+            kv,
+            out,
+            out,
+            lse,
+            sink,
+            indices,
+            lengths,
+            q,
+            kv,
+            sink,
+            workspace_lse,
+            workspace_dkv,
+            cutlass.Float32(1.0),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+            options=compile_options(gpu_arch=gpu_arch),
+        )
 
 
 def flash_attn_bwd_sm100(
@@ -221,6 +346,7 @@ def flash_attn_bwd_sm100(
     workspace: Optional[torch.Tensor] = None,
     *,
     d_sink: Optional[torch.Tensor] = None,
+    _compiled_kernel=None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """FlashAttention (DSA) Backward Pass for Blackwell (SM100), with K=V.
 
@@ -243,9 +369,16 @@ def flash_attn_bwd_sm100(
         dq: preallocated (total_S_q, nheads, headdim), same dtype as q
         dkv: preallocated (total_S_kv, headdim), same dtype as kv
         d_sink: preallocated (nheads,) float32
-        deterministic: use ordered bounded-wave scratch accumulation
+        deterministic: use ordered bounded-wave scratch accumulation; the
+            supported BF16 H128 envelopes retain their two-CTA kernels
+        current_stream: CUDA stream handle for all initialization, main, and
+            reduction launches; defaults to the current CUDA stream (the plan
+            API selects Q's device context before entering this function)
         workspace: reusable uint8 scratch sized by
             ``flash_attn_bwd_sm100_workspace_size``
+        _compiled_kernel: internal plan-owned launchable whose compile-time
+            metadata must match the runtime tensors; direct callers should
+            leave this unset to use the lazy compile cache
 
     Returns:
         (dq, dkv, d_sink) -- flat layout gradients
@@ -350,7 +483,8 @@ def flash_attn_bwd_sm100(
             workspace=workspace,
             deterministic=deterministic,
         )
-    kernel_cls = _get_sm100_kernel_class(backend, deterministic)
+    kernel_cls = _get_sm100_kernel_class(backend, deterministic, total_S_q)
+    deterministic_shards = kernel_cls.num_dkv_shards if deterministic else 0
     uses_h128_two_cta = backend == "h128_2cta_m64"
     batch_size = 1
 
@@ -362,6 +496,7 @@ def flash_attn_bwd_sm100(
         head_dim,
         num_head,
         deterministic,
+        backend,
     )
     workspace_LSE_OdO, workspace_dKV = _carve_workspace_sm100(
         workspace,
@@ -375,11 +510,11 @@ def flash_attn_bwd_sm100(
         assert kernel_cls._get_workspace_size_LSE_OdO(total_S_q, head_dim, num_head, batch_size, cutlass.Float32) == tuple(workspace_lse_odo_shape)
         assert kernel_cls._get_workspace_size_dKV(total_S_kv, head_dim, batch_size, cutlass.Float32) == tuple(workspace_dkv_shape)
 
-    # Every route initializes its FP32 dKV accumulator and overwrites dKV.
-    # The ordinary two-CTA prologue clears d_sink before atomic updates;
-    # its deterministic finalizer overwrites d_sink. Other routes retain
-    # the shared output reset below.
-    if not uses_h128_two_cta:
+    # Every route clears its FP32 dKV accumulator in-kernel and its finalizer
+    # overwrites every public dKV element, so dkv needs no reset. Ordinary
+    # sum_dSink uses atomics and needs this reset; deterministic sum_dSink and
+    # the H128 two-CTA zero_init overwrite/clear d_sink themselves.
+    if not uses_h128_two_cta and not deterministic:
         memset_zero_async(d_sink.data_ptr(), d_sink.numel() * d_sink.element_size(), int(current_stream))
 
     problem_shape = (total_S_q, total_S_kv, head_dim, (num_head, batch_size))
@@ -387,12 +522,25 @@ def flash_attn_bwd_sm100(
     dtype = torch2cute_dtype_map[q.dtype]
 
     has_topk_length = topk_length is not None
-    # ``backend`` and ``deterministic`` together select the kernel class, so
-    # both belong in the key.  The tail stays ``(max_topk, has_topk_length)``
-    # for the dispatch tests that inspect it.
-    compile_key = (backend, deterministic, dtype, head_dim, head_dim_v, num_head, block_tile, max_topk, has_topk_length)
+    # Backend, deterministic mode, and the finite shard specialization select
+    # the kernel class. The tail stays ``(max_topk, has_topk_length)`` for the
+    # dispatch tests that inspect it.
+    compile_key = (
+        backend,
+        deterministic,
+        dtype,
+        head_dim,
+        head_dim_v,
+        num_head,
+        block_tile,
+        deterministic_shards,
+        device.index,
+        max_topk,
+        has_topk_length,
+    )
 
-    if compile_key not in flash_attn_bwd_sm100.compile_cache:
+    compiled_kernel = _compiled_kernel
+    if compiled_kernel is None and compile_key not in flash_attn_bwd_sm100.compile_cache:
         q_tensor = to_cute_tensor(q, divisibility=head_dim)
         kv_tensor = to_cute_tensor(kv, divisibility=head_dim)
         out_tensor = to_cute_tensor(out, divisibility=head_dim_v)
@@ -440,9 +588,11 @@ def flash_attn_bwd_sm100(
                 current_stream,
                 options=compile_options(),
             )
+    if compiled_kernel is None:
+        compiled_kernel = flash_attn_bwd_sm100.compile_cache[compile_key]
 
     with torch.cuda.nvtx.range(f"flash_attn_bwd_sm100_kernel[{backend}]"):
-        flash_attn_bwd_sm100.compile_cache[compile_key](
+        compiled_kernel(
             problem_shape,
             q,
             kv,
