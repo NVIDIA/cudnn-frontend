@@ -59,7 +59,7 @@ import cutlass.experimental.primitives as nvvm
 import cutlass.experimental.cuda.tensor_map as tma
 
 from ..common.thd import emit_seq_descs, emit_tile_seq_descs, TENSOR_MAP_QWORDS
-from cudnn.frost.tile_dsl.barrier import MBarrier, Producer, launch_dependent_grids, wait_on_dependent_grids
+from cudnn.frost.tile_dsl.barrier import MBarrier, Producer, wait_on_dependent_grids
 from cudnn.frost.tile_dsl.handles import SmemTile, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.mma import mma_step
 from cudnn.frost.tile_dsl.pointwise import fadd2, ffma2, fmul2, fp32_to_fp16, movmatrix_16b, opaque_f32_zero, opaque_i32, sigmoid
@@ -72,7 +72,7 @@ from .gdn2_prep_config import CFG
 USE_PDL = True
 LOG2_E: float = 1.4426950408889634
 DEFAULT_GATE_LOWER_BOUND: float = -5.0
-L2_NORM_EPS: float = 1.0e-12
+L2_NORM_EPS: float = 1.0e-6
 
 
 class Gdn2PrepBars(NamedTuple):
@@ -400,9 +400,8 @@ def compute_warp_group(
             k_sum_sq = k_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 4, 31, kind=nvvm.Shfl.BFLY))
             k_sum_sq = k_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 2, 31, kind=nvvm.Shfl.BFLY))
             k_sum_sq = k_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 1, 31, kind=nvvm.Shfl.BFLY))
-            norm_floor_sq = cutlass.Float32(L2_NORM_EPS * L2_NORM_EPS)
-            q_inv_norm = cute.math.rsqrt(cute.math.max(q_sum_sq, norm_floor_sq), fastmath=True)
-            k_inv_norm = cute.math.rsqrt(cute.math.max(k_sum_sq, norm_floor_sq), fastmath=True)
+            q_inv_norm = cute.math.rsqrt(q_sum_sq + cutlass.Float32(L2_NORM_EPS), fastmath=True)
+            k_inv_norm = cute.math.rsqrt(k_sum_sq + cutlass.Float32(L2_NORM_EPS), fastmath=True)
 
         # ---- Beta guard ----------------------------------------------------------
         if cutlass.const_expr(cfg.beta_guard):
@@ -1077,8 +1076,6 @@ def frost_gdn2_prep(
         desc_q_decay_base,
         desc_t_base,
     )
-    if cutlass.const_expr(USE_PDL):
-        launch_dependent_grids()
 
 
 @dataclass

@@ -315,6 +315,7 @@ def test_gnn_mha_gat_uses_current_stream():
     node = torch.randn((3, 8), device="cuda")
     weights = torch.randn((16,), device="cuda")
     stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         actual = mha_gat(graph, node, weights, num_heads=2)
     stream.synchronize()

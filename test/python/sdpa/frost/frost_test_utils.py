@@ -10,6 +10,7 @@ re-derived per file. Five files each carried their own copy pinned to exactly
 while the engines they test serve the whole line.
 """
 
+import contextlib
 import hashlib
 import json
 import os
@@ -17,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import threading
 from typing import NamedTuple
 
 import pytest
@@ -90,6 +92,31 @@ def _dsl_usable():
 
 _DSL_OK, _DSL_WHY = _dsl_usable()
 requires_dsl = pytest.mark.skipif(not _DSL_OK, reason=_DSL_WHY or "cutedsl available")
+
+
+@contextlib.contextmanager
+def process_watchdog(seconds: float, what: str):
+    """Kill THIS process (``os._exit(70)``) if the block runs longer than ``seconds``.
+
+    For a kernel that can wedge its CUDA context: a wedged launch never returns to Python, so neither a pytest timeout
+    plugin (not installed here) nor a signal handler (``torch.cuda.synchronize`` holds the GIL inside C++) can end the
+    test -- only a daemon timer thread can, and exiting the whole process is the only way to free the GPU.  Exit code 70
+    marks a watchdog kill (under xdist the worker crash is reported and the rest of the suite continues).  Wrap only the
+    arm that can wedge, with a budget well above its compile + execute time.
+    """
+
+    def _abort():
+        sys.stderr.write(f"\n[process_watchdog] {what} exceeded {seconds:.0f} s -- killing the test process (exit 70)\n")
+        sys.stderr.flush()
+        os._exit(70)
+
+    timer = threading.Timer(seconds, _abort)
+    timer.daemon = True
+    timer.start()
+    try:
+        yield
+    finally:
+        timer.cancel()
 
 
 def _dsl_installed() -> bool:
@@ -167,6 +194,18 @@ _CUTE_DTYPE = {
 }
 
 
+def check_decode_q_rows(host, sq):
+    """The direct driver's Q-row guard, the contract the production binder validates: a decode body WITHOUT the token-unit
+    axis covers ``S_q x HEADS_PER_TILE <= N_Q`` only and rejects more rows; a body that declares ``Q_TOKEN_UNITS`` serves
+    any ``S_q`` as ``ceil(S_q / Q_BOX_TOKENS)`` units per head group, so the guard yields.  ``host`` is the module's host
+    entry (its ``__globals__`` is the compiled module's namespace)."""
+    import inspect
+
+    namespace = inspect.unwrap(host).__globals__
+    if "N_Q" in namespace and not namespace.get("Q_TOKEN_UNITS", False) and sq * namespace["HEADS_PER_TILE"] > namespace["N_Q"]:
+        raise ValueError(f"decode Q rows exceed the compiled {namespace['N_Q']}-row tile")
+
+
 def launch_f16(
     fn,
     q,
@@ -211,8 +250,7 @@ def launch_f16(
         cfg = namespace["CFG"]
         if cfg.PACK_GQA and h != kh * cfg.QH_PER_KH:
             raise ValueError(f"PACK_GQA requires H_q == H_kv * {cfg.QH_PER_KH}; got H_q={h}, H_kv={kh}")
-        if "N_Q" in namespace and sq * namespace["HEADS_PER_TILE"] > namespace["N_Q"]:
-            raise ValueError(f"decode Q rows exceed the compiled {namespace['N_Q']}-row tile")
+        check_decode_q_rows(host, sq)
     if paged:
         skv, n_pages = block_table_tensor.shape[1] * page_size, k.shape[0]
         k_st, v_st = (k.stride(0), k.stride(1), k.stride(2)), (v.stride(0), v.stride(1), v.stride(2))
@@ -253,6 +291,27 @@ def launch_f16(
         # hosts that do not carry them.
         ragged_q_addr=0,
         ragged_q_div=1,
+        # The d256 half bodies' epilogue-gate slots (a pointer + a runtime stride triple, required by their host ABI): the gate is a
+        # module specialization no direct test enables, so this is the no-gate pair the binders fill; filtered out for hosts that
+        # do not carry them.
+        gate_ptr=None,
+        gate_strides=(0, 0, 0),
+        # The d128 prefill hosts' ten APPENDED operand slots (both arch trees): the score side outputs, the additive bias, the
+        # per-key kv_mask and the pre-scale bias divisor.  They are explicit on the production ABI (the prepared binder fills
+        # them from the frame, compile()'s fakes shape them; a Python default would leave the compiled host un-persistable), so
+        # a direct launch fills them too -- with the values of a plan WITHOUT the arms: None pointers, zero strides, unit
+        # broadcast extents, inv_scale 1.0 (CFG.BIAS_MODE / KV_MASK_FORM fold the paths out of every direct test's rendering;
+        # the stride / divisor slots are then unread).  Filtered out for hosts that do not carry them.
+        score_max_ptr=None,
+        score_sum_exp_ptr=None,
+        score_max_strides=(0, 0, 0),
+        score_sum_exp_strides=(0, 0, 0),
+        bias_ptr=None,
+        bias_strides=(0, 0, 0),
+        bias_extents=(1, 1),
+        kv_mask_ptr=None,
+        kv_mask_batch_stride=0,
+        inv_scale_softmax=1.0,
     )
     params = set(inspect.signature(host if host is not None else fn).parameters)
     fn(**{name: value for name, value in kw.items() if name in params}, stream=stream)
@@ -418,3 +477,154 @@ def run_sass_probe(tmp_path, *, probe_src: str, arch: str, params: dict, tag: st
     md5 = next((ln.split()[1] for ln in out if ln.startswith("CUBIN_MD5 ")), "")
     print(f"\n{tag} {arch} {params} SASS: {stats}; module says {expect}; cubin md5 {md5}")
     return SassProbe(stats, expect, md5)
+
+
+def cuda_launch_names(*runs):
+    """The CUDA kernel launches per callable under ``torch.profiler``, by name and in launch order (memset / memcpy excluded),
+    or ``None`` when the profiler records no CUDA activity here (CUPTI absent, or failing to start -- the ONLY failure this
+    swallows).  An exception raised by a callable propagates.  The caller skips EXPLICITLY on ``None`` (an empty capture is
+    unavailable validation, never a missing-kernel finding) and asserts on the returned names OUTSIDE any handler, so a wrong
+    launch census fails the test instead of printing "unverified" (the launch censuses of the MXFP8 backward, review of PR #1355)."""
+    import torch
+    from torch.profiler import ProfilerActivity, profile
+
+    names = []
+    for run in runs:
+        prof = profile(activities=[ProfilerActivity.CUDA])
+        try:
+            prof.start()
+        except Exception:  # noqa: BLE001 -- CUPTI unavailable on this box: the caller's bitwise pins stand on their own
+            return None
+        try:
+            run()
+            torch.cuda.synchronize()
+        finally:
+            prof.stop()
+        names.append(
+            [
+                e.name
+                for e in prof.events()
+                if e.device_type == torch.autograd.DeviceType.CUDA and "memset" not in e.name.lower() and "memcpy" not in e.name.lower()
+            ]
+        )
+    return names if names and names[0] else None
+
+
+def cuda_launch_counts(*runs):
+    """CUDA kernel launches per callable under ``torch.profiler`` (memset / memcpy excluded), or ``None`` when the profiler
+    records no CUDA activity here (CUPTI absent, or failing to start -- the ONLY failure this swallows).  An exception raised
+    by a callable propagates, and the caller asserts on the returned counts OUTSIDE any handler, so a wrong launch count
+    fails the test instead of printing "unverified" (the launch-count pins of the external-delta tests, review of PR #1352).
+    The capture itself is ``cuda_launch_names``."""
+    names = cuda_launch_names(*runs)
+    return None if names is None else [len(n) for n in names]
+
+
+def run_d512_delayed_observer(tmp_path, engine):
+    """Delay a passive CTA before observing a reused empty slot; check liveness and gradients.
+
+    The delay belongs only to the test's private template copy. No production knob or
+    scheduling probability is involved. A child process bounds an unfixed kernel's hang.
+    """
+    from pathlib import Path
+
+    import cudnn
+
+    script = tmp_path / "delayed_observer.py"
+    script.write_text(textwrap.dedent(r"""
+        import hashlib, json, os, sys
+        from pathlib import Path
+        test_root, expected_fe, engine, work = sys.argv[1:]
+        sys.path.insert(0, test_root)
+        import conftest  # Preserve allocator setup and Transformer Engine import ordering.
+        sys.path.insert(0, str(Path(test_root) / "sdpa/frost"))
+        import torch
+        import cudnn
+        from cudnn.sdpa.bwd import api_dsl
+        from frost_test_utils import process_watchdog, select_engine
+        import test_sdpa_bwd_dsl_sm100 as ref
+
+        assert Path(cudnn.__file__).resolve() == Path(expected_fe).resolve()
+        api_dsl.STAGE2_2X2 = True
+        original = api_dsl.load_template
+        served = []
+
+        def delayed(path, params, tag="template"):
+            p = Path(path)
+            if p.name == "bprop_d512_f16_2x2.py":
+                assert p.parent.name == ("sm107" if engine == "sdpa_bwd_sm107_d512" else "sm100")
+                source = p.read_text()
+                begin = source.index("def _ldg_kv_tile(")
+                end = source.index("\n@cute.jit\ndef _tmaldg_warp_group(", begin)
+                section = source[begin:end]
+                anchor = "    for c in cutlass.range_constexpr(CFG.N_CHUNKS):\n"
+                assert section.count(anchor) == 1
+                # Chunk 0 of the second KV tile reuses slot 0 on both the four-
+                # and eight-stage rings. CTA 3 is passive on this even chunk.
+                delay = (
+                    "        if cutlass.const_expr(c == 0):\n"
+                    "            if (pair_id == cutlass.Int32(1)) & (is_leader == False) & (kv_loop == cutlass.Int32(1)) & (tile_no == cutlass.Int32(0)):\n"
+                    "                observer_start = cute.arch.globaltimer()\n"
+                    "                while cute.arch.globaltimer() - observer_start < cutlass.Int64(10_000_000):\n"
+                    "                    pass\n"
+                )
+                patched = source[:begin] + section.replace(anchor, anchor + delay) + source[end:]
+                target = Path(work) / (p.parent.name + "_delayed_observer.py")
+                target.write_text(patched)
+                served.append(dict(path=str(p), sha256=hashlib.sha256(source.encode()).hexdigest(), params=repr(params)))
+                path = str(target)
+            return original(path, params, tag)
+
+        api_dsl.load_template = delayed
+        torch.manual_seed(1519)
+        b, h, sq, skv, d = 1, 4, 256, 1024, 512
+        tensors = {n: ref._bshd(b, s, h, d) for n, s in (("q", sq), ("k", skv), ("v", skv), ("do", sq))}
+        o, lse, _, dq, dk, dv = ref._reference(*(tensors[n] for n in ("q", "k", "v", "do")))
+        expected = (dq, dk, dv)
+        tensors["o"] = torch.empty_like(tensors["q"]).copy_(o)
+        tensors["stats"] = lse.unsqueeze(-1).contiguous()
+        for n, like in (("dq", "q"), ("dk", "k"), ("dv", "v")):
+            tensors[n] = torch.empty_like(tensors[like])
+        g, ports, outputs = ref._build_graph(b, h, h, sq, skv, d, d**-0.5)
+        select_engine(g, engine)
+        g.check_support()
+        g.build_plans()
+        ports.update(zip(("dq", "dk", "dv"), outputs))
+        pack = {ports[n]: t for n, t in tensors.items()}
+        workspace = torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
+        assert served, "the delayed twin template did not serve the graph"
+        print("DELAYED_OBSERVER_SOURCE", json.dumps(served), flush=True)
+
+        def check():
+            for name, want in zip(("dq", "dk", "dv"), expected):
+                got = tensors[name].float()
+                cos = torch.nn.functional.cosine_similarity(got.flatten(), want.flatten(), dim=0).item()
+                rel = ((got - want).abs().max() / max(want.abs().max().item(), 1e-30)).item()
+                assert cos > ref._TOL_COS and rel < ref._TOL_REL, (name, cos, rel)
+
+        # Compilation is outside the execution watchdog; a slow compiler is not a hang.
+        with process_watchdog(45.0, "D512 delayed empty-phase observer"):
+            g.execute(pack, workspace)
+            torch.cuda.synchronize()
+            check()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                g.execute(pack, workspace)
+            for _ in range(8):
+                for name in ("dq", "dk", "dv"):
+                    tensors[name].fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+                check()
+        print("DELAYED_OBSERVER_PASS", flush=True)
+    """))
+    env = dict(os.environ, CUDNN_FRONTEND_ENABLE_FROST_ENGINES="1", CUDNN_FRONTEND_COMPILED_CACHE=str(tmp_path / "compiled"))
+    proc = subprocess.run(
+        [sys.executable, str(script), str(Path(__file__).resolve().parents[2]), cudnn.__file__, engine, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        env=env,
+    )
+    (tmp_path / "delayed_observer.log").write_text(proc.stdout + "\n--- stderr ---\n" + proc.stderr)
+    assert proc.returncode == 0 and "DELAYED_OBSERVER_PASS" in proc.stdout, f"rc={proc.returncode}\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"

@@ -26,7 +26,10 @@ def main() -> None:
     args = parser.parse_args()
     debug_repro = os.environ.get("CUDNN_DEBUG_REPRO", "0") == "1"
 
-    lines = log_parser.read_lines(args.logfile)
+    try:
+        lines = log_parser.read_lines(args.logfile)
+    except FileNotFoundError as exc:
+        raise SystemExit(f"error: {exc}")
     entries = list(log_parser.iter_context_entries(lines))
     if not entries:
         raise SystemExit("No context entries found in log.")

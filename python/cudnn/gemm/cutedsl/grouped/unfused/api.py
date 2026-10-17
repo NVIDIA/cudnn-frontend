@@ -26,6 +26,8 @@ from cudnn.tensor_adapter import (
 )
 
 from ._bf16_api import GroupedGemmBf16API, _validate_pointer_tensor
+from ..backend_utils import row_major_layout
+from ..canonical import b_nkl, check_canonical_contiguous
 from ..moe_utils import MoEWeightMode
 
 __all__ = ["GroupedGemmBf16API"]
@@ -180,8 +182,8 @@ def _validate_output(
     tensor: torch.Tensor,
     *,
     name: str,
-    shape: Tuple[int, int, int],
-    stride: Tuple[int, int, int],
+    shape: Tuple[int, ...],
+    stride: Tuple[int, ...],
     dtype: torch.dtype,
     device: torch.device,
 ) -> None:
@@ -209,6 +211,7 @@ def _normalize_call(
     cd_major: str,
     m_aligned: int,
     framework: str,
+    b_major: str = "k",
 ) -> tuple[bool, int, int, int]:
     is_dense = b_tensor is not None
     is_discrete = b_ptrs is not None
@@ -225,8 +228,9 @@ def _normalize_call(
 
     if _convert_to_cutlass_data_type(a_tensor.dtype) is not cutlass.BFloat16:
         raise ValueError(f"a_tensor must have dtype torch.bfloat16, got {a_tensor.dtype}")
-    if len(get_shape(a_tensor)) != 3 or get_shape(a_tensor)[2] != 1:
-        raise ValueError(f"a_tensor must have shape (m, k, 1), got {get_shape(a_tensor)}")
+    a_shape = get_shape(a_tensor)
+    if len(a_shape) not in (2, 3) or (len(a_shape) == 3 and a_shape[2] != 1):
+        raise ValueError(f"a_tensor must have shape (m, k) or (m, k, 1), got {a_shape}")
     if prob_tensor is None:
         raise ValueError("prob_tensor is required")
     if cd_major != "n":
@@ -244,11 +248,15 @@ def _normalize_call(
     if compute_capability < 100:
         raise RuntimeError(f"GroupedGemmSm100 requires SM100+, found SM{compute_capability}")
 
-    tensor_m, k, _ = get_shape(a_tensor)
+    tensor_m, k = a_shape[:2]
     if tensor_m % 256 != 0:
         raise ValueError(f"a_tensor M dimension must be 256-aligned, got {tensor_m}")
-    if get_shape(prob_tensor) != (tensor_m, 1, 1):
-        raise ValueError(f"prob_tensor must have shape {(tensor_m, 1, 1)}, got " f"{get_shape(prob_tensor)}")
+    if get_shape(prob_tensor) not in ((tensor_m,), (tensor_m, 1, 1)):
+        raise ValueError(f"prob_tensor must have shape {(tensor_m,)} or {(tensor_m, 1, 1)}, got " f"{get_shape(prob_tensor)}")
+    if framework == "torch":
+        check_canonical_contiguous(a_tensor, b_tensor, prob_tensor)
+    elif len(a_shape) == 2:
+        raise ValueError("Canonical BF16 layouts require torch tensors")
     if _convert_to_cutlass_data_type(prob_tensor.dtype) is not cutlass.Float32:
         raise ValueError(f"prob_tensor must have dtype torch.float32, got {prob_tensor.dtype}")
     if is_dense:
@@ -260,7 +268,7 @@ def _normalize_call(
             raise ValueError(f"b_tensor must have dtype torch.bfloat16, got {b_tensor.dtype}")
         if len(get_shape(b_tensor)) != 3:
             raise ValueError(f"b_tensor must have shape (n, k, experts), got {get_shape(b_tensor)}")
-        n, b_k, experts = get_shape(b_tensor)
+        n, b_k, experts = b_nkl(b_tensor, b_major)
         if b_k != k:
             raise ValueError(f"b_tensor K dimension ({b_k}) must match a_tensor ({k})")
     else:
@@ -312,52 +320,52 @@ def grouped_gemm_wrapper_sm100(
     # pure function of the operands' metadata plus the scalar config, both of which are
     # in the key below. So a hit skips the derivation and reuses its result. It does not
     # skip any check: op.execute() still validates every operand, including the data
-    # pointers the key deliberately omits. Only the allocate-the-outputs case is memoized;
-    # caller-supplied c/d need _validate_output and fall through.
-    _memo_key = None
-    if c_tensor is None and d_tensor is None:
-        _memo_key = (
-            type(a_tensor),
-            _operand_meta(a_tensor),
-            _operand_meta(padded_offsets),
-            _operand_meta(alpha_tensor),
-            _operand_meta(prob_tensor),
-            _operand_meta(b_tensor),
-            _operand_meta(b_ptrs),
-            _operand_meta(bias_tensor),
-            n,
-            b_dtype,
-            b_major,
-            acc_dtype,
-            c_dtype,
-            d_dtype,
-            cd_major,
-            tuple(mma_tiler_mn),
-            None if cluster_shape_mn is None else tuple(cluster_shape_mn),
-            vector_f32,
-            m_aligned,
-            generate_c,
-            use_dynamic_sched,
-            os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"),
+    # pointers the key deliberately omits. Caller-supplied c/d are part of the key, so a hit
+    # reuses the _validate_output outcome for the same metadata.
+    _memo_key = (
+        type(a_tensor),
+        _operand_meta(a_tensor),
+        _operand_meta(c_tensor),
+        _operand_meta(d_tensor),
+        _operand_meta(padded_offsets),
+        _operand_meta(alpha_tensor),
+        _operand_meta(prob_tensor),
+        _operand_meta(b_tensor),
+        _operand_meta(b_ptrs),
+        _operand_meta(bias_tensor),
+        n,
+        b_dtype,
+        b_major,
+        acc_dtype,
+        c_dtype,
+        d_dtype,
+        cd_major,
+        tuple(mma_tiler_mn),
+        None if cluster_shape_mn is None else tuple(cluster_shape_mn),
+        vector_f32,
+        m_aligned,
+        generate_c,
+        use_dynamic_sched,
+        os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"),
+    )
+    memo = _wrapper_memo.get(_memo_key)
+    if memo is not None:
+        op, framework, expected_shape, expected_stride, memo_c_dtype, memo_d_dtype, is_dense = memo
+        internal_c = c_tensor if c_tensor is not None else _allocate_output(framework, expected_shape, expected_stride, memo_c_dtype, a_tensor.device)
+        d_out = d_tensor if d_tensor is not None else _allocate_output(framework, expected_shape, expected_stride, memo_d_dtype, a_tensor.device)
+        op.execute(
+            a_tensor=a_tensor,
+            c_tensor=internal_c,
+            d_tensor=d_out,
+            padded_offsets=padded_offsets,
+            alpha_tensor=alpha_tensor,
+            b_tensor=b_tensor if is_dense else None,
+            b_ptrs=None if is_dense else b_ptrs,
+            bias_tensor=bias_tensor,
+            prob_tensor=prob_tensor,
+            current_stream=current_stream,
         )
-        memo = _wrapper_memo.get(_memo_key)
-        if memo is not None:
-            op, framework, expected_shape, expected_stride, memo_c_dtype, memo_d_dtype, is_dense = memo
-            internal_c = _allocate_output(framework, expected_shape, expected_stride, memo_c_dtype, a_tensor.device)
-            d_out = _allocate_output(framework, expected_shape, expected_stride, memo_d_dtype, a_tensor.device)
-            op.execute(
-                a_tensor=a_tensor,
-                c_tensor=internal_c,
-                d_tensor=d_out,
-                padded_offsets=padded_offsets,
-                alpha_tensor=alpha_tensor,
-                b_tensor=b_tensor if is_dense else None,
-                b_ptrs=None if is_dense else b_ptrs,
-                bias_tensor=bias_tensor,
-                prob_tensor=prob_tensor,
-                current_stream=current_stream,
-            )
-            return TupleDict(d_tensor=d_out, c_tensor=internal_c if generate_c else None)
+        return TupleDict(d_tensor=d_out, c_tensor=internal_c if generate_c else None)
 
     framework = detect_framework(a_tensor)
     if framework not in ("torch", "jax"):
@@ -383,9 +391,9 @@ def grouped_gemm_wrapper_sm100(
         cd_major,
         m_aligned,
         framework,
+        b_major,
     )
-    expected_shape = (tensor_m, n_out, 1)
-    expected_stride = (n_out, 1, tensor_m * n_out)
+    expected_shape, expected_stride = row_major_layout(tensor_m, n_out, len(get_shape(a_tensor)) == 2)
 
     def _allocate(dtype):
         return _allocate_output(framework, expected_shape, expected_stride, dtype, a_tensor.device)
@@ -478,8 +486,7 @@ def grouped_gemm_wrapper_sm100(
         op.compile()
         _cache_of_GroupedGemmSm100Objects[cache_key] = op
 
-    if _memo_key is not None:
-        _wrapper_memo[_memo_key] = (op, framework, expected_shape, expected_stride, c_dtype, d_dtype, is_dense)
+    _wrapper_memo[_memo_key] = (op, framework, expected_shape, expected_stride, c_dtype, d_dtype, is_dense)
 
     op.execute(
         a_tensor=a_tensor,
@@ -498,6 +505,8 @@ def grouped_gemm_wrapper_sm100(
         c_tensor=internal_c if generate_c else None,
     )
 
+
+grouped_gemm_wrapper_sm100.supports_bf16_canonical_layouts = True
 
 __all__ = [
     "GroupedGemmSm100",

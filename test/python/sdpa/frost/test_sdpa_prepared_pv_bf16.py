@@ -10,14 +10,14 @@ from frost_test_utils import requires_dsl
 pytestmark = [requires_dsl]
 
 
-def _case(d=128, dtype=torch.float8_e4m3fn, stats=True, amax=True, v=None, has_amax_o=True):
+def _case(d=128, dtype=torch.float8_e4m3fn, stats=True, amax=True, v=None, has_amax_o=True, b=2):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("PV-BF16 needs pre-Rubin SM100")
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
     from test_sdpa_fwd_mxfp8_sm100 import _quantize
 
     gen = torch.Generator(device="cuda").manual_seed(577)
-    b, hq, hk, s = 2, 4, 2, 128
+    hq, hk, s = 4, 2, 128
     qf = torch.randn((b, hq, s, d), device="cuda", generator=gen) * 0.5
     kf = torch.randn((b, hk, s, d), device="cuda", generator=gen) * 0.5
     q, sfq, dq, _ = _quantize(qf, b, hq, s, d, dtype, columnwise=False)
@@ -114,7 +114,6 @@ def test_pv_bf16_prepared_rebind_and_replay(d, dtype, stats, amax, monkeypatch):
 
         guards.setattr(cute.runtime, "make_fake_tensor", forbidden)
         guards.setattr(cute.runtime, "make_fake_compact_tensor", forbidden)
-        guards.setattr(api, "_dummy", forbidden)
         guards.setattr(api, "_can_prepare_fp8", forbidden)
         guards.setattr(api, "_can_prepare_mxfp8", forbidden)
         guards.setattr(torch.Tensor, "view", forbidden)
@@ -141,7 +140,7 @@ def test_pv_bf16_prepared_rebind_and_replay(d, dtype, stats, amax, monkeypatch):
     assert torch.all(storage[..., 128:] == 79)
     with pytest.raises(ValueError, match="does not consume sf_v"):
         api.execute(**bufs, workspace=ws, sf_v=bufs["sf_k"])
-    with pytest.raises(ValueError, match="bfloat16"):
+    with pytest.raises(ValueError, match="bfloat16|runtime buffer dtype does not match"):
         api.execute(**dict(bufs, v_tensor=bufs["v_tensor"].to(dtype)), workspace=ws)
 
 

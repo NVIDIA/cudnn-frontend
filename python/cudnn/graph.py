@@ -83,6 +83,7 @@ def graph(
     io_data_type: cudnn.data_type = cudnn.data_type.HALF,
     intermediate_data_type: cudnn.data_type = cudnn.data_type.FLOAT,
     compute_data_type: cudnn.data_type = cudnn.data_type.FLOAT,
+    **graph_kwargs,
 ) -> cudnn.pygraph:
     """
     Context manager for creating and managing a CUDNN graph object.
@@ -92,6 +93,9 @@ def graph(
         name: Name of the graph for debugging purposes.
         io_data_type: Data type for input/output tensors.
         compute_data_type: Data type for computation.
+        **graph_kwargs: Forwarded to ``cudnn.pygraph`` (for example
+            ``is_cuda_graph_replay_expected=True`` for a caller that captures
+            ``graph.execute`` into a CUDA graph and replays it).
 
     Yields:
         Tuple[cudnn.pygraph, List]: (graph object, list of tensors to get UIDs for)
@@ -102,6 +106,7 @@ def graph(
         io_data_type=io_data_type,
         intermediate_data_type=intermediate_data_type,
         compute_data_type=compute_data_type,
+        **graph_kwargs,
     )
 
     yield g, []

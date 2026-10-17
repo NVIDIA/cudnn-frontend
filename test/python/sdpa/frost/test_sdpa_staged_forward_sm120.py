@@ -102,6 +102,7 @@ def _check(tensors, storage, features=False):
 @pytest.mark.parametrize("split,features", [(1, False), (1, True), (4, False)])
 def test_staged_forward_uses_pointer_host(d, fp8, split, features, monkeypatch):
     import cutlass.cute as cute
+    from sdpa.frost.native_binding_utils import forbid_python_forward_binding
 
     api, tensors, storage = _case(d, fp8=fp8, split=split, features=features)
     monkeypatch.setattr(cute.runtime, "make_fake_tensor", lambda *a, **k: pytest.fail("staged forward constructed a tensor fake"))
@@ -110,6 +111,8 @@ def test_staged_forward_uses_pointer_host(d, fp8, split, features, monkeypatch):
     backing = torch.full((required + 257,), 177, device="cuda", dtype=torch.uint8)
     workspace = backing[128 : 128 + required + 1]
     api.compile()
+    assert api._staged_spec.core.native is not None
+    forbid_python_forward_binding(monkeypatch)
     assert api.scratch_workspace_bytes() == required
     assert api._staged_spec is not None and api._dense_spec is None
     _execute(api, tensors, workspace)
@@ -294,6 +297,19 @@ def test_staged_invalid_operand_is_rejected_before_any_copy(fp8, bad, monkeypatc
     monkeypatch.setattr(torch.Tensor, "copy_", lambda *a, **k: pytest.fail("invalid operand reached a staging copy"))
     monkeypatch.setattr(api._staged_spec.core, "fn", lambda *a, **k: pytest.fail("invalid operand reached attention"))
     with pytest.raises(ValueError):
+        _execute(api, tensors, workspace)
+
+
+def test_staged_rejects_mxfp8_input_scales(monkeypatch):
+    """A per-tensor FP8 conversion plan has no MXFP8 scale operand: one passed to execute raises before any
+    staging copy or attention launch."""
+    api, tensors, _ = _case(fp8=True)
+    api.compile()
+    workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
+    tensors["sf_q"] = torch.full((1, 4, 1, 512), 127, device="cuda", dtype=torch.uint8)
+    _forbid_staging(monkeypatch)
+    monkeypatch.setattr(api._staged_spec.core, "fn", lambda *a, **k: pytest.fail("MXFP8 scales reached attention"))
+    with pytest.raises(ValueError, match="MXFP8 plans only"):
         _execute(api, tensors, workspace)
 
 

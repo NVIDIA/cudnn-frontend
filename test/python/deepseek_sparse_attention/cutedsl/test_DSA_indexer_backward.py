@@ -11,8 +11,9 @@ import torch.nn.functional as F
 import inspect
 import threading
 
-from test_utils import torch_fork_set_rng
+from test_utils import assert_bitwise_runs, torch_fork_set_rng
 
+from cudnn.api_base import ws_align
 from deepseek_sparse_attention.cutedsl.dsa_utils import dsa_init, with_dsa_indexer_backward_params, _require_sm100
 from deepseek_sparse_attention.cutedsl.dsa_reference import (
     _indexer_predict_distribution,
@@ -21,16 +22,16 @@ from deepseek_sparse_attention.cutedsl.dsa_reference import (
 
 
 def _require_exact_sm100():
-    """Skip unless the current device is exactly SM100 (capability ``(10, 0)``).
+    """Keep hardware-validation cases on the available SM100 runner.
 
     ``dsa_init(min_compute_capability=100)`` means "SM100 **or newer**" — it
     compares ``major * 10 + minor`` — so an SM103/SM107/SM120 runner falls
-    straight through it. ``backend="sm100_v2"`` is exact-``(10, 0)`` by
-    construction (``check_support`` raises otherwise), so the v2 tests need
-    the exact gate on top of ``dsa_init``'s floor.
+    straight through it. The public gate also accepts SM103, covered by a
+    capability unit test; end-to-end SM103 execution is intentionally not
+    required by this suite yet.
     """
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("backend='sm100_v2' requires an SM100 (10, 0) GPU")
+        pytest.skip("this hardware-validation case requires an SM100 (10, 0) GPU")
 
 
 def _allocate(cfg, sm_scale: float):
@@ -181,6 +182,150 @@ def test_DSA_indexer_backward_wrapper(
         )
 
 
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_DSA_indexer_backward_wrapper_compact_h32():
+    """SM100 keeps the public tensors at H32 while using an internal M64 tile."""
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    _require_sm100()
+
+    cfg = {
+        "b": 1,
+        "s_q": 128,
+        "s_kv": 512,
+        "head_dim": 128,
+        "qhead_per_kv_head": 32,
+        "topk": 512,
+    }
+    index_q, weights, index_k, attn_score, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
+    attn_score_ref = attn_score.clone()
+    index_score_ref = index_score.clone()
+
+    # Back the compact outputs with canary tails. The internal M64 dQ tile
+    # must be clipped by the H32 tensor map, and dW must predicate heads 32:64.
+    guard_elems = 256
+    guard_value = 23.0
+    dq_storage = torch.full((index_q.numel() + guard_elems,), guard_value, dtype=index_q.dtype, device=index_q.device)
+    dw_storage = torch.full((weights.numel() + guard_elems,), guard_value, dtype=weights.dtype, device=weights.device)
+    d_index_q = dq_storage[: index_q.numel()].view_as(index_q)
+    d_weights = dw_storage[: weights.numel()].view_as(weights)
+    d_index_k = torch.empty_like(index_k, dtype=torch.float32)
+
+    result = DSA.indexer_backward_wrapper(
+        index_q,
+        weights,
+        index_k,
+        attn_score,
+        index_score,
+        topk_indices,
+        sm_scale=1.0,
+        loss_coeff=float(cfg["b"] * cfg["s_q"]),
+        grad_loss=torch.ones((), dtype=torch.float32, device=index_q.device),
+        block_I=128,
+        d_index_q=d_index_q,
+        d_weights=d_weights,
+        d_index_k=d_index_k,
+        backend="default",
+    )
+
+    assert result["d_index_q"] is d_index_q
+    assert result["d_weights"] is d_weights
+    assert result["d_index_k"] is d_index_k
+    torch.testing.assert_close(dq_storage[index_q.numel() :], torch.full_like(dq_storage[index_q.numel() :], guard_value), rtol=0.0, atol=0.0)
+    torch.testing.assert_close(dw_storage[weights.numel() :], torch.full_like(dw_storage[weights.numel() :], guard_value), rtol=0.0, atol=0.0)
+    check_ref_indexer_backward(
+        index_q,
+        weights,
+        index_k,
+        attn_score_ref,
+        index_score_ref,
+        topk_indices,
+        d_index_q,
+        d_weights,
+        d_index_k,
+        sm_scale=1.0,
+        grad_scale=1.0,
+    )
+
+
+@pytest.mark.L0
+def test_DSA_indexer_backward_sm100_rejects_untested_sub_m64_heads():
+    """The new compact contract adds H32 only; it does not silently widen the domain."""
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    _require_sm100()
+
+    b, s_q, s_k, h, d, topk = 1, 1, 128, 48, 128, 128
+    plan = DSA.IndexerBackward(
+        sample_index_q=torch.empty((b, s_q, h, d), dtype=torch.bfloat16, device="cuda"),
+        sample_weights=torch.empty((b, s_q, h), dtype=torch.bfloat16, device="cuda"),
+        sample_index_k=torch.empty((b, s_k, d), dtype=torch.bfloat16, device="cuda"),
+        sample_d_index_q=torch.empty((b, s_q, h, d), dtype=torch.bfloat16, device="cuda"),
+        sample_d_weights=torch.empty((b, s_q, h), dtype=torch.bfloat16, device="cuda"),
+        sample_d_index_k=torch.empty((b, s_k, d), dtype=torch.bfloat16, device="cuda"),
+        sample_attn_score=torch.empty((b, s_q, topk), dtype=torch.float32, device="cuda"),
+        sample_index_score=torch.empty((b, s_q, topk), dtype=torch.float32, device="cuda"),
+        sample_topk_indices=torch.empty((b, s_q, topk), dtype=torch.int32, device="cuda"),
+        sm_scale=1.0,
+        block_I=128,
+    )
+    with pytest.raises(ValueError, match="requires H=32 or H>=64"):
+        plan.check_support()
+
+
+@pytest.mark.L0
+def test_DSA_indexer_backward_packed_shapes_reuse_compilation(monkeypatch):
+    """GitHub #1188: packed training changes (B, Sq, Sk) every step; once a TopK bucket's
+    kernels are compiled, new shapes must run without compiling again."""
+    _require_sm100()
+    try:
+        import cutlass.cute as cute
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    def forbidden_compile(*args, **kwargs):
+        raise AssertionError("indexer backward recompiled for a new packed shape")
+
+    for i, (s_q, s_kv) in enumerate([(64, 1024), (160, 3072), (96, 2048)]):
+        cfg = dict(b=1, s_q=s_q, s_kv=s_kv, head_dim=128, qhead_per_kv_head=64, topk=512)
+        index_q, weights, index_k, attn_score, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
+        attn_score_ref, index_score_ref = attn_score.clone(), index_score.clone()
+        result = DSA.indexer_backward_wrapper(
+            index_q,
+            weights,
+            index_k,
+            attn_score,
+            index_score,
+            topk_indices,
+            sm_scale=1.0,
+            loss_coeff=float(s_q),
+            grad_loss=torch.ones((), dtype=torch.float32, device="cuda"),
+            block_I=128,
+        )
+        torch.cuda.synchronize()
+        check_ref_indexer_backward(
+            index_q,
+            weights,
+            index_k,
+            attn_score_ref,
+            index_score_ref,
+            topk_indices,
+            result["d_index_q"],
+            result["d_weights"],
+            result["d_index_k"],
+            sm_scale=1.0,
+            grad_scale=1.0,
+        )
+        if i == 0:
+            monkeypatch.setattr(cute, "compile", forbidden_compile)
+
+
 # ===========================================================================
 # Regression coverage for the output/plan-signature validation on the default
 # indexer backward (SM100/SM90):
@@ -299,6 +444,12 @@ def test_DSA_indexer_backward_fp32_dindexk_zeroed_internally():
     assert max_diff < 1.0, f"fp32 d_index_k not zeroed internally: max|nonzero-init - zero-init| = {max_diff:.3e}"
 
 
+def _workspace_for(plan, device="cuda"):
+    """The caller-owned scratch a plan carves at execute (R2): ``None`` when it needs none."""
+    nbytes = plan.scratch_workspace_bytes()
+    return torch.empty(nbytes, dtype=torch.uint8, device=device) if nbytes else None
+
+
 def _noncontiguous_like(sample):
     """A tensor with ``sample``'s shape/dtype/device but a strided (non-dense)
     layout, so its stride differs from a contiguous descriptor's."""
@@ -335,6 +486,7 @@ def test_DSA_indexer_backward_direct_plan_shape_stride_mismatch_raises():
     )
     assert plan.check_support()
     plan.compile()
+    ws = _workspace_for(plan)
 
     b, s_q, _, _ = iq.shape
     topk = tk.shape[-1]
@@ -347,7 +499,9 @@ def test_DSA_indexer_backward_direct_plan_shape_stride_mismatch_raises():
     aq_bad_pre = aq_bad.clone()
     isc_pre = isc.clone()
     with pytest.raises(ValueError):
-        plan.execute(iq, w, ik, torch.empty_like(iq), torch.empty_like(w), torch.empty_like(ik), aq_bad, isc, tk, grad_loss, loss_coeff=loss_coeff)
+        plan.execute(
+            iq, w, ik, torch.empty_like(iq), torch.empty_like(w), torch.empty_like(ik), aq_bad, isc, tk, grad_loss, loss_coeff=loss_coeff, workspace=ws
+        )
     torch.cuda.synchronize()
     assert torch.equal(aq_bad, aq_bad_pre), "attn_score mutated before the shape check (fail-dirty)"
     assert torch.equal(isc, isc_pre), "index_score mutated before the shape check (fail-dirty)"
@@ -358,7 +512,9 @@ def test_DSA_indexer_backward_direct_plan_shape_stride_mismatch_raises():
     aq_nc_pre = aq_nc.clone()
     isc2_pre = isc2.clone()
     with pytest.raises(ValueError):
-        plan.execute(iq, w, ik, torch.empty_like(iq), torch.empty_like(w), torch.empty_like(ik), aq_nc, isc2, tk, grad_loss, loss_coeff=loss_coeff)
+        plan.execute(
+            iq, w, ik, torch.empty_like(iq), torch.empty_like(w), torch.empty_like(ik), aq_nc, isc2, tk, grad_loss, loss_coeff=loss_coeff, workspace=ws
+        )
     torch.cuda.synchronize()
     assert torch.equal(aq_nc, aq_nc_pre), "attn_score mutated before the stride check (fail-dirty)"
     assert torch.equal(isc2, isc2_pre), "index_score mutated before the stride check (fail-dirty)"
@@ -370,7 +526,7 @@ def test_DSA_indexer_backward_direct_plan_shape_stride_mismatch_raises():
     isc3_pre = isc3.clone()
     dw_nc = _noncontiguous_like(torch.empty_like(w))
     with pytest.raises(ValueError):
-        plan.execute(iq, w, ik, torch.empty_like(iq), dw_nc, torch.empty_like(ik), aq3, isc3, tk, grad_loss, loss_coeff=loss_coeff)
+        plan.execute(iq, w, ik, torch.empty_like(iq), dw_nc, torch.empty_like(ik), aq3, isc3, tk, grad_loss, loss_coeff=loss_coeff, workspace=ws)
     torch.cuda.synchronize()
     assert torch.equal(aq3, aq3_pre), "attn_score mutated before the output-stride check (fail-dirty)"
     assert torch.equal(isc3, isc3_pre), "index_score mutated before the output-stride check (fail-dirty)"
@@ -536,6 +692,198 @@ def test_DSA_indexer_backward_wrong_ndim_rejected():
         )
 
 
+# ===========================================================================
+# Rule 8 detectors (python/cudnn/AGENTS.md R2 / R9): the plan owns no device
+# memory. The fp32 dK accumulator behind a bf16 d_index_k and the sm100_v2
+# ticket counter are carved from the caller's workspace; execute() allocates
+# nothing and never blocks the host.
+# ===========================================================================
+
+
+def _require_backend_gpu(backend):
+    """Skip unless the current GPU runs ``backend``: ``default`` resolves to the
+    sm90 or sm100 kernels by device, ``sm100_v2`` is exact (10, 0)."""
+    if backend == "sm100_v2":
+        _require_exact_sm100()
+        return
+    major = torch.cuda.get_device_capability()[0]
+    if major != 9 and major < 10:
+        pytest.skip("IndexerBackward requires SM90 or SM100+")
+
+
+def _build_plan(DSA, backend, dk_dtype, inputs):
+    """A checked, compiled IndexerBackward plus its output buffers (bf16 dW: the
+    default backend's kernel stores dW in bf16 only)."""
+    iq, w, ik, attn, idx, tk, _, _ = inputs
+    outputs = (torch.empty_like(iq), torch.empty_like(w), torch.empty_like(ik, dtype=dk_dtype))
+    plan = DSA.IndexerBackward(
+        sample_index_q=iq,
+        sample_weights=w,
+        sample_index_k=ik,
+        sample_d_index_q=outputs[0],
+        sample_d_weights=outputs[1],
+        sample_d_index_k=outputs[2],
+        sample_attn_score=attn,
+        sample_index_score=idx,
+        sample_topk_indices=tk,
+        sm_scale=_IDXBWD_SM_SCALE,
+        block_I=128,
+        backend=backend,
+    )
+    assert plan.check_support()
+    return plan, outputs
+
+
+_DK_DTYPE_PARAMS = pytest.mark.parametrize("dk_dtype", [torch.bfloat16, torch.float32], ids=["bf16_d_index_k", "fp32_d_index_k"])
+_BACKEND_PARAMS = pytest.mark.parametrize("backend", ["default", "sm100_v2"])
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@_BACKEND_PARAMS
+@_DK_DTYPE_PARAMS
+def test_execute_allocates_nothing_and_never_synchronizes(backend, dk_dtype, compile_allocates_nothing):
+    """R9: with the caller's workspace, three warm executes leave the torch
+    caching allocator's allocation count unchanged; the fe_api conftest arms
+    ``torch.cuda.set_sync_debug_mode("error")`` around every execute, so a
+    host sync fails the test too. ``compile()`` allocates nothing (R11)."""
+    _require_backend_gpu(backend)
+    DSA, _ = _import_dsa()
+    inputs = _idxbwd_inputs()
+    iq, w, ik, attn, idx, tk, loss_coeff, grad_loss = inputs
+    plan, (dq, dw, dk) = _build_plan(DSA, backend, dk_dtype, inputs)
+    compile_allocates_nothing(plan)
+    ws = _workspace_for(plan)
+    if backend == "sm100_v2" or dk_dtype == torch.bfloat16:
+        assert ws is not None, "this configuration carves scratch and must declare it"
+
+    # kernel 1 overwrites attn_score: one pristine copy per execute, all made
+    # before the allocation accounting starts
+    attns = [attn.clone() for _ in range(4)]
+
+    def run(aq):
+        plan.execute(iq, w, ik, dq, dw, dk, aq, idx, tk, grad_loss, loss_coeff=loss_coeff, workspace=ws)
+
+    # warm: the factories cute.compile their kernels lazily on the first call
+    run(attns[0])
+    torch.cuda.synchronize()
+    allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+    for aq in attns[1:]:
+        run(aq)
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations, "IndexerBackward.execute allocated device memory (Rule 8, R2)"
+    for name, t in (("d_index_q", dq), ("d_weights", dw), ("d_index_k", dk)):
+        assert torch.isfinite(t.float()).all(), f"{name} contains NaN/Inf"
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@_BACKEND_PARAMS
+def test_bf16_d_index_k_requires_workspace(backend):
+    """A bf16 d_index_k needs the ``B * S_k * D`` fp32 accumulator (plus the
+    8-byte ticket counter on sm100_v2): ``scratch_workspace_bytes()`` says so,
+    ``execute(workspace=None)`` raises the WorkspaceCarver error before kernel 1
+    overwrites attn_score, and an undersized buffer is rejected the same way.
+    An fp32 d_index_k on the default backend needs no scratch at all."""
+    _require_backend_gpu(backend)
+    DSA, _ = _import_dsa()
+    inputs = _idxbwd_inputs()
+    iq, w, ik, attn, idx, tk, loss_coeff, grad_loss = inputs
+    b, s_k, d = ik.shape
+
+    plan, (dq, dw, dk) = _build_plan(DSA, backend, torch.bfloat16, inputs)
+    plan.compile()
+    expected = ws_align(b * s_k * d * 4) + (ws_align(8) if backend == "sm100_v2" else 0)
+    assert plan.scratch_workspace_bytes() == expected
+
+    aq = attn.clone()
+    aq_pre = aq.clone()
+    with pytest.raises(ValueError, match=r"requires a \d+-byte workspace"):
+        plan.execute(iq, w, ik, dq, dw, dk, aq, idx, tk, grad_loss, loss_coeff=loss_coeff, workspace=None)
+    short = torch.empty(expected - 128, dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match=r"requires a \d+-byte workspace"):
+        plan.execute(iq, w, ik, dq, dw, dk, aq, idx, tk, grad_loss, loss_coeff=loss_coeff, workspace=short)
+    torch.cuda.synchronize()
+    assert torch.equal(aq, aq_pre), "missing workspace must be rejected before kernel 1 mutates attn_score (fail-dirty)"
+
+    if backend == "default":
+        plan32, (dq32, dw32, dk32) = _build_plan(DSA, backend, torch.float32, inputs)
+        plan32.compile()
+        assert plan32.scratch_workspace_bytes() == 0
+        plan32.execute(iq, w, ik, dq32, dw32, dk32, attn.clone(), idx, tk, grad_loss, loss_coeff=loss_coeff)
+        torch.cuda.synchronize()
+        assert torch.isfinite(dk32).all()
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_v2_counter_lives_in_caller_workspace():
+    """The sm100_v2 dynamic-ticket counter is the first ``ws_align(8)`` bytes of
+    the caller's workspace and is re-zeroed on every execute: a workspace
+    poisoned with 0xFF before each call still yields the serial reference, two
+    plans with private workspaces interleaved on two streams without host
+    synchronization reproduce it too, and after a call the carve order is
+    visible in the buffer (zero counter words, then the fp32 accumulator whose
+    bf16 rounding is exactly the returned d_index_k)."""
+    _require_exact_sm100()
+    DSA, cuda = _import_dsa()
+    inputs = _idxbwd_inputs()
+    iq, w, ik, attn, idx, tk, loss_coeff, grad_loss = inputs
+    n_iters = 4
+
+    plans = [_build_plan(DSA, "sm100_v2", torch.bfloat16, inputs) for _ in range(2)]
+    for plan, _ in plans:
+        plan.compile()
+    workspaces = [_workspace_for(plan) for plan, _ in plans]
+    for ws in workspaces:
+        assert ws.numel() == ws_align(8) + ws_align(ik.numel() * 4)
+
+    # serial reference from plan 0, workspace poisoned first
+    plan0, (dq0, dw0, dk0) = plans[0]
+    workspaces[0].fill_(0xFF)
+    plan0.execute(iq, w, ik, dq0, dw0, dk0, attn.clone(), idx, tk, grad_loss, loss_coeff=loss_coeff, workspace=workspaces[0])
+    torch.cuda.synchronize()
+    ref = (dq0.clone(), dw0.clone(), dk0.clone())
+    assert torch.isfinite(ref[2].float()).all()
+    counter = workspaces[0][: ws_align(8)].view(torch.int32)
+    assert torch.equal(counter[:2], torch.zeros(2, dtype=torch.int32, device="cuda")), "the ticket counter must be zero after a completed launch"
+    accumulator = workspaces[0][ws_align(8) : ws_align(8) + ik.numel() * 4].view(torch.float32).view(ik.shape)
+    assert torch.equal(accumulator.to(torch.bfloat16), ref[2]), "the fp32 accumulator follows the counter in the workspace"
+
+    # interleave the two plans / workspaces on two streams, no host sync in the loop
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    cu_streams = [cuda.CUstream(s.cuda_stream) for s in streams]
+    attn_clones = [[attn.clone() for _ in range(n_iters)] for _ in range(2)]
+    for lane, ws in enumerate(workspaces):
+        with torch.cuda.stream(streams[lane]):
+            ws.fill_(0xFF)
+    for it in range(n_iters):
+        for lane in range(2):
+            plan, (dq, dw, dk) = plans[lane]
+            streams[lane].wait_stream(torch.cuda.current_stream())
+            plan.execute(
+                iq,
+                w,
+                ik,
+                dq,
+                dw,
+                dk,
+                attn_clones[lane][it],
+                idx,
+                tk,
+                grad_loss,
+                loss_coeff=loss_coeff,
+                current_stream=cu_streams[lane],
+                workspace=workspaces[lane],
+            )
+    torch.cuda.synchronize()
+    for lane in range(2):
+        _, (dq, dw, dk) = plans[lane]
+        assert torch.equal(dq, ref[0]), f"lane {lane}: d_index_q diverged"
+        assert torch.equal(dw, ref[1]), f"lane {lane}: d_weights diverged"
+        assert _rms_rel(dk, ref[2].double()) < _DK_ATOMIC_BAND, f"lane {lane}: d_index_k diverged"
+
+
 def _v2_call(
     index_q,
     weights,
@@ -671,6 +1019,635 @@ _V2_TOPK_PARAMS = [
     pytest.param(1024, marks=pytest.mark.L1),
     pytest.param(2048, marks=pytest.mark.L1),
 ]
+
+
+@pytest.mark.parametrize("backend", ["default", "sm100_v2"])
+@pytest.mark.parametrize(
+    "dk_dtype,repeats,topk_indices_global",
+    [
+        pytest.param(torch.float32, 3, False, marks=pytest.mark.L0, id="fp32-dk-local-ids"),
+        pytest.param(torch.float32, 3, True, marks=pytest.mark.L0, id="fp32-dk-global-ids"),
+        pytest.param(torch.bfloat16, 3, False, marks=pytest.mark.L1, id="bf16-dk-local-ids"),
+        pytest.param(torch.float32, 1000, False, marks=pytest.mark.L2, id="fp32-dk-repeat1000"),
+    ],
+)
+@torch_fork_set_rng(seed=1701)
+def test_DSA_indexer_backward_deterministic_contract(backend, dk_dtype, repeats, topk_indices_global):
+    """The opt-in path owns/reset its exact scratch and reproduces every
+    output bitwise across the fixed producer-grid boundary."""
+    try:
+        from cudnn import DSA
+        from cudnn.deepseek_sparse_attention.indexer_backward.deterministic_dk_sm100 import (
+            NUM_DK_PRODUCER_CTAS,
+            NUM_DK_PLANES,
+            deterministic_dk_workspace_bytes,
+        )
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    _require_exact_sm100()
+
+    cfg = dict(b=2, s_q=NUM_DK_PRODUCER_CTAS // 2 + 1, s_kv=257, head_dim=128, qhead_per_kv_head=64, topk=512)
+    index_q, weights, index_k, attn_source, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
+    reference_topk_indices = topk_indices
+    if topk_indices_global:
+        batch_offsets = torch.arange(cfg["b"], dtype=torch.int32, device="cuda").view(cfg["b"], 1, 1) * cfg["s_kv"]
+        topk_indices = torch.where(topk_indices >= 0, topk_indices + batch_offsets, topk_indices)
+    attn = attn_source.clone()
+    d_index_q = torch.empty_like(index_q)
+    d_weights = torch.empty_like(weights, dtype=torch.float32 if backend == "sm100_v2" else torch.bfloat16)
+    d_index_k = torch.empty_like(index_k, dtype=dk_dtype)
+    grad_loss = torch.ones((), dtype=torch.float32, device="cuda")
+    plan = DSA.IndexerBackward(
+        sample_index_q=index_q,
+        sample_weights=weights,
+        sample_index_k=index_k,
+        sample_d_index_q=d_index_q,
+        sample_d_weights=d_weights,
+        sample_d_index_k=d_index_k,
+        sample_attn_score=attn,
+        sample_index_score=index_score,
+        sample_topk_indices=topk_indices,
+        sm_scale=1.0,
+        block_I=128,
+        topk_indices_global=topk_indices_global,
+        backend=backend,
+        deterministic=True,
+    )
+    assert plan.check_support()
+    plan.compile()
+    expected = deterministic_dk_workspace_bytes(cfg["b"], cfg["s_kv"], cfg["head_dim"])
+    assert expected == ws_align(NUM_DK_PLANES * cfg["b"] * cfg["s_kv"] * cfg["head_dim"] * 4)
+    assert plan.scratch_workspace_bytes() == expected
+    workspace = torch.empty(expected, dtype=torch.uint8, device="cuda")
+
+    # Workspace validation is fail-clean: score scratch has not been touched.
+    attn.copy_(attn_source)
+    with pytest.raises(ValueError, match="workspace"):
+        plan.execute(
+            index_q,
+            weights,
+            index_k,
+            d_index_q,
+            d_weights,
+            d_index_k,
+            attn,
+            index_score,
+            topk_indices,
+            grad_loss,
+            loss_coeff=float(cfg["b"] * cfg["s_q"]),
+            workspace=workspace[:-1],
+        )
+    torch.testing.assert_close(attn, attn_source, rtol=0.0, atol=0.0)
+
+    def run():
+        attn.copy_(attn_source)
+        workspace.fill_(0xA5)
+        d_index_q.fill_(float("nan"))
+        d_weights.fill_(float("nan"))
+        d_index_k.fill_(float("nan"))
+        plan.execute(
+            index_q,
+            weights,
+            index_k,
+            d_index_q,
+            d_weights,
+            d_index_k,
+            attn,
+            index_score,
+            topk_indices,
+            grad_loss,
+            loss_coeff=float(cfg["b"] * cfg["s_q"]),
+            workspace=workspace,
+        )
+        torch.cuda.synchronize()
+        return tuple(t.clone() for t in (d_index_q, d_weights, d_index_k, attn))
+
+    reference = run()
+    for repeat in range(repeats):
+        actual = run()
+        for name, actual_tensor, reference_tensor in zip(("d_index_q", "d_weights", "d_index_k", "grad_signal"), actual, reference):
+            assert torch.equal(actual_tensor, reference_tensor), f"{backend} {name} changed at repeat {repeat}"
+
+    check_ref_indexer_backward(
+        index_q,
+        weights,
+        index_k,
+        attn_source,
+        index_score,
+        reference_topk_indices,
+        reference[0],
+        reference[1],
+        reference[2],
+        sm_scale=1.0,
+        grad_scale=1.0,
+    )
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("backend", ["default", "sm100_v2"])
+@pytest.mark.parametrize(
+    "dk_planes,s_q,dk_dtype",
+    [
+        pytest.param(128, 128, torch.float32, id="planes128-fp32-single-row-stripe"),
+        pytest.param(148, 148, torch.float32, id="planes148-fp32-single-row-stripe"),
+        pytest.param(148, 149, torch.bfloat16, id="planes148-bf16-reused-plane"),
+    ],
+)
+@torch_fork_set_rng(seed=1702)
+def test_DSA_indexer_backward_deterministic_plane_specializations(backend, dk_planes, s_q, dk_dtype):
+    """Larger compile-time grids own exact scratch and remain deterministic.
+
+    The BF16 case has one more query row than planes, so CTA/plane zero is
+    reused before the fixed-order reducer converts its accumulator.
+    """
+    try:
+        from cudnn import DSA
+        from cudnn.deepseek_sparse_attention.indexer_backward.deterministic_dk_sm100 import deterministic_dk_workspace_bytes
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    _require_exact_sm100()
+
+    cfg = dict(b=1, s_q=s_q, s_kv=128, head_dim=128, qhead_per_kv_head=64, topk=128)
+    index_q, weights, index_k, attn_source, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
+    attn = attn_source.clone()
+    d_index_q = torch.empty_like(index_q)
+    d_weights = torch.empty_like(weights, dtype=torch.float32 if backend == "sm100_v2" else torch.bfloat16)
+    d_index_k = torch.empty_like(index_k, dtype=dk_dtype)
+    grad_loss = torch.ones((), dtype=torch.float32, device="cuda")
+    plan = DSA.IndexerBackward(
+        sample_index_q=index_q,
+        sample_weights=weights,
+        sample_index_k=index_k,
+        sample_d_index_q=d_index_q,
+        sample_d_weights=d_weights,
+        sample_d_index_k=d_index_k,
+        sample_attn_score=attn,
+        sample_index_score=index_score,
+        sample_topk_indices=topk_indices,
+        backend=backend,
+        deterministic=True,
+        deterministic_dk_planes=dk_planes,
+    )
+    assert plan.check_support()
+    plan.compile()
+    expected_bytes = deterministic_dk_workspace_bytes(cfg["b"], cfg["s_kv"], cfg["head_dim"], dk_planes)
+    assert expected_bytes == ws_align(dk_planes * cfg["b"] * cfg["s_kv"] * cfg["head_dim"] * 4)
+    assert plan.scratch_workspace_bytes() == expected_bytes
+    workspace = torch.empty(expected_bytes, dtype=torch.uint8, device="cuda")
+
+    def run():
+        attn.copy_(attn_source)
+        plan.execute(
+            index_q,
+            weights,
+            index_k,
+            d_index_q,
+            d_weights,
+            d_index_k,
+            attn,
+            index_score,
+            topk_indices,
+            grad_loss,
+            loss_coeff=float(cfg["s_q"]),
+            workspace=workspace,
+        )
+        torch.cuda.synchronize()
+        return tuple(t.clone() for t in (d_index_q, d_weights, d_index_k, attn))
+
+    reference = run()
+    actual = run()
+    for name, actual_tensor, reference_tensor in zip(("d_index_q", "d_weights", "d_index_k", "grad_signal"), actual, reference):
+        assert torch.equal(actual_tensor, reference_tensor), f"{backend} planes={dk_planes} changed {name}"
+
+    check_ref_indexer_backward(
+        index_q,
+        weights,
+        index_k,
+        attn_source,
+        index_score,
+        topk_indices,
+        reference[0],
+        reference[1],
+        reference[2],
+        sm_scale=1.0,
+        grad_scale=1.0,
+    )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("aliased_name", ["index_q", "d_index_k"])
+@torch_fork_set_rng(seed=1703)
+def test_DSA_indexer_backward_deterministic_workspace_alias_rejected_before_launch(aliased_name):
+    """The live plane scratch cannot overlap a read or write operand."""
+    try:
+        from cudnn import DSA
+        from cudnn.deepseek_sparse_attention.indexer_backward.deterministic_dk_sm100 import deterministic_dk_workspace_bytes
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    _require_exact_sm100()
+
+    cfg = dict(b=1, s_q=96, s_kv=128, head_dim=128, qhead_per_kv_head=64, topk=128)
+    index_q, weights, index_k, attn_score, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
+    d_index_q = torch.empty_like(index_q)
+    d_weights = torch.empty_like(weights)
+    d_index_k = torch.empty_like(index_k)
+    required = deterministic_dk_workspace_bytes(cfg["b"], cfg["s_kv"], cfg["head_dim"])
+    workspace = torch.empty(required, dtype=torch.uint8, device="cuda")
+
+    if aliased_name == "index_q":
+        aliased = workspace[: index_q.numel() * index_q.element_size()].view(index_q.dtype).view_as(index_q)
+        aliased.copy_(index_q)
+        index_q = aliased
+    else:
+        aliased = workspace[: d_index_k.numel() * d_index_k.element_size()].view(d_index_k.dtype).view_as(d_index_k)
+        aliased.zero_()
+        d_index_k = aliased
+
+    plan = DSA.IndexerBackward(
+        index_q,
+        weights,
+        index_k,
+        d_index_q,
+        d_weights,
+        d_index_k,
+        attn_score,
+        index_score,
+        topk_indices,
+        deterministic=True,
+    )
+
+    def launch_tripwire(*args, **kwargs):
+        raise AssertionError("overlapping workspace reached the compiled kernel")
+
+    plan._compiled_kernel = launch_tripwire
+    attn_before = attn_score.clone()
+    aliased_before = aliased.clone()
+    grad_loss = torch.ones((), dtype=torch.float32, device="cuda")
+    with pytest.raises(ValueError, match=rf"workspace must not overlap {aliased_name}"):
+        plan.execute(
+            index_q,
+            weights,
+            index_k,
+            d_index_q,
+            d_weights,
+            d_index_k,
+            attn_score,
+            index_score,
+            topk_indices,
+            grad_loss,
+            loss_coeff=float(cfg["s_q"]),
+            workspace=workspace,
+        )
+    assert torch.equal(attn_score, attn_before)
+    assert torch.equal(aliased, aliased_before)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=1704)
+def test_DSA_indexer_backward_deterministic_workspace_allows_disjoint_view_of_same_allocation():
+    """Only the live scratch prefix aliases; a disjoint shared-storage tail is valid."""
+    try:
+        from cudnn import DSA
+        from cudnn.deepseek_sparse_attention.indexer_backward.deterministic_dk_sm100 import deterministic_dk_workspace_bytes
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    _require_exact_sm100()
+
+    cfg = dict(b=1, s_q=96, s_kv=128, head_dim=128, qhead_per_kv_head=64, topk=128)
+    source_q, weights, index_k, attn_score, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
+    required = deterministic_dk_workspace_bytes(cfg["b"], cfg["s_kv"], cfg["head_dim"])
+    q_bytes = source_q.numel() * source_q.element_size()
+    backing = torch.empty(required + q_bytes, dtype=torch.uint8, device="cuda")
+    workspace = backing
+    index_q = backing[required:].view(source_q.dtype).view_as(source_q)
+    index_q.copy_(source_q)
+    d_index_q = torch.empty_like(index_q)
+    d_weights = torch.empty_like(weights)
+    d_index_k = torch.empty_like(index_k)
+    plan = DSA.IndexerBackward(
+        index_q,
+        weights,
+        index_k,
+        d_index_q,
+        d_weights,
+        d_index_k,
+        attn_score,
+        index_score,
+        topk_indices,
+        deterministic=True,
+    )
+
+    class LaunchIntercepted(Exception):
+        pass
+
+    def launch_tripwire(*args, **kwargs):
+        raise LaunchIntercepted
+
+    plan._compiled_kernel = launch_tripwire
+    with pytest.raises(LaunchIntercepted):
+        plan.execute(
+            index_q,
+            weights,
+            index_k,
+            d_index_q,
+            d_weights,
+            d_index_k,
+            attn_score,
+            index_score,
+            topk_indices,
+            torch.ones((), dtype=torch.float32, device="cuda"),
+            loss_coeff=float(cfg["s_q"]),
+            workspace=workspace,
+        )
+
+
+@pytest.mark.L0
+def test_DSA_indexer_backward_deterministic_plane_policy_rejects_invalid_values_before_tensors():
+    """Validate plane selection and the nonempty fixed-owner grid before tensors."""
+    try:
+        from cudnn import DSA
+        from cudnn.deepseek_sparse_attention.indexer_backward.deterministic_dk_sm100 import deterministic_dk_producer_ctas
+        from cudnn.deepseek_sparse_attention.indexer_backward.indexer_backward_sm100 import indexer_backward_sm100
+        from cudnn.deepseek_sparse_attention.indexer_backward.indexer_backward_v2_sm100 import indexer_backward_v2_sm100
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    args = (None,) * 7
+    for value in (0, 95, 97, 149, 96.0, True, None):
+        with pytest.raises(ValueError, match="deterministic_dk_planes must be one of"):
+            DSA.indexer_backward_wrapper(*args, deterministic=True, deterministic_dk_planes=value)
+    with pytest.raises(ValueError, match="only configurable when deterministic=True"):
+        DSA.indexer_backward_wrapper(*args, deterministic=False, deterministic_dk_planes=128)
+    for total_rows in (0, -1):
+        with pytest.raises(ValueError, match="at least one query row"):
+            deterministic_dk_producer_ctas(total_rows)
+    for factory in (indexer_backward_sm100, indexer_backward_v2_sm100):
+        with pytest.raises(ValueError, match="only configurable when deterministic=True"):
+            factory(1, 1, 128, 64, 128, 128, deterministic=False, deterministic_dk_planes=128)
+        with pytest.raises(ValueError, match="at least one query row"):
+            factory(1, 0, 128, 64, 128, 128, deterministic=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("backend", ["default", "sm100_v2"])
+def test_DSA_indexer_backward_deterministic_empty_query_rejected_before_allocation(monkeypatch, backend):
+    """Reject an empty deterministic grid before output allocation or backend dispatch."""
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required to build IndexerBackward tensor descriptors")
+
+    b, s_q, s_k, h, d, topk = 1, 0, 128, 64, 128, 128
+    index_q = torch.empty((b, s_q, h, d), dtype=torch.bfloat16, device="cuda")
+    weights = torch.empty((b, s_q, h), dtype=torch.bfloat16, device="cuda")
+    index_k = torch.empty((b, s_k, d), dtype=torch.bfloat16, device="cuda")
+    attn_score = torch.empty((b, s_q, topk), dtype=torch.float32, device="cuda")
+    index_score = torch.empty_like(attn_score)
+    topk_indices = torch.empty((b, s_q, topk), dtype=torch.int32, device="cuda")
+    grad_loss = torch.ones((), dtype=torch.float32, device="cuda")
+    d_index_q = torch.empty_like(index_q)
+    d_weights = torch.empty_like(weights)
+    d_index_k = torch.empty_like(index_k)
+
+    plan = DSA.IndexerBackward(
+        index_q,
+        weights,
+        index_k,
+        d_index_q,
+        d_weights,
+        d_index_k,
+        attn_score,
+        index_score,
+        topk_indices,
+        backend=backend,
+        deterministic=True,
+    )
+    with pytest.raises(ValueError, match="at least one query row"):
+        plan.check_support()
+
+    monkeypatch.setattr(
+        torch,
+        "empty_like",
+        lambda *args, **kwargs: pytest.fail("output allocation happened before deterministic row validation"),
+    )
+    with pytest.raises(ValueError, match="at least one query row"):
+        DSA.indexer_backward_wrapper(
+            index_q,
+            weights,
+            index_k,
+            attn_score,
+            index_score,
+            topk_indices,
+            grad_loss,
+            backend=backend,
+            deterministic=True,
+        )
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("backend", ["default", "sm100_v2"])
+@pytest.mark.parametrize("s_q", [7, 17], ids=["short-grid", "uneven-grid"])
+@torch_fork_set_rng(seed=1703)
+def test_DSA_indexer_backward_deterministic_cuda_graph(backend, s_q):
+    """Short and uneven warmed plans with fixed scratch are replay-safe."""
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    _require_exact_sm100()
+
+    cfg = dict(b=1, s_q=s_q, s_kv=128, head_dim=128, qhead_per_kv_head=64, topk=128)
+    index_q, weights, index_k, attn_source, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
+    attn = attn_source.clone()
+    d_index_q = torch.empty_like(index_q)
+    d_weights = torch.empty_like(weights, dtype=torch.float32 if backend == "sm100_v2" else torch.bfloat16)
+    d_index_k = torch.empty_like(index_k, dtype=torch.float32)
+    grad_loss = torch.ones((), dtype=torch.float32, device="cuda")
+    plan = DSA.IndexerBackward(
+        sample_index_q=index_q,
+        sample_weights=weights,
+        sample_index_k=index_k,
+        sample_d_index_q=d_index_q,
+        sample_d_weights=d_weights,
+        sample_d_index_k=d_index_k,
+        sample_attn_score=attn,
+        sample_index_score=index_score,
+        sample_topk_indices=topk_indices,
+        backend=backend,
+        deterministic=True,
+    )
+    assert plan.check_support()
+    plan.compile()
+    workspace = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda")
+
+    def launch():
+        plan.execute(
+            index_q,
+            weights,
+            index_k,
+            d_index_q,
+            d_weights,
+            d_index_k,
+            attn,
+            index_score,
+            topk_indices,
+            grad_loss,
+            loss_coeff=float(cfg["s_q"]),
+            workspace=workspace,
+        )
+
+    # Compile every lazy kernel before capture.
+    attn.copy_(attn_source)
+    launch()
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            attn.copy_(attn_source)
+            launch()
+        torch.cuda.synchronize()
+        expected = tuple(t.clone() for t in (d_index_q, d_weights, d_index_k, attn))
+
+        for repeat in range(3):
+            workspace.fill_(0xA5)
+            d_index_q.fill_(float("nan"))
+            d_weights.fill_(float("nan"))
+            d_index_k.fill_(float("nan"))
+            attn.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            for name, actual, reference in zip(("d_index_q", "d_weights", "d_index_k", "grad_signal"), (d_index_q, d_weights, d_index_k, attn), expected):
+                assert torch.equal(actual, reference), f"{backend} graph replay changed {name} at repeat {repeat}"
+    finally:
+        graph.reset()
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("backend", ["default", "sm100_v2"])
+@pytest.mark.parametrize("s_q,topk", [(2, 2048), (193, 896), (193, 2048)], ids=["short-k2048", "persistent-k896", "persistent-k2048"])
+@torch_fork_set_rng(seed=1705)
+def test_DSA_indexer_backward_deterministic_topk2048_boundary(backend, s_q, topk):
+    """Large TopK and repeated producer-row handoffs preserve every output bit."""
+    try:
+        from cudnn import DSA
+        from cudnn.deepseek_sparse_attention.indexer_backward.deterministic_dk_sm100 import deterministic_dk_workspace_bytes
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    _require_exact_sm100()
+
+    # With 96 planes, 193 rows makes a producer consume three different rows.
+    cfg = dict(b=1, s_q=s_q, s_kv=2048, head_dim=128, qhead_per_kv_head=64, topk=topk)
+    index_q, weights, index_k, attn_source, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
+    attn = attn_source.clone()
+    grad_loss = torch.ones((), dtype=torch.float32, device="cuda")
+    d_index_q = torch.empty_like(index_q)
+    d_weights = torch.empty_like(weights, dtype=torch.float32 if backend == "sm100_v2" else torch.bfloat16)
+    d_index_k = torch.empty_like(index_k, dtype=torch.float32)
+    workspace = torch.empty(deterministic_dk_workspace_bytes(cfg["b"], cfg["s_kv"], cfg["head_dim"]), dtype=torch.uint8, device="cuda")
+
+    def run():
+        attn.copy_(attn_source)
+        workspace.fill_(0xA5)
+        for output in (d_index_q, d_weights, d_index_k):
+            output.fill_(float("nan"))
+        DSA.indexer_backward_wrapper(
+            index_q,
+            weights,
+            index_k,
+            attn,
+            index_score,
+            topk_indices,
+            grad_loss=grad_loss,
+            loss_coeff=float(cfg["s_q"]),
+            d_index_q=d_index_q,
+            d_weights=d_weights,
+            d_index_k=d_index_k,
+            workspace=workspace,
+            backend=backend,
+            deterministic=True,
+        )
+        return tuple(t.clone() for t in (d_index_q, d_weights, d_index_k, attn))
+
+    assert_bitwise_runs(run, label=f"{backend} s_q={s_q} topk={topk}")
+    check_ref_indexer_backward(
+        index_q,
+        weights,
+        index_k,
+        attn_source,
+        index_score,
+        topk_indices,
+        d_index_q,
+        d_weights,
+        d_index_k,
+        sm_scale=1.0,
+        grad_scale=1.0,
+    )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("capability,supported", [((9, 0), False), ((10, 3), True), ((10, 7), False)])
+@torch_fork_set_rng(seed=1707)
+def test_DSA_indexer_backward_deterministic_capability_gate(monkeypatch, capability, supported):
+    """The deterministic path accepts SM100/SM103 and fails closed elsewhere."""
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    cfg = dict(b=1, s_q=2, s_kv=128, head_dim=128, qhead_per_kv_head=64, topk=128)
+    index_q, weights, index_k, attn_score, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
+    plan = DSA.IndexerBackward(
+        sample_index_q=index_q,
+        sample_weights=weights,
+        sample_index_k=index_k,
+        sample_d_index_q=torch.empty_like(index_q),
+        sample_d_weights=torch.empty_like(weights),
+        sample_d_index_k=torch.empty_like(index_k),
+        sample_attn_score=attn_score,
+        sample_index_score=index_score,
+        sample_topk_indices=topk_indices,
+        deterministic=True,
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
+
+    attn_before = attn_score.clone()
+    if supported:
+        assert plan.check_support()
+    else:
+        with pytest.raises(ValueError, match="deterministic IndexerBackward requires capability"):
+            plan.check_support()
+    assert torch.equal(attn_score, attn_before)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=1708)
+def test_DSA_indexer_backward_v2_accepts_sm103_capability(monkeypatch):
+    """The v2 plan gate shares the deterministic SM100/SM103 capability set."""
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    cfg = dict(b=1, s_q=2, s_kv=128, head_dim=128, qhead_per_kv_head=64, topk=128)
+    index_q, weights, index_k, attn_score, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
+    plan = DSA.IndexerBackward(
+        sample_index_q=index_q,
+        sample_weights=weights,
+        sample_index_k=index_k,
+        sample_d_index_q=torch.empty_like(index_q),
+        sample_d_weights=torch.empty_like(weights),
+        sample_d_index_k=torch.empty_like(index_k),
+        sample_attn_score=attn_score,
+        sample_index_score=index_score,
+        sample_topk_indices=topk_indices,
+        backend="sm100_v2",
+        deterministic=True,
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 3))
+    assert plan.check_support()
 
 
 @torch_fork_set_rng(seed=0)
@@ -1454,10 +2431,12 @@ def test_DSA_indexer_backward_wrapper_v2_stream_none_ambient_streams(
     with ``torch.cuda.current_stream()``, i.e. to the *ambient* stream of the
     calling context. Keying the plan cache on the ``stream`` argument alone
     therefore mapped two genuinely different execution streams onto one cached
-    plan, and so onto one per-plan workspace -- the self-resetting ticket
-    counter -- which the backend documents as single-execution-at-a-time
-    state. The committed multi-stream test only
-    passes ``stream=`` explicitly, which is the gap this covers.
+    plan. The ticket counter now lives in the wrapper's per-call workspace
+    (zeroed every execute), so sharing a plan across streams no longer shares
+    device state; the stream key is kept so one cached plan's executes stay
+    stream-ordered, and this test pins that cache-key invariant. The committed
+    multi-stream test only passes ``stream=`` explicitly, which is the gap this
+    covers.
 
     What this test asserts is the *invariant* (one plan per resolved stream),
     not gradient corruption: the two checks are (a) the two ambient streams get
@@ -1465,13 +2444,7 @@ def test_DSA_indexer_backward_wrapper_v2_stream_none_ambient_streams(
     regression in the cache key breaks (keying the raw ``stream`` argument
     yields one entry instead of two), and (b) the interleaved executions still
     reproduce their serial results, which is a correctness guard on the keyed
-    path. (b) is not a second detector for the same bug -- a deliberately
-    shared plan does not reliably corrupt on a dedicated B200, because the v2
-    kernel is a persistent grid of one CTA per SM that still requests 207872 of
-    the 232448 B per-CTA shared-memory budget at this shape (the layout's only
-    topk-dependent part is 2 KB per 128 slots), so a second launch mostly cannot
-    get co-resident CTAs and the damage window stays closed. That is a property of this device being
-    fully available to one launch, not a guarantee the backend offers.
+    path (each call's counter and accumulator are private scratch).
 
     ``s_q``/``S_k``/topk together are deliberately different from every other
     v2 test's, so this test's plan-cache keys cannot collide with theirs
@@ -1563,37 +2536,22 @@ def test_DSA_indexer_backward_wrapper_v2_stream_none_ambient_streams(
 @pytest.mark.L1
 @torch_fork_set_rng(seed=0)
 @with_dsa_indexer_backward_params
-def test_DSA_indexer_backward_wrapper_v2_stream_per_thread_two_threads(
+@pytest.mark.parametrize("stream_kind", ["explicit", "per_thread"])
+def test_DSA_indexer_backward_wrapper_v2_two_threads(
     dtype,
     acc_dtype,
     head_dim,
     qhead_per_kv_head,
     block_I,
     request,
+    stream_kind,
 ):
-    """Two host threads passing ``cudaStreamPerThread`` explicitly must not
-    share one plan.
+    """Concrete per-thread streams use independent plans; CUstream(2) is rejected.
 
-    ``cudaStreamPerThread`` is the integer 2 in every host thread, each time
-    denoting that thread's own stream, so the handle alone cannot tell the two
-    streams apart -- but the caller can: that handle means "the calling
-    thread's stream" by definition, so the wrapper appends the calling thread's
-    id to the key for that one value. Without it both threads land on one plan
-    and so on one per-plan workspace -- the self-resetting ticket counter --
-    which the backend documents as single-execution-at-a-time state.
-
-    This is the explicit-handle twin of the ``stream=None`` ambient-stream test
-    above and asserts the same invariant: one plan per resolved stream. Two
-    implementation details of the test matter. The threads are held alive across
-    the whole measured window by a barrier, because ``threading.get_ident()`` is
-    only unique among *live* threads and Python does hand a dead thread's id to
-    a later one. Their wrapper calls are serialized with a lock, so what is
-    asserted is the cache key and not the thread-safety of first-call
-    compilation.
-
-    ``s_q``/``S_k``/topk together are deliberately different from every other
-    v2 test's, so this test's plan-cache keys cannot collide with theirs
-    regardless of test order."""
+    Keep both threads alive throughout the test so their identities differ.
+    Compile once before the threaded phase, then serialize wrapper entry to
+    isolate stream identity and rejection from first-call compilation races.
+    """
     try:
         from cudnn import DSA
         from cuda.bindings import driver as cuda
@@ -1650,8 +2608,15 @@ def test_DSA_indexer_backward_wrapper_v2_stream_per_thread_two_threads(
         try:
             barrier.wait()  # both threads alive before any id is observed
             with serialize:
-                results[lane_id] = (threading.get_ident(), call(per_thread_stream))
-                torch.cuda.synchronize()
+                if stream_kind == "per_thread":
+                    with pytest.raises(ValueError, match="cudaStreamPerThread"):
+                        call(per_thread_stream)
+                    results[lane_id] = (threading.get_ident(), None)
+                else:
+                    concrete = torch.cuda.Stream()
+                    with torch.cuda.stream(concrete):
+                        results[lane_id] = (threading.get_ident(), call(concrete.cuda_stream))
+                    concrete.synchronize()
             barrier.wait()  # still alive, so neither id can have been recycled
         except BaseException as exc:  # surfaced in the main thread below
             errors[lane_id] = exc
@@ -1666,12 +2631,10 @@ def test_DSA_indexer_backward_wrapper_v2_stream_per_thread_two_threads(
     assert len({ident for ident, _ in results.values()}) == 2, "test setup: the two worker threads must have distinct live ids"
 
     added = set(cache.keys()) - keys_before
-    assert len(added) == 2, (
-        "two host threads passing cudaStreamPerThread must key two separate plans "
-        "(the handle is the integer 2 in both threads but denotes a different stream in each, "
-        "and the per-plan ticket counter cannot be shared across concurrent streams); "
-        f"got {len(added)} new plan-cache entries"
-    )
+    if stream_kind == "per_thread":
+        assert not added, "rejected PTDS calls must not populate the plan cache"
+        return
+    assert len(added) == 2, f"two concrete streams must key separate plans, got {len(added)} new entries"
 
     # Correctness guard on the keyed path: d_index_q / d_weights are
     # deterministic, so each thread must reproduce the main-thread reference
@@ -1693,14 +2656,14 @@ def test_DSA_indexer_backward_wrapper_v2_multi_device(
     block_I,
     request,
 ):
-    """Per-device plan/workspace ownership: the wrapper keys its plan cache
-    on the CUDA device, so same-shape default-stream calls on two devices get
-    private plans (the ticket-counter workspace is device-resident, so sharing
-    one cached plan across devices would hand device 1 the device-0 counter).
-    Run the identical input bits on each device, then interleave the devices,
-    checking dq/dw bitwise against each device's serial result and dk in the
-    fp32-atomic class; finally, executing a plan with tensors on the wrong
-    device must raise ValueError before kernel 1 overwrites attn_score."""
+    """Per-device plans: the wrapper keys its plan cache on the CUDA device,
+    so same-shape default-stream calls on two devices get private plans (the
+    descriptors and the compiled kernels are that device's). Run the identical
+    input bits on each device, then interleave the devices, checking dq/dw
+    bitwise against each device's serial result and dk in the fp32-atomic
+    class; finally, the workspace-device rule: a plan's scratch (the ticket
+    counter lives in it) must be on the tensors' device, and a workspace on
+    another device raises ValueError before kernel 1 overwrites attn_score."""
     try:
         from cudnn import DSA
         from cuda.bindings import driver as cuda  # noqa: F401
@@ -1776,8 +2739,9 @@ def test_DSA_indexer_backward_wrapper_v2_multi_device(
             assert torch.equal(r["d_weights"], refs[dev]["d_weights"]), f"device {dev} iter {it}: d_weights diverged"
             assert _rms_rel(r["d_index_k"], refs[dev]["d_index_k"].double()) < _DK_ATOMIC_BAND, f"device {dev} iter {it}: d_index_k diverged"
 
-    # direct-object contract: a plan built on device 0 must reject device-1
-    # tensors BEFORE kernel 1 overwrites attn_score
+    # direct-object contract: the scratch (ticket counter + dK accumulator)
+    # must live on the tensors' device; a device-1 workspace for device-0
+    # tensors is rejected BEFORE kernel 1 overwrites attn_score
     iq0, w0, ik0, attn0, index0, tki0 = inputs[0]
     with torch.cuda.device(0):
         plan = DSA.IndexerBackward(
@@ -1796,29 +2760,30 @@ def test_DSA_indexer_backward_wrapper_v2_multi_device(
         )
         assert plan.check_support()
         plan.compile()
-    iq1, w1, ik1, attn1, index1, tki1 = inputs[1]
-    attn1 = attn1.clone()
-    index1 = index1.clone()
-    attn1_before = attn1.clone()
-    index1_before = index1.clone()
-    with torch.cuda.device(1):
+    attn0 = attn0.clone()
+    index0 = index0.clone()
+    attn0_before = attn0.clone()
+    index0_before = index0.clone()
+    wrong_device_ws = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda:1")
+    with torch.cuda.device(0):
         with pytest.raises(ValueError, match="device"):
             plan.execute(
-                iq1,
-                w1,
-                ik1,
-                torch.empty_like(iq1),
-                torch.empty_like(w1),
-                torch.empty_like(ik1),
-                attn1,
-                index1,
-                tki1,
-                grad_loss=grad_loss[1],
+                iq0,
+                w0,
+                ik0,
+                torch.empty_like(iq0),
+                torch.empty_like(w0),
+                torch.empty_like(ik0),
+                attn0,
+                index0,
+                tki0,
+                grad_loss=grad_loss[0],
                 loss_coeff=loss_coeff,
+                workspace=wrong_device_ws,
             )
         torch.cuda.synchronize()
-    assert torch.equal(attn1, attn1_before), "cross-device rejection must not mutate attn_score"
-    assert torch.equal(index1, index1_before), "cross-device rejection must not mutate index_score"
+    assert torch.equal(attn0, attn0_before), "workspace-device rejection must not mutate attn_score"
+    assert torch.equal(index0, index0_before), "workspace-device rejection must not mutate index_score"
 
 
 @pytest.mark.L0
@@ -2109,6 +3074,13 @@ def test_DSA_indexer_backward_wrapper_backend_keyword_only_signature():
     assert "backend" in params
     assert params["backend"].kind is inspect.Parameter.KEYWORD_ONLY
     assert params["backend"].default == "default"
+    assert params["workspace"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert params["deterministic"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert params["deterministic"].default is False
+    assert params["deterministic_dk_planes"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert params["deterministic_dk_planes"].default == 96
+    keyword_only = [name for name, parameter in params.items() if parameter.kind is inspect.Parameter.KEYWORD_ONLY]
+    assert keyword_only == ["backend", "workspace", "deterministic", "deterministic_dk_planes"]
 
     # A legacy positional call in develop order binds the trailing tensors to
     # d_index_q/d_weights/d_index_k/stream (not to backend) and leaves backend
@@ -2125,6 +3097,10 @@ def test_DSA_indexer_backward_wrapper_backend_keyword_only_signature():
         sig.bind(*(sentinels + [object()]))
     bound_kw = sig.bind(*sentinels, backend="sm100_v2")
     assert bound_kw.arguments["backend"] == "sm100_v2"
+    bound_deterministic = sig.bind(*sentinels, deterministic=True)
+    assert bound_deterministic.arguments["deterministic"] is True
+    bound_planes = sig.bind(*sentinels, deterministic=True, deterministic_dk_planes=148)
+    assert bound_planes.arguments["deterministic_dk_planes"] == 148
 
 
 @pytest.mark.L0
@@ -2411,6 +3387,8 @@ def test_DSA_indexer_backward_sm100_score_grad_pdl_full_pipeline_matches_serial(
     d_index_q = torch.empty_like(index_q)
     d_weights = torch.empty_like(weights)
     d_index_k = torch.empty_like(index_k)
+    # bf16 d_index_k: the factory carves its fp32 accumulator from the caller's workspace (R2)
+    workspace = torch.empty(ws_align(d_index_k.numel() * 4), dtype=torch.uint8, device=device)
     for _ in range(2):
         kernel(
             index_q,
@@ -2424,6 +3402,7 @@ def test_DSA_indexer_backward_sm100_score_grad_pdl_full_pipeline_matches_serial(
             topk_indices,
             grad_loss,
             grad_scale,
+            workspace=workspace,
         )
     torch.cuda.synchronize()
 

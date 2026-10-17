@@ -79,6 +79,22 @@ def _destroy_default_handles() -> None:
 atexit.register(_destroy_default_handles)
 
 
+_PYTHON_ONLY_BOOL_ATTRS = frozenset({"attn_scale_prefolded"})
+
+
+def _python_only_attr_is_set(attr: str, value) -> bool:
+    """Whether a python-only op attribute is SET (-> python engines only).  A bool attribute
+    (``attn_scale_prefolded``) is set when truthy: ``False`` / ``0`` / a false numpy bool are its
+    default and leave the node backend-lowerable.  Every other attribute is set when not None --
+    including an explicit ``softmax_precision=FLOAT``, which selects the f32 pipeline ON the python
+    engines (the backend is not consulted; ``key()`` / ``serialize()`` refuse it, as documented)."""
+    if value is None:
+        return False
+    if attr in _PYTHON_ONLY_BOOL_ATTRS:
+        return bool(value)
+    return True
+
+
 def _detached_exception(exc: Exception) -> Exception:
     """Preserve the backend error type/message without retaining traceback frames.
 
@@ -176,6 +192,16 @@ class pygraph:
     All graph structure and attributes are kept in Python. C++ is only
     used for execution via lazy lowering.
 
+    Two constructor arguments are statements about the CALLER, not graph
+    properties, and integrations pass them: ``is_override_shape_enabled``
+    (the graph will execute with shape / stride overrides; forwarded to the
+    backend graph) and the keyword-only ``is_cuda_graph_replay_expected``
+    (``execute`` is captured into a CUDA graph and replayed, so the python
+    engines' heuristics may lead with the plan that is fastest on the GPU
+    alone; never forwarded to the backend, changes no numerics). After
+    planning, ``selected_engine`` and ``backend_plan_entries()`` report which
+    side serves the graph -- see their docstrings.
+
     Example:
         >>> graph = pygraph(io_data_type=cudnn.data_type.HALF)
         >>> A = graph.tensor(dim=[8, 64, 128], name="A")
@@ -205,6 +231,8 @@ class pygraph:
         device_property: Any = None,
         is_dynamic_shape_enabled: bool = False,
         is_override_shape_enabled: bool = False,
+        *,
+        is_cuda_graph_replay_expected: bool = False,
         **kwargs,
     ):
         self._context = GraphContext(
@@ -229,6 +257,14 @@ class pygraph:
             self._cpp_graph_kwargs["is_dynamic_shape_enabled"] = True
         if is_override_shape_enabled:
             self._cpp_graph_kwargs["is_override_shape_enabled"] = True
+        # The caller's statement about how it will RUN this graph, not a graph
+        # property: it captures graph.execute into a CUDA graph and replays it,
+        # so per-execute host costs (a plan's second launch, slab carving) are
+        # paid once at capture, never per step. Python engines' heuristics may
+        # then lead with the plan that is fastest on the GPU alone (the SDPA
+        # analyzer records it as facts.cuda_graph_replay). Never forwarded to
+        # the backend; changes no numerics and no support.
+        self.is_cuda_graph_replay_expected = bool(is_cuda_graph_replay_expected)
         self._nodes: List[Node] = []
         self._tensors: Dict[str, Tensor] = {}
         self._tensor_by_uid: Dict[int, Tensor] = {}
@@ -342,6 +378,15 @@ class pygraph:
     def selected_engine(self) -> Optional["BaseEngine"]:
         """The python engine for the currently selected plan entry, or None for
         the backend path. Populated after create_execution_plans().
+
+        Public API, read by integrations after planning: ``None`` means the
+        cuDNN backend serves the selected entry; otherwise ``.name`` is the
+        engine's manifest name (``sdpa_fwd_prefill_sm100`` /
+        ``sdpa_fwd_prefill_sm107`` / ``sdpa_fwd_prefill_sm120``, ...), a stable
+        identifier -- manifest names and slots are append-only, never renamed
+        or reused -- so a caller may compare against one.
+        ``get_plan_name_at_index`` reports the same name with the plan's
+        public knobs appended in brackets.
 
         Cached, because ``execute()`` asks on every call and answering means
         walking every registered engine for the one declaring this id, re-deriving
@@ -895,15 +940,19 @@ class pygraph:
                 if spec_entry:
                     _, spec = spec_entry
                     infer = spec.get("infer", {})
+                    # builder-time dims of a "reinfer" port are provisional: they depend on a sibling the caller may set later
+                    reinfer = spec.get("reinfer", ())
                     for oport, out_t in node.outputs.items():
-                        if out_t is not None and not out_t.dim:
+                        if out_t is not None and (not out_t.dim or (oport in reinfer and not out_t.dim_assigned)):
                             try:
                                 d = infer.get(oport, lambda n: None)(node)
                             except Exception:  # noqa: BLE001 — best-effort
                                 d = None
                             if d:
+                                reinferred = bool(out_t.dim)
                                 out_t.dim = list(d)
-                                out_t.stride = _row_major_stride(out_t.dim)
+                                if not (reinferred and out_t.stride_assigned):  # a re-inferred port keeps the caller's stride
+                                    out_t.stride = _row_major_stride(out_t.dim)
                 node.validate()
         except ValueError:
             # Inference can reject shapes before the family validator runs
@@ -972,6 +1021,28 @@ class pygraph:
         if validator is None or not self._candidate_engines():
             return None
         return validator
+
+    def _backend_guard_reason(self) -> Optional[str]:
+        """A family's reason the backend must NOT be consulted for this graph at planning, or None
+        (``manifest.EngineFamily.backend_guard``: ``guard(graph, facts) -> Optional[str]``).  Answered from
+        the family's facts -- un-memoized while the graph is still mutable, exactly as ``_facts_for`` --
+        and recorded as the backend's decline by the planning sequence, ``_finalize_backend_layout`` (before
+        the first C++ lowering) and ``backend_plan_entries`` (before the heuristics query).  The two paths
+        that create backend plans OUTSIDE that sequence refuse through ``_refuse_guarded_backend``: an
+        explicit ``create_execution_plan(<backend engine id>, knobs)`` (``_append_backend_plan``) and a late
+        backend lowering for a classic query (``_lower_backend_plan``).  ``key()``, ``serialize()`` and a
+        direct ``build_operation_graph()`` only lower (C++ lowering, validate, build_operation_graph): no
+        plan is created there, and that part of the sequence completes on the guarded domain."""
+        from .engines import manifest
+
+        family = manifest.family_for(self) if self._nodes else None
+        if family is None:
+            return None
+        guard, analyzer = manifest.resolve_backend_guard(family), manifest.resolve_analyzer(family)
+        if guard is None or analyzer is None:
+            return None
+        facts = self._facts_for(analyzer)
+        return None if facts is None else guard(self, facts)
 
     def build_operation_graph(self) -> None:
         """Validate the graph; lower to C++ when no python engines are registered.
@@ -1073,10 +1144,20 @@ class pygraph:
             if is_python_engine(cfg.engine_id) and not self._owners_for_id(cfg.engine_id):
                 raise ValueError(f"heuristics produced a plan for unknown python engine_id {cfg.engine_id} (known: {sorted(known)})")
         if not plans:
-            # Say WHY, or the user is left guessing which side had nothing: the
-            # backend's own rejection is the usual answer.
-            why = f" (the backend declined: {self._backend_declined})" if self._backend_declined is not None else ""
-            raise cudnn_graph_not_supported(f"no engine — python or backend — proposed a plan for this graph{why}")
+            # Say WHY, both sides, or the user is left guessing which side had nothing: the backend's own
+            # rejection and every python engine's reason (a failure-path re-run of check_support; the
+            # engines that accepted the graph but whose family proposed nothing are named too).
+            from .engines.heuristics import decline_reasons
+
+            why = []
+            if self._backend_declined is not None:
+                why.append(f"the backend declined: {self._backend_declined}")
+            declined, accepted = decline_reasons(self._candidate_engines(), self)
+            if declined:
+                why.append("python engines declined: " + "; ".join(msg if msg.startswith(name) else f"{name}: {msg}" for name, msg in declined.items()))
+            if accepted:
+                why.append("python engines that accepted the graph but proposed no plan: " + ", ".join(accepted))
+            raise cudnn_graph_not_supported("no engine — python or backend — proposed a plan for this graph" + (f" ({'; '.join(why)})" if why else ""))
         self._plans = plans
         self._planning_done = True
         self._plan_index = 0
@@ -1110,6 +1191,13 @@ class pygraph:
         import cudnn
 
         if not self._backend_lowerable():  # no backend lowering for this op at all
+            return
+        reason = self._backend_guard_reason()
+        if reason is not None:
+            # A family-declared domain where consulting the backend is unsafe (a measured crash of its
+            # planner): recorded as the backend's decline, never lowered (EngineFamily.backend_guard).
+            _LOG.info("backend not consulted for this graph: %s", reason)
+            self._backend_declined = cudnn_graph_not_supported(reason)
             return
         try:
             self._lower_backend_graph()
@@ -1178,7 +1266,7 @@ class pygraph:
                 return node  # no lowering branch at all
             if spec_entry[1].get("python_only"):
                 return node  # declared python-only: lowering raises by design
-            if any(node.params.get(attr) is not None for attr in spec_entry[1].get("python_only_attrs", ())):
+            if any(_python_only_attr_is_set(attr, node.params.get(attr)) for attr in spec_entry[1].get("python_only_attrs", ())):
                 return node  # an op attribute the backend has no field for is SET: python engines only
             if any(node.outputs.get(port) is not None for port in spec_entry[1].get("python_only_out_kwargs", ())):
                 return node  # an output the backend cannot produce (sf_o) is requested: python engines only
@@ -1192,6 +1280,13 @@ class pygraph:
     def backend_plan_entries(self) -> List[Any]:
         """The backend's own ranked ``(engine_id, knobs)`` recommendation, as
         PlanConfig entries carrying their C++ plan index.
+
+        Public API: an integration that must keep the cuDNN backend reachable
+        for a graph (a Stats layout only the backend serves everywhere) asks
+        this after ``create_execution_plans()`` and reads ``[]`` as "the
+        backend does not serve it" -- the answer is the backend's own (or the
+        family's recorded backend guard), independent of which python engines
+        are offered.
 
         Returns [] for the two things that legitimately mean "no backend entries":
         the backend DECLINED the graph (``cudnnGraphNotSupportedError``) or is not
@@ -1227,6 +1322,14 @@ class pygraph:
             self._backend_declined = cudnn_graph_not_supported(
                 f"No valid engine configs for {name}: {name.lower()} has no cuDNN backend lowering; it runs on a python engine"
             )
+            self._backend_entries = []
+            return self._backend_entries
+
+        reason = self._backend_guard_reason()
+        if reason is not None:
+            # A family-declared domain where consulting the backend is unsafe (a measured crash of its
+            # planner): recorded as the backend's decline, never queried (EngineFamily.backend_guard).
+            self._backend_declined = cudnn_graph_not_supported(reason)
             self._backend_entries = []
             return self._backend_entries
 
@@ -1539,8 +1642,25 @@ class pygraph:
                 return mode
         return None
 
+    def _refuse_guarded_backend(self) -> None:
+        """Raise the family's backend guard as a typed decline before a backend PLAN is created or queried.
+
+        The planning sequence records the guard as the backend's decline and never asks
+        (``_finalize_backend_layout``, ``backend_plan_entries``).  Two paths create backend plans outside
+        that sequence and refuse here instead: an explicit ``create_execution_plan(<backend engine id>,
+        knobs)`` (``_append_backend_plan`` -- one C++ engine config, measured to crash exactly as the
+        heuristics query does on the guarded domain) and a late backend lowering for a classic query
+        (``_lower_backend_plan`` -- the heuristics query itself).  So an explicit diagnostic pin of a
+        backend plan on a guarded graph is a decline that names the reason, never a dead process; the
+        reason is recorded as the backend's decline as the planning sequence would have."""
+        reason = self._backend_guard_reason()
+        if reason is not None:
+            self._backend_declined = cudnn_graph_not_supported(reason)
+            raise cudnn_graph_not_supported(reason)
+
     def _lower_backend_plan(self) -> None:
         """Lower to C++ (if not already) and create the backend plans (once)."""
+        self._refuse_guarded_backend()
         self._lower_backend_graph()
         self._create_backend_plans()
 
@@ -1580,6 +1700,7 @@ class pygraph:
         once a candidate exists (plans.h), so the appended plan is neither built
         nor selected by the plain calls. Everything downstream therefore has to
         address it BY INDEX — which is why this returns one."""
+        self._refuse_guarded_backend()  # a backend record replayed onto a guarded graph: a decline, not a crash
         self._lower_backend_graph()  # heuristics would only add plans nobody asked for
         at = self._lowered_graph.get_execution_plan_count()
         self._lowered_graph.create_execution_plan(engine_id, knobs or {})
@@ -1630,9 +1751,10 @@ class pygraph:
         (``NotImplementedError`` / ``cudnnGraphNotSupportedError``) advances the
         walk — any other exception is a bug in that engine and propagates.
 
-        An explicit ``select_plan(i)`` is strict: the walk starts at ``i``, and
-        both a decline there and that plan being barred raise rather than
-        silently running a different plan.
+        An explicit ``select_plan(i)`` is strict: a decline there or that
+        plan being barred raises instead of silently selecting another plan.
+        ALL visits the whole list and retains the selected plan when it builds;
+        declines from other entries do not invalidate the pin.
         """
         import cudnn
 
@@ -1646,9 +1768,12 @@ class pygraph:
         strict = self._plan_pinned
         barred = self._barred_indices()  # once: resolving names can lower the backend
         failures = []
-        for index in range(self._plan_index, len(self._plans)):
+        previous_index = self._plan_index
+        selected_index = None
+        self._is_built = False  # requalify the selection against the current filters
+        for index in range(0 if build_all else previous_index, len(self._plans)):
             if index in barred:
-                if strict:  # select_plan and deselect_engines contradict each other
+                if strict and index == previous_index:  # select_plan and deselect_engines contradict each other
                     raise ValueError(
                         f"plan {index} ({self.get_plan_name_at_index(index)!r}) is pinned by select_plan() but "
                         f"excluded by deselect_engines(); drop one of the two instructions"
@@ -1661,7 +1786,7 @@ class pygraph:
                     if need > self._workspace_limit:
                         raise cudnn_graph_not_supported(f"needs {need} workspace bytes, over the {self._workspace_limit} limit")
             except decline_types() as exc:
-                if strict:
+                if strict and index == previous_index:
                     raise
                 failures.append(f"[{index}] {self.get_plan_name_at_index(index)}: {exc}")
                 _LOG.info("plan %d declined at build time (%s); trying the next entry", index, exc)
@@ -1670,13 +1795,22 @@ class pygraph:
                 self._plan_index = index
                 self._is_built = True
                 return
-            if not self._is_built:  # ALL: the first success is still the selection
-                self._plan_index, self._is_built = index, True
-        if self._is_built:
+            if selected_index is None or index == previous_index:
+                selected_index = index
+        if selected_index is not None:
+            if self._engine_for(self._plans[selected_index]) is None:
+                # Each native build changes C++'s candidate. Re-select the
+                # retained, already-built plan so delegated queries, serialization
+                # and CUDA-graph APIs agree with indexed execution.
+                self._build_plan_at(selected_index, *args, ctx=ctx, **kwargs)
+            self._plan_index, self._is_built = selected_index, True
             return
         if self._backend_declined is not None and not failures:
             raise _detached_exception(self._backend_declined)  # nothing else ran: the backend's failure IS the answer
-        raise cudnn_graph_not_supported("no plan in the list could be built:\n  " + "\n  ".join(failures or ["the plan list is empty"]))
+        # The recorded backend decline too: a list with no backend entry (the backend declined, or a family guard kept
+        # it out) whose python plans all failed to build would otherwise read as if the backend had never been asked.
+        why = f"\n  the backend declined: {self._backend_declined}" if self._backend_declined is not None else ""
+        raise cudnn_graph_not_supported("no plan in the list could be built:\n  " + "\n  ".join(failures or ["the plan list is empty"]) + why)
 
     def _build_plan_at(self, index: int, *args, ctx: Any = None, **kwargs) -> None:
         """Build one entry — the single place the two sides diverge.
@@ -2001,17 +2135,32 @@ class pygraph:
 
         if eng is not None:  # python engine (plan id in the reserved region)
             h = handle if handle is not None else self._handle
-            ctx = ExecutionContext(handle=h, stream=self._resolve_stream(h), workspace=workspace)
+            stream = self._resolve_stream(h)
             # A JIT engine launches through the driver, which reads the calling
             # thread's context stack; an autograd worker has none. The handle's
             # device decides when the stream names no context.
-            ensure_current_context(ctx.stream, h.device.ordinal if h is not None else None)
+            ensure_current_context(stream, h.device.ordinal if h is not None else None)
             if self._plan_index not in self._compiled_plans:
                 # compile with the CALLER's context (execute-supplied handle
                 # and its stream reach the JIT build)
+                ctx = ExecutionContext(handle=h, stream=stream, workspace=workspace)
                 self._compiled_plans[self._plan_index] = eng.build_plan(self, self._selected_plan_config, ctx)
                 self._is_built = True
             plan = self._compiled_plans[self._plan_index]
+            native_ordered = getattr(plan, "_ordered_native", None) if ordered else None
+            if native_ordered is not None:
+                schema = self._prepare_ordered_binding_schema()
+                if schema is None:
+                    raise ValueError("The graph has no operand layout for ordered execution")
+                result = plan._execute_ordered(self, schema, tensor_dict, tensor_uids, workspace, override_uids, override_shapes, override_strides, stream)
+                if result is None:
+                    return
+                # A producer without the exchange protocol is observed once by
+                # the existing Python completion path, then uses the same plan.
+                pack = self._finish_ordered(schema, result, workspace, override_uids)
+                plan.execute(self, pack, ExecutionContext(handle=h, stream=stream, workspace=workspace))
+                return
+            ctx = ExecutionContext(handle=h, stream=stream, workspace=workspace)
             # Overrides go INTO the pack rather than around it: they describe
             # what this execute runs, so an engine reading the pack agrees with
             # the backend without knowing they exist.
@@ -2034,11 +2183,7 @@ class pygraph:
                 plan.execute(self, uid_to_data, ctx)
             return
 
-        variant_pack = (
-            self._normalize_ordered(tensor_dict, tensor_uids, workspace, override_uids, override_shapes, override_strides)
-            if ordered
-            else (None if overriding else self._normalize(uid_to_data, workspace))
-        )
+        variant_pack = None if ordered or overriding else self._normalize(uid_to_data, workspace)
 
         # Backend path. Address the plan the WALK built, not the backend's own
         # selection: they differ once the walk has skipped an entry.
@@ -2046,6 +2191,24 @@ class pygraph:
         cpp_index = cfg.cpp_index if cfg is not None else None
 
         if ordered:
+            schema = self._prepare_ordered_binding_schema()
+            if schema is None:
+                raise ValueError("The graph has no operand layout for ordered execution")
+            result = self._lowered_graph._execute_ordered(
+                schema,
+                tensor_dict,
+                tensor_uids,
+                self._data_bindings,
+                workspace,
+                override_uids,
+                override_shapes,
+                override_strides,
+                to_backend_handle(handle) or 0,
+                -1 if cpp_index is None else cpp_index,
+            )
+            if result is None:
+                return
+            variant_pack = self._finish_ordered(schema, result, workspace, override_uids)
             self._lowered_graph._execute_ordered_pack(
                 variant_pack.native, variant_pack.workspace, to_backend_handle(handle) or 0, -1 if cpp_index is None else cpp_index
             )
@@ -2106,8 +2269,11 @@ class pygraph:
             # "the caller supplies nothing": a gdn graph marks its own O virtual
             # and the caller passes a buffer for it regardless. A slot nobody
             # fills stays empty; which ports are optional is the engine's own
-            # business, and it already reads them with .get().
-            order = sorted({t.uid for node in self._nodes for t in list(node.inputs.values()) + list(node.outputs.values()) if t is not None})
+            # business, and it already reads them with .get().  A port's ragged
+            # offset hangs off its tensor, not a port; it is a caller slot too
+            # (engines that address padded THD layouts read it on device).
+            ports = [t for node in self._nodes for t in list(node.inputs.values()) + list(node.outputs.values()) if t is not None]
+            order = sorted({t.uid for t in ports} | {t.ragged_offset.uid for t in ports if getattr(t, "ragged_offset", None) is not None})
         if not order:
             return None
         self._sorted_uids = order
@@ -2151,6 +2317,8 @@ class pygraph:
         return from_graph
 
     def _workspace_extent_fallback(self, workspace):
+        if type(workspace) is int:
+            return workspace, None  # A raw address carries no observed capacity.
         workspace_ptr, workspace_tensor = self._describe(workspace, -1)
         if not _is_dense(workspace_tensor.dim, workspace_tensor.stride):
             raise ValueError(f"the workspace buffer must be contiguous; got dim {tuple(workspace_tensor.dim)} stride {tuple(workspace_tensor.stride)}")
@@ -2160,7 +2328,11 @@ class pygraph:
         schema = self._prepare_ordered_binding_schema()
         if schema is None:
             raise ValueError("The graph has no operand layout for ordered execution")
-        native, unread, extent, described = schema.read(buffers, tensor_uids, self._data_bindings, workspace, override_uids, override_shapes, override_strides)
+        result = schema.read(buffers, tensor_uids, self._data_bindings, workspace, override_uids, override_shapes, override_strides)
+        return self._finish_ordered(schema, result, workspace, override_uids)
+
+    def _finish_ordered(self, schema, result, workspace, override_uids):
+        native, unread, extent, described = result
         if unread:
             from_graph = self._observe_unread(native, unread, self._ordered_binding_uids)
             described = from_graph + schema.finish(native, from_graph)
@@ -2742,6 +2914,8 @@ _install_pointwise_builders()
 #                      whose predicate is False is skipped, and comes back None)
 #   infer              per-output IR-side shape inference (introspection; cuDNN
 #                      re-infers at build) — best-effort, None on failure
+#   reinfer            output ports whose builder-time inferred dims validate()
+#                      recomputes (they follow a sibling the caller may set later)
 #   dtype_like         per-output data_type copied from a named input port
 #   push_output_dims   True for ops whose output dims cuDNN cannot infer
 #                      (dgrad/wgrad/reduction/reshape/...): IR dims are pushed
@@ -2821,7 +2995,7 @@ def _linear_attention_final_state_dims(node):
     state0 = node.inputs.get("initial_state")
     if node.inputs.get("state_indices") is not None and state0 is not None and state0.dim:
         rows = state0.dim[0]
-    return [rows, max(q[1], v[1]), v[2], q[2]]
+    return [rows, max(q[-2], v[-2]), v[-1], q[-1]]
 
 
 def _linear_attention_summary_final_dims(node):
@@ -2830,7 +3004,7 @@ def _linear_attention_summary_final_dims(node):
     cu = node.inputs.get("cu_seqlens")
     if cu is None or not cu.dim:
         return None
-    return [cu.dim[0] - 1, g[1], v[2], k[2]]
+    return [cu.dim[0] - 1, g[1], v[-1], k[-1]]
 
 
 def _linear_attention_transition_dims(node):
@@ -2839,7 +3013,7 @@ def _linear_attention_transition_dims(node):
     cu = node.inputs.get("cu_seqlens")
     if cu is None or not cu.dim:
         return None
-    return [cu.dim[0] - 1, g[1], k[2], k[2]]
+    return [cu.dim[0] - 1, g[1], k[-1], k[-1]]
 
 
 def linear_attention_summary_bwd_dims(node):
@@ -2848,7 +3022,7 @@ def linear_attention_summary_bwd_dims(node):
     cu = node.inputs.get("cu_seqlens")
     if cu is None or not cu.dim:
         return None
-    return [cu.dim[0] - 1, g[1], do[2], k[2]]
+    return [cu.dim[0] - 1, g[1], do[-1], k[-1]]
 
 
 def _linear_attention_state_checkpoints_dims(node):
@@ -2857,19 +3031,28 @@ def _linear_attention_state_checkpoints_dims(node):
     cu = node.inputs["cu_seqlens"].dim if node.inputs.get("cu_seqlens") is not None else None
     if not n or not q or not v or not cu:
         return None
-    return [max(v[0] // n + (cu[0] - 1), 1), max(q[1], v[1]), v[2], q[2]]
+    return [max((v[0] * v[1] if len(v) == 4 else v[0]) // n + (cu[0] - 1), 1), max(q[-2], v[-2]), v[-1], q[-1]]
 
 
 def _linear_attention_o_dims(node):
     # [total_T, HO, V]: the output lives at the gate heads (HO = max(q, v))
     q, v = node.inputs["q"].dim, node.inputs["v"].dim
-    return [v[0], max(q[1], v[1]), v[2]]
+    return [v[0] * v[1] if len(v) == 4 else v[0], max(q[-2], v[-2]), v[-1]]
 
 
 def _gdp_o_dims(node):
-    # [total_T, HO, V]: O follows q's rows; k/v carry the num_householder expansion
+    # [total_T, HO, V]: O follows q's rows; k/v carry the num_householder expansion (expanded rows or token-major)
     q, v = node.inputs["q"].dim, node.inputs["v"].dim
-    return [q[0], max(q[1], v[1]), v[2]]
+    return [q[0], max(q[-2], v[-2]), v[-1]]
+
+
+def _mamba2_transition_dims(node):
+    # [N, HO]: the Mamba-2 piece transition is one scalar (log2 of the decay product) per sequence and head
+    g = node.inputs["g"].dim
+    cu = node.inputs.get("cu_seqlens")
+    if cu is None or not cu.dim:
+        return None
+    return [cu.dim[0] - 1, g[1]]
 
 
 def _block_quant_scale_dims(node):
@@ -2881,7 +3064,29 @@ def _block_quant_scale_dims(node):
     return d
 
 
-_NORM_FWD_INFER = {"Y": _like("input"), "mean": _stats_like("input", (0,)), "inv_var": _stats_like("input", (0,))}
+def _norm_stats_like(first_axis):  # the C++ node's rule: input dims, 1 wherever scale is not 1 (from first_axis on)
+    def infer(node):
+        d = node.inputs["input"].dim if "input" in node.inputs else None
+        s = node.inputs["scale"].dim if node.inputs.get("scale") is not None else None
+        if not d:
+            return None
+        if not s:  # no scale (rmsnorm, #188): every axis after the batch axis is normalized
+            return [x if i == 0 else 1 for i, x in enumerate(d)]
+        return [1 if i >= first_axis and s[i] != 1 else x for i, x in enumerate(d)]
+
+    return infer
+
+
+def _layernorm_stat_like(other):  # the C++ layernorm node's rule: an unset stat takes the dims set on the other one
+    def infer(node):
+        t = node.outputs.get(other)
+        return list(t.dim) if t is not None and t.dim_assigned and t.dim else _norm_stats_like(0)(node)
+
+    return infer
+
+
+_NORM_FWD_INFER = {"Y": _like("input"), "mean": _layernorm_stat_like("inv_var"), "inv_var": _layernorm_stat_like("mean")}
+_ADANORM_FWD_INFER = {"Y": _like("input"), "mean": _norm_stats_like(1), "inv_var": _norm_stats_like(1)}
 _NORM_BWD_INFER = {"DX": _like("input"), "DScale": _like("scale"), "DBias": _like("scale")}
 
 
@@ -2892,6 +3097,11 @@ def _training_phase(node):  # norm stats exist only in TRAINING forward phase
 
 _NORM_FWD_MAYBE = {"mean": _training_phase, "inv_var": _training_phase}
 
+
+def _has_scale(node):  # rmsnorm/layernorm backward without a scale have no DScale or DBias (#188)
+    return node.inputs.get("scale") is not None
+
+
 _STRUCTURED_OPS = {
     # ---- norms --------------------------------------------------------------
     "rmsnorm": dict(
@@ -2900,7 +3110,7 @@ _STRUCTURED_OPS = {
         attrs=("norm_forward_phase",),
         outputs=("Y", "inv_var"),
         maybe={"inv_var": _training_phase},
-        infer={"Y": _like("input"), "inv_var": _stats_like("input", (0,))},
+        infer={"Y": _like("input"), "inv_var": _norm_stats_like(0)},
     ),
     "rmsnorm_backward": dict(
         node_type=NodeType.RMSNORM_BWD,
@@ -2910,7 +3120,7 @@ _STRUCTURED_OPS = {
         # classic rmsnorm_backward names its outputs ::Dscale/::Dbias (mixed
         # case), unlike the other norm backwards (::DSCALE/::DBIAS)
         out_suffix={"DScale": "Dscale", "DBias": "Dbias"},
-        maybe={"DBias": lambda n: n.params.get("has_dbias", True) is not False},
+        maybe={"DScale": _has_scale, "DBias": lambda n: _has_scale(n) and n.params.get("has_dbias", True) is not False},
         infer=_NORM_BWD_INFER,
     ),
     "layernorm": dict(
@@ -2920,11 +3130,13 @@ _STRUCTURED_OPS = {
         outputs=("Y", "mean", "inv_var"),
         maybe=_NORM_FWD_MAYBE,
         infer=_NORM_FWD_INFER,
+        reinfer=("mean", "inv_var"),
     ),
     "layernorm_backward": dict(
         node_type=NodeType.LAYERNORM_BWD,
         inputs=("grad", "input", "scale", "mean", "inv_variance"),
         outputs=("DX", "DScale", "DBias"),
+        maybe={"DScale": _has_scale, "DBias": _has_scale},
         infer=_NORM_BWD_INFER,
     ),
     "adalayernorm": dict(
@@ -2933,7 +3145,7 @@ _STRUCTURED_OPS = {
         attrs=("norm_forward_phase",),
         outputs=("Y", "mean", "inv_var"),
         maybe=_NORM_FWD_MAYBE,
-        infer=_NORM_FWD_INFER,
+        infer=_ADANORM_FWD_INFER,
     ),
     "adalayernorm_backward": dict(
         node_type=NodeType.ADALAYERNORM_BWD,
@@ -3016,12 +3228,19 @@ _STRUCTURED_OPS = {
     "moe_grouped_matmul": dict(
         node_type=NodeType.MOE_GROUPED_MATMUL,
         inputs=("token", "weight", "first_token_offset", "token_index", "token_ks"),
+        keyword_inputs=("top_k_scores",),
         attrs=("mode", "top_k"),
         outputs=("OUT_0",),
         infer={
             "OUT_0": lambda n: [
                 1,
-                n.inputs["token_index" if n.params.get("mode") == cudnn.moe_grouped_matmul_mode.GATHER else "token"].dim[-2],
+                n.inputs[
+                    (
+                        "top_k_scores"
+                        if n.params.get("mode") == cudnn.moe_grouped_matmul_mode.COMBINE
+                        else "token_index" if n.params.get("mode") == cudnn.moe_grouped_matmul_mode.GATHER else "token"
+                    )
+                ].dim[-2],
                 n.inputs["weight"].dim[-1],
             ]
         },
@@ -3106,6 +3325,83 @@ _STRUCTURED_OPS = {
         outputs=("d_initial_state", "transition"),
         maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
         infer={"d_initial_state": linear_attention_summary_bwd_dims, "transition": _linear_attention_transition_dims},
+        python_only=True,
+    ),
+    "mamba2": dict(
+        node_type=NodeType.MAMBA2,
+        inputs=("q", "k", "v", "g", "a", "cu_seqlens", "initial_state", "dt_bias", "d", "z", "state_indices"),
+        attrs=(
+            "output_final_state",
+            "checkpoint_every_n_tokens",
+            "dt_softplus",
+            "dt_min",
+            "dt_max",
+            "output_pre_gate",
+            "batch_invariant",
+            "overwrite_initial_state",
+        ),
+        outputs=("O", "final_state", "state_checkpoints", "O_pre"),
+        maybe={
+            "final_state": lambda n: bool(n.params.get("output_final_state", False)),
+            "state_checkpoints": lambda n: bool(n.params.get("checkpoint_every_n_tokens") or 0),
+            "O_pre": lambda n: bool(n.params.get("output_pre_gate", False)) and "z" in n.inputs,
+        },
+        infer={
+            "O": _linear_attention_o_dims,
+            "final_state": _linear_attention_final_state_dims,
+            "state_checkpoints": _linear_attention_state_checkpoints_dims,
+            "O_pre": _linear_attention_o_dims,
+        },
+        python_only=True,
+    ),
+    "mamba2_bwd": dict(
+        node_type=NodeType.MAMBA2_BWD,
+        inputs=("q", "k", "v", "g", "a", "cu_seqlens", "dO", "state_checkpoints", "initial_state", "d_final_state", "dt_bias", "d", "z", "O_pre"),
+        attrs=(
+            "checkpoint_every_n_tokens",
+            "dt_softplus",
+            "dt_min",
+            "dt_max",
+            "batch_invariant",
+            "overwrite_initial_state",
+        ),
+        outputs=("dQ", "dK", "dV", "dG", "dA", "d_initial_state", "d_dt_bias", "dD", "dZ"),
+        maybe={
+            "d_initial_state": lambda n: "initial_state" in n.inputs,
+            "d_dt_bias": lambda n: "dt_bias" in n.inputs,
+            "dD": lambda n: "d" in n.inputs,
+            "dZ": lambda n: "z" in n.inputs,
+        },
+        infer={
+            "dQ": _like("q"),
+            "dK": _like("k"),
+            "dV": _like("v"),
+            "dG": _like("g"),
+            "dA": _like("a"),
+            "d_initial_state": _like("initial_state"),
+            "d_dt_bias": _like("dt_bias"),
+            "dD": _like("d"),
+            "dZ": _like("z"),
+        },
+        dtype_like={"d_initial_state": "initial_state", "dA": "a", "d_dt_bias": "dt_bias", "dD": "d", "dZ": "z"},
+        python_only=True,
+    ),
+    "mamba2_summary": dict(
+        node_type=NodeType.MAMBA2_SUMMARY,
+        inputs=("k", "v", "g", "a", "cu_seqlens", "initial_state", "dt_bias"),
+        attrs=("output_transition", "dt_softplus", "dt_min", "dt_max", "batch_invariant"),
+        outputs=("final_state", "transition"),
+        maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
+        infer={"final_state": _linear_attention_summary_final_dims, "transition": _mamba2_transition_dims},
+        python_only=True,
+    ),
+    "mamba2_summary_bwd": dict(
+        node_type=NodeType.MAMBA2_SUMMARY_BWD,
+        inputs=("q", "k", "g", "a", "cu_seqlens", "dO", "d_final_state", "dt_bias"),
+        attrs=("output_transition", "dt_softplus", "dt_min", "dt_max", "batch_invariant"),
+        outputs=("d_initial_state", "transition"),
+        maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
+        infer={"d_initial_state": linear_attention_summary_bwd_dims, "transition": _mamba2_transition_dims},
         python_only=True,
     ),
     "gdp": dict(
@@ -3491,8 +3787,13 @@ def _install_structured_builders() -> None:
                 kwargs[ak] = v
             args = args[:n_p]
             for port, v in zip(input_ports, args):
-                node.inputs[port] = self._ensure_tensor(v, name=f"{name_}::{port}")
+                if v is not None:  # an optional port passed positionally as None (e.g. scale, #188)
+                    node.inputs[port] = self._ensure_tensor(v, name=f"{name_}::{port}")
             for port in input_ports[len(args) :]:
+                v = kwargs.pop(port, None)
+                if v is not None:
+                    node.inputs[port] = self._ensure_tensor(v, name=f"{name_}::{port}")
+            for port in spec.get("keyword_inputs", ()):
                 v = kwargs.pop(port, None)
                 if v is not None:
                     node.inputs[port] = self._ensure_tensor(v, name=f"{name_}::{port}")
@@ -3646,11 +3947,27 @@ _CAPTURED_OPS = {
         # engine that honors them can serve the graph. `softmax_precision`
         # (cudnn.data_type.FLOAT | HALF, default FLOAT) asks for the softmax
         # accumulator precision -- numerics-changing, hence an op attribute
-        # rather than a tuning knob.
-        python_only_attrs=("softmax_precision",),
+        # rather than a tuning knob.  `attn_scale_prefolded` (bool, default False)
+        # states that the caller pre-multiplied Q by attn_scale * log2(e): the
+        # engine applies no softmax scale (attn_scale must stay unset); False
+        # counts as unset.  Served by the cc 10.7 python engines only.
+        python_only_attrs=("softmax_precision", "attn_scale_prefolded"),
+        # ``kv_mask``: a per-key mask ``(1|B, 1, 1, S_kv)`` (broadcast over the heads
+        # and the query rows) the backend has no field for -- an INPUT python engines
+        # fold in-kernel; a graph that binds it is python-engines-only (see
+        # sdpa_mxfp8's scale_o).  BOOLEAN: False = the key is masked for every query,
+        # like a key past ``seq_len_kv`` (a query whose every key is masked reads
+        # O = 0 and Stats = -inf, the FROST empty-row contract).  The Q/K/V dtype or
+        # FLOAT: an ADDITIVE per-key vector added to the scaled scores (the models'
+        # finite -1e9 fold as a value; S_kv % 8 == 0, 16-byte strides).
+        python_only_in_kwargs=("kv_mask",),
     ),
     "sdpa_backward": dict(
         node_type=NodeType.SDPA_BWD,
+        # The forward's two softmax attributes are FORWARD-ONLY (the backward recomputes P from the
+        # forward's unscaled contract).  Declared python-only here too so a SET value keeps the node off
+        # the backend (the C++ binding has no such argument) and the analyzer's typed decline surfaces.
+        python_only_attrs=("softmax_precision", "attn_scale_prefolded"),
         pos=("q", "k", "v", "o", "dO", "stats"),
         outputs=("dQ", "dK", "dV"),
         out_kwargs=("dBias", "dSink_token", "rng_dump"),
@@ -3669,10 +3986,11 @@ _CAPTURED_OPS = {
         python_only_out_kwargs=("sf_o",),
         maybe={"Stats": _stats_expected},
         infer={"O": _sdpa_o_dims, "Stats": _sdpa_stats_dims, "Amax_S": _AMAX, "Amax_O": _AMAX},
-        python_only_attrs=("softmax_precision",),  # see "sdpa"
+        python_only_attrs=("softmax_precision", "attn_scale_prefolded"),  # see "sdpa"
     ),
     "sdpa_fp8_backward": dict(
         node_type=NodeType.SDPA_FP8_BWD,
+        python_only_attrs=("softmax_precision", "attn_scale_prefolded"),  # forward-only, see "sdpa_backward"
         pos=(
             "q",
             "k",
@@ -3731,11 +4049,16 @@ _CAPTURED_OPS = {
         out_kwargs=("sf_o",),
         python_only_out_kwargs=("sf_o",),
         python_only_in_kwargs=("scale_o",),
+        # The same two op attributes as "sdpa".  Without this entry a SET
+        # softmax_precision would be forwarded to the C++ sdpa_mxfp8 (which has
+        # no such argument) instead of keeping the node on the python engines.
+        python_only_attrs=("softmax_precision", "attn_scale_prefolded"),
         maybe={"Stats": _stats_expected},
         infer={"O": _sdpa_o_dims, "Stats": _sdpa_stats_dims, "Amax_O": _AMAX},
     ),
     "sdpa_mxfp8_backward": dict(
         node_type=NodeType.SDPA_MXFP8_BWD,
+        python_only_attrs=("softmax_precision", "attn_scale_prefolded"),  # forward-only, see "sdpa_backward"
         pos=(
             "q",
             "q_T",

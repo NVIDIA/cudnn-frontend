@@ -1148,10 +1148,12 @@ def test_sdpa_bwd_dsl_sm120_envelope_pad_compact_strides():
 @pytest.mark.L0
 @torch_fork_set_rng(seed=8)
 def test_sdpa_bwd_dsl_sm120_strided_io_rejects_unaligned():
-    """Non-16-byte-multiple strides decline at build and fall through to the
-    backend (Rule 2: never a copy)."""
+    """Non-16-byte-multiple strides decline at build (Rule 2: never a copy).
+    The backend refuses the same stride (#1571), so no plan builds."""
 
     _require_dsl()
+    import cudnn
+
     batch, h, s, d = 2, 4, 128, 64
     # head stride 68 elems: not a multiple of the 8-element fp16 quantum
     q = torch.randn(batch, s, h, d + 4, dtype=torch.float16, device="cuda").transpose(1, 2)[..., :d]
@@ -1161,8 +1163,9 @@ def test_sdpa_bwd_dsl_sm120_strided_io_rejects_unaligned():
     scale = 1.0 / math.sqrt(d)
     o, stats, _, _, _, _ = _ref_bwd(q, k, v, do, scale=scale)
     o = _bhsd(batch, h, s, d, torch.float16, empty=True).copy_(o)
-    plan_name = _run_bwd_graph(q, k, v, o, do, stats, scale=scale, select=False, build_only=True)[-1]
-    assert plan_name != ENGINE
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="not a multiple of the tensor's 16-byte alignment") as exc:
+        _run_bwd_graph(q, k, v, o, do, stats, scale=scale, select=False, build_only=True)
+    assert "cannot address natively" in str(exc.value)
 
 
 @pytest.mark.L0
@@ -2054,24 +2057,19 @@ class TestPreparedSm120Bwd:
 
     @pytest.mark.L0
     @pytest.mark.parametrize("failure", ["missing", "dtype", "device", "span", "alignment", "extra", "workspace_alias", "geometry", "strided_lengths"])
-    def test_validate_before_any_stage(self, failure, monkeypatch):
+    def test_validate_before_any_stage(self, failure):
         from dataclasses import replace
         from cudnn.sdpa.bwd import prepared
         from cudnn.sdpa.fwd.prepared import facts_of_tensor
 
-        observed = []
-        execute = prepared.execute
-
-        def observe(spec, *args, **kwargs):
-            observed.append(spec)
-            return execute(spec, *args, **kwargs)
-
-        with monkeypatch.context() as patcher:
-            patcher.setattr(prepared, "execute", observe)
-            case = _prepared_bwd_case()
-        assert observed, "the graph did not take prepared backward"
+        case = _prepared_bwd_case()
+        launch = case.graph._compiled_plans[case.graph._plan_index]._prepared
+        assert isinstance(launch, prepared.PreparedBwdLaunch), "the graph did not take prepared backward"
+        # The graph now binds natively; retain this standalone/Python validation
+        # test by reading the actual plan instead of intercepting its old route.
         launches = []
-        spec = replace(observed[-1], fn=lambda *args: launches.append(args))
+        execute = prepared.execute
+        spec = replace(launch.spec, fn=lambda *args: launches.append(args))
         facts = {name: facts_of_tensor(value) for name, value in case.tensors.items()}
         workspace = case.workspace.data_ptr()
         geometry = None

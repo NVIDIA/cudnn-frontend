@@ -37,6 +37,42 @@ from ..common.host import get_dtype
 from ..common.piece_chain import dtype_name, launch_state_chain
 from . import kda_chain_prologue_f16, kda_prefill_f16, kda_summary_f16
 
+CHAIN_FORWARD_BUFFERS = (
+    "q",
+    "k",
+    "v",
+    "gate",
+    "beta",
+    "a_log",
+    "dt_bias",
+    "o",
+    "cu_seqlens",
+    "cu_pieces",
+    "cu_pieces",
+    "main_rows",
+    "summary_rows",
+    "main_count",
+    "summary_count",
+    "work_items",
+    "work_items_summary",
+    "scheduler_all",
+    "scheduler_summary",
+    "scheduler_prefill",
+    "summary_words",
+    "prefill_words",
+    "state_h",
+    "state_m",
+    "state_h",
+    "state_m",
+    "state_x",
+    "seed",
+    "seed_indices",
+    "state_x",
+    "final_state",
+    "final_indices",
+    "checkpoints",
+)
+
 chain_forward_cache = {}
 
 
@@ -194,7 +230,7 @@ def chain_forward_host(
     )
 
 
-def build_configs(io_dtype, state_dtype, gate_dtype, *, store_final_state, enable_checkpoints, **flags):
+def build_configs(io_dtype, state_dtype, gate_dtype, *, store_final_state, enable_checkpoints, checkpoint_dtype=None, **flags):
     summary_cfg = kda_summary_f16.build_cfg(io_dtype, gate_dtype, use_initial_state=False, **flags)
     prefill_cfg = kda_prefill_f16.build_cfg(
         io_dtype,
@@ -203,6 +239,7 @@ def build_configs(io_dtype, state_dtype, gate_dtype, *, store_final_state, enabl
         use_initial_state=True,
         store_final_state=store_final_state,
         enable_checkpoints=enable_checkpoints,
+        checkpoint_dtype=checkpoint_dtype,
         **flags,
     )
     return summary_cfg, prefill_cfg
@@ -299,6 +336,7 @@ def build_chain_forward(
         bool(use_beta_sigmoid),
         bool(allow_neg_eigval),
         int(checkpoint_every_n_tokens) > 0,
+        str(checkpoints.dtype) if int(checkpoint_every_n_tokens) > 0 else "none",
         final_state is not None,
         has_seed,
         seed_indices is not None,
@@ -312,6 +350,7 @@ def build_chain_forward(
             gate_dtype,
             store_final_state=final_state is not None,
             enable_checkpoints=int(checkpoint_every_n_tokens) > 0,
+            checkpoint_dtype=get_dtype(checkpoints.dtype) if int(checkpoint_every_n_tokens) > 0 else None,
             l2norm=use_qk_l2norm,
             safe_gate=safe_gate,
             gate_scale_log2=gate_scale_log2,
@@ -421,46 +460,14 @@ def run_chain_forward(
     scale,
     stream,
 ) -> None:
-    """Replay the chain forward: one crossing into the DSL for the four launches.  The plan validated the contract at build,
-    so nothing here raises."""
+    """Launch the compiled chain with the current buffers and stream."""
+    buffers = locals()
     compiled(
         int(pieces),
         int(heads_out),
         int(num_seqs),
         int(checkpoint_every_n_tokens),
         float(scale),
-        q,
-        k,
-        v,
-        gate,
-        beta,
-        a_log,
-        dt_bias,
-        o,
-        cu_seqlens,
-        cu_pieces,
-        cu_pieces,
-        main_rows,
-        summary_rows,
-        main_count,
-        summary_count,
-        work_items,
-        work_items_summary,
-        scheduler_all,
-        scheduler_summary,
-        scheduler_prefill,
-        summary_words,
-        prefill_words,
-        state_h,
-        state_m,
-        state_h,
-        state_m,
-        state_x,
-        seed,
-        seed_indices,
-        state_x,
-        final_state,
-        final_indices,
-        checkpoints,
+        *(buffers[name] for name in CHAIN_FORWARD_BUFFERS),
         cuda.CUstream(int(stream)),
     )

@@ -164,6 +164,97 @@ class SingleTileScheduler:
         return SingleTileScheduler(*(tuple(obj_list)), loc=self._loc)
 
 
+class SingleTileHeadFastScheduler:
+    """One tile per CTA, heads fastest: grid (num_block * num_head, 1, num_batch).
+
+    Adjacent head tiles may improve L2 reuse; execution order is unspecified.
+    """
+
+    @dataclass
+    class Params(ParamsBase):
+        num_block: Int32
+        num_head: Int32
+        num_batch: Int32
+        num_head_divmod: FastDivmodDivisor
+
+        @staticmethod
+        def create(args: TileSchedulerArguments, *, loc=None, ip=None) -> "SingleTileHeadFastScheduler.Params":
+            """Build head-fast parameters from tile scheduler arguments."""
+            return SingleTileHeadFastScheduler.Params(
+                args.num_block,
+                args.num_head,
+                args.num_batch,
+                FastDivmodDivisor(args.num_head),
+            )
+
+    def __init__(self, params: Params, blk_coord: cute.Coord, *, loc=None, ip=None):
+        """Initialize the CTA coordinates and single-tile validity state."""
+        self.params = params
+        self._blk_coord = blk_coord
+        self._is_first_block = True
+        self._loc = loc
+        self._ip = ip
+
+    @staticmethod
+    def to_underlying_arguments(args: TileSchedulerArguments, *, loc=None, ip=None) -> Params:
+        """Convert tile scheduler arguments to head-fast parameters."""
+        return SingleTileHeadFastScheduler.Params.create(args, loc=loc, ip=ip)
+
+    @staticmethod
+    def create(params: Params, *, loc=None, ip=None) -> "SingleTileHeadFastScheduler":
+        """Create a scheduler for the current CTA."""
+        blk_coord = cute.arch.block_idx()
+        return SingleTileHeadFastScheduler(params, blk_coord, loc=loc, ip=ip)
+
+    @staticmethod
+    def get_grid_shape(
+        params: Params,
+        *,
+        loc=None,
+        ip=None,
+    ) -> Tuple[Int32, Int32, Int32]:
+        """Return the head-fast grid (num_block * num_head, 1, num_batch)."""
+        return (params.num_block * params.num_head, Int32(1), params.num_batch)
+
+    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+        """Return this CTA's tile and validity with split index zero."""
+        block_head_idx, _, batch_idx = self._blk_coord
+        block_idx, head_idx = divmod(block_head_idx, self.params.num_head_divmod)
+        return WorkTileInfo(
+            (block_idx, head_idx, batch_idx, Int32(0)),
+            self._is_first_block,
+        )
+
+    def initial_work_tile_info(self, *, loc=None, ip=None):
+        """Return this CTA's initial work tile."""
+        return self.get_current_work(loc=loc, ip=ip)
+
+    def prefetch_next_work(self, *, loc=None, ip=None):
+        """Do nothing because each CTA processes only one tile."""
+        pass
+
+    def advance_to_next_work(self, *, loc=None, ip=None):
+        """Mark this CTA's tile as consumed."""
+        self._is_first_block = False
+
+    def __extract_mlir_values__(self):
+        """Extract parameters and CTA coordinates, recording their MLIR lengths."""
+        values, self._values_pos = [], []
+        for obj in [self.params, self._blk_coord]:
+            obj_values = cutlass.extract_mlir_values(obj)
+            values += obj_values
+            self._values_pos.append(len(obj_values))
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        """Rebuild scheduler parameters and CTA coordinates from MLIR values."""
+        obj_list = []
+        for obj, n_items in zip([self.params, self._blk_coord], self._values_pos):
+            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
+            values = values[n_items:]
+        return SingleTileHeadFastScheduler(*(tuple(obj_list)), loc=self._loc)
+
+
 class StaticPersistentTileScheduler:
     @dataclass
     class Params(ParamsBase):

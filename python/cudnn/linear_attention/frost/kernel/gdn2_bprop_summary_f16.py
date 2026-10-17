@@ -89,7 +89,6 @@ from ..common.thd import TENSOR_MAP_QWORDS, emit_seq_descs
 from .gdn2_bprop_config import CFG
 
 from cudnn.frost.tile_dsl.barrier import (
-    launch_dependent_grids,
     wait_on_dependent_grids,
     advance,
     MBarrier,
@@ -112,7 +111,7 @@ USE_PDL = True
 
 LOG2_E: float = 1.4426950408889634
 DEFAULT_GATE_LOWER_BOUND: float = -5.0
-L2_NORM_EPS: float = 1.0e-12
+L2_NORM_EPS: float = 1.0e-6
 
 
 class Gdn2BpropSummaryBars(NamedTuple):
@@ -863,8 +862,6 @@ def tmaldg_warp(
             raw_index = advance(raw_index, cfg.smem_raw_stages)
         next_tile, scheduler_state = scheduler_publish_next(cfg, bars, sScheduler, mScheduler, scheduler_state, num_ctas, elect_one)
         tile_idx = next_tile
-    if cutlass.const_expr(USE_PDL):
-        launch_dependent_grids()
 
 
 @cute.jit
@@ -1121,9 +1118,8 @@ def compute0_warp_group(
                 k_sum_sq = k_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 4, 31, kind=nvvm.Shfl.BFLY))
                 k_sum_sq = k_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 2, 31, kind=nvvm.Shfl.BFLY))
                 k_sum_sq = k_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 1, 31, kind=nvvm.Shfl.BFLY))
-                norm_floor_sq = cutlass.Float32(L2_NORM_EPS * L2_NORM_EPS)
-                q_inv_norm = cute.math.rsqrt(cute.math.max(q_sum_sq, norm_floor_sq), fastmath=True)
-                k_inv_norm = cute.math.rsqrt(cute.math.max(k_sum_sq, norm_floor_sq), fastmath=True)
+                q_inv_norm = cute.math.rsqrt(q_sum_sq + cutlass.Float32(L2_NORM_EPS), fastmath=True)
+                k_inv_norm = cute.math.rsqrt(k_sum_sq + cutlass.Float32(L2_NORM_EPS), fastmath=True)
             q_stage_norm = q_inv_norm * scale
 
             # ---- Beta guard ----------------------------------------------------------
@@ -1539,7 +1535,6 @@ def frost_gdn2_bprop_summary_prologue(
     arrays via :func:`build_descs_body`, one warp per array."""
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
-        launch_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
     tidx = cutlass.Int32(tidx)
     widx = tidx // cutlass.Int32(32)
@@ -1674,7 +1669,7 @@ def host(
 
     # ---- launch ----------------------------------------------------------------------
     n_desc = num_sequences
-    grid_shape = (cfg.max_active_clusters, 1, 1)
+    grid_shape = (cutlass.min(cutlass.Int32(cfg.max_active_clusters), cutlass.max(cutlass.Int32(work_items.shape[0]), cutlass.Int32(1))), 1, 1)
     frost_gdn2_bprop_summary(
         cfg,
         q_ratio,

@@ -90,7 +90,6 @@ from ..common.thd import TENSOR_MAP_QWORDS, emit_checkpoint_seq_descs, emit_seq_
 from .gdn2_recompute_config import CFG
 
 from cudnn.frost.tile_dsl.barrier import (
-    launch_dependent_grids,
     wait_on_dependent_grids,
     advance,
     MBarrier,
@@ -118,7 +117,7 @@ USE_PDL = True
 
 LOG2_E: float = 1.4426950408889634
 DEFAULT_GATE_LOWER_BOUND: float = -5.0
-L2_NORM_EPS: float = 1.0e-12
+L2_NORM_EPS: float = 1.0e-6
 
 
 class Gdn2RecomputeBars(NamedTuple):
@@ -759,8 +758,6 @@ def tmaldg_warp(
             raw_index = advance(raw_index, cfg.smem_raw_stages)
             raw_bar_index = advance(raw_bar_index, cfg.smem_raw_bar_stages)
         tile_idx, scheduler_state = scheduler_publish_next(cfg, bars, sScheduler, mScheduler, scheduler_state, num_ctas, elect_one)
-    if cutlass.const_expr(USE_PDL):
-        launch_dependent_grids()
 
 
 @cute.jit
@@ -988,8 +985,7 @@ def compute0_warp_group(
                 k_sum_sq = k_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 4, 31, kind=nvvm.Shfl.BFLY))
                 k_sum_sq = k_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 2, 31, kind=nvvm.Shfl.BFLY))
                 k_sum_sq = k_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 1, 31, kind=nvvm.Shfl.BFLY))
-                norm_floor_sq = cutlass.Float32(L2_NORM_EPS * L2_NORM_EPS)
-                k_inv_norm = cute.math.rsqrt(cute.math.max(k_sum_sq, norm_floor_sq), fastmath=True)
+                k_inv_norm = cute.math.rsqrt(k_sum_sq + cutlass.Float32(L2_NORM_EPS), fastmath=True)
 
             # ---- Beta guard ----------------------------------------------------------
             if cutlass.const_expr(cfg.beta_guard):
@@ -1959,30 +1955,24 @@ def build_descs_body(
     sub5 = cute.make_tensor(tensormap_workspace.iterator + 5 * arr_words, cute.make_layout((arr_words,), stride=(1,)))
 
     if widx == 0:
-        if nvvm.elect_sync():
-            emit_seq_descs(base_k, sub0, cu_seqlens, k, n_batch, 2)
-            nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
+        emit_seq_descs(base_k, sub0, cu_seqlens, k, n_batch, 2, lanes=32)
+        nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     if widx == 1:
-        if nvvm.elect_sync():
-            emit_seq_descs(base_v, sub1, cu_seqlens, v, n_batch, 2)
-            nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
+        emit_seq_descs(base_v, sub1, cu_seqlens, v, n_batch, 2, lanes=32)
+        nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     if widx == 2:
-        if nvvm.elect_sync():
-            emit_seq_descs(base_gate, sub2, cu_seqlens, gate, n_batch, 2)
-            nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
+        emit_seq_descs(base_gate, sub2, cu_seqlens, gate, n_batch, 2, lanes=32)
+        nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     if widx == 3:
-        if nvvm.elect_sync():
-            emit_seq_descs(base_beta, sub3, cu_seqlens, beta, n_batch, 2)
-            nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
+        emit_seq_descs(base_beta, sub3, cu_seqlens, beta, n_batch, 2, lanes=32)
+        nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     if widx == 4:
-        if nvvm.elect_sync():
-            emit_seq_descs(base_w, sub4, cu_seqlens, w, n_batch, 2)
-            nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
+        emit_seq_descs(base_w, sub4, cu_seqlens, w, n_batch, 2, lanes=32)
+        nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     if cutlass.const_expr(state_checkpoints is not None):
         if widx == 5:
-            if nvvm.elect_sync():
-                emit_checkpoint_seq_descs(base_checkpoint, sub5, cu_seqlens, state_checkpoints, n_batch, checkpoint_every_n, 2)
-                nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
+            emit_checkpoint_seq_descs(base_checkpoint, sub5, cu_seqlens, state_checkpoints, n_batch, checkpoint_every_n, 2, lanes=32)
+            nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
 
 
 @cute.kernel
@@ -2020,7 +2010,6 @@ def frost_gdn2_recompute_prologue(
     arrays via :func:`build_descs_body`, one warp per array."""
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
-        launch_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
     tidx = cutlass.Int32(tidx)
     widx = tidx // cutlass.Int32(32)
@@ -2085,34 +2074,20 @@ def frost_gdn2_recompute_prologue(
 
 
 @cute.jit
-def prologue(
+def base_descriptors(
     io_dtype: cutlass.Constexpr,
     b_t: cutlass.Constexpr[int],
-    run_order: cutlass.Constexpr[bool],
-    gen_intervals: cutlass.Constexpr[bool],
     k: cute.Tensor,
     v: cute.Tensor,
     gate: cute.Tensor,
     beta: cute.Tensor,
     w: cute.Tensor,
     state_checkpoints: cute.Tensor | None,
-    cu_seqlens: cute.Tensor,
-    work_count: cute.Tensor,
-    work_items: cute.Tensor,
-    scheduler_all: cute.Tensor | None,
-    tensormap_workspace: cute.Tensor,
-    checkpoint_every_n: cutlass.Int32,
-    seed_span_chunks: cutlass.Int32,
-    stream: cuda_driver.CUstream,
 ):
-    """One-launch prologue. Synthesizes and LPT-orders the uncut work items (when this kernel is
-    the table's first consumer) and builds the 6 per-batch TMA-descriptor
-    arrays (k, v, gate, beta, w, state_checkpoints) into
-    ``tensormap_workspace``."""
+    """The whole-tensor TMA descriptors (K, V, the gate, beta, w, checkpoints) the prologue's per-batch arrays are built from."""
     h_k = k.shape[1]
     h_v = v.shape[1]
     ho = gate.shape[1]
-    batch_size = cu_seqlens.shape[0] - 1
     d_k = k.shape[2]
     d_v = v.shape[2]
     bytes_per_element = io_dtype.width // 8
@@ -2145,6 +2120,36 @@ def prologue(
         base_checkpoint = cuda.create_tensor_map_tiled_from_view(
             checkpoint_view, box_dims=(tma_box_elements, d_v, 1, 1), stride_order=(0, 1, 2, 3), swizzle=swizzle
         )
+    return base_k, base_v, base_gate, base_beta, base_w, base_checkpoint
+
+
+@cute.jit
+def prologue(
+    io_dtype: cutlass.Constexpr,
+    b_t: cutlass.Constexpr[int],
+    run_order: cutlass.Constexpr[bool],
+    gen_intervals: cutlass.Constexpr[bool],
+    k: cute.Tensor,
+    v: cute.Tensor,
+    gate: cute.Tensor,
+    beta: cute.Tensor,
+    w: cute.Tensor,
+    state_checkpoints: cute.Tensor | None,
+    cu_seqlens: cute.Tensor,
+    work_count: cute.Tensor,
+    work_items: cute.Tensor,
+    scheduler_all: cute.Tensor | None,
+    tensormap_workspace: cute.Tensor,
+    checkpoint_every_n: cutlass.Int32,
+    seed_span_chunks: cutlass.Int32,
+    stream: cuda_driver.CUstream,
+):
+    """One-launch prologue. Synthesizes and LPT-orders the uncut work items (when this kernel is
+    the table's first consumer) and builds the 6 per-batch TMA-descriptor
+    arrays (k, v, gate, beta, w, state_checkpoints) into
+    ``tensormap_workspace``."""
+    batch_size = cu_seqlens.shape[0] - 1
+    base_k, base_v, base_gate, base_beta, base_w, base_checkpoint = base_descriptors(io_dtype, b_t, k, v, gate, beta, w, state_checkpoints)
     frost_gdn2_recompute_prologue(
         run_order,
         gen_intervals,
@@ -2202,7 +2207,7 @@ def host(
     num_sequences = cu_seqlens.shape[0] - 1
 
     # ---- launch ----------------------------------------------------------------------
-    grid_shape = (cfg.max_active_clusters, 1, 1)
+    grid_shape = (cutlass.min(cutlass.Int32(cfg.max_active_clusters), cutlass.max(cutlass.Int32(work_items.shape[0]), cutlass.Int32(1))), 1, 1)
     frost_gdn2_recompute(
         cfg,
         k_ratio,

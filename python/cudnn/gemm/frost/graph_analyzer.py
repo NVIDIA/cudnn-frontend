@@ -128,6 +128,7 @@ class _RecordedOp:
     moe_mode: str | None = None  # moe_grouped_matmul mode; None otherwise
     token_index: int | None = None
     token_ks: int | None = None
+    top_k_scores: int | None = None
     top_k: int = 1
     op_attrs: tuple = ()  # pointwise scalar attrs (negative_slope/clips/swish_beta/axis)
     reduction_mode: str | None = None  # "add"/"amax"/"max"/"min"; None otherwise
@@ -174,8 +175,9 @@ class GemmBinding:
     Operand lists are in kernel distinct-slot order; ``outputs`` in
     :pyattr:`FusionChain.outputs` slot order (recorder order); ``aux`` in
     :pyattr:`FusionChain.aux_tensors` order. Block-scale fills ``sfa/sfb_operands``
-    parallel to ``a/b_operands``; MoE fills ``first_token_offset``, GATHER/SCATTER
-    also fill ``token_index``, and SCATTER fills ``token_ks``."""
+    parallel to ``a/b_operands``; MoE fills ``first_token_offset``. Routing modes
+    bind ``token_index``; SCATTER/COMBINE also bind ``token_ks``, and COMBINE
+    binds ``top_k_scores`` in original token/slot order."""
 
     a_operands: list[Any] = field(default_factory=list)
     b_operands: list[Any] = field(default_factory=list)
@@ -186,6 +188,7 @@ class GemmBinding:
     first_token_offset: Any = None
     token_index: Any = None
     token_ks: Any = None
+    top_k_scores: Any = None
 
     def bound_tensors(self) -> list[Any]:
         ts = [
@@ -202,6 +205,8 @@ class GemmBinding:
             ts.append(self.token_index)
         if self.token_ks is not None:
             ts.append(self.token_ks)
+        if self.top_k_scores is not None:
+            ts.append(self.top_k_scores)
         return [t for t in ts if t is not None]
 
 
@@ -219,6 +224,7 @@ def swap_ab_binding(binding: "GemmBinding | None") -> "GemmBinding | None":
         first_token_offset=binding.first_token_offset,
         token_index=binding.token_index,
         token_ks=binding.token_ks,
+        top_k_scores=binding.top_k_scores,
     )
 
 
@@ -234,6 +240,7 @@ def _make_multi_binding(
     first_token_offset=None,
     token_index=None,
     token_ks=None,
+    top_k_scores=None,
 ) -> GemmBinding:
     """Build a GemmBinding for the multi-operand builders (multi-GEMM / MoE):
     the cuDNN tensor per distinct A/B slot (+ its SF for block-scale) from ``meta``."""
@@ -258,6 +265,7 @@ def _make_multi_binding(
         first_token_offset=first_token_offset,
         token_index=token_index,
         token_ks=token_ks,
+        top_k_scores=top_k_scores,
     )
 
 
@@ -327,6 +335,7 @@ _MOE_MODE_FROM_CUDNN: dict[Any, str] = {
     cudnn.moe_grouped_matmul_mode.NONE: "none",
     cudnn.moe_grouped_matmul_mode.GATHER: "gather",
     cudnn.moe_grouped_matmul_mode.SCATTER: "scatter",
+    cudnn.moe_grouped_matmul_mode.COMBINE: "combine",
 }
 
 _REDUCTION_MODE_FROM_CUDNN: dict[Any, str] = {
@@ -387,6 +396,7 @@ def _node_to_recorded_op(node: Any) -> "_RecordedOp | None":
             token_index=id(node.inputs["token_index"]) if node.inputs.get("token_index") is not None else None,
             token_ks=id(node.inputs["token_ks"]) if node.inputs.get("token_ks") is not None else None,
             top_k=node.params.get("top_k", 1),
+            top_k_scores=id(node.inputs["top_k_scores"]) if node.inputs.get("top_k_scores") is not None else None,
         )
     if node_type == "REDUCTION":
         inp = node.inputs["input"]
@@ -935,14 +945,19 @@ def _build_multi_moe_chain(
 
     if any(op.cudnn_name == "matmul" for op in ops):
         raise ValueError("a MoE grouped matmul graph cannot also contain a plain matmul; " "mixed MoE + matmul graphs are out of POC scope")
+    combine = moe_ops[0].moe_mode == "combine"
+    if combine and (len(moe_ops) != 1 or any(op.cudnn_name not in ("moe_grouped_matmul", "block_scale_dequantize") for op in ops)):
+        raise NotImplementedError("MoE COMBINE currently requires one GEMM with no post-combine operations")
     for moe in moe_ops:
-        if moe.moe_mode not in ("none", "gather", "scatter"):
+        if moe.top_k_scores is not None and moe.moe_mode != "combine":
+            raise ValueError("top_k_scores is only valid for MoE COMBINE")
+        if moe.moe_mode not in ("none", "gather", "scatter", "combine"):
             raise NotImplementedError(f"MoE grouped matmul mode {moe.moe_mode!r} is unsupported")
         if (moe.moe_mode, moe.token_index, moe.token_ks, moe.top_k) != (moe_ops[0].moe_mode, moe_ops[0].token_index, moe_ops[0].token_ks, moe_ops[0].top_k):
             raise ValueError("parallel MoE grouped matmuls must share the same mode, token_index, token_ks and top_k")
     index_meta = None
-    ks_meta = None
-    if moe_ops[0].moe_mode in ("gather", "scatter"):
+    ks_meta = scores_meta = None
+    if moe_ops[0].moe_mode in ("gather", "scatter", "combine"):
         mode = moe_ops[0].moe_mode.upper()
         index_meta = meta.get(moe_ops[0].token_index)
         if index_meta is None:
@@ -951,12 +966,12 @@ def _build_multi_moe_chain(
             raise ValueError(f"MoE {mode} token_index must have shape [1, routed_rows, 1]")
         if index_meta.dtype != "int32" or index_meta.stride[1] != 1:
             raise NotImplementedError(f"MoE {mode} token_index must be INT32 with contiguous routed rows")
-        if mode == "SCATTER":
+        if mode in ("SCATTER", "COMBINE"):
             ks_meta = meta.get(moe_ops[0].token_ks)
             if ks_meta is None or ks_meta.dim != index_meta.dim:
-                raise ValueError("MoE SCATTER token_ks must match token_index shape [1, routed_rows, 1]")
+                raise ValueError(f"MoE {mode} token_ks must match token_index shape [1, routed_rows, 1]")
             if ks_meta.dtype != "int32" or ks_meta.stride[1] != 1:
-                raise NotImplementedError("MoE SCATTER token_ks must be INT32 with contiguous routed rows")
+                raise NotImplementedError(f"MoE {mode} token_ks must be INT32 with contiguous routed rows")
 
     # All GEMMs must share the SAME first_token_offset (identical routed-group layout).
     fto_id = moe_ops[0].inputs[2]
@@ -1055,15 +1070,25 @@ def _build_multi_moe_chain(
     M, N, K, E, a_major, b_major, a_dtype, b_dtype = geom0
     if E < 1 or num_groups < 1 or num_groups % E:
         raise NotImplementedError("FROST MoE requires G+1 explicit first_token_offset boundaries, where G is a positive multiple of num_experts")
-    if moe_ops[0].moe_mode == "scatter":
+    if moe_ops[0].moe_mode in ("scatter", "combine"):
         top_k = moe_ops[0].top_k
-        if not isinstance(top_k, int) or top_k < 1 or top_k > E or M % top_k:
-            raise ValueError("MoE SCATTER requires 1 <= top_k <= num_experts and routed_rows divisible by top_k")
+        if not isinstance(top_k, int) or top_k < 1 or top_k > E or (not combine and M % top_k):
+            raise ValueError(f"MoE {moe_ops[0].moe_mode.upper()} requires 1 <= top_k <= num_experts; SCATTER routed_rows must be divisible by top_k")
         if index_meta.dim[1] != M:
-            raise ValueError("MoE SCATTER token_index and token_ks must match token rows")
+            raise ValueError(f"MoE {moe_ops[0].moe_mode.upper()} token_index and token_ks must match token rows")
     if moe_ops[0].moe_mode == "gather":
         M = int(index_meta.dim[1])
     matmul_out_dim = (1, M, N)
+    if combine:
+        scores_meta = meta.get(moe_ops[0].top_k_scores)
+        if scores_meta is None:
+            raise ValueError("MoE COMBINE requires top_k_scores")
+        if len(scores_meta.dim) != 3 or scores_meta.dim[0] != 1 or scores_meta.dim[1] < 1 or scores_meta.dim[2] != top_k:
+            raise ValueError("MoE COMBINE top_k_scores must have shape [1, tokens, top_k]")
+        if scores_meta.dtype != "fp32" or scores_meta.stride[1:] != (top_k, 1):
+            raise NotImplementedError("MoE COMBINE top_k_scores must be compact FP32")
+        if tuple(moe_ops[0].output_tensor.get_dim()) != (1, scores_meta.dim[1], N):
+            raise ValueError("MoE COMBINE output must have shape [1, tokens, N] matching top_k_scores")
 
     # Shared BlockScaleSpec (every distinct operand must match GEMM 0's combo).
     block_scale_spec = None
@@ -1448,7 +1473,8 @@ def _build_multi_moe_chain(
         a_dtype=a_dtype,
         b_dtype=b_dtype,
         accum_dtype=mm_compute,
-        out_dtype=matmul_out_dtype,
+        # COMBINE rounds the weighted contribution, not the raw FC2 result.
+        out_dtype="fp32" if combine else matmul_out_dtype,
     )
     # An implicit (never set_output) raw-MoE output is kept only when nothing
     # else was requested; with reductions present it is dropped (no phantom C).
@@ -1490,6 +1516,7 @@ def _build_multi_moe_chain(
         first_token_offset=meta[fto_id].tensor,
         token_index=index_meta.tensor if index_meta is not None else None,
         token_ks=ks_meta.tensor if ks_meta is not None else None,
+        top_k_scores=scores_meta.tensor if scores_meta is not None else None,
     )
     return chain, binding
 

@@ -26,11 +26,12 @@ def test_dglu_workspace_device_rejected_before_consumer(kind, monkeypatch):
     else:
         storage = torch.empty(nbytes, dtype=torch.uint8, device="cuda")
         # Intercept before any launch: no operation is run on this deliberately
-        # mismatched device declaration, even on a single-GPU CI worker.
+        # mismatched device declaration. With one visible GPU the ordinal does
+        # not exist, which the device resolver rejects first.
         workspace = DeviceView(storage.data_ptr(), (nbytes,), "uint8", storage.device.index + 1)
     seen = []
     monkeypatch.setattr(op._implementation, "_compiled_kernel", lambda *args: seen.append(args))
-    with pytest.raises(ValueError, match="workspace must be"):
+    with pytest.raises(ValueError, match="workspace must be|does not exist"):
         op.execute(p["a"], p["c"], p["d"], None, None, p["offsets"], p["alpha"], p["beta"], p["prob"], p["dp"], **p["bind"], workspace=workspace)
     assert not seen
 

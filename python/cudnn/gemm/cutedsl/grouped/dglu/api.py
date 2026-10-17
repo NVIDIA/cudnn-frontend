@@ -28,10 +28,12 @@ from ..backend_utils import (
     allocate_wrapper_workspace,
     backend_cache_key,
     block_scaled_sfd_tensors,
+    row_major_layout,
     select_grouped_gemm_backend,
     wrapper_operand_meta,
     wrapper_workspace,
 )
+from ..canonical import b_nkl, check_canonical_contiguous, check_packed_sf, is_canonical_b, is_flat_sf, normalize_prob
 from ..moe_utils import MoEWeightMode
 from cuda.bindings import driver as cuda
 import logging
@@ -43,7 +45,7 @@ if TYPE_CHECKING:
 
 import cutlass
 
-from cudnn.api_base import APIBase, TupleDict, get_device_type
+from cudnn.api_base import APIBase, TupleDict, ceil_div, get_device_type
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.tensor_adapter import (
     cuda_is_available,
@@ -133,6 +135,7 @@ class DgluCall:
     num_experts: Optional[int] = None
     round_dgrad_to_input_dtype: bool = False
     activation_tensor: Optional[torch.Tensor] = None
+    deterministic: bool = False
 
 
 class GroupedGemmDgluSm100(APIBase):
@@ -217,6 +220,7 @@ class GroupedGemmDgluSm100(APIBase):
         situ_beta2: float = 25.0,
         round_dgrad_to_input_dtype: bool = False,
         sample_activation: Optional[torch.Tensor] = None,
+        _deterministic: bool = False,
     ) -> None:
         super().__init__()
         self._pending_init_kwargs = dict(locals())
@@ -624,11 +628,12 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall, memo_key: Optional[tupl
     if not is_dense and not is_discrete:
         raise ValueError("Must provide either (b_tensor, sfb_tensor) or (b_ptrs, sfb_ptrs)")
 
-    valid_m, k_physical, _ = a_tensor.shape
+    check_canonical_contiguous(a_tensor, b_tensor, prob_tensor)
+    valid_m, k_physical = a_tensor.shape[:2]
 
     if is_dense:
         weight_mode = MoEWeightMode.DENSE
-        n_weight, _, l = b_tensor.shape
+        n_weight, _, l = b_nkl(b_tensor, b_major)
     else:
         weight_mode = MoEWeightMode.DISCRETE
         _require_pointer_tensor(b_ptrs, "b_ptrs")
@@ -642,6 +647,8 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall, memo_key: Optional[tupl
         l = num_experts
 
     n_out = 2 * n_weight
+    logical_k = k_physical * 2 if a_tensor.dtype in (torch.float4_e2m1fn_x2, torch.uint8) else k_physical
+    check_packed_sf(sfa_tensor, sfb_tensor, valid_m, n_weight, l, ceil_div(ceil_div(logical_k, sf_vec_size), 4))
 
     _logger.debug("grouped_gemm_dglu_wrapper_sm100: Creating output tensors")
 
@@ -649,8 +656,11 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall, memo_key: Optional[tupl
         raise ValueError(f"cd_major must be 'n', got {cd_major}")
     is_fp8_config = a_tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and sfa_tensor.dtype in (torch.float8_e8m0fnu, torch.float8_e4m3fn)
     sf_dtype = sfa_tensor.dtype if is_fp8_config else None
-    outputs = dglu_block_scaled_outputs(valid_m, n_out, l, d_dtype, sf_dtype, sf_vec_size, generate_dbias, dprob_tensor, a_tensor.device)
+    outputs = dglu_block_scaled_outputs(
+        valid_m, n_out, l, d_dtype, sf_dtype, sf_vec_size, generate_dbias, dprob_tensor, a_tensor.device, call.current_stream, a_tensor.ndim == 2
+    )
     d_row_tensor, d_col_tensor, _, dbias_tensor, amax_tensor, sfd_row_tensor, sfd_col_tensor = outputs
+    deterministic = call.deterministic
 
     if valid_m == 0:
         _logger.debug("grouped_gemm_dglu_wrapper_sm100: valid_m is zero, skipping kernel execution")
@@ -679,6 +689,11 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall, memo_key: Optional[tupl
         return static_shape_suffix, stride_signature, tensor.dtype
 
     use_full_dynamic = is_dense and os.environ.get("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1") != "0"
+    sfa_signature = (
+        dynamic_tensor_signature(sfa_tensor)
+        if use_full_dynamic or is_flat_sf(sfa_tensor)
+        else dynamic_m_tensor_signature(sfa_tensor, (sfa_tensor.shape[4], 1) if sfa_tensor is not None else None, dynamic_stride_dims=(5,))
+    )
 
     if is_dense:
         cache_key = (
@@ -689,7 +704,7 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall, memo_key: Optional[tupl
             epilogue_op,
             use_full_dynamic,
             a_tensor.shape[1:] if not use_full_dynamic else None,
-            b_tensor.shape[2] if use_full_dynamic else tuple(b_tensor.shape),
+            l if use_full_dynamic else tuple(b_tensor.shape),
             c_tensor.shape[1:] if not use_full_dynamic else None,
             a_tensor.dtype,
             b_tensor.dtype,
@@ -697,16 +712,14 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall, memo_key: Optional[tupl
             stride_order(a_tensor),
             stride_order(b_tensor),
             stride_order(c_tensor),
-            *(
-                dynamic_tensor_signature(sfa_tensor)
-                if use_full_dynamic
-                else dynamic_m_tensor_signature(sfa_tensor, (sfa_tensor.shape[4], 1) if sfa_tensor is not None else None, dynamic_stride_dims=(5,))
-            ),
+            *sfa_signature,
             *tensor_signature(alpha_tensor),
             *tensor_signature(beta_tensor),
             *(dynamic_m_tensor_signature(prob_tensor, (1, 1)) if not use_full_dynamic else dynamic_tensor_signature(prob_tensor)),
             *(dynamic_m_tensor_signature(dprob_tensor, (1, 1)) if not use_full_dynamic else dynamic_tensor_signature(dprob_tensor)),
-            *(dynamic_tensor_signature(dbias_tensor) if use_full_dynamic else tensor_signature(dbias_tensor)),
+            # dbias keeps its full shape even under full dynamic: its compiled descriptor bakes n, and
+            # nothing else in this key carries n (the B entry is l).
+            *tensor_signature(dbias_tensor),
             *(dynamic_tensor_signature(sfb_tensor) if use_full_dynamic else tensor_signature(sfb_tensor)),
             norm_const_tensor.shape if norm_const_tensor is not None else None,
             norm_const_tensor.stride() if norm_const_tensor is not None else None,
@@ -738,7 +751,7 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall, memo_key: Optional[tupl
             b_shape,
             b_dtype,
             *dynamic_m_tensor_signature(c_tensor, tuple(c_tensor.shape[1:]), dynamic_stride_dims=(2,)),
-            *dynamic_m_tensor_signature(sfa_tensor, (sfa_tensor.shape[4], 1) if sfa_tensor is not None else None, dynamic_stride_dims=(5,)),
+            *sfa_signature,
             *tensor_signature(alpha_tensor),
             *tensor_signature(beta_tensor),
             *dynamic_m_tensor_signature(prob_tensor, (1, 1)),
@@ -770,7 +783,17 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall, memo_key: Optional[tupl
             num_experts,
         )
 
-    cache_key = (*cache_key, int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")))
+    cache_key = (
+        *cache_key,
+        is_flat_sf(sfa_tensor),
+        is_flat_sf(sfb_tensor),
+        b_major if is_canonical_b(b_tensor) else None,
+        int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")),
+    )
+    if deterministic:  # the kernel writes per-N-tile slots instead of dprob; key on their count
+        from ..dsrelu.api import _dprob_n_slots
+
+        cache_key = (*cache_key, "deterministic", _dprob_n_slots(n_weight, mma_tiler_mn, cluster_shape_mn, True))
 
     # ---- Cache lookup or create + compile ----
     if cache_key in _cache_of_GroupedGemmDgluSm100Objects:
@@ -778,6 +801,7 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall, memo_key: Optional[tupl
         api = _cache_of_GroupedGemmDgluSm100Objects[cache_key]
     else:
         _logger.debug("grouped_gemm_dglu_wrapper_sm100: Creating new object")
+        dprob_kernel_tensor = _dglu_dprob_slots(call, n_weight, valid_m) if deterministic else dprob_tensor
         if is_dense:
             api = GroupedGemmDgluSm100(
                 sample_a=a_tensor,
@@ -789,7 +813,7 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall, memo_key: Optional[tupl
                 sample_alpha=alpha_tensor,
                 sample_beta=beta_tensor,
                 sample_prob=prob_tensor,
-                sample_dprob=dprob_tensor,
+                sample_dprob=dprob_kernel_tensor,
                 sample_dbias=dbias_tensor,
                 sample_b=b_tensor,
                 sample_sfb=sfb_tensor,
@@ -806,6 +830,7 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall, memo_key: Optional[tupl
                 m_aligned=m_aligned,
                 discrete_col_sfd=discrete_col_sfd,
                 act_func=act_func,
+                b_major=b_major,
                 epilogue_op=epilogue_op,
                 use_dynamic_sched=use_dynamic_sched,
                 use_single_group_runtime_offsets=use_single_group_runtime_offsets,
@@ -815,6 +840,7 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall, memo_key: Optional[tupl
                 glu_clamp_min=glu_clamp_min,
                 situ_beta1=situ_beta1,
                 situ_beta2=situ_beta2,
+                _deterministic=deterministic,
             )
         else:
             api = GroupedGemmDgluSm100(
@@ -827,7 +853,7 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall, memo_key: Optional[tupl
                 sample_alpha=alpha_tensor,
                 sample_beta=beta_tensor,
                 sample_prob=prob_tensor,
-                sample_dprob=dprob_tensor,
+                sample_dprob=dprob_kernel_tensor,
                 sample_dbias=dbias_tensor,
                 num_experts=num_experts,
                 b_shape=b_shape,
@@ -855,6 +881,7 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall, memo_key: Optional[tupl
                 glu_clamp_min=glu_clamp_min,
                 situ_beta1=situ_beta1,
                 situ_beta2=situ_beta2,
+                _deterministic=deterministic,
             )
 
         if not api.check_support():
@@ -868,31 +895,51 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall, memo_key: Optional[tupl
     return dglu_block_scaled_run(*memo, call, outputs)
 
 
-def dglu_block_scaled_outputs(valid_m, n_out, l, d_dtype, sf_dtype, sf_vec_size, generate_dbias, dprob_tensor, device) -> TupleDict:
+def dglu_block_scaled_outputs(
+    valid_m, n_out, l, d_dtype, sf_dtype, sf_vec_size, generate_dbias, dprob_tensor, device, current_stream, canonical=False
+) -> TupleDict:
     import torch
 
-    sfd_row_tensor = sfd_col_tensor = amax_tensor = dbias_tensor = None
-    if sf_dtype is not None:
-        sfd_row_tensor, sfd_col_tensor = block_scaled_sfd_tensors(valid_m, n_out, sf_dtype, sf_vec_size, device)
-    if d_dtype in (torch.bfloat16, torch.float16):
-        amax_tensor = torch.full((l, 2, 1), float("-inf"), dtype=torch.float32, device=device)
-    if generate_dbias:
-        dbias_tensor = torch.zeros((l, n_out, 1), dtype=torch.bfloat16, device=device)
-    return TupleDict(
-        d_row_tensor=torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_dtype, device=device),
-        d_col_tensor=torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_dtype, device=device),
-        dprob_tensor=dprob_tensor,
-        dbias_tensor=dbias_tensor,
-        amax_tensor=amax_tensor,
-        sfd_row_tensor=sfd_row_tensor,
-        sfd_col_tensor=sfd_col_tensor,
-    )
+    # Allocate on the launch stream, like the BF16 path: amax and dbias are accumulated into, so
+    # their initialization must be ordered before the kernel, and the caching allocator must see
+    # every output as used on the stream the kernel writes it on.
+    with _torch_stream_context(current_stream, device):
+        sfd_row_tensor = sfd_col_tensor = amax_tensor = dbias_tensor = None
+        if sf_dtype is not None:
+            sfd_row_tensor, sfd_col_tensor = block_scaled_sfd_tensors(valid_m, n_out, sf_dtype, sf_vec_size, device, canonical)
+        if d_dtype in (torch.bfloat16, torch.float16):
+            amax_tensor = torch.full((l, 2, 1), float("-inf"), dtype=torch.float32, device=device)
+        if generate_dbias:
+            dbias_tensor = torch.zeros((l, n_out, 1), dtype=torch.bfloat16, device=device)
+        d_layout = row_major_layout(valid_m, n_out, canonical)
+        return TupleDict(
+            d_row_tensor=torch.empty_strided(*d_layout, dtype=d_dtype, device=device),
+            d_col_tensor=torch.empty_strided(*d_layout, dtype=d_dtype, device=device),
+            dprob_tensor=dprob_tensor,
+            dbias_tensor=dbias_tensor,
+            amax_tensor=amax_tensor,
+            sfd_row_tensor=sfd_row_tensor,
+            sfd_col_tensor=sfd_col_tensor,
+        )
 
 
 def dglu_block_scaled_run(api, valid_m, n_out, l, d_dtype, sf_dtype, generate_dbias, call: DgluCall, outputs: Optional[TupleDict] = None) -> TupleDict:
     """Allocate fresh outputs and execute with the current call operands."""
     if outputs is None:
-        outputs = dglu_block_scaled_outputs(valid_m, n_out, l, d_dtype, sf_dtype, call.sf_vec_size, generate_dbias, call.dprob_tensor, call.a_tensor.device)
+        outputs = dglu_block_scaled_outputs(
+            valid_m,
+            n_out,
+            l,
+            d_dtype,
+            sf_dtype,
+            call.sf_vec_size,
+            generate_dbias,
+            call.dprob_tensor,
+            call.a_tensor.device,
+            call.current_stream,
+            call.a_tensor.ndim == 2,
+        )
+    dprob_slots = _dglu_dprob_slots(call, n_out // 2, valid_m) if call.deterministic else None
     api.execute(
         a_tensor=call.a_tensor,
         c_tensor=call.c_tensor,
@@ -903,7 +950,7 @@ def dglu_block_scaled_run(api, valid_m, n_out, l, d_dtype, sf_dtype, generate_db
         alpha_tensor=call.alpha_tensor,
         beta_tensor=call.beta_tensor,
         prob_tensor=call.prob_tensor,
-        dprob_tensor=call.dprob_tensor,
+        dprob_tensor=call.dprob_tensor if dprob_slots is None else dprob_slots,
         dbias_tensor=outputs["dbias_tensor"],
         b_tensor=call.b_tensor,
         sfb_tensor=call.sfb_tensor,
@@ -916,7 +963,23 @@ def dglu_block_scaled_run(api, valid_m, n_out, l, d_dtype, sf_dtype, generate_db
         current_stream=call.current_stream,
         workspace=allocate_wrapper_workspace("torch", api.scratch_workspace_bytes(), call.a_tensor.device, call.current_stream),
     )
+    if dprob_slots is not None:
+        from ..dsrelu.api import _reduce_dprob_slots
+
+        _reduce_dprob_slots(dprob_slots, normalize_prob(call.dprob_tensor)[1], call.current_stream)
     return outputs
+
+
+def _dglu_dprob_slots(call: DgluCall, n_weight: int, valid_m: int):
+    """Deterministic dprob scratch: one zeroed fp32 slot per (token, N-tile), zeroed on the launch stream."""
+    import torch
+
+    from ..backend_utils import _torch_stream_context
+    from ..dsrelu.api import _dprob_n_slots
+
+    n_slots = _dprob_n_slots(n_weight, call.mma_tiler_mn, call.cluster_shape_mn, True)
+    with _torch_stream_context(call.current_stream, call.a_tensor.device):
+        return torch.zeros((valid_m, n_slots, 1), dtype=torch.float32, device=call.a_tensor.device)
 
 
 def _normalize_dglu_call(
@@ -948,15 +1011,15 @@ def _normalize_dglu_call(
     if not is_dense and not is_discrete:
         raise ValueError("Must provide either (b_tensor, sfb_tensor) or (b_ptrs, sfb_ptrs)")
     a_shape = get_shape(call.a_tensor)
-    if len(a_shape) != 3 or a_shape[2] != 1:
-        raise ValueError(f"a_tensor must have shape (m, k, 1), got {a_shape}")
+    if len(a_shape) not in (2, 3) or (len(a_shape) == 3 and a_shape[2] != 1):
+        raise ValueError(f"a_tensor must have shape (m, k) or (m, k, 1), got {a_shape}")
 
-    valid_m, k, _ = a_shape
+    valid_m, k = a_shape[:2]
     if is_dense:
         b_full_shape = get_shape(call.b_tensor)
         if len(b_full_shape) != 3:
             raise ValueError(f"b_tensor must have shape (n, k, experts), got {b_full_shape}")
-        n_weight, b_k, num_experts = b_full_shape
+        n_weight, b_k, num_experts = b_nkl(call.b_tensor, call.b_major)
         if b_k != k:
             raise ValueError(f"b_tensor K dimension ({b_k}) must match a_tensor ({k})")
         defining_b_dtype = call.b_tensor.dtype
@@ -1012,6 +1075,10 @@ def _normalize_dglu_call(
             raise ValueError("round_dgrad_to_input_dtype is supported only by the BF16 kernel")
         return normalized, backend
 
+    if detect_framework(call.a_tensor) == "torch":
+        check_canonical_contiguous(call.a_tensor, call.b_tensor, call.prob_tensor)
+    elif len(a_shape) == 2:
+        raise ValueError("Canonical BF16 layouts require torch tensors")
     if call.activation_tensor is not None:
         if detect_framework(call.a_tensor) != "torch":
             raise ValueError("activation output currently requires torch tensors")
@@ -1036,12 +1103,11 @@ def _normalize_dglu_call(
     if n_weight <= 0 or n_weight % 32 != 0:
         raise ValueError(f"N must be positive and divisible by 32, got {n_weight}")
     two_n = 2 * n_weight
-    if get_shape(call.c_tensor) != (valid_m, two_n, 1):
-        raise ValueError(f"c_tensor must have shape {(valid_m, two_n, 1)}, got {get_shape(call.c_tensor)}")
-    if get_shape(call.prob_tensor) != (valid_m, 1, 1):
-        raise ValueError(f"prob_tensor must have shape {(valid_m, 1, 1)}, got {get_shape(call.prob_tensor)}")
-    if get_shape(call.dprob_tensor) != (valid_m, 1, 1):
-        raise ValueError(f"dprob_tensor must have shape {(valid_m, 1, 1)}, got {get_shape(call.dprob_tensor)}")
+    if get_shape(call.c_tensor) not in ((valid_m, two_n), (valid_m, two_n, 1)):
+        raise ValueError(f"c_tensor must have shape {(valid_m, two_n)} or {(valid_m, two_n, 1)}, got {get_shape(call.c_tensor)}")
+    for name, tensor in (("prob_tensor", call.prob_tensor), ("dprob_tensor", call.dprob_tensor)):
+        if get_shape(tensor) not in ((valid_m,), (valid_m, 1, 1)):
+            raise ValueError(f"{name} must have shape {(valid_m,)} or {(valid_m, 1, 1)}, got {get_shape(tensor)}")
     if _convert_to_cutlass_data_type(call.dprob_tensor.dtype) is not cutlass.Float32:
         raise ValueError(f"dprob_tensor must have dtype torch.float32, got {call.dprob_tensor.dtype}")
     offsets_shape = get_shape(call.padded_offsets)
@@ -1099,8 +1165,7 @@ def _dglu_allocate_outputs(framework, valid_m, two_n, d_dtype, generate_dbias, n
         # _torch_stream_context is torch-only; other frameworks never enter it.
         with _torch_stream_context(current_stream, a_tensor.device):
             d_row_tensor = torch.empty_strided(
-                (valid_m, two_n, 1),
-                (two_n, 1, valid_m * two_n),
+                *row_major_layout(valid_m, two_n, a_tensor.ndim == 2),
                 dtype=framework_dtype(d_dtype, "torch"),
                 device=a_tensor.device,
             )
@@ -1129,7 +1194,7 @@ _dglu_wrapper_memo: dict = {}
 def _grouped_gemm_dglu_bf16_call(call: DgluCall, memo_key: Optional[tuple] = None) -> TupleDict:
     framework = detect_framework(call.a_tensor)
     valid_m = get_shape(call.a_tensor)[0]
-    n_weight = get_shape(call.b_tensor)[0] if call.b_tensor is not None else call.n
+    n_weight = b_nkl(call.b_tensor, call.b_major)[0] if call.b_tensor is not None else call.n
     two_n = 2 * n_weight
     d_row_tensor, dbias_tensor = _dglu_allocate_outputs(
         framework, valid_m, two_n, call.d_dtype, call.generate_dbias, call.num_experts, call.a_tensor, call.current_stream
@@ -1294,8 +1359,65 @@ def grouped_gemm_dglu_wrapper_sm100(
     current_stream: Optional[cuda.CUstream] = None,
     round_dgrad_to_input_dtype: bool = False,
     activation_tensor: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
 ) -> TupleDict:
-    """Dispatch grouped GEMM dGLU once from an immutable normalized call."""
+    """Dispatch grouped GEMM dGLU once from an immutable normalized call.
+
+    ``deterministic=True`` makes ``dprob`` bit-identical run to run (block-scaled kernel, torch,
+    no dbias). See docs/fe-oss-apis/gemm_fusions/grouped_gemm_dglu.md.
+    """
+    if b_tensor is not None and sfa_tensor is not None and detect_framework(a_tensor) == "jax":
+        from ..canonical_jax import check_jax_wrapper_options
+        from .jax_api import grouped_gemm_dglu_jax_sm100
+
+        check_jax_wrapper_options(
+            acc_dtype=acc_dtype,
+            cd_major=cd_major,
+            sf_vec_size=sf_vec_size,
+            vector_f32=vector_f32,
+            m_aligned=m_aligned,
+            current_stream=current_stream,
+            epilogue_op=epilogue_op,
+            dprob_tensor_buf=dprob_tensor,
+            b_ptrs=b_ptrs,
+            sfb_ptrs=sfb_ptrs,
+            b_major=b_major,
+            use_dynamic_sched=use_dynamic_sched,
+            use_single_group_runtime_offsets=use_single_group_runtime_offsets,
+            sf_fp8_dtype_override=sf_fp8_dtype_override,
+        )
+        for name, rejected in (
+            ("round_dgrad_to_input_dtype", round_dgrad_to_input_dtype),
+            ("activation_tensor", activation_tensor is not None),
+            ("deterministic", deterministic),
+            ("b_dtype", b_dtype is not None),
+        ):
+            if rejected:
+                raise ValueError(f"{name} is unsupported for the JAX MXFP8 path")
+        return grouped_gemm_dglu_jax_sm100(
+            a_tensor=a_tensor,
+            b_tensor=b_tensor,
+            c_tensor=c_tensor,
+            sfa_tensor=sfa_tensor,
+            sfb_tensor=sfb_tensor,
+            padded_offsets=padded_offsets,
+            alpha_tensor=alpha_tensor,
+            beta_tensor=beta_tensor,
+            prob_tensor=prob_tensor,
+            norm_const_tensor=norm_const_tensor,
+            n=n,
+            acc_dtype=acc_dtype if acc_dtype is not None else cutlass.Float32,
+            d_dtype=d_dtype if d_dtype is not None else cutlass.BFloat16,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            discrete_col_sfd=discrete_col_sfd,
+            act_func=act_func,
+            linear_offset=linear_offset,
+            geglu_alpha=geglu_alpha,
+            glu_clamp_max=glu_clamp_max,
+            glu_clamp_min=glu_clamp_min,
+            generate_dbias=generate_dbias,
+        )
     # Hot-loop memo; same shape as the unfused and GLU wrappers. Everything from here to
     # execute() is derivation -- dtype resolution, DgluCall construction, normalization and
     # the op cache-key rebuild -- and a pure function of the operands' metadata plus the
@@ -1345,6 +1467,7 @@ def grouped_gemm_dglu_wrapper_sm100(
         use_dynamic_sched,
         os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"),
         os.getenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1") != "0",
+        deterministic,
     )
     memo = _dglu_wrapper_memo.get(memo_key)
     if memo is not None and memo[0].backend is GroupedGemmBackend.BF16:
@@ -1426,6 +1549,7 @@ def grouped_gemm_dglu_wrapper_sm100(
         use_dynamic_sched=use_dynamic_sched,
         use_single_group_runtime_offsets=use_single_group_runtime_offsets,
         current_stream=current_stream,
+        deterministic=deterministic and dprob_tensor is not None,  # without dprob there is nothing to make deterministic
     )
     if memo is not None:
         return dglu_block_scaled_run(*memo, call)
@@ -1436,8 +1560,14 @@ def grouped_gemm_dglu_wrapper_sm100(
     if framework == "jax" and b_tensor is not None:
         raise ValueError(_JAX_DENSE_B_ERROR)
     normalized, backend = _normalize_dglu_call(call)
+    if deterministic and (framework != "torch" or backend is GroupedGemmBackend.BF16):
+        raise NotImplementedError("deterministic=True is implemented only for the block-scaled kernel with torch tensors")
     if backend is GroupedGemmBackend.BF16:
         return _grouped_gemm_dglu_bf16_call(normalized, memo_key)
     if framework == "jax":
         raise ValueError(_JAX_BLOCK_SCALED_ERROR)
     return _grouped_gemm_dglu_block_scaled_call(normalized, memo_key)
+
+
+grouped_gemm_dglu_wrapper_sm100.supports_canonical_layouts = True
+grouped_gemm_dglu_wrapper_sm100.supports_bf16_canonical_layouts = True

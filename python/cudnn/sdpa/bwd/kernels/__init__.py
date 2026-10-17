@@ -50,5 +50,7 @@ The SM100 d=256 MXFP8 kernels (``sm100/bprop_dq_d256_mxfp8``,
 ``sm100/bprop_dkdv_d256_mxfp8``, their shared ``sm100/_bprop_mxfp8_*`` helpers
 and the ``sm100/bprop_sf_repack_mxfp8`` scale-factor repack) are the exception:
 ported CuTe DSL kernel CLASSES that specialize through their constructors, so
-they are ordinary importable modules with no template parameters.
+they are ordinary importable modules with no template parameters.  So is
+``sm100/bprop_sparse_d256_f16``, the index-list sparse (QSA) backward behind
+``bwd/sparse_gqa_sm100.py``.
 """

@@ -94,6 +94,7 @@ class ExecConfig:
         'output_type': torch,
         'diag_align': cudnn.diagonal_alignment,
         'implementation': cudnn.attention_implementation,
+        'softmax_precision': cudnn.data_type,
     }
 
     data_type: torch.dtype = None
@@ -216,6 +217,49 @@ class ExecConfig:
     dropout_prob: float = 0.0
 
     implementation: cudnn.attention_implementation = cudnn.attention_implementation.AUTO
+
+    # Forward softmax levers of the cc 10.7 FROST rows -- python-only op attributes of graph.sdpa /
+    # sdpa_fp8 / sdpa_mxfp8 (served domain: sdpa/softmax_knobs.py).  Appended here (after every
+    # existing field) so the seeded sweeps' RandomizationContext draw order is unchanged.
+    #   softmax_precision    None (= FLOAT, the f32 pipeline) or cudnn.data_type.HALF, the f16x2
+    #                        exponent arm of the quantized (FP8 / MXFP8) kernels.
+    #   attn_scale_prefolded the harness pre-multiplies Q by attn_scale * log2(e) -- in Q's dtype for
+    #                        half inputs, in fp32 before quantization for MXFP8 -- passes
+    #                        attn_scale=None to the op, and runs the reference on that same Q with
+    #                        attn_scale = ln 2 (softmax(ln2 * S_folded) = 2^S_folded).
+    softmax_precision: cudnn.data_type = None
+    attn_scale_prefolded: bool = False
+    # Forward Stats request independent of training.  None = the harness default (fp16: Stats are
+    # produced with the backward only; fp8 / mxfp8: always); True / False = request / omit the
+    # Stats output of an inference forward, so a sweep can draw the Stats and the stats-less
+    # kernel specializations without running a backward.  The backward always has Stats.
+    fwd_stats: bool = None
+    # MXFP8 dense forward only: declare Q/K/V/O BSHD-physical -- the layout the FROST MXFP8 rows
+    # serve.  None = the harness's legacy rule (BSHD for the block-scaled-O and paged draws, which
+    # only FROST serves; BHSD otherwise, which routes the plain draws to the backend); True = always,
+    # so a sweep that asserts FROST routing (the cc 10.7 sweeps) lands every case on the row.
+    # Inference only (the backward graph declares BHSD).
+    bshd_layout: bool = None
+    # Paged only (f16/bf16 forward harness): physical layout of the K/V page pools that
+    # sdpa.helpers.create_container_and_page_table carves from the dense (B, H, S, D) tensors.
+    # None / "hnd" = [pages, H, page, D] contiguous (today's layout); "nhd" = [pages, page, H, D]
+    # physical, declared through the same (pages, H, page, D) logical dims with permuted strides
+    # (the token-major pool layout serving frameworks also hand over).
+    paged_pool_layout: str = None
+    # Forward only: one sink logit on every head instead of the N(0, 0.5) draw (keyless-row pins at
+    # -120 / -5 / +3 / +10 exercise both far ends of the sink fold).
+    sink_token_value: float = None
+    # Forward only, Rule 9 diagnostics: pin ONE plan of the unified list instead of walking it.
+    # {"engine": "backend"} selects the first backend plan; {"engine": "<FROST engine name>",
+    # "knobs": {"TILE_CGA_M": 1, "PACK_GQA": 1, "SPLIT_KV": 1}} appends that knob set through
+    # graph.create_execution_plan and selects it.  A pin is strict: a decline of the pinned plan
+    # FAILS the case (it never degrades to another plan).  Plain dict, so --repro replays the pin.
+    plan_pin: dict = None
+    # Paged MXFP8 harness lever (sdpa/mxfp8.py, forward / inference; set AFTER the RandomizationContext so no seed
+    # moves): V pages live at a different pool permutation than K's and bind their OWN block table (proves per-page
+    # SF_V addressing rather than contiguous-pool luck).  The MXFP8 harness reads paged_pool_layout ("nhd") and
+    # sink_token_value above as the f16 harness does.
+    paged_distinct_v_table: bool = False
 
     @property
     def is_train(self):

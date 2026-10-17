@@ -32,18 +32,225 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
-from ..common import split_k
-from ..common.host import get_dtype
-from . import gdn_recompute_f16, gdn_tinv_f16
+import cutlass.experimental.cuda.tensor_map as tma
+from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
 
+from ..common import split_k
+from ..common.host import get_dtype, family_slots
+from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, gen_interval_items, order_body
+from . import gdn_bprop_f16, gdn_recompute_f16, gdn_tinv_f16, gdp_bprop_v64_f16
+
+USE_PDL = True
 warmup_backward_cache = {}
+
+
+@cute.kernel
+def frost_gdn_regenerate_prologue(
+    compact_qdo: cutlass.Constexpr[bool],
+    recompute_orders: cutlass.Constexpr[bool],
+    recompute_order_gen: cutlass.Constexpr[bool],
+    coarse: cutlass.Constexpr[bool],
+    bwd_orders: cutlass.Constexpr[bool],
+    bwd_order_gen: cutlass.Constexpr[bool],
+    b_t: cutlass.Constexpr[int],
+    expand_num: cutlass.Constexpr[int],
+    recompute_base_k: cutlass.GridConstant[tma.TensorMap],
+    recompute_base_v: cutlass.GridConstant[tma.TensorMap],
+    recompute_base_checkpoint: cutlass.GridConstant[tma.TensorMap],
+    recompute_base_tinv: cutlass.GridConstant[tma.TensorMap],
+    base_q: cutlass.GridConstant[tma.TensorMap],
+    base_k: cutlass.GridConstant[tma.TensorMap],
+    base_v: cutlass.GridConstant[tma.TensorMap],
+    base_do: cutlass.GridConstant[tma.TensorMap],
+    base_checkpoint: cutlass.GridConstant[tma.TensorMap],
+    base_dq: cutlass.GridConstant[tma.TensorMap],
+    base_dk: cutlass.GridConstant[tma.TensorMap],
+    base_dv: cutlass.GridConstant[tma.TensorMap],
+    base_tinv: cutlass.GridConstant[tma.TensorMap],
+    recompute_workspace: cute.Tensor,
+    bprop_workspace: cute.Tensor,
+    cu_seqlens: cute.Tensor,
+    cu_seqlens_bprop: cute.Tensor,
+    q: cute.Tensor,
+    k: cute.Tensor,
+    v: cute.Tensor,
+    do_: cute.Tensor,
+    gate: cute.Tensor,
+    checkpoints: cute.Tensor,
+    dq: cute.Tensor,
+    dk: cute.Tensor,
+    dv: cute.Tensor,
+    tinv: Optional[cute.Tensor],
+    staging_recompute: Optional[cute.Tensor],
+    series_count: cute.Tensor,
+    series_items: cute.Tensor,
+    scheduler_recompute: Optional[cute.Tensor],
+    staging_bprop: Optional[cute.Tensor],
+    work_count: cute.Tensor,
+    work_items: cute.Tensor,
+    scheduler_bprop: Optional[cute.Tensor],
+    n_batch: cutlass.Int32,
+    checkpoint_every_n: cutlass.Int32,
+    seed_span_chunks: cutlass.Int32,
+    k_slots: cutlass.Constexpr[int] = 1,
+    v_slots: cutlass.Constexpr[int] = 1,
+) -> None:
+    """Four-CTA prologue of the regenerate path, the recompute's and the bprop's prologues in one launch: block 0 the
+    recompute's item phase (the interval items under ``coarse``, the LPT order under ``recompute_orders``), block 1 the
+    bprop's (under ``bwd_orders``), block 2 the recompute's per-batch TMA-descriptor arrays, block 3 the bprop's, one
+    warp per array."""
+    if cutlass.const_expr(USE_PDL):
+        wait_on_dependent_grids()
+    tidx, _, _ = cute.arch.thread_idx()
+    tidx = cutlass.Int32(tidx)
+    widx = tidx // cutlass.Int32(32)
+    bidx = cutlass.Int32(cute.arch.block_idx()[0])
+    if bidx == cutlass.Int32(0):
+        n_heads_out = cutlass.Int32(gate.shape[1])
+        if cutlass.const_expr(coarse):
+            gen_interval_items(
+                b_t,
+                ORDER_THREADS,
+                tidx,
+                n_heads_out,
+                n_heads_out * n_batch,
+                seed_span_chunks,
+                cu_seqlens,
+                series_count,
+                series_items,
+                scheduler_recompute,
+                expand_num,
+            )
+        if cutlass.const_expr(recompute_orders):
+            sKey = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
+            sIdx = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
+            sSpread = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.smem, alignment=8)
+            order_body(
+                recompute_order_gen,
+                b_t,
+                ORDER_THREADS,
+                ORDER_ELEMENTS,
+                tidx,
+                n_heads_out,
+                n_heads_out * n_batch,
+                cu_seqlens,
+                staging_recompute,
+                series_count,
+                series_items,
+                scheduler_recompute,
+                sKey,
+                sIdx,
+                sSpread,
+                expand_num=expand_num,
+            )
+    elif bidx == cutlass.Int32(1):
+        if cutlass.const_expr(bwd_orders):
+            sKey = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
+            sIdx = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
+            sSpread = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.smem, alignment=8)
+            n_heads_out = cutlass.Int32(do_.shape[1])
+            order_body(
+                bwd_order_gen,
+                b_t,
+                ORDER_THREADS,
+                ORDER_ELEMENTS,
+                tidx,
+                n_heads_out,
+                n_heads_out * n_batch,
+                cu_seqlens_bprop,
+                staging_bprop,
+                work_count,
+                work_items,
+                scheduler_bprop,
+                sKey,
+                sIdx,
+                sSpread,
+                expand_num=expand_num,
+            )
+    elif bidx == cutlass.Int32(2):
+        gdn_recompute_f16.build_descs_body(
+            widx,
+            recompute_base_k,
+            recompute_base_v,
+            recompute_base_checkpoint,
+            recompute_base_tinv,
+            recompute_workspace,
+            cu_seqlens,
+            k,
+            v,
+            checkpoints,
+            tinv,
+            n_batch,
+            checkpoint_every_n,
+            b_t,
+            expand_num,
+            k_slots=k_slots,
+            v_slots=v_slots,
+        )
+    else:
+        if cutlass.const_expr(compact_qdo):
+            gdp_bprop_v64_f16.build_descs_body(
+                widx,
+                base_q,
+                base_k,
+                base_v,
+                base_do,
+                base_checkpoint,
+                base_dq,
+                base_dk,
+                base_dv,
+                bprop_workspace,
+                cu_seqlens_bprop,
+                q,
+                k,
+                v,
+                do_,
+                checkpoints,
+                dq,
+                dk,
+                dv,
+                n_batch,
+                cutlass.Int32(b_t),
+                expand_num,
+                k_slots=k_slots,
+                v_slots=v_slots,
+            )
+        else:
+            gdn_bprop_f16.build_descs_body(
+                widx,
+                base_q,
+                base_k,
+                base_v,
+                base_do,
+                base_checkpoint,
+                base_dq,
+                base_dk,
+                base_dv,
+                base_tinv,
+                bprop_workspace,
+                cu_seqlens_bprop,
+                q,
+                k,
+                v,
+                do_,
+                checkpoints,
+                dq,
+                dk,
+                dv,
+                tinv,
+                n_batch,
+                cutlass.Int32(b_t),
+                b_t,
+                expand_num,
+                k_slots=k_slots,
+                v_slots=v_slots,
+            )
 
 
 @cute.jit
 def warmup_backward_host(
     split: cutlass.Constexpr[bool],
     b_t: cutlass.Constexpr[int],
-    scan_rows: cutlass.Constexpr[int],
     log_gate: cutlass.Constexpr[bool],
     safe_gate: cutlass.Constexpr[bool],
     overhead_chunks: cutlass.Constexpr[int],
@@ -68,7 +275,6 @@ def warmup_backward_host(
     batch_size: cutlass.Int32,
     log2_thresh: cutlass.Float32,
     n_scan_ctas: cutlass.Int32,
-    n_scan_blocks: cutlass.Int32,
     n_walk_ctas: cutlass.Int32,
     checkpoint_every_n: cutlass.Int32,
     seed_span_chunks: cutlass.Int32,
@@ -114,6 +320,8 @@ def warmup_backward_host(
     recompute_words: Optional[cute.Tensor],
     bprop_words: cute.Tensor,
     stream: cuda.CUstream,
+    k_slots: cutlass.Constexpr[int] = 1,
+    v_slots: cutlass.Constexpr[int] = 1,
 ) -> None:
     if cutlass.const_expr(tinv_pass):
         gdn_tinv_f16.host(tinv_cfg, True, k, tinv_words, gate, a_log, dt_bias, beta, cu_seqlens, tinv, tinv_rows, tinv_row_count, stream)
@@ -121,9 +329,9 @@ def warmup_backward_host(
         split_k.launch(
             split,
             b_t,
-            scan_rows,
             log_gate,
             safe_gate,
+            True,
             overhead_chunks,
             expand_num,
             warmup_cap,
@@ -143,33 +351,72 @@ def warmup_backward_host(
             work_count_table,
             scheduler_all,
             n_scan_ctas,
-            n_scan_blocks,
             n_walk_ctas,
             stream,
         )
     if cutlass.const_expr(recompute):
-        gdn_recompute_f16.prologue(
-            io_dtype,
-            b_t,
+        recompute_base_k, recompute_base_v, recompute_base_checkpoint, recompute_base_tinv = gdn_recompute_f16.base_descriptors(
+            io_dtype, b_t, k, v, checkpoints, tinv, expand_num=expand_num, k_slots=k_slots, v_slots=v_slots
+        )
+        if cutlass.const_expr(compact_qdo):
+            base_q, base_k, base_v, base_do, base_checkpoint, base_dq, base_dk, base_dv = bprop.base_descriptors(
+                io_dtype, b_t, q, k, v, do, dq, dk, dv, checkpoints, expand_num=expand_num, k_slots=k_slots, v_slots=v_slots
+            )
+            base_tinv = base_k
+        else:
+            base_q, base_k, base_v, base_do, base_checkpoint, base_dq, base_dk, base_dv, base_tinv = bprop.base_descriptors(
+                io_dtype, b_t, q, k, v, do, dq, dk, dv, checkpoints, tinv, expand_num=expand_num, k_slots=k_slots, v_slots=v_slots
+            )
+        frost_gdn_regenerate_prologue(
+            compact_qdo,
             recompute_orders,
             recompute_order_gen,
             coarse,
+            bwd_orders,
+            bwd_order_gen,
+            b_t,
             expand_num,
+            recompute_base_k,
+            recompute_base_v,
+            recompute_base_checkpoint,
+            recompute_base_tinv,
+            base_q,
+            base_k,
+            base_v,
+            base_do,
+            base_checkpoint,
+            base_dq,
+            base_dk,
+            base_dv,
+            base_tinv,
+            recompute_words,
+            bprop_words,
+            cu_seqlens,
+            cu_seqlens_bprop,
+            q,
             k,
             v,
+            do,
             gate,
-            cu_seqlens,
             checkpoints,
+            dq,
+            dk,
+            dv,
+            tinv,
             staging_recompute,
             series_count,
             series_items,
             scheduler_all_recompute,
+            staging_bprop,
+            work_count,
+            work_items,
+            scheduler_all_bprop,
+            batch_size,
             checkpoint_every_n,
             seed_span_chunks,
-            tinv,
-            recompute_words,
-            stream,
-        )
+            k_slots,
+            v_slots,
+        ).launch(grid=(4, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
         gdn_recompute_f16.host(
             recompute_cfg,
             k,
@@ -190,7 +437,7 @@ def warmup_backward_host(
             recompute_words,
             stream,
         )
-    if cutlass.const_expr(compact_qdo):
+    elif cutlass.const_expr(compact_qdo):
         bprop.prologue(
             io_dtype,
             b_t,
@@ -212,6 +459,8 @@ def warmup_backward_host(
             scheduler_all_bprop,
             bprop_words,
             stream,
+            k_slots,
+            v_slots,
         )
     else:
         bprop.prologue(
@@ -236,6 +485,8 @@ def warmup_backward_host(
             tinv,
             bprop_words,
             stream,
+            k_slots,
+            v_slots,
         )
 
 
@@ -294,10 +545,8 @@ def build_warmup_backward(
 ):
     """Compile (cached per static config) the head of the warmup or uncut backward over the buffers of one plan.  The
     placeholders repeat the marks of the standalone builds so every kernel compiles as it does there."""
-    _HQ, DK = q.shape[1], q.shape[2]
-    k.shape[1]
-    _HV, DV = v.shape[1], v.shape[2]
-    gate.shape[1]
+    DK = q.shape[2]
+    DV = v.shape[-1]
     if not safe_gate:
         a_log = None
         dt_bias = None
@@ -318,8 +567,12 @@ def build_warmup_backward(
     recompute_order_gen = not (recompute_orders and split)
     bwd_order_gen = bwd_orders and not split
     cu_align = 8 if str(cu_seqlens.dtype).endswith("int64") else 4
+    k_slots = family_slots(k, expand_num, 3)
+    v_slots = family_slots(v, expand_num, 3)
+    beta_slots = family_slots(beta, expand_num, 2)
     key = (
         str(q.dtype),
+        str(seed_checkpoints.dtype) if coarse else "none",
         str(cu_seqlens.dtype),
         str(gate.dtype),
         str(beta.dtype),
@@ -333,7 +586,6 @@ def build_warmup_backward(
         int(b_t),
         int(expand_num),
         bool(split),
-        facts.scan_rows,
         bool(tinv_pass),
         bool(recompute),
         bool(recompute_orders),
@@ -345,6 +597,12 @@ def build_warmup_backward(
         bool(use_beta_sigmoid),
         bool(allow_neg_eigval),
         bprop_module.__name__,
+        len(k.shape),
+        len(v.shape),
+        len(beta.shape),
+        k_slots,
+        v_slots,
+        beta_slots,
     )
     if key not in warmup_backward_cache:
         tinv_cfg = None
@@ -358,6 +616,8 @@ def build_warmup_backward(
                 allow_neg_eigval=allow_neg_eigval,
                 d_k=DK,
                 expand_num=expand_num,
+                k_slots=k_slots,
+                beta_slots=beta_slots,
             )
         recompute_cfg = None
         if recompute:
@@ -374,6 +634,8 @@ def build_warmup_backward(
                 d_k=DK,
                 d_v=DV,
                 expand_num=expand_num,
+                k_slots=k_slots,
+                v_slots=v_slots,
             )
 
         gate_table_placeholder = None
@@ -411,7 +673,6 @@ def build_warmup_backward(
             warmup_backward_host,
             facts.split,
             facts.b_t,
-            facts.scan_rows,
             facts.log_gate,
             facts.safe_gate,
             facts.overhead_chunks,
@@ -436,21 +697,20 @@ def build_warmup_backward(
             cutlass.Int32(facts.batch_size),
             cutlass.Float32(facts.log2_threshold),
             cutlass.Int32(facts.n_scan_ctas),
-            cutlass.Int32(facts.n_scan_blocks),
             cutlass.Int32(facts.n_walk_ctas),
             cutlass.Int32(int(b_t)),
             cutlass.Int32(int(seed_span_tokens or seed_every_n_tokens) // int(b_t)),
             cutlass.Int32(int(seed_every_n_tokens)),
             from_dlpack(q, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=2),
+            from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=len(k.shape) - 1),
+            from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=len(v.shape) - 1),
             from_dlpack(do, assumed_align=16).mark_layout_dynamic(leading_dim=2),
             from_dlpack(dq, assumed_align=16).mark_layout_dynamic(leading_dim=2),
             from_dlpack(dk, assumed_align=16).mark_layout_dynamic(leading_dim=2),
             from_dlpack(dv, assumed_align=16).mark_layout_dynamic(leading_dim=2),
             from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=1),
             gate_table_placeholder,
-            from_dlpack(beta, assumed_align=16).mark_layout_dynamic(leading_dim=1),
+            from_dlpack(beta, assumed_align=16).mark_layout_dynamic(leading_dim=len(beta.shape) - 1),
             from_dlpack(a_log, assumed_align=4).mark_layout_dynamic() if a_log is not None else None,
             from_dlpack(a_log, assumed_align=4).mark_layout_dynamic() if a_log is not None else None,
             from_dlpack(dt_bias, assumed_align=4).mark_layout_dynamic(leading_dim=len(dt_bias.shape) - 1) if dt_bias is not None else None,
@@ -482,6 +742,8 @@ def build_warmup_backward(
             from_dlpack(recompute_words, assumed_align=128).mark_layout_dynamic() if recompute else None,
             from_dlpack(bprop_words, assumed_align=128).mark_layout_dynamic(),
             cuda.CUstream(int(stream)),
+            k_slots,
+            v_slots,
             options="--enable-tvm-ffi --opt-level 2",
         )
     return warmup_backward_cache[key], facts
@@ -540,7 +802,6 @@ def run_warmup_backward(
         facts.batch_size,
         facts.log2_threshold,
         facts.n_scan_ctas,
-        facts.n_scan_blocks,
         facts.n_walk_ctas,
         int(b_t),
         int(seed_span_tokens or seed_every_n_tokens) // int(b_t),

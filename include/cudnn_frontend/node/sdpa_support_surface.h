@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <string>
 #include <unordered_set>
 
 #include "../../cudnn_frontend_Heuristics.h"
@@ -15,6 +16,38 @@
 #include "../node_interface.h"
 
 namespace cudnn_frontend::graph {
+
+// Native SDPA kernels move Q/K/V/O with 16-byte vector loads and TMA, and the backend does not check the
+// caller's strides or pointers against the declared alignment: SM90/SM100 return wrong output, SM80/SM89
+// fault on a misaligned address (#1571). The frontend enforces the alignment it declares.
+inline error_t
+validate_sdpa_operand_stride_alignment(std::shared_ptr<Tensor_attributes> const& tensor, std::string const& name) {
+    if (tensor == nullptr) {
+        return {error_code_t::OK, ""};
+    }
+    auto const element_bytes = static_cast<int64_t>(detail::get_data_type_size(tensor->get_data_type()));
+    auto const alignment     = tensor->get_alignment();
+    if (element_bytes == 0 || alignment <= 1) {
+        return {error_code_t::OK, ""};
+    }
+    auto const& stride = tensor->get_stride();
+    auto const i       = misaligned_stride_dimension(tensor->get_dim(), stride, element_bytes, alignment);
+    RETURN_CUDNN_FRONTEND_ERROR_IF(i >= 0,
+                                   error_code_t::GRAPH_NOT_SUPPORTED,
+                                   name + ": stride " + std::to_string(stride[i]) + " of dimension " +
+                                       std::to_string(i) + " is " + std::to_string(stride[i] * element_bytes) +
+                                       " bytes, not a multiple of the tensor's " + std::to_string(alignment) +
+                                       "-byte alignment");
+    return {error_code_t::OK, ""};
+}
+
+inline void
+add_sdpa_aligned_operand(std::shared_ptr<Tensor_attributes> const& tensor, AlignedOperands& aligned_operands) {
+    if (tensor && !tensor->get_is_virtual() && tensor->get_alignment() > 1) {
+        aligned_operands[tensor->get_uid()] = {
+            tensor->get_alignment(), static_cast<int64_t>(detail::get_data_type_size(tensor->get_data_type()))};
+    }
+}
 
 inline error_t
 SDPA_attributes::validate_sdpa_support_surface(const detail::Context& context,

@@ -38,6 +38,8 @@ from cudnn.gemm.frost.tile_helpers import (
     tma_gather4,
     moe_gather_scales,
     moe_scatter_row,
+    moe_combine_add,
+    moe_combine_add_vector,
     tma_scatter4,
     copy_tensormap_to_workspace as _copy_tensormap_to_workspace,
     epi_subtile_spans as _epi_subtile_spans,
@@ -2073,7 +2075,7 @@ def _host(
                     1,
                     256,
                     cute.assume(256 * rest_k, 8),
-                    cute.assume(256 * rest_k * rest_n, 8),
+                    cute.assume(_sfb_op.stride[2] // 2, 8),
                 ),
             ),
         )
@@ -2152,10 +2154,10 @@ def compile() -> Callable:
             assumed_align=16,
         )
 
-    # F8_128x4 SF uses a base pointer; GATHER token SF also uses row shape/stride.
-    # For the blocked inputs, the host rebuilds the
-    # F8_128x4 view from problem_size. Modes 0/1 and all strides carry no
-    # contract; mode 2 keeps its literal plane count (1 for sfa, sym_e for sfb).
+    # The host rebuilds blocked row/K geometry from problem_size. Keep SF
+    # layouts dynamic to retain the validated weight SFB expert stride and
+    # GATHER token SFA row shape/stride. Mode 2 keeps the plane count
+    # (1 for SFA, sym_e for SFB).
     def _make_fake_sfa():
         return cute.runtime.make_fake_tensor(
             sf_cutlass_dtype,

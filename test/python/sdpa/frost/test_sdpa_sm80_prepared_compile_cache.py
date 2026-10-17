@@ -25,6 +25,7 @@ def test_replan_reloads_prepared_artifact(direction, d, dv, tmp_path, monkeypatc
 
         build = lambda: _case(d, dv, hk=4 if d == 64 else 2, causal=d != 64, features=d == 128)
     monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE", str(tmp_path))
+    monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO", "0")  # the reload path is under test; the memo would hand plan 2 the object plan 1 got
     first = build()
     first.graph.execute(first.pack, first.workspace)
     _check(first)

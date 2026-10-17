@@ -430,6 +430,7 @@ def build_chain_backward(
     dseed_name = dtype_name(dseed.dtype) if has_dseed else "float32"
     key = (
         str(q.dtype),
+        str(seed_checkpoints.dtype) if coarse else "none",
         str(cu_seqlens.dtype),
         str(gate.dtype),
         str(beta.dtype),

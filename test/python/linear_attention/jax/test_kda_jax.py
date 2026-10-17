@@ -69,8 +69,8 @@ def reference(
     q, k, v, g, beta, state, a, dt = jax.tree.map(lambda x: x.astype(jnp.float32), args)
     ho, dk, dv = g.shape[1], q.shape[-1], v.shape[-1]
     if use_qk_l2norm_in_kernel:
-        q = q * jax.lax.rsqrt(jnp.sum(q * q, axis=-1, keepdims=True) + 1e-12)
-        k = k * jax.lax.rsqrt(jnp.sum(k * k, axis=-1, keepdims=True) + 1e-12)
+        q = q * jax.lax.rsqrt(jnp.sum(q * q, axis=-1, keepdims=True) + 1e-6)
+        k = k * jax.lax.rsqrt(jnp.sum(k * k, axis=-1, keepdims=True) + 1e-6)
     q, k, v = (jnp.repeat(x, ho // x.shape[1], axis=1) for x in (q, k, v))
     q = q * (dk**-0.5 if scale is None else scale)
     if safe_gate:
@@ -414,6 +414,22 @@ def test_helper_types_not_exported():
     for name in ("KdaResidual", "KdaGradients"):
         assert name not in cudnn.jax.__all__
         assert not hasattr(cudnn.jax, name)
+
+
+def test_arrays_on_another_gpu_run_there_and_split_arrays_are_rejected():
+    """Other GPUs may be visible: concrete arrays run on the GPU holding them, and must all share it."""
+    devices = [d for d in jax.local_devices() if str(getattr(d, "compute_capability", "")) in ("10.0", "10.3")]
+    if len(jax.local_devices()) < 2:
+        pytest.skip("needs two visible GPUs")
+    args, cu = inputs()
+    if len(devices) > 1:
+        moved = jax.device_put((args, cu), devices[1])
+        out, _ = run(*moved)
+        assert out.devices() == {devices[1]}
+        assert_close(out, run(args, cu)[0])
+    split = jax.device_put(args[0], jax.local_devices()[1])
+    with pytest.raises(ValueError, match="one GPU"):
+        kda(split, *args[1:5], cu)
 
 
 def test_bad_metadata():

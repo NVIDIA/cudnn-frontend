@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""cudnn.linear_attention.frost: the FROST linear-attention engines (GDN, KDA, GDN-2, GDP) on the SM100 / SM103 / SM107 chunked kernels
+"""cudnn.linear_attention.frost: the FROST linear-attention engines (GDN, KDA, GDN-2, GDP, Mamba-2) on the SM100 / SM103 / SM107 chunked kernels
 built on Cutlass primitives; forward and backward on SM100 / SM103 / SM107, ranked ahead of the cuTile fallbacks."""
 
 # Lazy: importing one family's engine must not drag its neighbours in.
@@ -17,6 +17,8 @@ _LAZY_EXPORTS = {
     "Gdn2SummaryFrostEngine": (".gdn2_engine", "Gdn2SummaryFrostEngine"),
     "KdaSummaryFrostEngine": (".kda_engine", "KdaSummaryFrostEngine"),
     "GdpSummaryFrostEngine": (".gdp_engine", "GdpSummaryFrostEngine"),
+    "Mamba2FrostEngine": (".mamba2_engine", "Mamba2FrostEngine"),
+    "Mamba2SummaryFrostEngine": (".mamba2_engine", "Mamba2SummaryFrostEngine"),
 }
 
 
@@ -43,4 +45,6 @@ __all__ = [
     "KdaSummaryFrostEngine",
     "Gdn2SummaryFrostEngine",
     "GdpSummaryFrostEngine",
+    "Mamba2FrostEngine",
+    "Mamba2SummaryFrostEngine",
 ]

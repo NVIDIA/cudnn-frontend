@@ -126,7 +126,7 @@ class GroupedGemmDswigluSm100(APIBase):
                 raise ValueError(
                     "GroupedGemmDswigluSm100 only supports dense weight mode, whose expert-outermost strided "
                     "B layout (n, k, l) is not expressible as JAX arrays (row-major only); "
-                    "use torch tensors for this backward API, or cudnn.jax.grouped_gemm_dswiglu for canonical MXFP8 JAX arrays"
+                    "use torch tensors for this backward API, or cudnn.grouped_gemm_dglu_jax_sm100 for canonical MXFP8 JAX arrays"
                 )
             raise ValueError(f"Unsupported tensor framework '{framework}' for GroupedGemmDswigluSm100; pass torch tensors")
         if acc_dtype is None:
@@ -823,7 +823,12 @@ def grouped_gemm_dswiglu_wrapper_sm100(
     if framework not in ("torch", "jax"):
         raise ValueError(f"Unsupported tensor framework '{framework}' for grouped_gemm_dswiglu_wrapper_sm100; pass torch tensors or JAX arrays")
     if framework == "jax":
-        from cudnn.jax import grouped_gemm_dswiglu
+        from cudnn.frost.buffers import cutedsl_requirement_error
+
+        requirement = cutedsl_requirement_error("grouped_gemm_dswiglu")
+        if requirement:
+            raise ImportError(requirement)
+        from .jax_api import grouped_gemm_dswiglu
         from ..canonical_jax import check_jax_wrapper_options
 
         check_jax_wrapper_options(
@@ -832,7 +837,6 @@ def grouped_gemm_dswiglu_wrapper_sm100(
             sf_vec_size=sf_vec_size,
             vector_f32=vector_f32,
             m_aligned=m_aligned,
-            discrete_col_sfd=discrete_col_sfd,
             current_stream=current_stream,
             epilogue_op=epilogue_op,
             dprob_tensor_buf=dprob_tensor_buf,
@@ -852,6 +856,7 @@ def grouped_gemm_dswiglu_wrapper_sm100(
             d_dtype=d_dtype if d_dtype is not None else cutlass.BFloat16,
             mma_tiler_mn=mma_tiler_mn,
             cluster_shape_mn=cluster_shape_mn,
+            discrete_col_sfd=discrete_col_sfd,
         )
     import torch
 

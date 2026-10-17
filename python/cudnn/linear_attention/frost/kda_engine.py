@@ -8,6 +8,8 @@ few (sequence, head) tiles run as an exact piece chain (``common/piece_chain.py`
 from __future__ import annotations
 
 import math
+from operator import itemgetter
+
 
 from cudnn import behavior_note
 from cudnn.engines.base import BaseEngine, CompiledPlan
@@ -60,6 +62,7 @@ class KdaFrostEngine(BaseEngine):
         if facts.gate_channels != facts.d_qk:
             raise NotImplementedError(f"KdaFrostEngine: g must carry d_qk = {facts.d_qk} channels, got {facts.gate_channels}")
         checkpoint = facts.checkpoint_every_n_tokens
+        checkpoint_dtypes = (cudnn.data_type.FLOAT, facts.io_dtype)
         if checkpoint and checkpoint % 16 != 0:
             raise NotImplementedError(f"KdaFrostEngine: checkpoint_every_n_tokens must be a positive multiple of 16 (got {checkpoint})")
         if not facts.gates_at_ho:
@@ -74,10 +77,10 @@ class KdaFrostEngine(BaseEngine):
         beta_wants = (cudnn.data_type.FLOAT, facts.io_dtype)
         if facts.beta_dtype not in beta_wants + (None,):
             raise NotImplementedError(f"KdaFrostEngine: 'beta' must be {' or '.join(str(w) for w in beta_wants)}, got {facts.beta_dtype}")
-        state_dtypes = (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16)
+        state_dtypes = (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
         for port, got in (("initial_state", facts.state_dtype), ("final_state", facts.final_state_dtype)):
             if got not in state_dtypes + (None,):
-                raise NotImplementedError(f"KdaFrostEngine: '{port}' must be fp32/bf16, got {got}")
+                raise NotImplementedError(f"KdaFrostEngine: '{port}' must be fp32/bf16/fp16, got {got}")
         if not facts.state_pair_match:
             raise NotImplementedError("KdaFrostEngine: initial_state and final_state dtypes must match")
         gate_param_dtypes = (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
@@ -98,13 +101,18 @@ class KdaFrostEngine(BaseEngine):
                 raise NotImplementedError(f"KdaFrostEngine: 'd_initial_state' must mirror initial_state ({state_grad_want}), got an unset dtype")
             if facts.dg_dtype not in (facts.g_dtype, None):
                 raise NotImplementedError(f"KdaFrostEngine: 'dG' must match 'g' ({facts.g_dtype}), got {facts.dg_dtype}")
-            for port, got in (("dO", facts.do_dtype), ("state_checkpoints", facts.state_checkpoints_dtype)):
-                if got not in (facts.io_dtype, None):
-                    raise NotImplementedError(f"KdaFrostEngine: '{port}' must match the io dtype")
+            if facts.do_dtype not in (facts.io_dtype, None):
+                raise NotImplementedError("KdaFrostEngine: 'dO' must match the io dtype")
+            if facts.state_checkpoints_dtype not in checkpoint_dtypes + (None,):
+                raise NotImplementedError(
+                    f"KdaFrostEngine: 'state_checkpoints' must be {' or '.join(str(w) for w in checkpoint_dtypes)}, got {facts.state_checkpoints_dtype}"
+                )
             if facts.dbeta_dtype not in (facts.beta_dtype, None):
                 raise NotImplementedError(f"KdaFrostEngine: 'dBeta' must match 'beta' ({facts.beta_dtype}), got {facts.dbeta_dtype}")
-        elif facts.io_dtype is not None and facts.state_checkpoints_out_dtype not in (facts.io_dtype, None):
-            raise NotImplementedError("KdaFrostEngine: 'state_checkpoints' must match the io dtype")
+        elif facts.io_dtype is not None and facts.state_checkpoints_out_dtype not in checkpoint_dtypes + (None,):
+            raise NotImplementedError(
+                f"KdaFrostEngine: 'state_checkpoints' must be {' or '.join(str(w) for w in checkpoint_dtypes)}, got {facts.state_checkpoints_out_dtype}"
+            )
 
     def build_plan(self, graph, plan, ctx=None) -> CompiledPlan:
         handle = ctx.handle if ctx is not None else None
@@ -123,13 +131,16 @@ class CompiledKda:
 
     def __init__(self, node, kernel_module):
         """Resolve graph attributes and select the forward scheduling family."""
+        from cuda.bindings.driver import CUstream
+
         from .common.host import tensormap_workspace_bytes
         from .common.piece_chain import DV_SPLIT_TILES, chain_rows_per_cta, choose_pieces, is_dv_split, piece_table_layout
-        from .kernel.kda_chain_forward_f16 import build_chain_forward, run_chain_forward
+        from .kernel.kda_chain_forward_f16 import CHAIN_FORWARD_BUFFERS, build_chain_forward, run_chain_forward
         from .kernel.kda_uncut_forward_f16 import build_uncut_forward, run_uncut_forward
         from .common.split_k import WORK_ITEM_FIELDS
 
         self.node = node
+        self.stream_type = CUstream
         self.chain_rows_per_cta = chain_rows_per_cta
         self.uncut_launch = None
         self.build_uncut_forward = build_uncut_forward
@@ -137,6 +148,7 @@ class CompiledKda:
         self.build_chain_forward = build_chain_forward
         self.run_chain_forward = run_chain_forward
         self.chain_launch = None
+        self.chain_buffer_names = CHAIN_FORWARD_BUFFERS
         self.plan_name = "KdaFrostEngine (KDA)"
         self.device = current_device()
         scale = node.params.get("scale")
@@ -274,8 +286,40 @@ class CompiledKda:
         self.index_state_checkpoints = pos.get("state_checkpoints")
         self.index_a_log = pos.get("a_log")
         self.index_dt_bias = pos.get("dt_bias")
+        if self.chain:
+            positions = pos | {name: len(names) + i for i, name in enumerate(self.carve_names)}
+            aliases = {
+                "gate": "g",
+                "o": "O",
+                "seed": "initial_state",
+                "seed_indices": "state_indices",
+                "final_indices": "state_indices",
+                "checkpoints": "state_checkpoints",
+                "summary_words": "fused_tensormaps",
+                "prefill_words": "tensormaps",
+                "scheduler_summary": "scheduler_h",
+            }
+            absent = len(names) + len(self.carve_names)
+            if not self.safe_gate:
+                positions.pop("a_log", None)
+                positions.pop("dt_bias", None)
+            if not (self.has_state_checkpoints and self.checkpoint):
+                positions.pop("state_checkpoints", None)
+            indices = [positions.get(aliases.get(name, name), absent) for name in self.chain_buffer_names]
+            self.chain_buffers = itemgetter(*indices)
+            self.chain_scalars = (
+                int(self.pieces),
+                int(self.n_heads_out),
+                int(self.num_seqs),
+                int(self.checkpoint if self.has_state_checkpoints else 0),
+                float(self.scale),
+            )
 
     def run(self, views, workspace, stream) -> None:
+        if self.chain and self.chain_launch is not None:
+            buffers = self.chain_buffers((*views, *workspace.carve(self.carve), None))
+            self.chain_launch(*self.chain_scalars, *buffers, self.stream_type(int(stream or 0)))
+            return
         q = views[self.index_q]
         k = views[self.index_k]
         v = views[self.index_v]
@@ -463,7 +507,9 @@ class CompiledKdaBwd:
         q, g, v = node.inputs["q"], node.inputs["g"], node.inputs["v"]
         self.b_t = bwd_module.CFG.B_T
         self.checkpoint_cadence = int(node.params.get("checkpoint_every_n_tokens", 0) or 0)
-        self.coarse_checkpoints = self.has_state_checkpoints and self.checkpoint_cadence > self.b_t
+        self.coarse_checkpoints = self.has_state_checkpoints and (
+            self.checkpoint_cadence > self.b_t or node.inputs["state_checkpoints"].get_data_type().name == "FLOAT"
+        )
         self.needs_recompute = not self.has_state_checkpoints or self.coarse_checkpoints
         total = q.dim[0]
         HQ, HV = q.dim[1], v.dim[1]

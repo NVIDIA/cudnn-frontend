@@ -101,6 +101,35 @@ class CudaGraphRetainedResource {
         return retain_on_graph(capture_graph, std::forward<MakePayload>(make_payload));
     }
 
+    // Whether user-object destructors have handed back payloads that still await release.
+    static bool
+    has_deferred_releases() {
+        return deferred_releases().pending.load(std::memory_order_acquire);
+    }
+
+    // Release queued payloads if `stream` is not being captured. For callers that retain nothing
+    // themselves; cheap (no CUDA call) when nothing is queued.
+    static cudaError_t
+    drain_deferred_releases_on_stream(cudaStream_t stream) {
+        if (!has_deferred_releases()) {
+            return cudaSuccess;
+        }
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        cudaGraph_t capture_graph              = nullptr;
+        cudaError_t const query_status         = cuda_stream_get_capture_info(stream, &capture_status, &capture_graph);
+        if (query_status == cudaErrorStreamCaptureImplicit) {
+            (void)cuda_get_last_error();
+            return cudaSuccess;
+        }
+        if (query_status != cudaSuccess) {
+            return query_status;
+        }
+        if (capture_status == cudaStreamCaptureStatusNone) {
+            drain_deferred_releases();
+        }
+        return cudaSuccess;
+    }
+
     // Release payloads handed back by user-object destructors (see class comment).
     static void
     drain_deferred_releases() {

@@ -167,6 +167,7 @@ def apply_mask_chunk(
     causal_diag=None,
     mask_value: float = _NEG_INF_BITS,
     window_right: int = 0,
+    keep_words=None,
 ):
     """Mask the ``N``-wide fp32 register chunk ``reg_S`` (one lane = one q row ``q_abs``, columns
     ``kv_col_base .. kv_col_base + N``) for the compile-time ``mask_flags`` set, in the bit-word form.
@@ -185,14 +186,25 @@ def apply_mask_chunk(
     A side no term defines is ``None`` and folds out.  ``mask_value`` is what a masked score becomes:
     the default is the legacy finite sentinel; the f16 prefill kernels pass ``float("-inf")`` so a
     fully-masked row's max stays -inf under any scale and the canonical ``max == -inf -> substitute 0``
-    guard (``row_max_for_exp2``) applies.  ``MASK_NONE`` returns ``reg_S`` itself.
+    guard (``row_max_for_exp2``) applies.  ``MASK_NONE`` without ``keep_words`` returns ``reg_S`` itself.
+
+    ``keep_words`` (optional): a tuple of ``ceil(N / 32)`` per-32-column KEEP words from a DATA mask -- the
+    per-key boolean ``kv_mask`` assembled by :func:`kv_mask_keep_words` -- ANDed into the band's words (or
+    used alone under ``MASK_NONE``), so a data-masked key costs the same one select per cell as a banded one
+    and the whole mask stays ONE ``R2P`` + ``FSEL`` pass; a keep word is warp-uniform (every lane of the warp
+    holds the same word), the band words are per lane.
 
     Domain: a compile-time ``window_left`` / ``window_right`` at or past ``MASK_BOUND_LIMIT`` raises
     at trace time (see the constant): the band arithmetic is Int32 and a wrapped ``lo`` would mask the
     whole chunk.  Callers that invent a "no sequence reaches this" band (the dense per-tensor fp8 d192
     lowering) must stay below it -- `config_sm100.canonicalize_d192_lowering` uses ``MASK_BOUND_LIMIT - 1``."""
+    n_words = (N + MASK_WORD_COLS - 1) // MASK_WORD_COLS
+    if keep_words is not None and len(keep_words) != n_words:
+        raise ValueError(f"apply_mask_chunk: keep_words has {len(keep_words)} word(s); an N={N} chunk needs {n_words}")
     if cutlass.const_expr(mask_flags == MASK_NONE):
-        return reg_S
+        if keep_words is None:
+            return reg_S
+        return apply_mask_words(reg_S, tuple(keep_words), mask_value=mask_value, n_cols=N)
 
     if (mask_flags & MASK_SWA) and isinstance(window_left, int) and window_left >= MASK_BOUND_LIMIT:
         raise ValueError(f"apply_mask_chunk: window_left must be < {MASK_BOUND_LIMIT} (got {window_left}); the Int32 band arithmetic would wrap")
@@ -213,7 +225,37 @@ def apply_mask_chunk(
         hi = seq_kv_len if hi is None else cute.math.min(hi, seq_kv_len)
 
     words = band_mask_words(lo, hi, kv_col_base, N)
+    if keep_words is not None:
+        words = tuple(w & k for w, k in zip(words, keep_words))
     return apply_mask_words(reg_S, words, mask_value=mask_value, n_cols=N)
+
+
+def kv_mask_keep_words(kv_mask_tensor, batch_idx, kv_col_base, seq_kv_len, n_cols: int):
+    """The per-key boolean mask's KEEP words for the ``n_cols`` kv columns starting at ``kv_col_base``: one
+    warp-uniform ``Uint32`` per 32 columns, bit ``i`` of word ``s`` set iff key ``kv_col_base + 32 s + i`` is
+    inside the sequence (``< seq_kv_len``) AND its mask byte is non-zero.
+
+    Trace-time helper for the softmax warps (plain Python over traced values): lane ``i`` of the warp loads
+    the byte of key ``32 s + i`` from ``kv_mask_tensor[batch_idx, key]`` (a ``(B, S_kv)`` Int8 view over the
+    graph's BOOLEAN tensor; the key index is clamped into ``[0, seq_kv_len)`` so the load never leaves the
+    row and an out-of-range key votes 0) and a ``vote.ballot`` assembles the word -- 4 byte loads + 4 ballots
+    per 128-column tile per warp, no SMEM staging, nothing packed on the host.  Every lane of the warp holds
+    the same words, which is what lets them AND into :func:`apply_mask_chunk`'s per-lane band words."""
+    from cutlass.experimental.primitives import VoteSync, vote_sync
+
+    n_words = (n_cols + MASK_WORD_COLS - 1) // MASK_WORD_COLS
+    lane = cute.arch.thread_idx()[0] & cutlass.Int32(MASK_WORD_COLS - 1)
+    last = cute.math.max(seq_kv_len - cutlass.Int32(1), cutlass.Int32(0))
+    mask_arr = cutlass.make_array_view(kv_mask_tensor)
+    words = []
+    for s in range(n_words):
+        col = kv_col_base + cutlass.Int32(MASK_WORD_COLS * s) + lane
+        in_range = col < seq_kv_len
+        col_c = cute.math.min(col, last)
+        byte = mask_arr[batch_idx, col_c]
+        keep = in_range & (byte != cutlass.Int8(0))
+        words.append(cutlass.Uint32(vote_sync(0xFFFFFFFF, keep, VoteSync.BALLOT)))
+    return tuple(words)
 
 
 # ---------------------------------------------------------------------------
@@ -247,9 +289,7 @@ def _div_up(a, b):
 def swa_kv_lo_tile(anchor_row, window_left: int, tile_n: int):
     """First KV tile a left window of ``window_left`` keeps for ``anchor_row``
     (the q row plus the bottom-right diagonal); 0 while the window still
-    reaches kv 0.  The forward's KV-loop lower bound, and the backward's
-    deterministic dQ relay -- a kv-tile's turn on a q-tile is its rank among
-    that q-tile's visitors, which start here.
+    reaches kv 0.  The forward's KV-loop lower bound.
     """
     cond = anchor_row > cutlass.Int32(window_left)
     delta = anchor_row - cutlass.Int32(window_left)
@@ -384,3 +424,103 @@ def compute_q_loop_bounds(
         hi = cute.math.min(_div_up(q_hi_abs, tile_q), n_q_tiles)
 
     return QLoopBounds(lo=lo, hi=hi)
+
+
+@cute.jit
+def q_tile_kv_hi(
+    q_tile: cutlass.Int32,
+    seqlen_q: cutlass.Int32,
+    seq_kv_len: cutlass.Int32,
+    kv_last: cutlass.Int32,
+    mask_flags: cutlass.Constexpr[int],
+    tile_q: cutlass.Constexpr[int],
+    tile_kv: cutlass.Constexpr[int],
+    bottom_right: cutlass.Constexpr[bool],
+    window_right: cutlass.Int32,
+) -> cutlass.Int32:
+    """Highest kv tile whose compute_q_loop_bounds range contains ``q_tile``,
+    capped at ``kv_last`` (the last kv tile that runs).
+
+    Inverts the causal lower bound: kv tile k visits q tile j iff
+    ``(k * tile_kv - diag - window_right) // tile_q <= j``.  The window only
+    removes LOW kv tiles, so it does not move this bound.  The backward's
+    deterministic dQ relay counts turns down from it.  Meaningless for a q tile
+    no kv tile visits (nobody relays on it).  ``@cute.jit`` because the relay
+    calls it inside the kernel's dynamic q loop.
+    """
+    hi = kv_last
+    if cutlass.const_expr(mask_flags & MASK_CAUSAL):
+        if cutlass.const_expr(bottom_right):
+            causal_diag = seq_kv_len - seqlen_q
+        else:
+            causal_diag = cutlass.Int32(0)
+        q_end = (q_tile + cutlass.Int32(1)) * cutlass.Int32(tile_q)
+        hi = cute.math.min(hi, (q_end + causal_diag + window_right - cutlass.Int32(1)) // cutlass.Int32(tile_kv))
+    return hi
+
+
+# ---------------------------------------------------------------------------
+# Membership mask: a list-gathered KV tile has no band; each cell is either one
+# of THIS row's keys or not, and the decision is a bit the caller pre-computed.
+# ---------------------------------------------------------------------------
+
+
+def _membership_bit(word, i: int):
+    """The single-bit test mask for bit ``i`` in ``word``'s own integer type: a ``Uint32`` word takes ``1 << i`` as is; an
+    ``Int32`` word (the ``ldg_int32x4`` / ``ld.global.nc.v4.s32`` membership words) takes the SIGNED encoding, so bit 31 is
+    ``-2**31`` and never an out-of-range i32 literal."""
+    if isinstance(word, cutlass.Uint32):
+        return cutlass.Uint32(1 << i)
+    return cutlass.Int32((1 << i) - (1 << 32) if i == 31 else (1 << i))
+
+
+def apply_membership_words(reg_S, words, *, n_cols: int = None, mask_value: float = float("-inf")):
+    """``reg_S[c] if keep-bit(c) else mask_value`` over an ``n_cols``-wide register chunk whose mask is a MEMBERSHIP bit
+    table: ``words`` is a tuple of 32-bit words, bit ``i`` of word ``s`` = column ``32 s + i`` is one of THIS row's keys
+    (kept); a zero bit is "not one of this row's keys" (masked).  The bit-word twin of :func:`apply_mask_words` for a
+    list-gathered KV tile, whose per-cell decision is a bit the caller pre-computed rather than a band edge -- the words
+    arrive from GMEM already in mask-word form, so there is no ``band_mask_words`` step: ONE bit test + ONE
+    ``arith.select`` per cell, spelled as ``apply_mask_words`` spells it (a Python ``range`` over a compile-time bit index
+    of one register) so ptxas emits ``R2P`` (register -> 7 predicates) + one ``FSEL`` per cell.
+
+    Words may be ``Int32`` (``ldg_int32x4`` slot words) or ``Uint32``; the bit-31 test uses the word's own signed /
+    unsigned encoding (:func:`_membership_bit`).  The default ``mask_value`` is a TRUE ``-inf`` (not the finite
+    ``_NEG_INF_BITS`` sentinel): a fully-masked chunk's max is then ``-inf`` under any scale and the consumer's
+    ``max == -inf -> substitute`` guard applies (sdpa-invariants.md section 2); a kept cell passes through bit-exactly
+    (NaN payloads included).  Truth table identical to the per-cell spelling ``((word >> i) & 1) == 0 -> mask_value`` --
+    and on sm_107a ptxas ALREADY lowered that spelling to R2P + FSEL (the pre-upstream d512 index-list kernel read 16 R2P,
+    no per-cell ISETP), so this is the shared idiom, not a SASS change: O / LSE bitwise either way.  Trace-time helper
+    (plain Python over traced values)."""
+    if n_cols is None:
+        n_cols = MASK_WORD_COLS * len(words)
+    if len(words) * MASK_WORD_COLS < n_cols:
+        raise ValueError(f"apply_membership_words: {len(words)} word(s) cover {len(words) * MASK_WORD_COLS} columns, chunk has {n_cols}")
+    neg_inf = cutlass.Float32(mask_value)
+    elems = []
+    for s, word in enumerate(words):
+        for i in range(MASK_WORD_COLS):
+            c = MASK_WORD_COLS * s + i
+            if c >= n_cols:
+                break
+            keep = cutlass.Boolean(word & _membership_bit(word, i))
+            elems.append(cutlass.Float32(arith.select(keep.ir_value(), reg_S[c].ir_value(), neg_inf.ir_value())))
+    return cutlass.Vector.from_elements(tuple(elems), cutlass.Float32)
+
+
+def apply_membership_chunk(reg_S, word_lo, word_hi, *, n: int = 64, mask_value: float = float("-inf")):
+    """Per-CELL membership mask for a ``n``-wide chunk of scores: cell ``i`` KEEPS ``reg_S[i]``
+    iff bit ``i`` of the 64-bit pair ``(word_lo, word_hi)`` is set, else becomes ``mask_value``.
+
+    Bit ``i`` lives in ``word_lo`` for ``i < 32`` and in ``word_hi`` (bit ``i - 32``) above;
+    ``word_hi`` is unused at ``n <= 32``.  A ZERO bit says "this gathered column is none of this
+    row's keys" (under a multi-token UNION tile a duplicate-free row sees every copy but its own as
+    zero bits; a ``-1`` / sanitised id is a zero-filled row AND a zero bit, so no real logit of 0
+    survives).
+
+    The two-word convenience form of :func:`apply_membership_words` (same select, same ``-inf``
+    default, same truth table); a kernel with wider chunks calls the words form directly.
+    """
+    if cutlass.const_expr(not 1 <= n <= 64):
+        raise ValueError(f"apply_membership_chunk: n must be in 1..64 (two 32-bit words), got {n}")
+    words = (word_lo,) if n <= MASK_WORD_COLS else (word_lo, word_hi)
+    return apply_membership_words(reg_S, words, n_cols=n, mask_value=mask_value)

@@ -1,6 +1,6 @@
 # python/cudnn — Agent Guide
 
-The `cudnn` Python package: pybind11-backed graph API plus pure-Python **frontend-only OSS kernels** (CuTeDSL). See `README.md` in this directory for the package inventory and [../../AGENTS.md](../../AGENTS.md) for build/test commands.
+The `cudnn` Python package: nanobind-backed graph API plus pure-Python **frontend-only OSS kernels** (CuTeDSL). See `README.md` in this directory for the package inventory and [../../AGENTS.md](../../AGENTS.md) for build/test commands.
 
 ## Import-time rules (the most common way to break this package)
 
@@ -9,7 +9,7 @@ The `cudnn` Python package: pybind11-backed graph API plus pure-Python **fronten
   submodule directly on its parent, bypassing module `__getattr__`. Check direct-submodule,
   sibling-symbol, and public-symbol import orders in fresh interpreters; the detector is
   `test_ops_callable_exports_survive_import_order` in `test/python/core/test_import_boundaries.py`.
-- Never add an eager `import torch` / `import cutlass` to `__init__.py` or anything it imports transitively. `api_base.py` itself imports them at top level, which is why kernel classes must only be reachable through the lazy table.
+- Never add an eager `import torch` / `import cutlass` to `__init__.py` or anything it imports transitively. Kernel modules import them at top level, which is why they must only be reachable through the lazy table.
 - Reuse the existing required CuTeDSL dependencies (`pyproject.toml` `[project] dependencies`) unless a kernel truly needs a new package. The `[cutedsl]` extra now holds only `cuda-python`.
 
 ## Hard rules
@@ -58,6 +58,25 @@ Numbered so reviews can cite them; the list grows — append, never renumber.
   inputs against their observed span as well as their effective shape, and check
   pointer alignment for the element type. The host-only detector is
   `test_dense_metadata_rejects_short_observed_storage_and_misalignment`.
+- **A runtime SF expert stride needs a per-plane contract.** FROST MoE weight
+  scales in `F8_128x4` require E outermost, dense byte storage within each expert
+  plane, sufficient blocked capacity per plane, and a non-overlapping 16-byte
+  aligned expert pitch. Whole-blob density does not establish this: an
+  interleaved expert view can pass it and silently select the wrong scales.
+  Detector: `gemm/frost/test_moe_grouped_block_scale_matmul_fwd.py`'s
+  `test_moe_weight_sf_plane_binding` and `test_moe_weight_sf_runtime_stride`.
+- **Native geometry caches retain no storage observations.** A geometry hit must
+  still check the current dtype, device, address alignment and observed byte span.
+  Mark an uninitialized cache entry explicitly: an empty shape is an input to
+  reject, not an initialized entry. Derive binder ABI tests from the actual host
+  signature, including optional slots, then exercise the real graph launch.
+  `test_sdpa_native_dense_binding.py` covers these boundaries and changed-input replay.
+- **A shared native binder must preserve each caller's validation contract.**
+  Standalone SDPA length tensors require exactly the declared batch size; graph
+  binding may accept a larger carrier for an effective batch. Keep the adapter's
+  stricter check before common binding. The standalone native decode test in
+  `test_sdpa_native_dense_binding.py` rejects oversized length carriers after
+  warmup and checks that per-call scale changes do not modify the plan.
 
 **Rule 2 — `execute()` launches exactly the kernels the plan promised:
 serve the declared layout natively, or decline — never adapt.**
@@ -86,6 +105,12 @@ unsupported input runnable.
   must address natively (layout-driven offset math, strides encoded in TMA
   descriptors) — acceptance is a promise about the execute path, not about
   what the adapter can patch up.
+- Architecture admission needs a native compile-and-execute detector, not
+  only a mocked capability check. Shared compiler architecture maps may also
+  gate unrelated kernels; qualify a new operation through a scoped compile
+  target instead of widening that shared support gate. The detector is
+  `test_DSA_indexer_top_k_sm120_native_boundary`, including changed-input replay
+  at the documented shared-memory limits.
 
 **Rule 3 — `execute()` never reads device memory to the host.**
 
@@ -183,7 +208,23 @@ not become a compile key.
   template module's `PARAMS` inside the host instead of passing the same
   dataclass again. Build a second plan with `cute.compile` forbidden, assert
   a real cache hit, and check the reloaded artifact's outputs and graph replay;
-  `test_replan_reloads_prepared_artifact` is the SM80 detector.
+  `test_replan_reloads_prepared_artifact` is the SM80 detector. Such a test
+  sets `CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO=0` for its own process
+  first: `compile_cached` keeps an in-process memo in front of the files, so
+  the second plan would otherwise get the first plan's object without a disk
+  hit (`stats()["memo_hits"]` grows, `hits` does not) and a key compiled by
+  an earlier test in the same process would turn the first build into a memo
+  hit too, leaving nothing on disk to reload.
+- **Compiled CuTe launchables belong to their CUDA context.** Pin a plan's device
+  when compiling storage-free declarations; compile and execute under that device,
+  and reject differently placed bindings before lowering pointers. An outer
+  argument-only `functools.lru_cache` can bypass `compiled_cache`'s device/context
+  key and return another GPU's launchable: delegate reuse to the device-aware
+  cache. Detector: intercept device contexts and compilation, build identical
+  plans for two device ordinals, and verify each reaches compilation in its own
+  context; no invalid cross-device GPU launch is needed. See the sparse SDPA
+  tests `test_compilation_and_launch_preserve_the_declared_or_resolved_device`
+  and `test_compilation_bypasses_argument_only_caches_across_devices`.
 - **Issue #604 is closed**: SM80 THD compiles use symbolic packed extents.
   The prepared backward host takes Int64 capacities and launch bounds at
   runtime, including the compact Stats head pitch and deterministic-counter
@@ -201,6 +242,11 @@ not become a compile key.
   kernel — every miss is a spurious multi-second recompile). Enumerate what
   `check_support()` validates and what the kernel specializes on; the key
   is that set.
+
+- **Scratch state needs an owner, not just a pointer.** When cached plans share
+  an allocation, invalidate cached geometry whenever another plan writes it.
+  Test A→B→A reuse with the same pointer; see
+  `test_te_workspace_plan_switch` for the compact GQA regression.
 
 **Rule 5 — every torch operation on the execute path is ordered on the
 LAUNCH stream, never implicitly on torch's current stream.**
@@ -234,7 +280,7 @@ the kernel that reads it).
   flagged in review on PR #517.
 - **A raw stream handle never goes straight into `torch.cuda.ExternalStream`.**
   Every eager caller on torch's default stream hands us a default-stream
-  sentinel (`0`, `cudaStreamLegacy` = 1, `cudaStreamPerThread` = 2), and torch
+  legacy sentinel (`0`, `cudaStreamLegacy` = 1), and torch
   before PR pytorch/pytorch#183258 (in v2.13.0; NGC 26.06 and torch <= 2.12
   lack it) returns a fresh NON-BLOCKING pool stream for `ExternalStream(0)`.
   Torch work issued in that context is unordered with a kernel launched on
@@ -242,7 +288,7 @@ the kernel that reads it).
   test passes; under xdist load the kernel reads stale conversion buffers and
   a staged output is copied back before it is written (the qa sm90
   `hopper_cuda` reds, PR #1165 — the same trap FROST SDPA hit in #682/#717/#860).
-  Map the sentinels and torch's own default stream to
+  Map the legacy sentinels and torch's own default stream to
   `torch.cuda.default_stream(device)`, the current stream to itself, and only a
   genuine side stream to `ExternalStream(handle, device=device)`. The one
   implementation is `cudnn._torch_stream` (`as_torch_stream`, `stream_context`,
@@ -303,16 +349,34 @@ DSL satisfies your kernel.**
   and say so in the PR body if it raises the floor of a user-facing op:
   `cutlass.experimental.*` (primitives, `cuda.tensor_map`; everything under
   `cudnn/frost/tile_dsl` inherits it) → 4.7.0.
+  Native im2col tensor-map creation used by `conv/cutedsl/conv3d_postops`
+  (`cutlass.experimental.cuda.create_tensor_map_im2col`) → 4.9.
 - Tests that import a kernel module directly `pytest.skip` on a too-old DSL —
   they do not fail. CI runs the `oss:` lanes across the supported DSL versions
   (`ci/stages/oss_tests/jobs.yml` in internal CI); a lane below your floor
   must show skips, not errors.
+- Keep declaration and execute-preflight metadata validators outside modules
+  that import newer DSL kernel APIs. A correctly gated stage cannot protect
+  an earlier constructor import of its validator. Exercise the public
+  constructor and preflight in a fresh process on the real dependency-floor
+  wheel; `test_gated_block_declaration_and_execute_preflight_do_not_import_cache_kernel`
+  is the detector for the gated block's paged-cache validation.
 - **MLIR argument widths are part of a DSL API migration.**
   `FastDivmodDivisorV2` carries two MLIR values (encoded divisor and scalar),
   while its predecessor carried one. Custom `__new_from_mlir_values__` methods
   must slice by the lengths recorded during extraction, rather than assuming
   one value per field. Static coordinates can contribute zero values, too.
   `test_cutlass_schedulers.py` checks these round trips on real MLIR values.
+- **The installed DSL's preprocessor may be patched by a co-resident library.**
+  quack-kernels (>= 0.6.2, pinned by vLLM and SGLang, and present in the CI
+  test image) replaces `DSLPreprocessor.visit_If` process-wide on
+  `import quack`. It rewrites `if const_expr(S) and D: ... else: body` into a
+  constexpr `if` that holds a copy of `body`, so a name assigned in `body`
+  becomes function-scoped. If a later dynamic loop reassigns that name, the
+  loop carries it as maybe-unset (`TYPE_UNSTABLE_JOIN ... None on one path`)
+  whenever `S` is true. Give such loop-local names their own spelling.
+  Detector: rerun the kernel's tests with quack imported first (for example,
+  a `-p` plugin that does `import quack`).
 - Why: PR #799's `causal_conv1d_update` imported `frost.tile_dsl` from a route
   with no version check and broke the 4.6.2 lane — the version vLLM and SGLang
   ship — with a bare `ModuleNotFoundError: cutlass.experimental`; the bulk
@@ -395,8 +459,18 @@ tensor.record_stream(as_torch_stream(ctx.stream, device))
 ```
 Never call `torch.cuda.ExternalStream` / `get_stream_from_external` directly.
 `stream_context(None)` is a no-op; a handle equal to torch's current stream is
-a no-op via the raw-handle fast path; `0`/`1`/`2` and torch's default stream
-resolve to `torch.cuda.default_stream(device)`.
+a no-op via the raw-handle fast path; `0`/`1` and torch's default stream
+resolve to `torch.cuda.default_stream(device)`. `CUstream(2)` is a per-thread
+stream, NOT the legacy default. Torch interop rejects this sentinel: a cache
+key or allocator stream record based on `(device, 2)` aliases distinct host
+threads, and mapping it to the legacy default misorders scratch lifetimes.
+Use a concrete `torch.cuda.Stream` or its raw handle. The rejection must happen
+before the raw-current-stream shortcut too. Detector:
+`core/cutedsl/test_torch_stream_sentinels.py`. When staging a caller tensor,
+record its storage on the consuming stream even when `stream=None`: the caller
+may have entered a side-stream context after allocating it elsewhere. Use
+`contiguous_on_stream` / `copy_into_on_stream`; `core/cutedsl/test_torch_stream_staging.py`
+checks both explicit and implicit current streams with allocator reuse controls.
 
 **R2 — execute needs scratch (metadata, on-device descriptors, an output the
 kernel always writes but the graph did not request, staging for a dead-but-
@@ -408,7 +482,7 @@ def execute(self, graph, variant_pack, ctx):
     ws = Workspace.over(variant_pack, self.get_workspace_size(), type(self).__name__)  # frost/workspace.py
     meta = ws.take(4 * b + 4, "int32"); desc = ws.view(off, "int64", (slots * 16,))
 ```
-(APIBase adapters: `scratch_workspace_bytes()` + `WorkspaceCarver(workspace, bytes, label).take(numel, dtype)`
+(Adapters: `scratch_workspace_bytes()` + `WorkspaceCarver(workspace, bytes, label).take(numel, dtype)`
 in `sdpa/fwd/api_dsl.py`.) `Workspace(None, ...)` already raises
 `"<owner> requires a N-byte workspace but execute() received none; allocate
 graph.get_workspace_size() bytes and pass the buffer to execute()"` — reuse
@@ -428,6 +502,14 @@ byte copy; never run a real kernel on an intentionally recycled scratch pointer.
 For direct API workspace, validate CUDA device type and the operand's ordinal
 before launch (`Workspace(..., device=...)`); byte size/alignment alone also
 accept host memory.
+
+DLPack metadata export must select the producer's `__dlpack_device__()` and
+restore the caller's context even on errors; `stream=-1` avoids synchronization
+but does not bypass a producer's current-device check. For CAI-only workspace,
+use runtime pointer attributes: older cuda-python driver bindings return zero
+for `CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL` on every GPU. The foreign-device,
+export-failure and capture checks in `core/cutedsl/test_workspace_device.py`
+cover these boundaries with two visible GPUs.
 
 **R3 — a dead ABI slot (the compiled kernel never dereferences it).** In order
 of preference: (1) compile it out — an `Optional`/`None`-typed kernel parameter
@@ -529,13 +611,51 @@ treatment at the caller boundary.**
   heuristic ranking or plan-list order. For shared host optimizations, measure
   both routes and report their scope separately; one engine's result is not proof
   for the other.
+- **Native context checks preserve the thread's execution policy.** A real
+  stream determines its context; default-stream sentinels use the handle's
+  device. Checking only whether any context is bound misses a caller on the
+  wrong GPU. Retain primary contexts once per device, including repeated cold
+  calls. `core/graph/test_ensure_current_context.py` covers cold threads,
+  foreign contexts, first native use, lazy import and retain count; its
+  foreign-device cases require two visible GPUs.
+- **A guard that keeps the backend's planner away from a graph covers EVERY
+  path that creates a backend plan, not only the heuristics query.** The cc 10.7
+  single-query MXFP8 guard (`manifest.EngineFamily.backend_guard`,
+  `sdpa/fwd/backend_guard.py`: the cuDNN 9.26 / 9.27 planner SIGSEGVs there)
+  first intercepted the planning sequence only -- `_finalize_backend_layout`
+  and `backend_plan_entries`. `create_execution_plan(<backend engine id>,
+  knobs)`, a replayed autotune record, still reached the C++
+  `Graph::create_execution_plan` and took the process down the same way (rc 139
+  on 9.26.0.51, no exception to catch), so "explicit diagnostic selection stays
+  available" was a crash for exactly the selection it named. The two
+  out-of-sequence creators, `_append_backend_plan` (the explicit pin and the
+  materialization of a replayed entry) and `_lower_backend_plan` (a late
+  heuristics query for a classic call), go through
+  `_pygraph._refuse_guarded_backend` and raise the typed decline with the guard's
+  reason; `key()` / `serialize()` only lower, which completes on that domain.
+  Detector: `sdpa/frost/test_sdpa_backend_guard.py::test_explicit_backend_pin_on_a_guarded_graph_is_a_typed_decline`
+  (host-only, cc 10.7 modelled, a `_lower_backend_graph` tripwire), seen RED on
+  the first guard. A version-bounded guard also needs the detector that
+  re-measures its bound (test/AGENTS.md).
+- **The names FlashInfer reads are pinned.** `cudnn.sdpa_capabilities()`,
+  `cudnn.frost.cutedsl_runtime_available(device_cc=None)`,
+  `cudnn.datatypes.torch_to_cudnn_data_type`, `pygraph.selected_engine` /
+  `.backend_plan_entries()` and the private spellings FlashInfer still uses
+  (`_SdpaThdBinder.supports_*`, `datatypes._torch_to_cudnn_data_type`) are a
+  caller boundary: `test/python/sdpa/frost/test_flashinfer_consumed_surface.py`
+  (host-only) pins each with its signature, including the cc 10.7 + 4.7.x DSL
+  -> False cell of the arch-aware probe. Renaming one means updating
+  FlashInfer's fallbacks first; that test failing is the reminder. The runtime
+  probe takes the part because the DSL floor is 4.7.0 everywhere and 4.8.0 on
+  cc 10.7 (Rule 7): a device-blind "available" is the blind spot that routes a
+  cc 10.7 graph to the backend engine.
 
 ## Frontend-only kernel package layout
 
 ```
 python/cudnn/<operation>/            # or sdpa/<direction>/, gemm/cutedsl/<layout>/<fusion>/
-├── __init__.py                      # exports API class + wrapper via __all__
-├── api.py                           # APIBase subclass + <operation>_wrapper() function
+├── __init__.py                      # exports the public functions via __all__
+├── api.py                           # <op>_<direction>() / <op>_<direction>_jax() functions
 └── <kernel_module>.py               # CuTeDSL kernel implementation(s); some families use csrc/ per-arch trees
 ```
 
@@ -551,7 +671,9 @@ python/cudnn/gemm/
 ├── frost/                           # the FROST GEMM engine (JIT fused matmul chains from cuDNN graphs)
 │   ├── sm100/, sm120/               #   one tree per arch family: compiler.py + epilogue_codegen.py + kernel_templates/
 │   ├── compiler.py, epilogue_codegen.py  # facades: become the active family's module (arch_family.py)
-│   └── kernel_templates/            #   template code SHARED by both trees (split-K reduction)
+│   ├── kernel_templates/            #   template code SHARED by both trees (split-K reduction)
+│   └── ln_prologue/                 #   the LayerNorm-prologue gated dual GEMM substrate: host (__init__.py) + ONE RENDERED body per arch (two arms: pairing=columns = TriMul K1, pairing=accumulators = TriMul K3)
+│                                    #   (sm107_dual_gemm.py; a rendering for one arch is not a registry template, so not under kernel_templates/)
 ├── ops/                             # backend-independent torch custom-op contracts
 └── reference/                       # pure-PyTorch MATMUL/POINTWISE correctness engine
 ```
@@ -582,24 +704,55 @@ rewritten into a dynamic `ir_loop` and cannot iterate heterogeneous objects
 and `pytest --collect-only` both stay green. After any refactor of a kernel
 body, run that flavor's own tests.
 
-## The APIBase contract (`api_base.py`)
+**A `setmaxnreg` register split needs `min_blocks_per_mp=1` on the launch.**
+With `.reqntid` alone (what `block=` emits) ptxas cannot bound the register
+count at entry: it prints C7508 and drops every `setmaxnreg`. The SASS then has
+no `USETMAXREG`, the consumer warps never get their raised budget, and ptxas may
+size every warp for several CTAs per SM — the sm120 dual MoE GEMM fell to 40
+registers with 11 KB of spills and ran 4-6x slower. `.launch(...,
+min_blocks_per_mp=1)` emits `.minnctapersm 1` and makes the split live. The DSL
+never surfaces C7508 (not even under `CUTE_DSL_COMPILER_OPT=warnings`), so the
+numerics tests cannot see a lost split. Once the split is live, the producer
+budget is a hard limit: keep per-lane producer state small (one elected lane
+holding a tile's worth of GATHER rows spilled at 24 registers and made sm120 MoE
+GATHER up to 1.45x slower; each TMA-warp lane now issues its own GATHER4s), and
+accept only warp grids the split fits (`Sm120KernelTemplate.warp_layout_reject`).
+**Detector:** a compile-only SASS pin — one `USETMAXREG.DEALLOC` and one
+`TRY_ALLOC` at the template's counts, plus a spill bound on producer-heavy cases
+(the SDPA pins in `sdpa/frost/test_sdpa_bwd_d256_sm100.py` are the pattern).
 
-Every OSS kernel API extends `APIBase` and implements:
+**Immutable tensor-map reuse is local to a consumer and a launch.** A persistent
+loader or store warp may skip acquisition only while it keeps using an unchanged
+map it already acquired. Track the sequence/expert per consuming warp, reacquire
+on a switch, and reset that state at kernel entry. Never cache acquisition in a
+host plan or infer it from another CTA's fence. Verify fresh pointer bindings and
+changed device-side boundaries during CUDA-graph replay against an independent
+reference; `sdpa/frost/test_sdpa_thd_tensormap_acquire.py` and
+`gemm/cutedsl/test_wgrad_tensormap_acquire.py` exercise those lifetimes. Fences
+surrounding descriptor replacement, data visibility, and pipeline synchronization
+have different contracts and remain required.
 
-- `check_support() -> bool` — validate dtype/shape/stride/arch/config via the `_check_tensor_*` / `_value_error_if` helpers; must set `self._is_supported`. Works on `TensorDesc` (metadata-only tensors), so it runs without GPU storage.
-- `compile()` — calls `self._ensure_support_checked()`, builds and `cute.compile`s the kernel, caches in `self._compiled_kernel`.
-- `execute(..., current_stream=None)` — runs the cached kernel.
+For fractional-microsecond performance changes, repeat A/B with shared addresses,
+reversed construction order, and an independently compiled unchanged-source
+control. An A/A that shares one compiled kernel does not bound the variation
+introduced by separate compilation and code placement.
+Also check that an optimization's admission condition is exercised by the
+repository benchmark shapes or a documented target workload. A favorable
+synthetic shape establishes a local effect, not representative benefit; it does
+not by itself justify another compile-cache specialization.
 
-`__call__` = compile-if-needed + execute. High-level wrappers (`<op>_wrapper_sm100(...)`) allocate outputs and return a **`TupleDict`** (dict that also unpacks as a tuple) with stable, documented key order. FP4x2 packing: use `_tensor_shape`/`_tensor_stride`, which double the innermost dim when `interpret_uint8_as_fp4x2` is set.
+## The public function contract
+
+Public functions (`<op>_<direction>(...)` / `<op>_<direction>_jax(...)`, see `docs/fe-oss-apis/api_conventions.md`) allocate outputs and return them in a stable, documented order. PyTorch functions return a **`TupleDict`** (dict that also unpacks as a tuple). JAX functions return a plain tuple or dict: `jax.jit` rejects `TupleDict`, which is not a registered pytree.
 
 ## Adding a new frontend-only API — required checklist
 
 1. Kernel package under the closest existing family (layout above).
-2. `APIBase` subclass + wrapper in `api.py`.
+2. Public functions in `api.py`.
 3. Exports: family `__init__.py` `__all__` **and** `_LAZY_OPTIONAL_IMPORTS` in `python/cudnn/__init__.py`; register any new package dir in `pyproject.toml` packages list.
 4. Docs: page under `docs/fe-oss-apis/` (family subdir) + link it from `docs/fe-oss-apis/overview.md`.
-5. Tests: `test/python/<op>/cutedsl/test_<op>.py` (+ `_utils.py`/reference), covering check_support pass/fail and numerical reference comparison.
-6. DSL version gate (Rule 7): the route/`check_support` declines with a version-naming error below `CUTEDSL_MIN_VERSION`, and the tests skip there instead of failing.
+5. Tests: `test/python/<op>/cutedsl/test_<op>.py` (+ `_utils.py`/reference), covering supported and unsupported configurations and numerical reference comparison.
+6. DSL version gate (Rule 7): the route declines with a version-naming error below `CUTEDSL_MIN_VERSION`, and the tests skip there instead of failing.
 
 The `cutedsl-kernel-integration` skill (`skills/cutedsl-kernel-integration/`) documents this workflow in detail, including how to classify a kernel into a family — follow it for any kernel integration.
 

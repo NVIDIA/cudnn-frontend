@@ -1,0 +1,2 @@
+# Benchmark-only dependency; not part of cudnn-frontend's runtime package.
+diffusers==0.40.0
