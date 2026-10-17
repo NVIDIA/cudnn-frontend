@@ -46,6 +46,7 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. New A
 - [DSv4.1 Vision RoPE Backward](attention/vision_rope_backward.md)
 - [Engram Saved-State Gate](/fe-oss-apis/engram_saved_gate)
 - [RMSNorm + RHT + Amax](rmsnorm_rht_amax.md)
+- [SDPA Backward, d = 128, dense and THD MHA/GQA/MQA (SM100)](attention/sdpa_bwd_sm100_d128.md)
 - [SDPA Backward (SM120)](attention/sdpa_bwd_sm120.md)
 - [SDPA Backward, d = 256 and d in (256, 512] (SM107 / Rubin; SM100 / SM103 via the 2x2-datapath body)](attention/sdpa_bwd_sm107.md)
 - [Compact GQA Backward (SM107)](attention/compact_gqa_backward.md)
