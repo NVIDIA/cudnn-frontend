@@ -1366,7 +1366,7 @@ def grouped_gemm_dglu_wrapper_sm100(
     ``deterministic=True`` makes ``dprob`` bit-identical run to run (block-scaled kernel, torch,
     no dbias). See docs/fe-oss-apis/gemm_fusions/grouped_gemm_dglu.md.
     """
-    if b_tensor is not None and sfa_tensor is not None and detect_framework(a_tensor) == "jax":
+    if b_tensor is not None and detect_framework(a_tensor) == "jax":
         from ..canonical_jax import check_jax_wrapper_options
         from .jax_api import grouped_gemm_dglu_jax_sm100
 
@@ -1385,6 +1385,7 @@ def grouped_gemm_dglu_wrapper_sm100(
             use_dynamic_sched=use_dynamic_sched,
             use_single_group_runtime_offsets=use_single_group_runtime_offsets,
             sf_fp8_dtype_override=sf_fp8_dtype_override,
+            sf_vec_sizes=(16, 32),
         )
         for name, rejected in (
             ("round_dgrad_to_input_dtype", round_dgrad_to_input_dtype),
@@ -1417,6 +1418,7 @@ def grouped_gemm_dglu_wrapper_sm100(
             glu_clamp_max=glu_clamp_max,
             glu_clamp_min=glu_clamp_min,
             generate_dbias=generate_dbias,
+            sf_vec_size=sf_vec_size,
         )
     # Hot-loop memo; same shape as the unfused and GLU wrappers. Everything from here to
     # execute() is derivation -- dtype resolution, DgluCall construction, normalization and
