@@ -1565,6 +1565,7 @@ cudnn.triangle_attention.TriangleAttentionFwd.launches_per_call
 cudnn.triangle_attention.TriangleAttentionFwd.make_cuda_graph
 cudnn.triangle_attention.copy_counters
 cudnn.triangle_attention.mask_to_kv_lengths
+cudnn.triangle_attention.prefix_mask_to_kv_lengths
 cudnn.triangle_attention.reset_copy_counters
 cudnn.triangle_attention.triangle_attention
 cudnn.triangle_attention.triangle_attention_reference
