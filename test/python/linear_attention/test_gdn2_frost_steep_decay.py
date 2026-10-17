@@ -424,6 +424,10 @@ def test_forward_state_alias_after_graph_warmup(backend, K, state_dtype):
         state.copy_(fresh)
         captured.replay()
         torch.cuda.synchronize()
+        assert torch.isfinite(expected_o).all(), "non-finite eager output"
+        assert torch.isfinite(expected_state).all(), "non-finite eager state"
+        assert torch.isfinite(o).all(), "non-finite replayed output"
+        assert torch.isfinite(state).all(), "non-finite replayed state"
         assert_bitwise("replayed output", o, expected_o)
         assert_bitwise("replayed state", state, expected_state)
 
