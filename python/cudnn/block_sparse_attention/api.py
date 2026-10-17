@@ -189,6 +189,7 @@ def block_sparse_attention_forward(
     layout: str = "bhsd",
     kv_splits: int | str = 1,
     use_clc: Optional[bool] = None,
+    blk64_plan=None,
 ) -> TupleDict:
     """Run non-causal block-sparse scaled dot-product attention.
 
@@ -266,6 +267,19 @@ def block_sparse_attention_forward(
             q2k_block_index.shape[-1],
             require_even=require_even,
         )
+
+    if blk64_plan is not None:
+        from ._blk64_plan import Blk64Plan, eligible
+
+        if not isinstance(blk64_plan, Blk64Plan):
+            raise TypeError("blk64_plan must come from block_sparse_attention_blk64_prepare")
+        blk64_plan.check_binding(q2k_block_index, q2k_block_nums, block_sparse_num, sparse_block_size)
+        if kv_splits == 1 and use_clc is None and eligible(blk64_plan, q_tensor, k_tensor, v_tensor, arch, layout, softmax_scale, block_sizes):
+            with torch.cuda.device(q_tensor.device):
+                from ._blk64_paired import forward
+
+                out, lse = forward(q_tensor, k_tensor, v_tensor, blk64_plan, softmax_scale)
+            return TupleDict(o_tensor=out, lse_tensor=lse)
 
     with torch.cuda.device(q_tensor.device):
         from . import _interface
@@ -393,6 +407,7 @@ def block_sparse_attention_backward(
     bucket_size_blocks: Optional[int] = None,
     sparse_block_size: Optional[int] = None,
     layout: str = "bhsd",
+    blk64_plan=None,
 ) -> TupleDict:
     """Compute explicit dQ, dK, and dV for block-sparse attention.
 
@@ -463,6 +478,44 @@ def block_sparse_attention_backward(
         v_tensor,
     )
 
+    if blk64_plan is not None:
+        from ._blk64_plan import Blk64Plan, eligible
+
+        if not isinstance(blk64_plan, Blk64Plan):
+            raise TypeError("blk64_plan must come from block_sparse_attention_blk64_prepare")
+        blk64_plan.check_binding(q2k_block_index, q2k_block_nums, block_sparse_num, sparse_block_size)
+        if bucket_size_blocks in (None, blk64_plan.bucket_size_blocks) and eligible(
+            blk64_plan,
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            arch,
+            layout,
+            softmax_scale,
+            block_sizes,
+            backward=True,
+            extra=(do_tensor, o_tensor, lse_tensor, dq_tensor, dk_tensor, dv_tensor),
+        ):
+            with torch.cuda.device(q_tensor.device):
+                import tvm_ffi
+                from ._blk64_paired import backward
+
+                with tvm_ffi.use_torch_stream():
+                    dq, dk, dv = backward(
+                        do_tensor,
+                        q_tensor,
+                        k_tensor,
+                        v_tensor,
+                        o_tensor,
+                        lse_tensor,
+                        blk64_plan,
+                        softmax_scale,
+                        dq_tensor,
+                        dk_tensor,
+                        dv_tensor,
+                    )
+            return TupleDict(dq_tensor=dq, dk_tensor=dk, dv_tensor=dv)
+
     with torch.cuda.device(q_tensor.device):
         from . import _interface
 
@@ -488,8 +541,32 @@ def block_sparse_attention_backward(
     return TupleDict(dq_tensor=dq, dk_tensor=dk, dv_tensor=dv)
 
 
+def block_sparse_attention_blk64_prepare(
+    q2k_block_index: torch.Tensor,
+    block_sparse_num: Optional[int] = None,
+    *,
+    num_kv_blocks: int,
+    q2k_block_nums: Optional[torch.Tensor] = None,
+    bucket_size_blocks: Optional[int] = None,
+):
+    """Analyze exact blk64 pairs for the ordinary forward/backward entry points.
+
+    Pass the result as ``blk64_plan=plan`` with ``sparse_block_size=64``.
+    FWD pairs Q neighborhoods; BWD independently pairs KV reverse neighborhoods.
+    Unpairable directions and unsupported layouts use the original blk64 path.
+    This explicit CPU preparation synchronizes routing metadata and must run
+    outside CUDA Graph capture. Rebuild after changing the sparse graph.
+    ``bucket_size_blocks`` counts Q64 blocks (default 1024).
+    See ``docs/fe-oss-apis/bsa.md`` for the lifetime and allocation contracts.
+    """
+    from ._blk64_plan import prepare
+
+    return prepare(q2k_block_index, block_sparse_num, num_kv_blocks, q2k_block_nums, bucket_size_blocks)
+
+
 __all__ = [
     "block_sparse_attention_forward",
     "block_sparse_attention_fp8_forward",
     "block_sparse_attention_backward",
+    "block_sparse_attention_blk64_prepare",
 ]
