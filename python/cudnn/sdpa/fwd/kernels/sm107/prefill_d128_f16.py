@@ -1931,17 +1931,17 @@ def _tmaldg_item_pair(
         sb = _pair_step_bounds(q_tile_idx, seqlen_q, seqlen_kv, seq_kv_lens_tensor, seq_q_lens_addr, rows)
         kv_left = sb.left
         kv_right = sb.right
-        # Assigned on EVERY path of the step (an empty step never reads it): the kv loop further down is a separate region, and a
-        # value that is unassigned on one path into it is a type-unstable join for the DSL's region analysis.
+        # Bound on EVERY path of the step (an empty step never reads them): the kv loop further down is a separate region that
+        # re-assigns these names, and a name bound on only one path into it is a type-unstable join for the DSL's region analysis.
         kv_row_base = kv_left * CFG.TILE_N
+        # One ring stage per sub-tile per kv tile: stage `states[qs]` holds K / V of row rows[qs] (the MMA reads it for sub-tile qs).
+        states = [kv_state]
+        for _i in cutlass.range_constexpr(CFG.TILES_Q - 1):
+            states.append(advance(states[-1], CFG.STAGES_KV))
+        st = states[0]
         if cutlass.const_expr(MAY_BE_EMPTY) and (kv_right <= kv_left):
             pass
         else:
-            # One ring stage per sub-tile per kv tile: stage `states[qs]` holds K / V of row rows[qs] (the MMA reads it for sub-tile qs).
-            states = [kv_state]
-            for _i in cutlass.range_constexpr(CFG.TILES_Q - 1):
-                states.append(advance(states[-1], CFG.STAGES_KV))
-
             # Prologue: Q[rows[qs]] -> K[rows[qs]] per sub-tile (q_empty_phase flips right after the LAST Q load), then the bias, then V.
             for qs in cutlass.range_constexpr(CFG.TILES_Q):
                 st = states[qs]
