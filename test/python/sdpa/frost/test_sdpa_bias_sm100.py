@@ -365,6 +365,39 @@ def test_dead_subtile_quiet_pick_and_request_on_the_inf_body_on_sm100(_sm100_dev
         _api(s_q=384, s_kv=384, dead_subtile_quiet=1).check_support()  # the plain body: a typed decline on this line
 
 
+def test_dead_subtile_quiet_pick_sees_the_width_a_bias_plan_runs_at_on_sm100(_sm100_device_for_the_adapter, monkeypatch):
+    """The dead-sub-tile rows rule (a cluster tile of 2 x tile_m x cga rows) is evaluated at the width the plan RUNS at -- the ``cta_mma``
+    arm of ``template_params``: a bias plan without a width request takes the heuristics' width (D 64 at S_kv <= 128 is the cga-2 resident
+    block), a kv_mask-only plan its request or the small tiles' cga1.  A knob-less D 64 bias plan at S_kv 128 and S_q 256 therefore takes
+    the quiet body (the cluster's 512 rows leave CTA 1 of the pair without a live row), as the pick at cga 2 says and as the explicit
+    width request already did; at S_q 300 too (sub-tile 1 of CTA 1 dead); at S_q 512 the full body (every sub-tile live).  The
+    kv_mask-only plan keeps the small tiles' cga1 and its own rule (no dead sub-tile at a 256 multiple, one at S_q 300)."""
+    from cudnn.sdpa.fwd import config_sm100 as c0
+
+    monkeypatch.setattr(c0, "_DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS", None)
+    assert c0.sm100_dead_subtile_quiet_pick(64, has_bias=True, has_kv_mask=False, s_q=256, cga=2) == 1
+    assert c0.sm100_dead_subtile_quiet_pick(64, has_bias=True, has_kv_mask=False, s_q=256, cga=1) == 0
+    api = _api(d=64, s_q=256, s_kv=128, bias=(1, 4, 256, 128))
+    assert api.check_support() is True
+    p = api.template_params()
+    assert (p.cta_mma, p.tile_n, p.bias_mode) == (2, 128, 1), p
+    assert p.dead_subtile_quiet == 1, "the pick is evaluated at the cga-2 width the plan runs at (the cta_mma arm), not at the small tiles' cga1"
+    apir = _api(d=64, s_q=256, s_kv=128, bias=(1, 4, 256, 128), cga=2)
+    assert apir.check_support() is True and apir.template_params().dead_subtile_quiet == 1, "the explicit width request agrees"
+    api300 = _api(d=64, s_q=300, s_kv=128, bias=(1, 4, 300, 128))
+    assert api300.check_support() is True and api300.template_params().dead_subtile_quiet == 1
+    api512 = _api(d=64, s_q=512, s_kv=128, bias=(1, 4, 512, 128))
+    assert api512.check_support() is True
+    assert (api512.template_params().cta_mma, api512.template_params().dead_subtile_quiet) == (2, 0), "S_q 512 fills the cluster tile"
+    apim = _api(d=64, s_q=256, s_kv=128, kv_mask=(2, 1, 1, 128))
+    assert apim.check_support() is True
+    pm = apim.template_params()
+    assert (pm.cta_mma, pm.kv_mask_form, pm.dead_subtile_quiet) == (1, 1, 0), "a kv_mask-only plan keeps cga1: no dead sub-tile at a 256 multiple"
+    apim300 = _api(d=64, s_q=300, s_kv=128, kv_mask=(2, 1, 1, 128))
+    assert apim300.check_support() is True
+    assert (apim300.template_params().cta_mma, apim300.template_params().dead_subtile_quiet) == (1, 1), "sub-tile 1 of the second item dead at cga1"
+
+
 # --------------------------------------------------------------------------- tier 3: the GPU cells (a cc 10.0 / 10.3 device)
 
 # The Rubin module's degenerate-input matrix INSIDE the SM100 resident budget (S_kv <= 256 at the 32-wide tile, <= 128 at the 64-wide one):
@@ -770,18 +803,29 @@ def test_pre_masked_tail_on_the_bias_body_matches_the_oracle_and_the_word_body_b
 
 
 # The dead-sub-tile QUIET body on the -inf arms (the sweep seam in-process): a dead sub-tile 1 (S_q % 256 in 1..128) on the resident block, the
-# streamed rings at both widths, the D 64 cga-1 ring at the losing cell's shape, with the kv_mask word and with the pre-masked padded tail --
-# against the oracle and BITWISE against the full body (the dead rows are never stored; every live row's O / Stats come from the same body).
+# streamed rings at both widths, the D 64 cga-1 ring at the losing cell's shape, with the kv_mask word and with the pre-masked padded tail,
+# and the cga-2 RESIDENT block (D 64 at S_kv <= 128: the heuristics' width, so the one-batch-entry item's cluster tile is 512 rows and the
+# dead-sub-tile rule is evaluated at cga 2) -- against the oracle and BITWISE against the full body (the dead rows are never stored; every
+# live row's O / Stats come from the same body).
 _QUIET_CASES = {
     "quiet_bias_384": dict(b=2, h=2, h_kv=2, s_q=384, s_kv=384),  # sub-tile 1 of the 2nd item dead: the 2-stage ring at 128 / the 3-stage ring at 64
     "quiet_bias_pad_384": dict(
         b=2, h=2, h_kv=2, s_q=384, s_kv=392, kv_lens=[392, 200]
     ),  # sub-tile 1 of the 2nd item dead, with the pre-masked padded tail (both arms on)
+    "quiet_bias_d64_300_cga2": dict(
+        b=2, h=2, h_kv=2, s_q=300, s_kv=128, d=64
+    ),  # cga2: CTA 1 of the pair keeps sub-tile 0 live (rows 256..299), its sub-tile 1 dead
+    "quiet_bias_d64_256_cga2": dict(
+        b=2, h=2, h_kv=2, s_q=256, s_kv=128, d=64
+    ),  # cga2: CTA 1 of the pair holds NO live row (both sub-tiles quiet); the collective MMA still runs
 }
 _QUIET_PAIRS = [
     ("quiet_bias_384", 128, False),
     ("quiet_bias_384", 64, True),
     ("quiet_bias_pad_384", 128, False),
+    ("quiet_bias_d64_300_cga2", 128, False),
+    ("quiet_bias_d64_300_cga2", 128, True),
+    ("quiet_bias_d64_256_cga2", 128, False),
 ]
 
 
@@ -801,6 +845,8 @@ def test_quiet_dead_sub_tile_on_the_inf_body_matches_the_oracle_and_the_full_bod
     monkeypatch.setattr(c0, "_DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS", 1)
     quiet = _run(q, k, v, tile_n=tile_n, **kw)
     assert full["knobs"].tile_n == quiet["knobs"].tile_n == tile_n, (case, full["knobs"], quiet["knobs"])
+    want_cga = 2 if case.endswith("_cga2") else 1
+    assert full["knobs"].cga == quiet["knobs"].cga == want_cga, (case, full["knobs"], quiet["knobs"])
     _t7._check(quiet, ref)
     assert torch.equal(quiet["o"], full["o"]) and torch.equal(quiet["stats"], full["stats"]), (case, tile_n, with_mask)
 

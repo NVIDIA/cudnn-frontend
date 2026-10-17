@@ -2021,7 +2021,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 has_kv_mask=self.kv_mask_desc is not None,
                 request=self.dead_subtile_quiet,
                 s_q=int(self.q_desc.shape[2]),
-                cga=int(self.cga) if self.cga is not None else 1,
+                # the width the plan RUNS at -- the cta_mma arm of template_params(): a bias plan takes the heuristics' width (the narrowest
+                # resident block; D 64 at S_kv <= 128 is cga2), a kv_mask-only plan its request or the small tiles' cga1 -- so the dead-sub-tile
+                # rows rule (2 x tile_m x cga) sees the cluster tile the kernel really covers
+                cga=self._resident_arm_cga() if self.bias_desc is not None else (int(self.cga) if self.cga is not None else 1),
                 padded=bool(self.seq_kv_lens_present),
                 tile_n=self._effective_tile_n(),
             )
