@@ -158,8 +158,8 @@ def _check_case(variant, shape, *, offset, spread, num_groups=None, channels_las
     # correct. A half-ulp bound there would have been 0.154 and hidden a 2.2e-02 y.
     mean_round = (mean_ref.float().double() - mean_ref).abs()
 
-    # rstd carries no offset: a few fp32 roundings is all it may lose. This is the
-    # assertion the broken reduction missed by ~5 orders of magnitude.
+    # rstd has no offset and loses at most a few fp32 rounding steps.
+    # The previous reduction exceeded this bound by about five orders of magnitude.
     rstd_err = (rstd.double().reshape(-1) - rstd_ref.reshape(-1)).abs().max().item()
     rstd_tol = 64 * _F32_EPS * rstd_ref.abs().max().item()
     ok = rstd_err <= rstd_tol

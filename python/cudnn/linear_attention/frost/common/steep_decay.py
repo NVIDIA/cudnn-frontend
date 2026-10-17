@@ -455,8 +455,9 @@ def steep_grad_corrections(
         dkd_attn = sum_{s<t} dM[t, s] k_n[s] F(t, s)          dkd_mma = sum_{s<t} dM[t, s] K inv[s]
         dk_inv   = sum_{s>t} (scale q_n[s] dA[s, t] - beta[s] k_n[s] dM[s, t]) F(s, t)
 
-    every exponent of F at most 0. ``*_mma`` are the steep column's products that the dQ attn and dK decay GEMMs
-    already accumulated. Return the dQ correction, the inverse-side dK term, the beta correction and the
+    Every exponent of F is at most 0. ``dq_mma`` and ``dkd_mma`` contain products for the steep column.
+    The dQ attn and dK decay GEMMs have already accumulated these products.
+    Return the dQ correction, the inverse-side dK term, the beta correction and the
     decay-side dK correction (also used for dgate). Callers only map these onto their register layouts;
     they add the two dK terms in their original accumulation order."""
     dq_attn = cutlass.Float32(0.0)
