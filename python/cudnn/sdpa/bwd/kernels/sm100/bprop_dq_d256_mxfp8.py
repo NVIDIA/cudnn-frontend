@@ -2284,8 +2284,7 @@ class BlackwellFmhaBackwardDQ256:
         if warp_idx == self.compute_warp_id_0[0]:
             # Dealloc the tensor memory buffer for 2-CTA support
             tmem.relinquish_alloc_permit()
-            tmem._num_allocated_columns = self.tmem_alloc_cols
-            tmem.free(tmem_ptr)
+            tmem.free(tmem_ptr, num_columns=self.tmem_alloc_cols)
 
     bwd.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
