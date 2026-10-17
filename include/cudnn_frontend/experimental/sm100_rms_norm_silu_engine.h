@@ -176,14 +176,13 @@ class Sm100RmsNormSiluEngine : public IOssNormEngine {
         is_cooperative_ = (ctas_per_row_ > 1);
 
         // Cache SM count
-        cudaDeviceProp devProp;
         int device_ordinal   = 0;
         cudaError_t cuda_err = detail::cuda_get_device(&device_ordinal);
         RETURN_CUDNN_FRONTEND_ERROR_IF(cuda_err != cudaSuccess, error_code_t::CUDA_API_FAILED, "cudaGetDevice failed");
-        cuda_err = detail::cuda_get_device_properties(&devProp, device_ordinal);
+        cuda_err = cudnn_frontend::detail::cuda_device_get_attribute(
+            &sm_count_, cudaDevAttrMultiProcessorCount, device_ordinal);
         RETURN_CUDNN_FRONTEND_ERROR_IF(
-            cuda_err != cudaSuccess, error_code_t::CUDA_API_FAILED, "cudaGetDeviceProperties failed");
-        sm_count_ = devProp.multiProcessorCount;
+            cuda_err != cudaSuccess, error_code_t::CUDA_API_FAILED, "cudaDeviceGetAttribute failed");
 
         support_checked_ = true;
         return {error_code_t::OK, ""};
@@ -292,13 +291,26 @@ class Sm100RmsNormSiluEngine : public IOssNormEngine {
         }
 
         // Add CUDA Toolkit include paths for NVRTC to resolve #include <cuda_bf16.h> etc.
-        std::string cuda_include = "/usr/local/cuda/include";
+        std::string cuda_include   = "/usr/local/cuda/include";
+        bool cuda_include_from_env = false;
         if (auto env0 = get_environment("CUDA_HOME")) {
-            cuda_include = std::string(env0) + "/include";
+            cuda_include          = std::string(env0) + "/include";
+            cuda_include_from_env = true;
         } else if (auto env1 = get_environment("CUDA_PATH")) {
-            cuda_include = std::string(env1) + "/include";
+            cuda_include          = std::string(env1) + "/include";
+            cuda_include_from_env = true;
+        }
+        // The headers next to the loaded NVRTC (toolkit lib64/../include, pip nvidia/cu13/lib/../include) match its
+        // version and need no CUDA_HOME: searched after an explicit CUDA_HOME/CUDA_PATH, before /usr/local/cuda.
+        auto const nvrtc_dir            = detail::nvrtc_library_dir();
+        std::string const nvrtc_include = nvrtc_dir.empty() ? std::string{} : nvrtc_dir + "/../include";
+        if (!nvrtc_include.empty() && !cuda_include_from_env) {
+            flags.push_back("--include-path=" + nvrtc_include);
         }
         flags.push_back("--include-path=" + cuda_include);
+        if (!nvrtc_include.empty() && cuda_include_from_env) {
+            flags.push_back("--include-path=" + nvrtc_include);
+        }
 
         // CCCL headers needed for cuda::ptx:: used by block-scale (NVFP4) code paths.
         // CUDA 13+ ships CCCL under targets/<arch>-linux/include/cccl.

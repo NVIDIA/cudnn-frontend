@@ -94,8 +94,8 @@ from typing import Callable, Optional
 
 from cutlass._mlir.dialects import arith
 
-from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32
-from cudnn.frost.tile_dsl.tma import ld_global_v4, st_global
+from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16
+from cudnn.frost.tile_dsl.tma import ld_global, ld_global_v2, ld_global_v4, st_global, st_global_v4
 from cudnn.gated_attention_block.kernels.proj_gemm import NormRopeFusionParams, validate_norm_rope_params
 from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
 
@@ -209,6 +209,18 @@ WANT_RSTD: bool = PARAMS.want_rstd
 # loads, no rstd; the Q/K tiles are rotated on the fp32 accumulator and stored.  Every
 # norm-only block below sits under const_expr(_QK_NORM); the weights are None at the ABI.
 _QK_NORM: bool = PARAMS.qk_norm
+# The paged KV-cache WRITE-THROUGH arm (NormRopeFusionParams.kv_pool_page_size > 0; 0 = this template as before, byte for byte):
+# every K / V tile's post-norm, post-RoPE row is ALSO stored into the pools [P, H_kv, _KV_PAGE, D] at slot_mapping[token] --
+# the gated attention block's serving cache write folded into stage (1).  One thread owns one row of the 128 x 256 tile
+# (mma_size_m == 1, one tile == one head at d_head 256), so the pool row is the thread's own 32-bf16 subtile words, the
+# same registers the slab store reads: the pool row IS the slab row (bitwise the separate cache-write kernel).  Per row
+# ONE slot read, issued with the early cos / sin loads BEFORE the accumulator wait; a negative slot or one past the pools
+# writes nothing (the serving stacks' padding convention); the Q / GATE tiles never store.  No new barrier, no new SMEM:
+# the two pre-development tables of this arm are empty deltas.  The page size and the slot dtype are compile keys exactly
+# as in cache_write.py (the in-kernel divide; int64 slots as two 32-bit halves).
+_KV_PAGE: int = int(PARAMS.kv_pool_page_size)
+_KV_WRITE: bool = _KV_PAGE > 0
+_KV_SLOT_I64: bool = bool(PARAMS.kv_slot_i64)
 NORM_SOURCE: str = PARAMS.norm_source  # "ldg" | "ldg_early" | "const" | "off"
 _LDG: bool = NORM_SOURCE in ("ldg", "ldg_early")  # real loads (vs the const diagnostic)
 _ROPE_SUBTILES: int = _ROPE_DIM // epi_n
@@ -320,6 +332,10 @@ def frost_sm100_matmul_128x256x128_128x256x32_cluster2x1_2ctamma(
     sin_tab: cute.Tensor,  # [T, ROPE_DIM]
     rstd_q: Optional[cute.Tensor],  # [T, H_q]  fp32, or None (folds out)
     rstd_k: Optional[cute.Tensor],  # [T, H_kv] fp32, or None
+    # ---- the write-through arm: appended, None (dropped from the specialised signature) unless _KV_WRITE ----
+    k_pool: Optional[cute.Tensor] = None,  # [P, H_kv, _KV_PAGE, D] io dtype: the first three strides symbolic Int64, D contiguous
+    v_pool: Optional[cute.Tensor] = None,  # same, the V pool
+    slot_map: Optional[cute.Tensor] = None,  # [T] int32 (or int64 under _KV_SLOT_I64), contiguous
 ) -> None:
     tma_a_descs = [tma_a_desc_0]
     tma_b_descs = [tma_b_desc_0]
@@ -1275,6 +1291,41 @@ def frost_sm100_matmul_128x256x128_128x256x32_cluster2x1_2ctamma(
                     for _h in cutlass.range_constexpr(_ROPE_DIM * _IO_BPE // 16):
                         for _w in ld_global_v4(_sn_addr_e + cutlass.Int64(_h * 16), cutlass.Int32):
                             _sn_words_early.append(_w)
+                if cutlass.const_expr(_KV_WRITE):
+                    # The write-through arm's per-row resolve, BEFORE the accumulator wait like the early table loads: the tile's
+                    # pool (K or V; a Q / GATE tile stores nothing), its head within that pool, this row's slot (a tail row reads
+                    # row m - 1 and is never live), the live predicate and the pool address.  Int64 scalars selected per tile.
+                    _is_v = _n0 >= cutlass.Int32(_OFF_V)
+                    _kv_tile = _is_k | _is_v
+                    _kv_head = cutlass.Int32(
+                        arith.select(
+                            _is_k.ir_value(), ((_n0 - cutlass.Int32(_OFF_K)) >> _LOG2_D).ir_value(), ((_n0 - cutlass.Int32(_OFF_V)) >> _LOG2_D).ir_value()
+                        )
+                    )
+                    if cutlass.const_expr(_KV_SLOT_I64):
+                        _slo, _shi = ld_global_v2(slot_map.iterator.toint() + _row_c * cutlass.Int64(8), cutlass.Int32)
+                        _slot = (_shi.to(cutlass.Int64) * cutlass.Int64(1 << 32)) + (_slo.to(cutlass.Int64) & cutlass.Int64(0xFFFFFFFF))
+                    else:
+                        _slot = ld_global(slot_map.iterator.toint() + _row_c * cutlass.Int64(4), cutlass.Int32).to(cutlass.Int64)
+                    # the capacity both pools hold (the smaller of the two: a slot past either pool would be a write past that pool)
+                    _n_slots = cutlass.min(cutlass.Int64(k_pool.shape[0]), cutlass.Int64(v_pool.shape[0])) * cutlass.Int64(_KV_PAGE)
+                    _kv_live = _kv_tile & _rstd_row_valid & (_slot >= cutlass.Int64(0)) & (_slot < _n_slots)
+                    _slot32 = _slot.to(cutlass.Int32)  # an in-range slot fits 32 bits (a pool of 2^31 rows of >= 16 B exceeds any device)
+                    _kv_pg = _slot32 // cutlass.Int32(_KV_PAGE)
+                    _kv_off = _slot32 - _kv_pg * cutlass.Int32(_KV_PAGE)
+                    _pool_base = cutlass.Int64(arith.select(_is_k.ir_value(), k_pool.iterator.toint().ir_value(), v_pool.iterator.toint().ir_value()))
+                    _pool_s0 = cutlass.Int64(
+                        arith.select(_is_k.ir_value(), cutlass.Int64(k_pool.stride[0]).ir_value(), cutlass.Int64(v_pool.stride[0]).ir_value())
+                    )
+                    _pool_s1 = cutlass.Int64(
+                        arith.select(_is_k.ir_value(), cutlass.Int64(k_pool.stride[1]).ir_value(), cutlass.Int64(v_pool.stride[1]).ir_value())
+                    )
+                    _pool_s2 = cutlass.Int64(
+                        arith.select(_is_k.ir_value(), cutlass.Int64(k_pool.stride[2]).ir_value(), cutlass.Int64(v_pool.stride[2]).ir_value())
+                    )
+                    _kv_dst = _pool_base + (
+                        _kv_pg.to(cutlass.Int64) * _pool_s0 + _kv_head.to(cutlass.Int64) * _pool_s1 + _kv_off.to(cutlass.Int64) * _pool_s2
+                    ) * cutlass.Int64(_IO_BPE)
 
             while not nvvm.mbarrier_try_wait_parity(acc_full_mbar_ptr.subview(acc_stage), acc_full_phase_bit, time_limit=10_000_000):
                 pass
@@ -1493,6 +1544,17 @@ def frost_sm100_matmul_128x256x128_128x256x32_cluster2x1_2ctamma(
 
                             col = coord_n_c + subtile_col_offset
                             vec_out = cutlass.Vector.from_elements(tuple(_elems), cutlass.Float32).to(cutlass.BFloat16)
+                            if cutlass.const_expr(_KV_WRITE):
+                                # The pool row = this subtile's 32 bf16 words (cvt.rn.bf16x2.f32 = the slab's RN rounding, bit for bit),
+                                # 4 x st.global.v4 at the row's pool address; the K tiles only (the Q tiles are norm tiles too).
+                                if _kv_live:
+                                    # (loop variables of their own: a dynamic `if` must leave every traced local with the structure it had)
+                                    _kv_words = []
+                                    for _kvw in cutlass.range_constexpr(subtile_w // 2):
+                                        _kv_words.append(fp32_to_fp16(_elems[2 * _kvw], _elems[2 * _kvw + 1], dtype=cutlass.BFloat16))
+                                    _kv_sub = _kv_dst + cutlass.Int64(subtile_col_offset * _IO_BPE)
+                                    for _kvv in cutlass.range_constexpr(subtile_w // 8):
+                                        st_global_v4(_kv_sub + cutlass.Int64(_kvv * 16), _kv_words[4 * _kvv : 4 * _kvv + 4], cutlass.Int32)
 
                             epi_stage_idx = (epi_stage_idx + 1) % EPI_SMEM_STAGES
                             _tsv_0 = cutlass.Array(base=smem_d_ptr.data_ptr(epi_stage_idx * epi_subtile_elems), shape=4096, dtype=cutlass.BFloat16)
@@ -1547,6 +1609,15 @@ def frost_sm100_matmul_128x256x128_128x256x32_cluster2x1_2ctamma(
 
                             _r_mm = (vec_f32).to(cutlass.BFloat16)
                             vec_out = (_r_mm).to(cutlass.BFloat16)
+                            if cutlass.const_expr(_KV_WRITE):
+                                # The V tiles' pool row (the GATE tiles have _kv_tile False): the raw accumulator's bf16 words.
+                                if _kv_live:
+                                    _kv_words = []
+                                    for _kvw in cutlass.range_constexpr(subtile_w // 2):
+                                        _kv_words.append(fp32_to_fp16(vec_f32[2 * _kvw], vec_f32[2 * _kvw + 1], dtype=cutlass.BFloat16))
+                                    _kv_sub = _kv_dst + cutlass.Int64(subtile_col_offset * _IO_BPE)
+                                    for _kvv in cutlass.range_constexpr(subtile_w // 8):
+                                        st_global_v4(_kv_sub + cutlass.Int64(_kvv * 16), _kv_words[4 * _kvv : 4 * _kvv + 4], cutlass.Int32)
 
                             epi_stage_idx = (epi_stage_idx + 1) % EPI_SMEM_STAGES
                             _tsv_0 = cutlass.Array(base=smem_d_ptr.data_ptr(epi_stage_idx * epi_subtile_elems), shape=4096, dtype=cutlass.BFloat16)
@@ -1630,6 +1701,10 @@ def _host(
     rstd_q: Optional[cute.Tensor],
     rstd_k: Optional[cute.Tensor],
     stream: _cuda.CUstream,
+    # ---- the write-through arm: appended after `stream`, None unless PARAMS.kv_pool_page_size > 0 ----
+    k_pool: Optional[cute.Tensor] = None,
+    v_pool: Optional[cute.Tensor] = None,
+    slot_map: Optional[cute.Tensor] = None,
 ) -> None:
     _a_operands = [a_0]
     _b_operands = [b_0]
@@ -1775,6 +1850,9 @@ def _host(
         sin_tab,
         rstd_q,
         rstd_k,
+        k_pool,
+        v_pool,
+        slot_map,
     )
     # Mixed CGA: `cluster` is the preferred (wide) shape and `fallback_cluster`
     # the regular one the device groups blocks into when a preferred cluster does
@@ -1857,6 +1935,29 @@ def compile() -> Callable:
     fake_sin = make_fake_compact_tensor(cd_dtype, (sym_m, _ROPE_DIM), stride_order=(1, 0), assumed_align=16)
     fake_rstd_q = make_fake_compact_tensor(cutlass.Float32, (sym_m, _H_Q), stride_order=(1, 0), assumed_align=4) if WANT_RSTD else None
     fake_rstd_k = make_fake_compact_tensor(cutlass.Float32, (sym_m, _H_KV), stride_order=(1, 0), assumed_align=4) if WANT_RSTD else None
+    # ---- the write-through arm's operands (None = the arm is not traced; the artifact's signature is the pre-arm one) ----
+    # The pools: [P, H_kv, page, D] with P and the first three strides SYMBOLIC (Int64) and D contiguous -- one artifact binds an HND
+    # compact pool and an NHD one (the layout is nothing but those strides); the page size is concrete (a compile key).  The slot
+    # map: [T] contiguous int32 / int64 (kv_slot_i64) at its element's alignment.
+    _kv_kw = {}
+    if _KV_WRITE:
+        _kv_kw = dict(
+            k_pool=cute.runtime.make_fake_tensor(
+                dtype=cd_dtype,
+                shape=(cute.sym_int(), _H_KV, _KV_PAGE, _D),
+                stride=(cute.sym_int(width=64), cute.sym_int(width=64), cute.sym_int(width=64), 1),
+                assumed_align=16,
+            ),
+            v_pool=cute.runtime.make_fake_tensor(
+                dtype=cd_dtype,
+                shape=(cute.sym_int(), _H_KV, _KV_PAGE, _D),
+                stride=(cute.sym_int(width=64), cute.sym_int(width=64), cute.sym_int(width=64), 1),
+                assumed_align=16,
+            ),
+            slot_map=make_fake_compact_tensor(
+                cutlass.Int64 if _KV_SLOT_I64 else cutlass.Int32, (sym_m,), stride_order=(0,), assumed_align=8 if _KV_SLOT_I64 else 4
+            ),
+        )
 
     def _sym_operand_strides(is_mn_major: bool) -> tuple:
         # Operand is permuted to (M|N, K, L): the unit stride is mode 0 when MN-major, mode 1 when K-major, and never reaches TMA.
@@ -1900,6 +2001,7 @@ def compile() -> Callable:
         fake_rstd_q,
         fake_rstd_k,
         stream=_fake_stream,
+        **_kv_kw,
         options=frost_compile_options,
         cache_key=_cache_key,
         symbol="frost_gemm_norm_rope",

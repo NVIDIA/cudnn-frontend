@@ -188,6 +188,8 @@ def wrapper_operand_meta(tensor):
     so an id-keyed memo answers for tensors it never saw. Data pointers are excluded --
     they vary per call and nothing derived depends on them; execute() re-checks them.
     """
+    if is_torch_tensor(tensor):
+        return (tensor.shape, tensor.stride(), tensor.dtype, tensor.device)
     if tensor is None or not hasattr(tensor, "shape"):
         return tensor
     device = get_device(tensor)

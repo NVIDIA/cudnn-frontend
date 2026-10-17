@@ -147,6 +147,26 @@ ordered after that read.**
   is `ref == 0, gpu != 0` elements on masked configs with `key mod TILE_N`
   in the aliased range — recover the leaked keys by matching
   `O_gpu - O_ref` against `V` rows.
+- Prove completion and inter-thread ordering separately for every TMEM reuse
+  edge. The specialized synchronization route uses the applicable
+  `tcgen05.wait::ld/st`, producer `before_thread_sync`, synchronization, and
+  consumer `after_thread_sync`; `tcgen05.commit` supplies its implicit
+  producer fence. A standard memory-model alternative needs a complete
+  ordering proof. Detector: enumerate the `tcgen05` load/store/MMA,
+  completion, fence, and mbarrier sites in each emitted PTX flavor, then
+  trace each dependency in its actual cubin. A STORE-completion
+  `FENCE.VIEW.ASYNC.T` or numerical pass alone does not establish inter-thread
+  ordering. Specialized fences may constrain code motion without a distinct
+  SASS opcode. See [PTX ISA, specialized synchronization and canonical
+  patterns](https://docs.nvidia.com/cuda/parallel-thread-execution/),
+  sections 9.7.18.6.3–6.4 and 9.7.18.11.1 in PTX 9.4.
+- A DSL version gate does not establish support for every PTX modifier in
+  the installed compiler. Cross-compile with the advertised public package's
+  default CUDA flavor. A CTA-group-1 kernel allocating all 512 TMEM columns
+  can use ordinary allocation/deallocation; the `.exclusive` modifier can
+  fail assembly even with public CuTeDSL 4.8. The d128 dense, THD and grouped
+  execution tests must cover all four accumulation routes, plus recompute
+  as an unchanged control.
 
 
 **Rule S4 — Split-K partial Stats keep the combiner's log base.**
@@ -280,6 +300,31 @@ on the address path shows the wrap before any GPU run.
   whenever the selected batch/map changes. Exercise empty and repeated work items
   with the existing `thd_over_launched_units_are_dead` and
   `thd_multi_unit_per_cta` regressions.
+
+**Rule S9 — Every scheduler reader needs a reuse back-edge; match output-phase cadence.**
+
+Every scheduler payload reader must either return a reuse credit or have a
+back-edge that gates the next publication on its observation. An idle role
+that only reads a CLC response can miss a complete parity cycle, including
+the terminal response. Remove that role's loop when it has no work. If this
+also removes the only waiter on a credit barrier, stop arriving that object:
+common dense CLC routes credits only to its leader, while persistent THD and
+local predecode retain broadcast credits and their local scheduler roles.
+Peer credit barriers then receive zero arrives and have no waiters. Credit
+helpers require converged warps; retain their per-specialization lowering
+choice when changing the target. Check scheduler and credit-helper selection
+together at each caller; THD does not imply persistent scheduling in every
+kernel family. Detector:
+`test_sdpa_fwd_o_empty_backedge.py::test_scheduler_and_credit_target_select_the_same_layouts`.
+
+Match barrier completion cadence to the consumer's loop. SM100 D512 MXFP8
+SWA=128 drains two Dv slices per tile, so a once-per-tile softmax wait must use
+the once-per-tile Q/O alias signal, including its explicit bootstrap phase,
+not the twice-per-tile O-empty signal. Detector:
+`test_sdpa_fwd_o_empty_backedge.py::test_d512_swa_waits_for_both_output_slices`
+delays softmax after publishing retained P, then checks dense/THD O, LSE and
+Amax after capture/replay. The delay lives in a private test template copy;
+production kernels gain no debug knob or timing-dependent assertion.
 
 ## 2x2 datapath (cta_group::2, M=128 collective = 64 rows per CTA) lessons
 
@@ -757,6 +802,198 @@ public MMA width, and masked KV work depends on the candidate Q span and tile
 alignment. Compare masked bounds with an independent visible-key oracle and
 verify every alternative is rescored, deduplicated and within the candidate
 cap. An exact winning-rank golden alone does not detect stale model inputs.
+
+The SM107 resident-bias arm's (n, n+1) pair item has no public chunk-length
+knob until the frontend-band enum member lands in both pybind extensions;
+`config_sm107._N_CHUNK_OVERRIDE_FOR_SWEEPS` is a private, process-local TEST
+seam read by `sm107_n_chunk_pick` and, through `sm107_pair_item_active`, by
+the engine row's mismatch, the heuristics and the adapter -- a set value
+changes the plan the graph builds and its eligibility. Set it only through
+`monkeypatch.setattr` in a test or from a sweep driver that resets it to
+`None`; never from a plan path, a module import or a config. Pin behaviour on
+the pick's output (`test_n_chunk_override_seam_is_read_by_the_pick`), not on
+the seam's name.  The bias FORM and the streamed ring's depth have the same
+shape of seam: `config_sm107._BIAS_MODE_OVERRIDE_FOR_SWEEPS` (1 = the resident
+block, declining above its budget; 2 = the streamed ring wherever it fits,
+including where the block would also fit -- the A/B's two arms) and
+`_BIAS_STAGES_OVERRIDE_FOR_SWEEPS` (2 / 3), read by `sm107_bias_mode_pick` /
+`sm107_bias_stages_pick` and so by the engine row, the heuristics' width pick
+and the adapter; the same rules apply (pinned by
+`test_seams_pin_the_form_and_the_depth`).
+
+Measured facts the small-tile bias heuristics must honour (bf16, D = 32,
+S_q = S_kv = 384, H = 4, 384 flattened batch rows; a 212-SM cc 10.7 node at the
+2376 MHz lock, 100 x 3 graph-replay rounds, control pair within 0.2 %):
+
+- A graph with BOTH a bias and a bool `kv_mask` is superadditive on the
+  128-wide tile: plain 46.3 us, bias +10.0, `kv_mask` +20.0, both +34.7 (the
+  sum + 15 %; the one-batch-entry item + 21 %). The mechanism is the
+  instruction cache: the combined softmax body is ~3480 hot SASS instructions
+  against ~3050 for either feature alone, and the warp-stall ratio
+  `smsp__average_warps_issue_stalled_no_instruction_per_issue_active` jumps
+  0.5 -> 2.0 while every other reason stays put and the instruction count
+  stays sub-additive. `TILE_N = 64` halves the unrolled body and restores
+  additivity: both 81.0 -> 70.9 us (+14 %; `no_instruction` 2.0 -> 0.25) while
+  every single-feature arm LOSES at the half tile (plain -12 %, bias -4 %,
+  `kv_mask` -10 %). A chooser that scores the bias and the mask as independent
+  costs is wrong by that excess. This is ONE measured cell: at this shape the
+  combined graph's best measured width is `TILE_N 64` (+14 % same-process; the
+  one-batch-entry form +12 %, the additive-vector form +22 %) -- a finding the
+  chooser scores per S / n_chunk / form from its own sweep before any default
+  flips, not a pick to apply elsewhere. Check the ratio on any new rendering
+  that adds body (a streamed ring, a third operand) before shipping it.
+- The default `n_chunk` rule's pick (`sm107_n_chunk_rule`) is one step short at S = 128 (2 vs the measured
+  4: 12.8 vs 11.2 us, +15 %) and one past at S = 768 (16 vs 8: 328.9 vs 316.7
+  us, +4 %); it is the measured best at 384 and 512. Past ~2.5 items per SM
+  every chunk length loses to the wave tail (`n_chunk = N` 13-16x).
+- The item-boundary bubble of the resident block is 0.13 / 0.23-0.33 /
+  0.36-0.56 us per item at S = 384 / 512 / 768 (it grows with the block bytes:
+  the exposed tail of the per-item fill), 0.8-1.3 % of the cell at the rule's
+  pick -- not a lever. The pair item's gain over the one-batch-entry item is
+  the 256-row super-tile's q-row waste (25 % at S = 384), not the bubble: per
+  computed 128 x 128 sub-tile step the two forms cost the same.
+- `BIAS_PRELOAD_CHUNKS` 1 -> 0 (no bias chunk loaded before the `bmm1_done`
+  wait) is +1.7..+1.9 % on the pair item and +3 % on the one-batch-entry item;
+  2 is -1 %. The row read hides in place on the issue-bound small tile.
+- The ADDITIVE bf16 `kv_mask` vector costs twice the bool word's increment
+  (+85 % vs +43 % over plain): the per-pair FFMA2 + unpack is the cost, the
+  ballots are not (0.8 % of the bool arm's stall samples). Keep the bool word
+  the default where the caller can give one.
+
+Measured facts from the knob sweep of the same arms over the grid (bf16, D = 32
+and 64, S_q = S_kv = S in {128, 256, 384, 512, 768, 1024} plus the padding leg
+{200, 217, 300, 450, 600}, H = 4, B x S flattened rows with B = 1 and 4, the bias
+batch-broadcast; a 212-SM cc 10.7 node at the 2376 MHz lock -- the sampled busy
+median 2364 MHz on 32 of 35 processes, 2316-2352 MHz on three d64 processes
+whose absolute times are lower bounds; 100 x 3 graph-replay rounds, a control
+twin per process within 0.25 % on 31 of 35 processes and up to 1.0 % on the
+launch-bound small-S processes, 648 cells, EVERY ratio same-process; at S <= 256
+the graph replay is launch-bound on the host (replay / CUPTI 1.2-1.6), so those
+ratios read the kernel-only CUPTI time):
+
+- `TILE_N 64` for every graph with BOTH a bias and a bool `kv_mask` -- 26 of 27
+  (D, B, S) sets, +9..+55 %, one tie at d32 S 1024 B = 1 (d32 B = 1: +21 / +30 /
+  +13 / +18 / +13 % at S 128 / 256 / 384 / 512 / 768, 0 % at 1024; B = 4
+  +9..+55 %, the top end the kernel-only time at S 128; d64 +22..+44 % at every
+  S).
+  Where the knob-less pick is the one-batch-entry streamed ring (d32 S >= 512)
+  the best form is the PAIR item's resident block at TILE_N 64 (`n_chunk 8`:
+  169 -> 144 us at 512, 487 -> 429 at 768) -- the form pick is coupled to the
+  width pick (the same pair form LOSES to the ring at TILE_N 128).
+- The padded `plain` rendering (S_kv % 128 != 0, no bias, no mask) at TILE_N 128
+  is pathologically slow at D = 32: kernel-only 25.9 us at S 217 against 15.4 for
+  the DENSE S 256 cell and 19.6 for the same padded shape WITH a kv_mask; 58.7 at
+  S 300 against 43.5 for the dense 384. TILE_N 64 reads +51 / +52 / +57 / +19 /
+  +4 % at S 200 / 217 / 300 / 450 / 600 (B = 4: +68 / +64 % at 217 / 300; D = 64:
+  +36 % at 200, -4 % at 600). A code-generation effect of the padded dense arm,
+  not a work difference (the same kv tiles) -- an open kernel item; until it is
+  fixed the chooser takes TILE_N 64 on the padding leg for plain and bias graphs
+  (not for the kv_mask-only graph: a wash or a loss there except at one kv tile).
+- `TILE_N 64` for the bias-only graph at S_kv <= 256 (+7..+37 % at every D and
+  B; with `n_chunk 4` at one kv tile) and on the padding leg (+17..+38 %);
+  TILE_N 128 at S_kv % 128 == 0 >= 384 (TILE_N 64 is -3..-13 % there). Plain and
+  kv_mask-only graphs at S % 128 == 0 keep TILE_N 128 (64 loses -3..-20 %).
+- `n_chunk`: a floor of 4 at ONE kv tile (+8..+16 % over the clamp-2 pick; 8 is
+  worse); above ~1500 flattened rows the rule's pick is one power of two too
+  large (8 at 1536 rows: +3.1 / +3.7 % at d32 / d64; 4 for the d64 pair ring at
+  S_kv 640..896: +2..+5 %) -- a 6-wave reading of the trade with the one-tile
+  floor; the `S_q % 256 == 0` one-batch-entry guard holds at TILE_N 128 and
+  <= 768 rows only (at TILE_N 64 the pair n2 wins S 256 by +3 %; at 1024 rows the
+  pair n8 wins +3.7 % and the one-batch-entry 2-stage ring beats its own resident
+  block by +9.6 %, one process).
+- The one-batch-entry streamed ring wants 2 stages, not the derived 3:
+  +1.5..+3.6 % on 6 of 6 processes (d32 S 512 / 768 / 1024, B = 1 and 4, with and
+  without a kv_mask); the pair ring is a tie at d64 and -0.3 / -1.7 % at 2 stages
+  in the earlier d32 measurement.
+- The d64 one-batch-entry item at cga 2 with the 2-stage ring beats the pair
+  ring at S_kv 1024 only (+4.0 % three times at B = 1, +4.6 % at B = 4); at 512 /
+  640 / 768 / 896 it is -1 / -33 / -19 / -5 % (two GPUs, the gap closing
+  monotonically towards 1024) -- not a rule; the pair ring with `n_chunk 4` is
+  within 0..3 % of the best form everywhere >= 640.
+- `BIAS_PRELOAD_CHUNKS` 1 -> 0 flips sign with the rendering's FORM (a base / 0 /
+  base cross-process A/B/A over 27 cells, base drift <= 0.23 %, then a 12-cell
+  confirm of the applied constant, control floors <= 0.18 %): at TILE_N 128
+  +1.8..+3.2 % on the RESIDENT bias forms at S_kv >= 384 (+0.9..+2.1 % with a
+  kv_mask on the pair forms, -0.7 % on the one-batch-entry + kv_mask; a second node
+  of the class read the same S 384 d32 forms +1.7..+1.9 / +3.1 / +1.2 %), +0.0..+0.6 %
+  on the streamed ring, -1.2..+0.7 % at one kv tile (S 128, where the chooser never
+  picks 128 for a bias graph); the confirm on the applied tree +2.1 % (resident
+  pair) and +0.3 / +0.5 / +0.3 % on the three 128-wide ring renderings (above the
+  replay control floors, inside the CUPTI control spread); at TILE_N 64 the signs
+  are MIXED -- the resident bias + kv_mask body (the body the chooser picks for
+  that graph) -2.5..-2.7 %, the resident bias-only forms +0.3..+1.4 %, the ring
+  -2.6 % plain / +1.4 % with a kv_mask (one cell each) -- so it is a per-RENDERING
+  constant, never a module default: `config_sm107.sm107_bias_preload_chunks`
+  (`SM107_BIAS_PRELOAD_CHUNKS_BY_TILE_N`: 0 at TILE_N 128, 1 at TILE_N 64), read
+  once by the kernel module from `CFG.TILE_N`; numerics are unchanged at every
+  value, only the instruction stream around the `bmm1_done` wait moves.
+- The THIRD softmax warp group (`TemplateParams.softmax_wgs` 3: a 20-warp body
+  whose pair work item takes three rows of the chunk per step, the split 12 x 128
+  + 4 x 56 + 4 x 40 = the 20-warp entry pool) is the default of exactly ONE form
+  -- a bias TOGETHER WITH a kv_mask on the pair item at TILE_N 64, cga 1, dense KV
+  lengths, S_kv >= 640 and at most 3072 flattened batch rows
+  (`config_sm107.SM107_THREE_WG_S_KV_MIN` / `SM107_THREE_WG_B_FLAT_MAX`,
+  `sm107_softmax_wgs_pick`): +8.1 / +7.9 / +3.3 / +2.9 % over the pair's pick at
+  d32 S 640 / 768 / 896 / 1024 and +3.5 / +8.7 % at d64 S 768 / 1024 (the arm and
+  its base in one process, 100 x 3 replays, control twins <= 0.14 %); the applied
+  default confirmed knob-less +6.6 / +7.3 / +3.3 % at d32 S 640 / 768 / 1024 and
+  +5.4 / +10.7 % at d64 S 768 / 1024 at B 1, +7.2 / +7.4 % at d32 S 640 / 768 and
+  +0.8 % at d64 S 768 with four batch entries (2560 / 3072 rows), but -2.4 % at
+  d32 S 1024 with four (4096 rows) -- hence the row bound.  Inside the resolution
+  at S 384 / 512 (+0.5..+0.8 %, d64 S 512 -2.5 %), a LOSS on the bias alone at
+  TILE_N 64 (d64 -10..-17 %), and -2.5..-28.5 % at ANY chunk that is not a
+  multiple of three (the 3-WG body recomputes one or two DEAD rows per chunk:
+  `rows_per_step` in the chunk rule, 6 under the pair's cap of 8).  The P-publish
+  hand-off chain is not the binder (a no-chain variant +1.6 / -0.3 %).  Every
+  two-group rendering is byte-identical to its md5 record; O / Stats are BITWISE
+  the two-group kernel's (`test_sdpa_softmax_wgs_sm107.py`).
+
+The table those facts imply is CODE, in one place per axis, and the sweep's
+second half (S = 2048 at D 32 / 64 and B 1 / 4; cluster 1 vs 2 at D 64 S 128..2048;
+the padding-mask leg with per-batch lengths of 0.75 S; the one-batch-entry
+resident block vs its 2- / 3-stage ring at two kv tiles; the kv_mask-only body at
+one kv tile) is in it:
+
+- `config_sm107.sm107_tile_n_pick` is the width (a bias with ANY mask -- the
+  kv_mask or the kernel's padding-mask arm -- takes TILE_N 64: the combined body
+  is the one over the instruction-cache cliff: with per-batch lengths of 0.75 S
+  +11..+73 % at S 256..2048, both D, B 1 / 4, 13 of 13 cells with the table's form
+  measured; a bias alone at S_kv <= 256; a kv_mask alone at one kv tile,
+  +7..+14 %; the plain body at S_kv % 128 != 0 at d32 and up to 256 at d64; 128
+  everywhere else -- per-batch lengths at a tile multiple included, where 64 is
+  -11..-18 % on the plain body at S 512 / 1024 and -19 / -20 % at d32 / d64 S 2048;
+  the pick sees S_kv, not the lengths, so where the lengths themselves end
+  mid-tile (0.75 S at S 256 = 192 keys) the half tile's measured +58..+119 % is
+  out of its reach -- the padded dense body's open kernel item). `heuristics._resident_arm_tile_n`, the engine
+  row's form evaluation in `engines._bias_arm_decline` and the adapter's
+  `_effective_tile_n` call it (rule 8b').
+- The one-batch-entry guard of `sm107_n_chunk_pick` holds at TILE_N 128 only: on
+  the 64-wide tile the pair's resident block wins (+2.8 % at S 256, +12 / +13 %
+  at S 512 / 768 with a kv_mask), so the pick takes the plan's `tile_n`.
+- `sm107_n_chunk_refine` caps the pair chunk at 8 (every larger rule pick lost
+  where it was measured against n8: 1536 / 2048 / 8192 rows, the d64 ring at
+  640..2048) and floors it at 4 at one 128-wide kv tile while the 2-row items
+  stay under 2 waves (128 rows: +8..+16 %; 512 rows: n2 wins back +8 %).
+- `sm107_bias_stages_pick` gives the one-batch-entry ring 2 stages (6 of 6 d32
+  processes +1.5..+3.6 %, +2.0..+2.1 % at S 2048), the pair ring the deepest.
+- `sm107_bias_mode_pick` STREAMS the one-batch-entry item at the 32-wide tile
+  wherever its ring fits and the range is two kv tiles or more (+6.4 / +10.0 % over
+  its resident block at S 256 with 256 / 1024 rows, +9.9 / +12.9 % at S 384; the
+  256-row item's block fill is exposed per item, the ring overlaps it); the pair
+  item keeps "resident where it fits" (its 2-stage ring is -0.3 / -1.7 % at d32).
+- Cluster 2 is never the pick on the small tiles: -32 / -31 % at d64 S 128 / 256,
+  a tie at 384 / 512, -2.7 % at 2048 (graph replay; the CUPTI kernel time -2.4 %); a cga2 request at D <= 32 rides the 64-wide
+  tile (-45 % at S 256); the d64 one-batch-entry cga2 ring stays an isolated
+  point (+4 % at S_kv 1024 only).
+
+`test/python/sdpa/frost/test_sdpa_heuristics_small_tile_sm107.py` pins every
+cell of the table with the margin of the best measured arm over the pick the
+heuristics made before it, and the public knob record's round trip through
+`knobs_to_public` / `knobs_from_public`. A new measured cell goes into that table
+with its margin and its process's node class, clock and control pair -- never a
+default flip from one cell. The per-rendering constants were re-measured on the
+new renderings: see the module constants' comments in
+`kernels/sm107/prefill_d128_f16.py` for the A/B/A each carries.
 
 ## Single-CTA packed split scheduler
 

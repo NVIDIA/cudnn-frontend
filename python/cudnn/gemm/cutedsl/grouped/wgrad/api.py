@@ -521,3 +521,4 @@ def grouped_gemm_wgrad_wrapper_sm100(
 
 
 grouped_gemm_wgrad_wrapper_sm100.supports_canonical_layouts = True
+grouped_gemm_wgrad_wrapper_sm100.supports_bf16_canonical_layouts = True

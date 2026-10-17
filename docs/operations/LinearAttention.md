@@ -31,8 +31,8 @@ decline with an error that names the installed version otherwise). One linear-at
 | write / erase gates | `beta` `[T, HO]`; fp32 or io dtype | `beta` `[T, HO]`; fp32 or io dtype | `beta` `[T, HO, K]`, `w` `[T, HO, V]`; io dtype | `beta` `[T * n, HO]`; fp32 or io dtype | none (`dt` is both the decay exponent and the write strength) |
 | gate forms | `gate_domain` log or linear, `safe_gate` (`-exp(a_log) softplus(g + dt_bias)`), `use_beta_sigmoid_in_kernel`, `allow_neg_eigval` | same plus `gate_lower_bound` | same plus `beta_guard` (needs `use_qk_l2norm_in_kernel`) | same as GDN | `dt_softplus`, `dt_bias`, `dt_min`, `dt_max`, `A` `[H]`, skip `D` `[H]` or `[H, P]`, output gate `z` |
 | `use_qk_l2norm_in_kernel` | yes | yes | yes | yes | n/a |
-| recurrent state | `initial_state` / `final_state` `[N, HO, V, K]`, fp32 or bf16 | same | same | same | `[N, H, P, N]`, fp32 or bf16 |
-| `state_checkpoints` (`checkpoint_every_n_tokens`) | multiple of 16 | multiple of 16 | multiple of 16 | multiple of 16 expanded sub-tokens | multiple of 128 |
+| recurrent state | `initial_state` / `final_state` `[N, HO, V, K]`, fp32, bf16 or fp16 | same | same | same | `[N, H, P, N]`, fp32, bf16 or fp16 |
+| `state_checkpoints` (`checkpoint_every_n_tokens`) | multiple of 16 | multiple of 16 | multiple of 16 | multiple of 64 expanded sub-tokens | multiple of 128 |
 | `state_indices` (paged state pool, forward only) | yes | yes | yes | yes | yes |
 | `overwrite_initial_state` (in place, inference) | yes | yes | yes | yes | yes |
 | `batch_invariant` | yes | yes | yes | yes | yes |
@@ -54,9 +54,11 @@ requirement is a contiguous innermost (head-dim) axis. A column slice of a wider
 Tensors are rank 3 (`[T, heads, dim]`); a hidden-fused `[T, heads * dim]` slice needs a `.view` to rank 3, which is
 free when `heads * dim` is contiguous.
 
-GDP runs on two timelines: `q` and `g` have one row per real token, while `k`, `v` and `beta` have `n` rows per token
-(`[T * n, ...]`, update-major: the `n` updates of token `t` are rows `t * n` to `t * n + n - 1`). `cu_seqlens` counts
-real tokens. `num_householder == 1` is exactly GDN.
+GDP runs on two timelines: `q` and `g` have one row per real token, while `k`, `v` and `beta` have `n` rows per token.
+They come either expanded (`[T * n, ...]`, update-major: the `n` updates of token `t` are rows `t * n` to `t * n + n - 1`)
+or token-major (`k` `[T, n, HK, K]`, `v` `[T, n, HV, V]`, `beta` `[T, n, HO]`, with the caller's token stride), so the
+per-token column slices of a joint `[V | K | Q]` projection (`[T, n * H * D]` viewed as `[T, n, H, D]`) are consumed in
+place; `dk`, `dv` and `dbeta` come back in the input's shape. `num_householder == 1` is exactly GDN.
 
 Mamba-2 uses the SSD vocabulary: `x` plays `v`, `B` plays `k`, `C` plays `q`, `dt` is the gate. The output is
 `y = C^T S + D x`, gated by `z sigmoid(z)` when `z` is given.
@@ -65,7 +67,10 @@ Mamba-2 uses the SSD vocabulary: `x` plays `v`, `B` plays `k`, `C` plays `q`, `d
 
 - **States and checkpoints.** `output_final_state=True` returns the per-sequence state after the last token.
   `checkpoint_every_n_tokens > 0` also returns the state series, one entry every `n` tokens strictly before each
-  sequence end, as a non-differentiable dump that the backward reuses instead of recomputing. `state_indices`
+  sequence end, as a non-differentiable dump that the backward reuses instead of recomputing. The rows are io dtype; the
+  four delta-rule variants (GDN, GDP, KDA, GDN-2) also take `checkpoint_dtype=torch.float32` for fp32 rows (the backward
+  reuses io rows at the chunk cadence and regenerates the dense series from any other rows), while Mamba-2 has no
+  `checkpoint_dtype` and stores io-dtype rows only. `state_indices`
   turns `initial_state` into a pool `[N_pool, ...]` addressed per sequence, written back in place; forward only
   and exclusive with checkpoints.
 - **Summaries.** `<op>_summary` returns the end state of each sequence from a given start state together with the

@@ -83,9 +83,17 @@ import cutlass.experimental.primitives as nvvm
 import cutlass.experimental.cuda.tensor_map as tma
 from cutlass.cute.runtime import from_dlpack
 
-from ..common.thd import emit_seq_descs, emit_tile_seq_descs, TENSOR_MAP_QWORDS
+from ..common.thd import (
+    emit_checkpoint_seq_descs,
+    emit_family_descs,
+    emit_seq_descs,
+    emit_tile_seq_descs,
+    expanded_view,
+    tma_load_family,
+    TENSOR_MAP_QWORDS,
+)
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, decode_work_item, order_body
-from ..common.host import get_dtype
+from ..common.host import get_dtype, family_slots
 
 RCP_LN2 = 1.4426950408889634  # 1/ln(2): natural-log gates -> the kernel's log2 domain
 from cudnn.frost.tile_dsl.barrier import (
@@ -834,10 +842,12 @@ def tmaldg_warp(
     bars,
     q_ratio,
     k_ratio,
+    arr_words,
 ):
-    """TMA-LDG warp role (warp 13): every Q/K/dO TMA load and the chunk-factor tile TMA loads; a dO stage is recycled
-    after both its readers (the dU intra GEMM and CG0) release it."""
+    """TMA-LDG warp role (warp 13): every Q/K/dO TMA load (K through its (token, slot, head, dim) descriptor family) and
+    the chunk-factor tile TMA loads; a dO stage is recycled after both its readers (the dU intra GEMM and CG0) release it."""
     nvvm.setmaxregister(cfg.num_regs_other, nvvm.SetMaxRegisterAction.DECREASE)
+    acquired_batch = cutlass.Int32(-1)
 
     q_index = PipelineState.start(phase=1)
     k_index = PipelineState.start(phase=1)
@@ -907,15 +917,17 @@ def tmaldg_warp(
         head_k = head_idx // k_ratio
         slot = batch_idx * desc_qwords
         desc_q_slot = (desc_q_base + slot).tospace(cutlass.AddressSpace.generic)
-        desc_k_slot = (desc_k_base + slot).tospace(cutlass.AddressSpace.generic)
+        desc_k_family = desc_k_base + slot
         desc_do_slot = (desc_do_base + slot).tospace(cutlass.AddressSpace.generic)
-        if elect_one:
-            tma_tensormap_acquire(desc_q_slot)
-            tma_tensormap_acquire(desc_k_slot)
-            tma_tensormap_acquire(desc_do_slot)
         desc_tinv_slot = (desc_tinv_base + slot).tospace(cutlass.AddressSpace.generic)
-        if elect_one:
-            tma_tensormap_acquire(desc_tinv_slot)
+        if batch_idx != acquired_batch:
+            acquired_batch = batch_idx
+            if elect_one:
+                tma_tensormap_acquire(desc_q_slot)
+                for s in cutlass.range_constexpr(1 if cfg.b_t % cfg.k_slots == 0 else cfg.k_slots + 1):
+                    tma_tensormap_acquire((desc_k_family + s * arr_words).tospace(cutlass.AddressSpace.generic))
+                tma_tensormap_acquire(desc_do_slot)
+                tma_tensormap_acquire(desc_tinv_slot)
 
         if cutlass.const_expr(cfg.expand_num > 1):
             sub = (compute_end - 1) % cutlass.Int32(cfg.expand_num)
@@ -935,8 +947,7 @@ def tmaldg_warp(
             k_index = advance(k_index, cfg.smem_k_stages)
             if elect_one:
                 bars.mb_k_ready[k_idx].arrive(n_bytes=cfg.tma_k_bytes)
-            k_slice = tma_slice_runtime_desc(desc_k_slot, cutlass.Int32(0), head_k, tok_coord)
-            tma_load_tile(sK_tma[k_idx], k_slice, bars.mb_k_ready[k_idx].smem_ptr, acquire=False)
+            tma_load_family(sK_tma[k_idx], desc_k_family, arr_words, head_k, chunk_idx, bars.mb_k_ready[k_idx].smem_ptr, cutlass.Int32(0), cfg.b_t, cfg.k_slots)
 
             # ---- Q load: the block's 64 compact tokens -------------------------------
             if block_head:
@@ -1569,15 +1580,17 @@ def build_descs_body(
     b_t: cutlass.Constexpr[int],
     expand_num: cutlass.Constexpr[int],
     q_step: cutlass.Constexpr[int] = 1,
+    k_slots: cutlass.Constexpr[int] = 1,
 ) -> None:
     """Per-batch descriptor-array build, one warp per array (the tinv array on the K warp), after the prologue's order pass.
     q and dO address the compact
     token timeline (``expand_num`` scales k alone); ``q_step`` > 1 reads the phase rows of an expanded q buffer."""
     arr_words = n_batch * cutlass.Int32(TENSOR_MAP_QWORDS)
+    family_arrays = 1 if b_t % expand_num == 0 else expand_num + 1
     sub0 = cute.make_tensor(desc_workspace.iterator, cute.make_layout((arr_words,), stride=(1,)))
-    sub1 = cute.make_tensor(desc_workspace.iterator + arr_words, cute.make_layout((arr_words,), stride=(1,)))
-    sub2 = cute.make_tensor(desc_workspace.iterator + 2 * arr_words, cute.make_layout((arr_words,), stride=(1,)))
-    sub3 = cute.make_tensor(desc_workspace.iterator + 3 * arr_words, cute.make_layout((arr_words,), stride=(1,)))
+    sub1 = cute.make_tensor(desc_workspace.iterator + arr_words, cute.make_layout((family_arrays * arr_words,), stride=(1,)))
+    sub2 = cute.make_tensor(desc_workspace.iterator + (1 + family_arrays) * arr_words, cute.make_layout((arr_words,), stride=(1,)))
+    sub3 = cute.make_tensor(desc_workspace.iterator + (2 + family_arrays) * arr_words, cute.make_layout((arr_words,), stride=(1,)))
 
     if widx == 0:
         if cutlass.const_expr(q_step > 1):
@@ -1590,7 +1603,7 @@ def build_descs_body(
             emit_seq_descs(base_q, sub0, cu_seqlens, q, n_batch, 2, 1, lanes=32)
         nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     if widx == 1:
-        emit_seq_descs(base_k, sub1, cu_seqlens, k, n_batch, 2, expand_num, lanes=32)
+        emit_family_descs(base_k, sub1, cu_seqlens, k, n_batch, b_t, k_slots, expand_num, lanes=32)
         if cutlass.const_expr(tinv is not None):
             emit_tile_seq_descs(base_tinv, sub3, cu_seqlens, tinv, n_batch, b_t, 3, expand_num, lanes=32)
         nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
@@ -1621,6 +1634,7 @@ def frost_gdn_bprop_summary_prologue(
     mWorkItems: cute.Tensor,
     mScheduler: Optional[cute.Tensor],
     n_batch: cutlass.Int32,
+    k_slots: cutlass.Constexpr[int] = 1,
 ) -> None:
     """Two-CTA prologue: under ``run_order`` (this kernel is the first work-item-table consumer) block 0 LPT-orders the
     table and zeroes both consumers' scheduler rings (:func:`order_body`); block 1 builds the per-batch TMA-descriptor
@@ -1657,21 +1671,7 @@ def frost_gdn_bprop_summary_prologue(
             )
     else:
         build_descs_body(
-            widx,
-            base_q,
-            base_k,
-            base_do,
-            base_tinv,
-            desc_workspace,
-            cu_seqlens,
-            q,
-            k,
-            do_,
-            tinv,
-            n_batch,
-            b_t,
-            expand_num,
-            q_step,
+            widx, base_q, base_k, base_do, base_tinv, desc_workspace, cu_seqlens, q, k, do_, tinv, n_batch, b_t, expand_num, q_step, k_slots=k_slots
         )
 
 
@@ -1694,11 +1694,13 @@ def prologue(
     tinv: Optional[cute.Tensor],
     tensormap_workspace: cute.Tensor,
     stream: cuda.CUstream,
+    k_slots: cutlass.Constexpr[int] = 1,
 ):
     """One-launch prologue: LPT-order the work items (``run_order``, when this kernel is the backward pair's first table
     consumer) and build the per-(b,h) TMA-descriptor arrays (Q, K, dO) into ``tensormap_workspace``."""
+    k = expanded_view(k, k_slots, expand_num)
     h_q = q.shape[1]
-    h_k = k.shape[1]
+    h_k = k.shape[2]
     h_v = do_.shape[1]
     batch_size = cu_seqlens.shape[0] - 1
     heads_out = h_q if h_q >= h_v else h_v
@@ -1708,7 +1710,6 @@ def prologue(
     bt = b_t
 
     q_row_stride, q_head_stride = q.stride[0], q.stride[1]
-    k_row_stride, k_head_stride = k.stride[0], k.stride[1]
 
     d_k = q.shape[2]
     if cutlass.const_expr(q_step > 1):
@@ -1718,12 +1719,20 @@ def prologue(
         )
     else:
         q_headed = cute.make_tensor(q.iterator, cute.make_layout((q.shape[0], h_q, d_k), stride=(q_row_stride, q_head_stride, 1)))
-    k_headed = cute.make_tensor(k.iterator, cute.make_layout((k.shape[0], h_k, d_k), stride=(k_row_stride, k_head_stride, 1)))
 
     do_headed = cute.make_tensor(do_.iterator, cute.make_layout((d_v, heads_out, do_.shape[0]), stride=(1, do_.stride[1], do_.stride[0])))
     swizzle_128b = tma.TensorMapSwizzle.s128b
     base_desc_q = tma.create_tensor_map_tiled_from_view(q_headed, box_dims=(bt, 1, box_elems), stride_order=(2, 1, 0), swizzle=swizzle_128b)
-    base_desc_k = tma.create_tensor_map_tiled_from_view(k_headed, box_dims=(bt, 1, box_elems), stride_order=(2, 1, 0), swizzle=swizzle_128b)
+    if cutlass.const_expr(k_slots == 1):
+        k_rows = cute.make_tensor(k.iterator, cute.make_layout((k.shape[0], k.shape[2], k.shape[3]), stride=(k.stride[0], k.stride[2], 1)))
+        base_desc_k = tma.create_tensor_map_tiled_from_view(k_rows, box_dims=(b_t, 1, box_elems), stride_order=(2, 1, 0), swizzle=swizzle_128b)
+    else:
+        k_headed = cute.make_tensor(
+            k.iterator, cute.make_layout((k.shape[0], k_slots, k.shape[2], k.shape[3]), stride=(k.stride[0], k.stride[1], k.stride[2], 1))
+        )
+        base_desc_k = tma.create_tensor_map_tiled_from_view(
+            k_headed, box_dims=(b_t // k_slots, k_slots, 1, box_elems), stride_order=(3, 2, 1, 0), swizzle=swizzle_128b
+        )
     base_desc_do = tma.create_tensor_map_tiled_from_view(do_headed, box_dims=(box_elems, 1, bt), stride_order=(0, 1, 2), swizzle=swizzle_128b)
 
     base_desc_tinv = base_desc_k
@@ -1754,6 +1763,7 @@ def prologue(
         work_items,
         scheduler_all,
         cutlass.Int32(batch_size),
+        k_slots,
     ).launch(grid=(2, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 
@@ -1779,8 +1789,9 @@ def host(
 ):
     batch_size = cu_seqlens.shape[0] - 1
     heads_out = cutlass.Int32(gate.shape[1])
+    k = expanded_view(k, cfg.k_slots, cfg.expand_num)
     q_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(q.shape[1]))
-    k_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(k.shape[1]))
+    k_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(k.shape[2]))
 
     # ---- SMEM sizing: per-buffer element cosizes -------------------------------------
     bytes_per_element = cfg.io_dtype.width // 8
@@ -1891,10 +1902,11 @@ def frost_gdn_bprop_summary(
     desc_base_words = tensormap_workspace.iterator.raw_ptr()
     desc_qwords = cutlass.Int32(TENSOR_MAP_QWORDS)
     arr_words = n_desc * desc_qwords
+    family_arrays = 1 if cfg.b_t % cfg.expand_num == 0 else cfg.expand_num + 1
     desc_q_base = desc_base_words
     desc_k_base = desc_base_words + arr_words
-    desc_do_base = desc_base_words + cutlass.Int32(2) * arr_words
-    desc_tinv_base = desc_base_words + cutlass.Int32(3) * arr_words
+    desc_do_base = desc_base_words + cutlass.Int32(1 + family_arrays) * arr_words
+    desc_tinv_base = desc_base_words + cutlass.Int32(2 + family_arrays) * arr_words
 
     SMEM = cutlass.AddressSpace.smem
     bars = make_bars(cfg)
@@ -2188,6 +2200,7 @@ def frost_gdn_bprop_summary(
             bars=bars,
             q_ratio=q_ratio,
             k_ratio=k_ratio,
+            arr_words=arr_words,
         )
 
     if warp_idx == cfg.load_gate_beta_warp_id:
@@ -2239,6 +2252,7 @@ class GdnBpropSummaryCfg:
     # ---- fixed constants stamped from CFG at build time ------------------------------
     b_t: int = CFG.B_T
     expand_num: int = 1
+    k_slots: int = 1
     compute_group_0_warp_ids: Tuple[int, ...] = CFG.COMPUTE_GROUP_0_WARP_IDS
     compute_group_1_warp_ids: Tuple[int, ...] = CFG.COMPUTE_GROUP_1_WARP_IDS
     compute_group_2_warp_ids: Tuple[int, ...] = CFG.COMPUTE_GROUP_2_WARP_IDS
@@ -2306,6 +2320,7 @@ def build_cfg(
     d_k: int,
     d_v: int,
     expand_num: int = 1,
+    k_slots: int = 1,
 ) -> GdnBpropSummaryCfg:
     """Build the per-compile ``GdnBpropSummaryCfg`` (io_dtype in {Float16, BFloat16}; acc is always Float32)."""
     if expand_num > 1 and (CFG.SMEM_Q_STAGES != 2 or CFG.SMEM_DO_STAGES != 2):
@@ -2320,6 +2335,7 @@ def build_cfg(
         d_k=d_k,
         d_v=d_v,
         expand_num=expand_num,
+        k_slots=k_slots,
     )
     n_cg0 = len(cfg.compute_group_0_warp_ids)
     n_cg1 = len(cfg.compute_group_1_warp_ids)
@@ -2338,7 +2354,8 @@ def build_cfg(
     return cfg
 
 
-TENSORMAP_DESC_ARRAYS = 4  # per-batch runtime TMA descriptors: Q, K, dO, tinv
+TENSORMAP_DESC_ARRAYS = 4  # per-batch runtime TMA descriptors: Q, K, dO, tinv (K as a family)
+TENSORMAP_FAMILY_OPERANDS = 1  # K: expand_num + 1 descriptor arrays when expand_num does not divide b_t
 
 
 # ---------------------------------------------------------------------------
@@ -2364,6 +2381,7 @@ def get_compiled_cache(
     run_order: bool = False,
     order_gen: bool = False,
     q_step: int = 1,
+    layout_key: tuple = (),
 ):
     """Return a mutable dict that lazily stores the compiled kernel."""
     return {}
@@ -2379,6 +2397,7 @@ def compile(
     d_k: int,
     d_v: int,
     expand_num: int = 1,
+    k_slots: int = 1,
     q_cute,
     k_cute,
     gate_cute,
@@ -2407,6 +2426,7 @@ def compile(
         d_k=d_k,
         d_v=d_v,
         expand_num=expand_num,
+        k_slots=k_slots,
     )
 
     return cute.compile(
@@ -2472,8 +2492,6 @@ def chunk_gdn_bwd_summary(
     q_step: row step of the phase rows inside ``q`` (1 = compact buffer)
     own_prologue: False skips the prologue launch when the chain prologue already ordered the table and built the descriptors
     """
-    q.shape[1]
-    k.shape[1]
     do.shape[1]
     DK = q.shape[2]
     DV = do.shape[2]
@@ -2491,6 +2509,7 @@ def chunk_gdn_bwd_summary(
     if not safe_gate:
         a_log = None
         dt_bias = None
+    k_slots = family_slots(k, expand_num, 3)
     cache = get_compiled_cache(
         str(q.dtype),
         str(cu_seqlens.dtype),
@@ -2510,6 +2529,7 @@ def chunk_gdn_bwd_summary(
         run_order,
         order_gen,
         q_step,
+        layout_key=(len(k.shape), k_slots),
     )
 
     if "compiled" not in cache:
@@ -2536,8 +2556,9 @@ def chunk_gdn_bwd_summary(
             d_k=DK,
             d_v=DV,
             expand_num=expand_num,
+            k_slots=k_slots,
             q_cute=from_dlpack(q, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            k_cute=from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2),
+            k_cute=from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=len(k.shape) - 1),
             gate_cute=from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=1),
             a_log_cute=a_log_cute,
             dt_bias_cute=dt_bias_cute,
@@ -2579,7 +2600,7 @@ def chunk_gdn_bwd_summary(
             expand_num,
             q_step,
             from_dlpack(q, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2),
+            from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=len(k.shape) - 1),
             from_dlpack(do, assumed_align=16).mark_layout_dynamic(leading_dim=2),
             cu_placeholder,
             staging_placeholder,
@@ -2589,6 +2610,7 @@ def chunk_gdn_bwd_summary(
             tinv_placeholder,
             workspace_placeholder,
             cu_stream,
+            k_slots,
             options="--enable-tvm-ffi --opt-level 2",
         )
     if own_prologue:

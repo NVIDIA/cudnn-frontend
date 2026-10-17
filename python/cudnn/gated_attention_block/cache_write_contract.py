@@ -7,6 +7,8 @@ Declarations and execute preflight must remain usable on the package's supported
 DSL floor, before a stage checks the newer version its kernel requires.
 """
 
+from typing import Optional
+
 import torch
 
 _SLOT_DTYPES = (torch.int32, torch.int64)
@@ -35,15 +37,20 @@ def check_pool(pool: torch.Tensor, name: str, *, h: int, page_size: int, d: int,
         raise ValueError(f"{name} must be 16-byte aligned (a 16-byte vector-store target), got data_ptr={pool.data_ptr():#x}")
 
 
-def check_slot_mapping(slot: torch.Tensor, name: str, *, t: int, device=None) -> None:
+def check_slot_mapping(slot: torch.Tensor, name: str, *, t: int, device=None, t_live: Optional[int] = None) -> None:
     """``slot_mapping`` against the kernel's contract, typed (no device read): a contiguous 1-D int32 / int64 tensor of
-    exactly ``T`` entries (one flat slot per token; the VALUES are device data the kernel range-checks), on ``device``."""
+    exactly ``T`` entries (one flat slot per token; the VALUES are device data the kernel range-checks), on ``device``.
+    ``t_live`` (appended; the block's ``num_tokens_live``): a second admitted count -- exactly ``T_live`` entries, the live tokens'
+    slots alone (a serving stack's ``slot_mapping[rows]`` with no padding copy); the launch then reads the first ``T_live`` of a
+    ``T``-entry mapping or all of a ``T_live``-entry one."""
+    admitted = (t,) if t_live is None else (t, t_live)
     if not isinstance(slot, torch.Tensor):
         raise ValueError(f"{name} must be a [{t}] int32 / int64 tensor (one flat slot per token), got {type(slot).__name__}")
     if slot.dtype not in _SLOT_DTYPES:
         raise ValueError(f"{name} must be int32 or int64, got {slot.dtype}")
-    if slot.dim() != 1 or int(slot.numel()) != t:
-        raise ValueError(f"{name} must be 1-D with exactly T={t} entries (one flat slot per token of this launch), got shape {tuple(slot.shape)}")
+    if slot.dim() != 1 or int(slot.numel()) not in admitted:
+        want = f"T={t}" if t_live is None else f"T={t} (the declared capacity) or T_live={t_live} (num_tokens_live)"
+        raise ValueError(f"{name} must be 1-D with exactly {want} entries (one flat slot per token of this launch), got shape {tuple(slot.shape)}")
     if not slot.is_contiguous():
         raise ValueError(f"{name} must be contiguous, got strides {tuple(slot.stride())}")
     if device is not None and slot.device != torch.device(device):

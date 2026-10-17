@@ -124,7 +124,7 @@ class SparseCapabilities:
     cu_seq_len: bool = True  # ... the lengths as [B + 1] prefix sums (cu_seq_q_lens / cu_seq_kv_lens, normalised on device) -- reached through thd
     paged_kv: bool = True  # page pools [num_pages, H_kv, page_size, D] (HND compact / NHD by strides) through a (B, max_pages) table; page_size % 4 == 0
     decode: bool = (
-        True  # the sparse DECODE FORM through the standalone adapter: bottom_right + list_per_sequence [+ split_kv]; the block's decode mode is not bound yet
+        True  # the sparse DECODE FORM: bottom_right + list_per_sequence [+ split_kv] -- the standalone adapter, and the gated attention block's decode mode since 2026-10-14
     )
     epilogue_gate: bool = (
         True  # O * sigmoid(G) in the epilogue; G in O's shape, Q's dtype, own strides; a module specialization; composes with thd / paged_kv; under a split it rides the combine

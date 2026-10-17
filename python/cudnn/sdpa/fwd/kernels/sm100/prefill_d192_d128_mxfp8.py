@@ -212,6 +212,12 @@ def _row_reduction_pair_64_segmented(vec64):
     return cutlass.Vector(arith.addf(sum01, sum23), dtype=cutlass.Float32)
 
 
+# Only the common dense CLC path has a single scheduler publisher.
+# THD/predecode retains local schedulers and broadcast credits.
+if not CFG.THD_VARLEN:
+    from cudnn.frost.tile_dsl.scheduler import read_tile_id_arrive_on_leader as read_tile_id_arrive
+
+
 @cute.jit
 def _apply_padding_mask_if_needed(reg_s, kv_col_base, eff_seqlen_kv):
     """Apply the per-element padding predicate only to a partial KV chunk."""

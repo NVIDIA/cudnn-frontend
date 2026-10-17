@@ -24,8 +24,9 @@ bottom-right / SWA / right-band / KV-padding masks, the per-batch seq_len_q
 trim, attention sinks, GQA/MQA with PackGQA, dense split-KV, any dense
 B/H/S storage order with the head dim innermost, THD (ragged) with
 token- or head-major Stats, and the block-scaled MXFP8 O (E4M3 + UE8M0
-per 32 in sf_o) at d = 128. The d512 flavor and the NVFP4 O
-are declined. Base-2 Stats are exercised through the direct adapter: the
+per 32 in sf_o) at d = 128. Both head dims in (256, 512] ride the d512
+flavor (``sm120/prefill_d512_mxfp8.py``, 64 x 64 CTA), covered by its own
+section. The NVFP4 O is declined. Base-2 Stats are exercised through the direct adapter: the
 ``sdpa_mxfp8`` graph op has no ``stats_use_log2`` argument.
 
 Requires: an SM120-line GPU (cc 12.x), cutlass-dsl. Skips otherwise.
@@ -251,6 +252,7 @@ def _run(
     split_kv=None,
     poison_pad=False,
     poison_v_sf_pad_cols=False,
+    poison_qk_sf_pad_blocks=False,
     sync_debug=False,
     layout="bshd",
     sf_o_layout=None,
@@ -299,6 +301,13 @@ def _run(
         sfv = sfv.clone()
         off = _columnwise_sf_offsets(B, H_kv, S_kv, d_v, list(range(_cdiv(S_kv, _BLOCK))), list(range(d_v, _cdiv(d_v, 128) * 128)))
         sfv.view(-1)[off.reshape(-1)] = 0xFF
+    if poison_qk_sf_pad_blocks:
+        # Q/K-scale blocks past d_qk inside the last plane carry the NaN encoding (caller-owned pad bytes).
+        pad_blocks = list(range(_cdiv(d_qk, _BLOCK), _qk_sf_cols(d_qk)))
+        if pad_blocks:
+            sfq, sfk = sfq.clone(), sfk.clone()
+            sfq.view(-1)[_rowwise_sf_offsets(B, H_q, S_q, d_qk, list(range(S_q)), pad_blocks).reshape(-1)] = 0xFF
+            sfk.view(-1)[_rowwise_sf_offsets(B, H_kv, S_kv, d_qk, list(range(S_kv)), pad_blocks).reshape(-1)] = 0xFF
 
     Ob = _nan_output((B, S_q, H_q, d_v), out_dt).transpose(1, 2)
     Qb, Kb, Vb, Ob = (_LAYOUTS[layout](x) for x in (Qb, Kb, Vb, Ob))
@@ -457,6 +466,15 @@ def test_mxfp8_sm120_head_dims(d_qk, d_v):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("kv_tile", [64, 128], ids=lambda n: f"kv{n}")
+@pytest.mark.parametrize("d_v", [256, 128], ids=lambda d: f"dv{d}")
+@torch_fork_set_rng(seed=18)
+def test_mxfp8_sm120_d256_qk_on_both_kv_tiles(d_v, kv_tile):
+    """A 256-column Q/K head on either KV tile."""
+    _check(_run(1, 4, 2, 256, 384, d_qk=256, d_v=d_v, tiles=(128, kv_tile), sdpa_kwargs=_MASKS["causal"]), d_qk=256)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("d_qk,d_v", [(80, 80), (112, 112), (112, 80), pytest.param(144, 208, marks=pytest.mark.L1)], ids=lambda d: str(d))
 @torch_fork_set_rng(seed=19)
 def test_mxfp8_sm120_head_dim_envelope(d_qk, d_v):
@@ -586,10 +604,11 @@ def test_mxfp8_sm120_block_scaled_output(sf_o_layout, scale_o, tiles):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 512])
 @torch_fork_set_rng(seed=79)
-def test_mxfp8_sm120_execute_reads_no_device_memory():
-    """Rule 3: execute performs no blocking device-to-host read."""
-    _check(_run(1, 2, 2, 128, 128, sync_debug=True))
+def test_mxfp8_sm120_execute_reads_no_device_memory(d):
+    """Rule 3: execute performs no blocking device-to-host read, on the general and d512 templates."""
+    _check(_run(1, 2, 2, 128, 128, d_qk=d, sync_debug=True), d_qk=d)
 
 
 @pytest.mark.L1
@@ -604,11 +623,166 @@ def test_mxfp8_sm120_e5m2_wide_heads():
     _check(_run(2, 4, 2, 384, 512, d_qk=256, d_v=256, in_key="e5m2", seq_lens_kv=[512, 300], sdpa_kwargs=_MASKS["causal_br"]), 256)
 
 
+# --- d512 flavor: both head dims in (256, 512] on 512 x 512 tiles, 64 x 64 CTA -------------------
+# Two warps split each 16-row Q slab's head dim, so every warp reads its own two scale planes of Q,
+# K and V; shapes keep S > 128 and B * H > 1 so a plane, tile or head misaddressed scale shows up.
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("mask", list(_MASKS))
+@pytest.mark.parametrize("in_key", ["e4m3", pytest.param("e5m2", marks=pytest.mark.L1)])
+@torch_fork_set_rng(seed=211)
+def test_mxfp8_sm120_d512_masks(mask, in_key):
+    _check(_run(2, 4, 2, 192, 320, d_qk=512, in_key=in_key, sdpa_kwargs=_MASKS[mask]), d_qk=512)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "d_qk,d_v",
+    [(272, 496), (512, 272), (496, 512), (384, 320), pytest.param(448, 448, marks=pytest.mark.L1), pytest.param(320, 320, marks=pytest.mark.L1)],
+    ids=lambda d: str(d),
+)
+@torch_fork_set_rng(seed=223)
+def test_mxfp8_sm120_d512_envelope(d_qk, d_v):
+    """Head dims inside (256, 512] ride the 512 x 512 tiles with TMA zero-fill. 3-plane scale tiles
+    (<= 384) have no fourth plane, and the NaN-encoded scale blocks of the zero-filled Q/K columns and
+    V-scale rows past d_v stay out of O, Stats and Amax_O."""
+    res = _run(2, 4, 2, 192, 320, d_qk=d_qk, d_v=d_v, sdpa_kwargs=_MASKS["causal"], poison_v_sf_pad_cols=d_v % 128 != 0, poison_qk_sf_pad_blocks=True)
+    _check(res, d_qk=d_qk)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "out_dt", [torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2, pytest.param(torch.float16, marks=pytest.mark.L1)], ids=["bf16", "e4m3", "e5m2", "fp16"]
+)
+@torch_fork_set_rng(seed=227)
+def test_mxfp8_sm120_d512_o_dtype(out_dt):
+    _check(_run(1, 4, 2, 65, 193, d_qk=512, out_dt=out_dt, sdpa_kwargs=_MASKS["causal"]), d_qk=512)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=228)
+def test_mxfp8_sm120_d512_no_stats():
+    """Without a Stats output the LSE store compiles out; O and Amax_O are unchanged."""
+    _check(_run(1, 8, 2, 65, 193, d_qk=512, out_dt=torch.float8_e4m3fn, with_stats=False, sdpa_kwargs=_MASKS["causal"]), d_qk=512)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("layout", ["padded_pitch", "bhsd"])
+@torch_fork_set_rng(seed=230)
+def test_mxfp8_sm120_d512_conversion_layout(layout):
+    """Q/K/V/O with a D + 1 head pitch, or head-major (BHSD) storage, through the staged copies around the
+    d512 flavor; an fp8 O exercises the strided copy-back of the quantized output."""
+    _check(_run(1, 4, 2, 65, 193, d_qk=512, out_dt=torch.float8_e4m3fn, layout=layout, sdpa_kwargs=_MASKS["causal"]), d_qk=512)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("mask", ["none", "causal"])
+@torch_fork_set_rng(seed=229)
+def test_mxfp8_sm120_d512_negative_scale(mask):
+    _check(_run(2, 4, 2, 130, 200, d_qk=512, scale=-0.7 / math.sqrt(512), sdpa_kwargs=_MASKS[mask]), d_qk=512)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=233)
+def test_mxfp8_sm120_d512_poisoned_pad_sink():
+    """Per-batch Q/KV lengths over NaN-poisoned pad data and scales, including a batch with no key and
+    one with no query, with attention sinks: the V tail guard picks its blocks at both 64-key halves of
+    the scale span."""
+    sinks = torch.randn(1, 8, 1, 1, device="cuda")
+    res = _run(3, 8, 2, 192, 256, d_qk=512, seq_lens_q=[192, 100, 0], seq_lens_kv=[256, 77, 129], sinks=sinks, poison_pad=True)
+    _check(res, d_qk=512)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=239)
+def test_mxfp8_sm120_d512_pack_gqa():
+    """MQA packed as 64 heads x 1 token per 64-row tile: each lane's Q scale row follows its (token, head)."""
+    _check(_run(1, 64, 1, 65, 193, d_qk=512, pack_gqa=True, sdpa_kwargs=_MASKS["causal"]), d_qk=512)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=241)
+def test_mxfp8_sm120_d512_persistent_units(monkeypatch):
+    """Dense d512 CTAs are persistent: with two CTAs each walks several units, re-arming the K/V barriers
+    and reloading the Q scale words and V scale tile per unit."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+
+    monkeypatch.setattr(SdpaFwdDslSm120, "_persistent_ctas", lambda self, device: 2)
+    _check(_run(2, 8, 2, 193, 193, d_qk=512, sdpa_kwargs=_MASKS["causal"]), d_qk=512)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("split_kv", [2, 3])
+@torch_fork_set_rng(seed=251)
+def test_mxfp8_sm120_d512_split_kv(split_kv):
+    _check(_run(1, 4, 1, 96, 1100, d_qk=512, out_dt=torch.bfloat16, split_kv=split_kv, sdpa_kwargs=_MASKS["causal"]), d_qk=512)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("h_q,sinks", [(64, False), (64, True), pytest.param(128, False, marks=pytest.mark.L1)], ids=["h64", "h64_sink", "h128"])
+@torch_fork_set_rng(seed=257)
+def test_mxfp8_sm120_d512_mqa_window128(h_q, sinks):
+    """MQA under a 128-token causal window, the shape the d512 flavor's tile and unit walk are tuned for."""
+    sink_t = torch.randn(1, h_q, 1, 1, device="cuda") if sinks else None
+    _check(_run(1, h_q, 1, 320, 320, d_qk=512, sinks=sink_t, sdpa_kwargs=dict(use_causal_mask=True, diagonal_band_left_bound=129)), d_qk=512)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "d_qk,d_v,mask,stats,sink,poison",
+    [
+        (512, 512, "causal", "token_major", False, False),
+        (512, 512, "swa", "head_major", True, True),
+        (384, 320, "causal", "head_major", False, True),
+        (272, 336, "causal_br", "token_major", True, False),
+    ],
+    ids=["512_causal", "512_swa_sink_poison", "384x320_head_major_poison", "272x336_sink"],
+)
+@torch_fork_set_rng(seed=263)
+def test_mxfp8_sm120_d512_thd(d_qk, d_v, mask, stats, sink, poison, monkeypatch):
+    """THD packs each sequence's scale tiles after every earlier one's, 3 or 4 planes per tile as the head
+    dim needs. Two persistent CTAs claim several units each, so the K/V barriers carry their phase from
+    one unit to the next and every unit reloads its scale coordinates."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+
+    monkeypatch.setattr(SdpaFwdDslSm120, "_persistent_ctas", lambda self, device: 2)
+    sinks = torch.randn(1, 4, 1, 1, device="cuda") if sink else None
+    res = _run_thd(*_THD_LENS, 4, 2, d_qk=d_qk, d_v=d_v, stats=stats, sinks=sinks, poison_pad=poison, sdpa_kwargs=_MASKS[mask])
+    _check(res, d_qk=d_qk)
+
+
+@pytest.mark.L0
+def test_mxfp8_sm120_d512_flavor_routing():
+    """Both head dims in (256, 512] run the d512 template; any wider or one-sided pair declines."""
+    from cudnn.frost.tile_dsl.constants import DTYPE_E4M3
+    from cudnn.sdpa.fwd import api_dsl
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+    from cudnn.sdpa.fwd.config_sm120 import FP8_D512_TILE, TemplateParams
+
+    def _api(d_qk, d_v):
+        q, k = (torch.zeros(1, 128, 4, d_qk, device="cuda").to(torch.float8_e4m3fn).transpose(1, 2) for _ in range(2))
+        v = torch.zeros(1, 128, 4, d_v, device="cuda").to(torch.float8_e4m3fn).transpose(1, 2)
+        o = torch.empty(1, 128, 4, d_v, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+        return SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o)
+
+    for d_qk, d_v in ((512, 512), (272, 496), (384, 320)):
+        api = _api(d_qk, d_v)
+        assert api.check_support() and api.flavor == (512, 512) and (api.q_tile, api.kv_tile) == FP8_D512_TILE, (d_qk, d_v)
+    for d_qk, d_v in ((256, 512), (512, 256), (528, 512)):
+        with pytest.raises(ValueError):
+            _api(d_qk, d_v).check_support()
+    mod = api_dsl._load_sm120_kernel_module((512, 512), TemplateParams(dtype_qkv=DTYPE_E4M3, q_tile=64, kv_tile=64), fp8=True)
+    assert mod.__file__.replace("\\", "/").endswith("sm120/prefill_d512_mxfp8.py")
+    with pytest.raises(ValueError, match="head dimensions must both be in"):
+        mod.compile(compute_capability=torch.cuda.get_device_capability(), b=1, qh=1, kh=1, sq=128, skv=128, d_qk=256, d_v=256, has_lse=False)
+
+
 # --- direct adapter --------------------------------------------------------------------------
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d", [64, 256])
+@pytest.mark.parametrize("d", [64, 256, 512])
 def test_mxfp8_sm120_stats_log2_direct(d):
     """Both Stats bases agree with analytic constant logits; O is unchanged between them."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
@@ -658,6 +832,26 @@ def test_mxfp8_sm120_direct_rejects_per_tensor_descales():
         api.execute(q_tensor=q, k_tensor=q, v_tensor=v, o_tensor=o, sf_q=sfq, sf_k=sfq, sf_v=sfv, descale_q=one, workspace=workspace)
 
 
+@pytest.mark.L0
+def test_mxfp8_sm120_direct_d256_admits_both_kv_tiles():
+    """(256, 256) heads accept an explicit tile_n of 64 or 128; an unset one picks a kernel-table tile."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+    from cudnn.sdpa.fwd.config_sm120 import tile_domain
+
+    def _api(d_qk, d_v, **kw):
+        q, k = (torch.zeros(1, 128, 4, d_qk, device="cuda").to(torch.float8_e4m3fn).transpose(1, 2) for _ in range(2))
+        v = torch.zeros(1, 128, 4, d_v, device="cuda").to(torch.float8_e4m3fn).transpose(1, 2)
+        o = torch.empty(1, 128, 4, d_v, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+        return SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o, **kw)
+
+    for d_qk, d_v in ((256, 256), (240, 240), (256, 240)):
+        for tile_n in (64, 128):
+            api = _api(d_qk, d_v, tile_n=tile_n)
+            assert api.check_support() and api.kv_tile == tile_n, (d_qk, d_v, tile_n)
+        api = _api(d_qk, d_v)
+        assert api.check_support() and (api.q_tile, api.kv_tile) in tile_domain(d_qk, d_v, fp8=True), (d_qk, d_v)
+
+
 # --- engine admission -------------------------------------------------------------------------
 
 
@@ -691,8 +885,15 @@ def _graph_offers(d_qk=128, d_v=128):
 @pytest.mark.L0
 @pytest.mark.parametrize(
     "kwargs,offered",
-    [(dict(d_qk=128, d_v=128), True), (dict(d_qk=512, d_v=512), False), (dict(d_qk=24, d_v=24), False)],
-    ids=["d128", "d512", "off_granule"],
+    [
+        (dict(d_qk=128, d_v=128), True),
+        (dict(d_qk=512, d_v=512), True),
+        (dict(d_qk=384, d_v=320), True),
+        (dict(d_qk=256, d_v=512), False),
+        (dict(d_qk=528, d_v=528), False),
+        (dict(d_qk=24, d_v=24), False),
+    ],
+    ids=["d128", "d512", "d384x320", "d256x512", "d528", "off_granule"],
 )
 def test_mxfp8_sm120_offers_only_inside_the_envelope(kwargs, offered):
     assert _graph_offers(**kwargs) == offered

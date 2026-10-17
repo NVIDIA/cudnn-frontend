@@ -300,7 +300,7 @@ def run_mamba2_fwd(
             raise ValueError("mamba2: state_indices requires a pool whose rows are dense [H, P, N] blocks on a 16-byte aligned slot stride")
         state_pool_rows = int(initial_state.shape[0])
     if initial_state is not None:
-        check_dtype("initial_state", initial_state, (torch.float32, torch.bfloat16))
+        check_dtype("initial_state", initial_state, (torch.float32, torch.bfloat16, torch.float16))
         if state_indices is None and initial_state.shape[0] != N:
             raise ValueError(f"initial_state must carry one state per sequence: got {initial_state.shape[0]} for {N} sequences")
     for tensor_name, tensor in (
@@ -756,7 +756,7 @@ def mamba2_bwd_op(
         check_dtype("state_checkpoints", state_checkpoints, x.dtype)
     dstate_dtype = initial_state.dtype if initial_state is not None else torch.float32
     if d_final_state is not None:
-        check_dtype("d_final_state", d_final_state, (torch.float32, torch.bfloat16))
+        check_dtype("d_final_state", d_final_state, (torch.float32, torch.bfloat16, torch.float16))
         if d_final_state.dtype != dstate_dtype:
             raise TypeError(f"mamba2: d_final_state must be {dstate_dtype} (one state dtype per kernel)")
     dt_max_value = float("inf") if dt_max is None else float(dt_max)
@@ -852,7 +852,7 @@ def mamba2_bwd_op(
     dD = torch.empty(0, dtype=torch.float32, device=device)
     if D is not None:
         variant_pack[t["d"]] = D
-        dD = torch.empty_like(D)
+        dD = torch.empty(D.shape, dtype=D.dtype, device=device)
         variant_pack[t["dD"]] = dD
     dz = torch.empty(0, dtype=x.dtype, device=device)
     if z is not None:

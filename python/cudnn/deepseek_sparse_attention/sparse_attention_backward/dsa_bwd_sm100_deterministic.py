@@ -13,33 +13,57 @@ from cutlass.cute.typing import Float32, Int32, Int64
 
 from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 
+_SUPPORTED_DKV_SHARDS = (32, 64, 128)
+
+
+def deterministic_dkv_shards(total_seqlen_q: int) -> int:
+    """Select 32, 64, or 128 shards from the declared query extent.
+
+    Thirty-two shards are the floor: smaller grids leave most SM100-family
+    multiprocessors idle while increasing the number of kernel boundaries.
+    The policy targets at most four waves through 512 queries and retains the
+    established 128-shard memory bound for larger batches.
+    """
+    if total_seqlen_q <= 0:
+        raise ValueError(f"deterministic DSA backward requires at least one query row, got {total_seqlen_q}")
+    required = (int(total_seqlen_q) + 3) // 4
+    for num_shards in _SUPPORTED_DKV_SHARDS:
+        if required <= num_shards:
+            return num_shards
+    return _SUPPORTED_DKV_SHARDS[-1]
+
 
 class FlashAttentionDSABackwardSm100Deterministic(FlashAttentionDSABackwardSm100):
     """Deterministic dKV/dSink reduction layered on the ordinary M64 kernel.
 
-    Each launch contains 128 query CTAs. CTA ``i`` is the only writer of dKV
-    shard ``i`` in that wave, and same-stream launch ordering serializes reuse
-    of the shard by later waves. No semaphore or cooperative launch is used.
+    Each launch contains ``num_dkv_shards`` query CTAs. CTA ``i`` is the only
+    writer of dKV shard ``i`` in that wave, and same-stream launch ordering
+    serializes reuse by later waves. No semaphore or cooperative launch is
+    used.
     """
 
     num_dkv_shards = 128
     q_wave_ctas = num_dkv_shards
     dkv_fold_group_size = 8
     num_dkv_fold_groups = num_dkv_shards // dkv_fold_group_size
+    num_dkv_final_terms = num_dkv_fold_groups
+    dkv_final_stride = dkv_fold_group_size
+    run_dkv_prefold = True
     serialize_head_blocks = True
 
-    @staticmethod
+    @classmethod
     def _get_workspace_size_dKV(
+        cls,
         k: int,
         d: int,
         b: int,
         acc_dtype: Type[cutlass.Numeric],
     ):
-        """Return byte-shaped storage for all 128 padded FP32 shards."""
+        """Return byte-shaped storage for this specialization's FP32 shards."""
         d = (d + 7) // 8 * 8
         k = (k + 7) // 8 * 8
         workspace_bytes = d * acc_dtype.width // 8
-        return (b, FlashAttentionDSABackwardSm100Deterministic.num_dkv_shards, k, workspace_bytes)
+        return (b, cls.num_dkv_shards, k, workspace_bytes)
 
     @cute.jit
     def make_dKV_accumulator(
@@ -48,7 +72,7 @@ class FlashAttentionDSABackwardSm100Deterministic(FlashAttentionDSABackwardSm100
         total_seqlen_KV: Int32,
         head_dim: Int32,
     ) -> cute.Tensor:
-        """View deterministic scratch as 128 contiguous FP32 shards."""
+        """View deterministic scratch as contiguous FP32 shards."""
         dkv_iter = cute.recast_ptr(workspace_dKV.iterator, dtype=self.acc_dtype)
         return cute.make_tensor(
             dkv_iter,
@@ -99,12 +123,13 @@ class FlashAttentionDSABackwardSm100Deterministic(FlashAttentionDSABackwardSm100
         seqlen: Int32,
         stream: cuda.CUstream,
     ):
-        """Launch the fixed first fold followed by ordered conversion."""
-        self.fold_dKV_shards(mdKV_acc, seqlen).launch(
-            grid=[seqlen, self.num_dkv_fold_groups, 1],
-            block=[256, 1, 1],
-            stream=stream,
-        )
+        """Launch the optional first fold followed by ordered conversion."""
+        if cutlass.const_expr(self.run_dkv_prefold):
+            self.fold_dKV_shards(mdKV_acc, seqlen).launch(
+                grid=[seqlen, self.num_dkv_fold_groups, 1],
+                block=[256, 1, 1],
+                stream=stream,
+            )
         convert_grid_x = (seqlen + self.block_seq - 1) // self.block_seq
         self.convert(mdKV_acc, mdKV, seqlen).launch(
             grid=[convert_grid_x, 1, 1],
@@ -119,7 +144,7 @@ class FlashAttentionDSABackwardSm100Deterministic(FlashAttentionDSABackwardSm100
         mdKV: cute.Tensor,
         seqlen: Int32,
     ):
-        """Fold the 16 group results in order and store the output dtype."""
+        """Fold the specialization's final terms and store the output dtype."""
         tidx, tidy, _ = cute.arch.thread_idx()
         seq_block_idx, _, batch_idx = cute.arch.block_idx()
         seq_id = self.block_seq * seq_block_idx + tidy
@@ -129,8 +154,8 @@ class FlashAttentionDSABackwardSm100Deterministic(FlashAttentionDSABackwardSm100
             for i in cutlass.range(num_128_tiles, unroll_full=True):
                 for j in cutlass.range(2, unroll_full=True):
                     acc = Float32(0.0)
-                    for group_idx in cutlass.range_constexpr(self.num_dkv_fold_groups):
-                        shard_idx = group_idx * self.dkv_fold_group_size
+                    for group_idx in cutlass.range_constexpr(self.num_dkv_final_terms):
+                        shard_idx = group_idx * self.dkv_final_stride
                         row = mdKV_acc[None, seq_id + shard_idx * seqlen, (0, batch_idx)]
                         tile = cute.flat_divide(cute.flat_divide(row, (64,)), (32,))
                         acc += tile[tidx, j, i]
@@ -139,8 +164,8 @@ class FlashAttentionDSABackwardSm100Deterministic(FlashAttentionDSABackwardSm100
             if cutlass.const_expr(not self.same_hdim_kv):
                 for j in cutlass.range(2, unroll_full=True):
                     acc = Float32(0.0)
-                    for group_idx in cutlass.range_constexpr(self.num_dkv_fold_groups):
-                        shard_idx = group_idx * self.dkv_fold_group_size
+                    for group_idx in cutlass.range_constexpr(self.num_dkv_final_terms):
+                        shard_idx = group_idx * self.dkv_final_stride
                         row = mdKV_acc[None, seq_id + shard_idx * seqlen, (0, batch_idx)]
                         tile = cute.flat_divide(cute.flat_divide(row, (64,)), (32,))
                         acc += tile[tidx, j, num_128_tiles]
@@ -181,3 +206,43 @@ class FlashAttentionDSABackwardSm100Deterministic(FlashAttentionDSABackwardSm100
         acc = cute.arch.warp_reduction_sum(acc, threads_in_group=self.dSink_num_threads)
         if tidx == 0:
             dSink[head_idx, (0, batch_idx)] = acc
+
+
+class FlashAttentionDSABackwardSm100Deterministic32(FlashAttentionDSABackwardSm100Deterministic):
+    """Thirty-two-shard specialization for short query batches."""
+
+    num_dkv_shards = 32
+    q_wave_ctas = num_dkv_shards
+    num_dkv_fold_groups = num_dkv_shards // FlashAttentionDSABackwardSm100Deterministic.dkv_fold_group_size
+    num_dkv_final_terms = num_dkv_shards
+    dkv_final_stride = 1
+    run_dkv_prefold = False
+
+
+class FlashAttentionDSABackwardSm100Deterministic64(FlashAttentionDSABackwardSm100Deterministic):
+    """Sixty-four-shard specialization for medium query batches."""
+
+    num_dkv_shards = 64
+    q_wave_ctas = num_dkv_shards
+    num_dkv_fold_groups = num_dkv_shards // FlashAttentionDSABackwardSm100Deterministic.dkv_fold_group_size
+    num_dkv_final_terms = num_dkv_fold_groups
+
+
+_DETERMINISTIC_KERNELS = {
+    32: FlashAttentionDSABackwardSm100Deterministic32,
+    64: FlashAttentionDSABackwardSm100Deterministic64,
+    128: FlashAttentionDSABackwardSm100Deterministic,
+}
+
+
+def deterministic_kernel_class(total_seqlen_q: int):
+    """Return the compile-time shard specialization for a query extent."""
+    return _DETERMINISTIC_KERNELS[deterministic_dkv_shards(total_seqlen_q)]
+
+
+def _deterministic_kernel_class_for_shards(num_shards: int):
+    """Return the deterministic specialization for an already selected shard count."""
+    try:
+        return _DETERMINISTIC_KERNELS[num_shards]
+    except KeyError as exc:
+        raise ValueError(f"unsupported deterministic dKV shard count {num_shards}") from exc

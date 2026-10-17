@@ -61,6 +61,7 @@ class Gdn2FrostEngine(BaseEngine):
         if facts.gate_channels != facts.d_qk:
             raise NotImplementedError(f"Gdn2FrostEngine: g must carry d_qk = {facts.d_qk} channels, got {facts.gate_channels}")
         checkpoint = facts.checkpoint_every_n_tokens
+        checkpoint_dtypes = (cudnn.data_type.FLOAT, facts.io_dtype)
         if checkpoint and checkpoint % 16 != 0:
             raise NotImplementedError(f"Gdn2FrostEngine: checkpoint_every_n_tokens must be a positive multiple of 16 (got {checkpoint})")
         if not facts.gates_at_ho:
@@ -82,10 +83,10 @@ class Gdn2FrostEngine(BaseEngine):
         for port, got in (("a_log", facts.a_log_dtype), ("dt_bias", facts.dt_bias_dtype)):
             if got not in gate_param_dtypes + (None,):
                 raise NotImplementedError(f"Gdn2FrostEngine: '{port}' must be fp32/bf16/fp16, got {got}")
-        state_dtypes = (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16)
+        state_dtypes = (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
         for port, got in (("initial_state", facts.state_dtype), ("final_state", facts.final_state_dtype)):
             if got not in state_dtypes + (None,):
-                raise NotImplementedError(f"Gdn2FrostEngine: '{port}' must be fp32/bf16, got {got}")
+                raise NotImplementedError(f"Gdn2FrostEngine: '{port}' must be fp32/bf16/fp16, got {got}")
         if facts.is_bwd:
             for port, got, want in (("d_a_log", facts.d_a_log_dtype, facts.a_log_dtype), ("d_dt_bias", facts.d_dt_bias_dtype, facts.dt_bias_dtype)):
                 if want is None and got is not None:
@@ -100,16 +101,17 @@ class Gdn2FrostEngine(BaseEngine):
                 raise NotImplementedError(f"Gdn2FrostEngine: 'd_initial_state' must mirror initial_state ({state_grad_want}), got an unset dtype")
             if facts.dg_dtype not in (facts.g_dtype, None):
                 raise NotImplementedError(f"Gdn2FrostEngine: 'dG' must match 'g' ({facts.g_dtype}), got {facts.dg_dtype}")
-            for port, got in (
-                ("dO", facts.do_dtype),
-                ("state_checkpoints", facts.state_checkpoints_dtype),
-                ("dBeta", facts.dbeta_dtype),
-                ("dW", facts.dw_dtype),
-            ):
+            for port, got in (("dO", facts.do_dtype), ("dBeta", facts.dbeta_dtype), ("dW", facts.dw_dtype)):
                 if facts.io_dtype is not None and got not in (facts.io_dtype, None):
                     raise NotImplementedError(f"Gdn2FrostEngine: '{port}' must match the io dtype, got {got}")
-        elif facts.io_dtype is not None and facts.state_checkpoints_out_dtype not in (facts.io_dtype, None):
-            raise NotImplementedError("Gdn2FrostEngine: 'state_checkpoints' must match the io dtype")
+            if facts.io_dtype is not None and facts.state_checkpoints_dtype not in checkpoint_dtypes + (None,):
+                raise NotImplementedError(
+                    f"Gdn2FrostEngine: 'state_checkpoints' must be {' or '.join(str(w) for w in checkpoint_dtypes)}, got {facts.state_checkpoints_dtype}"
+                )
+        elif facts.io_dtype is not None and facts.state_checkpoints_out_dtype not in checkpoint_dtypes + (None,):
+            raise NotImplementedError(
+                f"Gdn2FrostEngine: 'state_checkpoints' must be {' or '.join(str(w) for w in checkpoint_dtypes)}, got {facts.state_checkpoints_out_dtype}"
+            )
         if not facts.state_pair_match:
             raise NotImplementedError("Gdn2FrostEngine: initial_state and final_state dtypes must match")
 
@@ -520,7 +522,9 @@ class CompiledGdn2Bwd:
         q, g, v = node.inputs["q"], node.inputs["g"], node.inputs["v"]
         self.b_t = bwd_module.CFG.B_T
         self.checkpoint_cadence = int(node.params.get("checkpoint_every_n_tokens", 0) or 0)
-        self.coarse_checkpoints = self.has_state_checkpoints and self.checkpoint_cadence > self.b_t
+        self.coarse_checkpoints = self.has_state_checkpoints and (
+            self.checkpoint_cadence > self.b_t or node.inputs["state_checkpoints"].get_data_type().name == "FLOAT"
+        )
         self.needs_recompute = not self.has_state_checkpoints or self.coarse_checkpoints
         total = q.dim[0]
         HQ, HV = q.dim[1], v.dim[1]

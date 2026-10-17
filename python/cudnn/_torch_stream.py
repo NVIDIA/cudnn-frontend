@@ -99,9 +99,11 @@ def stream_context(stream, device=None, *, verify_current: bool = False) -> Iter
 
     handle = stream.cuda_stream if isinstance(stream, torch.cuda.Stream) else int(stream)
     _reject_per_thread_stream(handle)
-    if not verify_current and handle not in DEFAULT_STREAM_HANDLES:
+    if not verify_current:
         raw = _raw_current_stream(torch, device)
-        if raw is not None and handle == raw:
+        # A default-stream sentinel maps to torch's default stream (see as_torch_stream), so it
+        # is also a no-op while torch is on its default stream.
+        if raw is not None and (handle == raw or (handle in DEFAULT_STREAM_HANDLES and raw in DEFAULT_STREAM_HANDLES)):
             yield
             return
     with torch.cuda.stream(as_torch_stream(stream, device)):

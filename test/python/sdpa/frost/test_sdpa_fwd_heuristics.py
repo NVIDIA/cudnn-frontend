@@ -192,9 +192,14 @@ def test_recommend_split_leads_and_respects_structure():
     plans = [p for p in recommend("A", _facts(causal=False), _OFFERED) if p.engine_id == 20500]
     assert plans[0].knobs.split_kv > 1, "an underfilled grid runs the split the model chose"
     assert any(p.knobs.split_kv == 1 for p in plans), "no-split must stay reachable as the runner-up"
-    for bad in (dict(has_sink=True), dict(thd=True, padded=True), dict(padded=True), dict(s_q=8192)):
+    for bad in (dict(thd=True, padded=True), dict(padded=True), dict(s_q=8192)):
         got = [p for p in recommend("A", _facts(**bad), _OFFERED) if p.engine_id == 20500]
         assert all(p.knobs.split_kv == 1 for p in got), f"split emitted under {bad}"
+    # A sink no longer suppresses the split on the half flavors: the partials are
+    # sink-free and the combine folds the sink once (gpt-oss decode at b=1 ran
+    # unsplit before, 10x behind the split kernels).
+    with_sink = [p for p in recommend("A", _facts(has_sink=True), _OFFERED) if p.engine_id == 20500]
+    assert with_sink[0].knobs.split_kv > 1, "a sink graph splits like the sink-free one"
 
 
 @pytest.mark.L0
@@ -267,7 +272,7 @@ def test_sm120_d192_keeps_sm120_cga_domain(engine_name, dtype, is_fp8):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d_qk,d_v", [(64, 64), (128, 128), (192, 128), (256, 256), (80, 112)], ids=lambda d: str(d))
+@pytest.mark.parametrize("d_qk,d_v", [(64, 64), (128, 128), (192, 128), (256, 256), (80, 112), (384, 320), (512, 512)], ids=lambda d: str(d))
 def test_sm120_mxfp8_proposals_are_admissible_cga1_sets(d_qk, d_v):
     """The SM120 MXFP8 row rides the SM120 tile rule, and no rule measured on another row (the SM100
     MXFP8 d128 cga1 / cga2 choice) hands it a set outside its own domain."""
@@ -289,6 +294,71 @@ def test_sm120_mxfp8_proposals_are_admissible_cga1_sets(d_qk, d_v):
     for plan in plans:
         assert plan.knobs.cga == 1
         assert engines.mismatch(spec.capabilities, facts, plan.knobs) is None
+
+
+@pytest.mark.L0
+def test_sm120_mxfp8_d256_admits_both_kv_tiles():
+    """MXFP8 (256, 256) heads admit an explicit TILE_N of 64 or 128, and every proposal is a kernel-table
+    tile that fits SMEM."""
+    from cudnn.sdpa.fwd.config_sm120 import SMEM_CAPACITY_BYTES, smem_bytes, tile_domain
+
+    name = "sdpa_fwd_prefill_sm120_mxfp8"
+    spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == name)
+    for d_qk, d_v in ((256, 256), (240, 256)):
+        domain = tile_domain(d_qk, d_v, fp8=True)
+        assert {(128, 128), (128, 64), (64, 128), (64, 64)} <= domain, (d_qk, d_v)
+        for s_q, causal in ((2048, True), (16384, False)):
+            facts = _facts(
+                s_q=s_q,
+                s_kv=s_q,
+                h_q=32,
+                h_kv=2,
+                d_qk=d_qk,
+                d_v=d_v,
+                causal=causal,
+                dtype=cudnn.data_type.FP8_E4M3,
+                dtype_o=cudnn.data_type.BFLOAT16,
+                is_mxfp8=True,
+                device_cc=(12, 0),
+                device_sm_count=188,
+            )
+            plans = recommend("A", facts, {name: 20518})
+            assert plans, (d_qk, d_v, s_q)
+            for plan in plans:
+                assert engines.mismatch(spec.capabilities, facts, plan.knobs) is None
+                assert (plan.knobs.tile_m, plan.knobs.tile_n) in domain
+                assert smem_bytes(256, 256, plan.knobs.tile_m, plan.knobs.tile_n, itemsize=1, out_itemsize=2, mxfp8=True) <= SMEM_CAPACITY_BYTES
+            for tile_n in (64, 128):
+                assert engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(tile_m=128, tile_n=tile_n)) is None, (d_qk, d_v, tile_n)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(256, 256), (224, 224), (128, 128)], ids=lambda d: str(d))
+def test_sm120_mxfp8_packed_sets_ride_the_rule_kv_tile(d_qk, d_v):
+    """The packed GQA leg takes the tile rule's KV tile."""
+    from cudnn.sdpa.fwd.heuristics import _sm120_tiles
+
+    name = "sdpa_fwd_prefill_sm120_mxfp8"
+    spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == name)
+    facts = _facts(
+        s_q=32,
+        s_kv=8192,
+        h_q=32,
+        h_kv=4,
+        d_qk=d_qk,
+        d_v=d_v,
+        causal=True,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=cudnn.data_type.BFLOAT16,
+        is_mxfp8=True,
+        device_cc=(12, 0),
+        device_sm_count=188,
+    )
+    plans = recommend("A", facts, {name: 20518})
+    packed = [plan for plan in plans if plan.knobs.pack_gqa]
+    assert packed, "a 32-token GQA-8 graph is packing-eligible"
+    assert packed[0].knobs.tile_n == _sm120_tiles(spec.capabilities, facts)[1]
+    assert all(engines.mismatch(spec.capabilities, facts, plan.knobs) is None for plan in plans)
 
 
 @pytest.mark.L0
@@ -372,6 +442,41 @@ def test_sm120_fp8_d512_flavor_and_tile_contract():
 
 
 @pytest.mark.L0
+def test_sm120_mxfp8_d512_flavor_and_tile_contract():
+    """MXFP8 D512 runs the FP8 d512 CTA tile and adds the V scale tile plus the staged K scale words
+    to its SMEM budget; every plan the ranking proposes, windowed or not, is one the row admits."""
+    from cudnn.sdpa.fwd.config_sm120 import SMEM_CAPACITY_BYTES, pick_flavor, smem_bytes, tile_domain
+
+    assert pick_flavor(512, 512, fp8=True) == (512, 512)
+    assert tile_domain(512, 512, fp8=True) == frozenset({(64, 64)})
+    assert smem_bytes(512, 512, 64, 64, itemsize=1, out_itemsize=2, mxfp8=True) == 101144 <= SMEM_CAPACITY_BYTES
+    assert smem_bytes(272, 496, 64, 64, itemsize=1, out_itemsize=2, mxfp8=True) == 101144
+    name = "sdpa_fwd_prefill_sm120_mxfp8"
+    spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == name)
+
+    def facts(**over):
+        return _facts(
+            **{
+                **dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_mxfp8=True, device_cc=(12, 0), device_sm_count=188),
+                **over,
+            }
+        )
+
+    for d_qk, d_v in ((272, 272), (496, 512), (512, 496), (512, 512), (384, 320)):
+        f = facts(d_qk=d_qk, d_v=d_v)
+        plans = recommend("A", f, {name: 20518})
+        assert plans, (d_qk, d_v)
+        assert {(plan.knobs.tile_m, plan.knobs.tile_n) for plan in plans} == {(64, 64)}
+        assert all(engines.mismatch(spec.capabilities, f, plan.knobs) is None for plan in plans)
+    for d_qk, d_v in ((256, 512), (512, 256), (264, 512), (512, 528)):
+        assert engines.mismatch(spec.capabilities, facts(d_qk=d_qk, d_v=d_v)) is not None, (d_qk, d_v)
+    f = facts(s_q=16384, s_kv=16384, h_q=64, h_kv=1, d_qk=512, d_v=512, window_left=128)
+    windowed = recommend("A", f, {name: 20518})
+    assert windowed and {(plan.knobs.tile_m, plan.knobs.tile_n) for plan in windowed} == {(64, 64)}
+    assert all(engines.mismatch(spec.capabilities, f, plan.knobs) is None for plan in windowed)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("dim", [256, 512])
 def test_sm120_fp8_dense_layouts_and_split_output(dim):
     """FP8 layouts normalize to compact storage before main and split-combine kernels."""
@@ -434,10 +539,15 @@ def test_quantized_cga_follows_selected_native_flavor(mxfp8, d_qk, d_v, expected
     unsplit = [plan for plan in plans if (plan.knobs.split_kv or 1) == 1]
     assert unsplit and {plan.knobs.cga for plan in unsplit} == {expected_cga}, [plan.knobs for plan in plans]
     if (d_qk, d_v) == (128, 128):
-        # Both d128 quantized rows offer both widths (per-tensor: the split leg
-        # stays on the cga2 pair; MXFP8: cga1 only for the short-walk packed banded
-        # leg, the split leg keeps the pair), so the plan list may carry both.
+        # Both d128 quantized rows offer both widths (per-tensor: a dense graph runs
+        # cga1 split or unsplit, the paged / THD legs keep the row's cga2; MXFP8: cga1
+        # only for the short-walk packed banded leg, the split leg keeps the pair), so
+        # the plan list may carry both.
         assert {plan.knobs.cga for plan in plans} <= {1, 2}
+        if not mxfp8:
+            assert all(
+                plan.knobs.cga == 1 for plan in plans if (plan.knobs.split_kv or 1) > 1
+            ), "a dense fp8 d128 split runs at cga1 (one 256-row CTA per unit, half the MMA of the pair)"
     else:
         assert {plan.knobs.cga for plan in plans} == {expected_cga}
 
@@ -448,6 +558,41 @@ def test_quantized_cga_follows_selected_native_flavor(mxfp8, d_qk, d_v, expected
         assert engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=wrong_cga)) is None, "the quantized d128 rows build at both widths"
     else:
         assert "outside this engine's domain" in engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=wrong_cga))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("batch", [1, 8, 128], ids=lambda b: f"b{b}")
+def test_per_tensor_fp8_d128_paged_decode_runs_cga1_on_both_legs(batch):
+    """The paged per-tensor FP8 d128 leg (the serving fp8 KV-cache decode) names
+    cga1 on every plan it proposes, split or unsplit: the paged K/V walk is the
+    same TMA path at either width, and the cga2 pair doubles the MMA on a
+    decode shape.  An unnamed width (None) would hand the lowering its cga2
+    default and feed the split model a one-CTA tile that launches as two."""
+    from types import SimpleNamespace
+
+    pool = SimpleNamespace(get_dim=lambda: [1024, 8, 128, 128], get_stride=lambda: [8 * 128 * 128, 128 * 128, 128, 1])
+    name = engines.engine_name(fp8=True)
+    facts = _facts(
+        b=batch,
+        h_q=64,
+        h_kv=8,
+        s_q=1,
+        s_kv=131072,
+        causal=False,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=cudnn.data_type.BFLOAT16,
+        is_fp8=True,
+        has_paged_kv=True,
+        page_size=128,
+        padded=True,
+        k_t=pool,
+        v_t=pool,
+    )
+    plans = recommend("A", facts, {name: 20513})
+    assert plans, "paged per-tensor fp8 d128 decode must be served"
+    assert all(plan.knobs.cga == 1 for plan in plans), [plan.knobs for plan in plans]
+    if batch == 1:
+        assert any((plan.knobs.split_kv or 1) > 1 for plan in plans), "one batch over 128k keys splits"
 
 
 @pytest.mark.L0
@@ -1287,11 +1432,12 @@ def test_sm107_d128_cga_and_pack_admission(sm107_metadata_target):
         assert engines.mismatch(caps, _sm107_d128_facts(h_kv=h_kv), pack) is None, h_kv
     assert engines.mismatch(caps, _sm107_d128_facts(d_qk=64, d_v=64), pack) is None
     assert "divide" in engines.mismatch(caps, _sm107_d128_facts(h_q=96, h_kv=8), pack)
-    # dense d256 (64/8 at S_q 8 = 64 packed rows = two token units of the 32-column tile): the d256 decode tile packs the whole
-    # group, so the request is ADMITTED; past the route (S_q 16 = 128 rows) the dense d256 prefill kernel runs unpacked and the
-    # packed request is a typed decline naming the decode tile among the routes
+    # dense d256 (64/8 at S_q 8 = 64 packed rows = ONE unit of the 64-column tile; S_q 16 = 128 rows = two units of it): the d256
+    # decode tile packs the whole group, so the request is ADMITTED; past the route (S_q 17 = 136 rows, a third unit) the dense d256
+    # prefill kernel runs unpacked and the packed request is a typed decline naming the decode tile among the routes
     assert engines.mismatch(caps, _sm107_d128_facts(d_qk=256, d_v=256), pack) is None
-    past_route = engines.mismatch(caps, _sm107_d128_facts(d_qk=256, d_v=256, s_q=16), pack)
+    assert engines.mismatch(caps, _sm107_d128_facts(d_qk=256, d_v=256, s_q=16), pack) is None
+    past_route = engines.mismatch(caps, _sm107_d128_facts(d_qk=256, d_v=256, s_q=17), pack)
     assert past_route is not None and "decode tile" in past_route, past_route
     thd = _sm107_d128_facts(thd=True, padded=True)
     assert "outside this engine's domain" in engines.mismatch(caps, thd, engines.SdpaFwdKnobs(cga=1))
@@ -1343,6 +1489,13 @@ def test_sm107_shared_d128_scheduler_follows_the_measured_tables(sm107_metadata_
     facts = _sm107_d128_facts(**over)
     plans = _sm107_f16_plans(facts)
     first = plans[0].knobs
+    if over.get("d_qk") == 64:
+        # The d64 envelope no longer rides the shared d128 bodies knob-less: the row's native 64-wide tile (the dense leg, cga1,
+        # unpacked) is the first proposal; the shared decode tile stays reachable through the PackGQA / split knobs.
+        caps = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16).capabilities
+        assert first.pack_gqa is False and first.cga == 1, first
+        assert engines.mismatch(caps, facts, first) is None, first
+        return
     assert first.pack_gqa is True, first
     assert first.sched_policy == first_sched, [p.knobs for p in plans]
     other = SCHED_LPT if first_sched == 0 else 0
@@ -1381,12 +1534,13 @@ def _decode_d256_facts(**over):
 def test_decode_tile_split_points_lead_with_the_eager_safe_choice():
     """A d256 graph the decode tile serves gets the decode split model
     (choose_decode_tile_split_kv), not the prefill fit: the LEADING set is the
-    choice that also pays for the split path's second host launch, the captured
-    caller's optimum follows as a runner-up (select_plan / autotune reach it),
-    and no-split closes the list. The same graph one token wider (S_q=2: 32
-    packed rows, the compiled-but-unrouted 32-column tile) or longer (S_q=3: 48
-    rows) is the prefill tile's launch and keeps the prefill model, which does
-    not split either shape at b=32."""
+    choice that also pays for the split path's second launch (device-side only
+    since the native binder issues both from C++), the captured caller's
+    optimum follows as a runner-up where it differs, and no-split closes the
+    list. The same graph one token wider (S_q=2: 32 packed rows, the
+    compiled-but-unrouted 32-column tile) or longer (S_q=3: 48 rows) is the
+    prefill tile's launch and keeps the prefill model, which does not split
+    either shape at b=32."""
 
     def sets(**over):
         return [p.knobs for p in recommend("A", _decode_d256_facts(**over), _OFFERED) if p.engine_id == 20500]
@@ -1437,19 +1591,23 @@ def test_decode_tile_model_counts_the_whole_packed_group():
     row-group (partial PackGQA), the decode tile packs all 12 (HEADS_PER_TILE =
     QH_PER_KH, no partial form), so its routing test and its split model count
     S_q x 12 like the adapter does: S_q = 1 is a 12-row decode launch of b x 8
-    units, S_q = 2 (24 rows) is the prefill tile's graph.  Fed the partial group
-    the model would call S_q = 2 an 8-row decode launch and cost it with the
-    decode model while the adapter lowers it onto the prefill tile."""
+    units, S_q = 2 (24 rows) is the prefill tile's graph unless the launch is big
+    enough for the 32-column tile (config_sm100.d256_wide_decode_launch).  Fed the
+    partial group the model would call S_q = 2 an 8-row decode launch and cost it
+    with the decode model while the adapter lowers it onto the prefill tile."""
     from cudnn.sdpa.fwd.heuristics import _d256_decode_tile_selected, _decode_tile_pack_g, _pack_gqa_group
 
     row = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _F16)
-    one, two = _decode_d256_facts(h_q=96, h_kv=8, s_q=1), _decode_d256_facts(h_q=96, h_kv=8, s_q=2)
+    one, two = _decode_d256_facts(h_q=96, h_kv=8, s_q=1), _decode_d256_facts(h_q=96, h_kv=8, s_q=2, b=2)
     partial = _pack_gqa_group(row, one, 128, True)
     assert partial == 4, partial
     assert _decode_tile_pack_g(one, partial) == 12 and _decode_tile_pack_g(one, 1) == 1
     assert _d256_decode_tile_selected(row, one, _decode_tile_pack_g(one, partial))
     assert _d256_decode_tile_selected(row, two, partial), "the control: the partial group would admit the 24-row graph"
     assert not _d256_decode_tile_selected(row, two, _decode_tile_pack_g(two, partial))
+    # The same S_q = 2 step in a launch big enough to be HBM-bound rides the 32-column tile.
+    wide = _decode_d256_facts(h_q=96, h_kv=8, s_q=2, b=32, s_kv=8192)
+    assert _d256_decode_tile_selected(row, wide, _decode_tile_pack_g(wide, partial))
 
 
 @pytest.mark.L0
@@ -1491,7 +1649,12 @@ def test_rubin_decode_tile_packs_the_whole_group_and_takes_the_decode_split_mode
     small = sets(b=8)
     assert small[0].pack_gqa is True and small[0].split_kv == 8 and any(k.split_kv == 1 for k in small[1:]), small
     assert sets(b=3)[0].split_kv == 16
-    assert all(k.split_kv == 1 for k in sets(b=128))
+    # b = 128: 256 units on 204 SMs are a wave and a quarter -- the eager lead stays unsplit (the second launch costs more
+    # than the tail wave it would halve), the replaying caller's runner-up splits once (the wave term: measured on the
+    # Rubin performance class at B 128 x kv 4K on the 64-column tile, split 2 ran the tile 11 % faster than unsplit).
+    saturated = sets(b=128)
+    assert saturated[0].split_kv == 1 and [k.split_kv for k in saturated if k.split_kv > 1] == [2], saturated
+    assert sets(b=128, cuda_graph_replay=True)[0].split_kv == 2
     # The 24/2 geometry: the whole group, dense or paged.
     q24 = facts(h_q=24, b=3, s_kv=1000)
     assert _pack_gqa_eligible(row, q24, 128) and _pack_gqa_group(row, q24, 128, True) == 12
@@ -1512,20 +1675,36 @@ def test_rubin_decode_tile_packs_the_whole_group_and_takes_the_decode_split_mode
     assert engines.mismatch(row, facts(s_q=2), engines.SdpaFwdKnobs(pack_gqa=True)) is None
     assert engines.mismatch(row, facts(s_q=2, has_paged_kv=False, page_size=0), engines.SdpaFwdKnobs(pack_gqa=True)) is None
     from cudnn.sdpa.fwd.config_sm100 import decode_d256_q_units
-    from cudnn.sdpa.fwd.heuristics import _split_points, choose_decode_tile_split_kv
+    from cudnn.sdpa.fwd.heuristics import _DECODE_TILE_SPLIT_LAUNCH_COST_CC107, _split_points, choose_decode_tile_split_kv
     from cudnn.sdpa.fwd.config_sm107 import decode_d256_q_tile as rubin_q_tile
 
-    mtp4 = facts(h_q=24, s_q=4, causal=True, bottom_right=True)  # 24/2 at S_q = 4: two units of two tokens x 12 heads
-    assert rubin_q_tile(4, 12) == 32 and decode_d256_q_units(4, 12, 32) == 2
+    mtp4 = facts(h_q=24, s_q=4, causal=True, bottom_right=True)  # 24/2 at S_q = 4 over pages, bottom-right: ONE unit of the 64-column tile
+    assert rubin_q_tile(4, 12, paged=True, masked=True) == 64 and decode_d256_q_units(4, 12, 64) == 1
+    assert rubin_q_tile(4, 12, paged=True, masked=False) == 32 and decode_d256_q_units(4, 12, 32) == 2  # mask-free over pages: two 32-column units
+    assert engines._facts_decode_form(mtp4) == (True, True)
     assert _pack_gqa_eligible(row, mtp4, 128) and _pack_gqa_group(row, mtp4, 128, True) == 12
-    want = choose_decode_tile_split_kv(units=32 * 2 * 2, kv_tiles=4096 // 128, sm_count=204, q_tile=32)
+    # the model's inputs as _split_points passes them: the arch line (the row's: cc 10.7, with its own eager charge), the combine
+    # grid (B 32 x 24 heads x S_q 4 = 768 lean blocks) and the row's per-partial price
+    want = choose_decode_tile_split_kv(
+        units=32 * 2 * 1,
+        kv_tiles=4096 // 128,
+        sm_count=204,
+        q_tile=64,
+        launch_cost=_DECODE_TILE_SPLIT_LAUNCH_COST_CC107,
+        device_cc=(10, 7),
+        combine_grid=(32, 24, 4),
+    )
     assert _split_points(row, mtp4, 128, 128, 2, pack_g=12)[0] == want, (_split_points(row, mtp4, 128, 128, 2, pack_g=12), want)
     assert sets(h_q=24, s_q=4, causal=True, bottom_right=True)[0].pack_gqa is True
-    # Past the route (a third token unit): no packed set, the packed request a typed decline.
-    mtp5 = facts(h_q=24, s_q=5, causal=True, bottom_right=True)
-    assert rubin_q_tile(5, 12) == 0 and not _pack_gqa_eligible(row, mtp5, 128)
-    assert all(k.pack_gqa is not True for k in sets(h_q=24, s_q=5, causal=True, bottom_right=True))
-    why = engines.mismatch(row, mtp5, engines.SdpaFwdKnobs(pack_gqa=True))
+    mtp8 = facts(h_q=24, s_q=8, causal=True, bottom_right=True)  # 96 rows: two units of the 64-column tile, the model's streams
+    assert rubin_q_tile(8, 12, paged=True, masked=True) == 64 and decode_d256_q_units(8, 12, 64) == 2 and _pack_gqa_eligible(row, mtp8, 128)
+    want8 = choose_decode_tile_split_kv(units=32 * 2 * 2, kv_tiles=4096 // 128, sm_count=204, q_tile=64, device_cc=(10, 7), combine_grid=(32, 24, 8))
+    assert _split_points(row, mtp8, 128, 128, 2, pack_g=12)[0] == want8, (_split_points(row, mtp8, 128, 128, 2, pack_g=12), want8)
+    # Past the route (a third token unit of the 64-column tile): no packed set, the packed request a typed decline.
+    mtp11 = facts(h_q=24, s_q=11, causal=True, bottom_right=True)
+    assert rubin_q_tile(11, 12, paged=True, masked=True) == 0 and not _pack_gqa_eligible(row, mtp11, 128)
+    assert all(k.pack_gqa is not True for k in sets(h_q=24, s_q=11, causal=True, bottom_right=True))
+    why = engines.mismatch(row, mtp11, engines.SdpaFwdKnobs(pack_gqa=True))
     assert why and "decode tile" in why, why
     # MHA, the sink, and a prefill-shaped dense graph: unpacked / unsplit as the shared rules say.
     assert all(k.pack_gqa is not True for k in sets(h_q=4, h_kv=4, b=3, s_kv=1000))
@@ -1542,6 +1721,50 @@ def test_rubin_decode_tile_packs_the_whole_group_and_takes_the_decode_split_mode
     assert engines.mismatch(row, facts(thd=True), engines.SdpaFwdKnobs(pack_gqa=True, cga=2, split_kv=1)) is None
     why = engines.mismatch(row, facts(thd=True), engines.SdpaFwdKnobs(pack_gqa=True, split_kv=2))
     assert why and "decode tile" in why and "paged half THD" in why, why
+
+
+@pytest.mark.L0
+def test_rubin_decode_width_is_64_exactly_when_two_32_column_units_would_be_needed():
+    """The Rubin route's width pick, stated as the MEASURED rule rather than as a table lookup: a packed step rides
+    the 64-column tile exactly when it would otherwise need two or more token units of the 32-column tile, one
+    32-column unit when its rows fit one, the 16-column tile below that -- always ONE token unit inside the table.
+    Measured on the Rubin performance class (212 SMs) at the 24/2 and 32/2 geometries: at S_q 2 (one 32-column
+    unit) the 32-column tile is the faster kernel, at S_q 3 (two units) the 64-column one, because one 64-column
+    unit streams a KV tile in about three quarters of the time of two 32-column units.  The table-driven rule
+    (config_sm107.decode_d256_single_unit_q_tile: the narrowest width holding S_q x G rows) is the same statement,
+    since ``S_q x G > 32`` is exactly ``ceil(S_q / (32 // G)) >= 2``; the cap at 32 (``max_q_tile=32``, the route
+    before the 64-column width landed) is the negative control: two 32-column units at S_q 3 / 4."""
+    from cudnn.sdpa.fwd.config_sm100 import decode_d256_q_units
+    from cudnn.sdpa.fwd.config_sm107 import D256_DECODE_SINGLE_UNIT_Q_TILES, decode_d256_q_tile, decode_d256_single_unit_q_tile
+
+    assert D256_DECODE_SINGLE_UNIT_Q_TILES == (16, 32, 64)
+    for g in (2, 3, 4, 5, 6, 8, 12, 16, 24, 32):
+        for s_q in range(1, 65):
+            if s_q * g > 64:
+                break  # past the one-unit table: the token-unit arm, pinned by the Rubin decode-tile test above
+            got = decode_d256_q_tile(s_q, g, paged=True, masked=True)
+            assert got == decode_d256_single_unit_q_tile(s_q, g, paged=True, masked=True), (g, s_q, got)
+            assert decode_d256_q_units(s_q, g, got) == 1, (g, s_q, got)
+            if s_q * g <= 16:
+                assert got == 16, (g, s_q, got)
+            else:
+                units_of_32 = decode_d256_q_units(s_q, g, 32)
+                assert got == (64 if units_of_32 >= 2 else 32), (g, s_q, got, units_of_32)
+    # the measured cells by name: 24/2 (G 12) and 32/2 (G 16), S_q 1 .. 4
+    assert [decode_d256_q_tile(s, 12, paged=True, masked=True) for s in (1, 2, 3, 4)] == [16, 32, 64, 64]
+    assert [decode_d256_q_tile(s, 16, paged=True, masked=True) for s in (1, 2, 3, 4)] == [16, 32, 64, 64]
+    assert decode_d256_q_units(2, 12, 32) == decode_d256_q_units(2, 16, 32) == 1
+    assert decode_d256_q_units(3, 12, 32) == decode_d256_q_units(3, 16, 32) == decode_d256_q_units(4, 12, 32) == decode_d256_q_units(4, 16, 32) == 2
+    # the negative control: capped at 32 the same steps run two 32-column units (the former route, value for value)
+    for g in (12, 16):
+        for s_q in (3, 4):
+            assert decode_d256_q_tile(s_q, g, paged=True, masked=True, max_q_tile=32) == 32, (g, s_q)
+    assert decode_d256_q_tile(2, 12, paged=True, masked=True, max_q_tile=32) == 32 and decode_d256_q_units(2, 12, 32) == 1
+    # the facts-level twin the heuristics read agrees on the Rubin row and is 0 past 16 rows on the Blackwell row
+    caps107 = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16)
+    caps100 = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _F16)
+    assert [engines.decode_d256_q_tile_for_row(caps107, s, 12, paged=True, masked=True) for s in (1, 2, 3, 4)] == [16, 32, 64, 64]
+    assert [engines.decode_d256_q_tile_for_row(caps100, s, 12, paged=True, masked=True) for s in (1, 2, 3, 4)] == [16, 0, 0, 0]
 
 
 @pytest.mark.L0

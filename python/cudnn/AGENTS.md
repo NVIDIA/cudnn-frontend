@@ -105,6 +105,12 @@ unsupported input runnable.
   must address natively (layout-driven offset math, strides encoded in TMA
   descriptors) — acceptance is a promise about the execute path, not about
   what the adapter can patch up.
+- Architecture admission needs a native compile-and-execute detector, not
+  only a mocked capability check. Shared compiler architecture maps may also
+  gate unrelated kernels; qualify a new operation through a scoped compile
+  target instead of widening that shared support gate. The detector is
+  `test_DSA_indexer_top_k_sm120_native_boundary`, including changed-input replay
+  at the documented shared-memory limits.
 
 **Rule 3 — `execute()` never reads device memory to the host.**
 
@@ -665,7 +671,9 @@ python/cudnn/gemm/
 ├── frost/                           # the FROST GEMM engine (JIT fused matmul chains from cuDNN graphs)
 │   ├── sm100/, sm120/               #   one tree per arch family: compiler.py + epilogue_codegen.py + kernel_templates/
 │   ├── compiler.py, epilogue_codegen.py  # facades: become the active family's module (arch_family.py)
-│   └── kernel_templates/            #   template code SHARED by both trees (split-K reduction)
+│   ├── kernel_templates/            #   template code SHARED by both trees (split-K reduction)
+│   └── ln_prologue/                 #   the LayerNorm-prologue gated dual GEMM substrate: host (__init__.py) + ONE RENDERED body per arch (two arms: pairing=columns = TriMul K1, pairing=accumulators = TriMul K3)
+│                                    #   (sm107_dual_gemm.py; a rendering for one arch is not a registry template, so not under kernel_templates/)
 ├── ops/                             # backend-independent torch custom-op contracts
 └── reference/                       # pure-PyTorch MATMUL/POINTWISE correctness engine
 ```
@@ -717,8 +725,7 @@ GATHER up to 1.45x slower; each TMA-warp lane now issues its own GATHER4s), and
 accept only warp grids the split fits (`Sm120KernelTemplate.warp_layout_reject`).
 **Detector:** a compile-only SASS pin — one `USETMAXREG.DEALLOC` and one
 `TRY_ALLOC` at the template's counts, plus a spill bound on producer-heavy cases
-(`gemm/frost/sm120/test_sm120_register_split.py`; the SDPA pins in
-`sdpa/frost/test_sdpa_bwd_d256_sm100.py` do the same).
+(the SDPA pins in `sdpa/frost/test_sdpa_bwd_d256_sm100.py` are the pattern).
 
 **Immutable tensor-map reuse is local to a consumer and a launch.** A persistent
 loader or store warp may skip acquisition only while it keeps using an unchanged

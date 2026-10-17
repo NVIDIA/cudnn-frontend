@@ -423,8 +423,7 @@ def test_combine_shape_binding_and_support():
     assert binding.top_k_scores is scores and scores in binding.bound_tensors()
     assert y.get_dim() == [1, 129, 96]
     C._check_executable(chain)
-    with pytest.raises(NotImplementedError, match="COMBINE"):
-        C120._check_executable(chain)
+    C120._check_executable(chain)
     # The frontend can represent the enum; native operation construction declines.
     cpp = _build_combine_graph()[0]._lower_to_cpp()
     cpp.validate()

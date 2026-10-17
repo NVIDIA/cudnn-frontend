@@ -615,13 +615,23 @@ def test_sparse_validator_box_fits_the_slot_is_implied_and_live(monkeypatch):
 
 def test_index_list_fields_are_appended_with_inert_defaults():
     names = [f.name for f in dataclasses.fields(TemplateParams)]
-    assert names[-5:] == [
-        "qsa_block_topk",
-        "qsa_block_size",
-        "qsa_include_open_block",
-        "qsa_list_per_sequence",
-        "qsa_softmax_groups",
-    ], "append-only: the four index-list fields + the softmax-split knob are the LAST five"
+    index_list = ["qsa_block_topk", "qsa_block_size", "qsa_include_open_block", "qsa_list_per_sequence", "qsa_softmax_groups"]
+    start = names.index("qsa_block_topk")
+    assert names[start : start + 5] == index_list, "append-only: the four index-list fields + the softmax-split knob stay contiguous, in landing order"
+    # ... and the only fields after them are the small-tile / resident-bias fields that landed next, in their order.
+    assert names[start + 5 :] == [
+        "bias_mode",
+        "kv_mask_form",
+        "tile_n",
+        "n_chunk",
+        "bias_stages",
+        "padded_tail_form",
+        "dead_subtile_quiet",
+        "bias_max_form",
+        "softmax_wgs",
+        "s_slots",
+        "q_in_tmem",
+    ], names[start:]
     assert TemplateParams() == TemplateParams(
         qsa_block_topk=0, qsa_block_size=0, qsa_include_open_block=True, qsa_list_per_sequence=False, qsa_softmax_groups=0
     )

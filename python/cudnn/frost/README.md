@@ -340,6 +340,7 @@ python/cudnn/
         sm120/prefill_fp8.py          general SM120 FP8 template (d <= 256)
         sm120/prefill_mxfp8.py        block-scaled MXFP8 template (d <= 256)
         sm120/prefill_d512_fp8.py     d512 flavor for FP8
+        sm120/prefill_d512_mxfp8.py   d512 flavor for MXFP8
         sm120/_common.py              SM120-only warp-level primitives
         _common_blackwell.py      SHARED by sm100/ + sm107/ (cc 100-119), so it
                                   sits ABOVE both rather than inside either

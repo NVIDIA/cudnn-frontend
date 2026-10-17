@@ -25,7 +25,7 @@ import pytest
 
 from frost_test_utils import requires_dsl
 
-from cudnn.sdpa.fwd.api_dsl import _EXP2_FMA_SPLIT_CC, _EXP2_FMA_SPLIT_KERNELS, _exp2_fma_split_for, _quant_kind
+from cudnn.sdpa.fwd.api_dsl import _EXP2_FMA_SPLIT_CC, _EXP2_FMA_SPLIT_DECODE_KERNELS, _EXP2_FMA_SPLIT_KERNELS, _exp2_fma_split_for, _quant_kind
 from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
 pytestmark = [pytest.mark.L0]
@@ -86,6 +86,20 @@ def test_exp2_fma_split_is_claimed_only_by_the_kernels_that_measured_a_win():
         assert _exp2_fma_split_for((10, 0), kind=kind, flavor=flavor) is False, (kind, flavor)
     # A flavor is passed as whatever sequence the adapter holds; the lookup normalises it.
     assert _exp2_fma_split_for((10, 0), kind="fp8", flavor=[128, 128]) is True
+
+
+def test_exp2_fma_split_of_the_d64_decode_tile_has_its_own_set():
+    """The d64 decode tile (``decode_tile``: sm100/decode_d128_f16.py at d_flavor 64) shares the f16 (64, 64) key with the d64 prefill tile but is
+    another kernel: it claims the split through ``_EXP2_FMA_SPLIT_DECODE_KERNELS`` on the measured cc only, and the prefill spelling of the same
+    flavor stays off (never measured), as does every other flavor and kind on the decode spelling."""
+    assert _EXP2_FMA_SPLIT_DECODE_KERNELS == frozenset({("f16", (64, 64))}), "widening the decode set is a per-kernel A/B, never a default"
+    for cc in _CCS:
+        for kind in _KINDS:
+            for flavor in _FLAVORS + [(64, 64)]:
+                want = cc == (10, 0) and (kind, flavor) in _EXP2_FMA_SPLIT_DECODE_KERNELS
+                assert _exp2_fma_split_for(cc, kind=kind, flavor=flavor, decode_tile=True) is want, (cc, kind, flavor)
+    assert _exp2_fma_split_for((10, 0), kind="f16", flavor=(64, 64)) is False
+    assert _exp2_fma_split_for((10, 0), kind="f16", flavor=[64, 64], decode_tile=True) is True
 
 
 def test_template_params_default_is_the_all_mufu_kernel():

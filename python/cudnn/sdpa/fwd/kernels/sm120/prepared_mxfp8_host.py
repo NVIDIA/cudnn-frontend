@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""Pointer host for the SM120 block-scaled MXFP8 template (``sm120/prefill_mxfp8.py``).
+"""Pointer host for the SM120 block-scaled MXFP8 templates (``sm120/prefill_mxfp8.py``,
+``sm120/prefill_d512_mxfp8.py``).
 
 The scale slots (``sf_q_ptr`` / ``sf_k_ptr`` / ``sf_v_ptr``, ``sf_tiles``,
 ``amax_o_ptr``, and for a block-scaled O ``sf_o_ptr`` / ``scale_o_ptr``) use the
