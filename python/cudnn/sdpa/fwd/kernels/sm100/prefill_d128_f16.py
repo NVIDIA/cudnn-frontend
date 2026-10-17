@@ -307,7 +307,21 @@ THD_PERSISTENT = True
 # count must be in CGA-tile (cluster) units (q_tiles = n_q_supers // CTA_MMA),
 # not per-CTA super-row units; the legacy default over-counts by CTA_MMA and
 # scrambles LPT tile assignment (cf. ctm_lpt_decode_qtiles_bug; dsv4/qwen sm100).
-_sdpa_h = make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units=True)
+# Qualify this integer-only lookup independently of the attention arithmetic.
+# Keep other geometries on their existing decoder until they are measured.
+_BOUNDED_THD_DECODE = (
+    CFG.THD_VARLEN == 1
+    and CFG.DTYPE_QKV == 2
+    and PARAMS.d_flavor == 128
+    and CFG.TILE_M == 128
+    and CFG.TILE_N == 128
+    and CFG.CGA_M == 2
+    and CFG.CGA_N == 1
+    and CFG.SPLIT_KV == 1
+    and (CFG.MASK_FLAGS & (MASK_CAUSAL | MASK_SWA)) == MASK_CAUSAL
+    and CFG.BOTTOM_RIGHT == 0
+)
+_sdpa_h = make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units=True, bounded_thd_decode=_BOUNDED_THD_DECODE)
 _decode_initial = _sdpa_h.decode_initial
 _decode_payload = _sdpa_h.decode_payload
 # qtrim variant: collapses the KV loop for CGA tiles entirely past the
