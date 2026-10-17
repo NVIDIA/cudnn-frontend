@@ -77,6 +77,7 @@ def _compressor_bwd_adapter(stream, kv, score, ape, cu, cu_comp, grad_out, grad_
         coff,
         _BWD_ROWS,
         _BWD_THREADS,
+        False,  # deterministic: JAX path zero-inits grad_ape and uses the atomic dAPE reduction
     ).launch(
         grid=((nb_total + _BWD_ROWS - 1) // _BWD_ROWS, (head_dim + _BWD_THREADS - 1) // _BWD_THREADS, 1),
         block=(_BWD_THREADS, 1, 1),
@@ -152,6 +153,7 @@ def _compressor_bwd_r128_adapter(
         threads_x,
         fastexp,
         goreuse,
+        False,  # deterministic: JAX path zero-inits grad_ape and uses the atomic dAPE reduction
     ).launch(
         grid=((nb_total + rows_per_cta - 1) // rows_per_cta, (ncol + threads_x - 1) // threads_x, 1),
         block=(threads_x, tchunks, 1),
