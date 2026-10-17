@@ -401,6 +401,13 @@ def _epilogue_loop(
         if lo >= hi:
             _wait_tcgen(bars.dq_done, dq_state.phase)
             dq_state = advance(dq_state, 1)
+        # Observe every terminal source-credit phase before the next CLC
+        # owner bootstraps these barriers again. Native dV/dK alone wait on
+        # slices 1/3, leaving slices 0/2 unobserved after the final dQ or a
+        # zero-trip owner. Each completed mbarrier phase needs a successful
+        # wait before an arrival in its next phase.
+        for i in cutlass.range_constexpr(4):
+            _wait(bars.dq_empty[i], empty_state.phase)
         _native_epilogue(slab, tmem_base, bars, row, lo < hi, empty_state.phase, dtype, False)
         _native_epilogue(slab, tmem_base, bars, row, lo < hi, empty_state.phase, dtype, True)
         empty_state = advance(empty_state, 1)
