@@ -471,14 +471,17 @@ cuda_graph_node_get_dependencies_v2(cudaGraphNode_t node,
 // 3-parameter shim for cudaGraphNodeGetDependencies.
 inline cudaError_t
 cuda_graph_node_get_dependencies(cudaGraphNode_t node, cudaGraphNode_t *pDependencies, size_t *pNumDependencies) {
-#if (CUDART_VERSION >= 13000)
 #if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
-    if (get_cuda_runtime_version() < 13000) {
-        // A CUDA 12 runtime's base symbol IS the three-parameter function.
-        NV_FE_CALL_TO_CUDA(
-            cuda_graph_node_get_dependencies, cudaGraphNodeGetDependencies, node, pDependencies, pNumDependencies);
+    // CUDA 13 added an edge-data parameter to the unversioned symbol. Dispatch on the loaded runtime, not on
+    // CUDART_VERSION of the headers this file was compiled with.
+    void *fptr = get_cuda_symbol(CudaLibrary::CUDART, "cudaGraphNodeGetDependencies");
+    if (loaded_cudart_version() >= 13000) {
+        using Fn = cudaError_t (*)(cudaGraphNode_t, cudaGraphNode_t *, void *, size_t *);
+        return reinterpret_cast<Fn>(fptr)(node, pDependencies, /*edgeData=*/nullptr, pNumDependencies);
     }
-#endif
+    using Fn = cudaError_t (*)(cudaGraphNode_t, cudaGraphNode_t *, size_t *);
+    return reinterpret_cast<Fn>(fptr)(node, pDependencies, pNumDependencies);
+#elif (CUDART_VERSION >= 13000)
     // The 3-parameter version of cudaGraphNodeGetDependencies was removed in CUDA 13.0,
     // so call the other shim.
     return cuda_graph_node_get_dependencies_v2(node, pDependencies, /*edgeData=*/nullptr, pNumDependencies);

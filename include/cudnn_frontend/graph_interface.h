@@ -802,11 +802,6 @@ class Graph : public ICudnn, public INode {
                 detail::cuda_graph_node_get_dependent_nodes(current_node, &current_node, &num_dependent_nodes));
         }
 
-        // Make sure device pointer is provided for all uids expected for this plan
-        // Legacy Slice aliasing: the plan expects the destination UID to point at the source
-        // pointer plus a byte offset, so materialise those entries before looking them up.
-        CHECK_CUDNN_FRONTEND_ERROR(make_variant_pack_replacements(uid_to_device_ptrs, variant_pack_replacements));
-
         std::vector<void *> device_ptrs;
         std::vector<uid_t> uids;
 
@@ -972,11 +967,6 @@ class Graph : public ICudnn, public INode {
 
         // Get the BE's cuda graph
 
-        // Make sure device pointer is provided for all uids expected for this plan
-        // Legacy Slice aliasing: the plan expects the destination UID to point at the source
-        // pointer plus a byte offset, so materialise those entries before looking them up.
-        CHECK_CUDNN_FRONTEND_ERROR(make_variant_pack_replacements(uid_to_device_ptrs, variant_pack_replacements));
-
         std::vector<void *> device_ptrs;
         device_ptrs.reserve(variant_pack_uids.size());
         std::vector<uid_t> uids;
@@ -1109,6 +1099,12 @@ class Graph : public ICudnn, public INode {
                                std::unordered_map<Tensor_attributes::uid_t, void *> &uid_to_device_ptrs,
                                void *workspace,
                                cudaGraph_t cudnn_cuda_graph) {
+        // Only a cuDNN execution plan can be recorded into a CUDA graph by this API.
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            plans.is_frontend_engine_candidate(),
+            error_code_t::GRAPH_NOT_SUPPORTED,
+            "The selected engine is not backed by a cuDNN execution plan, so populate_cuda_graph_direct() "
+            "cannot record it; capture execute() on a stream instead.");
         size_t numNodes = 0;
         _CUDNN_CHECK_CUDA_ERROR(detail::cuda_graph_get_nodes(cudnn_cuda_graph, nullptr, &numNodes));
         RETURN_CUDNN_FRONTEND_ERROR_IF(numNodes != 0,
@@ -1137,20 +1133,20 @@ class Graph : public ICudnn, public INode {
         }
 
         // Make sure device pointer is provided for all uids expected for this plan
-        // Legacy Slice aliasing: the plan expects the destination UID to point at the source
-        // pointer plus a byte offset, so materialise those entries before looking them up.
-        CHECK_CUDNN_FRONTEND_ERROR(make_variant_pack_replacements(uid_to_device_ptrs, variant_pack_replacements));
+        // Legacy Slice destinations are derived from their source per call; a destination the caller binds wins.
+        UidBindings const derived_bindings = derive_variant_pack_replacements_(uid_to_device_ptrs);
+        CHECK_CUDNN_FRONTEND_ERROR(check_aligned_operand_pointers_(uid_to_device_ptrs, derived_bindings));
 
         std::vector<void *> device_ptrs;
         std::vector<uid_t> uids;
         device_ptrs.reserve(variant_pack_uids.size());
         uids.reserve(variant_pack_uids.size());
         for (auto const &uid : variant_pack_uids) {
-            auto search = uid_to_device_ptrs.find(uid);
-            RETURN_CUDNN_FRONTEND_ERROR_IF(search == uid_to_device_ptrs.end(),
+            void *const *binding = find_binding_(uid, uid_to_device_ptrs, derived_bindings);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(binding == nullptr,
                                            error_code_t::INVALID_VARIANT_PACK,
                                            "Uid " + std::to_string(uid) + " does not exist in variant pack.");
-            device_ptrs.push_back(search->second);
+            device_ptrs.push_back(*binding);
             uids.push_back(uid);
         }
 
@@ -1198,6 +1194,12 @@ class Graph : public ICudnn, public INode {
                              std::unordered_map<Tensor_attributes::uid_t, void *> &uid_to_device_ptrs,
                              void *workspace,
                              cudaGraph_t cudnn_cuda_graph) {
+        // Only a cuDNN execution plan can be updated in place by this API.
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            plans.is_frontend_engine_candidate(),
+            error_code_t::GRAPH_NOT_SUPPORTED,
+            "The selected engine is not backed by a cuDNN execution plan, so update_cuda_graph_direct() "
+            "cannot update it; capture execute() on a stream instead.");
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             cudnn_cuda_graph == nullptr, error_code_t::INVALID_VALUE, "cudnn_cuda_graph should not be a nullptr");
         RETURN_CUDNN_FRONTEND_ERROR_IF(
@@ -1212,20 +1214,20 @@ class Graph : public ICudnn, public INode {
             uid_to_device_ptrs[entry.first] = static_cast<char *>(workspace) + std::get<1>(entry.second);
         }
 
-        // Legacy Slice aliasing: the plan expects the destination UID to point at the source
-        // pointer plus a byte offset, so materialise those entries before looking them up.
-        CHECK_CUDNN_FRONTEND_ERROR(make_variant_pack_replacements(uid_to_device_ptrs, variant_pack_replacements));
+        // Legacy Slice destinations are derived from their source per call; a destination the caller binds wins.
+        UidBindings const derived_bindings = derive_variant_pack_replacements_(uid_to_device_ptrs);
+        CHECK_CUDNN_FRONTEND_ERROR(check_aligned_operand_pointers_(uid_to_device_ptrs, derived_bindings));
 
         std::vector<void *> device_ptrs;
         std::vector<uid_t> uids;
         device_ptrs.reserve(variant_pack_uids.size());
         uids.reserve(variant_pack_uids.size());
         for (auto const &uid : variant_pack_uids) {
-            auto search = uid_to_device_ptrs.find(uid);
-            RETURN_CUDNN_FRONTEND_ERROR_IF(search == uid_to_device_ptrs.end(),
+            void *const *binding = find_binding_(uid, uid_to_device_ptrs, derived_bindings);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(binding == nullptr,
                                            error_code_t::INVALID_VARIANT_PACK,
                                            "Uid " + std::to_string(uid) + " does not exist in variant pack.");
-            device_ptrs.push_back(search->second);
+            device_ptrs.push_back(*binding);
             uids.push_back(uid);
         }
 
