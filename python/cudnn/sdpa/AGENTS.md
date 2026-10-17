@@ -179,6 +179,13 @@ can otherwise leave half the rows unwritten while corrupting padding. The
 SM107 detector is `test_sm107_fp8_stats_nonunit_row_stride`; MXFP8 also checks
 rebound padded and batch-inner layouts under CUDA Graph replay.
 
+Vector-load alignment must follow each input's declared base and physical
+strides. Inspect the original tensor iterator before `raw_ptr()` conversion,
+which can discard its alignment declaration; checking the converted pointer
+can leave an intended vector path scalar. Compile both aligned and misaligned
+controls and inspect the emitted loads, then check physical pitches, pointer
+rebinding and replay. `test_sdpa_bwd_dot_strides.py` covers the shared dot helper.
+
 Block-scaled SF_O uses byte addressing: its fake tensor extent, host geometry
 arguments, device parameters, and every intermediate offset product must all
 stay Int64. Widen operands before multiplication. The physical detector is
