@@ -688,6 +688,12 @@ helper *call* was the problem. Duplicating the block across flavors is the
 correct trade here. Factor only host-side code, or code you can mark
 `@cute.jit`.
 
+Never reuse a persistent loop index in a nested unrolled loop. In GDN-2 prep,
+reusing `j` for operand packing changed the next raw-stage refill index.
+The GDN-2 `test_prep_fwd_matches_uncut_and_reference` and
+`test_prep_checkpoint_series` cases in `linear_attention/test_la.py` exercise
+multiple work items per CTA and detect this regression.
+
 Related: inside a kernel body, `for x in (a, b)` over a Python tuple is
 rewritten into a dynamic `ir_loop` and cannot iterate heterogeneous objects
 (e.g. `GridConstant[TensorMap]`). Unroll it, or use `cutlass.range_constexpr`.

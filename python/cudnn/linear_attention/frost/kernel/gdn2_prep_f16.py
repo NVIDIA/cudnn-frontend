@@ -382,8 +382,8 @@ def compute_warp_group(
             k_inv_vec, k_decay_vec, k_restore_half = key_operand_half(
                 cfg, dim_half, raw_k_regs, raw_beta_regs, k_inv_norm, exp_g_regs, inverse_g_regs, restore_g_regs
             )
-            for j in cutlass.range_constexpr(4):
-                k_restore_pack[dim_half * 4 + j] = k_restore_half[j]
+            for restore_word in cutlass.range_constexpr(4):
+                k_restore_pack[dim_half * 4 + restore_word] = k_restore_half[restore_word]
             f16_segment = dim_base // 64
             f16_segment_dim = dim_base - f16_segment * 64
             k_inv_swizzled_idx = f16_segment * (cfg.b_t * 64) + decay_row * 64 + swizzle_xor_128b(decay_row, f16_segment_dim, elem_bytes=2)
