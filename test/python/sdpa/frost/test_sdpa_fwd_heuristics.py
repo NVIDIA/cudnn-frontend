@@ -1489,6 +1489,13 @@ def test_sm107_shared_d128_scheduler_follows_the_measured_tables(sm107_metadata_
     facts = _sm107_d128_facts(**over)
     plans = _sm107_f16_plans(facts)
     first = plans[0].knobs
+    if over.get("d_qk") == 64:
+        # The d64 envelope no longer rides the shared d128 bodies knob-less: the row's native 64-wide tile (the dense leg, cga1,
+        # unpacked) is the first proposal; the shared decode tile stays reachable through the PackGQA / split knobs.
+        caps = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16).capabilities
+        assert first.pack_gqa is False and first.cga == 1, first
+        assert engines.mismatch(caps, facts, first) is None, first
+        return
     assert first.pack_gqa is True, first
     assert first.sched_policy == first_sched, [p.knobs for p in plans]
     other = SCHED_LPT if first_sched == 0 else 0

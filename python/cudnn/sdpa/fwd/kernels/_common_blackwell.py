@@ -107,6 +107,36 @@ class Bars(NamedTuple):
     # arithmetic: make_d256_bars.
     mb_gate_full: object = None
     mb_gate_empty: object = None
+    # Resident additive-bias block handshake (the sm107 d128-file tiles at
+    # CFG.BIAS_MODE == 1); None unless built with bias_resident=True.  Two
+    # ITEM-level rows (lane ledger in make_classic_bars):
+    #   mb_bias_full   TMA_LOAD, init ONE_LANE: the TMA-LDG warp arms it once per
+    #                  non-empty work item (pred=elect_sync -> 1 lane) with the
+    #                  sum of the block's FULL tile boxes; both softmax WGs wait
+    #                  it once per item before their first bias read.
+    #   mb_bias_empty  THREAD, init BIAS_EMPTY_ARRIVERS = the softmax warps (8):
+    #                  each softmax warp arrives once per non-empty item after
+    #                  its LAST read of the block (`if elect_sync():` -> 1 lane x
+    #                  8 warps); the TMA-LDG warp waits it before the NEXT item's
+    #                  fill (consumer phase pre-armed at 1: the first fill waits
+    #                  on nothing).  An EMPTY item (zero kv tiles) touches
+    #                  neither row on either side.
+    mb_bias_full: object = None
+    mb_bias_empty: object = None
+    # The STREAMED bias ring (CFG.BIAS_MODE == 2; None unless built with bias_ring_stages > 0): STAGES_BIAS stages, one bias
+    # tile (BIAS_BLOCK_ROWS x TILE_N) per kv tile.
+    #   mb_bias_ring_full[s]   TMA_LOAD, init ONE_LANE: the TMA-LDG warp arms stage s once per kv tile (expect_tx = the tile's
+    #                          FULL boxes, one elected lane) and queues the tile; both softmax warpgroups wait it before the
+    #                          tile's first bias read (256 lanes wait; waits do not count).
+    #   mb_bias_ring_empty[s]  THREAD, init BIAS_EMPTY_ARRIVERS = the softmax warps (8): one elected arrive per softmax warp per
+    #                          kv tile after the stage's last bias word is consumed; the TMA-LDG warp waits it before refilling
+    #                          the stage (pre-armed on its side: the first STAGES_BIAS fills wait on nothing).  On the
+    #                          streamed_multicast ring (CFG.BIAS_MODE == 3) the init is BIAS_EMPTY_ARRIVERS x BIAS_MCAST_CTAS
+    #                          (make_classic_bars(bias_ring_empty_arrivers=): 8 own + 8 peer = 16): the PEER CTA's softmax warps
+    #                          credit this CTA's stage too, through the .release.cta cluster arrive (arrive_on_peer(release_cta=True),
+    #                          a read-then-credit across CTAs -- never the relaxed form; the kernel's barrier table has the row).
+    mb_bias_ring_full: object = None
+    mb_bias_ring_empty: object = None
 
 
 class D256Bars(NamedTuple):
@@ -349,7 +379,17 @@ def make_d512_2x2_bars(CFG, *, N_O_CHUNKS: int, STAT_STAGES: int = 2, cross_pair
     )
 
 
-def make_classic_bars(CFG, s_stages: Optional[int] = None, *, epilogue_gate: bool = False, q_full_arrivers: int = 1, o_parts: int = 1) -> Bars:
+def make_classic_bars(
+    CFG,
+    s_stages: Optional[int] = None,
+    *,
+    epilogue_gate: bool = False,
+    q_full_arrivers: int = 1,
+    o_parts: int = 1,
+    bias_resident: bool = False,
+    bias_ring_stages: int = 0,
+    bias_ring_empty_arrivers: Optional[int] = None,
+) -> Bars:
     """The classic pipeline's barrier set.
 
     ``s_stages`` is the S/P TMEM slot ring depth the BMM1-done / BMM2-ready
@@ -358,7 +398,37 @@ def make_classic_bars(CFG, s_stages: Optional[int] = None, *, epilogue_gate: boo
     kernel alternates its S between so BMM1(i+1) can overlap softmax(i)
     (``sm100/decode_d128_f16.py`` passes 2).  Every other barrier keeps its
     per-sub-tile count.
+
+    ``bias_resident``: the two item-level rows of the resident additive-bias
+    block (``Bars.mb_bias_full`` / ``mb_bias_empty``; the issuing-lane ledger is on the
+    fields).  Init counts: ONE_LANE (one elected expect_tx arrive per item) and
+    ``CFG.BIAS_EMPTY_ARRIVERS`` (one elected THREAD arrive per softmax warp per
+    item = SOFTMAX_WARPGROUPS x SOFTMAX_WG_WARPS, pinned by the config
+    validator).  False (every other caller) leaves them None and traces the
+    pre-bias bundle byte-for-byte.
+
+    ``bias_ring_stages``: the STREAMED bias ring's two rows (``Bars.mb_bias_ring_full`` /
+    ``mb_bias_ring_empty``, that many stages each; the same two init counts per stage
+    -- ONE_LANE for the TMA-LDG warp's per-kv-tile expect_tx, ``CFG.BIAS_EMPTY_ARRIVERS``
+    for the softmax warps' per-kv-tile elected release).  0 (every other caller)
+    leaves them None.  A kernel passes one of ``bias_resident`` / ``bias_ring_stages``,
+    never both: the two bias forms fold on ``CFG.BIAS_MODE``.
+
+    ``bias_ring_empty_arrivers`` (appended): the ``mb_bias_ring_empty`` init count when it is NOT the CTA's own softmax
+    warps alone -- the ``streamed_multicast`` ring (``CFG.BIAS_MODE == 3``) releases every stage from BOTH CTAs of the
+    cluster (one elected local arrive + one elected ``.release.cta`` cluster arrive (``arrive_on_peer(release_cta=True)``,
+    a READ-then-credit across CTAs -- never the relaxed form) per softmax warp), so each CTA's ring counts
+    ``BIAS_EMPTY_ARRIVERS x 2`` per phase.  None (every other caller) = ``CFG.BIAS_EMPTY_ARRIVERS``.
     """
+    if bias_resident and bias_ring_stages:
+        raise ValueError("make_classic_bars: bias_resident and bias_ring_stages are the two bias FORMS (CFG.BIAS_MODE 1 / 2); pass one")
+    if bias_ring_stages < 0:
+        raise ValueError(f"make_classic_bars: bias_ring_stages must be >= 0 (got {bias_ring_stages})")
+    if bias_ring_empty_arrivers is not None and (not bias_ring_stages or int(bias_ring_empty_arrivers) < 1):
+        raise ValueError(f"make_classic_bars: bias_ring_empty_arrivers={bias_ring_empty_arrivers} needs a ring (bias_ring_stages={bias_ring_stages}) and >= 1")
+    # Read CFG.BIAS_EMPTY_ARRIVERS only when a bias form asks for it: the shared SM100 bodies (the d128 decode tile, the
+    # SM100 prefill files) build their bars through this factory with Cfg records that carry no bias fields.
+    ring_empty_count = int(bias_ring_empty_arrivers) if bias_ring_empty_arrivers is not None else (CFG.BIAS_EMPTY_ARRIVERS if bias_ring_stages else 0)
     # ``epilogue_gate``: same two LOCAL gate barriers as make_d256_bars (table
     # there); no classic (d128/d192) kernel passes True yet, so today every
     # caller gets None and traces unchanged.  The init counts (ONE_LANE /
@@ -417,6 +487,14 @@ def make_classic_bars(CFG, s_stages: Optional[int] = None, *, epilogue_gate: boo
         mb_qo_slab_free=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.ONE_WARP, producer=Producer.THREAD),
         mb_gate_full=(MBarrier(_alloc(1), stages=1, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD) if epilogue_gate else None),
         mb_gate_empty=(MBarrier(_alloc(1), stages=1, init_count=CFG.CORR_LANES, producer=Producer.THREAD) if epilogue_gate else None),
+        mb_bias_full=(MBarrier(_alloc(1), stages=1, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD) if bias_resident else None),
+        mb_bias_empty=(MBarrier(_alloc(1), stages=1, init_count=CFG.BIAS_EMPTY_ARRIVERS, producer=Producer.THREAD) if bias_resident else None),
+        mb_bias_ring_full=(
+            MBarrier(_alloc(bias_ring_stages), stages=bias_ring_stages, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD) if bias_ring_stages else None
+        ),
+        mb_bias_ring_empty=(
+            MBarrier(_alloc(bias_ring_stages), stages=bias_ring_stages, init_count=ring_empty_count, producer=Producer.THREAD) if bias_ring_stages else None
+        ),
     )
 
 
@@ -1601,3 +1679,39 @@ def sdpa_gate_tensor(gate_ptr, problem_size, d_v, gate_strides, thd=False):
         return None
     B, QH, _, SQ, _, _ = problem_size
     return _bshd(gate_ptr, B, SQ, QH, d_v, gate_strides, thd)
+
+
+def sdpa_bias_tensor(bias_ptr, problem_size, bias_strides, bias_extents):
+    """The additive attention bias ``[B_b, H_b, S_q, S_kv]`` (``B_b`` in {1, B}, ``H_b`` in {1, QH}: the graph's
+    broadcast dims, bound as runtime extents so one artifact serves every broadcast form) over the caller's
+    (batch, head, q-row) element strides; the kv column is contiguous.  None folds the bias path out (the
+    module's CFG.BIAS_MODE must agree).  Dense only."""
+    if bias_ptr is None:
+        return None
+    _, _, _, SQ, SKV, _ = problem_size
+    b_b, h_b = bias_extents
+    sb, sh, sq = (cutlass.Int64(s) for s in bias_strides)
+    return cute.make_tensor(bias_ptr, cute.make_layout((b_b, h_b, SQ, SKV), stride=(sb, sh, sq, 1)))
+
+
+def sdpa_kv_mask_tensor(kv_mask_ptr, problem_size, kv_mask_batch_stride):
+    """The per-key boolean mask ``[B_m, S_kv]`` (the graph's ``[1|B, 1, 1, S_kv]`` BOOLEAN tensor read as bytes; a
+    batch stride of 0 broadcasts one row over the batch) in the caller's batch element stride; the key is
+    contiguous.  None folds the kv_mask path out (CFG.KV_MASK_FORM must agree)."""
+    if kv_mask_ptr is None:
+        return None
+    B, _, _, _, SKV, _ = problem_size
+    return cute.make_tensor(kv_mask_ptr, cute.make_layout((B, SKV), stride=(cutlass.Int64(kv_mask_batch_stride), 1)))
+
+
+def sdpa_score_tensor(score_ptr, problem_size, score_strides):
+    """One score side output (``score_max`` or ``score_sum_exp``): a dense fp32 ``(B, QH, SQ)`` row
+    statistic in the caller's declared (batch, head, row) element strides -- the Stats geometry
+    without its unit axis.  None folds the store out of the kernel (the DSL specializes on None),
+    so a plan that does not request the output traces byte-identically to before the slot existed.
+    Dense only: the THD / split builds decline the outputs at ``compile()``."""
+    if score_ptr is None:
+        return None
+    B, QH, _, SQ, _, _ = problem_size
+    s0, s1, s2 = score_strides
+    return cute.make_tensor(score_ptr, cute.make_layout((B, QH, SQ), stride=(s0, s1, s2)))
