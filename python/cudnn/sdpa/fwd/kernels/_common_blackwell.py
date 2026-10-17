@@ -993,8 +993,15 @@ def make_sdpa_helpers(
     lpt_head_group: int = 1,
     lpt_q_tiles: int = 0,
     kv_shared_cluster: bool = False,
+    bounded_thd_decode: bool = False,
 ) -> SdpaHelpers:
     """Decode / bounds / THD closures for a flavor.
+
+    ``bounded_thd_decode`` uses the device-sorted batch remap to locate a live
+    THD work item without scanning later sequences. Equal endpoint tile counts
+    admit direct indexing, including unequal lengths in the same tile bucket.
+    Callers opt in after qualifying their geometry; other flavors keep the
+    original decoder. Neither path reads sequence lengths on the host.
 
     ``kv_shared_cluster`` (default False = every existing kernel's trace, byte for byte): the
     CLUSTER-UNION geometry of the d512 2x2-datapath kernel, whose CGA_M CTAs each own their
@@ -1286,9 +1293,90 @@ def make_sdpa_helpers(
         return q_super, f_head, f_batch + split * n_batch
 
     @cute.jit
+    def _thd_decode_bounded(linear_cta, seq_kv_lens_t, n_batch, n_qh, cta_in_pair):
+        u = linear_cta // cutlass.Int32(CFG.CGA_M)
+        split = cutlass.Int32(0)
+        if cutlass.const_expr(getattr(CFG, "SPLIT_KV", 1) > 1):
+            # Split is the low digit of the live ragged work list. Both
+            # initial admission and persistent claims use this same mapping.
+            split = u % cutlass.Int32(CFG.SPLIT_KV)
+            u = u // cutlass.Int32(CFG.SPLIT_KV)
+        cu = cutlass.make_array_view(seq_kv_lens_t)
+        cuq0 = n_batch
+        acc = cutlass.Int32(0)
+        # DEAD-unit sentinel (issue #552 over-launch): a unit no sequence
+        # claims (u >= sum of live units) keeps batch == n_batch.  That index
+        # makes every downstream consumer a no-op through IN-BOUNDS metadata
+        # reads: _resolve_seqlen_kv reads meta[n_batch] = cu_q[0] = 0 (empty
+        # KV range in every role), the epilogue's per-sequence Q length
+        # cu[2n+1]-cu[2n] goes negative (LSE predicate never fires), and the
+        # O-store role skips the TMA store explicitly (batch >= n_batch).
+        f_batch = n_batch
+        f_head = cutlass.Int32(0)
+        f_qc = cutlass.Int32(0)
+        found_cb = cutlass.Int32(1)
+        found_local = cutlass.Int32(0)
+        done = cutlass.Int32(0)
+        remap0 = cutlass.Int32(3) * n_batch + cutlass.Int32(2)
+        search = cutlass.Int32(1)
+        # batch_remap is sorted by decreasing Q length. Rounding length to
+        # tile count is monotone, so equal endpoint counts prove that EVERY
+        # batch has the same count, including unequal lengths in one bucket.
+        # All observations are current device metadata; no host promise.
+        if n_batch > cutlass.Int32(0):
+            first_b = cutlass.Int32(cu[remap0])
+            last_b = cutlass.Int32(cu[remap0 + n_batch - cutlass.Int32(1)])
+            first_s = cutlass.Int32(cu[cuq0 + first_b + cutlass.Int32(1)]) - cutlass.Int32(cu[cuq0 + first_b])
+            last_s = cutlass.Int32(cu[cuq0 + last_b + cutlass.Int32(1)]) - cutlass.Int32(cu[cuq0 + last_b])
+            first_cb = (first_s + cutlass.Int32(thd_token_tile_m - 1)) // cutlass.Int32(thd_token_tile_m)
+            last_cb = (last_s + cutlass.Int32(thd_token_tile_m - 1)) // cutlass.Int32(thd_token_tile_m)
+            if first_cb == last_cb:
+                search = cutlass.Int32(0)
+                if first_cb > cutlass.Int32(0):
+                    per_batch = first_cb * n_qh
+                    ordinal = u // per_batch
+                    if ordinal < n_batch:
+                        f_batch = cutlass.Int32(cu[remap0 + ordinal])
+                        found_cb = first_cb
+                        found_local = u % per_batch
+                        done = cutlass.Int32(1)
+        i = cutlass.Int32(0)
+        # Preserve longest-first remapping and the DEAD-unit sentinel. Empty
+        # batches consume zero work. No host knowledge of lengths is needed.
+        while (i < n_batch) & (done == cutlass.Int32(0)) & (search != cutlass.Int32(0)):
+            b = cutlass.Int32(cu[remap0 + i])
+            s_i = cutlass.Int32(cu[cuq0 + b + cutlass.Int32(1)]) - cutlass.Int32(cu[cuq0 + b])
+            cb = (s_i + cutlass.Int32(thd_token_tile_m - 1)) // cutlass.Int32(thd_token_tile_m)
+            units_b = cb * n_qh
+            if u < acc + units_b:
+                f_batch = b
+                found_cb = cb
+                found_local = u - acc
+                done = cutlass.Int32(1)
+            acc = acc + units_b
+            i = i + cutlass.Int32(1)
+        # Quotient/remainder decoding is needed only for the matching batch.
+        # cb is positive here; keep head/row zero for an unclaimed work unit.
+        if done != cutlass.Int32(0):
+            f_head = found_local // found_cb
+            f_qc = found_local % found_cb
+            if cutlass.const_expr(CFG.DTYPE_QKV in (2, 3) and CFG.TILE_K in (64, 128, 256)):
+                if cutlass.const_expr(CFG.SCHEDULER_POLICY == SCHED_LPT):
+                    f_head = found_local % n_qh
+                    f_qc = found_cb - cutlass.Int32(1) - found_local // n_qh
+                elif cutlass.const_expr(CFG.SCHEDULER_POLICY == SCHED_LPT_L2):
+                    group = cutlass.Int32(_packed_heads_per_kv if CFG.PACK_GQA else CFG.QH_PER_KH)
+                    f_head = (found_local // (found_cb * group)) * group + found_local % group
+                    f_qc = found_cb - cutlass.Int32(1) - (found_local // group) % found_cb
+        q_super = f_qc * cutlass.Int32(_q_supers_per_cluster) + cta_in_pair
+        return q_super, f_head, f_batch + split * n_batch
+
+    _thd_decode_impl = _thd_decode_bounded if bounded_thd_decode else _thd_decode
+
+    @cute.jit
     def _dispatch_decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh=None, seqlen_kv=None):
         if cutlass.const_expr(_thd_on):
-            return _thd_decode(bidx, seq_kv_lens_t, n_batch, n_qh, cta_in_pair)
+            return _thd_decode_impl(bidx, seq_kv_lens_t, n_batch, n_qh, cta_in_pair)
         if cutlass.const_expr(CFG.PACK_GQA):
             qh_per_kh = cutlass.Int32(_packed_heads_per_kv)
         return _decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh, seqlen_kv)
@@ -1296,7 +1384,7 @@ def make_sdpa_helpers(
     @cute.jit
     def _dispatch_decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh=None, seqlen_kv=None):
         if cutlass.const_expr(_thd_on):
-            return _thd_decode(t0, seq_kv_lens_t, n_batch, n_qh, cta_in_pair)
+            return _thd_decode_impl(t0, seq_kv_lens_t, n_batch, n_qh, cta_in_pair)
         if cutlass.const_expr(CFG.PACK_GQA):
             qh_per_kh = cutlass.Int32(_packed_heads_per_kv)
         return _decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh, seqlen_kv)
@@ -1333,7 +1421,7 @@ def make_sdpa_helpers(
         bounds_for_tile_qtrim=_bounds_for_tile_qtrim,
         resolve_seqlen_kv=_resolve_seqlen_kv,
         resolve_seqlen_q=_resolve_seqlen_q,
-        thd_decode=_thd_decode,
+        thd_decode=_thd_decode_impl,
         dispatch_decode_initial=_dispatch_decode_initial,
         dispatch_decode_payload=_dispatch_decode_payload,
         thd_tma_offsets=_thd_tma_offsets,
