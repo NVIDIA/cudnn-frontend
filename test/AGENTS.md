@@ -111,7 +111,7 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 - Coverage-shape selectors raise when they cannot select the requested schedule.
   Only the device-dependent fixture may convert that error into a skip.
   Fixed supported-device geometry tests must fail if a schedule becomes unavailable.
-  `linear_attention/test_gdn2_steep_decay.py::test_steep_schedule_geometry_rejects_missing_schedule`
+  `linear_attention/test_gdn2_frost_steep_decay.py::test_steep_schedule_geometry_rejects_missing_schedule`
   disables DV splitting to check this boundary.
 
 - MXFP8 input does not imply three scale-factor buffers or one-byte V.
@@ -967,3 +967,9 @@ a different GPU current; include changed-input capture replay. The detector is
 `test_direct_standalone_with_another_device_current` in the SM100 backward
 staging suite; it exercises both standalone adapters with a real host. A test
 that intercepts entry before launch provides a safe RED control for this bug.
+
+FROST regression filenames must match the CI `-k frost` selection, including
+pure scratch-layout tests without a backend parameter. Verify collection with
+that filter. Gate suites that import kernel helpers with the shared DSL
+availability and version checks before importing those helpers. Keep pure
+layout suites runnable below the kernel DSL floor.

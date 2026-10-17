@@ -812,7 +812,7 @@ with fp16 operands (`k * 2^-g` overflows). Both lie inside the documented gate r
 - Range tests must vary state-gradient magnitude independently of gate magnitude. A large finite
   FP32 seed, or a carry accumulated from finite FP16 output gradients, can overflow an undecayed
   FP16 state operand even when the decayed carry and all returned gradients fit. The large-seed
-  and large-carry regressions in `test_gdn2_steep_decay.py` cover both backward implementations.
+  and large-carry regressions in `test_gdn2_frost_steep_decay.py` cover both backward implementations.
 - Keep steep state gradients and bounded key operands in FP32 through their projections
   (`common/gdn2_state_grad.py`). Narrowing a bounded key first can erase a term that becomes
   representable after multiplication by the state gradient. The caller-owned per-CTA workspace
@@ -835,10 +835,17 @@ with fp16 operands (`k * 2^-g` overflows). Both lie inside the documented gate r
   alias them later. A forward graph without a final-state output cannot overwrite its seeds;
   indexed input pools in such graphs need no snapshot.
 
-Detectors, all in `linear_attention/test_gdn2_steep_decay.py`: `test_fwd_bwd_steep_channel_decay`
+Detectors, all in `linear_attention/test_gdn2_frost_steep_decay.py`: `test_fwd_bwd_steep_channel_decay`
 (and its fp16 twin), `test_fp16_inverse_range_without_normalization`,
 `test_multiple_steep_channels_are_repeatable`, `test_forward_state_alias_after_graph_warmup`,
-`test_steep_channel_decay_overwrite_initial_state`, `test_read_only_state_pool_needs_no_snapshot`, `test_strided_state_overwrite` and
+`test_steep_channel_decay_overwrite_initial_state`, `test_steep_channel_decay_backward_overwrite_initial_state`,
+`test_read_only_state_pool_needs_no_snapshot`, `test_strided_state_overwrite` and
 `test_steep_summary_matches_reference`. Scratch bounds are checked by
-`linear_attention/test_gdn2_steep_scratch.py`; `test_steep_schedule_geometry` checks schedule case
+`linear_attention/test_gdn2_frost_steep_scratch.py`; `test_steep_schedule_geometry` checks schedule case
 selection across SM counts without changing the kernel launch limits.
+
+State snapshots preserve both the source dtype and its element width. The snapshot
+kernel copies raw bytes and does not convert FP16 to FP32. Exercise every accepted
+state dtype with forward and backward aliasing, padded storage, and changed-state
+CUDA-graph replay. The overwrite and replay cases in
+`linear_attention/test_gdn2_frost_steep_decay.py` cover these paths.

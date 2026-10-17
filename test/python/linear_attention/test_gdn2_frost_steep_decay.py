@@ -10,6 +10,14 @@ import pytest
 torch = pytest.importorskip("torch")
 cudnn = pytest.importorskip("cudnn")
 
+from cudnn.frost.buffers import cutedsl_requirement_error, cutedsl_state
+
+if not cutedsl_state()[0]:
+    pytest.skip("GDN-2 FROST tests require nvidia-cutlass-dsl", allow_module_level=True)
+requirement_error = cutedsl_requirement_error("GDN-2 FROST")
+if requirement_error:
+    pytest.skip(requirement_error, allow_module_level=True)
+
 from .test_la import (
     BWD_TOL,
     CUDNN_DTYPE,
@@ -236,18 +244,29 @@ def test_fwd_bwd_steep_channel_decay_fp16(backend, built_plans, variant, shape, 
 
 
 @pytest.mark.parametrize("variant", ("gdn2",))
-def test_steep_channel_decay_overwrite_initial_state(backend, variant):
-    """An aliased state (``overwrite_initial_state``) is read from a snapshot, so the exact relaunch still sees the
-    original: output, final state and every gradient bitwise the separate-buffer run's."""
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16, torch.float16], ids=["fp32", "bf16", "fp16"])
+def test_steep_channel_decay_overwrite_initial_state(backend, built_plans, variant, state_dtype):
+    """A state snapshot preserves the output and final state when the state buffers alias."""
     case = steep_gate(make_case(variant, torch.bfloat16, B=8, T=512, H=4), "spike")
-    state0, d_final = random_state(case), random_state(case, scale=0.1, seed=SEED + 3)
+    state0 = random_state(case, dtype=state_dtype)
     o_ref, fs_ref = run_fwd(backend, case, initial_state=state0.clone(), output_final_state=True, batch_invariant=True)
     state = state0.clone()
-    o, _ = run_fwd(backend, case, initial_state=state, output_final_state=True, overwrite_initial_state=True)
+    o, _ = run_fwd(backend, case, initial_state=state, output_final_state=True, overwrite_initial_state=True, batch_invariant=True)
     assert torch.isfinite(o).all()
     assert_bitwise("o", o, o_ref)
     assert_bitwise("final_state", state, fs_ref)
+    aliased_plans = [plan for plan in built_plans if plan.overwrite_initial_state]
+    assert aliased_plans
+    assert all("state_snapshot" in plan.carve_names for plan in aliased_plans)
 
+
+@pytest.mark.parametrize("variant", ("gdn2",))
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16, torch.float16], ids=["fp32", "bf16", "fp16"])
+def test_steep_channel_decay_backward_overwrite_initial_state(backend, built_plans, variant, state_dtype):
+    """A gradient snapshot preserves every gradient when the state-gradient buffers alias."""
+    case = steep_gate(make_case(variant, torch.bfloat16, B=8, T=512, H=4), "spike")
+    state0 = random_state(case, dtype=state_dtype)
+    d_final = random_state(case, scale=0.1, seed=SEED + 3, dtype=state_dtype)
     _, _, grads, dO, _ = chain_grads(backend, case, initial_state=state0, d_final_state=d_final, batch_invariant=True)
     names = LEAF_NAMES[variant]
     inputs = dict(zip(names, op_args(case)[: len(names)]))
@@ -278,6 +297,9 @@ def test_steep_channel_decay_overwrite_initial_state(backend, variant):
         assert torch.isfinite(got[name]).all(), name
         assert_bitwise(f"d{name}", got[name], grads[name])
     assert_bitwise("d_initial_state", d_state, grads["initial_state"])
+    aliased_plans = [plan for plan in built_plans if plan.overwrite_initial_state]
+    assert aliased_plans
+    assert all("dstate_snapshot" in plan.carve_names for plan in aliased_plans)
 
 
 @pytest.mark.parametrize("K", [64, 128])
@@ -303,13 +325,14 @@ def test_read_only_state_pool_needs_no_snapshot(backend, built_plans, K, steep):
 
 
 @pytest.mark.parametrize("K", [64, 128])
-def test_strided_state_overwrite(backend, K):
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16, torch.float16], ids=["fp32", "bf16", "fp16"])
+def test_strided_state_overwrite(backend, K, state_dtype):
     """The snapshot follows the state's strides: a padded ``initial_state`` overwritten in place matches the
     separate-buffer run bitwise through a steep relaunch, and its padding is untouched."""
     case = steep_gate(make_case("gdn2", torch.bfloat16, K=K, seq_lens=[96, 32, 160, 1]), "spike")
-    state0 = random_state(case)
+    state0 = random_state(case, dtype=state_dtype)
     o_ref, fs_ref = run_fwd(backend, case, initial_state=state0.clone(), output_final_state=True, batch_invariant=True)
-    padded = torch.full((case.N, case.HO, case.V, K + 16), 7.0, device="cuda")
+    padded = torch.full((case.N, case.HO, case.V, K + 16), 7.0, device="cuda", dtype=state_dtype)
     state = padded[..., :K]
     state.copy_(state0)
     o, _ = run_fwd(backend, case, initial_state=state, output_final_state=True, overwrite_initial_state=True)
@@ -352,10 +375,11 @@ def test_multiple_steep_channels_are_repeatable(backend, built_plans, K, shape, 
 
 
 @pytest.mark.parametrize("K", [64, 128])
-def test_forward_state_alias_after_graph_warmup(backend, K):
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16, torch.float16], ids=["fp32", "bf16", "fp16"])
+def test_forward_state_alias_after_graph_warmup(backend, K, state_dtype):
     """An overwrite-capable graph can bind separate buffers before binding an alias."""
     case = steep_gate(make_case("gdn2", torch.bfloat16, B=8, T=64, H=4, K=K), "spike")
-    state0 = random_state(case)
+    state0 = random_state(case, dtype=state_dtype)
     inputs = dict(zip(LEAF_NAMES["gdn2"], op_args(case)))
     inputs.update(cu_seqlens=case.cu, initial_state=state0)
     graph = cudnn.pygraph()
@@ -369,7 +393,7 @@ def test_forward_state_alias_after_graph_warmup(backend, K):
         name="forward",
     )[:2]
     output.set_output(True).set_data_type(CUDNN_DTYPE[case.dtype])
-    final_state.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    final_state.set_output(True).set_data_type(CUDNN_DTYPE[state_dtype])
     build_and_pin(graph, "gdn2_frost")
     o_ref, fs_ref = run_fwd(backend, case, initial_state=state0, output_final_state=True, batch_invariant=True)
     o = torch.empty_like(o_ref)
@@ -388,6 +412,20 @@ def test_forward_state_alias_after_graph_warmup(backend, K):
     torch.cuda.synchronize()
     assert_bitwise("rebound output", o, o_ref)
     assert_bitwise("rebound state", state, fs_ref)
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    captured = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(captured, stream=side):
+        graph.execute(pack, workspace)
+    for seed in (SEED + 2, SEED + 3):
+        fresh = random_state(case, dtype=state_dtype, seed=seed)
+        expected_o, expected_state = run_fwd(backend, case, initial_state=fresh, output_final_state=True, batch_invariant=True)
+        state.copy_(fresh)
+        captured.replay()
+        torch.cuda.synchronize()
+        assert_bitwise("replayed output", o, expected_o)
+        assert_bitwise("replayed state", state, expected_state)
 
 
 @pytest.mark.parametrize("K", [64, 128])
