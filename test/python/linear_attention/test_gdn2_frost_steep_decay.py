@@ -376,7 +376,8 @@ def test_multiple_steep_channels_are_repeatable(backend, built_plans, K, shape, 
 
 @pytest.mark.parametrize("K", [64, 128])
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16, torch.float16], ids=["fp32", "bf16", "fp16"])
-def test_forward_state_alias_after_graph_warmup(backend, K, state_dtype):
+@pytest.mark.filterwarnings("error:The CUDA Graph is empty")
+def test_forward_state_alias_after_graph_warmup(backend, cudnn_handle, K, state_dtype):
     """An overwrite-capable graph can bind separate buffers before binding an alias."""
     case = steep_gate(make_case("gdn2", torch.bfloat16, B=8, T=64, H=4, K=K), "spike")
     state0 = random_state(case, dtype=state_dtype)
@@ -416,8 +417,13 @@ def test_forward_state_alias_after_graph_warmup(backend, K, state_dtype):
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     captured = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(captured, stream=side):
-        graph.execute(pack, workspace)
+    original_stream = cudnn.get_stream(cudnn_handle)
+    try:
+        cudnn.set_stream(cudnn_handle, side.cuda_stream)
+        with torch.cuda.graph(captured, stream=side):
+            graph.execute(pack, workspace, handle=cudnn_handle)
+    finally:
+        cudnn.set_stream(cudnn_handle, original_stream)
     for seed in (SEED + 2, SEED + 3):
         fresh = random_state(case, dtype=state_dtype, seed=seed)
         expected_o, expected_state = run_fwd(backend, case, initial_state=fresh, output_final_state=True, batch_invariant=True)
