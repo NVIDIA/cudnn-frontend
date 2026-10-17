@@ -367,6 +367,7 @@ MMA as d=512.
 | **Decode tile** (decode + MTP; f16/bf16, dense or paged: d128 `S_q · PACK_G ≤ 128`ᵈᵗ, d256 `S_q · G` within the routed rowsᵈ) | ❌ (prefill tile) | ✅ᵈ⁶⁴ **native** (f16/bf16; an explicit cga2 runs the prefill tile) | ✅ᵈᵗ **native** | ❌ (prefill tile) | ✅ᵈ (d256 decode tile, swap-AB) | ❌ (prefill tile) | — |  —  |
 | Paged KV cache (`paged_attention_k/v_table` + padding mask)ᵖ | via the native d64 flavorᵗ⁰ | ✅ᵖ f16 + fp8 (native d64; mxfp8 d64 is unpaged) | ✅ᵖ f16 + fp8 + mxfp8 | ✅ᵖ f16 + mxfp8 (native (192, 128)) | ✅ᵖ ᵈ f16 + mxfp8 | ✅ᵖ f16 + mxfp8 (native 512; (256, 512] envelope) | ❌ |  ❌  |
 | Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`; the SM107 rows serve it, see the SM107 table) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |  ❌  |
+| Index-list sparse attention (QSA: per-query `(T, 2051)` token lists of 4-token blocks + the open tail; frontend-only, the standalone `sparse_gqa_sm100` backward adapter, no graph form) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | bf16 ✅ (SM100 / cc 10.0 only, SM103 declined; 24 Q / 2 KV heads, softmax scale 1/16, one sequence of `T <= 349525`; no batch, THD, context parallel or deterministic mode) |
 
 ᵗ⁰ **The 32-wide small tile on SM100 / SM103 (`sm100/prefill_d128_f16.py` at `d_flavor = 32`; `config_sm100.make_cfg_d32`).** The SM100 twin
 of the Rubin small tile (ᵗ in the SM107 table), landed 2026-10-13 as the first step of the small-tile port: the f16/bf16 d128 FILE at `TILE_K =
@@ -2996,6 +2997,8 @@ rows; cos > 0.999 on every live row, the padded entry's rows EXACTLY 0, block 0'
 against the declared route (template, packing, split, `epilogue_gate` False):
 
 2026-10-16: the DECODE-GRID combine form (`sm100/split_combine._combine_decode_grid_kernel`, the split-aware form rule `heuristics.decode_combine_grid_selected` and the adapter's plan-time pin in `fwd/prepared.py`) is the cc 10.7 row's: off cc 10.7 the rule answers False and the plan pins the combine module's own three-way rule (the lean group, the serial walk and its decode form, with the attention-sink fold), measured on its own line; no capability field changes.
+
+2026-10-16 (later): the cc 10.7 row's lean-grid-OVERFLOW split launches (a lean combine grid past `heuristics.DECODE_COMBINE_MAX_LEAN_BLOCKS`: the B 32 / B 128 x 24 heads serving cells) at a split of at most 4 (`heuristics.DECODE_COMBINE_LEAN_WALK_MAX_SPLIT`: the measured regime; a deeper split keeps the module's own forms) take the combine module's restored LEAN GROUP WALK (`sm100/split_combine._combine_lean_walk_kernel`, the module's former lean kernel; the rule `heuristics.decode_combine_lean_walk_selected`, the plan-time pin in `fwd/prepared.py`), measured on the Rubin performance class at 3.3-8.9 us per launch against the module's wide lean group / serial walk's 5.3-12.4 there; inside the bound, off cc 10.7 and on every quantized / packed / sink entry nothing changes; no capability field changes.
 
 The route of record (2026-10-15, the fill 2026-10-16; the default policy `single_unit`; `tile N` = the Rubin d256 decode tile at N
 columns with the whole group packed, `T64 x 2` = two token units of the 64-column tile, `PREFILL` = the paged d256 prefill tile with the

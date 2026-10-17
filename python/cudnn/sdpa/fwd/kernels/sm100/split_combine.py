@@ -45,7 +45,8 @@ launch is a sink-free, unquantized fp32-partial one whose lean geometry holds
 the lean grid holds at most ``heuristics.DECODE_COMBINE_MAX_LEAN_BLOCKS`` blocks;
 every other launch takes the three-way rule above (the decode form past G_S
 splits at S_q <= 2, the wide lean group within it, the serial form from S_q 3),
-which is also what ``DECODE_GRID_OFF`` means.  The quantized and packed entries
+which is also what ``DECODE_GRID_OFF`` means; ``DECODE_GRID_LEAN_WALK`` names the
+fifth form below.  The quantized and packed entries
 keep their own kernels.  Order statement: every reduction of every form is in a
 FIXED order (no atomics on O / LSE), so a launch is deterministic; for
 ``n_splits <= 16`` only chain 0 of the decode-grid kernel holds splits and its
@@ -64,6 +65,42 @@ carries the griddepcontrol pair under one constexpr -- the wait before its
 first global read (the partial slabs are the split tile's output), the release
 right after (the pass has no prologue to overlap) -- and the launch carries the
 programmatic-stream-serialization attribute; the same math, bitwise.
+
+The LEAN GROUP WALK (``_combine_lean_walk_kernel``), a fifth form of the lean
+fp32-partial path: the module's FORMER lean kernel, restored for the lean-grid
+OVERFLOW launches of the cc 10.7 line -- one warp per (q_row, head, batch), four
+rows per block, a lane owning four columns of every split; the LSE and partial-O
+rows of the first ``LEAN_WALK_G_S`` (4) splits are loaded up front, the rest walked
+in groups of ``LEAN_WALK_G_T`` (16) loads per memory round trip (the max extended
+group by group before any weight is formed), a clamped slot re-reading the last
+split and SELECTED out, the row accumulated in split order from +0.  So its O /
+LSE are BITWISE the serial walk's at every split count and the wide lean group's
+within that group's window (<= 16 splits); the decode form (past 16 splits at
+S_q <= 2) associates the sum differently and agrees to fp32 rounding.  It carries
+the ragged placement, the gate, the amax / scale arms and the griddepcontrol pair
+of the kernel it was, and no sink fold: ``_launch_combine`` takes it only on a
+sink-free launch (``sinks is None and q_lens is None``; a sink entry keeps the
+three-way rule under every selector value), and only where the lean geometry
+holds (``d_v % 4 == 0``, a 16-byte aligned slab: the same runtime test as the
+decode-grid kernel's), else the three-way rule -- never the decode-grid kernel.
+It is reached through ``compile_ptr(decode_grid=DECODE_GRID_LEAN_WALK)`` alone:
+the cc 10.7 adapter names it per plan where
+``heuristics.decode_combine_lean_walk_selected`` says so -- a lean grid PAST
+``heuristics.DECODE_COMBINE_MAX_LEAN_BLOCKS`` (where the decode-grid kernel is
+never eligible) at a split of at most ``LEAN_WALK_G_S``
+(``heuristics.DECODE_COMBINE_LEAN_WALK_MAX_SPLIT``: the whole split axis in the
+up-front group, one memory round trip -- the measured regime; a deeper split
+keeps the module's own forms until a measurement widens the bound), measured on
+the Rubin performance class: at B 32 / B 128 x 24
+heads (768 / 3072 lean blocks) the walk costs 3.3-3.4 / 5.9 us at split 2 where
+the wide lean group costs 5.9 / 12.4, and 4.0 / 8.9 us at S_q 4 (split 2-3) where
+the serial walk costs 5.3-5.5 / 11.7; on the small grids inside the bound the
+module's forms are the faster ones (the wide group 4.1 us against the walk's 5.6
+at B 1 x 4K x 16 splits; the decode form 5.8 / 8.1 / 6.1 against 8.4 / 14.0 / 8.5
+past 16 splits) and stay.  The Blackwell line's adapter never names the walk; the
+quantized entries drop every selector value (``compile_ptr``: their form is
+``()``, their launch rule the three-way one), so the walk's amax / scale arms are
+reachable only by a direct ``_launch_combine`` call.
 
 Gate in the combine (``compile_ptr(gate=True)``, the dense half entry only): a
 split launch of a kernel that has no epilogue-gate seams -- the d256 decode
@@ -179,10 +216,22 @@ DECODE_RED_WORDS = DECODE_RED_ACC_OFF + DECODE_CHAINS * DECODE_LANES_PER_CHAIN *
 DECODE_GRID_AUTO = 0  # the grid rule (the cc 10.7 adapters' entry): the decode-grid kernel inside the lean-grid bound, else the module's own forms
 DECODE_GRID_ON = 1  # always the decode-grid kernel where its geometry holds (tests; an explicit decode flag)
 DECODE_GRID_OFF = 2  # never the decode-grid kernel: the module's own three-way rule (compile_ptr's default; the Blackwell line's entry; tests; a kill switch)
+# Appended 2026-10-16: the LEAN GROUP WALK (the cc 10.7 adapter's entry on a lean-grid-OVERFLOW plan at a split of at most LEAN_WALK_G_S,
+# heuristics.decode_combine_lean_walk_selected): the module's former lean kernel on a sink-free fp32-partial launch whose lean geometry holds, else the
+# three-way rule; never the decode-grid kernel.
+DECODE_GRID_LEAN_WALK = 3
+# The lean group walk's two group widths (the former lean kernel's G_S / G_T).  LEAN_WALK_G_S splits' LSE and partial-O rows are loaded up front,
+# before any math; splits past them are walked in GROUPS of LEAN_WALK_G_T: every group's rows are loaded before any of its math, so a warp
+# pays one memory round trip per group instead of one per split (the one-split-per-step walk read 40 us for 64 splits at batch 1 where 2
+# splits cost 3.3 us: ~0.3 us, one DRAM round trip, per split per pass).  A slot past ``n_splits`` re-reads the last split and contributes
+# nothing, so the pass is bitwise what the one-split-per-step walk was for every split count.  LEAN_WALK_G_T is also the decode-grid
+# kernel's per-chain slot count and the wide lean group's width (DECODE_SPLITS_PER_CHAIN == G_S == 16): the bitwise window of the forms.
+LEAN_WALK_G_S = 4
+LEAN_WALK_G_T = 16
 
 
 def lean_grid_blocks(b: int, h: int, s_q: int) -> int:
-    """The lean forms' grid in blocks: ``ceil(S_q / ROWS_PER_BLOCK) x H_q x B`` (the quantity the decode-grid selection rule reads)."""
+    """The lean forms' grid in blocks: ``ceil(S_q / ROWS_PER_BLOCK) x H_q x B`` (the quantity the decode-grid and lean-walk selection rules read)."""
     return -(-int(s_q) // ROWS_PER_BLOCK) * int(h) * int(b)
 
 
@@ -1632,6 +1681,405 @@ def _combine_packed_kernel(
 _combine_packed_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
+@cute.kernel
+def _combine_lean_walk_kernel(
+    o_partial: cute.Tensor,  # [S*B, S_q, H, D] — split-major partial O
+    lse_partial: cute.Tensor,  # [S*B, H, S_q]   — split-major partial LSE
+    o_out: cute.Tensor,  # [B, S_q, H, D]
+    lse_out: Optional[cute.Tensor],  # [B, H, S_q] or None (None-specialized)
+    # 1-element fp32 amax of the RECOMBINED O.  The per-split epilogues cannot
+    # compute this: each sees only its own partial, and O is a convex
+    # combination of those, so a max over partials over-reports (~2.9x at 8
+    # splits).  The FP8 kernels therefore skip their in-kernel amax write when
+    # SPLIT_KV > 1 and leave it to this pass.  None-specialized off otherwise.
+    amax_o: Optional[cute.Tensor],
+    # 1-element fp32 output scale, present only when O is stored quantized.
+    # The split kernels leave it out of their epilogue and write UNSCALED
+    # partials; this pass applies it at the single cast, so the FP8 rounding
+    # happens once, on the recombined value.
+    scale_o: Optional[cute.Tensor],
+    n_batch: cutlass.Int32,
+    n_splits: cutlass.Int32,
+    d_v: cutlass.Int32,
+    s_q: cutlass.Int32,
+    stats_log2: cutlass.Constexpr[bool],  # write the FINAL LSE in base 2 (stats_use_log2)
+    # Ragged final rows (the decode tile's RAGGED_Q leg): (B+1,) int32 / int64 ragged
+    # offsets of Q, O and Stats in ELEMENTS and their elements-per-token
+    # divisors.  The partials stay dense; only the final O / LSE rows move to
+    # ``offset[b] / div + q_row`` on the packed [1, T, ...] outputs, and a row
+    # at or past this sequence's Q length (offset[b+1] - offset[b]) / div --
+    # every row of a zero-length sequence -- is not written at all.  None
+    # (None-specialized) keeps the dense (batch, q_row) placement.
+    ragged_q: Optional[cute.Tensor] = None,
+    ragged_o: Optional[cute.Tensor] = None,
+    ragged_lse: Optional[cute.Tensor] = None,
+    ragged_q_div: cutlass.Int64 = 1,
+    ragged_o_div: cutlass.Int64 = 1,
+    ragged_lse_div: cutlass.Int64 = 1,
+    # Packed token capacities of the final O and Stats buffers (ragged only): a
+    # row whose ragged placement lands at or past them is not written, so a
+    # short buffer or a bad offset can never store outside the caller's bytes.
+    ragged_o_cap: cutlass.Int32 = 0,
+    ragged_lse_cap: cutlass.Int32 = 0,
+    # The gate G of the graph's ``mul(O_v, sigmoid(G))`` tail, [B, S_q, H, D] in
+    # the caller's strides (the dense placement only), applied to the fp32 merged
+    # value before the single cast -- see the module docstring.  None
+    # (None-specialized) is the plain reduction; its traced code is unchanged.
+    gate: Optional[cute.Tensor] = None,
+    # Programmatic dependent launch (the launch attribute is set by _launch_combine under the same flag): the partial slabs are
+    # the split tile's output, so nothing is read above the wait; the pass has no prologue to overlap, so the dependent grid (the
+    # out projection in the gated block) is released right after it and stages its own while this pass runs.
+    use_pdl: cutlass.Constexpr[bool] = False,
+) -> None:
+    """The LEAN GROUP WALK: the module's former lean kernel, restored as the fifth form for the lean-grid-overflow launches of the cc 10.7
+    line (the module docstring).  One warp per (q_row, head, batch), ROWS_PER_BLOCK rows per block, a lane owning four columns of every
+    split: LEAN_WALK_G_S splits loaded up front, the rest in groups of LEAN_WALK_G_T per memory round trip, the row accumulated in split
+    order from +0 after a full max pass (bitwise the serial walk at every split count, the wide lean group within 16 splits).  Precondition,
+    the launch rule's (``_launch_combine`` under DECODE_GRID_LEAN_WALK): fp32 partials, ``d_v % 4 == 0``, a 16-byte aligned slab -- the
+    kernel it was tested that at runtime and served half partials on an element path; that path is develop's ``_combine_kernel``'s now
+    and is not duplicated here.  No sink fold (the selector takes a sink-free launch only); no CTA barrier; the griddepcontrol pair sits
+    before the first global read."""
+    if cutlass.const_expr(use_pdl):
+        wait_on_dependent_grids()
+        launch_dependent_grids()
+    tidx, _, _ = cute.arch.thread_idx()
+    lane = tidx % cutlass.Int32(32)
+    q_row = cute.arch.block_idx()[0] * cutlass.Int32(ROWS_PER_BLOCK) + tidx // cutlass.Int32(32)
+    head = cute.arch.block_idx()[1]
+    batch = cute.arch.block_idx()[2]
+
+    # A warp past S_q (last block only) has no row; there is no block-level
+    # barrier below, so it simply falls through. Everything inside is
+    # warp-uniform except the per-lane column guard.
+    if q_row < s_q:
+        oo = cutlass.make_array_view(o_out)
+
+        # Where the recombined row lands: dense (batch, q_row), or the ragged
+        # placement on the packed outputs (batch coord 0).
+        o_batch = batch
+        o_tok = q_row
+        lse_batch = batch
+        lse_tok = q_row
+        row_live = cutlass.Int32(1) == cutlass.Int32(1)
+        lse_live = row_live
+        if cutlass.const_expr(ragged_q is not None):
+            # Offsets are int32 or int64 elements; divide in 64 bits (a large packed
+            # buffer's element offset can exceed 2^31) and keep the token index in 32.
+            # Bounds are checked in 64 bits BEFORE narrowing: a negative or wrapped
+            # offset must fail the capacity test, not alias a valid token after the cast.
+            rq = cutlass.make_array_view(ragged_q)
+            q_base = cutlass.Int64(rq[batch]) // cutlass.Int64(ragged_q_div)
+            q_len64 = cutlass.Int64(rq[batch + cutlass.Int32(1)]) // cutlass.Int64(ragged_q_div) - q_base
+            in_seq = cutlass.Int64(q_row) < q_len64
+            o_batch = cutlass.Int32(0)
+            o_tok64 = cutlass.Int64(cutlass.make_array_view(ragged_o)[batch]) // cutlass.Int64(ragged_o_div) + cutlass.Int64(q_row)
+            row_live = in_seq & (o_tok64 >= cutlass.Int64(0)) & (o_tok64 < cutlass.Int64(ragged_o_cap))
+            o_tok = cutlass.Int32(o_tok64)
+            lse_live = row_live
+            if cutlass.const_expr(ragged_lse is not None):
+                lse_batch = cutlass.Int32(0)
+                lse_tok64 = cutlass.Int64(cutlass.make_array_view(ragged_lse)[batch]) // cutlass.Int64(ragged_lse_div) + cutlass.Int64(q_row)
+                lse_live = in_seq & (lse_tok64 >= cutlass.Int64(0)) & (lse_tok64 < cutlass.Int64(ragged_lse_cap))
+                lse_tok = cutlass.Int32(lse_tok64)
+
+        neg_inf = cutlass.Float32(NEG_INF)
+        zero = cutlass.Float32(0.0)
+        # Pre-declared: assigned per 128-column chunk inside the loop below; the LSE tail reads them after the join.
+        amax_local = cutlass.Float32(0.0)
+        m_safe = zero
+        den = zero
+        all_dead = zero > zero
+        o_base = o_partial.iterator.toint()
+        # fp32 partials with 16-byte rows: the lean path.  Lane l owns columns 4l..4l+3 of
+        # every split; each (b, h, q_row) base offset is computed once and the per-split
+        # address is a single 64-bit add (the split axis is the leading, batch-stacked mode).
+        lse_base = lse_partial.iterator.toint() + cutlass.Int64(cute.crd2idx((batch, head, q_row), lse_partial.layout)) * 4
+        lse_step = cutlass.Int64(lse_partial.stride[0]) * cutlass.Int64(n_batch) * 4
+        o_step = cutlass.Int64(o_partial.stride[0]) * cutlass.Int64(n_batch) * 4
+        s_last = n_splits - cutlass.Int32(1)
+        out_base = o_out.iterator.toint()
+        st_ok = zero > zero
+        if cutlass.const_expr(o_out.element_type in (cutlass.Float16, cutlass.BFloat16)):
+            _st_strides = cutlass.Int64(o_out.stride[0]) | cutlass.Int64(o_out.stride[1]) | cutlass.Int64(o_out.stride[2])
+            st_ok = (
+                ((out_base & cutlass.Int64(7)) == cutlass.Int64(0))
+                & (cutlass.Int64(o_out.stride[3]) == cutlass.Int64(1))
+                & ((_st_strides & cutlass.Int64(3)) == cutlass.Int64(0))
+            )
+        q_scale = cutlass.Float32(1.0)
+        if cutlass.const_expr(scale_o is not None):
+            q_scale = cutlass.Float32(cutlass.make_array_view(scale_o)[0])
+        # Gate in the combine: the 0.5 handed to the packed multiply must be opaque (a constant
+        # float into inline_ptx ICEs libNVVM).  Hoisted once per row, like the fused kernels do
+        # per tile; traced only on the gated entry, so the plain entries' code is unchanged.
+        if cutlass.const_expr(gate is not None):
+            gate_half = opaque_f32_zero() + cutlass.Float32(0.5)
+        for cbase in cutlass.range(0, d_v, 128, unroll=1):
+            d0 = cbase + lane * cutlass.Int32(4)
+            if d0 < d_v:
+                o_row_base = o_base + cutlass.Int64(cute.crd2idx((batch, q_row, head, d0), o_partial.layout)) * 4
+                # Every load of the row goes out first -- the LSE of the first LEAN_WALK_G_S splits and their partial-O
+                # rows (a clamped split index re-reads the last split for slots past n_splits; those get
+                # weight 0) -- so a warp pays ONE memory round trip instead of one per pass.
+                lse_v = []
+                o_v = []
+                for s in cutlass.range_constexpr(LEAN_WALK_G_S):
+                    s_eff64 = cutlass.Int64(cute.math.min(cutlass.Int32(s), s_last))
+                    lse_v.append(_ld_global_f32(lse_base + s_eff64 * lse_step))
+                    o_v.append(ld_global_v4(o_row_base + s_eff64 * o_step, cutlass.Float32))
+                m = neg_inf
+                for s in cutlass.range_constexpr(LEAN_WALK_G_S):
+                    m = cute.math.max(m, lse_v[s])
+                # Splits past LEAN_WALK_G_S extend the max before any weight is formed: LEAN_WALK_G_T LSEs per
+                # round trip (a clamped slot re-reads the last split; max is idempotent).
+                if n_splits > cutlass.Int32(LEAN_WALK_G_S):
+                    for s0 in cutlass.range(LEAN_WALK_G_S, n_splits, LEAN_WALK_G_T, unroll=1):
+                        lse_t = []
+                        for j in cutlass.range_constexpr(LEAN_WALK_G_T):
+                            s_eff64 = cutlass.Int64(cute.math.min(s0 + cutlass.Int32(j), s_last))
+                            lse_t.append(_ld_global_f32(lse_base + s_eff64 * lse_step))
+                        for j in cutlass.range_constexpr(LEAN_WALK_G_T):
+                            m = cute.math.max(m, lse_t[j])
+                # All splits dead (every row fully masked): emit O := 0 / lse := -inf rather than
+                # exp(-inf - -inf) == NaN.  m_safe only feeds the exponentials.
+                all_dead = m == neg_inf
+                m_safe = cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), m.ir_value()))
+                acc0 = zero
+                acc1 = zero
+                acc2 = zero
+                acc3 = zero
+                den = zero
+                for s in cutlass.range_constexpr(LEAN_WALK_G_S):
+                    lse_s = lse_v[s]
+                    v = o_v[s]
+                    live = (lse_s > neg_inf) & (cutlass.Int32(s) < n_splits)
+                    e = cute.math.exp(lse_s - m_safe, fastmath=True)
+                    w = cutlass.Float32(arith.select(live.ir_value(), e.ir_value(), zero.ir_value()))
+                    v0 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[0]).ir_value(), zero.ir_value()))
+                    v1 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[1]).ir_value(), zero.ir_value()))
+                    v2 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[2]).ir_value(), zero.ir_value()))
+                    v3 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[3]).ir_value(), zero.ir_value()))
+                    den = den + w
+                    acc0 = acc0 + w * v0
+                    acc1 = acc1 + w * v1
+                    acc2 = acc2 + w * v2
+                    acc3 = acc3 + w * v3
+                if n_splits > cutlass.Int32(LEAN_WALK_G_S):
+                    # LEAN_WALK_G_T splits per round trip: every LSE and partial-O row of the group
+                    # is loaded first, then the group is accumulated in split order.  A
+                    # slot past n_splits (the last group only) re-reads the last split
+                    # and is SELECTED out of the sums, so den / acc hold exactly what the
+                    # one-split-per-step walk left in them.
+                    for s0 in cutlass.range(LEAN_WALK_G_S, n_splits, LEAN_WALK_G_T, unroll=1):
+                        lse_t = []
+                        o_t = []
+                        for j in cutlass.range_constexpr(LEAN_WALK_G_T):
+                            s_eff64 = cutlass.Int64(cute.math.min(s0 + cutlass.Int32(j), s_last))
+                            lse_t.append(_ld_global_f32(lse_base + s_eff64 * lse_step))
+                            o_t.append(ld_global_v4(o_row_base + s_eff64 * o_step, cutlass.Float32))
+                        for j in cutlass.range_constexpr(LEAN_WALK_G_T):
+                            lse_s = lse_t[j]
+                            v = o_t[j]
+                            in_range = (s0 + cutlass.Int32(j)) < n_splits
+                            live = (lse_s > neg_inf) & in_range
+                            e = cute.math.exp(lse_s - m_safe, fastmath=True)
+                            w = cutlass.Float32(arith.select(live.ir_value(), e.ir_value(), zero.ir_value()))
+                            v0 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[0]).ir_value(), zero.ir_value()))
+                            v1 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[1]).ir_value(), zero.ir_value()))
+                            v2 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[2]).ir_value(), zero.ir_value()))
+                            v3 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[3]).ir_value(), zero.ir_value()))
+                            den = cutlass.Float32(arith.select(in_range.ir_value(), (den + w).ir_value(), den.ir_value()))
+                            acc0 = cutlass.Float32(arith.select(in_range.ir_value(), (acc0 + w * v0).ir_value(), acc0.ir_value()))
+                            acc1 = cutlass.Float32(arith.select(in_range.ir_value(), (acc1 + w * v1).ir_value(), acc1.ir_value()))
+                            acc2 = cutlass.Float32(arith.select(in_range.ir_value(), (acc2 + w * v2).ir_value(), acc2.ir_value()))
+                            acc3 = cutlass.Float32(arith.select(in_range.ir_value(), (acc3 + w * v3).ir_value(), acc3.ir_value()))
+                inv_den = cutlass.Float32(1.0) / cute.math.max(den, cutlass.Float32(1e-30))
+                inv_den = cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), inv_den.ir_value()))
+                outs = (acc0 * inv_den, acc1 * inv_den, acc2 * inv_den, acc3 * inv_den)
+                if cutlass.const_expr(gate is not None):
+                    # The gated prefill kernels' epilogue arithmetic, verbatim
+                    # (_common_blackwell.gate_epilogue_pairs): per pair one
+                    # FMUL2 (g / 2), two MUFU.TANH, one FFMA2 (h * t + h), on the
+                    # fp32 merged value; then the dead-row SELECT per element,
+                    # AFTER the fma -- a dead row is exactly 0 whatever G holds
+                    # (a NaN gate times the zero h would be NaN; a select is not).
+                    # sigmoid's 0.5 folds into the scale (``h = acc * (inv_den / 2)``:
+                    # exact, a power-of-two scaling of the plain output).
+                    inv_den_half = inv_den * cutlass.Float32(0.5)
+                    gv = cutlass.make_array_view(gate)
+                    g0 = cutlass.Float32(gv[batch, q_row, head, d0])
+                    g1 = zero
+                    g2 = zero
+                    g3 = zero
+                    if d0 + cutlass.Int32(1) < d_v:
+                        g1 = cutlass.Float32(gv[batch, q_row, head, d0 + cutlass.Int32(1)])
+                    if d0 + cutlass.Int32(2) < d_v:
+                        g2 = cutlass.Float32(gv[batch, q_row, head, d0 + cutlass.Int32(2)])
+                    if d0 + cutlass.Int32(3) < d_v:
+                        g3 = cutlass.Float32(gv[batch, q_row, head, d0 + cutlass.Int32(3)])
+                    h0 = acc0 * inv_den_half
+                    h1 = acc1 * inv_den_half
+                    h2 = acc2 * inv_den_half
+                    h3 = acc3 * inv_den_half
+                    s0, s1 = fmul2(g0, g1, gate_half, gate_half)
+                    s2, s3 = fmul2(g2, g3, gate_half, gate_half)
+                    t0 = cute.math.tanh(s0, approx=True)
+                    t1 = cute.math.tanh(s1, approx=True)
+                    t2 = cute.math.tanh(s2, approx=True)
+                    t3 = cute.math.tanh(s3, approx=True)
+                    y0, y1 = ffma2(t0, t1, h0, h1, h0, h1)
+                    y2, y3 = ffma2(t2, t3, h2, h3, h2, h3)
+                    outs = (
+                        cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y0.ir_value())),
+                        cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y1.ir_value())),
+                        cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y2.ir_value())),
+                        cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y3.ir_value())),
+                    )
+                vals = []
+                for i in cutlass.range_constexpr(4):
+                    o_val = outs[i]
+                    if cutlass.const_expr(amax_o is not None):
+                        # Measured before scale_o, so this is already the pre-quant
+                        # amax and needs no post-hoc divide.
+                        amax_local = cute.math.max(amax_local, cute.math.max(o_val, -o_val))
+                    if cutlass.const_expr(scale_o is not None):
+                        o_val = o_val * q_scale
+                    vals.append(o_val)
+                if cutlass.const_expr(o_out.element_type in (cutlass.Float16, cutlass.BFloat16)):
+                    if st_ok & row_live & (d0 + cutlass.Int32(3) < d_v):
+                        _cvt = "bf16x2" if cutlass.const_expr(o_out.element_type == cutlass.BFloat16) else "f16x2"
+                        p01, p23 = nvvm.inline_ptx(
+                            f"cvt.rn.{_cvt}.f32 $0, $3, $2;\ncvt.rn.{_cvt}.f32 $1, $5, $4;",
+                            write_only_types=[cutlass.Int32, cutlass.Int32],
+                            read_only_args=[vals[0], vals[1], vals[2], vals[3]],
+                        )
+                        o_idx = cute.crd2idx((o_batch, o_tok, head, d0), o_out.layout)
+                        st_global_v2(out_base + cutlass.Int64(o_idx) * 2, (p01, p23), cutlass.Int32)
+                    else:
+                        for i in cutlass.range_constexpr(4):
+                            if row_live & (d0 + cutlass.Int32(i) < d_v):
+                                oo[o_batch, o_tok, head, d0 + cutlass.Int32(i)] = vals[i].to(o_out.element_type)
+                else:
+                    for i in cutlass.range_constexpr(4):
+                        # Index all modes: ArrayView's row slice is a pointer and drops
+                        # the final mode's stride, so a subsequent [d0] would assume
+                        # contiguous D.
+                        if row_live & (d0 + cutlass.Int32(i) < d_v):
+                            oo[o_batch, o_tok, head, d0 + cutlass.Int32(i)] = vals[i].to(o_out.element_type)
+        # amax: reduce across the warp, then ONE atomic per warp.  The value is
+        # non-negative, so its fp32 bit pattern orders the same as the float and
+        # an integer atomicMax is exact -- the same trick the kernels' own
+        # epilogues use.
+        if cutlass.const_expr(amax_o is not None):
+            for off in cutlass.range_constexpr(5):
+                amax_local = cute.math.max(amax_local, cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, amax_local, 16 >> off, 31, kind=nvvm.Shfl.BFLY)))
+            if lane == cutlass.Int32(0):
+                _amax_ptr = Pointer(amax_o.iterator.raw_ptr(), dtype=cutlass.Int32)
+                nvvm.atomicrmw(nvvm.AtomicOp.MAX, _amax_ptr, amax_local.bitcast(cutlass.Int32))
+
+        # --- the recombined LSE (only when the caller asked for Stats) ---
+        if cutlass.const_expr(lse_out is not None):
+            if (lane == cutlass.Int32(0)) & lse_live:
+                lo = cutlass.make_array_view(lse_out)
+                lse_val = m_safe + cute.math.log(cute.math.max(den, cutlass.Float32(1e-30)), fastmath=True)
+                lse_val = cutlass.Float32(arith.select(all_dead.ir_value(), cutlass.Float32(NEG_INF).ir_value(), lse_val.ir_value()))
+                # Base-2 Stats (stats_use_log2): the partials stay natural (the
+                # merge above needs them); only the final value converts.
+                if cutlass.const_expr(stats_log2):
+                    lse_val = lse_val * cutlass.Float32(1.4426950408889634)
+                lo[lse_batch, head, lse_tok] = lse_val
+
+
+_combine_lean_walk_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
+@cute.jit
+def _launch_own_forms(
+    o_partial: cute.Tensor,
+    lse_partial: cute.Tensor,
+    o_out: cute.Tensor,
+    lse_out: Optional[cute.Tensor],
+    amax_o: Optional[cute.Tensor],
+    scale_o: Optional[cute.Tensor],
+    problem_size: Tuple[int, int, int, int],
+    n_splits: cutlass.Int32,
+    stats_log2: cutlass.Constexpr[bool],
+    ragged_q: Optional[cute.Tensor],
+    ragged_o: Optional[cute.Tensor],
+    ragged_lse: Optional[cute.Tensor],
+    ragged_divs: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    ragged_caps: Tuple[cutlass.Int32, cutlass.Int32],
+    gate: Optional[cute.Tensor],
+    stream: _cuda_driver.CUstream = None,
+    sinks: Optional[cute.Tensor] = None,
+    q_lens: Optional[cute.Tensor] = None,
+    use_pdl: cutlass.Constexpr[bool] = False,
+) -> None:
+    """The module's own THREE-WAY rule -- what ``DECODE_GRID_OFF`` means, and what every launch that takes neither the
+    decode-grid kernel nor the lean group walk runs: one of three kernels, chosen per launch from the runtime geometry
+    (the comment below).  The positional frame is ``_launch_combine``'s without its form selector."""
+    B, H, SQ, D = problem_size
+    args = (
+        o_partial,
+        lse_partial,
+        o_out,
+        lse_out,
+        amax_o,
+        scale_o,
+        sinks,
+        cutlass.Int32(B),
+        n_splits,
+        cutlass.Int32(D),
+        cutlass.Int32(SQ),
+        stats_log2,
+        ragged_q,
+        ragged_o,
+        ragged_lse,
+        cutlass.Int64(ragged_divs[0]),
+        cutlass.Int64(ragged_divs[1]),
+        cutlass.Int64(ragged_divs[2]),
+        cutlass.Int32(ragged_caps[0]),
+        cutlass.Int32(ragged_caps[1]),
+        gate,
+        q_lens,
+    )
+    # Three kernels, chosen per launch: decode rows (S_q <= 2, where the block has
+    # at least two warps per row) with more splits than the lean form's up-front
+    # group hand the block's spare warps to the split axis of the same row
+    # (_combine_decode_kernel: B300 128 splits 32.5 -> 12.6 us, 32 splits 10.5
+    # -> 5.8); S_q = 3 and up keep the one-warp-per-row form, whose lower
+    # register footprint matters where the combine is a throughput problem
+    # (b=128 x 16 rows x 2 splits: 41 us against 61 for the decode form) and
+    # which beats the single-warp lane-strided form at S_q = 3.  A decode row
+    # whose whole split axis fits the lean group (n_splits <= G_S) also takes
+    # the one-warp-per-row form: every load goes out at once, one memory round
+    # trip, where the decode form pays three dependent ones (B300, d64 / d128
+    # S_q = 1, 2-8 splits: 3.4-4.4 us -> 2.1-2.9 us).
+    if cutlass.Int32(SQ) <= cutlass.Int32(ROWS_PER_BLOCK // 2):
+        if n_splits > cutlass.Int32(G_S):
+            _combine_decode_kernel(*args, use_pdl=use_pdl).launch(
+                grid=(1, H, B),
+                block=[THREADS, 1, 1],
+                smem=SMEM_BYTES,
+                stream=stream,
+                use_pdl=use_pdl,
+            )
+        else:
+            _combine_kernel(*args, lean_wide=True, use_pdl=use_pdl).launch(
+                grid=((SQ + ROWS_PER_BLOCK - 1) // ROWS_PER_BLOCK, H, B),
+                block=[THREADS, 1, 1],
+                stream=stream,
+                use_pdl=use_pdl,
+            )
+    else:
+        _combine_kernel(*args, use_pdl=use_pdl).launch(
+            grid=((SQ + ROWS_PER_BLOCK - 1) // ROWS_PER_BLOCK, H, B),
+            block=[THREADS, 1, 1],
+            stream=stream,
+            use_pdl=use_pdl,
+        )
+
+
 @cute.jit
 def _launch_combine(
     o_partial: cute.Tensor,
@@ -1669,115 +2117,149 @@ def _launch_combine(
     (``d_v % 4 == 0``, a 16-byte aligned slab; a runtime test, like the lean
     path's own) and the lean grid holds at most
     ``heuristics.DECODE_COMBINE_MAX_LEAN_BLOCKS`` blocks; ``DECODE_GRID_ON``
-    drops the grid bound; ``DECODE_GRID_OFF`` never launches it.  Every other
-    launch -- a sink, an amax or an output scale, half partials, an unaligned
-    slab, a grid past the bound, or OFF -- takes the module's own three-way
-    rule below."""
+    drops the grid bound; ``DECODE_GRID_OFF`` never launches it;
+    ``DECODE_GRID_LEAN_WALK`` (appended) launches the LEAN GROUP WALK
+    (``_combine_lean_walk_kernel``) when the launch is a sink-free fp32-partial
+    one whose lean geometry holds -- an amax or an output scale included (the
+    kernel's own arms; ``compile_ptr``'s quantized entries name no form, so only
+    a direct call reaches them) -- and never the decode-grid kernel.  Every
+    other launch takes the module's own three-way rule (``_launch_own_forms``):
+    under AUTO / ON / OFF a sink, an amax or an output scale, half partials, an
+    unaligned slab, a grid past the bound (AUTO) or OFF itself; under LEAN_WALK
+    a sink, half partials or an unaligned slab."""
     B, H, SQ, D = problem_size
-    # The decode-grid kernel's geometry test is the lean path's own: lane l reads columns 4l..4l+3 of the compact fp32 partial
-    # rows as one 16-byte load when d_v % 4 == 0 and the slab is 16-byte aligned; any other d_v / base (legal through this
-    # runtime-shape entry) takes the module's forms, whose bounded element loads and stores serve it.
-    use_decode_grid = cutlass.Int32(0) == cutlass.Int32(1)
-    if cutlass.const_expr(
-        decode_grid != DECODE_GRID_OFF and o_partial.element_type == cutlass.Float32 and amax_o is None and scale_o is None and sinks is None and q_lens is None
-    ):
+    if cutlass.const_expr(decode_grid == DECODE_GRID_LEAN_WALK and o_partial.element_type == cutlass.Float32 and sinks is None and q_lens is None):
+        # The LEAN GROUP WALK entry (the cc 10.7 adapter's on a lean-grid-overflow plan): the walk where the lean geometry holds -- the
+        # same runtime test as the decode-grid kernel's and the lean path's own -- else the module's own three-way rule.  Never the
+        # decode-grid kernel: a LEAN_WALK entry with fp32 sink-free partials reaches this branch only, and one with half partials or
+        # a sink fails the fp32 / sink-free conjuncts of the branch below.  The walk's amax / scale arms are its own (the kernel it
+        # was served the quantized entries); compile_ptr's quantized entry names no form, so they are reached by a direct call only.
         d32 = cutlass.Int32(D)
         o_base = o_partial.iterator.toint()
         lean_ok = ((d32 & cutlass.Int32(3)) == cutlass.Int32(0)) & ((o_base & cutlass.Int64(15)) == cutlass.Int64(0))
-        if cutlass.const_expr(decode_grid == DECODE_GRID_ON):
-            use_decode_grid = lean_ok
-        else:
-            lean_blocks = ((cutlass.Int32(SQ) + cutlass.Int32(ROWS_PER_BLOCK - 1)) // cutlass.Int32(ROWS_PER_BLOCK)) * cutlass.Int32(H) * cutlass.Int32(B)
-            use_decode_grid = lean_ok & (lean_blocks <= cutlass.Int32(_DECODE_COMBINE_MAX_LEAN_BLOCKS))
-    if use_decode_grid:
-        n_chunks = (cutlass.Int32(D) + cutlass.Int32(DECODE_CHUNK_COLS - 1)) // cutlass.Int32(DECODE_CHUNK_COLS)
-        _combine_decode_grid_kernel(
-            o_partial,
-            lse_partial,
-            o_out,
-            lse_out,
-            amax_o,
-            scale_o,
-            cutlass.Int32(B),
-            n_splits,
-            cutlass.Int32(D),
-            n_chunks,
-            stats_log2,
-            ragged_q,
-            ragged_o,
-            ragged_lse,
-            cutlass.Int64(ragged_divs[0]),
-            cutlass.Int64(ragged_divs[1]),
-            cutlass.Int64(ragged_divs[2]),
-            cutlass.Int32(ragged_caps[0]),
-            cutlass.Int32(ragged_caps[1]),
-            gate,
-            use_pdl,
-        ).launch(
-            grid=(cutlass.Int32(SQ) * n_chunks, H, B),
-            block=[DECODE_THREADS, 1, 1],
-            stream=stream,
-            use_pdl=use_pdl,
-        )
-    else:
-        args = (
-            o_partial,
-            lse_partial,
-            o_out,
-            lse_out,
-            amax_o,
-            scale_o,
-            sinks,
-            cutlass.Int32(B),
-            n_splits,
-            cutlass.Int32(D),
-            cutlass.Int32(SQ),
-            stats_log2,
-            ragged_q,
-            ragged_o,
-            ragged_lse,
-            cutlass.Int64(ragged_divs[0]),
-            cutlass.Int64(ragged_divs[1]),
-            cutlass.Int64(ragged_divs[2]),
-            cutlass.Int32(ragged_caps[0]),
-            cutlass.Int32(ragged_caps[1]),
-            gate,
-            q_lens,
-        )
-        # Three kernels, chosen per launch: decode rows (S_q <= 2, where the block has
-        # at least two warps per row) with more splits than the lean form's up-front
-        # group hand the block's spare warps to the split axis of the same row
-        # (_combine_decode_kernel: B300 128 splits 32.5 -> 12.6 us, 32 splits 10.5
-        # -> 5.8); S_q = 3 and up keep the one-warp-per-row form, whose lower
-        # register footprint matters where the combine is a throughput problem
-        # (b=128 x 16 rows x 2 splits: 41 us against 61 for the decode form) and
-        # which beats the single-warp lane-strided form at S_q = 3.  A decode row
-        # whose whole split axis fits the lean group (n_splits <= G_S) also takes
-        # the one-warp-per-row form: every load goes out at once, one memory round
-        # trip, where the decode form pays three dependent ones (B300, d64 / d128
-        # S_q = 1, 2-8 splits: 3.4-4.4 us -> 2.1-2.9 us).
-        if cutlass.Int32(SQ) <= cutlass.Int32(ROWS_PER_BLOCK // 2):
-            if n_splits > cutlass.Int32(G_S):
-                _combine_decode_kernel(*args, use_pdl=use_pdl).launch(
-                    grid=(1, H, B),
-                    block=[THREADS, 1, 1],
-                    smem=SMEM_BYTES,
-                    stream=stream,
-                    use_pdl=use_pdl,
-                )
-            else:
-                _combine_kernel(*args, lean_wide=True, use_pdl=use_pdl).launch(
-                    grid=((SQ + ROWS_PER_BLOCK - 1) // ROWS_PER_BLOCK, H, B),
-                    block=[THREADS, 1, 1],
-                    stream=stream,
-                    use_pdl=use_pdl,
-                )
-        else:
-            _combine_kernel(*args, use_pdl=use_pdl).launch(
+        if lean_ok:
+            _combine_lean_walk_kernel(
+                o_partial,
+                lse_partial,
+                o_out,
+                lse_out,
+                amax_o,
+                scale_o,
+                cutlass.Int32(B),
+                n_splits,
+                cutlass.Int32(D),
+                cutlass.Int32(SQ),
+                stats_log2,
+                ragged_q,
+                ragged_o,
+                ragged_lse,
+                cutlass.Int64(ragged_divs[0]),
+                cutlass.Int64(ragged_divs[1]),
+                cutlass.Int64(ragged_divs[2]),
+                cutlass.Int32(ragged_caps[0]),
+                cutlass.Int32(ragged_caps[1]),
+                gate,
+                use_pdl,
+            ).launch(
                 grid=((SQ + ROWS_PER_BLOCK - 1) // ROWS_PER_BLOCK, H, B),
                 block=[THREADS, 1, 1],
                 stream=stream,
                 use_pdl=use_pdl,
+            )
+        else:
+            _launch_own_forms(
+                o_partial,
+                lse_partial,
+                o_out,
+                lse_out,
+                amax_o,
+                scale_o,
+                problem_size,
+                n_splits,
+                stats_log2,
+                ragged_q,
+                ragged_o,
+                ragged_lse,
+                ragged_divs,
+                ragged_caps,
+                gate,
+                stream,
+                sinks,
+                q_lens,
+                use_pdl,
+            )
+    else:
+        # The decode-grid kernel's geometry test is the lean path's own: lane l reads columns 4l..4l+3 of the compact fp32 partial
+        # rows as one 16-byte load when d_v % 4 == 0 and the slab is 16-byte aligned; any other d_v / base (legal through this
+        # runtime-shape entry) takes the module's forms, whose bounded element loads and stores serve it.
+        use_decode_grid = cutlass.Int32(0) == cutlass.Int32(1)
+        if cutlass.const_expr(
+            decode_grid != DECODE_GRID_OFF
+            and o_partial.element_type == cutlass.Float32
+            and amax_o is None
+            and scale_o is None
+            and sinks is None
+            and q_lens is None
+        ):
+            d32 = cutlass.Int32(D)
+            o_base = o_partial.iterator.toint()
+            lean_ok = ((d32 & cutlass.Int32(3)) == cutlass.Int32(0)) & ((o_base & cutlass.Int64(15)) == cutlass.Int64(0))
+            if cutlass.const_expr(decode_grid == DECODE_GRID_ON):
+                use_decode_grid = lean_ok
+            else:
+                lean_blocks = ((cutlass.Int32(SQ) + cutlass.Int32(ROWS_PER_BLOCK - 1)) // cutlass.Int32(ROWS_PER_BLOCK)) * cutlass.Int32(H) * cutlass.Int32(B)
+                use_decode_grid = lean_ok & (lean_blocks <= cutlass.Int32(_DECODE_COMBINE_MAX_LEAN_BLOCKS))
+        if use_decode_grid:
+            n_chunks = (cutlass.Int32(D) + cutlass.Int32(DECODE_CHUNK_COLS - 1)) // cutlass.Int32(DECODE_CHUNK_COLS)
+            _combine_decode_grid_kernel(
+                o_partial,
+                lse_partial,
+                o_out,
+                lse_out,
+                amax_o,
+                scale_o,
+                cutlass.Int32(B),
+                n_splits,
+                cutlass.Int32(D),
+                n_chunks,
+                stats_log2,
+                ragged_q,
+                ragged_o,
+                ragged_lse,
+                cutlass.Int64(ragged_divs[0]),
+                cutlass.Int64(ragged_divs[1]),
+                cutlass.Int64(ragged_divs[2]),
+                cutlass.Int32(ragged_caps[0]),
+                cutlass.Int32(ragged_caps[1]),
+                gate,
+                use_pdl,
+            ).launch(
+                grid=(cutlass.Int32(SQ) * n_chunks, H, B),
+                block=[DECODE_THREADS, 1, 1],
+                stream=stream,
+                use_pdl=use_pdl,
+            )
+        else:
+            _launch_own_forms(
+                o_partial,
+                lse_partial,
+                o_out,
+                lse_out,
+                amax_o,
+                scale_o,
+                problem_size,
+                n_splits,
+                stats_log2,
+                ragged_q,
+                ragged_o,
+                ragged_lse,
+                ragged_divs,
+                ragged_caps,
+                gate,
+                stream,
+                sinks,
+                q_lens,
+                use_pdl,
             )
 
 
@@ -2238,8 +2720,13 @@ def compile_ptr(
     runtime geometry), else the module's own forms; ``DECODE_GRID_ON`` forces the
     decode-grid kernel where its geometry holds, ``DECODE_GRID_OFF`` the module's
     own three-way rule (tests, an explicit decode flag, a kill switch; the sink
-    entries take the module's own forms under every value).  The quantized and
-    packed entries ignore it (always their own kernel).
+    entries take the module's own forms under every value); ``DECODE_GRID_LEAN_WALK``
+    (appended) = the module's LEAN GROUP WALK (``_combine_lean_walk_kernel``) on a
+    sink-free fp32-partial launch whose lean geometry holds, else the three-way
+    rule, never the decode-grid kernel -- the cc 10.7 adapter names it on a
+    lean-grid-overflow plan at a split of at most ``LEAN_WALK_G_S``
+    (``heuristics.decode_combine_lean_walk_selected``).
+    The quantized and packed entries ignore every value (always their own kernel).
     ``use_pdl=True`` (appended; in the key; the sink-free dense half entries
     ``_host_ptr`` / ``_host_ptr_gated`` only) traces the programmatic-dependent-launch
     form of the same reduction: the launch attribute plus every form's
@@ -2273,8 +2760,8 @@ def compile_ptr(
         raise ValueError("has_q_lens is a sink specialization: the Q lengths only decide which rows fold the sink")
     if has_q_lens and (ragged or packed):
         raise ValueError("has_q_lens serves the dense sink entry (the ragged and packed placements have no padded rows)")
-    if decode_grid not in (DECODE_GRID_AUTO, DECODE_GRID_ON, DECODE_GRID_OFF):
-        raise ValueError("decode_grid must be DECODE_GRID_AUTO, DECODE_GRID_ON or DECODE_GRID_OFF")
+    if decode_grid not in (DECODE_GRID_AUTO, DECODE_GRID_ON, DECODE_GRID_OFF, DECODE_GRID_LEAN_WALK):
+        raise ValueError("decode_grid must be DECODE_GRID_AUTO, DECODE_GRID_ON, DECODE_GRID_OFF or DECODE_GRID_LEAN_WALK")
     if use_pdl and (packed or quantized or ragged):
         raise ValueError("use_pdl=True is served by the dense half entries only (no packed partials, no quantized O, no ragged placement)")
     if use_pdl and has_sink:

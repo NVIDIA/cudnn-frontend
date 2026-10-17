@@ -1149,6 +1149,10 @@ def _validate_cfg_d256(cfg: CfgD256) -> None:
         (cfg.Q_SWZ_BYTES in (64, 128) and cfg.K_SWZ_BYTES in (64, 128), "d256: Q/K swizzle must be 64/128B"),
         (cfg.V_SWZ_BYTES in (32, 64, 128) and cfg.O_SWZ_BYTES in (64, 128), "d256: V/O swizzle out of range"),
         (cfg.TILES_Q == 1, "d256 pipeline mandates TILES_Q == 1"),
+        (
+            not fused_corr_split_p or not (cfg.MASK_FLAGS & MASK_SWA),
+            "d256/d512: SWA P reuse and split-P correction require different alias phases",
+        ),
         (not split_p or split_p_supported, "d256: unsupported split-P specialization"),
         (cfg.SOFTMAX_WARPGROUPS == 2 if cfg.MASK_FLAGS == MASK_NONE and fp8 else True, "d256: dense FP8 must split P generation"),
         (cfg.TOTAL_WARPS == (12 if fused_corr_split_p else 16 if split_p else 12), "d256: role layout and warp count disagree"),

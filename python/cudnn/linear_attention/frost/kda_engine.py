@@ -62,7 +62,7 @@ class KdaFrostEngine(BaseEngine):
         if facts.gate_channels != facts.d_qk:
             raise NotImplementedError(f"KdaFrostEngine: g must carry d_qk = {facts.d_qk} channels, got {facts.gate_channels}")
         checkpoint = facts.checkpoint_every_n_tokens
-        checkpoint_dtypes = (cudnn.data_type.FLOAT,) if checkpoint > 16 else (cudnn.data_type.FLOAT, facts.io_dtype)
+        checkpoint_dtypes = (cudnn.data_type.FLOAT, facts.io_dtype)
         if checkpoint and checkpoint % 16 != 0:
             raise NotImplementedError(f"KdaFrostEngine: checkpoint_every_n_tokens must be a positive multiple of 16 (got {checkpoint})")
         if not facts.gates_at_ho:
@@ -105,13 +105,13 @@ class KdaFrostEngine(BaseEngine):
                 raise NotImplementedError("KdaFrostEngine: 'dO' must match the io dtype")
             if facts.state_checkpoints_dtype not in checkpoint_dtypes + (None,):
                 raise NotImplementedError(
-                    f"KdaFrostEngine: 'state_checkpoints' must be {' or '.join(str(w) for w in checkpoint_dtypes)} at checkpoint_every_n_tokens {checkpoint}"
+                    f"KdaFrostEngine: 'state_checkpoints' must be {' or '.join(str(w) for w in checkpoint_dtypes)}, got {facts.state_checkpoints_dtype}"
                 )
             if facts.dbeta_dtype not in (facts.beta_dtype, None):
                 raise NotImplementedError(f"KdaFrostEngine: 'dBeta' must match 'beta' ({facts.beta_dtype}), got {facts.dbeta_dtype}")
         elif facts.io_dtype is not None and facts.state_checkpoints_out_dtype not in checkpoint_dtypes + (None,):
             raise NotImplementedError(
-                f"KdaFrostEngine: 'state_checkpoints' must be {' or '.join(str(w) for w in checkpoint_dtypes)} at checkpoint_every_n_tokens {checkpoint}"
+                f"KdaFrostEngine: 'state_checkpoints' must be {' or '.join(str(w) for w in checkpoint_dtypes)}, got {facts.state_checkpoints_out_dtype}"
             )
 
     def build_plan(self, graph, plan, ctx=None) -> CompiledPlan:
