@@ -496,6 +496,7 @@ def _kernel(
     sfo_col_off_h: cutlass.Int64 = 0,
     sfo_cols: cutlass.Int64 = 0,
     prepared_sfo_geometry: cutlass.Constexpr = None,
+    paged_v_hnd: cutlass.Constexpr[bool] = False,
 ) -> None:
     # The prepared plan fixes this byte geometry; retain Int64 while allowing
     # constant folding of the SF atom's offset arithmetic.
@@ -811,6 +812,7 @@ def _kernel(
             block_table_tensor=block_table_tensor,
             block_table_v_tensor=block_table_v_tensor,
             paged_hnd=paged_hnd,
+            paged_v_hnd=paged_v_hnd,
         )
 
     elif warp_idx == CFG.TMASTG_WARP_ID:
@@ -940,6 +942,7 @@ def _tmaldg_warp_group(
     block_table_tensor=None,
     block_table_v_tensor=None,
     paged_hnd: cutlass.Constexpr[bool] = False,
+    paged_v_hnd: cutlass.Constexpr[bool] = False,
 ):
     """Unified TMA-LDG warp — cga1/cga2 × MASK_NONE/PADDED/CAUSAL/SWA.
 
@@ -972,13 +975,18 @@ def _tmaldg_warp_group(
         tma_tensormap_acquire(_v_rt_ptr)
         tma_k = lambda *coords: tma_slice_runtime_desc(_k_rt_ptr, *coords)  # noqa: E731
         tma_v = lambda *coords: tma_slice_runtime_desc(_v_rt_ptr, *coords)  # noqa: E731
-    elif cutlass.const_expr(PAGED_KV and paged_hnd):
-        # HND page pools: the row stride is below the head stride, so _host
-        # built the descriptors with dims (D, row, H_kv, page). Every load site
-        # keeps the (d, head, row, page) vocabulary; the swap lives here.
+    elif cutlass.const_expr(PAGED_KV):
+        # Each pool has its own TMA order. HND descriptors use (D, row, H_kv, page);
+        # load sites keep (d, head, row, page), with each operand's swap here.
         _tk, _tv = GmemTileTma(tma_k_desc), GmemTileTma(tma_v_desc)
-        tma_k = lambda d, h, r, p: _tk(d, r, h, p)  # noqa: E731
-        tma_v = lambda d, h, r, p: _tv(d, r, h, p)  # noqa: E731
+        if cutlass.const_expr(paged_hnd):
+            tma_k = lambda d, h, r, p: _tk(d, r, h, p)  # noqa: E731
+        else:
+            tma_k = _tk
+        if cutlass.const_expr(paged_v_hnd):
+            tma_v = lambda d, h, r, p: _tv(d, r, h, p)  # noqa: E731
+        else:
+            tma_v = _tv
     else:
         tma_k = GmemTileTma(tma_k_desc)
         tma_v = GmemTileTma(tma_v_desc)
@@ -3223,6 +3231,7 @@ def _host(
     prepared: cutlass.Constexpr[bool] = False,
     paged_hnd_prepared: cutlass.Constexpr[bool] = False,
     prepared_sfo_geometry: cutlass.Constexpr = None,
+    paged_v_hnd_prepared: cutlass.Constexpr[bool] = False,
 ) -> None:
     B, QH, KH, SQ, SKV, _ = problem_size
     if cutlass.const_expr(CFG.THD_VARLEN):
@@ -3260,10 +3269,10 @@ def _host(
         # Pool layout is a plan fact; element strides are Int64 runtime values.
         # The shared binder validates both pools against this specialization.
         paged_hnd = paged_hnd_prepared
+        paged_v_hnd = paged_v_hnd_prepared
     else:
         paged_hnd = bool(PAGED_KV) and k_tensor.stride[1] < k_tensor.stride[2]
-        if cutlass.const_expr(PAGED_KV and (v_tensor.stride[1] < v_tensor.stride[2]) != paged_hnd):
-            raise ValueError("paged K and V pools must share an in-page layout (both HND or both NHD)")
+        paged_v_hnd = bool(PAGED_KV) and v_tensor.stride[1] < v_tensor.stride[2]
     kv_stride_order = (3, 1, 2, 0) if paged_hnd else stride_order
 
     def _tma_swz(byte_w: int):
@@ -3287,7 +3296,7 @@ def _host(
     tma_v_desc = tmap.create_tensor_map_tiled_from_view(
         v_tensor,
         box_dims=vo_box_v,
-        stride_order=kv_stride_order,
+        stride_order=(3, 1, 2, 0) if paged_v_hnd else stride_order,
         swizzle=_tma_swz(CFG.V_SWZ_BYTES),
         l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
     )
@@ -3393,6 +3402,7 @@ def _host(
         sfo_col_off_h,
         sfo_cols,
         prepared_sfo_geometry=prepared_sfo_geometry,
+        paged_v_hnd=paged_v_hnd,
     ).launch(
         grid=grid_shape,
         block=[CFG.THREADS_PER_CTA, 1, 1],
@@ -3416,7 +3426,9 @@ def compile_prepared(
     has_amax: bool = True,
     scale_o_in_combine: bool = False,
     sfo_geometry: Optional[tuple[int, int, int, int]] = None,
+    paged_v_hnd: Optional[bool] = None,
 ) -> Callable:
+    paged_v_hnd = paged_hnd if paged_v_hnd is None else paged_v_hnd
     cache_key = _template_key(globals(), locals(), "compile_prepared")
     from cudnn.sdpa.fwd.kernels._fp8_host import LSE_KINDS, compile_host
 
@@ -3434,7 +3446,7 @@ def compile_prepared(
         raise ValueError(f"lse_kind must be one of {LSE_KINDS}; got {lse_kind!r}")
     if has_lse and (lse_kind == "dense") == bool(CFG.THD_VARLEN):
         raise ValueError("lse_kind 'dense' is the dense form; 'token' / 'head' / 'padded' are the THD forms")
-    if paged_hnd and not PARAMS.paged_kv:
+    if (paged_hnd or paged_v_hnd) and not PARAMS.paged_kv:
         raise ValueError("paged_hnd requires a paged-KV specialization")
     return compile_host(
         _host,
@@ -3453,4 +3465,5 @@ def compile_prepared(
         sfo_geometry=sfo_geometry,
         optional_amax=True,
         amax_prescaled=True,
+        paged_v_hnd=paged_v_hnd,
     )

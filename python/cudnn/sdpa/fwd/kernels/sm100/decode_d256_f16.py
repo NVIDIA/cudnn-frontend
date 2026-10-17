@@ -396,14 +396,21 @@ def _tmaldg_warp_group(
     block_table_v_tensor=None,
     paged_hnd: cutlass.Constexpr[bool] = False,
     use_pdl: cutlass.Constexpr[bool] = False,
+    paged_v_hnd: cutlass.Constexpr[bool] = False,
 ):
     tma_q = GmemTileTma(tma_q_desc)
-    if cutlass.const_expr(PAGED_KV and paged_hnd):
-        # HND page pools: descriptor dims are (D, row, H_kv, page); every load
-        # site keeps the (d, head, row, page) vocabulary, the swap lives here.
+    if cutlass.const_expr(PAGED_KV):
+        # Each pool has its own TMA order. HND descriptors use (D, row, H_kv, page);
+        # load sites keep (d, head, row, page), with each operand's swap here.
         _tk, _tv = GmemTileTma(tma_k_desc), GmemTileTma(tma_v_desc)
-        tma_k = lambda d, h, r, p: _tk(d, r, h, p)  # noqa: E731
-        tma_v = lambda d, h, r, p: _tv(d, r, h, p)  # noqa: E731
+        if cutlass.const_expr(paged_hnd):
+            tma_k = lambda d, h, r, p: _tk(d, r, h, p)  # noqa: E731
+        else:
+            tma_k = _tk
+        if cutlass.const_expr(paged_v_hnd):
+            tma_v = lambda d, h, r, p: _tv(d, r, h, p)  # noqa: E731
+        else:
+            tma_v = _tv
     else:
         tma_k = GmemTileTma(tma_k_desc)
         tma_v = GmemTileTma(tma_v_desc)
@@ -938,6 +945,7 @@ def _kernel(
     # Programmatic dependent launch (the launch attribute is set by the host entry under the same flag): each role waits on the
     # dependent grid right after its own prologue and before its first global read, and the TMA role releases the dependent grid.
     use_pdl: cutlass.Constexpr[bool] = False,
+    paged_v_hnd: cutlass.Constexpr[bool] = False,
 ) -> None:
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx, _, _ = cute.arch.thread_idx()
@@ -1103,6 +1111,7 @@ def _kernel(
             block_table_v_tensor=block_table_v_tensor,
             paged_hnd=paged_hnd,
             use_pdl=use_pdl,
+            paged_v_hnd=paged_v_hnd,
         )
 
 
@@ -1143,6 +1152,7 @@ def _host(
     paged_hnd: cutlass.Constexpr[bool],
     use_pdl: cutlass.Constexpr[bool] = False,
     stream: _cuda_driver.CUstream = None,
+    paged_v_hnd: cutlass.Constexpr[bool] = False,
 ) -> None:
     """Bind the shared explicit SDPA ABI and launch the existing decode kernel.
 
@@ -1223,7 +1233,7 @@ def _host(
 
     tma_q_desc = _create_tma_desc(q_tensor, box_q, _tma_swz(CFG.Q_SWZ_BYTES))
     tma_k_desc = _create_tma_desc(k_tensor, box_kv, _tma_swz(CFG.K_SWZ_BYTES), kv_stride_order)
-    tma_v_desc = _create_tma_desc(v_tensor, box_kv, _tma_swz(CFG.V_SWZ_BYTES), kv_stride_order)
+    tma_v_desc = _create_tma_desc(v_tensor, box_kv, _tma_swz(CFG.V_SWZ_BYTES), (3, 1, 2, 0) if paged_v_hnd else stride_order)
 
     # Token units: ceil(SQ / Q_BOX_TOKENS) CTAs per (head group, batch, split), the unit the fast index of x.
     n_tok_units = (cutlass.Int32(SQ) + cutlass.Int32(Q_BOX_TOKENS - 1)) // cutlass.Int32(Q_BOX_TOKENS)
@@ -1246,25 +1256,25 @@ def _host(
     )
 
     # `pdl` is an explicit argument of both helpers (like `hnd`): the DSL refuses a closure capture inside a staged `if`.
-    def launch(args, k_table, v_table, hnd, pdl, grid, current_stream):
+    def launch(args, k_table, v_table, hnd, pdl, grid, current_stream, v_hnd):
         # pdl: the programmatic-stream-serialization launch attribute, paired with the kernel's griddepcontrol sites.
-        _kernel(*args, k_table, v_table, hnd, pdl).launch(
+        _kernel(*args, k_table, v_table, hnd, pdl, paged_v_hnd=v_hnd).launch(
             grid=grid,
             block=[CFG.THREADS_PER_CTA, 1, 1],
             stream=current_stream,
             use_pdl=pdl,
         )
 
-    def launch_tables(args, kt, vt, kp, vp, strides, batch, kv_extent, hnd, pdl, grid, current_stream):
+    def launch_tables(args, kt, vt, kp, vp, strides, batch, kv_extent, hnd, pdl, grid, current_stream, v_hnd):
         if cutlass.const_expr(PAGED_KV):
             # Keep the common unit page-column stride static in the device code.
             if strides[1] == cutlass.Int64(1):
                 layout = cute.make_layout((batch, kv_extent // cutlass.Int32(PAGE_SIZE)), stride=(strides[0], 1))
-                launch(args, cute.make_tensor(kp, layout), cute.make_tensor(vp, layout), hnd, pdl, grid, current_stream)
+                launch(args, cute.make_tensor(kp, layout), cute.make_tensor(vp, layout), hnd, pdl, grid, current_stream, v_hnd)
             else:
-                launch(args, kt, vt, hnd, pdl, grid, current_stream)
+                launch(args, kt, vt, hnd, pdl, grid, current_stream, v_hnd)
         else:
-            launch(args, kt, vt, hnd, pdl, grid, current_stream)
+            launch(args, kt, vt, hnd, pdl, grid, current_stream, v_hnd)
 
     compact_inner = o_strides[2] == cutlass.Int64(d_v)
     if cutlass.const_expr(lse_ptr is not None):
@@ -1276,7 +1286,19 @@ def _host(
             stats = cute.make_tensor(lse_ptr, cute.make_layout((B * SPLIT_KV, QH, SQ), stride=(lse_strides[0], lse_strides[1], 1)))
         args = kernel_args[:3] + (output, stats) + kernel_args[5:]
         launch_tables(
-            args, block_table_tensor, block_table_v_tensor, block_table_ptr, block_table_v_ptr, table_strides, B, SKV, paged_hnd, use_pdl, grid_shape, stream
+            args,
+            block_table_tensor,
+            block_table_v_tensor,
+            block_table_ptr,
+            block_table_v_ptr,
+            table_strides,
+            B,
+            SKV,
+            paged_hnd,
+            use_pdl,
+            grid_shape,
+            stream,
+            paged_v_hnd,
         )
     else:
         launch_tables(
@@ -1292,6 +1314,7 @@ def _host(
             use_pdl,
             grid_shape,
             stream,
+            paged_v_hnd,
         )
 
 
@@ -1307,12 +1330,14 @@ def compile(  # noqa: A001
     lse_kind: str = "dense",
     paged_hnd: bool = False,
     use_pdl: bool = False,
+    paged_v_hnd: Optional[bool] = None,
 ) -> Callable:
     """Compile the shared pointer ABI for dense or paged decode. Shapes and strides
     are runtime arguments; head-dim envelopes, Stats presence and pool layout
     are specializations. All stride fakes, including page tables, are Int64.
     ``use_pdl`` (appended; in the key) traces the programmatic-dependent-launch form: the launch attribute plus the per-role
     ``griddepcontrol`` wait before the first global read and the release after the prologue -- the same math, bitwise."""
+    paged_v_hnd = paged_hnd if paged_v_hnd is None else paged_v_hnd
     _cache_key = _template_key(globals(), locals(), "compile")
     if not (0 < d_qk <= CFG.TILE_K and 0 < d_v <= CFG.TILE_O):
         raise ValueError(f"d256 envelope: need 0 < d_qk <= {CFG.TILE_K} and 0 < d_v <= {CFG.TILE_O}; got ({d_qk}, {d_v})")
@@ -1322,7 +1347,7 @@ def compile(  # noqa: A001
         raise ValueError("d256: split_kv > 1 requires has_lse=True (the per-split LSE drives the combine)")
     if lse_kind not in LSE_KINDS:
         raise ValueError(f"lse_kind must be one of {LSE_KINDS}; got {lse_kind!r}")
-    if paged_hnd and not PAGED_KV:
+    if (paged_hnd or paged_v_hnd) and not PAGED_KV:
         raise ValueError("paged_hnd is a paged-KV specialization")
     gmem = cute.AddressSpace.gmem
 
@@ -1368,4 +1393,5 @@ def compile(  # noqa: A001
         options="--enable-tvm-ffi",
         cache_key=_cache_key,
         symbol="frost_sdpa_fwd_decode",
+        paged_v_hnd=paged_v_hnd,
     )

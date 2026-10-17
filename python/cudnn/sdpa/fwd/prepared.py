@@ -180,6 +180,7 @@ class ThdLaunchSpec:
         "paged",
         "page_size",
         "paged_hnd",
+        "paged_v_hnd",
         "decl",
         "expect",
         "gate_expect",
@@ -222,10 +223,10 @@ _FILLED_PER_CALL = frozenset(
 )
 
 
-def _compiled_paged_hnd(api) -> bool:
+def _compiled_paged_hnd(api, which_v=False) -> bool:
     """The in-page layout kind the artifact was compiled for (``paged_hnd``: the row stride below the head
     stride in the kernel's (page, row, head, d) order), read the way ``_explicit_compile_kwargs`` derived it."""
-    ps = api._paged_pool_stride(api.k_desc)
+    ps = api._paged_pool_stride(api.v_desc if which_v else api.k_desc)
     return bool(int(ps[1]) < int(ps[2]))
 
 
@@ -285,6 +286,7 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     s.fixed_batch = bool(getattr(km, "PREPARED_FIXED_BATCH", False))
     s.workspace_alignment = int(getattr(km, "PREPARED_WORKSPACE_ALIGNMENT", _ALIGN_TMA))
     s.paged_hnd = _compiled_paged_hnd(api) if s.paged else False
+    s.paged_v_hnd = _compiled_paged_hnd(api, which_v=True) if s.paged else False
     s.decl = dict(q=plan.q, k=plan.k, v=plan.v, o=plan.o)  # (h, d, token_stride, head_stride, elem_stride, row_span)
     s.expect = {n: str(getattr(api, f"{n}_desc").dtype).split(".")[-1] for n in ("q", "k", "v", "o")}
     # The kernel's epilogue gate on a THD plan (the f16/bf16 d256 prefill is the only THD body with the gate seams; it
@@ -658,6 +660,7 @@ class DenseLaunchSpec:
         "paged",
         "page_size",
         "paged_hnd",
+        "paged_v_hnd",
         "expect",
         "elem_bytes",
         "has_lse",
@@ -776,6 +779,7 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
         raise ValueError(f"cudnn.sdpa: decode query rows exceed the compiled {km.N_Q}-row tile")
     s.paged, s.page_size = bool(api.paged), int(api.paged_page_size or 0)
     s.paged_hnd = _compiled_paged_hnd(api) if s.paged else False
+    s.paged_v_hnd = _compiled_paged_hnd(api, which_v=True) if s.paged else False
     s.split = int(api.split_kv)
     s.fp32_partial = bool(api._fp32_partial_split()) if s.split > 1 else False
     s.expect = {n: str(getattr(api, f"{n}_desc").dtype).split(".")[-1] for n in ("q", "k", "v", "o")}
@@ -1010,7 +1014,15 @@ def _bind_paged_kv(spec, frame: List[Any], ix: Dict[str, int], facts: Dict[str, 
     pool_strides = {}
     for name, f, d in (("k", k, spec.d_qk), ("v", v, spec.d_v)):
         try:
-            strides, need = _paged_pool_layout(f.shape, f.strides, _buffers.DTYPE_ITEMSIZE[f.dtype], spec.paged_hnd, spec.kh, spec.page_size, d)
+            strides, need = _paged_pool_layout(
+                f.shape,
+                f.strides,
+                _buffers.DTYPE_ITEMSIZE[f.dtype],
+                (getattr(spec, "paged_v_hnd", spec.paged_hnd) if name == "v" else spec.paged_hnd),
+                spec.kh,
+                spec.page_size,
+                d,
+            )
         except ValueError as error:
             raise ValueError(f"cudnn.sdpa: {name}: {error}") from error
         if f.span >= 0 and f.span < need:

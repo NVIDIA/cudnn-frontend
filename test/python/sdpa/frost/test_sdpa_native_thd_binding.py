@@ -282,14 +282,16 @@ def test_native_asymmetric_head_dims_and_int64_runtime_token_strides():
     assert frame[s.index["problem_size"]][3] == 16
 
 
-def _paged_fixture(hnd=False, layout="NH", table_rank=4, dtype="bfloat16", kh=2):
+def _paged_fixture(hnd=False, layout="NH", table_rank=4, dtype="bfloat16", kh=2, v_hnd=None):
     s, facts, frames = _fixture(dtype=dtype, layout=layout)
     s.paged, s.paged_hnd, s.page_size, s.kh = True, hnd, 16, kh
+    s.paged_v_hnd = hnd if v_hnd is None else v_hnd
     s.lens_form = 1  # cumulative Q, direct per-sequence KV lengths
     facts["kv_lens"] = facts["kv_lens"]._replace(shape=(4,), strides=(1,), span=4)
     for role in ("k", "v"):
         s.decl[role] = (kh, 128, kh * 128, 128, 1, kh * 128)
-        strides = (16 * kh * 128, 16 * 128, 128, 1) if hnd else (16 * kh * 128, 128, kh * 128, 1)
+        pool_hnd = s.paged_v_hnd if role == "v" else hnd
+        strides = (16 * kh * 128, 16 * 128, 128, 1) if pool_hnd else (16 * kh * 128, 128, kh * 128, 1)
         facts[role] = facts[role]._replace(shape=(8, kh, 16, 128), strides=strides, span=8 * kh * 16 * 128)
     shape, strides = ((4, 1, 4, 1), (4, 4, 1, 1)) if table_rank == 4 else ((4, 4), (4, 1))
     for i, role in enumerate(("block_table", "block_table_v")):
@@ -298,12 +300,12 @@ def _paged_fixture(hnd=False, layout="NH", table_rank=4, dtype="bfloat16", kh=2)
     return s, facts, frames
 
 
-@pytest.mark.parametrize("hnd", [False, True])
+@pytest.mark.parametrize("hnd,v_hnd", [(False, False), (True, True), (False, True), (True, False)])
 @pytest.mark.parametrize("layout", [None, "NH", "HN"])
 @pytest.mark.parametrize("table_rank", [2, 4])
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
-def test_native_paged_matches_python_and_rebinds(hnd, layout, table_rank, dtype):
-    s, facts, _ = _paged_fixture(hnd, layout, table_rank, dtype)
+def test_native_paged_matches_python_and_rebinds(hnd, layout, table_rank, dtype, v_hnd):
+    s, facts, _ = _paged_fixture(hnd, layout, table_rank, dtype, v_hnd=v_hnd)
     original = tuple(s.template)
     first = _equal(s, facts)
     changed = {name: f._replace(ptr=f.ptr + 0x100000) for name, f in facts.items()}

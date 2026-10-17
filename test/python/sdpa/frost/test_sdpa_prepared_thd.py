@@ -953,13 +953,14 @@ def test_dense_layout_rule_covers_every_tma_global_stride_and_the_lse_aliasing()
     assert not prep_mod._covering((2, 8, 128), (8 * 128, 64, 1)), "head stride 64 aliases rows 64.. of the previous head"
 
 
-def test_paged_pools_must_be_the_compiled_in_page_layout_kind():
+@pytest.mark.parametrize("k_hnd,v_hnd", [(False, False), (True, True), (False, True), (True, False)])
+def test_paged_pools_must_be_the_compiled_in_page_layout_kind(k_hnd, v_hnd):
     """Host-side: the paged binder refuses a pool whose in-page (row, head) order differs from the one the
     artifact was compiled for (``paged_hnd`` orders the TMA descriptors), for K and for V alike."""
     from types import SimpleNamespace
 
     kh, ps, d, n_pages, b, max_pages = 2, 16, 128, 8, 2, 4
-    spec = SimpleNamespace(paged=True, paged_hnd=False, page_size=ps, kh=kh, d_qk=d, d_v=d, device_index=0)
+    spec = SimpleNamespace(paged=True, paged_hnd=k_hnd, paged_v_hnd=v_hnd, page_size=ps, kh=kh, d_qk=d, d_v=d, device_index=0)
     order = ["k_ptr", "v_ptr", "k_strides", "v_strides", "block_table_ptr", "block_table_v_ptr", "table_strides", "n_pages"]
     ix = {n: i for i, n in enumerate(order)}
 
@@ -971,10 +972,10 @@ def test_paged_pools_must_be_the_compiled_in_page_layout_kind():
     table = prep_mod.BufferFacts(8192, "int32", (2, 0), b * max_pages, (b, 1, max_pages, 1), (max_pages, max_pages, 1, 1))
     facts = dict(block_table=table, block_table_v=table)
     frame = [None] * len(order)
-    assert binding_reference._bind_paged_kv(spec, frame, ix, facts, pool(False), pool(False), b) == max_pages * ps
-    for k_hnd, v_hnd in ((True, False), (False, True)):
-        with pytest.raises(ValueError, match="compiled for NHD"):
-            binding_reference._bind_paged_kv(spec, list(frame), ix, facts, pool(k_hnd), pool(v_hnd), b)
+    assert binding_reference._bind_paged_kv(spec, frame, ix, facts, pool(k_hnd), pool(v_hnd), b) == max_pages * ps
+    for changed_k, changed_v in ((not k_hnd, v_hnd), (k_hnd, not v_hnd)):
+        with pytest.raises(ValueError, match="compiled for"):
+            binding_reference._bind_paged_kv(spec, list(frame), ix, facts, pool(changed_k), pool(changed_v), b)
 
 
 @requires_pre_rubin_blackwell
@@ -1065,8 +1066,8 @@ def test_split_prepared_strided_output_rebind_and_capture(d, stats, stats_log2, 
 @requires_dsl
 @pytest.mark.parametrize("kh", [1, 2])
 @pytest.mark.parametrize("k_hnd,v_hnd", [(False, False), (True, True), (False, True), (True, False)])
-def test_paged_adapter_rejects_mixed_pool_layout_at_support_check(kh, k_hnd, v_hnd):
-    """One compiled page-layout specialization must cover both pools, including singleton KH."""
+def test_paged_adapter_accepts_independent_pool_layout_at_support_check(kh, k_hnd, v_hnd):
+    """Each pool declares its own layout specialization, including singleton KH."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     b, h, sq, d, page_size, n_pages = 2, 8, 4, 128, 16, 8
@@ -1089,11 +1090,7 @@ def test_paged_adapter_rejects_mixed_pool_layout_at_support_check(kh, k_hnd, v_h
         split_kv=1,
         pack_gqa=False,
     )
-    if k_hnd == v_hnd:
-        assert api.check_support()
-    else:
-        with pytest.raises(NotImplementedError, match="paged K and V pools must use the same HND or NHD layout kind"):
-            api.check_support()
+    assert api.check_support()
 
 
 @requires_pre_rubin_blackwell
@@ -2020,6 +2017,9 @@ def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page,
 @pytest.mark.parametrize(
     "geometry,stats_layout,stats_log2,splits",
     [
+        ("d128_split_mixed", "HN", True, 3),
+        ("d128_split_mixed_gqa", "NH", False, 2),
+        ("d256_split_mixed", "HN", True, 3),
         ("sink_d128_split", "NH", False, 4),
         ("sink_d128_split_b1_gqa", "HN", True, 8),
         ("sink_d128_gqa16_split_gqa", "NH", False, 3),
@@ -2100,7 +2100,7 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
         hk = h
     dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
     rng = torch.Generator(device=DEV).manual_seed(191)
-    _, _, k, v, table = _pools(b, hk, d, page, kcap // page, hnd, dtype, generator=rng)
+    _, _, k, v, table = _pools(b, hk, d, page, kcap // page, hnd, dtype, generator=rng, v_hnd=not hnd if "_mixed" in geometry else hnd)
     if has_sink:
         # Serving caches can concatenate K/V inside each token; preserve the
         # physical HND/NHD layout and test the strided views, without a gather.

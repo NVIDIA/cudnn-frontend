@@ -1043,3 +1043,14 @@ After compiling `score_sign`, launch with `config_sm80.kernel_scale` of the
 logical scale and reject a runtime sign change. Zero is a logical zero scale,
 not a request to reuse the plan's scale. `test_graph_thd_nonpositive_scale_and_replay`
 checks zero/negative scales, keyless rows and changed-V replay.
+
+
+Paged pool layout is per operand. A logical `(pages, heads, page_size, dim)`
+shape does not imply physical HND storage; singleton head axes can make two
+layout kinds both report `is_contiguous()`. Specialize the TMA dimension
+order and loader coordinates from each pool's declared strides, and validate
+each runtime pool against its own compiled kind. Changing only the eligibility
+check or native binder is insufficient: a V descriptor still ordered like K
+silently produces wrong O. The `independent_pool_layouts` tests pin FROST
+execution and compare O/Stats in both mixed directions, including one KV
+head; backend fallback must not count as evidence of kernel support.

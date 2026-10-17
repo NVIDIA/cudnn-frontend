@@ -228,6 +228,8 @@ class SdpaThdBinder {
         }
         paged_     = py::cast<bool>(spec.attr("paged"));
         paged_hnd_ = paged_ && py::cast<bool>(spec.attr("paged_hnd"));
+        paged_v_hnd_ =
+            paged_ && (py::hasattr(spec, "paged_v_hnd") ? py::cast<bool>(spec.attr("paged_v_hnd")) : paged_hnd_);
         page_size_ = paged_ ? integer(spec, "page_size") : 0;
         if (paged_ && page_size_ <= 0) invalid("page_size must be positive for a paged plan");
         fixed_batch_         = py::hasattr(spec, "fixed_batch") && py::cast<bool>(spec.attr("fixed_batch"));
@@ -797,22 +799,23 @@ class SdpaThdBinder {
     pool_geometry(const NativeOperandView &f, size_t role) const {
         const auto name = std::string(names[role]);
         const auto d    = declarations_[role][1];
+        const bool hnd  = role == V ? paged_v_hnd_ : paged_hnd_;
         if (f.shape.size() != 4 || f.shape[0] <= 0 || f.shape[1] != kh_ || f.shape[2] != page_size_ || f.shape[3] != d)
             invalid(name + ": a page pool must be (n_pages, H_kv, page_size, D)");
         if (stride(f, 3) != 1) invalid(name + ": the page pool's head dim must be contiguous");
-        if ((stride(f, 1) > stride(f, 2)) != paged_hnd_)
+        if ((stride(f, 1) > stride(f, 2)) != hnd)
             invalid(name + ": page pool layout differs from the compiled HND/NHD specialization");
         // Same storage-order canonicalization as dense_bind_strides: unused
         // singleton strides are not observable. Every stepped axis is covering
         // and TMA-aligned; observed storage remains a separate per-call bound.
-        const int64_t h = paged_hnd_ ? page_size_ : kh_, seq = paged_hnd_ ? kh_ : page_size_;
-        int64_t bs = stride(f, 0), hs = stride(f, paged_hnd_ ? 2 : 1), ss = stride(f, paged_hnd_ ? 1 : 2);
+        const int64_t h = hnd ? page_size_ : kh_, seq = hnd ? kh_ : page_size_;
+        int64_t bs = stride(f, 0), hs = stride(f, hnd ? 2 : 1), ss = stride(f, hnd ? 1 : 2);
         if (h == 1) hs = d;
         if (seq == 1) ss = multiply(h, hs);
         if (f.shape[0] == 1) bs = multiply(seq, ss);
         if (hs < d || ss < multiply(h, hs) || bs < multiply(seq, ss) || hs % 8 || ss % 8 || (f.shape[0] > 1 && bs % 8))
             invalid(name + ": page-pool strides must be covering and 16-byte aligned");
-        const int64_t token = paged_hnd_ ? hs : ss, head = paged_hnd_ ? ss : hs;
+        const int64_t token = hnd ? hs : ss, head = hnd ? ss : hs;
         const auto need =
             add(add(add(multiply(f.shape[0] - 1, bs), multiply(page_size_ - 1, token)), multiply(kh_ - 1, head)), d);
         if (span(f) >= 0 && span(f) < need) invalid(name + ": page pool observed storage is too small");
@@ -860,7 +863,7 @@ class SdpaThdBinder {
     int64_t sq_max_ = 0, lse_elements_ = 0, lse_span_ = 0, live_sq_max_ = -1;
     std::array<int64_t, 3> lse_strides_{};
     bool lse_padded_ = false;
-    bool has_lse_, has_sink_, lse_head_major_, lse_stride_override_, paged_, paged_hnd_, fixed_batch_;
+    bool has_lse_, has_sink_, lse_head_major_, lse_stride_override_, paged_, paged_hnd_, paged_v_hnd_, fixed_batch_;
 };
 
 }  // namespace

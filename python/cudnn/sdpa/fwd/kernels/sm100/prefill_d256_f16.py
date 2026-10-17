@@ -313,6 +313,7 @@ def _kernel(
     # Fused epilogue gate: the gate tile's LOAD descriptor; None (dropped from the specialised signature, so the ungated
     # cubin does not move) unless CFG.EPILOGUE_GATE.  Appended LAST.
     tma_gate_desc: Optional[cutlass.GridConstant[tmap.TensorMap]] = None,
+    paged_v_hnd: cutlass.Constexpr[bool] = False,
 ) -> None:
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx, _, _ = cute.arch.thread_idx()
@@ -581,6 +582,7 @@ def _kernel(
             paged_hnd=paged_hnd,
             tma_gate_desc=tma_gate_desc,
             sGate=sGate,
+            paged_v_hnd=paged_v_hnd,
         )
 
     elif warp_idx == CFG.TMASTG_WARP_ID:
@@ -698,6 +700,7 @@ def _tmaldg_warp_group(
     # Fused epilogue gate (appended; the call is by keyword).  None = gate off.
     tma_gate_desc=None,
     sGate=None,
+    paged_v_hnd: cutlass.Constexpr[bool] = False,
 ):
     q_o_alias_phase = cutlass.Int32(0)
     kv_state = PipelineState.start(phase=1)
@@ -721,12 +724,18 @@ def _tmaldg_warp_group(
         tma_tensormap_acquire(_v_rt_ptr)
         tma_k = lambda *coords: tma_slice_runtime_desc(_k_rt_ptr, *coords)  # noqa: E731
         tma_v = lambda *coords: tma_slice_runtime_desc(_v_rt_ptr, *coords)  # noqa: E731
-    elif cutlass.const_expr(PAGED_KV and paged_hnd):
-        # HND page pools: descriptor dims are (D, row, H_kv, page); every load
-        # site keeps the (d, head, row, page) vocabulary, the swap lives here.
+    elif cutlass.const_expr(PAGED_KV):
+        # Each pool has its own TMA order. HND descriptors use (D, row, H_kv, page);
+        # load sites keep (d, head, row, page), with each operand's swap here.
         _tk, _tv = GmemTileTma(tma_k_desc), GmemTileTma(tma_v_desc)
-        tma_k = lambda d, h, r, p: _tk(d, r, h, p)  # noqa: E731
-        tma_v = lambda d, h, r, p: _tv(d, r, h, p)  # noqa: E731
+        if cutlass.const_expr(paged_hnd):
+            tma_k = lambda d, h, r, p: _tk(d, r, h, p)  # noqa: E731
+        else:
+            tma_k = _tk
+        if cutlass.const_expr(paged_v_hnd):
+            tma_v = lambda d, h, r, p: _tv(d, r, h, p)  # noqa: E731
+        else:
+            tma_v = _tv
     else:
         tma_k = GmemTileTma(tma_k_desc)
         tma_v = GmemTileTma(tma_v_desc)
@@ -2124,6 +2133,7 @@ def _host(
     gate_ptr: Optional[cute.Pointer],
     gate_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     stream: _cuda_driver.CUstream = None,
+    paged_v_hnd: cutlass.Constexpr[bool] = False,
 ) -> None:
     """Host entry: device pointers, runtime extents and strides in, TMA encodes and launches out.
 
@@ -2227,7 +2237,7 @@ def _host(
 
     tma_q_desc = _create_tma_desc(q_tensor, qk_box_q, _tma_swz(CFG.Q_SWZ_BYTES))
     tma_k_desc = _create_tma_desc(k_tensor, qk_box_k, _tma_swz(CFG.K_SWZ_BYTES), kv_stride_order)
-    tma_v_desc = _create_tma_desc(v_tensor, vo_box_v, _tma_swz(CFG.V_SWZ_BYTES), kv_stride_order)
+    tma_v_desc = _create_tma_desc(v_tensor, vo_box_v, _tma_swz(CFG.V_SWZ_BYTES), (3, 1, 2, 0) if paged_v_hnd else stride_order)
     _o_box = list(vo_box_o)
     if _FP32_PARTIALS:
         # fp32 is 4 bytes; scale the box by the O element's own width so
@@ -2310,6 +2320,7 @@ def _host(
         block_table_v_tensor,
         paged_hnd,
         tma_gate_desc,
+        paged_v_hnd=paged_v_hnd,
     ).launch(
         grid=grid_shape,
         block=[CFG.THREADS_PER_CTA, 1, 1],
@@ -2323,14 +2334,24 @@ LSE_KINDS = ("dense", "token", "head", "padded")
 
 
 @lru_cache(maxsize=None)
-def compile_thd_split(*, has_lse: bool = True, lse_kind: str = "head", paged_hnd: bool = False) -> Callable:
+def compile_thd_split(*, has_lse: bool = True, lse_kind: str = "head", paged_hnd: bool = False, paged_v_hnd: Optional[bool] = None) -> Callable:
     """Compile only from plan facts; every token capacity and stride is dynamic."""
+    paged_v_hnd = paged_hnd if paged_v_hnd is None else paged_v_hnd
     if not (CFG.THD_VARLEN and SPLIT_KV > 1 and CFG.TILE_O == 256 and CFG.TILE_K == 256 and not CFG.PACK_GQA):
         raise ValueError("packed D256 split requires THD without PackGQA")
     cache_key = _template_key(globals(), locals(), "compile_thd_split")
     # gate_slots: this body's host ends in the two required epilogue-gate slots; the split wrapper passes the no-gate pair.
     return _compile_thd_split_host(
-        _host, CFG, STORAGE_DTYPE, cache_key, has_lse=has_lse, lse_kind=lse_kind, paged_hnd=paged_hnd, ragged_q_slots=False, gate_slots=True
+        _host,
+        CFG,
+        STORAGE_DTYPE,
+        cache_key,
+        has_lse=has_lse,
+        lse_kind=lse_kind,
+        paged_hnd=paged_hnd,
+        ragged_q_slots=False,
+        gate_slots=True,
+        paged_v_hnd=paged_v_hnd,
     )
 
 
@@ -2341,6 +2362,7 @@ def compile(  # noqa: A001
     has_lse: bool = True,
     lse_kind: str = "dense",
     paged_hnd: bool = False,
+    paged_v_hnd: Optional[bool] = None,
 ) -> Callable:
     """Compile the host entry for one layout kind.
 
@@ -2350,12 +2372,13 @@ def compile(  # noqa: A001
     tile box stays the compile-time TILE geometry — box columns past d_qk / d_v
     zero-fill on load, O columns past d_v clip on store), whether the LSE store
     exists, the Stats layout kind, and for paged pools whether the in-page
-    layout is HND (row stride below head stride).
+    layout of each pool is HND (row stride below head stride).
 
     Constraint: every non-innermost TMA global stride must be a 16-byte
     multiple; the compact BSHD H-stride is d * BPE, so d must be a multiple of
     8 at 2 bytes/elem — checked here for the envelope, by the adapter for
     declared strides."""
+    paged_v_hnd = paged_hnd if paged_v_hnd is None else paged_v_hnd
     _cache_key = _template_key(globals(), locals(), "compile")
     if not (0 < d_qk <= CFG.TILE_K and 0 < d_v <= CFG.TILE_O):
         raise ValueError(f"d256 envelope: need 0 < d_qk <= {CFG.TILE_K} and 0 < d_v <= {CFG.TILE_O}; got ({d_qk}, {d_v})")
@@ -2367,7 +2390,7 @@ def compile(  # noqa: A001
         raise ValueError(f"lse_kind must be one of {LSE_KINDS}; got {lse_kind!r}")
     if has_lse and (lse_kind == "dense") == bool(CFG.THD_VARLEN):
         raise ValueError("lse_kind 'dense' is the dense form; 'token' / 'head' / 'padded' are the THD forms")
-    if paged_hnd and not PAGED_KV:
+    if (paged_hnd or paged_v_hnd) and not PAGED_KV:
         raise ValueError("paged_hnd is a paged-KV specialization")
     gmem = cute.AddressSpace.gmem
 
@@ -2415,6 +2438,7 @@ def compile(  # noqa: A001
         options="--enable-tvm-ffi",
         cache_key=_cache_key,
         symbol="frost_sdpa_fwd",
+        paged_v_hnd=paged_v_hnd,
     )
 
 

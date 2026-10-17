@@ -403,6 +403,7 @@ def _kernel(
     ragged_q_i64: cutlass.Constexpr[bool] = False,
     # The final O under DIRECT_O (None-specialized otherwise): the correction warps store the half output straight from TMEM.
     o_direct: Optional[cute.Tensor] = None,
+    paged_v_hnd: cutlass.Constexpr[bool] = False,
 ) -> None:
     if cutlass.const_expr(PARAMS.thd_batch_one):
         # Fold the generic batch scan and split-index quotient/remainder.
@@ -633,6 +634,7 @@ def _kernel(
             ragged_q_addr=ragged_q_addr,
             ragged_q_div=ragged_q_div,
             ragged_q_i64=ragged_q_i64,
+            paged_v_hnd=paged_v_hnd,
         )
 
     elif warp_idx == CFG.TMASTG_WARP_ID:
@@ -743,6 +745,7 @@ def _tmaldg_warp_group(
     ragged_q_addr: cutlass.Int64 = 0,
     ragged_q_div: cutlass.Int64 = 1,
     ragged_q_i64: cutlass.Constexpr[bool] = False,
+    paged_v_hnd: cutlass.Constexpr[bool] = False,
 ):
     """TMA-LDG warp: one Q slab per tile, then K/V through the STAGES_KV ring."""
     q_empty_phase = cutlass.Int32(1)
@@ -768,13 +771,18 @@ def _tmaldg_warp_group(
         tma_tensormap_acquire(_v_rt_ptr)
         tma_k = lambda *coords: tma_slice_runtime_desc(_k_rt_ptr, *coords)  # noqa: E731
         tma_v = lambda *coords: tma_slice_runtime_desc(_v_rt_ptr, *coords)  # noqa: E731
-    elif cutlass.const_expr(PAGED_KV and paged_hnd):
-        # HND page pools: the row stride is below the head stride, so _host
-        # built the descriptors with dims (D, row, H_kv, page). Every load site
-        # keeps the (d, head, row, page) vocabulary; the swap lives here.
+    elif cutlass.const_expr(PAGED_KV):
+        # Each pool has its own TMA order. HND descriptors use (D, row, H_kv, page);
+        # load sites keep (d, head, row, page), with each operand's swap here.
         _tk, _tv = GmemTileTma(tma_k_desc), GmemTileTma(tma_v_desc)
-        tma_k = lambda d, h, r, p: _tk(d, r, h, p)  # noqa: E731
-        tma_v = lambda d, h, r, p: _tv(d, r, h, p)  # noqa: E731
+        if cutlass.const_expr(paged_hnd):
+            tma_k = lambda d, h, r, p: _tk(d, r, h, p)  # noqa: E731
+        else:
+            tma_k = _tk
+        if cutlass.const_expr(paged_v_hnd):
+            tma_v = lambda d, h, r, p: _tv(d, r, h, p)  # noqa: E731
+        else:
+            tma_v = _tv
     else:
         tma_k = GmemTileTma(tma_k_desc)
         tma_v = GmemTileTma(tma_v_desc)
@@ -2429,6 +2437,7 @@ def _launch(
     ragged_q_div: cutlass.Int64,
     ragged_q_i64: cutlass.Constexpr[bool],
     stream: _cuda_driver.CUstream = None,
+    paged_v_hnd: cutlass.Constexpr[bool] = False,
 ) -> None:
     """TMA construction and launch for the explicit pointer host entry."""
     B, QH, KH, SQ, SKV, _ = problem_size
@@ -2473,7 +2482,7 @@ def _launch(
     tma_v_desc = tmap.create_tensor_map_tiled_from_view(
         v_tensor,
         box_dims=vo_box_v,
-        stride_order=kv_stride_order,
+        stride_order=(3, 1, 2, 0) if paged_v_hnd else stride_order,
         swizzle=_tma_swz(CFG.V_SWZ_BYTES),
         l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
     )
@@ -2549,6 +2558,7 @@ def _launch(
         paged_hnd,
         ragged_q_i64,
         o_tensor if cutlass.const_expr(DIRECT_O) else None,
+        paged_v_hnd=paged_v_hnd,
     ).launch(
         grid=grid_shape,
         block=[CFG.THREADS_PER_CTA, 1, 1],
@@ -2593,6 +2603,7 @@ def _host(
     paged_hnd: cutlass.Constexpr[bool],
     ragged_q_i64: cutlass.Constexpr[bool],
     stream: _cuda_driver.CUstream = None,
+    paged_v_hnd: cutlass.Constexpr[bool] = False,
 ) -> None:
     """Bind the shared explicit SDPA ABI and launch the existing decode kernel.
 
@@ -2679,6 +2690,7 @@ def _host(
         ragged_q_div,
         ragged_q_i64,
         stream,
+        paged_v_hnd=paged_v_hnd,
     )
 
 
@@ -2689,8 +2701,11 @@ LSE_KINDS = ("token", "head", "padded") if CFG.THD_VARLEN and SPLIT_KV == 1 else
 
 
 @lru_cache(maxsize=None)
-def compile_thd_split(*, has_lse: bool = True, lse_kind: str = "head", paged_hnd: bool = False, has_sink: bool = False) -> Callable:
+def compile_thd_split(
+    *, has_lse: bool = True, lse_kind: str = "head", paged_hnd: bool = False, has_sink: bool = False, paged_v_hnd: Optional[bool] = None
+) -> Callable:
     """Compile only from plan facts; every token capacity and stride is dynamic."""
+    paged_v_hnd = paged_hnd if paged_v_hnd is None else paged_v_hnd
     supported_shape = (CFG.TILE_K == CFG.TILE_O == 64 and PAGED_KV) or (
         CFG.TILE_O == 128 and (CFG.TILE_K == 128 or (CFG.TILE_K == 192 and not PAGED_KV and not CFG.PACK_GQA))
     )
@@ -2700,7 +2715,16 @@ def compile_thd_split(*, has_lse: bool = True, lse_kind: str = "head", paged_hnd
     if has_sink and not (CFG.TILE_K == CFG.TILE_O == 128 and PAGED_KV and not CFG.HAS_SINK):
         raise ValueError("packed split sinks require sink-free D128 paged partials")
     return _compile_thd_split_host(
-        _host, CFG, STORAGE_DTYPE, cache_key, has_lse=has_lse, lse_kind=lse_kind, paged_hnd=paged_hnd, ragged_q_slots=True, has_sink=has_sink
+        _host,
+        CFG,
+        STORAGE_DTYPE,
+        cache_key,
+        has_lse=has_lse,
+        lse_kind=lse_kind,
+        paged_hnd=paged_hnd,
+        ragged_q_slots=True,
+        has_sink=has_sink,
+        paged_v_hnd=paged_v_hnd,
     )
 
 
@@ -2712,11 +2736,13 @@ def compile(  # noqa: A001
     lse_kind: str = "dense",
     paged_hnd: bool = False,
     ragged_i64: bool = False,
+    paged_v_hnd: Optional[bool] = None,
 ) -> Callable:
     """Compile the shared pointer ABI for dense/paged decode. Shapes and strides
     are runtime arguments; head-dim envelopes, Stats presence, pool layout and the
     ragged-Q offset width (``ragged_i64``: int64 offsets; int32 otherwise -- CFG.RAGGED_Q
     only) are specializations. All stride fakes, including page tables, are Int64."""
+    paged_v_hnd = paged_hnd if paged_v_hnd is None else paged_v_hnd
     _cache_key = _template_key(globals(), locals(), "compile")
     if ragged_i64 and not RAGGED_Q:
         raise ValueError("ragged_i64 is a RAGGED_Q specialization")
@@ -2776,4 +2802,5 @@ def compile(  # noqa: A001
         options="--enable-tvm-ffi",
         cache_key=_cache_key,
         symbol="frost_sdpa_fwd_decode",
+        paged_v_hnd=paged_v_hnd,
     )
