@@ -3262,8 +3262,6 @@ def _host(
         paged_hnd = paged_hnd_prepared
     else:
         paged_hnd = bool(PAGED_KV) and k_tensor.stride[1] < k_tensor.stride[2]
-        if cutlass.const_expr(PAGED_KV and (v_tensor.stride[1] < v_tensor.stride[2]) != paged_hnd):
-            raise ValueError("paged K and V pools must share an in-page layout (both HND or both NHD)")
     kv_stride_order = (3, 1, 2, 0) if paged_hnd else stride_order
 
     def _tma_swz(byte_w: int):

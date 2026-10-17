@@ -18,11 +18,12 @@ from cudnn.sdpa.fwd import prepared as prep
 pytestmark = [pytest.mark.L0]
 
 
-def _fixture(dtype="bfloat16", paged=False, hnd=False, lse=True, lengths=True, d=128, sq=1):
+def _fixture(dtype="bfloat16", paged=False, hnd=False, lse=True, lengths=True, d=128, sq=1, v_hnd=None):
     s = prep.DenseLaunchSpec()
     s.b, s.qh, s.kh, s.d_qk, s.d_v = 4, 8, 2, d, d
     s.s_q_max, s.s_k_max, s.page_size, s.tile_n = sq, 128, 16, 128
     s.paged, s.paged_hnd, s.has_lse, s.has_sink = paged, hnd, lse, False
+    s.paged_v_hnd = hnd if v_hnd is None else v_hnd
     s.seq_kv_present, s.seq_q_present = lengths, lengths
     s.device_index, s.split, s.window_right = 0, 1, 0
     s.ragged = s.fp32_partial = s.shape_fixed = s.lpt_grid_fixed = s.kv_tail_native = s.causal = s.causal_bottom_right = False
@@ -42,7 +43,8 @@ def _fixture(dtype="bfloat16", paged=False, hnd=False, lse=True, lengths=True, d
         shape, strides = (4, h, seq, d), (seq * h * d, d, h * d, 1)
         if paged and role in ("k", "v"):
             shape = (32, h, 16, d)
-            strides = (16 * h * d, 16 * d, d, 1) if hnd else (16 * h * d, d, h * d, 1)
+            pool_hnd = s.paged_v_hnd if role == "v" else hnd
+            strides = (16 * h * d, 16 * d, d, 1) if pool_hnd else (16 * h * d, d, h * d, 1)
         span = sum((n - 1) * st for n, st in zip(shape, strides)) + 1
         facts[role] = prep.BufferFacts(0x1000 * (i + 1), dtype, (2, 0), span, shape, strides)
     if lengths:
@@ -77,12 +79,12 @@ def _equal(s, facts, stream=17):
 
 
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
-@pytest.mark.parametrize("paged,hnd", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("paged,hnd,v_hnd", [(False, False, False), (True, False, False), (True, True, True), (True, False, True), (True, True, False)])
 @pytest.mark.parametrize("lse", [False, True])
 @pytest.mark.parametrize("lengths", [False, True])
 @pytest.mark.parametrize("d,sq", [(64, 1), (128, 1), (256, 1), (256, 4)])
-def test_native_dense_matches_python_and_rebinds(dtype, paged, hnd, lse, lengths, d, sq):
-    s, facts, _ = _fixture(dtype, paged, hnd, lse, lengths, d=d, sq=sq)
+def test_native_dense_matches_python_and_rebinds(dtype, paged, hnd, lse, lengths, d, sq, v_hnd):
+    s, facts, _ = _fixture(dtype, paged, hnd, lse, lengths, d=d, sq=sq, v_hnd=v_hnd)
     first = _equal(s, facts)
     changed = {name: f._replace(ptr=f.ptr + 0x100000) for name, f in facts.items()}
     second = _equal(s, changed, stream=23)
