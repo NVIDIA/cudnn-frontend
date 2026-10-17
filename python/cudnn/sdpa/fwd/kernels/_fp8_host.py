@@ -66,7 +66,6 @@ def host(
     amax_prescaled: cutlass.Constexpr[bool],
     table_v_strides: Optional[Tuple[cutlass.Int64, cutlass.Int64]],
     stream: _cuda_driver.CUstream = None,
-    paged_v_hnd: cutlass.Constexpr[bool] = False,
 ) -> None:
     """Bind dense or THD pointer views and launch the selected FP8 host.
 
@@ -154,9 +153,7 @@ def host(
     if cutlass.const_expr(partial_slot):
         kernel_kwargs.update(o_partial_f32=o_partial_f32)
     if cutlass.const_expr(paged):
-        kernel_kwargs.update(
-            block_table_tensor=block_table_tensor, block_table_v_tensor=block_table_v_tensor, paged_hnd_prepared=paged_hnd, paged_v_hnd_prepared=paged_v_hnd
-        )
+        kernel_kwargs.update(block_table_tensor=block_table_tensor, block_table_v_tensor=block_table_v_tensor, paged_hnd_prepared=paged_hnd)
     kernel_host(
         *args,
         scale_softmax_log2,
@@ -200,9 +197,7 @@ def compile_host(
     optional_amax=False,
     sfo_geometry=None,
     amax_prescaled=False,
-    paged_v_hnd=None,
 ):
-    paged_v_hnd = paged_hnd if paged_v_hnd is None else paged_v_hnd
     if amax_prescaled:
         cache_key = f"{cache_key}:amax_prescaled"
     if cfg.SPLIT_KV > 1 and not has_lse:
@@ -277,5 +272,4 @@ def compile_host(
         options="--enable-tvm-ffi",
         cache_key=cache_key,
         symbol="frost_sdpa_fwd_prepared",
-        paged_v_hnd=paged_v_hnd,
     )

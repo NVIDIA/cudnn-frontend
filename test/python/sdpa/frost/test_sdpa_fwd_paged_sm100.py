@@ -2864,7 +2864,7 @@ def test_paged_mxfp8_graph_declines_off_contract():
     ],
 )
 def test_paged_independent_pool_layouts(k_hnd, v_hnd, kh, dtype, d, d_v, cga, s_q, split):
-    """Each pool keeps its own TMA order, including ambiguous singleton head strides."""
+    """Each pool keeps its own strides, including ambiguous singleton head layouts."""
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
 
     _run_graph(

@@ -955,8 +955,8 @@ def test_dense_layout_rule_covers_every_tma_global_stride_and_the_lse_aliasing()
 
 @pytest.mark.parametrize("k_hnd,v_hnd", [(False, False), (True, True), (False, True), (True, False)])
 def test_paged_pools_must_be_the_compiled_in_page_layout_kind(k_hnd, v_hnd):
-    """Host-side: the paged binder refuses a pool whose in-page (row, head) order differs from the one the
-    artifact was compiled for (``paged_hnd`` orders the TMA descriptors), for K and for V alike."""
+    """Host-side: each runtime pool must retain its own declared in-page layout,
+    even when K and V declare different layout kinds."""
     from types import SimpleNamespace
 
     kh, ps, d, n_pages, b, max_pages = 2, 16, 128, 8, 2, 4
@@ -1067,7 +1067,7 @@ def test_split_prepared_strided_output_rebind_and_capture(d, stats, stats_log2, 
 @pytest.mark.parametrize("kh", [1, 2])
 @pytest.mark.parametrize("k_hnd,v_hnd", [(False, False), (True, True), (False, True), (True, False)])
 def test_paged_adapter_accepts_independent_pool_layout_at_support_check(kh, k_hnd, v_hnd):
-    """Each pool declares its own layout specialization, including singleton KH."""
+    """Each pool declares its own layout kind, including singleton KH."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     b, h, sq, d, page_size, n_pages = 2, 8, 4, 128, 16, 8

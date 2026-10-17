@@ -681,7 +681,6 @@ def _kernel(
     bias_h_extent: Optional[cutlass.Int32] = None,
     kv_mask_tensor: Optional[cute.Tensor] = None,
     inv_scale_softmax: Optional[cutlass.Float32] = None,
-    paged_v_hnd: cutlass.Constexpr[bool] = False,
 ) -> None:
     if cutlass.const_expr(PARAMS.thd_batch_one):
         # Specialize only declared batch capacity; Q/KV lengths remain live.
@@ -1019,7 +1018,6 @@ def _kernel(
             sBias=sBias,
             bias_b_extent=bias_b_extent,
             bias_h_extent=bias_h_extent,
-            paged_v_hnd=paged_v_hnd,
         )
 
     elif warp_idx == CFG.TMASTG_WARP_ID:
@@ -1188,7 +1186,6 @@ def _tmaldg_warp_group(
     sBias=None,
     bias_b_extent=None,
     bias_h_extent=None,
-    paged_v_hnd: cutlass.Constexpr[bool] = False,
 ):
     """Unified TMA-LDG warp — cga1 / cga2 x MASK_NONE / PADDED / CAUSAL / SWA.
 
@@ -1227,18 +1224,13 @@ def _tmaldg_warp_group(
         tma_tensormap_acquire(_v_rt_ptr)
         tma_k = lambda *coords: tma_slice_runtime_desc(_k_rt_ptr, *coords)  # noqa: E731
         tma_v = lambda *coords: tma_slice_runtime_desc(_v_rt_ptr, *coords)  # noqa: E731
-    elif cutlass.const_expr(PAGED_KV):
-        # Each pool has its own TMA order. HND descriptors use (D, row, H_kv, page);
-        # load sites keep (d, head, row, page), with each operand's swap here.
+    elif cutlass.const_expr(PAGED_KV and paged_hnd):
+        # HND page pools: the row stride is below the head stride, so _host
+        # built the descriptors with dims (D, row, H_kv, page). Every load site
+        # keeps the (d, head, row, page) vocabulary; the swap lives here.
         _tk, _tv = GmemTileTma(tma_k_desc), GmemTileTma(tma_v_desc)
-        if cutlass.const_expr(paged_hnd):
-            tma_k = lambda d, h, r, p: _tk(d, r, h, p)  # noqa: E731
-        else:
-            tma_k = _tk
-        if cutlass.const_expr(paged_v_hnd):
-            tma_v = lambda d, h, r, p: _tv(d, r, h, p)  # noqa: E731
-        else:
-            tma_v = _tv
+        tma_k = lambda d, h, r, p: _tk(d, r, h, p)  # noqa: E731
+        tma_v = lambda d, h, r, p: _tv(d, r, h, p)  # noqa: E731
     else:
         tma_k = GmemTileTma(tma_k_desc)
         tma_v = GmemTileTma(tma_v_desc)
@@ -3419,7 +3411,6 @@ def _host(
     kv_mask_batch_stride: cutlass.Int64,
     inv_scale_softmax: cutlass.Float32,
     stream: _cuda_driver.CUstream = None,
-    paged_v_hnd: cutlass.Constexpr[bool] = False,
 ) -> None:
     """Host entry: device pointers, runtime extents and strides in, TMA encodes and launches out.
 
@@ -3533,7 +3524,7 @@ def _host(
     tma_v_desc = tmap.create_tensor_map_tiled_from_view(
         v_tensor,
         box_dims=vo_box_v,
-        stride_order=(3, 1, 2, 0) if paged_v_hnd else stride_order,
+        stride_order=kv_stride_order,
         swizzle=_v_tma_swz,
         l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
     )
@@ -3632,7 +3623,6 @@ def _host(
         bias_h_ext,
         kv_mask_tensor,
         inv_scale_arg,
-        paged_v_hnd=paged_v_hnd,
     ).launch(
         grid=grid_shape,
         block=[CFG.THREADS_PER_CTA, 1, 1],
@@ -3656,7 +3646,6 @@ def compile(  # noqa: A001
     has_score_sum_exp: bool = False,
     has_bias: bool = False,
     has_kv_mask: bool = False,
-    paged_v_hnd: Optional[bool] = None,
 ) -> Callable:
     """Compile the host entry for one layout kind.
 
@@ -3671,13 +3660,12 @@ def compile(  # noqa: A001
     tile box stays the compile-time TILE geometry — box columns past d_qk / d_v
     zero-fill on load, O columns past d_v clip on store), whether the LSE store
     exists, the Stats layout kind, and for paged pools whether the in-page
-    layout of each pool is HND (row stride below head stride).
+    layout is HND (row stride below head stride).
 
     Constraint: every non-innermost TMA global stride must be a 16-byte
     multiple; the compact BSHD H-stride is d * BPE, so d must be a multiple of
     8 at 2 bytes/elem — checked here for the envelope, checked by the adapter
     for declared strides."""
-    paged_v_hnd = paged_hnd if paged_v_hnd is None else paged_v_hnd
     _cache_key = _template_key(globals(), locals(), "compile")
     if not (0 < d_qk <= CFG.TILE_K and 0 < d_v <= CFG.TILE_O):
         raise ValueError(f"d128 envelope: need 0 < d_qk <= {CFG.TILE_K} and 0 < d_v <= {CFG.TILE_O}; got ({d_qk}, {d_v})")
@@ -3689,7 +3677,7 @@ def compile(  # noqa: A001
         raise ValueError(f"lse_kind must be one of {LSE_KINDS}; got {lse_kind!r}")
     if has_lse and (lse_kind == "dense") == bool(CFG.THD_VARLEN):
         raise ValueError("lse_kind 'dense' is the dense form; 'token' / 'head' / 'padded' are the THD forms")
-    if (paged_hnd or paged_v_hnd) and not PAGED_KV:
+    if paged_hnd and not PAGED_KV:
         raise ValueError("paged_hnd is a paged-KV specialization")
     if (has_score_max or has_score_sum_exp) and (SPLIT_KV > 1 or CFG.THD_VARLEN or PAGED_KV):
         # The stores index the dense (B, QH, SQ) row; a split's partials and the packed THD rows have no
@@ -3758,5 +3746,4 @@ def compile(  # noqa: A001
         options="--enable-tvm-ffi",
         cache_key=_cache_key,
         symbol="frost_sdpa_fwd",
-        paged_v_hnd=paged_v_hnd,
     )

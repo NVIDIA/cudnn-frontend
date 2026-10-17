@@ -223,9 +223,10 @@ _FILLED_PER_CALL = frozenset(
 )
 
 
-def _compiled_paged_hnd(api, which_v=False) -> bool:
-    """The in-page layout kind the artifact was compiled for (``paged_hnd``: the row stride below the head
-    stride in the kernel's (page, row, head, d) order), read the way ``_explicit_compile_kwargs`` derived it."""
+def _declared_paged_hnd(api, which_v=False) -> bool:
+    """The operand's declared in-page layout: row stride below head stride in the
+    kernel's (page, row, head, d) order. K also chooses the shared TMA coordinate order;
+    the two descriptors carry independent strides in that order."""
     ps = api._paged_pool_stride(api.v_desc if which_v else api.k_desc)
     return bool(int(ps[1]) < int(ps[2]))
 
@@ -285,8 +286,8 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     s.paged, s.page_size = bool(api.paged), int(api.paged_page_size or 0)
     s.fixed_batch = bool(getattr(km, "PREPARED_FIXED_BATCH", False))
     s.workspace_alignment = int(getattr(km, "PREPARED_WORKSPACE_ALIGNMENT", _ALIGN_TMA))
-    s.paged_hnd = _compiled_paged_hnd(api) if s.paged else False
-    s.paged_v_hnd = _compiled_paged_hnd(api, which_v=True) if s.paged else False
+    s.paged_hnd = _declared_paged_hnd(api) if s.paged else False
+    s.paged_v_hnd = _declared_paged_hnd(api, which_v=True) if s.paged else False
     s.decl = dict(q=plan.q, k=plan.k, v=plan.v, o=plan.o)  # (h, d, token_stride, head_stride, elem_stride, row_span)
     s.expect = {n: str(getattr(api, f"{n}_desc").dtype).split(".")[-1] for n in ("q", "k", "v", "o")}
     # The kernel's epilogue gate on a THD plan (the f16/bf16 d256 prefill is the only THD body with the gate seams; it
@@ -778,8 +779,8 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     if hasattr(km, "N_Q") and not getattr(km, "Q_TOKEN_UNITS", False) and s.s_q_max * km.HEADS_PER_TILE > km.N_Q:
         raise ValueError(f"cudnn.sdpa: decode query rows exceed the compiled {km.N_Q}-row tile")
     s.paged, s.page_size = bool(api.paged), int(api.paged_page_size or 0)
-    s.paged_hnd = _compiled_paged_hnd(api) if s.paged else False
-    s.paged_v_hnd = _compiled_paged_hnd(api, which_v=True) if s.paged else False
+    s.paged_hnd = _declared_paged_hnd(api) if s.paged else False
+    s.paged_v_hnd = _declared_paged_hnd(api, which_v=True) if s.paged else False
     s.split = int(api.split_kv)
     s.fp32_partial = bool(api._fp32_partial_split()) if s.split > 1 else False
     s.expect = {n: str(getattr(api, f"{n}_desc").dtype).split(".")[-1] for n in ("q", "k", "v", "o")}
@@ -1010,7 +1011,7 @@ def _bind_paged_kv(spec, frame: List[Any], ix: Dict[str, int], facts: Dict[str, 
         if table.span >= 0 and table.span < need:
             raise ValueError(f"cudnn.sdpa: paged_attention_{name}_table spans {table.span} elements; ({b}, {max_pages}) with strides {strides} needs {need}")
     # the pools: (n_pages, KH, page_size, D) containers, head dim contiguous, one page count for K and V,
-    # and the in-page layout kind the artifact was compiled for (its TMA descriptors order (row, head) by it)
+    # and each operand's declared in-page layout kind (the descriptor carries that pool's own strides)
     pool_strides = {}
     for name, f, d in (("k", k, spec.d_qk), ("v", v, spec.d_v)):
         try:

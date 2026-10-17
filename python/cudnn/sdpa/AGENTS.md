@@ -1047,10 +1047,9 @@ checks zero/negative scales, keyless rows and changed-V replay.
 
 Paged pool layout is per operand. A logical `(pages, heads, page_size, dim)`
 shape does not imply physical HND storage; singleton head axes can make two
-layout kinds both report `is_contiguous()`. Specialize the TMA dimension
-order and loader coordinates from each pool's declared strides, and validate
-each runtime pool against its own compiled kind. Changing only the eligibility
-check or native binder is insufficient: a V descriptor still ordered like K
-silently produces wrong O. The `independent_pool_layouts` tests pin FROST
-execution and compare O/Stats in both mixed directions, including one KV
-head; backend fallback must not count as evidence of kernel support.
+layout kinds both report `is_contiguous()`. Validate each runtime pool against
+its own declared kind. TMA descriptors may share a coordinate order while
+carrying different strides; keep descriptor axes and loader coordinates
+consistent rather than changing one alone. The `independent_pool_layouts`
+tests pin FROST execution and compare O/Stats in both mixed directions,
+including one KV head; backend fallback must not count as kernel support.

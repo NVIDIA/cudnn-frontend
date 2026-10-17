@@ -74,8 +74,9 @@ Paged K and V may independently use HND or NHD physical storage on every
 existing paged forward row: SM100/SM103 half D64/D128/D192x128/D256/D512,
 per-tensor FP8 D64/D128, MXFP8 D128/D192x128/D256/D512; SM107 half THD
 D128/D256 and D256 decode, plus MXFP8 D128/D256. Each operand's declared
-layout is a separate plan specialization; descriptors and native binders
-validate that operand against its own layout. Runtime pointers and legal
+layout is recorded separately in the plan and checked by its native binder.
+TMA descriptors retain the existing shared coordinate order with each pool's
+own strides; no additional kernel specialization is needed. Runtime pointers and legal
 strides still rebind without repacking, allocation, or recompilation.
 Existing architecture, mask, page-size, precision and split restrictions
 remain in force. The `independent_pool_layouts` cases in the paged SM100,

@@ -3915,7 +3915,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 has_lse=self.lse_desc is not None,
                 lse_kind="head" if self.thd_stats_head_major else "token",
                 paged_hnd=ps is not None and ps[1] < ps[2],
-                paged_v_hnd=self.paged and self.v_desc.stride[2] < self.v_desc.stride[1],
                 **({"has_sink": True} if self.has_sink else {}),
             )
         if not self.thd or self.thd_decode_leg:
@@ -3963,8 +3962,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         if "paged_hnd" in accepted and self.paged:
             ps = self._paged_pool_stride(self.k_desc)  # kernel order: page, row, head, d
             kw["paged_hnd"] = ps[1] < ps[2]
-            if "paged_v_hnd" in accepted:
-                kw["paged_v_hnd"] = self.v_desc.stride[2] < self.v_desc.stride[1]
         if "ragged_i64" in accepted and self.thd_decode_leg:
             # The ragged-Q leg's offset read width (int32 or int64 offsets).
             kw["ragged_i64"] = self.ragged_offsets_int64
