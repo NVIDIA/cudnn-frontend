@@ -2586,12 +2586,12 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
                                         _ocylo = (_oclo - _mean0) * _rstd0
                                         _ocyhi = (_ochi - _mean0) * _rstd0
                                     else:
-                                        _ocgl = (_hg0, _hg1, _hg2, _hg3, _hg4, _hg5, _hg6, _hg7)[2 * _e]
-                                        _ocgh = (_hg0, _hg1, _hg2, _hg3, _hg4, _hg5, _hg6, _hg7)[2 * _e + 1]
+                                        _oc_gl = (_hg0, _hg1, _hg2, _hg3, _hg4, _hg5, _hg6, _hg7)[2 * _e]
+                                        _oc_gh = (_hg0, _hg1, _hg2, _hg3, _hg4, _hg5, _hg6, _hg7)[2 * _e + 1]
                                         _ocbl = (_hb0, _hb1, _hb2, _hb3, _hb4, _hb5, _hb6, _hb7)[2 * _e]
                                         _ocbh = (_hb0, _hb1, _hb2, _hb3, _hb4, _hb5, _hb6, _hb7)[2 * _e + 1]
-                                        _ocylo = (_oclo - _mean0) * _rstd0 * _ocgl + _ocbl
-                                        _ocyhi = (_ochi - _mean0) * _rstd0 * _ocgh + _ocbh
+                                        _ocylo = (_oclo - _mean0) * _rstd0 * _oc_gl + _ocbl
+                                        _ocyhi = (_ochi - _mean0) * _rstd0 * _oc_gh + _ocbh
                                     smem_a_list[0].data_ptr(sA_elems * _sts[_j] + _xoe[2 * _e] + _occl * cta_tile_mnk[2]).store(_ocylo.to(cutlass.BFloat16))
                                     smem_a_list[0].data_ptr(sA_elems * _sts[_j] + _xoe[2 * _e + 1] + (_occl + 1) * cta_tile_mnk[2]).store(
                                         _ocyhi.to(cutlass.BFloat16)
