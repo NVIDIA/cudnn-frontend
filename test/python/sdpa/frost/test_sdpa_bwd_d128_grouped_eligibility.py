@@ -80,8 +80,6 @@ def test_grouped_range_gates_and_widened_query_helpers():
     max_sk = 2**31 // 16 - 128
     assert reason(grouped_facts(thd=False, b=1, h_q=2, h_kv=1, s_kv=max_sk)) is None
     assert "vector index" in reason(grouped_facts(thd=False, b=1, h_q=2, h_kv=1, s_kv=max_sk + 128))
-    # Query helper rows and addresses are widened; total Q rows need not fit Int32.
-    assert reason(grouped_facts(thd=False, b=32768, h_q=2, h_kv=1, s_q=32768, s_kv=128)) is None
     # External KV uses Hkv, but native partial maps use Hq and compact KV capacity.
     value = grouped_facts(thd=True, b=1, h_q=32768, h_kv=1, s_q=128, s_kv=131072, max_total_seq_len_q=128, max_total_seq_len_kv=131072)
     assert "native KV partial byte stride" in reason(value)
@@ -114,6 +112,20 @@ def test_grouped_packed_layout_uses_each_ports_head_count(packing):
     ],
 )
 def test_grouped_graph_gate_matches_standalone(monkeypatch, thd, cc, scale, version, accepted):
+    value = grouped_facts(thd=thd, packing="HN", device_cc=cc, scale=scale)
+    _assert_grouped_graph_and_standalone_gate(monkeypatch, value, version, accepted)
+
+
+@pytest.mark.parametrize("batch,accepted", [(32767, True), (32768, False), (32769, False)])
+def test_grouped_dense_stats_int32_boundary(monkeypatch, batch, accepted):
+    value = grouped_facts(thd=False, b=batch, h_q=2, h_kv=1, s_q=32768, s_kv=128)
+    if not accepted:
+        assert "Stats/Delta span" in reason(value)
+        assert recommend("A", value, {"sdpa_bwd_sm100_d128": 20609}) == []
+    _assert_grouped_graph_and_standalone_gate(monkeypatch, value, "4.8.0", accepted)
+
+
+def _assert_grouped_graph_and_standalone_gate(monkeypatch, value, version, accepted):
     from cudnn import _pybind_module
     from cudnn.api_base import TensorDesc
     from cudnn.frost import buffers, device
@@ -122,9 +134,9 @@ def test_grouped_graph_gate_matches_standalone(monkeypatch, thd, cc, scale, vers
     state = lambda: (True, ("nvidia-cutlass-dsl", version))
     monkeypatch.setattr(engines, "cutedsl_state", state)
     monkeypatch.setattr(buffers, "cutedsl_state", state)
-    monkeypatch.setattr(device, "compute_capability", lambda _: cc)
+    monkeypatch.setattr(device, "compute_capability", lambda _: value.device_cc)
     monkeypatch.setattr(_pybind_module, "_SdpaBwdBinder", SimpleNamespace(supports_zero_workspace=True))
-    value = grouped_facts(thd=thd, packing="HN", device_cc=cc, scale=scale)
+    thd = value.thd
     geometry = {name.lower(): (dim, stride) for name, dim, stride in value.port_layouts}
     geometry["stats"] = value.stats_t.get_dim(), value.stats_t.get_stride()
     samples = {
@@ -142,7 +154,7 @@ def test_grouped_graph_gate_matches_standalone(monkeypatch, thd, cc, scale, vers
     api = SdpaBwdDslSm100D128(
         **samples,
         thd=thd,
-        scale_softmax=scale,
+        scale_softmax=value.scale,
         max_total_seq_len_q=value.max_total_seq_len_q,
         max_total_seq_len_kv=value.max_total_seq_len_kv,
         thd_stats_head_stride=value.stats_t.get_stride()[1] if thd else None,

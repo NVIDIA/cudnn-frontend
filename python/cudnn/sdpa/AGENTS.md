@@ -160,6 +160,13 @@ ordered after that read.**
   SASS opcode. See [PTX ISA, specialized synchronization and canonical
   patterns](https://docs.nvidia.com/cuda/parallel-thread-execution/),
   sections 9.7.18.6.3–6.4 and 9.7.18.11.1 in PTX 9.4.
+- A DSL version gate does not establish support for every PTX modifier in
+  the installed compiler. Cross-compile with the advertised public package's
+  default CUDA flavor. A CTA-group-1 kernel allocating all 512 TMEM columns
+  can use ordinary allocation/deallocation; the `.exclusive` modifier can
+  fail assembly even with public CuTeDSL 4.8. The d128 dense, THD and grouped
+  execution tests must cover all four accumulation routes, plus recompute
+  as an unchanged control.
 
 
 **Rule S4 — Split-K partial Stats keep the combiner's log base.**

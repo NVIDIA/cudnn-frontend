@@ -291,8 +291,9 @@ Engines: `sdpa_fwd_prefill_sm100` (f16/bf16), `sdpa_fwd_prefill_sm100_fp8`,
 `sdpa_bwd_sm100_d256`, `sdpa_bwd_sm100_d128`. The half-precision d512 backward engine serves **only
 the large-head-dim band, d ∈ (256, 512]**, the half-precision d256 backward
 engine (`sdpa_bwd_sm100_d256`, the 2x2-datapath body, 2026-10-01, opt_in) serves
-**exactly d = 256**, the MHA half-precision d128 engine serves **exactly
-d = 128**, and the MXFP8 backward engine serves **exactly d = 256** —
+**exactly d = 256**, the d128 engine serves **exactly d = 128** for
+half-precision MHA and, on exact SM100, BF16 GQA/MQA within the restrictions
+below. The MXFP8 backward engine serves **exactly d = 256** —
 every other `sdpa_backward()` / `sdpa_mxfp8_backward()` shape still falls
 through to the cuDNN backend. The d512 BPROP column below reads ᵇ for the
 half-precision d512 row and ᵍ for the MXFP8 row; the d256 BPROP column reads ᵇ²

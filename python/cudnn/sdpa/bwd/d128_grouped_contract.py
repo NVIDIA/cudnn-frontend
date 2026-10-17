@@ -27,6 +27,9 @@ def validate_dense_bounds(batch, heads, kv_heads, sq, skv):
     validate_dimensions(batch, heads, kv_heads, sq, skv)
     if sq % 128 or skv % 128:
         raise ValueError("dense sequence lengths must be multiples of 128")
+    # The main kernel indexes dense Stats and Delta with Int32 row offsets.
+    if batch * heads * sq > 2**31 - 1:
+        raise ValueError("dense Stats/Delta span exceeds the Int32 index range")
     # The shared fold computes bidx*256+tidx in Int32 before its widened
     # element-address math. Aligned Skv makes this vector count block-aligned.
     if batch * skv * kv_heads * 16 > 2**31 - 1:

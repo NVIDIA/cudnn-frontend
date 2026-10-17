@@ -173,7 +173,7 @@ def bprop_d128_accum_grouped_dense_kernel(
     sched_words = dense._view(slab, CFG.SCHED_PAYLOAD, cutlass.Int32, 16, alignment=16)
     sched = Sched(bars.sched_full.base_ptr, bars.sched_empty.base_ptr, sched_words, x, y, z)
     if warp == 0:
-        nvvm.tcgen05_alloc(tmem_slot, cutlass.Int32(CFG.TMEM_COLS), is_exclusive=True, group=nvvm.CTAGroup.CTA_1)
+        nvvm.tcgen05_alloc(tmem_slot, cutlass.Int32(CFG.TMEM_COLS), group=nvvm.CTAGroup.CTA_1)
         nvvm.tcgen05_relinquish_alloc_permit(group=nvvm.CTAGroup.CTA_1)
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
         if nvvm.elect_sync():
@@ -198,7 +198,7 @@ def bprop_d128_accum_grouped_dense_kernel(
     nvvm.barrier_cta_sync()
     if warp == 0:
         nvvm.tcgen05_fence(nvvm.Tcgen05Fence.AFTER_THREAD_SYNC)
-        nvvm.tcgen05_dealloc(nvvm.make_tmem_ptr(tmem_slot.load(), cutlass.Int8), cutlass.Int32(CFG.TMEM_COLS), is_exclusive=True, group=nvvm.CTAGroup.CTA_1)
+        nvvm.tcgen05_dealloc(nvvm.make_tmem_ptr(tmem_slot.load(), cutlass.Int8), cutlass.Int32(CFG.TMEM_COLS), group=nvvm.CTAGroup.CTA_1)
 
 
 @cute.kernel
@@ -224,7 +224,7 @@ def bprop_d128_accum_grouped_thd_kernel(
     sched_words = packed._view(slab, CFG.SCHED_PAYLOAD, cutlass.Int32, 16, alignment=16)
     sched = Sched(bars.sched_full.base_ptr, bars.sched_empty.base_ptr, sched_words, x, y, z)
     if warp == 0:
-        nvvm.tcgen05_alloc(tmem_slot, cutlass.Int32(CFG.TMEM_COLS), is_exclusive=True, group=nvvm.CTAGroup.CTA_1)
+        nvvm.tcgen05_alloc(tmem_slot, cutlass.Int32(CFG.TMEM_COLS), group=nvvm.CTAGroup.CTA_1)
         nvvm.tcgen05_relinquish_alloc_permit(group=nvvm.CTAGroup.CTA_1)
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
         if nvvm.elect_sync():
@@ -249,7 +249,7 @@ def bprop_d128_accum_grouped_thd_kernel(
     nvvm.barrier_cta_sync()
     if warp == 0:
         nvvm.tcgen05_fence(nvvm.Tcgen05Fence.AFTER_THREAD_SYNC)
-        nvvm.tcgen05_dealloc(nvvm.make_tmem_ptr(tmem_slot.load(), cutlass.Int8), cutlass.Int32(CFG.TMEM_COLS), is_exclusive=True, group=nvvm.CTAGroup.CTA_1)
+        nvvm.tcgen05_dealloc(nvvm.make_tmem_ptr(tmem_slot.load(), cutlass.Int8), cutlass.Int32(CFG.TMEM_COLS), group=nvvm.CTAGroup.CTA_1)
 
 
 bprop_d128_accum_grouped_dense_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
