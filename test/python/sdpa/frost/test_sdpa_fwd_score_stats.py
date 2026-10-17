@@ -32,6 +32,7 @@ import pytest
 import torch
 
 from frost_test_utils import _SM, assert_no_new_spills, make_dense_stats, offers_engine, requires_blackwell, requires_dsl, run_sass_probe, sass_probe_source
+from test_sdpa_fwd_decode_d256_sm107 import _DSL_FLOOR_WHY
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 
@@ -92,6 +93,8 @@ def test_rows_claim_exactly_the_wired_flavors():
 def test_mismatch_accepts_and_rejects(row):
     """Accept: dense d128 f16, each output alone, with Stats, with base-2 Stats, without Stats.  Reject (typed reasons):
     THD, paged KV, an unwired flavor, split_kv > 1 and the cga=1 tile."""
+    if row == "sdpa_fwd_prefill_sm107" and _DSL_FLOOR_WHY:
+        pytest.skip(_DSL_FLOOR_WHY)  # Rule 7: below the sm_107a DSL floor the Rubin row declines typed before any claim
     from cudnn.sdpa.fwd import engines
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
 
@@ -255,6 +258,8 @@ def _stub_compiled(monkeypatch, api):
 def test_adapter_check_support_declines_typed(monkeypatch, cc):
     """Rule 8b twins of the rows' claims on the STANDALONE adapter: the accept side first, then each decline typed --
     ValueError for a malformed request, NotImplementedError for "not mine" -- and execute's presence contract both ways."""
+    if cc == (10, 7) and _DSL_FLOOR_WHY:
+        pytest.skip(_DSL_FLOOR_WHY)  # Rule 7: below the sm_107a DSL floor the Rubin adapter declines typed before any claim
     _fake_cc(monkeypatch, cc)
     api = _api()
     assert api.check_support()

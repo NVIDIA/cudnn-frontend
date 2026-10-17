@@ -52,7 +52,12 @@ def test_direct_launcher_fills_every_required_slot_of_the_host(arch, template, d
     and addresses; nothing is compiled or launched) and compared with the host's required runtime slots."""
     import inspect
 
-    mod = _load(arch, template, d_qk, d_v)
+    try:
+        mod = _load(arch, template, d_qk, d_v)
+    except NotImplementedError as e:
+        if "sm_107a" in str(e):
+            pytest.skip(str(e))  # Rule 7: below the sm_107a DSL floor the Rubin host declines typed; the pin runs where it loads
+        raise
     host_params = inspect.signature(mod._host).parameters
     required = [n for n, p in host_params.items() if "Constexpr" not in str(p.annotation) and p.default is inspect.Parameter.empty]
     b, h, sq, skv = 1, 2, 4, 256  # the decode tiles' row guard: S_q x HEADS_PER_TILE <= N_Q

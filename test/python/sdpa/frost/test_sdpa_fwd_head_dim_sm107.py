@@ -42,6 +42,7 @@ import torch
 
 from frost_test_utils import assert_no_new_spills, requires_dsl, requires_rubin, run_sass_probe, sass_probe_source
 from small_tile_cells import CASES, TOL_O, case_inputs, check, check_degenerate_rows, run_graph
+from test_sdpa_fwd_decode_d256_sm107 import requires_sm107_dsl
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 
@@ -86,6 +87,7 @@ def _rubin_pool():
     return tuple(f for f in _SM107_FLAVORS if f in _SM107_KERNEL_FILES)
 
 
+@requires_sm107_dsl
 def test_row_serves_every_small_head_dim_on_the_next_width():
     """The three implementations of the pick agree on every served D (rule 8b'): the row's envelope walk
     (``engines._selected_d_shape``), the adapter's flavor pool (``api_dsl._pick_flavor``) and ``sm107_f16_tile_width``; a D above
@@ -121,6 +123,7 @@ def test_row_serves_every_small_head_dim_on_the_next_width():
     assert _pick_flavor(24, 24, None) == (64, 64), "Blackwell has no 32-wide tile: its smallest flavor stays d64"
 
 
+@requires_sm107_dsl
 def test_row_serves_the_dense_leg_on_the_small_tiles():
     """Accept on the small tiles: the dense feature set at d32 (both dtypes, causal / bottom-right / right band / SWA / padded /
     sink / GQA / Stats natural and base-2 / no Stats), cga1 at d32, cga1 and cga2 at d64; the auto pick is cga1 on both."""
@@ -184,6 +187,7 @@ _LEGS = (
 _DECLINE_WORDS = {"THD": "THD", "PackGQA": "PackGQA", None: "cga"}
 
 
+@requires_sm107_dsl
 def test_row_routes_every_leg_beyond_dense_past_the_small_tiles():
     """The small tiles carry the dense leg ONLY (``Capabilities.dense_only_d_shapes``): split-KV and the score side outputs at
     D <= 64 select the d128 flavor (the pre-tile route, where ``split_d_shapes`` / ``score_stats_d_shapes`` name it) and are
@@ -403,6 +407,7 @@ def _rubin_device_for_the_adapter(monkeypatch):
         monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 7))
 
 
+@requires_sm107_dsl
 def test_adapter_check_support_twins_and_record():
     """The standalone adapter on a Rubin device: a small head dim is admitted, the compile-time record carries the tile's
     ``d_flavor`` and cga1; the legs beyond the dense one route like the row (cga2 at d24 -> the 64-wide tile, split-KV / the
