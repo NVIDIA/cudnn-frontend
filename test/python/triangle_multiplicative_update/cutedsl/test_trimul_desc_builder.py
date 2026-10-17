@@ -1,5 +1,5 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 """The LayerNorm-prologue dual GEMM's tcgen05 SMEM-descriptor builder (``ln_prologue.tcgen05_smem_desc_builder``) -- host tests, no GPU.
 
