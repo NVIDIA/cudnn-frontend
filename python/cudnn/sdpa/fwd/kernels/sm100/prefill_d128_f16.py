@@ -29,7 +29,7 @@ SM100 resource layout:
      fuses load and row-max into ``tmem_load_max_reduction_x64``.  Masked
      tiles always take the software path.
   4. **Softmax pipe balance**: the per-KV ring waits spin (``SPIN_RING_WAITS``)
-     and, on cc 10.0 dense-band builds only, 32 of the 128 P columns per row
+     and, on cc 10.0 dense bands and eligible causal THD interior tiles, 32 of the 128 P columns per row
      take the FMA-pipe exp2 (``_E2E_*`` / ``exp2_mixed``) -- both measured
      against the cuDNN SM100 bf16 prefill, see the constants' comments.
   5. SM100 launch: ``cluster=(CTA_MMA, 1, 1)``.
@@ -258,17 +258,26 @@ _NB_FENCE_P0 = 11
 # exp2 split MUFU / FMA (``_E2E_*``): of every _E2E_FREQ P columns the LAST _E2E_RES are evaluated on the FMA
 # pipe (``exp2_emul_pair``, a degree-3 polynomial + exponent insert), the rest on MUFU.EX2 -- the sm100 d128
 # MXFP8 / FP8 kernels' pattern.  Two trace-time gates fold it in or out: ``PARAMS.exp2_fma_split`` (api_dsl,
-# cc 10.0 only -- cc 10.3's MUFU runs at twice the rate and the split loses there) AND a dense band: on the
-# causal / sliding-window builds the split measured a loss on cc 10.0 (the masked diagonal tiles pay the FMA
-# work without the MUFU relief), so those builds keep every column on MUFU.  Off, both exp2 sites below trace
-# the develop spelling and the module is IR-identical to the unsplit kernel.  Padding (THD / seq_kv_lens) is
-# not a band and keeps the split.
+# cc 10.0 only -- cc 10.3 retains its all-MUFU path) AND a tile/layout gate. Dense bands retain
+# their existing mix. BF16 D128 causal THD also mixes interior tiles, where apply_mask is false;
+# its diagonal/masked tiles retain MUFU. Dense causal, sliding-window, FP16 causal THD, d64 THD,
+# paged THD, and split-KV builds retain their previous behavior. Padding alone is not a causal/SWA band.
 _E2E_FREQ = 16
 _E2E_RES = 4
 _E2E_LIMIT = CFG.TILE_N
 _SOFTMAX_CHUNK = 64  # tcgen05_ld width of one softmax chunk (see _softmax_kv_body CHUNK)
 _E2E_DENSE_BAND = (CFG.MASK_FLAGS & (MASK_CAUSAL | MASK_SWA)) == 0
-_E2E_ENABLED = bool(PARAMS.exp2_fma_split) and _E2E_DENSE_BAND
+# SM100 D128 BF16 nonpaged THD causal interior extension for CP workloads. Keep the
+# existing architecture gate and use MUFU on every masked/diagonal tile.
+_E2E_THD_INTERIOR = bool(
+    CFG.THD_VARLEN
+    and not CFG.PAGED_KV
+    and CFG.DTYPE_QKV == 2
+    and PARAMS.d_flavor == 128
+    and CFG.SPLIT_KV == 1
+    and (CFG.MASK_FLAGS & (MASK_CAUSAL | MASK_SWA)) == MASK_CAUSAL
+)
+_E2E_ENABLED = bool(PARAMS.exp2_fma_split) and (_E2E_DENSE_BAND or _E2E_THD_INTERIOR)
 _E2E_EMULATED_COLS = (_E2E_LIMIT // _E2E_FREQ) * _E2E_RES if _E2E_ENABLED else 0
 if _E2E_ENABLED:
     if not (0 <= _E2E_RES <= _E2E_FREQ and _E2E_FREQ % 2 == 0 and _E2E_RES % 2 == 0 and _E2E_LIMIT % _E2E_FREQ == 0):
@@ -1922,7 +1931,7 @@ def _softmax_kv_body(
     chunk_S_0 = reg_S[0:CHUNK].vec
     # exp2 split: the _E2E_PAIRS[chunk] columns on the FMA pipe, the rest on MUFU (see _E2E_FREQ).  Folded at
     # trace time (_E2E_ENABLED): off, this chunk is the plain MUFU exp2 -- the develop spelling.
-    if cutlass.const_expr(_E2E_ENABLED):
+    if cutlass.const_expr(_E2E_ENABLED and (_E2E_DENSE_BAND or not apply_mask)):
         chunk_P_0 = exp2_mixed(chunk_S_0, _E2E_PAIRS[0], CHUNK)
     else:
         chunk_P_0 = cute.math.exp2(chunk_S_0, fastmath=True)
@@ -1943,7 +1952,7 @@ def _softmax_kv_body(
     deferred_P_1 = None
     if cutlass.const_expr(N_CHUNKS == 2):
         chunk_S_1 = reg_S[CHUNK : 2 * CHUNK].vec
-        if cutlass.const_expr(_E2E_ENABLED):
+        if cutlass.const_expr(_E2E_ENABLED and (_E2E_DENSE_BAND or not apply_mask)):
             deferred_P_1 = exp2_mixed(chunk_S_1, _E2E_PAIRS[1], CHUNK)
         else:
             deferred_P_1 = cute.math.exp2(chunk_S_1, fastmath=True)
