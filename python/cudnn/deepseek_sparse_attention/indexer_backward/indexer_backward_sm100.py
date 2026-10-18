@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Indexer Backward — SM100 CuTe-DSL, 3-kernel design.
+Indexer Backward — SM100 CuTe-DSL.
 
 Three stream-ordered kernels; the first two use programmatic dependent launch
 to overlap independent prologue work while preserving their data dependencies:
@@ -17,6 +17,11 @@ to overlap independent prologue work while preserving their data dependencies:
       SMEM and issues 512-byte cp.reduce.async.bulk FP32 additions.
   Kernel 3 (PyTorch):  dk_convert — cast dK from float32 to output dtype
       (same as dQ, dW).
+
+The deterministic specialization keeps kernel 2 but maps a selected persistent
+CTA count to fixed query stripes and gives each CTA one private FP32 dK plane. One
+trailing CuTe DSL kernel folds the planes in fixed CTA order and stores the
+requested output dtype. The ordinary path above is unchanged.
 
 Kernel 2 — Warp specialization (16 warps, 512 threads):
   Warp 0:      Load (Q via TMA, weights, grad_signal)
@@ -46,6 +51,12 @@ SMEM (kernel 2): full-row grad_signal/top-k staging plus a four-warp padded
   FP32 ping-pong buffer for bulk dK reduction.
 TMEM: S0/dK0 @0, dQ @128, S1/dK1 @256 (384/512 cols).
 
+H32 tensors stay compact at the public/global-memory boundary. Because
+TCGEN05 does not accept M32, GEMM1/GEMM3 use an internal M64 tile whose upper
+half is zero-filled by TMA and zero weights; the dQ tensor map clips stores to
+H32 and dW stores predicate the upper half. This avoids caller-side H64 padding
+while retaining the proven Gather4 schedule and its numerical order.
+
 Barriers for kernel 2:
   mbar[0-1]:  S_full_0/1     (MMA commits after GEMM1  → Compute waits)
   mbar[2-3]:  dS_ready_0/1   (Compute arrives after dS  → MMA waits)
@@ -64,7 +75,8 @@ CTA per SM; it retains TMEM across rows and consolidates per-row barrier
 initialization.  The short-row variants select it only when the grid has more
 rows than SMs.  Stage phases are derived from the number of 128-wide blocks per
 row so the same schedule is valid for one through four blocks.
-TopK=1024/2048 retain the one-query-per-CTA 2-D grid.
+Ordinary TopK=1024/2048 retain the one-query-per-CTA 2-D grid; deterministic
+execution uses the fixed-owner serial-persistent grid at every TopK.
 """
 
 from __future__ import annotations
@@ -108,6 +120,16 @@ from cudnn.deepseek_sparse_attention.utils.copy import cpasync_reduce_bulk_add_f
 from cudnn.deepseek_sparse_attention.utils.runtime import (
     resolve_stream as _resolve_stream,
     torch_stream_context as _torch_stream_context,
+)
+from cudnn.frost.buffers import memset_zero_async
+
+from .deterministic_dk_sm100 import (
+    DEFAULT_DK_PLANES,
+    deterministic_dk_producer_ctas,
+    deterministic_dk_planes_bytes,
+    deterministic_dk_workspace_bytes,
+    reduce_deterministic_dk,
+    validate_deterministic_dk_plane_policy,
 )
 
 _HAS_TMA_GATHER4 = all(
@@ -372,6 +394,13 @@ def _tma_gather4_k_rows(
 
 
 class IndexerBackwardSm100:
+    """Warp-specialized SM100 GEMM stage for sparse indexer backward.
+
+    Compact H32 tensors use the same internal M64 TCGEN05 schedule as H64:
+    out-of-range Q rows and weights are zero-filled, while dQ/dW stores are
+    clipped to the logical head count.
+    """
+
     arch = 100
     WARP_SIZE = 32
     WARPGROUP_SIZE = 128
@@ -404,7 +433,22 @@ class IndexerBackwardSm100:
         persistent_grid_size: int = 1,
         topk_indices_global: bool = True,
         enable_score_pdl: bool = False,
+        deterministic: bool = False,
     ):
+        """Configure tiling, persistence, sparse-index convention, and PDL.
+
+        Args:
+            head_dim: Logical Q/K head dimension.
+            heads: Logical query-head count; H32 and H64-or-larger are valid.
+            block_I: Sparse top-k block width; ``topk`` must be divisible by it.
+            topk: Number of selected KV rows per query row.
+            total_seqlen_k: Runtime KV capacity metadata retained by the factory.
+            total_rows: Total query rows, used only to select launch policy.
+            persistent_grid_size: CTA count available to a persistent launch.
+            topk_indices_global: Whether indices are already flattened across batches.
+            enable_score_pdl: Allow dependency overlap with the preceding score grid.
+            deterministic: Use fixed CTA row ownership and CTA-private dK planes.
+        """
         self.head_dim = head_dim
         self.heads = heads
         self.block_I = block_I
@@ -419,24 +463,28 @@ class IndexerBackwardSm100:
         # ``gemm_only`` calls compile a non-PDL variant to preserve arbitrary
         # stream-predecessor semantics.
         self.enable_score_pdl = enable_score_pdl
+        self.deterministic = bool(deterministic)
         # When True (default, matches the public fwd convention), mTopkIdx
         # carries global KV ids (``b * seqlen_k + local``); the kernel uses
         # them as flat ids into the (B*S_k, D) K/dK view directly. When
         # False, mTopkIdx carries local-per-batch ids and the kernel adds
         # ``batch_idx * S_k_per_batch`` to convert. Const_expr-branched.
         self.topk_indices_global = topk_indices_global
-        assert heads >= 64
+        assert heads == 32 or heads >= 64, "supported head counts are H=32 and H>=64"
         assert topk > 0
         assert topk % block_I == 0
         self.num_topk_blocks = topk // block_I
 
         self.head_dim_padded = int(math.ceil(head_dim / 16) * 16)
-        self.heads_padded = int(math.ceil(heads / 8) * 8)
+        # TCGEN05 requires M >= 64. H32 keeps the public tensors compact and
+        # zero-fills only the upper half of the internal Q/dS tiles; no H64
+        # global tensors or caller-side padding traffic is needed.
+        self.heads_padded = 64 if heads == 32 else int(math.ceil(heads / 8) * 8)
         # Half-dS publication is specialized for the production TopK=512,
         # H64 x I128 fragment map. Larger TopK values retain the full-dS drain
         # order because the additional barrier traffic regresses them.
         self.use_ds_half = topk == 512 and self.heads_padded == 64 and block_I == 128
-        self.use_persistent = (
+        self.use_persistent = self.deterministic or (
             topk in (128, 256, 384, 512)
             and self.heads_padded == 64
             and self.head_dim_padded == 128
@@ -455,7 +503,10 @@ class IndexerBackwardSm100:
         # existing manual cp.async loader; both paths feed identical BF16 K
         # tiles into the same FP32 GEMMs.
         self.use_tma_gather = _HAS_TMA_GATHER4
-        self.use_cross_row_persistent = self.use_persistent and self.use_tma_gather
+        # Cross-row double buffering is sized for the established short-row
+        # variants. Deterministic TopK 1024/2048 uses the fully drained serial
+        # persistent loop so its one-row SMEM footprint stays within the cap.
+        self.use_cross_row_persistent = self.use_persistent and self.use_tma_gather and topk <= 512
 
         # GEMM tilers (M, N, K) — cute.gemm, SMEM operands, TMEM acc
         # GEMM1: S[H,TileN] = Q[H,D] @ K[TileN,D].  A=Q K-major, B=K K-major
@@ -500,6 +551,10 @@ class IndexerBackwardSm100:
             barrier_id=4,
             num_threads=self.WARP_SIZE + 2 * self.WARPGROUP_SIZE,
         )
+        self.dk_row_barrier = pipeline.NamedBarrier(
+            barrier_id=5,
+            num_threads=self.WARPGROUP_SIZE,
+        )
 
     @cute.jit
     def __call__(
@@ -515,6 +570,7 @@ class IndexerBackwardSm100:
         sm_scale: Float32 | float,
         stream: cuda.CUstream,
     ):
+        """Materialize tensor views and launch the configured GEMM kernel."""
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
 
@@ -668,7 +724,10 @@ class IndexerBackwardSm100:
         seqlen = cute.size(mQ.shape[0])
         batch_size = cute.size(mQ.shape[3]) if cute.rank(mQ.shape) > 3 else 1
 
-        launch_grid = (cutlass.min(seqlen * batch_size, self.persistent_grid_size), 1, 1) if self.use_persistent else (seqlen, batch_size, 1)
+        if const_expr(self.deterministic):
+            launch_grid = (self.persistent_grid_size, 1, 1)
+        else:
+            launch_grid = (cutlass.min(seqlen * batch_size, self.persistent_grid_size), 1, 1) if self.use_persistent else (seqlen, batch_size, 1)
         self.kernel_gemm(
             mQ_tma,
             mW,
@@ -733,6 +792,7 @@ class IndexerBackwardSm100:
         seqlen: Int32,
         batch_size: Int32,
     ):
+        """Run the warp-specialized GEMMs in serial-row or persistent-row mode."""
         # ScoreGrad launches this grid programmatically.  Serial rows wait at
         # entry; the cross-row persistent path delays the wait until its load
         # warp has issued the independent first-row Q TMA, allowing the Q/K
@@ -751,6 +811,17 @@ class IndexerBackwardSm100:
             flat_row_idx = batch_idx * seqlen + seq_idx
         seqlen_k = cute.size(mK.shape[0])
         total_rows = seqlen * batch_size
+        if const_expr(self.deterministic):
+            # Each launched CTA owns one dense plane and at least one fixed-
+            # stripe row, so dK has no cross-CTA write races.
+            plane_offset = cutlass.Int64(cute.arch.block_idx()[0]) * cutlass.Int64(seqlen_k) * cutlass.Int64(self.head_dim)
+            mdK_f32 = cute.make_tensor(
+                mdK_f32.iterator + plane_offset,
+                cute.make_layout(
+                    (seqlen_k, self.head_dim),
+                    stride=(cutlass.Int64(self.head_dim), 1),
+                ),
+            )
 
         # TMA descriptor prefetch (load warp only)
         if warp_idx == self.load_warp_id:
@@ -768,7 +839,7 @@ class IndexerBackwardSm100:
         _row_operand_stages = 2 if self.use_cross_row_persistent else 1
         _sQ_storage_size = int(sQ_size) * _row_operand_stages
         _grad_storage_size = self.topk * _row_operand_stages
-        _weight_storage_size = self.heads * _row_operand_stages
+        _weight_storage_size = self.heads_padded * _row_operand_stages
         _dq_epi_storage_size = int(sdQ_epi_size) if self.use_cross_row_persistent else 1
 
         # Cross-row persistence double-buffers top-k IDs; all other paths need
@@ -824,7 +895,7 @@ class IndexerBackwardSm100:
 
         sGradSignal = storage.sGradSignal.get_tensor(cute.make_layout((self.topk,), stride=(1,)))
         sTopkIdxs = storage.sTopkIdxs.get_tensor(cute.make_layout((smem_topk_capacity,), stride=(1,)))
-        sW = storage.sW.get_tensor(cute.make_layout((self.heads,), stride=(1,)))
+        sW = storage.sW.get_tensor(cute.make_layout((self.heads_padded,), stride=(1,)))
         sdKStage = storage.sdKStage.get_tensor(cute.make_layout((_dk_stage_elements,), stride=(1,)))
 
         if const_expr(self.use_cross_row_persistent):
@@ -1023,6 +1094,15 @@ class IndexerBackwardSm100:
                 tmma3.__extract_mlir_values__(),
             )
 
+        # Rendezvous all TMEM consumers at one static named-barrier
+        # instruction before the role-specific control flow.  Keeping the
+        # same barrier ID at multiple program counters prevents reliable
+        # synchronization validation and makes participant drift easy to miss.
+        if warp_idx == self.compute_warp_id[0]:
+            tmem.allocate(self.tmem_alloc_cols)
+        if warp_idx == self.mma_warp_id or warp_idx in self.compute_warp_id or warp_idx in self.reduce_warp_id:
+            tmem.wait_for_alloc()
+
         # =============================================================
         # Warp dispatch — setmaxnreg rebalances registers across WGs.
         # =============================================================
@@ -1045,7 +1125,6 @@ class IndexerBackwardSm100:
 
         elif warp_idx == self.mma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_wg0)
-            tmem.wait_for_alloc()
             tmem_ptr_base = tmem.retrieve_ptr(self.acc_dtype)
             tStS_0, tStS_1, tDqDq, tDkDk_0, tDkDk_1 = self.get_tmem_tensor(
                 s_acc_layout,
@@ -1080,9 +1159,6 @@ class IndexerBackwardSm100:
 
         elif warp_idx in self.compute_warp_id:
             cute.arch.setmaxregister_increase(self.num_regs_compute)
-            if warp_idx == self.compute_warp_id[0]:
-                tmem.allocate(self.tmem_alloc_cols)
-            tmem.wait_for_alloc()
             tmem_ptr_base = tmem.retrieve_ptr(self.acc_dtype)
             tStS_0, tStS_1, tDqDq, tDkDk_0, tDkDk_1 = self.get_tmem_tensor(
                 s_acc_layout,
@@ -1145,7 +1221,6 @@ class IndexerBackwardSm100:
 
         elif warp_idx in self.reduce_warp_id:
             cute.arch.setmaxregister_increase(self.num_regs_reduce)
-            tmem.wait_for_alloc()
             tmem_ptr_base = tmem.retrieve_ptr(self.acc_dtype)
             tStS_0, tStS_1, tDqDq, tDkDk_0, tDkDk_1 = self.get_tmem_tensor(
                 s_acc_layout,
@@ -1362,10 +1437,6 @@ class IndexerBackwardSm100:
             cute.arch.mbarrier_init(mbar + MBAR_W_LOADED, self.WARP_SIZE)
             cute.arch.mbarrier_init(mbar + MBAR_DQ_DONE, 1)
             cute.arch.mbarrier_init(
-                mbar + MBAR_REDUCE_DONE,
-                self.WARPGROUP_SIZE,
-            )
-            cute.arch.mbarrier_init(
                 mbar + MBAR_DS_HALF_0,
                 self.WARPGROUP_SIZE,
             )
@@ -1407,6 +1478,13 @@ class IndexerBackwardSm100:
             ),
             sQ_layout.outer,
         )
+
+        # Keep the 288 TMEM-consuming threads on one static BAR.SYNC before
+        # the role-specific loops diverge.
+        if warp_idx == self.compute_warp_id[0]:
+            tmem.allocate(self.tmem_alloc_cols)
+        if warp_idx == self.mma_warp_id or warp_idx in self.compute_warp_id or warp_idx in self.reduce_warp_id:
+            tmem.wait_for_alloc()
 
         if warp_idx == self.load_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_wg0)
@@ -1474,8 +1552,8 @@ class IndexerBackwardSm100:
                     cute.make_layout((self.topk,), stride=(1,)),
                 )
                 sW_row = cute.make_tensor(
-                    sW_storage_ptr + parity * self.heads,
-                    cute.make_layout((self.heads,), stride=(1,)),
+                    sW_storage_ptr + parity * self.heads_padded,
+                    cute.make_layout((self.heads_padded,), stride=(1,)),
                 )
                 seqlen_k_per_batch = seqlen_k // batch_size
                 batch_offset_l2g = Int32(0) if const_expr(self.topk_indices_global) else batch_idx * seqlen_k_per_batch
@@ -1495,11 +1573,10 @@ class IndexerBackwardSm100:
                             batch_idx,
                         ]
                 for step in cutlass.range_constexpr(
-                    (self.heads + self.WARP_SIZE - 1) // self.WARP_SIZE,
+                    (self.heads_padded + self.WARP_SIZE - 1) // self.WARP_SIZE,
                 ):
                     h = step * self.WARP_SIZE + lane_id
-                    if h < self.heads:
-                        sW_row[h] = mW[seq_idx, h, batch_idx]
+                    sW_row[h] = mW[seq_idx, h, batch_idx] if h < self.heads else self.q_dtype(0.0)
                 cute.arch.fence_view_async_shared()
                 # Every load-warp lane publishes its own SMEM writes.
                 cute.arch.mbarrier_arrive(
@@ -1507,7 +1584,6 @@ class IndexerBackwardSm100:
                 )
         elif warp_idx == self.mma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_wg0)
-            tmem.wait_for_alloc()
             tmem_ptr_base = tmem.retrieve_ptr(self.acc_dtype)
             tStS_0, tStS_1, tDqDq_0, tDkDk_0, tDkDk_1 = self.get_tmem_tensor(
                 s_acc_layout,
@@ -1593,9 +1669,6 @@ class IndexerBackwardSm100:
                     )
         elif warp_idx in self.compute_warp_id:
             cute.arch.setmaxregister_increase(self.num_regs_compute)
-            if warp_idx == self.compute_warp_id[0]:
-                tmem.allocate(self.tmem_alloc_cols)
-            tmem.wait_for_alloc()
             tmem_ptr_base = tmem.retrieve_ptr(self.acc_dtype)
             tStS_0, tStS_1, tDqDq_0, _, _ = self.get_tmem_tensor(
                 s_acc_layout,
@@ -1630,8 +1703,8 @@ class IndexerBackwardSm100:
                     cute.make_layout((self.topk,), stride=(1,)),
                 )
                 sW_row = cute.make_tensor(
-                    sW_storage_ptr + parity * self.heads,
-                    cute.make_layout((self.heads,), stride=(1,)),
+                    sW_storage_ptr + parity * self.heads_padded,
+                    cute.make_layout((self.heads_padded,), stride=(1,)),
                 )
                 gdQ = cute.local_tile(
                     mdQ,
@@ -1733,7 +1806,6 @@ class IndexerBackwardSm100:
 
         elif warp_idx in self.reduce_warp_id:
             cute.arch.setmaxregister_increase(self.num_regs_reduce)
-            tmem.wait_for_alloc()
             tmem_ptr_base = tmem.retrieve_ptr(self.acc_dtype)
             _, _, _, tDkDk_0, tDkDk_1 = self.get_tmem_tensor(
                 s_acc_layout,
@@ -1940,7 +2012,6 @@ class IndexerBackwardSm100:
             )
         elif warp_idx == self.mma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_wg0)
-            tmem.wait_for_alloc()
             tmem_ptr_base = tmem.retrieve_ptr(self.acc_dtype)
             tStS_0, tStS_1, tDqDq, tDkDk_0, tDkDk_1 = self.get_tmem_tensor(
                 s_acc_layout,
@@ -1974,10 +2045,6 @@ class IndexerBackwardSm100:
             )
         elif warp_idx in self.compute_warp_id:
             cute.arch.setmaxregister_increase(self.num_regs_compute)
-            if warp_idx == self.compute_warp_id[0]:
-                if const_expr(not self.use_persistent):
-                    tmem.allocate(self.tmem_alloc_cols)
-            tmem.wait_for_alloc()
             tmem_ptr_base = tmem.retrieve_ptr(self.acc_dtype)
             tStS_0, tStS_1, tDqDq, _, _ = self.get_tmem_tensor(
                 s_acc_layout,
@@ -2037,7 +2104,6 @@ class IndexerBackwardSm100:
             )
         elif warp_idx in self.reduce_warp_id:
             cute.arch.setmaxregister_increase(self.num_regs_reduce)
-            tmem.wait_for_alloc()
             tmem_ptr_base = tmem.retrieve_ptr(self.acc_dtype)
             _, _, _, tDkDk_0, tDkDk_1 = self.get_tmem_tensor(
                 s_acc_layout,
@@ -2091,11 +2157,10 @@ class IndexerBackwardSm100:
                 sGradSignal[pos] = mGradSignal[seq_idx, pos, batch_idx]
 
         # Load W[heads] to sW
-        W_PER_THREAD = const_expr((self.heads + self.WARP_SIZE - 1) // self.WARP_SIZE)
+        W_PER_THREAD = const_expr((self.heads_padded + self.WARP_SIZE - 1) // self.WARP_SIZE)
         for wi in cutlass.range_constexpr(W_PER_THREAD):
             idx = wi * self.WARP_SIZE + lane_id
-            if idx < self.heads:
-                sW[idx] = mW[seq_idx, idx, batch_idx]
+            sW[idx] = mW[seq_idx, idx, batch_idx] if idx < self.heads else self.q_dtype(0.0)
 
         cute.arch.fence_view_async_shared()
         # Signal W + grad_signal loaded for compute warpgroup.
@@ -3031,8 +3096,10 @@ class IndexerBackwardSm100:
             )
             if lane_id % 4 == 0:
                 h0 = warp_id_in_wg * 16 + lane_id // 4
-                mdW[seq_idx, h0, batch_idx] = self.q_dtype(sum_low)
-                mdW[seq_idx, h0 + 8, batch_idx] = self.q_dtype(sum_high)
+                if h0 < self.heads:
+                    mdW[seq_idx, h0, batch_idx] = self.q_dtype(sum_low)
+                if h0 + 8 < self.heads:
+                    mdW[seq_idx, h0 + 8, batch_idx] = self.q_dtype(sum_high)
         else:
             HEADS_PER_WARP = const_expr(self.heads_padded // 4)
             warp_base_h = warp_id_in_wg * Int32(HEADS_PER_WARP)
@@ -3047,7 +3114,7 @@ class IndexerBackwardSm100:
                     if elem_h == h:
                         my_partial = my_partial + dw_accum[ei]
                 total = cute.arch.warp_reduction_sum(my_partial)
-                if lane_id == 0:
+                if lane_id == 0 and h < self.heads:
                     mdW[seq_idx, h, batch_idx] = self.q_dtype(total)
 
     # =========================================================================
@@ -3103,8 +3170,12 @@ class IndexerBackwardSm100:
                 cute.copy(tiled_tmem_load_dk_0, tDkDk_t2r_0, tDKrDK)
                 cute.arch.fence_view_async_tmem_load()
                 _tcgen05_fence_before_thread_sync()
-                if bi == self.num_topk_blocks - 1:
-                    cute.arch.mbarrier_arrive(mbar + MBAR_REDUCE_DONE)
+                if const_expr(not self.use_cross_row_persistent):
+                    if bi == self.num_topk_blocks - 1:
+                        # Serial rows use REDUCE_DONE to guard TMEM teardown.
+                        # Cross-row rows publish the same completion through
+                        # ROW_FREE after this helper returns.
+                        cute.arch.mbarrier_arrive(mbar + MBAR_REDUCE_DONE)
                 cute.arch.mbarrier_arrive(mbar + MBAR_DK_EMPTY_0)
             else:
                 cute.arch.mbarrier_wait(mbar + MBAR_DK_FULL_1, dk_full_1_phase)
@@ -3113,8 +3184,9 @@ class IndexerBackwardSm100:
                 cute.copy(tiled_tmem_load_dk_1, tDkDk_t2r_1, tDKrDK)
                 cute.arch.fence_view_async_tmem_load()
                 _tcgen05_fence_before_thread_sync()
-                if bi == self.num_topk_blocks - 1:
-                    cute.arch.mbarrier_arrive(mbar + MBAR_REDUCE_DONE)
+                if const_expr(not self.use_cross_row_persistent):
+                    if bi == self.num_topk_blocks - 1:
+                        cute.arch.mbarrier_arrive(mbar + MBAR_REDUCE_DONE)
                 cute.arch.mbarrier_arrive(mbar + MBAR_DK_EMPTY_1)
 
             # The 16dp256b16x map materializes eight rows per warp into one
@@ -3156,10 +3228,17 @@ class IndexerBackwardSm100:
                     # invalid sparse row, matching the bulk pipeline contract.
                     cute.arch.cp_async_bulk_commit_group()
 
-        if const_expr(not self.use_cross_row_persistent) and lane_id < 8:
-            # Full completion (not just shared-read completion) before the
-            # following stream-ordered cast can consume dK_f32.
+        if const_expr(not self.use_cross_row_persistent or self.deterministic) and lane_id < 8:
+            # Deterministic persistent rows fully complete their plane update
+            # before the CTA advances to its next fixed row. The ordinary
+            # cross-row path keeps one group in flight for overlap and drains
+            # it once after the loop; serial rows drain here as before.
             cute.arch.cp_async_bulk_wait_group(0)
+        if const_expr(self.deterministic):
+            # Every dK lane has completed its asynchronous reduction before
+            # any warp begins the CTA's next fixed row. Cross-row collisions
+            # can map to different warps even though the plane is CTA-private.
+            self.dk_row_barrier.arrive_and_wait()
 
     # =========================================================================
     # Warps 8-11: K loading warpgroup (3-stage sK)
@@ -3427,7 +3506,15 @@ def indexer_backward_sm100(
     sm_scale=1.0,
     block_I=128,
     topk_indices_global: bool = True,
+    deterministic: bool = False,
+    deterministic_dk_planes: int = DEFAULT_DK_PLANES,
 ):
+    """Build the default SM100 backward pipeline for one plan signature.
+
+    ``deterministic=True`` replaces the cross-CTA dK atomic target with
+    fixed-owner CTA-private planes and a trailing fixed-order reduction.
+    """
+    deterministic_dk_planes = validate_deterministic_dk_plane_policy(deterministic, deterministic_dk_planes)
     # ``batch``/``seqlen``/``seqlen_k`` are runtime extents (packed training
     # changes them every step, GitHub #1188). They only select the persistent
     # launch policy, and that policy -- not the shape -- is in the compile key.
@@ -3455,6 +3542,8 @@ def indexer_backward_sm100(
         sm_scale,
         block_I,
         topk_indices_global=topk_indices_global,
+        deterministic=deterministic,
+        deterministic_dk_planes=deterministic_dk_planes,
     )
 
 
@@ -3802,14 +3891,22 @@ def _build_cute_dsl_kernel(
     sm_scale,
     block_I,
     topk_indices_global: bool = True,
+    deterministic: bool = False,
+    deterministic_dk_planes: int = DEFAULT_DK_PLANES,
 ):
+    """Create lazily compiled score/GEMM runners for one launch policy."""
     from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 
+    persistent_grid_size = None
+    if deterministic:
+        persistent_grid_size = deterministic_dk_producer_ctas(batch * seqlen, deterministic_dk_planes)
     if torch.cuda.get_device_capability()[0] < 10:
         raise RuntimeError("Requires SM100+")
-    persistent_grid_size = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    if persistent_grid_size is None:
+        persistent_grid_size = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
 
     def _make_kernel(enable_score_pdl: bool):
+        """Instantiate the GEMM object with or without score-stage PDL."""
         return IndexerBackwardSm100(
             head_dim=dim,
             heads=heads,
@@ -3820,6 +3917,7 @@ def _build_cute_dsl_kernel(
             persistent_grid_size=persistent_grid_size,
             topk_indices_global=topk_indices_global,
             enable_score_pdl=enable_score_pdl,
+            deterministic=deterministic,
         )
 
     kernel_objects = {
@@ -3834,6 +3932,8 @@ def _build_cute_dsl_kernel(
         topk_indices_global,
         kernel_objects[False].use_persistent,
         persistent_grid_size,
+        deterministic,
+        deterministic_dk_planes,
     )
 
     def _ensure_compiled(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, AttnScore, TopkIndices, enable_score_pdl: bool, current_stream=None):
@@ -3879,7 +3979,17 @@ def _build_cute_dsl_kernel(
                 s,
             )
 
-    def _run_gemm_only(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, GradSignal, TopkIndices, current_stream=None):
+    def _run_gemm_only(
+        IndexQ,
+        Weights,
+        IndexK,
+        dIndexQ,
+        dWeights,
+        dIndexK_f32,
+        GradSignal,
+        TopkIndices,
+        current_stream=None,
+    ):
         """Run kernel 2 after arbitrary stream work (PDL overlap disabled)."""
         _run_gemm(
             IndexQ,
@@ -3922,10 +4032,41 @@ def _build_cute_dsl_kernel(
     def _run(
         IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK, AttnScore, IndexScore, TopkIndices, GradLoss, grad_scale, current_stream=None, workspace=None
     ):
+        """Run score-grad, GEMM, and the selected dK finalization in order."""
         # ``grad_scale`` is a host scalar (Python float / 0-D fp32 tensor)
         # multiplied into ``score_grad`` as a runtime ``Float32`` arg —
         # changing it across calls does **not** trigger recompilation.
         score_grad = partial(_score_grad_inplace, block_I=block_I)
+
+        if deterministic:
+            planes_bytes = deterministic_dk_planes_bytes(batch, seqlen_k, dim, deterministic_dk_planes)
+            carver = WorkspaceCarver(
+                workspace,
+                deterministic_dk_workspace_bytes(batch, seqlen_k, dim, deterministic_dk_planes),
+                "IndexerBackward deterministic (sm100)",
+            )
+            dIndexK_planes = carver.take(planes_bytes // 4, torch.float32).view(deterministic_dk_planes, batch * seqlen_k, dim)
+            memset_zero_async(dIndexK_planes.data_ptr(), planes_bytes, _resolve_stream(current_stream))
+            score_grad(
+                AttnScore,
+                IndexScore,
+                GradLoss,
+                grad_scale,
+                current_stream=current_stream,
+            )
+            _run_gemm_after_score(
+                IndexQ,
+                Weights,
+                IndexK,
+                dIndexQ,
+                dWeights,
+                dIndexK_planes,
+                AttnScore,
+                TopkIndices,
+                current_stream=current_stream,
+            )
+            reduce_deterministic_dk(dIndexK_planes, dIndexK, deterministic_dk_planes, current_stream)
+            return
 
         if dIndexK.dtype == torch.float32:
             # The dK epilogue atomic-adds into this caller-owned fp32 buffer,

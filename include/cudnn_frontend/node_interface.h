@@ -30,6 +30,26 @@ namespace cudnn_frontend {
 
 namespace graph {
 
+// uid -> (byte alignment, element bytes) that execute() enforces on the caller's pointer and override strides.
+using AlignedOperands = std::unordered_map<Tensor_attributes::uid_t, std::pair<int64_t, int64_t>>;
+
+// First dimension (extent > 1, stride != 1) whose byte stride is not a multiple of `alignment`, or -1.
+inline int64_t
+misaligned_stride_dimension(std::vector<int64_t> const& dim,
+                            std::vector<int64_t> const& stride,
+                            int64_t element_bytes,
+                            int64_t alignment) {
+    if (element_bytes <= 0 || alignment <= 1) {
+        return -1;
+    }
+    for (size_t i = 0; i < dim.size() && i < stride.size(); ++i) {
+        if (dim[i] > 1 && stride[i] != 1 && (stride[i] * element_bytes) % alignment != 0) {
+            return static_cast<int64_t>(i);
+        }
+    }
+    return -1;
+}
+
 class BatchNormNode;
 class DBNNode;
 class ConcatenateNode;
@@ -134,6 +154,12 @@ class INode {
     collect_tensors_in_workspace_node(
         std::unordered_map<Tensor_attributes::uid_t, std::tuple<int64_t, int64_t, std::vector<float>>>&,
         int64_t&) const {
+        return {error_code_t::OK, ""};
+    }
+
+    // Operands whose pointer and override strides execute() checks against the declared alignment.
+    virtual error_t
+    collect_aligned_operands_node(AlignedOperands&) const {
         return {error_code_t::OK, ""};
     }
 
@@ -349,6 +375,15 @@ class INode {
         CHECK_CUDNN_FRONTEND_ERROR(collect_pass_by_value_tensors_node(tensor_to_pass_by_value));
         for (auto const& sub_node : sub_nodes) {
             CHECK_CUDNN_FRONTEND_ERROR(sub_node->collect_pass_by_value_tensors_subtree(tensor_to_pass_by_value));
+        }
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    collect_aligned_operands_subtree(AlignedOperands& aligned_operands) const {
+        CHECK_CUDNN_FRONTEND_ERROR(collect_aligned_operands_node(aligned_operands));
+        for (auto const& sub_node : sub_nodes) {
+            CHECK_CUDNN_FRONTEND_ERROR(sub_node->collect_aligned_operands_subtree(aligned_operands));
         }
         return {error_code_t::OK, ""};
     }

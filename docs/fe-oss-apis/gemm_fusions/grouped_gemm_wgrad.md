@@ -83,6 +83,11 @@ the pointer tensor alive until work on `current_stream` completes. The API
 records the pointer tensor on the launch stream, but it cannot manage the
 lifetime of allocations represented only by integer addresses.
 
+`offsets_tensor` values and `wgrad_ptrs` entries are a **device-data contract**: the
+kernel reads them on device and `execute()` does not copy them to the host. Set
+`CUDNN_FE_GROUPED_GEMM_VALIDATE_DEVICE_VALUES=1` (read once at import) to turn on
+blocking debug checks of those values at `execute()`.
+
 The wrapper always returns `TupleDict(wgrad_tensor=...)`; it contains exactly
 one item and supports either keyed access or tuple unpacking.
 

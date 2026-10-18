@@ -196,7 +196,7 @@ def parse_args():
         "--variant",
         default="gdn",
         type=str,
-        help="Linear attention variant to use. Can be 'gdn' (scalar decay), 'kda' (per-key-channel decay), 'gdn2' (channel-wise decay/erase/write gates), 'gdp' (num_householder updates per token; k/v/beta on the expanded sub-token timeline), or 'mamba2' (the Mamba-2 SSD: the dt gate is both the decay exp(A dt) and the write strength; q/k are C/B at the group count, v is x at the head count).",
+        help="Linear attention variant to use. Can be 'gdn' (scalar decay), 'kda' (per-key-channel decay), 'gdn2' (channel-wise decay/erase/write gates), 'gdp' (num_householder updates per token; k / v token-major [T, n, H, D], beta [T, n, HO]), or 'mamba2' (the Mamba-2 SSD: the dt gate is both the decay exp(A dt) and the write strength; q/k are C/B at the group count, v is x at the head count).",
         choices=["gdn", "kda", "gdn2", "gdp", "mamba2"],
     )
     parser.add_argument(
@@ -214,6 +214,17 @@ def parse_args():
         "--store_on",
         action="store_true",
         help="Dump the recurrent state every chunk plus the per-sequence final state from the forward pass (backends without a per-chunk state output are rejected; with backward, the final state's gradient feeds the backward pass)",
+    )
+    parser.add_argument(
+        "--fp32_checkpoints",
+        action="store_true",
+        help="With --store_on, store the per-chunk states in fp32 instead of the io dtype (cudnn backend, GDN / GDP / KDA / GDN-2)",
+    )
+    parser.add_argument(
+        "--checkpoint_chunk_mult",
+        type=int,
+        default=1,
+        help="With --store_on, the checkpoint cadence in kernel chunks (1 = every chunk; larger = coarse rows the backward regenerates from)",
     )
     parser.add_argument(
         "--batch_invariant",
@@ -527,8 +538,8 @@ else:
         raise ValueError("Both --head_dim_qk and --head_dim_vo must be provided together when using asymmetric head dims.")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     assert device.type == "cuda", "Requires CUDA device"
-    # GDP: k/v/beta live on the expanded sub-token timeline (num_householder
-    # rows per real token); every other variant runs at num_householder == 1.
+    # GDP: k / v token-major [B, T, n, H, D] as column slices of one [B, T, V | K | Q] projection buffer, beta
+    # [B, T, n, HO]; every other variant runs at num_householder == 1.
     num_householder = args.num_householder if args.variant == "gdp" else 1
     if args.variant == "gdp" and num_householder < 1:
         raise ValueError("--num_householder must be a positive integer")
@@ -640,7 +651,7 @@ else:
 
         ## --store_on dumps the per-chunk state series alongside the final
         ## state (the state_checkpoints output; one entry per kernel chunk).
-        ckpt_tokens = _CHUNK_SIZE[args.variant] if args.store_on else 0
+        ckpt_tokens = _CHUNK_SIZE[args.variant] * args.checkpoint_chunk_mult if args.store_on else 0
         safe_gate_kwargs = {}
         if raw_gates:
             safe_gate_kwargs = dict(
@@ -665,6 +676,7 @@ else:
                     output_final_state=output_final_state,
                     use_qk_l2norm_in_kernel=use_qk_l2norm,
                     checkpoint_every_n_tokens=ckpt_tokens,
+                    checkpoint_dtype=torch.float32 if args.fp32_checkpoints else None,
                     batch_invariant=args.batch_invariant,
                 )
             elif args.variant == "gdp":
@@ -681,6 +693,7 @@ else:
                     output_final_state=output_final_state,
                     use_qk_l2norm_in_kernel=use_qk_l2norm,
                     checkpoint_every_n_tokens=ckpt_tokens,
+                    checkpoint_dtype=torch.float32 if args.fp32_checkpoints else None,
                     batch_invariant=args.batch_invariant,
                 )
             elif args.variant == "kda":
@@ -696,6 +709,7 @@ else:
                     output_final_state=output_final_state,
                     use_qk_l2norm_in_kernel=use_qk_l2norm,
                     checkpoint_every_n_tokens=ckpt_tokens,
+                    checkpoint_dtype=torch.float32 if args.fp32_checkpoints else None,
                     batch_invariant=args.batch_invariant,
                     **safe_gate_kwargs,
                 )
@@ -728,6 +742,7 @@ else:
                     output_final_state=output_final_state,
                     use_qk_l2norm_in_kernel=use_qk_l2norm,
                     checkpoint_every_n_tokens=ckpt_tokens,
+                    checkpoint_dtype=torch.float32 if args.fp32_checkpoints else None,
                     batch_invariant=args.batch_invariant,
                     beta_guard=False,
                     **safe_gate_kwargs,
@@ -1187,23 +1202,51 @@ else:
     # backend-specific setup ran first: every backend sees the same inputs.
     torch.manual_seed(args.seed)
     for i in range(total_iters):
-        query = torch.randn(batch_size, seqlen, num_q_heads, head_dim_qk, dtype=target_dtype, device=device)
-        key = torch.nn.functional.normalize(torch.randn(batch_size, kv_seqlen, num_q_heads, head_dim_qk, dtype=torch.float32, device=device), dim=-1).to(
-            target_dtype
-        )
-        value = torch.randn(batch_size, kv_seqlen, num_kv_heads, head_dim_vo, dtype=target_dtype, device=device)
-        gate, beta, write_gate = generate_gates()
+        if args.variant == "gdp":
+            # GDP: one [B, T, V | K | Q] projection buffer, q / k / v its column slices
+            v_width = num_householder * num_kv_heads * head_dim_vo
+            k_width = num_householder * num_q_heads * head_dim_qk
+            joint = torch.empty(batch_size, seqlen, v_width + k_width + num_q_heads * head_dim_qk, dtype=target_dtype, device=device)
+            joint[:, :, :v_width] = torch.randn(batch_size, seqlen, v_width, dtype=target_dtype, device=device)
+            joint[:, :, v_width : v_width + k_width] = (
+                torch.nn.functional.normalize(
+                    torch.randn(batch_size, seqlen, num_householder, num_q_heads, head_dim_qk, dtype=torch.float32, device=device), dim=-1
+                )
+                .to(target_dtype)
+                .view(batch_size, seqlen, k_width)
+            )
+            joint[:, :, v_width + k_width :] = torch.randn(batch_size, seqlen, num_q_heads * head_dim_qk, dtype=target_dtype, device=device)
+            gate, beta, write_gate = generate_gates()
+            value, key, query = torch.split(joint, [v_width, k_width, num_q_heads * head_dim_qk], dim=-1)
+            value = value.view(batch_size, seqlen, num_householder, num_kv_heads, head_dim_vo)
+            key = key.view(batch_size, seqlen, num_householder, num_q_heads, head_dim_qk)
+            query = query.view(batch_size, seqlen, num_q_heads, head_dim_qk)
+            if args.la_backend == "cudnn":
+                # THD views: q [T, H, K], k / v [T, n, H, D], beta [T, n, HO], g [T, HO]
+                query = query.view(batch_size * seqlen, num_q_heads, head_dim_qk)
+                key = key.view(batch_size * seqlen, num_householder, num_q_heads, head_dim_qk)
+                value = value.view(batch_size * seqlen, num_householder, num_kv_heads, head_dim_vo)
+                gate = gate.view(batch_size * seqlen, num_o_heads)
+                beta = beta.view(batch_size * seqlen, num_householder, num_o_heads)
+            elif args.la_backend == "fla":
+                query = query.contiguous()
+                key = key.reshape(batch_size, kv_seqlen, num_q_heads, head_dim_qk)
+                value = value.reshape(batch_size, kv_seqlen, num_kv_heads, head_dim_vo)
+            leaves = [query, key, value, gate, beta]
+        else:
+            query = torch.randn(batch_size, seqlen, num_q_heads, head_dim_qk, dtype=target_dtype, device=device)
+            key = torch.nn.functional.normalize(torch.randn(batch_size, kv_seqlen, num_q_heads, head_dim_qk, dtype=torch.float32, device=device), dim=-1).to(
+                target_dtype
+            )
+            value = torch.randn(batch_size, kv_seqlen, num_kv_heads, head_dim_vo, dtype=target_dtype, device=device)
+            gate, beta, write_gate = generate_gates()
 
-        query, key, value = preprocess_qkv(query, key, value, args.la_backend)
-        gate, beta, write_gate = preprocess_gates(gate, beta, write_gate, args.la_backend)
+            query, key, value = preprocess_qkv(query, key, value, args.la_backend)
+            gate, beta, write_gate = preprocess_gates(gate, beta, write_gate, args.la_backend)
+            leaves = [t for t in (query, key, value, gate, beta, write_gate) if t is not None]
         if run_bwd:
-            query.requires_grad_(True)
-            key.requires_grad_(True)
-            value.requires_grad_(True)
-            gate.requires_grad_(True)
-            beta.requires_grad_(True)
-            if write_gate is not None:
-                write_gate.requires_grad_(True)
+            for leaf in leaves:
+                leaf.requires_grad_(True)
 
         # Recurrent state ports: --initial_state seeds the recurrence and
         # carries a final-state gradient back; --store_on only dumps the
@@ -1274,16 +1317,8 @@ else:
             with profile(activities=[ProfilerActivity.CUDA], record_shapes=True) as prof:
                 with record_function("linear_attention.backward"):  # Custom marker
                     torch.autograd.backward(grad_outputs, grads)
-
-                    dQuery = query.grad
-                    dKey = key.grad
-                    dValue = value.grad
-
-                    query.grad = None
-                    key.grad = None
-                    value.grad = None
-                    gate.grad = None
-                    beta.grad = None
+                    for leaf in leaves:
+                        leaf.grad = None
                 torch.cuda.synchronize()
 
             matched_kernels = [
@@ -1313,7 +1348,11 @@ else:
                 value_ref = value.detach().reshape(batch_size, kv_seqlen, num_kv_heads, head_dim_vo)
                 if args.la_backend == "cudnn":
                     gate_ref = gate.detach().reshape(batch_size, seqlen, *gate.shape[1:])
-                    beta_ref = beta.detach().reshape(batch_size, kv_seqlen, *beta.shape[1:])
+                    beta_ref = (
+                        beta.detach().reshape(batch_size, kv_seqlen, num_o_heads)
+                        if args.variant == "gdp"
+                        else beta.detach().reshape(batch_size, kv_seqlen, *beta.shape[1:])
+                    )
                 elif args.la_backend == "flash_kda":
                     # raw logits pass through; the fla reference applies the
                     # same in-kernel activations
@@ -1347,7 +1386,7 @@ else:
         else:
             forward_diffs.append(0.0)
 
-        del query, key, value, gate, beta, write_gate, output, final_state, state0, dOutput, dFinal
+        del query, key, value, gate, beta, write_gate, output, final_state, state0, dOutput, dFinal, leaves
 
     _clock_sampler.stop()
 

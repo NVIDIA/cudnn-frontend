@@ -65,12 +65,14 @@ _MAKE_CFG = {64: make_cfg_d64, 128: lambda p: make_cfg_d128(p, cga1_kv_stages=3)
 if PARAMS.d_flavor not in _MAKE_CFG:
     raise ValueError(f"prefill_d128_mxfp8: d_flavor must be 64 or 128; got {PARAMS.d_flavor}")
 CFG, _TMA = _MAKE_CFG[PARAMS.d_flavor](PARAMS)
+if PARAMS.dual_kv_stream:
+    raise ValueError("sm100/prefill_d128_mxfp8: dual_kv_stream (two KV streams over one Q tile) is served by sm100/prefill_d128_fp8.py only")
 # Lowering of the CLC scheduler's credit arrive (``tile_dsl.scheduler.read_tile_id_arrive``, every call site below): False =
 # the lane-compare BRANCH form, True = the single predicated arrive of PR #1169.  Both land the same arrives from the same
 # lanes (READ_TILE_ARRIVERS unchanged), so this is a per-SPECIALIZATION tuning constant, keyed on the compile-time mask bits
 # that select the dense and the masked softmax arms (``CFG.MASK_FLAGS == 0`` is this kernel's dense gate): the branch form on
 # the UNMASKED specialization, the predicated form (develop's) wherever a mask arm -- causal / SWA / padded -- is compiled in.
-# MEASURED on B200 (A/B/A x3, CUPTI medians, O / Stats / Amax_O bit-identical, 2026-09-22), stacked on this branch's exp2
+# Historical broadcast-credit measurements on B200 (A/B/A x3, CUPTI medians, O / Stats / Amax_O bit-identical, 2026-09-22), stacked on this branch's exp2
 # split; branch form vs predicated form:
 #   B=1 H=24/8 S=16K dense (MASK_FLAGS == 0), NATURAL          +8.14 % (ctrl 0.15)  -> branch form here (False)
 #   B=1 H=24/8 S=16K top_left causal, LPT (the proposed plan)  -5.13 % (ctrl 0.10)  -> predicated form kept (True)
@@ -78,8 +80,11 @@ CFG, _TMA = _MAKE_CFG[PARAMS.d_flavor](PARAMS)
 #   d192x128 MXFP8 sibling, H=128 S=8K dense                   +6.84 % (ctrl 0.04)  -> branch form there too
 # Mechanism OPEN: a kernel-wide ptxas reschedule of the softmax body (the predicated form sinks the dense arm's alpha / stats
 # publish to the end of the exp burst; the branch form is what loses on the masked body).  Per-specialization tuning
-# constant; re-measure before changing.  Pinned by test_sdpa_fwd_mxfp8_sm100.py: the source scan (this exact expression,
-# every site passes it), the module value per specialization, and the sm_100a BSSY / SYNCS.ARRIVE counts of both.
+# constant; re-measure before changing. With leader-only credits, the GB200 follow-up on PR #1547 also favors the dense
+# branch: switching to the predicated form lost 2.5-4.1% across S=4K/8K/16K on two GPUs. A clock-limited engineering
+# board showed the opposite sign, so exp2_fma_split is not a sufficient key for widening this choice to all cc 10.0.
+# test_sdpa_fwd_mxfp8_sm100.py checks that every site consumes this choice and separately checks whole-kernel SASS;
+# it does not freeze a performance winner or this expression.
 PREDICATED_CREDIT_ARRIVE: bool = CFG.MASK_FLAGS != 0
 # The named barrier that couples the two softmax warpgroups around the P stores (WG1 admitted after WG0's P
 # stores, WG0 released once WG1 is ready).  Per-specialization tuning constant like PREDICATED_CREDIT_ARRIVE:
@@ -1072,6 +1077,12 @@ _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 # === Warp-group functions ===
+
+
+# Only the common dense CLC path has a single scheduler publisher.
+# THD/predecode retains local schedulers and broadcast credits.
+if not CFG.THD_VARLEN:
+    from cudnn.frost.tile_dsl.scheduler import read_tile_id_arrive_on_leader as read_tile_id_arrive
 
 
 @cute.jit

@@ -45,6 +45,8 @@ from .common import execute_graph, make_execution_resources, make_summary_cache_
 # ---------------------------------------------------------------------------
 
 
+CHECKPOINT_CHUNK = 16
+
 fprop_cache: Dict[tuple, tuple] = {}
 bprop_cache: Dict[tuple, tuple] = {}
 summary_cache: Dict[tuple, tuple] = {}
@@ -91,6 +93,7 @@ def make_fprop_cache_key(
     a_log_dtype,
     dt_bias_dtype,
     checkpoint,
+    checkpoint_dtype,
     device,
     plan_name,
     overwrite_initial_state,
@@ -127,6 +130,7 @@ def make_fprop_cache_key(
         a_log_dtype,
         dt_bias_dtype,
         checkpoint,
+        checkpoint_dtype,
         device,
         plan_name,
         bool(overwrite_initial_state),
@@ -154,6 +158,7 @@ def make_bprop_cache_key(
     state_dtype,
     dstate_in_dtype,
     checkpoint_rows,
+    checkpoint_dtype,
     checkpoint_every_n_tokens,
     scale,
     use_qk_l2norm,
@@ -190,6 +195,7 @@ def make_bprop_cache_key(
         state_dtype,
         dstate_in_dtype,
         checkpoint_rows,
+        checkpoint_dtype,
         int(checkpoint_every_n_tokens),
         float(scale),
         bool(use_qk_l2norm),
@@ -234,6 +240,7 @@ def build_fprop_graph(
     gate_lower_bound,
     gate_domain,
     checkpoint,
+    checkpoint_dtype,
     a_log_dtype=None,
     dt_bias_dtype=None,
     overwrite_initial_state=False,
@@ -287,6 +294,8 @@ def build_fprop_graph(
         checkpoint_every_n_tokens=checkpoint,
         name="kda",
     )
+    if state_checkpoints_t is not None:
+        state_checkpoints_t.set_data_type(cudnn.data_type.FLOAT if checkpoint_dtype == torch.float32 else io_dtype)
     return graph, dict(
         q=q_t,
         k=k_t,
@@ -329,6 +338,7 @@ def run_kda_fwd(
     a_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
+    checkpoint_dtype: Optional[torch.dtype] = None,
     plan_name: Optional[str] = None,
     final_state_out: Optional[torch.Tensor] = None,
     state_indices: Optional[torch.Tensor] = None,
@@ -385,7 +395,7 @@ def run_kda_fwd(
             raise ValueError("kimi_delta_attention: state_indices requires a pool whose rows are dense [HO, V, K] blocks on a 16-byte aligned slot stride")
         state_pool_rows = int(initial_state.shape[0])
     if initial_state is not None:
-        check_dtype("initial_state", initial_state, (torch.float32, torch.bfloat16))
+        check_dtype("initial_state", initial_state, (torch.float32, torch.bfloat16, torch.float16))
         if state_indices is None and initial_state.shape[0] != N:
             raise ValueError(f"initial_state must carry one state per sequence: got {initial_state.shape[0]} for {N} sequences")
     for tensor_name, tensor in (
@@ -403,6 +413,10 @@ def run_kda_fwd(
             raise ValueError(f"kimi_delta_attention: {tensor_name} must be on q's device ({device}); got {tensor.device}")
     state0 = initial_state if initial_state is not None else None
     checkpoint = int(checkpoint_every_n_tokens)
+    if checkpoint_dtype not in (None, torch.float32, q.dtype):
+        raise ValueError(f"kimi_delta_attention: checkpoint_dtype must be None, torch.float32 or the io dtype ({q.dtype}), got {checkpoint_dtype}")
+    if checkpoint_dtype is None:
+        checkpoint_dtype = q.dtype
 
     cache_key = make_fprop_cache_key(
         total,
@@ -433,6 +447,7 @@ def run_kda_fwd(
         a_log.dtype if a_log is not None else None,
         dt_bias.dtype if dt_bias is not None else None,
         checkpoint,
+        checkpoint_dtype,
         device,
         plan_name,
         final_state_out is not None,
@@ -462,6 +477,7 @@ def run_kda_fwd(
             float(gate_lower_bound) if gate_lower_bound is not None else None,
             str(gate_domain),
             checkpoint,
+            checkpoint_dtype,
             a_log_dtype=torch_dtype_to_cudnn(a_log.dtype) if a_log is not None else None,
             dt_bias_dtype=torch_dtype_to_cudnn(dt_bias.dtype) if dt_bias is not None else None,
             overwrite_initial_state=final_state_out is not None,
@@ -501,7 +517,7 @@ def run_kda_fwd(
     state_checkpoints = torch.empty(0, dtype=q.dtype, device=device)
     if checkpoint > 0:
         total_checkpoints = max(total // checkpoint + N, 1)
-        state_checkpoints = torch.empty(total_checkpoints, HO, V, K, dtype=q.dtype, device=device)
+        state_checkpoints = torch.empty(total_checkpoints, HO, V, K, dtype=checkpoint_dtype, device=device)
         variant_pack[t["state_checkpoints"]] = state_checkpoints
     workspace, handle = make_execution_resources(graph, device)
     execute_graph(graph, variant_pack, workspace, handle)
@@ -529,6 +545,7 @@ def kda_fwd(
     a_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
+    checkpoint_dtype: Optional[torch.dtype] = None,
     plan_name: Optional[str] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Functional KDA forward: :func:`run_kda_fwd` with fresh outputs; the autograd formula registers below."""
@@ -552,6 +569,7 @@ def kda_fwd(
         a_log=a_log,
         dt_bias=dt_bias,
         checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        checkpoint_dtype=checkpoint_dtype,
         plan_name=plan_name,
     )
 
@@ -576,6 +594,7 @@ def kda_fwd_overwrite_state(
     a_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
+    checkpoint_dtype: Optional[torch.dtype] = None,
     plan_name: Optional[str] = None,
     state_indices: Optional[torch.Tensor] = None,
     output_final_state: bool = True,
@@ -603,6 +622,7 @@ def kda_fwd_overwrite_state(
         a_log=a_log,
         dt_bias=dt_bias,
         checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        checkpoint_dtype=checkpoint_dtype,
         plan_name=plan_name,
         output_final_state=bool(output_final_state),
         final_state_out=initial_state if output_final_state else None,
@@ -632,6 +652,7 @@ def kda_fwd_fake(
     a_log=None,
     dt_bias=None,
     checkpoint_every_n_tokens=0,
+    checkpoint_dtype=None,
     plan_name: Optional[str] = None,
 ):
     """Return FakeTensor-compatible output metadata for KDA forward."""
@@ -657,7 +678,13 @@ def kda_fwd_fake(
     final = q.new_empty((N, HO, V, K) if output_final_state else (0,), dtype=state_dtype)
     if checkpoint_every_n_tokens > 0:
         total_checkpoints = max(total // int(checkpoint_every_n_tokens) + N, 1)
-        state_checkpoints = q.new_empty(total_checkpoints, HO, V, K)
+        state_checkpoints = q.new_empty(
+            total_checkpoints,
+            HO,
+            V,
+            K,
+            dtype=torch.float32 if checkpoint_dtype == torch.float32 else q.dtype,
+        )
     else:
         state_checkpoints = q.new_empty(0)
     return o, final, state_checkpoints
@@ -683,6 +710,7 @@ def kda_fwd_overwrite_state_fake(
     a_log=None,
     dt_bias=None,
     checkpoint_every_n_tokens=0,
+    checkpoint_dtype=None,
     plan_name=None,
     state_indices=None,
     output_final_state=True,
@@ -707,6 +735,7 @@ def kda_fwd_overwrite_state_fake(
         a_log=a_log,
         dt_bias=dt_bias,
         checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        checkpoint_dtype=checkpoint_dtype,
         plan_name=plan_name,
         output_final_state=bool(output_final_state),
     )
@@ -744,6 +773,7 @@ def build_bprop_graph(
     a_log_dtype=None,
     dt_bias_dtype=None,
     checkpoint_every_n_tokens=0,
+    checkpoint_dtype=None,
 ):
     """Build a single-node KDA backward graph and its tensor placeholders."""
     graph = cudnn.pygraph()
@@ -763,7 +793,7 @@ def build_bprop_graph(
         dfs_t = graph.tensor([N, HO, V, K], data_type=dstate_in_dtype, name="d_final_state")
     checkpoints_t = None
     if checkpoint_rows is not None:
-        checkpoints_t = graph.tensor([checkpoint_rows, HO, V, K], data_type=io_dtype, name="state_checkpoints")
+        checkpoints_t = graph.tensor([checkpoint_rows, HO, V, K], data_type=checkpoint_dtype, name="state_checkpoints")
     a_log_t = None
     dt_bias_t = None
     if a_log_dtype is not None:
@@ -850,9 +880,9 @@ def kda_bwd(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Internal KDA backward over a cached single-node KDA_BWD pygraph in THD layout.
 
-    ``state_checkpoints`` is the forward's per-chunk state series (io dtype,
-    chunk cadence); when given, the engine consumes it instead of running
-    the checkpoint recompute pass. Returns ``(dq, dk, dv, dg, dbeta,
+    ``state_checkpoints`` is the forward's state series (io dtype or fp32 at the forward's cadence); when given, the
+    engine reuses io-dtype rows at the chunk cadence and regenerates the dense series from any other rows instead of
+    running the checkpoint recompute pass. Returns ``(dq, dk, dv, dg, dbeta,
     d_initial_state, d_a_log, d_dt_bias)``.
     """
     total, H, K = q.shape
@@ -887,16 +917,16 @@ def kda_bwd(
     if gate_domain == "linear" and safe_gate:
         raise ValueError("kimi_delta_attention: gate_domain='linear' cannot combine with safe_gate=True")
     if initial_state is not None:
-        check_dtype("initial_state", initial_state, (torch.float32, torch.bfloat16))
+        check_dtype("initial_state", initial_state, (torch.float32, torch.bfloat16, torch.float16))
         if initial_state.shape[0] != N:
             raise ValueError(f"initial_state must carry one state per sequence: got {initial_state.shape[0]} for {N} sequences")
     dstate_dtype = initial_state.dtype if initial_state is not None else torch.float32
     if d_final_state is not None:
-        check_dtype("d_final_state", d_final_state, (torch.float32, torch.bfloat16))
+        check_dtype("d_final_state", d_final_state, (torch.float32, torch.bfloat16, torch.float16))
         if d_final_state.dtype != dstate_dtype:
             raise TypeError(f"kimi_delta_attention: d_final_state must be {dstate_dtype} (one state dtype per kernel)")
     if state_checkpoints is not None:
-        check_dtype("state_checkpoints", state_checkpoints, q.dtype)
+        check_dtype("state_checkpoints", state_checkpoints, (torch.float32, q.dtype))
     for tensor_name, tensor in (
         ("k", k),
         ("v", v),
@@ -934,6 +964,7 @@ def kda_bwd(
         state0.dtype if state0 is not None else None,
         dstate_in.dtype if dstate_in is not None else None,
         state_checkpoints.shape[0] if state_checkpoints is not None else None,
+        state_checkpoints.dtype if state_checkpoints is not None else None,
         checkpoint_every_n_tokens,
         scale,
         use_qk_l2norm_in_kernel,
@@ -975,6 +1006,7 @@ def kda_bwd(
             a_log_dtype=torch_dtype_to_cudnn(a_log.dtype) if a_log is not None else None,
             dt_bias_dtype=torch_dtype_to_cudnn(dt_bias.dtype) if dt_bias is not None else None,
             checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
+            checkpoint_dtype=torch_dtype_to_cudnn(state_checkpoints.dtype) if state_checkpoints is not None else None,
         )
         select_plan(bprop_cache[cache_key][0], plan_name)
 
@@ -1058,11 +1090,11 @@ def kda_bwd_fake(
     d_a_log = torch.empty_like(a_log) if a_log is not None else q.new_empty(0, dtype=torch.float32)
     d_dt_bias = torch.empty_like(dt_bias) if dt_bias is not None else q.new_empty(0, dtype=torch.float32)
     return (
-        torch.empty_like(q),
-        torch.empty_like(k),
-        torch.empty_like(v),
-        torch.empty_like(g),
-        torch.empty_like(beta),
+        q.new_empty(q.shape),
+        q.new_empty(k.shape),
+        q.new_empty(v.shape),
+        g.new_empty(g.shape),
+        beta.new_empty(beta.shape),
         dstate0,
         d_a_log,
         d_dt_bias,
@@ -1096,10 +1128,11 @@ def kda_setup_context(ctx, inputs, output):
         a_log,
         dt_bias,
         checkpoint_every_n_tokens,
+        checkpoint_dtype,
         plan_name,
     ) = inputs
     saved = [q, k, v, g, beta, cu_seqlens]
-    ctx.checkpoint_reuse = checkpoint_every_n_tokens > 0 and checkpoint_every_n_tokens % 16 == 0 and output[2].numel() > 0
+    ctx.checkpoint_reuse = checkpoint_every_n_tokens > 0 and checkpoint_every_n_tokens % CHECKPOINT_CHUNK == 0 and output[2].numel() > 0
     ctx.checkpoint_every_n_tokens = checkpoint_every_n_tokens if ctx.checkpoint_reuse else 0
     if ctx.checkpoint_reuse:
         saved.append(output[2])
@@ -1187,6 +1220,7 @@ def kda_backward(ctx, dO, dFinal, dstate_checkpoints):
         d_dt_bias if ctx.has_dt_bias else None,
         None,
         None,
+        None,
     )
 
 
@@ -1222,6 +1256,7 @@ def kimi_delta_attention(
     a_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
+    checkpoint_dtype: Optional[torch.dtype] = None,
     plan_name: Optional[str] = None,
     overwrite_initial_state: bool = False,
     state_indices: Optional[torch.Tensor] = None,
@@ -1299,10 +1334,12 @@ def kimi_delta_attention(
             float16; ``d_dt_bias`` comes back in the same dtype), or ``None``
             for zero bias.
         checkpoint_every_n_tokens: if ``> 0``, also return the per-chunk
-            recurrent state series ``state_checkpoints`` (``[total_checkpoints, HO, V, K]`` io dtype,
+            recurrent state series ``state_checkpoints`` (``[total_checkpoints, HO, V, K]``, dtype per ``checkpoint_dtype``,
             one entry per N tokens strictly before each sequence end; the
             FROST engine requires a positive multiple of the kernel chunk size, 16). The series is
             a non-differentiable dump.
+        checkpoint_dtype: ``None`` stores io-dtype rows; ``torch.float32`` stores fp32 rows (the backward reuses io rows at the
+            chunk cadence and regenerates the dense series from any other rows).
 
         plan_name: optionally pin one execution plan by name (the plan
             API's ``get_plan_name_at_index`` names, e.g. ``kda_frost``); a
@@ -1349,6 +1386,7 @@ def kimi_delta_attention(
             a_log=a_log,
             dt_bias=dt_bias,
             checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
+            checkpoint_dtype=checkpoint_dtype,
             plan_name=plan_name,
             state_indices=state_indices,
             output_final_state=bool(output_final_state) or bool(overwrite_initial_state),
@@ -1375,6 +1413,7 @@ def kimi_delta_attention(
             a_log=a_log,
             dt_bias=dt_bias,
             checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
+            checkpoint_dtype=checkpoint_dtype,
             plan_name=plan_name,
         )
     if checkpoint_every_n_tokens > 0:

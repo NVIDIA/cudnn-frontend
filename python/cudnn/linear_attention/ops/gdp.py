@@ -4,8 +4,9 @@
 """
 PyTorch custom operator for Gated DeltaProduct (GDP) linear attention: ``num_householder`` beta-gated Householder updates
 per token with one scalar decay per token, run as the GDN recurrence on an expanded sub-token timeline (gate on sub-token
-0, readout on sub-token ``n - 1``).  k/v/beta arrive expanded at ``total_tokens * n`` rows; q/g and O/dQ/dG live at real
-tokens.  A thin adapter over cached single-node ``GDP`` / ``GDP_BWD`` pygraphs served by ``GdpFrostEngine``.
+0, readout on sub-token ``n - 1``).  k/v/beta arrive expanded at ``total_tokens * n`` rows or token-major
+(``[total_tokens, n, ...]`` with any token stride, a joint projection's column slices as they are); q/g and O/dQ/dG live at
+real tokens.  A thin adapter over cached single-node ``GDP`` / ``GDP_BWD`` pygraphs served by ``GdpFrostEngine``.
 """
 
 import math
@@ -20,6 +21,8 @@ from .common import execute_graph, make_execution_resources, make_summary_cache_
 # Module-level state
 # ---------------------------------------------------------------------------
 
+
+CHECKPOINT_CHUNK = 64
 
 fprop_cache: Dict[tuple, tuple] = {}
 bprop_cache: Dict[tuple, tuple] = {}
@@ -60,10 +63,12 @@ def make_fprop_cache_key(
     a_log_dtype,
     dt_bias_dtype,
     checkpoint,
+    checkpoint_dtype,
     device,
     plan_name,
     overwrite_initial_state,
     state_pool_rows=None,
+    beta_shape=None,
 ):
     return (
         "gdp_fprop",
@@ -93,10 +98,12 @@ def make_fprop_cache_key(
         a_log_dtype,
         dt_bias_dtype,
         checkpoint,
+        checkpoint_dtype,
         device,
         plan_name,
         bool(overwrite_initial_state),
         state_pool_rows,
+        beta_shape,
     )
 
 
@@ -119,6 +126,7 @@ def make_bprop_cache_key(
     v_shape,
     cu_dtype,
     checkpoint_rows,
+    checkpoint_dtype,
     checkpoint_every_n_tokens,
     scale,
     use_qk_l2norm,
@@ -131,6 +139,7 @@ def make_bprop_cache_key(
     dt_bias_dtype,
     device,
     plan_name,
+    beta_shape=None,
 ):
     return (
         "gdp_bprop",
@@ -152,6 +161,7 @@ def make_bprop_cache_key(
         v_shape,
         cu_dtype,
         checkpoint_rows,
+        checkpoint_dtype,
         int(checkpoint_every_n_tokens),
         float(scale),
         bool(use_qk_l2norm),
@@ -164,14 +174,40 @@ def make_bprop_cache_key(
         dt_bias_dtype,
         device,
         plan_name,
+        beta_shape,
     )
 
 
 def check_gdp_rows(op_name, total, num_householder, k, v, beta, g, dO=None) -> None:
+    """The two timelines: g / dO carry the ``total`` real tokens; k / v / beta carry ``total * num_householder`` rows,
+    either expanded (``[T*n, H, D]`` / ``[T*n, HO]``) or token-major (``[T, n, H, D]`` / ``[T, n, HO]``, any token stride)."""
     expanded = total * num_householder
-    for name, t, want in (("k", k, expanded), ("v", v, expanded), ("beta", beta, expanded), ("g", g, total), ("dO", dO, total)):
+    for name, t, want in (("g", g, total), ("dO", dO, total)):
         if t is not None and t.shape[0] != want:
-            raise ValueError(f"{op_name}: {name} must carry {want} rows (q rows {'* num_householder' if want == expanded else ''}), got {t.shape[0]}")
+            raise ValueError(f"{op_name}: {name} must carry {want} rows (q rows), got {t.shape[0]}")
+    for name, t, expanded_rank in (("k", k, 3), ("v", v, 3), ("beta", beta, 2)):
+        if t is None:
+            continue
+        if t.dim() == expanded_rank:
+            if t.shape[0] != expanded:
+                raise ValueError(f"{op_name}: {name} must carry {expanded} rows (q rows * num_householder), got {t.shape[0]}")
+        elif t.dim() == expanded_rank + 1:
+            if t.shape[0] != total or t.shape[1] != num_householder:
+                raise ValueError(f"{op_name}: token-major {name} must be [{total}, {num_householder}, ...] (q rows, num_householder), got {tuple(t.shape)}")
+        else:
+            raise ValueError(f"{op_name}: {name} must be rank {expanded_rank} (expanded rows) or rank {expanded_rank + 1} (token-major), got rank {t.dim()}")
+
+
+def check_tma_strides(op_name, name, t) -> None:
+    """The kernels fetch k / v through TMA: a stride-1 innermost dim, every other stride a multiple of 16 bytes and a
+    16-byte aligned base (a joint projection's column slice satisfies this when its offset and width are multiples of 8
+    elements)."""
+    unit = 16 // t.element_size()
+    strides = t.stride()
+    if t.shape[-1] > 1 and strides[-1] != 1:
+        raise ValueError(f"{op_name}: {name} needs a stride-1 innermost dim, got strides {tuple(strides)}")
+    if any(size > 1 and stride % unit for size, stride in zip(t.shape[:-1], strides[:-1])) or t.data_ptr() % 16:
+        raise ValueError(f"{op_name}: {name} needs 16-byte aligned outer strides and base, got strides {tuple(strides)} (elements of {t.element_size()} bytes)")
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +234,7 @@ def build_fprop_graph(
     use_qk_l2norm,
     batch_invariant,
     checkpoint,
+    checkpoint_dtype,
     use_beta_sigmoid=False,
     allow_neg_eigval=False,
     safe_gate=False,
@@ -207,15 +244,18 @@ def build_fprop_graph(
     overwrite_initial_state=False,
     state_indices_dtype=None,
     state_pool_rows=None,
+    k_shape=None,
+    v_shape=None,
+    beta_shape=None,
 ):
     graph = cudnn.pygraph()
     HO = max(H, HV)
     expanded = total * num_householder
     q_t = graph.tensor([total, H, K], data_type=io_dtype, name="q")
-    k_t = graph.tensor([expanded, HK, K], data_type=io_dtype, name="k")
-    v_t = graph.tensor([expanded, HV, V], data_type=io_dtype, name="v")
+    k_t = graph.tensor(list(k_shape) if k_shape is not None else [expanded, HK, K], data_type=io_dtype, name="k")
+    v_t = graph.tensor(list(v_shape) if v_shape is not None else [expanded, HV, V], data_type=io_dtype, name="v")
     g_t = graph.tensor([total, HO], data_type=g_dtype, name="g")
-    beta_t = graph.tensor([expanded, HO], data_type=beta_dtype, name="beta")
+    beta_t = graph.tensor(list(beta_shape) if beta_shape is not None else [expanded, HO], data_type=beta_dtype, name="beta")
     cu_t = graph.tensor([N + 1], data_type=cu_dtype, name="cu_seqlens")
     state0_t = None
     if state_dtype is not None:
@@ -254,6 +294,8 @@ def build_fprop_graph(
         checkpoint_every_n_tokens=checkpoint,
         name="gdp",
     )
+    if state_checkpoints_t is not None:
+        state_checkpoints_t.set_data_type(cudnn.data_type.FLOAT if checkpoint_dtype == torch.float32 else io_dtype)
     return graph, dict(
         q=q_t,
         k=k_t,
@@ -296,6 +338,7 @@ def run_gdp_fwd(
     a_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
+    checkpoint_dtype: Optional[torch.dtype] = None,
     plan_name: Optional[str] = None,
     final_state_out: Optional[torch.Tensor] = None,
     state_indices: Optional[torch.Tensor] = None,
@@ -313,11 +356,19 @@ def run_gdp_fwd(
     n = int(num_householder)
     if n < 1:
         raise ValueError(f"gated_delta_product: num_householder must be a positive integer, got {num_householder}")
-    HK = k.shape[1]
-    HV, V = v.shape[1], v.shape[2]
+    if 0 in k.stride():
+        k = k.contiguous()
+    if 0 in v.stride():
+        v = v.contiguous()
+    if 0 in beta.stride():
+        beta = beta.contiguous()
+    HK = k.shape[-2]
+    HV, V = v.shape[-2], v.shape[-1]
     if HK not in (H, HV):
         raise ValueError(f"k head count ({HK}) must match q's ({H}) or v's ({HV})")
     check_gdp_rows("gated_delta_product", total, n, k, v, beta, g)
+    check_tma_strides("gated_delta_product", "k", k)
+    check_tma_strides("gated_delta_product", "v", v)
     N = cu_seqlens.shape[0] - 1
     device = q.device
     if cu_seqlens.dtype not in (torch.int32, torch.int64):
@@ -354,7 +405,7 @@ def run_gdp_fwd(
             raise ValueError("gated_delta_product: state_indices requires a pool whose rows are dense [HO, V, K] blocks on a 16-byte aligned slot stride")
         state_pool_rows = int(initial_state.shape[0])
     if initial_state is not None:
-        check_dtype("initial_state", initial_state, (torch.float32, torch.bfloat16))
+        check_dtype("initial_state", initial_state, (torch.float32, torch.bfloat16, torch.float16))
         if state_indices is None and initial_state.shape[0] != N:
             raise ValueError(f"initial_state must carry one state per sequence: got {initial_state.shape[0]} for {N} sequences")
     for tensor_name, tensor in (
@@ -373,6 +424,12 @@ def run_gdp_fwd(
     state0 = initial_state if initial_state is not None else None
     state_out_dtype = state0.dtype if state0 is not None else torch.float32
     checkpoint = int(checkpoint_every_n_tokens)
+    if checkpoint_dtype not in (None, torch.float32, q.dtype):
+        raise ValueError(f"gated_delta_product: checkpoint_dtype must be None, torch.float32 or the io dtype ({q.dtype}), got {checkpoint_dtype}")
+    if checkpoint_dtype is None:
+        checkpoint_dtype = q.dtype
+
+    from ..frost.common.host import family_slots
 
     cache_key = make_fprop_cache_key(
         total,
@@ -401,11 +458,13 @@ def run_gdp_fwd(
         a_log.dtype if a_log is not None else None,
         dt_bias.dtype if dt_bias is not None else None,
         checkpoint,
+        checkpoint_dtype,
         device,
         plan_name,
         final_state_out is not None,
         state_pool_rows,
-    )
+        tuple(beta.shape),
+    ) + (family_slots(k, n, 3), family_slots(v, n, 3), family_slots(beta, n, 2))
     if cache_key not in fprop_cache:
         fprop_cache[cache_key] = build_fprop_graph(
             total,
@@ -426,6 +485,7 @@ def run_gdp_fwd(
             bool(use_qk_l2norm_in_kernel),
             bool(batch_invariant),
             checkpoint,
+            checkpoint_dtype,
             use_beta_sigmoid=bool(use_beta_sigmoid_in_kernel),
             allow_neg_eigval=bool(allow_neg_eigval),
             safe_gate=bool(safe_gate),
@@ -435,6 +495,9 @@ def run_gdp_fwd(
             overwrite_initial_state=final_state_out is not None,
             state_indices_dtype=torch_dtype_to_cudnn(state_indices.dtype) if state_indices is not None else None,
             state_pool_rows=state_pool_rows,
+            k_shape=tuple(k.shape),
+            v_shape=tuple(v.shape),
+            beta_shape=tuple(beta.shape),
         )
         select_plan(fprop_cache[cache_key][0], plan_name)
 
@@ -469,7 +532,7 @@ def run_gdp_fwd(
     state_checkpoints = torch.empty(0, dtype=q.dtype, device=device)
     if checkpoint > 0:
         total_checkpoints = max(total * n // checkpoint + N, 1)
-        state_checkpoints = torch.empty(total_checkpoints, HO, V, K, dtype=q.dtype, device=device)
+        state_checkpoints = torch.empty(total_checkpoints, HO, V, K, dtype=checkpoint_dtype, device=device)
         variant_pack[t["state_checkpoints"]] = state_checkpoints
     workspace, handle = make_execution_resources(graph, device)
     execute_graph(graph, variant_pack, workspace, handle)
@@ -497,6 +560,7 @@ def gdp_fwd(
     a_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
+    checkpoint_dtype: Optional[torch.dtype] = None,
     plan_name: Optional[str] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Functional GDP forward: :func:`run_gdp_fwd` with fresh outputs; the autograd formula registers below."""
@@ -520,6 +584,7 @@ def gdp_fwd(
         a_log=a_log,
         dt_bias=dt_bias,
         checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        checkpoint_dtype=checkpoint_dtype,
         plan_name=plan_name,
     )
 
@@ -544,6 +609,7 @@ def gdp_fwd_overwrite_state(
     a_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
+    checkpoint_dtype: Optional[torch.dtype] = None,
     plan_name: Optional[str] = None,
     state_indices: Optional[torch.Tensor] = None,
     output_final_state: bool = True,
@@ -571,6 +637,7 @@ def gdp_fwd_overwrite_state(
         a_log=a_log,
         dt_bias=dt_bias,
         checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        checkpoint_dtype=checkpoint_dtype,
         plan_name=plan_name,
         output_final_state=bool(output_final_state),
         final_state_out=initial_state if output_final_state else None,
@@ -600,11 +667,12 @@ def gdp_fwd_fake(
     a_log=None,
     dt_bias=None,
     checkpoint_every_n_tokens=0,
+    checkpoint_dtype=None,
     plan_name: Optional[str] = None,
 ):
     total, H, K = q.shape
-    HK = k.shape[1]
-    HV, V = v.shape[1], v.shape[2]
+    HK = k.shape[-2]
+    HV, V = v.shape[-2], v.shape[-1]
     if HK not in (H, HV):
         raise ValueError(f"k head count ({HK}) must match q's ({H}) or v's ({HV})")
     HO = max(H, HV)
@@ -624,7 +692,13 @@ def gdp_fwd_fake(
     final = q.new_empty((N, HO, V, K) if output_final_state else (0,), dtype=state_dtype)
     if checkpoint_every_n_tokens > 0:
         total_checkpoints = max(total * int(num_householder) // int(checkpoint_every_n_tokens) + N, 1)
-        state_checkpoints = q.new_empty(total_checkpoints, HO, V, K)
+        state_checkpoints = q.new_empty(
+            total_checkpoints,
+            HO,
+            V,
+            K,
+            dtype=torch.float32 if checkpoint_dtype == torch.float32 else q.dtype,
+        )
     else:
         state_checkpoints = q.new_empty(0)
     return o, final, state_checkpoints
@@ -650,6 +724,7 @@ def gdp_fwd_overwrite_state_fake(
     a_log=None,
     dt_bias=None,
     checkpoint_every_n_tokens=0,
+    checkpoint_dtype=None,
     plan_name=None,
     state_indices=None,
     output_final_state=True,
@@ -673,6 +748,7 @@ def gdp_fwd_overwrite_state_fake(
         a_log=a_log,
         dt_bias=dt_bias,
         checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        checkpoint_dtype=checkpoint_dtype,
         plan_name=plan_name,
         output_final_state=bool(output_final_state),
     )
@@ -710,15 +786,19 @@ def build_bprop_graph(
     a_log_dtype=None,
     dt_bias_dtype=None,
     checkpoint_every_n_tokens=0,
+    k_shape=None,
+    v_shape=None,
+    beta_shape=None,
+    checkpoint_dtype=None,
 ):
     graph = cudnn.pygraph()
     HO = max(H, HV)
     expanded = total * num_householder
     q_t = graph.tensor([total, H, K], data_type=io_dtype, name="q")
-    k_t = graph.tensor([expanded, HK, K], data_type=io_dtype, name="k")
-    v_t = graph.tensor([expanded, HV, V], data_type=io_dtype, name="v")
+    k_t = graph.tensor(list(k_shape) if k_shape is not None else [expanded, HK, K], data_type=io_dtype, name="k")
+    v_t = graph.tensor(list(v_shape) if v_shape is not None else [expanded, HV, V], data_type=io_dtype, name="v")
     g_t = graph.tensor([total, HO], data_type=g_dtype, name="g")
-    beta_t = graph.tensor([expanded, HO], data_type=beta_dtype, name="beta")
+    beta_t = graph.tensor(list(beta_shape) if beta_shape is not None else [expanded, HO], data_type=beta_dtype, name="beta")
     cu_t = graph.tensor([N + 1], data_type=cu_dtype, name="cu_seqlens")
     dO_t = graph.tensor([total, HO, V], data_type=io_dtype, name="dO")
     state0_t = None
@@ -729,7 +809,7 @@ def build_bprop_graph(
         dfs_t = graph.tensor([N, HO, V, K], data_type=dstate_in_dtype, name="d_final_state")
     checkpoints_t = None
     if checkpoint_rows is not None:
-        checkpoints_t = graph.tensor([checkpoint_rows, HO, V, K], data_type=io_dtype, name="state_checkpoints")
+        checkpoints_t = graph.tensor([checkpoint_rows, HO, V, K], data_type=checkpoint_dtype, name="state_checkpoints")
     a_log_t = dt_bias_t = None
     if a_log_dtype is not None:
         a_log_t = graph.tensor([HO], data_type=a_log_dtype, name="a_log")
@@ -828,11 +908,20 @@ def gdp_bwd(
     check_dtype("dO", dO, q.dtype)
     if d_final_state is not None and 0 in d_final_state.stride():
         d_final_state = d_final_state.contiguous()
-    HK = k.shape[1]
-    HV, V = v.shape[1], v.shape[2]
+    k_in, v_in, beta_in = k, v, beta
+    if 0 in k.stride():
+        k = k.contiguous()
+    if 0 in v.stride():
+        v = v.contiguous()
+    if 0 in beta.stride():
+        beta = beta.contiguous()
+    HK = k.shape[-2]
+    HV, V = v.shape[-2], v.shape[-1]
     if HK not in (H, HV):
         raise ValueError(f"k head count ({HK}) must match q's ({H}) or v's ({HV})")
     check_gdp_rows("gated_delta_product", total, n, k, v, beta, g, dO=dO)
+    check_tma_strides("gated_delta_product", "k", k)
+    check_tma_strides("gated_delta_product", "v", v)
     N = cu_seqlens.shape[0] - 1
     device = q.device
     if cu_seqlens.dtype not in (torch.int32, torch.int64):
@@ -854,12 +943,12 @@ def gdp_bwd(
     check_dtype("g", g, (torch.float32, torch.bfloat16, torch.float16))
     check_dtype("beta", beta, (torch.float32, q.dtype))
     if initial_state is not None:
-        check_dtype("initial_state", initial_state, (torch.float32, torch.bfloat16))
+        check_dtype("initial_state", initial_state, (torch.float32, torch.bfloat16, torch.float16))
         if initial_state.shape[0] != N:
             raise ValueError(f"initial_state must carry one state per sequence: got {initial_state.shape[0]} for {N} sequences")
     dstate_dtype = initial_state.dtype if initial_state is not None else torch.float32
     if state_checkpoints is not None:
-        check_dtype("state_checkpoints", state_checkpoints, q.dtype)
+        check_dtype("state_checkpoints", state_checkpoints, (torch.float32, q.dtype))
     for tensor_name, tensor in (
         ("k", k),
         ("v", v),
@@ -876,10 +965,12 @@ def gdp_bwd(
             raise ValueError(f"gated_delta_product: {tensor_name} must be on q's device ({device}); got {tensor.device}")
     state0 = initial_state if initial_state is not None else None
     if d_final_state is not None:
-        check_dtype("d_final_state", d_final_state, (torch.float32, torch.bfloat16))
+        check_dtype("d_final_state", d_final_state, (torch.float32, torch.bfloat16, torch.float16))
         if d_final_state.dtype != dstate_dtype:
             raise TypeError(f"gated_delta_product: d_final_state must be {dstate_dtype} (one state dtype per kernel)")
     dstate_in = d_final_state if d_final_state is not None else None
+
+    from ..frost.common.host import family_slots
 
     cache_key = make_bprop_cache_key(
         total,
@@ -900,6 +991,7 @@ def gdp_bwd(
         tuple(v.shape),
         cu_seqlens.dtype,
         state_checkpoints.shape[0] if state_checkpoints is not None else None,
+        state_checkpoints.dtype if state_checkpoints is not None else None,
         checkpoint_every_n_tokens,
         scale,
         use_qk_l2norm_in_kernel,
@@ -912,7 +1004,8 @@ def gdp_bwd(
         dt_bias.dtype if dt_bias is not None else None,
         device,
         plan_name,
-    )
+        tuple(beta.shape),
+    ) + (family_slots(k, n, 3), family_slots(v, n, 3), family_slots(beta, n, 2))
     if cache_key not in bprop_cache:
         bprop_cache[cache_key] = build_bprop_graph(
             total,
@@ -940,6 +1033,10 @@ def gdp_bwd(
             a_log_dtype=torch_dtype_to_cudnn(a_log.dtype) if a_log is not None else None,
             dt_bias_dtype=torch_dtype_to_cudnn(dt_bias.dtype) if dt_bias is not None else None,
             checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
+            checkpoint_dtype=torch_dtype_to_cudnn(state_checkpoints.dtype) if state_checkpoints is not None else None,
+            k_shape=tuple(k.shape),
+            v_shape=tuple(v.shape),
+            beta_shape=tuple(beta.shape),
         )
         select_plan(bprop_cache[cache_key][0], plan_name)
 
@@ -989,7 +1086,8 @@ def gdp_bwd(
     execute_graph(graph, variant_pack, workspace, handle)
     if dstate0 is None:
         dstate0 = torch.empty(0, dtype=dstate_dtype, device=device)
-    return dq, dk, dv, dg, dbeta, dstate0, d_a_log, d_dt_bias
+    # dk / dv / dbeta are dense in the expanded row order; the token-major input's shape is a free view of them
+    return dq, dk.view(k_in.shape), dv.view(v_in.shape), dg, dbeta.view(beta_in.shape), dstate0, d_a_log, d_dt_bias
 
 
 @gdp_bwd.register_fake
@@ -1024,11 +1122,11 @@ def gdp_bwd_fake(
     d_a_log = torch.empty_like(a_log) if a_log is not None else q.new_empty(0, dtype=torch.float32)
     d_dt_bias = torch.empty_like(dt_bias) if dt_bias is not None else q.new_empty(0, dtype=torch.float32)
     return (
-        torch.empty_like(q),
-        torch.empty_like(k),
-        torch.empty_like(v),
-        torch.empty_like(g),
-        torch.empty_like(beta),
+        q.new_empty(q.shape),
+        q.new_empty(k.shape),
+        q.new_empty(v.shape),
+        g.new_empty(g.shape),
+        beta.new_empty(beta.shape),
         dstate0,
         d_a_log,
         d_dt_bias,
@@ -1061,10 +1159,11 @@ def gdp_setup_context(ctx, inputs, output):
         a_log,
         dt_bias,
         checkpoint_every_n_tokens,
+        checkpoint_dtype,
         plan_name,
     ) = inputs
     saved = [q, k, v, g, beta, cu_seqlens]
-    ctx.checkpoint_reuse = checkpoint_every_n_tokens > 0 and checkpoint_every_n_tokens % 64 == 0 and output[2].numel() > 0
+    ctx.checkpoint_reuse = checkpoint_every_n_tokens > 0 and checkpoint_every_n_tokens % CHECKPOINT_CHUNK == 0 and output[2].numel() > 0
     ctx.checkpoint_every_n_tokens = checkpoint_every_n_tokens if ctx.checkpoint_reuse else 0
     if ctx.checkpoint_reuse:
         saved.append(output[2])
@@ -1151,6 +1250,7 @@ def gdp_backward(ctx, dO, dFinal, dstate_checkpoints):
         d_dt_bias if ctx.has_dt_bias else None,
         None,
         None,
+        None,
     )
 
 
@@ -1186,6 +1286,7 @@ def gated_delta_product(
     a_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
+    checkpoint_dtype: Optional[torch.dtype] = None,
     plan_name: Optional[str] = None,
     overwrite_initial_state: bool = False,
     state_indices: Optional[torch.Tensor] = None,
@@ -1197,11 +1298,20 @@ def gated_delta_product(
     updates; the readout follows the last one).  THD layout on two timelines:
 
         q: ``[total_tokens, H, K]``; g: ``[total_tokens, HO]``;
-        k: ``[total_tokens * n, HK, K]``; v: ``[total_tokens * n, HV, V]``;
-        beta: ``[total_tokens * n, HO]``;
-        cu_seqlens: ``[N+1]`` int32 over the real tokens; O and the states
-        live at HO = max(H, HV) heads (initial_state / final_state:
+        k: ``[total_tokens * n, HK, K]`` or token-major ``[total_tokens, n, HK, K]``;
+        v: ``[total_tokens * n, HV, V]`` or token-major ``[total_tokens, n, HV, V]``;
+        beta: ``[total_tokens * n, HO]`` or token-major ``[total_tokens, n, HO]``;
+        cu_seqlens: ``[N+1]`` int32 or int64 over the real tokens; O and the
+        states live at HO = max(H, HV) heads (initial_state / final_state:
         ``[N, HO, V, K]``)
+
+    The expanded form numbers rows per update (token ``t``'s updates are rows
+    ``t * n`` to ``t * n + n - 1``); the token-major form keeps the caller's
+    token stride, so the per-token column slices of a joint ``[V | K | Q]``
+    projection (``[T, n * H * D]`` viewed as ``[T, n, H, D]``) go in without a
+    copy.  Strides are read as given (a stride-1 innermost dim, 16-byte
+    aligned outer strides); ``dk`` / ``dv`` / ``dbeta`` come back in the
+    input's shape.
 
     ``num_householder == 1`` is exactly ``gated_delta_net``.  Dtypes are
     kernel-native and strict (callers convert).  ``g`` is float32, bfloat16
@@ -1245,6 +1355,8 @@ def gated_delta_product(
             positive multiple of the kernel chunk size, 64. ``64`` lets the
             backward reuse the series; a multiple of ``lcm(64, n)`` puts every
             checkpoint on a real-token boundary.
+        checkpoint_dtype: ``None`` stores io-dtype rows; ``torch.float32`` stores fp32 rows (the backward reuses io rows at the
+            chunk cadence and regenerates the dense series from any other rows).
         overwrite_initial_state: if ``True``, ``final_state`` is written
             into the ``initial_state`` buffer, which is required and
             returned as the final state; the engine runs the chain or the
@@ -1290,6 +1402,7 @@ def gated_delta_product(
             a_log=a_log,
             dt_bias=dt_bias,
             checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
+            checkpoint_dtype=checkpoint_dtype,
             plan_name=plan_name,
             state_indices=state_indices,
             output_final_state=bool(output_final_state) or bool(overwrite_initial_state),
@@ -1316,6 +1429,7 @@ def gated_delta_product(
             a_log=a_log,
             dt_bias=dt_bias,
             checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
+            checkpoint_dtype=checkpoint_dtype,
             plan_name=plan_name,
         )
     if checkpoint_every_n_tokens > 0:
@@ -1351,13 +1465,16 @@ def build_gdp_summary_graph(
     gate_domain="log",
     a_log_dtype=None,
     dt_bias_dtype=None,
+    k_shape=None,
+    v_shape=None,
+    beta_shape=None,
 ):
     graph = cudnn.pygraph()
     expanded = total * num_householder
-    k_t = graph.tensor([expanded, HK, K], data_type=io_dtype, name="k")
-    v_t = graph.tensor([expanded, HV, V], data_type=io_dtype, name="v")
+    k_t = graph.tensor(list(k_shape) if k_shape is not None else [expanded, HK, K], data_type=io_dtype, name="k")
+    v_t = graph.tensor(list(v_shape) if v_shape is not None else [expanded, HV, V], data_type=io_dtype, name="v")
     g_t = graph.tensor([total, HO], data_type=g_dtype, name="g")
-    beta_t = graph.tensor([expanded, HO], data_type=beta_dtype, name="beta")
+    beta_t = graph.tensor(list(beta_shape) if beta_shape is not None else [expanded, HO], data_type=beta_dtype, name="beta")
     cu_t = graph.tensor([N + 1], data_type=cu_dtype, name="cu_seqlens")
     state0_t = None
     if state_dtype is not None:
@@ -1435,11 +1552,19 @@ def gdp_summary(
     n = int(num_householder)
     if n < 1:
         raise ValueError(f"gated_delta_product_summary: num_householder must be a positive integer, got {num_householder}")
-    HK, K = k.shape[1], k.shape[2]
-    HV, V = v.shape[1], v.shape[2]
-    if beta.shape[1] != HO:
-        raise ValueError(f"gated_delta_product_summary: beta must carry HO = g's head count ({HO}); got {beta.shape[1]}")
+    if 0 in k.stride():
+        k = k.contiguous()
+    if 0 in v.stride():
+        v = v.contiguous()
+    if 0 in beta.stride():
+        beta = beta.contiguous()
+    HK, K = k.shape[-2], k.shape[-1]
+    HV, V = v.shape[-2], v.shape[-1]
+    if beta.shape[-1] != HO:
+        raise ValueError(f"gated_delta_product_summary: beta must carry HO = g's head count ({HO}); got {beta.shape[-1]}")
     check_gdp_rows("gated_delta_product_summary", total, n, k, v, beta, g)
+    check_tma_strides("gated_delta_product_summary", "k", k)
+    check_tma_strides("gated_delta_product_summary", "v", v)
     N = cu_seqlens.shape[0] - 1
     device = k.device
     if cu_seqlens.dtype not in (torch.int32, torch.int64):
@@ -1479,6 +1604,8 @@ def gdp_summary(
             raise ValueError(f"gated_delta_product_summary: {tensor_name} must be on k's device ({device}); got {tensor.device}")
     state0 = initial_state if initial_state is not None else None
 
+    from ..frost.common.host import family_slots
+
     cache_key = make_summary_cache_key(
         "gdp_summary",
         total,
@@ -1508,7 +1635,8 @@ def gdp_summary(
         plan_name,
         gate_domain=gate_domain,
         num_householder=n,
-    )
+        beta_shape=tuple(beta.shape),
+    ) + (family_slots(k, n, 3), family_slots(v, n, 3), family_slots(beta, n, 2))
     if cache_key not in summary_cache:
         summary_cache[cache_key] = build_gdp_summary_graph(
             total,
@@ -1533,6 +1661,9 @@ def gdp_summary(
             gate_domain=str(gate_domain),
             a_log_dtype=torch_dtype_to_cudnn(a_log.dtype) if a_log is not None else None,
             dt_bias_dtype=torch_dtype_to_cudnn(dt_bias.dtype) if dt_bias is not None else None,
+            k_shape=tuple(k.shape),
+            v_shape=tuple(v.shape),
+            beta_shape=tuple(beta.shape),
         )
         select_plan(summary_cache[cache_key][0], plan_name)
 
@@ -1586,8 +1717,8 @@ def gdp_summary_fake(
     n = int(num_householder)
     if n < 1:
         raise ValueError(f"gated_delta_product_summary: num_householder must be a positive integer, got {num_householder}")
-    K = k.shape[2]
-    V = v.shape[2]
+    K = k.shape[-1]
+    V = v.shape[-1]
     N = cu_seqlens.shape[0] - 1
     if cu_seqlens.dtype not in (torch.int32, torch.int64):
         raise ValueError(f"gated_delta_product_summary: cu_seqlens must be int32 or int64; got {cu_seqlens.dtype}")
@@ -1634,13 +1765,15 @@ def build_gdp_summary_bwd_graph(
     a_log_dtype=None,
     dt_bias_dtype=None,
     output_transition=False,
+    k_shape=None,
+    beta_shape=None,
 ):
     graph = cudnn.pygraph()
     expanded = total * num_householder
     q_t = graph.tensor([total, HQ, K], data_type=io_dtype, name="q")
-    k_t = graph.tensor([expanded, HK, K], data_type=io_dtype, name="k")
+    k_t = graph.tensor(list(k_shape) if k_shape is not None else [expanded, HK, K], data_type=io_dtype, name="k")
     g_t = graph.tensor([total, HO], data_type=g_dtype, name="g")
-    beta_t = graph.tensor([expanded, HO], data_type=beta_dtype, name="beta")
+    beta_t = graph.tensor(list(beta_shape) if beta_shape is not None else [expanded, HO], data_type=beta_dtype, name="beta")
     dO_t = graph.tensor([total, HV, V], data_type=io_dtype, name="dO")
     cu_t = graph.tensor([N + 1], data_type=cu_dtype, name="cu_seqlens")
     d_final_state_t = None
@@ -1725,12 +1858,17 @@ def gdp_summary_bwd(
     n = int(num_householder)
     if n < 1:
         raise ValueError(f"gated_delta_product_summary_bwd: num_householder must be a positive integer, got {num_householder}")
-    HK = k.shape[1]
+    if 0 in k.stride():
+        k = k.contiguous()
+    if 0 in beta.stride():
+        beta = beta.contiguous()
+    HK = k.shape[-2]
     HV, V = dO.shape[1], dO.shape[2]
     HO = g.shape[1]
-    if beta.shape[1] != HO:
-        raise ValueError(f"gated_delta_product_summary_bwd: beta must carry HO = g's head count ({HO}); got {beta.shape[1]}")
+    if beta.shape[-1] != HO:
+        raise ValueError(f"gated_delta_product_summary_bwd: beta must carry HO = g's head count ({HO}); got {beta.shape[-1]}")
     check_gdp_rows("gated_delta_product_summary_bwd", total, n, k, None, beta, g, dO=dO)
+    check_tma_strides("gated_delta_product_summary_bwd", "k", k)
     N = cu_seqlens.shape[0] - 1
     device = dO.device
     if cu_seqlens.dtype not in (torch.int32, torch.int64):
@@ -1771,6 +1909,8 @@ def gdp_summary_bwd(
         if tensor is not None and tensor.device != device:
             raise ValueError(f"gated_delta_product_summary_bwd: {tensor_name} must be on dO's device ({device}); got {tensor.device}")
 
+    from ..frost.common.host import family_slots
+
     cache_key = make_summary_cache_key(
         "gdp_summary_bwd",
         total,
@@ -1805,7 +1945,8 @@ def gdp_summary_bwd(
         do_dtype=dO.dtype,
         do_shape=tuple(dO.shape),
         q_shape=tuple(q.shape),
-    )
+        beta_shape=tuple(beta.shape),
+    ) + (family_slots(k, n, 3), 1, family_slots(beta, n, 2))
     if cache_key not in summary_cache:
         summary_cache[cache_key] = build_gdp_summary_bwd_graph(
             total,
@@ -1832,6 +1973,8 @@ def gdp_summary_bwd(
             output_transition=bool(output_transition),
             a_log_dtype=torch_dtype_to_cudnn(a_log.dtype) if a_log is not None else None,
             dt_bias_dtype=torch_dtype_to_cudnn(dt_bias.dtype) if dt_bias is not None else None,
+            k_shape=tuple(k.shape),
+            beta_shape=tuple(beta.shape),
         )
         select_plan(summary_cache[cache_key][0], plan_name)
 
@@ -1887,8 +2030,8 @@ def gdp_summary_bwd_fake(
     n = int(num_householder)
     if n < 1:
         raise ValueError(f"gated_delta_product_summary_bwd: num_householder must be a positive integer, got {num_householder}")
-    V = dO.shape[2]
-    K = k.shape[2]
+    V = dO.shape[-1]
+    K = k.shape[-1]
     HO = g.shape[1]
     N = cu_seqlens.shape[0] - 1
     if cu_seqlens.dtype not in (torch.int32, torch.int64):
@@ -1952,8 +2095,8 @@ def gated_delta_product_summary(
     ``[N, HO, K, K]`` the span transition in stored domain (``M_buf = M^T``), so that across spans ``X_final = X_init @
     M_buf + X_H`` and ``X_dh0 = X_dht @ M_buf^T + X_G``.  Both outputs are non-differentiable.  THD layout and gate
     semantics match :func:`gated_delta_product` (k ``[total_tokens * n, HK, K]``, v ``[total_tokens * n, HV, V]``, beta
-    ``[total_tokens * n, HO]`` on the expanded timeline, ``n = num_householder``; g ``[total_tokens, HO]`` and cu_seqlens
-    ``[N+1]`` at the real tokens); ``initial_state`` is float32.
+    ``[total_tokens * n, HO]`` on the expanded timeline or their token-major forms ``[total_tokens, n, ...]``, ``n =
+    num_householder``; g ``[total_tokens, HO]`` and cu_seqlens ``[N+1]`` at the real tokens); ``initial_state`` is float32.
 
     Args:
         use_beta_sigmoid_in_kernel: apply ``sigmoid(beta)`` in the kernel; ``beta`` then holds raw logits.
@@ -1962,8 +2105,8 @@ def gated_delta_product_summary(
         gate_domain: ``"log"`` (``g = ln(alpha)``) or ``"linear"`` (``g = alpha in (0, 1]``, 1e-10 floor); not with ``safe_gate``.
         plan_name: pin one execution plan by name (e.g. ``gdp_summary_frost``).
     """
-    if k.dim() != 3:
-        raise ValueError("expected THD [total_tokens, heads, dim] tensors")
+    if k.dim() not in (3, 4):
+        raise ValueError("expected THD [total_tokens * n, heads, dim] or token-major [total_tokens, n, heads, dim] tensors")
     final_state, transition = torch.ops.cudnn.gated_delta_product_summary(
         k,
         v,
@@ -2014,8 +2157,9 @@ def gated_delta_product_summary_bwd(
     also ``transition`` ``[N, HO, K, K]`` float32, the span transition in the backward's stored-domain orientation
     (``M_buf^T``) so that ``X_dh0 = X_dht @ transition + X_G``.  The outputs are non-differentiable.  THD layout and gate
     semantics match :func:`gated_delta_product` (k ``[total_tokens * n, HK, K]`` and beta ``[total_tokens * n, HO]`` on the
-    expanded timeline, ``n = num_householder``; q ``[total_tokens, HQ, K]``, g ``[total_tokens, HO]``, dO ``[total_tokens, HO,
-    V]`` in the io dtype and cu_seqlens ``[N+1]`` at the real tokens); ``d_final_state`` is float32 ``[N, HO, V, K]``.
+    expanded timeline or their token-major forms ``[total_tokens, n, ...]``, ``n = num_householder``; q ``[total_tokens, HQ,
+    K]``, g ``[total_tokens, HO]``, dO ``[total_tokens, HO, V]`` in the io dtype and cu_seqlens ``[N+1]`` at the real
+    tokens); ``d_final_state`` is float32 ``[N, HO, V, K]``.
 
     Args:
         scale: attention scale applied to ``q``; defaults to ``1 / sqrt(K)``.

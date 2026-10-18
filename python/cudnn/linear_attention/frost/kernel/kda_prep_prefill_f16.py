@@ -221,14 +221,14 @@ def epilogue_warp(
     if cutlass.const_expr(cfg.enable_checkpoints):
         sCheckpoint_tma = SmemTile(
             base=sCheckpoint_raw,
-            elems_per_stage=(cfg.d_k * cfg.d_v),
+            elems_per_stage=cfg.checkpoint_stage_elems,
             stages=cfg.smem_checkpoint_stages,
             leading_byte_offset=0,
             stride_byte_offset=0,
             layout=0,
-            tma_loads_per_tile=(cfg.d_k // 64),
-            tma_granu_elems=64,
-            tma_subtile_stride_elems=cfg.d_v * 64,
+            tma_loads_per_tile=(cfg.d_k // cfg.checkpoint_box_elems),
+            tma_granu_elems=cfg.checkpoint_box_elems,
+            tma_subtile_stride_elems=cfg.d_v * cfg.checkpoint_box_elems,
         )
     checkpoint_ready_index = PipelineState.start(phase=0)
     sO_tma = SmemTile(
@@ -292,9 +292,9 @@ def epilogue_warp(
                     do_checkpoint = do_checkpoint and chunk_idx >= write_start
                     checkpoint_stage = checkpoint_ready_index.idx
                     if do_checkpoint:
+                        checkpoint_entry = checkpoint_quotient
                         bars.mb_checkpoint_tmastg_ready[checkpoint_ready_index.idx].wait(checkpoint_ready_index.phase)
                         checkpoint_ready_index = advance(checkpoint_ready_index, cfg.smem_checkpoint_stages)
-                        checkpoint_entry = checkpoint_quotient
                         checkpoint_slice = tma_slice_runtime_desc(desc_checkpoint_slot, cutlass.Int32(0), v_offset, checkpoint_entry, head_o)
                         tma_store_tile(sCheckpoint_tma[checkpoint_stage], checkpoint_slice, acquire=False)
                         tma_store_commit()
@@ -904,37 +904,44 @@ def compute0_warp_group(
                         bars.mb_checkpoint_tmastg_done[checkpoint_row_stage].wait(
                             (checkpoint_row_idx // cutlass.Int32(cfg.smem_checkpoint_stages) + cutlass.Int32(1)) % 2
                         )
-                        checkpoint_row_addr = checkpoint_row_stage * (cfg.d_k * cfg.d_v)
+                        checkpoint_row_addr = checkpoint_row_stage * cfg.checkpoint_stage_elems
                         if cutlass.const_expr(cfg.d_v == 128):
                             if checkpoint_row_valid:
                                 for b in cutlass.range_constexpr(dk_halves):
-                                    for word_group in cutlass.range_constexpr(4):
-                                        dk = b * 32 + word_group * 8
+                                    for g in cutlass.range_constexpr(32 // cfg.checkpoint_store_elems):
+                                        dk = b * 32 + g * cfg.checkpoint_store_elems
                                         row_addr = (
                                             checkpoint_row_addr
-                                            + (dk // 64) * (cfg.d_v * 64)
-                                            + checkpoint_row_dim * 64
-                                            + swizzle_xor_128b(checkpoint_row_dim, dk % 64, elem_bytes=2)
+                                            + (dk // cfg.checkpoint_box_elems) * (cfg.d_v * cfg.checkpoint_box_elems)
+                                            + checkpoint_row_dim * cfg.checkpoint_box_elems
+                                            + swizzle_xor_128b(checkpoint_row_dim, dk % cfg.checkpoint_box_elems, elem_bytes=cfg.checkpoint_elem_bytes)
                                         )
-                                        (sCheckpoint_ptr + row_addr).store(
-                                            cutlass.Vector.from_elements(
-                                                tuple(l_packed_blocks[b][word_group * 4 + t] for t in range(4)), cutlass.Int32
-                                            ).bitcast(cfg.io_dtype),
-                                            alignment=16,
-                                        )
+                                        if cutlass.const_expr(cfg.checkpoint_dtype.width == 16):
+                                            row_vec = cutlass.Vector.from_elements(
+                                                tuple(l_packed_blocks[b][g * 4 + t] for t in range(4)), cutlass.Int32
+                                            ).bitcast(cfg.io_dtype)
+                                        else:
+                                            row_vec = cutlass.Vector.from_elements(tuple(l_state_vecs[b][g * 4 + t] for t in range(4)), cutlass.Float32)
+                                        (sCheckpoint_ptr + row_addr).store(row_vec, alignment=16)
                         else:
                             for m in cutlass.range_constexpr(cfg.d_k // 16):
                                 dk = 8 * m
                                 for h in cutlass.range_constexpr(2):
                                     row_addr = (
                                         checkpoint_row_addr
-                                        + (dk // 64) * (cfg.d_v * 64)
-                                        + (checkpoint_row_dim + 8 * h) * 64
-                                        + swizzle_xor_128b(checkpoint_row_dim + 8 * h, dk % 64 + 2 * (lane_idx % 4), elem_bytes=2)
+                                        + (dk // cfg.checkpoint_box_elems) * (cfg.d_v * cfg.checkpoint_box_elems)
+                                        + (checkpoint_row_dim + 8 * h) * cfg.checkpoint_box_elems
+                                        + swizzle_xor_128b(
+                                            (checkpoint_row_dim + 8 * h),
+                                            dk % cfg.checkpoint_box_elems + 2 * (lane_idx % 4),
+                                            elem_bytes=cfg.checkpoint_elem_bytes,
+                                        )
                                     )
-                                    (sCheckpoint_ptr + row_addr).store(
-                                        cutlass.Vector.from_elements((l_packed[2 * m + h],), cutlass.Int32).bitcast(cfg.io_dtype), alignment=4
-                                    )
+                                    if cutlass.const_expr(cfg.checkpoint_dtype.width == 16):
+                                        row_vec = cutlass.Vector.from_elements((l_packed[2 * m + h],), cutlass.Int32).bitcast(cfg.io_dtype)
+                                    else:
+                                        row_vec = cutlass.Vector.from_elements((l_state[4 * m + 2 * h], l_state[4 * m + 2 * h + 1]), cutlass.Float32)
+                                    (sCheckpoint_ptr + row_addr).store(row_vec, alignment=2 * cfg.checkpoint_elem_bytes)
                         nvvm.fence_proxy("async.shared", space="cta")
                         if nvvm.elect_sync():
                             bars.mb_checkpoint_tmastg_ready[checkpoint_row_stage].arrive()
@@ -1229,20 +1236,23 @@ def compute2_warp_group(
                                     bars.mb_checkpoint_tmastg_done[checkpoint_stage].wait(checkpoint_stage_parity)
                                 if state_row_valid:
                                     for i in cutlass.range_constexpr(init_blocks_lo, init_blocks_hi):
-                                        for word_group in cutlass.range_constexpr(2):
-                                            dk = i * 16 + word_group * 8
+                                        for g in cutlass.range_constexpr(16 // cfg.checkpoint_store_elems):
+                                            dk = i * 16 + g * cfg.checkpoint_store_elems
                                             seed_row_addr = (
                                                 seed_stage_base
-                                                + (dk // 64) * (cfg.d_v * 64)
-                                                + value_dim * 64
-                                                + swizzle_xor_128b(value_dim, dk % 64, elem_bytes=2)
+                                                + (dk // cfg.checkpoint_box_elems) * (cfg.d_v * cfg.checkpoint_box_elems)
+                                                + value_dim * cfg.checkpoint_box_elems
+                                                + swizzle_xor_128b(value_dim, dk % cfg.checkpoint_box_elems, elem_bytes=cfg.checkpoint_elem_bytes)
                                             )
-                                            (sCheckpoint_ptr + seed_row_addr).store(
-                                                cutlass.Vector.from_elements(
-                                                    tuple(seed_packed_blocks[i - init_blocks_lo][word_group * 4 + t] for t in range(4)), cutlass.Int32
-                                                ).bitcast(cfg.io_dtype),
-                                                alignment=16,
-                                            )
+                                            if cutlass.const_expr(cfg.checkpoint_dtype.width == 16):
+                                                seed_vec = cutlass.Vector.from_elements(
+                                                    tuple(seed_packed_blocks[i - init_blocks_lo][g * 4 + t] for t in range(4)), cutlass.Int32
+                                                ).bitcast(cfg.io_dtype)
+                                            else:
+                                                seed_vec = cutlass.Vector.from_elements(
+                                                    tuple(seed_vecs[i - init_blocks_lo][g * 4 + t] for t in range(4)), cutlass.Float32
+                                                )
+                                            (sCheckpoint_ptr + seed_row_addr).store(seed_vec, alignment=16)
                     nvvm.tcgen05_wait("store")
                     if cutlass.const_expr(cfg.enable_checkpoints):
                         if write_start == 0:
@@ -1255,18 +1265,21 @@ def compute2_warp_group(
             if cutlass.const_expr(cfg.enable_checkpoints and mState_init is None):
                 if write_start == 0:
                     bars.mb_checkpoint_tmastg_done[checkpoint_stage].wait(checkpoint_stage_parity)
-                    checkpoint_stage_base = checkpoint_stage * (cfg.d_k * cfg.d_v)
-                    zero_packs = tuple(cutlass.Int32(0) for _ in range(4))
+                    checkpoint_stage_base = checkpoint_stage * cfg.checkpoint_stage_elems
+                    if cutlass.const_expr(cfg.checkpoint_dtype.width == 16):
+                        zero_vec = cutlass.Vector.from_elements(tuple(cutlass.Int32(0) for _ in range(4)), cutlass.Int32).bitcast(cfg.io_dtype)
+                    else:
+                        zero_vec = cutlass.Vector.from_elements(tuple(cutlass.Float32(0.0) for _ in range(4)), cutlass.Float32)
                     if state_row_valid:
-                        for i in cutlass.range_constexpr(cfg.d_k // 16):
-                            for g in cutlass.range_constexpr(2):
-                                dk = i * 16 + g * 8
-                                checkpoint_addr = (
-                                    checkpoint_stage_base + (dk // 64) * (cfg.d_v * 64) + value_dim * 64 + swizzle_xor_128b(value_dim, dk % 64, elem_bytes=2)
-                                )
-                                (sCheckpoint_ptr + checkpoint_addr).store(
-                                    cutlass.Vector.from_elements(zero_packs, cutlass.Int32).bitcast(cfg.io_dtype), alignment=16
-                                )
+                        for c in cutlass.range_constexpr(cfg.d_k // cfg.checkpoint_store_elems):
+                            dk = c * cfg.checkpoint_store_elems
+                            checkpoint_addr = (
+                                checkpoint_stage_base
+                                + (dk // cfg.checkpoint_box_elems) * (cfg.d_v * cfg.checkpoint_box_elems)
+                                + value_dim * cfg.checkpoint_box_elems
+                                + swizzle_xor_128b(value_dim, dk % cfg.checkpoint_box_elems, elem_bytes=cfg.checkpoint_elem_bytes)
+                            )
+                            (sCheckpoint_ptr + checkpoint_addr).store(zero_vec, alignment=16)
                     nvvm.fence_proxy("async.shared", space="cta")
                     if nvvm.elect_sync():
                         bars.mb_checkpoint_tmastg_ready[checkpoint_stage].arrive()
@@ -1439,34 +1452,44 @@ def compute2_warp_group(
                     bars.mb_checkpoint_tmastg_done[checkpoint_row_stage].wait(
                         (checkpoint_row_idx // cutlass.Int32(cfg.smem_checkpoint_stages) + cutlass.Int32(1)) % 2
                     )
-                    checkpoint_row_addr = checkpoint_row_stage * (cfg.d_k * cfg.d_v)
+                    checkpoint_row_addr = checkpoint_row_stage * cfg.checkpoint_stage_elems
                     if cutlass.const_expr(cfg.d_v == 128):
                         if state_row_valid:
                             for i in cutlass.range_constexpr(state_blocks_per_half, cfg.d_k // 16):
-                                for word_group in cutlass.range_constexpr(2):
-                                    dk = i * 16 + word_group * 8
+                                for g in cutlass.range_constexpr(16 // cfg.checkpoint_store_elems):
+                                    dk = i * 16 + g * cfg.checkpoint_store_elems
                                     row_addr = (
-                                        checkpoint_row_addr + (dk // 64) * (cfg.d_v * 64) + value_dim * 64 + swizzle_xor_128b(value_dim, dk % 64, elem_bytes=2)
+                                        checkpoint_row_addr
+                                        + (dk // cfg.checkpoint_box_elems) * (cfg.d_v * cfg.checkpoint_box_elems)
+                                        + value_dim * cfg.checkpoint_box_elems
+                                        + swizzle_xor_128b(value_dim, dk % cfg.checkpoint_box_elems, elem_bytes=cfg.checkpoint_elem_bytes)
                                     )
-                                    (sCheckpoint_ptr + row_addr).store(
-                                        cutlass.Vector.from_elements(
-                                            tuple(packed_blocks[i - state_blocks_per_half][word_group * 4 + t] for t in range(4)), cutlass.Int32
-                                        ).bitcast(cfg.io_dtype),
-                                        alignment=16,
-                                    )
+                                    if cutlass.const_expr(cfg.checkpoint_dtype.width == 16):
+                                        row_vec = cutlass.Vector.from_elements(
+                                            tuple(packed_blocks[i - state_blocks_per_half][g * 4 + t] for t in range(4)), cutlass.Int32
+                                        ).bitcast(cfg.io_dtype)
+                                    else:
+                                        row_vec = cutlass.Vector.from_elements(
+                                            tuple(state_vecs[i - state_blocks_per_half][g * 4 + t] for t in range(4)), cutlass.Float32
+                                        )
+                                    (sCheckpoint_ptr + row_addr).store(row_vec, alignment=16)
                     else:
                         for m in cutlass.range_constexpr(cfg.d_k // 16):
                             dk = cfg.d_k // 2 + 8 * m
                             for h in cutlass.range_constexpr(2):
                                 row_addr = (
                                     checkpoint_row_addr
-                                    + (dk // 64) * (cfg.d_v * 64)
-                                    + (pack_row + 8 * h) * 64
-                                    + swizzle_xor_128b(pack_row + 8 * h, dk % 64 + 2 * (lane_idx % 4), elem_bytes=2)
+                                    + (dk // cfg.checkpoint_box_elems) * (cfg.d_v * cfg.checkpoint_box_elems)
+                                    + (pack_row + 8 * h) * cfg.checkpoint_box_elems
+                                    + swizzle_xor_128b(
+                                        (pack_row + 8 * h), dk % cfg.checkpoint_box_elems + 2 * (lane_idx % 4), elem_bytes=cfg.checkpoint_elem_bytes
+                                    )
                                 )
-                                (sCheckpoint_ptr + row_addr).store(
-                                    cutlass.Vector.from_elements((packed_right[2 * m + h],), cutlass.Int32).bitcast(cfg.io_dtype), alignment=4
-                                )
+                                if cutlass.const_expr(cfg.checkpoint_dtype.width == 16):
+                                    row_vec = cutlass.Vector.from_elements((packed_right[2 * m + h],), cutlass.Int32).bitcast(cfg.io_dtype)
+                                else:
+                                    row_vec = cutlass.Vector.from_elements((state_right[4 * m + 2 * h], state_right[4 * m + 2 * h + 1]), cutlass.Float32)
+                                (sCheckpoint_ptr + row_addr).store(row_vec, alignment=2 * cfg.checkpoint_elem_bytes)
                     nvvm.fence_proxy("async.shared", space="cta")
                     if nvvm.elect_sync():
                         bars.mb_checkpoint_tmastg_ready[checkpoint_row_stage].arrive()
@@ -1862,7 +1885,10 @@ def prologue(
             ),
         )
         base_checkpoint = cuda.create_tensor_map_tiled_from_view(
-            checkpoint_view, box_dims=(box_elems, d_v_state // tiles_per_head, 1, 1), stride_order=(0, 1, 2, 3), swizzle=swizzle
+            checkpoint_view,
+            box_dims=(128 // (state_checkpoints.element_type.width // 8), d_v_state // tiles_per_head, 1, 1),
+            stride_order=(0, 1, 2, 3),
+            swizzle=swizzle,
         )
     base_k_decay = base_o
     base_q_decay = base_o
@@ -2056,7 +2082,7 @@ def frost_kda_prep_prefill(
         alignment=cfg.buffer_align_bytes,
     )
     sCheckpoint_raw = (
-        cutlass.Array(cfg.io_dtype, cfg.smem_checkpoint_stages * cfg.d_k * cfg.d_v, space=SMEM, alignment=cfg.buffer_align_bytes)
+        cutlass.Array(cfg.checkpoint_dtype, cfg.smem_checkpoint_stages * cfg.checkpoint_stage_elems, space=SMEM, alignment=cfg.buffer_align_bytes)
         if cutlass.const_expr(cfg.enable_checkpoints)
         else sO_raw
     )
@@ -2320,6 +2346,11 @@ class KdaPrepPrefillCfg:
     smem_raw_bar_stages: int = 0  # ready/beta-ring mbar depth: raw rounded up to even
     smem_o_stages: int = CFG.SMEM_O_STAGES
     smem_checkpoint_stages: int = 1
+    checkpoint_dtype: Type[cutlass.Numeric] = None
+    checkpoint_box_elems: int = 64
+    checkpoint_stage_elems: int = 0
+    checkpoint_elem_bytes: int = 2
+    checkpoint_store_elems: int = 8
     smem_decay_stages: int = CFG.SMEM_DECAY_STAGES
     smem_intermediate_stages: int = CFG.SMEM_INTERMEDIATE_STAGES
     tmem_q_state_acc_stages: int = CFG.TMEM_Q_STATE_ACC_STAGES
@@ -2355,6 +2386,7 @@ def build_cfg(
     use_initial_state: bool,
     store_final_state: bool,
     enable_checkpoints: bool,
+    checkpoint_dtype=None,
     l2norm: bool,
     safe_gate: bool,
     gate_scale_log2: float,
@@ -2387,8 +2419,13 @@ def build_cfg(
         d_v=d_v,
         tiles_per_head=tiles_per_head,
     )
+    cfg.checkpoint_dtype = io_dtype if checkpoint_dtype is None else checkpoint_dtype
+    cfg.checkpoint_box_elems = 128 // (cfg.checkpoint_dtype.width // 8)
+    cfg.checkpoint_elem_bytes = cfg.checkpoint_dtype.width // 8
+    cfg.checkpoint_store_elems = 16 // cfg.checkpoint_elem_bytes
+    cfg.checkpoint_stage_elems = cfg.d_k * cfg.d_v
     if enable_checkpoints:
-        cfg.smem_checkpoint_stages = 2
+        cfg.smem_checkpoint_stages = 1 if cfg.checkpoint_dtype.width == 32 else 2
     cfg.smem_raw_bar_stages = cfg.smem_raw_stages + (cfg.smem_raw_stages % 2)
     cfg.threads_per_cta = 16 * cfg.threads_per_warp
     cfg.tmem_user_threads = (

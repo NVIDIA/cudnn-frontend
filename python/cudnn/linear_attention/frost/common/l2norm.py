@@ -23,6 +23,8 @@ from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fmul2, fp32_to_fp16, l2
 from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
 from cudnn.frost.tile_dsl.tma import ld_global_v4, st_global, st_global_v4
 
+from .thd import expanded_view
+
 USE_PDL = True
 
 THREADS_PER_CTA = 512
@@ -46,6 +48,7 @@ def frost_l2norm_qk(
     expand_num: cutlass.Constexpr[int],
     expand_phase: cutlass.Constexpr[int],
     expand_fill: cutlass.Constexpr[bool],
+    k_slots: cutlass.Constexpr[int],
 ) -> None:
     """Grid over all q rows then all k rows, FWD_LANES lanes x (d // FWD_LANES)
     elements per row, FWD_ROWS_PER_GROUP consecutive rows per lane group: fp32 sums
@@ -96,7 +99,13 @@ def frost_l2norm_qk(
             k_row = row_r - n_q_rows
             t = k_row // h_k
             h = k_row % h_k
-            src_elements = t * cutlass.Int64(mK.stride[0]) + h * cutlass.Int64(mK.stride[1])
+            if cutlass.const_expr(k_slots == 1):
+                tok = t
+                slot = cutlass.Int32(0)
+            else:
+                tok = t // cutlass.Int32(k_slots)
+                slot = t - tok * cutlass.Int32(k_slots)
+            src_elements = tok * cutlass.Int64(mK.stride[0]) + slot * cutlass.Int64(mK.stride[1]) + h * cutlass.Int64(mK.stride[2])
             src_addr = mK.iterator.toint() + src_elements * cutlass.Int64(2)
             workspace_addr = mKn.iterator.toint() + cutlass.Int64(k_row) * cutlass.Int64(d) * cutlass.Int64(2)
             if cutlass.const_expr(mInvK is not None):
@@ -148,9 +157,12 @@ def l2norm_qk_launch(
     expand_num: cutlass.Constexpr[int],
     expand_phase: cutlass.Constexpr[int],
     expand_fill: cutlass.Constexpr[bool],
+    k_slots: cutlass.Constexpr[int],
+    k_expand_num: cutlass.Constexpr[int],
     stream: cuda.CUstream,
 ):
-    frost_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, n_q_rows, n_rows, h_q, h_k, d, expand_num, expand_phase, expand_fill).launch(
+    k = expanded_view(k, k_slots, k_expand_num)
+    frost_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, n_q_rows, n_rows, h_q, h_k, d, expand_num, expand_phase, expand_fill, k_slots).launch(
         grid=(n_blocks, 1, 1), block=(THREADS_PER_CTA, 1, 1), stream=stream, use_pdl=USE_PDL
     )
 
@@ -175,7 +187,7 @@ def run_l2norm_qk(r, q, k, q_n, k_n, inv_q, inv_k, stream) -> None:
     r.compiled(q, k, q_n, k_n, inv_q, inv_k, r.n_q_rows, r.n_rows, r.h_q, r.h_k, r.n_blocks, cuda.CUstream(int(stream)))
 
 
-def build_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, *, expand_num=1, expand_phase=0, expand_fill=False, skip_q=False, stream) -> L2NormQkRecipe:
+def build_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, *, expand_num=1, expand_phase=0, expand_fill=False, skip_q=False, k_slots=1, stream) -> L2NormQkRecipe:
     """Compile (cached), run once, and bake the q/k normalize: rows into the
     compact io workspace copies, fp32 inverse norms to their slots.  ``inv_q``
     and ``inv_k`` are given together or both None; with None the norms are not
@@ -187,29 +199,50 @@ def build_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, *, expand_num=1, expand_phase=
     row and normalizes a zero row on the off-phase ones, so q_n and inv_q come
     out fully written on the expanded timeline.  ``skip_q`` walks the k rows
     alone (the state summaries take no q); q, q_n and inv_q are then never
-    read and may alias the k buffers."""
+    read and may alias the k buffers.  ``k_slots`` is :func:`common.host.family_slots` of ``k``: 1 for uniform rows
+    (expanded ``[rows, HK, K]`` or a dense token-major view), else the token-major ``[token, k_slots, HK, K]`` with its
+    own strides; a rank-4 ``k`` carries its rows per token (``num_householder``) as the slot extent, which the view takes
+    its row stride from (the ``expand_num`` here is the q-row expansion alone); ``k_n`` is always the dense expanded copy."""
     assert (inv_q is None) == (inv_k is None), "inv_q and inv_k are given together or both None"
+    if skip_q:
+        q = q_n
     total, h_q, d = (int(s_) for s_ in q.shape)
-    total_k, h_k, d_k = (int(s_) for s_ in k.shape)
+    h_k, d_k = int(k.shape[-2]), int(k.shape[-1])
+    total_k = int(k.shape[0]) * (int(k.shape[1]) if len(k.shape) == 4 else 1)
     ROWS = (THREADS_PER_CTA // FWD_LANES) * FWD_ROWS_PER_GROUP
     n_q_rows = 0 if skip_q else total * h_q * (int(expand_num) if expand_fill else 1)
     n_rows = n_q_rows + total_k * h_k
     args = (n_q_rows, n_rows, h_q, h_k, (n_rows + ROWS - 1) // ROWS)
     cu_stream = cuda.CUstream(int(stream))
-    key = ("fwd", str(q.dtype), int(expand_num), int(expand_phase), bool(expand_fill), inv_k is not None, d, current_device())
+    k_expand_num = int(k.shape[1]) if len(k.shape) == 4 else 1
+    key = (
+        "fwd",
+        str(q.dtype),
+        int(expand_num),
+        int(expand_phase),
+        bool(expand_fill),
+        inv_k is not None,
+        d,
+        current_device(),
+        int(k_slots),
+        len(k.shape),
+        k_expand_num,
+    )
     if key not in compiled_cache:
         tensors = (q, k, q_n, k_n, inv_q, inv_k)
         compiled_cache[key] = cute.compile(
             l2norm_qk_launch,
             *(
                 from_dlpack(t, assumed_align=16).mark_layout_dynamic(leading_dim=lead) if t is not None else None
-                for t, lead in zip(tensors, (2, 2, 2, 2, 1, 1))
+                for t, lead in zip(tensors, (2, len(k.shape) - 1, 2, 2, 1, 1))
             ),
             *(cutlass.Int32(a) for a in args),
             d,
             int(expand_num),
             int(expand_phase),
             bool(expand_fill),
+            int(k_slots),
+            k_expand_num,
             cu_stream,
             options="--enable-tvm-ffi",
         )

@@ -37,6 +37,8 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 from .engine_ids import (
     FAMILY_BLOCK,
     FROST_GEMM_ID_BASE,
+    FROST_NORM_BWD_ID_BASE,
+    FROST_NORM_FWD_ID_BASE,
     FROST_SDPA_BWD_ID_BASE,
     FROST_SDPA_FWD_ID_BASE,
     GDN2_ID_BASE,
@@ -140,6 +142,14 @@ class EngineFamily:
 # ignored when classifying, so `matmul + pointwise` is a gemm graph. Names, not
 # enum members, so this file imports no engine code.
 _ANCHOR_NODE_TO_FAMILY = {
+    "LAYERNORM": "frost_norm_fwd",
+    "RMSNORM": "frost_norm_fwd",
+    "INSTANCENORM": "frost_norm_fwd",
+    "BATCHNORM": "frost_norm_fwd",
+    "LAYERNORM_BWD": "frost_norm_bwd",
+    "RMSNORM_BWD": "frost_norm_bwd",
+    "INSTANCENORM_BWD": "frost_norm_bwd",
+    "BATCHNORM_BWD": "frost_norm_bwd",
     "MATMUL": "frost_gemm",
     "MATMUL_FP8": "frost_gemm",
     "MOE_GROUPED_MATMUL": "frost_gemm",
@@ -263,7 +273,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_fwd_prefill_sm100": EngineSlot(11),
             "sdpa_fwd_prefill_sm100_mxfp8": EngineSlot(12, opt_in=True),
             "sdpa_fwd_prefill_sm100_fp8": EngineSlot(13),
-            "sdpa_fwd_prefill_sm107_fp8": EngineSlot(14, opt_in=True),
+            "sdpa_fwd_prefill_sm107_fp8": EngineSlot(14),
             "sdpa_fwd_prefill_sm107": EngineSlot(15),
             "sdpa_fwd_prefill_sm107_mxfp8": EngineSlot(16),
             "sdpa_fwd_prefill_sm90": EngineSlot(17),
@@ -289,6 +299,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_bwd_sm107_mxfp8": EngineSlot(6, opt_in=True),
             "sdpa_bwd_sm100_d256": EngineSlot(7, opt_in=True),
             "sdpa_bwd_sm107_d512": EngineSlot(8, opt_in=True),
+            "sdpa_bwd_sm100_d128": EngineSlot(9, opt_in=True),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
         # One entry per eligible row, WITH the tiles the lowering would pick
@@ -302,6 +313,23 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "cudnn.conv.frost.engine",
         "FrostConvEngines",
         slots={"frost_conv": EngineSlot(0, opt_in=True)},
+    ),
+    EngineFamily(
+        FROST_NORM_FWD_ID_BASE,
+        "frost_norm_fwd",
+        "cudnn.norm.fprop.engine",
+        "FrostNormFwdEngines",
+        # Slots are FIXED FOREVER; append the next free one, never reorder.
+        slots={"norm_fprop_sm100": EngineSlot(0)},
+        analyzer=("cudnn.norm.graph_analyzer", "analyze"),
+    ),
+    EngineFamily(
+        FROST_NORM_BWD_ID_BASE,
+        "frost_norm_bwd",
+        "cudnn.norm.bprop.engine",
+        "FrostNormBwdEngines",
+        slots={"norm_bprop_sm100": EngineSlot(0)},
+        analyzer=("cudnn.norm.graph_analyzer", "analyze"),
     ),
 )
 

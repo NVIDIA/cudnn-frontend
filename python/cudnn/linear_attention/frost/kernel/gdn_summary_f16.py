@@ -79,9 +79,17 @@ import cutlass.experimental.cuda.tensor_map as tma
 from cutlass.cute.arch.nvvm_wrappers import inline_ptx
 from cutlass.cute.runtime import from_dlpack
 
-from ..common.thd import emit_seq_descs, emit_tile_seq_descs, TENSOR_MAP_QWORDS
+from ..common.thd import (
+    emit_checkpoint_seq_descs,
+    emit_family_descs,
+    emit_seq_descs,
+    emit_tile_seq_descs,
+    expanded_view,
+    tma_load_family,
+    TENSOR_MAP_QWORDS,
+)
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, decode_head, decode_work_item, order_body
-from ..common.host import get_dtype
+from ..common.host import get_dtype, family_slots
 
 RCP_LN2 = 1.4426950408889634  # 1/ln(2): natural-log gates -> the kernel's log2 domain
 from cudnn.frost.tile_dsl.barrier import (
@@ -559,10 +567,12 @@ def tmaldg_warp(
     bars,
     k_ratio,
     v_ratio,
+    arr_words,
 ):
     """TMA-LDG warp role (warp 9): persistent scheduler loop + per-chunk K / V
-    TMA loads and the chunk-factor tile TMA loads."""
+    TMA loads (through their (token, slot, head, dim) descriptor families) and the chunk-factor tile TMA loads."""
     nvvm.setmaxregister(cfg.num_regs_other, nvvm.SetMaxRegisterAction.DECREASE)
+    acquired_batch = cutlass.Int32(-1)
 
     k_index = PipelineState.start(phase=1)
     v_index = PipelineState.start(phase=1)
@@ -617,26 +627,26 @@ def tmaldg_warp(
         head_k = head_idx // k_ratio
         head_v = head_idx // v_ratio
         slot = batch_idx * desc_qwords
-        desc_k_slot = (desc_k_base + slot).tospace(cutlass.AddressSpace.generic)
-        desc_v_slot = (desc_v_base + slot).tospace(cutlass.AddressSpace.generic)
-        if elect_one:
-            tma_tensormap_acquire(desc_k_slot)
-            tma_tensormap_acquire(desc_v_slot)
+        desc_k_family = desc_k_base + slot
+        desc_v_family = desc_v_base + slot
         desc_tinv_slot = (desc_tinv_base + slot).tospace(cutlass.AddressSpace.generic)
-        if elect_one:
-            tma_tensormap_acquire(desc_tinv_slot)
+        if batch_idx != acquired_batch:
+            acquired_batch = batch_idx
+            if elect_one:
+                for s in cutlass.range_constexpr(1 if cfg.b_t % cfg.k_slots == 0 else cfg.k_slots + 1):
+                    tma_tensormap_acquire((desc_k_family + s * arr_words).tospace(cutlass.AddressSpace.generic))
+                for s in cutlass.range_constexpr(1 if cfg.b_t % cfg.v_slots == 0 else cfg.v_slots + 1):
+                    tma_tensormap_acquire((desc_v_family + s * arr_words).tospace(cutlass.AddressSpace.generic))
+                tma_tensormap_acquire(desc_tinv_slot)
 
         for chunk_idx in cutlass.range(compute_start, write_end):
-            tok_coord = chunk_idx * cutlass.Int32(cfg.b_t)
-
             # ---- K load --------------------------------------------------------------
             k_idx = k_index.idx
             bars.mb_k_done[k_idx].wait(k_index.phase)
             k_index = advance(k_index, cfg.smem_k_stages)
             if elect_one:
                 bars.mb_k_ready[k_idx].arrive(n_bytes=cfg.tma_k_bytes)
-            k_slice = tma_slice_runtime_desc(desc_k_slot, cutlass.Int32(0), head_k, tok_coord)
-            tma_load_tile(sK_tma[k_idx], k_slice, bars.mb_k_ready[k_idx].smem_ptr, acquire=False)
+            tma_load_family(sK_tma[k_idx], desc_k_family, arr_words, head_k, chunk_idx, bars.mb_k_ready[k_idx].smem_ptr, cutlass.Int32(0), cfg.b_t, cfg.k_slots)
 
             # ---- chunk-factor tile load ----------------------------------------------
             tinv_idx = tinv_index.idx
@@ -653,8 +663,7 @@ def tmaldg_warp(
             v_index = advance(v_index, cfg.smem_v_stages)
             if elect_one:
                 bars.mb_v_ready[v_idx].arrive(n_bytes=cfg.tma_v_bytes)
-            v_slice = tma_slice_runtime_desc(desc_v_slot, v_offset, head_v, tok_coord)
-            tma_load_tile(sV_tma[v_idx], v_slice, bars.mb_v_ready[v_idx].smem_ptr, acquire=False)
+            tma_load_family(sV_tma[v_idx], desc_v_family, arr_words, head_v, chunk_idx, bars.mb_v_ready[v_idx].smem_ptr, v_offset, cfg.b_t, cfg.v_slots)
 
         tile_idx, scheduler_state = scheduler_publish_next(cfg, bars, sScheduler, mScheduler, scheduler_state, num_ctas, elect_one)
 
@@ -999,20 +1008,23 @@ def build_descs_body(
     n_batch: cutlass.Int32,
     b_t: cutlass.Constexpr[int],
     expand_num: cutlass.Constexpr[int],
+    k_slots: cutlass.Constexpr[int] = 1,
+    v_slots: cutlass.Constexpr[int] = 1,
 ) -> None:
     """Per-batch descriptor-array build, one warp per array (K, V), the tinv array on the K warp."""
     arr_words = n_batch * cutlass.Int32(TENSOR_MAP_QWORDS)
-    desc_k_arr = cute.make_tensor(desc_workspace.iterator, cute.make_layout((arr_words,), stride=(1,)))
-    desc_v_arr = cute.make_tensor(desc_workspace.iterator + arr_words, cute.make_layout((arr_words,), stride=(1,)))
-    desc_tinv_arr = cute.make_tensor(desc_workspace.iterator + 2 * arr_words, cute.make_layout((arr_words,), stride=(1,)))
+    family_arrays = 1 if b_t % expand_num == 0 else expand_num + 1
+    desc_k_arr = cute.make_tensor(desc_workspace.iterator, cute.make_layout((family_arrays * arr_words,), stride=(1,)))
+    desc_v_arr = cute.make_tensor(desc_workspace.iterator + family_arrays * arr_words, cute.make_layout((family_arrays * arr_words,), stride=(1,)))
+    desc_tinv_arr = cute.make_tensor(desc_workspace.iterator + (2 * family_arrays) * arr_words, cute.make_layout((arr_words,), stride=(1,)))
 
     if widx == 0:
-        emit_seq_descs(base_k, desc_k_arr, cu_seqlens, k, n_batch, 2, expand_num, lanes=32)
+        emit_family_descs(base_k, desc_k_arr, cu_seqlens, k, n_batch, b_t, k_slots, expand_num, lanes=32)
         if cutlass.const_expr(tinv is not None):
             emit_tile_seq_descs(base_tinv, desc_tinv_arr, cu_seqlens, tinv, n_batch, b_t, 3, expand_num, lanes=32)
         nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     if widx == 1:
-        emit_seq_descs(base_v, desc_v_arr, cu_seqlens, v, n_batch, 2, expand_num, lanes=32)
+        emit_family_descs(base_v, desc_v_arr, cu_seqlens, v, n_batch, b_t, v_slots, expand_num, lanes=32)
         nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
 
 
@@ -1037,6 +1049,8 @@ def frost_gdn_summary_prologue(
     mWorkItems: cute.Tensor,
     mScheduler: Optional[cute.Tensor],
     n_batch: cutlass.Int32,
+    k_slots: cutlass.Constexpr[int] = 1,
+    v_slots: cutlass.Constexpr[int] = 1,
 ) -> None:
     """Two-CTA prologue: under ``run_order`` block 0 LPT-orders the work-item table and zeroes the scheduler rings
     (:func:`order_body`); block 1 builds the per-batch K and V TMA-descriptor arrays (:func:`build_descs_body`)."""
@@ -1073,20 +1087,7 @@ def frost_gdn_summary_prologue(
                 expand_num=expand_num,
             )
     else:
-        build_descs_body(
-            widx,
-            base_k,
-            base_v,
-            base_tinv,
-            desc_workspace,
-            cu_seqlens,
-            k,
-            v,
-            tinv,
-            n_batch,
-            b_t,
-            expand_num,
-        )
+        build_descs_body(widx, base_k, base_v, base_tinv, desc_workspace, cu_seqlens, k, v, tinv, n_batch, b_t, expand_num, k_slots=k_slots, v_slots=v_slots)
 
 
 @cute.jit
@@ -1108,27 +1109,43 @@ def prologue(
     tensormap_workspace: cute.Tensor,
     stream: cuda.CUstream,
     tiles_per_head: cutlass.Constexpr[int] = 1,
+    k_slots: cutlass.Constexpr[int] = 1,
+    v_slots: cutlass.Constexpr[int] = 1,
 ):
     """One-launch prologue: order the work items (``run_order``) and build the
     2 per-batch TMA-descriptor arrays (K, V) into ``tensormap_workspace``."""
-    h_k = k.shape[1]
-    h_v = v.shape[1]
+    k = expanded_view(k, k_slots, expand_num)
+    v = expanded_view(v, v_slots, expand_num)
+    h_k = k.shape[2]
+    h_v = v.shape[2]
     batch_size = cu_seqlens.shape[0] - 1
-    d_v = v.shape[2]
+    d_v = v.shape[3]
     bytes_per_element = io_dtype.width // 8
     box_elems = 128 // bytes_per_element
     bt = b_t
 
-    k_row_stride, k_head_stride = k.stride[0], k.stride[1]
-    v_row_stride, v_head_stride = v.stride[0], v.stride[1]
-
-    seqlen = k.shape[0]
-    d_k = k.shape[2]
-    k_headed = cute.make_tensor(k.iterator, cute.make_layout((seqlen, h_k, d_k), stride=(k_row_stride, k_head_stride, 1)))
-    v_headed = cute.make_tensor(v.iterator, cute.make_layout((d_v, h_v, seqlen), stride=(1, v_head_stride, v_row_stride)))
+    d_k = k.shape[3]
     swizzle_128b = tma.TensorMapSwizzle.s128b
-    base_desc_k = tma.create_tensor_map_tiled_from_view(k_headed, box_dims=(bt, 1, box_elems), stride_order=(2, 1, 0), swizzle=swizzle_128b)
-    base_desc_v = tma.create_tensor_map_tiled_from_view(v_headed, box_dims=(box_elems, 1, bt), stride_order=(0, 1, 2), swizzle=swizzle_128b)
+    if cutlass.const_expr(k_slots == 1):
+        k_rows = cute.make_tensor(k.iterator, cute.make_layout((k.shape[0], k.shape[2], k.shape[3]), stride=(k.stride[0], k.stride[2], 1)))
+        base_desc_k = tma.create_tensor_map_tiled_from_view(k_rows, box_dims=(b_t, 1, box_elems), stride_order=(2, 1, 0), swizzle=swizzle_128b)
+    else:
+        k_headed = cute.make_tensor(
+            k.iterator, cute.make_layout((k.shape[0], k_slots, k.shape[2], k.shape[3]), stride=(k.stride[0], k.stride[1], k.stride[2], 1))
+        )
+        base_desc_k = tma.create_tensor_map_tiled_from_view(
+            k_headed, box_dims=(b_t // k_slots, k_slots, 1, box_elems), stride_order=(3, 2, 1, 0), swizzle=swizzle_128b
+        )
+    if cutlass.const_expr(v_slots == 1):
+        v_rows = cute.make_tensor(v.iterator, cute.make_layout((v.shape[0], v.shape[2], v.shape[3]), stride=(v.stride[0], v.stride[2], 1)))
+        base_desc_v = tma.create_tensor_map_tiled_from_view(v_rows, box_dims=(b_t, 1, box_elems), stride_order=(2, 1, 0), swizzle=swizzle_128b)
+    else:
+        v_headed = cute.make_tensor(
+            v.iterator, cute.make_layout((v.shape[0], v_slots, v.shape[2], v.shape[3]), stride=(v.stride[0], v.stride[1], v.stride[2], 1))
+        )
+        base_desc_v = tma.create_tensor_map_tiled_from_view(
+            v_headed, box_dims=(b_t // v_slots, v_slots, 1, box_elems), stride_order=(3, 2, 1, 0), swizzle=swizzle_128b
+        )
 
     base_desc_tinv = base_desc_k
     if cutlass.const_expr(tinv is not None):
@@ -1157,6 +1174,8 @@ def prologue(
         work_items,
         scheduler_all,
         cutlass.Int32(batch_size),
+        k_slots,
+        v_slots,
     ).launch(grid=(2, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 
@@ -1183,12 +1202,12 @@ def host(
     heads_out = cutlass.Int32(gate.shape[1])
     if cutlass.const_expr(cfg.tiles_per_head > 1):
         heads_out = heads_out * cutlass.Int32(cfg.tiles_per_head)
-    k_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(k.shape[1]))
-    v_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(v.shape[1]))
+    k = expanded_view(k, cfg.k_slots, cfg.expand_num)
+    v = expanded_view(v, cfg.v_slots, cfg.expand_num)
+    k_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(k.shape[2]))
+    v_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(v.shape[2]))
 
-    # ---- head-major views: (tokens, dim, heads) k / q, (dim, tokens, heads) v / o, (V, K, heads, seqs) states ----
-    k = cute.make_tensor(k.iterator, cute.make_layout((k.shape[0], k.shape[2], k.shape[1]), stride=(k.stride[0], k.stride[2], k.stride[1])))
-    v = cute.make_tensor(v.iterator, cute.make_layout((v.shape[2], v.shape[0], v.shape[1]), stride=(v.stride[2], v.stride[0], v.stride[1])))
+    # ---- head-major views: (V, K, heads, seqs) states ----
     if cutlass.const_expr(state_in is not None):
         state_in = cute.make_tensor(
             state_in.iterator,
@@ -1298,9 +1317,10 @@ def frost_gdn_summary(
     desc_base_words = tensormap_workspace.iterator.raw_ptr()
     desc_qwords = cutlass.Int32(TENSOR_MAP_QWORDS)
     arr_words = n_desc * desc_qwords
+    family_arrays = 1 if cfg.b_t % cfg.expand_num == 0 else cfg.expand_num + 1
     desc_k_base = desc_base_words
-    desc_v_base = desc_base_words + arr_words
-    desc_tinv_base = desc_base_words + cutlass.Int32(2) * arr_words
+    desc_v_base = desc_base_words + cutlass.Int32(family_arrays) * arr_words
+    desc_tinv_base = desc_base_words + cutlass.Int32(2 * family_arrays) * arr_words
 
     SMEM = cutlass.AddressSpace.smem
 
@@ -1492,6 +1512,7 @@ def frost_gdn_summary(
             bars=bars,
             k_ratio=k_ratio,
             v_ratio=v_ratio,
+            arr_words=arr_words,
         )
 
     elif warp_idx == cfg.register_pool_warp_id:
@@ -1519,6 +1540,8 @@ class GdnSummaryCfg:
     # ---- fixed constants stamped from CFG at build time ------------------------------
     b_t: int = CFG.B_T
     expand_num: int = 1
+    k_slots: int = 1
+    v_slots: int = 1
     chain_m_warp_ids: Tuple[int, ...] = CFG.CHAIN_M_WARP_IDS
     chain_h_warp_ids: Tuple[int, ...] = CFG.CHAIN_H_WARP_IDS
     load_gate_warp_id: int = CFG.LOAD_GATE_WARP_ID
@@ -1570,6 +1593,8 @@ def build_cfg(
     d_k: int,
     d_v: int,
     expand_num: int = 1,
+    k_slots: int = 1,
+    v_slots: int = 1,
     tiles_per_head: int = 1,
 ) -> GdnSummaryCfg:
     """Build the per-compile ``GdnSummaryCfg`` (io_dtype in {Float16, BFloat16}; acc is always Float32).  ``tiles_per_head`` > 1
@@ -1587,6 +1612,8 @@ def build_cfg(
         d_k=d_k,
         d_v=d_v,
         expand_num=expand_num,
+        k_slots=k_slots,
+        v_slots=v_slots,
         tiles_per_head=tiles_per_head,
     )
     n_chain = len(cfg.chain_h_warp_ids) + len(cfg.chain_m_warp_ids)
@@ -1603,7 +1630,8 @@ def build_cfg(
     return cfg
 
 
-TENSORMAP_DESC_ARRAYS = 3  # per-batch runtime TMA descriptors: K, V, tinv
+TENSORMAP_DESC_ARRAYS = 3  # per-batch runtime TMA descriptors: K, V, tinv (K and V as families)
+TENSORMAP_FAMILY_OPERANDS = 2  # K and V: expand_num + 1 descriptor arrays each when expand_num does not divide b_t
 
 
 # ---------------------------------------------------------------------------
@@ -1629,6 +1657,7 @@ def get_compiled_cache(
     run_order: bool,
     order_gen: bool,
     tiles_per_head: int,
+    layout_key: tuple = (),
 ):
     """Return a mutable dict that lazily stores the compiled kernel."""
     return {}
@@ -1645,6 +1674,8 @@ def compile(
     d_k: int,
     d_v: int,
     expand_num: int = 1,
+    k_slots: int = 1,
+    v_slots: int = 1,
     tiles_per_head: int = 1,
     k_cute,
     v_cute,
@@ -1673,6 +1704,8 @@ def compile(
         d_k=d_k,
         d_v=d_v,
         expand_num=expand_num,
+        k_slots=k_slots,
+        v_slots=v_slots,
         tiles_per_head=tiles_per_head,
     )
 
@@ -1737,11 +1770,9 @@ def chunk_gdn_summary(
     tiles_per_head: tiles per gate head (2 = the d_v split: two CTAs per (sequence, head), each owning half of d_v)
     own_prologue: False skips the prologue launch when the chain prologue already ordered the table and built the descriptors
     """
-    k.shape[1]
     HO = gate.shape[1]
-    DK = k.shape[2]
-    v.shape[1]
-    DV = v.shape[2]
+    DK = k.shape[-1]
+    DV = v.shape[-1]
     B = cu_seqlens.shape[0] - 1
     if tuple(tinv.shape[1:]) != (HO, CFG.B_T, CFG.B_T):
         raise ValueError(f"tinv must be (rows, {HO}, {CFG.B_T}, {CFG.B_T}), got {tuple(tinv.shape)}")
@@ -1767,6 +1798,8 @@ def chunk_gdn_summary(
     state_dtype = get_dtype(output_state.dtype)
 
     cu_stream = cuda.CUstream(int(stream))
+    k_slots = family_slots(k, expand_num, 3)
+    v_slots = family_slots(v, expand_num, 3)
     cache = get_compiled_cache(
         str(k.dtype),
         str(output_state.dtype),
@@ -1786,11 +1819,12 @@ def chunk_gdn_summary(
         run_order,
         order_gen,
         tiles_per_head,
+        layout_key=(len(k.shape), len(v.shape), k_slots, v_slots),
     )
 
     if "compiled" not in cache:
-        k_cute = from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        v_cute = from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=2)
+        k_cute = from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=len(k.shape) - 1)
+        v_cute = from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=len(v.shape) - 1)
         gate_cute = from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=1)
         a_log_cute = from_dlpack(a_log, assumed_align=4).mark_layout_dynamic() if a_log is not None else None
         dt_bias_cute = from_dlpack(dt_bias, assumed_align=4).mark_layout_dynamic(leading_dim=len(dt_bias.shape) - 1) if dt_bias is not None else None
@@ -1821,6 +1855,8 @@ def chunk_gdn_summary(
             d_k=DK,
             d_v=DV // tiles_per_head,
             expand_num=expand_num,
+            k_slots=k_slots,
+            v_slots=v_slots,
             tiles_per_head=tiles_per_head,
             k_cute=k_cute,
             v_cute=v_cute,
@@ -1842,8 +1878,8 @@ def chunk_gdn_summary(
     compiled = cache["compiled"]
 
     if own_prologue and "prologue" not in cache:
-        k_placeholder = from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        v_placeholder = from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=2)
+        k_placeholder = from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=len(k.shape) - 1)
+        v_placeholder = from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=len(v.shape) - 1)
         gate_placeholder = from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=1)
         cu_placeholder = from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic()
         staging_placeholder = None
@@ -1877,6 +1913,8 @@ def chunk_gdn_summary(
             workspace_placeholder,
             cu_stream,
             tiles_per_head,
+            k_slots,
+            v_slots,
             options="--enable-tvm-ffi --opt-level 2",
         )
     if own_prologue:

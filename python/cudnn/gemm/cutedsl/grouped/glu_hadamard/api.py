@@ -19,6 +19,22 @@ from cutlass.cute.runtime import from_dlpack, make_fake_stream
 from cudnn.api_base import APIBase, TupleDict, ceil_div, is_power_of_2
 from cudnn.datatypes import _convert_to_cutlass_data_type
 
+from ..backend_utils import row_major_layout
+from ..canonical import (
+    b_nkl,
+    canonical_b_fake,
+    canonical_mx_fake,
+    canonical_prob_fake,
+    check_canonical_contiguous,
+    check_packed_sf,
+    check_sf_shape,
+    is_flat_sf,
+    layout_desc,
+    make_flat_sf_fake,
+    normalize_b,
+    normalize_mx,
+    normalize_prob,
+)
 from ..moe_utils import MoEWeightMode
 from .hadamard_utils import HADAMARD_SIZE, hadamard_matrix
 from .moe_blockscaled_grouped_gemm_glu_hadamard import BlockScaledMoEGroupedGemmGluHadamardKernel
@@ -111,16 +127,29 @@ class GroupedGemmGluHadamardSm100(APIBase):
         else:
             raise ValueError("Provide either (sample_b, sample_sfb) or (num_experts, b_shape, b_dtype)")
 
-        self.a_desc = self._make_tensor_desc(sample_a, name="sample_a", interpret_uint8_as_fp4x2=False)
-        self.c_desc = self._make_tensor_desc(sample_c, name="sample_c")
-        self.d_desc = self._make_tensor_desc(sample_d, name="sample_d")
+        self.canonical_a, sample_a = normalize_mx(sample_a)
+        self.canonical_c, sample_c = normalize_mx(sample_c)
+        self.canonical_d, sample_d = normalize_mx(sample_d)
+        self.canonical_prob, sample_prob = normalize_prob(sample_prob)
+        self.canonical_b, sample_b = normalize_b(sample_b)
+        self.sfa_is_flat = is_flat_sf(sample_sfa)
+        self.sfb_is_flat = is_flat_sf(sample_sfb)
+        if (self.canonical_a or self.canonical_b) and sample_a.dtype == torch.uint8:
+            raise ValueError("Canonical layouts require torch.float4_e2m1fn_x2 operands")
+
+        def operand_desc(tensor, name, canonical, **kwargs):
+            return layout_desc(self, tensor, name) if canonical else self._make_tensor_desc(tensor, name=name, **kwargs)
+
+        self.a_desc = operand_desc(sample_a, "sample_a", self.canonical_a, interpret_uint8_as_fp4x2=False)
+        self.c_desc = operand_desc(sample_c, "sample_c", self.canonical_c)
+        self.d_desc = operand_desc(sample_d, "sample_d", self.canonical_d)
         self.sfa_desc = self._make_tensor_desc(sample_sfa, name="sample_sfa")
         self.padded_offsets_desc = self._make_tensor_desc(sample_padded_offsets, name="sample_padded_offsets")
         self.alpha_desc = self._make_tensor_desc(sample_alpha, name="sample_alpha")
-        self.prob_desc = self._make_tensor_desc(sample_prob, name="sample_prob")
+        self.prob_desc = operand_desc(sample_prob, "sample_prob", self.canonical_prob)
         self.bias_desc = self._make_tensor_desc(sample_bias, name="sample_bias")
         if self.weight_mode == MoEWeightMode.DENSE:
-            self.b_desc = self._make_tensor_desc(sample_b, name="sample_b", interpret_uint8_as_fp4x2=False)
+            self.b_desc = operand_desc(sample_b, "sample_b", self.canonical_b, interpret_uint8_as_fp4x2=False)
             self.sfb_desc = self._make_tensor_desc(sample_sfb, name="sample_sfb")
             self.expert_cnt = self.padded_offsets_desc.shape[0]
             self.b_shape = None
@@ -228,9 +257,9 @@ class GroupedGemmGluHadamardSm100(APIBase):
             self._check_tensor_shape(self.b_desc, (n, k, l), "B")
         self._check_tensor_shape(self.c_desc, (tensor_m, n, 1), "C")
         self._check_tensor_shape(self.d_desc, (tensor_m, n_out, 1), "D")
-        self._check_tensor_shape(self.sfa_desc, (32, 4, ceil_div(tensor_m, 128), 4, ceil_div(ceil_div(k, self.sf_vec_size), 4), 1), "SFA")
+        check_sf_shape(self, self.sfa_desc, self.sfa_is_flat, (32, 4, ceil_div(tensor_m, 128), 4, ceil_div(ceil_div(k, self.sf_vec_size), 4), 1), "SFA")
         if self.weight_mode == MoEWeightMode.DENSE:
-            self._check_tensor_shape(self.sfb_desc, (32, 4, ceil_div(n, 128), 4, ceil_div(ceil_div(k, self.sf_vec_size), 4), l), "SFB")
+            check_sf_shape(self, self.sfb_desc, self.sfb_is_flat, (32, 4, ceil_div(n, 128), 4, ceil_div(ceil_div(k, self.sf_vec_size), 4), l), "SFB")
         self._check_tensor_shape(self.padded_offsets_desc, (l,), "padded_offsets")
         self._check_tensor_shape(self.alpha_desc, (l,), "alpha")
         self._check_tensor_shape(self.prob_desc, (tensor_m, 1, 1), "prob")
@@ -391,18 +420,24 @@ class GroupedGemmGluHadamardSm100(APIBase):
             shape=(valid_m, 1, 1),
             stride=self.prob_desc.stride,
         )
-        sfa_cute_fake = self._make_fake_cute_tensor(
-            dtype=self.sfa_desc.dtype,
-            shape=(32, 4, tensor_m_128, 4, self.sfa_desc.shape[4], 1),
-            stride=(16, 4, self.sfa_desc.stride[2], 1, 512, stride_tensor_m_128),
-        )
+        if self.sfa_is_flat:
+            sfa_cute_fake = make_flat_sf_fake(self, self.sfa_desc)
+        else:
+            sfa_cute_fake = self._make_fake_cute_tensor(
+                dtype=self.sfa_desc.dtype,
+                shape=(32, 4, tensor_m_128, 4, self.sfa_desc.shape[4], 1),
+                stride=(16, 4, self.sfa_desc.stride[2], 1, 512, stride_tensor_m_128),
+            )
         if self.weight_mode == MoEWeightMode.DENSE:
             b_cute_arg = (
                 _reinterpret_raw_grouped_fp4_tensor(self._sample_b_tensor)
                 if self.b_desc.dtype == torch.uint8
-                else self._make_fake_cute_tensor_from_desc(self.b_desc, assumed_align=16)
+                else canonical_b_fake(self._make_fake_cute_tensor_from_desc(self.b_desc, assumed_align=16), self.canonical_b)
             )
-            sfb_cute_arg = self._make_fake_cute_tensor_from_desc(self.sfb_desc, assumed_align=16)
+            if self.sfb_is_flat:
+                sfb_cute_arg = make_flat_sf_fake(self, self.sfb_desc)
+            else:
+                sfb_cute_arg = self._make_fake_cute_tensor_from_desc(self.sfb_desc, assumed_align=16)
             n_arg = cutlass.Int32(0)
             k_arg = cutlass.Int32(0)
             b_stride_arg = cutlass.Int64(0)
@@ -436,7 +471,11 @@ class GroupedGemmGluHadamardSm100(APIBase):
 
         compiled_kernel = cute.compile(
             kernel,
-            _reinterpret_raw_grouped_fp4_tensor(self._sample_a_tensor) if self.a_desc.dtype == torch.uint8 else a_cute_fake,
+            (
+                _reinterpret_raw_grouped_fp4_tensor(self._sample_a_tensor)
+                if self.a_desc.dtype == torch.uint8
+                else canonical_mx_fake(a_cute_fake, self.canonical_a)
+            ),
             b_cute_arg,
             sfa_cute_fake,
             sfb_cute_arg,
@@ -445,13 +484,13 @@ class GroupedGemmGluHadamardSm100(APIBase):
             b_stride_arg,
             b_major_arg,
             workspace_arg,
-            c_cute_fake,
-            d_cute_fake,
+            canonical_mx_fake(c_cute_fake, self.canonical_c),
+            canonical_mx_fake(d_cute_fake, self.canonical_d),
             amax_cute_fake,
             post_rht_amax_cute_fake,
             padded_offsets_cute_fake,
             alpha_cute_fake,
-            prob_cute_fake,
+            canonical_prob_fake(prob_cute_fake, self.canonical_prob),
             hadamard_cute_fake,
             bias_cute_fake,
             max_active_clusters,
@@ -717,10 +756,11 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
     if not is_dense and not is_discrete:
         raise ValueError("Must provide either (b_tensor, sfb_tensor) or (b_ptrs, sfb_ptrs)")
 
-    _, k_physical, _ = a_tensor.shape
+    check_canonical_contiguous(a_tensor, b_tensor, prob_tensor)
+    k_physical = a_tensor.shape[1]
     if is_dense:
         weight_mode = MoEWeightMode.DENSE
-        n_full, _, l = b_tensor.shape
+        n_full, _, l = b_nkl(b_tensor)
         if sfb_tensor is None:
             raise ValueError("sfb_tensor is required in dense mode")
     else:
@@ -738,8 +778,11 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
     if cd_major != "n":
         raise ValueError(f"cd_major must be 'n', got {cd_major}")
 
-    c_tensor = torch.empty_strided((valid_m, n_full, 1), (n_full, 1, valid_m * n_full), dtype=c_dtype, device=a_tensor.device)
-    d_tensor = torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_dtype, device=a_tensor.device)
+    logical_k = k_physical * 2 if a_tensor.dtype == torch.float4_e2m1fn_x2 else k_physical
+    check_packed_sf(sfa_tensor, sfb_tensor, valid_m, n_full, l, ceil_div(ceil_div(logical_k, sf_vec_size), 4))
+    canonical = a_tensor.ndim == 2
+    c_tensor = torch.empty_strided(*row_major_layout(valid_m, n_full, canonical), dtype=c_dtype, device=a_tensor.device)
+    d_tensor = torch.empty_strided(*row_major_layout(valid_m, n_out, canonical), dtype=d_dtype, device=a_tensor.device)
     amax_tensor = None
     post_rht_amax_tensor = None
     if d_dtype in [torch.bfloat16, torch.float16]:
@@ -782,7 +825,11 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
         stride_order(a_tensor),
         stride_order(b_tensor) if is_dense else b_major,
         stride_order(c_tensor),
-        *dynamic_m_tensor_signature(sfa_tensor, (sfa_tensor.shape[4], 1), dynamic_stride_dims=(5,)),
+        *(
+            (sfa_tensor.ndim, None, sfa_tensor.dtype)
+            if is_flat_sf(sfa_tensor)
+            else dynamic_m_tensor_signature(sfa_tensor, (sfa_tensor.shape[4], 1), dynamic_stride_dims=(5,))
+        ),
         *(tensor_signature(sfb_tensor) if is_dense else (tuple(sfb_ptrs.shape), tuple(sfb_ptrs.stride()), sfb_ptrs.dtype)),
         *tensor_signature(alpha_tensor),
         *dynamic_m_tensor_signature(prob_tensor, (1, 1)),
@@ -796,6 +843,8 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
         m_aligned,
         use_dynamic_sched,
         use_tmem_post_rht_amax,
+        is_flat_sf(sfa_tensor),
+        is_flat_sf(sfb_tensor),
         *((tuple(b_ptrs.shape), tuple(b_ptrs.stride()), b_ptrs.dtype, l) if is_discrete else ()),
     )
 
@@ -876,3 +925,6 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
             current_stream=current_stream,
         )
     return TupleDict(c_tensor=c_tensor, d_tensor=d_tensor, amax_tensor=amax_tensor, post_rht_amax_tensor=post_rht_amax_tensor)
+
+
+grouped_gemm_glu_hadamard_wrapper_sm100.supports_canonical_layouts = True

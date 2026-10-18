@@ -59,7 +59,9 @@ HF weight ``w`` is handed over as ``1 + w`` by the loader, ``modeling:160-163``)
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import functools
 import math
 import os
 import sys
@@ -372,6 +374,31 @@ def random_block_ids(
 # ---------------------------------------------------------------------------
 
 
+@contextlib.contextmanager
+def ieee_fp32_matmul():
+    """The oracle's fp32 GEMMs are IEEE fp32, not TF32.  On Ampere and later an fp32 ``torch.matmul`` runs as TF32 whenever
+    ``torch.backends.cuda.matmul.allow_tf32`` reads True -- the default of some PyTorch builds (their containers start the process
+    with the cuBLAS TF32 override on), which turns this fp32 reference into a ~1e-3-relative one and fails its own self-tests at
+    their fp32 budgets.  Pinned off for the call and restored after, so a caller's setting is untouched."""
+    prev = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = prev
+
+
+def _ieee_fp32(fn):
+    """Run ``fn`` under :func:`ieee_fp32_matmul` (every oracle entry point below)."""
+
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        with ieee_fp32_matmul():
+            return fn(*args, **kwargs)
+
+    return wrapped
+
+
 def _rms_norm_direct(x: torch.Tensor, w: torch.Tensor, eps: float, acc_dtype: torch.dtype) -> torch.Tensor:
     """``x * rsqrt(mean(x^2) + eps) * w`` in ``acc_dtype`` (``modeling:155-163``; ``w`` is the direct multiplier,
     HF's ``(1 + weight)`` already folded by the caller)."""
@@ -379,6 +406,7 @@ def _rms_norm_direct(x: torch.Tensor, w: torch.Tensor, eps: float, acc_dtype: to
     return x32 * torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + eps) * w.to(acc_dtype)
 
 
+@_ieee_fp32
 def qsa_indexer_reference(
     h: torch.Tensor,
     w_i: torch.Tensor,
@@ -531,6 +559,7 @@ def split_qkvg_qsa(proj: torch.Tensor, geom: RefGeometry, spec: RefQsaSpec):
     return q, gate, k, v, band
 
 
+@_ieee_fp32
 def gated_attention_block_qsa_reference(
     h: torch.Tensor,
     w_qkvg: torch.Tensor,
@@ -588,7 +617,10 @@ def gated_attention_block_qsa_reference(
     rep = geom.h_q // geom.h_kv
 
     # (1) fused QKV+GATE(+INDEX) projection, fp32 accumulate, one rounding.
-    proj = (h.to(acc_dtype) @ w_qkvg.to(acc_dtype).t()).to(out_dtype)
+    # Dense columns and the band are separate GEMMs: cuBLAS may reduce in a different order at another N (A100 / L40S do),
+    # and the dense columns must match the dense oracle's N = n_dense GEMM bitwise.
+    h_acc = h.to(acc_dtype)
+    proj = torch.cat([h_acc @ w_qkvg[:n_dense].to(acc_dtype).t(), h_acc @ w_qkvg[n_dense:].to(acc_dtype).t()], dim=-1).to(out_dtype)
     q_pre, gate, k_pre, v, band = split_qkvg_qsa(proj, geom, spec)
     index_q_raw = index_k_raw = None
     if band is not None:
@@ -671,6 +703,7 @@ def gated_attention_block_qsa_reference(
     )
 
 
+@_ieee_fp32
 def gated_attention_block_qsa_reference_packed(
     h: torch.Tensor,
     w_qkvg: torch.Tensor,

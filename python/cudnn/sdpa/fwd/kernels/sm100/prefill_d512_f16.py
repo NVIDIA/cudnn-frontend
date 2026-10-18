@@ -716,6 +716,12 @@ def _kernel(
 _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
+# Only the common dense CLC path has a single scheduler publisher.
+# THD/predecode retains local schedulers and broadcast credits.
+if not CFG.THD_VARLEN:
+    from cudnn.frost.tile_dsl.scheduler import read_tile_id_arrive_on_leader as read_tile_id_arrive
+
+
 @cute.jit
 def _paged_load_tile(
     smem_tile,
@@ -1236,7 +1242,8 @@ def _compute_warp_group(
             q_row_global = q_super_idx * cutlass.Int32(CFG.TILES_Q * TOKENS_PER_TILE) + (tid_in_wg // cutlass.Int32(HEADS_PER_TILE))
             row_head_idx = head_idx * cutlass.Int32(HEADS_PER_TILE) + (tid_in_wg % cutlass.Int32(HEADS_PER_TILE))
             LN2 = cutlass.Float32(0.6931471805599453)
-            if cutlass.const_expr(CFG.HAS_SINK):
+            # Under a KV split the fold moves to the combine pass (split_combine), which adds the sink column exactly once; the partials stay sink-free.
+            if cutlass.const_expr(CFG.HAS_SINK and SPLIT_KV == 1):
                 sinks_arr = cutlass.make_array_view(sinks_tensor)
                 sink_logit = cutlass.Float32(sinks_arr[row_head_idx])
                 final_max_nat = final_max * LN2
@@ -2070,7 +2077,10 @@ def _tmastg_warp_group(
         qh_per_kh,
         seqlen_kv,
     )
-    is_valid_tile = cutlass.Int32(1)
+    # sg0 does not store O or contribute scheduler read credits. It must not
+    # observe the ring: the credited roles could reuse its slot twice before
+    # this idle warp consumes a response, losing the terminal phase.
+    is_valid_tile = cutlass.Int32(is_sg1)
     sched_state = PipelineState.start()
 
     # Each per-sequence O map is immutable for this launch.

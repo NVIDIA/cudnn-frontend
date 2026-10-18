@@ -433,14 +433,22 @@ def test_fusion_params_offsets_follow_the_layout_contract():
 
 
 def test_qk_norm_knob_is_appended_and_validated():
-    """``qk_norm`` (then ``quant_mxfp8``, then ``weight_fp4``) are APPENDED with defaults that spell every
-    existing key identically -- a norm-on render's template-loader cache key is unchanged.  Under
+    """``qk_norm`` (then ``quant_mxfp8``, ``weight_fp4``, and the paged write-through's ``kv_pool_page_size`` /
+    ``kv_slot_i64``) are APPENDED with defaults that spell every existing key identically -- a norm-on render's
+    template-loader cache key is unchanged.  Under
     ``qk_norm=False`` there is no rstd to emit and no weight load to delete (``const_w`` has
     no meaning; ``const_cs`` == ``const``); ``off`` and the FP8 fork stay legal."""
     assert NormRopeFusionParams() == NormRopeFusionParams(qk_norm=True)
     assert NormRopeFusionParams() == NormRopeFusionParams(qk_norm=True, quant_mxfp8=False)
     names = [f.name for f in dataclasses.fields(NormRopeFusionParams)]
-    assert names[-4:] == ["quant_fp8", "qk_norm", "quant_mxfp8", "weight_fp4"], names  # the FROZEN order (PR-B section 1.5; weight_fp4 appended last)
+    assert names[-6:] == [
+        "quant_fp8",
+        "qk_norm",
+        "quant_mxfp8",
+        "weight_fp4",
+        "kv_pool_page_size",
+        "kv_slot_i64",
+    ], names  # the FROZEN order (PR-B section 1.5; the write-through's two fields appended after weight_fp4)
     with pytest.raises(ValueError, match="want_rstd"):
         validate_norm_rope_params(NormRopeFusionParams(qk_norm=False, want_rstd=True))
     with pytest.raises(ValueError, match="const_w"):
@@ -987,3 +995,148 @@ def test_fused_fp8_runner_rejects_wrong_bindings():
         launch(cos=inp["cos"].to(_FP8))  # the table dtype is the ACTIVATION dtype, not a.dtype
     with pytest.raises(ValueError, match="e4m3 operands"):
         launch(a=inp["a8"].to(torch.bfloat16))
+
+
+# ---------------------------------------------------------------------------
+# The SMALL-M route: the serving DECODE / MTP row counts (T = B x S_q <= 128)
+# ---------------------------------------------------------------------------
+
+from cudnn.gated_attention_block.kernels.proj_gemm import _FORCED_TILE_NAME, SMALL_M_MAX, small_m_tile_config  # noqa: E402
+
+# The Flash-Next 24/2 shard's two projections: the fused QKV + gate slab (N = (2 h_q + 2 h_kv) d_head) and the out projection.
+_FLASH_NEXT_24_2 = dict(d_model=2560, n_qkvg=(2 * 24 + 2 * 2) * 256, k_o=24 * 256)
+_RUBIN_SMS = 212
+
+
+@pytest.mark.parametrize(
+    "m, n, k, expect",
+    [
+        # the WIDE slab: a 64-row weight tile fills the machine (208 CTAs on 212 SMs) -> the 2x1-cluster swap-AB tile, tokens as the N tile
+        (1, _FLASH_NEXT_24_2["n_qkvg"], _FLASH_NEXT_24_2["d_model"], "CONFIG_sm100_64x8x128_64x8x32_cluster2x1_1ctamma_swapAB"),
+        (4, _FLASH_NEXT_24_2["n_qkvg"], _FLASH_NEXT_24_2["d_model"], "CONFIG_sm100_64x8x128_64x8x32_cluster2x1_1ctamma_swapAB"),
+        (9, _FLASH_NEXT_24_2["n_qkvg"], _FLASH_NEXT_24_2["d_model"], "CONFIG_sm100_64x16x128_64x16x32_cluster2x1_1ctamma_swapAB"),
+        (32, _FLASH_NEXT_24_2["n_qkvg"], _FLASH_NEXT_24_2["d_model"], "CONFIG_sm100_64x32x128_64x32x32_cluster2x1_1ctamma_swapAB"),
+        (64, _FLASH_NEXT_24_2["n_qkvg"], _FLASH_NEXT_24_2["d_model"], "CONFIG_sm100_64x64x128_64x64x32_cluster2x1_1ctamma_swapAB"),
+        (128, _FLASH_NEXT_24_2["n_qkvg"], _FLASH_NEXT_24_2["d_model"], "CONFIG_sm100_128x64x128_128x64x32_cluster1x1_1ctamma"),
+        # the NARROW out projection: 20 weight tiles of 128 rows -> split-K 8 fills one wave
+        (1, _FLASH_NEXT_24_2["d_model"], _FLASH_NEXT_24_2["k_o"], "CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_splitK8_swapAB"),
+        (32, _FLASH_NEXT_24_2["d_model"], _FLASH_NEXT_24_2["k_o"], "CONFIG_sm100_128x32x128_128x32x32_cluster1x1_1ctamma_splitK8_swapAB"),
+        (64, _FLASH_NEXT_24_2["d_model"], _FLASH_NEXT_24_2["k_o"], "CONFIG_sm100_128x64x128_128x64x32_cluster1x1_1ctamma_splitK8_swapAB"),
+        # past 64 tokens the narrow projection takes the plain 64x32 tile while that grid fits one wave (2 x 80 CTAs here)
+        (128, _FLASH_NEXT_24_2["d_model"], _FLASH_NEXT_24_2["k_o"], "CONFIG_sm100_64x32x128_64x32x32_cluster1x1_1ctamma"),
+        # the 32/2 shard: 272 64-row tiles overflow a wave -> 128-row weight tiles (136 CTAs), no split; its out projection
+        # (32 tiles of 128 rows over K 8192) splits 6 ways = one wave; past 64 tokens 2 x 128 plain tiles overflow -> the split
+        (1, (2 * 32 + 2 * 2) * 256, 4096, "CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_swapAB"),
+        (128, (2 * 32 + 2 * 2) * 256, 4096, "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_swapAB"),
+        (1, 4096, 32 * 256, "CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_splitK6_swapAB"),
+        (128, 4096, 32 * 256, "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_splitK6_swapAB"),
+        # the 8/1 shard's slab: 72 64-row tiles (a third of the machine) -> the 64-row tile without the pair's multicast
+        (1, (2 * 8 + 2 * 1) * 256, 4096, "CONFIG_sm100_64x8x128_64x8x32_cluster1x1_1ctamma_swapAB"),
+        # its out projection is narrow but SHALLOW (K 2048 = 32 K tiles): no split pays -> the 64-row swap-AB tile, the plain
+        # 64x32 past 64 tokens
+        (1, 4096, 8 * 256, "CONFIG_sm100_64x8x128_64x8x32_cluster1x1_1ctamma_swapAB"),
+        (128, 4096, 8 * 256, "CONFIG_sm100_64x32x128_64x32x32_cluster1x1_1ctamma"),
+    ],
+)
+def test_small_m_route_names_a_swap_ab_tile_for_decode_row_counts(m, n, k, expect):
+    """The route is a pure function of the shape and the SM count: the token tile is the power of two >= T, the weight
+    tile and the slice count follow the weight's width.  Every name it spells resolves in the catalog grammar."""
+    from cudnn.gemm.frost.tile_config import by_name
+
+    name = small_m_tile_config(m, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS)
+    assert name == expect
+    cfg = by_name(name)
+    assert cfg.swap_ab == name.endswith("_swapAB")
+    assert cfg.cta_tile_n >= min(m, 128) or not cfg.swap_ab  # the token tile covers the step
+
+
+def test_small_m_route_leaves_prefill_rows_on_the_forced_tile(monkeypatch):
+    """Past SMALL_M_MAX nothing changes: the 256-wide forced tile is the prefill / training plan it always was (on the route's
+    own compiler family; an ``sm120`` process keeps the forced tile at every row count -- its own cell below)."""
+    n, k = _FLASH_NEXT_24_2["n_qkvg"], _FLASH_NEXT_24_2["d_model"]
+    assert small_m_tile_config(SMALL_M_MAX + 1, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS) is None
+    assert small_m_tile_config(8192, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS) is None
+    from cudnn.gemm.frost import arch_family
+    from cudnn.gated_attention_block.kernels.proj_gemm import _auto_tile_name
+
+    monkeypatch.setattr(arch_family, "active_family", lambda: "sm100")
+    assert _auto_tile_name(8192, n, k, dtype=torch.bfloat16, a_major="k", b_major="k", block_scale=False, alpha=False) == _FORCED_TILE_NAME
+    assert _auto_tile_name(1, n, k, dtype=torch.bfloat16, a_major="k", b_major="k", block_scale=False, alpha=False) != _FORCED_TILE_NAME
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        dict(dtype=torch.float8_e4m3fn),  # the fp8 plans keep their validated forced tile (and the alpha epilogue)
+        dict(dtype=torch.bfloat16, alpha=True),
+        dict(dtype=torch.bfloat16, block_scale=True),
+        dict(dtype=torch.bfloat16, a_major="m"),  # the backward's transposed operands
+        dict(dtype=torch.bfloat16, b_major="n"),
+    ],
+    ids=["fp8", "alpha", "block_scale", "a_mmajor", "b_nmajor"],
+)
+def test_small_m_route_is_dense_k_major_bf16_only(kwargs):
+    assert small_m_tile_config(4, _FLASH_NEXT_24_2["n_qkvg"], _FLASH_NEXT_24_2["d_model"], sm_count=_RUBIN_SMS, **kwargs) is None
+
+
+@pytest.mark.parametrize("m, n, k", [(1, 0, 32 * 256), (0, 2560, 6144), (1, 2560, 0), (-1, 2560, 6144)], ids=["n0_deep_k", "m0", "k0", "m_negative"])
+def test_small_m_route_declines_non_positive_extents(m, n, k):
+    """A non-positive extent never reaches the route's one-wave arithmetic (``n = 0`` with a deep K divided by a zero CTA count
+    before the driver's own extent check could name it; ``m = 0`` or ``k = 0`` spelled a tile): the route declines, and
+    ``build_proj_gemm`` names the extent as it always did."""
+    assert small_m_tile_config(m, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS) is None
+    with pytest.raises(ValueError, match="must be > 0"):
+        build_proj_gemm(m=m, k=k, n=n, dtype=torch.bfloat16, label="extent")
+
+
+def test_small_m_route_keeps_off_256_geometries_on_todays_resolution():
+    """An N that 256 does not divide keeps today's resolution: the forced tile never existed for it, so the plan stays on the
+    graph route and a ``capture_safe`` declaration is refused, typed, before any graph or backend call -- the indexer band's
+    + 640 columns (``QsaSpec.index_band``) are the serving case.  The route never names a tile for such an N."""
+    n, k = _FLASH_NEXT_24_2["n_qkvg"] + 640, _FLASH_NEXT_24_2["d_model"]
+    assert n % 256 and n % 8 == 0
+    from cudnn.gated_attention_block.kernels.proj_gemm import _auto_tile_name
+
+    assert small_m_tile_config(1, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS) is None
+    assert _auto_tile_name(1, n, k, dtype=torch.bfloat16, a_major="k", b_major="k", block_scale=False, alpha=False) is None
+    with pytest.raises(NotImplementedError, match="capture_safe=True needs the forced-tile JIT route"):
+        build_proj_gemm(m=1, k=k, n=n, dtype=torch.bfloat16, label="off256", capture_safe=True)
+
+
+def test_small_m_route_is_an_sm100_family_selection(monkeypatch):
+    """The route's names are the tcgen05 tree's: a process on the ``sm120`` compiler family (SM 12.x) keeps the forced tile
+    for a small-M projection instead of a name its compiler would refuse; the ``sm100`` family takes the route."""
+    from cudnn.gemm.frost import arch_family
+    from cudnn.gated_attention_block.kernels.proj_gemm import _auto_tile_name
+
+    kw = dict(dtype=torch.bfloat16, a_major="k", b_major="k", block_scale=False, alpha=False)
+    monkeypatch.setattr(arch_family, "active_family", lambda: "sm120")
+    assert _auto_tile_name(32, 768, 4096, **kw) == _FORCED_TILE_NAME  # the forced tile, as before the route
+    monkeypatch.setattr(arch_family, "active_family", lambda: "sm100")
+    assert _auto_tile_name(32, 768, 4096, **kw) == small_m_tile_config(32, 768, 4096, dtype=torch.bfloat16) != _FORCED_TILE_NAME
+
+
+@requires_rubin
+@pytest.mark.parametrize("m", [1, 4, 32, 128])
+@pytest.mark.parametrize("shape", ["qkvg", "out"])
+def test_small_m_plans_run_the_named_tile_and_match_torch_linear(m, shape):
+    """The block's own driver at the 24/2 shard's shapes and the decode row counts: the plan names the small-M tile (never
+    the forced one), the kernel matches the fp32 reference within the module's budget, and two launches agree bitwise
+    (the split-K reducer is fixed-order)."""
+    n, k = (_FLASH_NEXT_24_2["n_qkvg"], _FLASH_NEXT_24_2["d_model"]) if shape == "qkvg" else (_FLASH_NEXT_24_2["d_model"], _FLASH_NEXT_24_2["k_o"])
+    torch.manual_seed(0)
+    a = (torch.randn(m, k, device="cuda", dtype=torch.float32) * 0.1).to(torch.bfloat16)
+    w = (torch.randn(n, k, device="cuda", dtype=torch.float32) * 0.05).to(torch.bfloat16)
+    out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
+    plan = build_proj_gemm(m=m, k=k, n=n, dtype=torch.bfloat16, label=f"small_m_{shape}", capture_safe=True)
+    assert plan.tile_config_name != _FORCED_TILE_NAME
+    assert plan.tile_config_name == small_m_tile_config(m, n, k, dtype=torch.bfloat16)
+    assert plan.route == "jit-only"
+    _run(plan, a, w, out)
+    first = out.clone()
+    _run(plan, a, w, out)
+    assert torch.equal(first.view(torch.int16), out.view(torch.int16))
+    ref = torch.nn.functional.linear(a.float(), w.float())
+    cos = torch.nn.functional.cosine_similarity(out.float().flatten(), ref.flatten(), dim=0).item()
+    assert cos > 0.999, f"cos {cos}"
+    assert torch.isfinite(out.float()).all()

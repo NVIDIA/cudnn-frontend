@@ -487,8 +487,11 @@ class ConfigSm120(TileConfig):
 
     ``mma.sync`` is m16n8; the template issues two of them back to back along N
     and treats the pair as ONE 16x16 instruction, which is what ``mma_tile_n``
-    counts. There is no CTA pair and no cluster (CC 12.x has no CGA), and the
-    12-warp block is 8 compute + TMA + CLC scheduler + 2 donors."""
+    counts. There is no CTA pair (CC 12.x has no 2-CTA MMA), and the cluster is
+    1x1 by design: CC 12.x does launch thread-block clusters (2-16 CTAs), but
+    its TMA multicast is not usable (emulated, ~3e4x slower), so a wider
+    cluster buys these kernels nothing. The 12-warp block is 8 compute + TMA +
+    CLC scheduler + 2 donors."""
 
     MMA_TILE_K_BYTES: ClassVar[tuple[int, ...]] = (32,)
     # Family facts live HERE (one home, per the TileConfig docstring),
@@ -504,9 +507,9 @@ class ConfigSm120(TileConfig):
     def __post_init__(self) -> None:
         # VALIDATED, not pinned: the geometry axes (CTA tile, warp grid, K
         # width) are real choices here; only the facts of the family are
-        # enforced -- the 16x16x32B warp-MMA pair, no CGA, no warp-level K
-        # split, and a block wide enough for the compute grid + TMA producer
-        # + CLC scheduler.
+        # enforced -- the 16x16x32B warp-MMA pair, the 1x1 cluster (see the
+        # class docstring), no warp-level K split, and a block wide enough for
+        # the compute grid + TMA producer + CLC scheduler.
         super().__post_init__()
         name = self.name
         mma = (self.mma_tile_m, self.mma_tile_n, self.mma_tile_k_bytes)
@@ -514,7 +517,10 @@ class ConfigSm120(TileConfig):
         if mma != fixed_mma:
             raise NotImplementedError(f"ConfigSm120 {name!r}: the warp MMA pair is fixed at " f"{fixed_mma}; got mma_tile={mma}")
         if (self.cga_size_m, self.cga_size_n) != (1, 1):
-            raise NotImplementedError(f"ConfigSm120 {name!r}: CC 12.x has no CGA; cluster must be 1x1, " f"got {self.cga_size_m}x{self.cga_size_n}")
+            raise NotImplementedError(
+                f"ConfigSm120 {name!r}: the sm120 family uses no CGA; cluster must be 1x1 (CC 12.x launches "
+                f"clusters, but its TMA multicast is not usable), got {self.cga_size_m}x{self.cga_size_n}"
+            )
         if self.warp_tile_k_bytes != self.cta_tile_k_bytes:
             raise NotImplementedError(
                 f"ConfigSm120 {name!r}: no warp-level K split; warp_tile_k_bytes="
