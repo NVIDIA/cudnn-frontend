@@ -2152,6 +2152,8 @@ def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page,
     "geometry,stats_layout,stats_log2,splits",
     [
         ("d128_split_mixed", "HN", True, 3),
+        ("d128_split_boundary33", "HN", True, 3),
+        ("d128_mha_split_boundary65", "NH", False, 4),
         ("d128_split_mixed_gqa", "NH", False, 2),
         ("d256_split_mixed", "HN", True, 3),
         ("sink_d128_split", "NH", False, 4),
@@ -2218,6 +2220,8 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
     b, h, hk, d, qcap, kcap = (1 if "_b1" in geometry else 3), 8, 2, 128, 1025, 2304
     if has_sink:
         qcap = 9
+    if "_boundary" in geometry:
+        b, qcap, kcap = (33 if geometry.endswith("33") else 65), 129, 256
     if geometry.startswith("d64"):
         if arch == "sm107":
             pytest.skip("Native D64 paged split is qualified on SM100/SM103")
@@ -2309,7 +2313,8 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
     index = next(i for i, name in enumerate(names) if name == engine_name(arch=arch) or name.startswith(engine_name(arch=arch) + "["))
     engine, knobs = g.get_engine_and_knobs_at_index(index)
     captures, workspaces = [], []
-    for policy in ((0,) if arch == "sm107" and d == 128 else (0, 1)):
+    policies = (0,) if arch == "sm107" and d == 128 else ((0, 1, 2) if "_boundary" in geometry else (0, 1))
+    for policy in policies:
         chosen = {
             **knobs,
             cudnn.knob_type.SCHED_POLICY: policy,
@@ -2374,6 +2379,14 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
             if b > 1
             else (([qcap], [qcap]), ([257], [769]), ([1], [1]), ([128], [0]), ([0], [kcap]), ([qcap], [qcap]))
         )
+        if b > 3:
+            lengths = [
+                (
+                    [0 if phase == 2 or (i + phase) % 7 == 0 else 1 + (13 * i + 7 * phase) % qcap for i in range(b)],
+                    [0 if (i + phase) % 11 == 0 else kcap - (i % 3) * 32 for i in range(b)],
+                )
+                for phase in range(3)
+            ]
         if has_sink:
             lengths = (
                 (([9, 4, 0], [2049, 1025, 0]), ([0, 9, 4], [0, 0, 2]), ([4, 0, 9], [128, 0, 2304]))

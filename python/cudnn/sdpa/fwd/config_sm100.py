@@ -3863,7 +3863,7 @@ MAKE_CFG = {32: make_cfg_d32, 64: make_cfg_d64, 128: make_cfg_d128, 192: make_cf
 
 
 def thd_work_prefix_enabled(cfg):
-    """Use indexed task lookup on the packed single-CTA paged prefix path."""
+    """Use indexed task lookup on the single-CTA paged prefix path."""
     # Shared decoders also receive families without THD_VARLEN or PAGED_KV.
     # Reject their head geometry before reading fields specific to this path.
     return bool(
@@ -3873,7 +3873,6 @@ def thd_work_prefix_enabled(cfg):
         and cfg.PAGED_KV
         and cfg.DTYPE_QKV in (2, 3)
         and cfg.CGA_M == 1
-        and cfg.PACK_GQA
         and cfg.SPLIT_KV > 1
         and cfg.BOTTOM_RIGHT
         and not (cfg.MASK_FLAGS & MASK_SWA)
