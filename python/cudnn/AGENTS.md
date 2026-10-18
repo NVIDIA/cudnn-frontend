@@ -204,9 +204,11 @@ not become a compile key.
   `test_dsl_sm100_thd_compile_key_plan_time_only`), not by inspection.
 - **Prove artifact reuse across plans.** A stable key does not guarantee that
   `compile_cached` exported an artifact: its wrapper serializer declines
-  dataclass compile arguments, including `Constexpr` ones. Read an immutable
-  template module's `PARAMS` inside the host instead of passing the same
-  dataclass again. Build a second plan with `cute.compile` forbidden, assert
+  runtime dataclass arguments. A `Constexpr` dataclass is exportable only when
+  the DSL executor establishes that it is absent from the runtime arguments;
+  its baked configuration must still be represented in the specialization key.
+  An immutable template module can instead read its `PARAMS` inside the host.
+  Build a second plan with `cute.compile` forbidden, assert
   a real cache hit, and check the reloaded artifact's outputs and graph replay;
   `test_replan_reloads_prepared_artifact` is the SM80 detector. Such a test
   sets `CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO=0` for its own process
