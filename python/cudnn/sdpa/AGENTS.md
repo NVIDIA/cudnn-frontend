@@ -702,6 +702,12 @@ their compilation through a shared decoder even when its own tests pass.
 Exercise real config objects (`test_thd_work_prefix_declines_other_config_families`)
 and the existing D512 `test_two_by_two_thd` compile-and-execute test.
 
+Standalone scratch queries after `check_support()` must not depend on a
+compiled module. Reserve metadata from checked plan geometry and keep the
+size stable through compilation. `test_thd_split_workspace_query_before_compile`
+allocates first, then compiles and executes with that buffer, including a
+batch size that crosses the metadata alignment boundary.
+
 **One metadata buffer, several persistent-scheduler launches per execute (the
 SM100 d512 backward's `heads // chunk` stage-2 launches): the two scheduler
 words are per LAUNCH.** `live` (`meta[4B+2]`) counts the units ONE launch

@@ -47,6 +47,62 @@ def test_thd_work_prefix_accepts_packed_paged_d128():
     assert thd_work_prefix_enabled(cfg)
 
 
+@requires_blackwell
+@requires_dsl
+@pytest.mark.parametrize("b", [3, 13])
+@pytest.mark.parametrize("paged,pack_gqa", [(True, True), (True, False), (False, True)])
+def test_thd_split_workspace_query_before_compile(b, paged, pack_gqa):
+    """Allocate from the checked plan, then compile and execute in that storage."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    ql, kl, h, hk, d, page = 129, 256, 8, 2, 128, 16
+    q = torch.zeros(b, ql, h, d, device=DEV, dtype=torch.bfloat16)
+    o = torch.full_like(q, torch.nan)
+    lse = torch.full((b, ql, h, 1), torch.nan, device=DEV)
+    k = torch.zeros((b * kl // page, hk, page, d) if paged else (b, kl, hk, d), device=DEV, dtype=q.dtype)
+    v = torch.zeros_like(k)
+    api = SdpaFwdDslSm100(
+        sample_q=q.transpose(1, 2),
+        sample_k=k if paged else k.transpose(1, 2),
+        sample_v=v if paged else v.transpose(1, 2),
+        sample_o=o.transpose(1, 2),
+        sample_lse=lse.transpose(1, 2),
+        is_causal=True,
+        causal_bottom_right=True,
+        seq_kv_lens_present=True,
+        cu_seq_q_lens=True,
+        cu_seq_kv_lens=not paged,
+        thd=True,
+        cga=1,
+        split_kv=4,
+        pack_gqa=pack_gqa,
+        paged_page_size=page if paged else 0,
+        paged_max_seq_len_kv=kl if paged else None,
+    )
+    assert api.check_support()
+    before = api.scratch_workspace_bytes()
+    workspace = torch.empty(before, device=DEV, dtype=torch.uint8)
+    api.compile()
+    assert api.scratch_workspace_bytes() == before == api._thd_spec.scratch_bytes
+    cu_q = torch.arange(b + 1, device=DEV, dtype=torch.int32) * ql
+    kv_lengths = torch.full((b,), kl, device=DEV, dtype=torch.int32) if paged else torch.arange(b + 1, device=DEV, dtype=torch.int32) * kl
+    table = torch.arange(b * kl // page, device=DEV, dtype=torch.int32).view(b, -1) if paged else None
+    api.execute(
+        q.flatten(0, 1),
+        k if paged else k.flatten(0, 1),
+        v if paged else v.flatten(0, 1),
+        o.flatten(0, 1),
+        lse_tensor=lse.view(b * ql, h),
+        seq_q_lens=cu_q,
+        seq_kv_lens=kv_lengths,
+        block_table=table,
+        workspace=workspace,
+    )
+    torch.testing.assert_close(o, torch.zeros_like(o), atol=0, rtol=0)
+    expected = torch.arange(kl - ql + 1, kl + 1, device=DEV).float().log().view(1, ql, 1, 1).expand_as(lse)
+    torch.testing.assert_close(lse, expected, atol=1e-5, rtol=1e-5)
+
+
 def _thd_graph(
     b,
     ql,

@@ -4586,11 +4586,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         return self.batch_size * ((s_q_decl + cga_tile_m - 1) // cga_tile_m) * self.h_q
 
     def _thd_meta_words(self):
-        from cudnn.sdpa.fwd.config_sm100 import thd_work_prefix_enabled
         from cudnn.frost.tile_dsl.thd import THD_META_WORDS, THD_WORK_META_WORDS
 
-        indexed = self.packed_thd_split and thd_work_prefix_enabled(self._k_mod.CFG)
-        return THD_WORK_META_WORDS(self.batch_size) if indexed else THD_META_WORDS(self.batch_size)
+        # Workspace queries are legal before compile(). Reserve the split
+        # metadata tail from checked geometry; variants without indexed
+        # lookup leave these B+1 words unused. No compiled module is needed.
+        return THD_WORK_META_WORDS(self.batch_size) if self.packed_thd_split else THD_META_WORDS(self.batch_size)
 
     def _thd_workspace_layout(self):
         b, qh = self.batch_size, self.h_q
