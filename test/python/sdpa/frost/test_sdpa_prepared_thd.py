@@ -28,6 +28,25 @@ pytestmark = [pytest.mark.L0]
 DEV = torch.device("cuda")
 
 
+@pytest.mark.parametrize("family", ["CfgD32", "CfgD64", "CfgD128", "CfgD128Decode", "CfgD192", "CfgD256", "CfgD256Decode", "CfgD512", "CfgD512X2"])
+@pytest.mark.parametrize("thd", [0, 1])
+def test_thd_work_prefix_declines_other_config_families(family, thd):
+    from cudnn.sdpa.fwd import config_sm100 as config
+
+    # Shared task decoding also sees configs without paged-KV fields (D512X2).
+    # Neither dense nor nonpaged THD requires the paged prefix metadata.
+    cfg_type = getattr(config, family)
+    cfg = cfg_type(**({"THD_VARLEN": thd} if "THD_VARLEN" in cfg_type.__dataclass_fields__ else {}))
+    assert not config.thd_work_prefix_enabled(cfg)
+
+
+def test_thd_work_prefix_accepts_packed_paged_d128():
+    from cudnn.sdpa.fwd.config_sm100 import CfgD128Decode, thd_work_prefix_enabled
+
+    cfg = CfgD128Decode(THD_VARLEN=1, PAGED_KV=1, PACK_GQA=1, SPLIT_KV=2, BOTTOM_RIGHT=1)
+    assert thd_work_prefix_enabled(cfg)
+
+
 def _thd_graph(
     b,
     ql,
