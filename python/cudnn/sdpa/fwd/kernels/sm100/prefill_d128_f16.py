@@ -309,6 +309,8 @@ THD_PERSISTENT = True
 # scrambles LPT tile assignment (cf. ctm_lpt_decode_qtiles_bug; dsv4/qwen sm100).
 # Qualify this integer-only lookup independently of the attention arithmetic.
 # Keep other geometries on their existing decoder until they are measured.
+# This also selects the shared paged body (including the SM107 paged route):
+# work ownership depends on packed Q tiles, not on K/V pool layout or length.
 _BOUNDED_THD_DECODE = (
     CFG.THD_VARLEN == 1
     and CFG.DTYPE_QKV == 2

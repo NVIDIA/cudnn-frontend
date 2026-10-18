@@ -70,6 +70,12 @@ Under THD PackGQA, setup and decoding count **token** tiles
 (`CGA_TILE_M / PACK_G`), while Stats stores use the unpacked query head.
 Changing only one side misses or aliases rows. The packing/capture tests
 exercise partial groups and protect untouched tails with sentinels.
+The D128 BF16 top-left causal bounded work decoder also serves paged THD
+at 128x128, two CTAs and SPLIT_KV=1, including the shared SM107 paged body.
+Packed-KV tests alone do not cover it: `test_thd_work_lookup_paged_replay`
+asserts the paged bounded route and checks unequal Q/KV lengths, partial
+PackGQA, changing K/V tables and live/empty transitions under one capture.
+FP16 and sliding-window paged cases do not exercise this opt-in.
 A bounded second wave is a plan-time tuning choice; compute its workload
 from packed token tiles, rather than unpacked tiles times all query heads.
 
