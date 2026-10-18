@@ -17,12 +17,14 @@ pytestmark = [requires_dsl, pytest.mark.skipif(_SM is None or not 100 <= _SM < 1
 
 
 def _case(dim, dtype, layout, origin=0):
-    level = pytest.mark.L0 if (dim, dtype, layout) in ((256, torch.bfloat16, "pitched"), (256, torch.bfloat16, "base2")) else pytest.mark.L1
+    smoke = dim == 256 and dtype == torch.bfloat16 and layout in ("pitched", "base2", "compact_base2", "compact_o_base2", "compact_do_base2")
+    level = pytest.mark.L0 if smoke else pytest.mark.L1
     return pytest.param(dim, dtype, layout, origin, id=f"d{dim}-{str(dtype).split('.')[-1]}-{layout}-{origin}", marks=level)
 
 
 _CASES = [_case(dim, dtype, layout) for dim, dtype in ((128, torch.bfloat16), (256, torch.float16), (256, torch.bfloat16)) for layout in ("compact", "pitched")]
 _CASES += [_case(256, torch.bfloat16, layout) for layout in ("asymmetric", "batch_odd", "row_odd", "head_odd", "base2", "padded")]
+_CASES += [_case(256, torch.bfloat16, layout) for layout in ("compact_base2", "compact_o_base2", "compact_do_base2")]
 _CASES += [_case(256, torch.bfloat16, "cp8", origin) for origin in (0, 512)]
 
 
@@ -35,7 +37,8 @@ def _compile(shape, strides, dtype, dim, alignment, arch, dump_dir=None):
     batch, seqlen, heads, _ = shape
     rounded = ((seqlen + 127) // 128) * 128
     scalar = cutlass.BFloat16 if dtype == torch.bfloat16 else cutlass.Float16
-    operands = [make_fake_tensor(scalar, shape, stride, assumed_align=alignment) for stride in strides]
+    alignments = (alignment, alignment) if isinstance(alignment, int) else alignment
+    operands = [make_fake_tensor(scalar, shape, stride, assumed_align=align) for stride, align in zip(strides, alignments)]
     delta = make_fake_tensor(cutlass.Float32, (batch, heads, rounded), (heads * rounded, rounded, 1), assumed_align=16)
     options = f"--enable-tvm-ffi --gpu-arch {arch}"
     if dump_dir is not None:
@@ -60,13 +63,18 @@ def _reference(operands):
 def test_backward_dot_physical_layout(dim, dtype, layout, origin):
     batch, seqlen, heads = (64, 512, 32) if layout == "cp8" else (2, 257, 4)
     width = 192 if layout == "padded" else dim
-    pitch = seqlen if layout == "compact" else 1024 if layout == "cp8" else seqlen + 127
+    pitch = seqlen if layout.startswith("compact") else 1024 if layout == "cp8" else seqlen + 127
     head_stride = width + int(layout == "head_odd")
     row_stride = heads * head_stride + int(layout == "row_odd")
     strides = [(pitch * row_stride + int(layout == "batch_odd"), row_stride, head_stride, 1)] * 2
     if layout == "asymmetric":
         strides[1] = ((pitch + 128) * row_stride, row_stride, head_stride, 1)
-    alignment = 2 if layout == "base2" else 16
+    alignment = {
+        "base2": (2, 2),
+        "compact_base2": (2, 2),
+        "compact_o_base2": (2, 16),
+        "compact_do_base2": (16, 2),
+    }.get(layout, (16, 16))
     shape = (batch, seqlen, heads, width)
     arch = f"sm_{_SM}a"
     if not arch_known_to_the_dsl(arch):
@@ -76,8 +84,8 @@ def test_backward_dot_physical_layout(dim, dtype, layout, origin):
     def inputs(extra=0):
         try:
             storage, views = [], []
-            for stride in strides:
-                offset = 16 + extra + int(layout == "base2") + origin * row_stride
+            for stride, align in zip(strides, alignment):
+                offset = 16 + extra + int(align == 2) + origin * row_stride
                 span = (batch - 1) * stride[0] + (seqlen - 1) * stride[1] + (heads - 1) * stride[2] + width
                 raw = torch.full((offset + span + 16,), 4096.0, dtype=dtype, device="cuda")
                 view = raw.as_strided(shape, stride, offset)
@@ -152,10 +160,12 @@ def test_backward_dot_physical_layout(dim, dtype, layout, origin):
 @pytest.mark.L1
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a", "sm_110a", "sm_120a"])
 @pytest.mark.parametrize("alignment", [16, 2])
-def test_backward_dot_other_arch_lowering(arch, alignment, tmp_path):
+@pytest.mark.parametrize("layout", ["compact", "pitched"])
+def test_backward_dot_other_arch_lowering(arch, alignment, layout, tmp_path):
     if not arch_known_to_the_dsl(arch):
         pytest.skip(f"Installed CuTe DSL cannot compile {arch}")
-    _compile((2, 257, 4, 256), [(384 * 1024, 1024, 256, 1)] * 2, torch.bfloat16, 256, alignment, arch, tmp_path)
+    pitch = 257 if layout == "compact" else 384
+    _compile((2, 257, 4, 256), [(pitch * 1024, 1024, 256, 1)] * 2, torch.bfloat16, 256, alignment, arch, tmp_path)
     ptx = "\n".join(path.read_text() for path in tmp_path.rglob("*.ptx"))
     assert ptx and "cudnn_kernel_dot_do_o_kernel" in ptx
     vector_load = re.search(r"ld\.global(?:\.[a-z0-9]+)*\.v4\.b32", ptx)

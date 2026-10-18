@@ -164,9 +164,15 @@ def dot_do_o_kernel(
             else:
                 g_off = base + row * row_stride + col0
                 for chunk in cutlass.range_constexpr(n_chunks):
-                    if cutlass.const_expr(D_V == 256 and o.element_type == cutlass.BFloat16 and do.element_type == cutlass.BFloat16):
+                    if cutlass.const_expr(
+                        D_V == 256
+                        and o.element_type == cutlass.BFloat16
+                        and do.element_type == cutlass.BFloat16
+                        and o.iterator.alignment >= 16
+                        and do.iterator.alignment >= 16
+                    ):
                         # Compact D256 BF16 rows and eight-element lane offsets
-                        # preserve the binding contract's 16-byte base alignment.
+                        # preserve each input's declared 16-byte base alignment.
                         ov = (o_ptr + g_off + chunk * chunk_elems).load(alignment=16, count=_COPY_ELEMS)
                         dov = (do_ptr + g_off + chunk * chunk_elems).load(alignment=16, count=_COPY_ELEMS)
                     else:

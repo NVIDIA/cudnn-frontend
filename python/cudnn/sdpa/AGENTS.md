@@ -205,6 +205,9 @@ which can discard its alignment declaration; checking the converted pointer
 can leave an intended vector path scalar. Compile both aligned and misaligned
 controls and inspect the emitted loads, then check physical pitches, pointer
 rebinding and replay. `test_sdpa_bwd_dot_strides.py` covers the shared dot helper.
+Compact strides do not establish base-pointer alignment. Keep the declaration
+check for both inputs in the compact path too; the compact alignment-2 cases
+exercise O alone, dO alone, and both inputs, with matching PTX controls.
 
 Block-scaled SF_O uses byte addressing: its fake tensor extent, host geometry
 arguments, device parameters, and every intermediate offset product must all
