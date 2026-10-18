@@ -5,6 +5,7 @@
 from cutlass.experimental import primitives as nvvm
 from cutlass.experimental.cuda import tensor_map as tmap
 
+from cudnn.frost.tile_dsl.thd import write_thd_work_prefix
 import cutlass
 import cutlass.cute as cute
 import cuda.bindings.driver as _cuda_driver
@@ -269,6 +270,7 @@ def build_thd_meta_o_descs_kernel(
     clamp_kv: cutlass.Constexpr[bool] = True,
     splits: cutlass.Constexpr[int] = 1,
     rank_by_kv: cutlass.Constexpr[bool] = False,
+    work_prefix: cutlass.Constexpr[bool] = False,
 ) -> None:
     """Per-execute f16/bf16 THD metadata, O descriptors, and scheduler bounds.
 
@@ -325,7 +327,10 @@ def build_thd_meta_o_descs_kernel(
     # kernel reads its own bound from here. The counter starts at n_clusters:
     # cluster c takes unit c from its blockIdx, then pulls from the counter.
     cute.arch.barrier()
-    write_thd_live_and_ctr(cutlass.make_array_view(meta_t), n_batch, n_qh, cga_tile_m, n_clusters, cutlass.Int32(tidx), splits)
+    if cutlass.const_expr(work_prefix):
+        write_thd_work_prefix(cutlass.make_array_view(meta_t), n_batch, n_qh, cga_tile_m, n_clusters, cutlass.Int32(tidx), splits)
+    else:
+        write_thd_live_and_ctr(cutlass.make_array_view(meta_t), n_batch, n_qh, cga_tile_m, n_clusters, cutlass.Int32(tidx), splits)
 
 
 build_thd_meta_o_descs_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)

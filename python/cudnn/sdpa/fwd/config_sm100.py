@@ -3860,3 +3860,21 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
 
 
 MAKE_CFG = {32: make_cfg_d32, 64: make_cfg_d64, 128: make_cfg_d128, 192: make_cfg_d192, 256: make_cfg_d256, 512: make_cfg_d512}
+
+
+def thd_work_prefix_enabled(cfg):
+    """Use indexed task lookup on the packed single-CTA paged prefix path."""
+    # Shared decoders also receive families without THD_VARLEN or PAGED_KV.
+    # Reject their head geometry before reading fields specific to this path.
+    return bool(
+        cfg.TILE_K == 128
+        and cfg.TILE_O == 128
+        and cfg.THD_VARLEN
+        and cfg.PAGED_KV
+        and cfg.DTYPE_QKV in (2, 3)
+        and cfg.CGA_M == 1
+        and cfg.PACK_GQA
+        and cfg.SPLIT_KV > 1
+        and cfg.BOTTOM_RIGHT
+        and not (cfg.MASK_FLAGS & MASK_SWA)
+    )
