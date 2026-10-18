@@ -3,6 +3,8 @@
 
 from typing import NamedTuple, Optional
 
+from cudnn.frost.tile_dsl.thd import THD_WORK_PREFIX_OFF, THD_WORK_META_WORDS, THD_REMAP_OFF
+from cudnn.sdpa.fwd.config_sm100 import thd_work_prefix_enabled
 import cutlass
 import cutlass.cute as cute
 from cutlass.base_dsl.typing import Pointer
@@ -1224,7 +1226,47 @@ def make_sdpa_helpers(
     _thd_on = int(getattr(CFG, "THD_VARLEN", 0))
 
     @cute.jit
+    def _thd_decode_prefix(linear_cta, meta_t, n_batch, n_qh, cta_in_pair):
+        u = linear_cta // cutlass.Int32(CFG.CGA_M)
+        split = u % cutlass.Int32(CFG.SPLIT_KV)
+        u = u // cutlass.Int32(CFG.SPLIT_KV)
+        meta = cutlass.make_array_view(meta_t)
+        b, local = n_batch, cutlass.Int32(0)
+        if n_batch == cutlass.Int32(1):
+            b, local = cutlass.Int32(0), u
+        elif n_batch > cutlass.Int32(1):
+            prefix0 = THD_WORK_PREFIX_OFF(n_batch)
+            if u < cutlass.Int32(meta[prefix0 + n_batch]):
+                lo, hi = cutlass.Int32(0), n_batch
+                while lo < hi:
+                    mid = (lo + hi) >> 1
+                    if cutlass.Int32(meta[prefix0 + mid + 1]) <= u:
+                        lo = mid + 1
+                    else:
+                        hi = mid
+                b = cutlass.Int32(meta[THD_REMAP_OFF(n_batch) + lo])
+                local = u - cutlass.Int32(meta[prefix0 + lo])
+        f_batch, f_head, f_qc = n_batch, cutlass.Int32(0), cutlass.Int32(0)
+        if b < n_batch:
+            q_len = cutlass.Int32(meta[n_batch + b + 1]) - cutlass.Int32(meta[n_batch + b])
+            cb = (q_len + cutlass.Int32(thd_token_tile_m - 1)) // cutlass.Int32(thd_token_tile_m)
+            if local < cb * n_qh:
+                head = local // cb
+                row = local % cb
+                if cutlass.const_expr(CFG.SCHEDULER_POLICY == SCHED_LPT):
+                    head = local % n_qh
+                    row = cb - 1 - local // n_qh
+                elif cutlass.const_expr(CFG.SCHEDULER_POLICY == SCHED_LPT_L2):
+                    group = cutlass.Int32(_packed_heads_per_kv if CFG.PACK_GQA else CFG.QH_PER_KH)
+                    head = (local // (cb * group)) * group + local % group
+                    row = cb - 1 - (local // group) % cb
+                f_batch, f_head, f_qc = b, head, row
+        return f_qc * cutlass.Int32(_q_supers_per_cluster) + cta_in_pair, f_head, f_batch + split * n_batch
+
+    @cute.jit
     def _thd_decode(linear_cta, seq_kv_lens_t, n_batch, n_qh, cta_in_pair):
+        if cutlass.const_expr(thd_work_prefix_enabled(CFG)):
+            return _thd_decode_prefix(linear_cta, seq_kv_lens_t, n_batch, n_qh, cta_in_pair)
         u = linear_cta // cutlass.Int32(CFG.CGA_M)
         split = cutlass.Int32(0)
         if cutlass.const_expr(getattr(CFG, "SPLIT_KV", 1) > 1):
@@ -1615,6 +1657,7 @@ def sdpa_operand_tensors(
     n_pages=0,
     o_pack=1,
     table_v_strides=None,
+    work_prefix=False,
 ) -> SdpaOperandTensors:
     """Pointer + stride prologue shared by every SM100 / SM107 prefill host (called while the
     host traces, so the branches below are static).
@@ -1649,7 +1692,7 @@ def sdpa_operand_tensors(
     sinks = _vec(sinks_ptr, QH)
     if thd:
         # [seq_kv(B) | cu_q(B+1) | cu_k(B+1) | remap(B) | live | ctr] and (B + 3) O/K/V descriptor slots
-        meta = _vec(meta_ptr, 4 * B + 4)
+        meta = _vec(meta_ptr, THD_WORK_META_WORDS(B) if work_prefix else 4 * B + 4)
         o_desc = _vec(o_desc_ptr, (B + 3) * tensor_map_qwords)
         q_lens = None if thd_q_lens_ptr is None else _vec(thd_q_lens_ptr, B + (thd_lens_form & 1))
         kv_lens = None if thd_kv_lens_ptr is None else _vec(thd_kv_lens_ptr, B + ((thd_lens_form >> 1) & 1))

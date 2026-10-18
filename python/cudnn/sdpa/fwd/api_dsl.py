@@ -4585,9 +4585,16 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         s_q_decl = int(self.q_desc.shape[2])
         return self.batch_size * ((s_q_decl + cga_tile_m - 1) // cga_tile_m) * self.h_q
 
+    def _thd_meta_words(self):
+        from cudnn.sdpa.fwd.config_sm100 import thd_work_prefix_enabled
+        from cudnn.frost.tile_dsl.thd import THD_META_WORDS, THD_WORK_META_WORDS
+
+        indexed = self.packed_thd_split and thd_work_prefix_enabled(self._k_mod.CFG)
+        return THD_WORK_META_WORDS(self.batch_size) if indexed else THD_META_WORDS(self.batch_size)
+
     def _thd_workspace_layout(self):
         b, qh = self.batch_size, self.h_q
-        base = ws_align((4 * b + 4) * 4) + ws_align((b + 3) * 16 * 8) + (0 if self.has_sink else ws_align(qh * 4))
+        base = ws_align(self._thd_meta_words() * 4) + ws_align((b + 3) * 16 * 8) + (0 if self.has_sink else ws_align(qh * 4))
         if self.packed_thd_split:
             from cudnn.sdpa.fwd.prepared import thd_split_workspace
 
@@ -4645,7 +4652,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             dbg = int(os.environ.get("FROST_THD_CLUSTERS", "0"))  # debug override
             if dbg > 0:
                 units = min(env, dbg)
-        n_meta = 4 * b + 4
+        n_meta = self._thd_meta_words()
         plan = SimpleNamespace(
             q=self._thd_decl(self.q_desc),
             k=self._thd_decl(self.k_desc),

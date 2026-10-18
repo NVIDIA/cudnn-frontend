@@ -1839,10 +1839,10 @@ if _dsl_installed():
     import cutlass
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
-    from cudnn.frost.tile_dsl.thd import write_thd_batch_remap, write_thd_live_and_ctr, write_thd_prefix_warp
+    from cudnn.frost.tile_dsl.thd import write_thd_batch_remap, write_thd_live_and_ctr, write_thd_prefix_warp, write_thd_work_prefix
 
     @cute.kernel
-    def _prefix_probe(meta_t, q, k, b: cutlass.Int32, flags: cutlass.Int32, rank_by_kv: cutlass.Constexpr[bool]):
+    def _prefix_probe(meta_t, q, k, b: cutlass.Int32, flags: cutlass.Int32, rank_by_kv: cutlass.Constexpr[bool], work_prefix: cutlass.Constexpr[bool]):
         tid, _, _ = cute.arch.thread_idx()
         warp, lane = cutlass.Int32(tid) // 32, cutlass.Int32(tid) % 32
         meta = cutlass.make_array_view(meta_t)
@@ -1854,20 +1854,23 @@ if _dsl_installed():
         cute.arch.barrier()
         write_thd_batch_remap(meta, b, cutlass.Int32(tid), cutlass.Int32(64), rank_by_kv=rank_by_kv)
         cute.arch.barrier()
-        write_thd_live_and_ctr(meta, b, cutlass.Int32(3), cutlass.Int32(128), cutlass.Int32(7), cutlass.Int32(tid))
+        if cutlass.const_expr(work_prefix):
+            write_thd_work_prefix(meta, b, cutlass.Int32(3), cutlass.Int32(16), cutlass.Int32(7), cutlass.Int32(tid), 3)
+        else:
+            write_thd_live_and_ctr(meta, b, cutlass.Int32(3), cutlass.Int32(128), cutlass.Int32(7), cutlass.Int32(tid))
 
     _prefix_probe.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
     @cute.jit
-    def _prefix_host(m, q, k, b: cutlass.Int32, flags: cutlass.Int32, rank_by_kv: cutlass.Constexpr[bool], stream):
-        _prefix_probe(m, q, k, b, flags, rank_by_kv).launch(grid=(1, 1, 1), block=(64, 1, 1), stream=stream)
+    def _prefix_host(m, q, k, b: cutlass.Int32, flags: cutlass.Int32, rank_by_kv: cutlass.Constexpr[bool], work_prefix: cutlass.Constexpr[bool], stream):
+        _prefix_probe(m, q, k, b, flags, rank_by_kv, work_prefix).launch(grid=(1, 1, 1), block=(64, 1, 1), stream=stream)
 
 
 @pytest.fixture(scope="module")
 def _prefix_runner():
     compiled = {}
 
-    def run(meta, q, k, b, flags, rank_by_kv):
+    def run(meta, q, k, b, flags, rank_by_kv, work_prefix=False):
         tensor = lambda x: from_dlpack(x, assumed_align=16).mark_layout_dynamic(leading_dim=0)
         args = (
             tensor(meta),
@@ -1876,11 +1879,13 @@ def _prefix_runner():
             cutlass.Int32(b),
             cutlass.Int32(flags),
             rank_by_kv,
+            work_prefix,
             _prefix_cuda.CUstream(torch.cuda.current_stream().cuda_stream),
         )
-        if rank_by_kv not in compiled:
-            compiled[rank_by_kv] = cute.compile(_prefix_host, *args)
-        compiled[rank_by_kv](*args[:5], args[-1])
+        key = (rank_by_kv, work_prefix)
+        if key not in compiled:
+            compiled[key] = cute.compile(_prefix_host, *args)
+        compiled[key](*args[:5], args[-1])
 
     return run
 
@@ -1910,6 +1915,47 @@ def test_parallel_thd_metadata_matches_lengths_and_normalized_cu(b, flags, rank_
     remap = torch.tensor(sorted(range(b), key=lambda i: (-int(lengths[i]), i)), dtype=torch.int32)
     live = int(((q + 127) // 128).sum()) * 3
     torch.testing.assert_close(got[3 * b + 2 :], torch.cat((remap, torch.tensor([live, 7], dtype=torch.int32))), rtol=0, atol=0)
+
+
+@requires_blackwell
+@requires_dsl
+@pytest.mark.parametrize("b", [0, 1, 2, 31, 32, 33, 65, 257])
+@pytest.mark.parametrize("flags", [0, 3])
+def test_thd_work_prefix_replay_matches_live_tiles(b, flags, _prefix_runner):
+    """Remapped prefixes count real tile/head tasks, including empty requests."""
+    from cudnn.frost.tile_dsl.thd import THD_WORK_META_WORDS, THD_WORK_PREFIX_OFF
+
+    storage = torch.full((THD_WORK_META_WORDS(b) + 8,), -12345, dtype=torch.int32, device=DEV)
+    meta = storage[4:-4]
+    q_in = torch.zeros(b + (flags & 1), dtype=torch.int32, device=DEV)
+    k_in = torch.zeros(b + ((flags >> 1) & 1), dtype=torch.int32, device=DEV)
+    _prefix_runner(meta, q_in, k_in, b, flags, True, True)
+    capture = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(capture):
+        _prefix_runner(meta, q_in, k_in, b, flags, True, True)
+    try:
+        for state in range(3):
+            q = ((torch.arange(b, dtype=torch.int32) + state) * 17) % 65
+            k = ((torch.arange(b, dtype=torch.int32).flip(0) + state) * 31) % 129
+            if state == 2:
+                q.zero_()
+            cq = torch.cat((torch.zeros(1, dtype=torch.int32), q.cumsum(0, dtype=torch.int32)))
+            ck = torch.cat((torch.zeros(1, dtype=torch.int32), k.cumsum(0, dtype=torch.int32)))
+            q_in.copy_(cq + 17 if flags & 1 else q)
+            k_in.copy_(ck + 31 if flags & 2 else k)
+            storage.fill_(-12345)
+            capture.replay()
+            got = meta.cpu()
+            remap = torch.tensor(sorted(range(b), key=lambda i: (-int(k[i]), i)), dtype=torch.int32)
+            work = ((q[remap.long()] + 15) // 16) * 3
+            expected = torch.cat((k, cq, ck, remap, torch.tensor([int(work.sum()) * 3, 7], dtype=torch.int32)))
+            torch.testing.assert_close(got[: 4 * b + 4], expected, rtol=0, atol=0)
+            if b > 1:
+                prefix = torch.cat((torch.zeros(1, dtype=torch.int32), work.cumsum(0, dtype=torch.int32)))
+                torch.testing.assert_close(got[THD_WORK_PREFIX_OFF(b) :], prefix, rtol=0, atol=0)
+            assert torch.all(storage[:4] == -12345) and torch.all(storage[-4:] == -12345)
+    finally:
+        capture.reset()
 
 
 @requires_blackwell
