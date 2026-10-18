@@ -59,6 +59,27 @@ class SdpaBwdDslSm100D256(SdpaBwdDslSm107):
         """
         return not self.thd and self.dtype == torch.bfloat16 and _sm107.DQ_SINGLE_LAUNCH and 100 <= _prepared._sm(self) <= 106
 
+    def _chunk_partials_enabled(self) -> bool:
+        """A complete GQA group can be folded before its partial buffer is reused."""
+        return (
+            not self.thd
+            and self.dtype == torch.bfloat16
+            and self._gqa_group > 1
+            and not self._q_padded
+            and not self._kv_padded
+            and self._qh_chunk % self._gqa_group == 0
+            and (self._b_chunk < self.batch_size or self._qh_chunk < self.h_q)
+        )
+
+    def _family_scratch_shapes(self, kv_rows: int, gqa: bool):
+        plan = super()._family_scratch_shapes(kv_rows, gqa)
+        if self._chunk_partials_enabled():
+            return [
+                (name, (self._b_chunk, kv_rows, self._qh_chunk, self.head_dim_qk), dtype) if name in ("dv_part", "dk_part") else (name, shape, dtype)
+                for name, shape, dtype in plan
+            ]
+        return plan
+
     def check_support(self) -> bool:
         """This row's own declines first (what the 2x2 body has not run), then the half row's backstops."""
         self._value_error_if(

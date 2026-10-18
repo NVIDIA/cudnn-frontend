@@ -621,6 +621,21 @@ comment in `bwd/api_dsl.py` carries the full set).  Each lesson names its runnab
 
 ## Output initialization regressions
 
+D256 chunk-local GQA partial buffers may be reused only after a complete
+GQA group has been folded. Input batch/head origins remain global while the
+dV store and dK GEMM use independent local output origins. A head subgroup
+smaller than the GQA group still needs global partials until the final fold.
+`test_chunk_partials_workspace_and_subgroup_boundary` checks the allocation
+boundary; `test_chunk_partials_match_full_partials` checks batch, head and
+combined chunks against FP64 and the original fold, with poisoned workspace
+under dense, causal, bottom-right and sliding-window masks.
+`test_chunk_partials_preserve_per_member_dq` also retains the per-member dQ path.
+`test_chunk_partials_rebind_stream_and_replay` checks changed inputs and the
+caller's stream under capture.
+When a test monkeypatches the scratch policy, capture its shapes and byte
+count inside that context: these queries call the current policy dynamically,
+so restoring the class before reading the baseline silently changes the control.
+
 When removing wrapper-side output clears, verify that the prepared chain
 overwrites every element, including masked rows and partial tiles. Poison
 fresh auxiliary outputs with NaNs, forbid the removed Torch clear calls, and

@@ -155,6 +155,16 @@ the group's K head and writes its own global per-query-head dK/dV partials;
 the final reduction still sums the complete group once, after every chunk.
 FP16, packed THD and other architecture rows retain their whole-group choices.
 
+On the same dense BF16 D256 row, chunks that contain complete GQA groups
+reuse dK/dV partial buffers after reducing each chunk. With no query or KV
+padding, those buffers hold only `(batch_chunk, S_kv, query_head_chunk, D)`
+instead of all batches and query heads. Input batch/head origins stay global;
+partial-output origins are local, and the ordered FP32 group reduction writes
+the corresponding final dK/dV slice before reuse. The dS budget and chunk
+geometry are unchanged. Chunks smaller than one GQA group retain the global
+partials and final reduction described above. FP16, packed THD, padded shapes,
+and other architecture rows keep their existing partial-buffer allocation.
+
 The 8 GiB target is not a hard workspace limit: one query head alone can exceed
 it, and gradients and other scratch regions also require storage. For example,
 dense BF16 B=4, S_q=S_kv=131072, H_q=8, H_kv=2, D=256 uses a one-head dS slab

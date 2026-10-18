@@ -717,9 +717,13 @@ def test_head_subgroup_rule_is_scoped_and_workspace_is_honest(monkeypatch):
         assert (candidate._b_chunk, candidate._qh_chunk) == (1, 1)
         with monkeypatch.context() as old:
             old.setattr(SdpaBwdDslSm100D256, "_allow_head_subgroups", lambda _api: False)
+            # Isolate the subgroup dS saving from the independent whole-group
+            # partial-buffer reuse policy.
+            old.setattr(SdpaBwdDslSm100D256, "_chunk_partials_enabled", lambda _api: False)
             baseline = plan()
+            baseline_workspace = baseline.scratch_workspace_bytes()
         assert (baseline._b_chunk, baseline._qh_chunk) == (1, 4)
-        assert baseline.scratch_workspace_bytes() - candidate.scratch_workspace_bytes() == 96 * 2**30
+        assert baseline_workspace - candidate.scratch_workspace_bytes() == 96 * 2**30
         for sequence in (2048, 4096, 8192, 16384, 32768):
             api = plan(sequence)
             with monkeypatch.context() as old:
@@ -736,6 +740,109 @@ def test_head_subgroup_rule_is_scoped_and_workspace_is_honest(monkeypatch):
         assert plan()._qh_chunk == 4
     monkeypatch.setattr(prepared, "_sm", lambda _api: 100)
     assert not _adapter(sm107.SdpaBwdDslSm107, hq=8, hkv=2)._allow_head_subgroups()
+
+
+def test_chunk_partials_workspace_and_subgroup_boundary(monkeypatch):
+    from cudnn.sdpa.bwd import api_dsl_sm107 as sm107, prepared_sm107 as prepared
+    from cudnn.sdpa.bwd.api_dsl_sm100_d256 import SdpaBwdDslSm100D256
+
+    monkeypatch.setattr(prepared, "_sm", lambda _api: 100)
+    monkeypatch.setattr(sm107, "_SM107_WS_BUDGET_BYTES", 4 * 256 * 512 * 2)
+    kwargs = dict(b=2, hq=8, hkv=2, sq=256, skv=512)
+    candidate = _adapter(SdpaBwdDslSm100D256, **kwargs)
+    assert (candidate._b_chunk, candidate._qh_chunk) == (1, 4)
+    with monkeypatch.context() as old:
+        old.setattr(SdpaBwdDslSm100D256, "_chunk_partials_enabled", lambda _api: False)
+        baseline = _adapter(SdpaBwdDslSm100D256, **kwargs)
+        old_shapes = {name: shape for name, shape, _ in baseline._scratch_shapes()}
+        baseline_workspace = baseline.scratch_workspace_bytes()
+    new_shapes = {name: shape for name, shape, _ in candidate._scratch_shapes()}
+    assert old_shapes["ds_ws"] == new_shapes["ds_ws"]
+    for name in ("dk_part", "dv_part"):
+        assert old_shapes[name] == (2, 512, 8, 256)
+        assert new_shapes[name] == (1, 512, 4, 256), "Chunk partial workspace did not shrink"
+    assert baseline_workspace - candidate.scratch_workspace_bytes() == 2 * (2 * 8 - 1 * 4) * 512 * 256 * 2
+    for kw in (dict(dt=torch.float16), dict(thd=True), dict(hkv=8), dict(sq=255), dict(skv=511)):
+        control = _adapter(SdpaBwdDslSm100D256, **(kwargs | kw))
+        assert not control._chunk_partials_enabled()
+    # A chunk smaller than one GQA group cannot be folded independently.
+    monkeypatch.setattr(sm107, "_SM107_WS_BUDGET_BYTES", 256 * 512 * 2)
+    subgroup = _adapter(SdpaBwdDslSm100D256, **kwargs)
+    assert subgroup._qh_chunk == 1 and not subgroup._chunk_partials_enabled()
+    subgroup_shapes = {name: shape for name, shape, _ in subgroup._scratch_shapes()}
+    assert subgroup_shapes["dk_part"] == old_shapes["dk_part"]
+    assert subgroup_shapes["dv_part"] == old_shapes["dv_part"]
+
+
+@requires_pre_rubin_blackwell
+@pytest.mark.parametrize("b,hkv,group,budget_groups", [(2, 2, 4, 2), (4, 1, 4, 2), (2, 2, 4, 1), (2, 2, 2, 1)], ids=["heads", "batch", "both", "both-g2"])
+@pytest.mark.parametrize("mask", ["dense", "causal", "bottom-right", "window", "window-bottom-right"])
+def test_chunk_partials_match_full_partials(monkeypatch, b, hkv, group, budget_groups, mask):
+    """Reuse both partial buffers only after complete groups have been folded."""
+    from cudnn.sdpa.bwd import api_dsl_sm107 as sm107
+    from cudnn.sdpa.bwd.api_dsl_sm100_d256 import SdpaBwdDslSm100D256
+
+    sq, skv = 256, 512
+    monkeypatch.setattr(sm107, "_SM107_WS_BUDGET_BYTES", budget_groups * group * sq * skv * 2)
+    kwargs = dict(b=b, hq=hkv * group, hkv=hkv, sq=sq, skv=skv, poison=float("nan"), ws_poison=0xBD, runs=2)
+    if mask != "dense":
+        bottom_right = mask.endswith("bottom-right")
+        window = mask.startswith("window")
+        kwargs["keep"] = _causal_keep(sq, skv, bottom_right=bottom_right, **({"left": 128} if window else {}))
+        kwargs["use_causal_mask_bottom_right" if bottom_right else "use_causal_mask"] = True
+        if window:
+            kwargs["diagonal_band_left_bound"] = 128
+    seen = []
+    compile_plan = SdpaBwdDslSm100D256.compile
+
+    def compile_and_record(api):
+        result = compile_plan(api)
+        seen.append((api._chunk_partials_enabled(), api._b_chunk, api._qh_chunk, api.scratch_workspace_bytes()))
+        return result
+
+    monkeypatch.setattr(SdpaBwdDslSm100D256, "compile", compile_and_record)
+    with monkeypatch.context() as old:
+        old.setattr(SdpaBwdDslSm100D256, "_chunk_partials_enabled", lambda _api: False)
+        baseline = _run(**kwargs).check()
+    assert seen and all(not row[0] for row in seen)
+    baseline_plans = set(seen)
+    seen.clear()
+    candidate = _run(**kwargs).check()
+    assert seen and all(row[0] for row in seen)
+    assert len(set(seen)) == len(baseline_plans) == 1
+    (old_plan,) = baseline_plans
+    (new_plan,) = set(seen)
+    assert old_plan[1:3] == new_plan[1:3] and new_plan[3] < old_plan[3]
+    for before, after in zip(baseline.outs, candidate.outs):
+        for expected, actual in zip(before, after):
+            assert torch.equal(expected.view(torch.int16), actual.view(torch.int16))
+
+
+@requires_pre_rubin_blackwell
+def test_chunk_partials_preserve_per_member_dq(monkeypatch):
+    from cudnn.sdpa.bwd import api_dsl_sm107 as sm107
+
+    monkeypatch.setattr(sm107, "DQ_SINGLE_LAUNCH", False)
+    test_chunk_partials_match_full_partials(monkeypatch, 2, 2, 4, 1, "bottom-right")
+
+
+@requires_pre_rubin_blackwell
+def test_chunk_partials_rebind_stream_and_replay(monkeypatch):
+    from cudnn.sdpa.bwd import api_dsl_sm107 as sm107
+    from cudnn.sdpa.bwd.api_dsl_sm100_d256 import SdpaBwdDslSm100D256
+
+    monkeypatch.setattr(sm107, "_SM107_WS_BUDGET_BYTES", 2 * 512 * 512 * 2)
+    seen = []
+    compile_plan = SdpaBwdDslSm100D256.compile
+
+    def compile_and_record(api):
+        result = compile_plan(api)
+        seen.append(api._chunk_partials_enabled())
+        return result
+
+    monkeypatch.setattr(SdpaBwdDslSm100D256, "compile", compile_and_record)
+    test_prepared_rebind_stream_and_replay(torch.bfloat16, True)
+    assert seen and all(seen)
 
 
 @requires_pre_rubin_blackwell
