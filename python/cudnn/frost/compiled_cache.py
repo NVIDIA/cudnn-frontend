@@ -716,6 +716,7 @@ def _entry_lock(root: Path, entry: Path):
 
 
 def _compile_and_export(fn, args, kwargs, root, entry, cache_key, symbol, manifest):
+    """Compile a miss and return its reloaded artifact when export is supported."""
     import cutlass.cute as cute
 
     compiled = cute.compile(fn, *args, **kwargs)

@@ -83,6 +83,7 @@ result = cc.compile_cached(lambda: None, cache_key=key, options='--enable-tvm-ff
 
 
 def _start(root, rank, key="shared", mode="normal"):
+    """Start an independent cache caller with a retained per-process log."""
     log = (root / f"log-{rank}").open("w")
     process = subprocess.Popen([sys.executable, "-c", _CHILD, str(_SOURCE), str(root), str(rank), key, mode], stdout=log, stderr=subprocess.STDOUT)
     log.close()
@@ -90,6 +91,7 @@ def _start(root, rank, key="shared", mode="normal"):
 
 
 def _wait_files(root, prefix, count, processes):
+    """Wait for the child-process barrier while detecting early exits."""
     deadline = time.monotonic() + 20
     while len(list(root.glob(prefix + "*"))) < count:
         assert all(p.poll() is None for p in processes), [p.returncode for p in processes]
@@ -98,11 +100,13 @@ def _wait_files(root, prefix, count, processes):
 
 
 def _finish(root, processes, expected=0):
+    """Join callers and surface the failing child's diagnostic log."""
     for rank, process in processes:
         assert process.wait(timeout=30) == expected, (root / f"log-{rank}").read_text()
 
 
 def _cleanup(processes):
+    """Reap all children, including those left running after an assertion."""
     for process in processes:
         if process.poll() is None:
             process.kill()
@@ -110,6 +114,7 @@ def _cleanup(processes):
 
 
 def test_frost_cold_processes_compile_one_artifact(tmp_path):
+    """Cold callers share one compilation and a fresh warm caller takes no lock."""
     processes = [_start(tmp_path, rank) for rank in range(4)]
     try:
         _wait_files(tmp_path, "ready-", 4, processes)
@@ -129,6 +134,7 @@ def test_frost_cold_processes_compile_one_artifact(tmp_path):
 
 
 def test_frost_different_keys_can_compile_concurrently(tmp_path):
+    """Unrelated artifacts must enter their compilers without waiting for each other."""
     processes = [_start(tmp_path, rank, key=str(rank), mode="hold") for rank in range(2)]
     try:
         _wait_files(tmp_path, "ready-", 2, processes)
@@ -142,6 +148,7 @@ def test_frost_different_keys_can_compile_concurrently(tmp_path):
 
 @pytest.mark.parametrize("failure", ["fail", "kill"])
 def test_frost_compiler_failure_releases_the_artifact_lock(tmp_path, failure):
+    """Compiler exceptions and process termination must not strand the next caller."""
     owner = _start(tmp_path, "owner", mode="hold" if failure == "kill" else "fail")
     processes = [owner]
     try:
@@ -164,6 +171,7 @@ def test_frost_compiler_failure_releases_the_artifact_lock(tmp_path, failure):
 
 
 def test_frost_unavailable_lock_keeps_compilation_functional(tmp_path):
+    """An unusable lock directory preserves best-effort compilation and export."""
     process = _start(tmp_path, "fallback", mode="unavailable")
     try:
         _wait_files(tmp_path, "ready-", 1, [process])

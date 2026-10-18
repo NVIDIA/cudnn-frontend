@@ -82,6 +82,7 @@ def test_second_process_reloads_the_exported_kernel(tmp_path):
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX artifact locks")
 def test_concurrent_processes_share_one_frost_compilation(tmp_path):
+    """Concurrent GPU callers share one artifact and produce identical GEMM outputs."""
     env = dict(
         os.environ, CUDNN_FRONTEND_ENABLE_FROST_ENGINES="1", CUDNN_FRONTEND_COMPILED_CACHE=str(tmp_path / "cache"), CUDNN_TEST_CACHE_BARRIER=str(tmp_path)
     )
