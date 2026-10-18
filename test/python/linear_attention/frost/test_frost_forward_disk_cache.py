@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 
+import cudnn
 import pytest
 import torch
 
@@ -23,8 +24,8 @@ import torch, cudnn
 import cutlass.cute as cute
 from cudnn.frost import compiled_cache as cc
 from linear_attention.test_la import Backend, FWD_TOL, STATE_TOL, make_case, random_state, reference, pinned_op, op_args, assert_rms_close
-variant, phase, result_path, test_root = sys.argv[1:]
-assert Path(cudnn.__file__).resolve().is_relative_to(Path(test_root).resolve() / 'python')
+variant, phase, result_path, expected_module = sys.argv[1:]
+assert Path(cudnn.__file__).resolve() == Path(expected_module).resolve(), cudnn.__file__
 dtype = torch.bfloat16
 calls = []
 compile_fn = cute.compile
@@ -72,12 +73,16 @@ def test_frost_forward_reloads_in_a_fresh_process(tmp_path, variant):
     source = Path(__file__).resolve().parents[4]
     env = dict(os.environ, CUDNN_FRONTEND_COMPILED_CACHE=str(tmp_path / "cache"), CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO="0")
     env.pop("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", None)
-    env["PYTHONPATH"] = os.pathsep.join([str(source / "python"), str(source / "test/python"), env.get("PYTHONPATH", "")])
+    # CI installs the built wheel; the source tree has no extension module.
+    # Pin the child to the same package as this process, whether installed or
+    # imported from a development checkout, and add only the test helpers.
+    module_path = Path(cudnn.__file__).resolve()
+    env["PYTHONPATH"] = os.pathsep.join([str(module_path.parent.parent), str(source / "test/python"), env.get("PYTHONPATH", "")])
     results = []
     for phase in ("cold", "warm"):
         path = tmp_path / f"{phase}.json"
         process = subprocess.run(
-            [sys.executable, "-c", _CHILD, variant, phase, str(path), str(source)], env=env, cwd=tmp_path, capture_output=True, text=True, timeout=600
+            [sys.executable, "-c", _CHILD, variant, phase, str(path), str(module_path)], env=env, cwd=tmp_path, capture_output=True, text=True, timeout=600
         )
         assert process.returncode == 0, process.stdout[-4000:] + process.stderr[-6000:]
         results.append(json.loads(path.read_text()))
