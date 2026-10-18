@@ -759,13 +759,13 @@ _COMPILED = {}  # (form, dtype, page) -> the compiled block with write-through a
 
 
 def _oracle_rows(form, inp, meta, ref_geom):
-    """The per-sequence oracle's post-RoPE K / V as ``[T, H_kv, D]`` rows in token order (the dense oracle at B x S rows; the
-    packed one per sequence, concatenated -- an empty sequence contributes no rows)."""
+    """Post-RoPE K / V in token order. FP64 accumulation avoids reference GEMM errors at BF16 rounding boundaries;
+    intermediate casts still use the input dtype. Empty packed sequences contribute no rows."""
     if form == "dense":
-        ref = gated_attention_block_reference(**inp, geom=ref_geom)
+        ref = gated_attention_block_reference(**inp, geom=ref_geom, acc_dtype=torch.float64)
         return ref.k.reshape(-1, *ref.k.shape[2:]), ref.v.reshape(-1, *ref.v.shape[2:])
     refs = gated_attention_block_reference_packed(
-        inp["h"], inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], ref_geom, meta["lens"]
+        inp["h"], inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], ref_geom, meta["lens"], acc_dtype=torch.float64
     )
     ks = [r.k[0] for r in refs if r is not None]
     vs = [r.v[0] for r in refs if r is not None]
