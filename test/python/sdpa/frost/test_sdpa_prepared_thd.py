@@ -40,10 +40,11 @@ def test_thd_work_prefix_declines_other_config_families(family, thd):
     assert not config.thd_work_prefix_enabled(cfg)
 
 
-def test_thd_work_prefix_accepts_packed_paged_d128():
+@pytest.mark.parametrize("pack_gqa", [0, 1])
+def test_thd_work_prefix_accepts_paged_d128(pack_gqa):
     from cudnn.sdpa.fwd.config_sm100 import CfgD128Decode, thd_work_prefix_enabled
 
-    cfg = CfgD128Decode(THD_VARLEN=1, PAGED_KV=1, PACK_GQA=1, SPLIT_KV=2, BOTTOM_RIGHT=1)
+    cfg = CfgD128Decode(THD_VARLEN=1, PAGED_KV=1, PACK_GQA=pack_gqa, SPLIT_KV=2, BOTTOM_RIGHT=1)
     assert thd_work_prefix_enabled(cfg)
 
 
