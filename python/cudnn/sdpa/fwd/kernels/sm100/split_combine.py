@@ -431,6 +431,8 @@ def _lean_accumulate(G, lse_base, lse_step, o_row_base, o_step, s_last, n_splits
         live = (lse_s > neg_inf) & (cutlass.Int32(s) < n_splits)
         e = cute.math.exp(lse_s - m_safe, fastmath=True)
         w = cutlass.Float32(arith.select(live.ir_value(), e.ir_value(), zero.ir_value()))
+        # A finite LSE can still underflow to zero weight; 0 * NaN is not zero.
+        live = w > zero
         v0 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[0]).ir_value(), zero.ir_value()))
         v1 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[1]).ir_value(), zero.ir_value()))
         v2 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[2]).ir_value(), zero.ir_value()))
