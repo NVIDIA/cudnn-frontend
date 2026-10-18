@@ -253,8 +253,12 @@ def write_thd_row_offsets(meta, n_batch: cutlass.Int32, gran: cutlass.Int32, cu0
 
 
 @cute.jit
-def write_thd_batch_remap(meta, n_batch: cutlass.Int32, tid: cutlass.Int32, nthreads: cutlass.Int32) -> None:
-    """Fill ``batch_remap`` with ``[0, B)`` sorted by descending Q length.
+def write_thd_batch_remap(meta, n_batch: cutlass.Int32, tid: cutlass.Int32, nthreads: cutlass.Int32, rank_by_kv: cutlass.Constexpr[bool] = False) -> None:
+    """Fill ``batch_remap`` with ``[0, B)`` sorted by descending work length.
+
+    Forward split callers rank by KV length: each query tile traverses KV,
+    and a short-query request can still carry a long-running partition.
+    Other callers retain Q-length ordering. Equal lengths keep batch order.
 
     Rank-by-counting rather than a sort network: each thread owns a batch and
     counts how many sequences outrank it, which is O(B^2) comparisons but fully
@@ -262,16 +266,22 @@ def write_thd_batch_remap(meta, n_batch: cutlass.Int32, tid: cutlass.Int32, nthr
     original index, so the permutation is stable and reproducible run to run.
 
     WHOLE-BLOCK (not elected).  Must be called AFTER :func:`write_thd_meta`
-    (it reads the ``cu_seqlens_q`` it wrote) with a barrier in between.
+    (it reads the Q prefixes or KV lengths it wrote) with a barrier in between.
     """
     cuq0 = n_batch
     remap0 = cutlass.Int32(3) * n_batch + cutlass.Int32(2)
     i = tid
     while i < n_batch:
-        len_i = cutlass.Int32(meta[cuq0 + i + cutlass.Int32(1)]) - cutlass.Int32(meta[cuq0 + i])
+        if cutlass.const_expr(rank_by_kv):
+            len_i = cutlass.Int32(meta[i])
+        else:
+            len_i = cutlass.Int32(meta[cuq0 + i + cutlass.Int32(1)]) - cutlass.Int32(meta[cuq0 + i])
         rank = cutlass.Int32(0)
         for j in cutlass.range(0, n_batch, 1, unroll=1):
-            len_j = cutlass.Int32(meta[cuq0 + j + cutlass.Int32(1)]) - cutlass.Int32(meta[cuq0 + j])
+            if cutlass.const_expr(rank_by_kv):
+                len_j = cutlass.Int32(meta[j])
+            else:
+                len_j = cutlass.Int32(meta[cuq0 + j + cutlass.Int32(1)]) - cutlass.Int32(meta[cuq0 + j])
             # Descending by length; ties resolved by the lower original index.
             outranks = (len_j > len_i) | ((len_j == len_i) & (j < i))
             rank = rank + cutlass.Int32(arith.select(outranks.ir_value(), cutlass.Int32(1).ir_value(), cutlass.Int32(0).ir_value()))
