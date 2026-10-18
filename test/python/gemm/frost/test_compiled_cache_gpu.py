@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -19,13 +20,22 @@ from gemm_test_utils import requires_sm100
 pytestmark = [pytest.mark.L0, requires_sm100]
 
 _CHILD = r"""
-import hashlib, json, sys, torch, cudnn
+import hashlib, json, os, sys, time, torch, cudnn
 from pathlib import Path
 from cudnn.frost import compiled_cache as cc
 M, N, K = 256, 512, 256
 torch.manual_seed(0)
 a = torch.randn(1, M, K, device="cuda", dtype=torch.bfloat16)
 b = torch.randn(1, N, K, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+barrier = os.getenv("CUDNN_TEST_CACHE_BARRIER")
+if barrier:
+    root = Path(barrier)
+    (root / (Path(sys.argv[1]).stem + '.ready')).touch()
+    deadline = time.monotonic() + 120
+    while not (root / 'release').exists():
+        if time.monotonic() > deadline:
+            raise TimeoutError('cache test barrier')
+        time.sleep(.01)
 handle = cudnn.create_handle()
 g = cudnn.pygraph(handle=handle, io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
 A, B = g.tensor_like(a), g.tensor_like(b)
@@ -36,6 +46,7 @@ g.select_plan(idx); g.check_support(); g.build_plans()
 c = torch.empty(1, M, N, device="cuda", dtype=torch.bfloat16)
 ws = torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
 g.execute({A: a, B: b, C: c}, ws, handle=handle); torch.cuda.synchronize()
+torch.testing.assert_close(c.float(), a.float() @ b.float(), rtol=.02, atol=.1)
 launch = g._compiled_plans[idx]._compiled._launchable
 Path(sys.argv[1]).write_text(json.dumps({"stats": cc.stats(), "digest": hashlib.sha256(c.view(torch.int16).cpu().numpy().tobytes()).hexdigest(), "reloaded": hasattr(launch, "_compiled_cache_entry"), "root": str(cc.get_cache_dir())}))
 # Exercise trailing diagnostics even with a backend build that produces no logs.
@@ -67,3 +78,38 @@ def test_second_process_reloads_the_exported_kernel(tmp_path):
     second = _run(tmp_path)
     assert second["stats"]["misses"] == 0 and second["stats"]["hits"] >= 1, second
     assert second["digest"] == first["digest"], "the reloaded kernel must compute exactly what the compiled one did"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX artifact locks")
+def test_concurrent_processes_share_one_frost_compilation(tmp_path):
+    env = dict(
+        os.environ, CUDNN_FRONTEND_ENABLE_FROST_ENGINES="1", CUDNN_FRONTEND_COMPILED_CACHE=str(tmp_path / "cache"), CUDNN_TEST_CACHE_BARRIER=str(tmp_path)
+    )
+    env.pop("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", None)
+    processes = []
+    try:
+        for rank in range(2):
+            processes.append(
+                subprocess.Popen(
+                    [sys.executable, "-c", _CHILD, str(tmp_path / f"rank{rank}.json")], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+                )
+            )
+        deadline = time.monotonic() + 120
+        while len(list(tmp_path.glob("*.ready"))) < 2:
+            assert all(p.poll() is None for p in processes), "a cache-test child exited before the barrier"
+            assert time.monotonic() < deadline, "cache-test children did not reach the barrier"
+            time.sleep(0.01)
+        (tmp_path / "release").touch()
+        for process in processes:
+            output, _ = process.communicate(timeout=600)
+            assert process.returncode == 0, output[-4000:]
+        results = [json.loads((tmp_path / f"rank{rank}.json").read_text()) for rank in range(2)]
+        assert sum(r["stats"]["misses"] for r in results) == 1, results
+        assert sum(r["stats"]["hits"] for r in results) == 1, results
+        assert all(r["reloaded"] for r in results)
+        assert results[0]["digest"] == results[1]["digest"]
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=10)

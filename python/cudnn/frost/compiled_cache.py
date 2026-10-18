@@ -82,6 +82,7 @@ import stat
 import tempfile
 import threading
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 
@@ -669,6 +670,54 @@ def _compile_persistent(fn: Callable, args: tuple, kwargs: Dict[str, Any], *, ca
     if loaded is not None:
         _count("hits")
         return loaded
+    with _entry_lock(root, entry):
+        # Another process may have published this exact artifact while we
+        # waited. Warm loads above need no lock, and different keys can compile
+        # concurrently. Keep the lock through export and reload.
+        loaded = _try_load(entry, cache_key, symbol)
+        if loaded is not None:
+            _count("hits")
+            return loaded
+        return _compile_and_export(fn, args, kwargs, root, entry, cache_key, symbol, manifest)
+
+
+@contextmanager
+def _entry_lock(root: Path, entry: Path):
+    """Best-effort process lock, released by the OS if the compiler dies.
+
+    Lock files live outside the prunable environment directories and are never
+    unlinked: replacing an inode while a waiter holds it would create two locks
+    for the same artifact. They contain no kernel data.
+    """
+    lock_file = None
+    try:
+        import fcntl
+
+        lock_dir = root / ".locks"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_file = (lock_dir / f"{entry.parent.name}-{entry.name}.lock").open("a+b")
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+    except (ImportError, OSError) as exc:
+        if lock_file is not None:
+            lock_file.close()
+            lock_file = None
+        # Persistence has always been optional; an unavailable lock must not
+        # prevent an otherwise valid compilation, or hide a compiler failure.
+        _LOG.warning("compiled-plan cache: cannot lock %s (%s); compiling without a process lock", entry, exc)
+    except BaseException:
+        if lock_file is not None:
+            lock_file.close()
+        raise
+    try:
+        yield
+    finally:
+        if lock_file is not None:
+            lock_file.close()
+
+
+def _compile_and_export(fn, args, kwargs, root, entry, cache_key, symbol, manifest):
+    import cutlass.cute as cute
+
     compiled = cute.compile(fn, *args, **kwargs)
     _count("misses")
     execution_args = getattr(compiled, "execution_args", None)

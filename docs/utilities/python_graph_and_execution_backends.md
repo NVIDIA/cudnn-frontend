@@ -926,6 +926,16 @@ artifact can never be reused by accident:
   yields a loadable entry without its key.
 - **Anything doubtful is a miss**: missing, malformed, mismatched, or an
   object `load_module` refuses (an arch the device cannot run). Never an error.
+- **Concurrent cold callers share a compilation on POSIX.** A cache miss takes
+  an advisory lock for its environment and artifact key, then checks the cache
+  again before compiling. Different keys can compile concurrently; cache hits
+  do not acquire the lock. The OS releases it when a compiler exits, including
+  after a crash. If locking is unavailable, compilation and best-effort export
+  continue without deduplication. Empty lock files live in `<root>/.locks/`,
+  outside the prunable environments, and are retained to keep one stable lock
+  inode per key while other processes may be waiting. Do not unlink them while
+  the cache is in use. Filesystems must support POSIX advisory locking to
+  deduplicate callers sharing that cache.
 - **A hit and a miss run the same thing.** A reloaded tvm-ffi function is
   positional-only, so it is wrapped with the kwargs wrapper the DSL itself
   uses, rebuilt from the RUNTIME spec the record carries (`arg_names`,
