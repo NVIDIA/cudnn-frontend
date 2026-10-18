@@ -3060,9 +3060,11 @@ def test_paged_mxfp8_probe_accepts_and_declines():
     assert reason is not None and "BSHD" in reason, reason
 
 
-def test_paged_mxfp8_mixed_pool_layouts_are_invalid():
-    facts = ga.analyze(_mk_paged_mxfp8(v_nhd=True))
-    assert facts is not None and facts.invalid is not None and "in-page layout" in facts.invalid, facts.invalid
+def test_paged_mxfp8_accepts_mixed_pool_layouts():
+    g = _mk_paged_mxfp8(v_nhd=True)
+    facts = _facts(g)
+    assert facts.is_mxfp8 and facts.has_paged_kv
+    assert MXFP8_ENGINE in _eligible(g)
 
 
 # ---------------------------------------------------------------------------

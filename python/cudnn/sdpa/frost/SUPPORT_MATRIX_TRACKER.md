@@ -69,6 +69,19 @@ head shapes. Its D128 flavor also prepares
 existing paged KV graphs and split plans with NHD or HND pools and separate K/V
 page tables. Page counts, table and pool strides bind at execution time; the
 compiled pool layout and page size stay fixed.
+
+Paged K and V may independently use HND or NHD physical storage on every
+existing paged forward row: SM100/SM103 half D64/D128/D192x128/D256/D512,
+per-tensor FP8 D64/D128, MXFP8 D128/D192x128/D256/D512; SM107 half THD
+D128/D256 and D256 decode, plus MXFP8 D128/D256. Each operand's declared
+layout is recorded separately in the plan and checked by its native binder.
+TMA descriptors retain the existing shared coordinate order with each pool's
+own strides; no additional kernel specialization is needed. Runtime pointers and legal
+strides still rebind without repacking, allocation, or recompilation.
+Existing architecture, mask, page-size, precision and split restrictions
+remain in force. The `independent_pool_layouts` cases in the paged SM100,
+SM107 decode and SM107 MXFP8 suites check numerical execution, including
+both mixed directions and singleton KV heads.
 K/V page tables on this prepared FP8 path bind independent Int64 batch/page
 strides, including distinct declared layouts and runtime stride overrides.
 Each table retains its own observed storage bound. Device scales rebind each call; requested
@@ -579,7 +592,7 @@ gaps-table row below). On the FP8 row the
 d128 and native d64 selections are wired (`d_qk, d_v <= 128`: d ≤ 64 selects the (64, 64) flavor, larger
 the d128 one — both exact in FP8); a d192×d128 or d256 FP8 selection is declined. The K and V pools may
 differ in row width (d192×d128: a 192-wide K pool and a 128-wide V pool behind
-separate block tables) and must share the in-page layout. The graph is cuDNN's own
+separate block tables) and independently choose the in-page HND/NHD layout. The graph is cuDNN's own
 paged-cache contract: K/V are page pools `[num_pages, H_kv, page_size, D]` — HND
 compact, or NHD (`[num_pages, page_size, H_kv, D]` storage) declared through the
 strides — plus `(B, 1, max_pages, 1)` int32 block tables and `use_padding_mask` with

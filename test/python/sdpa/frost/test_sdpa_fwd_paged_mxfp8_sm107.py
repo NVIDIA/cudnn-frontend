@@ -171,3 +171,9 @@ def test_masked_leading_tile_with_live_keys_behind_it(P, d, sink):
             d_v=d,
             attn_scale=1.0,
         )
+
+
+@pytest.mark.parametrize("hnd", [False, True])
+@pytest.mark.parametrize("dims", [(128, 128), (256, 256)])
+def test_paged_mxfp8_independent_pool_layouts(hnd, dims):
+    _run(3, 8, 2, 128, 3, [257, 0, 129], hnd, d_qk=dims[0], d_v=dims[1], stats=True, s_q=3, mixed_layout=True, separate_v=True)
