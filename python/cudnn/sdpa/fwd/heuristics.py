@@ -2547,7 +2547,7 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
         and facts.h_kv > 0
         and facts.h_q % facts.h_kv == 0
         and facts.h_q // facts.h_kv in ((1, 2, 4, 8, 16) if caps.sm_lo == 100 else (1, 2, 4, 8))
-        and facts.page_size == 16
+        and facts.page_size in ((16, 128) if caps.sm_lo == 100 else (16,))
         and facts.causal
         and facts.bottom_right
         and facts.window_left is None
