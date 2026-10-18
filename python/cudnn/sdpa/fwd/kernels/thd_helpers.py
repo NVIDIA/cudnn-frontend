@@ -268,6 +268,7 @@ def build_thd_meta_o_descs_kernel(
     # so no packed-total clamp exists (the descriptors are pool-shaped).
     clamp_kv: cutlass.Constexpr[bool] = True,
     splits: cutlass.Constexpr[int] = 1,
+    rank_by_kv: cutlass.Constexpr[bool] = False,
 ) -> None:
     """Per-execute f16/bf16 THD metadata, O descriptors, and scheduler bounds.
 
@@ -280,6 +281,10 @@ def build_thd_meta_o_descs_kernel(
     ``lens_form`` bit 0/1 chooses cumulative Q/KV inputs; cumulative prefixes
     are normalized by subtracting their first entry. This preserves sliced
     prefixes without host validation or device-to-host reads.
+
+    Split callers may rank by KV traversal length for bottom-right attention
+    without a sliding window. Top-left and windowed work retain Q ordering:
+    their actual traversal is not described by the full KV length.
     """
     tidx, _, _ = cute.arch.thread_idx()
     nthreads, _, _ = cute.arch.block_dim()
@@ -314,7 +319,7 @@ def build_thd_meta_o_descs_kernel(
                     emit_clamped_desc(base_v_desc, o_desc_words, n_batch + cutlass.Int32(2), t_kv, seq_ord=2)
             nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     cute.arch.barrier()
-    write_thd_batch_remap(cutlass.make_array_view(meta_t), n_batch, cutlass.Int32(tidx), cutlass.Int32(nthreads))
+    write_thd_batch_remap(cutlass.make_array_view(meta_t), n_batch, cutlass.Int32(tidx), cutlass.Int32(nthreads), rank_by_kv=rank_by_kv and splits > 1)
     # Live unit total + claim counter for the persistent scheduler. The host
     # cannot know Sigma_b ceil(s_b/tile)*QH without a D2H (issue #552), so the
     # kernel reads its own bound from here. The counter starts at n_clusters:
