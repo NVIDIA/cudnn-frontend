@@ -38,6 +38,11 @@ class IndexerForward(APIBase):
     stride stays ``S_k_padded`` and columns ``[S_k, S_k_padded)`` are never
     written. Q/K/W must have a unit innermost stride; other layouts are
     declined in ``check_support()`` (Rule 2 / R5) rather than copied.
+
+    ``clean_logits=False`` skips the ``-inf`` fill of ``out`` that otherwise
+    precedes every ``execute()`` launch, so ``execute()`` launches the score
+    kernel only; see :func:`indexer_forward_wrapper` for the resulting output
+    contract.
     """
 
     def __init__(
@@ -53,6 +58,8 @@ class IndexerForward(APIBase):
         q_stage: int = 2,
         kv_stage: int = 4,
         sm_scale: float = 1.0,
+        *,
+        clean_logits: bool = True,
     ):
         super().__init__()
 
@@ -68,6 +75,7 @@ class IndexerForward(APIBase):
         self.kv_stage = int(kv_stage)
         self.sm_scale = float(sm_scale)
         self.qhead_per_kv_head = qhead_per_kv_head
+        self.clean_logits = bool(clean_logits)
 
         self.batch_size = None
         self.s_q = None
@@ -205,6 +213,7 @@ class IndexerForward(APIBase):
             sm_scale=self.sm_scale,
             precision="bf16",
             current_stream=current_stream,
+            clean_logits=self.clean_logits,
         )
 
 
@@ -234,14 +243,17 @@ def indexer_forward_wrapper(
     sf_vec_size: int = 32,
     return_lse: bool = False,
     lse_out: Optional[torch.Tensor] = None,
+    *,
+    clean_logits: bool = True,
 ) -> TupleDict:
     """High-level wrapper. Allocates the output buffer with TMA padding on S_k.
 
     With ``precision='bf16'``, Q/K are BF16 and per-head W may be BF16 or FP32.
-    Returns ``{'scores': (B, S_q, S_k) FP32}``. The ratio causal mask marks
-    positions outside the valid KV range with -inf. ``q_causal_offsets`` may
-    specify the global uncompressed token index for each batch/THD segment's
-    local q[0].
+    Returns ``{'scores': (B, S_q, S_k) FP32}``. With the default
+    ``clean_logits=True``, the ratio causal mask marks positions outside the
+    valid KV range with -inf (see ``clean_logits`` below for the opt-out).
+    ``q_causal_offsets`` may specify the global uncompressed token index for
+    each batch/THD segment's local q[0].
 
     On SM100 the kernel writes a ``(B, S_q, ceil4(S_k))`` (THD:
     ``(total_q, ceil4(max_seqlen_k))``) padded buffer through its ``[..., :S_k]``
@@ -249,10 +261,23 @@ def indexer_forward_wrapper(
     ``scores`` is contiguous (one copy when ``S_k % 4 != 0``), and a
     caller-provided ``out`` of the logical shape is filled whatever its layout
     (a padded-stride view is bound directly; anything else is staged and copied
-    back, so the caller's tensor keeps its identity). Strided ``q``/``k``/``w``/
+    back, so the caller's tensor keeps its identity -- rejected with
+    ``ValueError`` under ``clean_logits=False``). Strided ``q``/``k``/``w``/
     scales are made contiguous here on the launch stream as a torch-op
     convenience (one copy kernel each). ``IndexerForward`` itself declines all
     of that in ``check_support()`` and binds only a padded-stride ``out``.
+
+    ``clean_logits=False`` skips the dense ``-inf`` prefill of ``scores``
+    (one full-tensor write per call). Only the ratio-causal valid region is
+    then written: for local query row ``q_local`` of batch/segment ``b``, the
+    columns ``k_local < clamp((q_causal_offsets[b] + q_local + 1) // ratio, 0, seqlen_k_b)``.
+    All other elements -- masked columns, THD columns beyond a segment's own
+    ``seqlen_k_b``, THD rows not covered by ``cu_seqlens_q`` -- are unspecified
+    (stale or uninitialized, possibly NaN). Use it only when every consumer
+    reads each row's causal prefix and nothing else, e.g. ``indexer_top_k``
+    with ``next_n=1`` and per-row ``seq_lens`` no larger than that limit. A
+    caller ``out`` that would be staged and copied back is rejected with
+    ``ValueError`` under ``clean_logits=False``.
     """
     if device_major() == 9:
         if cu_seqlens_q_scale_padded is not None or cu_seqlens_k_scale_padded is not None:
@@ -292,6 +317,7 @@ def indexer_forward_wrapper(
             return_lse=return_lse,
             lse_out=lse_out,
             current_stream=stream,
+            clean_logits=clean_logits,
         )
         if return_lse:
             scores, lse = result
@@ -329,6 +355,7 @@ def indexer_forward_wrapper(
         cu_seqlens_k_scale_padded=cu_seqlens_k_scale_padded,
         sf_vec_size=sf_vec_size,
         current_stream=stream,
+        clean_logits=clean_logits,
     )
     return TupleDict(scores=scores)
 

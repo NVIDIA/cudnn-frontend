@@ -167,6 +167,7 @@ def indexer_fwd(
     softmax_out: Optional[torch.Tensor] = None,
     deterministic: bool = False,
     current_stream=None,
+    clean_logits: bool = True,
 ):
     """
     Indexer QK forward pass using CuTe DSL kernel.
@@ -218,6 +219,23 @@ def indexer_fwd(
         sf_vec_size: scale vector size for MXFP8, currently must be 32.
         q_causal_offsets: optional int32 CUDA tensor of shape ``(batch,)``.
             Each entry is the global uncompressed token index for local q[0].
+        clean_logits: dense path only. ``True`` (default) fills the dense
+            output with ``-inf`` before the score kernel runs, so every masked
+            position reads ``-inf``. ``False`` skips that fill: the kernel
+            writes only the ratio-causal valid region, i.e. for local query
+            row ``q_local`` of batch/segment ``b`` the columns
+            ``k_local < clamp((q_causal_offsets[b] + q_local + 1) // ratio, 0, seqlen_k_b)``
+            (offsets default to 0). Every other element of the output -- columns
+            at or beyond that limit, THD columns beyond a segment's own
+            ``seqlen_k_b`` up to ``max_seqlen_k``, and THD rows not covered by
+            ``cu_seqlens_q`` -- is unspecified (stale or uninitialized memory,
+            possibly NaN). Use ``False`` only when every consumer reads each
+            row's causal prefix and nothing else, e.g. ``indexer_top_k`` with
+            ``next_n=1`` and per-row ``seq_lens`` no larger than that limit.
+            ``False`` is rejected with ``ValueError`` when a caller ``out``
+            is not bindable and would be staged and copied back, and with
+            ``is_compressed_logits=True`` (which has no dense output). Not
+            part of any compile key.
 
     Returns:
         S_sum: BSHD ``(bs, seqlen_q, seqlen_k)`` or THD
@@ -237,6 +255,8 @@ def indexer_fwd(
         raise ValueError(f"ratio must be > 0, got {ratio}")
 
     if is_compressed_logits:
+        if not clean_logits:
+            raise ValueError("clean_logits=False applies only to the dense score output; is_compressed_logits=True writes no dense scores")
         if topk <= 0 or topk > 2048:
             raise ValueError("is_compressed_logits=True requires topk in (0, 2048], " f"got {topk}")
         if out is not None:
@@ -336,7 +356,14 @@ def indexer_fwd(
             raise ValueError(f"out must have shape {out_shape}, got {tuple(out.shape)}")
         try:
             _validate_out_view(out, out_shape, seqlen_k_dim, q.device)
-        except ValueError:
+        except ValueError as exc:
+            if not clean_logits:
+                # Staging copies the whole padded buffer back into the caller's
+                # out: that copy costs as much as the -inf fill this flag exists
+                # to skip, and copying back only each row's causal prefix would
+                # need a ragged per-row copy. Reject instead of silently keeping
+                # the cost.
+                raise ValueError(f"clean_logits=False requires a caller out that is bound directly, not staged and copied back: {exc}") from exc
             out = None  # not bindable: staged through a padded buffer and copied back
     need_pad = padded_seqlen_k(seqlen_k_dim) != seqlen_k_dim
     if out is None:
@@ -367,6 +394,7 @@ def indexer_fwd(
         cu_seqlens_k_scale_padded=cu_seqlens_k_scale_padded,
         sf_vec_size=sf_vec_size,
         current_stream=current_stream,
+        clean_logits=clean_logits,
     )
     return _finish_dense_out(out, out_orig, need_pad=need_pad, current_stream=current_stream)
 
@@ -429,9 +457,13 @@ def _indexer_fwd_bound(
     cu_seqlens_k_scale_padded: Optional[torch.Tensor] = None,
     sf_vec_size: int = 32,
     current_stream=None,
+    clean_logits: bool = True,
 ) -> torch.Tensor:
     """Strict dense entry (what ``IndexerForward.execute`` calls): binds a validated padded-stride ``out``
-    directly; never allocates, never copies, raises on strided inputs or an unbindable ``out``."""
+    directly; never allocates, never copies, raises on strided inputs or an unbindable ``out``.
+
+    ``clean_logits=False`` skips the ``-inf`` fill of ``out``; only the ratio-causal valid region is written
+    and everything else is unspecified (see :func:`indexer_fwd`). Not part of any compile key."""
     current_stream = resolve_stream(current_stream)
     precision = precision.lower()
     if precision not in ("bf16", "mxfp8"):
@@ -634,8 +666,9 @@ def _indexer_fwd_bound(
                 options=compile_options(),
             )
 
-        with _torch_stream_context(current_stream):
-            out.fill_(float("-inf"))
+        if clean_logits:
+            with _torch_stream_context(current_stream):
+                out.fill_(float("-inf"))
         scale_arg = cutlass.Float32(sm_scale)
         max_q_arg = cutlass.Int32(seqlen_q_dim)
         max_k_arg = cutlass.Int32(seqlen_k_dim)
@@ -722,9 +755,12 @@ def _indexer_fwd_bound(
             options=compile_options(),
         )
 
-    # Init to -inf: skipped causal n-blocks and masked positions stay -inf
-    with _torch_stream_context(current_stream):
-        out.fill_(float("-inf"))
+    # Init to -inf: skipped causal n-blocks and masked positions stay -inf.
+    # clean_logits=False leaves them unspecified (the kernel writes only the
+    # ratio-causal valid region).
+    if clean_logits:
+        with _torch_stream_context(current_stream):
+            out.fill_(float("-inf"))
     scale_arg = cutlass.Float32(sm_scale)
     max_q_arg = cutlass.Int32(seqlen_q_dim)
     max_k_arg = cutlass.Int32(seqlen_k_dim)
