@@ -47,12 +47,15 @@ for length in (17, 128, 512):
     assert_rms_close('eager output', output, expected[0], FWD_TOL[dtype])
     assert_rms_close('eager state', state, expected[1], STATE_TOL[dtype])
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured_output, captured_state = op(*args, **kwargs)
-    captured_output.fill_(float('nan')); captured_state.fill_(float('nan'))
-    graph.replay(); torch.cuda.synchronize()
-    assert_rms_close('replay output', captured_output, expected[0], FWD_TOL[dtype])
-    assert_rms_close('replay state', captured_state, expected[1], STATE_TOL[dtype])
+    try:
+        with torch.cuda.graph(graph):
+            captured_output, captured_state = op(*args, **kwargs)
+        captured_output.fill_(float('nan')); captured_state.fill_(float('nan'))
+        graph.replay(); torch.cuda.synchronize()
+        assert_rms_close('replay output', captured_output, expected[0], FWD_TOL[dtype])
+        assert_rms_close('replay state', captured_state, expected[1], STATE_TOL[dtype])
+    finally:
+        graph.reset()
 Path(result_path).write_text(json.dumps({'stats': cc.stats(), 'compile_calls': calls, 'source': cudnn.__file__, 'case_seconds': time.perf_counter() - started}))
 """
 
