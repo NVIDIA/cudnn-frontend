@@ -477,7 +477,7 @@ def run_grouped_gemm_srelu_ref(
     :param generate_amax: Generate AMAX tensor
     :param generate_sfd: Generate SFD tensor
     :param norm_const_tensor: Normalization constant tensor (1,)
-    :param c_dtype: Intermediate C tensor dtype (always bfloat16)
+    :param c_dtype: Saved intermediate C dtype; the activation consumes this rounded value.
     :param d_dtype: Output D tensor dtype
     :param sf_vec_size: Scale factor vector size
     :param sf_dtype: Scale factor dtype
@@ -516,6 +516,9 @@ def run_grouped_gemm_srelu_ref(
             start = end
 
     ref_tensors["c_ref"] = ref.clone()
+
+    # The forward activation uses the same rounded pre-activation saved for backward.
+    ref = ref.to(c_dtype).to(torch.float32)
 
     # Step 3: Apply (optionally soft-clamped) squared-ReLU and probability gating elementwise
     if tanh_clamp_scale is not None:

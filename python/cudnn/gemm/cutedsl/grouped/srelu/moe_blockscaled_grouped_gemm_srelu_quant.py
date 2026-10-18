@@ -1986,6 +1986,11 @@ class BlockScaledMoEGroupedGemmQuantKernel:
                     acc_vec = tTR_rAcc.load()
 
                     if cutlass.const_expr(self.epilogue_type == EpilogueType.SRELU.value):
+                        if cutlass.const_expr(self.generate_c):
+                            # Backward and activation recomputation consume the saved C.
+                            # Evaluate the original activation from that same rounded value,
+                            # while retaining FP32 activation arithmetic and BF16 C storage.
+                            acc_vec = acc_vec.to(self.c_dtype).to(self.acc_dtype)
                         if cutlass.const_expr(self.tanh_clamp_scale is not None):
                             # Soft-clamped squared ReLU: out = (s * tanh(relu(x)/s))^2 * w,
                             # computed as t^2 * prob_scale where t = tanh(relu(x)/s), and
