@@ -150,10 +150,14 @@ class VariantPack:
 
     __slots__ = ("uids", "native", "_index_of", "workspace", "workspace_bytes", "_device", "graph_described", "overridden")
 
-    def __init__(self, uids, native, workspace_ptr: int = 0, workspace_bytes: int = 0, graph_described=(), overridden=()):
+    def __init__(self, uids, native, workspace_ptr: int = 0, workspace_bytes: int | None = 0, graph_described=(), overridden=()):
         self.uids = uids
         self.native = native
         self.workspace = workspace_ptr
+        # Capacity is optional, never encoded in a byte count: None means an
+        # unmeasured raw address; every integer (including zero) is a bound.
+        if workspace_bytes is not None and workspace_bytes < 0:
+            raise ValueError("workspace capacity must be nonnegative or None for an unknown raw-address capacity")
         self.workspace_bytes = workspace_bytes
         # Slots whose dim/stride were lent by the graph because the caller
         # passed a bare address. Usually empty. An engine that reads extents by

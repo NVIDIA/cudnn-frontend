@@ -213,7 +213,7 @@ def test_band_support_rejects_unknown_or_empty_axis_claims():
 
 def test_shipped_rows_express_both_a_full_and_a_restricted_claim():
     # The tree contains RESTRICTED rows next to the full ones -- the MXFP8
-    # backward (causal only, top-left only) and the SM89 forward (top-left
+    # backward (causal and unmasked, top-left only) and the SM89 forward (top-left
     # anchor only, no right-band widening) -- which is why "every built-in row
     # supports causal" cannot be read as "the causal axis can be deleted": a
     # claim narrower than the full set on at least one axis is declarable, and

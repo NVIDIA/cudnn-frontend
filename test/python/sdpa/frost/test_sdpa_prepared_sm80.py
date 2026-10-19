@@ -3,7 +3,6 @@
 """Native SM80 layouts, current bindings and the prepared execution contract."""
 
 from dataclasses import replace
-import math
 from types import SimpleNamespace
 
 import cudnn
@@ -16,10 +15,24 @@ pytestmark = [requires_dsl, pytest.mark.skipif(torch.cuda.get_device_capability(
 
 
 def _case(
-    dq=128, dv=128, *, dtype=torch.bfloat16, layout="bshd", stats=True, features=False, causal=False, scheduler=0, wide=None, product=False, wide_axis="batch"
+    dq=128,
+    dv=128,
+    *,
+    dtype=torch.bfloat16,
+    layout="bshd",
+    stats=True,
+    features=False,
+    causal=False,
+    scheduler=0,
+    wide=None,
+    product=False,
+    wide_axis="batch",
+    heads=(4, 2),
+    scale=None,
 ):
+    scale = dq**-0.5 if scale is None else scale
     torch.manual_seed(3217)
-    b, h, hk, sq, skv = (5 if product else 2), 4, 2, 33, 65
+    b, h, hk, sq, skv = (5 if product else 2), *heads, 33, 65
     if wide_axis == "row":
         b, sq, skv = 1, (3 if product else 2), (3 if product else 2)
     elif wide_axis == "tile":
@@ -82,7 +95,7 @@ def _case(
             else:
                 refs[name] = graph.tensor_like(buf, name=name)
     optional = dict(use_padding_mask=True, seq_len_q=refs["seq_q"], seq_len_kv=refs["seq_kv"], sink_token=refs["sink"], bias=refs["bias"]) if features else {}
-    o, lse = graph.sdpa(q=refs["q"], k=refs["k"], v=refs["v"], attn_scale=dq**-0.5, generate_stats=stats, use_causal_mask=causal, **optional)
+    o, lse = graph.sdpa(q=refs["q"], k=refs["k"], v=refs["v"], attn_scale=scale, generate_stats=stats, use_causal_mask=causal, **optional)
     o.set_output(True).set_dim(bufs["o"].shape).set_stride(bufs["o"].stride()).set_data_type(io)
     refs["o"] = o
     if stats:
@@ -99,12 +112,13 @@ def _case(
     graph.build_plans()
     workspace = torch.empty(graph.get_workspace_size(), dtype=torch.uint8, device="cuda")
     pack = {refs[name]: buf for name, buf in bufs.items()}
-    return SimpleNamespace(graph=graph, bufs=bufs, storage=storage, refs=refs, pack=pack, workspace=workspace, features=features, causal=causal)
+    return SimpleNamespace(graph=graph, bufs=bufs, storage=storage, refs=refs, pack=pack, workspace=workspace, features=features, causal=causal, scale=scale)
 
 
 def _check(case):
     q, k, v = (case.bufs[name].double() for name in ("q", "k", "v"))
-    scores = q @ k.repeat_interleave(2, 1).transpose(-1, -2) / math.sqrt(q.shape[-1])
+    group = q.shape[1] // k.shape[1]  # Q heads per KV head; the kernel reads K/V head h // group
+    scores = q @ k.repeat_interleave(group, 1).transpose(-1, -2) * case.scale
     sq, skv = q.shape[2], k.shape[2]
     if case.features:
         scores += case.bufs["bias"].double()
@@ -114,7 +128,7 @@ def _check(case):
     all_scores = torch.cat((scores, case.bufs["sink"].double()[None, :, None, None].expand(q.shape[0], -1, sq, 1)), -1) if case.features else scores
     stats = all_scores.logsumexp(-1)
     probs = torch.nan_to_num((scores - stats[..., None]).exp(), nan=0)
-    out = probs @ v.repeat_interleave(2, 1)
+    out = probs @ v.repeat_interleave(group, 1)
     if case.features:
         padded = torch.arange(sq, device="cuda")[None, :] >= case.bufs["seq_q"][:, None]
         out.masked_fill_(padded[:, None, :, None], 0)
@@ -149,6 +163,27 @@ def test_sm80_prepared_native_layouts(dq, dv, dtype, layout):
         _check(case)
         if layout == "gapped":
             assert torch.all(case.storage["o"][..., dv:] == 123)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dq,dv", [(64, 64), (128, 128), (192, 128), (256, 256)], ids=["d64", "d128", "d192_d128", "d256"])
+@pytest.mark.parametrize("heads", [(8, 4), (8, 2), (8, 1)], ids=["g2", "g4", "mqa"])
+def test_sm80_prepared_gqa_ratios(dq, dv, heads):
+    """Native dense GQA/MQA where the group size H_q // H_kv differs from H_kv.
+
+    Every other case here runs H_q=4, H_kv=2, where the two counts are equal, so
+    a kernel that uses one for the other (dividing the Q head by H_kv, or sizing
+    the LPT_L2 KV groups and row ranks with the wrong count) still reads the
+    right K/V head. 8:4 and 8:2 tell the counts apart; MQA folds every Q head
+    onto one KV head. Pinned to LPT_L2, the SM80 heuristic's causal choice and
+    the only decode that reads H_kv, on all four flavors, so the dedicated d256
+    kernel is covered as well as the generic one."""
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT_L2
+
+    case = _case(dq, dv, causal=True, scheduler=SCHED_LPT_L2, heads=heads)
+    assert case.graph._compiled_plans[case.graph._plan_index]._prepared is not None
+    case.graph.execute(case.pack, case.workspace)
+    _check(case)
 
 
 @pytest.mark.L0
@@ -336,4 +371,30 @@ def test_sm80_prepared_standalone_flat_operands():
         seq_kv_lens=case.bufs["seq_kv"],
         bias_tensor=bias,
     )
+    _check(case)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dq,dv", [(64, 64), (128, 128), (256, 256)])
+@pytest.mark.parametrize("scale", [0.0, -0.3])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("features", [False, True])
+def test_sm80_prepared_nonpositive_scale(dq, dv, scale, causal, features):
+    # A zero or negative scale under masks, bias and sinks: the kernel compiles its sign into the scores (#1435).
+    case = _case(dq, dv, causal=causal, features=features, scale=scale)
+    case.graph.execute(case.pack, case.workspace)
+    torch.cuda.synchronize()
+    _check(case)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dq,dv", [(64, 64), (128, 128), (256, 256)])
+@pytest.mark.parametrize("scale", [0.7, 1.0, 4.0])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("features", [False, True])
+def test_sm80_prepared_scale_above_ln2(dq, dv, scale, causal, features):
+    # scale * log2(e) > 1 overflows a fully masked tile row's -FLT_MAX fill to -inf.
+    case = _case(dq, dv, causal=causal, features=features, scale=scale)
+    case.graph.execute(case.pack, case.workspace)
+    torch.cuda.synchronize()
     _check(case)

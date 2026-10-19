@@ -10,7 +10,6 @@ BSHD/THD buffer management for indexer_forward.
 
 from __future__ import annotations
 
-from threading import Lock
 from typing import Optional
 
 import torch
@@ -35,6 +34,12 @@ from cudnn.deepseek_sparse_attention.utils.runtime import (
 )
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import (
     to_cute_tensor as _to_cute_tensor,
+)
+
+from ._support import (
+    check_q_covered_by_k as _check_q_covered_by_k,
+    resolve_m_block_size as _resolve_m_block_size,
+    validate_qhead_per_kv_head as _validate_indexer_qhead_per_kv_head,
 )
 
 
@@ -85,15 +90,7 @@ def _validate_thd_mxfp8_scale_contract(
             raise ValueError("q_scale/k_scale must be on the same device as q/k")
 
 
-def _validate_indexer_qhead_per_kv_head(qhead_per_kv_head: int, precision: str) -> None:
-    supported = (32, 64)
-    if qhead_per_kv_head not in supported:
-        raise ValueError(f"precision={precision!r} indexer requires " f"qhead_per_kv_head=32 or 64, got {qhead_per_kv_head}")
-
-
 _compile_cache: dict = {}
-_denom_placeholder_cache: dict = {}
-_denom_placeholder_cache_lock = Lock()
 
 # Stage-2 fuses softmax over the selected logits. It is returned by default
 # because the indexer backward KL-loss path consumes this probability tensor.
@@ -108,35 +105,6 @@ def _make_i64_cand_buffer_compile_tensor():
         stride=(1,),
         assumed_align=16,
     )
-
-
-def _get_fwd_unified_denom_placeholder(
-    shape: tuple[int, ...],
-    device: torch.device,
-) -> torch.Tensor:
-    """Return a shaped view backed by a stable power-of-two capacity bucket."""
-    if device.type == "cuda":
-        device_index = torch.cuda.current_device() if device.index is None else device.index
-        alloc_device = torch.device("cuda", device_index)
-    else:
-        device_index = device.index
-        alloc_device = device
-
-    numel = 1
-    for dim in shape:
-        numel *= int(dim)
-    capacity = 1 << (max(1, numel) - 1).bit_length()
-    key = (alloc_device.type, device_index, len(shape), capacity)
-
-    # Buckets are never replaced or evicted: CUDA graphs may retain the
-    # placeholder address captured during warmup. The lock prevents concurrent
-    # first-use allocations from racing to populate the same bucket.
-    with _denom_placeholder_cache_lock:
-        cached = _denom_placeholder_cache.get(key)
-        if cached is None:
-            cached = torch.empty((capacity,), dtype=torch.float32, device=alloc_device)
-            _denom_placeholder_cache[key] = cached
-    return cached[:numel].view(shape)
 
 
 def _compress_local_to_global_bshd_(idx: torch.Tensor, seqlen_k: int) -> torch.Tensor:
@@ -231,8 +199,7 @@ def compress_topk_cand_buffer_size(
     ``microbatch_rows > 0`` raises here too (microbatch + LSE is unsupported)."""
     from ..indexer_top_k.compress_top_k_sm100 import per_batch_floats
 
-    if seqlen_q > seqlen_k * ratio:
-        raise ValueError(f"seqlen_q ({seqlen_q}) must be <= seqlen_k * ratio ({seqlen_k * ratio})")
+    _check_q_covered_by_k(seqlen_q, seqlen_k, ratio)
     if q_causal_offsets is not None:
         if not q_causal_offsets.is_cuda or q_causal_offsets.dtype != torch.int32 or q_causal_offsets.ndim != 1 or q_causal_offsets.shape[0] != bs:
             raise ValueError(f"q_causal_offsets must be a 1D CUDA int32 tensor of shape ({bs},)")
@@ -471,19 +438,11 @@ def indexer_fwd_compress_topk(
     _validate_indexer_qhead_per_kv_head(qhead_per_kv_head, precision)
     if n_heads_kv != 1:
         raise ValueError("compress-logits top-k currently requires n_heads_kv=1 (MQA); " f"got n_heads_kv={n_heads_kv}. The stage-1 GEMM reads only KV head 0.")
-    if precision == "bf16" and m_block_size // qhead_per_kv_head > 2:
-        if m_block_size == 128:
-            m_block_size = qhead_per_kv_head * 2
-        else:
-            raise ValueError(
-                "SM100 compressed indexer forward supports at most 2 q tokens "
-                f"per tile; got m_block_size={m_block_size}, "
-                f"qhead_per_kv_head={qhead_per_kv_head}"
-            )
+    if precision == "bf16":
+        m_block_size = _resolve_m_block_size(m_block_size, qhead_per_kv_head, head_dim, compressed=True, path="SM100 compressed indexer forward")
     if m_block_size % qhead_per_kv_head != 0:
         raise ValueError(f"m_block_size ({m_block_size}) must be divisible by " f"qhead_per_kv_head ({qhead_per_kv_head})")
-    if seqlen_q > seqlen_k * ratio:
-        raise ValueError(f"seqlen_q ({seqlen_q}) must be <= seqlen_k * ratio ({seqlen_k * ratio})")
+    _check_q_covered_by_k(seqlen_q, seqlen_k, ratio)
     device = q.device
 
     # Per-batch causal offsets (q_causal_offsets, (bs,) int32; default None = 0 = top-left,
@@ -667,12 +626,9 @@ def indexer_fwd_compress_topk(
     head_dim_padded = (head_dim + 15) // 16 * 16
     unified_k_block_size = 64 if head_dim_padded % 64 == 0 else head_dim_padded
     unified_kv_stage = 4
-    if want_lse:
-        lse_buf = lse_out if lse_out is not None else torch.empty((bs, seqlen_q), dtype=torch.float32, device=device)
-        denom_tmp = lse_buf
-    else:
-        lse_buf = None
-        denom_tmp = _get_fwd_unified_denom_placeholder((bs, seqlen_q), device)
+    # Without LSE the denom slot is compiled out: None at compile and launch (R3).
+    lse_buf = (lse_out if lse_out is not None else torch.empty((bs, seqlen_q), dtype=torch.float32, device=device)) if want_lse else None
+    denom_tmp = lse_buf
 
     if precision == "mxfp8":
         sf_groups = _ceil_div(head_dim, sf_vec_size)
@@ -728,7 +684,7 @@ def indexer_fwd_compress_topk(
         k_cute = _to_cute_tensor(k)
         w_cute = _to_cute_tensor(w)
         cand_cute = _to_cute_tensor(cand_gemm, leading_dim=1 if cand_2d else 0)
-        denom_cute = _to_cute_tensor(denom_tmp)
+        denom_cute = _to_cute_tensor(denom_tmp) if denom_tmp is not None else None
         qco_cute = _to_cute_tensor(q_causal_offsets, leading_dim=0) if q_causal_offsets is not None else None
         cbo_cute = _to_cute_tensor(cand_batch_offsets, leading_dim=0) if cand_batch_offsets is not None else None
         current_stream = resolve_stream(None)
@@ -1014,7 +970,7 @@ def _run_compress_gemm_varlen(
         # offsets back merely to validate caller-owned scratch; the caller
         # guarantees that the buffer was sized for the supplied sequence data.
         cand = cand_buffer.view(-1)
-    denom_tmp = lse_out if want_lse else _get_fwd_unified_denom_placeholder((total_q,), device)
+    denom_tmp = lse_out if want_lse else None  # dead slot compiled out (R3)
 
     head_dim_padded = (head_dim + 15) // 16 * 16
     unified_k_block_size = 64 if head_dim_padded % 64 == 0 else head_dim_padded
@@ -1054,7 +1010,7 @@ def _run_compress_gemm_varlen(
             q_scale_cute = _to_cute_tensor(q_scale)
             k_scale_cute = _to_cute_tensor(k_scale)
             cand_cute = _make_i64_cand_buffer_compile_tensor()
-            denom_cute = _to_cute_tensor(denom_tmp)
+            denom_cute = _to_cute_tensor(denom_tmp) if denom_tmp is not None else None
             cu_q_cute = _to_cute_tensor(cu_seqlens_q, leading_dim=0)
             cu_k_cute = _to_cute_tensor(cu_seqlens_k, leading_dim=0)
             cu_q_scale_cute = _to_cute_tensor(cu_seqlens_q_scale_padded, leading_dim=0)
@@ -1143,7 +1099,7 @@ def _run_compress_gemm_varlen(
         k_cute = _to_cute_tensor(k)
         w_cute = _to_cute_tensor(w)
         cand_cute = _make_i64_cand_buffer_compile_tensor()
-        denom_cute = _to_cute_tensor(denom_tmp)
+        denom_cute = _to_cute_tensor(denom_tmp) if denom_tmp is not None else None
         cu_q_cute = _to_cute_tensor(cu_seqlens_q, leading_dim=0)
         cu_k_cute = _to_cute_tensor(cu_seqlens_k, leading_dim=0)
         offs_cute = _to_cute_tensor(offsets, leading_dim=0)
@@ -1355,15 +1311,8 @@ def _indexer_fwd_compress_topk_thd(
             sf_groups=_ceil_div(head_dim, sf_vec_size),
             device=device,
         )
-    if precision == "bf16" and m_block_size // qhead_per_kv_head > 2:
-        if m_block_size == 128:
-            m_block_size = qhead_per_kv_head * 2
-        else:
-            raise ValueError(
-                "SM100 compressed indexer forward supports at most 2 q tokens "
-                f"per tile; got m_block_size={m_block_size}, "
-                f"qhead_per_kv_head={qhead_per_kv_head}"
-            )
+    if precision == "bf16":
+        m_block_size = _resolve_m_block_size(m_block_size, qhead_per_kv_head, head_dim, compressed=True, path="SM100 compressed indexer forward")
     if m_block_size % qhead_per_kv_head != 0:
         raise ValueError(f"m_block_size ({m_block_size}) must be divisible by " f"qhead_per_kv_head ({qhead_per_kv_head})")
     cu_q32 = cu_seqlens_q.to(torch.int32)
@@ -1423,8 +1372,7 @@ def _indexer_fwd_compress_topk_thd(
     lse_buf = None
     if want_lse:
         lse_buf = lse_out if lse_out is not None else torch.empty((total_q,), dtype=torch.float32, device=device)
-    if max_seqlen_q > max_seqlen_k * ratio:
-        raise ValueError(f"max_seqlen_q ({max_seqlen_q}) must be <= max_seqlen_k*ratio " f"({max_seqlen_k * ratio})")
+    _check_q_covered_by_k(int(max_seqlen_q), int(max_seqlen_k), ratio, what_q="max_seqlen_q", what_k="max_seqlen_k")
     if cand_batch_offsets is not None:
         # Structural check (host metadata, no sync): must be the exact tensor the
         # helper produces — int64, contiguous, (bs+1,), on the input device — so

@@ -427,7 +427,8 @@ enum class MoeGroupedMatmulMode_t {
 
     NONE,
     GATHER,
-    SCATTER
+    SCATTER,
+    COMBINE  // Frontend-only weighted scatter-add; no native cuDNN descriptor mode.
 };
 
 NLOHMANN_JSON_SERIALIZE_ENUM(MoeGroupedMatmulMode_t,
@@ -436,6 +437,7 @@ NLOHMANN_JSON_SERIALIZE_ENUM(MoeGroupedMatmulMode_t,
                                  {MoeGroupedMatmulMode_t::NONE, "NONE"},
                                  {MoeGroupedMatmulMode_t::GATHER, "GATHER"},
                                  {MoeGroupedMatmulMode_t::SCATTER, "SCATTER"},
+                                 {MoeGroupedMatmulMode_t::COMBINE, "COMBINE"},
                              })
 
 enum class DescriptorType_t {
@@ -2536,6 +2538,8 @@ convert_to_cudnn_type(cudnn_frontend::MoeGroupedMatmulMode_t const mode, cudnnMo
         case MoeGroupedMatmulMode_t::SCATTER:
             cudnn_mode = CUDNN_MOE_GROUPED_MATMUL_MODE_SCATTER;
             return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case MoeGroupedMatmulMode_t::COMBINE:
+            return cudnnStatus_t::CUDNN_STATUS_NOT_SUPPORTED;
 #ifndef NO_DEFAULT_IN_SWITCH
         default:
             return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;

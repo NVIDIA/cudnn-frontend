@@ -242,6 +242,7 @@ from cudnn.sdpa.fwd.kernels._common_blackwell import (
     lpt_tile_coords,
     make_sdpa_helpers,
     o_epilogue_convert_store,
+    running_max_step_finite_sentinel,
 )
 
 # ----------------------------------------------------------------------------
@@ -270,6 +271,31 @@ else:
         f"prefill_sdpa_d512_f16 (SM107): DTYPE_QKV={CFG.DTYPE_QKV} not supported " f"(expected 2=BF16, 3=FP16, or 4=TF32; FP8/MXFP8 ship in a separate kernel)"
     )
 OUT_STORAGE_DTYPE = STORAGE_DTYPE
+
+# softmax_scale_prefolded (graph.sdpa attn_scale_prefolded=True -> TemplateParams.softmax_scale_prefolded): the caller
+# multiplied Q by attn_scale * log2(e), so the raw QK^T already sits in the log2 domain and the softmax traces no
+# per-score scale -- the running max is the RAW tile max and the shift is `reg_S - m` (an FADD2 for the FFMA2 of the
+# scaled chain; numerically neutral, the adapter pins scale_softmax_log2 to exactly 1.0 and the kernel ignores the
+# argument).  Everything downstream of the shift -- alpha, the register row-sum, the (ell, max) ship to sg1, the sink
+# fold, the LSE and STATS_LOG2 -- consumes the log2-domain max and is unchanged.  A fully-masked tile leaves the raw
+# max exactly at the finite mask sentinel (== NEG_INF_F32); a tile that is dead AHEAD of the row's first live key is
+# selected out of the running state by running_max_step_finite_sentinel on both chains (total_max kept at the
+# sentinel, alpha = 1, shift 0 -> P = 0 on every column), the first live tile then starts the online softmax, and a
+# row with no live key at all is overridden by the epilogue's _row_empty geometry select.  The sentinel is never
+# multiplied under the fold, so the scaled-sentinel overflow the select also guards the other chain against
+# (-FLT_MAX * scale_log2 -> -inf, P = NaN) cannot occur here.
+SCALE_PREFOLDED = int(PARAMS.softmax_scale_prefolded)
+if SCALE_PREFOLDED and IS_TF32:
+    raise ValueError(
+        "prefill_sdpa_d512_f16 (cc 10.7): softmax_scale_prefolded is wired for the BF16 / FP16 variants only (the TF32 variant applies the scale in-kernel)"
+    )
+# softmax_f16 (softmax_precision=HALF) is a quantized-kernel specialization: this body stores P in the input half
+# format straight off the f32 exponent, so it carries no f16x2 exponent arm and the fused shift + convert never traces.
+# The config backstop declines the knob for half inputs; the import-time check keeps a stale record from tracing the
+# default chain under the request (a silent no-op).
+if PARAMS.softmax_f16:
+    raise ValueError("prefill_sdpa_d512_f16 (cc 10.7): softmax_f16 is a quantized-kernel (FP8 / MXFP8) specialization (half inputs run the f32 exponent)")
+_FUSED_SHIFT_CVT = False
 
 
 # ----------------------------------------------------------------------------
@@ -862,7 +888,7 @@ def _kernel(
     #   MMA       (warp 4): sg-conditional BMM1 (sg0) OR BMM2 (sg1);
     #                       non-leader CTAs run quiet (sg0) or forwarder (sg1).
     #   TMA-LDG   (warp 5): sg-conditional Q+K (sg0) OR V (sg1).
-    #   TMA-STG   (warp 6): sg1 only — O + LSE.  sg0 spins scheduler only.
+    #   TMA-STG   (warp 6): sg1 only — O + LSE.  sg0 does not enter the scheduler loop.
     #   Scheduler (warp 7): try_cancel; both sgs.
     # ------------------------------------------------------------------
     if warp_idx >= cutlass.Int32(CFG.SOFTMAX_WG0_BASE) and warp_idx < cutlass.Int32(CFG.SOFTMAX_WG0_BASE + CFG.SOFTMAX_WG_WARPS):
@@ -1025,6 +1051,12 @@ _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 # kernel-local vars are passed as explicit args; constants come from
 # module-level (NEG_INF_F32, RESCALE_THRESHOLD_F32, P_*, SOFTMAX_*, etc.).
 # ============================================================================
+# Only the common dense CLC path has a single scheduler publisher.
+# THD/predecode retains local schedulers and broadcast credits.
+if not CFG.THD_VARLEN:
+    from cudnn.frost.tile_dsl.scheduler import read_tile_id_arrive_on_leader as read_tile_id_arrive
+
+
 @cute.jit
 def _sg0_softmax_kv_iter(
     apply_mask: cutlass.Constexpr[bool],
@@ -1110,34 +1142,35 @@ def _sg0_softmax_kv_iter(
             s_addr_base,
             num_elems=CFG.TILE_N,
         )
-    current_max = current_max_raw * scale_log2
+    # current_max_raw is the tile's RAW row max -- exactly NEG_INF_F32 (the finite mask sentinel) iff every column of this
+    # tile is masked; running_max_step_finite_sentinel keys its dead-tile select on it.
+    if cutlass.const_expr(SCALE_PREFOLDED):
+        # Raw-domain max: Q carries attn_scale * log2(e) (SCALE_PREFOLDED, module header).
+        current_max = current_max_raw
+    else:
+        current_max = current_max_raw * scale_log2
 
     # All-thread DSMEM arrive on sg0 leader's mb_s_acc_empty (P11) —
     # doubles as the tmem_load_fence cross-warp sync.
     bars.mb_s_acc_empty[cur_parity_S].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
-    # Online softmax (RESCALE_THRESHOLD skip).
-    old_total_max = total_max
-    is_first = total_max == NEG_INF_F32
-    update_cond = is_first | ((current_max - total_max) > RESCALE_THRESHOLD_F32)
-    total_max = cutlass.Float32(
-        arith.select(
-            update_cond.ir_value(),
-            current_max.ir_value(),
-            total_max.ir_value(),
-        )
+    # Online softmax with the RESCALE_THRESHOLD skip: the running max, alpha and the exp2 shift of this tile.  A tile that
+    # is fully masked AHEAD of the row's first live key is selected out of the state (total_max stays NEG_INF_F32, alpha = 1,
+    # shift 0 -> P = 0 on every column): the finite mask sentinel never becomes the running max (scaled by scale_log2 > 1
+    # it overflowed to -inf and the shift read -inf - (-inf) = NaN into P; below that and under the pre-folded scale every masked
+    # column published P = 1, mass that only alpha = 0 at the next live tile wiped -- a multiply by zero).  Folded out
+    # of the MASK_NONE build; a row with no live key at all still ends its loop at (NEG_INF_F32, 0) and is published by the
+    # epilogue's _row_empty select.
+    total_max, alpha, new_total_max = running_max_step_finite_sentinel(
+        current_max_raw, current_max, total_max, NEG_INF_F32, RESCALE_THRESHOLD_F32, masked=CFG.MASK_FLAGS != MASK_NONE
     )
-    exp_input = cutlass.Float32(
-        arith.select(
-            is_first.ir_value(),
-            NEG_INF_F32.ir_value(),
-            (old_total_max - total_max).ir_value(),
-        )
-    )
-    alpha = cute.math.exp2(exp_input, fastmath=True)
 
-    # reg_S = reg_S * scale_log2 - total_max; then exp2.
-    reg_S_scaled = reg_S_tile.vec * scale_log2 - total_max
+    # reg_S = reg_S * scale_log2 - new_total_max (pre-folded scale: reg_S - new_total_max); then exp2.  new_total_max is the
+    # running max, or 0 on a dead leading tile (every column of it then lands at exp2(sentinel) = +0).
+    if cutlass.const_expr(SCALE_PREFOLDED):
+        reg_S_scaled = reg_S_tile.vec - new_total_max
+    else:
+        reg_S_scaled = reg_S_tile.vec * scale_log2 - new_total_max
     reg_P_fp32 = cute.math.exp2(reg_S_scaled, fastmath=True)
     reg_P_half_vec = reg_P_fp32.to(P_STORAGE_DTYPE)
     reg_P_half = RegTile(reg_P_half_vec, size=CFG.TILE_N)
@@ -1883,15 +1916,13 @@ def _compute_warp_group(
                         # rank-3 [1, QH, head_stride].  Serving only the rank-3 arm
                         # transposes every LSE on the common path.
                         if cutlass.const_expr(len(lse_tensor.shape) == 2):
-                            lse_row = lse_arr[_cu_q_b + q_row_global, :]
-                            lse_row[head_idx] = lse
+                            lse_arr[_cu_q_b + q_row_global, head_idx] = lse
                         else:
                             if cutlass.const_expr(len(lse_tensor.shape) == 4):
                                 # rank-4 = per-batch padded Stats (B, QH, s_max, 1) in the declared strides, no ragged offsets
                                 lse_arr[batch_idx, head_idx, q_row_global, 0] = lse
                             else:
-                                lse_row = lse_arr[cutlass.Int32(0), head_idx, :]
-                                lse_row[_cu_q_b + q_row_global] = lse
+                                lse_arr[cutlass.Int32(0), head_idx, _cu_q_b + q_row_global] = lse
             else:
                 if cutlass.const_expr(lse_tensor is not None):
                     if q_row_global < seqlen_q:
@@ -2013,6 +2044,7 @@ def _mma_warp_group(
         b_dtype=STORAGE_DTYPE,
         n_dim=CFG.TILE_N,
         m_dim=CFG.TILE_M * CFG.CTA_MMA,
+        a_negate=int(PARAMS.negate_scores),
     )
     # BMM2 idesc — N per call = 256 (NOT TILE_O); 2 calls per BMM2.
     idesc_pv = prims.Tcgen05InstrDesc.build(
@@ -2569,10 +2601,8 @@ def _tmastg_warp_group(
 ):
     """sg1: persistent O-store + per-chunk mb_tma_o_empty drain.
 
-    sg0 TMASTG (port of C++ lines 1417-1428): idle — just spin scheduler so
-    persistent tile claims advance in lockstep with sg1.  Does NOT call
-    read_tile_id_arrive (per the READ_TILE_ARRIVERS = 25 derivation — sg0's
-    TMASTG slot is NOT in the arriver list).
+    sg0 has no store work and does not enter the scheduler loop. It is not
+    counted in READ_TILE_ARRIVERS, so it must not consume scheduler responses.
 
     sg1 TMASTG (port of C++ lines 1430-1467):
         Per tile:
@@ -2601,14 +2631,14 @@ def _tmastg_warp_group(
         n_batch,
         seq_kv_lens_tensor,
     )
-    is_valid_tile = cutlass.Int32(1)
+    # sg0 does not store O or contribute scheduler read credits. It must not
+    # observe the ring: the credited roles could reuse its slot twice before
+    # this idle warp consumes a response, losing the terminal phase.
+    is_valid_tile = cutlass.Int32(is_sg1)
     sched_state = PipelineState.start()
 
     while is_valid_tile > cutlass.Int32(0):
-        # sg0's TMA-STG slot is idle but spins the scheduler so persistent
-        # tile claims advance in lockstep with sg1.  sg0 does NOT call
-        # read_tile_id_arrive (per the READ_TILE_ARRIVERS=25 derivation —
-        # sg0's TMA-STG slot is intentionally NOT in the arriver list).
+        # Only sg1 consumes scheduler responses and returns their read credit.
         if is_sg1:
             read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
 
@@ -2719,7 +2749,7 @@ def _host(
     v_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
-    lse_ext: cutlass.Int32,
+    lse_ext: cutlass.Int64,
     scale_softmax_log2: cutlass.Float32,
     n_thd_units: cutlass.Int32,
     seq_q_lens_addr: cutlass.Int64,
@@ -2964,7 +2994,7 @@ def compile(  # noqa: A001
         i64_3,
         i64_3,
         i64_3,
-        i32,
+        cutlass.Int64(0),
         cutlass.Float32(0.0),
         i32,
         cutlass.Int64(0),

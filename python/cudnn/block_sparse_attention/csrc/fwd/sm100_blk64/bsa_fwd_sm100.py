@@ -219,6 +219,10 @@ class BlockSparseAttnForwardSm100Blk64:
             # For hdim 192,128, we can fit 3 stages if we use uneven_kv_smem
             kv_stage = 3
         self.kv_stage = kv_stage
+        # The half-precision epilogue aliases only the first two KV stages.
+        # Keep the first K pack in stage 2 so it can overlap the previous O.
+        # FP8 uses smaller KV stages, and split-KV writes FP32 partial outputs.
+        self.prefetch_next_query = self.is_persistent and not self.is_sage_fp8 and not self.is_split_kv
         # self.s_stage is defined in __init__ (always 2)
         assert self.s_stage >= self.q_stage
         # For hdim 192,128 1CTA, we don't have enough smem to store all 3 stages of KV:
@@ -1396,10 +1400,14 @@ class BlockSparseAttnForwardSm100Blk64:
         q_producer_phase = Int32(1)
         kv_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.kv_stage)
         load_epi_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1) if const_expr(pipeline_load_epi is not None) else None
+        has_previous_tile = False
+        kv_stage_offset = Int32(0)
         tiler_gQ = ((self.mma_tiler_qk[0] * self.q_stage), self.head_dim_padded)
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            if const_expr(self.prefetch_next_query):
+                kv_stage_offset = Int32(self.kv_stage - 1) - kv_producer_state.index
             if const_expr(self.is_sage_fp8):
                 mQ_cur = mQ[None, None, None, head_idx, None, batch_idx]
                 gQ_tma = cute.group_modes(mQ_cur, 0, 3)
@@ -1482,6 +1490,10 @@ class BlockSparseAttnForwardSm100Blk64:
                         load_Q_fn(src_idx=0, dst_idx=0, tma_bar_ptr=tma_bar_ptr)
                 q_producer_phase ^= 1
 
+                if const_expr(self.prefetch_next_query):
+                    # The logical barrier ring remains monotonic. Drain old
+                    # readers before changing its mapping to physical stages.
+                    pipeline_kv.producer_tail(kv_producer_state.clone())
                 kv_producer_state = self.load_K_group(
                     tma_atom_K,
                     gK_tma,
@@ -1492,7 +1504,21 @@ class BlockSparseAttnForwardSm100Blk64:
                     block_iter_count - 1,
                     kv_producer_state,
                     pipeline_kv,
+                    kv_stage_offset,
                 )
+
+            if const_expr(self.prefetch_next_query):
+                # K0 lives outside the output alias. Subsequent K/V loads may
+                # overwrite the exchange/O buffer, so retain its epilogue wait.
+                # Empty tiles consume this handshake too, without advancing KV.
+                if has_previous_tile:
+                    pipeline_load_epi.consumer_wait(load_epi_consumer_state)
+                    with cute.arch.elect_one():
+                        pipeline_load_epi.consumer_release(load_epi_consumer_state)
+                    load_epi_consumer_state.advance()
+                has_previous_tile = True
+
+            if process_tile:
                 # q_stage=1 intra-warp overlap
                 # Load order: Q, K[N-1], K[N-2], {V[N-1-i], K[N-3-i]}x(N-2), V[1], V[0]
                 block_loop_count = block_iter_count - 2
@@ -1508,6 +1534,7 @@ class BlockSparseAttnForwardSm100Blk64:
                     block_iter_count - 2,
                     kv_producer_state,
                     pipeline_kv,
+                    kv_stage_offset,
                 )
 
                 # Flat main loop: N-2 iterations, each loads V then K
@@ -1523,6 +1550,7 @@ class BlockSparseAttnForwardSm100Blk64:
                         block_iter_count - 1 - i,
                         kv_producer_state,
                         pipeline_kv,
+                        kv_stage_offset,
                     )
                     # K[N-3-i]: K for the next QK GEMM
                     kv_producer_state = self.load_K_group(
@@ -1535,21 +1563,31 @@ class BlockSparseAttnForwardSm100Blk64:
                         block_iter_count - 3 - i,
                         kv_producer_state,
                         pipeline_kv,
+                        kv_stage_offset,
                     )
 
                 # Epilogue: last 2 V loads
-                kv_producer_state = self.load_V_group(tma_atom_V, gV_tma, sV, sKV_ptr, sV_tma_layout, n_block, 1, kv_producer_state, pipeline_kv)
-                kv_producer_state = self.load_V_group(tma_atom_V, gV_tma, sV, sKV_ptr, sV_tma_layout, n_block, 0, kv_producer_state, pipeline_kv)
+                kv_producer_state = self.load_V_group(
+                    tma_atom_V, gV_tma, sV, sKV_ptr, sV_tma_layout, n_block, 1, kv_producer_state, pipeline_kv, kv_stage_offset
+                )
+                kv_producer_state = self.load_V_group(
+                    tma_atom_V, gV_tma, sV, sKV_ptr, sV_tma_layout, n_block, 0, kv_producer_state, pipeline_kv, kv_stage_offset
+                )
 
             tile_scheduler.prefetch_next_work()
             work_tile = tile_scheduler.consumer_advance()
-            if const_expr(pipeline_load_epi is not None):
+            if const_expr(pipeline_load_epi is not None and not self.prefetch_next_query):
                 pipeline_load_epi.consumer_wait(load_epi_consumer_state)
                 with cute.arch.elect_one():
                     pipeline_load_epi.consumer_release(load_epi_consumer_state)
                 load_epi_consumer_state.advance()
             # End of persistent scheduler loop
 
+        if const_expr(self.prefetch_next_query):
+            if has_previous_tile:
+                pipeline_load_epi.consumer_wait(load_epi_consumer_state)
+                with cute.arch.elect_one():
+                    pipeline_load_epi.consumer_release(load_epi_consumer_state)
         pipeline_kv.producer_tail(kv_producer_state)
         # This is equivalent to pipeline_q.producer_tail
         if const_expr(len(self.load_warp_ids) == 1) or warp_idx == self.load_warp_ids[0]:
@@ -1593,6 +1631,7 @@ class BlockSparseAttnForwardSm100Blk64:
 
         mma_q_consumer_phase = Int32(0)
         mma_kv_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.kv_stage)
+        kv_stage_offset = Int32(0)
         q_full_mbar = Int32(pipeline_q.sync_object_full.get_barrier(0).toint())
         spo_empty_mbar0 = Int32(pipeline_s_p_o.sync_object_empty.get_barrier(0).toint())
         spo_empty_mbar1 = Int32(pipeline_s_p_o.sync_object_empty.get_barrier(1).toint())
@@ -1605,6 +1644,9 @@ class BlockSparseAttnForwardSm100Blk64:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+
+            if const_expr(self.prefetch_next_query):
+                kv_stage_offset = Int32(self.kv_stage - 1) - mma_kv_consumer_state.index
 
             raw_block_count, split_offset = self.get_tile_block_count_and_offset(
                 mSplitOffsets,
@@ -1654,7 +1696,7 @@ class BlockSparseAttnForwardSm100Blk64:
                     mma_kv_consumer_state.phase,
                 )
                 bsa_fwd_helpers.tcgen05_fence_after_thread_sync()
-                Ki_index, Ki_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
+                Ki_index, Ki_phase = self.kv_smem_stage(mma_kv_consumer_state.index, kv_stage_offset), mma_kv_consumer_state.phase
                 sK_cur = sK[None, None, None, Ki_index]
                 if const_expr(self.uneven_kv_smem):
                     sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
@@ -1680,7 +1722,7 @@ class BlockSparseAttnForwardSm100Blk64:
                     mma_kv_consumer_state.phase,
                 )
                 bsa_fwd_helpers.tcgen05_fence_after_thread_sync()
-                Ki_index, Ki_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
+                Ki_index, Ki_phase = self.kv_smem_stage(mma_kv_consumer_state.index, kv_stage_offset), mma_kv_consumer_state.phase
                 sK_cur = sK[None, None, None, Ki_index]
                 if const_expr(self.uneven_kv_smem):
                     sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
@@ -1733,7 +1775,7 @@ class BlockSparseAttnForwardSm100Blk64:
                         )
                         bsa_fwd_helpers.tcgen05_fence_after_thread_sync()
                         mma_kv_release_state = mma_kv_consumer_state.clone()
-                        Vi_index, Vi_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
+                        Vi_index, Vi_phase = self.kv_smem_stage(mma_kv_consumer_state.index, kv_stage_offset), mma_kv_consumer_state.phase
                         tOrVi = tOrV[None, None, None, Vi_index]
                         sV_cur = sV[None, None, None, Vi_index]
                         if const_expr(self.uneven_kv_smem):
@@ -1756,7 +1798,7 @@ class BlockSparseAttnForwardSm100Blk64:
                             mma_kv_consumer_state.phase,
                         )
                         bsa_fwd_helpers.tcgen05_fence_after_thread_sync()
-                        Ki_index, Ki_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
+                        Ki_index, Ki_phase = self.kv_smem_stage(mma_kv_consumer_state.index, kv_stage_offset), mma_kv_consumer_state.phase
                         sK_cur = sK[None, None, None, Ki_index]
                         if const_expr(self.uneven_kv_smem):
                             sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
@@ -1797,7 +1839,7 @@ class BlockSparseAttnForwardSm100Blk64:
                         mma_kv_consumer_state.phase,
                     )
                     bsa_fwd_helpers.tcgen05_fence_after_thread_sync()
-                    Vi_index, Vi_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
+                    Vi_index, Vi_phase = self.kv_smem_stage(mma_kv_consumer_state.index, kv_stage_offset), mma_kv_consumer_state.phase
                     tOrVi = tOrV[None, None, None, Vi_index]
                     sV_cur = sV[None, None, None, Vi_index]
                     if const_expr(self.uneven_kv_smem):
@@ -2882,6 +2924,13 @@ class BlockSparseAttnForwardSm100Blk64:
             work_tile = tile_scheduler.consumer_advance()
 
     @cute.jit
+    def kv_smem_stage(self, stage: Int32, offset: Int32) -> Int32:
+        if const_expr(self.prefetch_next_query):
+            rotated = stage + offset
+            return rotated - self.kv_stage if rotated >= self.kv_stage else rotated
+        return stage
+
+    @cute.jit
     def load_K_group(
         self,
         tma_atom_K: cute.CopyAtom,
@@ -2893,8 +2942,9 @@ class BlockSparseAttnForwardSm100Blk64:
         kv_block_idx: Int32,
         producer_state: pipeline.PipelineState,
         pipeline_kv: pipeline.PipelineAsync,
+        stage_offset: Int32,
     ):
-        stage = producer_state.index
+        stage = self.kv_smem_stage(producer_state.index, stage_offset)
         logical_base = kv_block_idx * self.sparse_blocks_per_kv
         idx0 = n_block(logical_base + 0)
         idx1 = n_block(logical_base + 1)
@@ -2941,8 +2991,9 @@ class BlockSparseAttnForwardSm100Blk64:
         kv_block_idx: Int32,
         producer_state: pipeline.PipelineState,
         pipeline_kv: pipeline.PipelineAsync,
+        stage_offset: Int32,
     ):
-        stage = producer_state.index
+        stage = self.kv_smem_stage(producer_state.index, stage_offset)
         logical_base = kv_block_idx * self.sparse_blocks_per_kv
         idx0 = n_block(logical_base + 0)
         idx1 = n_block(logical_base + 1)

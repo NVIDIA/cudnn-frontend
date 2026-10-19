@@ -72,11 +72,14 @@ class Graph : public ICudnn, public INode {
     std::unordered_set<std::shared_ptr<Tensor_attributes>> deserialized_tensor_properties;
     std::unordered_map<uid_t, pass_by_values_t> deserialized_pass_by_value;
     std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>> deserialized_workspace_modifications;
+    AlignedOperands deserialized_aligned_operands;
 
     // Cached values computed during build/deserialize, used during execute to avoid repeated collection.
     // These are mutable because execute() is const but needs non-const access for pointer extraction.
     mutable std::unordered_map<uid_t, pass_by_values_t> cached_pass_by_value;
     mutable std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>> cached_workspace_modifications;
+    // uid -> byte alignment execute() enforces on the caller's pointer (SDPA operands, #1571).
+    mutable AlignedOperands cached_aligned_operands;
 
     // Host sources of the host-to-device copies among cached_workspace_modifications (operation 0, e.g.
     // ALiBi slopes), keyed by uid, in immutable shared storage. A CUDA graph that copies from them, whether
@@ -281,6 +284,14 @@ class Graph : public ICudnn, public INode {
         int64_t &) const override {
         for (auto [uid, value] : deserialized_workspace_modifications) {
             worskspace_modifications.emplace(uid, value);
+        }
+        return {error_code_t::OK, ""};
+    }
+
+    virtual error_t
+    collect_aligned_operands_node(AlignedOperands &aligned_operands) const override {
+        for (auto const &[uid, value] : deserialized_aligned_operands) {
+            aligned_operands[uid] = value;
         }
         return {error_code_t::OK, ""};
     }
@@ -603,9 +614,13 @@ class Graph : public ICudnn, public INode {
         // Detect SM version and instantiate the appropriate OSS engine
         int oss_device_ordinal = 0;
         experimental::detail::cuda_get_device(&oss_device_ordinal);
-        cudaDeviceProp oss_dev_prop;
-        experimental::detail::cuda_get_device_properties(&oss_dev_prop, oss_device_ordinal);
-        int oss_sm = oss_dev_prop.major * 10 + oss_dev_prop.minor;
+        int oss_major = 0;
+        int oss_minor = 0;
+        cudnn_frontend::detail::cuda_device_get_attribute(
+            &oss_major, cudaDevAttrComputeCapabilityMajor, oss_device_ordinal);
+        cudnn_frontend::detail::cuda_device_get_attribute(
+            &oss_minor, cudaDevAttrComputeCapabilityMinor, oss_device_ordinal);
+        int oss_sm = oss_major * 10 + oss_minor;
 
         std::shared_ptr<experimental::IOssNormEngine> engine;
         if (oss_sm >= 80) {
@@ -625,6 +640,53 @@ class Graph : public ICudnn, public INode {
     Graph() : INode(detail::Context{}) {
         static std::atomic<uint64_t> next_gid{1};
         gid = next_gid.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    using UidBindings = std::unordered_map<Tensor_attributes::uid_t, void *>;
+
+    // Legacy Slice (cuDNN < 9.22) binds its output to the source pointer plus an offset, as execute() does.
+    // Derived per call and never written back, so a reused caller map re-derives from its current source;
+    // a destination the caller binds itself wins.
+    UidBindings
+    derive_variant_pack_replacements_(UidBindings const &uid_to_device_ptrs) const {
+        UidBindings derived;
+        for (auto const &[from_uid, value] : variant_pack_replacements) {
+            auto const &[to_uid, start_offset] = value;
+            auto source                        = uid_to_device_ptrs.find(from_uid);
+            if (source != uid_to_device_ptrs.end() && uid_to_device_ptrs.count(to_uid) == 0) {
+                derived[to_uid] = static_cast<char *>(source->second) + start_offset;
+            }
+        }
+        return derived;
+    }
+
+    static void *const *
+    find_binding_(Tensor_attributes::uid_t uid, UidBindings const &uid_to_device_ptrs, UidBindings const &derived) {
+        auto search = uid_to_device_ptrs.find(uid);
+        if (search != uid_to_device_ptrs.end()) {
+            return &search->second;
+        }
+        search = derived.find(uid);
+        return search != derived.end() ? &search->second : nullptr;
+    }
+
+    // The CUDA-graph paths build their own variant pack, so they apply execute()'s pointer check here (#1571).
+    error_t
+    check_aligned_operand_pointers_(UidBindings const &uid_to_device_ptrs, UidBindings const &derived) const {
+        for (auto const &[uid, alignment_and_bytes] : cached_aligned_operands) {
+            int64_t const alignment = alignment_and_bytes.first;
+            void *const *binding    = find_binding_(uid, uid_to_device_ptrs, derived);
+            if (alignment <= 1 || binding == nullptr ||
+                cached_workspace_modifications.find(uid) != cached_workspace_modifications.end()) {
+                continue;
+            }
+            RETURN_CUDNN_FRONTEND_ERROR_IF(reinterpret_cast<uintptr_t>(*binding) % alignment != 0,
+                                           error_code_t::INVALID_VARIANT_PACK,
+                                           "Uid " + std::to_string(uid) +
+                                               ": device pointer is not aligned to the tensor's " +
+                                               std::to_string(alignment) + "-byte alignment.");
+        }
+        return {error_code_t::OK, ""};
     }
 
     error_t
@@ -656,6 +718,8 @@ class Graph : public ICudnn, public INode {
             error_code_t::GRAPH_NOT_SUPPORTED,
             "The selected engine is not backed by a cuDNN execution plan, so update_cuda_graph() cannot "
             "record it; capture execute() on a stream instead.");
+        UidBindings const derived_bindings = derive_variant_pack_replacements_(uid_to_device_ptrs);
+        CHECK_CUDNN_FRONTEND_ERROR(check_aligned_operand_pointers_(uid_to_device_ptrs, derived_bindings));
 
         size_t num_root_nodes;
         _CUDNN_CHECK_CUDA_ERROR(detail::cuda_graph_get_root_nodes(cudnn_cuda_graph, nullptr, &num_root_nodes));
@@ -742,11 +806,11 @@ class Graph : public ICudnn, public INode {
         uids.reserve(variant_pack_uids.size());
 
         for (auto const &uid : variant_pack_uids) {
-            auto search = uid_to_device_ptrs.find(uid);
-            RETURN_CUDNN_FRONTEND_ERROR_IF(search == uid_to_device_ptrs.end(),
+            void *const *binding = find_binding_(uid, uid_to_device_ptrs, derived_bindings);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(binding == nullptr,
                                            error_code_t::INVALID_VARIANT_PACK,
                                            "Uid " + std::to_string(uid) + " does not exist in variant pack.");
-            device_ptrs.push_back(search->second);
+            device_ptrs.push_back(*binding);
             uids.push_back(uid);
         }
 
@@ -812,6 +876,8 @@ class Graph : public ICudnn, public INode {
             error_code_t::GRAPH_NOT_SUPPORTED,
             "The selected engine is not backed by a cuDNN execution plan, so populate_cuda_graph() cannot "
             "record it; capture execute() on a stream instead.");
+        UidBindings const derived_bindings = derive_variant_pack_replacements_(uid_to_device_ptrs);
+        CHECK_CUDNN_FRONTEND_ERROR(check_aligned_operand_pointers_(uid_to_device_ptrs, derived_bindings));
 
         // Check if the cuda graph is empty
         size_t numNodes = 0;
@@ -904,11 +970,11 @@ class Graph : public ICudnn, public INode {
         std::vector<uid_t> uids;
         uids.reserve(variant_pack_uids.size());
         for (auto const &uid : variant_pack_uids) {
-            auto search = uid_to_device_ptrs.find(uid);
-            RETURN_CUDNN_FRONTEND_ERROR_IF(search == uid_to_device_ptrs.end(),
+            void *const *binding = find_binding_(uid, uid_to_device_ptrs, derived_bindings);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(binding == nullptr,
                                            error_code_t::INVALID_VARIANT_PACK,
                                            "Uid " + std::to_string(uid) + " does not exist in variant pack.");
-            device_ptrs.push_back(search->second);
+            device_ptrs.push_back(*binding);
             uids.push_back(uid);
         }
 
@@ -1039,6 +1105,7 @@ class Graph : public ICudnn, public INode {
             CHECK_CUDNN_FRONTEND_ERROR(
                 collect_tensors_in_workspace_subtree(cached_workspace_modifications, temp_offset));
         }
+        CHECK_CUDNN_FRONTEND_ERROR(collect_aligned_operands_subtree(cached_aligned_operands));
         refresh_host_copy_sources_();
 
         CUDNN_FE_LOG_BANNER("  4/4 LOWERING TO BACKEND OPERATION GRAPH  ");
@@ -1246,19 +1313,28 @@ class Graph : public ICudnn, public INode {
         const int maxIterCount = 100;
         const float threshold  = 0.95f;
 
-        auto plan_cmp = [](std::shared_ptr<ExecutionPlan> a, std::shared_ptr<ExecutionPlan> b) {
-            return a->getExecutionTime() < b->getExecutionTime();
+        auto plan_cmp = [this](int64_t a, int64_t b) {
+            return plans.execution_plans[a]->getExecutionTime() < plans.execution_plans[b]->getExecutionTime();
         };
-        std::multiset<std::shared_ptr<ExecutionPlan>, decltype(plan_cmp)> timed_plans(plan_cmp);
+        std::multiset<int64_t, decltype(plan_cmp)> timed_plan_indices(plan_cmp);
 
-        cudaEvent_t start, stop;
-        detail::cuda_event_create(&start);
-        detail::cuda_event_create(&stop);
-        detail::cuda_device_synchronize();
+        // Release events on both successful tuning and any CUDA/cuDNN error.
+        struct TimingEvents {
+            cudaEvent_t start = nullptr;
+            cudaEvent_t stop  = nullptr;
+            ~TimingEvents() {
+                if (start != nullptr) detail::cuda_event_destroy(start);
+                if (stop != nullptr) detail::cuda_event_destroy(stop);
+            }
+        } events;
+        _CUDNN_CHECK_CUDA_ERROR(detail::cuda_event_create(&events.start));
+        _CUDNN_CHECK_CUDA_ERROR(detail::cuda_event_create(&events.stop));
+        _CUDNN_CHECK_CUDA_ERROR(detail::cuda_device_synchronize());
 
         cudaStream_t stream = nullptr;
-        detail::get_stream(handle, &stream);
+        _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
 
+        std::string failure_details;
         uint64_t successful_plan_count = 0;
         for (int64_t i = 0; i < static_cast<int64_t>(plans.execution_plans.size()); i++) {
             if (plans.execution_plans[i] == nullptr) continue;
@@ -1267,25 +1343,29 @@ class Graph : public ICudnn, public INode {
             auto warmup_status = execute_plan_at_index(handle, tensor_uid_to_pointer_map, workspace, i);
             if (warmup_status.is_bad()) {
                 CUDNN_FE_LOG_LABEL_ENDL("WARN: Plan " << i << " failed warmup, skipping.");
+                failure_details += "\nPlan at index " + std::to_string(i) + ": " + warmup_status.get_message();
                 continue;
             }
-            successful_plan_count++;
-            detail::cuda_device_synchronize();
+            _CUDNN_CHECK_CUDA_ERROR(detail::cuda_device_synchronize());
 
+            bool measured = false;
+            std::string last_iteration_error;
             float min_time_ms = std::numeric_limits<float>::max();
             for (int iter = 0; iter < maxIterCount; iter++) {
-                detail::cuda_event_record(start, stream);
+                _CUDNN_CHECK_CUDA_ERROR(detail::cuda_event_record(events.start, stream));
                 auto iter_status = execute_plan_at_index(handle, tensor_uid_to_pointer_map, workspace, i);
-                detail::cuda_event_record(stop, stream);
-                detail::cuda_event_synchronize(stop);
+                _CUDNN_CHECK_CUDA_ERROR(detail::cuda_event_record(events.stop, stream));
+                _CUDNN_CHECK_CUDA_ERROR(detail::cuda_event_synchronize(events.stop));
 
                 if (iter_status.is_bad()) {
                     CUDNN_FE_LOG_LABEL_ENDL("WARN: Plan " << i << " failed at iter " << iter << ", skipping time.");
+                    last_iteration_error = iter_status.get_message();
                     continue;
                 }
 
                 float time_ms = 0.0f;
-                detail::cuda_event_elapsed_time(&time_ms, start, stop);
+                _CUDNN_CHECK_CUDA_ERROR(detail::cuda_event_elapsed_time(&time_ms, events.start, events.stop));
+                measured      = true;
                 float new_min = std::min(min_time_ms, time_ms);
                 if (time_ms / min_time_ms < threshold) {
                     min_time_ms = new_min;
@@ -1294,26 +1374,32 @@ class Graph : public ICudnn, public INode {
                 }
             }
 
+            if (!measured) {
+                failure_details +=
+                    "\nPlan at index " + std::to_string(i) + ": No successful timed execution. " + last_iteration_error;
+                continue;
+            }
+            successful_plan_count++;
             CUDNN_FE_LOG_LABEL_ENDL("Plan " << plans.execution_plans[i]->getTag() << " took " << std::setw(10)
                                             << min_time_ms);
             plans.execution_plans[i]->setExecutionTime(min_time_ms);
-            timed_plans.insert(plans.execution_plans[i]);
+            timed_plan_indices.insert(i);
         }
 
-        // Re-order plans by measured time, winner at index 0
-        plans.execution_plans.clear();
-        for (auto sorted_plan : timed_plans) {
-            plans.execution_plans.push_back(sorted_plan);
-        }
+        CUDNN_FE_LOG_LABEL_ENDL("Autotuned " << successful_plan_count << " plans.");
+        // Publish a winner only after a successful measurement. A failed tune
+        // must leave the original plan list and selection available for retry.
+        RETURN_CUDNN_FRONTEND_ERROR_IF(timed_plan_indices.empty(),
+                                       error_code_t::GRAPH_EXECUTION_FAILED,
+                                       "No execution plans were successfully timed." + failure_details);
+
+        // Re-order plans and their metadata by measured time, winner at index 0.
+        plans.reorder_plans(std::vector<int64_t>(timed_plan_indices.begin(), timed_plan_indices.end()));
         plans.candidate = 0;
 
         // Re-prepare OSS slot indices to match the new plan ordering
         apply_oss_slot_indices_to_plans();
 
-        detail::cuda_event_destroy(start);
-        detail::cuda_event_destroy(stop);
-
-        CUDNN_FE_LOG_LABEL_ENDL("Autotuned " << successful_plan_count << " plans.");
         return {error_code_t::OK, ""};
     }
 
@@ -1447,6 +1533,29 @@ class Graph : public ICudnn, public INode {
 
         CHECK_CUDNN_FRONTEND_ERROR(plans.is_plan_index_executable(plan_index));
 
+        // Every mapping/ordered/raw-pointer entry reaches here. Reject a missing
+        // required workspace before patching workspace-relative addresses or
+        // launching auxiliary kernels. A zero-workspace plan may still use null.
+        if (workspace == nullptr) {
+            int64_t required_workspace = 0;
+#if (CUDNN_VERSION >= 92300)
+            if (!override_uids.empty() && detail::get_backend_version() >= 92300) {
+                CHECK_CUDNN_FRONTEND_ERROR(get_workspace_size_plan_at_index(
+                    handle, plan_index, required_workspace, override_uids, override_shapes, override_strides));
+            } else
+#endif
+            {
+                // Older headers/backends expose only the declared workspace.
+                // Preserve their existing override availability while checking
+                // the scratch requirement that this plan can report.
+                CHECK_CUDNN_FRONTEND_ERROR(get_workspace_size_plan_at_index(plan_index, required_workspace));
+            }
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                required_workspace > 0,
+                error_code_t::INVALID_VARIANT_PACK,
+                "Plan requires a " + std::to_string(required_workspace) + "-byte workspace but received null.");
+        }
+
         // Validate n_user matches expected user slot count
         RETURN_CUDNN_FRONTEND_ERROR_IF(n_user != static_cast<int>(varpack_template.user_slots.size()),
                                        error_code_t::INVALID_VARIANT_PACK,
@@ -1455,6 +1564,21 @@ class Graph : public ICudnn, public INode {
                                            std::to_string(varpack_template.user_slots.size()) + ").");
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             n_user > 0 && sorted_user_ptrs == nullptr, error_code_t::INVALID_VARIANT_PACK, "sorted_user_ptrs is null.");
+        for (size_t k = 0; k < override_uids.size() && k < override_shapes.size() && k < override_strides.size(); k++) {
+            auto it = cached_aligned_operands.find(override_uids[k]);
+            if (it == cached_aligned_operands.end()) {
+                continue;
+            }
+            auto const &[alignment, element_bytes] = it->second;
+            auto const &stride                     = override_strides[k];
+            auto const i = misaligned_stride_dimension(override_shapes[k], stride, element_bytes, alignment);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                i >= 0,
+                error_code_t::INVALID_VARIANT_PACK,
+                "Uid " + std::to_string(override_uids[k]) + ": override stride " + std::to_string(stride[i]) +
+                    " of dimension " + std::to_string(i) + " is " + std::to_string(stride[i] * element_bytes) +
+                    " bytes, not a multiple of the tensor's " + std::to_string(alignment) + "-byte alignment.");
+        }
 
         // Thread-safe: copy template to local stack, then patch.
         const int N             = (int)varpack_template.all_uids.size();
@@ -1485,6 +1609,14 @@ class Graph : public ICudnn, public INode {
             ptrs[dst_slot] = static_cast<char *>(ptrs[src_info.first]) + src_info.second;
         }
 
+        for (auto const &[slot, alignment] : varpack_template.aligned_slots) {
+            RETURN_CUDNN_FRONTEND_ERROR_IF(reinterpret_cast<uintptr_t>(ptrs[slot]) % alignment != 0,
+                                           error_code_t::INVALID_VARIANT_PACK,
+                                           "Uid " + std::to_string(varpack_template.all_uids[slot]) +
+                                               ": device pointer is not aligned to the tensor's " +
+                                               std::to_string(alignment) + "-byte alignment.");
+        }
+
         // 4. Run auxiliary kernels (e.g. SDPA reduction accumulator init)
         CHECK_CUDNN_FRONTEND_ERROR(run_auxiliary_kernels(handle, workspace, cached_workspace_modifications));
 
@@ -1492,7 +1624,7 @@ class Graph : public ICudnn, public INode {
         CHECK_CUDNN_FRONTEND_ERROR(log_tensors_to_dump_(handle, varpack_template.all_uids, ptrs));
 
         // 5. Dispatch
-        void *engine_workspace = static_cast<char *>(workspace) + fe_workspace_size;
+        void *engine_workspace = workspace == nullptr ? nullptr : static_cast<char *>(workspace) + fe_workspace_size;
 
         if (plan_index == graph::Execution_plan_list::OSS_RMS_NORM_SILU_ENGINE_CANDIDATE) {
             cudaStream_t stream = nullptr;
@@ -1505,14 +1637,28 @@ class Graph : public ICudnn, public INode {
         }
 
         // Backend path
+        std::vector<int64_t> const *backend_uids = &varpack_template.all_uids;
+        void *backend_stack_ptrs[STACK_MAX];
+        std::vector<void *> backend_heap_ptrs;
+        if (!varpack_template.backend_slots.empty()) {
+            int const n_backend = (int)varpack_template.backend_slots.size();
+            void **backend_ptrs = n_backend <= STACK_MAX
+                                      ? backend_stack_ptrs
+                                      : (backend_heap_ptrs.resize(n_backend), backend_heap_ptrs.data());
+            for (int i = 0; i < n_backend; i++) {
+                backend_ptrs[i] = ptrs[varpack_template.backend_slots[i]];
+            }
+            ptrs         = backend_ptrs;
+            backend_uids = &varpack_template.backend_uids;
+        }
         if (override_uids.empty()) {
             CHECK_CUDNN_FRONTEND_ERROR(detail::execute(
-                handle, plans.execution_plans[plan_index].get(), ptrs, varpack_template.all_uids, engine_workspace));
+                handle, plans.execution_plans[plan_index].get(), ptrs, *backend_uids, engine_workspace));
         } else {
             CHECK_CUDNN_FRONTEND_ERROR(detail::execute(handle,
                                                        plans.execution_plans[plan_index].get(),
                                                        ptrs,
-                                                       varpack_template.all_uids,
+                                                       *backend_uids,
                                                        engine_workspace,
                                                        override_uids,
                                                        override_shapes,
@@ -1698,6 +1844,18 @@ class Graph : public ICudnn, public INode {
         }
         j["workspace_modifications"] = workspace_modifications_json;
 
+        AlignedOperands aligned_operands;
+        if (sub_nodes.empty()) {
+            aligned_operands = cached_aligned_operands;
+        } else {
+            CHECK_CUDNN_FRONTEND_ERROR(collect_aligned_operands_subtree(aligned_operands));
+        }
+        json aligned_operands_json = json::object();
+        for (auto const &[uid, value] : aligned_operands) {
+            aligned_operands_json[std::to_string(uid)] = json::array({value.first, value.second});
+        }
+        j["aligned_operands"] = aligned_operands_json;
+
         j["variant_pack_replacements"] = variant_pack_replacements;
 
         j["fe_workspace_size"] = fe_workspace_size;
@@ -1816,6 +1974,7 @@ class Graph : public ICudnn, public INode {
         deserialized_tensor_properties.clear();
         deserialized_pass_by_value.clear();
         deserialized_workspace_modifications.clear();
+        deserialized_aligned_operands.clear();
         tensors_to_dump.clear();
 
         auto const has_graph_structure = j.contains("nodes") || j.contains("tensors");
@@ -1871,6 +2030,15 @@ class Graph : public ICudnn, public INode {
             }
         }
 
+        // Absent in graphs serialized before #1571: no pointer alignment check for them.
+        if (j.contains("aligned_operands")) {
+            auto const &aligned_operands_json = j["aligned_operands"];
+            for (auto it = aligned_operands_json.begin(); it != aligned_operands_json.end(); ++it) {
+                deserialized_aligned_operands[std::stoll(it.key())] = {it.value().at(0).get<int64_t>(),
+                                                                       it.value().at(1).get<int64_t>()};
+            }
+        }
+
         variant_pack_replacements = j["variant_pack_replacements"];
 
         fe_workspace_size = j["fe_workspace_size"];
@@ -1878,6 +2046,7 @@ class Graph : public ICudnn, public INode {
         // Initialize the execution caches from deserialized data
         cached_pass_by_value           = deserialized_pass_by_value;
         cached_workspace_modifications = deserialized_workspace_modifications;
+        cached_aligned_operands        = deserialized_aligned_operands;
         refresh_host_copy_sources_();
 
         // Reset prep state in case this Graph is being re-deserialized; otherwise the
@@ -2252,6 +2421,11 @@ class Graph : public ICudnn, public INode {
         std::vector<std::pair<int, int64_t>> workspace_slots;  // (slot, byte_offset)
         std::vector<std::pair<int, std::pair<int, int64_t>>>
             replacement_slots;  // (dst_slot, (src_slot, offset)) — only used by Slice nodes
+        std::vector<std::pair<int, int64_t>> aligned_slots;  // (slot, byte alignment), user and replacement slots
+        // Slots and uids handed to the backend, when a legacy Slice source the backend graph does not consume must be
+        // left out (the backend rejects an unknown uid). Empty when every slot goes to the backend.
+        std::vector<int> backend_slots;
+        std::vector<int64_t> backend_uids;
     };
 
     VariantPackTemplate varpack_template;
@@ -2359,6 +2533,15 @@ class Graph : public ICudnn, public INode {
             }
         }
 
+        // A legacy Slice destination is checked too: its pointer is the source pointer plus the slice offset.
+        for (int slot = 0; slot < (int)t.all_uids.size(); slot++) {
+            auto it = cached_aligned_operands.find(t.all_uids[slot]);
+            if (it != cached_aligned_operands.end() && it->second.first > 1 && t.template_ptrs[slot] == nullptr &&
+                workspace_uids.find(t.all_uids[slot]) == workspace_uids.end()) {
+                t.aligned_slots.emplace_back(slot, it->second.first);
+            }
+        }
+
         // 6. Pre-compute workspace slot indices
         for (auto const &[uid, data] : cached_workspace_modifications) {
             const auto &[operation_type, offset, vec_data] = data;
@@ -2379,6 +2562,18 @@ class Graph : public ICudnn, public INode {
             if (it_src != uid_to_slot.end() && it_dst != uid_to_slot.end()) {
                 t.replacement_slots.emplace_back(it_dst->second, std::make_pair(it_src->second, byte_offset));
             }
+        }
+
+        for (int slot = 0; slot < (int)t.all_uids.size(); slot++) {
+            int64_t uid = t.all_uids[slot];
+            if (variant_pack_replacements.count(uid) == 0 || variant_pack_uids.count(uid) != 0) {
+                t.backend_slots.push_back(slot);
+                t.backend_uids.push_back(uid);
+            }
+        }
+        if (t.backend_slots.size() == t.all_uids.size()) {
+            t.backend_slots.clear();
+            t.backend_uids.clear();
         }
 
         varpack_template = std::move(t);
@@ -2988,8 +3183,10 @@ Graph::build_plans(BuildPlanPolicy_t const policy, bool const do_multithreaded_b
 #endif
 
     // Build OSS RmsNorm+SiLU engine if it passed check_support
+    std::string oss_build_failure;
     if (plans.has_oss_rms_norm_silu_engine()) {
-        auto oss_status = plans.build_oss_rms_norm_silu_engine();
+        bool const oss_selected = plans.is_oss_rms_norm_silu_candidate();
+        auto oss_status         = plans.build_oss_rms_norm_silu_engine();
         if (oss_status.is_good()) {
             CUDNN_FE_LOG_LABEL_ENDL("INFO: OSS RmsNorm+SiLU engine built successfully (NVRTC compilation done)");
             if (policy == BuildPlanPolicy_t::HEURISTICS_CHOICE) {
@@ -2998,10 +3195,17 @@ Graph::build_plans(BuildPlanPolicy_t const policy, bool const do_multithreaded_b
             }
         } else {
             CUDNN_FE_LOG_LABEL_ENDL("WARN: OSS RmsNorm+SiLU engine build failed: " << oss_status.get_message());
+            if (oss_selected) {
+                oss_build_failure = oss_status.get_message();
+            }
         }
     }
 
-    CHECK_CUDNN_FRONTEND_ERROR(plans.build_plans(policy, do_multithreaded_builds));
+    auto plans_status = plans.build_plans(policy, do_multithreaded_builds);
+    RETURN_CUDNN_FRONTEND_ERROR_IF(plans_status.is_bad() && !oss_build_failure.empty(),
+                                   plans_status.get_code(),
+                                   plans_status.get_message() + "\nOSS RmsNorm+SiLU engine: " + oss_build_failure);
+    CHECK_CUDNN_FRONTEND_ERROR(plans_status);
 
     // Prepare the variant pack template for fast execution.
     // This pre-computes slot indices so execute() can skip map operations.
@@ -3254,9 +3458,14 @@ Graph::layernorm(std::shared_ptr<Tensor_attributes> x,
             output_tensor(attributes.name + "::INV_VARIANCE");
     }
     // Set inputs
-    attributes.inputs[Layernorm_attributes::input_names::X]     = x;
-    attributes.inputs[Layernorm_attributes::input_names::SCALE] = scale;
-    attributes.inputs[Layernorm_attributes::input_names::BIAS]  = bias;
+    attributes.inputs[Layernorm_attributes::input_names::X] = x;
+    // scale and bias are optional (#188); keep nullptr out of the inputs map
+    if (scale) {
+        attributes.inputs[Layernorm_attributes::input_names::SCALE] = scale;
+    }
+    if (bias) {
+        attributes.inputs[Layernorm_attributes::input_names::BIAS] = bias;
+    }
 
     sub_nodes.emplace_back(std::make_unique<LayerNormNode>(std::move(attributes), context));
 
@@ -3281,7 +3490,10 @@ Graph::adalayernorm(std::shared_ptr<Tensor_attributes> x,
     // Set inputs
     attributes.inputs[AdaLayernorm_attributes::input_names::X]     = x;
     attributes.inputs[AdaLayernorm_attributes::input_names::SCALE] = scale;
-    attributes.inputs[AdaLayernorm_attributes::input_names::BIAS]  = bias;
+    // bias is optional (#188); keep nullptr out of the inputs map
+    if (bias) {
+        attributes.inputs[AdaLayernorm_attributes::input_names::BIAS] = bias;
+    }
 
     sub_nodes.emplace_back(std::make_unique<AdaLayerNormNode>(std::move(attributes), context));
 
@@ -3422,15 +3634,22 @@ Graph::layernorm_backward(std::shared_ptr<Tensor_attributes> dy,
     // Set outputs
     auto DX = attributes.outputs[Layernorm_backward_attributes::output_names::DX] =
         output_tensor(attributes.name + "::DX");
-    auto DSCALE = attributes.outputs[Layernorm_backward_attributes::output_names::DSCALE] =
-        output_tensor(attributes.name + "::DSCALE");
-    auto DBIAS = attributes.outputs[Layernorm_backward_attributes::output_names::DBIAS] =
-        output_tensor(attributes.name + "::DBIAS");
+    // scale is optional (#188); without one there is no DSCALE or DBIAS
+    std::shared_ptr<Tensor_attributes> DSCALE = nullptr;
+    std::shared_ptr<Tensor_attributes> DBIAS  = nullptr;
+    if (scale) {
+        DSCALE = attributes.outputs[Layernorm_backward_attributes::output_names::DSCALE] =
+            output_tensor(attributes.name + "::DSCALE");
+        DBIAS = attributes.outputs[Layernorm_backward_attributes::output_names::DBIAS] =
+            output_tensor(attributes.name + "::DBIAS");
+    }
 
     // Set inputs
-    attributes.inputs[Layernorm_backward_attributes::input_names::DY]    = dy;
-    attributes.inputs[Layernorm_backward_attributes::input_names::X]     = x;
-    attributes.inputs[Layernorm_backward_attributes::input_names::SCALE] = scale;
+    attributes.inputs[Layernorm_backward_attributes::input_names::DY] = dy;
+    attributes.inputs[Layernorm_backward_attributes::input_names::X]  = x;
+    if (scale) {
+        attributes.inputs[Layernorm_backward_attributes::input_names::SCALE] = scale;
+    }
 
     sub_nodes.emplace_back(std::make_unique<DLNNode>(std::move(attributes), context));
 
@@ -3573,8 +3792,11 @@ Graph::rmsnorm(std::shared_ptr<Tensor_attributes> x,
             output_tensor(attributes.name + "::INV_VARIANCE");
     }
     // Set inputs
-    attributes.inputs[Rmsnorm_attributes::input_names::X]     = x;
-    attributes.inputs[Rmsnorm_attributes::input_names::SCALE] = scale;
+    attributes.inputs[Rmsnorm_attributes::input_names::X] = x;
+    // scale is optional (the backend accepts a null SCALE_DESC, #188); keep nullptr out of the inputs map
+    if (scale) {
+        attributes.inputs[Rmsnorm_attributes::input_names::SCALE] = scale;
+    }
 
     sub_nodes.emplace_back(std::make_unique<RMSNormNode>(std::move(attributes), context));
 
@@ -3626,18 +3848,24 @@ Graph::rmsnorm_backward(std::shared_ptr<Tensor_attributes> dy,
     // Set outputs
     auto DX = attributes.outputs[Rmsnorm_backward_attributes::output_names::DX] =
         output_tensor(attributes.name + "::DX");
-    auto DScale = attributes.outputs[Rmsnorm_backward_attributes::output_names::DSCALE] =
-        output_tensor(attributes.name + "::Dscale");
-    std::shared_ptr<Tensor_attributes> DBias = nullptr;
-    if (attributes.use_dbias.value_or(true)) {
-        DBias = attributes.outputs[Rmsnorm_backward_attributes::output_names::DBIAS] =
-            output_tensor(attributes.name + "::Dbias");
+    // scale is optional (#188); without one there is no DSCALE or DBIAS
+    std::shared_ptr<Tensor_attributes> DScale = nullptr;
+    std::shared_ptr<Tensor_attributes> DBias  = nullptr;
+    if (scale) {
+        DScale = attributes.outputs[Rmsnorm_backward_attributes::output_names::DSCALE] =
+            output_tensor(attributes.name + "::Dscale");
+        if (attributes.use_dbias.value_or(true)) {
+            DBias = attributes.outputs[Rmsnorm_backward_attributes::output_names::DBIAS] =
+                output_tensor(attributes.name + "::Dbias");
+        }
     }
 
     // Set inputs
-    attributes.inputs[Rmsnorm_backward_attributes::input_names::DY]           = dy;
-    attributes.inputs[Rmsnorm_backward_attributes::input_names::X]            = x;
-    attributes.inputs[Rmsnorm_backward_attributes::input_names::SCALE]        = scale;
+    attributes.inputs[Rmsnorm_backward_attributes::input_names::DY] = dy;
+    attributes.inputs[Rmsnorm_backward_attributes::input_names::X]  = x;
+    if (scale) {
+        attributes.inputs[Rmsnorm_backward_attributes::input_names::SCALE] = scale;
+    }
     attributes.inputs[Rmsnorm_backward_attributes::input_names::INV_VARIANCE] = inv_variance;
 
     sub_nodes.emplace_back(std::make_unique<DRMSNormNode>(std::move(attributes), context));

@@ -19,6 +19,7 @@ from gemm.cutedsl.test_grouped_gemm_dsrelu_utils import (
     with_grouped_gemm_dsrelu_params_fp8,
     allocate_grouped_gemm_dsrelu_tensors,
     allocate_grouped_gemm_input_tensors,
+    assert_close_quantized,
     check_ref_grouped_gemm_dsrelu,
     grouped_gemm_dsrelu_init,
 )
@@ -952,6 +953,18 @@ def test_grouped_gemm_dsrelu_deterministic_dbias_zero_tokens(request):
     assert outputs["dbias_tensor"].dtype == torch.bfloat16
     assert torch.count_nonzero(outputs["dbias_tensor"]).item() == 0
     assert outputs["dprob_tensor"].shape[1:] == (1, 1)
+
+
+@pytest.mark.L0
+def test_assert_close_quantized_accepts_only_midpoint_ties():
+    """A one-ulp disagreement passes only where the unrounded value sits on the midpoint between the two codes."""
+    expected = torch.tensor([112.0, 112.0, 40.0])
+    unrounded = torch.tensor([107.99999, 110.0, 40.0])
+    assert_close_quantized(torch.tensor([104.0, 112.0, 40.0]), expected, unrounded, atol=1e-1, rtol=1e-2)
+    with pytest.raises(AssertionError):
+        assert_close_quantized(torch.tensor([112.0, 104.0, 40.0]), expected, unrounded, atol=1e-1, rtol=1e-2)
+    with pytest.raises(AssertionError):
+        assert_close_quantized(torch.tensor([104.0, 112.0, 40.0]), expected, None, atol=1e-1, rtol=1e-2)
 
 
 @pytest.mark.L1

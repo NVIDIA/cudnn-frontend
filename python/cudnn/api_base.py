@@ -70,6 +70,43 @@ def is_power_of_2(n: int) -> bool:
     return n > 0 and (n & (n - 1)) == 0
 
 
+def tensor_byte_span(t) -> Tuple[int, int]:
+    """The half-open byte range ``[lo, hi)`` the elements of a framework tensor occupy: its base address (``data_ptr()``, the storage
+    offset included) plus the smallest and the largest element offset its shape and strides reach (a negative stride counted on the low
+    side, a zero stride on neither), the last element's bytes included; an empty tensor spans nothing (``lo == hi``).  Host arithmetic on
+    the metadata alone -- no device read, no synchronisation -- so it belongs on an execute path (Rule 1 / Rule 3)."""
+    base = int(t.data_ptr())
+    if t.numel() == 0:
+        return base, base
+    item = int(t.element_size())
+    lo = hi = 0
+    for size, stride in zip(t.shape, t.stride()):
+        if size > 1:
+            reach = (int(size) - 1) * int(stride)
+            if reach < 0:
+                lo += reach
+            else:
+                hi += reach
+    return base + lo * item, base + (hi + 1) * item
+
+
+def check_buffers_disjoint(writers, readers, *, what: str = "the kernels") -> None:
+    """Rule 1's aliasing check of an execute path: every buffer in ``writers`` (``(name, tensor)`` pairs; a ``None`` tensor is skipped) must
+    be disjoint, as a BYTE RANGE, from every buffer in ``readers`` and from the other writers.  Pointer equality is not that test: a caller's
+    view that starts inside an input (two views over one allocation) has a distinct ``data_ptr()``, and the kernel overwrites rows it has
+    still to read (measured on the triangle multiplicative update at N = 512: 16.7 M differing elements, max |diff| 2.56).  Inputs may
+    overlap each other (read-only).  A typed ``ValueError`` naming the two operands and their ranges, before any launch."""
+    spans = [(name, tensor_byte_span(t)) for name, t in writers if t is not None]
+    read = [(name, tensor_byte_span(t)) for name, t in readers if t is not None]
+    for i, (w_name, (w_lo, w_hi)) in enumerate(spans):
+        for r_name, (r_lo, r_hi) in read + spans[i + 1 :]:
+            if w_lo < r_hi and r_lo < w_hi:
+                raise ValueError(
+                    f"{w_name} must not alias {r_name}: their byte ranges intersect ({w_name} [{w_lo:#x}, {w_hi:#x}), {r_name} [{r_lo:#x}, {r_hi:#x})) "
+                    f"and {what} write {w_name} while {r_name} is still read or written; pass buffers that do not overlap"
+                )
+
+
 def is_sm107_device() -> bool:
     """Return True when the current CUDA device is Rubin (SM107)."""
     return cuda_is_available() and get_compute_capability() == (10, 7)
@@ -1139,3 +1176,76 @@ class TupleDict(dict):
                 raise IndexError(f"index {key} out of range for TupleDict with {len(self._keys)} items")
             return super().__getitem__(self._keys[key])
         return super().__getitem__(key)
+
+
+# Workspace-carve chunk alignment. The contract minimum is 16 bytes; 128 is
+# used so the per-sequence O TMA descriptors carved for the THD path satisfy
+# the cuTensorMap GMEM alignment (64 B) with margin. torch storage bases are
+# 512 B aligned, so 128 B-multiple offsets stay 128 B aligned absolutely.
+_WS_ALIGN = 128
+
+
+def ws_align(nbytes: int) -> int:
+    """Round a scratch-chunk size up to the carve alignment (128 B)."""
+    return -(-int(nbytes) // _WS_ALIGN) * _WS_ALIGN
+
+
+class WorkspaceCarver:
+    """Carves fixed-size, aligned scratch views out of the CALLER's workspace (R2).
+
+    An APIBase adapter that records a non-zero workspace requirement
+    (``scratch_workspace_bytes()`` / ``get_workspace_size()``) is handed the
+    caller's buffer at execute and carves its per-execute scratch from it
+    instead of allocating. Chunks are dealt sequentially at 128-byte relative
+    alignment and never reach beyond the buffer; an absent, non-torch, or
+    undersized buffer raises immediately with the required size in the message
+    (never silent corruption). Constructing the carver without taking a chunk
+    is the validation step for a backend graph that consumes the workspace
+    whole (``pygraph.execute(variant_pack, workspace)``). ``align`` is the base
+    alignment the consumer needs: 16 bytes by default; a path that carves TMA
+    descriptors out of the buffer asks for ``_WS_ALIGN`` (cuTensorMap wants 64).
+    """
+
+    def __init__(self, workspace, required: int, owner: str, *, align: int = 16):
+        if workspace is None:
+            raise ValueError(
+                f"cudnn: {owner} requires a {required}-byte workspace but execute() "
+                f"received none; allocate graph.get_workspace_size() bytes (uint8, on the "
+                f"graph's device) and pass the buffer to execute()"
+            )
+        if not (hasattr(workspace, "numel") and hasattr(workspace, "element_size") and hasattr(workspace, "view")):
+            raise TypeError(f"cudnn: {owner} carves its scratch out of the caller's workspace and needs a torch.Tensor; got {type(workspace).__name__}")
+        torch = _torch()
+        if not workspace.is_contiguous():
+            # reshape(-1) would copy a strided view: a hidden allocation carved into instead of the caller's buffer.
+            raise ValueError(f"cudnn: {owner} workspace must be contiguous; got shape {tuple(workspace.shape)} strides {tuple(workspace.stride())}")
+        flat = workspace if workspace.dtype == torch.uint8 else workspace.view(torch.uint8)
+        if flat.dim() != 1:
+            flat = flat.view(-1)
+        if flat.numel() < required:
+            raise ValueError(
+                f"cudnn: {owner} requires a {required}-byte workspace; the provided "
+                f"buffer has only {flat.numel()} bytes (size it with graph.get_workspace_size())"
+            )
+        if flat.data_ptr() % align != 0:
+            raise ValueError(f"cudnn: {owner} workspace must be at least {align}-byte aligned; got data_ptr=0x{flat.data_ptr():x}")
+        self._flat = flat
+        self._off = 0
+        self._owner = owner
+
+    def take(self, numel: int, dtype) -> Any:
+        """The next scratch chunk: a 1-D ``numel``-element view of ``dtype``."""
+        nbytes = int(numel) * dtype.itemsize
+        start, end = self._off, self._off + nbytes
+        if end > self._flat.numel():
+            raise ValueError(f"cudnn: {self._owner} workspace overrun: chunk [{start}, {end}) exceeds the {self._flat.numel()}-byte buffer (sizing bug)")
+        self._off = start + ws_align(nbytes)
+        chunk = self._flat if start == 0 and end == self._flat.numel() else self._flat[start:end]
+        try:
+            return chunk.view(dtype)
+        except RuntimeError as exc:
+            raise ValueError(f"cudnn: {self._owner} workspace is not sufficiently aligned for {dtype} scratch: {exc}") from None
+
+    def remaining(self) -> Any:
+        """The unconsumed tail (uint8) — handed down to a nested carver."""
+        return self._flat[self._off :]

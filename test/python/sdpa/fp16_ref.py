@@ -4,6 +4,7 @@
 import torch
 import math
 import cudnn
+from itertools import product
 
 # fmt: off
 
@@ -97,8 +98,33 @@ def _grouped(x, h_kv):
 # than torch.einsum. Same fp32 math, but einsum lowers "bhgqd,bhkd->bhgqk" to one bmm with the
 # GQA group folded into M (M = g*s_q up to ~10^5, N = the 128-wide KV block); on aarch64 VR200
 # (SM107) that cublasSgemmStridedBatched shape crashes or hangs under multi-process GPU
-# sharing (xdist -n 8), while the matmul form keeps the group as a batch dimension and does
-# not. See /home/scratch.vagarwalla_gpu/sm107_cublas_concurrency_repro.
+# sharing. Keeping the group as a batch dimension reduced those failures, but varied-shape
+# runs with four processes per GPU still fault in cublasGemmStridedBatchedEx on SM107,
+# including the large-K dK/dV reductions. Use ordinary GEMMs there for every contraction;
+# splitting only output rows would leave those reductions on the failing batched path.
+
+
+def _mm_unbatched(a, b):
+    """Matrix products with broadcast batches, without a strided-batched GEMM.
+
+    Each dot product keeps its full reduction axis. In particular, do not fold
+    GQA groups into that reduction: _kv_reduce sums the group results afterward.
+    """
+    if a.ndim < 2 or b.ndim < 2 or a.shape[-1] != b.shape[-2] or 0 in a.shape or 0 in b.shape:
+        return torch.matmul(a, b)
+    if a.shape[-1] == 1:
+        return a * b
+    batch = torch.broadcast_shapes(a.shape[:-2], b.shape[:-2])
+    a = a.expand(*batch, *a.shape[-2:])
+    b = b.expand(*batch, *b.shape[-2:])
+    shape = (*batch, a.shape[-2], b.shape[-1])
+    indices = product(*(range(n) for n in batch))
+    if torch.is_grad_enabled() and (a.requires_grad or b.requires_grad):
+        return torch.stack([torch.mm(a[index], b[index]) for index in indices]).reshape(shape)
+    out = a.new_empty(shape)
+    for index in indices:
+        torch.mm(a[index], b[index], out=out[index])
+    return out
 
 
 def _mm(a, b):
@@ -108,6 +134,8 @@ def _mm(a, b):
     # sm_107a target (PTXASError / process abort on Rubin). The product is exact either way.
     if a.shape[-1] == 1:
         return a * b
+    if a.is_cuda and torch.cuda.get_device_capability(a.device) == (10, 7):
+        return _mm_unbatched(a, b)
     return torch.matmul(a, b)
 
 

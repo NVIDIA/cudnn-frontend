@@ -6,6 +6,7 @@ import inspect
 from typing import Type
 
 import cutlass
+from cutlass.base_dsl.typing import Pointer
 from cutlass.cute.arch.nvvm_wrappers import inline_ptx
 from cutlass.experimental import primitives as nvvm
 import cutlass.cute as cute
@@ -553,6 +554,18 @@ def vec_scale_pair(vec, scalar, N):
     return cutlass.Vector(vector.shape_cast(flat_ty, result), dtype=cutlass.Float32)
 
 
+def vec_select_zero(pred, vec, N):
+    """``select(pred, 0, vec)`` on a ``vector<N x f32>``: EXACT +0.0 in every element where the thread's ``pred`` (one i1) holds,
+    ``vec`` unchanged elsewhere -- one ``arith.select`` over the whole vector (a SEL per element in the SASS, no FMUL).
+
+    The substitute for folding a zero into a scale (``vec * 0``): the multiply keeps a NaN / Inf operand (``NaN * 0 = NaN``), and an
+    accumulator can hold exactly that residue (a stage that ran zero iterations, a sub-tile whose body was skipped), so an epilogue
+    that must store zeros SELECTS them after the arithmetic (sdpa-invariants s 2)."""
+    flat_ty = _ir.VectorType.get([N], T_.f32())
+    zeros = vector.broadcast(flat_ty, cutlass.Float32(0.0).ir_value())
+    return cutlass.Vector(arith.select(pred.ir_value(), zeros, vec.ir_value()), dtype=cutlass.Float32)
+
+
 @cutlass.cute.jit
 def f16x2_to_f32(word, *, dtype=cutlass.Float16):
     """Unpack one Int32 (= 2 packed halves) into ``(lo_f32, hi_f32)`` Float32.
@@ -665,13 +678,14 @@ def exp2_emul_pair(x_lo, x_hi):
     row.  On SM100 the MUFU pipe (4 lanes/clk/SMSP) is then the longest single pipe of the
     softmax warps while the FP32 pipe has slack, so evaluating a compile-time subset of the
     columns here (6 packed FP32/INT instructions per PAIR instead of one MUFU per element)
-    shortens the burst.  The cuDNN backend kernel splits its exps the same way.  Three sm100
+    shortens the burst.  The cuDNN backend kernel splits its exps the same way.  Four sm100
     prefill kernels consume it, each behind the per-(kind, flavor) cc 10.0 gate of
     ``api_dsl._exp2_fma_split_for`` -- MEASURED vs develop, B200, A/B/A x3, CUPTI medians: the
     d128 MXFP8 kernel (``sm100/prefill_d128_mxfp8.py``, ``_E2E_*``) +7.83 % at B=1 H=24/8 S=16K
     dense (2.217 -> 2.056 ms, together with its Amax_O fold), the d128 per-tensor FP8 kernel
     +4.48 % at S=8K (llama layer, H=64/8), the d192x128 bf16 kernel +1.89 % at S=8K (DSv3 layer,
-    H=128/128).
+    H=128/128), and the d128 bf16 / fp16 kernel on its dense-band builds only (``_E2E_DENSE_BAND``:
+    +4..5 % dense on top of its spinning ring waits, a loss on the causal builds, llama layer).
 
     What it computes (bit for bit the backend's split, all ops ``.ftz``):
 
@@ -781,7 +795,7 @@ def sigmoid_f16x2(logit_pair: cutlass.Int32, input_dtype: cutlass.Constexpr):
     return sigmoid2(logit_vec_f32[0], logit_vec_f32[1])
 
 
-L2_NORM_EPS = 1.0e-12
+L2_NORM_EPS = 1.0e-6
 
 
 @cute.jit
@@ -797,10 +811,8 @@ def lane_group_sum(value: cutlass.Float32, lanes: cutlass.Constexpr[int]) -> cut
 
 @cute.jit
 def l2norm_inv(sum_sq: cutlass.Float32) -> cutlass.Float32:
-    """Inverse L2 norm with the shared epsilon floor: rows at or below the
-    floor normalize by ``1 / L2_NORM_EPS`` instead of dividing by zero."""
-    norm_floor_sq = cutlass.Float32(L2_NORM_EPS * L2_NORM_EPS)
-    return cute.math.rsqrt(cute.math.max(sum_sq, norm_floor_sq), fastmath=True)
+    """Inverse L2 norm, ``rsqrt(sum_sq + L2_NORM_EPS)``; a zero row normalizes to zero."""
+    return cute.math.rsqrt(sum_sq + cutlass.Float32(L2_NORM_EPS), fastmath=True)
 
 
 @cute.jit
@@ -816,6 +828,23 @@ def sigmoid2(x_lo, x_hi):
     halving and the scale-bias folded into one FMUL2 and one FFMA2."""
     half = opaque_f32_zero() + cutlass.Float32(0.5)
     scaled_lo, scaled_hi = fmul2(x_lo, x_hi, half, half)
+    tanh_lo = cute.math.tanh(scaled_lo, approx=True)
+    tanh_hi = cute.math.tanh(scaled_hi, approx=True)
+    return ffma2(tanh_lo, tanh_hi, half, half, half, half)
+
+
+@cute.jit
+def sigmoid2_biased_half(x_lo, x_hi, hb_lo, hb_hi):
+    """``(sigmoid(x_lo + b_lo), sigmoid(x_hi + b_hi))`` from the HALVED biases ``hb = b / 2``: one ``fma.rn.f32x2`` forms the tanh
+    argument ``x / 2 + b / 2`` in place of :func:`sigmoid2`'s ``add.f32x2`` (the bias add) + ``mul.f32x2`` (the halving), then the tanh
+    identity exactly as :func:`sigmoid2`.  The caller stages ``hb`` once (a bf16 bias halved in fp32 is exact down to the last bf16
+    subnormal).  OUTPUT-BITWISE with ``sigmoid2(*fadd2(x_lo, x_hi, b_lo, b_hi))`` on every input: for ``|x + b| >= 2^-125`` the fp32
+    grid is self-similar under a power-of-two scale, so ``RN(x / 2 + b / 2) = RN(x + b) / 2`` = the two-op form's argument bitwise; below
+    that both arguments are tiny (``|tanh| < 2^-25``) and ``RN(tanh / 2 + 1 / 2)`` is exactly 0.5 on both; an infinite ``x`` or an
+    overflowing sum saturates ``tanh.approx`` to +-1 on both; NaN propagates on both.  Measured use: the LN-prologue dual GEMM's gated
+    epilogue with per-channel biases (`epi_math="packed_biasfold"`): -16 FADD2 per 32-channel subtile per lane."""
+    half = opaque_f32_zero() + cutlass.Float32(0.5)
+    scaled_lo, scaled_hi = ffma2(x_lo, x_hi, half, half, hb_lo, hb_hi)
     tanh_lo = cute.math.tanh(scaled_lo, approx=True)
     tanh_hi = cute.math.tanh(scaled_hi, approx=True)
     return ffma2(tanh_lo, tanh_hi, half, half, half, half)
@@ -1198,3 +1227,19 @@ def warp_abs_max_f32_shfl(x: cutlass.Float32) -> cutlass.Float32:
     for i in cutlass.range_constexpr(5):
         v = fmax_f32(v, cute.arch.shuffle_sync_bfly(v, 1 << i))
     return v
+
+
+@cutlass.cute.jit
+def atomic_max_f32_bits(slot: cute.Tensor, value: cutlass.Float32) -> None:
+    """``slot[0] = max(slot[0], value)`` for a NON-NEGATIVE fp32 ``value`` through ONE int32 ``atomicMax`` of its bit
+    pattern -- the amax fold of every quantizing epilogue (``sdpa/bwd/kernels/sm107/bprop_d256_fp8.py``, the gated block's
+    gradient amax pass and gate backward).
+
+    Non-negative IEEE fp32 patterns order exactly as int32, so the slot ends at the fp32 max of every value folded into
+    it whatever order the warps arrive in: order-free and bitwise the ``max``.  Contract: ``slot`` is a 1-element fp32
+    tensor (4-byte aligned is enough) the caller ZEROED before the first arrive on the same stream -- ``0.0`` is the pattern
+    ``0x00000000``, the identity of this max, and a poisoned slot is the caller's bug; ``value >= +0.0`` -- a negative pattern
+    (``-0.0`` = ``0x80000000`` included) is a negative int32 and loses every comparison, a NaN pattern (``0x7FC00000``) wins
+    them all.  Call it from ONE lane (lane 0 after :func:`warp_abs_max_f32_shfl` / :func:`warp_abs_max_f32`)."""
+    ptr = Pointer(slot.iterator.raw_ptr(), dtype=cutlass.Int32)
+    nvvm.atomicrmw(nvvm.AtomicOp.MAX, ptr, value.bitcast(cutlass.Int32))

@@ -61,7 +61,7 @@ elif packed:
     extra = (total.data_ptr(),)
 def run():
     if amax is not None: amax.zero_()
-    fn(op.data_ptr(),lp.data_ptr(),o.data_ptr(),lse.data_ptr(),(b,h,sq,d),splits,ostride,lstride,*extra,torch.cuda.current_stream().cuda_stream)
+    fn(op.data_ptr(),lp.data_ptr(),o.data_ptr(),lse.data_ptr(),(b,h,sq,d),splits,ostride,lstride,*extra,torch.cuda.current_stream().cuda_stream,*((None,) if packed else ()))
 if reload == "1":
     assert hasattr(owner, "_compiled_cache_raw")
 def check():

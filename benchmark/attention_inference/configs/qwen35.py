@@ -3,7 +3,10 @@
 
 """Qwen 3.5 GQA attention (head_dim=256), inference phases.
 
-Swept across tensor-parallel shards (TP 1/2/4/8 -> 32/2, 16/1, 8/1, 4/1 heads).
+Swept across tensor-parallel shards (TP 1/2/4/8 -> 32/2, 16/1, 8/1, 4/1 heads; the
+two KV heads divide at TP 2 and replicate from TP 4 on) and, on the paged-KV
+backends, across the kernel block sizes the serving deployments allocate for
+this model (pages 16 / 32 / 64).
 """
 
 from ..config_types import InferenceBenchmarkConfig, ModelPreset, with_tp_shards
@@ -34,5 +37,10 @@ CONFIG = InferenceBenchmarkConfig(
     generation_batch_sizes=[1, 128],
     kv_cache_dtypes=["bfloat16", "fp8_e4m3"],
     page_size=16,
+    # The paged-KV backends sweep the kernel block sizes the serving deployments
+    # allocate for this model at every shard: 16 (TP 1, or a 4-token draft), 32
+    # (the TP 4 deployment) and 64; the cudnn graph paths are dense and run each
+    # case once at page_size.
+    page_sizes=[16, 32, 64],
     backends=["cudnn", "cudnn_oss"],
 )

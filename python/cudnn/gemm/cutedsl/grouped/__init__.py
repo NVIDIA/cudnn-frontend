@@ -57,7 +57,11 @@ from .unfused.api import (
     grouped_gemm_wrapper_sm100,
 )
 
+from .prepared import PreparedGroupedGemm, prepare_grouped_gemm
+
 __all__ = [
+    "PreparedGroupedGemm",
+    "prepare_grouped_gemm",
     "GroupedGemmSwigluSm100",
     "grouped_gemm_swiglu_wrapper_sm100",
     "GroupedGemmDswigluSm100",

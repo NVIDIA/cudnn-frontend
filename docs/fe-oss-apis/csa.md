@@ -15,9 +15,11 @@ and numerics in
 [Megatron-LM issue #5968](https://github.com/NVIDIA/Megatron-LM/issues/5968)). The eager
 region they replace decomposes into ~39 forward and ~51 backward kernel launches per
 call (at `compress_ratio = 4`, `coff = 2`) and materializes `(total_comp, 2*ratio, 1, head_dim)`
-window intermediates; the fused path is 1 + 1 kernels (plus one fp32 `dAPE`-buffer
-zero-fill in backward — the backward kernel writes `dKV`/`dScore` in full, including
-exact zeros to never-consumed positions, so those buffers need no fills).
+window intermediates. The default fused path is one forward and one backward kernel
+plus one fp32 `dAPE`-buffer zero-fill. Deterministic dAPE replaces that fill with a
+fixed-order reduction stage (two stages for ratio 4). Both backward modes write
+`dKV`/`dScore` in full, including
+exact zeros to never-consumed positions, so those buffers need no fills.
 
 ### Semantics
 
@@ -90,7 +92,10 @@ assume the ratio \{2, 4\} guarantees at ratio=128):
      fp32 max — its forward chunk partials are un-normalized (up to `2 · ratio ×`
      the reference's normalized weighted sums), so e.g. uniform-score inputs with
      `|kv|` within a factor `~2 · ratio` of fp32 max return ±Inf where the eager
-     reference is still finite.
+     reference is still finite. Non-finite inputs follow the same rule wherever
+     they fall in the forward's window chunks: a NaN or +Inf `score + ape` at one
+     window position makes that output NaN, and a -Inf position (a masked one)
+     gets weight 0 (`test_r128_forward_special_values_match_eager`).
 
   On inputs whose fp32 intermediates stay finite in BOTH evaluation orders — the
   eager reference's and the fused kernels' (which saturate earlier, see 3.) —
@@ -123,11 +128,62 @@ assume the ratio \{2, 4\} guarantees at ratio=128):
 
 In BOTH families the forward, `dKV` and `dScore` are **bitwise run-to-run
 deterministic** (fixed chunk boundaries and merge orders, no atomics in those
-outputs; NaN-prefill replay is part of the test suite). `dAPE` is reduced with one
-fp32 atomic per `(k, dim)` per CTA in both families and is **not** bitwise
-run-to-run deterministic; the backward APIs raise under
-`torch.use_deterministic_algorithms(True)` (warn-only mode warns and runs) — callers
-that need a fully deterministic backward must use an eager implementation.
+outputs; NaN-prefill replay is part of the test suite). The backward has two dAPE
+policies:
+
+- `deterministic=False` (default) keeps one fp32 atomic per `(k, dim)` per CTA.
+  This fastest path is not bitwise deterministic and raises under strict
+  `torch.use_deterministic_algorithms(True)` (warn-only mode warns and runs).
+  Its class plan requires `workspace=None`; workspace never switches a compiled
+  atomic plan to deterministic execution.
+- `deterministic=True` writes each CTA's register-local dAPE sums to caller-owned
+  fp32 partial planes and launches fixed-order reduction stages. Ratio 4 first reduces
+  independent groups of 32 CTA planes: eight warps each sum four contiguous planes,
+  then warp 0 merges those eight sums. A second kernel folds the resulting group sums
+  with an eight-way contiguous tree. This hierarchical grid supplies thousands of CTAs
+  on long packed sequences instead of assigning the whole partial axis to 16 CTAs.
+  Ratio 2 and ratio 128 use a serial ascending-CTA fold. Both forms contain no dAPE
+  atomics, fully overwrite `grad_ape`, are bitwise replay-deterministic, and are
+  accepted by strict torch deterministic mode.
+  The class API exposes `scratch_workspace_bytes()` and requires a contiguous uint8
+  `workspace` of at least that size at `execute`; the high-level wrapper allocates it.
+  Both launches use the caller stream and are CUDA-graph capture/replay safe after
+  `compile()`.
+
+#### Deterministic dAPE performance
+
+CUDA-event medians over 100 iterations after 30 warmups on one GB200
+(capability `(10, 0)`, CUDA 12.9, PyTorch 2.9.1, CUTLASS DSL 4.7) are below. Atomic and
+deterministic variants share all operand addresses, measurement order alternates AB/BA,
+and the whole run is repeated with plan construction order reversed. `operation`
+includes the atomic path's required dAPE zero-fill; deterministic dAPE overwrites its
+output and therefore needs no fill. JIT and allocations are outside the measurement.
+
+| configuration | workspace | atomic kernel | deterministic kernel | operation ratio, deterministic / atomic (both construction orders) |
+|---|---:|---:|---:|---:|
+| r4, c2, d128, 1x8192 | 1.031 MiB | 32.5–34.0 us | 39.8–42.9 us | 0.96–0.98x |
+| r4, c2, d128, 3x8192 | 3.094 MiB | 40.6–41.1 us | 45.7–47.1 us | 0.94–0.95x |
+| r4, c2, d512, 1x8192 | 4.125 MiB | 42.5–42.8 us | 50.8–51.2 us | 0.97–0.99x |
+| r4, c2, d512, 3x8192 | 12.375 MiB | 90.7–91.5 us | 89.6–91.0 us | 0.92–0.93x |
+| r128, c1, d128, 1x8192 | 4 MiB | 31.1–32.6 us | 38.2–41.8 us | 0.91–0.93x |
+| r128, c2, d128, 3x8192 | 8 MiB | 47.5–48.0 us | 53.1–54.5 us | 0.93–0.94x |
+| r128, c1, d512, 1x8192 | 16 MiB | 40.8–41.0 us | 42.2–44.0 us | 0.84–0.86x |
+| r128, c2, d512, 3x8192 | 16 MiB | 111.7–112.1 us | 115.9–116.9 us | 0.95–0.96x |
+
+For the production `coff=1`, `head_dim=128`, ratio-4 long-context path with local
+pooling disabled, the compressor runs after the raw CP shards are gathered and therefore
+still sees the global packed token count. CP32 and CP64 therefore present the same 256K
+compressor shape. On the same GB200, unequal-document 256K and 1M/CP64 packs measured
+236.4 -> 134.3 us and 806.6 -> 402.1 us respectively versus
+the previous 32-way reducer. Nsight Systems attributes the 1M reduction change to
+456.5 us in the old reducer versus 20.2 + 30.9 us in the two new stages; the producer
+remains 306 us. Workspace grows by 3.125% (64 -> 66 MiB at 1M).
+
+Reproduce the long-context rows with
+`benchmark/csa/bench_csa_dape_deterministic.py --long-context`. For the compact
+matrix above, omit that option; use
+`--construct-order deterministic-first` for the reversed build and `--atomic-only`
+against an unchanged-source checkout for the independent control.
 
 ### Support surface (`check_support`)
 
@@ -212,12 +268,17 @@ never-consumed positions — segment tails, the last block's first-half columns
 token-capacity padding beyond `cu_seqlens[-1]` — get exact zeros
 from their unique owning CTA, matching autograd). When `total_comp == 0` the kernel is
 not launched and the buffers are left untouched (zero them yourself if you need
-autograd's exact zeros; the high-level wrapper does). `grad_ape` must be
-**zero-initialized before every `execute` call and before every CUDA-graph replay
-that reuses the buffer** — the kernel only accumulates into it (fp32 atomics) and
-never clears it. (The high-level wrapper allocates a fresh zeroed `grad_ape` per
-call; the zero-fill is captured together with the kernel, so wrapper graph replays
-re-zero automatically.)
+autograd's exact zeros; the high-level wrapper does). With the default
+`deterministic=False`, `grad_ape` must be **zero-initialized before every `execute`
+call and before every CUDA-graph replay that reuses the buffer**: the kernel only
+accumulates into it with fp32 atomics. The high-level wrapper supplies this zero-fill,
+including during graph replay. With
+`CSACompressorBackward(..., deterministic=True)`, call
+`scratch_workspace_bytes()` after `check_support()`, then provide
+`execute(..., workspace=...)` a same-device, contiguous CUDA uint8 buffer that is
+16-byte aligned, does not overlap any input or gradient tensor, and has at least the
+reported capacity. The deterministic path fully overwrites `grad_ape` without a
+zero-fill.
 
 ### CUDA graphs
 
@@ -336,8 +397,10 @@ the online-rescale or two-phase accumulation form and, where it measured faster,
 shared memory chunk-parallel, computes `exp` and per-chunk partial `den`/`S` sums in
 the same pass, merges the partials per column in a fixed chunk order, and stores the
 gradients with a hoisted `1/den` multiply — plus kernel-side zero-writes to
-never-consumed slots and fp32-atomic `dAPE`, exactly as at ratio=4. The backward
-defaults to the same fast exp outside the d=128 small-pack (vec=1) buckets.
+never-consumed slots and, by default, fp32-atomic `dAPE`, exactly as at ratio=4. The
+opt-in deterministic policy shares the generic family's CTA-partial plus fixed-order
+reduction design. The backward defaults to the same fast exp outside the d=128
+small-pack (vec=1) buckets.
 
 **The ratio=128 numerics contract is the deterministic tolerance contract described in
 [Numerics](#numerics), NOT the generic-family (ratio \{2, 4\}) bitwise-`dKV`/`dScore` contract.** The
@@ -421,7 +484,9 @@ The tests validate numerics against an fp32-intermediate eager reference (bitwis
 fp64-oracle parity on finite-intermediate inputs), the upstream eager numerics, plus ragged packs, static-capacity
 padding, kernel-side zero-writes into uninitialized gradient buffers (NaN-canary with
 exact-zero assertions on every never-consumed slot class, and the `total_comp == 0`
-zeros fallback), run-to-run determinism, `grad_ape` zeroing ownership, the ratio=128
+zeros fallback), run-to-run determinism for both dAPE policies, deterministic
+workspace validation and CUDA-graph overwrite semantics, atomic-path `grad_ape`
+zeroing ownership, the ratio=128
 dispatch envelope (schedule selection at every `nb_total` bucket boundary at L0, and
 one execution of every shipped (config, schedule) kernel against the full contract —
 tolerance, fp64-oracle parity, determinism — at L1; run

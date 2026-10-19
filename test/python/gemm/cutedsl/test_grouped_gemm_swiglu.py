@@ -13,6 +13,7 @@ Reference: continugous_blockscaled_grouped_gemm_swiglu_quant_fusion.py
 import torch
 import pytest
 from test_utils import torch_fork_set_rng
+from cudnn.api_base import get_device_type
 from gemm.cutedsl.test_grouped_gemm_swiglu_utils import (
     grouped_gemm_swiglu_init,
     with_grouped_gemm_swiglu_params_fp4,
@@ -280,6 +281,74 @@ def test_grouped_gemm_swiglu_wrapper_cache_keys_on_expert_count(request, monkeyp
         assert len(cache) == 2
     finally:
         cache.clear()
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=4)
+@pytest.mark.parametrize(
+    "ab_dtype,d_dtype,mma_tiler_mn,cluster_shape_mn,vector_f32,prob_dtype",
+    [
+        pytest.param(torch.float4_e2m1fn_x2, torch.bfloat16, (256, 128), (2, 1), False, torch.float32, id="fp4_tile_n128_2cta"),
+        pytest.param(torch.float4_e2m1fn_x2, torch.bfloat16, (128, 128), (1, 1), False, torch.float32, id="fp4_tile_n128_1cta"),
+        pytest.param(torch.float8_e4m3fn, torch.float8_e4m3fn, (256, 256), (2, 1), True, torch.bfloat16, id="fp8_vector_f32_bf16_prob"),
+    ],
+)
+def test_grouped_gemm_swiglu_wrapper_dedicated_configs(request, ab_dtype, d_dtype, mma_tiler_mn, cluster_shape_mn, vector_f32, prob_dtype):
+    """Configurations the dedicated SwiGLU kernel supported remain supported on the unified GLU kernel."""
+    try:
+        from cudnn import grouped_gemm_swiglu_wrapper_sm100
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    cfg = grouped_gemm_swiglu_init(
+        request=request,
+        ab_dtype=ab_dtype,
+        c_dtype=torch.bfloat16,
+        d_dtype=d_dtype,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=vector_f32,
+    )
+    inputs = allocate_grouped_gemm_input_tensors(
+        n=cfg["n"],
+        k=cfg["k"],
+        l=cfg["l"],
+        group_m_list=cfg["group_m_list"],
+        ab_dtype=cfg["ab_dtype"],
+        sf_dtype=cfg["sf_dtype"],
+        sf_vec_size=cfg["sf_vec_size"],
+        m_aligned=cfg["m_aligned"],
+    )
+    inputs["prob_tensor"] = inputs["prob_tensor"].to(prob_dtype)
+
+    def run():
+        return grouped_gemm_swiglu_wrapper_sm100(
+            a_tensor=inputs["a_tensor"],
+            b_tensor=inputs["b_tensor"],
+            sfa_tensor=inputs["sfa_tensor"],
+            sfb_tensor=inputs["sfb_tensor"],
+            padded_offsets=inputs["padded_offsets_tensor"],
+            alpha_tensor=inputs["alpha_tensor"],
+            norm_const_tensor=inputs["norm_const_tensor"],
+            prob_tensor=inputs["prob_tensor"],
+            d_dtype=cfg["d_dtype"],
+            mma_tiler_mn=cfg["mma_tiler_mn"],
+            cluster_shape_mn=cfg["cluster_shape_mn"],
+            sf_vec_size=cfg["sf_vec_size"],
+            vector_f32=cfg["vector_f32"],
+        )
+
+    if mma_tiler_mn[1] == 128 and get_device_type() == "rubin":
+        # The Rubin GLU kernel only tiles N=256.
+        with pytest.raises(ValueError, match="MMA tiler N must be in"):
+            run()
+        return
+    outputs = run()
+    check_ref_grouped_gemm_swiglu(inputs, outputs, cfg, skip_ref=cfg["skip_ref"])
 
 
 """

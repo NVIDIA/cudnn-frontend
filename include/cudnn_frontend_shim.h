@@ -69,17 +69,34 @@ get_symbol(const char *function_name) {
 
 enum class CudaLibrary { CUDART, CUDA };
 
+// On Windows dlerror() is GetLastError(), an error code that successful calls do not reset (#809),
+// so success is judged by the returned handle or symbol alone and the code is only reported.
+inline std::string
+last_dl_error() {
+#ifdef _WIN32
+    return "Windows error " + std::to_string(GetLastError());
+#else
+    const char *error = dlerror();
+    return error ? error : "Unknown error";
+#endif
+}
+
 inline HMODULE
 load_cuda_so() {
     // Clear any existing error
     dlerror();
 
+#ifdef _WIN32
+    constexpr const char *lib = "nvcuda.dll";
+#else
+    constexpr const char *lib = "libcuda.so.1";
+#endif
+
     // Attempt to open the cuda library
-    HMODULE handle    = dlopen("libcuda.so.1", RTLD_NOW);
-    const char *error = reinterpret_cast<const char *>(dlerror());
-    if (!handle || error) {
+    HMODULE handle = dlopen(lib, RTLD_NOW);
+    if (!handle) {
         // If opening the library fails, throw an exception with the error message
-        throw std::runtime_error("Unable to dlopen libcuda.so.1 : " + std::string(error ? error : "Unknown error"));
+        throw std::runtime_error("Unable to dlopen " + std::string(lib) + " : " + last_dl_error());
     }
 
     return handle;
@@ -100,29 +117,38 @@ load_cudart_so() {
     const char *user_lib = get_environment("CUDNN_FRONTEND_CUDART_LIB_NAME");
     if (user_lib) {
         if (user_lib[0] != '\0') {
-            HMODULE handle    = dlopen(user_lib, RTLD_NOW);
-            const char *error = reinterpret_cast<const char *>(dlerror());
-            if (!handle || error) {
+            HMODULE handle = dlopen(user_lib, RTLD_NOW);
+            if (!handle) {
                 throw std::runtime_error(
                     "Unable to load libcudart library specified by CUDNN_FRONTEND_CUDART_LIB_NAME (" +
-                    std::string(user_lib) + "): " + std::string(error ? error : "Unknown error"));
+                    std::string(user_lib) + "): " + last_dl_error());
             }
             return handle;
         }
     }
 
     // List of potential libcudart libraries (Adding major version to support python package)
+#ifdef _WIN32
+    // Only the runtime matching the compiled CUDA major is ABI-compatible with the versioned
+    // entry points below (e.g. cudaStreamGetCaptureInfo), so there is no cross-major fallback.
+#if CUDART_VERSION >= 13000
+    constexpr const char *libs[] = {"cudart64_13.dll"};
+#else
+    constexpr const char *libs[] = {"cudart64_12.dll"};
+#endif
+#else
     constexpr const char *libs[] = {"libcudart.so.12", "libcudart.so.13"};
-    constexpr size_t num_libs    = sizeof(libs) / sizeof(libs[0]);
+#endif
+    constexpr size_t num_libs = sizeof(libs) / sizeof(libs[0]);
 
     HMODULE lib_handle = nullptr;
     int loaded_index   = -1;
 
     for (size_t i = 0; i < num_libs; ++i) {
-        HMODULE handle    = dlopen(libs[i], RTLD_NOW);
-        const char *error = reinterpret_cast<const char *>(dlerror());
+        dlerror();
+        HMODULE handle = dlopen(libs[i], RTLD_NOW);
 
-        if (handle && !error) {
+        if (handle) {
             if (lib_handle) {
                 // Already loaded one -> multiple found. This is not fatal: warn on stderr and keep
                 // the first one found. Set CUDNN_FRONTEND_CUDART_LIB_NAME to select one explicitly.
@@ -142,7 +168,11 @@ load_cudart_so() {
 
     // If opening the library fails, throw an exception with the error message
     if (!lib_handle) {
-        throw std::runtime_error("Unable to load any libcudart.so.* library.");
+        std::string tried;
+        for (size_t i = 0; i < num_libs; ++i) {
+            tried += (i ? ", " : "") + std::string(libs[i]);
+        }
+        throw std::runtime_error("Unable to load any libcudart library (tried " + tried + ").");
     }
 
     return lib_handle;
@@ -152,9 +182,11 @@ inline void *
 get_cuda_symbol(CudaLibrary library, const char *function_name) {
     // Static mutex to ensure thread-safety
     (void)function_name;
-    static std::mutex cuda_lib_mutex;
+    // Intentionally leaked: destructors of other statics (e.g. a cached execution plan releasing
+    // its CUDA graph user object) call back in here during process teardown (#1486).
+    static std::mutex &cuda_lib_mutex = *new std::mutex;
     // Static map to store handles for different libraries
-    static std::unordered_map<CudaLibrary, HMODULE> dl_handles;
+    static std::unordered_map<CudaLibrary, HMODULE> &dl_handles = *new std::unordered_map<CudaLibrary, HMODULE>;
 
     // Lock the mutex to ensure thread-safe access
     std::lock_guard<std::mutex> lock(cuda_lib_mutex);
@@ -168,12 +200,10 @@ get_cuda_symbol(CudaLibrary library, const char *function_name) {
     dlerror();
 
     // Try to find the symbol (function) in the library
-    void *symbol      = dlsym(dl_handles[library], function_name);
-    const char *error = reinterpret_cast<const char *>(dlerror());
-    if (!symbol || error) {
+    void *symbol = reinterpret_cast<void *>(dlsym(dl_handles[library], function_name));
+    if (!symbol) {
         // If the symbol is not found, throw an exception with details
-        throw std::runtime_error("Unable to find symbol " + std::string(function_name) + ": " +
-                                 std::string(error ? error : "Unknown error"));
+        throw std::runtime_error("Unable to find symbol " + std::string(function_name) + ": " + last_dl_error());
     }
 
     // Return the pointer to the function
@@ -224,6 +254,25 @@ get_cuda_symbol(CudaLibrary library, const char *function_name) {
 #define NV_FE_CALL_TO_CUDA(function_name, cuda_symbol, ...) return cuda_symbol(__VA_ARGS__);
 #define NV_FE_CALL_TO_CU(function_name, cuda_symbol, ...) return cuda_symbol(__VA_ARGS__);
 
+#endif
+
+#if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
+// Version of the libcudart that was loaded, which can be a different major than CUDART_VERSION
+// (e.g. a CUDA 13 wheel next to a CUDA 12 torch). Entry points whose ABI changed between majors
+// dispatch on it (#1563).
+inline int
+loaded_cudart_version() {
+    static int const version = [] {
+        using Fn  = cudaError_t (*)(int *);
+        int value = 0;
+        if (reinterpret_cast<Fn>(get_cuda_symbol(CudaLibrary::CUDART, "cudaRuntimeGetVersion"))(&value) !=
+            cudaSuccess) {
+            value = 0;
+        }
+        return value;
+    }();
+    return version;
+}
 #endif
 
 inline cudaError_t
@@ -320,7 +369,16 @@ inline cudaError_t
 cuda_graph_node_get_dependent_nodes(cudaGraphNode_t node,
                                     cudaGraphNode_t *pDependentNodes,
                                     size_t *pNumDependentNodes) {
-#if (CUDART_VERSION >= 13000)
+#if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
+    // CUDA 13 added an edge-data parameter to the unversioned symbol.
+    void *fptr = get_cuda_symbol(CudaLibrary::CUDART, "cudaGraphNodeGetDependentNodes");
+    if (loaded_cudart_version() >= 13000) {
+        using Fn = cudaError_t (*)(cudaGraphNode_t, cudaGraphNode_t *, void *, size_t *);
+        return reinterpret_cast<Fn>(fptr)(node, pDependentNodes, /*edgeData=*/nullptr, pNumDependentNodes);
+    }
+    using Fn = cudaError_t (*)(cudaGraphNode_t, cudaGraphNode_t *, size_t *);
+    return reinterpret_cast<Fn>(fptr)(node, pDependentNodes, pNumDependentNodes);
+#elif (CUDART_VERSION >= 13000)
     // The 3-parameter version of cudaGraphNodeGetDependentNodes was removed in CUDA 13.0,
     // so call the other shim.
     return cuda_graph_node_get_dependent_nodes_v2(node, pDependentNodes, /*edgeData=*/nullptr, pNumDependentNodes);
@@ -409,7 +467,29 @@ cuda_stream_get_capture_info_v2(cudaStream_t stream,
 // Reports the capture status of `stream` and, when it is capturing, the graph it records into.
 inline cudaError_t
 cuda_stream_get_capture_info(cudaStream_t stream, cudaStreamCaptureStatus *capture_status, cudaGraph_t *graph) {
-#if (CUDART_VERSION >= 13000)
+#if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
+    // Pick the prototype of the loaded runtime; on CUDA 12 the unversioned symbol is the legacy
+    // 3-parameter one that never reports the graph.
+    if (loaded_cudart_version() >= 13000) {
+        using Fn = cudaError_t (*)(cudaStream_t,
+                                   cudaStreamCaptureStatus *,
+                                   unsigned long long *,
+                                   cudaGraph_t *,
+                                   const cudaGraphNode_t **,
+                                   const void **,
+                                   size_t *);
+        return reinterpret_cast<Fn>(get_cuda_symbol(CudaLibrary::CUDART, "cudaStreamGetCaptureInfo"))(
+            stream, capture_status, nullptr, graph, nullptr, nullptr, nullptr);
+    }
+    using Fn = cudaError_t (*)(cudaStream_t,
+                               cudaStreamCaptureStatus *,
+                               unsigned long long *,
+                               cudaGraph_t *,
+                               const cudaGraphNode_t **,
+                               size_t *);
+    return reinterpret_cast<Fn>(get_cuda_symbol(CudaLibrary::CUDART, "cudaStreamGetCaptureInfo_v2"))(
+        stream, capture_status, nullptr, graph, nullptr, nullptr);
+#elif (CUDART_VERSION >= 13000)
     return cuda_stream_get_capture_info_v3(stream, capture_status, nullptr, graph, nullptr, nullptr, nullptr);
 #else
     return cuda_stream_get_capture_info_v2(stream, capture_status, nullptr, graph, nullptr, nullptr);
@@ -495,9 +575,22 @@ cuda_mem_set_async(void *devPtr, int value, size_t count, cudaStream_t stream) {
     NV_FE_CALL_TO_CUDA(cuda_mem_set_async, cudaMemsetAsync, devPtr, value, count, stream);
 }
 
+// The cudaDeviceProp layout differs between CUDA majors, so with dynamic loading it is only valid when
+// the loaded runtime matches CUDART_VERSION; prefer cuda_device_get_attribute() (#1563).
 inline cudaError_t
 cuda_get_device_properties(cudaDeviceProp *prop, int device) {
+#if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING && CUDART_VERSION >= 12000 && CUDART_VERSION < 13000
+    // CUDA 12 headers map cudaGetDeviceProperties to the _v2 symbol; the unversioned one fills the CUDA 11 layout.
+    if (loaded_cudart_version() < 13000) {
+        NV_FE_CALL_TO_CUDA(cuda_get_device_properties, cudaGetDeviceProperties_v2, prop, device);
+    }
+#endif
     NV_FE_CALL_TO_CUDA(cuda_get_device_properties, cudaGetDeviceProperties, prop, device);
+}
+
+inline cudaError_t
+cuda_device_get_attribute(int *value, cudaDeviceAttr attr, int device) {
+    NV_FE_CALL_TO_CUDA(cuda_device_get_attribute, cudaDeviceGetAttribute, value, attr, device);
 }
 
 inline cudaError_t

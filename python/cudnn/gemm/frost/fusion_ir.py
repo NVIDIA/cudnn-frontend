@@ -631,6 +631,7 @@ class MoeSpec:
     In ``gather`` mode, M counts routed rows and ``token_index`` maps each
     routed row to a source token. In ``scatter`` mode, the input stays grouped
     and output row is ``token_index[row] * top_k + token_ks[row]``.
+    COMBINE weights those contributions by top-k scores and sums into token rows.
     Template capabilities gate execution."""
 
     num_experts: int  # E — the weight batch; routed group g uses expert g % E
@@ -647,7 +648,7 @@ class MoeSpec:
             raise ValueError(f"num_experts must be positive; got {self.num_experts}")
         if self.num_groups < 1:
             object.__setattr__(self, "num_groups", self.num_experts)
-        if self.mode not in ("none", "gather", "scatter"):
+        if self.mode not in ("none", "gather", "scatter", "combine"):
             raise ValueError(f"MoE grouped matmul mode {self.mode!r} is unsupported")
         if self.top_k < 1:
             raise ValueError("MoE top_k must be positive")

@@ -78,6 +78,7 @@ def _check(tensors, storage):
 @pytest.mark.parametrize("d,dv", _FLAVORS)
 def test_fp8_staged_uses_pointer_host_and_current_storage(d, dv, monkeypatch):
     import cutlass.cute as cute
+    from sdpa.frost.native_binding_utils import forbid_python_forward_binding
 
     api, tensors, storage = _case(d, dv)
     monkeypatch.setattr(cute.runtime, "make_fake_tensor", lambda *a, **k: pytest.fail("conversion constructed a tensor fake"))
@@ -85,6 +86,8 @@ def test_fp8_staged_uses_pointer_host_and_current_storage(d, dv, monkeypatch):
     required = api.scratch_workspace_bytes()
     api.compile()
     assert api._staged_spec is not None
+    assert api._staged_spec.core.native is not None
+    forbid_python_forward_binding(monkeypatch)
     assert api.scratch_workspace_bytes() == required
     for offset in (128, 256):
         _, tensors, storage = _case(d, dv)
@@ -472,9 +475,7 @@ def test_sm107_d256_staging_preserves_each_native_operand(converted, monkeypatch
     assert [r[0] for r in api._staged_spec.regions] == [converted]
     assert api.scratch_workspace_bytes() == required
     workspace = torch.empty(required, device="cuda", dtype=torch.uint8)
-    from cudnn.sdpa.fwd import prepared
-
-    execute = prepared.execute_quantized
+    execute = prepared_staged_forward._bind_core
     seen = []
 
     def launch(spec, facts, *args, **kwargs):
@@ -483,7 +484,7 @@ def test_sm107_d256_staging_preserves_each_native_operand(converted, monkeypatch
         seen.append(True)
         return execute(spec, facts, *args, **kwargs)
 
-    monkeypatch.setattr(prepared, "execute_quantized", launch)
+    monkeypatch.setattr(prepared_staged_forward, "_bind_core", launch)
     _execute(api, tensors, workspace)
     _check(tensors, storage)
     for role in ("q", "k", "v", "o"):

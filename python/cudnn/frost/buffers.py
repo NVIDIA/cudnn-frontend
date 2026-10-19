@@ -18,6 +18,7 @@ no tensor-library dependency on the execute path.
 from __future__ import annotations
 
 import ctypes
+from contextlib import nullcontext
 from functools import lru_cache
 import logging
 import re as _re
@@ -315,10 +316,22 @@ def _dlpack_geometry(buf):
     # bookkeeping". This only reads metadata, so it never needed any -- and the
     # default makes torch call record_stream, which is illegal inside a CUDA
     # graph capture.
-    try:
-        capsule = dl(stream=-1)
-    except TypeError:  # a producer whose __dlpack__ predates the stream kwarg
-        capsule = dl()
+    # CUDA producers may require their device to be current even when stream=-1
+    # suppresses synchronization. The producer's metadata, not the caller's
+    # ambient device, determines the export context; restore it on every exit.
+    context = nullcontext()
+    dlpack_device = getattr(buf, "__dlpack_device__", None)
+    if dlpack_device is not None:
+        device_type, device_id = dlpack_device()
+        if int(device_type) == _KDL_CUDA:
+            from .device import device_context
+
+            context = device_context(int(device_id))
+    with context:
+        try:
+            capsule = dl(stream=-1)
+        except TypeError:  # a producer whose __dlpack__ predates the stream kwarg
+            capsule = dl()
     raw = _PyCapsule_GetPointer(capsule, b"dltensor")
     mt = ctypes.cast(raw, ctypes.POINTER(_DLManagedTensor)).contents
     t = mt.dl_tensor
@@ -473,6 +486,25 @@ def apply_fill_plan(ptr: int, plan, word: int, stream) -> None:
             _fill_word_2d_async(ptr + offset * 4, pitch, width, height, word, stream)
 
 
+def apply_zero_fill_plan(ptr: int, plan, elem_bytes: int, stream) -> None:
+    """Zero a validated element-based fill plan without touching its padding.
+
+    Byte memsets support both 16-bit and 32-bit outputs, including views whose
+    pointer or pitch has only natural element alignment.
+    """
+    from cuda.bindings import runtime as _rt
+
+    for offset, pitch, width, height in plan:
+        base = int(ptr) + offset * elem_bytes
+        if height == 1:
+            memset_zero_async(base, width * elem_bytes, stream)
+        else:
+            res = _rt.cudaMemset2DAsync(base, pitch * elem_bytes, 0, width * elem_bytes, height, int(stream) if stream is not None else 0)
+            err = res[0] if isinstance(res, tuple) else res
+            if int(err) != 0:
+                raise RuntimeError(f"cudaMemset2DAsync failed: {err}")
+
+
 def fill_word_strided_async(ptr: int, shape, strides, elem_bytes: int, word: int, stream) -> None:
     """Plan and issue in one call, for a caller with a single region to seed.
 
@@ -500,6 +532,7 @@ CUTEDSL_MIN_VERSION = (4, 7, 0)
 _RELEASE_INT = _re.compile(r"^(\d+)")  # leading integer of one version component ("2rc1" -> 2)
 
 _DSL_STATE = None
+_DSL_PRIMITIVES = None
 
 
 def cutedsl_state():
@@ -578,12 +611,53 @@ def _cutedsl_has_sm107():
 
 
 def cutedsl_arch_requirement_error(device_cc):
-    """Reject a DSL without the target architecture before kernel compilation."""
+    """Reject a DSL without the target architecture before kernel compilation.
+
+    The TARGET half of the public probe :func:`cudnn.frost.cutedsl_runtime_available`: cc 10.7 needs a DSL whose
+    ``Arch`` knows ``sm_107a`` (the public 4.8.0 wheel is the first), so the floor is 4.7.0 everywhere and 4.8.0 on
+    cc 10.7. None when the part is not cc 10.7 or the target is present; otherwise the message names the installed
+    DSL."""
     if device_cc != (10, 7) or _cutedsl_has_sm107():
         return None
     _, version = cutedsl_state()
     found = "unknown version" if version is None else " ".join(version)
     return f"SM107 requires a CuTe DSL build supporting sm_107a; found {found} without that target"
+
+
+def cutedsl_primitives_error(what):
+    """Message when the DSL is new enough but exports no ``cutlass.primitives``.
+
+    Clearing the version floor does not imply the primitive layer is reachable
+    under that name: public wheels have shipped it as
+    ``cutlass.experimental.primitives``, and where ``cutlass.primitives`` does
+    work it can be an alias with no directory of its own -- so neither the
+    version nor the filesystem answers this. Only an import does.
+
+    That import executes the cutlass package (~1 s), which is why this is NOT
+    folded into :func:`cutedsl_requirement_error`: callers run it last, once an
+    engine would otherwise accept, where lowering is about to import the DSL
+    anyway. Declining here still beats the alternative, which is an ImportError
+    raised from inside the lowering with the plan already in the ranked list.
+    """
+    global _DSL_PRIMITIVES
+    if _DSL_PRIMITIVES is None:
+        import importlib
+
+        try:
+            importlib.import_module("cutlass.primitives")
+            _DSL_PRIMITIVES = False
+        except Exception:  # noqa: BLE001 - any failure to reach it is the same answer
+            _DSL_PRIMITIVES = True
+    if not _DSL_PRIMITIVES:
+        return None
+    _, version = cutedsl_state()
+    found = version[1] if version else "unknown"
+    floor = ".".join(str(x) for x in CUTEDSL_MIN_VERSION)
+    return (
+        f"{what} lowers through the CuTe DSL primitive layer (cutlass.primitives), "
+        f"which the installed nvidia-cutlass-dsl ({found}) does not export. "
+        f"Install a build that provides it (>= {floor})."
+    )
 
 
 def cutedsl_requirement_error(what):
@@ -594,10 +668,12 @@ def cutedsl_requirement_error(what):
     downstream floor (4.6.2), below this one (see AGENTS.md Rule 7).
     """
     installed, version = cutedsl_state()
-    if not installed or not cutedsl_too_old(version):
+    if not installed:
         return None
     floor = ".".join(str(x) for x in CUTEDSL_MIN_VERSION)
-    return f"{what} requires nvidia-cutlass-dsl >= {floor}; found {version[1]}. " f"Upgrade with: pip install -U 'nvidia-cutlass-dsl>={floor}'"
+    if cutedsl_too_old(version):
+        return f"{what} requires nvidia-cutlass-dsl >= {floor}; found {version[1]}. " f"Upgrade with: pip install -U 'nvidia-cutlass-dsl>={floor}'"
+    return None
 
 
 def current_device_id():

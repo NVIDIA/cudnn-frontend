@@ -37,7 +37,7 @@ _E4M3, _BF16 = 0, 2
 # `sm100/decode_d128_f16.py`); "bwd" is the d512 backward's stage-2 kernel.  The site count is the migration table of
 # the port: a count that moves means an arm was added or dropped and the table (and this pin) must say so.
 _KERNELS = {
-    ("f16", (128, 128)): ("prefill_d128_f16.py", 1),
+    ("f16", (128, 128)): ("prefill_d128_f16.py", 3),  # + the resident-block bias / kv_mask arms' two sites (pre-masked tail, masked body)
     ("f16", (192, 128)): ("prefill_d192_d128_f16.py", 5),
     ("f16", (256, 256)): ("prefill_d256_f16.py", 2),
     ("f16", (512, 512)): ("prefill_d512_f16.py", 1),
@@ -49,7 +49,7 @@ _KERNELS = {
     ("mxfp8", (192, 128)): ("prefill_d192_d128_mxfp8.py", 3),
     ("mxfp8", (256, 256)): ("prefill_d256_mxfp8.py", 3),
     ("mxfp8", (512, 512)): ("prefill_d512_mxfp8.py", 3),
-    ("decode", (128, 128)): ("decode_d128_f16.py", 1),
+    ("decode", (128, 128)): ("decode_d128_f16.py", 2),  # the key-sharded softmax arm of the d64 quadrant tile (``QUAD``) is the second site
     ("bwd", (512, 512)): ("bprop_d512_f16.py", 1),
 }
 _KERNEL_IDS = [f"{k}-d{f[0]}" if f[0] == f[1] else f"{k}-d{f[0]}x{f[1]}" for k, f in _KERNELS]

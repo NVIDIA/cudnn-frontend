@@ -82,6 +82,27 @@ def test_numerics_and_grad(layout, d, variable, bucket):
         np.testing.assert_allclose(actual.astype(jnp.float32), desired.astype(jnp.float32), atol=3e-2, rtol=3e-2)
 
 
+def test_multi_gpu_process_runs_on_the_arrays_device():
+    devices = jax.local_devices()
+    if len(devices) < 2:
+        pytest.skip("needs a process with more than one visible GPU")
+    sm100 = [d for d in devices if d.platform == "gpu" and str(getattr(d, "compute_capability", "")) == "10.0"]
+    target = sm100[-1]
+    q, k, v, indices = [jax.device_put(x, target) for x in inputs()[:4]]
+    expected, expected_lse = reference(q, k, v, indices, None, "bhsd")
+    for run in (partial(forward, block_sparse_num=2), jax.jit(partial(forward, block_sparse_num=2))):
+        o, lse = run(q, k, v, indices)
+        assert o.devices() == {target} and lse.devices() == {target}
+        np.testing.assert_allclose(o.astype(jnp.float32), expected, atol=3e-2, rtol=3e-2)
+        np.testing.assert_allclose(lse, expected_lse, atol=2e-3, rtol=2e-3)
+    other = next(d for d in devices if d != target)
+    with pytest.raises(ValueError, match="same GPU"):
+        forward(q, jax.device_put(k, other), v, indices, 2)
+    if other not in sm100:
+        with pytest.raises(ValueError, match="SM100"):
+            forward(*[jax.device_put(x, other) for x in (q, k, v, indices)], 2)
+
+
 def test_eager_backward_reuses_compilation():
     q, k, v, indices, _ = inputs("bshd")
     o, lse = forward(q, k, v, indices, 2, layout="bshd")

@@ -4,7 +4,7 @@
 
 The MoE Grouped Matmul operation computes a grouped matrix multiplication across experts, as used in Mixture-of-Experts (MoE) layers. Each expert has its own weight matrix, and tokens are routed to experts via `first_token_offset`.
 
-Three routing modes are supported:
+Four routing modes are defined; COMBINE currently requires the FROST `frost_gemm` engine (see FROST COMBINE support below):
 
 **None mode** (tokens already routed per expert):
 
@@ -16,7 +16,13 @@ $$\text{Output}[1,\ S \times \text{topK},\ N] = \text{Token}[1,\ S,\ K]\ \times\
 
 **Scatter mode** (scatter output back to token order after matmul):
 
-$$\text{Output}[1,\ S \times \text{topK},\ N] = \text{Token}[1,\ S \times \text{topK},\ K]\ \times\ \text{Weight}[E,\ K,\ N]$$
+First compute the grouped matmul for each routed row, then scatter each result back to the expanded token/top-k output slot using `TokenIndex` and `TokenKs`:
+
+$$\text{GroupedResult}[r,\ N] = \text{Token}[1,\ r,\ K]\ \times\ \text{Weight}[\text{expert}(r),\ K,\ N]$$
+
+$$\text{Output}[1,\ \text{TokenIndex}[r] \times \text{topK} + \text{TokenKs}[r],\ N] = \text{GroupedResult}[r,\ N]$$
+
+**Combine mode** performs FC2, routing-score multiplication, and summation across selected experts, producing `[1, S, N]`. See the FROST COMBINE contract below.
 
 where $E$ = number of experts, $S$ = number of tokens, $K$ = hidden size, $N$ = output (weight) size.
 
@@ -24,12 +30,13 @@ where $E$ = number of experts, $S$ = number of tokens, $K$ = hidden size, $N$ = 
 
 | Tensor | Shape | Modes |
 |---|---|---|
-| `Token` | `[1, S*topK, K]` (None/Scatter) or `[1, S, K]` (Gather) | All |
+| `Token` | `[1, S*topK, K]` (None/Scatter/Combine) or `[1, S, K]` (Gather) | All |
 | `Weight` | `[E, K, N]` | All |
 | `FirstTokenOffset` | `[B*E+1, 1, 1]` explicit boundaries; INT32/INT64 | All |
-| `TokenIndex` | `[1, S*topK, 1]`, INT32 | Gather, Scatter |
-| `TokenKs` | `[1, S*topK, 1]`, INT32 | Scatter only |
-| `TopK` | scalar int32 | Scatter only |
+| `TokenIndex` | `[1, S*topK, 1]`, INT32 | Gather, Scatter, Combine |
+| `TokenKs` | `[1, S*topK, 1]`, INT32 | Scatter, Combine |
+| `TopK` | scalar int32 | Scatter, Combine |
+| `TopKScores` | `[1, S, topK]`, FP32 | Combine only |
 
 ## Support Matrix
 
@@ -61,10 +68,10 @@ both forward and backward APIs.
 
 ### FROST GATHER support
 
-The opt-in `frost_gemm` engine supports ordinary and block-scaled GATHER in
-both SM100 orientations, token-by-weight and weight-by-token (`SWAP_AB=1`),
-and in the SM120 token-by-weight path. Enable it with
-`CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before planning.
+The opt-in `frost_gemm` engine supports ordinary and block-scaled GATHER on
+SM100 and SM120, in both orientations: token-by-weight and weight-by-token
+(`SWAP_AB=1`). Enable it with `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before
+planning.
 
 Let `T` be the source token count and `R` the routed row count. Supply token
 `[1,T,K]`, weight `[E,K,N]`, INT32 `token_index` `[1,R,1]` with contiguous rows,
@@ -81,6 +88,15 @@ uses source-token order and is gathered with the same `token_index` as the
 token data. Token SFA in `F8_128x4` is not supported for GATHER. Weight scale
 factors (SFB) retain the per-expert `F8_128x4` layout. These public operand
 roles and layout requirements also apply with `SWAP_AB=1`.
+
+For all block-scaled FROST MoE modes, bind weight SF as a rank-3 byte buffer
+with E as its outermost axis. Each expert plane must be a dense packed
+`F8_128x4` blob containing at least
+`512 * ceil(N/128) * ceil((K/block)/4)` bytes. Its two inner axes may be
+permuted. The expert stride must be a multiple of 16 bytes and at least the
+full inner-plane byte span; padding between experts is supported. The base
+pointer must also be 16-byte aligned. Views that interleave experts, overlap
+planes, or expose insufficient plane capacity raise `ValueError` before launch.
 
 ```python
 fc1 = graph.moe_grouped_matmul(
@@ -100,16 +116,16 @@ needed. With `SWAP_AB=1`, tokens are the internal B operand and GATHER4 loads
 the token columns of the transposed matmul; the public tensors and routed
 output order stay the same. SM120 uses the `shared::cta` GATHER4 instruction
 with its existing warp-MMA mainloop and STG epilogue; its workspace remains
-the 128-byte scheduler counter. SM100 supports parallel GEMMs, including the
-gate/up pair for SwiGLU, sharing the same offsets and indices. SM120 retains
-its existing single-GEMM fusion support, including activation epilogues.
+the 128-byte scheduler counter. Both SM100 and SM120 support parallel GEMMs,
+including the gate/up pair for SwiGLU, sharing the same offsets and indices,
+in both orientations and for ordinary and block-scaled inputs.
 Output rows and row-wise epilogue auxiliaries use routed order.
 The existing dtype, layout, alignment, and fusion support gates still apply.
 
 ### FROST SCATTER support
 
-FROST supports SCATTER for ordinary and block-scaled MoE in both SM100
-orientations (`SWAP_AB=0/1`) and the SM120 token-by-weight path. The input and
+FROST supports SCATTER for ordinary and block-scaled MoE on SM100 and SM120,
+in both orientations (`SWAP_AB=0/1`). The input and
 its block scales keep their expert-grouped layout. The epilogue writes each
 routed row `r` to the expanded token slot:
 
@@ -148,6 +164,72 @@ weights and reduction across top-k require a subsequent operation to produce
 the final `[1,S,N]` result.
 
 ---
+
+
+### FROST COMBINE support
+
+`cudnn.moe_grouped_matmul_mode.COMBINE` fuses FC2 with weighted scatter-add.
+It is supported only by the opt-in `frost_gemm` engine, whose SM100 and SM120
+source families both run it for ordinary and block-scaled inputs and both
+`SWAP_AB=0/1` orientations. Native cuDNN engines decline this mode.
+
+Let `R` be routed input capacity, `T` the original token count, and `k=top_k`.
+Supply token `[1,R,K]`, weight `[E,K,N]`, contiguous INT32 `token_index` and
+`token_ks` of shape `[1,R,1]`, and compact FP32 `top_k_scores` `[1,T,k]`.
+The scores remain in original token/top-k-slot order. `1 <= k <= E`.
+Offsets retain the explicit `[G+1,1,1]` contract; `R` may include unused
+capacity and need not equal `T*k`.
+
+For each active routed row `r` in group `g`, the operation computes:
+
+```text
+t = token_index[0, r, 0]
+j = token_ks[0, r, 0]
+output[0, t, :] += (token[0, r, :] @ weight[g % E, :, :]) * top_k_scores[0, t, j]
+```
+
+The output is `[1,T,N]`; every execution starts from zero, including empty
+groups and repeated CUDA Graph replays. Out-of-range token/slot indices are
+ignored. Repeated destinations accumulate; destinations without contributions
+are zero. N-major and M-major output layouts, including padding, are supported.
+
+```python
+output = graph.moe_grouped_matmul(
+    fc2_input, fc2_weight, first_token_offset,
+    token_index=token_index, token_ks=token_ks,
+    top_k=top_k, top_k_scores=top_k_scores,
+    mode=cudnn.moe_grouped_matmul_mode.COMBINE,
+)
+output.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+```
+
+GEMM accumulation and score multiplication use FP32. Each weighted contribution
+is converted to the declared output dtype (BF16, FP16, or FP32), and atomic
+addition accumulates in that dtype. Atomic order is unspecified, so results
+are not bitwise deterministic and can differ from an FP32 top-k reduction
+followed by a single output cast. Choose FP32 output when FP32 combining is
+required. Scores are neither normalized nor modified by COMBINE.
+
+The first implementation accepts one grouped GEMM, with optional input
+block-scale dequantization, and one final output. Post-COMBINE pointwise,
+reduction, quantization, and parallel-GEMM fusion are declined: applying those
+operations before summing experts would change the graph's meaning.
+
+The FC2 epilogue issues weighted atomic additions directly to the final output;
+it does not materialize `[T*k,N]` results or launch a separate finalizer.
+For token-by-weight GEMM with contiguous output features, each lane packs up to
+eight BF16/FP16 or four FP32 contributions into a 16-byte vector atomic add.
+The destination address selects narrower accesses when the output pointer or
+row stride is unaligned. Weight-by-token (`SWAP_AB`) and M-major outputs retain
+scalar atomics because adjacent registers do not address adjacent features of
+the same token. Vectorization preserves per-element atomicity and output-dtype
+accumulation.
+Output zeroing uses `cudaMemsetAsync` for contiguous storage and
+`cudaMemset2DAsync` for padded row/column-major storage, preserving padding.
+The execute-time stream orders output memset, the existing scheduler-counter
+initialization kernel, and grouped GEMM. Routing metadata and scores may change
+on graph replay, and runtime token/output extents remain independent of routed
+capacity.
 
 ## MoE Grouped Matmul Forward
 
@@ -200,7 +282,7 @@ output = graph.moe_grouped_matmul(
 
 **Args:**
 - `token` (cudnn_tensor): Token data.
-  - None/Scatter mode: shape `(1, S*topK, K)`
+  - None/Scatter modes: shape `(1, S*topK, K)`
   - Gather mode: shape `(1, S, K)`
 - `weight` (cudnn_tensor): Expert weight data with shape `(E, K, N)`.
 - `first_token_offset` (cudnn_tensor): INT32/INT64 tensor of shape `(B*E+1, 1, 1)` including the final endpoint. See [deprecated implicit offsets](#deprecated-implicit-offsets) for compatibility.

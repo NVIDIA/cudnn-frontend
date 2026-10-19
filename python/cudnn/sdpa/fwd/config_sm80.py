@@ -108,6 +108,17 @@ class TemplateParams:
     # Pointer hosts consume the public natural-log sink directly. Legacy tensor
     # hosts keep their log2-unit ABI until their remaining callers migrate.
     sink_natural: bool = False
+    # Sign of attn_scale: the kernel negates (-1) or zeroes (0) the raw scores and runs at kernel_scale() (#1435).
+    score_sign: int = 1
+
+
+def score_sign(scale: float) -> int:
+    return (scale > 0) - (scale < 0)
+
+
+def kernel_scale(scale: float) -> float:
+    """The positive scale the kernel runs at once score_sign is folded into the scores."""
+    return abs(scale) if scale else 1.0
 
 
 def validate_params(p: TemplateParams) -> None:
@@ -127,6 +138,8 @@ def validate_params(p: TemplateParams) -> None:
         raise ValueError(f"sm80: (d_qk, d_v) = ({p.d_qk}, {p.d_v}) is not a swept flavor envelope")
     if p.sched_policy not in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2):
         raise ValueError(f"sm80: sched_policy must be a tile_dsl SCHED_* value; got {p.sched_policy}")
+    if p.score_sign not in (-1, 0, 1):
+        raise ValueError(f"sm80: score_sign must be -1, 0 or 1; got {p.score_sign}")
     if p.sched_l2_mib <= 0:
         raise ValueError(f"sm80: sched_l2_mib must be > 0; got {p.sched_l2_mib}")
     if p.causal_bottom_right and not (p.is_causal or p.has_swa):

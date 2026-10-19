@@ -90,11 +90,17 @@ def validate_inputs(primals, config):
         raise ValueError("scale must be finite")
 
 
-def target_device():
-    devices = jax.local_devices(backend="gpu")
-    if len(devices) != 1:
-        raise NotImplementedError("JAX KDA requires one visible GPU; set CUDA_VISIBLE_DEVICES")
-    device = devices[0].local_hardware_id
+def target_device(arrays=()):
+    placed = {d for x in arrays if isinstance(x, jax.Array) and not isinstance(x, jax.core.Tracer) for d in x.devices()}
+    if len(placed) > 1:
+        raise ValueError("all JAX KDA arrays must be on one GPU")
+    if jax.process_count() != 1:
+        raise NotImplementedError("JAX KDA requires a single process")
+    # Traced arrays carry no device; uncommitted computations run on JAX's default device.
+    target = placed.pop() if placed else (jax.config.jax_default_device or jax.local_devices()[0])
+    if target.platform != "gpu":
+        raise NotImplementedError(f"JAX KDA requires a GPU; got {target.platform}")
+    device = target.local_hardware_id
     from cudnn.frost.device import compute_capability
 
     major, minor = compute_capability(device)
@@ -161,7 +167,7 @@ def execute(primals, config, **backward_inputs):
     values = dict(zip(PRIMAL_NAMES, primals))
     values.update(backward_inputs)
     metadata = tuple((name, tuple(value.shape), np.dtype(value.dtype).name) for name, value in values.items() if value is not None)
-    invoke, inputs, outputs = build_call(metadata, config, target_device())
+    invoke, inputs, outputs = build_call(metadata, config, target_device(values.values()))
     return dict(zip(outputs, invoke(*(values[name] for name in inputs))[:-1]))
 
 

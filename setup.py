@@ -4,10 +4,22 @@
 import os
 import subprocess
 import sys
+import sysconfig
 from pathlib import Path
 
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
+
+stable_abi_value = os.environ.get("CUDNN_FRONTEND_PYTHON_STABLE_ABI", "OFF").strip().upper()
+if stable_abi_value not in ("", "0", "OFF", "NO", "FALSE", "1", "ON", "YES", "TRUE"):
+    raise ValueError("CUDNN_FRONTEND_PYTHON_STABLE_ABI must be ON or OFF")
+stable_abi_requested = stable_abi_value in ("1", "ON", "YES", "TRUE")
+stable_abi = stable_abi_requested and sys.implementation.name == "cpython" and sys.version_info >= (3, 12) and not sysconfig.get_config_var("Py_GIL_DISABLED")
+if stable_abi_requested and not stable_abi:
+    raise ValueError(
+        "CUDNN_FRONTEND_PYTHON_STABLE_ABI=ON requires CPython 3.12 or newer with the GIL enabled. "
+        "Set CUDNN_FRONTEND_PYTHON_STABLE_ABI=OFF to build an ordinary wheel."
+    )
 
 
 # A CMakeExtension needs a sourcedir instead of a file list.
@@ -15,18 +27,14 @@ from setuptools.command.build_ext import build_ext
 # If you need multiple extensions, see scikit-build.
 class CMakeExtension(Extension):
     def __init__(self, name: str, sourcedir: str = "") -> None:
-        super().__init__(name, sources=[])
+        super().__init__(name, sources=[], py_limited_api=stable_abi)
         self.sourcedir = os.fspath(Path(sourcedir).resolve())
 
 
 class CMakeBuild(build_ext):
     def build_extension(self, ext: CMakeExtension) -> None:
-        # Must be in this form due to bug in .resolve() only fixed in Python 3.10+
         ext_fullpath = Path.cwd() / self.get_ext_fullpath(ext.name)
         extdir = ext_fullpath.parent.resolve()
-
-        # Using this requires trailing slash for auto-detection & inclusion of
-        # auxiliary "native" libs
 
         debug = int(os.environ.get("DEBUG", 0)) if self.debug is None else self.debug
         cfg = "Debug" if debug else "Release"
@@ -34,9 +42,9 @@ class CMakeBuild(build_ext):
         is_windows = os.name == "nt"
         cmake_args = [
             f"-DPython_EXECUTABLE={sys.executable}",
-            f"-DPYBIND11_FINDPYTHON=ON",
             f"-DCMAKE_BUILD_TYPE={cfg}",  # not used on MSVC, but no harm
             f"-DCUDNN_FRONTEND_BUILD_PYTHON_BINDINGS=ON",
+            f"-DCUDNN_FRONTEND_PYTHON_STABLE_ABI={'ON' if stable_abi else 'OFF'}",
             # There's no need to build cpp samples and tests with python
             f"-DCUDNN_FRONTEND_BUILD_SAMPLES=OFF",
             f"-DCUDNN_FRONTEND_BUILD_TESTS=OFF",
@@ -50,8 +58,11 @@ class CMakeBuild(build_ext):
                 f"-DCUDNN_FRONTEND_FETCH_PYBINDS_IN_CMAKE=ON",
             ]
         else:
+            import nanobind
+
             cmake_args += [
                 f"-DCUDNN_FRONTEND_FETCH_PYBINDS_IN_CMAKE=OFF",
+                f"-Dnanobind_DIR={nanobind.cmake_dir()}",
             ]
         if "CUDA_PATH" in os.environ:
             cmake_args.append(f"-DCUDAToolkit_ROOT={os.environ['CUDA_PATH']}")
@@ -84,7 +95,7 @@ class CMakeBuild(build_ext):
 
         build_args = []
         if is_windows:
-            build_args += [f"--config Release"]
+            build_args += ["--config", cfg]
         # Set CMAKE_BUILD_PARALLEL_LEVEL to control the parallel build level
         # across all generators.
         if "CMAKE_BUILD_PARALLEL_LEVEL" not in os.environ:
@@ -112,4 +123,5 @@ class CMakeBuild(build_ext):
 setup(
     ext_modules=[CMakeExtension("cudnn._compiled_module")],
     cmdclass={"build_ext": CMakeBuild},
+    options={"bdist_wheel": {"py_limited_api": "cp312"}} if stable_abi else {},
 )

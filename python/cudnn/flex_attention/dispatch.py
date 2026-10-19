@@ -1356,6 +1356,7 @@ def _flex_attn_bwd(
                 num_q_heads=num_q_heads,
                 num_kv_heads=num_kv_heads,
                 is_varlen=is_varlen,
+                deterministic=deterministic,
             )
             if arch == 90
             else resolve_sm100_bwd_consumer_config(
@@ -1379,6 +1380,7 @@ def _flex_attn_bwd(
             raise NotImplementedError("the resolved arbitrary backward plan requires 2CTA")
         cluster_size = 2 if use_2cta else 1
 
+    dq_swap_ab = arch == 90 and head_dim == head_dim_v == 256 and not deterministic and num_q_heads == num_kv_heads
     if arch == 90:
         tile_m = bwd_config.tile_m
         tile_n = bwd_config.tile_n
@@ -1390,6 +1392,8 @@ def _flex_attn_bwd(
         atom_layout_n_dkv = bwd_config.atom_layout_n_dkv
         atom_layout_m_dq = bwd_config.atom_layout_m_dq
         dq_single_wg = bwd_config.dq_single_wg
+        if deterministic and head_dim == head_dim_v == 256:
+            dkv_swap_ab = False
     else:
         tile_m = 128
         tile_n = 128
@@ -1549,6 +1553,7 @@ def _flex_attn_bwd(
         num_stages_do,
         sdp_swap_ab,
         dkv_swap_ab,
+        dq_swap_ab,
         atom_layout_n_dkv,
         atom_layout_m_dq,
         dq_single_wg,
@@ -1625,6 +1630,7 @@ def _flex_attn_bwd(
                 AtomLayoutNdKV=atom_layout_n_dkv,
                 AtomLayoutMdQ=atom_layout_m_dq,
                 dQ_single_wg=dq_single_wg,
+                dQ_swapAB=dq_swap_ab,
             )
             compile_args = [
                 kernel,
@@ -1806,7 +1812,7 @@ def _flex_attn_bwd(
                 tile_m,
                 num_threads_post_q,
                 atom_layout_m_dq,
-                False,
+                dq_swap_ab,
                 False,
                 is_varlen,
                 use_2cta,
