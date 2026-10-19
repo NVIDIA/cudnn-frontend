@@ -1171,6 +1171,9 @@ def test_DSA_indexer_backward_deterministic_compact_h32(dk_dtype, topk_indices_g
         topk_indices = torch.where(topk_indices >= 0, topk_indices + batch_offsets, topk_indices)
     attn = attn_source.clone()
     grad_loss = torch.ones((), dtype=torch.float32, device="cuda")
+    # Match the unit grad_scale used by the numerical reference:
+    # loss_coeff / (B * S_q) == 1.0.
+    loss_coeff = float(cfg["b"] * cfg["s_q"])
 
     # Canary tails ensure the internal M64 tile cannot escape the compact H32
     # dQ/dW stores while exercising the deterministic persistent-row schedule.
@@ -1196,7 +1199,7 @@ def test_DSA_indexer_backward_deterministic_compact_h32(dk_dtype, topk_indices_g
             index_score,
             topk_indices,
             grad_loss=grad_loss,
-            loss_coeff=float(cfg["s_q"]),
+            loss_coeff=loss_coeff,
             d_index_q=d_index_q,
             d_weights=d_weights,
             d_index_k=d_index_k,
@@ -1222,6 +1225,8 @@ def test_DSA_indexer_backward_deterministic_compact_h32(dk_dtype, topk_indices_g
         d_index_k,
         sm_scale=1.0,
         grad_scale=1.0,
+        cos_min=0.99,
+        rms_rel_max=0.02,
     )
 
 
