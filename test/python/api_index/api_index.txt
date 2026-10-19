@@ -1345,10 +1345,14 @@ cudnn.ops.Nvfp4BlockScaleQuantizer.check_support
 cudnn.ops.Nvfp4BlockScaleQuantizer.compile
 cudnn.ops.Nvfp4BlockScaleQuantizer.execute
 cudnn.ops.b2b_causal_conv1d
+cudnn.ops.block_sparse_attention_backward_jax
+cudnn.ops.block_sparse_attention_forward_jax
 cudnn.ops.causal_conv1d
 cudnn.ops.causal_conv1d_nwh
 cudnn.ops.causal_conv1d_update
 cudnn.ops.fft_causal_conv1d
+cudnn.ops.kimi_delta_attention_backward_jax
+cudnn.ops.kimi_delta_attention_forward_jax
 cudnn.ops.nvfp4_block_scale_dequantize
 cudnn.ops.nvfp4_block_scale_quantize
 cudnn.pack_backward_weights

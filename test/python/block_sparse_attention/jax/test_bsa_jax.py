@@ -18,9 +18,9 @@ if requirement_error:
 jax = pytest.importorskip("jax", minversion="0.9.1")
 import jax.numpy as jnp
 
-from cudnn.jax import block_sparse_attention_forward as forward
-from cudnn.jax import block_sparse_attention_backward as backward
 from cudnn.jax import block_sparse_attention as attention
+from cudnn.ops import block_sparse_attention_forward_jax as forward
+from cudnn.ops import block_sparse_attention_backward_jax as backward
 
 pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 
@@ -135,6 +135,9 @@ import cudnn.jax as cj
 assert "cudnn.block_sparse_attention.jax_api" not in sys.modules
 for name in ("block_sparse_attention", "block_sparse_attention_forward", "block_sparse_attention_backward"):
     assert callable(getattr(cj, name))
+import cudnn.ops
+assert cudnn.ops.block_sparse_attention_forward_jax is cj.block_sparse_attention_forward
+assert cudnn.ops.block_sparse_attention_backward_jax is cj.block_sparse_attention_backward
 assert not hasattr(bsa, "block_sparse_attention")
 assert not hasattr(cudnn.BSA, "block_sparse_attention")
 assert "cudnn.block_sparse_attention.api" not in sys.modules

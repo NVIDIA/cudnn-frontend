@@ -22,7 +22,7 @@ def test_bsa_jax_torch_parity(layout):
     jax = pytest.importorskip("jax", minversion="0.9.1")
     import jax.numpy as jnp
     from cudnn import BSA
-    from cudnn.jax import block_sparse_attention_forward as jax_forward, block_sparse_attention_backward as jax_backward
+    from cudnn.ops import block_sparse_attention_forward_jax as jax_forward, block_sparse_attention_backward_jax as jax_backward
 
     rng = np.random.default_rng(19)
     arrays = [rng.normal(size=shape).astype(np.float32) for shape in ((1, 2, 256, 64), (1, 2, 512, 64), (1, 2, 512, 64))]

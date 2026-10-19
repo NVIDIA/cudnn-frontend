@@ -24,6 +24,10 @@ _LAZY_EXPORTS = {
     "Nvfp4BlockScaleDequantizer": (".nvfp4", "Nvfp4BlockScaleDequantizer"),
     "nvfp4_block_scale_quantize": (".nvfp4", "nvfp4_block_scale_quantize"),
     "nvfp4_block_scale_dequantize": (".nvfp4", "nvfp4_block_scale_dequantize"),
+    "kimi_delta_attention_forward_jax": ("cudnn.linear_attention.jax_api", "kimi_delta_attention_fwd"),
+    "kimi_delta_attention_backward_jax": ("cudnn.linear_attention.jax_api", "kimi_delta_attention_bwd"),
+    "block_sparse_attention_forward_jax": ("cudnn.block_sparse_attention.jax_api", "block_sparse_attention_forward"),
+    "block_sparse_attention_backward_jax": ("cudnn.block_sparse_attention.jax_api", "block_sparse_attention_backward"),
 }
 
 __all__ = list(_LAZY_EXPORTS)

@@ -18,11 +18,8 @@ jax = pytest.importorskip("jax", minversion="0.9.1")
 import jax.numpy as jnp
 import numpy as np
 
-from cudnn.jax import (
-    kimi_delta_attention as kda,
-    kimi_delta_attention_fwd as fwd,
-    kimi_delta_attention_bwd as bwd,
-)
+from cudnn.jax import kimi_delta_attention as kda
+from cudnn.ops import kimi_delta_attention_forward_jax as fwd, kimi_delta_attention_backward_jax as bwd
 
 pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 
@@ -406,6 +403,14 @@ def test_shape_inference():
     assert state.dtype == jnp.float32
     assert residual.checkpoints.shape == (5, 1, 64, 64)
     assert residual.checkpoints.dtype == jnp.bfloat16
+
+
+def test_ops_names_alias_jax_names():
+    import cudnn.jax
+    import cudnn.ops
+
+    assert cudnn.ops.kimi_delta_attention_forward_jax is cudnn.jax.kimi_delta_attention_fwd
+    assert cudnn.ops.kimi_delta_attention_backward_jax is cudnn.jax.kimi_delta_attention_bwd
 
 
 def test_helper_types_not_exported():
