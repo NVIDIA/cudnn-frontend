@@ -637,7 +637,9 @@ constant) and are neither listed by ``pdl_stages`` nor counted by ``use_pdl_effe
 CACHE_WRITE_SMALL_M_DEFAULT_MAX_ROWS = 128
 """The AUTO reading of ``fuse_cache_write_small_m`` (``None``, the default) folds the paged K / V write-through into the norm + RoPE
 launch (``kernels/qk_norm_rope_tma.py``'s pool-write arm: one launch fewer, the pools bitwise the separate write) wherever the arm is
-served and the step's token rows ``T = B x S_q`` are below this bound OR ``S_q == 1`` (a one-token-per-sequence step at any batch); at
+served and the step's token rows ``T = B x S_q`` are below this bound OR ``S_q == 1`` (a one-token-per-sequence step, measured to B 128 --
+past it the rule is reachable only under an explicit ``fuse_norm_rope=False``, since the C0 lowering hands rows > 128 to the fused fork,
+which owns its own write-through); at
 ``T >= 128`` with ``S_q > 1`` the separate cache-write launch runs (the chain as before).  The rule is the measurement on a 212-SM cc 10.7
 part: the arm wins on every B 1 .. 4 cell (+1.1 .. +3.2 % per decode step on the plain chain, +2.4 .. +4.9 % with PDL on; B 1 x KV 4K
 32.2 -> 31.4 us), at B 32 x S_q 1 and B 128 x S_q 1 (the PDL + write-through step +6.9 % / +2.5 % against +2.2 % / +1.8 % from PDL alone),
@@ -952,9 +954,11 @@ class DecodeEnvelope:
     # appended (2026-10-15): the stage kinds that take the ``use_pdl`` switch on this form (:data:`DECODE_PDL_STAGES`; stage (4) on a
     # decode-tile route only -- ``DecodeRoute.pdl_capable`` per route); empty under ``sparse_core`` (the switch is a typed decline there).
     pdl_stages: Tuple[str, ...] = ()
-    # appended (2026-10-19): the AUTO reading of ``use_pdl`` (None) on THIS part for the form -- True on the parts of :data:`DECODE_PDL_DEFAULT_CCS`
-    # for the bf16 / f16 block over pools in the activation dtype (stage (4) takes it on a decode-tile route, ``routes[i].pdl_capable``; a
-    # prefill-route step and an e4m3 cache resolve False), False elsewhere and under ``sparse_core``.  An explicit ``use_pdl`` outranks it.
+    # appended (2026-10-19): the AUTO reading of ``use_pdl`` (None) on THIS part for a SERVED form -- True on the parts of
+    # :data:`DECODE_PDL_DEFAULT_CCS` when ``served`` (the bf16 / f16 block over pools in the activation dtype), False wherever the form is
+    # not served (another part, an unserved dtype, a geometry row, no DSL target) and under ``sparse_core``.  A FORM-level reading: the
+    # per-step one is ``pdl_default and route(s_q, batch).pdl_capable`` (stage (4) takes the switch on a decode-tile route only; a
+    # prefill-route step launches plain and resolves False).  An explicit ``use_pdl`` outranks it.
     pdl_default: bool = False
 
 
@@ -3965,7 +3969,8 @@ class _QkNormRope(_Stage):
         elif self.page_size:
             raise NotImplementedError(
                 f"{self.name}: the paged write-through folded into the norm + RoPE launch is an arm of the TMA kernel (sm_90+, a geometry its tiling "
-                f"fits); this device / geometry resolves to the LDG kernel, which has no such arm -- declare fuse_cache_write_small_m=False (or None)"
+                f"fits), and the dense DECODE form's unfused chain is served on cc 10.7, where that kernel runs; this device resolves the stage to "
+                f"the LDG kernel, which has no such arm -- declare fuse_cache_write_small_m=False (the separate cache-write launch)"
             )
         else:
             from .kernels.qk_norm_rope import validate_shape
@@ -6632,7 +6637,8 @@ class GatedAttentionBlockFwd(APIBase):
         # read of a predecessor's output, a release after the prologue); False is the plain chain on every part.  The FROST GEMM templates
         # launch with the attribute regardless (their module constant USE_PDL).  The same kernels, the same math: `out` is BITWISE the
         # use_pdl=False block's, eagerly and under CUDA-graph capture.  An explicit True is served for the bf16 / f16 block only (no quant, no
-        # e4m3 KV cache, no QsaSpec: a typed decline); AUTO reads False on those pipelines.  A PER-STAGE fact (2026-10-15): a stage whose
+        # e4m3 KV cache, no QsaSpec: a typed decline; pools in the activation dtype, kv_cache_dtype None or that dtype, are the bf16 / f16
+        # block); AUTO reads False on those pipelines and never True where the explicit True is refused.  A PER-STAGE fact (2026-10-15): a stage whose
         # kernel carries no sites -- the paged d256 prefill tile of the DECODE form's prefill route and of the EXTEND form, the dense prefill
         # tiles under kv_source="self" -- launches plain and the link serializes there (correct by PDL's semantics: its successor's wait
         # blocks on full completion); the switch is never forwarded to such a kernel.  `pdl_stages` reads back the stages launching with the
@@ -6670,20 +6676,23 @@ class GatedAttentionBlockFwd(APIBase):
         self.geom = geometry
         self.dtype = sample_h.dtype
         self.device = sample_h.device
-        # Programmatic dependent launch over the chain (the constructor's note): the bf16 / f16 block only -- the quantized pipelines'
-        # quantize stages, the e4m3 write-through and the sparse core carry no griddepcontrol sites yet, so none of those chains overlaps
-        # at its attention link and the switch is a typed decline there (the per-stage form below is the bf16 / f16 chains', whose one
-        # site-less link is a prefill tile).  The FIRST decline of such a declaration, so the message names the switch rather than a
-        # later check's vocabulary.  None = AUTO: nothing to decline here; resolved from the form's facts below (`_pdl_default`), before any
-        # stage is built -- `use_pdl_requested` keeps the declaration, `use_pdl` the resolved switch every stage reads.
+        # Programmatic dependent launch over the chain (the constructor's note): the bf16 / f16 block only -- pools in the activation dtype
+        # (`kv_cache_dtype` None or that dtype: the same block) -- because the quantized pipelines' quantize stages, the e4m3 write-through
+        # and the sparse core carry no griddepcontrol sites yet, so none of those chains overlaps at its attention link and the switch is a
+        # typed decline there (the per-stage form below is the bf16 / f16 chains', whose one site-less link is a prefill tile).  The FIRST
+        # decline of such a declaration, so the message names the switch rather than a later check's vocabulary; a 16-bit kv_cache_dtype that
+        # is not the activation dtype passes here and hears the attribute's own ValueError below.  None = AUTO: nothing to decline here;
+        # resolved from the form's facts below (`_pdl_default`), before any stage is built, and only INSIDE the domain this decline admits
+        # (the two readings of the knob answer for one domain) -- `use_pdl_requested` keeps the declaration, `use_pdl` the resolved switch
+        # every stage reads.
         if use_pdl is not None and not isinstance(use_pdl, bool):
             raise TypeError(f"use_pdl must be None (auto), True or False, got {type(use_pdl).__name__}")
         self.use_pdl_requested: Optional[bool] = use_pdl
         self.use_pdl = bool(use_pdl)
-        if self.use_pdl and (quant is not None or kv_cache_dtype is not None or geometry.qsa is not None):
+        if self.use_pdl and (quant is not None or kv_cache_dtype not in (None, torch.bfloat16, torch.float16) or geometry.qsa is not None):
             raise NotImplementedError(
-                "use_pdl=True is served for the bf16 / f16 block only (no quant / QuantSpec, no kv_cache_dtype, no QsaSpec): those pipelines' "
-                "stages carry no programmatic-dependent-launch sites; declare use_pdl=False"
+                "use_pdl=True is served for the bf16 / f16 block only (no quant / QuantSpec, no e4m3 KV cache -- kv_cache_dtype None or the "
+                "activation dtype --, no QsaSpec): those pipelines' stages carry no programmatic-dependent-launch sites; declare use_pdl=False"
             )
         # FP8: `h` and both weights arrive as e4m3 with a QuantSpec; every
         # activation the block's own kernels touch (slab, O, out, cos/sin, norm
@@ -7478,7 +7487,9 @@ class GatedAttentionBlockFwd(APIBase):
         """The AUTO reading of ``use_pdl`` (None): True iff this is the dense DECODE form on a decode-tile route (``DecodeRoute.pdl_capable``:
         the tile and its split combine carry the griddepcontrol pair), the bf16 / f16 block (no ``quant``, no e4m3 cache, no ``QsaSpec``) and
         the sample's device is one of :data:`DECODE_PDL_DEFAULT_CCS` (cc 10.7, where the default was measured); False everywhere else -- the
-        EXTEND form, ``kv_source="self"``, the DECODE form's prefill route, the quantized pipelines, every other part and no CUDA device."""
+        EXTEND form, ``kv_source="self"``, the DECODE form's prefill route, the quantized pipelines, every other part and no CUDA device.
+        Never True where an explicit True is refused: the two readings of the knob answer for ONE domain (no ``quant``, pools in the
+        activation dtype -- ``kv_cache_dtype`` None or that dtype --, no ``QsaSpec``), the AUTO one narrowed further by route and part."""
         return bool(
             self.decode_route is not None
             and self.decode_route.pdl_capable
@@ -7508,9 +7519,16 @@ class GatedAttentionBlockFwd(APIBase):
         if not self.paged_kv_page_size:
             why = "needs paged_kv_page_size > 0 (there is no write-through to fold)"
         elif self.decode_route is None:
-            why = "is the dense DECODE form's arm (kv_source='paged' on a dense declaration); the EXTEND / packed forms keep their write-through"
+            why = (
+                "is the dense DECODE form's arm (kv_source='paged' on a dense bf16 / f16 declaration without a QsaSpec); the EXTEND / packed forms, the "
+                "write-through on the block's own K / V and the block-sparse decode mode keep their separate cache-write launch"
+            )
         elif self._norm_rope is None:
             why = "folds the write-through into the UNFUSED chain's norm + RoPE launch, and this declaration runs the fused projection fork (which owns the write-through: fuse_cache_write)"
+        # The three rows below are GUARDS no declaration reaches through the constructor today: the write-through's own quant decline
+        # (`_check_cache_write_declaration`) and the no-dense-route row above (a QsaSpec geometry, with or without the indexer band, and the
+        # e4m3 cache ride the block-sparse decode mode) speak first.  Kept so the resolver stays honest on its own facts should a form admit
+        # one of those pipelines onto a decode route; the host cell pins their text on the resolver directly.
         elif quant is not None:
             why = f"serves the bf16 / f16 pipeline only, got quant={type(quant).__name__}"
         elif self.geom.index_band:
@@ -8080,7 +8098,8 @@ class GatedAttentionBlockFwd(APIBase):
         ``decode_route_policy`` (appended) is the policy ``decode.routes`` / ``decode.route()`` are read under (``None`` = the default,
         :data:`DEFAULT_DECODE_ROUTE_POLICY`; ``decode.policy`` names it); ``decode_q_tile_max`` (appended) the width cap they are read
         under (``None`` = the whole single-unit table; ``decode.q_tile_max`` names it); ``decode.pdl_default`` (appended) is the AUTO
-        reading of ``use_pdl`` on this part (:data:`DECODE_PDL_DEFAULT_CCS`)."""
+        reading of ``use_pdl`` on this part for a served dense form (:data:`DECODE_PDL_DEFAULT_CCS`; False where ``decode.served`` is False
+        or under ``sparse_core``) -- the per-step reading is ``decode.pdl_default and decode.route(s_q, batch).pdl_capable``."""
         from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
 
         policy = _resolve_decode_route_policy(decode_route_policy)
@@ -8158,8 +8177,10 @@ class GatedAttentionBlockFwd(APIBase):
             claimed_max_s_q=DECODE_CLAIMED_MAX_S_Q,
             q_tile_max=q_tile_max,
             pdl_stages=() if sparse else DECODE_PDL_STAGES,
-            # the AUTO reading of the switch on this part (a decode-tile route, bf16 / f16 pools): the measured default on cc 10.7
-            pdl_default=(not sparse) and cc in DECODE_PDL_DEFAULT_CCS,
+            # the AUTO reading of the switch on this part for a SERVED dense form (the measured default on cc 10.7): False wherever the form
+            # is not served (`decode_reason`: another part, an unserved dtype, a geometry row, no DSL target) and under the sparse core; the
+            # per-step reading is `pdl_default and route(s_q, batch).pdl_capable`
+            pdl_default=(decode_reason is None) and (not sparse) and cc in DECODE_PDL_DEFAULT_CCS,
         )
         forms = tuple(nm for nm, env in (("extend", extend), ("decode", decode)) if env.served)
         return ServingEnvelope(

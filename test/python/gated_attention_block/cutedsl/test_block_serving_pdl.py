@@ -39,8 +39,9 @@ import pytest
 import torch
 
 import cudnn.gated_attention_block.api as _api
+from cudnn.frost import buffers as _buffers
 from cudnn.frost.buffers import cutedsl_requirement_error
-from cudnn.gated_attention_block import GatedAttentionBlockFwd, decode_route
+from cudnn.gated_attention_block import GatedAttentionBlockFwd, GatedAttentionBlockGeometry, QuantSpec, decode_route
 from cudnn.gated_attention_block.api import (
     DECODE_PDL_DEFAULT_CCS,
     DECODE_PDL_STAGES,
@@ -65,7 +66,7 @@ requires_rubin = pytest.mark.requires_rubin  # the suite's registered marker (co
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from gated_block_pdl_probe import cuda_versions, delayed_write, retrace  # noqa: E402
-from test_block_serving_decode import _DEV, _Case, _bits, _written  # noqa: E402
+from test_block_serving_decode import _D, _D_MODEL, _DEV, _ROPE, _Case, _bits, _geom, _make_block, _written  # noqa: E402
 
 _LENS = (100, 384, 500, 0)  # the decode module's standard cell: a tail tile, ring depth 3 and 4, a PADDED entry
 _CASES = {}
@@ -142,6 +143,79 @@ def test_the_switch_is_recorded_on_every_stage_resolves_by_part_and_declines_the
         _Case(16, 1, (100,), seed=1, blk_kw=dict(use_pdl=True, kv_cache_dtype=torch.float8_e4m3fn))
 
 
+def test_auto_and_the_explicit_switch_answer_for_one_domain_on_the_measured_part(monkeypatch):
+    """With the device read patched to the measured part, AUTO resolves True ONLY where an explicit True is served: the two readings of
+    the knob answer for one domain.  Pools declared in the activation dtype (``kv_cache_dtype=torch.bfloat16``, the ``None`` spelling)
+    take the default and the explicit True alike -- a serving stack that spells the dtype can form its own A/B --, a 16-bit pool of the
+    other width hears the attribute's own ``ValueError``, not the switch's decline.  On every pipeline the default excludes -- the EXTEND
+    form, ``kv_source="self"``, a QuantSpec pipeline, a QsaSpec geometry (with and without the indexer band), the e4m3 cache -- AUTO
+    reads False with no stage switched; the explicit True is served per stage on the two bf16 forms without a decode route (their
+    prefill tiles carry no sites) and is the typed decline on the other three."""
+    import test_block_qsa_decode as _qsa
+    import test_block_qsa_fp8_kv as _qkv
+    import test_block_serving_extend as _ext
+
+    monkeypatch.setattr(_api, "_device_cc_of", lambda device: (10, 7))
+    off = lambda blk: blk.use_pdl is False and blk.use_pdl_requested is None and blk.pdl_stages == () and blk.use_pdl_effective is False  # noqa: E731
+    decline = "use_pdl=True is served for the bf16 / f16 block only"
+    # pools spelled in the activation dtype: the same block as kv_cache_dtype=None, under both readings
+    auto = _make_block(12, 1, 1)[0]
+    spelled = _make_block(12, 1, 1, kv_cache_dtype=torch.bfloat16)[0]
+    assert auto.use_pdl is True and spelled.use_pdl is True and spelled.use_pdl_requested is None and not spelled.kv_cache_e4m3
+    assert spelled.pdl_stages == auto.pdl_stages == ("qk_norm_rope", "sdpa", "sigmoid_gate") and spelled.use_pdl_effective is True
+    on = _make_block(12, 1, 1, kv_cache_dtype=torch.bfloat16, use_pdl=True)[0]
+    assert on.use_pdl is True and on.use_pdl_requested is True and on.pdl_stages == auto.pdl_stages
+    assert _make_block(12, 1, 1, kv_cache_dtype=torch.bfloat16, use_pdl=False)[0].pdl_stages == ()
+    assert _make_block(12, 1, 1, dtype=torch.float16, kv_cache_dtype=torch.float16, use_pdl=True)[0].use_pdl is True
+    assert _make_block(12, 1, 1, dtype=torch.float16, kv_cache_dtype=torch.float16)[0].use_pdl is True
+    with pytest.raises(ValueError, match="differs from the activation dtype"):
+        _make_block(12, 1, 1, kv_cache_dtype=torch.float16, use_pdl=True)
+    with pytest.raises(NotImplementedError, match="no e4m3 KV cache"):
+        _make_block(12, 1, 1, kv_cache_dtype=torch.float8_e4m3fn, use_pdl=True)
+    # the EXTEND form and the block's own K / V: no decode route, AUTO False; the explicit True threads the stages with sites only
+    ext_auto, *_ = _ext._declare_extend(2, 128, max_kv_len=128)
+    assert off(ext_auto) and ext_auto.decode_route is None and isinstance(ext_auto._cache_write, _CacheWrite)
+    ext_on, *_ = _ext._declare_extend(2, 128, max_kv_len=128, use_pdl=True)
+    assert ext_on.use_pdl is True and ext_on._sdpa.use_pdl is False and "sdpa" not in ext_on.pdl_stages and ext_on.use_pdl_effective is False
+    assert ext_on.pdl_stages == ("qk_norm_rope", "cache_write", "sigmoid_gate")
+    geom, _ = _geom(12)
+    mk = lambda *shape: torch.empty(*shape, dtype=torch.bfloat16, device=_DEV)  # noqa: E731
+    args = (mk(1, 1, _D_MODEL), mk(geom.n_qkvg, _D_MODEL), mk(_D), mk(_D), mk(1, 1, _ROPE), mk(1, 1, _ROPE), mk(_D_MODEL, 24 * _D), mk(1, 1, _D_MODEL), geom)
+    own = GatedAttentionBlockFwd(*args)
+    assert off(own) and own.decode_route is None and own.kv_source == "self"
+    own_on = GatedAttentionBlockFwd(*args, use_pdl=True)
+    assert own_on.use_pdl is True and own_on._sdpa.use_pdl is False and "sdpa" not in own_on.pdl_stages and own_on.use_pdl_effective is False
+    # a QuantSpec pipeline: AUTO False, the explicit True declined
+    spec = QuantSpec(descale_h=0.01, descale_w_qkvg=0.02, descale_w_o=0.03, scale_q=1.0, scale_k=2.0, scale_v=3.0, scale_o=4.0)
+    g8 = GatedAttentionBlockGeometry(d_model=_D_MODEL, h_q=8, h_kv=2, d_head=_D, rope_dim=_ROPE)
+    e4 = lambda *shape: torch.zeros(*shape, dtype=torch.float8_e4m3fn, device=_DEV)  # noqa: E731
+    qargs = (
+        e4(1, 256, _D_MODEL),
+        e4(g8.n_qkvg, _D_MODEL),
+        mk(_D),
+        mk(_D),
+        mk(1, 256, _ROPE),
+        mk(1, 256, _ROPE),
+        e4(_D_MODEL, 8 * _D),
+        mk(1, 256, _D_MODEL),
+        g8,
+    )
+    assert off(GatedAttentionBlockFwd(*qargs, quant=spec))
+    with pytest.raises(NotImplementedError, match=decline):
+        GatedAttentionBlockFwd(*qargs, quant=spec, use_pdl=True)
+    # the block-sparse decode mode: a QsaSpec geometry, the indexer band, the e4m3 cache -- AUTO False, the explicit True declined
+    sparse = _qsa._declare(_qsa.GEOM_SMALL, 2, 1, n_pages=4)[0]
+    assert off(sparse) and sparse.decode_route is None and sparse.sparse_decode
+    with pytest.raises(NotImplementedError, match=decline):
+        _qsa._declare(_qsa.GEOM_SMALL, 2, 1, n_pages=4, use_pdl=True)
+    band = _qsa._declare(_qsa.GEOM_SMALL, 4, 1, n_pages=6, index_band=True, fuse_norm_rope=False)[0]
+    assert off(band) and band.geom.index_band
+    e4m3 = _qkv._declare(_qkv.GEOM_SMALL, 2, 1, fuse_norm_rope=False)[0]
+    assert off(e4m3) and e4m3.kv_cache_e4m3 and e4m3.decode_route is None
+    with pytest.raises(NotImplementedError, match="no e4m3 KV cache"):
+        _qkv._declare(_qkv.GEOM_SMALL, 2, 1, fuse_norm_rope=False, use_pdl=True)
+
+
 def test_the_prefill_route_keeps_the_switch_off_stage_four_and_reads_back_which_stages_took_it(monkeypatch):
     """The switch is PER STAGE: at 32 / 2, ``S_q = 5`` the DECODE form rides the paged d256 PREFILL tile (80 packed rows), whose
     template carries no griddepcontrol sites -- so the block declares fine, hands the switch to the norm + RoPE pass and the
@@ -178,10 +252,17 @@ def test_the_prefill_route_keeps_the_switch_off_stage_four_and_reads_back_which_
     env = GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, _DEV)
     assert env.decode.pdl_stages == DECODE_PDL_STAGES == ("qk_norm_rope", "cache_write", "sigmoid_gate", "sdpa")
     assert env.extend.pdl_stages == EXTEND_PDL_STAGES == ("qk_norm_rope", "cache_write", "sigmoid_gate")
-    # the part's AUTO reading of the switch, before anything is declared: this host's, and the measured part's against another part's
-    assert env.decode.pdl_default is (env.device_cc in DECODE_PDL_DEFAULT_CCS)
-    assert GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, _DEV, device_cc=(10, 7)).decode.pdl_default is True
+    # the part's AUTO reading of the switch, before anything is declared: this host's, and the measured part's against another part's --
+    # a FORM-level reading of a SERVED form (the measured part's reading needs the DSL's Rubin target, patched present as the decode module
+    # does; an unserved dtype reads False there); the per-step reading is `pdl_default and route(s_q, batch).pdl_capable`
+    assert env.decode.pdl_default is (env.decode.served and env.device_cc in DECODE_PDL_DEFAULT_CCS)
+    monkeypatch.setattr(_buffers, "_cutedsl_has_sm107", lambda: True)
+    rubin = GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, _DEV, device_cc=(10, 7)).decode
+    assert rubin.served and rubin.pdl_default is True and rubin.route(4).pdl_capable and not rubin.route(5, batch=32).pdl_capable
     assert GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, _DEV, device_cc=(10, 0)).decode.pdl_default is False
+    fp32 = GatedAttentionBlockFwd.serving_envelope(geom, torch.float32, _DEV, device_cc=(10, 7)).decode
+    assert not fp32.served and fp32.pdl_default is False, "the default is a reading of a served form"
+    monkeypatch.undo()
     assert (
         all(r.pdl_capable is r.decode_tile for r in env.decode.routes)
         and env.decode.route(5, batch=32).pdl_capable is False

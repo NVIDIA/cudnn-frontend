@@ -572,8 +572,12 @@ def test_the_envelope_on_a_rubin_reading_serves_the_decode_form_and_names_every_
     # the programmatic-dependent-launch readbacks: the switched stage kinds per form, stage (4) on a decode-tile route only
     assert d.pdl_stages == ("qk_norm_rope", "cache_write", "sigmoid_gate", "sdpa") and env.extend.pdl_stages == ("qk_norm_rope", "cache_write", "sigmoid_gate")
     assert all(r.pdl_capable is r.decode_tile for r in d.routes) and d.route(1).pdl_capable and not d.route(33).pdl_capable
-    # the AUTO reading of the switch on this part (a Rubin reading): on; off on every other part
+    # the AUTO reading of the switch on this part (a Rubin reading of a SERVED form): on; off on every other part and on an unserved dtype
+    # (a form-level reading: the per-step one is `pdl_default and route(s_q, batch).pdl_capable`)
     assert d.pdl_default is True and GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, _DEV, device_cc=(10, 0)).decode.pdl_default is False
+    fp32 = GatedAttentionBlockFwd.serving_envelope(geom, torch.float32, _DEV, device_cc=_SM107).decode
+    assert not fp32.served and fp32.pdl_default is False, "the default is a reading of a served form"
+    assert (d.pdl_default and d.route(1).pdl_capable) is True and (d.pdl_default and d.route(33).pdl_capable) is False
     g16, _ = _geom(16)
     e16 = GatedAttentionBlockFwd.serving_envelope(g16, torch.bfloat16, _DEV, device_cc=_SM107).decode
     assert e16.route(4).pdl_capable and not e16.route(5, batch=32).pdl_capable and e16.route(5, batch=32).prefill_tile and e16.route(9).pdl_capable
@@ -594,6 +598,7 @@ def test_the_envelope_requires_the_rubin_dsl_target(monkeypatch, version, has_ta
     env = GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, "cpu", device_cc=_SM107)
     assert env.cutedsl_ok is has_target
     assert env.extend.served is has_target and env.decode.served is has_target
+    assert env.decode.pdl_default is has_target  # the default follows the served form: no Rubin target, no PDL default
     assert env.forms == (("extend", "decode") if has_target else ())
     assert env.decode.route(1).served  # Geometry remains inspectable without a runnable target.
     if has_target:
@@ -2117,8 +2122,9 @@ def test_the_write_through_in_the_norm_rope_launch_drops_the_cache_write_launch_
 def test_fuse_cache_write_small_m_resolves_the_measured_rule_by_default_and_the_arm_owns_the_write():
     """``fuse_cache_write_small_m`` (appended; None = AUTO): where the paged write-through runs on the DECODE form's unfused chain.  AUTO is
     the MEASURED rule (``CACHE_WRITE_SMALL_M_DEFAULT_MAX_ROWS``): the write-through folds into the norm + RoPE launch (the stage carries the
-    page size, the separate stage is not built, the stage list loses ``cache_write``) at ``B x S_q < 128`` rows and at ``S_q = 1`` at any
-    batch; the separate launch runs at ``B x S_q >= 128`` with ``S_q > 1`` (where the arm measured slower) -- both edges pinned, an explicit
+    page size, the separate stage is not built, the stage list loses ``cache_write``) at ``B x S_q < 128`` rows and at ``S_q = 1``
+    (measured to B 128; past it only under an explicit ``fuse_norm_rope=False``); the separate launch runs at ``B x S_q >= 128`` with
+    ``S_q > 1`` (where the arm measured slower) -- both edges pinned, an explicit
     True / False winning on either side; the C0-lowered ``fuse_norm_rope=True`` declaration follows the same rule where it lowers and leaves
     the fork its own write-through past the bound; f16 pools take the arm; the typed declines (the fused fork, a self block, a non-bool); the
     carve does not read it."""
@@ -2137,7 +2143,8 @@ def test_fuse_cache_write_small_m_resolves_the_measured_rule_by_default_and_the_
     on = at(fuse_cache_write_small_m=True)
     assert on.fuse_cache_write_small_m is True and on.cache_write_in_norm_rope is True and on._cache_write is None and names(on) == names(auto)
     # the measured rule at its edges on the unfused chain (fuse_norm_rope=False: declared unfused at any row count, so the rule alone
-    # decides): every B 1 .. 4 cell and S_q = 1 at any batch fold in; 128 rows with S_q > 1 do not (B 32 x 4 = the measured loss), 127 do
+    # decides): every B 1 .. 4 cell and S_q = 1 (to B 129 here; measured to B 128) fold in; 128 rows with S_q > 1 do not (B 32 x 4 = the measured
+    # loss), 127 do
     cells = (
         ((1, 1), True),
         ((4, 4), True),
@@ -2195,3 +2202,83 @@ def test_fuse_cache_write_small_m_resolves_the_measured_rule_by_default_and_the_
             geom,
             fuse_cache_write_small_m=True,
         )
+
+
+def test_fuse_cache_write_small_m_is_a_typed_decline_off_the_arm_and_auto_reads_false_there():
+    """``fuse_cache_write_small_m=True`` off the arm's domain is a typed ``NotImplementedError`` naming the reason, and ``None`` reads False
+    there with the separate cache-write stage built (where there is a write-through at all): the EXTEND form and the write-through on the
+    block's own K / V (no dense decode route), the block-sparse decode mode -- a QsaSpec geometry with and without the indexer band, the
+    e4m3 cache -- (no dense route either: the no-route row speaks for them), a QuantSpec pipeline (the write-through's own quant decline
+    speaks first; without the attribute there is nothing to fold), fp32 activations on the dense form (the activation row).  The
+    resolver's quant / indexer-band / e4m3 rows are GUARDS the constructor cannot reach today; their text is pinned on the resolver
+    directly, so a form that admits one of those pipelines onto a decode route meets a pinned decline rather than a silent fold."""
+    import test_block_qsa_decode as _qsa
+    import test_block_qsa_fp8_kv as _qkv
+    import test_block_serving_extend as _ext
+    from cudnn.gated_attention_block import QuantSpec
+
+    no_route = "is the dense DECODE form's arm"
+    # the EXTEND form (packed, over the pools) and the dense write-through on the block's own K / V
+    with pytest.raises(NotImplementedError, match=no_route):
+        _ext._declare_extend(2, 128, max_kv_len=128, fuse_cache_write_small_m=True)
+    ext_auto, *_ = _ext._declare_extend(2, 128, max_kv_len=128)
+    assert ext_auto.cache_write_in_norm_rope is False and isinstance(ext_auto._cache_write, _CacheWrite) and ext_auto._norm_rope.page_size == 0
+    geom, _ = _geom(12)
+    mk = lambda *shape: torch.empty(*shape, dtype=torch.bfloat16, device=_DEV)  # noqa: E731
+    args = (mk(1, 1, _D_MODEL), mk(geom.n_qkvg, _D_MODEL), mk(_D), mk(_D), mk(1, 1, _ROPE), mk(1, 1, _ROPE), mk(_D_MODEL, 24 * _D), mk(1, 1, _D_MODEL), geom)
+    with pytest.raises(NotImplementedError, match=no_route):
+        GatedAttentionBlockFwd(*args, paged_kv_page_size=16, fuse_cache_write_small_m=True)
+    own = GatedAttentionBlockFwd(*args, paged_kv_page_size=16)
+    assert own.kv_source == KV_SOURCE_SELF and own.cache_write_in_norm_rope is False and isinstance(own._cache_write, _CacheWrite)
+    # the block-sparse decode mode: a QsaSpec geometry, the indexer band, the e4m3 cache -- no dense route
+    for decl in (
+        lambda **kw: _qsa._declare(_qsa.GEOM_SMALL, 2, 1, n_pages=4, fuse_norm_rope=False, **kw)[0],
+        lambda **kw: _qsa._declare(_qsa.GEOM_SMALL, 4, 1, n_pages=6, index_band=True, fuse_norm_rope=False, **kw)[0],
+        lambda **kw: _qkv._declare(_qkv.GEOM_SMALL, 2, 1, fuse_norm_rope=False, **kw)[0],
+    ):
+        with pytest.raises(NotImplementedError, match=no_route):
+            decl(fuse_cache_write_small_m=True)
+        blk = decl()
+        assert blk.decode_route is None and blk.cache_write_in_norm_rope is False and blk._cache_write is not None and blk._norm_rope.page_size == 0
+    # a QuantSpec pipeline: the write-through's own decline speaks first (e4m3 pools are the cache-dtype attribute's); nothing to fold without it
+    spec = QuantSpec(descale_h=0.01, descale_w_qkvg=0.02, descale_w_o=0.03, scale_q=1.0, scale_k=2.0, scale_v=3.0, scale_o=4.0)
+    g8 = GatedAttentionBlockGeometry(d_model=_D_MODEL, h_q=8, h_kv=2, d_head=_D, rope_dim=_ROPE)
+    e4 = lambda *shape: torch.zeros(*shape, dtype=torch.float8_e4m3fn, device=_DEV)  # noqa: E731
+    qargs = (
+        e4(1, 256, _D_MODEL),
+        e4(g8.n_qkvg, _D_MODEL),
+        mk(_D),
+        mk(_D),
+        mk(1, 256, _ROPE),
+        mk(1, 256, _ROPE),
+        e4(_D_MODEL, 8 * _D),
+        mk(1, 256, _D_MODEL),
+        g8,
+    )
+    with pytest.raises(NotImplementedError, match="paged_kv_page_size with quant=QuantSpec"):
+        GatedAttentionBlockFwd(*qargs, quant=spec, paged_kv_page_size=16, fuse_cache_write_small_m=True)
+    with pytest.raises(NotImplementedError, match="needs paged_kv_page_size > 0"):
+        GatedAttentionBlockFwd(*qargs, quant=spec, fuse_cache_write_small_m=True)
+    quant = GatedAttentionBlockFwd(*qargs, quant=spec)
+    assert quant.cache_write_in_norm_rope is False and quant._cache_write is None and quant.paged_kv_page_size == 0
+    # fp32 activations on the dense DECODE form (declared here, declined by check_support): the activation row
+    with pytest.raises(NotImplementedError, match="serves bf16 / f16 activations"):
+        _make_block(12, 1, 1, dtype=torch.float32, fuse_cache_write_small_m=True)
+    f32 = _make_block(12, 1, 1, dtype=torch.float32)[0]
+    assert f32.decode_route is not None and f32.cache_write_in_norm_rope is False and isinstance(f32._cache_write, _CacheWrite)
+    # the guard rows, on the resolver directly (a dense decode declaration with the facts forced): quant, the indexer band, the e4m3 cache
+    blk = _make_block(12, 1, 1)[0]
+    assert blk.cache_write_in_norm_rope is True
+    with pytest.raises(NotImplementedError, match="serves the bf16 / f16 pipeline only, got quant=QuantSpec"):
+        blk._resolve_cache_write_small_m(True, spec)
+    assert blk._resolve_cache_write_small_m(None, spec) is False
+    blk.geom = _qsa._geom(_qsa.GEOM_SMALL, index_band=True)[0]
+    assert blk.geom.index_band
+    with pytest.raises(NotImplementedError, match="indexer band"):
+        blk._resolve_cache_write_small_m(True, None)
+    assert blk._resolve_cache_write_small_m(None, None) is False
+    blk.geom = geom
+    blk.kv_cache_e4m3 = True
+    with pytest.raises(NotImplementedError, match="QUANTIZES"):
+        blk._resolve_cache_write_small_m(True, None)
+    assert blk._resolve_cache_write_small_m(None, None) is False
