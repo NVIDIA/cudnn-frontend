@@ -275,6 +275,27 @@ def _load_f32x4(source: cute.Pointer, *, loc=None, ip=None) -> Tuple[Float32, Fl
 
 
 @dsl_user_op
+def _store_f32x4(destination: cute.Pointer, value_0: Float32, value_1: Float32, value_2: Float32, value_3: Float32, *, loc=None, ip=None) -> None:
+    """Store four naturally aligned FP32 values with one 128-bit instruction."""
+    destination_i64 = destination.toint(loc=loc, ip=ip).ir_value()
+    llvm.inline_asm(
+        None,
+        [
+            destination_i64,
+            Float32(value_0).ir_value(loc=loc, ip=ip),
+            Float32(value_1).ir_value(loc=loc, ip=ip),
+            Float32(value_2).ir_value(loc=loc, ip=ip),
+            Float32(value_3).ir_value(loc=loc, ip=ip),
+        ],
+        "st.global.v4.f32 [$0], {$1, $2, $3, $4};",
+        "l,f,f,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
 def _match_any_sync_i32(value: Int32, *, loc=None, ip=None) -> Int32:
     """Return the full-warp mask of lanes whose 32-bit value matches this lane."""
     return Int32(
@@ -4050,7 +4071,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic(TwoCTADeterminis
 
     @cute.kernel
     def fold_dKV_shards(self, mdKV_acc: cute.Tensor, seqlen: Int32, active_shards: Int32):
-        """Fold eight accumulator slots, with each tail added in rank-0 then rank-1 order."""
+        """Fold eight accumulator slots four adjacent FP32 dimensions at a time."""
         row, group, _ = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
         pitch = cute.round_up(seqlen, 8)
@@ -4061,22 +4082,12 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic(TwoCTADeterminis
         group_tensor = cute.make_tensor(mdKV_acc.iterator + group_offset, cute.make_layout((self.head_dim, pitch), stride=(1, self.head_dim)))
         group_begin = group * Int32(self.COMPACT_QUERIES_PER_GROUP)
         if row < seqlen:
-            if tidx < Int32(256):
-                for main_half in cutlass.range_constexpr(2):
-                    dim = tidx + Int32(main_half * 256)
-                    acc = Float32(0.0)
-                    for local_query in cutlass.range_constexpr(self.COMPACT_QUERIES_PER_GROUP):
-                        slot = group_begin + Int32(local_query)
-                        if slot < active_shards:
-                            slot_tensor = cute.make_tensor(
-                                mdKV_acc.iterator + cutlass.Int64(slot) * slot_pitch,
-                                cute.make_layout((self.COMPACT_RECORD, pitch), stride=(1, self.COMPACT_RECORD)),
-                            )
-                            acc += slot_tensor[dim, row]
-                    group_tensor[dim, row] = acc
-            if tidx >= Int32(256):
-                tail_dim = tidx - Int32(256)
-                tail_acc = Float32(0.0)
+            if tidx < Int32(128):
+                dim = tidx * Int32(4)
+                acc_0 = Float32(0.0)
+                acc_1 = Float32(0.0)
+                acc_2 = Float32(0.0)
+                acc_3 = Float32(0.0)
                 for local_query in cutlass.range_constexpr(self.COMPACT_QUERIES_PER_GROUP):
                     slot = group_begin + Int32(local_query)
                     if slot < active_shards:
@@ -4084,9 +4095,41 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic(TwoCTADeterminis
                             mdKV_acc.iterator + cutlass.Int64(slot) * slot_pitch,
                             cute.make_layout((self.COMPACT_RECORD, pitch), stride=(1, self.COMPACT_RECORD)),
                         )
-                        tail_acc += slot_tensor[Int32(self.D_HEAD) + tail_dim, row]
-                        tail_acc += slot_tensor[Int32(self.D_QK) + tail_dim, row]
-                group_tensor[Int32(self.D_HEAD) + tail_dim, row] = tail_acc
+                        source = slot_tensor.iterator + cute.crd2idx((dim, row), slot_tensor.layout)
+                        values = _load_f32x4(source)
+                        acc_0 += values[0]
+                        acc_1 += values[1]
+                        acc_2 += values[2]
+                        acc_3 += values[3]
+                destination = group_tensor.iterator + cute.crd2idx((dim, row), group_tensor.layout)
+                _store_f32x4(destination, acc_0, acc_1, acc_2, acc_3)
+            if tidx >= Int32(128) and tidx < Int32(144):
+                tail_dim = (tidx - Int32(128)) * Int32(4)
+                acc_0 = Float32(0.0)
+                acc_1 = Float32(0.0)
+                acc_2 = Float32(0.0)
+                acc_3 = Float32(0.0)
+                for local_query in cutlass.range_constexpr(self.COMPACT_QUERIES_PER_GROUP):
+                    slot = group_begin + Int32(local_query)
+                    if slot < active_shards:
+                        slot_tensor = cute.make_tensor(
+                            mdKV_acc.iterator + cutlass.Int64(slot) * slot_pitch,
+                            cute.make_layout((self.COMPACT_RECORD, pitch), stride=(1, self.COMPACT_RECORD)),
+                        )
+                        rank_0 = slot_tensor.iterator + cute.crd2idx((Int32(self.D_HEAD) + tail_dim, row), slot_tensor.layout)
+                        rank_1 = slot_tensor.iterator + cute.crd2idx((Int32(self.D_QK) + tail_dim, row), slot_tensor.layout)
+                        values_0 = _load_f32x4(rank_0)
+                        values_1 = _load_f32x4(rank_1)
+                        acc_0 += values_0[0]
+                        acc_0 += values_1[0]
+                        acc_1 += values_0[1]
+                        acc_1 += values_1[1]
+                        acc_2 += values_0[2]
+                        acc_2 += values_1[2]
+                        acc_3 += values_0[3]
+                        acc_3 += values_1[3]
+                destination = group_tensor.iterator + cute.crd2idx((Int32(self.D_HEAD) + tail_dim, row), group_tensor.layout)
+                _store_f32x4(destination, acc_0, acc_1, acc_2, acc_3)
 
     @cute.kernel
     def fold_dKV_groups(self, mdKV_acc: cute.Tensor, seqlen: Int32, active_groups: Int32):
@@ -4179,7 +4222,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic(TwoCTADeterminis
     def fold_dKV_accumulator(self, mdKV_acc: cute.Tensor, seqlen: Int32, stream: cuda.CUstream, active_shards: Int32):
         """Launch both fixed-order compact folds and return the contiguous result."""
         active_groups = cute.ceil_div(active_shards, self.COMPACT_QUERIES_PER_GROUP)
-        self.fold_dKV_shards(mdKV_acc, seqlen, active_shards).launch(grid=[seqlen, active_groups, 1], block=[320, 1, 1], stream=stream)
+        self.fold_dKV_shards(mdKV_acc, seqlen, active_shards).launch(grid=[seqlen, active_groups, 1], block=[160, 1, 1], stream=stream)
         self.fold_dKV_groups(mdKV_acc, seqlen, active_groups).launch(grid=[seqlen, 1, 1], block=[256, 1, 1], stream=stream)
         pitch = cute.round_up(seqlen, 8)
         slot_pitch = cutlass.Int64(pitch) * cutlass.Int64(self.COMPACT_RECORD)
@@ -4205,7 +4248,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic(TwoCTADeterminis
     ):
         """Preserve the compact FP32 fold order and fuse the multi-query dSink tail."""
         active_groups = cute.ceil_div(active_shards, self.COMPACT_QUERIES_PER_GROUP)
-        self.fold_dKV_shards(mdKV_acc, seqlen, active_shards).launch(grid=[seqlen, active_groups, 1], block=[320, 1, 1], stream=stream)
+        self.fold_dKV_shards(mdKV_acc, seqlen, active_shards).launch(grid=[seqlen, active_groups, 1], block=[160, 1, 1], stream=stream)
         sink_blocks = 0
         if cutlass.const_expr(not self.SINGLE_QUERY):
             sink_blocks = 16
