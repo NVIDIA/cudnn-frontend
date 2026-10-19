@@ -1144,6 +1144,93 @@ def test_DSA_indexer_backward_deterministic_contract(backend, dk_dtype, repeats,
 
 
 @pytest.mark.L1
+@pytest.mark.parametrize(
+    "dk_dtype,topk_indices_global,topk,seqlen_k",
+    [
+        pytest.param(torch.float32, False, 512, 512, id="topk512-fp32-dk-local-ids"),
+        pytest.param(torch.bfloat16, True, 512, 512, id="topk512-bf16-dk-global-ids"),
+        pytest.param(torch.float32, True, 2048, 2048, id="topk2048-fp32-dk-global-ids"),
+    ],
+)
+@torch_fork_set_rng(seed=1711)
+def test_DSA_indexer_backward_deterministic_compact_h32(dk_dtype, topk_indices_global, topk, seqlen_k):
+    """Compact H32 preserves its public extent across fixed producer handoffs."""
+    try:
+        from cudnn import DSA
+        from cudnn.deepseek_sparse_attention.indexer_backward.deterministic_dk_sm100 import deterministic_dk_workspace_bytes
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    _require_exact_sm100()
+
+    # With 96 planes, 194 rows makes producer zero revisit its dK plane twice.
+    cfg = dict(b=2, s_q=97, s_kv=seqlen_k, head_dim=128, qhead_per_kv_head=32, topk=topk)
+    index_q, weights, index_k, attn_source, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
+    reference_topk_indices = topk_indices
+    if topk_indices_global:
+        batch_offsets = torch.arange(cfg["b"], dtype=torch.int32, device="cuda").view(cfg["b"], 1, 1) * cfg["s_kv"]
+        topk_indices = torch.where(topk_indices >= 0, topk_indices + batch_offsets, topk_indices)
+    attn = attn_source.clone()
+    grad_loss = torch.ones((), dtype=torch.float32, device="cuda")
+    # Match the unit grad_scale used by the numerical reference:
+    # loss_coeff / (B * S_q) == 1.0.
+    loss_coeff = float(cfg["b"] * cfg["s_q"])
+
+    # Canary tails ensure the internal M64 tile cannot escape the compact H32
+    # dQ/dW stores while exercising the deterministic persistent-row schedule.
+    guard_elems = 256
+    guard_value = 23.0
+    dq_storage = torch.full((index_q.numel() + guard_elems,), guard_value, dtype=index_q.dtype, device=index_q.device)
+    dw_storage = torch.full((weights.numel() + guard_elems,), guard_value, dtype=weights.dtype, device=weights.device)
+    d_index_q = dq_storage[: index_q.numel()].view_as(index_q)
+    d_weights = dw_storage[: weights.numel()].view_as(weights)
+    d_index_k = torch.empty_like(index_k, dtype=dk_dtype)
+    workspace = torch.empty(deterministic_dk_workspace_bytes(cfg["b"], cfg["s_kv"], cfg["head_dim"]), dtype=torch.uint8, device="cuda")
+
+    def run():
+        attn.copy_(attn_source)
+        workspace.fill_(0xA5)
+        for output in (d_index_q, d_weights, d_index_k):
+            output.fill_(float("nan"))
+        DSA.indexer_backward_wrapper(
+            index_q,
+            weights,
+            index_k,
+            attn,
+            index_score,
+            topk_indices,
+            grad_loss=grad_loss,
+            loss_coeff=loss_coeff,
+            d_index_q=d_index_q,
+            d_weights=d_weights,
+            d_index_k=d_index_k,
+            workspace=workspace,
+            backend="default",
+            deterministic=True,
+            topk_indices_global=topk_indices_global,
+        )
+        return tuple(t.clone() for t in (d_index_q, d_weights, d_index_k, attn))
+
+    assert_bitwise_runs(run, label=f"default H32 {dk_dtype=} {topk_indices_global=}")
+    torch.testing.assert_close(dq_storage[index_q.numel() :], torch.full_like(dq_storage[index_q.numel() :], guard_value), rtol=0.0, atol=0.0)
+    torch.testing.assert_close(dw_storage[weights.numel() :], torch.full_like(dw_storage[weights.numel() :], guard_value), rtol=0.0, atol=0.0)
+    check_ref_indexer_backward(
+        index_q,
+        weights,
+        index_k,
+        attn_source,
+        index_score,
+        reference_topk_indices,
+        d_index_q,
+        d_weights,
+        d_index_k,
+        sm_scale=1.0,
+        grad_scale=1.0,
+        cos_min=0.99,
+        rms_rel_max=0.02,
+    )
+
+
+@pytest.mark.L1
 @pytest.mark.parametrize("backend", ["default", "sm100_v2"])
 @pytest.mark.parametrize(
     "dk_planes,s_q,dk_dtype",
