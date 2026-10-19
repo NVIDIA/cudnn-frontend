@@ -795,17 +795,19 @@ def exec_sdpa_mxfp8_thd(cfg, request, cudnn_handle):
     if getattr(graph, "selected_engine", None) is None:
         pytest.skip("MXFP8 THD graph fell back to the native backend (FROST engine declined); native cannot execute THD mxfp8")
 
-    # Bind the flat packed storages directly: the graph reads only the base
-    # pointer, and a dense (b, h, s_max, d) view need not fit in a
-    # total-token-capacity buffer.
+    # Bind packed (T, H, D) views so the THD binder can observe token/head
+    # strides without requiring a dense (b, h, s_max, d) allocation. These
+    # zero-copy views retain the full capacity, including NaN-poisoned tails.
     variant_pack = {
-        tq: q_stor, tk: k_stor, tv: v_stor,
+        tq: q_stor.view(max_t_q, h_q, d_qk),
+        tk: k_stor.view(max_t_kv, h_k, d_qk),
+        tv: v_stor.view(max_t_kv, h_v, d_vo),
         sf_q_t: sfq_pk, sf_k_t: sfk_pk, sf_v_t: sfv_pk,
         len_q_t: cu_q_gpu if cfg.is_cu_seq_len else seq_len_q_gpu,
         len_kv_t: cu_kv_gpu if cfg.is_cu_seq_len else seq_len_kv_gpu,
         t_ro_q: ro_q, t_ro_k: ro_k, t_ro_v: ro_v, t_ro_o: ro_o,
         t_ro_stats: ro_stats,
-        o_t: o_stor,
+        o_t: o_stor.view(max_t_q, h_q, d_vo),
         stats_t: stats_stor,
         amax_o_t: amax_o_gpu,
     }
