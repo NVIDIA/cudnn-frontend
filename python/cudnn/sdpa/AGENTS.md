@@ -600,6 +600,11 @@ Backward (d512 stage 2):
   `test_head_subgroup_rule_is_scoped_and_workspace_is_honest`. They check
   old/new bitwise gradients against an independent oracle, poisoned scratch,
   stream/storage replay, exactly one fold and unchanged fitting choices.
+  Keep the stage-3 source pins consistent with ceiling division while retaining
+  the `b_head_group == 1` constant-fold checks. The SM107 suite's host-only
+  `test_stage3_b_descriptor_covers_partial_head_groups` evaluates the actual
+  template expression against the K heads reached by every Q head; restoring
+  floor division must fail for a subgroup smaller than one complete GQA group.
 
 Measured on the SM100 d512 backward's dV / dK / dQ GEMMs (B200, 148 SMs, 1155 MHz SW power cap, cuDNN 9.26.0.51, DSL 4.7.0,
 2026-10-01; the numbers quoted here are the per-GEMM CUPTI medians of CLEAN in-process round-robin A/B slots, and the constant's
