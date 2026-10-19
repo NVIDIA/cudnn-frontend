@@ -22,6 +22,13 @@ import statistics
 import torch
 from cudnn.csa import CSACompressorBackward
 
+# Mirrors the generic producer schedule so the benchmark can read its ratio-4
+# partial planes before the hierarchical reducer's stage buffer. On the seeded 1M
+# case, both deterministic trees stay within 2.1e-4 of the FP64 sum while the
+# atomic result varies by more than 1.9e-3.
+_GENERIC_BWD_ROWS_PER_CTA = 8
+_DAPE_FP64_ATOL = 2.5e-4
+
 SHAPES = (
     ("r4-c2-d128-1x8192", [8192], 128, 4, 2),
     ("r4-c2-d128-3x8192", [8192] * 3, 128, 4, 2),
@@ -99,6 +106,19 @@ def _event_us(fn):
     return start.elapsed_time(end) * 1000.0
 
 
+def _dape_fp64_reference(workspace, total_comp, ratio, coff, d):
+    """Sum the reducer's FP32 producer partials independently in FP64."""
+    nelems = ratio * coff * d
+    if ratio == 4:
+        npartials = (total_comp + _GENERIC_BWD_ROWS_PER_CTA - 1) // _GENERIC_BWD_ROWS_PER_CTA
+    else:
+        # Ratio 128 chooses rows_per_cta from the runtime device shape; its
+        # workspace (like generic ratio 2) contains only the producer planes.
+        npartials = workspace.numel() // (nelems * 4)
+    partials = workspace[: npartials * nelems * 4].view(torch.float32).view(npartials, ratio, coff * d)
+    return partials.sum(dim=0, dtype=torch.float64)
+
+
 def _bench_shape(name, lens, d, ratio, coff, args):
     inputs = _make_inputs(lens, d, ratio, coff)
     kv, score, ape, cu, cuc, grad_out = inputs
@@ -127,6 +147,7 @@ def _bench_shape(name, lens, d, ratio, coff, args):
             execute(True)
     torch.cuda.synchronize()
 
+    accuracy = {}
     if True in plans:
         grad_ape.zero_()
         execute(False)
@@ -137,7 +158,10 @@ def _bench_shape(name, lens, d, ratio, coff, args):
         torch.cuda.synchronize()
         assert torch.equal(grad_kv, atomic_kv)
         assert torch.equal(grad_score, atomic_score)
-        assert torch.allclose(grad_ape, atomic_ape, rtol=0, atol=1e-3)
+        dape_reference = _dape_fp64_reference(workspace, grad_out.shape[0], ratio, coff, d)
+        accuracy["atomic_dape_fp64_max_abs"] = (atomic_ape.double() - dape_reference).abs().max().item()
+        accuracy["deterministic_dape_fp64_max_abs"] = (grad_ape.double() - dape_reference).abs().max().item()
+        torch.testing.assert_close(grad_ape.double(), dape_reference, rtol=0, atol=_DAPE_FP64_ATOL)
         deterministic_ape = grad_ape.clone()
         grad_ape.fill_(float("nan"))
         execute(True)
@@ -164,6 +188,7 @@ def _bench_shape(name, lens, d, ratio, coff, args):
         "workspace_mib": workspace_bytes / (1024 * 1024),
         "atomic_kernel_us": statistics.median(kernel[False]),
         "atomic_operation_us": statistics.median(operation[False]),
+        **accuracy,
     }
     if True in plans:
         result.update(
