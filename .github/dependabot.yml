@@ -1,0 +1,31 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - cat-routine-update
+      - area:ci
+      - orig-bot
+
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - cat-routine-update
+      - area:python
+      - orig-bot
+
+  - package-ecosystem: pip
+    directory: /tools/cudnn_repro
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - cat-routine-update
+      - area:tools
+      - orig-bot
