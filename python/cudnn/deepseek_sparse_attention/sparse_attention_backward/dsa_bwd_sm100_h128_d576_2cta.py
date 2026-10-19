@@ -4218,6 +4218,67 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic(TwoCTADeterminis
                     if chain == Int32(0):
                         d_sink[head, (0, 0)] = acc
 
+    @cute.kernel
+    def fold_dKV_groups_to_output_vectorized(self, mdKV_acc: cute.Tensor, mdKV: cute.Tensor, seqlen: Int32, active_groups: Int32):
+        """Fold group planes four physical FP32 values at a time and write logical BF16 dKV."""
+        row, _, _ = cute.arch.block_idx()
+        tidx, _, _ = cute.arch.thread_idx()
+        pitch = cute.round_up(seqlen, 8)
+        slot_pitch = cutlass.Int64(pitch) * cutlass.Int64(self.COMPACT_RECORD)
+        group_pitch = cutlass.Int64(pitch) * cutlass.Int64(self.head_dim)
+        group_region = cutlass.Int64(self.COMPACT_SLOTS) * slot_pitch
+        if row < seqlen:
+            if tidx < Int32(128):
+                physical_0 = tidx * Int32(4)
+                acc_0 = Float32(0.0)
+                acc_1 = Float32(0.0)
+                acc_2 = Float32(0.0)
+                acc_3 = Float32(0.0)
+                for group in cutlass.range(active_groups):
+                    group_tensor = cute.make_tensor(
+                        mdKV_acc.iterator + group_region + cutlass.Int64(group) * group_pitch,
+                        cute.make_layout((self.head_dim, pitch), stride=(1, self.head_dim)),
+                    )
+                    source = group_tensor.iterator + cute.crd2idx((physical_0, row), group_tensor.layout)
+                    values = _load_f32x4(source)
+                    acc_0 += values[0]
+                    acc_1 += values[1]
+                    acc_2 += values[2]
+                    acc_3 += values[3]
+                physical_1 = physical_0 + Int32(1)
+                physical_2 = physical_0 + Int32(2)
+                physical_3 = physical_0 + Int32(3)
+                core_base = physical_0 // Int32(32) * Int32(32)
+                logical_0 = core_base + physical_0 % Int32(4) * Int32(8) + physical_0 % Int32(32) // Int32(16) * Int32(4) + physical_0 % Int32(16) // Int32(4)
+                logical_1 = core_base + physical_1 % Int32(4) * Int32(8) + physical_1 % Int32(32) // Int32(16) * Int32(4) + physical_1 % Int32(16) // Int32(4)
+                logical_2 = core_base + physical_2 % Int32(4) * Int32(8) + physical_2 % Int32(32) // Int32(16) * Int32(4) + physical_2 % Int32(16) // Int32(4)
+                logical_3 = core_base + physical_3 % Int32(4) * Int32(8) + physical_3 % Int32(32) // Int32(16) * Int32(4) + physical_3 % Int32(16) // Int32(4)
+                mdKV[logical_0, row, (0, 0)] = self.element_dtype(acc_0)
+                mdKV[logical_1, row, (0, 0)] = self.element_dtype(acc_1)
+                mdKV[logical_2, row, (0, 0)] = self.element_dtype(acc_2)
+                mdKV[logical_3, row, (0, 0)] = self.element_dtype(acc_3)
+            if tidx >= Int32(128) and tidx < Int32(144):
+                logical_0 = Int32(self.D_HEAD) + (tidx - Int32(128)) * Int32(4)
+                acc_0 = Float32(0.0)
+                acc_1 = Float32(0.0)
+                acc_2 = Float32(0.0)
+                acc_3 = Float32(0.0)
+                for group in cutlass.range(active_groups):
+                    group_tensor = cute.make_tensor(
+                        mdKV_acc.iterator + group_region + cutlass.Int64(group) * group_pitch,
+                        cute.make_layout((self.head_dim, pitch), stride=(1, self.head_dim)),
+                    )
+                    source = group_tensor.iterator + cute.crd2idx((logical_0, row), group_tensor.layout)
+                    values = _load_f32x4(source)
+                    acc_0 += values[0]
+                    acc_1 += values[1]
+                    acc_2 += values[2]
+                    acc_3 += values[3]
+                mdKV[logical_0, row, (0, 0)] = self.element_dtype(acc_0)
+                mdKV[logical_0 + Int32(1), row, (0, 0)] = self.element_dtype(acc_1)
+                mdKV[logical_0 + Int32(2), row, (0, 0)] = self.element_dtype(acc_2)
+                mdKV[logical_0 + Int32(3), row, (0, 0)] = self.element_dtype(acc_3)
+
     @cute.jit
     def fold_dKV_accumulator(self, mdKV_acc: cute.Tensor, seqlen: Int32, stream: cuda.CUstream, active_shards: Int32):
         """Launch both fixed-order compact folds and return the contiguous result."""
@@ -4249,12 +4310,13 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic(TwoCTADeterminis
         """Preserve the compact FP32 fold order and fuse the multi-query dSink tail."""
         active_groups = cute.ceil_div(active_shards, self.COMPACT_QUERIES_PER_GROUP)
         self.fold_dKV_shards(mdKV_acc, seqlen, active_shards).launch(grid=[seqlen, active_groups, 1], block=[160, 1, 1], stream=stream)
-        sink_blocks = 0
-        if cutlass.const_expr(not self.SINGLE_QUERY):
-            sink_blocks = 16
-        self.fold_dKV_groups_to_output(mdKV_acc, mdKV, sum_odo, scaled_lse, attn_sink, d_sink, seqlen, total_q, active_groups).launch(
-            grid=[seqlen + sink_blocks, 1, 1], block=[288, 1, 1], stream=stream
+        self.fold_dKV_groups_to_output_vectorized(mdKV_acc, mdKV, seqlen, active_groups).launch(
+            grid=[seqlen, 1, 1], block=[160, 1, 1], stream=stream
         )
+        if cutlass.const_expr(not self.SINGLE_QUERY):
+            self.fold_dKV_groups_to_output(mdKV_acc, mdKV, sum_odo, scaled_lse, attn_sink, d_sink, seqlen, total_q, active_groups).launch(
+                grid=[16, 1, 1], block=[288, 1, 1], stream=stream
+            )
 
     @cute.jit
     def _drain_dkv(
