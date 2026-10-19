@@ -9,7 +9,6 @@ on:
       - ready_for_review
   push:
     branches:
-      - liujane/security_job
       - develop
   schedule:
     - cron: "17 9 * * 1"
@@ -64,7 +63,7 @@ jobs:
 
   dependency-review:
     name: Dependency review
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -77,5 +76,3 @@ jobs:
         uses: actions/dependency-review-action@v5
         with:
           config-file: ./.github/dependency-review-config.yml
-          base-ref: ${{ github.event_name == 'push' && github.event.before || '' }}
-          head-ref: ${{ github.event_name == 'push' && github.sha || '' }}
