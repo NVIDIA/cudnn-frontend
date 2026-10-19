@@ -54,8 +54,10 @@ Backward:
   matching autograd output exactly. The default path accumulates ``dAPE`` in registers
   over ``rows_per_cta`` blocks and then uses one fp32 atomic per ``(k, dim)`` per CTA.
   The opt-in deterministic path instead writes those CTA-local sums to caller-owned
-  workspace and launches a fixed-order second-stage reduction which fully overwrites
-  ``dAPE``. When ``total_comp == 0`` no kernel is launched and the buffers are left
+  workspace and launches fixed-order reduction stages which fully overwrite ``dAPE``.
+  Ratio 4 uses a hierarchical two-kernel fold so long packed sequences expose enough
+  CTA parallelism; ratios 2 and 128 keep their serial fold. When ``total_comp == 0``
+  no kernel is launched and the buffers are left
   untouched (the wrapper falls back to allocating zeros).
 
 Static-capacity padding (``total_comp > cu_seqlens_comp[-1]``):
@@ -653,7 +655,7 @@ def _compressor_bwd_kernel(
                             mGS[(tail0 + tt) * W + d + dim] = ZERO_BF16
 
         # Default: one fp32 atomic per (k, dim) per CTA. Deterministic: every CTA
-        # writes a disjoint partial plane; the fixed-order reduction kernel consumes
+        # writes a disjoint partial plane; the fixed-order reduction kernels consume
         # those planes through its ratio-specific fixed tree and overwrites dAPE.
         if cutlass.const_expr(deterministic):
             for k in cutlass.range_constexpr(win):
@@ -691,35 +693,78 @@ def _dape_reduce_serial_kernel(
 
 
 _DAPE_REDUCTION_OUTPUTS = 32
-_DAPE_REDUCTION_SPLITS = 32
+_DAPE_REDUCTION_SPLITS = 8
+_DAPE_REDUCTION_GROUP_PARTIALS = 32
 
 
 @cute.kernel
-def _dape_reduce_split_kernel(
+def _dape_reduce_stage1_kernel(
     mDAPEPartial: cute.Tensor,  # [npartials, nelems] fp32
-    mGAPE: cute.Tensor,  # [nelems] fp32, fully overwritten
+    mDAPEStage: cute.Tensor,  # [ceil(npartials / 32), nelems] fp32
     npartials: cutlass.Int32,
     nelems: cutlass.Int32,
 ):
-    """Reduce ratio-4 dAPE with a fixed 32-way contiguous-partial tree.
+    """Reduce groups of 32 ratio-4 dAPE partials in parallel.
 
-    One CTA owns 32 adjacent output elements. Its 32 warps each sum one contiguous
-    CTA-partial interval in ascending order, so every global load is coalesced across
-    the warp. Warp 0 then merges the 32 interval sums in ascending interval order
-    through shared memory. Both partition boundaries and merge order depend only on
-    ``npartials`` and are therefore run-to-run bitwise deterministic.
+    A CTA owns 32 adjacent outputs from one fixed 32-partial group. Its eight
+    warps each sum four contiguous partials in ascending order, then warp 0 merges
+    the eight sums in ascending interval order. The flattened grid exposes enough
+    independent groups to occupy the GPU on long packed sequences without imposing
+    CUDA's 65535-block ``gridDim.y`` limit.
 
-    All threads reach the CTA barrier, including lanes in the final partial output
-    tile. Out-of-range lanes publish a zero split sum and never touch global memory.
+    All lanes publish a value before the barrier. The final group and output tile
+    are zero-padded, so the fixed tree is bitwise deterministic for every shape.
     """
+    output_lane = cutlass.Int32(cute.arch.thread_idx()[0])
+    split_lane = cutlass.Int32(cute.arch.thread_idx()[1])
+    output_tiles = (nelems + cutlass.Int32(_DAPE_REDUCTION_OUTPUTS - 1)) // cutlass.Int32(_DAPE_REDUCTION_OUTPUTS)
+    cta = cutlass.Int32(cute.arch.block_idx()[0])
+    group = cta // output_tiles
+    output_tile = cta - group * output_tiles
+    idx = output_tile * cutlass.Int32(_DAPE_REDUCTION_OUTPUTS) + output_lane
+    partials_per_split = cutlass.Int32(_DAPE_REDUCTION_GROUP_PARTIALS // _DAPE_REDUCTION_SPLITS)
+    begin = group * cutlass.Int32(_DAPE_REDUCTION_GROUP_PARTIALS) + split_lane * partials_per_split
+
+    acc = cutlass.Float32(0.0)
+    if idx < nelems:
+        for offset in cutlass.range_constexpr(_DAPE_REDUCTION_GROUP_PARTIALS // _DAPE_REDUCTION_SPLITS):
+            partial = begin + offset
+            if partial < npartials:
+                acc = acc + cutlass.Float32(mDAPEPartial[partial * nelems + idx])
+
+    smem = SmemAllocator()
+    split_partials = smem.allocate_tensor(
+        cutlass.Float32,
+        cute.make_layout(
+            (_DAPE_REDUCTION_SPLITS, _DAPE_REDUCTION_OUTPUTS),
+            stride=(_DAPE_REDUCTION_OUTPUTS, 1),
+        ),
+        byte_alignment=16,
+    )
+    split_partials[(split_lane, output_lane)] = acc
+    cute.arch.barrier()
+
+    if split_lane == 0 and idx < nelems:
+        result = cutlass.Float32(0.0)
+        for split in cutlass.range_constexpr(_DAPE_REDUCTION_SPLITS):
+            result = result + cutlass.Float32(split_partials[(split, output_lane)])
+        mDAPEStage[group * nelems + idx] = result
+
+
+@cute.kernel
+def _dape_reduce_stage2_kernel(
+    mDAPEStage: cute.Tensor,  # [ngroups, nelems] fp32
+    mGAPE: cute.Tensor,  # [nelems] fp32, fully overwritten
+    ngroups: cutlass.Int32,
+    nelems: cutlass.Int32,
+):
+    """Fold stage-1 group sums with a fixed eight-way contiguous tree."""
     output_lane = cutlass.Int32(cute.arch.thread_idx()[0])
     split_lane = cutlass.Int32(cute.arch.thread_idx()[1])
     idx = cutlass.Int32(cute.arch.block_idx()[0]) * cutlass.Int32(_DAPE_REDUCTION_OUTPUTS) + output_lane
 
-    # Contiguous quotient/remainder partition. Earlier splits receive one extra
-    # partial, keeping interval boundaries monotonic for arbitrary ``npartials``.
-    interval = npartials // cutlass.Int32(_DAPE_REDUCTION_SPLITS)
-    remainder = npartials % cutlass.Int32(_DAPE_REDUCTION_SPLITS)
+    interval = ngroups // cutlass.Int32(_DAPE_REDUCTION_SPLITS)
+    remainder = ngroups % cutlass.Int32(_DAPE_REDUCTION_SPLITS)
     begin = split_lane * interval
     count = interval
     if split_lane < remainder:
@@ -731,8 +776,8 @@ def _dape_reduce_split_kernel(
     acc = cutlass.Float32(0.0)
     if idx < nelems:
         for offset in cutlass.range(count, unroll=1):
-            partial = begin + offset
-            acc = acc + cutlass.Float32(mDAPEPartial[partial * nelems + idx])
+            group = begin + offset
+            acc = acc + cutlass.Float32(mDAPEStage[group * nelems + idx])
 
     smem = SmemAllocator()
     split_partials = smem.allocate_tensor(
@@ -863,6 +908,7 @@ def _compressor_bwd_launch(
 @cute.jit
 def _dape_reduce_launch(
     dape_partial_ptr: cute.Pointer,
+    dape_stage_ptr: cute.Pointer,
     gape_ptr: cute.Pointer,
     npartials: cutlass.Int32,
     nelems: cutlass.Int32,
@@ -872,9 +918,17 @@ def _dape_reduce_launch(
     """JIT entry point for the deterministic fixed-order dAPE reduction."""
     lay = cute.make_layout(_EXT)
     mDAPEPartial = cute.make_tensor(dape_partial_ptr, lay)
+    mDAPEStage = cute.make_tensor(dape_stage_ptr, lay)
     mGAPE = cute.make_tensor(gape_ptr, lay)
     if cutlass.const_expr(split):
-        _dape_reduce_split_kernel(mDAPEPartial, mGAPE, npartials, nelems).launch(
+        ngroups = (npartials + _DAPE_REDUCTION_GROUP_PARTIALS - 1) // _DAPE_REDUCTION_GROUP_PARTIALS
+        output_tiles = (nelems + _DAPE_REDUCTION_OUTPUTS - 1) // _DAPE_REDUCTION_OUTPUTS
+        _dape_reduce_stage1_kernel(mDAPEPartial, mDAPEStage, npartials, nelems).launch(
+            grid=(output_tiles * ngroups, 1, 1),
+            block=(_DAPE_REDUCTION_OUTPUTS, _DAPE_REDUCTION_SPLITS, 1),
+            stream=stream,
+        )
+        _dape_reduce_stage2_kernel(mDAPEStage, mGAPE, ngroups, nelems).launch(
             grid=((nelems + _DAPE_REDUCTION_OUTPUTS - 1) // _DAPE_REDUCTION_OUTPUTS, 1, 1),
             block=(_DAPE_REDUCTION_OUTPUTS, _DAPE_REDUCTION_SPLITS, 1),
             stream=stream,
@@ -925,6 +979,11 @@ def _bf16_ptr(t):
 def _f32_ptr(t):
     """Wrap an fp32 tensor's data pointer for the DSL."""
     return make_ptr(cutlass.Float32, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+
+
+def _f32_address_ptr(address):
+    """Wrap a 16-byte-aligned byte address as an fp32 DSL pointer."""
+    return make_ptr(cutlass.Float32, address, cute.AddressSpace.gmem, assumed_align=16)
 
 
 def _i32_ptr(t):
@@ -987,6 +1046,7 @@ def precompile_dape_reduce(device, split=False):
         scratch_f32 = torch.zeros(16, device=device, dtype=torch.float32)
         stream = cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
         args = (
+            _f32_ptr(scratch_f32),
             _f32_ptr(scratch_f32),
             _f32_ptr(scratch_f32),
             cutlass.Int32(1),
@@ -1104,30 +1164,37 @@ def run_fwd(kv, score, ape, cu_i, cuc_i, out, nb_total, ratio, d, coff, stream_h
 
 
 def bwd_dape_workspace_bytes(nb_total, ratio, d, coff):
-    """Caller-owned fp32 partial-plane bytes for deterministic generic backward."""
+    """Caller-owned deterministic dAPE partial and reduction-stage bytes."""
     if nb_total <= 0:
         return 0
     npartials = (nb_total + _BWD_ROWS - 1) // _BWD_ROWS
-    return npartials * ratio * coff * d * 4
+    nelems = ratio * coff * d
+    stage_elems = 0
+    if ratio == 4:
+        stage_elems = ((npartials + _DAPE_REDUCTION_GROUP_PARTIALS - 1) // _DAPE_REDUCTION_GROUP_PARTIALS) * nelems
+    return (npartials * nelems + stage_elems) * 4
 
 
 def _run_dape_reduce(workspace, gape, npartials, nelems, stream_handle, split=False):
     """Launch the shared fixed-order reduction on the caller's stream."""
     dev = gape.device.index
     key = ("dape_reduce", bool(split), dev)
+    stage_address = workspace.data_ptr() + (npartials * nelems * 4 if split else 0)
     launcher = _FAST.get(key)
     if launcher is not None:
         slots = launcher.slots
         slots[0].value = workspace.data_ptr()
-        slots[1].value = gape.data_ptr()
-        slots[2].value = npartials
-        slots[3].value = nelems
-        slots[4].value = stream_handle
+        slots[1].value = stage_address
+        slots[2].value = gape.data_ptr()
+        slots[3].value = npartials
+        slots[4].value = nelems
+        slots[5].value = stream_handle
         launcher.launch()
         return
     stream = cuda_driver.CUstream(stream_handle)
     args = (
         _f32_ptr(workspace),
+        _f32_address_ptr(stage_address),
         _f32_ptr(gape),
         cutlass.Int32(npartials),
         cutlass.Int32(nelems),
