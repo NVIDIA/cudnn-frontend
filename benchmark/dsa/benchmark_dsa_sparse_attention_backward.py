@@ -13,9 +13,9 @@ forward launch is intentionally excluded so the benchmark isolates backward.
 
 Usage:
     python benchmark_dsa_sparse_attention_backward.py
-    python benchmark_dsa_sparse_attention_backward.py --seqlens 4096,8192 --topks 128,512,2048
-    python benchmark_dsa_sparse_attention_backward.py --head-dim 576 --csv results.csv
-    python benchmark_dsa_sparse_attention_backward.py profile --seqlens 8192 --topks 2048
+    python benchmark_dsa_sparse_attention_backward.py --seqlens 4096,8192 --seqlens-kv 65536 --topks 2048 --deterministic both
+    python benchmark_dsa_sparse_attention_backward.py --nheads 96 --head-dim 576 --synthetic-forward --csv results.csv
+    python benchmark_dsa_sparse_attention_backward.py profile --seqlens 8192 --seqlens-kv 65536 --topks 2048 --deterministic on
 
 ``profile`` mode runs one warmed-up backward call wrapped in
 ``cudaProfilerStart/Stop`` and an NVTX range for nsys/ncu capture; it uses the
@@ -24,6 +24,7 @@ first value of ``--seqlens`` and the last value of ``--topks``.
 
 import argparse
 import csv
+import math
 import os
 
 import torch
@@ -43,8 +44,23 @@ def flops_bwd(seqlen_q, topk, nheads, head_dim, head_dim_v):
     return 2 * seqlen_q * nheads * topk * (3 * head_dim + 2 * head_dim_v)
 
 
+def make_topk_indices(seqlen_q, seqlen_kv, topk, device):
+    """Build unique, dispersed indices without materializing a Q-by-KV matrix."""
+    if topk > seqlen_kv:
+        raise ValueError(f"topk ({topk}) must not exceed seqlen_kv ({seqlen_kv})")
+    # A stride coprime with KV visits every key exactly once. Construct the
+    # multiplied vectors in int64, reduce them, then keep the Q-by-TopK result
+    # in int32 so production-sized cases do not need an int64 scratch matrix.
+    stride = 2654435761 % seqlen_kv
+    while math.gcd(stride, seqlen_kv) != 1:
+        stride = (stride - 1) % seqlen_kv
+    columns = ((torch.arange(topk, device=device, dtype=torch.int64) * stride) % seqlen_kv).to(torch.int32)
+    offsets = ((torch.arange(seqlen_q, device=device, dtype=torch.int64) * 104729) % seqlen_kv).to(torch.int32)
+    return (offsets[:, None] + columns[None, :]).remainder_(seqlen_kv)
+
+
 def make_inputs(seqlen_q, topk, seqlen_kv, nheads, head_dim, head_dim_v, dtype, use_attn_sink, use_topk_length):
-    """Build flat-layout backward inputs with unique random top-k indices per query."""
+    """Build flat-layout backward inputs with unique dispersed top-k rows."""
     device = "cuda"
     q = torch.randn(seqlen_q, nheads, head_dim, device=device, dtype=dtype) / 10
     kv = torch.randn(seqlen_kv, head_dim, device=device, dtype=dtype) / 10
@@ -55,7 +71,7 @@ def make_inputs(seqlen_q, topk, seqlen_kv, nheads, head_dim, head_dim_v, dtype, 
         # exp(-inf) contributes nothing to the softmax denominator: sink disabled.
         attn_sink = torch.full((nheads,), float("-inf"), device=device, dtype=torch.float32)
 
-    topk_idxs = torch.rand(seqlen_q, seqlen_kv, device=device).argsort(dim=-1)[:, :topk].to(torch.int32)
+    topk_idxs = make_topk_indices(seqlen_q, seqlen_kv, topk, device)
     topk_length = None
     if use_topk_length:
         topk_length = torch.full((seqlen_q,), topk, dtype=torch.int32, device=device)
@@ -80,8 +96,8 @@ def reference_forward(q, kv, attn_sink, topk_idxs, softmax_scale, head_dim_v, ch
     return out, lse
 
 
-def setup_case(seqlen_q, seqlen_kv, topk, args):
-    """Allocate inputs, run the reference forward, and return a zero-arg backward closure."""
+def setup_case(seqlen_q, seqlen_kv, topk, deterministic, args):
+    """Prepare one allocation-free backward plan and its reusable buffers."""
     dtype = DTYPES[args.dtype]
     softmax_scale = args.head_dim**-0.5
     q, kv, attn_sink, dout, topk_idxs, topk_length = make_inputs(
@@ -95,12 +111,37 @@ def setup_case(seqlen_q, seqlen_kv, topk, args):
         use_attn_sink=not args.no_attn_sink,
         use_topk_length=not args.no_topk_length,
     )
-    out, lse = reference_forward(q, kv, attn_sink, topk_idxs, softmax_scale, args.head_dim_v)
+    if args.synthetic_forward:
+        # Scores are close to zero for the scaled inputs above, so log(topk)
+        # is a representative finite LSE. This avoids a large reference-only
+        # gather when profiling production sequence lengths.
+        out = torch.zeros(seqlen_q, args.nheads, args.head_dim_v, dtype=dtype, device=q.device)
+        lse = torch.full((seqlen_q, args.nheads), math.log(topk), dtype=torch.float32, device=q.device)
+    else:
+        out, lse = reference_forward(q, kv, attn_sink, topk_idxs, softmax_scale, args.head_dim_v)
     dq = torch.empty_like(q)
-    dkv = torch.zeros_like(kv)
+    dkv = torch.empty_like(kv)
+    d_sink = torch.empty_like(attn_sink)
+
+    plan = DSA.SparseAttentionBackward(
+        sample_q=q,
+        sample_kv=kv,
+        sample_out=out,
+        sample_dout=dout,
+        sample_lse=lse,
+        sample_attn_sink=attn_sink,
+        sample_topk_idxs=topk_idxs,
+        sample_topk_length=topk_length,
+        softmax_scale=softmax_scale,
+        deterministic=deterministic,
+    )
+    assert plan.check_support()
+    plan.compile()
+    workspace_bytes = plan.scratch_workspace_bytes()
+    workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=q.device) if workspace_bytes else None
 
     def run():
-        DSA.sparse_attention_backward_wrapper(
+        plan.execute(
             q,
             kv,
             out,
@@ -108,18 +149,19 @@ def setup_case(seqlen_q, seqlen_kv, topk, args):
             lse,
             attn_sink,
             topk_idxs,
-            softmax_scale=softmax_scale,
+            dq,
+            dkv,
             topk_length=topk_length,
-            dq=dq,
-            dkv=dkv,
+            workspace=workspace,
+            d_sink=d_sink,
         )
 
-    return run
+    return run, workspace_bytes
 
 
-def bench_one(seqlen_q, seqlen_kv, topk, args):
-    """Benchmark one config; returns (bwd_ms, bwd_tflops)."""
-    run = setup_case(seqlen_q, seqlen_kv, topk, args)
+def bench_one(seqlen_q, seqlen_kv, topk, deterministic, args):
+    """Benchmark one config; returns (bwd_ms, bwd_tflops, workspace_bytes)."""
+    run, workspace_bytes = setup_case(seqlen_q, seqlen_kv, topk, deterministic, args)
 
     for _ in range(args.warmup):
         run()
@@ -134,7 +176,22 @@ def bench_one(seqlen_q, seqlen_kv, topk, args):
     torch.cuda.synchronize()
     bwd_ms = start.elapsed_time(end) / args.repeat
     bwd_tflops = flops_bwd(seqlen_q, topk, args.nheads, args.head_dim, args.head_dim_v) / (bwd_ms * 1e-3) / 1e12
-    return bwd_ms, bwd_tflops
+    return bwd_ms, bwd_tflops, workspace_bytes
+
+
+def sequence_pairs(args):
+    """Pair Q and KV extents, broadcasting one KV extent when requested."""
+    if args.seqlens_kv is None:
+        return [(seqlen, seqlen) for seqlen in args.seqlens]
+    if len(args.seqlens_kv) == 1:
+        return [(seqlen, args.seqlens_kv[0]) for seqlen in args.seqlens]
+    if len(args.seqlens_kv) != len(args.seqlens):
+        raise ValueError("--seqlens-kv must contain one value or the same number of values as --seqlens")
+    return list(zip(args.seqlens, args.seqlens_kv))
+
+
+def deterministic_modes(args):
+    return {"off": [False], "on": [True], "both": [False, True]}[args.deterministic]
 
 
 def run_benchmark_suite(args):
@@ -150,34 +207,37 @@ def run_benchmark_suite(args):
         f"warmup={args.warmup}, repeat={args.repeat}"
     )
     print(sep)
-    print(f"{'seqlen_q':<10} {'seqlen_kv':<10} {'topk':<8} {'BWD ms':<12} {'BWD TFLOPS':<12}")
+    print(f"{'seqlen_q':<10} {'seqlen_kv':<10} {'topk':<8} {'det':<5} {'BWD ms':<12} {'BWD TFLOPS':<12} {'workspace GiB':<14}")
     print("-" * 80)
 
     rows = []
-    for seqlen_q in args.seqlens:
-        seqlen_kv = seqlen_q
+    for seqlen_q, seqlen_kv in sequence_pairs(args):
         for topk in args.topks:
             if topk > seqlen_kv:
                 continue
-            try:
-                torch.cuda.empty_cache()
-                bwd_ms, bwd_tf = bench_one(seqlen_q, seqlen_kv, topk, args)
-                print(f"{seqlen_q:<10} {seqlen_kv:<10} {topk:<8} {bwd_ms:<12.3f} {bwd_tf:<12.2f}")
-                rows.append(
-                    {
-                        "seqlen_q": seqlen_q,
-                        "seqlen_kv": seqlen_kv,
-                        "topk": topk,
-                        "nheads": args.nheads,
-                        "head_dim": args.head_dim,
-                        "head_dim_v": args.head_dim_v,
-                        "bwd_ms": round(bwd_ms, 4),
-                        "bwd_tflops": round(bwd_tf, 2),
-                    }
-                )
-            except Exception as e:
-                print(f"{seqlen_q:<10} {seqlen_kv:<10} {topk:<8} ERROR: {e}")
-                torch.cuda.synchronize()
+            for deterministic in deterministic_modes(args):
+                try:
+                    torch.cuda.empty_cache()
+                    bwd_ms, bwd_tf, workspace_bytes = bench_one(seqlen_q, seqlen_kv, topk, deterministic, args)
+                    workspace_gib = workspace_bytes / 2**30
+                    print(f"{seqlen_q:<10} {seqlen_kv:<10} {topk:<8} {str(deterministic):<5} {bwd_ms:<12.3f} {bwd_tf:<12.2f} {workspace_gib:<14.3f}")
+                    rows.append(
+                        {
+                            "seqlen_q": seqlen_q,
+                            "seqlen_kv": seqlen_kv,
+                            "topk": topk,
+                            "nheads": args.nheads,
+                            "head_dim": args.head_dim,
+                            "head_dim_v": args.head_dim_v,
+                            "deterministic": deterministic,
+                            "bwd_ms": round(bwd_ms, 4),
+                            "bwd_tflops": round(bwd_tf, 2),
+                            "workspace_gib": round(workspace_gib, 4),
+                        }
+                    )
+                except Exception as e:
+                    print(f"{seqlen_q:<10} {seqlen_kv:<10} {topk:<8} {str(deterministic):<5} ERROR: {e}")
+                    torch.cuda.synchronize()
     print(sep)
 
     if args.csv and rows:
@@ -193,20 +253,27 @@ def run_benchmark_suite(args):
 
 def run_profile(args):
     """Single warmed-up backward call under cudaProfilerStart/Stop for ncu/nsys."""
-    seqlen_q = args.seqlens[0]
+    seqlen_q, seqlen_kv = sequence_pairs(args)[0]
     topk = args.topks[-1]
-    run = setup_case(seqlen_q, seqlen_q, topk, args)
-
-    # warmup (also triggers compile) outside the profiled range
-    run()
+    cases = []
+    for deterministic in deterministic_modes(args):
+        run, workspace_bytes = setup_case(seqlen_q, seqlen_kv, topk, deterministic, args)
+        run()
+        cases.append((deterministic, run, workspace_bytes))
     torch.cuda.synchronize()
 
     torch.cuda.cudart().cudaProfilerStart()
-    with torch.cuda.nvtx.range("dsa_sparse_attention_bwd_profile"):
-        run()
+    for deterministic, run, _ in cases:
+        with torch.cuda.nvtx.range(f"dsa_sparse_attention_bwd_profile[deterministic={deterministic}]"):
+            run()
     torch.cuda.synchronize()
     torch.cuda.cudart().cudaProfilerStop()
-    print(f"Profile run done: seqlen_q={seqlen_q}, topk={topk}, nheads={args.nheads}, d_qk={args.head_dim}, d_v={args.head_dim_v}, dtype={args.dtype}")
+    for deterministic, _, workspace_bytes in cases:
+        print(
+            f"Profile run done: seqlen_q={seqlen_q}, seqlen_kv={seqlen_kv}, topk={topk}, "
+            f"nheads={args.nheads}, d_qk={args.head_dim}, d_v={args.head_dim_v}, dtype={args.dtype}, "
+            f"deterministic={deterministic}, workspace={workspace_bytes / 2**30:.3f} GiB"
+        )
 
 
 def comma_separated_ints(s):
@@ -229,6 +296,12 @@ def parse_args():
         help="comma-separated total query lengths; seqlen_kv = seqlen_q (default: 4096,8192)",
     )
     p.add_argument(
+        "--seqlens-kv",
+        type=comma_separated_ints,
+        default=None,
+        help="one KV length broadcast to all Q lengths, or one per --seqlens value (default: match Q)",
+    )
+    p.add_argument(
         "--topks",
         type=comma_separated_ints,
         default=[128, 512, 1024, 2048],
@@ -243,6 +316,17 @@ def parse_args():
         help="QK head dim; 576 = 512 value dims + 64 RoPE dims. head_dim_v is derived (512)",
     )
     p.add_argument("--dtype", default="bfloat16", choices=sorted(DTYPES), help="input dtype (default: bfloat16)")
+    p.add_argument(
+        "--deterministic",
+        choices=("off", "on", "both"),
+        default="off",
+        help="benchmark deterministic execution off, on, or both (default: off)",
+    )
+    p.add_argument(
+        "--synthetic-forward",
+        action="store_true",
+        help="use finite synthetic out/LSE tensors instead of the reference forward (recommended for long sequences)",
+    )
     p.add_argument("--no-attn-sink", action="store_true", help="disable the attention sink (pass -inf sink logits)")
     p.add_argument(
         "--no-topk-length",
