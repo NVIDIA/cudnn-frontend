@@ -33,8 +33,8 @@ def deterministic_dkv_shards(total_seqlen_q: int) -> int:
     return _SUPPORTED_DKV_SHARDS[-1]
 
 
-class FlashAttentionDSABackwardSm100Deterministic(FlashAttentionDSABackwardSm100):
-    """Deterministic dKV/dSink reduction layered on the ordinary M64 kernel.
+class _DeterministicReductionPolicy:
+    """Reusable fixed-owner dKV/dSink reduction policy.
 
     Each launch contains ``num_dkv_shards`` query CTAs. CTA ``i`` is the only
     writer of dKV shard ``i`` in that wave, and same-stream launch ordering
@@ -206,6 +206,10 @@ class FlashAttentionDSABackwardSm100Deterministic(FlashAttentionDSABackwardSm100
         acc = cute.arch.warp_reduction_sum(acc, threads_in_group=self.dSink_num_threads)
         if tidx == 0:
             dSink[head_idx, (0, batch_idx)] = acc
+
+
+class FlashAttentionDSABackwardSm100Deterministic(_DeterministicReductionPolicy, FlashAttentionDSABackwardSm100):
+    """Deterministic reduction layered on the ordinary M64 kernel."""
 
 
 class FlashAttentionDSABackwardSm100Deterministic32(FlashAttentionDSABackwardSm100Deterministic):
