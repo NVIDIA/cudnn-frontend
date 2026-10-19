@@ -86,6 +86,9 @@ from cudnn import DSA
 DSA.SparseAttentionBackward
 DSA.sparse_attention_backward_wrapper
 
+DSA.GqaSparseAttentionBackward
+DSA.gqa_sparse_attention_backward_wrapper
+
 DSA.SparseAttentionForward
 DSA.sparse_attention_forward_wrapper
 
@@ -888,6 +891,71 @@ result = DSA.dense_indexer_backward_wrapper(
     grad_loss=grad_loss, sm_scale=1.0, loss_coeff=1.0, block_I=128, ratio=1,
     q_causal_offsets=q_causal_offsets,
 )
+```
+
+---
+
+### 11. GQA Sparse Attention Backward (QSA)
+
+Backward pass of Qwen Sparse Attention (QSA), the index-list sparse attention of
+Qwen3.8-Flash-Next: GQA with separate K and V, where each query attends to the
+complete 4-token key blocks its indexer selected plus the tokens of its own
+incomplete block. The indexer, the forward pass and the indexer loss are not
+included. Frontend-only CuTe DSL kernels for SM100 / SM103.
+
+- **Inputs**
+  - `q`, `out`, `dout`: `(T, 24, 256)` BF16
+  - `k`, `v`: `(T, 2, 256)` BF16
+  - `lse`: `(T, 24)` FP32, natural-log LSE of the scaled scores
+  - `topk_idxs`: `(T, 2051)` INT32, the selected token ids of every query
+    (layout below)
+- **Outputs** — `dq`: `(T, 24, 256)`, `dk`, `dv`: `(T, 2, 256)` BF16
+- **Constraints** — SM100 / SM103 (cc 10.0 / 10.3) with
+  `nvidia-cutlass-dsl >= 4.7.0`; 24 query heads over 2 KV heads, head dim 256,
+  softmax scale `1/16` (the default; any other value is declined); one sequence
+  of `1 <= T <= 349525` tokens; every tensor contiguous on one CUDA device. No
+  batch, packed (THD) or context-parallel layouts and no deterministic mode.
+- **Scratch** — the fp32 accumulators and index tables live in a caller
+  workspace of `scratch_workspace_bytes()` bytes (`execute(..., workspace=)`).
+  `gqa_sparse_attention_backward_wrapper` allocates it per call on the launch
+  stream unless `workspace=` is passed; calls sharing one buffer must not
+  overlap.
+
+**Index layout.** Row `i` of `topk_idxs` holds, in order, `nsel = min((i + 1) // 4, 512)`
+complete blocks in any order, each as the four consecutive ids `4b, ..., 4b + 3`
+with `4b + 3 <= i`; then the `(i + 1) % 4` tokens of the incomplete block,
+`4 * ((i + 1) // 4), ..., i`; then `-1` in the remaining columns. This is the
+layout the Qwen3.8 indexer produces. The kernels do not validate it, and rows
+that deviate from it give wrong gradients.
+
+**Numerics.** For query `i`, query head `h` (KV head `h // 12`) and each
+selected token `j`, with `S_ij = q_i . k_j / 16` and `P_ij = exp(S_ij - lse_ih)`:
+`Delta_i = rowsum(dO_i * O_i)`, `dS_ij = P_ij * (dO_i . v_j - Delta_i)`,
+`dQ_i = (1/16) * sum_j dS_ij k_j`, `dK_j = (1/16) * sum dS_ij q_i` and
+`dV_j = sum P_ij dO_i` over the queries and heads of the KV group. `Delta` is
+computed inside the kernels from the BF16 `out`, so pass the forward's output
+as it was stored. MMA operands are BF16 (`P` and `dS` are rounded to BF16), all
+accumulation is fp32. `dK`, `dV` and part of `dQ` are reduced with fp32
+atomics, so results are not bitwise reproducible between runs.
+
+```python
+from cudnn import DSA
+
+grads = DSA.gqa_sparse_attention_backward_wrapper(q, k, v, out, dout, lse, topk_idxs)
+dq, dk, dv = grads["dq"], grads["dk"], grads["dv"]
+```
+
+The class API takes caller-owned outputs and workspace. `execute()` never
+allocates or synchronizes, so it can be captured in a CUDA graph:
+
+```python
+plan = DSA.GqaSparseAttentionBackward(q, k, v, out, dout, lse, topk_idxs)
+plan.check_support()
+plan.compile()
+
+dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+workspace = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device=q.device)
+plan.execute(q, k, v, out, dout, lse, topk_idxs, dq, dk, dv, workspace=workspace)
 ```
 
 ---

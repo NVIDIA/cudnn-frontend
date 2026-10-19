@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Qwen Sparse Attention (QSA) backward for SM100, written with the CuTe DSL primitives."""
+"""Qwen Sparse Attention (QSA) backward for SM100 / SM103, written with the CuTe DSL primitives."""
 
 import math
 

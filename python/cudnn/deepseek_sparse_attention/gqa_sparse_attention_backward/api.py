@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Adapter of the SM100 / SM103 index-list sparse (QSA) d256 backward -- ``kernels/sm100/bprop_sparse_d256_f16.py``."""
+"""APIBase wrapper for the GQA index-list sparse attention (QSA) backward on SM100 / SM103 -- ``qsa_bwd_sm100.py``."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ def _overlaps(lhs: tuple[int, int], rhs: tuple[int, int]) -> bool:
     return lhs[0] < rhs[1] and rhs[0] < lhs[1]
 
 
-class SparseGqaBwdDslSm100(APIBase):
+class GqaSparseAttentionBackward(APIBase):
     """QSA backward: dQ, dK and dV from Q, K, V, O, dO, the forward LSE and the selected token indices."""
 
     def __init__(
@@ -108,7 +108,7 @@ class SparseGqaBwdDslSm100(APIBase):
                 f"{self.__class__.__name__} addresses only contiguous {name}, got shape {desc.shape} strides {desc.stride}",
             )
 
-        from .kernels.sm100 import bprop_sparse_d256_f16 as kernel
+        from . import qsa_bwd_sm100 as kernel
 
         self._value_error_if(
             not 1 <= seq_len <= kernel.MAX_SEQ_LEN,
@@ -179,10 +179,10 @@ class SparseGqaBwdDslSm100(APIBase):
         return dq, dk, dv
 
 
-_cache_of_SparseGqaBwdDslSm100Objects: dict = {}
+_cache_of_GqaSparseAttentionBackwardObjects: dict = {}
 
 
-def sparse_gqa_bwd_wrapper_sm100(
+def gqa_sparse_attention_backward_wrapper(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -201,12 +201,12 @@ def sparse_gqa_bwd_wrapper_sm100(
     inputs = (q, k, v, out, dout, lse, topk_idxs)
     key = (q.device, softmax_scale) + tuple((tuple(t.shape), t.stride(), t.dtype) for t in inputs)
     key += tuple(None if t is None else (tuple(t.shape), t.stride(), t.dtype) for t in (dq, dk, dv))
-    obj = _cache_of_SparseGqaBwdDslSm100Objects.get(key)
+    obj = _cache_of_GqaSparseAttentionBackwardObjects.get(key)
     if obj is None:
-        obj = SparseGqaBwdDslSm100(*inputs, sample_dq=dq, sample_dk=dk, sample_dv=dv, softmax_scale=softmax_scale)
+        obj = GqaSparseAttentionBackward(*inputs, sample_dq=dq, sample_dk=dk, sample_dv=dv, softmax_scale=softmax_scale)
         obj.check_support()
         obj.compile()
-        _cache_of_SparseGqaBwdDslSm100Objects[key] = obj
+        _cache_of_GqaSparseAttentionBackwardObjects[key] = obj
 
     with torch.cuda.device(q.device), stream_context(stream, q.device):
         dq = torch.empty_like(q) if dq is None else dq

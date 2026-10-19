@@ -247,6 +247,11 @@ cudnn.deepseek_sparse_attention.DenseIndexerScoreRecompute
 cudnn.deepseek_sparse_attention.DenseIndexerScoreRecompute.check_support
 cudnn.deepseek_sparse_attention.DenseIndexerScoreRecompute.compile
 cudnn.deepseek_sparse_attention.DenseIndexerScoreRecompute.execute
+cudnn.deepseek_sparse_attention.GqaSparseAttentionBackward
+cudnn.deepseek_sparse_attention.GqaSparseAttentionBackward.check_support
+cudnn.deepseek_sparse_attention.GqaSparseAttentionBackward.compile
+cudnn.deepseek_sparse_attention.GqaSparseAttentionBackward.execute
+cudnn.deepseek_sparse_attention.GqaSparseAttentionBackward.scratch_workspace_bytes
 cudnn.deepseek_sparse_attention.IndexerBackward
 cudnn.deepseek_sparse_attention.IndexerBackward.check_support
 cudnn.deepseek_sparse_attention.IndexerBackward.compile
@@ -285,6 +290,7 @@ cudnn.deepseek_sparse_attention.compress_topk_cand_buffer_size_thd
 cudnn.deepseek_sparse_attention.dense_attn_score_recompute_wrapper
 cudnn.deepseek_sparse_attention.dense_indexer_backward_wrapper
 cudnn.deepseek_sparse_attention.dense_indexer_score_recompute_wrapper
+cudnn.deepseek_sparse_attention.gqa_sparse_attention_backward_wrapper
 cudnn.deepseek_sparse_attention.indexer_backward_wrapper
 cudnn.deepseek_sparse_attention.indexer_forward_top_k_wrapper
 cudnn.deepseek_sparse_attention.indexer_forward_wrapper
@@ -1461,16 +1467,10 @@ cudnn.sdpa.bwd.SdpaBwdDslSm80.execute
 cudnn.sdpa.bwd.SdpaBwdDslSm80.scratch_workspace_bytes
 cudnn.sdpa.bwd.SdpaBwdDslSm80.thd_total_kv
 cudnn.sdpa.bwd.SdpaBwdDslSm80.thd_total_q
-cudnn.sdpa.bwd.SparseGqaBwdDslSm100
-cudnn.sdpa.bwd.SparseGqaBwdDslSm100.check_support
-cudnn.sdpa.bwd.SparseGqaBwdDslSm100.compile
-cudnn.sdpa.bwd.SparseGqaBwdDslSm100.execute
-cudnn.sdpa.bwd.SparseGqaBwdDslSm100.scratch_workspace_bytes
 cudnn.sdpa.bwd.compact_gqa_backward
 cudnn.sdpa.bwd.nvfp4_attention_qat_backward
 cudnn.sdpa.bwd.sdpa_bwd_wrapper_dsl_sm120
 cudnn.sdpa.bwd.sdpa_bwd_wrapper_sm80
-cudnn.sdpa.bwd.sparse_gqa_bwd_wrapper_sm100
 cudnn.sdpa.fwd
 cudnn.sdpa.fwd.SdpaFwdDsl
 cudnn.sdpa.fwd.SdpaFwdDsl.check_support
