@@ -125,8 +125,8 @@ def glu_hadamard_plan(inputs, outputs, mma_tiler_mn, cluster_shape_mn, sf_vec_si
         validated_configs.add(validation_key)
     if config not in kernel_cache:
         major, minor = get_compute_capability()
-        if (major, minor) not in ((10, 0), (10, 3)):
-            raise RuntimeError(f"Grouped GEMM GLU hadamard requires SM100 or SM103; it has no SM{major}{minor} kernel")
+        if major < 10:
+            raise RuntimeError(f"Grouped GEMM GLU hadamard requires SM100+, found SM{major}{minor}")
         mac = cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]) - margin
         if mac <= 0:
             raise ValueError("CUDNNFE_CLUSTER_OVERLAP_MARGIN leaves no active clusters")
@@ -173,7 +173,7 @@ def grouped_gemm_glu_hadamard_jax_forward(
     "srelu", in a BF16/FP16 ``d_dtype``, and the per-expert amax and
     post-Hadamard amax (experts,1), which are zero for experts without rows.
     Rows at or past padded_offsets[-1] are unspecified, as in the torch path.
-    SM100/SM103 only, with the default 256x256 tile.
+    SM100+, as in Torch, with the default 256x256 tile.
     """
     inputs = dict(a=a_tensor, b=b_tensor, sfa=sfa_tensor, sfb=sfb_tensor, padded_offsets=padded_offsets, alpha=alpha_tensor, prob=prob_tensor)
     check_jax_inputs(inputs)

@@ -117,8 +117,8 @@ def srelu_plan(inputs, outputs, mma_tiler_mn, cluster_shape_mn, discrete_col_sfd
         validated_configs.add(validation_key)
     if config not in kernel_cache:
         major, minor = get_compute_capability()
-        if (major, minor) not in ((10, 0), (10, 3)):
-            raise RuntimeError(f"Grouped GEMM SReLU requires SM100 or SM103; it has no SM{major}{minor} kernel")
+        if major < 10:
+            raise RuntimeError(f"Grouped GEMM SReLU requires SM100+, found SM{major}{minor}")
         mac = cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]) - margin
         if mac <= 0:
             raise ValueError("CUDNNFE_CLUSTER_OVERLAP_MARGIN leaves no active clusters")
@@ -175,7 +175,7 @@ def grouped_gemm_srelu_jax_forward(
     required and D_col and the physical 6-D SFD buffers are also produced;
     ``discrete_col_sfd=True`` packs column scales by expert. Outputs are not
     initialized, so rows at or past padded_offsets[-1] are unspecified, as in
-    the torch path. SM100/SM103 only: SReLU has no Rubin kernel.
+    the torch path. SM100+, as in Torch.
     """
     d_dtype = _convert_to_cutlass_data_type(d_dtype)
     low_precision = d_dtype in fp8_dtypes

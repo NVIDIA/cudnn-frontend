@@ -238,8 +238,8 @@ def grouped_gemm_dsrelu_jax_sm100(
     physical 6-D SFD buffers. A BF16/FP16 ``d_dtype`` returns D_row, D_srelu and
     the per-expert amax (experts,1). dprob (m,) is zero-initialized for
     accumulation; other rows at or past padded_offsets[-1] are unspecified.
-    dbias, dynamic scheduling and dSReLU reuse are unsupported. SM100/SM103
-    only: dSReLU has no Rubin kernel.
+    dbias, dynamic scheduling and dSReLU reuse are unsupported. SM100+, as in
+    Torch.
 
     With ``b_ptrs``: discrete FP8 weights.
 
@@ -568,8 +568,8 @@ def dsrelu_plan(inputs, outputs, mma_tiler_mn, cluster_shape_mn, discrete_col_sf
         validated_configs.add(validation_key)
     if config not in kernel_cache:
         major, minor = get_compute_capability()
-        if (major, minor) not in ((10, 0), (10, 3)):
-            raise RuntimeError(f"Grouped GEMM dSReLU requires SM100 or SM103; it has no SM{major}{minor} kernel")
+        if major < 10:
+            raise RuntimeError(f"Grouped GEMM dSReLU requires SM100+, found SM{major}{minor}")
         mac = cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]) - margin
         if mac <= 0:
             raise ValueError("CUDNNFE_CLUSTER_OVERLAP_MARGIN leaves no active clusters")

@@ -605,6 +605,7 @@ def test_jax_quant_rejects_unsupported_options(shared_wrapper, option, value):
         ("dglu", "moe_blockscaled_grouped_gemm_dglu_rubin", "moe_blockscaled_grouped_gemm_dglu_dbias"),
         ("wgrad", "moe_blockscaled_grouped_gemm_wgrad_rubin", "moe_blockscaled_grouped_gemm_wgrad"),
         ("quant", "moe_blockscaled_grouped_gemm_quant_rubin", "grouped_gemm_quant"),
+        ("glu_hadamard_quant", "moe_blockscaled_grouped_gemm_glu_hadamard_quant_rubin", "moe_blockscaled_grouped_gemm_glu_hadamard_quant"),
     ],
 )
 def test_jax_kernel_dispatch(operation, rubin, blackwell, monkeypatch):

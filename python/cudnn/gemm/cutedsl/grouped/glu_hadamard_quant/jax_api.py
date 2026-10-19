@@ -18,17 +18,26 @@ import cutlass.cute as cute
 import cutlass.utils
 from cutlass.cute.nvgpu import OperandMajorMode
 
-from cudnn.api_base import TupleDict, ceil_div
+from cudnn.api_base import TupleDict, ceil_div, get_device_type
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.frost.buffers import cutedsl_state
 from cudnn.tensor_adapter import get_compute_capability
 from ..canonical import kernel_facing_b, kernel_facing_fp4, kernel_facing_mx, kernel_facing_prob
-from ..canonical_jax import check_block_scaled_operands, check_jax_inputs, check_packed_sf_size, grouped_call, output_type, sf_array, sf_shape
+from ..canonical_jax import check_block_scaled_operands, check_jax_inputs, check_packed_sf_size, check_rubin_dsl, grouped_call, output_type, sf_array, sf_shape
 from ..moe_utils import MoEWeightMode
 from .moe_blockscaled_grouped_gemm_glu_hadamard_quant import BlockScaledMoEGroupedGemmGluHadamardQuantKernel
 
 kernel_cache = {}
 validated_configs = set()
+
+
+def glu_hadamard_quant_kernel_type():
+    if get_device_type() == "rubin":
+        check_rubin_dsl()
+        from .moe_blockscaled_grouped_gemm_glu_hadamard_quant_rubin import BlockScaledMoEGroupedGemmGluHadamardQuantKernel as RubinKernel
+
+        return RubinKernel
+    return BlockScaledMoEGroupedGemmGluHadamardQuantKernel
 
 
 @cute.jit
@@ -120,16 +129,17 @@ def glu_hadamard_quant_plan(inputs, mma_tiler_mn, cluster_shape_mn, sf_vec_size,
         raise ValueError("prob must have shape (m,) and dtype float32 or bfloat16")
     if inputs["padded_offsets"].shape != (experts,) or _convert_to_cutlass_data_type(inputs["padded_offsets"].dtype) is not cutlass.Int32:
         raise ValueError("padded_offsets must have shape (experts,) and dtype int32")
+    kernel_type = glu_hadamard_quant_kernel_type()
     use_2cta_instrs = mma_tiler_mn[0] == 256
     cluster_shape_mn = tuple(cluster_shape_mn or ((2, 1) if use_2cta_instrs else (1, 1)))
     margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
-    config = (experts, tuple(mma_tiler_mn), cluster_shape_mn, margin, sf_vec_size, act_func, rht_rowwise, rht_colwise, glu_alpha, glu_limit)
+    config = (get_device_type(), experts, tuple(mma_tiler_mn), cluster_shape_mn, margin, sf_vec_size, act_func, rht_rowwise, rht_colwise, glu_alpha, glu_limit)
     validation_key = (config, d_quant, rht_quant, tuple((name, tuple(t.shape), str(t.dtype)) for name, t in inputs.items()))
     if validation_key not in validated_configs:
         check_packed_sf_size(inputs, (("sfa", m, 1), ("sfb", n, experts)), ceil_div(ceil_div(k, sf_vec_size), 4))
         if experts > 1024:
             raise ValueError(f"expert count must be <= 1024, got {experts}")
-        if not BlockScaledMoEGroupedGemmGluHadamardQuantKernel.can_implement(
+        if not kernel_type.can_implement(
             ab_dtype,
             sf_dtype,
             sf_vec_size,
@@ -145,7 +155,7 @@ def glu_hadamard_quant_plan(inputs, mma_tiler_mn, cluster_shape_mn, sf_vec_size,
             "k",
             "k",
             "n",
-            BlockScaledMoEGroupedGemmGluHadamardQuantKernel.FIX_PAD_SIZE,
+            kernel_type.FIX_PAD_SIZE,
             rht_quant=rht_quant,
             d_quant=d_quant,
         ):
@@ -153,12 +163,12 @@ def glu_hadamard_quant_plan(inputs, mma_tiler_mn, cluster_shape_mn, sf_vec_size,
         validated_configs.add(validation_key)
     if config not in kernel_cache:
         major, minor = get_compute_capability()
-        if (major, minor) not in ((10, 0), (10, 3)):
-            raise RuntimeError(f"The JAX grouped GEMM GLU hadamard quant path requires SM100 or SM103, found SM{major}{minor}")
+        if major < 10:
+            raise RuntimeError(f"Grouped GEMM GLU hadamard quant requires SM100+, found SM{major}{minor}")
         mac = cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]) - margin
         if mac <= 0:
             raise ValueError("CUDNNFE_CLUSTER_OVERLAP_MARGIN leaves no active clusters")
-        kernel = BlockScaledMoEGroupedGemmGluHadamardQuantKernel(
+        kernel = kernel_type(
             sf_vec_size=sf_vec_size,
             acc_dtype=cutlass.Float32,
             use_2cta_instrs=use_2cta_instrs,
@@ -217,7 +227,8 @@ def grouped_gemm_glu_hadamard_quant_jax_forward(
     numbers, since a traced JAX value raises ConcretizationTypeError. Returns a
     TupleDict with the eager wrapper's keys, including the pre-activation C
     (m,n). Rows at or past padded_offsets[-1] are unspecified, as in the torch
-    path. SM100/SM103 only, with the default 256x256 tile. Needs
+    path. SM100+, with the Rubin kernel on SM107, and the default 256x256
+    tile. Needs
     nvidia-cutlass-dsl >= 4.8.
     """
     if not hasattr(cutlass, "FloatNV8E5M3FNU"):
