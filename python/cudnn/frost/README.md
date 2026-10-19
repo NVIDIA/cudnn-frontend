@@ -12,7 +12,8 @@ While an engine matures its manifest row is marked `opt_in=True`, so it is
 offered only with `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`. That flag is a
 per-engine maturity gate, not an architecture switch: an engine graduates by
 flipping one field once it has the arch coverage and the benchmarks to justify
-serving graphs unasked. The SDPA forward f16/bf16 rows for SM100 and SM120 have
+serving graphs unasked. The SDPA forward f16/bf16 rows for SM100, SM107, SM120 and SM90,
+the SM100 per-tensor FP8 row and the SM107 block-scale MXFP8 row have
 graduated; where a graduated engine is timed behind the backend its family ranks
 the backend's block first (`sdpa/fwd/placement.py`), and the flag, when set,
 ranks FROST first everywhere. Engines that are the only implementation of their
@@ -331,11 +332,15 @@ python/cudnn/
         sm100/prefill_d512_f16.py
         sm100/split_combine.py        the split-KV reduction pass
         sm107/prefill_d128_fp8.py     Rubin siblings (dense K=64 MMA, desc v1)
+        sm107/decode_d256_f16.py      the d256 decode tile's Rubin sibling (same
+                                      swap-AB body; config_sm107.make_cfg_d256_decode)
         sm120/prefill_f16.py          general SM120 template (d <= 256)
         sm120/prefill_d256_f16.py     d256 flavor
         sm120/prefill_d512_f16.py     d512 flavor
         sm120/prefill_fp8.py          general SM120 FP8 template (d <= 256)
+        sm120/prefill_mxfp8.py        block-scaled MXFP8 template (d <= 256)
         sm120/prefill_d512_fp8.py     d512 flavor for FP8
+        sm120/prefill_d512_mxfp8.py   d512 flavor for MXFP8
         sm120/_common.py              SM120-only warp-level primitives
         _common_blackwell.py      SHARED by sm100/ + sm107/ (cc 100-119), so it
                                   sits ABOVE both rather than inside either

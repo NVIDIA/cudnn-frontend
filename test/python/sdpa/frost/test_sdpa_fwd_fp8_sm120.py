@@ -136,6 +136,7 @@ def _run(
     poison_kv_pad=False,
     block_scaled_o=None,
     sf_o_layout="planes",
+    negative_descale_q=False,
 ):
     import cudnn
 
@@ -147,6 +148,9 @@ def _run(
     Q8, dq = _quant(Qf, io_dtype)
     K8, dk = _quant(Kf, io_dtype)
     V8, dv = _quant(Vf, io_dtype)
+    if negative_descale_q:
+        # Same dequantized Q, with a negative descale_q * descale_k on the device.
+        Q8, dq = (-Q8.float()).to(io_dtype), -dq
 
     def bshd(x8):
         return x8.permute(0, 2, 1, 3).contiguous().transpose(1, 2)
@@ -1840,3 +1844,25 @@ def test_fp8_sm120_thd_parallel_prefix_batches(batch):
     q = [(0, 17, 63, 65, 129)[i % 5] for i in range(batch)]
     kv = [(31, 0, 65, 127, 257)[i % 5] for i in range(batch)]
     _run_thd_fp8(seq_q_lens=q, seq_kv_lens=kv, h_q=4, h_kv=2, D=128, poison_pad=True, check_stats=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("mask", ["none", "causal"])
+@torch_fork_set_rng(seed=90)
+def test_fp8_sm120_negative_scale(mask):
+    """The general FP8 kernel folds a negative scale into Q's sign, like the d512 kernel (#1435)."""
+    sdpa_kwargs = dict(use_causal_mask=True) if mask == "causal" else {}
+    res = _run(2, 8, 2, 130, 200, scale=-0.7 / math.sqrt(128), sdpa_kwargs=sdpa_kwargs, o_dtype=torch.bfloat16)
+    _check(*res)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("scale_sign", [1, -1], ids=["pos_scale", "neg_scale"])
+@pytest.mark.parametrize("D", [128, 512])
+@pytest.mark.parametrize("mask", ["none", "causal"])
+@torch_fork_set_rng(seed=91)
+def test_fp8_sm120_negative_descale_product(scale_sign, D, mask):
+    """A negative descale_q * descale_k flips the softmax multiplier's sign on the device, for either plan sign (#1435)."""
+    sdpa_kwargs = dict(use_causal_mask=True) if mask == "causal" else {}
+    res = _run(1, 2, 1, 17, 65, scale=scale_sign * 0.7 / math.sqrt(D), sdpa_kwargs=sdpa_kwargs, D=D, o_dtype=torch.bfloat16, negative_descale_q=True)
+    _check(*res)

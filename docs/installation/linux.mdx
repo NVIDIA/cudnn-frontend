@@ -27,7 +27,7 @@ The distribution-independent package has the advantage of working across a wider
 
 ### Package Manager Installation
 
-Installation using RPM or Debian packages interfaces with your system's package management system. If the online network repository is enabled, RPM or Debian packages will be automatically downloaded at installation time using the package manager: `apt-get` or `dnf`. When using RPM or Debian local repo installers, the downloaded package contains a repository snapshot stored on the local filesystem in `/var/`. Such a package only informs the package manager where to find the actual installation packages, but will not install them.
+Installation using RPM or Debian packages interfaces with your system's package management system. If the online network repository is enabled, RPM or Debian packages will be automatically downloaded at installation time using the package manager: `apt-get`, `dnf`, or `tdnf`. When using RPM or Debian local repo installers, the downloaded package contains a repository snapshot stored on the local filesystem in `/var/`. Such a package only informs the package manager where to find the actual installation packages, but will not install them.
 
 #### Package Manager Network Installation
 
@@ -199,6 +199,54 @@ For Amazon Linux 2023, use `$distro=amzn2023` and `$arch` of `x86_64` or `aarch6
 
    ```
    sudo dnf -y install --allowerasing cudnn9-jit-cuda-13
+   ```
+
+<Note>
+Only one CUDA toolkit version of cuDNN 9 can be installed at a time.
+</Note>
+
+##### Microsoft Azure Linux Network Installation
+
+1. Enable the repository.
+
+   ```
+   sudo curl https://developer.download.nvidia.com/compute/cuda/repos/$distro/$arch/cuda-$distro.repo -o /etc/yum.repos.d/cuda-$distro.repo
+   sudo tdnf clean all
+   ```
+
+    Where `$distro/$arch` should be replaced by one of the following:
+
+   - `azl3/x86_64`
+   - `azl3/sbsa`
+
+<Note>
+Microsoft Azure Linux 3.0 uses `$distro=azl3` and `$arch` of `x86_64` or `sbsa`. Enable the repository with `curl`, then install packages with `tdnf`, as described in the [NVIDIA CUDA Installation Guide for Azure Linux](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/#azure-linux).
+</Note>
+
+2. Install the per-CUDA meta-packages.
+
+    To install for CUDA 12, run:
+
+   ```
+   sudo tdnf -y install --allowerasing cudnn9-cuda-12
+   ```
+
+    To install for CUDA 13, run:
+
+   ```
+   sudo tdnf -y install --allowerasing cudnn9-cuda-13
+   ```
+
+    To install cuDNN JIT for CUDA 12, run:
+
+   ```
+   sudo tdnf -y install --allowerasing cudnn9-jit-cuda-12
+   ```
+
+    To install cuDNN JIT for CUDA 13, run:
+
+   ```
+   sudo tdnf -y install --allowerasing cudnn9-jit-cuda-13
    ```
 
 <Note>
@@ -564,6 +612,77 @@ sudo rpm -i cudnn-local-repo-$distro-9.x.y-1.0-1.aarch64.rpm
 
    ```
    sudo dnf -y install --allowerasing cudnn9-jit-cuda-13
+   ```
+
+<Note>
+Only one CUDA toolkit version of cuDNN 9 can be installed at a time.
+</Note>
+
+##### Microsoft Azure Linux Local Installation
+
+<Note>
+Before issuing the following commands, you must replace `9.x.y`, `$distro`, and `$architecture` with your respective cuDNN version, OS distribution, and platform architecture.
+
+Where `$distro` is one of the following:
+
+- `azl3`
+
+And `$architecture` is one of the following:
+
+- `x86_64`
+- `aarch64`
+
+Microsoft Azure Linux 3.0 uses `$distro=azl3`. Install packages with `tdnf`.
+</Note>
+
+1. Download the RPM package from the developer website by using a web browser or the `wget` command.
+
+   The RPM package is available at [https://developer.nvidia.com/cudnn](https://developer.nvidia.com/cudnn).
+
+   - If using a web browser, click the buttons that describe your target platform and choose RPM (local) as the installer type.
+   - If using the `wget` command, run:
+
+     ```
+     wget https://developer.download.nvidia.com/compute/cudnn/9.x.y/local_installers/cudnn-local-repo-$distro-9.x.y-1.0-1.$architecture.rpm
+     ```
+
+2. Navigate to your `downloads` directory containing the cuDNN RPM local installer file.
+3. Enable the local repository.
+
+   ```
+   sudo rpm -i cudnn-local-repo-$distro-9.x.y-1.0-1.$architecture.rpm
+   ```
+
+4. Refresh the repository metadata.
+
+   ```
+   sudo tdnf clean all
+   ```
+
+5. Install the per-CUDA meta-packages.
+
+    To install for CUDA 12, run:
+
+   ```
+   sudo tdnf -y install --allowerasing cudnn9-cuda-12
+   ```
+
+    To install for CUDA 13, run:
+
+   ```
+   sudo tdnf -y install --allowerasing cudnn9-cuda-13
+   ```
+
+    To install cuDNN JIT for CUDA 12, run:
+
+   ```
+   sudo tdnf -y install --allowerasing cudnn9-jit-cuda-12
+   ```
+
+    To install cuDNN JIT for CUDA 13, run:
+
+   ```
+   sudo tdnf -y install --allowerasing cudnn9-jit-cuda-13
    ```
 
 <Note>

@@ -47,7 +47,7 @@ from cutlass._mlir.dialects import arith
 import cutlass
 from cutlass.experimental import primitives as prims
 import cutlass.cute as cute
-from cudnn.sdpa.fwd.kernels._quantized import _initialize_split_amax, _scale_or_one
+from cudnn.sdpa.fwd.kernels._quantized import _descale_qk_negate_bit, _initialize_split_amax, _scale_or_one
 import cuda.bindings.driver as _cuda_driver  # noqa: F401  (cute.compile pulls cuda)
 
 from dataclasses import dataclass
@@ -903,7 +903,7 @@ def _kernel(
         _pre_dsc_k = cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
         _pre_dsc_v = cutlass.Float32(cutlass.make_array_view(descale_v_t)[0])
         _pre_scl_o = _scale_or_one(scale_o_t)
-        scale_softmax_log2 = scale_softmax_log2 * _pre_dsc_q * _pre_dsc_k
+        scale_softmax_log2 = cute.math.abs(scale_softmax_log2 * _pre_dsc_q * _pre_dsc_k)
         o_scale_fused = o_scale_fused * _pre_dsc_v * _pre_scl_o
 
     softmax_first_end = CFG.CORR_WARP_BASE if cutlass.const_expr(MERGE_SOFTMAX_WGS) else CFG.SOFTMAX_WG0_BASE + CFG.SOFTMAX_WG_WARPS
@@ -912,7 +912,7 @@ def _kernel(
         if cutlass.const_expr(_ROLE_LOCAL_E4_SCALES):
             _wg0_dsc_q = cutlass.Float32(cutlass.make_array_view(descale_q_t)[0])
             _wg0_dsc_k = cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
-            scale_log2 = scale_softmax_log2 * _wg0_dsc_q * _wg0_dsc_k
+            scale_log2 = cute.math.abs(scale_softmax_log2 * _wg0_dsc_q * _wg0_dsc_k)
         else:
             scale_log2 = scale_softmax_log2
         if cutlass.const_expr(MERGE_SOFTMAX_WGS):
@@ -945,7 +945,7 @@ def _kernel(
         if cutlass.const_expr(_ROLE_LOCAL_E4_SCALES):
             _wg1_dsc_q = cutlass.Float32(cutlass.make_array_view(descale_q_t)[0])
             _wg1_dsc_k = cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
-            scale_log2 = scale_softmax_log2 * _wg1_dsc_q * _wg1_dsc_k
+            scale_log2 = cute.math.abs(scale_softmax_log2 * _wg1_dsc_q * _wg1_dsc_k)
         else:
             scale_log2 = scale_softmax_log2
         _softmax_warp_group(
@@ -1023,6 +1023,8 @@ def _kernel(
                     n_batch=n_batch,
                     mcast_mask=mcast_mask,
                     cta_in_pair=cta_in_pair,
+                    descale_q_t=descale_q_t,
+                    descale_k_t=descale_k_t,
                 )
             else:
                 _mma_warp_quiet(tmem_ptr_i32, bars)
@@ -1044,6 +1046,8 @@ def _kernel(
                 n_batch=n_batch,
                 mcast_mask=mcast_mask,
                 cta_in_pair=cta_in_pair,
+                descale_q_t=descale_q_t,
+                descale_k_t=descale_k_t,
             )
 
     elif warp_idx == CFG.TMALDG_WARP_ID:
@@ -1516,6 +1520,8 @@ def _mma_warp_group(
     n_batch,
     mcast_mask,
     cta_in_pair,
+    descale_q_t,
+    descale_k_t,
 ):
     """Unified MMA warp (cga1 / cga2-leader; MASK_NONE/PADDED/CAUSAL/SWA).
 
@@ -1536,7 +1542,9 @@ def _mma_warp_group(
         n_dim=CFG.TILE_N,
         m_dim=CFG.TILE_M * CFG.CTA_MMA,
         k_dim=0,
+        a_negate=int(PARAMS.negate_scores),
     )
+    idesc_qk = idesc_qk ^ _descale_qk_negate_bit(descale_q_t, descale_k_t)
     idesc_pv = prims.Tcgen05InstrDesc.build(
         c_dtype=cutlass.Float32,
         a_dtype=STORAGE_DTYPE,
@@ -2192,7 +2200,7 @@ def _softmax_warp_group(
     bmm1_phase = cutlass.Int32(0)
     stat_empty_phase = cutlass.Int32(1)  # bootstrap pre-armed at phase 1 so first wait passes
     inplace_phase = cutlass.Int32(0)
-    # BOTH softmax wgs wait on mb_o_empty[0]; init phase=1, XOR after.
+    # init phase=1, XOR after; each softmax wg waits its own O slot (see the top-of-tile wait).
     epilogue_state = cutlass.Int32(1)
 
     # total_sum is Vector[Float32, 2] (even/odd partials) so per-iter update
@@ -2240,7 +2248,12 @@ def _softmax_warp_group(
     while is_valid_tile > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
 
-        _wait_mbarrier(bars.mb_o_empty[0], epilogue_state)
+        # Each softmax warpgroup waits ITS OWN O slot.  Slot 0's producer chain (MMA bmm2_done[0] -> correction qs=0 epilogue ->
+        # o_full[0] -> TMA-STG -> o_empty[0]) never passes through warpgroup 1, so TMA-STG could complete a SECOND phase of slot 0
+        # before warpgroup 1 performed this parity wait -- shortest on an EMPTY (q-tile, split) unit -- and the wait aliased: warpgroup 1
+        # never published that tile's stats and the correction (stat_full[1]) and TMA-STG (o_full[1]) deadlocked (GitHub #1532, #1525).
+        # Slot sub_tile_id's chain runs through this warpgroup's own stats publish, so its producer is bounded to one phase ahead.
+        _wait_mbarrier(bars.mb_o_empty[sub_tile_id], epilogue_state)
         epilogue_state = epilogue_state ^ cutlass.Int32(1)
 
         total_max = NEG_INF

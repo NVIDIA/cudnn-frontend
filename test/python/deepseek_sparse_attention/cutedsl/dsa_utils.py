@@ -61,10 +61,25 @@ DSA_INDEXER_FORWARD_PARAM_MARKS = [
 ]
 
 DSA_INDEXER_TOP_K_PARAM_MARKS = [
-    # 705: regression for odd top_k > threads-per-CTA, which used to fail the
-    # width-2 vectorized-store assert at JIT compile time.
-    pytest.mark.parametrize("top_k", [512, 705]),
-    pytest.mark.parametrize("next_n", [1]),
+    pytest.mark.parametrize("acc_dtype", [torch.float32]),
+    pytest.mark.parametrize(
+        "dtype,top_k,next_n,s_kv,input_pattern",
+        [
+            pytest.param(torch.bfloat16, 512, 1, 1024, "random", marks=pytest.mark.L0, id="bf16-k512"),
+            # Odd top_k above the CTA width previously failed vectorized stores.
+            pytest.param(torch.bfloat16, 705, 1, 1024, "random", marks=pytest.mark.L0, id="bf16-k705"),
+            pytest.param(torch.float32, 1, 2, 1024, "adversarial", marks=pytest.mark.L0, id="fp32-k1"),
+            pytest.param(torch.float32, 511, 2, 1024, "adversarial", marks=pytest.mark.L0, id="fp32-k511"),
+            pytest.param(torch.float32, 513, 2, 1024, "adversarial", marks=pytest.mark.L0, id="fp32-k513"),
+            pytest.param(torch.float16, 513, 2, 4096, "adversarial", marks=pytest.mark.L0, id="fp16-k513"),
+            pytest.param(torch.bfloat16, 513, 2, 4096, "adversarial", marks=pytest.mark.L0, id="bf16-k513"),
+            pytest.param(torch.float32, 2048, 2, 4096, "adversarial", marks=pytest.mark.L0, id="fp32-k2048"),
+            # Tie bins exceed the radix kernel's 32768-candidate buffer.
+            pytest.param(torch.float32, 705, 2, 65536, "adversarial", marks=pytest.mark.L1, id="fp32-spill-k705"),
+            pytest.param(torch.float32, 2048, 2, 65536, "adversarial", marks=pytest.mark.L1, id="fp32-spill-k2048"),
+        ],
+    ),
+    pytest.mark.parametrize("tie_break", [0, 1, 2], ids=["ties-none", "ties-small", "ties-large"]),
     pytest.mark.parametrize("return_val", [True, False]),
 ]
 
@@ -109,7 +124,7 @@ def with_dsa_indexer_forward_params(func):
 
 
 def with_dsa_indexer_top_k_params(func):
-    return _apply(DSA_PARAM_MARKS + DSA_INDEXER_TOP_K_PARAM_MARKS, func)
+    return _apply(DSA_INDEXER_TOP_K_PARAM_MARKS, func)
 
 
 def with_dsa_score_recompute_params(func):
@@ -182,23 +197,20 @@ def pack_mxfp8_scales_thd(
     k_alignment: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build padded prefixes and packed Q/K scales for THD MXFP8 tests."""
-    from cudnn.deepseek_sparse_attention.utils.sm100.mxfp8_scale_utils import (
-        make_scale_cu_seqlens_padded,
-        pack_k_scale_thd,
-        pack_q_scale_thd,
-    )
+    from cudnn.deepseek_sparse_attention.utils.sm100.mxfp8_scale_utils import make_scale_cu_seqlens_padded
+    from deepseek_sparse_attention.cutedsl import mxfp8_scale_reference
 
     if q_alignment is None:
         q_alignment = 128 // math.gcd(128, qhead_per_kv_head)
     cu_q_scale = make_scale_cu_seqlens_padded(cu_seqlens_q, q_alignment)
     cu_k_scale = make_scale_cu_seqlens_padded(cu_seqlens_k, k_alignment)
-    q_scale = pack_q_scale_thd(
+    q_scale = mxfp8_scale_reference.pack_q_scale_thd(
         q_scale_logical,
         cu_seqlens_q,
         cu_q_scale,
         qhead_per_kv_head,
     )
-    k_scale = pack_k_scale_thd(k_scale_logical, cu_seqlens_k, cu_k_scale)
+    k_scale = mxfp8_scale_reference.pack_k_scale_thd(k_scale_logical, cu_seqlens_k, cu_k_scale)
     return q_scale, k_scale, cu_q_scale, cu_k_scale
 
 

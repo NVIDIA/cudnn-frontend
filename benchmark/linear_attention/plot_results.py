@@ -151,8 +151,10 @@ def generate_charts(
             gpu_info = f" ({gpu_name})" if gpu_name else ""
             group_label = f"Batch = {group_val}" if x_axis == "seqlen" else f"Sequence Length = {group_val}"
             dims = dims_label if dims_label else f"d = {head_dim}"
+            norm_label = "" if variant == "mamba2" else ", use_qk_l2norm = True"
+            title_variant = "Mamba-2" if variant == "mamba2" else variant.upper()
             fig.suptitle(
-                f"{variant.upper()} Linear Attention (BF16) — {group_label}, Heads = {heads}, {dims}, " f"use_qk_l2norm = True{gpu_info}",
+                f"{title_variant} Linear Attention (BF16) — {group_label}, Heads = {heads}, {dims}" f"{norm_label}{gpu_info}",
                 fontsize=TITLE_FONT_SIZE,
             )
 

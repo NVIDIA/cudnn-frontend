@@ -23,6 +23,7 @@ Kernel-facing inputs pass through every helper unchanged.
 
 from __future__ import annotations
 
+from dataclasses import replace
 import math
 
 import cutlass.cute as cute
@@ -50,11 +51,22 @@ def is_canonical_b(tensor) -> bool:
     return stride[2] == 1 and stride[1] != 1 and stride[0] != 1
 
 
-def normalize_b(tensor):
-    """(is_canonical, kernel-facing (n, k, l) view) for a weight tensor."""
+def normalize_b(tensor, n_major=False):
+    """(is_canonical, kernel-facing (n, k, l) view) for a weight tensor.
+
+    A canonical n-major weight is (l, k, n) row-major, e.g. a column-wise weight buffer.
+    """
     if is_canonical_b(tensor):
-        return True, tensor.permute(1, 2, 0)
+        return True, tensor.permute(2, 1, 0) if n_major else tensor.permute(1, 2, 0)
     return False, tensor
+
+
+def b_nkl(tensor, b_major="k"):
+    """(n, k, l) of a weight tensor in kernel-facing or canonical layout."""
+    if not is_canonical_b(tensor):
+        return tuple(tensor.shape)
+    l, x, y = tensor.shape
+    return (y, x, l) if b_major == "n" else (x, y, l)
 
 
 def normalize_prob(tensor):
@@ -64,6 +76,35 @@ def normalize_prob(tensor):
     return False, tensor
 
 
+def live_kernel_view(tensor, normalize, canonical: bool, name: str):
+    """Kernel-facing view of an execute operand, which must use the layout the kernel was compiled for."""
+    is_canonical, view = normalize(tensor)
+    if is_canonical != canonical:
+        raise ValueError(f"{name} layout mismatch: the kernel was compiled for the {'canonical' if canonical else 'legacy'} layout")
+    return view
+
+
+def operand_signature(tensor):
+    """Hashable (shape, stride, dtype, device) of an execute operand, or None; data pointers excluded."""
+    if tensor is None:
+        return None
+    from cudnn.tensor_adapter import get_device, get_shape, get_strides, is_torch_tensor
+
+    if is_torch_tensor(tensor):
+        return (tensor.shape, tensor.stride(), tensor.dtype, tensor.device)
+    return (get_shape(tensor), get_strides(tensor), tensor.dtype, get_device(tensor))
+
+
+def validate_once(cache: dict, check, operands) -> None:
+    """``check(*operands)`` once per distinct operand metadata; the outcome depends on nothing else."""
+    signature = tuple(operand_signature(tensor) for tensor in operands)
+    if signature not in cache:
+        check(*operands)
+        if len(cache) >= 1024:
+            cache.clear()
+        cache[signature] = True
+
+
 def is_flat_sf(tensor) -> bool:
     """True when a scale-factor tensor is a dense C-contiguous buffer (canonical form).
 
@@ -71,6 +112,33 @@ def is_flat_sf(tensor) -> bool:
     cases where both interpretations address identical memory.
     """
     return tensor is not None and tensor.is_contiguous()
+
+
+def check_canonical_contiguous(a, b, prob):
+    for name, tensor, canonical in (
+        ("a_tensor", a, a.ndim == 2),
+        ("b_tensor", b, is_canonical_b(b)),
+        ("prob_tensor", prob, prob is not None and prob.ndim == 1),
+    ):
+        if canonical and not tensor.is_contiguous():
+            raise ValueError(f"Canonical {name} must be contiguous")
+
+
+def check_packed_sf(sfa, sfb, a_rows, b_rows, experts, rest_k):
+    for name, tensor, rows, groups in (("sfa_tensor", sfa, a_rows, 1), ("sfb_tensor", sfb, b_rows, experts)):
+        if tensor is None:
+            continue
+        if is_flat_sf(tensor):
+            if tensor.numel() != 512 * ((rows + 127) // 128) * rest_k * groups:
+                raise ValueError(f"{name} must contain the complete MMA-packed scale buffer")
+        elif tensor.ndim != 6:
+            raise ValueError(f"{name} must be a contiguous packed buffer or a legacy 6-D MMA view")
+
+
+def layout_desc(api, tensor, name):
+    if tensor is None:
+        return None
+    return replace(api._make_tensor_desc(tensor, name=name, canonical=True), dtype=tensor.dtype)
 
 
 def check_sf_shape(api, desc, flat: bool, mma_shape, name: str):
@@ -113,12 +181,14 @@ def canonical_mx_fake(fake, canonical: bool):
     return refake(fake, fake.shape[:2], fake.stride[:2])
 
 
-def canonical_b_fake(fake, canonical: bool):
-    """Kernel-facing (n, k, l) fake -> canonical (l, n, k) fake sharing its symbolic dims."""
+def canonical_b_fake(fake, canonical: bool, n_major=False):
+    """Kernel-facing (n, k, l) fake -> canonical (l, n, k), or (l, k, n) when n-major."""
     if fake is None or not canonical:
         return fake
     n, k, l = fake.shape
     sn, sk, sl = fake.stride
+    if n_major:
+        return refake(fake, (l, k, n), (sl, sk, sn))
     return refake(fake, (l, n, k), (sl, sn, sk))
 
 
@@ -141,14 +211,22 @@ def kernel_facing_mx(tensor):
     return cute.make_tensor(tensor.iterator, cute.make_layout((m, x, 1), stride=(sm, sx, m * x)))
 
 
-def kernel_facing_b(tensor):
-    """Canonical (l, n, k) row-major -> k-major (n, k, l); kernel-facing forms pass through."""
+def kernel_facing_b(tensor, n_major=False):
+    """Canonical (l, n, k) -> k-major (n, k, l), or (l, k, n) -> n-major (n, k, l); kernel-facing forms pass through."""
     if tensor is None:
         return tensor
     innermost = tensor.stride[2]
     if cute.is_static(innermost) and innermost == 1:
-        return cute.make_tensor(tensor.iterator, cute.select(tensor.layout, [1, 2, 0]))
+        return cute.make_tensor(tensor.iterator, cute.select(tensor.layout, [2, 1, 0] if n_major else [1, 2, 0]))
     return tensor
+
+
+def kernel_facing_wgrad_sf(tensor, rows, tokens, sf_vec_size):
+    """Flat wgrad SF buffer -> (round_up(rows, 128), round_up(ceil(tokens / sf_vec_size), 4)); rank 2 passes through."""
+    if tensor is None or cute.rank(tensor) != 1:
+        return tensor
+    cols = (tokens + sf_vec_size * 4 - 1) // (sf_vec_size * 4) * 4
+    return cute.make_tensor(tensor.iterator, cute.make_layout(((rows + 127) // 128 * 128, cols), stride=(cols, 1)))
 
 
 def kernel_facing_prob(tensor):

@@ -106,6 +106,7 @@ def test_wrapper_capacity_and_hint_changes_reload_artifact(tmp_path, monkeypatch
     _sm80_thd_plan.cache_clear()
     _compile_thd_artifact.cache_clear()
     monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE", str(tmp_path))
+    monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO", "0")  # the reload path is under test; the memo would hand plan 2 the object plan 1 got
     first = _thd_case((96, 160), (128, 96), 4, 128, torch.float16, hkv=2)
     _wrapper(first, _prefix(first.cu_q), _prefix(first.cu_k), deterministic=True, max_s_q=160, max_s_kv=128)
     before = compiled_cache.stats()

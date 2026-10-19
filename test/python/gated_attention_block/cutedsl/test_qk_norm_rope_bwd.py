@@ -39,6 +39,7 @@ from cudnn.gated_attention_block.kernels.qk_norm_rope_bwd import (  # noqa: E402
     QkNormRopeBwdRecipe,
     compile_qk_norm_rope_bwd,
     moved_bytes,
+    n_amax_partials_for,
     n_ctas_for,
     run_dw_norm_reduce,
     run_qk_norm_rope_bwd,
@@ -200,7 +201,13 @@ def _check_dx(got, want64, dtype):
     over = (got64 - rounded).abs() > atol
     if over.any():
         tiny = torch.finfo(dtype).tiny
-        ulp = torch.finfo(dtype).eps * torch.exp2(torch.floor(torch.log2(want64.abs().clamp_min(tiny))))
+        # 2**floor(log2 |want|) from the fp64 bit pattern -- integer ops and views only: torch.exp2 / torch.log2 on an fp64
+        # CUDA tensor JIT-compile through nvrtc, which refuses this part's compute capability (cc 10.7); for a normal double
+        # (the clamp to the io dtype's tiny guarantees one) the biased exponent field minus 1023 IS floor(log2 |x|) and
+        # (e + 1023) << 52 reinterpreted as fp64 IS 2**e exactly -- numerics-identical to the exp2 / log2 spelling.
+        bits = want64.abs().clamp_min(tiny).view(torch.int64)
+        exp_field = (bits >> 52) & 0x7FF
+        ulp = torch.finfo(dtype).eps * (exp_field << 52).view(torch.float64)
         straddle = (got64 - want64).abs() <= 0.5 * ulp * (1.0 + 2.0**-6)
         unproven = over & ~straddle
         if unproven.any():
@@ -954,3 +961,148 @@ def test_reference_window_arm_matches_torch_sdpa(case):
     scores = torch.einsum("bshd,bthd->bhst", q, k.repeat_interleave(rep, dim=2)) * geom.scale
     lse = scores.masked_fill(~allowed[None, None], float("-inf")).logsumexp(-1)
     torch.testing.assert_close(ref.lse, lse, rtol=0, atol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# The amax fold of the stored bands (the quantized backward's dqkvg amax, half of it: the gate backward folds the GATE band)
+# ---------------------------------------------------------------------------
+
+
+@requires_cuda
+@_QK_NORM
+@pytest.mark.parametrize("lens", [None, (8, 3)], ids=["dense", "dead-rows"])
+def test_norm_rope_bwd_amax_fold_is_the_exact_max_of_the_stored_bands(qk_norm, lens):
+    """``max(amax_out[:n]) == max |.|`` over the three bands this kernel STORED (the io-dtype words, unpacked -- what the dqkvg
+    quantize reads next), EXACTLY, under both arms, with ``n = n_amax_partials_for(r, t) = sum(n_ctas_for(r, t))`` PER-CTA
+    partials -- every one written (a NaN-filled array comes back finite), the words past ``n`` untouched; the bands and the dW
+    partials stay bitwise the no-fold artifact's; a second launch OVERWRITES the partials (plain stores, not a max into a slot);
+    dead rows store the selected zero and so cannot reach a partial (their dq / dk / dv carry a huge value)."""
+    b, s_len, h_q, h_kv, d, rope_dim, dtype = 2, 8, 4, 2, 256, 64, torch.bfloat16
+    t = b * s_len
+    inp = _make(t, h_q, h_kv, d, rope_dim, dtype, seed=41)
+    seq_lens = torch.tensor(lens, device="cuda", dtype=torch.int32) if lens else None
+    if lens:
+        tok = torch.arange(t, device="cuda")
+        dead = (tok % s_len) >= seq_lens[tok // s_len]
+        for k in ("dq", "dk", "dv"):
+            inp[k][dead] = 1e4
+    want_dw = qk_norm
+    r0 = _compile(inp, rope_dim=rope_dim, qk_norm=qk_norm, want_dw=want_dw, has_seq_lens=lens is not None)
+    outs0 = [torch.empty_like(inp[k]) for k in ("dq", "dk", "dv")]
+    (pq0, pk0), _ = _launch(inp, r0, *outs0, qk_norm=qk_norm, want_dw=want_dw, seq_lens=seq_lens, s=s_len if lens else None)
+    r1 = compile_qk_norm_rope_bwd(
+        dtype=dtype, h_q=h_q, h_kv=h_kv, d=d, rope_dim=rope_dim, eps=_EPS, apply_norm=qk_norm, want_dw=want_dw, has_seq_lens=lens is not None, want_amax=True
+    )
+    assert r1.want_amax is True and r1.compiled is not r0.compiled and r0.want_amax is False
+    outs1 = [torch.empty_like(inp[k]) for k in ("dq", "dk", "dv")]
+    nq, nk, _ = n_ctas_for(r1, t)
+    pq1 = torch.full((nq, d), float("nan"), device="cuda") if want_dw else None
+    pk1 = torch.full((nk, d), float("nan"), device="cuda") if want_dw else None
+    xq, xk = (inp["xq"], inp["xk"]) if qk_norm else (None, None)
+    rq, rk = (_rstd(inp["xq"]), _rstd(inp["xk"])) if qk_norm else (None, None)
+    wq, wk = (inp["w_q"], inp["w_k"]) if qk_norm else (None, None)
+    n_p = n_amax_partials_for(r1, t)
+    assert n_p == sum(n_ctas_for(r1, t)) >= 3
+    block = torch.full((n_p + 8,), float("nan"), device="cuda")
+    slot = block[4 : 4 + n_p]
+    n_written = run_qk_norm_rope_bwd(
+        r1,
+        inp["dq"],
+        inp["dk"],
+        inp["dv"],
+        xq,
+        xk,
+        rq,
+        rk,
+        wq,
+        wk,
+        inp["cos"],
+        inp["sin"],
+        *outs1,
+        pq1,
+        pk1,
+        seq_lens,
+        s=s_len if lens else None,
+        stream=_stream(),
+        amax_out=slot,
+    )
+    torch.cuda.synchronize()
+    assert n_written == n_p
+    for name, a, b_ in zip(("out_q", "out_k", "out_v"), outs0, outs1):
+        assert torch.equal(a, b_), f"{name}: the fold changed the stored band"
+    if want_dw:
+        assert torch.equal(pq0, pq1) and torch.equal(pk0, pk1)
+    want = max(o.float().abs().amax().item() for o in outs1)
+    assert not torch.isnan(slot).any() and (slot >= 0).all(), "a partial was skipped"
+    assert slot.max().item() == want, (slot.max().item(), want)
+    assert torch.isnan(block[:4]).all() and torch.isnan(block[4 + n_p :]).all(), "a word outside the partials was written"
+    if lens:
+        assert want < 1e3, "a dead row's 1e4 reached a stored band"
+    # plain stores: a second launch over halved gradients OVERWRITES the partials (no slot, nothing to raise)
+    for k in ("dq", "dk", "dv"):
+        inp[k] = (inp[k].float() * 0.5).to(dtype)
+    run_qk_norm_rope_bwd(
+        r1,
+        inp["dq"],
+        inp["dk"],
+        inp["dv"],
+        xq,
+        xk,
+        rq,
+        rk,
+        wq,
+        wk,
+        inp["cos"],
+        inp["sin"],
+        *outs1,
+        pq1,
+        pk1,
+        seq_lens,
+        s=s_len if lens else None,
+        stream=_stream(),
+        amax_out=slot,
+    )
+    torch.cuda.synchronize()
+    assert slot.max().item() == max(o.float().abs().amax().item() for o in outs1) < want
+
+
+@requires_cuda
+def test_norm_rope_bwd_amax_contract_is_typed():
+    """``amax_out`` both directions against the recipe (Rule 1), the partials contract, the warp-multiple thread count, the cache key."""
+    inp = _make(8, 4, 2, 256, 64, torch.bfloat16, seed=42)
+    r0 = _compile(inp, rope_dim=64, qk_norm=True, want_dw=False)
+    r1 = compile_qk_norm_rope_bwd(
+        dtype=torch.bfloat16, h_q=4, h_kv=2, d=256, rope_dim=64, eps=_EPS, apply_norm=True, want_dw=False, has_seq_lens=False, want_amax=True
+    )
+    outs = [torch.empty_like(inp[k]) for k in ("dq", "dk", "dv")]
+    rq, rk = _rstd(inp["xq"]), _rstd(inp["xk"])
+    args = (inp["dq"], inp["dk"], inp["dv"], inp["xq"], inp["xk"], rq, rk, inp["w_q"], inp["w_k"], inp["cos"], inp["sin"], *outs)
+    n_p = n_amax_partials_for(r1, 8)
+    slot = torch.zeros(n_p, device="cuda")
+    with pytest.raises(ValueError, match="WITH the amax fold"):
+        run_qk_norm_rope_bwd(r1, *args, stream=_stream())
+    with pytest.raises(ValueError, match="WITHOUT the amax fold"):
+        run_qk_norm_rope_bwd(r0, *args, stream=_stream(), amax_out=slot)
+    with pytest.raises(ValueError, match="amax_out must be a contiguous fp32"):
+        run_qk_norm_rope_bwd(r1, *args, stream=_stream(), amax_out=torch.zeros(n_p))
+    with pytest.raises(ValueError, match=f"n_partials must be an int in \\[1, {n_p - 1}\\]"):
+        run_qk_norm_rope_bwd(r1, *args, stream=_stream(), amax_out=slot[: n_p - 1])
+    with pytest.raises(ValueError, match="want_amax needs threads_per_cta % 32"):
+        compile_qk_norm_rope_bwd(
+            dtype=torch.bfloat16,
+            h_q=4,
+            h_kv=2,
+            d=128,
+            rope_dim=64,
+            eps=_EPS,
+            apply_norm=True,
+            want_dw=False,
+            has_seq_lens=False,
+            want_amax=True,
+            threads_per_cta=48,
+        )
+    with pytest.raises(ValueError, match="want_amax must be a bool"):
+        compile_qk_norm_rope_bwd(
+            dtype=torch.bfloat16, h_q=4, h_kv=2, d=256, rope_dim=64, eps=_EPS, apply_norm=True, want_dw=False, has_seq_lens=False, want_amax=1
+        )
+    assert QkNormRopeBwdRecipe(**{f: getattr(r0, f) for f in r0._fields if f != "want_amax"}).want_amax is False

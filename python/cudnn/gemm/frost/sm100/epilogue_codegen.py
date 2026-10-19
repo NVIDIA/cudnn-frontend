@@ -678,6 +678,49 @@ def _tap_vec_bytes(chain: FusionChain, dtype: Dtype, dim, stride, vsize: int) ->
     return _tap_store_elems(chain, dtype, dim, stride, vsize) * DTYPE_BYTES[dtype]
 
 
+def _emit_moe_combine_store(tap_idx, i, src, spec, chain, vsize):
+    swapped = isinstance(chain.moe, MoeSwapAbSpec)
+    if not swapped and spec.major == "n":
+        # One lane owns consecutive features for the SAME routed row. Only
+        # those addresses can be packed; swapAB's register vector instead
+        # contains unrelated token destinations and keeps scalar scatter-add.
+        width = min(vsize, 16 // DTYPE_BYTES[spec.dtype])
+        lines = [
+            "if row < group_end:",
+            "    _combine_token = token_index[row]",
+            "    _combine_slot = token_ks[row]",
+            "    if (_combine_token >= 0) & (_combine_token < top_k_scores.shape[0]) & (_combine_slot >= 0) & (_combine_slot < moe_top_k):",
+            "        _combine_scale = top_k_scores[_combine_token, _combine_slot]",
+            f"        _combine_values = {src} * cutlass.full_like({src}, _combine_scale)",
+            f"        _combine_ptr = gC_tap_{tap_idx}_ptr + cutlass.Int64(_combine_token) * out_stride_m_{i} + cutlass.Int64(col_j) * out_stride_n_{i}",
+        ]
+        for e in range(0, vsize, width):
+            lines += [
+                f"        if col_j + {e + width} <= N:",
+                f"            moe_combine_add_vector(_combine_ptr + {e}, _combine_values[{e}:{e + width}], {DTYPE_TO_CUTLASS[spec.dtype]}, {width})",
+            ]
+        return lines
+    lines = []
+    for e in range(vsize):
+        routed = f"col_j + {e}" if swapped else "row"
+        feature = "row" if swapped else f"col_j + {e}"
+        bound = "M" if swapped else "N"
+        offset = (
+            f"cutlass.Int64({feature}) * out_stride_m_{i} + cutlass.Int64(_combine_token) * out_stride_n_{i}"
+            if swapped
+            else f"cutlass.Int64(_combine_token) * out_stride_m_{i} + cutlass.Int64({feature}) * out_stride_n_{i}"
+        )
+        lines += [
+            f"if ({routed} < group_end) & ({feature} < {bound}):",
+            f"    _combine_token = token_index[{routed}]",
+            f"    _combine_slot = token_ks[{routed}]",
+            "    if (_combine_token >= 0) & (_combine_token < top_k_scores.shape[0]) & (_combine_slot >= 0) & (_combine_slot < moe_top_k):",
+            f"        _combine_value = {src}[{e}] * top_k_scores[_combine_token, _combine_slot]",
+            f"        moe_combine_add(gC_tap_{tap_idx}_ptr + {offset}, _combine_value, {DTYPE_TO_CUTLASS[spec.dtype]})",
+        ]
+    return lines
+
+
 def _emit_moe_scatter_store(tap_idx, i, src, spec, chain, vsize, row_pred, col_bound):
     """Store FC2 fragments into distinct token/top-k slots without atomics."""
     swapped = isinstance(chain.moe, MoeSwapAbSpec)
@@ -1387,6 +1430,8 @@ def _emit_block_quant(
 
 
 def _tap_fake_shape(tap, chain: FusionChain | None = None) -> str:
+    if chain is not None and chain.has_moe and chain.moe.mode == "combine":
+        return "(sym_m, cute.sym_int(), 1)" if isinstance(chain.moe, MoeSwapAbSpec) else "(cute.sym_int(), sym_n, 1)"
     if tap.is_quant_scale:
         if chain is None or not chain.quants:
             raise AssertionError("quant scale tap requires FusionChain context")
@@ -1677,6 +1722,9 @@ def generate(
             body_lines.append(tma_out_ready_marker(_tma_j))
             continue
         tap_idx = _tap_of[si]
+        if chain.has_moe and chain.moe.mode == "combine":
+            body_lines.extend(_emit_moe_combine_store(tap_idx, si, src, spec, chain, vsize))
+            continue
         if chain.has_moe and chain.moe.mode == "scatter":
             body_lines.extend(_emit_moe_scatter_store(tap_idx, si, src, spec, chain, vsize, store_row_pred, col_bound))
             continue

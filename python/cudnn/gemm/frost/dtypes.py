@@ -283,6 +283,8 @@ def _output_align_reqs(chain: FusionChain, tma_slots: "frozenset[int]", vec_byte
     major.
     ``vec_bytes`` overrides the chain-derived chunk width (pass the tile-clamped
     value the kernel was rendered with)."""
+    if chain.has_moe and chain.moe.mode == "combine":
+        return [DTYPE_BYTES[out.dtype] for out in chain.outputs]
     if vec_bytes is None:
         vec_bytes = _compute_output_vec_bytes(chain)
     vsize = vec_bytes // DTYPE_BYTES[chain.output_dtype]

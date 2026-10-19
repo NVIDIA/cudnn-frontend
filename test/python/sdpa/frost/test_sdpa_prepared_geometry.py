@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 """Host-only contracts for reuse of prepared plans' pure geometry calculations."""
 
+import sdpa_binding_reference as binding_reference
+
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
@@ -14,13 +16,14 @@ pytestmark = [pytest.mark.L0]
 
 def _fixture(*, padded_stats=False):
     b, h, hk, sq, sk, d = 4, 8, 2, 4, 128, 128
-    spec = prep.ThdLaunchSpec()
+    spec = binding_reference.ReferenceThdLaunchSpec()
     spec.b, spec.qh, spec.kh, spec.d_qk, spec.d_v = b, h, hk, d, d
     spec.cga_tile_m = 512
     spec.paged, spec.lens_form = False, 3
     spec.has_lse, spec.has_sink = padded_stats, False
     spec.lse_padded, spec.lse_head_major = padded_stats, False
     spec.lse_head_stride, spec.lse_stride = 0, (h * sq, sq, 1)
+    spec.lse_fill_plan = tuple(prep._buffers.strided_fill_plan((b, h, sq), spec.lse_stride)) if padded_stats else None
     spec.s_q_max, spec.total_q, spec.total_kv = sq, b * sq, b * sk
     spec.device_index, spec.off_o_desc, spec.neg_inf = 0, 4096, 0xFF800000
     spec.expect = dict.fromkeys(("q", "k", "v", "o"), "bfloat16")
@@ -41,7 +44,7 @@ def _fixture(*, padded_stats=False):
 
 
 def _bind(spec, facts, workspace=0x30000, stream=17):
-    return prep.bind_thd(spec, facts, workspace, stream, stream)
+    return binding_reference.bind_thd(spec, facts, workspace, stream, stream)
 
 
 def test_thd_geometry_reuse_rebinds_addresses_workspace_stream_and_storage_span():
@@ -114,7 +117,15 @@ def test_thd_geometry_reuse_keeps_padded_stats_seed_per_call(monkeypatch):
     replacement = dict(facts, lse=facts["lse"]._replace(ptr=0x50000))
     _bind(spec, replacement, stream=23)
     assert spec._geometry_cache[1] is geometry
+    assert seeds == [], "binding is metadata-only, including a warm geometry hit"
+    launches = []
+    spec.fn = lambda *frame: launches.append(frame)
+    monkeypatch.setattr(prep._buffers, "strided_fill_plan", lambda *args: pytest.fail("fill geometry belongs to prepare"))
+    assert binding_reference.execute_thd(spec, facts, 0x30000, 17, 17)
+    assert binding_reference.execute_thd(spec, replacement, 0x30000, 23, 23)
+    assert spec._geometry_cache[1] is geometry
     assert [(ptr, stream) for ptr, _, _, stream in seeds] == [(0x20000, 17), (0x50000, 23)]
+    assert [(f[spec.index["lse_ptr"]], f[spec.index["stream"]]) for f in launches] == [(0x20000, 17), (0x50000, 23)]
 
 
 def test_dense_geometry_cache_keys_shape_strides_and_element_width():
@@ -162,7 +173,7 @@ def test_dense_geometry_warm_cache_preserves_per_call_binding_checks(updates, ma
     original = prep.BufferFacts(4096, "bfloat16", (2, 0), 2048, (2, 8, 1, 128), (1024, 128, 1024, 1))
 
     def bind(fact):
-        return prep._dense_role(spec, {"q": fact}, "q", 8, 128, 1, "bfloat16")
+        return binding_reference._dense_role(spec, {"q": fact}, "q", 8, 128, 1, "bfloat16")
 
     before = bind(original)
     hits = prep._dense_role_layout.cache_info().hits
@@ -196,7 +207,7 @@ def _split_fixture(stats):
         quant=None,
         shape_fixed=False,
         lpt_grid_fixed=False,
-        kv_tail_admitted=lambda q, kv: True,
+        kv_tail_native=True,
         dummy=lambda name: 0x100000,
     )
     spec.order = sorted(prep._FILLED_AT_BUILD_DENSE | prep._FILLED_PER_CALL_DENSE)
@@ -228,7 +239,7 @@ def test_split_frames_rebind_workspace_outputs_and_stream_independently(stats):
     def bind(i):
         workspace, stream = 0x100000 + i * 0x10000, 17 + i
         rebound = {name: f._replace(ptr=f.ptr + i * 0x100000) for name, f in facts.items()}
-        main, combine = prep.bind_dense_split(spec, rebound, workspace, stream, stream)
+        main, combine = binding_reference.bind_dense_split(spec, rebound, workspace, stream, stream)
         assert main[spec.index["o_ptr"]] == main[spec.index["o_partial_ptr"]] == combine[0] == workspace
         assert main[spec.index["lse_ptr"]] == combine[1] == workspace + spec.combine.lse_offset
         assert combine[2] == rebound["o"].ptr
@@ -260,7 +271,7 @@ def test_split_final_outputs_are_validated_before_launch(role, updates, match):
     spec, facts = _split_fixture(True)
     changed = dict(facts, **{role: facts[role]._replace(**updates)})
     with pytest.raises(ValueError, match=match):
-        prep.bind_dense_split(spec, changed, 0x100000, 17, 17)
+        binding_reference.bind_dense_split(spec, changed, 0x100000, 17, 17)
 
 
 @pytest.mark.parametrize("role", ["sinks", "seq_q_lens", "seq_kv_lens"])
@@ -284,7 +295,7 @@ def test_dense_metadata_rejects_short_observed_storage_and_misalignment(role, in
     facts[role] = prep.facts_of_roles(SimpleNamespace(native=native), [0])[0]
     assert facts[role].numel == count and facts[role].span == observed
     with pytest.raises(ValueError, match="spans" if invalid == "span" else "4-byte aligned"):
-        prep.bind_dense_split(spec, facts, 0x100000, 17, 17)
+        binding_reference.bind_dense_split(spec, facts, 0x100000, 17, 17)
 
 
 @pytest.mark.parametrize("role", ["sinks", "seq_q_lens", "seq_kv_lens"])
@@ -298,6 +309,78 @@ def test_dense_metadata_keeps_sized_and_bare_pointer_contracts(role, span_known)
         setattr(spec, "seq_q_present" if role == "seq_q_lens" else "seq_kv_present", True)
         count, dtype = spec.b, "int32"
     facts[role] = prep.BufferFacts(0x20000, dtype, (2, 0) if span_known else (-1, -1), count if span_known else -1, (count,), (1,))
-    main, _ = prep.bind_dense_split(spec, facts, 0x100000, 17, 17)
+    main, _ = binding_reference.bind_dense_split(spec, facts, 0x100000, 17, 17)
     slot = {"sinks": "sinks_ptr", "seq_q_lens": "seq_q_lens_addr", "seq_kv_lens": "meta_ptr"}[role]
     assert main[spec.index[slot]] == 0x20000
+
+
+@pytest.mark.parametrize(
+    ("adapter", "expect_cc", "rule_line"),
+    [
+        pytest.param(SimpleNamespace(_device_cc=(10, 7)), (10, 7), True, id="sm100_adapter_cc10_7"),
+        pytest.param(SimpleNamespace(_device_cc=(10, 0)), (10, 0), False, id="sm100_adapter_cc10_0"),
+        pytest.param(SimpleNamespace(_device_cc=(10, 3)), (10, 3), False, id="sm100_adapter_cc10_3"),
+        # the SM120 adapter records compute_capability and leaves the base class's _device_cc at None
+        pytest.param(SimpleNamespace(_device_cc=None, compute_capability=(12, 0)), (12, 0), False, id="sm120_adapter_cc12_0"),
+        pytest.param(SimpleNamespace(_device_cc=None, compute_capability=(12, 1)), (12, 1), False, id="sm120_adapter_cc12_1"),
+        pytest.param(SimpleNamespace(_device_cc=(9, 0)), (9, 0), False, id="sm90_adapter_cc9_0"),
+    ],
+)
+def test_split_combine_form_pin_reads_the_plan_device_per_line(adapter, expect_cc, rule_line):
+    """``build_dense_spec`` pins a split plan's combine entry to a kernel FORM through ``_split_combine_decode_grid``, which
+    reads the device the adapter recorded at check_support (``_plan_device_cc``: the SM100 / SM90 adapters' ``_device_cc``,
+    the SM120 adapter's ``compute_capability``) -- on cc 10.7 the split-aware rule (AUTO where it selects the decode-grid
+    kernel, OFF where it pins the module's own forms inside the kernel module's bound, and the LEAN GROUP WALK on a launch
+    past the bound at a split of at most ``heuristics.DECODE_COMBINE_LEAN_WALK_MAX_SPLIT`` (4):
+    ``heuristics.decode_combine_lean_walk_selected``; AUTO past that split), on every other device OFF on every launch inside
+    the bound; outside the bound the AUTO entry is the module's own forms by construction on every line off cc 10.7 and past
+    the walk's split bound on cc 10.7 too.
+    RED before the seam existed: the SM120 adapter's plan read ``tuple(None)``; RED before the walk's restore: the cc 10.7
+    plan past the bound read AUTO."""
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
+
+    assert prep._plan_device_cc(adapter) == expect_cc
+
+    def grid(b, h, s_q, split):
+        return prep._split_combine_decode_grid(adapter, b, h, s_q, split)
+
+    if rule_line:
+        assert grid(1, 24, 1, 16) == comb.DECODE_GRID_AUTO and grid(1, 24, 1, 4) == comb.DECODE_GRID_OFF
+        assert grid(4, 24, 4, 16) == comb.DECODE_GRID_OFF and grid(4, 24, 4, 32) == comb.DECODE_GRID_AUTO
+    else:
+        assert all(grid(*g, s) == comb.DECODE_GRID_OFF for g in ((1, 24, 1), (4, 24, 4), (4, 32, 1)) for s in (4, 8, 16, 32, 128))
+    # 256 lean blocks: past the bound nothing is forced on any line -- the cc 10.7 plan names the restored lean group walk there
+    # up to its split bound (the measured B 32 / B 128 cells at split 2-3: 768 / 3072 blocks), every other line the AUTO entry
+    # (= the module's own forms by construction); past the walk's split bound (4) every line keeps the AUTO entry
+    past = comb.DECODE_GRID_LEAN_WALK if rule_line else comb.DECODE_GRID_AUTO
+    assert grid(8, 32, 1, 4) == past and grid(32, 24, 1, 2) == past and grid(128, 24, 4, 2) == past
+    assert grid(8, 32, 1, 32) == comb.DECODE_GRID_AUTO and grid(32, 24, 1, 8) == comb.DECODE_GRID_AUTO
+
+
+def test_split_combine_form_pin_reads_the_device_when_the_adapter_recorded_none(monkeypatch):
+    """A plan whose adapter recorded neither ``_device_cc`` nor ``compute_capability`` reads its Q tensor's device once more
+    (the adapters' own read) instead of defaulting to any line."""
+    import torch
+
+    seen = []
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: seen.append(device) or (12, 0))
+    api = SimpleNamespace(_device_cc=None, q_desc=SimpleNamespace(device="cuda:3"))
+    assert prep._plan_device_cc(api) == (12, 0) and seen == ["cuda:3"]
+
+
+def test_packed_role_capacity_helper_bounds_the_ragged_token_count():
+    """``_packed_role`` (the ragged-Q leg of the Python frame binder) ends in ``_capacity``: RED on the tree that carried the role binder
+    without the helper (``NameError`` at the capacity line; pyflakes F821), GREEN with it -- a bare address is a typed ValueError, a span
+    shorter than one row holds 0 tokens, else the largest token whose row ends inside the span."""
+    T, H, D = 300, 4, 64
+    f = prep.BufferFacts(ptr=4096, dtype="bfloat16", device=(prep._DLPACK_CUDA, 0), span=T * H * D, shape=(T, H, D), strides=(H * D, D, 1))
+    spec = SimpleNamespace(device_index=0)
+    assert prep._packed_role(spec, {"q": f}, "q", H, D, "bfloat16", tma=True) == (4096, H * D, D, T)
+    geo = (H * D, D, 1, (H - 1) * D + D)  # (token stride, head stride, elem stride, row span)
+    assert prep._capacity(f._replace(span=geo[3]), geo, "q") == 1
+    assert prep._capacity(f._replace(span=geo[3] - 1), geo, "q") == 0
+    assert prep._capacity(f._replace(span=geo[3] + 2 * H * D + 5), geo, "q") == 3
+    with pytest.raises(ValueError, match="bare address"):
+        prep._capacity(f._replace(span=-1), geo, "q")
+    with pytest.raises(ValueError, match="is required"):
+        prep._packed_role(spec, {}, "q", H, D, "bfloat16", tma=True)

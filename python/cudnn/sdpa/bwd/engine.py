@@ -6,9 +6,10 @@
 Listed in ``cudnn/engines/manifest.py`` as ONE row owning the
 ``FROST_SDPA_BWD_ID_BASE`` block, so ``FrostSdpaBwdEngines()`` returns the whole
 family and a graph containing an sdpa_backward() node reaches them through the
-ordinary lifecycle — no registration call. The row is opt-in
-(``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``) until these engines have the arch
-coverage to serve graphs unasked.
+ordinary lifecycle — no registration call. ``sdpa_bwd_sm100`` (d in (256, 512],
+where the backend has no SM100 engine) is offered by default; the other slots stay
+opt-in (``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``) until they have the arch coverage
+to serve graphs unasked.
 
 The capability table, the probe and the lowering stay in ``engines.py``
 (``ENGINE_SPECS`` / ``analyze_for`` / ``build``); this file is only the engine

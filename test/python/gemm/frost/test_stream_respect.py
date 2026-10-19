@@ -122,10 +122,13 @@ def test_frost_gemm_respects_handle_stream_and_is_capturable(pattern):
             g.execute(vp, ws, handle=h)  # warm up / JIT-compile before capture
     s.synchronize()
     cg = torch.cuda.CUDAGraph()
-    c.zero_()
-    with torch.cuda.graph(cg, stream=s):
-        g.execute(vp, ws, handle=h)
-    c.zero_()
-    cg.replay()
-    torch.cuda.synchronize()
-    torch.testing.assert_close(c.float(), ref.float(), rtol=0, atol=0)
+    try:
+        c.zero_()
+        with torch.cuda.graph(cg, stream=s):
+            g.execute(vp, ws, handle=h)
+        c.zero_()
+        cg.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(c.float(), ref.float(), rtol=0, atol=0)
+    finally:
+        cg.reset()

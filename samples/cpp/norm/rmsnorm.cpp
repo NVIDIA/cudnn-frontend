@@ -3,6 +3,9 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <cmath>
+#include <vector>
+
 #include <catch2/catch_test_macros.hpp>
 #include "../utils/helpers.h"
 
@@ -146,6 +149,78 @@ TEST_CASE("RmsNorm Inference", "[rmsnorm][graph]") {
         {X, X_tensor.devPtr}, {scale, Scale_tensor.devPtr}, {bias, Bias_tensor.devPtr}, {Y, Y_tensor.devPtr}};
 
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
+}
+
+TEST_CASE("RmsNorm Training without scale", "[rmsnorm][graph]") {
+    namespace fe = cudnn_frontend;
+    fe::graph::Graph graph;
+    graph.set_intermediate_data_type(fe::DataType_t::FLOAT).set_compute_data_type(fe::DataType_t::FLOAT);
+
+    int64_t rows        = 256;
+    int64_t hidden_size = 128;
+
+    // One non-unit axis after the first, so the normalization axes need no scale to state them (#188).
+    auto X = graph.tensor(fe::graph::Tensor_attributes()
+                              .set_name("X")
+                              .set_data_type(fe::DataType_t::FLOAT)
+                              .set_dim({rows, hidden_size, 1, 1})
+                              .set_stride({hidden_size, 1, hidden_size, hidden_size}));
+
+    float epsilon_cpu = 1e-05f;
+    auto epsilon      = graph.tensor(epsilon_cpu);
+
+    auto rmsnorm_options =
+        fe::graph::Rmsnorm_attributes().set_forward_phase(fe::NormFwdPhase_t::TRAINING).set_epsilon(epsilon);
+    auto [Y, inv_variance] = graph.rmsnorm(X, nullptr, rmsnorm_options);
+    Y->set_output(true).set_data_type(fe::DataType_t::FLOAT);
+    inv_variance->set_output(true).set_data_type(fe::DataType_t::FLOAT);
+
+#if (CUDNN_VERSION < 8906)
+    SKIP("RmsNorm is not supported in cudnn versions prior to 8.9.6");
+#endif
+    if (check_device_arch_newer_than("ampere") == false) {
+        SKIP("RMSNorm requires Ampere and up");
+    }
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
+
+    REQUIRE(graph.validate().is_good());
+    REQUIRE(graph.build_operation_graph(handle).is_good());
+    REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
+    REQUIRE(graph.check_support().is_good());
+    REQUIRE(graph.build_plans().is_good());
+
+    Surface<float> X_tensor(rows * hidden_size);
+    Surface<float> Inv_variance_tensor(rows);
+    Surface<float> Y_tensor(rows * hidden_size);
+
+    int64_t workspace_size = 0;
+    REQUIRE(graph.get_workspace_size(workspace_size).is_good());
+    Surface<int8_t> workspace(workspace_size);
+
+    std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
+        {X, X_tensor.devPtr}, {inv_variance, Inv_variance_tensor.devPtr}, {Y, Y_tensor.devPtr}};
+
+    REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<float> x(rows * hidden_size), y(rows * hidden_size), inv_var(rows);
+    CUDA_CHECK(cudaMemcpy(x.data(), X_tensor.devPtr, x.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(y.data(), Y_tensor.devPtr, y.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(
+        cudaMemcpy(inv_var.data(), Inv_variance_tensor.devPtr, inv_var.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    for (int64_t r = 0; r < rows; r++) {
+        double sum_sq = 0;
+        for (int64_t h = 0; h < hidden_size; h++) {
+            sum_sq += double(x[r * hidden_size + h]) * x[r * hidden_size + h];
+        }
+        double ref_inv_var = 1.0 / std::sqrt(sum_sq / hidden_size + epsilon_cpu);
+        REQUIRE(std::fabs(inv_var[r] - ref_inv_var) <= 1e-4 * ref_inv_var);
+        for (int64_t h = 0; h < hidden_size; h++) {
+            REQUIRE(std::fabs(y[r * hidden_size + h] - x[r * hidden_size + h] * ref_inv_var) <=
+                    1e-4 * (1 + ref_inv_var));
+        }
+    }
 }
 
 TEST_CASE("RmsNorm Backward", "[rmsnorm][graph]") {

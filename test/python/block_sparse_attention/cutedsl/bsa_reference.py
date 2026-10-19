@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import math
 from typing import Optional
 
 import torch
@@ -67,13 +66,15 @@ def attention_backward_reference(
     v: torch.Tensor,
     do: torch.Tensor,
     mask: torch.Tensor,
+    softmax_scale: Optional[float] = None,
 ):
     """Return FP32 reference output/LSE and gradients for MHA."""
 
+    softmax_scale = q.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale
     q_ref = q.float().detach().requires_grad_()
     k_ref = k.float().detach().requires_grad_()
     v_ref = v.float().detach().requires_grad_()
-    scores = torch.einsum("bhqd,bhkd->bhqk", q_ref / math.sqrt(q.shape[-1]), k_ref)
+    scores = torch.einsum("bhqd,bhkd->bhqk", q_ref * softmax_scale, k_ref)
     scores = scores + mask
     probabilities = torch.softmax(scores, dim=-1)
     output = torch.einsum("bhqk,bhkd->bhqd", probabilities, v_ref)

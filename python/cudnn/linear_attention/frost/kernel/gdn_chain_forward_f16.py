@@ -31,9 +31,48 @@ from cutlass.cute.runtime import from_dlpack
 
 from cudnn.frost.buffers import DeviceView
 
-from ..common.host import get_dtype
+from ..common.host import get_dtype, family_slots
 from ..common.piece_chain import dtype_name, launch_state_chain
 from . import gdn_chain_prologue_f16, gdn_prefill_f16, gdn_summary_f16, gdn_tinv_f16
+
+CHAIN_FORWARD_BUFFERS = (
+    "q",
+    "k",
+    "v",
+    "gate",
+    "beta",
+    "a_log",
+    "dt_bias",
+    "o",
+    "cu_seqlens",
+    "cu_pieces",
+    "main_rows",
+    "summary_rows",
+    "main_count",
+    "summary_count",
+    "work_items",
+    "work_items_summary",
+    "scheduler_all",
+    "scheduler_summary",
+    "scheduler_prefill",
+    "tinv_words",
+    "tinv_rows",
+    "tinv_row_count",
+    "summary_words",
+    "prefill_words",
+    "tinv",
+    "state_h",
+    "state_m",
+    "state_h",
+    "state_m",
+    "state_x",
+    "seed",
+    "seed_indices",
+    "state_x",
+    "final_state",
+    "final_indices",
+    "checkpoints",
+)
 
 chain_forward_cache = {}
 
@@ -93,6 +132,8 @@ def chain_forward_host(
     final_indices: Optional[cute.Tensor],
     checkpoints: Optional[cute.Tensor],
     stream: cuda.CUstream,
+    k_slots: cutlass.Constexpr[int] = 1,
+    v_slots: cutlass.Constexpr[int] = 1,
 ) -> None:
     gdn_chain_prologue_f16.chain_prologue(
         pieces,
@@ -139,6 +180,8 @@ def chain_forward_host(
         None,
         tinv,
         stream,
+        k_slots,
+        v_slots,
     )
     gdn_tinv_f16.host(tinv_cfg, False, k, tinv_words, gate, a_log, dt_bias, beta, cu_pieces, tinv, tinv_rows, tinv_row_count, stream)
     gdn_summary_f16.host(
@@ -264,8 +307,7 @@ def build_chain_forward(
     launch arguments.  The placeholders repeat the marks of the standalone modules' builds so every kernel compiles as it
     does there."""
     _HQ, DK = q.shape[1], q.shape[2]
-    k.shape[1]
-    _HV, DV = v.shape[1], v.shape[2]
+    DV = v.shape[-1]
     HO = gate.shape[1]
     if not safe_gate:
         a_log = None
@@ -274,6 +316,9 @@ def build_chain_forward(
     state_dtype = get_dtype(state_x.dtype)
     has_seed = seed is not None
     seed_name = dtype_name(seed.dtype) if has_seed else "float32"
+    k_slots = family_slots(k, expand_num, 3)
+    v_slots = family_slots(v, expand_num, 3)
+    beta_slots = family_slots(beta, expand_num, 2)
     key = (
         str(q.dtype),
         str(state_x.dtype),
@@ -297,11 +342,18 @@ def build_chain_forward(
         bool(use_beta_sigmoid),
         bool(allow_neg_eigval),
         int(checkpoint_every_n_tokens) > 0,
+        str(checkpoints.dtype) if int(checkpoint_every_n_tokens) > 0 else "none",
         final_state is not None,
         has_seed,
         seed_indices is not None,
         final_indices is not None,
         int(chain_rows),
+        len(k.shape),
+        len(v.shape),
+        len(beta.shape),
+        k_slots,
+        v_slots,
+        beta_slots,
     )
     if key not in chain_forward_cache:
         tinv_cfg = gdn_tinv_f16.build_cfg(
@@ -313,6 +365,8 @@ def build_chain_forward(
             allow_neg_eigval=allow_neg_eigval,
             d_k=DK,
             expand_num=expand_num,
+            k_slots=k_slots,
+            beta_slots=beta_slots,
         )
         summary_cfg = gdn_summary_f16.build_cfg(
             io_dtype,
@@ -324,6 +378,8 @@ def build_chain_forward(
             d_k=DK,
             d_v=DV,
             expand_num=expand_num,
+            k_slots=k_slots,
+            v_slots=v_slots,
         )
         prefill_cfg = gdn_prefill_f16.build_cfg(
             io_dtype,
@@ -332,12 +388,16 @@ def build_chain_forward(
             use_initial_state=True,
             store_final_state=final_state is not None,
             enable_checkpoints=int(checkpoint_every_n_tokens) > 0,
+            checkpoint_dtype=get_dtype(checkpoints.dtype) if int(checkpoint_every_n_tokens) > 0 else None,
             log_gate=log_gate,
             safe_gate=safe_gate,
             tinv_source="gmem",
             d_k=DK,
             d_v=DV,
             expand_num=expand_num,
+            k_slots=k_slots,
+            v_slots=v_slots,
+            beta_slots=beta_slots,
         )
 
         work_items_placeholder = from_dlpack(work_items, assumed_align=16)
@@ -372,10 +432,10 @@ def build_chain_forward(
             cutlass.Int32(int(checkpoint_every_n_tokens)),
             float(scale),
             from_dlpack(q, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=2),
+            from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=len(k.shape) - 1),
+            from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=len(v.shape) - 1),
             from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=1),
-            from_dlpack(beta, assumed_align=16).mark_layout_dynamic(leading_dim=1),
+            from_dlpack(beta, assumed_align=16).mark_layout_dynamic(leading_dim=len(beta.shape) - 1),
             from_dlpack(a_log, assumed_align=4).mark_layout_dynamic() if a_log is not None else None,
             from_dlpack(dt_bias, assumed_align=4).mark_layout_dynamic(leading_dim=len(dt_bias.shape) - 1) if dt_bias is not None else None,
             from_dlpack(o, assumed_align=16).mark_layout_dynamic(leading_dim=2),
@@ -408,6 +468,8 @@ def build_chain_forward(
             from_dlpack(final_indices, assumed_align=4).mark_layout_dynamic() if final_indices is not None else None,
             from_dlpack(checkpoints, assumed_align=16).mark_layout_dynamic(leading_dim=3) if checkpoints is not None else None,
             cuda.CUstream(int(stream)),
+            k_slots,
+            v_slots,
             options="--enable-tvm-ffi --opt-level 2",
         )
     return chain_forward_cache[key]
@@ -458,47 +520,13 @@ def run_chain_forward(
 ) -> None:
     """Replay the chain forward: one crossing into the DSL for the five launches.  The plan validated the contract at build,
     so nothing here raises."""
+    buffers = locals()
     compiled(
         int(pieces),
         int(heads_out),
         int(num_seqs),
         int(checkpoint_every_n_tokens),
         float(scale),
-        q,
-        k,
-        v,
-        gate,
-        beta,
-        a_log,
-        dt_bias,
-        o,
-        cu_seqlens,
-        cu_pieces,
-        main_rows,
-        summary_rows,
-        main_count,
-        summary_count,
-        work_items,
-        work_items_summary,
-        scheduler_all,
-        scheduler_summary,
-        scheduler_prefill,
-        tinv_words,
-        tinv_rows,
-        tinv_row_count,
-        summary_words,
-        prefill_words,
-        tinv,
-        state_h,
-        state_m,
-        state_h,
-        state_m,
-        state_x,
-        seed,
-        seed_indices,
-        state_x,
-        final_state,
-        final_indices,
-        checkpoints,
+        *(buffers[name] for name in CHAIN_FORWARD_BUFFERS),
         cuda.CUstream(int(stream)),
     )

@@ -29,7 +29,8 @@ Three tiers:
 - Graph API: decode / MTP shapes select the decode tile (partially packed GQA
   groups included), a prefill shape keeps
   the prefill tile, a pinned cga=2 on a decode shape is honored, a chunked-prefill
-  THD graph declines cga=1 while FlashInfer's ragged paged graph at one token per
+  THD graph uses the two-slab cga=1 prefill body on SM100 (declines on SM103),
+  while FlashInfer's ragged paged graph at one token per
   sequence rides the ragged-Q leg (int32 / int64 offsets, an empty sequence, no
   Stats), dense (non-paged) padded decode, a dense MTP graph whose keyless rows
   carry a sink, a small-batch split, and CUDA-graph replay under
@@ -170,12 +171,12 @@ def test_decode_cfg_accepts_the_decode_geometry_and_rejects_the_rest():
 
 
 @pytest.mark.L0
-def test_standalone_cga_domain_admits_cga1_on_d128_f16_only():
+def test_standalone_cga_domain_cga1_is_a_decode_tile_only_on_d128_f16():
     """The adapter's twin of the engine row's domain (keep the three in lockstep).
     cga1 on the d128 f16/bf16 flavor IS the decode tile; the quantized families
-    have no decode tile -- per-tensor FP8 d128 also builds at cga1, but as its
-    256-row prefill CTA (the dense unsplit leg the heuristics run there), and
-    MXFP8 d128 keeps the cga2 pair."""
+    have no decode tile -- per-tensor FP8 d128 and MXFP8 d128 also build at cga1,
+    but as their 256-row prefill CTA (the legs heuristics._auto_sched_cga sends
+    there), never as a decode tile."""
     from cudnn.sdpa.fwd.api_dsl import supported_cgas_for
 
     assert supported_cgas_for((128, 128), fp8=False, device_cc=(10, 0)) == (1, 2)
@@ -184,9 +185,80 @@ def test_standalone_cga_domain_admits_cga1_on_d128_f16_only():
         1,
         2,
     ), "per-tensor FP8 d128: cga1 is a prefill CTA, not a decode tile"
-    assert supported_cgas_for((128, 128), fp8=True, device_cc=(10, 0), pertensor=False) == (2,), "MXFP8 d128 keeps the prefill pair"
-    assert supported_cgas_for((128, 128), fp8=False, device_cc=(10, 7)) == (2,), "no Rubin sibling of the decode tile"
+    assert supported_cgas_for((128, 128), fp8=True, device_cc=(10, 0), pertensor=False) == (
+        1,
+        2,
+    ), "MXFP8 d128 offers both widths (cga1 = one 256-row CTA of the prefill body, not the decode tile)"
+    assert supported_cgas_for((128, 128), fp8=False, device_cc=(10, 7)) == (1, 2), "cc 10.7 loads the same decode tile compiled for sm_107a (issue #1472)"
     assert supported_cgas_for((256, 256), fp8=False, device_cc=(10, 0)) == (2,)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("native_d64", [False, True], ids=["d128", "d64"])
+@pytest.mark.parametrize("splits", [1, 4], ids=["unsplit", "split4"])
+def test_decode_kernel_staged_o_store_without_early_q(splits, native_d64):
+    """The staged TMA O store (O through the Q u O slab, the store warp's return edge) is what a part without the early-Q claim runs -- cc 10.7 loads
+    this tile too -- so it keeps its own coverage: dense lengths incl. an empty one, and a paged cache that splits, on both head dims."""
+    d = 64 if native_d64 else 128
+    _run_kernel(3, 8, 2, 16, 40, [600, 77, 0], True, splits, d=d, dtype=torch.bfloat16, native_d64=native_d64, early_q=False, paged=splits > 1)
+
+
+@pytest.mark.L0
+def test_adapter_d64_decode_quad_gate():
+    """The d64 decode tile runs its quadrant softmax exactly when the live rows -- S_q x the packed group -- fit one 32-row lane quadrant, on a plan that
+    lowers onto the decode tile at all and is not THD (whose legs keep the staged O store the merge replaces).  Host-only: the method reads five attributes."""
+    from types import SimpleNamespace
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    def quad(h_q, h_kv, s_q, *, pack_gqa=True, thd=False, decode_tile=True, cc=(10, 0)):
+        me = SimpleNamespace(h_q=h_q, h_kv=h_kv, s_q_max=s_q, pack_gqa=pack_gqa, thd=thd, _device_cc=cc, _d64_decode_tile=lambda: decode_tile)
+        return SdpaFwdDslSm100._d64_decode_quad(me)
+
+    assert quad(64, 8, 1) and quad(64, 8, 4), "G = 8: one to four tokens fit 32 rows"
+    assert not quad(64, 8, 5) and not quad(64, 8, 16), "past 32 rows the 128-row tile's single-quadrant softmax stays"
+    assert quad(16, 1, 2) and not quad(16, 1, 3), "G = 16: two tokens"
+    assert quad(64, 8, 32, pack_gqa=False) and not quad(64, 8, 33, pack_gqa=False), "unpacked: one row per token"
+    assert not quad(64, 8, 1, decode_tile=False), "a plan that is not the decode tile never carries the quadrant record"
+    assert not quad(64, 8, 1, thd=True)
+    assert quad(64, 8, 1, cc=(10, 3)) and not quad(64, 8, 1, cc=(10, 7)), "early Q is claimed on the measured cc only; the quadrant softmax needs it"
+
+
+@pytest.mark.L0
+def test_adapter_decode_early_q_is_claimed_on_the_measured_cc_only():
+    """Early Q (``TemplateParams.early_q``) is a positive per-arch claim like the exp2 split: cc 10.0 / 10.3 take it on the decode tile (the d64 decode tile
+    and the d128 cga1 tile), cc 10.7 -- which loads the same tile -- and every unmeasured part keep the staged TMA store, as do THD and FP8 plans."""
+    from types import SimpleNamespace
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    def early_q(cc, *, flavor=(128, 128), cta_mma=1, decode_tile=False, thd=False, fp8=False):
+        me = SimpleNamespace(_device_cc=cc, flavor=flavor, thd=thd, _fp8=fp8)
+        return SdpaFwdDslSm100._decode_early_q(me, SimpleNamespace(decode_tile=decode_tile, cta_mma=cta_mma))
+
+    assert early_q((10, 0)) and early_q((10, 3)) and early_q((10, 0), flavor=(64, 64), decode_tile=True)
+    assert not early_q((10, 7)) and not early_q((11, 0)) and not early_q((12, 0))
+    assert not early_q((10, 0), cta_mma=2), "the d128 cga2 prefill body is not the decode tile"
+    assert not early_q((10, 0), flavor=(64, 64)), "d64 off the decode tile is the prefill body"
+    assert not early_q((10, 0), thd=True) and not early_q((10, 0), fp8=True)
+
+
+@pytest.mark.L0
+def test_decode_quad_record_is_validated():
+    """``decode_quad`` is the d64 decode tile's field: it needs ``decode_tile`` and ``early_q`` (the merge replaces the staged O store), and the kernel
+    declines the combinations its merge cannot serve (a packed group must divide the 32-row quadrant)."""
+    from dataclasses import replace
+
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d64_decode
+
+    base = TemplateParams(
+        cta_mma=1, d_flavor=64, decode_tile=True, early_q=True, dtype_qkv=2, qh_per_kh=8, pack_gqa=True, paged_kv=True, page_size=16, seq_kv_lens_present=True
+    )
+    make_cfg_d64_decode(replace(base, decode_quad=True))
+    with pytest.raises(ValueError, match="needs decode_tile and early_q"):
+        make_cfg_d64_decode(replace(base, decode_tile=False, decode_quad=True))
+    with pytest.raises(ValueError, match="needs decode_tile and early_q"):
+        make_cfg_d64_decode(replace(base, early_q=False, decode_quad=True))
 
 
 def _facts(**over):
@@ -243,7 +315,8 @@ def test_heuristics_propose_the_decode_tile_for_decode_and_mtp_shapes():
     # The fit is judged on PACK_G, not G: 96/8 at S_q=33 overflows the packed tile
     # (33 * 4 = 132 > 128) while 33 unpacked rows fit; at S_q=32 both legs fit.
     glm33 = _plans(_facts(s_q=33, h_q=96, h_kv=8))
-    assert all(p.knobs.cga == (2 if p.knobs.pack_gqa else 1) for p in glm33), [p.knobs for p in glm33]
+    assert all(p.knobs.cga == 1 for p in glm33 if not p.knobs.pack_gqa), [p.knobs for p in glm33]
+    assert {p.knobs.cga for p in glm33 if p.knobs.pack_gqa} == {1, 2}, [p.knobs for p in glm33]
     assert all(p.knobs.cga == 1 for p in _plans(_facts(s_q=32, h_q=96, h_kv=8)))
     # 24/8: G=3 shares no factor with the tile -- unpacked only, decode tile.
     assert all((p.knobs.cga, p.knobs.pack_gqa) == (1, False) for p in _plans(_facts(h_q=24, h_kv=8)))
@@ -255,15 +328,17 @@ def test_heuristics_propose_the_decode_tile_for_decode_and_mtp_shapes():
 
 @pytest.mark.L0
 def test_heuristics_keep_the_prefill_tile_when_the_rows_overflow_one_tile():
-    """S_q * G > 128 on the packed leg, prefill shapes, THD and the other
+    """S_q * G > 128 on the packed leg and dense prefill shapes list both widths
+    (the wave rule picks the lead, issue #1518); THD, paged K/V and the other
     flavors stay on cga2.  The unpacked runner-up of an overflowing packed leg
     is judged on ITS rows (S_q per head): see
     test_heuristics_decode_geometry_follows_the_selected_packing."""
     nine = _plans(_facts(s_q=9))  # 9 * 16 = 144 packed rows; 9 unpacked
-    assert all(p.knobs.cga == 2 for p in nine if p.knobs.pack_gqa), "the packed legs overflow one tile"
+    assert {p.knobs.cga for p in nine if p.knobs.pack_gqa} == {1, 2}, "the packed legs overflow one tile: both widths"
     assert all(p.knobs.cga == 1 for p in nine if not p.knobs.pack_gqa), "the unpacked runner-up fits one tile"
-    assert all(p.knobs.cga == 2 for p in _plans(_facts(s_q=512, h_q=8, h_kv=8, s_kv=512, padded=False)))
-    assert all(p.knobs.cga == 2 for p in _plans(_facts(s_q=2048, causal=True, padded=False)))
+    assert {p.knobs.cga for p in _plans(_facts(s_q=512, h_q=8, h_kv=8, s_kv=512, padded=False))} == {1, 2}
+    assert {p.knobs.cga for p in _plans(_facts(s_q=2048, causal=True, padded=False))} == {1, 2}
+    assert all(p.knobs.cga == 2 for p in _plans(_facts(s_q=9, has_paged_kv=True, page_size=16)) if p.knobs.pack_gqa)
     assert all(p.knobs.cga == 2 for p in _plans(_facts(thd=True)))
     assert all(p.knobs.cga == 2 for p in _plans(_facts(h_q=32, h_kv=2, d_qk=256, d_v=256)))
     # A causal prefill keeps its measured LPT primary: the decode NATURAL rule is decode-shaped only.  (Plain LPT, not
@@ -278,24 +353,25 @@ def test_heuristics_keep_the_prefill_tile_when_the_rows_overflow_one_tile():
 def test_heuristics_decode_geometry_follows_the_selected_packing():
     """Review (PR #1094): the decode-tile fit is decided per CANDIDATE from its
     own packing, not once per graph from PackGQA eligibility.  G=16, S_q=16:
-    the packed leg carries 256 rows (prefill tile, and it still leads), the
-    unpacked runner-up 16 rows per head (decode tile) -- before the fix both
-    rode cga2 because the fit was computed as if every candidate were packed.
-    At S_q > 128 no leg fits; the heur_mode B fallback (unpacked, unsplit)
-    follows its own rows too; every emitted set re-validates."""
+    the packed leg carries 256 rows (it still leads, at either width: past one
+    tile both are listed, issue #1518), the unpacked runner-up 16 rows per head
+    (decode tile) -- before the fix both rode cga2 because the fit was computed
+    as if every candidate were packed.  At S_q > 128 no leg fits; the heur_mode
+    B fallback (unpacked, unsplit) follows its own rows too; every emitted set
+    re-validates."""
     from cudnn.sdpa.fwd import engines
     from cudnn.sdpa.fwd.heuristics import recommend
 
     plans = _plans(_facts(s_q=16))
     legs = [(p.knobs.pack_gqa, p.knobs.cga) for p in plans]
-    assert legs[0] == (True, 2), legs
-    assert (False, 1) in legs and (False, 2) not in legs and (True, 1) not in legs, legs
-    assert all(p.knobs.cga == 2 for p in _plans(_facts(s_q=129))), "129 rows overflow one tile unpacked too"
+    assert legs[0][0] is True, legs
+    assert (False, 1) in legs and (False, 2) not in legs and {(True, 1), (True, 2)} <= set(legs), legs
+    assert {p.knobs.cga for p in _plans(_facts(s_q=129))} == {1, 2}, "129 rows overflow one tile unpacked too: both widths"
     fallback = recommend("B", _facts(s_q=16), {ENGINE: _SM100_ID})
     assert [(p.knobs.pack_gqa, p.knobs.cga) for p in fallback] == [(False, 1)], fallback
     # MHA has no group: one rule for the only leg.
     assert all(p.knobs.cga == 1 for p in _plans(_facts(s_q=64, h_q=8, h_kv=8)))
-    assert all(p.knobs.cga == 2 for p in _plans(_facts(s_q=129, h_q=8, h_kv=8)))
+    assert {p.knobs.cga for p in _plans(_facts(s_q=129, h_q=8, h_kv=8))} == {1, 2}
     caps = next(spec for spec in engines.ENGINE_SPECS if spec.name == ENGINE).capabilities
     for f in (_facts(s_q=16), _facts(s_q=9, causal=True, bottom_right=True)):
         for p in _plans(f):
@@ -375,6 +451,10 @@ def _run_kernel(
     paged=True,
     seed=0,
     expect_pack_g=None,
+    native_d64=False,
+    exp2_split=False,
+    quad=False,
+    early_q=True,
 ):
     """Drive sm100/decode_d128_f16.py directly (the split-KV suite's idiom).
 
@@ -386,10 +466,13 @@ def _run_kernel(
     draws).  ``has_lse=False`` compiles the Stats store out (unsplit only).
     ``pack=None`` packs whenever the group shares a factor with the 128-row
     tile (the partial-PackGQA contract the kernel carries); ``expect_pack_g``
-    pins the config's packed group.
+    pins the config's packed group.  ``native_d64`` runs the d64 flavor of the tile (``d_flavor=64, decode_tile``; ``d`` must be 64) instead of
+    the d128 envelope, with the exp2 MUFU / FMA split switched by ``exp2_split`` (what the adapter's cc 10.0 build sets) and the quadrant softmax by ``quad``.
+    ``early_q`` is the adapter's measured-cc claim (cc 10.0 / 10.3): on by default here, off to drive the staged TMA O store an unmeasured part keeps.
     """
     import cutlass
     import cuda.bindings.driver as cuda_driver
+    from dataclasses import replace
 
     from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d128_decode, pack_gqa_group_size
@@ -441,18 +524,24 @@ def _run_kernel(
         sched_policy=sched,
         split_kv=splits,
         cta_mma=1,
+        early_q=early_q,
         pack_gqa=pack,
         qh_per_kh=G if pack else 1,
         **paged_kw,
     )
+    if native_d64:
+        assert d <= 64
+        params = replace(params, d_flavor=64, decode_tile=True, exp2_fma_split=exp2_split, decode_quad=quad)
     if expect_pack_g is not None:
         cfg, _ = make_cfg_d128_decode(params)
         assert cfg.PACK_G == expect_pack_g, f"PACK_G={cfg.PACK_G} for G={G}, expected {expect_pack_g}"
     mod = _load_decode(
         params,
-        tag=f"decode_test_{'p' + str(P) if paged else 'dense'}_s{splits}_g{G if pack else 1}_{dtype}_br{int(causal_br)}_w{window_left}_sk{int(has_sink)}_l2{int(stats_log2)}_q{int(q_lens is not None)}_sc{sched}_lse{int(has_lse)}",
+        tag=f"decode_test_{'p' + str(P) if paged else 'dense'}_s{splits}_g{G if pack else 1}_{dtype}_br{int(causal_br)}_w{window_left}_sk{int(has_sink)}_l2{int(stats_log2)}_q{int(q_lens is not None)}_sc{sched}_lse{int(has_lse)}_n64{int(native_d64)}_e{int(exp2_split)}_qd{int(quad)}",
     )
     assert mod.CGA_TILE_M == 128 and mod.CFG.STAGES_KV == 3 and mod.CFG.TOTAL_WARPS == 12
+    assert mod.QUAD is bool(quad), "the quadrant softmax must fold in exactly when asked for"
+    assert mod.EARLY_Q is bool(early_q), "early Q must fold in exactly when the record claims it"
     fn = mod.compile(d_qk=d, d_v=d, has_lse=has_lse, paged_hnd=paged and hnd)
     o_p = torch.zeros(splits * B, s_q, H, d, device=dev, dtype=torch.float32 if splits > 1 else dtype)
     lse_p = torch.zeros(splits * B, H, s_q, device=dev, dtype=torch.float32)
@@ -486,8 +575,34 @@ def _run_kernel(
     else:
         o_out = torch.zeros(B, s_q, H, d, device=dev, dtype=dtype)
         lse_out = torch.zeros(B, H, s_q, device=dev, dtype=torch.float32)
-        cfn = positional_entry(comb.compile_ptr(dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=True, dtype_partial="f32", stats_log2=stats_log2))
-        cfn(o_p.data_ptr(), lse_p.data_ptr(), o_out.data_ptr(), lse_out.data_ptr(), (B, H, s_q, d), splits, o_out.stride(), lse_out.stride(), int(stream))
+        # Under a split the kernel's partials are sink-free; the sink entry of the
+        # combine takes the fp32 [H] logits right before the stream and folds them once.
+        split_sink = has_sink and splits > 1
+        # The dense padded-Q trim: the combine takes the per-batch Q lengths after the sinks, so a padded row keeps O := 0 / LSE := -inf.
+        qlens_sink = split_sink and q_lens is not None
+        cfn = positional_entry(
+            comb.compile_ptr(
+                dtype_o="f16" if dtype == torch.float16 else "bf16",
+                has_lse=True,
+                dtype_partial="f32",
+                stats_log2=stats_log2,
+                has_sink=split_sink,
+                has_q_lens=qlens_sink,
+            )
+        )
+        sink_args = ((sinks.data_ptr(), seq_q.data_ptr()) if qlens_sink else (sinks.data_ptr(),)) if split_sink else ()
+        cfn(
+            o_p.data_ptr(),
+            lse_p.data_ptr(),
+            o_out.data_ptr(),
+            lse_out.data_ptr(),
+            (B, H, s_q, d),
+            splits,
+            o_out.stride(),
+            lse_out.stride(),
+            *sink_args,
+            int(stream),
+        )
     torch.cuda.synchronize()
     assert not torch.isnan(o_out).any(), "NaN in O"
     for b in range(B):
@@ -647,9 +762,148 @@ def test_decode_kernel_keyless_rows_very_negative_sink_with_empty_sequence(paged
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("paged", [True, False], ids=["paged", "dense"])
+def test_decode_kernel_sink_split_kv(paged):
+    """Sink + KV split on the decode tile: the kernel's partials are sink-free (its
+    fold is compiled out under SPLIT_KV > 1) and the combine's sink entry folds
+    the per-head logit once -- mixed lengths including an empty sequence (every
+    split dead: O := 0, LSE := sink), 8:2 packing, random sinks, Stats natural
+    and base 2, S_q = 1 and a bottom-right causal S_q = 4."""
+    _run_kernel(4, 8, 2, 16, 20, [300, 77, 0, 129], hnd=True, splits=4, paged=paged, sink=True, dtype=torch.bfloat16)
+    _run_kernel(3, 8, 2, 16, 20, [300, 77, 1], hnd=False, splits=8, paged=paged, s_q=4, causal_br=True, sink=True, stats_log2=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("flavor", ["d128_direct", "d64_quad"])
+@pytest.mark.parametrize("paged", [True, False], ids=["paged", "dense"])
+def test_decode_kernel_sink_split_kv_keeps_padded_query_rows_dead(paged, flavor):
+    """The dense padded-Q trim under a split sink: a row past its batch's Q length (every row of a batch with Q length 0) must land on O := 0 /
+    LSE := -inf, not on the sink the combine folds into a VALID keyless row (the batch with no keys keeps LSE = sink) -- the partials of the two are the
+    same (every split dead), so the combine takes the Q lengths.  The direct O store of the d128 form and the quadrant softmax of the d64 form both
+    feed it; the second case runs the bottom-right causal MTP step with Stats in base 2."""
+    kw = dict(d=64, native_d64=True, quad=True) if flavor == "d64_quad" else {}
+    _run_kernel(3, 8, 2, 16, 40, [600, 77, 0], hnd=False, splits=4, paged=paged, s_q=2, q_lens=[2, 1, 0], sink=0.7, dtype=torch.bfloat16, **kw)
+    _run_kernel(
+        3,
+        8,
+        2,
+        16,
+        40,
+        [300, 0, 129],
+        hnd=False,
+        splits=4,
+        paged=paged,
+        s_q=4,
+        causal_br=True,
+        q_lens=[0, 4, 2],
+        sink=True,
+        stats_log2=True,
+        dtype=torch.bfloat16,
+        **kw,
+    )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("sink", [-120.0, 3.0], ids=["sink_m120", "sink_p3"])
+def test_decode_kernel_keyless_rows_sink_split_kv(sink):
+    """The keyless-row contract under a split: seq_len_kv = 0 next to a one-key and
+    a full batch, S_q = 4 bottom-right causal, four splits -- every split of a
+    keyless row is dead (-inf / 0 partials) and the combine must land on
+    LSE = sink exactly (never -inf or NaN) with O := 0, at either sink magnitude."""
+    _run_kernel(3, 8, 2, 16, 8, [1, 0, 128], hnd=False, splits=4, s_q=4, causal_br=True, sink=sink, paged=True, dtype=torch.bfloat16)
+
+
+@pytest.mark.L0
 def test_decode_kernel_d64_envelope():
     """d=64 (gpt-oss) rides the decode tile zero-padded: real extents on the descriptors."""
     _run_kernel(3, 8, 1, 16, 20, [300, 77, 1], hnd=False, splits=1, d=64, dtype=torch.bfloat16)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("exp2_split", [False, True], ids=["all_mufu", "fma_split"])
+@pytest.mark.parametrize(
+    "splits,s_q,window",
+    [(1, 1, None), (4, 1, None), (1, 2, 128)],
+    ids=["unsplit", "split4", "sliding_window"],
+)
+def test_decode_kernel_native_d64_exp2_split(splits, s_q, window, exp2_split):
+    """The native d64 flavor of the tile (``d_flavor=64, decode_tile``) with the exp2 MUFU / FMA split folded out (every cc but 10.0) and in (the cc
+    10.0 build: a quarter of each row's P columns through ``exp2_emul_pair`` on the FMA pipe) against the same fp32 reference: a long, a short and a
+    one-token cache, one sink logit per head, the split and sliding-window forms.  The trace-time pin is the count of emulated columns -- 32 of the
+    128 a tile covers, none with the split off or on a sliding-window build (one or two KV tiles a unit: no MUFU-bound loop to relieve)."""
+    mod = _run_kernel(
+        3,
+        8,
+        1,
+        16,
+        40,
+        [600, 77, 1],
+        hnd=True,
+        splits=splits,
+        s_q=s_q,
+        causal_br=window is not None,
+        window_left=window,
+        sink=True,
+        d=64,
+        dtype=torch.bfloat16,
+        native_d64=True,
+        exp2_split=exp2_split,
+    )
+    emulated = exp2_split and window is None
+    assert mod._E2E_ENABLED is emulated
+    assert 2 * sum(len(pairs) for pairs in mod._E2E_PAIRS) == (32 if emulated else 0)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "splits,s_q,lens",
+    [(1, 1, [600, 0, 77]), (4, 1, [600, 0, 77]), (1, 6, [600, 1, 129])],
+    ids=["empty_sequence", "empty_sequence_split4", "mtp6_rows_above_the_diagonal"],
+)
+def test_decode_kernel_native_d64_exp2_split_keeps_dead_rows_dead(splits, s_q, lens):
+    """A fully masked row (an empty sequence; MTP rows above the bottom-right diagonal) must still land on O := 0 / LSE := -inf with the exp2 split on:
+    the emulation clamps a masked input at -127, where the exponent insert yields exactly 0 (bit pattern 0), so the row's sum stays 0 and the dead-row
+    test holds.  S_q = 6 x G = 8 is past the 32-row quadrant, so this is the single-quadrant form the split serves."""
+    _run_kernel(3, 8, 1, 16, 40, lens, True, splits, s_q=s_q, causal_br=s_q > 1, d=64, dtype=torch.bfloat16, native_d64=True, exp2_split=True, sink=False)
+
+
+_QUAD_CASES = [
+    dict(id="unsplit", B=3, H=8, KH=1, P=16, max_pages=40, lens=[600, 77, 1], splits=1),
+    dict(id="split4", B=3, H=8, KH=2, P=16, max_pages=40, lens=[600, 77, 129], splits=4),
+    dict(id="sink", B=3, H=8, KH=1, P=16, max_pages=40, lens=[600, 77, 1], splits=1, sink=True),
+    dict(id="sink_underflow", B=3, H=8, KH=1, P=16, max_pages=40, lens=[600, 0, 77], splits=1, sink=-120.0),
+    dict(id="sink_split2", B=3, H=8, KH=1, P=16, max_pages=40, lens=[600, 77, 1], splits=2, sink=True),
+    dict(id="mtp4_bottom_right", B=3, H=8, KH=2, P=16, max_pages=40, lens=[600, 30, 129], splits=1, s_q=4, causal_br=True),
+    dict(id="mtp2_g16", B=3, H=16, KH=1, P=16, max_pages=40, lens=[600, 30, 129], splits=1, s_q=2, causal_br=True),
+    dict(id="mtp4_split2", B=2, H=8, KH=2, P=16, max_pages=64, lens=[1000, 513], splits=2, s_q=4, causal_br=True),
+    dict(id="sliding_window", B=3, H=8, KH=2, P=16, max_pages=40, lens=[600, 30, 129], splits=1, s_q=2, causal_br=True, window_left=100),
+    dict(id="q_trim", B=4, H=16, KH=4, P=16, max_pages=30, lens=[400, 77, 1, 129], splits=1, s_q=2, q_lens=[2, 1, 2, 1], causal_br=True),
+    dict(id="no_lse", B=3, H=8, KH=1, P=16, max_pages=40, lens=[600, 77, 1], splits=1, has_lse=False),
+    dict(id="stats_log2", B=3, H=8, KH=1, P=16, max_pages=40, lens=[600, 77, 1], splits=1, stats_log2=True),
+    dict(id="dense_lengths", B=3, H=8, KH=1, P=16, max_pages=40, lens=[600, 77, 0], splits=1, paged=False),
+    dict(id="unpacked", B=2, H=8, KH=2, P=16, max_pages=40, lens=[300, 129], splits=1, s_q=4, causal_br=True, pack=False),
+    dict(id="d48_envelope", B=3, H=8, KH=1, P=16, max_pages=40, lens=[600, 77, 1], splits=1, d=48),
+    dict(id="d48_envelope_split", B=3, H=8, KH=1, P=16, max_pages=40, lens=[600, 77, 129], splits=2, d=48),
+    dict(id="empty_ranges_many_units", B=3, H=8, KH=8, P=128, max_pages=33, lens=[4000, 1, 129], splits=8),
+    dict(id="fp16", B=3, H=8, KH=1, P=16, max_pages=40, lens=[600, 77, 1], splits=1, sink=True, dtype=torch.float16),
+    dict(id="fp16_split", B=3, H=8, KH=2, P=16, max_pages=40, lens=[600, 77, 129], splits=4, dtype=torch.float16),
+]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("case", _QUAD_CASES, ids=lambda c: c["id"])
+def test_decode_kernel_native_d64_quad_softmax(case):
+    """The quadrant-cooperative softmax of the d64 decode tile (``decode_quad``: the live rows replicated into all four TMEM lane quadrants, each softmax
+    warp owning a quarter of the keys, the correction warps merging the four partials per unit) against the same fp32 reference as every other form of the
+    tile: unsplit and split (fp32 partials), with and without a sink -- including the underflow sink and an empty sequence -- bottom-right MTP, a sliding
+    window, the padded-Q trim, the Stats variants, dense and paged, unpacked heads, a head dim under the tile width (the envelope), and a many-units
+    launch whose empty split ranges interleave with live units under the persistent scheduler."""
+    case = dict(case)
+    case.pop("id")
+    B, H, KH, P, max_pages, lens, splits = (case.pop(k) for k in ("B", "H", "KH", "P", "max_pages", "lens", "splits"))
+    d = case.pop("d", 64)
+    dtype = case.pop("dtype", torch.bfloat16)
+    _run_kernel(B, H, KH, P, max_pages, lens, True, splits, d=d, dtype=dtype, native_d64=True, quad=True, **case)
 
 
 @pytest.mark.L0
@@ -696,6 +950,7 @@ def _paged_graph(
     seed=0,
     table_batch_stride=None,
     require_prepared=False,
+    sink=None,
 ):
     """Build + run cuDNN's paged-cache graph; return (plan, o [B,H,s_q,d], stats or None, inputs)."""
     import cudnn
@@ -722,6 +977,12 @@ def _paged_graph(
     tk, tv = g.tensor_like(bt4), g.tensor_like(bt4)
     sq_t, sk_t = g.tensor_like(slq), g.tensor_like(slk)
     kw = dict(use_causal_mask_bottom_right=True) if causal_br else {}
+    sink_gpu = sinks = None
+    if sink is not None:
+        # ``sink``: True = random per-head logits, a number = that logit on every head.
+        sinks = torch.randn(H, device=dev, generator=gen) * 2.0 if sink is True else torch.full((H,), float(sink), device=dev)
+        sink_gpu = sinks.view(1, H, 1, 1).contiguous()
+        kw["sink_token"] = g.tensor_like(sink_gpu)
     o, st = g.sdpa(
         name="sdpa",
         q=q,
@@ -770,6 +1031,8 @@ def _paged_graph(
     vp = {q: q_gpu, k: k_c, v: v_c, tk: bt4, tv: bt4, sq_t: slq, sk_t: slk, o: o_gpu}
     if stats:
         vp[st] = stats_gpu
+    if sink_gpu is not None:
+        vp[kw["sink_token"]] = sink_gpu
     # Rule 3: the FROST execute path reads the per-batch lengths on device.
     torch.cuda.set_sync_debug_mode("error")
     try:
@@ -779,7 +1042,13 @@ def _paged_graph(
     torch.cuda.synchronize()
     for b in range(B):
         ref_o, ref_lse = _ref(
-            q_gpu[b].transpose(0, 1), _gather_kv(k_pool, bt[b], lens[b], hnd), _gather_kv(v_pool, bt[b], lens[b], hnd), s_q, scale, causal_br=causal_br
+            q_gpu[b].transpose(0, 1),
+            _gather_kv(k_pool, bt[b], lens[b], hnd),
+            _gather_kv(v_pool, bt[b], lens[b], hnd),
+            s_q,
+            scale,
+            causal_br=causal_br,
+            sink=sinks,
         )
         got = o_gpu[b].transpose(0, 1).float()  # [s_q, H, d]
         assert not torch.isnan(got).any()
@@ -869,9 +1138,20 @@ def test_graph_small_batch_decode_splits_kv():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("sink", [True, -100.0], ids=["random_sinks", "sink_-100"])
+def test_graph_small_batch_decode_sink_splits_kv(sink):
+    """The gpt-oss serving shape: per-head sinks, B=2, H_kv=1, a 32k cache next to
+    an EMPTY one.  The wave model now splits a sink graph too (the split kernel
+    writes sink-free partials and the combine folds the sink once), and O /
+    Stats match the virtual-column reference -- the keyless batch lands on
+    O := 0, LSE := sink rather than -inf, even for a sink far below zero."""
+    plan = _paged_graph(2, 8, 1, D, 16, 2048, [32000, 0], hnd=True, stats=True, sink=sink)
+    assert plan.knobs.cga == 1 and plan.knobs.split_kv > 1, plan.knobs
+
+
+@pytest.mark.L0
 def test_graph_thd_queries_never_get_the_decode_tile():
-    """Ragged (THD) queries over a paged cache: no cga=1 plan is offered for the
-    engine (the decode tile has no THD leg), and a pinned cga=1 declines."""
+    """An explicit single-CTA multi-query THD plan is prefill, never the decode tile."""
     import cudnn
     import cudnn.sdpa  # noqa: F401
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
@@ -923,15 +1203,18 @@ def test_graph_thd_queries_never_get_the_decode_tile():
     g = _build()
     g.create_execution_plans([cudnn.heur_mode.A])
     assert offers_engine(g, ENGINE)
-    cgas = {g.plans[i].knobs.cga for i in range(len(g.plans)) if g.get_plan_name_at_index(i).startswith(ENGINE)}
-    assert cgas == {2}, f"THD must stay on the prefill tile; offered cga domain {cgas}"
-    # Pinned cga=1 on the THD graph is a typed decline, not a silent substitution.
+    # SM100 admits the two-slab single-CTA prefill body; SM103 keeps its existing domain.
     g2 = _build()
     g2.create_execution_plan(_SM100_ID, SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=1))
     g2.select_plan(0)
-    with pytest.raises((cudnn.cudnnGraphNotSupportedError, NotImplementedError, ValueError), match="decode tile|THD"):
+    if torch.cuda.get_device_capability() == (10, 0):
         g2.check_support()
         g2.build_plans()
+        assert g2._compiled_plans[0]._compiled.kernel_template == "prefill_d128_f16"
+    else:
+        with pytest.raises((cudnn.cudnnGraphNotSupportedError, NotImplementedError, ValueError), match="decode tile|THD"):
+            g2.check_support()
+            g2.build_plans()
 
 
 # --- the ragged-Q leg: ragged Q/O/Stats over paged K/V at S_q(max) == 1 (nvbug 6607857) ---
@@ -1005,7 +1288,7 @@ def test_ragged_q_leg_predicate_and_heuristics():
     """engines._thd_decode_leg admits exactly FlashInfer's shape (ragged Q/O/Stats,
     paged, S_q(max) == 1, d128 half, one offset width whose multiplier divides the
     row) and the heuristics then propose the decode tile with PackGQA and a split
-    of at least 2. Multi-token THD has a separate packed split admission."""
+    of at least 2. Multi-token THD also admits the unsplit SM100 prefill tile."""
     import cudnn
     from cudnn.sdpa.fwd import engines
     from cudnn.sdpa.fwd.engines import _thd_decode_leg, _thd_decode_leg_divisors, _thd_decode_leg_int64
@@ -1025,12 +1308,14 @@ def test_ragged_q_leg_predicate_and_heuristics():
     i64 = _ragged_paged_facts(dtype=cudnn.data_type.INT64)
     assert _thd_decode_leg(caps, i64) and _thd_decode_leg_int64(i64)
     assert _thd_decode_leg(caps, _ragged_paged_facts(stats=False))
+    # A sink rides the leg: the split kernel's partials are sink-free and the ragged
+    # combine entry folds the per-head sink once.
+    assert _thd_decode_leg(caps, _ragged_paged_facts(has_sink=True))
     for off in (
         _ragged_paged_facts(s_q=2),  # separate packed-THD split path, not the single-Q leg
         _ragged_paged_facts(has_paged_kv=False, page_size=0),  # ragged K/V: the THD leg's clamped descriptors
         _ragged_paged_facts(mult=(3, 1, 1)),  # a multiplier that does not divide the row
         _ragged_paged_facts(d_qk=64, d_v=64),  # the d128 envelope, not the native flavor
-        _ragged_paged_facts(has_sink=True),
         _ragged_paged_facts(stats_t=_RaggedStub(cudnn.data_type.INT64)),  # mixed offset widths
         _ragged_paged_facts(cu_seq_kv_t=object()),  # the cu form is not plumbed on the dense kernel
     ):
@@ -1046,14 +1331,16 @@ def test_ragged_q_leg_predicate_and_heuristics():
     mtp = _ragged_paged_facts(s_q=2)
     mtp_plans = _plans(mtp)
     assert mtp_plans and all(engines.mismatch(caps, mtp, p.knobs) is None for p in mtp_plans)
-    # mismatch: cga=1 needs the split; cga=2 is the prefill THD leg (unsplit, unpacked).
+    # Q=1 at cga=1 still needs the decode split; cga=2 serves unsplit THD.
+    # Multi-token SM100 can also use the cga=1 prefill tile without a split.
     K = engines.SdpaFwdKnobs
     assert "split_kv >= 2" in (engines.mismatch(caps, leg, K(cga=1, split_kv=1)) or "")
     assert engines.mismatch(caps, leg, K(cga=1, split_kv=4, pack_gqa=True)) is None
     assert engines.mismatch(caps, leg, K(cga=2, split_kv=1)) is None
     assert engines.mismatch(caps, leg, K(cga=2, split_kv=2)) is not None, "the prefill THD leg cannot split"
     assert engines.mismatch(caps, mtp, K(cga=1, split_kv=2)) is None
-    assert engines.mismatch(caps, mtp, K(cga=1, split_kv=1)) is not None
+    assert engines.mismatch(caps, mtp, K(cga=1, split_kv=1)) is None
+    assert engines.mismatch(caps, _ragged_paged_facts(s_q=2, device_cc=(10, 3)), K(cga=1, split_kv=1)) is not None
     assert engines.mismatch(caps, mtp, K(cga=2, split_kv=1)) is None
 
 
@@ -1384,22 +1671,25 @@ def test_adapter_decode_tile_cuda_graph_replay_no_host_sync():
         api.execute(q_gpu, k_c, v_c, o_gpu, lse_tensor=lse, seq_kv_lens=seq_lens, seq_q_lens=seq_q, block_table=bt, workspace=ws)
     torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
-    prev_sync_mode = torch.cuda.get_sync_debug_mode()
-    with torch.cuda.graph(g, stream=s):
-        torch.cuda.set_sync_debug_mode("error")
-        try:
-            api.execute(q_gpu, k_c, v_c, o_gpu, lse_tensor=lse, seq_kv_lens=seq_lens, seq_q_lens=seq_q, block_table=bt, workspace=ws)
-        finally:
-            torch.cuda.set_sync_debug_mode(prev_sync_mode)
-    scale = 1.0 / math.sqrt(D)
-    for new_lens in ([5, 1024, 77, 128, 129, 1, 512, 1000], [1024] * B, [0, 1, 2, 3, 4, 5, 6, 7]):
-        seq_lens.copy_(torch.tensor(new_lens, dtype=torch.int32))
-        g.replay()
-        torch.cuda.synchronize()
-        for b in range(B):
-            ref_o, ref_lse = _ref(
-                q_gpu[b].transpose(0, 1), _gather_kv(k_pool, bt[b], new_lens[b], False), _gather_kv(v_pool, bt[b], new_lens[b], False), 1, scale
-            )
-            torch.testing.assert_close(o_gpu[b].transpose(0, 1).float(), ref_o, atol=2e-2, rtol=0)
-            live = ~torch.isinf(ref_lse)
-            torch.testing.assert_close(lse[b][live], ref_lse[live], atol=5e-3, rtol=0)
+    try:
+        prev_sync_mode = torch.cuda.get_sync_debug_mode()
+        with torch.cuda.graph(g, stream=s):
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                api.execute(q_gpu, k_c, v_c, o_gpu, lse_tensor=lse, seq_kv_lens=seq_lens, seq_q_lens=seq_q, block_table=bt, workspace=ws)
+            finally:
+                torch.cuda.set_sync_debug_mode(prev_sync_mode)
+        scale = 1.0 / math.sqrt(D)
+        for new_lens in ([5, 1024, 77, 128, 129, 1, 512, 1000], [1024] * B, [0, 1, 2, 3, 4, 5, 6, 7]):
+            seq_lens.copy_(torch.tensor(new_lens, dtype=torch.int32))
+            g.replay()
+            torch.cuda.synchronize()
+            for b in range(B):
+                ref_o, ref_lse = _ref(
+                    q_gpu[b].transpose(0, 1), _gather_kv(k_pool, bt[b], new_lens[b], False), _gather_kv(v_pool, bt[b], new_lens[b], False), 1, scale
+                )
+                torch.testing.assert_close(o_gpu[b].transpose(0, 1).float(), ref_o, atol=2e-2, rtol=0)
+                live = ~torch.isinf(ref_lse)
+                torch.testing.assert_close(lse[b][live], ref_lse[live], atol=5e-3, rtol=0)
+    finally:
+        g.reset()

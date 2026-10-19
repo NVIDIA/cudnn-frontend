@@ -44,8 +44,21 @@ experts:
 | `C`, `D` | `(M, N, 1)` | `(N, 1, M*N)`, BF16/FP16/FP32 |
 
 `M` and every cumulative offset must be 256-aligned. Dense weights are
-K-major. Discrete mode uses `b_major="k"`, `n=N`, and
-`b_dtype=torch.bfloat16`.
+K-major. Discrete mode accepts `b_major="k"` (physical stride `(K,1)`)
+or `b_major="n"` (physical stride `(1,N)`), with `n=N` and
+`b_dtype=torch.bfloat16`. N-major reads an original contiguous `(K,N)`
+allocation as the logical `(N,K)` matrix, avoiding a separate weight
+transpose for input gradients. Layout participates in wrapper/plan cache keys.
+
+Torch callers may instead pass the canonical layouts: contiguous `A` `(M, K)`,
+`prob` `(M,)`, and dense `B` `(L, N, K)`, or the N-major `(L, K, N)` buffer with
+`b_major="n"`. With 2-D `A`, `C` and `D` are `(M, N)`, including a caller-provided
+`d_tensor`. The wrapper advertises `supports_bf16_canonical_layouts`.
+
+`padded_offsets` values and `b_ptrs` entries are a **device-data contract**: the kernel
+reads them on device and `execute()` does not copy them to the host. Set
+`CUDNN_FE_GROUPED_GEMM_VALIDATE_DEVICE_VALUES=1` (read once at import) to turn on
+blocking debug checks of those values at `execute()`.
 
 The pointer-array tensor must be contiguous, non-null, eight-byte aligned, and
 on the same device as `A`; each target pointer must satisfy the kernel's

@@ -77,10 +77,15 @@ def validate_node(node) -> None:
         _validate_required(node, "MoeGroupedMatmul", _MOE_FWD_INPUTS, ("OUT_0",))
         _validate_moe_offsets(node)
         mode = getattr(node.params.get("mode"), "name", None)
-        if mode in ("GATHER", "SCATTER"):
+        if mode in ("GATHER", "SCATTER", "COMBINE"):
             _validate_required(node, "MoeGroupedMatmul", ("token_index",), ())
-        if mode == "SCATTER":
+        if mode in ("SCATTER", "COMBINE"):
             _validate_required(node, "MoeGroupedMatmul", ("token_ks",), ())
+        if mode == "COMBINE":
+            _validate_required(node, "MoeGroupedMatmul", ("top_k_scores",), ())
+            _validate_moe_combine(node)
+        elif node.inputs.get("top_k_scores") is not None:
+            raise ValueError("top_k_scores is only valid for MoE COMBINE")
     elif node.node_type == NodeType.MOE_GROUPED_MATMUL_BWD:
         _validate_required(node, "MoeGroupedMatmulBwd", _MOE_BWD_INPUTS, ("dweight",))
         _validate_moe_offsets(node)
@@ -109,6 +114,24 @@ def validate_node(node) -> None:
             dim = _dims(tensor)
             if dim and out and (len(dim) > len(out) or any(x != 1 and x != y for x, y in zip(reversed(dim), reversed(out)))):
                 raise _not_supported("Pointwise inputs do not broadcast to the output shape")
+
+
+def _validate_moe_combine(node) -> None:
+    """COMBINE changes the token extent; preserve that public graph contract."""
+    token, weight = _dims(node.inputs["token"]), _dims(node.inputs["weight"])
+    scores = _dims(node.inputs["top_k_scores"])
+    top_k = node.params.get("top_k")
+    if not token or not weight or len(token) != 3 or len(weight) != 3:
+        raise ValueError("MoE COMBINE token and weight must have rank 3")
+    if not isinstance(top_k, int) or not 1 <= top_k <= weight[0]:
+        raise ValueError("MoE COMBINE requires 1 <= top_k <= num_experts")
+    if not scores or len(scores) != 3 or scores[0] != 1 or scores[1] <= 0 or scores[2] != top_k:
+        raise ValueError("MoE COMBINE top_k_scores must have shape [1, tokens, top_k]")
+    for role in ("token_index", "token_ks"):
+        if _dims(node.inputs[role]) != [1, token[1], 1]:
+            raise ValueError(f"MoE COMBINE {role} must have shape [1, routed_rows, 1]")
+    if _dims(node.outputs["OUT_0"]) != [1, scores[1], weight[2]]:
+        raise ValueError("MoE COMBINE output must have shape [1, tokens, N] matching top_k_scores")
 
 
 def _validate_matmul(node) -> None:

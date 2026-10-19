@@ -31,12 +31,17 @@ def make_bwd_decode(CFG):
 
         (q_block, head, batch, q_tok, kv_tok, ws_row, seqlen_q, seqlen_kv)
 
-    ``q_block`` is in units of TILE_M rows and already carries ``cta_in_pair``.
-    The two sub-groups of a cluster deliberately land on the SAME q rows: sg1's
-    CTA k must hold the row-block sg0's CTA k holds, because the fp32 S ship is
-    lane-to-lane across ``cross_sg_peer = cta_id ^ CTA_MMA``. That falls out of
-    keying the row on ``cta_in_pair`` (0/1 within a pair) rather than on the
-    cluster-wide CTA id.
+    ``q_block`` is in units of TILE_M rows and already carries the caller's
+    ``row_key``: ``q_block = cluster * Q_BLOCKS_PER_CLUSTER + row_key``.  The
+    4x1 role-split kernel passes ``cta_in_pair`` (0/1 within a pair) with the
+    default ``Q_BLOCKS_PER_CLUSTER = CTA_MMA``, so the two sub-groups of a
+    cluster land on the SAME q rows -- sg1's CTA k must hold the row-block
+    sg0's CTA k holds, because the fp32 S ship is lane-to-lane across
+    ``cross_sg_peer = cta_id ^ CTA_MMA``.  The fused 2x2 kernel passes the
+    cluster-wide ``cta_id_x`` with ``Q_BLOCKS_PER_CLUSTER = CGA_M``: every CTA
+    owns its own TILE_M-row block of the cluster's ``CLUSTER_Q_ROWS``.  Both
+    read through ``getattr`` with the 4x1 defaults, so a config without the two
+    fields decodes exactly what it always did.
 
     **The per-sequence values ride WITH the decode rather than beside it.**
     Under THD a tile change also changes ``cu_q[b]``, ``cu_k[b]``,
@@ -50,11 +55,14 @@ def make_bwd_decode(CFG):
     Under ``CFG.THD_VARLEN`` both arms decode the SAME linear unit id -- from
     ``blockIdx.x`` for the first tile, from the persistent scheduler's payload
     word afterwards -- so there is one THD body. A unit is
-    ``TILE_M * CTA_MMA`` q rows of one head of one sequence, matching what the
-    setup launch counted into ``live``.
+    ``CLUSTER_Q_ROWS`` (= ``TILE_M * CTA_MMA`` on the 4x1 kernel) q rows of one
+    head of one sequence, matching what the setup launch counted into ``live``.
     """
     _thd = int(getattr(CFG, "THD_VARLEN", 0))
-    _CGA_TILE_M = CFG.TILE_M * CFG.CTA_MMA
+    # The cluster's q span and its TILE_M-row block count.  Defaults = the 4x1
+    # role split's arithmetic (256 rows, CTA_MMA blocks keyed on cta_in_pair).
+    _CGA_TILE_M = int(getattr(CFG, "CLUSTER_Q_ROWS", CFG.TILE_M * CFG.CTA_MMA))
+    _QB = int(getattr(CFG, "Q_BLOCKS_PER_CLUSTER", CFG.CTA_MMA))
 
     @cute.jit
     def _coords(meta_t, batch, n_batch, scalar_seqlen_q, scalar_seqlen_kv):
@@ -85,33 +93,33 @@ def make_bwd_decode(CFG):
         return cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0), scalar_seqlen_q, scalar_seqlen_kv
 
     @cute.jit
-    def _thd_decode(linear_cta, meta_t, n_batch, n_qh, cta_in_pair):
+    def _thd_decode(linear_cta, meta_t, n_batch, n_qh, row_key):
         u = linear_cta // cutlass.Int32(CFG.CGA_M)
         meta = cutlass.make_array_view(meta_t)
         q_tile_idx, batch, head = thd_decode_unit(meta, n_batch, u, n_qh, cutlass.Int32(_CGA_TILE_M), False)
-        return q_tile_idx * cutlass.Int32(CFG.CTA_MMA) + cta_in_pair, head, batch
+        return q_tile_idx * cutlass.Int32(_QB) + row_key, head, batch
 
     @cute.jit
-    def decode_initial(bidx, bidy, bidz, cta_in_pair, meta_t, n_batch, n_qh, seqlen_q, seqlen_kv):
+    def decode_initial(bidx, bidy, bidz, row_key, meta_t, n_batch, n_qh, seqlen_q, seqlen_kv):
         """From blockIdx, for the first tile."""
         if cutlass.const_expr(_thd):
-            q_block, head, batch = _thd_decode(bidx, meta_t, n_batch, n_qh, cta_in_pair)
+            q_block, head, batch = _thd_decode(bidx, meta_t, n_batch, n_qh, row_key)
         else:
-            q_block = (bidx // cutlass.Int32(CFG.CGA_M)) * cutlass.Int32(CFG.CTA_MMA) + cta_in_pair
+            q_block = (bidx // cutlass.Int32(CFG.CGA_M)) * cutlass.Int32(_QB) + row_key
             head, batch = bidy, bidz
         q_tok, kv_tok, ws_row, s_q, s_kv = _coords(meta_t, batch, n_batch, seqlen_q, seqlen_kv)
         return q_block, head, batch, q_tok, kv_tok, ws_row, s_q, s_kv
 
     @cute.jit
-    def decode_payload(t0, t1, cta_in_pair, meta_t, n_batch, n_qh, seqlen_q, seqlen_kv):
+    def decode_payload(t0, t1, row_key, meta_t, n_batch, n_qh, seqlen_q, seqlen_kv):
         """From the scheduler payload: dense (CLC) ``t0`` is the cancelled
         cluster's blockIdx.x and ``t1`` packs head in the low 16 bits and batch
         in the high 16; THD (persistent claim) puts ``unit * CGA_M`` in ``t0``
         and leaves ``t1`` unused."""
         if cutlass.const_expr(_thd):
-            q_block, head, batch = _thd_decode(t0, meta_t, n_batch, n_qh, cta_in_pair)
+            q_block, head, batch = _thd_decode(t0, meta_t, n_batch, n_qh, row_key)
         else:
-            q_block = (t0 // cutlass.Int32(CFG.CGA_M)) * cutlass.Int32(CFG.CTA_MMA) + cta_in_pair
+            q_block = (t0 // cutlass.Int32(CFG.CGA_M)) * cutlass.Int32(_QB) + row_key
             head = t1 & cutlass.Int32(0xFFFF)
             batch = (t1 >> cutlass.Int32(16)) & cutlass.Int32(0xFFFF)
         q_tok, kv_tok, ws_row, s_q, s_kv = _coords(meta_t, batch, n_batch, seqlen_q, seqlen_kv)

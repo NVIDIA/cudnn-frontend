@@ -177,6 +177,67 @@ def moe_gather_row(token_index, row, group_end, source_rows):
 
 
 @cute.jit
+def moe_combine_add(ptr, value, dtype: cutlass.Constexpr):
+    """Add one weighted contribution in the declared output precision."""
+    if cutlass.const_expr(dtype == cutlass.Float32):
+        llvm.inline_asm(
+            None,
+            [ptr.toint().ir_value(), value.ir_value()],
+            "red.global.add.f32 [$0], $1;",
+            "l,f,~{memory}",
+            has_side_effects=True,
+        )
+    else:
+        instruction = "red.global.add.noftz.bf16 [$0], $1;" if cutlass.const_expr(dtype == cutlass.BFloat16) else "red.global.add.noftz.f16 [$0], $1;"
+        llvm.inline_asm(
+            None,
+            [ptr.toint().ir_value(), value.to(dtype).bitcast(cutlass.Int16).ir_value()],
+            instruction,
+            "l,h,~{memory}",
+            has_side_effects=True,
+        )
+
+
+@cute.jit
+def moe_combine_add_vector(ptr, values, dtype: cutlass.Constexpr, count: cutlass.Constexpr):
+    """At most 16 bytes of adjacent output elements, with scalar alignment ABI.
+
+    The full destination address includes the routed token's runtime row
+    stride. Halve the access when it is not naturally aligned; this preserves
+    support for shifted pointers and odd/padded row strides on plan reuse.
+    Atomicity remains per element, exactly as in the scalar path.
+    """
+    if cutlass.const_expr(count == 1):
+        moe_combine_add(ptr, values[0], dtype)
+    else:
+        if ptr.toint() % (count * dtype.width // 8) == 0:
+            if cutlass.const_expr(dtype == cutlass.Float32):
+                words = values
+                nwords = count
+                instruction = f"red.global.add.v{count}.f32"
+                constraint = "f"
+            else:
+                words = values.to(dtype).bitcast(cutlass.Uint32)
+                nwords = count // 2
+                scalar_type = "bf16x2" if cutlass.const_expr(dtype == cutlass.BFloat16) else "f16x2"
+                vector_type = "" if cutlass.const_expr(count == 2) else f"v{count // 2}."
+                instruction = f"red.global.add.noftz.{vector_type}{scalar_type}"
+                constraint = "r"
+            operands = ", ".join(f"${i + 1}" for i in range(nwords))
+            operands = operands if cutlass.const_expr(nwords == 1) else "{" + operands + "}"
+            llvm.inline_asm(
+                None,
+                [ptr.toint().ir_value()] + [words[i].ir_value() for i in range(nwords)],
+                instruction + " [$0], " + operands + ";",
+                "l," + ",".join([constraint] * nwords) + ",~{memory}",
+                has_side_effects=True,
+            )
+        else:
+            moe_combine_add_vector(ptr, values[: count // 2], dtype, count // 2)
+            moe_combine_add_vector(ptr + count // 2, values[count // 2 :], dtype, count // 2)
+
+
+@cute.jit
 def moe_scatter_row(token_index, token_ks, row, group_end, output_rows, top_k: cutlass.Constexpr):
     """Map a routed row to its token/top-k slot; clip padding with an OOB row."""
     dst = cutlass.Int32(output_rows)

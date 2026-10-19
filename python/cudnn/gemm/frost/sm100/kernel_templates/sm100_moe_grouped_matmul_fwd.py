@@ -27,6 +27,8 @@ from cudnn.gemm.frost.kernel_templates.dynamic_scheduler_counter_initialization 
 )
 from cudnn.gemm.frost.tile_helpers import (
     moe_scatter_row,
+    moe_combine_add,
+    moe_combine_add_vector,
     tma_scatter4,
     moe_gather_row,
     tma_gather4,

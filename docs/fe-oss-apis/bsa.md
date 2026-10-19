@@ -154,17 +154,40 @@ split count. The SM100/SM103 blk64 path also accepts `kv_splits="auto"`; CLC is
 compatible with split execution. Pass `use_clc=True` to use persistent CLC
 scheduling with `kv_splits>1`, or `use_clc=False` to use one tile per CTA. The
 default `use_clc=None` keeps CLC disabled for split execution because the
-automatic scheduler policy has not been tuned for that combination. Automatic
-split selection uses metadata capacity rather than per-row count values. It
+automatic scheduler policy has not been tuned for that combination.
+
+The BF16 automatic policy is tuned assuming approximately uniform random KV
+indices with little overlap between the neighborhoods of different Q blocks.
+It uses host-visible tensor metadata and device properties, without reading
+indices or counts back to the host. Highly overlapping, shared or local-window
+indices can favor a different split count even at the same shape and density;
+benchmark explicit `kv_splits` values for those masks. This assumption affects
+performance only, not attention semantics or supported mask patterns.
+
+For fewer than 512 total Q tiles (`B * H * ceil(S_q / 64)`), the existing policy
+uses the fixed active block count, or index capacity for variable counts:
+256--449 blocks select two splits, 450--899 select four, and 900 or more select
+eight. Larger Q grids keep one split except in the measured long-Q region:
+BF16 MHA with Q/K/V head dimensions 128, `S_q >= 262144`, a fixed count of at
+least 512 active KV blocks, and density at most 1/8 (active blocks divided by
+`ceil(S_k / 64)`). In that region, K+V bytes **per batch and KV head** above twice
+the device L2 size select eight splits for at least 900 active blocks and four
+or more heads; a single head requires at least 1024 active blocks. Otherwise,
+four or more heads select four splits when per-head K+V bytes exceed L2.
+All other cases, including an unavailable L2 size, keep one split. Variable
+per-row counts also keep one split on larger Q grids because index capacity
+does not describe actual row work. The Sage FP8 policy is separate.
+
+Automatic selection
 falls back to a smaller split count when the estimated live workspace does not
 fit the available CUDA allocator budget; an explicit split count that exceeds
 that budget raises `RuntimeError`.
 
 ## Sage FP8 forward
 
-Sage FP8 is a forward-only blk64 path. Its public wrapper accepts contiguous
-BF16 Q, K, and V tensors in `BHSD` layout and performs FP8 quantization
-internally:
+Sage FP8 is forward-only and supports blk64 on SM100/SM103 and SM120, plus
+native blk128 on SM120. Its public wrapper accepts contiguous BF16 Q, K, and V
+tensors in `BHSD` layout and performs FP8 quantization internally:
 
 ```python
 fp8_result = block_sparse_attention_fp8_forward(
@@ -173,15 +196,25 @@ fp8_result = block_sparse_attention_fp8_forward(
     v,
     q2k_block_index,
     block_sparse_num=4,
+    sparse_block_size=64,
 )
 o_fp8 = fp8_result["o_tensor"]
 ```
 
 Q, K, and V must be BF16 MHA tensors in contiguous BHSD layout, have matching
-batch and head counts, and use `D=128`. The wrapper accepts the same blk64
-sparse index metadata used by the regular forward API. It lazily loads the
-quantizer, creates the E4M3 tensors and FP32 scales needed by the kernel, and
-does not expose those implementation details as public inputs or outputs.
+batch and head counts, and use `D=128`. The wrapper accepts the same sparse
+index metadata used by the regular forward API for the selected block size.
+It lazily loads the quantizer, creates the E4M3 tensors and FP32 scales needed
+by the kernel, and does not expose those implementation details as public
+inputs or outputs.
+
+`sparse_block_size` defaults to 64. On SM120, pass `sparse_block_size=128` with
+`q2k_block_index` shaped `(B, H, ceil(S_q / 128), K_max)` and, when supplied,
+`q2k_block_nums` shaped `(B, H, ceil(S_q / 128))`. Active indices address
+physical 128-token KV blocks, so they must be in `[0, ceil(S_kv / 128))`.
+For `block_sizes`, use `N_kv = ceil(S_kv / 128)` and valid-token counts in
+`[1, 128]` for referenced blocks. The native kernel consumes this metadata
+directly. Other architectures reject `sparse_block_size=128` for FP8.
 
 The result is a one-key `TupleDict` containing `o_tensor`, a contiguous BF16
 tensor of shape `(B, H, S_q, 128)`. This API does not return LSE and has no
@@ -189,14 +222,15 @@ backward implementation.
 
 The architecture-specific FP8 contracts are:
 
-- SM100/SM103 accepts any positive batch and head counts and requires both
-  sequence lengths to be multiples of 64. It uses fixed `block_sparse_num`
-  with full 64-token KV blocks; `q2k_block_nums` and `block_sizes` are not
-  supported. Split-KV is selected internally, and the public FP8 API does not
-  expose `kv_splits` or `use_clc`.
-- SM120 accepts any positive batch and head counts, non-aligned Q/KV sequence
-  tails, fixed or per-query-block counts, and `block_sizes` shaped `(N_kv,)`,
-  `(B, N_kv)`, or `(B, H, N_kv)`. It does not use split-KV.
+- SM100/SM103 supports only blk64, accepts any positive batch and head counts,
+  and requires both sequence lengths to be multiples of 64. It uses fixed
+  `block_sparse_num` with full 64-token KV blocks; `q2k_block_nums` and
+  `block_sizes` are not supported. Split-KV is selected internally, and the
+  public FP8 API does not expose `kv_splits` or `use_clc`.
+- SM120 supports blk64 and blk128, accepts any positive batch and head counts,
+  non-aligned Q/KV sequence tails, fixed or per-query-block counts, and
+  `block_sizes` shaped `(N_kv,)`, `(B, N_kv)`, or `(B, H, N_kv)`. It does not
+  use split-KV.
 
 `block_sparse_attention_fp8_forward` relies on functionality introduced in
 CuTe DSL 4.6.1; package-supported installations provide CuTe DSL 4.6.2 or
@@ -249,6 +283,7 @@ therefore requires full physical KV blocks and `block_sizes=None`.
 | SM120 | 64 | FP16, BF16 | QK=128, V=128 | MHA, GQA, MQA |
 | SM120 | 128 (explicit) | FP16, BF16 | QK=128, V=128 | MHA, GQA, MQA |
 | SM120 | 64 | BF16 / FP8 E4M3 | QK=128, V=128 | MHA |
+| SM120 | 128 (explicit) | BF16 / FP8 E4M3 | QK=128, V=128 | MHA |
 
 SM90 blk64 requires `S_q` to be a multiple of 64; native blk128 supports
 positive arbitrary Q/KV lengths, including partial final blocks. Its fixed count may be
@@ -334,7 +369,7 @@ output buffers. XLA owns the outputs and workspaces.
 
 | Property | Supported |
 | --- | --- |
-| Device | One visible CUDA GPU, exactly compute capability 10.0 (SM100) |
+| Device | All arrays on one CUDA GPU of exactly compute capability 10.0 (SM100); other GPUs may be visible. Single process |
 | Data | BF16 Q/K/V/O/dO/dQ/dK/dV; FP32 LSE and accumulation |
 | Dimensions | MHA with equal head counts, D=64 or 128; positive sequence lengths divisible by 128 |
 | Layout | Compact BHSD or BSHD, independently specialized |

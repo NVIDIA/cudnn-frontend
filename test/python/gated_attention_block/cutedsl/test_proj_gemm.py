@@ -14,7 +14,9 @@ measured on a backend plan would not be measuring FROST at all.
 """
 
 import dataclasses
+import gc
 import os
+import weakref
 
 import pytest
 import torch
@@ -103,6 +105,166 @@ def test_missing_frost_plan_raises_rather_than_falling_back():
     assert ("sm100 GEMM template family" in why) or ("CUDNN_FRONTEND_ENABLE_FROST_ENGINES" in why) or ("declined this shape" in why)
 
 
+class _FakeJit:
+    """A stand-in for a forced-tile JIT on the ``run_resolved`` route: the two attributes ``_resolved_pack`` keys on (``binding``,
+    ``run_resolved``) and a call log; no ``__call__`` and no ``workspace_bytes`` (the route without a split-K workspace)."""
+
+    binding = object()
+
+    def __init__(self):
+        self.calls = []
+
+    def run_resolved(self, resolved, stream=None, workspace=None):
+        self.calls.append((dict(resolved), stream, workspace))
+
+
+def _plan_with_fake_jit(label, m=8, k=16, n=32):
+    from cudnn.gated_attention_block.kernels.proj_gemm import ProjGemmPlan
+
+    # the graph tensors are the pack's keys: three distinct sentinels per plan, exactly as distinct graph tensor objects would be
+    return ProjGemmPlan(graph=None, a=object(), b=object(), c=object(), m=m, k=k, n=n, label=label, jit=_FakeJit())
+
+
+def _counting_resolver(monkeypatch, bound_ids):
+    """Replace the compiler's ``resolve_variant_pack`` (imported lazily inside ``_resolved_pack``) with one that maps each pack
+    key through ``bound_ids`` -- ``{id(bound tensor): buffer}``, the shape the real one returns -- and counts its calls."""
+    import cudnn.gemm.frost.graph_analyzer as ga
+
+    calls = []
+
+    def fake(vp, binding):
+        calls.append(binding)
+        return {bound_ids[k]: buf for k, buf in vp.items()}
+
+    monkeypatch.setattr(ga, "resolve_variant_pack", fake)
+    return calls
+
+
+def test_pack_resolution_is_taken_once_per_plan_and_dies_with_it(monkeypatch):
+    """The forced-tile JIT route resolves the pack's graph-tensor keys to the JIT's bound tensors ONCE per plan (the keys are the
+    plan's own graph tensors) and keeps that resolution on the plan: a second plan resolves its own, a key the entry has not seen
+    re-resolves exactly once more, and a dropped plan leaves NOTHING behind -- its JIT is collectable, and the module holds no
+    table of JITs.  The predecessor kept every JIT ever resolved in a module-level dict keyed by ``id(jit)`` (a strong reference
+    so the id stayed valid, never evicted): every dropped block leaked its four forced-tile JITs, bindings and graph tensors."""
+    from cudnn.gated_attention_block.kernels import proj_gemm
+    from cudnn.gated_attention_block.kernels.proj_gemm import _resolved_pack
+
+    plan, plan2 = _plan_with_fake_jit("p1"), _plan_with_fake_jit("p2")
+    bound = {plan.a: 101, plan.b: 202, plan.c: 303, plan2.a: 111, plan2.b: 222, plan2.c: 333}
+    calls = _counting_resolver(monkeypatch, bound)
+    a, w, out = object(), object(), object()
+    vp = {plan.a: a, plan.b: w, plan.c: out}
+    assert _resolved_pack(plan, vp) == {101: a, 202: w, 303: out}
+    assert len(calls) == 1
+    # the same plan again with fresh buffers: the cached keys, no second resolution; the per-call buffers map through
+    a2, w2, out2 = object(), object(), object()
+    assert _resolved_pack(plan, {plan.a: a2, plan.b: w2, plan.c: out2}) == {101: a2, 202: w2, 303: out2}
+    assert _resolved_pack(plan, vp) == {101: a, 202: w, 303: out} and len(calls) == 1
+    # the second plan resolves ITS keys once (per plan, not per process), and does not disturb the first plan's entry
+    assert _resolved_pack(plan2, {plan2.a: a, plan2.b: w, plan2.c: out}) == {111: a, 222: w, 333: out}
+    assert len(calls) == 2 and _resolved_pack(plan, vp) == {101: a, 202: w, 303: out} and len(calls) == 2
+    # a key the entry has not seen (an alpha bound later) re-resolves exactly once, then the widened entry serves
+    alpha_key, alpha = object(), object()
+    bound[alpha_key] = 404
+    vp_alpha = {**vp, alpha_key: alpha}
+    assert _resolved_pack(plan, vp_alpha) == {101: a, 202: w, 303: out, 404: alpha} and len(calls) == 3
+    assert _resolved_pack(plan, vp_alpha) == {101: a, 202: w, 303: out, 404: alpha} and len(calls) == 3
+    # a JIT swapped under the plan is re-resolved against the new binding (the entry is keyed on the JIT's identity)
+    plan.jit = _FakeJit()
+    assert _resolved_pack(plan, vp) == {101: a, 202: w, 303: out} and len(calls) == 4
+    # nothing without `run_resolved` is resolved (the plain __call__ route)
+    plan2.jit = object()
+    assert _resolved_pack(plan2, vp) is None and len(calls) == 4
+    # dropping the plans drops their JITs -- plan's current one, and plan2's ORIGINAL one, which since the swap above only its slot
+    # holds: no module-level table keeps either (the leak this pins)
+    jit_ref, jit2_ref = weakref.ref(plan.jit), weakref.ref(plan2._resolved_keys[0])
+    del plan, plan2, vp, vp_alpha
+    gc.collect()
+    assert jit_ref() is None and jit2_ref() is None, "a dropped plan's JIT is still reachable -- something outside the plan holds it"
+    assert not hasattr(proj_gemm, "_RESOLVED_KEYS"), "the module-level JIT table is back"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device for the launch-side tensors")
+def test_run_proj_gemm_resolves_the_pack_once_per_plan(monkeypatch):
+    """The same contract through the driver: ``run_proj_gemm`` on a forced-tile plan resolves once, then every launch hands
+    ``run_resolved`` the bound-id-keyed pack over the per-call buffers (the rank-3 views of a / w / out, in that order of ids) and
+    the resolved launch stream; a dropped plan's JIT is collectable afterwards."""
+    from cudnn.gated_attention_block.kernels.proj_gemm import ProjGemmPlan, run_proj_gemm
+
+    plan = _plan_with_fake_jit("drv")
+    calls = _counting_resolver(monkeypatch, {plan.a: 1, plan.b: 2, plan.c: 3})
+    a = torch.zeros(8, 16, dtype=torch.bfloat16, device="cuda")
+    w = torch.zeros(32, 16, dtype=torch.bfloat16, device="cuda")
+    out = torch.zeros(8, 32, dtype=torch.bfloat16, device="cuda")
+    ws = torch.empty(1, dtype=torch.uint8, device="cuda")
+    for _ in range(3):
+        run_proj_gemm(plan, a, w, out, ws)
+    assert len(calls) == 1 and len(plan.jit.calls) == 3
+    stream = torch.cuda.current_stream(out.device).cuda_stream
+    for resolved, s, workspace in plan.jit.calls:
+        assert s == stream and workspace is None
+        assert {k: v.data_ptr() for k, v in resolved.items()} == {1: a.data_ptr(), 2: w.data_ptr(), 3: out.data_ptr()}
+        assert all(v.ndim == 3 for v in resolved.values())
+    assert isinstance(plan, ProjGemmPlan) and plan._resolved_keys[0] is plan.jit
+    jit_ref = weakref.ref(plan.jit)
+    del plan
+    gc.collect()
+    assert jit_ref() is None
+
+
+def test_pack_resolution_is_by_role_so_one_tensor_may_be_bound_as_a_and_w(monkeypatch):
+    """The key resolution names the plan's ROLES -- which bound tensor each graph tensor is -- never the identity of a call's
+    buffers: a square projection binds ONE rank-3 tensor as both A and W (``_rank3`` passes rank-3 through unchanged) and the
+    resolved pack still carries both roles.  The predecessor resolved the real pack and inverted it over ``id(buffer)``: the alias
+    collapsed A and W onto one bound id (``run_resolved``: ``KeyError: 'variant pack is missing a buffer for A operand[0]'``) and
+    that two-role mapping was CACHED before the failure, so a distinct-buffer rebind of the same plan failed the same way.  Cold
+    cache under the alias, then the rebind; and the resolver is handed the plan's graph tensors, never this call's buffers."""
+    import cudnn.gemm.frost.graph_analyzer as ga
+    from cudnn.gated_attention_block.kernels.proj_gemm import _resolved_pack
+
+    plan = _plan_with_fake_jit("alias", m=256, k=256, n=256)
+    bound = {plan.a: 101, plan.b: 202, plan.c: 303}
+    seen = []
+
+    def resolver(vp, binding):
+        seen.append((list(vp), list(vp.values())))
+        return {bound[k]: buf for k, buf in vp.items()}
+
+    monkeypatch.setattr(ga, "resolve_variant_pack", resolver)
+    x, out = object(), object()
+    # COLD cache, aliased: the same buffer object under A and under W -> both roles resolved, one resolution
+    assert _resolved_pack(plan, {plan.a: x, plan.b: x, plan.c: out}) == {101: x, 202: x, 303: out}
+    assert len(seen) == 1
+    # the entry taken under the alias serves a distinct-buffer rebind of the SAME plan (the poisoned-cache shape): no re-resolution
+    a2, w2, out2 = object(), object(), object()
+    assert _resolved_pack(plan, {plan.a: a2, plan.b: w2, plan.c: out2}) == {101: a2, 202: w2, 303: out2}
+    assert _resolved_pack(plan, {plan.a: x, plan.b: x, plan.c: out}) == {101: x, 202: x, 303: out}
+    assert len(seen) == 1
+    # the resolver saw the plan's three graph tensors as the keys, and NONE of the call's buffers among the values
+    keys, values = seen[0]
+    assert {id(k) for k in keys} == {id(plan.a), id(plan.b), id(plan.c)}
+    assert all(v is not x and v is not out for v in values)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device for the launch-side tensors")
+def test_run_proj_gemm_hands_run_resolved_both_roles_of_an_aliased_operand(monkeypatch):
+    """The same through the driver: ``run_proj_gemm(plan, x, x, out)`` with a rank-3 ``x`` -- the object ``_rank3`` passes
+    through as A and as W -- hands ``run_resolved`` a pack with ALL THREE bound ids, A and W at ``x``'s pointer; the
+    distinct-buffer launch that follows on the same plan carries its own three.  One resolution serves both."""
+    from cudnn.gated_attention_block.kernels.proj_gemm import run_proj_gemm
+
+    plan = _plan_with_fake_jit("drv-alias", m=256, k=256, n=256)
+    calls = _counting_resolver(monkeypatch, {plan.a: 1, plan.b: 2, plan.c: 3})
+    x, out, a, w, out2 = (torch.zeros(1, 256, 256, dtype=torch.bfloat16, device="cuda") for _ in range(5))
+    ws = torch.empty(1, dtype=torch.uint8, device="cuda")
+    run_proj_gemm(plan, x, x, out, ws)  # COLD cache: one object as A and as W
+    run_proj_gemm(plan, a, w, out2, ws)  # then distinct buffers on the same plan
+    assert len(calls) == 1 and len(plan.jit.calls) == 2
+    ptrs = [{k: v.data_ptr() for k, v in resolved.items()} for resolved, _, _ in plan.jit.calls]
+    assert ptrs[0] == {1: x.data_ptr(), 2: x.data_ptr(), 3: out.data_ptr()}
+    assert ptrs[1] == {1: a.data_ptr(), 2: w.data_ptr(), 3: out2.data_ptr()}
+
+
 # ---------------------------------------------------------------------------
 # Numerics — needs an sm100-family device
 # ---------------------------------------------------------------------------
@@ -144,6 +306,39 @@ def test_rank2_and_rank3_binds_agree():
     _run(plan, a, w, o2)
     _run(plan, a.unsqueeze(0), w.unsqueeze(0), o3)
     torch.testing.assert_close(o2, o3[0], rtol=0, atol=0)
+
+
+@requires_frost_gemm
+def test_square_projection_binds_one_tensor_as_a_and_w_then_rebinds_distinct_buffers():
+    """``x @ x^T`` on the forced-tile JIT route: a square projection binds the SAME rank-3 read-only tensor as A and as W (the
+    object ``_rank3`` passes through for both roles).  Cold cache under the alias -> the result matches torch and is BITWISE the
+    launch over a clone of ``x`` as W (same kernel, same bytes, two objects); then a distinct-buffer launch on the SAME plan
+    matches torch too -- the key resolution taken under the alias is the plan's, not that call's.  Before the role-keyed
+    resolution the aliased launch raised ``KeyError: 'variant pack is missing a buffer for A operand[0]'`` and, the partial
+    mapping cached, so did every launch of the plan after it."""
+    m = k = n = 256
+    dtype = torch.bfloat16
+    torch.manual_seed(0)
+    x = (torch.randn(1, m, k, device="cuda", dtype=torch.float32) * 0.1).to(dtype)
+    plan = build_proj_gemm(m=m, k=k, n=n, dtype=dtype, label="alias")
+    assert plan.jit is not None, f"the square 256 projection is the forced-tile JIT route this pins; got route={plan.route!r}"
+    out = torch.empty(1, m, n, device="cuda", dtype=dtype)
+    _run(plan, x, x, out)  # COLD cache: one object as A and as W
+    ref = x[0].float() @ x[0].float().T
+    assert torch.isfinite(out.float()).all()
+    cos = torch.nn.functional.cosine_similarity(out.float().flatten(), ref.flatten(), dim=0).item()
+    assert cos > 0.999, f"cos {cos}"
+    ctrl = torch.empty_like(out)
+    _run(plan, x, x.clone(), ctrl)  # two objects, the same bytes
+    torch.testing.assert_close(out, ctrl, rtol=0, atol=0)
+    a = (torch.randn(m, k, device="cuda", dtype=torch.float32) * 0.1).to(dtype)
+    w = (torch.randn(n, k, device="cuda", dtype=torch.float32) * 0.05).to(dtype)
+    out2 = torch.empty(m, n, device="cuda", dtype=dtype)
+    _run(plan, a, w, out2)  # distinct buffers on the plan whose key resolution was taken under the alias
+    ref2 = torch.nn.functional.linear(a.float(), w.float())
+    assert torch.isfinite(out2.float()).all()
+    cos2 = torch.nn.functional.cosine_similarity(out2.float().flatten(), ref2.flatten(), dim=0).item()
+    assert cos2 > 0.999, f"cos {cos2}"
 
 
 @requires_frost_gemm
@@ -238,14 +433,22 @@ def test_fusion_params_offsets_follow_the_layout_contract():
 
 
 def test_qk_norm_knob_is_appended_and_validated():
-    """``qk_norm`` (then ``quant_mxfp8``) are APPENDED with defaults that spell every existing
-    key identically -- a norm-on render's template-loader cache key is unchanged.  Under
+    """``qk_norm`` (then ``quant_mxfp8``, ``weight_fp4``, and the paged write-through's ``kv_pool_page_size`` /
+    ``kv_slot_i64``) are APPENDED with defaults that spell every existing key identically -- a norm-on render's
+    template-loader cache key is unchanged.  Under
     ``qk_norm=False`` there is no rstd to emit and no weight load to delete (``const_w`` has
     no meaning; ``const_cs`` == ``const``); ``off`` and the FP8 fork stay legal."""
     assert NormRopeFusionParams() == NormRopeFusionParams(qk_norm=True)
     assert NormRopeFusionParams() == NormRopeFusionParams(qk_norm=True, quant_mxfp8=False)
     names = [f.name for f in dataclasses.fields(NormRopeFusionParams)]
-    assert names[-3:] == ["quant_fp8", "qk_norm", "quant_mxfp8"], names  # the FROZEN order (PR-B section 1.5)
+    assert names[-6:] == [
+        "quant_fp8",
+        "qk_norm",
+        "quant_mxfp8",
+        "weight_fp4",
+        "kv_pool_page_size",
+        "kv_slot_i64",
+    ], names  # the FROZEN order (PR-B section 1.5; the write-through's two fields appended after weight_fp4)
     with pytest.raises(ValueError, match="want_rstd"):
         validate_norm_rope_params(NormRopeFusionParams(qk_norm=False, want_rstd=True))
     with pytest.raises(ValueError, match="const_w"):
@@ -792,3 +995,148 @@ def test_fused_fp8_runner_rejects_wrong_bindings():
         launch(cos=inp["cos"].to(_FP8))  # the table dtype is the ACTIVATION dtype, not a.dtype
     with pytest.raises(ValueError, match="e4m3 operands"):
         launch(a=inp["a8"].to(torch.bfloat16))
+
+
+# ---------------------------------------------------------------------------
+# The SMALL-M route: the serving DECODE / MTP row counts (T = B x S_q <= 128)
+# ---------------------------------------------------------------------------
+
+from cudnn.gated_attention_block.kernels.proj_gemm import _FORCED_TILE_NAME, SMALL_M_MAX, small_m_tile_config  # noqa: E402
+
+# The Flash-Next 24/2 shard's two projections: the fused QKV + gate slab (N = (2 h_q + 2 h_kv) d_head) and the out projection.
+_FLASH_NEXT_24_2 = dict(d_model=2560, n_qkvg=(2 * 24 + 2 * 2) * 256, k_o=24 * 256)
+_RUBIN_SMS = 212
+
+
+@pytest.mark.parametrize(
+    "m, n, k, expect",
+    [
+        # the WIDE slab: a 64-row weight tile fills the machine (208 CTAs on 212 SMs) -> the 2x1-cluster swap-AB tile, tokens as the N tile
+        (1, _FLASH_NEXT_24_2["n_qkvg"], _FLASH_NEXT_24_2["d_model"], "CONFIG_sm100_64x8x128_64x8x32_cluster2x1_1ctamma_swapAB"),
+        (4, _FLASH_NEXT_24_2["n_qkvg"], _FLASH_NEXT_24_2["d_model"], "CONFIG_sm100_64x8x128_64x8x32_cluster2x1_1ctamma_swapAB"),
+        (9, _FLASH_NEXT_24_2["n_qkvg"], _FLASH_NEXT_24_2["d_model"], "CONFIG_sm100_64x16x128_64x16x32_cluster2x1_1ctamma_swapAB"),
+        (32, _FLASH_NEXT_24_2["n_qkvg"], _FLASH_NEXT_24_2["d_model"], "CONFIG_sm100_64x32x128_64x32x32_cluster2x1_1ctamma_swapAB"),
+        (64, _FLASH_NEXT_24_2["n_qkvg"], _FLASH_NEXT_24_2["d_model"], "CONFIG_sm100_64x64x128_64x64x32_cluster2x1_1ctamma_swapAB"),
+        (128, _FLASH_NEXT_24_2["n_qkvg"], _FLASH_NEXT_24_2["d_model"], "CONFIG_sm100_128x64x128_128x64x32_cluster1x1_1ctamma"),
+        # the NARROW out projection: 20 weight tiles of 128 rows -> split-K 8 fills one wave
+        (1, _FLASH_NEXT_24_2["d_model"], _FLASH_NEXT_24_2["k_o"], "CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_splitK8_swapAB"),
+        (32, _FLASH_NEXT_24_2["d_model"], _FLASH_NEXT_24_2["k_o"], "CONFIG_sm100_128x32x128_128x32x32_cluster1x1_1ctamma_splitK8_swapAB"),
+        (64, _FLASH_NEXT_24_2["d_model"], _FLASH_NEXT_24_2["k_o"], "CONFIG_sm100_128x64x128_128x64x32_cluster1x1_1ctamma_splitK8_swapAB"),
+        # past 64 tokens the narrow projection takes the plain 64x32 tile while that grid fits one wave (2 x 80 CTAs here)
+        (128, _FLASH_NEXT_24_2["d_model"], _FLASH_NEXT_24_2["k_o"], "CONFIG_sm100_64x32x128_64x32x32_cluster1x1_1ctamma"),
+        # the 32/2 shard: 272 64-row tiles overflow a wave -> 128-row weight tiles (136 CTAs), no split; its out projection
+        # (32 tiles of 128 rows over K 8192) splits 6 ways = one wave; past 64 tokens 2 x 128 plain tiles overflow -> the split
+        (1, (2 * 32 + 2 * 2) * 256, 4096, "CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_swapAB"),
+        (128, (2 * 32 + 2 * 2) * 256, 4096, "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_swapAB"),
+        (1, 4096, 32 * 256, "CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_splitK6_swapAB"),
+        (128, 4096, 32 * 256, "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_splitK6_swapAB"),
+        # the 8/1 shard's slab: 72 64-row tiles (a third of the machine) -> the 64-row tile without the pair's multicast
+        (1, (2 * 8 + 2 * 1) * 256, 4096, "CONFIG_sm100_64x8x128_64x8x32_cluster1x1_1ctamma_swapAB"),
+        # its out projection is narrow but SHALLOW (K 2048 = 32 K tiles): no split pays -> the 64-row swap-AB tile, the plain
+        # 64x32 past 64 tokens
+        (1, 4096, 8 * 256, "CONFIG_sm100_64x8x128_64x8x32_cluster1x1_1ctamma_swapAB"),
+        (128, 4096, 8 * 256, "CONFIG_sm100_64x32x128_64x32x32_cluster1x1_1ctamma"),
+    ],
+)
+def test_small_m_route_names_a_swap_ab_tile_for_decode_row_counts(m, n, k, expect):
+    """The route is a pure function of the shape and the SM count: the token tile is the power of two >= T, the weight
+    tile and the slice count follow the weight's width.  Every name it spells resolves in the catalog grammar."""
+    from cudnn.gemm.frost.tile_config import by_name
+
+    name = small_m_tile_config(m, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS)
+    assert name == expect
+    cfg = by_name(name)
+    assert cfg.swap_ab == name.endswith("_swapAB")
+    assert cfg.cta_tile_n >= min(m, 128) or not cfg.swap_ab  # the token tile covers the step
+
+
+def test_small_m_route_leaves_prefill_rows_on_the_forced_tile(monkeypatch):
+    """Past SMALL_M_MAX nothing changes: the 256-wide forced tile is the prefill / training plan it always was (on the route's
+    own compiler family; an ``sm120`` process keeps the forced tile at every row count -- its own cell below)."""
+    n, k = _FLASH_NEXT_24_2["n_qkvg"], _FLASH_NEXT_24_2["d_model"]
+    assert small_m_tile_config(SMALL_M_MAX + 1, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS) is None
+    assert small_m_tile_config(8192, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS) is None
+    from cudnn.gemm.frost import arch_family
+    from cudnn.gated_attention_block.kernels.proj_gemm import _auto_tile_name
+
+    monkeypatch.setattr(arch_family, "active_family", lambda: "sm100")
+    assert _auto_tile_name(8192, n, k, dtype=torch.bfloat16, a_major="k", b_major="k", block_scale=False, alpha=False) == _FORCED_TILE_NAME
+    assert _auto_tile_name(1, n, k, dtype=torch.bfloat16, a_major="k", b_major="k", block_scale=False, alpha=False) != _FORCED_TILE_NAME
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        dict(dtype=torch.float8_e4m3fn),  # the fp8 plans keep their validated forced tile (and the alpha epilogue)
+        dict(dtype=torch.bfloat16, alpha=True),
+        dict(dtype=torch.bfloat16, block_scale=True),
+        dict(dtype=torch.bfloat16, a_major="m"),  # the backward's transposed operands
+        dict(dtype=torch.bfloat16, b_major="n"),
+    ],
+    ids=["fp8", "alpha", "block_scale", "a_mmajor", "b_nmajor"],
+)
+def test_small_m_route_is_dense_k_major_bf16_only(kwargs):
+    assert small_m_tile_config(4, _FLASH_NEXT_24_2["n_qkvg"], _FLASH_NEXT_24_2["d_model"], sm_count=_RUBIN_SMS, **kwargs) is None
+
+
+@pytest.mark.parametrize("m, n, k", [(1, 0, 32 * 256), (0, 2560, 6144), (1, 2560, 0), (-1, 2560, 6144)], ids=["n0_deep_k", "m0", "k0", "m_negative"])
+def test_small_m_route_declines_non_positive_extents(m, n, k):
+    """A non-positive extent never reaches the route's one-wave arithmetic (``n = 0`` with a deep K divided by a zero CTA count
+    before the driver's own extent check could name it; ``m = 0`` or ``k = 0`` spelled a tile): the route declines, and
+    ``build_proj_gemm`` names the extent as it always did."""
+    assert small_m_tile_config(m, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS) is None
+    with pytest.raises(ValueError, match="must be > 0"):
+        build_proj_gemm(m=m, k=k, n=n, dtype=torch.bfloat16, label="extent")
+
+
+def test_small_m_route_keeps_off_256_geometries_on_todays_resolution():
+    """An N that 256 does not divide keeps today's resolution: the forced tile never existed for it, so the plan stays on the
+    graph route and a ``capture_safe`` declaration is refused, typed, before any graph or backend call -- the indexer band's
+    + 640 columns (``QsaSpec.index_band``) are the serving case.  The route never names a tile for such an N."""
+    n, k = _FLASH_NEXT_24_2["n_qkvg"] + 640, _FLASH_NEXT_24_2["d_model"]
+    assert n % 256 and n % 8 == 0
+    from cudnn.gated_attention_block.kernels.proj_gemm import _auto_tile_name
+
+    assert small_m_tile_config(1, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS) is None
+    assert _auto_tile_name(1, n, k, dtype=torch.bfloat16, a_major="k", b_major="k", block_scale=False, alpha=False) is None
+    with pytest.raises(NotImplementedError, match="capture_safe=True needs the forced-tile JIT route"):
+        build_proj_gemm(m=1, k=k, n=n, dtype=torch.bfloat16, label="off256", capture_safe=True)
+
+
+def test_small_m_route_is_an_sm100_family_selection(monkeypatch):
+    """The route's names are the tcgen05 tree's: a process on the ``sm120`` compiler family (SM 12.x) keeps the forced tile
+    for a small-M projection instead of a name its compiler would refuse; the ``sm100`` family takes the route."""
+    from cudnn.gemm.frost import arch_family
+    from cudnn.gated_attention_block.kernels.proj_gemm import _auto_tile_name
+
+    kw = dict(dtype=torch.bfloat16, a_major="k", b_major="k", block_scale=False, alpha=False)
+    monkeypatch.setattr(arch_family, "active_family", lambda: "sm120")
+    assert _auto_tile_name(32, 768, 4096, **kw) == _FORCED_TILE_NAME  # the forced tile, as before the route
+    monkeypatch.setattr(arch_family, "active_family", lambda: "sm100")
+    assert _auto_tile_name(32, 768, 4096, **kw) == small_m_tile_config(32, 768, 4096, dtype=torch.bfloat16) != _FORCED_TILE_NAME
+
+
+@requires_rubin
+@pytest.mark.parametrize("m", [1, 4, 32, 128])
+@pytest.mark.parametrize("shape", ["qkvg", "out"])
+def test_small_m_plans_run_the_named_tile_and_match_torch_linear(m, shape):
+    """The block's own driver at the 24/2 shard's shapes and the decode row counts: the plan names the small-M tile (never
+    the forced one), the kernel matches the fp32 reference within the module's budget, and two launches agree bitwise
+    (the split-K reducer is fixed-order)."""
+    n, k = (_FLASH_NEXT_24_2["n_qkvg"], _FLASH_NEXT_24_2["d_model"]) if shape == "qkvg" else (_FLASH_NEXT_24_2["d_model"], _FLASH_NEXT_24_2["k_o"])
+    torch.manual_seed(0)
+    a = (torch.randn(m, k, device="cuda", dtype=torch.float32) * 0.1).to(torch.bfloat16)
+    w = (torch.randn(n, k, device="cuda", dtype=torch.float32) * 0.05).to(torch.bfloat16)
+    out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
+    plan = build_proj_gemm(m=m, k=k, n=n, dtype=torch.bfloat16, label=f"small_m_{shape}", capture_safe=True)
+    assert plan.tile_config_name != _FORCED_TILE_NAME
+    assert plan.tile_config_name == small_m_tile_config(m, n, k, dtype=torch.bfloat16)
+    assert plan.route == "jit-only"
+    _run(plan, a, w, out)
+    first = out.clone()
+    _run(plan, a, w, out)
+    assert torch.equal(first.view(torch.int16), out.view(torch.int16))
+    ref = torch.nn.functional.linear(a.float(), w.float())
+    cos = torch.nn.functional.cosine_similarity(out.float().flatten(), ref.flatten(), dim=0).item()
+    assert cos > 0.999, f"cos {cos}"
+    assert torch.isfinite(out.float()).all()

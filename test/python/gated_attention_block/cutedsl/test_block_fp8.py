@@ -240,10 +240,22 @@ def test_quantspec_with_bf16_h_is_refused():
         GatedAttentionBlockFwd(inp["h"], inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], out, geom, quant=_SPEC)
 
 
-def test_fp8_declines_training():
-    """FP8 is inference-only (no q_pre/k_pre/pre-gate O contract under quantization)."""
-    with pytest.raises(NotImplementedError, match="inference-only"):
-        _decl_block(quant=_SPEC, save_for_backward=True, inplace_qkv=False)
+def test_fp8_unfused_trains_and_the_fused_fork_stays_declined():
+    """INVERTED from ``test_fp8_declines_training`` (2026-10-01): the UNFUSED FP8 pipeline accepts ``save_for_backward`` --
+    the same 7-stage list, with compact bf16 Q/K reserved so norm+RoPE runs OUT of place and the slab keeps the record's
+    PRE-norm bands (``test_block_training_forward.py`` pins the routing and the record).  The fully fused fork writes no
+    slab and no pre-gate O: its knobs' own training guards fire, typed, naming the knob; a single knob stays the
+    both-or-neither decline."""
+    blk = _decl_block(quant=_SPEC, save_for_backward=True, inplace_qkv=False)
+    assert blk.save_for_backward and blk.return_lse and not blk.inplace_qkv and not blk.fp8_fused
+    assert [s.name for s in blk._stages] == ["qkv_gate_proj", "qk_norm_rope", "quantize_q", "quantize_kv", "sdpa", "sigmoid_gate", "out_proj"]
+    assert blk._norm_rope.want_rstd is True
+    lay = blk._layout()
+    assert lay.q >= 0 and lay.k >= 0 and lay.v == -1 and lay.proj == -1 and lay.o == -1 and lay.o_gated >= 0 and lay.q8 >= 0 and lay.o8 >= 0
+    with pytest.raises(ValueError, match="incompatible with save_for_backward"):
+        _decl_block(quant=_SPEC, save_for_backward=True, **_FUSED)
+    with pytest.raises(NotImplementedError, match="fuse_norm_rope"):
+        _decl_block(quant=_SPEC, save_for_backward=True, fuse_gate=True)
 
 
 def test_fp8_accepts_both_fusions():
@@ -372,7 +384,7 @@ def test_fp8_fused_sdpa_is_the_production_adapter_gated_and_without_amax():
 @_QK_NORM
 @pytest.mark.parametrize("seq_len, causal", [(256, True), (1000, True), (256, False), (1024, False)])
 def test_fp8_block_matches_the_fake_quant_oracle(seq_len, causal, qk_norm):
-    """Causal covers a KV tail (S=1000); the dense FP8 kernel needs S % 128 == 0 (see the decline test).
+    """Causal covers a KV tail (S=1000); a dense KV tail is masked in-kernel (see the dense-tail test).
     ``rope_only``: None norm weights, the oracle skips the norm, same cosine bar."""
     out, ref, blk = _run_fp8_block({**_GEOM, "is_causal": causal, "qk_norm": qk_norm}, batch=2, seq_len=seq_len)
     assert blk._norm_rope._recipe.apply_norm is qk_norm
@@ -440,14 +452,17 @@ def test_fp8_fused_within_quant_noise_of_unfused():
 
 @requires_rubin
 @pytest.mark.parametrize("kw", [{}, _FUSED], ids=["unfused", "fused"])
-def test_fp8_dense_kv_tail_is_declined_not_computed_wrong(kw):
-    """The Rubin FP8 SDPA leaves a dense KV tail unmasked, so the adapter DECLINES S % 128 != 0 without a
-    padding mask or a causal mask -- the block must surface that at check_support, typed, not compute garbage.
-    The gated path IS the adapter (with a gate descriptor), so the fused block declines identically."""
+def test_fp8_dense_kv_tail_is_masked_not_computed_wrong(kw):
+    """A dense S % 128 != 0 with no padding mask: the SDPA adapter compiles the padded mask against the scalar S_kv
+    (kv_tail_mask, #1520), so the block serves it and the KV tail stays out of the softmax -- the oracle, at the same
+    cosine floor as the matrix.  The gated path IS the adapter (with a gate descriptor), so the fused block too."""
     if kw:
         _require_fp8_forks()
-    with pytest.raises((ValueError, NotImplementedError), match="multiple of 128"):
-        _run_fp8_block({**_GEOM, "is_causal": False}, batch=1, seq_len=1000, **kw)
+    out, ref, _ = _run_fp8_block({**_GEOM, "is_causal": False}, batch=1, seq_len=1000, **kw)
+    assert torch.isfinite(out.float()).all()
+    c = _cos(out, ref)
+    print(f"\nfp8 block dense KV tail S=1000: cos={c:.6f}")
+    assert c > 0.99, f"fp8 dense KV tail cos {c}"
 
 
 @pytest.mark.parametrize("kw", [{}, _FUSED], ids=["unfused", "fused"])

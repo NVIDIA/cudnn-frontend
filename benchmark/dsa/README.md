@@ -9,8 +9,9 @@ run them:
   per run. Arranged like [`../attention_training`](../attention_training/README.md)
   and [`../attention_inference`](../attention_inference/README.md).
 - **Single scripts** (`benchmark_dsa_sparse_attention_forward.py`,
-  `benchmark_dsa_sparse_attention_backward.py`) — ad-hoc shapes, execute-vs-
-  wrapper split, `profile` mode for nsys/ncu.
+  `benchmark_dsa_sparse_attention_backward.py`,
+  `benchmark_dsa_indexer_h32.py`) — ad-hoc shapes, execute-vs-wrapper split,
+  compact-H32 adapter comparisons, and `profile` mode for nsys/ncu.
 
 ## Contents
 
@@ -130,6 +131,80 @@ results/<config>/<gpu>/
 - `dsv4_flash: H=64, d=512, K=640 (indexer_topk=512)`; `dsv4_pro: H=128, d=512, K=1152 (indexer_topk=1024)`; bf16, sink + `topk_length`, non-deterministic backward.
 
 ## Single Scripts
+
+### Standalone Indexer Top-K
+
+`benchmark_dsa_indexer_top_k.py` compares `tie_break=0` and `2` with 8K local
+queries, KV=8K/32K/128K/512K, K=1024/2048, FP32 scores, `next_n=1`, and
+`return_val=False`. Causal lengths follow one rank of a single-sequence zigzag
+CP partition: for Q local queries, H=Q/2 and rank r, concatenate lengths
+`[r*H+1, (r+1)*H]` and `[KV-(r+1)*H+1, KV-r*H]`. CP=KV/Q; CP1 naturally
+covers every query. Rank 0 is the default. All local rows are measured without
+extrapolation. The largest default score matrix occupies 16 GiB, plus outputs
+and scratch. Internal scratch row chunks and all their launches are included.
+
+```bash
+python -m benchmark.dsa.benchmark_dsa_indexer_top_k --csv topk-random.csv
+python -m benchmark.dsa.benchmark_dsa_indexer_top_k --distribution duplicates --csv topk-duplicates.csv
+# An interior rank; CP=128K/8K=16:
+python -m benchmark.dsa.benchmark_dsa_indexer_top_k --tokens 131072 --cp-rank 7
+```
+
+Timing follows the existing [DSA per-call event median](benchmark_single_dsa.py)
+and [CSA graph replay](../csa/bench_csa_compressor.py) patterns: 20 side-stream
+warmup calls before capture, one complete API call per graph, and 50 timed
+replays. Both policies share score/length addresses and alternate measurement
+order. A 256 MiB buffer flushes L2 before each start event, so flush time is
+excluded. Events are primed and reused, following
+[causal-convolution timing](../causal_conv1d_update_sm100.py). Both graphs are
+warmed again after CPU validation. CSV reports every
+sample (milliseconds to six decimal places) and the median; `--warmup` and
+`--samples` control the counts.
+
+Compilation, capture, score generation and sampled CPU references are outside
+timing. `speedup_0_over_2 = time(0) / time(2)`; values below one mean tie policy 2
+is slower. These are selector GPU timings, excluding CPU enqueue overhead and
+score computation. They do not measure CP communication, sparse attention or
+complete DSA forward/training latency. The fixed local matrix does not reproduce
+Megatron's separate front/back calls, smaller score-budget chunks or per-call KV
+cropping.
+
+The reference samples the first/middle/last local rows and the K boundary when
+present in the shard, checking
+causal bounds, uniqueness and the selected set without requiring output order.
+Use `--distribution equal`, `sparse-left` or `sparse-right` for additional tie
+patterns; the sparse cases put k−1 strict winners and two cutoff ties near one
+end of each causal prefix. `--num-queries` must be even and divide every KV
+length, and `--cp-rank` must be valid for every selected case. `--tokens`,
+`--top-k`, `--samples` and `--warmup` can narrow or repeat the workload.
+SM90+ is required; memory admission is an
+estimate and does not guarantee allocation success.
+
+### Compact-H32 Indexer Backward
+
+`benchmark_dsa_indexer_h32.py` measures the default SM100 indexer-backward
+wrapper with compact H32 tensors against caller-side
+`torch.nn.functional.pad` to H64. Outputs are preallocated, H64 output slicing
+is excluded, case order is rotated, and L2 is flushed before each CUDA-event
+sample. The script validates the H64 result against the compact path before
+timing. Profile mode also exposes already-padded H64 inputs as a kernel-only
+sanity control.
+
+```bash
+python -m benchmark.dsa.benchmark_dsa_indexer_h32
+python -m benchmark.dsa.benchmark_dsa_indexer_h32 profile --profile-case compact_h32
+```
+
+Add `--deterministic` to benchmark the fixed-owner dK path with its reported
+caller-owned workspace. Add `--topk-indices-global` for the flat KV-id contract
+used by packed DSA forward. For example, a 1M-context/r4 indexer at CP64 has
+16K local query rows and 256K compressed KV rows:
+
+```bash
+python -m benchmark.dsa.benchmark_dsa_indexer_h32 \
+  --seqlen-q 16384 --seqlen-k 262144 --topk 512 \
+  --topk-indices-global --deterministic
+```
 
 ### Sparse Attention Forward
 

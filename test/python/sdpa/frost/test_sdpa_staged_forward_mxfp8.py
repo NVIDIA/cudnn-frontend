@@ -5,7 +5,7 @@
 import pytest
 import torch
 
-from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100, SdpaFwdDslSm120
 from frost_test_utils import requires_blackwell, requires_dsl
 from sdpa.frost.test_sdpa_prepared_mxfp8 import _case as _native_case, _change_scales, _check
 
@@ -15,8 +15,8 @@ _FLAVORS = [(128, 128), (192, 128), (256, 256), (512, 512)]
 
 def _case(d, dv, *, b=2, output_dtype=torch.bfloat16, split=1, stats=True, amax=True):
     cc = torch.cuda.get_device_capability()
-    if cc[0] != 10:
-        pytest.skip("SM100/SM103/SM107 MXFP8 conversion path")
+    if cc[0] not in (10, 12):
+        pytest.skip("SM100/SM103/SM107/SM120 MXFP8 conversion path")
     if cc == (10, 7) and split > 1:
         pytest.skip("SM107 MXFP8 does not serve split KV")
     _, _, _, buffers, _ = _native_case(
@@ -27,7 +27,7 @@ def _case(d, dv, *, b=2, output_dtype=torch.bfloat16, split=1, stats=True, amax=
         split_kv=split,
         stats=stats,
         amax=amax,
-        arch="sm107" if cc == (10, 7) else "sm100",
+        arch="sm120" if cc[0] == 12 else "sm107" if cc == (10, 7) else "sm100",
         explicit_plan=True,
     )
     storage = {}
@@ -39,7 +39,7 @@ def _case(d, dv, *, b=2, output_dtype=torch.bfloat16, split=1, stats=True, amax=
         if role != "o":
             view.copy_(t)
         storage[role], buffers[role] = raw, view
-    api = SdpaFwdDslSm100(
+    api = (SdpaFwdDslSm120 if cc[0] == 12 else SdpaFwdDslSm100)(
         **{"sample_" + role: buffers.get(role) for role in ("q", "k", "v", "o", "lse")},
         sample_amax_o=buffers.get("amax_o"),
         has_amax_o=amax,
@@ -63,6 +63,7 @@ def _execute(api, buffers, workspace, stream=None):
 @pytest.mark.parametrize("d,dv", _FLAVORS)
 def test_mxfp8_staged_uses_pointer_host_and_current_scales(d, dv, monkeypatch):
     import cutlass.cute as cute
+    from sdpa.frost.native_binding_utils import forbid_python_forward_binding
 
     api, buffers, storage = _case(d, dv)
     monkeypatch.setattr(cute.runtime, "make_fake_tensor", lambda *a, **k: pytest.fail("MXFP8 conversion constructed a tensor fake"))
@@ -70,6 +71,8 @@ def test_mxfp8_staged_uses_pointer_host_and_current_scales(d, dv, monkeypatch):
     required = api.scratch_workspace_bytes()
     api.compile()
     assert api._staged_spec is not None
+    assert api._staged_spec.core.native is not None
+    forbid_python_forward_binding(monkeypatch)
     assert api.scratch_workspace_bytes() == required
     for offset in (128, 256):
         _, buffers, storage = _case(d, dv)
@@ -176,8 +179,9 @@ def test_mxfp8_staged_physical_wide_batch_stride(d, dv, role, product):
 
 @pytest.mark.parametrize("d", [128, 192])
 @pytest.mark.parametrize("amax", [False, True])
-def test_staged_pv_bf16_keeps_v_width_and_omits_sf_v(d, amax):
+def test_staged_pv_bf16_keeps_v_width_and_omits_sf_v(d, amax, monkeypatch):
     from sdpa.frost.test_sdpa_prepared_pv_bf16 import _case as pv_case, _check as pv_check
+    from sdpa.frost.native_binding_utils import forbid_python_forward_binding
 
     _, buffers, _, scales = pv_case(d=d, amax=amax, has_amax_o=amax)
     for role in ("q", "k", "v", "o"):
@@ -196,6 +200,8 @@ def test_staged_pv_bf16_keeps_v_width_and_omits_sf_v(d, amax):
     )
     assert api.check_support()
     api.compile()
+    assert api._staged_spec.core.native is not None
+    forbid_python_forward_binding(monkeypatch)
     assert len(api._staged_spec.core.quant.sf_sizes) == 2
     assert api._staged_spec.core.quant.has_amax == amax
     workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
@@ -363,9 +369,7 @@ def test_sm107_d256_mxfp8_staging_preserves_each_native_operand(converted, monke
     assert [r[0] for r in api._staged_spec.regions] == [converted]
     assert api.scratch_workspace_bytes() == required
     workspace = torch.empty(required, device="cuda", dtype=torch.uint8)
-    from cudnn.sdpa.fwd import prepared
-
-    execute = prepared.execute_quantized
+    execute = prepared_staged_forward._bind_core
     seen = []
 
     def launch(spec, facts, *args, **kwargs):
@@ -374,7 +378,7 @@ def test_sm107_d256_mxfp8_staging_preserves_each_native_operand(converted, monke
         seen.append(True)
         return execute(spec, facts, *args, **kwargs)
 
-    monkeypatch.setattr(prepared, "execute_quantized", launch)
+    monkeypatch.setattr(prepared_staged_forward, "_bind_core", launch)
     _execute(api, tensors, workspace)
     _check(tensors, thd=False)
     for role in ("q", "k", "v", "o"):

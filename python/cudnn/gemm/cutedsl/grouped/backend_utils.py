@@ -29,14 +29,17 @@ DEBUG_VALIDATE_DEVICE_VALUES = os.getenv(DEBUG_VALIDATE_DEVICE_VALUES_ENV, "0") 
 
 
 def _check_not_capturing(stream, what: str) -> None:
-    err, status = cuda.cuStreamIsCapturing(cuda.CUstream(int(stream)))
-    if int(err) != 0:
-        raise RuntimeError(f"cuStreamIsCapturing failed: {err}")
-    if status != cuda.CUstreamCaptureStatus.CU_STREAM_CAPTURE_STATUS_NONE:
-        raise RuntimeError(
-            f"{what}: {DEBUG_VALIDATE_DEVICE_VALUES_ENV}=1 reads device values back to the host "
-            "and cannot run under CUDA graph capture; unset it for captured graphs"
-        )
+    """The debug validation's refusal under stream capture: the shared status query and typed refusal of
+    ``cudnn.frost.capture`` (one spelling for every FROST host path), with THIS module's remedy -- the env var
+    that turned the blocking host read on is the thing to unset.  Kept under its own name here so the two
+    call sites below (and the test that stubs them) keep reading it off this module."""
+    from cudnn.frost.capture import check_not_capturing
+
+    check_not_capturing(
+        stream,
+        what,
+        remedy=f"{DEBUG_VALIDATE_DEVICE_VALUES_ENV}=1 reads device values back to the host and cannot run under CUDA graph capture; unset it for captured graphs",
+    )
 
 
 def _host_int_values(tensor) -> Tuple[int, ...]:
@@ -185,21 +188,32 @@ def wrapper_operand_meta(tensor):
     so an id-keyed memo answers for tensors it never saw. Data pointers are excluded --
     they vary per call and nothing derived depends on them; execute() re-checks them.
     """
+    if is_torch_tensor(tensor):
+        return (tensor.shape, tensor.stride(), tensor.dtype, tensor.device)
     if tensor is None or not hasattr(tensor, "shape"):
         return tensor
     device = get_device(tensor)
     return (get_shape(tensor), get_strides(tensor), tensor.dtype, device.type, device.index)
 
 
-def block_scaled_sfd_tensors(valid_m, n_out, sf_dtype, sf_vec_size, device):
+def row_major_layout(rows, cols, canonical):
+    if canonical:
+        return (rows, cols), (cols, 1)
+    return (rows, cols, 1), (cols, 1, rows * cols)
+
+
+def block_scaled_sfd_tensors(valid_m, n_out, sf_dtype, sf_vec_size, device, canonical=False):
     """MMA-interleaved (sfd_row, sfd_col) output scale-factor buffers for a (valid_m, n_out) result."""
     import torch
 
     mma_permute_order = (3, 4, 1, 5, 2, 0)
     mma_shape_row = (1, ceil_div(valid_m, 128), ceil_div(ceil_div(n_out, sf_vec_size), 4), 32, 4, 4)
     mma_shape_col = (1, ceil_div(n_out, 128), ceil_div(ceil_div(valid_m, sf_vec_size), 4), 32, 4, 4)
-    sfd_row_tensor = torch.empty(mma_shape_row, dtype=sf_dtype, device=device).permute(mma_permute_order)
-    sfd_col_tensor = torch.empty(mma_shape_col, dtype=sf_dtype, device=device).permute(mma_permute_order)
+    sfd_row_tensor = torch.empty(mma_shape_row, dtype=sf_dtype, device=device)
+    sfd_col_tensor = torch.empty(mma_shape_col, dtype=sf_dtype, device=device)
+    if not canonical:
+        sfd_row_tensor = sfd_row_tensor.permute(mma_permute_order)
+        sfd_col_tensor = sfd_col_tensor.permute(mma_permute_order)
     return sfd_row_tensor, sfd_col_tensor
 
 
