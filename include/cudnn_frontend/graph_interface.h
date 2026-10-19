@@ -2278,7 +2278,7 @@ class Graph : public ICudnn, public INode {
         cached_pass_by_value           = deserialized_pass_by_value;
         cached_workspace_modifications = deserialized_workspace_modifications;
         count_node_producing_workspace_modifications_();
-        cached_aligned_operands        = deserialized_aligned_operands;
+        cached_aligned_operands = deserialized_aligned_operands;
         refresh_host_copy_sources_();
 
         // Reset prep state in case this Graph is being re-deserialized; otherwise the
