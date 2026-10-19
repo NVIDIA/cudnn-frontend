@@ -392,6 +392,13 @@ def test_shared_d64_artifact_runs_on_both_device_families(first_cc, head_dim, mo
                 flavor_params={"flavor": "gptoss", "d_qk": 64, "d_v": 64, "tile_m": 128, "tile_n": 64, "num_warps": 8},
             )
             assert api.check_support()
+
+            def core_artifact():
+                # d64 is native; d32 pads V/O through the staged copies around the same core.
+                assert (api._sm80_copy_spec is not None) == (head_dim == 32)
+                spec = api._sm80_spec if api._sm80_spec is not None else api._sm80_copy_spec.core
+                return spec.artifact
+
             if shared is None:
                 real_compile = prepared_host.compile_host
 
@@ -403,7 +410,7 @@ def test_shared_d64_artifact_runs_on_both_device_families(first_cc, head_dim, mo
                 with monkeypatch.context() as patch:
                     patch.setattr(prepared_host, "compile_host", record_compile)
                     api.compile()
-                shared = api._sm80_spec.artifact
+                shared = core_artifact()
             else:
 
                 def reuse_artifact(module, params, geometry, *args):
@@ -420,12 +427,15 @@ def test_shared_d64_artifact_runs_on_both_device_families(first_cc, head_dim, mo
                     if head_dim == 64 or index == 2:
                         patch.setattr(cute, "compile", forbid_jit)
                     api.compile()
-                assert api._sm80_spec.artifact is shared
+                assert core_artifact() is shared
             if head_dim == 32:
                 expected_misses = min(index + 1, 2)
                 assert compile_gather.cache_info().misses == expected_misses
                 assert compile_copy.cache_info().misses == expected_misses
-            api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=stats)
+            required = api.scratch_workspace_bytes()
+            assert (required > 0) == (head_dim == 32)
+            workspace = torch.empty(required, dtype=torch.uint8, device=device) if required else None
+            api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=stats, workspace=workspace)
             torch.cuda.synchronize(device)
             expected_o, expected_stats = _ref(q, k, v, False, head_dim**-0.5)
             torch.testing.assert_close(o.double(), expected_o, atol=2e-3, rtol=2e-3)

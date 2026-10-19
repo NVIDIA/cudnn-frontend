@@ -54,6 +54,16 @@ def compile_copy(shapes, widths, items_per_thread=1, *, device=None):
         return _compile_copy(shapes, widths, items_per_thread, target_cc)
 
 
+def _options(target_cc):
+    # The DSL's implicit target follows device 0, not the bound context, so the
+    # SM80/SM89 staged rows name the operand device's ISA. Other families keep
+    # the implicit target (e.g. sm_100a), which their staged paths were
+    # qualified with.
+    if target_cc[0] == 8:
+        return f"--enable-tvm-ffi --gpu-arch=sm_{target_cc[0]}{target_cc[1]}"
+    return "--enable-tvm-ffi"
+
+
 @lru_cache(maxsize=128)
 def _compile_copy(shapes, widths, items_per_thread, target_cc):
     """Shapes are a fixed plan contract; pointers and Int64 strides bind per call."""
@@ -70,7 +80,7 @@ def _compile_copy(shapes, widths, items_per_thread, target_cc):
         shapes,
         items_per_thread,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
-        options="--enable-tvm-ffi",
+        options=_options(target_cc),
         cache_key=key,
         symbol="frost_sdpa_staged_copy",
     )

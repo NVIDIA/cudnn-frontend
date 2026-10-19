@@ -615,4 +615,7 @@ compiled for a device-specific target. Test a staged d32 case as well as native
 d64 on SM80 and SM89 in both orders, then return to the first family. Require
 separate auxiliary cache misses for the two targets, reuse on the return visit,
 and independent O/LSE references. The second staged family may JIT its copies
-even when the core compiler is intercepted to reuse the first artifact.
+even when the core compiler is intercepted to reuse the first artifact. A staged
+plan keeps its core in `_sm80_copy_spec.core` (not `_sm80_spec`) and needs
+`scratch_workspace_bytes()` of workspace on the operand device; assert which
+path was taken so a native plan cannot stand in for the staged one.

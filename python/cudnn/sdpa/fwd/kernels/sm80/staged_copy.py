@@ -82,7 +82,9 @@ def _compile_gather(shapes, packed, target_cc):
         _packed_host if packed else _host,
         *args,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
-        options="--enable-tvm-ffi",
+        # The DSL's implicit target follows device 0, not the bound context; name
+        # the operand device's ISA so each family gets its own executable.
+        options=f"--enable-tvm-ffi --gpu-arch=sm_{target_cc[0]}{target_cc[1]}",
         cache_key=key,
         symbol="frost_sdpa_sm80_staged_gather",
     )
