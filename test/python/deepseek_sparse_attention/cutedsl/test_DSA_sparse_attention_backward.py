@@ -212,7 +212,7 @@ def test_DSA_sparse_attention_backward_sm100_auto_dispatch(
 
 @pytest.mark.L0
 def test_DSA_sparse_attention_backward_sm100_h96_dispatch():
-    """Select the H96 composition for every supported non-deterministic shape."""
+    """Select the H96 composition for ordinary and deterministic execution."""
     try:
         from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100 import _select_sm100_backend
     except ImportError:
@@ -220,7 +220,39 @@ def test_DSA_sparse_attention_backward_sm100_h96_dispatch():
 
     assert _select_sm100_backend(96, 576, max_topk=512) == ("h96_h64_h32", 64)
     assert _select_sm100_backend(96, 576, max_topk=1024) == ("h96_h64_h32", 64)
-    assert _select_sm100_backend(96, 576, max_topk=2048, deterministic=True) == ("generic_m64", 64)
+    assert _select_sm100_backend(96, 576, max_topk=2048, deterministic=True) == ("h96_h64_h32", 64)
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm100_h96_deterministic_composition():
+    """The H96 stages must share one fixed-owner reduction policy."""
+    try:
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100 import (
+            _get_sm100_kernel_class,
+            flash_attn_bwd_sm100_workspace_size,
+        )
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_h96 import (
+            FlashAttentionDSABackwardSm100H96Deterministic,
+            FlashAttentionDSABackwardSm100H96H32Deterministic,
+            FlashAttentionDSABackwardSm100H96H64Deterministic,
+        )
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    kernel_cls = _get_sm100_kernel_class("h96_h64_h32", deterministic=True)
+    assert kernel_cls is FlashAttentionDSABackwardSm100H96Deterministic
+    assert kernel_cls.num_dkv_shards == 128
+    assert FlashAttentionDSABackwardSm100H96H64Deterministic.num_dkv_shards == 128
+    assert FlashAttentionDSABackwardSm100H96H64Deterministic.q_wave_ctas == 128
+    assert not FlashAttentionDSABackwardSm100H96H64Deterministic.finalize_dkv
+    assert FlashAttentionDSABackwardSm100H96H32Deterministic.num_dkv_shards == 128
+    assert FlashAttentionDSABackwardSm100H96H32Deterministic.q_wave_ctas == 128
+    assert not FlashAttentionDSABackwardSm100H96H32Deterministic.initialize_dkv
+    assert FlashAttentionDSABackwardSm100H96H32Deterministic.finalize_dkv
+
+    adaptive_bytes = flash_attn_bwd_sm100_workspace_size(7, 1025, 576, 96, deterministic=True, backend="generic_m64")
+    h96_bytes = flash_attn_bwd_sm100_workspace_size(7, 1025, 576, 96, deterministic=True, backend="h96_h64_h32")
+    assert h96_bytes > adaptive_bytes
 
 
 @pytest.mark.L0
@@ -694,7 +726,11 @@ def _exercise_deterministic_sm100_case(num_heads, head_dim, s_q, s_kv, repeats, 
     """Run one deterministic case against bitwise and numerical contracts."""
     from cudnn import DSA
     from cuda.bindings import driver as cuda
-    from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100 import flash_attn_bwd_sm100_workspace_size
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100 import (
+        _get_sm100_kernel_class,
+        _select_sm100_backend,
+        flash_attn_bwd_sm100_workspace_size,
+    )
 
     _require_sm100()
     device = torch.device("cuda")
@@ -717,7 +753,16 @@ def _exercise_deterministic_sm100_case(num_heads, head_dim, s_q, s_kv, repeats, 
         softmax_scale=softmax_scale,
     )
     dout = torch.randn_like(out)
-    workspace_bytes = flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True, backend="generic_m64")
+    backend, _ = _select_sm100_backend(
+        num_heads,
+        head_dim,
+        head_dim_v=512,
+        dtype=torch.bfloat16,
+        max_topk=topk,
+        device_capability=torch.cuda.get_device_capability(),
+        deterministic=True,
+    )
+    workspace_bytes = flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True, backend=backend)
     api = DSA.SparseAttentionBackward(
         sample_q=q,
         sample_kv=kv,
@@ -736,7 +781,8 @@ def _exercise_deterministic_sm100_case(num_heads, head_dim, s_q, s_kv, repeats, 
     expected_lse_odo_bytes = num_heads * math.ceil(s_q / 8) * 8 * 2 * torch.float32.itemsize
     from cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_deterministic import deterministic_dkv_shards
 
-    expected_dkv_bytes = deterministic_dkv_shards(s_q) * math.ceil(s_kv / 8) * 8 * math.ceil(head_dim / 8) * 8 * torch.float32.itemsize
+    num_dkv_shards = deterministic_dkv_shards(s_q) if backend == "generic_m64" else _get_sm100_kernel_class(backend, True).num_dkv_shards
+    expected_dkv_bytes = num_dkv_shards * math.ceil(s_kv / 8) * 8 * math.ceil(head_dim / 8) * 8 * torch.float32.itemsize
     assert workspace_bytes == expected_lse_odo_bytes + expected_dkv_bytes
     workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=device)
     dq, dkv, d_sink = torch.empty_like(q), torch.empty_like(kv), torch.empty_like(attn_sink)
@@ -852,6 +898,7 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_adaptive_shards_repea
         pytest.param(128, 512, 128, torch.bfloat16, False, "h128_2cta_m64", id="h128-two-cta"),
         pytest.param(64, 512, 64, torch.bfloat16, True, "generic_m64", id="deterministic-generic-bf16"),
         pytest.param(64, 512, 64, torch.float16, True, "generic_m64", id="deterministic-generic-fp16"),
+        pytest.param(96, 576, 64, torch.bfloat16, True, "h96_h64_h32", id="deterministic-h96"),
         pytest.param(128, 512, 128, torch.bfloat16, True, "h128_2cta_m64", id="deterministic-h128-two-cta"),
     ],
 )
@@ -864,7 +911,7 @@ def test_DSA_sparse_attention_backward_sm100_plan_is_cold_capture_safe(
     deterministic,
     expected_backend,
 ):
-    """Every non-D576 SM100 plan compiles before its first captured execute."""
+    """Every selected SM100 plan compiles before its first captured execute."""
     try:
         from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100 as interface
     except ImportError:

@@ -168,8 +168,9 @@ def _select_sm100_backend(
     selected only for the Blackwell SM100/SM103 BF16 H128 envelopes validated
     by their kernels (D512, and contiguous D576 with D_v512); every other
     supported configuration retains the established backend.
-    Deterministic H128 execution retains the two-CTA Tensor Core kernels;
-    other deterministic envelopes use the established generic M64 kernel.
+    Deterministic H128 execution retains the two-CTA Tensor Core kernels and
+    H96 composes the deterministic H64 body with the tuned H32 tail; other
+    deterministic envelopes use the established generic M64 kernel.
     """
     if (
         device_capability in _BLACKWELL_CAPABILITIES
@@ -193,6 +194,11 @@ def _select_sm100_backend(
         # The D576 two-CTA plan launches without copies, so it only accepts
         # contiguous inputs; strided inputs keep the generic path below.
         return "h128_d576_2cta_m64", 64
+    if num_heads == 96 and head_dim == 576:
+        # Compose H64 with the tuned H32 tail. In deterministic mode both
+        # components use the same fixed-owner dKV shards: H64 initializes,
+        # H32 appends its tail, then performs one ordered fold and conversion.
+        return "h96_h64_h32", 64
     if deterministic:
         return "generic_m64", 64
     if num_heads == 16 and head_dim == 576:
@@ -201,11 +207,6 @@ def _select_sm100_backend(
         return "h16_m128", 128
     if num_heads == 32 and head_dim == 576:
         return "h32_m64", 64
-    if num_heads == 96 and head_dim == 576:
-        # Compose the established H64 kernel with the tuned H32 tail. Both
-        # components accumulate into one FP32 dKV workspace, which is cleared
-        # by H64 and converted once after H32 completes.
-        return "h96_h64_h32", 64
     return "generic_m64", 64
 
 
@@ -233,9 +234,9 @@ def _get_sm100_kernel_class(backend: str, deterministic: bool = False, total_s_q
 
         return FlashAttentionDSABackwardSm100H32
     if backend == "h96_h64_h32":
-        from .dsa_bwd_sm100_h96 import FlashAttentionDSABackwardSm100H96
+        from .dsa_bwd_sm100_h96 import FlashAttentionDSABackwardSm100H96, FlashAttentionDSABackwardSm100H96Deterministic
 
-        return FlashAttentionDSABackwardSm100H96
+        return FlashAttentionDSABackwardSm100H96Deterministic if deterministic else FlashAttentionDSABackwardSm100H96
     if deterministic:
         if total_s_q is None:
             raise ValueError("deterministic SM100 kernel selection requires total_s_q")
