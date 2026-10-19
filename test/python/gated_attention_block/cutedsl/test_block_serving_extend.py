@@ -707,6 +707,16 @@ def test_kernel_runner_refuses_a_mismatched_binding():
     odd = torch.full((2, 2, 16, 2 * 256 + 4), float("nan"), device="cuda", dtype=torch.bfloat16)
     with pytest.raises(ValueError, match=r"pool_b stride\[2\].*multiple of 16 bytes"):
         run_cache_write(r, src, src, pool, odd[..., 256:512], slot, stream=s)
+    # Every operand on src_a's CUDA device, named: a CPU slot_mapping (a serving stack's `torch.tensor(slots)` with no device=) passed
+    # the dtype / rank / length checks and the kernel dereferenced a host address; a CPU pool, source or anchor is the same wild access.
+    with pytest.raises(ValueError, match="slot_mapping must live on"):
+        run_cache_write(r, src, src, pool, pool, slot.cpu(), stream=s)
+    with pytest.raises(ValueError, match="pool_b must live on"):
+        run_cache_write(r, src, src, pool, pool.cpu(), slot, stream=s)
+    with pytest.raises(ValueError, match="src_b must be on"):
+        run_cache_write(r, src, src.cpu(), pool, pool, slot, stream=s)
+    with pytest.raises(ValueError, match="src_a must be a CUDA tensor"):
+        run_cache_write(r, src.cpu(), src, pool, pool, slot, stream=s)
     with pytest.raises(ValueError, match="page_size must be >= 1"):
         compile_cache_write(dtype=torch.bfloat16, h=2, d=256, page_size=0)
     with pytest.raises(ValueError, match="bf16 / f16"):
