@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Adapter of the SM100 index-list sparse (QSA) d256 backward -- ``kernels/sm100/bprop_sparse_d256_f16.py``."""
+"""Adapter of the SM100 / SM103 index-list sparse (QSA) d256 backward -- ``kernels/sm100/bprop_sparse_d256_f16.py``."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ NUM_KV_HEADS = 2
 HEAD_DIM = 256
 TOPK_WIDTH = 2051  # 512 blocks x 4 tokens + 3 tail tokens
 SOFTMAX_SCALE = HEAD_DIM**-0.5
-_SUPPORTED_CAPABILITIES = ((10, 0),)
+_SUPPORTED_CAPABILITIES = ((10, 0), (10, 3))
 
 
 def _byte_span(tensor: torch.Tensor) -> tuple[int, int]:
@@ -77,7 +77,7 @@ class SparseGqaBwdDslSm100(APIBase):
         capability = torch.cuda.get_device_capability(q_desc.device)
         self._not_implemented_error_if(
             capability not in _SUPPORTED_CAPABILITIES,
-            f"{self.__class__.__name__} requires SM100, found SM{capability[0]}{capability[1]}",
+            f"{self.__class__.__name__} requires SM100 or SM103, found SM{capability[0]}{capability[1]}",
         )
         self._not_implemented_error_if(
             self.softmax_scale not in (None, SOFTMAX_SCALE),

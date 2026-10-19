@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for the index-list sparse (QSA) backward on SM100, ``cudnn.sdpa.bwd.SparseGqaBwdDslSm100``."""
+"""Tests for the index-list sparse (QSA) backward on SM100 / SM103, ``cudnn.sdpa.bwd.SparseGqaBwdDslSm100``."""
 
 from unittest.mock import patch
 
@@ -19,8 +19,8 @@ _INPUT_NAMES = ("q", "k", "v", "out", "dout", "lse", "topk_idxs")
 
 @pytest.fixture(autouse=True)
 def supported_device():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("QSA backward requires SM100")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("QSA backward requires SM100 or SM103")
     if cutedsl_too_old(cutedsl_state()[1]):
         pytest.skip("QSA backward requires CuTe DSL >= 4.7.0")
 
