@@ -724,7 +724,7 @@ def _owner(
 
 
 @cute.kernel
-def _kernel(
+def bprop_d128_kernel(
     q128: cutlass.GridConstant[tmap.TensorMap],
     k128: cutlass.GridConstant[tmap.TensorMap],
     v128: cutlass.GridConstant[tmap.TensorMap],
@@ -819,7 +819,7 @@ def _kernel(
         tmem_dealloc(tmem_slot, CFG.TMEM_COLS, nvvm.CTAGroup.CTA_1)
 
 
-_kernel.set_name_prefix("cudnn_bprop_d128", remove_cutlass_symbol=True)
+bprop_d128_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 def _tensor_map(tensor, rows):
@@ -853,7 +853,7 @@ def host(
         raise ValueError("dense d128 backward requires positive sequence lengths")
     q_tiles = cute.ceil_div(q.shape[1], CFG.TILE_M)
     kv_tiles = cute.ceil_div(k.shape[1], CFG.TILE_M)
-    _kernel(
+    bprop_d128_kernel(
         _tensor_map(q, CFG.TILE_M),
         _tensor_map(k, CFG.TILE_M),
         _tensor_map(v, CFG.TILE_M),

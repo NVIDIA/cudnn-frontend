@@ -4754,8 +4754,8 @@ def test_sdpa_fwd_cc107_decode_tile_sink_keyless_rows_L0(env_info, request, cudn
 
 
 _P3_ENVELOPE_CASES = {
-    # GPT-OSS: d64 through the d128 envelope, 64/8, MTP depth 4, a left window of 128 keys, mixed per-batch caches incl. one live key
-    "gpt_oss_d64_sink_swa": dict(cfg=dict(b=4, h_q=64, h_kv=8, s_q=4, s_kv=4096, d=64, left_bound=128, stats=True, seq_len_q=[4] * 4, seq_len_kv=[4096, 4095, 129, 1]), pin=None, cga=1, knobs=None, template="decode_d128_f16"),
+    # GPT-OSS uses the native SM107 d64 tile; pin its unpacked cga1 plan.
+    "gpt_oss_d64_sink_swa": dict(cfg=dict(b=4, h_q=64, h_kv=8, s_q=4, s_kv=4096, d=64, left_bound=128, stats=True, seq_len_q=[4] * 4, seq_len_kv=[4096, 4095, 129, 1]), pin="u1n", cga=None, knobs=None, template="prefill_d128_f16"),
     "mha_q8_sink": dict(cfg=dict(b=8, h_q=8, h_kv=8, s_q=8, s_kv=2048), pin=None, cga=1, knobs=dict(pack_gqa=False), template="decode_d128_f16"),
     "fp16_b64_q8_kv8192": dict(cfg=dict(b=64, h_q=64, h_kv=8, s_q=8, s_kv=8192, dtype=torch.float16), pin=None, cga=1, knobs=None, template="decode_d128_f16"),
     "mha_decode_small": dict(cfg=dict(b=1, h_q=4, h_kv=4, s_q=1, s_kv=128, causal=False, stats=True), pin=None, cga=1, knobs=None, template="decode_d128_f16"),
@@ -4771,9 +4771,8 @@ _P3_ENVELOPE_CASES = {
 @pytest.mark.L0
 @pytest.mark.parametrize("case", sorted(_P3_ENVELOPE_CASES))
 def test_sdpa_fwd_cc107_decode_tile_envelope_pinned_L0(env_info, request, cudnn_handle, case):
-    """Pinned cells at the edges of the dense d128 contract on cc 10.7 (issue #1472): the GPT-OSS geometry (d64 through
-    the d128 envelope, 64/8, left window 128, bottom-right causal, mixed caches incl. a single live key, Stats) on the
-    decode tile; an MHA verify graph (8/8, S_q 8) riding the tile unpacked; an fp16 B64 verify graph over an 8k cache;
+    """Dense attention boundary cases on cc 10.7 (issue #1472): GPT-OSS d64 with a left window, sinks, mixed cache
+    lengths and Stats on its native tile; MHA (8/8, S_q 8) on the unpacked decode tile; fp16 B64 over an 8k cache;
     the smallest decode graph with Stats and no mask (SMOKE); the smallest PackGQA pin at cga2 on the shared prefill
     body (8/2, S_q 64: 256 rows per unit, past the tile; SMOKE); and two over-tile cga1 pins (B1 64/4 Q512, unpacked and
     packed: a decode grid of several Q tiles per unit, which an explicit pin reaches and the heuristics never propose).
@@ -4784,6 +4783,7 @@ def test_sdpa_fwd_cc107_decode_tile_envelope_pinned_L0(env_info, request, cudnn_
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
     test.cfg = _p3_dense_cfg(**c["cfg"])
     knobs, template = _pin_knobs(test.cfg, c["pin"]) if c["pin"] else (c["knobs"], c["template"])
+    template = c["template"] or template
     test.showConfig((request.node.name, 1), request)
 
     with _must_run(request):
