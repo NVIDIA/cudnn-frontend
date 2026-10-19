@@ -722,7 +722,7 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_workspace_respects_ba
         assert adaptive < fixed
 
 
-def _exercise_deterministic_sm100_case(num_heads, head_dim, s_q, s_kv, repeats, check_short_workspace=False):
+def _exercise_deterministic_sm100_case(num_heads, head_dim, s_q, s_kv, repeats, check_short_workspace=False, max_topk=None):
     """Run one deterministic case against bitwise and numerical contracts."""
     from cudnn import DSA
     from cuda.bindings import driver as cuda
@@ -734,7 +734,7 @@ def _exercise_deterministic_sm100_case(num_heads, head_dim, s_q, s_kv, repeats, 
 
     _require_sm100()
     device = torch.device("cuda")
-    topk = min(64, s_kv)
+    topk = min(64 if max_topk is None else max_topk, s_kv)
     softmax_scale = 1.0 / math.sqrt(head_dim)
 
     q = torch.randn(s_q, num_heads, head_dim, dtype=torch.bfloat16, device=device) / 10
@@ -780,8 +780,14 @@ def _exercise_deterministic_sm100_case(num_heads, head_dim, s_q, s_kv, repeats, 
     assert api.scratch_workspace_bytes() == workspace_bytes
     expected_lse_odo_bytes = num_heads * math.ceil(s_q / 8) * 8 * 2 * torch.float32.itemsize
     from cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_deterministic import deterministic_dkv_shards
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100_d576 import BACKENDS as d576_two_cta_backends
 
-    num_dkv_shards = deterministic_dkv_shards(s_q) if backend == "generic_m64" else _get_sm100_kernel_class(backend, True).num_dkv_shards
+    if backend == "generic_m64":
+        num_dkv_shards = deterministic_dkv_shards(s_q)
+    elif backend in d576_two_cta_backends:
+        num_dkv_shards = 128
+    else:
+        num_dkv_shards = _get_sm100_kernel_class(backend, True).num_dkv_shards
     expected_dkv_bytes = num_dkv_shards * math.ceil(s_kv / 8) * 8 * math.ceil(head_dim / 8) * 8 * torch.float32.itemsize
     assert workspace_bytes == expected_lse_odo_bytes + expected_dkv_bytes
     workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=device)
@@ -875,6 +881,16 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_bounded_waves(num_hea
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
 
+@pytest.mark.L2
+@torch_fork_set_rng(seed=20261019)
+def test_DSA_sparse_attention_backward_sm100_h96_d576_two_cta_repeat1000():
+    """The deterministic H96 D576 two-CTA route remains bitwise stable across persistent waves."""
+    try:
+        _exercise_deterministic_sm100_case(96, 576, 257, 256, repeats=1000, max_topk=128)
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+
 @pytest.mark.L1
 @torch_fork_set_rng(seed=420)
 @pytest.mark.parametrize("s_q", [128, 129], ids=["shards32", "shards64"])
@@ -898,7 +914,7 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_adaptive_shards_repea
         pytest.param(128, 512, 128, torch.bfloat16, False, "h128_2cta_m64", id="h128-two-cta"),
         pytest.param(64, 512, 64, torch.bfloat16, True, "generic_m64", id="deterministic-generic-bf16"),
         pytest.param(64, 512, 64, torch.float16, True, "generic_m64", id="deterministic-generic-fp16"),
-        pytest.param(96, 576, 64, torch.bfloat16, True, "h96_h64_h32", id="deterministic-h96"),
+        pytest.param(96, 576, 128, torch.bfloat16, True, "h96_d576_2cta_m64", id="deterministic-h96-d576-two-cta"),
         pytest.param(128, 512, 128, torch.bfloat16, True, "h128_2cta_m64", id="deterministic-h128-two-cta"),
     ],
 )
@@ -1232,7 +1248,8 @@ def test_DSA_sparse_attention_backward_sm100_direct_interface_stays_lazy(monkeyp
 def test_DSA_sparse_attention_backward_sm100_deterministic_boundaries(num_heads, head_dim, s_q, s_kv):
     """Exercise head tails, vector padding, wave boundaries, and exact scratch."""
     try:
-        _exercise_deterministic_sm100_case(num_heads, head_dim, s_q, s_kv, repeats=1, check_short_workspace=True)
+        max_topk = 128 if (num_heads, head_dim) == (96, 576) else None
+        _exercise_deterministic_sm100_case(num_heads, head_dim, s_q, s_kv, repeats=1, check_short_workspace=True, max_topk=max_topk)
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
@@ -1265,6 +1282,9 @@ def test_DSA_sparse_attention_backward_sm100_h128_two_cta_dispatch_is_fail_close
     # other head counts and unsupported layouts keep their existing fallback.
     assert _select_sm100_backend(128, 512, **supported, deterministic=True) == ("h128_2cta_m64", 64)
     assert _select_sm100_backend(128, 512, **supported, deterministic=True, is_contiguous=False) == ("generic_m64", 64)
+    assert _select_sm100_backend(96, 576, **supported, deterministic=True) == ("h96_d576_2cta_m64", 64)
+    assert _select_sm100_backend(96, 576, **supported, deterministic=False) == ("h96_h64_h32", 64)
+    assert _select_sm100_backend(96, 576, **supported, deterministic=True, is_contiguous=False) == ("h96_h64_h32", 64)
     assert _select_sm100_backend(16, 576, deterministic=True) == ("generic_m64", 64)
 
     fallback_cases = [
@@ -4122,6 +4142,7 @@ def test_DSA_sparse_attention_backward_sm90_execute_allocates_nothing_and_never_
         pytest.param(128, 512, 128, False, "off", "h128_2cta_m64", id="h128-2cta"),
         pytest.param(128, 576, 128, False, "off", "h128_d576_2cta_m64", id="h128-d576-2cta"),
         pytest.param(64, 576, 64, True, "off", "generic_m64", id="deterministic"),
+        pytest.param(96, 576, 128, True, "off", "h96_d576_2cta_m64", id="deterministic-h96-d576-2cta"),
         pytest.param(16, 576, 512, False, "adaptive_pair", "h16_m128", id="qcluster-h16"),
         pytest.param(32, 576, 512, False, "adaptive_pair", "h32_m64", id="qcluster-h32"),
     ],

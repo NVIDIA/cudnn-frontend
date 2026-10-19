@@ -34,7 +34,7 @@ _SM100_FAMILY_ARCH_FLAGS = {
 }
 _WORKSPACE_ALIGNMENT = 128
 _DETERMINISTIC_HEAD_COUNTS = (16, 32, 64, 96, 128)
-_STATIC_TOPK_STRIDE_BACKENDS = ("h16_m128", "h32_m64", "h96_h64_h32")
+_STATIC_TOPK_STRIDE_BACKENDS = ("h16_m128", "h32_m64", "h96_h64_h32", "h96_d576_2cta_m64")
 
 
 def _sm100_gpu_arch_flag(device_capability: Tuple[int, int]) -> str:
@@ -69,7 +69,7 @@ def _workspace_shapes_sm100(
 
     Generic deterministic M64 launches use the adaptive shard specialization.
     An unspecified backend remains conservative because the deterministic
-    H128 two-CTA kernels retain their fixed 128-plane public workspace.
+    D576 two-CTA kernels retain their fixed 128-plane public workspace.
     """
     acc_dtype = cutlass.Float32
     workspace_lse_odo_shape = FlashAttentionDSABackwardSm100._get_workspace_size_LSE_OdO(
@@ -104,7 +104,7 @@ def flash_attn_bwd_sm100_workspace_size(
     """Return the reusable caller scratch required by one SM100 launch.
 
     The generic deterministic M64 backend selects a 32-, 64-, or 128-plane
-    dKV layout from ``total_s_q``. H128 two-CTA and unspecified backends use
+    dKV layout from ``total_s_q``. H96/H128 two-CTA and unspecified backends use
     the conservative fixed 128-plane layout. The result includes alignment
     padding and is the minimum byte count for a contiguous ``torch.uint8``
     workspace; :func:`flash_attn_bwd_sm100` also accepts a larger buffer.
@@ -165,12 +165,11 @@ def _select_sm100_backend(
     """Return the tuned SM100 kernel variant and its sparse-row tile size.
 
     The two-CTA specializations are deliberately fail-closed.  They are
-    selected only for the Blackwell SM100/SM103 BF16 H128 envelopes validated
-    by their kernels (D512, and contiguous D576 with D_v512); every other
+    selected only for the Blackwell SM100/SM103 BF16 envelopes validated by
+    their kernels (H128 D512, and contiguous H96/H128 D576 with D_v512); every other
     supported configuration retains the established backend.
-    Deterministic H128 execution retains the two-CTA Tensor Core kernels and
-    H96 composes the deterministic H64 body with the tuned H32 tail; other
-    deterministic envelopes use the established generic M64 kernel.
+    Deterministic H96/H128 D576 execution uses the two-CTA Tensor Core kernel;
+    other deterministic envelopes use the established generic M64 kernel.
     """
     if (
         device_capability in _BLACKWELL_CAPABILITIES
@@ -194,10 +193,20 @@ def _select_sm100_backend(
         # The D576 two-CTA plan launches without copies, so it only accepts
         # contiguous inputs; strided inputs keep the generic path below.
         return "h128_d576_2cta_m64", 64
+    if (
+        deterministic
+        and device_capability in _BLACKWELL_CAPABILITIES
+        and dtype == torch.bfloat16
+        and num_heads == 96
+        and head_dim == 576
+        and head_dim_v == 512
+        and max_topk in (128, 512, 1024, 1152, 2048)
+        and is_contiguous
+    ):
+        return "h96_d576_2cta_m64", 64
     if num_heads == 96 and head_dim == 576:
-        # Compose H64 with the tuned H32 tail. In deterministic mode both
-        # components use the same fixed-owner dKV shards: H64 initializes,
-        # H32 appends its tail, then performs one ordered fold and conversion.
+        # Ordinary execution and deterministic configurations outside the
+        # native two-CTA envelope compose H64 with the tuned H32 tail.
         return "h96_h64_h32", 64
     if deterministic:
         return "generic_m64", 64
@@ -221,7 +230,7 @@ def _get_sm100_kernel_class(backend: str, deterministic: bool = False, total_s_q
         from .dsa_bwd_sm100_h128_2cta import FlashAttentionDSABackwardSm100H128TwoCTA, FlashAttentionDSABackwardSm100H128TwoCTADeterministic
 
         return FlashAttentionDSABackwardSm100H128TwoCTADeterministic if deterministic else FlashAttentionDSABackwardSm100H128TwoCTA
-    if backend == "h128_d576_2cta_m64":
+    if backend in ("h96_d576_2cta_m64", "h128_d576_2cta_m64"):
         from .dsa_bwd_sm100_h128_d576_2cta import FlashAttentionDSABackwardSm100H128D576TwoCTA, FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic
 
         return FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic if deterministic else FlashAttentionDSABackwardSm100H128D576TwoCTA
@@ -377,7 +386,7 @@ def _compile_nondeterministic_sm100(
     block_tile: int,
 ):
     """Compile one ordinary, device-owned, shape-dynamic plan artifact."""
-    if backend == "h128_d576_2cta_m64":
+    if backend in ("h96_d576_2cta_m64", "h128_d576_2cta_m64"):
         raise ValueError("the D576 two-CTA backend has its own prepared compiler")
     if dtype not in (torch.float16, torch.bfloat16):
         raise ValueError(f"unsupported SM100 dtype {dtype}")
@@ -439,7 +448,7 @@ def flash_attn_bwd_sm100(
         dkv: preallocated (total_S_kv, headdim), same dtype as kv
         d_sink: preallocated (nheads,) float32
         deterministic: use ordered bounded-wave scratch accumulation; the
-            supported BF16 H128 envelopes retain their two-CTA kernels
+            supported BF16 H96/H128 envelopes retain their two-CTA kernels
         current_stream: CUDA stream handle for all initialization, main, and
             reduction launches; defaults to the current CUDA stream (the plan
             API selects Q's device context before entering this function)
@@ -537,13 +546,13 @@ def flash_attn_bwd_sm100(
         device_capability=device_capability,
         deterministic=deterministic,
     )
-    if backend == "h128_d576_2cta_m64":
+    if backend in ("h96_d576_2cta_m64", "h128_d576_2cta_m64"):
         # The D576 two-CTA kernel has its own plan-time compile and launch
         # contract (see ``_interface_sm100_d576``); it shares this entry point
         # only so direct callers get the same selection as the plan.
-        from ._interface_sm100_d576 import flash_attn_bwd_sm100_h128_d576
+        from ._interface_sm100_d576 import flash_attn_bwd_sm100_d576_2cta
 
-        return flash_attn_bwd_sm100_h128_d576(
+        return flash_attn_bwd_sm100_d576_2cta(
             q,
             kv,
             out,
