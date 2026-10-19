@@ -4754,8 +4754,9 @@ def test_sdpa_fwd_cc107_decode_tile_sink_keyless_rows_L0(env_info, request, cudn
 
 
 _P3_ENVELOPE_CASES = {
-    # GPT-OSS: d64 through the d128 envelope, 64/8, MTP depth 4, a left window of 128 keys, mixed per-batch caches incl. one live key
-    "gpt_oss_d64_sink_swa": dict(cfg=dict(b=4, h_q=64, h_kv=8, s_q=4, s_kv=4096, d=64, left_bound=128, stats=True, seq_len_q=[4] * 4, seq_len_kv=[4096, 4095, 129, 1]), pin=None, cga=1, knobs=None, template="decode_d128_f16"),
+    # GPT-OSS: native d64 prefill, 64/8, MTP depth 4, a left window of 128 keys, mixed per-batch caches incl. one live key.
+    # SM107's native small-D flavor supersedes the old d128 decode envelope; the routing assertion still names the served template.
+    "gpt_oss_d64_sink_swa": dict(cfg=dict(b=4, h_q=64, h_kv=8, s_q=4, s_kv=4096, d=64, left_bound=128, stats=True, seq_len_q=[4] * 4, seq_len_kv=[4096, 4095, 129, 1]), pin=None, cga=1, knobs=None, template="prefill_d128_f16"),
     "mha_q8_sink": dict(cfg=dict(b=8, h_q=8, h_kv=8, s_q=8, s_kv=2048), pin=None, cga=1, knobs=dict(pack_gqa=False), template="decode_d128_f16"),
     "fp16_b64_q8_kv8192": dict(cfg=dict(b=64, h_q=64, h_kv=8, s_q=8, s_kv=8192, dtype=torch.float16), pin=None, cga=1, knobs=None, template="decode_d128_f16"),
     "mha_decode_small": dict(cfg=dict(b=1, h_q=4, h_kv=4, s_q=1, s_kv=128, causal=False, stats=True), pin=None, cga=1, knobs=None, template="decode_d128_f16"),
@@ -4771,9 +4772,9 @@ _P3_ENVELOPE_CASES = {
 @pytest.mark.L0
 @pytest.mark.parametrize("case", sorted(_P3_ENVELOPE_CASES))
 def test_sdpa_fwd_cc107_decode_tile_envelope_pinned_L0(env_info, request, cudnn_handle, case):
-    """Pinned cells at the edges of the dense d128 contract on cc 10.7 (issue #1472): the GPT-OSS geometry (d64 through
-    the d128 envelope, 64/8, left window 128, bottom-right causal, mixed caches incl. a single live key, Stats) on the
-    decode tile; an MHA verify graph (8/8, S_q 8) riding the tile unpacked; an fp16 B64 verify graph over an 8k cache;
+    """Pinned cells at the edges of the dense small-D/d128 contract on cc 10.7 (issue #1472): the GPT-OSS geometry (native
+    d64, 64/8, left window 128, bottom-right causal, mixed caches incl. a single live key, Stats) on the prefill template;
+    an MHA verify graph (8/8, S_q 8) riding the decode tile unpacked; an fp16 B64 verify graph over an 8k cache;
     the smallest decode graph with Stats and no mask (SMOKE); the smallest PackGQA pin at cga2 on the shared prefill
     body (8/2, S_q 64: 256 rows per unit, past the tile; SMOKE); and two over-tile cga1 pins (B1 64/4 Q512, unpacked and
     packed: a decode grid of several Q tiles per unit, which an explicit pin reaches and the heuristics never propose).

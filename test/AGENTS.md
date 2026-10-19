@@ -96,6 +96,15 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
       yield
   ```
 
+### Native flavor routing assertions
+
+When a native head-dimension flavor replaces an envelope, update the exact
+template expectation in existing end-to-end routing tests as well as adding
+new flavor tests. Keep the routing assertion, numerical comparisons and shape
+unchanged. The SM107 GPT-OSS D64 case in
+`test_sdpa_fwd_cc107_decode_tile_envelope_pinned_L0` exercises native D64
+prefill; a short query alone does not imply the D128 decode template.
+
 ### Layout
 
 - `test/python/<operation>/<backend>/` — tests grouped by operation (`sdpa`, `gemm`, `conv`, `norm`, `rope`, `linear_attention`, ...), then by the backend or framework they exercise: `graph` (native cuDNN through `cudnn.pygraph`), `frost` (FROST engines), `cutedsl` (CuTe DSL frontend-only APIs), `torch` and `jax` (framework integrations), and engine names such as `linear_attention/cake`. Tests that span backends sit at the operation root (e.g. `linear_attention/test_la.py`).
