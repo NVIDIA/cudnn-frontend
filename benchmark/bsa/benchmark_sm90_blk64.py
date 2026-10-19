@@ -10,7 +10,7 @@ from pathlib import Path
 
 import torch
 import cudnn
-from cudnn import BSA
+from cudnn import ops
 from benchmark_sm90_blk128 import measure
 
 
@@ -62,18 +62,18 @@ def main():
 
         def fwd(index=0):
             q, k, v, do = pool[index]
-            return BSA.block_sparse_attention_forward(q, k, v, ids64, count, sparse_block_size=64)
+            return ops.block_sparse_attention_forward(q, k, v, ids64, count, sparse_block_size=64)
 
         f = [fwd(index) for index in range(args.rotate)]
 
         def bwd(index=0):
             q, k, v, do = pool[index]
-            return BSA.block_sparse_attention_backward(do, q, k, v, f[index]["o_tensor"], f[index]["lse_tensor"], ids64, count, sparse_block_size=64)
+            return ops.block_sparse_attention_backward(do, q, k, v, f[index]["o_tensor"], f[index]["lse_tensor"], ids64, count, sparse_block_size=64)
 
         def train(index=0):
             q, k, v, do = pool[index]
             fo = fwd(index)
-            return BSA.block_sparse_attention_backward(do, q, k, v, fo["o_tensor"], fo["lse_tensor"], ids64, count, sparse_block_size=64)
+            return ops.block_sparse_attention_backward(do, q, k, v, fo["o_tensor"], fo["lse_tensor"], ids64, count, sparse_block_size=64)
 
         fm, _ = measure(fwd, args.repeats, 7, args.rotate)
         bm, _ = measure(bwd, args.repeats, 7, args.rotate)

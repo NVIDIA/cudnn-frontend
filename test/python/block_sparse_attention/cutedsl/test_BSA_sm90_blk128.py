@@ -5,7 +5,7 @@
 
 import pytest
 import torch
-from cudnn import BSA
+from cudnn import ops
 
 pytestmark = [pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 
@@ -120,7 +120,7 @@ def check(
 
         q, k, v = (row_view(t) for t in (q, k, v))
     opts = dict(block_sparse_num=count, q2k_block_nums=counts, block_sizes=sizes, sparse_block_size=128, softmax_scale=scale, layout=layout)
-    result = BSA.block_sparse_attention_forward(q, k, v, ids, allow_empty_block_nums=variable, kv_splits=splits, **opts)
+    result = ops.block_sparse_attention_forward(q, k, v, ids, allow_empty_block_nums=variable, kv_splits=splits, **opts)
     assert result["o_tensor"].is_contiguous()
     assert result["lse_tensor"].is_contiguous()
     do = torch.randn_like(result["o_tensor"]) if backward else None
@@ -131,7 +131,7 @@ def check(
         # Noncompact output rows exercise native writes, not temporary copies.
         backing = tuple(torch.full((*t.shape[:-1], t.shape[-1] * 2), 17.0, dtype=t.dtype, device=t.device) for t in (q, k, v))
         dest = tuple(storage[..., : t.shape[-1]] for storage, t in zip(backing, (q, k, v)))
-        gradients = BSA.block_sparse_attention_backward(
+        gradients = ops.block_sparse_attention_backward(
             do,
             q,
             k,
@@ -195,8 +195,8 @@ def test_graph_mutable_metadata_no_recompile():
     stream.wait_stream(torch.cuda.current_stream())
 
     def run():
-        f = BSA.block_sparse_attention_forward(q, k, v, ids, count, q2k_block_nums=counts, allow_empty_block_nums=True, sparse_block_size=128)
-        g = BSA.block_sparse_attention_backward(do, q, k, v, f["o_tensor"], f["lse_tensor"], ids, count, q2k_block_nums=counts, sparse_block_size=128)
+        f = ops.block_sparse_attention_forward(q, k, v, ids, count, q2k_block_nums=counts, allow_empty_block_nums=True, sparse_block_size=128)
+        g = ops.block_sparse_attention_backward(do, q, k, v, f["o_tensor"], f["lse_tensor"], ids, count, q2k_block_nums=counts, sparse_block_size=128)
         return f, g
 
     with torch.cuda.stream(stream):
@@ -276,7 +276,7 @@ def test_forward_partial_prologue(scale, variable):
     ids.copy_(order)
     sizes.fill_(128)
     sizes[:, -1] = 1
-    result = BSA.block_sparse_attention_forward(
+    result = ops.block_sparse_attention_forward(
         q, k, v, ids, count, q2k_block_nums=counts, allow_empty_block_nums=variable, block_sizes=sizes, sparse_block_size=128, softmax_scale=scale
     )
     ro, rl, _ = reference(q, k, v, ids, counts, sizes, count, scale, "bhsd")
@@ -295,10 +295,10 @@ def test_unsupported_contracts(kind):
     if kind == "unaligned_rows":
         q = torch.empty((*q.shape[:-1], 129), device=q.device, dtype=q.dtype)[..., :128]
         with pytest.raises(NotImplementedError, match="aligned"):
-            BSA.block_sparse_attention_forward(q, k, v, ids, count, sparse_block_size=128)
+            ops.block_sparse_attention_forward(q, k, v, ids, count, sparse_block_size=128)
     else:
         with pytest.raises((NotImplementedError, ValueError)):
-            BSA.block_sparse_attention_backward(
+            ops.block_sparse_attention_backward(
                 torch.empty_like(q),
                 q,
                 k,
@@ -334,7 +334,7 @@ def test_dsl_floor_before_kernel_import(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", guarded_import)
     q, k, v, ids, _, _, count = case()
     with pytest.raises(RuntimeError, match="requires nvidia-cutlass-dsl"):
-        BSA.block_sparse_attention_forward(q, k, v, ids, count, sparse_block_size=128)
+        ops.block_sparse_attention_forward(q, k, v, ids, count, sparse_block_size=128)
 
 
 @pytest.mark.L1
