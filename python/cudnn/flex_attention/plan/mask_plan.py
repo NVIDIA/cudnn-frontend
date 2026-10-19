@@ -553,6 +553,7 @@ class MaskPlan:
 
     __slots__ = (
         "_packed_plan",
+        "_deterministic_packed_plan",
         "_cu_seqlens_q",
         "_cu_seqlens_k",
         "_metadata",
@@ -570,6 +571,7 @@ class MaskPlan:
             block_sparse_tensors=packed_plan,
         )
         self._packed_plan = packed_plan
+        self._deterministic_packed_plan = None
         self._cu_seqlens_q = geometry.cu_seqlens_q
         self._cu_seqlens_k = geometry.cu_seqlens_k
         self._metadata = MaskPlanMetadata(
@@ -671,6 +673,10 @@ class MaskPlan:
     @property
     def _runtime_args(self) -> tuple[object, torch.Tensor | None, torch.Tensor | None]:
         return self._packed_plan, self._cu_seqlens_q, self._cu_seqlens_k
+
+    def _backward_runtime_args(self, deterministic: bool) -> tuple[object, torch.Tensor | None, torch.Tensor | None]:
+        packed_plan = self._deterministic_packed_plan if deterministic else None
+        return packed_plan if packed_plan is not None else self._packed_plan, self._cu_seqlens_q, self._cu_seqlens_k
 
 
 __all__ = [
