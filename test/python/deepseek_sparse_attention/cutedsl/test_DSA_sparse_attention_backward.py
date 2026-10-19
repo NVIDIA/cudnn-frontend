@@ -30,6 +30,18 @@ from deepseek_sparse_attention.cutedsl.dsa_reference import (
 _TWO_CTA_CAPABILITIES = ((10, 0), (10, 3))
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize("sm_count,expected", [(132, 66), (148, 74), (152, 76), (160, 76)])
+def test_DSA_sparse_attention_backward_d576_deterministic_compact_slots(sm_count, expected):
+    """One deterministic wave uses every complete two-SM cluster up to the compact workspace cap."""
+    try:
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100_d576 import _deterministic_compact_slots
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    assert _deterministic_compact_slots(sm_count) == expected
+
+
 def _assert_qcluster_dq_close(actual, expected, msg):
     """Reject erased dQ while allowing q-cluster accumulation-order noise."""
     actual_float = actual.float()
@@ -883,10 +895,11 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_bounded_waves(num_hea
 
 @pytest.mark.L2
 @torch_fork_set_rng(seed=20261019)
-def test_DSA_sparse_attention_backward_sm100_h96_d576_two_cta_repeat1000():
-    """The deterministic H96 D576 two-CTA route remains bitwise stable across persistent waves."""
+@pytest.mark.parametrize("num_heads", [96, 128], ids=["H96", "H128"])
+def test_DSA_sparse_attention_backward_sm100_d576_two_cta_repeat1000(num_heads):
+    """The deterministic D576 two-CTA routes remain bitwise stable across persistent waves."""
     try:
-        _exercise_deterministic_sm100_case(96, 576, 257, 256, repeats=1000, max_topk=128)
+        _exercise_deterministic_sm100_case(num_heads, 576, 257, 256, repeats=1000, max_topk=128)
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 

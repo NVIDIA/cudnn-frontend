@@ -3938,6 +3938,27 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic(TwoCTADeterminis
     dkv_shards_per_query = 1
     max_query_pairs_per_wave = COMPACT_SLOTS
 
+    def __init__(
+        self,
+        element_dtype: Type[cutlass.Numeric],
+        head_dim: int,
+        head_dim_v: int,
+        block_tile: int,
+        max_topk: int = 0,
+        single_query: bool = False,
+        num_heads: int = 128,
+        compact_slots: int = 74,
+    ):
+        """Specialize the deterministic wave width to the active GPU's two-SM cluster count."""
+        super().__init__(element_dtype, head_dim, head_dim_v, block_tile, max_topk, single_query, num_heads)
+        if not 1 <= compact_slots <= 76:
+            raise ValueError(f"deterministic D576 two-CTA compact slots must be in [1, 76], got {compact_slots}")
+        self.COMPACT_SLOTS = compact_slots
+        self.num_dkv_shards = compact_slots
+        self.max_query_pairs_per_wave = compact_slots
+        compact_values = compact_slots * self.COMPACT_RECORD + (self.COMPACT_GROUPS + 1) * self.head_dim
+        assert compact_values <= self.COMPACT_PUBLIC_PLANES * self.head_dim
+
     @cute.jit
     def make_dKV_accumulator(self, workspace_dKV: cute.Tensor, total_seqlen_KV: Int32):
         """Keep the public 128-plane view while privately using compact records."""
@@ -4132,7 +4153,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic(TwoCTADeterminis
                         d_sink[head, (0, 0)] = acc
 
     @cute.jit
-    def fold_dKV_accumulator(self, mdKV_acc: cute.Tensor, seqlen: Int32, stream: cuda.CUstream, active_shards: Int32 = 74):
+    def fold_dKV_accumulator(self, mdKV_acc: cute.Tensor, seqlen: Int32, stream: cuda.CUstream, active_shards: Int32):
         """Launch both fixed-order compact folds and return the contiguous result."""
         active_groups = cute.ceil_div(active_shards, self.COMPACT_QUERIES_PER_GROUP)
         self.fold_dKV_shards(mdKV_acc, seqlen, active_shards).launch(grid=[seqlen, active_groups, 1], block=[320, 1, 1], stream=stream)
@@ -4157,7 +4178,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic(TwoCTADeterminis
         seqlen: Int32,
         total_q: Int32,
         stream: cuda.CUstream,
-        active_shards: Int32 = 74,
+        active_shards: Int32,
     ):
         """Preserve the compact FP32 fold order and fuse the multi-query dSink tail."""
         active_groups = cute.ceil_div(active_shards, self.COMPACT_QUERIES_PER_GROUP)

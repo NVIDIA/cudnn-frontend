@@ -18,6 +18,7 @@ from ._interface_sm100 import _BLACKWELL_CAPABILITIES, _align_workspace_bytes, _
 BACKEND = "h128_d576_2cta_m64"
 H96_BACKEND = "h96_d576_2cta_m64"
 BACKENDS = (H96_BACKEND, BACKEND)
+_MAX_DETERMINISTIC_COMPACT_SLOTS = 76
 
 
 def _workspace_sizes(total_s_q: int, total_s_kv: int, deterministic: bool = False, num_heads: int = 128) -> tuple[int, int]:
@@ -38,6 +39,11 @@ def _split_count(total_s_q: int, max_topk: int, sm_count: int) -> int:
     return max(1, min((sm_count // 2) // max(total_s_q, 1), 1 + max_tiles // 2, 8))
 
 
+def _deterministic_compact_slots(sm_count: int) -> int:
+    """Fill one two-CTA wave without exceeding the compact workspace layout."""
+    return max(1, min(sm_count // 2, _MAX_DETERMINISTIC_COMPACT_SLOTS))
+
+
 @lru_cache(maxsize=None)
 def _compile_d576_2cta(
     device_capability,
@@ -47,6 +53,7 @@ def _compile_d576_2cta(
     split_regime: bool,
     deterministic: bool = False,
     num_heads: int = 128,
+    compact_slots: int = 74,
 ):
     """Compile from metadata; sequence extents and scale remain runtime inputs."""
     if device_capability not in _BLACKWELL_CAPABILITIES:
@@ -74,15 +81,18 @@ def _compile_d576_2cta(
     stats_workspace = tensor(cutlass.Uint8, (cute.sym_int64(),))
     dkv_workspace = tensor(cutlass.Uint8, (cute.sym_int64(),))
     kernel_cls = FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic if deterministic else FlashAttentionDSABackwardSm100H128D576TwoCTA
-    kernel = kernel_cls(
-        element_dtype=cutlass.BFloat16,
-        head_dim=576,
-        head_dim_v=512,
-        block_tile=64,
-        max_topk=max_topk,
-        single_query=single_query,
-        num_heads=num_heads,
-    )
+    kernel_kwargs = {
+        "element_dtype": cutlass.BFloat16,
+        "head_dim": 576,
+        "head_dim_v": 512,
+        "block_tile": 64,
+        "max_topk": max_topk,
+        "single_query": single_query,
+        "num_heads": num_heads,
+    }
+    if deterministic:
+        kernel_kwargs["compact_slots"] = compact_slots
+    kernel = kernel_cls(**kernel_kwargs)
     return cute.compile(
         kernel,
         (cutlass.Int32(1), cutlass.Int32(1), cutlass.Int32(576), (cutlass.Int32(num_heads), cutlass.Int32(1))),
@@ -225,7 +235,9 @@ def flash_attn_bwd_sm100_d576_2cta(
     num_heads = q.shape[1]
     max_topk = topk_idxs.shape[1]
     with torch.cuda.device(q.device):
-        split_count = 1 if deterministic else _split_count(sq, max_topk, torch.cuda.get_device_properties(q.device).multi_processor_count)
+        sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
+        split_count = 1 if deterministic else _split_count(sq, max_topk, sm_count)
+        compact_slots = _deterministic_compact_slots(sm_count) if deterministic else 74
         compiled_kernel = _compile_d576_2cta(
             torch.cuda.get_device_capability(q.device),
             max_topk,
@@ -234,6 +246,7 @@ def flash_attn_bwd_sm100_d576_2cta(
             split_count > 1,
             deterministic,
             num_heads,
+            compact_slots,
         )
         current_stream = resolve_stream(current_stream)
         with torch_stream_context(current_stream):
