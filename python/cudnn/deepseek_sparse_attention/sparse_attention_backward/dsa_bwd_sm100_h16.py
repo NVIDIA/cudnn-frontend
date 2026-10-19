@@ -45,6 +45,7 @@ class FlashAttentionDSABackwardSm100H16:
         if head_dim != 576 or head_dim_v != 512 or block_tile != 128:
             raise ValueError("H16 M128 requires head_dim=576, head_dim_v=512, and block_tile=128")
         self.head_dim = head_dim
+        self.same_hdim_kv = head_dim == head_dim_v
         self.block_tile = block_tile
         self.max_topk = max_topk
         # The 128-row sparse KV tile occupies M and the 16 heads occupy N.
