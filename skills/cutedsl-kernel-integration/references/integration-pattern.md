@@ -138,7 +138,7 @@ Do not expose `_get_rubin_kernel()` or Rubin module paths in public docs unless 
 
 Export public functions from `cudnn.ops`, so callers import them as `from cudnn.ops import ...`.
 
-Add each function to the `_LAZY_EXPORTS` table in `python/cudnn/ops/__init__.py` rather than importing it eagerly; `__all__` follows the table. Route the name to the module that implements it:
+Add each function to the `_LAZY_EXPORTS` table in `python/cudnn/ops/__init__.py` rather than importing it eagerly; `__all__` follows the table. For an op in a family (see `docs/fe-oss-apis/api_conventions.md`), use the table in `python/cudnn/ops/<family>/__init__.py`. Route the name to the module that implements it:
 
 ```python
 _LAZY_EXPORTS = {

@@ -24,7 +24,7 @@ Use this skill to add or update a CuTeDSL frontend-only API in cuDNN Frontend. T
 
 1. Add or update the operation package under the closest existing family, such as `python/cudnn/<operation>/`, `python/cudnn/gemm/cutedsl/dense/<operation>/`, `python/cudnn/gemm/cutedsl/grouped/<operation>/`, `python/cudnn/gemm/cutedsl/discrete_grouped/<operation>/`, or `python/cudnn/sdpa/<direction>/`.
 2. Implement the public functions in `api.py`: validate the configuration, allocate outputs, cache/reuse compiled kernels where the template does, and return a `TupleDict` (PyTorch) or a plain tuple or dict (JAX).
-3. Export the public functions through `_LAZY_EXPORTS` in `python/cudnn/ops/__init__.py`.
+3. Export the public functions through `_LAZY_EXPORTS` in `python/cudnn/ops/__init__.py`, or in `python/cudnn/ops/<family>/__init__.py` for an op in a family.
 4. Reuse the existing CuTeDSL dependencies in `[project] dependencies` unless the new kernel truly needs an additional package. The `cutedsl` extra now holds only `cuda-python`.
 5. Add FE OSS documentation and update the relevant overview or operation index links.
 6. Add tests under `test/python/<operation>/cutedsl/`, including support validation and numerical/reference coverage when executable.

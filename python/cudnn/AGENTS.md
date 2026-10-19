@@ -742,7 +742,7 @@ Public functions (`cudnn.ops.<op>_<direction>(...)` / `cudnn.ops.<op>_<direction
 
 1. Kernel package under the closest existing family (layout above).
 2. Public functions in `api.py`.
-3. Exports: `_LAZY_EXPORTS` in `python/cudnn/ops/__init__.py`; register any new package dir in `pyproject.toml` packages list.
+3. Exports: `_LAZY_EXPORTS` in `python/cudnn/ops/__init__.py` (or `python/cudnn/ops/<family>/__init__.py` for an op in a family); register any new package dir in `pyproject.toml` packages list.
 4. Docs: page under `docs/fe-oss-apis/` (family subdir) + link it from `docs/fe-oss-apis/overview.md`.
 5. Tests: `test/python/<op>/cutedsl/test_<op>.py` (+ `_utils.py`/reference), covering supported and unsupported configurations and numerical reference comparison.
 6. DSL version gate (Rule 7): the route declines with a version-naming error below `CUTEDSL_MIN_VERSION`, and the tests skip there instead of failing.
