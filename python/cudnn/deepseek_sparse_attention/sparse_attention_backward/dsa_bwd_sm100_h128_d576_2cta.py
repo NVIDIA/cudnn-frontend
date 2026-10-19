@@ -304,18 +304,41 @@ def _n64_rows_unique(index_row: cute.Tensor, tile_index: Int32, topk: Int32, seq
         row_1 = index_row[slot_1]
     valid_0 = row_0 >= Int32(0) and row_0 < seqlen_kv
     valid_1 = row_1 >= Int32(0) and row_1 < seqlen_kv
-    peers_0 = _match_any_sync_i32(row_0)
-    peers_1 = _match_any_sync_i32(row_1)
-    duplicate = Int32(0)
-    if valid_0 and cute.arch.popc(peers_0) > Int32(1):
-        duplicate = Int32(1)
-    if valid_1 and cute.arch.popc(peers_1) > Int32(1):
-        duplicate = Int32(1)
-    for source_lane in cutlass.range_constexpr(32):
-        other_row = cute.arch.shuffle_sync(row_1, source_lane)
-        if valid_0 and row_0 == other_row:
+
+    # Production Top-K rows are sorted by key index before attention.  Prove the
+    # common strictly-increasing case with two neighbor shuffles, and retain the
+    # exhaustive comparison below for arbitrary caller-provided index order.
+    sorted_violation = Int32(0)
+    next_row_0 = cute.arch.shuffle_sync(row_0, lane + Int32(1))
+    next_row_1 = cute.arch.shuffle_sync(row_1, lane + Int32(1))
+    first_row_1 = cute.arch.shuffle_sync(row_1, Int32(0))
+    if slot_0 < topk and not valid_0:
+        sorted_violation = Int32(1)
+    if slot_1 < topk and not valid_1:
+        sorted_violation = Int32(1)
+    if lane < Int32(31) and slot_0 + Int32(1) < topk and row_0 >= next_row_0:
+        sorted_violation = Int32(1)
+    if lane == Int32(31) and tile_base + Int32(32) < topk and row_0 >= first_row_1:
+        sorted_violation = Int32(1)
+    if lane < Int32(31) and slot_1 + Int32(1) < topk and row_1 >= next_row_1:
+        sorted_violation = Int32(1)
+    strictly_sorted = cute.arch.make_warp_uniform(cute.arch.warp_redux_sync(sorted_violation, "or")) == Int32(0)
+
+    rows_unique = strictly_sorted
+    if not strictly_sorted:
+        peers_0 = _match_any_sync_i32(row_0)
+        peers_1 = _match_any_sync_i32(row_1)
+        duplicate = Int32(0)
+        if valid_0 and cute.arch.popc(peers_0) > Int32(1):
             duplicate = Int32(1)
-    return cute.arch.make_warp_uniform(cute.arch.warp_redux_sync(duplicate, "or")) == Int32(0)
+        if valid_1 and cute.arch.popc(peers_1) > Int32(1):
+            duplicate = Int32(1)
+        for source_lane in cutlass.range_constexpr(32):
+            other_row = cute.arch.shuffle_sync(row_1, source_lane)
+            if valid_0 and row_0 == other_row:
+                duplicate = Int32(1)
+        rows_unique = cute.arch.make_warp_uniform(cute.arch.warp_redux_sync(duplicate, "or")) == Int32(0)
+    return rows_unique
 
 
 @cute.jit

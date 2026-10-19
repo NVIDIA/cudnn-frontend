@@ -2048,6 +2048,67 @@ def test_DSA_sparse_attention_backward_d576_2cta_numerics(s_q, topk, has_topk_le
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("duplicate", [False, True], ids=["unique", "duplicate"])
+@torch_fork_set_rng(seed=20261020)
+def test_DSA_sparse_attention_backward_d576_2cta_sorted_topk_numerics(duplicate, monkeypatch):
+    """Sorted Top-K rows use the ordered fast path and preserve duplicate accumulation."""
+    _require_sm100()
+    if torch.cuda.get_device_capability() not in _TWO_CTA_CAPABILITIES:
+        pytest.skip("D576 2-CTA requires an SM100-class GPU (compute capability 10.0 or 10.3)")
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    cfg = {"s_q": 9, "s_kv": 145, "h_q": 96, "head_dim": 576, "topk": 128}
+    q, kv, attn_sink, topk_idxs, topk_length = _allocate(cfg, not duplicate)
+    topk_idxs = topk_idxs.sort(dim=-1).values
+    if duplicate:
+        topk_idxs[:, 1] = topk_idxs[:, 0]
+    softmax_scale = 1.0 / math.sqrt(576)
+    out, lse = ref_sparse_attention_forward_chunked(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        topk_length=topk_length,
+        softmax_scale=softmax_scale,
+    )
+    dout = torch.randn_like(out)
+
+    two_cta_calls = _spy_d576_two_cta_execute(monkeypatch)
+    result = DSA.sparse_attention_backward_wrapper(
+        q,
+        kv,
+        out,
+        dout,
+        lse,
+        attn_sink,
+        topk_idxs,
+        topk_length=topk_length,
+        softmax_scale=softmax_scale,
+        deterministic=True,
+    )
+    assert two_cta_calls, "the wrapper did not execute the H96/D576 two-CTA backend"
+    check_ref_dsa_sparse_attention_backward(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        out,
+        dout,
+        lse,
+        result["dq"],
+        result["dkv"],
+        result["d_sink"],
+        topk_length=topk_length,
+        softmax_scale=softmax_scale,
+        atol=5e-2,
+        rtol=5e-2,
+    )
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("use_plan", [False, True], ids=["wrapper", "plan"])
 @torch_fork_set_rng(seed=577)
 def test_DSA_sparse_attention_backward_d576_2cta_ignored_nan_and_workspace_reuse(use_plan, monkeypatch):
