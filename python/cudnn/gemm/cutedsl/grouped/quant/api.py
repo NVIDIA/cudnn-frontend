@@ -49,6 +49,9 @@ from ..canonical import (
     canonical_mx_fake,
     canonical_b_fake,
     canonical_prob_fake,
+    raw_desc,
+    raw_fake,
+    raw_uint8_dtype,
 )
 from ..scheduler_counter import validate_scheduler_counter
 from cutlass.cute.nvgpu import OperandMajorMode
@@ -120,6 +123,7 @@ class GroupedGemmQuantSm100(APIBase):
         use_single_group_runtime_offsets: bool = False,
         *,
         sample_scheduler_counter: Optional[torch.Tensor] = None,
+        a_dtype: Optional[torch.dtype] = None,
     ):
         """Initialize the GroupedGemmQuantSm100 API.
 
@@ -135,7 +139,7 @@ class GroupedGemmQuantSm100(APIBase):
             Dense mode supports fp16/bfloat16/float32 bias; discrete mode supports fp16/bfloat16 bias.
         :param num_experts: (Discrete) Number of experts
         :param b_shape: (Discrete) Shape of a single expert B tensor, e.g. (n, k)
-        :param b_dtype: (Discrete) Data type of B tensors
+        :param b_dtype: (Discrete) Data type of B tensors. Dense mode: the dtype a raw uint8 B holds
         :param sample_sfd_row: Optional row scale factor for D
         :param sample_sfd_col: Optional column scale factor for D
         :param sample_amax: Optional amax tensor for quantization
@@ -159,6 +163,9 @@ class GroupedGemmQuantSm100(APIBase):
         :param discrete_col_sfd: Enable discrete col-major scale factor tensor
         :param b_major: Major dimension for B tensor, one of "k" or "n"
         :param use_dynamic_sched: Enable dynamic tile scheduling for load balancing
+        :param a_dtype: The dtype a raw uint8 A holds (float8_e4m3fn or float8_e5m2). Raw uint8
+            scale factors follow sf_vec_size: 32 is E8M0, 16 is E4M3. The kernel reads raw
+            operands as these dtypes with no host-side view.
         """
         framework = detect_framework(sample_a)
         if framework == "jax":
@@ -230,10 +237,15 @@ class GroupedGemmQuantSm100(APIBase):
             "row_scale",
         )
         self.bias_desc = self._make_tensor_desc(sample_bias, name="sample_bias", canonical=True)
+        self.raw_dtypes = {}
+        self.a_desc = raw_desc(self, "a", self.a_desc, raw_uint8_dtype(sample_a, a_dtype))
+        self.sfa_desc = raw_desc(self, "sfa", self.sfa_desc, raw_uint8_dtype(sample_sfa, sf_vec_size=sf_vec_size))
 
         if self.weight_mode == MoEWeightMode.DENSE:
-            self.b_desc = self._make_tensor_desc(sample_b, name="sample_b", canonical=True)
-            self.sfb_desc = self._make_tensor_desc(sample_sfb, name="sample_sfb", canonical=True)
+            self.b_desc = raw_desc(self, "b", self._make_tensor_desc(sample_b, name="sample_b", canonical=True), raw_uint8_dtype(sample_b, b_dtype))
+            self.sfb_desc = raw_desc(
+                self, "sfb", self._make_tensor_desc(sample_sfb, name="sample_sfb", canonical=True), raw_uint8_dtype(sample_sfb, sf_vec_size=sf_vec_size)
+            )
             self.expert_cnt = self.padded_offsets_desc.shape[0]
         else:
             self._value_error_if(num_experts == 0, "num_experts must be > 0")
@@ -661,6 +673,7 @@ class GroupedGemmQuantSm100(APIBase):
             # this cuDNN FE wrapper only exposes quantized D/D_col outputs.
             kernel_kwargs["generate_c"] = False
         gemm_quant = self._kernel(**kernel_kwargs)
+        gemm_quant.raw_dtypes = self.raw_dtypes
 
         hardware_info = cutlass.utils.HardwareInfo()
         max_active_clusters = hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1])
@@ -898,9 +911,9 @@ class GroupedGemmQuantSm100(APIBase):
         prob_cute_fake = canonical_prob_fake(prob_cute_fake, self.canonical_prob)
 
         compile_kwargs = dict(
-            a=a_cute_fake,
-            b=b_cute_fake,
-            sfb=sfb_cute_fake,
+            a=raw_fake(self, "a", a_cute_fake),
+            b=raw_fake(self, "b", b_cute_fake),
+            sfb=raw_fake(self, "sfb", sfb_cute_fake),
             n=cutlass.Int32(0),
             k=cutlass.Int32(0),
             b_stride_size=cutlass.Int64(0),
@@ -908,7 +921,7 @@ class GroupedGemmQuantSm100(APIBase):
             workspace_ptr=fake_workspace_ptr,
             d=d_cute_fake,
             d_col=d_col_cute_fake,
-            sfa=sfa_cute_fake,
+            sfa=raw_fake(self, "sfa", sfa_cute_fake),
             sfd_row_tensor=sfd_row_fake,
             sfd_col_tensor=sfd_col_fake,
             amax_tensor=self._make_fake_cute_tensor_from_desc(self.amax_desc, assumed_align=16),
@@ -1116,7 +1129,7 @@ class GroupedGemmQuantSm100(APIBase):
         prob_tensor = canonical_prob_fake(prob_tensor, self.canonical_prob)
 
         compile_kwargs = dict(
-            a=a_tensor,
+            a=raw_fake(self, "a", a_tensor),
             b=b_ptrs_cute,
             sfb=sfb_ptrs_cute,
             n=cutlass.Int32(n),
@@ -1126,7 +1139,7 @@ class GroupedGemmQuantSm100(APIBase):
             workspace_ptr=workspace_ptr_cute,
             d=d_tensor,
             d_col=d_col_tensor,
-            sfa=sfa_tensor,
+            sfa=raw_fake(self, "sfa", sfa_tensor),
             sfd_row_tensor=sfd_row_tensor,
             sfd_col_tensor=sfd_col_tensor,
             amax_tensor=amax_tensor,
@@ -1493,6 +1506,7 @@ def grouped_gemm_quant_wrapper_sm100(
     *,
     generate_amax: bool = True,
     scheduler_counter_tensor: Optional[torch.Tensor] = None,
+    a_dtype: Optional[torch.dtype] = None,
 ) -> TupleDict:
     """Convenience wrapper for grouped GEMM Quant operation.
 
@@ -1517,7 +1531,7 @@ def grouped_gemm_quant_wrapper_sm100(
         b_ptrs: (Discrete) 1-D int64 device tensor of per-expert B data pointers
         sfb_ptrs: (Discrete) 1-D int64 device tensor of per-expert SFB data pointers
         n: (Discrete) B weight N dimension
-        b_dtype: (Discrete) B weight data type
+        b_dtype: (Discrete) B weight data type. Dense mode: the FP8 dtype a raw uint8 b_tensor holds.
         b_major: (Discrete) B tensor major dimension ("k" or "n")
         norm_const_tensor: Optional normalization constant. Required when using FP8
             input configurations (i.e., when a_tensor.dtype is FP8 and sfa_tensor.dtype is FP8).
@@ -1589,6 +1603,7 @@ def grouped_gemm_quant_wrapper_sm100(
         wrapper_operand_meta(sfb_ptrs),
         n,
         b_dtype,
+        a_dtype,
         b_major,
         wrapper_operand_meta(norm_const_tensor),
         wrapper_operand_meta(prob_tensor),
@@ -1642,6 +1657,9 @@ def grouped_gemm_quant_wrapper_sm100(
 
     validate_scheduler_counter(scheduler_counter_tensor, a_tensor, b_tensor is not None and use_dynamic_sched)
 
+    raw_b = raw_uint8_dtype(b_tensor, b_dtype)
+    a_logical = raw_uint8_dtype(a_tensor, a_dtype) or a_tensor.dtype
+    sfa_logical = raw_uint8_dtype(sfa_tensor, sf_vec_size=sf_vec_size) or sfa_tensor.dtype
     acc_dtype = _convert_to_cutlass_data_type(acc_dtype) if acc_dtype is not None else cutlass.Float32
     d_dtype = _convert_to_cutlass_data_type(d_dtype) if d_dtype is not None else cutlass.BFloat16
     b_dtype = _convert_to_cutlass_data_type(b_dtype) if b_dtype is not None else None
@@ -1674,14 +1692,14 @@ def grouped_gemm_quant_wrapper_sm100(
         if bias_tensor is not None and tuple(bias_tensor.shape) != (n_out, num_experts):
             raise ValueError(f"bias_tensor must have shape {(n_out, num_experts)}, got {tuple(bias_tensor.shape)}")
 
-    logical_k = k_physical * 2 if a_tensor.dtype in (torch.float4_e2m1fn_x2, torch.uint8) else k_physical
+    logical_k = k_physical * 2 if a_logical in (torch.float4_e2m1fn_x2, torch.uint8) else k_physical
     rest_k = ceil_div(ceil_div(logical_k, sf_vec_size), 4)
     check_packed_sf(sfa_tensor, sfb_tensor, valid_m, n_out, l, rest_k)
 
-    is_fp8_input_config = _convert_to_cutlass_data_type(a_tensor.dtype) in (
+    is_fp8_input_config = _convert_to_cutlass_data_type(a_logical) in (
         cutlass.Float8E4M3FN,
         cutlass.Float8E5M2,
-    ) and _convert_to_cutlass_data_type(sfa_tensor.dtype) in (
+    ) and _convert_to_cutlass_data_type(sfa_logical) in (
         cutlass.Float8E8M0FNU,
         cutlass.Float8E4M3FN,
     )
@@ -1714,7 +1732,7 @@ def grouped_gemm_quant_wrapper_sm100(
         n_out=n_out,
         l=l,
         d_dtype=output_dtype,
-        sf_dtype=sfa_tensor.dtype,
+        sf_dtype=sfa_logical,
         sf_vec_size=sf_vec_size,
         canonical=canonical,
         low_precision=is_low_precision_output_config,
@@ -1782,6 +1800,8 @@ def grouped_gemm_quant_wrapper_sm100(
             l if use_full_dynamic else tuple(b_tensor.shape),
             a_tensor.dtype,
             b_tensor.dtype,
+            a_dtype,
+            b_dtype,
             stride_order(a_tensor),
             stride_order(b_tensor),
             d_tensor.shape[1:] if not use_full_dynamic else None,
@@ -1816,6 +1836,7 @@ def grouped_gemm_quant_wrapper_sm100(
             a_tensor.shape[1:],
             stride_order(a_tensor),
             a_tensor.dtype,
+            a_dtype,
             b_shape,
             b_dtype,
             d_tensor.shape[1:],
@@ -1894,6 +1915,8 @@ def grouped_gemm_quant_wrapper_sm100(
                 use_dynamic_sched=use_dynamic_sched,
                 use_single_group_runtime_offsets=use_single_group_runtime_offsets,
                 b_major=b_major,
+                b_dtype=raw_b,
+                a_dtype=a_dtype,
             )
         else:
             grouped_gemm_quant = GroupedGemmQuantSm100(
@@ -1907,6 +1930,7 @@ def grouped_gemm_quant_wrapper_sm100(
                 num_experts=num_experts,
                 b_shape=b_shape,
                 b_dtype=b_dtype,
+                a_dtype=a_dtype,
                 sample_bias=bias_tensor,
                 sample_amax=amax_tensor,
                 sample_sfd_row=sfd_row_tensor,
@@ -1954,6 +1978,7 @@ def grouped_gemm_quant_wrapper_sm100(
 
 
 grouped_gemm_quant_wrapper_sm100.supports_canonical_layouts = True
+grouped_gemm_quant_wrapper_sm100.supports_raw_uint8_operands = True
 grouped_gemm_quant_wrapper_sm100.supports_optional_amax = True
 
 grouped_gemm_quant_wrapper_sm100.supports_external_scheduler_counter = True

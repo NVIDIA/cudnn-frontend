@@ -26,6 +26,7 @@ from __future__ import annotations
 from dataclasses import replace
 import math
 
+import cutlass
 import cutlass.cute as cute
 
 # Host side: classify sample tensors and derive the kernel-facing views for the descriptors.
@@ -151,6 +152,36 @@ def check_sf_shape(api, desc, flat: bool, mma_shape, name: str):
         api._check_tensor_shape(desc, mma_shape, name)
 
 
+def raw_uint8_dtype(tensor, dtype=None, sf_vec_size=None):
+    """Logical dtype of a raw uint8 operand, or None when ``tensor`` is typed.
+
+    A data operand needs ``dtype`` (FP8 E4M3 or E5M2), because bare uint8 data already
+    means packed FP4. A scale-factor operand (``sf_vec_size`` given) follows its block
+    size: 32 -> E8M0, 16 -> E4M3.
+    """
+    import torch
+
+    if tensor is None or tensor.dtype != torch.uint8:
+        return None
+    if sf_vec_size is not None:
+        return torch.float8_e8m0fnu if sf_vec_size == 32 else torch.float8_e4m3fn
+    if dtype not in (None, torch.float8_e4m3fn, torch.float8_e5m2):
+        raise ValueError(f"raw uint8 data must hold float8_e4m3fn or float8_e5m2, got {dtype}")
+    return dtype
+
+
+def raw_desc(api, name, desc, dtype):
+    """``desc`` relabeled to ``dtype`` for every check; the kernel relabels the raw uint8 operand at trace time."""
+    from cudnn.datatypes import _convert_to_cutlass_data_type
+
+    import torch
+
+    if desc is None or dtype is None:
+        return desc
+    logical = api.raw_dtypes[name] = _convert_to_cutlass_data_type(dtype)
+    return replace(desc, dtype=dtype if isinstance(desc.dtype, torch.dtype) else logical)
+
+
 # Compile time: canonical-rank fakes for the compiled signature.
 
 
@@ -170,8 +201,15 @@ def make_flat_sf_fake(api, desc):
     )
 
 
-def refake(fake, shape, stride):
-    return cute.runtime.make_fake_tensor(dtype=fake.element_type, shape=shape, stride=stride, assumed_align=16)
+def refake(fake, shape, stride, dtype=None):
+    return cute.runtime.make_fake_tensor(dtype=dtype or fake.element_type, shape=shape, stride=stride, assumed_align=16)
+
+
+def raw_fake(api, name, fake):
+    """The fake over raw uint8 storage when ``name`` is a raw operand, so the call takes the uint8 tensor as is."""
+    if fake is None or name not in api.raw_dtypes:
+        return fake
+    return refake(fake, fake.shape, fake.stride, cutlass.Uint8)
 
 
 def canonical_mx_fake(fake, canonical: bool):
@@ -200,6 +238,14 @@ def canonical_prob_fake(fake, canonical: bool):
 
 
 # Trace time, inside the jit launcher: canonical cute tensors -> kernel-facing views.
+
+
+def kernel_facing_dtype(kernel, name, tensor):
+    """Raw uint8 operand -> its logical dtype (same width, no data change); typed operands pass through."""
+    dtype = getattr(kernel, "raw_dtypes", {}).get(name)
+    if tensor is None or dtype is None:
+        return tensor
+    return cute.make_tensor(cute.recast_ptr(tensor.iterator, dtype=dtype), tensor.layout)
 
 
 def kernel_facing_mx(tensor):

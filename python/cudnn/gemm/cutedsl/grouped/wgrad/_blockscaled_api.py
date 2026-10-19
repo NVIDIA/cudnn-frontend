@@ -18,7 +18,7 @@ from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tenso
 from cudnn.tensor_adapter import is_torch_tensor
 
 from .moe_blockscaled_grouped_gemm_wgrad import BlockScaledMoEGroupedGemmWgradKernel
-from ..canonical import check_sf_shape, make_flat_sf_fake
+from ..canonical import check_sf_shape, make_flat_sf_fake, raw_desc, raw_fake, raw_uint8_dtype
 from ..moe_utils import MoEWeightMode, WGradInputOrder
 
 
@@ -80,7 +80,12 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
         accumulate_on_output: bool = False,
         input_order: Union[WGradInputOrder, str] = WGradInputOrder.Tensor2D,
+        a_dtype: Optional[torch.dtype] = None,
+        b_dtype: Optional[torch.dtype] = None,
     ):
+        """``a_dtype``/``b_dtype`` name the FP8 dtype a raw uint8 A/B holds; raw uint8 scale
+        factors follow ``sf_vec_size`` (32 is E8M0, 16 is E4M3). The kernel reads raw operands
+        as these dtypes with no host-side view."""
         if sample_a is not None and not is_torch_tensor(sample_a):
             raise ValueError(
                 "The block-scaled wgrad backend supports torch tensors only: its B operand "
@@ -109,12 +114,14 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             raise ValueError("Provide either sample_wgrad for dense mode or " "(num_experts, wgrad_shape, wgrad_dtype) for discrete mode, but not both")
 
         self._interpret_uint8_as_fp4x2 = True
-        self.sample_a_tensor = sample_a if self._is_fp4x2(sample_a) else None
-        self.sample_b_tensor = sample_b if self._is_fp4x2(sample_b) else None
-        self.a_desc = self._make_tensor_desc(sample_a, name="sample_a")
-        self.b_desc = self._make_tensor_desc(sample_b, name="sample_b")
-        self.sfa_desc = self._make_tensor_desc(sample_sfa, name="sample_sfa")
-        self.sfb_desc = self._make_tensor_desc(sample_sfb, name="sample_sfb")
+        raw_a, raw_b = raw_uint8_dtype(sample_a, a_dtype), raw_uint8_dtype(sample_b, b_dtype)
+        self.sample_a_tensor = sample_a if raw_a is None and self._is_fp4x2(sample_a) else None
+        self.sample_b_tensor = sample_b if raw_b is None and self._is_fp4x2(sample_b) else None
+        self.raw_dtypes = {}
+        self.a_desc = raw_desc(self, "a", self._make_tensor_desc(sample_a, name="sample_a"), raw_a)
+        self.b_desc = raw_desc(self, "b", self._make_tensor_desc(sample_b, name="sample_b"), raw_b)
+        self.sfa_desc = raw_desc(self, "sfa", self._make_tensor_desc(sample_sfa, name="sample_sfa"), raw_uint8_dtype(sample_sfa, sf_vec_size=sf_vec_size))
+        self.sfb_desc = raw_desc(self, "sfb", self._make_tensor_desc(sample_sfb, name="sample_sfb"), raw_uint8_dtype(sample_sfb, sf_vec_size=sf_vec_size))
         self.offsets_desc = self._make_tensor_desc(sample_offsets, name="sample_offsets")
         self.global_scale_a_desc = self._make_tensor_desc(sample_global_scale_a, name="sample_global_scale_a")
         self.global_scale_b_desc = self._make_tensor_desc(sample_global_scale_b, name="sample_global_scale_b")
@@ -348,6 +355,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             input_order=self.input_order,
             sf_fp8_dtype_override=self.sf_fp8_dtype_override,
         )
+        kernel.raw_dtypes = self.raw_dtypes
 
         hardware_info = cutlass.utils.HardwareInfo()
         max_active_clusters = hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1])
@@ -398,8 +406,9 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
                 divisibility=16,
             )
         )
-        sfa_fake = wgrad_sf_fake(self, self.sfa_desc)
-        sfb_fake = wgrad_sf_fake(self, self.sfb_desc)
+        a_fake, b_fake = raw_fake(self, "a", a_fake), raw_fake(self, "b", b_fake)
+        sfa_fake = raw_fake(self, "sfa", wgrad_sf_fake(self, self.sfa_desc))
+        sfb_fake = raw_fake(self, "sfb", wgrad_sf_fake(self, self.sfb_desc))
         wgrad_fake = self._make_fake_cute_tensor_from_desc(self.wgrad_desc, assumed_align=16)
         offsets_fake = self._make_fake_cute_tensor_from_desc(self.offsets_desc, assumed_align=4)
         workspace_fake = from_dlpack(self._workspace, assumed_align=128, enable_tvm_ffi=True)
@@ -491,8 +500,9 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
                 divisibility=16,
             )
         )
-        sfa_fake = wgrad_sf_fake(self, self.sfa_desc)
-        sfb_fake = wgrad_sf_fake(self, self.sfb_desc)
+        a_fake, b_fake = raw_fake(self, "a", a_fake), raw_fake(self, "b", b_fake)
+        sfa_fake = raw_fake(self, "sfa", wgrad_sf_fake(self, self.sfa_desc))
+        sfb_fake = raw_fake(self, "sfb", wgrad_sf_fake(self, self.sfb_desc))
         offsets_fake = self._make_fake_cute_tensor_from_desc(self.offsets_desc, assumed_align=4)
         workspace_fake = from_dlpack(self._workspace, assumed_align=128, enable_tvm_ffi=True)
         gs_a_fake = self._make_fake_cute_tensor_from_desc(self.global_scale_a_desc, assumed_align=4)
@@ -589,8 +599,8 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
 
         # The kernel rebuilds a flat SF layout from the A/B shapes, so the buffer itself is checked on every call.
         if sfa_tensor.ndim == 1 or sfb_tensor.ndim == 1:
-            m, tokens = self._tensor_shape(a_tensor, name="a_tensor")
-            n = self._tensor_shape(b_tensor, name="b_tensor")[1]
+            m, tokens = tuple(a_tensor.shape) if "a" in self.raw_dtypes else self._tensor_shape(a_tensor, name="a_tensor")
+            n = (tuple(b_tensor.shape) if "b" in self.raw_dtypes else self._tensor_shape(b_tensor, name="b_tensor"))[1]
             scale_cols = _round_up(ceil_div(tokens, self.sf_vec_size), 4)
             for name, sf, rows in (("sfa_tensor", sfa_tensor, m), ("sfb_tensor", sfb_tensor, n)):
                 numel = _round_up(rows, 128) * scale_cols

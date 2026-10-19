@@ -30,7 +30,7 @@ from ..backend_utils import (
     select_grouped_gemm_backend,
     wrapper_operand_meta,
 )
-from ..canonical import b_nkl, check_canonical_contiguous, check_packed_sf, is_canonical_b, is_flat_sf
+from ..canonical import b_nkl, check_canonical_contiguous, check_packed_sf, is_canonical_b, is_flat_sf, raw_uint8_dtype
 from ..moe_utils import MoEWeightMode
 from ..scheduler_counter import validate_scheduler_counter
 from cuda.bindings import driver as cuda
@@ -100,6 +100,7 @@ class GluCall:
     sfb_ptrs: Optional[torch.Tensor] = None
     n: Optional[int] = None
     b_dtype: Optional[torch.dtype] = None
+    a_dtype: Optional[torch.dtype] = None
     b_major: str = "k"
     norm_const_tensor: Optional[torch.Tensor] = None
     prob_tensor: Optional[torch.Tensor] = None
@@ -200,6 +201,7 @@ class GroupedGemmGluSm100(APIBase):
         generate_c: bool = False,
         *,
         sample_scheduler_counter: Optional[torch.Tensor] = None,
+        a_dtype: Optional[torch.dtype] = None,
     ) -> None:
         super().__init__()
         self._pending_init_kwargs = dict(locals())
@@ -215,10 +217,14 @@ class GroupedGemmGluSm100(APIBase):
     def check_support(self) -> bool:
         if self._implementation is None:
             kwargs = self._pending_init_kwargs
-            defining_b_dtype = kwargs["sample_b"].dtype if kwargs["sample_b"] is not None else kwargs["b_dtype"]
+            sample_a, sample_b = kwargs["sample_a"], kwargs["sample_b"]
+            if sample_b is not None:
+                defining_b_dtype = raw_uint8_dtype(sample_b, kwargs["b_dtype"]) or sample_b.dtype
+            else:
+                defining_b_dtype = kwargs["b_dtype"]
             backend = select_grouped_gemm_backend(
                 operation="grouped_gemm_glu_sm100",
-                a_dtype=kwargs["sample_a"].dtype,
+                a_dtype=raw_uint8_dtype(sample_a, kwargs["a_dtype"]) or sample_a.dtype,
                 b_dtype=defining_b_dtype,
                 scale_controls=(
                     ("sample_sfa", kwargs["sample_sfa"]),
@@ -596,15 +602,17 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall, memo_key: Optional[tuple]
             raise ValueError(f"bias_tensor must have shape {(n_full, num_experts)}, got {tuple(bias_tensor.shape)}")
 
     n_out = n_full // 2
-    logical_k = k_physical * 2 if a_tensor.dtype in (torch.float4_e2m1fn_x2, torch.uint8) else k_physical
+    a_dtype = raw_uint8_dtype(a_tensor, call.a_dtype) or a_tensor.dtype
+    sfa_dtype = raw_uint8_dtype(sfa_tensor, sf_vec_size=sf_vec_size) or sfa_tensor.dtype
+    logical_k = k_physical * 2 if a_dtype in (torch.float4_e2m1fn_x2, torch.uint8) else k_physical
     check_packed_sf(sfa_tensor, sfb_tensor, valid_m, n_full, l, ceil_div(ceil_div(logical_k, sf_vec_size), 4))
 
     _logger.debug("grouped_gemm_glu_wrapper_sm100: Creating output tensors")
 
     if cd_major != "n":
         raise ValueError(f"cd_major must be 'n', got {cd_major}")
-    is_fp8_config = a_tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and sfa_tensor.dtype in (torch.float8_e8m0fnu, torch.float8_e4m3fn)
-    sf_dtype = sfa_tensor.dtype if is_fp8_config else None
+    is_fp8_config = a_dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and sfa_dtype in (torch.float8_e8m0fnu, torch.float8_e4m3fn)
+    sf_dtype = sfa_dtype if is_fp8_config else None
     outputs = glu_block_scaled_outputs(valid_m, n_full, n_out, l, c_dtype, d_dtype, sf_dtype, sf_vec_size, a_tensor.device, a_tensor.ndim == 2)
     c_tensor_out, d_tensor, d_col_tensor, amax_tensor, sfd_row_tensor, sfd_col_tensor = outputs
 
@@ -651,6 +659,8 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall, memo_key: Optional[tuple]
             c_tensor_out.shape[1:] if not use_full_dynamic else None,
             a_tensor.dtype,
             b_tensor.dtype,
+            call.a_dtype,
+            b_dtype,
             c_tensor_out.dtype,
             stride_order(a_tensor),
             stride_order(b_tensor),
@@ -693,6 +703,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall, memo_key: Optional[tuple]
             a_tensor.shape[1:],
             stride_order(a_tensor),
             a_tensor.dtype,
+            call.a_dtype,
             b_shape,
             b_dtype,
             c_tensor_out.shape[1:],
@@ -761,6 +772,8 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall, memo_key: Optional[tuple]
                 sample_bias=bias_tensor,
                 sample_b=b_tensor,
                 sample_sfb=sfb_tensor,
+                b_dtype=b_dtype,
+                a_dtype=call.a_dtype,
                 sample_sfd_row=sfd_row_tensor,
                 sample_sfd_col=sfd_col_tensor,
                 sample_amax=amax_tensor,
@@ -793,6 +806,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall, memo_key: Optional[tuple]
                 num_experts=num_experts,
                 b_shape=b_shape,
                 b_dtype=b_dtype,
+                a_dtype=call.a_dtype,
                 sample_sfd_row=sfd_row_tensor,
                 sample_sfd_col=sfd_col_tensor,
                 sample_amax=amax_tensor,
@@ -934,6 +948,8 @@ def glu_block_scaled_run(
 def _normalize_glu_call(call: GluCall) -> tuple[GluCall, GroupedGemmBackend]:
     from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
 
+    raw_a = raw_uint8_dtype(call.a_tensor, call.a_dtype)
+    raw_b = raw_uint8_dtype(call.b_tensor, call.b_dtype)
     call = replace(
         call,
         acc_dtype=_convert_to_cutlass_data_type(call.acc_dtype) if call.acc_dtype is not None else cutlass.Float32,
@@ -973,11 +989,11 @@ def _normalize_glu_call(call: GluCall) -> tuple[GluCall, GroupedGemmBackend]:
             n_full, b_k, num_experts = b_full_shape
         if b_k != k:
             raise ValueError(f"b_tensor K dimension ({b_k}) must match a_tensor ({k})")
-        defining_b_dtype = call.b_tensor.dtype
+        defining_b_dtype = raw_b or call.b_tensor.dtype
         b_shape = None
         weight_mode = MoEWeightMode.DENSE
-        if call.n is not None or call.b_dtype is not None:
-            raise ValueError("Dense mode forbids n and b_dtype")
+        if call.n is not None or (call.b_dtype is not None and raw_b is None):
+            raise ValueError("Dense mode forbids n, and b_dtype unless b_tensor is raw uint8")
     else:
         num_experts = _validate_pointer_tensor(call.b_ptrs, "b_ptrs")
         if call.n is None or call.b_dtype is None:
@@ -989,7 +1005,7 @@ def _normalize_glu_call(call: GluCall) -> tuple[GluCall, GroupedGemmBackend]:
 
     backend = select_grouped_gemm_backend(
         operation="grouped_gemm_glu_sm100",
-        a_dtype=call.a_tensor.dtype,
+        a_dtype=raw_a or call.a_tensor.dtype,
         b_dtype=defining_b_dtype,
         scale_controls=(
             ("sfa_tensor", call.sfa_tensor),
@@ -1283,6 +1299,7 @@ def grouped_gemm_glu_wrapper_sm100(
     sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
     *,
     scheduler_counter_tensor: Optional[torch.Tensor] = None,
+    a_dtype: Optional[torch.dtype] = None,
 ) -> TupleDict:
     """Dispatch grouped GEMM GLU with metadata caching.
 
@@ -1296,6 +1313,9 @@ def grouped_gemm_glu_wrapper_sm100(
     scheduler_counter_tensor optionally supplies a caller-owned CUDA int32 counter
     for dense dynamic scheduling. Initialize it to zero on the execution stream
     before each call; use distinct counters for overlapping invocations and GEMMs.
+    FP8 data may also arrive as raw uint8 storage: a_dtype (and b_dtype for a dense
+    b_tensor) names the FP8 dtype it holds, and raw uint8 SFA/SFB follow sf_vec_size
+    (32 is E8M0, 16 is E4M3). The kernel reads them as such with no host-side view.
     """
     if b_tensor is not None and sfa_tensor is not None and detect_framework(a_tensor) == "jax":
         from ..canonical_jax import check_jax_wrapper_options
@@ -1361,6 +1381,7 @@ def grouped_gemm_glu_wrapper_sm100(
         wrapper_operand_meta(prob_tensor),
         n,
         b_dtype,
+        a_dtype,
         b_major,
         acc_dtype,
         c_dtype,
@@ -1461,6 +1482,7 @@ def grouped_gemm_glu_wrapper_sm100(
         sfb_ptrs=sfb_ptrs,
         n=n,
         b_dtype=b_dtype,
+        a_dtype=a_dtype,
         b_major=b_major,
         norm_const_tensor=norm_const_tensor,
         prob_tensor=prob_tensor,
@@ -1515,3 +1537,4 @@ grouped_gemm_glu_wrapper_sm100.supports_bf16_canonical_layouts = True
 __all__ = ["GluCall", "GroupedGemmGluSm100", "grouped_gemm_glu_wrapper_sm100"]
 
 grouped_gemm_glu_wrapper_sm100.supports_external_scheduler_counter = True
+grouped_gemm_glu_wrapper_sm100.supports_raw_uint8_operands = True

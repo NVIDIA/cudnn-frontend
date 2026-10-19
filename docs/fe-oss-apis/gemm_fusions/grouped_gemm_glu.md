@@ -573,6 +573,15 @@ Returns a `TupleDict` (dictionary + tuple unpacking):
 | **MXFP8** | `float8_e4m3fn` or `float8_e5m2` | `float8_e8m0fnu` | 32 | `{float16, bfloat16, float8_e4m3fn, float8_e5m2}` |
 | **NVF4** | `float4_e2m1fn_x2` or `uint8` | \{`float8_e4m3fn`, `float8_e8m0fnu`\} | \{16, 32\} | `{bfloat16, float32}` |
 
+#### Raw uint8 FP8 storage
+
+FP8 operands may also arrive as raw `uint8` storage with the dtype passed separately:
+`a_dtype` (and `b_dtype` for a dense `b_tensor`) names the FP8 dtype, `float8_e4m3fn` or
+`float8_e5m2`. Raw `uint8` scale factors follow `sf_vec_size`: 32 is E8M0, 16 is E4M3. The
+kernel reads these operands as those dtypes, so the caller needs no `.view(dtype=...)`.
+Without `a_dtype`, `uint8` data keeps its packed-FP4 meaning. The wrapper advertises
+`supports_raw_uint8_operands`.
+
 ### Additional Type Constraints
 
 - `A` and `B` must have the same dtype

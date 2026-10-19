@@ -221,6 +221,15 @@ FP8 only), and scale buffers of any rank whose bytes are already MMA-packed. Wit
 the wrapper returns D_row/D_col `(M, 2N)` and contiguous physical SFD buffers. Legacy
 layouts are unchanged. The wrapper advertises `supports_canonical_layouts`.
 
+#### Raw uint8 FP8 storage
+
+FP8 operands may also arrive as raw `uint8` storage with the dtype passed separately:
+`a_dtype` (and `b_dtype` for a dense `b_tensor`) names the FP8 dtype, `float8_e4m3fn` or
+`float8_e5m2`. Raw `uint8` scale factors follow `sf_vec_size`: 32 is E8M0, 16 is E4M3. The
+kernel reads these operands as those dtypes, so the caller needs no `.view(dtype=...)`.
+Without `a_dtype`, `uint8` data keeps its packed-FP4 meaning. The wrapper advertises
+`supports_raw_uint8_operands`.
+
 ### Equations
 
 For dSiTU-GLU, define

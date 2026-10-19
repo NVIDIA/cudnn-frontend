@@ -35,7 +35,7 @@ from cutlass._mlir import ir
 from cutlass._mlir.dialects import math, llvm
 from cutlass._mlir.dialects import vector, arith
 
-from ..canonical import kernel_facing_b, kernel_facing_mx, kernel_facing_prob
+from ..canonical import kernel_facing_b, kernel_facing_dtype, kernel_facing_mx, kernel_facing_prob
 from ..moe_persistent_scheduler import (
     MoEPersistentTileScheduler,
     MoESchedulerParams,
@@ -761,6 +761,10 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         derivative. GeGLU parameters are ignored unless ``act_func == "dgeglu"``
         and SiTU parameters are ignored unless ``act_func == "dsituglu"``.
         """
+        a = kernel_facing_dtype(self, "a", a)
+        b = kernel_facing_dtype(self, "b", b)
+        sfa = kernel_facing_dtype(self, "sfa", sfa)
+        sfb = kernel_facing_dtype(self, "sfb", sfb)
         a = kernel_facing_mx(a)
         c = kernel_facing_mx(c)
         d = kernel_facing_mx(d)

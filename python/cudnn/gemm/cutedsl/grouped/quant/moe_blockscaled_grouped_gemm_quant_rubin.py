@@ -37,7 +37,7 @@ from ..moe_persistent_scheduler import (
     MoESchedulerParams,
     MoEWorkTileInfo,
 )
-from ..canonical import kernel_facing_mx, kernel_facing_b, kernel_facing_prob
+from ..canonical import kernel_facing_mx, kernel_facing_b, kernel_facing_dtype, kernel_facing_prob
 from ..moe_utils import (
     compute_expert_token_range,
     MoEWeightMode,
@@ -770,6 +770,10 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         """
         if cutlass.const_expr(scheduler_counter is not None):
             workspace_ptr = scheduler_counter.iterator
+        a = kernel_facing_dtype(self, "a", a)
+        b = kernel_facing_dtype(self, "b", b)
+        sfa = kernel_facing_dtype(self, "sfa", sfa)
+        sfb = kernel_facing_dtype(self, "sfb", sfb)
         a = kernel_facing_mx(a)
         d = kernel_facing_mx(d)
         d_col = kernel_facing_mx(d_col)
