@@ -14,6 +14,7 @@ import ml_dtypes
 
 from cudnn.api_base import TupleDict, ceil_div
 from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.frost.buffers import cutedsl_arch_requirement_error
 from cudnn.jax import TensorSpec, call, row_major_desc
 from cudnn.tensor_adapter import detect_framework, framework_dtype
 
@@ -227,3 +228,9 @@ def check_jax_wrapper_options(
     for name, supported in options.items():
         if not supported:
             raise ValueError(f"{name} is unsupported for the JAX MXFP8 path")
+
+
+def check_rubin_dsl():
+    requirement = cutedsl_arch_requirement_error((10, 7))
+    if requirement:
+        raise RuntimeError(requirement)

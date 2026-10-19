@@ -43,7 +43,7 @@ from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.tensor_adapter import detect_framework, framework_dtype, get_compute_capability
 from cudnn.jax import call, zeros_init
 from ..canonical import kernel_facing_fp4
-from ..canonical_jax import check_block_scaled_operands, grouped_call, output_type, sf_array
+from ..canonical_jax import check_block_scaled_operands, check_rubin_dsl, grouped_call, output_type, sf_array
 from ..moe_utils import MoEWeightMode, WGradInputOrder
 from ..unfused.jax_api import _pointer_count
 from .moe_blockscaled_grouped_gemm_wgrad import _NEEDS_FP4_LAYOUT_WORKAROUND, BlockScaledMoEGroupedGemmWgradKernel
@@ -272,6 +272,7 @@ validated_configs = set()
 
 def wgrad_kernel_type():
     if get_device_type() == "rubin":
+        check_rubin_dsl()
         from .moe_blockscaled_grouped_gemm_wgrad_rubin import BlockScaledMoEGroupedGemmWgradRubinKernel
 
         return BlockScaledMoEGroupedGemmWgradRubinKernel

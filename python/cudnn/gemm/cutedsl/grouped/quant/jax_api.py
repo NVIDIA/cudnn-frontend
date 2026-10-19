@@ -24,7 +24,7 @@ from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.tensor_adapter import detect_framework, get_compute_capability
 from cudnn.jax import neg_inf_init
 from ..canonical import kernel_facing_fp4
-from ..canonical_jax import check_block_scaled_operands, check_packed_sf_size, fp8_dtypes, grouped_call, output_type, sf_array, sf_shape
+from ..canonical_jax import check_block_scaled_operands, check_packed_sf_size, check_rubin_dsl, fp8_dtypes, grouped_call, output_type, sf_array, sf_shape
 from ..moe_utils import MoEWeightMode
 from .grouped_gemm_quant import BlockScaledMoEGroupedGemmQuantKernel
 
@@ -34,6 +34,7 @@ validated_configs = set()
 
 def quant_kernel_type():
     if get_device_type() == "rubin":
+        check_rubin_dsl()
         from .moe_blockscaled_grouped_gemm_quant_rubin import BlockScaledMoEGroupedGemmQuantKernel as RubinKernel
 
         return RubinKernel

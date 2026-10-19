@@ -480,6 +480,8 @@ def test_canonical_jax_glu_hadamard_quant_parity(d_quant, rht, shared_wrapper):
     import cudnn
     import cutlass
 
+    if not hasattr(cutlass, "FloatNV8E5M3FNU"):
+        pytest.skip("GLU + Hadamard + quant requires nvidia-cutlass-dsl >= 4.8")
     arrays, sf_vec_size = block_scaled_problem("nvfp4", 4)
     m, (experts, n) = arrays["a_tensor"].shape[0], arrays["b_tensor"].shape[:2]
     arrays["sfa_tensor"] = arrays["sfa_tensor"].reshape(1, m // 128, -1, 32, 4, 4)
@@ -685,7 +687,11 @@ def test_canonical_jax_wrappers_without_torch():
         a4 = jnp.full((256, 128), 0x22, jnp.uint8)
         b4 = jnp.full((1, 256, 128), 0x22, jnp.uint8)
         sf4 = jnp.full((1, 2, 4, 32, 4, 4), 0x38, jnp.uint8).view(ml_dtypes.float8_e4m3fn)
-        for hadamard in (cudnn.grouped_gemm_glu_hadamard_wrapper_sm100, cudnn.grouped_gemm_glu_hadamard_quant_wrapper_sm100):
+        import cutlass
+        hadamards = [cudnn.grouped_gemm_glu_hadamard_wrapper_sm100]
+        if hasattr(cutlass, 'FloatNV8E5M3FNU'):
+            hadamards.append(cudnn.grouped_gemm_glu_hadamard_quant_wrapper_sm100)
+        for hadamard in hadamards:
             out = jax.jit(hadamard)(a4, sf4, offsets, ones, prob, b_tensor=b4, sfb_tensor=sf4)
             np.testing.assert_array_equal(np.asarray(out['c_tensor']).astype(np.float32), 256)
         glu = partial(cudnn.grouped_gemm_glu_wrapper_sm100, generate_c=True)

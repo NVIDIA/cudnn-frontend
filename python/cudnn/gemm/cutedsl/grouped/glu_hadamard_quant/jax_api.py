@@ -20,6 +20,7 @@ from cutlass.cute.nvgpu import OperandMajorMode
 
 from cudnn.api_base import TupleDict, ceil_div
 from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.frost.buffers import cutedsl_state
 from cudnn.tensor_adapter import get_compute_capability
 from ..canonical import kernel_facing_b, kernel_facing_fp4, kernel_facing_mx, kernel_facing_prob
 from ..canonical_jax import check_block_scaled_operands, check_jax_inputs, check_packed_sf_size, grouped_call, output_type, sf_array, sf_shape
@@ -212,11 +213,17 @@ def grouped_gemm_glu_hadamard_quant_jax_forward(
     adds flat per-expert packed data (m*n_out/2,) and scales
     (m*n_out/sf_vec_size,). At most one RHT output may be requested. n_out is
     n/2, or n for ``act_func="srelu"``. ``norm_const``, ``rht_norm_const`` and
-    the GLU scalars are compile-time constants of the traced call. Returns a
+    the GLU scalars are compile-time constants of the traced call: pass Python
+    numbers, since a traced JAX value raises ConcretizationTypeError. Returns a
     TupleDict with the eager wrapper's keys, including the pre-activation C
     (m,n). Rows at or past padded_offsets[-1] are unspecified, as in the torch
-    path. SM100/SM103 only, with the default 256x256 tile.
+    path. SM100/SM103 only, with the default 256x256 tile. Needs
+    nvidia-cutlass-dsl >= 4.8.
     """
+    if not hasattr(cutlass, "FloatNV8E5M3FNU"):
+        version = cutedsl_state()[1]
+        found = "unknown version" if version is None else " ".join(version)
+        raise RuntimeError(f"GLU + Hadamard + quant from JAX requires nvidia-cutlass-dsl >= 4.8; found {found}")
     d_quant = _convert_to_cutlass_data_type(d_dtype) is cutlass.Float4E2M1FN
     if rht_rowwise_dtype is not None and rht_colwise_dtype is not None:
         raise ValueError("Request at most one of rht_rowwise_dtype or rht_colwise_dtype")

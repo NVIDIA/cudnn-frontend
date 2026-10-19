@@ -39,6 +39,7 @@ from ..canonical_jax import (
     check_grouped_shapes,
     check_jax_inputs,
     check_packed_sf_size,
+    check_rubin_dsl,
     fp8_dtypes,
     grouped_call,
     output_type,
@@ -362,6 +363,7 @@ validated_configs = set()
 
 def dglu_kernel_type():
     if get_device_type() == "rubin":
+        check_rubin_dsl()
         from .moe_blockscaled_grouped_gemm_dglu_rubin import BlockScaledMoEGroupedGemmDgluKernel
 
         return BlockScaledMoEGroupedGemmDgluKernel
