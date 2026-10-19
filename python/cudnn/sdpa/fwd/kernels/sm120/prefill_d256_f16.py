@@ -252,9 +252,6 @@ class SM120FusedMultiHeadAttentionForward:
         # maps window_right -> is_causal), so the masking sites key off
         # is_causal and add the (compile-time) widening. 0 = plain causal.
         self.window_right = window_size_right if window_size_right is not None else 0
-        # A translated diagonal (bottom-right anchoring or a right band) can
-        # straddle one more KV tile than the tile-aligned top-left one.
-        self.diag_shifted = bottom_right or self.window_right > 0
         self.seq_q_lens_present = seq_q_lens_present
         self.seq_kv_lens_present = seq_kv_lens_present
         self.has_sink = has_sink
@@ -275,6 +272,10 @@ class SM120FusedMultiHeadAttentionForward:
         # stored (G = 6 at 64 rows: 10 tokens, 60 live rows).
         self.live_rows = (q_tile // qh_per_kh) * qh_per_kh if pack_gqa else q_tile
         self.dead_rows = self.live_rows != q_tile
+        # The diagonal can straddle one more KV tile when translated
+        # (bottom-right or a right band) or when Q tiles start off the KV grid.
+        tile_tokens = q_tile // qh_per_kh if pack_gqa else q_tile
+        self.diag_shifted = bottom_right or self.window_right > 0 or (tile_tokens % kv_tile != 0 and kv_tile % tile_tokens != 0)
         # KV split: SPLIT_KV CTAs per (q_tile, batch, head), each covering a
         # contiguous slice of that tile's KV-tile range.  1 = off (folds away).
         self.split_kv = split_kv
@@ -1099,10 +1100,8 @@ class SM120FusedMultiHeadAttentionForward:
         if cutlass.const_expr(self.is_causal):
             mask_steps = ceil_div(self.q_tile // self.qh_per_kh if self.pack_gqa else self.q_tile, self.kv_tile)
             if cutlass.const_expr(self.diag_shifted):
-                # A translated diagonal (bottom-right anchoring or a right
-                # band) can straddle one additional KV tile; the frontier
-                # width itself is R-independent — the band only translates
-                # the diagonal.
+                # A shifted diagonal (see diag_shifted) can straddle one
+                # additional KV tile; the frontier width itself is R-independent.
                 mask_steps = ceil_div((self.q_tile // self.qh_per_kh if self.pack_gqa else self.q_tile) + self.kv_tile - 1, self.kv_tile)
         left_mask_steps = 1
         if cutlass.const_expr(self.window_size_left is not None):

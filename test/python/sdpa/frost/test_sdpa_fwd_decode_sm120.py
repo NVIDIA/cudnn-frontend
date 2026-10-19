@@ -91,6 +91,7 @@ def _decode_case(
     d: int = 128,
     d_v: Optional[int] = None,
     tile_m: int = 16,
+    tile_n: Optional[int] = None,
     pack_gqa: bool = True,
     split_kv: int = 1,
     sink: bool = False,
@@ -137,6 +138,7 @@ def _decode_case(
         seq_kv_lens_present=seq_kv is not None,
         stats_log2=stats_log2,
         tile_m=tile_m,
+        tile_n=tile_n,
         pack_gqa=pack_gqa,
         split_kv=split_kv,
         sched_policy=0,
@@ -481,6 +483,25 @@ def test_prefill_tile_whole_group_pack(d, tile_m, s_q, split):
     over several Q tiles, causal bottom-right; the dead rows must never store."""
     run = _decode_case(24, 4, s_q, 2500, d=d, tile_m=tile_m, split_kv=split, with_lse=True)
     assert run.api.q_tile == tile_m and run.api.pack_gqa
+    _assert_close(run)
+
+
+@requires_blackwell_geforce
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "d,h_q,tile_m,tile_n,split",
+    [
+        (128, 24, 64, 128, 1),  # G=6: the tile at token 120 crosses key 128
+        (128, 20, 128, 64, 1),  # G=5: the tile at token 50 crosses key 64
+        (128, 20, 128, 64, 2),  # one-tile KV splits
+        (256, 24, 64, 64, 1),  # G=6: the tile at token 60 crosses key 64
+        (256, 28, 128, 64, 1),  # G=7: the tile at token 54 crosses key 64
+    ],
+)
+def test_prefill_tile_whole_group_pack_top_left_crosses_kv_tiles(d, h_q, tile_m, tile_n, split):
+    """Top-left causal masks an extra KV tile when packed Q tiles start off the KV grid."""
+    run = _decode_case(h_q, 4, 150, 600, d=d, tile_m=tile_m, tile_n=tile_n, split_kv=split, bottom_right=False, with_lse=True)
+    assert (run.api.q_tile, run.api.kv_tile) == (tile_m, tile_n) and run.api.pack_gqa
     _assert_close(run)
 
 
