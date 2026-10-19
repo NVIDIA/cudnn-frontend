@@ -24,7 +24,7 @@ from .call import (
 )
 from cutlass.jax import TensorSpec
 
-_BSA_EXPORTS = ("block_sparse_attention", "block_sparse_attention_forward", "block_sparse_attention_backward")
+_BSA_EXPORTS = ("block_sparse_attention",)
 
 
 __all__ = [
@@ -37,8 +37,6 @@ __all__ = [
     "zeros_init",
     "neg_inf_init",
     "kimi_delta_attention",
-    "kimi_delta_attention_fwd",
-    "kimi_delta_attention_bwd",
 ]
 
 
@@ -47,7 +45,7 @@ def __getattr__(name):
         value = getattr(import_module("cudnn.block_sparse_attention.jax_api"), name)
         globals()[name] = value
         return value
-    if name in ("kimi_delta_attention", "kimi_delta_attention_fwd", "kimi_delta_attention_bwd"):
+    if name == "kimi_delta_attention":
         from cudnn.linear_attention import jax_api as kda
 
         value = getattr(kda, name)

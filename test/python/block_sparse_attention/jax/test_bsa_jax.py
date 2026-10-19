@@ -133,11 +133,12 @@ import cudnn
 import cudnn.block_sparse_attention as bsa
 import cudnn.jax as cj
 assert "cudnn.block_sparse_attention.jax_api" not in sys.modules
-for name in ("block_sparse_attention", "block_sparse_attention_forward", "block_sparse_attention_backward"):
-    assert callable(getattr(cj, name))
+assert callable(cj.block_sparse_attention)
 import cudnn.ops
-assert cudnn.ops.block_sparse_attention_forward_jax is cj.block_sparse_attention_forward
-assert cudnn.ops.block_sparse_attention_backward_jax is cj.block_sparse_attention_backward
+assert callable(cudnn.ops.block_sparse_attention_forward_jax)
+assert callable(cudnn.ops.block_sparse_attention_backward_jax)
+for name in ("block_sparse_attention_forward", "block_sparse_attention_backward"):
+    assert not hasattr(cj, name)
 assert not hasattr(bsa, "block_sparse_attention")
 assert not hasattr(cudnn.BSA, "block_sparse_attention")
 assert "cudnn.block_sparse_attention.api" not in sys.modules

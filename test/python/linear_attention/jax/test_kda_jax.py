@@ -405,12 +405,15 @@ def test_shape_inference():
     assert residual.checkpoints.dtype == jnp.bfloat16
 
 
-def test_ops_names_alias_jax_names():
+def test_explicit_entries_moved_to_cudnn_ops():
     import cudnn.jax
     import cudnn.ops
 
-    assert cudnn.ops.kimi_delta_attention_forward_jax is cudnn.jax.kimi_delta_attention_fwd
-    assert cudnn.ops.kimi_delta_attention_backward_jax is cudnn.jax.kimi_delta_attention_bwd
+    assert cudnn.ops.kimi_delta_attention_forward_jax is fwd
+    assert cudnn.ops.kimi_delta_attention_backward_jax is bwd
+    for name in ("kimi_delta_attention_fwd", "kimi_delta_attention_bwd"):
+        assert name not in cudnn.jax.__all__
+        assert not hasattr(cudnn.jax, name)
 
 
 def test_helper_types_not_exported():

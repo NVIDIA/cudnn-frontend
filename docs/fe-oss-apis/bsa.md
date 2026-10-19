@@ -42,7 +42,7 @@ environments that force an older DSL.
 
 ```python
 import torch
-from cudnn import (
+from cudnn.ops import (
     block_sparse_attention_forward,
     block_sparse_attention_backward,
     block_sparse_attention_fp8_forward,
@@ -359,7 +359,7 @@ Compilation is lazy. The first call for a new static configuration JIT-compiles
 the relevant kernel; subsequent calls reuse an in-process cache.
 
 The Torch public surface consists of allocating function wrappers under
-`cudnn` and `cudnn.BSA`; there is no separate `APIBase` class or explicit `compile()`
+`cudnn.ops`, also available under `cudnn` and `cudnn.BSA`; there is no separate `APIBase` class or explicit `compile()`
 lifecycle for BSA.
 
 Correctness tests and FP32 references are under
@@ -379,9 +379,7 @@ toward Speed of Light.
 `cudnn.jax.block_sparse_attention` adds first-order reverse-mode differentiation.
 All three accept JAX arrays, eagerly or under `jax.jit`, and require no PyTorch.
 `cudnn.jax.block_sparse_attention_forward` and `cudnn.jax.block_sparse_attention_backward`
-remain as aliases of the `cudnn.ops` functions.
-The existing `cudnn` and `BSA` Torch APIs are unchanged. The former top-level
-`cudnn.*_jax` exports have been removed without compatibility aliases.
+have been removed; use the `cudnn.ops` names.
 
 The JAX implementation reuses the SM100 blk128 forward, bucketed CSR, backward preprocess,
 backward, and gradient conversion kernels. Install `jax[cuda13]` alongside the
