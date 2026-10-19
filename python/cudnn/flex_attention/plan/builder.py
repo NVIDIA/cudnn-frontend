@@ -1140,6 +1140,8 @@ def _build_packed_mask_plan(
     pack_gqa: bool | None = None,
     build_backward: bool = False,
     _fwd_variant: _Sm100FwdVariant | None = None,
+    _deterministic_bwd: bool = False,
+    _shared_runtime_binding: ArbitraryPlanRuntimeBinding | None = None,
 ) -> BlockSparseTensorsTorch:
     """Build the internal consumer-specific packed-mask payloads."""
 
@@ -1161,7 +1163,7 @@ def _build_packed_mask_plan(
         max_seqlen_q,
         max_seqlen_k,
     )
-    runtime_binding = ArbitraryPlanRuntimeBinding.capture(
+    runtime_binding = _shared_runtime_binding or ArbitraryPlanRuntimeBinding.capture(
         is_varlen=metadata["is_varlen"],
         batch_size=metadata["batch_size"],
         seqlen_q=(None if metadata["is_varlen"] else metadata["seqlen_q_fixed"]),
@@ -1197,6 +1199,7 @@ def _build_packed_mask_plan(
                 num_q_heads=q.shape[-2],
                 num_kv_heads=k.shape[-2],
                 is_varlen=metadata["is_varlen"],
+                deterministic=_deterministic_bwd,
             )
             if build_backward
             else None
@@ -2357,12 +2360,32 @@ def create_mask_plan(
         build_backward=build_backward,
         _fwd_variant=_fwd_variant,
     )
-    return MaskPlan(
+    mask_plan = MaskPlan(
         packed_plan=packed_plan,
         geometry=geometry,
         dtype=q.dtype,
         device=q.device,
     )
+    if build_backward and geometry.arch == 90 and q.shape[-1] == v.shape[-1] == 256 and q.shape[-2] == k.shape[-2]:
+        # Preserve the original ordered reduction without rebuilding during
+        # backward or graph capture. Both views own the same prefix geometry.
+        legacy_plan = _build_packed_mask_plan(
+            mask_func,
+            q,
+            k,
+            v,
+            cu_seqlens_q=geometry.cu_seqlens_q,
+            cu_seqlens_k=geometry.cu_seqlens_k,
+            max_seqlen_q=(geometry.max_seqlen_q if geometry.is_varlen else None),
+            max_seqlen_k=(geometry.max_seqlen_k if geometry.is_varlen else None),
+            pack_gqa=pack_gqa,
+            build_backward=True,
+            _fwd_variant=_fwd_variant,
+            _deterministic_bwd=True,
+            _shared_runtime_binding=packed_plan.topology_tensors.runtime_binding,
+        )
+        mask_plan._deterministic_packed_plan = packed_plan._replace(bwd_tensors=legacy_plan.bwd_tensors)
+    return mask_plan
 
 
 __all__ = ["create_mask_plan"]

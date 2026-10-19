@@ -284,10 +284,12 @@ every execution (in-kernel on SM100, and with one stream-ordered memset for the
 SM90 dKV accumulator and for `d_sink` on the routes that accumulate it
 atomically). `execute(q, kv, out, dout, lse, attn_sink, topk_idxs, dq, dkv,
 ..., d_sink=...)` requires caller-provided `dq`, `dkv`, and the keyword-only
-`d_sink` on every
-backend and never allocates or copies during execution; the H128/D576 two-CTA
-plan additionally compiles in `compile()`, while the other routes compile on
-their first execution. The high-level wrapper allocates the outputs and the
+`d_sink` on every backend and never allocates or copies during execution.
+Every SM100 plan compiles its selected ordinary, deterministic, two-CTA, or
+adaptive-pair artifact in `compile()` from storage-free tensor metadata, so
+its first `execute()` performs no CuTe JIT and may be captured directly. The
+SM90 implementation retains its concrete-tensor compile caches and compiles on
+its first execution. The high-level wrapper allocates the outputs and the
 scratch on the launch stream when they are omitted. Inputs, outputs, and the
 live workspace must not alias; concurrent executions need distinct output and
 workspace storage.

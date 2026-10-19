@@ -25,6 +25,73 @@ def _import_bsa():
 
 
 @pytest.mark.L0
+@torch_fork_set_rng(seed=7)
+@pytest.mark.parametrize("seqlen", [33, 64])
+@pytest.mark.parametrize("layout", ["bhsd", "bshd"])
+def test_bsa_sm100_blk64_sum_odo_fp32_product(seqlen, layout):
+    """Casting after O*dO has already lost BF16 product bits needed by dS."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in {10, 11}:
+        pytest.skip("blk64 backward is specific to SM100/SM110")
+
+    from cudnn.frost.buffers import cutedsl_requirement_error
+
+    requirement_error = cutedsl_requirement_error("blk64 backward preprocessing test")
+    if requirement_error is not None:
+        pytest.skip(requirement_error)
+
+    _import_bsa()
+    import cutlass
+    import cutlass.cute as cute
+    from cuda.bindings import driver as cuda
+    from cudnn.block_sparse_attention.csrc.bwd.sm100_blk64.bsa_bwd_sm100 import BlockSparseAttnBackwardSm100Blk64
+    from cudnn.block_sparse_attention.csrc.utils.cute_dsl_utils import to_cute_tensor
+
+    @cute.jit
+    def launch_sum_odo(op: cutlass.Constexpr, out, dout, delta, lse, scaled_lse, stream):
+        n, d, h, b = out.shape
+        op.sum_OdO(
+            cute.group_modes(out, 2, 4),
+            cute.group_modes(dout, 2, 4),
+            cute.group_modes(delta, 1, 3),
+            cute.group_modes(lse, 1, 3),
+            cute.group_modes(scaled_lse, 1, 3),
+            cutlass.Float32(-1.0),
+            cutlass.Float32(-1.4426950408889634),
+            (n, n, d, (h, b)),
+        ).launch(
+            grid=(cute.ceil_div(n, op.sum_OdO_block_q), h, b),
+            block=(op.sum_OdO_num_threads_d, op.sum_OdO_num_threads_q, 1),
+            stream=stream,
+        )
+
+    batch, heads, dim = 2, 3, 128
+    out = torch.randn((batch, heads, seqlen, dim), device="cuda", dtype=torch.bfloat16)
+    dout = torch.randn_like(out)
+    # 1.0625 is exactly BF16, but its square 1.12890625 is not.
+    out[:, :, 0, :] = 1.0625
+    dout[:, :, 0, :] = 1.0625
+    if layout == "bshd":
+        out, dout = (tensor.transpose(1, 2).contiguous().transpose(1, 2) for tensor in (out, dout))
+    lse = torch.randn((batch, heads, seqlen), device="cuda", dtype=torch.float32)
+    delta = torch.full_like(lse, torch.nan)
+    scaled_lse = torch.full_like(lse, torch.nan)
+    operands = [out.permute(2, 3, 1, 0), dout.permute(2, 3, 1, 0)]
+    operands += [tensor.permute(2, 1, 0) for tensor in (delta, lse, scaled_lse)]
+    compiled = cute.compile(
+        launch_sum_odo,
+        BlockSparseAttnBackwardSm100Blk64(64, False),
+        *[to_cute_tensor(tensor, leading_dim=1 if i < 2 else 0) for i, tensor in enumerate(operands)],
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+        options="--enable-tvm-ffi",
+    )
+    compiled(*operands, cuda.CUstream(torch.cuda.current_stream().cuda_stream))
+
+    reference = -(out.double() * dout.double()).sum(dim=-1)
+    torch.testing.assert_close(delta.double(), reference, atol=2e-5, rtol=1e-6)
+    torch.testing.assert_close(scaled_lse, lse * -1.4426950408889634, atol=0, rtol=0)
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=2)
 def test_bsa_attention_backward_fixed_blocks():
     BSA = _import_bsa()
