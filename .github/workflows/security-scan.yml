@@ -77,3 +77,5 @@ jobs:
         uses: actions/dependency-review-action@v5
         with:
           config-file: ./.github/dependency-review-config.yml
+          base-ref: ${{ github.event_name == 'push' && github.event.before || '' }}
+          head-ref: ${{ github.event_name == 'push' && github.sha || '' }}
