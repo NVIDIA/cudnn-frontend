@@ -280,7 +280,7 @@ def test_unmasked_only_row_is_expressible_and_declines_every_mask(kind):
     assert probe(caps, legal_facts(kind, caps, s_kv=64, **band_right(4))) == band.feature_reason(band.LABEL_RIGHT_FINITE)
     assert probe(caps, legal_facts(kind, caps, s_kv=64, **band_window(3))) == band.REASON_LEFT_WINDOW
     assert probe(caps, legal_facts(kind, caps, s_kv=64, **band_causal_bottom_right())) == band.feature_reason(band.LABEL_RIGHT_CAUSAL)
-    # A causal-only row (the other restricted shape) is expressible as well.
+    # A causal-and-unmasked row (the other restricted shape) is expressible as well.
     causal_only = dataclasses.replace(
         spec.capabilities,
         causal=True,

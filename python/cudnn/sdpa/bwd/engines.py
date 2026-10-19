@@ -257,7 +257,8 @@ class Capabilities:
     # model the probe decides with.  APPENDED at the end for the append-only
     # contract; ``None`` means "derive from the legacy flags above", and a row
     # needing a restricted claim passes an explicit BandSupport (the MXFP8
-    # backward row's causal-only claim is the in-tree example).  __post_init__
+    # backward row's legacy ``causal=True`` already derives the restricted
+    # causal-and-unmasked set, ``BandSupport.causal_and_unmasked()``).  __post_init__
     # resolves it, so ``capabilities.band`` is never None after construction,
     # and a legacy flag that is SET outside an explicit claim is refused there.
     band: Optional["band.BandSupport"] = None
