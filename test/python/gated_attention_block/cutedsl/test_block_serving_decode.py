@@ -572,6 +572,8 @@ def test_the_envelope_on_a_rubin_reading_serves_the_decode_form_and_names_every_
     # the programmatic-dependent-launch readbacks: the switched stage kinds per form, stage (4) on a decode-tile route only
     assert d.pdl_stages == ("qk_norm_rope", "cache_write", "sigmoid_gate", "sdpa") and env.extend.pdl_stages == ("qk_norm_rope", "cache_write", "sigmoid_gate")
     assert all(r.pdl_capable is r.decode_tile for r in d.routes) and d.route(1).pdl_capable and not d.route(33).pdl_capable
+    # the AUTO reading of the switch on this part (a Rubin reading): on; off on every other part
+    assert d.pdl_default is True and GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, _DEV, device_cc=(10, 0)).decode.pdl_default is False
     g16, _ = _geom(16)
     e16 = GatedAttentionBlockFwd.serving_envelope(g16, torch.bfloat16, _DEV, device_cc=_SM107).decode
     assert e16.route(4).pdl_capable and not e16.route(5, batch=32).pdl_capable and e16.route(5, batch=32).prefill_tile and e16.route(9).pdl_capable
@@ -611,6 +613,7 @@ def test_the_envelope_declines_every_other_part_without_raising(cc, match):
     env = GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, "cpu" if cc is None else _DEV, device_cc=cc)
     assert not env.decode.served and not env.extend.served and env.forms == () and match in env.decode.reason and match in env.extend.reason
     assert env.decode.routes  # the routes are geometry facts, listed either way
+    assert env.decode.pdl_default is False  # the PDL default is the measured part's
 
 
 def test_every_static_decline_of_the_decode_declaration_is_predicted_by_the_envelope(monkeypatch):
@@ -791,10 +794,18 @@ def test_declaration_facts(group, s_q):
         assert (blk._sdpa.num_sequences, blk._sdpa.max_seq_len, blk._sdpa.cu_seqlens) == (4, s_q, False)
     names = [st.name for st in blk._stages]
     # C0: at decode row counts (B x S_q = 4 x s_q <= 128) the declaration fuse_norm_rope=True LOWERS stage (1) to the unfused chain --
-    # the slab GEMM, the norm + RoPE pass, the SEPARATE cache write (no write-through arm to fold into) -- and reads it back
+    # the slab GEMM, the norm + RoPE pass with the paged write-through folded in (fuse_cache_write_small_m's default below 128 rows: the
+    # separate cache-write stage is not built) -- and reads it back; fuse_cache_write_small_m=False keeps the separate launch
     assert blk.fuse_norm_rope and not blk.fuse_norm_rope_effective and blk.small_m_decode and blk.fuse_norm_rope_small_m is None
-    assert not blk.cache_write_fused and isinstance(blk._cache_write, _CacheWrite) and blk._norm_rope is not None
-    assert names == ["qkv_gate_proj", "qk_norm_rope", "cache_write", "sdpa"] + ([] if blk.gate_fused else ["sigmoid_gate"]) + ["out_proj"], names
+    assert not blk.cache_write_fused and blk.cache_write_in_norm_rope and blk._cache_write is None and blk._norm_rope is not None
+    assert names == ["qkv_gate_proj", "qk_norm_rope", "sdpa"] + ([] if blk.gate_fused else ["sigmoid_gate"]) + ["out_proj"], names
+    sep, _ = _make_block(
+        group, 4, s_q, fuse_gate=True, fuse_norm_rope=True, decode_split_kv=None if torch.cuda.is_available() else 2, fuse_cache_write_small_m=False
+    )
+    assert not sep.cache_write_in_norm_rope and isinstance(sep._cache_write, _CacheWrite) and sep.gate_fused is blk.gate_fused
+    assert [st.name for st in sep._stages] == ["qkv_gate_proj", "qk_norm_rope", "cache_write", "sdpa"] + ([] if sep.gate_fused else ["sigmoid_gate"]) + [
+        "out_proj"
+    ]
     # the A/B's control arm: fuse_norm_rope_small_m=True keeps the fused fork, the write-through FOLDED into its epilogue under AUTO
     blk_f, _ = _make_block(
         group, 4, s_q, fuse_gate=True, fuse_norm_rope=True, decode_split_kv=None if torch.cuda.is_available() else 2, fuse_norm_rope_small_m=True
@@ -834,13 +845,13 @@ def test_declaration_facts(group, s_q):
     if r.decode_tile:
         # an unsplit decode tile: the gate is its own launch
         assert blk1.decode_split_kv == 1 and not blk1.gate_fused and isinstance(blk1._gate, _SigmoidGate) and not blk1._sdpa.fuse_gate
-        assert [st.name for st in blk1._stages] == ["qkv_gate_proj", "qk_norm_rope", "cache_write", "sdpa", "sigmoid_gate", "out_proj"]
+        assert [st.name for st in blk1._stages] == ["qkv_gate_proj", "qk_norm_rope", "sdpa", "sigmoid_gate", "out_proj"]
         blk4, _ = _make_block(group, 4, s_q, fuse_gate=False, decode_split_kv=4)
         assert blk4.decode_split_kv == 4 and blk4._sdpa.decode_split_kv == 4 and not blk4.gate_fused
     else:
         # the prefill route runs unsplit with the gate in the body; a pinned split is the decode tile's and a typed decline here
         assert blk1.decode_split_kv == 1 and blk1.gate_fused and blk1._gate is None and blk1._sdpa.fuse_gate
-        assert [st.name for st in blk1._stages] == ["qkv_gate_proj", "qk_norm_rope", "cache_write", "sdpa", "out_proj"]
+        assert [st.name for st in blk1._stages] == ["qkv_gate_proj", "qk_norm_rope", "sdpa", "out_proj"]
         with pytest.raises(NotImplementedError, match="prefill route.*unsplit"):
             _make_block(group, 4, s_q, fuse_gate=False, decode_split_kv=4)
 
@@ -1268,7 +1279,7 @@ def test_the_fused_fork_control_arm_matches_the_oracle_at_decode_row_counts(s_q)
     dflt = _std_case(12, s_q)
     assert ctl.blk.fuse_norm_rope_effective and ctl.blk.cache_write_fused and not dflt.blk.fuse_norm_rope_effective and not dflt.blk.cache_write_fused
     assert [st.name for st in ctl.blk._stages] == ["qkv_gate_proj_norm_rope", "sdpa", "out_proj"]
-    assert [st.name for st in dflt.blk._stages] == ["qkv_gate_proj", "qk_norm_rope", "cache_write", "sdpa", "out_proj"]
+    assert [st.name for st in dflt.blk._stages] == ["qkv_gate_proj", "qk_norm_rope", "sdpa", "out_proj"]  # the write-through in the norm + RoPE launch
     a = ctl.run().clone()
     b = dflt.run().clone()
     ctl.check_against_oracle(a, what="the fused fork (control)")
@@ -1790,10 +1801,11 @@ def test_capture_of_the_first_execute_replays_bitwise_and_takes_new_lengths_tabl
 
 
 @requires_rubin
-def test_capture_of_the_first_execute_replays_bitwise_with_the_write_through_in_the_norm_rope_launch():
-    """The same cell with the paged write-through folded into the norm + RoPE launch (``fuse_cache_write_small_m=True``): the arm's slot
-    loads and pool stores are device-side like the separate kernel's, so the first execute captures with no host sync and replays bitwise."""
-    _capture_replay_cell(fuse_cache_write_small_m=True)
+def test_capture_of_the_first_execute_replays_bitwise_on_the_plain_chain_with_the_separate_cache_write():
+    """The same cell on the chain as before (``use_pdl=False``, the separate cache-write launch).  The default cell above runs the PDL
+    chain with the paged write-through folded into the norm + RoPE launch (the arm's slot loads and pool stores are device-side like the
+    separate kernel's), so the two cells together capture both chains with no host sync and replay bitwise."""
+    _capture_replay_cell(use_pdl=False, fuse_cache_write_small_m=False)
 
 
 # ---------------------------------------------------------------------------
@@ -2102,48 +2114,72 @@ def test_the_write_through_in_the_norm_rope_launch_drops_the_cache_write_launch_
     assert torch.equal(_bits(cells[True].k_cache), _bits(cells[False].k_cache)) and torch.equal(_bits(cells[True].v_cache), _bits(cells[False].v_cache))
 
 
-def test_fuse_cache_write_small_m_rows_are_typed_and_the_arm_owns_the_write(monkeypatch):
-    """``fuse_cache_write_small_m`` (appended; None = AUTO): where the paged write-through runs on the DECODE form's unfused chain.  AUTO =
-    the environment switch when set, else the separate launch; True folds it into the norm + RoPE launch (the stage carries the page size,
-    the separate stage is not built, the stage list loses ``cache_write``); False = the separate launch; the C0-lowered ``fuse_norm_rope=True``
-    declaration and f16 pools take the arm too; the typed declines (the fused fork, a self block, a non-bool); the carve does not read it."""
-    from cudnn.gated_attention_block.api import CACHE_WRITE_SMALL_M_ENV, CACHE_WRITE_SMALL_M_MODES
+def test_fuse_cache_write_small_m_resolves_the_measured_rule_by_default_and_the_arm_owns_the_write():
+    """``fuse_cache_write_small_m`` (appended; None = AUTO): where the paged write-through runs on the DECODE form's unfused chain.  AUTO is
+    the MEASURED rule (``CACHE_WRITE_SMALL_M_DEFAULT_MAX_ROWS``): the write-through folds into the norm + RoPE launch (the stage carries the
+    page size, the separate stage is not built, the stage list loses ``cache_write``) at ``B x S_q < 128`` rows and at ``S_q = 1`` at any
+    batch; the separate launch runs at ``B x S_q >= 128`` with ``S_q > 1`` (where the arm measured slower) -- both edges pinned, an explicit
+    True / False winning on either side; the C0-lowered ``fuse_norm_rope=True`` declaration follows the same rule where it lowers and leaves
+    the fork its own write-through past the bound; f16 pools take the arm; the typed declines (the fused fork, a self block, a non-bool); the
+    carve does not read it."""
+    from cudnn.gated_attention_block import CACHE_WRITE_SMALL_M_DEFAULT_MAX_ROWS
 
-    assert CACHE_WRITE_SMALL_M_MODES == ("launch", "norm_rope")
-    monkeypatch.delenv(CACHE_WRITE_SMALL_M_ENV, raising=False)
-    at = lambda **kw: _make_block(12, 1, 1, **kw)[0]  # noqa: E731
+    assert CACHE_WRITE_SMALL_M_DEFAULT_MAX_ROWS == 128
+    at = lambda b=1, s_q=1, **kw: _make_block(12, b, s_q, **kw)[0]  # noqa: E731
     names = lambda blk: [st.name for st in blk._stages]  # noqa: E731
     auto = at()
-    assert auto.fuse_cache_write_small_m is None and auto.cache_write_in_norm_rope is False and isinstance(auto._cache_write, _CacheWrite)
-    assert auto._norm_rope.page_size == 0 and "cache_write" in names(auto)
+    assert auto.fuse_cache_write_small_m is None and auto.cache_write_in_norm_rope is True and auto._cache_write is None
+    assert auto._norm_rope.page_size == 16 and "cache_write" not in names(auto) and "qk_norm_rope" in names(auto)
+    sep = at(fuse_cache_write_small_m=False)
+    assert sep.fuse_cache_write_small_m is False and sep.cache_write_in_norm_rope is False and isinstance(sep._cache_write, _CacheWrite)
+    assert sep._norm_rope.page_size == 0 and "cache_write" in names(sep)
+    assert names(auto) == [n for n in names(sep) if n != "cache_write"], "the arm drops exactly the cache-write stage"
     on = at(fuse_cache_write_small_m=True)
-    assert on.fuse_cache_write_small_m is True and on.cache_write_in_norm_rope is True and on._cache_write is None
-    assert on._norm_rope.page_size == 16 and "cache_write" not in names(on) and "qk_norm_rope" in names(on)
-    assert names(on) == [n for n in names(auto) if n != "cache_write"], "the arm drops exactly the cache-write stage"
-    assert at(fuse_cache_write_small_m=False).cache_write_in_norm_rope is False
-    low = at(fuse_norm_rope=True, fuse_cache_write_small_m=True)  # the C0 lowering: the unfused chain at decode row counts
+    assert on.fuse_cache_write_small_m is True and on.cache_write_in_norm_rope is True and on._cache_write is None and names(on) == names(auto)
+    # the measured rule at its edges on the unfused chain (fuse_norm_rope=False: declared unfused at any row count, so the rule alone
+    # decides): every B 1 .. 4 cell and S_q = 1 at any batch fold in; 128 rows with S_q > 1 do not (B 32 x 4 = the measured loss), 127 do
+    cells = (
+        ((1, 1), True),
+        ((4, 4), True),
+        ((1, 32), True),
+        ((32, 1), True),
+        ((127, 1), True),
+        ((128, 1), True),
+        ((129, 1), True),
+        ((31, 4), True),
+        ((63, 2), True),
+        ((32, 4), False),
+        ((64, 2), False),
+        ((16, 8), False),
+        ((128, 4), False),
+    )
+    for (b, s_q), want in cells:
+        blk = at(b, s_q, fuse_norm_rope=False)
+        assert blk.fuse_cache_write_small_m is None and blk.cache_write_in_norm_rope is want and (blk._cache_write is None) is want, (b, s_q)
+        assert ("cache_write" in names(blk)) is (not want) and blk._norm_rope.page_size == (16 if want else 0), (b, s_q)
+        # an explicit value wins on either side of the rule
+        assert at(b, s_q, fuse_norm_rope=False, fuse_cache_write_small_m=True).cache_write_in_norm_rope is True, (b, s_q)
+        assert at(b, s_q, fuse_norm_rope=False, fuse_cache_write_small_m=False).cache_write_in_norm_rope is False, (b, s_q)
+    # the default serving declaration (fuse_norm_rope=True): the C0 lowering runs the unfused chain to 128 rows -- the rule applies there
+    # (16 rows fold in, 128 rows with S_q 4 keep the separate launch) -- and the fused fork past it, which owns the write-through itself
+    low = at(4, 4, fuse_norm_rope=True)
     assert low.small_m_decode and not low.fuse_norm_rope_effective and low.cache_write_in_norm_rope and low._cache_write is None
-    assert at(dtype=torch.float16, fuse_cache_write_small_m=True).cache_write_in_norm_rope is True
-    assert auto._layout() == on._layout(), "the carve does not read the knob"
-    # the environment is the AUTO reading's switch; an explicit value outranks it
-    monkeypatch.setenv(CACHE_WRITE_SMALL_M_ENV, "norm_rope")
-    assert at().cache_write_in_norm_rope is True and at(fuse_cache_write_small_m=False).cache_write_in_norm_rope is False
-    monkeypatch.setenv(CACHE_WRITE_SMALL_M_ENV, "launch")
-    assert at().cache_write_in_norm_rope is False and at(fuse_cache_write_small_m=True).cache_write_in_norm_rope is True
-    monkeypatch.setenv(CACHE_WRITE_SMALL_M_ENV, "bogus")
-    with pytest.raises(ValueError, match=CACHE_WRITE_SMALL_M_ENV):
-        at()
-    monkeypatch.delenv(CACHE_WRITE_SMALL_M_ENV)
+    edge = at(32, 4, fuse_norm_rope=True)
+    assert edge.small_m_decode and not edge.fuse_norm_rope_effective and not edge.cache_write_in_norm_rope and isinstance(edge._cache_write, _CacheWrite)
+    high = at(129, 1, fuse_norm_rope=True)
+    assert (
+        not high.small_m_decode and high.fuse_norm_rope_effective and high.cache_write_fused and not high.cache_write_in_norm_rope and high._norm_rope is None
+    )
+    assert at(dtype=torch.float16).cache_write_in_norm_rope is True
+    assert auto._layout() == sep._layout(), "the carve does not read the knob"
     # the typed declines
     with pytest.raises(TypeError, match="fuse_cache_write_small_m must be None"):
         at(fuse_cache_write_small_m=1)
     with pytest.raises(NotImplementedError, match="fused projection fork"):
         at(fuse_norm_rope=True, fuse_norm_rope_small_m=True, fuse_cache_write_small_m=True)
-    # under AUTO the fork keeps its own write-through and the environment asks for nothing it cannot have
-    monkeypatch.setenv(CACHE_WRITE_SMALL_M_ENV, "norm_rope")
+    # under AUTO the fork keeps its own write-through (the arm reads False, never a decline)
     fork = at(fuse_norm_rope=True, fuse_norm_rope_small_m=True)
     assert fork.cache_write_in_norm_rope is False and fork.cache_write_fused and fork._norm_rope is None
-    monkeypatch.delenv(CACHE_WRITE_SMALL_M_ENV)
     geom, _ = _geom(12)
     mk = lambda *shape: torch.empty(*shape, dtype=torch.bfloat16, device=_DEV)  # noqa: E731
     with pytest.raises(NotImplementedError, match="needs paged_kv_page_size > 0"):

@@ -70,7 +70,7 @@ row's and discarded: the warp collectives stay unconditional, nothing of it is s
 tile is normed and rotated as before.  Every K / V row then goes to ``pool[slot //
 page_size, head, slot % page_size, :]`` at ``slot = slot_mapping[token]`` from the SAME
 lanes, 32 lanes x 16 B ``st.global.v4`` per 512-B row: the K words are the bf16 pair-rounds
-(``cvt.rn.bf16x2.f32``) of the very fp32 this lane hands ``sOut[s]`` -- the vector store's
+(``cvt.rn.bf16x2.f32``) of the very fp32 this thread hands ``sOut[s]`` -- the vector store's
 own rounding, so the pool row is the slab row, bitwise -- and the V words are the 16 B TMA
 laid into ``sIn[s]`` (``ld.shared.v4``: a bit copy, no cast).  The predicate is
 ``cache_write.py``'s, verbatim: the row's token inside ``T`` (TMA zero-filled the band's
@@ -836,9 +836,9 @@ def qk_norm_rope_tma_body(
             else:
                 sOut_raw.store(cutlass.Vector.from_elements(tuple(ys), cutlass.Float32).to(io_dtype), off_out, vector_size=ELEMS_PER_ACCESS, alignment=16)
             if cutlass.const_expr(pool_write):
-                # The paged write of this row (K and V tiles; a Q tile's row is dead by the predicate): this lane's 16 B to
+                # The paged write of this row (K and V tiles; a Q tile's row is dead by the predicate): this thread's 16 B to
                 # pool[page, head, off, lane*8 : +8] at slot = slot_mapping[token], page = slot // page_size, off = slot % page_size.
-                # The K words are the bf16 pair-rounds of the very fp32 this lane just handed sOut[s] (cvt.rn.bf16x2.f32 == the
+                # The K words are the bf16 pair-rounds of the very fp32 this thread just handed sOut[s] (cvt.rn.bf16x2.f32 == the
                 # vector store's rounding: the pool row is the slab row, bitwise); the V words are the 16 B TMA laid into sIn[s]
                 # (ld.shared.v4: a bit copy).  Everything is formed unconditionally and the band SELECTS -- no assignment inside a
                 # dynamic branch (the DSL joins such a name as None on the other path), only the store is predicated, cache_write.py's

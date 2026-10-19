@@ -612,14 +612,6 @@ DECODE_ROUTE_POLICIES = (DECODE_ROUTE_SINGLE_UNIT, DECODE_ROUTE_TOKEN_UNITS)
 DEFAULT_DECODE_ROUTE_POLICY = DECODE_ROUTE_SINGLE_UNIT
 
 DECODE_PDL_STAGES = ("qk_norm_rope", "cache_write", "sigmoid_gate", "sdpa")
-# Where the paged KV-cache write-through runs on the UNFUSED chain at decode row counts (`fuse_cache_write_small_m`; the constructor's
-# note): "launch" = the separate cache-write kernel after the norm + RoPE pass (the chain as measured), "norm_rope" = folded INTO the
-# norm + RoPE launch (kernels/qk_norm_rope_tma.py, the pool-write arm: the V band copied and the post-RoPE K / V rows written to the
-# pools from the same tiles -- one launch fewer, the pools bitwise the separate write).  The AUTO reading (None) is the environment
-# variable CACHE_WRITE_SMALL_M_ENV when set (the A/B switch of a serving chain that declares through the block), else "launch" until the
-# arm is measured on the perf node; the knob is performance-only (the same bytes land in the pools and the slab either way).
-CACHE_WRITE_SMALL_M_MODES = ("launch", "norm_rope")
-CACHE_WRITE_SMALL_M_ENV = "CUDNN_FRONTEND_BLOCK_CACHE_WRITE_SMALL_M"
 """The DECODE form's stages that take the ``use_pdl`` switch (by stage name): the norm + RoPE pass (the unfused chain), the separate
 cache write, the sigmoid gate when it is its own launch, and stage (4) on a DECODE-TILE route only (``DecodeRoute.pdl_capable``: the
 tile and its split combine carry the griddepcontrol pair; the prefill route's paged d256 prefill tile does not and launches plain --
@@ -630,6 +622,28 @@ whether every switched stage took it; ``DecodeEnvelope.pdl_stages`` carries this
 EXTEND_PDL_STAGES = ("qk_norm_rope", "cache_write", "sigmoid_gate")
 """The EXTEND form's stages that take the switch: stage (4), the paged d256 prefill tile, carries no sites and launches plain (the
 link serializes; the chain stays correct); ``ExtendEnvelope.pdl_stages`` carries this tuple."""
+
+DECODE_PDL_DEFAULT_CCS: Tuple[Tuple[int, int], ...] = ((10, 7),)
+"""The parts on which the AUTO reading of ``use_pdl`` (``None``, the default) resolves True on the dense DECODE form's decode-tile
+routes for the bf16 / f16 block (no ``quant``, no e4m3 cache, no ``QsaSpec``): programmatic dependent launch over the block's own chain
+-- the norm + RoPE pass, the separate cache write, the decode tile and its split combine.  Measured on a 212-SM cc 10.7 part as a
+1.1-1.5 us saving per decode step at B 1 (B 1 x KV 4K: +5.0 %, 32K +4.0 %, 128K +2.5 %; +2.8 % geomean over the B 1 .. 4 cells) and flat
+within the control pair where the tile dominates, no cell losing beyond its pair; every ``griddepcontrol`` site of the chain audited
+(each role's first dependent read behind its own wait, no global write above a wait, every release after its kernel's wait).  Every
+other part keeps False until measured there; an explicit ``use_pdl=True`` / ``False`` is honoured on every part.  The FROST GEMM stages
+(the slab GEMM, the out projection, its split-K reducer) launch with the attribute regardless of the switch (their templates' own
+constant) and are neither listed by ``pdl_stages`` nor counted by ``use_pdl_effective``."""
+
+CACHE_WRITE_SMALL_M_DEFAULT_MAX_ROWS = 128
+"""The AUTO reading of ``fuse_cache_write_small_m`` (``None``, the default) folds the paged K / V write-through into the norm + RoPE
+launch (``kernels/qk_norm_rope_tma.py``'s pool-write arm: one launch fewer, the pools bitwise the separate write) wherever the arm is
+served and the step's token rows ``T = B x S_q`` are below this bound OR ``S_q == 1`` (a one-token-per-sequence step at any batch); at
+``T >= 128`` with ``S_q > 1`` the separate cache-write launch runs (the chain as before).  The rule is the measurement on a 212-SM cc 10.7
+part: the arm wins on every B 1 .. 4 cell (+1.1 .. +3.2 % per decode step on the plain chain, +2.4 .. +4.9 % with PDL on; B 1 x KV 4K
+32.2 -> 31.4 us), at B 32 x S_q 1 and B 128 x S_q 1 (the PDL + write-through step +6.9 % / +2.5 % against +2.2 % / +1.8 % from PDL alone),
+and loses 0.7-2.7 us per step at B 32 .. 128 x S_q 4 (128-512 rows), where the per-row pool write inside the norm + RoPE kernel costs more
+than the write kernel it replaces.  Performance-only (the same bytes land in the pools and the slab either way); an explicit ``True`` /
+``False`` is honoured wherever the arm is served."""
 
 
 def _resolve_decode_route_policy(policy: Optional[str]) -> str:
@@ -938,6 +952,10 @@ class DecodeEnvelope:
     # appended (2026-10-15): the stage kinds that take the ``use_pdl`` switch on this form (:data:`DECODE_PDL_STAGES`; stage (4) on a
     # decode-tile route only -- ``DecodeRoute.pdl_capable`` per route); empty under ``sparse_core`` (the switch is a typed decline there).
     pdl_stages: Tuple[str, ...] = ()
+    # appended (2026-10-19): the AUTO reading of ``use_pdl`` (None) on THIS part for the form -- True on the parts of :data:`DECODE_PDL_DEFAULT_CCS`
+    # for the bf16 / f16 block over pools in the activation dtype (stage (4) takes it on a decode-tile route, ``routes[i].pdl_capable``; a
+    # prefill-route step and an e4m3 cache resolve False), False elsewhere and under ``sparse_core``.  An explicit ``use_pdl`` outranks it.
+    pdl_default: bool = False
 
 
 @dataclass(frozen=True)
@@ -6370,9 +6388,13 @@ class GatedAttentionBlockFwd(APIBase):
     names the kernel per ``(group, S_q)``; a wider dense step is a typed decline -- the EXTEND form's packed business) -- so
     the pipeline is ``(1)+(2)+(3) -> (4w) -> (4) [+ combine] -> (5) -> (6)``, five launches with ``fuse_norm_rope`` -- past decode row
     counts: at ``B x S_q <= 128`` (``kernels.proj_gemm.SMALL_M_MAX``) the declaration LOWERS stage (1) to the unfused chain, ``(1) -> (2)+(3)
-    -> (4w) -> (4) [+ combine] -> (5) -> (6)`` (the small-M route's slab GEMM, the norm + RoPE pass, the separate cache write: the measured
-    faster step; ``fuse_norm_rope_effective`` reads it back, ``fuse_norm_rope_small_m=True`` keeps the fused fork for the A/B, as does an
-    explicit ``fuse_cache_write=True`` -- the write-through arm lives in the fork and the request outranks the lowering).
+    -> (4w) -> (4) [+ combine] -> (5) -> (6)`` (the small-M route's slab GEMM, the norm + RoPE pass with the paged write-through folded in
+    -- ``fuse_cache_write_small_m``, by default below :data:`CACHE_WRITE_SMALL_M_DEFAULT_MAX_ROWS` rows or at ``S_q = 1``, the separate
+    cache write past it --: the measured faster step; ``fuse_norm_rope_effective`` / ``cache_write_in_norm_rope`` read it back,
+    ``fuse_norm_rope_small_m=True`` keeps the fused fork for the A/B, as does an explicit ``fuse_cache_write=True`` -- the write-through arm
+    lives in the fork and the request outranks the lowering).  Programmatic dependent launch is the form's default on its decode-tile routes
+    on cc 10.7 (``use_pdl=None`` -> True, :data:`DECODE_PDL_DEFAULT_CCS`; ``use_pdl=False`` the plain chain): the norm + RoPE pass, the tile
+    and its combine launch with the attribute, the FROST GEMM stages do regardless; ``pdl_stages`` / ``use_pdl_effective`` read it back.
     ``fuse_gate`` then rides the split COMBINE on the decode tile (``gate_fused``; the tile has no gate seams, the combine
     multiplies the merged fp32 value by ``sigmoid(G)`` before the single cast) and is its own launch on an unsplit tile.
     The pools' and the table's strides are the same declaration samples as the EXTEND form's (a row-sliced table at any row
@@ -6601,23 +6623,28 @@ class GatedAttentionBlockFwd(APIBase):
         # (the same function under every width -- the SDPA suite's cross-form bitwise pins); `DecodeRoute.q_tile_max` reads it back and
         # the stage hands it to the adapter so the compiled width is the declared one.  Module docstring, "The DECODE form".
         decode_q_tile_max: Optional[int] = None,
-        # APPENDED (MEASUREMENT PROTOTYPE, performance-only): programmatic dependent launch over the block's own launch chain.  True launches
-        # the norm + RoPE, cache-write, sigmoid-gate, d256 decode-tile and split-combine kernels with the programmatic-stream-serialization
-        # attribute and traces their griddepcontrol pair (a wait before the first global read of a predecessor's output, a release after the
-        # prologue); the FROST GEMM templates already launch that way (their module constant USE_PDL).  The same kernels, the same math:
-        # `out` is BITWISE the use_pdl=False block's, eagerly and under CUDA-graph capture.  Served for the bf16 / f16 block (no quant, no e4m3
-        # KV cache, no QsaSpec: a typed decline).  A PER-STAGE fact (2026-10-15): a stage whose kernel carries no sites -- the paged d256
-        # prefill tile of the DECODE form's prefill route and of the EXTEND form, the dense prefill tiles under kv_source="self" -- launches
-        # plain and the link serializes there (correct by PDL's semantics: its successor's wait blocks on full completion); the switch is
-        # never forwarded to such a kernel.  `pdl_stages` reads back the stages launching with the attribute, `use_pdl_effective` whether
-        # every switched stage of the chain does; `DecodeRoute.pdl_capable`, `DecodeEnvelope.pdl_stages` and `ExtendEnvelope.pdl_stages`
-        # say so before anything is declared.
-        use_pdl: bool = False,
+        # APPENDED (performance-only): programmatic dependent launch over the block's own launch chain.  None = AUTO (2026-10-19): True on the
+        # dense DECODE form's decode-tile routes for the bf16 / f16 block on the parts of DECODE_PDL_DEFAULT_CCS (cc 10.7, where the default
+        # was measured: 1.1-1.5 us per decode step at B 1, no cell losing beyond its control pair), False everywhere else -- the EXTEND form,
+        # kv_source="self", the DECODE form's prefill route, every other part -- until measured there; `use_pdl_requested` keeps the value as
+        # declared, `use_pdl` the resolved one.  True launches the norm + RoPE, cache-write, sigmoid-gate, d256 decode-tile and split-combine
+        # kernels with the programmatic-stream-serialization attribute and traces their griddepcontrol pair (a wait before the first global
+        # read of a predecessor's output, a release after the prologue); False is the plain chain on every part.  The FROST GEMM templates
+        # launch with the attribute regardless (their module constant USE_PDL).  The same kernels, the same math: `out` is BITWISE the
+        # use_pdl=False block's, eagerly and under CUDA-graph capture.  An explicit True is served for the bf16 / f16 block only (no quant, no
+        # e4m3 KV cache, no QsaSpec: a typed decline); AUTO reads False on those pipelines.  A PER-STAGE fact (2026-10-15): a stage whose
+        # kernel carries no sites -- the paged d256 prefill tile of the DECODE form's prefill route and of the EXTEND form, the dense prefill
+        # tiles under kv_source="self" -- launches plain and the link serializes there (correct by PDL's semantics: its successor's wait
+        # blocks on full completion); the switch is never forwarded to such a kernel.  `pdl_stages` reads back the stages launching with the
+        # attribute, `use_pdl_effective` whether every switched stage of the chain does; `DecodeRoute.pdl_capable`, `DecodeEnvelope.pdl_stages`
+        # / `.pdl_default` and `ExtendEnvelope.pdl_stages` say so before anything is declared.
+        use_pdl: Optional[bool] = None,
         # APPENDED (2026-10-15; the DECODE form only; performance-only): WHETHER the fused norm + RoPE projection runs at DECODE ROW COUNTS
         # (T = B x S_q <= kernels.proj_gemm.SMALL_M_MAX = 128 on the dense DECODE form, bf16 / f16, no indexer band, 16-bit pools) when
         # fuse_norm_rope=True.  None = AUTO = False: stage (1) is LOWERED to the unfused chain there -- the small-M route's slab GEMM, the
-        # norm + RoPE pass, the separate cache write (seven launches with the split combine) -- because the 256-wide fused fork pads one
-        # token tile and streams its weight at a fraction of the machine (the measured "route + unfused" step is the faster one at B 1 ..
+        # norm + RoPE pass with the cache write folded in (`fuse_cache_write_small_m`'s default; six launches with the split combine) --
+        # because the 256-wide fused fork pads one token tile and streams its weight at a fraction of the machine (the measured "route +
+        # unfused" step is the faster one at B 1 ..
         # 32), unless an explicit fuse_cache_write=True asks for the fork's write-through arm (the request outranks the lowering);
         # True = the fused fork as declared (the former behaviour; the A/B's control arm).  `fuse_norm_rope` stays what was declared,
         # `fuse_norm_rope_effective` reads back what runs (`cache_write_fused` follows it: the write-through arm lives in the fork).  Refused
@@ -6625,8 +6652,9 @@ class GatedAttentionBlockFwd(APIBase):
         fuse_norm_rope_small_m: Optional[bool] = None,
         # APPENDED (2026-10-16; the DECODE form's unfused chain; performance-only): WHERE the paged KV-cache write-through runs when stage (1)
         # is the unfused chain at decode row counts (the C0 lowering above, or fuse_norm_rope=False) on the dense DECODE form, bf16 / f16,
-        # no quant, no indexer band, 16-bit pools, the TMA norm + RoPE kernel.  None = AUTO: CACHE_WRITE_SMALL_M_ENV when set, else the
-        # separate cache-write launch ("launch": the chain as measured -- seven launches with the split combine); True = "norm_rope": the
+        # no quant, no indexer band, 16-bit pools, the TMA norm + RoPE kernel.  None = AUTO (2026-10-19): the MEASURED rule -- folded in
+        # where the arm is served and T = B x S_q < CACHE_WRITE_SMALL_M_DEFAULT_MAX_ROWS (128) or S_q == 1, the separate cache-write launch
+        # (the chain as before: seven launches with the split combine) at T >= 128 with S_q > 1, where the arm measured slower; True = the
         # write-through FOLDED INTO the norm + RoPE launch (kernels/qk_norm_rope_tma.py's pool-write arm: the slab's V band copied and the
         # post-RoPE K / V rows written to the pools from the same tiles, the separate cache-write stage not built -- six launches), a typed
         # decline on a form that cannot serve it (the fused fork, a quantized pipeline, the e4m3 cache, the indexer band, the EXTEND / packed
@@ -6646,7 +6674,11 @@ class GatedAttentionBlockFwd(APIBase):
         # quantize stages, the e4m3 write-through and the sparse core carry no griddepcontrol sites yet, so none of those chains overlaps
         # at its attention link and the switch is a typed decline there (the per-stage form below is the bf16 / f16 chains', whose one
         # site-less link is a prefill tile).  The FIRST decline of such a declaration, so the message names the switch rather than a
-        # later check's vocabulary.
+        # later check's vocabulary.  None = AUTO: nothing to decline here; resolved from the form's facts below (`_pdl_default`), before any
+        # stage is built -- `use_pdl_requested` keeps the declaration, `use_pdl` the resolved switch every stage reads.
+        if use_pdl is not None and not isinstance(use_pdl, bool):
+            raise TypeError(f"use_pdl must be None (auto), True or False, got {type(use_pdl).__name__}")
+        self.use_pdl_requested: Optional[bool] = use_pdl
         self.use_pdl = bool(use_pdl)
         if self.use_pdl and (quant is not None or kv_cache_dtype is not None or geometry.qsa is not None):
             raise NotImplementedError(
@@ -6888,6 +6920,12 @@ class GatedAttentionBlockFwd(APIBase):
             # seq_lens_present=True whatever was passed (the dense padding mask it names IS the per-sequence KV length -- bound to
             # the KV side only here).
             self.seq_lens_present = True
+        # PDL BY DEFAULT (2026-10-19): the AUTO reading of `use_pdl` resolves here, once the form is known and before any stage is built --
+        # True on the dense DECODE form's decode-tile routes for the bf16 / f16 block on the parts of DECODE_PDL_DEFAULT_CCS (its docstring:
+        # the measured default), False everywhere else; an explicit value was kept above.  A device-side fact read once (the sample's
+        # device), like the stages' own arch gates; a CPU sample (a host-side declaration) reads False.
+        if use_pdl is None:
+            self.use_pdl = self._pdl_default(quant)
         # C0 (2026-10-15): at DECODE ROW COUNTS the declaration `fuse_norm_rope=True` LOWERS stage (1) to the unfused chain.  The 256-wide
         # fused fork pads a decode step's handful of rows to one 256-row token tile and streams the slab weight from a quarter of the SMs
         # (the measured step at B 1 x KV 4K: the fork ~25 us against the small-M route's slab GEMM + norm / RoPE + cache write ~12 us of
@@ -7273,7 +7311,8 @@ class GatedAttentionBlockFwd(APIBase):
         # The programmatic-dependent-launch readback (the switch is per stage): the stages that launch with the attribute, and whether
         # every switched stage of the chain does (False with a plain link: the prefill tile of the DECODE form's prefill route or of the
         # EXTEND form, or a stage the switch is not threaded to -- the V compaction of inplace_qkv=False, the training copies).  The
-        # FROST GEMM stages launch with the attribute by their own constant and are not switched: neither listed nor counted.
+        # FROST GEMM stages launch with the attribute by their own constant and are not switched: neither listed nor counted.  `use_pdl`
+        # is the RESOLVED switch (None resolved by `_pdl_default`), `use_pdl_requested` the declaration as given.
         switched = tuple(st for st in self._stages if hasattr(st, "use_pdl"))
         self.pdl_stages: Tuple[str, ...] = tuple(st.name for st in switched if st.use_pdl)
         self.use_pdl_effective: bool = self.use_pdl and bool(switched) and all(st.use_pdl for st in switched)
@@ -7435,19 +7474,32 @@ class GatedAttentionBlockFwd(APIBase):
             )
         return page_size
 
+    def _pdl_default(self, quant) -> bool:
+        """The AUTO reading of ``use_pdl`` (None): True iff this is the dense DECODE form on a decode-tile route (``DecodeRoute.pdl_capable``:
+        the tile and its split combine carry the griddepcontrol pair), the bf16 / f16 block (no ``quant``, no e4m3 cache, no ``QsaSpec``) and
+        the sample's device is one of :data:`DECODE_PDL_DEFAULT_CCS` (cc 10.7, where the default was measured); False everywhere else -- the
+        EXTEND form, ``kv_source="self"``, the DECODE form's prefill route, the quantized pipelines, every other part and no CUDA device."""
+        return bool(
+            self.decode_route is not None
+            and self.decode_route.pdl_capable
+            and quant is None
+            and not self.kv_cache_e4m3
+            and self.qsa is None
+            and self.dtype in (torch.bfloat16, torch.float16)
+            and _device_cc_of(self.device) in DECODE_PDL_DEFAULT_CCS
+        )
+
     def _resolve_cache_write_small_m(self, requested: Optional[bool], quant) -> bool:
-        """Whether the paged write-through runs INSIDE the norm + RoPE launch (``fuse_cache_write_small_m``: None = AUTO -- the environment
-        variable ``CACHE_WRITE_SMALL_M_ENV`` when set, else "launch" --, True / False by name; ``TypeError`` otherwise).  Served on the dense
-        DECODE form's UNFUSED chain with paged pools in the activation dtype (bf16 / f16, no quant, no indexer band, no e4m3 cache) when the
-        TMA norm + RoPE kernel tiles the geometry; AUTO reads False everywhere else and an explicit True is a typed decline naming the
-        reason.  Device-free (the arch half -- sm_90+ for the TMA kernel -- is the stage's ``check_support``)."""
+        """Whether the paged write-through runs INSIDE the norm + RoPE launch (``fuse_cache_write_small_m``: None = AUTO -- the measured rule
+        of :data:`CACHE_WRITE_SMALL_M_DEFAULT_MAX_ROWS`: folded in at ``T = B x S_q < 128`` rows or at ``S_q == 1``, the separate launch at
+        ``T >= 128`` with ``S_q > 1`` --, True / False by name; ``TypeError`` otherwise).  Served on the dense DECODE form's UNFUSED chain with
+        paged pools in the activation dtype (bf16 / f16, no quant, no indexer band, no e4m3 cache) when the TMA norm + RoPE kernel tiles the
+        geometry; AUTO reads False everywhere else and an explicit True is a typed decline naming the reason.  Device-free (the arch half --
+        sm_90+ for the TMA kernel -- is the stage's ``check_support``; the dense DECODE form itself is served on cc 10.7 only)."""
         if requested is not None and not isinstance(requested, bool):
             raise TypeError(f"fuse_cache_write_small_m must be None (auto), True or False, got {type(requested).__name__}")
         if requested is None:
-            env = os.environ.get(CACHE_WRITE_SMALL_M_ENV, "").strip()
-            if env and env not in CACHE_WRITE_SMALL_M_MODES:
-                raise ValueError(f"{CACHE_WRITE_SMALL_M_ENV}={env!r} is not one of {CACHE_WRITE_SMALL_M_MODES}")
-            want = env == "norm_rope"
+            want = self.seq_len == 1 or self.batch * self.seq_len < CACHE_WRITE_SMALL_M_DEFAULT_MAX_ROWS
         else:
             want = requested
         if not want:
@@ -7479,7 +7531,7 @@ class GatedAttentionBlockFwd(APIBase):
             return True
         if requested is True:
             raise NotImplementedError(f"fuse_cache_write_small_m=True {why}")
-        return False  # AUTO (the environment asked): the separate launch where the arm is not served
+        return False  # AUTO: the separate launch where the arm is not served (the fused fork, the EXTEND / packed forms, a quantized pipeline, ...)
 
     def _check_fuse_cache_write_declaration(self, fuse_cache_write, quant) -> Optional[bool]:
         """``fuse_cache_write`` at declaration: None / True / False (``TypeError`` otherwise); True on a pipeline the fused projection's
@@ -8027,7 +8079,8 @@ class GatedAttentionBlockFwd(APIBase):
         ``device_cc`` (appended) overrides the device's compute capability for a host-side reading of another part's envelope;
         ``decode_route_policy`` (appended) is the policy ``decode.routes`` / ``decode.route()`` are read under (``None`` = the default,
         :data:`DEFAULT_DECODE_ROUTE_POLICY`; ``decode.policy`` names it); ``decode_q_tile_max`` (appended) the width cap they are read
-        under (``None`` = the whole single-unit table; ``decode.q_tile_max`` names it)."""
+        under (``None`` = the whole single-unit table; ``decode.q_tile_max`` names it); ``decode.pdl_default`` (appended) is the AUTO
+        reading of ``use_pdl`` on this part (:data:`DECODE_PDL_DEFAULT_CCS`)."""
         from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
 
         policy = _resolve_decode_route_policy(decode_route_policy)
@@ -8105,6 +8158,8 @@ class GatedAttentionBlockFwd(APIBase):
             claimed_max_s_q=DECODE_CLAIMED_MAX_S_Q,
             q_tile_max=q_tile_max,
             pdl_stages=() if sparse else DECODE_PDL_STAGES,
+            # the AUTO reading of the switch on this part (a decode-tile route, bf16 / f16 pools): the measured default on cc 10.7
+            pdl_default=(not sparse) and cc in DECODE_PDL_DEFAULT_CCS,
         )
         forms = tuple(nm for nm, env in (("extend", extend), ("decode", decode)) if env.served)
         return ServingEnvelope(
