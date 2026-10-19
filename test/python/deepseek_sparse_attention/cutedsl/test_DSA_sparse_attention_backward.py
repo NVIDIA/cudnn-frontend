@@ -55,27 +55,29 @@ def _spy_d576_two_cta_execute(monkeypatch):
     return calls
 
 
-def _spy_deterministic_sm100_compile(monkeypatch):
-    """Record (backend, num_heads) of each deterministic SM100 plan compile.
+def _spy_prepared_sm100_execute(monkeypatch):
+    """Record the backend and launchable of every freshly prepared SM100 plan."""
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward import api
 
-    Deterministic plans compile their own artifact in ``compile()`` and launch it
-    through ``_compiled_kernel``, so the route never appears in
-    ``flash_attn_bwd_sm100.compile_cache``. The wrapper's plan cache is emptied
-    for the test so an identical plan built by an earlier test still reaches
-    ``compile()``; the artifact itself stays cached below it.
-    """
-    from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100, api
-
+    # Do not let a plan built by an earlier test hide the compile() path. Keep
+    # the lower artifact memo intact so this still exercises normal reuse.
     monkeypatch.setattr(api, "_cache_of_SparseAttentionBackwardObjects", {})
-    compiles = []
-    real_compile = _interface_sm100._compile_deterministic_sm100
+    calls = []
+    real_execute = api.SparseAttentionBackward.execute
 
-    def recorded_compile(device_index, device_capability, backend, dtype, head_dim, head_dim_v, num_heads, *args, **kwargs):
-        compiles.append((backend, num_heads))
-        return real_compile(device_index, device_capability, backend, dtype, head_dim, head_dim_v, num_heads, *args, **kwargs)
+    def recorded_execute(plan, *args, **kwargs):
+        calls.append((plan._backend, plan._compiled_kernel))
+        return real_execute(plan, *args, **kwargs)
 
-    monkeypatch.setattr(_interface_sm100, "_compile_deterministic_sm100", recorded_compile)
-    return compiles
+    monkeypatch.setattr(api.SparseAttentionBackward, "execute", recorded_execute)
+    return calls
+
+
+def _assert_prepared_sm100_backend(calls, expected_backend):
+    """Require actual prepared execution through the expected compiled route."""
+    assert calls, "the wrapper did not execute a prepared SM100 plan"
+    assert all(backend == expected_backend for backend, _ in calls), f"expected only {expected_backend} prepared calls, got {calls}"
+    assert all(callable(compiled_kernel) for _, compiled_kernel in calls), "prepared execute did not receive a compiled launchable"
 
 
 def _allocate(cfg, has_topk_length: bool):
@@ -114,8 +116,9 @@ def _plan_case(
     has_topk_length=False,
     deterministic=False,
     q_cluster_mode="off",
+    compile_plan=True,
 ):
-    """Inputs, a checked and compiled plan, caller-owned outputs, and scratch for one route."""
+    """Inputs, a checked plan, caller-owned outputs, and scratch for one route."""
     from cudnn import DSA
 
     device = torch.device("cuda")
@@ -141,7 +144,8 @@ def _plan_case(
         q_cluster_mode=q_cluster_mode,
     )
     assert plan.check_support()
-    plan.compile()
+    if compile_plan:
+        plan.compile()
     workspace_bytes = plan.scratch_workspace_bytes()
     assert workspace_bytes > 0
     workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=device)
@@ -160,7 +164,7 @@ def _assert_execute_allocates_nothing_and_never_synchronizes(plan, inputs, outpu
         dq, dkv, d_sink = outputs
         return plan.execute(*inputs, dq, dkv, topk_length=topk_length, softmax_scale=softmax_scale, workspace=workspace, current_stream=stream, d_sink=d_sink)
 
-    execute()  # warm ordinary SM90/SM100 routes that still compile on first execute
+    execute()  # warm the legacy SM90 route and establish steady-state allocator counters
     torch.cuda.synchronize()
     before = torch.cuda.memory_stats()["allocation.all.allocated"]
     previous = torch.cuda.get_sync_debug_mode()
@@ -839,30 +843,45 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_adaptive_shards_repea
 @pytest.mark.L1
 @torch_fork_set_rng(seed=422)
 @pytest.mark.parametrize(
-    "num_heads,topk,dtype,expected_backend",
+    "num_heads,head_dim,topk,dtype,deterministic,expected_backend",
     [
-        pytest.param(64, 64, torch.bfloat16, "generic_m64", id="generic-bf16"),
-        pytest.param(64, 64, torch.float16, "generic_m64", id="generic-fp16"),
-        pytest.param(128, 128, torch.bfloat16, "h128_2cta_m64", id="h128-two-cta-bf16"),
+        pytest.param(16, 576, 64, torch.bfloat16, False, "h16_m128", id="h16"),
+        pytest.param(32, 576, 64, torch.bfloat16, False, "h32_m64", id="h32"),
+        pytest.param(64, 512, 64, torch.bfloat16, False, "generic_m64", id="generic"),
+        pytest.param(96, 576, 64, torch.bfloat16, False, "h96_h64_h32", id="h96"),
+        pytest.param(128, 512, 128, torch.bfloat16, False, "h128_2cta_m64", id="h128-two-cta"),
+        pytest.param(64, 512, 64, torch.bfloat16, True, "generic_m64", id="deterministic-generic-bf16"),
+        pytest.param(64, 512, 64, torch.float16, True, "generic_m64", id="deterministic-generic-fp16"),
+        pytest.param(128, 512, 128, torch.bfloat16, True, "h128_2cta_m64", id="deterministic-h128-two-cta"),
     ],
 )
-def test_DSA_sparse_attention_backward_sm100_deterministic_plan_is_cold_capture_safe(monkeypatch, num_heads, topk, dtype, expected_backend):
-    """The first execute after plan compilation is capture-safe and JIT-free."""
+def test_DSA_sparse_attention_backward_sm100_plan_is_cold_capture_safe(
+    monkeypatch,
+    num_heads,
+    head_dim,
+    topk,
+    dtype,
+    deterministic,
+    expected_backend,
+):
+    """Every non-D576 SM100 plan compiles before its first captured execute."""
     try:
         from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100 as interface
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     _require_sm100()
+    if expected_backend == "h128_2cta_m64":
+        _require_exact_sm100()
     plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
         num_heads,
-        512,
+        head_dim,
         topk,
         s_q=8,
-        s_kv=256,
+        s_kv=max(256, 2 * topk),
         dtype=dtype,
         has_topk_length=True,
-        deterministic=True,
+        deterministic=deterministic,
     )
     assert plan._backend == expected_backend
     assert callable(plan._compiled_kernel)
@@ -896,7 +915,10 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_plan_is_cold_capture_
         graph.replay()
         torch.cuda.synchronize()
         for actual, expected in zip(captured, reference):
-            assert torch.equal(actual, expected)
+            if deterministic:
+                assert torch.equal(actual, expected)
+            else:
+                torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
         q, kv, out, dout, lse, attn_sink, topk_idxs = inputs
         check_ref_dsa_sparse_attention_backward(
             q,
@@ -916,19 +938,153 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_plan_is_cold_capture_
         graph.reset()
 
 
+@pytest.mark.L0
+@torch_fork_set_rng(seed=426)
+def test_DSA_sparse_attention_backward_sm100_execute_requires_compile(monkeypatch):
+    """An SM100 plan validates support but never compiles implicitly in execute()."""
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    _require_sm100()
+    plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
+        64,
+        512,
+        64,
+        s_q=8,
+        s_kv=256,
+        has_topk_length=True,
+        compile_plan=False,
+    )
+    assert plan._compiled_kernel is None
+    dq, dkv, d_sink = outputs
+    execute_args = dict(
+        topk_length=topk_length,
+        softmax_scale=softmax_scale,
+        workspace=workspace,
+        d_sink=d_sink,
+    )
+    with pytest.raises(RuntimeError, match=r"call compile\(\) before execute\(\)"):
+        plan.execute(*inputs, dq, dkv, **execute_args)
+
+    q, kv, out, dout, lse, attn_sink, topk_idxs = inputs
+    unchecked_plan = DSA.SparseAttentionBackward(
+        q,
+        kv,
+        out,
+        dout,
+        lse,
+        attn_sink,
+        topk_idxs,
+        sample_topk_length=topk_length,
+        softmax_scale=softmax_scale,
+    )
+    assert unchecked_plan._device_major is None
+    with pytest.raises(RuntimeError, match=r"call compile\(\) before execute\(\)"):
+        unchecked_plan.execute(*inputs, dq, dkv, **execute_args)
+
+    unchecked_plan._is_supported = False
+
+    def rejected_support():
+        """Prove execute revalidates a stale support state before dispatch."""
+        raise NotImplementedError("support state must be revalidated")
+
+    monkeypatch.setattr(unchecked_plan, "check_support", rejected_support)
+    with pytest.raises(NotImplementedError, match="support state must be revalidated"):
+        unchecked_plan.execute(*inputs, dq, dkv, **execute_args)
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=428)
+def test_DSA_sparse_attention_backward_sm100_plan_revalidates_runtime_layout():
+    """Prepared plans reject runtime layouts that the low-level fast path skips."""
+    _require_sm100()
+    plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
+        64,
+        512,
+        64,
+        s_q=8,
+        s_kv=256,
+        has_topk_length=True,
+    )
+    dq, dkv, d_sink = outputs
+    execute_args = dict(
+        topk_length=topk_length,
+        softmax_scale=softmax_scale,
+        workspace=workspace,
+        d_sink=d_sink,
+    )
+
+    q = inputs[0]
+    q_storage = torch.empty((*q.shape[:-1], 2 * q.shape[-1]), dtype=q.dtype, device=q.device)
+    strided_q = q_storage[..., ::2]
+    assert strided_q.shape == q.shape and not strided_q.is_contiguous()
+    with pytest.raises(ValueError, match="q must be contiguous"):
+        plan.execute(strided_q, *inputs[1:], dq, dkv, **execute_args)
+
+    lse = inputs[4]
+    lse_storage = torch.empty(lse.numel() + 1, dtype=lse.dtype, device=lse.device)
+    misaligned_lse = lse_storage[1:].view_as(lse)
+    assert misaligned_lse.is_contiguous() and misaligned_lse.data_ptr() % 8 == 4
+    misaligned_inputs = (*inputs[:4], misaligned_lse, *inputs[5:])
+    with pytest.raises(ValueError, match="lse must be 8-byte aligned"):
+        plan.execute(*misaligned_inputs, dq, dkv, **execute_args)
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm100_ordinary_compile_cache_is_device_scoped(monkeypatch):
+    """Ordinary launchables compiled in one CUDA context are not reused by another."""
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100 as interface
+
+    compile_artifact = interface._compile_nondeterministic_sm100
+    compiled_devices = []
+
+    def fake_compile(device_index, *args, **kwargs):
+        """Return a unique launchable stand-in and record its owning device."""
+        compiled_devices.append(device_index)
+        return object()
+
+    compile_artifact.cache_clear()
+    monkeypatch.setattr(interface, "_compile_sm100_artifact", fake_compile)
+    args = ((10, 0), "generic_m64", torch.bfloat16, 512, 512, 64, 64, True, 64)
+    try:
+        device0 = compile_artifact(0, *args)
+        assert compile_artifact(0, *args) is device0
+        device1 = compile_artifact(1, *args)
+    finally:
+        compile_artifact.cache_clear()
+
+    assert device1 is not device0
+    assert compiled_devices == [0, 1]
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm100_compile_targets_cover_supported_family():
+    """Plan-time compilation preserves each supported SM100-family target."""
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100 as interface
+
+    assert interface._sm100_gpu_arch_flag((10, 0)) == "sm_100a"
+    assert interface._sm100_gpu_arch_flag((10, 3)) == "sm_103a"
+    assert interface._sm100_gpu_arch_flag((10, 7)) == "sm_107a"
+    with pytest.raises(ValueError, match="does not support compute capability"):
+        interface._sm100_gpu_arch_flag((10, 1))
+
+
 @pytest.mark.L1
 @torch_fork_set_rng(seed=423)
-def test_DSA_sparse_attention_backward_sm100_deterministic_artifact_is_shape_dynamic(monkeypatch):
-    """Q/KV extents sharing a shard bucket reuse one compiled artifact."""
+@pytest.mark.parametrize("deterministic", [False, True], ids=["ordinary", "deterministic"])
+def test_DSA_sparse_attention_backward_sm100_artifact_is_shape_dynamic(monkeypatch, deterministic):
+    """Compatible plans reuse one compiled artifact across Q and KV extents."""
     try:
         from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100 as interface
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     _require_sm100()
-    compile_artifact = interface._compile_deterministic_sm100
+    compile_artifact = interface._compile_deterministic_sm100 if deterministic else interface._compile_nondeterministic_sm100
     compile_artifact.cache_clear()
-    first, *_ = _plan_case(64, 512, 64, s_q=8, s_kv=256, has_topk_length=True, deterministic=True)
+    first, *_ = _plan_case(64, 512, 64, s_q=8, s_kv=256, has_topk_length=True, deterministic=deterministic)
     first_info = compile_artifact.cache_info()
 
     def forbidden_compile(*args, **kwargs):
@@ -943,7 +1099,7 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_artifact_is_shape_dyn
         s_q=16,
         s_kv=320,
         has_topk_length=True,
-        deterministic=True,
+        deterministic=deterministic,
     )
     second_info = compile_artifact.cache_info()
 
@@ -958,6 +1114,58 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_artifact_is_shape_dyn
         softmax_scale,
         workspace,
     )
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=427)
+def test_DSA_sparse_attention_backward_sm100_direct_interface_stays_lazy(monkeypatch):
+    """Direct low-level callers compile once on first use and reuse the lazy cache."""
+    try:
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100 as interface
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    _require_sm100()
+    _, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
+        64,
+        512,
+        64,
+        s_q=8,
+        s_kv=256,
+        has_topk_length=True,
+        compile_plan=False,
+    )
+    compile_cache = interface.flash_attn_bwd_sm100.compile_cache
+    saved_cache = compile_cache.copy()
+    compile_cache.clear()
+    compile_calls = 0
+    original_compile = interface.cute.compile
+
+    def tracked_compile(*args, **kwargs):
+        """Count actual CuTe compilation while forwarding to the compiler."""
+        nonlocal compile_calls
+        compile_calls += 1
+        return original_compile(*args, **kwargs)
+
+    monkeypatch.setattr(interface.cute, "compile", tracked_compile)
+    dq, dkv, d_sink = outputs
+    try:
+        for _ in range(2):
+            result = interface.flash_attn_bwd_sm100(
+                *inputs,
+                softmax_scale=softmax_scale,
+                topk_length=topk_length,
+                dq=dq,
+                dkv=dkv,
+                d_sink=d_sink,
+                workspace=workspace,
+            )
+            assert all(actual is expected for actual, expected in zip(result, outputs))
+    finally:
+        compile_cache.clear()
+        compile_cache.update(saved_cache)
+
+    assert compile_calls == 1
 
 
 @pytest.mark.L1
@@ -1089,7 +1297,6 @@ def test_DSA_sparse_attention_backward_sm100_h128_two_cta_masks_active_positive_
     try:
         from cudnn import DSA
         from cuda.bindings import driver as cuda
-        from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
@@ -1140,6 +1347,7 @@ def test_DSA_sparse_attention_backward_sm100_h128_two_cta_masks_active_positive_
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     two_cta_calls = _spy_d576_two_cta_execute(monkeypatch) if head_dim == 576 else None
+    prepared_calls = _spy_prepared_sm100_execute(monkeypatch) if head_dim == 512 else None
     result = DSA.sparse_attention_backward_wrapper(
         q,
         kv,
@@ -1156,10 +1364,7 @@ def test_DSA_sparse_attention_backward_sm100_h128_two_cta_masks_active_positive_
     )
 
     if head_dim == 512:
-        expected_cache_suffix = (topk, has_topk_length)
-        assert any(
-            key[0] == "h128_2cta_m64" and key[-2:] == expected_cache_suffix for key in _interface_sm100.flash_attn_bwd_sm100.compile_cache
-        ), "H128/D512 call did not execute the two-CTA backend"
+        _assert_prepared_sm100_backend(prepared_calls, "h128_2cta_m64")
     else:
         # The D576 route compiles through its own plan cache; assert that its launch entry ran.
         assert two_cta_calls, "H128/D576 call did not execute the two-CTA backend"
@@ -1246,10 +1451,9 @@ def test_DSA_sparse_attention_backward_sm100_h128_dsink_reduction_covers_tail():
 @pytest.mark.gpu_exclusive
 @pytest.mark.xdist_group(name="gpu_exclusive")
 @torch_fork_set_rng(seed=20260831)
-def test_DSA_sparse_attention_backward_sm100_h128_two_cta_cuda_graph():
+def test_DSA_sparse_attention_backward_sm100_h128_two_cta_cuda_graph(monkeypatch):
     try:
         from cudnn import DSA
-        from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
@@ -1273,6 +1477,7 @@ def test_DSA_sparse_attention_backward_sm100_h128_two_cta_cuda_graph():
     )
     dq = torch.empty_like(q)
     dkv = torch.empty_like(kv)
+    prepared_calls = _spy_prepared_sm100_execute(monkeypatch)
 
     def run():
         return DSA.sparse_attention_backward_wrapper(
@@ -1301,9 +1506,7 @@ def test_DSA_sparse_attention_backward_sm100_h128_two_cta_cuda_graph():
     graph.replay()
     torch.cuda.synchronize()
 
-    assert any(
-        key[0] == "h128_2cta_m64" and key[-2:] == (topk, True) for key in _interface_sm100.flash_attn_bwd_sm100.compile_cache
-    ), "CUDA Graph replay did not execute the two-CTA backend"
+    _assert_prepared_sm100_backend(prepared_calls, "h128_2cta_m64")
     assert torch.isfinite(captured["dq"]).all()
     assert torch.isfinite(captured["dkv"]).all()
     assert torch.isfinite(captured["d_sink"]).all()
@@ -1629,12 +1832,11 @@ def test_DSA_sparse_attention_backward_wrapper_h96_composite(has_topk_length, re
 @pytest.mark.L0
 @pytest.mark.parametrize("has_topk_length", [False, True], ids=["sentinel-padding", "lengths"])
 @torch_fork_set_rng(seed=960)
-def test_DSA_sparse_attention_backward_sm100_h96_composite_boundaries(has_topk_length):
+def test_DSA_sparse_attention_backward_sm100_h96_composite_boundaries(has_topk_length, monkeypatch):
     """Cover empty, partial, and multi-tile rows in both H96 components."""
     _require_sm100()
     try:
         from cudnn import DSA
-        from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
@@ -1662,6 +1864,7 @@ def test_DSA_sparse_attention_backward_sm100_h96_composite_boundaries(has_topk_l
         softmax_scale=softmax_scale,
     )
     dout = torch.randn_like(out)
+    prepared_calls = _spy_prepared_sm100_execute(monkeypatch)
     result = DSA.sparse_attention_backward_wrapper(
         q,
         kv,
@@ -1694,7 +1897,7 @@ def test_DSA_sparse_attention_backward_sm100_h96_composite_boundaries(has_topk_l
         atol=5e-2,
         rtol=5e-2,
     )
-    assert any(key[0] == "h96_h64_h32" for key in _interface_sm100.flash_attn_bwd_sm100.compile_cache)
+    _assert_prepared_sm100_backend(prepared_calls, "h96_h64_h32")
 
 
 @pytest.mark.parametrize(
@@ -2221,13 +2424,12 @@ def test_DSA_sparse_attention_backward_sm100_handles_infinite_sink_limits(sink_v
         pytest.param(96, "h96_h64_h32", id="h96-h64-h32"),
     ],
 )
-def test_DSA_sparse_attention_backward_sm100_specialized_masks_invalid_topk_rows(num_heads, expected_backend):
+def test_DSA_sparse_attention_backward_sm100_specialized_masks_invalid_topk_rows(num_heads, expected_backend, monkeypatch):
     """Specialized kernels must mask invalid rows before probability use and KV access."""
     _require_sm100()
 
     try:
         from cudnn import DSA
-        from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
@@ -2240,6 +2442,7 @@ def test_DSA_sparse_attention_backward_sm100_specialized_masks_invalid_topk_rows
     attn_sink = torch.full((num_heads,), -math.inf, dtype=torch.float32, device=device)
     out = kv[0, :head_dim_v].view(1, 1, head_dim_v).expand(1, num_heads, head_dim_v).contiguous()
     one_key_lse = ((q.float() * kv[0].float()).sum(dim=-1) * (192**-0.5)).contiguous()
+    prepared_calls = _spy_prepared_sm100_execute(monkeypatch)
 
     def run_and_check(topk_idxs, topk_length, lse):
         result = DSA.sparse_attention_backward_wrapper(
@@ -2295,7 +2498,7 @@ def test_DSA_sparse_attention_backward_sm100_specialized_masks_invalid_topk_rows
     repeated_key_lse = one_key_lse + math.log(valid_count)
     run_and_check(topk_idxs, None, repeated_key_lse)
 
-    assert any(key[0] == expected_backend and key[5] == num_heads for key in _interface_sm100.flash_attn_bwd_sm100.compile_cache)
+    _assert_prepared_sm100_backend(prepared_calls, expected_backend)
 
 
 @pytest.mark.L0
@@ -2308,13 +2511,12 @@ def test_DSA_sparse_attention_backward_sm100_specialized_masks_invalid_topk_rows
         pytest.param(96, "h96_h64_h32", id="h96-h64-h32"),
     ],
 )
-def test_DSA_sparse_attention_backward_sm100_specialized_handles_sink_limits(num_heads, expected_backend):
+def test_DSA_sparse_attention_backward_sm100_specialized_handles_sink_limits(num_heads, expected_backend, monkeypatch):
     """Specialized sink paths must implement empty and saturating softmax limits."""
     _require_sm100()
 
     try:
         from cudnn import DSA
-        from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
@@ -2324,6 +2526,7 @@ def test_DSA_sparse_attention_backward_sm100_specialized_handles_sink_limits(num
     kv = torch.randn(1, head_dim, dtype=torch.bfloat16, device=device)
     out = torch.zeros(1, num_heads, head_dim_v, dtype=torch.bfloat16, device=device)
     dout = torch.randn_like(out)
+    prepared_calls = _spy_prepared_sm100_execute(monkeypatch)
 
     cases = [(-math.inf, True), (math.inf, False)]
     # The finite-overflow case targets behavior implemented by the H16/H32
@@ -2359,7 +2562,7 @@ def test_DSA_sparse_attention_backward_sm100_specialized_handles_sink_limits(num
         assert torch.equal(result["dkv"], torch.zeros_like(result["dkv"]))
         assert torch.equal(result["d_sink"], torch.zeros_like(result["d_sink"]))
 
-    assert any(key[0] == expected_backend and key[5] == num_heads for key in _interface_sm100.flash_attn_bwd_sm100.compile_cache)
+    _assert_prepared_sm100_backend(prepared_calls, expected_backend)
 
 
 @pytest.mark.L0
@@ -2393,7 +2596,6 @@ def test_DSA_sparse_attention_backward_h128_two_cta_handles_sink_limits(head_dim
         pytest.skip("D576 2-CTA requires an SM100-class GPU (compute capability 10.0 or 10.3)")
     try:
         from cudnn import DSA
-        from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
@@ -2401,7 +2603,7 @@ def test_DSA_sparse_attention_backward_h128_two_cta_handles_sink_limits(head_dim
     num_heads, head_dim_v = 128, 512
     softmax_scale = 192**-0.5
     two_cta_calls = _spy_d576_two_cta_execute(monkeypatch) if head_dim == 576 else None
-    deterministic_compiles = _spy_deterministic_sm100_compile(monkeypatch)
+    prepared_calls = _spy_prepared_sm100_execute(monkeypatch) if head_dim == 512 else None
 
     q = torch.randn(s_q, num_heads, head_dim, dtype=torch.bfloat16, device=device)
     kv = torch.randn(1, head_dim, dtype=torch.bfloat16, device=device)
@@ -2445,12 +2647,7 @@ def test_DSA_sparse_attention_backward_h128_two_cta_handles_sink_limits(head_dim
     if head_dim == 576:
         assert two_cta_calls, "the wrapper did not execute the H128/D576 two-CTA backend"
     else:
-        if deterministic:
-            assert (expected_backend, num_heads) in deterministic_compiles
-        else:
-            assert any(
-                key[0] == expected_backend and key[1] == deterministic and key[5] == num_heads for key in _interface_sm100.flash_attn_bwd_sm100.compile_cache
-            )
+        _assert_prepared_sm100_backend(prepared_calls, expected_backend)
 
 
 @pytest.mark.L0
@@ -2478,7 +2675,6 @@ def test_DSA_sparse_attention_backward_h128_two_cta_one_key_padded_gradients(hea
     try:
         from cuda.bindings import driver as cuda
         from cudnn import DSA
-        from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
@@ -2506,7 +2702,7 @@ def test_DSA_sparse_attention_backward_h128_two_cta_one_key_padded_gradients(hea
     outputs = (torch.empty_like(q), torch.empty_like(kv), torch.empty_like(attn_sink))
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     two_cta_calls = _spy_d576_two_cta_execute(monkeypatch) if head_dim == 576 else None
-    deterministic_compiles = _spy_deterministic_sm100_compile(monkeypatch)
+    prepared_calls = _spy_prepared_sm100_execute(monkeypatch) if head_dim == 512 else None
 
     def check_gradients(actual, path):
         assert len(actual) == 3
@@ -2543,12 +2739,7 @@ def test_DSA_sparse_attention_backward_h128_two_cta_one_key_padded_gradients(hea
     if head_dim == 576:
         assert len(two_cta_calls) == 2, "both wrapper and plan must execute the H128/D576 two-CTA backend"
     else:
-        if deterministic:
-            assert (expected_backend, num_heads) in deterministic_compiles
-        else:
-            assert any(
-                key[0] == expected_backend and key[1] == deterministic and key[5] == num_heads for key in _interface_sm100.flash_attn_bwd_sm100.compile_cache
-            )
+        _assert_prepared_sm100_backend(prepared_calls, expected_backend)
 
 
 @pytest.mark.L0
@@ -2570,7 +2761,6 @@ def test_DSA_sparse_attention_backward_h128_two_cta_padded_slots_under_very_nega
         pytest.skip("D576 2-CTA requires an SM100-class GPU (compute capability 10.0 or 10.3)")
     try:
         from cudnn import DSA
-        from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
@@ -2578,7 +2768,7 @@ def test_DSA_sparse_attention_backward_h128_two_cta_padded_slots_under_very_nega
     s_q, s_kv, topk, num_heads, valid_slots = 4, 300, 128, 128, 3
     softmax_scale = head_dim**-0.5
     two_cta_calls = _spy_d576_two_cta_execute(monkeypatch) if head_dim == 576 else None
-    deterministic_compiles = _spy_deterministic_sm100_compile(monkeypatch)
+    prepared_calls = _spy_prepared_sm100_execute(monkeypatch) if head_dim == 512 else None
 
     # Every logit is about -10 * head_dim * softmax_scale (below -200 nats) and the sink is disabled.
     q = torch.full((s_q, num_heads, head_dim), 10.0, dtype=torch.bfloat16, device=device)
@@ -2602,23 +2792,17 @@ def test_DSA_sparse_attention_backward_h128_two_cta_padded_slots_under_very_nega
     if head_dim == 576:
         assert two_cta_calls, "the wrapper did not execute the H128/D576 two-CTA backend"
     else:
-        if deterministic:
-            assert (expected_backend, num_heads) in deterministic_compiles
-        else:
-            assert any(
-                key[0] == expected_backend and key[1] == deterministic and key[5] == num_heads for key in _interface_sm100.flash_attn_bwd_sm100.compile_cache
-            )
+        _assert_prepared_sm100_backend(prepared_calls, expected_backend)
 
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=678)
 @pytest.mark.parametrize("num_heads,expected_backend", [(16, "h16_m128"), (32, "h32_m64"), (64, "generic_m64")])
-def test_DSA_sparse_attention_backward_sm100_accumulates_odo_in_fp32(num_heads: int, expected_backend: str) -> None:
+def test_DSA_sparse_attention_backward_sm100_accumulates_odo_in_fp32(num_heads: int, expected_backend: str, monkeypatch) -> None:
     """dSink uses the saved BF16 O but must multiply O*dO in FP32."""
     _require_sm100()
     try:
         from cudnn import DSA
-        from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
@@ -2630,6 +2814,7 @@ def test_DSA_sparse_attention_backward_sm100_accumulates_odo_in_fp32(num_heads: 
     topk_idxs = torch.arange(s_kv, dtype=torch.int32, device=device).expand(s_q, -1).contiguous()
     out, lse = ref_sparse_attention_forward_chunked(q, kv, attn_sink, topk_idxs, softmax_scale=192**-0.5)
     dout = torch.randn_like(out)
+    prepared_calls = _spy_prepared_sm100_execute(monkeypatch)
 
     result = DSA.sparse_attention_backward_wrapper(
         q,
@@ -2644,9 +2829,7 @@ def test_DSA_sparse_attention_backward_sm100_accumulates_odo_in_fp32(num_heads: 
     p_sink = torch.exp(attn_sink.view(1, -1) - torch.logaddexp(lse, attn_sink.view(1, -1)))
     expected_d_sink = (-p_sink * (out.float() * dout.float()).sum(dim=-1)).sum(dim=0)
     torch.testing.assert_close(result["d_sink"], expected_d_sink, atol=2e-5, rtol=2e-3)
-    assert any(
-        key[0] == expected_backend and key[5] == num_heads for key in _interface_sm100.flash_attn_bwd_sm100.compile_cache
-    ), f"Expected native {expected_backend} dispatch for {num_heads} heads"
+    _assert_prepared_sm100_backend(prepared_calls, expected_backend)
 
 
 @pytest.mark.L0
@@ -3230,7 +3413,7 @@ def test_DSA_sparse_attention_backward_staged_store():
                 setattr(self, name, value)
 
         _dsa_bwd_kmod.FlashAttentionDSABackwardSm100._setup_attributes = patched
-        _dsa_bwd_iface.flash_attn_bwd_sm100.compile_cache.clear()
+        _dsa_bwd_iface._compile_nondeterministic_sm100.cache_clear()
         _dsa_bwd_api._cache_of_SparseAttentionBackwardObjects.clear()
         try:
             result = DSA.sparse_attention_backward_wrapper(
@@ -3248,7 +3431,7 @@ def test_DSA_sparse_attention_backward_staged_store():
             return result["dq"], result["dkv"], result["d_sink"]
         finally:
             _dsa_bwd_kmod.FlashAttentionDSABackwardSm100._setup_attributes = orig_setup
-            _dsa_bwd_iface.flash_attn_bwd_sm100.compile_cache.clear()
+            _dsa_bwd_iface._compile_nondeterministic_sm100.cache_clear()
             _dsa_bwd_api._cache_of_SparseAttentionBackwardObjects.clear()
 
     dq_ref, dkv_ref, d_sink_ref = run({})
