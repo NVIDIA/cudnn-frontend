@@ -39,6 +39,14 @@ from sdpa.graph.suites.common import Fixed
 SW_FULL = dict(causal=10, left_window_only=5, right_window_only=5, band_around_diag=10, no_mask=10)
 SW_NONE = dict(no_mask=10)
 
+# Joint bound on b * h_q * s_q * s_kv for the bprop suites (#965). Their s_q / s_kv
+# caps went 8192 -> 16384; the backend's deterministic backward workspace and the
+# dBias gradient scale with (b, h_q, s_q, s_kv), so the largest draws of the old
+# caps (16 x 8 x 8192^2 for f16, 4 x 8 x 8192^2 for fp8 / mxfp8) are kept as the
+# memory ceiling: a longer draw shrinks its batch instead of being unrunnable.
+BPROP_SCORE_CELLS_F16 = 16 * 8 * 8192 * 8192
+BPROP_SCORE_CELLS_FP8 = 4 * 8 * 8192 * 8192
+
 DIAG_BOTH = {
     cudnn.diagonal_alignment.TOP_LEFT: 1,
     cudnn.diagonal_alignment.BOTTOM_RIGHT: 1,
