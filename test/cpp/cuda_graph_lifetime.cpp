@@ -457,6 +457,7 @@ TEST_CASE("Releasing retained plans does not disturb another stream's capture", 
         SKIP("cudnn versions earlier than 9.5 don't support the native CUDA graph API.");
     }
 
+    cudnn_frontend::detail::CudaGraphRetainedResource::drain_deferred_releases();  // left over from earlier tests
     auto handle_ptr = create_cudnn_handle();
     auto handle     = *handle_ptr;
 
@@ -484,12 +485,21 @@ TEST_CASE("Releasing retained plans does not disturb another stream's capture", 
         return true;
     };
 
-    // 1. Record a graph from a plan, then destroy everything: the plan's release is now queued.
+    // 1. Create everything the capture in step 3 needs first. While a global-mode capture is
+    //    active, this thread may not allocate, free or synchronize, and building a graph
+    //    destroys temporary plans, which would release the queued plan from step 2 early.
+    auto captured = create_graph(b, m, n, k, scale_value);
+    if (!build(captured)) {
+        SKIP("No engine with the SUPPORTS_CUDA_GRAPH_NATIVE_API behavior note for this graph.");
+    }
+    Surface<int8_t> captured_workspace(captured->get_workspace_size());
+    cudaStream_t stream_a;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream_a, cudaStreamNonBlocking));
+
+    // 2. Record a graph from a plan, then destroy everything: the plan's release is now queued.
     {
         auto doomed = create_graph(b, m, n, k, scale_value);
-        if (!build(doomed)) {
-            SKIP("No engine with the SUPPORTS_CUDA_GRAPH_NATIVE_API behavior note for this graph.");
-        }
+        REQUIRE(build(doomed));
         Surface<int8_t> doomed_workspace(doomed->get_workspace_size());
         cudaGraph_t cudnn_cuda_graph;
         CUDA_CHECK(cudaGraphCreate(&cudnn_cuda_graph, 0));
@@ -498,25 +508,23 @@ TEST_CASE("Releasing retained plans does not disturb another stream's capture", 
         CUDA_CHECK(cudaGraphDestroy(cudnn_cuda_graph));
         CUDA_CHECK(cudaDeviceSynchronize());
     }
+    if (!cudnn_frontend::detail::CudaGraphRetainedResource::has_deferred_releases()) {
+        SKIP("The plan's engine is precompiled, so its CUDA graph did not retain it.");
+    }
 
-    // 2. Start a global-mode capture on stream A. Everything the capture needs is created
-    //    beforehand: while a global-mode capture is active, this thread may not allocate,
-    //    free or synchronize.
-    auto captured = create_graph(b, m, n, k, scale_value);
-    REQUIRE(build(captured));
-    Surface<int8_t> captured_workspace(captured->get_workspace_size());
-    cudaStream_t stream_a;
-    CUDA_CHECK(cudaStreamCreateWithFlags(&stream_a, cudaStreamNonBlocking));
+    // 3. Start a global-mode capture on stream A.
     REQUIRE(cudnnSetStream(handle, stream_a) == CUDNN_STATUS_SUCCESS);
     CUDA_CHECK(cudaStreamBeginCapture(stream_a, cudaStreamCaptureModeGlobal));
     REQUIRE(captured->execute(handle, variant_pack, captured_workspace.devPtr).is_good());
 
-    // 3. While the capture is active, release the queued plan from step 1. This is what
+    // 4. While the capture is active, release the queued plan from step 2. This is what
     //    destroying a frontend plan or graph does; it frees the plan's device resources and
     //    must not invalidate stream A's capture.
+    REQUIRE(cudnn_frontend::detail::CudaGraphRetainedResource::has_deferred_releases());
     cudnn_frontend::detail::CudaGraphRetainedResource::drain_deferred_releases();
+    REQUIRE_FALSE(cudnn_frontend::detail::CudaGraphRetainedResource::has_deferred_releases());
 
-    // 4. Stream A's capture is still valid and replays correctly.
+    // 5. Stream A's capture is still valid and replays correctly.
     cudaGraph_t captured_graph;
     CUDA_CHECK(cudaStreamEndCapture(stream_a, &captured_graph));
     cudaGraphExec_t cuda_graph_exec;
