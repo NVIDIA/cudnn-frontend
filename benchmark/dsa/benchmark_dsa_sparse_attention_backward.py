@@ -15,6 +15,7 @@ Usage:
     python benchmark_dsa_sparse_attention_backward.py
     python benchmark_dsa_sparse_attention_backward.py --seqlens 4096,8192 --seqlens-kv 65536 --topks 2048 --deterministic both
     python benchmark_dsa_sparse_attention_backward.py --nheads 96 --head-dim 576 --synthetic-forward --csv results.csv
+    python benchmark_dsa_sparse_attention_backward.py --seqlens 4096,8192,16384 --seqlens-kv 65536 --segment-lengths-kv 27726,17644,12603,7563 --sorted-topk --topks 2048 --nheads 96 --head-dim 576 --deterministic both --synthetic-forward
     python benchmark_dsa_sparse_attention_backward.py profile --seqlens 8192 --seqlens-kv 65536 --topks 2048 --deterministic on
 
 ``profile`` mode runs one warmed-up backward call wrapped in
@@ -44,10 +45,16 @@ def flops_bwd(seqlen_q, topk, nheads, head_dim, head_dim_v):
     return 2 * seqlen_q * nheads * topk * (3 * head_dim + 2 * head_dim_v)
 
 
-def make_topk_indices(seqlen_q, seqlen_kv, topk, device):
-    """Build unique, dispersed indices without materializing a Q-by-KV matrix."""
-    if topk > seqlen_kv:
-        raise ValueError(f"topk ({topk}) must not exceed seqlen_kv ({seqlen_kv})")
+def proportional_query_segments(seqlen_q, segment_lengths_kv):
+    """Assign query rows in proportion to packed KV segments, preserving the total."""
+    total_s_kv = sum(segment_lengths_kv)
+    segment_lengths_q = [seqlen_q * length // total_s_kv for length in segment_lengths_kv[:-1]]
+    segment_lengths_q.append(seqlen_q - sum(segment_lengths_q))
+    return segment_lengths_q
+
+
+def _make_segment_topk_indices(seqlen_q, seqlen_kv, topk, device):
+    """Build unique, dispersed indices local to one packed sequence."""
     # A stride coprime with KV visits every key exactly once. Construct the
     # multiplied vectors in int64, reduce them, then keep the Q-by-TopK result
     # in int32 so production-sized cases do not need an int64 scratch matrix.
@@ -59,7 +66,43 @@ def make_topk_indices(seqlen_q, seqlen_kv, topk, device):
     return (offsets[:, None] + columns[None, :]).remainder_(seqlen_kv)
 
 
-def make_inputs(seqlen_q, topk, seqlen_kv, nheads, head_dim, head_dim_v, dtype, use_attn_sink, use_topk_length):
+def make_topk_indices(seqlen_q, seqlen_kv, topk, device, segment_lengths_kv=None, sorted_topk=False):
+    """Build unique global indices, optionally constrained to packed sequences."""
+    if segment_lengths_kv is None:
+        segment_lengths_kv = [seqlen_kv]
+    if not segment_lengths_kv or any(length <= 0 for length in segment_lengths_kv):
+        raise ValueError("--segment-lengths-kv must contain positive lengths")
+    if sum(segment_lengths_kv) != seqlen_kv:
+        raise ValueError(f"--segment-lengths-kv must sum to seqlen_kv ({seqlen_kv}), got {sum(segment_lengths_kv)}")
+
+    segment_lengths_q = proportional_query_segments(seqlen_q, segment_lengths_kv)
+    pieces = []
+    kv_begin = 0
+    for segment_q, segment_kv in zip(segment_lengths_q, segment_lengths_kv):
+        if segment_q and topk > segment_kv:
+            raise ValueError(f"topk ({topk}) must not exceed each active KV segment; found segment length {segment_kv}")
+        if segment_q:
+            indices = _make_segment_topk_indices(segment_q, segment_kv, topk, device)
+            if sorted_topk:
+                indices = indices.sort(dim=-1).values
+            pieces.append(indices.add_(kv_begin))
+        kv_begin += segment_kv
+    return torch.cat(pieces, dim=0)
+
+
+def make_inputs(
+    seqlen_q,
+    topk,
+    seqlen_kv,
+    nheads,
+    head_dim,
+    head_dim_v,
+    dtype,
+    use_attn_sink,
+    use_topk_length,
+    segment_lengths_kv=None,
+    sorted_topk=False,
+):
     """Build flat-layout backward inputs with unique dispersed top-k rows."""
     device = "cuda"
     q = torch.randn(seqlen_q, nheads, head_dim, device=device, dtype=dtype) / 10
@@ -71,7 +114,14 @@ def make_inputs(seqlen_q, topk, seqlen_kv, nheads, head_dim, head_dim_v, dtype, 
         # exp(-inf) contributes nothing to the softmax denominator: sink disabled.
         attn_sink = torch.full((nheads,), float("-inf"), device=device, dtype=torch.float32)
 
-    topk_idxs = make_topk_indices(seqlen_q, seqlen_kv, topk, device)
+    topk_idxs = make_topk_indices(
+        seqlen_q,
+        seqlen_kv,
+        topk,
+        device,
+        segment_lengths_kv=segment_lengths_kv,
+        sorted_topk=sorted_topk,
+    )
     topk_length = None
     if use_topk_length:
         topk_length = torch.full((seqlen_q,), topk, dtype=torch.int32, device=device)
@@ -110,6 +160,8 @@ def setup_case(seqlen_q, seqlen_kv, topk, deterministic, args):
         dtype,
         use_attn_sink=not args.no_attn_sink,
         use_topk_length=not args.no_topk_length,
+        segment_lengths_kv=args.segment_lengths_kv,
+        sorted_topk=args.sorted_topk,
     )
     if args.synthetic_forward:
         # Scores are close to zero for the scaled inputs above, so log(topk)
@@ -210,6 +262,7 @@ def run_benchmark_suite(args):
     print(
         f"nheads={args.nheads}, d_qk={args.head_dim}, d_v={args.head_dim_v}, dtype={args.dtype}, "
         f"attn_sink={not args.no_attn_sink}, topk_length={not args.no_topk_length}, "
+        f"sorted_topk={args.sorted_topk}, segment_lengths_kv={args.segment_lengths_kv}, "
         f"warmup={args.warmup}, repeat={args.repeat}"
     )
     print(sep)
@@ -239,6 +292,11 @@ def run_benchmark_suite(args):
                             "bwd_ms": round(bwd_ms, 4),
                             "bwd_tflops": round(bwd_tf, 2),
                             "workspace_gib": round(workspace_gib, 4),
+                            "sorted_topk": args.sorted_topk,
+                            "segment_lengths_q": (
+                                ",".join(map(str, proportional_query_segments(seqlen_q, args.segment_lengths_kv))) if args.segment_lengths_kv else ""
+                            ),
+                            "segment_lengths_kv": ",".join(map(str, args.segment_lengths_kv)) if args.segment_lengths_kv else "",
                         }
                     )
                 except Exception as e:
@@ -278,7 +336,9 @@ def run_profile(args):
         print(
             f"Profile run done: seqlen_q={seqlen_q}, seqlen_kv={seqlen_kv}, topk={topk}, "
             f"nheads={args.nheads}, d_qk={args.head_dim}, d_v={args.head_dim_v}, dtype={args.dtype}, "
-            f"deterministic={deterministic}, workspace={workspace_bytes / 2**30:.3f} GiB"
+            f"deterministic={deterministic}, sorted_topk={args.sorted_topk}, "
+            f"segment_lengths_q={proportional_query_segments(seqlen_q, args.segment_lengths_kv) if args.segment_lengths_kv else None}, "
+            f"segment_lengths_kv={args.segment_lengths_kv}, workspace={workspace_bytes / 2**30:.3f} GiB"
         )
 
 
@@ -308,6 +368,12 @@ def parse_args():
         help="one KV length broadcast to all Q lengths, or one per --seqlens value (default: match Q)",
     )
     p.add_argument(
+        "--segment-lengths-kv",
+        type=comma_separated_ints,
+        default=None,
+        help="packed KV sequence lengths; Q segments are assigned proportionally (default: one flat sequence)",
+    )
+    p.add_argument(
         "--topks",
         type=comma_separated_ints,
         default=[128, 512, 1024, 2048],
@@ -329,6 +395,11 @@ def parse_args():
         help="benchmark deterministic execution off, on, or both (default: off)",
     )
     p.add_argument(
+        "--sorted-topk",
+        action="store_true",
+        help="sort each row of generated Top-K indices (default: dispersed order)",
+    )
+    p.add_argument(
         "--synthetic-forward",
         action="store_true",
         help="use finite synthetic out/LSE tensors instead of the reference forward (recommended for long sequences)",
@@ -348,6 +419,12 @@ def parse_args():
 def main():
     args = parse_args()
     args.head_dim_v = 512 if args.head_dim == 576 else args.head_dim  # matches the kernel-side derivation
+
+    if args.segment_lengths_kv:
+        segment_total = sum(args.segment_lengths_kv)
+        incompatible = [seqlen_kv for _, seqlen_kv in sequence_pairs(args) if seqlen_kv != segment_total]
+        if incompatible:
+            raise ValueError(f"--segment-lengths-kv sums to {segment_total}, but every --seqlens-kv value must match; " f"found {sorted(set(incompatible))}")
 
     if not torch.cuda.is_available():
         print("SKIP: CUDA not available")
