@@ -639,7 +639,14 @@ PyGraph::deserialize(std::optional<std::intptr_t> handle_, py::object const& pyo
         throw_if(status.is_bad(), status.get_code(), status.get_message());
 
     } else {
-        std::vector<uint8_t> data = py::cast<std::vector<uint8_t>>(pyobj);
+        std::vector<uint8_t> data;
+        if (py::isinstance<py::bytes>(pyobj)) {
+            auto bytes = py::borrow<py::bytes>(pyobj);
+            auto first = static_cast<const uint8_t*>(bytes.data());
+            data.assign(first, first + bytes.size());
+        } else {
+            data = py::cast<std::vector<uint8_t>>(pyobj);
+        }
 
         if (!handle_.has_value() && this->handle == nullptr && this->device_properties != nullptr) {
             // Handle-less path: use the device properties set at construction.
@@ -1447,7 +1454,15 @@ init_pygraph_submodule(py::module_& m) {
              py::arg("plan_index"))
         .def("populate_cuda_graph", &PyGraph::populate_cuda_graph)
         .def("update_cuda_graph", &PyGraph::update_cuda_graph)
-        .def("serialize", &PyGraph::serialize)
+        .def(
+            "serialize",
+            [](PyGraph const& self, bool as_bytes) -> py::object {
+                auto data = self.serialize();
+                if (as_bytes) return py::bytes(data.data(), data.size());
+                return py::cast(data);
+            },
+            py::kw_only(),
+            py::arg("as_bytes") = false)
         .def("deserialize",
              (void (PyGraph::*)(std::optional<std::intptr_t>, py::object const&, bool const))&PyGraph::deserialize,
              py::arg("handle_"),
