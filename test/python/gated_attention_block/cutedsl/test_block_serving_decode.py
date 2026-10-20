@@ -320,6 +320,9 @@ def _pools(n_pages, h, page_size, d, layout, dtype, device=_DEV, fill=None):
         return tuple(torch.full((n_pages, h, page_size, d), fill, device=device, dtype=dtype) for _ in range(2))
     if layout == "nhd":
         return tuple(torch.full((n_pages, page_size, h, d), fill, device=device, dtype=dtype).permute(0, 2, 1, 3) for _ in range(2))
+    if layout == "hnd_padded":
+        # HND with a PADDED page stride (8 spare token rows per page): covering and 16-B aligned, so the contract admits it; not compact
+        return tuple(torch.full((n_pages, h, page_size + 8, d), fill, device=device, dtype=dtype)[:, :, :page_size] for _ in range(2))
     assert layout == "unified"
     row = torch.full((n_pages, h, page_size, 2 * d), fill, device=device, dtype=dtype)
     return row[..., :d], row[..., d:]
@@ -569,6 +572,12 @@ def test_the_envelope_on_a_rubin_reading_serves_the_decode_form_and_names_every_
     # the programmatic-dependent-launch readbacks: the switched stage kinds per form, stage (4) on a decode-tile route only
     assert d.pdl_stages == ("qk_norm_rope", "cache_write", "sigmoid_gate", "sdpa") and env.extend.pdl_stages == ("qk_norm_rope", "cache_write", "sigmoid_gate")
     assert all(r.pdl_capable is r.decode_tile for r in d.routes) and d.route(1).pdl_capable and not d.route(33).pdl_capable
+    # the AUTO reading of the switch on this part (a Rubin reading of a SERVED form): on; off on every other part and on an unserved dtype
+    # (a form-level reading: the per-step one is `pdl_default and route(s_q, batch).pdl_capable`)
+    assert d.pdl_default is True and GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, _DEV, device_cc=(10, 0)).decode.pdl_default is False
+    fp32 = GatedAttentionBlockFwd.serving_envelope(geom, torch.float32, _DEV, device_cc=_SM107).decode
+    assert not fp32.served and fp32.pdl_default is False, "the default is a reading of a served form"
+    assert (d.pdl_default and d.route(1).pdl_capable) is True and (d.pdl_default and d.route(33).pdl_capable) is False
     g16, _ = _geom(16)
     e16 = GatedAttentionBlockFwd.serving_envelope(g16, torch.bfloat16, _DEV, device_cc=_SM107).decode
     assert e16.route(4).pdl_capable and not e16.route(5, batch=32).pdl_capable and e16.route(5, batch=32).prefill_tile and e16.route(9).pdl_capable
@@ -589,6 +598,7 @@ def test_the_envelope_requires_the_rubin_dsl_target(monkeypatch, version, has_ta
     env = GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, "cpu", device_cc=_SM107)
     assert env.cutedsl_ok is has_target
     assert env.extend.served is has_target and env.decode.served is has_target
+    assert env.decode.pdl_default is has_target  # the default follows the served form: no Rubin target, no PDL default
     assert env.forms == (("extend", "decode") if has_target else ())
     assert env.decode.route(1).served  # Geometry remains inspectable without a runnable target.
     if has_target:
@@ -608,6 +618,7 @@ def test_the_envelope_declines_every_other_part_without_raising(cc, match):
     env = GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, "cpu" if cc is None else _DEV, device_cc=cc)
     assert not env.decode.served and not env.extend.served and env.forms == () and match in env.decode.reason and match in env.extend.reason
     assert env.decode.routes  # the routes are geometry facts, listed either way
+    assert env.decode.pdl_default is False  # the PDL default is the measured part's
 
 
 def test_every_static_decline_of_the_decode_declaration_is_predicted_by_the_envelope(monkeypatch):
@@ -788,10 +799,18 @@ def test_declaration_facts(group, s_q):
         assert (blk._sdpa.num_sequences, blk._sdpa.max_seq_len, blk._sdpa.cu_seqlens) == (4, s_q, False)
     names = [st.name for st in blk._stages]
     # C0: at decode row counts (B x S_q = 4 x s_q <= 128) the declaration fuse_norm_rope=True LOWERS stage (1) to the unfused chain --
-    # the slab GEMM, the norm + RoPE pass, the SEPARATE cache write (no write-through arm to fold into) -- and reads it back
+    # the slab GEMM, the norm + RoPE pass with the paged write-through folded in (fuse_cache_write_small_m's default below 128 rows: the
+    # separate cache-write stage is not built) -- and reads it back; fuse_cache_write_small_m=False keeps the separate launch
     assert blk.fuse_norm_rope and not blk.fuse_norm_rope_effective and blk.small_m_decode and blk.fuse_norm_rope_small_m is None
-    assert not blk.cache_write_fused and isinstance(blk._cache_write, _CacheWrite) and blk._norm_rope is not None
-    assert names == ["qkv_gate_proj", "qk_norm_rope", "cache_write", "sdpa"] + ([] if blk.gate_fused else ["sigmoid_gate"]) + ["out_proj"], names
+    assert not blk.cache_write_fused and blk.cache_write_in_norm_rope and blk._cache_write is None and blk._norm_rope is not None
+    assert names == ["qkv_gate_proj", "qk_norm_rope", "sdpa"] + ([] if blk.gate_fused else ["sigmoid_gate"]) + ["out_proj"], names
+    sep, _ = _make_block(
+        group, 4, s_q, fuse_gate=True, fuse_norm_rope=True, decode_split_kv=None if torch.cuda.is_available() else 2, fuse_cache_write_small_m=False
+    )
+    assert not sep.cache_write_in_norm_rope and isinstance(sep._cache_write, _CacheWrite) and sep.gate_fused is blk.gate_fused
+    assert [st.name for st in sep._stages] == ["qkv_gate_proj", "qk_norm_rope", "cache_write", "sdpa"] + ([] if sep.gate_fused else ["sigmoid_gate"]) + [
+        "out_proj"
+    ]
     # the A/B's control arm: fuse_norm_rope_small_m=True keeps the fused fork, the write-through FOLDED into its epilogue under AUTO
     blk_f, _ = _make_block(
         group, 4, s_q, fuse_gate=True, fuse_norm_rope=True, decode_split_kv=None if torch.cuda.is_available() else 2, fuse_norm_rope_small_m=True
@@ -831,13 +850,13 @@ def test_declaration_facts(group, s_q):
     if r.decode_tile:
         # an unsplit decode tile: the gate is its own launch
         assert blk1.decode_split_kv == 1 and not blk1.gate_fused and isinstance(blk1._gate, _SigmoidGate) and not blk1._sdpa.fuse_gate
-        assert [st.name for st in blk1._stages] == ["qkv_gate_proj", "qk_norm_rope", "cache_write", "sdpa", "sigmoid_gate", "out_proj"]
+        assert [st.name for st in blk1._stages] == ["qkv_gate_proj", "qk_norm_rope", "sdpa", "sigmoid_gate", "out_proj"]
         blk4, _ = _make_block(group, 4, s_q, fuse_gate=False, decode_split_kv=4)
         assert blk4.decode_split_kv == 4 and blk4._sdpa.decode_split_kv == 4 and not blk4.gate_fused
     else:
         # the prefill route runs unsplit with the gate in the body; a pinned split is the decode tile's and a typed decline here
         assert blk1.decode_split_kv == 1 and blk1.gate_fused and blk1._gate is None and blk1._sdpa.fuse_gate
-        assert [st.name for st in blk1._stages] == ["qkv_gate_proj", "qk_norm_rope", "cache_write", "sdpa", "out_proj"]
+        assert [st.name for st in blk1._stages] == ["qkv_gate_proj", "qk_norm_rope", "sdpa", "out_proj"]
         with pytest.raises(NotImplementedError, match="prefill route.*unsplit"):
             _make_block(group, 4, s_q, fuse_gate=False, decode_split_kv=4)
 
@@ -1265,7 +1284,7 @@ def test_the_fused_fork_control_arm_matches_the_oracle_at_decode_row_counts(s_q)
     dflt = _std_case(12, s_q)
     assert ctl.blk.fuse_norm_rope_effective and ctl.blk.cache_write_fused and not dflt.blk.fuse_norm_rope_effective and not dflt.blk.cache_write_fused
     assert [st.name for st in ctl.blk._stages] == ["qkv_gate_proj_norm_rope", "sdpa", "out_proj"]
-    assert [st.name for st in dflt.blk._stages] == ["qkv_gate_proj", "qk_norm_rope", "cache_write", "sdpa", "out_proj"]
+    assert [st.name for st in dflt.blk._stages] == ["qkv_gate_proj", "qk_norm_rope", "sdpa", "out_proj"]  # the write-through in the norm + RoPE launch
     a = ctl.run().clone()
     b = dflt.run().clone()
     ctl.check_against_oracle(a, what="the fused fork (control)")
@@ -1716,14 +1735,13 @@ def test_two_launches_are_bitwise():
     assert torch.equal(a, b)
 
 
-@requires_rubin
-def test_capture_of_the_first_execute_replays_bitwise_and_takes_new_lengths_tables_slots_and_inputs():
+def _capture_replay_cell(**blk_kw):
     """The serving stack's defaults: the FIRST execute of a fresh declaration captured on a NEW stream with no eager warm-up
     under ``set_sync_debug_mode("error")`` (no host sync in the DECODE path: lengths, tables and slots are device data); the
     capture launches nothing, the replay is BITWISE a fresh eager run; a padded batch replays correctly; new ``kv_lens`` /
     ``block_table`` / ``slot_mapping`` / ``h`` through the captured tensors replay bitwise the eager run over them."""
     lens = (300, 0, 1000, 77)
-    case = _Case(16, 2, lens, seed=23)  # fresh: never executed
+    case = _Case(16, 2, lens, seed=23, blk_kw=blk_kw or None)  # fresh: never executed
     case.blk.check_support()
     case.blk.compile()
     case.ws = torch.empty(case.blk.get_workspace_size(), dtype=torch.uint8, device=_DEV)
@@ -1780,6 +1798,19 @@ def test_capture_of_the_first_execute_replays_bitwise_and_takes_new_lengths_tabl
         assert torch.equal(case.out, replayed2), "the replay over new lengths / tables / slots differs from the eager run over them"
     finally:
         graph.reset()
+
+
+@requires_rubin
+def test_capture_of_the_first_execute_replays_bitwise_and_takes_new_lengths_tables_slots_and_inputs():
+    _capture_replay_cell()
+
+
+@requires_rubin
+def test_capture_of_the_first_execute_replays_bitwise_on_the_plain_chain_with_the_separate_cache_write():
+    """The same cell on the chain as before (``use_pdl=False``, the separate cache-write launch).  The default cell above runs the PDL
+    chain with the paged write-through folded into the norm + RoPE launch (the arm's slot loads and pool stores are device-side like the
+    separate kernel's), so the two cells together capture both chains with no host sync and replay bitwise."""
+    _capture_replay_cell(use_pdl=False, fuse_cache_write_small_m=False)
 
 
 # ---------------------------------------------------------------------------
@@ -1948,3 +1979,350 @@ def test_decode_split_ladder_recombines_on_the_decode_grid(batch, s_q, split):
     assert rb["template"] == case.blk.decode_route.tile and rb["split"] == split and rb["epilogue_gate"] is False, rb
     if 0 in lens:
         assert (case.out[lens.index(0)] == 0).all(), "the padded entry writes exactly 0"
+
+
+# ---------------------------------------------------------------------------
+# The paged write-through folded into the norm + RoPE launch (fuse_cache_write_small_m): one launch fewer, the pools bitwise
+# ---------------------------------------------------------------------------
+#
+# kernels/qk_norm_rope_tma.py's pool-write arm: the slab's V band rides the launch as a third tile band and the post-RoPE K / V rows go
+# to the pools from the same tiles (the K words the slab's own, the V words a bit copy); the separate cache-write stage is not built.
+# The control is the chain as measured (the separate launch).  The two must leave BITWISE pools, slab bands and `out` on every pool
+# layout (the three served stride patterns + an HND pool with a padded page stride), both slot widths, with a padded entry (slot -1)
+# and with a slot pushed past the pools' capacity (a contract violation neither arm may write).  RED on a tree without the arm: the
+# declaration knob does not exist there (TypeError), and the V band is not part of the norm + RoPE launch.
+
+_POOL_LAYOUTS_PW = _LAYOUTS + ("hnd_padded",)
+_PW_LENS = (200, 0, 77, 1000)  # three live entries (a tail page each) around a PADDED one (block 0, slot -1)
+
+
+def _cupti_kernels(fn):
+    """The CUDA kernel names of one call under torch.profiler (CUPTI) after one warm call, memsets / memcpys split out; ``(None, None)``
+    when the node records nothing."""
+    from torch.profiler import ProfilerActivity, profile
+
+    fn()
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        fn()
+        torch.cuda.synchronize()
+    names = [e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA]
+    if not names:
+        return None, None
+    kernels = [n for n in names if "memset" not in n.lower() and "memcpy" not in n.lower()]
+    return kernels, [n for n in names if n not in kernels]
+
+
+def _slab_bands(case):
+    """The slab's Q, GATE, K and V bands after an execute, as the block's ``[T, H, D]`` column views (K and Q post-norm + RoPE)."""
+    g, lay = case.geom, case.blk._ws
+    t = case.blk.batch * case.blk.seq_len
+    proj = _view(case.ws, lay.proj, (t, g.n_qkvg), case.dtype)
+    o_q, o_g, o_k, o_v = g.qkvg_offsets[:4]
+    return tuple(_cols(proj, off, h, g.d_head) for off, h in ((o_q, g.h_q), (o_g, g.h_q), (o_k, g.h_kv), (o_v, g.h_kv)))
+
+
+def _pw_pair(layout, *, group=12, s_q=2, page=16, seed=3, dtype=torch.bfloat16):
+    """The control (the separate cache-write launch) and the arm (the write-through in the norm + RoPE launch) of one cell: identical
+    inputs, prefixes and pools, compiled once per layout (the stage compiles BOTH slot widths); each keeps a pristine copy of its pools
+    (the oracle prefix + the sentinel) to restore before every run."""
+    key = ("pw", layout, group, s_q, page, seed, dtype)
+    if key not in _CASES:
+        pair = []
+        for arm in (False, True):
+            c = _Case(group, s_q, _PW_LENS, page=page, layout=layout, seed=seed, dtype=dtype, blk_kw=dict(fuse_cache_write_small_m=arm)).compile()
+            c.pristine = (c.k_cache.clone(), c.v_cache.clone())
+            pair.append(c)
+        _CASES[key] = tuple(pair)
+    return _CASES[key]
+
+
+def _pw_run(case, slot_mapping):
+    case.k_cache.copy_(case.pristine[0])
+    case.v_cache.copy_(case.pristine[1])
+    case.out.fill_(float("nan"))
+    case.execute(slot_mapping=slot_mapping)
+    torch.cuda.synchronize()
+
+
+@requires_rubin
+@pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64], ids=["i32", "i64"])
+@pytest.mark.parametrize("layout", _POOL_LAYOUTS_PW)
+def test_the_write_through_in_the_norm_rope_launch_leaves_bitwise_pools_bands_and_out(layout, slot_dtype):
+    """The pools (K and V), the slab's four bands and ``out`` of the arm are BITWISE the separate launch's on ``layout`` with ``slot_dtype``
+    slots: (i) the padded cell (three live entries, one padded: slot -1 writes nothing, block 0 untouched, ``out`` vs the oracle), (ii) the
+    same cell with one live token's slot past BOTH pools' capacity (neither arm writes it: exactly ``H_kv`` rows fewer per pool)."""
+    ctl, arm = _pw_pair(layout)
+    h_kv = _GROUPS[12][1]
+    assert arm.blk.cache_write_in_norm_rope is True and arm.blk._cache_write is None and "cache_write" not in [st.name for st in arm.blk._stages]
+    assert ctl.blk.cache_write_in_norm_rope is False and isinstance(ctl.blk._cache_write, _CacheWrite)
+    assert arm.blk._norm_rope.page_size == 16 and ctl.blk._norm_rope.page_size == 0 and arm.blk._norm_rope._impl == "tma"
+    slots = ctl.slot_mapping.to(slot_dtype)
+    oor = slots.clone()
+    first_live = int(torch.nonzero(slots >= 0)[0].item())
+    oor[first_live] = ctl.n_pages * ctl.page + 3  # past both pools' capacity (n_pages x page slots): a contract violation, never written
+    written = {}
+    for tag, sm in (("padded", slots), ("out-of-range", oor)):
+        for c in (ctl, arm):
+            _pw_run(c, sm)
+        what = f"{layout} {slot_dtype} {tag}"
+        for name, a, b in (("K pool", arm.k_cache, ctl.k_cache), ("V pool", arm.v_cache, ctl.v_cache)):
+            assert torch.equal(_bits(a), _bits(b)), f"{what}: the {name} of the arm differs from the separate launch's"
+        assert torch.equal(_bits(arm.out), _bits(ctl.out)), f"{what}: out differs"
+        for name, a, b in zip(("Q", "GATE", "K", "V"), _slab_bands(arm), _slab_bands(ctl)):
+            assert torch.equal(_bits(a), _bits(b)), f"{what}: the slab's {name} band differs"
+        k0, v0 = arm.block0_bits
+        assert torch.equal(_bits(arm.k_cache[0]), k0) and torch.equal(_bits(arm.v_cache[0]), v0), f"{what}: block 0 written"
+        written[tag] = (_written(arm.k_cache), _written(arm.v_cache))
+        if tag == "padded":
+            arm.check_against_oracle(what=f"{what} (arm)")
+            assert written[tag][0] == _written(ctl.pristine[0]) + sum(2 for L in _PW_LENS if L) * h_kv, "the step's rows alone were written"
+    assert written["out-of-range"] == tuple(w - h_kv for w in written["padded"]), "the out-of-range token's rows must not land anywhere"
+
+
+@requires_rubin
+def test_the_write_through_in_the_norm_rope_launch_serves_f16_pools_bitwise():
+    """f16 activations (the unfused chain by declaration): the arm's pools and ``out`` bitwise the separate launch's on the compact layout."""
+    ctl, arm = _pw_pair("hnd", dtype=torch.float16, seed=5)
+    for c in (ctl, arm):
+        _pw_run(c, c.slot_mapping)
+    assert (
+        torch.equal(_bits(arm.k_cache), _bits(ctl.k_cache))
+        and torch.equal(_bits(arm.v_cache), _bits(ctl.v_cache))
+        and torch.equal(_bits(arm.out), _bits(ctl.out))
+    )
+    arm.check_against_oracle(what="f16 arm")
+
+
+@requires_rubin
+def test_the_write_through_in_the_norm_rope_launch_drops_the_cache_write_launch_seven_to_six():
+    """The DECODE chain's CUPTI census at the 24/2 shard's geometry (d_model 2560, B 1 x KV 4096, S_q 1, use_pdl): the separate-launch
+    chain is 7 kernels (slab GEMM, norm + RoPE, cache write, decode tile, split combine, out-proj GEMM, split-K reduce); with the
+    write-through in the norm + RoPE launch it is 6 -- the dropped name is the cache write's, `out` bitwise.  The pin names THIS tree's
+    chain (the two-kernel split-K reduce); a tree with the in-GEMM split-K reduce reads 6 / 5."""
+    cells = {}
+    for arm in (False, True):
+        cells[arm] = _Case(12, 1, (4096,), seed=1, d_model=2560, blk_kw=dict(use_pdl=True, fuse_cache_write_small_m=arm)).compile()
+    k_off, m_off = _cupti_kernels(lambda: cells[False].execute())
+    k_on, m_on = _cupti_kernels(lambda: cells[True].execute())
+    if k_off is None or k_on is None:
+        pytest.skip("torch.profiler recorded no CUDA events (CUPTI unavailable on this node); the launch count is unverified here")
+    print(f"\nseparate launch: {len(k_off)} kernels + {len(m_off)} memset/memcpy:\n  " + "\n  ".join(n[:120] for n in k_off))
+    print(f"in the norm + RoPE launch: {len(k_on)} kernels + {len(m_on)} memset/memcpy:\n  " + "\n  ".join(n[:120] for n in k_on))
+    assert any("frost_cache_write" in n for n in k_off) and not any("frost_cache_write" in n for n in k_on)
+    assert any("frost_qk_norm_rope_tma" in n for n in k_on)
+    assert not [n for n in m_on if "memcpy" in n.lower()], "a hidden copy on the arm's execute path"
+    assert (len(k_off), len(k_on)) == (7, 6), (len(k_off), len(k_on))
+    torch.cuda.synchronize()
+    cells[True].check_against_oracle(what="six launches")
+    assert torch.equal(_bits(cells[True].out), _bits(cells[False].out))
+    assert torch.equal(_bits(cells[True].k_cache), _bits(cells[False].k_cache)) and torch.equal(_bits(cells[True].v_cache), _bits(cells[False].v_cache))
+
+
+def test_fuse_cache_write_small_m_resolves_the_measured_rule_by_default_and_the_arm_owns_the_write():
+    """``fuse_cache_write_small_m`` (appended; None = AUTO): where the paged write-through runs on the DECODE form's unfused chain.  AUTO is
+    the MEASURED rule (``CACHE_WRITE_SMALL_M_DEFAULT_MAX_ROWS``): the write-through folds into the norm + RoPE launch (the stage carries the
+    page size, the separate stage is not built, the stage list loses ``cache_write``) at ``B x S_q < 128`` rows and at ``S_q = 1``
+    (measured to B 128; past it only under an explicit ``fuse_norm_rope=False``); the separate launch runs at ``B x S_q >= 128`` with
+    ``S_q > 1`` (where the arm measured slower) -- both edges pinned, an explicit
+    True / False winning on either side; the C0-lowered ``fuse_norm_rope=True`` declaration follows the same rule where it lowers and leaves
+    the fork its own write-through past the bound; f16 pools take the arm; the typed declines (the fused fork, a self block, a non-bool); the
+    carve does not read it."""
+    from cudnn.gated_attention_block import CACHE_WRITE_SMALL_M_DEFAULT_MAX_ROWS
+
+    assert CACHE_WRITE_SMALL_M_DEFAULT_MAX_ROWS == 128
+    at = lambda b=1, s_q=1, **kw: _make_block(12, b, s_q, **kw)[0]  # noqa: E731
+    names = lambda blk: [st.name for st in blk._stages]  # noqa: E731
+    auto = at()
+    assert auto.fuse_cache_write_small_m is None and auto.cache_write_in_norm_rope is True and auto._cache_write is None
+    assert auto._norm_rope.page_size == 16 and "cache_write" not in names(auto) and "qk_norm_rope" in names(auto)
+    sep = at(fuse_cache_write_small_m=False)
+    assert sep.fuse_cache_write_small_m is False and sep.cache_write_in_norm_rope is False and isinstance(sep._cache_write, _CacheWrite)
+    assert sep._norm_rope.page_size == 0 and "cache_write" in names(sep)
+    assert names(auto) == [n for n in names(sep) if n != "cache_write"], "the arm drops exactly the cache-write stage"
+    on = at(fuse_cache_write_small_m=True)
+    assert on.fuse_cache_write_small_m is True and on.cache_write_in_norm_rope is True and on._cache_write is None and names(on) == names(auto)
+    # the measured rule at its edges on the unfused chain (fuse_norm_rope=False: declared unfused at any row count, so the rule alone
+    # decides): every B 1 .. 4 cell and S_q = 1 (to B 129 here; measured to B 128) fold in; 128 rows with S_q > 1 do not (B 32 x 4 = the measured
+    # loss), 127 do
+    cells = (
+        ((1, 1), True),
+        ((4, 4), True),
+        ((1, 32), True),
+        ((32, 1), True),
+        ((127, 1), True),
+        ((128, 1), True),
+        ((129, 1), True),
+        ((31, 4), True),
+        ((63, 2), True),
+        ((32, 4), False),
+        ((64, 2), False),
+        ((16, 8), False),
+        ((128, 4), False),
+    )
+    for (b, s_q), want in cells:
+        blk = at(b, s_q, fuse_norm_rope=False)
+        assert blk.fuse_cache_write_small_m is None and blk.cache_write_in_norm_rope is want and (blk._cache_write is None) is want, (b, s_q)
+        assert ("cache_write" in names(blk)) is (not want) and blk._norm_rope.page_size == (16 if want else 0), (b, s_q)
+        # an explicit value wins on either side of the rule
+        assert at(b, s_q, fuse_norm_rope=False, fuse_cache_write_small_m=True).cache_write_in_norm_rope is True, (b, s_q)
+        assert at(b, s_q, fuse_norm_rope=False, fuse_cache_write_small_m=False).cache_write_in_norm_rope is False, (b, s_q)
+    # the default serving declaration (fuse_norm_rope=True): the C0 lowering runs the unfused chain to 128 rows -- the rule applies there
+    # (16 rows fold in, 128 rows with S_q 4 keep the separate launch) -- and the fused fork past it, which owns the write-through itself
+    low = at(4, 4, fuse_norm_rope=True)
+    assert low.small_m_decode and not low.fuse_norm_rope_effective and low.cache_write_in_norm_rope and low._cache_write is None
+    edge = at(32, 4, fuse_norm_rope=True)
+    assert edge.small_m_decode and not edge.fuse_norm_rope_effective and not edge.cache_write_in_norm_rope and isinstance(edge._cache_write, _CacheWrite)
+    high = at(129, 1, fuse_norm_rope=True)
+    assert (
+        not high.small_m_decode and high.fuse_norm_rope_effective and high.cache_write_fused and not high.cache_write_in_norm_rope and high._norm_rope is None
+    )
+    assert at(dtype=torch.float16).cache_write_in_norm_rope is True
+    assert auto._layout() == sep._layout(), "the carve does not read the knob"
+    # the typed declines
+    with pytest.raises(TypeError, match="fuse_cache_write_small_m must be None"):
+        at(fuse_cache_write_small_m=1)
+    with pytest.raises(NotImplementedError, match="fused projection fork"):
+        at(fuse_norm_rope=True, fuse_norm_rope_small_m=True, fuse_cache_write_small_m=True)
+    # under AUTO the fork keeps its own write-through (the arm reads False, never a decline)
+    fork = at(fuse_norm_rope=True, fuse_norm_rope_small_m=True)
+    assert fork.cache_write_in_norm_rope is False and fork.cache_write_fused and fork._norm_rope is None
+    geom, _ = _geom(12)
+    mk = lambda *shape: torch.empty(*shape, dtype=torch.bfloat16, device=_DEV)  # noqa: E731
+    with pytest.raises(NotImplementedError, match="needs paged_kv_page_size > 0"):
+        GatedAttentionBlockFwd(
+            mk(1, 1, _D_MODEL),
+            mk(geom.n_qkvg, _D_MODEL),
+            mk(_D),
+            mk(_D),
+            mk(1, 1, _ROPE),
+            mk(1, 1, _ROPE),
+            mk(_D_MODEL, 24 * _D),
+            mk(1, 1, _D_MODEL),
+            geom,
+            fuse_cache_write_small_m=True,
+        )
+
+
+def test_fuse_cache_write_small_m_is_a_typed_decline_off_the_arm_and_auto_reads_false_there():
+    """``fuse_cache_write_small_m=True`` off the arm's domain is a typed ``NotImplementedError`` naming the reason, and ``None`` reads False
+    there with the separate cache-write stage built (where there is a write-through at all): the EXTEND form and the write-through on the
+    block's own K / V (no dense decode route), the block-sparse decode mode -- a QsaSpec geometry with and without the indexer band, the
+    e4m3 cache -- (no dense route either: the no-route row speaks for them), a QuantSpec pipeline (the write-through's own quant decline
+    speaks first; without the attribute there is nothing to fold), fp32 activations on the dense form (the activation row).  The
+    resolver's quant / indexer-band / e4m3 rows are GUARDS the constructor cannot reach today; their text is pinned on the resolver
+    directly, so a form that admits one of those pipelines onto a decode route meets a pinned decline rather than a silent fold."""
+    import test_block_qsa_decode as _qsa
+    import test_block_qsa_fp8_kv as _qkv
+    import test_block_serving_extend as _ext
+    from cudnn.gated_attention_block import QuantSpec
+
+    no_route = "is the dense DECODE form's arm"
+    # the EXTEND form (packed, over the pools) and the dense write-through on the block's own K / V
+    with pytest.raises(NotImplementedError, match=no_route):
+        _ext._declare_extend(2, 128, max_kv_len=128, fuse_cache_write_small_m=True)
+    ext_auto, *_ = _ext._declare_extend(2, 128, max_kv_len=128)
+    assert ext_auto.cache_write_in_norm_rope is False and isinstance(ext_auto._cache_write, _CacheWrite) and ext_auto._norm_rope.page_size == 0
+    geom, _ = _geom(12)
+    mk = lambda *shape: torch.empty(*shape, dtype=torch.bfloat16, device=_DEV)  # noqa: E731
+    args = (mk(1, 1, _D_MODEL), mk(geom.n_qkvg, _D_MODEL), mk(_D), mk(_D), mk(1, 1, _ROPE), mk(1, 1, _ROPE), mk(_D_MODEL, 24 * _D), mk(1, 1, _D_MODEL), geom)
+    with pytest.raises(NotImplementedError, match=no_route):
+        GatedAttentionBlockFwd(*args, paged_kv_page_size=16, fuse_cache_write_small_m=True)
+    own = GatedAttentionBlockFwd(*args, paged_kv_page_size=16)
+    assert own.kv_source == KV_SOURCE_SELF and own.cache_write_in_norm_rope is False and isinstance(own._cache_write, _CacheWrite)
+    # the block-sparse decode mode: a QsaSpec geometry, the indexer band, the e4m3 cache -- no dense route
+    for decl in (
+        lambda **kw: _qsa._declare(_qsa.GEOM_SMALL, 2, 1, n_pages=4, fuse_norm_rope=False, **kw)[0],
+        lambda **kw: _qsa._declare(_qsa.GEOM_SMALL, 4, 1, n_pages=6, index_band=True, fuse_norm_rope=False, **kw)[0],
+        lambda **kw: _qkv._declare(_qkv.GEOM_SMALL, 2, 1, fuse_norm_rope=False, **kw)[0],
+    ):
+        with pytest.raises(NotImplementedError, match=no_route):
+            decl(fuse_cache_write_small_m=True)
+        blk = decl()
+        assert blk.decode_route is None and blk.cache_write_in_norm_rope is False and blk._cache_write is not None and blk._norm_rope.page_size == 0
+    # a QuantSpec pipeline: the write-through's own decline speaks first (e4m3 pools are the cache-dtype attribute's); nothing to fold without it
+    spec = QuantSpec(descale_h=0.01, descale_w_qkvg=0.02, descale_w_o=0.03, scale_q=1.0, scale_k=2.0, scale_v=3.0, scale_o=4.0)
+    g8 = GatedAttentionBlockGeometry(d_model=_D_MODEL, h_q=8, h_kv=2, d_head=_D, rope_dim=_ROPE)
+    e4 = lambda *shape: torch.zeros(*shape, dtype=torch.float8_e4m3fn, device=_DEV)  # noqa: E731
+    qargs = (
+        e4(1, 256, _D_MODEL),
+        e4(g8.n_qkvg, _D_MODEL),
+        mk(_D),
+        mk(_D),
+        mk(1, 256, _ROPE),
+        mk(1, 256, _ROPE),
+        e4(_D_MODEL, 8 * _D),
+        mk(1, 256, _D_MODEL),
+        g8,
+    )
+    with pytest.raises(NotImplementedError, match="paged_kv_page_size with quant=QuantSpec"):
+        GatedAttentionBlockFwd(*qargs, quant=spec, paged_kv_page_size=16, fuse_cache_write_small_m=True)
+    with pytest.raises(NotImplementedError, match="needs paged_kv_page_size > 0"):
+        GatedAttentionBlockFwd(*qargs, quant=spec, fuse_cache_write_small_m=True)
+    quant = GatedAttentionBlockFwd(*qargs, quant=spec)
+    assert quant.cache_write_in_norm_rope is False and quant._cache_write is None and quant.paged_kv_page_size == 0
+    # fp32 activations on the dense DECODE form (declared here, declined by check_support): the activation row
+    with pytest.raises(NotImplementedError, match="serves bf16 / f16 activations"):
+        _make_block(12, 1, 1, dtype=torch.float32, fuse_cache_write_small_m=True)
+    f32 = _make_block(12, 1, 1, dtype=torch.float32)[0]
+    assert f32.decode_route is not None and f32.cache_write_in_norm_rope is False and isinstance(f32._cache_write, _CacheWrite)
+    # the guard rows, on the resolver directly (a dense decode declaration with the facts forced): quant, the indexer band, the e4m3 cache
+    blk = _make_block(12, 1, 1)[0]
+    assert blk.cache_write_in_norm_rope is True
+    with pytest.raises(NotImplementedError, match="serves the bf16 / f16 pipeline only, got quant=QuantSpec"):
+        blk._resolve_cache_write_small_m(True, spec)
+    assert blk._resolve_cache_write_small_m(None, spec) is False
+    blk.geom = _qsa._geom(_qsa.GEOM_SMALL, index_band=True)[0]
+    assert blk.geom.index_band
+    with pytest.raises(NotImplementedError, match="indexer band"):
+        blk._resolve_cache_write_small_m(True, None)
+    assert blk._resolve_cache_write_small_m(None, None) is False
+    blk.geom = geom
+    blk.kv_cache_e4m3 = True
+    with pytest.raises(NotImplementedError, match="QUANTIZES"):
+        blk._resolve_cache_write_small_m(True, None)
+    assert blk._resolve_cache_write_small_m(None, None) is False
+
+
+def test_an_explicit_fuse_cache_write_false_keeps_the_separate_launch_under_the_auto_small_m_fold():
+    """``fuse_cache_write=False`` is "the separate launch always (the A/B control and the fallback)": under ``fuse_cache_write_small_m=None``
+    (AUTO) the request outranks the measured small-M rule -- the norm + RoPE launch carries no page size, the separate cache-write stage is
+    built and listed -- at every row count the rule would fold (``S_q = 1`` at any batch, ``B x S_q < 128``), on the C0-lowered
+    ``fuse_norm_rope=True`` declaration and on ``fuse_norm_rope=False`` alike; the control's stage list is the AUTO fold's plus exactly
+    ``cache_write``, its carve the same.  An explicit ``fuse_cache_write_small_m`` is this arm's own knob and the strongest request: ``True``
+    beside ``fuse_cache_write=False`` folds the write-through in (an explicit small-M value wins on either side, as documented), ``False`` keeps
+    the separate launch.  ``fuse_cache_write=None`` leaves the AUTO fold as before and ``fuse_cache_write=True`` keeps the fused fork, which
+    owns its own write-through (never this arm)."""
+    at = lambda b=1, s_q=1, **kw: _make_block(12, b, s_q, **kw)[0]  # noqa: E731
+    names = lambda blk: [st.name for st in blk._stages]  # noqa: E731
+    # the reviewed cell: a small-M decode declaration (24 / 2 at B 1 x S_q 1) with the control asked for by name
+    ctl = at(fuse_cache_write=False)
+    assert ctl.fuse_cache_write is False and ctl.fuse_cache_write_small_m is None and ctl.small_m_decode and not ctl.fuse_norm_rope_effective
+    assert ctl.cache_write_in_norm_rope is False and isinstance(ctl._cache_write, _CacheWrite) and not ctl.cache_write_fused
+    assert ctl._norm_rope is not None and ctl._norm_rope.page_size == 0 and "cache_write" in names(ctl)
+    auto = at()
+    assert auto.fuse_cache_write is None and auto.cache_write_in_norm_rope is True and auto._cache_write is None
+    assert names(auto) == [n for n in names(ctl) if n != "cache_write"], "the control adds exactly the cache-write stage"
+    assert ctl._layout() == auto._layout(), "the carve does not read the control (performance-only)"
+    # every cell the AUTO rule folds, with the C0 lowering (fuse_norm_rope=True to 128 rows) and on the chain declared unfused outright
+    for b, s_q in ((1, 1), (12, 1), (4, 4), (32, 1), (128, 1), (31, 4), (63, 2)):
+        for fnr in (True, False):
+            blk = at(b, s_q, fuse_norm_rope=fnr, fuse_cache_write=False)
+            assert blk._norm_rope is not None and not blk.fuse_norm_rope_effective, (b, s_q, fnr)
+            assert blk.cache_write_in_norm_rope is False and isinstance(blk._cache_write, _CacheWrite) and blk._norm_rope.page_size == 0, (b, s_q, fnr)
+            assert at(b, s_q, fuse_norm_rope=fnr).cache_write_in_norm_rope is True, (b, s_q, fnr)  # the AUTO twin folds
+    # the explicit small-M knob is the strongest request: True beside the control folds in, False keeps the separate launch
+    on = at(fuse_cache_write=False, fuse_cache_write_small_m=True)
+    assert on.cache_write_in_norm_rope is True and on._cache_write is None and on._norm_rope.page_size == 16 and names(on) == names(auto)
+    off = at(fuse_cache_write=False, fuse_cache_write_small_m=False)
+    assert off.cache_write_in_norm_rope is False and isinstance(off._cache_write, _CacheWrite) and names(off) == names(ctl)
+    # the other readings of fuse_cache_write: None folds as before; True keeps the fused fork (its own write-through, never this arm)
+    assert at(fuse_cache_write=None).cache_write_in_norm_rope is True
+    fork = at(fuse_norm_rope=True, fuse_cache_write=True)
+    assert fork.fuse_norm_rope_effective and fork.cache_write_fused and fork.cache_write_in_norm_rope is False and fork._norm_rope is None
+    # past the rule the control changes nothing: 128 rows with S_q > 1 keep the separate launch under every reading
+    assert at(32, 4, fuse_norm_rope=False).cache_write_in_norm_rope is False
+    assert at(32, 4, fuse_norm_rope=False, fuse_cache_write=False).cache_write_in_norm_rope is False
+    # the resolver on its own facts: AUTO reads False with the control declared and True without it; an explicit value is followed either way
+    assert ctl._resolve_cache_write_small_m(None, None) is False and auto._resolve_cache_write_small_m(None, None) is True
+    assert ctl._resolve_cache_write_small_m(True, None) is True and ctl._resolve_cache_write_small_m(False, None) is False

@@ -388,10 +388,12 @@ cudnn.flex_attention.flex_attn_func
 cudnn.frost
 cudnn.frost.cutedsl_runtime_available
 cudnn.gated_attention_block
+cudnn.gated_attention_block.CACHE_WRITE_SMALL_M_DEFAULT_MAX_ROWS
 cudnn.gated_attention_block.DECODE_CLAIMED_MAX_N_Q
 cudnn.gated_attention_block.DECODE_CLAIMED_MAX_S_Q
 cudnn.gated_attention_block.DECODE_MAX_ROWS
 cudnn.gated_attention_block.DECODE_MAX_S_Q
+cudnn.gated_attention_block.DECODE_PDL_DEFAULT_CCS
 cudnn.gated_attention_block.DECODE_PREFILL_ROUTE_MIN_CTAS
 cudnn.gated_attention_block.DECODE_PREFILL_TILE_ROWS
 cudnn.gated_attention_block.DECODE_ROUTE_POLICIES
@@ -401,6 +403,7 @@ cudnn.gated_attention_block.DecodeEnvelope
 cudnn.gated_attention_block.DecodeEnvelope.claimed_max_s_q
 cudnn.gated_attention_block.DecodeEnvelope.inference_only
 cudnn.gated_attention_block.DecodeEnvelope.kv_cache_dtypes
+cudnn.gated_attention_block.DecodeEnvelope.pdl_default
 cudnn.gated_attention_block.DecodeEnvelope.pdl_stages
 cudnn.gated_attention_block.DecodeEnvelope.policy
 cudnn.gated_attention_block.DecodeEnvelope.q_tile_max

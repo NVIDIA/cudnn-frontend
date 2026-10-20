@@ -9,8 +9,11 @@ prologue: the norm + RoPE pass (TMA), the paged write-through, the sigmoid gate,
 combine (the FROST GEMM templates already launch that way).  The same kernels run the same math, so the switch is a KNOB:
 ``out`` is BITWISE the ``use_pdl=False`` block's.
 
-Host cells (any device): the switch is recorded on the block and on every stage it reaches, defaults off, and a declaration
-of a pipeline whose stages carry no sites (the e4m3 KV cache here) is a typed decline that names the switch; the switch is PER
+Host cells (any device): the switch is recorded on the block and on every stage it reaches; its default is AUTO -- resolved True on
+the DECODE form's decode-tile routes for the bf16 / f16 block on cc 10.7 (``DECODE_PDL_DEFAULT_CCS``, the measured part; the device read
+patched here to pin both readings on any host), False on every other part, form (EXTEND, ``kv_source="self"``) and route (the prefill
+route), an explicit value winning everywhere -- and a declaration of a pipeline whose stages carry no sites (the e4m3 KV cache here) is a
+typed decline that names the switch; the switch is PER
 STAGE -- a stage whose kernel carries no sites (the paged d256 prefill tile of the DECODE form's prefill route) launches plain and
 the link serializes, which PDL's semantics keep correct -- read back by ``pdl_stages`` / ``use_pdl_effective`` on the block,
 ``DecodeRoute.pdl_capable`` per route and ``pdl_stages`` on each form's envelope.
@@ -35,9 +38,12 @@ import sys
 import pytest
 import torch
 
+import cudnn.gated_attention_block.api as _api
+from cudnn.frost import buffers as _buffers
 from cudnn.frost.buffers import cutedsl_requirement_error
-from cudnn.gated_attention_block import GatedAttentionBlockFwd, decode_route
+from cudnn.gated_attention_block import GatedAttentionBlockFwd, GatedAttentionBlockGeometry, QuantSpec, decode_route
 from cudnn.gated_attention_block.api import (
+    DECODE_PDL_DEFAULT_CCS,
     DECODE_PDL_STAGES,
     DECODE_TILE,
     EXTEND_PDL_STAGES,
@@ -60,7 +66,7 @@ requires_rubin = pytest.mark.requires_rubin  # the suite's registered marker (co
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from gated_block_pdl_probe import cuda_versions, delayed_write, retrace  # noqa: E402
-from test_block_serving_decode import _DEV, _Case, _bits, _written  # noqa: E402
+from test_block_serving_decode import _D, _D_MODEL, _DEV, _ROPE, _Case, _bits, _geom, _make_block, _written  # noqa: E402
 
 _LENS = (100, 384, 500, 0)  # the decode module's standard cell: a tail tile, ring depth 3 and 4, a PADDED entry
 _CASES = {}
@@ -87,36 +93,130 @@ def _slab(case):
 # -- the host cell ------------------------------------------------------------------------------------------------------------
 
 
-def test_the_switch_is_recorded_on_every_stage_defaults_off_and_declines_the_unserved_pipelines():
-    off = _Case(16, 1, (100,), seed=1)
+def test_the_switch_is_recorded_on_every_stage_resolves_by_part_and_declines_the_unserved_pipelines(monkeypatch):
+    off = _Case(16, 1, (100,), seed=1, blk_kw=dict(use_pdl=False))
     on = _Case(16, 1, (100,), seed=1, blk_kw=dict(use_pdl=True))
-    assert off.blk.use_pdl is False and on.blk.use_pdl is True
+    assert off.blk.use_pdl is False and on.blk.use_pdl is True and off.blk.use_pdl_requested is False and on.blk.use_pdl_requested is True
     assert off.blk._sdpa.use_pdl is False and on.blk._sdpa.use_pdl is True and on.blk.decode_route.pdl_capable is True
     assert off.blk.pdl_stages == () and off.blk.use_pdl_effective is False
-    # the default declaration (fuse_norm_rope=True, lowered to the unfused chain at decode row counts): the norm + RoPE pass and the
-    # write-through carry the switch; the fused fork (its template launches with PDL unconditionally) under the control knob carries none
-    assert isinstance(on.blk._norm_rope, _QkNormRope) and on.blk._norm_rope.use_pdl is True and on.blk._cache_write.use_pdl is True and on.blk._gate is None
-    assert on.blk.pdl_stages == ("qk_norm_rope", "cache_write", "sdpa") and on.blk.use_pdl_effective is True
+    # the default declaration (fuse_norm_rope=True, lowered to the unfused chain at decode row counts, the paged write-through folded into
+    # the norm + RoPE launch at one row): the norm + RoPE pass carries the switch and there is no separate cache write to carry it; the
+    # fused fork (its template launches with PDL unconditionally) under the control knob carries none
+    assert isinstance(on.blk._norm_rope, _QkNormRope) and on.blk._norm_rope.use_pdl is True and on.blk._cache_write is None and on.blk._gate is None
+    assert on.blk.cache_write_in_norm_rope and on.blk.pdl_stages == ("qk_norm_rope", "sdpa") and on.blk.use_pdl_effective is True
+    sep = _Case(16, 1, (100,), seed=1, blk_kw=dict(use_pdl=True, fuse_cache_write_small_m=False))
+    assert isinstance(sep.blk._cache_write, _CacheWrite) and sep.blk._cache_write.use_pdl is True
+    assert sep.blk.pdl_stages == ("qk_norm_rope", "cache_write", "sdpa") and sep.blk.use_pdl_effective is True
     fork = _Case(16, 1, (100,), seed=1, blk_kw=dict(use_pdl=True, fuse_norm_rope_small_m=True))
     assert fork.blk._norm_rope is None and fork.blk._cache_write is None and fork.blk._gate is None and fork.blk.use_pdl is True
     assert fork.blk.pdl_stages == ("sdpa",) and fork.blk.use_pdl_effective is True
-    # the unfused, unsplit declaration reaches every stage with its own kernel
-    on1 = _Case(16, 1, (100,), seed=1, blk_kw=dict(use_pdl=True, fuse_norm_rope=False, decode_split_kv=1))
+    # the unfused, unsplit declaration with the separate cache write reaches every stage with its own kernel
+    on1 = _Case(16, 1, (100,), seed=1, blk_kw=dict(use_pdl=True, fuse_norm_rope=False, decode_split_kv=1, fuse_cache_write_small_m=False))
     assert isinstance(on1.blk._norm_rope, _QkNormRope) and on1.blk._norm_rope.use_pdl is True
     assert isinstance(on1.blk._cache_write, _CacheWrite) and on1.blk._cache_write.use_pdl is True
     assert isinstance(on1.blk._gate, _SigmoidGate) and on1.blk._gate.use_pdl is True
     assert _stage_names(on1) == ["qkv_gate_proj", "qk_norm_rope", "cache_write", "sdpa", "sigmoid_gate", "out_proj"]
     assert on1.blk.pdl_stages == ("qk_norm_rope", "cache_write", "sdpa", "sigmoid_gate") and on1.blk.use_pdl_effective is True
-    off1 = _Case(16, 1, (100,), seed=1, blk_kw=dict(fuse_norm_rope=False, decode_split_kv=1))
+    off1 = _Case(16, 1, (100,), seed=1, blk_kw=dict(use_pdl=False, fuse_norm_rope=False, decode_split_kv=1, fuse_cache_write_small_m=False))
     assert off1.blk._norm_rope.use_pdl is False and off1.blk._cache_write.use_pdl is False and off1.blk._gate.use_pdl is False
     # the same stage list either way: the switch adds no launch and removes none
     assert _stage_names(on) == _stage_names(off) and _stage_names(on1) == _stage_names(off1)
+    # AUTO (the default, None): the PART decides -- True on the measured part (cc 10.7) for this decode-tile route, False on every other
+    # part; this host's own reading is one of the two, and the declaration is kept beside the resolved switch
+    assert DECODE_PDL_DEFAULT_CCS == ((10, 7),)
+    auto = _Case(16, 1, (100,), seed=1)
+    assert auto.blk.use_pdl_requested is None and auto.blk.use_pdl is (_api._device_cc_of(_DEV) in DECODE_PDL_DEFAULT_CCS)
+    for cc, want in (((10, 7), True), ((10, 0), False), ((10, 3), False), ((9, 0), False), (None, False)):
+        monkeypatch.setattr(_api, "_device_cc_of", lambda device, _cc=cc: _cc)
+        blk = _Case(16, 1, (100,), seed=1).blk
+        assert blk.use_pdl is want and blk.use_pdl_requested is None and blk._norm_rope.use_pdl is want and blk._sdpa.use_pdl is want, cc
+        assert blk.pdl_stages == (("qk_norm_rope", "sdpa") if want else ()) and blk.use_pdl_effective is want, cc
+        # an explicit value wins on every part
+        assert _Case(16, 1, (100,), seed=1, blk_kw=dict(use_pdl=False)).blk.use_pdl is False, cc
+        assert _Case(16, 1, (100,), seed=1, blk_kw=dict(use_pdl=True)).blk.use_pdl is True, cc
+    monkeypatch.undo()
+    # the knob is None / True / False
+    with pytest.raises(TypeError, match="use_pdl must be None"):
+        _Case(16, 1, (100,), seed=1, blk_kw=dict(use_pdl=1))
     # an unserved pipeline declines, typed, naming the switch -- before any other check of that pipeline runs
     with pytest.raises(NotImplementedError, match="use_pdl=True is served for the bf16 / f16 block only"):
         _Case(16, 1, (100,), seed=1, blk_kw=dict(use_pdl=True, kv_cache_dtype=torch.float8_e4m3fn))
 
 
-def test_the_prefill_route_keeps_the_switch_off_stage_four_and_reads_back_which_stages_took_it():
+def test_auto_and_the_explicit_switch_answer_for_one_domain_on_the_measured_part(monkeypatch):
+    """With the device read patched to the measured part, AUTO resolves True ONLY where an explicit True is served: the two readings of
+    the knob answer for one domain.  Pools declared in the activation dtype (``kv_cache_dtype=torch.bfloat16``, the ``None`` spelling)
+    take the default and the explicit True alike -- a serving stack that spells the dtype can form its own A/B --, a 16-bit pool of the
+    other width hears the attribute's own ``ValueError``, not the switch's decline.  On every pipeline the default excludes -- the EXTEND
+    form, ``kv_source="self"``, a QuantSpec pipeline, a QsaSpec geometry (with and without the indexer band), the e4m3 cache -- AUTO
+    reads False with no stage switched; the explicit True is served per stage on the two bf16 forms without a decode route (their
+    prefill tiles carry no sites) and is the typed decline on the other three."""
+    import test_block_qsa_decode as _qsa
+    import test_block_qsa_fp8_kv as _qkv
+    import test_block_serving_extend as _ext
+
+    monkeypatch.setattr(_api, "_device_cc_of", lambda device: (10, 7))
+    off = lambda blk: blk.use_pdl is False and blk.use_pdl_requested is None and blk.pdl_stages == () and blk.use_pdl_effective is False  # noqa: E731
+    decline = "use_pdl=True is served for the bf16 / f16 block only"
+    # pools spelled in the activation dtype: the same block as kv_cache_dtype=None, under both readings
+    auto = _make_block(12, 1, 1)[0]
+    spelled = _make_block(12, 1, 1, kv_cache_dtype=torch.bfloat16)[0]
+    assert auto.use_pdl is True and spelled.use_pdl is True and spelled.use_pdl_requested is None and not spelled.kv_cache_e4m3
+    assert spelled.pdl_stages == auto.pdl_stages == ("qk_norm_rope", "sdpa", "sigmoid_gate") and spelled.use_pdl_effective is True
+    on = _make_block(12, 1, 1, kv_cache_dtype=torch.bfloat16, use_pdl=True)[0]
+    assert on.use_pdl is True and on.use_pdl_requested is True and on.pdl_stages == auto.pdl_stages
+    assert _make_block(12, 1, 1, kv_cache_dtype=torch.bfloat16, use_pdl=False)[0].pdl_stages == ()
+    assert _make_block(12, 1, 1, dtype=torch.float16, kv_cache_dtype=torch.float16, use_pdl=True)[0].use_pdl is True
+    assert _make_block(12, 1, 1, dtype=torch.float16, kv_cache_dtype=torch.float16)[0].use_pdl is True
+    with pytest.raises(ValueError, match="differs from the activation dtype"):
+        _make_block(12, 1, 1, kv_cache_dtype=torch.float16, use_pdl=True)
+    with pytest.raises(NotImplementedError, match="no e4m3 KV cache"):
+        _make_block(12, 1, 1, kv_cache_dtype=torch.float8_e4m3fn, use_pdl=True)
+    # the EXTEND form and the block's own K / V: no decode route, AUTO False; the explicit True threads the stages with sites only
+    ext_auto, *_ = _ext._declare_extend(2, 128, max_kv_len=128)
+    assert off(ext_auto) and ext_auto.decode_route is None and isinstance(ext_auto._cache_write, _CacheWrite)
+    ext_on, *_ = _ext._declare_extend(2, 128, max_kv_len=128, use_pdl=True)
+    assert ext_on.use_pdl is True and ext_on._sdpa.use_pdl is False and "sdpa" not in ext_on.pdl_stages and ext_on.use_pdl_effective is False
+    assert ext_on.pdl_stages == ("qk_norm_rope", "cache_write", "sigmoid_gate")
+    geom, _ = _geom(12)
+    mk = lambda *shape: torch.empty(*shape, dtype=torch.bfloat16, device=_DEV)  # noqa: E731
+    args = (mk(1, 1, _D_MODEL), mk(geom.n_qkvg, _D_MODEL), mk(_D), mk(_D), mk(1, 1, _ROPE), mk(1, 1, _ROPE), mk(_D_MODEL, 24 * _D), mk(1, 1, _D_MODEL), geom)
+    own = GatedAttentionBlockFwd(*args)
+    assert off(own) and own.decode_route is None and own.kv_source == "self"
+    own_on = GatedAttentionBlockFwd(*args, use_pdl=True)
+    assert own_on.use_pdl is True and own_on._sdpa.use_pdl is False and "sdpa" not in own_on.pdl_stages and own_on.use_pdl_effective is False
+    # a QuantSpec pipeline: AUTO False, the explicit True declined
+    spec = QuantSpec(descale_h=0.01, descale_w_qkvg=0.02, descale_w_o=0.03, scale_q=1.0, scale_k=2.0, scale_v=3.0, scale_o=4.0)
+    g8 = GatedAttentionBlockGeometry(d_model=_D_MODEL, h_q=8, h_kv=2, d_head=_D, rope_dim=_ROPE)
+    e4 = lambda *shape: torch.zeros(*shape, dtype=torch.float8_e4m3fn, device=_DEV)  # noqa: E731
+    qargs = (
+        e4(1, 256, _D_MODEL),
+        e4(g8.n_qkvg, _D_MODEL),
+        mk(_D),
+        mk(_D),
+        mk(1, 256, _ROPE),
+        mk(1, 256, _ROPE),
+        e4(_D_MODEL, 8 * _D),
+        mk(1, 256, _D_MODEL),
+        g8,
+    )
+    assert off(GatedAttentionBlockFwd(*qargs, quant=spec))
+    with pytest.raises(NotImplementedError, match=decline):
+        GatedAttentionBlockFwd(*qargs, quant=spec, use_pdl=True)
+    # the block-sparse decode mode: a QsaSpec geometry, the indexer band, the e4m3 cache -- AUTO False, the explicit True declined
+    sparse = _qsa._declare(_qsa.GEOM_SMALL, 2, 1, n_pages=4)[0]
+    assert off(sparse) and sparse.decode_route is None and sparse.sparse_decode
+    with pytest.raises(NotImplementedError, match=decline):
+        _qsa._declare(_qsa.GEOM_SMALL, 2, 1, n_pages=4, use_pdl=True)
+    band = _qsa._declare(_qsa.GEOM_SMALL, 4, 1, n_pages=6, index_band=True, fuse_norm_rope=False)[0]
+    assert off(band) and band.geom.index_band
+    e4m3 = _qkv._declare(_qkv.GEOM_SMALL, 2, 1, fuse_norm_rope=False)[0]
+    assert off(e4m3) and e4m3.kv_cache_e4m3 and e4m3.decode_route is None
+    with pytest.raises(NotImplementedError, match="no e4m3 KV cache"):
+        _qkv._declare(_qkv.GEOM_SMALL, 2, 1, fuse_norm_rope=False, use_pdl=True)
+
+
+def test_the_prefill_route_keeps_the_switch_off_stage_four_and_reads_back_which_stages_took_it(monkeypatch):
     """The switch is PER STAGE: at 32 / 2, ``S_q = 5`` the DECODE form rides the paged d256 PREFILL tile (80 packed rows), whose
     template carries no griddepcontrol sites -- so the block declares fine, hands the switch to the norm + RoPE pass and the
     write-through, never to stage (4) (it launches plain and the link serializes: correct by PDL's semantics), and reads it back:
@@ -124,6 +224,7 @@ def test_the_prefill_route_keeps_the_switch_off_stage_four_and_reads_back_which_
     decode-tile route, and the envelopes name the switched stage kinds per form before anything is declared."""
     # 32 sequences x 2 KV heads = 64 CTAs: the prefill route's fill; 32 x 5 = 160 rows is past the small-M lowering's band (the fused
     # declaration keeps its fork there), so the unfused chain -- the stages the switch reaches -- is the fuse_norm_rope=False declaration
+    # (160 rows with S_q > 1: the paged write-through stays its own launch, the measured rule of fuse_cache_write_small_m)
     case = _Case(16, 5, (100,) * 32, seed=1, blk_kw=dict(use_pdl=True, fuse_norm_rope=False))
     blk = case.blk
     assert blk.use_pdl is True and blk.decode_route.prefill_tile and blk.decode_route.pdl_capable is False and blk._sdpa.thd and blk.decode_route.batch == 32
@@ -131,8 +232,15 @@ def test_the_prefill_route_keeps_the_switch_off_stage_four_and_reads_back_which_
     assert isinstance(blk._norm_rope, _QkNormRope) and blk._norm_rope.use_pdl is True and blk._cache_write.use_pdl is True and blk._gate is None
     assert _stage_names(case) == ["qkv_gate_proj", "qk_norm_rope", "cache_write", "sdpa", "out_proj"]
     assert blk.pdl_stages == ("qk_norm_rope", "cache_write") and blk.use_pdl_effective is False
-    plain = _Case(16, 5, (100,) * 32, seed=1, blk_kw=dict(fuse_norm_rope=False))
+    plain = _Case(16, 5, (100,) * 32, seed=1, blk_kw=dict(use_pdl=False, fuse_norm_rope=False))
     assert plain.blk.pdl_stages == () and plain.blk.use_pdl_effective is False and _stage_names(plain) == _stage_names(case)
+    # AUTO on the prefill route: the default is scoped to decode-tile routes (where stage (4) takes the switch), so even on the measured
+    # part this declaration launches the plain chain -- an explicit True still threads the two stages (above)
+    monkeypatch.setattr(_api, "_device_cc_of", lambda device: (10, 7))
+    auto = _Case(16, 5, (100,) * 32, seed=1, blk_kw=dict(fuse_norm_rope=False))
+    assert auto.blk.decode_route.prefill_tile and auto.blk.use_pdl is False and auto.blk.use_pdl_requested is None and auto.blk.pdl_stages == ()
+    assert _Case(16, 5, (100,), seed=1).blk.use_pdl is True, "below the fill the same step rides the decode tile: the default is on"
+    monkeypatch.undo()
     # the stage's own rule and the record's fact agree: a decode-tile route takes the switch, the prefill route and no route do not
     geom = blk.geom
     assert _Sdpa.pdl_capable(None) is False and _Sdpa.pdl_capable(decode_route(geom, 4)) is True and _Sdpa.pdl_capable(decode_route(geom, 5, batch=32)) is False
@@ -144,6 +252,17 @@ def test_the_prefill_route_keeps_the_switch_off_stage_four_and_reads_back_which_
     env = GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, _DEV)
     assert env.decode.pdl_stages == DECODE_PDL_STAGES == ("qk_norm_rope", "cache_write", "sigmoid_gate", "sdpa")
     assert env.extend.pdl_stages == EXTEND_PDL_STAGES == ("qk_norm_rope", "cache_write", "sigmoid_gate")
+    # the part's AUTO reading of the switch, before anything is declared: this host's, and the measured part's against another part's --
+    # a FORM-level reading of a SERVED form (the measured part's reading needs the DSL's Rubin target, patched present as the decode module
+    # does; an unserved dtype reads False there); the per-step reading is `pdl_default and route(s_q, batch).pdl_capable`
+    assert env.decode.pdl_default is (env.decode.served and env.device_cc in DECODE_PDL_DEFAULT_CCS)
+    monkeypatch.setattr(_buffers, "_cutedsl_has_sm107", lambda: True)
+    rubin = GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, _DEV, device_cc=(10, 7)).decode
+    assert rubin.served and rubin.pdl_default is True and rubin.route(4).pdl_capable and not rubin.route(5, batch=32).pdl_capable
+    assert GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, _DEV, device_cc=(10, 0)).decode.pdl_default is False
+    fp32 = GatedAttentionBlockFwd.serving_envelope(geom, torch.float32, _DEV, device_cc=(10, 7)).decode
+    assert not fp32.served and fp32.pdl_default is False, "the default is a reading of a served form"
+    monkeypatch.undo()
     assert (
         all(r.pdl_capable is r.decode_tile for r in env.decode.routes)
         and env.decode.route(5, batch=32).pdl_capable is False
@@ -155,7 +274,7 @@ def test_the_prefill_route_keeps_the_switch_off_stage_four_and_reads_back_which_
     for extra in (dict(decode_route_policy="token_units"), dict()):
         tu = _Case(16, 5, (100,), seed=1, blk_kw=dict(use_pdl=True, **extra))
         assert tu.blk.decode_route.decode_tile and tu.blk.decode_route.pdl_capable and tu.blk._sdpa.use_pdl is True and tu.blk.use_pdl_effective is True
-        assert tu.blk.pdl_stages == ("qk_norm_rope", "cache_write", "sdpa"), extra
+        assert tu.blk.pdl_stages == ("qk_norm_rope", "sdpa"), extra  # 5 rows: the write-through rides the norm + RoPE launch
 
 
 # -- the Rubin cells: bitwise with and without the switch ----------------------------------------------------------------------
@@ -199,6 +318,25 @@ def test_the_decode_step_is_bitwise_with_and_without_pdl(decl, s_q):
     assert torch.equal(b, c)
 
 
+@requires_rubin
+def test_the_default_declaration_resolves_the_switch_on_and_is_bitwise_the_plain_chain():
+    """On the measured part the DEFAULT declaration (``use_pdl`` left None) is the PDL chain: the readback says so (``use_pdl`` True from
+    ``use_pdl_requested`` None, the stages that took the attribute), the route and the stage list are the explicit chains', and ``out`` and
+    the pools are BITWISE the explicit plain chain's (``use_pdl=False``) and the explicit PDL chain's."""
+    auto = _Case(16, 1, _LENS, seed=0).compile()
+    off = _case(16, 1, pdl=False)
+    on = _case(16, 1, pdl=True)
+    assert auto.blk.use_pdl_requested is None and auto.blk.use_pdl is True and auto.blk.use_pdl_effective is True
+    assert auto.blk.pdl_stages == on.blk.pdl_stages == ("qk_norm_rope", "sdpa") and off.blk.pdl_stages == ()
+    assert auto.route_readback() == off.route_readback() and _stage_names(auto) == _stage_names(off) == _stage_names(on)
+    a = off.run().clone()
+    b = auto.run().clone()
+    auto.check_against_oracle(b, what="the default declaration")
+    assert torch.equal(a, b), f"the default chain differs from the plain chain (max|diff| {(a.float() - b.float()).abs().max().item():.3e})"
+    assert torch.equal(b, on.run().clone())
+    assert torch.equal(_bits(auto.k_cache), _bits(off.k_cache)) and torch.equal(_bits(auto.v_cache), _bits(off.v_cache)), "the write-through differs"
+
+
 # -- the Rubin cell: capture + replay ------------------------------------------------------------------------------------------
 
 
@@ -211,7 +349,7 @@ def test_capture_of_the_first_pdl_execute_replays_bitwise_the_eager_plain_and_pd
     v = cuda_versions()
     print(f"cuda versions: {v}")
     lens = (300, 0, 1000, 77)
-    plain = _Case(16, 2, lens, seed=23).compile()
+    plain = _Case(16, 2, lens, seed=23, blk_kw=dict(use_pdl=False)).compile()
     ref = plain.run().clone()
     plain.check_against_oracle(ref, what="plain eager")
     case = _Case(16, 2, lens, seed=23, blk_kw=dict(use_pdl=True))  # fresh: never executed
