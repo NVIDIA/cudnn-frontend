@@ -54,15 +54,20 @@ def _expected_split(api):
     )
 
 
-def _sm120_reference(q, k, v, *, causal=False, stats_log2=False):
-    """Keep the FP32 oracle's score matrix bounded to one query head."""
+def _sm120_reference(q, k, v, *, causal=False, bottom_right=False, stats_log2=False, sinks=None):
+    """Keep the FP32 oracle's score matrix bounded to one query head.
+
+    ``bottom_right`` anchors the causal diagonal at the last key. ``sinks``
+    (fp32 [H_q]) join each row's softmax as a column with no V row, so a row
+    with no visible key has O = 0 and Stats = its sink.
+    """
     b, h_q, s_q, d = q.shape
     h_kv, s_kv = k.shape[1:3]
     output = torch.empty((b, h_q, s_q, v.shape[-1]), device=q.device, dtype=torch.float32)
     stats = torch.empty((b, h_q, s_q), device=q.device, dtype=torch.float32)
     mask = None
     if causal:
-        i = torch.arange(s_q, device=q.device).view(s_q, 1)
+        i = torch.arange(s_q, device=q.device).view(s_q, 1) + ((s_kv - s_q) if bottom_right else 0)
         j = torch.arange(s_kv, device=q.device).view(1, s_kv)
         mask = j > i
     for head in range(h_q):
@@ -73,8 +78,10 @@ def _sm120_reference(q, k, v, *, causal=False, stats_log2=False):
         scores = torch.matmul(qb, kb.transpose(-1, -2)) / math.sqrt(d)
         if mask is not None:
             scores.masked_fill_(mask, float("-inf"))
+        if sinks is not None:
+            scores = torch.cat([scores, sinks[head].view(1, 1, 1, 1).expand(*scores.shape[:-1], 1)], dim=-1)
         p = torch.softmax(scores, dim=-1)
-        output[:, head : head + 1] = torch.matmul(p, vb)
+        output[:, head : head + 1] = torch.matmul(p[..., :s_kv], vb)
         stats[:, head : head + 1] = torch.logsumexp(scores, dim=-1) * (math.log2(math.e) if stats_log2 else 1.0)
     return output, stats
 
@@ -98,7 +105,21 @@ def test_sm120_split_reference_matches_dense(h_kv, causal, stats_log2):
 
 
 def _sm120_case(
-    h_q, h_kv, s_q, s_kv, *, d=128, with_lse=False, workspace=True, causal=False, lse_layout="contiguous", split_kv=None, stats_log2=False, zero_copy=False
+    h_q,
+    h_kv,
+    s_q,
+    s_kv,
+    *,
+    d=128,
+    with_lse=False,
+    workspace=True,
+    causal=False,
+    lse_layout="contiguous",
+    split_kv=None,
+    stats_log2=False,
+    zero_copy=False,
+    bottom_right=False,
+    sink=False,
 ):
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
 
@@ -125,7 +146,8 @@ def _sm120_case(
     else:
         raise ValueError(f"unknown LSE layout {lse_layout!r}")
 
-    kw = dict(is_causal=causal, stats_log2=stats_log2)
+    sinks = torch.randn(h_q, device=dev, dtype=torch.float32) if sink else None
+    kw = dict(is_causal=causal, causal_bottom_right=causal and bottom_right, has_sink=sink, stats_log2=stats_log2)
     # Probe pass: the chooser reads the adapter's own tile geometry.
     probe = SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, **kw)
     assert probe.check_support()
@@ -143,10 +165,10 @@ def _sm120_case(
     if zero_copy:
         assert api._dense_spec is not None
     ws = torch.empty(ws_bytes, dtype=torch.uint8, device=dev) if (workspace and ws_bytes) else None
-    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse, workspace=ws)
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse, sinks=sinks, workspace=ws)
     torch.cuda.synchronize()
 
-    reference, reference_stats = _sm120_reference(q, k, v, causal=causal, stats_log2=stats_log2)
+    reference, reference_stats = _sm120_reference(q, k, v, causal=causal, bottom_right=bottom_right, stats_log2=stats_log2, sinks=sinks)
     if lse is not None:
         torch.testing.assert_close(lse, reference_stats, rtol=3e-2, atol=5e-2)
     if lse_storage is not None:
@@ -239,6 +261,80 @@ def test_sm120_causal_split_requires_the_natural_scheduler():
         pytest.skip("this part is small enough that the causal shape already fills it")
     assert result.split == result.expected_split > 1, "the causal arm must actually exercise the split"
     assert (result.output - result.reference).abs().max().item() <= 2e-2
+
+
+# --- An attention sink under a split ----------------------------------------
+#
+# The half templates write sink-free partials under a split and the combine
+# folds each head's sink once. The FP8 / MXFP8 templates fold it in their
+# epilogue, so they keep the pair declined (mismatch, config, adapter).
+
+
+@pytest.mark.parametrize("split_kv", [1, 4], ids=["unsplit", "split4"])
+@pytest.mark.parametrize("d", [64, 128, 256, 512])
+def test_sm120_split_folds_the_sink_once(d, split_kv):
+    """gpt-oss decode (64 / 8 heads, one query token, a ragged last KV tile) on the general, D=256 and D=512 templates."""
+    result = _sm120_case(64, 8, 1, 4133, d=d, with_lse=True, split_kv=split_kv, sink=True)
+    assert result.split == split_kv
+    assert (result.output - result.reference).abs().max().item() <= 2e-2
+
+
+@pytest.mark.parametrize("s_q,s_kv,bottom_right", [(4, 2, True), (200, 256, False)], ids=["keyless_rows", "empty_chunks"])
+def test_sm120_split_sink_rows_without_keys(s_q, s_kv, bottom_right):
+    """A row no split shows a key lands on O := 0, LSE := sink; a split chunk with no key for a row is the
+    combine's identity."""
+    result = _sm120_case(32, 8, s_q, s_kv, with_lse=True, causal=True, bottom_right=bottom_right, split_kv=2, sink=True)
+    assert result.split == 2
+    assert (result.output - result.reference).abs().max().item() <= 2e-2
+
+
+def _sink_decode_facts(**over):
+    """gpt-oss decode facts (no GPU): 64 / 8 heads at d64 with sinks over 128K keys, unless overridden."""
+    import cudnn
+    from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
+
+    base = dict(b=1, h_q=64, h_kv=8, s_q=1, s_kv=131072, d_qk=64, d_v=64, dtype=cudnn.data_type.HALF, has_sink=True, device_cc=(12, 0), device_sm_count=188)
+    base.update(over)
+    return SdpaGraphFacts(**base)
+
+
+@pytest.mark.parametrize("d", [64, 128, 256, 512])
+def test_sm120_split_sink_is_eligible_on_the_half_row_only(d):
+    """mismatch() and the template backstop admit a split sink graph at f16 / bf16 and decline it at FP8."""
+    import cudnn
+    from cudnn.frost.tile_dsl.constants import DTYPE_E4M3
+    from cudnn.sdpa.fwd.config_sm120 import TemplateParams, validate_params
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS, SdpaFwdKnobs, mismatch
+
+    rows = {s.name: s.capabilities for s in ENGINE_SPECS}
+    knobs = SdpaFwdKnobs(sched_policy=0, split_kv=4)
+    assert mismatch(rows["sdpa_fwd_prefill_sm120"], _sink_decode_facts(d_qk=d, d_v=d), knobs) is None
+    if d <= 256:
+        fp8 = _sink_decode_facts(d_qk=d, d_v=d, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.HALF, is_fp8=True)
+        reason = mismatch(rows["sdpa_fwd_prefill_sm120_fp8"], fp8, knobs)
+        assert reason is not None and "a sink splits on the SM100 and SM120 half flavors only" in reason, reason
+    validate_params(TemplateParams(has_sink=True, split_kv=4))
+    with pytest.raises(ValueError, match="served by the FP16/BF16 templates only"):
+        validate_params(TemplateParams(dtype_qkv=DTYPE_E4M3, has_sink=True, split_kv=4), allowed_dtypes=(DTYPE_E4M3,))
+
+
+@pytest.mark.parametrize("over", [dict(), dict(h_q=32, h_kv=8, d_qk=128, d_v=128, s_kv=65536), dict(h_q=16, h_kv=2, d_qk=256, d_v=256, s_kv=16384)])
+def test_sm120_sink_sets_carry_the_split_choice(monkeypatch, over):
+    """The half row hands a sink graph to the split chooser (mocked) and carries its answer, and every set it proposes
+    is admissible; the FP8 row keeps a sink graph unsplit whatever the chooser answers."""
+    import cudnn
+    from cudnn.sdpa.fwd import heuristics
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS, mismatch
+
+    monkeypatch.setattr(heuristics, "choose_split_kv", lambda **_: 4)
+    rows = {s.name: s for s in ENGINE_SPECS}
+    half, facts = rows["sdpa_fwd_prefill_sm120"], _sink_decode_facts(**over)
+    sets = heuristics._knob_sets(half, facts)
+    assert 4 in {knobs.split_kv for knobs in sets}, sets
+    for knobs in sets:
+        assert mismatch(half.capabilities, facts, knobs) is None, knobs
+    fp8 = _sink_decode_facts(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.HALF, is_fp8=True, **over)
+    assert all((knobs.split_kv or 1) == 1 for knobs in heuristics._knob_sets(rows["sdpa_fwd_prefill_sm120_fp8"], fp8))
 
 
 # --- FP8, including a QUANTIZED O ------------------------------------------
