@@ -1688,10 +1688,44 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
                 _prefetch_o_row_l2(source)
 
     @cute.jit
+    def _compute_global_odo_h96_ordinary(
+        self, mOut: cute.Tensor, mdO: cute.Tensor, softmax_stats: cute.Tensor, token_idx: Int32, batch_idx: Int32, rank: Int32, reducer_tidx: Int32
+    ) -> None:
+        """Reduce ordinary H96 O.dO in two-row windows to limit live state."""
+        stats_warp = reducer_tidx // Int32(32)
+        lane = reducer_tidx % Int32(32)
+        row_base = stats_warp * Int32(8)
+        dim = lane * Int32(16)
+        active_warp = rank == Int32(0) or row_base < Int32(self.num_heads - self.H_TILE_CTA)
+        if active_warp:
+            for row_group in cutlass.range_constexpr(4):
+                out_bits = [None] * 2
+                dout_bits = [None] * 2
+                for slot in cutlass.range_constexpr(2):
+                    row = row_base + Int32(2 * row_group + slot)
+                    head = rank * Int32(self.H_TILE_CTA) + row
+                    out_pointer = mOut.iterator + mOut.layout((head, dim, (token_idx, batch_idx)))
+                    dout_pointer = mdO.iterator + mdO.layout((head, dim, (token_idx, batch_idx)))
+                    out_bits[slot] = _load_bf16x16(out_pointer)
+                    dout_bits[slot] = _load_bf16x16(dout_pointer)
+                for slot in cutlass.range_constexpr(2):
+                    partial = self._dot_odo_bf16x16_bits(out_bits[slot], dout_bits[slot])
+                    row_sum = cute.arch.warp_reduction_sum(partial, threads_in_group=32)
+                    if lane == Int32(0):
+                        row = row_base + Int32(2 * row_group + slot)
+                        softmax_stats[row, 1] = -row_sum
+        elif lane == Int32(0):
+            for row_offset in cutlass.range_constexpr(8):
+                softmax_stats[row_base + Int32(row_offset), 1] = Float32(0.0)
+
+    @cute.jit
     def _compute_global_odo(
         self, mOut: cute.Tensor, mdO: cute.Tensor, softmax_stats: cute.Tensor, token_idx: Int32, batch_idx: Int32, rank: Int32, reducer_tidx: Int32
     ) -> None:
         """Reduce O.dO for this CTA's heads of one token straight from global memory into ``softmax_stats``."""
+        if cutlass.const_expr(self.num_heads == 96 and not self.deterministic):
+            self._compute_global_odo_h96_ordinary(mOut, mdO, softmax_stats, token_idx, batch_idx, rank, reducer_tidx)
+            return
         stats_warp = reducer_tidx // Int32(32)
         lane = reducer_tidx % Int32(32)
         row_base = stats_warp * Int32(8)
