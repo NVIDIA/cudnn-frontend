@@ -13,7 +13,7 @@ import cutlass.cute as cute
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream, torch_stream_context
 
-from ._interface_sm100 import _BLACKWELL_CAPABILITIES, _align_workspace_bytes, _workspace_shapes_sm100, flash_attn_bwd_sm100_workspace_size
+from ._interface_sm100_common import _BLACKWELL_CAPABILITIES, _align_workspace_bytes, _workspace_shapes_sm100, flash_attn_bwd_sm100_workspace_size
 
 BACKEND = "h128_d576_2cta_m64"
 H96_BACKEND = "h96_d576_2cta_m64"

@@ -90,12 +90,27 @@ class FlashAttentionDSABackwardSm100H96H64Deterministic(FlashAttentionDSABackwar
 class FlashAttentionDSABackwardSm100H96H32Deterministic(_DeterministicReductionPolicy, FlashAttentionDSABackwardSm100H32):
     """Deterministic H32 tail sharing the H64 body's fixed-owner shards."""
 
+    # The reduction policy deliberately owns these attributes in the composite
+    # hierarchy; keep the overrides explicit instead of relying on base order.
+    num_dkv_shards = _DeterministicReductionPolicy.num_dkv_shards
+    q_wave_ctas = _DeterministicReductionPolicy.q_wave_ctas
+    serialize_head_blocks = _DeterministicReductionPolicy.serialize_head_blocks
+    make_dKV_accumulator = _DeterministicReductionPolicy.make_dKV_accumulator
+    select_dKV_accumulator = _DeterministicReductionPolicy.select_dKV_accumulator
+    convert = _DeterministicReductionPolicy.convert
+    dSink_grid_q = _DeterministicReductionPolicy.dSink_grid_q
+    sum_dSink = _DeterministicReductionPolicy.sum_dSink
+
     initialize_dkv = False
     run_sum_odo = False
     run_dsink = False
     head_offset = 64
     workspace_num_heads = 96
     workspace_head_offset = 64
+
+    @classmethod
+    def _get_workspace_size_dKV(cls, k: int, d: int, b: int, acc_dtype: Type[cutlass.Numeric]):
+        return _DeterministicReductionPolicy._get_workspace_size_dKV.__func__(cls, k, d, b, acc_dtype)
 
     @cute.kernel
     def fold_dKV_shards(self, mdKV_acc: cute.Tensor, seqlen: Int32):

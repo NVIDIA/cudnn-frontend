@@ -13,6 +13,12 @@ from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.runtime import device_capability as _device_capability, resolve_stream
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 from cudnn.frost.buffers import memset_zero_async
+from ._interface_sm100_common import (
+    _BLACKWELL_CAPABILITIES,
+    _align_workspace_bytes,
+    _workspace_shapes_sm100,
+    flash_attn_bwd_sm100_workspace_size,
+)
 from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 from .dsa_bwd_sm100_deterministic import (
     FlashAttentionDSABackwardSm100Deterministic,
@@ -26,13 +32,11 @@ torch2cute_dtype_map = {
     torch.float32: cutlass.Float32,
 }
 
-_BLACKWELL_CAPABILITIES = ((10, 0), (10, 3))
 _SM100_FAMILY_ARCH_FLAGS = {
     (10, 0): "sm_100a",
     (10, 3): "sm_103a",
     (10, 7): "sm_107a",
 }
-_WORKSPACE_ALIGNMENT = 128
 _DETERMINISTIC_HEAD_COUNTS = (16, 32, 64, 96, 128)
 _STATIC_TOPK_STRIDE_BACKENDS = ("h16_m128", "h32_m64", "h96_h64_h32", "h96_d576_2cta_m64")
 
@@ -50,82 +54,6 @@ def _topk_indices_compile_tensor(topk_idxs: torch.Tensor, max_topk: int, backend
     if backend in _STATIC_TOPK_STRIDE_BACKENDS:
         return cute.runtime.make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(), max_topk), stride_order=(1, 0), assumed_align=16)
     return to_cute_tensor(topk_idxs)
-
-
-def _align_workspace_bytes(num_bytes: int) -> int:
-    """Round a workspace segment size up to the shared alignment boundary."""
-    return -(-int(num_bytes) // _WORKSPACE_ALIGNMENT) * _WORKSPACE_ALIGNMENT
-
-
-def _workspace_shapes_sm100(
-    total_s_q: int,
-    total_s_kv: int,
-    head_dim: int,
-    num_heads: int,
-    deterministic: bool,
-    backend: Optional[str] = None,
-) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
-    """Return byte-shaped LSE/OdO and dKV scratch layouts for one launch.
-
-    Generic deterministic M64 launches use the adaptive shard specialization.
-    H96/H128 D576 two-CTA kernels use their compact 96-plane workspace. An
-    unspecified backend retains the conservative 128-plane capacity.
-    """
-    acc_dtype = cutlass.Float32
-    workspace_lse_odo_shape = FlashAttentionDSABackwardSm100._get_workspace_size_LSE_OdO(
-        total_s_q,
-        head_dim,
-        num_heads,
-        1,
-        acc_dtype,
-    )
-    if deterministic:
-        if backend == "generic_m64":
-            dkv_kernel_cls = deterministic_kernel_class(total_s_q)
-        elif backend in {"h96_d576_2cta_m64", "h128_d576_2cta_m64"}:
-            from .dsa_bwd_sm100_h128_d576_2cta_deterministic import TwoCTADeterministicReduction
-
-            dkv_kernel_cls = TwoCTADeterministicReduction
-        else:
-            dkv_kernel_cls = FlashAttentionDSABackwardSm100Deterministic
-    else:
-        dkv_kernel_cls = FlashAttentionDSABackwardSm100
-    workspace_dkv_shape = dkv_kernel_cls._get_workspace_size_dKV(
-        total_s_kv,
-        head_dim,
-        1,
-        acc_dtype,
-    )
-    return workspace_lse_odo_shape, workspace_dkv_shape
-
-
-def flash_attn_bwd_sm100_workspace_size(
-    total_s_q: int,
-    total_s_kv: int,
-    head_dim: int,
-    num_heads: int,
-    deterministic: bool = False,
-    *,
-    backend: Optional[str] = None,
-) -> int:
-    """Return the reusable caller scratch required by one SM100 launch.
-
-    The generic deterministic M64 backend selects a 32-, 64-, or 128-plane
-    dKV layout from ``total_s_q``. H96/H128 D576 two-CTA backends use a
-    compact 96-plane layout; unspecified backends use the conservative fixed
-    128-plane layout. The result includes alignment
-    padding and is the minimum byte count for a contiguous ``torch.uint8``
-    workspace; :func:`flash_attn_bwd_sm100` also accepts a larger buffer.
-    """
-    workspace_lse_odo_shape, workspace_dkv_shape = _workspace_shapes_sm100(
-        total_s_q,
-        total_s_kv,
-        head_dim,
-        num_heads,
-        deterministic,
-        backend,
-    )
-    return _align_workspace_bytes(math.prod(workspace_lse_odo_shape)) + _align_workspace_bytes(math.prod(workspace_dkv_shape))
 
 
 def _carve_workspace_sm100(
