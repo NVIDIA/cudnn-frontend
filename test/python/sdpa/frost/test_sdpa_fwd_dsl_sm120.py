@@ -1636,6 +1636,68 @@ def test_dsl_sm120_pack_gqa_deep(dtype: torch.dtype, s_q: int, h_kv: int):
     _run_case(batch=1, h_q=64, h_kv=h_kv, s_q=s_q, s_kv=2048, head_dim=128, dtype=dtype, is_causal=True, pack_gqa=True)
 
 
+# --- Whole-group PackGQA: q_tile // G tokens, the rows past them dead -------
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "h_q,head_dim,tiles",
+    [
+        (24, 128, (128, 128)),  # G=6: 21 tokens in 126 live rows
+        (24, 128, (64, 64)),  # G=6: 10 tokens in 60 live rows; the tile at token 60 crosses key 64
+        (20, 128, (128, 64)),  # G=5: 25 tokens in 125 live rows; the tile at token 50 crosses key 64
+        (12, 128, (64, 64)),  # G=3: 21 tokens in 63 live rows; the tile at token 63 crosses key 64
+        (24, 256, (128, 64)),  # G=6 on the D=256 template; the tile at token 63 crosses key 64
+        (28, 256, (128, 64)),  # G=7 on the D=256 template: 18 tokens in 126 live rows; token 54 crosses key 64
+    ],
+    ids=["g6_128x128", "g6_64x64", "g5_128x64", "g3_64x64", "g6_d256", "g7_d256"],
+)
+@torch_fork_set_rng(seed=5)
+def test_dsl_sm120_pack_gqa_whole_group(h_q: int, head_dim: int, tiles: tuple[int, int]):
+    """A group the tile does not divide packs whole on the general and D=256 templates; its dead rows (zero Q)
+    never store, or they would land on the next tile's first token. Top-left causal over 70 tokens starts
+    packed tiles off the KV grid, so the diagonal can straddle one more KV tile than the token span."""
+    _run_case(batch=2, h_q=h_q, h_kv=4, s_q=70, s_kv=280, head_dim=head_dim, is_causal=True, q_tile=tiles[0], kv_tile=tiles[1], pack_gqa=True, check_stats=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("mask", ["decode", "mtp_causal_br_sink", "swa_sink", "padded_qtrim"])
+@torch_fork_set_rng(seed=6)
+def test_dsl_sm120_pack_gqa_whole_group_features(mask: str):
+    """GQA 6 packed whole x the decode shapes (the heuristics' packed plan, split or not) and the dense
+    mask / sink / trim envelope, stats checked."""
+    kw: dict = dict(batch=2, h_q=24, h_kv=4, s_q=40, s_kv=256, head_dim=128, pack_gqa=True, check_stats=True)
+    if mask == "decode":
+        kw.update(s_q=1, s_kv=4133)
+    elif mask == "mtp_causal_br_sink":
+        kw.update(s_q=4, s_kv=4133, is_causal=True, causal_bottom_right=True, window_size_right=0, with_sink=True)
+    elif mask == "swa_sink":
+        kw.update(is_causal=True, window_size_left=16, with_sink=True)
+    elif mask == "padded_qtrim":
+        kw.update(
+            seq_q_lens=torch.tensor([37, 13], dtype=torch.int32, device="cuda"),
+            seq_kv_lens=torch.tensor([180, 240], dtype=torch.int32, device="cuda"),
+        )
+    _run_case(**kw)
+
+
+@pytest.mark.L0
+def test_dsl_sm120_pack_gqa_whole_group_admission():
+    """The general and D=256 templates pack any group up to the tile; the D=512 template keeps the divisor rule."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+
+    def api(h_q: int, h_kv: int, d: int, q_tile: int):
+        q = _bhsd(1, h_q, 8, d, torch.float16)
+        kv = _bhsd(1, h_kv, 64, d, torch.float16)
+        return SdpaFwdDslSm120(sample_q=q, sample_k=kv, sample_v=kv, sample_o=torch.empty_like(q), tile_m=q_tile, pack_gqa=True)
+
+    assert api(24, 4, 128, 64).check_support()
+    assert api(24, 4, 256, 128).check_support()
+    with pytest.raises(ValueError, match=r"h_q/h_kv <= q_tile \(64\)"):
+        api(128, 1, 128, 64).check_support()
+    with pytest.raises(ValueError, match=r"divide q_tile \(64\)"):
+        api(24, 4, 512, 64).check_support()
+
+
 @pytest.mark.L0
 @torch_fork_set_rng(seed=4)
 def test_dsl_sm120_causal_swa():

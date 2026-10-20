@@ -72,6 +72,16 @@ def tile_domain(d_qk: int, d_v: int, fp8: bool) -> frozenset[tuple[int, int]]:
     return frozenset((m, n) for m in SEQ_Q_TILES for n in GENERAL_KV_TILES)
 
 
+def whole_group_pack_supported(h_q: int, h_kv: int, q_tile: int) -> bool:
+    """Whether the general and D=256 half templates can pack this GQA group
+    at ``q_tile``: a whole group fits one Q tile. The ratio need not divide
+    the tile -- the rows past ``(q_tile // G) * G`` are dead (G = 6 at 64
+    rows: ten tokens in 60 live rows). The D=512, FP8 and MXFP8 templates
+    keep the divisor rule (``config_sm100.pack_gqa_supported``). MHA (G == 1)
+    is the bit-exact unpacked fold."""
+    return h_q > 0 and h_kv > 0 and h_q % h_kv == 0 and h_q // h_kv <= q_tile
+
+
 MXFP8_KV64_MIN_HEAD_TILE_QK = 224
 
 

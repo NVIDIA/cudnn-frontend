@@ -74,7 +74,11 @@ from cudnn.sdpa.fwd.config_sm107 import (
     SM107_FP32_VECTOR_WITH_BIAS_TILE_N,
     SM107_TILE_NS_BY_D_SHAPE,
 )
-from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR
+from cudnn.sdpa.fwd.config_sm120 import (
+    D512_FLAVOR,
+    GENERAL_HEAD_TILE_MAX as _SM120_GENERAL_HEAD_TILE_MAX,
+    whole_group_pack_supported as _sm120_whole_group_pack_supported,
+)
 
 # The DSL adapters (api_dsl) and cuda.bindings are LOWERING dependencies, not
 # support-check ones: importing them here would drag the CuTe DSL (~1.0 s, 357
@@ -921,6 +925,19 @@ def _selected_d_shape(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", kn
     return min(covering, key=lambda shape: (shape[0], shape[1])) if covering else None
 
 
+def sm120_whole_group_pack(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", tile_m: int) -> bool:
+    """Whether the SM120 half row packs this graph's whole GQA group at
+    ``tile_m`` with dead tail rows (``config_sm120.whole_group_pack_supported``):
+    the general and D=256 templates do; the D=512 template and the FP8 / MXFP8
+    rows keep the divisor rule."""
+    return (
+        capabilities.sm_lo == 120
+        and not (capabilities.is_fp8 or capabilities.is_mxfp8)
+        and max(facts.d_qk, facts.d_v) <= _SM120_GENERAL_HEAD_TILE_MAX
+        and _sm120_whole_group_pack_supported(facts.h_q, facts.h_kv, tile_m)
+    )
+
+
 def pack_gqa_partial(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> bool:
     """Whether the flavor this graph lowers onto packs a proper divisor of a
     GQA group that does not divide tile_m (``pack_gqa_partial_d_shapes``)."""
@@ -1572,10 +1589,13 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             # rows + 4 zero tail rows), so the prefill tiles' divisibility rule does not apply to a Rubin
             # graph that lowers onto it (api_dsl.check_support exempts the same graphs).  The SM100 line
             # keeps the rule as is: its partial PackGQA already admits such groups on the prefill tile.
-            _decode_packs_whole_group = capabilities.sm_lo == 107 and decode_tile and facts.h_kv > 0 and facts.h_q % facts.h_kv == 0
-            if not pack_gqa_supported(facts.h_q, facts.h_kv, _pg_tile_m, partial=_partial) and not _decode_packs_whole_group:
+            _packs_whole_group = capabilities.sm_lo == 107 and decode_tile and facts.h_kv > 0 and facts.h_q % facts.h_kv == 0
+            # The SM120 general / D=256 half templates pack whole groups with dead tail rows (a group up to the tile).
+            _packs_whole_group = _packs_whole_group or sm120_whole_group_pack(capabilities, facts, _pg_tile_m)
+            if not pack_gqa_supported(facts.h_q, facts.h_kv, _pg_tile_m, partial=_partial) and not _packs_whole_group:
                 return (
-                    f"PackGQA requires h_q/h_kv to {'share a factor with' if _partial else 'divide'} tile_m: "
+                    f"PackGQA requires h_q/h_kv to {'share a factor with' if _partial else 'divide'} tile_m"
+                    f"{' (on the SM120 half templates up to D=256: not to exceed it)' if capabilities.sm_lo == 120 else ''}: "
                     f"h_q/h_kv = {facts.h_q}/{facts.h_kv} does not pack at tile_m={_pg_tile_m}"
                 )
         if facts.has_score_max or facts.has_score_sum_exp:

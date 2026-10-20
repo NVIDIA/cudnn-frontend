@@ -412,6 +412,102 @@ def test_sm120_d512_sliding_window_packs_gqa():
     assert primary(window_left=128, d_qk=128, d_v=128).pack_gqa is False  # the rule is the d512 flavor's
 
 
+def _sm120_half_spec():
+    return next(spec for spec in engines.ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm120")
+
+
+def _sm120_gqa6_facts(**over):
+    """GQA 6 (24 / 4 heads) on an SM120 part, a 40-token causal prefill unless overridden."""
+    return _facts(**{**dict(h_q=24, h_kv=4, s_q=40, s_kv=256, device_cc=(12, 0), device_sm_count=188), **over})
+
+
+@pytest.mark.L0
+def test_sm120_half_packs_a_whole_group_the_tile_does_not_divide():
+    """The general and D=256 half templates pack any GQA group up to the tile (the rows past (tile_m // G) * G are
+    dead); the D=512 template and the FP8 row keep the divisor rule, and a group past the tile does not pack."""
+    from cudnn.sdpa.fwd.config_sm120 import whole_group_pack_supported
+
+    half = _sm120_half_spec().capabilities
+    fp8 = next(spec for spec in engines.ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm120_fp8").capabilities
+
+    def reason(caps, tile, **over):
+        knobs = engines.SdpaFwdKnobs(sched_policy=SCHED_NATURAL, tile_m=tile[0], tile_n=tile[1], cga=1, pack_gqa=True, split_kv=1)
+        return engines.mismatch(caps, _sm120_gqa6_facts(**over), knobs)
+
+    for tile in ((64, 64), (64, 128), (128, 64), (128, 128)):
+        assert reason(half, tile) is None, tile
+        assert reason(half, tile, h_q=20) is None, tile  # G = 5
+    assert reason(half, (128, 64), d_qk=256, d_v=256) is None
+    assert "does not pack at tile_m=64" in reason(half, (64, 32), d_qk=512, d_v=512)
+    assert "does not pack at tile_m=64" in reason(half, (64, 64), h_q=128, h_kv=1)
+    quantized = dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.HALF, is_fp8=True)
+    assert "does not pack at tile_m=128" in reason(fp8, (128, 128), **quantized)
+    assert whole_group_pack_supported(24, 4, 64) and whole_group_pack_supported(64, 1, 64)
+    assert not whole_group_pack_supported(128, 1, 64) and not whole_group_pack_supported(24, 5, 64)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over",
+    [
+        dict(s_q=1, s_kv=131072, causal=False),
+        dict(s_q=1, s_kv=32768, d_qk=256, d_v=256, causal=False),
+        dict(b=8, h_q=40, h_kv=8, s_q=4, s_kv=8192, bottom_right=True),
+        dict(h_q=28, s_q=40, s_kv=4096),
+        dict(s_q=2048, s_kv=2048),
+    ],
+)
+def test_sm120_whole_group_proposals_are_admissible(over):
+    """Every set the heuristics propose for a group the tile does not divide is admissible, and a packed one holds
+    the whole group in its tile."""
+    from cudnn.sdpa.fwd import heuristics
+
+    spec = _sm120_half_spec()
+    facts = _sm120_gqa6_facts(**over)
+    sets = heuristics._knob_sets(spec, facts)
+    assert sets
+    for knobs in sets:
+        assert engines.mismatch(spec.capabilities, facts, knobs) is None, knobs
+        if knobs.pack_gqa:
+            assert heuristics._pack_gqa_group(spec.capabilities, facts, knobs.tile_m, True) == facts.h_q // facts.h_kv <= knobs.tile_m, knobs
+
+
+@pytest.mark.L0
+def test_sm120_split_model_counts_whole_tokens_per_packed_tile():
+    """The split model sees ceil(S_q / (tile_m // G)) Q tiles per packed head, the kernels' grid. That equals
+    ceil(S_q x G / tile_m) whenever G divides the tile, and is the true count when a group does not: G = 6 holds
+    10 tokens in a 64-row tile, so S_q = 31 takes 4 tiles (ceil(186 / 64) = 3)."""
+    from cudnn.sdpa.fwd import heuristics
+
+    caps = _sm120_half_spec().capabilities
+    launch = heuristics._split_launch(caps, _sm120_gqa6_facts(s_q=31), 64, 128, 1, 6)
+    assert (launch.q_tiles, launch.heads_q) == (4, 4)
+    for g, s_q in ((4, 31), (8, 9), (2, 100)):
+        launch = heuristics._split_launch(caps, _sm120_gqa6_facts(h_q=8 * g, h_kv=8, s_q=s_q), 64, 128, 1, g)
+        assert launch.q_tiles == math.ceil(s_q * g / 64), (g, s_q)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("over", [dict(), dict(d_qk=256, d_v=256, s_kv=65536), dict(s_q=2, causal=True, bottom_right=True)])
+def test_sm120_whole_group_sets_split_for_their_own_launch(monkeypatch, over):
+    """The split chooser (mocked) sees each set's own launch -- G-head packed units, or G x as many unpacked -- so
+    the unpacked runner of a packed lead carries its own answer, not the packed launch's split."""
+    from cudnn.sdpa.fwd import heuristics
+
+    def by_units(*, q_tiles, heads_q, batch, **_):
+        return max(1, 256 // (q_tiles * heads_q * batch))
+
+    monkeypatch.setattr(heuristics, "choose_split_kv", by_units)
+    monkeypatch.setattr(heuristics, "_MAX_SETS_PER_ENGINE", 64)
+    facts = _sm120_gqa6_facts(**{**dict(s_q=1, s_kv=16384, causal=False), **over})
+    sets = heuristics._knob_sets(_sm120_half_spec(), facts)
+    assert any(knobs.pack_gqa for knobs in sets) and any(not knobs.pack_gqa for knobs in sets), sets
+    for knobs in sets:
+        g = facts.h_q // facts.h_kv if knobs.pack_gqa else 1
+        own = by_units(q_tiles=math.ceil(facts.s_q / (knobs.tile_m // g)), heads_q=facts.h_q // g, batch=facts.b)
+        assert (knobs.split_kv or 1) in (own, 1), (knobs, own)
+
+
 @pytest.mark.L0
 def test_sm120_fp8_d512_flavor_and_tile_contract():
     """FP8 D512 has a dedicated 64x64 tile and a full-width shared-memory budget."""

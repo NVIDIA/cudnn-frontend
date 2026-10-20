@@ -137,6 +137,7 @@ from cudnn.sdpa.fwd.config_sm120 import (
     pick_flavor as _sm120_pick_flavor,
     smem_bytes as _sm120_smem_bytes,
     tile_domain as _sm120_tile_domain,
+    whole_group_pack_supported as _sm120_whole_group_pack_supported,
 )
 
 
@@ -5573,10 +5574,17 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 self.thd,
                 "PackGQA is dense-only (THD/ragged runs unpacked)",
             )
-            self._value_error_if(
-                not pack_gqa_supported(int(h_q), int(h_kv), int(self.q_tile)),
-                f"PackGQA requires h_q/h_kv to divide q_tile ({self.q_tile}); got h_q/h_kv = {int(h_q)}/{int(h_kv)}",
-            )
+            if not self._fp8 and self.flavor != _SM120_D512_FLAVOR:
+                # The general and D=256 half templates pack whole groups with dead tail rows: any ratio up to the tile.
+                self._value_error_if(
+                    not _sm120_whole_group_pack_supported(int(h_q), int(h_kv), int(self.q_tile)),
+                    f"PackGQA needs h_q/h_kv <= q_tile ({self.q_tile}); got h_q/h_kv = {int(h_q)}/{int(h_kv)}",
+                )
+            else:
+                self._value_error_if(
+                    not pack_gqa_supported(int(h_q), int(h_kv), int(self.q_tile)),
+                    f"PackGQA requires h_q/h_kv to divide q_tile ({self.q_tile}); got h_q/h_kv = {int(h_q)}/{int(h_kv)}",
+                )
         for desc in (self.k_desc, self.v_desc, self.o_desc):
             if self._fp8 and desc is self.o_desc:
                 # SDPA_FP8's O dtype is independent of QKV: fp16/bf16 ride the

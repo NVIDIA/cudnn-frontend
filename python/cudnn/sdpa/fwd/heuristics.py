@@ -107,6 +107,7 @@ from cudnn.sdpa.fwd.engines import (
     mismatch,
     pack_gqa_partial,
     rubin_dense_d128_shared_leg,
+    sm120_whole_group_pack,
 )
 
 # Cells whose (tile_m, tile_n) choice _sm120_tiles makes.
@@ -2035,6 +2036,12 @@ def _decode_tile_pack_g(facts, pack_g: int) -> int:
     return (facts.h_q // facts.h_kv) if pack_g > 1 else 1
 
 
+def _sm120_whole_group_pack(caps: Capabilities, facts, tile_m: Optional[int]) -> bool:
+    """Whether the SM120 half templates pack this graph's GQA group at ``tile_m``:
+    a whole group per tile, no divisibility (engines.sm120_whole_group_pack)."""
+    return tile_m is not None and facts.h_q != facts.h_kv and sm120_whole_group_pack(caps, facts, tile_m)
+
+
 def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int, split_kv: Optional[int] = None, cga: Optional[int] = None) -> bool:
     """Whether a packed set can be built at ``tile_m``: the row offers packing,
     the graph carries no fused epilogue gate (its per-head
@@ -2087,7 +2094,11 @@ def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int, split_kv: Optiona
         and not (facts.thd and not _thd_decode_leg(caps, facts) and (facts.d_qk, facts.d_v) not in caps.thd_pack_gqa_d_shapes)
         and not (facts.has_epilogue_gate and not rubin_decode_tile)
         and facts.h_q != facts.h_kv
-        and (rubin_decode_tile or pack_gqa_supported(facts.h_q, facts.h_kv, tile_m, partial=pack_gqa_partial(caps, facts)))
+        and (
+            rubin_decode_tile
+            or _sm120_whole_group_pack(caps, facts, tile_m)
+            or pack_gqa_supported(facts.h_q, facts.h_kv, tile_m, partial=pack_gqa_partial(caps, facts))
+        )
     )
 
 
@@ -2109,6 +2120,9 @@ def _pack_gqa_group(caps: Capabilities, facts, tile_m: Optional[int], packed: Op
     if not packed:
         return 1
     g = facts.h_q // facts.h_kv
+    if _sm120_whole_group_pack(caps, facts, tile_m or 128):
+        # The SM120 half templates pack the whole group (dead tail rows past (tile_m // G) * G).
+        return g
     p = pack_gqa_group_size(g, tile_m or 128, partial=pack_gqa_partial(caps, facts))
     if p == 0 and _d256_decode_tile_selected(caps, facts, g, split_kv):
         return g
@@ -2247,7 +2261,9 @@ def _split_launch(caps: Capabilities, facts, tile_m, tile_n, cga, pack_g: int, *
         kv_tiles = _swa_kv_tiles(facts, token_span=rows // pack_g, tile_n=tile_n or 128)
         if physical:
             ctas = cga_ctas(_selected_d_shape(caps, facts)[0], cga)
-    return _SplitKvLaunch(_ceil_div(facts.s_q * pack_g, rows), facts.h_q // pack_g, kv_tiles, ctas)
+    # Whole tokens per tile (rows // pack_g): the same count as ceil(S_q * pack_g / rows) when the group divides
+    # the tile, and the true one when an SM120 half tile packs a whole group with dead tail rows.
+    return _SplitKvLaunch(_ceil_div(facts.s_q, rows // pack_g), facts.h_q // pack_g, kv_tiles, ctas)
 
 
 def _split_points(
@@ -2757,8 +2773,11 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     def _resplit(knobs: SdpaFwdKnobs) -> SdpaFwdKnobs:
         # A runner's changed packing/tile/CGA is a different launch, not just
         # a label on the baseline's split. Keep other architecture policies
-        # unchanged until they have their own geometry validation.
-        if not _sm100_f16(caps, facts):
+        # unchanged until they have their own geometry validation -- except an
+        # SM120 runner that changes the packing: its unit count changes with it
+        # (unpacked: G x the packed launch's).
+        sm120_repack = caps.sm_lo == 120 and knobs.pack_gqa != base.pack_gqa
+        if not _sm100_f16(caps, facts) and not sm120_repack:
             return knobs
 
         def leg(split):

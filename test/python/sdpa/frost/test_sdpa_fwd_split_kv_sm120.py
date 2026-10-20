@@ -120,6 +120,8 @@ def _sm120_case(
     zero_copy=False,
     bottom_right=False,
     sink=False,
+    pack_gqa=False,
+    tile_m=None,
 ):
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
 
@@ -147,7 +149,7 @@ def _sm120_case(
         raise ValueError(f"unknown LSE layout {lse_layout!r}")
 
     sinks = torch.randn(h_q, device=dev, dtype=torch.float32) if sink else None
-    kw = dict(is_causal=causal, causal_bottom_right=causal and bottom_right, has_sink=sink, stats_log2=stats_log2)
+    kw = dict(is_causal=causal, causal_bottom_right=causal and bottom_right, has_sink=sink, stats_log2=stats_log2, pack_gqa=pack_gqa, tile_m=tile_m)
     # Probe pass: the chooser reads the adapter's own tile geometry.
     probe = SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, **kw)
     assert probe.check_support()
@@ -285,6 +287,24 @@ def test_sm120_split_sink_rows_without_keys(s_q, s_kv, bottom_right):
     combine's identity."""
     result = _sm120_case(32, 8, s_q, s_kv, with_lse=True, causal=True, bottom_right=bottom_right, split_kv=2, sink=True)
     assert result.split == 2
+    assert (result.output - result.reference).abs().max().item() <= 2e-2
+
+
+# --- A whole GQA group packed under a split ---------------------------------
+#
+# The general and D=256 half templates pack a group the tile does not divide:
+# q_tile // G whole tokens per tile, the rows past them dead (zero Q, never
+# stored). A dead row that stored would land on the next tile's first token.
+
+
+@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("tile_m", [64, 128])
+@pytest.mark.parametrize("s_q", [1, 7, 33], ids=["decode", "mtp", "three_tiles"])
+def test_sm120_split_recombines_a_whole_group_pack(d, tile_m, s_q):
+    """GQA 6 (24 / 4 heads) over a ragged last KV tile, causal bottom-right past one token: 10 tokens in 60 live
+    rows of 64, 21 in 126 of 128."""
+    result = _sm120_case(24, 4, s_q, 2500, d=d, with_lse=True, causal=s_q > 1, bottom_right=True, split_kv=4, pack_gqa=True, tile_m=tile_m)
+    assert result.split == 4
     assert (result.output - result.reference).abs().max().item() <= 2e-2
 
 
