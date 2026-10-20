@@ -247,11 +247,12 @@ class SM120FusedMultiHeadAttentionForward:
             constraint as ``head_tile_qk``.
         :param q_tile: Query sequence tile size.
         :param kv_tile: Key/value sequence tile size.
-        :param pack_gqa: Enable PackGQA: each Q tile holds ``q_tile/qh_per_kh``
-            tokens x qh_per_kh query heads sharing one KV head, token-major
-            (row r ↔ token ``r // G``, head ``r % G``).
-        :param qh_per_kh: The graph's GQA ratio ``h_q // h_kv``; must divide
-            ``q_tile`` when ``pack_gqa`` is enabled, and is validated against
+        :param pack_gqa: Enable PackGQA: each Q tile holds ``q_tile // qh_per_kh``
+            whole tokens x qh_per_kh query heads sharing one KV head, token-major
+            (row r ↔ token ``r // G``, head ``r % G``); rows past
+            ``(q_tile // G) * G`` are dead (zero Q, never stored).
+        :param qh_per_kh: The graph's GQA ratio ``h_q // h_kv``; at most
+            ``q_tile`` when ``pack_gqa`` is enabled, and validated against
             the runtime Q/K head extents at ``__call__``.
         """
 
@@ -259,8 +260,8 @@ class SM120FusedMultiHeadAttentionForward:
             raise ValueError("out_dtype must match in_dtype")
         if qh_per_kh < 1:
             raise ValueError(f"qh_per_kh ({qh_per_kh}) must be >= 1")
-        if pack_gqa and q_tile % qh_per_kh != 0:
-            raise ValueError(f"qh_per_kh ({qh_per_kh}) must divide q_tile ({q_tile}) when pack_gqa is enabled")
+        if pack_gqa and qh_per_kh > q_tile:
+            raise ValueError(f"qh_per_kh ({qh_per_kh}) must not exceed q_tile ({q_tile}) when pack_gqa is enabled")
         if pack_gqa and thd_varlen:
             raise ValueError("PackGQA is dense-only (THD keeps the unpacked path)")
         if thd_varlen and thd_batch < 1:
@@ -275,9 +276,6 @@ class SM120FusedMultiHeadAttentionForward:
         # maps window_right -> is_causal), so the masking sites key off
         # is_causal and add the (compile-time) widening. 0 = plain causal.
         self.window_right = window_size_right if window_size_right is not None else 0
-        # A translated diagonal (bottom-right anchoring or a right band) can
-        # straddle one more KV tile than the tile-aligned top-left one.
-        self.diag_shifted = bottom_right or self.window_right > 0
         self.seq_q_lens_present = seq_q_lens_present
         self.seq_kv_lens_present = seq_kv_lens_present
         self.has_sink = has_sink
@@ -298,8 +296,15 @@ class SM120FusedMultiHeadAttentionForward:
         # row order. THD rows ride the packed token base and keep the per-lane
         # global loads.
         self.tma_q = not thd_varlen
-        # Rows of a Q tile per token (PackGQA packs qh_per_kh heads per token).
+        # A packed tile holds q_tile // G whole tokens; when G does not divide
+        # the tile, its rows past that many tokens x G are dead: zero Q, never
+        # stored (G = 6 at 64 rows: 10 tokens, 60 live rows).
         self.q_tile_tokens = q_tile // qh_per_kh if pack_gqa else q_tile
+        self.live_rows = self.q_tile_tokens * qh_per_kh if pack_gqa else q_tile
+        self.dead_rows = self.live_rows != q_tile
+        # The diagonal can straddle one more KV tile when translated
+        # (bottom-right or a right band) or when Q tiles start off the KV grid.
+        self.diag_shifted = bottom_right or self.window_right > 0 or (self.q_tile_tokens % kv_tile != 0 and kv_tile % self.q_tile_tokens != 0)
         # KV split: SPLIT_KV CTAs per (q_tile, batch, head), each covering a
         # contiguous slice of that tile's KV-tile range.  1 = off (folds away).
         self.split_kv = split_kv
@@ -452,7 +457,9 @@ class SM120FusedMultiHeadAttentionForward:
         chunks = self.k_tma_swizzle_chunks
         chunk_elems = self.k_swizzle_chunk_elems
         if prims.elect_sync():
-            if cutlass.const_expr(envelope):
+            # A packed box with dead rows holds only the live rows: one copy per
+            # chunk keeps the slab's q_tile-row chunk stride.
+            if cutlass.const_expr(envelope or self.dead_rows):
                 prims.mbarrier_arrive_expect_tx(mbar, chunks * tma_desc.global_tx_bytes())
                 for i in cutlass.range_constexpr(chunks):
                     # Packed descriptors place head before sequence.
@@ -472,6 +479,16 @@ class SM120FusedMultiHeadAttentionForward:
                     coords,
                     mbar,
                 )
+
+    @cute.jit
+    def zero_dead_q_rows(self, basic_params: SimpleNamespace, frag):
+        """Zero a packed tile's dead rows in one ``ldmatrix.x4`` A fragment: the packed
+        TMA box holds only the live rows, so theirs are stale slab bytes. Registers 0
+        and 2 hold row ``lane // 4`` of the warp's 16, registers 1 and 3 that row + 8."""
+        row_lo = basic_params.q_warp_row0 + basic_params.lane // 4
+        keep_lo = cutlass.Int32(-1) if row_lo < self.live_rows else cutlass.Int32(0)
+        keep_hi = cutlass.Int32(-1) if row_lo + 8 < self.live_rows else cutlass.Int32(0)
+        return cutlass.Vector.from_elements((frag[0] & keep_lo, frag[1] & keep_hi, frag[2] & keep_lo, frag[3] & keep_hi), cutlass.Int32)
 
     @cute.jit
     def load_q_frags_from_smem(
@@ -514,6 +531,8 @@ class SM120FusedMultiHeadAttentionForward:
             physical_row = chunk * self.q_tile + row_in_cta
             q_ptr = half_base + physical_row * chunk_elems + swizzle_xor(physical_row, col_in_chunk, chunk_elems, self.in_dtype.bytes)
             frag = prims.ldmatrix(q_ptr, 4, prims.MMALayout.ROW)
+            if cutlass.const_expr(self.dead_rows):
+                frag = self.zero_dead_q_rows(basic_params, frag)
             if cutlass.const_expr(d_frag < self.q_reg_frags):
                 q_regs[d_frag * 4 : 4] = frag
             else:
@@ -1159,7 +1178,7 @@ class SM120FusedMultiHeadAttentionForward:
         belongs to the CTA and is reused across units; dense units prefetch
         the next Q tile while storing the current output.
         """
-        q_seq_idx = q_tile_idx * (self.q_tile // self.qh_per_kh if self.pack_gqa else self.q_tile)
+        q_seq_idx = q_tile_idx * self.q_tile_tokens
 
         seqlen_q = cutlass.Int32(q.shape[1])
         seqlen_k = cutlass.Int32(k.shape[1])
@@ -1224,7 +1243,7 @@ class SM120FusedMultiHeadAttentionForward:
             if q_seq_idx >= seqlen_q:
                 num_kv_tiles = cutlass.Int32(0)
         if cutlass.const_expr(self.is_causal):
-            causal_k_end = q_seq_idx + (self.q_tile // self.qh_per_kh if self.pack_gqa else self.q_tile) + self.window_right
+            causal_k_end = q_seq_idx + self.q_tile_tokens + self.window_right
             if cutlass.const_expr(self.bottom_right):
                 causal_k_end += seqlen_k - seqlen_q
             causal_k_end = cute.math.max(cutlass.Int32(0), cute.math.min(causal_k_end, seqlen_k))
@@ -1385,16 +1404,14 @@ class SM120FusedMultiHeadAttentionForward:
         # Main attention loop.
         mask_steps = 1
         if cutlass.const_expr(self.is_causal):
-            mask_steps = ceil_div(self.q_tile // self.qh_per_kh if self.pack_gqa else self.q_tile, self.kv_tile)
+            mask_steps = ceil_div(self.q_tile_tokens, self.kv_tile)
             if cutlass.const_expr(self.diag_shifted):
-                # A translated diagonal (bottom-right anchoring or a right
-                # band) can straddle one additional KV tile; the frontier
-                # width itself is R-independent — the band only translates
-                # the diagonal.
-                mask_steps = ceil_div((self.q_tile // self.qh_per_kh if self.pack_gqa else self.q_tile) + self.kv_tile - 1, self.kv_tile)
+                # A shifted diagonal (see diag_shifted) can straddle one
+                # additional KV tile; the frontier width itself is R-independent.
+                mask_steps = ceil_div(self.q_tile_tokens + self.kv_tile - 1, self.kv_tile)
         left_mask_steps = 1
         if cutlass.const_expr(self.window_size_left is not None):
-            left_mask_steps = ceil_div((self.q_tile // self.qh_per_kh if self.pack_gqa else self.q_tile) + self.kv_tile - 1, self.kv_tile)
+            left_mask_steps = ceil_div(self.q_tile_tokens + self.kv_tile - 1, self.kv_tile)
 
         kv_tile_idx = num_kv_tiles - 1
         # Phase 1: potentially masked iterations.
@@ -1529,7 +1546,10 @@ class SM120FusedMultiHeadAttentionForward:
                         # Rows at/past this batch's Q length trim to -inf.
                         if lse_q_idx >= seqlen_q:
                             lse_out = -cutlass.Float32.inf
-                        if lse_q_idx < q.shape[1]:
+                        lse_row_live = lse_q_idx < q.shape[1]
+                        if cutlass.const_expr(self.dead_rows):
+                            lse_row_live = lse_row_live and _lse_row_in_cta < self.live_rows
+                        if lse_row_live:
                             lse_arr[o_batch_idx, _lse_head, lse_q_idx] = lse_out
 
         prims.barrier_cta_sync(self.bar_compute_sync, thread_count=self.threads_compute)
@@ -1582,6 +1602,9 @@ class SM120FusedMultiHeadAttentionForward:
         store_head_off = o_head_off
         if cutlass.const_expr(self.pack_gqa and self.qh_per_kh != 1):
             store_head_off = store_head_off + (_store_row_in_cta % self.qh_per_kh) * o_head_stride
+        store_row_live = store_q_seq_idx < q.shape[1]
+        if cutlass.const_expr(self.dead_rows):
+            store_row_live = store_row_live and _store_row_in_cta < self.live_rows
         for o_round in cutlass.range_constexpr(2):
             for j in cutlass.range_constexpr(pairs_per_round):
                 d_frag_pair = o_round * pairs_per_round + j
@@ -1606,7 +1629,7 @@ class SM120FusedMultiHeadAttentionForward:
                     if store_q_seq_idx < seqlen_q and store_col_in_cta < head_dim_v:
                         gO_ptr = o_ptr + store_head_off + store_q_seq_idx * o_seq_stride + store_col_in_cta
                         gO_ptr.store(sO_ptr.load(count=4, alignment=16).bitcast(o.dtype), alignment=16)
-                elif store_q_seq_idx < q.shape[1] and store_col_in_cta < head_dim_v:
+                elif store_row_live and store_col_in_cta < head_dim_v:
                     gO_ptr = o_ptr + store_head_off + store_q_seq_idx * o_seq_stride + store_col_in_cta
                     if store_q_seq_idx < seqlen_q:
                         gO_ptr.store(sO_ptr.load(count=4, alignment=16).bitcast(o.dtype), alignment=16)
@@ -2008,7 +2031,7 @@ class SM120FusedMultiHeadAttentionForward:
         if cutlass.const_expr(self.tma_q and self.pack_gqa):
             _q_chunks = self.k_tma_swizzle_chunks
             _q_chunk_elems = self.k_swizzle_chunk_elems
-            if cutlass.const_expr(head_dim_qk == self.head_tile_qk):
+            if cutlass.const_expr(head_dim_qk == self.head_tile_qk and not self.dead_rows):
                 _q_layout = cute.make_layout(
                     (q.shape[0], _q_chunks, q.shape[1], q.shape[2], _q_chunk_elems),
                     stride=(q.stride[0], _q_chunk_elems, q.stride[1], q.stride[2], 1),
@@ -2056,13 +2079,9 @@ class SM120FusedMultiHeadAttentionForward:
         # REAL batch count (the packed view's batch mode is 1); tiles past a shorter
         # sequence's length drain without work. NOTE thd_max_sq is a __call__
         # argument in this base, not a member.
-        # PackGQA: S_q*G packed rows per packed head, H_q/G packed heads on the
-        # head axis (THD is always unpacked).
-        n_q_tiles = (
-            ceil_div(thd_max_sq, self.q_tile)
-            if cutlass.const_expr(self.thd_varlen)
-            else ceil_div((q.shape[1] * self.qh_per_kh if self.pack_gqa else q.shape[1]), self.q_tile)
-        )
+        # Dense: ceil(S_q / q_tile_tokens) Q tiles per head; PackGQA puts H_q/G packed
+        # heads on the head axis (THD is always unpacked).
+        n_q_tiles = ceil_div(thd_max_sq, self.q_tile) if cutlass.const_expr(self.thd_varlen) else ceil_div(q.shape[1], self.q_tile_tokens)
         n_batch = thd_batch if cutlass.const_expr(self.thd_varlen) else q.shape[0]
         n_head = q.shape[2] // self.qh_per_kh if self.pack_gqa else q.shape[2]
         # Dense: a flat grid over the units, capped at thd_n_ctas — the persistent

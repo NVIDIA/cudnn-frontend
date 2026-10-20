@@ -1644,16 +1644,17 @@ def test_dsl_sm120_pack_gqa_deep(dtype: torch.dtype, s_q: int, h_kv: int):
         (24, 128, (128, 128)),  # G=6: 21 tokens in 126 live rows
         (24, 128, (64, 64)),  # G=6: 10 tokens in 60 live rows; the tile at token 60 crosses key 64
         (20, 128, (128, 64)),  # G=5: 25 tokens in 125 live rows; the tile at token 50 crosses key 64
-        (12, 128, (64, 64)),  # G=3: 21 tokens in 63 live rows; the tile at token 63 crosses key 64
-        (24, 256, (128, 64)),  # G=6 on the D=256 template; the tile at token 63 crosses key 64
+        (12, 128, (64, 64)),  # G=3: 21 tokens in 63 live rows
+        (24, 256, (128, 64)),  # G=6 on the D=256 template: 21 tokens in 126 live rows
         (28, 256, (128, 64)),  # G=7 on the D=256 template: 18 tokens in 126 live rows; token 54 crosses key 64
+        (24, 512, (64, 32)),  # G=6 on the D=512 template (TMA Q); the tile at token 30 crosses key 32
     ],
-    ids=["g6_128x128", "g6_64x64", "g5_128x64", "g3_64x64", "g6_d256", "g7_d256"],
+    ids=["g6_128x128", "g6_64x64", "g5_128x64", "g3_64x64", "g6_d256", "g7_d256", "g6_d512"],
 )
 @torch_fork_set_rng(seed=5)
 def test_dsl_sm120_pack_gqa_whole_group(h_q: int, head_dim: int, tiles: tuple[int, int]):
-    """A group the tile does not divide packs whole on the general and D=256 templates; its dead rows (zero Q)
-    never store, or they would land on the next tile's first token. Top-left causal over 70 tokens starts
+    """A group the tile does not divide packs whole on every template; its dead rows (zero Q) never store, or
+    they would land on the next tile's first token. Top-left causal over 70 tokens starts
     packed tiles off the KV grid, so the diagonal can straddle one more KV tile than the token span."""
     _run_case(batch=2, h_q=h_q, h_kv=4, s_q=70, s_kv=280, head_dim=head_dim, is_causal=True, q_tile=tiles[0], kv_tile=tiles[1], pack_gqa=True, check_stats=True)
 
@@ -1681,7 +1682,7 @@ def test_dsl_sm120_pack_gqa_whole_group_features(mask: str):
 
 @pytest.mark.L0
 def test_dsl_sm120_pack_gqa_whole_group_admission():
-    """The general and D=256 templates pack any group up to the tile; the D=512 template keeps the divisor rule."""
+    """Every template packs any group up to the tile, and declines a group past it."""
     _require_dsl()
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
 
@@ -1690,12 +1691,40 @@ def test_dsl_sm120_pack_gqa_whole_group_admission():
         kv = _bhsd(1, h_kv, 64, d, torch.float16)
         return SdpaFwdDslSm120(sample_q=q, sample_k=kv, sample_v=kv, sample_o=torch.empty_like(q), tile_m=q_tile, pack_gqa=True)
 
-    assert api(24, 4, 128, 64).check_support()
-    assert api(24, 4, 256, 128).check_support()
-    with pytest.raises(ValueError, match=r"h_q/h_kv <= q_tile \(64\)"):
-        api(128, 1, 128, 64).check_support()
-    with pytest.raises(ValueError, match=r"divide q_tile \(64\)"):
-        api(24, 4, 512, 64).check_support()
+    for d, q_tile in ((128, 64), (256, 128), (512, 64)):
+        assert api(24, 4, d, q_tile).check_support()
+        with pytest.raises(ValueError, match=rf"h_q/h_kv <= q_tile \({q_tile}\)"):
+            api(2 * q_tile, 1, d, q_tile).check_support()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("head_dim,kv_tile", [(128, 64), (512, 32)], ids=["d128", "d512"])
+@torch_fork_set_rng(seed=7)
+def test_dsl_sm120_pack_gqa_dead_rows_never_store(head_dim: int, kv_tile: int):
+    """A packed tile's dead rows map onto the next tile's first token (row r -> token r // G). Under LPT every
+    head's last Q tile is dispatched before any first one, and 384 of them outlast one wave, so a dead-row store
+    would land after the next tile's live store and overwrite it."""
+    _require_dsl()
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+
+    q = _bhsd(96, 24, 20, head_dim, torch.float16)
+    k = _bhsd(96, 4, 256, head_dim, torch.float16)
+    v = _bhsd(96, 4, 256, head_dim, torch.float16)
+    o = torch.empty_like(q)
+    lse = torch.empty(96, 24, 20, dtype=torch.float32, device="cuda")
+    # G = 6 at 64 rows: two tiles of 10 tokens per packed head, rows 60-63 dead.
+    api = SdpaFwdDslSm120(
+        sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, is_causal=True, tile_m=64, tile_n=kv_tile, pack_gqa=True, sched_policy=SCHED_LPT
+    )
+    assert api.check_support()
+    api.compile()
+    ws = torch.empty(max(api.scratch_workspace_bytes(), 1), dtype=torch.uint8, device="cuda")
+    api.execute(workspace=ws, q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse)
+    torch.cuda.synchronize()
+    expected, expected_lse = _ref_sdpa_full(q, k, v, scale=1.0 / math.sqrt(head_dim), is_causal=True, return_stats=True)
+    torch.testing.assert_close(o.float(), expected, atol=0.1, rtol=5e-2)
+    torch.testing.assert_close(lse, expected_lse, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.L0

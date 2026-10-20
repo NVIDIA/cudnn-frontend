@@ -137,14 +137,19 @@ def _run(
     block_scaled_o=None,
     sf_o_layout="planes",
     negative_descale_q=False,
+    qkv=None,
+    sched_policy=None,
 ):
     import cudnn
 
     dev = "cuda"
     D_v = D if D_v is None else D_v
-    Qf = torch.randn(B, H_q, S_q, D, device=dev) * 0.5
-    Kf = torch.randn(B, H_kv, S_kv, D, device=dev) * 0.5
-    Vf = torch.randn(B, H_kv, S_kv, D_v, device=dev) * 0.5
+    if qkv is None:
+        Qf = torch.randn(B, H_q, S_q, D, device=dev) * 0.5
+        Kf = torch.randn(B, H_kv, S_kv, D, device=dev) * 0.5
+        Vf = torch.randn(B, H_kv, S_kv, D_v, device=dev) * 0.5
+    else:
+        Qf, Kf, Vf = qkv
     Q8, dq = _quant(Qf, io_dtype)
     K8, dk = _quant(Kf, io_dtype)
     V8, dv = _quant(Vf, io_dtype)
@@ -272,7 +277,7 @@ def _run(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch="sm120", fp8=True), tiles=tiles, pack_gqa=pack_gqa)
+    _select_engine(g, engine_name(arch="sm120", fp8=True), tiles=tiles, pack_gqa=pack_gqa, sched_policy=sched_policy)
     g.check_support()
     g.build_plans()
     vp.update({o: Ob, amx_o: amax_o})
@@ -402,6 +407,95 @@ def test_fp8_sm120_pack_gqa_tile64():
         2, 8, 2, 24, 192, scale=1.0 / math.sqrt(128), sdpa_kwargs=dict(use_causal_mask=True), tiles=(64, 64), pack_gqa=True
     )
     _check(out, o_ref, a_o, a_ref, lse, lse_ref)
+
+
+# --- Whole-group PackGQA: q_tile // G tokens, the rows past them dead -------
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "h_q,D,tiles",
+    [
+        (24, 128, (128, 128)),  # G=6: 21 tokens in 126 live rows
+        (24, 128, (64, 64)),  # G=6: 10 tokens in 60 live rows; the tile at token 60 crosses key 64
+        (20, 128, (128, 64)),  # G=5: 25 tokens in 125 live rows; the tile at token 50 crosses key 64
+        (28, 256, (128, 64)),  # G=7: 18 tokens in 126 live rows; the tile at token 54 crosses key 64
+        (24, 512, (64, 64)),  # G=6 on the D=512 template; the tile at token 60 crosses key 64
+    ],
+    ids=["g6_128x128", "g6_64x64", "g5_128x64", "g7_d256", "g6_d512"],
+)
+@torch_fork_set_rng(seed=4)
+def test_fp8_sm120_pack_gqa_whole_group(h_q, D, tiles):
+    """A group the tile does not divide packs whole on the general and D=512 templates. Top-left causal over 70
+    tokens starts packed tiles off the KV grid, so the diagonal can straddle one more KV tile than the token span."""
+    out, o_ref, a_o, a_ref, lse, lse_ref = _run(
+        2, h_q, 4, 70, 280, scale=1.0 / math.sqrt(D), D=D, sdpa_kwargs=dict(use_causal_mask=True), tiles=tiles, pack_gqa=True
+    )
+    _check(out, o_ref, a_o, a_ref, lse, lse_ref)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("o_dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16_out", "e4m3_out"])
+@pytest.mark.parametrize("mask", ["decode", "mtp_causal_br_sink"])
+@torch_fork_set_rng(seed=5)
+def test_fp8_sm120_pack_gqa_whole_group_features(mask, o_dtype):
+    """GQA 6 packed whole x the heuristics' decode plan (split) and an MTP step with a bottom-right mask and a
+    sink, through both output-dtype epilogues."""
+    kw, sinks, s_q = {}, None, 1
+    if mask == "mtp_causal_br_sink":
+        kw, s_q = dict(use_causal_mask_bottom_right=True), 4
+        sinks = torch.randn(1, 24, 1, 1, dtype=torch.float32, device="cuda")
+    out, o_ref, a_o, a_ref, lse, lse_ref = _run(2, 24, 4, s_q, 4133, scale=1.0 / math.sqrt(128), sdpa_kwargs=kw, sinks=sinks, o_dtype=o_dtype, pack_gqa=True)
+    tol_o = 5e-2
+    if o_dtype == torch.float8_e4m3fn:
+        tol_o = max(tol_o, 3 * (o_ref - o_ref.to(o_dtype).float()).abs().max().item())
+    _check(out, o_ref, a_o, a_ref, lse, lse_ref, tol_o=tol_o)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("D,tiles", [(128, (64, 64)), (128, (128, 128)), (512, (64, 64))], ids=["64x64", "128x128", "d512"])
+@torch_fork_set_rng(seed=6)
+def test_fp8_sm120_pack_gqa_dead_rows_stay_out_of_amax(D, tiles):
+    """A packed tile's dead rows map onto the next tile's first token, a token below S_q, so Amax_O must skip
+    them. Key 0 carries a large V row the live queries never weight (their Q and its K oppose in column 0),
+    while a dead row's zero Q weights every key alike: its O would exceed every live one."""
+    q = torch.randn(1, 24, 40, D, device="cuda") * 0.5
+    q[..., 0] = 2.0
+    k = torch.randn(1, 4, 256, D, device="cuda") * 0.5
+    k[:, :, 0, 0] = -16.0 * math.sqrt(D)
+    v = torch.randn(1, 4, 256, D, device="cuda") * 0.5
+    v[:, :, 0] = 400.0
+    out, o_ref, a_o, a_ref, lse, lse_ref = _run(1, 24, 4, 40, 256, scale=1.0 / math.sqrt(D), D=D, sdpa_kwargs={}, tiles=tiles, pack_gqa=True, qkv=(q, k, v))
+    assert a_ref < 0.5, "the live rows must not weight key 0"
+    _check(out, o_ref, a_o, a_ref, lse, lse_ref)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("o_dtype", [torch.float16, torch.float8_e4m3fn], ids=["f16_out", "e4m3_out"])
+@pytest.mark.parametrize("D,tiles,s_q", [(128, (128, 128), 30), (512, (64, 64), 20)], ids=["d128", "d512"])
+@torch_fork_set_rng(seed=7)
+def test_fp8_sm120_pack_gqa_dead_rows_never_store(D, tiles, s_q, o_dtype):
+    """A packed tile's dead rows map onto the next tile's first token. Under LPT every head's last Q tile is
+    dispatched before any first one, and 384 of them outlast one wave, so a dead-row store would land after
+    the next tile's live store and overwrite it."""
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT
+
+    out, o_ref, a_o, a_ref, lse, lse_ref = _run(
+        96,
+        24,
+        4,
+        s_q,
+        256,
+        scale=1.0 / math.sqrt(D),
+        D=D,
+        sdpa_kwargs=dict(use_causal_mask=True),
+        tiles=tiles,
+        pack_gqa=True,
+        o_dtype=o_dtype,
+        sched_policy=SCHED_LPT,
+    )
+    tol_o = 5e-2
+    if o_dtype == torch.float8_e4m3fn:
+        tol_o = max(tol_o, 3 * (o_ref - o_ref.to(o_dtype).float()).abs().max().item())
+    _check(out, o_ref, a_o, a_ref, lse, lse_ref, tol_o=tol_o)
 
 
 _MASKS = {

@@ -2037,7 +2037,7 @@ def _decode_tile_pack_g(facts, pack_g: int) -> int:
 
 
 def _sm120_whole_group_pack(caps: Capabilities, facts, tile_m: Optional[int]) -> bool:
-    """Whether the SM120 half templates pack this graph's GQA group at ``tile_m``:
+    """Whether the SM120 templates pack this graph's GQA group at ``tile_m``:
     a whole group per tile, no divisibility (engines.sm120_whole_group_pack)."""
     return tile_m is not None and facts.h_q != facts.h_kv and sm120_whole_group_pack(caps, facts, tile_m)
 
@@ -2121,7 +2121,7 @@ def _pack_gqa_group(caps: Capabilities, facts, tile_m: Optional[int], packed: Op
         return 1
     g = facts.h_q // facts.h_kv
     if _sm120_whole_group_pack(caps, facts, tile_m or 128):
-        # The SM120 half templates pack the whole group (dead tail rows past (tile_m // G) * G).
+        # The SM120 templates pack the whole group (dead tail rows past (tile_m // G) * G).
         return g
     p = pack_gqa_group_size(g, tile_m or 128, partial=pack_gqa_partial(caps, facts))
     if p == 0 and _d256_decode_tile_selected(caps, facts, g, split_kv):
@@ -2262,7 +2262,7 @@ def _split_launch(caps: Capabilities, facts, tile_m, tile_n, cga, pack_g: int, *
         if physical:
             ctas = cga_ctas(_selected_d_shape(caps, facts)[0], cga)
     # Whole tokens per tile (rows // pack_g): the same count as ceil(S_q * pack_g / rows) when the group divides
-    # the tile, and the true one when an SM120 half tile packs a whole group with dead tail rows.
+    # the tile, and the true one when an SM120 tile packs a whole group with dead tail rows.
     return _SplitKvLaunch(_ceil_div(facts.s_q, rows // pack_g), facts.h_q // pack_g, kv_tiles, ctas)
 
 

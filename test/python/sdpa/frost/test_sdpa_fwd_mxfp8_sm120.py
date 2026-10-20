@@ -257,6 +257,7 @@ def _run(
     layout="bshd",
     sf_o_layout=None,
     scale_o=None,
+    sched_policy=None,
 ):
     """Quantize, build the sdpa_mxfp8 graph, pin the SM120 MXFP8 engine (and ``split_kv``), execute.
     ``layout`` names the storage order (``_LAYOUTS``) of Q/K/V/O. ``sf_o_layout`` ("planes" / "token_major")
@@ -367,7 +368,7 @@ def _run(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    chosen = _select_engine(g, _ENGINE, tiles=tiles, pack_gqa=pack_gqa)
+    chosen = _select_engine(g, _ENGINE, tiles=tiles, pack_gqa=pack_gqa, sched_policy=sched_policy)
     if split_kv is not None and (chosen.knobs.split_kv or 1) != split_kv:
         # The ranked plans need not carry this split count: re-plan the engine's own knob set with it.
         g.create_execution_plan(chosen.engine_id, replace(chosen.knobs, split_kv=split_kv, sched_policy=0))
@@ -507,6 +508,69 @@ def test_mxfp8_sm120_pack_gqa_envelope_head_dims(d_qk, d_v):
     """PackGQA over zero-padded envelope head dims: the packed Q rows keep their scale rows while the last
     scale block of each side covers the zero-filled columns."""
     _check(_run(2, 8, 2, 40, 300, d_qk=d_qk, d_v=d_v, pack_gqa=True, sdpa_kwargs=_MASKS["causal"]), d_qk)
+
+
+# --- Whole-group PackGQA: q_tile // G tokens, the rows past them dead -------
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "h_q,d,tiles",
+    [
+        (24, 128, (128, 128)),  # G=6: 21 tokens in 126 live rows
+        (24, 128, (64, 64)),  # G=6: 10 tokens in 60 live rows; the tile at token 60 crosses key 64
+        (28, 256, (128, 64)),  # G=7: 18 tokens in 126 live rows; the tile at token 54 crosses key 64
+        (20, 512, (64, 64)),  # G=5 on the D=512 template: 12 tokens in 60 live rows; token 60 crosses key 64
+    ],
+    ids=["g6_128x128", "g6_64x64", "g7_d256", "g5_d512"],
+)
+@torch_fork_set_rng(seed=37)
+def test_mxfp8_sm120_pack_gqa_whole_group(h_q, d, tiles):
+    """A group the tile does not divide packs whole: each live row's Q scale follows its (token, head), a dead row
+    takes the unit scale and never stores. Top-left causal over 70 tokens starts packed tiles off the KV grid."""
+    _check(_run(2, h_q, 4, 70, 280, d_qk=d, tiles=tiles, pack_gqa=True, sdpa_kwargs=_MASKS["causal"]), d)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("out_dt", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "e4m3"])
+@torch_fork_set_rng(seed=39)
+def test_mxfp8_sm120_pack_gqa_whole_group_split(out_dt):
+    """GQA 6 packed whole under a pinned split over two Q tiles: the live rows' partials recombine."""
+    _check(_run(2, 24, 4, 33, 1536, out_dt=out_dt, pack_gqa=True, split_kv=2, sdpa_kwargs=_MASKS["causal_br"]))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d,tiles", [(128, (64, 64)), (512, (64, 64))], ids=["d128", "d512"])
+@torch_fork_set_rng(seed=41)
+def test_mxfp8_sm120_pack_gqa_dead_rows_stay_out_of_amax(monkeypatch, d, tiles):
+    """A packed tile's dead rows map onto the next tile's first token, a token below S_q, so Amax_O must skip
+    them. Key 0 carries a large V row the live queries never weight (their Q and its K oppose in column 0),
+    while a dead row's zero Q weights every key alike: its O would exceed every live one."""
+
+    def draw(B, H_q, H_kv, S_q, S_kv, d_qk, d_v, fp8):
+        q = torch.randn(B, H_q, S_q, d_qk, device="cuda") * 0.5
+        q[..., 0] = 2.0
+        k = torch.randn(B, H_kv, S_kv, d_qk, device="cuda") * 0.5
+        k[:, :, 0, 0] = -16.0 * math.sqrt(d_qk)
+        v = torch.randn(B, H_kv, S_kv, d_v, device="cuda") * 0.5
+        v[:, :, 0] = 400.0
+        return _quantize(q, fp8, columnwise=False), _quantize(k, fp8, columnwise=False), _quantize(v, fp8, columnwise=True)
+
+    monkeypatch.setitem(globals(), "_draw", draw)
+    res = _run(1, 24, 4, 40, 256, d_qk=d, tiles=tiles, pack_gqa=True)
+    assert res.reference.abs().max().item() < 0.5, "the live rows must not weight key 0"
+    _check(res, d)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("out_dt", [torch.float16, torch.float8_e4m3fn], ids=["f16", "e4m3"])
+@pytest.mark.parametrize("d,tiles,s_q", [(128, (128, 128), 30), (512, (64, 64), 20)], ids=["d128", "d512"])
+@torch_fork_set_rng(seed=43)
+def test_mxfp8_sm120_pack_gqa_dead_rows_never_store(d, tiles, s_q, out_dt):
+    """A packed tile's dead rows map onto the next tile's first token. Under LPT every head's last Q tile is
+    dispatched before any first one, and 384 of them outlast one wave, so a dead-row store would land after
+    the next tile's live store and overwrite it."""
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT
+
+    _check(_run(96, 24, 4, s_q, 256, d_qk=d, out_dt=out_dt, tiles=tiles, pack_gqa=True, sched_policy=SCHED_LPT, sdpa_kwargs=_MASKS["causal"]), d)
 
 
 @pytest.mark.L0
