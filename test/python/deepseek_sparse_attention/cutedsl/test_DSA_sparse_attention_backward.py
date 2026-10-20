@@ -26,7 +26,7 @@ from deepseek_sparse_attention.cutedsl.dsa_reference import (
     ref_sparse_attention_forward_chunked,
 )
 
-# SM100-class compute capabilities routed to the H128/D576 two-CTA backend.
+# SM100-class compute capabilities routed to the H96/H128 D576 two-CTA backend.
 _TWO_CTA_CAPABILITIES = ((10, 0), (10, 3))
 
 
@@ -809,7 +809,7 @@ def _exercise_deterministic_sm100_case(num_heads, head_dim, s_q, s_kv, repeats, 
     if backend == "generic_m64":
         num_dkv_shards = deterministic_dkv_shards(s_q)
     elif backend in d576_two_cta_backends:
-        num_dkv_shards = 128
+        num_dkv_shards = 96
     else:
         num_dkv_shards = _get_sm100_kernel_class(backend, True).num_dkv_shards
     expected_dkv_bytes = num_dkv_shards * math.ceil(s_kv / 8) * 8 * math.ceil(head_dim / 8) * 8 * torch.float32.itemsize
