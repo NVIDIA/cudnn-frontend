@@ -78,6 +78,10 @@ The default layout is `BHSD`. Pass `layout="bshd"` for tensors in `BSHD`
 layout. The output follows the input layout, while `lse` is always the FP32
 natural-log log-sum-exp with shape `(B, H_q, S_q)`.
 
+For explicit Blackwell blk64 calls, TMA-aligned BSHD inputs are read through
+strided views. Both unsplit outputs and split-KV combined outputs are written
+directly in the requested layout. Misaligned inputs retain their staging fallback.
+
 ### Sparse metadata
 
 | Argument | Shape | Dtype | Meaning |
@@ -264,6 +268,28 @@ preallocated `dq_tensor`, `dk_tensor`, and `dv_tensor` arguments are supported.
 The backward implementation builds a bucketed K-to-Q CSR task layout on the
 GPU. `bucket_size_blocks` is an optional tuning override; leaving it unset uses
 the backend default.
+
+With contiguous per-row count metadata, at least two KV blocks and at least
+1024 (batch, head, KV block) tasks, backward pairs KV neighborhoods to reuse
+common Q/dO loads and dQ accumulation; smaller problems do not recover the
+per-call pairing cost and use regular tasks.
+Pairing metadata is limited to 64 MiB; fixed counts or unsupported metadata
+layouts use regular tasks. Duplicate sparse edges retain their multiplicity.
+Paired tasks retain FP32 dK/dV accumulation even with a single query bucket;
+regular tasks can use the direct dK/dV epilogue when its alignment requirements hold.
+The initial eight-KV matching is refined within 32-KV windows, with refinement
+skipped above 1024 bitset words. Metadata construction is included in the
+wrapper's work and is rebuilt for each call.
+Backward interleaves its tasks across attention heads only for queries shorter
+than 98,304 tokens, where it was measured to help; longer queries keep the
+head-major task order.
+
+These optimizations keep the public block size at 64 and preserve the existing
+wrapper-owned workspace model. They do not add an allocation-free graph engine.
+Use `benchmark/bsa/benchmark_sm100_blk64.py` for a synthetic complete-API
+comparison; it records the imported source, input hashes and individual CUDA
+Event samples. Numerical tests, sanitizer checks and measurements on each
+target GPU are required before drawing performance conclusions.
 
 Backward defaults to blk64 on SM90 and blk128 on SM100/SM103. Pass the same
 explicit `sparse_block_size` used by forward when selecting the Blackwell blk64

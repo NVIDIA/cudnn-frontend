@@ -182,10 +182,12 @@ def test_bsa_attention_backward_fixed_blocks():
         (None, 4 * 64 - 13, None),
     ],
 )
+@pytest.mark.parametrize("variable_counts", [False, True])
 def test_bsa_attention_backward_sm100_blk64(
     bucket_size_blocks,
     seqlen_k,
     softmax_scale,
+    variable_counts,
     monkeypatch,
 ):
     if not torch.cuda.is_available():
@@ -196,6 +198,9 @@ def test_bsa_attention_backward_sm100_blk64(
 
     BSA = _import_bsa()
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    if variable_counts:
+        # Keep this small case on the paired-KV path, whose shared dK/dV needs the FP32 workspace.
+        monkeypatch.setattr(interface, "_SM100_BLK64_PAIRED_KV_MIN_KV_TASKS", 0)
     workspace_modes = []
     allocate_workspace = interface._empty_bwd_workspace_with_zeroed_accum
 
@@ -215,6 +220,7 @@ def test_bsa_attention_backward_sm100_blk64(
     v = torch.randn_like(k)
     do = torch.randn_like(q)
     q2k, block_sparse_num, block_sizes = make_fixed_metadata(batch, heads, seqlen_q, seqlen_k, block_size)
+    counts = torch.full(q2k.shape[:-1], block_sparse_num, dtype=torch.int32, device=q.device) if variable_counts else None
     # Metadata selects KV blocks 0 and 2, leaving 1 and 3 empty.
     block_sizes[2] = block_size // 2
     mask = block_sparse_mask(q2k, block_sparse_num, block_sizes, seqlen_q, seqlen_k, block_size)
@@ -241,6 +247,7 @@ def test_bsa_attention_backward_sm100_blk64(
         sparse_block_size=64,
         softmax_scale=softmax_scale,
         use_clc=False,
+        q2k_block_nums=counts,
     )
     backward = BSA.block_sparse_attention_backward(
         do,
@@ -258,11 +265,13 @@ def test_bsa_attention_backward_sm100_blk64(
         bucket_size_blocks=bucket_size_blocks,
         sparse_block_size=64,
         softmax_scale=softmax_scale,
+        q2k_block_nums=counts,
     )
     assert backward["dq_tensor"].data_ptr() == dq.data_ptr()
     assert backward["dk_tensor"].data_ptr() == dk.data_ptr()
     assert backward["dv_tensor"].data_ptr() == dv.data_ptr()
-    expect_dkv_workspace = bucket_size_blocks == 1 or seqlen_k % block_size != 0
+    # Paired and residual tasks share FP32 accumulation even with a single Q group.
+    expect_dkv_workspace = variable_counts or bucket_size_blocks == 1 or seqlen_k % block_size != 0
     assert workspace_modes == [expect_dkv_workspace]
     torch.testing.assert_close(backward["dq_tensor"].float(), dq_ref, atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(backward["dk_tensor"].float(), dk_ref, atol=3e-2, rtol=3e-2)
