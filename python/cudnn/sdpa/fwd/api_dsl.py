@@ -5575,7 +5575,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             )
             # Every SM120 template packs any GQA ratio up to the tile, tile_q % G != 0 included.
             self._value_error_if(
-                not pack_gqa_supported(int(h_q), int(h_kv), int(self.q_tile), requires_divisor=False),
+                not pack_gqa_supported(int(h_q), int(h_kv), int(self.q_tile), requires_divisible=False),
                 f"PackGQA needs h_q/h_kv <= q_tile ({self.q_tile}); got h_q/h_kv = {int(h_q)}/{int(h_kv)}",
             )
         for desc in (self.k_desc, self.v_desc, self.o_desc):

@@ -2044,7 +2044,7 @@ def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int, split_kv: Optiona
     some plan) -- there is a group to pack and the ratio divides
     the tile -- or, on a flavor with partial PackGQA, shares a factor with it
     (96/8 packs 4 of its 12 heads; 24/8 has nothing to pack and stays unpacked),
-    and on a row that does not require a divisor (SM120) fits it (24/4 packs ten
+    and on a row that does not require divisibility (SM120) fits it (24/4 packs ten
     tokens in 60 rows of a 64-row tile).
     THD prefill packs only on a flavor advertising token-unit worklists and
     packed-head Stats stores; the decode tile's ragged-Q leg remains separate.
@@ -2091,7 +2091,7 @@ def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int, split_kv: Optiona
         and facts.h_q != facts.h_kv
         and (
             rubin_decode_tile
-            or pack_gqa_supported(facts.h_q, facts.h_kv, tile_m, partial=pack_gqa_partial(caps, facts), requires_divisor=caps.pack_gqa_requires_divisor)
+            or pack_gqa_supported(facts.h_q, facts.h_kv, tile_m, partial=pack_gqa_partial(caps, facts), requires_divisible=caps.pack_gqa_requires_divisible)
         )
     )
 
@@ -2099,7 +2099,7 @@ def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int, split_kv: Optiona
 def _pack_gqa_group(caps: Capabilities, facts, tile_m: Optional[int], packed: Optional[bool], split_kv: Optional[int] = None) -> int:
     """The heads one packed Q tile row-group holds for a ``pack_gqa=packed``
     set: 1 unpacked, else ``Cfg.PACK_G`` -- the whole ratio G when it divides
-    the tile (or, on a row that does not require a divisor, fits it), its
+    the tile (or, on a row that does not require divisibility, fits it), its
     largest divisor that does on a partial-PackGQA flavor (96/8 -> 4).  The
     launch geometry the wave-cost model must see is the PACKED one: ``h_q //
     p`` packed heads of ``s_q * p`` rows each -- feeding it G where the kernel
@@ -2115,7 +2115,7 @@ def _pack_gqa_group(caps: Capabilities, facts, tile_m: Optional[int], packed: Op
     if not packed:
         return 1
     g = facts.h_q // facts.h_kv
-    p = pack_gqa_group_size(g, tile_m or 128, partial=pack_gqa_partial(caps, facts), requires_divisor=caps.pack_gqa_requires_divisor)
+    p = pack_gqa_group_size(g, tile_m or 128, partial=pack_gqa_partial(caps, facts), requires_divisible=caps.pack_gqa_requires_divisible)
     if p == 0 and _d256_decode_tile_selected(caps, facts, g, split_kv):
         return g
     return p
@@ -2169,7 +2169,7 @@ def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] 
         wins = _ceil_div(facts.s_q * g, tile_q) < _ceil_div(facts.s_q, tile_q) * g
     else:
         wins = _pack_gqa_wins(facts, tile_q)
-        if wins and not caps.pack_gqa_requires_divisor:
+        if wins and not caps.pack_gqa_requires_divisible:
             # When tile_q % G != 0 a packed tile holds tile_q // G tokens, its tail rows dead: packing wins only while it launches no
             # more Q tiles than the unpacked set (G per KV head here, since S_q < tile_q).  48/1 at S_q = 120 would
             # launch 60 two-token tiles against 48, 71/1 at S_q = 100 one-token tiles 100 against 71.  A group that
@@ -2279,7 +2279,7 @@ def _split_points(
 
     ``pack_g`` is the packed group of the set the split rides (1 = unpacked;
     :func:`_pack_gqa_group` -- the kernel's ``Cfg.PACK_G``, which is the GQA
-    ratio G when it divides the tile (or fits it, where no divisor is required) and
+    ratio G when it divides the tile (or fits it, where divisibility is not required) and
     a proper divisor of it under partial PackGQA): packing puts ``rows //
     pack_g`` tokens of ``pack_g`` heads in each Q tile and divides the head
     count by ``pack_g``, so the wave-cost model must see the PACKED launch —

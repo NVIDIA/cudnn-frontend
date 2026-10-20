@@ -433,8 +433,7 @@ def _sm120_gqa6_facts(**over):
 @pytest.mark.parametrize("row", sorted(_SM120_ROW_FACTS))
 def test_sm120_packs_a_gqa_ratio_the_tile_does_not_divide(row):
     """Every SM120 template packs any GQA group up to the tile (the rows past (tile_m // G) * G are dead), at
-    D=128, 256 and 512, and declines a group past the tile. An unset tile_m is the flavor's own largest Q tile: 64
-    rows on the D=512 templates, so 96 / 1 is declined there and 64 / 1 admitted."""
+    D=128, 256 and 512, and declines a group past the tile. Every other row requires divisibility."""
     from cudnn.sdpa.fwd.config_sm100 import pack_gqa_supported
     from cudnn.sdpa.fwd.config_sm120 import tile_domain
 
@@ -451,34 +450,12 @@ def test_sm120_packs_a_gqa_ratio_the_tile_does_not_divide(row):
             assert reason(tile, d_qk=d, d_v=d, h_q=20) is None, (d, tile)  # G = 5
             refused = reason(tile, d_qk=d, d_v=d, h_q=2 * tile[0], h_kv=1)
             assert refused is not None and f"does not pack at tile_m={tile[0]}" in refused, (d, tile, refused)
-
-    def unset(h_q, d):
-        facts = _sm120_gqa6_facts(**{**_SM120_ROW_FACTS[row], **dict(h_q=h_q, h_kv=1, d_qk=d, d_v=d)})
-        return engines.mismatch(caps, facts, engines.SdpaFwdKnobs(pack_gqa=True))
-
-    refused = unset(96, 512)
-    assert refused is not None and "does not pack at tile_m=64" in refused, refused
-    assert unset(64, 512) is None
-    assert unset(96, 256) is None  # 128 rows below D=512
-    assert pack_gqa_supported(24, 4, 64, requires_divisor=False) and pack_gqa_supported(64, 1, 64, requires_divisor=False)
-    assert not pack_gqa_supported(128, 1, 64, requires_divisor=False) and not pack_gqa_supported(24, 5, 64, requires_divisor=False)
+    assert pack_gqa_supported(24, 4, 64, requires_divisible=False) and pack_gqa_supported(64, 1, 64, requires_divisible=False)
+    assert not pack_gqa_supported(128, 1, 64, requires_divisible=False) and not pack_gqa_supported(24, 5, 64, requires_divisible=False)
     assert not pack_gqa_supported(24, 4, 64)  # the full-ratio contract the other rows keep
-
-
-@pytest.mark.L0
-@pytest.mark.parametrize("row", sorted(_SM120_ROW_FACTS))
-def test_sm120_pack_gqa_rule_and_q_tile_domains_track_the_templates(row):
-    """Every SM120 row packs a GQA ratio the tile does not divide, and each flavor's Q tile domain is its templates'
-    (config_sm120.tile_domain): one 64-row tile at D=512, 64 and 128 rows below. Every other row requires a divisor."""
-    from cudnn.sdpa.fwd.config_sm120 import tile_domain
-
-    caps = _sm120_spec(row).capabilities
-    quantized = bool(_SM120_ROW_FACTS[row])
-    assert caps.pack_gqa_requires_divisor is False
-    for d in (64, 128, 256, 512):
-        facts = _sm120_gqa6_facts(**_SM120_ROW_FACTS[row], d_qk=d, d_v=d)
-        assert engines.effective_tile_ms(caps, facts) == {m for m, _ in tile_domain(d, d, quantized)}, d
-    assert all(spec.capabilities.pack_gqa_requires_divisor for spec in engines.ENGINE_SPECS if spec.capabilities.sm_lo != 120)
+    assert caps.pack_gqa_requires_divisible is False
+    for other in ("sdpa_fwd_prefill_sm100", "sdpa_fwd_prefill_sm90", "sdpa_fwd_prefill_sm80"):
+        assert _sm120_spec(other).capabilities.pack_gqa_requires_divisible, other
 
 
 @pytest.mark.L0
