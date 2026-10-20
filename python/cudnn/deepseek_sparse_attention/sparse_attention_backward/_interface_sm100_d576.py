@@ -22,13 +22,13 @@ _MAX_DETERMINISTIC_COMPACT_SLOTS = 76
 
 
 def _workspace_sizes(total_s_q: int, total_s_kv: int, deterministic: bool = False, num_heads: int = 128) -> tuple[int, int]:
-    """Byte sizes of the FP32 LSE/OdO and dKV planes, shared with the generic kernel."""
+    """Byte sizes of the FP32 LSE/OdO and compact dKV workspace."""
     backend = H96_BACKEND if num_heads == 96 else BACKEND
     return tuple(math.prod(shape) for shape in _workspace_shapes_sm100(total_s_q, total_s_kv, 576, num_heads, deterministic, backend))
 
 
 def _workspace_bytes(total_s_q: int, total_s_kv: int, deterministic: bool = False, num_heads: int = 128) -> int:
-    """Caller scratch bytes for this shape; identical to the generic SM100 formula."""
+    """Caller scratch bytes, including the deterministic 96-plane dKV workspace."""
     backend = H96_BACKEND if num_heads == 96 else BACKEND
     return flash_attn_bwd_sm100_workspace_size(total_s_q, total_s_kv, 576, num_heads, deterministic, backend=backend)
 

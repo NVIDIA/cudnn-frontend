@@ -719,19 +719,31 @@ def test_DSA_sparse_attention_backward_sm100_d576_workspace_uses_compact_rows(nu
 
 @pytest.mark.L0
 def test_DSA_sparse_attention_backward_sm100_deterministic_workspace_respects_backend():
-    """Adaptive M64 scratch must not undersize either deterministic H128 two-CTA route."""
+    """D576 two-CTA scratch exposes its compact 96-plane capacity."""
     try:
         from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100 import flash_attn_bwd_sm100_workspace_size
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
-    s_q, s_kv, num_heads = 7, 1025, 128
-    for head_dim, backend in ((512, "h128_2cta_m64"), (576, "h128_d576_2cta_m64")):
-        fixed = flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True)
-        two_cta = flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True, backend=backend)
-        adaptive = flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True, backend="generic_m64")
-        assert two_cta == fixed
-        assert adaptive < fixed
+    s_q, s_kv = 7, 1025
+    fixed_d512 = flash_attn_bwd_sm100_workspace_size(s_q, s_kv, 512, 128, deterministic=True)
+    two_cta_d512 = flash_attn_bwd_sm100_workspace_size(
+        s_q, s_kv, 512, 128, deterministic=True, backend="h128_2cta_m64"
+    )
+    assert two_cta_d512 == fixed_d512
+
+    padded_s_q = math.ceil(s_q / 8) * 8
+    padded_s_kv = math.ceil(s_kv / 8) * 8
+    for num_heads, backend in ((96, "h96_d576_2cta_m64"), (128, "h128_d576_2cta_m64")):
+        stats_bytes = num_heads * padded_s_q * 2 * torch.float32.itemsize
+        compact_dkv_bytes = 96 * padded_s_kv * 576 * torch.float32.itemsize
+        compact = flash_attn_bwd_sm100_workspace_size(s_q, s_kv, 576, num_heads, deterministic=True, backend=backend)
+        fixed = flash_attn_bwd_sm100_workspace_size(s_q, s_kv, 576, num_heads, deterministic=True)
+        adaptive = flash_attn_bwd_sm100_workspace_size(
+            s_q, s_kv, 576, num_heads, deterministic=True, backend="generic_m64"
+        )
+        assert compact == stats_bytes + compact_dkv_bytes
+        assert adaptive < compact < fixed
 
 
 def _exercise_deterministic_sm100_case(num_heads, head_dim, s_q, s_kv, repeats, check_short_workspace=False, max_topk=None):

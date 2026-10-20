@@ -68,8 +68,8 @@ def _workspace_shapes_sm100(
     """Return byte-shaped LSE/OdO and dKV scratch layouts for one launch.
 
     Generic deterministic M64 launches use the adaptive shard specialization.
-    An unspecified backend remains conservative because the deterministic
-    D576 two-CTA kernels retain their fixed 128-plane public workspace.
+    H96/H128 D576 two-CTA kernels use their compact 96-plane workspace. An
+    unspecified backend retains the conservative 128-plane capacity.
     """
     acc_dtype = cutlass.Float32
     workspace_lse_odo_shape = FlashAttentionDSABackwardSm100._get_workspace_size_LSE_OdO(
@@ -80,7 +80,14 @@ def _workspace_shapes_sm100(
         acc_dtype,
     )
     if deterministic:
-        dkv_kernel_cls = deterministic_kernel_class(total_s_q) if backend == "generic_m64" else FlashAttentionDSABackwardSm100Deterministic
+        if backend == "generic_m64":
+            dkv_kernel_cls = deterministic_kernel_class(total_s_q)
+        elif backend in {"h96_d576_2cta_m64", "h128_d576_2cta_m64"}:
+            from .dsa_bwd_sm100_h128_d576_2cta_deterministic import TwoCTADeterministicReduction
+
+            dkv_kernel_cls = TwoCTADeterministicReduction
+        else:
+            dkv_kernel_cls = FlashAttentionDSABackwardSm100Deterministic
     else:
         dkv_kernel_cls = FlashAttentionDSABackwardSm100
     workspace_dkv_shape = dkv_kernel_cls._get_workspace_size_dKV(
@@ -104,8 +111,9 @@ def flash_attn_bwd_sm100_workspace_size(
     """Return the reusable caller scratch required by one SM100 launch.
 
     The generic deterministic M64 backend selects a 32-, 64-, or 128-plane
-    dKV layout from ``total_s_q``. H96/H128 two-CTA and unspecified backends use
-    the conservative fixed 128-plane layout. The result includes alignment
+    dKV layout from ``total_s_q``. H96/H128 D576 two-CTA backends use a
+    compact 96-plane layout; unspecified backends use the conservative fixed
+    128-plane layout. The result includes alignment
     padding and is the minimum byte count for a contiguous ``torch.uint8``
     workspace; :func:`flash_attn_bwd_sm100` also accepts a larger buffer.
     """

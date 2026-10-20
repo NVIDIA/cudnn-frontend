@@ -338,8 +338,8 @@ class SparseAttentionBackward(APIBase):
         """Return the minimum reusable per-execution workspace in bytes.
 
         Generic deterministic SM100 plans include a query-dependent 32-, 64-,
-        or 128-plane FP32 dKV accumulator; deterministic H96/H128 two-CTA plans
-        retain their fixed 128-plane capacity. The returned size is
+        or 128-plane FP32 dKV accumulator. Deterministic H96/H128 D576 two-CTA
+        plans use the compact 96-plane capacity. The returned size is
         authoritative for this plan; ``execute()`` accepts a larger contiguous
         uint8 buffer on the plan device but never allocates one.
         """

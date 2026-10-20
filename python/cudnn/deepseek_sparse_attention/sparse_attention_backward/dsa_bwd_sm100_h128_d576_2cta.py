@@ -3981,12 +3981,12 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic(TwoCTADeterminis
     """D576 two-CTA arithmetic with fixed query-slot and rank reduction order."""
 
     # Each per-KV-row record holds 512 core values and two rank-private 64-value tails.
-    # Compact records and fold buffers fit inside the public 128-plane capacity.
+    # Compact records and fold buffers fit inside the 96-plane workspace capacity.
     COMPACT_SLOTS = 74
     COMPACT_RECORD = 640
     COMPACT_QUERIES_PER_GROUP = 8
     COMPACT_GROUPS = 10
-    COMPACT_PUBLIC_PLANES = 128
+    COMPACT_PUBLIC_PLANES = 96
     num_dkv_shards = COMPACT_SLOTS
     dkv_shards_per_query = 1
     max_query_pairs_per_wave = COMPACT_SLOTS
@@ -4014,7 +4014,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic(TwoCTADeterminis
 
     @cute.jit
     def make_dKV_accumulator(self, workspace_dKV: cute.Tensor, total_seqlen_KV: Int32):
-        """Keep the public 128-plane view while privately using compact records."""
+        """Expose the compact 96-plane view used by records and fold buffers."""
         pitch = cute.round_up(total_seqlen_KV, 8)
         return cute.make_tensor(
             cute.recast_ptr(workspace_dKV.iterator, dtype=Float32),
