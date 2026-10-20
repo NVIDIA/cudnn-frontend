@@ -68,8 +68,8 @@ def _inputs(b, h_q, h_kv, s_q, s_kv, dtype):
     return _bhsd(b, h_q, s_q, _D, dtype), _bhsd(b, h_kv, s_kv, _D, dtype), _bhsd(b, h_kv, s_kv, _D, dtype)
 
 
-# The step 7 and step 8 switch fields (config_sm90.TemplateParams). A variant names the ones it turns on; _plan sets every
-# other one False, so a variant never inherits the adapter's shipped values.
+# The overlap and persistent switch fields (config_sm90.TemplateParams). A variant names the ones it turns on; _plan
+# sets every other one False, so a variant never inherits the adapter's shipped values.
 _SWITCHES = ("intra_wg_overlap", "persistent")
 _VARIANTS = {"v1": (), "ov": ("intra_wg_overlap",), "pa": ("intra_wg_overlap", "persistent")}
 # The persistent variants: each must compute ov's O and Stats bit for bit.
@@ -614,10 +614,10 @@ def test_d128_layouts_are_bitwise_equal(layout):
     assert torch.equal(base[0], other[0]) and torch.equal(base[1], other[1])
 
 
-# --- Step 7: every switch value computes one function -------
+# --- Overlap and persistence: every switch value computes one function -------
 #
-# Overlap reorders issues and waits around the same multiplies, P words, V stages and k-step chains (plan
-# step7-overlap-pingpong.md 3.2), so it equals v1 bit for bit. Each case is an edge of the overlap protocol.
+# Overlap reorders issues and waits around the same multiplies, P words, V stages and k-step chains, so it equals v1
+# bit for bit. Each case is an edge of the overlap protocol.
 
 # K and the even Q rows take this constant: those rows take the FP64 exponents (the large-scores test's max-1.2e12 case),
 # while the odd rows (random Q, raw scores about 1e6, under the about 1.3e8 row limit) stay on FP32.
@@ -633,7 +633,7 @@ _CROSS = {  # id: (b, h_q, h_kv, s_q, s_kv, dtype, adapter keywords)
     "neg-scale": (2, 4, 2, 130, 200, torch.float16, dict(is_causal=True, scale_softmax=-0.25)),  # FP64 path on every tile
     "wide-fp64": (1, 2, 2, 128, 256, torch.bfloat16, {}),  # even rows FP64, odd rows FP32: lanes diverge inside the PV window
     "multi-wave": (4, 16, 4, 1024, 1024, torch.bfloat16, dict(is_causal=True, sched_policy=SCHED_LPT_L2)),
-    # Step 8: consecutive items of one CTA differ.
+    # For the persistent walk: consecutive items of one CTA differ.
     "alternating-wide": (2, 2, 2, 128, 256, torch.bfloat16, {}),  # head 0 FP64 rows, head 1 FP32: NATURAL items alternate
     "mixed-causal": (1, 2, 2, 640, 640, torch.bfloat16, dict(is_causal=True)),  # Q tiles walk 1 to 5 KV tiles (LPT_L2)
     "one-item": (1, 1, 1, 64, 64, torch.float16, {}),  # one item, one CTA, one KV tile
@@ -687,7 +687,7 @@ def _assert_bitwise(variant, case, got, base, against):
 @pytest.mark.parametrize("variant", ["ov"])
 @torch_fork_set_rng(seed=0)
 def test_d128_variant_is_bitwise_v1(variant, case):
-    """Every step 7 switch value computes v1's O and Stats bit for bit; v1 itself is checked against the
+    """Every overlap switch value computes v1's O and Stats bit for bit; v1 itself is checked against the
     reference. A difference that repeats launch after launch is arithmetic (compare the softmax block's
     FFMA/FMUL/FADD counts in SASS); one that moves between launches is a race."""
     _, _, _, s_q, s_kv, _, kw = _CROSS[case]
@@ -727,7 +727,7 @@ def test_d128_persistent_is_bitwise_ov(variant, case, grid):
 @torch_fork_set_rng(seed=0)
 def test_d128_graph_replay_is_bitwise_eager(variant, causal):
     """CUDA-graph replay of one plan equals its eager launch bit for bit, before and after the inputs change
-    in place at the captured pointers (design T9), for every switch record, dense and bottom-right causal; a
+    in place at the captured pointers, for every switch record, dense and bottom-right causal; a
     persistent one at two CTAs (24 items, 12 per CTA)."""
     q, k, v = _inputs(2, 4, 2, 300, 700, torch.bfloat16)
     mask = dict(is_causal=True, causal_bottom_right=True) if causal else {}
@@ -1048,7 +1048,7 @@ _SASS_PROBE = textwrap.dedent(r"""
         print("SASS", name, sum(1 for ln in sass if key in ln))
     print("SASS MAXREG", max((int(r) for ln in text for r in re.findall(r"\bR(\d+)\b", ln)), default=-1))
     # Overlap's reach: MUFU.EX2 between a wait_group(1) and the next wait_group(0), the fewest over the steps (34 of
-    # 66 in the kernel mapper's ov build, plan O1). Printed for the A/B record, not pinned.
+    # 66 in an offline compile of the ov build). Printed to compare builds, not pinned.
     under = []
     for a, ln in enumerate(text):
         if "DEPBAR.LE gsb0, 0x1" in ln:
@@ -1078,8 +1078,8 @@ _SASS_PROBE = textwrap.dedent(r"""
         if "Used" in ln or "spill" in ln or "C75" in ln:
             print("PTXAS_LINE", ln.strip())
     """)
-# A target, not yet a measurement: the plan expects no spills at the 240-register budget (design
-# 3.5 estimates about 200). Replace it with the STL/LDL counts of the first sm_90a compile (S2).
+# No spills: each case below compiles to 0 STL and 0 LDL at the 240-register budget in an offline sm_90a compile (ptxas
+# 13.4 V13.4.92, CuTe DSL 4.8.0); the test holds every new compile to that, within SPILL_TOLERANCE.
 _SPILL_PIN = {"STL": 0, "LDL": 0}
 # The SASS cases: (variant, causal body). Today's two on the causal body, plus the persistent record on the dense body,
 # the only one the adapter ships it on (one step instance: the masked phases fold away).
@@ -1088,12 +1088,12 @@ _SASS_CASES = {"v1": ("v1", True), "ov": ("ov", True), "pa-dense": ("pa", False)
 # above the items every CTA runs one item, and LLVM could fold the item loop away if it ever proved that (the warp-uniform
 # item index keeps it from doing so today); a count below the items pins the loop whatever it proves.
 _SASS_CTAS = 64
-# Per-case structure of the probe body (GQA 4, Stats, bf16), measured on the offline sm_90a kit (ptxas 13.4 V13.4.92,
-# CuTe DSL 4.8.0, compile_d128.sh --preset probe): v1 = 3 step instances x (8 SS + 8 RS); ov = prologue QK 8 + 2 step
-# instances x 16 + drain PV 8, one wait_group(1) per step instance; pa-dense is one copy of ov's dense item body inside
-# the item loop, one step instance (--no-causal --overlap --persistent --ctas 64). BAR_SYNC: the CTA barrier after the
-# barrier init and the O staging barrier in each branch of the warpgroup split (3); pa-dense adds, in each branch, the
-# barrier that holds warps 1 to 3 until warp 0's deferred O store wait returns (5). Body counts are a toolchain fact
+# Per-case structure of the probe body (GQA 4, Stats, bf16), measured in an offline sm_90a compile (ptxas 13.4 V13.4.92,
+# CuTe DSL 4.8.0): v1 = 3 step instances x (8 SS + 8 RS); ov = prologue QK 8 + 2 step instances x 16 + drain PV 8, one
+# wait_group(1) per step instance; pa-dense is one copy of ov's dense item body inside the item loop, one step instance
+# (the probe body made non-causal, persistent at 64 CTAs). BAR_SYNC: the CTA barrier after the barrier init and the O
+# staging barrier in each branch of the warpgroup split (3); pa-dense adds, in each branch, the barrier that holds warps
+# 1 to 3 until warp 0's deferred O store wait returns (5). Body counts are a toolchain fact
 # (python/cudnn/sdpa/AGENTS.md, the LDTM lesson): re-measure on a new toolchain and record it next to the numbers.
 _CODEGEN_PINS = {
     "v1": dict(HGMMA=48, DEPBAR=6, DEPBAR_1=0, BAR_SYNC=3, BAR_ARV=0),

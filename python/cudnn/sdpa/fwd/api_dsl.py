@@ -245,7 +245,7 @@ _SM100_KERNEL_FILES = {
 _SM100_D512_2X2_KERNEL_FILE = "sm100/prefill_d512_f16_2x2.py"
 _SM107_D512_2X2_KERNEL_FILE = "sm107/prefill_d512_f16_2x2.py"
 D512_2X2: bool = True
-# The SM90 D128 template's step 7 speed switch (config_sm90.TemplateParams.intra_wg_overlap). A CALL-TIME module
+# The SM90 D128 template's overlap switch (config_sm90.TemplateParams.intra_wg_overlap). A CALL-TIME module
 # constant that SdpaFwdDslSm90.check_support writes into a D128 plan's record (the D512_2X2 precedent above: a module
 # constant, not configuration, never per plan); a D512 plan never carries it. Either value computes the same function
 # bit for bit, up to the sign of a zero O element (test_sdpa_fwd_d128_sm90.py::test_d128_variant_is_bitwise_v1), so
@@ -5869,9 +5869,9 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             seq_q_lens_present=self.seq_q_lens_present,
             seq_kv_lens_present=self.seq_kv_lens_present,
             page_size=self.paged_page_size,
-            # D128 only: the step 7 switch, read at call time (module constant above).
+            # D128 only: the overlap switch, read at call time (module constant above).
             intra_wg_overlap=self.flavor == _SM90_D128_FLAVOR and D128_INTRA_WG_OVERLAP,
-            # D128 only: the step 8 switch.
+            # D128 only: the persistent-loop switch.
             persistent=persistent,
         )
         self._native_d64 = False

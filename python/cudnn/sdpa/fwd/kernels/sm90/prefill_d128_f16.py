@@ -18,7 +18,7 @@ The kernel implements:
   softmax and PV on query rows 0-63 and 64-127 of the tile.
 - Two-stage K and V rings, so the producer loads KV tile j+1 while tile j is in use.
 - One work tile per CTA over (Q tile, head, batch), in NATURAL, LPT or LPT_L2 order;
-  or, under ``TemplateParams.persistent`` (step 8), a grid of at most one CTA per SM
+  or, under ``TemplateParams.persistent``, a grid of at most one CTA per SM
   whose CTAs walk the work items in that order: the producer loads the next item's
   first K tile, Q and first V tile while the current item finishes.
 - Online softmax around an exact sign-aware row anchor, with lane-partial row sums
@@ -105,12 +105,12 @@ PREPARED_KV_TAIL_NATIVE = True
 
 STORAGE_DTYPE = {DTYPE_FP16: cutlass.Float16, DTYPE_BF16: cutlass.BFloat16}[PARAMS.dtype_qkv]
 
-# Step 7 speed switch (design 3.12), from the record: each value is its own module, digest and compile key
+# Intra-warpgroup overlap switch, from the record: each value is its own module, digest and compile key
 # (python/cudnn/sdpa/AGENTS.md, the hand-set digest lesson). Tests and benchmarks read it to assert that the arm they
 # asked for is the one that compiled. False is the v1 loop.
 INTRA_WG_OVERLAP: bool = PARAMS.intra_wg_overlap
-# Step 8 switch, read the same way: each value is its own module, digest and compile key. False is one work tile per
-# CTA; validate_params above has refused True without intra_wg_overlap.
+# Persistent-loop switch, read the same way: each value is its own module, digest and compile key. False is one work
+# tile per CTA; validate_params above has refused True without intra_wg_overlap.
 PERSISTENT: bool = PARAMS.persistent
 
 
@@ -171,8 +171,8 @@ class Bars(NamedTuple):
 class SM90FusedMultiHeadAttentionForward:
     """Configure and launch the SM90 FP16/BF16 D128 FMHA prefill kernel.
 
-    Each CTA runs one work tile, or under ``persistent`` every work item of its stride
-    (step 8), through three warpgroups: WG0 loads, WG1 and WG2 each compute 64 query
+    Each CTA runs one work tile, or under ``persistent`` every work item of its stride,
+    through three warpgroups: WG0 loads, WG1 and WG2 each compute 64 query
     rows. The constructor takes only what ``config_sm90.validate_params`` lets a D128
     specialization declare; the prepared host still reads ``thd_varlen``, ``has_sink``,
     ``thd_lse_head_stride`` and ``thd_origins``, which stay off.
@@ -222,9 +222,8 @@ class SM90FusedMultiHeadAttentionForward:
         :param stats_log2: Store Stats in base 2: the store multiplies each natural-log row
             LSE by ``log2(e)``; ``-inf`` stays ``-inf``, and ``lse`` None removes it.
         :param intra_wg_overlap: Issue QK(t) and PV(t-1) as two WGMMA groups in flight together and run
-            tile t's softmax under PV(t-1) (design 3.12, FA3's ``IntraWGOverlap``).
-        :param persistent: Launch ``min(items, persistent_ctas)`` CTAs that each loop over work items
-            (step 8).
+            tile t's softmax under PV(t-1) (FA3's ``IntraWGOverlap``).
+        :param persistent: Launch ``min(items, persistent_ctas)`` CTAs that each loop over work items.
         :param persistent_ctas: The persistent grid's CTA cap (the SM count); 0 when not persistent.
         """
 
@@ -298,7 +297,7 @@ class SM90FusedMultiHeadAttentionForward:
         self.o_fragment_slots = self.WG_ROWS * self.HEAD_TILE // cute.arch.THREADS_PER_WARPGROUP
         # One K or V stage in the descriptors' 16-byte start-field units.
         self.kv_stage_units = self.tile_elems * self.storage_dtype.bytes // 16
-        # Step 8: the work items and a persistent grid: at most one CTA per SM (min_blocks_per_mp=1 and 196,704 B of
+        # The work items and a persistent grid: at most one CTA per SM (min_blocks_per_mp=1 and 196,704 B of
         # SMEM leave no room for a second) and never more CTAs than items, so every CTA has an item and its first is its
         # block index.
         self.items = self.q_tiles * self.heads * self.b
@@ -693,7 +692,7 @@ class SM90FusedMultiHeadAttentionForward:
         active_masks: cutlass.Constexpr,
         release_q: cutlass.Constexpr = False,
     ):
-        """INTRA_WG_OVERLAP step t = ``kv_step`` >= 1: QK(t) and PV(t-1) in flight together (design 3.12).
+        """INTRA_WG_OVERLAP step t = ``kv_step`` >= 1: QK(t) and PV(t-1) in flight together.
 
         Issue QK(t) into ``s_regs``, correct O by alpha(t-1) while it runs, and issue PV(t-1) from
         ``p_words`` (P(t-1)); ``wait_group(1)`` retires QK(t), so K(t) is released while PV(t-1) still
@@ -775,7 +774,7 @@ class SM90FusedMultiHeadAttentionForward:
         orders that staging before warp 0's elected lane issues the TMA store. A
         warpgroup whose rows all lie past ``q_output_limit`` stores nothing.
 
-        ``persistent`` (step 8): Q was released in the walk, so the epilogue releases nothing; the TMA store's ``.read``
+        ``persistent``: Q was released in the walk, so the epilogue releases nothing; the TMA store's ``.read``
         wait moves to the start of the next item's staging (before ``stmatrix`` overwrites this half) and to the end of
         the CTA (compute_persistent).
         """
@@ -1005,7 +1004,7 @@ class SM90FusedMultiHeadAttentionForward:
 
     @cute.jit
     def work_record(self, tile, head, batch):
-        """One (Q tile, head, batch) item's record, as _run_unit builds it, for the persistent walk (step 8).
+        """One (Q tile, head, batch) item's record, as _run_unit builds it, for the persistent walk.
 
         A separate copy so the one-tile-per-CTA rendering stays byte-identical; test_d128_persistent_is_bitwise_ov holds
         the two to the same answers.
@@ -1028,7 +1027,7 @@ class SM90FusedMultiHeadAttentionForward:
 
     @cute.jit
     def work_of(self, item):
-        """Decode work item ``item`` (0 <= item < self.items) into its record (step 8).
+        """Decode work item ``item`` (0 <= item < self.items) into its record, for the persistent walk.
 
         NATURAL numbers the items as the hardware rasterizes the one-tile grid ``(q_tiles, h_q, b)``, Q tile fastest,
         then head, then batch, so a persistent grid's first round is that grid's first wave; LPT and LPT_L2 decode the
@@ -1062,8 +1061,8 @@ class SM90FusedMultiHeadAttentionForward:
         """A persistent CTA's first item: its block index (__call__ launches at most one CTA per item).
 
         Every item index, and every pipeline state and Q phase the walk carries (uniform_state, next_q_phase), is marked
-        warp-uniform, so ptxas can keep them in uniform registers: on the offline sm_90a kit the walk's LPT and LPT_L2
-        causal bodies peak at R232 with the marks and R234 without.
+        warp-uniform, so ptxas can keep them in uniform registers: compiled offline for sm_90a (CuTe DSL 4.8.0, ptxas
+        13.4), the walk's LPT and LPT_L2 causal bodies peak at R232 with the marks and R234 without.
         """
         item, _, _ = cute.arch.block_idx()
         return cute.arch.make_warp_uniform(item)
@@ -1208,7 +1207,7 @@ class SM90FusedMultiHeadAttentionForward:
 
     @cute.jit
     def tmaldg_persistent(self, sQ, sK, sV, bars, tma_q_desc, tma_k_desc, tma_v_desc):
-        """Persistent producer (step 8): this CTA's items in turn, each K(i, 0), Q(i), V(i, 0), then the rest of its
+        """Persistent producer: this CTA's items in turn, each K(i, 0), Q(i), V(i, 0), then the rest of its
         reverse walk as tmaldg_warp_group's.
 
         Warp 0 of WG0 only. The EMPTY phases start at 1 (passes at once on a fresh barrier) and are carried across items,
@@ -1285,7 +1284,7 @@ class SM90FusedMultiHeadAttentionForward:
 
     @cute.jit
     def compute_persistent(self, tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, w):
-        """Run compute warpgroup ``w`` (0 for WG1, 1 for WG2) over every item of this CTA (step 8).
+        """Run compute warpgroup ``w`` (0 for WG1, 1 for WG2) over every item of this CTA (the persistent walk).
 
         Built once per CTA, as compute_warp_group builds them per tile: the register Arrays, the operand descriptors, the
         row state and the launch-uniform scale guard. Then the walk (walk_items). After it, every lane of warp 0 waits for
@@ -1319,7 +1318,7 @@ class SM90FusedMultiHeadAttentionForward:
 
     @cute.jit
     def _run_persistent(self, tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, wg):
-        """Step 8: _run_unit's register split, once per CTA, then the role over every item.
+        """Persistent walk: _run_unit's register split, once per CTA, then the role over every item.
 
         setmaxnreg is warpgroup-collective, so all four WG0 warps still run it before warps 1 to 3 go idle.
         """
@@ -1480,7 +1479,7 @@ class SM90FusedMultiHeadAttentionForward:
         prims.fence_mbarrier_init()
         prims.barrier_cta_sync()
         if cutlass.const_expr(self.persistent):
-            # Step 8: every role walks this CTA's items (at most one CTA per SM, __call__).
+            # Persistent: every role walks this CTA's items (at most one CTA per SM, __call__).
             wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) // cute.arch.WARPS_PER_WARPGROUP
             self._run_persistent(tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, wg)
         else:
@@ -1569,7 +1568,7 @@ class SM90FusedMultiHeadAttentionForward:
             port_tma_desc(o, self.WG_ROWS, self.tma_orders[3]),
         )
         # The LPT policies launch the same tiles on one axis, which kernel unflattens; a persistent record launches at most
-        # one CTA per SM and never more than the items, and each CTA walks its items (step 8).
+        # one CTA per SM and never more than the items, and each CTA walks its items.
         grid = (self.q_tiles, self.heads, self.b)
         if cutlass.const_expr(self.sched_policy != SCHED_NATURAL):
             grid = (self.q_tiles * self.heads * self.b, 1, 1)

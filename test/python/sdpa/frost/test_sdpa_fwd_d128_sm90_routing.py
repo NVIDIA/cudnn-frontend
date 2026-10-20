@@ -488,7 +488,7 @@ def test_d128_template_fits_the_shared_sm90_prepared_host():
     assert reads <= set_attrs(d128), f"the prepared host reads kernel.{sorted(reads - set_attrs(d128))}, which the D128 template never sets"
 
 
-# --- D128 switches: step 7 (intra_wg_overlap) and step 8 (persistent) -------
+# --- D128 switches: intra_wg_overlap and persistent -------
 
 _SWITCHES = ("intra_wg_overlap", "persistent")
 _SWITCH_RECORDS = [dict(zip(_SWITCHES, values)) for values in itertools.product((False, True), repeat=len(_SWITCHES))]
@@ -512,9 +512,9 @@ def _admitted(fields):
 
 
 def test_d128_switch_fields_are_appended_last():
-    """The step 7 switch, then the step 8 switch, are appended after thd_origins, each defaulting to False: every
-    earlier specialization keeps its defaults (the append-only rule the kit's hygiene check also enforces). The
-    segment is pinned from its own first field, so a field appended after it later still passes."""
+    """The overlap switch, then the persistent switch, are appended after thd_origins, each defaulting to False:
+    every earlier specialization keeps its defaults (the append-only rule). The segment is pinned from its own first
+    field, so a field appended after it later still passes."""
     from cudnn.sdpa.fwd import config_sm90 as c
 
     fields = dataclasses.fields(c.TemplateParams)
@@ -533,7 +533,7 @@ def test_d128_switch_fields_are_appended_last():
     ],
 )
 def test_d512_refuses_the_d128_switches(switch, needs, why):
-    """Every switch is a D128 template field: D512 refuses it alone (the step 7 message keeps its spelling), and D128
+    """Every switch is a D128 template field: D512 refuses it alone (the overlap message keeps its spelling), and D128
     takes it with the switch it requires."""
     from cudnn.sdpa.fwd import config_sm90 as c
 
@@ -619,7 +619,7 @@ def test_d128_ships_persistence_over_the_overlap_loop():
     assert (api_dsl.D128_INTRA_WG_OVERLAP, api_dsl.D128_PERSISTENT) == (True, True)
 
 
-# --- Step 8 persistent walk: the Q protocol and source pins (host-only, no trace) -------
+# --- Persistent walk: the Q protocol and source pins (host-only, no trace) -------
 
 
 def _passes(completed, parity):
