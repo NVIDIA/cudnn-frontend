@@ -21,6 +21,7 @@ import math
 import os
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -2416,10 +2417,17 @@ def test_gate_domain_invalid_args_raise(backend, variant):
 
 # ---------------------------------------------------------------------------
 # Determinism (contract held by the FROST backend)
+#
+# cuTile serves the same ops where FROST does not, so the same checks run on
+# it. A variant cuTile has no kernel for waives; a cuTile failure here means
+# the fallback is not bitwise repeatable.
 # ---------------------------------------------------------------------------
 
+DETERMINISM_BACKENDS = ["frost", "cutile"]
+MAX_AUTOTUNE_CONFIGS = 8  # the occupancy x num_worker_warps grid is the largest candidate set
 
-@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+
+@pytest.mark.parametrize("backend", DETERMINISM_BACKENDS, indirect=True)
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_determinism_fwd(backend, variant):
     case = make_case(variant, torch.bfloat16, seq_lens=[497, 16, 1, 480, 0, 253])
@@ -2429,7 +2437,8 @@ def test_determinism_fwd(backend, variant):
         o, fs = run_fwd(backend, case, initial_state=state0, output_final_state=True)
         return o, fs
 
-    runs = [launch() for _ in range(DETERMINISM_REPEATS)]
+    with waive_unsupported(backend, variant):
+        runs = [launch() for _ in range(DETERMINISM_REPEATS)]
     torch.cuda.synchronize()
     for out in runs[0]:
         assert torch.isfinite(out.float()).all(), f"{variant} fwd: non-finite output in run 0"
@@ -2438,7 +2447,7 @@ def test_determinism_fwd(backend, variant):
             assert_bitwise(f"{variant} fwd output {i} run {r}", b, a)
 
 
-@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("backend", DETERMINISM_BACKENDS, indirect=True)
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_determinism_bwd(backend, variant):
     case = make_case(variant, torch.bfloat16, seq_lens=[497, 16, 1, 480, 0, 253])
@@ -2460,7 +2469,7 @@ def test_determinism_bwd(backend, variant):
                 assert_bitwise(f"{variant} bwd output {i} run {r}", b, a)
 
 
-@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("backend", DETERMINISM_BACKENDS, indirect=True)
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_determinism_multi_tile_fwd(backend, variant):
     """Multi-tile grid (B*H >> SM count) with an initial state is bitwise
@@ -2472,7 +2481,8 @@ def test_determinism_multi_tile_fwd(backend, variant):
         o, fs = run_fwd(backend, case, initial_state=state0, output_final_state=True)
         return o, fs
 
-    runs = [launch() for _ in range(DETERMINISM_REPEATS)]
+    with waive_unsupported(backend, variant):
+        runs = [launch() for _ in range(DETERMINISM_REPEATS)]
     torch.cuda.synchronize()
     for out in runs[0]:
         assert torch.isfinite(out.float()).all(), f"{variant} multi-tile fwd: non-finite output in run 0"
@@ -2481,7 +2491,7 @@ def test_determinism_multi_tile_fwd(backend, variant):
             assert_bitwise(f"{variant} multi-tile fwd output {i} run {r}", b, a)
 
 
-@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("backend", DETERMINISM_BACKENDS, indirect=True)
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_determinism_multi_tile_bwd(backend, variant):
     case = make_case(variant, torch.bfloat16, B=8, T=192, H=64)
@@ -2501,6 +2511,38 @@ def test_determinism_multi_tile_bwd(backend, variant):
         for r, outs in enumerate(runs[1:], start=1):
             for i, (a, b) in enumerate(zip(runs[0], outs)):
                 assert_bitwise(f"{variant} multi-tile bwd output {i} run {r}", b, a)
+
+
+@pytest.mark.parametrize("backend", ["cutile"], indirect=True)
+@pytest.mark.parametrize("variant", CUTILE_VARIANTS)
+def test_determinism_cutile_autotune_configs(backend, variant):
+    """Under torch deterministic mode the cuTile autotune pick does not reach the output.
+
+    The pick is timing-based and cached per process, so repeats inside one process never see a different one. Force
+    each candidate in turn instead of timing them; fwd and bwd must give the same bits for all of them."""
+    from cudnn.linear_attention.cutile.kernels import common, kda
+
+    shape = dict(seq_lens=[497, 16, 1, 480, 0, 253])
+
+    def run_picking(index):
+        def pick(configs, *args, **kwargs):
+            return SimpleNamespace(best=SimpleNamespace(config=configs[min(index, len(configs) - 1)]))
+
+        common.launch_hint_cache.clear()
+        with patch.object(common, "exhaustive_search", pick), patch.object(kda, "exhaustive_search", pick):
+            return stress_round(backend, variant, shape)
+
+    was_deterministic = torch.are_deterministic_algorithms_enabled()
+    torch.use_deterministic_algorithms(True)
+    try:
+        with waive_unsupported(backend, variant):
+            baseline = run_picking(0)
+        for index in range(1, MAX_AUTOTUNE_CONFIGS):
+            for name, want, have in zip(("o", "final_state", "dq", "dk"), baseline, run_picking(index)):
+                assert_bitwise(f"{variant} autotune pick {index} {name}", have, want)
+    finally:
+        torch.use_deterministic_algorithms(was_deterministic)
+        common.launch_hint_cache.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -2542,7 +2584,7 @@ def test_replay_stress(backend, variant):
         assert_stress_stable(backend, variant, STRESS_SHAPES[:1])
 
 
-@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("backend", DETERMINISM_BACKENDS, indirect=True)
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_multi_graph_stress(backend, variant):
     """Several distinct LA graphs live at once, executed round robin; every
