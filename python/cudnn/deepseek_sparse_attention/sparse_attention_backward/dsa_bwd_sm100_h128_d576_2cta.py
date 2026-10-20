@@ -3699,7 +3699,10 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
                     for line in cutlass.range_constexpr(4):
                         _prefetch_o_row_l2(row_base + Int32(64 * (5 + line)))
         else:
-            for wave in cutlass.range_constexpr(1):
+            # Four gather warps cover 16 rows per wave.  Ordinary H96 warms
+            # both N32 halves; the shared H128 and deterministic routes keep
+            # their established single advisory wave.
+            for wave in cutlass.range_constexpr(2 if self.num_heads == 96 and not self.deterministic else 1):
                 linear = role_tidx + Int32(wave * self.GATHER_THREADS)
                 local_n = Int32(0)
                 line = Int32(0)
