@@ -256,13 +256,29 @@ D512_2X2: bool = True
 # A ping-pong turn between the two compute warpgroups measured 1.11x alone and no further gain on top of overlap, so the
 # kernel has none: each warpgroup issues its own WGMMA groups and the hardware interleaves them.
 D128_INTRA_WG_OVERLAP: bool = True
-# The SM90 D128 template's step 8 switch (config_sm90.TemplateParams.persistent). A CALL-TIME module constant like
-# D128_INTRA_WG_OVERLAP above, written into a D128 plan's record by check_support; a D512 plan never carries it.
+# The SM90 D128 template's persistent-loop switch (config_sm90.TemplateParams.persistent). A CALL-TIME module constant
+# like D128_INTRA_WG_OVERLAP above, written into a D128 plan's record by check_support; a D512 plan never carries it.
 # Persistence rides the overlap loop (validate_params), so a plan is persistent only while D128_INTRA_WG_OVERLAP is on
-# as well, and only a dense plan: its items all walk the same KV tiles, so striding by the grid balances them, while
-# causal items differ in length and causal plans stay one tile per CTA. A persistent plan keeps a zero workspace. Off
-# until the step 8 A/B; the commit that turns it on records the measured table.
-D128_PERSISTENT: bool = False
+# as well, and only a non-causal plan: its items all walk the same KV tiles, so a stride by the grid balances them, and
+# it keeps a zero workspace. Either value computes the same O and Stats bit for bit
+# (test_sdpa_fwd_d128_sm90.py::test_d128_persistent_is_bitwise_ov), so this is a speed choice. Measured on one H100 SXM
+# (132 SMs) on 2026-10-20 against the one-tile-per-CTA overlap kernel and cuDNN 9.27 (bf16, 22 non-causal shapes, 9
+# interleaved rounds, 15 on the six s512 and s1024 shapes the default was chosen on, the decision shapes; CuTe DSL 4.8.0
+# and its ptxas 13.4, torch 2.14 on CUDA 13.0; every ratio a median of per-round ratios): persistence ran 1.006-1.305x
+# the one-tile kernel (geometric mean 1.112x; 1.225x over the decision shapes) and 1.021-1.144x cuDNN in the same rounds
+# (geometric mean 1.085x), where the one-tile kernel ran 0.821-1.140x cuDNN. Per shape set, over every measured shape
+# in it, against the one-tile kernel and cuDNN: b1-16 at 16 or 32 query heads, s512-8k, 1.006-1.231x and 1.021-1.144x;
+# b33 and b66, s512-8k, 1.010-1.305x and 1.064-1.111x; s1024 at b1-33, 1.006-1.204x and 1.072-1.111x; b2 at 32 query
+# heads, s4k-16k, 1.007-1.042x and 1.081-1.144x. The A/A band (the worst per-round gap between a timed kernel and its
+# twin: an independently compiled copy of it, or for cuDNN the same call timed twice per round) has a median of 0.13
+# over these shapes (0.02-0.24) against the one-tile kernel and 0.14 (0.02-0.31) against cuDNN. No shape ran below 1x
+# against either; 10 shapes, the six decision shapes among them, ran above 1 plus their band against the one-tile
+# kernel, and 3 against cuDNN. The weakest against the one-tile kernel, b1 h16/4 s1024 at 1.006x (host-bound, 0.025 ms
+# a call), has a band of 0.10. Causal plans stay one tile per CTA because of an earlier measurement (this one timed
+# non-causal shapes only): the same day, on another H100 SXM, a development copy of this loop, which this loop matched
+# within the copy's band on the six decision shapes, ran three long causal shapes at 0.889-0.922x the one-tile kernel
+# with a stride by the grid (b4 h8/8 s8192, b1 h16/4 s8192, b2 h32/32 s4096; only the first by more than its band).
+D128_PERSISTENT: bool = True
 # The d128 f16/bf16 DECODE tile (TILES_Q=1, cga1, one softmax warpgroup, three
 # KV stages -- config_sm100.CfgD128Decode): what a (128, 128) plan with
 # TILE_CGA_M=1 lowers to on dense graphs.  cga1 on this flavor IS the decode

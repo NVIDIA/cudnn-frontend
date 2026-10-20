@@ -20,8 +20,9 @@ pytestmark = pytest.mark.L1
 
 
 def _frost_shapes():
-    """(S, D) per FROST forward flavor this device serves: on SM90 the D512 envelope and the native exact (128, 128)
-    flavor (#378), whose NATURAL grid is the same (q_tiles, heads, b)."""
+    """(S, D) per FROST forward flavor this device serves: on SM90 the D512 body and, at exact (128, 128), the dedicated
+    D128 template (#378), whose 128 x 128 plans lead there. Its one-tile NATURAL grid is the same (q_tiles, heads, b); a
+    persistent non-causal plan's grid is flat, but launch_grid_mismatch still declines the pinned NATURAL plan."""
     if not torch.cuda.is_available():
         return []
     major, minor = torch.cuda.get_device_capability(0)

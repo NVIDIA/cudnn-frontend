@@ -631,16 +631,32 @@ its own QK (m64n128k16, SS), online softmax and PV (m64n128k16, RS) with no
 handoff between them, so a 64-row FP32 O accumulator costs 64 registers per
 thread. The CTA tile is 128 x 128 (Q rows by keys). K and V ride two-stage
 rings, so the producer loads KV tile j+1 while tile j is in use: 196,704 B of
-SMEM, one CTA per SM. The online softmax, the sign-aware row anchor, the FP64
-path for extreme scales and the reverse KV walk are D512's arithmetic
-(shared helpers in `sm90/_common_hopper.py`). Dense only: a direct caller's
+SMEM, one CTA per SM. A non-causal plan's grid is persistent: at most one CTA
+per SM (the SM count is a compile argument), each walking its work items by a
+stride of the grid, so the producer loads the next item's first K tile, Q and
+first V tile while the current item finishes. A causal plan runs one work item
+per CTA: its items differ in length, and a stride by the grid ran three long
+causal shapes at 0.889-0.922x the one-item-per-CTA kernel on an H100 (an
+earlier run on 2026-10-20 that timed a development build of the loop; the
+measurement below is non-causal only). The online
+softmax, the sign-aware row anchor, the FP64 path for extreme scales and the
+reverse KV walk are D512's arithmetic (shared helpers in
+`sm90/_common_hopper.py`). Dense only: a direct caller's
 declarations naming a `config_sm90.D128_NOT_SERVED` feature run on the D512
 body, or are refused under a pinned 128 x 128 tile; the row declines the 128 x
 128 tile for them. `S_q == 1` is a scope decline at the row, not a kernel
 limit: the kernel runs it on the direct route, and the row keeps the 128 x 128
 tile off it on the graph route because decode is outside the slice #378
-accepted. Placement keeps it behind the backend with the row's other non-D512
-shapes.
+accepted. Measured on one H100 SXM against cuDNN 9.27
+(2026-10-20, bf16, 22 non-causal shapes, s512 to 16k): the persistent kernel
+ran at 1.021-1.144x cuDNN's speed (geometric mean 1.085x; 1.021-1.144x at
+b1-16, 1.064-1.111x at b33 and b66, 1.072-1.111x at s1024, 1.073-1.144x at
+s4k-16k; medians of per-round ratios), where one work item per CTA ran at
+0.821-1.140x. The persistent kernel's lead is larger than the run-to-run noise
+band on 3 of the 22 shapes (per shape, the worst per-round gap between the
+persistent kernel and an independently compiled copy of it, or between two
+timings of the same cuDNN call, whichever is larger; median 0.14). Placement
+keeps it behind the backend with the row's other non-D512 shapes.
 
 ---
 

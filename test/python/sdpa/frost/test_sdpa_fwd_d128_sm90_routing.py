@@ -609,6 +609,16 @@ def test_sm90_persistent_cta_count_is_the_sm_count_and_ignores_the_thd_overrides
     assert api_dsl.SdpaFwdDslSm90._persistent_ctas(None, torch.device("cuda", 0)) == 77
 
 
+def test_d128_ships_persistence_over_the_overlap_loop():
+    """The shipped D128 switches, api_dsl's constants as committed: intra-warpgroup overlap and, over it, persistence,
+    which check_support writes into dense plans only (test_d128_ships_the_persistent_loop_on_dense_plans_only in
+    test_sdpa_fwd_d128_sm90.py runs both masks on an SM90 GPU). The measurement behind the default is D128_PERSISTENT's
+    comment; changing either value changes this test."""
+    from cudnn.sdpa.fwd import api_dsl
+
+    assert (api_dsl.D128_INTRA_WG_OVERLAP, api_dsl.D128_PERSISTENT) == (True, True)
+
+
 # --- Step 8 persistent walk: the Q protocol and source pins (host-only, no trace) -------
 
 

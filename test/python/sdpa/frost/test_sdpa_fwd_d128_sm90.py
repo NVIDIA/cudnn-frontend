@@ -909,6 +909,26 @@ def test_d128_adapter_passes_the_cta_count_exactly_when_persistent(monkeypatch):
         assert (kw.get("persistent_ctas") == 7) if persistent else ("persistent_ctas" not in kw), kw
 
 
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_d128_ships_the_persistent_loop_on_dense_plans_only():
+    """The shipped record (api_dsl's constants as committed, nothing patched): a dense plan compiles the persistent loop
+    over the overlap loop, at the device's SM count, and computes the one-tile overlap kernel's O and Stats bit for bit;
+    a causal plan compiles the one-tile-per-CTA overlap kernel (api_dsl.D128_PERSISTENT: a stride by the grid ran long
+    causal shapes slower)."""
+    q, k, v = _inputs(2, 4, 2, 300, 700, torch.bfloat16)
+    for causal in (False, True):
+        mask = dict(is_causal=True) if causal else {}
+        api, o, lse = _plan(q, k, v, stats=True, **mask)
+        assert (api._k_mod.INTRA_WG_OVERLAP, api._k_mod.PERSISTENT) == (True, not causal), causal
+        if not causal:
+            assert api._persistent_ctas(q.device) == torch.cuda.get_device_properties(q.device).multi_processor_count
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse)
+        torch.cuda.synchronize()
+        base = _run(q, k, v, stats=True, variant="ov", **mask)
+        _assert_bitwise("the shipped record", "causal" if causal else "dense", (o, lse), base, "ov")
+
+
 # --- Tight numerics against FP64 -------
 
 
