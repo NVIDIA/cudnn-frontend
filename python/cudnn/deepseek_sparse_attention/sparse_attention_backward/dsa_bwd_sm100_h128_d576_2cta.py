@@ -414,6 +414,15 @@ def _store_zero_f32x4(destination: cute.Pointer, *, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
+def _store_zero_f32x8(destination: cute.Pointer, *, loc=None, ip=None) -> None:
+    """Clear eight adjacent aligned FP32 values with one 256-bit store."""
+    destination_i64 = destination.toint(loc=loc, ip=ip).ir_value()
+    llvm.inline_asm(
+        None, [destination_i64], "st.global.v4.b64 [$0], {0, 0, 0, 0};", "l", has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT
+    )
+
+
+@dsl_user_op
 def _store_bf16x4_ordinary(destination: cute.Pointer, packed01: cutlass.Uint32, packed23: cutlass.Uint32, *, loc=None, ip=None) -> None:
     """Store four adjacent BF16 outputs with one ordinary 64-bit store."""
     destination_i64 = destination.toint(loc=loc, ip=ip).ir_value()
@@ -1126,7 +1135,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
             active_dkv_shards = min(Int32(self.num_dkv_shards), problem_shape[0] * Int32(self.dkv_shards_per_query))
             if cutlass.const_expr(self.max_topk == 2048):
                 self.zero_dKV_shards(mdKV_acc, mKV.shape[0]).launch(
-                    grid=[cute.ceil_div(mKV.shape[0], 16), active_dkv_shards, 1], block=[160, 1, 1], stream=stream
+                    grid=[cute.ceil_div(mKV.shape[0], 16), active_dkv_shards, 1], block=[640, 1, 1], stream=stream
                 )
             elif cutlass.const_expr(self.max_topk != 128):
                 self.zero_dKV_shards(mdKV_acc, mKV.shape[0]).launch(
@@ -4055,12 +4064,13 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic(TwoCTADeterminis
         slot_offset = cutlass.Int64(slot) * cutlass.Int64(pitch) * cutlass.Int64(self.COMPACT_RECORD)
         slot_tensor = cute.make_tensor(mdKV_acc.iterator + slot_offset, cute.make_layout((self.COMPACT_RECORD, pitch), stride=(1, self.COMPACT_RECORD)))
         if cutlass.const_expr(self.max_topk == 2048):
-            dim = tidx * Int32(4)
-            for row_offset in cutlass.range_constexpr(16):
-                row = block_row * 16 + row_offset
+            dim = tidx % Int32(80) * Int32(8)
+            row_lane = tidx // Int32(80)
+            for row_offset in cutlass.range_constexpr(2):
+                row = block_row * 16 + row_offset * Int32(8) + row_lane
                 if row < seqlen:
                     destination = slot_tensor.iterator + cute.crd2idx((dim, row), slot_tensor.layout)
-                    _store_zero_f32x4(destination)
+                    _store_zero_f32x8(destination)
         else:
             for row_offset in cutlass.range_constexpr(4):
                 row = block_row * 4 + row_offset
