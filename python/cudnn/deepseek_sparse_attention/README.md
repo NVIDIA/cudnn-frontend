@@ -4,7 +4,6 @@
 - **Indexer Forward**: `indexer_forward_wrapper` materializes dense scores on SM90/SM100; `indexer_forward_top_k_wrapper` is the separate SM100 compact-logits path that runs radix Top-K and its fused softmax without materializing the dense score tensor (BSHD/THD BF16 and MXFP8, with optional LSE).
 - **Indexer Top-K**: SM90+ CuTe-DSL radix top-K kernel with per-row ``seq_lens``.
 - **Sparse Attention Backward**: DSA backward for flat MQA tensors on SM90/SM100; consumes the forward wrapper's `out` and KV-only `lse`.
-- **GQA Sparse Attention Backward**: Qwen Sparse Attention (QSA) backward on SM100/SM103 for 24 Q / 2 KV heads at head dim 256 over per-query `(T, 2051)` token lists of 4-token blocks.
 - **Sparse Indexer / Attention Score Recompute**: Sparse (top-K) recomputation of indexer and attention scores for training loss.
 - **Dense Indexer / Attention Score Recompute**: Dense (full-KV) analogues of the above (BSHD on SM90/SM100; the THD `cu_seqlens` layout is SM100+ only).
 - **Indexer Backward**: Three-stage pipeline (score-grad, three GEMMs, dtype cast) for sparse top-K score tensors.
