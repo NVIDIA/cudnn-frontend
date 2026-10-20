@@ -26,6 +26,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05, warp
 from cutlass.cute.typing import BFloat16, Float32, Int32
 from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator
+from ..sparse_attention_forward._tma_gather4 import TMA_GATHER4_AVAILABLE, tma_gather4_cta1
 from .dsa_bwd_sm100_h128_d576_2cta_deterministic import TwoCTADeterministicReduction, ordered_dkv_quad
 
 U64x4 = Tuple[cutlass.Uint64, cutlass.Uint64, cutlass.Uint64, cutlass.Uint64]
@@ -556,6 +557,10 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
         # Only nondeterministic H128 short-circuits full-tile head guards.
         # Deterministic keeps them to avoid a small-workload SM100 regression.
         self.num_heads = num_heads
+        # Only the critical D256:512 refill uses gather4.  The earlier D0:256
+        # refill overlaps successfully with cp.async; converting both halves
+        # increases TMA pressure and regresses the steady-state schedule.
+        self.use_tma_gather4 = TMA_GATHER4_AVAILABLE and num_heads == 96 and not self.deterministic and max_topk != 128
         self.round_head_chunks = num_heads // self.ROUND_K_HEADS
         # Ordinary H96 only needs three 32-head operands per dV/dK sweep.
         # Keep the deterministic producer geometry unchanged so its fixed
@@ -1120,6 +1125,29 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
         round_tma_atom_dot, round_tma_tensor_dot = cute.nvgpu.make_tiled_tma_atom_A(
             round_tma_load_op, mdOT, round_a_layout, self.ROUND_TILER, dkv_tiled_mma, cluster_layout_vmnk.shape
         )
+        tma_atom_kv = tma_atom_q
+        if cutlass.const_expr(self.use_tma_gather4 and not split_regime):
+            # Describe the first 512 values of every D576 KV row as a logical
+            # (D, Tkv) tensor. gather4 fetches four sparse rows per 64-value
+            # transaction directly into the existing SW128 score-KV buffer.
+            kv_descriptor_tensor = cute.make_tensor(
+                mKV.iterator,
+                cute.make_layout(
+                    (self.D_HEAD, cute.size(mKV.shape[0])),
+                    stride=(mKV.stride[1], mKV.stride[0]),
+                ),
+            )
+            kv_descriptor_smem_layout = cute.make_composed_layout(
+                cute.make_swizzle(3, 4, 3),
+                0,
+                cute.make_layout((64, 1), stride=(1, 64)),
+            )
+            tma_atom_kv, _ = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE),
+                kv_descriptor_tensor,
+                kv_descriptor_smem_layout,
+                (64, 1),
+            )
         round_stage_bytes = cute.size_in_bytes(self.element_dtype, round_a_layout)
         assert round_stage_bytes == self.ROUND_STAGE_BYTES
         local_bulk_stage_offset = cute.cosize(round_a_layout_staged)
@@ -1160,6 +1188,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
                     round_tma_tensor_qt,
                     round_tma_atom_dot,
                     round_tma_tensor_dot,
+                    tma_atom_kv,
                     mKV,
                     mQ,
                     mdQ,
@@ -1229,6 +1258,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
                 round_tma_tensor_qt,
                 round_tma_atom_dot,
                 round_tma_tensor_dot,
+                tma_atom_kv,
                 mKV,
                 mQ,
                 mdQ,
@@ -1594,6 +1624,53 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
                 out_row[d] = self.element_dtype(acc_row[d])
 
     @cute.jit
+    def _gather_score_kv_tma_upper(
+        self,
+        tma_atom_kv: cute.CopyAtom,
+        score_kv_raw: cute.Pointer,
+        tile_indices: cute.Tensor,
+        tile_index: Int32,
+        topk: Int32,
+        rank: Int32,
+        warp_idx: Int32,
+        mbar_ptr: cute.Pointer,
+    ) -> None:
+        """Gather the rank-owned N32 x D256 upper half of score-KV."""
+        if warp_idx < Int32(self.GATHER_WARPS):
+            local_warp = warp_idx
+            if local_warp == Int32(0):
+                with cute.arch.elect_one():
+                    transaction_bytes = self.N_TILE_CTA * (self.D_HEAD // 2) * (self.element_dtype.width // 8)
+                    cute.arch.mbarrier_arrive_and_expect_tx(mbar_ptr, transaction_bytes)
+            with cute.arch.elect_one():
+                for row_group in cutlass.range_constexpr(2):
+                    row_base = cute.assume(local_warp * Int32(8) + Int32(row_group * 4), divby=4)
+                    logical_base = rank * Int32(self.N_TILE_CTA) + row_base
+                    topk_base = tile_index * Int32(self.N_TILE) + logical_base
+                    row0 = tile_indices[logical_base]
+                    row1 = tile_indices[logical_base + Int32(1)]
+                    row2 = tile_indices[logical_base + Int32(2)]
+                    row3 = tile_indices[logical_base + Int32(3)]
+                    row0 = row0 if topk_base < topk else Int32(-1)
+                    row1 = row1 if topk_base + Int32(1) < topk else Int32(-1)
+                    row2 = row2 if topk_base + Int32(2) < topk else Int32(-1)
+                    row3 = row3 if topk_base + Int32(3) < topk else Int32(-1)
+                    for col_in_half in cutlass.range_constexpr(4):
+                        local_col = 4 + col_in_half
+                        smem_offset = row_base * Int32(64) + Int32(local_col * self.N_TILE_CTA * 64)
+                        dst_ptr = score_kv_raw + cute.assume(smem_offset, divby=64)
+                        tma_gather4_cta1(
+                            tma_atom_kv,
+                            dst_ptr,
+                            mbar_ptr,
+                            Int32(local_col * 64),
+                            row0,
+                            row1,
+                            row2,
+                            row3,
+                        )
+
+    @cute.jit
     def _load_score_kv_indexed(
         self,
         mKV: cute.Tensor,
@@ -1898,6 +1975,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
         round_tma_tensor_qt: cute.Tensor,
         round_tma_atom_dot: cute.CopyAtom,
         round_tma_tensor_dot: cute.Tensor,
+        tma_atom_kv: cute.CopyAtom,
         mKV: cute.Tensor,
         mQ_tail: cute.Tensor,
         mdQ: cute.Tensor,
@@ -1969,6 +2047,8 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
             cpasync.prefetch_descriptor(tma_atom_do)
             cpasync.prefetch_descriptor(round_tma_atom_qt)
             cpasync.prefetch_descriptor(round_tma_atom_dot)
+            if cutlass.const_expr(self.use_tma_gather4 and not split_regime):
+                cpasync.prefetch_descriptor(tma_atom_kv)
         smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         tmem_holding_buf_ptr = storage.tmem_holding_buf.ptr
@@ -1981,6 +2061,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
         p_ready_mbars = storage.p_ready_mbars.data_ptr()
         ds_local_ready_mbar = storage.ds_local_ready_mbar.data_ptr()
         tail_ld_mbar = storage.tail_ld_mbar.data_ptr()
+        kv_tma_mbars = storage.kv_tma_mbars.data_ptr()
         stationary_do_raw = storage.stationary_do.data_ptr()
         round_buf_raw = storage.round_buf.data_ptr()
         score_kv_raw = storage.score_kv.data_ptr()
@@ -2180,6 +2261,8 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
             if cutlass.const_expr(split_regime):
                 cute.arch.mbarrier_init(ds_local_ready_mbar, 2 * self.MATH_WARPS)
             cute.arch.mbarrier_init(tail_ld_mbar, self.GATHER_WARPS)
+            if cutlass.const_expr(self.use_tma_gather4 and not split_regime):
+                cute.arch.mbarrier_init(kv_tma_mbars, 1)
         cute.arch.fence_view_async_shared()
         pipeline.pipeline_init_arrive(cluster_shape_mn=cluster_layout_vmnk, is_relaxed=False)
         if cutlass.const_expr(mTopkLength is None):
@@ -2387,7 +2470,15 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
                             # The next index slot was completed by the
                             # prologue or the preceding iteration. Warm its
                             # KV rows while the current tile is still active.
-                            self._prefetch_kv_rows_l2(mKV, staged_indices[None, next_index_slot], walk_base + walk_step * next_score_iter, topk, rank, tidx)
+                            self._prefetch_kv_rows_l2(
+                                mKV,
+                                staged_indices[None, next_index_slot],
+                                walk_base + walk_step * next_score_iter,
+                                topk,
+                                rank,
+                                tidx,
+                                use_tma_upper=self.use_tma_gather4 and not split_regime,
+                            )
                     if is_dq_owner:
                         if cutlass.const_expr(self.max_topk == 128):
                             pipe_kscore.producer_acquire(gather_state)
@@ -2517,24 +2608,36 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
                                     mTopkIdxs, staged_indices, token_idx, batch_idx, walk_base + walk_step * (score_iter + Int32(2)), index_slot, tidx
                                 )
                             pipe_kscore.producer_acquire(gather_state)
-                            self._load_score_kv_indexed(
-                                mKV,
-                                mTopkIdxs,
-                                staged_indices[None, next_index_slot],
-                                k_n,
-                                s_kt_score_rows,
-                                token_idx,
-                                batch_idx,
-                                walk_base + walk_step * next_iter,
-                                topk,
-                                rank,
-                                tidx,
-                                kv_copy_atom,
-                                kv_thread_copy,
-                                wave=1,
-                                pre_kv_index_0=next_kv_0,
-                                pre_kv_index_1=next_kv_1,
-                            )
+                            if cutlass.const_expr(self.use_tma_gather4 and not split_regime):
+                                self._gather_score_kv_tma_upper(
+                                    tma_atom_kv,
+                                    score_kv_raw,
+                                    staged_indices[None, next_index_slot],
+                                    walk_base + walk_step * next_iter,
+                                    topk,
+                                    rank,
+                                    warp_idx,
+                                    kv_tma_mbars,
+                                )
+                            else:
+                                self._load_score_kv_indexed(
+                                    mKV,
+                                    mTopkIdxs,
+                                    staged_indices[None, next_index_slot],
+                                    k_n,
+                                    s_kt_score_rows,
+                                    token_idx,
+                                    batch_idx,
+                                    walk_base + walk_step * next_iter,
+                                    topk,
+                                    rank,
+                                    tidx,
+                                    kv_copy_atom,
+                                    kv_thread_copy,
+                                    wave=1,
+                                    pre_kv_index_0=next_kv_0,
+                                    pre_kv_index_1=next_kv_1,
+                                )
                         cute.arch.cp_async_commit_group()
                         if cutlass.const_expr(not (split_regime or self.max_topk == 128)):
                             if has_dkv:
@@ -2553,6 +2656,8 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
                                     tail_ld_mbar,
                                 )
                         cute.arch.cp_async_wait_group(0)
+                        if cutlass.const_expr(self.use_tma_gather4 and not (split_regime or self.max_topk == 128)):
+                            cute.arch.mbarrier_wait(kv_tma_mbars, score_iter & Int32(1))
                         cute.arch.fence_view_async_shared()
                         if tidx & Int32(31) == Int32(0):
                             pipe_kscore.producer_commit(gather_state)
@@ -3307,6 +3412,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
             p_ready_mbars: cute.struct.MemRange[cutlass.Int64, 1]
             ds_local_ready_mbar: cute.struct.MemRange[cutlass.Int64, 1]
             tail_ld_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+            kv_tma_mbars: cute.struct.MemRange[cutlass.Int64, 1]
             tmem_dealloc_mbar: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
             stationary_q: cute.struct.Align[cute.struct.MemRange[element_dtype, 32768], 1024]
@@ -3680,7 +3786,16 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
         destination_chunks[None, index_in_group].fill(0.0)
 
     @cute.jit
-    def _prefetch_kv_rows_l2(self, mKV: cute.Tensor, tile_indices: cute.Tensor, tile_index: Int32, topk: Int32, rank: Int32, role_tidx: Int32) -> None:
+    def _prefetch_kv_rows_l2(
+        self,
+        mKV: cute.Tensor,
+        tile_indices: cute.Tensor,
+        tile_index: Int32,
+        topk: Int32,
+        rank: Int32,
+        role_tidx: Int32,
+        use_tma_upper: cutlass.Constexpr[bool] = False,
+    ) -> None:
         """Warm the next score rows with short-loop or steady-state ownership."""
         seqlen_kv = cute.size(mKV, mode=[0])
         if cutlass.const_expr(self.max_topk == 128):
@@ -3716,7 +3831,11 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
                         kv_index = tile_indices[local_n]
                     if kv_index >= Int32(0) and kv_index < seqlen_kv:
                         row_base = mKV.iterator + cute.crd2idx((kv_index, Int32(0), (0, Int32(0))), mKV.layout)
-                        _prefetch_o_row_l2(row_base + line * Int32(64))
+                        if cutlass.const_expr(use_tma_upper):
+                            if line < Int32(4):
+                                _prefetch_o_row_l2(row_base + line * Int32(64))
+                        else:
+                            _prefetch_o_row_l2(row_base + line * Int32(64))
                         if cutlass.const_expr(self.num_heads == 96 and not self.deterministic):
                             if line == Int32(0):
                                 _prefetch_o_row_l2(row_base + Int32(self.D_HEAD))
