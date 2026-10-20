@@ -2114,7 +2114,10 @@ def test_DSA_sparse_attention_backward_d576_2cta_sorted_topk_numerics(duplicate,
     _require_sm100()
     if torch.cuda.get_device_capability() not in _TWO_CTA_CAPABILITIES:
         pytest.skip("D576 2-CTA requires an SM100-class GPU (compute capability 10.0 or 10.3)")
-    DSA = _import_or_skip("cudnn").DSA
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     cfg = {"s_q": 9, "s_kv": 145, "h_q": 96, "head_dim": 576, "topk": 128}
     q, kv, attn_sink, topk_idxs, topk_length = _allocate(cfg, not duplicate)
