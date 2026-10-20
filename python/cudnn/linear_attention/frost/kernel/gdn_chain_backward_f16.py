@@ -116,6 +116,8 @@ def chain_backward_head_host(
     stream: cuda.CUstream,
     k_slots: cutlass.Constexpr[int] = 1,
     v_slots: cutlass.Constexpr[int] = 1,
+    dk_slots: cutlass.Constexpr[int] = 1,
+    dv_slots: cutlass.Constexpr[int] = 1,
 ) -> None:
     gdn_chain_prologue_f16.chain_prologue(
         pieces,
@@ -164,6 +166,8 @@ def chain_backward_head_host(
         stream,
         k_slots,
         v_slots,
+        dk_slots,
+        dv_slots,
     )
     gdn_tinv_f16.host(tinv_cfg, False, k, tinv_words, gate, a_log, dt_bias, beta, cu_pieces, tinv, tinv_rows, tinv_row_count, stream)
     if cutlass.const_expr(fused_h_m):
@@ -494,6 +498,8 @@ def build_chain_backward(
     cu_align = 8 if str(cu_seqlens.dtype).endswith("int64") else 4
     k_slots = family_slots(k, expand_num, 3)
     v_slots = family_slots(v, expand_num, 3)
+    dk_slots = family_slots(dk, expand_num, 3)
+    dv_slots = family_slots(dv, expand_num, 3)
     beta_slots = family_slots(beta, expand_num, 2)
     key = (
         str(q.dtype),
@@ -537,6 +543,10 @@ def build_chain_backward(
         k_slots,
         v_slots,
         beta_slots,
+        len(dk.shape),
+        len(dv.shape),
+        dk_slots,
+        dv_slots,
     )
     if key not in chain_backward_cache:
         tinv_cfg = gdn_tinv_f16.build_cfg(
@@ -633,6 +643,8 @@ def build_chain_backward(
             k_slots=k_slots,
             v_slots=v_slots,
             beta_slots=beta_slots,
+            dk_slots=dk_slots,
+            dv_slots=dv_slots,
         )
 
         work_items_placeholder = from_dlpack(work_items, assumed_align=16)
@@ -711,8 +723,8 @@ def build_chain_backward(
             from_dlpack(bprop_words, assumed_align=128).mark_layout_dynamic(),
             from_dlpack(checkpoints, assumed_align=16).mark_layout_dynamic(leading_dim=3),
             from_dlpack(dq, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(dk, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(dv, assumed_align=16).mark_layout_dynamic(leading_dim=2),
+            from_dlpack(dk, assumed_align=16).mark_layout_dynamic(leading_dim=len(dk.shape) - 1),
+            from_dlpack(dv, assumed_align=16).mark_layout_dynamic(leading_dim=len(dv.shape) - 1),
             from_dlpack(summary_q, assumed_align=16).mark_layout_dynamic(leading_dim=2),
             from_dlpack(summary_do, assumed_align=16).mark_layout_dynamic(leading_dim=2),
             from_dlpack(tinv, assumed_align=128).mark_layout_dynamic(leading_dim=3),
@@ -727,6 +739,8 @@ def build_chain_backward(
             cuda.CUstream(int(stream)),
             k_slots,
             v_slots,
+            dk_slots,
+            dv_slots,
             options="--enable-tvm-ffi --opt-level 2",
         )
         tail = cute.compile(
@@ -760,8 +774,8 @@ def build_chain_backward(
             from_dlpack(beta, assumed_align=16).mark_layout_dynamic(leading_dim=len(beta.shape) - 1),
             from_dlpack(do, assumed_align=16).mark_layout_dynamic(leading_dim=2),
             from_dlpack(dq, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(dk, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(dv, assumed_align=16).mark_layout_dynamic(leading_dim=2),
+            from_dlpack(dk, assumed_align=16).mark_layout_dynamic(leading_dim=len(dk.shape) - 1),
+            from_dlpack(dv, assumed_align=16).mark_layout_dynamic(leading_dim=len(dv.shape) - 1),
             from_dlpack(dgate, assumed_align=16).mark_layout_dynamic(leading_dim=1),
             from_dlpack(dbeta, assumed_align=16).mark_layout_dynamic(leading_dim=1),
             from_dlpack(dstate0, assumed_align=16).mark_layout_dynamic(leading_dim=3) if dstate0 is not None else None,
