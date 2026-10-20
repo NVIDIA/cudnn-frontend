@@ -30,16 +30,18 @@ from deepseek_sparse_attention.cutedsl.dsa_reference import (
 _TWO_CTA_CAPABILITIES = ((10, 0), (10, 3))
 
 
+def _import_or_skip(module_name):
+    """Import an optional CuTeDSL module or skip when the environment lacks it."""
+    return pytest.importorskip(module_name, reason="Environment not supported: cudnn[cutedsl] not installed")
+
+
 @pytest.mark.L0
 @pytest.mark.parametrize("sm_count,expected", [(132, 66), (148, 74), (152, 76), (160, 76)])
 def test_DSA_sparse_attention_backward_d576_deterministic_compact_slots(sm_count, expected):
     """One deterministic wave uses every complete two-SM cluster up to the compact workspace cap."""
-    try:
-        from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100_d576 import _deterministic_compact_slots
-    except ImportError:
-        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100_d576")
 
-    assert _deterministic_compact_slots(sm_count) == expected
+    assert interface._deterministic_compact_slots(sm_count) == expected
 
 
 def _assert_qcluster_dq_close(actual, expected, msg):
@@ -238,32 +240,22 @@ def test_DSA_sparse_attention_backward_sm100_h96_dispatch():
 @pytest.mark.L0
 def test_DSA_sparse_attention_backward_sm100_h96_deterministic_composition():
     """The H96 stages must share one fixed-owner reduction policy."""
-    try:
-        from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100 import (
-            _get_sm100_kernel_class,
-            flash_attn_bwd_sm100_workspace_size,
-        )
-        from cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_h96 import (
-            FlashAttentionDSABackwardSm100H96Deterministic,
-            FlashAttentionDSABackwardSm100H96H32Deterministic,
-            FlashAttentionDSABackwardSm100H96H64Deterministic,
-        )
-    except ImportError:
-        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100")
+    h96 = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_h96")
 
-    kernel_cls = _get_sm100_kernel_class("h96_h64_h32", deterministic=True)
-    assert kernel_cls is FlashAttentionDSABackwardSm100H96Deterministic
+    kernel_cls = interface._get_sm100_kernel_class("h96_h64_h32", deterministic=True)
+    assert kernel_cls is h96.FlashAttentionDSABackwardSm100H96Deterministic
     assert kernel_cls.num_dkv_shards == 128
-    assert FlashAttentionDSABackwardSm100H96H64Deterministic.num_dkv_shards == 128
-    assert FlashAttentionDSABackwardSm100H96H64Deterministic.q_wave_ctas == 128
-    assert not FlashAttentionDSABackwardSm100H96H64Deterministic.finalize_dkv
-    assert FlashAttentionDSABackwardSm100H96H32Deterministic.num_dkv_shards == 128
-    assert FlashAttentionDSABackwardSm100H96H32Deterministic.q_wave_ctas == 128
-    assert not FlashAttentionDSABackwardSm100H96H32Deterministic.initialize_dkv
-    assert FlashAttentionDSABackwardSm100H96H32Deterministic.finalize_dkv
+    assert h96.FlashAttentionDSABackwardSm100H96H64Deterministic.num_dkv_shards == 128
+    assert h96.FlashAttentionDSABackwardSm100H96H64Deterministic.q_wave_ctas == 128
+    assert not h96.FlashAttentionDSABackwardSm100H96H64Deterministic.finalize_dkv
+    assert h96.FlashAttentionDSABackwardSm100H96H32Deterministic.num_dkv_shards == 128
+    assert h96.FlashAttentionDSABackwardSm100H96H32Deterministic.q_wave_ctas == 128
+    assert not h96.FlashAttentionDSABackwardSm100H96H32Deterministic.initialize_dkv
+    assert h96.FlashAttentionDSABackwardSm100H96H32Deterministic.finalize_dkv
 
-    adaptive_bytes = flash_attn_bwd_sm100_workspace_size(7, 1025, 576, 96, deterministic=True, backend="generic_m64")
-    h96_bytes = flash_attn_bwd_sm100_workspace_size(7, 1025, 576, 96, deterministic=True, backend="h96_h64_h32")
+    adaptive_bytes = interface.flash_attn_bwd_sm100_workspace_size(7, 1025, 576, 96, deterministic=True, backend="generic_m64")
+    h96_bytes = interface.flash_attn_bwd_sm100_workspace_size(7, 1025, 576, 96, deterministic=True, backend="h96_h64_h32")
     assert h96_bytes > adaptive_bytes
 
 
@@ -720,14 +712,11 @@ def test_DSA_sparse_attention_backward_sm100_d576_workspace_uses_compact_rows(nu
 @pytest.mark.L0
 def test_DSA_sparse_attention_backward_sm100_deterministic_workspace_respects_backend():
     """D576 two-CTA scratch exposes its compact 96-plane capacity."""
-    try:
-        from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100 import flash_attn_bwd_sm100_workspace_size
-    except ImportError:
-        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100")
 
     s_q, s_kv = 7, 1025
-    fixed_d512 = flash_attn_bwd_sm100_workspace_size(s_q, s_kv, 512, 128, deterministic=True)
-    two_cta_d512 = flash_attn_bwd_sm100_workspace_size(s_q, s_kv, 512, 128, deterministic=True, backend="h128_2cta_m64")
+    fixed_d512 = interface.flash_attn_bwd_sm100_workspace_size(s_q, s_kv, 512, 128, deterministic=True)
+    two_cta_d512 = interface.flash_attn_bwd_sm100_workspace_size(s_q, s_kv, 512, 128, deterministic=True, backend="h128_2cta_m64")
     assert two_cta_d512 == fixed_d512
 
     padded_s_q = math.ceil(s_q / 8) * 8
@@ -735,9 +724,9 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_workspace_respects_ba
     for num_heads, backend in ((96, "h96_d576_2cta_m64"), (128, "h128_d576_2cta_m64")):
         stats_bytes = num_heads * padded_s_q * 2 * torch.float32.itemsize
         compact_dkv_bytes = 96 * padded_s_kv * 576 * torch.float32.itemsize
-        compact = flash_attn_bwd_sm100_workspace_size(s_q, s_kv, 576, num_heads, deterministic=True, backend=backend)
-        fixed = flash_attn_bwd_sm100_workspace_size(s_q, s_kv, 576, num_heads, deterministic=True)
-        adaptive = flash_attn_bwd_sm100_workspace_size(s_q, s_kv, 576, num_heads, deterministic=True, backend="generic_m64")
+        compact = interface.flash_attn_bwd_sm100_workspace_size(s_q, s_kv, 576, num_heads, deterministic=True, backend=backend)
+        fixed = interface.flash_attn_bwd_sm100_workspace_size(s_q, s_kv, 576, num_heads, deterministic=True)
+        adaptive = interface.flash_attn_bwd_sm100_workspace_size(s_q, s_kv, 576, num_heads, deterministic=True, backend="generic_m64")
         assert compact == stats_bytes + compact_dkv_bytes
         assert adaptive < compact < fixed
 
@@ -2125,10 +2114,7 @@ def test_DSA_sparse_attention_backward_d576_2cta_sorted_topk_numerics(duplicate,
     _require_sm100()
     if torch.cuda.get_device_capability() not in _TWO_CTA_CAPABILITIES:
         pytest.skip("D576 2-CTA requires an SM100-class GPU (compute capability 10.0 or 10.3)")
-    try:
-        from cudnn import DSA
-    except ImportError:
-        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    DSA = _import_or_skip("cudnn").DSA
 
     cfg = {"s_q": 9, "s_kv": 145, "h_q": 96, "head_dim": 576, "topk": 128}
     q, kv, attn_sink, topk_idxs, topk_length = _allocate(cfg, not duplicate)
