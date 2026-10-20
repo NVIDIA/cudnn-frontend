@@ -3714,6 +3714,9 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
                     if kv_index >= Int32(0) and kv_index < seqlen_kv:
                         row_base = mKV.iterator + cute.crd2idx((kv_index, Int32(0), (0, Int32(0))), mKV.layout)
                         _prefetch_o_row_l2(row_base + line * Int32(64))
+                        if cutlass.const_expr(self.num_heads == 96 and not self.deterministic):
+                            if line == Int32(0):
+                                _prefetch_o_row_l2(row_base + Int32(self.D_HEAD))
 
     @cute.jit
     def _load_kt_dq_tail_values(self, mKV: cute.Tensor, batch_idx: Int32, rank: Int32, role_tidx: Int32, pre_kv_index: Int32):
