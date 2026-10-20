@@ -56,7 +56,8 @@ DSA_SPARSE_ATTENTION_BACKWARD_PARAM_MARKS = [
 
 DSA_INDEXER_FORWARD_PARAM_MARKS = [
     pytest.mark.parametrize("head_dim", [128]),
-    pytest.mark.parametrize("qhead_per_kv_head", [32, 64]),
+    # the SM100 unified kernel packs 4 .. 64 heads per KV head (one accept cell per member); SM90 serves 16 / 32 / 64
+    pytest.mark.parametrize("qhead_per_kv_head", [4, 8, 16, 32, 64]),
     pytest.mark.parametrize("ratio", [4]),
 ]
 

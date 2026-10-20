@@ -230,8 +230,27 @@ _SNAPSHOT_ARMS = {
     "mxfp8_fused": dict(inplace_qkv=True, fp8=True, fp8_fused=True, mxfp8=True),
 }
 _ABSENT = dict(
-    gate=-1, o_gated=-1, base_align=256, o4=-1, sf_o=-1, kc8=-1, vc8=-1, kv_inv=-1, kv_gathered=-1, kv_len_t=-1, decode_q_lens=-1
-)  # the e4m3 KV cache's five appended slots + the DECODE form's prefill-route Q lengths
+    gate=-1,
+    o_gated=-1,
+    base_align=256,
+    o4=-1,
+    sf_o=-1,
+    ix_q=-1,
+    ix_kbar=-1,
+    ix_ids=-1,
+    ix_scores=-1,
+    ix_cand=-1,
+    ix_ids_sorted=-1,
+    ix_sort_idx=-1,
+    kc8=-1,
+    vc8=-1,
+    kv_inv=-1,
+    kv_gathered=-1,
+    kv_len_t=-1,
+    ix_q8=-1,
+    ix_kbar8=-1,
+    decode_q_lens=-1,
+)  # the in-block indexer's seven slots, the e4m3 KV cache's five, the fp8 indexer cache's two, the DECODE form's prefill-route Q lengths
 _NO_Q8 = dict(q8=-1, k8=-1, v8=-1, o8=-1, gate16=-1)
 _NO_SF = dict(sf_q=-1, sf_k=-1, sf_v=-1)
 _SNAPSHOT = {
