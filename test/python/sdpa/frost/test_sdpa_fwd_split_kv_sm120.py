@@ -290,19 +290,18 @@ def test_sm120_split_sink_rows_without_keys(s_q, s_kv, bottom_right):
     assert (result.output - result.reference).abs().max().item() <= 2e-2
 
 
-# --- A whole GQA group packed under a split ---------------------------------
+# --- PackGQA with tile_q % G != 0 under a split ------------------------------
 #
-# The general and D=256 half templates pack a group the tile does not divide:
-# q_tile // G whole tokens per tile, the rows past them dead (zero Q, never
-# stored). A dead row that stored would land on the next tile's first token.
+# Every SM120 template packs a group the tile does not divide: q_tile // G
+# whole tokens per tile, the rows past them dead (zero Q, never stored). A dead
+# row that stored would land on the next tile's first token.
 
 
-@pytest.mark.parametrize("d", [128, 256])
-@pytest.mark.parametrize("tile_m", [64, 128])
+@pytest.mark.parametrize("d,tile_m", [(128, 64), (128, 128), (256, 64), (256, 128), (512, 64)], ids=["64-128", "128-128", "64-256", "128-256", "64-512"])
 @pytest.mark.parametrize("s_q", [1, 7, 33], ids=["decode", "mtp", "three_tiles"])
-def test_sm120_split_recombines_a_whole_group_pack(d, tile_m, s_q):
+def test_sm120_split_recombines_pack_gqa_tile_q_not_divisible(d, tile_m, s_q):
     """GQA 6 (24 / 4 heads) over a ragged last KV tile, causal bottom-right past one token: 10 tokens in 60 live
-    rows of 64, 21 in 126 of 128."""
+    rows of 64, 21 in 126 of 128. D=512 runs its one 64-row tile, its Q loaded by TMA."""
     result = _sm120_case(24, 4, s_q, 2500, d=d, with_lse=True, causal=s_q > 1, bottom_right=True, split_kv=4, pack_gqa=True, tile_m=tile_m)
     assert result.split == 4
     assert (result.output - result.reference).abs().max().item() <= 2e-2

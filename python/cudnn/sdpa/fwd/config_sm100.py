@@ -880,7 +880,7 @@ def rescale_threshold(dtype_qkv: int) -> float:
     return 4.0 if dtype_qkv <= 1 else 8.0
 
 
-def pack_gqa_group_size(qh_per_kh: int, tile_m: int = 128, *, partial: bool = False) -> int:
+def pack_gqa_group_size(qh_per_kh: int, tile_m: int = 128, *, partial: bool = False, requires_divisor: bool = True) -> int:
     """Heads packed into one Q tile row-group for the GQA ratio ``G = qh_per_kh``.
 
     Full contract (``partial=False``): ``G`` when it divides ``tile_m``, else 0
@@ -888,26 +888,31 @@ def pack_gqa_group_size(qh_per_kh: int, tile_m: int = 128, *, partial: bool = Fa
     d256 f16 kernels): the largest divisor of ``G`` that divides ``tile_m`` --
     ``gcd(G, tile_m)`` -- so a 12-head group packs 4 heads per token row-group
     (three packed heads per KV head), a 6-head group packs 2, and a group with
-    no factor in common with the tile (3, 5, ...) yields 1 = unpacked.  MHA
-    (``G == 1``) is the identity, 1.
+    no factor in common with the tile (3, 5, ...) yields 1 = unpacked.
+    Without the divisor requirement (``requires_divisor=False``, the SM120
+    kernels): ``G`` whenever it fits the tile, ``tile_m % G != 0`` included --
+    ``tile_m // G`` tokens per tile, the rows past ``(tile_m // G) * G`` dead
+    (G = 6 at 64 rows: ten tokens in 60 live rows) -- else 0.  MHA (``G == 1``)
+    is the identity, 1.
     """
     if qh_per_kh <= 0:
         return 0
-    if tile_m % qh_per_kh == 0:
+    if tile_m % qh_per_kh == 0 or (not requires_divisor and qh_per_kh <= tile_m):
         return qh_per_kh
     return math.gcd(qh_per_kh, tile_m) if partial else 0
 
 
-def pack_gqa_supported(h_q: int, h_kv: int, tile_m: int = 128, *, partial: bool = False) -> bool:
+def pack_gqa_supported(h_q: int, h_kv: int, tile_m: int = 128, *, partial: bool = False, requires_divisor: bool = True) -> bool:
     """Whether a PACK_GQA=1 plan is HONORABLE for this head count: the group
-    divides the tile (full packing) or -- ``partial`` -- shares a factor > 1
-    with it.  MHA (G == 1) is the bit-exact unpacked fold, so it is honorable
-    too; a group that cannot pack at all (G=3 at tile_m=128) is declined rather
-    than silently run unpacked (frost/README.md rule 5)."""
+    divides the tile (full packing), -- ``partial`` -- shares a factor > 1
+    with it, or -- without ``requires_divisor`` -- fits it.  MHA (G == 1) is the bit-exact
+    unpacked fold, so it is honorable too; a group that cannot pack at all
+    (G=3 at tile_m=128) is declined rather than silently run unpacked
+    (frost/README.md rule 5)."""
     if h_q <= 0 or h_kv <= 0 or h_q % h_kv != 0:
         return False
     g = h_q // h_kv
-    p = pack_gqa_group_size(g, tile_m, partial=partial)
+    p = pack_gqa_group_size(g, tile_m, partial=partial, requires_divisor=requires_divisor)
     return p == g or p > 1
 
 

@@ -1595,7 +1595,7 @@ def test_dsl_sm120_pack_gqa_tiles(s_q: int):
 @pytest.mark.L0
 @torch_fork_set_rng(seed=2)
 def test_dsl_sm120_pack_gqa_tile64():
-    """Packed at q_tile=64 (G must divide the smaller tile: 8/2 -> G=4)."""
+    """Packed at q_tile=64 with a group that divides it (8/2 -> G=4: 16 tokens in all 64 rows, no dead rows)."""
     _run_case(batch=2, h_q=8, h_kv=2, s_q=24, s_kv=192, head_dim=64, is_causal=True, q_tile=64, kv_tile=64, pack_gqa=True, check_stats=True)
 
 
@@ -1636,7 +1636,7 @@ def test_dsl_sm120_pack_gqa_deep(dtype: torch.dtype, s_q: int, h_kv: int):
     _run_case(batch=1, h_q=64, h_kv=h_kv, s_q=s_q, s_kv=2048, head_dim=128, dtype=dtype, is_causal=True, pack_gqa=True)
 
 
-# --- Whole-group PackGQA: q_tile // G tokens, the rows past them dead -------
+# --- PackGQA with tile_q % G != 0: q_tile // G tokens, the rows past them dead
 @pytest.mark.L0
 @pytest.mark.parametrize(
     "h_q,head_dim,tiles",
@@ -1652,8 +1652,8 @@ def test_dsl_sm120_pack_gqa_deep(dtype: torch.dtype, s_q: int, h_kv: int):
     ids=["g6_128x128", "g6_64x64", "g5_128x64", "g3_64x64", "g6_d256", "g7_d256", "g6_d512"],
 )
 @torch_fork_set_rng(seed=5)
-def test_dsl_sm120_pack_gqa_whole_group(h_q: int, head_dim: int, tiles: tuple[int, int]):
-    """A group the tile does not divide packs whole on every template; its dead rows (zero Q) never store, or
+def test_dsl_sm120_pack_gqa_tile_q_not_divisible(h_q: int, head_dim: int, tiles: tuple[int, int]):
+    """A group the tile does not divide packs on every template; its dead rows (zero Q) never store, or
     they would land on the next tile's first token. Top-left causal over 70 tokens starts
     packed tiles off the KV grid, so the diagonal can straddle one more KV tile than the token span."""
     _run_case(batch=2, h_q=h_q, h_kv=4, s_q=70, s_kv=280, head_dim=head_dim, is_causal=True, q_tile=tiles[0], kv_tile=tiles[1], pack_gqa=True, check_stats=True)
@@ -1662,8 +1662,8 @@ def test_dsl_sm120_pack_gqa_whole_group(h_q: int, head_dim: int, tiles: tuple[in
 @pytest.mark.L0
 @pytest.mark.parametrize("mask", ["decode", "mtp_causal_br_sink", "swa_sink", "padded_qtrim"])
 @torch_fork_set_rng(seed=6)
-def test_dsl_sm120_pack_gqa_whole_group_features(mask: str):
-    """GQA 6 packed whole x the decode shapes (the heuristics' packed plan, split or not) and the dense
+def test_dsl_sm120_pack_gqa_tile_q_not_divisible_features(mask: str):
+    """GQA 6 packed x the decode shapes (the heuristics' packed plan, split or not) and the dense
     mask / sink / trim envelope, stats checked."""
     kw: dict = dict(batch=2, h_q=24, h_kv=4, s_q=40, s_kv=256, head_dim=128, pack_gqa=True, check_stats=True)
     if mask == "decode":
@@ -1681,7 +1681,7 @@ def test_dsl_sm120_pack_gqa_whole_group_features(mask: str):
 
 
 @pytest.mark.L0
-def test_dsl_sm120_pack_gqa_whole_group_admission():
+def test_dsl_sm120_pack_gqa_admits_any_ratio_up_to_the_tile():
     """Every template packs any group up to the tile, and declines a group past it."""
     _require_dsl()
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120

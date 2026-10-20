@@ -7,10 +7,11 @@
 and the D=256 specialization ``sm120/prefill_d256_f16.py`` are self-contained
 kernels that differ in head-tile geometry, MMA shape, and warp roles; the
 lane-level primitives below are shared between them (``sfo_atom_offset`` by the
-two block-scaled-O kernels, FP8 and MXFP8) and live here so a fix lands once.
+two block-scaled-O kernels, FP8 and MXFP8; the PackGQA tile geometry by these and
+the three D=512 templates) and live here so a fix lands once.
 """
 
-from typing import Type
+from typing import NamedTuple, Type
 
 import cutlass
 import cutlass.cute as cute
@@ -79,6 +80,43 @@ def pack_to_i32(
 def ceil_div(a: int, b: int) -> int:
     """Return the ceiling division of a by b."""
     return (a + b - 1) // b
+
+
+class PackedTileGeometry(NamedTuple):
+    """How one Q tile's rows map to tokens, shared by every SM120 template.
+
+    A PackGQA tile holds ``tile_tokens = q_tile // G`` whole tokens of the G query
+    heads sharing one KV head, token-major (row r: token ``r // G``, head ``r % G``).
+    When G does not divide the tile, the rows past ``live_rows = tile_tokens * G``
+    are dead: zero Q, never stored, outside Amax_O (G = 6 at 64 rows: ten tokens in
+    60 live rows). ``diag_shifted``: the causal diagonal can straddle one more KV
+    tile than a tile-aligned top-left one, when it is translated (bottom-right or a
+    right band) or when Q tiles start off the KV grid.
+    """
+
+    tile_tokens: int
+    live_rows: int
+    dead_rows: bool
+    diag_shifted: bool
+
+
+def packed_tile_geometry(q_tile: int, kv_tile: int, pack_gqa: bool, qh_per_kh: int, *, bottom_right: bool, window_right: int) -> PackedTileGeometry:
+    """The :class:`PackedTileGeometry` of a ``q_tile`` x ``kv_tile`` CTA tile."""
+    tile_tokens = q_tile // qh_per_kh if pack_gqa else q_tile
+    live_rows = tile_tokens * qh_per_kh if pack_gqa else q_tile
+    off_grid = tile_tokens % kv_tile != 0 and kv_tile % tile_tokens != 0
+    return PackedTileGeometry(tile_tokens, live_rows, live_rows != q_tile, bottom_right or window_right > 0 or off_grid)
+
+
+@cute.jit
+def zero_dead_q_rows(frag, row_lo, live_rows: cutlass.Constexpr[int]):
+    """Zero a packed tile's dead rows in one ``ldmatrix.x4`` A fragment of a TMA-staged
+    Q tile: the packed TMA box holds only the live rows, so theirs are stale slab bytes.
+    Registers 0 and 2 hold row ``row_lo`` (the warp's first row + ``lane // 4``),
+    registers 1 and 3 that row + 8."""
+    keep_lo = cutlass.Int32(-1) if row_lo < live_rows else cutlass.Int32(0)
+    keep_hi = cutlass.Int32(-1) if row_lo + 8 < live_rows else cutlass.Int32(0)
+    return cutlass.Vector.from_elements((frag[0] & keep_lo, frag[1] & keep_hi, frag[2] & keep_lo, frag[3] & keep_hi), cutlass.Int32)
 
 
 def sfo_atom_offset(plane, r, c, cols):

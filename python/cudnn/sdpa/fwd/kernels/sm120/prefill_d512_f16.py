@@ -94,6 +94,8 @@ from cudnn.sdpa.fwd.kernels.sm120._common import (
     nvvm_threadquad_reduction_max,
     nvvm_threadquad_reduction_sum,
     pack_to_i32,
+    packed_tile_geometry,
+    zero_dead_q_rows,
 )
 from cudnn.sdpa.fwd.config_sm100 import rescale_threshold
 from cudnn.sdpa.fwd.config_sm120 import (
@@ -296,15 +298,11 @@ class SM120FusedMultiHeadAttentionForward:
         # row order. THD rows ride the packed token base and keep the per-lane
         # global loads.
         self.tma_q = not thd_varlen
-        # A packed tile holds q_tile // G whole tokens; when G does not divide
-        # the tile, its rows past that many tokens x G are dead: zero Q, never
-        # stored (G = 6 at 64 rows: 10 tokens, 60 live rows).
-        self.q_tile_tokens = q_tile // qh_per_kh if pack_gqa else q_tile
-        self.live_rows = self.q_tile_tokens * qh_per_kh if pack_gqa else q_tile
-        self.dead_rows = self.live_rows != q_tile
-        # The diagonal can straddle one more KV tile when translated
-        # (bottom-right or a right band) or when Q tiles start off the KV grid.
-        self.diag_shifted = bottom_right or self.window_right > 0 or (self.q_tile_tokens % kv_tile != 0 and kv_tile % self.q_tile_tokens != 0)
+        # The PackGQA row map: whole tokens per tile, dead tail rows past them, and
+        # whether the causal diagonal can straddle one more KV tile (PackedTileGeometry).
+        self.q_tile_tokens, self.live_rows, self.dead_rows, self.diag_shifted = packed_tile_geometry(
+            q_tile, kv_tile, pack_gqa, qh_per_kh, bottom_right=bottom_right, window_right=self.window_right
+        )
         # KV split: SPLIT_KV CTAs per (q_tile, batch, head), each covering a
         # contiguous slice of that tile's KV-tile range.  1 = off (folds away).
         self.split_kv = split_kv
@@ -481,16 +479,6 @@ class SM120FusedMultiHeadAttentionForward:
                 )
 
     @cute.jit
-    def zero_dead_q_rows(self, basic_params: SimpleNamespace, frag):
-        """Zero a packed tile's dead rows in one ``ldmatrix.x4`` A fragment: the packed
-        TMA box holds only the live rows, so theirs are stale slab bytes. Registers 0
-        and 2 hold row ``lane // 4`` of the warp's 16, registers 1 and 3 that row + 8."""
-        row_lo = basic_params.q_warp_row0 + basic_params.lane // 4
-        keep_lo = cutlass.Int32(-1) if row_lo < self.live_rows else cutlass.Int32(0)
-        keep_hi = cutlass.Int32(-1) if row_lo + 8 < self.live_rows else cutlass.Int32(0)
-        return cutlass.Vector.from_elements((frag[0] & keep_lo, frag[1] & keep_hi, frag[2] & keep_lo, frag[3] & keep_hi), cutlass.Int32)
-
-    @cute.jit
     def load_q_frags_from_smem(
         self,
         basic_params: SimpleNamespace,
@@ -532,7 +520,7 @@ class SM120FusedMultiHeadAttentionForward:
             q_ptr = half_base + physical_row * chunk_elems + swizzle_xor(physical_row, col_in_chunk, chunk_elems, self.in_dtype.bytes)
             frag = prims.ldmatrix(q_ptr, 4, prims.MMALayout.ROW)
             if cutlass.const_expr(self.dead_rows):
-                frag = self.zero_dead_q_rows(basic_params, frag)
+                frag = zero_dead_q_rows(frag, basic_params.q_warp_row0 + basic_params.lane // 4, self.live_rows)
             if cutlass.const_expr(d_frag < self.q_reg_frags):
                 q_regs[d_frag * 4 : 4] = frag
             else:

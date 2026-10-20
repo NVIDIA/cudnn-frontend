@@ -73,6 +73,7 @@ from cudnn.sdpa.fwd.kernels.sm120._common import (
     nvvm_threadquad_reduction_max,
     nvvm_threadquad_reduction_sum,
     pack_to_i32,
+    packed_tile_geometry,
 )
 from cudnn.sdpa.fwd.config_sm120 import (
     HEAD_TILE_GRANULE,
@@ -263,15 +264,11 @@ class SM120FusedMultiHeadAttentionForward:
         self.kv_tile = kv_tile
         self.pack_gqa = pack_gqa
         self.qh_per_kh = qh_per_kh
-        # A packed tile holds q_tile // G whole tokens; when G does not divide
-        # the tile, its rows past that many tokens x G are dead: zero Q, never
-        # stored (G = 6 at 64 rows: 10 tokens, 60 live rows).
-        self.tile_tokens = q_tile // qh_per_kh if pack_gqa else q_tile
-        self.live_rows = self.tile_tokens * qh_per_kh if pack_gqa else q_tile
-        self.dead_rows = self.live_rows != q_tile
-        # The diagonal can straddle one more KV tile when translated
-        # (bottom-right or a right band) or when Q tiles start off the KV grid.
-        self.diag_shifted = bottom_right or self.window_right > 0 or (self.tile_tokens % kv_tile != 0 and kv_tile % self.tile_tokens != 0)
+        # The PackGQA row map: whole tokens per tile, dead tail rows past them, and
+        # whether the causal diagonal can straddle one more KV tile (PackedTileGeometry).
+        self.tile_tokens, self.live_rows, self.dead_rows, self.diag_shifted = packed_tile_geometry(
+            q_tile, kv_tile, pack_gqa, qh_per_kh, bottom_right=bottom_right, window_right=self.window_right
+        )
         # KV split: SPLIT_KV CTAs per (q_tile, batch, head), each covering a
         # contiguous slice of that tile's KV-tile range.  1 = off (folds away).
         self.split_kv = split_kv

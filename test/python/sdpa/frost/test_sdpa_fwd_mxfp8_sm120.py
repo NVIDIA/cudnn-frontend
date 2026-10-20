@@ -510,7 +510,7 @@ def test_mxfp8_sm120_pack_gqa_envelope_head_dims(d_qk, d_v):
     _check(_run(2, 8, 2, 40, 300, d_qk=d_qk, d_v=d_v, pack_gqa=True, sdpa_kwargs=_MASKS["causal"]), d_qk)
 
 
-# --- Whole-group PackGQA: q_tile // G tokens, the rows past them dead -------
+# --- PackGQA with tile_q % G != 0: q_tile // G tokens, the rows past them dead
 @pytest.mark.L0
 @pytest.mark.parametrize(
     "h_q,d,tiles",
@@ -523,18 +523,20 @@ def test_mxfp8_sm120_pack_gqa_envelope_head_dims(d_qk, d_v):
     ids=["g6_128x128", "g6_64x64", "g7_d256", "g5_d512"],
 )
 @torch_fork_set_rng(seed=37)
-def test_mxfp8_sm120_pack_gqa_whole_group(h_q, d, tiles):
-    """A group the tile does not divide packs whole: each live row's Q scale follows its (token, head), a dead row
+def test_mxfp8_sm120_pack_gqa_tile_q_not_divisible(h_q, d, tiles):
+    """A group the tile does not divide packs: each live row's Q scale follows its (token, head), a dead row
     takes the unit scale and never stores. Top-left causal over 70 tokens starts packed tiles off the KV grid."""
     _check(_run(2, h_q, 4, 70, 280, d_qk=d, tiles=tiles, pack_gqa=True, sdpa_kwargs=_MASKS["causal"]), d)
 
 
 @pytest.mark.L0
 @pytest.mark.parametrize("out_dt", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "e4m3"])
+@pytest.mark.parametrize("d,tiles", [(128, None), (256, (128, 64)), (512, (64, 64))], ids=["d128", "d256", "d512"])
 @torch_fork_set_rng(seed=39)
-def test_mxfp8_sm120_pack_gqa_whole_group_split(out_dt):
-    """GQA 6 packed whole under a pinned split over two Q tiles: the live rows' partials recombine."""
-    _check(_run(2, 24, 4, 33, 1536, out_dt=out_dt, pack_gqa=True, split_kv=2, sdpa_kwargs=_MASKS["causal_br"]))
+def test_mxfp8_sm120_pack_gqa_tile_q_not_divisible_split(d, tiles, out_dt):
+    """GQA 6 packed under a pinned split over two (128-row) or four (64-row) Q tiles, D=128, 256 and 512: the
+    live rows' partials recombine."""
+    _check(_run(2, 24, 4, 33, 1536, d_qk=d, tiles=tiles, out_dt=out_dt, pack_gqa=True, split_kv=2, sdpa_kwargs=_MASKS["causal_br"]), d)
 
 
 @pytest.mark.L0

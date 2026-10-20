@@ -25,6 +25,7 @@ Requires: SM120/SM121 (Blackwell GeForce), cutlass-dsl. Skips otherwise.
 """
 
 import math
+from dataclasses import replace
 from typing import NamedTuple
 
 import pytest
@@ -139,6 +140,7 @@ def _run(
     negative_descale_q=False,
     qkv=None,
     sched_policy=None,
+    split_kv=None,
 ):
     import cudnn
 
@@ -277,7 +279,12 @@ def _run(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch="sm120", fp8=True), tiles=tiles, pack_gqa=pack_gqa, sched_policy=sched_policy)
+    chosen = _select_engine(g, engine_name(arch="sm120", fp8=True), tiles=tiles, pack_gqa=pack_gqa, sched_policy=sched_policy)
+    if split_kv is not None and (chosen.knobs.split_kv or 1) != split_kv:
+        # The ranked plans need not carry this split count: re-plan the engine's own knob set with it.
+        g.create_execution_plan(chosen.engine_id, replace(chosen.knobs, split_kv=split_kv, sched_policy=0))
+        g.select_plan(len(g.plans) - 1)
+    assert split_kv is None or (g.plans[g._plan_index].knobs.split_kv or 1) == split_kv
     g.check_support()
     g.build_plans()
     vp.update({o: Ob, amx_o: amax_o})
@@ -402,14 +409,14 @@ def test_fp8_sm120_pack_gqa_features(mask, o_dtype):
 @pytest.mark.L1
 @torch_fork_set_rng(seed=3)
 def test_fp8_sm120_pack_gqa_tile64():
-    """Packed at q_tile=64 (G must divide the smaller tile: 8/2 -> G=4)."""
+    """Packed at q_tile=64 with a group that divides it (8/2 -> G=4: 16 tokens in all 64 rows, no dead rows)."""
     out, o_ref, a_o, a_ref, lse, lse_ref = _run(
         2, 8, 2, 24, 192, scale=1.0 / math.sqrt(128), sdpa_kwargs=dict(use_causal_mask=True), tiles=(64, 64), pack_gqa=True
     )
     _check(out, o_ref, a_o, a_ref, lse, lse_ref)
 
 
-# --- Whole-group PackGQA: q_tile // G tokens, the rows past them dead -------
+# --- PackGQA with tile_q % G != 0: q_tile // G tokens, the rows past them dead
 @pytest.mark.L0
 @pytest.mark.parametrize(
     "h_q,D,tiles",
@@ -423,8 +430,8 @@ def test_fp8_sm120_pack_gqa_tile64():
     ids=["g6_128x128", "g6_64x64", "g5_128x64", "g7_d256", "g6_d512"],
 )
 @torch_fork_set_rng(seed=4)
-def test_fp8_sm120_pack_gqa_whole_group(h_q, D, tiles):
-    """A group the tile does not divide packs whole on the general and D=512 templates. Top-left causal over 70
+def test_fp8_sm120_pack_gqa_tile_q_not_divisible(h_q, D, tiles):
+    """A group the tile does not divide packs on the general and D=512 templates. Top-left causal over 70
     tokens starts packed tiles off the KV grid, so the diagonal can straddle one more KV tile than the token span."""
     out, o_ref, a_o, a_ref, lse, lse_ref = _run(
         2, h_q, 4, 70, 280, scale=1.0 / math.sqrt(D), D=D, sdpa_kwargs=dict(use_causal_mask=True), tiles=tiles, pack_gqa=True
@@ -436,14 +443,33 @@ def test_fp8_sm120_pack_gqa_whole_group(h_q, D, tiles):
 @pytest.mark.parametrize("o_dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16_out", "e4m3_out"])
 @pytest.mark.parametrize("mask", ["decode", "mtp_causal_br_sink"])
 @torch_fork_set_rng(seed=5)
-def test_fp8_sm120_pack_gqa_whole_group_features(mask, o_dtype):
-    """GQA 6 packed whole x the heuristics' decode plan (split) and an MTP step with a bottom-right mask and a
+def test_fp8_sm120_pack_gqa_tile_q_not_divisible_features(mask, o_dtype):
+    """GQA 6 packed x the heuristics' decode plan (split) and an MTP step with a bottom-right mask and a
     sink, through both output-dtype epilogues."""
     kw, sinks, s_q = {}, None, 1
     if mask == "mtp_causal_br_sink":
         kw, s_q = dict(use_causal_mask_bottom_right=True), 4
         sinks = torch.randn(1, 24, 1, 1, dtype=torch.float32, device="cuda")
     out, o_ref, a_o, a_ref, lse, lse_ref = _run(2, 24, 4, s_q, 4133, scale=1.0 / math.sqrt(128), sdpa_kwargs=kw, sinks=sinks, o_dtype=o_dtype, pack_gqa=True)
+    tol_o = 5e-2
+    if o_dtype == torch.float8_e4m3fn:
+        tol_o = max(tol_o, 3 * (o_ref - o_ref.to(o_dtype).float()).abs().max().item())
+    _check(out, o_ref, a_o, a_ref, lse, lse_ref, tol_o=tol_o)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("o_dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16_out", "e4m3_out"])
+@pytest.mark.parametrize("D,tiles", [(256, (128, 64)), (256, (64, 64)), (512, (64, 64))], ids=["d256_128", "d256_64", "d512"])
+@pytest.mark.parametrize("s_q", [1, 7, 33], ids=["decode", "mtp", "three_tiles"])
+@torch_fork_set_rng(seed=7)
+def test_fp8_sm120_pack_gqa_tile_q_not_divisible_split(s_q, D, tiles, o_dtype):
+    """GQA 6 packed under split 4 on the D=256 and D=512 templates (bottom-right causal past one token): the
+    live rows' partials recombine, and no dead row reaches a partial, the LSE or Amax_O. 33 tokens span two or four
+    packed tiles, so a dead row's token is a real one of the next tile."""
+    kw = dict(use_causal_mask_bottom_right=True) if s_q > 1 else {}
+    out, o_ref, a_o, a_ref, lse, lse_ref = _run(
+        2, 24, 4, s_q, 4133, scale=1.0 / math.sqrt(D), D=D, sdpa_kwargs=kw, tiles=tiles, pack_gqa=True, split_kv=4, o_dtype=o_dtype
+    )
     tol_o = 5e-2
     if o_dtype == torch.float8_e4m3fn:
         tol_o = max(tol_o, 3 * (o_ref - o_ref.to(o_dtype).float()).abs().max().item())
