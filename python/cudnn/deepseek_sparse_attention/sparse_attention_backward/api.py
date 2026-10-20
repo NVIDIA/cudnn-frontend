@@ -233,7 +233,7 @@ class SparseAttentionBackward(APIBase):
                 deterministic=self.deterministic,
                 is_contiguous=all(desc.is_contiguous() for desc in descriptors),
             )
-        if self._backend == _iface_d576.BACKEND:
+        if self._backend in _iface_d576.BACKENDS:
             self._value_error_if(total_s_q <= 0 or self.kv_desc.shape[0] <= 0, "Q and KV sequence extents must be positive")
             if self.deterministic:
                 self._two_cta_split_count = 1
@@ -281,7 +281,7 @@ class SparseAttentionBackward(APIBase):
                     )
                 self._compiled_kernel = self._qcluster_plan
                 return
-        if self._backend == _iface_d576.BACKEND:
+        if self._backend in _iface_d576.BACKENDS:
             with torch.cuda.device(self.q_desc.device):
                 self._compiled_kernel = _iface_d576._compile_d576_2cta(
                     torch.cuda.get_device_capability(self.q_desc.device),
@@ -290,6 +290,12 @@ class SparseAttentionBackward(APIBase):
                     self.q_desc.shape[0] == 1,
                     self._two_cta_split_count > 1,
                     self.deterministic,
+                    self.q_desc.shape[1],
+                    (
+                        _iface_d576._deterministic_compact_slots(torch.cuda.get_device_properties(self.q_desc.device).multi_processor_count)
+                        if self.deterministic
+                        else 74
+                    ),
                 )
             return
         if self.deterministic:
@@ -334,8 +340,8 @@ class SparseAttentionBackward(APIBase):
         """Return the minimum reusable per-execution workspace in bytes.
 
         Generic deterministic SM100 plans include a query-dependent 32-, 64-,
-        or 128-plane FP32 dKV accumulator; deterministic H128 two-CTA plans
-        retain their fixed 128-plane capacity. The returned size is
+        or 128-plane FP32 dKV accumulator. Deterministic H96/H128 D576 two-CTA
+        plans use the compact 96-plane capacity. The returned size is
         authoritative for this plan; ``execute()`` accepts a larger contiguous
         uint8 buffer on the plan device but never allocates one.
         """
@@ -402,7 +408,7 @@ class SparseAttentionBackward(APIBase):
             if self._compiled_kernel is None:
                 raise RuntimeError("call compile() before execute()")
             self._validate_compiled_inputs(q, kv, out, dout, lse, attn_sink, topk_idxs, topk_length)
-        if self._backend == _iface_d576.BACKEND:
+        if self._backend in _iface_d576.BACKENDS:
             return _iface_d576._execute_d576_2cta(
                 self._compiled_kernel,
                 q,

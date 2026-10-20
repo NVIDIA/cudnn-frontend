@@ -25,10 +25,10 @@ def ordered_dkv_quad(target: cute.Tensor, values: cute.Tensor):
 
 
 class TwoCTADeterministicReduction:
-    """Public workspace capacity for the deterministic D576 two-CTA kernel."""
+    """Compact workspace capacity for the deterministic D576 two-CTA kernel."""
 
     deterministic = True
 
     @staticmethod
     def _get_workspace_size_dKV(k: int, d: int, b: int, acc_dtype: Type[cutlass.Numeric]):
-        return (b, 128, (k + 7) // 8 * 8, (d + 7) // 8 * 8 * (acc_dtype.width // 8))
+        return (b, 96, (k + 7) // 8 * 8, (d + 7) // 8 * 8 * (acc_dtype.width // 8))
