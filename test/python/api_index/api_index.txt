@@ -286,6 +286,11 @@ cudnn.csa.csa_compressor_backward_wrapper
 cudnn.csa.csa_compressor_forward_wrapper
 cudnn.csa_compressor_backward_wrapper
 cudnn.csa_compressor_forward_wrapper
+cudnn.cuda_graph_retention
+cudnn.cuda_graph_retention.NONE
+cudnn.cuda_graph_retention.PER_GRAPH
+cudnn.cuda_graph_retention.name
+cudnn.cuda_graph_retention.value
 cudnn.cudnnGraphNotSupportedError
 cudnn.cudnnGraphNotSupportedError.add_note
 cudnn.cudnnGraphNotSupportedError.args
