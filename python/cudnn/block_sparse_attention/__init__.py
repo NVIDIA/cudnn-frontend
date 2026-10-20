@@ -7,6 +7,7 @@ _SYMBOLS = {
     "block_sparse_attention_forward": (".api", "block_sparse_attention_forward"),
     "block_sparse_attention_fp8_forward": (".api", "block_sparse_attention_fp8_forward"),
     "block_sparse_attention_backward": (".api", "block_sparse_attention_backward"),
+    "block_sparse_attention_blk64_prepare": (".api", "block_sparse_attention_blk64_prepare"),
 }
 
 

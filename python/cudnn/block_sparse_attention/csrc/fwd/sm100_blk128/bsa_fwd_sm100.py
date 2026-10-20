@@ -22,7 +22,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as cutlass_pipeline
-from cutlass import Boolean, Float32, Int32, Int64, Uint32, const_expr, pipeline
+from cutlass import BFloat16, Boolean, Float32, Int32, Int64, Uint32, const_expr, pipeline
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import BaseDSL, T
 from cutlass.cute.nvgpu import cpasync, tcgen05
@@ -74,6 +74,7 @@ class BlockSparseAttnForwardSm100Blk128:
         pack_gqa: Optional[bool] = None,
         allow_empty_block_nums: bool = False,
         has_block_sizes: bool = True,
+        split_kv_load64: bool = False,
     ):
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -84,6 +85,13 @@ class BlockSparseAttnForwardSm100Blk128:
         self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
         self.m_block_size = self.tile_m
         self.n_block_size = self.tile_n
+        self.split_kv_load64 = split_kv_load64
+        if split_kv_load64:
+            # Load two arbitrary KV64 indices into the existing KV128 SMEM
+            # tile. QK/PV MMA shapes, layouts, stages and softmax stay unchanged.
+            assert self.tile_m == self.tile_n == 128
+            assert head_dim == head_dim_v == 128 and qhead_per_kvhead == 1
+            assert not has_block_sizes, "split KV loads currently require full physical blocks"
         self.q_stage = 1
         # If split_P_arrive, the softmax warps write some columns of P first, signal to the MMA warp
         # to being the P @ V MMA, then write the rest of P and signal again. This allows some overlap
@@ -358,22 +366,44 @@ class BlockSparseAttnForwardSm100Blk128:
             tiled_mma_qk,
         )
 
-        # TMA load for K
-        tma_atom_K, mK = cute.nvgpu.make_tiled_tma_atom_B(
-            tma_load_op,
-            mK,
-            cute.select(sK_layout, mode=[0, 1, 2]),
-            self.mma_tiler_qk,
-            tiled_mma_qk,
-        )
-        # TMA load for V
-        tma_atom_V, mV = cute.nvgpu.make_tiled_tma_atom_B(
-            tma_load_op,
-            mV,
-            cute.select(sV_layout, mode=[0, 1, 2]),
-            self.mma_tiler_pv,
-            tiled_mma_pv,
-        )
+        head_dim_v = mV.shape[0]
+        if const_expr(self.split_kv_load64):
+            assert self.k_dtype == BFloat16 and self.v_dtype == BFloat16
+            # The native 128-wide SMEM tile stores two contiguous D64 planes.
+            # Each 64x64 TMA fills one quarter; each full stage is still 32 KiB.
+            mK = cute.make_tensor(
+                mK.iterator,
+                cute.make_layout(
+                    (mK.shape[0], 64, 2, mK.shape[2], mK.shape[3]), stride=(mK.stride[0], mK.stride[1], 64 * mK.stride[1], mK.stride[2], mK.stride[3])
+                ),
+            )
+            mV = cute.make_tensor(
+                mV.iterator,
+                cute.make_layout(
+                    (64, mV.shape[1], 2, mV.shape[2], mV.shape[3]), stride=(mV.stride[0], mV.stride[1], 64 * mV.stride[0], mV.stride[2], mV.stride[3])
+                ),
+            )
+            sK_load = cute.make_composed_layout(sK_layout.inner, 0, cute.make_layout((64, 64, 1), stride=(64, 1, 8192)))
+            sV_load = cute.make_composed_layout(sV_layout.inner, 0, cute.make_layout((64, 64, 1), stride=(1, 64, 8192)))
+            tma_atom_K, mK = cpasync.make_tiled_tma_atom(tma_load_op, mK, sK_load, (64, 64, 1))
+            tma_atom_V, mV = cpasync.make_tiled_tma_atom(tma_load_op, mV, sV_load, (64, 64, 1))
+        else:
+            # TMA load for K
+            tma_atom_K, mK = cute.nvgpu.make_tiled_tma_atom_B(
+                tma_load_op,
+                mK,
+                cute.select(sK_layout, mode=[0, 1, 2]),
+                self.mma_tiler_qk,
+                tiled_mma_qk,
+            )
+            # TMA load for V
+            tma_atom_V, mV = cute.nvgpu.make_tiled_tma_atom_B(
+                tma_load_op,
+                mV,
+                cute.select(sV_layout, mode=[0, 1, 2]),
+                self.mma_tiler_pv,
+                tiled_mma_pv,
+            )
 
         self.num_epilogue_threads = cute.arch.WARP_SIZE * len(self.epilogue_warp_ids)
         if const_expr(self.use_tma_O):
@@ -411,7 +441,7 @@ class BlockSparseAttnForwardSm100Blk128:
             num_splits,
             cute.size(mK.shape[0]),
             mQ.shape[1],
-            mV.shape[0],  # Note that this is different from Sm90 since we transpose mV in Sm100
+            head_dim_v,  # Note that this is different from Sm90 since we transpose mV in Sm100
             total_q=cute.size(mQ.shape[0]) * cute.size(mQ.shape[3]),
             tile_shape_mn=self.cta_tiler[:2],
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
@@ -920,32 +950,31 @@ class BlockSparseAttnForwardSm100Blk128:
             gQ = layout_utils.select(cute.flat_divide(gQ, (self.mma_tiler_qk[0],)), mode=[0, 2, 1])  # (128, 128, 1)
 
             head_idx_kv = head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
-            mK_cur, mV_cur = [t[None, None, head_idx_kv, batch_idx] for t in (mK, mV)]
-            gK = cute.local_tile(mK_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0))
-            gV = cute.local_tile(mV_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None))
             tSgQ = thr_mma_qk.partition_A(gQ)
-            tSgK = thr_mma_qk.partition_B(gK)
-            tOgV = thr_mma_pv.partition_B(gV)
             load_Q_fn, _, _ = copy_utils.tma_get_copy_fn(tma_atom_Q, 0, cute.make_layout(1), tSgQ, sQ)
 
-            tKsK, tKgK = cpasync.tma_partition(
-                tma_atom_K,
-                0,  # no multicast
-                cute.make_layout(1),
-                cute.group_modes(sK, 0, 3),
-                cute.group_modes(tSgK, 0, 3),
-            )
-            tVsV, tVgV = cpasync.tma_partition(
-                tma_atom_V,
-                0,  # no multicast
-                cute.make_layout(1),
-                cute.group_modes(sV, 0, 3),
-                cute.group_modes(tOgV, 0, 3),
-            )
+            if const_expr(self.split_kv_load64):
+                mK_cur, mV_cur = [t[None, None, None, head_idx_kv, batch_idx] for t in (mK, mV)]
+                gK = cute.local_tile(mK_cur, (64, 64, 1), (None, 0, None))
+                gV = cute.local_tile(mV_cur, (64, 64, 1), (0, None, None))
+                sK_sub = cute.make_tensor(sK.iterator, cute.make_layout((64, 64, 1), stride=(64, 1, 8192)))
+                sV_sub = cute.make_tensor(sV.iterator, cute.make_layout((64, 64, 1), stride=(1, 64, 8192)))
+                tKsK, tKgK = cpasync.tma_partition(tma_atom_K, 0, cute.make_layout(1), cute.group_modes(sK_sub, 0, 3), cute.group_modes(gK, 0, 3))
+                tVsV, tVgV = cpasync.tma_partition(tma_atom_V, 0, cute.make_layout(1), cute.group_modes(sV_sub, 0, 3), cute.group_modes(gV, 0, 3))
+                load_kv_fn = self.load_KV_pair64
+            else:
+                mK_cur, mV_cur = [t[None, None, head_idx_kv, batch_idx] for t in (mK, mV)]
+                gK = cute.local_tile(mK_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0))
+                gV = cute.local_tile(mV_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None))
+                tSgK = thr_mma_qk.partition_B(gK)
+                tOgV = thr_mma_pv.partition_B(gV)
+                tKsK, tKgK = cpasync.tma_partition(tma_atom_K, 0, cute.make_layout(1), cute.group_modes(sK, 0, 3), cute.group_modes(tSgK, 0, 3))
+                tVsV, tVgV = cpasync.tma_partition(tma_atom_V, 0, cute.make_layout(1), cute.group_modes(sV, 0, 3), cute.group_modes(tOgV, 0, 3))
+                load_kv_fn = self.load_KV
 
             load_Q = partial(self.load_Q, load_Q_fn, pipeline_q=pipeline_q, phase=q_producer_phase)
             load_K = partial(
-                self.load_KV,
+                load_kv_fn,
                 tma_atom_K,
                 tKgK,
                 tKsK,
@@ -953,7 +982,7 @@ class BlockSparseAttnForwardSm100Blk128:
                 K_or_V="K",
             )
             load_V = partial(
-                self.load_KV,
+                load_kv_fn,
                 tma_atom_V,
                 tVgV,
                 tVsV,
@@ -973,6 +1002,18 @@ class BlockSparseAttnForwardSm100Blk128:
                 process_tile = True
                 block_iter_count = block_sparse_num
                 n_block = partial(block_info.get_n_block_idx, mBlockIndex, batch_idx, head_idx, m_block)
+
+            if const_expr(self.split_kv_load64):
+                # block_sparse_num / mBlockNums count KV128 compute tiles;
+                # mBlockIndex retains both original KV64 IDs for each tile.
+                n_block = partial(
+                    self.get_kv_pair64,
+                    mBlockIndex,
+                    batch_idx,
+                    head_idx,
+                    m_block,
+                    max_i=cutlass.max(raw_block_count - 1, Int32(0)) if const_expr(mBlockNums is not None) else None,
+                )
 
             if process_tile:
                 load_K(block=n_block(block_iter_count - 1), producer_state=kv_producer_state, page_idx=None)  # K0
@@ -1897,6 +1938,22 @@ class BlockSparseAttnForwardSm100Blk128:
     ):
         pipeline_q.producer_acquire_w_index_phase(stage, phase)
         load_Q_fn(src_idx=block, dst_idx=stage, tma_bar_ptr=pipeline_q.sync_object_full.get_barrier(stage))
+
+    @cute.jit
+    def get_kv_pair64(self, indices, batch, head, query, i, max_i=None):
+        idx = cutlass.min(i, max_i) if const_expr(max_i is not None) else i
+        return indices[batch, head, query, idx * 2], indices[batch, head, query, idx * 2 + 1]
+
+    @cute.jit
+    def load_KV_pair64(self, tma_atom, tXgX, tXsX, block, pipeline_kv, producer_state, K_or_V, page_idx=None):
+        pipeline_kv.producer_acquire(producer_state)
+        barrier = pipeline_kv.producer_get_barrier(producer_state)
+        for dim_half in cutlass.range_constexpr(2):
+            for kv_half in cutlass.range_constexpr(2):
+                # Preserve the original MMA operand layout: [D64 plane][KV128].
+                offset = producer_state.index * 16384 + dim_half * 8192 + kv_half * 4096
+                destination = cute.make_tensor(tXsX.iterator + offset, tXsX.layout)
+                cute.copy(tma_atom, tXgX[None, block[kv_half], dim_half], destination, tma_bar_ptr=barrier)
 
     @cute.jit
     def load_KV(

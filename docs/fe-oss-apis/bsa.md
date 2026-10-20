@@ -25,6 +25,90 @@ pipeline.
 
 BSA is implemented with Python CuTe DSL/JIT kernels.
 
+The ordinary blk64 entry points accept an explicit
+[`blk64_plan`](#prepared-pairs-in-the-blk64-path). It enables split 64-row TMA
+loads with unchanged 128-wide MMA tiles, independently for forward and backward.
+
+## Prepared pairs in the blk64 path
+
+```python
+from cudnn.torch import (
+    block_sparse_attention_blk64_prepare,
+    block_sparse_attention_forward,
+    block_sparse_attention_backward,
+)
+
+# Explicit CPU analysis, outside capture/timing; rebuild when routing changes.
+# q/k/v/dout are contiguous BSHD BF16 tensors with D=128.
+plan = block_sparse_attention_blk64_prepare(
+    q2k_block_index,
+    num_kv_blocks=k.shape[1] // 64,
+    q2k_block_nums=q2k_block_nums,  # optional valid-prefix counts
+    bucket_size_blocks=1024,      # Q64 blocks, i.e. 65,536 Q tokens
+)
+kwargs = dict(
+    q2k_block_nums=q2k_block_nums,
+    sparse_block_size=64,
+    layout="bshd",
+    blk64_plan=plan,
+)
+o, lse = block_sparse_attention_forward(q, k, v, q2k_block_index, **kwargs)
+dq, dk, dv = block_sparse_attention_backward(dout, q, k, v, o, lse, q2k_block_index, **kwargs)
+```
+
+| Direction | Exact pairing needed | Global GPU permutations | Compute geometry |
+| --- | --- | --- | --- |
+| FWD | Each Q64 neighborhood has even multiplicity and a positive even valid length | Q gather, O/LSE scatter; K/V retain original order | QK/PV both 128×128×128; K/V load as 64-row pieces |
+| BWD | Each KV64 reverse neighborhood has even multiplicity; Q rows are nonempty | K/V gather, dK/dV scatter; Q/dO/O/LSE retain original order | All five MMA tiles 128×128×128; KV stationary, loop Q; Q/dO load as 64-row pieces |
+
+Pair equality compares **sets of valid indices**, so list ordering need not
+match. Preparation validates prefixes and rejects duplicate or out-of-range
+valid indices. Padding after the valid prefix is ignored. Pairing is all-or-none
+for each direction across all batch/head entries. `plan.forward_enabled`,
+`plan.backward_enabled` and their corresponding `*_reason` fields describe
+graph eligibility. A Q-only plan can accelerate only FWD; a KV-only plan can
+accelerate only BWD. The other direction calls the original implementation.
+Odd backward degrees use a zero-contribution second Q64 half, and unused KV
+columns produce zero dK/dV. Identity permutations skip gather/scatter kernels.
+
+The paired implementation supports SM100/SM103, CuTe DSL >=4.7, BF16 MHA D128,
+contiguous aligned BSHD inputs, and sequence lengths divisible by 128. Other
+layouts, tails, `block_sizes`, FWD `kv_splits != 1` or an explicit `use_clc`, and
+backward outputs with unsupported strides retain native dispatch. An explicit
+backward `bucket_size_blocks` different from the plan's bucket width also uses
+native dispatch. There is no topK/length performance cutoff: paired topK=2
+inputs also use the new path. On short sequences BWD can be slower because
+packing and initialization are not amortized. `blk64_plan` requires
+`sparse_block_size=64`.
+
+No plan is built implicitly. With `blk64_plan=None` (the default), the original
+kernels, launch parameters, metadata construction and allocation path remain
+unchanged; the paired module is not imported. This avoids charging arbitrary
+blk64 calls for discovery, synchronization or permutations.
+
+**Lifetime and costs:** preparation copies routing metadata to the CPU and
+builds GPU permutations/CSR. The plan owns routing metadata, not Q/K/V storage,
+and can be reused with fresh Q/K/V/dO pointers. Pass the same routing tensors,
+count tensor and fixed-count argument used at preparation. Rebuild the plan
+whenever the sparse graph changes. Ordinary Torch in-place changes are rejected
+using host version counters; changes through raw CUDA pointers, captured graph
+writes or inference tensors cannot be detected and violate this immutable
+metadata contract. Do not modify the plan's private tensors.
+
+These are allocating Torch wrappers, not workspace-based `execute` APIs.
+They allocate outputs and scratch per call; optional `dq_tensor`, `dk_tensor`
+and `dv_tensor` still receive the gradients. No mutable execution scratch is
+shared between calls/streams. Warm the exact configuration before CUDA Graph
+capture. Replay resets accumulators and odd-row sentinels every time. GPU
+permutations and reset/pre/postprocessing are part of execution; CPU preparation
+and first-call compilation must be measured separately. Rebuilding a CPU plan
+per layer/iteration can outweigh the GPU saving; use this explicit path when
+the mask can be reused, and benchmark the complete workload.
+
+Use [`benchmark_sm100_blk64_grouped.py`](../../benchmark/bsa/benchmark_sm100_blk64_grouped.py)
+to compare native and planned FWD/BWD, including GPU permutations and
+pre/postprocessing. It reports explicit plan preparation separately.
+
 ## Installation
 
 The CuTe DSL runtime is a required dependency, so the base install is enough:
