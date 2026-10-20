@@ -135,7 +135,13 @@ def setup_case(seqlen_q, seqlen_kv, topk, deterministic, args):
         softmax_scale=softmax_scale,
         deterministic=deterministic,
     )
-    assert plan.check_support()
+    if not plan.check_support():
+        raise RuntimeError(
+            "Unsupported DSA backward benchmark case: "
+            f"seqlen_q={seqlen_q}, seqlen_kv={seqlen_kv}, topk={topk}, "
+            f"nheads={args.nheads}, head_dim={args.head_dim}, head_dim_v={args.head_dim_v}, "
+            f"dtype={args.dtype}, deterministic={deterministic}"
+        )
     plan.compile()
     workspace_bytes = plan.scratch_workspace_bytes()
     workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=q.device) if workspace_bytes else None
