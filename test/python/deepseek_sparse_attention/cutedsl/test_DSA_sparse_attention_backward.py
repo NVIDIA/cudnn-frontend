@@ -746,7 +746,9 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_workspace_respects_ba
         assert adaptive < compact < fixed
 
 
-def _exercise_deterministic_sm100_case(num_heads, head_dim, s_q, s_kv, repeats, check_short_workspace=False, max_topk=None):
+def _exercise_deterministic_sm100_case(
+    num_heads, head_dim, s_q, s_kv, repeats, check_short_workspace=False, max_topk=None, sorted_topk=False
+):
     """Run one deterministic case against bitwise and numerical contracts."""
     from cudnn import DSA
     from cuda.bindings import driver as cuda
@@ -765,6 +767,8 @@ def _exercise_deterministic_sm100_case(num_heads, head_dim, s_q, s_kv, repeats, 
     kv = torch.randn(s_kv, head_dim, dtype=torch.bfloat16, device=device) / 10
     attn_sink = torch.randn(num_heads, dtype=torch.float32, device=device)
     topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
+    if sorted_topk:
+        topk_idxs = topk_idxs.sort(dim=-1).values
     topk_length = torch.randint(1, topk + 1, (s_q,), dtype=torch.int32, device=device)
     if s_q > 1:
         topk_length[s_q // 2] = 0
@@ -912,6 +916,24 @@ def test_DSA_sparse_attention_backward_sm100_d576_two_cta_repeat1000(num_heads):
     """The deterministic D576 two-CTA routes remain bitwise stable across persistent waves."""
     try:
         _exercise_deterministic_sm100_case(num_heads, 576, 257, 256, repeats=1000, max_topk=128)
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=20261021)
+def test_DSA_sparse_attention_backward_sm100_h96_d576_topk2048_repeat():
+    """Top-K 2048 sorted rows stay correct and bitwise stable with poisoned scratch reuse."""
+    try:
+        _exercise_deterministic_sm100_case(
+            96,
+            576,
+            9,
+            2065,
+            repeats=2,
+            max_topk=2048,
+            sorted_topk=True,
+        )
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
