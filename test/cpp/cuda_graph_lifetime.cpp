@@ -7,9 +7,11 @@
 // frontend releases them again once those graphs are gone.
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <sstream>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -164,6 +166,21 @@ make_counted_payload() {
     });
 }
 
+// CUDA may run a user object's destructor asynchronously once its last reference is gone
+// (cudaUserObjectNoDestructorSync), so a payload shows up in the deferred-release queue some time
+// after its last CUDA graph is destroyed. Wait for that, for up to two seconds.
+bool
+wait_for_deferred_release() {
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!cudnn_frontend::detail::CudaGraphRetainedResource::has_deferred_releases()) {
+        if (std::chrono::steady_clock::now() > deadline) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
+}
+
 // Queue one payload for release: an owner records it into a CUDA graph, the owner goes away, then
 // the graph does.
 void
@@ -175,7 +192,7 @@ queue_one_release() {
         REQUIRE(owner.retain_on_graph(graph, make_counted_payload) == cudaSuccess);
     }
     CUDA_CHECK(cudaGraphDestroy(graph));
-    CUDA_CHECK(cudaDeviceSynchronize());  // user-object destructors may run asynchronously
+    REQUIRE(wait_for_deferred_release());
 }
 }  // namespace
 
@@ -500,16 +517,18 @@ TEST_CASE("Releasing retained plans does not disturb another stream's capture", 
     {
         auto doomed = create_graph(b, m, n, k, scale_value);
         REQUIRE(build(doomed));
+        std::vector<cudnn_frontend::BehaviorNote_t> notes;
+        REQUIRE(doomed->get_behavior_notes(notes).is_good());
+        if (std::find(notes.begin(), notes.end(), cudnn_frontend::BehaviorNote_t::RUNTIME_COMPILATION) == notes.end()) {
+            SKIP("The plan's engine is precompiled, so its CUDA graph does not retain it.");
+        }
         Surface<int8_t> doomed_workspace(doomed->get_workspace_size());
         cudaGraph_t cudnn_cuda_graph;
         CUDA_CHECK(cudaGraphCreate(&cudnn_cuda_graph, 0));
         REQUIRE(doomed->populate_cuda_graph(handle, variant_pack, doomed_workspace.devPtr, cudnn_cuda_graph).is_good());
         doomed.reset();
         CUDA_CHECK(cudaGraphDestroy(cudnn_cuda_graph));
-        CUDA_CHECK(cudaDeviceSynchronize());
-    }
-    if (!cudnn_frontend::detail::CudaGraphRetainedResource::has_deferred_releases()) {
-        SKIP("The plan's engine is precompiled, so its CUDA graph did not retain it.");
+        REQUIRE(wait_for_deferred_release());
     }
 
     // 3. Start a global-mode capture on stream A.
@@ -573,8 +592,7 @@ TEST_CASE("Retained resources are released when an owner is destroyed", "[cudagr
 
         auto other_owner = std::make_unique<CudaGraphRetainedResource>();
         CUDA_CHECK(cudaGraphDestroy(graph));
-        CUDA_CHECK(cudaDeviceSynchronize());
-        REQUIRE(CudaGraphRetainedResource::has_deferred_releases());
+        REQUIRE(wait_for_deferred_release());
         REQUIRE(released_payloads == 0);
 
         // Recording work on a stream that is not being captured, as execute() does, releases nothing.
@@ -590,16 +608,24 @@ TEST_CASE("Retained resources are released when an owner is destroyed", "[cudagr
         REQUIRE_FALSE(CudaGraphRetainedResource::has_deferred_releases());
     }
 
-    SECTION("an owner that outlives its graphs releases the payload when it is destroyed") {
+    SECTION("an owner that outlives its graphs releases the payload once it is destroyed") {
         cudaGraph_t graph;
         CUDA_CHECK(cudaGraphCreate(&graph, 0));
         {
             CudaGraphRetainedResource owner;
             REQUIRE(owner.retain_on_graph(graph, make_counted_payload) == cudaSuccess);
             CUDA_CHECK(cudaGraphDestroy(graph));
-            CUDA_CHECK(cudaDeviceSynchronize());
             REQUIRE(released_payloads == 0);  // the owner still holds it
         }
+        // The owner held the last reference. If CUDA ran the user object's destructor while the owner
+        // was destroyed, the owner released the payload itself; if it ran it asynchronously, the
+        // payload is queued for the next owner destruction instead.
+        auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (released_payloads == 0 && !CudaGraphRetainedResource::has_deferred_releases() &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        CudaGraphRetainedResource::drain_deferred_releases();
         REQUIRE(released_payloads == 1);
         REQUIRE_FALSE(CudaGraphRetainedResource::has_deferred_releases());
     }
