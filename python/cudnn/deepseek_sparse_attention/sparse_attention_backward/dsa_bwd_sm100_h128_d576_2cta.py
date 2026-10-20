@@ -1695,15 +1695,15 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
             head = rank * Int32(self.H_TILE_CTA) + row
             out_bits[slot] = zero_bits
             if cutlass.const_expr(not self.deterministic and self.num_heads == self.H_TILE_CLUSTER) or head < Int32(self.num_heads):
-                out_pointer = mOut.iterator + mOut.layout((head, dim, (token_idx, batch_idx)))
-                out_bits[slot] = _load_bf16x16(out_pointer)
+                prefetch_out_pointer = mOut.iterator + mOut.layout((head, dim, (token_idx, batch_idx)))
+                out_bits[slot] = _load_bf16x16(prefetch_out_pointer)
         for slot in cutlass.range_constexpr(4):
             row = row_base + Int32(slot)
             head = rank * Int32(self.H_TILE_CTA) + row
             dout_bits[slot] = zero_bits
             if cutlass.const_expr(not self.deterministic and self.num_heads == self.H_TILE_CLUSTER) or head < Int32(self.num_heads):
-                dout_pointer = mdO.iterator + mdO.layout((head, dim, (token_idx, batch_idx)))
-                dout_bits[slot] = _load_bf16x16(dout_pointer)
+                prefetch_dout_pointer = mdO.iterator + mdO.layout((head, dim, (token_idx, batch_idx)))
+                dout_bits[slot] = _load_bf16x16(prefetch_dout_pointer)
         for slot in cutlass.range_constexpr(4):
             row = row_base + Int32(slot)
             head = rank * Int32(self.H_TILE_CTA) + row
@@ -1767,8 +1767,8 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
             dim = logical_old_lane * Int32(16)
             out_prefetch[chunk] = zero_bits
             if cutlass.const_expr(not self.deterministic and self.num_heads == self.H_TILE_CLUSTER) or head < Int32(self.num_heads):
-                out_pointer = mOut.iterator + mOut.layout((head, dim, (token_idx, batch_idx)))
-                out_prefetch[chunk] = _load_bf16x16(out_pointer)
+                prefetch_out_pointer = mOut.iterator + mOut.layout((head, dim, (token_idx, batch_idx)))
+                out_prefetch[chunk] = _load_bf16x16(prefetch_out_pointer)
         cute.arch.mbarrier_wait(stationary_tma_mbars + 1, Int32(0))
         for chunk in cutlass.range_constexpr(4):
             logical_old_lane = group_lane + Int32(4 * chunk)
