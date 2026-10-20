@@ -869,7 +869,9 @@ def _exercise_deterministic_sm100_case(
     for repeat in range(1, repeats + 1):
         actual = run()
         for name, actual_tensor, reference_tensor in zip(output_names, actual, reference):
-            assert torch.equal(actual_tensor, reference_tensor), f"{name} differs from the first run at repetition {repeat}"
+            assert torch.equal(bitwise_bits(actual_tensor), bitwise_bits(reference_tensor)), (
+                f"{name} differs from the first run at repetition {repeat}"
+            )
 
     check_ref_dsa_sparse_attention_backward(
         q,
