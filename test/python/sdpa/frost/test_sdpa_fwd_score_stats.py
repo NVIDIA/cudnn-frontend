@@ -147,8 +147,8 @@ def test_capabilities_field_is_appended():
 
     names = [f.name for f in fields(Capabilities)]
     # ... the zero-scale and pre-folded-scale fields after it, then the resident-bias / kv_mask fields of the Rubin small tiles
-    # and their per-shape TILE_N domain after THOSE.
-    assert names[-10:] == [
+    # and their per-shape TILE_N domain after THOSE, followed by the canonical band capability.
+    assert names[-11:] == [
         "thd_pack_gqa_d_shapes",
         "zero_scale",
         "attn_scale_prefolded_d_shapes",
@@ -159,6 +159,7 @@ def test_capabilities_field_is_appended():
         "kv_mask",
         "kv_mask_dtypes",
         "tile_ns_by_d_shape",
+        "band",
     ], names[-11:]
     assert Capabilities.__dataclass_fields__["score_stats_d_shapes"].default is None
     assert Capabilities.__dataclass_fields__["dense_only_d_shapes"].default == frozenset()
