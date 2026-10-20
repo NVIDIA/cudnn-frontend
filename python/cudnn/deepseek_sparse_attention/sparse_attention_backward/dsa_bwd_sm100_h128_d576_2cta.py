@@ -1030,12 +1030,8 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
         )
         if cutlass.const_expr(mTopkLength is not None):
             mTopkLength = cute.make_tensor(mTopkLength.iterator, cute.make_layout((mTopkLength.shape[0], (1, 1)), stride=(mTopkLength.stride[0], (0, 0))))
-        mQT = cute.make_tensor(
-            mQ.iterator, cute.make_layout((self.D_HEAD, mQ.shape[0], mQ.shape[2]), stride=(mQ.stride[1], mQ.stride[0], mQ.stride[2]))
-        )
-        mdOT = cute.make_tensor(
-            mdO.iterator, cute.make_layout((self.D_HEAD, mdO.shape[0], mdO.shape[2]), stride=(mdO.stride[1], mdO.stride[0], mdO.stride[2]))
-        )
+        mQT = cute.make_tensor(mQ.iterator, cute.make_layout((self.D_HEAD, mQ.shape[0], mQ.shape[2]), stride=(mQ.stride[1], mQ.stride[0], mQ.stride[2])))
+        mdOT = cute.make_tensor(mdO.iterator, cute.make_layout((self.D_HEAD, mdO.shape[0], mdO.shape[2]), stride=(mdO.stride[1], mdO.stride[0], mdO.stride[2])))
         cg1 = tcgen05.CtaGroup.ONE
         cg2 = tcgen05.CtaGroup.TWO
         stationary_tiler = (self.H_TILE_CTA, self.N_TILE, self.D_HEAD)
@@ -4320,9 +4316,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic(TwoCTADeterminis
         """Preserve the compact FP32 fold order and fuse the multi-query dSink tail."""
         active_groups = cute.ceil_div(active_shards, self.COMPACT_QUERIES_PER_GROUP)
         self.fold_dKV_shards(mdKV_acc, seqlen, active_shards).launch(grid=[seqlen, active_groups, 1], block=[160, 1, 1], stream=stream)
-        self.fold_dKV_groups_to_output_vectorized(mdKV_acc, mdKV, seqlen, active_groups).launch(
-            grid=[seqlen, 1, 1], block=[160, 1, 1], stream=stream
-        )
+        self.fold_dKV_groups_to_output_vectorized(mdKV_acc, mdKV, seqlen, active_groups).launch(grid=[seqlen, 1, 1], block=[160, 1, 1], stream=stream)
         if cutlass.const_expr(not self.SINGLE_QUERY):
             self.fold_dKV_groups_to_output(mdKV_acc, mdKV, sum_odo, scaled_lse, attn_sink, d_sink, seqlen, total_q, active_groups).launch(
                 grid=[16, 1, 1], block=[288, 1, 1], stream=stream

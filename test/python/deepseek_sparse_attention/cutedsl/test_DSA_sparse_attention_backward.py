@@ -727,9 +727,7 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_workspace_respects_ba
 
     s_q, s_kv = 7, 1025
     fixed_d512 = flash_attn_bwd_sm100_workspace_size(s_q, s_kv, 512, 128, deterministic=True)
-    two_cta_d512 = flash_attn_bwd_sm100_workspace_size(
-        s_q, s_kv, 512, 128, deterministic=True, backend="h128_2cta_m64"
-    )
+    two_cta_d512 = flash_attn_bwd_sm100_workspace_size(s_q, s_kv, 512, 128, deterministic=True, backend="h128_2cta_m64")
     assert two_cta_d512 == fixed_d512
 
     padded_s_q = math.ceil(s_q / 8) * 8
@@ -739,16 +737,12 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_workspace_respects_ba
         compact_dkv_bytes = 96 * padded_s_kv * 576 * torch.float32.itemsize
         compact = flash_attn_bwd_sm100_workspace_size(s_q, s_kv, 576, num_heads, deterministic=True, backend=backend)
         fixed = flash_attn_bwd_sm100_workspace_size(s_q, s_kv, 576, num_heads, deterministic=True)
-        adaptive = flash_attn_bwd_sm100_workspace_size(
-            s_q, s_kv, 576, num_heads, deterministic=True, backend="generic_m64"
-        )
+        adaptive = flash_attn_bwd_sm100_workspace_size(s_q, s_kv, 576, num_heads, deterministic=True, backend="generic_m64")
         assert compact == stats_bytes + compact_dkv_bytes
         assert adaptive < compact < fixed
 
 
-def _exercise_deterministic_sm100_case(
-    num_heads, head_dim, s_q, s_kv, repeats, check_short_workspace=False, max_topk=None, sorted_topk=False
-):
+def _exercise_deterministic_sm100_case(num_heads, head_dim, s_q, s_kv, repeats, check_short_workspace=False, max_topk=None, sorted_topk=False):
     """Run one deterministic case against bitwise and numerical contracts."""
     from cudnn import DSA
     from cuda.bindings import driver as cuda
@@ -869,9 +863,7 @@ def _exercise_deterministic_sm100_case(
     for repeat in range(1, repeats + 1):
         actual = run()
         for name, actual_tensor, reference_tensor in zip(output_names, actual, reference):
-            assert torch.equal(bitwise_bits(actual_tensor), bitwise_bits(reference_tensor)), (
-                f"{name} differs from the first run at repetition {repeat}"
-            )
+            assert torch.equal(bitwise_bits(actual_tensor), bitwise_bits(reference_tensor)), f"{name} differs from the first run at repetition {repeat}"
 
     check_ref_dsa_sparse_attention_backward(
         q,

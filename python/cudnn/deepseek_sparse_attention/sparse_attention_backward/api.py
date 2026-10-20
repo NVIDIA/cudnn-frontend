@@ -291,9 +291,11 @@ class SparseAttentionBackward(APIBase):
                     self._two_cta_split_count > 1,
                     self.deterministic,
                     self.q_desc.shape[1],
-                    _iface_d576._deterministic_compact_slots(torch.cuda.get_device_properties(self.q_desc.device).multi_processor_count)
-                    if self.deterministic
-                    else 74,
+                    (
+                        _iface_d576._deterministic_compact_slots(torch.cuda.get_device_properties(self.q_desc.device).multi_processor_count)
+                        if self.deterministic
+                        else 74
+                    ),
                 )
             return
         if self.deterministic:
