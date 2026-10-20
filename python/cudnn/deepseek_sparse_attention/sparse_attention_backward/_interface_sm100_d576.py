@@ -21,6 +21,11 @@ BACKENDS = (H96_BACKEND, BACKEND)
 _MAX_DETERMINISTIC_COMPACT_SLOTS = 76
 
 
+def _workspace_alignment(deterministic: bool) -> int:
+    """Required base alignment for the selected workspace layout."""
+    return 32 if deterministic else 16
+
+
 def _workspace_sizes(total_s_q: int, total_s_kv: int, deterministic: bool = False, num_heads: int = 128) -> tuple[int, int]:
     """Byte sizes of the FP32 LSE/OdO and compact dKV workspace."""
     backend = H96_BACKEND if num_heads == 96 else BACKEND
@@ -79,7 +84,7 @@ def _compile_d576_2cta(
     # Deterministic dKV scratch exceeds 2 GiB for long sequences. Its byte
     # extent must remain wide when TVM-FFI binds the caller-owned workspace.
     stats_workspace = tensor(cutlass.Uint8, (cute.sym_int64(),))
-    dkv_workspace = tensor(cutlass.Uint8, (cute.sym_int64(),))
+    dkv_workspace = tensor(cutlass.Uint8, (cute.sym_int64(),), _workspace_alignment(deterministic))
     kernel_cls = FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic if deterministic else FlashAttentionDSABackwardSm100H128D576TwoCTA
     kernel_kwargs = {
         "element_dtype": cutlass.BFloat16,
@@ -170,8 +175,9 @@ def _execute_d576_2cta(
         raise ValueError("workspace must be a contiguous uint8 tensor on Q's device")
     if workspace.numel() < required:
         raise ValueError(f"the H{num_heads} D576 two-CTA backend requires a {required}-byte workspace; the provided buffer has {workspace.numel()} bytes")
-    if workspace.data_ptr() % 16:
-        raise ValueError(f"workspace must be 16-byte aligned; got data_ptr=0x{workspace.data_ptr():x}")
+    workspace_alignment = _workspace_alignment(deterministic)
+    if workspace.data_ptr() % workspace_alignment:
+        raise ValueError(f"workspace must be {workspace_alignment}-byte aligned; got data_ptr=0x{workspace.data_ptr():x}")
     stats_bytes, dkv_bytes = _workspace_sizes(sq, skv, deterministic, num_heads)
     flat = workspace.view(-1)
     dkv_begin = _align_workspace_bytes(stats_bytes)

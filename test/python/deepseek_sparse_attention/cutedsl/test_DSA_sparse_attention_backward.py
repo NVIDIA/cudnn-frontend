@@ -1120,6 +1120,48 @@ def test_DSA_sparse_attention_backward_sm100_plan_revalidates_runtime_layout():
         plan.execute(*misaligned_inputs, dq, dkv, **execute_args)
 
 
+@pytest.mark.L1
+@torch_fork_set_rng(seed=429)
+def test_DSA_sparse_attention_backward_sm100_d576_deterministic_workspace_requires_32_byte_alignment():
+    """Reject a 16-byte-only workspace before the Top-K 2048 kernel launches."""
+    _require_sm100()
+    plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
+        96,
+        576,
+        2048,
+        s_q=1,
+        s_kv=2048,
+        has_topk_length=True,
+        deterministic=True,
+        compile_plan=False,
+    )
+
+    def unexpected_launch(*args, **kwargs):
+        pytest.fail("the kernel launched before workspace alignment validation")
+
+    plan._compiled_kernel = unexpected_launch
+    workspace_bytes = workspace.numel()
+    del workspace
+    storage = torch.empty(workspace_bytes + 32, dtype=torch.uint8, device="cuda")
+    offset = (16 - storage.data_ptr() % 32) % 32
+    misaligned_workspace = storage[offset : offset + workspace_bytes]
+    assert misaligned_workspace.is_contiguous()
+    assert misaligned_workspace.data_ptr() % 16 == 0
+    assert misaligned_workspace.data_ptr() % 32 == 16
+
+    dq, dkv, d_sink = outputs
+    with pytest.raises(ValueError, match="workspace must be 32-byte aligned"):
+        plan.execute(
+            *inputs,
+            dq,
+            dkv,
+            topk_length=topk_length,
+            softmax_scale=softmax_scale,
+            workspace=misaligned_workspace,
+            d_sink=d_sink,
+        )
+
+
 @pytest.mark.L0
 def test_DSA_sparse_attention_backward_sm100_ordinary_compile_cache_is_device_scoped(monkeypatch):
     """Ordinary launchables compiled in one CUDA context are not reused by another."""
