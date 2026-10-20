@@ -235,6 +235,24 @@ def test_DSA_sparse_attention_backward_sm100_h96_dispatch():
     assert _select_sm100_backend(96, 576, max_topk=512) == ("h96_h64_h32", 64)
     assert _select_sm100_backend(96, 576, max_topk=1024) == ("h96_h64_h32", 64)
     assert _select_sm100_backend(96, 576, max_topk=2048, deterministic=True) == ("h96_h64_h32", 64)
+    assert _select_sm100_backend(
+        96,
+        576,
+        head_dim_v=512,
+        dtype=torch.bfloat16,
+        max_topk=2048,
+        device_capability=(10, 0),
+        deterministic=True,
+    ) == ("h96_d576_2cta_m64", 64)
+    assert _select_sm100_backend(
+        96,
+        576,
+        head_dim_v=512,
+        dtype=torch.bfloat16,
+        max_topk=2048,
+        device_capability=(10, 7),
+        deterministic=True,
+    ) == ("h96_h64_h32", 64)
 
 
 @pytest.mark.L0
@@ -4292,9 +4310,13 @@ def test_DSA_sparse_attention_backward_sm100_execute_allocates_nothing_and_never
     _require_sm100()
     if expected_backend == "h128_2cta_m64":
         _require_exact_sm100()
-    if expected_backend == "h128_d576_2cta_m64" and torch.cuda.get_device_capability() not in _TWO_CTA_CAPABILITIES:
-        pytest.skip("D576 2-CTA requires an SM100-class GPU (compute capability 10.0 or 10.3)")
-    if q_cluster_mode == "adaptive_pair" and torch.cuda.get_device_capability() not in _TWO_CTA_CAPABILITIES:
+    device_capability = torch.cuda.get_device_capability()
+    if expected_backend in ("h96_d576_2cta_m64", "h128_d576_2cta_m64") and device_capability not in _TWO_CTA_CAPABILITIES:
+        if expected_backend == "h96_d576_2cta_m64":
+            expected_backend = "h96_h64_h32"
+        else:
+            pytest.skip("D576 2-CTA requires an SM100-class GPU (compute capability 10.0 or 10.3)")
+    if q_cluster_mode == "adaptive_pair" and device_capability not in _TWO_CTA_CAPABILITIES:
         pytest.skip("q_cluster_mode='adaptive_pair' requires an SM100-class GPU (compute capability 10.0 or 10.3)")
     plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
         num_heads,
