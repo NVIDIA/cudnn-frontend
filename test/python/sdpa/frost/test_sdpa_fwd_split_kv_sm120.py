@@ -319,18 +319,22 @@ def test_sm120_split_sink_is_eligible_on_the_half_row_only(d):
 
 
 @pytest.mark.parametrize("over", [dict(), dict(h_q=32, h_kv=8, d_qk=128, d_v=128, s_kv=65536), dict(h_q=16, h_kv=2, d_qk=256, d_v=256, s_kv=16384)])
-def test_sm120_heuristics_split_a_sink_decode(over):
-    """A sink decode with few KV heads under-fills the part unsplit: the half row's lead set splits and every set it
-    proposes is admissible."""
+def test_sm120_sink_sets_carry_the_split_choice(monkeypatch, over):
+    """The half row hands a sink graph to the split chooser (mocked) and carries its answer, and every set it proposes
+    is admissible; the FP8 row keeps a sink graph unsplit whatever the chooser answers."""
+    import cudnn
     from cudnn.sdpa.fwd import heuristics
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS, mismatch
 
-    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm120")
-    facts = _sink_decode_facts(**over)
-    sets = heuristics._knob_sets(spec, facts)
-    assert (sets[0].split_kv or 1) > 1, sets[0]
+    monkeypatch.setattr(heuristics, "choose_split_kv", lambda **_: 4)
+    rows = {s.name: s for s in ENGINE_SPECS}
+    half, facts = rows["sdpa_fwd_prefill_sm120"], _sink_decode_facts(**over)
+    sets = heuristics._knob_sets(half, facts)
+    assert 4 in {knobs.split_kv for knobs in sets}, sets
     for knobs in sets:
-        assert mismatch(spec.capabilities, facts, knobs) is None, knobs
+        assert mismatch(half.capabilities, facts, knobs) is None, knobs
+    fp8 = _sink_decode_facts(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.HALF, is_fp8=True, **over)
+    assert all((knobs.split_kv or 1) == 1 for knobs in heuristics._knob_sets(rows["sdpa_fwd_prefill_sm120_fp8"], fp8))
 
 
 # --- FP8, including a QUANTIZED O ------------------------------------------
