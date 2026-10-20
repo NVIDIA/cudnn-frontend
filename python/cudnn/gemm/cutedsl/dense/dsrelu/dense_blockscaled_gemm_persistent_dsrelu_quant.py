@@ -6,6 +6,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cudnn._cutlass_helpers.warp_reduce import warp_amax_with_nan
 from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator, get_smem_capacity_in_bytes
 from cudnn._cutlass_helpers.static_persistent_tile_scheduler import PersistentTileSchedulerParams, StaticPersistentTileScheduler
 from cutlass.cute.nvgpu import cpasync, tcgen05
@@ -1419,12 +1420,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 # Perform amax reduction after all subtiles are processed
                 if cutlass.const_expr(self.generate_amax):
                     # Warp-level reduction using wrapper function
-                    warp_amax = cute.arch.warp_redux_sync(
-                        value=thread_tile_amax,
-                        kind="fmax",
-                        mask_and_clamp=0xFFFFFFFF,
-                        nan=True,
-                    )
+                    warp_amax = warp_amax_with_nan(thread_tile_amax)
                     # Each epilogue warp's lane 0 writes warp amax to shared memory
                     if cute.arch.lane_idx() == 0:
                         sAmax[warp_idx] = cutlass.Float32(warp_amax)
