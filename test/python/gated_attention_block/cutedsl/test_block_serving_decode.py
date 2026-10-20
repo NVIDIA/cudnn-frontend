@@ -2282,3 +2282,47 @@ def test_fuse_cache_write_small_m_is_a_typed_decline_off_the_arm_and_auto_reads_
     with pytest.raises(NotImplementedError, match="QUANTIZES"):
         blk._resolve_cache_write_small_m(True, None)
     assert blk._resolve_cache_write_small_m(None, None) is False
+
+
+def test_an_explicit_fuse_cache_write_false_keeps_the_separate_launch_under_the_auto_small_m_fold():
+    """``fuse_cache_write=False`` is "the separate launch always (the A/B control and the fallback)": under ``fuse_cache_write_small_m=None``
+    (AUTO) the request outranks the measured small-M rule -- the norm + RoPE launch carries no page size, the separate cache-write stage is
+    built and listed -- at every row count the rule would fold (``S_q = 1`` at any batch, ``B x S_q < 128``), on the C0-lowered
+    ``fuse_norm_rope=True`` declaration and on ``fuse_norm_rope=False`` alike; the control's stage list is the AUTO fold's plus exactly
+    ``cache_write``, its carve the same.  An explicit ``fuse_cache_write_small_m`` is this arm's own knob and the strongest request: ``True``
+    beside ``fuse_cache_write=False`` folds the write-through in (an explicit small-M value wins on either side, as documented), ``False`` keeps
+    the separate launch.  ``fuse_cache_write=None`` leaves the AUTO fold as before and ``fuse_cache_write=True`` keeps the fused fork, which
+    owns its own write-through (never this arm)."""
+    at = lambda b=1, s_q=1, **kw: _make_block(12, b, s_q, **kw)[0]  # noqa: E731
+    names = lambda blk: [st.name for st in blk._stages]  # noqa: E731
+    # the reviewed cell: a small-M decode declaration (24 / 2 at B 1 x S_q 1) with the control asked for by name
+    ctl = at(fuse_cache_write=False)
+    assert ctl.fuse_cache_write is False and ctl.fuse_cache_write_small_m is None and ctl.small_m_decode and not ctl.fuse_norm_rope_effective
+    assert ctl.cache_write_in_norm_rope is False and isinstance(ctl._cache_write, _CacheWrite) and not ctl.cache_write_fused
+    assert ctl._norm_rope is not None and ctl._norm_rope.page_size == 0 and "cache_write" in names(ctl)
+    auto = at()
+    assert auto.fuse_cache_write is None and auto.cache_write_in_norm_rope is True and auto._cache_write is None
+    assert names(auto) == [n for n in names(ctl) if n != "cache_write"], "the control adds exactly the cache-write stage"
+    assert ctl._layout() == auto._layout(), "the carve does not read the control (performance-only)"
+    # every cell the AUTO rule folds, with the C0 lowering (fuse_norm_rope=True to 128 rows) and on the chain declared unfused outright
+    for b, s_q in ((1, 1), (12, 1), (4, 4), (32, 1), (128, 1), (31, 4), (63, 2)):
+        for fnr in (True, False):
+            blk = at(b, s_q, fuse_norm_rope=fnr, fuse_cache_write=False)
+            assert blk._norm_rope is not None and not blk.fuse_norm_rope_effective, (b, s_q, fnr)
+            assert blk.cache_write_in_norm_rope is False and isinstance(blk._cache_write, _CacheWrite) and blk._norm_rope.page_size == 0, (b, s_q, fnr)
+            assert at(b, s_q, fuse_norm_rope=fnr).cache_write_in_norm_rope is True, (b, s_q, fnr)  # the AUTO twin folds
+    # the explicit small-M knob is the strongest request: True beside the control folds in, False keeps the separate launch
+    on = at(fuse_cache_write=False, fuse_cache_write_small_m=True)
+    assert on.cache_write_in_norm_rope is True and on._cache_write is None and on._norm_rope.page_size == 16 and names(on) == names(auto)
+    off = at(fuse_cache_write=False, fuse_cache_write_small_m=False)
+    assert off.cache_write_in_norm_rope is False and isinstance(off._cache_write, _CacheWrite) and names(off) == names(ctl)
+    # the other readings of fuse_cache_write: None folds as before; True keeps the fused fork (its own write-through, never this arm)
+    assert at(fuse_cache_write=None).cache_write_in_norm_rope is True
+    fork = at(fuse_norm_rope=True, fuse_cache_write=True)
+    assert fork.fuse_norm_rope_effective and fork.cache_write_fused and fork.cache_write_in_norm_rope is False and fork._norm_rope is None
+    # past the rule the control changes nothing: 128 rows with S_q > 1 keep the separate launch under every reading
+    assert at(32, 4, fuse_norm_rope=False).cache_write_in_norm_rope is False
+    assert at(32, 4, fuse_norm_rope=False, fuse_cache_write=False).cache_write_in_norm_rope is False
+    # the resolver on its own facts: AUTO reads False with the control declared and True without it; an explicit value is followed either way
+    assert ctl._resolve_cache_write_small_m(None, None) is False and auto._resolve_cache_write_small_m(None, None) is True
+    assert ctl._resolve_cache_write_small_m(True, None) is True and ctl._resolve_cache_write_small_m(False, None) is False

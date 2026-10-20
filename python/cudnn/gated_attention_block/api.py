@@ -645,7 +645,8 @@ part: the arm wins on every B 1 .. 4 cell (+1.1 .. +3.2 % per decode step on the
 32.2 -> 31.4 us), at B 32 x S_q 1 and B 128 x S_q 1 (the PDL + write-through step +6.9 % / +2.5 % against +2.2 % / +1.8 % from PDL alone),
 and loses 0.7-2.7 us per step at B 32 .. 128 x S_q 4 (128-512 rows), where the per-row pool write inside the norm + RoPE kernel costs more
 than the write kernel it replaces.  Performance-only (the same bytes land in the pools and the slab either way); an explicit ``True`` /
-``False`` is honoured wherever the arm is served."""
+``False`` is honoured wherever the arm is served, and an explicit ``fuse_cache_write=False`` (the separate launch asked for by name) keeps
+the AUTO fold off."""
 
 
 def _resolve_decode_route_policy(policy: Optional[str]) -> str:
@@ -6605,7 +6606,9 @@ class GatedAttentionBlockFwd(APIBase):
         # APPENDED (serving): WHERE the paged KV-cache write-through runs under paged_kv_page_size > 0.  None = AUTO: folded into the fused
         # projection's epilogue wherever that arm serves (fuse_norm_rope=True, bf16 / f16 activations, no indexer band -- both serving forms as
         # declared today: EXTEND 4 -> 3 stages with fuse_gate, DECODE 5 -> 4), the separate cache-write launch everywhere else; False = the
-        # separate launch always (the A/B control and the fallback); True = the fused arm, a typed decline on a form it cannot serve.  A
+        # separate launch always (the A/B control and the fallback; on the DECODE form's unfused chain it also keeps the AUTO small-M fold of
+        # fuse_cache_write_small_m=None off -- an explicit fuse_cache_write_small_m names that arm itself and is followed either way); True =
+        # the fused arm, a typed decline on a form it cannot serve.  A
         # performance-only knob: the pools hold the SAME bytes either way (the pool row is the slab row, bitwise).  At decode row counts
         # an explicit True is the REQUEST that keeps the fused fork the AUTO lowering (fuse_norm_rope_small_m=None) would otherwise replace
         # (user request > heuristic proposal); only the explicit contradiction fuse_norm_rope_small_m=False + fuse_cache_write=True declines.
@@ -6660,7 +6663,8 @@ class GatedAttentionBlockFwd(APIBase):
         # is the unfused chain at decode row counts (the C0 lowering above, or fuse_norm_rope=False) on the dense DECODE form, bf16 / f16,
         # no quant, no indexer band, 16-bit pools, the TMA norm + RoPE kernel.  None = AUTO (2026-10-19): the MEASURED rule -- folded in
         # where the arm is served and T = B x S_q < CACHE_WRITE_SMALL_M_DEFAULT_MAX_ROWS (128) or S_q == 1, the separate cache-write launch
-        # (the chain as before: seven launches with the split combine) at T >= 128 with S_q > 1, where the arm measured slower; True = the
+        # (the chain as before: seven launches with the split combine) at T >= 128 with S_q > 1, where the arm measured slower, and wherever
+        # an explicit fuse_cache_write=False asked for the separate launch by name (user request > heuristic proposal); True = the
         # write-through FOLDED INTO the norm + RoPE launch (kernels/qk_norm_rope_tma.py's pool-write arm: the slab's V band copied and the
         # post-RoPE K / V rows written to the pools from the same tiles, the separate cache-write stage not built -- six launches), a typed
         # decline on a form that cannot serve it (the fused fork, a quantized pipeline, the e4m3 cache, the indexer band, the EXTEND / packed
@@ -7503,14 +7507,18 @@ class GatedAttentionBlockFwd(APIBase):
     def _resolve_cache_write_small_m(self, requested: Optional[bool], quant) -> bool:
         """Whether the paged write-through runs INSIDE the norm + RoPE launch (``fuse_cache_write_small_m``: None = AUTO -- the measured rule
         of :data:`CACHE_WRITE_SMALL_M_DEFAULT_MAX_ROWS`: folded in at ``T = B x S_q < 128`` rows or at ``S_q == 1``, the separate launch at
-        ``T >= 128`` with ``S_q > 1`` --, True / False by name; ``TypeError`` otherwise).  Served on the dense DECODE form's UNFUSED chain with
+        ``T >= 128`` with ``S_q > 1``, and the separate launch wherever an explicit ``fuse_cache_write=False`` asked for it by name: the request
+        outranks the AUTO fold --, True / False by name -- this arm's own knob, the strongest request, followed under either reading of
+        ``fuse_cache_write``; ``TypeError`` otherwise).  Served on the dense DECODE form's UNFUSED chain with
         paged pools in the activation dtype (bf16 / f16, no quant, no indexer band, no e4m3 cache) when the TMA norm + RoPE kernel tiles the
         geometry; AUTO reads False everywhere else and an explicit True is a typed decline naming the reason.  Device-free (the arch half --
         sm_90+ for the TMA kernel -- is the stage's ``check_support``; the dense DECODE form itself is served on cc 10.7 only)."""
         if requested is not None and not isinstance(requested, bool):
             raise TypeError(f"fuse_cache_write_small_m must be None (auto), True or False, got {type(requested).__name__}")
         if requested is None:
-            want = self.seq_len == 1 or self.batch * self.seq_len < CACHE_WRITE_SMALL_M_DEFAULT_MAX_ROWS
+            # an explicit fuse_cache_write=False asks for the separate cache-write launch by name: the request outranks the AUTO fold
+            # (user request > heuristic proposal, as the constructor applies it to fuse_cache_write=True); the row rule decides otherwise
+            want = self.fuse_cache_write is not False and (self.seq_len == 1 or self.batch * self.seq_len < CACHE_WRITE_SMALL_M_DEFAULT_MAX_ROWS)
         else:
             want = requested
         if not want:
