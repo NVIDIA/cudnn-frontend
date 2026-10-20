@@ -43,12 +43,16 @@ def _check_against_reference(inputs, grads):
     [
         (2, 1.0),  # tail tokens only (a single token has dQ = dK = 0, which a relative bound cannot score)
         (5, 1.0),  # one complete block and a tail
+        (2051, 1.0),  # the longest sequence whose lists are all whole causal prefixes, so the bitmap is filled without the bitmap kernel
+        (2052, 1.0),  # the shortest sequence on which the last query drops a block and the bitmap kernel runs
         (4099, 1.0),  # every query in the dense kernel, sparse rows above 2050 included
         (16384, 1.0),  # every query in the dense kernel with the larger dense unit
-        (24577, 1.0),  # a single query on the query-major kernel
-        (28000, 1.0),  # dense and query-major kernels, two KV passes
-        (28000, 1e-7),  # training-scale gradients, which rule out reduced-range accumulators
-        (32769, 1.0),  # three KV passes and a partial last block
+        (22527, 1.0),  # the longest sequence served by the dense kernel alone
+        (22528, 1.0),  # the shortest sequence with a sparse remainder: a single query range on the key-major kernel
+        (22529, 1.0),  # one full query range and a second range holding a single query
+        (24000, 1.0),  # dense, query-major and key-major kernels in one KV pass and two query ranges
+        (24000, 1e-7),  # training-scale gradients, which rule out reduced-range accumulators
+        (32769, 1.0),  # the long-sequence crossover, two KV passes and a partial last block
     ],
 )
 def test_qsa_backward_matches_reference(seq_len, grad_scale):
@@ -95,7 +99,7 @@ def test_wrapper_on_explicit_stream_with_preallocated_outputs(monkeypatch):
     side.wait_stream(torch.cuda.current_stream())
     grads = DSA.gqa_sparse_attention_backward_wrapper(*args, dq=dq, dk=dk, dv=dv, stream=cuda.CUstream(side.cuda_stream))
     torch.cuda.current_stream().wait_stream(side)
-    assert streams == [side.cuda_stream] * 6
+    assert streams == [side.cuda_stream] * 9  # one launch per kernel of the dense + sparse sequence
     assert grads["dq"] is dq and grads["dk"] is dk and grads["dv"] is dv
     _check_against_reference(inputs, (dq, dk, dv))
 

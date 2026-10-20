@@ -32,7 +32,13 @@ def _overlaps(lhs: tuple[int, int], rhs: tuple[int, int]) -> bool:
 
 
 class GqaSparseAttentionBackward(APIBase):
-    """QSA backward: dQ, dK and dV from Q, K, V, O, dO, the forward LSE and the selected token indices."""
+    """QSA backward: dQ, dK and dV from Q, K, V, O, dO, the forward LSE and the selected token indices.
+
+    ``topk_idxs`` row ``i`` lists the first token of each of its ``min((i + 1) // 4, 512)`` complete 4-token blocks (the
+    four ids of a block are consecutive), then the ``(i + 1) % 4`` tail tokens, then ``-1``. Up to ``T = 2051`` every
+    row is therefore its whole causal prefix. The kernels read the block ids only and derive the tail block from the
+    position. Rows that break this layout are not checked.
+    """
 
     def __init__(
         self,
@@ -102,7 +108,7 @@ class GqaSparseAttentionBackward(APIBase):
             self._value_error_if(desc.shape != shape, f"{name} must have shape {shape}, got {desc.shape}")
             self._check_dtype(desc, dtype, name=name)
             self._value_error_if(desc.device != q_desc.device, f"{name} must be on {q_desc.device}, got {desc.device}")
-            # The kernels address the declared layout natively and never repack (Rule 2).
+            # The kernels address the declared layout natively and never repack (python/cudnn/AGENTS.md Rule 2).
             self._not_implemented_error_if(
                 not desc.is_contiguous(),
                 f"{self.__class__.__name__} addresses only contiguous {name}, got shape {desc.shape} strides {desc.stride}",
@@ -125,7 +131,7 @@ class GqaSparseAttentionBackward(APIBase):
         if self._compiled_kernel is not None:
             return
         with torch.cuda.device(self.descs["q"].device):
-            self._compiled_kernel = self._kernel_module.compile_kernels(self._plan.has_sparse)
+            self._compiled_kernel = self._kernel_module.compile_kernels(self._plan)
 
     def scratch_workspace_bytes(self) -> int:
         """Caller workspace bytes one execution needs."""
