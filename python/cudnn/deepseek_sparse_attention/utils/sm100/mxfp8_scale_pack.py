@@ -3,7 +3,7 @@
 
 """Single-launch F8_128x4 scale packing for the SM100 DSA indexer.
 
-The indexer consumes one byte per logical MXFP8 scale in NVIDIA's
+The indexer consumes one byte per logical MXFP8 or NVFP4 scale in NVIDIA's
 F8_128x4 layout.  This module copies those bytes directly from the caller's
 logical BSHD, THD, or MKL tensor into the packed layout.  Padding bytes are
 written as ``0x00`` by the same launch, so callers do not need an index tensor,

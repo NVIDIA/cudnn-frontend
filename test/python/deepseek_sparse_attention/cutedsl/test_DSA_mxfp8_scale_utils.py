@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for the SM100 MXFP8 scale-layout contract."""
+"""Tests for the SM100 block-scaled (MXFP8/NVFP4) scale-layout and descriptor contract."""
 
 from types import SimpleNamespace
 
@@ -379,6 +379,7 @@ def test_blockscaled_mma_op_adapter_maps_scale_and_major_modes_host_only():
     op = SimpleNamespace(
         a_dtype=cutlass.Float8E4M3FN,
         b_dtype=cutlass.Float8E5M2,
+        sf_dtype=cutlass.Float8E8M0FNU,
         shape_mnk=(128, 256, 64),
         a_major_mode=cute.nvgpu.tcgen05.mma.OperandMajorMode.K,
         b_major_mode=cute.nvgpu.tcgen05.mma.OperandMajorMode.MN,
@@ -398,3 +399,83 @@ def test_blockscaled_mma_op_adapter_maps_scale_and_major_modes_host_only():
         a_sf_id=2,
         b_sf_id=2,
     )
+
+
+def test_blockscaled_umma_descriptor_nvfp4_host_only():
+    """Packed E2M1 with E4M3 scales selects the .kind::mxf4nvf4 encodings."""
+    cutlass = pytest.importorskip("cutlass")
+    mma_desc = pytest.importorskip("cudnn.deepseek_sparse_attention.utils.sm100.mma_desc")
+
+    def nvfp4_desc(dtype=cutlass.Float4E2M1FN, scale_dtype=cutlass.Float8E4M3FN, packed_fp4=True):
+        return mma_desc.make_blockscaled_instr_desc(
+            dtype,
+            dtype,
+            M=128,
+            N=128,
+            a_major=mma_desc.Major.K,
+            b_major=mma_desc.Major.K,
+            scale_format=mma_desc.to_scale_format(scale_dtype),
+            packed_fp4=packed_fp4,
+        )
+
+    desc = nvfp4_desc()
+    assert (desc >> 7) & 0x7 == mma_desc.MXF4Format.E2M1 == 1
+    assert (desc >> 10) & 0x7 == mma_desc.MXF4Format.E2M1
+    assert (desc >> 23) & 0x1 == mma_desc.ScaleFormat.UE4M3 == 0
+    assert (desc >> 4) & 0x3 == 0
+    assert (desc >> 29) & 0x3 == 0
+    assert (desc >> 17) & 0x3F == 128 // 8
+    assert (desc >> 24) & 0x1F == 128 // 16
+    assert (desc >> 15) & 0x3 == 0  # both operands K-major
+
+    assert (nvfp4_desc(scale_dtype=cutlass.Float8E8M0FNU) >> 23) & 0x1 == mma_desc.ScaleFormat.UE8M0
+    # E2M1 is accepted only by the packed-FP4 kinds, and those take only E2M1.
+    with pytest.raises(TypeError, match="Float4E2M1FN"):
+        nvfp4_desc(packed_fp4=False)
+    with pytest.raises(TypeError, match="Float4E2M1FN"):
+        nvfp4_desc(dtype=cutlass.Float8E4M3FN)
+    with pytest.raises(TypeError, match="scale-factor type"):
+        mma_desc.to_scale_format(cutlass.Float8E5M2)
+
+
+@pytest.mark.usefixtures("cuda_scale_packer")
+def test_nvfp4_scale_pack_cuda_matches_reference():
+    """The CUDA packers place E4M3 NVFP4 scales (8 groups for head_dim 128) like the reference."""
+    bs, sq, sk, hq, hkv, groups, qhpkv = 2, 131, 259, 32, 1, 8, 32
+    q = torch.arange(bs * sq * hq * groups, dtype=torch.int64).to(torch.uint8).reshape(bs, sq, hq, groups).view(torch.float8_e4m3fn)
+    k = torch.arange(bs * sk * hkv * groups, dtype=torch.int64).to(torch.uint8).reshape(bs, sk, hkv, groups).view(torch.float8_e4m3fn)
+    q_ref = mxfp8_scale_reference.pack_q_scale_bshd(q, qhpkv)
+    k_ref = mxfp8_scale_reference.pack_k_scale_bshd(k)
+    assert q_ref.shape == (bs * hkv, 4224, groups)  # ceil128(131 * 32) rows, two 4-column atoms
+    assert k_ref.shape == (bs * hkv, 384, groups)
+
+    q_cuda = mxfp8_scale_utils.pack_q_scale_bshd(q.cuda(), qhpkv)
+    k_cuda = mxfp8_scale_utils.pack_k_scale_bshd(k.cuda())
+    torch.cuda.synchronize()
+
+    assert q_cuda.dtype == torch.float8_e4m3fn
+    assert torch.equal(q_cuda.cpu().view(torch.uint8), q_ref.view(torch.uint8))
+    assert torch.equal(k_cuda.cpu().view(torch.uint8), k_ref.view(torch.uint8))
+
+
+def test_nvfp4_scale_pack_two_atom_order_host_only():
+    """Eight scale groups per row fill two 128x4 atoms per 128-row block, K-fastest.
+
+    Byte offset of (row m, group g) in one L slice, matching ``tile_atom_to_shape_SF`` for the kernel's scale TMA:
+    ``(m // 128) * 1024 + (g // 4) * 512 + 16 * (m % 32) + 4 * ((m % 128) // 32) + g % 4``.
+    """
+    sk, groups = 259, 8
+    k = torch.arange(sk * groups, dtype=torch.int64).to(torch.uint8).reshape(1, sk, 1, groups).view(torch.float8_e4m3fn)
+    flat = mxfp8_scale_reference.pack_k_scale_bshd(k).view(torch.uint8)[0].reshape(-1)
+    logical = k.view(torch.uint8)[0, :, 0, :]
+    for (row, group), offset in {
+        (0, 0): 0,
+        (0, 1): 1,
+        (0, 4): 512,
+        (1, 0): 16,
+        (32, 0): 4,
+        (128, 0): 1024,
+        (130, 5): 1569,
+        (258, 7): 2048 + 512 + 32 + 3,
+    }.items():
+        assert int(flat[offset]) == int(logical[row, group]), (row, group, offset)

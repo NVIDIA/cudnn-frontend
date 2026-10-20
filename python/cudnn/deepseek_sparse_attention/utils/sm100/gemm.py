@@ -330,3 +330,118 @@ def gemm_ptx_partial_mxfp8(
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
+
+
+@cute.jit
+def gemm_ptx_partial_nvfp4(
+    op: cute.nvgpu.tcgen05.mma.BlockScaledMmaOp,
+    acc_tmem_addr: Int32,
+    tCrA: cute.Tensor,
+    tCrB: cute.Tensor,
+    sA: cute.Tensor,
+    sB: cute.Tensor,
+    tSFA: cute.Tensor,
+    tSFB: cute.Tensor,
+    zero_init: bool | Boolean = False,
+    kphase_offset: cutlass.Constexpr[int] = 0,
+) -> None:
+    """Issue blockscaled NVFP4 QK MMA with explicit scale TMEM operands.
+
+    The Indexer forward path uses K as operand A and packed Q as operand B, so
+    K scales are SFA and Q scales are SFB.  Each ``kind::mxf4nvf4`` MMA (K=64)
+    consumes four E4M3 scales per row, one TMEM column, so every K-slice reads
+    its own SFA/SFB column with scale factor id 0.  ``kphase_offset`` is the
+    index of this chunk's first MMA along K.
+    This helper has no inline mbarrier wait path; callers must pass
+    warp-uniform, fully populated SFA/SFB TMEM tensors for the current MMA.
+    """
+    sA_layout = sA.layout
+    sB_layout = sB.layout
+    sA_swizzle = parse_swizzle_from_pointer(sA.iterator)
+    smem_desc_base_a: int = const_expr(
+        sm100_desc.make_smem_desc_base(
+            cute.recast_layout(128, op.a_dtype.width, sA_layout[0]),
+            sA_swizzle,
+            sm100_desc.Major.K if const_expr(op.a_major_mode == OperandMajorMode.K) else sm100_desc.Major.MN,
+        )
+    )
+    smem_desc_base_a_lo, smem_desc_a_hi = i64_to_i32x2(smem_desc_base_a)
+    smem_desc_base_a_lo = const_expr(smem_desc_base_a_lo)
+    smem_desc_a_hi = const_expr(smem_desc_a_hi)
+
+    sB_swizzle = parse_swizzle_from_pointer(sB.iterator)
+    smem_desc_base_b: int = const_expr(
+        sm100_desc.make_smem_desc_base(
+            cute.recast_layout(128, op.b_dtype.width, sB_layout[0]),
+            sB_swizzle,
+            sm100_desc.Major.K if const_expr(op.b_major_mode == OperandMajorMode.K) else sm100_desc.Major.MN,
+        )
+    )
+    smem_desc_base_b_lo, smem_desc_b_hi = i64_to_i32x2(smem_desc_base_b)
+    smem_desc_base_b_lo = const_expr(smem_desc_base_b_lo)
+    smem_desc_b_hi = const_expr(smem_desc_b_hi)
+
+    num_k = cute.size(tCrA.shape[2])
+    offset_a = [cute.crd2idx((0, 0, k), tCrA.layout) for k in range(num_k)]
+    offset_b = [cute.crd2idx((0, 0, k), tCrB.layout) for k in range(cute.size(tCrB.shape[2]))]
+    idesc = const_expr(sm100_desc.blockscaled_mma_op_to_idesc(op, 0))
+
+    smem_desc_start_a_lo = Int32(smem_desc_base_a_lo | sm100_desc.make_smem_desc_start_addr(sA[None, None, 0].iterator))
+    smem_desc_start_b_lo = Int32(smem_desc_base_b_lo | sm100_desc.make_smem_desc_start_addr(sB[None, None, 0].iterator))
+    # One SFA/SFB TMEM column pair per MMA, passed as asm operands $4/$5, $6/$7, ...
+    sf_operands = [
+        Int32(cute.arch.make_warp_uniform(tsf[None, None, k + kphase_offset].iterator.toint())).ir_value() for k in range(num_k) for tsf in (tSFA, tSFB)
+    ]
+    pred_str = "p" if isinstance(zero_init, Boolean) else "0" if zero_init else "1"
+
+    llvm.inline_asm(
+        None,
+        [
+            Int32(cute.arch.make_warp_uniform(smem_desc_start_a_lo)).ir_value(),
+            Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
+            Int32(not zero_init).ir_value(),
+            Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
+            *sf_operands,
+        ],
+        "{\n\t"
+        ".reg .pred leader_thread;\n\t"
+        ".reg .pred p;\n\t"
+        ".reg .b32 idesc;\n\t"
+        ".reg .b32 tmem_acc;\n\t"
+        ".reg .b32 tmem_sfa;\n\t"
+        ".reg .b32 tmem_sfb;\n\t"
+        ".reg .b32 smem_desc_a_lo_start, smem_desc_b_lo_start;\n\t"
+        ".reg .b32 smem_desc_a_lo, smem_desc_b_lo;\n\t"
+        ".reg .b32 smem_desc_a_hi, smem_desc_b_hi;\n\t"
+        ".reg .b64 smem_desc_a, smem_desc_b;\n\t"
+        "elect.sync _|leader_thread, -1;\n\t"
+        "mov.b32 tmem_acc, $3;\n\t"
+        "mov.b32 tmem_sfa, $4;\n\t"
+        "mov.b32 tmem_sfb, $5;\n\t"
+        "mov.b32 smem_desc_a_lo_start, $0;\n\t"
+        "mov.b32 smem_desc_b_lo_start, $1;\n\t"
+        f"mov.b32 smem_desc_a_hi, {hex(smem_desc_a_hi)};\n\t"
+        f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
+        f"mov.b32 idesc, {hex(idesc)};\n\t"
+        "mov.b64 smem_desc_a, {smem_desc_a_lo_start, smem_desc_a_hi};\n\t"
+        "mov.b64 smem_desc_b, {smem_desc_b_lo_start, smem_desc_b_hi};\n\t"
+        "setp.ne.b32 p, $2, 0;\n\t"
+        f"@leader_thread tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.block16 [tmem_acc], smem_desc_a, smem_desc_b, idesc, [tmem_sfa], [tmem_sfb], {pred_str};\n\t"
+        + "".join(
+            (
+                f"add.u32 smem_desc_a_lo, smem_desc_a_lo_start, {hex(offset_a[k])};\n\t"
+                f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
+                f"mov.b32 tmem_sfa, ${4 + 2 * k};\n\t"
+                f"mov.b32 tmem_sfb, ${5 + 2 * k};\n\t"
+                f"mov.b64 smem_desc_a, {{smem_desc_a_lo, smem_desc_a_hi}};\n\t"
+                f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+                "@leader_thread tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.block16 [tmem_acc], smem_desc_a, smem_desc_b, idesc, [tmem_sfa], [tmem_sfb], 1;\n\t"
+            )
+            for k in range(1, num_k)
+        )
+        + "}\n",
+        ",".join(["r"] * (4 + len(sf_operands))),
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
