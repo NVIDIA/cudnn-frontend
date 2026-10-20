@@ -7,14 +7,13 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.typing import Float32, Int32
 import cutlass.pipeline as pipeline
-from cutlass._mlir.dialects import nvvm
 from cutlass.cute.nvgpu import LoadCacheMode, OperandMajorMode, cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils
 
 from typing import Tuple
 
 
-from .bsa_bwd_sm100 import BlockSparseAttnBackwardSm100Blk64
+from .bsa_bwd_sm100 import BlockSparseAttnBackwardSm100Blk64, _cp_async_copy_or_zero_fill
 from cudnn._cutlass_compat import SmemAllocator, TmemAllocator
 
 
@@ -177,7 +176,7 @@ class LocalPairedBackwardSm100(BlockSparseAttnBackwardSm100Blk64):
         pair_flags: cute.Tensor | None,
         pair_residuals: cute.Tensor | None,
     ):
-        bidx, bidy, bidz = self.logical_block_coord()
+        bidx, bidy, bidz = self.logical_block_coord(problem_shape[0])
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
         seqlen_q, seqlen_k, head_dim, HB = problem_shape
@@ -410,9 +409,6 @@ class LocalPairedBackwardSm100(BlockSparseAttnBackwardSm100Blk64):
                     tdVTtdVT,
                     kv_block_idx,
                     variable_block_sizes,
-                    bucketed_k2q_indices,
-                    k2q_begin,
-                    iter_count,
                     problem_shape,
                     compute_iter_count,
                     scale_softmax,
@@ -498,7 +494,7 @@ class LocalPairedBackwardSm100(BlockSparseAttnBackwardSm100Blk64):
             self.acc_dtype,
             num_bits_per_copy=self.acc_dtype.width,
         )
-        _, blk_coord_h, blk_coord_b = self.logical_block_coord()
+        _, blk_coord_h, blk_coord_b = self.logical_block_coord(problem_shape[0])
         seqlen_q, seqlen_k, head_dim, HB = problem_shape
         num_heads, batch_size = HB
         (
@@ -603,8 +599,8 @@ class LocalPairedBackwardSm100(BlockSparseAttnBackwardSm100Blk64):
                             load_compute_LSE_producer_state.index,
                         ],
                     )
-                elif cute.elem_less(LSE_idx + i, seqlen_q):
-                    cute.copy(
+                else:
+                    _cp_async_copy_or_zero_fill(
                         atom_async_copy,
                         LSE_for_copy[None, LSE_idx + i, (blk_coord_h, blk_coord_b)],
                         sLSE_for_copy[
@@ -612,36 +608,22 @@ class LocalPairedBackwardSm100(BlockSparseAttnBackwardSm100Blk64):
                             thread_idx * async_copy_num_elts + i,
                             load_compute_LSE_producer_state.index,
                         ],
+                        cute.elem_less(LSE_idx + i, seqlen_q),
                     )
-                else:
-                    sLSE_for_copy[
-                        None,
-                        thread_idx * async_copy_num_elts + i,
-                        load_compute_LSE_producer_state.index,
-                    ].fill(0.0)
 
             for i in cutlass.range_constexpr(async_copy_num_elts):
                 LSE_idx = q_block_idx_1 * self.sparse_block_size + thread_idx * async_copy_num_elts
-                if cute.elem_less(LSE_idx + i, seqlen_q):
-                    cute.copy(
-                        atom_async_copy,
-                        LSE_for_copy[None, LSE_idx + i, (blk_coord_h, blk_coord_b)],
-                        sLSE_for_copy[
-                            None,
-                            self.sparse_block_size + thread_idx * async_copy_num_elts + i,
-                            load_compute_LSE_producer_state.index,
-                        ],
-                    )
-                else:
+                _cp_async_copy_or_zero_fill(
+                    atom_async_copy,
+                    LSE_for_copy[None, LSE_idx + i, (blk_coord_h, blk_coord_b)],
                     sLSE_for_copy[
                         None,
                         self.sparse_block_size + thread_idx * async_copy_num_elts + i,
                         load_compute_LSE_producer_state.index,
-                    ].fill(0.0)
+                    ],
+                    cute.elem_less(LSE_idx + i, seqlen_q),
+                )
 
-            # Track cp.async without noinc, then publish ordinary zero stores.
-            stats_barrier = load_compute_LSE_pipeline.producer_get_barrier(load_compute_LSE_producer_state)
-            nvvm.cp_async_mbarrier_arrive(stats_barrier.to_llvm_ptr())
             load_compute_LSE_pipeline.producer_commit(load_compute_LSE_producer_state)
             load_compute_LSE_producer_state.advance()
 
@@ -686,8 +668,8 @@ class LocalPairedBackwardSm100(BlockSparseAttnBackwardSm100Blk64):
                             load_compute_sum_OdO_producer_state.index,
                         ],
                     )
-                elif cute.elem_less(sum_OdO_idx + i, seqlen_q):
-                    cute.copy(
+                else:
+                    _cp_async_copy_or_zero_fill(
                         atom_async_copy,
                         sum_OdO_for_copy[None, sum_OdO_idx + i, (blk_coord_h, blk_coord_b)],
                         sSum_OdO_for_copy[
@@ -695,35 +677,21 @@ class LocalPairedBackwardSm100(BlockSparseAttnBackwardSm100Blk64):
                             thread_idx * async_copy_num_elts + i,
                             load_compute_sum_OdO_producer_state.index,
                         ],
+                        cute.elem_less(sum_OdO_idx + i, seqlen_q),
                     )
-                else:
-                    sSum_OdO_for_copy[
-                        None,
-                        thread_idx * async_copy_num_elts + i,
-                        load_compute_sum_OdO_producer_state.index,
-                    ].fill(0.0)
             for i in cutlass.range_constexpr(async_copy_num_elts):
                 sum_OdO_idx = q_block_idx_1 * self.sparse_block_size + thread_idx * async_copy_num_elts
-                if cute.elem_less(sum_OdO_idx + i, seqlen_q):
-                    cute.copy(
-                        atom_async_copy,
-                        sum_OdO_for_copy[None, sum_OdO_idx + i, (blk_coord_h, blk_coord_b)],
-                        sSum_OdO_for_copy[
-                            None,
-                            self.sparse_block_size + thread_idx * async_copy_num_elts + i,
-                            load_compute_sum_OdO_producer_state.index,
-                        ],
-                    )
-                else:
+                _cp_async_copy_or_zero_fill(
+                    atom_async_copy,
+                    sum_OdO_for_copy[None, sum_OdO_idx + i, (blk_coord_h, blk_coord_b)],
                     sSum_OdO_for_copy[
                         None,
                         self.sparse_block_size + thread_idx * async_copy_num_elts + i,
                         load_compute_sum_OdO_producer_state.index,
-                    ].fill(0.0)
+                    ],
+                    cute.elem_less(sum_OdO_idx + i, seqlen_q),
+                )
 
-            # Track cp.async without noinc, then publish ordinary zero stores.
-            stats_barrier = load_compute_sum_OdO_pipeline.producer_get_barrier(load_compute_sum_OdO_producer_state)
-            nvvm.cp_async_mbarrier_arrive(stats_barrier.to_llvm_ptr())
             load_compute_sum_OdO_pipeline.producer_commit(load_compute_sum_OdO_producer_state)
             load_compute_sum_OdO_producer_state.advance()
 
@@ -799,8 +767,8 @@ class LocalPairedBackwardSm100(BlockSparseAttnBackwardSm100Blk64):
                                 load_compute_LSE_producer_state.index,
                             ],
                         )
-                    elif cute.elem_less(LSE_idx + i, seqlen_q):
-                        cute.copy(
+                    else:
+                        _cp_async_copy_or_zero_fill(
                             atom_async_copy,
                             LSE_for_copy[None, LSE_idx + i, (blk_coord_h, blk_coord_b)],
                             sLSE_for_copy[
@@ -808,36 +776,22 @@ class LocalPairedBackwardSm100(BlockSparseAttnBackwardSm100Blk64):
                                 thread_idx * async_copy_num_elts + i,
                                 load_compute_LSE_producer_state.index,
                             ],
+                            cute.elem_less(LSE_idx + i, seqlen_q),
                         )
-                    else:
-                        sLSE_for_copy[
-                            None,
-                            thread_idx * async_copy_num_elts + i,
-                            load_compute_LSE_producer_state.index,
-                        ].fill(0.0)
 
                 for i in cutlass.range_constexpr(async_copy_num_elts):
                     LSE_idx = q_block_idx_1 * self.sparse_block_size + thread_idx * async_copy_num_elts
-                    if cute.elem_less(LSE_idx + i, seqlen_q):
-                        cute.copy(
-                            atom_async_copy,
-                            LSE_for_copy[None, LSE_idx + i, (blk_coord_h, blk_coord_b)],
-                            sLSE_for_copy[
-                                None,
-                                self.sparse_block_size + thread_idx * async_copy_num_elts + i,
-                                load_compute_LSE_producer_state.index,
-                            ],
-                        )
-                    else:
+                    _cp_async_copy_or_zero_fill(
+                        atom_async_copy,
+                        LSE_for_copy[None, LSE_idx + i, (blk_coord_h, blk_coord_b)],
                         sLSE_for_copy[
                             None,
                             self.sparse_block_size + thread_idx * async_copy_num_elts + i,
                             load_compute_LSE_producer_state.index,
-                        ].fill(0.0)
+                        ],
+                        cute.elem_less(LSE_idx + i, seqlen_q),
+                    )
 
-                # Track cp.async without noinc, then publish ordinary zero stores.
-                stats_barrier = load_compute_LSE_pipeline.producer_get_barrier(load_compute_LSE_producer_state)
-                nvvm.cp_async_mbarrier_arrive(stats_barrier.to_llvm_ptr())
                 load_compute_LSE_pipeline.producer_commit(load_compute_LSE_producer_state)
                 load_compute_LSE_producer_state.advance()
 
@@ -879,8 +833,8 @@ class LocalPairedBackwardSm100(BlockSparseAttnBackwardSm100Blk64):
                                 load_compute_sum_OdO_producer_state.index,
                             ],
                         )
-                    elif cute.elem_less(sum_OdO_idx + i, seqlen_q):
-                        cute.copy(
+                    else:
+                        _cp_async_copy_or_zero_fill(
                             atom_async_copy,
                             sum_OdO_for_copy[None, sum_OdO_idx + i, (blk_coord_h, blk_coord_b)],
                             sSum_OdO_for_copy[
@@ -888,35 +842,21 @@ class LocalPairedBackwardSm100(BlockSparseAttnBackwardSm100Blk64):
                                 thread_idx * async_copy_num_elts + i,
                                 load_compute_sum_OdO_producer_state.index,
                             ],
+                            cute.elem_less(sum_OdO_idx + i, seqlen_q),
                         )
-                    else:
-                        sSum_OdO_for_copy[
-                            None,
-                            thread_idx * async_copy_num_elts + i,
-                            load_compute_sum_OdO_producer_state.index,
-                        ].fill(0.0)
                 for i in cutlass.range_constexpr(async_copy_num_elts):
                     sum_OdO_idx = q_block_idx_1 * self.sparse_block_size + thread_idx * async_copy_num_elts
-                    if cute.elem_less(sum_OdO_idx + i, seqlen_q):
-                        cute.copy(
-                            atom_async_copy,
-                            sum_OdO_for_copy[None, sum_OdO_idx + i, (blk_coord_h, blk_coord_b)],
-                            sSum_OdO_for_copy[
-                                None,
-                                self.sparse_block_size + thread_idx * async_copy_num_elts + i,
-                                load_compute_sum_OdO_producer_state.index,
-                            ],
-                        )
-                    else:
+                    _cp_async_copy_or_zero_fill(
+                        atom_async_copy,
+                        sum_OdO_for_copy[None, sum_OdO_idx + i, (blk_coord_h, blk_coord_b)],
                         sSum_OdO_for_copy[
                             None,
                             self.sparse_block_size + thread_idx * async_copy_num_elts + i,
                             load_compute_sum_OdO_producer_state.index,
-                        ].fill(0.0)
+                        ],
+                        cute.elem_less(sum_OdO_idx + i, seqlen_q),
+                    )
 
-                # Track cp.async without noinc, then publish ordinary zero stores.
-                stats_barrier = load_compute_sum_OdO_pipeline.producer_get_barrier(load_compute_sum_OdO_producer_state)
-                nvvm.cp_async_mbarrier_arrive(stats_barrier.to_llvm_ptr())
                 load_compute_sum_OdO_pipeline.producer_commit(load_compute_sum_OdO_producer_state)
                 load_compute_sum_OdO_producer_state.advance()
 
@@ -949,16 +889,13 @@ class LocalPairedBackwardSm100(BlockSparseAttnBackwardSm100Blk64):
         tdVTtdVT: cute.Tensor,
         kv_block_idx: tuple,
         variable_block_sizes: cute.Tensor,
-        union_indices: cute.Tensor,
-        union_begin: Int32,
-        union_count: Int32,
         problem_shape: Tuple[Int32, Int32, Int32, Tuple[Int32, Int32]],
         iter_count: Int32,
         scale_softmax: Float32,
         pipeline_args: tuple,
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        _, blk_coord_h, blk_coord_b = self.logical_block_coord()
+        _, blk_coord_h, blk_coord_b = self.logical_block_coord(problem_shape[0])
         seqlen_q, seqlen_k, head_dim, HB = problem_shape
         num_heads, batch_size = HB
         (
@@ -1030,7 +967,6 @@ class LocalPairedBackwardSm100(BlockSparseAttnBackwardSm100Blk64):
         if cutlass.const_expr(self.has_block_sizes):
             valid_k_0 = variable_block_sizes[blk_coord_b, kv_block_idx[0]]
             valid_k_1 = variable_block_sizes[blk_coord_b, kv_block_idx[1]]
-        total_mma_iters = iter_count
         while iter_count > 0:
             # Wait for S and P
             mma_compute_S_pipeline.consumer_wait(mma_compute_S_consumer_state)
@@ -1043,7 +979,7 @@ class LocalPairedBackwardSm100(BlockSparseAttnBackwardSm100Blk64):
 
             if cutlass.const_expr(self.has_block_sizes and self.kv_group_size == 2):
                 for i in cutlass.range_constexpr(cute.size(tTR_rS)):
-                    index_k, index_q = tTR_cS[i]
+                    index_k, _ = tTR_cS[i]
                     valid_k = valid_k_0 if index_k < 64 else valid_k_1
                     tTR_rS[i] = tTR_rS[i] if index_k % 64 < valid_k else -Float32.inf
             else:
@@ -1051,7 +987,7 @@ class LocalPairedBackwardSm100(BlockSparseAttnBackwardSm100Blk64):
                     # block_sizes describes valid K positions; Q rows stay full-sized.
                     if block_size_k < self.sparse_block_size:
                         for i in cutlass.range_constexpr(cute.size(tTR_rS)):
-                            index_k, index_q = tTR_cS[i]
+                            index_k, _ = tTR_cS[i]
                             is_valid = index_k < block_size_k
                             tTR_rS[i] = tTR_rS[i] if is_valid else -Float32.inf
 
@@ -1176,7 +1112,7 @@ class LocalPairedBackwardSm100(BlockSparseAttnBackwardSm100Blk64):
         tidx, _, _ = cute.arch.thread_idx()
         Q, K, D, HB = problem_shape
         H, B = HB
-        _, blk_coord_h, blk_coord_b = self.logical_block_coord()
+        _, blk_coord_h, blk_coord_b = self.logical_block_coord(problem_shape[0])
         mma_compute_dKdV_pipeline, mma_compute_dKdV_consumer_state = pipeline_args
 
         load_op = cute.make_copy_atom(

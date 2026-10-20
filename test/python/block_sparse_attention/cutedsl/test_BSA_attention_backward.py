@@ -198,6 +198,9 @@ def test_bsa_attention_backward_sm100_blk64(
 
     BSA = _import_bsa()
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    if variable_counts:
+        # Keep this small case on the paired-KV path, whose shared dK/dV needs the FP32 workspace.
+        monkeypatch.setattr(interface, "_SM100_BLK64_PAIRED_KV_MIN_KV_TASKS", 0)
     workspace_modes = []
     allocate_workspace = interface._empty_bwd_workspace_with_zeroed_accum
 

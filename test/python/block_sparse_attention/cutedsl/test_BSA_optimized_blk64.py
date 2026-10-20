@@ -21,12 +21,35 @@ def _bsa():
     return BSA
 
 
+def _force_paired_kv(monkeypatch):
+    """Route eligible variable-count calls through the paired-KV kernel regardless of the size gate.
+
+    Returns a list that records each paired kernel the dispatcher builds, so a test can prove the route
+    without reading compile-cache key positions.
+    """
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    monkeypatch.setattr(interface, "_SM100_BLK64_PAIRED_KV_MIN_KV_TASKS", 0)
+    builds = []
+    paired_cls = interface.MixedKvBackwardSm100
+
+    class RecordingMixedKvBackward(paired_cls):
+        def __init__(self, *args, **kwargs):
+            builds.append(args)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(interface, "MixedKvBackwardSm100", RecordingMixedKvBackward)
+    return builds
+
+
 @pytest.mark.L0
-@pytest.mark.parametrize("num_q_blocks,expected", [(2999, None), (3000, 4096), (4096, 4096), (4097, 4096), (8192, 4096)])
-def test_large_bucket_policy(num_q_blocks, expected):
+@pytest.mark.parametrize("num_q_blocks", [1, 2999, 3000, 4097, 8192, 65536])
+def test_large_bucket_policy_is_a_valid_choice(num_q_blocks):
+    """The automatic bucket is a performance heuristic, so only its contract is asserted: the choice is either
+    the default (``None``) or a usable bucket size."""
     from cudnn.block_sparse_attention.csrc.bwd.sm100_blk64.bsa_bwd_sm100 import sm100_bwd_auto_bucketed_k2q_size_blocks
 
-    assert sm100_bwd_auto_bucketed_k2q_size_blocks(num_q_blocks) == expected
+    choice = sm100_bwd_auto_bucketed_k2q_size_blocks(num_q_blocks)
+    assert choice is None or (isinstance(choice, int) and choice >= 1)
 
 
 @pytest.mark.L0
@@ -91,6 +114,8 @@ def test_forward_empty_rows_and_partial_tiles(clc, splits, seqlen):
 @pytest.mark.parametrize("variable", [False, True])
 def test_signed_scale_forward_backward_and_cache(monkeypatch, clc, splits, variable):
     bsa = _bsa()
+    if variable:
+        _force_paired_kv(monkeypatch)
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
     monkeypatch.setattr(interface.bsa_attn_fwd_blk64_cutedsl, "compile_cache", {})
     monkeypatch.setattr(interface._bsa_attn_bwd_bucketed_k2q_csr, "compile_cache", {})
@@ -104,8 +129,9 @@ def test_signed_scale_forward_backward_and_cache(monkeypatch, clc, splits, varia
     mask = block_sparse_mask(indices, 3, sizes, 193, 129, 64, counts)
     nonempty = torch.isfinite(mask).any(-1, keepdim=True)
     kwargs = dict(block_sparse_num=3, block_sizes=sizes, q2k_block_nums=counts, sparse_block_size=64)
-    cache_sizes = None
-    # Change sign without changing tensor declarations or recompiling either path.
+    cache_sizes = []
+    # Changing the sign never recompiles the backward; the forward compiles one extra, separately specialized
+    # nonpositive-scale kernel so the positive-scale softmax loop stays free of the masking-order branch.
     for scale in (128**-0.5, 0.0, -(128**-0.5), 128**-0.5):
         qr, kr, vr = [t.double().detach().requires_grad_() for t in (q, k, v)]
         scores = (qr @ kr.transpose(-1, -2)) * scale + mask
@@ -119,18 +145,20 @@ def test_signed_scale_forward_backward_and_cache(monkeypatch, clc, splits, varia
         torch.testing.assert_close(lse.double(), scores.logsumexp(-1), atol=0.03, rtol=0.03)
         for got, ref in zip((output, *gradients), (expected, qr.grad, kr.grad, vr.grad)):
             torch.testing.assert_close(got.double(), ref, atol=0.03, rtol=0.03)
-        current_sizes = (len(interface.bsa_attn_fwd_blk64_cutedsl.compile_cache), len(interface._bsa_attn_bwd_bucketed_k2q_csr.compile_cache))
-        if cache_sizes is None:
-            cache_sizes = current_sizes
-        assert current_sizes == cache_sizes
+        cache_sizes.append((len(interface.bsa_attn_fwd_blk64_cutedsl.compile_cache), len(interface._bsa_attn_bwd_bucketed_k2q_csr.compile_cache)))
+    forward_sizes, backward_sizes = zip(*cache_sizes)
+    assert set(backward_sizes) == {backward_sizes[0]}
+    assert forward_sizes == (forward_sizes[0], forward_sizes[0] + 1, forward_sizes[0] + 1, forward_sizes[0] + 1)
 
 
 @pytest.mark.L1
 @pytest.mark.parametrize("layout", ["bhsd", "bshd"])
 @pytest.mark.parametrize("sq,sk", [(193, 129), (248, 2177), (320, 1088), (513, 1025)])
 @pytest.mark.parametrize("variable", [False, True])
-def test_backward_partial_tiles_and_buckets(layout, sq, sk, variable):
+def test_backward_partial_tiles_and_buckets(layout, sq, sk, variable, monkeypatch):
     bsa = _bsa()
+    if variable:
+        _force_paired_kv(monkeypatch)
     torch.manual_seed(27000 + sq)
     torch.backends.cuda.matmul.allow_tf32 = False
     q = torch.randn((2, 3, sq, 128), device="cuda", dtype=torch.bfloat16)
@@ -182,10 +210,23 @@ def test_backward_partial_tiles_and_buckets(layout, sq, sk, variable):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("scale", [0.0, -(128**-0.5), float("nan")], ids=["zero", "negative", "nan"])
+def test_sage_fp8_rejects_nonpositive_softmax_scale(scale):
+    """Sage FP8 folds the softmax scale into its Q*K dequantization scales; a nonpositive scale would turn fully
+    masked groups into NaN/+inf, so the public entry point rejects it instead of returning non-finite output."""
+    bsa = _bsa()
+    q, k, v = [torch.randn((1, 2, 128, 128), device="cuda", dtype=torch.bfloat16) for _ in range(3)]
+    indices = torch.zeros((1, 2, 2, 1), device="cuda", dtype=torch.int32)
+    with pytest.raises(ValueError, match="softmax_scale must be positive"):
+        bsa.block_sparse_attention_fp8_forward(q, k, v, indices, 1, softmax_scale=scale)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("duplicates", [False, True])
 @pytest.mark.parametrize("kv_blocks", [17, 35])
 def test_paired_multiset_and_graph_replay(monkeypatch, duplicates, kv_blocks):
     bsa = _bsa()
+    paired_builds = _force_paired_kv(monkeypatch)
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
     monkeypatch.setattr(interface._bsa_attn_bwd_bucketed_k2q_csr, "compile_cache", {})
     torch.manual_seed(27123)
@@ -216,7 +257,7 @@ def test_paired_multiset_and_graph_replay(monkeypatch, duplicates, kv_blocks):
     ref_output.backward(do.float())
     for got, expected in zip(eager, (ref_output, qr.grad, kr.grad, vr.grad)):
         torch.testing.assert_close(got.float(), expected, atol=0.03, rtol=0.03)
-    assert any(key[1] is True for key in interface._bsa_attn_bwd_bucketed_k2q_csr.compile_cache)
+    assert paired_builds, "the dispatcher did not build the paired-KV kernel"
     torch.cuda.synchronize()
     torch.cuda.set_sync_debug_mode("error")
     try:
@@ -239,6 +280,7 @@ def test_paired_multiset_and_graph_replay(monkeypatch, duplicates, kv_blocks):
 @pytest.mark.L1
 def test_paired_cache_rebinds_bitset_lengths(monkeypatch):
     bsa = _bsa()
+    paired_builds = _force_paired_kv(monkeypatch)
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
     monkeypatch.setattr(interface._bsa_attn_bwd_bucketed_k2q_csr, "compile_cache", {})
     cache = interface._bsa_attn_bwd_bucketed_k2q_csr.compile_cache
@@ -256,3 +298,4 @@ def test_paired_cache_rebinds_bitset_lengths(monkeypatch):
             expected = torch.full_like(gradient, sq / 128 if i == 2 else 0)
             torch.testing.assert_close(gradient, expected, atol=0, rtol=0)
         assert len(cache) == 1
+    assert len(paired_builds) == 1

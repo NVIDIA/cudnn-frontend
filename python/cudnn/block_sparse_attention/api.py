@@ -324,6 +324,10 @@ def block_sparse_attention_fp8_forward(
 ) -> TupleDict:
     """Run Sage FP8 BSA; SM120 additionally supports native sparse_block_size=128."""
     batch, heads, seqlen_q, seqlen_k = _validate_sage_inputs(q_tensor, k_tensor, v_tensor)
+    # Sage FP8 folds the softmax scale into its per-group Q*K dequantization scales, so a zero or negative scale turns
+    # a fully masked group's -inf maximum into NaN/+inf. NaN is rejected as well.
+    if softmax_scale is not None and not softmax_scale > 0.0:
+        raise ValueError(f"Sage FP8 softmax_scale must be positive, got {softmax_scale}")
     arch = _device_arch(q_tensor)
     arch_family = arch // 10
     if arch_family not in {10, 11, 12}:
