@@ -255,21 +255,41 @@ update a fixed accumulation order. Stream ordering serializes slot reuse
 between waves, and fixed-order reductions produce `dKV` and `d_sink`. Both
 specializations keep the public workspace capacity of 128 FP32 dKV planes.
 
-Other deterministic envelopes with H16/H32/H64/H96/H128 keep the bounded-wave
-M64 implementation. It selects 32 dKV shards for `total_S_q <= 128`, 64 for
-`129..256`, and 128 for larger query batches. Queries run in same-stream waves
-with one CTA per shard; CTA lane `i` is the sole writer of FP32 dKV shard `i`
-in each wave. H16/H32 use a masked M64 head tile. H96/H128 split each query
-wave into ordered M64 head-block launches, preserving single-writer ownership
-without multiplying the number of shards. Kernel launch ordering serializes
-both head blocks and shard reuse across waves, so the protocol needs neither
-semaphores nor cooperative launch. The 32-shard specialization converts with
-one fixed-order reduction; the 64- and 128-shard specializations first fold
-groups of eight and then combine those groups in fixed order. One CTA per head
-reduces `d_sink`. The additional dKV workspace is
-`selected_shards * round_up(total_S_kv, 8) * round_up(D, 8) * sizeof(float)`
-bytes. Use `scratch_workspace_bytes()` as the authoritative full scratch size;
-a larger reusable workspace remains valid.
+Other deterministic envelopes with H16/H32/H64/H96/H128 use the bounded-wave
+M64 implementation. Ordinary extents select 32 dKV shards for
+`total_S_q <= 128`, 64 for `129..256`, and 128 for larger query batches.
+Queries run in same-stream waves with one CTA per shard; CTA lane `i` is the
+sole writer of FP32 dKV shard `i` in each wave. H16/H32 use a masked M64 head
+tile. H96/H128 split each query wave into ordered M64 head-block launches,
+preserving single-writer ownership without multiplying the number of shards.
+Kernel launch ordering serializes both head blocks and shard reuse across
+waves. The 32-shard specialization converts with one fixed-order reduction;
+the 64- and 128-shard specializations first fold groups of eight and then
+combine those groups in fixed order.
+
+If the selected bounded-wave layout would exceed 16 GiB, the generic M64 plan
+keeps each query wave at 128 CTAs and assigns one FP32 dKV plane to each
+cluster. Queries below 8192 rows use sixteen eight-CTA clusters; longer queries
+use thirty-two four-CTA clusters for additional reducer parallelism while
+remaining far below the ordinary 128-plane workspace. A setup kernel builds
+packed 8-bit or 4-bit rank masks for every
+`(query wave, head block, KV row)`. Reducer threads wait only for lower cluster
+ranks that actually update the same KV row, then publish that row with
+GPU-scope release/acquire ordering. Disjoint sparse rows continue in parallel;
+the fixed rank order handles both low- and high-overlap top-k rows without a
+global semaphore dependency on non-resident CTAs. The selected planes are
+folded in a fixed order. Duplicate top-k indices within one query row remain
+outside the deterministic contract, as in the bounded-wave path.
+
+For the ordinary policy, additional dKV workspace is
+`selected_shards * K8 * D8 * sizeof(float)`, where
+`K8 = round_up(total_S_kv, 8)` and `D8 = round_up(D, 8)`. The cluster relay
+uses `relay_planes * (K8 + mask_rows) * D8 * sizeof(float)`, where
+`relay_planes` is 16 or 32, `relay_width` is 8 or 4, and
+`mask_rows = ceil(ceil(total_S_q / 128) * ceil(H / 64) *
+(K8 / (32 / relay_width)) / D8)`.
+One CTA per head reduces `d_sink`. Use `scratch_workspace_bytes()` as the
+authoritative full scratch size; a larger reusable workspace remains valid.
 Treat this as a reproducibility requirement rather than a performance-tuning
 knob: keep the default `False` when bitwise run-to-run stability is not needed.
 

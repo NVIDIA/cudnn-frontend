@@ -315,8 +315,15 @@ class SparseAttentionBackward(APIBase):
         if self.deterministic:
             total_s_q, num_heads, head_dim = self.q_desc.shape
             head_dim_v = self.out_desc.shape[2]
-            kernel_cls = _iface_sm100._get_sm100_kernel_class(self._backend, True, total_s_q)
+            kernel_cls = _iface_sm100._get_sm100_kernel_class(
+                self._backend,
+                True,
+                total_s_q,
+                self.kv_desc.shape[0],
+                head_dim,
+            )
             shards = kernel_cls.num_dkv_shards
+            relay_cluster_size = getattr(kernel_cls, "dkv_relay_cluster_size", 1)
             with torch.cuda.device(self.q_desc.device):
                 self._compiled_kernel = _iface_sm100._compile_deterministic_sm100(
                     self.q_desc.device.index,
@@ -329,6 +336,7 @@ class SparseAttentionBackward(APIBase):
                     self.topk_idxs_desc.shape[1],
                     self.topk_length_desc is not None,
                     shards,
+                    relay_cluster_size,
                     self._wide_addressing,
                 )
             return
@@ -356,10 +364,12 @@ class SparseAttentionBackward(APIBase):
         """Return the minimum reusable per-execution workspace in bytes.
 
         Generic deterministic SM100 plans include a query-dependent 32-, 64-,
-        or 128-plane FP32 dKV accumulator. Deterministic H96/H128 D576 two-CTA
-        plans use the compact 96-plane capacity. The returned size is
-        authoritative for this plan; ``execute()`` accepts a larger contiguous
-        uint8 buffer on the plan device but never allocates one.
+        or 128-plane FP32 dKV accumulator. Large-context plans that would
+        exceed 16 GiB instead use 16 or 32 planes plus packed row-relay masks.
+        Deterministic H96/H128 D576 two-CTA plans use the compact 96-plane
+        capacity. The returned size is authoritative for this plan;
+        ``execute()`` accepts a larger contiguous uint8 buffer on the plan
+        device but never allocates one.
         """
         self._ensure_support_checked()
         major, _ = device_capability(self.q_desc.device)

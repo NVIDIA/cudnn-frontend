@@ -33,6 +33,7 @@ class FlashAttentionDSABackwardSm100:
     bwd_num_heads = 0
     workspace_num_heads = 0
     paired_q_view = False
+    dkv_cluster_shape = (1, 1, 1)
 
     def __init__(
         self,
@@ -319,6 +320,45 @@ class FlashAttentionDSABackwardSm100:
         return mdKV_acc
 
     @cute.jit
+    def prepare_dKV_relay(
+        self,
+        mdKV_acc: cute.Tensor,
+        mTopkIdxs: cute.Tensor,
+        mTopkLength: Optional[cute.Tensor],
+        problem_shape: Tuple[Int32, Int32, Int32, Tuple[Int32, Int32]],
+        stream: cuda.CUstream,
+    ):
+        """Prepare optional deterministic relay metadata."""
+
+    @cute.jit
+    def acquire_dKV_tile_relay(
+        self,
+        mdKV_acc: cute.Tensor,
+        mTopkIdxs: cute.Tensor,
+        max_seqlen_kv: Int32,
+        tile_index: Int32,
+        topk: Int32,
+        token_idx: Int32,
+        head_block_idx: Int32,
+        problem_shape: Tuple[Int32, Int32, Int32, Tuple[Int32, Int32]],
+    ):
+        """Acquire ordered ownership for one sparse dKV tile."""
+
+    @cute.jit
+    def release_dKV_tile_relay(
+        self,
+        mdKV_acc: cute.Tensor,
+        mTopkIdxs: cute.Tensor,
+        max_seqlen_kv: Int32,
+        tile_index: Int32,
+        topk: Int32,
+        token_idx: Int32,
+        head_block_idx: Int32,
+        problem_shape: Tuple[Int32, Int32, Int32, Tuple[Int32, Int32]],
+    ):
+        """Publish all dKV updates issued for one sparse tile."""
+
+    @cute.jit
     def finalize_dKV(
         self,
         mdKV_acc: cute.Tensor,
@@ -599,6 +639,7 @@ class FlashAttentionDSABackwardSm100:
         )
         if cutlass.const_expr(self.initialize_dkv):
             self.initialize_dKV_workspace(mdKV_acc, mKV.shape[0], stream)
+        self.prepare_dKV_relay(mdKV_acc, mTopkIdxs, mTopkLength, problem_shape, stream)
 
         # ============ Sum OdO ============
         sum_OdO_scale = Float32(-1.0)
@@ -702,7 +743,7 @@ class FlashAttentionDSABackwardSm100:
                 ).launch(
                     grid=(q_wave_size, head_blocks_per_launch, bwd_problem_shape[3][1]),
                     block=[self.threads_per_cta, 1, 1],
-                    cluster=[1, 1, 1],
+                    cluster=self.dkv_cluster_shape,
                     smem=self.shared_storage.size_in_bytes(),
                     stream=stream,
                     min_blocks_per_mp=1,
@@ -1233,6 +1274,8 @@ class FlashAttentionDSABackwardSm100:
                 tile_count,
                 topk,
                 token_idx,
+                head_block_idx,
+                problem_shape,
                 mma_reduce_dKV_pipeline,
             )
             # All T2R reads issued by this warp are complete here (each T2R
@@ -2302,6 +2345,8 @@ class FlashAttentionDSABackwardSm100:
         tile_count: Int32,
         topk: Int32,
         token_idx: Int32,
+        head_block_idx: Int32,
+        problem_shape: Tuple[Int32, Int32, Int32, Tuple[Int32, Int32]],
         mma_reduce_dKV_pipeline,
     ):
         """Reduce dKV MMA fragments into the selected global accumulator."""
@@ -2314,7 +2359,8 @@ class FlashAttentionDSABackwardSm100:
         wg_idx = tidx_in_wg // (4 * self.threads_per_warp)
 
         num_warp_groups = self.num_reduce_warps // 4
-        mdKV_acc = self.select_dKV_accumulator(mdKV_acc, max_seqlen_kv, token_idx)
+        mdKV_acc_full = mdKV_acc
+        mdKV_acc = self.select_dKV_accumulator(mdKV_acc_full, max_seqlen_kv, token_idx)
 
         tdKVtdKV0 = tdKVtdKV0[(None, None), 0, 0]
         tdKVtdKV1 = tdKVtdKV1[(None, None), 0, 0]
@@ -2354,6 +2400,17 @@ class FlashAttentionDSABackwardSm100:
                         rTopkIdx[i] = topk_idx if topk_idx >= 0 and topk_idx < max_seqlen_kv else Int32(-1)
                     else:
                         rTopkIdx[i] = Int32(-1)
+
+            self.acquire_dKV_tile_relay(
+                mdKV_acc_full,
+                mTopkIdxs,
+                max_seqlen_kv,
+                tile_index,
+                topk,
+                token_idx,
+                head_block_idx,
+                problem_shape,
+            )
 
             mma_reduce_dKV_pipeline.consumer_wait(mma_reduce_dKV_consumer_state)
 
@@ -2422,6 +2479,17 @@ class FlashAttentionDSABackwardSm100:
             if cutlass.const_expr(self.same_hdim_kv):
                 mma_reduce_dKV_pipeline.consumer_release(mma_reduce_dKV_consumer_state)
                 mma_reduce_dKV_consumer_state.advance()
+
+            self.release_dKV_tile_relay(
+                mdKV_acc_full,
+                mTopkIdxs,
+                max_seqlen_kv,
+                tile_index,
+                topk,
+                token_idx,
+                head_block_idx,
+                problem_shape,
+            )
 
             tile_index -= 1
 
