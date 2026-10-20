@@ -2382,6 +2382,12 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
                     next_kv_1 = Int32(-1)
                     if score_iter == Int32(0):
                         self.gather_barrier.arrive_and_wait()
+                    if cutlass.const_expr(self.num_heads == 96 and not self.deterministic):
+                        if score_iter != my_tile_count - Int32(1):
+                            # The next index slot was completed by the
+                            # prologue or the preceding iteration. Warm its
+                            # KV rows while the current tile is still active.
+                            self._prefetch_kv_rows_l2(mKV, staged_indices[None, next_index_slot], walk_base + walk_step * next_score_iter, topk, rank, tidx)
                     if is_dq_owner:
                         if cutlass.const_expr(self.max_topk == 128):
                             pipe_kscore.producer_acquire(gather_state)
@@ -2458,7 +2464,8 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
                         cute.arch.cp_async_wait_group(0)
                         cute.arch.fence_view_async_shared()
                     if score_iter != my_tile_count - Int32(1):
-                        self._prefetch_kv_rows_l2(mKV, staged_indices[None, next_index_slot], walk_base + walk_step * next_score_iter, topk, rank, tidx)
+                        if cutlass.const_expr(self.num_heads != 96 or self.deterministic):
+                            self._prefetch_kv_rows_l2(mKV, staged_indices[None, next_index_slot], walk_base + walk_step * next_score_iter, topk, rank, tidx)
                         if cutlass.const_expr(split_regime):
                             self.gather_barrier.arrive_and_wait()
                         next_iter = score_iter + Int32(1)
