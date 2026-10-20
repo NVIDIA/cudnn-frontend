@@ -5,7 +5,16 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cuda_runtime_api.h>
+
 #include <cudnn_frontend.h>
+
+#include <cstdint>
+#include <functional>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace {
 namespace fe = cudnn_frontend;
@@ -69,6 +78,10 @@ struct InspectableGraph : fe::graph::Graph {
     bool
     is_built(size_t i) const {
         return plans.execution_plans.at(i) != nullptr;
+    }
+    std::vector<fe::graph::Tensor_attributes::uid_t>
+    backend_variant_pack_uids() const {
+        return {variant_pack_uids.begin(), variant_pack_uids.end()};
     }
 };
 
@@ -146,4 +159,62 @@ TEST_CASE("An unbuilt OSS candidate cannot make build-all succeed", "[graph][pla
     REQUIRE(plans.build_oss_rms_norm_silu_engine().is_bad());
     REQUIRE(plans.build_plans(fe::BuildPlanPolicy_t::ALL, false).is_bad());
     REQUIRE(plans.candidate == -1);
+}
+
+// A frontend engine's sentinel candidate is not an index into the backend plans, so all four native CUDA graph entry
+// points must refuse it before recording anything. The direct pair used to fall through to execution_plans[candidate]
+// once every uid was bound. The stub stands in for the OSS RmsNorm+SiLU engine, so this needs no particular GPU.
+TEST_CASE("Native CUDA graph APIs refuse a selected frontend engine", "[graph][plan_selection][cuda_graph]") {
+    Handle handle;
+    auto graph = make_matmul_graph(handle.value);
+    REQUIRE(graph->create_execution_plans({fe::HeurMode_t::A}).is_good());
+    graph->register_oss_engine(true);
+    REQUIRE(graph->build_plans(fe::BuildPlanPolicy_t::ALL).is_good());
+    REQUIRE(graph->selected_index() == fe::graph::Execution_plan_list::OSS_RMS_NORM_SILU_ENGINE_CANDIDATE);
+
+    // Bind every uid the backend plans take, so a missing binding cannot be what rejects the call.
+    std::vector<void*> buffers;
+    std::unordered_map<fe::graph::Tensor_attributes::uid_t, void*> bindings;
+    auto const uids = graph->backend_variant_pack_uids();
+    REQUIRE_FALSE(uids.empty());
+    for (auto uid : uids) {
+        void* ptr = nullptr;
+        REQUIRE(cudaMalloc(&ptr, 64 * 64 * sizeof(uint16_t)) == cudaSuccess);
+        buffers.push_back(ptr);
+        bindings[uid] = ptr;
+    }
+    int64_t workspace_size = 0;
+    REQUIRE(graph->get_workspace_size(workspace_size).is_good());
+    void* workspace = nullptr;
+    REQUIRE(cudaMalloc(&workspace, workspace_size > 0 ? workspace_size : 1) == cudaSuccess);
+    buffers.push_back(workspace);
+
+    using EntryPoint = std::function<fe::error_t(cudaGraph_t)>;
+    std::vector<std::pair<std::string, EntryPoint>> const entry_points{
+        {"populate_cuda_graph",
+         [&](cudaGraph_t g) { return graph->populate_cuda_graph(handle.value, bindings, workspace, g); }},
+        {"update_cuda_graph",
+         [&](cudaGraph_t g) { return graph->update_cuda_graph(handle.value, bindings, workspace, g); }},
+        {"populate_cuda_graph_direct",
+         [&](cudaGraph_t g) { return graph->populate_cuda_graph_direct(handle.value, bindings, workspace, g); }},
+        {"update_cuda_graph_direct",
+         [&](cudaGraph_t g) { return graph->update_cuda_graph_direct(handle.value, bindings, workspace, g); }},
+    };
+    for (auto const& [name, call] : entry_points) {
+        INFO(name);
+        cudaGraph_t cuda_graph = nullptr;
+        REQUIRE(cudaGraphCreate(&cuda_graph, 0) == cudaSuccess);
+        auto status = call(cuda_graph);
+        INFO(status.get_message());
+        CHECK(status.get_code() == fe::error_code_t::GRAPH_NOT_SUPPORTED);
+        CHECK(status.get_message().find("not backed by a cuDNN execution plan") != std::string::npos);
+        size_t num_nodes = 1;
+        REQUIRE(cudaGraphGetNodes(cuda_graph, nullptr, &num_nodes) == cudaSuccess);
+        CHECK(num_nodes == 0);
+        REQUIRE(cudaGraphDestroy(cuda_graph) == cudaSuccess);
+    }
+
+    for (void* ptr : buffers) {
+        cudaFree(ptr);
+    }
 }
