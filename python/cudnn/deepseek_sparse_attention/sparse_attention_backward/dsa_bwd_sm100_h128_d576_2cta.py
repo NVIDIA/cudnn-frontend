@@ -553,6 +553,8 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
         self.block_tile = block_tile
         self.max_topk = max_topk
         self.SINGLE_QUERY = single_query
+        # Hot paths short-circuit their head guards on the full tile so the
+        # H96 tail predicate is absent from generated H128 code.
         self.num_heads = num_heads
         self.round_head_chunks = num_heads // self.ROUND_K_HEADS
         assert self.H_TILE_CLUSTER % self.ROUND_K_HEADS == 0
@@ -763,7 +765,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
                 logical_coordinate = rank_coordinates[coordinate]
                 d_in_round = Int32(cute.get(logical_coordinate, mode=[0]))
                 head = Int32(cute.get(logical_coordinate, mode=[1]))
-                if head < Int32(self.num_heads):
+                if cutlass.const_expr(self.num_heads == self.H_TILE_CLUSTER) or head < Int32(self.num_heads):
                     mdQ[Int32(round_index * self.D_TILE_CLUSTER) + d_in_round, head, (token_idx, batch_idx)] = self.element_dtype(0.0)
                 linear_index += Int32(self.MATH_THREADS_PER_CTA)
 
@@ -963,7 +965,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
             row = row_base + lane
             head = rank * Int32(self.H_TILE_CTA) + row
             neg_lse_log2 = neg_inf
-            if head < Int32(self.num_heads):
+            if cutlass.const_expr(self.num_heads == self.H_TILE_CLUSTER) or head < Int32(self.num_heads):
                 lse_value = Float32(mLSE[head, (token_idx, batch_idx)])
                 sink_value = Float32(mAttnSink[head, (0, batch_idx)])
                 lse_log2 = lse_value * log2_e
@@ -1336,7 +1338,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
                             adjacent_coordinate = chunk_coordinates[value_index + adjacent_offset]
                             adjacent_d = Int32(round_index * self.D_TILE_CLUSTER) + Int32(cute.get(adjacent_coordinate, mode=[0]))
                             contiguous = contiguous and Int32(cute.get(adjacent_coordinate, mode=[1])) == head and (adjacent_d == global_d + adjacent_offset)
-                        if contiguous and head < Int32(self.num_heads):
+                        if contiguous and (cutlass.const_expr(self.num_heads == self.H_TILE_CLUSTER) or head < Int32(self.num_heads)):
                             packed_base = value_index // self.DQ_CONVERSION_PAIR_VALUES
                             destination = mdQ_direct.iterator + mdQ_direct.layout((global_d, head, (token_idx, batch_idx)))
                             _dq_store_bf16x8_streaming(
@@ -1352,7 +1354,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
                                 scalar_coordinate = chunk_coordinates[scalar_index]
                                 scalar_d = Int32(round_index * self.D_TILE_CLUSTER) + Int32(cute.get(scalar_coordinate, mode=[0]))
                                 scalar_head = Int32(cute.get(scalar_coordinate, mode=[1]))
-                                if scalar_head < Int32(self.num_heads):
+                                if cutlass.const_expr(self.num_heads == self.H_TILE_CLUSTER) or scalar_head < Int32(self.num_heads):
                                     mdQ_direct[scalar_d, scalar_head, (token_idx, batch_idx)] = converted_values[scalar_index]
 
     @cute.jit
@@ -1528,7 +1530,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
                 chunk_in_block = flat_thread // Int32(self.DSINK_THREADS)
                 q_block_idx = (seq_block_idx - convert_blocks) * Int32(chunks_per_block) + chunk_in_block
                 q_idx = q_block_idx * Int32(self.DSINK_BLOCK_Q)
-                if q_idx < total_q and head_idx < Int32(self.num_heads):
+                if q_idx < total_q and (cutlass.const_expr(self.num_heads == self.H_TILE_CLUSTER) or head_idx < Int32(self.num_heads)):
                     q_end = min(total_q, (q_block_idx + Int32(1)) * Int32(self.DSINK_BLOCK_Q))
                     sink_log2 = Float32(attn_sink[head_idx, (0, batch_idx)]) * Float32(math.log2(math.e))
                     acc_0 = Float32(0.0)
@@ -1665,7 +1667,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
         row = row_base + lane // Int32(4)
         group_lane = lane % Int32(4)
         head = rank * Int32(self.H_TILE_CTA) + row
-        if head < Int32(self.num_heads):
+        if cutlass.const_expr(self.num_heads == self.H_TILE_CLUSTER) or head < Int32(self.num_heads):
             for chunk in cutlass.range_constexpr(2):
                 dim = (group_lane + Int32(4 * chunk)) * Int32(64)
                 source = mOut.iterator + mOut.layout((head, dim, (token_idx, batch_idx)))
@@ -1688,14 +1690,14 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
             row = row_base + Int32(slot)
             head = rank * Int32(self.H_TILE_CTA) + row
             out_bits[slot] = zero_bits
-            if head < Int32(self.num_heads):
+            if cutlass.const_expr(self.num_heads == self.H_TILE_CLUSTER) or head < Int32(self.num_heads):
                 out_pointer = mOut.iterator + mOut.layout((head, dim, (token_idx, batch_idx)))
                 out_bits[slot] = _load_bf16x16(out_pointer)
         for slot in cutlass.range_constexpr(4):
             row = row_base + Int32(slot)
             head = rank * Int32(self.H_TILE_CTA) + row
             dout_bits[slot] = zero_bits
-            if head < Int32(self.num_heads):
+            if cutlass.const_expr(self.num_heads == self.H_TILE_CLUSTER) or head < Int32(self.num_heads):
                 dout_pointer = mdO.iterator + mdO.layout((head, dim, (token_idx, batch_idx)))
                 dout_bits[slot] = _load_bf16x16(dout_pointer)
         for slot in cutlass.range_constexpr(4):
@@ -1706,7 +1708,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
             refill_head = rank * Int32(self.H_TILE_CTA) + refill_row
             out_bits[slot] = zero_bits
             dout_bits[slot] = zero_bits
-            if refill_head < Int32(self.num_heads):
+            if cutlass.const_expr(self.num_heads == self.H_TILE_CLUSTER) or refill_head < Int32(self.num_heads):
                 out_pointer = mOut.iterator + mOut.layout((refill_head, dim, (token_idx, batch_idx)))
                 dout_pointer = mdO.iterator + mdO.layout((refill_head, dim, (token_idx, batch_idx)))
                 out_bits[slot] = _load_bf16x16(out_pointer)
@@ -1760,7 +1762,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
             logical_old_lane = group_lane + Int32(4 * chunk)
             dim = logical_old_lane * Int32(16)
             out_prefetch[chunk] = zero_bits
-            if head < Int32(self.num_heads):
+            if cutlass.const_expr(self.num_heads == self.H_TILE_CLUSTER) or head < Int32(self.num_heads):
                 out_pointer = mOut.iterator + mOut.layout((head, dim, (token_idx, batch_idx)))
                 out_prefetch[chunk] = _load_bf16x16(out_pointer)
         cute.arch.mbarrier_wait(stationary_tma_mbars + 1, Int32(0))
@@ -1773,7 +1775,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
             logical_old_lane = group_lane + Int32(4 * chunk)
             dim = logical_old_lane * Int32(16)
             out_bits = zero_bits
-            if head < Int32(self.num_heads):
+            if cutlass.const_expr(self.num_heads == self.H_TILE_CLUSTER) or head < Int32(self.num_heads):
                 out_pointer = mOut.iterator + mOut.layout((head, dim, (token_idx, batch_idx)))
                 out_bits = _load_bf16x16(out_pointer)
             dout_bits = self._load_stationary_do_bf16x16(stationary_do_physical, row, dim)
@@ -1800,7 +1802,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
         if reducer_tidx < Int32(self.H_TILE_CTA):
             row = reducer_tidx
             head = rank * Int32(self.H_TILE_CTA) + row
-            if head < Int32(self.num_heads):
+            if cutlass.const_expr(self.num_heads == self.H_TILE_CLUSTER) or head < Int32(self.num_heads):
                 if cutlass.const_expr(self.SINGLE_QUERY):
                     sink_log2 = Float32(attn_sink[head, (0, batch_idx)]) * Float32(math.log2(math.e))
                     p_sink = cute.math.exp2(sink_log2 + softmax_stats[row, 0])
@@ -3584,7 +3586,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
             head = rank * Int32(self.H_TILE_CTA) + h_local
             destination_row = destination[h_local, None]
             destination_chunks = cute.flat_divide(destination_row, (8,))
-            if head < Int32(self.num_heads):
+            if cutlass.const_expr(self.num_heads == self.H_TILE_CLUSTER) or head < Int32(self.num_heads):
                 source_offset = mQ.iterator + mQ.layout((head, Int32(self.D_HEAD), (query, batch)))
                 source_row = cute.make_tensor(
                     cute.make_ptr(self.element_dtype, source_offset.llvm_ptr, cute.AddressSpace.gmem, assumed_align=16), cute.make_layout((self.D_TAIL,))
@@ -3949,7 +3951,12 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
                 d0 = Int32(cute.get(dqt_coordinates[i0], mode=[1]))
                 head1 = Int32(cute.get(dqt_coordinates[i1], mode=[0]))
                 d1 = Int32(cute.get(dqt_coordinates[i1], mode=[1]))
-                if head1 == head and d1 == d0 + Int32(1) and (d0 & Int32(1) == Int32(0)) and head < Int32(self.num_heads):
+                if (
+                    head1 == head
+                    and d1 == d0 + Int32(1)
+                    and (d0 & Int32(1) == Int32(0))
+                    and (cutlass.const_expr(self.num_heads == self.H_TILE_CLUSTER) or head < Int32(self.num_heads))
+                ):
                     packed = _dq_pack_bf16x2(r_dqt[i0], r_dqt[i1])
                     destination = cute.make_tensor(
                         cute.recast_ptr(dq.iterator + cute.crd2idx((Int32(self.D_HEAD) + d0, head, (query, batch)), dq.layout), dtype=cutlass.Uint32),
@@ -3957,9 +3964,9 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
                     )
                     destination[0] = packed
                 else:
-                    if head < Int32(self.num_heads):
+                    if cutlass.const_expr(self.num_heads == self.H_TILE_CLUSTER) or head < Int32(self.num_heads):
                         dq[Int32(self.D_HEAD) + d0, head, (query, batch)] = self.element_dtype(r_dqt[i0])
-                    if head1 < Int32(self.num_heads):
+                    if cutlass.const_expr(self.num_heads == self.H_TILE_CLUSTER) or head1 < Int32(self.num_heads):
                         dq[Int32(self.D_HEAD) + d1, head1, (query, batch)] = self.element_dtype(r_dqt[i1])
 
     @cute.jit
@@ -3969,7 +3976,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
             linear = tid + Int32(i * self.MATH_THREADS)
             h = rank * Int32(self.H_TILE_CTA) + linear // Int32(self.D_TAIL)
             d = Int32(self.D_HEAD) + linear % Int32(self.D_TAIL)
-            if h < Int32(self.num_heads):
+            if cutlass.const_expr(self.num_heads == self.H_TILE_CLUSTER) or h < Int32(self.num_heads):
                 dq[d, h, (query, batch)] = self.element_dtype(0.0)
 
 
@@ -4208,7 +4215,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic(TwoCTADeterminis
             if tidx < Int32(256):
                 head = physical_block * Int32(8) + tidx // Int32(32)
                 chain = tidx % Int32(32)
-                if head < Int32(self.num_heads):
+                if cutlass.const_expr(self.num_heads == self.H_TILE_CLUSTER) or head < Int32(self.num_heads):
                     sink_log2 = Float32(attn_sink[head, (0, 0)]) * Float32(math.log2(math.e))
                     acc = Float32(0.0)
                     q_idx = chain
