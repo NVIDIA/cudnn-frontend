@@ -488,47 +488,288 @@ def test_d128_template_fits_the_shared_sm90_prepared_host():
     assert reads <= set_attrs(d128), f"the prepared host reads kernel.{sorted(reads - set_attrs(d128))}, which the D128 template never sets"
 
 
-# --- Step 7 switch (TemplateParams.intra_wg_overlap) -------
+# --- D128 switches: step 7 (intra_wg_overlap) and step 8 (persistent) -------
+
+_SWITCHES = ("intra_wg_overlap", "persistent")
+_SWITCH_RECORDS = [dict(zip(_SWITCHES, values)) for values in itertools.product((False, True), repeat=len(_SWITCHES))]
 
 
-def test_step7_switch_fields_are_appended_last():
-    """The switch is appended after thd_origins, defaulting to False: every earlier specialization keeps its
-    defaults (the append-only rule the kit's hygiene check also enforces). The segment is pinned from its own first
-    field, so a field appended after it later still passes."""
+def _record(**over):
+    from cudnn.sdpa.fwd import config_sm90 as c
+
+    return dataclasses.replace(c.TemplateParams(), **over)
+
+
+def _admitted(fields):
+    """Whether validate_params(flavor=D128) admits the switch record ``fields`` (the rule itself, not a hand list)."""
+    from cudnn.sdpa.fwd import config_sm90 as c
+
+    try:
+        c.validate_params(_record(**fields), flavor=c.D128_FLAVOR)
+    except ValueError:
+        return False
+    return True
+
+
+def test_d128_switch_fields_are_appended_last():
+    """The step 7 switch, then the step 8 switch, are appended after thd_origins, each defaulting to False: every
+    earlier specialization keeps its defaults (the append-only rule the kit's hygiene check also enforces). The
+    segment is pinned from its own first field, so a field appended after it later still passes."""
     from cudnn.sdpa.fwd import config_sm90 as c
 
     fields = dataclasses.fields(c.TemplateParams)
     names = [f.name for f in fields]
     start = names.index("intra_wg_overlap")
     assert start > names.index("thd_origins"), names
-    expected = [("intra_wg_overlap", False, bool)]
+    expected = [("intra_wg_overlap", False, bool), ("persistent", False, bool)]
     assert [(f.name, f.default, type(f.default)) for f in fields[start : start + len(expected)]] == expected
 
 
-@pytest.mark.parametrize("over", [dict(intra_wg_overlap=True)], ids=["overlap"])
-def test_d512_refuses_the_step7_switches(over):
-    """The switch is a D128 template field: D512 refuses it, D128 takes it."""
+@pytest.mark.parametrize(
+    ("switch", "needs", "why"),
+    [
+        pytest.param("intra_wg_overlap", {}, "SM90 D512 has no intra-warpgroup overlap switch", id="overlap"),
+        pytest.param("persistent", dict(intra_wg_overlap=True), "SM90 D512 has no persistent switch", id="persistent"),
+    ],
+)
+def test_d512_refuses_the_d128_switches(switch, needs, why):
+    """Every switch is a D128 template field: D512 refuses it alone (the step 7 message keeps its spelling), and D128
+    takes it with the switch it requires."""
     from cudnn.sdpa.fwd import config_sm90 as c
 
-    params = dataclasses.replace(c.TemplateParams(), **over)
-    with pytest.raises(ValueError, match="SM90 D512 has no intra-warpgroup overlap switch"):
-        c.validate_params(params)
-    c.validate_params(params, flavor=c.D128_FLAVOR)
+    with pytest.raises(ValueError, match=f"^{why}"):
+        c.validate_params(_record(**{switch: True}))
+    c.validate_params(_record(**needs, **{switch: True}), flavor=c.D128_FLAVOR)
 
 
-def test_each_switch_combination_is_its_own_module_and_digest():
-    """The loader keys modules on (path, record) and folds repr(record) into the digest, so the two switch
-    values are two modules with two digests (two compile keys) in one process, with no hand-set digest
-    (python/cudnn/sdpa/AGENTS.md); the default record and a spelled-out False are one module."""
+def test_d128_persistent_refuses_a_record_without_overlap():
+    """Persistence rides the overlap loop (v1 stays the non-persistent reference). The template validates on import, so
+    loading such a record raises before a trace."""
     from cudnn.sdpa.fwd import config_sm90 as c
     from cudnn.sdpa.fwd.api_dsl import _load_kernel_template
 
-    mods = {}
-    for overlap in (False, True):
-        params = dataclasses.replace(c.TemplateParams(), intra_wg_overlap=overlap)
-        mod = _load_kernel_template("sm90/prefill_d128_f16.py", params, tag="switch_probe_sm90_d128")
-        assert mod.INTRA_WG_OVERLAP == overlap
-        mods[overlap] = mod
-    assert len({id(m) for m in mods.values()}) == 2
-    assert len({m.FROST_SOURCE_DIGEST for m in mods.values()}) == 2
-    assert _load_kernel_template("sm90/prefill_d128_f16.py", c.TemplateParams(), tag="switch_probe_sm90_d128") is mods[False]
+    why = "^SM90 D128 persistent requires intra_wg_overlap"
+    with pytest.raises(ValueError, match=why):
+        c.validate_params(_record(persistent=True), flavor=c.D128_FLAVOR)
+    with pytest.raises(ValueError, match=why):
+        _load_kernel_template("sm90/prefill_d128_f16.py", _record(persistent=True), tag="persistent_refusal_probe_sm90_d128")
+
+
+def test_each_switch_combination_is_its_own_module_and_digest():
+    """The loader keys modules on (path, record) and folds repr(record) into the digest, so the three switch records
+    validate_params admits (v1, ov and ov + persistent) are three modules with three digests (three compile keys) in one
+    process, with no hand-set digest (python/cudnn/sdpa/AGENTS.md); the default record and a spelled-out all-False one
+    are one module."""
+    from cudnn.sdpa.fwd import config_sm90 as c
+    from cudnn.sdpa.fwd.api_dsl import _load_kernel_template
+
+    admitted = [fields for fields in _SWITCH_RECORDS if _admitted(fields)]
+    assert len(admitted) == 3, admitted
+    mods = []
+    for fields in admitted:
+        mod = _load_kernel_template("sm90/prefill_d128_f16.py", _record(**fields), tag="switch_probe_sm90_d128")
+        assert {name: getattr(mod, name.upper()) for name in _SWITCHES} == fields
+        mods.append(mod)
+    assert len({id(m) for m in mods}) == len({m.FROST_SOURCE_DIGEST for m in mods}) == 3
+    assert _load_kernel_template("sm90/prefill_d128_f16.py", c.TemplateParams(), tag="switch_probe_sm90_d128") is mods[0]
+
+
+def test_d128_compile_takes_a_cta_count_exactly_when_persistent():
+    """compile()'s persistent_ctas is positive exactly when the record is persistent, checked before any trace: a
+    one-tile-per-CTA key never names a device, and a persistent artifact always has its grid cap."""
+    from cudnn.sdpa.fwd.api_dsl import _load_kernel_template
+
+    q, kv = (1048576, 128, 1024, 1), (262144, 128, 256, 1)
+    args = (2, 8, 2, 1024, 1024, q, kv, kv, q)
+
+    def load(**over):
+        return _load_kernel_template("sm90/prefill_d128_f16.py", _record(intra_wg_overlap=True, **over), tag="ctas_probe_sm90_d128")
+
+    why = "persistent_ctas must be positive exactly when the record is persistent"
+    for bad in (dict(persistent_ctas=132), dict(persistent_ctas=True), dict(persistent_ctas=-1)):
+        with pytest.raises(ValueError, match=why):
+            load().compile(*args, **bad)
+    for bad in ({}, dict(persistent_ctas=0), dict(persistent_ctas=True)):
+        with pytest.raises(ValueError, match=why):
+            load(persistent=True).compile(*args, **bad)
+
+
+def test_sm90_persistent_cta_count_is_the_sm_count_and_ignores_the_thd_overrides(monkeypatch):
+    """SdpaFwdDslSm90._persistent_ctas is the device's SM count (_device_sm_count, cached per device), and the THD grid
+    overrides FROST_THD_CTAS / FROST_THD_CTAS_PER_SM do not reach it (a forced THD count must neither resize nor re-key
+    a D128 grid). Host-only: the cache answers."""
+    import torch
+    from cudnn.sdpa.fwd import api_dsl
+
+    # Not 132 (an H100's count), so a hard-coded count cannot pass: only a read of the cached SM count returns 77.
+    monkeypatch.setattr(api_dsl, "_THD_SMS_CACHE", {0: 77})
+    monkeypatch.setattr(api_dsl, "_THD_CTAS_CACHE", {})
+    monkeypatch.setenv("FROST_THD_CTAS", "3")
+    monkeypatch.setenv("FROST_THD_CTAS_PER_SM", "2")
+    assert api_dsl.SdpaFwdDslSm90._persistent_ctas(None, torch.device("cuda", 0)) == 77
+
+
+# --- Step 8 persistent walk: the Q protocol and source pins (host-only, no trace) -------
+
+
+def _passes(completed, parity):
+    """An mbarrier wait at ``parity`` passes once the phase of that parity has completed: with ``completed`` phases done,
+    the phase in progress has parity completed & 1, so a wait passes iff its parity differs (a fresh barrier passes a
+    wait at parity 1 at once, the Bars docstring of prefill_d128_f16.py)."""
+    return (completed & 1) != parity
+
+
+def _q_phase_twin(n_items, rule):
+    """The persistent Q protocol of one CTA in plain Python, no GPU.
+
+    Q has one slot, which item n (from 0) fills for the n-th time. The producer's EMPTY wait for item n must block until
+    item n - 1 has released Q and pass once it has (the first item's passes at once); the consumers' FULL wait for item n
+    must block until Q(n) lands and pass once it has. ``rule`` picks the consumers' FULL parity: "state" carries a phase
+    flipped once per item (the kernel), "fixed" waits parity 0 every time (the one-tile kernel's literal phase, right for
+    the one Q per CTA it loads). Returns ``(bad_full, bad_empty, drain_ok)``: items whose FULL wait passes before their Q
+    lands or never passes, items whose EMPTY wait passes before the previous release or never passes, and whether the
+    producer's closing EMPTY wait blocks until the last release and passes after it."""
+    bad_full, bad_empty = [], []
+    p_phase, c_phase = 1, 0  # producer EMPTY from phase 1, consumers' FULL from phase 0 (the Bars docstring)
+    for n in range(n_items):
+        # EMPTY: n - 1 releases are in before item n - 1's own, n after it. FULL: n Q loads have landed before Q(n).
+        if (n > 0 and _passes(n - 1, p_phase)) or not _passes(n, p_phase):
+            bad_empty.append(n)
+        parity = c_phase if rule == "state" else 0
+        if _passes(n, parity) or not _passes(n + 1, parity):
+            bad_full.append(n)
+        p_phase ^= 1
+        c_phase ^= 1
+    drain_ok = not _passes(n_items - 1, p_phase) and _passes(n_items, p_phase)
+    return bad_full, bad_empty, drain_ok
+
+
+def test_q_phase_twin_flips_the_carried_phase_once_per_item():
+    """With one Q slot, a phase carried across items and flipped once per item never passes a Q FULL wait before its Q
+    lands and always passes it after, never passes a Q EMPTY wait before the previous item's release and always passes it
+    after, and the closing wait passes exactly once the last release is in, for 1 to 9 items per CTA. The one-tile
+    kernel's literal phase 0 passes every odd item's FULL wait at once, before its Q lands."""
+    for n_items in range(1, 10):
+        assert _q_phase_twin(n_items, "state") == ([], [], True), n_items
+    assert _q_phase_twin(6, "fixed")[0] == [1, 3, 5]
+
+
+def _kernel_ast():
+    import ast
+
+    from cudnn.sdpa.fwd import config_sm90 as c
+    from cudnn.sdpa.fwd.api_dsl import _load_kernel_template
+
+    mod = _load_kernel_template("sm90/prefill_d128_f16.py", c.TemplateParams(), tag="source_pin_sm90_d128")
+    with open(mod.__file__, encoding="utf-8") as f:
+        return ast.parse(f.read())
+
+
+def _parents(tree):
+    import ast
+
+    return {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+
+
+def _function(tree, name):
+    import ast
+
+    return next(f for f in ast.walk(tree) if isinstance(f, ast.FunctionDef) and f.name == name)
+
+
+def test_q_release_follows_the_one_release_rule():
+    """Q EMPTY is arrived at exactly the sites the one-release rule names: the one-tile-per-CTA epilogue, and under
+    release_q the first tile (one KV tile) and the steady step at its last kv_step, each right after the wait that retires
+    the item's last QK. A missing site hangs the producer, an extra one releases Q twice."""
+    import ast
+
+    sites = {}
+    for fn in ast.walk(_kernel_ast()):
+        if isinstance(fn, ast.FunctionDef):
+            n = sum(
+                1
+                for node in ast.walk(fn)
+                if isinstance(node, ast.Call) and ast.unparse(node.func).startswith("bars.mb_tma_q_empty") and ast.unparse(node.func).endswith(".arrive")
+            )
+            if n:
+                sites[fn.name] = n
+    assert sites == {"epilogue": 1, "overlap_first_tile": 1, "overlap_kv_step": 1}, sites
+
+
+@pytest.mark.parametrize(
+    ("role", "barrier", "phase", "start"),
+    [
+        pytest.param("walk_items", "q_full", "q_full_phase", 0, id="full"),
+        pytest.param("tmaldg_persistent", "q_empty", "q_empty_phase", 1, id="empty"),
+    ],
+)
+def test_persistent_q_waits_read_the_carried_phase(role, barrier, phase, start):
+    """Each persistent role waits on Q with the phase it carries across items (the twin above): it starts at the Bars
+    docstring's phase and flips once per item through next_q_phase, inside the item loop. A literal phase, the one-tile
+    kernel's, passes the second item's FULL wait before its Q lands."""
+    import ast
+
+    fn = _function(_kernel_ast(), role)
+    waits = [n for n in ast.walk(fn) if isinstance(n, ast.Call) and ast.unparse(n.func) == f"bars.mb_tma_{barrier}.wait"]
+    assert waits and [ast.unparse(w.args[0]) for w in waits] == [phase] * len(waits), [ast.unparse(w) for w in waits]
+    assigned = [ast.unparse(n) for n in ast.walk(fn) if isinstance(n, ast.Assign) and ast.unparse(n.targets[0]) == phase]
+    assert assigned == [f"{phase} = cutlass.Int32({start})", f"{phase} = self.next_q_phase({phase})"], assigned
+    loop = next(n for n in ast.walk(fn) if isinstance(n, ast.While))
+    flips = [n for n in ast.walk(loop) if isinstance(n, ast.Assign) and ast.unparse(n.targets[0]) == phase]
+    assert len(flips) == 1, [ast.unparse(n) for n in flips]
+
+
+def test_deferred_store_wait_sits_outside_the_row_guard():
+    """The persistent epilogue's O store wait runs on every lane of warp 0, outside the row guard and outside elect_sync:
+    stmatrix overwrites sO for every item, including one whose rows are all past q_output_limit, while the previous
+    item's store may still read it. compute_persistent repeats the wait before the CTA exits. The epilogue's order is
+    pinned too: the wait, then the persistent-only named barrier that holds warps 1 to 3 until it returns, then
+    stmatrix; without that barrier, or with the wait below stmatrix, warps overwrite the half the previous store still
+    reads."""
+    import ast
+
+    tree = _kernel_ast()
+    parents = _parents(tree)
+
+    def guards(node):
+        out = []
+        while node in parents:
+            node = parents[node]
+            if isinstance(node, ast.If):
+                out.append(ast.unparse(node.test))
+        return out
+
+    for name, deferred_count in (("epilogue", 1), ("compute_persistent", 1)):
+        fn = _function(tree, name)
+        waits = [n for n in ast.walk(fn) if isinstance(n, ast.Call) and ast.unparse(n.func) == "tma_store_wait"]
+        deferred = [w for w in waits if not any("elect_sync" in g for g in guards(w))]
+        assert len(deferred) == deferred_count, (name, [guards(w) for w in waits])
+        for w in deferred:
+            assert not any("row_base" in g or "q_output_limit" in g for g in guards(w)), (name, guards(w))
+            assert any("local_tid < cute.arch.WARP_SIZE" in g for g in guards(w)), (name, guards(w))
+    calls = [n for n in ast.walk(_function(tree, "epilogue")) if isinstance(n, ast.Call)]
+    waits = [c for c in calls if ast.unparse(c.func) == "tma_store_wait" and not any("elect_sync" in g for g in guards(c))]
+    held = [c for c in calls if ast.unparse(c.func) == "warpgroup_barrier_sync" and "cutlass.const_expr(persistent)" in guards(c)]
+    stmatrix = [c for c in calls if ast.unparse(c.func) == "store_fragment"]
+    assert len(waits) == 1 and len(held) == 2 and len(stmatrix) == 1, ([w.lineno for w in waits], [b.lineno for b in held], [s.lineno for s in stmatrix])
+    assert all(waits[0].lineno < b.lineno < stmatrix[0].lineno for b in held), "the deferred wait, then the barrier that holds warps 1 to 3, then stmatrix"
+
+
+def test_persistent_record_requires_every_item_to_have_kv_work():
+    """The persistent constructor refuses a shape with an item that has no KV tile (S_kv < 1; bottom-right causal with
+    S_q > S_kv), so neither role needs a liveness branch; a served shape constructs, with one item per (Q tile, head,
+    batch). Host-only: no trace."""
+    import math
+
+    from cudnn.sdpa.fwd.api_dsl import _load_kernel_template
+
+    mod = _load_kernel_template("sm90/prefill_d128_f16.py", _record(intra_wg_overlap=True, persistent=True), tag="ctor_probe_sm90_d128")
+
+    def make(shape, **kw):
+        return mod.SM90FusedMultiHeadAttentionForward(shape, intra_wg_overlap=True, persistent=True, persistent_ctas=132, **kw)
+
+    for shape, kw in (((1, 2, 2, 300, 200), dict(is_causal=True, bottom_right=True)), ((1, 2, 2, 128, 0), {})):
+        with pytest.raises(ValueError, match="needs KV work in every item"):
+            make(shape, **kw)
+    for shape, kw in (((1, 2, 2, 200, 300), dict(is_causal=True, bottom_right=True)), ((1, 2, 2, 300, 200), dict(is_causal=True)), ((1, 2, 2, 300, 1), {})):
+        assert make(shape, **kw).items == math.ceil(shape[3] / 128) * shape[1] * shape[0]

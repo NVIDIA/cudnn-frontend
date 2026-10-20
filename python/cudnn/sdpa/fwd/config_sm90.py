@@ -220,6 +220,14 @@ class TemplateParams:
     # zero O element. SdpaFwdDslSm90 sets the shipped value (api_dsl.D128_INTRA_WG_OVERLAP) for the D128 flavor only;
     # D512 refuses it.
     intra_wg_overlap: bool = False
+    # Step 8 switch of the D128 template, appended after the step 7 one so every earlier specialization keeps its
+    # default (False: one work tile per CTA). persistent launches min(work items, persistent_ctas) CTAs that each loop
+    # over work items, striding by the grid, with the pipeline states carried across items, so the producer loads the
+    # next item's first K tile and Q while the current item finishes (persistent_ctas is a compile() argument the adapter
+    # sizes to the SM count). It requires intra_wg_overlap, so the v1 loop stays the non-persistent reference, and it
+    # computes the one-tile-per-CTA overlap kernel's O and Stats bit for bit. SdpaFwdDslSm90 sets the shipped value
+    # (api_dsl.D128_PERSISTENT) on non-causal D128 plans only: causal plans stay one tile per CTA. D512 refuses it.
+    persistent: bool = False
 
 
 # The ports of ``TemplateParams.thd_origins``, in order.
@@ -256,10 +264,11 @@ def validate_params(params: TemplateParams, flavor: tuple[int, int] = D512_FLAVO
     """Validate the immutable specialization before constructing a kernel.
 
     ``flavor`` names the template asking. D512 (the default) runs the checks below
-    unchanged, messages included, and refuses the D128 template's intra-warpgroup
-    overlap switch. D128 first refuses its ``NOT_SERVED`` features (the
-    declarations pick_flavor keeps on D512, so the adapter never reaches this refusal),
-    then runs the same checks under its own name.
+    unchanged, messages included, and refuses the D128 template's step 7 and step 8
+    switches. D128 first refuses its ``NOT_SERVED`` features (the declarations
+    pick_flavor keeps on D512, so the adapter never reaches this refusal), then
+    persistence without intra-warpgroup overlap, then runs the same checks under its
+    own name.
     """
     if flavor == D128_FLAVOR:
         declared = declared_features(
@@ -279,6 +288,10 @@ def validate_params(params: TemplateParams, flavor: tuple[int, int] = D512_FLAVO
         raise ValueError(f"SM90 has no {flavor} template; flavors: {sorted(FLAVORS)}")
     if flavor == D512_FLAVOR and params.intra_wg_overlap:
         raise ValueError("SM90 D512 has no intra-warpgroup overlap switch; it is a D128 template field")
+    if flavor == D512_FLAVOR and params.persistent:
+        raise ValueError("SM90 D512 has no persistent switch; it is a D128 template field")
+    if params.persistent and not params.intra_wg_overlap:
+        raise ValueError("SM90 D128 persistent requires intra_wg_overlap; the v1 loop stays the non-persistent reference")
     name = f"SM90 D{flavor[0]}"
     tile_m = FLAVOR_TILES[flavor][0]
     if type(params.page_size) is not int or params.page_size < 0:

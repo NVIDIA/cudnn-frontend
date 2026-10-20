@@ -68,16 +68,37 @@ def _inputs(b, h_q, h_kv, s_q, s_kv, dtype):
     return _bhsd(b, h_q, s_q, _D, dtype), _bhsd(b, h_kv, s_kv, _D, dtype), _bhsd(b, h_kv, s_kv, _D, dtype)
 
 
-# TemplateParams.intra_wg_overlap per step 7 switch value.
-_VARIANTS = {"v1": False, "ov": True}
+# The step 7 and step 8 switch fields (config_sm90.TemplateParams). A variant names the ones it turns on; _plan sets every
+# other one False, so a variant never inherits the adapter's shipped values.
+_SWITCHES = ("intra_wg_overlap", "persistent")
+_VARIANTS = {"v1": (), "ov": ("intra_wg_overlap",), "pa": ("intra_wg_overlap", "persistent")}
+# The persistent variants: each must compute ov's O and Stats bit for bit.
+_PERSISTENT = ("pa",)
+# Forced persistent CTA counts: one CTA crossing every item boundary, two and three wrapping the K/V rings and the Q phase
+# at uneven parities, 131 leaving one SM's worth of items over. A cross-item bug shows only when a CTA runs more than one
+# item (python/cudnn/sdpa/AGENTS.md, the THD re-seed lesson): at the adapter's count every small case runs one item per CTA.
+_FORCED_GRIDS = (1, 2, 3, 131)
 
 
-def _plan(q, k, v, *, stats=False, variant=None, **kw):
+def _switches(variant):
+    """``variant``'s whole switch record: each _SWITCHES field, True exactly when the variant names it."""
+    return {name: name in _VARIANTS[variant] for name in _SWITCHES}
+
+
+def _counts(variant):
+    """The watchdog child's persistent CTA counts: the adapter's (0), and for a persistent variant 1 and 2 (one CTA crossing
+    every item boundary; two wrapping the K/V rings and the Q phase at uneven parities)."""
+    return [0, 1, 2] if "persistent" in _VARIANTS[variant] else [0]
+
+
+def _plan(q, k, v, *, stats=False, variant=None, grid=None, **kw):
     """One compiled D128 plan over NaN-filled O (and Stats); asserts the adapter chose D128.
 
-    ``variant`` names a step 7 switch value (``_VARIANTS``), set on the plan's record between
-    ``check_support`` and ``compile``; the compiled module must carry it, so a cache-key slip that hands
-    back the other value's kernel fails here. None is the adapter's shipped value.
+    ``variant`` names a switch record (``_VARIANTS``), set on the plan's record between
+    ``check_support`` and ``compile``; the compiled module must carry every switch of it, so a cache-key
+    slip that hands back another record's kernel fails here. None is the adapter's shipped record.
+    ``grid`` forces a persistent record's CTA count (the instance attribute shadows
+    ``SdpaFwdDslSm90._persistent_ctas``; each count is its own compile key).
     """
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm90
 
@@ -87,16 +108,19 @@ def _plan(q, k, v, *, stats=False, variant=None, **kw):
     api = SdpaFwdDslSm90(q, k, v, o, sample_lse=lse, **kw)
     assert api.check_support() and api.flavor == (128, 128), api.flavor
     if variant is not None:
-        api.params = dataclasses.replace(api.params, intra_wg_overlap=_VARIANTS[variant])
+        api.params = dataclasses.replace(api.params, **_switches(variant))
+    if grid is not None:
+        api._persistent_ctas = lambda device, n=grid: n
     api.compile()
     if variant is not None:
-        assert api._k_mod.INTRA_WG_OVERLAP == _VARIANTS[variant], variant
+        compiled = {name: getattr(api._k_mod, name.upper()) for name in _SWITCHES}
+        assert compiled == _switches(variant), (variant, compiled)
     return api, o, lse
 
 
-def _run(q, k, v, *, stats=False, variant=None, **kw):
+def _run(q, k, v, *, stats=False, variant=None, grid=None, **kw):
     """Plan, execute once, and return (O, Stats or None)."""
-    api, o, lse = _plan(q, k, v, stats=stats, variant=variant, **kw)
+    api, o, lse = _plan(q, k, v, stats=stats, variant=variant, grid=grid, **kw)
     api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse)
     torch.cuda.synchronize()
     return o, lse
@@ -520,24 +544,39 @@ def test_d128_execute_rejects_operands_that_contradict_the_compiled_plan():
 # --- Invariance: schedulers, repeats, layouts -------
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+@pytest.mark.parametrize("variant", ["ov", *_PERSISTENT])
 @torch_fork_set_rng(seed=0)
-def test_d128_schedulers_are_bitwise_equal():
+def test_d128_schedulers_are_bitwise_equal(variant, causal):
     """NATURAL, LPT and LPT_L2 launch the same tiles in different orders over ~4 waves on 132 SMs;
-    each tile's arithmetic is identical, so outputs are equal bit for bit."""
+    each tile's arithmetic is identical, so outputs are equal bit for bit, dense and causal. A persistent variant
+    walks the same orders (about four items per CTA), and its NATURAL run equals ov's. The dense persistent record
+    is what the adapter ships under every policy: the SCHED_POLICY knob, and the heuristic's LPT past 65535 heads or
+    batch."""
     q, k, v = _inputs(4, 16, 4, 1024, 1024, torch.bfloat16)
-    runs = [_run(q, k, v, stats=True, is_causal=True, sched_policy=policy) for policy in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2)]
+    mask = dict(is_causal=True) if causal else {}
+    runs = [_run(q, k, v, stats=True, sched_policy=policy, variant=variant, **mask) for policy in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2)]
     for o, lse in runs[1:]:
         assert torch.equal(o, runs[0][0]) and torch.equal(lse, runs[0][1])
-    _check(*runs[0], q, k, v, is_causal=True)
+    if variant != "ov":
+        o, lse = _run(q, k, v, stats=True, sched_policy=SCHED_NATURAL, variant="ov", **mask)
+        assert torch.equal(o, runs[0][0]) and torch.equal(lse, runs[0][1])
+    _check(*runs[0], q, k, v, is_causal=causal)
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
 @pytest.mark.parametrize("variant", list(_VARIANTS))
 @torch_fork_set_rng(seed=0)
-def test_d128_repeat_launches_are_bitwise_equal(variant):
+def test_d128_repeat_launches_are_bitwise_equal(variant, causal):
     """Two launches of one plan over the same inputs agree bit for bit (no race, no stale stage), for every
-    step 7 switch value."""
+    switch record, dense and causal. A persistent one runs at two CTAs (96 items, 48 per CTA), and both
+    launches equal ov's."""
     q, k, v = _inputs(2, 8, 2, 700, 900, torch.float16)
-    api, o, lse = _plan(q, k, v, stats=True, is_causal=True, variant=variant)
+    mask = dict(is_causal=True) if causal else {}
+    persistent = variant in _PERSISTENT
+    api, o, lse = _plan(q, k, v, stats=True, variant=variant, grid=2 if persistent else None, **mask)
     outs = []
     for _ in range(2):
         o.fill_(float("nan"))
@@ -546,6 +585,9 @@ def test_d128_repeat_launches_are_bitwise_equal(variant):
         torch.cuda.synchronize()
         outs.append((o.clone(), lse.clone()))
     assert torch.equal(outs[0][0], outs[1][0]) and torch.equal(outs[0][1], outs[1][1])
+    if persistent:
+        o_ov, lse_ov = _run(q, k, v, stats=True, variant="ov", **mask)
+        assert torch.equal(outs[0][0], o_ov) and torch.equal(outs[0][1], lse_ov)
 
 
 _LAYOUTS = {
@@ -591,7 +633,18 @@ _CROSS = {  # id: (b, h_q, h_kv, s_q, s_kv, dtype, adapter keywords)
     "neg-scale": (2, 4, 2, 130, 200, torch.float16, dict(is_causal=True, scale_softmax=-0.25)),  # FP64 path on every tile
     "wide-fp64": (1, 2, 2, 128, 256, torch.bfloat16, {}),  # even rows FP64, odd rows FP32: lanes diverge inside the PV window
     "multi-wave": (4, 16, 4, 1024, 1024, torch.bfloat16, dict(is_causal=True, sched_policy=SCHED_LPT_L2)),
+    # Step 8: consecutive items of one CTA differ.
+    "alternating-wide": (2, 2, 2, 128, 256, torch.bfloat16, {}),  # head 0 FP64 rows, head 1 FP32: NATURAL items alternate
+    "mixed-causal": (1, 2, 2, 640, 640, torch.bfloat16, dict(is_causal=True)),  # Q tiles walk 1 to 5 KV tiles (LPT_L2)
+    "one-item": (1, 1, 1, 64, 64, torch.float16, {}),  # one item, one CTA, one KV tile
+    "odd-items": (1, 7, 7, 128, 300, torch.float16, {}),  # seven items: at grid 2 one CTA runs four, the other three
+    "items-133": (7, 19, 19, 128, 128, torch.bfloat16, {}),  # 132 + 1 items: at the SM count one CTA runs two
+    # WG2 live on Q tile 0, dead on Q tile 1 (rows 192..255 >= 129), one KV tile each: at grid 1 WG2's stmatrix follows its
+    # previous store by one short item, the smallest window for a deferred store wait wrongly put under the row guard.
+    "short-dead-half": (1, 2, 2, 129, 128, torch.float16, {}),
 }
+# The cases whose inputs _case_inputs fills with _WIDE: their FP64 check is test_d128_large_scores_keep_rows_finite_and_nonzero's.
+_WIDE_CASES = ("wide-fp64", "alternating-wide")
 
 
 def _reference_mask(kw, s_q, s_kv):
@@ -600,41 +653,85 @@ def _reference_mask(kw, s_q, s_kv):
     return causal, causal and (kw.get("causal_bottom_right", False) or s_q == s_kv)
 
 
-@pytest.mark.parametrize("case", list(_CROSS))
+def _case_inputs(case):
+    """A ``_CROSS`` case's Q, K and V. ``wide-fp64`` puts the even Q rows and every key on _WIDE; ``alternating-wide``
+    puts head 0's Q and K on it, so head 0's rows take the FP64 exponents and head 1's stay on FP32, and a CTA that walks
+    consecutive NATURAL items alternates wide and narrow items (an anchor that is not restarted changes bits)."""
+    b, h_q, h_kv, s_q, s_kv, dtype, _ = _CROSS[case]
+    q, k, v = _inputs(b, h_q, h_kv, s_q, s_kv, dtype)
+    if case == "wide-fp64":
+        # A row's four lanes share its path, and a warp holds rows of both parities, so its lanes split.
+        q[:, :, 0::2].fill_(_WIDE)
+        k.fill_(_WIDE)
+    elif case == "alternating-wide":
+        q[:, 0].fill_(_WIDE)
+        k[:, 0].fill_(_WIDE)
+    return q, k, v
+
+
+def _assert_bitwise(variant, case, got, base, against):
+    """``got`` (O, Stats) must equal ``base``, the ``against`` variant's run, bit for bit; the failure names the first rows
+    that differ and how to tell arithmetic from a race."""
+    o, lse = got
+    if not (torch.equal(o, base[0]) and torch.equal(lse, base[1])):
+        d_o = (o.float() - base[0].float()).abs()
+        rows = torch.nonzero(d_o.amax(dim=-1) > 0)[:8].tolist()
+        pytest.fail(
+            f"{variant} is not {against} on {case}: max |dO| {d_o.max().item():.3e}, Stats equal {torch.equal(lse, base[1])}, "
+            f"first differing (batch, head, row) {rows}; rerun test_d128_repeat_launches_are_bitwise_equal[{variant}]: "
+            "stable launches mean arithmetic (compare the softmax FFMA/FMUL/FADD counts), moving ones a race"
+        )
+
+
+@pytest.mark.parametrize("case", [pytest.param(c, marks=_level(c in _L0_CROSS)) for c in _CROSS])
 @pytest.mark.parametrize("variant", ["ov"])
 @torch_fork_set_rng(seed=0)
 def test_d128_variant_is_bitwise_v1(variant, case):
     """Every step 7 switch value computes v1's O and Stats bit for bit; v1 itself is checked against the
     reference. A difference that repeats launch after launch is arithmetic (compare the softmax block's
     FFMA/FMUL/FADD counts in SASS); one that moves between launches is a race."""
-    b, h_q, h_kv, s_q, s_kv, dtype, kw = _CROSS[case]
-    q, k, v = _inputs(b, h_q, h_kv, s_q, s_kv, dtype)
-    if case == "wide-fp64":
-        # A row's four lanes share its path, and a warp holds rows of both parities, so its lanes split.
-        q[:, :, 0::2].fill_(_WIDE)
-        k.fill_(_WIDE)
+    _, _, _, s_q, s_kv, _, kw = _CROSS[case]
+    q, k, v = _case_inputs(case)
     base = _run(q, k, v, stats=True, variant="v1", **kw)
-    if case != "wide-fp64":  # its FP64 check is test_d128_large_scores_keep_rows_finite_and_nonzero's
+    if case not in _WIDE_CASES:
         is_causal, bottom_right = _reference_mask(kw, s_q, s_kv)
         _check(*base, q, k, v, scale=kw.get("scale_softmax", _SCALE), is_causal=is_causal, bottom_right=bottom_right)
-    o, lse = _run(q, k, v, stats=True, variant=variant, **kw)
-    if not (torch.equal(o, base[0]) and torch.equal(lse, base[1])):
-        d_o = (o.float() - base[0].float()).abs()
-        rows = torch.nonzero(d_o.amax(dim=-1) > 0)[:8].tolist()
-        pytest.fail(
-            f"{variant} is not v1 on {case}: max |dO| {d_o.max().item():.3e}, Stats equal {torch.equal(lse, base[1])}, "
-            f"first differing (batch, head, row) {rows}; rerun test_d128_repeat_launches_are_bitwise_equal[{variant}]: "
-            "stable launches mean arithmetic (compare the softmax FFMA/FMUL/FADD counts), moving ones a race"
-        )
+    _assert_bitwise(variant, case, _run(q, k, v, stats=True, variant=variant, **kw), base, "v1")
 
 
+def _grids(case):
+    """The grids worth running for a case: the adapter's (None), then each forced count below the item count (at or
+    above it every CTA runs one item, the adapter's grid again)."""
+    b, h_q, _, s_q, _, _, _ = _CROSS[case]
+    items = math.ceil(s_q / 128) * h_q * b
+    return [None] + [g for g in _FORCED_GRIDS if g < items]
+
+
+# The forced grids are where a cross-item bug shows: _L0_CROSS's cases run every grid in L0, the others at L1.
+@pytest.mark.parametrize("case, grid", [pytest.param(c, g, id=f"{c}-grid{g or 'sm'}", marks=_level(c in _L0_CROSS)) for c in _CROSS for g in _grids(c)])
+@pytest.mark.parametrize("variant", _PERSISTENT)
+@torch_fork_set_rng(seed=0)
+def test_d128_persistent_is_bitwise_ov(variant, case, grid):
+    """Every persistent record computes the one-tile-per-CTA overlap kernel's O and Stats bit for bit, at the adapter's CTA
+    count and at forced ones, where one CTA crosses many item boundaries and the K/V rings and the Q phase wrap at every
+    parity. ov is held to v1 by test_d128_variant_is_bitwise_v1."""
+    *_, kw = _CROSS[case]
+    q, k, v = _case_inputs(case)
+    base = _run(q, k, v, stats=True, variant="ov", **kw)
+    got = _run(q, k, v, stats=True, variant=variant, grid=grid, **kw)
+    _assert_bitwise(variant, f"{case} at grid {grid or 'sm'}", got, base, "ov")
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
 @pytest.mark.parametrize("variant", list(_VARIANTS))
 @torch_fork_set_rng(seed=0)
-def test_d128_graph_replay_is_bitwise_eager(variant):
+def test_d128_graph_replay_is_bitwise_eager(variant, causal):
     """CUDA-graph replay of one plan equals its eager launch bit for bit, before and after the inputs change
-    in place at the captured pointers (design T9), for every step 7 switch value."""
+    in place at the captured pointers (design T9), for every switch record, dense and bottom-right causal; a
+    persistent one at two CTAs (24 items, 12 per CTA)."""
     q, k, v = _inputs(2, 4, 2, 300, 700, torch.bfloat16)
-    api, o, lse = _plan(q, k, v, stats=True, is_causal=True, causal_bottom_right=True, variant=variant)
+    mask = dict(is_causal=True, causal_bottom_right=True) if causal else {}
+    api, o, lse = _plan(q, k, v, stats=True, variant=variant, grid=2 if variant in _PERSISTENT else None, **mask)
 
     def run():
         api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse)
@@ -660,33 +757,44 @@ def test_d128_graph_replay_is_bitwise_eager(variant):
             lse.fill_(float("nan"))
             graph.replay()
             torch.cuda.synchronize()
-            assert torch.equal(o, eager[0]) and torch.equal(lse, eager[1]), (variant, "changed inputs" if step else "same inputs")
+            assert torch.equal(o, eager[0]) and torch.equal(lse, eager[1]), (variant, causal, "changed inputs" if step else "same inputs")
     finally:
         graph.reset()
 
 
-# Compiles four plans, then runs each three times under a faulthandler deadline: a ring that never completes makes
-# the child exit instead of hanging the worker (test/AGENTS.md, crash isolation), and the parent reports HANG.
-# Self-contained, so it needs nothing from pytest's path setup.
+# Compiles one plan per (CTA count, case), then runs each three times under a faulthandler deadline: a ring that never
+# completes makes the child exit instead of hanging the worker (test/AGENTS.md, crash isolation), and the parent reports
+# HANG. Self-contained, so it needs nothing from pytest's path setup.
 _TURNS_CHILD = textwrap.dedent(r"""
-    import dataclasses, faulthandler, sys, time
+    import dataclasses, faulthandler, json, sys, time
     import torch
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm90
-    overlap, run_budget_s = sys.argv[1] == "1", int(sys.argv[2])
-    # (b, h_q, h_kv, s_q, s_kv, causal): ring wrap; one KV tile (the prologue meets the drain); WG2 without a row
-    # over three tiles of an incomplete Q tile (phase 3); bottom-right causal with masked and unmasked phases.
-    CASES = [(1, 2, 2, 256, 384, False), (1, 2, 2, 64, 128, False), (2, 2, 2, 17, 300, False), (2, 4, 2, 130, 700, True)]
+    switches, run_budget_s, counts = json.loads(sys.argv[1]), int(sys.argv[2]), json.loads(sys.argv[3])
+    # (b, h_q, h_kv, s_q, s_kv, causal, bottom_right): ring wrap; one KV tile (the prologue meets the drain); WG2 without
+    # a row over three tiles of an incomplete Q tile (phase 3); bottom-right causal with masked and unmasked phases (16
+    # items, eight per CTA at count 2); top-left causal square, whose Q tiles walk one and two KV tiles, so one CTA
+    # releases Q from the first tile and from the last step in turn.
+    CASES = [
+        (1, 2, 2, 256, 384, False, False),
+        (1, 2, 2, 64, 128, False, False),
+        (2, 2, 2, 17, 300, False, False),
+        (2, 4, 2, 130, 700, True, True),
+        (1, 4, 4, 256, 256, True, False),
+    ]
     plans = []
-    for b, h_q, h_kv, s_q, s_kv, causal in CASES:
-        torch.manual_seed(0)
-        q, k, v = (torch.randn(b, s, h, 128, device="cuda", dtype=torch.bfloat16).transpose(1, 2) for s, h in ((s_q, h_q), (s_kv, h_kv), (s_kv, h_kv)))
-        o = torch.full((b, s_q, h_q, 128), float("nan"), device="cuda", dtype=torch.bfloat16).transpose(1, 2)
-        api = SdpaFwdDslSm90(q, k, v, o, **(dict(is_causal=True, causal_bottom_right=True) if causal else {}))
-        assert api.check_support() and api.flavor == (128, 128), api.flavor
-        api.params = dataclasses.replace(api.params, intra_wg_overlap=overlap)
-        api.compile()
-        assert api._k_mod.INTRA_WG_OVERLAP == overlap
-        plans.append((api, q, k, v, o, (b, h_q, h_kv, s_q, s_kv, causal)))
+    for count in counts:  # 0: the adapter's CTA count; n > 0 forces n persistent CTAs (a compile argument, its own key)
+        for b, h_q, h_kv, s_q, s_kv, causal, bottom_right in CASES:
+            torch.manual_seed(0)
+            q, k, v = (torch.randn(b, s, h, 128, device="cuda", dtype=torch.bfloat16).transpose(1, 2) for s, h in ((s_q, h_q), (s_kv, h_kv), (s_kv, h_kv)))
+            o = torch.full((b, s_q, h_q, 128), float("nan"), device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+            api = SdpaFwdDslSm90(q, k, v, o, **(dict(is_causal=True, causal_bottom_right=bottom_right) if causal else {}))
+            assert api.check_support() and api.flavor == (128, 128), api.flavor
+            api.params = dataclasses.replace(api.params, **switches)
+            if count:
+                api._persistent_ctas = lambda device, n=count: n
+            api.compile()
+            assert {name: getattr(api._k_mod, name.upper()) for name in switches} == switches
+            plans.append((api, q, k, v, o, (count, b, h_q, h_kv, s_q, s_kv, causal, bottom_right)))
     print("COMPILED", len(plans), flush=True)
     faulthandler.dump_traceback_later(run_budget_s, exit=True)
     for api, q, k, v, o, case in plans:
@@ -718,10 +826,19 @@ _TURNS_COMPILE_BUDGET_S = 900 if _TEST_DEADLINE_S <= 0 else max(60, min(900, int
 @pytest.mark.parametrize("variant", list(_VARIANTS))
 def test_d128_turns_and_rings_complete_in_a_watchdogged_child(variant):
     """Every launch of every switch value finishes: no K or V ring slot waits for an arrival that never comes,
-    including one KV tile, a warpgroup without rows and an incomplete Q tile. A hang is a child that misses its
-    run deadline, reported as HANG with its last lines; a child that stalls before every plan has compiled is
-    reported as STALL, with its stack (the child arms its own deadline before its first import)."""
-    argv = [sys.executable, "-c", _TURNS_PREAMBLE + _TURNS_CHILD, str(int(_VARIANTS[variant])), str(_TURNS_RUN_BUDGET_S), str(_TURNS_COMPILE_BUDGET_S)]
+    including one KV tile, a warpgroup without rows and an incomplete Q tile, and a persistent record's item loop
+    completes at the adapter's CTA count and at one and two CTAs. A hang is a child that misses its run deadline,
+    reported as HANG with its last lines; a child that stalls before every plan has compiled is reported as STALL,
+    with its stack (the child arms its own deadline before its first import)."""
+    argv = [
+        sys.executable,
+        "-c",
+        _TURNS_PREAMBLE + _TURNS_CHILD,
+        json.dumps(_switches(variant)),
+        str(_TURNS_RUN_BUDGET_S),
+        json.dumps(_counts(variant)),
+        str(_TURNS_COMPILE_BUDGET_S),
+    ]
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=_TURNS_COMPILE_BUDGET_S + _TURNS_RUN_BUDGET_S)
     except subprocess.TimeoutExpired as exc:
@@ -738,20 +855,58 @@ def test_d128_turns_and_rings_complete_in_a_watchdogged_child(variant):
 
 @pytest.mark.L0
 def test_d128_adapter_applies_the_shipped_switches(monkeypatch):
-    """check_support writes api_dsl's D128 switch constant into a D128 plan's record at call time, and a
-    D512 plan (tile 64/64 pinned) never carries it."""
+    """check_support writes api_dsl's D128 switch constants into a D128 plan's record at call time: persistence only
+    under overlap, and only on a dense plan (causal plans stay one tile per CTA). A D512 plan (tile 64/64 pinned) never
+    carries either switch."""
+    import itertools
+
     from cudnn.sdpa.fwd import api_dsl
 
     q, k, v = _inputs(1, 2, 2, 64, 128, torch.float16)
     o = torch.empty_like(q)
-    for overlap in _VARIANTS.values():
+    for overlap, persistent, causal in itertools.product((False, True), repeat=3):
         monkeypatch.setattr(api_dsl, "D128_INTRA_WG_OVERLAP", overlap)
+        monkeypatch.setattr(api_dsl, "D128_PERSISTENT", persistent)
+        mask = dict(is_causal=True) if causal else {}
+        api = api_dsl.SdpaFwdDslSm90(q, k, v, o, **mask)
+        assert api.check_support() and api.flavor == (128, 128), api.flavor
+        got = {name: getattr(api.params, name) for name in _SWITCHES}
+        assert got == dict(intra_wg_overlap=overlap, persistent=overlap and persistent and not causal), (causal, got)
+        d512 = api_dsl.SdpaFwdDslSm90(q, k, v, o, tile_m=64, tile_n=64, **mask)
+        assert d512.check_support() and d512.flavor == (512, 512), d512.flavor
+        assert not any(getattr(d512.params, name) for name in _SWITCHES), d512.params
+
+
+def test_d128_adapter_passes_the_cta_count_exactly_when_persistent(monkeypatch):
+    """compile() passes the SM count (SdpaFwdDslSm90._persistent_ctas) to a persistent D128 record and nothing to any
+    other plan, so a non-persistent key never names a device."""
+    from types import SimpleNamespace
+
+    from cudnn.sdpa.fwd import api_dsl
+
+    class Stop(Exception):
+        pass
+
+    calls = []
+
+    def fake_compile(*args, **kw):
+        calls.append(kw)
+        raise Stop
+
+    monkeypatch.setattr(
+        api_dsl, "_load_sm90_kernel_module", lambda flavor, params, native_d64=False: SimpleNamespace(__file__="prefill_d128_f16.py", compile=fake_compile)
+    )
+    monkeypatch.setattr(api_dsl.SdpaFwdDslSm90, "_persistent_ctas", lambda self, device: 7)
+    q, k, v = _inputs(1, 2, 2, 64, 128, torch.float16)
+    o = torch.empty_like(q)
+    for persistent in (False, True):
         api = api_dsl.SdpaFwdDslSm90(q, k, v, o)
         assert api.check_support() and api.flavor == (128, 128), api.flavor
-        assert api.params.intra_wg_overlap == overlap
-        d512 = api_dsl.SdpaFwdDslSm90(q, k, v, o, tile_m=64, tile_n=64)
-        assert d512.check_support() and d512.flavor == (512, 512), d512.flavor
-        assert d512.params.intra_wg_overlap is False
+        api.params = dataclasses.replace(api.params, intra_wg_overlap=True, persistent=persistent)
+        with pytest.raises(Stop):
+            api.compile()
+        kw = calls.pop()
+        assert (kw.get("persistent_ctas") == 7) if persistent else ("persistent_ctas" not in kw), kw
 
 
 # --- Tight numerics against FP64 -------
@@ -833,7 +988,7 @@ def test_d128_large_scores_keep_rows_finite_and_nonzero(a):
 
 _SASS_PROBE = textwrap.dedent(r"""
     import dataclasses, glob, json, os, re, subprocess, sys
-    dump, fields, ptxas, cands = sys.argv[1], json.loads(sys.argv[2]), sys.argv[3], sys.argv[4:]
+    dump, case, ptxas, cands = sys.argv[1], json.loads(sys.argv[2]), sys.argv[3], sys.argv[4:]
     os.environ["CUTE_DSL_DUMP_DIR"] = dump
     os.environ["CUTE_DSL_KEEP"] = "ptx,cubin"
     os.environ["CUTE_DSL_ARCH"] = "sm_90a"  # unconditional: an inherited value would pin another target
@@ -841,13 +996,15 @@ _SASS_PROBE = textwrap.dedent(r"""
     from cudnn.frost.tile_dsl.constants import DTYPE_BF16
     from cudnn.sdpa.fwd.api_dsl import _load_kernel_template
     from cudnn.sdpa.fwd.config_sm90 import TemplateParams
-    # The heaviest D128 body: causal (three masked phases), GQA and Stats; ``fields`` adds the step 7 switch.
-    params = dataclasses.replace(TemplateParams(dtype_qkv=DTYPE_BF16, causal=True, has_lse=True, qh_per_kh=4), **fields)
+    # The heaviest D128 body: GQA and Stats, causal (three masked phases) or dense (a persistent record's dense body is
+    # different code); ``fields`` is the variant's switch record, ``ctas`` a persistent record's CTA count.
+    fields = case["switches"]
+    params = dataclasses.replace(TemplateParams(dtype_qkv=DTYPE_BF16, causal=case["causal"], has_lse=True, qh_per_kh=4), **fields)
     mod = _load_kernel_template("sm90/prefill_d128_f16.py", params, tag="sass_sm90_d128")
-    print("SWITCHES", int(mod.INTRA_WG_OVERLAP))
+    print("SWITCHES", *(int(getattr(mod, name.upper())) for name in sorted(fields)))
     b, h_q, h_kv, s = 2, 8, 2, 1024
     q, kv = (s * h_q * 128, 128, h_q * 128, 1), (s * h_kv * 128, 128, h_kv * 128, 1)
-    mod.compile(b, h_q, h_kv, s, s, q, kv, kv, q, (h_q * s, s, 1))
+    mod.compile(b, h_q, h_kv, s, s, q, kv, kv, q, (h_q * s, s, 1), **({"persistent_ctas": case["ctas"]} if fields["persistent"] else {}))
     cubins = sorted(glob.glob(os.path.join(dump, "**", "*.cubin"), recursive=True), key=os.path.getmtime)
     ptxs = sorted(glob.glob(os.path.join(dump, "**", "*.ptx"), recursive=True), key=os.path.getmtime)
     if not cubins or not ptxs:
@@ -904,13 +1061,24 @@ _SASS_PROBE = textwrap.dedent(r"""
 # A target, not yet a measurement: the plan expects no spills at the 240-register budget (design
 # 3.5 estimates about 200). Replace it with the STL/LDL counts of the first sm_90a compile (S2).
 _SPILL_PIN = {"STL": 0, "LDL": 0}
-# Per-value structure of the probe body (causal, GQA 4, Stats, bf16), measured on the offline sm_90a kit (ptxas 13.4
-# V13.4.92, CuTe DSL 4.8.0, compile_d128.sh --preset probe): v1 = 3 step instances x (8 SS + 8 RS); ov = prologue QK 8
-# + 2 step instances x 16 + drain PV 8, one wait_group(1) per step instance. Body counts are a toolchain fact
+# The SASS cases: (variant, causal body). Today's two on the causal body, plus the persistent record on the dense body,
+# the only one the adapter ships it on (one step instance: the masked phases fold away).
+_SASS_CASES = {"v1": ("v1", True), "ov": ("ov", True), "pa-dense": ("pa", False)}
+# A persistent record's CTA count in the probe: below the probe's 128 items, so each CTA walks two. With the count at or
+# above the items every CTA runs one item, and LLVM could fold the item loop away if it ever proved that (the warp-uniform
+# item index keeps it from doing so today); a count below the items pins the loop whatever it proves.
+_SASS_CTAS = 64
+# Per-case structure of the probe body (GQA 4, Stats, bf16), measured on the offline sm_90a kit (ptxas 13.4 V13.4.92,
+# CuTe DSL 4.8.0, compile_d128.sh --preset probe): v1 = 3 step instances x (8 SS + 8 RS); ov = prologue QK 8 + 2 step
+# instances x 16 + drain PV 8, one wait_group(1) per step instance; pa-dense is one copy of ov's dense item body inside
+# the item loop, one step instance (--no-causal --overlap --persistent --ctas 64). BAR_SYNC: the CTA barrier after the
+# barrier init and the O staging barrier in each branch of the warpgroup split (3); pa-dense adds, in each branch, the
+# barrier that holds warps 1 to 3 until warp 0's deferred O store wait returns (5). Body counts are a toolchain fact
 # (python/cudnn/sdpa/AGENTS.md, the LDTM lesson): re-measure on a new toolchain and record it next to the numbers.
 _CODEGEN_PINS = {
-    "v1": dict(HGMMA=48, DEPBAR=6, DEPBAR_1=0, BAR_ARV=0),
-    "ov": dict(HGMMA=48, DEPBAR=6, DEPBAR_1=2, BAR_ARV=0),
+    "v1": dict(HGMMA=48, DEPBAR=6, DEPBAR_1=0, BAR_SYNC=3, BAR_ARV=0),
+    "ov": dict(HGMMA=48, DEPBAR=6, DEPBAR_1=2, BAR_SYNC=3, BAR_ARV=0),
+    "pa-dense": dict(HGMMA=32, DEPBAR=4, DEPBAR_1=1, BAR_SYNC=5, BAR_ARV=0),
 }
 
 
@@ -923,35 +1091,42 @@ def _ptxas():
     return next((c for c in cands if c and os.path.isfile(c) and os.access(c, os.X_OK)), None)
 
 
-@pytest.mark.parametrize("variant", list(_VARIANTS))
-def test_d128_register_split_no_spills_and_no_wgmma_serialization(tmp_path, variant):
+@pytest.mark.parametrize("case", list(_SASS_CASES))
+def test_d128_register_split_no_spills_and_no_wgmma_serialization(tmp_path, case):
     """The (24, 240, 240) setmaxnreg split survives into SASS (min_blocks_per_mp=1 on the launch;
     python/cudnn/AGENTS.md: ptxas otherwise drops it silently), the compute body does not spill and stays
     under the 240-register budget, and ptxas keeps the QK and PV WGMMA groups pipelined (no C7511/C7513
-    serialization advisory), for every step 7 switch value. The switch must really compile: a
-    wait_group(1) appears exactly under overlap."""
+    serialization advisory), for every switch record and body in _SASS_CASES. The switch must really
+    compile: a wait_group(1) appears exactly under overlap."""
     cands = nvdisasm_candidates()
     if not cands:
         pytest.skip("no nvdisasm executable to try (CUDA_PATH unset and none on PATH)")
     dump = tmp_path / "dump"
     dump.mkdir()
-    overlap = _VARIANTS[variant]
-    fields = json.dumps(dict(intra_wg_overlap=overlap))
-    proc = subprocess.run([sys.executable, "-c", _SASS_PROBE, str(dump), fields, _ptxas() or "-", *cands], capture_output=True, text=True, timeout=1800)
-    assert proc.returncode == 0, f"sm_90a trace-compile of the D128 template ({variant}) failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
+    variant, causal = _SASS_CASES[case]
+    switches = _switches(variant)
+    overlap = switches["intra_wg_overlap"]
+    arg = json.dumps({"switches": switches, "causal": causal, "ctas": _SASS_CTAS})
+    proc = subprocess.run([sys.executable, "-c", _SASS_PROBE, str(dump), arg, _ptxas() or "-", *cands], capture_output=True, text=True, timeout=1800)
+    assert proc.returncode == 0, f"sm_90a trace-compile of the D128 template ({case}) failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
     out = proc.stdout.splitlines()
     if any(ln.startswith("SKIP") for ln in out):
         pytest.skip(str([ln for ln in out if ln.startswith(("SKIP", "REJECT"))]))
-    assert f"SWITCHES {int(overlap)}" in out, [ln for ln in out if ln.startswith("SWITCHES")]
+    want = "SWITCHES " + " ".join(str(int(switches[name])) for name in sorted(switches))
+    assert want in out, [ln for ln in out if ln.startswith("SWITCHES")]
     stats = {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith(("SASS ", "PTX "))}
-    print(f"\nD128 SASS {variant}:", stats, [ln for ln in out if ln.startswith("PTXAS")])
+    print(f"\nD128 SASS {case}:", stats, [ln for ln in out if ln.startswith("PTXAS")])
     assert stats["USETMAXREG"] > 0, "no USETMAXREG: ptxas dropped the register split (C7508)"
     assert (stats["USETMAXREG_ALLOC"], stats["USETMAXREG_DEALLOC"]) == (240, 24), stats
     assert stats["HGMMA"] > 0, stats
-    assert_no_new_spills(stats, _SPILL_PIN, tag=f"D128 sm_90a {variant}: ")
-    assert stats["MAXREG"] < 240, f"{variant}: register R{stats['MAXREG']} is past the 240-register budget"
-    assert (stats["DEPBAR_1"] > 0) == overlap, f"{variant}: wait_group(1) count {stats['DEPBAR_1']}"
-    assert {key: stats[key] for key in _CODEGEN_PINS[variant]} == _CODEGEN_PINS[variant], (variant, stats)
+    # A named barrier reached from a warp-role branch is a subset barrier and lowers without the aligned-CTA promise
+    # (python/cudnn/AGENTS.md): the O staging barriers of each compute warpgroup go through warpgroup_barrier_sync, so
+    # the only aligned barrier left in the PTX is the whole-CTA publish after the barrier init.
+    assert stats["LEGACY_BAR"] <= 1, f"{case}: {stats['LEGACY_BAR']} aligned bar.sync / barrier.sync.aligned in the PTX"
+    assert_no_new_spills(stats, _SPILL_PIN, tag=f"D128 sm_90a {case}: ")
+    assert stats["MAXREG"] < 240, f"{case}: register R{stats['MAXREG']} is past the 240-register budget"
+    assert (stats["DEPBAR_1"] > 0) == overlap, f"{case}: wait_group(1) count {stats['DEPBAR_1']}"
+    assert {key: stats[key] for key in _CODEGEN_PINS[case]} == _CODEGEN_PINS[case], (case, stats)
     ptxas = {ln.split()[1]: ln.split()[2] for ln in out if ln.startswith("PTXAS ") and len(ln.split()) == 3}
     if "serialized" in ptxas:
         assert ptxas["rc"] == "0" and ptxas["serialized"] == "0", [ln for ln in out if ln.startswith("PTXAS")]

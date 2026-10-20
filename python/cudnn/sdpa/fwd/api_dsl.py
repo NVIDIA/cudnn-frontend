@@ -256,6 +256,13 @@ D512_2X2: bool = True
 # A ping-pong turn between the two compute warpgroups measured 1.11x alone and no further gain on top of overlap, so the
 # kernel has none: each warpgroup issues its own WGMMA groups and the hardware interleaves them.
 D128_INTRA_WG_OVERLAP: bool = True
+# The SM90 D128 template's step 8 switch (config_sm90.TemplateParams.persistent). A CALL-TIME module constant like
+# D128_INTRA_WG_OVERLAP above, written into a D128 plan's record by check_support; a D512 plan never carries it.
+# Persistence rides the overlap loop (validate_params), so a plan is persistent only while D128_INTRA_WG_OVERLAP is on
+# as well, and only a dense plan: its items all walk the same KV tiles, so striding by the grid balances them, while
+# causal items differ in length and causal plans stay one tile per CTA. A persistent plan keeps a zero workspace. Off
+# until the step 8 A/B; the commit that turns it on records the measured table.
+D128_PERSISTENT: bool = False
 # The d128 f16/bf16 DECODE tile (TILES_Q=1, cga1, one softmax warpgroup, three
 # KV stages -- config_sm100.CfgD128Decode): what a (128, 128) plan with
 # TILE_CGA_M=1 lowers to on dense graphs.  cga1 on this flavor IS the decode
@@ -5828,6 +5835,8 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             tokens_per_tile = tile_m // pack_g
             units = b * packed_heads * ((s_q + tokens_per_tile - 1) // tokens_per_tile)
             self._not_implemented_error_if(max(b * self.split_kv, units) >= 2**31, "SM90 split-KV batch planes and flat grid must fit positive Int32")
+        # D128 only, read at call time (the module constants above); non-causal plans only.
+        persistent = self.flavor == _SM90_D128_FLAVOR and D128_INTRA_WG_OVERLAP and D128_PERSISTENT and not band["causal"]
         self.params = Sm90TemplateParams(
             dtype_qkv=DTYPE_BF16 if self.q_desc.dtype == torch.bfloat16 else DTYPE_FP16,
             head_tile=next(width for width in (128, 256, 512) if max(d_qk, d_v) <= width),
@@ -5846,6 +5855,8 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             page_size=self.paged_page_size,
             # D128 only: the step 7 switch, read at call time (module constant above).
             intra_wg_overlap=self.flavor == _SM90_D128_FLAVOR and D128_INTRA_WG_OVERLAP,
+            # D128 only: the step 8 switch.
+            persistent=persistent,
         )
         self._native_d64 = False
         if (d_qk, d_v) == (64, 64) and not self.paged:
@@ -5910,6 +5921,9 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             target="sm_90a",
             d_qk=self.head_dim_qk,
             d_v=self.head_dim_v,
+            # A persistent D128 record's grid cap, the SM count (_persistent_ctas below); every other plan passes nothing,
+            # so its compile key names no device.
+            **({"persistent_ctas": self._persistent_ctas(self.q_desc.device)} if self.params.persistent else {}),
         )
         from .prepared import build_dense_spec, build_thd_spec
 
@@ -5928,6 +5942,14 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
         from cudnn.sdpa.fwd.config_sm90 import thd_meta_words
 
         return thd_meta_words(self.batch_size, getattr(self, "_thd_origin_specs", None) is not None) * 4
+
+    def _persistent_ctas(self, device) -> int:
+        """The persistent D128 grid cap: the device's SM count. One CTA per SM fits (min_blocks_per_mp=1, 196,704 B of
+        SMEM), and a CTA with no item left just retires, so more would only queue behind the first wave. A device
+        property, cached per device by _device_sm_count: plan-time (python/cudnn/AGENTS.md Rule 4). Deliberately not
+        SdpaFwdDslSm120._persistent_ctas: FROST_THD_CTAS and FROST_THD_CTAS_PER_SM tune THD grids and must not resize
+        this one. Tests force a count by patching this method or by calling the template's compile() directly."""
+        return _device_sm_count(device)
 
     def execute(
         self,

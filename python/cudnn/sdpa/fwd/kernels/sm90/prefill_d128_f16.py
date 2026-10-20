@@ -17,7 +17,10 @@ The kernel implements:
 - Three warpgroups per CTA. WG0 issues the TMA loads. WG1 and WG2 run QK, the online
   softmax and PV on query rows 0-63 and 64-127 of the tile.
 - Two-stage K and V rings, so the producer loads KV tile j+1 while tile j is in use.
-- One work tile per CTA over (Q tile, head, batch), in NATURAL, LPT or LPT_L2 order.
+- One work tile per CTA over (Q tile, head, batch), in NATURAL, LPT or LPT_L2 order;
+  or, under ``TemplateParams.persistent`` (step 8), a grid of at most one CTA per SM
+  whose CTAs walk the work items in that order: the producer loads the next item's
+  first K tile, Q and first V tile while the current item finishes.
 - Online softmax around an exact sign-aware row anchor, with lane-partial row sums
   quad-reduced only at finalization: the D512 template's arithmetic at 32 keys per lane
   and row.
@@ -106,6 +109,9 @@ STORAGE_DTYPE = {DTYPE_FP16: cutlass.Float16, DTYPE_BF16: cutlass.BFloat16}[PARA
 # (python/cudnn/sdpa/AGENTS.md, the hand-set digest lesson). Tests and benchmarks read it to assert that the arm they
 # asked for is the one that compiled. False is the v1 loop.
 INTRA_WG_OVERLAP: bool = PARAMS.intra_wg_overlap
+# Step 8 switch, read the same way: each value is its own module, digest and compile key. False is one work tile per
+# CTA; validate_params above has refused True without intra_wg_overlap.
+PERSISTENT: bool = PARAMS.persistent
 
 
 @dsl_user_op
@@ -143,7 +149,8 @@ class Bars(NamedTuple):
 
     - ``mb_tma_q_full``: WG0's elected expect-tx arrival plus the TMA bytes of the Q tile
       -> WG1, WG2.
-    - ``mb_tma_q_empty``: the 8 warps of WG1 and WG2, at their epilogues.
+    - ``mb_tma_q_empty``: the 8 warps of WG1 and WG2, at their epilogues (one tile per
+      CTA) or right after the wait that retires the item's last QK (persistent).
     - ``mb_tma_{k,v}_full``: KV_STAGES slots; WG0's elected expect-tx arrival plus the TMA
       bytes -> WG1, WG2.
     - ``mb_tma_{k,v}_empty``: KV_STAGES slots; the 8 warps of WG1 and WG2, each after its
@@ -164,10 +171,11 @@ class Bars(NamedTuple):
 class SM90FusedMultiHeadAttentionForward:
     """Configure and launch the SM90 FP16/BF16 D128 FMHA prefill kernel.
 
-    Each CTA runs one work tile through three warpgroups: WG0 loads, WG1 and WG2 each
-    compute 64 query rows. The constructor takes only what ``config_sm90.validate_params``
-    lets a D128 specialization declare; the prepared host still reads ``thd_varlen``,
-    ``has_sink``, ``thd_lse_head_stride`` and ``thd_origins``, which stay off.
+    Each CTA runs one work tile, or under ``persistent`` every work item of its stride
+    (step 8), through three warpgroups: WG0 loads, WG1 and WG2 each compute 64 query
+    rows. The constructor takes only what ``config_sm90.validate_params`` lets a D128
+    specialization declare; the prepared host still reads ``thd_varlen``, ``has_sink``,
+    ``thd_lse_head_stride`` and ``thd_origins``, which stay off.
     """
 
     # The CTA tile: Q_TILE rows by KV_TILE keys over the HEAD_TILE-column head.
@@ -191,6 +199,8 @@ class SM90FusedMultiHeadAttentionForward:
         scale_mode: int = SCALE_POSITIVE,
         stats_log2: bool = False,
         intra_wg_overlap: bool = False,
+        persistent: bool = False,
+        persistent_ctas: int = 0,
     ):
         """Initialize the SM90 D128 FMHA prefill kernel configuration.
 
@@ -213,6 +223,9 @@ class SM90FusedMultiHeadAttentionForward:
             LSE by ``log2(e)``; ``-inf`` stays ``-inf``, and ``lse`` None removes it.
         :param intra_wg_overlap: Issue QK(t) and PV(t-1) as two WGMMA groups in flight together and run
             tile t's softmax under PV(t-1) (design 3.12, FA3's ``IntraWGOverlap``).
+        :param persistent: Launch ``min(items, persistent_ctas)`` CTAs that each loop over work items
+            (step 8).
+        :param persistent_ctas: The persistent grid's CTA cap (the SM count); 0 when not persistent.
         """
 
         _, h_q, h_kv, _, _ = shape
@@ -237,6 +250,18 @@ class SM90FusedMultiHeadAttentionForward:
         self.anchor_sentinel = -cutlass.Float32.inf if scale_mode >= SCALE_ZERO else cutlass.Float32.inf
         self.stats_log2 = stats_log2
         self.intra_wg_overlap = intra_wg_overlap
+        self.persistent = persistent
+        self.persistent_ctas = persistent_ctas
+        if persistent:
+            if persistent_ctas < 1:
+                raise ValueError(f"prefill_d128_f16_sm90: a persistent record needs persistent_ctas >= 1; got {persistent_ctas}")
+            # Every item must have KV work, so neither role needs a per-item liveness branch and both flip their Q
+            # phase once per item (the empty-tile trap of sm100/prefill_d128_f16.py, where an empty tile must still
+            # consume its Q phase, cannot arise): S_kv >= 1, and S_q <= S_kv under bottom-right causal (the adapter
+            # refuses the rest, api_dsl check_support).
+            _, _, _, s_q, s_kv = shape
+            if s_kv < 1 or (is_causal and bottom_right and s_q > s_kv):
+                raise ValueError(f"prefill_d128_f16_sm90: a persistent record needs KV work in every item; got S_q={s_q}, S_kv={s_kv}")
         # Read by prepared_host.host; a D128 specialization never declares them (no THD, sink,
         # paged pool or KV split: validate_params refuses each).
         self.thd_varlen = False
@@ -273,6 +298,11 @@ class SM90FusedMultiHeadAttentionForward:
         self.o_fragment_slots = self.WG_ROWS * self.HEAD_TILE // cute.arch.THREADS_PER_WARPGROUP
         # One K or V stage in the descriptors' 16-byte start-field units.
         self.kv_stage_units = self.tile_elems * self.storage_dtype.bytes // 16
+        # Step 8: the work items and a persistent grid: at most one CTA per SM (min_blocks_per_mp=1 and 196,704 B of
+        # SMEM leave no room for a second) and never more CTAs than items, so every CTA has an item and its first is its
+        # block index.
+        self.items = self.q_tiles * self.heads * self.b
+        self.n_ctas = min(self.items, self.persistent_ctas) if self.persistent else 0
 
         # TMA: every region moves in SW128 slabs of 128-byte rows, two per 128-column tile.
         # The WGMMA descriptors (wgmma_descriptor) assume exactly this atom. Q, K and V boxes
@@ -614,13 +644,14 @@ class SM90FusedMultiHeadAttentionForward:
                 p_words[2 * k_frag + row_half] = fp32_to_fp16(s_regs[slot], s_regs[slot + 1], dtype=self.storage_dtype).bitcast(cutlass.Float32)
 
     @cute.jit
-    def overlap_first_tile(self, basic_params, mma_params, softmax_params, s_regs, p_words, k_state):
+    def overlap_first_tile(self, basic_params, mma_params, softmax_params, s_regs, p_words, k_state, release_q: cutlass.Constexpr = False):
         """INTRA_WG_OVERLAP prologue, KV tile 0: QK(0) waited, its softmax, P(0) packed; no PV yet.
 
         Tile 0 is masked (MASK_PADDED plus the graph's mask) and has no history, as in v1; its softmax sets
         alpha to 1, which the first step (or the drain) applies to the zero O. PV(0) then accumulates onto
         that +0 where v1 overwrites O on its first k-step: the same O, except that a -0 sum becomes +0
-        (``torch.equal`` counts the two as equal).
+        (``torch.equal`` counts the two as equal). ``release_q`` (persistent): when the item has one KV tile,
+        QK(0) was its last QK, so Q is released with K(0).
 
         :return: ``k_state`` advanced to tile 1; tile 0's state stays the caller's ``v_state``.
         """
@@ -641,6 +672,9 @@ class SM90FusedMultiHeadAttentionForward:
         prims.bar_warp_sync(cute.arch.FULL_MASK)
         if prims.elect_sync():
             bars.mb_tma_k_empty[stage].arrive()
+            if cutlass.const_expr(release_q):
+                if work.iterations == 1:
+                    bars.mb_tma_q_empty.arrive()
         self.online_softmax(basic_params, softmax_params, s_regs, kv_seq_idx, active_masks=self.mask_flags | MASK_PADDED, is_first_kv_tile=True, pack_p=False)
         self.pack_probability_words(s_regs, p_words)
         return advance(k_state, self.KV_STAGES)
@@ -657,6 +691,7 @@ class SM90FusedMultiHeadAttentionForward:
         k_state,
         v_state,
         active_masks: cutlass.Constexpr,
+        release_q: cutlass.Constexpr = False,
     ):
         """INTRA_WG_OVERLAP step t = ``kv_step`` >= 1: QK(t) and PV(t-1) in flight together (design 3.12).
 
@@ -668,6 +703,8 @@ class SM90FusedMultiHeadAttentionForward:
 
         In flight, nothing may touch: ``s_regs`` from the QK issue to ``wait_group(1)``; ``output`` and
         ``p_words`` from the PV issue to ``wait_group(0)`` (a write there serializes every WGMMA, ptxas C7513).
+        ``release_q`` (persistent): at t = iterations - 1, QK(t) was the item's last QK, so Q is released with
+        K(t).
 
         :return: ``(k_state, v_state)`` for step t + 1: tile t + 1's state, then tile t's.
         """
@@ -702,6 +739,9 @@ class SM90FusedMultiHeadAttentionForward:
         prims.bar_warp_sync(cute.arch.FULL_MASK)
         if prims.elect_sync():
             bars.mb_tma_k_empty[k_stage].arrive()
+            if cutlass.const_expr(release_q):
+                if kv_step == work.iterations - 1:
+                    bars.mb_tma_q_empty.arrive()
         self.online_softmax(basic_params, softmax_params, s_regs, kv_seq_idx, active_masks=active_masks, is_first_kv_tile=False, pack_p=False)
         # PV(t-1) has retired: O, P(t-1) and V(t-1) are free.
         prims.wgmma_wait_group_sync_aligned(0)
@@ -726,7 +766,7 @@ class SM90FusedMultiHeadAttentionForward:
             bars.mb_tma_v_empty[stage].arrive()
 
     @cute.jit
-    def epilogue(self, bars, work, tma_o_desc, sO, output, row_sum_inv, local_tid, w, row_base):
+    def epilogue(self, bars, work, tma_o_desc, sO, output, row_sum_inv, local_tid, w, row_base, persistent: cutlass.Constexpr = False):
         """Normalize, stage and store compute warpgroup ``w``'s 64 O rows.
 
         All 128 threads of the warpgroup call this after its last PV, if any, has
@@ -734,14 +774,30 @@ class SM90FusedMultiHeadAttentionForward:
         the rows into the warpgroup's own O half, and named barrier ``bar_o_stage_base + w``
         orders that staging before warp 0's elected lane issues the TMA store. A
         warpgroup whose rows all lie past ``q_output_limit`` stores nothing.
+
+        ``persistent`` (step 8): Q was released in the walk, so the epilogue releases nothing; the TMA store's ``.read``
+        wait moves to the start of the next item's staging (before ``stmatrix`` overwrites this half) and to the end of
+        the CTA (compute_persistent).
         """
         rescale_output(output, row_sum_inv)
-        if work.iterations > 0:
-            prims.bar_warp_sync(cute.arch.FULL_MASK)
-            if prims.elect_sync():
-                bars.mb_tma_q_empty.arrive()
+        if cutlass.const_expr(not persistent):
+            if work.iterations > 0:
+                prims.bar_warp_sync(cute.arch.FULL_MASK)
+                if prims.elect_sync():
+                    bars.mb_tma_q_empty.arrive()
         # The O box lands rows in the Q box's order, so each fragment row is its O row.
         words = output.load(0, self.o_fragment_slots).to(self.out_dtype).bitcast(cutlass.Uint32)
+        if cutlass.const_expr(persistent):
+            # The previous item's O store from this half must finish READING sO before stmatrix overwrites it. Every lane
+            # of warp 0 waits: a bulk group belongs to the lane that committed it (elect_sync's lane is implementation-
+            # defined) and a lane without one returns at once. Not under the row guard below: this item may store nothing
+            # while the previous one did, and stmatrix always writes. The barrier holds warps 1 to 3 until the wait returns.
+            if local_tid < cute.arch.WARP_SIZE:
+                tma_store_wait(0)
+            if w == 0:
+                warpgroup_barrier_sync(self.bar_o_stage_base, cute.arch.THREADS_PER_WARPGROUP)
+            else:
+                warpgroup_barrier_sync(self.bar_o_stage_base + 1, cute.arch.THREADS_PER_WARPGROUP)
         store_fragment(words, sO.base.subview(w * self.wg_tile_elems), local_tid)
         prims.fence_proxy(prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
         # All four staging warps finish before warp 0 issues the TMA store. The branch is
@@ -755,7 +811,8 @@ class SM90FusedMultiHeadAttentionForward:
                 if prims.elect_sync():
                     tma_store_tile(sO.shifted(w * self.wg_tile_elems), self.tma_slice(tma_o_desc, work.head, row_base, work.batch, self.tma_orders[3]))
                     tma_store_commit()
-                    tma_store_wait(0)
+                    if cutlass.const_expr(not persistent):
+                        tma_store_wait(0)
 
     @cute.jit
     def compute_warp_group(self, tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, work, w):
@@ -947,6 +1004,333 @@ class SM90FusedMultiHeadAttentionForward:
             self.epilogue(bars, work, tma_o_desc, sO, output, row_sum_inv_values, local_tid, w, row_base)
 
     @cute.jit
+    def work_record(self, tile, head, batch):
+        """One (Q tile, head, batch) item's record, as _run_unit builds it, for the persistent walk (step 8).
+
+        A separate copy so the one-tile-per-CTA rendering stays byte-identical; test_d128_persistent_is_bitwise_ov holds
+        the two to the same answers.
+        """
+        q_base = tile * self.Q_TILE
+        q_len, kv_len = cutlass.Int32(self.s_q), cutlass.Int32(self.s_kv)
+        bounds = compute_kv_loop_bounds(q_base, q_len, kv_len, 0, self.mask_flags, self.KV_TILE, self.Q_TILE, bottom_right=self.kv_loop_bottom_right)
+        iterations = cute.math.max(cutlass.Int32(0), bounds.right)
+        return SimpleNamespace(
+            batch=batch,
+            head=head,
+            kv_head=head // self.qh_per_kh,
+            q_base=q_base,
+            q_len=q_len,
+            kv_len=kv_len,
+            q_output_limit=q_len,
+            iterations=iterations,
+            kv_right=iterations,
+        )
+
+    @cute.jit
+    def work_of(self, item):
+        """Decode work item ``item`` (0 <= item < self.items) into its record (step 8).
+
+        NATURAL numbers the items as the hardware rasterizes the one-tile grid ``(q_tiles, h_q, b)``, Q tile fastest,
+        then head, then batch, so a persistent grid's first round is that grid's first wave; LPT and LPT_L2 decode the
+        linear id kernel decodes for them. Every divisor is a compile-time constant (PREPARED_FIXED_SHAPE), so the
+        divisions strength-reduce.
+        """
+        tile = item % self.q_tiles
+        head = (item // self.q_tiles) % self.heads
+        batch = item // (self.q_tiles * self.heads)
+        if cutlass.const_expr(self.sched_policy == SCHED_LPT_L2):
+            # As kernel's LPT_L2 decode.
+            row_bytes = 2 * self.HEAD_TILE * self.storage_dtype.bytes
+            groups = SCHED_L2_BUDGET_BYTES // max(1, self.s_kv * row_bytes)
+            l2_bytes = (1 << groups.bit_length() - 1) * self.s_kv * row_bytes if groups > 1 else 0
+            tile, head, batch = lpt_l2_tile_coords(
+                item,
+                cutlass.Int32(self.heads),
+                cutlass.Int32(self.b),
+                cutlass.Int32(self.q_tiles),
+                self.qh_per_kh,
+                cutlass.Int32(self.s_kv),
+                row_bytes,
+                l2_bytes,
+            )
+        elif cutlass.const_expr(self.sched_policy != SCHED_NATURAL):
+            tile, head, batch = lpt_tile_coords(item, cutlass.Int32(self.heads), cutlass.Int32(self.b), cutlass.Int32(self.q_tiles))
+        return self.work_record(tile, head, batch)
+
+    @cute.jit
+    def first_item(self):
+        """A persistent CTA's first item: its block index (__call__ launches at most one CTA per item).
+
+        Every item index, and every pipeline state and Q phase the walk carries (uniform_state, next_q_phase), is marked
+        warp-uniform, so ptxas can keep them in uniform registers: on the offline sm_90a kit the walk's LPT and LPT_L2
+        causal bodies peak at R232 with the marks and R234 without.
+        """
+        item, _, _ = cute.arch.block_idx()
+        return cute.arch.make_warp_uniform(item)
+
+    @cute.jit
+    def next_item(self, item):
+        """This CTA's next item: one grid stride on, warp-uniform (first_item)."""
+        return cute.arch.make_warp_uniform(item + cutlass.Int32(self.n_ctas))
+
+    @cute.jit
+    def uniform_state(self, state):
+        """``state`` with its slot and phase marked warp-uniform (first_item)."""
+        return PipelineState(idx=cute.arch.make_warp_uniform(state.idx), phase=cute.arch.make_warp_uniform(state.phase))
+
+    @cute.jit
+    def next_q_phase(self, phase):
+        """The next item's Q phase, warp-uniform (first_item): Q's one slot completes one phase per item."""
+        return cute.arch.make_warp_uniform(phase ^ cutlass.Int32(1))
+
+    @cute.jit
+    def phase_ends(self, work):
+        """``(masked_end, unmasked_end)`` of one item's reverse walk: compute_warp_group's phase bounds."""
+        right = cute.math.max(cutlass.Int32(0), work.kv_right)
+        left = right - work.iterations
+        diagonal = work.kv_len - work.q_len if cutlass.const_expr(self.bottom_right) else cutlass.Int32(0)
+        hi = cute.math.min(right, work.kv_len // self.KV_TILE)
+        if cutlass.const_expr(self.mask_flags & MASK_CAUSAL):
+            # The last key must be <= the earliest row's inclusive upper bound.
+            full_columns = cute.math.max(cutlass.Int32(0), work.q_base + diagonal + 1)
+            hi = cute.math.min(hi, full_columns // self.KV_TILE)
+        hi = cute.math.max(left, hi)
+        lo = cute.math.min(left, hi)
+        if cutlass.const_expr(not self.q_rows_full):
+            if work.q_base + self.Q_TILE > work.q_len:
+                lo = hi
+        masked_end = cute.math.min(work.iterations, cute.math.max(cutlass.Int32(1), right - hi))
+        unmasked_end = cute.math.min(work.iterations, cute.math.max(masked_end, right - lo))
+        return masked_end, unmasked_end
+
+    @cute.jit
+    def softmax_setup(self, scale, anchor, partial_sum, alpha):
+        """compute_warp_group's softmax parameters, once per CTA: the scales and the launch-uniform FP64 guard depend on
+        the launch only."""
+        scale_log2 = scale * cutlass.Float32(LOG2_E)
+        scale_log2_wide = cutlass.Float64(scale) * cutlass.Float64(LOG2_E)
+        wide_uniform, wide_limit = cutlass.Boolean(False), cutlass.Float32(0.0)
+        if cutlass.const_expr(self.scale_mode == SCALE_POSITIVE):
+            # Launch-uniform: decide the scale-only guard once, in setup. The row limit is
+            # the smaller of the FP32 overflow bound and 2**24 / |k|: past |anchor * k| =
+            # 2**24 one rounding of anchor * k moves the top exponent by more than 1.
+            magnitude = cutlass.Float64(cute.math.abs(scale_log2))
+            wide_uniform = magnitude > cutlass.Float64(FLT_MAX_F64)
+            limit = cutlass.Float32(cutlass.Float64(FLT_MAX_F64) / magnitude)
+            if cutlass.Float64(limit) * magnitude > cutlass.Float64(FLT_MAX_F64):
+                limit = (limit.bitcast(cutlass.Uint32) - cutlass.Uint32(1)).bitcast(cutlass.Float32)
+            limit = cute.arch.fmin(limit, cutlass.Float32(cutlass.Float64(2.0**24) / magnitude))
+            # Anchors up to 2**126 apart cannot overflow their FP32 difference. A row limit past
+            # 2**126 needs |k| below 2**-102, so such a launch takes FP64 exponents on every row,
+            # and the per-row test (online_softmax) stays one FP32 compare: no FP64 instruction issues
+            # on the narrow path, where it would wait behind the other warpgroup's WGMMA.
+            wide_uniform = wide_uniform | (limit > cutlass.Float32(2.0**126))
+            wide_limit = limit
+        # Natural-log scale for finalization, FP32/FP64 log2 scales for EX2, and the
+        # launch-uniform guard terms for the per-row magnitude test.
+        return SimpleNamespace(
+            anchor=anchor,
+            partial_sum=partial_sum,
+            alpha=alpha,
+            scale=scale,
+            scale_log2=scale_log2,
+            scale_log2_wide=scale_log2_wide,
+            wide_uniform=wide_uniform,
+            wide_limit=wide_limit,
+        )
+
+    @cute.jit
+    def reset_item_state(self, cta):
+        """Start an item: O back to zero (every PV accumulates) and the anchor back to the sentinel (a first-tile softmax
+        still reads the old anchor in its FP64 guard). The first tile overwrites the lane-partial sum and alpha, and
+        finalize overwrites 1/sum and the LSE, so they need no reset."""
+        cta.output.store((0.0,) * self.o_fragment_slots)
+        sentinel = cutlass.Float32(self.anchor_sentinel)
+        cta.softmax_params.anchor.store((sentinel, sentinel))
+
+    @cute.jit
+    def item_params(self, cta, work):
+        """One item's basic_params and mma_params, as compute_warp_group builds them."""
+        row_base = work.q_base + cta.w * self.WG_ROWS
+        basic_params = SimpleNamespace(bars=cta.bars, local_tid=cta.local_tid, work=work, row_base=row_base)
+        mma_params = SimpleNamespace(o_regs=cta.output, q_desc=cta.q_desc, k_desc=cta.k_desc, v_desc=cta.v_desc)
+        return basic_params, mma_params
+
+    @cute.jit
+    def item_steps(self, basic_params, mma_params, softmax_params, qk, p_words, k_state, v_state):
+        """One item's steps t = 1 .. iterations - 1 in compute_warp_group's three phases; the last one releases Q
+        (release_q)."""
+        work = basic_params.work
+        masked_end, unmasked_end = self.phase_ends(work)
+        for kv_step in cutlass.range(1, masked_end, unroll=1):
+            k_state, v_state = self.overlap_kv_step(
+                basic_params, mma_params, softmax_params, qk, p_words, kv_step, k_state, v_state, active_masks=self.mask_flags | MASK_PADDED, release_q=True
+            )
+        for kv_step in cutlass.range(masked_end, unmasked_end, unroll=1):
+            k_state, v_state = self.overlap_kv_step(
+                basic_params, mma_params, softmax_params, qk, p_words, kv_step, k_state, v_state, active_masks=MASK_NONE, release_q=True
+            )
+        for kv_step in cutlass.range(unmasked_end, work.iterations, unroll=1):
+            k_state, v_state = self.overlap_kv_step(
+                basic_params, mma_params, softmax_params, qk, p_words, kv_step, k_state, v_state, active_masks=self.mask_flags | MASK_PADDED, release_q=True
+            )
+        return k_state, v_state
+
+    @cute.jit
+    def finalize_rows(self, cta):
+        """Finalize one item's two rows per lane into row_sum_inv and row_lse, as compute_warp_group does.
+
+        :return: ``(row_sum_inv, row_lse)``, each the two rows' values.
+        """
+        sp = cta.softmax_params
+        for row_half in cutlass.range_constexpr(2):
+            total = quad_reduce(sp.partial_sum[row_half], "sum")
+            inv, value = normalize_row(sp.anchor[row_half], sp.scale, sp.scale_log2, total, self.scale_mode)
+            cta.row_sum_inv[row_half], cta.row_lse[row_half] = inv, value
+        return cta.row_sum_inv.load(0, 2), cta.row_lse.load(0, 2)
+
+    @cute.jit
+    def store_stats(self, cta, work, row_base, row_lse_values):
+        """One item's Stats rows as compute_warp_group stores them: Int64 strides with every index promoted before its
+        multiply (SDPA Rule S7), one writer lane per row, rows past q_output_limit skipped."""
+        lse = cta.lse
+        if cutlass.const_expr(lse is not None):
+            if cta.local_tid % 4 == 0:
+                for row_half in cutlass.range_constexpr(2):
+                    token = row_base + owned_row(cta.local_tid, row_half)
+                    if token < work.q_output_limit:
+                        origin = cutlass.Int64(work.batch) * cutlass.Int64(lse.stride[0])
+                        lse_out = row_lse_values[row_half]
+                        if cutlass.const_expr(self.stats_log2):
+                            lse_out = lse_out * cutlass.Float32(LOG2_E)
+                        offset = origin + cutlass.Int64(work.head) * cutlass.Int64(lse.stride[1]) + cutlass.Int64(token) * cutlass.Int64(lse.stride[2])
+                        lse.iterator[offset] = lse_out
+
+    @cute.jit
+    def tmaldg_persistent(self, sQ, sK, sV, bars, tma_q_desc, tma_k_desc, tma_v_desc):
+        """Persistent producer (step 8): this CTA's items in turn, each K(i, 0), Q(i), V(i, 0), then the rest of its
+        reverse walk as tmaldg_warp_group's.
+
+        Warp 0 of WG0 only. The EMPTY phases start at 1 (passes at once on a fresh barrier) and are carried across items,
+        so item i+1's loads continue the rings where item i's ended: the producer runs ahead into item i+1 as far as the
+        K/V rings allow, and loads Q(i+1) as soon as the compute warpgroups release Q(i), right after item i's last QK.
+        K(i, 0) goes before Q's EMPTY wait (FA3's order), so it is in flight while item i finishes. Every item has KV work
+        (the constructor's precondition), so there is no liveness branch and the Q phase flips once per item, as the
+        compute warpgroups' does. The closing waits take Q's last release, then walk the WHOLE K/V ring, from the carried
+        states (python/cudnn/sdpa/AGENTS.md, the whole-ring drain lesson): no TMA payload is in flight at exit.
+        """
+        tid = cute.arch.thread_idx()[0]
+        if tid < cute.arch.WARP_SIZE:
+            q_empty_phase = cutlass.Int32(1)
+            kv_empty_state = PipelineState.start(phase=1)
+            item = self.first_item()
+            while item < cutlass.Int32(self.items):
+                work = self.work_of(item)
+                first_seq_idx = (work.kv_right - 1) * self.KV_TILE
+                first_stage = kv_empty_state.idx
+                bars.mb_tma_k_empty[first_stage].wait(kv_empty_state.phase)
+                self.load_one_kv_tile(sK[first_stage], tma_k_desc, bars.mb_tma_k_full[first_stage], work, first_seq_idx, is_v=False)
+                bars.mb_tma_q_empty.wait(q_empty_phase)
+                self.load_q_tile_tma(sQ, tma_q_desc, bars.mb_tma_q_full, work)
+                q_empty_phase = self.next_q_phase(q_empty_phase)
+                bars.mb_tma_v_empty[first_stage].wait(kv_empty_state.phase)
+                self.load_one_kv_tile(sV[first_stage], tma_v_desc, bars.mb_tma_v_full[first_stage], work, first_seq_idx, is_v=True)
+                kv_empty_state = advance(kv_empty_state, self.KV_STAGES)
+                for kv_step in cutlass.range(1, work.iterations, unroll=1):
+                    kv_seq_idx = (work.kv_right - 1 - kv_step) * self.KV_TILE
+                    stage = kv_empty_state.idx
+                    bars.mb_tma_k_empty[stage].wait(kv_empty_state.phase)
+                    self.load_one_kv_tile(sK[stage], tma_k_desc, bars.mb_tma_k_full[stage], work, kv_seq_idx, is_v=False)
+                    bars.mb_tma_v_empty[stage].wait(kv_empty_state.phase)
+                    self.load_one_kv_tile(sV[stage], tma_v_desc, bars.mb_tma_v_full[stage], work, kv_seq_idx, is_v=True)
+                    kv_empty_state = advance(kv_empty_state, self.KV_STAGES)
+                kv_empty_state = self.uniform_state(kv_empty_state)
+                item = self.next_item(item)
+            bars.mb_tma_q_empty.wait(q_empty_phase)
+            for _ in cutlass.range_constexpr(self.KV_STAGES):
+                bars.mb_tma_k_empty[kv_empty_state.idx].wait(kv_empty_state.phase)
+                bars.mb_tma_v_empty[kv_empty_state.idx].wait(kv_empty_state.phase)
+                kv_empty_state = advance(kv_empty_state, self.KV_STAGES)
+
+    @cute.jit
+    def walk_items(self, cta):
+        """This CTA's items in turn, each run as compute_warp_group runs its one tile, Q released in the walk.
+
+        The loop body calls no method of ``cta`` itself: the DSL carries every object whose method a dynamic loop calls,
+        and ``cta`` holds the O tensor map, which cannot be carried. ``bars`` (frozen barrier records) can.
+        """
+        bars = cta.bars
+        kv_full_state = PipelineState.start(phase=0)
+        q_full_phase = cutlass.Int32(0)
+        item = self.first_item()
+        while item < cutlass.Int32(self.items):
+            work = self.work_of(item)
+            basic_params, mma_params = self.item_params(cta, work)
+            self.reset_item_state(cta)
+            # Q's one slot completes one phase per item, so the CTA's item n (from 0) waits parity n & 1: the carried
+            # phase, flipped once per item. The one-tile kernel's literal phase 0 would pass item 1's wait at once,
+            # before its Q lands.
+            bars.mb_tma_q_full.wait(q_full_phase)
+            # V trails K by one tile inside an item and restarts from K at each item (the drain does not advance it).
+            v_state = kv_full_state
+            kv_full_state = self.overlap_first_tile(basic_params, mma_params, cta.softmax_params, cta.qk, cta.p_words, kv_full_state, release_q=True)
+            kv_full_state, v_state = self.item_steps(basic_params, mma_params, cta.softmax_params, cta.qk, cta.p_words, kv_full_state, v_state)
+            self.overlap_drain(basic_params, mma_params, cta.softmax_params, cta.p_words, v_state)
+            q_full_phase = self.next_q_phase(q_full_phase)
+            kv_full_state = self.uniform_state(kv_full_state)
+            row_sum_inv_values, row_lse_values = self.finalize_rows(cta)
+            self.store_stats(cta, work, basic_params.row_base, row_lse_values)
+            self.epilogue(bars, work, cta.tma_o_desc, cta.sO, cta.output, row_sum_inv_values, cta.local_tid, cta.w, basic_params.row_base, persistent=True)
+            item = self.next_item(item)
+
+    @cute.jit
+    def compute_persistent(self, tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, w):
+        """Run compute warpgroup ``w`` (0 for WG1, 1 for WG2) over every item of this CTA (step 8).
+
+        Built once per CTA, as compute_warp_group builds them per tile: the register Arrays, the operand descriptors, the
+        row state and the launch-uniform scale guard. Then the walk (walk_items). After it, every lane of warp 0 waits for
+        this half's last O store to finish reading sO before the CTA exits and frees it (the deferred wait, epilogue).
+        """
+        local_tid = cute.arch.thread_idx()[0] % cute.arch.THREADS_PER_WARPGROUP
+        anchor = cutlass.Array(cutlass.Float32, 2, alignment=16)
+        partial_sum = cutlass.Array(cutlass.Float32, 2, alignment=16)
+        partial_sum.store((0.0, 0.0))
+        alpha = cutlass.Array(cutlass.Float32, 2, alignment=8)
+        cta = SimpleNamespace(
+            bars=bars,
+            local_tid=local_tid,
+            w=w,
+            lse=lse,
+            sO=sO,
+            tma_o_desc=tma_o_desc,
+            qk=cutlass.Array(cutlass.Float32, 2 * self.qk_row_slots, alignment=16),
+            output=cutlass.Array(cutlass.Float32, self.o_fragment_slots, alignment=16),
+            p_words=cutlass.Array(cutlass.Float32, self.qk_row_slots, alignment=16),
+            row_sum_inv=cutlass.Array(cutlass.Float32, 2, alignment=8),
+            row_lse=cutlass.Array(cutlass.Float32, 2, alignment=8),
+            q_desc=wgmma_descriptor(sQ.base.subview(w * self.WG_ROWS * self.swizzle_chunk_elems)),
+            k_desc=wgmma_descriptor(sK.base),
+            v_desc=wgmma_descriptor(sV.base, mn_major=True, slab_rows=self.KV_TILE),
+            softmax_params=self.softmax_setup(scale, anchor, partial_sum, alpha),
+        )
+        self.walk_items(cta)
+        if local_tid < cute.arch.WARP_SIZE:
+            tma_store_wait(0)
+
+    @cute.jit
+    def _run_persistent(self, tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, wg):
+        """Step 8: _run_unit's register split, once per CTA, then the role over every item.
+
+        setmaxnreg is warpgroup-collective, so all four WG0 warps still run it before warps 1 to 3 go idle.
+        """
+        if wg == 0:
+            prims.setmaxregister(self.REG_BUDGETS[0], prims.SetMaxRegisterAction.DECREASE)
+            self.tmaldg_persistent(sQ, sK, sV, bars, tma_q_desc, tma_k_desc, tma_v_desc)
+        else:
+            prims.setmaxregister(self.REG_BUDGETS[1], prims.SetMaxRegisterAction.INCREASE)
+            self.compute_persistent(tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, wg - 1)
+
+    @cute.jit
     def _run_unit(self, tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, wg, tile, head, batch):
         """Resolve one (Q tile, head, batch) work tile and run this thread's role on it.
 
@@ -988,7 +1372,8 @@ class SM90FusedMultiHeadAttentionForward:
         lse,
         scale: cutlass.Float32,
     ):
-        """Run one work tile per CTA: allocate, decode, then run the three roles.
+        """Run one work tile per CTA, or under ``persistent`` every item of the CTA's stride: allocate, decode, then run
+        the three roles.
 
         Warp 0's elected lane initializes every barrier, and the default CTA barrier (id 0)
         publishes them before any role runs.
@@ -1094,31 +1479,36 @@ class SM90FusedMultiHeadAttentionForward:
                     bars.mb_tma_v_empty[stage].init()
         prims.fence_mbarrier_init()
         prims.barrier_cta_sync()
-        # One (Q tile, head, batch) work tile per CTA; the LPT policies unflatten the single
-        # grid axis they launch.
-        tile, head, batch = cute.arch.block_idx()
-        if cutlass.const_expr(self.sched_policy == SCHED_LPT_L2):
-            # As the D512 template: a block holds a power of two of whole KV groups -- one KV
-            # head and the query heads reading it -- within the budget; 0 bytes means one
-            # group. lpt_l2_tile_coords floors its per-group bytes and group count at 1, so
-            # its wrapping Int32 product cannot matter.
-            row_bytes = 2 * self.HEAD_TILE * self.storage_dtype.bytes
-            groups = SCHED_L2_BUDGET_BYTES // max(1, self.s_kv * row_bytes)
-            l2_bytes = (1 << groups.bit_length() - 1) * self.s_kv * row_bytes if groups > 1 else 0
-            tile, head, batch = lpt_l2_tile_coords(
-                tile,
-                cutlass.Int32(self.heads),
-                cutlass.Int32(self.b),
-                cutlass.Int32(self.q_tiles),
-                self.qh_per_kh,
-                cutlass.Int32(self.s_kv),
-                row_bytes,
-                l2_bytes,
-            )
-        elif cutlass.const_expr(self.sched_policy != SCHED_NATURAL):
-            tile, head, batch = lpt_tile_coords(tile, cutlass.Int32(self.heads), cutlass.Int32(self.b), cutlass.Int32(self.q_tiles))
-        wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) // cute.arch.WARPS_PER_WARPGROUP
-        self._run_unit(tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, wg, tile, head, batch)
+        if cutlass.const_expr(self.persistent):
+            # Step 8: every role walks this CTA's items (at most one CTA per SM, __call__).
+            wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) // cute.arch.WARPS_PER_WARPGROUP
+            self._run_persistent(tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, wg)
+        else:
+            # One (Q tile, head, batch) work tile per CTA; the LPT policies unflatten the single
+            # grid axis they launch.
+            tile, head, batch = cute.arch.block_idx()
+            if cutlass.const_expr(self.sched_policy == SCHED_LPT_L2):
+                # As the D512 template: a block holds a power of two of whole KV groups -- one KV
+                # head and the query heads reading it -- within the budget; 0 bytes means one
+                # group. lpt_l2_tile_coords floors its per-group bytes and group count at 1, so
+                # its wrapping Int32 product cannot matter.
+                row_bytes = 2 * self.HEAD_TILE * self.storage_dtype.bytes
+                groups = SCHED_L2_BUDGET_BYTES // max(1, self.s_kv * row_bytes)
+                l2_bytes = (1 << groups.bit_length() - 1) * self.s_kv * row_bytes if groups > 1 else 0
+                tile, head, batch = lpt_l2_tile_coords(
+                    tile,
+                    cutlass.Int32(self.heads),
+                    cutlass.Int32(self.b),
+                    cutlass.Int32(self.q_tiles),
+                    self.qh_per_kh,
+                    cutlass.Int32(self.s_kv),
+                    row_bytes,
+                    l2_bytes,
+                )
+            elif cutlass.const_expr(self.sched_policy != SCHED_NATURAL):
+                tile, head, batch = lpt_tile_coords(tile, cutlass.Int32(self.heads), cutlass.Int32(self.b), cutlass.Int32(self.q_tiles))
+            wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) // cute.arch.WARPS_PER_WARPGROUP
+            self._run_unit(tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, wg, tile, head, batch)
 
     kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
@@ -1178,10 +1568,13 @@ class SM90FusedMultiHeadAttentionForward:
             port_tma_desc(v, self.KV_TILE, self.tma_orders[2]),
             port_tma_desc(o, self.WG_ROWS, self.tma_orders[3]),
         )
-        # The LPT policies launch the same tiles on one axis, which kernel unflattens.
+        # The LPT policies launch the same tiles on one axis, which kernel unflattens; a persistent record launches at most
+        # one CTA per SM and never more than the items, and each CTA walks its items (step 8).
         grid = (self.q_tiles, self.heads, self.b)
         if cutlass.const_expr(self.sched_policy != SCHED_NATURAL):
             grid = (self.q_tiles * self.heads * self.b, 1, 1)
+        if cutlass.const_expr(self.persistent):
+            grid = (self.n_ctas, 1, 1)
         if cutlass.const_expr(sinks is not None):
             raise ValueError("prefill_d128_f16_sm90: a D128 specialization binds no sinks")
         # The declared problem sizes the grid, the KV-head addressing and the Stats store, so
@@ -1215,6 +1608,7 @@ def compile(  # noqa: A001
     target: str = "sm_90a",
     d_qk: int = 128,
     d_v: int = 128,
+    persistent_ctas: int = 0,
 ) -> Callable:
     """Compile one declared problem at plan build time.
 
@@ -1224,14 +1618,37 @@ def compile(  # noqa: A001
     ``has_lse`` template. The result exposes the positional pointer ABI in
     ``prepared_host.host``. ``d_qk``/``d_v`` must be the flavor's 128; this front coerces
     them to plain ints, because ``template_key`` refuses a non-plain argument.
+    ``persistent_ctas`` caps a persistent record's grid (SdpaFwdDslSm90 sizes it to the
+    SM count, as SM120 D512 does): positive exactly when ``PARAMS.persistent``, else 0, so
+    a one-tile-per-CTA key never names a device.
     """
     if (d_qk, d_v) != D128_FLAVOR:
         raise ValueError(f"prefill_d128_f16_sm90: serves D_QK = D_V = 128 exactly; got D_QK={d_qk}/D_V={d_v}")
-    return _compile(b, h_q, h_kv, s_q, s_kv, q_stride, k_stride, v_stride, o_stride, lse_stride, target=target, d_qk=int(d_qk), d_v=int(d_v))
+    if isinstance(persistent_ctas, bool) or int(persistent_ctas) < 0 or PARAMS.persistent != (int(persistent_ctas) > 0):
+        raise ValueError(
+            "prefill_d128_f16_sm90: persistent_ctas must be positive exactly when the record is persistent; "
+            f"got {persistent_ctas!r} with persistent={PARAMS.persistent}"
+        )
+    return _compile(
+        b,
+        h_q,
+        h_kv,
+        s_q,
+        s_kv,
+        q_stride,
+        k_stride,
+        v_stride,
+        o_stride,
+        lse_stride,
+        target=target,
+        d_qk=int(d_qk),
+        d_v=int(d_v),
+        persistent_ctas=int(persistent_ctas),
+    )
 
 
 @lru_cache(maxsize=None)
-def _compile(b, h_q, h_kv, s_q, s_kv, q_stride, k_stride, v_stride, o_stride, lse_stride, *, target, d_qk, d_v):
+def _compile(b, h_q, h_kv, s_q, s_kv, q_stride, k_stride, v_stride, o_stride, lse_stride, *, target, d_qk, d_v, persistent_ctas):
     """Build the compiled launcher for :func:`compile`.
 
     ``compiled_cache`` persists it across processes.
@@ -1251,6 +1668,8 @@ def _compile(b, h_q, h_kv, s_q, s_kv, q_stride, k_stride, v_stride, o_stride, ls
         scale_mode=PARAMS.scale_mode,
         stats_log2=PARAMS.stats_log2,
         intra_wg_overlap=PARAMS.intra_wg_overlap,
+        persistent=PARAMS.persistent,
+        persistent_ctas=persistent_ctas,
     )
 
     # Axis order is plan metadata, shared by descriptor construction and kernel
