@@ -557,9 +557,14 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
         # Deterministic keeps them to avoid a small-workload SM100 regression.
         self.num_heads = num_heads
         self.round_head_chunks = num_heads // self.ROUND_K_HEADS
+        # Ordinary H96 only needs three 32-head operands per dV/dK sweep.
+        # Keep the deterministic producer geometry unchanged so its fixed
+        # reduction schedule remains byte-for-byte equivalent to upstream.
+        self.round_gens_per_group = self.H_TILE_CLUSTER // self.ROUND_K_HEADS if self.deterministic else self.round_head_chunks
+        self.round_gens_per_tile = 4 * self.round_gens_per_group
         assert self.H_TILE_CLUSTER % self.ROUND_K_HEADS == 0
         assert self.ROUND_STAGES in (2, 4, 8)
-        assert self.ROUND_GENS_PER_TILE % (2 * self.ROUND_STAGES) == 0
+        assert self.round_gens_per_tile % (2 * self.ROUND_STAGES) == 0
         assert (
             self.GATHER_SETMAXREG * self.GATHER_THREADS
             + self.MATH_SETMAXREG * self.MATH_THREADS
@@ -694,6 +699,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
         round_fragment_7: cute.Tensor,
         b_fragment_0: cute.Tensor,
         b_fragment_1: cute.Tensor,
+        sweep_index: cutlass.Constexpr[int],
         first_accumulate: cutlass.Constexpr[bool],
         round_pipeline,
         round_consumer_state: pipeline.PipelineState,
@@ -720,16 +726,20 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
             b_k_half = head_base % self.H_TILE_CTA // self.ROUND_K_HEADS
             accumulate = True if chunk > 0 else first_accumulate
             round_pipeline.consumer_wait(round_consumer_state)
-            self._issue_dkv_pass(dkv_tiled_mma, t_dkv, round_slot_fragments[chunk % self.ROUND_STAGES], b_fragment, b_k_half, accumulate)
+            if cutlass.const_expr(self.deterministic):
+                round_slot = chunk % self.ROUND_STAGES
+            else:
+                round_slot = (sweep_index * self.round_head_chunks + chunk) % self.ROUND_STAGES
+            self._issue_dkv_pass(dkv_tiled_mma, t_dkv, round_slot_fragments[round_slot], b_fragment, b_k_half, accumulate)
             round_pipeline.consumer_release(round_consumer_state)
             round_consumer_state.advance()
-        # Keep every sweep aligned to round fragment zero. H96 consumes three
-        # useful chunks from a two-stage ring, so it retires the fourth
-        # producer generation without issuing the invalid-head MMA.
-        for _ in cutlass.range_constexpr((-self.round_head_chunks) % self.ROUND_STAGES):
-            round_pipeline.consumer_wait(round_consumer_state)
-            round_pipeline.consumer_release(round_consumer_state)
-            round_consumer_state.advance()
+        if cutlass.const_expr(self.deterministic):
+            # Preserve the fixed four-generation sweep used by the
+            # deterministic H96 schedule.
+            for _ in cutlass.range_constexpr((-self.round_head_chunks) % self.ROUND_STAGES):
+                round_pipeline.consumer_wait(round_consumer_state)
+                round_pipeline.consumer_release(round_consumer_state)
+                round_consumer_state.advance()
         return round_consumer_state
 
     @cute.jit
@@ -3003,6 +3013,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
                             round_fragments[7 % len(round_fragments)],
                             p_fragments[0],
                             p_fragments[1],
+                            0,
                             False,
                             pipe_round,
                             round_cons,
@@ -3022,6 +3033,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
                             round_fragments[7 % len(round_fragments)],
                             p_fragments[0],
                             p_fragments[1],
+                            1,
                             False,
                             pipe_round,
                             round_cons,
@@ -3043,6 +3055,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
                             round_fragments[7 % len(round_fragments)],
                             ds_fragments[0],
                             ds_fragments[1],
+                            2,
                             True,
                             pipe_round,
                             round_cons,
@@ -3063,6 +3076,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
                             round_fragments[7 % len(round_fragments)],
                             ds_fragments[0],
                             ds_fragments[1],
+                            3,
                             True,
                             pipe_round,
                             round_cons,
@@ -3093,8 +3107,8 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
                 if has_dkv:
                     round_count = my_tile_count
                 for loop_iter in cutlass.range(round_count):
-                    gens_per_group = self.H_TILE_CLUSTER // self.ROUND_K_HEADS
-                    for micro_gen in cutlass.range_constexpr(self.ROUND_GENS_PER_TILE):
+                    gens_per_group = self.round_gens_per_group
+                    for micro_gen in cutlass.range_constexpr(self.round_gens_per_tile):
                         if cutlass.const_expr(split_regime):
                             grad_round = micro_gen // (2 * gens_per_group)
                             tensor_kind = micro_gen // gens_per_group % 2
@@ -3105,7 +3119,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
                         round_slot = micro_gen % self.ROUND_STAGES
                         round_acq = pipeline.PipelineState(
                             self.ROUND_STAGES,
-                            loop_iter * Int32(self.ROUND_GENS_PER_TILE) + Int32(micro_gen),
+                            loop_iter * Int32(self.round_gens_per_tile) + Int32(micro_gen),
                             Int32(round_slot),
                             Int32(1 ^ micro_gen // self.ROUND_STAGES & 1),
                         )
@@ -3126,7 +3140,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
                                 tma_bar_ptr=round_completion_mbar,
                             )
                 if has_dkv:
-                    round_tail = pipeline.PipelineState(self.ROUND_STAGES, my_tile_count * Int32(self.ROUND_GENS_PER_TILE), Int32(0), Int32(1))
+                    round_tail = pipeline.PipelineState(self.ROUND_STAGES, my_tile_count * Int32(self.round_gens_per_tile), Int32(0), Int32(1))
                     pipe_round.producer_tail(round_tail)
             elif cutlass.const_expr(mTopkLength is not None and self.max_topk == 128):
                 cute.arch.mbarrier_wait(stationary_tma_mbars, Int32(0))
@@ -3398,14 +3412,14 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
     ):
         """Finish dK0, then issue dV1/dK1 after the caller's first dV sweep."""
         _mbarrier_wait_acquire_cluster(relay_mbars + 1, relay_phase)
-        round_consumer_state = self._issue_dkv_sweep(dkv_tiled_mma, t_dkv_0, *round_fragments, *ds_fragments, True, round_pipeline, round_consumer_state)
+        round_consumer_state = self._issue_dkv_sweep(dkv_tiled_mma, t_dkv_0, *round_fragments, *ds_fragments, 1, True, round_pipeline, round_consumer_state)
         cute.arch.fence_view_async_tmem_store()
         dkv_done_pipeline.producer_commit(dkv_commit_state)
         dkv_commit_state.advance()
         dkv_done_pipeline.producer_acquire(dkv_acquire_state)
         dkv_acquire_state.advance()
-        round_consumer_state = self._issue_dkv_sweep(dkv_tiled_mma, t_dkv_1, *round_fragments, *p_fragments, False, round_pipeline, round_consumer_state)
-        round_consumer_state = self._issue_dkv_sweep(dkv_tiled_mma, t_dkv_1, *round_fragments, *ds_fragments, True, round_pipeline, round_consumer_state)
+        round_consumer_state = self._issue_dkv_sweep(dkv_tiled_mma, t_dkv_1, *round_fragments, *p_fragments, 2, False, round_pipeline, round_consumer_state)
+        round_consumer_state = self._issue_dkv_sweep(dkv_tiled_mma, t_dkv_1, *round_fragments, *ds_fragments, 3, True, round_pipeline, round_consumer_state)
         cute.arch.fence_view_async_tmem_store()
         dkv_done_pipeline.producer_commit(dkv_commit_state)
         dkv_commit_state.advance()
@@ -3455,7 +3469,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
         _mbarrier_wait_acquire_cluster(relay_mbars, relay_phase)
         dkv_done_pipeline.producer_acquire(dkv_acquire_state)
         dkv_acquire_state.advance()
-        round_consumer_state = self._issue_dkv_sweep(dkv_tiled_mma, t_dkv_0, *round_fragments, *p_fragments, False, round_pipeline, round_consumer_state)
+        round_consumer_state = self._issue_dkv_sweep(dkv_tiled_mma, t_dkv_0, *round_fragments, *p_fragments, 0, False, round_pipeline, round_consumer_state)
         pds_pipeline.consumer_wait(pds_consumer_state)
         round_consumer_state, dkv_acquire_state, dkv_commit_state = self._finish_dkv_panels(
             dkv_tiled_mma,
@@ -3537,7 +3551,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
         _mbarrier_wait_acquire_cluster(relay_mbars, relay_phase)
         dkv_done_pipeline.producer_acquire(dkv_acquire_state)
         dkv_acquire_state.advance()
-        round_consumer_state = self._issue_dkv_sweep(dkv_tiled_mma, t_dkv_0, *round_fragments, *p_fragments, False, round_pipeline, round_consumer_state)
+        round_consumer_state = self._issue_dkv_sweep(dkv_tiled_mma, t_dkv_0, *round_fragments, *p_fragments, 0, False, round_pipeline, round_consumer_state)
         _mbarrier_wait_acquire_cluster(ds_local_ready_mbar, relay_phase)
         kscore_consumer_state = self._issue_dq_rounds_early(
             dq_tiled_mma,

@@ -265,6 +265,21 @@ def test_DSA_sparse_attention_backward_sm100_h96_dispatch():
 
 
 @pytest.mark.L0
+def test_DSA_sparse_attention_backward_h96_ordinary_skips_padded_dkv_generation():
+    """Ordinary H96 produces 12 useful round operands; deterministic H96 retains its fixed 16."""
+    module = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_h128_d576_2cta")
+    common = (module.BFloat16, 576, 512, 64, 128)
+
+    ordinary_h96 = module.FlashAttentionDSABackwardSm100H128D576TwoCTA(*common, num_heads=96)
+    ordinary_h128 = module.FlashAttentionDSABackwardSm100H128D576TwoCTA(*common, num_heads=128)
+    deterministic_h96 = module.FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic(*common, num_heads=96)
+
+    assert (ordinary_h96.round_gens_per_group, ordinary_h96.round_gens_per_tile) == (3, 12)
+    assert (ordinary_h128.round_gens_per_group, ordinary_h128.round_gens_per_tile) == (4, 16)
+    assert (deterministic_h96.round_gens_per_group, deterministic_h96.round_gens_per_tile) == (4, 16)
+
+
+@pytest.mark.L0
 def test_DSA_sparse_attention_backward_sm100_h96_deterministic_composition():
     """The H96 stages must share one fixed-owner reduction policy."""
     interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100")
