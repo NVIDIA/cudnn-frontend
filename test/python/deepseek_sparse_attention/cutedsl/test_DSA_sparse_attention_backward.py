@@ -226,7 +226,7 @@ def test_DSA_sparse_attention_backward_sm100_auto_dispatch(
 
 @pytest.mark.L0
 def test_DSA_sparse_attention_backward_sm100_h96_dispatch():
-    """Select the H96 composition for ordinary and deterministic execution."""
+    """Select native H96 only inside the validated two-CTA envelope."""
     try:
         from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100 import _select_sm100_backend
     except ImportError:
@@ -235,6 +235,15 @@ def test_DSA_sparse_attention_backward_sm100_h96_dispatch():
     assert _select_sm100_backend(96, 576, max_topk=512) == ("h96_h64_h32", 64)
     assert _select_sm100_backend(96, 576, max_topk=1024) == ("h96_h64_h32", 64)
     assert _select_sm100_backend(96, 576, max_topk=2048, deterministic=True) == ("h96_h64_h32", 64)
+    assert _select_sm100_backend(
+        96,
+        576,
+        head_dim_v=512,
+        dtype=torch.bfloat16,
+        max_topk=2048,
+        device_capability=(10, 0),
+        deterministic=False,
+    ) == ("h96_d576_2cta_m64", 64)
     assert _select_sm100_backend(
         96,
         576,
@@ -1373,7 +1382,7 @@ def test_DSA_sparse_attention_backward_sm100_h128_two_cta_dispatch_is_fail_close
     assert _select_sm100_backend(128, 512, **supported, deterministic=True) == ("h128_2cta_m64", 64)
     assert _select_sm100_backend(128, 512, **supported, deterministic=True, is_contiguous=False) == ("generic_m64", 64)
     assert _select_sm100_backend(96, 576, **supported, deterministic=True) == ("h96_d576_2cta_m64", 64)
-    assert _select_sm100_backend(96, 576, **supported, deterministic=False) == ("h96_h64_h32", 64)
+    assert _select_sm100_backend(96, 576, **supported, deterministic=False) == ("h96_d576_2cta_m64", 64)
     assert _select_sm100_backend(96, 576, **supported, deterministic=True, is_contiguous=False) == ("h96_h64_h32", 64)
     assert _select_sm100_backend(16, 576, deterministic=True) == ("generic_m64", 64)
 
@@ -1972,8 +1981,8 @@ def test_DSA_sparse_attention_backward_wrapper_h128(topk, has_topk_length, deter
 @pytest.mark.xdist_group(name="gpu_exclusive")
 @pytest.mark.parametrize("has_topk_length", [False, True], ids=["full-topk", "lengths"])
 @torch_fork_set_rng(seed=96)
-def test_DSA_sparse_attention_backward_wrapper_h96_composite(has_topk_length, request):
-    """Validate the H64 plus H32 composition against the FP32 reference."""
+def test_DSA_sparse_attention_backward_wrapper_h96_d576(has_topk_length, request):
+    """Validate the native H96 route, or its device fallback, against the FP32 reference."""
     _run_DSA_sparse_attention_backward_wrapper(
         dtype=torch.bfloat16,
         acc_dtype=torch.float32,
@@ -1989,16 +1998,18 @@ def test_DSA_sparse_attention_backward_wrapper_h96_composite(has_topk_length, re
 @pytest.mark.L0
 @pytest.mark.parametrize("has_topk_length", [False, True], ids=["sentinel-padding", "lengths"])
 @torch_fork_set_rng(seed=960)
-def test_DSA_sparse_attention_backward_sm100_h96_composite_boundaries(has_topk_length, monkeypatch):
-    """Cover empty, partial, and multi-tile rows in both H96 components."""
+def test_DSA_sparse_attention_backward_sm100_h96_native_boundaries(has_topk_length, monkeypatch):
+    """Cover empty, partial, and multi-tile rows in the native H96 backend."""
     _require_sm100()
+    if torch.cuda.get_device_capability() not in _TWO_CTA_CAPABILITIES:
+        pytest.skip("H96 two-CTA requires compute capability 10.0 or 10.3")
     try:
         from cudnn import DSA
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     device = torch.device("cuda")
-    s_q, s_kv, topk_width = 4, 129, 256
+    s_q, s_kv, topk_width = 4, 129, 512
     num_heads, head_dim = 96, 576
     softmax_scale = 1.0 / math.sqrt(head_dim)
     lengths = torch.tensor([0, 1, 65, 129], dtype=torch.int32, device=device)
@@ -2054,7 +2065,7 @@ def test_DSA_sparse_attention_backward_sm100_h96_composite_boundaries(has_topk_l
         atol=5e-2,
         rtol=5e-2,
     )
-    _assert_prepared_sm100_backend(prepared_calls, "h96_h64_h32")
+    _assert_prepared_sm100_backend(prepared_calls, "h96_d576_2cta_m64")
 
 
 @pytest.mark.parametrize(
@@ -4289,6 +4300,7 @@ def test_DSA_sparse_attention_backward_sm90_execute_allocates_nothing_and_never_
         pytest.param(32, 576, 64, False, "off", "h32_m64", id="h32"),
         pytest.param(64, 576, 64, False, "off", "generic_m64", id="h64"),
         pytest.param(96, 576, 64, False, "off", "h96_h64_h32", id="h96"),
+        pytest.param(96, 576, 128, False, "off", "h96_d576_2cta_m64", id="h96-d576-2cta"),
         pytest.param(128, 512, 64, False, "off", "generic_m64", id="h128-generic"),
         pytest.param(128, 512, 128, False, "off", "h128_2cta_m64", id="h128-2cta"),
         pytest.param(128, 576, 128, False, "off", "h128_d576_2cta_m64", id="h128-d576-2cta"),
