@@ -48,8 +48,16 @@ def flops_bwd(seqlen_q, topk, nheads, head_dim, head_dim_v):
 def proportional_query_segments(seqlen_q, segment_lengths_kv):
     """Assign query rows in proportion to packed KV segments, preserving the total."""
     total_s_kv = sum(segment_lengths_kv)
-    segment_lengths_q = [seqlen_q * length // total_s_kv for length in segment_lengths_kv[:-1]]
-    segment_lengths_q.append(seqlen_q - sum(segment_lengths_q))
+    segment_lengths_q = []
+    cumulative_kv = 0
+    previous_q_boundary = 0
+    for segment_kv in segment_lengths_kv:
+        cumulative_kv += segment_kv
+        # Round each cumulative boundary with integer arithmetic so fractional
+        # rows are distributed across segments instead of collected at the end.
+        q_boundary = (seqlen_q * cumulative_kv + total_s_kv // 2) // total_s_kv
+        segment_lengths_q.append(q_boundary - previous_q_boundary)
+        previous_q_boundary = q_boundary
     return segment_lengths_q
 
 
