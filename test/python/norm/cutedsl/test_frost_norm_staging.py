@@ -21,6 +21,12 @@ import torch.nn.functional as F
 
 pytest.importorskip("cudnn.norm", reason="frost norm engines require a built cudnn frontend")
 
+from cudnn.norm._lazy import dsl_unavailable
+
+requirement_error = dsl_unavailable("FROST norm tests")
+if requirement_error:
+    pytest.skip(requirement_error, allow_module_level=True)
+
 from cudnn.norm.config_sm100 import (
     STAGE_BULK,
     STAGE_CPASYNC,

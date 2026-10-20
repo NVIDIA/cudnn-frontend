@@ -195,6 +195,17 @@ python -m benchmark.dsa.benchmark_dsa_indexer_h32
 python -m benchmark.dsa.benchmark_dsa_indexer_h32 profile --profile-case compact_h32
 ```
 
+Add `--deterministic` to benchmark the fixed-owner dK path with its reported
+caller-owned workspace. Add `--topk-indices-global` for the flat KV-id contract
+used by packed DSA forward. For example, a 1M-context/r4 indexer at CP64 has
+16K local query rows and 256K compressed KV rows:
+
+```bash
+python -m benchmark.dsa.benchmark_dsa_indexer_h32 \
+  --seqlen-q 16384 --seqlen-k 262144 --topk 512 \
+  --topk-indices-global --deterministic
+```
+
 ### Sparse Attention Forward
 
 `benchmark_dsa_sparse_attention_forward.py` benchmarks the public SM100

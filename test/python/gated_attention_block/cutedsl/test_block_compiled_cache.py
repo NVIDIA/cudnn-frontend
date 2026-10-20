@@ -123,9 +123,9 @@ def test_every_block_compile_site_goes_through_the_compiled_plan_cache():
 # ---------------------------------------------------------------------------------------------------------------------------------
 
 
-def test_the_plain_modules_key_on_their_file_digest_and_the_memo_dict_key(monkeypatch):
-    """``elementwise`` and ``qk_norm_rope_tma`` hand ``compile_cached`` ``template_key(globals(), {"key": <the dict key>}, <tag>)``
-    -- the file digest, the tag, and exactly the Constexpr tuple the dict memoises under -- with the site's symbol and options."""
+@pytest.mark.parametrize("use_pdl", [False, True])
+def test_the_plain_modules_key_on_their_file_digest_and_the_memo_dict_key(monkeypatch, use_pdl):
+    """Cache keys include the source digest, function tag and all compile flags."""
     calls = []
     monkeypatch.setattr(kern_ew, "compile_cached", _recorder(calls))
     monkeypatch.setattr(kern_ew, "compiled_cache", {})
@@ -143,10 +143,10 @@ def test_the_plain_modules_key_on_their_file_digest_and_the_memo_dict_key(monkey
     monkeypatch.setattr(kern_tma, "compile_cached", _recorder(calls))
     monkeypatch.setattr(kern_tma, "compiled_cache", {})
     monkeypatch.setattr(kern_tma, "current_device", lambda: 0)
-    r = kern_tma.compile_qk_norm_rope_tma(dtype=torch.bfloat16, h_q=8, h_kv=2, d=256, rope_dim=64, eps=1e-6, want_rstd=False, tile_rows=8)
+    r = kern_tma.compile_qk_norm_rope_tma(dtype=torch.bfloat16, h_q=8, h_kv=2, d=256, rope_dim=64, eps=1e-6, want_rstd=False, tile_rows=8, use_pdl=use_pdl)
     (key,) = kern_tma.compiled_cache.keys()
-    assert key[:6] == ("torch.bfloat16", 8, 2, 256, 64, 8) and key[-4:] == (0, True, False, False)  # ..., device, apply_norm, fp8_out, mx_out
-    assert len(key) == 16 and all(isinstance(v, (str, int, bool)) for v in key)
+    assert key[:6] == ("torch.bfloat16", 8, 2, 256, 64, 8) and key[-5:] == (0, True, False, False, use_pdl)
+    assert len(key) == 17 and all(isinstance(v, (str, int, bool)) for v in key)
     assert calls[0]["cache_key"] == cc.template_key(vars(kern_tma), {"key": key}, "compile_qk_norm_rope_tma")
     assert calls[0]["cache_key"].startswith(f"{kern_tma.FROST_SOURCE_DIGEST}|compile_qk_norm_rope_tma|[('key', ('torch.bfloat16', 8, 2, 256, 64, 8, ")
     assert (calls[0]["symbol"], calls[0]["options"]) == ("cudnn_block_qk_norm_rope_tma", "--enable-tvm-ffi")

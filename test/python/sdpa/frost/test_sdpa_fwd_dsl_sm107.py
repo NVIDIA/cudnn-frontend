@@ -59,11 +59,35 @@ def _code_lines(src):
     return "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))
 
 
+def _host_runtime_slots(module, values):
+    """The positional argument list of ``module._host``'s raw entry: its runtime parameters in signature order (the ``Constexpr`` ones
+    are baked into the kernel), each read from ``values`` by name.  A slot the kernel does not have is left out -- the d128 kernel
+    appends the score / bias / kv_mask slots, the other flavors have none -- and a slot ``values`` lacks is a KeyError."""
+    import inspect
+
+    return [values[name] for name, p in inspect.signature(module._host).parameters.items() if "Constexpr" not in str(p.annotation)]
+
+
 @pytest.mark.parametrize("flavor", _FLAVORS)
 def test_f16_routes_to_the_sm107_sibling(flavor):
     """Every f16 flavor has a Rubin sibling, and Blackwell keeps the SM100 one."""
     assert "sm107" in _load(flavor, rubin=True).__name__
     assert "sm100" in _load(flavor, rubin=False).__name__
+
+
+@pytest.mark.parametrize("rubin", [True, False], ids=["sm107", "sm100"])
+@pytest.mark.parametrize("flavor", _FLAVORS)
+def test_f16_host_entries_carry_only_record_reproducible_defaults(flavor, rubin):
+    """The compiled-plan cache persists a ``--enable-tvm-ffi`` host only when every default of its calling convention is a value the
+    artifact record carries (None / bool / int / float / str): a tuple default silently leaves the host un-persistable, and the staged
+    artifact JITs again in every process (``TestStagedHalf::test_artifact_reload`` is the GPU detector).  Pinned on the host for every
+    f16 flavor of both arch trees."""
+    import inspect
+    from cudnn.frost.compiled_cache import _json_plain
+
+    sig = inspect.signature(_load(flavor, rubin=rubin)._host)
+    offending = {n: p.default for n, p in sig.parameters.items() if p.default is not inspect.Parameter.empty and not _json_plain(p.default)}
+    assert not offending, f"{flavor} rubin={rubin}: host defaults the artifact record cannot carry: {offending}"
 
 
 # Which flavors' MMA-operand SMEM crosses 256 KiB -- the boundary above which a
@@ -111,9 +135,10 @@ def test_sm107_every_prefill_kernel_takes_a_guarded_running_max_step():
         with open(f, encoding="utf-8") as fh:
             code = _code_lines(fh.read())
         name = os.path.basename(f)
-        if "row_max_for_exp2(" in code:
-            assert "running_max_step_finite_sentinel" not in code, f"{name}: both running-max forms in one body"
-            continue
+        if "row_max_for_exp2(" in code and "running_max_step_finite_sentinel(" not in code:
+            continue  # the -inf-masked twin alone (the 2x2 bodies)
+        # sm107/prefill_d128_f16.py carries BOTH forms: its plain softmax body takes the finite-sentinel helper while its
+        # bias / kv_mask body masks with a true -inf (row_max_for_exp2's family) -- checked below as a shared-helper file.
         calls = shared_call.findall(code)
         assert (
             calls
@@ -127,7 +152,7 @@ def test_sm107_every_prefill_kernel_takes_a_guarded_running_max_step():
         seen_shared += 1
     assert (
         seen_shared == 12
-    ), f"the twelve finite-sentinel prefill bodies (d128 / d192x128 / d256 / d512 x f16 / fp8 / mxfp8) take the helper; saw {seen_shared}"
+    ), f"the twelve finite-sentinel prefill bodies (d128 / d192x128 / d256 / d512 x f16 / fp8 / mxfp8; the sm107 d128 f16 file counts through its plain body) take the helper; saw {seen_shared}"
 
 
 @pytest.mark.parametrize("kind,load_kw", _DTYPE_FAMILIES, ids=[k for k, _ in _DTYPE_FAMILIES])
@@ -185,7 +210,23 @@ def test_sm107_every_smem_tile_takes_the_module_desc_version(flavor, kind, load_
 # drifting in silently.  Flipping a kernel's constant is the whole experiment; the SASS twin of this check is
 # test_sm107_ring_wait_form_sass_pins.
 _SPIN_RING_WAITS = {  # (kind, flavor): (SPIN_RING_WAITS, ring wait sites, idle wait sites)
-    ("f16", (128, 128)): (True, 32, 11),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait
+    # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait; +2 ring (bmm1_done / stat_empty of the bias / kv_mask arm's own
+    # kv body, _softmax_kv_body_inf) and +2 ITEM-level idle waits (mb_bias_full in the softmax group, mb_bias_empty in the TMA-LDG
+    # warp -- waited once per work item, the sleeping form by rule) since the resident bias block landed (2026-10-08).  The (n, n+1)
+    # PAIR work item then added its five `_*_item_pair` roles beside the one-batch-entry loops -- every per-tile ring protocol spelled a
+    # second time (+37 ring, +8 idle: 34 / 13 -> 71 / 21; the pin was not moved with it and read stale until the streamed ring landed).
+    # +2 RING waits since the STREAMED bias ring (mb_bias_ring_full in the softmax kv body, mb_bias_ring_empty in the TMA-LDG fill helper:
+    # per-kv-tile sites, so they take the module constant; the two item-level mb_bias_full / mb_bias_empty waits stay idle).
+    # -14 RING sites when the third softmax warp group landed (TemplateParams.softmax_wgs): the five `_*_item_pair` roles spell their
+    # per-sub-tile ring protocol ONCE inside `range_constexpr(CFG.TILES_Q)` loops (one site per ring per role, two or three sub-tiles
+    # traced from it) where the pair had hand-unrolled sub-tile 0 and sub-tile 1 -- the rendering is byte-identical (the md5 records),
+    # the SOURCE count is not: 73 / 21 -> 59 / 21; +2 ring waits for the dead-sub-tile QUIET body's mb_bmm1_done / mb_stat_empty (per kv
+    # tile, the live body's two sites): 61 / 21.
+    # +20 RING waits with the double-buffered S (TemplateParams.s_slots: the per-slot mb_bmm1_done / mb_bmm2_ready cursor waits of every role,
+    # spelled per slot) -- 81 / 21 on that body (its pin had stayed at 61 / 21); +1 RING wait (the multicast ring's softmax ghost loop:
+    # mb_bias_ring_full per leader fill a padded / shorter chunk receives) and +1 IDLE wait (the TMA-LDG warp's end-of-kernel
+    # mb_bias_ring_empty drain, P15) since the ring's cluster-multicast form (bias_mode 3) landed: 82 / 22.
+    ("f16", (128, 128)): (True, 82, 22),
     ("fp8", (128, 128)): (False, 44, 12),  # +1 ring wait: the block-scaled O epilogue's first mb_o_empty wait (sf_o)
     ("mxfp8", (128, 128)): (True, 36, 13),  # +1 ring wait: the block-scaled O epilogue's first mb_o_empty wait (sf_o)
     ("f16", (192, 128)): (True, 32, 11),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait
@@ -212,7 +253,7 @@ _SPIN_RING_WAITS = {  # (kind, flavor): (SPIN_RING_WAITS, ring wait sites, idle 
 # POLL_CROSS_PAIR_WAITS is a correctness constant pinned True by the module itself, never the SPIN_RING_WAITS perf lever:
 # (poll-site count, targets).
 _D512_2X2_CROSS_PAIR_WAITS = (10, {"mb_k_empty", "mb_v_empty", "mb_k_full", "mb_v_full", "mb_o_empty"})
-_IDLE_WAIT_TARGETS = ("mb_tmem_dealloc", "mb_o_full", "mb_tma_o_full", "mb_tmastg_go")
+_IDLE_WAIT_TARGETS = ("mb_tmem_dealloc", "mb_o_full", "mb_tma_o_full", "mb_tmastg_go", "mb_bias_full", "mb_bias_empty")
 
 
 def _wait_sites(code):
@@ -648,13 +689,19 @@ def test_rubin_f16_never_picks_a_flavor_it_has_no_kernel_for():
     """
     from cudnn.sdpa.fwd.api_dsl import (
         _SM100_FLAVORS,
+        _SM107_FLAVORS,
         _SM107_FP8_KERNEL_FILES,
         _SM107_KERNEL_FILES,
         _pick_flavor,
     )
 
-    rubin_pool = tuple(f for f in _SM100_FLAVORS if f in _SM107_KERNEL_FILES)
+    # The f16 Rubin pool walks _SM107_FLAVORS (= _SM100_FLAVORS plus the 32-wide tile, which has no SM100 kernel); the
+    # quantized pools stay on _SM100_FLAVORS.
+    rubin_pool = tuple(f for f in _SM107_FLAVORS if f in _SM107_KERNEL_FILES)
+    assert _SM107_FLAVORS == ((32, 32),) + _SM100_FLAVORS and rubin_pool == _SM107_FLAVORS
     assert _pick_flavor(192, 128, rubin_pool) == (192, 128)
+    assert _pick_flavor(24, 24, rubin_pool) == (32, 32) and _pick_flavor(48, 48, rubin_pool) == (64, 64)
+    assert _pick_flavor(24, 24, None) == (64, 64), "Blackwell has no 32-wide tile: a small head dim rides its d64 flavor"
     # Blackwell keeps its native d192xd128 kernel.
     assert _pick_flavor(192, 128, None) == (192, 128)
     # INVERTED: the quantized Rubin lines gained their d192 siblings, so a
@@ -666,7 +713,7 @@ def test_rubin_f16_never_picks_a_flavor_it_has_no_kernel_for():
     # Blackwell flavor list, and _pick_flavor is only ever handed the pool whose
     # kernel files exist.  A pool built from a map that lacks a flavor must not
     # offer it -- this is the guard that survives the next partial arch line.
-    assert set(rubin_pool) <= set(_SM100_FLAVORS) and set(rubin_fp8_pool) <= set(_SM100_FLAVORS)
+    assert set(rubin_pool) <= set(_SM107_FLAVORS) and set(rubin_fp8_pool) <= set(_SM100_FLAVORS)
     assert _pick_flavor(192, 128, tuple(f for f in rubin_fp8_pool if f != (192, 128))) != (192, 128)
     # Every flavor Rubin can pick has a module ON DISK -- the map is the only
     # thing standing between _pick_flavor and a KeyError/ImportError deep in
@@ -726,7 +773,7 @@ def test_sm107_f16_row_owns_the_rubin_lane():
     assert "SM100-106" in engines.mismatch(sm100, _f16_facts(device_cc=(10, 7)))
 
 
-@pytest.mark.parametrize("d", [(128, 128), (256, 256), (512, 512)])
+@pytest.mark.parametrize("d", [(32, 32), (64, 64), (128, 128), (192, 128), (256, 256), (512, 512)])
 def test_sm107_f16_accepts_every_native_shape(d):
     from cudnn.sdpa.fwd import engines
 
@@ -782,25 +829,30 @@ def test_sm107_f16_serves_d192_on_its_native_kernel():
 
 
 def test_sm107_f16_thd_is_served_on_every_flavor():
-    """FULLY INVERTED 2026-09-09: every f16 flavor now serves THD.
+    """FULLY INVERTED 2026-09-09: every f16 flavor of the 128..512 family serves THD.
 
-    The row must cover exactly `d_shapes` -- no more (a shape with no kernel
-    would KeyError inside module loading) and no less (a served shape left out
-    is a capability the engine silently declines).  Asserted on real facts
-    objects, not the dataclass field, so it walks the path mismatch() takes.
+    PARTIALLY RE-INVERTED with the small head-dim tiles (d32 / d64 on the d128 file): `thd_d_shapes` is now a STRICT
+    SUBSET of `d_shapes` -- the small tiles' bodies carry the THD contract in principle (the same file) but their THD leg is
+    unvalidated, so the row declines it TYPED (and the config factory refuses `thd_varlen` for the "sm107 d32" / "sm107 d64"
+    flavors) until a THD sweep lands.  The two halves pinned: every THD shape is a served shape with no kernel-less member,
+    and every small tile is a typed decline, never a KeyError in module loading.  Asserted on real facts objects.
 
-    This keeps `thd_d_shapes` as a named SET rather than collapsing to `True`,
-    because that is what makes the next partial arch line expressible without
-    reintroducing a boolean that cannot describe it."""
+    This keeps `thd_d_shapes` as a named SET rather than collapsing to `True`, because that is what makes a partial arch
+    line expressible without reintroducing a boolean that cannot describe it."""
     from cudnn.sdpa.fwd import engines
-    from cudnn.sdpa.fwd.config_sm107 import SM107_F16_THD_SHAPES
+    from cudnn.sdpa.fwd.config_sm107 import SM107_F16_SMALL_D_SHAPES, SM107_F16_THD_SHAPES
 
     caps = _caps("sdpa_fwd_prefill_sm107")
     assert caps.thd is True
     assert caps.thd_d_shapes is SM107_F16_THD_SHAPES
-    assert SM107_F16_THD_SHAPES == caps.d_shapes, "every served f16 shape must serve THD, and no unserved one may"
-    for d_qk, d_v in sorted(caps.d_shapes):
+    assert (
+        SM107_F16_THD_SHAPES < caps.d_shapes and caps.d_shapes - SM107_F16_THD_SHAPES == SM107_F16_SMALL_D_SHAPES
+    ), "THD = every f16 shape but the small tiles"
+    for d_qk, d_v in sorted(SM107_F16_THD_SHAPES):
         assert engines.mismatch(caps, _f16_facts(thd=True, padded=True, d_qk=d_qk, d_v=d_v)) is None, (d_qk, d_v)
+    for d_qk, d_v in sorted(SM107_F16_SMALL_D_SHAPES):
+        why = engines.mismatch(caps, _f16_facts(thd=True, padded=True, d_qk=d_qk, d_v=d_v))
+        assert why is not None and "THD" in why, (d_qk, d_v, why)
 
 
 def test_sm107_f16_split_coverage_and_pack_gqa_gate():
@@ -812,6 +864,14 @@ def test_sm107_f16_split_coverage_and_pack_gqa_gate():
     for d_qk, d_v in _FLAVORS:
         why = engines.mismatch(caps, _f16_facts(d_qk=d_qk, d_v=d_v), engines.SdpaFwdKnobs(split_kv=2))
         assert (why is None) == (d_v == 128), (d_qk, d_v, why)
+    # The small head-dim tiles carry the dense leg only: a split graph at D <= 64 is selected past them onto the d128 flavor
+    # (its pre-tile route) and served there, never declined (engines.Capabilities.dense_only_d_shapes).
+    for d in (24, 32, 64):
+        knobs = engines.SdpaFwdKnobs(split_kv=2)
+        assert engines.mismatch(caps, _f16_facts(d_qk=d, d_v=d), knobs) is None, d
+        assert engines._selected_d_shape(caps, _f16_facts(d_qk=d, d_v=d), knobs) == (128, 128) and engines._selected_d_shape(
+            caps, _f16_facts(d_qk=d, d_v=d)
+        ) != (128, 128), d
     for feature in (dict(thd=True, padded=True), dict(padded=True), dict(has_sink=True)):
         assert engines.mismatch(caps, _f16_facts(**feature), engines.SdpaFwdKnobs(split_kv=2)) is not None
     # THD nonpaged d128 unsplit has no packed leg (dense d128 packs on the shared SM100 body since issue #1472, below).
@@ -1524,7 +1584,8 @@ def test_thd_stats_padded_is_appended_to_the_public_signature():
     extension_start = params.index("sample_amax_o")
     assert extension_start == params.index("thd_stats_padded") + 1, params[extension_start - 1 : extension_start + 1]
     # Append-only: the ragged-Q decode leg's two plan-time facts follow the block-scale tail; then (2026-10-15) the Rubin decode
-    # route's width cap and the programmatic-dependent-launch switch, in landing order.
+    # route's width cap and the programmatic-dependent-launch switch, in landing order; then this branch's tail (the score side
+    # outputs, the resident-block operands of the small tiles and their knobs), appended after the public tree's.
     assert params[extension_start:] == [
         "sample_amax_o",
         "pv_bf16",
@@ -1537,6 +1598,21 @@ def test_thd_stats_padded_is_appended_to_the_public_signature():
         "ragged_offsets_int64",
         "decode_q_tile_max",
         "use_pdl",
+        # ... then the score side outputs (score_max / score_sum_exp) ...
+        "sample_score_max",
+        "sample_score_sum_exp",
+        # ... then the resident-block operands of the Rubin small tiles (the additive bias, the per-key mask) ...
+        "sample_bias",
+        "sample_kv_mask",
+        # ... and their knobs in landing order (the pair chunk, the bias form and ring depth, the padded-tail form, the quiet
+        # body, the row-max form, the softmax warp-group count), the newest tail.
+        "n_chunk",
+        "bias_mode",
+        "bias_stages",
+        "padded_tail_form",
+        "dead_subtile_quiet",
+        "bias_max_form",
+        "softmax_wgs",
     ], params[extension_start:]
     assert inspect.signature(SdpaFwdDsl.__init__).parameters["stats_log2"].default is False
     assert inspect.signature(SdpaFwdDsl.__init__).parameters["decode_q_tile_max"].default is None
@@ -1546,8 +1622,19 @@ def test_thd_stats_padded_is_appended_to_the_public_signature():
     sig = inspect.signature(SdpaFwdDsl.__init__).parameters
     assert sig["sample_gate"].default is None and sig["has_amax_o"].default is True
     exec_params = list(inspect.signature(SdpaFwdDslSm100.execute).parameters)
-    # Append-only: the ragged-offset operands of the ragged-Q decode leg follow sf_o.
-    assert exec_params[-6:] == ["block_table_v", "gate", "sf_o", "ragged_q", "ragged_o", "ragged_lse"], exec_params[-7:]
+    # Append-only: the ragged-offset operands of the ragged-Q decode leg follow sf_o, then the score side outputs.
+    assert exec_params[-10:] == [
+        "block_table_v",
+        "gate",
+        "sf_o",
+        "ragged_q",
+        "ragged_o",
+        "ragged_lse",
+        "score_max_tensor",
+        "score_sum_exp_tensor",
+        "bias_tensor",
+        "kv_mask_tensor",
+    ], exec_params[-11:]
     assert inspect.signature(SdpaFwdDslSm100.execute).parameters["gate"].default is None
     assert inspect.signature(SdpaFwdDslSm100.execute).parameters["sf_o"].default is None
     assert all(inspect.signature(SdpaFwdDslSm100.execute).parameters[n].default is None for n in ("ragged_q", "ragged_o", "ragged_lse"))
@@ -2880,9 +2967,12 @@ def test_sm107_gate_lpt_is_bitwise_natural():
 # md5 of the sm_107a cubins the block drives, recorded BEFORE the THD gate descriptor (the dense gated and the
 # ungated THD renderings must not move: the gate's THD arm is a host-side map + a binder slot, never a body change).
 # Keyed by the DSL that produced them; another toolchain re-records (the probe prints the md5 it saw).
+# Re-recorded under nvidia-cutlass-dsl 4.8.0 after #1547 (the dense CLC path reads the tile id through one scheduler publisher,
+# `read_tile_id_arrive_on_leader`, under `not CFG.THD_VARLEN`): the dense gated arm moved with that body change; both THD arms
+# re-rendered byte-identical to their records, as the `THD_VARLEN` guard predicts.
 _THD_GATE_CUBIN_RECORD = {
     "nvidia-cutlass-dsl": "4.8.0",
-    "dense_gated_bf16_lse": "50657ada1609d250868f34068d58d93f",
+    "dense_gated_bf16_lse": "fde505d05124f3978d1f106b7b47891b",
     "thd_ungated_bf16_head": "2a3467773a4dfa420660002a49c59fe0",
     # the THD-gated rendering itself (the packed gate map): recorded WITH the descriptor, so the next change to it is seen
     "thd_gated_bf16_head": "88a6956e90cc110697611583095ac47f",
@@ -3301,13 +3391,15 @@ def test_sm107_thd_gate_keyless_sequence_is_exactly_zero_and_a_zero_length_seque
 # were added (the ungated renderings must not move on either line: every seam folds on const_expr, every new kernel
 # argument is Optional[...] = None) plus the two gated sm_107a renderings recorded WITH the seams (the next change to
 # them is seen).  Keyed by the DSL that produced them; another toolchain re-records (the probe prints the md5 it saw).
+# Re-recorded under nvidia-cutlass-dsl 4.8.0 after #1547 (one scheduler publisher on the dense CLC path, under `not CFG.THD_VARLEN`):
+# the two dense arms moved on sm_100a and sm_107a alike; the eight THD / paged / gated arms re-rendered byte-identical.
 _PAGED_GATE_CUBIN_RECORD = {
     "nvidia-cutlass-dsl": "4.8.0",
-    "sm_100a_dense": "dc698e8b8a4f86996a7090ab24c4d452",
+    "sm_100a_dense": "7db6daaf02f536bd9fbfd7e36e671fd8",
     "sm_100a_thd": "71f32b147b7c86af413a227f1c2408a5",
     "sm_100a_paged_thd": "5f2ccc374d24b90239ab99a8a1d529ff",
     "sm_100a_paged_thd_pack": "ee82153f5d070035d98e32582d9e30e2",
-    "sm_107a_dense": "b4af8e7d23a52179c0c299bb03cd9c3d",
+    "sm_107a_dense": "63d9b3efb571b4ba00f3a4625fd280bc",
     "sm_107a_thd": "b07ad1515c7755c604986b8cd352d768",
     "sm_107a_paged_thd": "a1651799d5f6116d5726df3667e0a39a",
     "sm_107a_paged_thd_pack": "9d83e9ff26a04c5c3d0840f85c876c3a",
@@ -5034,35 +5126,51 @@ def test_sm107_half_split_direct_template_stats_base(d, stats_log2):
     module = _load((d, dv), rubin=True, dtype_qkv=DTYPE_FP16, dtype_o=DTYPE_FP16, split_kv=splits, stats_log2=stats_log2)
     raw = positional_entry(module.compile(d_qk=d, d_v=dv))
     assert raw is not None
-    # This bypasses the adapter, which clears stats_log2 when producing partials.
+    # This bypasses the adapter, which clears stats_log2 when producing partials.  The raw entry takes every runtime slot of the host
+    # entry positionally; the slots the d128 kernel appends (the score / bias / kv_mask operands) are compiled out here: None / zeros.
     raw(
-        q.data_ptr(),
-        k.data_ptr(),
-        v.data_ptr(),
-        partial_o.data_ptr(),
-        partial_lse.data_ptr(),
-        0,
-        0,
-        0,
-        (b, h, 1, sq, skv, 0),
-        tuple(q.stride()[:3]),
-        tuple(k.stride()[:3]),
-        tuple(v.stride()[:3]),
-        tuple(partial_o.stride()[:3]),
-        tuple(partial_lse.stride()),
-        0,
-        math.log2(math.e) / math.sqrt(d),
-        0,
-        0,
-        None,
-        None,
-        None,
-        partial_o.data_ptr(),
-        None,
-        None,
-        (0, 0),
-        0,
-        cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+        *_host_runtime_slots(
+            module,
+            dict(
+                q_ptr=q.data_ptr(),
+                k_ptr=k.data_ptr(),
+                v_ptr=v.data_ptr(),
+                o_ptr=partial_o.data_ptr(),
+                lse_ptr=partial_lse.data_ptr(),
+                sinks_ptr=0,
+                meta_ptr=0,
+                o_desc_ptr=0,
+                problem_size=(b, h, 1, sq, skv, 0),
+                q_strides=tuple(q.stride()[:3]),
+                k_strides=tuple(k.stride()[:3]),
+                v_strides=tuple(v.stride()[:3]),
+                o_strides=tuple(partial_o.stride()[:3]),
+                lse_strides=tuple(partial_lse.stride()),
+                lse_ext=0,
+                scale_softmax_log2=math.log2(math.e) / math.sqrt(d),
+                n_thd_units=0,
+                seq_q_lens_addr=0,
+                thd_q_lens_ptr=None,
+                thd_kv_lens_ptr=None,
+                thd_lens_form=None,
+                o_partial_ptr=partial_o.data_ptr(),
+                block_table_ptr=None,
+                block_table_v_ptr=None,
+                table_strides=(0, 0),
+                n_pages=0,
+                score_max_ptr=None,
+                score_sum_exp_ptr=None,
+                score_max_strides=(0, 0, 0),
+                score_sum_exp_strides=(0, 0, 0),
+                bias_ptr=None,
+                bias_strides=(0, 0, 0),
+                bias_extents=(1, 1),
+                kv_mask_ptr=None,
+                kv_mask_batch_stride=0,
+                inv_scale_softmax=math.sqrt(d),
+                stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+            ),
+        )
     )
     scores = torch.einsum("bqhd,bknd->bhqk", q.double(), k.double()) / math.sqrt(d)
     values = v.double().transpose(1, 2).expand(b, h, skv, dv)

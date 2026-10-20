@@ -33,8 +33,8 @@ def deterministic_dkv_shards(total_seqlen_q: int) -> int:
     return _SUPPORTED_DKV_SHARDS[-1]
 
 
-class FlashAttentionDSABackwardSm100Deterministic(FlashAttentionDSABackwardSm100):
-    """Deterministic dKV/dSink reduction layered on the ordinary M64 kernel.
+class _DeterministicReductionPolicy:
+    """Reusable fixed-owner dKV/dSink reduction policy.
 
     Each launch contains ``num_dkv_shards`` query CTAs. CTA ``i`` is the only
     writer of dKV shard ``i`` in that wave, and same-stream launch ordering
@@ -206,6 +206,26 @@ class FlashAttentionDSABackwardSm100Deterministic(FlashAttentionDSABackwardSm100
         acc = cute.arch.warp_reduction_sum(acc, threads_in_group=self.dSink_num_threads)
         if tidx == 0:
             dSink[head_idx, (0, batch_idx)] = acc
+
+
+class FlashAttentionDSABackwardSm100Deterministic(_DeterministicReductionPolicy, FlashAttentionDSABackwardSm100):
+    """Deterministic reduction layered on the ordinary M64 kernel."""
+
+    # The reduction policy deliberately owns these attributes; spell out the
+    # override contract instead of relying on base order alone.
+    num_dkv_shards = _DeterministicReductionPolicy.num_dkv_shards
+    q_wave_ctas = _DeterministicReductionPolicy.q_wave_ctas
+    serialize_head_blocks = _DeterministicReductionPolicy.serialize_head_blocks
+    make_dKV_accumulator = _DeterministicReductionPolicy.make_dKV_accumulator
+    select_dKV_accumulator = _DeterministicReductionPolicy.select_dKV_accumulator
+    finalize_dKV = _DeterministicReductionPolicy.finalize_dKV
+    convert = _DeterministicReductionPolicy.convert
+    dSink_grid_q = _DeterministicReductionPolicy.dSink_grid_q
+    sum_dSink = _DeterministicReductionPolicy.sum_dSink
+
+    @classmethod
+    def _get_workspace_size_dKV(cls, k: int, d: int, b: int, acc_dtype: Type[cutlass.Numeric]):
+        return _DeterministicReductionPolicy._get_workspace_size_dKV.__func__(cls, k, d, b, acc_dtype)
 
 
 class FlashAttentionDSABackwardSm100Deterministic32(FlashAttentionDSABackwardSm100Deterministic):

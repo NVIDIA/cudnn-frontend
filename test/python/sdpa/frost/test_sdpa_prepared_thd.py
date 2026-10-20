@@ -28,6 +28,82 @@ pytestmark = [pytest.mark.L0]
 DEV = torch.device("cuda")
 
 
+@pytest.mark.parametrize("family", ["CfgD32", "CfgD64", "CfgD128", "CfgD128Decode", "CfgD192", "CfgD256", "CfgD256Decode", "CfgD512", "CfgD512X2"])
+@pytest.mark.parametrize("thd", [0, 1])
+def test_thd_work_prefix_declines_other_config_families(family, thd):
+    from cudnn.sdpa.fwd import config_sm100 as config
+
+    # Shared task decoding also sees configs without paged-KV fields (D512X2).
+    # Neither dense nor nonpaged THD requires the paged prefix metadata.
+    cfg_type = getattr(config, family)
+    cfg = cfg_type(**({"THD_VARLEN": thd} if "THD_VARLEN" in cfg_type.__dataclass_fields__ else {}))
+    assert not config.thd_work_prefix_enabled(cfg)
+
+
+@pytest.mark.parametrize("pack_gqa", [0, 1])
+def test_thd_work_prefix_accepts_paged_d128(pack_gqa):
+    from cudnn.sdpa.fwd.config_sm100 import CfgD128Decode, thd_work_prefix_enabled
+
+    cfg = CfgD128Decode(THD_VARLEN=1, PAGED_KV=1, PACK_GQA=pack_gqa, SPLIT_KV=2, BOTTOM_RIGHT=1)
+    assert thd_work_prefix_enabled(cfg)
+
+
+@requires_blackwell
+@requires_dsl
+@pytest.mark.parametrize("b", [3, 13])
+@pytest.mark.parametrize("paged,pack_gqa", [(True, True), (True, False), (False, True)])
+def test_thd_split_workspace_query_before_compile(b, paged, pack_gqa):
+    """Allocate from the checked plan, then compile and execute in that storage."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    ql, kl, h, hk, d, page = 129, 256, 8, 2, 128, 16
+    q = torch.zeros(b, ql, h, d, device=DEV, dtype=torch.bfloat16)
+    o = torch.full_like(q, torch.nan)
+    lse = torch.full((b, ql, h, 1), torch.nan, device=DEV)
+    k = torch.zeros((b * kl // page, hk, page, d) if paged else (b, kl, hk, d), device=DEV, dtype=q.dtype)
+    v = torch.zeros_like(k)
+    api = SdpaFwdDslSm100(
+        sample_q=q.transpose(1, 2),
+        sample_k=k if paged else k.transpose(1, 2),
+        sample_v=v if paged else v.transpose(1, 2),
+        sample_o=o.transpose(1, 2),
+        sample_lse=lse.transpose(1, 2),
+        is_causal=True,
+        causal_bottom_right=True,
+        seq_kv_lens_present=True,
+        cu_seq_q_lens=True,
+        cu_seq_kv_lens=not paged,
+        thd=True,
+        cga=1,
+        split_kv=4,
+        pack_gqa=pack_gqa,
+        paged_page_size=page if paged else 0,
+        paged_max_seq_len_kv=kl if paged else None,
+    )
+    assert api.check_support()
+    before = api.scratch_workspace_bytes()
+    workspace = torch.empty(before, device=DEV, dtype=torch.uint8)
+    api.compile()
+    assert api.scratch_workspace_bytes() == before == api._thd_spec.scratch_bytes
+    cu_q = torch.arange(b + 1, device=DEV, dtype=torch.int32) * ql
+    kv_lengths = torch.full((b,), kl, device=DEV, dtype=torch.int32) if paged else torch.arange(b + 1, device=DEV, dtype=torch.int32) * kl
+    table = torch.arange(b * kl // page, device=DEV, dtype=torch.int32).view(b, -1) if paged else None
+    api.execute(
+        q.flatten(0, 1),
+        k if paged else k.flatten(0, 1),
+        v if paged else v.flatten(0, 1),
+        o.flatten(0, 1),
+        lse_tensor=lse.view(b * ql, h),
+        seq_q_lens=cu_q,
+        seq_kv_lens=kv_lengths,
+        block_table=table,
+        workspace=workspace,
+    )
+    torch.testing.assert_close(o, torch.zeros_like(o), atol=0, rtol=0)
+    expected = torch.arange(kl - ql + 1, kl + 1, device=DEV).float().log().view(1, ql, 1, 1).expand_as(lse)
+    torch.testing.assert_close(lse, expected, atol=1e-5, rtol=1e-5)
+
+
 def _thd_graph(
     b,
     ql,
@@ -953,13 +1029,14 @@ def test_dense_layout_rule_covers_every_tma_global_stride_and_the_lse_aliasing()
     assert not prep_mod._covering((2, 8, 128), (8 * 128, 64, 1)), "head stride 64 aliases rows 64.. of the previous head"
 
 
-def test_paged_pools_must_be_the_compiled_in_page_layout_kind():
-    """Host-side: the paged binder refuses a pool whose in-page (row, head) order differs from the one the
-    artifact was compiled for (``paged_hnd`` orders the TMA descriptors), for K and for V alike."""
+@pytest.mark.parametrize("k_hnd,v_hnd", [(False, False), (True, True), (False, True), (True, False)])
+def test_paged_pools_must_be_the_compiled_in_page_layout_kind(k_hnd, v_hnd):
+    """Host-side: each runtime pool must retain its own declared in-page layout,
+    even when K and V declare different layout kinds."""
     from types import SimpleNamespace
 
     kh, ps, d, n_pages, b, max_pages = 2, 16, 128, 8, 2, 4
-    spec = SimpleNamespace(paged=True, paged_hnd=False, page_size=ps, kh=kh, d_qk=d, d_v=d, device_index=0)
+    spec = SimpleNamespace(paged=True, paged_hnd=k_hnd, paged_v_hnd=v_hnd, page_size=ps, kh=kh, d_qk=d, d_v=d, device_index=0)
     order = ["k_ptr", "v_ptr", "k_strides", "v_strides", "block_table_ptr", "block_table_v_ptr", "table_strides", "n_pages"]
     ix = {n: i for i, n in enumerate(order)}
 
@@ -971,10 +1048,10 @@ def test_paged_pools_must_be_the_compiled_in_page_layout_kind():
     table = prep_mod.BufferFacts(8192, "int32", (2, 0), b * max_pages, (b, 1, max_pages, 1), (max_pages, max_pages, 1, 1))
     facts = dict(block_table=table, block_table_v=table)
     frame = [None] * len(order)
-    assert binding_reference._bind_paged_kv(spec, frame, ix, facts, pool(False), pool(False), b) == max_pages * ps
-    for k_hnd, v_hnd in ((True, False), (False, True)):
-        with pytest.raises(ValueError, match="compiled for NHD"):
-            binding_reference._bind_paged_kv(spec, list(frame), ix, facts, pool(k_hnd), pool(v_hnd), b)
+    assert binding_reference._bind_paged_kv(spec, frame, ix, facts, pool(k_hnd), pool(v_hnd), b) == max_pages * ps
+    for changed_k, changed_v in ((not k_hnd, v_hnd), (k_hnd, not v_hnd)):
+        with pytest.raises(ValueError, match="compiled for"):
+            binding_reference._bind_paged_kv(spec, list(frame), ix, facts, pool(changed_k), pool(changed_v), b)
 
 
 @requires_pre_rubin_blackwell
@@ -1065,8 +1142,8 @@ def test_split_prepared_strided_output_rebind_and_capture(d, stats, stats_log2, 
 @requires_dsl
 @pytest.mark.parametrize("kh", [1, 2])
 @pytest.mark.parametrize("k_hnd,v_hnd", [(False, False), (True, True), (False, True), (True, False)])
-def test_paged_adapter_rejects_mixed_pool_layout_at_support_check(kh, k_hnd, v_hnd):
-    """One compiled page-layout specialization must cover both pools, including singleton KH."""
+def test_paged_adapter_accepts_independent_pool_layout_at_support_check(kh, k_hnd, v_hnd):
+    """Each pool declares its own layout kind, including singleton KH."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     b, h, sq, d, page_size, n_pages = 2, 8, 4, 128, 16, 8
@@ -1089,11 +1166,7 @@ def test_paged_adapter_rejects_mixed_pool_layout_at_support_check(kh, k_hnd, v_h
         split_kv=1,
         pack_gqa=False,
     )
-    if k_hnd == v_hnd:
-        assert api.check_support()
-    else:
-        with pytest.raises(NotImplementedError, match="paged K and V pools must use the same HND or NHD layout kind"):
-            api.check_support()
+    assert api.check_support()
 
 
 @requires_pre_rubin_blackwell
@@ -1842,10 +1915,10 @@ if _dsl_installed():
     import cutlass
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
-    from cudnn.frost.tile_dsl.thd import write_thd_batch_remap, write_thd_live_and_ctr, write_thd_prefix_warp
+    from cudnn.frost.tile_dsl.thd import write_thd_batch_remap, write_thd_live_and_ctr, write_thd_prefix_warp, write_thd_work_prefix
 
     @cute.kernel
-    def _prefix_probe(meta_t, q, k, b: cutlass.Int32, flags: cutlass.Int32):
+    def _prefix_probe(meta_t, q, k, b: cutlass.Int32, flags: cutlass.Int32, rank_by_kv: cutlass.Constexpr[bool], work_prefix: cutlass.Constexpr[bool]):
         tid, _, _ = cute.arch.thread_idx()
         warp, lane = cutlass.Int32(tid) // 32, cutlass.Int32(tid) % 32
         meta = cutlass.make_array_view(meta_t)
@@ -1855,28 +1928,40 @@ if _dsl_installed():
             write_thd_prefix_warp(meta, cutlass.make_array_view(k), b, 2 * b + 1, (flags & 2) != 0, lane, store_lengths=True)
 
         cute.arch.barrier()
-        write_thd_batch_remap(meta, b, cutlass.Int32(tid), cutlass.Int32(64))
+        write_thd_batch_remap(meta, b, cutlass.Int32(tid), cutlass.Int32(64), rank_by_kv=rank_by_kv)
         cute.arch.barrier()
-        write_thd_live_and_ctr(meta, b, cutlass.Int32(3), cutlass.Int32(128), cutlass.Int32(7), cutlass.Int32(tid))
+        if cutlass.const_expr(work_prefix):
+            write_thd_work_prefix(meta, b, cutlass.Int32(3), cutlass.Int32(16), cutlass.Int32(7), cutlass.Int32(tid), 3)
+        else:
+            write_thd_live_and_ctr(meta, b, cutlass.Int32(3), cutlass.Int32(128), cutlass.Int32(7), cutlass.Int32(tid))
 
     _prefix_probe.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
     @cute.jit
-    def _prefix_host(m, q, k, b: cutlass.Int32, flags: cutlass.Int32, stream):
-        _prefix_probe(m, q, k, b, flags).launch(grid=(1, 1, 1), block=(64, 1, 1), stream=stream)
+    def _prefix_host(m, q, k, b: cutlass.Int32, flags: cutlass.Int32, rank_by_kv: cutlass.Constexpr[bool], work_prefix: cutlass.Constexpr[bool], stream):
+        _prefix_probe(m, q, k, b, flags, rank_by_kv, work_prefix).launch(grid=(1, 1, 1), block=(64, 1, 1), stream=stream)
 
 
 @pytest.fixture(scope="module")
 def _prefix_runner():
-    compiled = None
+    compiled = {}
 
-    def run(meta, q, k, b, flags):
-        nonlocal compiled
+    def run(meta, q, k, b, flags, rank_by_kv, work_prefix=False):
         tensor = lambda x: from_dlpack(x, assumed_align=16).mark_layout_dynamic(leading_dim=0)
-        args = (tensor(meta), tensor(q), tensor(k), cutlass.Int32(b), cutlass.Int32(flags), _prefix_cuda.CUstream(torch.cuda.current_stream().cuda_stream))
-        if compiled is None:
-            compiled = cute.compile(_prefix_host, *args)
-        compiled(*args)
+        args = (
+            tensor(meta),
+            tensor(q),
+            tensor(k),
+            cutlass.Int32(b),
+            cutlass.Int32(flags),
+            rank_by_kv,
+            work_prefix,
+            _prefix_cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+        )
+        key = (rank_by_kv, work_prefix)
+        if key not in compiled:
+            compiled[key] = cute.compile(_prefix_host, *args)
+        compiled[key](*args[:5], args[-1])
 
     return run
 
@@ -1885,21 +1970,68 @@ def _prefix_runner():
 @requires_dsl
 @pytest.mark.parametrize("b", [0, 1, 2, 4, 7, 8, 9, 31, 32, 33, 63, 64, 65, 255, 256, 257, 1024])
 @pytest.mark.parametrize("flags", range(4))
-def test_parallel_thd_metadata_matches_lengths_and_normalized_cu(b, flags, _prefix_runner):
+@pytest.mark.parametrize("rank_by_kv", [False, True])
+def test_parallel_thd_metadata_matches_lengths_and_normalized_cu(b, flags, rank_by_kv, _prefix_runner):
     """Exact metadata across warp boundaries, zero lengths, and sliced prefixes."""
     q = (torch.arange(b, dtype=torch.int32) * 17) % 257
     k = (torch.arange(b, dtype=torch.int32) * 31) % 1025
+    if rank_by_kv:
+        # Anti-correlated lengths plus repeated values exercise the cost key
+        # and stable ties independently of attention heuristics.
+        k = k.flip(0) % 129
     cq = torch.cat((torch.zeros(1, dtype=torch.int32), q.cumsum(0, dtype=torch.int32)))
     ck = torch.cat((torch.zeros(1, dtype=torch.int32), k.cumsum(0, dtype=torch.int32)))
     q_in = (cq + 17 if flags & 1 else q).to(DEV)
     k_in = (ck + 31 if flags & 2 else k).to(DEV)
     meta = torch.full((4 * b + 4,), -12345, dtype=torch.int32, device=DEV)
-    _prefix_runner(meta, q_in, k_in, b, flags)
+    _prefix_runner(meta, q_in, k_in, b, flags, rank_by_kv)
     got = meta.cpu()
     torch.testing.assert_close(got[: 3 * b + 2], torch.cat((k, cq, ck)), rtol=0, atol=0)
-    remap = torch.tensor(sorted(range(b), key=lambda i: (-int(q[i]), i)), dtype=torch.int32)
+    lengths = k if rank_by_kv else q
+    remap = torch.tensor(sorted(range(b), key=lambda i: (-int(lengths[i]), i)), dtype=torch.int32)
     live = int(((q + 127) // 128).sum()) * 3
     torch.testing.assert_close(got[3 * b + 2 :], torch.cat((remap, torch.tensor([live, 7], dtype=torch.int32))), rtol=0, atol=0)
+
+
+@requires_blackwell
+@requires_dsl
+@pytest.mark.parametrize("b", [0, 1, 2, 31, 32, 33, 65, 257])
+@pytest.mark.parametrize("flags", [0, 3])
+def test_thd_work_prefix_replay_matches_live_tiles(b, flags, _prefix_runner):
+    """Remapped prefixes count real tile/head tasks, including empty requests."""
+    from cudnn.frost.tile_dsl.thd import THD_WORK_META_WORDS, THD_WORK_PREFIX_OFF
+
+    storage = torch.full((THD_WORK_META_WORDS(b) + 8,), -12345, dtype=torch.int32, device=DEV)
+    meta = storage[4:-4]
+    q_in = torch.zeros(b + (flags & 1), dtype=torch.int32, device=DEV)
+    k_in = torch.zeros(b + ((flags >> 1) & 1), dtype=torch.int32, device=DEV)
+    _prefix_runner(meta, q_in, k_in, b, flags, True, True)
+    capture = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(capture):
+        _prefix_runner(meta, q_in, k_in, b, flags, True, True)
+    try:
+        for state in range(3):
+            q = ((torch.arange(b, dtype=torch.int32) + state) * 17) % 65
+            k = ((torch.arange(b, dtype=torch.int32).flip(0) + state) * 31) % 129
+            if state == 2:
+                q.zero_()
+            cq = torch.cat((torch.zeros(1, dtype=torch.int32), q.cumsum(0, dtype=torch.int32)))
+            ck = torch.cat((torch.zeros(1, dtype=torch.int32), k.cumsum(0, dtype=torch.int32)))
+            q_in.copy_(cq + 17 if flags & 1 else q)
+            k_in.copy_(ck + 31 if flags & 2 else k)
+            storage.fill_(-12345)
+            capture.replay()
+            got = meta.cpu()
+            remap = torch.tensor(sorted(range(b), key=lambda i: (-int(k[i]), i)), dtype=torch.int32)
+            work = ((q[remap.long()] + 15) // 16) * 3
+            expected = torch.cat((k, cq, ck, remap, torch.tensor([int(work.sum()) * 3, 7], dtype=torch.int32)))
+            torch.testing.assert_close(got[: 4 * b + 4], expected, rtol=0, atol=0)
+            if b > 1:
+                prefix = torch.cat((torch.zeros(1, dtype=torch.int32), work.cumsum(0, dtype=torch.int32)))
+                torch.testing.assert_close(got[THD_WORK_PREFIX_OFF(b) :], prefix, rtol=0, atol=0)
+            assert torch.all(storage[:4] == -12345) and torch.all(storage[-4:] == -12345)
+    finally:
+        capture.reset()
 
 
 @requires_blackwell
@@ -2020,6 +2152,11 @@ def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page,
 @pytest.mark.parametrize(
     "geometry,stats_layout,stats_log2,splits",
     [
+        ("d128_split_mixed", "HN", True, 3),
+        ("d128_split_boundary33", "HN", True, 3),
+        ("d128_mha_split_boundary65", "NH", False, 4),
+        ("d128_split_mixed_gqa", "NH", False, 2),
+        ("d256_split_mixed", "HN", True, 3),
         ("sink_d128_split", "NH", False, 4),
         ("sink_d128_split_b1_gqa", "HN", True, 8),
         ("sink_d128_gqa16_split_gqa", "NH", False, 3),
@@ -2084,6 +2221,8 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
     b, h, hk, d, qcap, kcap = (1 if "_b1" in geometry else 3), 8, 2, 128, 1025, 2304
     if has_sink:
         qcap = 9
+    if "_boundary" in geometry:
+        b, qcap, kcap = (33 if geometry.endswith("33") else 65), 129, 256
     if geometry.startswith("d64"):
         if arch == "sm107":
             pytest.skip("Native D64 paged split is qualified on SM100/SM103")
@@ -2100,7 +2239,7 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
         hk = h
     dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
     rng = torch.Generator(device=DEV).manual_seed(191)
-    _, _, k, v, table = _pools(b, hk, d, page, kcap // page, hnd, dtype, generator=rng)
+    _, _, k, v, table = _pools(b, hk, d, page, kcap // page, hnd, dtype, generator=rng, v_hnd=not hnd if "_mixed" in geometry else hnd)
     if has_sink:
         # Serving caches can concatenate K/V inside each token; preserve the
         # physical HND/NHD layout and test the strided views, without a gather.
@@ -2175,7 +2314,8 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
     index = next(i for i, name in enumerate(names) if name == engine_name(arch=arch) or name.startswith(engine_name(arch=arch) + "["))
     engine, knobs = g.get_engine_and_knobs_at_index(index)
     captures, workspaces = [], []
-    for policy in ((0,) if arch == "sm107" and d == 128 else (0, 1)):
+    policies = (0,) if arch == "sm107" and d == 128 else ((0, 1, 2) if "_boundary" in geometry else (0, 1))
+    for policy in policies:
         chosen = {
             **knobs,
             cudnn.knob_type.SCHED_POLICY: policy,
@@ -2240,6 +2380,14 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
             if b > 1
             else (([qcap], [qcap]), ([257], [769]), ([1], [1]), ([128], [0]), ([0], [kcap]), ([qcap], [qcap]))
         )
+        if b > 3:
+            lengths = [
+                (
+                    [0 if phase == 2 or (i + phase) % 7 == 0 else 1 + (13 * i + 7 * phase) % qcap for i in range(b)],
+                    [0 if (i + phase) % 11 == 0 else kcap - (i % 3) * 32 for i in range(b)],
+                )
+                for phase in range(3)
+            ]
         if has_sink:
             lengths = (
                 (([9, 4, 0], [2049, 1025, 0]), ([0, 9, 4], [0, 0, 2]), ([4, 0, 9], [128, 0, 2304]))

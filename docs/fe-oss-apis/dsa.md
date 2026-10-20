@@ -284,10 +284,12 @@ every execution (in-kernel on SM100, and with one stream-ordered memset for the
 SM90 dKV accumulator and for `d_sink` on the routes that accumulate it
 atomically). `execute(q, kv, out, dout, lse, attn_sink, topk_idxs, dq, dkv,
 ..., d_sink=...)` requires caller-provided `dq`, `dkv`, and the keyword-only
-`d_sink` on every
-backend and never allocates or copies during execution; the H128/D576 two-CTA
-plan additionally compiles in `compile()`, while the other routes compile on
-their first execution. The high-level wrapper allocates the outputs and the
+`d_sink` on every backend and never allocates or copies during execution.
+Every SM100 plan compiles its selected ordinary, deterministic, two-CTA, or
+adaptive-pair artifact in `compile()` from storage-free tensor metadata, so
+its first `execute()` performs no CuTe JIT and may be captured directly. The
+SM90 implementation retains its concrete-tensor compile caches and compiles on
+its first execution. The high-level wrapper allocates the outputs and the
 scratch on the launch stream when they are omitted. Inputs, outputs, and the
 live workspace must not alias; concurrent executions need distinct output and
 workspace storage.
@@ -678,26 +680,25 @@ missing or undersized buffer raises `ValueError` before `attn_score` is touched.
 the same optional `workspace=` keyword for reuse; executions that share one
 buffer must not overlap on the device.
 
-`deterministic=True` is request-or-fail and supports SM100/SM103, `H == 64`,
-`D == 128`, `block_I == 128`, and `topk % 128 == 0` for
-`128 <= topk <= 2048`, on either compute backend. Each producer CTA owns one
-plane and processes the fixed row stripe `cta`, `cta + num_ctas`, ...; the v2
-backend disables its ordinary dynamic ticket assignment for this path. The
-main GEMM therefore retains its existing Tensor Core math while dK has a fixed
-association order across launches. Scratch is exactly
-`ws_align(deterministic_dk_planes * B * S_k * D * sizeof(float))` for either
-backend. It is
-cleared on the launch stream at every execute, then reduced once in fixed
-plane order. The live scratch byte range must not overlap any input or output;
-`execute` validates this before clearing the planes, while allowing disjoint
-views of the same allocation. A warmed plan with caller-provided outputs and
-workspace is CUDA Graph compatible. To capture the convenience wrapper, warm
-it first and pass every output plus `workspace=` explicitly; omitted buffers
-are allocated per call. A fixed plane count is bitwise reproducible across
-runs; changing the plane count changes the FP32 accumulation grouping, so
-results from two plane counts are not required to be bitwise identical. As
-with the existing deterministic sparse-attention backward, valid IDs in a
-semantic top-k row are expected to be distinct.
+`deterministic=True` is request-or-fail and supports SM100/SM103, `D == 128`,
+`block_I == 128`, and `topk % 128 == 0` for `128 <= topk <= 2048`. The default
+backend accepts `H in {32, 64}` while `sm100_v2` accepts `H == 64`. Each
+producer CTA owns one plane and processes the fixed row stripe `cta`,
+`cta + num_ctas`, ...; the v2 backend disables its ordinary dynamic ticket
+assignment for this path. The main GEMM therefore retains its existing Tensor
+Core math while dK has a fixed association order across launches. Scratch is
+exactly `ws_align(deterministic_dk_planes * B * S_k * D * sizeof(float))` for
+either backend. It is cleared on the launch stream at every execute, then
+reduced once in fixed plane order. The live scratch byte range must not overlap
+any input or output; `execute` validates this before clearing the planes, while
+allowing disjoint views of the same allocation. A warmed plan with caller-owned
+outputs and workspace is CUDA Graph compatible. To capture the convenience
+wrapper, warm it first and pass every output plus `workspace=` explicitly;
+omitted buffers are allocated per call. A fixed plane count is bitwise
+reproducible across runs; changing the plane count changes the FP32
+accumulation grouping, so results from two plane counts are not required to be
+bitwise identical. As with the existing deterministic sparse-attention
+backward, valid IDs in a semantic top-k row are expected to be distinct.
 
 **The TileLang fallback present in the upstream repo is dropped here
 (CuTe-DSL only).** If the CuTe-DSL path fails the wrapper raises
@@ -739,8 +740,11 @@ The default SM100 backend accepts compact H32 `index_q`, `weights`,
 `d_index_q`, and `d_weights` tensors directly. TCGEN05 still executes its
 minimum M64 tile internally: the upper Q rows and weights are zero-filled, and
 the dQ/dW stores are clipped to the logical H32 extent. Callers must not pad
-these tensors to H64 or slice H64 outputs. Other sub-M64 head counts remain
-unsupported; H64 and larger head counts retain their existing behavior.
+these tensors to H64 or slice H64 outputs. This compact path also applies to
+`deterministic=True`: fixed producer ownership changes only the dK destination
+and row schedule, while the same H32 input padding and output predicates remain
+active. Other sub-M64 head counts remain unsupported; H64 and larger head
+counts retain their existing behavior.
 
 On SM90, also prefer preserving the producer's id convention. The performance
 difference between local and global ids is generally small, so a separate

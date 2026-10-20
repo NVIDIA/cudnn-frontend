@@ -2736,3 +2736,43 @@ def test_decode_adapter_64_column_tile_cuda_graph_replay_no_host_sync():
             torch.testing.assert_close(lse.view(B, H, s_q)[live], ref_lse[live], atol=5e-3, rtol=0)
     finally:
         g.reset()
+
+
+@requires_rubin
+@pytest.mark.parametrize("hnd", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("split", [1, 2])
+@pytest.mark.parametrize("pack", [False, True])
+def test_paged_decode_independent_pool_layouts(hnd, dtype, split, pack):
+    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+    from test_sdpa_fwd_paged_sm100 import _run_graph
+
+    _run_graph(
+        2,
+        8,
+        2,
+        256,
+        16,
+        16,
+        [251, 129],
+        hnd,
+        dtype=dtype,
+        stats=True,
+        s_q=3,
+        causal_br=True,
+        v_hnd=not hnd,
+        replay=True,
+        arch="sm107",
+        pack_gqa=pack,
+        explicit_knobs=SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=2, pack_gqa=pack, split_kv=split),
+    )
+
+
+@requires_rubin
+@pytest.mark.parametrize("hnd", [False, True])
+@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("pack", [False, True])
+def test_paged_thd_independent_pool_layouts(hnd, d, pack):
+    from test_sdpa_fwd_paged_sm100 import _run_thd_graph
+
+    _run_thd_graph((d, d), hnd, v_hnd=not hnd, q_lens=[37, 130, 5], kv_lens=[300, 77, 129], arch="sm107", pack_gqa=pack)

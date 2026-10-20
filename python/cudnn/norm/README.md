@@ -125,13 +125,12 @@ API (the kernel is still used for InstanceNorm graphs).
 
 ## Environment
 
-Blackwell (sm_100), cu13-capable driver. Uses the **internal** CUTLASS DSL (only
-it ships `cutlass.experimental.primitives`):
+Requires Blackwell (sm_100), a CUDA 13-capable driver, and a CUTLASS DSL build
+>= 4.7.0 that exports `cutlass.primitives`. The norm entry points reject builds
+without this module. Check the active environment before running:
 
 ```bash
-python3 -m venv norm_venv && source norm_venv/bin/activate
-pip install nvidia-cutlass-dsl-internal \
-    --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi-local/simple
+python -c "import cutlass.primitives"
 pip install torch --index-url https://download.pytorch.org/whl/cu128   # Blackwell
 ```
 

@@ -16,13 +16,30 @@ from cudnn.sdpa.bwd import prepared as prep
 from cudnn.sdpa.fwd.prepared import BufferFacts, _set_native_fact
 
 pytestmark = [pytest.mark.L0]
-_ARCHES = ("sm80", "sm100", "sm107", "sm107_thd", "sm120")
+_ARCHES = (
+    "sm80",
+    "sm100",
+    "sm107",
+    "sm107_thd",
+    "sm120",
+    "sm100_d128",
+    "sm100_d128_thd",
+    "sm100_d128_grouped_thd",
+)
+_D128_THD_ARCHES = ("sm100_d128_thd", "sm100_d128_grouped_thd")
 _WORKSPACE = 0x700000000000
 
 
-def _fixture(arch="sm100", dtype="bfloat16", features=True, wide=0):
-    family = arch.split("_thd")[0]
-    path = Path(prep.__file__).parent / "kernels" / family / "prepared_host.py"
+def _fixture(arch="sm100", dtype="bfloat16", features=True, wide=0, workspace_bytes=4096):
+    family = "sm100" if arch.startswith("sm100_d128") else arch.split("_thd")[0]
+    filename = {
+        "sm100_d128": "prepared_d128_host.py",
+        "sm100_d128_accum": "prepared_d128_accum_host.py",
+        "sm100_d128_thd": "prepared_d128_thd_host.py",
+        "sm100_d128_grouped_dense": "prepared_d128_grouped_host.py",
+        "sm100_d128_grouped_thd": "prepared_d128_grouped_thd_host.py",
+    }.get(arch, "prepared_host.py")
+    path = Path(prep.__file__).parent / "kernels" / family / filename
     entry = "host_f16_thd" if arch == "sm107_thd" else "host_f16" if family == "sm107" else "host"
     host = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == entry)
     names = [arg.arg for arg in host.args.args if "Constexpr" not in ast.unparse(arg.annotation)]
@@ -30,11 +47,16 @@ def _fixture(arch="sm100", dtype="bfloat16", features=True, wide=0):
     if family == "sm80":
         assert names[:4] == ["t_q", "t_kv", "max_sq", "max_skv"]
         names = names[4:]
+    if arch in _D128_THD_ARCHES:
+        assert names[:7] == ["t_q", "t_kv", "t_q_phys", "t_kv_phys", "max_sq", "max_skv", "stats_head_stride"]
+        names = names[7:]
     aliases = {"lse": "stats", "q_lens": "seq_q", "kv_lens": "seq_kv"}
+    if arch in _D128_THD_ARCHES:
+        aliases.update({"ro_" + port: "ragged_" + port for port in ("q", "k", "v", "o", "do", "dq", "dk", "dv", "stats")})
     roles = tuple(aliases.get(name.removesuffix("_ptr"), name.removesuffix("_ptr")) for name in names[: names.index("workspace")])
     ops, declared, facts = [], [], {}
     for i, role in enumerate(roles):
-        enabled = i < 9 or (features and role != "delta")
+        enabled = i < (11 if arch in _D128_THD_ARCHES else 9) or (features and role != "delta")
         if not enabled:
             ops.append(None)
             declared.append(None)
@@ -43,9 +65,11 @@ def _fixture(arch="sm100", dtype="bfloat16", features=True, wide=0):
         dt = (
             "int32"
             if role.startswith("seq_")
-            else "int64" if role.startswith("ro_") else "float32" if role in ("stats", "sink", "dsink", "bias", "dbias") else dtype
+            else "int64" if role.startswith(("ro_", "ragged_")) else "float32" if role in ("stats", "sink", "dsink", "bias", "dbias") else dtype
         )
         shape, strides = ((2,), (1,)) if i >= 9 else ((2, 3, 5, 8), (160, 8, 32, 1))
+        if role.startswith("ragged_"):
+            shape, strides = (3,), (1,)
         if role == "stats":
             shape, strides = (2, 3, 5, 1), (21, 7, 1, 1)
         if wide and i < 9:
@@ -67,7 +91,7 @@ def _fixture(arch="sm100", dtype="bfloat16", features=True, wide=0):
         object(),
         entry,
         tuple(ops),
-        4096,
+        workspace_bytes,
         0,
         0.125,
         "sdpa_bwd_" + family,
@@ -127,7 +151,7 @@ def test_standalone_geometry_accepts_lists(arch):
         native.bind(pack, indices, _WORKSPACE, 17, (), None, True, wrong)
 
 
-@pytest.mark.parametrize("arch", ["sm80", "sm100", "sm107_thd"])
+@pytest.mark.parametrize("arch", ["sm80", "sm100", "sm107_thd", *_D128_THD_ARCHES])
 @pytest.mark.parametrize("q_prefix,kv_prefix", [(False, False), (True, False), (False, True), (True, True)])
 def test_native_standalone_prefix_form_and_storage(arch, q_prefix, kv_prefix):
     spec, _, facts, _, _ = _fixture(arch)
@@ -148,6 +172,40 @@ def test_native_standalone_prefix_form_and_storage(arch, q_prefix, kv_prefix):
             prep.bind(spec, dict(facts, **{role: facts[role]._replace(strides=(2,), span=6)}), _WORKSPACE, 17)
 
 
+@pytest.mark.parametrize("arch", _D128_THD_ARCHES)
+@pytest.mark.parametrize(
+    "role,fault",
+    [
+        ("seq_q", "missing"),
+        ("seq_kv", "short"),
+        ("ragged_q", "dtype"),
+        ("ragged_stats", "alignment"),
+        ("ragged_dv", "overlap"),
+    ],
+)
+def test_d128_thd_metadata_revalidates_current_storage(arch, role, fault):
+    spec, native, facts, _, frames = _fixture(arch)
+    indices = tuple(range(len(spec.operands)))
+    native.execute(_pack(spec, facts), indices, _WORKSPACE, 17, ())
+    assert len(frames) == 1
+    fact = facts[role]
+    bad = {
+        "missing": None,
+        "dtype": fact._replace(dtype="float32"),
+        "alignment": fact._replace(ptr=fact.ptr + 1),
+        "short": fact._replace(span=fact.span - 1),
+        "overlap": fact._replace(ptr=_WORKSPACE),
+    }[fault]
+    changed = facts | {role: bad}
+    with pytest.raises(ValueError):
+        prep.bind(spec, changed, _WORKSPACE, 31, raw_storage=True)
+    with pytest.raises(ValueError):
+        native.execute(_pack(spec, changed), indices, _WORKSPACE, 31, ())
+    assert len(frames) == 1
+    native.execute(_pack(spec, facts), indices, _WORKSPACE, 47, ())
+    assert len(frames) == 2 and frames[-1][-1] == 47
+
+
 @pytest.mark.parametrize("arch", _ARCHES)
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 @pytest.mark.parametrize("features", [False, True])
@@ -164,6 +222,13 @@ def test_actual_backward_host_frames_match_python(arch, dtype, features, wide):
         assert list(frames[-1]) == expected
         held.append((actual, tuple(expected)))
     assert all(actual == expected for actual, expected in held)
+
+
+@pytest.mark.parametrize("arch", ["sm100_d128_accum", "sm100_d128_grouped_dense"])
+def test_dense_d128_accumulation_host_frame_matches_python(arch):
+    # These dense variants share the nine-operand ABI. Retain a complete frame
+    # comparison, including pointer rebinding, stream changes and wide products.
+    test_actual_backward_host_frames_match_python(arch, "bfloat16", False, 2)
 
 
 @pytest.mark.parametrize("arch", _ARCHES)
@@ -255,6 +320,63 @@ def test_backward_workspace_and_pointer_ranges(workspace):
     assert not frames
 
 
+@pytest.mark.parametrize("arch", _ARCHES)
+@pytest.mark.parametrize("workspace_kind", ["null", "unused_overlap", "unused_unaligned"])
+def test_backward_zero_workspace_preserves_host_frame(arch, workspace_kind):
+    spec, native, facts, _, frames = _fixture(arch, features=False, workspace_bytes=0)
+    assert cudnn._pybind_module._SdpaBwdBinder.supports_zero_workspace
+    # A zero-byte region has no overlap or alignment requirement. The ABI still
+    # carries its unused slot, including when a caller supplies an address.
+    workspace = {"null": 0, "unused_overlap": facts["q"].ptr + 16, "unused_unaligned": 1}[workspace_kind]
+    expected = prep._bind_python(spec, facts, workspace, 29, raw_storage=True)
+    assert expected[len(spec.operands)] == workspace
+    assert list(_native(spec, native, facts, workspace, 29)) == expected
+    native.execute(_pack(spec, facts), tuple(range(len(spec.operands))), workspace, 29, ())
+    prep.execute(spec, facts, workspace, 29, raw_storage=True)
+    assert frames == [tuple(expected), tuple(expected)]
+
+
+@pytest.mark.parametrize("native_binding", [False, True])
+@pytest.mark.parametrize("workspace", [0, 1])
+def test_backward_positive_workspace_rejects_missing_or_unaligned_storage(native_binding, workspace):
+    spec, _, facts, _, frames = _fixture()
+    spec = replace(spec, native_binding=native_binding)
+    with pytest.raises(ValueError, match="aligned caller workspace"):
+        prep.execute(spec, facts, workspace, 17, raw_storage=True)
+    assert not frames
+
+
+@pytest.mark.parametrize(
+    "role,fault",
+    [
+        ("q", "missing"),
+        ("stats", "alignment"),
+        ("dq", "short"),
+        ("dk", "alignment"),
+        ("dv", "missing"),
+    ],
+)
+def test_backward_zero_workspace_revalidates_operand_storage(role, fault):
+    spec, native, facts, _, frames = _fixture(workspace_bytes=0)
+    _native(spec, native, facts, 0)
+    f = facts[role]
+    changed = dict(facts, **{role: {"missing": None, "alignment": f._replace(ptr=f.ptr + 1), "short": f._replace(span=f.span - 1)}[fault]})
+    with pytest.raises(ValueError):
+        prep.execute(spec, changed, 0, 17, raw_storage=True)
+    with pytest.raises(ValueError):
+        native.execute(_pack(spec, changed), tuple(range(len(spec.operands))), 0, 17, ())
+    assert not frames
+    assert list(_native(spec, native, facts, 0)) == prep._bind_python(spec, facts, 0, 17, raw_storage=True)
+
+
+def test_backward_zero_workspace_preserves_operand_address_range_check():
+    spec, native, facts, _, frames = _fixture(workspace_bytes=0)
+    changed = dict(facts, q=facts["q"]._replace(ptr=2**63 - 16))
+    with pytest.raises(ValueError, match="storage address range"):
+        native.execute(_pack(spec, changed), tuple(range(len(spec.operands))), 0, 17, ())
+    assert not frames
+
+
 def test_backward_frames_do_not_share_runtime_storage():
     spec, native, facts, _, _ = _fixture()
 
@@ -318,3 +440,61 @@ def test_half_backward_graph_uses_native_binding(dtype, causal, hkv, monkeypatch
         _check_prepared(case)
     finally:
         captured.reset()
+
+
+def test_d128_accumulation_guard_is_shared_by_graph_and_standalone():
+    from cudnn.sdpa.bwd.prepared_sm100_d128 import _GuardedAccumulationEntry
+
+    spec, _, facts, geometry, frames = _fixture("sm100_d128_accum", features=False)
+    guarded = _GuardedAccumulationEntry(spec.fn, spec.operands, spec.workspace_bytes)
+    spec = replace(spec, fn=guarded, scale=0.125, native_binding=True)
+    prep.execute(spec, facts, _WORKSPACE, 29, geometry=geometry)
+    spec.native.execute(_pack(spec, facts), spec.native_indices, _WORKSPACE, 31, ())
+    assert len(frames) == 2 and frames[-1][-2:] == (0.125, 31)
+    for role in ("q", "stats", "dq"):
+        changed = facts | {"dk": facts["dk"]._replace(ptr=facts[role].ptr + 16)}
+        with pytest.raises(ValueError, match="overlaps"):
+            spec.native.execute(_pack(spec, changed), spec.native_indices, _WORKSPACE, 31, ())
+        assert len(frames) == 2
+    for scale in (0.0, -0.125, float("nan"), float("inf"), 1e-50, 3e38):
+        with pytest.raises(ValueError, match="scale"):
+            prep.execute(spec, facts, _WORKSPACE, 29, scale=scale, geometry=geometry)
+        assert len(frames) == 2
+
+
+@pytest.mark.parametrize("arch", _D128_THD_ARCHES)
+@pytest.mark.parametrize("role", ["seq_q", "ragged_stats", "ragged_dv"])
+def test_d128_thd_guard_rejects_output_metadata_aliases(arch, role):
+    from cudnn.sdpa.bwd.prepared_sm100_d128_thd import _GuardedEntry
+
+    spec, _, facts, _, frames = _fixture(arch)
+    spec = replace(spec, fn=_GuardedEntry(spec.fn, spec.operands, spec.workspace_bytes), native_binding=True)
+    prep.execute(spec, facts, _WORKSPACE, 17)
+    changed = facts | {role: facts[role]._replace(ptr=facts["dk"].ptr)}
+    with pytest.raises(ValueError, match="overlaps"):
+        prep.execute(spec, changed, _WORKSPACE, 29)
+    with pytest.raises(ValueError, match="overlaps"):
+        spec.native.execute(_pack(spec, changed), spec.native_indices, _WORKSPACE, 31, ())
+    assert len(frames) == 1
+    spec.native.execute(_pack(spec, facts), spec.native_indices, _WORKSPACE, 47, ())
+    assert len(frames) == 2
+
+
+@pytest.mark.parametrize("role", ["seq_q", "seq_kv"])
+@pytest.mark.parametrize("arch", _D128_THD_ARCHES)
+def test_d128_thd_guard_includes_the_last_prefix_element(arch, role):
+    from cudnn.sdpa.bwd.prepared_sm100_d128_thd import _GuardedEntry
+
+    spec, _, facts, _, frames = _fixture(arch)
+    operands = list(spec.operands)
+    slot = spec.roles.index(role)
+    operands[slot] = replace(operands[slot], allowed_numels=(2, 3))
+    spec = replace(spec, operands=tuple(operands))
+    spec = replace(spec, fn=_GuardedEntry(spec.fn, spec.operands, spec.workspace_bytes), native_binding=True)
+    # Two lengths fit immediately before dK; a third prefix word aliases it.
+    current = facts | {role: facts[role]._replace(ptr=facts["dk"].ptr - 8)}
+    prep.execute(spec, current, _WORKSPACE, 17)
+    current[role] = current[role]._replace(shape=(3,), strides=(1,), span=3)
+    with pytest.raises(ValueError, match="overlaps"):
+        prep.execute(spec, current, _WORKSPACE, 29)
+    assert len(frames) == 1

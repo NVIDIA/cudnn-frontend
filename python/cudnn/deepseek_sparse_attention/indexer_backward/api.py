@@ -250,8 +250,9 @@ class IndexerBackward(APIBase):
     weights, and stores are clipped to the caller's H32 tensors. No caller-side
     H32→H64 padding or output slicing is required.
 
-    ``deterministic=True`` is an SM100/SM103 request-or-fail policy for H=64,
-    D=128, block_I=128, and 128-multiple top-k in [128, 2048]. It launches up
+    ``deterministic=True`` is an SM100/SM103 request-or-fail policy for H=32 or
+    H=64 on the default backend (H=64 on ``sm100_v2``), D=128, block_I=128,
+    and 128-multiple top-k in [128, 2048]. It launches up
     to ``deterministic_dk_planes`` persistent CTAs over fixed grid-stride query
     rows and allocates one CTA-private FP32 dK plane for each possible producer.
     The plane count is a compile-time specialization selected from
@@ -528,9 +529,11 @@ class IndexerBackward(APIBase):
                         desc.device != self.iq_desc.device,
                         f"deterministic IndexerBackward requires all tensors on one device: {name} is on {desc.device}, index_q on {self.iq_desc.device}",
                     )
+            deterministic_heads = (64,) if self.use_v2 else (32, 64)
             self._value_error_if(
-                self.heads != 64 or self.head_dim != 128,
-                f"deterministic IndexerBackward requires H=64, D=128, got H={self.heads}, D={self.head_dim}",
+                self.heads not in deterministic_heads or self.head_dim != 128,
+                f"deterministic IndexerBackward with backend='{self.backend}' requires "
+                f"H in {deterministic_heads}, D=128, got H={self.heads}, D={self.head_dim}",
             )
             self._value_error_if(
                 self.block_I != 128,
@@ -1080,8 +1083,9 @@ def indexer_backward_wrapper(
         deterministic: keyword-only opt-in for bitwise-reproducible gradients
             on SM100/SM103. Fixed-owner producer CTAs accumulate into
             CTA-private FP32 planes; a fixed CTA-order reduction writes
-            ``d_index_k``. A warmed plan with preallocated outputs and
-            workspace remains CUDA Graph compatible. Valid top-k indices
+            ``d_index_k``. The default backend supports compact H32 and H64;
+            ``sm100_v2`` supports H64. A warmed plan with preallocated outputs
+            and workspace remains CUDA Graph compatible. Valid top-k indices
             within each query row must be unique.
         deterministic_dk_planes: compile-time deterministic producer-grid and
             FP32-plane specialization, one of ``{96, 128, 148}`` (default

@@ -115,7 +115,7 @@ def bind(spec, facts, workspace_ptr, stream_int, *, scale=None, geometry=None, r
 
 def _bind_python(spec, facts, workspace_ptr, stream_int, *, scale=None, geometry=None, raw_storage=False):
     """Python-owned quantized backward contracts (also the differential test reference)."""
-    if not workspace_ptr or workspace_ptr % 16:
+    if spec.workspace_bytes > 0 and (not workspace_ptr or workspace_ptr % 16):
         raise ValueError(f"{spec.name} needs an aligned caller workspace")
     frame = []
     packed_tiles = {}
@@ -175,7 +175,7 @@ def _bind_python(spec, facts, workspace_ptr, stream_int, *, scale=None, geometry
             extent = packed_tiles[name] * op.packed_tile_bytes
         else:
             extent = (f.numel if op.allowed_numels and f.shape and not raw_storage else op.span) * op.itemsize
-        if workspace_ptr < f.ptr + extent and f.ptr < workspace_ptr + spec.workspace_bytes:
+        if spec.workspace_bytes > 0 and workspace_ptr < f.ptr + extent and f.ptr < workspace_ptr + spec.workspace_bytes:
             raise ValueError(f"{spec.name}: caller workspace overlaps {name}")
         frame.append(f.ptr)
     scale = spec.scale if scale is None else float(scale)

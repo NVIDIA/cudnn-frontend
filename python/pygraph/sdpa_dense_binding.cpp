@@ -184,6 +184,7 @@ class SdpaDenseBinder {
         window_right_ = integer("window_right");
         paged_        = flag("paged");
         hnd_          = flag("paged_hnd");
+        v_hnd_        = py::hasattr(spec, "paged_v_hnd") ? flag("paged_v_hnd") : hnd_;
         has_lse_      = flag("has_lse");
         has_sink_     = flag("has_sink");
         seq_kv_       = flag("seq_kv_present");
@@ -754,8 +755,13 @@ class SdpaDenseBinder {
             auto ts     = py::cast<std::array<int64_t, 2>>(result.bound);
             result.need = add(add(multiply(b - 1, ts[0]), multiply(result.extent1 - 1, ts[1])), 1);
         } else if (paged_ && (role == K || role == V)) {
-            auto value     = py::cast<py::tuple>(pool_layout_(
-                shape_tuple, stride_tuple, dtype_bits_[role] / 8, hnd_, kh_, page_size_, role == K ? d_qk_ : d_v_));
+            auto value     = py::cast<py::tuple>(pool_layout_(shape_tuple,
+                                                          stride_tuple,
+                                                          dtype_bits_[role] / 8,
+                                                          role == V ? v_hnd_ : hnd_,
+                                                          kh_,
+                                                          page_size_,
+                                                          role == K ? d_qk_ : d_v_));
             result.bound   = py::cast<py::tuple>(value[0]);
             result.need    = py::cast<int64_t>(value[1]);
             result.extent0 = result.shape[0];
@@ -867,7 +873,7 @@ class SdpaDenseBinder {
     int64_t total_q_ = 0;
     int offset_bits_ = 32;
     bool ragged_, has_total_q_ = false, ragged_lse_head_major_ = false;
-    bool paged_, hnd_, has_lse_, has_sink_, seq_kv_, seq_q_, shape_fixed_, lpt_fixed_, tail_native_, causal_,
+    bool paged_, hnd_, v_hnd_, has_lse_, has_sink_, seq_kv_, seq_q_, shape_fixed_, lpt_fixed_, tail_native_, causal_,
         bottom_right_, fp32_partial_, dense_flex_;
     bool combine_q_lens_ = false;
 };
