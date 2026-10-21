@@ -1282,18 +1282,18 @@ def qsa_bwd_prep_kernel(
     nrows = T * HQ
     nwarps = nb * (PREP_THREADS // 32)
     for r0 in cutlass.range(bid * (PREP_THREADS // 32) + wib, nrows, nwarps * PREP_ROWS, unroll=1):
-        ovs = []
-        dvs = []
+        o_vecs = []
+        do_vecs = []
         for u in cutlass.range_constexpr(PREP_ROWS):
             r = r0 + u * nwarps
             if r >= nrows:
                 r = r0
-            ovs.append((p_o + r * D + lane * 8).load(count=8, alignment=16))
-            dvs.append((p_do + r * D + lane * 8).load(count=8, alignment=16))
+            o_vecs.append((p_o + r * D + lane * 8).load(count=8, alignment=16))
+            do_vecs.append((p_do + r * D + lane * 8).load(count=8, alignment=16))
         for u in cutlass.range_constexpr(PREP_ROWS):
             r = r0 + u * nwarps
-            ov = ovs[u].to(F32)
-            dv = dvs[u].to(F32)
+            ov = o_vecs[u].to(F32)
+            dv = do_vecs[u].to(F32)
             acc = F32(0.0)
             for j in cutlass.range_constexpr(8):
                 acc = acc + ov[j] * dv[j]
