@@ -66,6 +66,7 @@ add_executable(
     misc/sm_carveout.cpp
     misc/cudagraphs.cpp
     misc/cudagraph_topology.cpp
+    misc/localized_tensors.cpp
     misc/deviceless_aot_compilation.cpp
     misc/compile_time_constant_example.cpp
 
@@ -114,6 +115,7 @@ target_link_libraries(
 
     CUDA::cublasLt
     CUDA::cudart
+    CUDA::cuda_driver
     CUDA::nvrtc
 )
 
