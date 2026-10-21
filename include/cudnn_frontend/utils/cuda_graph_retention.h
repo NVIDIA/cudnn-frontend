@@ -35,13 +35,28 @@ namespace detail {
 // read from.
 //
 // CUDA forbids CUDA API calls in user-object destructors, and releasing a payload may make them
-// (e.g. cudnnBackendDestroyDescriptor frees device memory). The destructor therefore only
-// queues the payload. Those calls would also invalidate an active stream capture, so the queue
-// is drained by the next execution that is NOT being captured. A payload queued after the last
-// such execution stays alive until process exit.
+// (e.g. cudnnBackendDestroyDescriptor frees device memory and unloads code). The destructor
+// therefore only queues the payload, and the next destruction of a CudaGraphRetainedResource's
+// owner (an execution plan, a graph's host-copy storage, ...) releases it. Not an execution:
+// freeing memory or unloading code waits for all work on the device, and would make an otherwise
+// asynchronous execute block on, or deadlock with, unrelated streams. A payload queued after the
+// last such destruction stays alive until process exit.
 class CudaGraphRetainedResource {
    public:
     CudaGraphRetainedResource() = default;
+
+    // Destroying an owner is when payloads that graphs handed back are released (see class
+    // comment), this one's included if no graph holds it any more.
+    ~CudaGraphRetainedResource() {
+        state.reset();
+        drain_deferred_releases();
+    }
+    CudaGraphRetainedResource(CudaGraphRetainedResource const &) = default;
+    CudaGraphRetainedResource(CudaGraphRetainedResource &&)      = default;
+    CudaGraphRetainedResource &
+    operator=(CudaGraphRetainedResource const &) = default;
+    CudaGraphRetainedResource &
+    operator=(CudaGraphRetainedResource &&) = default;
 
     // Give `graph` one reference to the payload. `make_payload()` is invoked once, on the first
     // call, and must return a non-null std::shared_ptr<void> (or convertible) that owns
@@ -73,8 +88,7 @@ class CudaGraphRetainedResource {
         return cuda_graph_retain_user_object(graph, state->user_object, 1, /*flags=*/0);
     }
 
-    // Same as retain_on_graph() for the graph `stream` is currently capturing into. When the
-    // stream is not capturing, this is the point at which queued payloads are released instead.
+    // Same as retain_on_graph() for the graph `stream` is currently capturing into, if any.
     template <typename MakePayload>
     cudaError_t
     retain_on_capturing_stream(cudaStream_t stream, MakePayload &&make_payload) {
@@ -83,17 +97,12 @@ class CudaGraphRetainedResource {
         cudaError_t const query_status         = cuda_stream_get_capture_info(stream, &capture_status, &capture_graph);
         if (query_status == cudaErrorStreamCaptureImplicit) {
             // Legacy default stream while another stream captures in global mode: not our
-            // capture, and not a safe moment to release anything either. The recorded work
-            // itself reports the problem if there is one.
+            // capture. The recorded work itself reports the problem if there is one.
             (void)cuda_get_last_error();
             return cudaSuccess;
         }
         if (query_status != cudaSuccess) {
             return query_status;
-        }
-        if (capture_status == cudaStreamCaptureStatusNone) {
-            drain_deferred_releases();
-            return cudaSuccess;
         }
         if (capture_status != cudaStreamCaptureStatusActive || capture_graph == nullptr) {
             return cudaSuccess;
@@ -105,29 +114,6 @@ class CudaGraphRetainedResource {
     static bool
     has_deferred_releases() {
         return deferred_releases().pending.load(std::memory_order_acquire);
-    }
-
-    // Release queued payloads if `stream` is not being captured. For callers that retain nothing
-    // themselves; cheap (no CUDA call) when nothing is queued.
-    static cudaError_t
-    drain_deferred_releases_on_stream(cudaStream_t stream) {
-        if (!has_deferred_releases()) {
-            return cudaSuccess;
-        }
-        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
-        cudaGraph_t capture_graph              = nullptr;
-        cudaError_t const query_status         = cuda_stream_get_capture_info(stream, &capture_status, &capture_graph);
-        if (query_status == cudaErrorStreamCaptureImplicit) {
-            (void)cuda_get_last_error();
-            return cudaSuccess;
-        }
-        if (query_status != cudaSuccess) {
-            return query_status;
-        }
-        if (capture_status == cudaStreamCaptureStatusNone) {
-            drain_deferred_releases();
-        }
-        return cudaSuccess;
     }
 
     // Release payloads handed back by user-object destructors (see class comment).

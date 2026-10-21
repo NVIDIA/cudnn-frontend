@@ -11,7 +11,7 @@ from pathlib import Path
 import torch
 
 import cudnn
-from cudnn import BSA
+from cudnn import ops
 from cudnn.block_sparse_attention.csrc.fwd.sm90_blk64 import bsa_fwd_sm90
 from benchmark_sm90_blk128 import measure
 
@@ -59,7 +59,7 @@ def main():
         indices = torch.rand(b, h, sq // 64, sk // 64, device="cuda").argsort(-1)[..., :topk].int().contiguous()
 
         def forward(index=0):
-            return BSA.block_sparse_attention_forward(q, k, v, indices, topk, sparse_block_size=64)
+            return ops.block_sparse_attention_forward(q, k, v, indices, topk, sparse_block_size=64)
 
         fm, _ = measure(forward, args.repeats, 7)
         flops = 4 * b * h * sq * 128 * topk * 64

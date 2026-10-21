@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Adapter of the SM100 index-list sparse (QSA) d256 backward -- ``kernels/sm100/bprop_sparse_d256_f16.py``."""
+"""APIBase wrapper for the GQA index-list sparse attention (QSA) backward on SM100 / SM103 -- ``qsa_bwd_sm100.py``."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ NUM_KV_HEADS = 2
 HEAD_DIM = 256
 TOPK_WIDTH = 2051  # 512 blocks x 4 tokens + 3 tail tokens
 SOFTMAX_SCALE = HEAD_DIM**-0.5
-_SUPPORTED_CAPABILITIES = ((10, 0),)
+_SUPPORTED_CAPABILITIES = ((10, 0), (10, 3))
 
 
 def _byte_span(tensor: torch.Tensor) -> tuple[int, int]:
@@ -31,8 +31,14 @@ def _overlaps(lhs: tuple[int, int], rhs: tuple[int, int]) -> bool:
     return lhs[0] < rhs[1] and rhs[0] < lhs[1]
 
 
-class SparseGqaBwdDslSm100(APIBase):
-    """QSA backward: dQ, dK and dV from Q, K, V, O, dO, the forward LSE and the selected token indices."""
+class GqaSparseAttentionBackward(APIBase):
+    """QSA backward: dQ, dK and dV from Q, K, V, O, dO, the forward LSE and the selected token indices.
+
+    ``topk_idxs`` row ``i`` lists the first token of each of its ``min((i + 1) // 4, 512)`` complete 4-token blocks (the
+    four ids of a block are consecutive), then the ``(i + 1) % 4`` tail tokens, then ``-1``. Up to ``T = 2051`` every
+    row is therefore its whole causal prefix. The kernels read the block ids only and derive the tail block from the
+    position. Rows that break this layout are not checked.
+    """
 
     def __init__(
         self,
@@ -77,7 +83,7 @@ class SparseGqaBwdDslSm100(APIBase):
         capability = torch.cuda.get_device_capability(q_desc.device)
         self._not_implemented_error_if(
             capability not in _SUPPORTED_CAPABILITIES,
-            f"{self.__class__.__name__} requires SM100, found SM{capability[0]}{capability[1]}",
+            f"{self.__class__.__name__} requires SM100 or SM103, found SM{capability[0]}{capability[1]}",
         )
         self._not_implemented_error_if(
             self.softmax_scale not in (None, SOFTMAX_SCALE),
@@ -102,13 +108,13 @@ class SparseGqaBwdDslSm100(APIBase):
             self._value_error_if(desc.shape != shape, f"{name} must have shape {shape}, got {desc.shape}")
             self._check_dtype(desc, dtype, name=name)
             self._value_error_if(desc.device != q_desc.device, f"{name} must be on {q_desc.device}, got {desc.device}")
-            # The kernels address the declared layout natively and never repack (Rule 2).
+            # The kernels address the declared layout natively and never repack (python/cudnn/AGENTS.md Rule 2).
             self._not_implemented_error_if(
                 not desc.is_contiguous(),
                 f"{self.__class__.__name__} addresses only contiguous {name}, got shape {desc.shape} strides {desc.stride}",
             )
 
-        from .kernels.sm100 import bprop_sparse_d256_f16 as kernel
+        from . import qsa_bwd_sm100 as kernel
 
         self._value_error_if(
             not 1 <= seq_len <= kernel.MAX_SEQ_LEN,
@@ -125,7 +131,7 @@ class SparseGqaBwdDslSm100(APIBase):
         if self._compiled_kernel is not None:
             return
         with torch.cuda.device(self.descs["q"].device):
-            self._compiled_kernel = self._kernel_module.compile_kernels(self._plan.has_sparse)
+            self._compiled_kernel = self._kernel_module.compile_kernels(self._plan)
 
     def scratch_workspace_bytes(self) -> int:
         """Caller workspace bytes one execution needs."""
@@ -179,10 +185,10 @@ class SparseGqaBwdDslSm100(APIBase):
         return dq, dk, dv
 
 
-_cache_of_SparseGqaBwdDslSm100Objects: dict = {}
+_cache_of_GqaSparseAttentionBackwardObjects: dict = {}
 
 
-def sparse_gqa_bwd_wrapper_sm100(
+def gqa_sparse_attention_backward_wrapper(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -201,12 +207,12 @@ def sparse_gqa_bwd_wrapper_sm100(
     inputs = (q, k, v, out, dout, lse, topk_idxs)
     key = (q.device, softmax_scale) + tuple((tuple(t.shape), t.stride(), t.dtype) for t in inputs)
     key += tuple(None if t is None else (tuple(t.shape), t.stride(), t.dtype) for t in (dq, dk, dv))
-    obj = _cache_of_SparseGqaBwdDslSm100Objects.get(key)
+    obj = _cache_of_GqaSparseAttentionBackwardObjects.get(key)
     if obj is None:
-        obj = SparseGqaBwdDslSm100(*inputs, sample_dq=dq, sample_dk=dk, sample_dv=dv, softmax_scale=softmax_scale)
+        obj = GqaSparseAttentionBackward(*inputs, sample_dq=dq, sample_dk=dk, sample_dv=dv, softmax_scale=softmax_scale)
         obj.check_support()
         obj.compile()
-        _cache_of_SparseGqaBwdDslSm100Objects[key] = obj
+        _cache_of_GqaSparseAttentionBackwardObjects[key] = obj
 
     with torch.cuda.device(q.device), stream_context(stream, q.device):
         dq = torch.empty_like(q) if dq is None else dq

@@ -15,7 +15,7 @@ from pathlib import Path
 
 import torch
 
-from cudnn import BSA
+from cudnn import ops
 from cudnn.block_sparse_attention import _interface
 from cudnn.block_sparse_attention._fp8_quant import _quantize_sage_bhsd
 from benchmark_sm120_blk128 import _make_block_indices, _rounded_topk
@@ -117,7 +117,7 @@ def main():
                                 sparse_block_size=block_size,
                                 v_block_size=128 if block_size == 128 else 0,
                             )[0]
-                        return BSA.block_sparse_attention_fp8_forward(q, k, v, indices, sparse_block_size=block_size)["o_tensor"]
+                        return ops.block_sparse_attention_fp8_forward(q, k, v, indices, sparse_block_size=block_size)["o_tensor"]
 
                     graph, output = _capture(run, args.warmup)
                     graphs.append(graph)

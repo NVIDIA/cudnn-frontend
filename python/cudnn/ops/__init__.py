@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Torch-dependent cuDNN operation helpers.
+"""cuDNN operations for PyTorch and JAX.
 
 Public symbols resolve on first attribute access so importing ``cudnn.ops``
-does not require PyTorch.
+requires neither PyTorch nor JAX.
 """
 
 import importlib
@@ -26,6 +26,13 @@ _LAZY_EXPORTS = {
     "Nvfp4BlockScaleDequantizer": (".nvfp4", "Nvfp4BlockScaleDequantizer"),
     "nvfp4_block_scale_quantize": (".nvfp4", "nvfp4_block_scale_quantize"),
     "nvfp4_block_scale_dequantize": (".nvfp4", "nvfp4_block_scale_dequantize"),
+    "block_sparse_attention_forward": ("cudnn.block_sparse_attention", "block_sparse_attention_forward"),
+    "block_sparse_attention_backward": ("cudnn.block_sparse_attention", "block_sparse_attention_backward"),
+    "block_sparse_attention_fp8_forward": ("cudnn.block_sparse_attention", "block_sparse_attention_fp8_forward"),
+    "kimi_delta_attention_forward_jax": ("cudnn.linear_attention.jax_api", "kimi_delta_attention_fwd"),
+    "kimi_delta_attention_backward_jax": ("cudnn.linear_attention.jax_api", "kimi_delta_attention_bwd"),
+    "block_sparse_attention_forward_jax": ("cudnn.block_sparse_attention.jax_api", "block_sparse_attention_forward"),
+    "block_sparse_attention_backward_jax": ("cudnn.block_sparse_attention.jax_api", "block_sparse_attention_backward"),
 }
 
 __all__ = list(_LAZY_EXPORTS)
