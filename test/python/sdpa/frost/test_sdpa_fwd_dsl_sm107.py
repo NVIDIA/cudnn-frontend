@@ -8109,9 +8109,10 @@ def _d512_half_fold_ptx_counts(tmp_path, params: dict, tag: str) -> dict:
 def test_d512_half_prefolded_scale_ptx_drops_the_per_score_multiply(tmp_path, spec):
     """The sm_107a PTX of the role-split d512 bf16 kernel with softmax_scale_prefolded carries 64 fewer `mul.f32x2` per traced
     softmax body (the dense specialization traces one body, the causal one two: the unmasked and the masked arm) and one fewer
-    scalar `mul.f32` per body (the tile max) than the same specialization without it, the SAME `sub.f32x2` (the shift stays),
-    the same `mul.rn.f32x2` (the correction / epilogue scalings) and the same exponent count; neither build fuses the shift
-    into an fma.  The module constants pin the flag and the absence of a fused arm.  Runs wherever the DSL knows sm_107a
+    scalar `mul.f32` per body (the tile max) than the same specialization without it, the SAME 64 `sub.f32x2` per body (the
+    shift stays), the same `mul.rn.f32x2` (the correction / epilogue scalings) and the same exponent count.  Row-sum updates
+    may use packed FMA in either build, but folding must not change their count.  The module constants pin the flag and
+    the absence of a fused arm.  Runs wherever the DSL knows sm_107a
     (no disassembler needed)."""
     mask = _D512_HALF_FOLD_SASS_SPECS[spec]
     base = _d512_half_fold_ptx_counts(tmp_path, mask, f"d512_half_{spec}_scaled")
@@ -8128,7 +8129,10 @@ def test_d512_half_prefolded_scale_ptx_drops_the_per_score_multiply(tmp_path, sp
     ), f"{spec}: scalar mul.f32 {base['MUL_F32']} -> {fold['MUL_F32']} vs {bodies} traced bodies: a raw-max site still scales (or a non-softmax multiply moved)"
     for key in ("SUB_F32X2", "MUL_RN_F32X2", "EX2"):
         assert fold[key] == base[key], f"{spec}: {key} moved ({base[key]} -> {fold[key]}); only the per-score multiply may change"
-    assert base["FMA_F32X2"] == fold["FMA_F32X2"] == 0, f"{spec}: the shift must not lower to an fma ({base['FMA_F32X2']} / {fold['FMA_F32X2']})"
+    assert base["SUB_F32X2"] == 64 * bodies, f"{spec}: the shift must retain 64 sub.f32x2 per traced body ({base['SUB_F32X2']} / {bodies})"
+    # total_sum_vec * alpha_pair + iter_sum_pair may contract independently of the score shift.  Compare the builds
+    # instead of requiring zero FMA across the whole kernel; the SUB pin above checks that the score shift stays separate.
+    assert base["FMA_F32X2"] == fold["FMA_F32X2"], f"{spec}: folding changed the packed FMA count ({base['FMA_F32X2']} -> {fold['FMA_F32X2']})"
 
 
 @pytest.mark.parametrize("spec", sorted(_D512_HALF_FOLD_SASS_SPECS))
