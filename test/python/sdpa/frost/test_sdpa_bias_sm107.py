@@ -455,8 +455,16 @@ def test_template_params_and_capabilities_are_appended():
         2,
         1,
     ), "a record without the fields renders the legacy tail, the full body, the two-group body and one S slot"
-    # ... followed by the per-shape TILE_N domain (the TILE_N 64 cells of the small tiles), appended after them.
-    assert [f.name for f in dataclasses.fields(Capabilities)][-5:] == ["bias_d_shapes", "bias_io_dtype_only", "kv_mask", "kv_mask_dtypes", "tile_ns_by_d_shape"]
+    # ... followed by the per-shape TILE_N domain (the TILE_N 64 cells of the small tiles), appended after them, and then the
+    # canonical band set (#601), the newest field.
+    assert [f.name for f in dataclasses.fields(Capabilities)][-6:] == [
+        "bias_d_shapes",
+        "bias_io_dtype_only",
+        "kv_mask",
+        "kv_mask_dtypes",
+        "tile_ns_by_d_shape",
+        "band",
+    ]
 
 
 def test_kernel_module_constants_and_mask_sites(monkeypatch):

@@ -49,6 +49,20 @@ partial LSEs stay natural (the combine merges them in that base) and only the
 combine kernel's final LSE converts. Backward engines consume natural-log Stats
 only (the graph attribute is forward-only).
 
+**Band masks** (`causal` / `bottom_right` / `swa` / `right_band_widening`) are
+declared through the canonical model in `cudnn/sdpa/band.py`, which separates the
+band a GRAPH asks for (`BandFacts`: left bound present or not / right mode
+unbounded · causal · finite-right / top-left · bottom-right anchor, plus the
+"a bottom-right anchor needs a diagonal" combination rule) from the band SET a
+row serves (`BandSupport`, held on each row as `Capabilities.band` and derived
+from the legacy flags by one normalization layer). The legacy flags stay the
+declaration spelling of every row below; the point of the model is that a
+RESTRICTED row is expressible — the causal-and-unmasked claim of the MXFP8 backward, or
+the top-left-anchor-only claim of the SM89 forward row — instead of an
+unmentioned axis silently meaning yes. The matcher asks every axis in BOTH
+directions, so a mode the graph requests by leaving a flag unset (unbounded
+right band, no left bound, top-left anchor) is part of the row's claim too.
+
 `sdpa_fwd_prefill_sm100`, `sdpa_fwd_prefill_sm107`, `sdpa_fwd_prefill_sm120`, `sdpa_fwd_prefill_sm90` (f16/bf16),
 `sdpa_fwd_prefill_sm100_fp8` and `sdpa_fwd_prefill_sm107_fp8` (per-tensor FP8) and `sdpa_fwd_prefill_sm107_mxfp8`
 (block-scale MXFP8, exact cc 10.7) are default candidates, ranked against the backend per measured shard or qualification verdict

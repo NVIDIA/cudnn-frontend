@@ -27,6 +27,7 @@ from typing import Any, Callable, Optional
 
 import cudnn
 from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_arch_requirement_error, cutedsl_state, cutedsl_too_old
+from cudnn.sdpa import band
 from cudnn.sdpa import graph_analyzer as ga
 
 # Lowering dependencies, resolved at build time — see the note in fwd/engines.py:
@@ -189,6 +190,12 @@ class Capabilities:
 
     # optional features a backward graph may request
     gqa: bool = False  # h_q != h_kv
+    # The band axes a graph may request, in the PRE-MODEL declaration spelling
+    # (see cudnn.sdpa.band): causal (right bound 0), bottom-right anchor, sliding
+    # window (left bound), right-band widening (right bound > 0).  Mapped ONCE,
+    # in __post_init__ below, onto ``band`` -- the canonical set the probe
+    # decides with; a restricted row declares ``band`` instead, and declaring
+    # both is allowed only while they agree exactly.
     causal: bool = False
     bottom_right: bool = False
     deterministic: bool = False  # use_deterministic_algorithm=True
@@ -275,6 +282,50 @@ class Capabilities:
     # Appended for positional compatibility; no graph parsing, kernel imports,
     # allocation or compilation. The row supplies the verdict from pure facts.
     declaration_check: Optional[Callable[["ga.SdpaGraphFacts", Any], Optional[str]]] = None
+
+    # The canonical band-support SET this row claims (cudnn.sdpa.band), the
+    # model the probe decides with.  APPENDED at the end for the append-only
+    # contract; ``None`` means "derive from the legacy flags above", and a row
+    # needing a restricted claim passes an explicit BandSupport (the MXFP8
+    # backward row's legacy ``causal=True`` already derives the restricted
+    # causal-and-unmasked set, ``BandSupport.causal_and_unmasked()``).  __post_init__
+    # resolves it, so ``capabilities.band`` is never None after construction,
+    # and a legacy flag that is SET outside an explicit claim is refused there.
+    band: Optional["band.BandSupport"] = None
+
+    def __post_init__(self) -> None:
+        """Single normalization layer: legacy mask flags -> canonical band set."""
+        if self.band is None:
+            object.__setattr__(
+                self,
+                "band",
+                band.BandSupport.from_legacy_flags(
+                    causal=self.causal,
+                    bottom_right=self.bottom_right,
+                    swa=self.swa,
+                    right_band_widening=self.right_band_widening,
+                ),
+            )
+            return
+        # A band-only declaration is the point of the model, so only the flags
+        # that are actually SET constrain the explicit claim: each of them must
+        # name an axis the declared band serves (the legacy spelling is then a
+        # redundant, narrower view of the same claim).  The all-default legacy
+        # block is the spelling of "nothing declared" and leaves the band alone.
+        legacy_axes = (
+            ("causal", self.causal, band.RIGHT_CAUSAL in self.band.right),
+            ("right_band_widening", self.right_band_widening, band.RIGHT_FINITE in self.band.right),
+            ("swa", self.swa, band.LEFT_WINDOW in self.band.left),
+            ("bottom_right", self.bottom_right, band.ANCHOR_BOTTOM_RIGHT in self.band.anchors),
+        )
+        conflicting = sorted(name for name, set_flag, served in legacy_axes if set_flag and not served)
+        if conflicting:
+            raise ValueError(
+                "Capabilities declares an explicit band support "
+                f"{self.band.as_dict()} that does not serve the legacy mask flags {conflicting} set with it; the two "
+                "spellings must state the same claim (clear the flags or widen the band) -- conflicting declarations "
+                "are never silently resolved"
+            )
 
 
 def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: Any = None) -> Optional[str]:
@@ -375,6 +426,14 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
             if not compact:
                 return f"{name} must use compact BSHD storage; got stride {tuple(stride)}"
 
+    # The band decision goes through the canonical model (cudnn.sdpa.band):
+    # BandFacts is the graph's ask, ``capabilities.band`` the row's claim.  Built
+    # HERE, after the cheap arch/dtype/shape declines, so a probe that is going to
+    # reject the graph anyway does not pay for it; the checks are spliced in at the
+    # positions this probe has always used, so the first reported reason is
+    # unchanged.  BandSupport.decline() is the same decision in a single call.
+    band_facts = band.BandFacts.from_sdpa_facts(facts)
+    band_support = capabilities.band
     for fact, cap, label in (
         # Row-neutral reason: the sm120 / sm80 rows accumulate dQ through fp32 atomics, but the sm107 chains have no atomics at
         # all and simply have not claimed the two-run bitwise guarantee yet -- the old shared text was false for them.
@@ -394,8 +453,10 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         (facts.scale == 0.0, capabilities.zero_scale, "attn_scale = 0"),
         (facts.has_unfuse_fma, capabilities.unfuse_fma, "unfuse_fma"),
         (facts.seq_q_trim, capabilities.seq_q_trim, "seq_len_q without padding mask"),
-        (facts.right_band_widening, capabilities.right_band_widening, "causal right-band widening"),
-        (facts.window_left is not None, capabilities.swa, "sliding window"),
+        # Symmetric on every axis (see fwd/engines.py): the mode the graph asks
+        # for by leaving a flag unset is part of the row's claim too.
+        (True, band_support.serves_right_mode(band_facts.right_mode), band.LABEL_RIGHT[band_facts.right_mode]),
+        (True, band_support.serves_left_mode(band_facts.left_mode), band.LABEL_LEFT[band_facts.left_mode]),
         # A ragged graph always sets `padded` (its lengths ARE the mask), but a
         # row may serve the packed path without serving DENSE padding -- the
         # dense mask needs the per-batch length threaded into a kernel that
@@ -404,7 +465,6 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         (facts.has_sink, capabilities.sink, "sink token"),
         (facts.thd, capabilities.thd, "THD / ragged"),
         (facts.has_cu_seq_len, capabilities.cu_seq_len, "cu_seq_len_q / cu_seq_len_kv"),
-        (facts.causal, capabilities.causal, "causal mask"),
     ):
         if fact and not cap:
             return f"graph uses {label}, which this engine does not support"
@@ -462,10 +522,12 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         return "dSink_token output requires a sink_token input"
     if facts.s_q == 1 and not capabilities.decode:
         return "s_q == 1 (decode) is out of scope for the prefill kernels"
-    if facts.bottom_right and not (facts.causal or facts.right_band_widening):
-        return "bottom-right alignment requires a causal upper bound (plain or right-widened)"
-    if facts.bottom_right and not capabilities.bottom_right:
-        return "graph uses bottom-right causal, which this engine does not support"
+    if band_facts.anchor == band.ANCHOR_BOTTOM_RIGHT and not band_facts.has_diagonal:
+        return band.REASON_ANCHOR_WITHOUT_DIAGONAL
+    if not band_support.serves_anchor(band_facts):
+        # The backward probe has always said "engine" here (the forward one says
+        # "kernel"); band.anchor_reason keeps both wordings in one definition.
+        return band.anchor_reason("engine", anchor=band_facts.anchor)
     m = capabilities.bottom_right_s_q_multiple
     if facts.bottom_right and m > 1 and facts.s_q % m != 0:
         return (
