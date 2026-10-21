@@ -78,6 +78,10 @@ DSA_INDEXER_TOP_K_PARAM_MARKS = [
             # Tie bins exceed the radix kernel's 32768-candidate buffer.
             pytest.param(torch.float32, 705, 2, 65536, "adversarial", marks=pytest.mark.L1, id="fp32-spill-k705"),
             pytest.param(torch.float32, 2048, 2, 65536, "adversarial", marks=pytest.mark.L1, id="fp32-spill-k2048"),
+            # BF16 wider than 32768 columns: FP16-derived coarse key and two refine rounds. The tie rows fill both
+            # candidate buffers past shared memory; the random rows are 1024 wide-index rows that spill.
+            pytest.param(torch.bfloat16, 2048, 2, 65536, "adversarial", marks=pytest.mark.L0, id="bf16-wide-k2048"),
+            pytest.param(torch.bfloat16, 2048, 1, 131072, "random", marks=pytest.mark.L0, id="bf16-wide-random-k2048"),
         ],
     ),
     pytest.mark.parametrize("tie_break", [0, 1, 2], ids=["ties-none", "ties-small", "ties-large"]),
