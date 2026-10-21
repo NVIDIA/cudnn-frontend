@@ -35,10 +35,18 @@ _LAZY_EXPORTS = {
     "block_sparse_attention_backward_jax": ("cudnn.block_sparse_attention.jax_api", "block_sparse_attention_backward"),
 }
 
+# Op families are subpackages; they resolve lazily like the ops above.
+_FAMILIES = ("nsa",)
+
 __all__ = list(_LAZY_EXPORTS)
 
 
 def __getattr__(name: str) -> Any:
+    if name in _FAMILIES:
+        module = importlib.import_module(f".{name}", __name__)
+        globals()[name] = module
+        return module
+
     target = _LAZY_EXPORTS.get(name)
     if target is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
