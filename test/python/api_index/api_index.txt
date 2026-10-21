@@ -1358,6 +1358,10 @@ cudnn.ops.causal_conv1d
 cudnn.ops.causal_conv1d_nwh
 cudnn.ops.causal_conv1d_update
 cudnn.ops.fft_causal_conv1d
+cudnn.ops.hstu_attention_backward_jax
+cudnn.ops.hstu_attention_forward_jax
+cudnn.ops.hstu_lmsd_backward_jax
+cudnn.ops.hstu_lmsd_forward_jax
 cudnn.ops.kimi_delta_attention_backward_jax
 cudnn.ops.kimi_delta_attention_forward_jax
 cudnn.ops.nvfp4_block_scale_dequantize
