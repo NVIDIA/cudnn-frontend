@@ -3247,9 +3247,12 @@ CONTIGUOUS; `execute(block_ids=[, block_lens=], k_cache=, v_cache=, slot_mapping
 written through, then stage (4) is the index-list sparse core (`sparse_gqa_sm107`, the index-list section below) READING THE POOLS --
 per sequence the listed 4-token blocks and the open tail over `[0, kv_lens[b])` through `block_table[b]`, on the bottom-right diagonal
 (row `j` at `kv_lens[b] - S_q + j`; a negative position is a dead row, `kv_lens = 0` a dead entry: `out = 0` / `LSE = -inf` exactly).
-The list form is a declaration fact derived from `S_q`: at `S_q <= 4` ONE list per sequence (`block_ids [B, top_k]` + `block_lens
-[B]`, the adapter's `list_per_sequence` arm: selected at the step-0 position and shared by the step's rows, the MTP visible set of the
-contract page), past four rows one list per row (`[B, S_q, top_k]`, the adapter's bottom-right per-token form) at any `S_q`; the split
+The list form is a declaration fact -- `QsaSpec.index_list_form` (2026-10-21; `None` = derived from `S_q`): `"shared"` at `S_q <= 4`, ONE
+list per sequence (`block_ids [B, top_k]` + `block_lens [B]`, the adapter's `list_per_sequence` arm: selected at the step-0 position and
+shared by the step's rows, the MTP visible set of the contract page; the default under caller lists up to four rows, the typed decline
+`shared_list_rows` past them), `"per_row"` one list per row (`[B, S_q, top_k]`, the adapter's bottom-right per-token form) at any `S_q`
+(declarable at `S_q` 1 .. 4 too -- the serving stacks' per-row selection, validated 2026-10-21 at `S_q` 2 / 4 against the per-row oracle:
+the `per-row declared` cells below; the default past four rows); the split
 (`decode_split_kv`: `None` = `ceil(SMs / (B x H_kv x S_q))` chunks capped at `min(16, ceil((top_k + 1) / 32))` -- the cap from the split sweeps at B 1 / B 4 x S_kv 32K x S_q 1 on a 212-SM cc 10.7 part with the pinned decode-grid combine (CUDA-graph replay at the 2376 MHz lock): B 1 39.0 / 38.1 / 37.7 us at split 8 / 16 / 17, B 4 37.1 / 36.2 / 36.4, the former combine entry turning up past 16 --, or a pinned int up to `ceil((top_k + 1) / 32)`)
 puts fp32 partials in the block's workspace (`get_workspace_size()` holds them) and runs the split combine; `fuse_gate` is served at every
 split (the core's epilogue unsplit, the combine otherwise), `return_lse` is served (`[B, H_q, S_q]` fp32).  The indexer band's slab
@@ -3277,6 +3280,9 @@ rows exact, the pools' step rows BITWISE the slab's K / V bands, the prefix rows
 | ladder 8 | 8 / per row | 2: 300, 100 | L1 page 16 | 1 | launch / LSE | bf16 ✅ |
 | ladder 9 | 64 / per row (the 2500 list omits blocks) | 2: 2500, 64 | L2 NHD page 64 | 2 | fused (combine) / -- | bf16 ✅ |
 | MTP residues | 2 and 4 / shared, `pos_0 mod 4` in 0..3 on ~60-token sequences | 2 | L1 page 16 | 1 | fused / LSE | bf16 ✅ (the step-0-anchored oracle within budget; the per-row-tail reading farther on the `4k + 3` rows) |
+| per-row declared 1 (2026-10-21) | 2 / per row (`QsaSpec(index_list_form="per_row")`) | 4: 300, 0, 2052, 77 | L1 page 16 | 4 | fused (combine) / LSE | bf16 ✅ (the per-row oracle: every row's list at its own position) |
+| per-row declared 2 (2026-10-21) | 4 / per row, `block_lens` absent, a row at a negative position | 4: 8191, 8190, 2, 8188 | L2 NHD page 64 | the fill rule | launch / LSE | bf16 ✅ |
+| per-row declared 3 (2026-10-21) | 4 / per row, 24 / 2 at `d_model` 2560 | 1: 4096 | L1 page 16 | 1 | fused (epilogue) / -- | bf16 ✅ |
 | adapter twin | 2 / shared | 4: 700, 0, 2052, 130 | L1 page 16 | 1 and 4 | fused / LSE | bf16 ✅ BITWISE the standalone adapter on the block's own Q / gate views |
 | workspace sentinel | 1 / shared | 3: 4096, 512, 0 | L1 page 16 | 8 | fused | bf16 ✅ (a sentinel past `get_workspace_size()` untouched; unsplit scratch 0) |
 | capture / replay | 2 / shared | 4: 300, 0, 1000, 77 -> 301, 0, 1000, 77 | L1 page 16 | 4 | fused / LSE | bf16 ✅ (the first execute captured with no warm-up under `set_sync_debug_mode("error")`, the replay bitwise eager, the replay over new lengths / table / lists / slots / inputs bitwise eager) |
@@ -3408,8 +3414,9 @@ n_tail) x 4 x 2 x 512 B` of K / V, ~2.1 MiB at a saturated list with two tail id
 bytes -- ~16 MiB per sequence per layer at `S_q = 4`, `top_k` 512 and 2 KV heads (~4 MiB at `S_q = 1`); the 64-wide single-item
 form that would gather the shared list once is not built.  The gated attention block's decode mode (`kv_lens` /
 `block_table` / `slot_mapping` / pools through `_SparseSdpa`) is served since 2026-10-14: `kv_source="paged"` on a dense `[B, S_q]`
-`QsaSpec` declaration binds this form -- `list_per_sequence` at `S_q <= 4` (the block derives the list form from `S_q`; one list per row
-past it), `bottom_right` from the geometry, the split from `decode_split_kv` or the block's fill rule (`ceil(SMs / (B x H_kv x S_q))`
+`QsaSpec` declaration binds this form -- `list_per_sequence` at `S_q <= 4` (`QsaSpec.index_list_form`: `None` derives the list form from
+`S_q`, one list per row past four rows; `"per_row"` binds the per-token arm at any `S_q`, `"shared"` the shared arm up to four rows --
+2026-10-21), `bottom_right` from the geometry, the split from `decode_split_kv` or the block's fill rule (`ceil(SMs / (B x H_kv x S_q))`
 capped at 16 and at the item's tile count), the pools and the whole table as declaration samples, the gate and the LSE through the block -- validated
 end to end against the fp32 block oracle (the serving-forms section above, `test_block_qsa_decode.py`).
 

@@ -134,15 +134,30 @@ def _pools(n_pages, h, page, layout, dtype, device=_DEV, fill=float("nan")):
     return row[..., :D], row[..., D:]
 
 
-def _geom(geom_kw, top_k=512, index_band=False, **over):
+def _geom(geom_kw, top_k=512, index_band=False, index_list_form=None, **over):
     kw = dict(geom_kw, causal_bottom_right=True)
     kw.update(over)
-    return GatedAttentionBlockGeometry(**kw, qsa=QsaSpec(top_k=top_k, index_band=index_band)), RefGeometry(**kw)
+    return GatedAttentionBlockGeometry(**kw, qsa=QsaSpec(top_k=top_k, index_band=index_band, index_list_form=index_list_form)), RefGeometry(**kw)
 
 
-def _declare(geom_kw, batch, s_q, *, page=16, layout="hnd", n_pages=8, dtype=BF16, top_k=512, index_band=False, table=None, geom_over=None, **blk_kw):
+def _declare(
+    geom_kw,
+    batch,
+    s_q,
+    *,
+    page=16,
+    layout="hnd",
+    n_pages=8,
+    dtype=BF16,
+    top_k=512,
+    index_band=False,
+    table=None,
+    geom_over=None,
+    index_list_form=None,
+    **blk_kw,
+):
     """A declared (not compiled) sparse DECODE block on EMPTY tensors: the declaration cells (any device)."""
-    geom, _ = _geom(geom_kw, top_k=top_k, index_band=index_band, **(geom_over or {}))
+    geom, _ = _geom(geom_kw, top_k=top_k, index_band=index_band, index_list_form=index_list_form, **(geom_over or {}))
     mk = lambda *shape: torch.empty(*shape, dtype=dtype, device=_DEV)  # noqa: E731
     kc, vc = _pools(n_pages, geom.h_kv, page, layout, dtype)
     bt = torch.zeros(batch, n_pages, dtype=torch.int32, device=_DEV) if table is None else table
@@ -459,6 +474,91 @@ def test_execute_form_checks_of_the_sparse_decode_mode():
             run(blk, s_q=2, ids=i32(2, 512))  # every form check passed: the uncompiled block stops at its own gate
 
 
+def test_index_list_form_is_a_declaration_attribute_the_envelope_publishes():
+    """``QsaSpec.index_list_form`` (appended; a DECLARATION attribute, numerics-changing): ``"per_row"`` binds one list per row at ANY
+    ``S_q`` (the sparse core's per-token arm, the serving stacks' per-row selection -- ``qsa_shared_list`` False, ``execute`` takes
+    ``[T, top_k]`` / ``[B, S_q, top_k]``); ``None`` keeps the ``S_q`` rule (shared at ``S_q <= 4``, per row past it); ``"shared"`` past the
+    cap is a typed decline whose text EQUALS the envelope's ``shared_list_rows`` row (one shared token: ``tail covers at most two blocks``);
+    ``"shared"`` on the block's own K / V is refused by name; the vocabulary is pinned at ``QsaSpec.validate``; the envelope publishes the
+    forms per geometry (``index_list_forms`` / ``index_list_form_default``) and lists the row under ``decode.declines``."""
+    import re
+
+    from cudnn.gated_attention_block.api import QSA_INDEX_LIST_FORMS
+
+    assert QSA_INDEX_LIST_FORMS == (None, "shared", "per_row")
+    with pytest.raises(ValueError, match="index_list_form must be None"):
+        QsaSpec(index_list_form="rows").validate()
+    with _no_host_sync():
+        for s_q in (1, 2, 4, 8):
+            per_row, _ = _declare(GEOM_SMALL, 2, s_q, n_pages=4, index_list_form="per_row")
+            assert per_row.sparse_decode and not per_row.qsa_shared_list and per_row.qsa_list_form == "per_row" and not per_row._sdpa.list_per_sequence
+            auto, _ = _declare(GEOM_SMALL, 2, s_q, n_pages=4)
+            assert auto.qsa_shared_list is (s_q <= SHARED_MAX_S_Q) and auto.qsa_list_form == ("shared" if s_q <= SHARED_MAX_S_Q else "per_row")
+            if s_q <= SHARED_MAX_S_Q:
+                shared, _ = _declare(GEOM_SMALL, 2, s_q, n_pages=4, index_list_form="shared")
+                assert shared.qsa_shared_list and shared.qsa_list_form == "shared" and shared._sdpa.list_per_sequence
+        env = GatedAttentionBlockFwd.serving_envelope(_geom(GEOM_SMALL)[0], BF16, _DEV, device_cc=_SM107)
+        assert env.decode.index_list_forms == ("shared", "per_row") and env.decode.index_list_form_default == "shared"
+        assert "shared_list_rows" in env.decode.declines and "tail covers at most two blocks" in env.decode.declines["shared_list_rows"]
+        with pytest.raises(NotImplementedError, match=re.escape("tail covers at most two blocks")) as e:
+            _declare(GEOM_SMALL, 2, 8, n_pages=4, index_list_form="shared")
+        assert str(e.value) == env.decode.declines["shared_list_rows"]
+        assert (
+            "shared_list_rows"
+            not in GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**GEOM_SMALL), BF16, _DEV, device_cc=_SM107).decode.declines
+        )
+        assert GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**GEOM_SMALL), BF16, _DEV, device_cc=_SM107).decode.index_list_forms == ()
+        # the block's own K / V: every row carries its own list -- "shared" is refused by name, "per_row" names what happens
+        geom_self = GatedAttentionBlockGeometry(**GEOM_SMALL, qsa=QsaSpec(index_list_form="shared"))
+        mk = lambda *shape: torch.empty(*shape, dtype=BF16, device=_DEV)  # noqa: E731
+        args = lambda g: (
+            mk(1, 8, g.d_model),
+            mk(g.n_qkvg, g.d_model),
+            mk(D),
+            mk(D),
+            mk(1, 8, ROPE),
+            mk(1, 8, ROPE),
+            mk(g.d_model, g.h_q * D),
+            mk(1, 8, g.d_model),
+            g,
+        )  # noqa: E731
+        with pytest.raises(ValueError, match="kv_source='self'"):
+            GatedAttentionBlockFwd(*args(geom_self))
+        own = GatedAttentionBlockFwd(*args(GatedAttentionBlockGeometry(**GEOM_SMALL, qsa=QsaSpec(index_list_form="per_row"))))
+        assert not own.sparse_decode and own.qsa_list_form is None and not own.qsa_shared_list
+        # the per-row form's execute contract at S_q 2: both per-row spellings pass the form checks (the uncompiled block stops at its own gate),
+        # the shared spelling is refused by name
+        blk, aux = _declare(GEOM_SMALL, 2, 2, n_pages=4, index_list_form="per_row")
+        geom = aux["geom"]
+        i32 = lambda *shape: torch.zeros(*shape, dtype=torch.int32, device=_DEV)  # noqa: E731
+        z = lambda *shape: torch.zeros(*shape, dtype=BF16, device=_DEV)  # noqa: E731
+
+        def run(ids):
+            return blk.execute(
+                z(2, 2, geom.d_model),
+                z(geom.n_qkvg, geom.d_model),
+                torch.ones(D, dtype=BF16, device=_DEV),
+                torch.ones(D, dtype=BF16, device=_DEV),
+                z(2, 2, ROPE),
+                z(2, 2, ROPE),
+                z(geom.d_model, geom.h_q * D),
+                z(2, 2, geom.d_model),
+                torch.empty(1 << 20, dtype=torch.uint8, device=_DEV),
+                block_ids=ids,
+                k_cache=aux["k_cache"],
+                v_cache=aux["v_cache"],
+                block_table=aux["block_table"],
+                kv_lens=i32(2),
+                slot_mapping=i32(4),
+            )
+
+        for ids in (i32(4, 512), i32(2, 2, 512)):
+            with pytest.raises(RuntimeError, match="compile"):
+                run(ids)
+        with pytest.raises(ValueError, match=r"block_ids must be \[4, 512\] or \[2, 2, 512\].*index_list_form"):
+            run(i32(2, 512))
+
+
 # ---------------------------------------------------------------------------
 # Rubin: the oracle, the cells
 # ---------------------------------------------------------------------------
@@ -496,11 +596,14 @@ class _Case:
         n_pages=None,
         pos0_anchor=True,
         shuffle=True,
+        index_list_form=None,
     ):
         self.s_q, self.kv_lens, self.page, self.layout, self.dtype, self.top_k = int(s_q), [int(x) for x in kv_lens], page, layout, dtype, top_k
         self.block_lens_given, self.return_lse, self.fuse_gate, self.index_band = bool(block_lens), bool(return_lse), bool(fuse_gate), bool(index_band)
-        self.shared = self.s_q <= SHARED_MAX_S_Q
-        self.geom, self.ref_geom = _geom(geom_kw, top_k=top_k, index_band=index_band)
+        # the list form: the S_q rule (one list per sequence up to the shared-list cap), or QsaSpec.index_list_form as declared
+        self.index_list_form = index_list_form
+        self.shared = (self.s_q <= SHARED_MAX_S_Q) if index_list_form is None else (index_list_form == "shared")
+        self.geom, self.ref_geom = _geom(geom_kw, top_k=top_k, index_band=index_band, index_list_form=index_list_form)
         geom, ref_geom = self.geom, self.ref_geom
         h_q, h_kv, d_model = geom.h_q, geom.h_kv, geom.d_model
         G = h_q // h_kv
@@ -695,7 +798,8 @@ class _Case:
         return q, gate, k, v, o, proj
 
     def label(self):
-        return f"[{self.geom.h_q}/{self.geom.h_kv} S_q={self.s_q} {'shared' if self.shared else 'per-token'} p{self.page} {self.layout} {self.dtype} split={self.blk.decode_split_kv} gate={'fused' if self.fuse_gate else 'launch'} lse={self.return_lse} lens={self.kv_lens}]"
+        form = f"{'shared' if self.shared else 'per-row'}{'' if self.index_list_form is None else ' (declared)'}"
+        return f"[{self.geom.h_q}/{self.geom.h_kv} S_q={self.s_q} {form} p{self.page} {self.layout} {self.dtype} split={self.blk.decode_split_kv} gate={'fused' if self.fuse_gate else 'launch'} lse={self.return_lse} lens={self.kv_lens}]"
 
     def check(self, out=None, ws=None, lse=None, *, what="out"):
         """The standard assertions: finite, no sentinel, dead rows exact, within the budget vs the oracle (out, the gated O slot, the
@@ -779,6 +883,44 @@ _LADDER = [
     pytest.param(GEOM_SMALL, 8, (300, 100), BF16, 16, "hnd", 1, False, True, True, False, False, 8, id="Sq8-B2-per-token-p16-unsplit-lse"),
     pytest.param(GEOM_SMALL, 64, (2500, 64), BF16, 64, "nhd", 2, True, False, True, False, False, 9, id="Sq64-B2-per-token-p64-nhd-split2-fused-gate"),
 ]
+
+# (geometry, S_q, kv_lens, page, layout, split, fuse_gate, return_lse, block_lens, seed): the DECLARED per-row form at S_q <= 4 --
+# QsaSpec(index_list_form="per_row") -- one list per row at the row's own position (the serving stacks' per-row selection), where the
+# S_q rule would have bound the shared step-0 list; the control arm the in-block indexer's decode step is compared against
+_PER_ROW_LADDER = [
+    pytest.param(GEOM_SMALL, 2, (300, 0, 2052, 77), 16, "hnd", 4, True, True, True, 11, id="Sq2-B4-per-row-declared-p16-split4-fused-gate-lse"),
+    pytest.param(
+        GEOM_SMALL, 4, (8191, 8190, 2, 8188), 64, "nhd", None, False, True, False, 12, id="Sq4-B4-per-row-declared-p64-nhd-default-split-no-block-lens"
+    ),
+    pytest.param(GEOM_FLASH_NEXT, 4, (4096,), 16, "hnd", 1, True, False, True, 13, id="Sq4-B1-per-row-declared-flash-next-24-2-unsplit-fused-gate"),
+]
+
+
+@requires_rubin
+@pytest.mark.parametrize("geom_kw, s_q, kv_lens, page, layout, split, fuse_gate, return_lse, block_lens, seed", _PER_ROW_LADDER)
+def test_the_declared_per_row_form_at_mtp_widths_matches_the_per_row_oracle(
+    geom_kw, s_q, kv_lens, page, layout, split, fuse_gate, return_lse, block_lens, seed
+):
+    """``QsaSpec(index_list_form="per_row")`` at ``S_q`` 2 / 4 (the widths the ``S_q`` rule binds to the shared step-0 list): one list per
+    row at the row's own position, the step within the budget of the PER-ROW oracle (every row's list anchored at its own position: the
+    row at ``4k + 3`` sees block ``k`` only through its own list), dead rows exact, the pools bitwise, two launches bitwise -- the
+    serving stacks' per-row selection as the sparse core computes it."""
+    case = _Case(
+        geom_kw,
+        s_q,
+        kv_lens,
+        page=page,
+        layout=layout,
+        seed=seed,
+        split=split,
+        fuse_gate=fuse_gate,
+        return_lse=return_lse,
+        block_lens=block_lens,
+        index_list_form="per_row",
+    )
+    assert not case.shared and not case.blk.qsa_shared_list and case.blk.qsa_list_form == "per_row" and case.block_ids.shape == (len(kv_lens), s_q, 512)
+    case.compile()
+    _two_launches(case, "per-row declared")
 
 
 @requires_rubin

@@ -550,6 +550,12 @@ _KV_SOURCES = (KV_SOURCE_SELF, KV_SOURCE_PAGED)
 # a different function (the per-tensor FP8 SDPA rows take e4m3 Q / K / V together) and is not a form of this block.
 KV_CACHE_E4M3 = torch.float8_e4m3fn
 INDEX_CACHE_E4M3 = torch.float8_e4m3fn  # the fp8 INDEXER cache's element type (QsaSpec.index_cache_dtype): plain e4m3, no scales
+QSA_INDEX_LIST_FORM_SHARED = "shared"
+QSA_INDEX_LIST_FORM_PER_ROW = "per_row"
+QSA_INDEX_LIST_FORMS = (None, QSA_INDEX_LIST_FORM_SHARED, QSA_INDEX_LIST_FORM_PER_ROW)
+"""The vocabulary of ``QsaSpec.index_list_form`` (the block-sparse decode mode's list form): ``None`` = the ``S_q`` rule (``"shared"``
+under caller lists at ``S_q <= 4``, ``"per_row"`` past it and under the in-block indexer over the pools), ``"shared"`` = one list per
+sequence anchored at the step-0 position, ``"per_row"`` = one list per row at the row's own position."""
 """``kv_cache_dtype``: e4m3 pools with per-tensor fp32 ``k_scale`` / ``v_scale`` at execute (the serving stacks' fp8 KV cache)."""
 _UPCAST_ROWS = (
     2176  # rows per (token, KV head) item of the gathered-cast scratch: 17 x the decode tile's 128-row KV tile (qsa_kv_upcast.ROWS, pinned at check_support)
@@ -980,6 +986,12 @@ class DecodeEnvelope:
     # per-step one is ``pdl_default and route(s_q, batch).pdl_capable`` (stage (4) takes the switch on a decode-tile route only; a
     # prefill-route step launches plain and resolves False).  An explicit ``use_pdl`` outranks it.
     pdl_default: bool = False
+    # appended (the list form, ``QsaSpec.index_list_form``; a QsaSpec geometry only, empty otherwise): the forms the block-sparse decode
+    # mode serves at this geometry -- ``("shared", "per_row")`` under caller lists (``"shared"`` at ``S_q <= 4``: the record's shared-list
+    # cap, ``requires`` spells it), ``("per_row",)`` under the in-block indexer over the pools -- and what ``index_list_form=None`` resolves to
+    # (``"shared"`` under caller lists at ``S_q <= 4``, ``"per_row"`` past it and under the indexer).
+    index_list_forms: Tuple[str, ...] = ()
+    index_list_form_default: str = ""
 
 
 @dataclass(frozen=True)
@@ -1081,6 +1093,17 @@ class QsaSpec:
         a knob; bf16 stays the default and the reference.  Refused under ``index_source="caller"``: nothing of the block
         reads or writes an indexer cache there.
 
+    index_list_form
+        The LIST FORM of the block-sparse DECODE mode (``kv_source="paged"`` on a dense ``[B, S_q]`` declaration; appended):
+        ``"shared"`` -- ONE list per sequence, ``[B, top_k]``, selected at the step-0 position ``kv_lens[b] - S_q`` and
+        shared by the step's rows (the MTP form; ``S_q`` at most the sparse core's shared-list cap, 4); ``"per_row"`` -- one
+        list per row, ``[B, S_q, top_k]`` / ``[B x S_q, top_k]`` at positions ``kv_lens[b] - S_q + j`` (the serving stacks'
+        per-row selection), at ANY ``S_q``; ``None`` (the default) -- ``"shared"`` under caller lists at ``S_q <= 4`` and
+        ``"per_row"`` past it (the former derivation), ``"per_row"`` under the in-block indexer over the pools.  A
+        DECLARATION ATTRIBUTE (numerics-changing: which keys the speculative rows see), never a knob.  ``"shared"`` under the
+        indexer over the pools and under caller lists past four rows are typed declines; on the block's own K / V
+        (``kv_source="self"``) every row carries its own list, so ``"shared"`` is refused there by name.
+
     Fixed semantics that are deliberately NOT fields: the open tail block is always visible, the causal mask is always
     applied, and the id dtype is int32 (one legal value; an int64 list is refused at ``execute``).  A dense route below
     the identity bound (:attr:`identity_bound` visible tokens -- 2051 at the defaults -- below which every query's
@@ -1098,6 +1121,7 @@ class QsaSpec:
     index_head_dim: int = 128
     index_norm_eps: float = 1e-6
     index_cache_dtype: Optional[torch.dtype] = None  # appended: None = the activation dtype; torch.float8_e4m3fn = the fp8 indexer cache
+    index_list_form: Optional[str] = None  # appended: the decode mode's list form -- None (the S_q rule / per row under the indexer), "shared", "per_row"
 
     @property
     def index_cache_e4m3(self) -> bool:
@@ -1163,6 +1187,12 @@ class QsaSpec:
                 f"QsaSpec.index_cache_dtype={self.index_cache_dtype} requires index_source='indexer': under caller lists nothing of the block reads or "
                 "writes an indexer cache (the compressed keys and the queries are the stack's), so the declaration would be silently meaningless -- "
                 "refused by name, whatever the dtype"
+            )
+        if self.index_list_form not in QSA_INDEX_LIST_FORMS:
+            raise ValueError(
+                f"QsaSpec.index_list_form must be None (the S_q rule: 'shared' at S_q <= 4 under caller lists, 'per_row' past it and under the "
+                f"in-block indexer over the pools), 'shared' (one list per sequence, [B, top_k], anchored at the step-0 position) or 'per_row' "
+                f"(one list per row, [B, S_q, top_k]), got {self.index_list_form!r}"
             )
 
 
@@ -7068,15 +7098,33 @@ _SPARSE_DECODE_REQUIRES = (
     "geometry.is_causal=True, geometry.causal_bottom_right=True, window_left=-1, window_right in (-1, 0), qsa=QsaSpec(index_source='caller'), d_head=256",
     "sample_k_cache / sample_v_cache (the pools' [num_pages, H_kv, P, D] shape / dtype / strides) and sample_block_table ([B, max_pages] int32, CONTIGUOUS: the sparse core binds the whole table)",
     "bf16 / f16 activations (quant=None), save_for_backward=False, token_capacity=None; return_lse served ([B, H_q, S_q] fp32); fuse_gate served (the core's epilogue unsplit, the split combine otherwise)",
-    "S_q <= 4: ONE list per sequence -- execute(block_ids=) [B, top_k] int32 (+ block_lens [B]) selected at the step-0 position kv_lens[b] - S_q and shared by the step's rows "
-    "(row j sees the listed blocks plus every token from the step-0 tail start to its own position); S_q > 4: one list per row, block_ids [B, S_q, top_k] / [B x S_q, top_k] "
-    "(+ block_lens [B, S_q] / [B x S_q]) at positions kv_lens[b] - S_q + j (the extend-with-prefix form)",
+    "the list form (QsaSpec.index_list_form; None = the S_q rule below under caller lists, 'per_row' under the in-block indexer): 'shared' -- S_q <= 4, ONE list per "
+    "sequence -- execute(block_ids=) [B, top_k] int32 (+ block_lens [B]) selected at the step-0 position kv_lens[b] - S_q and shared by the step's rows "
+    "(row j sees the listed blocks plus every token from the step-0 tail start to its own position); 'per_row' -- any S_q, one list per row, block_ids [B, S_q, top_k] / "
+    "[B x S_q, top_k] (+ block_lens [B, S_q] / [B x S_q]) at positions kv_lens[b] - S_q + j (the serving stacks' per-row selection; the extend-with-prefix form); "
+    "None = 'shared' at S_q <= 4 and 'per_row' past it",
     "decode_split_kv=None (the fill rule: ceil(SMs / (B x H_kv x S_q)) chunks, at most min(16, ceil((top_k + 1) / 32))) or an int in [1, ceil((top_k + 1) / 32)]: performance only",
     "execute(block_table=, kv_lens=, k_cache=, v_cache=, slot_mapping=, block_ids=[, block_lens=]) with seq_lens=None (kv_lens binds the KV side only; a row at a negative position is dead)",
     "kv_cache_dtype=None (bf16 / f16 pools) or torch.float8_e4m3fn (bf16 activations, S_q <= 4, return_lse=False, decode_split_kv None / 1, fuse_norm_rope=False, "
     "inplace_qkv None / False: the pools' e4m3 codes under per-tensor fp32 k_scale / v_scale at execute -- the write-through quantizes, the step reads through the "
     "gathered cast + the d256 decode tile)",
 )
+
+
+def _qsa_decode_decline_texts(geometry: GatedAttentionBlockGeometry, dtype: torch.dtype) -> Dict[str, str]:
+    """The typed declines of the block-sparse DECODE mode's list form, keyed by name -- ONE spelling for the constructor (which
+    raises them) and :meth:`serving_envelope` (which publishes them under ``decode.declines``), formatted from the geometry and
+    the activation dtype alone (no ``S_q``, no device: a raised text equals its envelope entry byte for byte).  Each row carries
+    ONE shared token the tests pin (``shared_list_rows``: ``tail covers at most two blocks``)."""
+    del geometry, dtype  # the rows below spell record facts only; the indexer rows (appended later) read the geometry
+    cap = int(_sparse_record().index_shared_list_max_tokens)
+    return {
+        "shared_list_rows": (
+            f"QsaSpec(index_list_form='shared') past {cap} rows per sequence: the shared per-sequence list is anchored at the step-0 position and "
+            f"its tail covers at most two blocks (S_q <= {cap}); declare index_list_form='per_row' (one list per row, [B, S_q, top_k])"
+        ),
+    }
+
 
 _EXTEND_REQUIRES = (
     "thd=True (the packed declaration: h / cos / sin / out as [T_max, .] token matrices)",
@@ -7760,11 +7808,19 @@ class GatedAttentionBlockFwd(APIBase):
             lowering_applies and (self.fuse_norm_rope_small_m is False or (self.fuse_norm_rope_small_m is None and fuse_cache_write is not True))
         )
         # The BLOCK-SPARSE decode / extend-with-prefix mode (a QsaSpec geometry over the pools; the packed form met the table's
-        # `sparse` row above): stage (4) is the sparse core reading the pools, and the LIST FORM is a declaration fact derived from
-        # S_q -- ONE list per sequence at S_q <= the record's shared-list cap (the MTP form, anchored at the step-0 position), one
-        # list per row past it.  Read off the record, never transcribed.
+        # `sparse` row above): stage (4) is the sparse core reading the pools, and the LIST FORM is a declaration fact --
+        # `QsaSpec.index_list_form` as declared, or (None) derived from S_q under caller lists: ONE list per sequence at S_q <= the
+        # record's shared-list cap (the MTP form, anchored at the step-0 position), one list per row past it; under the in-block indexer
+        # over the pools the rows select for themselves (per row at every S_q: the serving stacks' function).  `_check_qsa_declaration`
+        # declined the forms the core does not serve ("shared" past the cap, "shared" under the indexer); the cap is read off the record.
         self.sparse_decode = self.kv_source == KV_SOURCE_PAGED and self.qsa is not None
-        self.qsa_shared_list = self.sparse_decode and self.seq_len <= _sparse_record().index_shared_list_max_tokens
+        self.indexer_decode = self.sparse_decode and self.qsa.index_source == "indexer"
+        list_form = self.qsa.index_list_form if self.qsa is not None else None
+        self.qsa_shared_list = self.sparse_decode and (
+            list_form == QSA_INDEX_LIST_FORM_SHARED
+            or (list_form is None and not self.indexer_decode and self.seq_len <= _sparse_record().index_shared_list_max_tokens)
+        )
+        self.qsa_list_form = (QSA_INDEX_LIST_FORM_SHARED if self.qsa_shared_list else QSA_INDEX_LIST_FORM_PER_ROW) if self.sparse_decode else None
         # The e4m3 KV cache OVER THE POOLS: stage (4) is the gathered cast + the dense decode tile (the block-sparse decode mode at
         # S_q <= 4 only); every other paged form over e4m3 pools, the LSE and a split are typed declines, and the mode norms +
         # rotates OUT of place (the tile's per-item Q is a view of the compact Q only), so inplace_qkv / fuse_norm_rope are settled here.
@@ -8203,6 +8259,18 @@ class GatedAttentionBlockFwd(APIBase):
         if paged and not rec.bottom_right:
             # the mode's arm, read off the record: a record that retires it declines here by name instead of binding a body without it
             raise NotImplementedError("QsaSpec with kv_source='paged': the sparse adapter's record declines bottom_right (the decode mode's diagonal)")
+        # The list form (QsaSpec.index_list_form): the shared per-sequence list is the decode mode's MTP form -- over the pools, at most the
+        # record's shared-list cap of rows per sequence, under caller lists (the in-block indexer selects per row: its own row below); on the
+        # block's own K / V every row carries its own list, so "shared" is refused by name rather than read as the per-row form.
+        if q.index_list_form == QSA_INDEX_LIST_FORM_SHARED:
+            if not paged:
+                raise ValueError(
+                    "QsaSpec(index_list_form='shared') is the block-sparse decode mode's shared per-sequence list (kv_source='paged', S_q <= "
+                    f"{rec.index_shared_list_max_tokens}: one list per sequence anchored at the step-0 position); on the block's own K / V "
+                    "(kv_source='self') every row carries its own list -- declare index_list_form=None or 'per_row'"
+                )
+            if q.index_source != "indexer" and self.seq_len > rec.index_shared_list_max_tokens:
+                raise NotImplementedError(_qsa_decode_decline_texts(g, self.dtype)["shared_list_rows"])
         # The head dim, the block size, the top_k range, the GQA group and the dtype: the RECORD's claims, read, not transcribed.
         _check_qsa_geometry_against_record(g, self.dtype)
         if q.index_source == "indexer":
@@ -8327,7 +8395,7 @@ class GatedAttentionBlockFwd(APIBase):
                 (b, top_k),
                 h.device,
                 hint=f" (the decode mode's SHARED list: one row per sequence selected at the step-0 position kv_lens[b] - {self.seq_len}; a per-token "
-                f"[{t}, {top_k}] / [{b}, {self.seq_len}, {top_k}] list is the form of a declaration with S_q > 4)",
+                f"[{t}, {top_k}] / [{b}, {self.seq_len}, {top_k}] list is the form of a declaration with S_q > 4 or QsaSpec(index_list_form='per_row'))",
             )
         else:
             _check_index_tensor(
@@ -8336,7 +8404,8 @@ class GatedAttentionBlockFwd(APIBase):
                 (t, top_k),
                 (self.batch, self.seq_len, top_k),
                 h.device,
-                hint=" (a [B, top_k] list shared by a sequence's rows is the decode mode's form: a dense declaration with S_q <= 4 over the pools, kv_source='paged')",
+                hint=" (a [B, top_k] list shared by a sequence's rows is the decode mode's shared form: a dense declaration with S_q <= 4 over the pools, "
+                "kv_source='paged', under QsaSpec(index_list_form=None or 'shared'))",
             )
         # The sparse core binds block_ids as a TMA / bulk-copy base (assumed_align=16): the adapter refuses a view that starts off a
         # 16-byte boundary (a storage offset of a few ids) -- but at stage (4), after the projection, norm + RoPE and a declared
@@ -8626,6 +8695,12 @@ class GatedAttentionBlockFwd(APIBase):
                 f"{e4} over the pools serves the SHARED-list form, S_q <= {_UPCAST_MAX_S_Q} rows per sequence (the decode step and its speculative rows): the "
                 f"gathered cast lays out {_UPCAST_ROWS} x {_UPCAST_D} bf16 rows per (row, KV head) item ({2 * _UPCAST_ROWS * _UPCAST_D * 2} bytes), so the "
                 f"per-token list form (S_q > {_UPCAST_MAX_S_Q}: the extend-with-prefix mode) over e4m3 pools waits for the in-kernel dequant arm; got S_q={self.seq_len}"
+            )
+        if self.qsa.index_list_form == QSA_INDEX_LIST_FORM_PER_ROW:
+            raise NotImplementedError(
+                f"QsaSpec(index_list_form='per_row') with {e4} over the pools: the gathered cast reads ONE list per sequence (the shared form anchored at the "
+                "step-0 position) per (row, KV head) item; the per-row list over e4m3 pools waits for the sparse core's in-kernel dequant arm -- declare "
+                "index_list_form=None or 'shared', or bf16 pools"
             )
         if self.return_lse:
             raise NotImplementedError(
@@ -9107,6 +9182,12 @@ class GatedAttentionBlockFwd(APIBase):
         decode_reason = probe(False, 1)
         has_group = int(geometry.h_kv) >= 1 and int(geometry.h_q) % int(geometry.h_kv) == 0
         sparse = geometry.qsa is not None  # stage (4) over the pools is the index-list sparse core: its own requires, no dense route
+        indexer = sparse and geometry.qsa.index_source == "indexer"
+        decode_declines = {name: msg for name, _exc, _pred, msg in _EXTEND_DECLINES if name in _DECODE_DECLINE_NAMES}
+        if sparse:
+            # the block-sparse decode mode's own rows (the list form, the in-block indexer over the pools): the constructor raises these
+            # very texts, so a stack's dispatch predicate and the block's declines cannot drift
+            decode_declines.update(_qsa_decode_decline_texts(geometry, dtype))
         decode = DecodeEnvelope(
             served=decode_reason is None,
             reason=decode_reason,
@@ -9114,7 +9195,7 @@ class GatedAttentionBlockFwd(APIBase):
             dtypes=(torch.bfloat16, torch.float16),
             page_sizes=SERVING_PAGE_SIZES,
             pool_layouts=SERVING_POOL_LAYOUTS,
-            declines={name: msg for name, _exc, _pred, msg in _EXTEND_DECLINES if name in _DECODE_DECLINE_NAMES},
+            declines=decode_declines,
             max_s_q=DECODE_MAX_S_Q,
             max_rows=DECODE_MAX_ROWS,
             # the declared envelope and its first decline, under the policy asked for
@@ -9135,6 +9216,10 @@ class GatedAttentionBlockFwd(APIBase):
             # is not served (`decode_reason`: another part, an unserved dtype, a geometry row, no DSL target) and under the sparse core; the
             # per-step reading is `pdl_default and route(s_q, batch).pdl_capable`
             pdl_default=(decode_reason is None) and (not sparse) and cc in DECODE_PDL_DEFAULT_CCS,
+            # the list form (QsaSpec.index_list_form) at this geometry: the indexer over the pools selects per row; caller lists take the
+            # shared step-0 list at S_q <= the record's cap (requires spells it) or the per-row list at any S_q
+            index_list_forms=((QSA_INDEX_LIST_FORM_PER_ROW,) if indexer else (QSA_INDEX_LIST_FORM_SHARED, QSA_INDEX_LIST_FORM_PER_ROW)) if sparse else (),
+            index_list_form_default=(QSA_INDEX_LIST_FORM_PER_ROW if indexer else QSA_INDEX_LIST_FORM_SHARED) if sparse else "",
         )
         forms = tuple(nm for nm, env in (("extend", extend), ("decode", decode)) if env.served)
         return ServingEnvelope(

@@ -255,6 +255,7 @@ top_k=512`). It is a DECLARATION ATTRIBUTE -- it changes the function -- never a
 | `index_source` (`"caller"`) | `"caller"`: `execute(block_ids=)` carries the selection; `"indexer"`: the block runs the indexer over its own band and derives the selection (bf16, `index_band=True`; "The in-block indexer" below) |
 | `index_band` (`False`) | `W_qkvg` carries a fifth band `ProjBlock.INDEX` of `(index_heads + index_kv_heads) * index_head_dim` columns below V |
 | `index_cache_dtype` (`None`) | appended: the indexer cache's dtype under `index_source="indexer"` -- `None` / `torch.bfloat16` (the compressed keys and the queries as the compress kernel writes them) or `torch.float8_e4m3fn` (the fp8 indexer cache: both as plain e4m3 of the same values, no scales, scored through the scorer's MXFP8 arm with unit scale factors; `index_k_compressed` is then an e4m3 buffer). Numerics-changing (3 mantissa bits move the weakest selected blocks at the k-th boundary: 99.0 / 97.4 / 96.5 % set agreement with the bf16 selection at S = 4096 / 32768 / 131072 on synthetic activations, every flip a rank-boundary flip), so an attribute, never a knob; bf16 stays the default and the reference. Refused under `index_source="caller"` (nothing of the block reads or writes an indexer cache there); e5m2 named |
+| `index_list_form` (`None`) | appended: the block-sparse DECODE mode's list form (`kv_source="paged"` on a dense `[B, S_q]` block) -- `"shared"`: ONE list per sequence, `[B, top_k]`, selected at the step-0 position `kv_lens[b] - S_q` and shared by the step's rows (the MTP form; `S_q <= 4`, the sparse core's shared-list cap); `"per_row"`: one list per row, `[B, S_q, top_k]` / `[T, top_k]`, at the row's own position (the serving stacks' per-row selection) at ANY `S_q`; `None`: `"shared"` at `S_q <= 4` and `"per_row"` past it under caller lists (the former derivation), `"per_row"` under the in-block indexer over the pools. A declaration attribute (numerics-changing: which keys the speculative rows see), never a knob. Typed declines: `"shared"` past four rows (`shared_list_rows`), `"shared"` under the indexer over the pools; `"shared"` on the block's own K / V (`kv_source="self"`) is refused by name. The envelope publishes `decode.index_list_forms` / `decode.index_list_form_default` |
 | `index_heads`, `index_kv_heads`, `index_head_dim`, `index_norm_eps` (`4`, `1`, `128`, `1e-6`) | the indexer's geometry; they size the band (and `index_kv_heads x index_head_dim` the raw indexer key's write-through pool); under `index_source="indexer"` the scorer reads them (`index_heads` one of its packed head groups, `index_head_dim` its head dim) |
 
 `QsaSpec.identity_bound` (`top_k * block_size + block_size - 1` = 2051 at the defaults) is the visible-token count up to which
@@ -347,6 +348,7 @@ over as they are: never read back, never converted, never reallocated, graph-cap
 |---|---|---|
 | `block_ids` | int32 `[T, top_k]` with `T = B x S_q` (row `b x S_q + s` is query `s` of sequence `b`), or `[B, S_q, top_k]`; contiguous; int32 ONLY (an int64 list is refused, never converted) | per query, the ids of its SELECTED COMPLETE 4-token blocks, RELATIVE to the query's own sequence: block `k` is that sequence's tokens `[4k, 4k + 4)` -- never a page, a slot or a global token index; the valid prefix then `-1`; order unspecified (a top-k output) |
 | `block_lens` | int32 `[T]` / `[B, S_q]`, contiguous; optional | the valid-prefix length per query, consumed on device by the count rule below |
+| `QsaSpec.index_list_form` (a declaration attribute) | `None` / `"shared"` / `"per_row"` | the decode mode's list form: one step-0 list per sequence (`[B, top_k]`, `S_q <= 4`) or one list per row (`[B, S_q, top_k]`, any `S_q`); `None` = shared up to four rows, per row past them (caller lists) and per row under the in-block indexer over the pools |
 | `top_k` | `QsaSpec.top_k`: any multiple of 4 in `[4, 512]` (512 = the 2048-token budget over 4-token blocks, the default) | the list width; it sizes the kernel's per-query index staging, so a list is exactly `top_k` wide |
 | `seq_lens` (block) / `seq_kv_lens` (core) | int32 `[B]`, optional and declared (`seq_lens_present=True`) | the KV length of every sequence; a query sees `min(pos + 1, seq_lens[b])` tokens; `0` = a dead sequence |
 | `paged_kv_page_size` (`P`, a declaration attribute) | a positive multiple of 16 -- so 4 divides P and a 4-token block never straddles a page | the write-through: pools `k_cache` / `v_cache` `[num_pages, H_kv, P, D]` (HND compact or NHD by strides) and `slot_mapping [T]` int32 / int64 (flat slot `page x P + offset`; a negative slot writes nothing) -- the next section |
@@ -403,7 +405,9 @@ approximations of a per-row re-selection. The reference oracle takes the step-0 
 `None` yields the per-row-tail reading, so a shim that needs that parity can pin it. Chunked prefill over a cached prefix
 is the same paged-READ mode with one list per new row (`[T, top_k]`) at positions `prefix_len + s`: a dense `[B, S_q > 4]`
 declaration on the `QsaSpec` geometry with `kv_source="paged"` takes `block_ids [B, S_q, top_k]` / `[T, top_k]` (the list form
-is derived from `S_q` at declaration -- one per sequence up to four rows, one per row past it), at any `S_q`.
+is `QsaSpec.index_list_form`: `None` derives it from `S_q` at declaration -- one per sequence up to four rows, one per row past it --,
+`"per_row"` declares one list per row at ANY `S_q`, the step's rows at 1 .. 4 included -- the serving stacks' per-row selection, and the
+form the in-block indexer's decode step over the pools binds --, `"shared"` the step-0 list at `S_q <= 4` by name), at any `S_q`.
 
 **The indexer fields.** `QsaSpec.index_heads`, `index_kv_heads`, `index_head_dim`, `index_norm_eps` size the fifth
 band of `W_qkvg` -- and `index_kv_heads x index_head_dim` the raw indexer key's write-through pool `index_k_raw` (next
@@ -1198,12 +1202,14 @@ kv_source="paged", sample_k_cache=, sample_v_cache=, sample_block_table=)`: the 
 is the index-list sparse core READING THE POOLS -- per sequence the keys of the listed 4-token blocks and the open tail over the
 first `kv_lens[b]` tokens of its `block_table` row, on the bottom-right diagonal (row `j` at `pos_j = kv_lens[b] - S_q + j`; a
 negative position -- a sequence shorter than the step -- is a dead row, `kv_lens = 0` a dead entry: `out = 0`, `LSE = -inf`
-exactly).  The list form is a DECLARATION fact derived from `S_q`: at `S_q <= 4` ONE list per sequence, `execute(block_ids=)`
-`[B, top_k]` int32 (+ `block_lens [B]`), selected at the step-0 position `kv_lens[b] - S_q` and shared by the step's rows (the
-visible set of "The decode mode and the speculative (MTP) rows" above: the listed blocks plus every token from the step-0 tail
-start to the row's own position); past four rows one list per row, `[B, S_q, top_k]` / `[B x S_q, top_k]` (+ `block_lens
-[B, S_q]` / `[B x S_q]`) at positions `kv_lens[b] - S_q + j` -- a chunked prefill over a cached prefix -- at ANY `S_q` (the
-sparse core runs one work item per query row: no 32-row cap, no decode-tile route).  What differs from the dense form:
+exactly).  The list form is a DECLARATION fact -- `QsaSpec.index_list_form` (appended; `None` = derived from `S_q`): `"shared"` -- at
+`S_q <= 4` ONE list per sequence, `execute(block_ids=)` `[B, top_k]` int32 (+ `block_lens [B]`), selected at the step-0 position
+`kv_lens[b] - S_q` and shared by the step's rows (the visible set of "The decode mode and the speculative (MTP) rows" above: the listed
+blocks plus every token from the step-0 tail start to the row's own position; the default under caller lists up to four rows, a typed
+decline past them); `"per_row"` -- one list per row, `[B, S_q, top_k]` / `[B x S_q, top_k]` (+ `block_lens [B, S_q]` / `[B x S_q]`) at
+positions `kv_lens[b] - S_q + j` -- the serving stacks' per-row selection, a chunked prefill over a cached prefix -- at ANY `S_q` (the
+default past four rows and under the in-block indexer over the pools; the sparse core runs one work item per query row: no 32-row cap, no
+decode-tile route).  What differs from the dense form:
 `sample_block_table` must be CONTIGUOUS (the sparse core binds the whole `[B, max_pages]` table, and `execute(block_table=)` is
 exactly that table -- a row slice of a wider table is a typed `ValueError`); `return_lse` is served (`[B, H_q, S_q]` fp32,
 natural log); `fuse_gate` is served at every split (the core's epilogue unsplit, the split combine otherwise); `decode_split_kv`
