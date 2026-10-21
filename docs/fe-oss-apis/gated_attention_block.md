@@ -1149,7 +1149,7 @@ sparse core runs one work item per query row: no 32-row cap, no decode-tile rout
 `sample_block_table` must be CONTIGUOUS (the sparse core binds the whole `[B, max_pages]` table, and `execute(block_table=)` is
 exactly that table -- a row slice of a wider table is a typed `ValueError`); `return_lse` is served (`[B, H_q, S_q]` fp32,
 natural log); `fuse_gate` is served at every split (the core's epilogue unsplit, the split combine otherwise); `decode_split_kv`
-is `None` (the fill rule: `ceil(SMs / (B x H_kv x S_q))` chunks, at most `min(8, ceil((top_k + 1) / 32))` -- the cap from a split sweep on a 212-SM part) or an int in
+is `None` (the fill rule: `ceil(SMs / (B x H_kv x S_q))` chunks, at most `min(16, ceil((top_k + 1) / 32))` -- the cap from the B 1 / B 4 x 32K x S_q 1 split sweeps on a 212-SM part with the pinned decode-grid combine) or an int in
 `[1, ceil((top_k + 1) / 32)]` -- the one performance knob (fp32 partials inside `get_workspace_size()`, one combine launch), the
 same function under every value; `max_kv_len` keeps its contract (at most the table's reach).  Typed declines: the packed
 (`thd=True`) form (the serving table's `sparse` row: the sparse core serves packed sequences and paged pools one at a time), the

@@ -206,13 +206,18 @@ def test_declaration_facts_of_the_sparse_decode_mode(s_q, fuse_gate):
 
 def test_the_sparse_split_rule_fills_the_machine_and_stays_inside_the_item():
     """The split the sparse decode mode lowers with when ``decode_split_kv=None``: enough chunks to put one work item per SM
-    (``ceil(SMs / (B x H_kv x S_q))``), never more than the item's tile count ``ceil((top_k + 1) / 32)`` nor than the measured cap of 8
-    (the 4 x 32K x 1 split sweep on a 212-SM part: the combine's cost grows with the partial count), 1 for a full launch and
+    (``ceil(SMs / (B x H_kv x S_q))``), never more than the item's tile count ``ceil((top_k + 1) / 32)`` nor than the measured cap of 16
+    (the B 1 / B 4 x 32K x S_q 1 split sweeps on a 212-SM part with the pinned decode-grid combine: the step keeps falling to 16-17
+    chunks where the former combine entry, whose cost grows with the partial count, turned up past 16), 1 for a full launch and
     for a non-CUDA reading (0 SMs) -- a performance choice only: the same function under every value."""
+    from cudnn.gated_attention_block.api import SPARSE_DECODE_SPLIT_CAP
     from cudnn.gated_attention_block.api import sparse_decode_split_choice as pick
 
-    assert pick(batch=4, h_kv=2, s_q=1, top_k=512, sm_count=212) == 8  # 212 / 8 = 27 -> the measured cap of 8 (below the 17 tiles of a 512-list item)
-    assert pick(batch=1, h_kv=2, s_q=1, top_k=512, sm_count=212) == 8  # 2 items: the cap again
+    assert SPARSE_DECODE_SPLIT_CAP == 16
+    assert pick(batch=4, h_kv=2, s_q=1, top_k=512, sm_count=212) == 16  # 212 / 8 = 27 -> the measured cap of 16 (below the 17 tiles of a 512-list item)
+    assert pick(batch=1, h_kv=2, s_q=1, top_k=512, sm_count=212) == 16  # 2 items: the cap again
+    assert pick(batch=1, h_kv=2, s_q=1, top_k=256, sm_count=212) == 9  # ceil(257 / 32) = 9 tiles at top_k 256: the item's tile count binds under the cap
+    assert pick(batch=32, h_kv=2, s_q=1, top_k=512, sm_count=212) == 4  # ceil(212 / 64) = 4: the fill rule, under either cap
     assert pick(batch=4, h_kv=2, s_q=4, top_k=512, sm_count=212) == 7  # ceil(212 / 32)
     assert pick(batch=32, h_kv=2, s_q=4, top_k=512, sm_count=212) == 1  # 256 items: a full launch never splits
     assert pick(batch=2, h_kv=2, s_q=1, top_k=64, sm_count=212) == 3  # ceil(65 / 32) = 3 tiles at top_k 64
@@ -929,3 +934,52 @@ def test_capture_of_the_first_execute_replays_bitwise_and_takes_new_lengths_tabl
         ), "the replay over new lengths / tables / lists / slots differs from the eager run over them"
     finally:
         graph.reset()
+
+
+# ---------------------------------------------------------------------------
+# Rubin: the split combine's FORM per grid -- the census names the kernel, two executes bitwise
+# ---------------------------------------------------------------------------
+
+# The kernel names the CUDA profiler reports for the shared combine module's forms (its own pins name them the same way).
+_COMBINE_KERNELS = {
+    "decode_grid": ("cudnn_kernel__combine_decode_grid_kernel",),
+    "lean_walk": ("cudnn_kernel__combine_lean_walk_kernel",),
+    "own": ("cudnn_kernel__combine_kernel", "cudnn_kernel__combine_decode_kernel"),
+}
+# (geometry, S_q, kv_lens, pinned split, the form the sparse stage pins its combine entry to): the decode-grid kernel on a small grid
+# from split 8 (B 2 x 8 heads: 16 lean blocks / 16 rows), the module's own forms on the same grid below split 8, the lean group walk on
+# an overflow grid at split <= 4 (B 6 x 24 heads: 144 lean blocks, past the decode-grid bound of 128), the module's own forms on the
+# B 4 x S_q 4 grid at split 7 (128 rows -- a small grid, but below split 8).
+_COMBINE_FORM_CELLS = [
+    pytest.param(GEOM_SMALL, 1, (2052, 300), 8, "decode_grid", 51, id="B2-Sq1-split8-decode-grid"),
+    pytest.param(GEOM_SMALL, 1, (2052, 300), 4, "own", 52, id="B2-Sq1-split4-own-forms"),
+    pytest.param(GEOM_FLASH_NEXT, 1, (2052, 300, 1000, 77, 4097, 64), 4, "lean_walk", 53, id="B6-Sq1-24-2-split4-lean-walk"),
+    pytest.param(GEOM_SMALL, 4, (2052, 300, 1000, 77), 7, "own", 54, id="B4-Sq4-split7-own-forms"),
+]
+
+
+@requires_rubin
+@pytest.mark.parametrize("geom_kw, s_q, kv_lens, split, form, seed", _COMBINE_FORM_CELLS)
+def test_the_split_combine_takes_the_pinned_form_per_grid_and_two_executes_are_bitwise(geom_kw, s_q, kv_lens, split, form, seed):
+    """The block's sparse stage compiles its split combine with the FORM the adapter pins per plan on the sparse grid ``(B, H_q, S_q)``
+    (``SparseGqaFwdDslSm107.combine_form``: the dense adapter's rule -- the decode-grid kernel on a small grid from split 8, the lean
+    group walk on an overflow grid at split <= 4, the module's own forms otherwise); the CUDA profiler's census of one execute names
+    exactly that combine kernel; the step is within the budget vs the oracle (the gate in the combine), two executes bitwise."""
+    from gated_block_census import cupti_kernels as _cupti_kernels
+
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
+
+    want = {"decode_grid": comb.DECODE_GRID_AUTO, "lean_walk": comb.DECODE_GRID_LEAN_WALK, "own": comb.DECODE_GRID_OFF}[form]
+    case = _Case(geom_kw, s_q, kv_lens, page=16, seed=seed, split=split, fuse_gate=True, return_lse=True)
+    case.compile()
+    impl = case.blk._sdpa._impl
+    assert case.blk.decode_split_kv == split == impl.split_kv and impl.combine_form() == want == impl._combine_form, (form, impl._combine_form)
+    _two_launches(case, f"combine form {form}")
+    kernels, _ = _cupti_kernels(lambda: case.execute())
+    if kernels is None:
+        pytest.skip("torch.profiler recorded no CUDA event (CUPTI unavailable on this node): the combine kernel's name is unverified here")
+    combines = [k for k in kernels if k.startswith("cudnn_kernel__combine")]
+    assert len(combines) == 1 and combines[0].startswith(_COMBINE_KERNELS[form]), (form, combines)
+    others = tuple(k for f, ks in _COMBINE_KERNELS.items() if f != form for k in ks)
+    assert not combines[0].startswith(others), (form, combines)
+    print(f"\n{case.label()} combine form {form}: the census saw {combines[0]} among {len(kernels)} kernels")

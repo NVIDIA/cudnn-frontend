@@ -898,10 +898,15 @@ def sparse_decode_split_choice(*, batch: int, h_kv: int, s_q: int, top_k: int, s
     runs ONE work item per (sequence, KV head, query row) -- ``B x H_kv x S_q`` items of at most ``ceil((top_k + 1) / 32)`` 32-row
     tiles each -- so an under-full launch cuts every item into enough chunks to put one on each SM (``ceil(SMs / items)``), never
     more than the item's tile count (a larger split has an empty chunk, a dead work item, on every item -- the adapter's own bound)
-    and never more than :data:`SPARSE_DECODE_SPLIT_CAP` = 8 chunks (MEASURED on a 212-SM part at B 4 x S_kv 32K x S_q 1: the step at
-    split 1 / 2 / 4 / 8 / 17 = 69.2 / 64.3 / 59.9 / 59.8 / 65.0 us -- the core flattens past 4-8 chunks while the combine's cost grows
-    with the partial count, 2.9 us at 4, 12.2 us at 17), 1 for a launch that already fills the part and for a non-CUDA reading
-    (``sm_count`` 0, declined at ``check_support`` anyway).  A PERFORMANCE choice only (the fp32 partials ride the workspace, the
+    and never more than :data:`SPARSE_DECODE_SPLIT_CAP` = 16 chunks (MEASURED with the pinned combine forms -- Rubin cc 10.7, 212 SMs at
+    the 2376 MHz lock, CUDA-graph replay, the decode-grid combine pinned per grid by ``sparse_gqa_sm107._sparse_combine_decode_grid``:
+    the B 1 x S_kv 32K x S_q 1 step 39.0 us at split 8 -> 38.1 at 16 -> 37.7 at 17, the B 4 x S_kv 32K x S_q 1 step 37.1 -> 36.2 (16)
+    -> 36.4 (17), the former combine entry's step turning UP past 16 (its cost grows with the partial count: 3.3 / 4.5 / 6.5 us at
+    8 / 16 / 17 at B 1, where the decode-grid kernel stays at 2.8-3.1 us); 16 is within 1 % of the best on both cells, and the adapter's
+    bound at ``top_k`` 512 is 17.  The sweep behind the former cap of 8 (B 4 x 32K x 1: 69.2 / 64.3 / 59.9 / 59.8 / 65.0 us at split
+    1 / 2 / 4 / 8 / 17) ran the combine module's OWN forms, the entry compiled without a form -- its knee was that combine's growth
+    (2.9 us at 4, 12.2 us at 17); the pinned forms moved the knee and the cap moved with the measurement, never ahead of it), 1 for a
+    launch that already fills the part and for a non-CUDA reading (``sm_count`` 0, declined at ``check_support`` anyway).  A PERFORMANCE choice only (the fp32 partials ride the workspace, the
     combine is one more launch): the same function under every value, so a caller may pin any split in ``[1, ceil((top_k + 1) / 32)]``
     (the cap binds the DEFAULT only)."""
     max_tiles = -(-(int(top_k) + 1) // 32)
@@ -912,7 +917,9 @@ def sparse_decode_split_choice(*, batch: int, h_kv: int, s_q: int, top_k: int, s
 
 
 SPARSE_DECODE_SPLIT_CAP = (
-    8  # the fill rule's cap on the DEFAULT split of the block-sparse decode mode (the 4 x 32K x 1 sweep above); a pinned split may exceed it
+    16  # the fill rule's cap on the DEFAULT split of the block-sparse decode mode: the B 1 / B 4 x 32K x S_q 1 sweeps above, taken with
+    # the pinned decode-grid combine on a 212-SM cc 10.7 part (the former cap of 8 came from the combine module's own forms, whose cost
+    # grew with the partial count); a pinned split may exceed it, up to the item's tile count
 )
 
 
@@ -7048,7 +7055,7 @@ _SPARSE_DECODE_REQUIRES = (
     "S_q <= 4: ONE list per sequence -- execute(block_ids=) [B, top_k] int32 (+ block_lens [B]) selected at the step-0 position kv_lens[b] - S_q and shared by the step's rows "
     "(row j sees the listed blocks plus every token from the step-0 tail start to its own position); S_q > 4: one list per row, block_ids [B, S_q, top_k] / [B x S_q, top_k] "
     "(+ block_lens [B, S_q] / [B x S_q]) at positions kv_lens[b] - S_q + j (the extend-with-prefix form)",
-    "decode_split_kv=None (the fill rule: ceil(SMs / (B x H_kv x S_q)) chunks, at most min(8, ceil((top_k + 1) / 32))) or an int in [1, ceil((top_k + 1) / 32)]: performance only",
+    "decode_split_kv=None (the fill rule: ceil(SMs / (B x H_kv x S_q)) chunks, at most min(16, ceil((top_k + 1) / 32))) or an int in [1, ceil((top_k + 1) / 32)]: performance only",
     "execute(block_table=, kv_lens=, k_cache=, v_cache=, slot_mapping=, block_ids=[, block_lens=]) with seq_lens=None (kv_lens binds the KV side only; a row at a negative position is dead)",
     "kv_cache_dtype=None (bf16 / f16 pools) or torch.float8_e4m3fn (bf16 activations, S_q <= 4, return_lse=False, decode_split_kv None / 1, fuse_norm_rope=False, "
     "inplace_qkv None / False: the pools' e4m3 codes under per-tensor fp32 k_scale / v_scale at execute -- the write-through quantizes, the step reads through the "
@@ -7174,7 +7181,7 @@ class GatedAttentionBlockFwd(APIBase):
     (row ``j`` sees the listed blocks plus every token from the step-0 tail start to its own position -- the contract page's
     MTP definition); past four rows one list per row (``[B, S_q, top_k]``) at positions ``kv_lens[b] - S_q + j`` -- a chunked
     prefill over a cached prefix -- at any ``S_q`` (no 32-row cap: one sparse work item per row).  ``decode_split_kv``
-    (``None`` = the fill rule :func:`sparse_decode_split_choice`, at most ``min(8, ceil((top_k + 1) / 32))``) is the one performance
+    (``None`` = the fill rule :func:`sparse_decode_split_choice`, at most ``min(16, ceil((top_k + 1) / 32))``) is the one performance
     knob (fp32 partials in the workspace, the split combine as a second launch); ``fuse_gate`` rides the core's epilogue
     unsplit and the combine under a split; ``return_lse`` is served (``[B, H_q, S_q]`` fp32).  A dead sequence
     (``kv_lens = 0``) and a row at a negative position (a sequence shorter than the step) yield ``out = 0`` / ``LSE = -inf``

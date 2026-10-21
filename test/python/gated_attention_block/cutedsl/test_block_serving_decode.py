@@ -1996,21 +1996,7 @@ _POOL_LAYOUTS_PW = _LAYOUTS + ("hnd_padded",)
 _PW_LENS = (200, 0, 77, 1000)  # three live entries (a tail page each) around a PADDED one (block 0, slot -1)
 
 
-def _cupti_kernels(fn):
-    """The CUDA kernel names of one call under torch.profiler (CUPTI) after one warm call, memsets / memcpys split out; ``(None, None)``
-    when the node records nothing."""
-    from torch.profiler import ProfilerActivity, profile
-
-    fn()
-    torch.cuda.synchronize()
-    with profile(activities=[ProfilerActivity.CUDA]) as prof:
-        fn()
-        torch.cuda.synchronize()
-    names = [e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA]
-    if not names:
-        return None, None
-    kernels = [n for n in names if "memset" not in n.lower() and "memcpy" not in n.lower()]
-    return kernels, [n for n in names if n not in kernels]
+from gated_block_census import cupti_kernels as _cupti_kernels  # the shared census helper (moved out: no test-module import for it)
 
 
 def _slab_bands(case):
