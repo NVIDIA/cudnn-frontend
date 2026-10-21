@@ -15,6 +15,8 @@ from typing import Any
 _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
 
 _LAZY_EXPORTS = {
+    "qsa_forward": ("cudnn.QSA.api", "qsa_forward"),
+    "qsa_backward": ("cudnn.QSA.api", "qsa_backward"),
     "causal_conv1d": (".causal_conv1d", "causal_conv1d"),
     "causal_conv1d_nwh": (".causal_conv1d", "causal_conv1d_nwh"),
     "b2b_causal_conv1d": (".causal_conv1d", "b2b_causal_conv1d"),
