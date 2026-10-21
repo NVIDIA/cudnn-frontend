@@ -1215,6 +1215,8 @@ cudnn.ops.causal_conv1d_update
 cudnn.ops.fft_causal_conv1d
 cudnn.ops.nvfp4_block_scale_dequantize
 cudnn.ops.nvfp4_block_scale_quantize
+cudnn.ops.qsa_backward
+cudnn.ops.qsa_forward
 cudnn.pygraph
 cudnn.pygraph.abs
 cudnn.pygraph.adalayernorm

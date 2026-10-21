@@ -38,6 +38,7 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. New A
 - [Grouped GEMM + Quant (Unified)](gemm_fusions/grouped_gemm_quant_unified.md)
 - [Grouped GEMM + Wgrad](gemm_fusions/grouped_gemm_wgrad.md)
 - [Block Sparse Attention (BSA)](bsa.md)
+- [Query Sparse Attention (QSA)](qsa.md)
 - [DeepSeek Sparse Attention (DSA)](dsa.md)
 - [Flex Attention](attention/flex_attention.md) and [mask plan design](attention/flex_attention_design.md)
 - [HSTU Attention (Blackwell SM100/SM103)](hstu/hstu_attention.md)
