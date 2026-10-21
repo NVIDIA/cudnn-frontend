@@ -57,7 +57,7 @@ THREADS = (512, 1024)
 
 def _cluster_sizes():
     cc = _cc()
-    return (1,) if cc is None or cc < (9, 0) else (1, 4, 8, 16)
+    return [1] if cc is None or cc < (9, 0) else [1, 4, 8, 16]
 
 
 def reference_canonical(logits: torch.Tensor, counts: torch.Tensor, top_k: int) -> torch.Tensor:

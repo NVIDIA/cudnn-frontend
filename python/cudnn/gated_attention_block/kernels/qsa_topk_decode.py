@@ -122,7 +122,7 @@ states the per-lane stride that keeps the banks spread):
 |---|---|---|---|
 | ``s_hist`` i32 x ``2 x 4096`` | ``red.shared.add`` at the digit of each candidate (data-dependent); the zeroing ``s_hist[b][j x THREADS + t]`` | the scan: thread ``t`` reads bins ``4095 - BPT x t - j`` (``4 x BPT`` B between lanes: 4 wavefronts per load, BPT loads per pass -- immaterial) | the zeroing is conflict-free; the histogram side is bin-addressed by nature |
 | ``s_cand`` u32 x ``CAND_CAP``, ``s_cand_id`` i32 x ``CAND_CAP`` (the fallback's candidate list; views of ``s_pool``) | the appending lanes of a warp at ``base + popc(ballot & lt_mask)`` (consecutive slots: 4 B between lanes) | the later passes (round-strided; the all-pairs rank of a kernel without the fast path: entry ``t`` and every entry) | conflict-free |
-| ``s_pool`` i32 x ``max(nwarps x STAGE_CAP + 1, FALLBACK_POOL_WORDS)`` (the fast path's staging regions, ``STAGE_CAP = top_k + RANK_CAP``, 0 words when they would exceed ``STAGE_POOL_MAX_BYTES`` = 96 KB; the fallback's ``s_cand`` / ``s_cand_id`` / ``s_bal`` are VIEWS of the same words -- a row runs one path or the other) | the staging sweep: the selected lanes of a round store CONSECUTIVE words of their warp's region (4 B between them); every other lane stores the last word (one same-address broadcast store) | the two walks: warp ``w`` reads words ``base + lane`` of its region (consecutive) | conflict-free |
+| ``s_pool`` i32 x ``max(nwarps x STAGE_CAP + 1, fallback_pool_words(cols_cap) = 2 x CAND_CAP + cols_cap / 32)`` (the fast path's staging regions, ``STAGE_CAP = top_k + RANK_CAP``, 0 words when they would exceed ``STAGE_POOL_MAX_BYTES`` = 96 KB; the fallback's ``s_cand`` / ``s_cand_id`` / ``s_bal`` are VIEWS of the same words -- a row runs one path or the other) | the staging sweep: the selected lanes of a round store CONSECUTIVE words of their warp's region (4 B between them); every other lane stores the last word (one same-address broadcast store) | the two walks: warp ``w`` reads words ``base + lane`` of its region (consecutive) | conflict-free |
 | ``s_rank_key`` u32 x ``RANK_CAP``, ``s_rank_id`` i32 x ``RANK_CAP`` | the appending lanes (consecutive slots) | the spread rank: ``THREADS / RANK_CAP`` consecutive lanes read one slot (a broadcast), then slots ``part + j x parts`` (distinct words across the group); the walks: a flagged word's slot (<= 2 words per lane) | conflict-free / broadcast |
 | ``s_bal`` u32 x ``cols_cap / 32`` (one word per round per warp; the fallback; a view of ``s_pool`` past the list) | lane 0 of warp ``w`` at word ``w x EPT + i`` in sweep A | sweep B: every lane of warp ``w`` reads word ``w x EPT + i`` (a broadcast) | consecutive words per warp, one lane writes, broadcast reads: conflict-free |
 | ``s_wsum`` i32 x 32 | lane 31 (the scans) or lane 0 (sweep A) of each warp | every thread reads slot ``lane`` | 4 B between lanes: conflict-free |
@@ -198,7 +198,6 @@ from typing import NamedTuple, Optional
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-from cutlass.experimental import primitives as nvvm
 import torch
 
 from cudnn._cutlass_compat import SmemAllocator
@@ -209,6 +208,7 @@ from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_depende
 from cudnn.frost.tile_dsl.tma import ld_global, st_global
 
 __all__ = [
+    "FROST_SOURCE_DIGEST",
     "QSA_TOPK_DECODE_MAX_K",
     "MAX_ROWS",
     "MAX_EPT",
@@ -253,12 +253,13 @@ MAX_EPT = 64
 """Keys per thread kept in registers: the register budget of a 512-thread CTA (128 per thread) carries 64; 1024 threads carry 32."""
 MAX_ROWS = 65535
 """The widest row block one launch serves: one CTA per row along ``grid.y``, whose extent the launch grid caps at 65535."""
-_FULL_MASK = 0xFFFFFFFF
 _FAKE_STREAM = None
 compiled_cache = {}
 # Imported normally (not through the template loader), so the module names its own source identity: ``template_key`` joins
 # it with the compile site's key to name the persistent object (``compiled_cache``); the cache's environment manifest covers
 # every other ``.py`` the kernel is traced from.
+# read through the module globals by the persistent compiled-plan cache (``template_key(globals(), ...)``: the digest keys every
+# artifact of this file) and by the test attestation; exported so the reference is explicit
 FROST_SOURCE_DIGEST = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
 
 
@@ -324,9 +325,6 @@ def fallback_pool_words(cols_cap: int) -> int:
     """The words the fallback's views need of the pool: the candidate list (``CAND_CAP`` keys + ``CAND_CAP`` ids) and the ballot words
     (one per round per warp = ``cols_cap / 32``)."""
     return 2 * CAND_CAP + cols_cap // 32
-
-
-FALLBACK_POOL_WORDS = fallback_pool_words  # the name the SMEM table cites
 
 
 def stage_words_for(top_k: int, threads_per_cta: int) -> int:
@@ -743,7 +741,6 @@ def frost_qsa_topk_decode(
                     idstar = s_found[3]
                 else:
                     # the narrowing passes over the list (or, a bin wider than the list, over the row's keys): 12-bit digits of [lo, hi]
-                    sh = cutlass.Uint32(0)
                     done = cutlass.Boolean(False)
                     take = zero
                     for p0_ in cutlass.range_constexpr(MAX_PASSES - 1):
@@ -1139,7 +1136,6 @@ def frost_qsa_topk_decode_cluster(
                     idstar = s_found[1]
                 else:
                     # the narrowing passes over the union list, local to every CTA (identical data -> identical verdict)
-                    sh = cutlass.Uint32(0)
                     done = cutlass.Boolean(False)
                     take = zero
                     for p0 in cutlass.range_constexpr(MAX_PASSES - 1):
@@ -1193,7 +1189,6 @@ def frost_qsa_topk_decode_cluster(
             else:
                 # a CTA holds more candidates than the union carries: the merged passes over the row's keys (every CTA, every pass),
                 # then -- for an exact key with a partial take -- the merged 2 x 12-bit select over the ids of the keys equal to it
-                sh = cutlass.Uint32(0)
                 done = cutlass.Boolean(False)
                 take = zero
                 for p0 in cutlass.range_constexpr(MAX_PASSES - 1):
