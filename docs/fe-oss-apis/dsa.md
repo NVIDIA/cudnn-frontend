@@ -336,11 +336,23 @@ compressed column 0.
     `q_scale * sm_scale`; SM100 MXFP8 requires BF16 weights.
   - `q_causal_offsets` (optional): CUDA INT32 tensor with one entry per
     batch/THD segment, on the same device as `q`.
-- **Output** — `scores`: `(B, S_q, S_k)` FP32. On SM100 this is the
-  `[..., :S_k]` view over a `(B, S_q, ceil4(S_k))` (THD:
-  `(total_q, ceil4(max_seqlen_k))`) allocation: the kernel binds `out` through
-  a 16-byte-aligned layout, so the fp32 row stride must be a multiple of 4
-  elements and at least `ceil4(S_k)`. When `S_k % 4 != 0` the returned tensor
+- **Output** — `scores`: `(B, S_q, S_k)` FP32 by default; BF16 with
+  `out_dtype=torch.bfloat16` (or a BF16 `out`) on SM100/SM103, for both
+  `precision="bf16"` and `precision="mxfp8"`. BF16 output keeps the FP32
+  accumulation and the FP32 weighted head reduction and rounds each finished
+  score once, round-to-nearest-even, as the kernel stores it, so a BF16 score
+  is bit-identical to the FP32 score cast with `.to(torch.bfloat16)`. It halves
+  the score buffer and the bytes a following top-K reads
+  (`indexer_top_k_wrapper` takes BF16 input). Masked positions are `-inf` in
+  either dtype. SM90 writes FP32 only and raises `NotImplementedError` for
+  BF16; the combined Indexer Forward + Top-K path keeps its FP32 candidates.
+  On SM100 this is the
+  `[..., :S_k]` view over a `(B, S_q, S_k_padded)` (THD:
+  `(total_q, max_seqlen_k padded)`) allocation: the kernel binds `out` through
+  a 16-byte-aligned layout, so the row stride must be a whole number of 16
+  bytes and cover `S_k` -- a multiple of 4 elements and at least `ceil4(S_k)`
+  for FP32, a multiple of 8 and at least `ceil8(S_k)` for BF16. When `S_k` is
+  not already such a multiple the returned tensor
   is therefore a strided view, not a fresh contiguous copy. A caller-provided
   `out` must be such a view (`ValueError` otherwise); nothing is staged or
   copied back. `IndexerForward` takes the contiguous padded
@@ -390,6 +402,12 @@ result = DSA.indexer_forward_wrapper(
     q, k, w, ratio=4, q_causal_offsets=q_causal_offsets,
 )
 scores = result["scores"]
+
+# BF16 scores (SM100/SM103): FP32 math, one rounding at the store.
+scores_bf16 = DSA.indexer_forward_wrapper(
+    q, k, w, ratio=4, q_causal_offsets=q_causal_offsets,
+    out_dtype=torch.bfloat16,
+)["scores"]
 ```
 
 ### 4. Combined Indexer Forward + Top-K

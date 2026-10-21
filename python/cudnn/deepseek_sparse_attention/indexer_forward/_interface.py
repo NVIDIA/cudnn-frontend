@@ -86,12 +86,48 @@ def _validate_thd_mxfp8_scale_contract(
 
 
 # The score kernel binds ``out`` through a 16-byte-aligned dynamic layout, so
-# the fp32 row stride must be a multiple of 4 elements (and cover ceil4(S_k)).
-TMA_ALIGN_ELEMS = 4
+# the row stride must be a whole number of 16 bytes (and cover S_k rounded up to
+# it): 4 elements for the default fp32 scores, 8 for bf16 scores.
+OUT_ROW_ALIGN_BYTES = 16
+TMA_ALIGN_ELEMS = 4  # fp32 row alignment in elements; out_row_align_elems() for any score dtype
+# Dense score dtypes the SM100 scorer writes. Accumulation and the weighted head
+# reduction are fp32 for both; a bf16 output rounds that fp32 score once at the store.
+SUPPORTED_OUT_DTYPES = (torch.float32, torch.bfloat16)
 
 
-def padded_seqlen_k(seqlen_k: int) -> int:
-    return _ceil_div(int(seqlen_k), TMA_ALIGN_ELEMS) * TMA_ALIGN_ELEMS
+def out_row_align_elems(dtype: torch.dtype = torch.float32) -> int:
+    return OUT_ROW_ALIGN_BYTES // dtype.itemsize
+
+
+def padded_seqlen_k(seqlen_k: int, dtype: torch.dtype = torch.float32) -> int:
+    align = out_row_align_elems(dtype)
+    return _ceil_div(int(seqlen_k), align) * align
+
+
+def resolve_out_dtype(out_dtype: Optional[torch.dtype], out: Optional[torch.Tensor]) -> torch.dtype:
+    """Dense score dtype: ``out_dtype`` when given, else a caller ``out``'s dtype, else fp32."""
+    if out_dtype is None:
+        out_dtype = out.dtype if out is not None else torch.float32
+    if out_dtype not in SUPPORTED_OUT_DTYPES:
+        raise ValueError(f"dense indexer scores must be torch.float32 or torch.bfloat16, got {out_dtype}")
+    if out is not None and out.dtype != out_dtype:
+        raise ValueError(f"out has dtype {out.dtype} but out_dtype={out_dtype}")
+    return out_dtype
+
+
+# Two bf16 -inf (0xFF80) as one int32 (0xFF80FF80).
+_BF16_NEG_INF_PAIR = -8323200
+
+
+def _fill_neg_inf(out: torch.Tensor) -> None:
+    """The ``-inf`` prefill of masked positions. torch's ``fill_`` stores 16-bit elements at about half the
+    bandwidth of 32-bit ones (GB300, 1M-key scores: 8.4 ms for 32 GiB of bf16 vs 8.8 ms for 64 GiB of fp32),
+    so a bf16 view whose rows hold an even number of elements is filled through an int32 view: same bits,
+    one kernel, no copy. Anything else takes the plain fill."""
+    if out.dtype == torch.bfloat16 and out.shape[-1] % 2 == 0 and all(s % 2 == 0 for s in out.stride()[:-1]) and out.data_ptr() % 4 == 0:
+        out.view(torch.int32).fill_(_BF16_NEG_INF_PAIR)
+    else:
+        out.fill_(float("-inf"))
 
 
 def _validate_out_view(
@@ -100,27 +136,29 @@ def _validate_out_view(
     seqlen_k_dim: int,
     device: torch.device,
 ) -> None:
-    seqlen_k_padded = padded_seqlen_k(seqlen_k_dim)
-    if out.dtype != torch.float32 or not out.is_cuda or out.device != device:
-        raise ValueError(f"out must be a float32 CUDA tensor on {device}, got {out.dtype} on {out.device}")
+    if out.dtype not in SUPPORTED_OUT_DTYPES or not out.is_cuda or out.device != device:
+        raise ValueError(f"out must be a float32 or bfloat16 CUDA tensor on {device}, got {out.dtype} on {out.device}")
     if tuple(out.shape) != out_shape:
         raise ValueError(f"out must have shape {out_shape}, got {tuple(out.shape)}")
     if seqlen_k_dim == 0:
         # A query with no compressed key yet (fewer than ``ratio`` tokens: not one complete block, the geometry ``check_q_covered_by_k``
         # admits): the empty ``out`` IS the result and has no row to stride, so the alignment rule below does not apply to it.
         return
+    align = out_row_align_elems(out.dtype)
+    seqlen_k_padded = padded_seqlen_k(seqlen_k_dim, out.dtype)
     strides = tuple(out.stride())
     if (
         strides[-1] != 1
-        or strides[-2] % TMA_ALIGN_ELEMS != 0
+        or strides[-2] % align != 0
         or strides[-2] < seqlen_k_padded
-        or any(s % TMA_ALIGN_ELEMS for s in strides[:-2])
-        or out.data_ptr() % 16
+        or any(s % align for s in strides[:-2])
+        or out.data_ptr() % OUT_ROW_ALIGN_BYTES
     ):
         padded_shape = (*out_shape[:-1], seqlen_k_padded)
+        dtype_name = str(out.dtype).removeprefix("torch.")
         raise ValueError(
             f"out must be a view with a {seqlen_k_padded}-element (16-byte-aligned) row stride; "
-            f"allocate {padded_shape} fp32 and pass out[..., :{seqlen_k_dim}]; got strides {strides}"
+            f"allocate {padded_shape} {dtype_name} and pass out[..., :{seqlen_k_dim}]; got strides {strides}"
         )
 
 
@@ -167,6 +205,7 @@ def indexer_fwd(
     softmax_out: Optional[torch.Tensor] = None,
     deterministic: bool = False,
     current_stream=None,
+    out_dtype: Optional[torch.dtype] = None,
 ):
     """
     Indexer QK forward pass using CuTe DSL kernel.
@@ -196,12 +235,20 @@ def indexer_fwd(
              path). BSHD: ``(bs, seqlen_q, seqlen_k)``; THD:
              ``(total_q, max_seqlen_k)`` with local-K columns. ``None``
              allocates on ``current_stream`` and returns a contiguous result.
-             A caller ``out`` whose row stride is a multiple of 4 fp32 elements
-             and at least ``ceil4(seqlen_k)`` (e.g. ``buf[..., :seqlen_k]`` of a
-             ``(..., ceil4(seqlen_k))`` allocation) is bound directly; any other
-             layout of the logical shape is staged and copied back (identity
-             kept). Strided q/k/w/q_scale/k_scale are made contiguous here.
+             A caller ``out`` whose row stride is a whole number of 16 bytes
+             and covers ``seqlen_k`` (fp32: ``ceil4(seqlen_k)``, bf16:
+             ``ceil8(seqlen_k)``; e.g. ``buf[..., :seqlen_k]`` of such an
+             allocation) is bound directly; any other layout of the logical
+             shape is staged and copied back (identity kept). Strided
+             q/k/w/q_scale/k_scale are made contiguous here.
              ``_indexer_fwd_bound`` is the strict, allocation-free entry.
+        out_dtype: dense score dtype, ``torch.float32`` (default) or
+             ``torch.bfloat16``. ``None`` takes ``out.dtype`` when ``out`` is
+             given, else fp32. Accumulation and the weighted head reduction
+             stay fp32; bf16 rounds each finished fp32 score once
+             (round-to-nearest-even) at the store, halving the score bytes
+             written here and read by a following top-k. Not available on the
+             compressed-logits path, whose candidate scores stay fp32.
         sm_scale: scalar applied to fp32 score post head-reduce; default 1.0
         precision: ``"bf16"`` for the existing BF16 kernel or ``"mxfp8"``
             for the SM100 MXFP8 kernel.
@@ -221,7 +268,7 @@ def indexer_fwd(
 
     Returns:
         S_sum: BSHD ``(bs, seqlen_q, seqlen_k)`` or THD
-               ``(total_q, max_seqlen_k)`` [FP32]
+               ``(total_q, max_seqlen_k)`` [FP32, or BF16 per ``out_dtype``]
     """
     current_stream = resolve_stream(current_stream)
     precision = precision.lower()
@@ -241,6 +288,8 @@ def indexer_fwd(
             raise ValueError("is_compressed_logits=True requires topk in (0, 2048], " f"got {topk}")
         if out is not None:
             raise ValueError("out is a dense-score buffer and cannot be used with is_compressed_logits=True")
+        if out_dtype is not None and out_dtype != torch.float32:
+            raise ValueError(f"out_dtype selects the dense score dtype; is_compressed_logits=True keeps fp32 candidate scores, got out_dtype={out_dtype}")
         if kv_stage != 4:
             raise ValueError(f"SM100 compressed indexer forward only supports kv_stage=4, got {kv_stage}")
         from ._compressed_top_k_sm100 import (
@@ -328,20 +377,21 @@ def indexer_fwd(
     q_scale = _maybe_contiguous(q_scale, current_stream)
     k_scale = _maybe_contiguous(k_scale, current_stream)
     out_shape, seqlen_k_dim = _dense_out_shape(q, k, cu_seqlens_q, max_seqlen_k)
+    out_dtype = resolve_out_dtype(out_dtype, out)
     out_orig = out
     if out is not None:
-        if out.dtype != torch.float32 or not out.is_cuda or out.device != q.device:
-            raise ValueError(f"out must be a float32 CUDA tensor on {q.device}, got {out.dtype} on {out.device}")
+        if not out.is_cuda or out.device != q.device:
+            raise ValueError(f"out must be a {out_dtype} CUDA tensor on {q.device}, got {out.dtype} on {out.device}")
         if tuple(out.shape) != out_shape:
             raise ValueError(f"out must have shape {out_shape}, got {tuple(out.shape)}")
         try:
             _validate_out_view(out, out_shape, seqlen_k_dim, q.device)
         except ValueError:
             out = None  # not bindable: staged through a padded buffer and copied back
-    need_pad = padded_seqlen_k(seqlen_k_dim) != seqlen_k_dim
+    need_pad = padded_seqlen_k(seqlen_k_dim, out_dtype) != seqlen_k_dim
     if out is None:
         with _torch_stream_context(current_stream):
-            out = torch.empty((*out_shape[:-1], padded_seqlen_k(seqlen_k_dim)), dtype=torch.float32, device=q.device)[..., :seqlen_k_dim]
+            out = torch.empty((*out_shape[:-1], padded_seqlen_k(seqlen_k_dim, out_dtype)), dtype=out_dtype, device=q.device)[..., :seqlen_k_dim]
     _indexer_fwd_bound(
         q,
         k,
@@ -431,7 +481,8 @@ def _indexer_fwd_bound(
     current_stream=None,
 ) -> torch.Tensor:
     """Strict dense entry (what ``IndexerForward.execute`` calls): binds a validated padded-stride ``out``
-    directly; never allocates, never copies, raises on strided inputs or an unbindable ``out``."""
+    directly; never allocates, never copies, raises on strided inputs or an unbindable ``out``.
+    ``out.dtype`` (fp32 or bf16) selects the score dtype and is part of the compile key."""
     current_stream = resolve_stream(current_stream)
     precision = precision.lower()
     if precision not in ("bf16", "mxfp8"):
@@ -552,7 +603,8 @@ def _indexer_fwd_bound(
 
     if out is None:
         raise ValueError(
-            f"indexer_fwd requires out: allocate {(*out_shape[:-1], padded_seqlen_k(seqlen_k_dim))} fp32 and pass "
+            f"indexer_fwd requires out: allocate {(*out_shape[:-1], padded_seqlen_k(seqlen_k_dim))} fp32 "
+            f"(or {(*out_shape[:-1], padded_seqlen_k(seqlen_k_dim, torch.bfloat16))} bf16) and pass "
             f"out[..., :{seqlen_k_dim}] (indexer_forward_wrapper allocates it for you)"
         )
     _validate_out_view(out, out_shape, seqlen_k_dim, device)
@@ -570,6 +622,7 @@ def _indexer_fwd_bound(
             w.dtype,
             q_scale.dtype,
             k_scale.dtype,
+            out.dtype,
             head_dim,
             qhead_per_kv_head,
             ratio,
@@ -635,7 +688,7 @@ def _indexer_fwd_bound(
             )
 
         with _torch_stream_context(current_stream):
-            out.fill_(float("-inf"))
+            _fill_neg_inf(out)
         scale_arg = cutlass.Float32(sm_scale)
         max_q_arg = cutlass.Int32(seqlen_q_dim)
         max_k_arg = cutlass.Int32(seqlen_k_dim)
@@ -666,6 +719,7 @@ def _indexer_fwd_bound(
         "bf16",
         q.dtype,
         w.dtype,
+        out.dtype,
         head_dim,
         qhead_per_kv_head,
         ratio,
@@ -724,7 +778,7 @@ def _indexer_fwd_bound(
 
     # Init to -inf: skipped causal n-blocks and masked positions stay -inf
     with _torch_stream_context(current_stream):
-        out.fill_(float("-inf"))
+        _fill_neg_inf(out)
     scale_arg = cutlass.Float32(sm_scale)
     max_q_arg = cutlass.Int32(seqlen_q_dim)
     max_k_arg = cutlass.Int32(seqlen_k_dim)
