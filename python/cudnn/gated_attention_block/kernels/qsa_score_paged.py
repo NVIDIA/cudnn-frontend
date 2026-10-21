@@ -61,7 +61,8 @@ Work decomposition (every constant below is a module constant or a compile key; 
 * the mainloop, live warps, in batches of ``mma_batch`` n-tiles (4 at ``units_per_warp`` 1, 2 above: the HMMA chains of a batch
   interleave) -- per n-tile: the table word of n-tile ``i + 2 x ring_depth``; ``cp.async.wait_group`` for group ``i``; ``bar.warp.sync``
   (the other lanes' copies visible, the previous slot's reads ordered before its reuse); four ``ld.shared.v4`` (the B fragments);
-  the copies of n-tile ``i + ring_depth`` into the slot read one step earlier (the ring has ``ring_depth + 1`` slots); then the
+  the copies of n-tile ``i + ring_depth`` into the slot read one step earlier (the ring has ``ring_slots = min(ring_depth + 1,
+  n_tiles)`` slots: one spare only where a mainloop copy exists); then the
   batch's ``8 x m_tiles`` MMAs per n-tile, relu per (s, h) element (fp32), the head sum, the scale; the lane with ``gi == 0`` (every
   lane at ``P' = 1``) stores query ``s``'s two adjacent keys ``8 i + 2q, + 1`` -- one ``st.global.v2.f32`` when both are visible to
   that row, ``st.global.f32`` when only the first is, nothing otherwise;
@@ -74,16 +75,20 @@ Work decomposition (every constant below is a module constant or a compile key; 
 * the op order: the MMA's fp32 accumulation over the 128 D per (s, h), ``relu``, then ``((h0 + h1) + (h2 + h3))`` and the tile sums,
   then ``x scale`` -- fixed, so two launches are bitwise; the fp64 reference's budget is met by the fp32 accumulation.
 
-**SMEM buffer table** (`frost-kernels.md` section 5; no descriptor reads either buffer -- the swizzle's one job is the banks):
+**SMEM buffer table** (`frost-kernels.md` section 5; no descriptor reads either buffer -- the swizzle's one job is the banks).  ONE
+dynamic allocation sized by the DSL from the two ``cutlass.Array`` declarations (no ``smem=`` at the launch): ``sK`` at offset 0, ``sA``
+at ``4 x ring_slots x 2 KiB``; total ``4 x ring_slots x 2 KiB + m_tiles x 4 KiB`` with ``ring_slots = min(ring_depth + 1, n_tiles)`` =
+**36 KiB at the defaults** (units 1 = 4 n-tiles, depth 4: 4 slots; one m-tile), 44 KiB from units 2 (5 slots), 36 / 68 / 76 KiB at
+depth 8 for units 1 / 2 / 4 and 8 (4 / 8 / 9 slots); every size a multiple of 2 KiB, both buffers 128-B aligned:
 
 =======  =====  ========================  =============================================  ==============================================  ==========================================================================
 name     dtype  elems                     written by                                     read by                                         per-lane stride / swizzle
 =======  =====  ========================  =============================================  ==============================================  ==========================================================================
-``sK``   Int32  ``4 x (ring_depth + 1)    this warp's ``cp.async.cg`` (16 B per lane:    this warp's ``ld.shared.v4``: lane ``(g, q)``   the 16-B granule ``c`` of row ``r`` sits at ``r x 256 + (c ^ (4 x (r & 1))) x 16``:
-                x 512`` (a per-warp       lanes 0-15 row ``2 e``, 16-31 row ``2 e + 1``)  reads row ``g``'s granules ``q + 4 j``          a quarter-warp of a write (one row's eight granules) or of a read (rows ``2 m``,
-                ring of ``ring_depth +                                                                                                     ``2 m + 1``, four granules each) spans all 32 banks: ONE wavefront per quarter-
-                1`` slots of 8 rows x                                                                                                      warp, the minimum for 128-bit accesses (an unswizzled layout puts the eight rows'
-                256 B; 40 KiB at depth 4)                                                                                                  granule ``c`` on the same 16 banks: 2-way)
+``sK``   Int32  ``4 x ring_slots x 512``  this warp's ``cp.async.cg`` (16 B per lane:    this warp's ``ld.shared.v4``: lane ``(g, q)``   the 16-B granule ``c`` of row ``r`` sits at ``r x 256 + (c ^ (4 x (r & 1))) x 16``:
+                (a per-warp ring of       lanes 0-15 row ``2 e``, 16-31 row ``2 e + 1``)  reads row ``g``'s granules ``q + 4 j``          a quarter-warp of a write (one row's eight granules) or of a read (rows ``2 m``,
+                ``ring_slots`` slots of                                                                                                   ``2 m + 1``, four granules each) spans all 32 banks: ONE wavefront per quarter-
+                8 rows x 256 B; 32 KiB                                                                                                    warp, the minimum for 128-bit accesses (an unswizzled layout puts the eight rows'
+                at the defaults)                                                                                                          granule ``c`` on the same 16 banks: 2-way)
 ``sA``   Int32  ``m_tiles x 1024`` (the   every thread's ``cp.async.cg`` (2 per m-tile:  every warp's ``ld.shared.v4``: lane ``(g, q)``  the same ``c ^ (4 x (row & 1))`` layout and the same one-wavefront-per-quarter-warp
                 padded query tile, 16      thread ``t`` granule ``t % 16`` of rows ``t /  reads rows ``g`` / ``g + 8``'s granules ``q +   argument (the copy's 16 consecutive lanes cover one row = two 128-B lines)
                 rows x 256 B per m-tile)   16`` and ``8 + t / 16``)                       4 j``
@@ -111,8 +116,14 @@ name                  kind                                    issuing lanes     
 
 PDL sites (under the ``use_pdl`` compile key, the launch attribute set with it): ``griddepcontrol.wait`` is the kernel's first
 instruction -- ahead of the ``kv_lens`` / table / ``qi`` reads and so of every cache read --, ``griddepcontrol.launch_dependents``
-follows the prologue's copies.  Without PDL (``use_pdl=False``, the standalone default) neither instruction is traced and the kernel
-runs on any CuTe DSL device from sm_80 (``mma.sync.m16n8k16``, ``cp.async``).
+follows the prologue's copies, BEFORE the counts and the logits are written.  That early trigger puts an obligation on the dependent
+grid: a kernel launched with the programmatic-stream-serialization attribute behind this one may start while this one still runs and
+MUST issue its own ``griddepcontrol.wait`` before it touches anything this kernel reads or writes (``logits``, ``counts``,
+``block_lens``, and the inputs it could overwrite); the wait returns only after this grid has completed and flushed.  The standalone
+selector (``qsa_select_decode_paged``) launches the radix top-k WITHOUT the attribute, so the pair is inert there (the top-k starts
+after the scorer completes, as any stream-ordered launch); it matters in the fused decode chain, whose nodes carry the attribute and
+wait.  Without PDL (``use_pdl=False``, the standalone default) neither instruction is traced and the kernel runs on any CuTe DSL
+device from sm_80 (``mma.sync.m16n8k16``, ``cp.async``).
 
 Degenerate inputs, each with its handling: ``kv_lens[b] == 0`` (a padding sequence) -> every ``pos_t < 0``, ``n_vis = 0``: no
 logits column written, ``counts = block_lens = 0``, no warp of the sequence copies a key (its ``qi`` rows and table words ARE read
@@ -359,7 +370,9 @@ def frost_qsa_score_paged(
     rm = query_row_map(s_q, h_i)  # the (s, h) -> MMA-row map (host facts, compile-time)
     n_tiles = NTILES_PER_UNIT * units_per_warp  # n-tiles of 8 keys per warp
     depth = ring_depth  # n-tiles of keys in flight (cp.async groups) ahead of the MMAs
-    ring_slots = ring_depth + 1  # + the slot being read: the one warp sync per n-tile orders the WAR on the slot reused next
+    ring_slots = min(
+        ring_depth + 1, n_tiles
+    )  # + the slot being read (the one warp sync per n-tile orders the WAR on the slot reused next); no spare when no mainloop copy exists
     # the two SMEM buffers (declared ahead of every branch): each warp's ring of ring_slots n-tiles of 8 compressed rows, and the
     # CTA's padded (s, h) query tile (16 rows x 256 B per m-tile), both written by cp.async and read as fragments
     sK = cutlass.Array(cutlass.Int32, THREADS // 32 * ring_slots * _SLOT_ELEMS, alignment=128, space=cutlass.AddressSpace.smem)
