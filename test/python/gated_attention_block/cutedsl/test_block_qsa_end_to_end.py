@@ -2105,9 +2105,9 @@ def test_a_packed_qsa_block_with_write_through_is_bitwise_the_one_without():
 
 
 def _decode_indexer_block(geom, inp, s_q, *, ps, k_cache, v_cache, table, icache, ring, ring_table, fuse_prepare, dtype=BF16):
-    """One decode-indexer declaration (``QsaSpec(index_source="indexer")`` over the pools) at ``[1, s_q]`` on EMPTY step inputs -- the
-    prefill's weights, the K / V pools + the three side caches as samples, the gate fused, the LSE out -- checked, compiled, with its
-    sentinel-filled workspace."""
+    """One decode-indexer declaration (``QsaSpec(index_source="indexer")`` over the pools; the geometry's ``index_cache_dtype`` names the
+    cache's dtype -- ``icache`` is in it) at ``[1, s_q]`` on EMPTY step inputs -- the prefill's weights, the K / V pools + the three side
+    caches as samples, the gate fused, the LSE out -- checked, compiled, with its sentinel-filled workspace."""
     mk = lambda *shape, dt=dtype: torch.empty(*shape, dtype=dt, device="cuda")  # noqa: E731
     blk = GatedAttentionBlockFwd(
         mk(1, s_q, geom.d_model),
@@ -2131,15 +2131,16 @@ def _decode_indexer_block(geom, inp, s_q, *, ps, k_cache, v_cache, table, icache
         fuse_gate=True,
         fuse_prepare=fuse_prepare,
     )
-    assert blk.indexer_decode and blk.fuse_prepare is fuse_prepare and blk.check_support()
+    assert blk.indexer_decode and blk.fuse_prepare is fuse_prepare and blk.index_cache_dtype == icache.dtype and blk.check_support()
     blk.compile()
     ws = torch.full((blk.get_workspace_size(),), 0x7F, dtype=torch.uint8, device="cuda")
     return blk, ws
 
 
 @requires_rubin
+@pytest.mark.parametrize("cache_dtype", [None, E4M3], ids=["bf16", "e4m3"])
 @pytest.mark.parametrize("fuse_prepare", [False, True], ids=["unfused", "fused"])
-def test_decode_indexer_steps_after_a_prefill_carry_the_ring_and_the_paged_cache(fuse_prepare):
+def test_decode_indexer_steps_after_a_prefill_carry_the_ring_and_the_paged_cache(fuse_prepare, cache_dtype):
     """The multi-step decode on ONE token stream: a 301-token prompt through the PREFILL form of the in-block indexer (``index_k_compressed``
     out, the K / V written through into the pools), its 75 compressed rows scattered into the paged compressed-key cache and the ring
     primed from the prompt's raw band (the slab's), then EIGHT decode steps over the pools with the ring / cache / pools CARRIED between
@@ -2152,12 +2153,20 @@ def test_decode_indexer_steps_after_a_prefill_carry_the_ring_and_the_paged_cache
     budget of the fp32 oracle fed the kernel's list (the two-stage oracle over the ACCEPTED prefix + the step's own tokens), the ring
     rows of the step the slab's raw keys, the pools' step rows the slab's K / V; and the cache's rows for every complete block of the
     ACCEPTED stream BITWISE a from-scratch prefill compress of that stream's raw keys (the compress kernel's dense form over the keys
-    the block committed) -- so the prefill's rows, the rows a step completes and a re-stepped block are one chain.  Both knob readings."""
+    the block committed) -- so the prefill's rows, the rows a step completes and a re-stepped block are one chain.  Both knob readings.
+    Under the e4m3 indexer cache (``cache_dtype`` e4m3, served 2026-10-21): the prompt runs the PREFILL form with ``index_cache_dtype=e4m3``
+    (its e4m3 ``index_k_compressed`` rows = the per-tensor cast of the bf16 rows), those rows prime the paged e4m3 cache, the decode steps
+    STORE e4m3 directly (the compress kernels' e4m3 store arm: the e4m3 cast of the bf16 row) -- and after EVERY step the cache's rows are
+    BITWISE a from-scratch e4m3 compress of the accepted stream (``compile_qsa_compress(out_dtype=e4m3)``), possible only because the prefill
+    form, the step form and the fused prepare share ONE rounding convention; the ring stays bf16."""
     import test_block_qsa_decode as _qsa
     from cudnn.gated_attention_block.kernels.qsa_compress import compile_qsa_compress, run_qsa_compress
 
     geom_kw, S0, ps, cap, top_k = GEOM_SMALL, 301, 16, 8, 512
-    geom = GatedAttentionBlockGeometry(**geom_kw, causal_bottom_right=True, qsa=QsaSpec(top_k=top_k, index_source="indexer", index_band=True))
+    cd = BF16 if cache_dtype is None else cache_dtype
+    geom = GatedAttentionBlockGeometry(
+        **geom_kw, causal_bottom_right=True, qsa=QsaSpec(top_k=top_k, index_source="indexer", index_band=True, index_cache_dtype=cache_dtype)
+    )
     ref_geom = RefGeometry(**geom_kw, causal_bottom_right=True)
     d_i, h_q, h_kv, d_model, D_ = geom.qsa.index_head_dim, geom.h_q, geom.h_kv, geom.d_model, geom.d_head
     G, rpp, n_dense = h_q // h_kv, ps // BS, sum(geom.qkvg_block_widths[:4])
@@ -2182,8 +2191,28 @@ def test_decode_indexer_steps_after_a_prefill_carry_the_ring_and_the_paged_cache
         seed=61,
         paged_kv_page_size=ps,
         pools=dict(k_cache=k_cache, v_cache=v_cache, slot_mapping=slots0, index_k_raw=raw_pool),
+        index_cache_dtype=cache_dtype,
     )
-    _indexer_two_stage(pre, "small8-2 S=301 prefill (the stream's prompt)")
+    if cache_dtype is None:
+        _indexer_two_stage(pre, "small8-2 S=301 prefill (the stream's prompt)")
+    else:
+        # the e4m3 prefill form (#1749): its own two-stage oracle beside the bf16 twin on the same inputs
+        pre16 = _run(
+            geom_kw,
+            1,
+            S0,
+            indexer=True,
+            indexer_outputs=True,
+            inp=pre.inp,
+            paged_kv_page_size=ps,
+            pools=dict(
+                k_cache=_nan_pool(n_pages, h_kv, ps, D_),
+                v_cache=_nan_pool(n_pages, h_kv, ps, D_),
+                slot_mapping=slots0,
+                index_k_raw=torch.full((n_pages, ps, d_i), float("nan"), device="cuda", dtype=BF16),
+            ),
+        )
+        _indexer_e4m3_two_stage(pre, pre16, "small8-2 S=301 e4m3 prefill (the stream's prompt)")
     _check(pre, "small8-2 S=301 prefill (the stream's prompt)")
     inp = pre.inp
     cos_all, sin_all = build_rope_tables(n_pos, geom.rope_dim, base=ref_geom.rope_base, batch=1, device="cuda", dtype=BF16)
@@ -2191,20 +2220,22 @@ def test_decode_indexer_steps_after_a_prefill_carry_the_ring_and_the_paged_cache
     k_raw_all = torch.full((n_pos, d_i), float("nan"), device="cuda", dtype=BF16)  # the raw band of every COMMITTED position, as the block computed it
     lay0 = pre.blk._layout()
     k_raw_all[:S0] = index_k_raw_view(_view(pre.ws, lay0.proj, (S0, pre.geom.n_qkvg), BF16), pre.geom, 1, S0)[0, :, 0]
-    # (2) the side caches: the prompt's complete blocks into the paged cache (through the table), the ring primed with the last `cap` raw keys
-    icache = torch.full((n_pages, rpp, 1, d_i), float("nan"), device="cuda", dtype=BF16)
+    # (2) the side caches: the prompt's complete blocks into the paged cache (through the table; the prefill form's rows in the CACHE dtype),
+    # the ring primed with the last `cap` raw keys (bf16, a bit copy)
+    icache = torch.full((n_pages, rpp, 1, d_i), float("nan"), device="cuda", dtype=cd)
     nb0 = S0 // BS
     kbar0 = pre.ix["kbar_out"][0, :nb0]
+    assert kbar0.dtype == cd
     for j in range(nb0):
         icache[pages[j // rpp], j % rpp, 0] = kbar0[j]
     ring = torch.full((2, cap, 1, d_i), float("nan"), device="cuda", dtype=BF16)  # block 0 the null block
     for p in range(S0 - cap, S0):
         ring[1, p % cap, 0] = k_raw_all[p]
     ring_table = torch.tensor([[1]], dtype=torch.int32, device="cuda")
-    recipe = compile_qsa_compress(dtype=BF16, d=d_i, rope_dim=geom.rope_dim, pool=BS, has_seq_lens=False, table_dtype=BF16)
+    recipe = compile_qsa_compress(dtype=BF16, d=d_i, rope_dim=geom.rope_dim, pool=BS, has_seq_lens=False, table_dtype=BF16, out_dtype=cd)
 
-    def compress(k_raw):  # the from-scratch prefill compress of a raw-key stream [1, 4 nb, d_i] -> [1, nb, d_i]
-        out = torch.full((1, int(k_raw.shape[1]) // BS, d_i), float("nan"), device="cuda", dtype=BF16)
+    def compress(k_raw):  # the from-scratch prefill compress of a raw-key stream [1, 4 nb, d_i] -> [1, nb, d_i] in the CACHE dtype
+        out = torch.full((1, int(k_raw.shape[1]) // BS, d_i), float("nan"), device="cuda", dtype=cd)
         run_qsa_compress(
             recipe,
             k_raw.contiguous(),
@@ -2220,9 +2251,10 @@ def test_decode_indexer_steps_after_a_prefill_carry_the_ring_and_the_paged_cache
         torch.cuda.synchronize()
         return out
 
+    bits_c = (lambda x: x.view(torch.uint8)) if cd == E4M3 else _bits  # noqa: E731  (8-bit patterns under the e4m3 cache)
     assert torch.equal(
-        _bits(compress(k_raw_all[None, : nb0 * BS])[0]), _bits(kbar0)
-    ), "the prefill's compressed rows are not the from-scratch compress of its raw band"
+        bits_c(compress(k_raw_all[None, : nb0 * BS])[0]), bits_c(kbar0)
+    ), "the prefill's compressed rows are not the from-scratch compress of its raw band (one rounding convention: the prefill form's cast == the kernel's e4m3 store)"
     common = dict(ps=ps, k_cache=k_cache, v_cache=v_cache, table=table, icache=icache, ring=ring, ring_table=ring_table, fuse_prepare=fuse_prepare)
     blk1, ws1 = _decode_indexer_block(geom, inp, 1, **common)
     blk4, ws4 = _decode_indexer_block(geom, inp, 4, **common)
@@ -2320,11 +2352,11 @@ def test_decode_indexer_steps_after_a_prefill_carry_the_ring_and_the_paged_cache
         kb = compress(k_raw_all[None, : nb * BS])[0]
         j_all = torch.arange(nb, device="cuda")
         rows = icache[pages_t[j_all // rpp], j_all % rpp, 0]
-        assert torch.equal(_bits(rows), _bits(kb)), f"{label}: the cache's {nb} complete blocks are not the from-scratch compress of the accepted stream"
+        assert torch.equal(bits_c(rows), bits_c(kb)), f"{label}: the cache's {nb} complete blocks are not the from-scratch compress of the accepted stream"
         for p in range(max(L - BS + 1, 0), L):  # the ring rows the NEXT step may pool: the accepted keys
             assert torch.equal(_bits(ring[1, p % cap, 0]), _bits(k_raw_all[p])), f"{label}: ring row {p} after acceptance"
         assert torch.isnan(ring[0].float()).all() and torch.isnan(icache[0].float()).all(), f"{label}: the null ring block / page 0 moved"
-        print(f"\n{label}: counts {counts.tolist()} completed {[k for k in completed if k >= (pos0 // BS)]} O {d_o:.3e} LSE {d_lse:.3e} cos {c:.6f}")
+        print(f"\n{label} cache={cd}: counts {counts.tolist()} completed {[k for k in completed if k >= (pos0 // BS)]} O {d_o:.3e} LSE {d_lse:.3e} cos {c:.6f}")
     assert L == S0 + 17 and completed == [75, 76, 76, 77, 78], (L, completed)  # 303 | 307 (draft) | 307 (re-step) | 311 | 315
 
 
