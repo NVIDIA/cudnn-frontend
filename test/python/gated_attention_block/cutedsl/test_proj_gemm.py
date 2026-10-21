@@ -1036,11 +1036,19 @@ _RUBIN_SMS = 212
         # 64x32 past 64 tokens
         (1, 4096, 8 * 256, "CONFIG_sm100_64x8x128_64x8x32_cluster1x1_1ctamma_swapAB"),
         (128, 4096, 8 * 256, "CONFIG_sm100_64x32x128_64x32x32_cluster1x1_1ctamma"),
+        # the 24/2 slab WITH the indexer band (N 13312 + 640 = 13952, off the 256 grid): its 218 64-row tiles overflow the wave, so the
+        # overflow branch's 128-row weight tiles -- which divide 13952 exactly (109 CTAs) -- carry it: the one N off the 256 grid the
+        # route names a tile for, the same names as the 32/2 slab; the token tile as everywhere
+        (1, _FLASH_NEXT_24_2["n_qkvg"] + 640, _FLASH_NEXT_24_2["d_model"], "CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_swapAB"),
+        (4, _FLASH_NEXT_24_2["n_qkvg"] + 640, _FLASH_NEXT_24_2["d_model"], "CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_swapAB"),
+        (32, _FLASH_NEXT_24_2["n_qkvg"] + 640, _FLASH_NEXT_24_2["d_model"], "CONFIG_sm100_128x32x128_128x32x32_cluster1x1_1ctamma_swapAB"),
+        (128, _FLASH_NEXT_24_2["n_qkvg"] + 640, _FLASH_NEXT_24_2["d_model"], "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_swapAB"),
     ],
 )
 def test_small_m_route_names_a_swap_ab_tile_for_decode_row_counts(m, n, k, expect):
     """The route is a pure function of the shape and the SM count: the token tile is the power of two >= T, the weight
-    tile and the slice count follow the weight's width.  Every name it spells resolves in the catalog grammar."""
+    tile and the slice count follow the weight's width.  Every name it spells resolves in the catalog grammar, and the weight
+    tile it names divides N (no partial weight tile on any row -- the 128-row tiles of the band slab included)."""
     from cudnn.gemm.frost.tile_config import by_name
 
     name = small_m_tile_config(m, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS)
@@ -1048,6 +1056,7 @@ def test_small_m_route_names_a_swap_ab_tile_for_decode_row_counts(m, n, k, expec
     cfg = by_name(name)
     assert cfg.swap_ab == name.endswith("_swapAB")
     assert cfg.cta_tile_n >= min(m, 128) or not cfg.swap_ab  # the token tile covers the step
+    assert n % (cfg.cta_tile_m if cfg.swap_ab else cfg.cta_tile_n) == 0  # the WEIGHT tile (MMA M under swap-AB, MMA N otherwise) divides N
 
 
 def test_small_m_route_leaves_prefill_rows_on_the_forced_tile(monkeypatch):
@@ -1089,18 +1098,39 @@ def test_small_m_route_declines_non_positive_extents(m, n, k):
         build_proj_gemm(m=m, k=k, n=n, dtype=torch.bfloat16, label="extent")
 
 
-def test_small_m_route_keeps_off_256_geometries_on_todays_resolution():
-    """An N that 256 does not divide keeps today's resolution: the forced tile never existed for it, so the plan stays on the
-    graph route and a ``capture_safe`` declaration is refused, typed, before any graph or backend call -- the indexer band's
-    + 640 columns (``QsaSpec.index_band``) are the serving case.  The route never names a tile for such an N."""
-    n, k = _FLASH_NEXT_24_2["n_qkvg"] + 640, _FLASH_NEXT_24_2["d_model"]
-    assert n % 256 and n % 8 == 0
+def test_small_m_route_admits_the_indexer_band_slab_off_the_256_grid_and_keeps_other_off_grid_shapes_on_todays_resolution(monkeypatch):
+    """The indexer band's slab (N 13312 + 640 = 13952, ``QsaSpec.index_band``) is the ONE N off the 256 grid the route names a tile
+    for: 128 divides it and its 218 64-row tiles overflow the wave, so the overflow branch's 128-row swap-AB tiles (109 CTAs, no
+    partial tile) carry it at every decode row count -- ``tile_config="auto"`` resolves the same name (the live part's SM count: the
+    overflow branch below 218 SMs) and a ``capture_safe`` declaration builds (the Rubin cell below).  Past ``SMALL_M_MAX`` the band
+    slab has no forced tile either (256 does not divide it), so it keeps the graph route and the typed capture-safe refusal at
+    compile, before any graph or backend call.  Every other off-grid N keeps today's resolution: one that 128 does not divide
+    (13376 = 13312 + 64) on every branch, and one that 128 divides but 256 does not whose 64-row tiles FIT one wave (13440 =
+    13312 + 128: 210 tiles on 212 SMs, unmeasured on the route) -- None, the graph route."""
+    from cudnn.gemm.frost import arch_family
     from cudnn.gated_attention_block.kernels.proj_gemm import _auto_tile_name
 
-    assert small_m_tile_config(1, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS) is None
-    assert _auto_tile_name(1, n, k, dtype=torch.bfloat16, a_major="k", b_major="k", block_scale=False, alpha=False) is None
+    monkeypatch.setattr(arch_family, "active_family", lambda: "sm100")
+    kw = dict(dtype=torch.bfloat16, a_major="k", b_major="k", block_scale=False, alpha=False)
+    n, k = _FLASH_NEXT_24_2["n_qkvg"] + 640, _FLASH_NEXT_24_2["d_model"]
+    assert n % 256 and n % 128 == 0 and -(-n // 64) > _RUBIN_SMS
+    band = "CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_swapAB"
+    assert small_m_tile_config(1, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS) == band
+    assert _auto_tile_name(1, n, k, **kw) == small_m_tile_config(1, n, k, dtype=torch.bfloat16) == band
+    assert small_m_tile_config(SMALL_M_MAX + 1, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS) is None
+    assert _auto_tile_name(SMALL_M_MAX + 1, n, k, **kw) is None
+    with pytest.raises(NotImplementedError, match="capture_safe=True needs the forced-tile JIT route.*small-M route"):
+        build_proj_gemm(m=SMALL_M_MAX + 1, k=k, n=n, dtype=torch.bfloat16, label="band_past_small_m", capture_safe=True)
+    off = _FLASH_NEXT_24_2["n_qkvg"] + 64  # 13376: no catalog weight tile divides it
+    assert off % 128 and off % 8 == 0
+    assert small_m_tile_config(1, off, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS) is None
+    assert _auto_tile_name(1, off, k, **kw) is None
     with pytest.raises(NotImplementedError, match="capture_safe=True needs the forced-tile JIT route"):
-        build_proj_gemm(m=1, k=k, n=n, dtype=torch.bfloat16, label="off256", capture_safe=True)
+        build_proj_gemm(m=1, k=k, n=off, dtype=torch.bfloat16, label="off128", capture_safe=True)
+    fits = _FLASH_NEXT_24_2["n_qkvg"] + 128  # 13440 = 105 x 128: its 210 64-row tiles fit one wave of 212 -> not the overflow branch
+    assert fits % 256 and fits % 128 == 0 and -(-fits // 64) <= _RUBIN_SMS
+    assert small_m_tile_config(1, fits, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS) is None
+    assert small_m_tile_config(128, fits, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS) is None
 
 
 def test_small_m_route_is_an_sm100_family_selection(monkeypatch):
@@ -1118,12 +1148,17 @@ def test_small_m_route_is_an_sm100_family_selection(monkeypatch):
 
 @requires_rubin
 @pytest.mark.parametrize("m", [1, 4, 32, 128])
-@pytest.mark.parametrize("shape", ["qkvg", "out"])
+@pytest.mark.parametrize("shape", ["qkvg", "out", "band"])
 def test_small_m_plans_run_the_named_tile_and_match_torch_linear(m, shape):
     """The block's own driver at the 24/2 shard's shapes and the decode row counts: the plan names the small-M tile (never
     the forced one), the kernel matches the fp32 reference within the module's budget, and two launches agree bitwise
-    (the split-K reducer is fixed-order)."""
-    n, k = (_FLASH_NEXT_24_2["n_qkvg"], _FLASH_NEXT_24_2["d_model"]) if shape == "qkvg" else (_FLASH_NEXT_24_2["d_model"], _FLASH_NEXT_24_2["k_o"])
+    (the split-K reducer is fixed-order).  ``band`` is the slab WITH the indexer band (N 13952, off the 256 grid): the overflow
+    branch's 128-row swap-AB tile, capture-safe on the JIT-only route like the other two."""
+    n, k = {
+        "qkvg": (_FLASH_NEXT_24_2["n_qkvg"], _FLASH_NEXT_24_2["d_model"]),
+        "out": (_FLASH_NEXT_24_2["d_model"], _FLASH_NEXT_24_2["k_o"]),
+        "band": (_FLASH_NEXT_24_2["n_qkvg"] + 640, _FLASH_NEXT_24_2["d_model"]),
+    }[shape]
     torch.manual_seed(0)
     a = (torch.randn(m, k, device="cuda", dtype=torch.float32) * 0.1).to(torch.bfloat16)
     w = (torch.randn(n, k, device="cuda", dtype=torch.float32) * 0.05).to(torch.bfloat16)
@@ -1131,7 +1166,9 @@ def test_small_m_plans_run_the_named_tile_and_match_torch_linear(m, shape):
     plan = build_proj_gemm(m=m, k=k, n=n, dtype=torch.bfloat16, label=f"small_m_{shape}", capture_safe=True)
     assert plan.tile_config_name != _FORCED_TILE_NAME
     assert plan.tile_config_name == small_m_tile_config(m, n, k, dtype=torch.bfloat16)
-    assert plan.route == "jit-only"
+    assert plan.route == "jit-only" and plan.capture_safe
+    if shape == "band":
+        assert plan.tile_config_name.startswith("CONFIG_sm100_128x") and plan.tile_config_name.endswith("_swapAB") and "splitK" not in plan.tile_config_name
     _run(plan, a, w, out)
     first = out.clone()
     _run(plan, a, w, out)

@@ -1059,7 +1059,10 @@ class QsaSpec:
         columns below V: the indexer's query heads first, its single raw key head last (the checkpoint's own row
         order, so the indexer weight concatenates unchanged).  Served on the UNFUSED projection (the FROST GEMM writes
         the wider slab; :func:`index_k_raw_view` exposes the raw key); the fused projection fork renders 256-column
-        tiles and declines a 640-column band, typed.
+        tiles and declines a 640-column band, typed.  At decode row counts (``T = B x S_q <= 128``) the slab GEMM takes the
+        small-M route's 128-row swap-AB tile (N 13952 = 109 x 128: the route's overflow branch admits the one N off the 256
+        grid whose 128-row tiles divide it), so a band declaration over the pools compiles without the opt-in flag and is
+        capture-safe like the four-band one; past 128 rows the band slab keeps the graph route.
     index_heads, index_kv_heads, index_head_dim, index_norm_eps
         The indexer's geometry.  Under ``index_source="caller"`` they SIZE THE BAND ONLY (no kernel reads them); under
         ``"indexer"`` they are the scorer's: ``index_heads`` a head group the indexer scorer packs, ``index_head_dim``
@@ -2949,6 +2952,19 @@ class _Projection(_Stage):
             raise NotImplementedError(
                 f"{self.name}: a per-weight dtype (A {self.dtype}, W {self.w_dtype}) exists only as a block-scale row; the dense GEMM takes one dtype"
             )
+
+    def resolves_a_jit_tile(self) -> bool:
+        """Whether ``tile_config="auto"`` names a JIT tile for this stage's own ``(M, N, K)`` -- asked of the driver's ONE resolver
+        (``kernels.proj_gemm._auto_tile_name``: the small-M route at ``M <= SMALL_M_MAX``, else the forced 256-wide tile where 256
+        divides N) with the operands :meth:`compile` hands ``build_proj_gemm`` (K-major A and B, this stage's dtype / alpha /
+        block_scale).  True is the JIT-only route (no backend plan, no cuDNN handle at execute: what a ``capture_safe`` declaration
+        needs to compile); False is the graph route, where ``capture_safe=True`` would be the driver's typed decline at ``compile()``
+        -- so the block sets the flag only where this reads True.  The indexer band's slab (N 13952, off the 256 grid) reads True
+        at decode row counts through the small-M route's 128-row swap-AB tile and False past 128 rows.  A host query (no device
+        sync): the SM count and the compiler family it reads are device properties."""
+        from .kernels.proj_gemm import _auto_tile_name
+
+        return _auto_tile_name(self.m, self.n, self.k, dtype=self.dtype, a_major="k", b_major="k", block_scale=self.block_scale, alpha=self.alpha) is not None
 
     def compile(self) -> None:
         from .kernels.proj_gemm import build_proj_gemm
@@ -8080,19 +8096,24 @@ class GatedAttentionBlockFwd(APIBase):
         # The SERVING declaration (kv_source="paged") is captured by a serving stack with vLLM's defaults -- the FIRST execute
         # of a fresh declaration inside a CUDA-graph capture on a new stream, no eager warm-up -- so both dense projection
         # stages are declared capture-safe here.  The flag is consumed by the projection GEMM driver's capture-safe route
-        # (build_proj_gemm(capture_safe=True): the forced-tile JIT route by construction, never a ranked list, no cuDNN handle
-        # at the first execute; a shape without a forced tile is a typed NotImplementedError at compile()), which
+        # (build_proj_gemm(capture_safe=True): the JIT-only route by construction, never a ranked list, no cuDNN handle at the
+        # first execute; a shape the driver resolves no JIT tile for is a typed NotImplementedError at compile()), which
         # `_Projection.compile` forwards it to when the driver takes the kwarg (the CUDA-graph capture-refusal change of
         # kernels/proj_gemm.py); on a tree without that route the flag is recorded on the stage and the projections take the
         # driver's existing route (the serving suite's capture cell skips there).  The fused norm + RoPE projection builds no
         # build_proj_gemm plan, so the flag is set on the two dense projection stages only.
-        # The forced tile exists only for an N that 256 divides: the indexer band (QsaSpec.index_band: + 640 columns) leaves n_qkvg
-        # off that grid, so a band geometry over the pools keeps the driver's own route -- its steps run eagerly and a capture is the
-        # driver's typed refusal at the first captured execute (the block-sparse decode mode's documented limit until the band is
-        # padded to 256 columns); the capture-safe flag would otherwise decline the whole block at compile.
-        if self.kv_source == KV_SOURCE_PAGED and geometry.n_qkvg % 256 == 0:
+        # Per stage, iff the driver's "auto" resolver names a JIT tile for the stage's OWN (M, N, K) (`_Projection.resolves_a_jit_tile`):
+        # the forced 256-wide tile where 256 divides N (every dense served geometry: n_qkvg, d_model and h_q * d_head), or the small-M
+        # route's tile at T = B x S_q <= 128 -- which is how the indexer band's slab (QsaSpec.index_band: n_qkvg = 13312 + 640 = 13952,
+        # off the 256 grid) is capture-safe at decode row counts: its 218 64-row tiles overflow a wave and the route takes the 128-row
+        # swap-AB tile that divides it exactly (109 CTAs), the same JIT-only route as the four-band slab, no opt-in flag at compile().
+        # A band declaration past 128 rows resolves no tile and keeps the driver's own route -- its steps run eagerly and a capture is
+        # the driver's typed refusal at the first captured execute (the band's prefill / extend forms' documented limit); setting the
+        # flag there would decline the whole block at compile.  Read off the resolver `build_proj_gemm` itself runs, never re-spelled,
+        # so this predicate cannot drift from the route.
+        if self.kv_source == KV_SOURCE_PAGED:
             for st in (self._proj, self._out_proj):
-                if isinstance(st, _Projection):
+                if isinstance(st, _Projection) and st.resolves_a_jit_tile():
                     st.capture_safe = True
         # Stage order == pipeline order.  `_quant_o` is listed only where it is a
         # DISTINCT stage (MXFP8: quantize_o, or quantize_fp4_o under o_fp4); under

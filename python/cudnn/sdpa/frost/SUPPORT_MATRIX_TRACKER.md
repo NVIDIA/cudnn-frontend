@@ -3252,7 +3252,11 @@ The list form is a declaration fact derived from `S_q`: at `S_q <= 4` ONE list p
 contract page), past four rows one list per row (`[B, S_q, top_k]`, the adapter's bottom-right per-token form) at any `S_q`; the split
 (`decode_split_kv`: `None` = `ceil(SMs / (B x H_kv x S_q))` chunks capped at `min(16, ceil((top_k + 1) / 32))` -- the cap from the split sweeps at B 1 / B 4 x S_kv 32K x S_q 1 on a 212-SM cc 10.7 part with the pinned decode-grid combine (CUDA-graph replay at the 2376 MHz lock): B 1 39.0 / 38.1 / 37.7 us at split 8 / 16 / 17, B 4 37.1 / 36.2 / 36.4, the former combine entry turning up past 16 --, or a pinned int up to `ceil((top_k + 1) / 32)`)
 puts fp32 partials in the block's workspace (`get_workspace_size()` holds them) and runs the split combine; `fuse_gate` is served at every
-split (the core's epilogue unsplit, the combine otherwise), `return_lse` is served (`[B, H_q, S_q]` fp32).  Typed declines: the packed form
+split (the core's epilogue unsplit, the combine otherwise), `return_lse` is served (`[B, H_q, S_q]` fp32).  The indexer band's slab
+(`QsaSpec(index_band=True)`, N 13312 + 640 = 13952, off the 256 grid) takes the small-M projection route's 128-row swap-AB tile at
+`B x S_q <= 128` (13952 = 109 x 128 on the route's overflow branch; 2026-10-21), so the band declaration over the pools is capture-safe
+and compiles without the opt-in flag like the four-band one (the band capture / replay row below); past 128 rows the band slab keeps
+the graph route.  Typed declines: the packed form
 (the table's `sparse` row: THD and paged pools one at a time), the in-block indexer over the pools, a non-contiguous table sample, a split
 past the item's tile count, `fuse_prepare`; `causal_bottom_right` on the block's own K / V names this mode.  Validated on a Rubin
 development node (cc 10.7, 204 SMs; functional cells, no perf claim) against the fp32 oracle of the whole sequence (the dense block
@@ -3276,6 +3280,7 @@ rows exact, the pools' step rows BITWISE the slab's K / V bands, the prefix rows
 | adapter twin | 2 / shared | 4: 700, 0, 2052, 130 | L1 page 16 | 1 and 4 | fused / LSE | bf16 ✅ BITWISE the standalone adapter on the block's own Q / gate views |
 | workspace sentinel | 1 / shared | 3: 4096, 512, 0 | L1 page 16 | 8 | fused | bf16 ✅ (a sentinel past `get_workspace_size()` untouched; unsplit scratch 0) |
 | capture / replay | 2 / shared | 4: 300, 0, 1000, 77 -> 301, 0, 1000, 77 | L1 page 16 | 4 | fused / LSE | bf16 ✅ (the first execute captured with no warm-up under `set_sync_debug_mode("error")`, the replay bitwise eager, the replay over new lengths / table / lists / slots / inputs bitwise eager) |
+| band capture / replay (N 13952) | 1 / shared, the indexer band's `index_k_raw` write-through, 24 / 2 at `d_model` 2560 | 2: 4096, 60 -> 4095, 61 | L1 page 16 | 8 | fused / LSE | bf16 ✅ (2026-10-21: the slab GEMM on the small-M route's 128-row swap-AB tile -- 13952 = 109 x 128, the one N off the 256 grid the route names a tile for --, both projections `capture_safe` on the JIT-only route, compiled with `CUDNN_FRONTEND_ENABLE_FROST_ENGINES` unset; the first execute captured with no warm-up under `set_sync_debug_mode("error")`, the replay bitwise eager (`out`, the LSE, the raw-key pool rows), the replay over new lengths / table / lists / slots / inputs bitwise eager; the launch census one above the band-off chain's, the raw-key write) |
 
 **Served since 2026-10-14 -- the e4m3 KV cache** (`kv_cache_dtype=torch.float8_e4m3fn`; bf16 activations; `paged_kv_page_size > 0`; the
 serving stacks' `--kv-cache-dtype fp8` recipe: e4m3 codes under per-tensor fp32 DEscales `execute(k_scale=, v_scale=)`, value = code x
