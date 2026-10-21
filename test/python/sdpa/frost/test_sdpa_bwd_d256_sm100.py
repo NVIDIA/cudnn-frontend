@@ -255,6 +255,20 @@ def test_reject_thd(monkeypatch):
     assert _decline_reason(monkeypatch, thd=True) is not None
 
 
+@pytest.mark.parametrize("dt", _DTYPES, ids=_DTYPE_IDS)
+@pytest.mark.parametrize("kv_heads", [4, 2], ids=["mha", "gqa"])
+def test_standalone_adapter_rejects_thd(dt, kv_heads):
+    """A direct adapter must decline packed THD even when no graph capability filter runs."""
+    from cudnn.sdpa.bwd.api_dsl_sm100_d256 import SdpaBwdDslSm100D256
+    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107
+
+    options = dict(hq=4, hkv=kv_heads, dt=dt, thd=True, max_total_seq_len_q=1024, max_total_seq_len_kv=1024)
+    # These descriptors are valid for the parent row that implements packed THD.
+    assert _adapter(SdpaBwdDslSm107, **options).check_support()
+    with pytest.raises(ValueError, match="sdpa_bwd_sm100_d256: THD / ragged is not implemented"):
+        _adapter(SdpaBwdDslSm100D256, **options).check_support()
+
+
 def test_reject_decode_shaped(monkeypatch):
     assert _decline_reason(monkeypatch, sq=1) is not None
 
@@ -1160,6 +1174,10 @@ def _batch_pitch_case(sq, sk, kv_heads, dt, seed):
     lse = scores.logsumexp(-1)
     output = scores.softmax(-1) @ v.repeat_interleave(group, 1)
     expected = torch.autograd.grad(output, (q, k, v), do)
+    for role in ("q", "k", "v", "do"):
+        begin, length = (0, sk) if role in ("k", "v") else (origin, sq)
+        cpu[role][:, :begin].fill_(13)
+        cpu[role][:, begin + length :].fill_(13)
     cpu["o"] = torch.full_like(cpu["q"], 11)
     view(cpu["o"], "o").copy_(output.detach().to(dt))
     for role, base in (("dq", "q"), ("dk", "k"), ("dv", "v")):
@@ -1219,6 +1237,11 @@ def test_batch_pitch_rebind_and_replay(cudnn_handle, dt, kv_heads, sq, sk):
     capture = None
 
     def check():
+        for role in ("q", "k", "v", "o", "do"):
+            begin, length = (0, sk) if role in ("k", "v") else (origin, sq)
+            storage = bases[role].cpu()
+            canary = 11 if role == "o" else 13
+            assert (storage[:, :begin] == canary).all() and (storage[:, begin + length :] == canary).all(), role
         for role, reference in zip(("dq", "dk", "dv"), expected):
             actual = values[role].double().cpu()
             torch.testing.assert_close(actual, reference, atol=0.025, rtol=0.025)

@@ -1073,3 +1073,11 @@ carrying different strides; keep descriptor axes and loader coordinates
 consistent rather than changing one alone. The `independent_pool_layouts`
 tests pin FROST execution and compare O/Stats in both mixed directions,
 including one KV head; backend fallback must not count as kernel support.
+
+An adapter subclass must explicitly retain unsupported layout flags when its
+parent gains a new mode. Graph capability filtering does not protect direct
+adapter callers. `test_standalone_adapter_rejects_thd` checks the SM100 D256
+decline with otherwise valid descriptors and a positive parent-row control;
+it must fail if the subclass inherits the parent's THD admission. For pitched
+views, protect input and output padding with canaries as well as gradient
+padding, and check all of them after eager execution and graph replay.
