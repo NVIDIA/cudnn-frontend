@@ -21,6 +21,12 @@ stage of the pipeline in ``api.py``::
     elementwise.py              stage (5) sigmoid gate, and (3b) V compaction
     cache_write.py              (4w) serving write-through: post-RoPE K / V (and the raw indexer key) into paged pools
                                 at a slot mapping -- two operands per launch, HND / NHD / unified-row pools by strides
+    qsa_prepare.py              (2+3+4w) under the block knob ``fuse_prepare``: the Q / K norm + RoPE in place and the paged
+                                write-through of the post-RoPE K, the V and the raw indexer key as ONE launch; it also carries
+                                the indexer's decode-step arms (the queries' norm + RoPE, the raw-key ring, the incremental compress)
+    qsa_compress.py             (4i) the in-block indexer's key side: the raw indexer keys mean-pooled per 4-token block, RMSNormed
+                                and rotated at the block start (the prefill form), the same body at pool 1 for the indexer
+                                queries, and the step form (the raw-key ring + the incremental compress of the compressed-key cache)
     sigmoid_gate_bwd.py         BACKWARD of stage (5): dO, dG into the GATE band, optional O_gated
     qk_norm_rope_bwd.py         BACKWARD of stages (2)+(3): exact RoPE adjoint + RMSNorm backward into
                                 the Q / K bands, dW_norm partials + fixed-order reduce, the V band copy

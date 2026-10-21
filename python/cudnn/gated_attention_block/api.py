@@ -61,6 +61,17 @@ stage (1)'s epilogue** (``_FusedQkvProjection`` over the fork
 accumulator and the slab is written once. Inference / in-place only (no
 ``q_pre``); OFF by default until the perf node ranks it.
 
+**FUSION KNOB (2026-10-08): ``fuse_prepare=True`` folds stages (2)+(3) and the
+serving write-through (4w) into ONE launch** (:class:`_QsaPrepare` over
+``kernels/qsa_prepare.py``): Q / K are normed + rotated in place and the post-RoPE
+K, the V and the raw indexer key land in the paged pools from the same registers,
+so a pool row IS the row attention consumes and every output is BITWISE the
+unfused chain's.  A performance knob (same function); needs ``paged_kv_page_size
+> 0`` and the in-place bf16 / f16 pipeline, OFF by default.  The kernel also
+carries the indexer's decode-step arms (the queries' norm + RoPE, the raw-key
+ring + the incremental compress) for the serving step; the block binds them when
+its decode mode lands.
+
 **STATUS (2026-09-11): every stage is REAL.** The two projections drive the
 shipped FROST GEMM, stages (2)+(3) are one FROST kernel of this block's own,
 stage (4) is the shipped FROST SDPA, stage (5) is this block's elementwise
@@ -5959,6 +5970,153 @@ class _BandCopy(_ElementwiseStage):
         self._run(src, None, dst, current_stream)
 
 
+class _QsaPrepare(_Stage):
+    """(2+3+4w) The PREPARE fusion: stages (2)+(3) and the serving write-through (4w) as ONE launch
+    (``kernels/qsa_prepare.py``), built under ``fuse_prepare=True`` in place of :class:`_QkNormRope` + :class:`_CacheWrite`.
+
+    Q / K are RMSNormed and rotated in place in the slab (``qk_norm_rope.py``'s chain, op for op) and the post-RoPE K, the
+    V and -- when the geometry declares the indexer band -- the raw indexer key are written into the paged pools at
+    ``slot_mapping`` from the same registers: a pool row IS the row attention consumes, and every output is BITWISE the two
+    stages it replaces (the K pool = the slab's K band, the V pool = the V band, the raw pool = ``index_k_raw_view``).  The
+    gate split costs nothing in either form (the GATE band is addressed in place).  A PERFORMANCE knob of the block:
+    the same function, one launch fewer (two with the band).
+
+    The kernel also carries the indexer's decode-step arms -- the queries' norm + RoPE (the compress kernel at pool 1),
+    the raw-key ring and the incremental compress (its step form) -- traced by presence; this stage binds only what the
+    block's execute contract carries today (the write-through), so the knob changes no input.  The decode mode binds the
+    rest when it lands.
+
+    No SMEM, no mbarrier (the kernel's module docstring: both pre-development tables empty by construction).  Needs no
+    workspace -- the pools and the slot mapping are the caller's -- so ``get_workspace_size`` is the unfused block's.
+    ``geometry.qk_norm=False`` traces the RoPE-only arm (the weight slots ``None``, as ``_QkNormRope`` does); ``geometry.rope_dim=0`` is a
+    typed decline at ``check_support`` with or without ``qk_norm`` (the tables would be zero-width operands).  ``use_pdl`` (the
+    block's resolved switch) launches it with the programmatic-dependent-launch attribute and traces the kernel's griddepcontrol
+    pair, as the two stages it replaces do.
+    """
+
+    name = "qsa_prepare"
+
+    def __init__(self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, dtype: torch.dtype, page_size: int, use_pdl: bool = False) -> None:
+        self.geom = geometry
+        self.batch = int(batch)
+        self.seq_len = int(seq_len)
+        self.dtype = dtype
+        self.page_size = int(page_size)
+        # The kernel's programmatic-dependent-launch form (kernels/qsa_prepare.py: the launch attribute + the griddepcontrol pair -- the wait
+        # before the first global read, the release after the body's last store), taken from the block as the two stages it replaces take it.
+        self.use_pdl = bool(use_pdl)
+        self.index_band = bool(geometry.index_band)
+        self._recipes = None  # {slot dtype: recipe}
+
+    def _index_arms(self):
+        from .kernels.qsa_prepare import QsaPrepareIndexArms
+
+        q = self.geom.qsa
+        return QsaPrepareIndexArms(heads=q.index_heads, head_dim=q.index_head_dim, raw_pool=True, query=False, compress=False) if self.index_band else None
+
+    def check_support(self) -> None:
+        # Rule 7: a too-old CuTe DSL reads as a VERSION decline here, before the kernel module (which imports the DSL) is loaded.
+        from cudnn.frost.buffers import cutedsl_requirement_error
+
+        too_old = cutedsl_requirement_error("the gated attention block's fused prepare launch")
+        if too_old is not None:
+            raise NotImplementedError(too_old)
+        from .kernels.qsa_prepare import validate_prepare_shape
+
+        g = self.geom
+        if self.dtype not in (torch.bfloat16, torch.float16):
+            raise NotImplementedError(f"{self.name}: bf16 / f16 only (the activation dtype of the slab and the pools), got {self.dtype}")
+        if g.rope_dim == 0:
+            # Every rope_dim == 0 geometry, with or without qk_norm: the kernel binds cos / sin as [T, rope_dim] operands and its artifact
+            # is traced with one-column tables (`table_dim = rope_dim if rope_dim else 1`), so the [T, 0] tables execute would hand it are
+            # not operands it takes -- a typed decline here, not a shape mismatch at the launch.
+            raise ValueError(
+                f"{self.name}: fuse_prepare=True with geometry.rope_dim=0: the fused launch would bind the RoPE tables cos / sin as zero-width "
+                "[T, 0] operands, which its artifact (traced with one-column tables) does not take -- the knob needs rope_dim > 0 (with or without qk_norm)"
+            )
+        validate_prepare_shape(g.d_head, g.rope_dim, self.page_size, _ELEMENTWISE_THREADS, g.qsa.index_head_dim if self.index_band else None)
+
+    def compile(self) -> None:
+        """Both slot dtypes are compiled (int32 and int64 are the two the serving stacks hand over; the dtype is a compile
+        key), so ``execute`` dispatches on a guaranteed cache hit (Rule 4) whichever one arrives."""
+        from .kernels.qsa_prepare import compile_qsa_prepare
+
+        g = self.geom
+        self._recipes = {
+            slot_dtype: compile_qsa_prepare(
+                dtype=self.dtype,
+                h_q=g.h_q,
+                h_kv=g.h_kv,
+                d=g.d_head,
+                rope_dim=g.rope_dim,
+                eps=g.qk_norm_eps,
+                page_size=self.page_size,
+                slot_dtype=slot_dtype,
+                apply_norm=g.qk_norm,
+                index=self._index_arms(),
+                threads_per_cta=_ELEMENTWISE_THREADS,
+                use_pdl=self.use_pdl,
+            )
+            for slot_dtype in (torch.int32, torch.int64)
+        }
+
+    def moved_bytes(self, slot_dtype=torch.int32) -> int:
+        """HBM traffic of the one launch -- the denominator for the SOL number."""
+        from .kernels.qsa_prepare import moved_bytes
+
+        g = self.geom
+        return moved_bytes(
+            self.batch * self.seq_len, g.h_q, g.h_kv, g.d_head, elem_bytes=_itemsize(self.dtype), slot_bytes=_itemsize(slot_dtype), index=self._index_arms()
+        )
+
+    def execute(
+        self,
+        q: torch.Tensor,  # [T, H_q,  D] the slab's Q band (rewritten in place)
+        k: torch.Tensor,  # [T, H_kv, D] the K band (rewritten in place; its post-RoPE rows land in k_cache)
+        v: torch.Tensor,  # [T, H_kv, D] the V band (read; its rows land in v_cache)
+        w_q_norm: Optional[torch.Tensor],  # [D]; None (both) iff geometry.qk_norm is False
+        w_k_norm: Optional[torch.Tensor],
+        cos: torch.Tensor,  # [B, S, ROPE_DIM] (or [T, ROPE_DIM]) the attention's per-token tables
+        sin: torch.Tensor,
+        k_cache: torch.Tensor,  # [num_pages, H_kv, page_size, D]
+        v_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,  # [T] int32 / int64
+        index_src: Optional[torch.Tensor] = None,  # [T, 1, index_head_dim] the raw indexer key band; given iff the band is declared
+        index_cache: Optional[torch.Tensor] = None,  # [num_pages, page_size, index_head_dim] its pool
+        current_stream=None,
+    ) -> None:
+        from .kernels.qsa_prepare import run_qsa_prepare
+
+        if self._recipes is None:
+            raise RuntimeError("call compile() before execute()")
+        g = self.geom
+        _check_norm_weights_agree(g.qk_norm, w_q_norm, w_k_norm)
+        if (index_src is None) != (index_cache is None) or (index_cache is not None) != self.index_band:
+            raise ValueError(f"{self.name}: index_src / index_cache are given together, and exactly when the geometry declares the indexer band")
+        if slot_mapping.dtype not in self._recipes:
+            raise ValueError(f"{self.name}: slot_mapping must be int32 or int64, got {slot_mapping.dtype}")
+        t = self.batch * self.seq_len
+        stream = current_stream if current_stream is not None else torch.cuda.current_stream(q.device).cuda_stream
+        run_qsa_prepare(
+            self._recipes[slot_mapping.dtype],
+            q,
+            k,
+            v,
+            None,
+            None,
+            w_q_norm,
+            w_k_norm,
+            cos.view(t, g.rope_dim),
+            sin.view(t, g.rope_dim),
+            k_cache,
+            v_cache,
+            slot_mapping,
+            index_k_raw_src=index_src,
+            index_k_raw_pool=index_cache,
+            stream=stream,
+        )
+
+
 # ---------------------------------------------------------------------------
 # 5b. The in-block indexer (block-sparse attention, QsaSpec.index_source="indexer")
 # ---------------------------------------------------------------------------
@@ -6936,6 +7094,10 @@ class GatedAttentionBlockFwd(APIBase):
     ``out`` is bitwise the block's without it.  A declaration ATTRIBUTE: ``execute`` then REQUIRES the pools and the
     slot mapping and refuses them otherwise.  The stage addresses TOKENS, so under ``thd=True`` (the block is
     ``B = 1, S = T`` inside) it is the same launch over the same ``[T, H_kv, D]`` views; a pad token's slot is ``-1``.
+    The knob ``fuse_prepare=True`` (in-place bf16 / f16 only, the dense declaration with the write-through alone) runs (2+3)
+    and (4w) as ONE launch,
+    ``(2+3+4w) prepare: PROJ[Q], PROJ[K] -> in place; PROJ[K], PROJ[V] (and the raw key) -> the pools`` --
+    bitwise the two-stage form, one launch fewer (two with the band).
 
     **Block-sparse attention (``geometry.qsa``, a :class:`QsaSpec`; bf16 / f16 inference, dense ``[B, S, d_model]`` or
     packed ``thd=True``)** swaps stage (4) for the index-list sparse core -- ``(4) sdpa_sparse  PROJ[Q,K,V], block_ids[,
@@ -7212,6 +7374,10 @@ class GatedAttentionBlockFwd(APIBase):
         # an explicit True is the REQUEST that keeps the fused fork the AUTO lowering (fuse_norm_rope_small_m=None) would otherwise replace
         # (user request > heuristic proposal); only the explicit contradiction fuse_norm_rope_small_m=False + fuse_cache_write=True declines.
         fuse_cache_write: Optional[bool] = None,
+        # APPENDED (serving): run stages (2)+(3) and the write-through (4w) as ONE launch (kernels/qsa_prepare.py).  A
+        # PERFORMANCE knob -- the same function, every output bitwise the two-stage form; needs paged_kv_page_size > 0 and
+        # the in-place bf16 / f16 pipeline (typed otherwise).  Off by default.
+        fuse_prepare: bool = False,
         # APPENDED (serving, the e4m3 KV cache): the POOLS' dtype.  None = the activation dtype (the pools as before).  torch.float8_e4m3fn =
         # the serving stacks' fp8 KV cache: the write-through quantizes the post-RoPE K / V into e4m3 codes under per-tensor fp32 DEscales
         # (execute(k_scale=, v_scale=), REQUIRED there, refused otherwise) and the block-sparse DECODE mode (S_q <= 4) reads the pools
@@ -7599,6 +7765,14 @@ class GatedAttentionBlockFwd(APIBase):
             self.fuse_cache_write is True
             or (self.fuse_cache_write is None and self.fuse_norm_rope_effective and quant is None and not geometry.index_band and not self.kv_cache_e4m3)
         )
+        # The PREPARE fusion (stages (2)+(3) + (4w) in one launch): a performance knob over the write-through declaration;
+        # its own rows (type, the attribute it needs, the pipelines its kernel has an arm for), typed and naming the knob.
+        self.fuse_prepare = self._check_fuse_prepare_declaration(fuse_prepare)
+        if self.fuse_prepare and self.kv_cache_e4m3:
+            raise NotImplementedError(
+                "fuse_prepare=True with kv_cache_dtype=torch.float8_e4m3fn: the prepare kernel writes the activation dtype's K / V rows into the pools; "
+                "the e4m3 cache's write-through quantizes in its own stage (two per-tensor casts + the bit copy) -- pass fuse_prepare=False"
+            )
         self._descs = {
             "w_qkvg": self._make_tensor_desc(sample_w_qkvg, name="w_qkvg"),
             "w_q_norm": self._make_tensor_desc(sample_w_q_norm, name="w_q_norm"),
@@ -7836,6 +8010,14 @@ class GatedAttentionBlockFwd(APIBase):
             self._cache_write = _CacheWrite(
                 geometry, batch=self.batch, seq_len=self.seq_len, dtype=act, page_size=self.paged_kv_page_size, use_pdl=self.use_pdl
             )
+        # (2+3+4w) FUSED under fuse_prepare: ONE launch norms + rotates Q / K in place and writes the post-RoPE K, the V (and the
+        # raw indexer key) into the pools from the same registers -- bitwise the two stages it replaces, which are then not
+        # built (a stage that never runs is not in `_stages`).
+        self._prepare = None
+        if self.fuse_prepare:
+            self._prepare = _QsaPrepare(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act, page_size=self.paged_kv_page_size, use_pdl=self.use_pdl)
+            self._norm_rope = None
+            self._cache_write = None
         # (4i) the IN-BLOCK INDEXER -- built only under QsaSpec(index_source="indexer"): the band's queries normed + rotated, the
         # raw key compressed per block, the scorer's top-k -> the list stage (4) consumes.  Its workspace slots exist only when
         # the scorer runs (S past the identity bound); below it the stage hands over a plan-time identity list.
@@ -7913,6 +8095,7 @@ class GatedAttentionBlockFwd(APIBase):
             for st in (
                 self._proj,
                 self._norm_rope,
+                self._prepare,  # (2+3+4w) in the (2+3) slot under fuse_prepare; `_norm_rope` / `_cache_write` are None then
                 self._gate_copy,
                 self._kpre_copy,
                 self._compact_v,
@@ -8293,6 +8476,48 @@ class GatedAttentionBlockFwd(APIBase):
                     "cache's write-through QUANTIZES (two per-tensor casts + the bit copy through the pools' bf16 views) -- declare fuse_cache_write=False (or None)"
                 )
         return fuse_cache_write
+
+    def _check_fuse_prepare_declaration(self, fuse_prepare) -> bool:
+        """``fuse_prepare`` at declaration: a ``bool`` (``TypeError`` otherwise); ``True`` needs the write-through attribute
+        (there is nothing to fold without it -- ``ValueError`` naming both), the in-place pipeline (the fused kernel rewrites
+        Q / K in the slab; the out-of-place layout keeps its two stages -- ``ValueError``) and not ``fuse_norm_rope`` (the norm
+        + RoPE already live in the projection epilogue there; the prepare kernel has no cache-write-only arm --
+        ``NotImplementedError``); then the knob's own arms: not ``thd=True`` (the prepare kernel addresses the dense ``[B, S]``
+        slab) and not ``kv_source="paged"`` (the fusion is validated with the write-through alone) -- ``NotImplementedError``.
+        ``quant`` / ``save_for_backward`` are excluded by the attribute's own rows, which ran first.  Device-free.  A performance
+        knob: whatever it returns, the block computes the same function."""
+        if not isinstance(fuse_prepare, bool):
+            raise TypeError(f"fuse_prepare must be a bool (the prepare-fusion knob), got {type(fuse_prepare).__name__}")
+        if not fuse_prepare:
+            return False
+        if not self.paged_kv_page_size:
+            raise ValueError(
+                "fuse_prepare=True folds stages (2)+(3) and the paged-cache write-through (4w) into one launch, so it needs paged_kv_page_size > 0; "
+                "this block was declared without the write-through (paged_kv_page_size=0) -- there is nothing to fold (pass fuse_prepare=False)"
+            )
+        if self.fuse_norm_rope:
+            raise NotImplementedError(
+                "fuse_prepare=True with fuse_norm_rope=True: the norm + RoPE already run in the projection epilogue there and the prepare kernel "
+                "has no cache-write-only arm; pick one fusion (fuse_norm_rope=True keeps the write-through as its own stage)"
+            )
+        if not self.inplace_qkv:
+            raise ValueError(
+                "fuse_prepare=True rewrites Q / K in place in the projection slab and writes the pools from the same registers; the out-of-place "
+                "layout (inplace_qkv=False) keeps its two stages -- pass inplace_qkv=True (the inference default) or fuse_prepare=False"
+            )
+        if self.thd:
+            raise NotImplementedError(
+                "fuse_prepare=True with thd=True: the prepare kernel addresses the dense [B, S] slab (one RoPE table row per (b, s)); its "
+                "packed-sequence arm is a follow-up -- run the two-stage form (fuse_prepare=False: the norm + RoPE stage and the write-through "
+                "both serve thd=True)"
+            )
+        if self.kv_source == KV_SOURCE_PAGED:
+            raise NotImplementedError(
+                "fuse_prepare=True with kv_source='paged': the prepare fusion is validated with the write-through alone (stage (4) over the "
+                "block's own K / V); under the EXTEND / DECODE forms stage (4) reads the pools the fused launch writes -- a composition without "
+                "its accept cell yet; run the two-stage form (fuse_prepare=False)"
+            )
+        return True
 
     # -- the e4m3 KV cache (kv_cache_dtype) ---------------------------------
 
@@ -9857,24 +10082,44 @@ class GatedAttentionBlockFwd(APIBase):
             # q_out/k_out=None means IN PLACE, which is the stage's own
             # default and is safe by construction: every lane holds its whole [D]
             # row in registers before it stores, and no lane touches another's.
-            self._norm_rope.execute(
-                q_src[:rows],
-                k_src[:rows],
-                w_q_norm,
-                w_k_norm,
-                cos_live,
-                sin_live,
-                q_out=None if q_c is None else q_c[:rows],
-                k_out=None if k_c is None else k_c[:rows],
-                rstd_q=rstd_q,
-                rstd_k=rstd_k,
-                current_stream=stream,
-                flat=True,
-                # (4w) folded in (cache_write_in_norm_rope): the slab's V band is copied and the post-RoPE K / V rows are written to the
-                # pools from the same tiles -- the pool row is bitwise the slab row stage (4) reads; the slot map is the LIVE-ROW view, as
-                # the separate stage takes it.
-                **({"v": v_src[:rows], "k_cache": k_cache, "v_cache": v_cache, "slot_mapping": slot_live} if self.cache_write_in_norm_rope else {}),
-            )
+            if self._prepare is not None:
+                # (2+3+4w) FUSED: the same norm + RoPE in place AND the write-through of the post-RoPE K / V (+ the raw
+                # indexer key) into the pools at slot_mapping, one launch -- bitwise the two stages below (`_cache_write`
+                # is None under the knob, so the write-through block further down does not run again).
+                self._prepare.execute(
+                    q_src,
+                    k_src,
+                    v_src,
+                    w_q_norm,
+                    w_k_norm,
+                    cos,
+                    sin,
+                    k_cache,
+                    v_cache,
+                    slot_mapping,
+                    index_src=_cols(proj, g.index_k_raw_offset, g.qsa.index_kv_heads, g.qsa.index_head_dim) if g.index_band else None,
+                    index_cache=index_k_raw if g.index_band else None,
+                    current_stream=stream,
+                )
+            else:
+                self._norm_rope.execute(
+                    q_src[:rows],
+                    k_src[:rows],
+                    w_q_norm,
+                    w_k_norm,
+                    cos_live,
+                    sin_live,
+                    q_out=None if q_c is None else q_c[:rows],
+                    k_out=None if k_c is None else k_c[:rows],
+                    rstd_q=rstd_q,
+                    rstd_k=rstd_k,
+                    current_stream=stream,
+                    flat=True,
+                    # (4w) folded in (cache_write_in_norm_rope): the slab's V band is copied and the post-RoPE K / V rows are written to the
+                    # pools from the same tiles -- the pool row is bitwise the slab row stage (4) reads; the slot map is the LIVE-ROW view, as
+                    # the separate stage takes it.
+                    **({"v": v_src[:rows], "k_cache": k_cache, "v_cache": v_cache, "slot_mapping": slot_live} if self.cache_write_in_norm_rope else {}),
+                )
         if sv is not None and sv.gate_dst is not None:
             # (3g) TRAINING, gate-copy save mode: the slab's GATE band -> the compact
             # caller `saved.gate` (ONE strided copy).  q_pre / k_pre likewise, only

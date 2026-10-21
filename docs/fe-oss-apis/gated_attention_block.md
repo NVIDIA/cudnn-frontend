@@ -62,6 +62,15 @@ the launch stream through events, overlapping the SDPA backward chain) -- see [B
   the gate tile TMA-staged by the load warp (inference only: no pre-gate `O` for the backward). Dense and packed
   (`thd=True`): under THD the gate rides the packed d256 prefill's epilogue through the SDPA's THD gate descriptor
   (G mapped like Q / O, at the slab's gate column stride), so the packed block is one launch fewer too.
+- `fuse_prepare=True` (serving, with `paged_kv_page_size > 0`) folds stages (2)+(3) and the paged-cache write-through (4w)
+  into ONE launch: Q / K are normed and rotated in place and the post-RoPE K, the V and the raw indexer key land in the
+  pools from the same registers -- every output bitwise the two-stage form, one launch fewer (two with the indexer band).
+  In-place bf16 / f16 only, on the dense declaration with the write-through alone; `fuse_norm_rope` together with it is a typed
+  decline (pick one), as are `thd=True` and `kv_source="paged"` (the prepare kernel's packed and paged arms are follow-ups) and
+  `kv_cache_dtype=torch.float8_e4m3fn` (the e4m3 cache's write-through quantizes in its own stage); a geometry with `rope_dim=0`
+  (RMSNorm only) is a `ValueError` at `check_support` naming the zero-width RoPE table operands the fused launch would bind.
+  `use_pdl=True` launches the fused stage with the programmatic-dependent-launch attribute, as it does the two stages it replaces.
+  See "Serving: write-through".
 
 With both on, the block is **three launches**: `proj(+norm+RoPE[+quant]) -> sdpa(+gate) -> out_proj`.
 
@@ -533,10 +542,12 @@ How a stack's vocabulary maps onto it (the shim is a renaming, not a conversion)
 A serving stack keeps every token's post-norm, post-RoPE K and its V in a paged cache. `GatedAttentionBlockFwd(...,
 paged_kv_page_size=P)` (appended; `0` = off, the default) declares that write-through: after norm + RoPE the block writes
 each token's K and V row into the caller's pools at `execute(slot_mapping=)` -- ONE extra launch (two with the indexer band's
-raw-key pool) -- and then attends over its own K / V exactly as before, so `out` is bitwise the block's without it and
-`get_workspace_size()` does not change. It is a declaration ATTRIBUTE (it changes the input contract), never a knob. Dense
-`[B, S, d_model]` and packed (`thd=True`) blocks alike: the stage addresses tokens, so the packed block (`B = 1, S = T` inside)
-runs the same launch over the same `[T, H_kv, D]` views.
+raw-key pool), or NONE with the knob `fuse_prepare=True`, which runs norm + RoPE and the write-through as a single launch that
+is bitwise the two-stage form -- and then attends over its own K / V exactly as before, so `out` is bitwise the block's
+without it and `get_workspace_size()` does not change. It is a declaration ATTRIBUTE (it changes the input contract), never a
+knob (`fuse_prepare` is the knob: it changes no input and no output, only the launch count). Dense `[B, S, d_model]` and packed
+(`thd=True`) blocks alike: the stage addresses tokens, so the packed block (`B = 1, S = T` inside) runs the same launch over the
+same `[T, H_kv, D]` views.
 
 | input (appended to `execute`) | shape / dtype | contract |
 |---|---|---|
@@ -561,6 +572,17 @@ and f16 (the live pool rows bitwise the K / V rows attention consumed; padded to
 quantized cache arrive with a cache-dtype attribute and its cast kernel) and `save_for_backward` with `paged_kv_page_size` are
 typed `NotImplementedError`s naming the feature; a CuTe DSL below FROST's floor is declined at `check_support`, named with
 the installed version, before the kernel module is imported.
+
+`fuse_prepare=True` needs the attribute (a `ValueError` without it), the in-place pipeline (`inplace_qkv=True`, a `ValueError`
+otherwise) and not `fuse_norm_rope` (a typed `NotImplementedError`: the norm + RoPE already live in the projection epilogue
+there); `thd=True`, `kv_source="paged"` and `kv_cache_dtype=torch.float8_e4m3fn` together with it are typed `NotImplementedError`s
+naming the knob (the prepare kernel's packed and paged arms are follow-ups; the e4m3 cache's write-through quantizes in its own
+stage); `rope_dim=0` with the knob is a `ValueError` at `check_support`, with or without `qk_norm`, naming the zero-width RoPE table
+operands: the fused launch binds `cos` / `sin` as `[T, rope_dim]` operands and its artifact is traced with one-column tables, so a
+`[T, 0]` table is not an operand it takes.  The fused stage takes `use_pdl` as the two stages it replaces do (the attribute and the
+kernel's griddepcontrol pair).  Its
+kernel (`kernels/qsa_prepare.py`) also carries the indexer's decode-step arms -- the queries' norm + RoPE, the raw-key ring and
+the incremental compress of the compressed-key cache -- which the block binds when its decode mode lands.
 
 ### Forward
 
@@ -589,6 +611,7 @@ blk = GatedAttentionBlockFwd(
     sample_k_cache=None, sample_v_cache=None, sample_block_table=None,   # kv_source="paged" only: the pools' and the table's shape / dtype / strides (compiled in; any table row stride)
     max_kv_len=None,             # the DECODE form: the logical KV bound kv_lens[b] <= max_kv_len; None = max_pages * P
     decode_split_kv=None,        # the DECODE form: the decode tile's split-KV; None = the decode split model (fp32 partials in the workspace + one combine)
+    fuse_prepare=False,          # serving: stages (2)+(3) and that write-through as ONE launch (needs paged_kv_page_size > 0; same function)
     kv_cache_dtype=None,         # serving: None = the activation dtype; torch.float8_e4m3fn = the e4m3 KV cache (per-tensor k_scale / v_scale at execute) -- "Serving: the e4m3 KV cache"
     decode_route_policy=None,    # the DECODE form: None = "single_unit" (the decode tile in one unit, else the packed prefill tile where the step fills the part); "token_units" = the adapter's route -- "Serving: the decode form"
     decode_q_tile_max=None,      # the DECODE form: None = the decode tile's whole width table (16, 32, 64); 32 = the route before the 64-column width landed (a performance-only cap)
@@ -609,7 +632,7 @@ blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace,
 
 Every appended argument (`sample_w_o_sf`, `w_o_sf`, `saved_gate_copy`, the four packing knobs `thd` / `num_sequences` /
 `max_seq_len` / `cu_seqlens`, the serving attributes `paged_kv_page_size` / `kv_source` / `token_capacity` / `kv_cache_dtype` with their samples, the DECODE
-form's `max_kv_len` / `decode_split_kv`, the execute inputs, `num_tokens_live` and `k_scale` / `v_scale` last) sits at the end with a default,
+form's `max_kv_len` / `decode_split_kv`, the knob `fuse_prepare`, the execute inputs, `num_tokens_live` and `k_scale` / `v_scale` last) sits at the end with a default,
 so positional callers of the bf16, FP8 and MXFP8 pipelines are unchanged; `MxQuantSpec.o_fp4` and `sample_w_o_sf` must be given
 together (a typed `ValueError` names the missing half), and `num_sequences` / `max_seq_len` / `cu_seqlens` are refused without
 `thd=True`.
