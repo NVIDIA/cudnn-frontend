@@ -45,15 +45,16 @@ replay. The JSON records first-call compile time, source hashes, GPU, driver,
 CUDA, PyTorch, Triton and DSL versions.
 
 Use `--components --min-tokens 4096 --max-tokens 32768` to add native compaction,
-preallocated forward, backward prep/main/finish, and combined backward kernel
-timings. These use eager launches with prebuilt IDs and buffers. Backward
+preallocated gather-only forward, backward prep/main/finish, and combined backward
+kernel timings. Forward components do not describe the public dense route.
+These use eager launches with prebuilt IDs and buffers. Backward
 accumulators are reset before each main-kernel sample, outside its timed region.
 Component sums need not equal full-call timings; the full call remains primary.
 
 Memory fields give live bytes before each pass, peak allocated/reserved bytes,
-and peak extra allocation. The dense bitmap and the current native int32 ID
-buffer alone need 4 GiB and 16 GiB at 128K. Reference saved state remains live
-during timing. Output and log files are kept per case and implementation.
+and peak extra allocation. At 128K, the bitmap needs 4 GiB and forward int32 IDs
+need 16 GiB. Paired Blackwell 12:1 backward uses 8 GiB for IDs. Reference saved
+state remains live during timing. Output and log files are kept per case and implementation.
 An illegal device access cannot invalidate another process's result. A failed
 implementation has no speedup ratio, and the command exits nonzero after the
 remaining cases finish. `--timeout` sets the limit per process.
@@ -63,5 +64,6 @@ Its bitmap address uses an int32 row index multiplied by the row stride. At
 128K, the largest bitmap offset is 2^32−1, outside signed int32. A separate B300
 control with identical input hashes changed only the three bitmap row-offset
 multiplications to int64: the original failed and the control passed all three
-forward checks. The harness keeps the original baseline and its failure; the
-control is not used for speedup ratios.
+forward checks. The default command keeps the original baseline and its failure.
+The labeled 128K table in [results.md](results.md) uses the Int64-only control;
+those ratios are not unchanged-Miles results.

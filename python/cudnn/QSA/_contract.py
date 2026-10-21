@@ -11,7 +11,7 @@ import torch
 def check_tensor(name, tensor, shape, dtype, device, alignment=4):
     if not isinstance(tensor, torch.Tensor):
         raise TypeError(f"{name} must be a torch.Tensor")
-    if tuple(tensor.shape) != tuple(shape):
+    if tensor.shape != tuple(shape):
         raise ValueError(f"{name} must have shape {tuple(shape)}, got {tuple(tensor.shape)}")
     if tensor.dtype != dtype or tensor.device != device:
         raise ValueError(f"{name} must have dtype {dtype} on {device}")
@@ -43,7 +43,7 @@ def check_inputs(q, k, v, sel_blocks, lo, hi, blk_base, tok_base, block_first, b
         raise ValueError("NB must be in [1, INT32_MAX]")
     device = q.device
     for name, tensor, heads in (("q", q, hq), ("k", k, hkv), ("v", v, hkv)):
-        check_tensor(name, tensor, (total, heads, dim), q.dtype, device, 16)
+        check_tensor(name, tensor, (total, heads, dim), torch.bfloat16, device, 16)
     check_tensor("sel_blocks", sel_blocks, (total, blocks), torch.uint8, device, 1)
     for name, tensor in (("lo", lo), ("hi", hi), ("blk_base", blk_base), ("tok_base", tok_base)):
         check_tensor(name, tensor, (total,), torch.int32, device)

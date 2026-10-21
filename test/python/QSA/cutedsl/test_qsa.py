@@ -4,6 +4,7 @@
 """Packed QSA API, numerics, and changed-input replay."""
 
 import inspect
+import math
 import subprocess
 import sys
 
@@ -209,6 +210,48 @@ def test_runtime_scale(supported_gpu, scale):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("heads", [(12, 1), (24, 2)])
+@pytest.mark.parametrize("score,magnitude", [(8.0, 1e34), (-86.0, 1e38)], ids=["selected-large-v", "tiny-probability-large-v"])
+def test_forward_large_values(supported_gpu, heads, score, magnitude):
+    inputs = make_inputs((513,), *heads)
+    for name in ("q", "k", "v", "sel_blocks", "lo"):
+        inputs[name].zero_()
+    inputs["q"][:, :, 0] = 16
+    inputs["k"][128:256, :, 0] = score
+    inputs["v"][128:256] = magnitude
+    inputs["sel_blocks"][:, :64] = 1
+    inputs["hi"].fill_(255)
+    # The score changes after 128 keys; only the second set has V.
+    value = float(inputs["v"][128, 0, 0]) / (1.0 + math.exp(-score))
+    out = torch.full(inputs["q"].shape, value, dtype=torch.float64, device=inputs["q"].device)
+    lse = torch.full((heads[0], 513), math.log(128.0) + math.log1p(math.exp(score)), dtype=torch.float64, device=out.device)
+    expected = (out.to(inputs["q"].dtype), out, lse)
+    for actual, ref in zip(qsa_forward(**inputs), expected):
+        assert actual.isfinite().all()
+        assert_close(actual, ref)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("heads", [(12, 1), (24, 2)])
+@pytest.mark.parametrize("large_logits", [False, True], ids=["constant-key", "large-logits"])
+def test_backward_cancellation(supported_gpu, heads, large_logits):
+    inputs = make_inputs((257,), *heads, all_selected=True)
+    inputs["k"].fill_(1)
+    if large_logits:
+        inputs["q"].fill_(8)
+        inputs["k"].fill_(-8)
+        inputs["k"][1::2] = 8
+    # Independent saved state isolates backward precision from forward rounding.
+    _, out, lse = reference(inputs)
+    out, lse = out.float(), lse.float()
+    grad_out = inputs["q"] * 0.125
+    expected = reference(inputs, grad_out, out, lse)
+    actual = qsa_backward(grad_out, **inputs, out_fp32=out, lse=lse)
+    for grad, ref in zip(actual, expected):
+        assert_close(grad, ref)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("heads", [(12, 1), (24, 2)])
 @pytest.mark.parametrize("poison", [(torch.nan, torch.inf), (torch.inf, torch.nan), (1e20, -1e20)], ids=["nan-inf", "inf-nan", "finite"])
 def test_masked_kv_poison(supported_gpu, heads, poison):
     inputs = make_inputs((3, 5), *heads, all_selected=True)
@@ -281,8 +324,9 @@ def test_changed_selection_replay(supported_gpu):
 
 
 @pytest.mark.L0
-def test_dynamic_extents_reuse_compile(supported_gpu, monkeypatch):
-    first = make_inputs((17,), 12, 1)
+@pytest.mark.parametrize("lengths,next_lengths", [((17,), (13, 21)), ((257, 256), (259, 382))])
+def test_dynamic_extents_reuse_compile(supported_gpu, monkeypatch, lengths, next_lengths):
+    first = make_inputs(lengths, 12, 1)
     check_case(first)
     import cutlass.cute as cute
 
@@ -290,7 +334,98 @@ def test_dynamic_extents_reuse_compile(supported_gpu, monkeypatch):
         pytest.fail("Changed token/block extents triggered compilation")
 
     monkeypatch.setattr(cute, "compile", forbidden)
-    check_case(make_inputs((13, 21), 12, 1, empty=True))
+    check_case(make_inputs(next_lengths, 12, 1, empty=True))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("lengths", [(3, 5, 9), (257,)])
+def test_paired_backward_mask_replay(supported_gpu, lengths):
+    inputs = make_inputs(lengths, 12, 1, all_selected=True)
+    selected, lower, upper = (inputs[name].clone() for name in ("sel_blocks", "lo", "hi"))
+    grad = inputs["q"].clone()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.stream(stream):
+            for _ in range(2):
+                warm = qsa_forward(**inputs)
+                qsa_backward(grad, **inputs, out_fp32=warm["out_fp32"], lse=warm["lse"])
+        stream.synchronize()
+        with torch.cuda.graph(graph, stream=stream):
+            result = qsa_forward(**inputs)
+            grads = qsa_backward(grad, **inputs, out_fp32=result["out_fp32"], lse=result["lse"])
+        for state in ("disjoint", "even-empty", "odd-empty", "partial", "restore"):
+            inputs["sel_blocks"].copy_(selected)
+            inputs["lo"].copy_(lower)
+            inputs["hi"].copy_(upper)
+            if state == "disjoint":
+                inputs["sel_blocks"][::2, 1::2] = 0
+                inputs["sel_blocks"][1::2, ::2] = 0
+            elif state in ("even-empty", "odd-empty"):
+                parity = int(state == "odd-empty")
+                inputs["lo"][parity::2] = torch.iinfo(torch.int32).max
+                inputs["hi"][parity::2] = -1
+            elif state == "partial":
+                inputs["lo"].copy_(torch.maximum(lower, upper - 2))
+            grad.mul_(-0.5)
+            expected = reference(inputs)
+            for tensor in (*result, *grads):
+                tensor.fill_(torch.nan)
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                graph.replay()
+            stream.synchronize()
+            for actual, ref in zip(result, expected):
+                assert_close(actual, ref)
+            expected_grads = reference(inputs, grad, result["out_fp32"], result["lse"])
+            for actual, ref in zip(grads, expected_grads):
+                assert_close(actual, ref)
+    finally:
+        graph.reset()
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("heads", [(12, 1), (24, 2)])
+def test_dense_gather_replay(supported_gpu, heads):
+    inputs = make_inputs((67, 446), *heads, empty=True)
+    inputs["hi"].clamp_(max=511)
+    inputs["lo"].copy_(torch.maximum(inputs["lo"], inputs["hi"] - 71))
+    expected = reference(inputs)
+    clean_k, clean_v = inputs["k"][-1].clone(), inputs["v"][-1].clone()
+    grad = inputs["q"].clone()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.stream(stream):
+            for _ in range(2):
+                warm = qsa_forward(**inputs)
+                qsa_backward(grad, **inputs, out_fp32=warm["out_fp32"], lse=warm["lse"])
+        stream.synchronize()
+        with torch.cuda.graph(graph, stream=stream):
+            result = qsa_forward(**inputs)
+            grads = qsa_backward(grad, **inputs, out_fp32=result["out_fp32"], lse=result["lse"])
+        for poisoned in (False, True, False):
+            inputs["k"][-1].copy_(clean_k)
+            inputs["v"][-1].copy_(clean_v)
+            if poisoned:
+                inputs["k"][-1].fill_(torch.nan)
+                inputs["v"][-1].fill_(torch.inf)
+            for tensor in (*result, *grads):
+                tensor.fill_(torch.nan)
+            graph.replay()
+            torch.cuda.synchronize()
+            for actual, ref in zip(result, expected):
+                assert_close(actual, ref)
+            # The unused tail is restored for the independent dense oracle.
+            inputs["k"][-1].copy_(clean_k)
+            inputs["v"][-1].copy_(clean_v)
+            expected_grads = reference(inputs, grad, result["out_fp32"], result["lse"])
+            for actual, ref in zip(grads, expected_grads):
+                assert_close(actual, ref)
+    finally:
+        graph.reset()
 
 
 @pytest.mark.L0
