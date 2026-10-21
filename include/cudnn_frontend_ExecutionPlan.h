@@ -480,8 +480,15 @@ class ExecutionPlanBuilder_v8 {
             }
         }
 #endif
+        status = apply_cuda_graph_retention_();
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(&m_execution_plan,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: SetAttribute "
+                                          "CUDNN_ATTR_EXECUTION_PLAN_CUDA_GRAPH_RETENTION Failed");
+            return std::move(m_execution_plan);
+        }
         // Finalizing the descriptor
-        apply_cuda_graph_retention_();
         status = detail::finalize(m_execution_plan.pointer->get_backend_descriptor());
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
@@ -610,7 +617,14 @@ class ExecutionPlanBuilder_v8 {
             }
         }
 
-        apply_cuda_graph_retention_();
+        status = apply_cuda_graph_retention_();
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(&m_execution_plan,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: SetAttribute "
+                                          "CUDNN_ATTR_EXECUTION_PLAN_CUDA_GRAPH_RETENTION Failed");
+            return std::move(m_execution_plan);
+        }
         status = detail::finalize(m_execution_plan.pointer->get_backend_descriptor());
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
@@ -690,10 +704,9 @@ class ExecutionPlanBuilder_v8 {
     std::optional<CudaGraphRetention_t> cuda_graph_retention;
 
     // Applies the retention mode to the plan: the frontend's own retention, and, when set explicitly and both the
-    // headers and the backend support it (9.28+), the backend's (CUDNN_ATTR_EXECUTION_PLAN_CUDA_GRAPH_RETENTION).
-    // Unset, the backend reads CUDNN_CUDA_GRAPH_RETENTION itself. The backend half is best effort: a backend that
-    // rejects the attribute keeps its own default, and the plan is still built.
-    void
+    // headers and the backend are cuDNN 9.28+, the backend's (CUDNN_ATTR_EXECUTION_PLAN_CUDA_GRAPH_RETENTION).
+    // Unset, the backend reads CUDNN_CUDA_GRAPH_RETENTION itself.
+    cudnnStatus_t
     apply_cuda_graph_retention_() {
         CudaGraphRetention_t const retention    = detail::effective_cuda_graph_retention(cuda_graph_retention);
         m_execution_plan.retain_for_cuda_graphs = retention != CudaGraphRetention_t::NONE;
@@ -702,19 +715,14 @@ class ExecutionPlanBuilder_v8 {
             cudnnCudaGraphRetention_t backend_retention = retention == CudaGraphRetention_t::NONE
                                                               ? CUDNN_CUDA_GRAPH_RETENTION_NONE
                                                               : CUDNN_CUDA_GRAPH_RETENTION_PER_GRAPH;
-            auto const status = detail::set_attribute(m_execution_plan.pointer->get_backend_descriptor(),
-                                                      CUDNN_ATTR_EXECUTION_PLAN_CUDA_GRAPH_RETENTION,
-                                                      CUDNN_TYPE_CUDA_GRAPH_RETENTION,
-                                                      1,
-                                                      &backend_retention);
-            if (status != CUDNN_STATUS_SUCCESS) {
-                CUDNN_FE_LOG_LABEL_ENDL(
-                    "INFO: The cuDNN backend does not support "
-                    "CUDNN_ATTR_EXECUTION_PLAN_CUDA_GRAPH_RETENTION (status "
-                    << status << "); it keeps its default CUDA graph retention.");
-            }
+            return detail::set_attribute(m_execution_plan.pointer->get_backend_descriptor(),
+                                         CUDNN_ATTR_EXECUTION_PLAN_CUDA_GRAPH_RETENTION,
+                                         CUDNN_TYPE_CUDA_GRAPH_RETENTION,
+                                         1,
+                                         &backend_retention);
         }
 #endif
+        return CUDNN_STATUS_SUCCESS;
     }
 
     ExecutionPlan_v8 m_execution_plan;
