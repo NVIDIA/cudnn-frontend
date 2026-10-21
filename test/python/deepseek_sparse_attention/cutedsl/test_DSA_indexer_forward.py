@@ -428,13 +428,15 @@ def test_DSA_indexer_forward_wrapper_mxfp8_matches_dequant_reference(
     s_q_default,
     ratio,
 ):
+    """Compare MXFP8 dense and top-k indexer outputs with references."""
     try:
         from cudnn import DSA
         from cuda.bindings import driver as cuda
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
-    scale_utils = pytest.importorskip("cudnn.deepseek_sparse_attention.utils.sm100.mxfp8_scale_utils")
+    from deepseek_sparse_attention.cutedsl import mxfp8_scale_reference as scale_utils
+
     cfg = dsa_init(
         request=request,
         head_dim=128,
@@ -644,7 +646,7 @@ def test_DSA_indexer_forward_wrapper_mxfp8_small_head_groups_match_dequant_refer
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("MXFP8 indexer forward requires SM100+")
-    scale_utils = pytest.importorskip("cudnn.deepseek_sparse_attention.utils.sm100.mxfp8_scale_utils")
+    from deepseek_sparse_attention.cutedsl import mxfp8_scale_reference as scale_utils
 
     device = torch.device("cuda")
     b, s_q, s_k, d = 3, 37, 200, 128
@@ -685,6 +687,7 @@ def test_DSA_indexer_forward_wrapper_mxfp8_small_head_groups_match_dequant_refer
 
 @pytest.mark.L0
 def test_DSA_indexer_forward_wrapper_mxfp8_requires_mqa():
+    """Verify that MXFP8 indexer forward rejects non-MQA inputs."""
     try:
         from cudnn import DSA
     except ImportError:
@@ -693,7 +696,9 @@ def test_DSA_indexer_forward_wrapper_mxfp8_requires_mqa():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("MXFP8 indexer forward requires SM100+")
 
-    scale_utils = pytest.importorskip("cudnn.deepseek_sparse_attention.utils.sm100.mxfp8_scale_utils")
+    from cudnn.deepseek_sparse_attention.utils.sm100.mxfp8_scale_utils import make_scale_cu_seqlens_padded
+    from deepseek_sparse_attention.cutedsl import mxfp8_scale_reference as scale_utils
+
     device = torch.device("cuda")
     b, s_q, s_k, h_q, h_kv, d = 1, 128, 32, 128, 2, 128
     qhead_per_kv_head = h_q // h_kv
@@ -716,8 +721,8 @@ def test_DSA_indexer_forward_wrapper_mxfp8_requires_mqa():
 
     cu_q = torch.tensor([0, s_q], dtype=torch.int32, device=device)
     cu_k = torch.tensor([0, s_k], dtype=torch.int32, device=device)
-    cu_q_scale = scale_utils.make_scale_cu_seqlens_padded(cu_q, token_alignment=2)
-    cu_k_scale = scale_utils.make_scale_cu_seqlens_padded(cu_k, token_alignment=128)
+    cu_q_scale = make_scale_cu_seqlens_padded(cu_q, token_alignment=2)
+    cu_k_scale = make_scale_cu_seqlens_padded(cu_k, token_alignment=128)
     with pytest.raises(ValueError, match="requires n_heads_kv=1"):
         DSA.indexer_forward_wrapper(
             q[0],

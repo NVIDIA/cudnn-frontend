@@ -2967,9 +2967,12 @@ def test_sm107_gate_lpt_is_bitwise_natural():
 # md5 of the sm_107a cubins the block drives, recorded BEFORE the THD gate descriptor (the dense gated and the
 # ungated THD renderings must not move: the gate's THD arm is a host-side map + a binder slot, never a body change).
 # Keyed by the DSL that produced them; another toolchain re-records (the probe prints the md5 it saw).
+# Re-recorded under nvidia-cutlass-dsl 4.8.0 after #1547 (the dense CLC path reads the tile id through one scheduler publisher,
+# `read_tile_id_arrive_on_leader`, under `not CFG.THD_VARLEN`): the dense gated arm moved with that body change; both THD arms
+# re-rendered byte-identical to their records, as the `THD_VARLEN` guard predicts.
 _THD_GATE_CUBIN_RECORD = {
     "nvidia-cutlass-dsl": "4.8.0",
-    "dense_gated_bf16_lse": "50657ada1609d250868f34068d58d93f",
+    "dense_gated_bf16_lse": "fde505d05124f3978d1f106b7b47891b",
     "thd_ungated_bf16_head": "2a3467773a4dfa420660002a49c59fe0",
     # the THD-gated rendering itself (the packed gate map): recorded WITH the descriptor, so the next change to it is seen
     "thd_gated_bf16_head": "88a6956e90cc110697611583095ac47f",
@@ -3388,13 +3391,15 @@ def test_sm107_thd_gate_keyless_sequence_is_exactly_zero_and_a_zero_length_seque
 # were added (the ungated renderings must not move on either line: every seam folds on const_expr, every new kernel
 # argument is Optional[...] = None) plus the two gated sm_107a renderings recorded WITH the seams (the next change to
 # them is seen).  Keyed by the DSL that produced them; another toolchain re-records (the probe prints the md5 it saw).
+# Re-recorded under nvidia-cutlass-dsl 4.8.0 after #1547 (one scheduler publisher on the dense CLC path, under `not CFG.THD_VARLEN`):
+# the two dense arms moved on sm_100a and sm_107a alike; the eight THD / paged / gated arms re-rendered byte-identical.
 _PAGED_GATE_CUBIN_RECORD = {
     "nvidia-cutlass-dsl": "4.8.0",
-    "sm_100a_dense": "dc698e8b8a4f86996a7090ab24c4d452",
+    "sm_100a_dense": "7db6daaf02f536bd9fbfd7e36e671fd8",
     "sm_100a_thd": "71f32b147b7c86af413a227f1c2408a5",
     "sm_100a_paged_thd": "5f2ccc374d24b90239ab99a8a1d529ff",
     "sm_100a_paged_thd_pack": "ee82153f5d070035d98e32582d9e30e2",
-    "sm_107a_dense": "b4af8e7d23a52179c0c299bb03cd9c3d",
+    "sm_107a_dense": "63d9b3efb571b4ba00f3a4625fd280bc",
     "sm_107a_thd": "b07ad1515c7755c604986b8cd352d768",
     "sm_107a_paged_thd": "a1651799d5f6116d5726df3667e0a39a",
     "sm_107a_paged_thd_pack": "9d83e9ff26a04c5c3d0840f85c876c3a",

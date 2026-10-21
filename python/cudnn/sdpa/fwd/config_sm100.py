@@ -880,7 +880,7 @@ def rescale_threshold(dtype_qkv: int) -> float:
     return 4.0 if dtype_qkv <= 1 else 8.0
 
 
-def pack_gqa_group_size(qh_per_kh: int, tile_m: int = 128, *, partial: bool = False) -> int:
+def pack_gqa_group_size(qh_per_kh: int, tile_m: int = 128, *, partial: bool = False, requires_divisible: bool = True) -> int:
     """Heads packed into one Q tile row-group for the GQA ratio ``G = qh_per_kh``.
 
     Full contract (``partial=False``): ``G`` when it divides ``tile_m``, else 0
@@ -888,26 +888,31 @@ def pack_gqa_group_size(qh_per_kh: int, tile_m: int = 128, *, partial: bool = Fa
     d256 f16 kernels): the largest divisor of ``G`` that divides ``tile_m`` --
     ``gcd(G, tile_m)`` -- so a 12-head group packs 4 heads per token row-group
     (three packed heads per KV head), a 6-head group packs 2, and a group with
-    no factor in common with the tile (3, 5, ...) yields 1 = unpacked.  MHA
-    (``G == 1``) is the identity, 1.
+    no factor in common with the tile (3, 5, ...) yields 1 = unpacked.
+    Without the divisibility requirement (``requires_divisible=False``, the
+    SM120 kernels): ``G`` whenever it fits the tile, ``tile_m % G != 0`` included --
+    ``tile_m // G`` tokens per tile, the rows past ``(tile_m // G) * G`` dead
+    (G = 6 at 64 rows: ten tokens in 60 live rows) -- else 0.  MHA (``G == 1``)
+    is the identity, 1.
     """
     if qh_per_kh <= 0:
         return 0
-    if tile_m % qh_per_kh == 0:
+    if tile_m % qh_per_kh == 0 or (not requires_divisible and qh_per_kh <= tile_m):
         return qh_per_kh
     return math.gcd(qh_per_kh, tile_m) if partial else 0
 
 
-def pack_gqa_supported(h_q: int, h_kv: int, tile_m: int = 128, *, partial: bool = False) -> bool:
+def pack_gqa_supported(h_q: int, h_kv: int, tile_m: int = 128, *, partial: bool = False, requires_divisible: bool = True) -> bool:
     """Whether a PACK_GQA=1 plan is HONORABLE for this head count: the group
-    divides the tile (full packing) or -- ``partial`` -- shares a factor > 1
-    with it.  MHA (G == 1) is the bit-exact unpacked fold, so it is honorable
-    too; a group that cannot pack at all (G=3 at tile_m=128) is declined rather
-    than silently run unpacked (frost/README.md rule 5)."""
+    divides the tile (full packing), -- ``partial`` -- shares a factor > 1
+    with it, or -- without ``requires_divisible`` -- fits it.  MHA (G == 1) is the bit-exact
+    unpacked fold, so it is honorable too; a group that cannot pack at all
+    (G=3 at tile_m=128) is declined rather than silently run unpacked
+    (frost/README.md rule 5)."""
     if h_q <= 0 or h_kv <= 0 or h_q % h_kv != 0:
         return False
     g = h_q // h_kv
-    p = pack_gqa_group_size(g, tile_m, partial=partial)
+    p = pack_gqa_group_size(g, tile_m, partial=partial, requires_divisible=requires_divisible)
     return p == g or p > 1
 
 
@@ -3860,3 +3865,20 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
 
 
 MAKE_CFG = {32: make_cfg_d32, 64: make_cfg_d64, 128: make_cfg_d128, 192: make_cfg_d192, 256: make_cfg_d256, 512: make_cfg_d512}
+
+
+def thd_work_prefix_enabled(cfg):
+    """Use indexed task lookup on the single-CTA paged prefix path."""
+    # Shared decoders also receive families without THD_VARLEN or PAGED_KV.
+    # Reject their head geometry before reading fields specific to this path.
+    return bool(
+        cfg.TILE_K == 128
+        and cfg.TILE_O == 128
+        and cfg.THD_VARLEN
+        and cfg.PAGED_KV
+        and cfg.DTYPE_QKV in (2, 3)
+        and cfg.CGA_M == 1
+        and cfg.SPLIT_KV > 1
+        and cfg.BOTTOM_RIGHT
+        and not (cfg.MASK_FLAGS & MASK_SWA)
+    )

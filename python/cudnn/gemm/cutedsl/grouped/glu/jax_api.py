@@ -16,7 +16,6 @@ malformed offsets are the caller's responsibility here (the eager wrapper
 validates them).
 """
 
-import math
 import os
 from typing import Any, Optional, Tuple
 
@@ -31,8 +30,20 @@ from cutlass.cute.nvgpu import OperandMajorMode
 from cudnn.api_base import TupleDict, ceil_div, get_device_type
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.tensor_adapter import framework_dtype, get_compute_capability
-from cudnn.jax import call, gemm_operand_spec
-from ..canonical_jax import check_grouped_shapes, check_jax_inputs, grouped_call, output_type, sf_array, sf_shape
+from cudnn.jax import call, gemm_operand_spec, neg_inf_init
+from ..canonical import kernel_facing_fp4
+from ..canonical_jax import (
+    check_bf16_dense_inputs,
+    check_grouped_shapes,
+    check_jax_inputs,
+    check_packed_sf_size,
+    check_rubin_dsl,
+    fp8_dtypes,
+    grouped_call,
+    output_type,
+    sf_array,
+    sf_shape,
+)
 from ..moe_utils import MoEWeightMode
 from ..unfused.jax_api import _pointer_count, _prob_spec
 from .moe_blockscaled_grouped_gemm_glu_bias import BlockScaledMoEGroupedGemmGluBiasKernel
@@ -103,21 +114,30 @@ def grouped_gemm_glu_jax_sm100(
     geglu_alpha: float = 1.702,
     glu_clamp_max: float = 7.0,
     glu_clamp_min: float = -7.0,
+    sf_vec_size: int = 32,
 ) -> Any:
     """Grouped GEMM GLU forward as an XLA custom call.
 
-    With ``b_tensor``: canonical MXFP8 dense weights, eagerly or under jax.jit.
-    A (m,k), B (experts,n,k), prob (m,) fp32/bf16, explicit alpha (experts,)
-    fp32, norm_const (1,) fp32, and int32 padded_offsets (experts,). Offsets
-    must be nondecreasing multiples of 256 within [0,m]; m is padded to 256.
-    SF buffers contain packed E8M0 MMA-tiled bytes, at any dense rank (uint8
-    bit patterns also accepted). FP8 A/B and an explicit FP8 ``d_dtype`` are
-    required. ``act_func`` is "swiglu" or "geglu"; the activation scalars are
-    compile-time constants of the traced call. ``discrete_col_sfd=True`` packs
-    column scales by expert. Returns a TupleDict with the eager wrapper's keys:
-    natural 2-D C/D/D_col (C None unless ``generate_c``) and physical 6-D SF
-    buffers. Rows at or past padded_offsets[-1] are unspecified. Runs the Rubin
-    GLU kernel on SM107 and the SM100 kernel otherwise.
+    With ``b_tensor``: canonical block-scaled dense weights, eagerly or under
+    jax.jit. A (m,k), B (experts,n,k), prob (m,) fp32/bf16, explicit alpha
+    (experts,) fp32, and int32 padded_offsets (experts,). Offsets must be
+    nondecreasing multiples of 256 within [0,m]; m is padded to 256. A/B are
+    MXFP8, or packed FP4 as uint8 with two values per byte, so K is twice the
+    array extent. SF buffers contain packed MMA-tiled bytes at any dense rank:
+    E8M0 with ``sf_vec_size=32`` for MXFP8 (uint8 bit patterns also accepted),
+    E8M0 or E4M3 (NVFP4, ``sf_vec_size=16``) for FP4. MXFP8 inputs take an
+    FP8 ``d_dtype`` and norm_const (1,) fp32, and return D, D_col and the
+    physical 6-D SFD buffers; ``discrete_col_sfd=True`` packs column scales by
+    expert. FP4 inputs take a BF16/FP16 ``d_dtype`` and return D and the
+    per-expert amax (experts,1). ``act_func`` is "swiglu" or "geglu"; the
+    activation scalars are compile-time constants of the traced call. Returns
+    a TupleDict with the eager wrapper's keys (C None unless ``generate_c``).
+    Rows at or past padded_offsets[-1] are unspecified. Runs the Rubin GLU
+    kernel on SM107 and the SM100 kernel otherwise.
+
+    With a BF16 ``b_tensor`` and no scale tensors: canonical BF16 dense weights,
+    A (m,k) and B (experts,n,k) bfloat16 with fp32 prob (m,). Returns a
+    TupleDict with C (m,n) (None unless ``generate_c``) and D (m,n/2).
 
     With ``b_ptrs``: BF16 discrete weights.
 
@@ -143,6 +163,23 @@ def grouped_gemm_glu_jax_sm100(
         for name, rejected in unsupported.items():
             if rejected:
                 raise ValueError(f"{name} is unsupported for the JAX MXFP8 path")
+        if _convert_to_cutlass_data_type(getattr(a_tensor, "dtype", None)) is cutlass.BFloat16:
+            if any(t is not None for t in (sfa_tensor, sfb_tensor, norm_const_tensor)):
+                raise ValueError("BF16 weights do not take scale tensors or norm_const_tensor")
+            return bf16_dense_glu_jax(
+                a_tensor=a_tensor,
+                b_tensor=b_tensor,
+                padded_offsets=padded_offsets,
+                alpha_tensor=alpha_tensor,
+                prob_tensor=prob_tensor,
+                c_dtype=c_dtype,
+                d_dtype=d_dtype,
+                mma_tiler_mn=mma_tiler_mn,
+                cluster_shape_mn=cluster_shape_mn,
+                act_func=act_func,
+                linear_offset=linear_offset,
+                generate_c=generate_c,
+            )
         return blockscaled_glu_jax(
             a_tensor=a_tensor,
             b_tensor=b_tensor,
@@ -163,6 +200,7 @@ def grouped_gemm_glu_jax_sm100(
             glu_clamp_max=glu_clamp_max,
             glu_clamp_min=glu_clamp_min,
             generate_c=generate_c,
+            sf_vec_size=sf_vec_size,
         )
     if b_ptrs is None or prob_tensor is None or any(t is not None for t in (sfa_tensor, sfb_tensor, norm_const_tensor)):
         raise ValueError("BF16 discrete weights take b_ptrs and prob_tensor and no scale tensors; pass b_tensor for canonical MXFP8")
@@ -299,36 +337,36 @@ def grouped_glu_adapter(
     padded_offsets,
     alpha,
     prob,
-    norm_const,
-    c,
-    d,
-    d_col,
-    sfd_row,
-    sfd_col,
-    *,
+    *rest,
     kernel,
     mac,
+    low_precision,
     linear_offset,
     geglu_alpha,
     glu_clamp_max,
     glu_clamp_min,
 ):
+    # rest: [norm_const], c, d, then d_col, sfd_row, sfd_col for FP8 output or amax otherwise
+    norm_const = rest[0] if cutlass.const_expr(low_precision) else None
+    outputs = rest[int(low_precision) :]
+    d = outputs[1]
     kernel(
-        a=a,
-        b=b,
+        a=kernel_facing_fp4(a),
+        b=kernel_facing_fp4(b),
         sfb=sfb,
         n=cutlass.Int32(0),
         k=cutlass.Int32(0),
         b_stride_size=cutlass.Int64(0),
         b_major_mode=OperandMajorMode.K,
         workspace_ptr=cute.make_ptr(cutlass.Uint8, 0, cute.AddressSpace.gmem, assumed_align=128),
-        c=c,
+        c=outputs[0],
         d=d,
-        d_col=d_col,
+        # Without quantization the kernel only needs a D_col descriptor and does not write through it.
+        d_col=outputs[2] if cutlass.const_expr(low_precision) else d,
         sfa=sfa,
-        sfd_row_tensor=sfd_row,
-        sfd_col_tensor=sfd_col,
-        amax_tensor=None,
+        sfd_row_tensor=outputs[3] if cutlass.const_expr(low_precision) else None,
+        sfd_col_tensor=outputs[4] if cutlass.const_expr(low_precision) else None,
+        amax_tensor=None if cutlass.const_expr(low_precision) else outputs[2],
         norm_const_tensor=norm_const,
         padded_offsets=padded_offsets,
         alpha=alpha,
@@ -345,39 +383,39 @@ def grouped_glu_adapter(
 
 def glu_kernel_type():
     if get_device_type() == "rubin":
+        check_rubin_dsl()
         from .moe_blockscaled_grouped_gemm_glu_rubin import BlockScaledMoEGroupedGemmGluKernel
 
         return BlockScaledMoEGroupedGemmGluKernel
     return BlockScaledMoEGroupedGemmGluBiasKernel
 
 
-def glu_plan(inputs, outputs, mma_tiler_mn, cluster_shape_mn, discrete_col_sfd, act_func):
-    check_grouped_shapes(inputs, outputs, backward=False)
+def glu_plan(inputs, outputs, mma_tiler_mn, cluster_shape_mn, discrete_col_sfd, act_func, sf_vec_size):
+    ab_dtype, sf_dtype, k = check_grouped_shapes(inputs, outputs, backward=False, sf_vec_size=sf_vec_size)
     if act_func not in ("swiglu", "geglu"):
-        raise ValueError(f"act_func must be 'swiglu' or 'geglu' for the JAX MXFP8 path, got {act_func!r}")
-    m, k = inputs["a"].shape
+        raise ValueError(f"act_func must be 'swiglu' or 'geglu' for the JAX block-scaled path, got {act_func!r}")
+    m = inputs["a"].shape[0]
     experts, n, _ = inputs["b"].shape
+    d_dtype = _convert_to_cutlass_data_type(outputs["d"].dtype)
+    low_precision = d_dtype in fp8_dtypes
     use_2cta_instrs = mma_tiler_mn[0] == 256
     cluster_shape_mn = tuple(cluster_shape_mn or ((2, 1) if use_2cta_instrs else (1, 1)))
     margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
-    config = (experts, tuple(mma_tiler_mn), cluster_shape_mn, margin, discrete_col_sfd, act_func)
+    config = (get_device_type(), experts, tuple(mma_tiler_mn), cluster_shape_mn, margin, discrete_col_sfd, act_func, sf_vec_size, low_precision)
     validation_key = (config, tuple((name, tuple(t.shape), str(t.dtype)) for name, t in (*inputs.items(), *outputs.items())))
     if validation_key not in validated_configs:
-        rest_k = ceil_div(ceil_div(k, 32), 4)
-        for name, rows, groups in (("sfa", m, 1), ("sfb", n, experts)):
-            if math.prod(inputs[name].shape) != 512 * ceil_div(rows, 128) * rest_k * groups:
-                raise ValueError(f"{name.upper()} must contain the complete MMA-packed scale buffer")
+        check_packed_sf_size(inputs, (("sfa", m, 1), ("sfb", n, experts)), ceil_div(ceil_div(k, sf_vec_size), 4))
         if _convert_to_cutlass_data_type(inputs["prob"].dtype) not in (cutlass.Float32, cutlass.BFloat16):
             raise ValueError("prob must be float32 or bfloat16")
         if experts > 1024:
             raise ValueError(f"expert count must be <= 1024, got {experts}")
         kernel_type = glu_kernel_type()
         if not kernel_type.can_implement(
-            _convert_to_cutlass_data_type(inputs["a"].dtype),
-            cutlass.Float8E8M0FNU,
-            32,
+            ab_dtype,
+            sf_dtype,
+            sf_vec_size,
             cutlass.Float32,
-            _convert_to_cutlass_data_type(outputs["d"].dtype),
+            d_dtype,
             use_2cta_instrs,
             tuple(mma_tiler_mn),
             cluster_shape_mn,
@@ -390,7 +428,7 @@ def glu_plan(inputs, outputs, mma_tiler_mn, cluster_shape_mn, discrete_col_sfd, 
             "n",
             kernel_type.FIX_PAD_SIZE,
         ):
-            raise ValueError("Unsupported grouped GEMM GLU tile, cluster, alignment, or layout configuration")
+            raise ValueError("Unsupported grouped GEMM GLU dtype, tile, cluster, alignment, or layout configuration")
         validated_configs.add(validation_key)
     if config not in kernel_cache:
         major, minor = get_compute_capability()
@@ -400,13 +438,13 @@ def glu_plan(inputs, outputs, mma_tiler_mn, cluster_shape_mn, discrete_col_sfd, 
         if mac <= 0:
             raise ValueError("CUDNNFE_CLUSTER_OVERLAP_MARGIN leaves no active clusters")
         kernel = glu_kernel_type()(
-            sf_vec_size=32,
+            sf_vec_size=sf_vec_size,
             acc_dtype=cutlass.Float32,
             use_2cta_instrs=use_2cta_instrs,
             mma_tiler_mn=tuple(mma_tiler_mn),
             cluster_shape_mn=cluster_shape_mn,
             vectorized_f32=False,
-            generate_sfd=True,
+            generate_sfd=low_precision,
             discrete_col_sfd=discrete_col_sfd,
             expert_cnt=experts,
             weight_mode=MoEWeightMode.DENSE,
@@ -437,30 +475,27 @@ def blockscaled_glu_jax(
     glu_clamp_max,
     glu_clamp_min,
     generate_c,
+    sf_vec_size=32,
 ):
-    inputs = dict(
-        a=a_tensor,
-        b=b_tensor,
-        sfa=sfa_tensor,
-        sfb=sfb_tensor,
-        padded_offsets=padded_offsets,
-        alpha=alpha_tensor,
-        prob=prob_tensor,
-        norm_const=norm_const_tensor,
-    )
+    low_precision = _convert_to_cutlass_data_type(d_dtype) in fp8_dtypes
+    inputs = dict(a=a_tensor, b=b_tensor, sfa=sfa_tensor, sfb=sfb_tensor, padded_offsets=padded_offsets, alpha=alpha_tensor, prob=prob_tensor)
+    if low_precision:
+        inputs["norm_const"] = norm_const_tensor
     check_jax_inputs(inputs)
     inputs["sfa"] = sf_array(sfa_tensor)
     inputs["sfb"] = sf_array(sfb_tensor)
     m = a_tensor.shape[0]
-    n = b_tensor.shape[1]
-    outputs = dict(
-        c=output_type((m, n), c_dtype),
-        d=output_type((m, n // 2), d_dtype),
-        d_col=output_type((m, n // 2), d_dtype),
-        sfd_row=output_type(sf_shape(m, n // 2), cutlass.Float8E8M0FNU),
-        sfd_col=output_type(sf_shape(n // 2, m), cutlass.Float8E8M0FNU),
-    )
-    kernel, mac = glu_plan(inputs, outputs, mma_tiler_mn, cluster_shape_mn, discrete_col_sfd, act_func)
+    experts, n = b_tensor.shape[:2]
+    outputs = dict(c=output_type((m, n), c_dtype), d=output_type((m, n // 2), d_dtype))
+    if low_precision:
+        outputs.update(
+            d_col=output_type((m, n // 2), d_dtype),
+            sfd_row=output_type(sf_shape(m, n // 2, sf_vec_size), cutlass.Float8E8M0FNU),
+            sfd_col=output_type(sf_shape(n // 2, m, sf_vec_size), cutlass.Float8E8M0FNU),
+        )
+    else:
+        outputs["amax"] = output_type((experts, 1), cutlass.Float32)
+    kernel, mac = glu_plan(inputs, outputs, mma_tiler_mn, cluster_shape_mn, discrete_col_sfd, act_func, sf_vec_size)
     if linear_offset is None:
         linear_offset = 1.0 if act_func == "geglu" else 0.0
     result = grouped_call(
@@ -469,7 +504,8 @@ def blockscaled_glu_jax(
         mac,
         tuple(output_type(t.shape, t.dtype) for t in inputs.values()),
         tuple(outputs.values()),
-        zero_dprob=False,
+        initialized=() if low_precision else ((2, neg_inf_init),),
+        low_precision=low_precision,
         linear_offset=float(linear_offset),
         geglu_alpha=float(geglu_alpha),
         glu_clamp_max=float(glu_clamp_max),
@@ -478,8 +514,98 @@ def blockscaled_glu_jax(
     return TupleDict(
         c_tensor=result[0] if generate_c else None,
         d_tensor=result[1],
-        d_col_tensor=result[2],
-        amax_tensor=None,
-        sfd_row_tensor=result[3],
-        sfd_col_tensor=result[4],
+        d_col_tensor=result[2] if low_precision else None,
+        amax_tensor=None if low_precision else result[2],
+        sfd_row_tensor=result[3] if low_precision else None,
+        sfd_col_tensor=result[4] if low_precision else None,
+    )
+
+
+@cute.jit
+def grouped_glu_bf16_dense_adapter(stream, a, b, padded_offsets, alpha, prob, c, d, *, kernel, mac, linear_offset):
+    kernel(
+        a=a,
+        b=b,
+        n=cutlass.Int32(0),
+        k=cutlass.Int32(0),
+        b_stride_size=cutlass.Int64(0),
+        b_major_mode=OperandMajorMode.K,
+        workspace_ptr=cute.make_ptr(cutlass.Uint8, 0, cute.AddressSpace.gmem, assumed_align=128),
+        c=c,
+        d=d,
+        padded_offsets=padded_offsets,
+        alpha=alpha,
+        prob=prob,
+        bias=None,
+        max_active_clusters=mac,
+        stream=stream,
+        linear_offset=cutlass.Float32(linear_offset),
+    )
+
+
+def bf16_dense_glu_jax(
+    *, a_tensor, b_tensor, padded_offsets, alpha_tensor, prob_tensor, c_dtype, d_dtype, mma_tiler_mn, cluster_shape_mn, act_func, linear_offset, generate_c
+):
+    inputs = dict(a=a_tensor, b=b_tensor, padded_offsets=padded_offsets, alpha=alpha_tensor, prob=prob_tensor)
+    m, k, experts, n = check_bf16_dense_inputs(inputs)
+    c_dtype = _convert_to_cutlass_data_type(c_dtype)
+    d_dtype = _convert_to_cutlass_data_type(d_dtype)
+    if c_dtype not in _output_dtypes or d_dtype not in _output_dtypes:
+        raise ValueError(f"c_dtype/d_dtype must be BF16, FP16, or FP32, got {c_dtype}/{d_dtype}")
+    if act_func not in ("swiglu", "geglu"):
+        raise ValueError(f"act_func must be 'swiglu' or 'geglu', got {act_func}")
+    if linear_offset is None:
+        linear_offset = 1.0 if act_func == "geglu" else 0.0
+    use_2cta_instrs = mma_tiler_mn[0] == 256
+    cluster_shape_mn = tuple(cluster_shape_mn or ((2, 1) if use_2cta_instrs else (1, 1)))
+    margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
+    config = ("bf16_dense", experts, c_dtype, d_dtype, tuple(mma_tiler_mn), cluster_shape_mn, margin, act_func, generate_c)
+    if (config, m, n, k) not in validated_configs:
+        if n % 64 or not MoEGroupedGemmGluBiasBf16Kernel.can_implement(
+            cutlass.BFloat16,
+            c_dtype,
+            d_dtype,
+            cutlass.Float32,
+            use_2cta_instrs,
+            tuple(mma_tiler_mn),
+            cluster_shape_mn,
+            m,
+            n,
+            k,
+            experts,
+            "k",
+            "k",
+            "n",
+            MoEGroupedGemmGluBiasBf16Kernel.FIX_PAD_SIZE,
+        ):
+            raise ValueError("Unsupported BF16 grouped GEMM GLU tile, cluster, alignment, or layout configuration")
+        validated_configs.add((config, m, n, k))
+    if config not in kernel_cache:
+        mac = cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]) - margin
+        if mac <= 0:
+            raise ValueError("CUDNNFE_CLUSTER_OVERLAP_MARGIN leaves no active clusters")
+        kernel = MoEGroupedGemmGluBiasBf16Kernel(
+            acc_dtype=cutlass.Float32,
+            use_2cta_instrs=use_2cta_instrs,
+            mma_tiler_mn=tuple(mma_tiler_mn),
+            cluster_shape_mn=cluster_shape_mn,
+            vectorized_f32=False,
+            expert_cnt=experts,
+            weight_mode=MoEWeightMode.DENSE,
+            act_func=act_func,
+            enable_bias=False,
+            generate_c=generate_c,
+        )
+        kernel_cache[config] = (kernel, mac)
+    kernel, mac = kernel_cache[config]
+    result = grouped_call(
+        grouped_glu_bf16_dense_adapter,
+        kernel,
+        mac,
+        tuple(output_type(t.shape, t.dtype) for t in inputs.values()),
+        (output_type((m, n), c_dtype), output_type((m, n // 2), d_dtype)),
+        linear_offset=float(linear_offset),
+    )(*inputs.values())
+    return TupleDict(
+        c_tensor=result[0] if generate_c else None, d_tensor=result[1], d_col_tensor=None, amax_tensor=None, sfd_row_tensor=None, sfd_col_tensor=None
     )

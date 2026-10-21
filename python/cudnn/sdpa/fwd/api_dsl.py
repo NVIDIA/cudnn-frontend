@@ -2141,10 +2141,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self._value_error_if(page_size != self.paged_page_size, f"K container page_size {page_size} != declared {self.paged_page_size}")
             self._check_tensor_shape(self.k_desc, (num_pages, h_kv, page_size, d_qk), name="K")
             self._check_tensor_shape(self.v_desc, (num_pages, h_kv, page_size, d_v), name="V")
-            self._not_implemented_error_if(
-                (self.k_desc.stride[2] < self.k_desc.stride[1]) != (self.v_desc.stride[2] < self.v_desc.stride[1]),
-                "paged K and V pools must use the same HND or NHD layout kind",
-            )
             self._value_error_if(
                 self.paged_max_seq_len_kv is None or self.paged_max_seq_len_kv <= 0,
                 "paged KV needs paged_max_seq_len_kv (the logical S_kv the block tables address)",
@@ -4589,9 +4585,17 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         s_q_decl = int(self.q_desc.shape[2])
         return self.batch_size * ((s_q_decl + cga_tile_m - 1) // cga_tile_m) * self.h_q
 
+    def _thd_meta_words(self):
+        from cudnn.frost.tile_dsl.thd import THD_META_WORDS, THD_WORK_META_WORDS
+
+        # Workspace queries are legal before compile(). Reserve the split
+        # metadata tail from checked geometry; variants without indexed
+        # lookup leave these B+1 words unused. No compiled module is needed.
+        return THD_WORK_META_WORDS(self.batch_size) if self.packed_thd_split else THD_META_WORDS(self.batch_size)
+
     def _thd_workspace_layout(self):
         b, qh = self.batch_size, self.h_q
-        base = ws_align((4 * b + 4) * 4) + ws_align((b + 3) * 16 * 8) + (0 if self.has_sink else ws_align(qh * 4))
+        base = ws_align(self._thd_meta_words() * 4) + ws_align((b + 3) * 16 * 8) + (0 if self.has_sink else ws_align(qh * 4))
         if self.packed_thd_split:
             from cudnn.sdpa.fwd.prepared import thd_split_workspace
 
@@ -4649,7 +4653,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             dbg = int(os.environ.get("FROST_THD_CLUSTERS", "0"))  # debug override
             if dbg > 0:
                 units = min(env, dbg)
-        n_meta = 4 * b + 4
+        n_meta = self._thd_meta_words()
         plan = SimpleNamespace(
             q=self._thd_decl(self.q_desc),
             k=self._thd_decl(self.k_desc),
@@ -5569,9 +5573,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 self.thd,
                 "PackGQA is dense-only (THD/ragged runs unpacked)",
             )
+            # Every SM120 template packs any GQA ratio up to the tile, tile_q % G != 0 included.
             self._value_error_if(
-                not pack_gqa_supported(int(h_q), int(h_kv), int(self.q_tile)),
-                f"PackGQA requires h_q/h_kv to divide q_tile ({self.q_tile}); got h_q/h_kv = {int(h_q)}/{int(h_kv)}",
+                not pack_gqa_supported(int(h_q), int(h_kv), int(self.q_tile), requires_divisible=False),
+                f"PackGQA needs h_q/h_kv <= q_tile ({self.q_tile}); got h_q/h_kv = {int(h_q)}/{int(h_kv)}",
             )
         for desc in (self.k_desc, self.v_desc, self.o_desc):
             if self._fp8 and desc is self.o_desc:
@@ -5695,8 +5700,11 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             # Partials stay half here (see _fp32_partial_split): sO aliases sKV
             # on this arch, so there is no room to widen the O tile the way the
             # SM100 kernels do.
+            #
+            # The half templates write sink-free partials and the combine folds
+            # the sink once; the FP8 epilogues still fold it per split.
             self._not_implemented_error_if(self.thd, "split_kv > 1 is dense-only (THD packs its own flat grid)")
-            self._value_error_if(self.has_sink, "split_kv > 1 with an attention sink is not supported")
+            self._value_error_if(self.has_sink and self._fp8, "split_kv > 1 with an attention sink is served by the FP16/BF16 templates only")
             self._value_error_if(
                 self.seq_kv_lens_present or self.seq_q_lens_present,
                 "split_kv > 1 serves unpadded dense graphs only",

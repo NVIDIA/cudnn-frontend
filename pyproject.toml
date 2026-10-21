@@ -42,14 +42,16 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Environment :: GPU :: NVIDIA CUDA",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 
 dependencies = [
-    "nvidia-cutlass-dsl[cu13]>=4.6.2",
-    "apache-tvm-ffi>=0.1.11",
+    # These runtimes do not ship Windows ARM64 packages.
+    "nvidia-cutlass-dsl[cu13]>=4.6.2; sys_platform != 'win32' or platform_machine != 'ARM64'",
+    "apache-tvm-ffi>=0.1.11; sys_platform != 'win32' or platform_machine != 'ARM64'",
 ]
 
 [project.urls]
@@ -124,7 +126,13 @@ jax = [
 [build-system]
 # nanobind 3.x matches the project's Python 3.10 minimum.
 # 3.0.0 was yanked for incorrectly advertising Python 3.9 support.
-requires = ["setuptools>=64", "cmake>=3.26", "ninja==1.11.1.1", "nanobind>=3.0.1,<4"]
+requires = [
+    "setuptools>=64",
+    "cmake>=3.26",
+    "ninja==1.11.1.1; sys_platform != 'win32' or platform_machine != 'ARM64'",
+    "ninja>=1.13.0; sys_platform == 'win32' and platform_machine == 'ARM64'",
+    "nanobind>=3.0.1,<4",
+]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]

@@ -1417,7 +1417,7 @@ class CompiledGdnSummary:
             if self.l2norm is None:
                 self.l2norm = self.build_l2norm_qk(k, k, k_n, k_n, None, None, skip_q=True, k_slots=family_slots(k, self.num_householder, 3), stream=stream)
             else:
-                self.run_l2norm_qk(self.l2norm, k, k, k_n, k_n, None, None, stream)
+                self.run_l2norm_qk(self.l2norm, k_n, k, k_n, k_n, None, None, stream)
             k = k_n
         if self.chain:
             self.run_chain(k, v, g, beta, cu, state0, final_state, transition, a_log, dt_bias, region, stream)

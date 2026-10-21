@@ -31,7 +31,7 @@ namespace detail {
 // the plan, so give the graph a reference to the plan first.
 inline error_t
 retain_plan_on_capturing_stream(cudnnHandle_t handle, ExecutionPlan* plan) {
-    if (!plan->needs_cuda_graph_retention() && !CudaGraphRetainedResource::has_deferred_releases()) {
+    if (!plan->needs_cuda_graph_retention()) {
         return {error_code_t::OK, ""};
     }
     cudaStream_t stream = nullptr;
@@ -856,8 +856,28 @@ class Execution_plan_list {
              std::unordered_map<int64_t, void*> const& tensor_to_pointer_map,
              void* workspace,
              void* user_impl = nullptr) {
-        auto error = autotune_impl(execution_plans, handle, tensor_to_pointer_map, workspace, user_impl);
-        return error;
+        // Callbacks sort/prune plan pointers. Keep the canonical list intact
+        // until their result can be applied to plans and metadata together.
+        auto ranked_plans = execution_plans;
+        CHECK_CUDNN_FRONTEND_ERROR(autotune_impl(ranked_plans, handle, tensor_to_pointer_map, workspace, user_impl));
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            ranked_plans.empty(), error_code_t::GRAPH_EXECUTION_FAILED, "Autotune returned no execution plans.");
+        std::vector<int64_t> indices;
+        indices.reserve(ranked_plans.size());
+        for (auto const& plan : ranked_plans) {
+            auto it = std::find(execution_plans.begin(), execution_plans.end(), plan);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(plan == nullptr || it == execution_plans.end(),
+                                           error_code_t::GRAPH_EXECUTION_FAILED,
+                                           "Autotune returned an unknown or unbuilt execution plan.");
+            auto index = static_cast<int64_t>(it - execution_plans.begin());
+            RETURN_CUDNN_FRONTEND_ERROR_IF(std::find(indices.begin(), indices.end(), index) != indices.end(),
+                                           error_code_t::GRAPH_EXECUTION_FAILED,
+                                           "Autotune returned a duplicate execution plan.");
+            indices.push_back(index);
+        }
+        reorder_plans(indices);
+        candidate = 0;
+        return {error_code_t::OK, ""};
     }
 
     error_t

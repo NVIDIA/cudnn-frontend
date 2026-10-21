@@ -17,7 +17,8 @@ region they replace decomposes into ~39 forward and ~51 backward kernel launches
 call (at `compress_ratio = 4`, `coff = 2`) and materializes `(total_comp, 2*ratio, 1, head_dim)`
 window intermediates. The default fused path is one forward and one backward kernel
 plus one fp32 `dAPE`-buffer zero-fill. Deterministic dAPE replaces that fill with a
-second reduction kernel. Both backward modes write `dKV`/`dScore` in full, including
+fixed-order reduction stage (two stages for ratio 4). Both backward modes write
+`dKV`/`dScore` in full, including
 exact zeros to never-consumed positions, so those buffers need no fills.
 
 ### Semantics
@@ -136,9 +137,11 @@ policies:
   Its class plan requires `workspace=None`; workspace never switches a compiled
   atomic plan to deterministic execution.
 - `deterministic=True` writes each CTA's register-local dAPE sums to caller-owned
-  fp32 partial planes and launches a second fixed-order reduction kernel. Ratio 4
-  partitions the CTA planes into 32 contiguous ranges: 32 warps sum those ranges in
-  ascending CTA order, then warp 0 merges the range sums in ascending range order.
+  fp32 partial planes and launches fixed-order reduction stages. Ratio 4 first reduces
+  independent groups of 32 CTA planes: eight warps each sum four contiguous planes,
+  then warp 0 merges those eight sums. A second kernel folds the resulting group sums
+  with an eight-way contiguous tree. This hierarchical grid supplies thousands of CTAs
+  on long packed sequences instead of assigning the whole partial axis to 16 CTAs.
   Ratio 2 and ratio 128 use a serial ascending-CTA fold. Both forms contain no dAPE
   atomics, fully overwrite `grad_ape`, are bitwise replay-deterministic, and are
   accepted by strict torch deterministic mode.
@@ -149,25 +152,36 @@ policies:
 
 #### Deterministic dAPE performance
 
-CUDA-event medians over 100 iterations after 30 warmups on an SM100 runtime
-(capability `(10, 0)`, CUDA 13.0, PyTorch 2.11, CUTLASS DSL 4.7) are below. Atomic and
+CUDA-event medians over 100 iterations after 30 warmups on one GB200
+(capability `(10, 0)`, CUDA 12.9, PyTorch 2.9.1, CUTLASS DSL 4.7) are below. Atomic and
 deterministic variants share all operand addresses, measurement order alternates AB/BA,
 and the whole run is repeated with plan construction order reversed. `operation`
 includes the atomic path's required dAPE zero-fill; deterministic dAPE overwrites its
 output and therefore needs no fill. JIT and allocations are outside the measurement.
 
-| configuration | workspace | atomic kernel | deterministic kernel | operation slowdown (both construction orders) |
+| configuration | workspace | atomic kernel | deterministic kernel | operation ratio, deterministic / atomic (both construction orders) |
 |---|---:|---:|---:|---:|
-| r4, c2, d128, 1x8192 | 1 MiB | 28.1–30.8 us | 36.5–37.4 us | 1.10–1.15x |
-| r4, c2, d128, 3x8192 | 3 MiB | 36.4 us | 46.3–46.6 us | 1.16–1.17x |
-| r4, c2, d512, 1x8192 | 4 MiB | 36.1–40.0 us | 46.3–50.9 us | 1.10–1.16x |
-| r4, c2, d512, 3x8192 | 12 MiB | 87.0 us | 94.0–94.4 us | 1.09x |
-| r128, c1, d128, 1x8192 | 4 MiB | 24.4–25.0 us | 32.1–32.9 us | 1.14–1.15x |
-| r128, c2, d128, 3x8192 | 8 MiB | 45.9–46.7 us | 52.3–52.7 us | 1.17x |
-| r128, c1, d512, 1x8192 | 16 MiB | 35.4–35.5 us | 40.1–40.2 us | 1.03–1.04x |
-| r128, c2, d512, 3x8192 | 16 MiB | 108.1–108.4 us | 112.6–112.8 us | 1.01–1.02x |
+| r4, c2, d128, 1x8192 | 1.031 MiB | 32.5–34.0 us | 39.8–42.9 us | 0.96–0.98x |
+| r4, c2, d128, 3x8192 | 3.094 MiB | 40.6–41.1 us | 45.7–47.1 us | 0.94–0.95x |
+| r4, c2, d512, 1x8192 | 4.125 MiB | 42.5–42.8 us | 50.8–51.2 us | 0.97–0.99x |
+| r4, c2, d512, 3x8192 | 12.375 MiB | 90.7–91.5 us | 89.6–91.0 us | 0.92–0.93x |
+| r128, c1, d128, 1x8192 | 4 MiB | 31.1–32.6 us | 38.2–41.8 us | 0.91–0.93x |
+| r128, c2, d128, 3x8192 | 8 MiB | 47.5–48.0 us | 53.1–54.5 us | 0.93–0.94x |
+| r128, c1, d512, 1x8192 | 16 MiB | 40.8–41.0 us | 42.2–44.0 us | 0.84–0.86x |
+| r128, c2, d512, 3x8192 | 16 MiB | 111.7–112.1 us | 115.9–116.9 us | 0.95–0.96x |
 
-Reproduce with `benchmark/csa/bench_csa_dape_deterministic.py`; use
+For the production `coff=1`, `head_dim=128`, ratio-4 long-context path with local
+pooling disabled, the compressor runs after the raw CP shards are gathered and therefore
+still sees the global packed token count. CP32 and CP64 therefore present the same 256K
+compressor shape. On the same GB200, unequal-document 256K and 1M/CP64 packs measured
+236.4 -> 134.3 us and 806.6 -> 402.1 us respectively versus
+the previous 32-way reducer. Nsight Systems attributes the 1M reduction change to
+456.5 us in the old reducer versus 20.2 + 30.9 us in the two new stages; the producer
+remains 306 us. Workspace grows by 3.125% (64 -> 66 MiB at 1M).
+
+Reproduce the long-context rows with
+`benchmark/csa/bench_csa_dape_deterministic.py --long-context`. For the compact
+matrix above, omit that option; use
 `--construct-order deterministic-first` for the reversed build and `--atomic-only`
 against an unchanged-source checkout for the independent control.
 

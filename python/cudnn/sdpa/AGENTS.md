@@ -739,6 +739,19 @@ ordered by CTA barriers. Check prefix lengths around warp boundaries and
 zero-length sequences (`test_parallel_thd_metadata_matches_lengths_and_normalized_cu`),
 and run racecheck/memcheck before changing this shared setup again.
 
+Shared compile-time predicates must reject unrelated head geometry before
+reading family-specific config fields. The D512 two-by-two config has no
+`PAGED_KV`; D256 decode has no `THD_VARLEN`. A D128-only optimization can break
+their compilation through a shared decoder even when its own tests pass.
+Exercise real config objects (`test_thd_work_prefix_declines_other_config_families`)
+and the existing D512 `test_two_by_two_thd` compile-and-execute test.
+
+Standalone scratch queries after `check_support()` must not depend on a
+compiled module. Reserve metadata from checked plan geometry and keep the
+size stable through compilation. `test_thd_split_workspace_query_before_compile`
+allocates first, then compiles and executes with that buffer, including a
+batch size that crosses the metadata alignment boundary.
+
 **One metadata buffer, several persistent-scheduler launches per execute (the
 SM100 d512 backward's `heads // chunk` stage-2 launches): the two scheduler
 words are per LAUNCH.** `live` (`meta[4B+2]`) counts the units ONE launch
@@ -1087,3 +1100,13 @@ After compiling `score_sign`, launch with `config_sm80.kernel_scale` of the
 logical scale and reject a runtime sign change. Zero is a logical zero scale,
 not a request to reuse the plan's scale. `test_graph_thd_nonpositive_scale_and_replay`
 checks zero/negative scales, keyless rows and changed-V replay.
+
+
+Paged pool layout is per operand. A logical `(pages, heads, page_size, dim)`
+shape does not imply physical HND storage; singleton head axes can make two
+layout kinds both report `is_contiguous()`. Validate each runtime pool against
+its own declared kind. TMA descriptors may share a coordinate order while
+carrying different strides; keep descriptor axes and loader coordinates
+consistent rather than changing one alone. The `independent_pool_layouts`
+tests pin FROST execution and compare O/Stats in both mixed directions,
+including one KV head; backend fallback must not count as kernel support.

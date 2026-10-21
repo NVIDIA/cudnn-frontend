@@ -717,8 +717,6 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         s_kv = int(declared_max) if declared_max is not None else max_pages * page_size
         if s_kv > max_pages * page_size:
             return _invalid(f"paged_attention_max_seq_len_kv ({s_kv}) exceeds what the block table addresses ({max_pages} pages x {page_size})")
-        if (k_stride[1] > k_stride[2]) != (v_stride[1] > v_stride[2]):
-            return _invalid("paged K and V containers must share an in-page layout (both HND or both NHD)")
         table_k = table_k if table_k is not None else table_v
         table_v = table_v if table_v is not None else table_k
     else:

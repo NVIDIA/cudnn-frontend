@@ -201,6 +201,9 @@ def bprop_d128_accum_grouped_dense_kernel(
         nvvm.tcgen05_dealloc(nvvm.make_tmem_ptr(tmem_slot.load(), cutlass.Int8), cutlass.Int32(CFG.TMEM_COLS), group=nvvm.CTAGroup.CTA_1)
 
 
+bprop_d128_accum_grouped_dense_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.kernel
 def bprop_d128_accum_grouped_thd_kernel(
     maps: cute.Tensor,
@@ -252,7 +255,6 @@ def bprop_d128_accum_grouped_thd_kernel(
         nvvm.tcgen05_dealloc(nvvm.make_tmem_ptr(tmem_slot.load(), cutlass.Int8), cutlass.Int32(CFG.TMEM_COLS), group=nvvm.CTAGroup.CTA_1)
 
 
-bprop_d128_accum_grouped_dense_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 bprop_d128_accum_grouped_thd_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 

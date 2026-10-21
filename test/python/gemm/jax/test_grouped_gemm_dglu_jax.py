@@ -193,9 +193,10 @@ def test_grouped_gemm_dglu_jax_errors():
     offsets_j, alpha_j, beta_j, prob_j = (jnp.asarray(x) for x in (offsets_np, alpha_np, beta_np, prob_np))
     dprob_j = jnp.zeros((m, 1, 1), dtype=jnp.float32)
 
-    # Dense weight mode: (n, k, experts) expert-outermost strides are inexpressible.
-    b_dense_j = jnp.asarray(b_storage_np)  # (experts, n, k): not the dense-mode layout
-    with pytest.raises(ValueError, match="not expressible as JAX arrays"):
+    # Dense weight mode takes the canonical layouts (covered in test_grouped_gemm_canonical_jax.py)
+    # and allocates dprob itself.
+    b_dense_j = jnp.asarray(b_storage_np)
+    with pytest.raises(ValueError, match="dprob_tensor"):
         grouped_gemm_dglu_wrapper_sm100(
             a_tensor=a_j,
             c_tensor=c_j,

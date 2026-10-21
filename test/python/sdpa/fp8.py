@@ -761,7 +761,11 @@ def assert_amax_o(amax_o_gpu, o_amax_ref, *, torch_itype, torch_otype, o_gpu=Non
             f"{tag}: |{amax_o:.6g} - reference {o_amax_ref:.6g}| = {abs(amax_o - o_amax_ref):.3g} exceeds one P code step of the reference amax ({tol_ref:.3g})"
         )
         if o_gpu is not None:
-            max_o = o_gpu.detach().float().abs().max().item()
+            if o_gpu.numel() == 0:
+                assert amax_o == 0.0, f"{tag}: empty stored O requires Amax_O = 0, got {amax_o!r}"
+                max_o = 0.0
+            else:
+                max_o = o_gpu.detach().float().abs().max().item()
             half_spacing = torch.finfo(torch_otype).eps / 2  # half a code spacing of O's dtype, relative, at the max element
             slack = half_spacing * max(amax_o, max_o) + 1e-6
             assert max_o <= amax_o + slack, f"{tag}: the stored O reaches {max_o:.6g} but the kernel reported Amax_O = {amax_o:.6g} (beyond {torch_otype} rounding {slack:.2g})"

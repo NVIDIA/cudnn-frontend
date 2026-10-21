@@ -707,6 +707,16 @@ def test_kernel_runner_refuses_a_mismatched_binding():
     odd = torch.full((2, 2, 16, 2 * 256 + 4), float("nan"), device="cuda", dtype=torch.bfloat16)
     with pytest.raises(ValueError, match=r"pool_b stride\[2\].*multiple of 16 bytes"):
         run_cache_write(r, src, src, pool, odd[..., 256:512], slot, stream=s)
+    # Every operand on src_a's CUDA device, named: a CPU slot_mapping (a serving stack's `torch.tensor(slots)` with no device=) passed
+    # the dtype / rank / length checks and the kernel dereferenced a host address; a CPU pool, source or anchor is the same wild access.
+    with pytest.raises(ValueError, match="slot_mapping must live on"):
+        run_cache_write(r, src, src, pool, pool, slot.cpu(), stream=s)
+    with pytest.raises(ValueError, match="pool_b must live on"):
+        run_cache_write(r, src, src, pool, pool.cpu(), slot, stream=s)
+    with pytest.raises(ValueError, match="src_b must be on"):
+        run_cache_write(r, src, src.cpu(), pool, pool, slot, stream=s)
+    with pytest.raises(ValueError, match="src_a must be a CUDA tensor"):
+        run_cache_write(r, src.cpu(), src, pool, pool, slot, stream=s)
     with pytest.raises(ValueError, match="page_size must be >= 1"):
         compile_cache_write(dtype=torch.bfloat16, h=2, d=256, page_size=0)
     with pytest.raises(ValueError, match="bf16 / f16"):
@@ -759,13 +769,13 @@ _COMPILED = {}  # (form, dtype, page) -> the compiled block with write-through a
 
 
 def _oracle_rows(form, inp, meta, ref_geom):
-    """The per-sequence oracle's post-RoPE K / V as ``[T, H_kv, D]`` rows in token order (the dense oracle at B x S rows; the
-    packed one per sequence, concatenated -- an empty sequence contributes no rows)."""
+    """Post-RoPE K / V in token order. FP64 accumulation avoids reference GEMM errors at BF16 rounding boundaries;
+    intermediate casts still use the input dtype. Empty packed sequences contribute no rows."""
     if form == "dense":
-        ref = gated_attention_block_reference(**inp, geom=ref_geom)
+        ref = gated_attention_block_reference(**inp, geom=ref_geom, acc_dtype=torch.float64)
         return ref.k.reshape(-1, *ref.k.shape[2:]), ref.v.reshape(-1, *ref.v.shape[2:])
     refs = gated_attention_block_reference_packed(
-        inp["h"], inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], ref_geom, meta["lens"]
+        inp["h"], inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], ref_geom, meta["lens"], acc_dtype=torch.float64
     )
     ks = [r.k[0] for r in refs if r is not None]
     vs = [r.v[0] for r in refs if r is not None]
@@ -2347,14 +2357,27 @@ def test_extend_capture_of_the_first_execute_replays_with_new_lengths_tables_and
 @pytest.mark.L0
 def test_num_tokens_live_is_the_last_execute_parameter_with_default_none():
     """The append-only rule on the public ``execute`` signature: ``num_tokens_live`` (default ``None`` = the declared capacity) was appended
-    after ``slot_mapping`` / ``index_k_raw``, and the e4m3 KV cache's ``k_scale`` / ``v_scale`` (default ``None`` = pools of the activation
-    dtype) after IT, so every positional caller of the serving forms is unchanged; the slot-mapping form check gained its second admitted
-    count the same way (``t_live``, appended, default None)."""
+    after ``slot_mapping`` / ``index_k_raw``, the e4m3 KV cache's ``k_scale`` / ``v_scale`` (default ``None`` = pools of the activation
+    dtype) after IT, and the in-block indexer's five execute inputs (``w_iq_norm`` .. ``block_lens_out``, every default ``None``) after
+    ``v_scale`` -- the END of the signature, never mid-list -- so every positional caller of the earlier parameters is unchanged; the
+    slot-mapping form check gained its second admitted count the same way (``t_live``, appended, default None).  The pin is the exact
+    tail, by name: the next insertion anywhere inside it goes red."""
     from cudnn.gated_attention_block.cache_write_contract import check_slot_mapping
 
     params = list(inspect.signature(GatedAttentionBlockFwd.execute).parameters.values())
-    assert [p.name for p in params[-5:]] == ["slot_mapping", "index_k_raw", "num_tokens_live", "k_scale", "v_scale"]
-    assert all(p.default is None for p in params[-3:])
+    assert [p.name for p in params[-10:]] == [
+        "slot_mapping",
+        "index_k_raw",
+        "num_tokens_live",
+        "k_scale",
+        "v_scale",
+        "w_iq_norm",
+        "w_ik_norm",
+        "index_k_compressed",
+        "block_ids_out",
+        "block_lens_out",
+    ]
+    assert all(p.default is None for p in params[-10:])
     slot_params = inspect.signature(check_slot_mapping).parameters
     assert list(slot_params)[-1] == "t_live" and slot_params["t_live"].default is None
 

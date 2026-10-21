@@ -96,6 +96,8 @@ class _ResolvedSm90BwdConsumerConfig:
 def _tile_size_bwd_sm90(
     head_dim: int,
     head_dim_v: int,
+    deterministic: bool = False,
+    qhead_per_kvhead: int = 1,
 ) -> BwdConfig:
     """Return the native SM90 backward tile configuration."""
 
@@ -149,14 +151,15 @@ def _tile_size_bwd_sm90(
             AtomLayoutNdKV=2,
             AtomLayoutMdQ=1,
         )
+    use_d256_fast_path = head_dim == head_dim_v == 256 and not deterministic and qhead_per_kvhead == 1
     return BwdConfig(
         m_block_size=64,
-        n_block_size=64,
-        num_stages_Q=1,
+        n_block_size=80 if use_d256_fast_path else 64,
+        num_stages_Q=2 if use_d256_fast_path else 1,
         num_stages_dO=1,
         num_stages_PdS=1,
         SdP_swapAB=False,
-        dKV_swapAB=False,
+        dKV_swapAB=use_d256_fast_path,
         AtomLayoutNdKV=1,
         AtomLayoutMdQ=1,
     )
@@ -170,6 +173,7 @@ def _native_sm90_bwd_smem_bytes(
     head_dim: int,
     head_dim_v: int,
     config: BwdConfig,
+    deterministic: bool = False,
 ) -> int:
     """Return the exact native SM90 backward dynamic shared-memory size."""
 
@@ -177,12 +181,14 @@ def _native_sm90_bwd_smem_bytes(
     tile_hdim_v = math.ceil(head_dim_v / 16) * 16
     tile_m = config.m_block_size
     tile_n = config.n_block_size
+    direct_dq = head_dim == head_dim_v == 256 and not deterministic and config.n_block_size == 80
+    q_stages = 1 if head_dim == head_dim_v == 256 and deterministic else config.num_stages_Q
     mma_dkv_is_rs = config.AtomLayoutNdKV == _SM90_BWD_NUM_MMA_WG and config.SdP_swapAB and not config.dKV_swapAB
-    offset = (config.num_stages_Q * 2 + config.num_stages_dO * 2) * 8
+    offset = (q_stages * 2 + config.num_stages_dO * 2) * 8
     fields = (
-        (_align_up(tile_m, 64) * config.num_stages_Q * 4, 128),
+        (_align_up(tile_m, 64) * q_stages * 4, 128),
         (_align_up(tile_m, 64) * config.num_stages_dO * 4, 128),
-        (tile_m * tile_hdim * config.num_stages_Q * 2, 1024),
+        (tile_m * tile_hdim * q_stages * 2, 1024),
         (tile_n * tile_hdim_v * 2, 1024),
         (tile_n * tile_hdim * 2, 1024),
         (tile_m * tile_hdim_v * config.num_stages_dO * 2, 1024),
@@ -191,7 +197,7 @@ def _native_sm90_bwd_smem_bytes(
             1024,
         ),
         (tile_m * tile_n * config.num_stages_PdS * 2, 1024),
-        (tile_m * tile_hdim * 4, 1024),
+        (0 if direct_dq else tile_m * tile_hdim * 4, 1024),
     )
     for size, alignment in fields:
         offset = _align_up(offset, alignment) + size
@@ -220,7 +226,7 @@ def sm90_native_bwd_can_implement(
     if head_dim > 192 and (tile_hdim != 256 or tile_hdim_v not in (64, 128, 256)):
         return False
 
-    config = _tile_size_bwd_sm90(head_dim, head_dim_v)
+    config = _tile_size_bwd_sm90(head_dim, head_dim_v, qhead_per_kvhead=num_q_heads // num_kv_heads)
     return _native_sm90_bwd_smem_bytes(head_dim, head_dim_v, config) <= 232448
 
 
@@ -233,6 +239,7 @@ def resolve_sm90_bwd_consumer_config(
     num_q_heads: int,
     num_kv_heads: int,
     is_varlen: bool,
+    deterministic: bool = False,
 ) -> _ResolvedSm90BwdConsumerConfig:
     """Resolve the arbitrary SM90 backward consumer before inspecting a plan."""
 
@@ -262,7 +269,7 @@ def resolve_sm90_bwd_consumer_config(
 
     # Arbitrary masking changes K2Q traversal and payload application without
     # changing the dimension-specific tile or pipeline configuration.
-    cfg = _tile_size_bwd_sm90(head_dim, head_dim_v)
+    cfg = _tile_size_bwd_sm90(head_dim, head_dim_v, deterministic, num_q_heads // num_kv_heads)
     payload_values_per_thread, remainder = divmod(cfg.m_block_size * cfg.n_block_size, _SM90_BWD_NUM_MMA_THREADS)
     if remainder:
         raise AssertionError("SdP accumulator values must partition evenly across MMA threads")

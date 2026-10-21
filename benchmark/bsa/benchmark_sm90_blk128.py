@@ -14,7 +14,7 @@ import importlib.metadata
 
 import torch
 import cudnn
-from cudnn import BSA
+from cudnn import ops
 
 
 def measure(fn, repeats, samples, rotations=1):
@@ -114,13 +114,13 @@ def main():
 
             def fwd(index=0):
                 q, k, v, do = pool[index]
-                return BSA.block_sparse_attention_forward(q, k, v, indices, indices.shape[-1], sparse_block_size=block)
+                return ops.block_sparse_attention_forward(q, k, v, indices, indices.shape[-1], sparse_block_size=block)
 
             f = [fwd(index) for index in range(args.rotate)]
 
             def bwd(index=0):
                 q, k, v, do = pool[index]
-                return BSA.block_sparse_attention_backward(
+                return ops.block_sparse_attention_backward(
                     do,
                     q,
                     k,
@@ -135,7 +135,7 @@ def main():
             def train(index=0):
                 q, k, v, do = pool[index]
                 fo = fwd(index)
-                return BSA.block_sparse_attention_backward(do, q, k, v, fo["o_tensor"], fo["lse_tensor"], indices, indices.shape[-1], sparse_block_size=block)
+                return ops.block_sparse_attention_backward(do, q, k, v, fo["o_tensor"], fo["lse_tensor"], indices, indices.shape[-1], sparse_block_size=block)
 
             fm, fo = measure(fwd, args.repeats, 7, args.rotate)
             bm, bo = measure(bwd, args.repeats, 7, args.rotate)
