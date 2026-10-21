@@ -911,8 +911,8 @@ def decode_split_choice(route: DecodeRoute, *, batch: int, h_kv: int, max_kv_len
 def sparse_decode_split_choice(*, batch: int, h_kv: int, s_q: int, top_k: int, sm_count: int) -> int:
     """The split-KV the block-sparse DECODE mode lowers with when the declaration leaves ``decode_split_kv=None``: the sparse core
     runs ONE work item per (sequence, KV head, query row) -- ``B x H_kv x S_q`` items of at most ``ceil((top_k + 1) / 32)`` 32-row
-    tiles each -- so an under-full launch cuts every item into enough chunks to put one on each SM (``ceil(SMs / items)``), never
-    more than the item's tile count (a larger split has an empty chunk, a dead work item, on every item -- the adapter's own bound)
+    tiles each -- so an under-full launch cuts every item into enough chunks to put one on each SM (the FILL rule, ``ceil(SMs / items)``),
+    never more than the item's tile count (a larger split has an empty chunk, a dead work item, on every item -- the adapter's own bound)
     and never more than :data:`SPARSE_DECODE_SPLIT_CAP` = 16 chunks (MEASURED with the pinned combine forms -- Rubin cc 10.7, 212 SMs at
     the 2376 MHz lock, CUDA-graph replay, the decode-grid combine pinned per grid by ``sparse_gqa_sm107._sparse_combine_decode_grid``:
     the B 1 x S_kv 32K x S_q 1 step 39.0 us at split 8 -> 38.1 at 16 -> 37.7 at 17, the B 4 x S_kv 32K x S_q 1 step 37.1 -> 36.2 (16)
@@ -921,20 +921,61 @@ def sparse_decode_split_choice(*, batch: int, h_kv: int, s_q: int, top_k: int, s
     bound at ``top_k`` 512 is 17.  The sweep behind the former cap of 8 (B 4 x 32K x 1: 69.2 / 64.3 / 59.9 / 59.8 / 65.0 us at split
     1 / 2 / 4 / 8 / 17) ran the combine module's OWN forms, the entry compiled without a form -- its knee was that combine's growth
     (2.9 us at 4, 12.2 us at 17); the pinned forms moved the knee and the cap moved with the measurement, never ahead of it), 1 for a
-    launch that already fills the part and for a non-CUDA reading (``sm_count`` 0, declined at ``check_support`` anyway).  A PERFORMANCE choice only (the fp32 partials ride the workspace, the
-    combine is one more launch): the same function under every value, so a caller may pin any split in ``[1, ceil((top_k + 1) / 32)]``
-    (the cap binds the DEFAULT only)."""
+    non-CUDA reading (``sm_count`` 0, declined at ``check_support`` anyway).
+
+    THE WAVE RULE (2026-10-21): where the fill rule's pick overflows ONE wave of SMs (``B x H_kv x S_q x split > SMs``) the launch pays
+    its tail wave in full -- a CTA streams its chunk serially, so 256 equal items on 212 SMs cost two item durations, not 1.2 (the
+    block's end-to-end census on a Rubin cc 10.7 part, 212 SMs at the 2376 MHz lock, CUDA-graph replay, the 24 / 2 geometry at
+    ``top_k`` 512: the T 128 step (B 32 x S_q 4) runs its 256 unsplit 17-tile items in two waves, 64.7 / 69.0 / 70.9 us at KV 8K / 32K /
+    128K; B 32 x S_q 1 at the fill rule's 4 runs 256 chunk-items of 5 / 4 / 4 / 4 tiles in 1.2 waves, 19.2-19.3 us; B 4 x S_q 4 at its
+    7 runs 224 chunk-items of 3 / 3 / 3 / 2 / 2 / 2 / 2 tiles in 1.06 waves, 13.3-14.7 us) -- so the split is then the one in
+    ``[1, min(ceil((top_k + 1) / 32), SPARSE_DECODE_SPLIT_CAP)]`` that minimizes
+    ``ceil(items x split / SMs) x (ceil(tiles / split) + SPARSE_DECODE_SPLIT_ITEM_COST_TILES)`` (:func:`sparse_decode_split_rounds`: the
+    waves the launch takes, times the tiles a chunk streams plus the chunk-item's fixed cost in tile units -- its Q and ids loads, the
+    KV ring's first fill and the epilogue, about one tile's streaming time: the dense decode model's per-CTA term), ties to the SMALLER
+    split (fewer partials for the combine, fewer item ramps).  What falls out on the measured cells: T 128 1 -> 3 (768 chunk-items of
+    6 / 6 / 5 tiles: 4 waves x 7 = 28 against 2 x 18 = 36; the bare waves x tiles count would pick 9 -- 2304 two-tile items in 11 waves
+    -- which the item term rules out), B 32 x S_q 1 4 -> 3 (192 chunk-items, ONE wave of 6 / 6 / 5: 7 against 2 x 6), B 4 x S_q 4 7 -> 6
+    (192 chunk-items, one wave of 3 / 3 / 3 / 3 / 3 / 2: 4 against 2 x 4); the rule can also UNDO a split (150 items: the fill rule's 2 =
+    300 chunk-items in two waves, 20; unsplit one wave of 17, 18).  Every launch the fill rule keeps in one wave -- every B <= 4 x S_q 1
+    cell and B 1 x S_q 4, the measured 16s -- is untouched, bitwise.  The combine form a moved cell takes is the pinned one
+    (``sparse_gqa_sm107._sparse_combine_decode_grid``): the lean group walk at B 32 x 24 heads at split 3 as at 4, the combine module's
+    own forms at B 4 x S_q 4 at split 6 as at 7.  A MODEL until the end-to-end gate measures the moved cells against their former split
+    (``decode_split_kv=`` pins either).
+
+    A PERFORMANCE choice only (the fp32 partials ride the workspace, the combine is one more launch): the same function under every
+    value, so a caller may pin any split in ``[1, ceil((top_k + 1) / 32)]`` (the cap binds the DEFAULT only)."""
     max_tiles = -(-(int(top_k) + 1) // 32)
     if int(sm_count) <= 0:
         return 1
+    sms = int(sm_count)
     units = max(int(batch) * int(h_kv) * int(s_q), 1)
-    return max(1, min(max_tiles, SPARSE_DECODE_SPLIT_CAP, -(-int(sm_count) // units)))
+    fill = max(1, min(max_tiles, SPARSE_DECODE_SPLIT_CAP, -(-sms // units)))
+    if units * fill <= sms:
+        return fill  # ONE wave: the fill rule as measured, bitwise
+    # a SECOND wave: the split that costs the fewest tile rounds over the launch's waves; ties to the smaller split
+    cap = max(1, min(max_tiles, SPARSE_DECODE_SPLIT_CAP))
+    return min(range(1, cap + 1), key=lambda s: (sparse_decode_split_rounds(units=units, split=s, max_tiles=max_tiles, sm_count=sms), s))
+
+
+def sparse_decode_split_rounds(*, units: int, split: int, max_tiles: int, sm_count: int) -> int:
+    """The wave rule's price of ``split`` (:func:`sparse_decode_split_choice`), in 32-row-tile units (MODEL): ``ceil(units x split /
+    sm_count)`` waves of SMs -- a CTA streams its chunk serially, so a launch past one wave pays every wave in full --, each streaming
+    ``ceil(max_tiles / split)`` tiles plus :data:`SPARSE_DECODE_SPLIT_ITEM_COST_TILES` per chunk-item."""
+    waves = -(-(int(units) * int(split)) // int(sm_count))
+    return waves * (-(-int(max_tiles) // int(split)) + SPARSE_DECODE_SPLIT_ITEM_COST_TILES)
 
 
 SPARSE_DECODE_SPLIT_CAP = (
     16  # the fill rule's cap on the DEFAULT split of the block-sparse decode mode: the B 1 / B 4 x 32K x S_q 1 sweeps above, taken with
     # the pinned decode-grid combine on a 212-SM cc 10.7 part (the former cap of 8 came from the combine module's own forms, whose cost
-    # grew with the partial count); a pinned split may exceed it, up to the item's tile count
+    # grew with the partial count); a pinned split may exceed it, up to the item's tile count; the wave rule's candidates stop at it too
+)
+SPARSE_DECODE_SPLIT_ITEM_COST_TILES = (
+    1  # the wave rule's fixed cost per chunk-item in 32-row-tile units (MODEL): the item's Q and ids loads, the KV ring's first fill and
+    # the epilogue -- about one tile's streaming time (the sparse core's own B = 1 calibration: ~2900-3400 clocks per K + V tile pair) --
+    # the term that keeps the rule from cutting a 17-tile item into two-tile chunks (T 128: split 9's 2304 chunk-items in 11 waves
+    # against split 3's 768 in 4); the gate's A/B of the moved cells against their former split is what refits it
 )
 
 
@@ -7688,7 +7729,8 @@ _SPARSE_DECODE_REQUIRES = (
     "(row j sees the listed blocks plus every token from the step-0 tail start to its own position); 'per_row' -- any S_q, one list per row, block_ids [B, S_q, top_k] / "
     "[B x S_q, top_k] (+ block_lens [B, S_q] / [B x S_q]) at positions kv_lens[b] - S_q + j (the serving stacks' per-row selection; the extend-with-prefix form); "
     "None = 'shared' at S_q <= 4 and 'per_row' past it",
-    "decode_split_kv=None (the fill rule: ceil(SMs / (B x H_kv x S_q)) chunks, at most min(16, ceil((top_k + 1) / 32))) or an int in [1, ceil((top_k + 1) / 32)]: performance only",
+    "decode_split_kv=None (the fill rule: ceil(SMs / (B x H_kv x S_q)) chunks, at most min(16, ceil((top_k + 1) / 32)); where that fill leaves a second wave of SMs, "
+    "the wave rule's split: the fewest waves x (tiles per chunk + 1) under the same cap) or an int in [1, ceil((top_k + 1) / 32)]: performance only",
     "execute(block_table=, kv_lens=, k_cache=, v_cache=, slot_mapping=, block_ids=[, block_lens=]) with seq_lens=None (kv_lens binds the KV side only; a row at a negative position is dead)",
     "kv_cache_dtype=None (bf16 / f16 pools) or torch.float8_e4m3fn (bf16 activations, S_q <= 4, return_lse=False, decode_split_kv None / 1, fuse_norm_rope=False, "
     "inplace_qkv None / False: the pools' e4m3 codes under per-tensor fp32 k_scale / v_scale at execute -- the write-through quantizes, the step reads through the "

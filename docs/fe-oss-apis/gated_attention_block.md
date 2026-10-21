@@ -1243,7 +1243,7 @@ decode-tile route).  What differs from the dense form:
 `sample_block_table` must be CONTIGUOUS (the sparse core binds the whole `[B, max_pages]` table, and `execute(block_table=)` is
 exactly that table -- a row slice of a wider table is a typed `ValueError`); `return_lse` is served (`[B, H_q, S_q]` fp32,
 natural log); `fuse_gate` is served at every split (the core's epilogue unsplit, the split combine otherwise); `decode_split_kv`
-is `None` (the fill rule: `ceil(SMs / (B x H_kv x S_q))` chunks, at most `min(16, ceil((top_k + 1) / 32))` -- the cap from the B 1 / B 4 x 32K x S_q 1 split sweeps on a 212-SM part with the pinned decode-grid combine) or an int in
+is `None` (the fill rule: `ceil(SMs / (B x H_kv x S_q))` chunks, at most `min(16, ceil((top_k + 1) / 32))` -- the cap from the B 1 / B 4 x 32K x S_q 1 split sweeps on a 212-SM part with the pinned decode-grid combine; where that fill leaves a second wave of SMs (`B x H_kv x S_q x split > SMs`: a CTA streams its chunk serially, so 256 equal items on 212 SMs cost two item durations) the wave rule takes the split in `[1, that cap]` with the fewest `waves x (tiles per chunk + 1)`, ties to the smaller -- on a 212-SM part the T 128 step 3 chunks instead of none, B 32 x S_q 1 3 instead of 4, B 4 x S_q 4 6 instead of 7, every one-wave launch its fill-rule split) or an int in
 `[1, ceil((top_k + 1) / 32)]` -- the one performance knob (fp32 partials inside `get_workspace_size()`, one combine launch), the
 same function under every value; `max_kv_len` keeps its contract (at most the table's reach).  Typed declines: the packed
 (`thd=True`) form (the serving table's `sparse` row: the sparse core serves packed sequences and paged pools one at a time), the
