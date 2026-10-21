@@ -1406,26 +1406,40 @@ def compile_qsa_topk_decode(
         _FAKE_STREAM = make_fake_stream(use_tvm_ffi_env_stream=False)
     key = (cols_cap, top_k, cluster_ctas, threads_per_cta, bool(use_pdl), device)
     if key not in compiled_cache:
-        # the in-process memo; behind it the persistent compiled-plan cache keyed by this file's digest + the key's plain values
+        # the in-process memo; behind it the persistent compiled-plan cache keyed by this file's digest + the key's plain values;
+        # the compile runs with the plan device current (its context), so the DSL's compile-target auto-detect sees the device the
+        # constants above were taken from -- a build_device() scope or the tensors' device of the convenience entry, not whichever
+        # GPU the caller left current
         cache_key = template_key(globals(), {"key": key}, "compile_qsa_topk_decode")
-        compiled_cache[key] = compile_cached(
-            qsa_topk_decode_launch,
-            _fake_rows(cutlass.Int32),  # the fp32 logits enter as their int32 bits (a view at the launch boundary)
-            cute.runtime.make_fake_compact_tensor(dtype=cutlass.Int32, shape=(cute.sym_int(),), stride_order=(0,), assumed_align=4),
-            _fake_rows(cutlass.Int32),
-            cutlass.Int32(1),  # rows: runtime, the literal pins the type
-            cols_cap,
-            top_k,
-            cluster_ctas,
-            threads_per_cta,
-            bool(use_pdl),
-            smem_bytes,
-            _FAKE_STREAM,
-            options="--enable-tvm-ffi",
-            cache_key=cache_key,
-            symbol="cudnn_qsa_topk_decode",
-        )
+        with torch.cuda.device(device):
+            compiled_cache[key] = _compile_for(cache_key, cols_cap, top_k, cluster_ctas, threads_per_cta, bool(use_pdl), smem_bytes)
     return QsaTopkDecodeRecipe(compiled_cache[key], cols_cap, top_k, cluster_ctas, threads_per_cta, bool(use_pdl), smem_bytes, device)
+
+
+def _compile_for(cache_key, cols_cap, top_k, cluster_ctas, threads_per_cta, use_pdl, smem_bytes):
+    """The one ``compile_cached`` call of :func:`compile_qsa_topk_decode` (split out so the device scope around it reads as one line)."""
+    return compile_cached(
+        qsa_topk_decode_launch,
+        _fake_rows(cutlass.Int32),  # the fp32 logits enter as their int32 bits (a view at the launch boundary)
+        cute.runtime.make_fake_compact_tensor(dtype=cutlass.Int32, shape=(cute.sym_int(),), stride_order=(0,), assumed_align=4),
+        _fake_rows(cutlass.Int32),
+        cutlass.Int32(1),  # rows: runtime, the literal pins the type
+        cols_cap,
+        top_k,
+        cluster_ctas,
+        threads_per_cta,
+        use_pdl,
+        smem_bytes,
+        _FAKE_STREAM,
+        options="--enable-tvm-ffi",
+        cache_key=cache_key,
+        symbol="cudnn_qsa_topk_decode",
+    )
+
+
+def _tensor_device_index(x: torch.Tensor) -> int:
+    """The CUDA ordinal a tensor lives on (a device without an index = the current one)."""
+    return x.device.index if x.device.index is not None else torch.cuda.current_device()
 
 
 def _check_rows(name: str, x: torch.Tensor, *, dtype, rows: int, device) -> None:
@@ -1452,24 +1466,30 @@ def run_qsa_topk_decode(r: QsaTopkDecodeRecipe, logits: torch.Tensor, counts: to
     """
     if not isinstance(counts, torch.Tensor) or counts.ndim != 1 or counts.dtype != torch.int32 or not counts.is_cuda or not counts.is_contiguous():
         raise ValueError("counts must be a contiguous 1-D int32 CUDA tensor")
-    rows = int(counts.shape[0])
-    if rows > MAX_ROWS:
-        raise ValueError(f"counts holds {rows} rows; the launch grid caps the row count at {MAX_ROWS} (one CTA per row along grid.y) -- split the row block")
-    device = counts.device
-    _check_rows("logits", logits, dtype=torch.float32, rows=rows, device=device)
-    _check_rows("block_ids", block_ids, dtype=torch.int32, rows=rows, device=device)
-    n_blocks_max = int(logits.shape[1])
-    if n_blocks_max < 1 or n_blocks_max > r.cols_cap:
-        raise ValueError(f"logits holds {n_blocks_max} columns; this artifact was compiled for cols_cap = {r.cols_cap} (1 <= n_blocks_max <= cols_cap)")
-    if int(block_ids.shape[1]) != r.top_k:
-        raise ValueError(f"block_ids must be [T, top_k = {r.top_k}] for this artifact, got shape {tuple(block_ids.shape)}")
-    dev_index = device.index if device.index is not None else torch.cuda.current_device()
-    if dev_index != r.device:
-        raise ValueError(f"the tensors live on device {dev_index} but the artifact was compiled for device {r.device} (compile per device)")
-    if rows == 0:
-        return
-    handle = int(stream) if stream is not None else torch.cuda.current_stream(device).cuda_stream
-    r.compiled(logits.view(torch.int32), counts, block_ids, cutlass.Int32(rows), cuda.CUstream(handle))
+    # the recipe's device is the plan device: current for the form checks (a refusal restores the caller's device the same way),
+    # the stream selection (``None`` = THAT device's current stream, whose raw handle may be the default-stream sentinel) and the
+    # launch (the prepared host enters with the plan device's context, whichever GPU the caller left current)
+    with torch.cuda.device(r.device):
+        rows = int(counts.shape[0])
+        if rows > MAX_ROWS:
+            raise ValueError(
+                f"counts holds {rows} rows; the launch grid caps the row count at {MAX_ROWS} (one CTA per row along grid.y) -- split the row block"
+            )
+        device = counts.device
+        _check_rows("logits", logits, dtype=torch.float32, rows=rows, device=device)
+        _check_rows("block_ids", block_ids, dtype=torch.int32, rows=rows, device=device)
+        n_blocks_max = int(logits.shape[1])
+        if n_blocks_max < 1 or n_blocks_max > r.cols_cap:
+            raise ValueError(f"logits holds {n_blocks_max} columns; this artifact was compiled for cols_cap = {r.cols_cap} (1 <= n_blocks_max <= cols_cap)")
+        if int(block_ids.shape[1]) != r.top_k:
+            raise ValueError(f"block_ids must be [T, top_k = {r.top_k}] for this artifact, got shape {tuple(block_ids.shape)}")
+        dev_index = _tensor_device_index(counts)
+        if dev_index != r.device:
+            raise ValueError(f"the tensors live on device {dev_index} but the artifact was compiled for device {r.device} (compile per device)")
+        if rows == 0:
+            return
+        handle = int(stream) if stream is not None else torch.cuda.current_stream(r.device).cuda_stream
+        r.compiled(logits.view(torch.int32), counts, block_ids, cutlass.Int32(rows), cuda.CUstream(handle))
 
 
 def qsa_topk_decode(
@@ -1493,23 +1513,27 @@ def qsa_topk_decode(
         raise NotImplementedError(too_old)
     if not isinstance(block_ids, torch.Tensor) or block_ids.ndim != 2:
         raise ValueError("block_ids must be a [T, top_k] int32 CUDA tensor")
-    if not isinstance(logits, torch.Tensor) or logits.ndim != 2:
+    if not isinstance(logits, torch.Tensor) or logits.ndim != 2 or not logits.is_cuda:
         raise ValueError("logits must be a [T, n_blocks_max] fp32 CUDA tensor")
-    if cluster_ctas is None:
-        rows = int(counts.shape[0]) if isinstance(counts, torch.Tensor) and counts.ndim == 1 else 0
-        auto_c, auto_t = default_knobs_for(rows, int(logits.shape[1]), compute_capability(current_device()))
-        # an explicit thread count other than the cluster form's keeps the single-CTA form (the knobs are a pair)
-        cluster_ctas = auto_c if (threads_per_cta is None or int(threads_per_cta) == CLUSTER_THREADS) else 1
-        threads_per_cta = auto_t if threads_per_cta is None else int(threads_per_cta)
-    else:
-        cluster_ctas = int(cluster_ctas)
-        threads_per_cta = (CLUSTER_THREADS if cluster_ctas > 1 else DEFAULT_THREADS_PER_CTA) if threads_per_cta is None else int(threads_per_cta)
-    r = compile_qsa_topk_decode(
-        cols_cap=cols_cap_for(int(logits.shape[1]), cluster_ctas, threads_per_cta),
-        top_k=int(block_ids.shape[1]),
-        cluster_ctas=cluster_ctas,
-        threads_per_cta=threads_per_cta,
-        use_pdl=use_pdl,
-    )
-    run_qsa_topk_decode(r, logits, counts, block_ids, stream=stream)
+    # the plan device is the TENSORS' device (``logits``; the lowered launch checks the other two against it), not whichever GPU
+    # is current: the knob pick's capability, the compile and the launch all run with it current, the caller's device restored
+    # after -- also when a form check refuses
+    with torch.cuda.device(_tensor_device_index(logits)):
+        if cluster_ctas is None:
+            rows = int(counts.shape[0]) if isinstance(counts, torch.Tensor) and counts.ndim == 1 else 0
+            auto_c, auto_t = default_knobs_for(rows, int(logits.shape[1]), compute_capability(current_device()))
+            # an explicit thread count other than the cluster form's keeps the single-CTA form (the knobs are a pair)
+            cluster_ctas = auto_c if (threads_per_cta is None or int(threads_per_cta) == CLUSTER_THREADS) else 1
+            threads_per_cta = auto_t if threads_per_cta is None else int(threads_per_cta)
+        else:
+            cluster_ctas = int(cluster_ctas)
+            threads_per_cta = (CLUSTER_THREADS if cluster_ctas > 1 else DEFAULT_THREADS_PER_CTA) if threads_per_cta is None else int(threads_per_cta)
+        r = compile_qsa_topk_decode(
+            cols_cap=cols_cap_for(int(logits.shape[1]), cluster_ctas, threads_per_cta),
+            top_k=int(block_ids.shape[1]),
+            cluster_ctas=cluster_ctas,
+            threads_per_cta=threads_per_cta,
+            use_pdl=use_pdl,
+        )
+        run_qsa_topk_decode(r, logits, counts, block_ids, stream=stream)
     return block_ids

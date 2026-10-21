@@ -392,6 +392,57 @@ def test_columns_past_the_count_may_hold_anything_and_a_short_row_in_a_wide_bloc
 
 
 @needs_cuda
+@needs_dsl_target
+@pytest.mark.parametrize("explicit_stream", (False, True))
+def test_entry_points_select_the_tensors_device_with_another_device_current(explicit_stream):
+    """The plan device is the TENSORS' device, not whichever GPU is current: the convenience entry compiles for and launches on the
+    tensors' device while another one is current, the lowered launch enters the recipe device's context (its current stream when
+    none is given, the handed one otherwise) and restores the caller's device -- also when a form check refuses.  Skips with one
+    visible GPU."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two CUDA devices")
+    target = torch.cuda.current_device()
+    other = next(i for i in range(torch.cuda.device_count()) if i != target)
+    device = torch.device("cuda", target)
+    logits, counts = _case(6, 8192, K, seed=61, device=device)
+    ref = reference_canonical(logits, counts, K)
+    side = torch.cuda.Stream(device=target)
+    side.wait_stream(torch.cuda.current_stream(target))
+    handed = side.cuda_stream if explicit_stream else None
+    # (a) the convenience entry with another device current: compiled for the tensors' device, launched there, the caller restored
+    out = torch.full((6, K), SENTINEL, dtype=torch.int32, device=device)
+    with torch.cuda.device(other):
+        topk_mod.qsa_topk_decode(logits, counts, out, stream=handed)
+        assert torch.cuda.current_device() == other, "the caller's device must be restored"
+    torch.cuda.synchronize(target)
+    assert torch.equal(out, ref), "the convenience entry served tensors on a device other than the current one"
+    # (b) the lowered launch: a recipe compiled for `target` (as an engine's build would), executed with `other` current -- the launch
+    # must run in the recipe device's context, on that device's current stream when none is handed
+    r = topk_mod.compile_qsa_topk_decode(cols_cap=8192, top_k=K)
+    assert r.device == target
+    real = r.compiled
+    expected = (side if explicit_stream else torch.cuda.current_stream(target)).cuda_stream
+
+    def checked(*args):
+        assert torch.cuda.current_device() == target, "the launch must run in the recipe device's context"
+        assert int(args[-1]) == expected, "the stream must be the recipe device's current stream (or the handed one)"
+        return real(*args)
+
+    r2 = r._replace(compiled=checked)
+    out2 = torch.full((6, K), SENTINEL, dtype=torch.int32, device=device)
+    with torch.cuda.device(other):
+        topk_mod.run_qsa_topk_decode(r2, logits, counts, out2, stream=handed)
+        assert torch.cuda.current_device() == other
+    torch.cuda.synchronize(target)
+    assert torch.equal(out2, ref)
+    # (c) a form check that refuses restores the caller's device too
+    with torch.cuda.device(other):
+        with pytest.raises(ValueError, match="dtype"):
+            topk_mod.run_qsa_topk_decode(r2, logits.half(), counts, out2, stream=handed)
+        assert torch.cuda.current_device() == other
+
+
+@needs_cuda
 @needs_pdl_gpu
 @needs_dsl_target
 def test_use_pdl_arm_is_bitwise_the_plain_arm():
