@@ -67,8 +67,10 @@ the launch stream through events, overlapping the SDPA backward chain) -- see [B
   pools from the same registers -- every output bitwise the two-stage form, one launch fewer (two with the indexer band).
   In-place bf16 / f16 only, on the dense declaration with the write-through alone; `fuse_norm_rope` together with it is a typed
   decline (pick one), as are `thd=True` and `kv_source="paged"` (the prepare kernel's packed and paged arms are follow-ups) and
-  `kv_cache_dtype=torch.float8_e4m3fn` (the e4m3 cache's write-through quantizes in its own stage).  `use_pdl=True` launches the
-  fused stage with the programmatic-dependent-launch attribute, as it does the two stages it replaces.  See "Serving: write-through".
+  `kv_cache_dtype=torch.float8_e4m3fn` (the e4m3 cache's write-through quantizes in its own stage); a geometry with `rope_dim=0`
+  (RMSNorm only) is a `ValueError` at `check_support` naming the zero-width RoPE table operands the fused launch would bind.
+  `use_pdl=True` launches the fused stage with the programmatic-dependent-launch attribute, as it does the two stages it replaces.
+  See "Serving: write-through".
 
 With both on, the block is **three launches**: `proj(+norm+RoPE[+quant]) -> sdpa(+gate) -> out_proj`.
 
@@ -575,7 +577,10 @@ the installed version, before the kernel module is imported.
 otherwise) and not `fuse_norm_rope` (a typed `NotImplementedError`: the norm + RoPE already live in the projection epilogue
 there); `thd=True`, `kv_source="paged"` and `kv_cache_dtype=torch.float8_e4m3fn` together with it are typed `NotImplementedError`s
 naming the knob (the prepare kernel's packed and paged arms are follow-ups; the e4m3 cache's write-through quantizes in its own
-stage).  The fused stage takes `use_pdl` as the two stages it replaces do (the attribute and the kernel's griddepcontrol pair).  Its
+stage); `rope_dim=0` with the knob is a `ValueError` at `check_support`, with or without `qk_norm`, naming the zero-width RoPE table
+operands: the fused launch binds `cos` / `sin` as `[T, rope_dim]` operands and its artifact is traced with one-column tables, so a
+`[T, 0]` table is not an operand it takes.  The fused stage takes `use_pdl` as the two stages it replaces do (the attribute and the
+kernel's griddepcontrol pair).  Its
 kernel (`kernels/qsa_prepare.py`) also carries the indexer's decode-step arms -- the queries' norm + RoPE, the raw-key ring and
 the incremental compress of the compressed-key cache -- which the block binds when its decode mode lands.
 

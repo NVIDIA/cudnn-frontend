@@ -23,6 +23,7 @@ with the band) shorter.
 """
 
 import os
+import re
 import sys
 
 import pytest
@@ -674,13 +675,54 @@ def test_fuse_prepare_declaration_rows():
     assert not plain.fuse_prepare and plain._prepare is None
 
 
+# The fused stage's rope_dim == 0 decline, verbatim (the cells below pin the EXACT message: it names the zero-width table operands).
+_ROPE_DIM_ZERO_DECLINE = (
+    "qsa_prepare: fuse_prepare=True with geometry.rope_dim=0: the fused launch would bind the RoPE tables cos / sin as zero-width "
+    "[T, 0] operands, which its artifact (traced with one-column tables) does not take -- the knob needs rope_dim > 0 (with or without qk_norm)"
+)
+
+
+@pytest.mark.parametrize("qk_norm", [True, False], ids=["rmsnorm_only", "no_norm_no_rope"])
+def test_fuse_prepare_declines_every_rope_dim_zero_geometry(qk_norm):
+    """``rope_dim=0`` under the knob is ONE typed ``ValueError`` naming the zero-width RoPE table operands, with and without ``qk_norm``
+    (the exact message): the fused launch binds ``cos`` / ``sin`` as ``[T, rope_dim]`` operands and its artifact is traced with one-column
+    tables, so a ``[T, 0]`` table is not an operand it takes -- the stage declines at ``check_support`` (device-free) instead of letting a
+    shape mismatch surface at the launch.  Pinned on the stage alone and on the stage the block built.  Through the block's own
+    ``check_support``, the RMSNorm-only geometry (``qk_norm=True``) is a legal declaration that reaches the stage (the Rubin cell below),
+    while ``qk_norm=False`` with ``rope_dim=0`` is the geometry's own decline first (``validate()``: an identity copy of Q / K), before any
+    stage is asked."""
+    geom_kw = dict(_SMALL_D256, rope_dim=0, qk_norm=qk_norm)
+    stage = _QsaPrepare(GatedAttentionBlockGeometry(**geom_kw), batch=1, seq_len=64, dtype=BF16, page_size=16)  # validate() runs at check_support
+    with pytest.raises(ValueError, match=re.escape(_ROPE_DIM_ZERO_DECLINE)):
+        stage.check_support()
+    blk, *_ = _make_block(geom_kw, 1, 64, paged_kv_page_size=16, fuse_prepare=True)  # the dense constructor declares; the geometry's rows run at check_support
+    assert isinstance(blk._prepare, _QsaPrepare)
+    with pytest.raises(ValueError, match=re.escape(_ROPE_DIM_ZERO_DECLINE)):
+        blk._prepare.check_support()
+    if not qk_norm:
+        # through the block, the geometry's own row (an identity copy of Q / K) is declined before any stage is asked -- device-agnostic
+        with pytest.raises(ValueError, match="qk_norm=False with rope_dim=0 leaves stage"):
+            blk.check_support()
+
+
+@requires_rubin
+def test_rmsnorm_only_block_with_fuse_prepare_is_declined_at_check_support():
+    """Through the block's own ``check_support`` (its stage loop, which the projection and SDPA engines admit on Rubin): the RMSNorm-only
+    block declared with the knob is the fused stage's exact decline, and the same declaration without the knob passes the plan check --
+    the decline is the knob's, not the geometry's."""
+    blk, *_ = _make_block(dict(_SMALL_D256, rope_dim=0), 1, 64, paged_kv_page_size=16, fuse_prepare=True)
+    with pytest.raises(ValueError, match=re.escape(_ROPE_DIM_ZERO_DECLINE)):
+        blk.check_support()
+    plain, *_ = _make_block(dict(_SMALL_D256, rope_dim=0), 1, 64, paged_kv_page_size=16)
+    assert plain.check_support() is True
+
+
 def _assert_prepare_compiles_with_pdl(stage, expected, monkeypatch):
     """``_QsaPrepare.compile`` hands ``use_pdl`` to ``compile_qsa_prepare`` for BOTH slot recipes (the flag is a compile key of the
-    kernel: the launch attribute and the griddepcontrol pair are traced in), recorded through the kernel module's entry -- no device."""
-    import cudnn.gated_attention_block.kernels.qsa_prepare as kernel_module
-
+    kernel: the launch attribute and the griddepcontrol pair are traced in), recorded through the kernel module's entry (patched by its
+    dotted path: the module is imported once, at the top of this file, in one form) -- no device."""
     seen = []
-    monkeypatch.setattr(kernel_module, "compile_qsa_prepare", lambda **kw: seen.append(kw) or ("recipe", kw["slot_dtype"]))
+    monkeypatch.setattr("cudnn.gated_attention_block.kernels.qsa_prepare.compile_qsa_prepare", lambda **kw: seen.append(kw) or ("recipe", kw["slot_dtype"]))
     stage.compile()
     assert sorted((kw["slot_dtype"] for kw in seen), key=str) == [torch.int32, torch.int64]
     assert [kw["use_pdl"] for kw in seen] == [expected, expected], seen

@@ -5988,7 +5988,8 @@ class _QsaPrepare(_Stage):
 
     No SMEM, no mbarrier (the kernel's module docstring: both pre-development tables empty by construction).  Needs no
     workspace -- the pools and the slot mapping are the caller's -- so ``get_workspace_size`` is the unfused block's.
-    ``geometry.qk_norm=False`` traces the RoPE-only arm (the weight slots ``None``, as ``_QkNormRope`` does).  ``use_pdl`` (the
+    ``geometry.qk_norm=False`` traces the RoPE-only arm (the weight slots ``None``, as ``_QkNormRope`` does); ``geometry.rope_dim=0`` is a
+    typed decline at ``check_support`` with or without ``qk_norm`` (the tables would be zero-width operands).  ``use_pdl`` (the
     block's resolved switch) launches it with the programmatic-dependent-launch attribute and traces the kernel's griddepcontrol
     pair, as the two stages it replaces do.
     """
@@ -6025,9 +6026,13 @@ class _QsaPrepare(_Stage):
         g = self.geom
         if self.dtype not in (torch.bfloat16, torch.float16):
             raise NotImplementedError(f"{self.name}: bf16 / f16 only (the activation dtype of the slab and the pools), got {self.dtype}")
-        if not g.qk_norm and g.rope_dim == 0:
+        if g.rope_dim == 0:
+            # Every rope_dim == 0 geometry, with or without qk_norm: the kernel binds cos / sin as [T, rope_dim] operands and its artifact
+            # is traced with one-column tables (`table_dim = rope_dim if rope_dim else 1`), so the [T, 0] tables execute would hand it are
+            # not operands it takes -- a typed decline here, not a shape mismatch at the launch.
             raise ValueError(
-                f"{self.name}: geometry.qk_norm=False with rope_dim=0 leaves no norm and no RoPE to fuse with the write-through; drop fuse_prepare"
+                f"{self.name}: fuse_prepare=True with geometry.rope_dim=0: the fused launch would bind the RoPE tables cos / sin as zero-width "
+                "[T, 0] operands, which its artifact (traced with one-column tables) does not take -- the knob needs rope_dim > 0 (with or without qk_norm)"
             )
         validate_prepare_shape(g.d_head, g.rope_dim, self.page_size, _ELEMENTWISE_THREADS, g.qsa.index_head_dim if self.index_band else None)
 

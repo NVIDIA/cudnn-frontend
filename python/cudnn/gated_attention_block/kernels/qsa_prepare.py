@@ -359,7 +359,7 @@ def frost_qsa_prepare(
             src_addr = mIQsrc.iterator.toint() + (token64 * cutlass.Int64(mIQsrc.stride[0]) + head64 * cutlass.Int64(mIQsrc.stride[1])) * bpe
             # pool = 1: acc = 0 + x, pooled = acc * 1.0 -- the compress kernel's own arithmetic, kept so the bits agree.
             acc = []
-            for c in cutlass.range_constexpr(chunks_i):
+            for _ in cutlass.range_constexpr(chunks_i):
                 acc.append([cutlass.Float32(0.0)] * ELEMS_PER_ACCESS)
             for c in cutlass.range_constexpr(chunks_i):
                 coff = cutlass.Int64((c * lanes_i) * ACCESS_BYTES) + lane_off
@@ -471,7 +471,7 @@ def frost_qsa_prepare(
                 # pool the block's rows in POSITION order: below pos0 from the ring, at or above it from this step's rows
                 seq_base = mIKsrc.iterator.toint() + (b * s_q).to(cutlass.Int64) * raw_tok
                 acc = []
-                for c in cutlass.range_constexpr(chunks_i):
+                for _ in cutlass.range_constexpr(chunks_i):
                     acc.append([cutlass.Float32(0.0)] * ELEMS_PER_ACCESS)
                 for r in cutlass.range_constexpr(pool):
                     q = tok0 + cutlass.Int32(r)
