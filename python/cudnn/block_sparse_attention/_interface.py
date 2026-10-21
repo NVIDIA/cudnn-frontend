@@ -1616,6 +1616,9 @@ def bsa_attn_fwd_blk64_cutedsl(
     is_persistent = use_clc_scheduler
     pack_gqa = False
     input_layout = "bhsd_native"
+    # Short/medium KV lists are dominated by the per-tile ramp, which short_tile_opt shortens; near-dense lists (capacity of the
+    # sparse index >= 90% of the KV blocks, known on the host without a sync) hide the ramp and keep the original schedule.
+    short_tile_opt = int(q2k_block_index.shape[-1]) * 10 < ((seqlen_k + sparse_block_size - 1) // sparse_block_size) * 9
 
     split_offsets = None
     if kv_splits_i > 1:
@@ -1684,6 +1687,7 @@ def bsa_attn_fwd_blk64_cutedsl(
             use_int64_kv_strides,
             is_sage_fp8,
             nonpositive_scale,
+            short_tile_opt,
         ),
         (
             q_bhsd,
@@ -1728,6 +1732,7 @@ def bsa_attn_fwd_blk64_cutedsl(
             use_exact_kv_layout=use_exact_kv_layout,
             use_int64_kv_strides=use_int64_kv_strides,
             nonpositive_scale=nonpositive_scale,
+            short_tile_opt=short_tile_opt,
         )
 
         bsa_attn_fwd_blk64_cutedsl.compile_cache[compile_key] = cute.compile(
