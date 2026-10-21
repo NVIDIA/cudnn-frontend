@@ -23,7 +23,7 @@ def qsa_forward(
     block_last: Tensor,
     scale: float,
     block_size: int = 4,
-) -> tuple[Tensor, Tensor, Tensor]:
+) -> TupleDict:
     ...  # out, out_fp32, lse
 
 def qsa_backward(
@@ -42,7 +42,7 @@ def qsa_backward(
     block_last: Tensor,
     scale: float,
     block_size: int = 4,
-) -> tuple[Tensor, Tensor, Tensor]:
+) -> TupleDict:
     ...  # dq, dk, dv
 ```
 
