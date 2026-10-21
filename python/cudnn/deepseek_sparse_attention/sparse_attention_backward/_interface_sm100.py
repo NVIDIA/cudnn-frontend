@@ -199,6 +199,15 @@ def _fake_compact_tensor(dtype, shape, alignment=16):
     )
 
 
+def _fake_runtime_tensor(dtype, rank, *, divisibility=1, alignment=16):
+    """Mirror the dynamic DLPack tensor type rebound by the plan executor."""
+    shape = [cute.sym_int() for _ in range(rank)]
+    if divisibility != 1:
+        shape[-1] = cute.sym_int(divisibility=divisibility)
+    stride = [cute.sym_int64(divisibility=divisibility) for _ in range(rank - 1)] + [1]
+    return cute.runtime.make_fake_tensor(dtype, tuple(shape), tuple(stride), assumed_align=alignment)
+
+
 def _compile_sm100_artifact(
     device_index: int,
     device_capability: Tuple[int, int],
@@ -214,16 +223,20 @@ def _compile_sm100_artifact(
     dkv_planes: int,
 ):
     """Build an SM100 launchable from tensor metadata without allocating storage."""
-    total_s_q, total_s_kv = cute.sym_int(), cute.sym_int()
-    q = _fake_compact_tensor(element_dtype, (total_s_q, num_heads, head_dim))
-    kv = _fake_compact_tensor(element_dtype, (total_s_kv, head_dim))
-    out = _fake_compact_tensor(element_dtype, (total_s_q, num_heads, head_dim_v))
-    lse = _fake_compact_tensor(cutlass.Float32, (total_s_q, num_heads), alignment=8)
-    sink = _fake_compact_tensor(cutlass.Float32, (num_heads,))
+    total_s_q = cute.sym_int()
+    q = _fake_runtime_tensor(element_dtype, 3, divisibility=head_dim)
+    kv = _fake_runtime_tensor(element_dtype, 2, divisibility=head_dim)
+    out = _fake_runtime_tensor(element_dtype, 3, divisibility=head_dim_v)
+    dout = _fake_runtime_tensor(element_dtype, 3, divisibility=head_dim_v)
+    lse = _fake_runtime_tensor(cutlass.Float32, 2, alignment=8)
+    sink = _fake_runtime_tensor(cutlass.Float32, 1)
     indices = _fake_compact_tensor(cutlass.Int32, (total_s_q, max_topk))
-    lengths = _fake_compact_tensor(cutlass.Int32, (total_s_q,), alignment=4) if has_topk_length else None
-    workspace_lse = _fake_compact_tensor(cutlass.Uint8, (1, num_heads, cute.sym_int(), 8))
-    workspace_dkv = _fake_compact_tensor(cutlass.Uint8, (1, dkv_planes, cute.sym_int(), head_dim * 4))
+    lengths = _fake_runtime_tensor(cutlass.Int32, 1, alignment=4) if has_topk_length else None
+    dq = _fake_runtime_tensor(element_dtype, 3, divisibility=head_dim)
+    dkv = _fake_runtime_tensor(element_dtype, 2, divisibility=head_dim)
+    d_sink = _fake_runtime_tensor(cutlass.Float32, 1)
+    workspace_lse = _fake_runtime_tensor(cutlass.Uint8, 4)
+    workspace_dkv = _fake_runtime_tensor(cutlass.Uint8, 4)
     problem_shape = (
         cutlass.Int32(1),
         cutlass.Int32(1),
@@ -244,14 +257,14 @@ def _compile_sm100_artifact(
             q,
             kv,
             out,
-            out,
+            dout,
             lse,
             sink,
             indices,
             lengths,
-            q,
-            kv,
-            sink,
+            dq,
+            dkv,
+            d_sink,
             workspace_lse,
             workspace_dkv,
             cutlass.Float32(1.0),

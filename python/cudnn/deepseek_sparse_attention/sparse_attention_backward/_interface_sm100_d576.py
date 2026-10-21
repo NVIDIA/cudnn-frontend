@@ -74,13 +74,25 @@ def _compile_d576_2cta(
         """Fake compact row-major tensor whose leading extent stays symbolic."""
         return cute.runtime.make_fake_compact_tensor(dtype, shape, stride_order=tuple(reversed(range(len(shape)))), assumed_align=alignment)
 
-    q = tensor(cutlass.BFloat16, (sq, num_heads, 576))
-    kv = tensor(cutlass.BFloat16, (skv, 576))
-    out = tensor(cutlass.BFloat16, (sq, num_heads, 512))
-    lse = tensor(cutlass.Float32, (sq, num_heads), 8)
-    sink = tensor(cutlass.Float32, (num_heads,))
+    def runtime_tensor(dtype, rank, alignment=16, divisibility=1):
+        """Mirror the dynamic DLPack tensor type rebound by the executor."""
+        shape = [cute.sym_int() for _ in range(rank)]
+        if divisibility != 1:
+            shape[-1] = cute.sym_int(divisibility=divisibility)
+        stride = [cute.sym_int64(divisibility=divisibility) for _ in range(rank - 1)] + [1]
+        return cute.runtime.make_fake_tensor(dtype, tuple(shape), tuple(stride), assumed_align=alignment)
+
+    q = runtime_tensor(cutlass.BFloat16, 3, divisibility=576)
+    kv = runtime_tensor(cutlass.BFloat16, 2, divisibility=576)
+    out = runtime_tensor(cutlass.BFloat16, 3, divisibility=512)
+    dout = runtime_tensor(cutlass.BFloat16, 3, divisibility=512)
+    lse = runtime_tensor(cutlass.Float32, 2, 8)
+    sink = runtime_tensor(cutlass.Float32, 1)
     indices = tensor(cutlass.Int32, (sq, max_topk))
-    lengths = tensor(cutlass.Int32, (sq,), 4) if has_topk_length else None
+    lengths = runtime_tensor(cutlass.Int32, 1, 4) if has_topk_length else None
+    dq = runtime_tensor(cutlass.BFloat16, 3, divisibility=576)
+    dkv = runtime_tensor(cutlass.BFloat16, 2, divisibility=576)
+    d_sink = runtime_tensor(cutlass.Float32, 1)
     # Deterministic dKV scratch exceeds 2 GiB for long sequences. Its byte
     # extent must remain wide when TVM-FFI binds the caller-owned workspace.
     stats_workspace = tensor(cutlass.Uint8, (cute.sym_int64(),))
@@ -104,14 +116,14 @@ def _compile_d576_2cta(
         q,
         kv,
         out,
-        out,
+        dout,
         lse,
         sink,
         indices,
         lengths,
-        q,
-        kv,
-        sink,
+        dq,
+        dkv,
+        d_sink,
         stats_workspace,
         dkv_workspace,
         cutlass.Float32(1.0),
