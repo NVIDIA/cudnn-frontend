@@ -24,6 +24,9 @@ Either way, ``F.scaled_dot_product_attention`` under
 (pygraph + engine Router: FROST OSS kernels or cuDNN-backend engines), with
 hybrid fallback to the existing implementations for configurations the
 python path does not serve yet.
+
+On torch < 2.13 (no registry, no varlen ops), ``cudnn.torch.install()``
+applies the ``F.scaled_dot_product_attention`` overrides directly.
 """
 
 from cudnn.torch.sdpa_provider import SdpaOverrides, calls, install, install_sdpa_overrides, served_plan_names  # noqa: F401

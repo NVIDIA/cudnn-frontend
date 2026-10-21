@@ -329,7 +329,7 @@ def _register_with_torch() -> None:
     try:
         from torch.nn.attention import register_flash_attention_impl
     except ImportError:
-        return  # torch < 2.13: use install_sdpa_overrides() directly
+        return  # torch < 2.13: use install() directly
     register_flash_attention_impl("CUDNN", register_fn=install_sdpa_overrides)
 
 
