@@ -49,7 +49,8 @@ preallocated gather-only forward, backward prep/main/finish, and combined backwa
 kernel timings. Forward components do not describe the public dense route.
 These use eager launches with prebuilt IDs and buffers. Backward
 accumulators are reset before each main-kernel sample, outside its timed region.
-Component sums need not equal full-call timings; the full call remains primary.
+The isolated backward main excludes the public nonfinite scan and fallback
+dispatch. Component sums need not equal full-call timings; the full call remains primary.
 
 Memory fields give live bytes before each pass, peak allocated/reserved bytes,
 and peak extra allocation. At 128K, the bitmap needs 4 GiB and forward int32 IDs

@@ -125,7 +125,11 @@ def frost_qsa_bprop_sm100(
     scale: F32,
     HQ: cutlass.Constexpr[int],
     HKV: cutlass.Constexpr[int],
+    nonfinite,
 ):
+    if cutlass.const_expr(nonfinite is not None):
+        if nonfinite[0] == 0:
+            cute.arch.nvvm.exit()
     hint_ld = cutlass.Int64(L2_EVICT_FIRST)
     tidx, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
@@ -210,9 +214,9 @@ def frost_qsa_bprop_sm100(
             nq = I32(0)
             for qq in cutlass.range(bid, T, nctas, unroll=1):
                 qi = qq
-                nblk = (p_counts + qi).load()
+                nblk = (p_counts + (qi // 2 if cutlass.const_expr(nonfinite is not None) else qi)).load()
                 if nblk > 0:
-                    lrow = p_sparse_blocks + I64(qi) * capacity
+                    lrow = p_sparse_blocks + I64(qi // 2 if cutlass.const_expr(nonfinite is not None) else qi) * capacity
                     nchunks = (nblk + (CHB - 1)) // CHB
                     _wait(b_qe, (nq & 1) ^ 1)
                     if prims.elect_sync():
@@ -247,6 +251,8 @@ def frost_qsa_bprop_sm100(
                             xnext = (lrow + m1).load()
                         m = c * CHB + lane
                         blk = xcur
+                        if cutlass.const_expr(nonfinite is not None):
+                            blk = blk & I32((1 << 28) - 1)
                         ok = m < nblk
                         if lane >= CHB:
                             ok = False
@@ -285,9 +291,9 @@ def frost_qsa_bprop_sm100(
         if warp == 1:
             gc = I32(0)
             for qi in cutlass.range(bid, T, nctas, unroll=1):
-                nblk = (p_counts + qi).load()
+                nblk = (p_counts + (qi // 2 if cutlass.const_expr(nonfinite is not None) else qi)).load()
                 if nblk > 0:
-                    lrow = p_sparse_blocks + I64(qi) * capacity
+                    lrow = p_sparse_blocks + I64(qi // 2 if cutlass.const_expr(nonfinite is not None) else qi) * capacity
                     lower, upper = (p_lo + qi).load(), (p_hi + qi).load()
                     nchunks = (nblk + CHB - 1) // CHB
                     for c in cutlass.range(nchunks, unroll=1):
@@ -300,14 +306,21 @@ def frost_qsa_bprop_sm100(
                             needs_mask = True
                             if c * CHB + lane < nblk:
                                 block = (lrow + c * CHB + lane).load()
+                                owned = True
+                                if cutlass.const_expr(nonfinite is not None):
+                                    owned = ((block >> (28 + qi % 2)) & 1) != 0
+                                    block = block & I32((1 << 28) - 1)
                                 begin, end = (p_first + block).load(), (p_last + block).load()
-                                needs_mask = not ((begin >= lower) & (begin + 3 <= upper) & (begin + 3 <= end) & (begin >= 0) & (begin + 3 < T))
+                                needs_mask = not (owned & (begin >= lower) & (begin + 3 <= upper) & (begin + 3 <= end) & (begin >= 0) & (begin + 3 < T))
                         if cute.arch.vote_ballot_sync(needs_mask) != 0:
                             for b in cutlass.range(CHB, unroll=1):
                                 selected = c * CHB + b < nblk
                                 first, last = I32(0), I32(-1)
                                 if selected:
                                     block = (lrow + c * CHB + b).load()
+                                    if cutlass.const_expr(nonfinite is not None):
+                                        selected = ((block >> (28 + qi % 2)) & 1) != 0
+                                        block = block & I32((1 << 28) - 1)
                                     first, last = (p_first + block).load(), (p_last + block).load()
                                 for half in cutlass.range_constexpr(2):
                                     token = first + lane // 16 + half * 2
@@ -371,9 +384,9 @@ def frost_qsa_bprop_sm100(
             nq = I32(0)
             for qq in cutlass.range(bid, T, nctas, unroll=1):
                 qi = qq
-                nblk = (p_counts + qi).load()
+                nblk = (p_counts + (qi // 2 if cutlass.const_expr(nonfinite is not None) else qi)).load()
                 if nblk > 0:
-                    lrow = p_sparse_blocks + I64(qi) * capacity
+                    lrow = p_sparse_blocks + I64(qi // 2 if cutlass.const_expr(nonfinite is not None) else qi) * capacity
                     nchunks = (nblk + (CHB - 1)) // CHB
                     _wait(b_qf, nq & 1)
                     for c in cutlass.range(nchunks + 1, unroll=1):
@@ -475,9 +488,9 @@ def frost_qsa_bprop_sm100(
         ds_off = (OFF_DS + jrow * 384 + (row & 7) * 16) // 4
         for qq in cutlass.range(bid, T, nctas, unroll=1):
             qi = qq
-            nblk = (p_counts + qi).load()
+            nblk = (p_counts + (qi // 2 if cutlass.const_expr(nonfinite is not None) else qi)).load()
             if nblk > 0:
-                lrow = p_sparse_blocks + I64(qi) * capacity
+                lrow = p_sparse_blocks + I64(qi // 2 if cutlass.const_expr(nonfinite is not None) else qi) * capacity
                 nchunks = (nblk + (CHB - 1)) // CHB
                 lbase = qi * HQ + (hrow % HKV) * GQ
                 del_a = (p_delta + lbase).load(count=4, alignment=16)
@@ -501,8 +514,12 @@ def frost_qsa_bprop_sm100(
                         valid = False
                     if valid:
                         blk = (lrow + m).load()
+                        owned = True
+                        if cutlass.const_expr(nonfinite is not None):
+                            owned = ((blk >> (28 + qi % 2)) & 1) != 0
+                            blk = blk & I32((1 << 28) - 1)
                         token = (p_first + blk).load() + trow
-                        valid = (hrow < HKV) & (token >= (p_lo + qi).load()) & (token <= (p_hi + qi).load())
+                        valid = owned & (hrow < HKV) & (token >= (p_lo + qi).load()) & (token <= (p_hi + qi).load())
                         valid = valid & (token <= (p_last + blk).load()) & (token >= 0) & (token < T)
                     pw = []
                     dw = []
@@ -604,9 +621,9 @@ def frost_qsa_bprop_sm100(
         gc = I32(0)
         for qq in cutlass.range(bid, T, nctas, unroll=1):
             qi = qq
-            nblk = (p_counts + qi).load()
+            nblk = (p_counts + (qi // 2 if cutlass.const_expr(nonfinite is not None) else qi)).load()
             if nblk > 0:
-                lrow = p_sparse_blocks + I64(qi) * capacity
+                lrow = p_sparse_blocks + I64(qi // 2 if cutlass.const_expr(nonfinite is not None) else qi) * capacity
                 nchunks = (nblk + (CHB - 1)) // CHB
                 # Prefetch the next chunk with in-bounds index loads.
                 nx = []
@@ -638,6 +655,8 @@ def frost_qsa_bprop_sm100(
                     for g in cutlass.range_constexpr(4):
                         m = c * CHB + qd * 4 + g
                         blk = cur[g]
+                        if cutlass.const_expr(nonfinite is not None):
+                            blk = blk & I32((1 << 28) - 1)
                         ok = m < nblk
                         if qd * 4 + g >= CHB:
                             ok = False
@@ -716,6 +735,7 @@ def _bprop_host(
     scale: F32,
     nctas: I32,
     stream: cuda_driver.CUstream,
+    nonfinite=None,
 ):
     total = q.shape[0]
     hq, hkv = cutlass.const_expr(q.shape[1]), cutlass.const_expr(k.shape[1])
@@ -749,6 +769,7 @@ def _bprop_host(
         scale,
         hq,
         hkv,
+        nonfinite,
     ).launch(grid=(nctas, 1, 1), block=(NTHREADS, 1, 1), min_blocks_per_mp=1, stream=stream)
 
 

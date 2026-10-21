@@ -444,3 +444,40 @@ def test_reject_before_launch(supported_gpu, monkeypatch):
         qsa_forward(**inputs, block_size=8)
     with pytest.raises(ValueError, match="lse"):
         qsa_backward(inputs["q"], **inputs, out_fp32=inputs["q"].float(), lse=torch.empty((17, 12), device="cuda"))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("packed", [False, True])
+def test_paired_backward_nonfinite_isolation(supported_gpu, packed):
+    """A selected NaN in one query must not poison another query's masked dQ."""
+    inputs = make_inputs((3, 5) if packed else (8,), 12, 1, all_selected=True)
+    if not packed:
+        inputs["sel_blocks"][2:] = 0
+        inputs["lo"][1] = 1
+    keep = 3 if packed else 1
+    grad = inputs["q"].clone()
+    clean = qsa_forward(**inputs)
+    expected = qsa_backward(grad, **inputs, out_fp32=clean["out_fp32"], lse=clean["lse"])
+    saved_k, saved_v = inputs["k"].clone(), inputs["v"].clone()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            out = qsa_forward(**inputs)
+            grads = qsa_backward(grad, **inputs, out_fp32=out["out_fp32"], lse=out["lse"])
+        for poisoned in (True, False, True):
+            inputs["k"].copy_(saved_k)
+            inputs["v"].copy_(saved_v)
+            if poisoned:
+                inputs["k"][keep:] = torch.nan
+                inputs["v"][keep:] = torch.inf
+            graph.replay()
+            torch.cuda.synchronize()
+            stop = keep if poisoned else inputs["q"].shape[0]
+            torch.testing.assert_close(out["out"][:stop], clean["out"][:stop], atol=0.04, rtol=0.04)
+            for name in ("dq", "dk", "dv"):
+                assert torch.isfinite(grads[name][:stop]).all()
+                torch.testing.assert_close(grads[name][:stop], expected[name][:stop], atol=0.04, rtol=0.04)
+    finally:
+        graph.reset()

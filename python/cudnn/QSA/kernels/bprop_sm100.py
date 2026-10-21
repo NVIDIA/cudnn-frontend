@@ -126,7 +126,11 @@ def frost_qsa_bprop_sm100(
     scale: F32,
     HQ: cutlass.Constexpr[int],
     HKV: cutlass.Constexpr[int],
+    nonfinite,
 ):
+    if cutlass.const_expr(nonfinite is not None):
+        if nonfinite[0] != 0:
+            cute.arch.nvvm.exit()
     hint_ld = cutlass.Int64(L2_EVICT_FIRST)
     tidx, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
@@ -744,6 +748,7 @@ def _bprop_host(
     scale: F32,
     nctas: I32,
     stream: cuda_driver.CUstream,
+    nonfinite=None,
 ):
     total = q.shape[0]
     hq, hkv = cutlass.const_expr(q.shape[1]), cutlass.const_expr(k.shape[1])
@@ -783,6 +788,7 @@ def _bprop_host(
         scale,
         hq,
         hkv,
+        nonfinite,
     ).launch(grid=(nctas, 1, 1), block=(NTHREADS, 1, 1), min_blocks_per_mp=1, stream=stream)
 
 
@@ -831,6 +837,9 @@ def compile_kernel(dtype, query_heads, kv_heads, arch):
         cache_key=key,
         symbol="qsa_backward",
     )
+    from . import bprop_dispatch
+
+    compiled["dispatch"] = bprop_dispatch.compile_kernel(arch)
     return compiled
 
 
@@ -840,27 +849,6 @@ def launch(compiled, grad_out, q, k, v, out_fp32, lse, ids, counts, lo, hi, firs
         from .bprop_sm100_base import launch as launch_baseline
 
         return launch_baseline(compiled, grad_out, q, k, v, out_fp32, lse, ids, counts, lo, hi, first, last, dq, dk, dv, scratch, scale, stream, num_sms)
-    blocks = max(1, min(num_sms * 8, (q.numel() // 8 + 255) // 256))
-    compiled["prep"](out_fp32, grad_out, scratch["delta"], scratch["dq_acc"], scratch["dk_acc"], scratch["dv_acc"], blocks, stream)
-    groups = (q.shape[0] + NQ - 1) // NQ
-    compiled["main"](
-        q,
-        k,
-        v,
-        grad_out,
-        lse,
-        scratch["delta"],
-        scratch["dq_acc"],
-        scratch["dk_acc"],
-        scratch["dv_acc"],
-        ids,
-        counts,
-        lo,
-        hi,
-        first,
-        last,
-        scale,
-        min(groups, num_sms),
-        stream,
-    )
-    compiled["finish"](scratch["dq_acc"], scratch["dk_acc"], scratch["dv_acc"], dq, dk, dv, blocks, stream)
+    from .bprop_dispatch import launch as dispatch
+
+    return dispatch(compiled["dispatch"], grad_out, q, k, v, out_fp32, lse, ids, counts, lo, hi, first, last, dq, dk, dv, scratch, scale, stream, num_sms)

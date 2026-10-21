@@ -104,6 +104,11 @@ K/V gradient contributions from all query heads are summed. Floating-point
 atomic reductions can change low bits between runs.
 On Blackwell, the 12:1 path pairs adjacent queries and gathers their selected
 block union. Owner bits retain each query's mask while sharing K/V loads.
+A device-side K/V scan selects a per-query fallback when nonfinite values are
+present. The fallback reuses the compact union but applies each query's owner
+bits and bounds before dQ arithmetic, preventing a masked NaN from crossing
+between queries or packed sequences. Both launches test the current device flag;
+only one computes gradients. The flag is rebuilt during CUDA graph replay.
 
 For each query head and its shared KV head, the backward equations are:
 
@@ -158,7 +163,8 @@ rebuilt from the current bitmap on each call. Forward scratch includes an int32
 `[T, NB]` compact-index buffer and int32 `[T]` counts. Blackwell 12:1 backward
 uses `[ceil(T/2), NB]` indices and `[ceil(T/2)]` counts; other backward paths use
 the forward shapes. Backward also uses FP32 gradient accumulators and `[T, Hq]`
-delta. The dense route also uses packed token
+delta. The paired backward safety scan also uses four int32 flags per 1024
+K/V elements plus one reduced flag. The dense route also uses packed token
 masks, tile ranges and K/V check flags. These buffers are rebuilt on each call.
 Full-call benchmarks must include forward preparation, compaction, backward
 preparation, and final gradient casts.
