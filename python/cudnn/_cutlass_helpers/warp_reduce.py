@@ -22,10 +22,6 @@ def target_needs_shuffle_amax() -> bool:
     return (int(arch.major), int(arch.minor)) == (11, 0)
 
 
-# Backwards-compatible alias for the name #1280 introduced in the grouped helpers.
-_target_needs_shuffle_amax = target_needs_shuffle_amax
-
-
 @cute.jit
 def warp_amax_with_nan(value):
     """Full-warp FP32 max with NaN propagation; ``redux.f32`` or an SM110 shuffle."""

@@ -41,12 +41,21 @@ _GEMM_ROOT = _REPO_ROOT / "python" / "cudnn" / "gemm" / "cutedsl"
 _HELPER = _REPO_ROOT / "python" / "cudnn" / "_cutlass_helpers" / "warp_reduce.py"
 _HADAMARD_HELPER = _GEMM_ROOT / "grouped" / "glu_hadamard_quant" / "moe_kernel_helpers.py"
 
-_DIRECT_FMAX_REDUX = re.compile(r"cute\.arch\.warp_redux_sync\((?:[^)]|\n)*?kind=\"fmax\"", re.MULTILINE)
+_DIRECT_FMAX_REDUX = re.compile(r"cute\.arch\.warp_redux_sync\([^)]*?kind=\"fmax\"")
 _DIRECT_REDUX_F32_ASM = re.compile(r"redux\.sync\.[a-z.]*f32")
 
 
 def _gemm_sources():
     return sorted(p for p in _GEMM_ROOT.rglob("*.py"))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("kind, expected", [("fmax", True), ("max", False)])
+def test_direct_redux_scan_handles_multiline_call(kind, expected):
+    # A non-fmax call must fail to match without backtracking over overlapping
+    # alternatives for each newline in the argument list.
+    source = "cute.arch.warp_redux_sync(" + "\n" * 4096 + f'kind="{kind}")'
+    assert bool(_DIRECT_FMAX_REDUX.search(source)) is expected
 
 
 @pytest.mark.L0
@@ -85,12 +94,14 @@ def test_shared_helper_keeps_both_forms():
     [(11, 0, True), (10, 0, False), (10, 3, False), (10, 7, False), (12, 0, False), (9, 0, False)],
 )
 def test_target_predicate_selects_the_shuffle_only_on_sm110(major, minor, expected):
+    from cudnn.gemm.cutedsl.grouped import moe_kernel_helpers as grouped
+
     arch = mock.Mock(major=major, minor=minor)
     dsl = mock.Mock()
     dsl.get_arch_enum.return_value = arch
     with mock.patch("cutlass.cutlass_dsl.CuTeDSL._get_dsl", return_value=dsl):
         assert warp_reduce.target_needs_shuffle_amax() is expected
-        assert warp_reduce._target_needs_shuffle_amax() is expected
+        assert grouped._target_needs_shuffle_amax() is expected
 
 
 @pytest.mark.L0
@@ -98,7 +109,6 @@ def test_grouped_helper_reexports_the_shared_names():
     from cudnn.gemm.cutedsl.grouped import moe_kernel_helpers as grouped
 
     assert grouped.warp_amax_with_nan is warp_reduce.warp_amax_with_nan
-    assert grouped._target_needs_shuffle_amax is warp_reduce.target_needs_shuffle_amax
 
 
 @cute.kernel

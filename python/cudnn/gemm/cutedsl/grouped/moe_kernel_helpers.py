@@ -18,7 +18,7 @@ from typing import Type, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
-from cudnn._cutlass_helpers.warp_reduce import _target_needs_shuffle_amax, warp_amax_with_nan  # noqa: F401  (re-exported)
+from cudnn._cutlass_helpers.warp_reduce import target_needs_shuffle_amax, warp_amax_with_nan
 from cudnn._cutlass_compat import LayoutEnum
 import cutlass.cute.testing as testing
 from cutlass.cute.nvgpu import cpasync, tcgen05
@@ -1128,6 +1128,11 @@ def get_tma_atom_kind(atom_sm_cnt: cutlass.Int32, mcast: cutlass.Boolean) -> Uni
 # ---------------------------------------------------------------------------
 # Kernel helper functions (no kernel instance state needed)
 # ---------------------------------------------------------------------------
+
+
+def _target_needs_shuffle_amax():
+    """Preserve the grouped helper's original target-predicate entry point."""
+    return target_needs_shuffle_amax()
 
 
 @cute.jit
