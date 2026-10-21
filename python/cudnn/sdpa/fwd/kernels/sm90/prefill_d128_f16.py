@@ -19,7 +19,8 @@ The kernel implements:
 - Two-stage K and V rings, so the producer loads KV tile j+1 while tile j is in use.
 - One work tile per CTA over (Q tile, head, batch), in NATURAL, LPT or LPT_L2 order;
   or, under ``TemplateParams.persistent``, a grid of at most one CTA per SM
-  whose CTAs walk the work items in that order: the producer loads the next item's
+  whose CTAs walk the work items in that order, or a causal record's in pairs of
+  equal KV work (``TemplateParams.causal_walk``): the producer loads the next item's
   first K tile, Q and first V tile while the current item finishes.
 - Online softmax around an exact sign-aware row anchor, with lane-partial row sums
   quad-reduced only at finalization: the D512 template's arithmetic at 32 keys per lane
@@ -279,6 +280,91 @@ def causal_walk_plan(
     return best if best_load <= stride_load else None
 
 
+# The paired walk in the kernel. Both roles carry one warp-uniform walk position per CTA, pos = 2 * round + slot (slot
+# 0 or 1, the item inside the unit), and decode it with the four functions below, so the producer and the compute
+# warpgroups visit the same items in the same order with nothing shared between them. Plain functions with no loop or
+# branch on a traced value, so the kernel's methods trace them in place (as compute_kv_loop_bounds), and a host test
+# runs them on plain ints.
+
+
+def _pick(condition, if_true, if_false):
+    """``if_true`` where ``condition`` holds, else ``if_false``: a select on a traced condition, a plain choice on a
+    Python bool."""
+    if isinstance(condition, bool):
+        return if_true if condition else if_false
+    return cutlass.Int32(cutlass.select_(condition, if_true, if_false))
+
+
+def walk_unit(pos, cta, walk: CausalWalk):
+    """The unit at walk position ``pos`` of CTA ``cta``: round pos >> 1 deals units to CTAs 0 to ctas - 1, odd rounds in
+    reverse under snake (CausalWalk)."""
+    k = pos >> 1
+    column = _pick((k & 1) != 0, walk.ctas - 1 - cta, cta) if walk.snake else cta
+    return k * walk.ctas + column
+
+
+def walk_live(pos, cta, walk: CausalWalk):
+    """Whether walk position ``pos`` of CTA ``cta`` names an item, that is whether its unit exists: the item loop's
+    condition."""
+    return walk_unit(pos, cta, walk) < walk.units
+
+
+def walk_next(pos, unit, walk: CausalWalk):
+    """The walk position after ``pos`` in ``unit``: the unit's second item while pos is its first and the unit holds two
+    (a pair, or two groups' middle tiles), else the next round's first. Both are pos + 1 at an odd pos."""
+    if walk.heavy_units - walk.lone_middle > 0:
+        return _pick(unit < walk.heavy_units - walk.lone_middle, pos + 1, (pos | 1) + 1)
+    return (pos | 1) + 1
+
+
+def walk_item(pos, unit, walk: CausalWalk):
+    """``(Q tile, group)`` of the item at walk position ``pos`` in ``unit`` (walk_unit), group = head + h_q * batch.
+
+    Every divisor is a compile-time constant, so the divisions strength-reduce. The constants alone pick the branches,
+    which is what keeps a pair count of 0 (T - light_rows of 0 or 1) from ever reaching a divisor: under a traced
+    condition a select would compute both arms.
+    """
+    q_tiles, groups, light, pairs, heavy = walk.q_tiles, walk.groups, walk.light_rows, walk.pairs, walk.heavy_units
+    second = (pos & 1) != 0
+    tile = group = None
+    if heavy > 0:
+        if not walk.middles:
+            # T - light_rows even, so pairs >= 1: each group's pairs in turn.
+            group = unit // pairs
+            j = unit - group * pairs
+            tile = _pick(second, light + j, q_tiles - 1 - j)
+        elif pairs == 0:
+            # T - light_rows == 1: one middle tile per group; groups 2k and 2k + 1 share unit k (an odd count's last
+            # alone). The tile is T - 1 in every such unit, written as a division by the unit count so that it stays a
+            # run-time value: as a trace-time constant at T = 1 it turns the item's loop bounds into constants, and
+            # ptxas then keeps values hoisted out of the item loop live across it, past the register budget (96 B of
+            # spills in an offline sm_90a compile, ptxas 13.4; none in this form).
+            group = 2 * unit + (pos & 1)
+            tile = q_tiles - 1 - unit // heavy
+        else:
+            # Blocks of 2 * pairs + 1 units: group 2k's pairs, group 2k + 1's, then their shared middle unit. An odd
+            # count's last block holds its group's pairs, then that group's middle alone.
+            span = 2 * pairs + 1
+            block = unit // span
+            w = unit - block * span
+            in_pairs = w < _pick(unit >= groups // 2 * span, pairs, 2 * pairs)
+            half = w // pairs
+            j = w - half * pairs
+            group = _pick(in_pairs, 2 * block + half, 2 * block + (pos & 1))
+            tile = _pick(in_pairs, _pick(second, light + j, q_tiles - 1 - j), light + pairs)
+    if light > 0:
+        # The light rows, one item per unit: tile light - 1 of every group, then light - 2, ..., tile 0.
+        i = unit - heavy
+        rows = i // groups
+        light_tile, light_group = light - 1 - rows, i - rows * groups
+        if tile is None:
+            tile, group = light_tile, light_group
+        else:
+            in_heavy = unit < heavy
+            tile, group = _pick(in_heavy, tile, light_tile), _pick(in_heavy, group, light_group)
+    return tile, group
+
+
 @dsl_user_op
 def warpgroup_barrier_sync(barrier_id: int, thread_count: int, *, loc=None, ip=None):
     """A named barrier among the warps of one warp-role branch (a compute warpgroup's O staging): a subset barrier, so it
@@ -336,11 +422,12 @@ class Bars(NamedTuple):
 class SM90FusedMultiHeadAttentionForward:
     """Configure and launch the SM90 FP16/BF16 D128 FMHA prefill kernel.
 
-    Each CTA runs one work tile, or under ``persistent`` every work item of its stride,
-    through three warpgroups: WG0 loads, WG1 and WG2 each compute 64 query
-    rows. The constructor takes only what ``config_sm90.validate_params`` lets a D128
-    specialization declare; the prepared host still reads ``thd_varlen``, ``has_sink``,
-    ``thd_lse_head_stride`` and ``thd_origins``, which stay off.
+    Each CTA runs one work tile, or under ``persistent`` every work item of its stride
+    (of its units, under the paired walk), through three warpgroups: WG0 loads, WG1 and
+    WG2 each compute 64 query rows. The constructor takes only what
+    ``config_sm90.validate_params`` lets a D128 specialization declare; the prepared host
+    still reads ``thd_varlen``, ``has_sink``, ``thd_lse_head_stride`` and ``thd_origins``,
+    which stay off.
     """
 
     # The CTA tile: Q_TILE rows by KV_TILE keys over the HEAD_TILE-column head.
@@ -389,7 +476,8 @@ class SM90FusedMultiHeadAttentionForward:
             LSE by ``log2(e)``; ``-inf`` stays ``-inf``, and ``lse`` None removes it.
         :param intra_wg_overlap: Issue QK(t) and PV(t-1) as two WGMMA groups in flight together and run
             tile t's softmax under PV(t-1) (FA3's ``IntraWGOverlap``).
-        :param persistent: Launch ``min(items, persistent_ctas)`` CTAs that each loop over work items.
+        :param persistent: Launch ``min(items, persistent_ctas)`` CTAs, or under the paired walk
+            ``min(units, persistent_ctas)`` (``walk.ctas``), that each loop over work items.
         :param persistent_ctas: The persistent grid's CTA cap (the SM count); 0 when not persistent.
         :param causal_walk: A persistent causal record's walk: 0 the stride by the grid, 1 the paired walk
             (causal_walk_plan, which may keep the stride).
@@ -469,8 +557,8 @@ class SM90FusedMultiHeadAttentionForward:
         # One K or V stage in the descriptors' 16-byte start-field units.
         self.kv_stage_units = self.tile_elems * self.storage_dtype.bytes // 16
         # The work items and a persistent grid: at most one CTA per SM (min_blocks_per_mp=1 and 196,704 B of
-        # SMEM leave no room for a second) and never more CTAs than items, so every CTA has an item and its first is its
-        # block index.
+        # SMEM leave no room for a second) and never more CTAs than items, so every CTA has an item and, on the
+        # stride, its first is its block index.
         self.items = self.q_tiles * self.heads * self.b
         self.n_ctas = min(self.items, self.persistent_ctas) if self.persistent else 0
         # The paired walk's constants, or None for the stride by the grid: the plan-time rule over the declared shape
@@ -479,6 +567,10 @@ class SM90FusedMultiHeadAttentionForward:
         if self.causal_walk:
             shape = (self.b, self.h_q, self.h_kv, self.s_q, self.s_kv)
             self.walk = causal_walk_plan(shape, self.kv_loop_bottom_right, self.sched_policy, self.qh_per_kh, self.persistent_ctas, self.storage_dtype.bytes)
+        # The paired walk launches one CTA per unit up to the cap (walk.ctas), so every CTA has a unit.
+        self.paired_walk = self.walk is not None
+        if self.paired_walk:
+            self.n_ctas = self.walk.ctas
 
         # TMA: every region moves in SW128 slabs of 128-byte rows, two per 128-column tile.
         # The WGMMA descriptors (wgmma_descriptor) assume exactly this atom. Q, K and V boxes
@@ -1209,8 +1301,13 @@ class SM90FusedMultiHeadAttentionForward:
         NATURAL numbers the items as the hardware rasterizes the one-tile grid ``(q_tiles, h_q, b)``, Q tile fastest,
         then head, then batch, so a persistent grid's first round is that grid's first wave; LPT and LPT_L2 decode the
         linear id kernel decodes for them. Every divisor is a compile-time constant (PREPARED_FIXED_SHAPE), so the
-        divisions strength-reduce.
+        divisions strength-reduce. Under the paired walk ``item`` is a walk position, decoded through its unit
+        (walk_unit, walk_item).
         """
+        if cutlass.const_expr(self.paired_walk):
+            cta, _, _ = cute.arch.block_idx()
+            tile, group = walk_item(item, walk_unit(item, cta, self.walk), self.walk)
+            return self.work_record(tile, group % self.heads, group // self.heads)
         tile = item % self.q_tiles
         head = (item // self.q_tiles) % self.heads
         batch = item // (self.q_tiles * self.heads)
@@ -1235,18 +1332,34 @@ class SM90FusedMultiHeadAttentionForward:
 
     @cute.jit
     def first_item(self):
-        """A persistent CTA's first item: its block index (__call__ launches at most one CTA per item).
+        """A persistent CTA's first item: its block index (__call__ launches at most one CTA per item), or under the
+        paired walk walk position 0, the first item of the CTA's first unit (walk_unit).
 
         Every item index, and every pipeline state and Q phase the walk carries (uniform_state, next_q_phase), is marked
         warp-uniform, so ptxas can keep them in uniform registers: compiled offline for sm_90a (CuTe DSL 4.8.0, ptxas
         13.4), the walk's LPT and LPT_L2 causal bodies peak at R232 with the marks and R234 without.
         """
+        if cutlass.const_expr(self.paired_walk):
+            return cute.arch.make_warp_uniform(cutlass.Int32(0))
         item, _, _ = cute.arch.block_idx()
         return cute.arch.make_warp_uniform(item)
 
     @cute.jit
+    def live(self, item):
+        """Whether ``item`` (first_item, next_item) names an item of this CTA: the item loop's condition in both roles.
+        Under the paired walk, whether its unit exists (walk_live)."""
+        if cutlass.const_expr(self.paired_walk):
+            cta, _, _ = cute.arch.block_idx()
+            return walk_live(item, cta, self.walk)
+        return item < cutlass.Int32(self.items)
+
+    @cute.jit
     def next_item(self, item):
-        """This CTA's next item: one grid stride on, warp-uniform (first_item)."""
+        """This CTA's next item: one grid stride on, or under the paired walk the next walk position (walk_next);
+        warp-uniform (first_item)."""
+        if cutlass.const_expr(self.paired_walk):
+            cta, _, _ = cute.arch.block_idx()
+            return cute.arch.make_warp_uniform(walk_next(item, walk_unit(item, cta, self.walk), self.walk))
         return cute.arch.make_warp_uniform(item + cutlass.Int32(self.n_ctas))
 
     @cute.jit
@@ -1400,7 +1513,7 @@ class SM90FusedMultiHeadAttentionForward:
             q_empty_phase = cutlass.Int32(1)
             kv_empty_state = PipelineState.start(phase=1)
             item = self.first_item()
-            while item < cutlass.Int32(self.items):
+            while self.live(item):
                 work = self.work_of(item)
                 first_seq_idx = (work.kv_right - 1) * self.KV_TILE
                 first_stage = kv_empty_state.idx
@@ -1439,7 +1552,7 @@ class SM90FusedMultiHeadAttentionForward:
         kv_full_state = PipelineState.start(phase=0)
         q_full_phase = cutlass.Int32(0)
         item = self.first_item()
-        while item < cutlass.Int32(self.items):
+        while self.live(item):
             work = self.work_of(item)
             basic_params, mma_params = self.item_params(cta, work)
             self.reset_item_state(cta)
@@ -1548,8 +1661,8 @@ class SM90FusedMultiHeadAttentionForward:
         lse,
         scale: cutlass.Float32,
     ):
-        """Run one work tile per CTA, or under ``persistent`` every item of the CTA's stride: allocate, decode, then run
-        the three roles.
+        """Run one work tile per CTA, or under ``persistent`` every item of the CTA's stride (of its units, under the
+        paired walk): allocate, decode, then run the three roles.
 
         Warp 0's elected lane initializes every barrier, and the default CTA barrier (id 0)
         publishes them before any role runs.

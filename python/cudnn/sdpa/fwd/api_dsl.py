@@ -286,9 +286,10 @@ D128_PERSISTENT: bool = True
 # D128_INTRA_WG_OVERLAP and D128_PERSISTENT are on: 0 keeps a causal plan one tile per CTA, 1 runs it on the persistent
 # loop with the stride by the grid (causal_walk 0), 2 on the paired walk (causal_walk 1). An int, not a bool, so that
 # either walk can be selected. Every value computes the one-tile kernel's O and Stats bit for bit
-# (test_sdpa_fwd_d128_sm90.py::test_d128_persistent_is_bitwise_ov runs the persistent records on causal cases), so
-# this is a speed choice. 0 until both walks are measured against the one-tile kernel on causal shapes: the stride ran
-# three long causal shapes at 0.889-0.922x it (D128_PERSISTENT's comment).
+# (test_sdpa_fwd_d128_sm90.py: test_d128_persistent_is_bitwise_ov runs the stride on causal cases,
+# test_d128_paired_walk_is_bitwise_ov the paired walk at each of its branches), so this is a speed choice. 0 until
+# both walks are measured against the one-tile kernel on causal shapes: the stride ran three long causal shapes at
+# 0.889-0.922x it (D128_PERSISTENT's comment).
 D128_PERSISTENT_CAUSAL_WALK: int = 0
 # The d128 f16/bf16 DECODE tile (TILES_Q=1, cga1, one softmax warpgroup, three
 # KV stages -- config_sm100.CfgD128Decode): what a (128, 128) plan with

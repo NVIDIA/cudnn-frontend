@@ -75,6 +75,8 @@ _SWITCHES = ("intra_wg_overlap", "persistent", "causal_walk")
 _VARIANTS = {"v1": (), "ov": ("intra_wg_overlap",), "pa": ("intra_wg_overlap", "persistent")}
 # The persistent variants: each must compute ov's O and Stats bit for bit.
 _PERSISTENT = ("pa",)
+# Variants of causal records only: the paired walk (causal_walk 1), which validate_params refuses on a dense record.
+_CAUSAL_VARIANTS = {"pw": ("intra_wg_overlap", "persistent", "causal_walk")}
 # Forced persistent CTA counts: one CTA crossing every item boundary, two and three wrapping the K/V rings and the Q phase
 # at uneven parities, 131 leaving one SM's worth of items over. A cross-item bug shows only when a CTA runs more than one
 # item (python/cudnn/sdpa/AGENTS.md, the THD re-seed lesson): at the adapter's count every small case runs one item per CTA.
@@ -84,13 +86,14 @@ _FORCED_GRIDS = (1, 2, 3, 131)
 def _switches(variant):
     """``variant``'s whole switch record: each _SWITCHES field on exactly when the variant names it (True, or 1 for the
     causal walk's int)."""
-    return {name: int(name in _VARIANTS[variant]) if name == "causal_walk" else name in _VARIANTS[variant] for name in _SWITCHES}
+    names = {**_VARIANTS, **_CAUSAL_VARIANTS}[variant]
+    return {name: int(name in names) if name == "causal_walk" else name in names for name in _SWITCHES}
 
 
 def _counts(variant):
     """The watchdog child's persistent CTA counts: the adapter's (0), and for a persistent variant 1 and 2 (one CTA crossing
     every item boundary; two wrapping the K/V rings and the Q phase at uneven parities)."""
-    return [0, 1, 2] if "persistent" in _VARIANTS[variant] else [0]
+    return [0, 1, 2] if "persistent" in {**_VARIANTS, **_CAUSAL_VARIANTS}[variant] else [0]
 
 
 def _plan(q, k, v, *, stats=False, variant=None, grid=None, **kw):
@@ -724,6 +727,181 @@ def test_d128_persistent_is_bitwise_ov(variant, case, grid):
     _assert_bitwise(variant, f"{case} at grid {grid or 'sm'}", got, base, "ov")
 
 
+# The paired walk (causal_walk 1) on causal records. Each case runs at the adapter's CTA count and at forced counts
+# below its items, and each forced (case, count) cell is pinned to the walk branch the plan-time rule picks there
+# (_walk_branch), so the cells together take every branch of walk_item and walk_next, single items only, one item per
+# CTA, and the stride the rule keeps on chunked prefill. bottom_right is the template's (the adapter spells top-left on
+# a square as bottom-right).
+_WALK_CASES = {  # id: (b, h_q, h_kv, s_q, s_kv, dtype, adapter keywords)
+    "odd-t": (4, 4, 4, 1152, 1152, torch.bfloat16, dict(is_causal=True)),  # T = 9: middle units
+    "odd-groups": (3, 5, 5, 1152, 1152, torch.float16, dict(is_causal=True, causal_bottom_right=True)),  # a lone middle
+    "sq-above-skv": (2, 4, 4, 640, 384, torch.bfloat16, dict(is_causal=True)),  # top-left: rows past S_kv see every key
+    "diag-576": (2, 4, 2, 1024, 1600, torch.bfloat16, dict(is_causal=True, causal_bottom_right=True)),  # not a tile multiple
+    "partial-ragged": (2, 4, 2, 1000, 1100, torch.float16, dict(is_causal=True, causal_bottom_right=True)),
+    "one-q-tile": (2, 8, 2, 100, 300, torch.bfloat16, dict(is_causal=True, causal_bottom_right=True)),  # T = 1
+    "one-q-tile-odd": (3, 5, 5, 100, 300, torch.float16, dict(is_causal=True, causal_bottom_right=True)),
+    "middle-light": (2, 2, 2, 200, 500, torch.bfloat16, dict(is_causal=True, causal_bottom_right=True)),  # light_rows = T - 1
+    "middle-light-lone": (1, 1, 1, 300, 300, torch.float16, dict(is_causal=True)),
+    "gqa8": (2, 8, 1, 768, 768, torch.bfloat16, dict(is_causal=True)),
+    "items-200": (5, 5, 5, 1024, 1024, torch.bfloat16, dict(is_causal=True)),  # 133 to 264 items
+    "items-133": (7, 19, 19, 128, 128, torch.bfloat16, dict(is_causal=True)),  # 132 + 1 one-tile groups
+    "stride-fallback": (8, 24, 8, 256, 2048, torch.bfloat16, dict(is_causal=True, causal_bottom_right=True)),  # chunked
+    "mixed": (1, 2, 2, 640, 640, torch.bfloat16, dict(is_causal=True)),
+    "multi-wave": (4, 16, 4, 1024, 1024, torch.bfloat16, dict(is_causal=True)),
+}
+_WALK_CELLS = {  # (case, forced CTA count): the walk branch there (_walk_branch)
+    ("odd-t", 1): "pairs-middles",
+    ("odd-t", 2): "pairs-middles",
+    ("odd-t", 3): "pairs-middles",
+    ("odd-t", 131): "singles",
+    ("odd-groups", 1): "pairs-middles+lone",
+    ("odd-groups", 2): "pairs-middles+light+lone",
+    ("odd-groups", 3): "pairs+light",
+    ("odd-groups", 131): "singles",
+    ("sq-above-skv", 1): "pairs-middles",
+    ("sq-above-skv", 2): "pairs-middles",
+    ("sq-above-skv", 3): "pairs-middles+light",
+    ("diag-576", 1): "pairs",
+    ("diag-576", 2): "pairs",
+    ("diag-576", 3): "pairs+light",
+    ("partial-ragged", 1): "pairs",
+    ("partial-ragged", 2): "pairs",
+    ("partial-ragged", 3): "pairs+light",
+    ("one-q-tile", 1): "middles",
+    ("one-q-tile", 2): "middles",
+    ("one-q-tile", 3): "middles",
+    ("one-q-tile-odd", 1): "middles+lone",
+    ("one-q-tile-odd", 2): "middles+lone",
+    ("one-q-tile-odd", 3): "singles",
+    ("middle-light", 1): "pairs",
+    ("middle-light", 2): "pairs",
+    ("middle-light", 3): "middles+light",
+    ("middle-light-lone", 1): "pairs-middles+lone",
+    ("middle-light-lone", 2): "middles+light+lone",
+    ("gqa8", 1): "pairs",
+    ("gqa8", 2): "pairs",
+    ("gqa8", 3): "pairs",
+    ("items-200", 1): "pairs",
+    ("items-200", 2): "pairs",
+    ("items-200", 3): "pairs+light",
+    ("items-200", 131): "singles",
+    ("items-133", 1): "middles+lone",
+    ("items-133", 2): "middles+lone",
+    ("items-133", 3): "middles+lone",
+    ("items-133", 131): "middles+lone",
+    ("stride-fallback", 1): "pairs",
+    ("stride-fallback", 2): "pairs",
+    ("stride-fallback", 3): "pairs",
+    ("stride-fallback", 131): "stride",
+    ("mixed", 1): "pairs-middles",
+    ("mixed", 2): "pairs+light",
+    ("mixed", 3): "pairs-middles+light",
+    ("multi-wave", 1): "pairs",
+    ("multi-wave", 2): "pairs",
+    ("multi-wave", 3): "pairs+light",
+    ("multi-wave", 131): "pairs",
+}
+
+
+def _walk_branch(api, grid):
+    """The walk branch a compiled paired-walk plan takes at ``grid`` CTAs (None: the adapter's count), from the plan's
+    own rule (the module's causal_walk_plan over its record): which unit kinds its walk has, or "stride"."""
+    p = api.params
+    ctas = grid or api._persistent_ctas(api.q_desc.device)
+    shape = (api.batch_size, api.h_q, api.h_kv, api.s_q_max, api.s_k_max)
+    walk = api._k_mod.causal_walk_plan(shape, p.causal if p.bottom_right is None else p.bottom_right, p.sched_policy, p.qh_per_kh, ctas, 2)
+    if walk is None:
+        return "stride"
+    if walk.heavy_units == 0:
+        return "singles" if walk.units > ctas else "one-per-cta"
+    kind = "pairs" if not walk.middles else "middles" if walk.pairs == 0 else "pairs-middles"
+    return kind + ("+light" if walk.light_rows else "") + ("+lone" if walk.lone_middle else "")
+
+
+def _walk_grids(case):
+    b, h_q, _, s_q, _, _, _ = _WALK_CASES[case]
+    items = math.ceil(s_q / 128) * h_q * b
+    return [None] + [g for g in _FORCED_GRIDS if g < items]
+
+
+@pytest.mark.L0
+def test_d128_paired_walk_cells_cover_every_branch():
+    """The pinned cells reach every branch of the paired walk: pairs, middle units, middle tiles only (T - light_rows of
+    1), light rows with each, a lone middle with each, single items only, and the stride the rule keeps; and every
+    forced count below a case's items is pinned."""
+    assert {key for key in _WALK_CELLS} == {(c, g) for c in _WALK_CASES for g in _walk_grids(c) if g}, "a forced cell without its pin"
+    kinds = set(_WALK_CELLS.values())
+    assert {"pairs", "pairs+light", "pairs-middles", "pairs-middles+light", "pairs-middles+lone", "pairs-middles+light+lone"} <= kinds, kinds
+    assert {"middles", "middles+lone", "middles+light", "middles+light+lone", "singles", "stride"} <= kinds, kinds
+
+
+@pytest.mark.parametrize(
+    "case, grid", [pytest.param(c, g, id=f"{c}-grid{g or 'sm'}", marks=_level(c in _L0_WALK)) for c in _WALK_CASES for g in _walk_grids(c)]
+)
+@torch_fork_set_rng(seed=0)
+def test_d128_paired_walk_is_bitwise_ov(case, grid):
+    """A paired-walk record computes the one-tile-per-CTA overlap kernel's O and Stats bit for bit, on causal cases at
+    every walk branch (_WALK_CELLS) and at the adapter's CTA count, where one CTA runs pairs, middles and light rows in
+    turn and the K/V rings and the Q phase wrap at every parity across items of different lengths."""
+    b, h_q, h_kv, s_q, s_kv, dtype, kw = _WALK_CASES[case]
+    q, k, v = _inputs(b, h_q, h_kv, s_q, s_kv, dtype)
+    base = _run(q, k, v, stats=True, variant="ov", **kw)
+    api, o, lse = _plan(q, k, v, stats=True, variant="pw", grid=grid, **kw)
+    if grid:
+        assert _walk_branch(api, grid) == _WALK_CELLS[(case, grid)], (case, grid, _walk_branch(api, grid))
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse)
+    torch.cuda.synchronize()
+    _assert_bitwise("pw", f"{case} at grid {grid or 'sm'}", (o, lse), base, "ov")
+
+
+@pytest.mark.parametrize("grid", [2, 3], ids=["grid2", "grid3"])
+@torch_fork_set_rng(seed=0)
+def test_d128_paired_walk_repeats_and_replays_bitwise(grid):
+    """Two launches of one paired-walk plan agree bit for bit and equal ov's, and its CUDA-graph replay equals its
+    eager launch before and after the inputs change in place (bottom-right causal, partial Q and ragged KV: pairs
+    alone at 2 CTAs, pairs then light rows at 3)."""
+    q, k, v = _inputs(2, 4, 2, 1000, 1100, torch.bfloat16)
+    mask = dict(is_causal=True, causal_bottom_right=True)
+    api, o, lse = _plan(q, k, v, stats=True, variant="pw", grid=grid, **mask)
+    assert _walk_branch(api, grid) == {2: "pairs", 3: "pairs+light"}[grid], (grid, _walk_branch(api, grid))
+
+    def run():
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse)
+
+    outs = []
+    for _ in range(2):
+        o.fill_(float("nan"))
+        lse.fill_(float("nan"))
+        run()
+        torch.cuda.synchronize()
+        outs.append((o.clone(), lse.clone()))
+    assert torch.equal(outs[0][0], outs[1][0]) and torch.equal(outs[0][1], outs[1][1])
+    _assert_bitwise("pw", f"repeat at grid {grid}", outs[0], _run(q, k, v, stats=True, variant="ov", **mask), "ov")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.stream(stream):
+            run()
+            with torch.cuda.graph(graph, stream=stream):
+                run()
+        stream.synchronize()
+        for step in range(2):
+            if step:
+                k.mul_(0.5)
+                v.add_(1.0)
+            run()
+            torch.cuda.synchronize()
+            eager = (o.clone(), lse.clone())
+            o.fill_(float("nan"))
+            lse.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(o, eager[0]) and torch.equal(lse, eager[1]), (grid, "changed inputs" if step else "same inputs")
+    finally:
+        graph.reset()
+
+
 @pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
 @pytest.mark.parametrize("variant", list(_VARIANTS))
 @torch_fork_set_rng(seed=0)
@@ -775,17 +953,24 @@ _TURNS_CHILD = textwrap.dedent(r"""
     # (b, h_q, h_kv, s_q, s_kv, causal, bottom_right): ring wrap; one KV tile (the prologue meets the drain); WG2 without
     # a row over three tiles of an incomplete Q tile (phase 3); bottom-right causal with masked and unmasked phases (16
     # items, eight per CTA at count 2); top-left causal square, whose Q tiles walk one and two KV tiles, so one CTA
-    # releases Q from the first tile and from the last step in turn.
+    # releases Q from the first tile and from the last step in turn. The paired walk takes pairs alone on those two, so
+    # two more: a top-left square of three Q tiles (a pair, then the lone middle, at count 1; the lone middle, then two
+    # light rows, at count 2), and odd T over an odd group count (pairs, middle units and a lone middle at count 1, with
+    # light rows at count 2).
     CASES = [
         (1, 2, 2, 256, 384, False, False),
         (1, 2, 2, 64, 128, False, False),
         (2, 2, 2, 17, 300, False, False),
         (2, 4, 2, 130, 700, True, True),
         (1, 4, 4, 256, 256, True, False),
+        (1, 1, 1, 300, 300, True, False),
+        (3, 5, 5, 1152, 1152, True, True),
     ]
     plans = []
     for count in counts:  # 0: the adapter's CTA count; n > 0 forces n persistent CTAs (a compile argument, its own key)
         for b, h_q, h_kv, s_q, s_kv, causal, bottom_right in CASES:
+            if switches.get("causal_walk") and not causal:
+                continue  # the paired walk orders causal records only
             torch.manual_seed(0)
             q, k, v = (torch.randn(b, s, h, 128, device="cuda", dtype=torch.bfloat16).transpose(1, 2) for s, h in ((s_q, h_q), (s_kv, h_kv), (s_kv, h_kv)))
             o = torch.full((b, s_q, h_q, 128), float("nan"), device="cuda", dtype=torch.bfloat16).transpose(1, 2)
@@ -825,13 +1010,14 @@ _TURNS_COMPILE_BUDGET_S = 900 if _TEST_DEADLINE_S <= 0 else max(60, min(900, int
 
 @pytest.mark.gpu_exclusive
 @pytest.mark.xdist_group(name="gpu_exclusive")
-@pytest.mark.parametrize("variant", list(_VARIANTS))
+@pytest.mark.parametrize("variant", [pytest.param(v, marks=_level(v in _L0_WATCHDOG)) for v in [*_VARIANTS, *_CAUSAL_VARIANTS]])
 def test_d128_turns_and_rings_complete_in_a_watchdogged_child(variant):
     """Every launch of every switch value finishes: no K or V ring slot waits for an arrival that never comes,
     including one KV tile, a warpgroup without rows and an incomplete Q tile, and a persistent record's item loop
-    completes at the adapter's CTA count and at one and two CTAs. A hang is a child that misses its run deadline,
-    reported as HANG with its last lines; a child that stalls before every plan has compiled is reported as STALL,
-    with its stack (the child arms its own deadline before its first import)."""
+    completes at the adapter's CTA count and at one and two CTAs (the paired walk's on the causal cases, through pairs,
+    middle units, light rows and a lone middle). A hang is a child that misses its run deadline, reported as HANG with
+    its last lines; a child that stalls before every plan has compiled is reported as STALL, with its stack (the
+    child arms its own deadline before its first import)."""
     argv = [
         sys.executable,
         "-c",
@@ -1021,14 +1207,21 @@ _SASS_PROBE = textwrap.dedent(r"""
     from cudnn.sdpa.fwd.api_dsl import _load_kernel_template
     from cudnn.sdpa.fwd.config_sm90 import TemplateParams
     # The heaviest D128 body: GQA and Stats, causal (three masked phases) or dense (a persistent record's dense body is
-    # different code); ``fields`` is the variant's switch record, ``ctas`` a persistent record's CTA count.
+    # different code); ``fields`` is the variant's switch record, ``ctas`` a persistent record's CTA count, ``shape``
+    # the declared (b, h_q, h_kv, s_q, s_kv).
     fields = case["switches"]
     params = dataclasses.replace(TemplateParams(dtype_qkv=DTYPE_BF16, causal=case["causal"], has_lse=True, qh_per_kh=4), **fields)
     mod = _load_kernel_template("sm90/prefill_d128_f16.py", params, tag="sass_sm90_d128")
     print("SWITCHES", *(int(getattr(mod, name.upper())) for name in sorted(fields)))
-    b, h_q, h_kv, s = 2, 8, 2, 1024
-    q, kv = (s * h_q * 128, 128, h_q * 128, 1), (s * h_kv * 128, 128, h_kv * 128, 1)
-    mod.compile(b, h_q, h_kv, s, s, q, kv, kv, q, (h_q * s, s, 1), **({"persistent_ctas": case["ctas"]} if fields["persistent"] else {}))
+    b, h_q, h_kv, s_q, s_kv = case["shape"]
+    if fields.get("causal_walk"):
+        # The walk the record takes: the template's rule over the probe's record, shape and CTA count, as the kernel's
+        # constructor calls it (bf16: 2 bytes). Light rows, pairs, middles and the lone middle; -1 for the stride.
+        bottom_right = params.causal if params.bottom_right is None else params.bottom_right
+        walk = mod.causal_walk_plan((b, h_q, h_kv, s_q, s_kv), bottom_right, params.sched_policy, params.qh_per_kh, case["ctas"], 2)
+        print("WALK", *((-1,) * 4 if walk is None else (walk.light_rows, walk.pairs, int(walk.middles), walk.lone_middle)))
+    q, kv = (s_q * h_q * 128, 128, h_q * 128, 1), (s_kv * h_kv * 128, 128, h_kv * 128, 1)
+    mod.compile(b, h_q, h_kv, s_q, s_kv, q, kv, kv, q, (h_q * s_q, s_q, 1), **({"persistent_ctas": case["ctas"]} if fields["persistent"] else {}))
     cubins = sorted(glob.glob(os.path.join(dump, "**", "*.cubin"), recursive=True), key=os.path.getmtime)
     ptxs = sorted(glob.glob(os.path.join(dump, "**", "*.ptx"), recursive=True), key=os.path.getmtime)
     if not cubins or not ptxs:
@@ -1086,23 +1279,40 @@ _SASS_PROBE = textwrap.dedent(r"""
 # 13.4 V13.4.92, CuTe DSL 4.8.0); the test holds every new compile to that, within SPILL_TOLERANCE.
 _SPILL_PIN = {"STL": 0, "LDL": 0}
 # The SASS cases: (variant, causal body). Today's two on the causal body, plus the persistent record on the dense body,
-# the only one the adapter ships it on (one step instance: the masked phases fold away).
-_SASS_CASES = {"v1": ("v1", True), "ov": ("ov", True), "pa-dense": ("pa", False)}
+# the only one the adapter ships it on (one step instance: the masked phases fold away), and the paired walk on the
+# causal body (pairs alone at 64 CTAs: four pairs per group, one unit per CTA) and on its one-Q-tile twin (S_q 100,
+# S_kv 300 at 3 CTAs: middle tiles only, two groups to a unit), the branch whose Q tile walk_item writes as a division
+# so that the item's loop bounds stay run-time values (as a trace-time constant it spilled; walk_item's comment).
+_SASS_CASES = {"v1": ("v1", True), "ov": ("ov", True), "pa-dense": ("pa", False), "pw-causal": ("pw", True), "pw-causal-t1": ("pw", True)}
 # A persistent record's CTA count in the probe: below the probe's 128 items, so each CTA walks two. With the count at or
 # above the items every CTA runs one item, and LLVM could fold the item loop away if it ever proved that (the warp-uniform
 # item index keeps it from doing so today); a count below the items pins the loop whatever it proves.
 _SASS_CTAS = 64
+# The probe's declared problem (b, h_q, h_kv, s_q, s_kv), and the cases that compile another one at their own CTA
+# count.
+_SASS_SHAPE = (2, 8, 2, 1024, 1024)
+_SASS_SHAPES = {"pw-causal-t1": ((2, 8, 2, 100, 300), 3)}
+# The walk each paired-walk case compiles (the probe's WALK line: light rows, pairs, middles, lone middle), so that a
+# rule or constant change that moves a case to another branch, or to the stride (-1), fails here instead of pinning
+# another body.
+_SASS_WALKS = {"pw-causal": (0, 4, 0, 0), "pw-causal-t1": (0, 0, 1, 0)}
 # Per-case structure of the probe body (GQA 4, Stats, bf16), measured in an offline sm_90a compile (ptxas 13.4 V13.4.92,
 # CuTe DSL 4.8.0): v1 = 3 step instances x (8 SS + 8 RS); ov = prologue QK 8 + 2 step instances x 16 + drain PV 8, one
 # wait_group(1) per step instance; pa-dense is one copy of ov's dense item body inside the item loop, one step instance
 # (the probe body made non-causal, persistent at 64 CTAs). BAR_SYNC: the CTA barrier after the barrier init and the O
 # staging barrier in each branch of the warpgroup split (3); pa-dense adds, in each branch, the barrier that holds warps
-# 1 to 3 until warp 0's deferred O store wait returns (5). Body counts are a toolchain fact
-# (python/cudnn/sdpa/AGENTS.md, the LDTM lesson): re-measure on a new toolchain and record it next to the numbers.
+# 1 to 3 until warp 0's deferred O store wait returns (5). pw-causal is one copy of ov's causal item body inside the
+# item loop (48, 6, 2) with pa-dense's five barriers; it peaks at R232, where the stride peaks at R236 on this body.
+# pw-causal-t1 is the same loop over the one-Q-tile body, whose partial Q tile and ragged KV trace one more step
+# instance (64, 8, 3; ov's one-tile kernel on that shape has the same three).
+# Body counts are a toolchain fact (python/cudnn/sdpa/AGENTS.md, the LDTM lesson): re-measure on a new toolchain and
+# record it next to the numbers.
 _CODEGEN_PINS = {
     "v1": dict(HGMMA=48, DEPBAR=6, DEPBAR_1=0, BAR_SYNC=3, BAR_ARV=0),
     "ov": dict(HGMMA=48, DEPBAR=6, DEPBAR_1=2, BAR_SYNC=3, BAR_ARV=0),
     "pa-dense": dict(HGMMA=32, DEPBAR=4, DEPBAR_1=1, BAR_SYNC=5, BAR_ARV=0),
+    "pw-causal": dict(HGMMA=48, DEPBAR=6, DEPBAR_1=2, BAR_SYNC=5, BAR_ARV=0),
+    "pw-causal-t1": dict(HGMMA=64, DEPBAR=8, DEPBAR_1=3, BAR_SYNC=5, BAR_ARV=0),
 }
 
 
@@ -1130,7 +1340,8 @@ def test_d128_register_split_no_spills_and_no_wgmma_serialization(tmp_path, case
     variant, causal = _SASS_CASES[case]
     switches = _switches(variant)
     overlap = switches["intra_wg_overlap"]
-    arg = json.dumps({"switches": switches, "causal": causal, "ctas": _SASS_CTAS})
+    shape, ctas = _SASS_SHAPES.get(case, (_SASS_SHAPE, _SASS_CTAS))
+    arg = json.dumps({"switches": switches, "causal": causal, "ctas": ctas, "shape": shape})
     proc = subprocess.run([sys.executable, "-c", _SASS_PROBE, str(dump), arg, _ptxas() or "-", *cands], capture_output=True, text=True, timeout=1800)
     assert proc.returncode == 0, f"sm_90a trace-compile of the D128 template ({case}) failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
     out = proc.stdout.splitlines()
@@ -1138,6 +1349,9 @@ def test_d128_register_split_no_spills_and_no_wgmma_serialization(tmp_path, case
         pytest.skip(str([ln for ln in out if ln.startswith(("SKIP", "REJECT"))]))
     want = "SWITCHES " + " ".join(str(int(switches[name])) for name in sorted(switches))
     assert want in out, [ln for ln in out if ln.startswith("SWITCHES")]
+    if switches["causal_walk"]:
+        walk = "WALK " + " ".join(map(str, _SASS_WALKS[case]))
+        assert walk in out, (case, walk, [ln for ln in out if ln.startswith("WALK")])
     stats = {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith(("SASS ", "PTX "))}
     print(f"\nD128 SASS {case}:", stats, [ln for ln in out if ln.startswith("PTXAS")])
     assert stats["USETMAXREG"] > 0, "no USETMAXREG: ptxas dropped the register split (C7508)"

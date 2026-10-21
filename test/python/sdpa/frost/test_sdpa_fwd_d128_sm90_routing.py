@@ -1131,3 +1131,95 @@ def test_causal_walk_record_carries_the_rule():
         make((1, 2, 2, 256, 256), is_causal=True, causal_walk=1)
     with pytest.raises(ValueError, match="orders a persistent causal record's walk"):
         make((1, 2, 2, 256, 256), persistent=True, persistent_ctas=2, causal_walk=1)
+
+
+# --- The paired walk: the kernel's decode on plain ints (host-only, no trace) -------
+#
+# walk_unit, walk_live, walk_next and walk_item are the functions both roles of the kernel trace in place; here they run
+# on plain ints, CTA by CTA, as the item loop runs them (first_item, live, next_item, work_of).
+
+_WALK_Q_TILES = (1, 2, 3, 4, 5, 8, 9, 17, 33)
+_WALK_LAYOUTS = ((1, 1), (1, 2), (1, 3), (2, 2), (3, 3), (1, 16), (5, 7))  # (b, h_q): 1, 2, 3, 4, 9, 16 and 35 groups
+_WALK_CTAS = (1, 2, 3, 7, 131, 132)
+
+
+def _walk_of_cta(mod, walk, cta):
+    """CTA ``cta``'s items in the order the kernel's item loop visits them: position 0, then walk_next while walk_live,
+    each item decoded by walk_item."""
+    pos, items = 0, []
+    while mod.walk_live(pos, cta, walk):
+        unit = mod.walk_unit(pos, cta, walk)
+        items.append(mod.walk_item(pos, unit, walk))
+        pos = mod.walk_next(pos, unit, walk)
+        assert len(items) <= 2 * walk.units, "the walk does not end"
+    return items
+
+
+def test_paired_walk_visits_every_item_once_in_the_dealt_order():
+    """The kernel's decode against the units built item by item (_walk_units) and dealt round by round (_deal): for Q
+    tile counts 1, 2, 3, 4, 5, 8, 9, 17 and 33, group counts 1, 2, 3, 4, 9, 16 and 35, light-row counts at every edge
+    (0, 1, 2, T // 2, T - 2, T - 1, T: no pairs, middle tiles only, one pair, light rows with and without middles, odd
+    and even group counts), CTA counts 1, 2, 3, 7, 131 and 132, with and without the snake, every CTA visits exactly its
+    dealt units' items in order, every CTA has at least one unit, and the CTAs together visit every (Q tile, group)
+    item once. A pair count of 0 (T - light_rows of 0 or 1) never reaches a divisor: on plain ints it would raise
+    ZeroDivisionError here."""
+    mod = _walk_module()
+    for q_tiles, (b, h_q), ctas, snake in itertools.product(_WALK_Q_TILES, _WALK_LAYOUTS, _WALK_CTAS, (True, False)):
+        groups = b * h_q
+        for light in sorted({0, 1, 2, q_tiles // 2, q_tiles - 2, q_tiles - 1, q_tiles} & set(range(q_tiles + 1))):
+            walk = mod.causal_walk_layout(q_tiles, groups, light, ctas, snake)
+            dealt = _deal(_walk_units(q_tiles, groups, light), ctas, snake)
+            assert walk.ctas == len(dealt) and walk.units == sum(map(len, dealt)), (walk, len(dealt))
+            seen = []
+            for cta in range(walk.ctas):
+                visited = _walk_of_cta(mod, walk, cta)
+                assert visited and visited == [item for unit in dealt[cta] for item in unit], (walk, cta)
+                seen += visited
+            assert sorted(seen) == [(t, g) for t in range(q_tiles) for g in range(groups)], walk
+
+
+def test_paired_walk_record_launches_one_cta_per_unit():
+    """A causal_walk=1 record on the paired walk launches walk.ctas CTAs, min(units, persistent_ctas), so every CTA
+    has a unit; where the rule keeps the stride it launches min(items, persistent_ctas), as a causal_walk=0 record does.
+    Host-only: no trace."""
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT_L2
+
+    mod = _walk_module()
+
+    def make(shape, ctas, walk):
+        return mod.SM90FusedMultiHeadAttentionForward(
+            shape,
+            is_causal=True,
+            bottom_right=True,
+            sched_policy=SCHED_LPT_L2,
+            qh_per_kh=shape[1] // shape[2],
+            intra_wg_overlap=True,
+            persistent=True,
+            persistent_ctas=ctas,
+            causal_walk=walk,
+        )
+
+    paired = make((2, 8, 2, 1024, 1024), 64, 1)
+    assert paired.paired_walk and paired.n_ctas == paired.walk.ctas == 64 and paired.walk.units == 64, paired.walk
+    stride = make((8, 24, 8, 256, 2048), 132, 1)
+    assert stride.walk is None and not stride.paired_walk and stride.n_ctas == 132
+    plain = make((2, 8, 2, 1024, 1024), 64, 0)
+    assert not plain.paired_walk and plain.n_ctas == 64
+
+
+def test_both_roles_walk_with_the_same_methods():
+    """The producer (tmaldg_persistent) and the compute warpgroups (walk_items) start at first_item, loop while live,
+    decode with work_of and step with next_item, so under either walk they visit the same items in the same order; each
+    of those methods takes the paired walk exactly under the record's paired_walk constant."""
+    import ast
+
+    tree = _kernel_ast()
+    for role in ("tmaldg_persistent", "walk_items"):
+        fn = _function(tree, role)
+        calls = [ast.unparse(n.func) for n in ast.walk(fn) if isinstance(n, ast.Call) and ast.unparse(n.func).startswith("self.")]
+        loops = [n for n in ast.walk(fn) if isinstance(n, ast.While)]
+        assert len(loops) == 1 and ast.unparse(loops[0].test) == "self.live(item)", (role, [ast.unparse(n.test) for n in loops])
+        assert {"self.first_item", "self.work_of", "self.next_item"} <= set(calls), (role, calls)
+    for name in ("first_item", "live", "next_item", "work_of"):
+        tests = [ast.unparse(n.test) for n in ast.walk(_function(tree, name)) if isinstance(n, ast.If)]
+        assert tests[:1] == ["cutlass.const_expr(self.paired_walk)"], (name, tests)
