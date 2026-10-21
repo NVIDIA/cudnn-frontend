@@ -1,0 +1,157 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="940" viewBox="0 0 1600 940" role="img" aria-labelledby="title desc">
+  <title id="title">Memory-bounded DSA backward determinism</title>
+  <desc id="desc">Diagram of the adaptive clustered relay used by deterministic SM100 DSA backward to reduce FP32 scratch while preserving a fixed accumulation order.</desc>
+  <defs>
+    <style>
+      .bg { fill: #f6f8fb; }
+      .panel { fill: #ffffff; stroke: #c8d8e8; stroke-width: 2; }
+      .panel-green { fill: #fbfffd; stroke: #70c9a0; stroke-width: 2; }
+      .panel-red { fill: #fffafa; stroke: #e7b4bc; stroke-width: 2; }
+      .panel-blue { fill: #f8fcff; stroke: #8dc8e8; stroke-width: 2; }
+      .title { font: 600 38px Inter, Arial, sans-serif; fill: #1c2938; }
+      .subtitle { font: 400 19px Inter, Arial, sans-serif; fill: #52657a; }
+      .h2 { font: 600 25px Inter, Arial, sans-serif; fill: #1c2938; }
+      .h3 { font: 600 18px Inter, Arial, sans-serif; fill: #25364a; }
+      .body { font: 400 16px Inter, Arial, sans-serif; fill: #3e5269; }
+      .small { font: 400 14px Inter, Arial, sans-serif; fill: #536a82; }
+      .tiny { font: 400 12px Inter, Arial, sans-serif; fill: #61778d; }
+      .mono { font: 400 14px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #425b72; }
+      .mono-strong { font: 600 15px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #2e475e; }
+      .tag { font: 600 13px Inter, Arial, sans-serif; letter-spacing: .6px; }
+      .num { font: 600 19px Inter, Arial, sans-serif; fill: white; }
+      .line { stroke: #60cdee; stroke-width: 4; fill: none; }
+      .green-line { stroke: #43cf91; stroke-width: 4; fill: none; }
+      .red-line { stroke: #f1697a; stroke-width: 4; fill: none; }
+    </style>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#60cdee"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#43cf91"/>
+    </marker>
+    <marker id="arrow-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#f1697a"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" width="1600" height="940"/>
+  <circle cx="1510" cy="-30" r="260" fill="#eaf6fb"/>
+  <circle cx="30" cy="940" r="210" fill="#eaf8f2"/>
+
+  <text class="title" x="70" y="68">Memory-Bounded DSA Backward Determinism</text>
+  <text class="subtitle" x="70" y="103">Row-aware clustered relay: fixed accumulation order with 8–32 FP32 accumulator planes</text>
+
+  <rect x="1180" y="42" width="115" height="34" rx="17" fill="#e8f7ff" stroke="#6ab9df"/>
+  <text class="tag" x="1237" y="64" text-anchor="middle" fill="#3b7290">SM100/103</text>
+  <rect x="1308" y="42" width="104" height="34" rx="17" fill="#eafaf2" stroke="#57bb8a"/>
+  <text class="tag" x="1360" y="64" text-anchor="middle" fill="#307658">8 PLANES</text>
+  <rect x="1425" y="42" width="112" height="34" rx="17" fill="#f6effb" stroke="#aa82bd"/>
+  <text class="tag" x="1481" y="64" text-anchor="middle" fill="#745083">NO GRID WAIT</text>
+
+  <!-- 1: policy -->
+  <rect class="panel" x="55" y="135" width="1490" height="196" rx="24"/>
+  <circle cx="92" cy="173" r="20" fill="#53c9ed"/>
+  <text class="num" x="92" y="180" text-anchor="middle">1</text>
+  <text class="h2" x="125" y="181">Choose the layout at plan time</text>
+
+  <rect class="panel-red" x="85" y="205" width="310" height="94" rx="16"/>
+  <text class="h3" x="105" y="233">Upstream large-Q layout</text>
+  <text class="mono-strong" x="105" y="260">128 CTAs → 128 FP32 planes</text>
+  <text class="small" x="105" y="284">1M KV, D576: 288 GiB + statistics</text>
+
+  <path class="line" d="M 410 252 L 485 252" marker-end="url(#arrow-blue)"/>
+  <text class="tiny" x="447" y="235" text-anchor="middle">if &gt; 16 GiB</text>
+
+  <rect class="panel-blue" x="505" y="205" width="480" height="94" rx="16"/>
+  <text class="h3" x="525" y="233">Preferred relay tier</text>
+  <text class="mono-strong" x="525" y="260">cluster-4 → 32 planes   |   cluster-8 → 16 planes</text>
+  <text class="small" x="525" y="284">Keeps more reducer parallelism when memory permits</text>
+
+  <path class="line" d="M 1000 252 L 1075 252" marker-end="url(#arrow-blue)"/>
+  <text class="tiny" x="1037" y="235" text-anchor="middle">if &gt; 32 GiB</text>
+
+  <rect class="panel-green" x="1095" y="205" width="410" height="94" rx="16"/>
+  <text class="h3" x="1115" y="233">Memory-first tier</text>
+  <text class="mono-strong" x="1115" y="260">cluster-16 → 8 FP32 planes</text>
+  <text class="small" x="1115" y="284">1M KV, H64, D576: 20.008 GiB total scratch</text>
+
+  <!-- 2: mapping -->
+  <rect class="panel-blue" x="55" y="355" width="925" height="318" rx="24"/>
+  <circle cx="92" cy="394" r="20" fill="#53c9ed"/>
+  <text class="num" x="92" y="401" text-anchor="middle">2</text>
+  <text class="h2" x="125" y="402">Share one plane inside each 16-CTA cluster</text>
+  <text class="small" x="85" y="431">One wave still contains 128 query CTAs; spatial grouping reduces the number of FP32 copies.</text>
+
+  <text class="mono" x="90" y="469">Q CTA ranks</text>
+  <g>
+    <rect x="185" y="446" width="62" height="42" rx="9" fill="#eaf8ff" stroke="#56c7ed"/><text class="mono" x="216" y="472" text-anchor="middle">r0</text>
+    <rect x="255" y="446" width="62" height="42" rx="9" fill="#eaf8ff" stroke="#56c7ed"/><text class="mono" x="286" y="472" text-anchor="middle">r1</text>
+    <rect x="325" y="446" width="62" height="42" rx="9" fill="#eaf8ff" stroke="#56c7ed"/><text class="mono" x="356" y="472" text-anchor="middle">r2</text>
+    <text class="body" x="410" y="473">…</text>
+    <rect x="440" y="446" width="68" height="42" rx="9" fill="#eaf8ff" stroke="#56c7ed"/><text class="mono" x="474" y="472" text-anchor="middle">r15</text>
+    <text class="body" x="535" y="473">× 8 clusters</text>
+  </g>
+  <path class="line" d="M 345 493 L 345 528" marker-end="url(#arrow-blue)"/>
+
+  <rect x="185" y="540" width="325" height="58" rx="12" fill="#eaf9f2" stroke="#67c99b"/>
+  <text class="mono-strong" x="347" y="565" text-anchor="middle">shared FP32 plane P0</text>
+  <text class="small" x="347" y="588" text-anchor="middle">only rows selected by this cluster are touched</text>
+
+  <rect x="545" y="446" width="395" height="152" rx="16" fill="#ffffff" stroke="#aacfe3"/>
+  <text class="h3" x="568" y="475">Row-rank replay mask</text>
+  <text class="small" x="568" y="501">The setup kernel derives bits from actual Top-K indices.</text>
+  <text class="mono" x="568" y="530">KV row 17:  0010 0101 0000 1001</text>
+  <text class="mono" x="568" y="557">active ranks:  r0 → r3 → r8 → r10 → r13</text>
+  <text class="small" x="568" y="584">Disjoint rows carry independent masks and progress in parallel.</text>
+
+  <rect x="85" y="620" width="855" height="30" rx="15" fill="#e9f6fb"/>
+  <text class="small" x="512" y="641" text-anchor="middle">128 query CTAs → 8 shared planes; ordering is paid only where sparse rows collide</text>
+
+  <!-- 3: protocol -->
+  <rect class="panel-green" x="1005" y="355" width="540" height="318" rx="24"/>
+  <circle cx="1042" cy="394" r="20" fill="#48d397"/>
+  <text class="num" x="1042" y="401" text-anchor="middle">3</text>
+  <text class="h2" x="1075" y="402">Fixed per-row handoff</text>
+
+  <rect x="1040" y="444" width="205" height="54" rx="12" fill="#eef9ff" stroke="#79c9e8"/>
+  <text class="mono-strong" x="1142" y="467" text-anchor="middle">wait lower active bits</text>
+  <text class="tiny" x="1142" y="487" text-anchor="middle">GPU acquire + CTA barrier</text>
+  <path class="green-line" d="M 1252 471 L 1300 471" marker-end="url(#arrow-green)"/>
+  <rect x="1310" y="444" width="195" height="54" rx="12" fill="#ecfbf4" stroke="#5fc994"/>
+  <text class="mono-strong" x="1407" y="467" text-anchor="middle">accumulate FP32 row</text>
+  <text class="tiny" x="1407" y="487" text-anchor="middle">shared plane</text>
+
+  <path class="green-line" d="M 1407 505 L 1407 537" marker-end="url(#arrow-green)"/>
+  <rect x="1175" y="548" width="330" height="58" rx="12" fill="#ecfbf4" stroke="#5fc994"/>
+  <text class="mono-strong" x="1340" y="572" text-anchor="middle">release-clear this rank bit</text>
+  <text class="tiny" x="1340" y="594" text-anchor="middle">publishes every reducer thread's writes</text>
+
+  <path class="green-line" d="M 1170 577 L 1108 577 L 1108 505" marker-end="url(#arrow-green)"/>
+  <text class="small" x="1043" y="633">Same row:</text><text class="mono" x="1123" y="633">r0 → r3 → r8 → r10 → r13</text>
+  <text class="small" x="1043" y="657">No edge exists to a rank that did not select the row.</text>
+
+  <!-- 4: proof and fold -->
+  <rect class="panel" x="55" y="698" width="1490" height="177" rx="24"/>
+  <circle cx="92" cy="737" r="20" fill="#f4b44e"/>
+  <text class="num" x="92" y="744" text-anchor="middle">4</text>
+  <text class="h2" x="125" y="745">Why the result is deterministic</text>
+
+  <rect x="85" y="775" width="300" height="66" rx="14" fill="#f8fbfd" stroke="#c5d7e6"/>
+  <text class="h3" x="235" y="802" text-anchor="middle">Same sparse inputs</text>
+  <text class="small" x="235" y="826" text-anchor="middle">produce the same per-row masks</text>
+  <path class="line" d="M 395 808 L 455 808" marker-end="url(#arrow-blue)"/>
+  <rect x="465" y="775" width="300" height="66" rx="14" fill="#f8fbfd" stroke="#c5d7e6"/>
+  <text class="h3" x="615" y="802" text-anchor="middle">Same rank order</text>
+  <text class="small" x="615" y="826" text-anchor="middle">for every conflicting KV row</text>
+  <path class="line" d="M 775 808 L 835 808" marker-end="url(#arrow-blue)"/>
+  <rect x="845" y="775" width="300" height="66" rx="14" fill="#f8fbfd" stroke="#c5d7e6"/>
+  <text class="h3" x="995" y="802" text-anchor="middle">Same wave order</text>
+  <text class="small" x="995" y="826" text-anchor="middle">from same-stream launch sequencing</text>
+  <path class="line" d="M 1155 808 L 1215 808" marker-end="url(#arrow-blue)"/>
+  <rect x="1225" y="775" width="280" height="66" rx="14" fill="#eaf9f2" stroke="#67c99b"/>
+  <text class="h3" x="1365" y="802" text-anchor="middle">Fixed FP32 fold</text>
+  <text class="small" x="1365" y="826" text-anchor="middle">8 / 16 / 32 planes → dKV</text>
+
+  <line x1="70" y1="900" x2="1530" y2="900" stroke="#cdd9e5" stroke-width="2"/>
+  <text class="small" x="70" y="925">No grid-wide semaphore • no resident-predecessor dependency • allocation-free execute() after plan-time compilation • CUDA Graph replay safe</text>
+</svg>

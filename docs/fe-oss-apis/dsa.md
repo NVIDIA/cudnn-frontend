@@ -284,6 +284,8 @@ global semaphore dependency on non-resident CTAs. The selected planes are
 folded in a fixed order. Duplicate top-k indices within one query row remain
 outside the deterministic contract, as in the bounded-wave path.
 
+![Memory-bounded DSA backward deterministic relay](assets/dsa_backward_deterministic_relay.svg)
+
 For the ordinary policy, additional dKV workspace is
 `selected_shards * K8 * D8 * sizeof(float)`, where
 `K8 = round_up(total_S_kv, 8)` and `D8 = round_up(D, 8)`. The cluster relay
@@ -302,6 +304,23 @@ On GB200 with BF16, `total_S_q=16384`, `top_k=2048`, `H=64`, `D_qk=576`, and
 increased from 89.079 ms to 104.538 ms. At shorter KV extents the narrower
 relays remain preferable, so the policy keeps cluster-4 for `total_S_kv=278528`
 before applying cluster-16 to larger layouts.
+
+At `total_S_kv=1048576` with CP64 (`total_S_q=16384` per launch), D576, and
+the generic M64 deterministic backend, the full scratch comparison is:
+
+| Heads | Dispatch scope | Upstream deterministic | Cluster-16 relay | Saved | Reduction |
+|---:|:---|---:|---:|---:|---:|
+| 16 | automatic generic M64 | 288.002 GiB | 20.002 GiB | 268.000 GiB | 93.1% |
+| 32 | automatic generic M64 | 288.004 GiB | 20.004 GiB | 268.000 GiB | 93.1% |
+| 64 | automatic generic M64 | 288.008 GiB | 20.008 GiB | 268.000 GiB | 93.1% |
+| 96 | generic M64 fallback | 288.012 GiB | 22.012 GiB | 266.000 GiB | 92.4% |
+| 128 | generic M64 fallback | 288.016 GiB | 22.016 GiB | 266.000 GiB | 92.4% |
+
+The H96/H128 rows describe configurations outside their native two-CTA
+fastpath envelope. Contiguous BF16 H96/H128 D576/Dv512 inputs with a supported
+top-k use the existing 96-plane two-CTA deterministic backend, which this
+relay change does not modify. The extra 2 GiB in the H96/H128 generic relay
+rows stores masks for a second ordered M64 head block.
 
 `SparseAttentionBackward.scratch_workspace_bytes()` reports the full scratch
 requirement on every backend: the SM100 FP32 statistics and dKV-accumulator
