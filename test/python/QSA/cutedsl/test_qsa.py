@@ -472,6 +472,8 @@ def test_paired_backward_nonfinite_isolation(supported_gpu, packed):
             if poisoned:
                 inputs["k"][keep:] = torch.nan
                 inputs["v"][keep:] = torch.inf
+            for tensor in (*out, *grads):
+                tensor.fill_(torch.nan)
             graph.replay()
             torch.cuda.synchronize()
             stop = keep if poisoned else inputs["q"].shape[0]
