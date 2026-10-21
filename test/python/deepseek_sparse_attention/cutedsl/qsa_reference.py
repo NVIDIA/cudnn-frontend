@@ -13,7 +13,7 @@ BLOCK = 4
 TOPK_BLOCKS = 512
 W = TOPK_BLOCKS * BLOCK + BLOCK - 1
 SCALE = D**-0.5
-CHUNK = 512
+CHUNK = 512  # query rows per gather, which bounds the fp32 K / V gathers to a few GB
 
 
 def make_topk_idxs(seq_len, generator):
@@ -23,7 +23,7 @@ def make_topk_idxs(seq_len, generator):
     ncb = (pos + 1) // BLOCK
     nsel = ncb.clamp(max=TOPK_BLOCKS)
     idx = torch.full((seq_len, W + 1), -1, dtype=torch.int64, device=device)
-    for r0 in range(0, seq_len, 4096):
+    for r0 in range(0, seq_len, 4096):  # rows per batch, which bounds the random-score tensor
         r1 = min(r0 + 4096, seq_len)
         nb = int(ncb[r1 - 1])
         if nb == 0:
