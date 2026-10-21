@@ -583,7 +583,9 @@ passes beyond), and a per-warp ballot compaction writes the canonical list.  Bot
 performance-only (every served value is the same function, pinned bitwise by the tests; no performance number is quoted until one is
 measured on an exclusive GPU).  Typed declines: a CuTe DSL below the floor or without the device's target (the version / target named),
 `use_pdl=True` below cc 9.0 (`griddepcontrol` exists from Hopper), a per-CTA shared-memory need above the device's opt-in limit (the
-bytes named: about 66 KB fixed plus `cols_cap / 2` B for the bitmaps); `cluster_ctas > 1` below cc 9.0 (clusters and DSMEM exist from Hopper); `ValueError` on any malformed form -- a cluster size outside
+bytes named: `smem_bytes_for(cols_cap, cluster_ctas, threads_per_cta, top_k)` -- the 32 KB histogram plus a pool sized by the
+fast path's staging regions (`threads / 32 x (top_k + 128)` words, at most 96 KB) or the fallback's list and ballot words, about
+114 KB at 32768 columns x 1024 threads x `top_k` 512, above the 99 KB opt-in limit of some parts, which serve 512 threads); `cluster_ctas > 1` below cc 9.0 (clusters and DSMEM exist from Hopper); `ValueError` on any malformed form -- a cluster size outside
 1 / 4 / 8 / 16, a thread count outside the domain (1024 for the cluster form), more than 64 keys per thread, a row block of more than 65535
 rows.  The
 in-block decode indexer that binds it over the paged compressed-key cache is a follow-up; until then the dense standalone selector keeps
