@@ -2266,14 +2266,14 @@ FP8 layout on block-scaled MMAs, with the same **64 x 64 CTA**.
 | Ragged `S_kv` (no tile rule) | ✅ | ✅ | ✅ |
 | Decode-shaped (`S_q == 1`) | ✅ | ✅ | ✅ |
 
-Base-2 stats are wired into all three f16 templates and the FP8 and MXFP8
-templates, including the final Split-KV combine. `sdpa_mxfp8` graphs take no
+Base-2 stats are wired into all four f16 templates (the decode tile included) and
+the FP8 and MXFP8 templates, including the final Split-KV combine. `sdpa_mxfp8` graphs take no
 `stats_use_log2` input, so only the direct adapter reaches the MXFP8 wiring.
 Target-SM120 numerical validation remains required; local SM80/SM100 results do
 not validate these kernels.
 
-**Split-KV with an attention sink (FP16/BF16).** The general, D=256 and D=512
-half templates write sink-free partials under a split and the split combine
+**Split-KV with an attention sink (FP16/BF16).** The general, D=256, D=512 and
+decode half templates write sink-free partials under a split and the split combine
 folds the per-head sink once (a row no split saw a key for lands on O := 0,
 LSE := sink, the unsplit contract), so a sink graph splits like any other dense
 graph. FP8 / MXFP8 still decline the pair: their epilogues fold the sink per split.

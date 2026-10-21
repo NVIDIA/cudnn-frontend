@@ -132,7 +132,10 @@ from cudnn.sdpa.fwd.config_sm120 import (
     TemplateParams as Sm120TemplateParams,
     D256_FLAVOR as _SM120_D256_FLAVOR,
     D512_FLAVOR as _SM120_D512_FLAVOR,
+    DECODE_Q_TILES as _SM120_DECODE_Q_TILES,
+    decode_kv_stage as _sm120_decode_kv_stage,
     head_tiles as _sm120_head_tiles,
+    is_decode_tile as _sm120_is_decode_tile,
     kv_tile_preference as _sm120_kv_tile_preference,
     pick_flavor as _sm120_pick_flavor,
     smem_bytes as _sm120_smem_bytes,
@@ -343,6 +346,7 @@ _SM120_KERNEL_FILES = {
     _SM120_D512_FLAVOR: "sm120/prefill_d512_f16.py",
     None: "sm120/prefill_f16.py",
 }
+_SM120_DECODE_KERNEL_FILE = "sm120/decode_f16.py"
 _SM120_FP8_KERNEL_FILES = {_SM120_D512_FLAVOR: "sm120/prefill_d512_fp8.py", None: "sm120/prefill_fp8.py"}
 _SM120_MXFP8_KERNEL_FILES = {_SM120_D512_FLAVOR: "sm120/prefill_d512_mxfp8.py", None: "sm120/prefill_mxfp8.py"}
 
@@ -752,6 +756,9 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
 
 
 def _load_sm120_kernel_module(flavor: Optional[tuple[int, int]], params: Sm120TemplateParams, fp8: bool = False, pertensor: bool = False):
+    if not fp8 and _sm120_is_decode_tile(params.q_tile):
+        # The decode tile serves every half head tile up to 256 in one body.
+        return _load_kernel_template(_SM120_DECODE_KERNEL_FILE, params, tag="sdpa_fwd_sm120_decode")
     files = (_SM120_FP8_KERNEL_FILES if pertensor else _SM120_MXFP8_KERNEL_FILES) if fp8 else _SM120_KERNEL_FILES
     tag = f"sdpa_fwd_sm120_{'fp8' if pertensor else 'mxfp8'}" if fp8 else "sdpa_fwd_sm120"
     if flavor is not None:
@@ -5395,6 +5402,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
     ``tile_m`` / ``tile_n`` are honored on every template within its kernel
     table (``config_sm120.tile_domain``); left unset, each runs the first KV
     tile of ``config_sm120.kv_tile_preference`` in that table that fits SMEM.
+    ``tile_m`` 16 / 32 runs the decode tile (``sm120/decode_f16.py``), whose
+    KV tile is its stage width (``config_sm120.decode_kv_stage``).
     """
 
     def _initialize_implementation(self) -> None:
@@ -5571,6 +5580,16 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         self._tile_domain = _sm120_tile_domain(int(d_q), int(d_v), self._fp8)
         if self.tile_m is None and not any(m == self.q_tile for m, _ in self._tile_domain):
             self.q_tile = max(m for m, _ in self._tile_domain)
+        decode_tile = _sm120_is_decode_tile(int(self.q_tile))
+        if decode_tile:
+            self._not_implemented_error_if(self._fp8, "the SM120 decode tile (tile_m 16 / 32) serves FP16/BF16 only")
+            self._not_implemented_error_if(self.thd, "the SM120 decode tile (tile_m 16 / 32) is dense-only (THD keeps the prefill templates)")
+            self._not_implemented_error_if(
+                self.flavor == _SM120_D512_FLAVOR, f"the SM120 decode tile serves head dims up to {_SM120_GENERAL_HEAD_TILE_MAX}; got {(int(d_q), int(d_v))}"
+            )
+            self._value_error_if(
+                self.sched_policy not in (None, SCHED_NATURAL), f"the SM120 decode tile runs SCHED_NATURAL only; got sched_policy={self.sched_policy}"
+            )
         if self.pack_gqa:
             self._not_implemented_error_if(
                 self.thd,
@@ -5613,13 +5632,22 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             f"Q must be a CUDA tensor, got device {self.q_desc.device}",
         )
         self._value_error_if(
-            self.q_tile not in _SM120_Q_TILES,
-            f"q_tile must be one of {_SM120_Q_TILES}",
+            self.q_tile not in _SM120_Q_TILES + _SM120_DECODE_Q_TILES,
+            f"q_tile must be one of {_SM120_Q_TILES + _SM120_DECODE_Q_TILES}",
         )
-        self._value_error_if(
-            self.kv_tile not in _SM120_KV_TILES,
-            f"kv_tile must be one of {_SM120_KV_TILES}",
-        )
+        if decode_tile:
+            # The decode tile's KV tile is its stage width, fixed by the head tiles.
+            stage = _sm120_decode_kv_stage(*_sm120_head_tiles(d_q, d_v, _SM120_HEAD_TILE_GRANULE))
+            self._value_error_if(
+                self.tile_n is not None and self.tile_n != stage,
+                f"the SM120 decode tile streams {stage}-key K/V stages at D=({d_q}, {d_v}); kv_tile must be {stage} or unset, got {self.tile_n}",
+            )
+            self.kv_tile = stage
+        else:
+            self._value_error_if(
+                self.kv_tile not in _SM120_KV_TILES,
+                f"kv_tile must be one of {_SM120_KV_TILES}",
+            )
         self._value_error_if(
             self.causal_bottom_right and not self.is_causal,
             "causal_bottom_right requires is_causal=True (a band graph arrives as is_causal with its right bound)",
@@ -5667,20 +5695,20 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 d_qp, d_vp, self.q_tile, kv_tile, self.dtype.itemsize, 2 if self._fp8 else self.dtype.itemsize, mxfp8=self._fp8 and not self._pertensor
             )
 
-        if self.tile_n is None:
+        if self.tile_n is None and not decode_tile:
             # Pick the fastest KV tile in the kernel table that fits this device.
             kv_tiles = _sm120_kv_tile_preference(d_q, mxfp8=self._fp8 and not self._pertensor)
             self.kv_tile = next((t for t in kv_tiles if (self.q_tile, t) in self._tile_domain and _smem_bytes(t) <= smem_capacity_bytes), self.kv_tile)
         self._not_implemented_error_if(
             _smem_bytes(self.kv_tile) > smem_capacity_bytes,
             (
-                f"SM120 prefill requires {_smem_bytes(self.kv_tile)} bytes of shared memory for D={d_q}, "
+                f"SM120 SDPA requires {_smem_bytes(self.kv_tile)} bytes of shared memory for D={d_q}, "
                 f"q_tile={self.q_tile}, and kv_tile={self.kv_tile}, but {arch} provides {smem_capacity_bytes} bytes"
             ),
         )
         self._not_implemented_error_if(
             (self.q_tile, self.kv_tile) not in self._tile_domain,
-            f"SM120 prefill has no kernel for q_tile={self.q_tile}, kv_tile={self.kv_tile} at D=({d_q}, {d_v}); supported: {sorted(self._tile_domain)}",
+            f"SM120 SDPA has no kernel for q_tile={self.q_tile}, kv_tile={self.kv_tile} at D=({d_q}, {d_v}); supported: {sorted(self._tile_domain)}",
         )
 
         if self.scale_softmax is None:
@@ -5760,8 +5788,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             sched_policy = SCHED_NATURAL
             # THD is excluded: the LPT decodes assume a dense rectangular
             # tile space, while a ragged batch carries its own scheduler,
-            # which walks the live units through batch_remap.
-            if self.window_right is not None and not self.thd:
+            # which walks the live units through batch_remap. So is the decode
+            # tile, whose few units carry no triangular load to balance.
+            if self.window_right is not None and not self.thd and not _sm120_is_decode_tile(int(self.q_tile)):
                 # Causal: balance the triangular load; pick the LPT variant by working set.
                 _, _, s_kv_sched, _ = self.k_desc.shape
                 _, _, _, d_qk_sched = self.q_desc.shape
