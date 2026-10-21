@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for the SM100 MXFP8 scale-layout contract."""
+"""Tests for the SM100 block-scaled (MXFP8/MXFP4) scale-layout and UMMA descriptor contract."""
 
 from types import SimpleNamespace
 
@@ -379,6 +379,7 @@ def test_blockscaled_mma_op_adapter_maps_scale_and_major_modes_host_only():
     op = SimpleNamespace(
         a_dtype=cutlass.Float8E4M3FN,
         b_dtype=cutlass.Float8E5M2,
+        sf_dtype=cutlass.Float8E8M0FNU,
         shape_mnk=(128, 256, 64),
         a_major_mode=cute.nvgpu.tcgen05.mma.OperandMajorMode.K,
         b_major_mode=cute.nvgpu.tcgen05.mma.OperandMajorMode.MN,
@@ -398,3 +399,40 @@ def test_blockscaled_mma_op_adapter_maps_scale_and_major_modes_host_only():
         a_sf_id=2,
         b_sf_id=2,
     )
+
+
+def test_blockscaled_umma_descriptor_mxfp4_host_only():
+    """Packed E2M1 with UE8M0 scales selects the .kind::mxf4 encodings."""
+    cutlass = pytest.importorskip("cutlass")
+    mma_desc = pytest.importorskip("cudnn.deepseek_sparse_attention.utils.sm100.mma_desc")
+
+    def mxfp4_desc(sf_id=0, dtype=cutlass.Float4E2M1FN, packed_fp4=True):
+        return mma_desc.make_blockscaled_instr_desc(
+            dtype,
+            dtype,
+            M=128,
+            N=128,
+            a_major=mma_desc.Major.K,
+            b_major=mma_desc.Major.K,
+            a_sf_id=sf_id,
+            b_sf_id=sf_id,
+            packed_fp4=packed_fp4,
+        )
+
+    desc = mxfp4_desc()
+    assert (desc >> 7) & 0x7 == mma_desc.MXF4Format.E2M1 == 1
+    assert (desc >> 10) & 0x3 == mma_desc.MXF4Format.E2M1
+    assert (desc >> 12) & 0x1 == 0  # reserved above the 2-bit B format
+    assert (desc >> 23) & 0x1 == 1  # UE8M0 scales
+    assert (desc >> 31) & 0x1 == 0  # dense K=64 per MMA
+    assert desc == 0x08A00480
+    assert mxfp4_desc(sf_id=2) == 0x48A004A0  # scale-factor ids in bits 4-5 (B) and 29-30 (A)
+
+    # The descriptor helper maps Float4E2M1FN only through packed_fp4 (kind::mxf4), and packed_fp4 takes only Float4E2M1FN.
+    with pytest.raises(TypeError, match="Float4E2M1FN"):
+        mxfp4_desc(packed_fp4=False)
+    with pytest.raises(TypeError, match="Float4E2M1FN"):
+        mxfp4_desc(dtype=cutlass.Float8E4M3FN)
+    # scale_vec::2X reads a scale pair per MMA, so odd scale ids are refused.
+    with pytest.raises(ValueError, match="must be 0 or 2"):
+        mxfp4_desc(sf_id=1)

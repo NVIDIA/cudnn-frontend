@@ -1,13 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""SM100 CuTeDSL unified MXFP8 dense indexer-score kernel.
+"""SM100 CuTeDSL unified MXFP8 / MXFP4 dense indexer-score kernel.
 
-This module owns the MXFP8 blockscaled QK producer and unified indexer epilogue
-used by both forward score and backward dense indexer score.
+This module owns the MXFP8 and MXFP4 blockscaled QK producer and unified indexer
+epilogue used by both forward score and backward dense indexer score.  Both
+formats carry one E8M0 scale per 32 head_dim elements, so the scale path is
+shared; the Q/K dtype picks the MMA: E4M3 runs ``kind::mxf8f6f4`` (K=32 per
+instruction) and packed E2M1 runs ``kind::mxf4`` (K=64).
 
 High-level flow:
-  1. reinterpret FP8 Q/K and packed E8M0 scales into CuTe/TMA layouts,
+  1. reinterpret E4M3 or packed E2M1 Q/K and packed E8M0 scales into CuTe/TMA layouts,
   2. load Q/K and SFB/SFA scales into SMEM,
   3. copy scales into TMEM SFB/SFA fields and issue blockscaled QK UMMA,
   4. reduce heads in FP32 to write scores and optional LSE.
@@ -69,7 +72,7 @@ from .dense_score_recompute_sm100 import (
 
 
 class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
-    """Shared MXFP8 dense score kernel with unified indexer output semantics."""
+    """Shared MXFP8 / MXFP4 dense score kernel with unified indexer output semantics."""
 
     arch = 100
     # The tile stays 128 packed rows wide for every group (the scale atom), so the
@@ -95,21 +98,22 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         # the compile keys constrained avoids dragging attention/D512 branches
         # into the generated code.
         if head_dim != 128:
-            raise ValueError("SM100 unified indexer MXFP8 currently requires head_dim=128")
+            raise ValueError("SM100 unified indexer MXFP8/MXFP4 currently requires head_dim=128")
         if sf_vec_size != 32:
-            raise ValueError("SM100 dense score MXFP8 currently requires sf_vec_size=32")
+            raise ValueError("SM100 dense score MXFP8/MXFP4 currently requires sf_vec_size=32")
         if m_block_size != 128 or n_block_size != 128:
-            raise ValueError("SM100 dense score MXFP8 currently requires m_block_size=n_block_size=128")
+            raise ValueError("SM100 dense score MXFP8/MXFP4 currently requires m_block_size=n_block_size=128")
         if qhead_per_kvhead not in (4, 8, 16, 32, 64):
-            raise ValueError("SM100 unified indexer MXFP8 requires qhead_per_kvhead in (4, 8, 16, 32, 64), " f"got {qhead_per_kvhead}")
+            raise ValueError("SM100 unified indexer MXFP8/MXFP4 requires qhead_per_kvhead in (4, 8, 16, 32, 64), " f"got {qhead_per_kvhead}")
         k_block_size = 64 if k_block_size is None else k_block_size
         # k_block_size is an internal K-split knob (num_k_chunks = head_dim_padded //
         # k_block_size; the per-chunk scale phase + base-class SMEM derive from it), so
         # any multiple of sf_vec_size that divides head_dim_padded is valid (default 64).
+        # Packed E2M1 Q/K also need a multiple of the 64-wide kind::mxf4 MMA (checked at compile).
         _hd_padded = ((head_dim + 15) // 16) * 16
         if k_block_size <= 0 or k_block_size % sf_vec_size != 0 or _hd_padded % k_block_size != 0:
             raise ValueError(
-                "SM100 unified indexer MXFP8 requires k_block_size to be a "
+                "SM100 unified indexer MXFP8/MXFP4 requires k_block_size to be a "
                 f"positive multiple of sf_vec_size ({sf_vec_size}) that divides "
                 f"head_dim_padded ({_hd_padded}); got {k_block_size}"
             )
@@ -215,6 +219,12 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         self.k_dtype = mK.element_type
         self.sf_dtype = mQScale.element_type
         is_varlen = mCuSeqlensQ is not None
+        # Packed E2M1 Q/K (MXFP4) run tcgen05 kind::mxf4: K=64 per MMA, which reads two
+        # E8M0 scales per row.  E4M3 Q/K (MXFP8) run kind::mxf8f6f4: K=32, one scale.
+        self.packed_fp4 = self.q_dtype.width == 4
+        self.mma_inst_k = 64 if const_expr(self.packed_fp4) else 32
+        if const_expr(self.k_block_size % self.mma_inst_k != 0):
+            raise ValueError(f"k_block_size ({self.k_block_size}) must be a multiple of the MMA K ({self.mma_inst_k}) for {self.q_dtype}")
 
         # The API accepts either BSHD or packed THD.  The compile key records
         # is_varlen, and these asserts make accidental mismatches fail during
@@ -278,16 +288,19 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
 
         # Two MMA descriptors are built from the same logical tile:
         #   tiled_mma_qk: ordinary shape/partition helper for data tensors,
-        #   blockscaled_tiled_mma_qk: actual MXFP8 UMMA op with SFA/SFB fields.
-        tiled_mma_qk = _make_trivial_tiled_mma(
-            self.q_dtype,
-            self.q_dtype,
-            self.k_major_mode,
-            self.q_major_mode,
-            self.qk_acc_dtype,
-            cta_group,
-            self.mma_tiler_qk[:2],
-        )
+        #   blockscaled_tiled_mma_qk: actual block-scaled UMMA op with SFA/SFB fields.
+        # Packed E2M1 data takes its layouts and partitions from the kind::mxf4 op
+        # itself: the unscaled tcgen05 kinds read FP4 only in the padded f8f6f4 format.
+        if const_expr(not self.packed_fp4):
+            tiled_mma_qk = _make_trivial_tiled_mma(
+                self.q_dtype,
+                self.q_dtype,
+                self.k_major_mode,
+                self.q_major_mode,
+                self.qk_acc_dtype,
+                cta_group,
+                self.mma_tiler_qk[:2],
+            )
         blockscaled_tiled_mma_qk = _make_blockscaled_trivial_tiled_mma(
             self.k_dtype,
             self.k_dtype,
@@ -298,6 +311,8 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
             cta_group,
             self.mma_tiler_qk[:2],
         )
+        if const_expr(self.packed_fp4):
+            tiled_mma_qk = blockscaled_tiled_mma_qk
 
         self.cluster_shape_mnk = (*self.cluster_shape_mn, 1)
         self.cluster_layout_vmnk = cute.tiled_divide(
@@ -339,7 +354,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         self.sQScale_layout = sQScale_layout
         self.sKScale_layout = sKScale_layout
 
-        # Data TMA atoms load FP8 Q/K tiles into SMEM.  Scale TMA atoms load
+        # Data TMA atoms load E4M3 or packed E2M1 Q/K tiles into SMEM.  Scale TMA atoms load
         # packed E8M0 factors as Int16 internally because CUTLASS blockscaled
         # layouts store two E8M0 bytes per logical compact element.
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(cta_group)
@@ -507,8 +522,8 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
             )
             return
 
-        # Generic blockscaled CuTe path.  kphase_offset selects the correct
-        # E8M0 scale group when k_block_size=64 accumulates two chunks.
+        # Generic blockscaled CuTe path.  kphase_offset, the index of this chunk's
+        # first MMA along K, selects its E8M0 scale group.
         num_kphases = cute.size(tSrK_stage, mode=[2])
         for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
             kphase_coord = (None, None, kphase_idx)
@@ -1667,7 +1682,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
                                 tSrQ_kc = tSrQ[None, None, None, _kc]
                                 sK_stage = sK[None, None, None, K_mma_state.index]
                                 sQ_stage = sQ[None, None, None, _kc]
-                                kphase_offset = const_expr(_kc * (self.k_block_size // self.sf_vec_size))
+                                kphase_offset = const_expr(_kc * (self.k_block_size // self.mma_inst_k))
                                 self._gemm_blockscaled_qk(
                                     blockscaled_tiled_mma_qk,
                                     tStS_cur,
