@@ -284,8 +284,6 @@ global semaphore dependency on non-resident CTAs. The selected planes are
 folded in a fixed order. Duplicate top-k indices within one query row remain
 outside the deterministic contract, as in the bounded-wave path.
 
-![Memory-bounded DSA backward deterministic relay](assets/dsa_backward_deterministic_relay.svg)
-
 For the ordinary policy, additional dKV workspace is
 `selected_shards * K8 * D8 * sizeof(float)`, where
 `K8 = round_up(total_S_kv, 8)` and `D8 = round_up(D, 8)`. The cluster relay
