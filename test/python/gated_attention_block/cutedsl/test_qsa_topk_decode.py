@@ -121,6 +121,19 @@ def _case(rows: int, cols: int, top_k: int, *, seed: int, device, kind: str = "r
     elif kind == "relu":
         # the scorer's functional form: relu over 4 heads, summed, scaled
         logits = torch.relu(torch.randn(rows, cols, 4, device=device, generator=g)).sum(-1) / math.sqrt(128.0)
+    elif kind == "spread_tie":
+        # n_above distinct values strictly above a tie value T = 100.0 (octaves above it), n_tie copies of T spread EVENLY over the
+        # ids (every slice of a 4- / 8- / 16-CTA cluster holds a few of them, under UNION_CAP), the rest randn far below T:
+        # n_above < top_k < n_above + n_tie -> the k-th key is EXACT with a PARTIAL take (the top_k - n_above smallest tied ids) and
+        # the k-th bin holds n_tie > RANK_CAP candidates: the single-CTA list passes + the 2 x 12-bit id select; the cluster form's
+        # union-list passes + the id rank behind its R2 barrier (the one path no other kind reaches)
+        n_above = (3 * top_k) // 4
+        n_tie = max(getattr(topk_mod, "RANK_CAP", 128), top_k - n_above) + 72
+        tie_ids = torch.arange(n_tie, device=device) * max(2 * (cols // (2 * n_tie)), 2)  # even ids
+        above_ids = torch.arange(n_above, device=device) * max(2 * (cols // (2 * n_above)), 2) + 1  # odd ids: disjoint from the ties
+        tie_ids, above_ids = tie_ids[tie_ids < cols], above_ids[above_ids < cols]
+        logits[:, tie_ids] = 100.0
+        logits[:, above_ids] = 1000.0 + torch.arange(above_ids.numel(), device=device, dtype=torch.float32) * 0.5
     base = [cols, max(cols // 2 + 3, 1), 0, min(cols, top_k), min(cols, top_k + 1), 1]
     counts = torch.tensor([base[i % len(base)] for i in range(rows)], dtype=torch.int32, device=device)
     for t in range(rows):
@@ -171,12 +184,13 @@ def test_matches_the_exact_canonical_reference(cols, threads):
 
 @needs_cuda
 @needs_dsl_target
-@pytest.mark.parametrize("kind", ["ties", "boundary_tie", "neg", "wide", "relu"])
+@pytest.mark.parametrize("kind", ["ties", "boundary_tie", "neg", "wide", "relu", "spread_tie"])
 def test_ties_wide_ranges_negative_and_scorer_shaped_logits(kind):
     """A row of identical logits (more candidates in the k-th bin than the candidate list holds: the row-sweep fallback), a
     two-valued row, exactly ``k + 1`` equal maxima (the largest of them is the one dropped), all-negative rows, a value range of
-    many octaves (the k-th value in the window's saturated bin: three more passes) and the scorer's own relu-sum shape: the
-    k-th-value ties resolve to the smaller ids, every form bitwise the reference."""
+    many octaves (the k-th value in the window's saturated bin: three more passes), the scorer's own relu-sum shape and a spread
+    tie at the k-th key with a partial take (the list passes, then the 2 x 12-bit id select): the k-th-value ties resolve to the
+    smaller ids, every form bitwise the reference."""
     device = torch.device("cuda")
     for threads in THREADS:
         logits, counts = _case(6, 8192, K, seed=11, device=device, kind=kind)
@@ -255,6 +269,35 @@ def test_the_cluster_form_matches_the_exact_canonical_reference(cols, cluster_ct
         _check(logits, counts, K, cluster_ctas=cluster_ctas, threads_per_cta=1024)
     logits, counts = _case(128, cols, K, seed=128 + cluster_ctas, device=device)
     _check(logits, counts, K, cluster_ctas=cluster_ctas, threads_per_cta=1024)
+
+
+@needs_cuda
+@needs_cluster_gpu
+@needs_dsl_target
+@pytest.mark.parametrize("cluster_ctas", [4, 8, 16])
+@pytest.mark.parametrize("cols", [8192, 32768])
+def test_the_cluster_form_union_list_passes_and_the_id_rank_on_a_spread_tie(cols, cluster_ctas):
+    """The k-th bin's candidates spread over every CTA (each under ``UNION_CAP``: the union path, not the merged-pass one), more of
+    them than ``RANK_CAP`` (the narrowing passes over the union list, not the all-pairs rank) and an EXACT k-th key with a PARTIAL
+    take (the id rank behind the R2 barrier names ``idstar``): the one path of the cluster form no other cell reaches.  Eight
+    launches, each bitwise the single-CTA form's result and the canonical reference; the fp64 oracle on the set.  (The 2026-10-21
+    barrier audit's HIGH finding lived here: the finder published ``idstar`` in the word every thread had just read as ``above``
+    after the last pass's scan barrier, with no barrier between that read and the write -- a latent race; the kernel now publishes
+    it in the fourth word of the record, read nowhere else.)"""
+    device = torch.device("cuda")
+    logits, counts = _case(6, cols, K, seed=29 + cluster_ctas, device=device, kind="spread_tie")
+    n0 = int(counts[0])
+    vals = torch.sort(logits[0, :n0], descending=True).values
+    assert (
+        float(vals[K - 1]) == 100.0 == float(vals[K]) and int((logits[0, :n0] > 100.0).sum()) == (3 * K) // 4
+    ), "the premise: an exact k-th key, a partial take"
+    assert int((logits[0, :n0] == 100.0).sum()) > topk_mod.RANK_CAP, "the premise: more tied candidates than the all-pairs rank takes"
+    want = _check(logits, counts, K, cluster_ctas=1, threads_per_cta=1024)
+    outs = [_run(logits, counts, K, cluster_ctas=cluster_ctas, threads_per_cta=1024) for _ in range(8)]
+    torch.cuda.synchronize()
+    for i, out in enumerate(outs):
+        assert torch.equal(out, want), f"launch {i} of the cluster form differs from the single-CTA form"
+    assert_set_matches_fp64_topk(logits, counts, outs[0])
 
 
 @needs_cuda
@@ -636,7 +679,7 @@ def _render(tmp_path, threads, use_pdl, cap, cluster_ctas):
 @pytest.mark.parametrize("threads,use_pdl,cap", [(1024, False, 32768), (1024, True, 8192), (512, False, 32768)])
 def test_sm_107a_rendering_of_the_single_cta_form_carries_the_tables_structure(tmp_path, threads, use_pdl, cap):
     """A host trace-compile for sm_107a (no GPU): the single-CTA form holds NO cluster barrier, NO DSMEM access, NO mbarrier, NO
-    ``match.any``; its hot path is ``bar.sync`` sites only (the barrier table: B0, B1 / B2 / B3, C1 / C2, R1, F on the common path, the
+    ``match.any``; its hot path is ``bar.sync`` sites only (the barrier table: B0, B1 / B2 / B3, C1, R1, F on the common path, the
     rare paths' own); shared atomics and warp ``redux`` present; the griddepcontrol pair iff ``use_pdl``; no ``%lanemask_lt`` read (the
     mask is derived); the row read by ``EPT + 1`` global loads (the count and one per round); no local-memory spill at 8192 columns
     (the 32-key tile at 32768 x 1024 is allowed its few)."""
