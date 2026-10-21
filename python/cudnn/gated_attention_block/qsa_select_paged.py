@@ -292,7 +292,8 @@ def qsa_select_decode_paged(
     * ``stream``: the LAUNCH stream -- a ``torch.cuda.Stream`` (on ``qi``'s device), a raw CUDA stream handle (an ``int`` or a
       ``cuda.CUstream``), or ``None`` = torch's current stream on ``qi``'s device.  It is resolved to one torch stream before any
       torch operation of the call, and every one of them (the output allocations here, the top-k wrapper's allocations and
-      launch) runs on it (Rule 5); the two kernels receive its raw handle.
+      launch) runs on it (Rule 5); the two kernels receive its raw handle.  ``qi``'s device is selected for the compile and the
+      launch setup whichever device is current at the call, and the caller's device is restored on return.
 
     Raises:
         NotImplementedError: a CuTe DSL below the floor / without the target, a device below cc 9.0 (the radix top-k's bound;
@@ -387,21 +388,25 @@ def qsa_select_decode_paged(
     from .kernels.qsa_score_paged import compile_qsa_score_paged, run_qsa_score_paged
 
     dev = qi.device.index if qi.device.index is not None else torch.cuda.current_device()
-    recipe = compile_qsa_score_paged(
-        h_i=h_i, s_q=int(seq_q), page_size=page_size, units_per_warp=int(units_per_warp), has_block_lens=True, use_pdl=bool(use_pdl), device=dev
-    )
+    # The operand device is SELECTED for the compile and the whole launch setup -- the house rule for a direct standalone entry:
+    # nothing of the call depends on which device is current (`stream_context`'s fast path does not switch devices; the DSL's
+    # compile and its load of the launchable run under the current device); the caller's device is restored on exit.
+    with torch.cuda.device(dev):
+        recipe = compile_qsa_score_paged(
+            h_i=h_i, s_q=int(seq_q), page_size=page_size, units_per_warp=int(units_per_warp), has_block_lens=True, use_pdl=bool(use_pdl), device=dev
+        )
 
-    # Rule 5: ONE torch stream resolved from `stream` FIRST (a torch.cuda.Stream / a raw handle / a cuda.CUstream; None = torch's current
-    # stream on qi's device); every torch operation below -- the scorer's output allocations, the top-k wrapper's own allocations and
-    # launch -- runs inside its context, and both kernels receive its raw handle.
-    launch = launch_stream(stream, qi.device)
-    raw_stream = int(launch.cuda_stream)
-    with stream_context(launch, qi.device):
-        logits = torch.empty((t, n_blocks_max), dtype=torch.float32, device=qi.device) if logits_out is None else logits_out
-        counts = torch.empty((t,), dtype=torch.int32, device=qi.device) if counts_out is None else counts_out
-        block_lens = torch.empty((t,), dtype=torch.int32, device=qi.device) if block_lens_out is None else block_lens_out
-        run_qsa_score_paged(recipe, qi, kbar, block_table, kv_lens, logits, counts, block_lens, top_k=int(top_k), scale=float(scale), stream=raw_stream)
-        selected = indexer_top_k_wrapper(logits, counts, int(top_k), next_n=1, return_val=True, stream=raw_stream, tie_break=0, deterministic=True)
+        # Rule 5: ONE torch stream resolved from `stream` FIRST (a torch.cuda.Stream / a raw handle / a cuda.CUstream; None = torch's
+        # current stream on qi's device); every torch operation below -- the scorer's output allocations, the top-k wrapper's own
+        # allocations and launch -- runs inside its context, and both kernels receive its raw handle.
+        launch = launch_stream(stream, qi.device)
+        raw_stream = int(launch.cuda_stream)
+        with stream_context(launch, qi.device):
+            logits = torch.empty((t, n_blocks_max), dtype=torch.float32, device=qi.device) if logits_out is None else logits_out
+            counts = torch.empty((t,), dtype=torch.int32, device=qi.device) if counts_out is None else counts_out
+            block_lens = torch.empty((t,), dtype=torch.int32, device=qi.device) if block_lens_out is None else block_lens_out
+            run_qsa_score_paged(recipe, qi, kbar, block_table, kv_lens, logits, counts, block_lens, top_k=int(top_k), scale=float(scale), stream=raw_stream)
+            selected = indexer_top_k_wrapper(logits, counts, int(top_k), next_n=1, return_val=True, stream=raw_stream, tie_break=0, deterministic=True)
     return TupleDict(block_ids=selected["indices"], block_lens=block_lens, scores=selected["values"], logits=logits, counts=counts)
 
 

@@ -723,30 +723,31 @@ def compile_qsa_score_paged(
         # The dict is the in-process memo; behind it sits the persistent compiled-plan cache, keyed by this file's digest
         # (``FROST_SOURCE_DIGEST`` above) + the key's plain values: a second process reloads the object instead of re-tracing.
         cache_key = template_key(globals(), {"key": key}, "compile_qsa_score_paged")
-        compiled_cache[key] = compile_cached(
-            qsa_score_paged_launch,
-            _fake_q(h_i),
-            _fake_kbar(rows_per_page),
-            _fake_i32_2d(),  # the table [B, max_pages]
-            _fake_i32_1d(),  # kv_lens
-            _fake_f32_2d(),  # logits [T, n_blocks_max]
-            _fake_i32_1d(),  # counts
-            _fake_i32_1d() if has_block_lens else None,
-            cutlass.Int32(0),  # top_k    ) runtime; the zeros pin the TYPE only
-            cutlass.Float32(0.0),  # scale    )
-            cutlass.Int32(0),  # n_chunks )
-            cutlass.Int32(0),  # batch    )
-            int(h_i),
-            int(s_q),
-            int(rows_per_page),
-            int(units_per_warp),
-            int(ring_depth),
-            bool(use_pdl),
-            _FAKE_STREAM,
-            options="--enable-tvm-ffi",
-            cache_key=cache_key,
-            symbol="cudnn_block_qsa_score_paged",
-        )
+        with torch.cuda.device(dev):  # the compile and the DSL's load of the launchable run ON the artifact's device, whichever device is current
+            compiled_cache[key] = compile_cached(
+                qsa_score_paged_launch,
+                _fake_q(h_i),
+                _fake_kbar(rows_per_page),
+                _fake_i32_2d(),  # the table [B, max_pages]
+                _fake_i32_1d(),  # kv_lens
+                _fake_f32_2d(),  # logits [T, n_blocks_max]
+                _fake_i32_1d(),  # counts
+                _fake_i32_1d() if has_block_lens else None,
+                cutlass.Int32(0),  # top_k    ) runtime; the zeros pin the TYPE only
+                cutlass.Float32(0.0),  # scale    )
+                cutlass.Int32(0),  # n_chunks )
+                cutlass.Int32(0),  # batch    )
+                int(h_i),
+                int(s_q),
+                int(rows_per_page),
+                int(units_per_warp),
+                int(ring_depth),
+                bool(use_pdl),
+                _FAKE_STREAM,
+                options="--enable-tvm-ffi",
+                cache_key=cache_key,
+                symbol="cudnn_block_qsa_score_paged",
+            )
     return QsaScorePagedRecipe(
         compiled=compiled_cache[key],
         h_i=int(h_i),
@@ -782,7 +783,8 @@ def run_qsa_score_paged(
     with a unit column stride, ``max_pages x R >= n_blocks_max``; ``kv_lens [B]`` int32; ``logits [T, n_blocks_max]`` fp32 with a
     unit column stride and 16-byte-aligned rows; ``counts [T]`` int32; ``block_lens [T]`` int32 iff the artifact traces it;
     ``top_k`` in ``[1, 2048]``; ``scale > 0`` (the ordering is scale-free); ``stream`` a raw CUDA stream handle (an ``int`` or a
-    ``cuda.CUstream``; the host entry resolves a ``torch.cuda.Stream`` to it)."""
+    ``cuda.CUstream``; the host entry resolves a ``torch.cuda.Stream`` to it).  The operands must live on the artifact's device
+    (``r.device``, typed); the launch selects that device whichever device is current at the call and restores the caller's."""
     if not isinstance(qi, torch.Tensor) or qi.dim() != 3:
         raise ValueError(f"qi must be a [T, H_i, {INDEX_HEAD_DIM}] bf16 tensor, got {getattr(qi, 'shape', type(qi).__name__)}")
     if qi.dtype != torch.bfloat16:
@@ -839,18 +841,21 @@ def run_qsa_score_paged(
         raise ValueError(f"top_k must be in [1, {TOP_K_KERNEL_MAX}], got {top_k}")
     if not float(scale) > 0.0:
         raise ValueError(f"scale must be positive (the ordering is scale-free), got {scale}")
+    if device.index is not None and device.index != r.device:
+        raise ValueError(f"this artifact was compiled for CUDA device {r.device}; the operands live on {device} (compile one per device)")
     n_chunks = _ceil_div(n_blocks_max, blocks_per_cta(r.units_per_warp))
-    r.compiled(
-        qi,
-        kbar_view,
-        block_table,
-        kv_lens,
-        logits,
-        counts,
-        block_lens,
-        cutlass.Int32(int(top_k)),
-        cutlass.Float32(float(scale)),
-        cutlass.Int32(n_chunks),
-        cutlass.Int32(batch),
-        cuda.CUstream(int(stream)),
-    )
+    with torch.cuda.device(r.device):  # the launch runs in the artifact's context whichever device is current at the call
+        r.compiled(
+            qi,
+            kbar_view,
+            block_table,
+            kv_lens,
+            logits,
+            counts,
+            block_lens,
+            cutlass.Int32(int(top_k)),
+            cutlass.Float32(float(scale)),
+            cutlass.Int32(n_chunks),
+            cutlass.Int32(batch),
+            cuda.CUstream(int(stream)),
+        )

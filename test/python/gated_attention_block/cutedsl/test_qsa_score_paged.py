@@ -25,8 +25,9 @@ step, a visible count inside a page, a ``-1`` / out-of-range table page under a 
 Selector cells (cc 9.0+: the radix top-k): the selected SET of every row equals ``torch.topk`` of the fp64 reference up to
 ties at the k-th boundary (the dense decode selector's oracle), the ids ASCENDING with ``-1`` past ``block_lens``, the identity
 region (fewer than ``top_k`` visible blocks selects every one), two calls BITWISE, preallocated outputs used in place, the selection
-on a side stream with the ambient stream parked bitwise a synchronised control; the agreement with the dense-cache selector runs
-where that module is present (probed by name, skipped by name otherwise).
+on a side stream with the ambient stream parked bitwise a synchronised control, the selection with ANOTHER device current bitwise
+the same-device control (two visible devices); the agreement with the dense-cache selector runs where that module is present
+(probed by name, skipped by name otherwise).
 """
 
 import hashlib
@@ -132,10 +133,10 @@ class _Case:
         return scores.masked_fill(~visible, float("-inf"))
 
     def outputs(self, with_lens=True):
-        t = self.batch * self.s_q
-        logits = torch.full((t, self.n_blocks_max), SENTINEL, dtype=torch.float32, device=_DEV)
-        counts = torch.full((t,), -7, dtype=torch.int32, device=_DEV)
-        lens = torch.full((t,), -7, dtype=torch.int32, device=_DEV) if with_lens else None
+        t, dev = self.batch * self.s_q, self.qi.device  # the operands' device, whichever device is current at the call
+        logits = torch.full((t, self.n_blocks_max), SENTINEL, dtype=torch.float32, device=dev)
+        counts = torch.full((t,), -7, dtype=torch.int32, device=dev)
+        lens = torch.full((t,), -7, dtype=torch.int32, device=dev) if with_lens else None
         return logits, counts, lens
 
     def run(self, recipe, *, table=None, top_k=TOP_K, scale=None, with_lens=True):
@@ -842,6 +843,80 @@ def test_selector_on_a_side_stream_with_the_ambient_stream_parked_matches_the_sy
     print(f"premise: parked_at_issue={parked_at_issue} parked_at_compare={parked_at_compare}; same={same}")
     assert parked_at_issue and parked_at_compare, "the premise: the ambient stream must still be busy at the issue and at the comparison"
     assert all(same.values()), f"the selection on the side stream differs from the synchronised control: {same}"
+
+
+def _evict_scorer_memo(h_i, s_q, page_size):
+    """Drop the in-process compile memo of one shape (every knob and device): the next compile of that shape happens anew -- through the
+    persistent compiled-plan cache or a trace -- so a test sees WHERE a compile loads its launchable; a warm memo would hide it."""
+    for key in [k for k in sp.compiled_cache if k[:3] == (h_i, s_q, page_size)]:
+        del sp.compiled_cache[key]
+
+
+@needs_selector
+def test_selector_with_another_device_current():
+    """The direct standalone entry selects the OPERAND device (the house rule): with another CUDA device current -- and torch on that
+    device's default stream -- the selection on tensors of the target device compiles, allocates and launches in the target's context
+    and stream, bitwise the control taken with the target current, with an implicit stream (None) and with an explicit
+    ``torch.cuda.Stream`` of the target; the caller's current device is restored on return.  Skips below two visible devices."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two CUDA devices")
+    target = torch.cuda.current_device()
+    other = next(i for i in range(torch.cuda.device_count()) if i != target)
+    case = _Case(2, 3, 1032, 16, [4 * 1032 - 1, 4 * 300 + 2], seed=23)
+    control = fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, seq_q=3)
+    torch.cuda.synchronize(target)
+    ref = case.reference(D**-0.5).view(6, 1032)
+    _assert_rows(control["block_ids"], control["scores"], control["block_lens"], ref, TOP_K)
+    side = torch.cuda.Stream(device=target)
+    for arg in (None, side):
+        _evict_scorer_memo(H, 3, 16)  # the scorer compiles COLD under the foreign device each time (the control above would otherwise have warmed it)
+        with torch.cuda.device(other):
+            with torch.cuda.stream(torch.cuda.default_stream(other)):  # the default-stream sentinel of a FOREIGN device
+                out = fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, seq_q=3, stream=arg)
+                assert torch.cuda.current_device() == other, "the caller's current device was not restored"
+        torch.cuda.synchronize(target)
+        assert out["logits"].device.index == target and out["block_ids"].device.index == target
+        for key in ("block_ids", "counts", "block_lens"):
+            assert torch.equal(out[key], control[key]), (arg, key)
+        assert torch.equal(_bits(out["scores"]), _bits(control["scores"]))
+        live = torch.arange(1032, device=case.qi.device)[None, :] < control["counts"][:, None]
+        assert torch.equal(_bits(out["logits"][live]), _bits(control["logits"][live]))
+    # the kernel-level pair alone: compiled COLD for the target while the other device is current, launched likewise; a mismatched artifact is typed
+    _evict_scorer_memo(H, 3, 16)
+    with torch.cuda.device(other):
+        r = sp.compile_qsa_score_paged(h_i=H, s_q=3, page_size=16, device=target)
+        logits, counts, lens = case.outputs()
+        sp.run_qsa_score_paged(
+            r,
+            case.qi,
+            case.pool,
+            case.table,
+            case.kv_lens,
+            logits,
+            counts,
+            lens,
+            top_k=TOP_K,
+            scale=D**-0.5,
+            stream=torch.cuda.current_stream(target).cuda_stream,
+        )
+        assert torch.cuda.current_device() == other
+    torch.cuda.synchronize(target)
+    _assert_scorer(case, logits, counts, lens)
+    wrong = sp.compile_qsa_score_paged(h_i=H, s_q=3, page_size=16, device=other)
+    with pytest.raises(ValueError, match="compiled for CUDA device"):
+        sp.run_qsa_score_paged(
+            wrong,
+            case.qi,
+            case.pool,
+            case.table,
+            case.kv_lens,
+            logits,
+            counts,
+            lens,
+            top_k=TOP_K,
+            scale=D**-0.5,
+            stream=torch.cuda.current_stream(target).cuda_stream,
+        )
 
 
 @needs_selector
