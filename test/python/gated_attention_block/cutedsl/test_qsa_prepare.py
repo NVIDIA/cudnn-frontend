@@ -26,8 +26,10 @@ The PAGED compress arm (the serving stack's ring and compressed-key cache throug
 the same tokens (two call sites of ONE addressing helper per table), the slot form bitwise the derived form, the table arm
 bitwise the per-token form, a padding sequence (``kv_lens 0``) writing nothing, a live sequence whose state entry is the null
 block or lies past the ring owning no ring in BOTH kernels (no ring row anywhere, a ring-fed block ``-2``), the table arm's host
-bound (a table of exactly the addressable positions served, one row short refused by form), the refusals in both directions,
-and the decode form's census -- four unfused launches, one fused.
+bound (a table of exactly the addressable positions served, one row short refused by form), the table arm's IN-KERNEL ceiling on
+the live positions (a row at or past the table: ``-2`` in both kernels, its Q / K / K-pool / indexer-query rows, its ring row and
+its block unwritten, the neighbour below the ceiling bitwise the unfused chain), the refusals in both directions, and the decode
+form's census -- four unfused launches, one fused.
 """
 
 import os
@@ -139,7 +141,8 @@ def _launch_names(*runs):
 class _Chain:
     """A decode (or prefill) step's operands at a geometry: the ``[T, N]`` slab with its five bands, the pools, the
     slot mapping (every 5th token padded, one slot past the pool), the per-token and the position-indexed RoPE tables,
-    the ring state and the compressed-key cache; ``run_unfused`` / ``run_fused`` write into independent copies."""
+    the ring state and the compressed-key cache; ``run_unfused`` / ``run_fused`` write into independent copies.  ``n_pos`` fixes
+    the positions the cache and the table hold (default: every position of the step + 8)."""
 
     def __init__(
         self,
@@ -163,6 +166,7 @@ class _Chain:
         ring_slots=False,
         rope_table=False,
         padding=(),
+        n_pos=None,
     ):
         dev = "cuda"
         self.dtype, self.slot_dtype, self.layout, self.apply_norm, self.band = dtype, slot_dtype, layout, apply_norm, band
@@ -209,7 +213,7 @@ class _Chain:
         self.n_commit = None if n_commit is None else torch.tensor(list(n_commit), dtype=torch.int32, device=dev)
         # the position table holds EXACTLY the positions the compress arm's cache can address -- NB x pool on the dense form,
         # max_pages x P on the paged one -- which is the RoPE-table arm's host bound, met with equality (the accept cell at the bound)
-        s_need = int(self.pos0.max().item()) + rows + 8
+        s_need = int(self.pos0.max().item()) + rows + 8 if n_pos is None else int(n_pos)
         self.nb_cap = (s_need + _POOL - 1) // _POOL
         self.rpp = page // _POOL
         self.n_lpages = (self.nb_cap + self.rpp - 1) // self.rpp
@@ -1084,6 +1088,66 @@ def test_rope_table_arm_is_bitwise_the_per_token_form(paged):
             stream=_stream(),
             **short,
         )
+
+
+@requires_cuda
+@pytest.mark.parametrize("paged", [False, True], ids=["dense_state", "paged_state"])
+@pytest.mark.parametrize("rows, pos0", [(1, (16, 15)), (4, (14, 3))], ids=["one_row_at_the_ceiling", "mtp_four_rows_straddling_it"])
+def test_rope_table_arm_row_at_or_past_the_table_reports_minus_two_and_stores_nothing_rotated(paged, rows, pos0):
+    """The RoPE-table arm checks the LIVE (device-derived) position of every row against the table IN-KERNEL -- the host cannot
+    (``pos0`` / ``kv_lens`` are device data).  A 16-position compressed-key cache (dense: 4 blocks; paged: one page of P 16 behind a
+    1-wide block table) with a table of exactly those 16 rows (the host bound met with equality): the sequence stepping at position 16
+    (``pos0 16``; paged ``kv_lens 17``) is reported ``-2`` by the fused launch AND by the step form, its Q / K slab rows keep the
+    projection's bits (never rotated with the clamped row 15), its K pool row and its indexer-query row stay at their sentinels, its
+    ring row and the cache are untouched; its V pool row and its raw-key pool row (position-free bit copies) are written as in the
+    per-token form.  The in-bounds sequence (position 15, ``kv_lens 16``) is bitwise the unfused chain on every output and completes
+    block 3 from the ring.  The four-row form straddles the ceiling: rows at 14 / 15 served bitwise (``[-1, 3]``), rows at 16 / 17
+    untouched and ``-2``; the second sequence (positions 3 .. 6) completes block 0.  The previous kernel reported ``-1`` for the rows
+    past the table and stored their Q / K / K-pool / indexer-query rows rotated at the clamped row."""
+    ch = _Chain(_GEOM_SMALL, batch=len(pos0), rows=rows, pos0=pos0, paged=paged, page=16, cap=8, rope_table=True, n_pos=16, pad_every=0)
+    assert ch.cos_pos.shape[1] == 16 and ch.nb_cap == 4 and (not paged or ch.n_lpages == 1)
+    gen = torch.Generator(device="cuda").manual_seed(5)
+    ch.slot = torch.randperm(ch.n_pages * _PAGE, generator=gen, device="cuda")[: ch.T].to(ch.slot_dtype)  # every token on a live slot
+    ch.live = torch.ones_like(ch.slot, dtype=torch.bool)
+    ch.compile_unfused()
+    ch.compile_fused()
+    ch.run_unfused()
+    ch.run_fused()
+    torch.cuda.synchronize()
+    A, Bf = ch.A, ch.Bf
+    positions = [p + j for p in pos0 for j in range(rows)]  # token t = b * rows + j
+    over = [t for t, p in enumerate(positions) if p >= 16]
+    served = [t for t, p in enumerate(positions) if p < 16]
+    assert over and served, positions
+    want = [[-2 if p + j >= 16 else (((p + j) // _POOL) if (p + j) % _POOL == _POOL - 1 else -1) for j in range(rows)] for p in pos0]
+    assert Bf["cslot"].tolist() == want, (Bf["cslot"].tolist(), want)
+    assert _same(A["cslot"], Bf["cslot"]) and _same(A["ring"], Bf["ring"]) and _same(A["comp"], Bf["comp"]), "the step form and the fused launch disagree"
+    q0, k0 = ch.cols(ch.slab0, ch.o_q, ch.h_q, ch.d), ch.cols(ch.slab0, ch.o_k, ch.h_kv, ch.d)
+    v0, raw0 = ch.cols(ch.slab0, ch.o_v, ch.h_kv, ch.d), ch.cols(ch.slab0, ch.o_ik, 1, ch.d_i)
+    qa, ka = ch.cols(A["slab"], ch.o_q, ch.h_q, ch.d), ch.cols(A["slab"], ch.o_k, ch.h_kv, ch.d)
+    qb, kb = ch.cols(Bf["slab"], ch.o_q, ch.h_q, ch.d), ch.cols(Bf["slab"], ch.o_k, ch.h_kv, ch.d)
+    s_ = ch.slot.long()
+    for t in over:
+        assert _same(qb[t], q0[t]) and _same(kb[t], k0[t]), f"token {t} (position {positions[t]}): a Q / K row past the table was rotated and stored"
+        assert torch.isnan(Bf["k_pool"][s_[t] // _PAGE, :, s_[t] % _PAGE, :].float()).all(), f"token {t}: the K pool row of a row past the table was written"
+        assert _same(Bf["v_pool"][s_[t] // _PAGE, :, s_[t] % _PAGE, :], v0[t]), f"token {t}: the V pool row (a position-free bit copy) must still be written"
+        assert _same(Bf["i_pool"][s_[t] // _PAGE, s_[t] % _PAGE, :], raw0[t, 0]), f"token {t}: the raw-key pool row (a bit copy) must still be written"
+        assert torch.isnan(Bf["qi"][t].float()).all(), f"token {t}: an indexer-query row past the table was written"
+        b, p = t // rows, positions[t]
+        ring_row = Bf["ring"][int(ch.state_table[b, 0]), p % ch.ring_n, 0] if paged else Bf["ring"][b, p % ch.ring_n]
+        ring_was = ch.ring0[int(ch.state_table[b, 0]), p % ch.ring_n, 0] if paged else ch.ring0[b, p % ch.ring_n]
+        assert _same(ring_row, ring_was), f"token {t}: the ring row of a position past the table was written"
+    for t in served:
+        assert _same(qb[t], qa[t]) and _same(kb[t], ka[t]), f"token {t} (position {positions[t]}): Q / K differ from the unfused chain"
+        assert _same(Bf["k_pool"][s_[t] // _PAGE, :, s_[t] % _PAGE, :], A["k_pool"][s_[t] // _PAGE, :, s_[t] % _PAGE, :]), t
+        assert _same(Bf["qi"][t], A["qi"][t]), t
+    assert _same(Bf["v_pool"].contiguous(), A["v_pool"].contiguous()) and _same(Bf["i_pool"], A["i_pool"])
+    # the blocks the report names exist in the cache, and nothing else was written there
+    for b, row in enumerate(want):
+        for blk in row:
+            if blk >= 0:
+                assert bool((ch.kbar_row(Bf, b, blk).float() != ch.sent).any()), (b, blk)
+    assert int((Bf["comp"].float() != ch.sent).any(-1).sum()) == sum(1 for row in want for blk in row if blk >= 0)
 
 
 @requires_cuda

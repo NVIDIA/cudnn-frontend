@@ -90,9 +90,13 @@ RING of raw keys, ``raw_key_ring [B, RING, D]`` in the io dtype:
   row);
 * ``compressed_slot [B, S_q]`` int32 reports per row: the block id written,
   ``-1`` = this row completes no block (or is an uncommitted draft), ``-2`` =
-  the row would complete a block the compressed-key cache or the RoPE table
-  cannot hold (``blk >= out.shape[1]`` or ``blk * POOL >= cos.shape[1]``;
-  nothing is written -- size both for the context);
+  the row's position lies at or past the RoPE table (``pos0 + j >= cos.shape[1]``:
+  the table is the CEILING on positions, checked on the live position of every
+  committed row -- the row writes nothing, no ring row either; no block ever
+  pools a ring row at or past the table, since a block's rows all lie at or
+  below its completing row's position) or the row would complete a block the
+  compressed-key cache cannot hold (``blk >= out.shape[1]``: the block is not
+  written; the raw key still enters the ring) -- size both for the context;
 * ``RING >= S_q + POOL - 1`` (``min_ring_rows``), validated on the host: a
   completing row of this step reads ring positions down to ``pos0 - POOL +
   1`` while the step's committed rows write positions ``pos0 .. pos0 + S_q -
@@ -162,7 +166,8 @@ ring row only for ``physical_block > 0``; an entry past the ring reads as the nu
 and a block of its that needs ring rows -- a block starting below ``pos0`` -- reports ``-2`` and writes nothing, so the null
 block's rows are never pooled into a live sequence's block (a block pooled from this step's rows alone is still written); a
 completing row whose block lies past the table's width, on a negative (unassigned) page or on a page past the
-cache reports ``-2`` and writes nothing (the capacity rule of the dense form); ``n_commit`` keeps its meaning.  The aliasing
+cache reports ``-2`` and writes nothing (the capacity rule of the dense form); a committed row at or past the RoPE table reports ``-2``
+and writes nothing, no ring row either (the table ceiling of the dense form); ``n_commit`` keeps its meaning.  The aliasing
 argument of the dense form holds unchanged: a completing row of this step reads ring positions ``pos0 - POOL + 1 ..
 pos0 - 1`` while the step writes positions ``pos0 .. pos0 + S_q - 1``, disjoint rows whenever ``cap >= S_q + POOL - 1``
 (``min_ring_rows``; a cap of 4 serves ``S_q = 1``, 8 serves ``S_q <= 5``), so within a launch no row is read after another
@@ -621,8 +626,11 @@ def moved_bytes(batch: int, seq_len: int, d: int, *, pool: int = DEFAULT_POOL, e
 SLOT_NO_BLOCK = -1
 """``compressed_slot`` value: this row completes no block, or is an uncommitted draft."""
 SLOT_CAPACITY = -2
-"""``compressed_slot`` value: the row completes a block past the compressed-key cache or the RoPE table, or (paged form) a block
-that needs ring rows the sequence does not own; nothing written."""
+"""``compressed_slot`` value: the committed row's position lies at or past the RoPE table (``pos >= S_pos`` -- the table is the ceiling on
+positions, checked in-kernel on the live position of EVERY committed row, completing or not: no ring row, no block, and under the fused
+launch's RoPE-table arm no Q / K / indexer-query row is written for it), or the row completes a block the compressed-key cache cannot
+hold, or (paged form) a block that needs ring rows the sequence does not own or a block on an unassigned page (the block is not written;
+the committed row's raw key still enters the ring, since the position itself is served)."""
 
 _RING_SLOT_DTYPES = (torch.int32, torch.int64)
 E4M3_STORE_DECLINE = (
@@ -647,7 +655,6 @@ def step_position(mPos0: Optional[cute.Tensor], mKvLens: Optional[cute.Tensor], 
     """The position of row 0 of sequence ``b``: ``kv_lens[b] - S_q`` from the KV length AFTER the step (the paged form -- a
     negative value marks the rows below position 0 dead), or the ``pos0`` vector clamped at 0 (the dense form -- a negative
     ``pos0`` is the first step of a sequence).  Exactly one of the two vectors is bound (the host checks)."""
-    pos0 = cutlass.Int32(0)
     if cutlass.const_expr(mKvLens is not None):
         pos0 = ld_global(mKvLens.iterator.toint() + b.to(cutlass.Int64) * cutlass.Int64(4), cutlass.Int32) - s_q
     else:
@@ -815,16 +822,23 @@ def frost_qsa_compress_step(
         fits = blk < n_cap
         blk_r = blk if fits else n_cap - cutlass.Int32(1)
         out_row = mOut.iterator.toint() + (b64 * cutlass.Int64(mOut.stride[0]) + blk_r.to(cutlass.Int64) * cutlass.Int64(mOut.stride[1])) * bpe
+    # The RoPE table is the CEILING on positions: a committed row at p >= S_pos has no table row (the fused launch's RoPE-table arm
+    # would rotate it with a clamped row), so it writes nothing -- no ring row, no block -- and reports -2.  A block's rows all lie at
+    # or below its completing row's position, so no block ever pools a ring row at or past the table, and the block start's table row
+    # exists whenever the completing row's does (tok0 <= p).
+    in_table = cutlass.Boolean(True)
+    past_table = cutlass.Boolean(False)
     if cutlass.const_expr(rope_dim > 0):
-        fits = fits & (tok0 < s_pos)
-    write_blk = committed & completes & fits
+        in_table = p < s_pos
+        past_table = p >= s_pos
+    write_blk = committed & completes & fits & in_table
 
     lane_off = lane.to(cutlass.Int64) * cutlass.Int64(ACCESS_BYTES)
     knew_tok = cutlass.Int64(mKnew.stride[1]) * bpe
     knew_b = mKnew.iterator.toint() + b64 * cutlass.Int64(mKnew.stride[0]) * bpe
 
-    # --- (1) the committed row's raw key enters the ring: a bit copy, 16 B per lane ----
-    ring_write = committed & owns_ring
+    # --- (1) the committed row's raw key enters the ring: a bit copy, 16 B per lane (never for a row at or past the table) ----
+    ring_write = committed & owns_ring & in_table
     if cutlass.const_expr(has_ring_slots):
         dst, slot_live = ring_slot_address(mRing, mRingSlots, b * s_q + jr, ring_slot_i64, bpe)
         ring_write = ring_write & slot_live
@@ -904,8 +918,9 @@ def frost_qsa_compress_step(
             packed = [fp32_to_fp16(y[i], y[i + 1], dtype=mOut.element_type) for i in range(0, ELEMS_PER_ACCESS, 2)]
             st_global_v4(out_row + off, packed, cutlass.Int32)
 
-    # --- the per-row report: the block id written, -1 (no block / draft), -2 (capacity) ----
-    slot_val = cutlass.Int32(SLOT_CAPACITY) if (committed & completes) else cutlass.Int32(SLOT_NO_BLOCK)
+    # --- the per-row report: the block id written, -1 (no block / draft), -2 (capacity: a block the cache cannot hold, or a row at or
+    # past the table) ----
+    slot_val = cutlass.Int32(SLOT_CAPACITY) if (committed & (completes | past_table)) else cutlass.Int32(SLOT_NO_BLOCK)
     slot_val = blk if write_blk else slot_val
     if in_row & (lane == cutlass.Int32(0)):
         slot_addr = mSlot.iterator.toint() + (b64 * cutlass.Int64(mSlot.stride[0]) + jr.to(cutlass.Int64) * cutlass.Int64(mSlot.stride[1])) * cutlass.Int64(4)
@@ -1269,8 +1284,9 @@ def run_qsa_compress_step(
     ``k_new`` ``[B, S_q, D]`` this step's raw keys (any batch / token stride with 16-B aligned rows), ``ring``
     ``[B, RING, D]`` compact with ``RING >= S_q + pool - 1``, ``out`` ``[B, NB, D]`` compact (the compressed-key
     cache; a block past ``NB`` is reported ``-2`` and not written), ``w`` ``[D]``, ``cos`` / ``sin`` ``[1 or B, S_pos,
-    rope_dim]`` (a block whose start position is past ``S_pos`` is reported ``-2``), ``pos0`` ``[B]`` int32 (the
-    position of row 0), ``slot_out`` ``[B, S_q]`` int32 (written for every row), ``n_commit`` ``[B]`` int32 iff the
+    rope_dim]`` (the table is the ceiling on positions: a committed row at a position at or past ``S_pos`` is reported ``-2`` and
+    writes nothing -- size the table for the context), ``pos0`` ``[B]`` int32 (the position of row 0), ``slot_out`` ``[B, S_q]``
+    int32 (written for every row), ``n_commit`` ``[B]`` int32 iff the
     recipe traced it (the accepted prefix of the step's rows).  ``norm_weight_offset`` as in the prefill form.
 
     On a PAGED recipe the SAME positional slots carry the paged state: ``ring`` is the stack's ring ``[blocks >= 1, cap >= S_q + pool - 1,

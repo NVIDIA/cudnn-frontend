@@ -18,6 +18,10 @@ slot form is bitwise the derived one, a padding sequence (``kv_lens 0``) writes 
 unassigned page reports ``-2``, a live sequence whose state entry is the null block or lies past the ring owns no ring (no ring
 row anywhere; a block needing ring rows ``-2``, one from the step's rows alone written), one artifact serves every page size and
 ring capacity, the launch is ONE kernel with no allocation, and every refusal is typed in both directions.
+
+The RoPE table is the CEILING on positions in both forms: a committed row at or past it (completing or not) reports ``-2`` and
+writes nothing -- no ring row, no block -- while the row below the ceiling is served; the cache capacity is not the ceiling (a
+position past the cache inside the table is served, and only a block past the cache is ``-2``).
 """
 
 import os
@@ -303,8 +307,9 @@ def test_two_phase_commit_is_idempotent():
 
 @requires_cuda
 def test_capacity_overflow_reports_minus_two_and_writes_nothing():
-    """A completing row whose block is past the compressed-key cache, or whose block start is past the RoPE table,
-    reports -2 and writes no block; the row's raw key still enters the ring (it is committed)."""
+    """A completing row whose block is past the compressed-key cache reports -2 and writes no block while its raw key still enters
+    the ring (the position itself is served); a step whose rows lie at or past the RoPE table reports -2 for EVERY one of them and
+    writes nothing at all, no ring row either (the table is the ceiling on positions)."""
     dtype, s_tok, k = torch.bfloat16, 128, 7
     k_raw, w, cos, sin = _make(1, s_tok, dtype, seed=9)
     pos0 = 4 * k
@@ -316,12 +321,14 @@ def test_capacity_overflow_reports_minus_two_and_writes_nothing():
     assert slot.tolist() == [[-1, -1, -1, SLOT_CAPACITY]]
     assert bool((out == _SENTINEL).all())
     assert torch.equal(ring[0, (pos0 + 3) % _RING], k_raw[0, pos0 + 3])
-    # (b) a RoPE table that ends before the block's start position
+    # (b) a RoPE table that ends AT the block's start position: the table is the ceiling on positions, so every row of the step (all at
+    # or past it) reports -2 and writes nothing -- no ring row either (where the cache rule above still enters the committed row's key)
     ring = _ring_from_prefix(k_raw, [pos0], _RING)
+    ring_before = ring.clone()
     out = _sentinel(1, s_tok // _POOL, _D, dtype=dtype)
     slot = _step(k_new, ring, out, w, cos[:, :pos0].contiguous(), sin[:, :pos0].contiguous(), _i32([pos0]))
-    assert slot.tolist() == [[-1, -1, -1, SLOT_CAPACITY]]
-    assert bool((out == _SENTINEL).all())
+    assert slot.tolist() == [[SLOT_CAPACITY] * 4]
+    assert bool((out == _SENTINEL).all()) and torch.equal(ring, ring_before), "a row at or past the table wrote something"
 
 
 @requires_cuda
@@ -715,7 +722,8 @@ def test_rows_below_position_zero_are_dead_and_the_rest_are_served():
 @requires_cuda
 def test_paged_capacity_reports_minus_two_and_writes_nothing():
     """A completing row whose block lies past the block table's width, on a negative (unassigned) page, or on a page past the
-    cache reports ``-2`` and writes no block; its raw key still enters the ring (it is committed)."""
+    cache reports ``-2`` and writes no block; its raw key still enters the ring (it is committed).  A step at or past the RoPE table
+    reports ``-2`` for every row and writes nothing at all (the table ceiling, the dense form's rule)."""
     dtype, s_tok = torch.bfloat16, 128
     k_raw, w, cos, sin = _make(1, s_tok, dtype, seed=26)
     k = 7
@@ -737,10 +745,92 @@ def test_paged_capacity_reports_minus_two_and_writes_nothing():
     pg.block_table[0, k // 4] = pg.n_pages + 5
     slot = _step_paged(pg, k_new, w, cos, sin, [pos0 + 4])
     assert slot.tolist() == [[-1, -1, -1, SLOT_CAPACITY]] and pg.rows_written() == 0
-    # (d) the RoPE table ends before the block's start position (the dense form's rule, unchanged)
+    # (d) the RoPE table ends AT the block's start position: the table is the ceiling on positions (the dense form's rule) -- every row of
+    # the step reports -2 and writes nothing, no ring row either
     pg = _Paged(1, s_tok, dtype, page=16, cap=8, seed=26)
     slot = _step_paged(pg, k_new, w, cos[:, :pos0].contiguous(), sin[:, :pos0].contiguous(), [pos0 + 4])
-    assert slot.tolist() == [[-1, -1, -1, SLOT_CAPACITY]] and pg.rows_written() == 0
+    assert slot.tolist() == [[SLOT_CAPACITY] * 4] and pg.rows_written() == 0
+    assert bool((pg.ring.float() == pg.sent).all()), "a row at or past the table wrote its ring row"
+
+
+@requires_cuda
+@pytest.mark.parametrize("paged", [False, True], ids=["dense_state", "paged_state"])
+def test_a_row_at_or_past_the_rope_table_reports_minus_two_and_writes_nothing(paged):
+    """The RoPE table is the CEILING on positions, checked on the LIVE (device-derived) position of EVERY committed row, completing or
+    not.  A 16-position compressed-key cache (dense: 4 blocks; paged: one page of P 16 behind a 1-wide block table) with a table of
+    exactly those 16 rows: a one-row step at position 16 (``pos0 16``; paged ``kv_lens 17``) reports ``-2`` and writes NOTHING -- its
+    ring row keeps the prefix key it held, no block -- where the previous kernel reported ``-1`` and wrote the ring row; the in-bounds
+    neighbour (position 15; ``kv_lens 16``) completes block 3 from the ring bitwise the prefill, slot 3, its ring row written; a four-row
+    step straddling the ceiling (positions 14 .. 17) is ``[-1, 3, -2, -2]`` with ring rows for 14 / 15 only.  The cache capacity is NOT
+    the ceiling: with the full table a position past the 16-position cache is served (``-1``, its ring row written) and a block past the
+    cache stays ``-2`` by the cache rule with the row's ring row written (the position itself is served)."""
+    dtype, s_tok = torch.bfloat16, 64
+    k_raw, w, cos, sin = _make(1, s_tok, dtype, seed=31)
+    ref, _ = _prefill(k_raw, w, cos, sin, _i32([s_tok]))
+    n_pos = 16
+    cos16, sin16 = cos[:, :n_pos].contiguous(), sin[:, :n_pos].contiguous()
+    sent = _sent_of(dtype)
+
+    def same(a, b):
+        return torch.equal(a.view(torch.int16), b.view(torch.int16))
+
+    class State:
+        """One fresh 16-position state (the ring pre-filled with the positions below ``pos0``), dense or paged, behind one accessor set."""
+
+        def __init__(self, pos0):
+            if paged:
+                self.pg = _Paged(1, s_tok, dtype, page=16, cap=8, seed=31, table_pages=1)
+                assert self.pg.block_table.shape == (1, 1)
+                self.pg.fill_ring_from_prefix(k_raw, [pos0])
+            else:
+                self.ring = _ring_from_prefix(k_raw, [pos0], _RING)
+                self.out = _sentinel(1, n_pos // _POOL, _D, dtype=dtype)
+
+        def step(self, pos0, rows, table):
+            k_new = k_raw[:, pos0 : pos0 + rows].contiguous()
+            if paged:
+                return _step_paged(self.pg, k_new, w, *table, [pos0 + rows]).tolist()
+            return _step(k_new, self.ring, self.out, w, *table, _i32([pos0])).tolist()
+
+        def ring_clone(self):
+            return (self.pg.ring if paged else self.ring).clone()
+
+        def ring_equal(self, other):
+            return same(self.pg.ring if paged else self.ring, other)
+
+        def ring_row(self, p):
+            return self.pg.ring_row(0, p) if paged else self.ring[0, p % _RING]
+
+        def kbar(self, blk):
+            return self.pg.kbar_row(0, blk) if paged else self.out[0, blk]
+
+        def blocks_written(self):
+            return self.pg.rows_written() if paged else int((self.out.float() != sent).any(-1).sum())
+
+    # (a) the row AT the ceiling: -2, not one byte written (its ring row keeps the prefix key of position 8)
+    st = State(16)
+    before = st.ring_clone()
+    assert st.step(16, 1, (cos16, sin16)) == [[SLOT_CAPACITY]]
+    assert st.ring_equal(before), "the ring row of a position past the table was written"
+    assert st.blocks_written() == 0
+    # (b) the neighbour below it: block 3 from the ring, bitwise the prefill; its ring row written
+    st = State(15)
+    assert st.step(15, 1, (cos16, sin16)) == [[3]]
+    assert same(st.kbar(3), ref[0, 3]) and same(st.ring_row(15), k_raw[0, 15]) and st.blocks_written() == 1
+    # (c) a four-row step straddling the ceiling: rows 14 / 15 served (block 3), rows 16 / 17 -2 with their ring rows untouched
+    st = State(14)
+    assert st.step(14, 4, (cos16, sin16)) == [[-1, 3, SLOT_CAPACITY, SLOT_CAPACITY]]
+    assert same(st.kbar(3), ref[0, 3]) and st.blocks_written() == 1
+    assert same(st.ring_row(14), k_raw[0, 14]) and same(st.ring_row(15), k_raw[0, 15])
+    assert same(st.ring_row(16), k_raw[0, 8]) and same(st.ring_row(17), k_raw[0, 9]), "ring rows 16 % 8 / 17 % 8 must still hold positions 8 / 9"
+    # (d) the cache capacity is NOT the ceiling: the full table serves a position past the 16-position cache (-1, its ring row written);
+    # a block past the cache stays -2 by the cache rule, the committed row's key still in the ring
+    st = State(16)
+    assert st.step(16, 1, (cos, sin)) == [[-1]]
+    assert same(st.ring_row(16), k_raw[0, 16]) and st.blocks_written() == 0
+    st = State(19)
+    assert st.step(19, 1, (cos, sin)) == [[SLOT_CAPACITY]]
+    assert same(st.ring_row(19), k_raw[0, 19]) and st.blocks_written() == 0
 
 
 @requires_cuda

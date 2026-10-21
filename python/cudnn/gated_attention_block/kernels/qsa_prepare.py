@@ -59,11 +59,14 @@ out of ``qk_norm_rope``):
   two call sites: the step form and this launch); ``index_state_slot_mapping [T]`` (``ring_slots``) names the ring WRITE
   rows instead of deriving them (the stack's own slots; bitwise the derived form);
 * ``cos`` / ``sin`` None (``rope_table``): the RoPE-table arm -- the Q / K and the indexer-query rows read ``cos_pos`` /
-  ``sin_pos`` at ``pos0 + j`` (the position clamped into the table), bitwise the per-token form, so a serving stack hands the
-  model's position-indexed table once instead of gathering per-token rows every step.  The host refuses BY FORM a table shorter
-  than the positions the compress arm's cache can address (paged: ``max_pages x P`` rows, the block table's width times the page;
-  dense: ``NB x pool``), so no live row is ever rotated with a clamped table row (the clamp serves the dead rows of a padding
-  sequence, whose rotation nothing consumes).
+  ``sin_pos`` at ``pos0 + j``, bitwise the per-token form, so a serving stack hands the model's position-indexed table once
+  instead of gathering per-token rows every step.  The table is the CEILING on positions, checked IN-KERNEL on the LIVE
+  (device-derived) position of every row, never on the host: a row at ``pos0 + j >= S_pos`` has no rotation, so its Q / K row, its
+  K pool row and its indexer-query row are NOT written and the compress arm reports it ``-2`` (no ring row, no block either; the V
+  row and the raw key are position-free bit copies and are stored as in the per-token form) -- never a silently clamped rotation.
+  The host also refuses BY FORM a table shorter than the positions the compress arm's cache can address (paged: ``max_pages x P``
+  rows, the block table's width times the page; dense: ``NB x pool``), so a conforming stack never meets the ceiling with a position
+  its cache holds, and the in-kernel clamp serves only the dead rows of a padding sequence (whose rotation nothing consumes).
 
 Table forms -- two, because two kinds of position are involved: ``cos`` / ``sin`` ``[T, rope_dim]`` are the attention's own
 PER-TOKEN rows (the block's contract: row ``t`` is token ``t``'s position), read by the Q / K and the indexer-query rows;
@@ -72,8 +75,9 @@ at the block START ``4 * blk`` -- a position of an EARLIER step that the per-tok
 
 Degenerate inputs, each with its handling: a negative slot (padding) writes no pool row and a slot past the pool's capacity
 writes none either (``live``); ``n_commit[b] = 0`` (a finished sequence) writes no ring row and no block, every slot report
-``-1``; ``pos0 < 0`` is clamped to 0; a row completing a block past the cache or the table reports ``-2`` and writes nothing;
-a ragged last warp computes on the last row and stores nothing; a token count below one lane group per arm still launches
+``-1``; ``pos0 < 0`` is clamped to 0; a row completing a block past the cache reports ``-2`` and writes no block; a committed row at a
+position at or past the RoPE table reports ``-2`` and writes nothing at all (the table ceiling, in both forms of the compress arm and in
+the step form); a ragged last warp computes on the last row and stores nothing; a token count below one lane group per arm still launches
 (the host never launches an empty grid: ``T >= 1`` is checked).  The paged form adds (``qsa_compress.py``, "The PAGED decode
 form"): a row at a negative position (``kv_lens[b] < S_q``; a padding sequence has ``kv_lens 0``) is dead -- no ring row, no
 block, slot ``-1`` -- so the null ring block and page 0 are never written for it; a sequence whose state-table entry is ``<= 0``
@@ -179,35 +183,44 @@ def prepare_warp_counts(
 
 
 @cute.jit
+def _step_row_position(mPos0: Optional[cute.Tensor], mKvLens: Optional[cute.Tensor], token: cutlass.Int32, s_q: cutlass.Int32):
+    """The step position of token ``token`` of a ``B x S_q`` step and its sequence, ``(pos0(b) + j, b)`` with ``b = token // S_q``,
+    ``j = token % S_q`` and ``pos0`` from ``kv_lens`` or the ``pos0`` vector exactly as the compress arm derives it
+    (:func:`qsa_compress.step_position`), the position clamped at 0 (the dead rows of a padding sequence).  Under the RoPE-table arm
+    EVERY lane of a row computes it: the rotation reads the table at it, and the row's stores are gated on ``pos < S_pos`` (the table
+    is the ceiling on positions -- a row at or past it stores nothing rotated and the compress arm reports it ``-2``)."""
+    b_t = token // s_q
+    j_t = token - b_t * s_q
+    pos = step_position(mPos0, mKvLens, b_t, s_q) + j_t
+    pos = pos if pos > cutlass.Int32(0) else cutlass.Int32(0)
+    return pos, b_t
+
+
+@cute.jit
 def _rope_row_addrs(
     mCos: Optional[cute.Tensor],
     mSin: Optional[cute.Tensor],
     mCosPos: Optional[cute.Tensor],
     mSinPos: Optional[cute.Tensor],
-    mPos0: Optional[cute.Tensor],
-    mKvLens: Optional[cute.Tensor],
+    pos: cutlass.Int32,
+    b_t: cutlass.Int32,
     token: cutlass.Int32,
-    s_q: cutlass.Int32,
     lane_off: cutlass.Int64,
     bpe: cutlass.Int64,
 ):
     """The cos / sin row addresses of one token's rotation: the per-token rows ``mCos[t]`` / ``mSin[t]`` (the block's contract),
-    or -- the RoPE-table arm, ``mCos`` None -- the position-indexed tables at ``pos0(b) + j`` (``b = t // S_q``, ``j = t % S_q``,
-    ``pos0`` from ``kv_lens`` or the ``pos0`` vector exactly as the compress arm derives it), the position clamped into
-    ``[0, S_pos)`` -- memory safety only: the lower clamp serves the dead rows of a padding sequence (negative positions read row
-    0; nothing consumes their rotation), and the upper clamp is unreachable for a live row because :func:`run_qsa_prepare` refuses
-    by form a table shorter than the positions the compress arm's cache can address (paged ``max_pages x P``, dense ``NB x pool``)."""
+    or -- the RoPE-table arm, ``mCos`` None -- the position-indexed tables at ``pos`` (the row's step position from
+    :func:`_step_row_position`, ``b_t`` its sequence), clamped into ``[0, S_pos)`` -- memory safety only: a row at or past the table
+    stores nothing rotated (the arms gate their stores on ``pos < S_pos``) and the compress arm reports it ``-2``, so the clamped
+    row is never consumed; :func:`run_qsa_prepare` also refuses by form a table shorter than the positions the compress arm's cache
+    can address (paged ``max_pages x P``, dense ``NB x pool``), so a conforming stack never meets the ceiling with a live row."""
     token64 = token.to(cutlass.Int64)
     if cutlass.const_expr(mCos is None):
-        b_t = token // s_q
-        j_t = token - b_t * s_q
-        pos = step_position(mPos0, mKvLens, b_t, s_q) + j_t
         s_pos = cutlass.Int32(mCosPos.shape[1])
-        pos = pos if pos > cutlass.Int32(0) else cutlass.Int32(0)
-        pos = pos if pos < s_pos else s_pos - cutlass.Int32(1)
+        pos_r = pos if pos < s_pos else s_pos - cutlass.Int32(1)
         bc = b_t if cutlass.Int32(mCosPos.shape[0]) > cutlass.Int32(1) else cutlass.Int32(0)
         bc64 = bc.to(cutlass.Int64)
-        pos64 = pos.to(cutlass.Int64)
+        pos64 = pos_r.to(cutlass.Int64)
         c_addr = mCosPos.iterator.toint() + (bc64 * cutlass.Int64(mCosPos.stride[0]) + pos64 * cutlass.Int64(mCosPos.stride[1])) * bpe + lane_off
         s_addr = mSinPos.iterator.toint() + (bc64 * cutlass.Int64(mSinPos.stride[0]) + pos64 * cutlass.Int64(mSinPos.stride[1])) * bpe + lane_off
     else:
@@ -357,6 +370,18 @@ def frost_qsa_prepare(
         p1 = cutlass.Int64(mVPool.stride[1]) if is_v else cutlass.Int64(mKPool.stride[1])
         p2 = cutlass.Int64(mVPool.stride[2]) if is_v else cutlass.Int64(mKPool.stride[2])
         pool_addr = pool_base + (page.to(cutlass.Int64) * p0 + head64 * p1 + off.to(cutlass.Int64) * p2) * bpe
+        # The RoPE-table arm: the row's step position on EVERY lane (the rotation reads the table at it) and the store gates -- a row at
+        # or past the table has no rotation (the clamp in _rope_row_addrs is memory safety only): its Q / K slab row and its K pool row
+        # are NOT written, and the compress arm reports it -2; the V row is a position-free bit copy, stored as in the per-token form.
+        store_slab = valid & (~is_v)
+        store_kpool = live & is_k
+        pos_t = cutlass.Int32(0)
+        b_t = cutlass.Int32(0)
+        if cutlass.const_expr(mCos is None):
+            pos_t, b_t = _step_row_position(mPos0, mKvLens, token, s_q)
+            in_table = pos_t < cutlass.Int32(mCosPos.shape[1])
+            store_slab = store_slab & in_table
+            store_kpool = store_kpool & in_table
 
         # PASS 1: the row, as packed words (the V copy) and as fp32 (the norm).
         raw_words = []
@@ -392,7 +417,7 @@ def frost_qsa_prepare(
             cos_v = [cutlass.Float32(0.0)] * ELEMS_PER_ACCESS
             sin_v = [cutlass.Float32(0.0)] * ELEMS_PER_ACCESS
             if in_rope:
-                c_addr, s_addr = _rope_row_addrs(mCos, mSin, mCosPos, mSinPos, mPos0, mKvLens, token, s_q, lane_off, bpe)
+                c_addr, s_addr = _rope_row_addrs(mCos, mSin, mCosPos, mSinPos, pos_t, b_t, token, lane_off, bpe)
                 c_pairs = [f16x2_to_f32(w, dtype=table_dtype) for w in ld_global_v4(c_addr, cutlass.Int32)]
                 s_pairs = [f16x2_to_f32(w, dtype=table_dtype) for w in ld_global_v4(s_addr, cutlass.Int32)]
                 cos_v = [v for pair in c_pairs for v in pair]
@@ -407,11 +432,11 @@ def frost_qsa_prepare(
         for c in cutlass.range_constexpr(chunks_a):
             y = ys[c]
             out_words.append([fp32_to_fp16(y[i], y[i + 1], dtype=mQo.element_type) for i in range(0, ELEMS_PER_ACCESS, 2)])
-        if valid & (~is_v):
+        if store_slab:
             for c in cutlass.range_constexpr(chunks_a):
                 coff = cutlass.Int64((c * lanes_a) * ACCESS_BYTES) + lane_off
                 st_global_v4(dst_addr + coff, out_words[c], cutlass.Int32)
-        if live & is_k:
+        if store_kpool:
             for c in cutlass.range_constexpr(chunks_a):
                 coff = cutlass.Int64((c * lanes_a) * ACCESS_BYTES) + lane_off
                 st_global_v4(pool_addr + coff, out_words[c], cutlass.Int32)
@@ -432,6 +457,13 @@ def frost_qsa_prepare(
             head64 = head.to(cutlass.Int64)
             lane_off = lane.to(cutlass.Int64) * cutlass.Int64(ACCESS_BYTES)
             src_addr = mIQsrc.iterator.toint() + (token64 * cutlass.Int64(mIQsrc.stride[0]) + head64 * cutlass.Int64(mIQsrc.stride[1])) * bpe
+            # the RoPE-table arm: the row's step position on every lane and the store gate (a row at or past the table stores nothing)
+            store_qi = valid
+            pos_t = cutlass.Int32(0)
+            b_t = cutlass.Int32(0)
+            if cutlass.const_expr(mCos is None):
+                pos_t, b_t = _step_row_position(mPos0, mKvLens, token, s_q)
+                store_qi = store_qi & (pos_t < cutlass.Int32(mCosPos.shape[1]))
             # pool = 1: acc = 0 + x, pooled = acc * 1.0 -- the compress kernel's own arithmetic, kept so the bits agree.
             acc = []
             for _ in cutlass.range_constexpr(chunks_i):
@@ -463,7 +495,7 @@ def frost_qsa_prepare(
                 cos_v = [cutlass.Float32(0.0)] * ELEMS_PER_ACCESS
                 sin_v = [cutlass.Float32(0.0)] * ELEMS_PER_ACCESS
                 if in_rope:
-                    c_addr, s_addr = _rope_row_addrs(mCos, mSin, mCosPos, mSinPos, mPos0, mKvLens, token, s_q, lane_off, bpe)
+                    c_addr, s_addr = _rope_row_addrs(mCos, mSin, mCosPos, mSinPos, pos_t, b_t, token, lane_off, bpe)
                     c_pairs = [f16x2_to_f32(wd, dtype=table_dtype) for wd in ld_global_v4(c_addr, cutlass.Int32)]
                     s_pairs = [f16x2_to_f32(wd, dtype=table_dtype) for wd in ld_global_v4(s_addr, cutlass.Int32)]
                     cos_v = [v for pair in c_pairs for v in pair]
@@ -471,7 +503,7 @@ def frost_qsa_prepare(
                 for i in cutlass.range_constexpr(ELEMS_PER_ACCESS):
                     rotated = rope_rotate_half(ys[0][i], cos_v[i], sin_v[i], lane, half_lanes)
                     ys[0][i] = rotated if in_rope else ys[0][i]
-            if valid:
+            if store_qi:
                 out_base = mIQout.iterator.toint() + (token64 * cutlass.Int64(mIQout.stride[0]) + head64 * cutlass.Int64(mIQout.stride[1])) * bpe
                 for c in cutlass.range_constexpr(chunks_i):
                     coff = cutlass.Int64((c * lanes_i) * ACCESS_BYTES) + lane_off
@@ -541,12 +573,18 @@ def frost_qsa_prepare(
                     fits = blk < n_cap
                     blk_r = blk if fits else n_cap - cutlass.Int32(1)
                     out_row = mComp.iterator.toint() + (b64 * cutlass.Int64(mComp.stride[0]) + blk_r.to(cutlass.Int64) * cutlass.Int64(mComp.stride[1])) * bpe
+                # the RoPE table is the CEILING on positions (qsa_compress_step's rule): a committed row at p >= S_pos writes nothing -- no ring
+                # row, no block (and no Q / K / indexer-query row under the RoPE-table arm) -- and reports -2; a block's rows all lie at or
+                # below its completing row's position, so no block ever pools a ring row at or past the table
+                in_table = cutlass.Boolean(True)
+                past_table = cutlass.Boolean(False)
                 if cutlass.const_expr(rope_dim > 0):
                     s_pos = cutlass.Int32(mCosPos.shape[1])
-                    fits = fits & (tok0 < s_pos)
-                write_blk = committed & completes & fits
-                # the committed row's raw key enters the ring (a bit copy): the derived row, or the stack's own slot
-                ring_write = committed & owns_ring
+                    in_table = p < s_pos
+                    past_table = p >= s_pos
+                write_blk = committed & completes & fits & in_table
+                # the committed row's raw key enters the ring (a bit copy): the derived row, or the stack's own slot (never a row at or past the table)
+                ring_write = committed & owns_ring & in_table
                 if cutlass.const_expr(has_ring_slots):
                     dst, slot_live = ring_slot_address(mRing, mRingSlots, t, slot_i64, bpe)
                     ring_write = ring_write & slot_live
@@ -621,7 +659,7 @@ def frost_qsa_prepare(
                         y = ys[c]
                         packed = [fp32_to_fp16(y[i], y[i + 1], dtype=mComp.element_type) for i in range(0, ELEMS_PER_ACCESS, 2)]
                         st_global_v4(out_row + coff, packed, cutlass.Int32)
-                slot_val = cutlass.Int32(SLOT_CAPACITY) if (committed & completes) else cutlass.Int32(SLOT_NO_BLOCK)
+                slot_val = cutlass.Int32(SLOT_CAPACITY) if (committed & (completes | past_table)) else cutlass.Int32(SLOT_NO_BLOCK)
                 slot_val = blk if write_blk else slot_val
                 if in_row & (lane == cutlass.Int32(0)):
                     slot_addr = mCSlot.iterator.toint() + (
@@ -1042,8 +1080,11 @@ def run_qsa_prepare(
     ``[T]`` of the artifact's slot dtype iff ``index.ring_slots``; ``pos0`` is REFUSED there (the positions derive from ``kv_lens``), and a
     dense recipe REFUSES every paged keyword.  The RoPE-table arm (``index.rope_table``) REFUSES ``cos`` / ``sin`` (pass ``None``): the
     per-token rotations read ``cos_pos`` / ``sin_pos`` at ``pos0 + j``, and the table must hold at least as many rows as the compress
-    arm's cache can address (paged: ``block_table.shape[1] x P``; dense: ``NB x pool``) -- refused by form otherwise, so no live row
-    is rotated with a clamped table row.
+    arm's cache can address (paged: ``block_table.shape[1] x P``; dense: ``NB x pool``) -- refused by form otherwise.  The LIVE
+    positions (``pos0`` / ``kv_lens`` are device data: no host bound without a sync) are checked IN-KERNEL against the table: a row at
+    ``pos0 + j >= S_pos`` is reported ``-2`` in ``compressed_slot`` and none of its rotated outputs (its Q / K rows, its K pool row, its
+    indexer queries), its ring row or its block is written -- check ``compressed_slot`` for ``-2`` before consuming a step's outputs
+    (the existing capacity report; no silently clamped rotation).
     """
     t = int(q.shape[0])
     if t < 1:
