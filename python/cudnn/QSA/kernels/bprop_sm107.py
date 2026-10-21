@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# Adapted from sdpa/bwd/kernels/sm100/bprop_sparse_d256_f16.py.
+# Adapted from sdpa/bwd/kernels/sm107/bprop_sparse_d256_f16.py.
 
 """Native packed QSA backward for Rubin SM107.
 
@@ -33,8 +33,8 @@ D = 256
 LOG2E = 1.4426950408889634
 
 NTHREADS = 512
-# Rubin fits all 128 MMA rows and three full operand stages in shared memory.
-CHB = 16
+# Use whole 16-row dQ steps within the three operand stages.
+CHB = 14
 
 
 OFF_Q = 0  # Reserve 32 shared rows per slab; MMA padding stays zero.
@@ -49,7 +49,7 @@ OFF_DS = OFF_V + K_STAGE
 DS_BYTES = 6144
 NDRAIN = 8
 EP_BYTES = 4096
-OFF_EP = OFF_DS + DS_BYTES
+OFF_EP = OFF_DS + 3 * DS_BYTES
 SMEM_BYTES = OFF_EP + NDRAIN * EP_BYTES
 
 TM_S = 0
@@ -417,17 +417,18 @@ def frost_qsa_bprop_sm107(
                                             _wait(b_dqe, (nq & 1) ^ 1)
                                             prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
                                     hh = j
-                                    for kk in cutlass.range(CHB // 2, unroll=1):
-                                        if prims.elect_sync():
-                                            prims.tcgen05_mma(
-                                                prims.Tcgen05MMAKind.F16,
-                                                prims.CTAGroup.CTA_1,
-                                                prims.make_tmem_ptr(tmem_raw + (TM_DQ + hh * 32), F32),
-                                                dk_mn.advance_start_address(hh * 2 * SLAB + kk * 2 * BLK_SMEM),
-                                                d_ds_mn.advance_start_address(kk * 768),
-                                                idesc_q,
-                                                acc_q | (kk > 0),
-                                            )
+                                    for component in cutlass.range_constexpr(3):
+                                        for kk in cutlass.range(CHB // 2, unroll=1):
+                                            if prims.elect_sync():
+                                                prims.tcgen05_mma(
+                                                    prims.Tcgen05MMAKind.F16,
+                                                    prims.CTAGroup.CTA_1,
+                                                    prims.make_tmem_ptr(tmem_raw + (TM_DQ + hh * 32), F32),
+                                                    dk_mn.advance_start_address(hh * 2 * SLAB + kk * 2 * BLK_SMEM),
+                                                    d_ds_mn.advance_start_address(component * DS_BYTES + kk * 768),
+                                                    idesc_q,
+                                                    acc_q | (kk > 0) | (component > 0),
+                                                )
                                     if cutlass.const_expr(j == 1):
                                         if prims.elect_sync():
                                             prims.tcgen05_commit(b_ke.subview(pb), group=prims.CTAGroup.CTA_1)
@@ -469,7 +470,6 @@ def frost_qsa_bprop_sm107(
         hrow = lane & 1
         trow = (lane & 7) >> 1
         jrow = row >> 3
-        c_s = scale * F32(LOG2E)
         gc = I32(0)
         nq = I32(0)
         ds_off = (OFF_DS + jrow * 384 + (row & 7) * 16) // 4
@@ -522,7 +522,7 @@ def frost_qsa_bprop_sm107(
                         pj = F32(0.0)
                         dsj = F32(0.0)
                         if valid:
-                            pj = cute.math.exp2(s0 * c_s - lj * F32(LOG2E), fastmath=True)
+                            pj = cute.math.exp2((s0 * scale - lj) * F32(LOG2E), fastmath=True)
                             dsj = pj * (d0 - ej) * scale
                         pw.append(pj)
                         dw.append(dsj)
@@ -558,8 +558,14 @@ def frost_qsa_bprop_sm107(
                     prims.tcgen05_st("32x32b", t_pt, pvec)
                     prims.tcgen05_st("32x32b", t_dst, dvec)
                     # dQ^T reads dS^T as an SMEM B operand, so the row is also stored as MN-major core matrices.
-                    for nc in cutlass.range_constexpr(3):
-                        (sbase + ds_off + nc * 32).store(dvec[nc * 4 : nc * 4 + 4], alignment=16)
+                    ds_float = cutlass.Vector.from_elements(dfull, F32)
+                    ds_high = ds_float.to(BF16)
+                    ds_middle = (ds_float - ds_high.to(F32)).to(BF16)
+                    ds_low = ((ds_float - ds_high.to(F32)) - ds_middle.to(F32)).to(BF16)
+                    dq_components = [ds_high.bitcast(I32), ds_middle.bitcast(I32), ds_low.bitcast(I32)]
+                    for component in cutlass.range_constexpr(3):
+                        for nc in cutlass.range_constexpr(3):
+                            (sbase + ds_off + component * DS_BYTES // 4 + nc * 32).store(dq_components[component][nc * 4 : nc * 4 + 4], alignment=16)
                     prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
                     prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
                     prims.fence_proxy(prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)

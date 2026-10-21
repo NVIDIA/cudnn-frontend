@@ -90,16 +90,20 @@ Its block spans have at most four tokens; only the final block can be shorter.
 The spans, bases, and token bounds must agree. Values remain on the device and
 are a caller contract. No host read checks these relationships.
 
-Forward compacts the selected blocks on the GPU, gathers K/V, computes scaled
-QK scores, applies the bounds, and uses online softmax followed by PV. It writes
-FP32 output and natural-log LSE, then casts the output to BF16. Empty attention
-rows produce zero output and negative-infinity LSE.
+Forward uses dense tiles for short key spans and gathers selected blocks for
+other tiles. GPU preparation checks the current K/V values and bounds, then
+builds exact masks. Nonfinite K/V uses the gather path to exclude unused values
+before arithmetic. Both paths compute scaled QK scores, apply the bounds, and
+use online softmax followed by PV. They write FP32 output and natural-log LSE,
+then cast output to BF16. Empty rows produce zero output and negative-infinity LSE.
 
 Backward compacts the current selection, computes
 `delta = sum(grad_out * out_fp32, dim=-1)`, reconstructs probabilities from QK
 and LSE, and forms dQ/dK/dV. Accumulation uses FP32; output gradients use BF16.
 K/V gradient contributions from all query heads are summed. Floating-point
 atomic reductions can change low bits between runs.
+On Blackwell, the 12:1 path pairs adjacent queries and gathers their selected
+block union. Owner bits retain each query's mask while sharing K/V loads.
 
 For each query head and its shared KV head, the backward equations are:
 
@@ -119,8 +123,9 @@ full score or probability matrices.
 
 | Call | GPU component | Result |
 |---|---|---|
-| Both | Selection compaction | Private block IDs and counts for each query |
-| Forward | Gather, QK, online softmax, PV | `out`, `out_fp32`, `lse` |
+| Forward | Tile bounds, K/V checks, exact mask preparation | Private tile modes, key ranges and token masks |
+| Both | Selection compaction | Private block IDs and counts for gathered queries |
+| Forward | Dense or gathered QK, online softmax, PV | `out`, `out_fp32`, `lse` |
 | Backward | Preparation | FP32 `delta`; cleared gradient accumulators |
 | Backward | Gather, probability reconstruction, gradient products | FP32 dQ/dK/dV accumulators |
 | Backward | Final cast | BF16 `dq`, `dk`, `dv` |
@@ -149,8 +154,12 @@ required; Rubin also requires a build with the `sm_107a` target.
 Calls allocate outputs and scratch on the input device and enqueue work on its
 current PyTorch CUDA stream. Warm up the chosen head geometry before CUDA graph
 capture. Compiled kernels reuse symbolic token and block extents; metadata is
-rebuilt from the current bitmap on each call. Scratch includes an int32
-`[T, NB]` compact-index buffer, int32 `[T]` counts, and, for backward, FP32
-gradient accumulators and `[T, Hq]` delta. Full-call benchmarks must include
-compaction, backward preparation, and final gradient casts.
-At `T=131072` and `NB=32768`, the compact-index buffer alone uses 16 GiB.
+rebuilt from the current bitmap on each call. Forward scratch includes an int32
+`[T, NB]` compact-index buffer and int32 `[T]` counts. Blackwell 12:1 backward
+uses `[ceil(T/2), NB]` indices and `[ceil(T/2)]` counts; other backward paths use
+the forward shapes. Backward also uses FP32 gradient accumulators and `[T, Hq]`
+delta. The dense route also uses packed token
+masks, tile ranges and K/V check flags. These buffers are rebuilt on each call.
+Full-call benchmarks must include forward preparation, compaction, backward
+preparation, and final gradient casts.
+At `T=131072` and `NB=32768`, the forward compact-index buffer alone uses 16 GiB.

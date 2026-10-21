@@ -159,10 +159,12 @@ def native_components(inputs, backward_inputs, args):
         return {"host_wall_median_ms": statistics.median(samples), "host_wall_samples_ms": samples}
 
     result = {
-        "boundary": "Diagnostic eager launches, warm caches; component sums need not equal full-call timing. Prebuilt IDs and buffers remain live.",
+        "boundary": "Diagnostic gather-only launches with warm caches and prebuilt IDs. Public forward may use dense tiles; these components do not describe that route.",
         "compact_with_allocation": timed(lambda: api._compact(*compact_args, arch, stream)),
         "compact_preallocated": timed(lambda: compact(*compact_args, ids, counts, stream)),
-        "fprop_preallocated": timed(lambda: fprop.launch(compiled_fwd, q, k, v, out, fp32, lse, ids, counts, lo, hi, first, last, inputs["scale"], stream)),
+        "gather_fprop_preallocated": timed(
+            lambda: fprop.launch(compiled_fwd, q, k, v, out, fp32, lse, ids, counts, lo, hi, first, last, inputs["scale"], stream)
+        ),
         "warm_fprop_compile_lookup": host_timed(lambda: fprop.compile_kernel(cutlass.BFloat16, q.shape[1], k.shape[1], arch)),
         "warm_compact_compile_lookup": host_timed(lambda: _metadata.compile_kernel(arch)),
     }
@@ -170,6 +172,12 @@ def native_components(inputs, backward_inputs, args):
         return result
     bprop, _ = api._implementation(q, "bprop")
     compiled = bprop.compile_kernel(cutlass.BFloat16, q.shape[1], k.shape[1], arch)
+    backward_ids, backward_counts = api._compact_backward(*compact_args, arch, stream, k.shape[1])
+    result["backward_compact_with_allocation"] = timed(lambda: api._compact_backward(*compact_args, arch, stream, k.shape[1]))
+    if arch in (100, 103) and k.shape[1] == 1:
+        result["warm_backward_compact_compile_lookup"] = host_timed(lambda: _metadata.compile_group_kernel(arch, bprop.NQ, bprop.BLK_BITS))
+    else:
+        result["warm_backward_compact_compile_lookup"] = host_timed(lambda: _metadata.compile_kernel(arch))
     result["warm_bprop_compile_lookup"] = host_timed(lambda: bprop.compile_kernel(cutlass.BFloat16, q.shape[1], k.shape[1], arch))
     scratch = {
         "delta": torch.empty(q.shape[:2], dtype=torch.float32, device=q.device),
@@ -196,14 +204,14 @@ def native_components(inputs, backward_inputs, args):
             scratch["dq_acc"],
             scratch["dk_acc"],
             scratch["dv_acc"],
-            ids,
-            counts,
+            backward_ids,
+            backward_counts,
             lo,
             hi,
             first,
             last,
             inputs["scale"],
-            min(q.shape[0], sms),
+            min(backward_counts.shape[0], sms),
             stream,
         )
 
@@ -211,8 +219,16 @@ def native_components(inputs, backward_inputs, args):
     result["bprop_main"] = timed(main, before_each=prep)
     result["bprop_finish"] = timed(lambda: compiled["finish"](scratch["dq_acc"], scratch["dk_acc"], scratch["dv_acc"], dq, dk, dv, blocks, stream))
     result["bprop_preallocated_all_kernels"] = timed(
-        lambda: bprop.launch(compiled, grad, q, k, v, saved_out, saved_lse, ids, counts, lo, hi, first, last, dq, dk, dv, scratch, inputs["scale"], stream, sms)
+        lambda: bprop.launch(
+            compiled, grad, q, k, v, saved_out, saved_lse, backward_ids, backward_counts, lo, hi, first, last, dq, dk, dv, scratch, inputs["scale"], stream, sms
+        )
     )
+    import reference
+
+    expected = api.qsa_backward(**backward_inputs)
+    result["backward_component_checks"] = reference.compare(dict(zip(("dq", "dk", "dv"), expected)), dict(dq=dq, dk=dk, dv=dv))
+    if not all(check["passed"] for check in result["backward_component_checks"].values()):
+        raise AssertionError("Preallocated backward components differ from the public call")
     return result
 
 

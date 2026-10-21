@@ -3,18 +3,20 @@
 # Adapted from sdpa/fwd/kernels/sm107/sparse_d256_f16.py.
 """QSA forward for SM100/103: gathered four-token blocks and packed GQA.
 
-Each CTA owns one query token and one KV head. Eight gather warps fill a
-three-stage K/V ring. One MMA warp overlaps the next score tile with the
-current softmax and value product. Two softmax groups own eight heads each.
+Each CTA processes one query, or up to 32 in gated tiles, for one KV head.
+Sixteen gather warps fill a three-stage K/V ring. One MMA warp overlaps scores with the
+current softmax and value product. The two softmax groups split the head
+columns; a 12-head group uses eight columns and four columns.
 The compact block list is streamed from global memory; its width has no
 compile-time limit. All token addresses use the supplied block spans.
 
-Barrier counts: Q full=1 TMA issuer; KV full=8 TMA issuers; KV empty,
+Barrier counts: Q full=1 TMA issuer; KV full=16 TMA issuers; KV empty,
 score full and value done=1 MMA issuer; score empty, P full and TMEM
 release=256 softmax lanes. Empty rings start at phase 1; full rings at 0.
 """
 
 import hashlib
+from functools import lru_cache
 from pathlib import Path
 from typing import NamedTuple
 
@@ -38,7 +40,7 @@ from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 I32, I64, F32 = cutlass.Int32, cutlass.Int64, cutlass.Float32
 D, NQ, TILE_N = 256, 16, 128
 KV_STAGES, S_STAGES = 3, 2
-SOFTMAX_WARPS, GATHER_WARPS, THREADS = 8, 8, 640
+SOFTMAX_WARPS, GATHER_WARPS, THREADS = 8, 16, 832
 SOFTMAX_LANES = 256
 LOG2E, LN2 = 1.4426950408889634, 0.6931471805599453
 FROST_SOURCE_DIGEST = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
@@ -98,39 +100,39 @@ def _fprop_gather(desc, contiguous_desc, storage, bars, state, tile, query, head
     warp = cute.arch.make_warp_uniform(cute.arch.warp_idx()) - SOFTMAX_WARPS
     lane = cute.arch.thread_idx()[0] % 32
     begin, end = I32(-1), I32(-1)
-    if lane < 4:
-        entry = tile * 32 + warp * 4 + lane
+    if lane < 2:
+        entry = tile * 32 + warp * 2 + lane
         begin, end = _fprop_key_span(ids, first, last, query, entry, count)
     starts, ends = [], []
-    for block in cutlass.range_constexpr(4):
+    for block in cutlass.range_constexpr(2):
         starts.append(I32(nvvm.shfl_sync(0xFFFFFFFF, begin, block, 31, kind=nvvm.Shfl.IDX)))
         ends.append(I32(nvvm.shfl_sync(0xFFFFFFFF, end, block, 31, kind=nvvm.Shfl.IDX)))
-    contiguous = (starts[0] >= 0) & (starts[0] >= low) & (starts[0] + 15 <= high) & (starts[0] + 15 < total)
-    for block in cutlass.range_constexpr(4):
+    contiguous = (starts[0] >= 0) & (starts[0] >= low) & (starts[0] + 7 <= high) & (starts[0] + 7 < total)
+    for block in cutlass.range_constexpr(2):
         contiguous = contiguous & (starts[block] == starts[0] + block * 4) & (ends[block] >= starts[block] + 3)
     bars.kv_empty[state.idx].wait(state.phase ^ 1)
     hint = opaque_i64(TMA_L2_EVICT_LAST)
     if nvvm.elect_sync():
-        bars.kv_full[state.idx].arrive(n_bytes=8192)
+        bars.kv_full[state.idx].arrive(n_bytes=4096)
     if contiguous:
         if nvvm.elect_sync():
             for box in cutlass.range_constexpr(4):
                 nvvm.cp_async_bulk_tensor_shared_cta_global(
-                    storage.subview(state.idx * (TILE_N * D) + box * (TILE_N * 64) + warp * 16 * 64),
+                    storage.subview(state.idx * (TILE_N * D) + box * (TILE_N * 64) + warp * 8 * 64),
                     contiguous_desc.get_ptr(),
                     [head * D + box * 64, starts[0]],
                     bars.kv_full[state.idx].smem_ptr,
                     l2_cache_hint=hint,
                 )
     else:
-        for block in cutlass.range_constexpr(4):
+        for block in cutlass.range_constexpr(2):
             if nvvm.elect_sync():
                 rows = []
                 for r in cutlass.range_constexpr(4):
                     token = starts[block] + r
                     valid = (starts[block] >= 0) & (token <= ends[block]) & (token >= low) & (token <= high) & (token < total)
                     rows.append(_fprop_select_i32(valid, token, -1))
-                quad_offset = (warp * 4 + block) * 4 * 64
+                quad_offset = (warp * 2 + block) * 4 * 64
                 for box in cutlass.range_constexpr(4):
                     tma_gather4(
                         desc,
@@ -160,8 +162,12 @@ def _fprop_gather_loop(k_desc, v_desc, k_contiguous_desc, v_contiguous_desc, sto
 
 
 @cute.jit
-def _fprop_mma(sq, sk, sv, sp, tmem, bars, tiles, dtype: cutlass.Constexpr):
-    tmem_alloc(tmem, 64, nvvm.CTAGroup.CTA_1)
+def _fprop_mma(sq, sk, sv, sp, tmem, bars, tiles, dtype: cutlass.Constexpr, retain_permit: cutlass.Constexpr = False):
+    if cutlass.const_expr(retain_permit):
+        nvvm.tcgen05_alloc(tmem, I32(64), group=nvvm.CTAGroup.CTA_1)
+        nvvm.bar_warp_sync(cute.arch.FULL_MASK)
+    else:
+        tmem_alloc(tmem, 64, nvvm.CTAGroup.CTA_1)
     nvvm.barrier_cta_arrive(1, SOFTMAX_LANES + 32)
     tm = nvvm.make_tmem_ptr(tmem.load(), cutlass.Int8)
     qk = MmaDesc(
@@ -256,6 +262,7 @@ def _fprop_softmax(
     tiles,
     scale,
     group_size: cutlass.Constexpr,
+    ncols: cutlass.Constexpr,
 ):
     nvvm.barrier_cta_sync(barrier_id=1, thread_count=SOFTMAX_LANES + 32)
     tid = cute.arch.thread_idx()[0]
@@ -264,13 +271,13 @@ def _fprop_softmax(
     red = Pointer(scratch.data_ptr(), dtype=F32)
     base = tmem.load()
     neg_inf, zero, one = F32(float("-inf")), F32(0), F32(1)
-    m = cutlass.Vector.from_elements(tuple(F32(float("-inf")) for _ in range(8)), F32)
-    norm = cutlass.Vector.from_elements(tuple(F32(0) for _ in range(8)), F32)
+    m = cutlass.Vector.from_elements(tuple(F32(float("-inf")) for _ in range(ncols)), F32)
+    norm = cutlass.Vector.from_elements(tuple(F32(0) for _ in range(ncols)), F32)
     score, value = PipelineState.start(), PipelineState.start()
     for tile in cutlass.range(tiles, unroll=1):
         bars.s_full[score.idx].wait(score.phase)
         nvvm.tcgen05_fence(nvvm.Tcgen05Fence.AFTER_THREAD_SYNC)
-        raw = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(base + score.idx * 16 + column, F32), num=8)
+        raw = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(base + score.idx * 16 + column, F32), num=ncols)
         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
         nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
         bars.s_empty[score.idx].arrive()
@@ -279,7 +286,7 @@ def _fprop_softmax(
         valid = (begin >= 0) & (token <= end) & (token >= low) & (token <= high) & (token < total)
         scores = []
         red_base = score.idx * 64 + warp * 8
-        for col in cutlass.range_constexpr(8):
+        for col in cutlass.range_constexpr(ncols):
             s = _fprop_select_f32(valid, F32(raw[col]) * scale * F32(LOG2E), neg_inf)
             scores.append(s)
             warp_max = _fprop_warp_max(s)
@@ -287,7 +294,7 @@ def _fprop_softmax(
                 (red + red_base + col).store(warp_max)
         nvvm.barrier_cta_sync(barrier_id=2 + group, thread_count=128)
         maxima, sums, alphas, probabilities = [], [], [], []
-        for col in cutlass.range_constexpr(8):
+        for col in cutlass.range_constexpr(ncols):
             maximum = F32(m[col])
             for other_warp in cutlass.range_constexpr(4):
                 maximum = cute.math.max(maximum, F32((red + score.idx * 64 + group * 32 + other_warp * 8 + col).load()), ftz=True)
@@ -301,8 +308,10 @@ def _fprop_softmax(
             probabilities.append(probability)
         m, norm = cutlass.Vector.from_elements(tuple(maxima), F32), cutlass.Vector.from_elements(tuple(sums), F32)
         words = []
-        for col in cutlass.range_constexpr(4):
+        for col in cutlass.range_constexpr(ncols // 2):
             words.append(fp32_to_fp16(probabilities[2 * col], probabilities[2 * col + 1], dtype=out.element_type))
+        for col in cutlass.range_constexpr(ncols // 2, 4):
+            words.append(I32(0))
         packed = cutlass.Vector.from_elements(tuple(words), I32)
         p_ptr = Pointer(sp.subview(score.idx * (TILE_N * NQ // 2) + lane * 8 + group * 4).data_ptr(), dtype=I32)
         p_ptr.store_swizzled(packed, cutlass.Swizzle(1, 4, 3), alignment=16)
@@ -312,14 +321,14 @@ def _fprop_softmax(
             value = advance(value, S_STAGES)
             nvvm.tcgen05_fence(nvvm.Tcgen05Fence.AFTER_THREAD_SYNC)
             needs_rescale = alphas[0] != one
-            for col in cutlass.range_constexpr(1, 8):
+            for col in cutlass.range_constexpr(1, ncols):
                 needs_rescale = needs_rescale | (alphas[col] != one)
             if needs_rescale:
                 for half in cutlass.range_constexpr(2):
                     op = nvvm.make_tmem_ptr(base + 32 + half * 16 + column, F32)
-                    old = nvvm.tcgen05_ld("32x32b", op, num=8)
+                    old = nvvm.tcgen05_ld("32x32b", op, num=ncols)
                     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                    updated = cutlass.Vector.from_elements(tuple(F32(old[col]) * alphas[col] for col in range(8)), F32)
+                    updated = cutlass.Vector.from_elements(tuple(F32(old[col]) * alphas[col] for col in range(ncols)), F32)
                     nvvm.tcgen05_st("32x32b", op, updated)
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
         nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
@@ -327,13 +336,13 @@ def _fprop_softmax(
         score = advance(score, S_STAGES)
     bars.value_done[value.idx].wait(value.phase)
     nvvm.tcgen05_fence(nvvm.Tcgen05Fence.AFTER_THREAD_SYNC)
-    for col in cutlass.range_constexpr(8):
+    for col in cutlass.range_constexpr(ncols):
         warp_sum = _fprop_warp_sum(F32(norm[col]))
         if tid % 32 == 0:
             (red + 128 + warp * 8 + col).store(warp_sum)
     nvvm.barrier_cta_sync(barrier_id=2 + group, thread_count=128)
     inverses, empty = [], []
-    for col in cutlass.range_constexpr(8):
+    for col in cutlass.range_constexpr(ncols):
         denominator = zero
         for other_warp in cutlass.range_constexpr(4):
             denominator = denominator + F32((red + 128 + group * 32 + other_warp * 8 + col).load())
@@ -345,9 +354,9 @@ def _fprop_softmax(
         if (lane == col) & (column + col < group_size):
             lse[(I64(head * group_size + column + col), I64(query))] = stats
     for half in cutlass.range_constexpr(2):
-        raw_o = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(base + 32 + half * 16 + column, F32), num=8)
+        raw_o = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(base + 32 + half * 16 + column, F32), num=ncols)
         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-        for col in cutlass.range_constexpr(8):
+        for col in cutlass.range_constexpr(ncols):
             if column + col < group_size:
                 result = _fprop_select_f32(empty[col], zero, F32(raw_o[col]) * inverses[col])
                 coord = (I64(query), I64(head * group_size + column + col), I64(lane + half * 128))
@@ -375,8 +384,11 @@ def _fprop_body(
     last: cute.Tensor,
     scale,
     group_size: cutlass.Constexpr,
+    query_override=None,
 ):
     query, head, _ = cute.arch.block_idx()
+    if cutlass.const_expr(query_override is not None):
+        query = I32(query_override)
     tid = cute.arch.thread_idx()[0]
     warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     dtype = out.element_type
@@ -421,13 +433,25 @@ def _fprop_body(
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync()
     if warp < SOFTMAX_WARPS:
-        _fprop_softmax(tmem, bars, scratch, sp_raw, out, out_fp32, lse, ids, first, last, query, head, count, low, high, out.shape[0], tiles, scale, group_size)
+        if cutlass.const_expr(group_size == 12):
+            if warp < 4:
+                _fprop_softmax(
+                    tmem, bars, scratch, sp_raw, out, out_fp32, lse, ids, first, last, query, head, count, low, high, out.shape[0], tiles, scale, group_size, 8
+                )
+            else:
+                _fprop_softmax(
+                    tmem, bars, scratch, sp_raw, out, out_fp32, lse, ids, first, last, query, head, count, low, high, out.shape[0], tiles, scale, group_size, 4
+                )
+        else:
+            _fprop_softmax(
+                tmem, bars, scratch, sp_raw, out, out_fp32, lse, ids, first, last, query, head, count, low, high, out.shape[0], tiles, scale, group_size, 8
+            )
     elif warp < SOFTMAX_WARPS + GATHER_WARPS:
         _fprop_gather_loop(
             k_desc, v_desc, k_contiguous_desc, v_contiguous_desc, kv_raw, bars, ids, first, last, query, head, count, low, high, out.shape[0], tiles
         )
     elif warp == SOFTMAX_WARPS + GATHER_WARPS:
-        _fprop_mma(sq, sk, sv, sp, tmem, bars, tiles, dtype)
+        _fprop_mma(sq, sk, sv, sp, tmem, bars, tiles, dtype, cutlass.const_expr(query_override is not None))
     elif warp == SOFTMAX_WARPS + GATHER_WARPS + 1:
         bars.q_full.arrive(n_bytes=group_size * D * 2, pred=nvvm.elect_sync())
         tma_load_tile(sq, GmemTileTma(q_desc)(I32(0), head * group_size, query), bars.q_full.smem_ptr, cta_group=1)
@@ -450,17 +474,48 @@ def frost_qsa_fprop_sm100(
     hi: cute.Tensor,
     first: cute.Tensor,
     last: cute.Tensor,
+    mode,
     scale: F32,
     group_size: cutlass.Constexpr[int],
 ):
-    _fprop_body(q_desc, k_desc, v_desc, k_contiguous_desc, v_contiguous_desc, out, out_fp32, lse, ids, counts, lo, hi, first, last, scale, group_size)
+    if cutlass.const_expr(mode is None):
+        _fprop_body(q_desc, k_desc, v_desc, k_contiguous_desc, v_contiguous_desc, out, out_fp32, lse, ids, counts, lo, hi, first, last, scale, group_size)
+    else:
+        first_query = cute.arch.block_idx()[0] * 32
+        if first_query < out.shape[0]:
+            if mode[I64(first_query // 128)] != 0:
+                for step in cutlass.range(32, unroll=1):
+                    query = first_query + step
+                    if query < out.shape[0]:
+                        _fprop_body(
+                            q_desc,
+                            k_desc,
+                            v_desc,
+                            k_contiguous_desc,
+                            v_contiguous_desc,
+                            out,
+                            out_fp32,
+                            lse,
+                            ids,
+                            counts,
+                            lo,
+                            hi,
+                            first,
+                            last,
+                            scale,
+                            group_size,
+                            query,
+                        )
+                        nvvm.barrier_cta_sync()
+                if cute.arch.warp_idx() == SOFTMAX_WARPS + GATHER_WARPS:
+                    nvvm.tcgen05_relinquish_alloc_permit(group=nvvm.CTAGroup.CTA_1)
 
 
 frost_qsa_fprop_sm100.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit
-def _fprop_host(q, k, v, out, out_fp32, lse, ids, counts, lo, hi, first, last, scale: F32, stream: cuda.CUstream, arch: cutlass.Constexpr[int]):
+def _fprop_host(q, k, v, out, out_fp32, lse, ids, counts, lo, hi, first, last, mode, scale: F32, stream: cuda.CUstream, arch: cutlass.Constexpr[int]):
     group_size = cutlass.const_expr(q.shape[1] // k.shape[1])
     q_desc = tmap.create_tensor_map_tiled(
         global_address=q.iterator.toint(),
@@ -494,7 +549,7 @@ def _fprop_host(q, k, v, out, out_fp32, lse, ids, counts, lo, hi, first, last, s
         dtype=k.element_type,
         global_dims=(k.shape[1] * D, k.shape[0]),
         global_strides=(I64(k.stride[0]) // 8,),
-        box_dims=(64, 16),
+        box_dims=(64, 8),
         swizzle=tmap.TensorMapSwizzle.s128b,
         l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
     )
@@ -503,7 +558,7 @@ def _fprop_host(q, k, v, out, out_fp32, lse, ids, counts, lo, hi, first, last, s
         dtype=v.element_type,
         global_dims=(v.shape[1] * D, v.shape[0]),
         global_strides=(I64(v.stride[0]) // 8,),
-        box_dims=(64, 16),
+        box_dims=(64, 8),
         swizzle=tmap.TensorMapSwizzle.s128b,
         l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
     )
@@ -511,23 +566,27 @@ def _fprop_host(q, k, v, out, out_fp32, lse, ids, counts, lo, hi, first, last, s
         from .fprop_sm107 import frost_qsa_fprop_sm107
 
         frost_qsa_fprop_sm107(
-            q_desc, k_desc, v_desc, k_contiguous_desc, v_contiguous_desc, out, out_fp32, lse, ids, counts, lo, hi, first, last, scale, group_size
-        ).launch(grid=(q.shape[0], k.shape[1], 1), block=(THREADS, 1, 1), min_blocks_per_mp=1, stream=stream)
+            q_desc, k_desc, v_desc, k_contiguous_desc, v_contiguous_desc, out, out_fp32, lse, ids, counts, lo, hi, first, last, mode, scale, group_size
+        ).launch(
+            grid=(cute.ceil_div(q.shape[0], 8) if cutlass.const_expr(mode is not None) else q.shape[0], k.shape[1], 1),
+            block=(THREADS, 1, 1),
+            min_blocks_per_mp=1,
+            stream=stream,
+        )
     else:
         frost_qsa_fprop_sm100(
-            q_desc, k_desc, v_desc, k_contiguous_desc, v_contiguous_desc, out, out_fp32, lse, ids, counts, lo, hi, first, last, scale, group_size
-        ).launch(grid=(q.shape[0], k.shape[1], 1), block=(THREADS, 1, 1), min_blocks_per_mp=1, stream=stream)
+            q_desc, k_desc, v_desc, k_contiguous_desc, v_contiguous_desc, out, out_fp32, lse, ids, counts, lo, hi, first, last, mode, scale, group_size
+        ).launch(
+            grid=(cute.ceil_div(q.shape[0], 32) if cutlass.const_expr(mode is not None) else q.shape[0], k.shape[1], 1),
+            block=(THREADS, 1, 1),
+            min_blocks_per_mp=1,
+            stream=stream,
+        )
 
 
-def compile_kernel(dtype, query_heads: int, kv_heads: int, arch: int):
-    """Compile dynamic extents with the common device-aware artifact cache."""
-    key = template_key(globals(), {**locals(), "sm107_source_digest": _FPROP_SM107_SOURCE_DIGEST if arch == 107 else None}, "compile_kernel")
-    if arch not in (100, 103, 107):
-        raise ValueError(f"QSA forward requires SM100, SM103 or SM107, got SM{arch}")
-    if query_heads % kv_heads or not 1 <= query_heads // kv_heads <= NQ:
-        raise ValueError("QSA forward requires a GQA group in [1,16]")
-    if dtype not in (cutlass.BFloat16, cutlass.Float16):
-        raise ValueError("QSA forward requires BF16 or FP16")
+@lru_cache(maxsize=None)
+def _compile_args(dtype, query_heads, kv_heads, gated):
+    """Reuse storage-free signatures; the shared cache owns CUDA objects."""
     total, capacity, blocks = cute.sym_int64(), cute.sym_int64(), cute.sym_int64()
 
     def tensor(dt, shape, alignment=16):
@@ -539,8 +598,7 @@ def compile_kernel(dtype, query_heads: int, kv_heads: int, arch: int):
     lse = tensor(F32, (query_heads, total), 4)
     ids = tensor(I32, (total, capacity), 4)
     rows, spans = tensor(I32, (total,), 4), tensor(I32, (blocks,), 4)
-    return compile_cached(
-        _fprop_host,
+    return (
         q,
         kv,
         kv,
@@ -553,8 +611,24 @@ def compile_kernel(dtype, query_heads: int, kv_heads: int, arch: int):
         rows,
         spans,
         spans,
+        tensor(I32, (cute.sym_int64(),), 4) if gated else None,
         F32(1),
         make_fake_stream(use_tvm_ffi_env_stream=False),
+    )
+
+
+def compile_kernel(dtype, query_heads: int, kv_heads: int, arch: int, gated=False):
+    """Compile dynamic extents with the common device-aware artifact cache."""
+    key = template_key(globals(), {**locals(), "sm107_source_digest": _FPROP_SM107_SOURCE_DIGEST if arch == 107 else None}, "compile_kernel")
+    if arch not in (100, 103, 107):
+        raise ValueError(f"QSA forward requires SM100, SM103 or SM107, got SM{arch}")
+    if query_heads % kv_heads or not 1 <= query_heads // kv_heads <= NQ:
+        raise ValueError("QSA forward requires a GQA group in [1,16]")
+    if dtype not in (cutlass.BFloat16, cutlass.Float16):
+        raise ValueError("QSA forward requires BF16 or FP16")
+    return compile_cached(
+        _fprop_host,
+        *_compile_args(dtype, query_heads, kv_heads, gated),
         arch,
         options=f"--enable-tvm-ffi --gpu-arch=sm_{arch}a",
         cache_key=key,
@@ -562,6 +636,6 @@ def compile_kernel(dtype, query_heads: int, kv_heads: int, arch: int):
     )
 
 
-def launch(compiled, q, k, v, out, out_fp32, lse, block_ids, block_counts, lo, hi, block_first, block_last, scale, stream):
+def launch(compiled, q, k, v, out, out_fp32, lse, block_ids, block_counts, lo, hi, block_first, block_last, scale, stream, mode=None):
     """Launch with caller-owned outputs and compact metadata; no allocation."""
-    compiled(q, k, v, out, out_fp32, lse, block_ids, block_counts, lo, hi, block_first, block_last, F32(scale), stream)
+    compiled(q, k, v, out, out_fp32, lse, block_ids, block_counts, lo, hi, block_first, block_last, mode, F32(scale), stream)
