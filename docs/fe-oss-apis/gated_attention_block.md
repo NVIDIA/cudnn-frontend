@@ -563,6 +563,31 @@ How a stack's vocabulary maps onto it (the shim is a renaming, not a conversion)
 | the open tail, the causal mask, the per-row `visible_blocks` clamp | nothing -- the kernel derives all three from the position and the KV length |
 | the output gate | nothing -- stage (5) is the block's (`sigmoid(gate)` after the dead-row select); a split merge is internal |
 
+**The decode top-k kernel (standalone today).** `cudnn.gated_attention_block.qsa_topk.qsa_topk_decode(logits, counts, block_ids, *,
+cluster_ctas=None, threads_per_cta=None, use_pdl=False, stream=None)` -- the DSL-free host entry: the kernel module
+`kernels/qsa_topk_decode.py` behind it imports the CuTe DSL at module scope, so the entry gates the DSL version FIRST and imports the
+kernel module lazily (a DSL below the floor reads as a typed `NotImplementedError` naming the version, never as an error from inside
+the DSL; `qsa_topk_decode_kernel_module()` hands the gated module, with its plan-time / per-execute split, to an engine) -- selects,
+per query row, the top-k block ids of the decode scorer's fp32 logits: `logits [T, n_blocks_max]` fp32 (row `t` scored in columns
+`[0, counts[t])`; the columns past them are never read), `counts [T]` int32 (the VISIBLE-block count per row, clamped in-kernel to
+`[0, n_blocks_max]` -- never the list length `min(top_k, n_vis)`: that spelling puts every row with more visible blocks than `top_k`
+in the identity region and returns the oldest `top_k` blocks with no error), `block_ids [T, top_k]` int32 -- the CALLER's buffer,
+nothing is allocated -- written in CANONICAL order: the `min(top_k, counts[t])` selected ids strictly descending, then `-1`.  The set is the exact
+top-k of the fp32 values (every selected logit at or above every unselected one; a tie at the k-th value keeps the smaller ids), so
+two launches are bitwise and the list is the form the sparse core's list stage consumes without a sort.  One thread-block cluster
+per row (`cluster_ctas` in 1 / 2 / 4 / 8, each CTA a contiguous slice of the row; `threads_per_cta` 256 / 512 / 1024): an exact
+8-bit radix select in at most four passes, the per-CTA histograms merged through distributed shared memory after a cluster
+barrier, an early stop when the k-th bin is taken whole, the canonical compaction from per-warp selection bitmaps.  Both knobs
+are performance-only (every value is the same function, pinned bitwise by the tests; the defaults are a starting point, not a
+measured optimum -- no performance number is quoted until one is measured on an exclusive GPU).  Typed declines: a CuTe DSL
+below the floor or without the device's target (the version / target named), `cluster_ctas > 1` or `use_pdl=True` below cc 9.0
+(clusters, DSMEM and `griddepcontrol` exist from Hopper), a per-CTA shared-memory need above the device's opt-in limit (the bytes
+named: `cols_cap x 4.5 B / cluster_ctas` for the staged keys, the selection bitmaps and their prefixes, plus about 4.4 KB fixed for
+the four histogram buffers and the scratch); `ValueError` on any malformed form, a row block of more than 65535 rows included.  The
+in-block decode
+indexer that binds it over the paged compressed-key cache is a follow-up; until then the dense standalone selector keeps the radix
+top-k it binds today.
+
 
 ### Serving: write-through into a paged KV cache (`paged_kv_page_size`)
 

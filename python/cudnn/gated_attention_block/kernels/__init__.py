@@ -45,6 +45,10 @@ stage of the pipeline in ``api.py``::
                                 streamed by cp.async through a per-warp SMEM ring, any CuTe DSL device from sm_80; its standalone selector
                                 ``qsa_select_decode_paged`` (scorer + radix top-k) is the DSL-free host entry ``../qsa_select_paged.py``,
                                 which also owns the kernel's host-side facts and gates the DSL floor BEFORE importing this module (Rule 7)
+    qsa_topk_decode.py          the block-sparse indexer's DECODE top-k: one thread-block cluster per query row, an exact
+                                radix select over the fp32 block logits (per-CTA histograms merged through DSMEM), the list
+                                written in canonical order (ids descending, -1 last); the DSL-free host entry is
+                                ``gated_attention_block/qsa_topk.py`` -- standalone until the decode indexer binds it
 
 **The SDPA stage owns no file here.**  It drives the shipped forward adapter
 ``cudnn.sdpa.fwd.api_dsl.SdpaFwdDslSm100`` in EVERY configuration; the
