@@ -121,6 +121,16 @@ def _case(rows: int, cols: int, top_k: int, *, seed: int, device, kind: str = "r
     elif kind == "relu":
         # the scorer's functional form: relu over 4 heads, summed, scaled
         logits = torch.relu(torch.randn(rows, cols, 4, device=device, generator=g)).sum(-1) / math.sqrt(128.0)
+    elif kind == "recency":
+        # the top-k = the LAST top_k ids (distinct, increasing): every staged word of the fast path falls into the one or two warps
+        # that own the row's tail -- the per-warp region bound (top_k + RANK_CAP words) at its worst case
+        lo_id = max(cols - top_k, 0)
+        logits[:, lo_id:] = 50.0 + torch.arange(cols - lo_id, device=device, dtype=torch.float32) * 0.01
+    elif kind == "whole_wide":
+        # exactly top_k identical maxima spread over the row: the k-th bin is taken WHOLE with top_k > RANK_CAP candidates in it (the
+        # fast path stages every one of them; the first RANK_CAP are rank-list entries as well, the rest plain ids)
+        ids = torch.arange(top_k, device=device) * max(cols // top_k, 1)
+        logits[:, ids[ids < cols]] = 77.0
     elif kind == "spread_tie":
         # n_above distinct values strictly above a tie value T = 100.0 (octaves above it), n_tie copies of T spread EVENLY over the
         # ids (every slice of a 4- / 8- / 16-CTA cluster holds a few of them, under UNION_CAP), the rest randn far below T:
@@ -184,13 +194,14 @@ def test_matches_the_exact_canonical_reference(cols, threads):
 
 @needs_cuda
 @needs_dsl_target
-@pytest.mark.parametrize("kind", ["ties", "boundary_tie", "neg", "wide", "relu", "spread_tie"])
+@pytest.mark.parametrize("kind", ["ties", "boundary_tie", "neg", "wide", "relu", "spread_tie", "recency", "whole_wide"])
 def test_ties_wide_ranges_negative_and_scorer_shaped_logits(kind):
     """A row of identical logits (more candidates in the k-th bin than the candidate list holds: the row-sweep fallback), a
     two-valued row, exactly ``k + 1`` equal maxima (the largest of them is the one dropped), all-negative rows, a value range of
     many octaves (the k-th value in the window's saturated bin: three more passes), the scorer's own relu-sum shape and a spread
-    tie at the k-th key with a partial take (the list passes, then the 2 x 12-bit id select): the k-th-value ties resolve to the
-    smaller ids, every form bitwise the reference."""
+    tie at the k-th key with a partial take (the list passes, then the 2 x 12-bit id select), the top-k concentrated in the row's
+    last ids (one warp's staging region at its bound) and exactly k identical maxima (the k-th bin taken whole, wider than the rank
+    list): the k-th-value ties resolve to the smaller ids, every form bitwise the reference."""
     device = torch.device("cuda")
     for threads in THREADS:
         logits, counts = _case(6, 8192, K, seed=11, device=device, kind=kind)
@@ -207,6 +218,12 @@ def test_ties_wide_ranges_negative_and_scorer_shaped_logits(kind):
                 if n > K:
                     # the K smallest of the K + 1 tied maxima: id K is the dropped one
                     assert int(out[t, 0]) == K - 1 and int(out[t, K - 1]) == 0 and K not in out[t].tolist()
+        if kind == "recency":
+            n0 = int(counts[0])
+            assert torch.equal(out[0], torch.arange(n0 - 1, n0 - 1 - K, -1, device=device, dtype=torch.int32)), "the premise: the last k ids"
+        if kind == "whole_wide":
+            n0 = int(counts[0])
+            assert int((logits[0, :n0] == 77.0).sum()) == K > topk_mod.RANK_CAP, "the premise: exactly k maxima, more than the rank list"
 
 
 @needs_cuda
@@ -453,7 +470,7 @@ def test_declines_a_shared_memory_need_above_the_device_limit(monkeypatch):
     monkeypatch.setattr(topk_mod, "shared_memory_per_block_optin", lambda device: 1024)
     monkeypatch.setattr(topk_mod, "compute_capability", lambda device: (10, 7))
     monkeypatch.setattr(topk_mod, "cutedsl_arch_requirement_error", lambda cc_: None)
-    need = topk_mod.smem_bytes_for(2048, 1, 1024)
+    need = topk_mod.smem_bytes_for(2048, 1, 1024, K)
     with pytest.raises(NotImplementedError, match=f"needs {need} B of shared memory per CTA; the device allows 1024 B"):
         topk_mod.compile_qsa_topk_decode(cols_cap=2048, top_k=K, threads_per_cta=1024)
 
@@ -704,7 +721,9 @@ def test_sm_107a_rendering_of_the_single_cta_form_carries_the_tables_structure(t
         assert counts[".local"] == 0, counts
     assert counts["atom.shared"] + counts["red.shared"] > 0 and counts["redux.sync"] >= 2 and counts["vote.sync.ballot"] >= 2 * ept, counts
     assert counts["griddepcontrol.wait"] == counts["griddepcontrol.launch_dependents"] == (1 if use_pdl else 0), counts
-    assert counts["ld.global"] == ept + 1 and counts["st.global"] >= ept + 1, counts
+    assert (
+        counts["ld.global"] == 2 * ept + 1 and counts["st.global"] >= ept + 2
+    ), counts  # two load paths (the row as wide as the capacity / narrower), the count
 
 
 @pytest.mark.parametrize("cluster_ctas,use_pdl", [(8, False), (16, True)])
