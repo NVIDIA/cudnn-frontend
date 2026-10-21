@@ -2232,7 +2232,6 @@ class Graph : public ICudnn, public INode {
             "enforce_precompiled requested, but serialized graph has no precompiled execution plan");
 
         auto serialized_plan = j["cudnn_backend_data"];
-        plans.set_cuda_graph_retention(cuda_graph_retention);
         if (device_prop != nullptr) {
             CHECK_CUDNN_FRONTEND_ERROR(plans.build_plans(device_prop, serialized_plan));
         } else {
@@ -2348,6 +2347,7 @@ class Graph : public ICudnn, public INode {
     Graph &
     set_cuda_graph_retention(CudaGraphRetention_t retention) {
         cuda_graph_retention = retention;
+        plans.set_cuda_graph_retention(retention);
         return *this;
     }
 
@@ -3388,7 +3388,6 @@ Graph::create_execution_plans(std::vector<HeurMode_t> const &mode) {
         plans.set_tag(operation_graph->getTag());
         plans.enqueue_engine_configs(op_graph_to_configs);
         plans.set_kernel_cache(kernel_cache);
-        plans.set_cuda_graph_retention(cuda_graph_retention);
 
         CUDNN_FE_LOG_LABEL_ENDL("INFO: Querying engine config properties.");
         CHECK_CUDNN_FRONTEND_ERROR(plans.query_properties());
