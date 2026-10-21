@@ -21,8 +21,8 @@ documented import path resolves on every installed DSL, the public 4.6.2 wheel (
 :func:`qsa_select_decode_paged` checks every operand's FORM first, then gates the DSL floor, the ``sm_107a`` target on cc 10.7
 and the radix top-k's cc 9.0 -- each a typed ``NotImplementedError`` naming the version or the device -- and only THEN imports
 the kernel module (whose import executes the DSL, like its neighbours) inside the function body.  The kernel's host-side
-facts a declaration may need before any kernel is reached -- the warp-lane geometry, the compile-key validator, the knob
-default, the byte model -- live here for the same reason, and the kernel module imports them from here (never the other way
+facts a declaration may need before any kernel is reached -- the MMA row map of the query rows, the compile-key validator, the
+knob defaults, the byte model -- live here for the same reason, and the kernel module imports them from here (never the other way
 round at module scope).  The kernel's SMEM table, barrier table, PDL sites and degenerate-input matrix are in the kernel
 module's docstring; :func:`qsa_select_decode_paged` documents the selection's contract.
 
@@ -34,7 +34,7 @@ output and scratch allocations and its launch -- handing both kernels that strea
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
 
@@ -50,7 +50,11 @@ __all__ = [
     "TOP_K_KERNEL_MAX",
     "MAX_QUERY_ROWS",
     "UNITS_PER_WARP_CHOICES",
-    "lane_geometry",
+    "RING_DEPTH_CHOICES",
+    "QueryRowMap",
+    "padded_heads",
+    "query_row_map",
+    "keys_per_warp",
     "blocks_per_cta",
     "default_units_per_warp",
     "validate_params",
@@ -63,13 +67,23 @@ QSA_TOP_K = 512  # blocks kept per row (2048 selected tokens / 4)
 TOP_K_KERNEL_MAX = 2048  # the radix top-k kernel's bound on top_k
 THREADS = 128  # 4 warps per CTA
 WARPS = THREADS // 32
-ROWS_PER_UNIT = 16  # compressed rows per warp unit: every unit's loads are in flight before its first FMA
-UNITS_PER_WARP_CHOICES = (1, 2, 4)  # blocks_per_cta 64 / 128 / 256 -- a performance knob, the same function
-MAX_QUERY_ROWS = 64  # S_q x H_i (s, h) rows staged as fp32 in SMEM: 64 x 512 B = 32 KiB
+# The warp-level MMA the scorer runs: mma.sync.m16n8k16 (bf16 in, fp32 accumulate) -- M = 16 padded (s, h) query rows, N = 8 keys per
+# n-tile, K = 16 of the 128 D per k-step.
+MMA_M = 16
+MMA_N = 8
+MMA_K = 16
+K_STEPS = INDEX_HEAD_DIM // MMA_K  # 8 k-steps per key row
+KEYS_PER_NTILE = MMA_N  # 8 compressed rows per MMA n-tile
+NTILES_PER_UNIT = 4  # n-tiles per warp unit = the register ring depth: every key load of a unit is in flight before its first MMA
+NTILES_IN_FLIGHT = NTILES_PER_UNIT  # the default ring depth (n-tiles of keys in flight per warp); RING_DEPTH_CHOICES is the knob's domain
+RING_DEPTH_CHOICES = (2, 4, 8)
+ROWS_PER_UNIT = KEYS_PER_NTILE * NTILES_PER_UNIT  # 32 compressed rows per warp unit
+UNITS_PER_WARP_CHOICES = (1, 2, 4, 8)  # 32 / 64 / 128 / 256 rows per warp = blocks_per_cta 128 / 256 / 512 / 1024 -- a performance knob, the same function
+MAX_QUERY_ROWS = 64  # S_q x next_pow2(H_i) padded (s, h) MMA rows resident in registers per warp: 4 m-tiles of 16 (32 registers each)
 MIN_PAGE_SIZE = 2 * BLOCK_SIZE  # at least two compressed rows per page (a power-of-two row count)
 CHUNK_ELEMS = 8  # bf16 elements per 16-byte chunk
 CHUNKS_PER_ROW = INDEX_HEAD_DIM // CHUNK_ELEMS  # 16
-HALF = CHUNKS_PER_ROW * 4  # the fp32 offset of the second 4-element halves inside a half-split SMEM row (64)
+CHUNKS_PER_LANE = CHUNKS_PER_ROW // 4  # the 4 chunks `q + 4 j` lane (g, q) loads of a row: one 16-byte load each
 # The radix top-k's input contract, by value (``deepseek_sparse_attention.indexer_top_k``: ``INPUT_ALIGN`` = 32 bytes, fp32 rows read in
 # 256-bit vectors): spelled here because the preallocated-output checks run BEFORE the gate that makes that kernel module importable.
 _SCORE_ROW_ALIGN = 8  # n_blocks_max must be a multiple of 8 fp32 (one 256-bit vector)
@@ -81,38 +95,95 @@ def _ceil_div(a: int, b: int) -> int:
     return -(-int(a) // int(b))
 
 
-def lane_geometry(rows_per_page: int):
-    """``(rows per warp-step, lanes per row, 16-byte chunks per lane, steps per 16-row unit)`` for a page of ``rows_per_page``
-    compressed rows: 4 rows x 8 lanes at page 16, 8 x 4 at page 32 and up, 2 x 16 at page 8 (the kernel module's docstring)."""
-    r_step = min(int(rows_per_page), 8)
-    lanes = 32 // r_step
-    return r_step, lanes, CHUNKS_PER_ROW // lanes, ROWS_PER_UNIT // r_step
+class QueryRowMap(NamedTuple):
+    """How the ``S_q x H_i`` (s, h) query rows sit in the MMA's M dimension (the kernel module's docstring, "the row map"): the
+    heads of a query are padded to ``P = next_pow2(H_i)`` rows; ``P' = min(P, 16)`` of them share a 16-row m-tile with
+    ``QPT = 16 / P'`` queries; a query wider than a tile spans ``TPQ = P / 16`` tiles.  Lane ``(g = lane / 4, q = lane % 4)`` of the
+    warp holds rows ``g`` and ``g + 8`` of every tile: with ``P' >= 2`` those two rows are heads ``2 gi`` / ``2 gi + 1`` of ONE query
+    (``gi = g % G``, ``G = P' / 2``) -- the head sum is one in-thread add plus ``stages = log2(G)`` butterfly shuffles over the lanes
+    ``xor 4, 8, 16``; with ``P' = 1`` the two rows are two queries and nothing is summed."""
+
+    h_i: int
+    s_q: int
+    padded: int  # P
+    tile_rows: int  # P'
+    queries_per_tile: int  # QPT
+    tiles_per_query: int  # TPQ
+    m_tiles: int
+    group: int  # G = P' / 2 (0 at P' = 1): consecutive g values of one query inside a tile
+    stages: int  # butterfly stages of the head sum (lane xor 4 << k)
+
+    def row_of(self, t: int, r: int):
+        """The (s, h) of padded row ``r`` of m-tile ``t`` (the lane's half = ``r // 8``), or ``None`` for a padding row."""
+        g, half = r % 8, r // 8
+        if self.tile_rows == 1:
+            s, h = t * self.queries_per_tile + r, 0
+        else:
+            s = (t // self.tiles_per_query) * self.queries_per_tile + g // self.group
+            h = 16 * (t % self.tiles_per_query) + 2 * (g % self.group) + half
+        return (s, h) if s < self.s_q and h < self.h_i else None
+
+    def tile_row(self, s: int, h: int):
+        """The inverse: ``(m-tile, padded row)`` of query row ``s``, head ``h``."""
+        if self.tile_rows == 1:
+            return s // self.queries_per_tile, s % self.queries_per_tile
+        t = s // self.queries_per_tile * self.tiles_per_query + h // 16
+        g = (s % self.queries_per_tile) * self.group + (h % 16) // 2
+        return t, g + 8 * ((h % 16) % 2)
+
+
+def padded_heads(h_i: int) -> int:
+    """``next_pow2(h_i)``: the MMA rows one query occupies."""
+    p = 1
+    while p < int(h_i):
+        p *= 2
+    return p
+
+
+def query_row_map(s_q: int, h_i: int) -> QueryRowMap:
+    p = padded_heads(h_i)
+    tile_rows = min(p, MMA_M)
+    qpt = MMA_M // tile_rows
+    tpq = max(1, p // MMA_M)
+    group = tile_rows // 2
+    return QueryRowMap(int(h_i), int(s_q), p, tile_rows, qpt, tpq, _ceil_div(int(s_q) * p, MMA_M), group, max(0, group.bit_length() - 1))
+
+
+def keys_per_warp(units_per_warp: int) -> int:
+    """Compressed rows one warp streams: ``units_per_warp`` units of 32 (4 MMA n-tiles each)."""
+    return ROWS_PER_UNIT * int(units_per_warp)
 
 
 def blocks_per_cta(units_per_warp: int) -> int:
-    """Compressed rows per CTA: 4 warps x 16 rows x ``units_per_warp``."""
-    return WARPS * ROWS_PER_UNIT * int(units_per_warp)
+    """Compressed rows per CTA: 4 independent warps x ``keys_per_warp``."""
+    return WARPS * keys_per_warp(units_per_warp)
 
 
-def default_units_per_warp(n_blocks_max: int) -> int:
-    """The knob's default from the cache capacity: 64 rows per CTA up to 8192 blocks (more CTAs for a short cache -- the
-    kernel is latency-bound there), 128 above (fewer re-stagings of the queries per compressed row for a long one).  Both
-    values are the same function (``test_units_per_warp_is_a_knob``); re-measure per arch before changing the rule."""
-    return 1 if int(n_blocks_max) <= 8192 else 2
+# The knob's default (fit on the 2026-10-21 decode ranking, B 1..32 x 8K..128K x S_q 1 / 4): ONE unit per warp on every measured
+# cell -- every key of the warp is in flight at once, the shortest per-warp chain, and the machine fills from 10 warps per SM up.  Two
+# units were within +-7 % (better on one cell, B 4 x 128K x S_q 4, worse on B 32 x 32K x S_q 4) and four / eight never won a cell: the
+# longer per-warp chains cost more than the per-warp table traffic they save.  The arguments stay (the step's key count, the device's
+# SM count, the rows per sequence) for a refit per arch; re-measure before changing.
+UNITS_DEFAULT = 1
 
 
-def validate_params(*, h_i: int, s_q: int, page_size: int, units_per_warp: int) -> None:
-    """The compile-key facts, typed (never an assert): the head count and the rows per sequence (their product is the SMEM
-    envelope), the page size (a power of two of at least two compressed rows: the in-kernel page / row split is a shift),
-    the units knob."""
+def default_units_per_warp(n_blocks_max: int, batch: int = 1, num_sms: Optional[int] = None, s_q: int = 1) -> int:
+    return UNITS_DEFAULT
+
+
+def validate_params(*, h_i: int, s_q: int, page_size: int, units_per_warp: int, ring_depth: int = NTILES_IN_FLIGHT) -> None:
+    """The compile-key facts, typed (never an assert): the head count and the rows per sequence (their PADDED product is the
+    register envelope of the resident query fragments), the page size (a power of two of at least two compressed rows: the
+    in-kernel page / row split is a shift), the units knob."""
     if int(h_i) < 1:
         raise ValueError(f"h_i must be >= 1, got {h_i}")
     if int(s_q) < 1:
         raise ValueError(f"s_q must be >= 1, got {s_q}")
-    if int(s_q) * int(h_i) > MAX_QUERY_ROWS:
+    padded = int(s_q) * padded_heads(h_i)
+    if padded > MAX_QUERY_ROWS:
         raise ValueError(
-            f"s_q x h_i = {int(s_q) * int(h_i)} (s, h) query rows exceed the {MAX_QUERY_ROWS}-row shared-memory staging envelope "
-            f"({MAX_QUERY_ROWS * INDEX_HEAD_DIM * 4 // 1024} KiB of fp32): score more rows per sequence in several calls"
+            f"s_q x h_i = {s_q} x {h_i} pads to {padded} (s, h) MMA rows (h_i padded to the next power of two, {padded_heads(h_i)}), past the "
+            f"{MAX_QUERY_ROWS}-row register envelope ({MAX_QUERY_ROWS // MMA_M} m-tiles of {MMA_M}): score more rows per sequence in several calls"
         )
     p = int(page_size)
     if p < MIN_PAGE_SIZE or p % BLOCK_SIZE or (p & (p - 1)):
@@ -121,6 +192,8 @@ def validate_params(*, h_i: int, s_q: int, page_size: int, units_per_warp: int) 
         )
     if int(units_per_warp) not in UNITS_PER_WARP_CHOICES:
         raise ValueError(f"units_per_warp must be one of {UNITS_PER_WARP_CHOICES}, got {units_per_warp}")
+    if int(ring_depth) not in RING_DEPTH_CHOICES:
+        raise ValueError(f"ring_depth must be one of {RING_DEPTH_CHOICES}, got {ring_depth}")
 
 
 def _check_i32_1d(t, name: str, n: int, device) -> None:
@@ -156,10 +229,13 @@ def _kbar_rows_view(kbar: torch.Tensor, rows_per_page: int, device) -> torch.Ten
             f"kbar must hold >= 1 pages of {rows_per_page} compressed rows (page_size {rows_per_page * BLOCK_SIZE} / {BLOCK_SIZE}) x {INDEX_HEAD_DIM}, got {tuple(kbar.shape)}"
         )
     s0, s1, s2 = (int(x) for x in view.stride())
-    if s2 != 1 or (s0 * 2) % 16 or (s1 * 2) % 16 or kbar.data_ptr() % 16:
+    if s2 != 1 or s1 != INDEX_HEAD_DIM or (s0 * 2) % 16 or kbar.data_ptr() % 16:
         raise ValueError(
-            f"kbar must be contiguous along D with 16-byte-aligned page / row strides and base, got strides {tuple(kbar.stride())}, data_ptr {kbar.data_ptr():#x}"
+            f"kbar must hold a page's compressed rows contiguously (row stride {INDEX_HEAD_DIM}, D contiguous) with a 16-byte-aligned page stride and "
+            f"base, got strides {tuple(kbar.stride())}, data_ptr {kbar.data_ptr():#x}"
         )
+    if s0 * 2 >= 2**31:
+        raise ValueError(f"kbar's page stride must be below 2 GiB (the kernel's 32-bit page stride), got {s0 * 2} bytes")
     if kbar.device != device:
         raise ValueError(f"kbar must live on {device}, got {kbar.device}")
     return view
@@ -210,8 +286,9 @@ def qsa_select_decode_paged(
       calls on the same inputs are BITWISE.  ``logits_out`` / ``counts_out`` / ``block_lens_out`` are optional preallocated
       scorer outputs (``logits_out`` 32-byte aligned, contiguous); the top-k's outputs and its radix scratch are allocated here
       per call on the launch stream (the standalone form; the block's stage carves them from its workspace).
-    * ``top_k`` in ``[1, 2048]``; ``scale`` defaults to ``1 / sqrt(128)`` and must be positive; ``units_per_warp`` (1 / 2 / 4,
-      ``None`` = :func:`default_units_per_warp`) and ``use_pdl`` are performance knobs: the same function.
+    * ``top_k`` in ``[1, 2048]``; ``scale`` defaults to ``1 / sqrt(128)`` and must be positive; ``units_per_warp`` (1 / 2 / 4 / 8
+      units of 32 compressed rows per warp, ``None`` = :func:`default_units_per_warp` from the step's total key count, the
+      device's SM count and ``seq_q``) and ``use_pdl`` are performance knobs: the same function.
     * ``stream``: the LAUNCH stream -- a ``torch.cuda.Stream`` (on ``qi``'s device), a raw CUDA stream handle (an ``int`` or a
       ``cuda.CUstream``), or ``None`` = torch's current stream on ``qi``'s device.  It is resolved to one torch stream before any
       torch operation of the call, and every one of them (the output allocations here, the top-k wrapper's allocations and
@@ -268,7 +345,7 @@ def qsa_select_decode_paged(
     if not float(scale) > 0.0:
         raise ValueError(f"scale must be positive (the ordering is scale-free), got {scale}")
     if units_per_warp is None:
-        units_per_warp = default_units_per_warp(n_blocks_max)
+        units_per_warp = default_units_per_warp(n_blocks_max, batch, torch.cuda.get_device_properties(qi.device).multi_processor_count, int(seq_q))
     validate_params(h_i=h_i, s_q=int(seq_q), page_size=page_size, units_per_warp=int(units_per_warp))
     _kbar_rows_view(kbar, rows_per_page, qi.device)  # the cache's form (its singleton row axis, D contiguous, the alignment) ahead of the gates
     for name, out, shape in (("logits_out", logits_out, (t, n_blocks_max)), ("counts_out", counts_out, (t,)), ("block_lens_out", block_lens_out, (t,))):
@@ -331,23 +408,23 @@ def qsa_select_decode_paged(
 def moved_bytes(n_vis_rows, *, s_q: int, h_i: int, n_blocks_max: int, page_size: int, units_per_warp: int = 1) -> int:
     """The HBM-side byte model of one scorer launch for a SOL number: ``n_vis_rows`` = every row's visible count (host arithmetic
     from the caller's own ``kv_lens``, ``[T]`` in row order, ``T = B x s_q``): the compressed rows a sequence streams once
-    (its last row's count x 256 B), the fp32 logits written (every row's count x 4 B), the queries re-staged per CTA (L2-resident
-    in practice, counted) and the table words (one per page per warp, counted once per sequence)."""
+    (its last row's count x 256 B), the fp32 logits written (every row's count x 4 B), the padded query tile every LIVE CTA stages
+    (``16 x 256 B`` per m-tile, L2-resident in practice, counted) and the table words (one per page, read by the warp that owns it)."""
     rows = [int(v) for v in n_vis_rows]
     s_q = int(s_q)
     if s_q < 1 or len(rows) % s_q:
         raise ValueError(f"n_vis_rows holds {len(rows)} rows, not a multiple of s_q = {s_q}")
     rows_per_page = int(page_size) // BLOCK_SIZE
-    n_chunks = _ceil_div(int(n_blocks_max), blocks_per_cta(units_per_warp))
+    per_cta = blocks_per_cta(units_per_warp)
+    n_ctas = _ceil_div(int(n_blocks_max), per_cta)
+    tile_bytes = query_row_map(s_q, h_i).m_tiles * MMA_M * INDEX_HEAD_DIM * 2
     total = 0
     for b in range(len(rows) // s_q):
         seq = rows[b * s_q : (b + 1) * s_q]
         n_max = max(seq)
         total += n_max * INDEX_HEAD_DIM * 2  # the compressed rows read once
         total += sum(seq) * 4  # the logits written
-        total += (
-            min(n_chunks, _ceil_div(n_max, blocks_per_cta(units_per_warp))) * s_q * int(h_i) * INDEX_HEAD_DIM * 2
-        )  # the queries per LIVE CTA (none for a padding sequence)
-        total += _ceil_div(n_max, rows_per_page) * 4 * WARPS  # the table words
+        total += min(n_ctas, _ceil_div(n_max, per_cta)) * tile_bytes  # the query tile per LIVE CTA (none for a padding sequence)
+        total += _ceil_div(n_max, rows_per_page) * 4  # the table words, one per page
     total += 2 * len(rows) * 4  # counts + block_lens
     return total

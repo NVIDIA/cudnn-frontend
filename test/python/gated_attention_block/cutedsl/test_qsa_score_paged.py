@@ -4,20 +4,23 @@
 """``kernels/qsa_score_paged.py`` -- the decode indexer's scorer over the PAGED compressed-key cache -- and its DSL-free host entry
 ``gated_attention_block/qsa_select_paged.py`` (the standalone selector + the kernel's host-side facts).
 
-Host cells (any machine): the warp-lane geometry per page size, the compile-key envelope (typed ``ValueError``), the byte model, the
+Host cells (any machine): the MMA row map of the (s, h) query rows (a bijection onto the padded rows; the head-sum geometry per
+head count), the knob's default rule at both sides of every threshold, the compile-key envelope (typed ``ValueError``), the byte model, the
 compile site's persistent-cache key (the module digest), the Rule 7 gates (the DSL floor, the ``sm_107a`` target, the radix top-k's
 cc 9.0 and PDL's cc 9.0 -- each a ``NotImplementedError`` naming the version or the device, raised BEFORE any compile), the e4m3 pair
 refused BY NAME, the form checks naming their fault; with a CUDA device: the front door's import-time contract in a FRESH process (the
 DSL modeled as the public 4.6.2 wheel: the typed decline, the kernel module never imported) and the launch-stream resolution with both
 kernels stubbed (a ``torch.cuda.Stream`` / a raw handle / ``None``: every torch operation on the launch stream).
 
-Scorer cells (ANY CuTe DSL device -- the kernel is plain CUDA-core code: loads, shuffles, one barrier): the fp32 logits of every
+Scorer cells (ANY CuTe DSL device from sm_80 -- the kernel is one warp-level ``mma.sync.m16n8k16`` per 8 keys x 16 D, loads,
+shuffles, no barrier): the fp32 logits of every
 visible column against an fp64 re-derivation of the indexer score on the SAME bf16 inputs gathered through the table
 (``relu(q_h . kbar_j)`` summed over heads, times the scale), the per-row counts against the QSA oracle's count rule, the
 columns at or past a row's count NEVER written (a sentinel proves it), two launches bitwise, the ``units_per_warp`` knob and the
 PDL arm bitwise the plain launch, the degenerate matrix of the module docstring (a padding sequence, a sequence shorter than the
 step, a visible count inside a page, a ``-1`` / out-of-range table page under a visible block and past the visible range), at
-``n_blocks_max`` {8, 520, 4096, 8192, 32768} x rows 1..4 x page sizes {16, 32, 64}; a fresh variant reaching the compiled-plan cache.
+``n_blocks_max`` {8, 520, 4096, 8192, 32768} x rows 1..4 x page sizes {16, 32, 64}; every branch of the row map (``H_i`` 1 / 2 / 3 /
+8 / 16 / 32, several m-tiles, a query spanning two tiles) against the same reference; a fresh variant reaching the compiled-plan cache.
 
 Selector cells (cc 9.0+: the radix top-k): the selected SET of every row equals ``torch.topk`` of the fp64 reference up to
 ties at the k-th boundary (the dense decode selector's oracle), the ids ASCENDING with ``-1`` past ``block_lens``, the identity
@@ -232,27 +235,62 @@ def _step_kv_lens(n_blocks_max, rows, batch=4):
 # --------------------------------------------------------------------------------------------- host cells
 
 
-def test_lane_geometry_blocks_per_cta_and_the_units_default():
-    """4 rows x 8 lanes per warp-step at page 16, 8 x 4 from page 32, 2 x 16 at page 8; the lanes' chunks always cover the row; the
-    CTA holds 64 / 128 / 256 rows; the knob's default follows the cache capacity.  The facts live in the DSL-free front door and the
-    kernel module uses the very same objects (one definition, Rule 7's placement)."""
-    assert fd.lane_geometry(2) == (2, 16, 1, 8)
-    assert fd.lane_geometry(4) == (4, 8, 2, 4)
-    assert fd.lane_geometry(8) == (8, 4, 4, 2)
-    assert fd.lane_geometry(16) == (8, 4, 4, 2)
-    assert fd.lane_geometry(64) == (8, 4, 4, 2)
-    for rpp in (2, 4, 8, 16, 32, 64):
-        r_step, lanes, chunks, steps = fd.lane_geometry(rpp)
-        assert r_step * lanes == 32 and lanes * chunks * fd.CHUNK_ELEMS == D and r_step * steps == fd.ROWS_PER_UNIT
-    assert [fd.blocks_per_cta(u) for u in (1, 2, 4)] == [64, 128, 256]
-    assert (
-        fd.default_units_per_warp(8) == 1
-        and fd.default_units_per_warp(8192) == 1
-        and fd.default_units_per_warp(8200) == 2
-        and fd.default_units_per_warp(32768) == 2
-    )
-    assert sp.lane_geometry is fd.lane_geometry and sp.blocks_per_cta is fd.blocks_per_cta and sp.validate_params is fd.validate_params
-    assert sp.THREADS == fd.THREADS == 128 and sp.INDEX_HEAD_DIM == D
+def test_query_row_map_is_a_bijection_and_the_head_sum_geometry_follows_the_head_count():
+    """The (s, h) -> (m-tile, padded row) map the kernel loads its A fragments by: every (s, h) lands on exactly one padded row, every
+    other padded row is a padding row (``row_of`` None), the inverse agrees; the heads of one query sit on the lane's two rows
+    (``g``, ``g + 8``) and ``group`` consecutive ``g`` values -- ``stages`` butterfly shuffles (H_i 4: ONE); a query wider than a
+    tile spans ``tiles_per_query`` tiles.  The facts live in the DSL-free front door and the kernel module uses the very same
+    objects (one definition, Rule 7's placement)."""
+    for h_i, s_q, want in (
+        (4, 1, dict(padded=4, tile_rows=4, queries_per_tile=4, tiles_per_query=1, m_tiles=1, group=2, stages=1)),
+        (4, 4, dict(padded=4, tile_rows=4, queries_per_tile=4, tiles_per_query=1, m_tiles=1, group=2, stages=1)),
+        (4, 5, dict(padded=4, tile_rows=4, queries_per_tile=4, tiles_per_query=1, m_tiles=2, group=2, stages=1)),
+        (3, 2, dict(padded=4, tile_rows=4, queries_per_tile=4, tiles_per_query=1, m_tiles=1, group=2, stages=1)),
+        (1, 20, dict(padded=1, tile_rows=1, queries_per_tile=16, tiles_per_query=1, m_tiles=2, group=0, stages=0)),
+        (2, 3, dict(padded=2, tile_rows=2, queries_per_tile=8, tiles_per_query=1, m_tiles=1, group=1, stages=0)),
+        (8, 2, dict(padded=8, tile_rows=8, queries_per_tile=2, tiles_per_query=1, m_tiles=1, group=4, stages=2)),
+        (16, 3, dict(padded=16, tile_rows=16, queries_per_tile=1, tiles_per_query=1, m_tiles=3, group=8, stages=3)),
+        (17, 2, dict(padded=32, tile_rows=16, queries_per_tile=1, tiles_per_query=2, m_tiles=4, group=8, stages=3)),
+        (64, 1, dict(padded=64, tile_rows=16, queries_per_tile=1, tiles_per_query=4, m_tiles=4, group=8, stages=3)),
+    ):
+        rm = fd.query_row_map(s_q, h_i)
+        assert rm.h_i == h_i and rm.s_q == s_q and {k: getattr(rm, k) for k in want} == want, (h_i, s_q, rm)
+        seen = {}
+        for s in range(s_q):
+            for h in range(h_i):
+                t, r = rm.tile_row(s, h)
+                assert 0 <= t < rm.m_tiles and 0 <= r < 16
+                assert rm.row_of(t, r) == (s, h), (h_i, s_q, s, h, t, r, rm.row_of(t, r))
+                seen[(t, r)] = (s, h)
+        assert len(seen) == s_q * h_i, "two (s, h) share a padded row"
+        for t in range(rm.m_tiles):
+            for r in range(16):
+                if (t, r) not in seen:
+                    assert rm.row_of(t, r) is None, (h_i, s_q, t, r)
+        if rm.tile_rows > 1:
+            # one query's heads: the lane's two rows (g and g + 8) x the `group` consecutive g values x its tiles -- nothing else
+            for s in range(s_q):
+                rows = {rm.tile_row(s, h) for h in range(h_i)}
+                gs = {r % 8 for _, r in rows}
+                tiles = {t for t, _ in rows}
+                assert len(tiles) == rm.tiles_per_query and max(gs) - min(gs) < rm.group and min(gs) % rm.group == 0, (h_i, s_q, s, rows)
+    with pytest.raises(ValueError, match="s_q x h_i"):
+        fd.query_row_map(17, 4) and fd.validate_params(h_i=4, s_q=17, page_size=16, units_per_warp=1)
+    assert [fd.padded_heads(h) for h in (1, 2, 3, 4, 5, 8, 9, 16, 17, 64)] == [1, 2, 4, 4, 8, 8, 16, 16, 32, 64]
+    assert [fd.keys_per_warp(u) for u in fd.UNITS_PER_WARP_CHOICES] == [32, 64, 128, 256]
+    assert [fd.blocks_per_cta(u) for u in fd.UNITS_PER_WARP_CHOICES] == [128, 256, 512, 1024]
+    assert fd.ROWS_PER_UNIT == fd.KEYS_PER_NTILE * fd.NTILES_PER_UNIT == 32 and fd.K_STEPS == 8 and fd.MAX_QUERY_ROWS == 64
+    assert sp.query_row_map is fd.query_row_map and sp.blocks_per_cta is fd.blocks_per_cta and sp.validate_params is fd.validate_params
+    assert sp.keys_per_warp is fd.keys_per_warp and sp.THREADS == fd.THREADS == 128 and sp.INDEX_HEAD_DIM == D
+
+
+def test_default_units_is_one_everywhere_and_the_rule_keeps_its_arguments():
+    """The knob's default (fit on the 2026-10-21 decode ranking): ONE unit per warp on every cell -- the function keeps the step's key
+    count, the SM count and the rows per sequence for a refit; the one-argument call still resolves."""
+    for sms in (212, 204):
+        for b, n, s_q in ((1, 2048, 1), (1, 32768, 1), (4, 32768, 4), (32, 2048, 1), (32, 32768, 4), (32, 32768, 1), (1, 10**9, 4)):
+            assert fd.default_units_per_warp(n, b, sms, s_q) == fd.UNITS_DEFAULT == 1, (sms, b, n, s_q)
+    assert fd.default_units_per_warp(8) == 1 and fd.default_units_per_warp(32768, 32) == 1 and fd.UNITS_DEFAULT in fd.UNITS_PER_WARP_CHOICES
 
 
 def test_validate_params_rejects_outside_the_envelope_and_accepts_inside():
@@ -269,7 +307,16 @@ def test_validate_params_rejects_outside_the_envelope_and_accepts_inside():
         fd.validate_params(h_i=0, s_q=1, page_size=16, units_per_warp=1)
     with pytest.raises(ValueError, match="s_q must be >= 1"):
         fd.validate_params(h_i=4, s_q=0, page_size=16, units_per_warp=1)
-    for h_i, s_q, page, units in ((4, 4, 16, 1), (4, 16, 64, 4), (64, 1, 8, 2), (8, 8, 32, 2), (16, 4, 256, 1)):
+    with pytest.raises(ValueError, match=r"s_q x h_i = 12 x 5 pads to 96"):
+        fd.validate_params(h_i=5, s_q=12, page_size=16, units_per_warp=1)  # 60 (s, h) rows, but 5 heads pad to 8: past the envelope
+    with pytest.raises(ValueError, match="units_per_warp must be one of"):
+        fd.validate_params(h_i=4, s_q=1, page_size=16, units_per_warp=16)
+    for depth in (3, 16, 0):
+        with pytest.raises(ValueError, match="ring_depth must be one of"):
+            fd.validate_params(h_i=4, s_q=1, page_size=16, units_per_warp=1, ring_depth=depth)
+    for depth in fd.RING_DEPTH_CHOICES:
+        fd.validate_params(h_i=4, s_q=1, page_size=16, units_per_warp=1, ring_depth=depth)
+    for h_i, s_q, page, units in ((4, 4, 16, 1), (4, 16, 64, 4), (64, 1, 8, 2), (8, 8, 32, 2), (16, 4, 256, 1), (3, 16, 16, 8), (5, 8, 16, 1)):
         fd.validate_params(h_i=h_i, s_q=s_q, page_size=page, units_per_warp=units)
 
 
@@ -278,9 +325,11 @@ def test_moved_bytes_counts_the_streamed_rows_and_the_written_logits():
     n = fd.moved_bytes([9, 10, 0, 0], s_q=2, h_i=4, n_blocks_max=64, page_size=16, units_per_warp=1)
     rows = 10 * D * 2  # the first sequence streams 10 compressed rows (the padding sequence none)
     logits = (9 + 10) * 4
-    queries = 1 * 2 * 4 * D * 2  # one live CTA (64 rows per CTA) re-stages 2 x 4 query rows
-    table = -(-10 // 4) * 4 * fd.WARPS
+    queries = 1 * 16 * D * 2  # one live CTA (128 rows per CTA) stages the padded 16-row query tile (2 x 4 rows pad to one m-tile)
+    table = -(-10 // 4) * 4  # one word per page
     assert n == rows + logits + queries + table + 2 * 4 * 4
+    n2 = fd.moved_bytes([200, 200], s_q=1, h_i=4, n_blocks_max=512, page_size=16, units_per_warp=1)
+    assert n2 == 200 * D * 2 * 2 + 200 * 4 * 2 + 2 * 16 * D * 2 * 2 + -(-200 // 4) * 4 * 2 + 2 * 2 * 4  # 2 live CTAs of 128 rows per sequence
     with pytest.raises(ValueError, match="not a multiple of s_q"):
         fd.moved_bytes([1, 2, 3], s_q=2, h_i=4, n_blocks_max=64, page_size=16)
 
@@ -522,11 +571,11 @@ def test_run_form_checks_name_the_fault():
 @pytest.mark.parametrize("n_blocks_max", [8, 520, 4096, 8192, 32768])
 def test_scorer_matches_the_fp64_reference_and_writes_only_the_visible_columns(n_blocks_max, rows, page_size):
     """Four sequences whose step-0 positions cover every residue modulo the block size (the last sees every block of the cache), the
-    knob at its default for the capacity: counts = the oracle's count rule, block_lens = min(top_k, counts), every visible logit
+    knob at its default: counts = the oracle's count rule, block_lens = min(top_k, counts), every visible logit
     within the fp32 budget of the fp64 reference gathered through the SAME shuffled table, every other column untouched, and a
     second launch bitwise."""
     case = _Case(4, rows, n_blocks_max, page_size, _step_kv_lens(n_blocks_max, rows), seed=n_blocks_max + 7 * rows + page_size)
-    r = sp.compile_qsa_score_paged(h_i=H, s_q=rows, page_size=page_size, units_per_warp=fd.default_units_per_warp(n_blocks_max))
+    r = sp.compile_qsa_score_paged(h_i=H, s_q=rows, page_size=page_size, units_per_warp=fd.default_units_per_warp(n_blocks_max, 4, None, rows))
     logits, counts, lens = case.run(r)
     _assert_scorer(case, logits, counts, lens)
     logits2, counts2, lens2 = case.run(r)
@@ -599,10 +648,27 @@ def test_degenerate_rows_and_dead_pages():
 
 
 @needs_scorer
+@pytest.mark.parametrize(
+    "h_i,s_q,n_blocks_max,page_size", [(1, 20, 72, 16), (2, 3, 72, 32), (3, 2, 136, 16), (8, 2, 72, 16), (16, 3, 72, 64), (17, 2, 136, 16), (4, 5, 136, 8)]
+)
+def test_scorer_row_map_branches_match_the_fp64_reference(h_i, s_q, n_blocks_max, page_size):
+    """Every branch of the row map against the same fp64 reference: ``P' = 1`` (two queries per lane, no sum), the pair-only sum
+    (``H_i`` 2), a padded head count (3 -> 4), two and three shuffle stages (8 / 16 heads), a query spanning two m-tiles (17 heads),
+    several m-tiles of queries (``s_q`` 20 at one head, 5 at four) -- counts, sentinel and a second launch bitwise."""
+    kv = [4 * n_blocks_max + s_q - 1, 4 * 30 + s_q + 2, s_q]
+    case = _Case(3, s_q, n_blocks_max, page_size, kv, seed=100 * h_i + s_q, h=h_i)
+    r = sp.compile_qsa_score_paged(h_i=h_i, s_q=s_q, page_size=page_size)
+    logits, counts, lens = case.run(r)
+    _assert_scorer(case, logits, counts, lens)
+    logits2, counts2, lens2 = case.run(r)
+    assert torch.equal(_bits(logits), _bits(logits2)) and torch.equal(counts, counts2) and torch.equal(lens, lens2)
+
+
+@needs_scorer
 @pytest.mark.parametrize("page_size", [16, 64])
 def test_units_per_warp_is_a_knob(page_size):
-    """64 / 128 / 256 compressed rows per CTA: the same lane mapping per row, so the logits are BITWISE across the knob (the
-    capacity is not a multiple of 256: every value walks a ragged last chunk)."""
+    """32 / 64 / 128 / 256 compressed rows per warp: the same MMA chain per key whichever warp owns it, so the logits are BITWISE across
+    the knob (the capacity is not a multiple of 1024: every value walks a ragged last chunk)."""
     case = _Case(3, 2, 1032, page_size, [4 * 1032 - 1, 4 * 700 + 2, 4 * 3 + 3], seed=6)
     outs = []
     for units in fd.UNITS_PER_WARP_CHOICES:
@@ -611,6 +677,23 @@ def test_units_per_warp_is_a_knob(page_size):
     _assert_scorer(case, *outs[0])
     for logits, counts, lens in outs[1:]:
         assert torch.equal(_bits(outs[0][0]), _bits(logits)) and torch.equal(outs[0][1], counts) and torch.equal(outs[0][2], lens)
+
+
+@needs_scorer
+def test_ring_depth_is_a_knob():
+    """2 / 4 / 8 n-tiles of keys in flight per warp: the same copies and the same MMA chain per key, so the logits are BITWISE
+    across the knob; the recipe records the depth and the compile key keeps the default's identity."""
+    case = _Case(2, 3, 1032, 16, [4 * 1032 - 1, 4 * 300 + 2], seed=21)
+    outs = []
+    for depth in fd.RING_DEPTH_CHOICES:
+        r = sp.compile_qsa_score_paged(h_i=H, s_q=3, page_size=16, units_per_warp=2, ring_depth=depth)
+        assert r.ring_depth == depth
+        outs.append(case.run(r))
+    _assert_scorer(case, *outs[0])
+    for logits, counts, lens in outs[1:]:
+        assert torch.equal(_bits(outs[0][0]), _bits(logits)) and torch.equal(outs[0][1], counts) and torch.equal(outs[0][2], lens)
+    with pytest.raises(ValueError, match="ring_depth must be one of"):
+        sp.compile_qsa_score_paged(h_i=H, s_q=3, page_size=16, units_per_warp=2, ring_depth=5)
 
 
 @needs_scorer

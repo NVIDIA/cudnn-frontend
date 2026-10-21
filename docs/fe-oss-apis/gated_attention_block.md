@@ -508,12 +508,13 @@ deterministic radix top-k. Row `s` of sequence `b` sits at position `kv_lens[b] 
 (`scale x sum_h relu(qi[t, h] . kbar[b, j])` in fp32: the ReLU-summed, head-reduced indexer score) and the counts on device -- no torch
 prologue -- and the top-k returns `block_ids [T, top_k]` int32 in ASCENDING order with `-1` past `block_lens = min(top_k, counts)`
 (ties to the smaller id), so two calls are bitwise. A `-1` table entry under a visible block reads as a zero key (logit 0);
-a padding sequence (`kv_lens == 0`) reads and writes nothing but its counts (0). The scorer kernel alone
-(`kernels.qsa_score_paged.compile_qsa_score_paged` / `run_qsa_score_paged`: CUDA-core work, one shared-memory staging of the
-query rows, one CTA
-barrier, the programmatic-dependent-launch pair under `use_pdl`) runs on any CuTe DSL device; the paired selector needs the
-radix top-k's cc 9.0. The e4m3 indexer cache is a typed decline by name (the paged scorer's e4m3 read arm is a follow-up);
-`units_per_warp` (64 / 128 / 256 compressed rows per CTA) and `use_pdl` are performance knobs -- the same function. The entry's
+a padding sequence (`kv_lens == 0`) writes nothing but its counts (0) and never reads the cache. The scorer kernel alone
+(`kernels.qsa_score_paged.compile_qsa_score_paged` / `run_qsa_score_paged`: one warp-level `mma.sync.m16n8k16` per 8 keys x 16 D
+over the `seq_q x index_heads` query rows padded to 16 -- the query tile staged once per CTA in shared memory behind one CTA
+barrier, the keys streamed by `cp.async` through a per-warp ring into the B fragments; the programmatic-dependent-launch pair under
+`use_pdl`) runs on any CuTe DSL device from sm_80; the paired selector needs the radix top-k's cc 9.0. The e4m3 indexer cache is a
+typed decline by name (the paged scorer's e4m3 read arm is a follow-up); `units_per_warp` (1 / 2 / 4 / 8 units of 32 compressed rows
+per warp, default 1) and `use_pdl` are performance knobs -- the same function. The entry's
 module imports no CuTe DSL: the DSL floor, the `sm_107a` target on cc 10.7 and the radix top-k's cc 9.0 are typed
 `NotImplementedError`s raised BEFORE the kernel module is imported, so the import path resolves on the public 4.6.2 wheel too;
 `stream` takes a `torch.cuda.Stream`, a raw stream handle or `None` (torch's current stream), and every torch operation of the
