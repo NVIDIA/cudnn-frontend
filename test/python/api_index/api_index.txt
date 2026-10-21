@@ -383,6 +383,8 @@ cudnn.deepseek_sparse_attention.indexer_forward_top_k_wrapper
 cudnn.deepseek_sparse_attention.indexer_forward_wrapper
 cudnn.deepseek_sparse_attention.indexer_top_k_wrapper
 cudnn.deepseek_sparse_attention.local_to_global_wrapper
+cudnn.deepseek_sparse_attention.qsa_indexed_backward
+cudnn.deepseek_sparse_attention.qsa_indexed_forward
 cudnn.deepseek_sparse_attention.sparse_attention
 cudnn.deepseek_sparse_attention.sparse_attention_backward_wrapper
 cudnn.deepseek_sparse_attention.sparse_attention_forward_wrapper
@@ -1364,6 +1366,8 @@ cudnn.ops.nvfp4_block_scale_dequantize
 cudnn.ops.nvfp4_block_scale_quantize
 cudnn.ops.qsa_backward
 cudnn.ops.qsa_forward
+cudnn.ops.qsa_indexed_backward
+cudnn.ops.qsa_indexed_forward
 cudnn.pack_backward_weights
 cudnn.pack_causal_conv3d_weight_sm100
 cudnn.pack_conv3d_weight_sm100

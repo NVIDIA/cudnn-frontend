@@ -4,6 +4,8 @@
 from importlib import import_module
 
 _SYMBOLS = {
+    "qsa_indexed_forward": (".qsa_training", "qsa_indexed_forward"),
+    "qsa_indexed_backward": (".qsa_training", "qsa_indexed_backward"),
     "sparse_attention": (".training", "sparse_attention"),
     "sparse_attention_score_recompute": (".training", "sparse_attention_score_recompute"),
     "SparseAttentionForward": (".sparse_attention_forward", "SparseAttentionForward"),
