@@ -39,18 +39,22 @@ Algorithm (``THREADS`` threads, ``EPT = cols_cap / THREADS`` elements per thread
 ``[w x EPT x 32, (w + 1) x EPT x 32)`` and its round ``i`` the 32 consecutive ids ``w x EPT x 32 + 32 i + lane`` -- coalesced 128-B
 rounds, and an ascending id order that is warp-major, round-major, lane-minor; ``n = clamp(counts[t], 0, n_blocks_max)``):
 
-1. ``counts[t]`` and the row's first ``min(EPT, SPEC_ROUNDS)`` rounds of logits are loaded in the SAME memory flight (the logits
-   against the row WIDTH, the address clamped to the last column -- a dummy for the tail -- never against ``n``, which is not known
-   yet): ONE memory latency instead of two for every row of up to ``SPEC_ROUNDS x 32 x nwarps`` columns.  The rounds past them load
-   after ``n`` lands, their address clamped to the last VISIBLE column (a dummy, no predicate).  ``n <= top_k`` -> the identity list.
-2. Keys: ``u = bits ^ (bits >> 31 ? 0xFFFFFFFF : 0x80000000)`` (a larger float is a larger unsigned key), every REAL key raised to at
-   least 1 (0 is the pattern of a negative NaN, whose rank is unspecified) and every DUMMY (an id at or past ``n``) given key 0 -- the
-   smallest key, below every threshold the kernel derives, so a dummy is never selected and never a candidate; kept in REGISTERS for
-   the whole kernel.  The valid maximum ``kmax`` (warp ``redux``, one barrier, one in-warp reduce).
-3. Pass 1 -- the WINDOWED histogram of EVERY key (no predicate; 6 instructions per element): ``base = max(kmax >> 14, 4095) -
-   4095``, digit ``clamp((key >> 14) - base, 0, 4095)``: 4096 bins over the 8 octaves below the maximum, everything further below
-   saturates into bin 0 (exact, merely slower); the dummies all land in digit 0 and their count (``EPT x THREADS - n``) is taken
-   out of bin 0 by the scan.  Plain ``red.shared.add`` (no ``match.any``: at 4096 bins a warp seldom holds two equal digits).
+1. ``counts[t]`` and the row's first ``min(EPT, SPEC_ROUNDS)`` rounds of logits are loaded in the SAME memory flight: ONE memory
+   latency instead of two for every row of up to ``SPEC_ROUNDS x 32 x nwarps`` columns.  A row as wide as the compiled capacity
+   (``n_blocks_max == cols_cap``: every power-of-two width) has every round inside it: one load per round off a per-thread base, no
+   address arithmetic; a narrower row clamps the speculated rounds' address to the last column (a dummy for the tail -- never against
+   ``n``, which is not known yet) and the rounds past them, loaded after ``n`` lands, to the last VISIBLE column (a dummy, no
+   predicate).  ``n <= top_k`` -> the identity list.
+2. Keys: ``u = bits ^ (bits >> 31 ? 0xFFFFFFFF : 0x80000000)`` (a larger float is a larger unsigned key; a REAL key is 0 only for a
+   negative NaN, whose rank is unspecified) and every DUMMY (an id at or past ``n``) given key 0 -- the smallest key, below every
+   threshold the kernel derives, so a dummy is never selected and never a candidate; a row with every column of the capacity visible
+   (``n == cols_cap``, the common decode row) has no dummy and skips that select; kept in REGISTERS for the whole kernel.  The
+   valid maximum ``kmax`` (warp ``redux``, one barrier, one in-warp reduce).
+3. Pass 1 -- the WINDOWED histogram of EVERY key (no predicate; 4 instructions per element): ``base = max(kmax >> 14, 4095) -
+   4095``, digit ``max((key >> 14) - base, 0)`` (never above 4095: no key exceeds the row maximum, whose digit is 4095 or less by the
+   choice of the base): 4096 bins over the 8 octaves below the maximum, everything further below saturates into bin 0 (exact,
+   merely slower); the dummies all land in digit 0 and their count (``EPT x THREADS - n``) is taken out of bin 0 by the scan.
+   Plain shared atomics (no ``match.any``: at 4096 bins a warp seldom holds two equal digits).
 4. The scan (``_scan_find``): thread ``t`` owns the 4 (8 at 512 threads) consecutive bins ``4095 - BPT x t - j`` in DESCENDING order;
    its sum -> a branch-free warp inclusive scan (shuffles + arithmetic selects) -> ``s_wsum[warp]`` -> barrier -> every thread scans
    ``s_wsum`` in-warp and takes its own warp's exclusive prefix with ONE index shuffle -> ``above(b)`` per bin -> the ONE thread whose
@@ -58,19 +62,38 @@ rounds, and an ascending id order that is warp-major, round-major, lane-minor; `
 5. The verdict is a THRESHOLD PAIR ``(kstar, idstar)``: selected <=> ``key > kstar`` or (``key == kstar`` and ``id <= idstar``).  Bin
    ``B`` of pass 1 spans the keys ``[lo, hi]`` (``lo = (base + B) << 14``, or 0 for the saturated bin; ``hi = lo + 2^14 - 1``) and
    ``need = top_k - above``:
-   - the bin taken whole (``count == need``): ``kstar = lo - 1``, ``idstar = n - 1`` -- no further work;
-   - else the bin's candidates (``key``, ``id``) are compacted ONCE into a shared list (one sweep; the append path runs only in the
-     warps that hold a candidate) and, with at most ``RANK_CAP`` of them, an exact all-pairs rank (key descending, id ascending) names
-     the ``need``-th candidate, whose (key, id) IS the pair: one barrier, no second histogram;
-   - a wider bin: narrowing passes over the list (12-bit digits of ``[lo, hi]``; the row's keys instead of the list when the bin
-     exceeds ``CAND_CAP``), each 3 barriers, until the bin is taken whole or the key is exact; an exact key with only part of its
-     tied ids wanted resolves ``idstar`` by a 2 x 12-bit select over the ids of the keys equal to it (ascending ids = descending
-     complemented digits, the same scan).  Four passes at most (the saturated bin: ``[0, 2^32)`` in 12 + 12 + 8 bits).
-6. The canonical compaction: sweep A counts the selected ids per warp (one ballot per round; lane 0 stores the round's ballot word
-   in ``s_bal[warp x EPT + i]``) -> one barrier -> every thread takes its warp's exclusive prefix over the warp counts -> sweep B
-   reads each round's word back (no recomputation; a zero word skips the round) and writes the selected id of ascending rank
-   ``pos`` (the lower warps' count + the warp's running count + the lanes below) at slot ``top_k - 1 - pos``: strictly descending
-   ids, every slot of a row with ``n > top_k`` written, no atomic decides a slot, two launches bitwise.
+   - the bin taken whole (``count == need``): ``kstar = lo - 1``, ``idstar = n - 1``;
+   - THE FAST PATH (``lo >= 2^14`` -- the bin's lower bound above the dummies' key and a negative NaN's -- and the bin holding at
+     most ``RANK_CAP`` candidates, taken whole or not; the common case; compiled in from ``FAST_MIN_EPT`` = 8 keys per thread on,
+     below which the fallback's two cheap sweeps win): every key AT OR ABOVE
+     ``lo`` is either surely selected (a higher bin: fewer than ``top_k`` in the row) or a candidate of the bin, so ONE sweep -- the
+     staging sweep -- stages them: per round one compare (``key >= lo``) and one ballot; a round holding any stores, per selected
+     lane, ONE word into the warp's region of ``STAGE_CAP = top_k + RANK_CAP`` words at the warp's running count plus the lanes
+     below (ascending id order within the warp; the regions concatenate in warp order = ascending id order over the row), the
+     candidates of the bin (``key <= hi``) ALSO appended to the rank list (``s_rank_key`` / ``s_rank_id``, ``RANK_CAP`` slots) and
+     staged as their slot with bit 31 set.  No region can overflow: a warp stages at most (surely selected < ``top_k``) +
+     (candidates <= ``RANK_CAP``); the store's address select carries ``rel < STAGE_CAP`` anyway.  The bin not taken whole: one barrier
+     (the rank list), the spread rank -- ``THREADS / RANK_CAP`` consecutive lanes share one candidate, each ranks it against every
+     so-many-th other (key descending, id ascending), the partial ranks summed by butterfly shuffles -- names the ``need``-th
+     candidate, whose (key, id) IS the pair, one barrier;
+   - THE FALLBACK (``lo == 0``: the saturated bin or a row whose maximum is a negative NaN / -inf; a bin wider than ``RANK_CAP``,
+     taken whole or not; fewer than ``FAST_MIN_EPT`` keys per thread; a ``top_k`` whose regions exceed ``STAGE_POOL_MAX_BYTES``): the
+     bin taken whole needs no list; otherwise the bin's candidates (``key``, ``id``)
+     compacted ONCE into the candidate list (one sweep; the append path runs only in the warps that hold a candidate; the id guard
+     keeps the dummies out when ``lo == 0``), then narrowing passes over the list (12-bit digits of ``[lo, hi]``; the row's keys
+     instead of the list when the bin exceeds ``CAND_CAP``), each 3 barriers, until the bin is taken whole or the key is exact; an
+     exact key with only part of its tied ids wanted resolves ``idstar`` by a 2 x 12-bit select over the ids of the keys equal to
+     it (ascending ids = descending complemented digits, the same scan).  Four passes at most (the saturated bin: ``[0, 2^32)`` in
+     12 + 12 + 8 bits).
+6. The canonical compaction.  The fast path works on the staged words alone: each warp walks ITS region (one iteration of 32 words
+   for a warp holding up to 32; a flagged word reads its (key, id) from the rank list, a plain word is a selected id) to count its
+   selected (``sel = key > kstar | (key == kstar & id <= idstar)``; every staged word when the bin is taken whole, so that walk is
+   skipped) -> one barrier -> every thread takes its warp's exclusive prefix over the warp counts -> the same walk writes the
+   selected id of ascending rank ``pos`` at slot ``top_k - 1 - pos``.  The fallback sweeps the keys: sweep A counts the selected
+   ids per warp (one ballot per round; lane 0 stores the round's ballot word in ``s_bal[warp x EPT + i]``) -> one barrier -> the
+   exclusive prefix -> sweep B reads each round's word back (no recomputation; a zero word skips the round) and writes as above.
+   Either way: strictly descending ids, every slot of a row with ``n > top_k`` written, no atomic decides a slot, two launches
+   bitwise.
 
 Barrier table (REQUIRED pre-development table; no mbarrier, no cluster barrier: every site is ``bar.sync 0`` reached by EVERY thread of
 the CTA exactly once per visit, ``SUM(issuing lanes) == THREADS`` at every row; the identity path performs no barrier):
@@ -80,13 +103,17 @@ the CTA exactly once per visit, ``SUM(issuing lanes) == THREADS`` at every row; 
 | B0 | after the loads, before pass 1 | ``s_hist[0][*] = 0`` (every thread, BPT bins each), ``s_wmax[warp]`` (lane 0 per warp), ``s_ncand = 0`` -> the window base read by every thread and the pass-1 atomics |
 | B1_1 | after pass 1's atomics | the atomics into ``s_hist[0]`` -> the scan's reads; ``s_hist[1][*] = 0`` -> a later pass's atomics |
 | B2_p / B3_p (``_scan_find``, once per executed histogram pass p and per id-select pass) | the warp sums / the record | ``s_wsum[warp]`` (lane 31 per warp) -> the cross-warp prefix; ``s_found[0..2]`` (ONE thread) -> every thread; ``s_wsum`` free again |
-| C1 (the bin not taken whole) | after the candidate sweep | ``s_cand`` / ``s_cand_id[slot]`` and ``s_ncand`` (the appending lanes) -> the rank or the later passes |
-| R1 (the rank path) | after the rank | ``s_wmax[0]`` / ``s_found[1]`` = the pair (ONE thread) -> every thread |
+| C1 (fast path, the bin not taken whole) | after the staging sweep | ``s_rank_key`` / ``s_rank_id[slot]`` and ``s_ncand`` (the appending lanes) -> the spread rank; the staging regions are private to their warp (a ``bar.warp.sync`` after the sweep orders the warp's own stores before its walks) |
+| R1 (fast path, the bin not taken whole) | after the spread rank | ``s_wmax[0]`` / ``s_found[3]`` = the pair (ONE thread; the fourth word: words 0..2 were read after B3) -> every thread |
+| F2 (fast path) | after the counting walk | ``s_wsum[warp]`` = the warp's selected count (lane 0) -> the cross-warp prefix before the writing walk |
+| C1 (fallback, the bin not taken whole) | after the candidate sweep | ``s_cand`` / ``s_cand_id[slot]`` and ``s_ncand`` (the appending lanes) -> the later passes (or the all-pairs rank of a kernel without the fast path) |
+| R1 (fallback without the fast path) | after the all-pairs rank | ``s_wmax[0]`` / ``s_found[3]`` = the pair (ONE thread) -> every thread |
 | B1_p (later passes, p <= 4) | after the pass's atomics | the atomics into ``s_hist[p & 1]`` -> the scan; the other buffer zeroed -> the next pass |
 | I0_q / I1_q (the id select, q <= 2) | before / after its atomics | the zeroing of ``s_hist[q & 1]`` -> the atomics; the atomics -> the scan |
-| F | after sweep A | ``s_wsum[warp]`` = the warp's selected count and ``s_bal[warp x EPT + i]`` = the round's ballot word (lane 0 per warp) -> the cross-warp prefix and sweep B's reads |
+| F (fallback) | after sweep A | ``s_wsum[warp]`` = the warp's selected count and ``s_bal[warp x EPT + i]`` = the round's ballot word (lane 0 per warp) -> the cross-warp prefix and sweep B's reads |
 
-The common path (the rank decides) is 7 sites: B0, B1_1, B2_1, B3_1, C1, R1, F; a bin taken whole at pass 1 is 5.
+The common path (the fast path, the spread rank decides) is 7 sites: B0, B1_1, B2_1, B3_1, C1, R1, F2; a bin taken whole at pass 1 is
+5 (B0, B1_1, B2_1, B3_1, F2); the fallback's shortest path is B0, B1_1, B2_1, B3_1, C1, B1_2, B2_2, B3_2, F.
 
 SMEM table (REQUIRED pre-development table; dynamic shared memory through ``SmemAllocator``; no descriptor reads any buffer, so each row
 states the per-lane stride that keeps the banks spread):
@@ -94,10 +121,16 @@ states the per-lane stride that keeps the banks spread):
 | name / dtype / elems | written by | read by | per-lane stride, bank argument |
 |---|---|---|---|
 | ``s_hist`` i32 x ``2 x 4096`` | ``red.shared.add`` at the digit of each candidate (data-dependent); the zeroing ``s_hist[b][j x THREADS + t]`` | the scan: thread ``t`` reads bins ``4095 - BPT x t - j`` (``4 x BPT`` B between lanes: 4 wavefronts per load, BPT loads per pass -- immaterial) | the zeroing is conflict-free; the histogram side is bin-addressed by nature |
-| ``s_cand`` u32 x ``CAND_CAP``, ``s_cand_id`` i32 x ``CAND_CAP`` | the appending lanes of a warp at ``base + popc(ballot & lt_mask)`` (consecutive slots: 4 B between lanes) | the rank (thread ``t`` reads entry ``t`` and every entry: broadcast) and the later passes (round-strided) | conflict-free |
-| ``s_bal`` u32 x ``cols_cap / 32`` (one word per round per warp) | lane 0 of warp ``w`` at word ``w x EPT + i`` in sweep A | sweep B: every lane of warp ``w`` reads word ``w x EPT + i`` (a broadcast) | consecutive words per warp, one lane writes, broadcast reads: conflict-free |
+| ``s_cand`` u32 x ``CAND_CAP``, ``s_cand_id`` i32 x ``CAND_CAP`` (the fallback's candidate list; views of ``s_pool``) | the appending lanes of a warp at ``base + popc(ballot & lt_mask)`` (consecutive slots: 4 B between lanes) | the later passes (round-strided; the all-pairs rank of a kernel without the fast path: entry ``t`` and every entry) | conflict-free |
+| ``s_pool`` i32 x ``max(nwarps x STAGE_CAP + 1, FALLBACK_POOL_WORDS)`` (the fast path's staging regions, ``STAGE_CAP = top_k + RANK_CAP``, 0 words when they would exceed ``STAGE_POOL_MAX_BYTES`` = 96 KB; the fallback's ``s_cand`` / ``s_cand_id`` / ``s_bal`` are VIEWS of the same words -- a row runs one path or the other) | the staging sweep: the selected lanes of a round store CONSECUTIVE words of their warp's region (4 B between them); every other lane stores the last word (one same-address broadcast store) | the two walks: warp ``w`` reads words ``base + lane`` of its region (consecutive) | conflict-free |
+| ``s_rank_key`` u32 x ``RANK_CAP``, ``s_rank_id`` i32 x ``RANK_CAP`` | the appending lanes (consecutive slots) | the spread rank: ``THREADS / RANK_CAP`` consecutive lanes read one slot (a broadcast), then slots ``part + j x parts`` (distinct words across the group); the walks: a flagged word's slot (<= 2 words per lane) | conflict-free / broadcast |
+| ``s_bal`` u32 x ``cols_cap / 32`` (one word per round per warp; the fallback; a view of ``s_pool`` past the list) | lane 0 of warp ``w`` at word ``w x EPT + i`` in sweep A | sweep B: every lane of warp ``w`` reads word ``w x EPT + i`` (a broadcast) | consecutive words per warp, one lane writes, broadcast reads: conflict-free |
 | ``s_wsum`` i32 x 32 | lane 31 (the scans) or lane 0 (sweep A) of each warp | every thread reads slot ``lane`` | 4 B between lanes: conflict-free |
 | ``s_wmax`` u32 x 32 | lane 0 of each warp (the warp maxima); slot 0 again by the ranked thread (``kstar``) | every thread reads slot ``lane`` / slot 0 | conflict-free / broadcast |
+
+Dynamic shared memory at 32768 columns, 1024 threads, ``top_k`` 512: 32 KB (``s_hist``) + 80 KB (the pool: the staging regions, 32 x
+640 words, over the fallback's 36 KB of list + ballot words) + 1 KB (the rank list) + the small rows ~ 114 KB; 512 threads halve the
+regions (40 KB: 73 KB in all -- the 99-KB parts serve 512 threads at ``top_k`` 512 and decline 1024 by the limit gate below).
 | ``s_found`` i32 x 4, ``s_ncand`` i32 x 4 | the one finder thread / the appending lanes (atomics) | every thread (broadcast) | trivial |
 
 Degenerate inputs, each with its handling: ``counts[t] == 0`` -> every slot ``-1``, nothing of the row is used; ``counts[t] < 0`` -> clamped
@@ -143,7 +176,8 @@ Knobs (performance-only, the same function under every served value -- the tests
 ``threads_per_cta`` in (512, 1024) for the single-CTA form (``EPT = cols_cap / threads_per_cta`` keys per thread stay in registers: 32 at
 1024 threads and 32768 columns, 64 at 512 -- the ``MAX_EPT`` bound; the cluster form runs 1024); ``cluster_ctas`` in (1, 4, 8, 16)
 (16 is a non-portable cluster size: the CuTe DSL launch sets ``CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED`` on every kernel it
-loads, driver 11.8+).  ``cols_cap`` (the compiled row capacity, a power of two, >= ``n_blocks_max``, >= ``cluster_ctas x threads_per_cta``,
+loads, driver 11.8+).  ``top_k`` sizes the staging regions (``smem_bytes_for(..., top_k)``); above 640 at 1024 threads (1408 at 512)
+the regions would exceed ``STAGE_POOL_MAX_BYTES`` and the kernel is compiled as the fallback form alone (correct, slower).  ``cols_cap`` (the compiled row capacity, a power of two, >= ``n_blocks_max``, >= ``cluster_ctas x threads_per_cta``,
 <= ``MAX_EPT x cluster_ctas x threads_per_cta``) sizes the register tile; one artifact serves every ``n_blocks_max`` up to it.
 Requirements: a CuTe DSL at or above the FROST floor with the device's target (Rule 7, gated before anything else), a cc 9.0+ device
 for ``cluster_ctas > 1`` (thread-block clusters, DSMEM) and for ``use_pdl`` (``griddepcontrol``; both exist from Hopper; the single-CTA
@@ -206,6 +240,9 @@ WINDOW_SHIFT = 14
 MAX_PASSES = 4
 CAND_CAP = 4096
 RANK_CAP = 128
+STAGE_POOL_MAX_BYTES = 96 * 1024  # the staging regions of the fast path (nwarps x (top_k + RANK_CAP) words) must fit this; else the kernel is the fallback form
+STAGE_FLAG = -(1 << 31)
+FAST_MIN_EPT = 8  # the fast path from 8 keys per thread on (below it the two-sweep fallback is the cheaper form: the ranking of 2048-column rows)  # a staged word with bit 31 set names a rank-list slot (a candidate of the k-th bin), a clear one a plain id
 """Up to this many candidates in the k-th bin, the select ends with an exact all-pairs rank among them (one barrier) instead of the
 narrowing passes (three barriers each)."""
 """The k-th bin's candidates compacted into shared memory after pass 1 (keys only); a bin with more candidates than this (a row of
@@ -283,15 +320,35 @@ def validate_topk_geometry(cols_cap: int, top_k: int, cluster_ctas: int, threads
         raise ValueError(f"{cols_cap // threads_per_cta} keys per thread overflow the register tile ({MAX_EPT} per thread); {advice}")
 
 
-def smem_bytes_for(cols_cap: int, cluster_ctas: int, threads_per_cta: int) -> int:
-    """Dynamic shared memory of one CTA (the SMEM table's rows, 16-B aligned each, plus the allocator's slack)."""
+def fallback_pool_words(cols_cap: int) -> int:
+    """The words the fallback's views need of the pool: the candidate list (``CAND_CAP`` keys + ``CAND_CAP`` ids) and the ballot words
+    (one per round per warp = ``cols_cap / 32``)."""
+    return 2 * CAND_CAP + cols_cap // 32
+
+
+FALLBACK_POOL_WORDS = fallback_pool_words  # the name the SMEM table cites
+
+
+def stage_words_for(top_k: int, threads_per_cta: int) -> int:
+    """The staging pool of the fast path in words: one region of ``top_k + RANK_CAP`` words per warp plus the scratch word, or 0 when
+    the regions would exceed ``STAGE_POOL_MAX_BYTES`` (the kernel then runs its fallback form for every row: ``top_k`` above 640 at
+    1024 threads, above 1408 at 512)."""
+    words = (threads_per_cta // 32) * (top_k + RANK_CAP) + 1
+    return words if words * 4 <= STAGE_POOL_MAX_BYTES else 0
+
+
+def smem_bytes_for(cols_cap: int, cluster_ctas: int, threads_per_cta: int, top_k: Optional[int] = None) -> int:
+    """Dynamic shared memory of one CTA (the SMEM table's rows, 16-B aligned each, plus the allocator's slack).  ``top_k`` sizes the
+    fast path's staging pool; without it the pool is its bound (``STAGE_POOL_MAX_BYTES``: the figure a caller plans with)."""
     if cluster_ctas > 1:
         return smem_bytes_for_cluster(cols_cap, cluster_ctas)
 
     def al(x):
         return (x + 15) // 16 * 16
 
-    total = al(2 * BINS * 4) + 2 * al(CAND_CAP * 4) + al(32 * 4) + al(32 * 4) + al(4 * 4) + al(4 * 4) + al(cols_cap // 32 * 4)
+    stage = STAGE_POOL_MAX_BYTES // 4 if top_k is None else stage_words_for(top_k, threads_per_cta)
+    pool = max(stage, fallback_pool_words(cols_cap))  # ONE pool: the staging regions of the fast path, the list + ballot words of the fallback
+    total = al(2 * BINS * 4) + al(pool * 4) + 2 * al(RANK_CAP * 4) + al(32 * 4) + al(32 * 4) + al(4 * 4) + al(4 * 4)
     return total + 128
 
 
@@ -385,16 +442,35 @@ def frost_qsa_topk_decode(
     spec = cutlass.const_expr(min(ept, SPEC_ROUNDS))
     nwarps = cutlass.const_expr(threads_per_cta // 32)
     bpt = cutlass.const_expr(BINS // threads_per_cta)  # bins per thread in the scan (4 at 1024 threads, 8 at 512)
+    stage_words = cutlass.const_expr(stage_words_for(top_k, threads_per_cta))
+    use_fast = cutlass.const_expr(stage_words > 0 and ept >= FAST_MIN_EPT)
+    stage_cap = cutlass.const_expr(top_k + RANK_CAP)  # one region per warp
+    scratch = cutlass.const_expr(max(stage_words - 1, 0))  # the word every unselected lane's store lands on
+    branch_sweep = cutlass.const_expr(ept >= 16)  # at 16+ rounds most rounds stage nothing: skip the body on a zero ballot
+    parts = cutlass.const_expr(threads_per_cta // RANK_CAP)  # threads per candidate in the spread rank (8 at 1024, 4 at 512)
+    pshift = cutlass.const_expr(parts.bit_length() - 1)
 
     smem = SmemAllocator()
+    pool_words = cutlass.const_expr(max(stage_words, fallback_pool_words(cols_cap)))
     s_hist = smem.allocate_tensor(cutlass.Int32, cute.make_layout((2 * BINS,)), byte_alignment=16)
-    s_cand = smem.allocate_tensor(cutlass.Uint32, cute.make_layout((CAND_CAP,)), byte_alignment=16)
-    s_cand_id = smem.allocate_tensor(cutlass.Int32, cute.make_layout((CAND_CAP,)), byte_alignment=16)
+    s_pool = smem.allocate_tensor(cutlass.Int32, cute.make_layout((pool_words,)), byte_alignment=16)  # the fast path's staging regions
+    s_rank_key = smem.allocate_tensor(cutlass.Uint32, cute.make_layout((RANK_CAP,)), byte_alignment=16)
+    s_rank_id = smem.allocate_tensor(cutlass.Int32, cute.make_layout((RANK_CAP,)), byte_alignment=16)
     s_wsum = smem.allocate_tensor(cutlass.Int32, cute.make_layout((32,)), byte_alignment=16)
     s_wmax = smem.allocate_tensor(cutlass.Uint32, cute.make_layout((32,)), byte_alignment=16)
     s_found = smem.allocate_tensor(cutlass.Int32, cute.make_layout((4,)), byte_alignment=16)
     s_ncand = smem.allocate_tensor(cutlass.Int32, cute.make_layout((4,)), byte_alignment=16)
-    s_bal = smem.allocate_tensor(cutlass.Uint32, cute.make_layout((cols_cap // 32,)), byte_alignment=16)  # one selection word per round per warp
+    # the fallback's buffers are VIEWS of the pool (a row runs one path or the other, never both): the candidate list's keys and ids,
+    # then the ballot words (one per round per warp)
+    pool_addr = s_pool.iterator.toint()
+    s_cand = cute.make_tensor(cute.make_ptr(cutlass.Uint32, pool_addr, cute.AddressSpace.smem, assumed_align=16), cute.make_layout((CAND_CAP,)))
+    s_cand_id = cute.make_tensor(
+        cute.make_ptr(cutlass.Int32, pool_addr + cutlass.Int32(CAND_CAP * 4), cute.AddressSpace.smem, assumed_align=16), cute.make_layout((CAND_CAP,))
+    )
+    s_bal = cute.make_tensor(
+        cute.make_ptr(cutlass.Uint32, pool_addr + cutlass.Int32(2 * CAND_CAP * 4), cute.AddressSpace.smem, assumed_align=16),
+        cute.make_layout((cols_cap // 32,)),
+    )
 
     tidx = cutlass.Int32(cute.arch.thread_idx()[0])
     lane = cutlass.Int32(cute.arch.lane_idx())
@@ -414,12 +490,19 @@ def frost_qsa_topk_decode(
     cols = cutlass.Int32(mLogits.shape[1])
     row_ptr = mLogits.iterator + row64 * cutlass.Int64(mLogits.stride[0])
     out_row = mOut.iterator.toint() + row64 * cutlass.Int64(mOut.stride[0]) * four
-    # ---- the counts and the speculated rounds in ONE memory flight (the address clamped to the row width: a dummy for the tail) ----
-    raw = []
-    for i in cutlass.range_constexpr(spec):
-        e = e0 + cutlass.Int32(32 * i)
-        e_c = e if e < cols else cols - one
-        raw.append((row_ptr + e_c).load())
+    exact = cols == cutlass.Int32(cols_cap)  # the row is as wide as the compiled capacity: every round is inside it, no address clamp
+    p0 = row_ptr + e0
+    # ---- the counts and the speculated rounds in ONE memory flight (the address clamped to the row width when the row is narrower
+    # than the capacity: a dummy for the tail) ----------------------------------------------------------------------------------
+    raw = [zero] * spec  # the list's shape is fixed before the branch (the traced join needs one type on both paths)
+    if exact:
+        for i in cutlass.range_constexpr(spec):
+            raw[i] = (p0 + cutlass.Int32(32 * i)).load()
+    else:
+        for i in cutlass.range_constexpr(spec):
+            e = e0 + cutlass.Int32(32 * i)
+            e_c = e if e < cols else cols - one
+            raw[i] = (row_ptr + e_c).load()
     n = ld_global(mCounts.iterator.toint() + row64 * four, cutlass.Int32)
     n = n if n > zero else zero
     n = n if n < cols else cols
@@ -434,26 +517,41 @@ def frost_qsa_topk_decode(
             val = val if j < n else cutlass.Int32(-1)
             st_global(out_row + j.to(cutlass.Int64) * four, val, cutlass.Int32)
     else:
-        # ---- the rounds past the speculated ones (the address clamped to the last VISIBLE column: a dummy, no predicate) -----
+        # ---- the rounds past the speculated ones (inside the row by construction, or the address clamped to the last VISIBLE
+        # column: a dummy, no predicate) ----------------------------------------------------------------------------------------
         n_m1 = n - one
-        tail = []
-        for i0 in cutlass.range_constexpr(ept - spec):
-            e = e0 + cutlass.Int32(32 * (i0 + spec))
-            e_c = e if e < n_m1 else n_m1
-            tail.append((row_ptr + e_c).load())
-        # ---- the keys (registers): every real key >= 1, the dummies' key 0 (never selected: the thresholds below are >= 0 and a
-        # dummy's id is past every real id); the row maximum ------------------------------------------------------------------
-        keys = []
+        tail = [zero] * (ept - spec)
+        if exact:
+            for i0 in cutlass.range_constexpr(ept - spec):
+                tail[i0] = (p0 + cutlass.Int32(32 * (i0 + spec))).load()
+        else:
+            for i0 in cutlass.range_constexpr(ept - spec):
+                e = e0 + cutlass.Int32(32 * (i0 + spec))
+                e_c = e if e < n_m1 else n_m1
+                tail[i0] = (row_ptr + e_c).load()
+        # ---- the keys (registers): every real key >= 1 but a negative NaN's, the dummies' key 0 (never selected: the thresholds
+        # below are >= 0 and a dummy's id is past every real id); the row maximum ------------------------------------------------
+        keys = [cutlass.Uint32(0)] * ept
         kmax_t = cutlass.Uint32(0)
-        for i in cutlass.range_constexpr(ept):
-            bits = (raw[i] if i < spec else tail[i - spec]).to(cutlass.Uint32)
-            sign = bits >> cutlass.Uint32(31)
-            flip = (cutlass.Uint32(0) - sign) | cutlass.Uint32(0x80000000)
-            key = bits ^ flip
-            e = e0 + cutlass.Int32(32 * i)
-            key = key if e < n else cutlass.Uint32(0)  # a dummy: the smallest key; a REAL key 0 (a negative NaN) is told apart by its id
-            keys.append(key)
-            kmax_t = kmax_t if kmax_t > key else key
+        full = n == cutlass.Int32(cols_cap)  # every column of the capacity visible: no dummy anywhere (the common decode row)
+        if full:
+            for i in cutlass.range_constexpr(ept):
+                bits = (raw[i] if i < spec else tail[i - spec]).to(cutlass.Uint32)
+                sign = bits >> cutlass.Uint32(31)
+                flip = (cutlass.Uint32(0) - sign) | cutlass.Uint32(0x80000000)
+                key = bits ^ flip
+                keys[i] = key
+                kmax_t = kmax_t if kmax_t > key else key
+        else:
+            for i in cutlass.range_constexpr(ept):
+                bits = (raw[i] if i < spec else tail[i - spec]).to(cutlass.Uint32)
+                sign = bits >> cutlass.Uint32(31)
+                flip = (cutlass.Uint32(0) - sign) | cutlass.Uint32(0x80000000)
+                key = bits ^ flip
+                e = e0 + cutlass.Int32(32 * i)
+                key = key if e < n else cutlass.Uint32(0)  # a dummy: the smallest key; a REAL key 0 (a negative NaN) is told apart by its id
+                keys[i] = key
+                kmax_t = kmax_t if kmax_t > key else key
         kmax_w = cute.arch.warp_redux_sync(kmax_t, "umax")
         if lane == zero:
             s_wmax[warp] = kmax_w
@@ -470,12 +568,12 @@ def frost_qsa_topk_decode(
         base = (top - cutlass.Uint32(BINS - 1)) if top > cutlass.Uint32(BINS - 1) else cutlass.Uint32(0)
         n_dummy = cutlass.Int32(ept * threads_per_cta) - n  # the forced-0 keys, all in digit 0 of pass 1
 
-        # ---- pass 1: the windowed 4096-bin histogram of EVERY key (6 instructions per element, no predicate) --------------------
+        # ---- pass 1: the windowed 4096-bin histogram of EVERY key (no predicate; the digit never exceeds 4095: no key is above the
+        # row maximum, whose digit is at most 4095 by the choice of the base) ---------------------------------------------------
         wbase = base.to(cutlass.Int32)
         for i in cutlass.range_constexpr(ept):
             d = (keys[i] >> cutlass.Uint32(WINDOW_SHIFT)).to(cutlass.Int32) - wbase
             d = d if d > zero else zero
-            d = d if d < cutlass.Int32(BINS - 1) else cutlass.Int32(BINS - 1)
             cute.arch.atomic_add(s_hist.iterator + d, one, sem="relaxed", scope="cta")
         for j in cutlass.range_constexpr(bpt):
             s_hist[cutlass.Int32(BINS + j * threads_per_cta) + tidx] = zero
@@ -498,138 +596,243 @@ def frost_qsa_topk_decode(
         # the bin taken whole: everything at or above lo
         kstar = (lo - cutlass.Uint32(1)) if lo > cutlass.Uint32(0) else cutlass.Uint32(0)
         idstar = n - one
-        if not whole:
-            # the candidates of the k-th bin (key, id) into the list, one sweep (the append path only in the warps that hold one)
-            use_list = cnt_b <= cutlass.Int32(CAND_CAP)
-            span1 = hi - lo
-            if use_list:
-                for i in cutlass.range_constexpr(ept):
-                    key = keys[i]
-                    inb = (key - lo) <= span1  # unsigned: lo <= key <= hi in one compare
-                    if lo == cutlass.Uint32(0):
-                        inb = inb & ((e0 + cutlass.Int32(32 * i)) < n)  # a range from 0 would admit the dummies: keep the real ids only
-                    w_c = cutlass.Uint32(cute.arch.vote_ballot_sync(inb))
+        fast = cutlass.Boolean(False)
+        if cutlass.const_expr(use_fast):
+            # the fast path: the k-th bin's lower bound is above the dummies' key (lo >= 2^14) and the elements at or above the bin are
+            # few enough to stage (every one of them when the bin is taken whole; otherwise at most RANK_CAP candidates on top of the
+            # surely-selected ones): ONE sweep stages them per warp in id order, and everything after works on the staged words
+            fast = (lo != cutlass.Uint32(0)) & (cnt_b <= cutlass.Int32(RANK_CAP))
+        if fast:
+            warp_off = warp * cutlass.Int32(stage_cap)
+            sh_lt = cutlass.Uint32(32) - lane.to(cutlass.Uint32)  # bal << sh_lt keeps the lanes below (a shift of 32 clears the word)
+            run = zero
+            for i in cutlass.range_constexpr(ept):
+                key = keys[i]
+                c = key >= lo
+                bal = cutlass.Uint32(cute.arch.vote_ballot_sync(c))
+                go = cutlass.Boolean(True)
+                if cutlass.const_expr(branch_sweep):
+                    go = bal != cutlass.Uint32(0)
+                if go:
+                    rel = run + cutlass.Int32(cute.arch.popc(bal << sh_lt))
+                    is_cand = c & (key <= hi)  # the bin's candidates: lo <= key <= hi
+                    w_c = cutlass.Uint32(cute.arch.vote_ballot_sync(is_cand))
+                    slot = zero
                     if w_c != cutlass.Uint32(0):
                         wbase_c = zero
                         if lane == zero:
                             wbase_c = cute.arch.atomic_add(s_ncand.iterator, cutlass.Int32(cute.arch.popc(w_c)), sem="relaxed", scope="cta")
                         wbase_c = cute.arch.shuffle_sync(wbase_c, zero, mask_and_clamp=31)
-                        slot = wbase_c + cutlass.Int32(cute.arch.popc(w_c & lt_mask))
-                        if inb & (slot < cutlass.Int32(CAND_CAP)):
-                            s_cand[slot] = key
-                            s_cand_id[slot] = e0 + cutlass.Int32(32 * i)
-            cute.arch.barrier()  # C1: the list and its count
-            ncand = s_ncand[0]
-            ncand = ncand if ncand < cutlass.Int32(CAND_CAP) else cutlass.Int32(CAND_CAP)
-            if use_list & (ncand <= cutlass.Int32(RANK_CAP)):
-                # few candidates: an exact all-pairs rank (key descending, id ascending); the need-th candidate IS the threshold pair
-                if tidx < ncand:
-                    key_c = s_cand[tidx]
-                    id_c = s_cand_id[tidx]
-                    rnk = zero
-                    for j in range(ncand):
-                        kj = s_cand[j]
-                        ij = s_cand_id[j]
-                        ahead = (kj > key_c) | ((kj == key_c) & (ij < id_c))
-                        rnk = rnk + (one if ahead else zero)
-                    if rnk == need - one:
-                        s_wmax[0] = key_c  # s_wmax is free after B0
-                        s_found[1] = id_c
+                        slot = wbase_c + cutlass.Int32(cute.arch.popc(w_c << sh_lt))  # < RANK_CAP: the bin holds at most RANK_CAP candidates here
+                        if is_cand:
+                            s_rank_key[slot] = key
+                            s_rank_id[slot] = e0 + cutlass.Int32(32 * i)
+                    word = (slot + cutlass.Int32(STAGE_FLAG)) if is_cand else (e0 + cutlass.Int32(32 * i))
+                    idx = (warp_off + rel) if (c & (rel < cutlass.Int32(stage_cap))) else cutlass.Int32(scratch)
+                    s_pool[idx] = word
+                    run = run + cutlass.Int32(cute.arch.popc(bal))
+            cnt_w = run  # this warp's staged count (warp-uniform)
+            cute.arch.sync_warp()  # the region and the rank-list entries this warp wrote, visible to every lane of it
+            if not whole:
+                cute.arch.barrier()  # C1: the rank list and its count
+                ncand = s_ncand[0]  # <= cnt_b <= RANK_CAP here
+                # the spread rank: `parts` consecutive lanes share one candidate, each ranks it against every parts-th other, the
+                # partial ranks summed by butterfly shuffles inside the aligned lane group
+                cnd = tidx >> cutlass.Int32(pshift)
+                part = tidx & cutlass.Int32(parts - 1)
+                valid_c = cnd < ncand
+                cidx = cnd if valid_c else zero
+                key_c = s_rank_key[cidx]
+                id_c = s_rank_id[cidx]
+                rnk = zero
+                for j in range(part, ncand, parts):
+                    kj = s_rank_key[j]
+                    ij = s_rank_id[j]
+                    ahead = (kj > key_c) | ((kj == key_c) & (ij < id_c))
+                    rnk = rnk + (one if ahead else zero)
+                for sft in cutlass.range_constexpr(pshift):
+                    rnk = rnk + cute.arch.shuffle_sync_bfly(rnk, 1 << sft, mask_and_clamp=31)
+                if valid_c & (part == zero) & (rnk == need - one):
+                    s_wmax[0] = key_c  # s_wmax is free after B0
+                    s_found[3] = id_c  # the fourth word: words 0..2 were read after B3 (C1 lies between, the fourth word is read nowhere else)
                 cute.arch.barrier()  # R1: the pair
                 kstar = s_wmax[0]
-                idstar = s_found[1]
-            else:
-                # the narrowing passes over the list (or, a bin wider than the list, over the row's keys): 12-bit digits of [lo, hi]
-                sh = cutlass.Uint32(0)
-                done = cutlass.Boolean(False)
-                take = zero
-                for p0 in cutlass.range_constexpr(MAX_PASSES - 1):
-                    p = p0 + 1
-                    if not done:
-                        hbuf = cutlass.const_expr((p & 1) * BINS)
-                        span = hi - lo
-                        blen = cutlass.Int32(32) - cute.arch.clz(span).to(cutlass.Int32)
-                        nsh = blen - cutlass.Int32(BIN_BITS)
-                        sh = (nsh if nsh > zero else zero).to(cutlass.Uint32)
-                        span_p = hi - lo
-                        if use_list:
-                            for c in range(tidx, ncand, threads_per_cta):
-                                key = s_cand[c]
-                                if (key - lo) <= span_p:
-                                    d = ((key - lo) >> sh).to(cutlass.Int32)
-                                    cute.arch.atomic_add(s_hist.iterator + (cutlass.Int32(hbuf) + d), one, sem="relaxed", scope="cta")
-                        else:
-                            for i in cutlass.range_constexpr(ept):
-                                key = keys[i]
-                                if ((key - lo) <= span_p) & ((e0 + cutlass.Int32(32 * i)) < n):
-                                    d = ((key - lo) >> sh).to(cutlass.Int32)
-                                    cute.arch.atomic_add(s_hist.iterator + (cutlass.Int32(hbuf) + d), one, sem="relaxed", scope="cta")
-                        if cutlass.const_expr(p + 1 < MAX_PASSES):
-                            nbuf = cutlass.const_expr(((p + 1) & 1) * BINS)
-                            for j in cutlass.range_constexpr(bpt):
-                                s_hist[cutlass.Int32(nbuf + j * threads_per_cta) + tidx] = zero
-                        cute.arch.barrier()  # B1_p
-                        _scan_find(s_hist, hbuf, s_wsum, s_found, need, zero, tidx, lane, warp, threads_per_cta)
-                        b = s_found[0]
-                        above_b = s_found[1]
-                        cnt_b = s_found[2]
-                        need = need - above_b
-                        new_lo = lo + (b.to(cutlass.Uint32) << sh)
-                        hi = new_lo + ((cutlass.Uint32(1) << sh) - cutlass.Uint32(1))
-                        lo = new_lo
-                        whole_p = cnt_b == need
-                        exact = lo == hi
-                        done = whole_p | exact
-                        take = need
-                # the pass verdict as a pair: a bin taken whole -> everything at or above lo; an exact key with every tied id taken ->
-                # the key with idstar = n - 1; an exact key with a partial take -> the take-th smallest id among the tied ids, found by
-                # a 2 x 12-bit select over the ids of the keys equal to it (ascending ids = descending complemented digits)
-                kstar = (lo - cutlass.Uint32(1)) if lo > cutlass.Uint32(0) else cutlass.Uint32(0)
-                idstar = n - one
-                if (lo == hi) & (take < cnt_b):
-                    kstar = lo
-                    id_lo = zero  # the id range [id_lo, id_lo + 2^id_sh x 4096) narrowed twice: ids < 2^24
-                    for q in cutlass.range_constexpr(2):
-                        id_sh = cutlass.const_expr(12 * (1 - q))
-                        hbuf = cutlass.const_expr((q & 1) * BINS)
-                        for j in cutlass.range_constexpr(bpt):
-                            s_hist[cutlass.Int32(hbuf + j * threads_per_cta) + tidx] = zero
-                        cute.arch.barrier()  # I0_q
-                        for i in cutlass.range_constexpr(ept):
-                            e = e0 + cutlass.Int32(32 * i)
-                            d = cutlass.Int32(BINS - 1) - (((e - id_lo) >> cutlass.Int32(id_sh)) & cutlass.Int32(BINS - 1))
-                            if (keys[i] == kstar) & (e < n) & (e >= id_lo) & (e < id_lo + cutlass.Int32(BINS << id_sh)):
-                                cute.arch.atomic_add(s_hist.iterator + (cutlass.Int32(hbuf) + d), one, sem="relaxed", scope="cta")
-                        cute.arch.barrier()  # I1_q
-                        _scan_find(s_hist, hbuf, s_wsum, s_found, take, zero, tidx, lane, warp, threads_per_cta)
-                        db = cutlass.Int32(BINS - 1) - s_found[0]  # the digit holding the take-th smallest id
-                        take = take - s_found[1]
-                        id_lo = id_lo + (db << cutlass.Int32(id_sh))
-                    idstar = id_lo + take - one  # the exact id: `take` ids remain wanted at the last (unit) digit, and they are one id
-
-        # ---- the canonical compaction: sweep A counts the selected ids per warp, one barrier, sweep B writes --------------------
-        wcnt = zero
-        for i in cutlass.range_constexpr(ept):
-            key = keys[i]
-            e = e0 + cutlass.Int32(32 * i)
-            sel = (key > kstar) | ((key == kstar) & (e <= idstar))
-            bal = cutlass.Uint32(cute.arch.vote_ballot_sync(sel))
+                idstar = s_found[3]
+            # ---- the canonical compaction over the staged words: this warp's region in id order; pass S1 counts the selected (every
+            # staged word is selected when the bin is taken whole: the count is the staged count), F2 publishes the warp counts, pass
+            # S2 writes the selected ids at their global descending rank ------------------------------------------------------------
+            sel_w = cnt_w
+            if not whole:
+                sel_w = zero
+                for base_r in range(0, cnt_w, 32):
+                    r = base_r + lane
+                    valid = r < cnt_w
+                    rr = r if valid else cnt_w - one
+                    word = s_pool[warp_off + rr]
+                    flagged = word < zero
+                    sl = word & cutlass.Int32(RANK_CAP - 1)
+                    kk = s_rank_key[sl]
+                    ii = s_rank_id[sl]
+                    idv = ii if flagged else word
+                    sel = valid & ((~flagged) | (kk > kstar) | ((kk == kstar) & (idv <= idstar)))
+                    sel_w = sel_w + cutlass.Int32(cute.arch.popc(cutlass.Uint32(cute.arch.vote_ballot_sync(sel))))
             if lane == zero:
-                s_bal[warp * cutlass.Int32(ept) + cutlass.Int32(i)] = bal
-            wcnt = wcnt + cutlass.Int32(cute.arch.popc(bal))
-        if lane == zero:
-            s_wsum[warp] = wcnt
-        cute.arch.barrier()  # F: the per-warp selected counts and the words
-        wlow, _ = _cross_warp_excl(s_wsum, lane, warp, nwarps)
-        run = wlow
-        for i in cutlass.range_constexpr(ept):
-            bal = s_bal[warp * cutlass.Int32(ept) + cutlass.Int32(i)]
-            if bal != cutlass.Uint32(0):
-                if (bal & my_bit) != cutlass.Uint32(0):
-                    pos = run + cutlass.Int32(cute.arch.popc(bal & lt_mask))
-                    slot = cutlass.Int32(top_k - 1) - pos
-                    st_global(out_row + slot.to(cutlass.Int64) * four, e0 + cutlass.Int32(32 * i), cutlass.Int32)
-                run = run + cutlass.Int32(cute.arch.popc(bal))
+                s_wsum[warp] = sel_w
+            cute.arch.barrier()  # F2: the per-warp selected counts
+            wlow, _ = _cross_warp_excl(s_wsum, lane, warp, nwarps)
+            run2 = wlow
+            for base_r in range(0, cnt_w, 32):
+                r = base_r + lane
+                valid = r < cnt_w
+                rr = r if valid else cnt_w - one
+                word = s_pool[warp_off + rr]
+                flagged = word < zero
+                sl = word & cutlass.Int32(RANK_CAP - 1)
+                kk = s_rank_key[sl]
+                ii = s_rank_id[sl]
+                idv = ii if flagged else word
+                sel = valid & ((~flagged) | (kk > kstar) | ((kk == kstar) & (idv <= idstar)))
+                bal = cutlass.Uint32(cute.arch.vote_ballot_sync(sel))
+                if sel:
+                    pos = run2 + cutlass.Int32(cute.arch.popc(bal << sh_lt))
+                    slot_o = cutlass.Int32(top_k - 1) - pos
+                    st_global(out_row + slot_o.to(cutlass.Int64) * four, idv, cutlass.Int32)
+                run2 = run2 + cutlass.Int32(cute.arch.popc(bal))
+        else:
+            # ---- the fallback: the bin's candidates listed (one sweep), the narrowing passes over the list (or the row), the id
+            # select for a partial tie, then the two-sweep canonical compaction over the keys ----------------------------------------
+            if not whole:
+                use_list = cnt_b <= cutlass.Int32(CAND_CAP)
+                span1 = hi - lo
+                if use_list:
+                    for i in cutlass.range_constexpr(ept):
+                        key = keys[i]
+                        inb = (key - lo) <= span1  # unsigned: lo <= key <= hi in one compare
+                        if lo == cutlass.Uint32(0):
+                            inb = inb & ((e0 + cutlass.Int32(32 * i)) < n)  # a range from 0 would admit the dummies: keep the real ids only
+                        w_c = cutlass.Uint32(cute.arch.vote_ballot_sync(inb))
+                        if w_c != cutlass.Uint32(0):
+                            wbase_c = zero
+                            if lane == zero:
+                                wbase_c = cute.arch.atomic_add(s_ncand.iterator, cutlass.Int32(cute.arch.popc(w_c)), sem="relaxed", scope="cta")
+                            wbase_c = cute.arch.shuffle_sync(wbase_c, zero, mask_and_clamp=31)
+                            slot = wbase_c + cutlass.Int32(cute.arch.popc(w_c & lt_mask))
+                            if inb & (slot < cutlass.Int32(CAND_CAP)):
+                                s_cand[slot] = key
+                                s_cand_id[slot] = e0 + cutlass.Int32(32 * i)
+                cute.arch.barrier()  # C1: the list and its count
+                ncand = s_ncand[0]
+                ncand = ncand if ncand < cutlass.Int32(CAND_CAP) else cutlass.Int32(CAND_CAP)
+                if (not use_fast) & use_list & (ncand <= cutlass.Int32(RANK_CAP)):
+                    # (only without the fast path: there a bin of <= RANK_CAP candidates never reaches here) few candidates: an exact
+                    # all-pairs rank (key descending, id ascending); the need-th candidate IS the threshold pair
+                    if tidx < ncand:
+                        key_c = s_cand[tidx]
+                        id_c = s_cand_id[tidx]
+                        rnk = zero
+                        for j in range(ncand):
+                            kj = s_cand[j]
+                            ij = s_cand_id[j]
+                            ahead = (kj > key_c) | ((kj == key_c) & (ij < id_c))
+                            rnk = rnk + (one if ahead else zero)
+                        if rnk == need - one:
+                            s_wmax[0] = key_c  # s_wmax is free after B0
+                            s_found[3] = id_c
+                    cute.arch.barrier()  # R1: the pair
+                    kstar = s_wmax[0]
+                    idstar = s_found[3]
+                else:
+                    # the narrowing passes over the list (or, a bin wider than the list, over the row's keys): 12-bit digits of [lo, hi]
+                    sh = cutlass.Uint32(0)
+                    done = cutlass.Boolean(False)
+                    take = zero
+                    for p0_ in cutlass.range_constexpr(MAX_PASSES - 1):
+                        p = p0_ + 1
+                        if not done:
+                            hbuf = cutlass.const_expr((p & 1) * BINS)
+                            span = hi - lo
+                            blen = cutlass.Int32(32) - cute.arch.clz(span).to(cutlass.Int32)
+                            nsh = blen - cutlass.Int32(BIN_BITS)
+                            sh = (nsh if nsh > zero else zero).to(cutlass.Uint32)
+                            span_p = hi - lo
+                            if use_list:
+                                for c_ in range(tidx, ncand, threads_per_cta):
+                                    key = s_cand[c_]
+                                    if (key - lo) <= span_p:
+                                        d = ((key - lo) >> sh).to(cutlass.Int32)
+                                        cute.arch.atomic_add(s_hist.iterator + (cutlass.Int32(hbuf) + d), one, sem="relaxed", scope="cta")
+                            else:
+                                for i in cutlass.range_constexpr(ept):
+                                    key = keys[i]
+                                    if ((key - lo) <= span_p) & ((e0 + cutlass.Int32(32 * i)) < n):
+                                        d = ((key - lo) >> sh).to(cutlass.Int32)
+                                        cute.arch.atomic_add(s_hist.iterator + (cutlass.Int32(hbuf) + d), one, sem="relaxed", scope="cta")
+                            if cutlass.const_expr(p + 1 < MAX_PASSES):
+                                nbuf = cutlass.const_expr(((p + 1) & 1) * BINS)
+                                for j in cutlass.range_constexpr(bpt):
+                                    s_hist[cutlass.Int32(nbuf + j * threads_per_cta) + tidx] = zero
+                            cute.arch.barrier()  # B1_p
+                            _scan_find(s_hist, hbuf, s_wsum, s_found, need, zero, tidx, lane, warp, threads_per_cta)
+                            b = s_found[0]
+                            above_b = s_found[1]
+                            cnt_b = s_found[2]
+                            need = need - above_b
+                            new_lo = lo + (b.to(cutlass.Uint32) << sh)
+                            hi = new_lo + ((cutlass.Uint32(1) << sh) - cutlass.Uint32(1))
+                            lo = new_lo
+                            whole_p = cnt_b == need
+                            exact_k = lo == hi
+                            done = whole_p | exact_k
+                            take = need
+                    # the pass verdict as a pair: a bin taken whole -> everything at or above lo; an exact key with every tied id taken ->
+                    # the key with idstar = n - 1; an exact key with a partial take -> the take-th smallest id among the tied ids, found by
+                    # a 2 x 12-bit select over the ids of the keys equal to it (ascending ids = descending complemented digits)
+                    kstar = (lo - cutlass.Uint32(1)) if lo > cutlass.Uint32(0) else cutlass.Uint32(0)
+                    idstar = n - one
+                    if (lo == hi) & (take < cnt_b):
+                        kstar = lo
+                        id_lo = zero  # the id range [id_lo, id_lo + 2^id_sh x 4096) narrowed twice: ids < 2^24
+                        for q in cutlass.range_constexpr(2):
+                            id_sh = cutlass.const_expr(12 * (1 - q))
+                            hbuf = cutlass.const_expr((q & 1) * BINS)
+                            for j in cutlass.range_constexpr(bpt):
+                                s_hist[cutlass.Int32(hbuf + j * threads_per_cta) + tidx] = zero
+                            cute.arch.barrier()  # I0_q
+                            for i in cutlass.range_constexpr(ept):
+                                e = e0 + cutlass.Int32(32 * i)
+                                d = cutlass.Int32(BINS - 1) - (((e - id_lo) >> cutlass.Int32(id_sh)) & cutlass.Int32(BINS - 1))
+                                if (keys[i] == kstar) & (e < n) & (e >= id_lo) & (e < id_lo + cutlass.Int32(BINS << id_sh)):
+                                    cute.arch.atomic_add(s_hist.iterator + (cutlass.Int32(hbuf) + d), one, sem="relaxed", scope="cta")
+                            cute.arch.barrier()  # I1_q
+                            _scan_find(s_hist, hbuf, s_wsum, s_found, take, zero, tidx, lane, warp, threads_per_cta)
+                            db = cutlass.Int32(BINS - 1) - s_found[0]  # the digit holding the take-th smallest id
+                            take = take - s_found[1]
+                            id_lo = id_lo + (db << cutlass.Int32(id_sh))
+                        idstar = id_lo + take - one  # the exact id: `take` ids remain wanted at the last (unit) digit, and they are one id
+
+            # ---- the canonical compaction: sweep A counts the selected ids per warp, one barrier, sweep B writes --------------------
+            wcnt = zero
+            for i in cutlass.range_constexpr(ept):
+                key = keys[i]
+                e = e0 + cutlass.Int32(32 * i)
+                sel = (key > kstar) | ((key == kstar) & (e <= idstar))
+                bal = cutlass.Uint32(cute.arch.vote_ballot_sync(sel))
+                if lane == zero:
+                    s_bal[warp * cutlass.Int32(ept) + cutlass.Int32(i)] = bal
+                wcnt = wcnt + cutlass.Int32(cute.arch.popc(bal))
+            if lane == zero:
+                s_wsum[warp] = wcnt
+            cute.arch.barrier()  # F: the per-warp selected counts and the words
+            wlow, _ = _cross_warp_excl(s_wsum, lane, warp, nwarps)
+            run = wlow
+            for i in cutlass.range_constexpr(ept):
+                bal = s_bal[warp * cutlass.Int32(ept) + cutlass.Int32(i)]
+                if bal != cutlass.Uint32(0):
+                    if (bal & my_bit) != cutlass.Uint32(0):
+                        pos = run + cutlass.Int32(cute.arch.popc(bal & lt_mask))
+                        slot = cutlass.Int32(top_k - 1) - pos
+                        st_global(out_row + slot.to(cutlass.Int64) * four, e0 + cutlass.Int32(32 * i), cutlass.Int32)
+                    run = run + cutlass.Int32(cute.arch.popc(bal))
 
 
 frost_qsa_topk_decode.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -770,7 +973,7 @@ def frost_qsa_topk_decode_cluster(
     n = n if n > zero else zero
     n = n if n < cols else cols
     # the mbarriers: ONE lane initialises, the fence + CTA barrier publish them, the cluster barrier makes them visible to every peer
-    # before any remote store (P4); the wait overlaps the loads in flight
+    # before any remote store; the wait overlaps the loads in flight
     if tidx == zero:
         for k in cutlass.range_constexpr(5):
             cute.arch.mbarrier_init(s_mb.iterator + k, LOCAL_ARRIVERS)
@@ -1191,7 +1394,7 @@ def compile_qsa_topk_decode(
         )
     if use_pdl and cc < (9, 0):
         raise NotImplementedError(f"qsa_topk_decode with use_pdl=True needs griddepcontrol (cc 9.0+); found cc {cc[0]}.{cc[1]}")
-    smem_bytes = smem_bytes_for(cols_cap, cluster_ctas, threads_per_cta)
+    smem_bytes = smem_bytes_for(cols_cap, cluster_ctas, threads_per_cta, top_k)
     limit = shared_memory_per_block_optin(device)
     if smem_bytes > limit:
         raise NotImplementedError(
