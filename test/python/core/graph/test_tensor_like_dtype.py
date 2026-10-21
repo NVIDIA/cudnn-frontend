@@ -78,6 +78,13 @@ def test_op_builder_framework_operand_matches_what_execute_describes():
     assert node.inputs["B"].data_type == _buffer_dtype_to_cudnn(b.dtype) == cudnn.data_type.FLOAT
 
 
+def test_execute_lookup_resolves_a_dtype_by_name():
+    """execute() describes cupy / numba buffers with the same lookup, so it must
+    resolve a name-only dtype the same way tensor_like() declares it."""
+    assert _buffer_dtype_to_cudnn(_NamedDtype("bfloat16")) == cudnn.data_type.BFLOAT16
+    assert _buffer_dtype_to_cudnn(_NamedDtype("not_a_dtype")) is None
+
+
 def test_unknown_dtype_still_falls_back_to_io_data_type():
     g = _half_graph()
     t = g.tensor_like(_Buffer((4, 8), _NamedDtype("not_a_dtype")))

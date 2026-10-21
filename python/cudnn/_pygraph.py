@@ -506,14 +506,10 @@ class pygraph:
                 dim = list(template.shape)
                 stride = _row_major_stride(dim)
 
-        # Same lookup as execute(), so non-torch arrays are declared with their
-        # own dtype. ml_dtypes types may be missing from the table if ml_dtypes
-        # was imported after it was built, so try the dtype name as well.
+        # Same lookup as execute(), so non-torch arrays are declared with their own dtype.
         data_type = None
         try:
             data_type = _buffer_dtype_to_cudnn(template.dtype)
-            if data_type is None:
-                data_type = _buffer_dtype_to_cudnn(getattr(template.dtype, "name", None))
         except Exception:
             pass
 

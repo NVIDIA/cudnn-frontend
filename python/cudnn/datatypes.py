@@ -234,7 +234,12 @@ def _buffer_dtype_to_cudnn(dtype) -> cudnn_data_type:
                     except TypeError:
                         pass  # no numpy spelling (bfloat16); the name key serves it
         _buffer_dtype_to_cudnn_dict = table
-    return _buffer_dtype_to_cudnn_dict.get(dtype)
+    data_type = _buffer_dtype_to_cudnn_dict.get(dtype)
+    if data_type is None and not isinstance(dtype, str):
+        # ml_dtypes types (jax bfloat16, fp8) are keys only if ml_dtypes was
+        # imported before the table was built, so fall back to the dtype name.
+        data_type = _buffer_dtype_to_cudnn_dict.get(getattr(dtype, "name", None))
+    return data_type
 
 
 def _torch_to_cutlass_data_type(data_type, interpret_uint8_as_fp4x2: bool = False):
