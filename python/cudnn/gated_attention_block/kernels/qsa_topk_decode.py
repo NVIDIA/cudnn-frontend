@@ -66,10 +66,11 @@ rounds, and an ascending id order that is warp-major, round-major, lane-minor; `
      exceeds ``CAND_CAP``), each 3 barriers, until the bin is taken whole or the key is exact; an exact key with only part of its
      tied ids wanted resolves ``idstar`` by a 2 x 12-bit select over the ids of the keys equal to it (ascending ids = descending
      complemented digits, the same scan).  Four passes at most (the saturated bin: ``[0, 2^32)`` in 12 + 12 + 8 bits).
-6. The canonical compaction: sweep A counts the selected ids per warp (one ballot per round) -> one barrier -> every thread takes its
-   warp's exclusive prefix over the warp counts -> sweep B recomputes each round's ballot and writes the selected id of ascending
-   rank ``pos`` (the lower warps' count + the warp's running count + the lanes below) at slot ``top_k - 1 - pos``: strictly
-   descending ids, every slot of a row with ``n > top_k`` written, no atomic decides a slot, two launches bitwise.
+6. The canonical compaction: sweep A counts the selected ids per warp (one ballot per round; lane 0 stores the round's ballot word
+   in ``s_bal[warp x EPT + i]``) -> one barrier -> every thread takes its warp's exclusive prefix over the warp counts -> sweep B
+   reads each round's word back (no recomputation; a zero word skips the round) and writes the selected id of ascending rank
+   ``pos`` (the lower warps' count + the warp's running count + the lanes below) at slot ``top_k - 1 - pos``: strictly descending
+   ids, every slot of a row with ``n > top_k`` written, no atomic decides a slot, two launches bitwise.
 
 Barrier table (REQUIRED pre-development table; no mbarrier, no cluster barrier: every site is ``bar.sync 0`` reached by EVERY thread of
 the CTA exactly once per visit, ``SUM(issuing lanes) == THREADS`` at every row; the identity path performs no barrier):
@@ -83,7 +84,7 @@ the CTA exactly once per visit, ``SUM(issuing lanes) == THREADS`` at every row; 
 | R1 (the rank path) | after the rank | ``s_wmax[0]`` / ``s_found[1]`` = the pair (ONE thread) -> every thread |
 | B1_p (later passes, p <= 4) | after the pass's atomics | the atomics into ``s_hist[p & 1]`` -> the scan; the other buffer zeroed -> the next pass |
 | I0_q / I1_q (the id select, q <= 2) | before / after its atomics | the zeroing of ``s_hist[q & 1]`` -> the atomics; the atomics -> the scan |
-| F | after sweep A | ``s_wsum[warp]`` = the warp's selected count (lane 0 per warp) -> the cross-warp prefix before sweep B |
+| F | after sweep A | ``s_wsum[warp]`` = the warp's selected count and ``s_bal[warp x EPT + i]`` = the round's ballot word (lane 0 per warp) -> the cross-warp prefix and sweep B's reads |
 
 The common path (the rank decides) is 7 sites: B0, B1_1, B2_1, B3_1, C1, R1, F; a bin taken whole at pass 1 is 5.
 
@@ -94,6 +95,7 @@ states the per-lane stride that keeps the banks spread):
 |---|---|---|---|
 | ``s_hist`` i32 x ``2 x 4096`` | ``red.shared.add`` at the digit of each candidate (data-dependent); the zeroing ``s_hist[b][j x THREADS + t]`` | the scan: thread ``t`` reads bins ``4095 - BPT x t - j`` (``4 x BPT`` B between lanes: 4 wavefronts per load, BPT loads per pass -- immaterial) | the zeroing is conflict-free; the histogram side is bin-addressed by nature |
 | ``s_cand`` u32 x ``CAND_CAP``, ``s_cand_id`` i32 x ``CAND_CAP`` | the appending lanes of a warp at ``base + popc(ballot & lt_mask)`` (consecutive slots: 4 B between lanes) | the rank (thread ``t`` reads entry ``t`` and every entry: broadcast) and the later passes (round-strided) | conflict-free |
+| ``s_bal`` u32 x ``cols_cap / 32`` (one word per round per warp) | lane 0 of warp ``w`` at word ``w x EPT + i`` in sweep A | sweep B: every lane of warp ``w`` reads word ``w x EPT + i`` (a broadcast) | consecutive words per warp, one lane writes, broadcast reads: conflict-free |
 | ``s_wsum`` i32 x 32 | lane 31 (the scans) or lane 0 (sweep A) of each warp | every thread reads slot ``lane`` | 4 B between lanes: conflict-free |
 | ``s_wmax`` u32 x 32 | lane 0 of each warp (the warp maxima); slot 0 again by the ranked thread (``kstar``) | every thread reads slot ``lane`` / slot 0 | conflict-free / broadcast |
 | ``s_found`` i32 x 4, ``s_ncand`` i32 x 4 | the one finder thread / the appending lanes (atomics) | every thread (broadcast) | trivial |
@@ -119,15 +121,22 @@ ALL-GATHER (``_merge_hist``: 16 KB in and out per CTA per phase), the k-th bin's
 up to ``UNION_CAP`` = 127 (key, id) pairs; a CTA with more sends the merged-pass fallback down the same path in every CTA), and the
 per-CTA selected counts (C words) for the canonical prefix.  Every CTA derives the same verdict from the same merged data; the
 candidates' rank, the narrowing passes over the union and the id select are CTA-local.  Its barrier table: P0 (``mbarrier.init`` x 5
-by thread 0 -> ``fence.mbarrier_init`` -> ``bar.sync`` -> ``barrier.cluster.arrive.relaxed`` + ``wait``: the inits before any peer's
-store), then per exchange ONE local ``mbarrier.arrive.expect_tx`` (thread 0; the init count is 1) against exactly the bytes the C
-senders push (``SUM(stores x bytes) == expect_tx``: C x 4 for the maximum and the counts, C x 4096 / C x 4 = 16384 for each merge
-phase, C x 1024 for the union), every thread ``mbarrier.try_wait`` on the phase parity (``mb_rs`` / ``mb_ag`` advance once per merged
-pass; the others are used once), and the exit drain (``barrier.cluster.arrive.relaxed`` + ``wait`` after the last wait of every CTA:
-no CTA leaves while a peer's store into it may be in flight -- a store lands only before the phase it completes, and every CTA waited
-for every phase that targets it).  A receive buffer is reused across merged passes without a second barrier because a peer's pass-p+1
-store needs the receiver's pass-p all-gather message, sent only after the receiver consumed the pass-p data.  SMEM: ``s_rs`` / ``s_merged``
-(16 KB each), ``s_mslice`` (4096 / C words), ``s_union`` (C KB), ``s_msg`` (1 KB), the single-CTA buffers (the bitmap words sized to the
+by thread 0, each with init count ``LOCAL_ARRIVERS`` = 1 -> ``fence.mbarrier_init`` by every thread -> ``bar.sync`` ->
+``barrier.cluster.arrive.relaxed`` + ``wait``: the inits before any peer's store), then per exchange ONE local
+``mbarrier.arrive.expect_tx`` (thread 0) against exactly the bytes the C senders push (``SUM(stores x bytes) == expect_tx``:
+``C x XCHG_WORD_BYTES`` for the maximum and the counts, ``HIST_XCHG_BYTES`` = C x 4096 / C x 4 = 16384 for each merge phase,
+``C x UNION_MSG_BYTES`` = C x 1024 for the union), every thread ``mbarrier.try_wait`` on the phase parity (``mb_rs`` / ``mb_ag`` advance
+once per merged pass; the others are used once), and the exit drain (``barrier.cluster.arrive.relaxed`` + ``wait`` after the last wait
+of every CTA: no CTA leaves while a peer's store into it may be in flight -- a store lands only before the phase it completes, and
+every CTA waited for every phase that targets it).  Its CTA-local ``bar.sync`` sites beyond the single-CTA form's: M1 (inside
+``_merge_hist``, once per merge phase: the reduced slice ``s_mslice`` before its chunks leave), C2 (the union message ``s_msg``
+assembled before its chunks leave), C3 (the union compacted into ``s_cand`` / ``s_cand_id`` before the rank or the passes), R2 (the
+id rank over the union list behind the narrowing passes: the finder publishes ``idstar`` in ``s_found[3]`` -- the FOURTH word, read
+nowhere else, because every thread read words 0..2 right after the last pass's B3 with no barrier since; a write into word 1 there
+raced a reader still behind that read), and F before the counts exchange.  A receive buffer is reused across merged passes without a
+second barrier because a peer's pass-p+1 store needs the receiver's pass-p all-gather message, sent only after the receiver consumed
+the pass-p data.  SMEM: ``s_rs`` / ``s_merged`` (16 KB each), ``s_mslice`` (4096 / C words), ``s_union`` (C KB), ``s_msg`` (1 KB),
+``s_xmax`` / ``s_cnt`` (C words each, the two one-word-per-sender receive buffers), the single-CTA buffers (``s_bal`` sized to the
 slice), five mbarriers.
 
 Knobs (performance-only, the same function under every served value -- the tests pin every value bitwise against the others):
@@ -633,6 +642,12 @@ UNION_CAP = 127
 """Candidates of the k-th bin one CTA contributes to the cluster-wide union (one 1 KB message: a count word, a pad word, 127 pairs);
 a CTA with more falls back to the merged passes over the row's keys."""
 MSG_WORDS = 256
+# the exchange table (every mbarrier: init count LOCAL_ARRIVERS; one ``arrive.expect_tx`` by thread 0 per phase against EXACTLY the
+# bytes the C senders' ``st.async`` complete; the senders never arrive)
+LOCAL_ARRIVERS = 1  # the one local arriver (thread 0) of every mbarrier phase
+XCHG_WORD_BYTES = 4  # one Int32 per sender: the row maximum and the selected-count exchanges expect ``C x XCHG_WORD_BYTES``
+HIST_XCHG_BYTES = BINS * 4  # each merge phase (reduce-scatter, all-gather) completes the whole histogram: C senders x (4096 / C bins) x 4 B
+UNION_MSG_BYTES = MSG_WORDS * 4  # one CTA's union message (1 KB); the union exchange expects ``C x UNION_MSG_BYTES``
 
 
 @cute.jit
@@ -655,7 +670,7 @@ def _merge_hist(s_hist, hbuf: cutlass.Constexpr[int], s_rs, s_mslice, s_merged, 
     )
     cute.arch.store_async_dsmem(dst, (v0, v1, v2, v3), mb_rs, q)
     if tidx == zero:
-        cute.arch.mbarrier_arrive_and_expect_tx(mb_rs, BINS * 4)
+        cute.arch.mbarrier_arrive_and_expect_tx(mb_rs, HIST_XCHG_BYTES)
     cute.arch.mbarrier_wait(mb_rs, parity)
     if tidx < cutlass.Int32(bins_per_peer):
         acc = zero
@@ -676,7 +691,7 @@ def _merge_hist(s_hist, hbuf: cutlass.Constexpr[int], s_rs, s_mslice, s_merged, 
     )
     cute.arch.store_async_dsmem(dst2, (w0, w1, w2, w3), mb_ag, q)
     if tidx == zero:
-        cute.arch.mbarrier_arrive_and_expect_tx(mb_ag, BINS * 4)
+        cute.arch.mbarrier_arrive_and_expect_tx(mb_ag, HIST_XCHG_BYTES)
     cute.arch.mbarrier_wait(mb_ag, parity)
 
 
@@ -758,8 +773,10 @@ def frost_qsa_topk_decode_cluster(
     # before any remote store (P4); the wait overlaps the loads in flight
     if tidx == zero:
         for k in cutlass.range_constexpr(5):
-            cute.arch.mbarrier_init(s_mb.iterator + k, 1)
-        cute.arch.mbarrier_init_fence()
+            cute.arch.mbarrier_init(s_mb.iterator + k, LOCAL_ARRIVERS)
+    # the fence by EVERY thread (the order: ONE lane inits -> fence -> CTA barrier -> cluster barrier -> the first remote store); it is
+    # a per-thread fence, so for the threads that initialised nothing it orders nothing and costs one instruction
+    cute.arch.mbarrier_init_fence()
     cute.arch.barrier()  # P0
     cute.arch.cluster_arrive_relaxed(aligned=True)
     cute.arch.cluster_wait()
@@ -800,7 +817,7 @@ def frost_qsa_topk_decode_cluster(
         if tidx < cutlass.Int32(C):
             cute.arch.store_async_dsmem(s_xmax.iterator + rank, kmax_l.to(cutlass.Int32), mb_max, tidx)
         if tidx == zero:
-            cute.arch.mbarrier_arrive_and_expect_tx(mb_max, C * 4)
+            cute.arch.mbarrier_arrive_and_expect_tx(mb_max, C * XCHG_WORD_BYTES)
         cute.arch.mbarrier_wait(mb_max, 0)
         kmax = cutlass.Uint32(0)
         for j in cutlass.range_constexpr(C):
@@ -881,7 +898,7 @@ def frost_qsa_topk_decode_cluster(
                 )
                 cute.arch.store_async_dsmem(dstu, (m0, m1, m2, m3), mb_un, q)
             if tidx == zero:
-                cute.arch.mbarrier_arrive_and_expect_tx(mb_un, C * MSG_WORDS * 4)
+                cute.arch.mbarrier_arrive_and_expect_tx(mb_un, C * UNION_MSG_BYTES)
             cute.arch.mbarrier_wait(mb_un, 0)
             # the union's counts: every CTA derives the same decision
             total = zero
@@ -964,9 +981,12 @@ def frost_qsa_topk_decode_cluster(
                                 for j in range(ncand):
                                     rnk = rnk + (one if ((s_cand[j] == kstar) & (s_cand_id[j] < id_c)) else zero)
                                 if rnk == take - one:
-                                    s_found[1] = id_c
+                                    # the FOURTH word, read nowhere else: words 0..2 were read as (b, above, count) by every thread
+                                    # right after the last pass's B3 with no barrier since, so a write into word 1 here would race a
+                                    # reader still behind that read (the 2026-10-21 barrier audit's finding)
+                                    s_found[3] = id_c
                         cute.arch.barrier()  # R2
-                        idstar = s_found[1]
+                        idstar = s_found[3]
             else:
                 # a CTA holds more candidates than the union carries: the merged passes over the row's keys (every CTA, every pass),
                 # then -- for an exact key with a partial take -- the merged 2 x 12-bit select over the ids of the keys equal to it
@@ -1046,7 +1066,7 @@ def frost_qsa_topk_decode_cluster(
         if tidx < cutlass.Int32(C):
             cute.arch.store_async_dsmem(s_cnt.iterator + rank, ctot, mb_cnt, tidx)
         if tidx == zero:
-            cute.arch.mbarrier_arrive_and_expect_tx(mb_cnt, C * 4)
+            cute.arch.mbarrier_arrive_and_expect_tx(mb_cnt, C * XCHG_WORD_BYTES)
         cute.arch.mbarrier_wait(mb_cnt, 0)
         sel_lt = zero
         for j in cutlass.range_constexpr(C):
