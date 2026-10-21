@@ -844,3 +844,290 @@ def test_persistent_record_requires_every_item_to_have_kv_work():
             make(shape, **kw)
     for shape, kw in (((1, 2, 2, 200, 300), dict(is_causal=True, bottom_right=True)), ((1, 2, 2, 300, 200), dict(is_causal=True)), ((1, 2, 2, 300, 1), {})):
         assert make(shape, **kw).items == math.ceil(shape[3] / 128) * shape[1] * shape[0]
+
+
+# --- The paired walk's plan-time rule (host-only, no trace) -------
+#
+# causal_walk_plan picks, from the declared shape and the CTA count alone, the light-row count light_rows of the paired
+# walk (or keeps the stride by the grid). The references below build every unit and every CTA's load item by item from
+# the CausalWalk docstring, independently of the rule's run-length arithmetic.
+
+_PAIRED = dict(_CAUSAL_PERSISTENT, causal_walk=1)
+
+
+def _walk_module():
+    from cudnn.sdpa.fwd.api_dsl import _load_kernel_template
+
+    return _load_kernel_template("sm90/prefill_d128_f16.py", _record(**_PAIRED), tag="walk_rule_sm90_d128")
+
+
+def _walk_units(q_tiles, groups, light):
+    """The paired walk's units in walk order, built item by item from the CausalWalk docstring: per unit, its
+    ``(Q tile, group)`` items in order."""
+    pairs, odd = divmod(q_tiles - light, 2)
+    middle = light + pairs
+    units = []
+    for g in range(groups):
+        units += [((q_tiles - 1 - j, g), (light + j, g)) for j in range(pairs)]
+        if odd and g % 2:
+            units.append(((middle, g - 1), (middle, g)))
+        elif odd and g == groups - 1:
+            units.append(((middle, g),))
+    for tile in range(light - 1, -1, -1):
+        units += [((tile, g),) for g in range(groups)]
+    return units
+
+
+def _deal(units, ctas, snake):
+    """Every CTA's units: round k gives units k * n to k * n + n - 1 to CTAs 0 to n - 1, n = min(ctas, units), and odd
+    rounds to CTAs n - 1 to 0 under snake."""
+    n = min(ctas, len(units))
+    per_cta = [[] for _ in range(n)]
+    for u, unit in enumerate(units):
+        k, i = divmod(u, n)
+        per_cta[n - 1 - i if snake and k % 2 else i].append(unit)
+    return per_cta
+
+
+def _lpt_l2_coords(linear, q_h, batch, q_tiles, heads_per_kv, seqlen_kv, row_bytes, l2_bytes):
+    """scheduler.lpt_l2_tile_coords line by line on Python ints (its selects as max and min)."""
+    n_kh = q_h // heads_per_kv
+    num_groups = n_kh * batch
+    per_group = max(1, seqlen_kv * row_bytes)
+    active = min(max(1, l2_bytes // per_group), num_groups)
+    budget_blocks = (num_groups + active - 1) // active
+    active = (num_groups + budget_blocks - 1) // budget_blocks
+    tiles_per_blk = active * q_tiles * heads_per_kv
+    num_blocks = (num_groups + active - 1) // active
+    block, within = divmod(linear, tiles_per_blk)
+    eff = num_groups - block * active if block + 1 == num_blocks else active
+    row_rank, in_rank = divmod(within, eff * heads_per_kv)
+    kv_group = in_rank % eff + block * active
+    return q_tiles - 1 - row_rank, (kv_group % n_kh) * heads_per_kv + in_rank // eff, kv_group // n_kh
+
+
+def _stride_tiles(shape, sched_policy, qh_per_kh, q_tiles):
+    """The stride walk's Q tile per item in the one-tile grid's order (work_of), decoded item by item."""
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT_L2, SCHED_NATURAL
+
+    b, h_q, _, _, s_kv = shape
+    row_bytes = 2 * 128 * 2
+    groups = 50 * 1024 * 1024 // (s_kv * row_bytes)
+    l2_bytes = (1 << groups.bit_length() - 1) * s_kv * row_bytes if groups > 1 else 0
+    items = q_tiles * h_q * b
+    if sched_policy == SCHED_NATURAL:
+        return [i % q_tiles for i in range(items)]
+    if sched_policy == SCHED_LPT_L2:
+        return [_lpt_l2_coords(i, h_q, b, q_tiles, qh_per_kh, s_kv, row_bytes, l2_bytes)[0] for i in range(items)]
+    return [q_tiles - 1 - i // (h_q * b) for i in range(items)]
+
+
+def test_causal_kv_tiles_count_every_row_of_the_tile():
+    """causal_kv_tiles, the rule's count of each Q tile's KV tiles, against the count over every row the tile launches
+    (rows past S_q included, which the kernel walks too): the tile walks up to the KV tile of its rows' last visible
+    key, min(S_kv - 1, row + diag), diag = S_kv - S_q under bottom-right and 0 under top-left."""
+    mod = _walk_module()
+    for s_q, s_kv, bottom_right in [
+        (1024, 1024, True),
+        (1000, 1100, True),
+        (1536, 1024, False),
+        (1024, 1600, True),
+        (128, 4096, True),
+        (1000, 1000, False),
+        (1152, 1152, False),
+        (300, 200, False),
+        (1, 300, True),
+        (129, 129, True),
+    ]:
+        diag = s_kv - s_q if bottom_right else 0
+        want = [max(min(s_kv - 1, row + diag) for row in range(128 * t, 128 * t + 128)) // 128 + 1 for t in range(-(-s_q // 128))]
+        assert mod.causal_kv_tiles((1, 1, 1, s_q, s_kv), bottom_right) == want, (s_q, s_kv, bottom_right)
+
+
+# Twenty-six causal shapes (b, h_q, h_kv, S_q = S_kv) at 132 CTAs, an H100 SXM's SM count, under the adapter's LPT_L2
+# order, and the light-row count light_rows the rule gives each (test_causal_walk_rule_is_an_exhaustive_search checks
+# the rule itself): pairs alone where pairs fill the rounds evenly, a light tail on the long shapes and where the pairs
+# leave a round short, single items only (light_rows = T) on b1 h16/4 and b17 h2/2 s1024.
+_RULE_L = {
+    (16, 16, 4, 512): 0,
+    (8, 16, 4, 1024): 0,
+    (2, 32, 8, 2048): 0,
+    (1, 32, 8, 4096): 32,
+    (1, 16, 4, 8192): 31,
+    (33, 8, 8, 512): 0,
+    (33, 4, 4, 1024): 0,
+    (33, 2, 2, 2048): 0,
+    (33, 1, 1, 4096): 0,
+    (66, 4, 1, 512): 0,
+    (33, 4, 1, 1024): 0,
+    (33, 1, 1, 8192): 0,
+    (1, 16, 4, 1024): 8,
+    (11, 3, 3, 1024): 0,
+    (17, 2, 2, 1024): 8,
+    (23, 6, 6, 1024): 1,
+    (32, 16, 4, 1024): 0,
+    (33, 16, 4, 1024): 0,
+    (2, 32, 8, 4096): 32,
+    (2, 32, 8, 8192): 31,
+    (2, 32, 8, 16384): 29,
+    (2, 32, 32, 4096): 8,
+    (8, 32, 8, 4096): 15,
+    (4, 8, 8, 8192): 15,
+    (2, 16, 4, 16384): 29,
+    (1, 64, 8, 16384): 29,
+}
+
+
+def test_causal_walk_rule_light_rows_on_26_causal_shapes():
+    """The rule's light-row count on 26 causal shapes, b1 to b66 at S = 512 to 16384 (_RULE_L), at 132 CTAs: the paired
+    walk on every one, with its layout's constants consistent (pairs, the middle units, every item in a unit)."""
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT_L2
+
+    mod = _walk_module()
+    for (b, h_q, h_kv, s), light in _RULE_L.items():
+        walk = mod.causal_walk_plan((b, h_q, h_kv, s, s), True, SCHED_LPT_L2, h_q // h_kv, 132, 2)
+        assert walk is not None and walk.light_rows == light, ((b, h_q, h_kv, s), walk)
+        q_tiles = s // 128
+        assert (walk.q_tiles, walk.groups, walk.ctas) == (q_tiles, h_q * b, min(walk.units, 132)), walk
+        assert sum(map(len, _walk_units(q_tiles, h_q * b, light))) == q_tiles * h_q * b == 2 * walk.heavy_units - walk.lone_middle + h_q * b * light
+
+
+@pytest.mark.parametrize(
+    ("shape", "light"),
+    [
+        pytest.param((4, 24, 8, 512, 4096), None, id="b4-h24-sq512-skv4096"),
+        pytest.param((8, 24, 8, 256, 2048), None, id="b8-h24-sq256-skv2048"),
+        pytest.param((8, 32, 8, 2048, 16384), 0, id="b8-h32-sq2048-skv16384"),
+        pytest.param((4, 32, 8, 2048, 16384), 0, id="b4-h32-sq2048-skv16384"),
+    ],
+)
+def test_causal_walk_rule_keeps_the_stride_where_it_balances_better(shape, light):
+    """Chunked prefill (bottom-right, S_q well below S_kv): every Q tile walks nearly the same KV tiles, so pairs are a
+    coarser grain than single items. On the first two shapes the stride's largest CTA load is the smaller and the rule
+    keeps the stride (None); on the last two the paired walk's is no larger and the rule takes it."""
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT_L2
+
+    walk = _walk_module().causal_walk_plan(shape, True, SCHED_LPT_L2, shape[1] // shape[2], 132, 2)
+    assert (None if walk is None else walk.light_rows) == light, walk
+
+
+@pytest.mark.parametrize(
+    ("shape", "bottom_right", "sched"),
+    [
+        pytest.param((4, 16, 4, 1152, 1152), False, "SCHED_LPT_L2", id="odd-q-tiles"),
+        pytest.param((2, 16, 4, 1536, 1024), False, "SCHED_LPT_L2", id="sq-above-skv"),
+        pytest.param((4, 16, 4, 1000, 1100), True, "SCHED_LPT", id="partial-ragged-lpt"),
+        pytest.param((3, 5, 5, 1152, 1152), True, "SCHED_NATURAL", id="odd-groups-natural"),
+        pytest.param((1, 24, 8, 1024, 1024), True, "SCHED_LPT_L2", id="192-items"),
+        pytest.param((23, 6, 6, 1024, 1024), True, "SCHED_LPT_L2", id="l2-cap-binds"),
+        pytest.param((8, 24, 8, 256, 2048), True, "SCHED_LPT_L2", id="stride-wins"),
+        pytest.param((2, 8, 1, 100, 300), True, "SCHED_LPT_L2", id="one-q-tile"),
+        pytest.param((4, 16, 4, 1000, 1000), False, "SCHED_LPT_L2", id="partial-q"),
+        pytest.param((4, 16, 4, 1024, 1600), True, "SCHED_LPT_L2", id="diag-576"),
+        pytest.param((1, 32, 8, 2048, 8192), True, "SCHED_LPT_L2", id="chunked"),
+        pytest.param((3, 5, 5, 4224, 4224), True, "SCHED_LPT_L2", id="odd-t33-odd-groups"),
+        pytest.param((2, 48, 8, 640, 640), True, "SCHED_LPT_L2", id="odd-t5"),
+    ],
+)
+def test_causal_walk_rule_is_an_exhaustive_search(shape, bottom_right, sched):
+    """The rule against a brute force that visits every item, at 1, 3, 7, 64 and 132 CTAs: for each light_rows from 0 to
+    the L2 cap, every CTA's load summed over the units _walk_units builds and _deal deals; for the stride, every CTA's
+    load over the one-tile grid's order decoded item by item (NATURAL, LPT, lpt_l2_tile_coords on plain ints); each item
+    its KV tiles plus CAUSAL_WALK_PHI. The plan is the light_rows with the smallest largest load (the smaller on a tie),
+    and None exactly where the stride's is smaller; a plan with at most one item per CTA takes light_rows = T. The cap
+    is recomputed from its definition: a round of single items reads up to min(ceil(CTAs / qh_per_kh) + 1, h_kv * b) KV
+    heads, each to its row's last KV tile of 128 rows of K and V, within the LPT_L2 order's L2 budget (one KV group's
+    bytes where that is 0)."""
+    from cudnn.frost.tile_dsl import constants
+
+    mod = _walk_module()
+    sched = getattr(constants, sched)
+    b, h_q, h_kv, _, s_kv = shape
+    kv_tiles = mod.causal_kv_tiles(shape, bottom_right)
+    q_tiles, groups = len(kv_tiles), h_q * b
+    cost = [tiles + mod.CAUSAL_WALK_PHI for tiles in kv_tiles]
+    row_bytes = 2 * 128 * 2
+    l2_groups = 50 * 1024 * 1024 // (s_kv * row_bytes)
+    budget = ((1 << l2_groups.bit_length() - 1) * s_kv * row_bytes if l2_groups > 1 else 0) or s_kv * row_bytes
+    for ctas in (1, 3, 7, 64, 132):
+        walk = mod.causal_walk_plan(shape, bottom_right, sched, h_q // h_kv, ctas, 2)
+        if q_tiles * groups <= ctas:
+            assert walk is not None and walk.light_rows == q_tiles, (ctas, walk)
+            continue
+        heads = min(-(-ctas // (h_q // h_kv)) + 1, h_kv * b)
+        cap = 0
+        while cap < q_tiles and heads * kv_tiles[cap] * 128 * row_bytes <= budget:
+            cap += 1
+        loads = []
+        for light in range(cap + 1):
+            per_cta = _deal(_walk_units(q_tiles, groups, light), ctas, True)
+            loads.append(max(sum(cost[t] for unit in units for t, _ in unit) for units in per_cta))
+        best = loads.index(min(loads))
+        stride = [0] * min(ctas, q_tiles * groups)
+        for i, tile in enumerate(_stride_tiles(shape, sched, h_q // h_kv, q_tiles)):
+            stride[i % len(stride)] += cost[tile]
+        want = best if loads[best] <= max(stride) else None
+        assert (None if walk is None else walk.light_rows) == want, (ctas, cap, loads, max(stride), walk)
+
+
+def test_causal_walk_rule_honours_its_constants():
+    """The rule's constants as compile-time arms: a forced light-row count is taken as is (0: pairs only), clamped to T,
+    and never by a plan with at most one item per CTA (light_rows = T); the L2 cap off lets light_rows past it (b23 h6/6
+    s1024: 1 capped, 8 uncapped; b2 h32/32 s4096: 8 and 32); the snake off scores the walk dealt every round from CTA 0,
+    which favours pairs alone (b1 h16/4 s8192: 31 with the snake, 0 without)."""
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT_L2
+
+    mod = _walk_module()
+
+    def light(shape, **kw):
+        walk = mod.causal_walk_plan(shape, True, SCHED_LPT_L2, shape[1] // shape[2], 132, 2, **kw)
+        return None if walk is None else walk.light_rows
+
+    assert [light((1, 16, 4, 8192, 8192), light_rows=n) for n in (0, 5, 64, 1000)] == [0, 5, 64, 64]
+    assert [light((1, 16, 4, 1024, 1024), light_rows=n) for n in (0, 3)] == [8, 8]
+    assert [light((23, 6, 6, 1024, 1024), l2_cap=cap) for cap in (True, False)] == [1, 8]
+    assert [light((2, 32, 32, 4096, 4096), l2_cap=cap) for cap in (True, False)] == [8, 32]
+    assert [light((1, 16, 4, 8192, 8192), snake=on) for on in (True, False)] == [31, 0]
+    assert mod.causal_walk_plan((1, 16, 4, 8192, 8192), True, SCHED_LPT_L2, 4, 132, 2, snake=False).snake is False
+    assert (mod.CAUSAL_WALK_LIGHT_ROWS, mod.CAUSAL_WALK_L2_CAP, mod.CAUSAL_WALK_PHI, mod.CAUSAL_WALK_SNAKE) == (-1, True, 2, True)
+
+
+def test_causal_walk_rule_stays_cheap_on_large_plans():
+    """The rule runs once per compile, in Python: on four large plans (up to 262,144 items, T = 512 Q tiles over 512
+    groups with unequal pairs on the top-left S_q > S_kv one) it stays far below a compile's seconds. Measured at most
+    0.1 s each in the offline compile container (2 CPUs); the bound leaves room for a slow host."""
+    import time
+
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT_L2
+
+    mod = _walk_module()
+    for shape, bottom_right in [
+        ((32, 32, 8, 32000, 32020), True),
+        ((8, 64, 8, 65536, 32768), False),
+        ((16, 32, 8, 16000, 16010), True),
+        ((2, 16, 4, 4096, 2048), False),
+    ]:
+        start = time.perf_counter()
+        mod.causal_walk_plan(shape, bottom_right, SCHED_LPT_L2, shape[1] // shape[2], 132, 2)
+        assert time.perf_counter() - start < 2.0, shape
+
+
+def test_causal_walk_record_carries_the_rule():
+    """The persistent constructor of a causal_walk=1 record takes the rule's walk for its shape, CTA count and order
+    (``walk``); a causal_walk=0 record carries none; causal_walk=1 is refused on a one-tile record and on a non-causal
+    one. Host-only: no trace."""
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT_L2, SCHED_NATURAL
+
+    mod = _walk_module()
+
+    def make(shape, **kw):
+        return mod.SM90FusedMultiHeadAttentionForward(shape, intra_wg_overlap=True, **kw)
+
+    for shape, bottom_right, sched, ctas in [((2, 8, 2, 1024, 1024), True, SCHED_LPT_L2, 3), ((3, 5, 5, 1152, 1300), True, SCHED_NATURAL, 7)]:
+        kw = dict(is_causal=True, bottom_right=bottom_right, sched_policy=sched, qh_per_kh=shape[1] // shape[2], persistent=True, persistent_ctas=ctas)
+        assert make(shape, causal_walk=1, **kw).walk == mod.causal_walk_plan(shape, bottom_right, sched, shape[1] // shape[2], ctas, 2)
+        assert make(shape, **kw).walk is None
+    with pytest.raises(ValueError, match="orders a persistent causal record's walk"):
+        make((1, 2, 2, 256, 256), is_causal=True, causal_walk=1)
+    with pytest.raises(ValueError, match="orders a persistent causal record's walk"):
+        make((1, 2, 2, 256, 256), persistent=True, persistent_ctas=2, causal_walk=1)
