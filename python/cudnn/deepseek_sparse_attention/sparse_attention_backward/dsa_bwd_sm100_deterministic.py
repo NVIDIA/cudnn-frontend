@@ -16,6 +16,7 @@ from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 
 _SUPPORTED_DKV_SHARDS = (32, 64, 128)
 _LARGE_CONTEXT_WORKSPACE_BYTES = 16 << 30
+_RELAY_WORKSPACE_BUDGET_BYTES = 32 << 30
 _RELAY_WAVE_CTAS = 128
 _CLUSTER4_MIN_Q = 8192
 
@@ -58,16 +59,39 @@ def use_cluster_dkv_relay(total_seqlen_q: int, total_seqlen_kv: int, head_dim: i
     return num_shards * k * d * 4 > _LARGE_CONTEXT_WORKSPACE_BYTES
 
 
-def deterministic_dkv_relay_cluster_size(total_seqlen_q: int) -> int:
-    """Select the relay width while keeping one 128-CTA query wave.
+def _relay_workspace_bytes(total_seqlen_q: int, total_seqlen_kv: int, head_dim: int, num_heads: int, cluster_size: int) -> int:
+    """Return the complete FP32-plane and packed-mask relay allocation."""
+    k = (int(total_seqlen_kv) + 7) // 8 * 8
+    d = (int(head_dim) + 7) // 8 * 8
+    num_planes = _RELAY_WAVE_CTAS // cluster_size
+    mask_rows_per_word = 32 // cluster_size
+    num_waves = (int(total_seqlen_q) + _RELAY_WAVE_CTAS - 1) // _RELAY_WAVE_CTAS
+    num_head_blocks = (int(num_heads) + 63) // 64
+    mask_words = num_waves * num_head_blocks * ((k + mask_rows_per_word - 1) // mask_rows_per_word)
+    mask_rows = (mask_words + d - 1) // d
+    return num_planes * (k + mask_rows) * d * 4
 
-    Four-CTA relays double the number of FP32 planes but expose twice as many
-    independent reducers. They are reserved for long query batches where the
-    extra parallelism amortizes the larger, still bounded workspace.
+
+def deterministic_dkv_relay_cluster_size(total_seqlen_q: int, total_seqlen_kv: int, head_dim: int, num_heads: int = 64) -> int:
+    """Select the preferred relay or its minimum-workspace fallback.
+
+    Long query batches prefer four-CTA relays for reducer parallelism; shorter
+    batches prefer eight. Cluster-16 is the minimum-workspace fallback when the
+    preferred layout would exceed the memory-first budget. The long-query path
+    deliberately skips cluster-8: measured GB200 sweeps found it slower than
+    cluster-16 while retaining twice as many FP32 planes.
     """
     if total_seqlen_q <= 0:
         raise ValueError(f"deterministic DSA backward requires at least one query row, got {total_seqlen_q}")
-    return 4 if total_seqlen_q >= _CLUSTER4_MIN_Q else 8
+    if total_seqlen_kv <= 0 or head_dim <= 0 or num_heads <= 0:
+        raise ValueError(
+            "deterministic DSA backward requires positive KV, head-dimension, and head-count extents, "
+            f"got S_kv={total_seqlen_kv}, D={head_dim}, H={num_heads}"
+        )
+
+    preferred_cluster_size = 4 if total_seqlen_q >= _CLUSTER4_MIN_Q else 8
+    preferred_bytes = _relay_workspace_bytes(total_seqlen_q, total_seqlen_kv, head_dim, num_heads, preferred_cluster_size)
+    return preferred_cluster_size if preferred_bytes <= _RELAY_WORKSPACE_BUDGET_BYTES else 16
 
 
 class _DeterministicReductionPolicy:
@@ -483,7 +507,7 @@ class _FlashAttentionDSABackwardSm100DeterministicRelay(FlashAttentionDSABackwar
         _, _, batch_idx = cute.arch.block_idx()
         tidx_in_wg = tidx - self.reduce_warp_id[0] * self.threads_per_warp
         rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-        lower_byte_mask = (Uint32(1) << Uint32(rank)) - Uint32(1)
+        lower_rank_bits = (Uint32(1) << Uint32(rank)) - Uint32(1)
         if tidx_in_wg < self.block_tile and rank > 0:
             tile_begin = tile_index * self.block_tile
             slot = tile_begin + tidx_in_wg
@@ -491,9 +515,13 @@ class _FlashAttentionDSABackwardSm100DeterministicRelay(FlashAttentionDSABackwar
                 kv_row = mTopkIdxs[slot, (token_idx, batch_idx)]
                 if kv_row >= 0 and kv_row < max_seqlen_kv:
                     row_shift = Uint32((kv_row % self.dkv_mask_rows_per_word) * self.dkv_relay_cluster_size)
-                    lower_rank_mask = lower_byte_mask << row_shift
+                    lower_rank_mask = lower_rank_bits << row_shift
                     mask_ptr = self._mask_word_ptr(mdKV_acc, max_seqlen_kv, token_idx, head_block_idx, problem_shape, kv_row)
                     _wait_lower_rank_mask(mask_ptr, lower_rank_mask)
+        # The slot lanes import predecessor releases. The CTA barrier carries
+        # those observations to every reducer thread before it touches the
+        # shared plane; the GPU fence keeps the following GMEM updates after
+        # that handoff.
         self.dkv_relay_barrier.arrive_and_wait()
         cute.arch.fence_acq_rel_gpu()
 
@@ -513,6 +541,8 @@ class _FlashAttentionDSABackwardSm100DeterministicRelay(FlashAttentionDSABackwar
         _, _, batch_idx = cute.arch.block_idx()
         tidx_in_wg = tidx - self.reduce_warp_id[0] * self.threads_per_warp
         rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        # Publish every reducer thread's relaxed FP32 atomics through the CTA
+        # barrier before a slot lane release-clears this rank's ownership bit.
         cute.arch.fence_acq_rel_gpu()
         self.dkv_relay_barrier.arrive_and_wait()
         if tidx_in_wg < self.block_tile:
@@ -598,6 +628,18 @@ class FlashAttentionDSABackwardSm100DeterministicCluster8(_FlashAttentionDSABack
     num_dkv_final_terms = num_dkv_fold_groups
 
 
+class FlashAttentionDSABackwardSm100DeterministicCluster16(_FlashAttentionDSABackwardSm100DeterministicRelay):
+    """Eight-plane memory-first specialization using sixteen-CTA relays."""
+
+    num_dkv_shards = 8
+    dkv_relay_cluster_size = 16
+    dkv_mask_rows_per_word = 32 // dkv_relay_cluster_size
+    dkv_row_rank_mask = (1 << dkv_relay_cluster_size) - 1
+    dkv_cluster_shape = (dkv_relay_cluster_size, 1, 1)
+    num_dkv_fold_groups = num_dkv_shards // _FlashAttentionDSABackwardSm100DeterministicRelay.dkv_fold_group_size
+    num_dkv_final_terms = num_dkv_fold_groups
+
+
 class FlashAttentionDSABackwardSm100DeterministicCluster4(_FlashAttentionDSABackwardSm100DeterministicRelay):
     """Thirty-two-plane specialization using four-CTA relays."""
 
@@ -619,6 +661,7 @@ _DETERMINISTIC_KERNELS = {
 _DETERMINISTIC_RELAY_KERNELS = {
     4: FlashAttentionDSABackwardSm100DeterministicCluster4,
     8: FlashAttentionDSABackwardSm100DeterministicCluster8,
+    16: FlashAttentionDSABackwardSm100DeterministicCluster16,
 }
 
 
@@ -626,13 +669,15 @@ def deterministic_kernel_class(
     total_seqlen_q: int,
     total_seqlen_kv: int | None = None,
     head_dim: int | None = None,
+    num_heads: int = 64,
 ):
     """Return the compile-time deterministic specialization for one plan."""
     if total_seqlen_kv is not None or head_dim is not None:
         if total_seqlen_kv is None or head_dim is None:
             raise ValueError("total_seqlen_kv and head_dim must be provided together")
         if use_cluster_dkv_relay(total_seqlen_q, total_seqlen_kv, head_dim):
-            return _DETERMINISTIC_RELAY_KERNELS[deterministic_dkv_relay_cluster_size(total_seqlen_q)]
+            relay_width = deterministic_dkv_relay_cluster_size(total_seqlen_q, total_seqlen_kv, head_dim, num_heads)
+            return _DETERMINISTIC_RELAY_KERNELS[relay_width]
     return _DETERMINISTIC_KERNELS[deterministic_dkv_shards(total_seqlen_q)]
 
 

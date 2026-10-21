@@ -162,6 +162,7 @@ def _get_sm100_kernel_class(
     total_s_q: Optional[int] = None,
     total_s_kv: Optional[int] = None,
     head_dim: Optional[int] = None,
+    num_heads: int = 64,
 ):
     """Load the selected implementation without perturbing other variants.
 
@@ -192,7 +193,7 @@ def _get_sm100_kernel_class(
     if deterministic:
         if total_s_q is None or total_s_kv is None or head_dim is None:
             raise ValueError("deterministic SM100 kernel selection requires total_s_q, total_s_kv, and head_dim")
-        return deterministic_kernel_class(total_s_q, total_s_kv, head_dim)
+        return deterministic_kernel_class(total_s_q, total_s_kv, head_dim, num_heads)
     return FlashAttentionDSABackwardSm100
 
 
@@ -434,8 +435,9 @@ def flash_attn_bwd_sm100(
         dkv: preallocated (total_S_kv, headdim), same dtype as kv
         d_sink: preallocated (nheads,) float32
         deterministic: use ordered bounded-wave scratch accumulation; large
-            generic-M64 plans use row-aware four- or eight-CTA cluster relays, while
-            supported BF16 H96/H128 envelopes retain their two-CTA kernels
+            generic-M64 plans use row-aware four-, eight-, or sixteen-CTA
+            cluster relays, while supported BF16 H96/H128 envelopes retain
+            their two-CTA kernels
         current_stream: CUDA stream handle for all initialization, main, and
             reduction launches; defaults to the current CUDA stream (the plan
             API selects Q's device context before entering this function)
@@ -556,7 +558,7 @@ def flash_attn_bwd_sm100(
             workspace=workspace,
             deterministic=deterministic,
         )
-    kernel_cls = _get_sm100_kernel_class(backend, deterministic, total_S_q, total_S_kv, head_dim)
+    kernel_cls = _get_sm100_kernel_class(backend, deterministic, total_S_q, total_S_kv, head_dim, num_head)
     deterministic_shards = kernel_cls.num_dkv_shards if deterministic else 0
     deterministic_relay_cluster_size = getattr(kernel_cls, "dkv_relay_cluster_size", 1) if deterministic else 0
     uses_h128_two_cta = backend == "h128_2cta_m64"

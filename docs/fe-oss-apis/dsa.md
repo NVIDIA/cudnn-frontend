@@ -269,10 +269,13 @@ combine those groups in fixed order.
 
 If the selected bounded-wave layout would exceed 16 GiB, the generic M64 plan
 keeps each query wave at 128 CTAs and assigns one FP32 dKV plane to each
-cluster. Queries below 8192 rows use sixteen eight-CTA clusters; longer queries
-use thirty-two four-CTA clusters for additional reducer parallelism while
-remaining far below the ordinary 128-plane workspace. A setup kernel builds
-packed 8-bit or 4-bit rank masks for every
+cluster. Queries below 8192 rows prefer sixteen eight-CTA clusters; longer
+queries prefer thirty-two four-CTA clusters for additional reducer parallelism.
+If that preferred layout's complete FP32-plane and packed-mask allocation would
+exceed 32 GiB, the plan selects an eight-plane, sixteen-CTA memory-first relay.
+The long-query policy deliberately skips cluster-8: GB200 sweeps at 393K, 512K,
+and 768K KV found it slower than cluster-16 while retaining twice as many FP32
+planes. A setup kernel builds packed 16-bit, 8-bit, or 4-bit rank masks for every
 `(query wave, head block, KV row)`. Reducer threads wait only for lower cluster
 ranks that actually update the same KV row, then publish that row with
 GPU-scope release/acquire ordering. Disjoint sparse rows continue in parallel;
@@ -285,13 +288,20 @@ For the ordinary policy, additional dKV workspace is
 `selected_shards * K8 * D8 * sizeof(float)`, where
 `K8 = round_up(total_S_kv, 8)` and `D8 = round_up(D, 8)`. The cluster relay
 uses `relay_planes * (K8 + mask_rows) * D8 * sizeof(float)`, where
-`relay_planes` is 16 or 32, `relay_width` is 8 or 4, and
+`relay_planes` is 8, 16, or 32, `relay_width` is 16, 8, or 4, and
 `mask_rows = ceil(ceil(total_S_q / 128) * ceil(H / 64) *
 (K8 / (32 / relay_width)) / D8)`.
 One CTA per head reduces `d_sink`. Use `scratch_workspace_bytes()` as the
 authoritative full scratch size; a larger reusable workspace remains valid.
 Treat this as a reproducibility requirement rather than a performance-tuning
 knob: keep the default `False` when bitwise run-to-run stability is not needed.
+
+On GB200 with BF16, `total_S_q=16384`, `top_k=2048`, `H=64`, `D_qk=576`, and
+`D_v=512`, the memory-first cluster-16 route reduced full scratch from
+74.008 GiB to 20.008 GiB at `total_S_kv=1048576`; warmed `execute()` latency
+increased from 89.079 ms to 104.538 ms. At shorter KV extents the narrower
+relays remain preferable, so the policy keeps cluster-4 for `total_S_kv=278528`
+before applying cluster-16 to larger layouts.
 
 `SparseAttentionBackward.scratch_workspace_bytes()` reports the full scratch
 requirement on every backend: the SM100 FP32 statistics and dKV-accumulator

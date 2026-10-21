@@ -694,14 +694,19 @@ def test_DSA_sparse_attention_backward_qcluster_graph_replay_switches_overlap_pa
 def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
     """Keep deterministic scheduling policy separate from ordinary tuning."""
     try:
+        import cutlass
+
         from cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
         from cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_deterministic import (
             FlashAttentionDSABackwardSm100Deterministic,
             FlashAttentionDSABackwardSm100Deterministic32,
             FlashAttentionDSABackwardSm100Deterministic64,
+            FlashAttentionDSABackwardSm100DeterministicCluster16,
             FlashAttentionDSABackwardSm100DeterministicCluster4,
             FlashAttentionDSABackwardSm100DeterministicCluster8,
+            _RELAY_WORKSPACE_BUDGET_BYTES,
             _deterministic_kernel_class_for_config,
+            _relay_workspace_bytes,
             deterministic_dkv_relay_cluster_size,
             deterministic_dkv_shards,
             deterministic_kernel_class,
@@ -733,15 +738,37 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
     assert FlashAttentionDSABackwardSm100DeterministicCluster8.q_wave_ctas == 128
     assert FlashAttentionDSABackwardSm100DeterministicCluster8.dkv_cluster_shape == (8, 1, 1)
     assert FlashAttentionDSABackwardSm100DeterministicCluster8.dkv_mask_rows_per_word == 4
+    assert FlashAttentionDSABackwardSm100DeterministicCluster16.num_dkv_shards == 8
+    assert FlashAttentionDSABackwardSm100DeterministicCluster16.q_wave_ctas == 128
+    assert FlashAttentionDSABackwardSm100DeterministicCluster16.dkv_cluster_shape == (16, 1, 1)
+    assert FlashAttentionDSABackwardSm100DeterministicCluster16.dkv_mask_rows_per_word == 2
     assert use_cluster_dkv_relay(16384, 278528, 576)
     assert use_cluster_dkv_relay(16384, 131072, 576)
     assert not use_cluster_dkv_relay(128, 131072, 576)
-    assert deterministic_dkv_relay_cluster_size(8191) == 8
-    assert deterministic_dkv_relay_cluster_size(8192) == 4
+    assert deterministic_dkv_relay_cluster_size(8191, 65537, 512) == 8
+    assert deterministic_dkv_relay_cluster_size(8192, 65537, 512) == 4
+    assert deterministic_dkv_relay_cluster_size(16384, 278528, 576) == 4
+    assert deterministic_dkv_relay_cluster_size(16384, 524288, 576) == 16
+    assert deterministic_dkv_relay_cluster_size(16384, 1048576, 576) == 16
+    assert deterministic_dkv_relay_cluster_size(16384, 1048576, 512) == 16
+    assert _relay_workspace_bytes(16384, 453432, 576, 64, 4) <= _RELAY_WORKSPACE_BUDGET_BYTES
+    assert _relay_workspace_bytes(16384, 453433, 576, 64, 4) > _RELAY_WORKSPACE_BUDGET_BYTES
+    assert deterministic_dkv_relay_cluster_size(16384, 453432, 576) == 4
+    assert deterministic_dkv_relay_cluster_size(16384, 453433, 576) == 16
+    for kernel_cls in (
+        FlashAttentionDSABackwardSm100DeterministicCluster4,
+        FlashAttentionDSABackwardSm100DeterministicCluster8,
+        FlashAttentionDSABackwardSm100DeterministicCluster16,
+    ):
+        dkv_shape = kernel_cls._get_workspace_size_dKV_for_q(16384, 524288, 576, 64, 1, cutlass.Float32)
+        assert math.prod(dkv_shape) == _relay_workspace_bytes(16384, 524288, 576, 64, kernel_cls.dkv_relay_cluster_size)
     assert deterministic_kernel_class(8191, 65537, 512) is FlashAttentionDSABackwardSm100DeterministicCluster8
     assert deterministic_kernel_class(8192, 65537, 512) is FlashAttentionDSABackwardSm100DeterministicCluster4
+    assert deterministic_kernel_class(16384, 524288, 576) is FlashAttentionDSABackwardSm100DeterministicCluster16
+    assert deterministic_kernel_class(16384, 1048576, 576) is FlashAttentionDSABackwardSm100DeterministicCluster16
     assert _deterministic_kernel_class_for_config(16, 8) is FlashAttentionDSABackwardSm100DeterministicCluster8
     assert _deterministic_kernel_class_for_config(32, 4) is FlashAttentionDSABackwardSm100DeterministicCluster4
+    assert _deterministic_kernel_class_for_config(8, 16) is FlashAttentionDSABackwardSm100DeterministicCluster16
     # The cap is inclusive: switch only when the selected ordinary layout is
     # strictly larger than 16 GiB. Exercise every adaptive shard boundary.
     for s_q, boundary_k in ((128, 262144), (129, 131072), (257, 65536)):
@@ -758,7 +785,9 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
     with pytest.raises(ValueError, match="at least one query row"):
         deterministic_dkv_shards(0)
     with pytest.raises(ValueError, match="at least one query row"):
-        deterministic_dkv_relay_cluster_size(0)
+        deterministic_dkv_relay_cluster_size(0, 256, 576)
+    with pytest.raises(ValueError, match="positive KV, head-dimension, and head-count extents"):
+        deterministic_dkv_relay_cluster_size(128, 0, 576)
     with pytest.raises(ValueError, match="inconsistent deterministic dKV relay configuration"):
         _deterministic_kernel_class_for_config(16, 4)
     with pytest.raises(ValueError, match="unsupported deterministic dKV relay cluster size"):
@@ -829,6 +858,7 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_workspace_respects_ba
         pytest.param(8191, 65537, 64, id="cluster8-policy-boundary"),
         pytest.param(8192, 65537, 64, id="cluster4-policy-boundary"),
         pytest.param(16384, 278528, 64, id="one-million-cp64"),
+        pytest.param(16384, 1048576, 64, id="memory-first-cluster16"),
     ],
 )
 def test_DSA_sparse_attention_backward_sm100_large_context_workspace_uses_cluster_masks(s_q, s_kv, num_heads):
@@ -840,7 +870,7 @@ def test_DSA_sparse_attention_backward_sm100_large_context_workspace_uses_cluste
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     head_dim = 576
-    kernel_cls = deterministic_kernel_class(s_q, s_kv, head_dim)
+    kernel_cls = deterministic_kernel_class(s_q, s_kv, head_dim, num_heads)
     padded_q = math.ceil(s_q / 8) * 8
     padded_kv = math.ceil(s_kv / 8) * 8
     num_waves = math.ceil(s_q / kernel_cls.q_wave_ctas)
@@ -938,7 +968,7 @@ def _exercise_deterministic_sm100_case(
     api.compile()
     assert api.scratch_workspace_bytes() == workspace_bytes
     expected_lse_odo_bytes = num_heads * math.ceil(s_q / 8) * 8 * 2 * torch.float32.itemsize
-    kernel_cls = _get_sm100_kernel_class(backend, True, s_q, s_kv, head_dim)
+    kernel_cls = _get_sm100_kernel_class(backend, True, s_q, s_kv, head_dim, num_heads)
     if expected_relay_cluster_size is not None:
         assert kernel_cls.dkv_relay_cluster_size == expected_relay_cluster_size
     if hasattr(kernel_cls, "_get_workspace_size_dKV_for_q"):
@@ -1314,6 +1344,55 @@ def test_DSA_sparse_attention_backward_sm100_cluster4_repeat100():
             check_graph=True,
             check_short_workspace=True,
             expected_relay_cluster_size=4,
+        )
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+
+@pytest.mark.L2
+@torch_fork_set_rng(seed=427)
+def test_DSA_sparse_attention_backward_sm100_cluster16_repeat100():
+    """Memory-first sixteen-CTA relays remain exact under graph replay."""
+    try:
+        _exercise_deterministic_sm100_case(
+            64,
+            512,
+            8192,
+            1048576,
+            repeats=100,
+            topk=64,
+            strided_topk=True,
+            check_graph=True,
+            check_short_workspace=True,
+            expected_relay_cluster_size=16,
+        )
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+
+@pytest.mark.L2
+@torch_fork_set_rng(seed=428)
+@pytest.mark.parametrize(
+    "num_heads,head_dim,s_kv,topk,shared_topk,has_topk_length",
+    [
+        pytest.param(64, 576, 524288, 129, False, True, id="d576-tail-variable-lengths"),
+        pytest.param(96, 512, 524288, 64, True, False, id="two-head-blocks-high-overlap"),
+    ],
+)
+def test_DSA_sparse_attention_backward_sm100_cluster16_boundaries(num_heads, head_dim, s_kv, topk, shared_topk, has_topk_length):
+    """Memory-first relays cover the D576 tail and serialized head blocks."""
+    try:
+        _exercise_deterministic_sm100_case(
+            num_heads,
+            head_dim,
+            8192,
+            s_kv,
+            repeats=3,
+            topk=topk,
+            shared_topk=shared_topk,
+            strided_topk=not shared_topk,
+            has_topk_length=has_topk_length,
+            expected_relay_cluster_size=16,
         )
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")

@@ -46,7 +46,7 @@ def _workspace_shapes_sm100(
     )
     if deterministic:
         if backend == "generic_m64":
-            dkv_kernel_cls = deterministic_kernel_class(total_s_q, total_s_kv, head_dim)
+            dkv_kernel_cls = deterministic_kernel_class(total_s_q, total_s_kv, head_dim, num_heads)
         elif backend in {"h96_d576_2cta_m64", "h128_d576_2cta_m64"}:
             from .dsa_bwd_sm100_h128_d576_2cta_deterministic import TwoCTADeterministicReduction
 
@@ -128,7 +128,9 @@ def flash_attn_bwd_sm100_workspace_size(
 
     The generic deterministic M64 backend selects 32, 64, or 128 dKV planes
     for ordinary extents. If that policy would exceed 16 GiB, it selects a
-    16- or 32-plane cluster relay and adds packed per-wave KV-row rank masks.
+    8-, 16-, or 32-plane cluster relay and adds packed per-wave KV-row rank
+    masks. It switches to the eight-plane cluster-16 layout when the preferred
+    relay would exceed its memory-first scratch budget.
     H96/H128 D576 two-CTA backends use a compact 96-plane layout; unspecified
     backends use the conservative fixed 128-plane layout. The result includes
     alignment padding and is the minimum byte count for a contiguous

@@ -321,6 +321,7 @@ class SparseAttentionBackward(APIBase):
                 total_s_q,
                 self.kv_desc.shape[0],
                 head_dim,
+                num_heads,
             )
             shards = kernel_cls.num_dkv_shards
             relay_cluster_size = getattr(kernel_cls, "dkv_relay_cluster_size", 1)
@@ -365,11 +366,12 @@ class SparseAttentionBackward(APIBase):
 
         Generic deterministic SM100 plans include a query-dependent 32-, 64-,
         or 128-plane FP32 dKV accumulator. Large-context plans that would
-        exceed 16 GiB instead use 16 or 32 planes plus packed row-relay masks.
-        Deterministic H96/H128 D576 two-CTA plans use the compact 96-plane
-        capacity. The returned size is authoritative for this plan;
-        ``execute()`` accepts a larger contiguous uint8 buffer on the plan
-        device but never allocates one.
+        exceed 16 GiB instead use 8, 16, or 32 planes plus packed row-relay
+        masks; the eight-plane memory-first tier is selected when the preferred
+        relay would exceed 32 GiB. Deterministic H96/H128 D576 two-CTA plans use
+        the compact 96-plane capacity. The returned size is authoritative for
+        this plan; ``execute()`` accepts a larger contiguous uint8 buffer on the
+        plan device but never allocates one.
         """
         self._ensure_support_checked()
         major, _ = device_capability(self.q_desc.device)
