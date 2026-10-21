@@ -278,7 +278,18 @@ D128_INTRA_WG_OVERLAP: bool = True
 # non-causal shapes only): the same day, on another H100 SXM, a development copy of this loop, which this loop matched
 # within the copy's band on the six decision shapes, ran three long causal shapes at 0.889-0.922x the one-tile kernel
 # with a stride by the grid (b4 h8/8 s8192, b1 h16/4 s8192, b2 h32/32 s4096; only the first by more than its band).
+# D128_PERSISTENT_CAUSAL_WALK below can put causal plans on the persistent loop as well; at its default, 0, they stay
+# one tile per CTA.
 D128_PERSISTENT: bool = True
+# Causal D128 plans on the persistent loop (config_sm90.TemplateParams.causal_walk). A CALL-TIME module constant like
+# D128_PERSISTENT above, read by check_support (_sm90_d128_persistence) for causal D128 plans only, and only while
+# D128_INTRA_WG_OVERLAP and D128_PERSISTENT are on: 0 keeps a causal plan one tile per CTA, 1 runs it on the persistent
+# loop with the stride by the grid (causal_walk 0), 2 on the paired walk (causal_walk 1). An int, not a bool, so that
+# either walk can be selected. Every value computes the one-tile kernel's O and Stats bit for bit
+# (test_sdpa_fwd_d128_sm90.py::test_d128_persistent_is_bitwise_ov runs the persistent records on causal cases), so
+# this is a speed choice. 0 until both walks are measured against the one-tile kernel on causal shapes: the stride ran
+# three long causal shapes at 0.889-0.922x it (D128_PERSISTENT's comment).
+D128_PERSISTENT_CAUSAL_WALK: int = 0
 # The d128 f16/bf16 DECODE tile (TILES_Q=1, cga1, one softmax warpgroup, three
 # KV stages -- config_sm100.CfgD128Decode): what a (128, 128) plan with
 # TILE_CGA_M=1 lowers to on dense graphs.  cga1 on this flavor IS the decode
@@ -502,6 +513,18 @@ def _causal_sched_policy(s_kv: int, d_qk: int, d_v: int, elem_bytes: int) -> int
     """SCHED_LPT_L2 vs SCHED_LPT for a causal graph (see _SCHED_L2_BUDGET_BYTES)."""
     one_head_bytes = int(s_kv) * (int(d_qk) + int(d_v)) * int(elem_bytes)
     return SCHED_LPT_L2 if _SCHED_L2_BUDGET_BYTES >= one_head_bytes else SCHED_LPT
+
+
+def _sm90_d128_persistence(flavor: tuple[int, int], causal: bool) -> tuple[bool, int]:
+    """``(TemplateParams.persistent, TemplateParams.causal_walk)`` of an SM90 plan of ``flavor``, from the D128 switch
+    constants above, read at call time: persistent on D128 under overlap for every non-causal plan, and for a causal
+    plan only when D128_PERSISTENT_CAUSAL_WALK picks a persistent walk; causal_walk 1 exactly when it picks the paired
+    walk. A D512 plan carries neither."""
+    walk = D128_PERSISTENT_CAUSAL_WALK
+    if type(walk) is not int or walk not in (0, 1, 2):
+        raise ValueError(f"api_dsl.D128_PERSISTENT_CAUSAL_WALK must be 0, 1 or 2; got {walk!r}")
+    persistent = flavor == _SM90_D128_FLAVOR and D128_INTRA_WG_OVERLAP and D128_PERSISTENT and (not causal or walk > 0)
+    return persistent, int(persistent and causal and walk == 2)
 
 
 class WorkspaceCarver:
@@ -5851,8 +5874,8 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             tokens_per_tile = tile_m // pack_g
             units = b * packed_heads * ((s_q + tokens_per_tile - 1) // tokens_per_tile)
             self._not_implemented_error_if(max(b * self.split_kv, units) >= 2**31, "SM90 split-KV batch planes and flat grid must fit positive Int32")
-        # D128 only, read at call time (the module constants above); non-causal plans only.
-        persistent = self.flavor == _SM90_D128_FLAVOR and D128_INTRA_WG_OVERLAP and D128_PERSISTENT and not band["causal"]
+        # D128 only, read at call time (the module constants above); causal plans as D128_PERSISTENT_CAUSAL_WALK says.
+        persistent, causal_walk = _sm90_d128_persistence(self.flavor, band["causal"])
         self.params = Sm90TemplateParams(
             dtype_qkv=DTYPE_BF16 if self.q_desc.dtype == torch.bfloat16 else DTYPE_FP16,
             head_tile=next(width for width in (128, 256, 512) if max(d_qk, d_v) <= width),
@@ -5871,8 +5894,9 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             page_size=self.paged_page_size,
             # D128 only: the overlap switch, read at call time (module constant above).
             intra_wg_overlap=self.flavor == _SM90_D128_FLAVOR and D128_INTRA_WG_OVERLAP,
-            # D128 only: the persistent-loop switch.
+            # D128 only: the persistent-loop switch and, on a causal plan, its walk.
             persistent=persistent,
+            causal_walk=causal_walk,
         )
         self._native_d64 = False
         if (d_qk, d_v) == (64, 64) and not self.paged:

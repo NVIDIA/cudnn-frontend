@@ -512,34 +512,35 @@ def _admitted(fields):
 
 
 def test_d128_switch_fields_are_appended_last():
-    """The overlap switch, then the persistent switch, are appended after thd_origins, each defaulting to False:
-    every earlier specialization keeps its defaults (the append-only rule). The segment is pinned from its own first
-    field, so a field appended after it later still passes."""
+    """The overlap switch, the persistent switch, then the causal walk are appended after thd_origins, defaulting to
+    False, False and 0 (the stride by the grid): every earlier specialization keeps its defaults (the append-only
+    rule). The segment is pinned from its own first field, so a field appended after it later still passes."""
     from cudnn.sdpa.fwd import config_sm90 as c
 
     fields = dataclasses.fields(c.TemplateParams)
     names = [f.name for f in fields]
     start = names.index("intra_wg_overlap")
     assert start > names.index("thd_origins"), names
-    expected = [("intra_wg_overlap", False, bool), ("persistent", False, bool)]
+    expected = [("intra_wg_overlap", False, bool), ("persistent", False, bool), ("causal_walk", 0, int)]
     assert [(f.name, f.default, type(f.default)) for f in fields[start : start + len(expected)]] == expected
 
 
 @pytest.mark.parametrize(
-    ("switch", "needs", "why"),
+    ("switch", "value", "needs", "why"),
     [
-        pytest.param("intra_wg_overlap", {}, "SM90 D512 has no intra-warpgroup overlap switch", id="overlap"),
-        pytest.param("persistent", dict(intra_wg_overlap=True), "SM90 D512 has no persistent switch", id="persistent"),
+        pytest.param("intra_wg_overlap", True, {}, "SM90 D512 has no intra-warpgroup overlap switch", id="overlap"),
+        pytest.param("persistent", True, dict(intra_wg_overlap=True), "SM90 D512 has no persistent switch", id="persistent"),
+        pytest.param("causal_walk", 1, dict(causal=True, intra_wg_overlap=True, persistent=True), "SM90 D512 has no causal walk switch", id="causal-walk"),
     ],
 )
-def test_d512_refuses_the_d128_switches(switch, needs, why):
+def test_d512_refuses_the_d128_switches(switch, value, needs, why):
     """Every switch is a D128 template field: D512 refuses it alone (the overlap message keeps its spelling), and D128
-    takes it with the switch it requires."""
+    takes it with the switches it requires."""
     from cudnn.sdpa.fwd import config_sm90 as c
 
     with pytest.raises(ValueError, match=f"^{why}"):
-        c.validate_params(_record(**{switch: True}))
-    c.validate_params(_record(**needs, **{switch: True}), flavor=c.D128_FLAVOR)
+        c.validate_params(_record(**{switch: value}))
+    c.validate_params(_record(**needs, **{switch: value}), flavor=c.D128_FLAVOR)
 
 
 def test_d128_persistent_refuses_a_record_without_overlap():
@@ -553,6 +554,42 @@ def test_d128_persistent_refuses_a_record_without_overlap():
         c.validate_params(_record(persistent=True), flavor=c.D128_FLAVOR)
     with pytest.raises(ValueError, match=why):
         _load_kernel_template("sm90/prefill_d128_f16.py", _record(persistent=True), tag="persistent_refusal_probe_sm90_d128")
+
+
+_CAUSAL_PERSISTENT = dict(causal=True, intra_wg_overlap=True, persistent=True)
+
+
+@pytest.mark.parametrize(
+    ("fields", "why"),
+    [
+        pytest.param(dict(causal=True, intra_wg_overlap=True, causal_walk=1), "^SM90 D128 causal_walk=1 requires persistent and causal", id="one-tile"),
+        pytest.param(dict(intra_wg_overlap=True, persistent=True, causal_walk=1), "^SM90 D128 causal_walk=1 requires persistent and causal", id="dense"),
+        pytest.param(dict(_CAUSAL_PERSISTENT, causal_walk=2), "^SM90 D128 causal_walk must be 0", id="two"),
+        pytest.param(dict(_CAUSAL_PERSISTENT, causal_walk=-1), "^SM90 D128 causal_walk must be 0", id="negative"),
+        pytest.param(dict(_CAUSAL_PERSISTENT, causal_walk=True), "^SM90 D128 causal_walk must be 0", id="bool"),
+    ],
+)
+def test_d128_causal_walk_is_the_int_0_or_1_on_a_persistent_causal_record(fields, why):
+    """causal_walk names the walk of a persistent causal record: D128 refuses the paired walk (1) on a one-tile record
+    and on a dense one, and refuses any value but the ints 0 and 1 (a bool True included, though it equals 1); a
+    persistent causal record takes either walk."""
+    from cudnn.sdpa.fwd import config_sm90 as c
+
+    with pytest.raises(ValueError, match=why):
+        c.validate_params(_record(**fields), flavor=c.D128_FLAVOR)
+    for walk in (0, 1):
+        c.validate_params(_record(**_CAUSAL_PERSISTENT, causal_walk=walk), flavor=c.D128_FLAVOR)
+
+
+def test_each_causal_walk_is_its_own_module_and_digest():
+    """A persistent causal record's two walks are two modules with two digests (two compile keys) in one process, each
+    carrying its value as CAUSAL_WALK; the stride is the module the persistent causal record loads by default."""
+    from cudnn.sdpa.fwd.api_dsl import _load_kernel_template
+
+    mods = [_load_kernel_template("sm90/prefill_d128_f16.py", _record(**_CAUSAL_PERSISTENT, causal_walk=walk), tag="walk_probe_sm90_d128") for walk in (0, 1)]
+    assert [mod.CAUSAL_WALK for mod in mods] == [0, 1]
+    assert len({id(m) for m in mods}) == len({m.FROST_SOURCE_DIGEST for m in mods}) == 2
+    assert _load_kernel_template("sm90/prefill_d128_f16.py", _record(**_CAUSAL_PERSISTENT), tag="walk_probe_sm90_d128") is mods[0]
 
 
 def test_each_switch_combination_is_its_own_module_and_digest():
@@ -611,12 +648,36 @@ def test_sm90_persistent_cta_count_is_the_sm_count_and_ignores_the_thd_overrides
 
 def test_d128_ships_persistence_over_the_overlap_loop():
     """The shipped D128 switches, api_dsl's constants as committed: intra-warpgroup overlap and, over it, persistence,
-    which check_support writes into dense plans only (test_d128_ships_the_persistent_loop_on_dense_plans_only in
-    test_sdpa_fwd_d128_sm90.py runs both masks on an SM90 GPU). The measurement behind the default is D128_PERSISTENT's
-    comment; changing either value changes this test."""
+    which check_support writes into dense plans only, causal plans staying one tile per CTA
+    (test_d128_ships_the_persistent_loop_on_dense_plans_only in test_sdpa_fwd_d128_sm90.py runs both masks on an SM90
+    GPU). The measurements behind the defaults are D128_PERSISTENT's and D128_PERSISTENT_CAUSAL_WALK's comments;
+    changing any value changes this test."""
     from cudnn.sdpa.fwd import api_dsl
 
-    assert (api_dsl.D128_INTRA_WG_OVERLAP, api_dsl.D128_PERSISTENT) == (True, True)
+    assert (api_dsl.D128_INTRA_WG_OVERLAP, api_dsl.D128_PERSISTENT, api_dsl.D128_PERSISTENT_CAUSAL_WALK) == (True, True, 0)
+
+
+def test_d128_causal_plans_take_the_walk_the_constant_names(monkeypatch):
+    """check_support's persistence decision (_sm90_d128_persistence) over every value of the three D128 switch
+    constants and both masks: D128_PERSISTENT_CAUSAL_WALK 0 keeps a causal plan one tile per CTA, 1 makes it persistent
+    on the stride by the grid (causal_walk 0) and 2 on the paired walk (causal_walk 1), each only under overlap and
+    persistence; a non-causal plan ignores it, a D512 plan carries neither switch, every record it names validates, and
+    a value outside 0, 1 and 2 is refused. Host-only: the decision reads the constants alone."""
+    from cudnn.sdpa.fwd import api_dsl, config_sm90 as c
+
+    for overlap, persistent, walk, causal in itertools.product((False, True), (False, True), (0, 1, 2), (False, True)):
+        monkeypatch.setattr(api_dsl, "D128_INTRA_WG_OVERLAP", overlap)
+        monkeypatch.setattr(api_dsl, "D128_PERSISTENT", persistent)
+        monkeypatch.setattr(api_dsl, "D128_PERSISTENT_CAUSAL_WALK", walk)
+        on = overlap and persistent and (not causal or walk > 0)
+        got = api_dsl._sm90_d128_persistence(c.D128_FLAVOR, causal)
+        assert got == (on, int(on and causal and walk == 2)), (overlap, persistent, walk, causal, got)
+        c.validate_params(_record(causal=causal, intra_wg_overlap=overlap, persistent=got[0], causal_walk=got[1]), flavor=c.D128_FLAVOR)
+        assert api_dsl._sm90_d128_persistence(c.D512_FLAVOR, causal) == (False, 0)
+    for bad in (3, -1, True, 2.0):
+        monkeypatch.setattr(api_dsl, "D128_PERSISTENT_CAUSAL_WALK", bad)
+        with pytest.raises(ValueError, match="D128_PERSISTENT_CAUSAL_WALK must be 0, 1 or 2"):
+            api_dsl._sm90_d128_persistence(c.D128_FLAVOR, True)
 
 
 # --- Persistent walk: the Q protocol and source pins (host-only, no trace) -------

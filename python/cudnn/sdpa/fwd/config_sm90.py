@@ -226,8 +226,18 @@ class TemplateParams:
     # next item's first K tile and Q while the current item finishes (persistent_ctas is a compile() argument the adapter
     # sizes to the SM count). It requires intra_wg_overlap, so the v1 loop stays the non-persistent reference, and it
     # computes the one-tile-per-CTA overlap kernel's O and Stats bit for bit. SdpaFwdDslSm90 sets the shipped value
-    # (api_dsl.D128_PERSISTENT) on non-causal D128 plans only: causal plans stay one tile per CTA. D512 refuses it.
+    # (api_dsl.D128_PERSISTENT) on non-causal D128 plans, and on causal ones only as api_dsl.D128_PERSISTENT_CAUSAL_WALK
+    # says (causal_walk below; at its default, 0, causal plans stay one tile per CTA). D512 refuses it.
     persistent: bool = False
+    # Causal walk of the D128 persistent loop, appended after the persistent switch so every earlier specialization
+    # keeps its default (0: the stride by the grid over the sched_policy order). 1 is the paired walk: of each (head,
+    # batch)'s T Q tiles, tiles light_rows to T - 1 go out in pairs of equal KV work on an aligned causal staircase
+    # (tile T - 1 - j with tile light_rows + j; two groups' middle tiles pair up when T - light_rows is odd), then tiles
+    # light_rows - 1 down to 0 one at a time, in rounds dealt to the CTAs in alternating directions, with light_rows set
+    # at compile time from the declared shape and CTA count (or the stride, where it balances better). It requires
+    # persistent and causal, and computes the one-tile-per-CTA overlap kernel's O and Stats bit for bit. SdpaFwdDslSm90
+    # sets it from api_dsl.D128_PERSISTENT_CAUSAL_WALK on causal D128 plans only. D512 refuses it.
+    causal_walk: int = 0
 
 
 # The ports of ``TemplateParams.thd_origins``, in order.
@@ -264,11 +274,12 @@ def validate_params(params: TemplateParams, flavor: tuple[int, int] = D512_FLAVO
     """Validate the immutable specialization before constructing a kernel.
 
     ``flavor`` names the template asking. D512 (the default) runs the checks below
-    unchanged, messages included, and refuses the D128 template's overlap and
-    persistent switches. D128 first refuses its ``NOT_SERVED`` features (the declarations
-    pick_flavor keeps on D512, so the adapter never reaches this refusal), then
-    persistence without intra-warpgroup overlap, then runs the same checks under its
-    own name.
+    unchanged, messages included, and refuses the D128 template's overlap, persistent
+    and causal walk switches. D128 first refuses its ``NOT_SERVED`` features (the
+    declarations pick_flavor keeps on D512, so the adapter never reaches this refusal),
+    then persistence without intra-warpgroup overlap, then a causal walk other than 0
+    and 1 and the paired walk outside a persistent causal record, then runs the same
+    checks under its own name.
     """
     if flavor == D128_FLAVOR:
         declared = declared_features(
@@ -290,8 +301,14 @@ def validate_params(params: TemplateParams, flavor: tuple[int, int] = D512_FLAVO
         raise ValueError("SM90 D512 has no intra-warpgroup overlap switch; it is a D128 template field")
     if flavor == D512_FLAVOR and params.persistent:
         raise ValueError("SM90 D512 has no persistent switch; it is a D128 template field")
+    if flavor == D512_FLAVOR and params.causal_walk:
+        raise ValueError("SM90 D512 has no causal walk switch; it is a D128 template field")
     if params.persistent and not params.intra_wg_overlap:
         raise ValueError("SM90 D128 persistent requires intra_wg_overlap; the v1 loop stays the non-persistent reference")
+    if type(params.causal_walk) is not int or params.causal_walk not in (0, 1):
+        raise ValueError(f"SM90 D128 causal_walk must be 0 (the stride by the grid) or 1 (the paired walk); got {params.causal_walk!r}")
+    if params.causal_walk and not (params.persistent and params.causal):
+        raise ValueError("SM90 D128 causal_walk=1 requires persistent and causal: it orders a causal plan's persistent walk")
     name = f"SM90 D{flavor[0]}"
     tile_m = FLAVOR_TILES[flavor][0]
     if type(params.page_size) is not int or params.page_size < 0:

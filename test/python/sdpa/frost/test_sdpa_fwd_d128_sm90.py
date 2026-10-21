@@ -68,9 +68,10 @@ def _inputs(b, h_q, h_kv, s_q, s_kv, dtype):
     return _bhsd(b, h_q, s_q, _D, dtype), _bhsd(b, h_kv, s_kv, _D, dtype), _bhsd(b, h_kv, s_kv, _D, dtype)
 
 
-# The overlap and persistent switch fields (config_sm90.TemplateParams). A variant names the ones it turns on; _plan
-# sets every other one False, so a variant never inherits the adapter's shipped values.
-_SWITCHES = ("intra_wg_overlap", "persistent")
+# The overlap, persistent and causal walk switch fields (config_sm90.TemplateParams). A variant names the ones it turns
+# on; _plan sets every other one off (False, or 0 for the causal walk), so a variant never inherits the adapter's
+# shipped values.
+_SWITCHES = ("intra_wg_overlap", "persistent", "causal_walk")
 _VARIANTS = {"v1": (), "ov": ("intra_wg_overlap",), "pa": ("intra_wg_overlap", "persistent")}
 # The persistent variants: each must compute ov's O and Stats bit for bit.
 _PERSISTENT = ("pa",)
@@ -81,8 +82,9 @@ _FORCED_GRIDS = (1, 2, 3, 131)
 
 
 def _switches(variant):
-    """``variant``'s whole switch record: each _SWITCHES field, True exactly when the variant names it."""
-    return {name: name in _VARIANTS[variant] for name in _SWITCHES}
+    """``variant``'s whole switch record: each _SWITCHES field on exactly when the variant names it (True, or 1 for the
+    causal walk's int)."""
+    return {name: int(name in _VARIANTS[variant]) if name == "causal_walk" else name in _VARIANTS[variant] for name in _SWITCHES}
 
 
 def _counts(variant):
@@ -856,22 +858,24 @@ def test_d128_turns_and_rings_complete_in_a_watchdogged_child(variant):
 @pytest.mark.L0
 def test_d128_adapter_applies_the_shipped_switches(monkeypatch):
     """check_support writes api_dsl's D128 switch constants into a D128 plan's record at call time: persistence only
-    under overlap, and only on a dense plan (causal plans stay one tile per CTA). A D512 plan (tile 64/64 pinned) never
-    carries either switch."""
+    under overlap, on a dense plan always and on a causal plan as D128_PERSISTENT_CAUSAL_WALK says (0 one tile per CTA,
+    1 the stride by the grid, 2 the paired walk). A D512 plan (tile 64/64 pinned) never carries a switch."""
     import itertools
 
     from cudnn.sdpa.fwd import api_dsl
 
     q, k, v = _inputs(1, 2, 2, 64, 128, torch.float16)
     o = torch.empty_like(q)
-    for overlap, persistent, causal in itertools.product((False, True), repeat=3):
+    for overlap, persistent, walk, causal in itertools.product((False, True), (False, True), (0, 1, 2), (False, True)):
         monkeypatch.setattr(api_dsl, "D128_INTRA_WG_OVERLAP", overlap)
         monkeypatch.setattr(api_dsl, "D128_PERSISTENT", persistent)
+        monkeypatch.setattr(api_dsl, "D128_PERSISTENT_CAUSAL_WALK", walk)
         mask = dict(is_causal=True) if causal else {}
         api = api_dsl.SdpaFwdDslSm90(q, k, v, o, **mask)
         assert api.check_support() and api.flavor == (128, 128), api.flavor
+        on = overlap and persistent and (not causal or walk > 0)
         got = {name: getattr(api.params, name) for name in _SWITCHES}
-        assert got == dict(intra_wg_overlap=overlap, persistent=overlap and persistent and not causal), (causal, got)
+        assert got == dict(intra_wg_overlap=overlap, persistent=on, causal_walk=int(on and causal and walk == 2)), (causal, walk, got)
         d512 = api_dsl.SdpaFwdDslSm90(q, k, v, o, tile_m=64, tile_n=64, **mask)
         assert d512.check_support() and d512.flavor == (512, 512), d512.flavor
         assert not any(getattr(d512.params, name) for name in _SWITCHES), d512.params
@@ -920,7 +924,7 @@ def test_d128_ships_the_persistent_loop_on_dense_plans_only():
     for causal in (False, True):
         mask = dict(is_causal=True) if causal else {}
         api, o, lse = _plan(q, k, v, stats=True, **mask)
-        assert (api._k_mod.INTRA_WG_OVERLAP, api._k_mod.PERSISTENT) == (True, not causal), causal
+        assert (api._k_mod.INTRA_WG_OVERLAP, api._k_mod.PERSISTENT, api._k_mod.CAUSAL_WALK) == (True, not causal, 0), causal
         if not causal:
             assert api._persistent_ctas(q.device) == torch.cuda.get_device_properties(q.device).multi_processor_count
         api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse)

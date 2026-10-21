@@ -112,6 +112,9 @@ INTRA_WG_OVERLAP: bool = PARAMS.intra_wg_overlap
 # Persistent-loop switch, read the same way: each value is its own module, digest and compile key. False is one work
 # tile per CTA; validate_params above has refused True without intra_wg_overlap.
 PERSISTENT: bool = PARAMS.persistent
+# Causal walk switch, read the same way: 0 is the stride by the grid, 1 the paired walk; validate_params above has
+# refused 1 outside a persistent causal record.
+CAUSAL_WALK: int = PARAMS.causal_walk
 
 
 @dsl_user_op
