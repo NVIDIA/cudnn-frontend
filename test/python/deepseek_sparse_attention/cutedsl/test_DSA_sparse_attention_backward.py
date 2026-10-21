@@ -945,6 +945,86 @@ def test_DSA_sparse_attention_backward_sm100_d576_two_cta_repeat1000(num_heads):
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
 
+@pytest.mark.L2
+def test_DSA_sparse_attention_backward_sm100_h96_d576_uses_i64_query_offsets():
+    """The first Q extent past INT32 element addressing stays finite and exact."""
+    _require_sm100()
+    if torch.cuda.get_device_capability() not in _TWO_CTA_CAPABILITIES:
+        pytest.skip("H96/D576 two-CTA requires compute capability 10.0 or 10.3")
+    try:
+        from cuda.bindings import driver as cuda
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    num_heads, head_dim, head_dim_v, topk = 96, 576, 512, 2048
+    i32_max = torch.iinfo(torch.int32).max
+    s_q = i32_max // (num_heads * head_dim) + 1
+    assert (s_q - 1) * num_heads * head_dim <= i32_max < s_q * num_heads * head_dim
+    device = torch.device("cuda")
+    try:
+        q = torch.zeros((s_q, num_heads, head_dim), dtype=torch.bfloat16, device=device)
+        kv = torch.zeros((topk, head_dim), dtype=torch.bfloat16, device=device)
+        out = torch.zeros((s_q, num_heads, head_dim_v), dtype=torch.bfloat16, device=device)
+        dout = torch.full_like(out, 1.0 / s_q)
+        lse = torch.zeros((s_q, num_heads), dtype=torch.float32, device=device)
+        attn_sink = torch.full((num_heads,), -math.inf, dtype=torch.float32, device=device)
+        topk_idxs = torch.zeros((s_q, topk), dtype=torch.int32, device=device)
+        topk_length = torch.ones((s_q,), dtype=torch.int32, device=device)
+    except torch.OutOfMemoryError:
+        pytest.skip("requires enough GPU memory to cross the INT32 query-offset boundary")
+    scale = head_dim**-0.5
+
+    plan = DSA.SparseAttentionBackward(
+        q,
+        kv,
+        out,
+        dout,
+        lse,
+        attn_sink,
+        topk_idxs,
+        sample_topk_length=topk_length,
+        softmax_scale=scale,
+        deterministic=True,
+    )
+    assert plan.check_support()
+    assert plan._backend == "h96_d576_2cta_m64"
+    plan.compile()
+    try:
+        workspace = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device=device)
+        dq, dkv, d_sink = torch.empty_like(q), torch.empty_like(kv), torch.empty_like(attn_sink)
+    except torch.OutOfMemoryError:
+        pytest.skip("requires enough GPU memory to cross the INT32 query-offset boundary")
+    dq.fill_(math.nan)
+    dkv.fill_(math.nan)
+    d_sink.fill_(math.nan)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    actual = plan.execute(
+        q,
+        kv,
+        out,
+        dout,
+        lse,
+        attn_sink,
+        topk_idxs,
+        dq,
+        dkv,
+        topk_length=topk_length,
+        softmax_scale=scale,
+        current_stream=stream,
+        workspace=workspace,
+        d_sink=d_sink,
+    )
+    assert actual == (dq, dkv, d_sink)
+    assert torch.count_nonzero(dq).item() == 0
+    expected_dv = torch.tensor(float(dout[0, 0, 0]) * s_q * num_heads, dtype=torch.bfloat16, device=device)
+    assert torch.count_nonzero(dkv[0, :head_dim_v] != expected_dv).item() == 0
+    assert torch.count_nonzero(dkv[0, head_dim_v:]).item() == 0
+    assert torch.count_nonzero(dkv[1:]).item() == 0
+    assert torch.count_nonzero(d_sink).item() == 0
+
+
 @pytest.mark.L1
 @torch_fork_set_rng(seed=20261021)
 def test_DSA_sparse_attention_backward_sm100_h96_d576_topk2048_repeat():
