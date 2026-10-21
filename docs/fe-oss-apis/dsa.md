@@ -305,22 +305,35 @@ increased from 89.079 ms to 104.538 ms. At shorter KV extents the narrower
 relays remain preferable, so the policy keeps cluster-4 for `total_S_kv=278528`
 before applying cluster-16 to larger layouts.
 
-At `total_S_kv=1048576` with CP64 (`total_S_q=16384` per launch), D576, and
-the generic M64 deterministic backend, the full scratch comparison is:
+At `total_S_kv=1048576` with CP64 (`total_S_q=16384` per launch), BF16,
+top-k 2048, D576/Dv512, and contiguous inputs, the automatic deterministic
+dispatch comparison is:
 
-| Heads | Dispatch scope | Upstream deterministic | Cluster-16 relay | Saved | Reduction |
-|---:|:---|---:|---:|---:|---:|
-| 16 | automatic generic M64 | 288.002 GiB | 20.002 GiB | 268.000 GiB | 93.1% |
-| 32 | automatic generic M64 | 288.004 GiB | 20.004 GiB | 268.000 GiB | 93.1% |
-| 64 | automatic generic M64 | 288.008 GiB | 20.008 GiB | 268.000 GiB | 93.1% |
-| 96 | generic M64 fallback | 288.012 GiB | 22.012 GiB | 266.000 GiB | 92.4% |
-| 128 | generic M64 fallback | 288.016 GiB | 22.016 GiB | 266.000 GiB | 92.4% |
+| Heads | Automatic route | Upstream scratch / latency | Previous relay scratch / latency | This change scratch / latency | Scratch saved vs upstream | Latency vs previous relay |
+|---:|:---|:---|:---|:---|:---|:---|
+| 16 | generic M64 | 288.002 GiB / OOM | 74.002 GiB / 88.514 ms | 20.002 GiB / 103.846 ms | 268.000 GiB (93.1%) | +17.3% |
+| 32 | generic M64 | 288.004 GiB / OOM | 74.004 GiB / 88.684 ms | 20.004 GiB / 104.011 ms | 268.000 GiB (93.1%) | +17.3% |
+| 64 | generic M64 | 288.008 GiB / OOM | 74.008 GiB / 89.061 ms | 20.008 GiB / 104.569 ms | 268.000 GiB (93.1%) | +17.4% |
+| 96 | D576 two-CTA | 216.012 GiB / OOM | unchanged | 216.012 GiB / OOM | 0 GiB | N/A |
+| 128 | D576 two-CTA | 216.016 GiB / OOM | unchanged | 216.016 GiB / OOM | 0 GiB | N/A |
 
-The H96/H128 rows describe configurations outside their native two-CTA
-fastpath envelope. Contiguous BF16 H96/H128 D576/Dv512 inputs with a supported
-top-k use the existing 96-plane two-CTA deterministic backend, which this
-relay change does not modify. The extra 2 GiB in the H96/H128 generic relay
-rows stores masks for a second ordered M64 head block.
+The measurements use an NVIDIA GB200 with 185.0 GiB usable memory, five
+warm-ups, and 50 timed allocation-free `execute()` calls. The fixed 128-plane
+upstream generic layout and the existing 96-plane D576 two-CTA layouts cannot
+fit this 1M-KV case, so their latency is not measurable on this device. The
+previous-relay column is the cluster-4 predecessor of the memory-first tier,
+not the upstream 128-plane implementation. H96/H128 stay on their existing
+two-CTA fastpath and are deliberately not claimed as savings from this change;
+configurations that select generic M64 receive its adaptive relay policy.
+
+For H64, a three-round, 20-call, reversed-order A/B measured prepared-plan
+eager execution at 104.579 ms and CUDA Graph replay at 104.225 ms (0.997x).
+Capture completed with PyTorch synchronization-debug error mode enabled. The
+cluster-16 regression also passed 100 repeated bitwise executions, graph
+capture/replay with poisoned outputs and workspace, and changed device-side
+`topk_length` values. Compilation and allocation remain plan-time operations;
+capture uses caller-owned outputs and workspace, and replay requires the same
+declared tensor shapes and storage addresses while their contents may change.
 
 `SparseAttentionBackward.scratch_workspace_bytes()` reports the full scratch
 requirement on every backend: the SM100 FP32 statistics and dKV-accumulator

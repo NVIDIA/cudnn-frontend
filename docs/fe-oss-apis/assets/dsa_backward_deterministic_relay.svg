@@ -55,7 +55,7 @@
   <text class="h2" x="125" y="181">Choose the layout at plan time</text>
 
   <rect class="panel-red" x="85" y="205" width="310" height="94" rx="16"/>
-  <text class="h3" x="105" y="233">Upstream large-Q layout</text>
+  <text class="h3" x="105" y="233">Upstream generic M64 layout</text>
   <text class="mono-strong" x="105" y="260">128 CTAs → 128 FP32 planes</text>
   <text class="small" x="105" y="284">1M KV, D576: 288 GiB + statistics</text>
 
