@@ -1282,8 +1282,16 @@ _SPILL_PIN = {"STL": 0, "LDL": 0}
 # the only one the adapter ships it on (one step instance: the masked phases fold away), and the paired walk on the
 # causal body (pairs alone at 64 CTAs: four pairs per group, one unit per CTA) and on its one-Q-tile twin (S_q 100,
 # S_kv 300 at 3 CTAs: middle tiles only, two groups to a unit), the branch whose Q tile walk_item writes as a division
-# so that the item's loop bounds stay run-time values (as a trace-time constant it spilled; walk_item's comment).
-_SASS_CASES = {"v1": ("v1", True), "ov": ("ov", True), "pa-dense": ("pa", False), "pw-causal": ("pw", True), "pw-causal-t1": ("pw", True)}
+# so that the item's loop bounds stay run-time values (as a trace-time constant it spilled; walk_item's comment), and
+# the stride on that one-Q-tile body (NATURAL, 3 CTAs), whose Q tile work_of writes the same way (work_of's comment).
+_SASS_CASES = {
+    "v1": ("v1", True),
+    "ov": ("ov", True),
+    "pa-dense": ("pa", False),
+    "pw-causal": ("pw", True),
+    "pw-causal-t1": ("pw", True),
+    "pa-causal-t1": ("pa", True),
+}
 # A persistent record's CTA count in the probe: below the probe's 128 items, so each CTA walks two. With the count at or
 # above the items every CTA runs one item, and LLVM could fold the item loop away if it ever proved that (the warp-uniform
 # item index keeps it from doing so today); a count below the items pins the loop whatever it proves.
@@ -1291,7 +1299,7 @@ _SASS_CTAS = 64
 # The probe's declared problem (b, h_q, h_kv, s_q, s_kv), and the cases that compile another one at their own CTA
 # count.
 _SASS_SHAPE = (2, 8, 2, 1024, 1024)
-_SASS_SHAPES = {"pw-causal-t1": ((2, 8, 2, 100, 300), 3)}
+_SASS_SHAPES = {"pw-causal-t1": ((2, 8, 2, 100, 300), 3), "pa-causal-t1": ((2, 8, 2, 100, 300), 3)}
 # The walk each paired-walk case compiles (the probe's WALK line: light rows, pairs, middles, lone middle), so that a
 # rule or constant change that moves a case to another branch, or to the stride (-1), fails here instead of pinning
 # another body.
@@ -1304,7 +1312,8 @@ _SASS_WALKS = {"pw-causal": (0, 4, 0, 0), "pw-causal-t1": (0, 0, 1, 0)}
 # 1 to 3 until warp 0's deferred O store wait returns (5). pw-causal is one copy of ov's causal item body inside the
 # item loop (48, 6, 2) with pa-dense's five barriers; it peaks at R232, where the stride peaks at R236 on this body.
 # pw-causal-t1 is the same loop over the one-Q-tile body, whose partial Q tile and ragged KV trace one more step
-# instance (64, 8, 3; ov's one-tile kernel on that shape has the same three).
+# instance (64, 8, 3; ov's one-tile kernel on that shape has the same three); pa-causal-t1, the stride over that body,
+# has the same counts (R234).
 # Body counts are a toolchain fact (python/cudnn/sdpa/AGENTS.md, the LDTM lesson): re-measure on a new toolchain and
 # record it next to the numbers.
 _CODEGEN_PINS = {
@@ -1313,6 +1322,7 @@ _CODEGEN_PINS = {
     "pa-dense": dict(HGMMA=32, DEPBAR=4, DEPBAR_1=1, BAR_SYNC=5, BAR_ARV=0),
     "pw-causal": dict(HGMMA=48, DEPBAR=6, DEPBAR_1=2, BAR_SYNC=5, BAR_ARV=0),
     "pw-causal-t1": dict(HGMMA=64, DEPBAR=8, DEPBAR_1=3, BAR_SYNC=5, BAR_ARV=0),
+    "pa-causal-t1": dict(HGMMA=64, DEPBAR=8, DEPBAR_1=3, BAR_SYNC=5, BAR_ARV=0),
 }
 
 

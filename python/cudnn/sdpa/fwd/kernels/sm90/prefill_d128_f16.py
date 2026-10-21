@@ -1309,6 +1309,13 @@ class SM90FusedMultiHeadAttentionForward:
             tile, group = walk_item(item, walk_unit(item, cta, self.walk), self.walk)
             return self.work_record(tile, group % self.heads, group // self.heads)
         tile = item % self.q_tiles
+        if cutlass.const_expr(self.sched_policy == SCHED_NATURAL and self.q_tiles == 1 and self.mask_flags & MASK_CAUSAL):
+            # One Q tile, causal: the tile is 0 for every item, written as a division by the item count (item < items)
+            # so that it stays a run-time value, as in walk_item's middle-tiles-only branch: as the trace-time constant
+            # 0 it turns the item's loop bounds into constants, and ptxas then keeps values hoisted out of the item loop
+            # live across it, past the register budget (80 B of spills at 3 CTAs in an offline sm_90a compile, ptxas
+            # 13.4; none in this form). The dense body keeps item % q_tiles.
+            tile = item // self.items
         head = (item // self.q_tiles) % self.heads
         batch = item // (self.q_tiles * self.heads)
         if cutlass.const_expr(self.sched_policy == SCHED_LPT_L2):
