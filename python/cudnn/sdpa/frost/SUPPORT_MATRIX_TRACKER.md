@@ -3361,7 +3361,8 @@ page pool; the combination lands with its own accept cells when a serving stack 
 together with the in-block indexer (`index_source="indexer"`: the scorer reads dense `[B, S]` prompts) stays a typed decline naming
 the feature; `thd=True` together with the paged write-through (`paged_kv_page_size`) is served since 2026-10-14 (the stage addresses
 tokens: the packed sparse block builds the same `(4w)` stage at the packed token count, `slot_mapping` `[T]`, and its pools hold the
-slab's post-RoPE rows -- `out` / LSE bitwise the packed sparse block without it).  `fuse_gate=True` composes with `thd=True`
+slab's post-RoPE rows -- `out` / LSE bitwise the packed sparse block without it; the fused prepare knob keeps its own `thd` /
+`kv_source="paged"` declines).  `fuse_gate=True` composes with `thd=True`
 through the block (the GATE is the packed `[1, T, H_q, D]` slab slice like O, gated in the sparse core's epilogue; validated on
 Rubin, bf16 and f16: the gated packed block within one rounding of the activation dtype of the unfused packed block on O, the
 LSE bitwise).

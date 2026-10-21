@@ -63,7 +63,9 @@ def test_importing_cudnn_pulls_no_framework():
 
 @pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="the gated attention block requires torch")
 def test_gated_block_declaration_and_execute_preflight_do_not_import_cache_kernel():
-    """Exercise the public constructor in a fresh process, including on the real DSL floor."""
+    """Exercise the public constructor in a fresh process, including on the real DSL floor -- the write-through declared
+    separately and fused with the norm + RoPE (``fuse_prepare=True``): neither kernel module is imported at declaration or
+    at the execute preflight."""
     modules = _modules("""
 import torch
 from cudnn.gated_attention_block import GatedAttentionBlockFwd, GatedAttentionBlockGeometry
@@ -73,8 +75,8 @@ def empty(*shape):
     return torch.empty(shape, dtype=torch.bfloat16, device="cpu")
 args = (empty(1, 16, 32), empty(2560, 32), empty(256), empty(256),
         empty(1, 16, 64), empty(1, 16, 64), empty(32, 1024), empty(1, 16, 32))
-for page_size in (0, 16):
-    block = GatedAttentionBlockFwd(*args, g, paged_kv_page_size=page_size)
+for page_size, fuse_prepare in ((0, False), (16, False), (16, True)):
+    block = GatedAttentionBlockFwd(*args, g, paged_kv_page_size=page_size, fuse_prepare=fuse_prepare)
     cache_args = {}
     if page_size:
         cache_args = dict(k_cache=empty(1, 1, 16, 256), v_cache=empty(1, 1, 16, 256),
@@ -87,6 +89,7 @@ for page_size in (0, 16):
         raise AssertionError("an uncompiled declaration executed")
 """)
     assert "cudnn.gated_attention_block.kernels.cache_write" not in modules
+    assert "cudnn.gated_attention_block.kernels.qsa_prepare" not in modules
     assert "cudnn.frost.tile_dsl" not in modules
 
 
