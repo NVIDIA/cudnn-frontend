@@ -48,6 +48,8 @@ def _compact_backward(sel_blocks, lo, hi, block_first, block_last, arch, stream,
         from .kernels.bprop_sm100 import NQ, BLK_BITS
 
         total, blocks = sel_blocks.shape
+        if blocks > 1 << BLK_BITS:
+            raise NotImplementedError(f"Paired QSA requires NB <= {1 << BLK_BITS} for block-owner encoding")
         groups = (total + NQ - 1) // NQ
         ids = torch.empty((groups, blocks), dtype=torch.int32, device=sel_blocks.device)
         counts = torch.empty(groups, dtype=torch.int32, device=sel_blocks.device)

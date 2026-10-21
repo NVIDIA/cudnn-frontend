@@ -483,3 +483,17 @@ def test_paired_backward_nonfinite_isolation(supported_gpu, packed):
                 torch.testing.assert_close(grads[name][:stop], expected[name][:stop], atol=0.04, rtol=0.04)
     finally:
         graph.reset()
+
+
+@pytest.mark.L0
+def test_paired_owner_encoding_rejects_oversized_metadata(supported_gpu, monkeypatch):
+    from types import SimpleNamespace
+    from cudnn.QSA import api
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Oversized owner encoding reached allocation")
+
+    monkeypatch.setattr(torch, "empty", forbidden)
+    oversized = SimpleNamespace(shape=(1, (1 << 28) + 1))
+    with pytest.raises(NotImplementedError, match="block-owner encoding"):
+        api._compact_backward(oversized, None, None, None, None, 100, None, 1)
