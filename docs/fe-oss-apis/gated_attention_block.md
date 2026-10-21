@@ -570,9 +570,10 @@ kernel module lazily (a DSL below the floor reads as a typed `NotImplementedErro
 the DSL; `qsa_topk_decode_kernel_module()` hands the gated module, with its plan-time / per-execute split, to an engine) -- selects,
 per query row, the top-k block ids of the decode scorer's fp32 logits: `logits [T, n_blocks_max]` fp32 (row `t` scored in columns
 `[0, counts[t])`; the columns past them never influence the result -- the kernel may read them, so they must be addressable, which
-they are inside the tensor), `counts [T]` int32 (the VISIBLE-block count per row, clamped in-kernel to `[0, n_blocks_max]` -- never the
-list length `min(top_k, n_vis)`: that spelling puts every row with more visible blocks than `top_k` in the identity region and returns
-the oldest `top_k` blocks with no error), `block_ids [T, top_k]` int32 -- the CALLER's buffer, nothing is allocated -- written in
+they are inside the tensor), `counts [T]` int32 (the VISIBLE-block count per row, clamped in-kernel to `[0, n_blocks_max]`; a row with more than
+`top_k` visible blocks gets the score-based top-k, a row with at most `top_k` the identity list of every visible block -- so never pass
+the list length `min(top_k, n_vis)` as the count: every row with more visible blocks than `top_k` would then read as exactly `top_k`,
+take the identity path and return its oldest `top_k` blocks instead of a selection, with no error), `block_ids [T, top_k]` int32 -- the CALLER's buffer, nothing is allocated -- written in
 CANONICAL order: the `min(top_k, counts[t])` selected ids strictly descending, then `-1`.  The set is the exact top-k of the fp32 values
 (every selected logit at or above every unselected one; a tie at the k-th value keeps the smaller ids), so two launches are bitwise and
 the list is the form the sparse core's list stage consumes without a sort.  One thread block per row (`threads_per_cta` 512 / 1024), or
