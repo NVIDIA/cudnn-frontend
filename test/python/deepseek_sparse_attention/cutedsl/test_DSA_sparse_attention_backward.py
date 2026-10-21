@@ -863,14 +863,11 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_workspace_respects_ba
 )
 def test_DSA_sparse_attention_backward_sm100_large_context_workspace_uses_cluster_masks(s_q, s_kv, num_heads):
     """Large generic plans budget the selected relay planes and row masks."""
-    try:
-        from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100 import flash_attn_bwd_sm100_workspace_size
-        from cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_deterministic import deterministic_kernel_class
-    except ImportError:
-        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100")
+    deterministic = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_deterministic")
 
     head_dim = 576
-    kernel_cls = deterministic_kernel_class(s_q, s_kv, head_dim, num_heads)
+    kernel_cls = deterministic.deterministic_kernel_class(s_q, s_kv, head_dim, num_heads)
     padded_q = math.ceil(s_q / 8) * 8
     padded_kv = math.ceil(s_kv / 8) * 8
     num_waves = math.ceil(s_q / kernel_cls.q_wave_ctas)
@@ -880,7 +877,7 @@ def test_DSA_sparse_attention_backward_sm100_large_context_workspace_uses_cluste
     mask_rows_per_plane = math.ceil(mask_words_per_plane / head_dim)
     lse_odo_bytes = num_heads * padded_q * 2 * torch.float32.itemsize
     dkv_bytes = kernel_cls.num_dkv_shards * (padded_kv + mask_rows_per_plane) * head_dim * torch.float32.itemsize
-    assert flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True, backend="generic_m64") == lse_odo_bytes + dkv_bytes
+    assert interface.flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True, backend="generic_m64") == lse_odo_bytes + dkv_bytes
 
 
 def _exercise_deterministic_sm100_case(
@@ -4628,7 +4625,7 @@ def test_DSA_sparse_attention_backward_cross_shape_validation():
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=51)
-def test_DSA_sparse_attention_backward_check_support_validates_contract():
+def test_DSA_sparse_attention_backward_check_support_validates_contract(monkeypatch):
     """check_support works on metadata-only descriptors and is the advertised
     support gate, so the cross-tensor contract must be enforced there as well,
     not only by the runtime asserts in the execution interface."""
@@ -4663,6 +4660,16 @@ def test_DSA_sparse_attention_backward_check_support_validates_contract():
     )
     assert SparseAttentionBackward(**good).check_support()
     assert SparseAttentionBackward(**good, deterministic=True).check_support()
+
+    from cudnn.frost import buffers
+
+    with monkeypatch.context() as old_dsl:
+        old_dsl.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.6.2")))
+        with pytest.raises(RuntimeError, match=r"deterministic DSA backward requires nvidia-cutlass-dsl >= 4\.7\.0; found 4\.6\.2"):
+            SparseAttentionBackward(**good, deterministic=True).check_support()
+        # The new relay primitives do not change the established dependency
+        # contract of the non-deterministic backend.
+        assert SparseAttentionBackward(**good).check_support()
 
     deterministic_h32 = dict(good)
     deterministic_h32["sample_q"] = q[:, :32].contiguous()
