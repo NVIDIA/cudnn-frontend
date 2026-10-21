@@ -2565,6 +2565,15 @@ class pygraph:
 
         return {uid: _ptr(d) for uid, d in uid_to_data.items()}, (_ptr(workspace) if workspace is not None else 0)
 
+    def get_cuda_graph_retention(self):
+        """The CUDA graph retention mode in effect for this graph: the one passed as
+        ``cuda_graph_retention``, else the ``CUDNN_CUDA_GRAPH_RETENTION`` environment variable, else
+        ``cuda_graph_retention.PER_GRAPH``. Available before the graph is lowered."""
+        lowered = self.__dict__.get("_lowered_graph")
+        if lowered is not None:
+            return lowered.get_cuda_graph_retention()
+        return _pybind_module._effective_cuda_graph_retention(self._cpp_graph_kwargs.get("cuda_graph_retention"))
+
     def __getattr__(self, name: str):
         # Plan-configuration and query methods (deselect_engines,
         # get_engine_and_knobs_at_index, key, populate_cuda_graph, ...) operate

@@ -1442,6 +1442,7 @@ cudnn.pygraph.gen_index
 cudnn.pygraph.genstats
 cudnn.pygraph.get_behavior_notes
 cudnn.pygraph.get_behavior_notes_for_plan_at_index
+cudnn.pygraph.get_cuda_graph_retention
 cudnn.pygraph.get_engine_and_knobs_at_index
 cudnn.pygraph.get_execution_plan_count
 cudnn.pygraph.get_inputs

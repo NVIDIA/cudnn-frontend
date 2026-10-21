@@ -154,8 +154,9 @@ def test_device_buffer_finalizer_restores_capture_mode(monkeypatch, free_raises)
 
 @pytest.mark.parametrize("retention", ["PER_GRAPH", "NONE"])
 def test_cuda_graph_retention_option(retention, cudnn_handle):
-    """pygraph(cuda_graph_retention=...) reaches the C++ graph (also through deserialize), and a graph
-    built with it executes and replays from a CUDA graph as usual while the graph is alive."""
+    """pygraph(cuda_graph_retention=...) is reported before and after lowering, reaches the C++ graph (also
+    through deserialize), and a graph built with it executes and replays from a CUDA graph as usual while
+    the graph is alive."""
     mode = getattr(cudnn.cuda_graph_retention, retention)
     graph = cudnn.pygraph(
         handle=cudnn_handle,
@@ -164,6 +165,7 @@ def test_cuda_graph_retention_option(retention, cudnn_handle):
         compute_data_type=cudnn.data_type.FLOAT,
         cuda_graph_retention=mode,
     )
+    assert graph.get_cuda_graph_retention() == mode  # before the graph is lowered
     tx = graph.tensor(dim=[1, 32, 32], stride=[1024, 32, 1], data_type=cudnn.data_type.FLOAT)
     ty = graph.relu(tx).set_output(True).set_data_type(cudnn.data_type.FLOAT)
     graph.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])

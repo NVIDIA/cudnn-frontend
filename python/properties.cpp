@@ -496,6 +496,14 @@ init_properties(py::module_& m) {
     )pbdoc")
         .value("PER_GRAPH", cudnn_frontend::CudaGraphRetention_t::PER_GRAPH)
         .value("NONE", cudnn_frontend::CudaGraphRetention_t::NONE);
+    // The mode in effect for a given explicit setting (else the environment variable, else PER_GRAPH), for
+    // pygraph.get_cuda_graph_retention() before the graph is lowered.
+    m.def(
+        "_effective_cuda_graph_retention",
+        [](std::optional<cudnn_frontend::CudaGraphRetention_t> retention) {
+            return cudnn_frontend::detail::effective_cuda_graph_retention(retention);
+        },
+        py::arg("cuda_graph_retention").none());
 
     bind_enum<cudnn_frontend::BehaviorNote_t>(m, "behavior_note")
         .value("RUNTIME_COMPILATION", cudnn_frontend::BehaviorNote_t::RUNTIME_COMPILATION)
