@@ -10,36 +10,31 @@ overrides installed for every test there.
 import pytest
 import torch
 
-import cudnn  # noqa: F401
-
 if not torch.cuda.is_available():
     pytest.skip("CUDA device required", allow_module_level=True)
 
-try:
-    from torch.nn.attention import SDPBackend, sdpa_kernel
-    from torch.nn.attention import varlen as _varlen  # noqa: F401
-except ImportError:
-    pytest.skip("torch.nn.attention.varlen required (torch >= 2.13)", allow_module_level=True)
+pytest.importorskip("torch.nn.attention.varlen", reason="torch.nn.attention.varlen required (torch >= 2.13)")
+
+from torch.nn.attention import SDPBackend, sdpa_kernel  # noqa: E402
 
 import torch.nn.functional as F  # noqa: E402
 
-import cudnn.torch as provider  # noqa: E402
 from cudnn.torch import sdpa_provider  # noqa: E402
 
 
 def _python_fwd_calls_for_one_sdpa():
     q = torch.randn(1, 2, 128, 64, device="cuda", dtype=torch.bfloat16)
-    before = provider.calls["fwd"]
+    before = sdpa_provider.calls["fwd"]
     with sdpa_kernel([SDPBackend.CUDNN_ATTENTION]):
         F.scaled_dot_product_attention(q, q, q, is_causal=True)
-    return provider.calls["fwd"] - before
+    return sdpa_provider.calls["fwd"] - before
 
 
 @pytest.mark.L0
 def test_remove_restores_builtin_kernels():
     if _python_fwd_calls_for_one_sdpa() != 0:
         pytest.skip("overrides already installed in this process")
-    overrides = provider.install_sdpa_overrides()
+    overrides = sdpa_provider.install_sdpa_overrides()
     try:
         assert _python_fwd_calls_for_one_sdpa() == 1
     finally:
