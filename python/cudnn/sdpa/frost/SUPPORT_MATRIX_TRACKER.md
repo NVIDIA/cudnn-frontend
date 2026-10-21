@@ -3250,7 +3250,7 @@ per sequence the listed 4-token blocks and the open tail over `[0, kv_lens[b])` 
 The list form is a declaration fact derived from `S_q`: at `S_q <= 4` ONE list per sequence (`block_ids [B, top_k]` + `block_lens
 [B]`, the adapter's `list_per_sequence` arm: selected at the step-0 position and shared by the step's rows, the MTP visible set of the
 contract page), past four rows one list per row (`[B, S_q, top_k]`, the adapter's bottom-right per-token form) at any `S_q`; the split
-(`decode_split_kv`: `None` = `ceil(SMs / (B x H_kv x S_q))` chunks capped at `min(8, ceil((top_k + 1) / 32))` -- the cap from a split sweep at B 4 x S_kv 32K x S_q 1 on a 212-SM part: the step 69.2 / 64.3 / 59.9 / 59.8 / 65.0 us at split 1 / 2 / 4 / 8 / 17 --, or a pinned int up to `ceil((top_k + 1) / 32)`)
+(`decode_split_kv`: `None` = `ceil(SMs / (B x H_kv x S_q))` chunks capped at `min(16, ceil((top_k + 1) / 32))` -- the cap from the split sweeps at B 1 / B 4 x S_kv 32K x S_q 1 on a 212-SM cc 10.7 part with the pinned decode-grid combine (CUDA-graph replay at the 2376 MHz lock): B 1 39.0 / 38.1 / 37.7 us at split 8 / 16 / 17, B 4 37.1 / 36.2 / 36.4, the former combine entry turning up past 16 --, or a pinned int up to `ceil((top_k + 1) / 32)`)
 puts fp32 partials in the block's workspace (`get_workspace_size()` holds them) and runs the split combine; `fuse_gate` is served at every
 split (the core's epilogue unsplit, the combine otherwise), `return_lse` is served (`[B, H_q, S_q]` fp32).  Typed declines: the packed form
 (the table's `sparse` row: THD and paged pools one at a time), the in-block indexer over the pools, a non-contiguous table sample, a split
