@@ -26,6 +26,7 @@ CASES = [
     (16384, 3, 12, 1, 0),
     (16384, 3, 24, 2, 0),
     (32768, 1, 12, 1, 0),
+    (32768, 1, 24, 2, 0),
     (131072, 1, 12, 1, 0),
     (131072, 1, 24, 2, 0),
 ]
@@ -398,7 +399,10 @@ def main():
                     exit_code = process.returncode
                 except subprocess.TimeoutExpired:
                     exit_code = "timeout"
-            result = json.loads(result_path.read_text()) if result_path.exists() else {}
+            try:
+                result = json.loads(result_path.read_text()) if result_path.exists() else {}
+            except json.JSONDecodeError as error:
+                result = {"status": "failed", "error": f"Invalid worker result JSON: {error}"}
             if exit_code != 0:
                 result["status"] = "failed"
             result.update(exit_code=exit_code, log_path=str(log_path))

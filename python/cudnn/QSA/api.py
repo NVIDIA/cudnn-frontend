@@ -18,7 +18,7 @@ def _implementation(q, direction):
 
     installed, version = cutedsl_state()
     if not installed or cutedsl_too_old(version):
-        raise ImportError(cutedsl_requirement_error("QSA"))
+        raise ImportError(cutedsl_requirement_error("QSA") or "QSA requires nvidia-cutlass-dsl")
     cc = torch.cuda.get_device_capability(q.device)
     if cc not in ((10, 0), (10, 3), (10, 7)):
         raise NotImplementedError(f"QSA requires SM100, SM103 or SM107, got SM{cc[0]}{cc[1]}")

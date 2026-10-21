@@ -22,7 +22,7 @@ def supported_gpu():
         pytest.skip("QSA requires SM100, SM103 or SM107")
     installed, version = cutedsl_state()
     if not installed or cutedsl_too_old(version):
-        pytest.skip(cutedsl_requirement_error("QSA"))
+        pytest.skip(cutedsl_requirement_error("QSA") or "QSA requires nvidia-cutlass-dsl")
     reason = cutedsl_arch_requirement_error(cc)
     if reason:
         pytest.skip(reason)
@@ -145,18 +145,19 @@ assert callable(qsa_forward) and callable(qsa_backward)
 
 
 @pytest.mark.L0
-def test_dsl_gate_before_kernel_import(supported_gpu, monkeypatch):
+@pytest.mark.parametrize("state,match", [((True, ("nvidia-cutlass-dsl", "4.6.2")), "4.6.2"), ((False, None), "QSA requires nvidia-cutlass-dsl")])
+def test_dsl_gate_before_kernel_import(supported_gpu, monkeypatch, state, match):
     from cudnn.QSA import api
     from cudnn.frost import buffers
 
     inputs = make_inputs((1,), 12, 1)
-    monkeypatch.setattr(buffers, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.6.2")))
+    monkeypatch.setattr(buffers, "cutedsl_state", lambda: state)
 
     def forbidden(*args, **kwargs):
-        pytest.fail("Old DSL reached a kernel import")
+        pytest.fail("Unsupported DSL reached a kernel import")
 
     monkeypatch.setattr(api.importlib, "import_module", forbidden)
-    with pytest.raises(ImportError, match="4.6.2"):
+    with pytest.raises(ImportError, match=match):
         qsa_forward(**inputs)
 
 
