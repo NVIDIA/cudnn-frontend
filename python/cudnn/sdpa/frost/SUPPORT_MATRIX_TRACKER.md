@@ -3253,7 +3253,10 @@ decode twin carries the shared body's register trims (bitwise, except the FTZ ma
 forms of the split combine take the launch attribute with their `griddepcontrol` pair; bitwise the plain chain; PER STAGE: a kernel
 without the sites -- the paged d256 prefill tile of the DECODE form's prefill route and of the EXTEND form -- launches plain and the
 link serializes, read back by `pdl_stages` / `use_pdl_effective` on the block, `DecodeRoute.pdl_capable` per route and `pdl_stages` on
-each form's envelope; the quantized, e4m3 and sparse pipelines decline the switch, typed) and `fuse_norm_rope_small_m` (at `B x S_q <= 128` a `fuse_norm_rope=True` declaration
+each form's envelope; the quantized and e4m3 pipelines decline the switch, typed; the block-sparse chain takes it since 2026-10-21 -- the sparse core's
+`griddepcontrol` sites (one wait per role before its first dependent read, one release per CTA after the prologue) and its split combine's pair, bitwise
+the plain chain, `thd=True` x the switch declined by name, the AUTO reading `False` on the sparse form until measured (`SPARSE_DECODE_PDL_DEFAULT_CCS`,
+empty) -- a knob, no `Capabilities` field) and `fuse_norm_rope_small_m` (at `B x S_q <= 128` a `fuse_norm_rope=True` declaration
 LOWERS stage (1) to the unfused chain -- `fuse_norm_rope_effective` reads it back; `True` keeps the fused fork for the A/B, and so does an
 explicit `fuse_cache_write=True`, the request for the arm that lives in the fork; `False` + `fuse_cache_write=True` is the typed decline).
 

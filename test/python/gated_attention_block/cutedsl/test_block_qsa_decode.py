@@ -800,7 +800,7 @@ class _CaseBase:
 
     def label(self):
         form = f"{'shared' if self.shared else 'per-row'}{'' if self.index_list_form is None else ' (declared)'}"
-        return f"[{self.geom.h_q}/{self.geom.h_kv} S_q={self.s_q} {form} p{self.page} {self.layout} {self.dtype} split={self.blk.decode_split_kv} gate={'fused' if self.fuse_gate else 'launch'} lse={self.return_lse} lens={self.kv_lens}]"
+        return f"[{self.geom.h_q}/{self.geom.h_kv} S_q={self.s_q} {form} p{self.page} {self.layout} {self.dtype} split={self.blk.decode_split_kv} gate={'fused' if self.fuse_gate else 'launch'} lse={self.return_lse} pdl={self.blk.use_pdl} lens={self.kv_lens}]"
 
     def check(self, out=None, ws=None, lse=None, *, what="out"):
         """The standard assertions: finite, no sentinel, dead rows exact, within the budget vs the oracle (out, the gated O slot, the
@@ -881,9 +881,11 @@ class _Case(_CaseBase):
         shuffle=True,
         index_list_form=None,
         fuse_prepare=None,
+        use_pdl=None,
     ):
         self.s_q, self.kv_lens, self.page, self.layout, self.dtype, self.top_k = int(s_q), [int(x) for x in kv_lens], page, layout, dtype, top_k
         self.fuse_prepare = fuse_prepare
+        self.use_pdl = use_pdl
         self.block_lens_given, self.return_lse, self.fuse_gate, self.index_band = bool(block_lens), bool(return_lse), bool(fuse_gate), bool(index_band)
         # the list form: the S_q rule (one list per sequence up to the shared-list cap), or QsaSpec.index_list_form as declared
         self.index_list_form = index_list_form
@@ -995,6 +997,7 @@ class _Case(_CaseBase):
             fuse_norm_rope=fuse_norm_rope,
             return_lse=return_lse,
             decode_split_kv=split,
+            use_pdl=use_pdl,
         )
         if fuse_prepare is not None:
             kw["fuse_prepare"] = fuse_prepare
@@ -2692,3 +2695,337 @@ def test_caller_list_band_block_with_fuse_prepare_is_bitwise_the_two_stage_form(
     assert torch.equal(_bits(on.index_cache), _bits(off.index_cache)), "the raw-key pool differs"
     names_on, names_off = [st.name for st in on.blk._stages], [st.name for st in off.blk._stages]
     assert "qsa_prepare" in names_on and "cache_write" not in names_on and "qk_norm_rope" not in names_on and len(names_on) == len(names_off) - 1
+
+
+# ---------------------------------------------------------------------------
+# Programmatic dependent launch on the block-sparse decode chain (``use_pdl``): a KNOB -- bitwise the plain chain
+# ---------------------------------------------------------------------------
+
+# The ladder rows the PDL pair runs (indices into _LADDER): the shared list at S_q 1 / 3 / 4 over bf16 and f16 pools (the default split,
+# split 4 without block_lens, split 17 with the fused gate and the LSE), the 24 / 2 geometry, and the per-token form unsplit and split 2.
+_PDL_ROWS = [0, 2, 3, 4, 7, 8]
+
+
+def _stage_names(case):
+    return [st.name for st in case.blk._stages]
+
+
+@requires_rubin
+@pytest.mark.parametrize("row", _PDL_ROWS, ids=[_LADDER[i].id for i in _PDL_ROWS])
+def test_pdl_on_is_bitwise_pdl_off_on_the_decode_ladder(row):
+    """``use_pdl=True`` on the block-sparse DECODE mode: the same stages, the same kernels -- the sparse core launches with the
+    programmatic-stream-serialization attribute and carries its griddepcontrol sites, the split combine takes the pair -- and ``out``,
+    the gated O slot, the LSE and the pools are BITWISE the ``use_pdl=False`` block's on the same inputs; within the budget vs the
+    oracle; a second switched step bitwise the first.  The readback: ``use_pdl`` True, ``sdpa_sparse`` among ``pdl_stages``,
+    ``use_pdl_effective`` True (every switched stage of the chain took the attribute)."""
+    geom_kw, s_q, kv_lens, dtype, page, layout, split, fuse_gate, return_lse, block_lens, fuse_norm_rope, index_band, seed = _LADDER[row].values
+    kw = dict(page=page, layout=layout, dtype=dtype, seed=seed, split=split, fuse_gate=fuse_gate, return_lse=return_lse, block_lens=block_lens)
+    kw.update(fuse_norm_rope=fuse_norm_rope, index_band=index_band)
+    off = _Case(geom_kw, s_q, kv_lens, use_pdl=False, **kw).compile()
+    on = _Case(geom_kw, s_q, kv_lens, use_pdl=True, **kw).compile()
+    assert off.blk.use_pdl is False and off.blk.pdl_stages == () and on.blk.use_pdl is True and on.blk.use_pdl_requested is True
+    assert "sdpa_sparse" in on.blk.pdl_stages and on.blk.use_pdl_effective is True and on.blk._sdpa.use_pdl is True and on.blk._sdpa._impl.use_pdl is True
+    assert _stage_names(on) == _stage_names(off) and on.blk.decode_split_kv == off.blk.decode_split_kv
+    a = off.run().clone()
+    o_a = off.slab_views()[4].clone()
+    lse_a = None if off.lse is None else off.lse.clone()
+    b = on.run().clone()
+    o_b = on.slab_views()[4].clone()
+    on.check(what=f"pdl on {on.label()}")
+    assert torch.equal(_bits(a), _bits(b)) and torch.equal(
+        _bits(o_a), _bits(o_b)
+    ), f"out / O differ with use_pdl (max|d out| {(a.float() - b.float()).abs().max().item():.3e})"
+    if lse_a is not None:
+        assert torch.equal(lse_a, on.lse), "the LSE differs with use_pdl"
+    assert torch.equal(_bits(on.k_cache), _bits(off.k_cache)) and torch.equal(_bits(on.v_cache), _bits(off.v_cache)), "the write-through differs"
+    c = on.run().clone()
+    assert torch.equal(_bits(b), _bits(c)), "a second switched step is not bitwise the first"
+
+
+def test_pdl_auto_stays_off_on_the_sparse_form_until_measured_and_the_envelope_says_so(monkeypatch):
+    """The AUTO reading of ``use_pdl`` on the block-sparse decode mode is False on every part today (``SPARSE_DECODE_PDL_DEFAULT_CCS``
+    is EMPTY: a part enters it with its measurement); the arm exists behind the tuple -- with the tuple patched to the measured dense part
+    AUTO resolves True on the sparse form and the switch reaches the sparse stage; an explicit value wins either way.  The envelope names
+    the switched stage kinds on the sparse form (``DECODE_PDL_STAGES``, the same four) and reads ``pdl_default`` off the sparse tuple."""
+    import cudnn.gated_attention_block.api as _api
+    from cudnn.frost import buffers
+
+    assert _api.SPARSE_DECODE_PDL_DEFAULT_CCS == ()
+    monkeypatch.setattr(_api, "_device_cc_of", lambda device: (10, 7))
+    with _no_host_sync():
+        auto = _declare(GEOM_SMALL, 2, 1, n_pages=4)[0]
+        on = _declare(GEOM_SMALL, 2, 1, n_pages=4, use_pdl=True)[0]
+        off = _declare(GEOM_SMALL, 2, 1, n_pages=4, use_pdl=False)[0]
+    assert auto.use_pdl_requested is None and auto.use_pdl is False and auto.pdl_stages == () and auto.use_pdl_effective is False
+    assert on.use_pdl is True and "sdpa_sparse" in on.pdl_stages and on.use_pdl_effective is True and off.use_pdl is False and off.pdl_stages == ()
+    monkeypatch.setattr(_api, "SPARSE_DECODE_PDL_DEFAULT_CCS", ((10, 7),))
+    with _no_host_sync():
+        measured = _declare(GEOM_SMALL, 2, 1, n_pages=4)[0]
+        other_part = None
+    assert measured.use_pdl_requested is None and measured.use_pdl is True and "sdpa_sparse" in measured.pdl_stages and measured.use_pdl_effective is True
+    assert _declare(GEOM_SMALL, 2, 1, n_pages=4, use_pdl=False)[0].use_pdl is False
+    monkeypatch.setattr(_api, "_device_cc_of", lambda device: (10, 0))
+    with _no_host_sync():
+        other_part = _declare(GEOM_SMALL, 2, 1, n_pages=4)[0]
+    assert other_part.use_pdl is False, "a part outside the tuple reads False"
+    monkeypatch.undo()
+    # the envelope: the sparse form names the four switched stage kinds; pdl_default reads the sparse tuple (empty -> False; patched -> True)
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    geom, _ = _geom(GEOM_SMALL)
+    env = GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV, device_cc=_SM107)
+    assert (
+        env.decode.served
+        and env.decode.sparse_core
+        and env.decode.pdl_stages == _api.DECODE_PDL_STAGES == ("qk_norm_rope", "cache_write", "sigmoid_gate", "sdpa")
+    )
+    assert env.decode.pdl_default is False
+    monkeypatch.setattr(_api, "SPARSE_DECODE_PDL_DEFAULT_CCS", ((10, 7),))
+    assert GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV, device_cc=_SM107).decode.pdl_default is True
+    assert GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV, device_cc=(10, 0)).decode.pdl_default is False
+    dense = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**GEOM_SMALL, causal_bottom_right=True), BF16, _DEV, device_cc=_SM107)
+    assert dense.decode.pdl_default is True and not dense.decode.sparse_core, "the dense form keeps its own measured tuple"
+
+
+def test_pdl_is_declined_on_e4m3_pools_and_on_the_packed_sparse_form_by_name():
+    """The two kept declines around the sparse chain's switch: ``use_pdl=True`` over e4m3 pools under QsaSpec (the gathered cast and the
+    decode tile carry no threaded switch; the block's own clause) and ``use_pdl=True`` with ``thd=True`` on a QsaSpec geometry (the sparse
+    core's packed form reads the setup launch's metadata above every role wait) -- each typed, naming the switch; the paged bf16 form with
+    ``thd=False`` constructs with the switch."""
+    import test_block_qsa_fp8_kv as _qkv
+
+    with pytest.raises(NotImplementedError, match="no e4m3 KV cache"):
+        _qkv._declare(_qkv.GEOM_SMALL, 2, 1, fuse_norm_rope=False, use_pdl=True)
+    assert _qkv._declare(_qkv.GEOM_SMALL, 2, 1, fuse_norm_rope=False)[0].use_pdl is False
+    geom, _ = _geom(GEOM_SMALL, causal_bottom_right=False)
+    mk = lambda *shape: torch.empty(*shape, dtype=BF16, device=_DEV)  # noqa: E731
+    args = (
+        mk(32, geom.d_model),
+        mk(geom.n_qkvg, geom.d_model),
+        mk(D),
+        mk(D),
+        mk(32, ROPE),
+        mk(32, ROPE),
+        mk(geom.d_model, geom.h_q * D),
+        mk(32, geom.d_model),
+        geom,
+    )
+    thd_kw = dict(thd=True, num_sequences=2, max_seq_len=32, token_capacity=32)
+    with pytest.raises(NotImplementedError, match="thd=True with use_pdl=True is not served") as e:
+        GatedAttentionBlockFwd(*args, **thd_kw, use_pdl=True)
+    # ONE source of the kernel fact: the block's declaration-time text carries the adapter's statement verbatim (`pdl_decline_reason`), so
+    # the two sites cannot drift apart; the adapter's own check_support raises the same statement (the sparse adapter's suite pins that side)
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import pdl_decline_reason
+
+    assert "on a QsaSpec geometry" in str(e.value) and pdl_decline_reason(thd=True) in str(e.value) and "declare use_pdl=False" in str(e.value)
+    assert pdl_decline_reason(thd=False) is None
+    with _no_host_sync():
+        assert _declare(GEOM_SMALL, 2, 1, n_pages=4, use_pdl=True)[0].use_pdl is True
+
+
+@requires_rubin
+def test_pdl_census_names_the_same_kernels_as_the_plain_chain():
+    """The switch adds no launch and removes none: the CUDA profiler's census of one switched execute is the plain execute's kernel list
+    (the same names in the same order -- the sparse core, its combine and the chain's other kernels); the switched chain's time is never
+    attributed here (a functional node; the pdl-OFF arm is the attribution of a measurement)."""
+    from gated_block_census import cupti_kernels as _cupti_kernels
+
+    off = _Case(GEOM_SMALL, 2, (300, 0, 1000, 77), page=16, seed=61, split=4, fuse_gate=True, return_lse=True, use_pdl=False).compile()
+    on = _Case(GEOM_SMALL, 2, (300, 0, 1000, 77), page=16, seed=61, split=4, fuse_gate=True, return_lse=True, use_pdl=True).compile()
+    k_off, _ = _cupti_kernels(lambda: off.execute())
+    k_on, _ = _cupti_kernels(lambda: on.execute())
+    if k_off is None or k_on is None:
+        pytest.skip("torch.profiler recorded no CUDA event (CUPTI unavailable on this node): the census is unverified here")
+    assert k_on == k_off, (k_on, k_off)
+    assert any(k.startswith("cudnn_kernel__combine") for k in k_on) and len(k_on) >= 4, k_on  # the GEMMs, the norm + RoPE pass, the core, its combine
+    print(f"\ncensus with use_pdl: {k_on}")
+
+
+@requires_rubin
+def test_capture_of_the_first_pdl_execute_of_the_sparse_chain_replays_bitwise_the_eager_plain_and_switched_chains(tmp_path):
+    """The serving stack's defaults on the SWITCHED sparse declaration (the dense chain's cell of ``test_block_serving_pdl`` on the block-sparse
+    decode mode): the FIRST execute of a fresh ``use_pdl=True`` block captured on a NEW stream, no warm-up, under ``set_sync_debug_mode("error")``
+    -- the sparse core's and its split combine's programmatic edges are captured without error, the capture launches nothing, the replay is
+    BITWISE the eager plain (``use_pdl=False``) chain on ``out`` / the LSE / the pools and bitwise the eager switched chain, and stays bitwise
+    over repeated replays (a race across a programmatic edge would surface as a replay that differs).  The graph's kernel-node census and the
+    driver / runtime / torch / DSL versions are printed (the record of what served the capture)."""
+    from gated_block_pdl_probe import cuda_versions
+
+    print(f"\ncuda versions: {cuda_versions()}")
+    kw = dict(page=16, seed=67, split=4, fuse_gate=True, return_lse=True)
+    plain = _Case(GEOM_SMALL, 2, (300, 0, 1000, 77), use_pdl=False, **kw).compile()
+    ref = plain.run().clone()
+    ref_lse = plain.lse.clone()
+    plain.check(ref, lse=ref_lse, what="plain eager")
+    case = _Case(GEOM_SMALL, 2, (300, 0, 1000, 77), use_pdl=True, **kw)  # fresh: never executed
+    assert case.blk.use_pdl is True and "sdpa_sparse" in case.blk.pdl_stages and case.blk.use_pdl_effective is True
+    case.blk.check_support()
+    case.blk.compile()
+    case.ws = torch.full((case.blk.get_workspace_size(),), 0x7F, dtype=torch.uint8, device=_DEV)
+    case.out.fill_(float("nan"))
+    case.lse.fill_(float("nan"))
+    k_before = _written(case.k_cache)
+    torch.cuda.synchronize()
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    dumped = None
+    try:
+        if hasattr(graph, "enable_debug_mode"):
+            graph.enable_debug_mode()
+        with torch.cuda.graph(graph, stream=stream):
+            prev = torch.cuda.get_sync_debug_mode()
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                case.execute()  # the FIRST execute of this declaration, captured: the switched stages carry the attribute
+            finally:
+                torch.cuda.set_sync_debug_mode(prev)
+        torch.cuda.synchronize()
+        assert torch.isnan(case.out).all() and _written(case.k_cache) == k_before, "the capture launched work"
+        if hasattr(graph, "debug_dump"):
+            try:  # best effort: the graph's DOT (cudaGraphDebugDotPrint) -- the kernel-node census beside the verdict, never the verdict
+                path = str(tmp_path / "sparse_pdl_decode_graph.dot")
+                graph.debug_dump(path)
+                dot = open(path).read()
+                dumped = dict(kernel_nodes=dot.count("KERNEL"), programmatic=sum(dot.lower().count(w) for w in ("programmatic", "port")))
+            except Exception as exc:  # noqa: BLE001 -- the dump is a record, never the verdict
+                dumped = f"debug_dump unavailable ({type(exc).__name__})"
+        graph.replay()
+        torch.cuda.synchronize()
+        replayed, replayed_lse = case.out.clone(), case.lse.clone()
+        case.check(replayed, lse=replayed_lse, what="replay of the switched chain")
+        assert torch.equal(_bits(replayed), _bits(ref)) and torch.equal(
+            replayed_lse, ref_lse
+        ), "the replay of the captured switched chain differs from the eager plain chain"
+        assert torch.equal(_bits(case.k_cache), _bits(plain.k_cache)) and torch.equal(_bits(case.v_cache), _bits(plain.v_cache)), "the write-through differs"
+        case.out.fill_(float("nan"))
+        case.lse.fill_(float("nan"))
+        case.execute()
+        torch.cuda.synchronize()
+        assert torch.equal(_bits(case.out), _bits(replayed)) and torch.equal(case.lse, replayed_lse), "the eager switched chain differs from its replay"
+        case.out.fill_(float("nan"))
+        case.lse.fill_(float("nan"))
+        for _ in range(50):
+            graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(_bits(case.out), _bits(replayed)) and torch.equal(
+            case.lse, replayed_lse
+        ), "repeated replays of the switched chain are not bitwise (a race across a programmatic edge)"
+    finally:
+        graph.reset()
+    print(f"graph census: {dumped}")
+
+
+# -- the detector of a late wait on the sparse core (GREEN with the shipped kernel, RED with its wait removed) -----------------------
+
+_SPIN_US = (300.0, 3000.0)  # the primary's late write: well past any launch latency, so a core that does not wait reads the poison
+
+
+def _standalone_sparse(case, *, pdl):
+    """The block's sparse stage as a standalone adapter on the block's OWN views (Q / GATE at the slab's token stride, the pools, the table,
+    the lengths, the list), with the switch; returns ``(adapter, run, o_buf)``."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    q, gate, _k, _v, o, _proj = case.slab_views()
+    o2 = torch.full_like(o, _sentinel(case.dtype))
+    lse2 = torch.full_like(case.lse, _sentinel(case.dtype))
+    a = SparseGqaFwdDslSm107(
+        q=q,
+        k=case.k_cache,
+        v=case.v_cache,
+        o=o2,
+        lse=lse2,
+        block_ids=case.block_ids,
+        block_lens=case.block_lens,
+        seq_kv_lens=case.kv_lens_t,
+        top_k=case.top_k,
+        scale=case.geom.scale,
+        paged_kv=True,
+        page_size=case.page,
+        block_table=case.block_table,
+        list_per_sequence=True,
+        bottom_right=True,
+        split_kv=case.blk.decode_split_kv,
+        epilogue_gate=gate,
+        use_pdl=pdl,
+    )
+    assert a.check_support() and a.use_pdl is pdl
+    a.compile()
+    ws = torch.empty(max(a.scratch_workspace_bytes(), 16), dtype=torch.uint8, device=_DEV)
+
+    def run():
+        a.execute(workspace=ws)
+        return o2
+
+    return a, run, o2
+
+
+def _race_the_core(case, run, o_buf, ref):
+    """Ahead of each launch of the switched core: poison an operand (NaN over the slab or the K pool, -1 over the block list, 0 over the
+    lengths), then the primary that releases its dependent at once and restores the operand late.  Returns, per (operand, spin), whether
+    the core's output equals ``ref``."""
+    from gated_block_pdl_probe import delayed_write
+
+    _q, _g, _k, _v, _o, proj = case.slab_views()
+    operands = {
+        "slab": (proj, proj.clone(), lambda t: t.fill_(float("nan"))),
+        "k_pool": (case.k_cache, case.k_cache.clone(), lambda t: t.fill_(float("nan"))),
+        # the int32 operands as FLAT views of the same storage (the probe takes 1-D int32 as is; a bf16 buffer it reinterprets itself)
+        "block_ids": (case.block_ids.view(-1), case.block_ids.clone().view(-1), lambda t: t.fill_(-1)),
+        "kv_lens": (case.kv_lens_t.view(-1), case.kv_lens_t.clone().view(-1), lambda t: t.fill_(0)),
+    }
+    verdicts = {}
+    for spin in _SPIN_US:
+        for name, (t, saved, poison) in operands.items():
+            poison(t)
+            delayed_write(saved, t, spin_us=spin)
+            run()
+            torch.cuda.synchronize()
+            verdicts[(name, spin)] = torch.equal(o_buf, ref)
+            t.copy_(saved)
+    torch.cuda.synchronize()
+    return verdicts
+
+
+@requires_rubin
+def test_detector_the_sparse_core_reads_its_operands_only_after_its_dependent_wait():
+    """GREEN: the shipped sparse core, launched with the attribute right after a primary that released it at once and wrote the slab (the
+    Q / GATE bands), the K pool, the block list or the lengths late, produces the undisturbed output -- every role's first read of each
+    sits below its dependent-grid wait (the kernel header's PDL SITES paragraph)."""
+    case = _Case(GEOM_SMALL, 2, (300, 0, 1000, 77), page=16, seed=71, split=4, fuse_gate=True, return_lse=True, use_pdl=True).compile()
+    case.run()
+    _a, run, o_buf = _standalone_sparse(case, pdl=True)
+    ref = run().clone()
+    torch.cuda.synchronize()
+    assert torch.equal(_bits(ref), _bits(case.slab_views()[4])), "the standalone switched core differs from the block's own sparse stage"
+    verdicts = _race_the_core(case, run, o_buf, ref)
+    print(f"\ndetector (shipped sparse core): {verdicts}")
+    assert all(verdicts.values()), f"the sparse core read an operand before its dependent wait: {verdicts}"
+
+
+@requires_rubin
+def test_detector_turns_red_when_the_sparse_core_launches_with_the_attribute_but_does_not_wait(monkeypatch):
+    """The detector's sensitivity: the same cell with the core's dependent-grid wait swapped for a no-op (the launch attribute kept, the
+    kernel retraced) reads the slab / the pool / the list / the lengths during the primary's spin -- a deliberately absent wait turns the
+    cell RED on every operand at the longest spin.  Runs after the GREEN cell; the retrace is undone before the next test compiles."""
+    import cudnn.frost.compiled_cache as compiled_cache
+    from gated_block_pdl_probe import retrace
+
+    case = _Case(GEOM_SMALL, 2, (300, 0, 1000, 77), page=16, seed=71, split=4, fuse_gate=True, return_lse=True, use_pdl=True).compile()
+    case.run()
+    mod = case.blk._sdpa._impl._module  # the loaded sparse template module (one object per template params)
+    assert mod.__name__.startswith("cudnn.frost._templates.") and hasattr(mod, "wait_on_dependent_grids")
+    monkeypatch.setenv("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", "1")  # the on-disk artifact would be the SHIPPED kernel
+    monkeypatch.setattr(mod, "wait_on_dependent_grids", lambda: None)
+    retrace(mod.compile)
+    try:
+        _a, run, o_buf = _standalone_sparse(case, pdl=True)  # a fresh trace: the attribute on, the waits gone
+        ref = run().clone()  # unraced, the no-wait core is still correct: nothing is in flight ahead of it
+        torch.cuda.synchronize()
+        verdicts = _race_the_core(case, run, o_buf, ref)
+        print(f"\ndetector (sparse core WITHOUT its waits): {verdicts}")
+        assert not all(verdicts.values()), f"the detector did not turn red for a core that never waits: {verdicts}"
+        assert not any(verdicts[k] for k in verdicts if k[1] == max(_SPIN_US)), f"the longest spin must turn every operand red: {verdicts}"
+        del _a, run
+    finally:
+        monkeypatch.undo()
+        retrace(mod.compile)  # the memo held the no-wait object under the shipped key
+        compiled_cache.clear_memo()
