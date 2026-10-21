@@ -900,8 +900,12 @@ def sparse_decode_split_choice(*, batch: int, h_kv: int, s_q: int, top_k: int, s
     more than the item's tile count (a larger split has an empty chunk, a dead work item, on every item -- the adapter's own bound)
     and never more than :data:`SPARSE_DECODE_SPLIT_CAP` = 8 chunks (MEASURED on a 212-SM part at B 4 x S_kv 32K x S_q 1: the step at
     split 1 / 2 / 4 / 8 / 17 = 69.2 / 64.3 / 59.9 / 59.8 / 65.0 us -- the core flattens past 4-8 chunks while the combine's cost grows
-    with the partial count, 2.9 us at 4, 12.2 us at 17), 1 for a launch that already fills the part and for a non-CUDA reading
-    (``sm_count`` 0, declined at ``check_support`` anyway).  A PERFORMANCE choice only (the fp32 partials ride the workspace, the
+    with the partial count, 2.9 us at 4, 12.2 us at 17; that sweep ran the combine module's OWN forms, the entry compiled without a
+    form.  Since 2026-10-21 the sparse adapter pins the combine's FORM per plan -- the decode-grid kernel inside the lean-grid bound from
+    split 8, flat in the partial count, the lean group walk on an overflow launch at split <= 4, the module's own forms otherwise
+    (``sparse_gqa_sm107._sparse_combine_decode_grid``) -- which changes the knee's shape, so the cap holds its measured value until the
+    sweep is repeated with the pinned forms on a performance node: a constant moves with its measurement, never ahead of it), 1 for a
+    launch that already fills the part and for a non-CUDA reading (``sm_count`` 0, declined at ``check_support`` anyway).  A PERFORMANCE choice only (the fp32 partials ride the workspace, the
     combine is one more launch): the same function under every value, so a caller may pin any split in ``[1, ceil((top_k + 1) / 32)]``
     (the cap binds the DEFAULT only)."""
     max_tiles = -(-(int(top_k) + 1) // 32)
@@ -912,7 +916,8 @@ def sparse_decode_split_choice(*, batch: int, h_kv: int, s_q: int, top_k: int, s
 
 
 SPARSE_DECODE_SPLIT_CAP = (
-    8  # the fill rule's cap on the DEFAULT split of the block-sparse decode mode (the 4 x 32K x 1 sweep above); a pinned split may exceed it
+    8  # the fill rule's cap on the DEFAULT split of the block-sparse decode mode (the 4 x 32K x 1 sweep above, taken with the combine
+    # module's own forms; re-swept with the pinned decode-grid / lean-walk forms before it moves); a pinned split may exceed it
 )
 
 

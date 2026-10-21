@@ -929,3 +929,52 @@ def test_capture_of_the_first_execute_replays_bitwise_and_takes_new_lengths_tabl
         ), "the replay over new lengths / tables / lists / slots differs from the eager run over them"
     finally:
         graph.reset()
+
+
+# ---------------------------------------------------------------------------
+# Rubin: the split combine's FORM per grid -- the census names the kernel, two executes bitwise
+# ---------------------------------------------------------------------------
+
+# The kernel names the CUDA profiler reports for the shared combine module's forms (its own pins name them the same way).
+_COMBINE_KERNELS = {
+    "decode_grid": ("cudnn_kernel__combine_decode_grid_kernel",),
+    "lean_walk": ("cudnn_kernel__combine_lean_walk_kernel",),
+    "own": ("cudnn_kernel__combine_kernel", "cudnn_kernel__combine_decode_kernel"),
+}
+# (geometry, S_q, kv_lens, pinned split, the form the sparse stage pins its combine entry to): the decode-grid kernel on a small grid
+# from split 8 (B 2 x 8 heads: 16 lean blocks / 16 rows), the module's own forms on the same grid below split 8, the lean group walk on
+# an overflow grid at split <= 4 (B 6 x 24 heads: 144 lean blocks, past the decode-grid bound of 128), the module's own forms on the
+# B 4 x S_q 4 grid at split 7 (128 rows -- a small grid, but below split 8).
+_COMBINE_FORM_CELLS = [
+    pytest.param(GEOM_SMALL, 1, (2052, 300), 8, "decode_grid", 51, id="B2-Sq1-split8-decode-grid"),
+    pytest.param(GEOM_SMALL, 1, (2052, 300), 4, "own", 52, id="B2-Sq1-split4-own-forms"),
+    pytest.param(GEOM_FLASH_NEXT, 1, (2052, 300, 1000, 77, 4097, 64), 4, "lean_walk", 53, id="B6-Sq1-24-2-split4-lean-walk"),
+    pytest.param(GEOM_SMALL, 4, (2052, 300, 1000, 77), 7, "own", 54, id="B4-Sq4-split7-own-forms"),
+]
+
+
+@requires_rubin
+@pytest.mark.parametrize("geom_kw, s_q, kv_lens, split, form, seed", _COMBINE_FORM_CELLS)
+def test_the_split_combine_takes_the_pinned_form_per_grid_and_two_executes_are_bitwise(geom_kw, s_q, kv_lens, split, form, seed):
+    """The block's sparse stage compiles its split combine with the FORM the adapter pins per plan on the sparse grid ``(B, H_q, S_q)``
+    (``SparseGqaFwdDslSm107.combine_form``: the dense adapter's rule -- the decode-grid kernel on a small grid from split 8, the lean
+    group walk on an overflow grid at split <= 4, the module's own forms otherwise); the CUDA profiler's census of one execute names
+    exactly that combine kernel; the step is within the budget vs the oracle (the gate in the combine), two executes bitwise."""
+    from test_block_serving_decode import _cupti_kernels
+
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
+
+    want = {"decode_grid": comb.DECODE_GRID_AUTO, "lean_walk": comb.DECODE_GRID_LEAN_WALK, "own": comb.DECODE_GRID_OFF}[form]
+    case = _Case(geom_kw, s_q, kv_lens, page=16, seed=seed, split=split, fuse_gate=True, return_lse=True)
+    case.compile()
+    impl = case.blk._sdpa._impl
+    assert case.blk.decode_split_kv == split == impl.split_kv and impl.combine_form() == want == impl._combine_form, (form, impl._combine_form)
+    _two_launches(case, f"combine form {form}")
+    kernels, _ = _cupti_kernels(lambda: case.execute())
+    if kernels is None:
+        pytest.skip("torch.profiler recorded no CUDA event (CUPTI unavailable on this node): the combine kernel's name is unverified here")
+    combines = [k for k in kernels if k.startswith("cudnn_kernel__combine")]
+    assert len(combines) == 1 and combines[0].startswith(_COMBINE_KERNELS[form]), (form, combines)
+    others = tuple(k for f, ks in _COMBINE_KERNELS.items() if f != form for k in ks)
+    assert not combines[0].startswith(others), (form, combines)
+    print(f"\n{case.label()} combine form {form}: the census saw {combines[0]} among {len(kernels)} kernels")

@@ -3065,3 +3065,273 @@ def test_decode_form_mtp_shared_list_is_bitwise_the_replicated_per_token_list(S_
     print(
         f"\nshared list == replicated per-token list (bitwise) S_q={S_q} r={r} lens={kv_lens}: max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}; rows with an appended block {appended}"
     )
+
+
+# ============================================================================ the split combine's FORM pin (decode-grid / lean walk / the module's own forms)
+# The kernel names the CUDA profiler reports for the combine's forms (the shared combine module's own pins name them the same way).
+_COMBINE_DECODE_GRID_KERNEL = "cudnn_kernel__combine_decode_grid_kernel"
+_COMBINE_LEAN_WALK_KERNEL = "cudnn_kernel__combine_lean_walk_kernel"
+_COMBINE_OWN_FORM_KERNELS = ("cudnn_kernel__combine_kernel", "cudnn_kernel__combine_decode_kernel")  # the wide lean group / serial walk, the decode form
+_FORM_KERNEL = {"decode_grid": (_COMBINE_DECODE_GRID_KERNEL,), "lean_walk": (_COMBINE_LEAN_WALK_KERNEL,), "own": _COMBINE_OWN_FORM_KERNELS}
+# (B, S_q, split) -> the FORM the sparse adapter pins its combine entry to on cc 10.7 at 24 Q heads (the dense adapter's rule on the
+# sparse grid): the serving decode cells (B 1 / B 4 at split 8) take the decode-grid kernel, the B 32 x S_q 1 step at split <= 4 the lean
+# group walk, a small grid below split 8 and the mid-sized B 4 x S_q 4 grid at split 7 the module's own forms, an overflow grid past the
+# walk's split bound the AUTO entry (= the module's own forms there by construction).
+_FORM_CELLS = {
+    (1, 1, 8): "decode_grid",
+    (4, 1, 8): "decode_grid",
+    (1, 2, 16): "decode_grid",
+    (1, 1, 17): "decode_grid",
+    (32, 1, 4): "lean_walk",
+    (32, 1, 8): "auto_overflow",
+    (4, 4, 7): "own",
+    (1, 1, 4): "own",
+}
+
+
+def _form_value(comb, form):
+    return {"decode_grid": comb.DECODE_GRID_AUTO, "auto_overflow": comb.DECODE_GRID_AUTO, "lean_walk": comb.DECODE_GRID_LEAN_WALK, "own": comb.DECODE_GRID_OFF}[
+        form
+    ]
+
+
+def test_sparse_combine_form_pin_follows_the_dense_rule_per_grid(sm107_host_target):
+    """``_sparse_combine_decode_grid`` -- the FORM the sparse adapter compiles a split plan's combine entry with -- is the dense adapter's
+    rule (``prepared._split_combine_decode_grid``) on the sparse grid ``(B, H_q, S_q)``: on cc 10.7 the decode-grid kernel on the small
+    grids from split 8 (B 1 / B 4 x 24 heads: the serving decode cells; the 17-split item too), the lean group walk on the overflow grid
+    (B 32 x S_q 1) at split <= 4, the module's own forms where the rule forces them (a small grid below split 8, B 4 x S_q 4 at split 7),
+    the AUTO entry on an overflow grid past the walk's bound; off cc 10.7 never the walk and never the AUTO entry inside the bound.  The
+    adapter reads the same value back (``combine_form()``, after ``check_support`` on the host-modelled target), ``DECODE_GRID_OFF``
+    unsplit; the two halves of the rule name every pin."""
+    from types import SimpleNamespace
+
+    from cudnn.sdpa.fwd import heuristics as heur
+    from cudnn.sdpa.fwd import prepared as prep
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107, _sparse_combine_decode_grid
+
+    H, KH, rubin = 24, 2, (10, 7)
+    for (b, s_q, split), form in _FORM_CELLS.items():
+        want = _form_value(comb, form)
+        assert _sparse_combine_decode_grid(b, H, s_q, split, rubin) == want, (b, s_q, split, form)
+        # the ONE source of the pin: the dense adapter's rule on the same (B, H_q, S_q, split) at the same device
+        assert prep._split_combine_decode_grid(SimpleNamespace(_device_cc=rubin), b, H, s_q, split) == want, (b, s_q, split)
+        walk = heur.decode_combine_lean_walk_selected(b, H, s_q, split, device_cc=rubin)
+        forced = heur.decode_combine_force_lean(b, H, s_q, split, device_cc=rubin)
+        assert walk is (form == "lean_walk") and forced is (form == "own"), (b, s_q, split, form, walk, forced)
+        inside = heur.decode_combine_lean_blocks(b, H, s_q) <= heur.DECODE_COMBINE_MAX_LEAN_BLOCKS
+        assert inside is (form != "lean_walk" and form != "auto_overflow"), (b, s_q, split)
+        # off the measured line: the module's own forms inside the bound (forced OFF), the AUTO entry outside it (its own forms there)
+        for other in ((10, 0), (10, 3), (12, 0), (9, 0)):
+            assert _sparse_combine_decode_grid(b, H, s_q, split, other) == (comb.DECODE_GRID_OFF if inside else comb.DECODE_GRID_AUTO), (b, s_q, split, other)
+        # the adapter's readback (device_cc (10, 7) in the stand-ins; the target modelled on the host)
+        a = SparseGqaFwdDslSm107(**_decode_operands(B=b, S=s_q, H=H, KH=KH, split_kv=split))
+        assert a.check_support() is True and a.combine_form() == want, (b, s_q, split, form)
+    assert SparseGqaFwdDslSm107(**_decode_operands(B=1, S=1, H=H, KH=KH, split_kv=1)).combine_form() == comb.DECODE_GRID_OFF, "unsplit: no combine"
+    # the selector's vocabulary is the combine module's (the pin names ITS constants; a value the module does not know is refused by compile_ptr)
+    assert {comb.DECODE_GRID_AUTO, comb.DECODE_GRID_OFF, comb.DECODE_GRID_LEAN_WALK} == {0, 2, 3}
+
+
+def test_adapter_compiles_the_combine_with_the_pinned_form_and_the_pdl_switch(monkeypatch, sm107_host_target):
+    """The split combine's ``compile_ptr`` call carries ``decode_grid=`` (the pinned form) and ``use_pdl=`` (the adapter's switch; False
+    here) per plan -- recorded through a stub (the kernel template stubbed too: no device), the form the adapter recorded equal to the
+    kwarg; an unsplit plan compiles no combine."""
+    from functools import lru_cache
+    from types import SimpleNamespace
+
+    import cudnn.frost.compiled_cache as cache
+    import cudnn.frost.template_loader as loader
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    seen = []
+
+    @lru_cache(None)
+    def kernel(**kwargs):
+        return lambda **kw: None
+
+    def combine(**kwargs):
+        seen.append(dict(kwargs))
+        return lambda *a: None
+
+    monkeypatch.setattr(loader, "load_template", lambda *a, **kw: SimpleNamespace(compile=kernel))
+    monkeypatch.setattr(comb, "compile_ptr", combine)
+    monkeypatch.setattr(cache, "positional_entry", lambda owner: owner)
+    for (b, s_q, split), form in _FORM_CELLS.items():
+        a = SparseGqaFwdDslSm107(**_decode_operands(B=b, S=s_q, H=24, KH=2, split_kv=split))
+        a.compile()
+        kw = seen[-1]
+        assert kw["decode_grid"] == _form_value(comb, form) == a._combine_form and kw["use_pdl"] is False, (b, s_q, split, kw)
+        assert (kw["dtype_o"], kw["dtype_partial"], kw["has_lse"], kw["stats_log2"], kw["gate"], kw["dtype_gate"]) == ("bf16", "f32", True, False, False, None)
+    n = len(seen)
+    SparseGqaFwdDslSm107(**_decode_operands(B=1, S=1, H=24, KH=2, split_kv=1)).compile()
+    assert len(seen) == n, "an unsplit plan compiles no combine"
+    # the gated split: the gate rides the combine's entry (dtype_gate named), the form pinned the same way
+    kw = _decode_operands(B=4, S=1, H=24, KH=2, split_kv=8)
+    kw.update(epilogue_gate=_T((4, 1, 24, D), (24 * D, 24 * D, D, 1), "torch.bfloat16"))
+    SparseGqaFwdDslSm107(**kw).compile()
+    assert seen[-1]["gate"] is True and seen[-1]["dtype_gate"] == "bf16" and seen[-1]["decode_grid"] == comb.DECODE_GRID_AUTO
+
+
+def test_adapter_declines_use_pdl_by_name_until_the_core_carries_the_sites(sm107_host_target):
+    """``use_pdl=True`` on the sparse adapter is a typed decline naming the missing sites (the kernel body carries no ``griddepcontrol``
+    site on this tree, so a dependent launch of it with the attribute would read its operands before the predecessor's writes land); the
+    default (``False``) is served, and the flag is a recorded constructor fact.  The kernel source has no site (the pin that inverts when
+    the sites land)."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    kw = _decode_operands(B=1, S=1, H=24, KH=2, split_kv=8)
+    off = SparseGqaFwdDslSm107(**kw)
+    assert off.use_pdl is False and off.check_support() is True
+    on = SparseGqaFwdDslSm107(**kw, use_pdl=True)
+    assert on.use_pdl is True
+    with pytest.raises(NotImplementedError, match="use_pdl=True is not served by the kernel body yet") as e:
+        on.check_support()
+    assert "griddepcontrol" in str(e.value) and "declare use_pdl=False" in str(e.value)
+    with pytest.raises(NotImplementedError, match="use_pdl=True is not served by the kernel body yet"):
+        SparseGqaFwdDslSm107(**_operands(S=8), use_pdl=True).check_support()  # the prefill form alike: one switch, one decline
+    code = _code(_kernel_source())
+    assert "griddepcontrol" not in code and "wait_on_dependent_grids" not in code and "launch_dependent_grids" not in code
+
+
+def _combine_kernels_of(fn):
+    """The combine kernel names (``cudnn_kernel__combine*``) the CUDA profiler sees while ``fn`` runs; ``None`` when the node recorded
+    no CUDA event at all (CUPTI unavailable: the caller skips the name assertion by name)."""
+    from torch.profiler import ProfilerActivity, profile
+
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        fn()
+        torch.cuda.synchronize()
+    events = [e for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA]
+    if not events:
+        return None
+    return {e.name for e in events if e.name.startswith("cudnn_kernel__combine")}
+
+
+def _former_combine_entry(gate: bool):
+    """The combine entry the sparse adapter compiled BEFORE the form pin: ``compile_ptr`` without ``decode_grid`` (= ``DECODE_GRID_OFF``,
+    the module's own three-way rule on every device) and without ``use_pdl`` -- the develop entry, run here over the adapter's own partials."""
+    from cudnn.frost.compiled_cache import positional_entry
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
+
+    return positional_entry(
+        comb.compile_ptr(dtype_o="bf16", dtype_partial="f32", has_lse=True, stats_log2=False, gate=gate, dtype_gate="bf16" if gate else None)
+    )
+
+
+def _pinned_form_cell(B, S_q, split, gate, with_lse, seed):
+    """One decode cell through the adapter with the pinned combine form: returns ``(adapter, o, lse, ws, gate_t, ref_o, ref_lse, run)`` --
+    ``run`` executes the adapter once more into the same O / LSE / workspace (the census hook)."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    H, KH, top_k, dtype = 24, 2, 512, torch.bfloat16
+    kv_lens = {1: [8192], 4: [8192, 2052, 4097, 7000], 6: [8192, 300, 2052, 4097, 7000, 1024]}[B]
+    SKV = 8192
+    q, k, v, g = _inputs(B, S_q, H, KH, dtype, seed, SKV=SKV)
+    ids, lens = _decode_lists("shuffled", B, S_q, top_k, kv_lens, g)
+    scale = 1.0 / math.sqrt(D)
+    gate_t = (torch.randn(B, S_q, H, D, device=q.device, dtype=torch.float32, generator=g) * 2.0).to(dtype) if gate else None
+    ref_o, ref_lse, _ = _reference_decode(q, k, v, ids, lens, kv_lens, scale, top_k)
+    if gate:
+        ref_o = ref_o * torch.sigmoid(gate_t.float())
+    dev = q.device
+    sent = _sentinel(dtype)
+    o = torch.full((B, S_q, H, D), sent, device=dev, dtype=dtype)
+    lse = torch.full((B, H, S_q), sent, device=dev, dtype=torch.float32) if with_lse else None
+    a = SparseGqaFwdDslSm107(
+        q=q,
+        k=k,
+        v=v,
+        o=o,
+        lse=lse,
+        block_ids=ids,
+        block_lens=lens,
+        seq_kv_lens=torch.tensor(kv_lens, device=dev, dtype=torch.int32),
+        top_k=top_k,
+        scale=scale,
+        list_per_sequence=True,
+        bottom_right=True,
+        split_kv=split,
+        epilogue_gate=gate_t,
+    )
+    assert a.check_support()
+    a.compile()
+    ws = torch.full((a.scratch_workspace_bytes() // 4,), 1.5e30, device=dev, dtype=torch.float32)
+
+    def run():
+        a.execute(stream=_stream(), workspace=ws)
+
+    run()
+    torch.cuda.synchronize()
+    return a, o, lse, ws, gate_t, ref_o, ref_lse, run
+
+
+_PINNED_FORM_CELLS = [
+    pytest.param(1, 1, 8, False, True, "decode_grid", id="B1-Sq1-split8-decode-grid-lse"),
+    pytest.param(4, 1, 8, True, True, "decode_grid", id="B4-Sq1-split8-decode-grid-gated-lse"),
+    pytest.param(1, 2, 16, False, True, "decode_grid", id="B1-Sq2-split16-decode-grid-shared-list"),
+    pytest.param(6, 1, 4, False, False, "lean_walk", id="B6-Sq1-split4-lean-walk-no-lse-output"),
+    pytest.param(6, 1, 4, True, True, "lean_walk", id="B6-Sq1-split4-lean-walk-gated-lse"),
+    pytest.param(4, 4, 7, False, True, "own", id="B4-Sq4-split7-own-forms"),
+    pytest.param(1, 1, 4, True, True, "own", id="B1-Sq1-split4-own-forms-gated"),
+    pytest.param(1, 1, 17, False, True, "decode_grid", id="B1-Sq1-split17-decode-grid-fp32-association"),
+]
+
+
+@requires_rubin
+@pytest.mark.parametrize("B, S_q, split, gate, with_lse, form", _PINNED_FORM_CELLS)
+def test_decode_form_combine_takes_the_pinned_form_and_is_bitwise_the_former_entry(B, S_q, split, gate, with_lse, form):
+    """The decode form with the combine's FORM pinned per plan (the decode-grid kernel on the small grids from split 8, the lean group
+    walk on the overflow grid at split <= 4, the module's own forms otherwise): within the budget vs the oracle (gated exactly where the
+    gate rides the combine), and -- over the SAME fp32 partials the adapter's kernel wrote -- BITWISE the FORMER entry (``compile_ptr``
+    without a form, the module's own three-way rule) on O and LSE up to 16 splits, the forms' shared arithmetic; at 17 splits the
+    decode-grid kernel associates its eight chain partials differently, so O agrees within one output ulp and the LSE within fp32
+    rounding (the former entry there is the module's decode form, itself another association).  Two launches bitwise."""
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
+
+    a, o, lse, ws, gate_t, ref_o, ref_lse, run = _pinned_form_cell(B, S_q, split, gate, with_lse, seed=100 + split)
+    assert a.combine_form() == _form_value(comb, form) == a._combine_form, (form, a._combine_form)
+    H = 24
+    lse_check = lse if with_lse else ws[a._split_workspace_layout()[2] // 4 :][: B * H * S_q].view(B, H, S_q)
+    max_o, max_lse = _check([(o, lse_check)], ref_o, ref_lse)
+    o1, lse1 = o.clone(), lse_check.clone()
+    run()
+    torch.cuda.synchronize()
+    assert torch.equal(o, o1) and torch.equal(lse_check, lse1), "two launches are not bitwise"
+    # the former entry over the adapter's own partials (the workspace the kernel just wrote), into fresh O / LSE buffers
+    o_off, lse_off, fin_off, _total = a._split_workspace_layout()
+    base = int(ws.data_ptr())
+    o2 = torch.full_like(o, _sentinel(o.dtype))
+    lse2 = torch.full((B, H, S_q), _sentinel(o.dtype), device=o.device, dtype=torch.float32)
+    args = [base + o_off, base + lse_off, int(o2.data_ptr()), int(lse2.data_ptr()), (B, H, S_q, D), split, tuple(o2.stride()), tuple(lse2.stride())]
+    if gate:
+        args += [int(gate_t.data_ptr()), tuple(gate_t.stride())]
+    _former_combine_entry(gate)(*args, int(_stream()))
+    torch.cuda.synchronize()
+    live = ~torch.isinf(ref_lse)  # [B, H, S]
+    if split <= 16:
+        assert torch.equal(o2, o1) and torch.equal(lse2, lse1), f"{form} at split {split}: the pinned form differs from the former entry on the same partials"
+        verdict = "bitwise the former entry"
+    else:
+        d = (o2.float() - o1.float()).abs()
+        ulps = d.cpu() / _ulp_of(torch.maximum(o2.float().abs(), o1.float().abs()), o.dtype)
+        d_lse = float((lse2 - lse1)[live].abs().max())
+        assert float(ulps.max()) <= 1.0 and d_lse <= 1e-5, f"split {split}: {float(ulps.max()):.3f} ulp / |dLSE| {d_lse:.2e} vs the former entry"
+        verdict = f"within {float(ulps.max()):.3f} output ulp / |dLSE| {d_lse:.2e} of the former entry (two fp32 associations)"
+    print(f"\npinned combine form {form} B={B} S_q={S_q} split={split} gate={gate} lse={with_lse}: max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}; {verdict}")
+
+
+@requires_rubin
+@pytest.mark.parametrize("B, S_q, split, gate, with_lse, form", _PINNED_FORM_CELLS[:1] + _PINNED_FORM_CELLS[3:4] + _PINNED_FORM_CELLS[5:7])
+def test_decode_form_combine_launches_the_pinned_kernel(B, S_q, split, gate, with_lse, form):
+    """The kernel the profiler sees for the combine launch is the pinned form's: ``_combine_decode_grid_kernel`` on the small grid at
+    split 8, ``_combine_lean_walk_kernel`` on the overflow grid at split 4, the module's own kernels where the rule forces them."""
+    a, o, lse, ws, gate_t, ref_o, ref_lse, run = _pinned_form_cell(B, S_q, split, gate, with_lse, seed=200 + split)
+    names = _combine_kernels_of(run)
+    if names is None:
+        pytest.skip("torch.profiler recorded no CUDA event (CUPTI unavailable on this node): the kernel name is unverified here")
+    want = _FORM_KERNEL[form]
+    assert len(names) == 1 and any(next(iter(names)).startswith(w) for w in want), (form, names)
+    others = {k for f, ks in _FORM_KERNEL.items() if f != form for k in ks}
+    assert not any(next(iter(names)).startswith(w) for w in others), (form, names)
+    print(f"\npinned combine form {form} B={B} S_q={S_q} split={split}: the profiler saw {sorted(names)}")
