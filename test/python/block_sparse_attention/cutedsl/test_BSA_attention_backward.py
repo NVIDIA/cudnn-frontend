@@ -15,11 +15,11 @@ pytestmark = [pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclu
 
 def _import_bsa():
     try:
-        from cudnn import BSA
+        from cudnn import ops
 
         importlib.import_module("cudnn.block_sparse_attention._interface")
 
-        return BSA
+        return ops
     except (ImportError, OSError) as error:
         pytest.skip(f"block sparse attention optional dependencies are unavailable: {error}")
 
@@ -94,7 +94,7 @@ def test_bsa_sm100_blk64_sum_odo_fp32_product(seqlen, layout):
 @pytest.mark.L0
 @torch_fork_set_rng(seed=2)
 def test_bsa_attention_backward_fixed_blocks():
-    BSA = _import_bsa()
+    ops = _import_bsa()
     block_size = supported_block_size(backward=True)
     batch, heads, seqlen_q, seqlen_k, dim = 1, 2, 2 * block_size, 4 * block_size, 128
     q = torch.randn((batch, heads, seqlen_q, dim), device="cuda", dtype=torch.bfloat16)
@@ -105,7 +105,7 @@ def test_bsa_attention_backward_fixed_blocks():
     mask = block_sparse_mask(q2k, block_sparse_num, block_sizes, seqlen_q, seqlen_k, block_size)
     _, _, dq_ref, dk_ref, dv_ref = attention_backward_reference(q, k, v, do, mask)
 
-    forward = BSA.block_sparse_attention_forward(
+    forward = ops.block_sparse_attention_forward(
         q,
         k,
         v,
@@ -114,7 +114,7 @@ def test_bsa_attention_backward_fixed_blocks():
         block_sizes,
         sparse_block_size=block_size,
     )
-    backward = BSA.block_sparse_attention_backward(
+    backward = ops.block_sparse_attention_backward(
         do,
         q,
         k,
@@ -132,7 +132,7 @@ def test_bsa_attention_backward_fixed_blocks():
 
     q_bshd, k_bshd, v_bshd = (tensor.transpose(1, 2) for tensor in (q, k, v))
     do_bshd = do.transpose(1, 2)
-    forward_bshd = BSA.block_sparse_attention_forward(
+    forward_bshd = ops.block_sparse_attention_forward(
         q_bshd,
         k_bshd,
         v_bshd,
@@ -145,7 +145,7 @@ def test_bsa_attention_backward_fixed_blocks():
     dq_bshd = torch.empty_like(q_bshd)
     dk_bshd = torch.empty_like(k_bshd)
     dv_bshd = torch.empty_like(v_bshd)
-    backward_bshd = BSA.block_sparse_attention_backward(
+    backward_bshd = ops.block_sparse_attention_backward(
         do_bshd,
         q_bshd,
         k_bshd,
@@ -196,7 +196,7 @@ def test_bsa_attention_backward_sm100_blk64(
     if major not in {10, 11}:
         pytest.skip("blk64 backward test is specific to SM100/SM110")
 
-    BSA = _import_bsa()
+    ops = _import_bsa()
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
     if variable_counts:
         # Keep this small case on the paired-KV path, whose shared dK/dV needs the FP32 workspace.
@@ -237,7 +237,7 @@ def test_bsa_attention_backward_sm100_blk64(
     dk = torch.full_like(k, torch.nan)
     dv = torch.full_like(v, torch.nan)
 
-    forward = BSA.block_sparse_attention_forward(
+    forward = ops.block_sparse_attention_forward(
         q,
         k,
         v,
@@ -249,7 +249,7 @@ def test_bsa_attention_backward_sm100_blk64(
         use_clc=False,
         q2k_block_nums=counts,
     )
-    backward = BSA.block_sparse_attention_backward(
+    backward = ops.block_sparse_attention_backward(
         do,
         q,
         k,
@@ -294,7 +294,7 @@ def test_bsa_attention_backward_blk128_dk_zero_init_accumulate_transition(num_q_
     if major not in {10, 11}:
         pytest.skip("blk128 backward is specific to SM100/SM110")
 
-    BSA = _import_bsa()
+    ops = _import_bsa()
     block_size = 128
     batch, heads, dim = 1, 1, 128
     seqlen_q = num_q_blocks * block_size
@@ -313,7 +313,7 @@ def test_bsa_attention_backward_blk128_dk_zero_init_accumulate_transition(num_q_
     mask = block_sparse_mask(q2k, block_sparse_num, full_block_sizes, seqlen_q, seqlen_k, block_size)
     _, _, dq_ref, dk_ref, dv_ref = attention_backward_reference(q, k, v, do, mask)
 
-    forward = BSA.block_sparse_attention_forward(
+    forward = ops.block_sparse_attention_forward(
         q,
         k,
         v,
@@ -322,7 +322,7 @@ def test_bsa_attention_backward_blk128_dk_zero_init_accumulate_transition(num_q_
         None,
         sparse_block_size=block_size,
     )
-    backward = BSA.block_sparse_attention_backward(
+    backward = ops.block_sparse_attention_backward(
         do,
         q,
         k,

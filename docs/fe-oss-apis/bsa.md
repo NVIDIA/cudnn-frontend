@@ -40,12 +40,9 @@ environments that force an older DSL.
 
 ## Forward
 
-The `cudnn.torch` BSA functions are lazy aliases of the existing `cudnn` and
-`cudnn.BSA` functions, with identical signatures, outputs, and supported configurations.
-
 ```python
 import torch
-from cudnn.torch import (
+from cudnn.ops import (
     block_sparse_attention_forward,
     block_sparse_attention_backward,
     block_sparse_attention_fp8_forward,
@@ -362,7 +359,7 @@ Compilation is lazy. The first call for a new static configuration JIT-compiles
 the relevant kernel; subsequent calls reuse an in-process cache.
 
 The Torch public surface consists of allocating function wrappers under
-`cudnn.torch`, also available under `cudnn` and `cudnn.BSA`; there is no separate `APIBase` class or explicit `compile()`
+`cudnn.ops`, also available under `cudnn` and `cudnn.BSA`; there is no separate `APIBase` class or explicit `compile()`
 lifecycle for BSA.
 
 Correctness tests and FP32 references are under
@@ -377,12 +374,12 @@ toward Speed of Light.
 
 ## Experimental JAX support
 
-`cudnn.jax.block_sparse_attention_forward` and
-`cudnn.jax.block_sparse_attention_backward` provide explicit forward/backward;
+`cudnn.ops.block_sparse_attention_forward_jax` and
+`cudnn.ops.block_sparse_attention_backward_jax` provide explicit forward/backward;
 `cudnn.jax.block_sparse_attention` adds first-order reverse-mode differentiation.
 All three accept JAX arrays, eagerly or under `jax.jit`, and require no PyTorch.
-The existing `cudnn` and `BSA` Torch APIs are unchanged. The former `_jax`
-exports have been removed without compatibility aliases.
+`cudnn.jax.block_sparse_attention_forward` and `cudnn.jax.block_sparse_attention_backward`
+have been removed; use the `cudnn.ops` names.
 
 The JAX implementation reuses the SM100 blk128 forward, bucketed CSR, backward preprocess,
 backward, and gradient conversion kernels. Install `jax[cuda13]` alongside the
@@ -423,10 +420,10 @@ runtime operands. Do not mutate saved forward inputs or metadata before backward
 import jax
 import jax.numpy as jnp
 from functools import partial
-from cudnn.jax import (
-    block_sparse_attention_forward as forward,
-    block_sparse_attention_backward as backward,
-    block_sparse_attention as attention,
+from cudnn.jax import block_sparse_attention as attention
+from cudnn.ops import (
+    block_sparse_attention_forward_jax as forward,
+    block_sparse_attention_backward_jax as backward,
 )
 
 q = jnp.ones((1, 2, 256, 64), dtype=jnp.bfloat16)

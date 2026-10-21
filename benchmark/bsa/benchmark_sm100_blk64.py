@@ -56,7 +56,7 @@ def main():
 
     import torch
     import cudnn
-    from cudnn import BSA
+    from cudnn import ops
 
     root = args.expected_source_root.resolve()
     expected_package = root / "python" / "cudnn"
@@ -86,12 +86,12 @@ def main():
     kwargs = dict(block_sparse_num=width, block_sizes=sizes, q2k_block_nums=counts, sparse_block_size=64, layout=args.layout)
 
     def forward():
-        return BSA.block_sparse_attention_forward(q, k, v, indices, **kwargs)
+        return ops.block_sparse_attention_forward(q, k, v, indices, **kwargs)
 
     output, lse = forward()
 
     def backward():
-        return BSA.block_sparse_attention_backward(do, q, k, v, output, lse, indices, **kwargs, bucket_size_blocks=args.bucket_size)
+        return ops.block_sparse_attention_backward(do, q, k, v, output, lse, indices, **kwargs, bucket_size_blocks=args.bucket_size)
 
     flush = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device="cuda")
     fwd_times, final_forward = measure(forward, args.warmup, args.repeats, args.rounds, flush)
