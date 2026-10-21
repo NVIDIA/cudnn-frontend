@@ -74,7 +74,7 @@ from cudnn.sdpa.fwd.config_sm107 import (
     SM107_FP32_VECTOR_WITH_BIAS_TILE_N,
     SM107_TILE_NS_BY_D_SHAPE,
 )
-from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR
+from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR, tile_domain as _sm120_tile_domain
 
 # The DSL adapters (api_dsl) and cuda.bindings are LOWERING dependencies, not
 # support-check ones: importing them here would drag the CuTe DSL (~1.0 s, 357
@@ -1573,7 +1573,13 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 # Not on the d256 decode tile's split: its gate is applied by
                 # the combine, element-wise on the real O.
                 return "PackGQA cannot ride the fused epilogue gate (only the d256 decode tile's split applies the gate in its combine)"
-            _pg_tile_m = knobs.tile_m if knobs.tile_m is not None else max(capabilities.tile_ms)
+            if knobs.tile_m is not None:
+                _pg_tile_m = knobs.tile_m
+            elif capabilities.sm_lo == _BLACKWELL_GEFORCE[0]:
+                # The adapter's own Q tile: the flavor's largest (one 64-row tile on the D=512 templates).
+                _pg_tile_m = max(m for m, _ in _sm120_tile_domain(facts.d_qk, facts.d_v, facts.is_fp8 or facts.is_mxfp8))
+            else:
+                _pg_tile_m = max(capabilities.tile_ms)
             _partial = pack_gqa_partial(capabilities, facts)
             # The decode tile packs the WHOLE group into its 16-row Q tile whatever tile_m (24/2: 12 live
             # rows + 4 zero tail rows), so the prefill tiles' divisibility rule does not apply to a Rubin

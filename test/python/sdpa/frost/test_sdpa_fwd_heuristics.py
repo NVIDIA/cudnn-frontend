@@ -433,7 +433,8 @@ def _sm120_gqa6_facts(**over):
 @pytest.mark.parametrize("row", sorted(_SM120_ROW_FACTS))
 def test_sm120_packs_a_gqa_ratio_the_tile_does_not_divide(row):
     """Every SM120 template packs any GQA group up to the tile (the rows past (tile_m // G) * G are dead), at
-    D=128, 256 and 512, and declines a group past the tile. Every other row requires divisibility."""
+    D=128, 256 and 512, and declines a group past the tile. An unset tile_m is the adapter's own Q tile: 64 rows on
+    the D=512 templates, so 96 / 1 is declined there and 64 / 1 admitted. Every other row requires divisibility."""
     from cudnn.sdpa.fwd.config_sm100 import pack_gqa_supported
     from cudnn.sdpa.fwd.config_sm120 import tile_domain
 
@@ -450,6 +451,15 @@ def test_sm120_packs_a_gqa_ratio_the_tile_does_not_divide(row):
             assert reason(tile, d_qk=d, d_v=d, h_q=20) is None, (d, tile)  # G = 5
             refused = reason(tile, d_qk=d, d_v=d, h_q=2 * tile[0], h_kv=1)
             assert refused is not None and f"does not pack at tile_m={tile[0]}" in refused, (d, tile, refused)
+
+    def unset(h_q, d):
+        facts = _sm120_gqa6_facts(**{**_SM120_ROW_FACTS[row], **dict(h_q=h_q, h_kv=1, d_qk=d, d_v=d)})
+        return engines.mismatch(caps, facts, engines.SdpaFwdKnobs(pack_gqa=True))
+
+    refused = unset(96, 512)
+    assert refused is not None and "does not pack at tile_m=64" in refused, refused
+    assert unset(64, 512) is None
+    assert unset(96, 256) is None  # 128 rows below D=512
     assert pack_gqa_supported(24, 4, 64, requires_divisible=False) and pack_gqa_supported(64, 1, 64, requires_divisible=False)
     assert not pack_gqa_supported(128, 1, 64, requires_divisible=False) and not pack_gqa_supported(24, 5, 64, requires_divisible=False)
     assert not pack_gqa_supported(24, 4, 64)  # the full-ratio contract the other rows keep
