@@ -476,7 +476,9 @@ stream; a CUDA graph that captures a block's FIRST execute records those uploads
 re-writes the same ones), so warm the block up on the capture stream before capturing, as every capture of the block does.
 `qsa_select` itself creates its cached constants (the constant head weights, the packed-K row offsets, the e4m3 arm's unit scale
 blobs) on the launch stream of the first call that needs them and orders a later call on another stream behind that fill through
-an event recorded at the creation (not inside a capture, where no such event can be waited on -- the warm-up rule above covers it).
+an event recorded at the creation (not inside a capture, where no such event can be waited on -- the warm-up rule above covers it);
+the head weights and the unit scale blobs are bucketed by power-of-two capacity (one flat allocation per bucket, the scorer handed a
+view in the exact packed shape), so a serving process's distinct geometries keep O(log n) such constants resident, never one per shape.
 
 **What the suite asserts** (`test_block_qsa_end_to_end.py`, the two-stage oracle): the selection as a SET against the
 top-k of the scores recomputed in fp64 from the kernel's own bf16 queries and compressed keys up to ties; against the

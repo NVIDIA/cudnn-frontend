@@ -282,6 +282,144 @@ def test_qsa_select_creates_its_constants_on_the_launch_stream_with_the_ambient_
     torch.cuda.synchronize()
 
 
+def _poison_a_block_of(nbytes: int, device) -> int:
+    """The allocator block an ``nbytes`` allocation on torch's CURRENT stream would reuse, filled with ZEROS first (freed right away): a
+    fill that has not landed cannot hide behind stale right bytes.  Returns the poisoned block's address (a premise diagnostic)."""
+    poison = torch.zeros(nbytes, dtype=torch.uint8, device=device)
+    torch.cuda.synchronize()
+    ptr = poison.data_ptr()
+    del poison
+    return ptr
+
+
+def _unit_scale_capacity(numel: int) -> int:
+    return 1 << (max(1, numel) - 1).bit_length()
+
+
+@needs_cuda
+@needs_dsl_floor
+def test_qsa_select_unit_scale_blobs_share_one_bucket_per_capacity_and_are_created_on_the_launch_stream(monkeypatch):
+    """The e4m3 arm's unit scale blobs are cached per (device, power-of-two CAPACITY), never per exact shape -- the scorer stubbed so any
+    CUDA device runs it.  Two geometries whose Q scale blobs round to one capacity (T = 256 and T = 300 tokens: (1, 1152, 4) and
+    (1, 1408, 4) elements, both inside 8192) share ONE storage -- one cache entry per capacity, one base address --, and a larger
+    geometry (T = 2048: (1, 8320, 4), 65536) allocates the next bucket without touching the first.  Every blob the scorer receives is
+    a contiguous E8M0 view in the exact packed shape at the base of a cached bucket, 16-byte aligned.  The bucket is created on the
+    LAUNCH stream: with the ambient stream parked by a long spin and the allocator blocks a creation on the ambient stream would reuse
+    poisoned with zeros, the stub reading both blobs on the launch stream sees 127 (= 2^0) in every byte (a control call ahead of the park
+    loads every kernel of the path first: a first use loads its module lazily and synchronizes the device).  The previous form cached one
+    blob per exact shape: three entries after the first two calls, two base addresses for the two Q blobs."""
+    if not hasattr(torch.cuda, "_sleep"):
+        pytest.skip("torch.cuda._sleep is the park; the matmul fallback is too short")
+    import time
+
+    import cuda.bindings.driver as cuda_drv
+
+    import cudnn.deepseek_sparse_attention.indexer_forward as dsa_fwd
+
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from gated_block_stream_probe import park_the_default_stream
+
+    device = torch.device("cuda")
+    index = torch.cuda.current_device()
+    ambient, side = torch.cuda.default_stream(), torch.cuda.Stream()
+    assert torch.cuda.current_stream() == ambient and side != ambient
+    seen = {}
+
+    def stub(q, k, weights, **kw):
+        # what the scorer does with the scale blobs: read them on the LAUNCH stream
+        blobs = {"q_scale": kw["q_scale"], "k_scale": kw["k_scale"]}
+        with torch.cuda.stream(side):
+            seen["not_127"] = {name: (blob.view(torch.uint8) != 127).sum() for name, blob in blobs.items()}
+        seen["blobs"] = blobs
+        total = q.shape[0]
+        return {"indices": torch.full((total, kw["top_k"]), -1, dtype=torch.int32, device=device), "logits": torch.zeros(total, kw["top_k"], device=device)}
+
+    n_blocks_of = {256: 128, 300: 128, 2048: 512}
+    prepared = {}
+    for total, n_blocks in n_blocks_of.items():  # every input BEFORE the park: a host tensor's upload would block the host on the parked stream
+        qi, kbar, cu = _inputs([total], n_blocks, device, seed=total)
+        prepared[total] = (qi.to(_E4M3), kbar.to(_E4M3), cu)
+    torch.cuda.synchronize()
+
+    def select(total, stream=side):
+        q8, k8, cu = prepared[total]
+        qsa_select(q8, k8, cu, top_k=16, stream=None if stream is None else cuda_drv.CUstream(stream.cuda_stream))
+        return seen.pop("blobs")
+
+    def packed_q_rows(total):  # the e4m3 arm's Q scale rows: (T + 31) tokens x 4 heads, rounded up to the 128-row scale atom
+        return -(-((total + 31) * _H) // 128) * 128
+
+    q_numel_a, q_numel_b, k_numel = packed_q_rows(256) * 4, packed_q_rows(300) * 4, 128 * 4
+    assert _unit_scale_capacity(q_numel_a) == _unit_scale_capacity(q_numel_b) == 8192 and _unit_scale_capacity(k_numel) == 512, "the premise of the geometry"
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 0))  # the scorer's family; the stub never launches it
+    monkeypatch.setattr(dsa_fwd, "indexer_forward_top_k_wrapper", stub)
+    monkeypatch.setattr(qsa_mod, "_unit_scale_cache", {})  # the live cache set aside for the whole test (restored after it)
+    # the control on the ambient stream: every kernel of the e4m3 path and of the stub LOADED (a kernel's first use in a process loads its
+    # module lazily and synchronizes the device, which would end the park under the measured call) and the weight / K-prefix caches warm
+    select(256, stream=None)
+    seen.clear()
+    torch.cuda.synchronize()
+    monkeypatch.setattr(qsa_mod, "_unit_scale_cache", {})  # the blob cache COLD for the measured calls
+    poisoned = {n: _poison_a_block_of(n, device) for n in (8192, 512)}
+    park_the_default_stream(3.0)  # the AMBIENT stream is busy from here, through the first call and past its issue
+    parked_before_call = not ambient.query()
+    t0 = time.perf_counter()
+    first = select(256)
+    issue_s = time.perf_counter() - t0
+    parked_at_issue = not ambient.query()
+    with torch.cuda.stream(side):
+        not_127 = {name: int(v.cpu()) for name, v in seen["not_127"].items()}  # read back through the LAUNCH stream only (the ambient one is still parked)
+    side.synchronize()
+    second = select(300)
+    entries_after_two = len(qsa_mod._unit_scale_cache)
+    third = select(2048)
+    torch.cuda.synchronize()  # the park is over: the cache and the views can be inspected on any stream
+    assert parked_before_call and parked_at_issue, (
+        f"the premise: the ambient stream must be busy before ({parked_before_call}) and after ({parked_at_issue}) the first call was issued "
+        f"(the call took {issue_s:.2f} s of host time)"
+    )
+    print(
+        f"first blobs at q 0x{first['q_scale'].data_ptr():x} k 0x{first['k_scale'].data_ptr():x}; poisoned {', '.join(f'{n} B at 0x{p:x}' for n, p in poisoned.items())}"
+    )
+    assert not_127 == {"q_scale": 0, "k_scale": 0}, f"bytes other than 127 read on the launch stream: {not_127} (the fill sat on the parked ambient stream)"
+    # (a) the two geometries of one Q capacity (and one K shape) share their storage: two entries, one base address each
+    assert entries_after_two == 2, f"{entries_after_two} cache entries after two geometries of one Q capacity and one K shape (one blob per capacity: Q and K)"
+    assert first["q_scale"].data_ptr() == second["q_scale"].data_ptr(), "the two Q blobs of one capacity do not share a storage"
+    assert first["k_scale"].data_ptr() == second["k_scale"].data_ptr()
+    # (b) the larger geometry allocates the next buckets (Q 65536, K 2048) and leaves the first two alone
+    assert set(qsa_mod._unit_scale_cache) == {(index, 8192), (index, 512), (index, 65536), (index, 2048)}, f"keys {sorted(qsa_mod._unit_scale_cache)}"
+    assert third["q_scale"].data_ptr() != first["q_scale"].data_ptr() and third["k_scale"].data_ptr() != first["k_scale"].data_ptr()
+    assert all(v[0].dim() == 1 and v[0].numel() == c for (_, c), v in qsa_mod._unit_scale_cache.items()), "a bucket's blob is not a flat blob of its capacity"
+    assert all(bool((v[0].view(torch.uint8) == 127).all()) for v in qsa_mod._unit_scale_cache.values()), "a bucket holds a byte other than 127"
+    # (c) every view: the exact packed shape, E8M0, contiguous, 16-byte aligned, at the base of a cached bucket
+    bases = {entry[0].data_ptr() for entry in qsa_mod._unit_scale_cache.values()}
+    for call, total in ((first, 256), (second, 300), (third, 2048)):
+        assert tuple(call["q_scale"].shape) == (1, packed_q_rows(total), 4) and tuple(call["k_scale"].shape) == (1, n_blocks_of[total], 4)
+        for name, blob in call.items():
+            assert (
+                blob.dtype == torch.float8_e8m0fnu and blob.is_contiguous() and blob.data_ptr() % 16 == 0
+            ), f"{name} of T = {total}: {blob.dtype}, {blob.stride()}"
+            assert blob.data_ptr() in bases, f"{name} of T = {total} is not at the base of a cached bucket"
+
+
+@needs_cuda
+def test_unit_scale_blob_views_of_one_bucket_keep_the_batched_decode_packing_contiguous(monkeypatch):
+    """The decode form's blobs are batched, (B, rows, 4): a view of the flat bucket's leading elements stays contiguous for B > 1 (a 3-D
+    slice of a larger blob would carry the larger row stride), shares the bucket with a prefill-shaped blob of the same capacity and a
+    smaller one, and reads 127 in every byte.  The previous form cached one blob per exact shape (three entries)."""
+    device = torch.device("cuda")
+    monkeypatch.setattr(qsa_mod, "_unit_scale_cache", {})
+    decode = qsa_mod._unit_scale_blob((3, 128, 4), device)  # 1536 elements -> the 2048 bucket
+    prefill = qsa_mod._unit_scale_blob((1, 384, 4), device)  # 1536 elements in another shape -> the same bucket
+    smaller = qsa_mod._unit_scale_blob((1, 300, 4), device)  # 1200 elements -> the same bucket
+    torch.cuda.synchronize()
+    assert len(qsa_mod._unit_scale_cache) == 1, f"{len(qsa_mod._unit_scale_cache)} cache entries for three shapes of one capacity"
+    assert decode.data_ptr() == prefill.data_ptr() == smaller.data_ptr()
+    for t, shape in ((decode, (3, 128, 4)), (prefill, (1, 384, 4)), (smaller, (1, 300, 4))):
+        assert tuple(t.shape) == shape and t.is_contiguous() and t.dtype == torch.float8_e8m0fnu and t.data_ptr() % 16 == 0, f"{shape}: {t.stride()}"
+        assert bool((t.view(torch.uint8) == 127).all())
+
+
 # --------------------------------------------------------------------------------------------- accept cells
 
 

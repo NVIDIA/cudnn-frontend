@@ -106,7 +106,7 @@ def indexer_scorer_head_groups() -> tuple:
 
 _cu_k_cache: dict = {}  # (device index, B, n_blocks_max) -> (the int32 row offsets, the filling stream's handle, its fill event or None)
 _cu_k_cache_lock = Lock()
-_unit_scale_cache: dict = {}  # (device index, shape) -> (the E8M0 ones blob, the filling stream's handle, its fill event or None)
+_unit_scale_cache: dict = {}  # (device index, capacity) -> (the flat E8M0 ones blob of that capacity, the filling stream's handle, its fill event or None)
 _unit_scale_cache_lock = Lock()
 
 
@@ -160,22 +160,34 @@ def _constant_weights(numel: int, device: torch.device) -> torch.Tensor:
     return buf[:numel]
 
 
+def _unit_scale_capacity(numel: int) -> int:
+    """The power-of-two capacity bucket of a ``numel``-element unit scale blob (the constant weights' rule, :func:`_constant_weights`)."""
+    return 1 << (max(1, int(numel)) - 1).bit_length()
+
+
 def _unit_scale_blob(shape: tuple, device: torch.device) -> torch.Tensor:
     """An all-ones E8M0 scale tensor of ``shape`` (``(L, rows, sf_groups)``): the plain-e4m3 scorer's scale factors.
 
-    Every byte is 127 (= 2^0), so the MXFP8 scorer multiplies by 1.0 and computes the plain e4m3 x e4m3 dot. Cached per
-    exact shape and never evicted (a CUDA graph may retain the address captured at warm-up); the blob is 1/32 of the data.
-    Created on the launch stream of the first call that needs it and ordered for every other stream (:func:`_cached_constant`).
+    Every byte is 127 (= 2^0), so the MXFP8 scorer multiplies by 1.0 and computes the plain e4m3 x e4m3 dot.  The storage is ONE
+    flat blob per ``(device, capacity)`` with the capacity rounded up to a power of two (the constant weights' rule), so a process
+    that serves many geometries holds O(log n) blobs, never one per distinct shape; a blob is never evicted (a CUDA graph may retain
+    the address captured at warm-up), is created on the launch stream of the first call that needs its bucket and is ordered for
+    every other stream (:func:`_cached_constant`); the blob is 1/32 of the data.  The result is the bucket's leading ``numel``
+    elements viewed in ``shape``: a contiguous E8M0 view at the bucket's base address (the allocator's 16-byte-aligned block start)
+    -- the exact packed shape the scorer checks, the dtype, the contiguity and the alignment its CuTe tensor conversion assumes.
     """
     index = _device_index(device)
     dims = tuple(int(x) for x in shape)
-    return _cached_constant(
+    numel = math.prod(dims)
+    capacity = _unit_scale_capacity(numel)
+    blob = _cached_constant(
         _unit_scale_cache,
         _unit_scale_cache_lock,
-        (index, dims),
+        (index, capacity),
         index,
-        lambda: torch.ones(dims, dtype=torch.float32, device=torch.device("cuda", index)).to(_E8M0),
+        lambda: torch.ones((capacity,), dtype=torch.float32, device=torch.device("cuda", index)).to(_E8M0),
     )
+    return blob[:numel].view(dims)
 
 
 def _round_up(x: int, m: int) -> int:
@@ -620,7 +632,7 @@ def qsa_select_decode(
         fp8_kwargs = {}
         if fp8:
             # all-ones E8M0 blobs in the dense (BSHD) packing: (B, packed rows rounded up to 128, 4) for Q, (B, blocks
-            # rounded up to 128, 4) for K -- exact shapes, cached
+            # rounded up to 128, 4) for K -- exact shapes, each a contiguous view of its capacity bucket (_unit_scale_blob)
             sf_groups = head_dim // _SF_VEC_SIZE
             fp8_kwargs = dict(
                 precision="mxfp8",
