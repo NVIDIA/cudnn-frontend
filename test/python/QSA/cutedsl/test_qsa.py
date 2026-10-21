@@ -486,7 +486,8 @@ def test_paired_backward_nonfinite_isolation(supported_gpu, packed):
 
 
 @pytest.mark.L0
-def test_paired_owner_encoding_rejects_oversized_metadata(supported_gpu, monkeypatch):
+@pytest.mark.parametrize("arch", [100, 103, 107])
+def test_paired_owner_encoding_rejects_oversized_metadata(supported_gpu, monkeypatch, arch):
     from types import SimpleNamespace
     from cudnn.QSA import api
 
@@ -496,4 +497,53 @@ def test_paired_owner_encoding_rejects_oversized_metadata(supported_gpu, monkeyp
     monkeypatch.setattr(torch, "empty", forbidden)
     oversized = SimpleNamespace(shape=(1, (1 << 28) + 1))
     with pytest.raises(NotImplementedError, match="block-owner encoding"):
-        api._compact_backward(oversized, None, None, None, None, 100, None, 1)
+        api._compact_backward(oversized, None, None, None, None, arch, None, 1)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("blocks", [1, 15, 16, 31, 32, 511, 512, 513, 1023, 1024, 1025, 32768])
+@pytest.mark.parametrize("offset", [0, 1])
+def test_compaction_boundaries_and_replay(supported_gpu, blocks, offset):
+    from cuda.bindings import driver as cuda
+    from cudnn.QSA import _metadata
+
+    major, minor = torch.cuda.get_device_capability()
+    compiled = _metadata.compile_kernel(major * 10 + minor)
+    storage = torch.full((8 * blocks + offset,), 255, dtype=torch.uint8, device="cuda")
+    sel = storage[offset:].view(8, blocks)
+    first = torch.arange(blocks, dtype=torch.int32, device="cuda").flip(0) * 4
+    last = first + 3
+    lo = torch.tensor([0, 1, 4, 20, 0, 8, 1, 0], dtype=torch.int32, device="cuda")
+    hi = torch.tensor([4 * blocks - 1, 9, 3, 21, -1, 4 * blocks - 2, 1, 4 * blocks - 1], dtype=torch.int32, device="cuda")
+    ids = torch.full((8, blocks), -1, dtype=torch.int32, device="cuda")
+    counts = torch.full((8,), -1, dtype=torch.int32, device="cuda")
+
+    def launch():
+        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        compiled(sel, lo, hi, first, last, ids, counts, stream)
+
+    launch()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            launch()
+        for pattern in ("full", "alternate", "empty"):
+            sel.fill_(0 if pattern == "empty" else 255)
+            if pattern == "alternate":
+                sel[:, 1::2] = 0
+            valid = (sel != 0) & (last[None] >= lo[:, None]) & (first[None] <= hi[:, None]) & (lo[:, None] <= hi[:, None])
+            expected_counts = valid.sum(1).int()
+            expected_ids = torch.full_like(ids, -1)
+            for row in range(8):
+                selected = torch.nonzero(valid[row]).flatten().int()
+                expected_ids[row, : selected.numel()] = selected
+            for run in (launch, graph.replay):
+                ids.fill_(-1)
+                counts.fill_(-1)
+                run()
+                torch.cuda.synchronize()
+                torch.testing.assert_close(counts, expected_counts, atol=0, rtol=0)
+                torch.testing.assert_close(ids, expected_ids, atol=0, rtol=0)
+    finally:
+        graph.reset()

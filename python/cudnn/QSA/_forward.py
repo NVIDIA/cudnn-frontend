@@ -63,7 +63,7 @@ def _launch(
         counts = cute.make_tensor(scratch.iterator + counts_offset, cute.make_layout((total,)))
         flat_k = cute.make_tensor(k.iterator, cute.make_layout((cute.size(k),)))
         flat_v = cute.make_tensor(v.iterator, cute.make_layout((cute.size(v),)))
-        fprop_prepare.prepare(flat_k, flat_v, sel, lo, hi, bases, origins, first, last, partials, modes, ranges, bits, order, ids, counts, stream)
+        fprop_prepare.prepare(flat_k, flat_v, sel, lo, hi, bases, origins, first, last, partials, modes, ranges, bits, order, ids, counts, stream, arch == 107)
         total, hq, dim = q.shape
         hkv = k.shape[1]
         q_view = cute.make_tensor(q.iterator, cute.make_layout((total, dim, hq), stride=(hq * dim, 1, dim)))
@@ -81,7 +81,7 @@ def _launch(
         ids = cute.make_tensor(scratch.iterator, cute.make_layout((total, blocks), stride=(blocks, 1)))
         counts_offset = cute.ceil_div(total * blocks, 4) * 4
         counts = cute.make_tensor(scratch.iterator + counts_offset, cute.make_layout((total,)))
-        _metadata._compact_host(sel, lo, hi, first, last, ids, counts, stream)
+        _metadata._compact_host(sel, lo, hi, first, last, ids, counts, stream, arch == 107)
         fprop_sm100._fprop_host(q, k, v, out, out32, lse, ids, counts, lo, hi, first, last, None, scale, stream, arch)
 
 

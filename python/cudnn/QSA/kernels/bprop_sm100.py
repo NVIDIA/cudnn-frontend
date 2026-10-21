@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from sdpa/bwd/kernels/sm100/bprop_sparse_d256_f16.py.
 
-"""Blackwell QSA backward: pair 12:1 queries and retain the 24:2 path."""
+"""Paired 12:1 QSA backward for Blackwell and Rubin."""
 
 import hashlib
 from pathlib import Path
@@ -802,8 +802,8 @@ def compile_kernel(dtype, query_heads, kv_heads, arch):
 
     if dtype != BF16 or (query_heads, kv_heads) != (GQ, 1):
         raise ValueError("Batched QSA backward requires BF16, D256 and 12/1 heads")
-    if arch not in (100, 103):
-        raise ValueError(f"Blackwell QSA backward requires SM100 or SM103, got SM{arch}")
+    if arch not in (100, 103, 107):
+        raise ValueError(f"Paired QSA backward requires SM100, SM103 or SM107, got SM{arch}")
     key = template_key(globals(), {"query_heads": query_heads, "kv_heads": kv_heads, "arch": arch}, "compile_kernel")
     total, capacity, blocks, groups = cute.sym_int64(), cute.sym_int64(), cute.sym_int64(), cute.sym_int64()
     q, kv = fake(BF16, (total, query_heads, D)), fake(BF16, (total, kv_heads, D))
