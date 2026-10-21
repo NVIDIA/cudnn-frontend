@@ -652,7 +652,11 @@ other part keeps False until measured there; an explicit ``use_pdl=True`` / ``Fa
 (the slab GEMM, the out projection, its split-K reducer) launch with the attribute regardless of the switch (their templates' own
 constant) and are neither listed by ``pdl_stages`` nor counted by ``use_pdl_effective``."""
 
-SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS: Tuple[Tuple[int, int], ...] = ()
+# Measured 2026-10-21 (the end-to-end decode gate): Rubin cc 10.7, 212 SMs at the 2376 MHz lock, CUDA-graph replay A/B/A 3 x 100 --
+# unfused / fused - 1 = +9.6 .. +14.5 % at B <= 4 and +4.4 .. +10.0 % at B 32 over the 19 decode cells (geomean +11.9 % over B <= 4),
+# bitwise the two-stage form on out AND the list everywhere; the control pairs -0.5 .. -1.3 % (a capture-order bias AGAINST the fused
+# arm: the band-corrected lever >= +9.1 % on every B <= 4 cell).  Hence cc 10.7 reads True; every other part keeps False until measured.
+SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS: Tuple[Tuple[int, int], ...] = ((10, 7),)
 """The parts on which the AUTO reading of ``fuse_prepare`` (``None``, the default) resolves True on the in-block indexer's DECODE step
 over the pools (``QsaSpec(index_source="indexer")`` with ``kv_source="paged"``): the ONE prepare launch -- Q / K norm + RoPE, the K / V
 write-through, the indexer queries' norm + RoPE into the workspace, the raw key into the paged ring and the block a committed row
@@ -7896,7 +7900,8 @@ class GatedAttentionBlockFwd(APIBase):
     -> (4i: the paged scorer, the decode top-k) -> (4) [+ combine] -> (6)`` under ``fuse_prepare=True`` (8 launches at a split,
     6 unsplit), the unfused twin ``(1) -> (2)+(3) -> (4w) -> (4i: the pool-1 query norm, the paged compress step, the scorer,
     the top-k) -> ...`` (11 / 9) under ``fuse_prepare=False``, bitwise; ``fuse_prepare=None`` is the MEASURED default
-    (:data:`SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS`, empty until the fused form is measured).  The declaration adds the three
+    (:data:`SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS`: True on cc 10.7 since the 2026-10-21 end-to-end gate measured the fused step
+    +9.6 .. +14.5 % at B <= 4 and +4.4 .. +10.0 % at B 32, bitwise; False on every other part until measured).  The declaration adds the three
     side-cache SAMPLES (``sample_index_kv_cache`` ``[num_pages, P / 4, 1, 128]``, ``sample_index_state_cache`` ``[num_ring_blocks,
     cap >= S_q + 3, 1, 128]``, ``sample_index_state_block_table`` ``[B, 1]`` int32: their FORM, never their strides) and three
     input-contract flags (``index_state_slot_mapping_present``, ``index_commit_present`` -- a typed decline --,
@@ -8106,7 +8111,7 @@ class GatedAttentionBlockFwd(APIBase):
         # PERFORMANCE knob -- the same function, every output bitwise the two-stage form; needs paged_kv_page_size > 0 and
         # the in-place bf16 / f16 pipeline (typed otherwise).  None = AUTO (the type widened from bool, the position kept; False keeps
         # its meaning everywhere): the MEASURED default -- True on the in-block indexer's DECODE step over the pools on the parts of
-        # SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS (empty until the fused form is measured there: `fuse_prepare_default` on the envelope),
+        # SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS (cc 10.7 since the 2026-10-21 measurement; `fuse_prepare_default` on the envelope),
         # False on every other form; `fuse_prepare_requested` keeps the declaration, `fuse_prepare` the resolved knob.
         fuse_prepare: Optional[bool] = None,
         # APPENDED (serving, the e4m3 KV cache): the POOLS' dtype.  None = the activation dtype (the pools as before).  torch.float8_e4m3fn =
@@ -9562,9 +9567,10 @@ class GatedAttentionBlockFwd(APIBase):
 
     def _fuse_prepare_default(self) -> bool:
         """The AUTO reading of ``fuse_prepare`` (None): True iff this is the in-block indexer's DECODE step over the pools (the form the
-        fused launch's three paged arms serve) and the sample's device is one of :data:`SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS` -- empty
-        until the fused form is measured against the unfused twin on an exclusive part (the measured-default rule) --; False everywhere
-        else (the knob's former default).  Never True where an explicit True is declined."""
+        fused launch's three paged arms serve) and the sample's device is one of :data:`SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS` -- cc 10.7
+        since the 2026-10-21 end-to-end gate measured the fused step +9.6 .. +14.5 % at B <= 4 against the unfused twin on an exclusive part
+        (the measured-default rule; every other part waits for its own measurement) --; False everywhere else (the knob's former default).  Never True where an explicit True is declined.
+        """
         return bool(self.indexer_decode and _device_cc_of(self.device) in SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS)
 
     def _check_fuse_prepare_declaration(self, fuse_prepare) -> bool:
@@ -10272,7 +10278,7 @@ class GatedAttentionBlockFwd(APIBase):
             index_query_rows_max=int(MAX_QUERY_ROWS),
             index_state_rows_extra=_index_state_ring_extra_rows(q.block_size),
             index_page_sizes=tuple(p for p in SERVING_PAGE_SIZES if page_ok(p)),
-            fuse_prepare_default=bool(decode_served and q.index_source == "indexer" and cc in SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS),
+            fuse_prepare_default=bool(decode_served and indexer_served and q.index_source == "indexer" and cc in SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS),
         )
 
     def index_k_raw(self, workspace: torch.Tensor) -> torch.Tensor:

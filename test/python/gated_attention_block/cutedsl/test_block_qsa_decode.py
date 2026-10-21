@@ -1391,12 +1391,13 @@ _INDEXER_DECLINE_TOKENS = {
 }
 
 
-def test_decode_indexer_declaration_facts_carve_and_the_envelope_rows():
+def test_decode_indexer_declaration_facts_carve_and_the_envelope_rows(monkeypatch):
     """``QsaSpec(index_source="indexer")`` over the pools CONSTRUCTS (no host sync, any device): the decode step ``qsa_indexer`` sits in the
-    indexer's slot before the sparse core, the prefill indexer is not built, the list form is per row; under ``fuse_prepare=False`` (the
-    default: ``SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS`` is empty until measured) the unfused twin -- the norm + RoPE pass, a K / V-only cache
-    write (no raw-key pool arm), the stage's four launches --, under ``True`` the prepare launch with the three paged arms and the stage's two
-    launches; the knob's AUTO reading and its readback; the switch's AUTO reading False and an explicit ``use_pdl=True`` the existing typed
+    indexer's slot before the sparse core, the prefill indexer is not built, the list form is per row; under ``fuse_prepare=False`` the
+    unfused twin -- the norm + RoPE pass, a K / V-only cache write (no raw-key pool arm), the stage's four launches --, under ``True`` the
+    prepare launch with the three paged arms and the stage's two launches; the knob's AUTO reading (``None``: the MEASURED default --
+    ``SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS == ((10, 7),)`` since the 2026-10-21 end-to-end gate, so cc 10.7 reads True on the indexer's
+    decode step and every other part / the caller-list band form read False) and its readback; the switch's AUTO reading False and an explicit ``use_pdl=True`` the existing typed
     decline (the switch is the sparse chain's follow-up); the carve = the caller-list band block's + the five slots appended at the END in
     the stage's order; the envelope's indexer rows on a Rubin reading (every one read off the host facts, the FlashInfer-read names pinned
     by signature), ``kv_cache_dtypes`` narrowed to the activation dtype under the indexer; the ring rule's two spellings equal."""
@@ -1410,10 +1411,10 @@ def test_decode_indexer_declaration_facts_carve_and_the_envelope_rows():
         _qsa_indexer_decode_slots,
     )
 
-    assert SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS == ()
+    assert SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS == ((10, 7),)
     with _no_host_sync():
         for s_q, batch in ((1, 1), (4, 2), (16, 1)):
-            off = _declare_indexer(GEOM_SMALL, batch, s_q, cap=s_q + 3)
+            off = _declare_indexer(GEOM_SMALL, batch, s_q, cap=s_q + 3, fuse_prepare=False)
             on = _declare_indexer(GEOM_SMALL, batch, s_q, cap=s_q + 3, fuse_prepare=True)
             for blk in (off, on):
                 assert blk.indexer_decode and blk.sparse_decode and not blk.qsa_shared_list and blk.qsa_list_form == "per_row"
@@ -1422,7 +1423,7 @@ def test_decode_indexer_declaration_facts_carve_and_the_envelope_rows():
                 assert names.index("qsa_indexer") == names.index("sdpa_sparse") - (1 if blk.fuse_prepare else 2), names
                 assert blk.use_pdl is False and blk.use_pdl_requested is None and blk.pdl_stages == () and not blk.use_pdl_effective
                 assert blk._indexer_decode.n_blocks_max == 4 * (16 // BS) and blk._indexer_decode.fused is blk.fuse_prepare
-            assert off.fuse_prepare is False and off.fuse_prepare_requested is None and off._prepare is None
+            assert off.fuse_prepare is False and off.fuse_prepare_requested is False and off._prepare is None
             assert off._cache_write is not None and not off._cache_write.index_band  # the K / V-only write: no raw-key pool arm
             assert [st.name for st in off._stages][:3] == ["qkv_gate_proj", "qk_norm_rope", "qsa_indexer"] and "cache_write" in [st.name for st in off._stages]
             assert off._indexer_decode.launches_per_execute() == 4 and off._indexer_decode.pdl_names == ("qsa_compress_step", "qsa_score", "qsa_topk")
@@ -1460,6 +1461,24 @@ def test_decode_indexer_declaration_facts_carve_and_the_envelope_rows():
         # the switch stays the sparse chain's follow-up: an explicit True is the existing typed decline, AUTO reads False
         with pytest.raises(NotImplementedError, match="use_pdl=True is served for the bf16 / f16 block only"):
             _declare_indexer(GEOM_SMALL, 1, 1, use_pdl=True)
+        # the knob's AUTO reading: the measured part (cc 10.7) resolves True on the indexer's decode step, every other part False, the
+        # caller-list band form False everywhere; an explicit value wins on every part; the declaration is kept beside the resolved knob
+        import cudnn.gated_attention_block.api as _api
+
+        for cc, want in (((10, 7), True), ((10, 0), False), ((10, 3), False), ((9, 0), False), (None, False)):
+            monkeypatch.setattr(_api, "_device_cc_of", lambda device, _cc=cc: _cc)
+            auto = _declare_indexer(GEOM_SMALL, 1, 1)
+            assert auto.fuse_prepare is want and auto.fuse_prepare_requested is None and (auto._prepare is not None) is want, cc
+            assert (
+                (auto._cache_write is None) is want and auto._indexer_decode.fused is want and auto._indexer_decode.launches_per_execute() == (2 if want else 4)
+            ), cc
+            assert (
+                _declare_indexer(GEOM_SMALL, 1, 1, fuse_prepare=False).fuse_prepare is False
+                and _declare_indexer(GEOM_SMALL, 1, 1, fuse_prepare=True).fuse_prepare is True
+            ), cc
+            band = _declare(GEOM_SMALL, 1, 1, n_pages=4, index_band=True, index_list_form="per_row")[0]
+            assert band.fuse_prepare is False and band.fuse_prepare_requested is None and band._prepare is None, cc
+        monkeypatch.undo()
         # the ring rule's DSL-free spelling
         assert _index_state_ring_extra_rows(BS) == 3
         # the envelope on a Rubin reading: the indexer rows a serving stack READS (never re-spells), pinned by name
@@ -1469,7 +1488,7 @@ def test_decode_indexer_declaration_facts_carve_and_the_envelope_rows():
         assert d.served and d.sparse_core
         assert d.index_sources == ("caller", "indexer") and d.index_cache_dtypes == (BF16,) and d.index_head_dims == (128,) and d.index_kv_heads == (1,)
         assert d.index_block_sizes == (4,) and d.index_top_k_range == (4, 512, 4) and d.index_query_rows_max == 64 and d.index_state_rows_extra == 3
-        assert d.index_page_sizes == (16, 32, 64, 128) and d.fuse_prepare_default is False and d.kv_cache_dtypes == (BF16,)
+        assert d.index_page_sizes == (16, 32, 64, 128) and d.fuse_prepare_default is True and d.kv_cache_dtypes == (BF16,)  # the measured part
         assert d.index_list_forms == ("per_row",) and d.index_list_form_default == "per_row" and d.pdl_stages == () and d.pdl_default is False
         assert set(_INDEXER_DECLINE_TOKENS) <= set(d.declines) and all(tok in d.declines[nm] for nm, tok in _INDEXER_DECLINE_TOKENS.items())
         # the record's tail is append-only (a serving stack reads these by name; a new field goes after `fuse_prepare_default`)
@@ -1487,10 +1506,15 @@ def test_decode_indexer_declaration_facts_carve_and_the_envelope_rows():
             "index_page_sizes",
             "fuse_prepare_default",
         ]
+        assert GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV, device_cc=(10, 0)).decode.fuse_prepare_default is False  # an unmeasured part
         f16 = GatedAttentionBlockFwd.serving_envelope(geom, F16, _DEV, device_cc=_SM107).decode
-        assert f16.index_sources == ("caller",) and f16.index_cache_dtypes == ()
+        assert f16.index_sources == ("caller",) and f16.index_cache_dtypes == () and f16.fuse_prepare_default is False
         caller_env = GatedAttentionBlockFwd.serving_envelope(_geom(GEOM_SMALL)[0], BF16, _DEV, device_cc=_SM107).decode
-        assert caller_env.index_sources == ("caller", "indexer") and caller_env.kv_cache_dtypes == (BF16, torch.float8_e4m3fn)
+        assert (
+            caller_env.index_sources == ("caller", "indexer")
+            and caller_env.kv_cache_dtypes == (BF16, torch.float8_e4m3fn)
+            and caller_env.fuse_prepare_default is False
+        )
         dense_env = GatedAttentionBlockFwd.serving_envelope(
             GatedAttentionBlockGeometry(**GEOM_SMALL, causal_bottom_right=True), BF16, _DEV, device_cc=_SM107
         ).decode
@@ -2150,7 +2174,7 @@ def _two_launches_indexer(case: _IndexerCase, what: str):
 
 # (geometry, S_q, kv_lens, page, layout, split, fuse_gate, return_lse, fuse_prepare, cap, seed)
 _INDEXER_LADDER = [
-    pytest.param(GEOM_SMALL, 1, (2052, 8192, 0, 4097), 16, "hnd", None, False, True, None, None, 101, id="Sq1-B4-p16-hnd-default-split-lse-unfused"),
+    pytest.param(GEOM_SMALL, 1, (2052, 8192, 0, 4097), 16, "hnd", None, False, True, None, None, 101, id="Sq1-B4-p16-hnd-default-split-lse-auto-knob"),
     pytest.param(GEOM_SMALL, 2, (300, 0, 2051, 77), 64, "nhd", 1, True, False, True, None, 102, id="Sq2-B4-p64-nhd-unsplit-fused-gate-fused-prepare"),
     pytest.param(GEOM_SMALL, 3, (8192, 2052), 32, "unified", 4, True, True, True, None, 103, id="Sq3-B2-p32-unified-split4-fused-gate-lse-fused-prepare"),
     pytest.param(
@@ -2175,7 +2199,12 @@ def test_decode_indexer_matches_the_two_stage_oracle(geom_kw, s_q, kv_lens, page
     case.compile()
     if split is not None:
         assert case.blk.decode_split_kv == split
-    assert case.blk.fuse_prepare is bool(fuse_prepare)
+    from cudnn.gated_attention_block.api import SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS, _device_cc_of
+
+    want = (
+        fuse_prepare if fuse_prepare is not None else (_device_cc_of(_DEV) in SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS)
+    )  # the AUTO knob: the measured part reads True
+    assert case.blk.fuse_prepare is want and case.blk.fuse_prepare_requested is fuse_prepare
     m = _two_launches_indexer(case, "indexer ladder")
     print(f"\n{case.label()}: {m}")
 

@@ -348,8 +348,8 @@ def test_decode_indexer_declines_are_published_row_by_row_and_the_envelope_names
     """The decode indexer's decline rows (`_qsa_decode_decline_texts`) reach the envelope VERBATIM under a sparse geometry on every reading,
     each carrying its one shared token, and the FlashInfer-read indexer facts are published by name on a Rubin reading: `index_sources`
     (`"caller"`, `"indexer"` at bf16 x head dim 128; `"caller"` alone at f16), the cache dtype, the head dims / KV heads / block sizes, the
-    `top_k` range, the 64-row query envelope, the ring's extra rows, the page sizes the paged scorer serves, `fuse_prepare_default` False
-    until measured; a DENSE geometry publishes none of them (any device, no host sync)."""
+    `top_k` range, the 64-row query envelope, the ring's extra rows, the page sizes the paged scorer serves, `fuse_prepare_default` True on the measured part (cc 10.7,
+    2026-10-21) for the bf16 indexer geometry and False off it; a DENSE geometry publishes none of them (any device, no host sync)."""
     import dataclasses
 
     from cudnn.gated_attention_block import DecodeEnvelope
@@ -377,12 +377,15 @@ def test_decode_indexer_declines_are_published_row_by_row_and_the_envelope_names
         assert d.index_cache_dtypes == ((torch.bfloat16,) if dtype == torch.bfloat16 else ())
         assert d.index_head_dims == (128,) and d.index_kv_heads == (1,) and d.index_block_sizes == (4,) and d.index_top_k_range == (4, 512, 4)
         assert d.index_query_rows_max == 64 and d.index_state_rows_extra == 3 and d.index_page_sizes == (16, 32, 64, 128)
-        assert d.fuse_prepare_default is False and SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS == ()
+        assert d.fuse_prepare_default is (dtype == torch.bfloat16) and SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS == (
+            (10, 7),
+        )  # the measured part; f16: not served
         assert d.index_list_forms == ("per_row",) and d.index_list_form_default == "per_row"
     dense = GatedAttentionBlockFwd.serving_envelope(
         GatedAttentionBlockGeometry(**_SMALL_D256, causal_bottom_right=True), torch.bfloat16, _DEV, device_cc=(10, 7)
     ).decode
     assert dense.index_sources == () and dense.index_page_sizes == () and dense.index_query_rows_max == 0 and dense.fuse_prepare_default is False
+    assert GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, _DEV, device_cc=(10, 0)).decode.fuse_prepare_default is False  # an unmeasured part
     assert not (set(tokens) & set(dense.declines))
     assert [f.name for f in dataclasses.fields(DecodeEnvelope)][-10:] == [
         "index_sources",

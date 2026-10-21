@@ -3288,12 +3288,12 @@ rows exact, the pools' step rows BITWISE the slab's K / V bands, the prefix rows
 | workspace sentinel | 1 / shared | 3: 4096, 512, 0 | L1 page 16 | 8 | fused | bf16 ✅ (a sentinel past `get_workspace_size()` untouched; unsplit scratch 0) |
 | capture / replay | 2 / shared | 4: 300, 0, 1000, 77 -> 301, 0, 1000, 77 | L1 page 16 | 4 | fused / LSE | bf16 ✅ (the first execute captured with no warm-up under `set_sync_debug_mode("error")`, the replay bitwise eager, the replay over new lengths / table / lists / slots / inputs bitwise eager) |
 | band capture / replay (N 13952) | 1 / shared, the indexer band's `index_k_raw` write-through, 24 / 2 at `d_model` 2560 | 2: 4096, 60 -> 4095, 61 | L1 page 16 | 8 | fused / LSE | bf16 ✅ (2026-10-21: the slab GEMM on the small-M route's 128-row swap-AB tile -- 13952 = 109 x 128, the one N off the 256 grid the route names a tile for --, both projections `capture_safe` on the JIT-only route, compiled with `CUDNN_FRONTEND_ENABLE_FROST_ENGINES` unset; the first execute captured with no warm-up under `set_sync_debug_mode("error")`, the replay bitwise eager (`out`, the LSE, the raw-key pool rows), the replay over new lengths / table / lists / slots / inputs bitwise eager; the launch census one above the band-off chain's, the raw-key write) |
-| indexer ladder 1 (2026-10-21) | 1 / per row, `QsaSpec(index_source="indexer")` over the pools | 4: 2052, 8192, 0 (dead), 4097 | L1 HND page 16 | the fill rule | launch / LSE ; the unfused prepare | bf16 ✅ (the two-stage oracle: the set vs the fp64 top-k of the block's own operands up to ties; every row within budget on the kernel's list; the ring rows and the completed cache row bitwise the compress kernel) |
+| indexer ladder 1 (2026-10-21) | 1 / per row, `QsaSpec(index_source="indexer")` over the pools | 4: 2052, 8192, 0 (dead), 4097 | L1 HND page 16 | the fill rule | launch / LSE ; the AUTO knob (True on cc 10.7) | bf16 ✅ (the two-stage oracle: the set vs the fp64 top-k of the block's own operands up to ties; every row within budget on the kernel's list; the ring rows and the completed cache row bitwise the compress kernel) |
 | indexer ladder 2 (2026-10-21) | 2 / per row | 4: 300, 0, 2051, 77 | L2 NHD page 64 | 1 | fused (epilogue) / -- ; `fuse_prepare` | bf16 ✅ |
 | indexer ladder 3 (2026-10-21) | 3 / per row | 2: 8192, 2052 | L3 unified page 32 | 4 | fused (combine) / LSE ; `fuse_prepare` | bf16 ✅ |
 | indexer ladder 4 (2026-10-21) | 4 / per row, every residue of the step-0 position | 4: 8191, 8190, 8189, 8188 | L1 page 16 | 16 | fused (combine) / LSE ; the unfused prepare | bf16 ✅ |
 | indexer ladder 5 (2026-10-21) | 4 / per row, 24 / 2 at `d_model` 2560 | 1: 4096 | L1 page 16 | the fill rule | fused / -- ; `fuse_prepare` | bf16 ✅ |
-| indexer ladder 6 (2026-10-21) | 4 / per row, rows at negative positions | 4: 2, 4, 0, 20000 | L1 page 16 | 2 | launch / LSE ; the default knob (False) | bf16 ✅ |
+| indexer ladder 6 (2026-10-21) | 4 / per row, rows at negative positions | 4: 2, 4, 0, 20000 | L1 page 16 | 2 | launch / LSE ; the AUTO knob (True on cc 10.7) | bf16 ✅ |
 | indexer ladder 7 (2026-10-21) | 1 / per row, 32K (the cluster top-k), ring cap 4 | 2: 32768, 300 | L1 page 16 | the fill rule | fused / LSE ; `fuse_prepare` | bf16 ✅ |
 | indexer ladder 8 (2026-10-21) | 2 / per row, ring cap 5, a mid-block step | 2: 8195, 8194 | L1 page 16 | 1 | launch / LSE ; the unfused prepare | bf16 ✅ |
 | indexer identity (2026-10-21) | 1 / per row, 512 visible blocks | 4: 2048 x 4 | L1 page 16 | 8 | fused / LSE ; `fuse_prepare` | bf16 ✅ (the list `511 .. 0`; BITWISE the caller-list band block fed the full list) |
@@ -3325,9 +3325,11 @@ table's reach; canonical descending ids, `-1` past), the sparse core on the per-
 `"shared"` the typed decline `indexer_shared_list`).  Under `fuse_prepare=True` the prepare launch carries the query + compress arms
 (`QsaPrepareIndexArms(raw_pool=False, query=True, compress=True, paged=True)`) and the stage adds two launches (8 kernels on the whole
 step with a split); under `False` the unfused twin -- the norm + RoPE pass, the pool-1 compress, the step compress, the K / V-only
-write-through (no raw-key pool arm) -- four for the stage (11); `None` is the MEASURED default (`SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS`
-empty: `False` until the end-to-end gate on an exclusive node measures the fusion; `serving_envelope(...).decode.fuse_prepare_default`),
-the two readings bitwise.  The caller-list band form takes the knob too (`raw_pool=True`: the paged write-through + the raw key's write in
+write-through (no raw-key pool arm) -- four for the stage (11); `None` is the MEASURED default (`SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS
+= ((10, 7),)`: the end-to-end gate on an exclusive 212-SM cc 10.7 part at the 2376 MHz lock, CUDA-graph replay A/B/A 3 x 100, read
+unfused / fused - 1 = +9.6 .. +14.5 % at B <= 4 and +4.4 .. +10.0 % at B 32 over the 19 decode cells, geomean +11.9 % over B <= 4, bitwise
+on out and the list; the control pairs -0.5 .. -1.3 %, a capture-order bias against the fused arm -- so cc 10.7 reads True and every other
+part False until measured; `serving_envelope(...).decode.fuse_prepare_default`), the two readings bitwise.  The caller-list band form takes the knob too (`raw_pool=True`: the paged write-through + the raw key's write in
 the prepare launch; the `caller-list band + fuse_prepare` row).  `index_state_slot_mapping_present=True` takes the ring's write rows from
 `execute(index_state_slot_mapping=)` (`block x cap + pos % cap`, `-1` dead; `slot_mapping`'s dtype) -- bitwise the derived rows;
 `rope_position_tables_only=True` (fused only) refuses `cos` / `sin` and rotates from the position tables at the device-derived position --
