@@ -7,8 +7,9 @@ SM110 (Jetson Thor) amax-reduction dispatch for the CuTeDSL GEMM kernels (#1686)
 ``tcgen05`` MMA does.  Every FP32 warp amax in ``python/cudnn/gemm/cutedsl`` must
 therefore go through ``cudnn._cutlass_helpers.warp_reduce.warp_amax_with_nan``
 (or the Hadamard-quant helper's own ``warp_redux_sync``, which carries the same
-fallback).  The source checks pin the target predicate, and the SM110 device
-checks exercise every lane including negative values, NaNs and infinities.
+fallback).  The source checks pin the target predicate, and the device checks
+exercise both native redux on SM100/SM103/SM107 and the SM110 shuffle fallback,
+checking every lane including negative values, NaNs and infinities.
 The grouped / dense / discrete GEMM suites cover the enclosing kernels.
 """
 
@@ -20,6 +21,12 @@ from unittest import mock
 
 import pytest
 import torch
+
+from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
+
+requirement_error = cutedsl_requirement_error("GEMM warp amax reduction tests")
+if requirement_error is not None:
+    pytest.skip(requirement_error, allow_module_level=True)
 
 pytest.importorskip("cutlass")
 
@@ -111,9 +118,13 @@ def _amax(x: cute.Tensor, out: cute.Tensor, absolute: cutlass.Constexpr):
 @pytest.mark.L0
 @pytest.mark.parametrize("absolute", [False, True])
 @pytest.mark.parametrize("case", ["finite", "negative", "nan", "infinity"])
-def test_sm110_amax_all_lanes(case, absolute):
-    if torch.cuda.get_device_capability() != (11, 0):
-        pytest.skip("Exercises the native SM110 shuffle target")
+def test_amax_all_lanes(case, absolute):
+    device_cc = torch.cuda.get_device_capability()
+    if device_cc not in ((10, 0), (10, 3), (10, 7), (11, 0)):
+        pytest.skip("Requires a supported SM100/SM103/SM107 redux or SM110 shuffle target")
+    arch_requirement_error = cutedsl_arch_requirement_error(device_cc)
+    if arch_requirement_error is not None:
+        pytest.skip(arch_requirement_error)
     x = torch.arange(32, device="cuda", dtype=torch.float32) - 16
     if case == "negative":
         x = -x.abs() - 1
