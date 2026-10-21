@@ -396,6 +396,12 @@ _nomask_range_split = _split_h.nomask_range_split
 _partial_batch = _split_h.partial_batch
 
 
+# Only the common dense CLC path has a single scheduler publisher.
+# THD/predecode retains local schedulers and broadcast credits.
+if not CFG.THD_VARLEN:
+    from cudnn.frost.tile_dsl.scheduler import read_tile_id_arrive_on_leader as read_tile_id_arrive
+
+
 @cute.jit
 def _poll_wait(mb, phase):
     """A wait that NEVER parks the warp: the shared tile_dsl ``barrier.wait_poll`` (an inline-PTX ``mbarrier.test_wait.parity``

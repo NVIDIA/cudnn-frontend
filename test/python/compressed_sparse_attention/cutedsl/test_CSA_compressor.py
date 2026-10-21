@@ -364,6 +364,73 @@ def test_replay_determinism_r128():
         assert torch.allclose(runs[0][3], other[3], rtol=0, atol=1e-3)
 
 
+def _fused_forward(kv, score, ape, cu, cuc, total_comp, ratio, d, coff):
+    """Forward only through the fused wrapper; returns out as (total_comp, 1, d)."""
+    compressor = _import_compressor()
+    total = kv.shape[0]
+    out = compressor.csa_compressor_forward_wrapper(
+        kv.view(total, -1), score.view(total, -1), ape, cu, cuc, ratio=ratio, head_dim=d, coff=coff, total_comp=total_comp
+    )["out"]
+    torch.cuda.synchronize()
+    return out.view(total_comp, 1, d)
+
+
+# Every ratio=128 forward schedule: (coff, d, nb) per bucket (small <= 128 rows, default, large >= 1024 rows).
+# c1d512-small and c2d128-large run their default bucket's schedule; the d=512 large packs are L1.
+_R128_FWD_BUCKETS = [
+    pytest.param(1, 128, 64, id="c1d128-small", marks=pytest.mark.L0),
+    pytest.param(1, 128, 300, id="c1d128-default", marks=pytest.mark.L0),
+    pytest.param(1, 128, 1024, id="c1d128-large-twophase", marks=pytest.mark.L0),
+    pytest.param(2, 128, 64, id="c2d128-small", marks=pytest.mark.L0),
+    pytest.param(2, 128, 300, id="c2d128-default", marks=pytest.mark.L0),
+    pytest.param(1, 512, 300, id="c1d512-default", marks=pytest.mark.L0),
+    pytest.param(1, 512, 1024, id="c1d512-large", marks=pytest.mark.L1),
+    pytest.param(2, 512, 64, id="c2d512-small", marks=pytest.mark.L0),
+    pytest.param(2, 512, 300, id="c2d512-default", marks=pytest.mark.L0),
+    pytest.param(2, 512, 1024, id="c2d512-large", marks=pytest.mark.L1),
+]
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "nan_score",  # one NaN score, not in its window's first chunk
+        "posinf_score",  # one +inf score, not in its window's first chunk
+        "neginf_ape_chunk_start",  # -inf APE row 64: a masked position that starts a chunk
+        "neginf_ape_whole_chunk",  # -inf APE rows 64..127: chunks with no finite position
+        "neginf_ape_all",  # every position masked: the eager softmax is NaN everywhere
+    ],
+)
+@pytest.mark.parametrize("coff,d,nb", _R128_FWD_BUCKETS)
+def test_r128_forward_special_values_match_eager(coff, d, nb, case):
+    """ratio=128 forward with special values at single window positions, in every schedule bucket.
+
+    The forward merges per-chunk softmax partials. The output's NaN pattern must equal the fp32 eager
+    reference's, and the finite elements must stay within the r128 tolerance contract: a NaN or +inf
+    position makes its output NaN, and a -inf position gets weight 0 wherever it falls in a chunk.
+    """
+    _require_sm100()
+    ratio = 128
+    kv, score, ape, cu, cuc, total_comp, _ = _make_inputs([nb * ratio], d, ratio, coff)
+    if case.endswith("_score"):
+        # Block 1, own-half position 100, column 0 of the own-half projection.
+        score[ratio + 100, 0, d if coff == 2 else 0] = float("nan") if case == "nan_score" else float("inf")
+    else:
+        rows = {"neginf_ape_chunk_start": slice(64, 65), "neginf_ape_whole_chunk": slice(64, 128), "neginf_ape_all": slice(0, ratio)}[case]
+        ape[rows] = float("-inf")
+
+    out = _fused_forward(kv, score, ape, cu, cuc, total_comp, ratio, d, coff).float()
+    ref = _eager_pool(kv, score, ape, cu, cuc, total_comp, ratio, d, coff, mode="fp32").float()
+    assert torch.equal(out.isnan(), ref.isnan()), (int(out.isnan().sum()), int(ref.isnan().sum()))
+    if case.endswith("_score"):
+        assert ref[1, 0, 0].isnan()
+    finite = ~ref.isnan()
+    if finite.any():
+        diff = (out[finite] - ref[finite]).abs()
+        assert diff.max().item() <= 1.6e-2, diff.max().item()
+        assert (diff > 0).sum().item() <= max(1, int(0.001 * diff.numel()))
+
+
 # ---------------------------------------------------------------------------
 # ratio=128 dispatch envelope: every shipped schedule bucket
 # ---------------------------------------------------------------------------
@@ -774,6 +841,18 @@ def test_backward_fills_uninitialized_buffers(lens, d, ratio, coff, pad, tok_pad
 # ---------------------------------------------------------------------------
 # Deterministic mode
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.L0
+def test_ratio4_deterministic_workspace_includes_hierarchical_stage():
+    """Ratio 4 reserves disjoint producer and stage-1 planes."""
+    from cudnn.csa.compressor.compressor_sm100 import bwd_dape_workspace_bytes
+
+    nb_total, ratio, d, coff = 65536, 4, 128, 1
+    npartials = (nb_total + 7) // 8
+    nelems = ratio * coff * d
+    ngroups = (npartials + 31) // 32
+    assert bwd_dape_workspace_bytes(nb_total, ratio, d, coff) == (npartials + ngroups) * nelems * 4
 
 
 @pytest.mark.L0

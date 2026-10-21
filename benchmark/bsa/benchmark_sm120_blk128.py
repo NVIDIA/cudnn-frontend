@@ -18,7 +18,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from cudnn import BSA
+from cudnn import ops
 
 
 def _rounded_topk(num_blocks: int, density: float) -> int:
@@ -157,7 +157,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             def sparse_call():
                 """Execute native blk128 attention with the current sparse mask."""
-                return BSA.block_sparse_attention_forward(
+                return ops.block_sparse_attention_forward(
                     q,
                     k,
                     v,

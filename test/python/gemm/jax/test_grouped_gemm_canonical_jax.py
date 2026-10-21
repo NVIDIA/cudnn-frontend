@@ -49,11 +49,39 @@ def problem(backward, experts, flat_sf, bf16_prob, n=256):
     return arrays
 
 
+def block_scaled_problem(data_format, experts, n=512, backward=False):
+    """Operands for "mxfp8", "nvfp4" (E4M3 scales per 16) or "mxfp4" (E8M0 scales per 32); FP4 is packed uint8."""
+    arrays = problem(backward, experts, True, False, n=n)
+    del arrays["norm_const_tensor"]
+    if data_format == "mxfp8":
+        return arrays, 32
+    rng = np.random.default_rng(797)
+    m, k = arrays["a_tensor"].shape
+    sf_vec_size, sf_low, sf_dtype = (16, 0x30, ml_dtypes.float8_e4m3fn) if data_format == "nvfp4" else (32, 125, ml_dtypes.float8_e8m0fnu)
+    rest_k = k // (4 * sf_vec_size)
+    arrays.update(
+        a_tensor=rng.integers(0, 256, (m, k // 2), dtype=np.uint8),
+        b_tensor=rng.integers(0, 256, (experts, n, k // 2), dtype=np.uint8),
+        sfa_tensor=rng.integers(sf_low, sf_low + 4, (1, m // 128, rest_k, 32, 4, 4), dtype=np.uint8).view(sf_dtype),
+        sfb_tensor=rng.integers(sf_low, sf_low + 4, (experts, n // 128, rest_k, 32, 4, 4), dtype=np.uint8).view(sf_dtype),
+    )
+    return arrays, sf_vec_size
+
+
+def poison_allocator():
+    """Fill freed JAX device memory so an output the kernel never writes cannot read back as zeros."""
+    for _ in range(8):
+        jax.block_until_ready(jnp.full((1 << 22,), 0x55, jnp.uint8))
+
+
 def torch_inputs(arrays):
     result = {}
     for name, array in arrays.items():
         if name.startswith("sf"):
-            tensor = torch.from_numpy(array).cuda().view(torch.float8_e8m0fnu)
+            sf_dtype = torch.float8_e4m3fn if array.dtype == ml_dtypes.float8_e4m3fn else torch.float8_e8m0fnu
+            tensor = torch.from_numpy(array.view(np.uint8)).cuda().view(sf_dtype)
+        elif array.dtype == np.uint8:
+            tensor = torch.from_numpy(array).cuda().view(torch.float4_e2m1fn_x2)
         elif array.dtype == ml_dtypes.float8_e4m3fn:
             tensor = torch.from_numpy(array.view(np.uint8)).cuda().view(torch.float8_e4m3fn)
         elif array.dtype == ml_dtypes.bfloat16:
@@ -134,30 +162,35 @@ def test_canonical_jax_glu_parity(act_func, experts, shared_wrapper):
 
 
 def kernel_facing_torch(arrays):
-    """Torch dGLU takes the kernel-facing views of the canonical buffers."""
+    """Kernel-facing views of the canonical buffers, for the torch SReLU, dSReLU and GLU + Hadamard + quant wrappers,
+    which take only those layouts."""
     tensors = torch_inputs(arrays)
-    for name in ("a_tensor", "c_tensor"):
+    for name in {"a_tensor", "c_tensor"} & tensors.keys():
         tensor = tensors[name]
         tensors[name] = tensor.as_strided((*tensor.shape, 1), (*tensor.stride(), tensor.numel()))
     m = tensors["prob_tensor"].numel()
     tensors["prob_tensor"] = tensors["prob_tensor"].as_strided((m, 1, 1), (1, m, m))
     tensors["b_tensor"] = tensors["b_tensor"].permute(1, 2, 0)
-    for name in ("sfa_tensor", "sfb_tensor"):
+    for name in {"sfa_tensor", "sfb_tensor"} & tensors.keys():
         tensors[name] = tensors[name].permute(3, 4, 1, 5, 2, 0)
     return tensors
+
+
+def canonical_reference(result):
+    """A kernel-facing torch result in the canonical JAX layouts: unit L mode dropped, physical 6-D scale buffers."""
+    for name, tensor in result.items():
+        if tensor is not None and tensor.ndim == 6:
+            result[name] = tensor.permute(5, 2, 4, 0, 1, 3)
+        elif tensor is not None and name != "amax_tensor" and tensor.ndim == 3:
+            result[name] = tensor.reshape(tensor.shape[:-1])
+    return result
 
 
 def dglu_reference(arrays, **options):
     import cudnn
 
-    m = arrays["a_tensor"].shape[0]
-    dprob = torch.zeros((m, 1, 1), device="cuda")
-    result = cudnn.grouped_gemm_dglu_wrapper_sm100(**kernel_facing_torch(arrays), dprob_tensor=dprob, d_dtype=torch.float8_e4m3fn, sf_vec_size=32, **options)
-    for name in ("d_row_tensor", "d_col_tensor", "dprob_tensor"):
-        result[name] = result[name].reshape(result[name].shape[:-1] if name != "dprob_tensor" else (m,))
-    for name in ("sfd_row_tensor", "sfd_col_tensor"):
-        result[name] = result[name].permute(5, 2, 4, 0, 1, 3)
-    return result
+    dprob = torch.zeros((arrays["a_tensor"].shape[0],), device="cuda")
+    return cudnn.grouped_gemm_dglu_wrapper_sm100(**torch_inputs(arrays), dprob_tensor=dprob, d_dtype=torch.float8_e4m3fn, sf_vec_size=32, **options)
 
 
 @pytest.mark.parametrize("act_func", ["dswiglu", "dgeglu"])
@@ -221,15 +254,49 @@ def test_canonical_jax_wgrad_parity(splits, shared_wrapper):
     bridge = eager if shared_wrapper else cudnn.grouped_gemm_wgrad_jax_sm100
     inputs = {name: jnp.asarray(array) for name, array in arrays.items()}
     inputs["sfa_tensor"] = inputs["sfa_tensor"].reshape(-1)
-    # Poison the allocator so an empty expert's unwritten output cannot read back as zeros.
-    for _ in range(8):
-        jax.block_until_ready(jnp.full((1 << 22,), 0x55, jnp.uint8))
+    # An empty expert's output must be written, not left over from the allocator.
+    poison_allocator()
     assert_outputs(bridge(**inputs), eager(**torch_inputs(arrays)))
     compiled = jax.jit(bridge, compiler_options={"xla_gpu_enable_command_buffer": "FUSION,CUSTOM_CALL"})
     assert_outputs(compiled(**inputs), eager(**torch_inputs(arrays)))
     arrays["offsets_tensor"] = np.cumsum((0,) * (len(splits) - 1) + (sum(splits),)).astype(np.int32)
     inputs["offsets_tensor"] = jnp.asarray(arrays["offsets_tensor"])
     assert_outputs(compiled(**inputs), eager(**torch_inputs(arrays)))
+
+
+@pytest.mark.parametrize("data_format", ["nvfp4", "mxfp4"])
+@pytest.mark.parametrize("shared_wrapper", [False, True], ids=["jax_entry", "wrapper"])
+def test_canonical_jax_wgrad_fp4(data_format, shared_wrapper):
+    skip_unless_sm100()
+    import cudnn
+    from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad import _NEEDS_FP4_LAYOUT_WORKAROUND
+
+    if _NEEDS_FP4_LAYOUT_WORKAROUND:
+        pytest.skip("FP4 wgrad from JAX requires nvidia-cutlass-dsl >= 4.8")
+    rng = np.random.default_rng(798)
+    m, n, splits = 384, 640, (256, 512, 0, 256)
+    tokens = sum(splits)
+    sf_vec_size, sf_low, sf_dtype = (16, 0x30, ml_dtypes.float8_e4m3fn) if data_format == "nvfp4" else (32, 125, ml_dtypes.float8_e8m0fnu)
+    arrays = dict(
+        a_tensor=rng.integers(0, 256, (m, tokens // 2), dtype=np.uint8),
+        # Packed FP4 B is token-innermost: (n, tokens / 2).
+        b_tensor=rng.integers(0, 256, (n, tokens // 2), dtype=np.uint8),
+        sfa_tensor=rng.integers(sf_low, sf_low + 4, (m, tokens // sf_vec_size), dtype=np.uint8).view(sf_dtype),
+        sfb_tensor=rng.integers(sf_low, sf_low + 4, (n, tokens // sf_vec_size), dtype=np.uint8).view(sf_dtype),
+        offsets_tensor=np.cumsum(splits).astype(np.int32),
+    )
+    if data_format == "nvfp4":
+        arrays.update(global_scale_a=rng.uniform(0.5, 2, len(splits)).astype(np.float32), global_scale_b=rng.uniform(0.5, 2, len(splits)).astype(np.float32))
+    eager = partial(cudnn.grouped_gemm_wgrad_wrapper_sm100, sf_vec_size=sf_vec_size)
+    reference_inputs = torch_inputs(arrays)
+    reference_inputs["b_tensor"] = reference_inputs["b_tensor"].T
+    reference = eager(**reference_inputs)
+    bridge = eager if shared_wrapper else partial(cudnn.grouped_gemm_wgrad_jax_sm100, sf_vec_size=sf_vec_size)
+    inputs = {name: jnp.asarray(array) for name, array in arrays.items()}
+    poison_allocator()
+    assert_outputs(bridge(**inputs), reference)
+    compiled = jax.jit(bridge, compiler_options={"xla_gpu_enable_command_buffer": "FUSION,CUSTOM_CALL"})
+    assert_outputs(compiled(**inputs), reference)
 
 
 @pytest.mark.parametrize(
@@ -265,12 +332,280 @@ def test_jax_wgrad_rejects_invalid_sf():
         jax.jit(cudnn.grouped_gemm_wgrad_jax_sm100)(**inputs)
 
 
+@pytest.mark.parametrize("b_major,fp8_output,with_prob", [("k", False, True), ("n", False, True), ("k", True, False), ("n", True, True)])
+@pytest.mark.parametrize("experts", [1, 4])
+@pytest.mark.parametrize("shared_wrapper", [False, True], ids=["jax_entry", "wrapper"])
+def test_canonical_jax_quant_parity(b_major, fp8_output, with_prob, experts, shared_wrapper):
+    skip_unless_sm100()
+    import cudnn
+
+    arrays = problem(False, experts, True, False, n=512)
+    if b_major == "n":
+        arrays["b_tensor"] = np.ascontiguousarray(arrays["b_tensor"].transpose(0, 2, 1))
+    if not with_prob:
+        del arrays["prob_tensor"]
+    if not fp8_output:
+        del arrays["norm_const_tensor"]
+    options = dict(b_major=b_major, discrete_col_sfd=fp8_output)
+    # BF16 output also returns the per-expert amax, the eager wrapper's default.
+    eager = partial(cudnn.grouped_gemm_quant_wrapper_sm100, sf_vec_size=32, **options)
+    reference = partial(eager, d_dtype=torch.float8_e4m3fn if fp8_output else torch.bfloat16)
+    bridge = eager if shared_wrapper else partial(cudnn.grouped_gemm_quant_jax_forward, generate_amax=True, **options)
+    bridge = partial(bridge, d_dtype=ml_dtypes.float8_e4m3fn if fp8_output else ml_dtypes.bfloat16)
+    inputs = {name: jnp.asarray(array) for name, array in arrays.items()}
+    assert_outputs(bridge(**inputs), reference(**torch_inputs(arrays)))
+    compiled = jax.jit(bridge, compiler_options={"xla_gpu_enable_command_buffer": "FUSION,CUSTOM_CALL"})
+    assert_outputs(compiled(**inputs), reference(**torch_inputs(arrays)))
+    arrays["alpha_tensor"] *= 0.5
+    inputs["alpha_tensor"] = jnp.asarray(arrays["alpha_tensor"])
+    assert_outputs(compiled(**inputs), reference(**torch_inputs(arrays)))
+
+
+@pytest.mark.parametrize("data_format", ["nvfp4", "mxfp4"])
+@pytest.mark.parametrize("shared_wrapper", [False, True], ids=["jax_entry", "wrapper"])
+def test_canonical_jax_quant_fp4(data_format, shared_wrapper):
+    skip_unless_sm100()
+    import cudnn
+
+    arrays, sf_vec_size = block_scaled_problem(data_format, 4)
+    eager = partial(cudnn.grouped_gemm_quant_wrapper_sm100, sf_vec_size=sf_vec_size)
+    reference = eager(**torch_inputs(arrays), d_dtype=torch.bfloat16)
+    assert reference["amax_tensor"] is not None
+    bridge = eager if shared_wrapper else partial(cudnn.grouped_gemm_quant_jax_forward, sf_vec_size=sf_vec_size, generate_amax=True)
+    bridge = partial(bridge, d_dtype=ml_dtypes.bfloat16)
+    inputs = {name: jnp.asarray(array) for name, array in arrays.items()}
+    poison_allocator()
+    assert_outputs(bridge(**inputs), reference)
+    compiled = jax.jit(bridge, compiler_options={"xla_gpu_enable_command_buffer": "FUSION,CUSTOM_CALL"})
+    assert_outputs(compiled(**inputs), reference)
+    assert_outputs(compiled(**inputs), reference)
+
+
+def bf16_problem(experts, backward=False, n=512):
+    rng = np.random.default_rng(800)
+    m, k = experts * 256, 256
+    scaled = lambda *shape: (rng.standard_normal(shape, dtype=np.float32) * 0.25).astype(ml_dtypes.bfloat16)
+    arrays = dict(
+        a_tensor=scaled(m, k),
+        b_tensor=scaled(experts, n, k),
+        padded_offsets=np.arange(256, m + 1, 256, dtype=np.int32),
+        alpha_tensor=rng.uniform(0.5, 1.5, experts).astype(np.float32),
+        prob_tensor=rng.uniform(0.5, 1.5, m).astype(np.float32),
+    )
+    if backward:
+        arrays.update(c_tensor=scaled(m, 2 * n), beta_tensor=rng.uniform(0.5, 1.5, experts).astype(np.float32))
+    return arrays
+
+
+@pytest.mark.parametrize("act_func", ["swiglu", "geglu"])
+@pytest.mark.parametrize("shared_wrapper", [False, True], ids=["jax_entry", "wrapper"])
+def test_canonical_jax_glu_bf16(act_func, shared_wrapper):
+    skip_unless_sm100()
+    import cudnn
+
+    arrays = bf16_problem(4)
+    eager = partial(cudnn.grouped_gemm_glu_wrapper_sm100, sfa_tensor=None, act_func=act_func, generate_c=True)
+    reference = eager(**torch_inputs(arrays))
+    bridge = eager if shared_wrapper else partial(cudnn.grouped_gemm_glu_jax_sm100, act_func=act_func, generate_c=True)
+    inputs = {name: jnp.asarray(array) for name, array in arrays.items()}
+    poison_allocator()
+    assert_outputs(bridge(**inputs), reference)
+    compiled = jax.jit(bridge, compiler_options={"xla_gpu_enable_command_buffer": "FUSION,CUSTOM_CALL"})
+    assert_outputs(compiled(**inputs), reference)
+
+
+@pytest.mark.parametrize("act_func", ["dswiglu", "dgeglu"])
+@pytest.mark.parametrize("shared_wrapper", [False, True], ids=["jax_entry", "wrapper"])
+def test_canonical_jax_dglu_bf16(act_func, shared_wrapper):
+    skip_unless_sm100()
+    import cudnn
+
+    arrays = bf16_problem(4, backward=True)
+    m = arrays["a_tensor"].shape[0]
+    eager = partial(cudnn.grouped_gemm_dglu_wrapper_sm100, sfa_tensor=None, act_func=act_func)
+    reference = eager(**torch_inputs(arrays), dprob_tensor=torch.zeros((m,), device="cuda"))
+    bridge = partial(eager, dprob_tensor=None) if shared_wrapper else partial(cudnn.grouped_gemm_dglu_jax_sm100, act_func=act_func)
+    inputs = {name: jnp.asarray(array) for name, array in arrays.items()}
+    poison_allocator()
+    assert_outputs(bridge(**inputs), reference)
+    compiled = jax.jit(bridge, compiler_options={"xla_gpu_enable_command_buffer": "FUSION,CUSTOM_CALL"})
+    assert_outputs(compiled(**inputs), reference)
+    # The dprob accumulator must restart from zero on every call.
+    assert_outputs(compiled(**inputs), reference)
+
+
+def test_canonical_jax_wgrad_bf16_dense():
+    skip_unless_sm100()
+    import cudnn
+
+    rng = np.random.default_rng(801)
+    m, n, splits = 384, 640, (256, 512, 0, 256)
+    tokens = sum(splits)
+    scaled = lambda *shape: (rng.standard_normal(shape, dtype=np.float32) * 0.25).astype(ml_dtypes.bfloat16)
+    arrays = dict(a_tensor=scaled(m, tokens), b_tensor=scaled(tokens, n), offsets_tensor=np.cumsum(splits).astype(np.int32))
+    reference = cudnn.grouped_gemm_wgrad_wrapper_sm100(**torch_inputs(arrays), sfa_tensor=None, sfb_tensor=None)
+    inputs = {name: jnp.asarray(array) for name, array in arrays.items()}
+    poison_allocator()
+    assert_outputs(cudnn.grouped_gemm_wgrad_jax_sm100(**inputs), reference)
+    compiled = jax.jit(cudnn.grouped_gemm_wgrad_jax_sm100, compiler_options={"xla_gpu_enable_command_buffer": "FUSION,CUSTOM_CALL"})
+    assert_outputs(compiled(**inputs), reference)
+
+
+@pytest.mark.parametrize("data_format,act_func", [("nvfp4", "swiglu"), ("nvfp4", "geglu"), ("nvfp4", "srelu"), ("mxfp4", "swiglu")])
+@pytest.mark.parametrize("shared_wrapper", [False, True], ids=["jax_entry", "wrapper"])
+def test_canonical_jax_glu_hadamard_parity(data_format, act_func, shared_wrapper):
+    skip_unless_sm100()
+    import cudnn
+
+    arrays, sf_vec_size = block_scaled_problem(data_format, 4)
+    eager = partial(cudnn.grouped_gemm_glu_hadamard_wrapper_sm100, sf_vec_size=sf_vec_size, act_func=act_func)
+    reference = eager(**torch_inputs(arrays))
+    bridge = eager if shared_wrapper else partial(cudnn.grouped_gemm_glu_hadamard_jax_forward, sf_vec_size=sf_vec_size, act_func=act_func)
+    inputs = {name: jnp.asarray(array) for name, array in arrays.items()}
+    poison_allocator()
+    assert_outputs(bridge(**inputs), reference)
+    compiled = jax.jit(bridge, compiler_options={"xla_gpu_enable_command_buffer": "FUSION,CUSTOM_CALL"})
+    assert_outputs(compiled(**inputs), reference)
+    # The amax accumulators must restart on every call.
+    assert_outputs(compiled(**inputs), reference)
+
+
+@pytest.mark.parametrize(
+    "d_quant,rht",
+    [(False, None), (True, None), (False, "rowwise_bf16"), (False, "rowwise"), (True, "rowwise"), (False, "colwise"), (True, "colwise")],
+)
+@pytest.mark.parametrize("shared_wrapper", [False, True], ids=["jax_entry", "wrapper"])
+def test_canonical_jax_glu_hadamard_quant_parity(d_quant, rht, shared_wrapper):
+    skip_unless_sm100()
+    import cudnn
+    import cutlass
+
+    if not hasattr(cutlass, "FloatNV8E5M3FNU"):
+        pytest.skip("GLU + Hadamard + quant requires nvidia-cutlass-dsl >= 4.8")
+    arrays, sf_vec_size = block_scaled_problem("nvfp4", 4)
+    m, (experts, n) = arrays["a_tensor"].shape[0], arrays["b_tensor"].shape[:2]
+    arrays["sfa_tensor"] = arrays["sfa_tensor"].reshape(1, m // 128, -1, 32, 4, 4)
+    arrays["sfb_tensor"] = arrays["sfb_tensor"].reshape(experts, n // 128, -1, 32, 4, 4)
+    # Packed NVFP4 outputs are requested with the cutlass dtype from JAX and the packed torch dtype from torch.
+    jax_options = dict(sf_vec_size=sf_vec_size, norm_const=0.5, rht_norm_const=0.25)
+    torch_options = dict(jax_options)
+    if d_quant:
+        jax_options["d_dtype"], torch_options["d_dtype"] = cutlass.Float4E2M1FN, torch.float4_e2m1fn_x2
+    if rht == "rowwise_bf16":
+        jax_options["rht_rowwise_dtype"], torch_options["rht_rowwise_dtype"] = ml_dtypes.bfloat16, torch.bfloat16
+    elif rht is not None:
+        jax_options[f"rht_{rht}_dtype"], torch_options[f"rht_{rht}_dtype"] = cutlass.Float4E2M1FN, torch.float4_e2m1fn_x2
+    reference = canonical_reference(cudnn.grouped_gemm_glu_hadamard_quant_wrapper_sm100(**kernel_facing_torch(arrays), **torch_options))
+    bridge = cudnn.grouped_gemm_glu_hadamard_quant_wrapper_sm100 if shared_wrapper else cudnn.grouped_gemm_glu_hadamard_quant_jax_forward
+    bridge = partial(bridge, **jax_options)
+    inputs = {name: jnp.asarray(array) for name, array in arrays.items()}
+    poison_allocator()
+    assert_outputs(bridge(**inputs), reference)
+    compiled = jax.jit(bridge, compiler_options={"xla_gpu_enable_command_buffer": "FUSION,CUSTOM_CALL"})
+    assert_outputs(compiled(**inputs), reference)
+
+
+@pytest.mark.parametrize("data_format,fp8_output", [("mxfp8", True), ("mxfp8", False), ("nvfp4", False), ("mxfp4", False)])
+@pytest.mark.parametrize("shared_wrapper", [False, True], ids=["jax_entry", "wrapper"])
+def test_canonical_jax_srelu_parity(data_format, fp8_output, shared_wrapper):
+    skip_unless_sm100()
+    import cudnn
+
+    arrays, sf_vec_size = block_scaled_problem(data_format, 4)
+    for name in ("sfa_tensor", "sfb_tensor"):
+        rows, experts = (arrays["a_tensor"].shape[0], 1) if name == "sfa_tensor" else (arrays["b_tensor"].shape[1], arrays["b_tensor"].shape[0])
+        arrays[name] = arrays[name].reshape(experts, rows // 128, -1, 32, 4, 4)
+    if fp8_output:
+        arrays["norm_const_tensor"] = np.array([0.01], np.float32)
+    options = dict(sf_vec_size=sf_vec_size, discrete_col_sfd=fp8_output)
+    eager = partial(cudnn.grouped_gemm_srelu_wrapper_sm100, **options)
+    reference = canonical_reference(eager(**kernel_facing_torch(arrays), d_dtype=torch.float8_e4m3fn if fp8_output else torch.bfloat16))
+    bridge = eager if shared_wrapper else partial(cudnn.grouped_gemm_srelu_jax_forward, **options)
+    bridge = partial(bridge, d_dtype=ml_dtypes.float8_e4m3fn if fp8_output else ml_dtypes.bfloat16)
+    inputs = {name: jnp.asarray(array) for name, array in arrays.items()}
+    inputs["sfa_tensor"] = inputs["sfa_tensor"].reshape(-1)
+    poison_allocator()
+    assert_outputs(bridge(**inputs), reference)
+    compiled = jax.jit(bridge, compiler_options={"xla_gpu_enable_command_buffer": "FUSION,CUSTOM_CALL"})
+    assert_outputs(compiled(**inputs), reference)
+    assert_outputs(compiled(**inputs), reference)
+
+
+@pytest.mark.parametrize("data_format", ["mxfp8", "nvfp4", "mxfp4"])
+@pytest.mark.parametrize("shared_wrapper", [False, True], ids=["jax_entry", "wrapper"])
+def test_canonical_jax_dsrelu_parity(data_format, shared_wrapper):
+    skip_unless_sm100()
+    import cudnn
+
+    arrays, sf_vec_size = block_scaled_problem(data_format, 4)
+    rng = np.random.default_rng(799)
+    m, (experts, n) = arrays["a_tensor"].shape[0], arrays["b_tensor"].shape[:2]
+    arrays["c_tensor"] = rng.uniform(-2, 2, (m, n)).astype(ml_dtypes.bfloat16)
+    arrays["sfa_tensor"] = arrays["sfa_tensor"].reshape(1, m // 128, -1, 32, 4, 4)
+    arrays["sfb_tensor"] = arrays["sfb_tensor"].reshape(experts, n // 128, -1, 32, 4, 4)
+    fp8_output = data_format == "mxfp8"
+    if fp8_output:
+        arrays["norm_const_tensor"] = np.array([0.01], np.float32)
+    options = dict(sf_vec_size=sf_vec_size, discrete_col_sfd=fp8_output)
+    eager = partial(cudnn.grouped_gemm_dsrelu_wrapper_sm100, **options)
+
+    def reference():
+        result = eager(
+            **kernel_facing_torch(arrays), dprob_tensor=torch.zeros((m, 1, 1), device="cuda"), d_dtype=torch.float8_e4m3fn if fp8_output else torch.bfloat16
+        )
+        result = canonical_reference(result)
+        result["dprob_tensor"] = result["dprob_tensor"].reshape(m)
+        if not fp8_output:
+            # Torch allocates D_col but the kernel does not write it without quantization.
+            result["d_col_tensor"] = None
+        return result
+
+    bridge = eager if shared_wrapper else partial(cudnn.grouped_gemm_dsrelu_jax_sm100, **options)
+    bridge = partial(bridge, d_dtype=ml_dtypes.float8_e4m3fn if fp8_output else ml_dtypes.bfloat16)
+    inputs = {name: jnp.asarray(array) for name, array in arrays.items()}
+    inputs["sfa_tensor"] = inputs["sfa_tensor"].reshape(-1)
+    poison_allocator()
+    assert_outputs(bridge(**inputs), reference())
+    compiled = jax.jit(bridge, compiler_options={"xla_gpu_enable_command_buffer": "FUSION,CUSTOM_CALL"})
+    assert_outputs(compiled(**inputs), reference())
+    assert_outputs(compiled(**inputs), reference())
+
+
+@pytest.mark.parametrize(
+    "shared_wrapper,option,value",
+    [
+        (True, "sf_vec_size", 16),
+        (True, "use_dynamic_sched", True),
+        (True, "row_scale_tensor", 1),
+        (True, "d_tensor", 1),
+        (True, "bias_tensor", 1),
+        (False, "b_major", "m"),
+        (False, "norm_const_tensor", None),
+    ],
+)
+def test_jax_quant_rejects_unsupported_options(shared_wrapper, option, value):
+    skip_unless_sm100()
+    import cudnn
+
+    arrays = problem(False, 1, True, False)
+    del arrays["norm_const_tensor"]
+    inputs = {name: jnp.asarray(array) for name, array in arrays.items()}
+    options = dict(sf_vec_size=32, generate_amax=False) if shared_wrapper else {}
+    # FP8 output requires norm_const.
+    options.update({"d_dtype": ml_dtypes.float8_e4m3fn} if option == "norm_const_tensor" else {}, **{option: value})
+    fn = cudnn.grouped_gemm_quant_wrapper_sm100 if shared_wrapper else cudnn.grouped_gemm_quant_jax_forward
+    with pytest.raises(ValueError, match=option):
+        fn(**inputs, **options)
+
+
 @pytest.mark.parametrize(
     "operation,rubin,blackwell",
     [
-        ("glu", "BlockScaledMoEGroupedGemmGluKernel", "BlockScaledMoEGroupedGemmGluBiasKernel"),
-        ("dglu", "BlockScaledMoEGroupedGemmDgluKernel", "BlockScaledMoEGroupedGemmDgluDbiasKernel"),
-        ("wgrad", "BlockScaledMoEGroupedGemmWgradRubinKernel", "BlockScaledMoEGroupedGemmWgradKernel"),
+        ("glu", "moe_blockscaled_grouped_gemm_glu_rubin", "moe_blockscaled_grouped_gemm_glu_bias"),
+        ("dglu", "moe_blockscaled_grouped_gemm_dglu_rubin", "moe_blockscaled_grouped_gemm_dglu_dbias"),
+        ("wgrad", "moe_blockscaled_grouped_gemm_wgrad_rubin", "moe_blockscaled_grouped_gemm_wgrad"),
+        ("quant", "moe_blockscaled_grouped_gemm_quant_rubin", "grouped_gemm_quant"),
+        ("glu_hadamard_quant", "moe_blockscaled_grouped_gemm_glu_hadamard_quant_rubin", "moe_blockscaled_grouped_gemm_glu_hadamard_quant"),
     ],
 )
 def test_jax_kernel_dispatch(operation, rubin, blackwell, monkeypatch):
@@ -281,7 +616,7 @@ def test_jax_kernel_dispatch(operation, rubin, blackwell, monkeypatch):
     families = [("blackwell", blackwell)] + ([] if cutedsl_arch_requirement_error((10, 7)) else [("rubin", rubin)])
     for family, name in families:
         monkeypatch.setattr(api, "get_device_type", lambda: family)
-        assert getattr(api, f"{operation}_kernel_type")().__name__ == name
+        assert getattr(api, f"{operation}_kernel_type")().__module__.rsplit(".", 1)[1] == name
 
 
 def test_jax_wgrad_plan_caches_kernel_per_architecture(monkeypatch):
@@ -299,7 +634,7 @@ def test_jax_wgrad_plan_caches_kernel_per_architecture(monkeypatch):
     kernels = []
     for family in ("blackwell", "rubin", "blackwell"):
         monkeypatch.setattr(jax_api, "get_device_type", lambda: family)
-        kernels.append(jax_api.wgrad_plan(inputs, wgrad, (256, 256), None)[0])
+        kernels.append(jax_api.wgrad_plan(inputs, wgrad, (256, 256), None, 32)[0])
     assert [type(kernel).__name__ for kernel in kernels] == [
         "BlockScaledMoEGroupedGemmWgradKernel",
         "BlockScaledMoEGroupedGemmWgradRubinKernel",
@@ -308,7 +643,7 @@ def test_jax_wgrad_plan_caches_kernel_per_architecture(monkeypatch):
     assert kernels[0] is kernels[2]
 
 
-def test_canonical_jax_dglu_wgrad_without_torch():
+def test_canonical_jax_wrappers_without_torch():
     skip_unless_sm100()
     import os
     import subprocess
@@ -323,7 +658,7 @@ def test_canonical_jax_dglu_wgrad_without_torch():
         import ml_dtypes
         import numpy as np
         from functools import partial
-        from cudnn import grouped_gemm_dglu_wrapper_sm100, grouped_gemm_wgrad_wrapper_sm100
+        from cudnn import grouped_gemm_dglu_wrapper_sm100, grouped_gemm_quant_wrapper_sm100, grouped_gemm_wgrad_wrapper_sm100
         fp8 = ml_dtypes.float8_e4m3fn
         a = jnp.ones((256, 256), fp8)
         b = jnp.ones((1, 256, 256), fp8)
@@ -339,12 +674,86 @@ def test_canonical_jax_dglu_wgrad_without_torch():
         sf_t = jnp.full((256, 8), 127, jnp.uint8)
         out = jax.jit(wgrad)(a, a, sf_t, sf_t, offsets)
         np.testing.assert_array_equal(np.asarray(out['wgrad_tensor']).astype(np.float32), 256)
+        quant = partial(grouped_gemm_quant_wrapper_sm100, sf_vec_size=32, generate_amax=False)
+        out = jax.jit(quant)(a, sf, offsets, ones, b_tensor=b, sfb_tensor=sf)
+        np.testing.assert_array_equal(np.asarray(out['d_tensor']).astype(np.float32), 256)
+        import cudnn
+        srelu = partial(cudnn.grouped_gemm_srelu_wrapper_sm100, sf_vec_size=32)
+        out = jax.jit(srelu)(a, b, sf, sf, offsets, ones, prob_tensor=prob)
+        np.testing.assert_array_equal(np.asarray(out['c_tensor']).astype(np.float32), 256)
+        dsrelu = partial(cudnn.grouped_gemm_dsrelu_wrapper_sm100, sf_vec_size=32, d_dtype=fp8, norm_const_tensor=ones)
+        out = jax.jit(dsrelu)(a, b, jnp.ones((256, 256), jnp.bfloat16), sf, sf, offsets, ones, prob)
+        assert np.isfinite(np.asarray(out['dprob_tensor'])).all()
+        # Packed FP4 ones (0x22), E4M3 unit scales (0x38), scales per 16.
+        a4 = jnp.full((256, 128), 0x22, jnp.uint8)
+        b4 = jnp.full((1, 256, 128), 0x22, jnp.uint8)
+        sf4 = jnp.full((1, 2, 4, 32, 4, 4), 0x38, jnp.uint8).view(ml_dtypes.float8_e4m3fn)
+        import cutlass
+        hadamards = [cudnn.grouped_gemm_glu_hadamard_wrapper_sm100]
+        if hasattr(cutlass, 'FloatNV8E5M3FNU'):
+            hadamards.append(cudnn.grouped_gemm_glu_hadamard_quant_wrapper_sm100)
+        for hadamard in hadamards:
+            out = jax.jit(hadamard)(a4, sf4, offsets, ones, prob, b_tensor=b4, sfb_tensor=sf4)
+            np.testing.assert_array_equal(np.asarray(out['c_tensor']).astype(np.float32), 256)
+        glu = partial(cudnn.grouped_gemm_glu_wrapper_sm100, generate_c=True)
+        bf = jnp.ones((256, 256), jnp.bfloat16)
+        out = jax.jit(glu)(bf, None, offsets, ones, b_tensor=jnp.ones((1, 256, 256), jnp.bfloat16), prob_tensor=prob)
+        np.testing.assert_array_equal(np.asarray(out['c_tensor']).astype(np.float32), 256)
         assert sys.modules['torch'] is None
     """)
     result = subprocess.run(
         [sys.executable, "-c", script], env={**os.environ, "XLA_PYTHON_CLIENT_PREALLOCATE": "false"}, capture_output=True, text=True, timeout=180
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("data_format", ["nvfp4", "mxfp4"])
+@pytest.mark.parametrize("act_func", ["swiglu", "geglu"])
+@pytest.mark.parametrize("shared_wrapper", [False, True], ids=["jax_entry", "wrapper"])
+def test_canonical_jax_glu_fp4(data_format, act_func, shared_wrapper):
+    skip_unless_sm100()
+    import cudnn
+
+    arrays, sf_vec_size = block_scaled_problem(data_format, 4)
+    eager = partial(cudnn.grouped_gemm_glu_wrapper_sm100, sf_vec_size=sf_vec_size, act_func=act_func, generate_c=True)
+    reference = eager(**torch_inputs(arrays), d_dtype=torch.bfloat16)
+    assert reference["amax_tensor"] is not None and reference["sfd_row_tensor"] is None
+    # Torch allocates D_col but the kernel does not write it without quantization.
+    reference["d_col_tensor"] = None
+    bridge = eager if shared_wrapper else partial(cudnn.grouped_gemm_glu_jax_sm100, sf_vec_size=sf_vec_size, act_func=act_func, generate_c=True)
+    bridge = partial(bridge, d_dtype=ml_dtypes.bfloat16)
+    inputs = {name: jnp.asarray(array) for name, array in arrays.items()}
+    poison_allocator()
+    assert_outputs(bridge(**inputs), reference)
+    compiled = jax.jit(bridge, compiler_options={"xla_gpu_enable_command_buffer": "FUSION,CUSTOM_CALL"})
+    assert_outputs(compiled(**inputs), reference)
+    # The amax accumulator must restart from -inf on every call.
+    assert_outputs(compiled(**inputs), reference)
+
+
+@pytest.mark.parametrize("data_format", ["nvfp4", "mxfp4"])
+@pytest.mark.parametrize("act_func", ["dswiglu", "dgeglu"])
+@pytest.mark.parametrize("shared_wrapper", [False, True], ids=["jax_entry", "wrapper"])
+def test_canonical_jax_dglu_fp4(data_format, act_func, shared_wrapper):
+    skip_unless_sm100()
+    import cudnn
+
+    arrays, sf_vec_size = block_scaled_problem(data_format, 4, backward=True)
+    m = arrays["a_tensor"].shape[0]
+    eager = partial(cudnn.grouped_gemm_dglu_wrapper_sm100, sf_vec_size=sf_vec_size, act_func=act_func)
+    reference = eager(**torch_inputs(arrays), dprob_tensor=torch.zeros((m,), device="cuda"), d_dtype=torch.bfloat16)
+    assert reference["amax_tensor"] is not None and reference["sfd_row_tensor"] is None
+    # Torch allocates D_col but the kernel does not write it without quantization.
+    reference["d_col_tensor"] = None
+    bridge = partial(eager, dprob_tensor=None) if shared_wrapper else partial(cudnn.grouped_gemm_dglu_jax_sm100, sf_vec_size=sf_vec_size, act_func=act_func)
+    bridge = partial(bridge, d_dtype=ml_dtypes.bfloat16)
+    inputs = {name: jnp.asarray(array) for name, array in arrays.items()}
+    poison_allocator()
+    assert_outputs(bridge(**inputs), reference)
+    compiled = jax.jit(bridge, compiler_options={"xla_gpu_enable_command_buffer": "FUSION,CUSTOM_CALL"})
+    assert_outputs(compiled(**inputs), reference)
+    # The dprob and amax accumulators must restart on every call.
+    assert_outputs(compiled(**inputs), reference)
 
 
 @pytest.mark.parametrize(
@@ -498,9 +907,7 @@ def test_canonical_jax_runtime_offsets_and_padding(backward, monkeypatch):
     jax.block_until_ready(compiled(**inputs))
     arrays["padded_offsets"] = np.array([0, 256, 256, 768], np.int32)
     inputs["padded_offsets"] = jnp.asarray(arrays["padded_offsets"])
-    # Poison the allocator so an uninitialized output cannot read back as zeros.
-    for _ in range(8):
-        jax.block_until_ready(jnp.full((1 << 22,), 0x55, jnp.uint8))
+    poison_allocator()
     result = jax.block_until_ready(compiled(**inputs))
     reference = getattr(cudnn, f"grouped_gemm_{name}_wrapper_sm100")(**torch_inputs(arrays), d_dtype=torch.float8_e4m3fn, sf_vec_size=32)
     keys = ("d_row_tensor", "d_col_tensor", "dprob_tensor") if backward else ("c_tensor", "d_tensor", "d_col_tensor")

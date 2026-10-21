@@ -954,7 +954,31 @@ _SNAPSHOT_ARMS = {
     "mxfp8_unfused": dict(inplace_qkv=True, fp8=True, mxfp8=True),
     "mxfp8_fused": dict(inplace_qkv=True, fp8=True, fp8_fused=True, mxfp8=True),
 }
-_COMMON = dict(gate=-1, o_gated=-1, base_align=256, o4=-1, sf_o=-1, kc8=-1, vc8=-1, kv_inv=-1, kv_gathered=-1, kv_len_t=-1, decode_q_lens=-1)
+# Every slot no pre-existing pipeline reserves reads -1: the gate copies, the fp4 O pair, the in-block indexer's seven
+# (`ix_q .. ix_sort_idx`, a QsaSpec(index_source="indexer") block past its identity bound -- test_block_qsa.py pins their carve), the e4m3
+# KV cache's five, the fp8 indexer cache's two and the DECODE form's prefill-route Q lengths (the same set as the training-forward twin's _ABSENT).
+_COMMON = dict(
+    gate=-1,
+    o_gated=-1,
+    base_align=256,
+    o4=-1,
+    sf_o=-1,
+    ix_q=-1,
+    ix_kbar=-1,
+    ix_ids=-1,
+    ix_scores=-1,
+    ix_cand=-1,
+    ix_ids_sorted=-1,
+    ix_sort_idx=-1,
+    kc8=-1,
+    vc8=-1,
+    kv_inv=-1,
+    kv_gathered=-1,
+    kv_len_t=-1,
+    ix_q8=-1,
+    ix_kbar8=-1,
+    decode_q_lens=-1,
+)
 _SNAPSHOT = {
     ("test", "bf16_inplace"): dict(
         proj=0, q=-1, k=-1, v=-1, o=20480000, engine_scratch=28672000, total_bytes=28672000, q8=-1, k8=-1, v8=-1, o8=-1, gate16=-1, sf_q=-1, sf_k=-1, sf_v=-1
@@ -1139,8 +1163,9 @@ _SNAPSHOT = {
 @pytest.mark.parametrize("shape", list(_SNAPSHOT_SHAPES))
 def test_workspace_layout_is_byte_identical_without_fp4(shape, arm):
     """Every field of ``_plan_workspace`` for every pre-existing pipeline equals the frozen snapshot (test AND 397B geometry,
-    unfused AND fused arms), and the appended ``o_fp4=None`` spells the same layout as not passing it.  The two new fields
-    read ``-1`` there.  No GPU."""
+    unfused AND fused arms), and the appended ``o_fp4=None`` spells the same layout as not passing it.  The two fp4 fields
+    and the in-block indexer's seven slots read ``-1`` there (the EXACT field set is asserted: a slot appended to
+    ``_Intermediates`` lands here and in test_block_training_forward.py's ``_ABSENT``, or both pins go red).  No GPU."""
     from cudnn.gated_attention_block.api import _plan_workspace
 
     geom_kw, b, s = _SNAPSHOT_SHAPES[shape]

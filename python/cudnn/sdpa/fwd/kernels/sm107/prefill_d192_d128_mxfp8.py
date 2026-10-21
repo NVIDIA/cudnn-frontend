@@ -980,6 +980,10 @@ _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 # === Warp-group functions ===
 
 
+# This kernel uses common CLC for both dense and THD work.
+from cudnn.frost.tile_dsl.scheduler import read_tile_id_arrive_on_leader as read_tile_id_arrive
+
+
 @cute.jit
 def _tmaldg_warp_group(
     tma_q_desc,

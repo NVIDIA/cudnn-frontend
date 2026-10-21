@@ -3,6 +3,7 @@
 
 """Shared metadata validation for canonical grouped MXFP8 JAX entry points."""
 
+import math
 import os
 from functools import lru_cache
 
@@ -13,7 +14,8 @@ import ml_dtypes
 
 from cudnn.api_base import TupleDict, ceil_div
 from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.jax import TensorSpec, call, row_major_desc, zeros_init
+from cudnn.frost.buffers import cutedsl_arch_requirement_error
+from cudnn.jax import TensorSpec, call, row_major_desc
 from cudnn.tensor_adapter import detect_framework, framework_dtype
 
 jax.tree_util.register_pytree_node(
@@ -37,15 +39,44 @@ def sf_array(array):
     return array
 
 
-def sf_shape(rows, cols):
-    return (1, ceil_div(rows, 128), ceil_div(ceil_div(cols, 32), 4), 32, 4, 4)
+def sf_shape(rows, cols, sf_vec_size=32):
+    return (1, ceil_div(rows, 128), ceil_div(ceil_div(cols, sf_vec_size), 4), 32, 4, 4)
+
+
+fp8_dtypes = (cutlass.Float8E4M3FN, cutlass.Float8E5M2)
+
+
+def operand_dtype(array):
+    """JAX has no packed FP4 dtype, so FP4 operands travel as uint8 with two values per byte."""
+    dtype = _convert_to_cutlass_data_type(array.dtype)
+    return cutlass.Float4E2M1FN if dtype is cutlass.Uint8 else dtype
+
+
+def check_block_scaled_operands(a, b, sfa, sfb, sf_vec_size):
+    """Validate the A/B and scale dtypes; return the A/B dtype and the scale dtype."""
+    ab_dtype = operand_dtype(a)
+    if ab_dtype not in (*fp8_dtypes, cutlass.Float4E2M1FN) or operand_dtype(b) is not ab_dtype:
+        raise ValueError("a and b must have the same dtype: MXFP8 e4m3 or e5m2, or packed FP4 as uint8")
+    sf_dtype = _convert_to_cutlass_data_type(sfa.dtype)
+    if sf_dtype not in (cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN) or _convert_to_cutlass_data_type(sfb.dtype) is not sf_dtype:
+        raise ValueError("sfa and sfb must both contain E8M0 scale bytes, or both E4M3 for NVFP4")
+    if sf_vec_size not in (16, 32) or (ab_dtype in fp8_dtypes and (sf_vec_size != 32 or sf_dtype is not cutlass.Float8E8M0FNU)):
+        raise ValueError("sf_vec_size must be 32 with E8M0 scales for MXFP8, and 16 or 32 for FP4")
+    return ab_dtype, sf_dtype
+
+
+def check_packed_sf_size(inputs, sizes, rest_k):
+    for name, rows, groups in sizes:
+        if math.prod(inputs[name].shape) != 512 * ceil_div(rows, 128) * rest_k * groups:
+            raise ValueError(f"{name.upper()} must contain the complete MMA-packed scale buffer")
 
 
 def output_type(shape, dtype):
     return jax.ShapeDtypeStruct(shape, framework_dtype(dtype, "jax"))
 
 
-def check_grouped_shapes(inputs, outputs, *, backward):
+def check_grouped_shapes(inputs, outputs, *, backward, sf_vec_size=32):
+    """Validate the canonical GLU/dGLU operands; return the A/B dtype, the scale dtype and the logical K."""
     a, b = inputs["a"], inputs["b"]
     if a.ndim != 2 or b.ndim != 3:
         raise ValueError("A must have shape (m, k) and B (experts, n, k)")
@@ -55,13 +86,7 @@ def check_grouped_shapes(inputs, outputs, *, backward):
         raise ValueError("Expected nonempty A/B with matching K and at least one expert")
     if m % 256:
         raise ValueError("A rows must be padded to a multiple of 256")
-    fp8 = (cutlass.Float8E4M3FN, cutlass.Float8E5M2)
-    for name in ("a", "b"):
-        if _convert_to_cutlass_data_type(inputs[name].dtype) not in fp8:
-            raise ValueError(f"{name} must be MXFP8 e4m3 or e5m2; packed FP4 is unsupported")
-    for name in ("sfa", "sfb"):
-        if _convert_to_cutlass_data_type(inputs[name].dtype) is not cutlass.Float8E8M0FNU:
-            raise ValueError(f"{name} must contain E8M0 scale bytes")
+    ab_dtype, sf_dtype = check_block_scaled_operands(a, b, inputs["sfa"], inputs["sfb"], sf_vec_size)
     for name, shape in (("alpha", (experts,)), ("beta", (experts,)), ("norm_const", (1,))):
         if name in inputs and (tuple(inputs[name].shape) != shape or _convert_to_cutlass_data_type(inputs[name].dtype) is not cutlass.Float32):
             raise ValueError(f"{name} must have shape {shape} and dtype float32")
@@ -69,15 +94,20 @@ def check_grouped_shapes(inputs, outputs, *, backward):
         raise ValueError("prob must have shape (m,)")
     if inputs["padded_offsets"].shape != (experts,) or _convert_to_cutlass_data_type(inputs["padded_offsets"].dtype) is not cutlass.Int32:
         raise ValueError("padded_offsets must have shape (experts,) and dtype int32")
-    d = outputs["d_row" if backward else "d"]
-    if _convert_to_cutlass_data_type(d.dtype) not in fp8:
-        raise ValueError("The MXFP8 JAX entry point requires FP8 output dtype")
-    if backward and _convert_to_cutlass_data_type(d.dtype) is not cutlass.Float8E4M3FN:
-        raise ValueError("d_dtype must be e4m3 for JAX backward; the packed backward quantizer does not support e5m2")
+    d_dtype = _convert_to_cutlass_data_type(outputs["d_row" if backward else "d"].dtype)
+    if ab_dtype in fp8_dtypes:
+        if d_dtype not in fp8_dtypes:
+            raise ValueError("The MXFP8 JAX entry point requires FP8 output dtype")
+        if backward and d_dtype is not cutlass.Float8E4M3FN:
+            raise ValueError("d_dtype must be e4m3 for JAX backward; the packed backward quantizer does not support e5m2")
+    elif d_dtype not in (cutlass.BFloat16, cutlass.Float16):
+        raise ValueError("FP4 inputs require a BF16 or FP16 d_dtype")
+    return ab_dtype, sf_dtype, k * (2 if ab_dtype is cutlass.Float4E2M1FN else 1)
 
 
 def grouped_plan(api_type, inputs, outputs, *, mma_tiler_mn, cluster_shape_mn, discrete_col_sfd):
-    check_grouped_shapes(inputs, outputs, backward=True)
+    if check_grouped_shapes(inputs, outputs, backward=True)[0] not in fp8_dtypes:
+        raise ValueError("a and b must be MXFP8 e4m3 or e5m2; packed FP4 is unsupported")
     experts = inputs["b"].shape[0]
     margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
     config = (experts, mma_tiler_mn, cluster_shape_mn, margin, discrete_col_sfd)
@@ -118,14 +148,37 @@ def check_jax_inputs(inputs):
         raise ValueError("JAX requires canonical A (m,k) and B (experts,n,k) layouts")
 
 
+def check_bf16_dense_inputs(inputs):
+    """Validate the canonical BF16 dense operands shared by GLU and dGLU; return (m, k, experts, n)."""
+    check_jax_inputs(inputs)
+    a, b = inputs["a"], inputs["b"]
+    m, k = a.shape
+    experts, n, b_k = b.shape
+    if m <= 0 or experts <= 0 or k != b_k:
+        raise ValueError("Expected nonempty A/B with matching K and at least one expert")
+    if m % 256:
+        raise ValueError("A rows must be padded to a multiple of 256")
+    if _convert_to_cutlass_data_type(b.dtype) is not cutlass.BFloat16:
+        raise ValueError("a and b must both be bfloat16")
+    for name, shape in (("alpha", (experts,)), ("beta", (experts,)), ("prob", (m,))):
+        if name in inputs and (tuple(inputs[name].shape) != shape or _convert_to_cutlass_data_type(inputs[name].dtype) is not cutlass.Float32):
+            raise ValueError(f"{name} must have shape {shape} and dtype float32")
+    if inputs["padded_offsets"].shape != (experts,) or _convert_to_cutlass_data_type(inputs["padded_offsets"].dtype) is not cutlass.Int32:
+        raise ValueError("padded_offsets must have shape (experts,) and dtype int32")
+    if experts > 1024:
+        raise ValueError(f"expert count must be <= 1024, got {experts}")
+    return m, k, experts, n
+
+
 @lru_cache(maxsize=128)
-def grouped_call(adapter, kernel, mac, input_types, output_types, *, zero_dprob, **scalars):
+def grouped_call(adapter, kernel, mac, input_types, output_types, *, initialized=(), **scalars):
+    """initialized: (output index, initializer) pairs for the outputs the kernel accumulates into."""
     return call(
         adapter,
         output_shape_dtype=output_types,
         input_spec=tuple(row_spec(t) for t in input_types),
         output_spec=tuple(row_spec(t) for t in output_types),
-        initialized_outputs={2: zeros_init} if zero_dprob else None,
+        initialized_outputs=dict(initialized) or None,
         kernel=kernel,
         mac=mac,
         **scalars,
@@ -151,11 +204,12 @@ def check_jax_wrapper_options(
     use_single_group_runtime_offsets=False,
     sf_fp8_dtype_override=None,
     scheduler_counter_tensor=None,
+    sf_vec_sizes=(32,),
 ):
     options = {
         "acc_dtype": acc_dtype is None or _convert_to_cutlass_data_type(acc_dtype) is cutlass.Float32,
         "cd_major": cd_major == "n",
-        "sf_vec_size": sf_vec_size == 32,
+        "sf_vec_size": sf_vec_size in sf_vec_sizes,
         "vector_f32": not vector_f32,
         "m_aligned": m_aligned == 256,
         "current_stream": current_stream is None,
@@ -174,3 +228,9 @@ def check_jax_wrapper_options(
     for name, supported in options.items():
         if not supported:
             raise ValueError(f"{name} is unsupported for the JAX MXFP8 path")
+
+
+def check_rubin_dsl():
+    requirement = cutedsl_arch_requirement_error((10, 7))
+    if requirement:
+        raise RuntimeError(requirement)

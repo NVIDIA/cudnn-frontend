@@ -689,13 +689,15 @@ def test_DSA_dense_score_recompute_wrapper_mxfp8_matches_dequant_reference(
     s_q_default,
     request,
 ):
+    """Compare MXFP8 score recompute with a dequantized reference."""
     try:
         from cudnn import DSA
         from cuda.bindings import driver as cuda
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
-    scale_utils = pytest.importorskip("cudnn.deepseek_sparse_attention.utils.sm100.mxfp8_scale_utils")
+    from deepseek_sparse_attention.cutedsl import mxfp8_scale_reference as scale_utils
+
     cfg = dsa_init(
         request=request,
         head_dim=128,

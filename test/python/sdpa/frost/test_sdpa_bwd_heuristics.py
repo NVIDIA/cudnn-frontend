@@ -40,6 +40,7 @@ _OFFERED = {
     "sdpa_bwd_sm107_mxfp8": 20606,
     "sdpa_bwd_sm100_d256": 20607,
     "sdpa_bwd_sm107_d512": 20608,
+    "sdpa_bwd_sm100_d128": 20609,
 }
 
 
@@ -133,8 +134,18 @@ def test_sm100_d256_row_lists_one_knobless_entry_on_the_sm100_line(cc, listed):
     if listed:
         assert [p.engine_id for p in plans] == [20607]
         assert 20607 not in [p.engine_id for p in recommend("A", _facts(d_qk=512, d_v=512, device_cc=cc), _OFFERED)]
-        assert recommend("A", _facts(d_qk=128, d_v=128, device_cc=cc), _OFFERED) == []
+        assert [p.engine_id for p in recommend("A", _facts(d_qk=128, d_v=128, device_cc=cc), _OFFERED)] == [20609]
         assert recommend("A", _facts(d_qk=256, d_v=256, s_q=1, device_cc=cc), _OFFERED) == []
+
+
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3), (10, 6)])
+def test_sm100_d128_dense_row_lists_one_knobless_entry(monkeypatch, cc):
+    monkeypatch.setattr(bwd_engines, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.8.0")))
+    facts = _facts(device_cc=cc)
+    assert [(p.engine_id, p.knobs) for p in recommend("A", facts, _OFFERED)] == [(20609, None)]
+    grouped = recommend("A", _facts(device_cc=cc, h_kv=2, dtype=cudnn.data_type.BFLOAT16), _OFFERED)
+    assert [(p.engine_id, p.knobs) for p in grouped] == ([(20609, None)] if cc == (10, 0) else [])
+    assert recommend("A", _facts(device_cc=cc, h_kv=2, dtype=cudnn.data_type.HALF), _OFFERED) == []
 
 
 @pytest.mark.parametrize(

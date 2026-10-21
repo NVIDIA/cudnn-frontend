@@ -371,7 +371,7 @@ def test_DSA_compressed_indexer_forward_bshd_mxfp8_small_head_groups(h_q):
         from cudnn import DSA
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    scale_utils = pytest.importorskip("cudnn.deepseek_sparse_attention.utils.sm100.mxfp8_scale_utils")
+    from deepseek_sparse_attention.cutedsl import mxfp8_scale_reference as scale_utils
 
     device = torch.device("cuda")
     b, s_q, s_k, d = 2, 133, 64, 128
@@ -1322,10 +1322,7 @@ def test_DSA_compressed_indexer_forward_thd_mxfp8_lse(deterministic, h_q):
     _require_sm100()
     try:
         from cudnn import DSA
-        from cudnn.deepseek_sparse_attention.utils.sm100.mxfp8_scale_utils import (
-            pack_k_scale_bshd,
-            pack_q_scale_bshd,
-        )
+        from deepseek_sparse_attention.cutedsl import mxfp8_scale_reference
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
@@ -1405,11 +1402,11 @@ def test_DSA_compressed_indexer_forward_thd_mxfp8_lse(deterministic, h_q):
             ratio=ratio,
             sm_scale=d**-0.5,
             precision="mxfp8",
-            q_scale=pack_q_scale_bshd(
+            q_scale=mxfp8_scale_reference.pack_q_scale_bshd(
                 q_scale_logical[q0:q1].unsqueeze(0).clone(),
                 qhead_per_kv_head=h_q,
             ),
-            k_scale=pack_k_scale_bshd(k_scale_logical[k0:k1].unsqueeze(0)),
+            k_scale=mxfp8_scale_reference.pack_k_scale_bshd(k_scale_logical[k0:k1].unsqueeze(0)),
         )["scores"]
         check_ref_compressed_topk(
             dense,

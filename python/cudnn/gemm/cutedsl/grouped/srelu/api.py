@@ -1267,6 +1267,44 @@ def grouped_gemm_srelu_wrapper_sm100(
     from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
 
     framework = detect_framework(a_tensor)
+    if framework == "jax" and b_tensor is not None:
+        from ..canonical_jax import check_jax_wrapper_options
+        from .jax_api import grouped_gemm_srelu_jax_forward
+
+        check_jax_wrapper_options(
+            acc_dtype=acc_dtype,
+            cd_major=cd_major,
+            sf_vec_size=sf_vec_size,
+            vector_f32=vector_f32,
+            m_aligned=m_aligned,
+            current_stream=current_stream,
+            bias_tensor=bias_tensor,
+            b_ptrs=b_ptrs,
+            sfb_ptrs=sfb_ptrs,
+            b_major=b_major,
+            use_dynamic_sched=use_dynamic_sched,
+            sf_vec_sizes=(16, 32),
+        )
+        for name, rejected in (("n", n is not None), ("b_dtype", b_dtype is not None)):
+            if rejected:
+                raise ValueError(f"{name} is unsupported for the JAX block-scaled path")
+        return grouped_gemm_srelu_jax_forward(
+            a_tensor,
+            b_tensor,
+            sfa_tensor,
+            sfb_tensor,
+            padded_offsets,
+            alpha_tensor,
+            prob_tensor,
+            norm_const_tensor,
+            c_dtype=c_dtype if c_dtype is not None else cutlass.BFloat16,
+            d_dtype=d_dtype if d_dtype is not None else cutlass.BFloat16,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            discrete_col_sfd=discrete_col_sfd,
+            sf_vec_size=sf_vec_size,
+            tanh_clamp_scale=tanh_clamp_scale,
+        )
     if framework == "jax":
         raise ValueError(f"grouped_gemm_srelu_wrapper_sm100 does not support JAX arrays: {_JAX_SF_LAYOUT_ERROR}")
     if framework != "torch":

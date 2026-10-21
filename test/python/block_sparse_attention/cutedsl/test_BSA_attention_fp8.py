@@ -18,10 +18,10 @@ pytestmark = [pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclu
 
 def _import_bsa():
     try:
-        from cudnn import BSA
+        from cudnn import ops
 
         importlib.import_module("cudnn.block_sparse_attention._interface")
-        return BSA
+        return ops
     except (ImportError, OSError) as error:
         pytest.skip(f"block sparse attention optional dependencies are unavailable: {error}")
 
@@ -139,7 +139,7 @@ def test_bsa_fp8_interface_quantizes_before_private_launch(monkeypatch):
 @pytest.mark.L0
 @pytest.mark.parametrize(("batch", "heads"), ((1, 4), (1, 3), (2, 3)))
 def test_bsa_fp8_forward_accepts_positive_batch_and_head_counts(monkeypatch, batch, heads):
-    BSA = _import_bsa()
+    ops = _import_bsa()
     api = importlib.import_module("cudnn.block_sparse_attention.api")
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
     monkeypatch.setattr(api, "_device_arch", lambda tensor: 100)
@@ -160,7 +160,7 @@ def test_bsa_fp8_forward_accepts_positive_batch_and_head_counts(monkeypatch, bat
         return expected
 
     monkeypatch.setattr(interface, "bsa_fp8_blk64_fwd", fake_forward)
-    result = BSA.block_sparse_attention_fp8_forward(
+    result = ops.block_sparse_attention_fp8_forward(
         q,
         k,
         v,
@@ -328,7 +328,7 @@ def test_bsa_fp8_split_workspace_estimate_uses_bf16_output_size():
 @pytest.mark.parametrize(("batch", "heads"), ((1, 4), (2, 3)))
 @torch_fork_set_rng(seed=2026)
 def test_bsa_fp8_sm100_bf16_forward_matches_reference(batch, heads):
-    BSA = _require_sm100_fp8()
+    ops = _require_sm100_fp8()
     seqlen_q, seqlen_k, head_dim, topk = 128, 640, 128, 5
     q = torch.randn((batch, heads, seqlen_q, head_dim), device="cuda", dtype=torch.bfloat16) * 0.5
     k = torch.randn((batch, heads, seqlen_k, head_dim), device="cuda", dtype=torch.bfloat16) * 0.5
@@ -340,7 +340,7 @@ def test_bsa_fp8_sm100_bf16_forward_matches_reference(batch, heads):
     softmax_scale = head_dim**-0.5
     reference, _ = attention_reference(q, k, v, mask, softmax_scale)
 
-    result = BSA.block_sparse_attention_fp8_forward(
+    result = ops.block_sparse_attention_fp8_forward(
         q,
         k,
         v,

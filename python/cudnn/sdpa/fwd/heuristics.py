@@ -74,6 +74,8 @@ from cudnn.sdpa.fwd.config_sm100 import (
     supports_paged_d256_pack_gqa,
     supports_paged_prefill_cga1,
 )
+from cudnn.sdpa.fwd.config_sm107 import SM107_FP32_VECTOR_WITH_BIAS_TILE_N, sm107_bias_auto_cga, sm107_pair_item_active, sm107_tile_n_pick
+from cudnn.sdpa.fwd.config_sm100 import sm100_bias_auto_cga, sm100_tile_n_pick
 from cudnn.sdpa.fwd.config_sm120 import (
     D512_FLAVOR,
     FP8_HEAD_TILE_GRANULE,
@@ -556,7 +558,13 @@ _DECODE_TILE_COMBINE_COST = 3.5
 # is the cc 10.7 row's price of a partial on the LEAN forms of the combine
 # (decode_tile_combine_per_partial); the DECODE-GRID form's own price follows,
 # and the Blackwell line's fit, which prices the decode and the serial form of
-# the combine apart, after it.
+# the combine apart, after it.  The grouped-load walk this was measured on IS
+# the combine module's LEAN GROUP WALK (split_combine._combine_lean_walk_kernel),
+# the form the cc 10.7 line's lean-grid-overflow launches run again up to the
+# walk's split bound (decode_combine_lean_walk_selected); inside the grid bound,
+# and past the split bound, the module's own forms run (measured faster than the
+# walk on the small grids) and keep this price, conservative for them there --
+# so the restore of the walk moves no pick.
 _DECODE_TILE_COMBINE_PER_PARTIAL = 0.17
 # What every partial adds to the DECODE-GRID form of the combine, in KV-tile
 # units: that kernel spreads the split axis over a block's eight lane chains and
@@ -601,8 +609,9 @@ _DECODE_TILE_SERIAL_COMBINE_PER_SPLIT = 0.15
 DECODE_COMBINE_LEAN_ROWS_PER_BLOCK = 4
 # Which FORM of the shared sm100/split_combine serves a launch ON THE cc 10.7
 # LINE (the selection constant; the kernel module reads it).  The lean
-# fp32-partial path has, beside the module's own three forms (the lean group
-# walk, the serial walk and its decode form, which the Blackwell line keeps),
+# fp32-partial path has, beside the module's own three forms (the wide lean
+# group, the serial walk and its decode form, which the Blackwell line keeps)
+# and the lean group walk of the overflow launches (below),
 # the DECODE-GRID kernel (one block per (row, head, batch, 64-column chunk) --
 # 4x the blocks at d 256 -- with the split axis spread over the block's eight
 # 16-lane chains and merged once through SMEM in a fixed order, so a lane's
@@ -611,9 +620,10 @@ DECODE_COMBINE_LEAN_ROWS_PER_BLOCK = 4
 # grid, ceil(S_q / 4) x H_q x B blocks, holds at most this many blocks: fewer
 # blocks than SMs on every SM100-line part (148 .. 212), i.e. a launch the lean
 # kernel could not fill one wave with (B 1 x 24 Q heads = 24 blocks; B 4 x 24 =
-# 96; B 4 x 32 = 128), where nothing hides a serial walk; a prefill grid
-# (thousands of blocks) and a large-batch decode keep the module's own forms by
-# construction.  The constant is GEOMETRY, not a fit: both kernels move the same
+# 96; B 4 x 32 = 128), where nothing hides a serial walk; the decode-grid kernel
+# never serves a prefill grid (thousands of blocks) or a large-batch decode: on
+# cc 10.7 those take the lean group walk up to its split bound (below), else the
+# module's own forms.  The constant is GEOMETRY, not a fit: both kernels move the same
 # bytes and the decode-grid kernel is never the longer chain, so the threshold
 # only bounds which launches change at all.  :func:`decode_combine_grid_selected`
 # is the rule's host reading, the one the split model prices a launch's combine
@@ -644,6 +654,34 @@ DECODE_COMBINE_DEEP_SPLIT = 32
 # Blackwell line, measured on B200 / B300 by the combine module's author, and any line the rule was never
 # run on) keeps the combine module's own forms on every launch.
 _DECODE_COMBINE_RULE_CC = (10, 7)
+# The LEAN GROUP WALK (``split_combine.DECODE_GRID_LEAN_WALK``: the combine module's FORMER lean kernel -- one warp per
+# (q_row, head, batch), four splits loaded up front, then sixteen per memory round trip, the row accumulated in split order --
+# restored as the module's fifth form) serves the lean-grid OVERFLOW launches of the cc 10.7 line: a lean grid of at least
+# this many blocks, one past DECODE_COMBINE_MAX_LEAN_BLOCKS, so the two rules partition the grid axis and the decode-grid
+# kernel is never eligible where the walk is -- at a split of at most DECODE_COMBINE_LEAN_WALK_MAX_SPLIT (below).  Measured on
+# the Rubin performance class (212 SMs, 24 Q heads, d 256, the combine inside the serving step; device us per launch, the
+# module's form -> the walk): at B 32 (768 lean blocks) and B 128 (3072) the wide lean group costs 5.9 / 12.4 us at split 2
+# where the walk costs 3.3-3.4 / 5.9, and at S_q 4 (split 2-3) the serial walk 5.3-5.5 / 11.7 where the walk costs 4.0 / 8.9
+# -- the serving step +0.7 .. +6.2 % (geomean +3.4 %) on the six B 32 / B 128 cells with the module's forms (B 32 x 4K 53.3 ->
+# 55.7 us, B 128 x 4K 121.5 -> 127.7, B 32 x 32 heads 62.0 -> 65.9; S_q 4: 196.8 -> 199.5, 169.2 -> 173.7, 208.9 -> 210.4).
+# The counter-evidence that bounds the rule from below, same class, the SMALL grids inside the bound (24-96 rows): the
+# module's forms are the faster ones -- the wide lean group 4.1 us against the walk's 5.6 at B 1 x 4K x 16 splits (4.7 against
+# 6.0 at B 4 x 128K x 16), the decode form past 16 splits 5.8 / 8.1 / 6.1 against 8.4 / 14.0 / 8.5 at B 1 x 32K / 128K -- so
+# inside the bound nothing changes, and the eight decode-grid cells (the B 1 class, B 4 x 128K) keep their kernels.  A refit
+# moves this one line.  The split model prices the lean forms at _DECODE_TILE_COMBINE_PER_PARTIAL, measured on this walk, so
+# no pick moves with the restore.
+DECODE_COMBINE_LEAN_WALK_MIN_LEAN_BLOCKS = DECODE_COMBINE_MAX_LEAN_BLOCKS + 1
+# The walk's SPLIT bound: the measured regime above (split 2-3) is the one where the walk's up-front group holds the whole
+# split axis (split_combine.LEAN_WALK_G_S = 4 splits' LSE and partial-O rows; the kernel module cannot be imported here -- it
+# imports this one -- so the test suite pins the two equal): ONE memory round trip of at most 4 slot pairs where the module's
+# own forms issue 8 (their narrow lean group, split_combine.G_LEAN_SMALL, up to 8 splits -- the wide lean group at S_q <= 2 and
+# the one-warp-per-row form at S_q >= 3 alike).  From split 5 the walk pays two more DEPENDENT round trips per 16 splits (the
+# tail groups' max pass, then their weighted pass) where the module's forms still issue every load in one trip up to 8 splits
+# (16 at S_q <= 2), and past 16 splits the decode form beat the walk 1.4-1.7x on the small grids (above); the one-warp-per-row
+# form's deep split walk (S_q >= 3, past 8 splits) is unmeasured against the walk on an overflow grid.  So past this bound an
+# overflow launch keeps the module's own forms (the forms it ran before the restore), and widening the bound takes a measurement
+# at a mid-overflow grid (B 8-16 x 24 heads at kv 32K-128K, where the split model picks 8-16) -- a refit of this one line.
+DECODE_COMBINE_LEAN_WALK_MAX_SPLIT = 4
 
 
 def decode_combine_lean_blocks(b: int, h_q: int, s_q: int) -> int:
@@ -676,6 +714,20 @@ def decode_combine_grid_selected(b: int, h_q: int, s_q: int, split: int, device_
     if decode_combine_lean_blocks(b, h_q, s_q) > DECODE_COMBINE_MAX_LEAN_BLOCKS or int(split) < DECODE_COMBINE_MIN_SPLIT:
         return False
     return decode_combine_rows(b, h_q, s_q) <= DECODE_COMBINE_SMALL_GRID_ROWS or int(split) >= DECODE_COMBINE_DEEP_SPLIT
+
+
+def decode_combine_lean_walk_selected(b: int, h_q: int, s_q: int, split: int, device_cc: Optional[Tuple[int, int]] = None) -> bool:
+    """Whether a split launch of a ``(B, H_q, S_q)`` graph takes the combine module's LEAN GROUP WALK
+    (``split_combine.DECODE_GRID_LEAN_WALK``) at ``split`` partials: the lean-grid-overflow rule above -- the lean grid
+    (:func:`decode_combine_lean_blocks`) at least ``DECODE_COMBINE_LEAN_WALK_MIN_LEAN_BLOCKS`` blocks, i.e. past the
+    decode-grid kernel's bound, at a split of at most ``DECODE_COMBINE_LEAN_WALK_MAX_SPLIT`` (the measured regime: the whole
+    split axis in the walk's up-front group; a deeper split keeps the module's own forms until a measurement widens the
+    bound) -- on the cc 10.7 line only: ``device_cc`` has :func:`decode_combine_grid_selected`'s semantics (None reads the
+    cc 10.7 rule, the line it was measured on, ``_DECODE_COMBINE_RULE_CC``; every other device answers False and keeps the
+    module's own forms).  Where it answers True, :func:`decode_combine_grid_selected` answers False by construction."""
+    if device_cc is not None and tuple(device_cc)[:2] != _DECODE_COMBINE_RULE_CC:
+        return False
+    return decode_combine_lean_blocks(b, h_q, s_q) >= DECODE_COMBINE_LEAN_WALK_MIN_LEAN_BLOCKS and int(split) <= DECODE_COMBINE_LEAN_WALK_MAX_SPLIT
 
 
 def decode_combine_force_lean(b: int, h_q: int, s_q: int, split: int, device_cc: Optional[Tuple[int, int]] = None) -> bool:
@@ -1661,17 +1713,78 @@ def _in_flavor_sched_domain(caps: Capabilities, facts, selected: int, seed: int)
     return seed if seed in domain else min(domain)
 
 
+def _resident_arm_tile_n(spec: EngineSpec, facts, default: Optional[int]) -> Optional[int]:
+    """The KV tile width of a plan on the Rubin small head-dim tiles: the knob sweep's measured table,
+    ``config_sm107.sm107_tile_n_pick`` -- 64 for a bias TOGETHER WITH a kv_mask (any form; for the fp32 ADDITIVE vector it is also
+    the only width that serves the pair, ``SM107_FP32_VECTOR_WITH_BIAS_TILE_N``: the 128-wide rendering spills on the softmax role and
+    ``engines._bias_arm_decline`` refuses an explicit 128 typed), for a bias at one or two 128-wide kv tiles and for the plain / bias
+    body on the padding leg at the 32-wide tile (the 64-wide one up to two tiles); 128 everywhere else -- the ``sm107_bias_auto_cga``
+    idiom for the other knob of the form.  The engine row evaluates the pair / one-batch-entry form at the same width
+    (``engines._bias_arm_decline``) and the adapter defaults to it (rule 8b').  Every plan off those tiles keeps ``default``."""
+    caps = spec.capabilities
+    selected = _selected_d_shape(caps, facts, None)
+    domain = dict(caps.tile_ns_by_d_shape).get(selected)
+    if selected is None or domain is None:
+        return default
+    if caps.sm_lo == 100:
+        # The SM100 small tiles: the same question through config_sm100.sm100_tile_n_pick (128 unless the fp32 vector WITH a bias, which the
+        # 128-wide rendering does not serve, the bias body on the PADDING leg inside the 64-wide resident budget (measured on GB200), or the
+        # BUDGET rule); the row's _bias_arm_decline and the adapter read the same arithmetic (rule 8b').
+        pick = sm100_tile_n_pick(
+            selected[0],
+            facts.s_kv,
+            has_bias=facts.has_bias,
+            has_kv_mask=facts.has_kv_mask,
+            kv_mask_fp32=facts.kv_mask_dtype == cudnn.data_type.FLOAT,
+            padded=facts.padded,
+            domain=domain,
+        )
+        return pick if pick in domain else default
+    if caps.sm_lo != 107:
+        return default
+    pick = sm107_tile_n_pick(selected[0], facts.s_kv, has_bias=facts.has_bias, has_kv_mask=facts.has_kv_mask, padded=facts.padded, domain=domain)
+    return pick if pick in domain else default
+
+
 def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int, pack_gqa: Optional[bool] = None) -> tuple[int, Optional[int]]:
     """``pack_gqa`` is the candidate's packing where the width depends on it
     (the d128 f16 SM100 flavor, :func:`_d128_decode_tile_fits`); ``None`` asks
     the graph-level question.  The other flavors' rules ignore it."""
     caps = spec.capabilities
     domain = effective_cgas(caps, facts, split_kv)
-    selected_shape = _selected_d_shape(caps, facts)
+    # The leg's knobs ride along: on a row with dense-only tiles (the Rubin d32 / d64) a split or packed leg at D <= 64
+    # selects the d128 flavor, so the rule below reasons about the shape that leg actually lands on.
+    selected_shape = _selected_d_shape(caps, facts, SdpaFwdKnobs(split_kv=split_kv, pack_gqa=pack_gqa))
     if selected_shape == (192, 128) and (split_kv or 1) > 1 and domain == frozenset({1}):
         # The packed THD split ABI uses the single-Q tile. The existing dense
         # D192 split remains a two-CTA lowering.
         return sched_policy, 1
+    if caps.sm_lo == 107 and selected_shape is not None and facts.has_bias and caps.bias_d_shapes is not None:
+        # The resident bias block of the Rubin 32- / 64-wide tiles (a kv_mask ALONE stages nothing in SMEM -- no block, no
+        # budget -- and takes the flavor's own rule below): the NARROWEST width whose block holds S_kv
+        # (config_sm107.sm107_bias_auto_cga -- the arithmetic engines._bias_arm_decline and the adapter read, rule 8b'):
+        # a d64 graph at S_kv 256 lands on cga2 (two tiles), S_kv <= 128 keeps the tuned cga1 below.  No width holding it
+        # falls through: mismatch() declines every plan of such a graph whatever the pick.
+        bias_shapes = caps.bias_d_shapes if caps.bias_d_shapes is not None else caps.d_shapes
+        # The (n, n+1) pair item (a batch-broadcast bias on >= 2 rows, cga1) holds twice the kv columns of the 256-row item --
+        # the width pick evaluates the block of the form each width would run (config_sm107.sm107_bias_pair_form).
+        _bias_b = facts.bias_dim[0] if len(facts.bias_dim) == 4 else 1
+        # the item form depends on the plan's KV tile width (the one-batch-entry guard holds at 128 only): the width pick first
+        _tile_n = _resident_arm_tile_n(spec, facts, 128) or 128
+        _pair = sm107_pair_item_active(
+            _bias_b, facts.b, facts.h_q, facts.s_q, facts.device_sm_count or 0, 1, s_kv=facts.s_kv, d_flavor=selected_shape[0], tile_n=_tile_n
+        )
+        bias_cga = sm107_bias_auto_cga(selected_shape[0], facts.s_kv, domain, pair=_pair) if selected_shape in bias_shapes else None
+        if bias_cga is not None:
+            return sched_policy, bias_cga
+    if caps.sm_lo == 100 and selected_shape is not None and facts.has_bias and caps.bias_d_shapes is not None and selected_shape in caps.bias_d_shapes:
+        # The SM100 twin of the rule above at the SM100 budget (config_sm100.sm100_bias_auto_cga -- the arithmetic the row's
+        # _bias_arm_decline and the adapter's _resident_arm_cga read, rule 8b'): the NARROWEST width whose resident block holds S_kv --
+        # a D 64 bias graph lands on cga2 (its cga1 holds no block at 227 KiB), the 32-wide tile on its cga1.  No width holding it
+        # falls through: mismatch() declined every plan of such a graph already (the ring is not on the SM100 file yet).
+        bias_cga = sm100_bias_auto_cga(selected_shape[0], facts.s_kv, domain, tile_n=_resident_arm_tile_n(spec, facts, 128) or 128)
+        if bias_cga is not None:
+            return sched_policy, bias_cga
     if selected_shape == (64, 64) and domain == frozenset({1, 2}) and not (facts.is_fp8 or facts.is_mxfp8):
         # d64 runs cga1 on BOTH legs -- it is the prefill width (the narrow
         # slabs need no collective MMA, and a 512-row cga2 cluster wastes most
@@ -1930,7 +2043,9 @@ def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int, split_kv: Optiona
     SPLIT, whose combine applies the gate (``split_kv``: the set's split, None =
     some plan) -- there is a group to pack and the ratio divides
     the tile -- or, on a flavor with partial PackGQA, shares a factor with it
-    (96/8 packs 4 of its 12 heads; 24/8 has nothing to pack and stays unpacked).
+    (96/8 packs 4 of its 12 heads; 24/8 has nothing to pack and stays unpacked),
+    and on a row that does not require divisibility (SM120) fits it (24/4 packs ten
+    tokens in 60 rows of a 64-row tile).
     THD prefill packs only on a flavor advertising token-unit worklists and
     packed-head Stats stores; the decode tile's ragged-Q leg remains separate.
     cc 10.7 half packs dense D128 on the shared SM100 bodies (issue #1472) and dense d256
@@ -1974,18 +2089,22 @@ def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int, split_kv: Optiona
         and not (facts.thd and not _thd_decode_leg(caps, facts) and (facts.d_qk, facts.d_v) not in caps.thd_pack_gqa_d_shapes)
         and not (facts.has_epilogue_gate and not rubin_decode_tile)
         and facts.h_q != facts.h_kv
-        and (rubin_decode_tile or pack_gqa_supported(facts.h_q, facts.h_kv, tile_m, partial=pack_gqa_partial(caps, facts)))
+        and (
+            rubin_decode_tile
+            or pack_gqa_supported(facts.h_q, facts.h_kv, tile_m, partial=pack_gqa_partial(caps, facts), requires_divisible=caps.pack_gqa_requires_divisible)
+        )
     )
 
 
 def _pack_gqa_group(caps: Capabilities, facts, tile_m: Optional[int], packed: Optional[bool], split_kv: Optional[int] = None) -> int:
     """The heads one packed Q tile row-group holds for a ``pack_gqa=packed``
     set: 1 unpacked, else ``Cfg.PACK_G`` -- the whole ratio G when it divides
-    the tile, its largest divisor that does on a partial-PackGQA flavor (96/8
-    -> 4).  The launch geometry the wave-cost model must see is the PACKED
-    one: ``h_q // p`` packed heads of ``s_q * p`` rows each -- feeding it G
-    where the kernel packs p (96/8: 8 heads instead of 24) shrinks the
-    apparent grid 3x and over-proposes the split at mid batch sizes.
+    the tile (or, on a row that does not require divisibility, fits it), its
+    largest divisor that does on a partial-PackGQA flavor (96/8 -> 4).  The
+    launch geometry the wave-cost model must see is the PACKED one: ``h_q //
+    p`` packed heads of ``s_q * p`` rows each -- feeding it G where the kernel
+    packs p (96/8: 8 heads instead of 24) shrinks the apparent grid 3x and
+    over-proposes the split at mid batch sizes.
 
     When NO prefill tile can pack the group (the full contract at a ratio that
     does not divide the tile: the Rubin half row's 24/2, G = 12 at tile_m 128,
@@ -1996,7 +2115,7 @@ def _pack_gqa_group(caps: Capabilities, facts, tile_m: Optional[int], packed: Op
     if not packed:
         return 1
     g = facts.h_q // facts.h_kv
-    p = pack_gqa_group_size(g, tile_m or 128, partial=pack_gqa_partial(caps, facts))
+    p = pack_gqa_group_size(g, tile_m or 128, partial=pack_gqa_partial(caps, facts), requires_divisible=caps.pack_gqa_requires_divisible)
     if p == 0 and _d256_decode_tile_selected(caps, facts, g, split_kv):
         return g
     return p
@@ -2050,6 +2169,13 @@ def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] 
         wins = _ceil_div(facts.s_q * g, tile_q) < _ceil_div(facts.s_q, tile_q) * g
     else:
         wins = _pack_gqa_wins(facts, tile_q)
+        if wins and not caps.pack_gqa_requires_divisible:
+            # When tile_q % G != 0 a packed tile holds tile_q // G tokens, its tail rows dead: packing wins only while it launches no
+            # more Q tiles than the unpacked set (G per KV head here, since S_q < tile_q).  48/1 at S_q = 120 would
+            # launch 60 two-token tiles against 48, 71/1 at S_q = 100 one-token tiles 100 against 71.  A group that
+            # divides the tile always passes: ceil(S_q * G / tile_q) <= G.
+            g = facts.h_q // facts.h_kv
+            wins = _ceil_div(facts.s_q, tile_q // g) <= g
         if (
             wins
             and rubin_dense_d128_shared_leg(caps, facts)
@@ -2134,7 +2260,9 @@ def _split_launch(caps: Capabilities, facts, tile_m, tile_n, cga, pack_g: int, *
         kv_tiles = _swa_kv_tiles(facts, token_span=rows // pack_g, tile_n=tile_n or 128)
         if physical:
             ctas = cga_ctas(_selected_d_shape(caps, facts)[0], cga)
-    return _SplitKvLaunch(_ceil_div(facts.s_q * pack_g, rows), facts.h_q // pack_g, kv_tiles, ctas)
+    # Whole tokens per tile (rows // pack_g): the same count as ceil(S_q * pack_g / rows) when the group divides
+    # the tile, and the true one when it does not (SM120: tile_q % G != 0).
+    return _SplitKvLaunch(_ceil_div(facts.s_q, rows // pack_g), facts.h_q // pack_g, kv_tiles, ctas)
 
 
 def _split_points(
@@ -2151,10 +2279,11 @@ def _split_points(
 
     ``pack_g`` is the packed group of the set the split rides (1 = unpacked;
     :func:`_pack_gqa_group` -- the kernel's ``Cfg.PACK_G``, which is the GQA
-    ratio G when it divides the tile and a proper divisor of it under partial
-    PackGQA): packing multiplies each packed head's Q rows by ``pack_g`` and
-    divides the head count by it, so the wave-cost model must see the PACKED
-    launch — the packed grid is smaller, which is exactly when splitting pays.
+    ratio G when it divides the tile (or fits it, where divisibility is not required) and
+    a proper divisor of it under partial PackGQA): packing puts ``rows //
+    pack_g`` tokens of ``pack_g`` heads in each Q tile and divides the head
+    count by ``pack_g``, so the wave-cost model must see the PACKED launch —
+    the packed grid is smaller, which is exactly when splitting pays.
 
     The value comes from :func:`choose_split_kv`'s wave-cost model, fed the
     EXACT launch geometry via :func:`_pack_gqa_tile_q` — the Q rows one grid
@@ -2188,11 +2317,14 @@ def _split_points(
         return [no_split]
     # Paged KV is padded by construction and the split composes with the
     # per-batch lengths (it IS the decode lever there) — see mismatch().
-    # A sink splits on the half flavors (the combine folds it once); FP8 keeps the per-tile
-    # fold, and a gated graph's split (the gate rides its combine) carries no sink.
+    # A sink splits on the SM100 / SM120 half flavors (the combine folds it once); FP8 keeps
+    # the per-tile fold, and a gated graph's split (the gate rides its combine) carries no sink.
     if (
         (facts.thd and not ragged_decode)
-        or (facts.has_sink and (facts.is_fp8 or facts.is_mxfp8 or facts.has_epilogue_gate or not (caps.sm_lo == 100 and caps.sm_hi < 107)))
+        or (
+            facts.has_sink
+            and (facts.is_fp8 or facts.is_mxfp8 or facts.has_epilogue_gate or not ((caps.sm_lo == 100 and caps.sm_hi < 107) or caps.sm_lo == 120))
+        )
         or (facts.padded and not facts.has_paged_kv)
         or facts.seq_q_trim
     ):
@@ -2434,7 +2566,7 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
         and facts.h_kv > 0
         and facts.h_q % facts.h_kv == 0
         and facts.h_q // facts.h_kv in ((1, 2, 4, 8, 16) if caps.sm_lo == 100 else (1, 2, 4, 8))
-        and facts.page_size == 16
+        and facts.page_size in ((16, 128) if caps.sm_lo == 100 else (16,))
         and facts.causal
         and facts.bottom_right
         and facts.window_left is None
@@ -2619,7 +2751,7 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
         return SdpaFwdKnobs(
             sched_policy=sched_policy,
             tile_m=base_tile[0],
-            tile_n=base_tile[1],
+            tile_n=_resident_arm_tile_n(spec, facts, base_tile[1]),
             cga=cga,
             pack_gqa=pack_gqa,
             split_kv=split_value,
@@ -2641,8 +2773,11 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     def _resplit(knobs: SdpaFwdKnobs) -> SdpaFwdKnobs:
         # A runner's changed packing/tile/CGA is a different launch, not just
         # a label on the baseline's split. Keep other architecture policies
-        # unchanged until they have their own geometry validation.
-        if not _sm100_f16(caps, facts):
+        # unchanged until they have their own geometry validation.  On SM120 a
+        # runner's packing or Q tile sets its unit count (unpacked: G x the
+        # packed launch's; G = 6 at S_q = 31: two 128-row packed tiles, four of
+        # 64), so every runner takes the split of its own launch.
+        if not _sm100_f16(caps, facts) and caps.sm_lo != 120:
             return knobs
 
         def leg(split):
@@ -2739,7 +2874,7 @@ def _fallback_knobs(spec: EngineSpec, facts) -> SdpaFwdKnobs:
     return SdpaFwdKnobs(
         sched_policy=sched_policy,
         tile_m=min(caps.tile_ms, default=None),
-        tile_n=min(caps.tile_ns, default=None),
+        tile_n=_resident_arm_tile_n(spec, facts, min(caps.tile_ns, default=None)),
         cga=cga,
         pack_gqa=pack_gqa,
         split_kv=1,  # the fallback never splits: least-demanding means one kernel, no partial workspace

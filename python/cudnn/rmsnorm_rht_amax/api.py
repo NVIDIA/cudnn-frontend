@@ -134,6 +134,13 @@ class RmsNormRhtAmaxSm100(APIBase):
             f"RmsNormRhtAmaxSm100 requires SM100+, found SM{compute_capability}",
         )
 
+        smem_bytes = RMSNormRHTAmaxKernel.smem_bytes_for(n, resolved_num_threads)
+        smem_limit = torch.cuda.get_device_properties(self.x_desc.device).shared_memory_per_block_optin
+        self._value_error_if(
+            smem_bytes > smem_limit,
+            f"N={n} needs {smem_bytes} bytes of shared memory per CTA (the bf16 row tile and reduction slots), above the device limit of {smem_limit} bytes",
+        )
+
         self.num_threads = resolved_num_threads
         self.rows_per_cta = resolved_rows_per_cta
         self.n = n

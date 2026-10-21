@@ -330,9 +330,13 @@ def test_split_combine_form_pin_reads_the_plan_device_per_line(adapter, expect_c
     """``build_dense_spec`` pins a split plan's combine entry to a kernel FORM through ``_split_combine_decode_grid``, which
     reads the device the adapter recorded at check_support (``_plan_device_cc``: the SM100 / SM90 adapters' ``_device_cc``,
     the SM120 adapter's ``compute_capability``) -- on cc 10.7 the split-aware rule (AUTO where it selects the decode-grid
-    kernel, OFF where it pins the module's own forms inside the kernel module's bound), on every other device OFF on every
-    launch inside the bound; outside the bound the AUTO entry is the module's own forms by construction on every line.
-    RED before the seam existed: the SM120 adapter's plan read ``tuple(None)``."""
+    kernel, OFF where it pins the module's own forms inside the kernel module's bound, and the LEAN GROUP WALK on a launch
+    past the bound at a split of at most ``heuristics.DECODE_COMBINE_LEAN_WALK_MAX_SPLIT`` (4):
+    ``heuristics.decode_combine_lean_walk_selected``; AUTO past that split), on every other device OFF on every launch inside
+    the bound; outside the bound the AUTO entry is the module's own forms by construction on every line off cc 10.7 and past
+    the walk's split bound on cc 10.7 too.
+    RED before the seam existed: the SM120 adapter's plan read ``tuple(None)``; RED before the walk's restore: the cc 10.7
+    plan past the bound read AUTO."""
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 
     assert prep._plan_device_cc(adapter) == expect_cc
@@ -345,7 +349,12 @@ def test_split_combine_form_pin_reads_the_plan_device_per_line(adapter, expect_c
         assert grid(4, 24, 4, 16) == comb.DECODE_GRID_OFF and grid(4, 24, 4, 32) == comb.DECODE_GRID_AUTO
     else:
         assert all(grid(*g, s) == comb.DECODE_GRID_OFF for g in ((1, 24, 1), (4, 24, 4), (4, 32, 1)) for s in (4, 8, 16, 32, 128))
-    assert grid(8, 32, 1, 32) == comb.DECODE_GRID_AUTO  # 256 lean blocks: past the bound, nothing to force on any line
+    # 256 lean blocks: past the bound nothing is forced on any line -- the cc 10.7 plan names the restored lean group walk there
+    # up to its split bound (the measured B 32 / B 128 cells at split 2-3: 768 / 3072 blocks), every other line the AUTO entry
+    # (= the module's own forms by construction); past the walk's split bound (4) every line keeps the AUTO entry
+    past = comb.DECODE_GRID_LEAN_WALK if rule_line else comb.DECODE_GRID_AUTO
+    assert grid(8, 32, 1, 4) == past and grid(32, 24, 1, 2) == past and grid(128, 24, 4, 2) == past
+    assert grid(8, 32, 1, 32) == comb.DECODE_GRID_AUTO and grid(32, 24, 1, 8) == comb.DECODE_GRID_AUTO
 
 
 def test_split_combine_form_pin_reads_the_device_when_the_adapter_recorded_none(monkeypatch):
@@ -357,3 +366,21 @@ def test_split_combine_form_pin_reads_the_device_when_the_adapter_recorded_none(
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: seen.append(device) or (12, 0))
     api = SimpleNamespace(_device_cc=None, q_desc=SimpleNamespace(device="cuda:3"))
     assert prep._plan_device_cc(api) == (12, 0) and seen == ["cuda:3"]
+
+
+def test_packed_role_capacity_helper_bounds_the_ragged_token_count():
+    """``_packed_role`` (the ragged-Q leg of the Python frame binder) ends in ``_capacity``: RED on the tree that carried the role binder
+    without the helper (``NameError`` at the capacity line; pyflakes F821), GREEN with it -- a bare address is a typed ValueError, a span
+    shorter than one row holds 0 tokens, else the largest token whose row ends inside the span."""
+    T, H, D = 300, 4, 64
+    f = prep.BufferFacts(ptr=4096, dtype="bfloat16", device=(prep._DLPACK_CUDA, 0), span=T * H * D, shape=(T, H, D), strides=(H * D, D, 1))
+    spec = SimpleNamespace(device_index=0)
+    assert prep._packed_role(spec, {"q": f}, "q", H, D, "bfloat16", tma=True) == (4096, H * D, D, T)
+    geo = (H * D, D, 1, (H - 1) * D + D)  # (token stride, head stride, elem stride, row span)
+    assert prep._capacity(f._replace(span=geo[3]), geo, "q") == 1
+    assert prep._capacity(f._replace(span=geo[3] - 1), geo, "q") == 0
+    assert prep._capacity(f._replace(span=geo[3] + 2 * H * D + 5), geo, "q") == 3
+    with pytest.raises(ValueError, match="bare address"):
+        prep._capacity(f._replace(span=-1), geo, "q")
+    with pytest.raises(ValueError, match="is required"):
+        prep._packed_role(spec, {}, "q", H, D, "bfloat16", tma=True)

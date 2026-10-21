@@ -3298,14 +3298,16 @@ def test_gdp_summary_token_major_bitwise(backend, n):
     k, v, beta, g, q = to_thd(case.k), to_thd(case.v), to_thd(case.gates["beta"]), to_thd(case.gates["g"]), to_thd(case.q)
     set_seed(SEED + 2)
     dO = torch.randn(case.T, case.HO, case.V, device="cuda").to(case.dtype)
-    with waive_unsupported(backend, "gdp"):
-        h_e, m_e = la_ops.gated_delta_product_summary(k, v, g, beta, case.cu, n, use_qk_l2norm_in_kernel=True, plan_name="gdp_summary_frost")
-        h_t, m_t = la_ops.gated_delta_product_summary(k_tm, v_tm, g, beta_tm, case.cu, n, use_qk_l2norm_in_kernel=True, plan_name="gdp_summary_frost")
-        g_e = la_ops.gated_delta_product_summary_bwd(q, k, g, beta, dO, case.cu, n, use_qk_l2norm_in_kernel=True, plan_name="gdp_summary_frost")
-        g_t = la_ops.gated_delta_product_summary_bwd(q, k_tm, g, beta_tm, dO, case.cu, n, use_qk_l2norm_in_kernel=True, plan_name="gdp_summary_frost")
-    assert_bitwise("H", h_t, h_e)
-    assert_bitwise("M", m_t, m_e)
-    assert_bitwise("G", g_t, g_e)
+    # Exercise both initial compilation and reuse of the cached summaries.
+    for _ in range(2):
+        with waive_unsupported(backend, "gdp"):
+            h_e, m_e = la_ops.gated_delta_product_summary(k, v, g, beta, case.cu, n, use_qk_l2norm_in_kernel=True, plan_name="gdp_summary_frost")
+            h_t, m_t = la_ops.gated_delta_product_summary(k_tm, v_tm, g, beta_tm, case.cu, n, use_qk_l2norm_in_kernel=True, plan_name="gdp_summary_frost")
+            g_e = la_ops.gated_delta_product_summary_bwd(q, k, g, beta, dO, case.cu, n, use_qk_l2norm_in_kernel=True, plan_name="gdp_summary_frost")
+            g_t = la_ops.gated_delta_product_summary_bwd(q, k_tm, g, beta_tm, dO, case.cu, n, use_qk_l2norm_in_kernel=True, plan_name="gdp_summary_frost")
+        assert_bitwise("H", h_t, h_e)
+        assert_bitwise("M", m_t, m_e)
+        assert_bitwise("G", g_t, g_e)
 
 
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)

@@ -163,6 +163,7 @@ from cudnn.frost.tile_dsl.tma import (
     ld_shared_v2,
     ld_shared_v4,
 )
+from cudnn.sdpa.fwd.config_sm100 import thd_work_prefix_enabled
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, GmemTileTma, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 from cudnn.frost.tile_dsl.mask import (
@@ -351,6 +352,12 @@ class KernelTmemLayout:
 
 
 LAYOUT = KernelTmemLayout()
+
+
+# Only the common dense CLC path has a single scheduler publisher.
+# THD/predecode retains local schedulers and broadcast credits.
+if not CFG.THD_VARLEN:
+    from cudnn.frost.tile_dsl.scheduler import read_tile_id_arrive_on_leader as read_tile_id_arrive
 
 
 @cute.jit
@@ -2510,6 +2517,8 @@ def _launch(
             n_thd_units,
             not PAGED_KV,  # clamp_kv: paged pools have no packed KV total to clamp to
             SPLIT_KV,
+            bool(CFG.BOTTOM_RIGHT) and (CFG.MASK_FLAGS & MASK_SWA) == 0,
+            thd_work_prefix_enabled(CFG),
         ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
     else:
@@ -2637,6 +2646,7 @@ def _host(
         thd=CFG.THD_VARLEN,
         split_kv=SPLIT_KV,
         tensor_map_qwords=16,
+        work_prefix=thd_work_prefix_enabled(CFG),
         paged=PAGED_KV,
         page_size=PAGE_SIZE,
         block_table_ptr=block_table_ptr,

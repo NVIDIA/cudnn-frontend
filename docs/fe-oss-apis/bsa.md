@@ -40,12 +40,9 @@ environments that force an older DSL.
 
 ## Forward
 
-The `cudnn.torch` BSA functions are lazy aliases of the existing `cudnn` and
-`cudnn.BSA` functions, with identical signatures, outputs, and supported configurations.
-
 ```python
 import torch
-from cudnn.torch import (
+from cudnn.ops import (
     block_sparse_attention_forward,
     block_sparse_attention_backward,
     block_sparse_attention_fp8_forward,
@@ -77,6 +74,10 @@ o, lse = result
 The default layout is `BHSD`. Pass `layout="bshd"` for tensors in `BSHD`
 layout. The output follows the input layout, while `lse` is always the FP32
 natural-log log-sum-exp with shape `(B, H_q, S_q)`.
+
+For explicit Blackwell blk64 calls, TMA-aligned BSHD inputs are read through
+strided views. Both unsplit outputs and split-KV combined outputs are written
+directly in the requested layout. Misaligned inputs retain their staging fallback.
 
 ### Sparse metadata
 
@@ -265,6 +266,28 @@ The backward implementation builds a bucketed K-to-Q CSR task layout on the
 GPU. `bucket_size_blocks` is an optional tuning override; leaving it unset uses
 the backend default.
 
+With contiguous per-row count metadata, at least two KV blocks and at least
+1024 (batch, head, KV block) tasks, backward pairs KV neighborhoods to reuse
+common Q/dO loads and dQ accumulation; smaller problems do not recover the
+per-call pairing cost and use regular tasks.
+Pairing metadata is limited to 64 MiB; fixed counts or unsupported metadata
+layouts use regular tasks. Duplicate sparse edges retain their multiplicity.
+Paired tasks retain FP32 dK/dV accumulation even with a single query bucket;
+regular tasks can use the direct dK/dV epilogue when its alignment requirements hold.
+The initial eight-KV matching is refined within 32-KV windows, with refinement
+skipped above 1024 bitset words. Metadata construction is included in the
+wrapper's work and is rebuilt for each call.
+Backward interleaves its tasks across attention heads only for queries shorter
+than 98,304 tokens, where it was measured to help; longer queries keep the
+head-major task order.
+
+These optimizations keep the public block size at 64 and preserve the existing
+wrapper-owned workspace model. They do not add an allocation-free graph engine.
+Use `benchmark/bsa/benchmark_sm100_blk64.py` for a synthetic complete-API
+comparison; it records the imported source, input hashes and individual CUDA
+Event samples. Numerical tests, sanitizer checks and measurements on each
+target GPU are required before drawing performance conclusions.
+
 Backward defaults to blk64 on SM90 and blk128 on SM100/SM103. Pass the same
 explicit `sparse_block_size` used by forward when selecting the Blackwell blk64
 path. SM100/SM103 blk128 backward does not yet consume `block_sizes`; it
@@ -336,7 +359,7 @@ Compilation is lazy. The first call for a new static configuration JIT-compiles
 the relevant kernel; subsequent calls reuse an in-process cache.
 
 The Torch public surface consists of allocating function wrappers under
-`cudnn.torch`, also available under `cudnn` and `cudnn.BSA`; there is no separate `APIBase` class or explicit `compile()`
+`cudnn.ops`, also available under `cudnn` and `cudnn.BSA`; there is no separate `APIBase` class or explicit `compile()`
 lifecycle for BSA.
 
 Correctness tests and FP32 references are under
@@ -351,12 +374,12 @@ toward Speed of Light.
 
 ## Experimental JAX support
 
-`cudnn.jax.block_sparse_attention_forward` and
-`cudnn.jax.block_sparse_attention_backward` provide explicit forward/backward;
+`cudnn.ops.block_sparse_attention_forward_jax` and
+`cudnn.ops.block_sparse_attention_backward_jax` provide explicit forward/backward;
 `cudnn.jax.block_sparse_attention` adds first-order reverse-mode differentiation.
 All three accept JAX arrays, eagerly or under `jax.jit`, and require no PyTorch.
-The existing `cudnn` and `BSA` Torch APIs are unchanged. The former `_jax`
-exports have been removed without compatibility aliases.
+`cudnn.jax.block_sparse_attention_forward` and `cudnn.jax.block_sparse_attention_backward`
+have been removed; use the `cudnn.ops` names.
 
 The JAX implementation reuses the SM100 blk128 forward, bucketed CSR, backward preprocess,
 backward, and gradient conversion kernels. Install `jax[cuda13]` alongside the
@@ -397,10 +420,10 @@ runtime operands. Do not mutate saved forward inputs or metadata before backward
 import jax
 import jax.numpy as jnp
 from functools import partial
-from cudnn.jax import (
-    block_sparse_attention_forward as forward,
-    block_sparse_attention_backward as backward,
-    block_sparse_attention as attention,
+from cudnn.jax import block_sparse_attention as attention
+from cudnn.ops import (
+    block_sparse_attention_forward_jax as forward,
+    block_sparse_attention_backward_jax as backward,
 )
 
 q = jnp.ones((1, 2, 256, 64), dtype=jnp.bfloat16)

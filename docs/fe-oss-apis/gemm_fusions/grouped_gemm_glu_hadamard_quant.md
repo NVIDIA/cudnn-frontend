@@ -4,7 +4,7 @@
 
 ## JAX support
 
-JAX arrays are **not supported**: this fusion is block-scaled-only and its mandatory scale-factor inputs use an MMA-interleaved layout with no row-major (JAX) equivalent. JAX inputs raise a clear `ValueError` at the entry points. The API is otherwise type-erased and torch-lazy.
+**Canonical FP4 (dense weights):** the `jax.jit`-compatible entry point `cudnn.grouped_gemm_glu_hadamard_quant_jax_forward` takes packed FP4 A `(m, k/2)` and B `(experts, n, k/2)` as `uint8` with two values per byte, already MMA-packed `sfa_tensor`/`sfb_tensor` bytes (physical or flat; E4M3 with `sf_vec_size=16` for NVFP4, or E8M0), int32 `padded_offsets`, fp32 alpha and prob `(m,)` fp32/bf16. Output modes are dtype driven as in Torch, with `cutlass.Float4E2M1FN` selecting NVFP4 (Torch's packed dtype has no JAX equivalent): NVFP4 D and rowwise RHT come back as packed `uint8` `(m, n_out/2)` with physical 6-D E4M3 scale buffers, and colwise RHT as flat packed data `(m*n_out/2,)` and scales `(m*n_out/sf_vec_size,)`. `norm_const`, `rht_norm_const`, `glu_alpha` and `glu_limit` are compile-time constants of the traced call: pass Python numbers (or mark them static), since a traced JAX value raises `ConcretizationTypeError`. A scale computed inside the jitted program is not supported. Rows at or past `padded_offsets[-1]` are unspecified. `grouped_gemm_glu_hadamard_quant_wrapper_sm100` dispatches JAX inputs with a dense `b_tensor` to it. SM100+, with the Rubin kernel on SM107, and the default 256x256 tile; needs `nvidia-cutlass-dsl >= 4.8`. Bias, dynamic scheduling, discrete (`b_ptrs`) weights and the class API raise `ValueError` for JAX.
 
 ## Overview
 

@@ -84,6 +84,15 @@ def scan(package_root, modules_file):
                             record(f"{name}.{export}", getattr(module, export))
                         except (Exception, SystemExit) as error:
                             errors.append(f"{name}.{export}: {type(error).__name__}: {error}")
+                # Lazy names stay out of __all__ so `import *` does not load optional
+                # dependencies. Their objects are indexed where defined; record the name.
+                for export in sorted(set(vars(module).get("_LAZY_OPTIONAL_IMPORTS", ())) - set(exports)):
+                    if public(export):
+                        try:
+                            getattr(module, export)
+                            names.add(f"{name}.{export}")
+                        except (Exception, SystemExit) as error:
+                            errors.append(f"{name}.{export}: {type(error).__name__}: {error}")
             except (Exception, SystemExit) as error:
                 errors.append(f"{name}: {type(error).__name__}: {error}")
     finally:

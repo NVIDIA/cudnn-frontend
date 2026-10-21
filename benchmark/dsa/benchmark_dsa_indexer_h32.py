@@ -24,15 +24,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import statistics
 
 import torch
 
 from cudnn import DSA
+from cudnn.deepseek_sparse_attention.indexer_backward.deterministic_dk_sm100 import deterministic_dk_workspace_bytes
 
 
-def _make_case(batch: int, seqlen_q: int, seqlen_k: int, topk: int, seed: int):
+def _make_case(batch: int, seqlen_q: int, seqlen_k: int, topk: int, seed: int, topk_indices_global: bool):
     """Allocate deterministic compact-H32 inputs and sparse-score operands."""
+    if topk > seqlen_k:
+        raise ValueError(f"topk ({topk}) must not exceed seqlen_k ({seqlen_k})")
     generator = torch.Generator(device="cuda")
     generator.manual_seed(seed)
     q32 = torch.randn((batch, seqlen_q, 32, 128), device="cuda", dtype=torch.bfloat16, generator=generator)
@@ -40,7 +44,18 @@ def _make_case(batch: int, seqlen_q: int, seqlen_k: int, topk: int, seed: int):
     k = torch.randn((batch, seqlen_k, 128), device="cuda", dtype=torch.bfloat16, generator=generator)
     attn = torch.randn((batch, seqlen_q, topk), device="cuda", dtype=torch.float32, generator=generator)
     predict = torch.softmax(torch.randn(attn.shape, device="cuda", dtype=torch.float32, generator=generator), dim=-1)
-    indices = torch.randint(0, seqlen_k, attn.shape, device="cuda", dtype=torch.int32, generator=generator)
+    # Deterministic dK requires distinct valid IDs in each semantic top-k row.
+    # An affine permutation avoids materializing one S_k-wide random tensor per
+    # query while retaining a dispersed gather pattern at production lengths.
+    index_stride = max(1, seqlen_k // topk)
+    while math.gcd(index_stride, seqlen_k) != 1:
+        index_stride += 1
+    starts = torch.randint(0, seqlen_k, (batch, seqlen_q, 1), device="cuda", dtype=torch.int64, generator=generator)
+    positions = torch.arange(topk, device="cuda", dtype=torch.int64).view(1, 1, topk)
+    indices = ((starts + positions * index_stride) % seqlen_k).to(torch.int32)
+    if topk_indices_global:
+        batch_offsets = torch.arange(batch, device="cuda", dtype=torch.int32).view(batch, 1, 1) * seqlen_k
+        indices += batch_offsets
 
     return q32, w32, k, attn, predict, indices
 
@@ -54,7 +69,7 @@ def _outputs(q: torch.Tensor, w: torch.Tensor, k: torch.Tensor):
     )
 
 
-def _call(q, w, k, attn, predict, indices, grad_loss, outputs):
+def _call(q, w, k, attn, predict, indices, grad_loss, outputs, *, deterministic, topk_indices_global, workspace):
     """Launch the default indexer-backward backend into supplied outputs."""
     d_index_q, d_weights, d_index_k = outputs
     return DSA.indexer_backward_wrapper(
@@ -68,11 +83,13 @@ def _call(q, w, k, attn, predict, indices, grad_loss, outputs):
         sm_scale=1.0,
         loss_coeff=float(q.shape[0] * q.shape[1]),
         block_I=128,
-        topk_indices_global=False,
+        topk_indices_global=topk_indices_global,
         d_index_q=d_index_q,
         d_weights=d_weights,
         d_index_k=d_index_k,
         backend="default",
+        deterministic=deterministic,
+        workspace=workspace,
     )
 
 
@@ -101,6 +118,8 @@ def main():
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=30)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--deterministic", action="store_true", help="Use fixed-owner dK planes and their caller-owned workspace")
+    parser.add_argument("--topk-indices-global", action="store_true", help="Generate flat global KV ids, as packed DSA forward does")
     parser.add_argument(
         "--profile-case",
         choices=("compact_h32", "pre_padded_h64", "eager_pad_h64"),
@@ -113,9 +132,18 @@ def main():
     if args.topk <= 0 or args.topk % 128 != 0:
         raise ValueError("topk must be a positive multiple of 128")
 
-    q32, w32, k, attn_base, predict, indices = _make_case(args.batch, args.seqlen_q, args.seqlen_k, args.topk, args.seed)
+    q32, w32, k, attn_base, predict, indices = _make_case(
+        args.batch,
+        args.seqlen_q,
+        args.seqlen_k,
+        args.topk,
+        args.seed,
+        args.topk_indices_global,
+    )
     grad_loss = torch.ones((), device="cuda", dtype=torch.float32)
     l2_flush = torch.empty(256 * 1024 * 1024, device="cuda", dtype=torch.uint8)
+    workspace_bytes = deterministic_dk_workspace_bytes(args.batch, args.seqlen_k, 128) if args.deterministic else 0
+    workspace = torch.empty(workspace_bytes, device="cuda", dtype=torch.uint8) if workspace_bytes else None
 
     attn32 = attn_base.clone()
     attn64_eager = attn_base.clone()
@@ -128,13 +156,18 @@ def main():
         torch.empty_like(k, dtype=torch.float32),
     )
 
-    compact_h32 = lambda: _call(q32, w32, k, attn32, predict, indices, grad_loss, out32)
+    call_kwargs = {
+        "deterministic": args.deterministic,
+        "topk_indices_global": args.topk_indices_global,
+        "workspace": workspace,
+    }
+    compact_h32 = lambda: _call(q32, w32, k, attn32, predict, indices, grad_loss, out32, **call_kwargs)
 
     def eager_pad_h64():
         """Materialize H64 inputs on every call before launching the baseline."""
         q64_runtime = torch.nn.functional.pad(q32, (0, 0, 0, 32))
         w64_runtime = torch.nn.functional.pad(w32, (0, 32))
-        return _call(q64_runtime, w64_runtime, k, attn64_eager, predict, indices, grad_loss, out64_eager)
+        return _call(q64_runtime, w64_runtime, k, attn64_eager, predict, indices, grad_loss, out64_eager, **call_kwargs)
 
     cases = (
         ("compact_h32_us", "dsa_indexer_bwd_compact_h32", compact_h32, attn32),
@@ -151,7 +184,7 @@ def main():
             profile_case = (
                 "pre_padded_h64_us",
                 "dsa_indexer_bwd_pre_padded_h64",
-                lambda: _call(q64, w64, k, attn64_pre, predict, indices, grad_loss, out64_pre),
+                lambda: _call(q64, w64, k, attn64_pre, predict, indices, grad_loss, out64_pre, **call_kwargs),
                 attn64_pre,
             )
         else:
@@ -182,6 +215,9 @@ def main():
                         "head_dim": 128,
                         "topk": args.topk,
                     },
+                    "deterministic": args.deterministic,
+                    "topk_indices_global": args.topk_indices_global,
+                    "workspace_bytes": workspace_bytes,
                 },
                 indent=2,
             )
@@ -225,6 +261,10 @@ def main():
             "head_dim": 128,
             "topk": args.topk,
         },
+        "deterministic": args.deterministic,
+        "topk_indices_global": args.topk_indices_global,
+        "workspace_bytes": workspace_bytes,
+        "max_memory_allocated_bytes": torch.cuda.max_memory_allocated(),
         "samples": timings,
         "median_us": medians,
         "logical_gemm_tflops": {name.removesuffix("_us"): logical_gemm_flops / value / 1.0e6 for name, value in medians.items()},

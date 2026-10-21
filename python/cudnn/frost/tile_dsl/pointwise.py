@@ -554,6 +554,18 @@ def vec_scale_pair(vec, scalar, N):
     return cutlass.Vector(vector.shape_cast(flat_ty, result), dtype=cutlass.Float32)
 
 
+def vec_select_zero(pred, vec, N):
+    """``select(pred, 0, vec)`` on a ``vector<N x f32>``: EXACT +0.0 in every element where the thread's ``pred`` (one i1) holds,
+    ``vec`` unchanged elsewhere -- one ``arith.select`` over the whole vector (a SEL per element in the SASS, no FMUL).
+
+    The substitute for folding a zero into a scale (``vec * 0``): the multiply keeps a NaN / Inf operand (``NaN * 0 = NaN``), and an
+    accumulator can hold exactly that residue (a stage that ran zero iterations, a sub-tile whose body was skipped), so an epilogue
+    that must store zeros SELECTS them after the arithmetic (sdpa-invariants s 2)."""
+    flat_ty = _ir.VectorType.get([N], T_.f32())
+    zeros = vector.broadcast(flat_ty, cutlass.Float32(0.0).ir_value())
+    return cutlass.Vector(arith.select(pred.ir_value(), zeros, vec.ir_value()), dtype=cutlass.Float32)
+
+
 @cutlass.cute.jit
 def f16x2_to_f32(word, *, dtype=cutlass.Float16):
     """Unpack one Int32 (= 2 packed halves) into ``(lo_f32, hi_f32)`` Float32.
@@ -798,6 +810,46 @@ def lane_group_sum(value: cutlass.Float32, lanes: cutlass.Constexpr[int]) -> cut
 
 
 @cute.jit
+def rmsnorm_rstd(sum_sq_partial: cutlass.Float32, lanes: cutlass.Constexpr[int], d: cutlass.Constexpr[int], eps: cutlass.Float32) -> cutlass.Float32:
+    """RMSNorm reciprocal scale of one ``d``-element row spread over ``lanes``
+    consecutive lanes: ``rsqrt(sum(x^2) / d + eps)``.
+
+    ``sum_sq_partial`` is the calling lane's partial sum of squares over the elements it
+    holds; the group total comes from :func:`lane_group_sum`, so every lane of
+    the group returns the same value.  ``1 / d`` is a trace-time constant (one
+    multiply, never a divide) and the rsqrt is the fast-math MUFU form.  This is
+    the reduction the gated attention block's norm kernels compute; spell it
+    through this helper rather than inline.
+    """
+    return cute.math.rsqrt(lane_group_sum(sum_sq_partial, lanes) * cutlass.Float32(1.0 / d) + eps, fastmath=True)
+
+
+@cute.jit
+def rope_rotate_half(
+    y: cutlass.Float32, cos_v: cutlass.Float32, sin_v: cutlass.Float32, lane: cutlass.Int32, half_lanes: cutlass.Constexpr[int]
+) -> cutlass.Float32:
+    """NeoX ``rotate_half`` RoPE for ONE element of a lane-distributed row.
+
+    A row's leading ``ROPE_DIM`` elements sit on lanes ``[0, 2 * half_lanes)``
+    of their lane group, ``ELEMS`` per lane, so element ``e`` and its partner
+    ``e +- ROPE_DIM / 2`` are the SAME sub-index on lanes ``lane`` and
+    ``lane ^ half_lanes``: one butterfly shuffle fetches the partner, the sign is
+    ``-`` on the first half and ``+`` on the second, and the result is
+    ``y * cos + rotate_half(y) * sin`` with duplicated-half tables
+    (``cos[e] == cos[e + ROPE_DIM / 2]``).
+
+    ``shfl.sync`` with the full mask: EVERY lane of the warp must reach this
+    call, lanes outside the rope band included; the caller keeps the result on
+    the rope lanes only.  ``half_lanes`` must be a power of two so the butterfly
+    stays inside an aligned lane group, and ``lane`` is the index WITHIN the
+    group (``tidx % lanes``), not the hardware lane id.
+    """
+    partner = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, y, cutlass.Int32(half_lanes), 31, kind=nvvm.Shfl.BFLY))
+    signed = -partner if lane < cutlass.Int32(half_lanes) else partner
+    return y * cos_v + signed * sin_v
+
+
+@cute.jit
 def l2norm_inv(sum_sq: cutlass.Float32) -> cutlass.Float32:
     """Inverse L2 norm, ``rsqrt(sum_sq + L2_NORM_EPS)``; a zero row normalizes to zero."""
     return cute.math.rsqrt(sum_sq + cutlass.Float32(L2_NORM_EPS), fastmath=True)
@@ -816,6 +868,23 @@ def sigmoid2(x_lo, x_hi):
     halving and the scale-bias folded into one FMUL2 and one FFMA2."""
     half = opaque_f32_zero() + cutlass.Float32(0.5)
     scaled_lo, scaled_hi = fmul2(x_lo, x_hi, half, half)
+    tanh_lo = cute.math.tanh(scaled_lo, approx=True)
+    tanh_hi = cute.math.tanh(scaled_hi, approx=True)
+    return ffma2(tanh_lo, tanh_hi, half, half, half, half)
+
+
+@cute.jit
+def sigmoid2_biased_half(x_lo, x_hi, hb_lo, hb_hi):
+    """``(sigmoid(x_lo + b_lo), sigmoid(x_hi + b_hi))`` from the HALVED biases ``hb = b / 2``: one ``fma.rn.f32x2`` forms the tanh
+    argument ``x / 2 + b / 2`` in place of :func:`sigmoid2`'s ``add.f32x2`` (the bias add) + ``mul.f32x2`` (the halving), then the tanh
+    identity exactly as :func:`sigmoid2`.  The caller stages ``hb`` once (a bf16 bias halved in fp32 is exact down to the last bf16
+    subnormal).  OUTPUT-BITWISE with ``sigmoid2(*fadd2(x_lo, x_hi, b_lo, b_hi))`` on every input: for ``|x + b| >= 2^-125`` the fp32
+    grid is self-similar under a power-of-two scale, so ``RN(x / 2 + b / 2) = RN(x + b) / 2`` = the two-op form's argument bitwise; below
+    that both arguments are tiny (``|tanh| < 2^-25``) and ``RN(tanh / 2 + 1 / 2)`` is exactly 0.5 on both; an infinite ``x`` or an
+    overflowing sum saturates ``tanh.approx`` to +-1 on both; NaN propagates on both.  Measured use: the LN-prologue dual GEMM's gated
+    epilogue with per-channel biases (`epi_math="packed_biasfold"`): -16 FADD2 per 32-channel subtile per lane."""
+    half = opaque_f32_zero() + cutlass.Float32(0.5)
+    scaled_lo, scaled_hi = ffma2(x_lo, x_hi, half, half, hb_lo, hb_hi)
     tanh_lo = cute.math.tanh(scaled_lo, approx=True)
     tanh_hi = cute.math.tanh(scaled_hi, approx=True)
     return ffma2(tanh_lo, tanh_hi, half, half, half, half)

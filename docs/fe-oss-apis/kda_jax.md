@@ -107,12 +107,12 @@ da_log, ddt_bias = jax.jit(jax.grad(gate_loss, argnums=(0, 1)))(a_log, dt_bias)
 For explicit backward:
 
 ```python
-from cudnn.jax import kimi_delta_attention_fwd, kimi_delta_attention_bwd
+from cudnn.ops import kimi_delta_attention_forward_jax, kimi_delta_attention_backward_jax
 
-o, final, residual = kimi_delta_attention_fwd(
+o, final, residual = kimi_delta_attention_forward_jax(
     q, k, v, g, beta, cu, initial_state=state,
     output_final_state=True, checkpoint_every_n_tokens=16)
-grads = kimi_delta_attention_bwd(
+grads = kimi_delta_attention_backward_jax(
     residual, jnp.ones_like(o), d_final_state=jnp.ones_like(final))
 # grads.dq, dk, dv, dg, dbeta, d_initial_state, d_a_log, d_dt_bias
 ```

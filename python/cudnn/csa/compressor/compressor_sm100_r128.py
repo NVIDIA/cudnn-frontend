@@ -127,9 +127,10 @@ from .compressor_sm100 import (
 # issued instructions at the instruction-bound buckets (B200 SASS audit).
 # exp(-inf) == +0 and NaN -> NaN are preserved by ex2.approx; ftz flushes only
 # sub-2^-126 results, which softmax consumes as exact zeros (den >= exp(0) = 1 always
-# survives).
+# survives in a window with a finite position).
 _L2E_HI = 1.4426950216293335  # fp32(log2(e))
 _L2E_LO = 1.925963033500011e-08  # fp32(log2(e) - _L2E_HI); residual ~4e-16
+_LOWEST_F32 = -3.4028234663852886e38  # lowest finite fp32: the forward's initial running max
 
 
 # ``cute.math.exp2``'s ``approx``/``ftz`` keywords are newer than the
@@ -252,11 +253,16 @@ def _compressor_fwd_r128_kernel(
         #
         # Both forms produce a (m, den, acc) partial with identical merge semantics;
         # both are run-to-run bitwise deterministic.
+        #
+        # The running max starts at the lowest finite fp32, not -inf: a -inf position
+        # seen before any finite one (a masked position, or a chunk with no finite
+        # position) then contributes exp(-inf) == 0, as in the eager softmax, instead of
+        # exp(-inf - -inf) == NaN. On finite inputs the output is bitwise unchanged.
         fr_m = cute.make_rmem_tensor((vec,), cutlass.Float32)
         fr_d = cute.make_rmem_tensor((vec,), cutlass.Float32)
         fr_a = cute.make_rmem_tensor((vec,), cutlass.Float32)
         for j in cutlass.range_constexpr(vec):
-            fr_m[j] = cutlass.Float32(_NEG_INF)
+            fr_m[j] = cutlass.Float32(_LOWEST_F32)
             fr_d[j] = cutlass.Float32(0.0)
             fr_a[j] = cutlass.Float32(0.0)
 
@@ -315,7 +321,8 @@ def _compressor_fwd_r128_kernel(
                         m_old = cutlass.Float32(fr_m[j])
                         if s > m_old:
                             # New running max: rescale den/acc by exp(m_old - s); the
-                            # first valid position rescales by exp(-inf) == 0 exactly.
+                            # first finite position rescales the empty (0, 0) partial by
+                            # exp(lowest - s) == 0 exactly.
                             if cutlass.const_expr(fastexp):
                                 scale = _exp_fast(m_old - s)
                             else:
@@ -349,9 +356,10 @@ def _compressor_fwd_r128_kernel(
         if col < ncol:
             if tidy == 0:
                 # Fixed-order serial merge of the tchunks partials per dim. Empty
-                # partials (den == 0: the skipped previous-block half) are ignored;
-                # every row has at least one valid position (the own half), so the
-                # merged den is >= 1 and the final division is safe.
+                # partials (den == 0: the skipped previous-block half, or a chunk
+                # whose positions are all -inf) are ignored; a NaN partial is merged.
+                # A window with a finite position has a merged den >= 1; an all -inf
+                # window gives 0 / 0 = NaN, as the eager softmax does.
                 cvec = col * vec
                 fr_o = cute.make_rmem_tensor((vec,), cutlass.BFloat16)
                 for j in cutlass.range_constexpr(vec):
@@ -361,14 +369,16 @@ def _compressor_fwd_r128_kernel(
                     for t in cutlass.range_constexpr(1, tchunks):
                         slot = (t * threads_x + tidx) * vec + j
                         d2 = cutlass.Float32(sD[slot])
-                        if d2 > 0:
+                        # A NaN partial (a NaN or +inf score in that chunk) is merged, so the output is NaN.
+                        if d2 != cutlass.Float32(0.0):
                             m2 = cutlass.Float32(sM[slot])
                             a2 = cutlass.Float32(sA[slot])
                             mn = m
                             if m2 > mn:
                                 mn = m2
-                            # exp(-inf - mn) == 0 handles a still-empty running
-                            # partial; both-empty never reaches here (d2 > 0).
+                            # The running partial may still be empty (den == acc == 0,
+                            # m the initial lowest finite value); den and acc stay 0
+                            # whatever exp(m - mn) is.
                             s1 = cute_math.exp(m - mn)
                             s2 = cute_math.exp(m2 - mn)
                             den = _ffma_rn(den, s1, _fmul_rn(d2, s2))

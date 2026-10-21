@@ -1575,6 +1575,51 @@ def grouped_gemm_quant_wrapper_sm100(
                 # Integer indexing
                 d = result[0]  # d_tensor
     """
+    if b_tensor is not None and detect_framework(a_tensor) == "jax":
+        from ..canonical_jax import check_jax_wrapper_options
+        from .jax_api import grouped_gemm_quant_jax_forward
+
+        check_jax_wrapper_options(
+            acc_dtype=acc_dtype,
+            cd_major=cd_major,
+            sf_vec_size=sf_vec_size,
+            vector_f32=vector_f32,
+            m_aligned=m_aligned,
+            current_stream=current_stream,
+            bias_tensor=bias_tensor,
+            b_ptrs=b_ptrs,
+            sfb_ptrs=sfb_ptrs,
+            use_dynamic_sched=use_dynamic_sched,
+            use_single_group_runtime_offsets=use_single_group_runtime_offsets,
+            sf_fp8_dtype_override=sf_fp8_dtype_override,
+            scheduler_counter_tensor=scheduler_counter_tensor,
+            sf_vec_sizes=(16, 32),
+        )
+        for name, rejected in (
+            ("n", n is not None),
+            ("b_dtype", b_dtype is not None),
+            ("row_scale_tensor", row_scale_tensor is not None),
+            ("d_tensor", d_tensor is not None),
+        ):
+            if rejected:
+                raise ValueError(f"{name} is unsupported for the JAX MXFP8 path")
+        return grouped_gemm_quant_jax_forward(
+            a_tensor,
+            b_tensor,
+            sfa_tensor,
+            sfb_tensor,
+            padded_offsets,
+            alpha_tensor,
+            prob_tensor,
+            norm_const_tensor,
+            d_dtype=d_dtype if d_dtype is not None else cutlass.BFloat16,
+            b_major=b_major,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            discrete_col_sfd=discrete_col_sfd,
+            sf_vec_size=sf_vec_size,
+            generate_amax=generate_amax,
+        )
     memo_key = (
         type(a_tensor),
         wrapper_operand_meta(a_tensor),
