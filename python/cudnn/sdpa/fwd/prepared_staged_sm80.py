@@ -75,7 +75,9 @@ def compile_plan(api):
             continue
         shapes = tuple((f.shape[0], f.shape[2], f.shape[1], d) for _, _, f, d in group)
         artifact = (
-            compile_copy(shapes, (2,) * len(group)) if output else compile_gather(tuple((*shape, f.shape[3]) for shape, (_, _, f, _) in zip(shapes, group)))
+            compile_copy(shapes, (2,) * len(group), device=api.q_desc.device)
+            if output
+            else compile_gather(tuple((*shape, f.shape[3]) for shape, (_, _, f, _) in zip(shapes, group)), device=api.q_desc.device)
         )
         fn = positional_entry(artifact)
         if fn is None:

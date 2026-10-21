@@ -11,6 +11,7 @@ import cudnn
 import pytest
 import torch
 
+from cudnn.sdpa import band
 from cudnn.sdpa import graph_analyzer as ga
 from cudnn.sdpa.bwd import engines as bwd_engines
 from cudnn.sdpa.fwd import engines
@@ -1107,6 +1108,7 @@ def test_capabilities_positional_prefix_is_append_only():
         "kv_mask",
         "kv_mask_dtypes",
         "tile_ns_by_d_shape",
+        "band",
     )
     legacy_order = [n for n in names if n not in appended]
     caps = engines.Capabilities(*[legacy_value(n) for n in legacy_order])
@@ -1127,17 +1129,37 @@ def test_capabilities_positional_prefix_is_append_only():
     start = names.index("pack_gqa_d_shapes")
     assert names[start : start + len(legacy_tail)] == legacy_tail, names[start:]
     # ... and every later field is appended after it, in the order it landed (the zero-scale and pre-folded-scale fields,
-    # then the resident-bias / kv_mask fields of the Rubin small tiles and their per-shape TILE_N domain, last).
+    # then the resident-bias / kv_mask fields of the Rubin small tiles and their per-shape TILE_N domain; the canonical band
+    # set (#601) is the newest and sits at the very end).
     assert names[start + len(legacy_tail) :] == list(appended), names[start:]
 
+    # Positional construction in the PRE-BAND order (every row's spelling before the canonical model landed) still binds every
+    # field, and the appended band set is DERIVED from those flags rather than shadowing them.  The row built here carries the
+    # pre-band defaults, so its claim is unmasked-only.
+    pre_band_order = [n for n in names if n != "band"]
+    pre_band = engines.Capabilities(*[legacy_value(n) for n in pre_band_order])
+    assert pre_band.sm_lo == 100 and pre_band.d_shapes == frozenset({(128, 128)})
+    assert pre_band.causal is False and pre_band.swa is False
+    assert pre_band.band == band.BandSupport.unmasked_only()
+
+    # ... and the row's claim is exactly the legacy flags' mapping (the normalization layer is one-directional: flags in,
+    # canonical set out).
+    assert pre_band.band == band.BandSupport.from_legacy_flags(
+        causal=pre_band.causal,
+        bottom_right=pre_band.bottom_right,
+        swa=pre_band.swa,
+        right_band_widening=pre_band.right_band_widening,
+    )
+
     bwd_names = [f.name for f in dataclasses.fields(bwd_engines.Capabilities)]
-    assert bwd_names[-6:] == [
+    assert bwd_names[-7:] == [
         "bottom_right_s_q_multiple",
         "thd_head_stride",
         "zero_scale",
         "thd_ragged_offsets",
         "compact_bshd",
         "declaration_check",
+        "band",
     ], bwd_names
 
 

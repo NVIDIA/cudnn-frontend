@@ -225,6 +225,15 @@ not become a compile key.
   context; no invalid cross-device GPU launch is needed. See the sparse SDPA
   tests `test_compilation_and_launch_preserve_the_declared_or_resolved_device`
   and `test_compilation_bypasses_argument_only_caches_across_devices`.
+- **Shared architecture rows need an explicit compiler target.** Choose a
+  common `--gpu-arch` ISA, or pass the operand device's `--gpu-arch` and key the
+  cache on it; never inherit the current device's target under an
+  architecture-independent key. Keying alone is not enough: the DSL detects its
+  implicit target from device 0 once per process, so binding another device's
+  context does not retarget the compile. Reuse the artifact on both device
+  families with the second plan's JIT forbidden
+  (`test_shared_d64_artifact_runs_on_both_device_families`, which also covers
+  the staged d32 copies).
 - **Issue #604 is closed**: SM80 THD compiles use symbolic packed extents.
   The prepared backward host takes Int64 capacities and launch bounds at
   runtime, including the compact Stats head pitch and deterministic-counter

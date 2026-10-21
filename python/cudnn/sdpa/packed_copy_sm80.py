@@ -12,11 +12,11 @@ from cudnn._torch_stream import _raw_current_stream
 
 
 @lru_cache(maxsize=128)
-def _plan(shapes):
+def _plan(shapes, device_index):
     from cudnn.frost.compiled_cache import positional_entry
     from .fwd.kernels.sm80.staged_copy import compile_gather
 
-    artifact = compile_gather(shapes, packed=True)
+    artifact = compile_gather(shapes, packed=True, device=device_index)
     entry = positional_entry(artifact)
     if entry is None:
         raise NotImplementedError("SM80 packed copies require a positional tvm-ffi entry")
@@ -81,7 +81,7 @@ def copy_packed_half(tensors, widths, query_roles, *, compact=False):
         raise ValueError("SM80 packed operands must have matching dtype and device")
     context = nullcontext() if torch.cuda.current_device() == device.index else torch.cuda.device(device)
     with context:
-        plan = _plan(shapes)
+        plan = _plan(shapes, device.index)
         outputs = list(tensors)
         for i, shape in zip(selected, output_shapes):
             outputs[i] = torch.empty(shape, dtype=dtype, device=device)

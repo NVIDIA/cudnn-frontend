@@ -11,6 +11,7 @@ import cutlass.cute as cute
 from cuda.bindings import driver
 
 from cudnn.frost.compiled_cache import compile_cached, template_key
+from cudnn.frost.device import compute_capability, device_context, resolve_device
 
 FROST_SOURCE_DIGEST = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
 _THREADS = 256
@@ -63,8 +64,16 @@ def _packed_host(srcs, dsts, strides, t_q: cutlass.Int64, t_kv: cutlass.Int64, s
     _kernel(srcs, dsts, strides, shapes, t_q, t_kv).launch(grid=((words + _THREADS - 1) // _THREADS, len(shapes), 1), block=(_THREADS, 1, 1), stream=stream)
 
 
+def compile_gather(shapes, *, packed=False, device=None):
+    """Compile for the operand device and cache by its target architecture."""
+    device = resolve_device(device)
+    target_cc = compute_capability(device)
+    with device_context(device):
+        return _compile_gather(shapes, packed, target_cc)
+
+
 @lru_cache(maxsize=128)
-def compile_gather(shapes, *, packed=False):
+def _compile_gather(shapes, packed, target_cc):
     key = template_key(globals(), locals(), "compile_gather")
     ptrs = tuple(cute.runtime.make_ptr(cutlass.Uint16, 16, cute.AddressSpace.gmem, assumed_align=2) for _ in shapes)
     strides = tuple((cutlass.Int64(0),) * 4 for _ in shapes)
@@ -73,7 +82,13 @@ def compile_gather(shapes, *, packed=False):
         _packed_host if packed else _host,
         *args,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
-        options="--enable-tvm-ffi",
+        # The DSL's implicit target follows device 0, not the bound context; name
+        # the operand device's ISA so each family gets its own executable.
+        options=f"--enable-tvm-ffi --gpu-arch=sm_{target_cc[0]}{target_cc[1]}",
         cache_key=key,
         symbol="frost_sdpa_sm80_staged_gather",
     )
+
+
+compile_gather.cache_clear = _compile_gather.cache_clear
+compile_gather.cache_info = _compile_gather.cache_info
