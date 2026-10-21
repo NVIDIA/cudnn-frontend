@@ -601,6 +601,8 @@ cudnn.gated_attention_block.QsaSpec.block_size
 cudnn.gated_attention_block.QsaSpec.identity_bound
 cudnn.gated_attention_block.QsaSpec.index_band
 cudnn.gated_attention_block.QsaSpec.index_band_cols
+cudnn.gated_attention_block.QsaSpec.index_cache_dtype
+cudnn.gated_attention_block.QsaSpec.index_cache_e4m3
 cudnn.gated_attention_block.QsaSpec.index_head_dim
 cudnn.gated_attention_block.QsaSpec.index_heads
 cudnn.gated_attention_block.QsaSpec.index_kv_heads

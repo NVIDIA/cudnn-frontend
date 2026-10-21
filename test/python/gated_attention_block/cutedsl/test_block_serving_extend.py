@@ -2357,14 +2357,27 @@ def test_extend_capture_of_the_first_execute_replays_with_new_lengths_tables_and
 @pytest.mark.L0
 def test_num_tokens_live_is_the_last_execute_parameter_with_default_none():
     """The append-only rule on the public ``execute`` signature: ``num_tokens_live`` (default ``None`` = the declared capacity) was appended
-    after ``slot_mapping`` / ``index_k_raw``, and the e4m3 KV cache's ``k_scale`` / ``v_scale`` (default ``None`` = pools of the activation
-    dtype) after IT, so every positional caller of the serving forms is unchanged; the slot-mapping form check gained its second admitted
-    count the same way (``t_live``, appended, default None)."""
+    after ``slot_mapping`` / ``index_k_raw``, the e4m3 KV cache's ``k_scale`` / ``v_scale`` (default ``None`` = pools of the activation
+    dtype) after IT, and the in-block indexer's five execute inputs (``w_iq_norm`` .. ``block_lens_out``, every default ``None``) after
+    ``v_scale`` -- the END of the signature, never mid-list -- so every positional caller of the earlier parameters is unchanged; the
+    slot-mapping form check gained its second admitted count the same way (``t_live``, appended, default None).  The pin is the exact
+    tail, by name: the next insertion anywhere inside it goes red."""
     from cudnn.gated_attention_block.cache_write_contract import check_slot_mapping
 
     params = list(inspect.signature(GatedAttentionBlockFwd.execute).parameters.values())
-    assert [p.name for p in params[-5:]] == ["slot_mapping", "index_k_raw", "num_tokens_live", "k_scale", "v_scale"]
-    assert all(p.default is None for p in params[-3:])
+    assert [p.name for p in params[-10:]] == [
+        "slot_mapping",
+        "index_k_raw",
+        "num_tokens_live",
+        "k_scale",
+        "v_scale",
+        "w_iq_norm",
+        "w_ik_norm",
+        "index_k_compressed",
+        "block_ids_out",
+        "block_lens_out",
+    ]
+    assert all(p.default is None for p in params[-10:])
     slot_params = inspect.signature(check_slot_mapping).parameters
     assert list(slot_params)[-1] == "t_live" and slot_params["t_live"].default is None
 
