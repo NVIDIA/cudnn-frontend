@@ -5,9 +5,7 @@
 
 import torch
 
-H_Q = 24
-H_KV = 2
-GROUP = H_Q // H_KV
+GROUP = 12  # query heads per KV head. The kernels take 2 KV heads (the model) or 1 (one of two tensor-parallel ranks).
 D = 256
 BLOCK = 4
 TOPK_BLOCKS = 512
@@ -42,21 +40,23 @@ def make_topk_idxs(seq_len, generator):
 
 def reference_forward(q, k, v, topk_idxs):
     """bf16 output and fp32 natural-log LSE of the scaled scores, the backward's saved tensors."""
+    h_kv = k.shape[1]
+    h_q = GROUP * h_kv
     out = torch.empty_like(q)
-    lse = torch.empty((q.shape[0], H_Q), dtype=torch.float32, device=q.device)
+    lse = torch.empty((q.shape[0], h_q), dtype=torch.float32, device=q.device)
     kf, vf = k.float(), v.float()
     for r0 in range(0, q.shape[0], CHUNK):
         r1 = min(r0 + CHUNK, q.shape[0])
         idx = topk_idxs[r0:r1].long()
         flat = idx.clamp(min=0).reshape(-1)
-        ks = kf.index_select(0, flat).view(*idx.shape, H_KV, D)
-        vs = vf.index_select(0, flat).view(*idx.shape, H_KV, D)
-        s = torch.einsum("nhgd,nwhd->nhgw", q[r0:r1].float().view(-1, H_KV, GROUP, D), ks) * SCALE
+        ks = kf.index_select(0, flat).view(*idx.shape, h_kv, D)
+        vs = vf.index_select(0, flat).view(*idx.shape, h_kv, D)
+        s = torch.einsum("nhgd,nwhd->nhgw", q[r0:r1].float().view(-1, h_kv, GROUP, D), ks) * SCALE
         s = s.masked_fill(~(idx >= 0)[:, None, None, :], float("-inf"))
         row_lse = s.logsumexp(-1)
         o = torch.einsum("nhgw,nwhd->nhgd", torch.exp(s - row_lse[..., None]), vs)
-        out[r0:r1] = o.reshape(-1, H_Q, D).to(out.dtype)
-        lse[r0:r1] = row_lse.reshape(-1, H_Q)
+        out[r0:r1] = o.reshape(-1, h_q, D).to(out.dtype)
+        lse[r0:r1] = row_lse.reshape(-1, h_q)
     return out, lse
 
 
@@ -65,6 +65,8 @@ def reference_backward(q, k, v, out, dout, lse, topk_idxs):
 
     Not autograd: rows with few keys cancel in dP - Delta, so a Delta from the unrounded O misses the tolerance.
     """
+    h_kv = k.shape[1]
+    h_q = GROUP * h_kv
     kf, vf = k.float(), v.float()
     dq = torch.empty(q.shape, dtype=torch.float32, device=q.device)
     dk = torch.zeros(k.shape, dtype=torch.float32, device=q.device)
@@ -74,29 +76,30 @@ def reference_backward(q, k, v, out, dout, lse, topk_idxs):
         idx = topk_idxs[r0:r1].long()
         valid = idx >= 0
         flat = idx.clamp(min=0).reshape(-1)
-        ks = kf.index_select(0, flat).view(*idx.shape, H_KV, D)
-        vs = vf.index_select(0, flat).view(*idx.shape, H_KV, D)
-        qf = q[r0:r1].float().view(-1, H_KV, GROUP, D)
-        dof = dout[r0:r1].float().view(-1, H_KV, GROUP, D)
+        ks = kf.index_select(0, flat).view(*idx.shape, h_kv, D)
+        vs = vf.index_select(0, flat).view(*idx.shape, h_kv, D)
+        qf = q[r0:r1].float().view(-1, h_kv, GROUP, D)
+        dof = dout[r0:r1].float().view(-1, h_kv, GROUP, D)
         s = torch.einsum("nhgd,nwhd->nhgw", qf, ks) * SCALE
-        p = torch.exp(s.masked_fill(~valid[:, None, None, :], float("-inf")) - lse[r0:r1].view(-1, H_KV, GROUP, 1))
-        delta = (dof * out[r0:r1].float().view(-1, H_KV, GROUP, D)).sum(-1, keepdim=True)
+        p = torch.exp(s.masked_fill(~valid[:, None, None, :], float("-inf")) - lse[r0:r1].view(-1, h_kv, GROUP, 1))
+        delta = (dof * out[r0:r1].float().view(-1, h_kv, GROUP, D)).sum(-1, keepdim=True)
         ds = p * (torch.einsum("nhgd,nwhd->nhgw", dof, vs) - delta)
-        dq[r0:r1] = (torch.einsum("nhgw,nwhd->nhgd", ds, ks) * SCALE).reshape(-1, H_Q, D)
-        dk.index_add_(0, flat, (torch.einsum("nhgw,nhgd->nwhd", ds, qf) * SCALE).reshape(-1, H_KV, D))
-        dv.index_add_(0, flat, torch.einsum("nhgw,nhgd->nwhd", p, dof).reshape(-1, H_KV, D))
+        dq[r0:r1] = (torch.einsum("nhgw,nwhd->nhgd", ds, ks) * SCALE).reshape(-1, h_q, D)
+        dk.index_add_(0, flat, (torch.einsum("nhgw,nhgd->nwhd", ds, qf) * SCALE).reshape(-1, h_kv, D))
+        dv.index_add_(0, flat, torch.einsum("nhgw,nhgd->nwhd", p, dof).reshape(-1, h_kv, D))
     return dq, dk, dv
 
 
-def make_inputs(seq_len, seed, grad_scale=1.0, device="cuda"):
+def make_inputs(seq_len, seed, grad_scale=1.0, device="cuda", h_kv=2):
     """Random QSA backward operands. ``grad_scale`` shrinks dO to training-like gradient magnitudes."""
     generator = torch.Generator(device=device).manual_seed(seed)
+    h_q = GROUP * h_kv
 
     def randn(*shape):
         return torch.randn(shape, device=device, generator=generator, dtype=torch.float32).to(torch.bfloat16)
 
-    q, k, v = randn(seq_len, H_Q, D), randn(seq_len, H_KV, D), randn(seq_len, H_KV, D)
-    dout = (torch.randn((seq_len, H_Q, D), device=device, generator=generator) * grad_scale).to(torch.bfloat16)
+    q, k, v = randn(seq_len, h_q, D), randn(seq_len, h_kv, D), randn(seq_len, h_kv, D)
+    dout = (torch.randn((seq_len, h_q, D), device=device, generator=generator) * grad_scale).to(torch.bfloat16)
     topk_idxs = make_topk_idxs(seq_len, generator)
     out, lse = reference_forward(q, k, v, topk_idxs)
     return {"q": q, "k": k, "v": v, "out": out, "dout": dout, "lse": lse, "topk_idxs": topk_idxs}

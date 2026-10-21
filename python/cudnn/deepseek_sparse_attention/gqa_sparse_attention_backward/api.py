@@ -14,8 +14,8 @@ from cudnn._torch_stream import device_context, stream_context
 from cudnn.api_base import APIBase, TupleDict, WorkspaceCarver
 from cudnn.frost.buffers import cutedsl_requirement_error
 
-NUM_Q_HEADS = 24
-NUM_KV_HEADS = 2
+GROUP_SIZE = 12  # query heads per KV head
+NUM_KV_HEADS = (1, 2)  # 24 / 2 is the full model, 12 / 1 is one tensor-parallel rank of two
 HEAD_DIM = 256
 TOPK_WIDTH = 2051  # 512 blocks x 4 tokens + 3 tail tokens
 SOFTMAX_SCALE = HEAD_DIM**-0.5
@@ -34,20 +34,21 @@ def _overlaps(lhs: tuple[int, int], rhs: tuple[int, int]) -> bool:
 class GqaSparseAttentionBackward(APIBase):
     """QSA backward: dQ, dK and dV from Q, K, V, O, dO, the forward LSE and the selected token indices.
 
-    ``topk_idxs`` row ``i`` lists the first token of each of its ``min((i + 1) // 4, 512)`` complete 4-token blocks (the
-    four ids of a block are consecutive), then the ``(i + 1) % 4`` tail tokens, then ``-1``. Up to ``T = 2051`` every
-    row is therefore its whole causal prefix. The kernels read the block ids only and derive the tail block from the
-    position. Rows that break this layout are not checked.
+    The geometry is 12 query heads per KV head with 2 KV heads (the model) or 1 (one of two tensor-parallel ranks),
+    read from the sample shapes. ``topk_idxs`` row ``i`` lists the first token of each of its ``min((i + 1) // 4, 512)``
+    complete 4-token blocks (the four ids of a block are consecutive), then the ``(i + 1) % 4`` tail tokens, then
+    ``-1``. Up to ``T = 2051`` every row is therefore its whole causal prefix. The kernels read the block ids only and
+    derive the tail block from the position. Rows that break this layout are not checked.
     """
 
     def __init__(
         self,
-        sample_q: torch.Tensor,  # (T, 24, 256) bf16
-        sample_k: torch.Tensor,  # (T, 2, 256) bf16
-        sample_v: torch.Tensor,  # (T, 2, 256) bf16
-        sample_out: torch.Tensor,  # (T, 24, 256) bf16
-        sample_dout: torch.Tensor,  # (T, 24, 256) bf16
-        sample_lse: torch.Tensor,  # (T, 24) fp32, natural-log LSE of the scaled scores
+        sample_q: torch.Tensor,  # (T, 12 * H_kv, 256) bf16
+        sample_k: torch.Tensor,  # (T, H_kv, 256) bf16, H_kv in (1, 2)
+        sample_v: torch.Tensor,  # (T, H_kv, 256) bf16
+        sample_out: torch.Tensor,  # (T, 12 * H_kv, 256) bf16
+        sample_dout: torch.Tensor,  # (T, 12 * H_kv, 256) bf16
+        sample_lse: torch.Tensor,  # (T, 12 * H_kv) fp32, natural-log LSE of the scaled scores
         sample_topk_idxs: torch.Tensor,  # (T, 2051) int32
         sample_dq: Optional[torch.Tensor] = None,
         sample_dk: Optional[torch.Tensor] = None,
@@ -89,19 +90,26 @@ class GqaSparseAttentionBackward(APIBase):
             self.softmax_scale not in (None, SOFTMAX_SCALE),
             f"{self.__class__.__name__} supports only softmax_scale {SOFTMAX_SCALE}, got {self.softmax_scale}",
         )
-        self._value_error_if(q_desc.ndim != 3, f"q must be 3-D (T, {NUM_Q_HEADS}, {HEAD_DIM}), got {q_desc.shape}")
+        k_desc = self.descs["k"]
+        self._value_error_if(q_desc.ndim != 3 or k_desc.ndim != 3, f"q and k must be 3-D (T, heads, {HEAD_DIM}), got {q_desc.shape} and {k_desc.shape}")
         seq_len = q_desc.shape[0]
+        num_kv_heads = k_desc.shape[1]
+        self._not_implemented_error_if(
+            num_kv_heads not in NUM_KV_HEADS,
+            f"{self.__class__.__name__} supports {NUM_KV_HEADS} KV heads with {GROUP_SIZE} query heads each, got k shape {k_desc.shape}",
+        )
+        num_q_heads = GROUP_SIZE * num_kv_heads
         expected = {
-            "q": ((seq_len, NUM_Q_HEADS, HEAD_DIM), torch.bfloat16),
-            "k": ((seq_len, NUM_KV_HEADS, HEAD_DIM), torch.bfloat16),
-            "v": ((seq_len, NUM_KV_HEADS, HEAD_DIM), torch.bfloat16),
-            "out": ((seq_len, NUM_Q_HEADS, HEAD_DIM), torch.bfloat16),
-            "dout": ((seq_len, NUM_Q_HEADS, HEAD_DIM), torch.bfloat16),
-            "lse": ((seq_len, NUM_Q_HEADS), torch.float32),
+            "q": ((seq_len, num_q_heads, HEAD_DIM), torch.bfloat16),
+            "k": ((seq_len, num_kv_heads, HEAD_DIM), torch.bfloat16),
+            "v": ((seq_len, num_kv_heads, HEAD_DIM), torch.bfloat16),
+            "out": ((seq_len, num_q_heads, HEAD_DIM), torch.bfloat16),
+            "dout": ((seq_len, num_q_heads, HEAD_DIM), torch.bfloat16),
+            "lse": ((seq_len, num_q_heads), torch.float32),
             "topk_idxs": ((seq_len, TOPK_WIDTH), torch.int32),
-            "dq": ((seq_len, NUM_Q_HEADS, HEAD_DIM), torch.bfloat16),
-            "dk": ((seq_len, NUM_KV_HEADS, HEAD_DIM), torch.bfloat16),
-            "dv": ((seq_len, NUM_KV_HEADS, HEAD_DIM), torch.bfloat16),
+            "dq": ((seq_len, num_q_heads, HEAD_DIM), torch.bfloat16),
+            "dk": ((seq_len, num_kv_heads, HEAD_DIM), torch.bfloat16),
+            "dv": ((seq_len, num_kv_heads, HEAD_DIM), torch.bfloat16),
         }
         for name, (shape, dtype) in expected.items():
             desc = self.descs[name]
@@ -116,12 +124,13 @@ class GqaSparseAttentionBackward(APIBase):
 
         from . import qsa_bwd_sm100 as kernel
 
+        max_seq_len = kernel.max_seq_len(num_kv_heads)
         self._value_error_if(
-            not 1 <= seq_len <= kernel.MAX_SEQ_LEN,
-            f"sequence length must be in [1, {kernel.MAX_SEQ_LEN}], got {seq_len}",
+            not 1 <= seq_len <= max_seq_len,
+            f"sequence length must be in [1, {max_seq_len}], got {seq_len}",
         )
         self._kernel_module = kernel
-        self._plan = kernel.LaunchPlan(seq_len, torch.cuda.get_device_properties(q_desc.device).multi_processor_count)
+        self._plan = kernel.LaunchPlan(seq_len, torch.cuda.get_device_properties(q_desc.device).multi_processor_count, num_kv_heads)
         self._is_supported = True
         return True
 

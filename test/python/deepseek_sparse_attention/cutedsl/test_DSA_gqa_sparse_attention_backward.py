@@ -38,6 +38,7 @@ def _check_against_reference(inputs, grads):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("h_kv", [2, 1])  # the model's 24 / 2 heads, and the 12 / 1 of one of two tensor-parallel ranks
 @pytest.mark.parametrize(
     "seq_len, grad_scale",
     [
@@ -49,16 +50,16 @@ def _check_against_reference(inputs, grads):
         (16384, 1.0),  # every query in the dense kernel with the larger dense unit
         (22527, 1.0),  # the longest sequence served by the dense kernel alone
         (22528, 1.0),  # the shortest sequence with a sparse remainder: a single query range on the key-major kernel
-        (22529, 1.0),  # one full query range and a second range holding a single query
+        (22529, 1.0),  # one full query range and a second range holding a single query, which with one KV head is an unpaired item
         (24000, 1.0),  # dense, query-major and key-major kernels in one KV pass and two query ranges
         (24000, 1e-7),  # training-scale gradients, which rule out reduced-range accumulators
         (32769, 1.0),  # the long-sequence crossover, two KV passes and a partial last block
     ],
 )
-def test_qsa_backward_matches_reference(seq_len, grad_scale):
+def test_qsa_backward_matches_reference(seq_len, grad_scale, h_kv):
     from cudnn import DSA
 
-    inputs = make_inputs(seq_len, seed=seq_len, grad_scale=grad_scale)
+    inputs = make_inputs(seq_len, seed=seq_len, grad_scale=grad_scale, h_kv=h_kv)
     grads = DSA.gqa_sparse_attention_backward_wrapper(*(inputs[name] for name in _INPUT_NAMES))
     _check_against_reference(inputs, (grads["dq"], grads["dk"], grads["dv"]))
 
@@ -66,11 +67,12 @@ def test_qsa_backward_matches_reference(seq_len, grad_scale):
 @pytest.mark.L1
 @pytest.mark.gpu_exclusive
 @pytest.mark.xdist_group(name="gpu_exclusive")
+@pytest.mark.parametrize("h_kv", [2, 1])
 @pytest.mark.parametrize("seq_len", [65536, 262144])
-def test_qsa_backward_long_sequences(seq_len):
+def test_qsa_backward_long_sequences(seq_len, h_kv):
     from cudnn import DSA
 
-    inputs = make_inputs(seq_len, seed=seq_len)
+    inputs = make_inputs(seq_len, seed=seq_len, h_kv=h_kv)
     grads = DSA.gqa_sparse_attention_backward_wrapper(*(inputs[name] for name in _INPUT_NAMES))
     _check_against_reference(inputs, (grads["dq"], grads["dk"], grads["dv"]))
 
@@ -133,14 +135,15 @@ def test_execute_allocates_nothing_and_never_synchronizes(seq_len, monkeypatch, 
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("h_kv", [2, 1])
 @pytest.mark.parametrize("seq_len", [4099, 28000])  # the dense-only and the dense + sparse launch sequences
-def test_first_execute_under_cuda_graph_capture_replays_new_inputs(seq_len, monkeypatch):
+def test_first_execute_under_cuda_graph_capture_replays_new_inputs(seq_len, h_kv, monkeypatch):
     from cudnn import DSA
     from cudnn.deepseek_sparse_attention.gqa_sparse_attention_backward import qsa_bwd_sm100 as kernel
 
     # Fresh artifacts make the capture hold their first launch.
     monkeypatch.setattr(kernel, "_COMPILED", {})
-    first, second = make_inputs(seq_len, seed=21), make_inputs(seq_len, seed=22)
+    first, second = make_inputs(seq_len, seed=21, h_kv=h_kv), make_inputs(seq_len, seed=22, h_kv=h_kv)
     static = {name: first[name].clone() for name in _INPUT_NAMES}
     args = [static[name] for name in _INPUT_NAMES]
     plan = DSA.GqaSparseAttentionBackward(*args)
@@ -173,10 +176,10 @@ def test_execute_requires_workspace_and_compiled_contract():
         plan.execute(*args, outputs[0][:32], *outputs[1:], workspace=workspace)
 
 
-def _sample_descs(seq_len=64):
-    q = torch.empty((seq_len, 24, 256), dtype=torch.bfloat16, device="cuda")
-    kv = torch.empty((seq_len, 2, 256), dtype=torch.bfloat16, device="cuda")
-    lse = torch.empty((seq_len, 24), dtype=torch.float32, device="cuda")
+def _sample_descs(seq_len=64, h_kv=2):
+    q = torch.empty((seq_len, 12 * h_kv, 256), dtype=torch.bfloat16, device="cuda")
+    kv = torch.empty((seq_len, h_kv, 256), dtype=torch.bfloat16, device="cuda")
+    lse = torch.empty((seq_len, 12 * h_kv), dtype=torch.float32, device="cuda")
     idx = torch.empty((seq_len, 2051), dtype=torch.int32, device="cuda")
     return {name: _metadata(t) for name, t in zip(_INPUT_NAMES, (q, kv, kv, q, q, lse, idx))}
 
@@ -192,7 +195,8 @@ def _with(descs, name, **changes):
     "name, changes, error, match",
     [
         ("q", {"dtype": torch.float16}, ValueError, "q"),
-        ("k", {"shape": (64, 4, 256), "stride": (1024, 256, 1)}, ValueError, "k must have shape"),
+        ("k", {"shape": (64, 4, 256), "stride": (1024, 256, 1)}, NotImplementedError, "KV heads"),
+        ("k", {"shape": (64, 1, 256), "stride": (256, 256, 1)}, ValueError, "q must have shape"),  # 24 query heads over one KV head
         ("q", {"shape": (64, 24, 128), "stride": (3072, 128, 1)}, ValueError, "q must have shape"),
         ("topk_idxs", {"shape": (64, 2048), "stride": (2048, 1)}, ValueError, "topk_idxs must have shape"),
         ("lse", {"dtype": torch.bfloat16}, ValueError, "lse"),
@@ -205,6 +209,15 @@ def test_check_support_declines(name, changes, error, match):
     descs = _with(_sample_descs(), name, **changes)
     with pytest.raises(error, match=match):
         DSA.GqaSparseAttentionBackward(*(descs[n] for n in _INPUT_NAMES)).check_support()
+
+
+@pytest.mark.L0
+def test_check_support_accepts_both_head_counts():
+    from cudnn import DSA
+
+    for h_kv in (1, 2):
+        descs = _sample_descs(h_kv=h_kv)
+        assert DSA.GqaSparseAttentionBackward(*(descs[n] for n in _INPUT_NAMES)).check_support()
 
 
 @pytest.mark.L0
