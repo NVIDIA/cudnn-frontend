@@ -303,7 +303,7 @@ On GB200 with BF16, `total_S_q=16384`, `top_k=2048`, `H=64`, `D_qk=576`, and
 288.008 GiB to 20.008 GiB at `total_S_kv=1048576`. The upstream allocation
 does not fit on the 185.0 GiB test GPU. At `total_S_kv=524288`, where both
 implementations fit, scratch falls from 144.008 GiB to 10.008 GiB and warmed
-`execute()` latency changes from 99.935 ms to 98.802 ms.
+`execute()` latency changes from 99.973 ms to 98.999 ms.
 
 At `total_S_kv=1048576` with CP64 (`total_S_q=16384` per launch), BF16,
 top-k 2048, D576/Dv512, and contiguous inputs, the official upstream baseline
@@ -316,21 +316,27 @@ and this change require:
 | 64 | 288.008 GiB | 20.008 GiB | 268.000 GiB (93.1%) |
 
 The upstream 128-plane baseline does not fit in the test system's 185.0 GiB
-usable memory, so its 1M-KV latency cannot be measured. The direct latency A/B
-therefore uses `total_S_kv=524288`, where upstream and this change both execute
-the same workload:
+usable memory, so its 1M-KV latency cannot be measured. The following direct
+A/B covers every deterministic dispatch selected by the adaptive policy, plus
+the unchanged H128/D576 two-CTA control. All rows use BF16, D576/Dv512,
+top-k 2048, and contiguous inputs; H is 64 except for the H128 control.
 
-| Heads | Upstream scratch | This change scratch | Scratch change | Upstream latency | This change latency | Latency change |
-|---:|---:|---:|---:|---:|---:|---:|
-| 16 | 144.002 GiB | 10.002 GiB | -134.000 GiB (-93.1%) | 99.235 ms | 98.152 ms | -1.083 ms (-1.1%) |
-| 32 | 144.004 GiB | 10.004 GiB | -134.000 GiB (-93.1%) | 99.452 ms | 98.285 ms | -1.167 ms (-1.2%) |
-| 64 | 144.008 GiB | 10.008 GiB | -134.000 GiB (-93.1%) | 99.935 ms | 98.802 ms | -1.133 ms (-1.1%) |
+| Dispatch | Q | KV | Upstream scratch | This change scratch | Scratch change | Upstream latency | This change latency | Latency change |
+|:---|---:|---:|---:|---:|---:|---:|---:|---:|
+| ordinary 32-plane | 128 | 32768 | 2.250 GiB | 2.250 GiB | 0.0% | 1.737 ms | 1.737 ms | +0.01% |
+| ordinary 64-plane | 256 | 32768 | 4.500 GiB | 4.500 GiB | 0.0% | 2.845 ms | 2.844 ms | -0.03% |
+| ordinary 128-plane | 16384 | 32768 | 9.008 GiB | 9.008 GiB | 0.0% | 38.566 ms | 38.551 ms | -0.04% |
+| cluster-8 / 16-plane | 4096 | 65536 | 18.002 GiB | 2.283 GiB | -87.3% | 16.967 ms | 23.618 ms | +39.2% |
+| cluster-4 / 32-plane | 16384 | 131072 | 36.008 GiB | 9.258 GiB | -74.3% | 49.858 ms | 57.753 ms | +15.8% |
+| cluster-16 / 8-plane | 16384 | 524288 | 144.008 GiB | 10.008 GiB | -93.1% | 99.973 ms | 98.999 ms | -1.0% |
+| H128/D576 two-CTA | 16384 | 32768 | 6.766 GiB | 6.766 GiB | 0.0% | 58.482 ms | 58.651 ms | +0.3% |
 
-The latency values are medians of three alternating-order A/B rounds. Each
-round uses three or five warm-ups followed by 20 or 50 timed, allocation-free
-`execute()` calls. The comparison covers the generic M64 route; H96/H128 remain
-on their existing D576 two-CTA fastpath and are unaffected by the adaptive
-relay policy.
+Latency values are medians of three alternating-order A/B rounds, each with
+three warm-ups and 20 timed, allocation-free `execute()` calls. The unchanged
+ordinary and two-CTA routes stay within 0.3%. Cluster-8 and cluster-4 trade
+39.2% and 15.8% latency, respectively, for substantial workspace reduction;
+at 512K KV, cluster-16 is 1.0% faster than upstream while using 93.1% less
+scratch.
 
 For H64, a three-round, 20-call, reversed-order A/B measured prepared-plan
 eager execution at 104.579 ms and CUDA Graph replay at 104.225 ms (0.997x).
