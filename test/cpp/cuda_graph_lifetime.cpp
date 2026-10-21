@@ -978,11 +978,6 @@ TEST_CASE("CUDA graph retention option", "[cudagraph][graph]") {
         graph.reset();
         CUDA_CHECK(cudaGraphExecDestroy(exec));
         CUDA_CHECK(cudaGraphDestroy(cuda_graph));
-        // User-object destructors run asynchronously; give them time.
-        for (int i = 0; i < 200 && !CudaGraphRetainedResource::has_deferred_releases(); ++i) {
-            CUDA_CHECK(cudaDeviceSynchronize());
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
         return true;
     };
 
@@ -994,13 +989,18 @@ TEST_CASE("CUDA graph retention option", "[cudagraph][graph]") {
         if (!record_and_release(fe::CudaGraphRetention_t::PER_GRAPH, manual_plan)) {
             SKIP("No runtime-compiled engine for this SDPA graph.");
         }
-        REQUIRE(CudaGraphRetainedResource::has_deferred_releases());
+        REQUIRE(wait_for_deferred_release());
         CudaGraphRetainedResource::drain_deferred_releases();
     }
 
     SECTION("NONE: the CUDA graph holds no reference") {
         if (!record_and_release(fe::CudaGraphRetention_t::NONE, manual_plan)) {
             SKIP("No runtime-compiled engine for this SDPA graph.");
+        }
+        // User-object destructors run asynchronously; give a release time to show up.
+        for (int i = 0; i < 200 && !CudaGraphRetainedResource::has_deferred_releases(); ++i) {
+            CUDA_CHECK(cudaDeviceSynchronize());
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         REQUIRE_FALSE(CudaGraphRetainedResource::has_deferred_releases());
     }
