@@ -3211,10 +3211,10 @@ def _combine_kernels_of(fn):
 def _former_combine_entry(gate: bool):
     """The combine entry the sparse adapter compiled BEFORE the form pin: ``compile_ptr`` without ``decode_grid`` (= ``DECODE_GRID_OFF``,
     the module's own three-way rule on every device) and without ``use_pdl`` -- the develop entry, run here over the adapter's own partials."""
-    from cudnn.frost.compiled_cache import positional_entry
+    import cudnn.frost.compiled_cache as cache
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 
-    return positional_entry(
+    return cache.positional_entry(
         comb.compile_ptr(dtype_o="bf16", dtype_partial="f32", has_lse=True, stats_log2=False, gate=gate, dtype_gate="bf16" if gate else None)
     )
 

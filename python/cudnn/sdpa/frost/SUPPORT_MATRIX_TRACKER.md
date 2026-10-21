@@ -3405,7 +3405,7 @@ form that would gather the shared list once is not built.  The gated attention b
 `block_table` / `slot_mapping` / pools through `_SparseSdpa`) is served since 2026-10-14: `kv_source="paged"` on a dense `[B, S_q]`
 `QsaSpec` declaration binds this form -- `list_per_sequence` at `S_q <= 4` (the block derives the list form from `S_q`; one list per row
 past it), `bottom_right` from the geometry, the split from `decode_split_kv` or the block's fill rule (`ceil(SMs / (B x H_kv x S_q))`
-capped at 8 and at the item's tile count), the pools and the whole table as declaration samples, the gate and the LSE through the block -- validated
+capped at 16 and at the item's tile count), the pools and the whole table as declaration samples, the gate and the LSE through the block -- validated
 end to end against the fp32 block oracle (the serving-forms section above, `test_block_qsa_decode.py`).
 
 Not served (typed declines by name; each lands with its accept cell and flips this section in the same change): the in-block

@@ -965,7 +965,7 @@ def test_the_split_combine_takes_the_pinned_form_per_grid_and_two_executes_are_b
     (``SparseGqaFwdDslSm107.combine_form``: the dense adapter's rule -- the decode-grid kernel on a small grid from split 8, the lean
     group walk on an overflow grid at split <= 4, the module's own forms otherwise); the CUDA profiler's census of one execute names
     exactly that combine kernel; the step is within the budget vs the oracle (the gate in the combine), two executes bitwise."""
-    from test_block_serving_decode import _cupti_kernels
+    from gated_block_census import cupti_kernels as _cupti_kernels
 
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 
