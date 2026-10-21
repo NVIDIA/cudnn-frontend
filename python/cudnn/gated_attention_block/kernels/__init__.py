@@ -38,6 +38,12 @@ stage of the pipeline in ``api.py``::
     mxfp8_bwd_fused.py          the MXFP8 BACKWARD's two fused launches -- PROLOGUE (scalar init, dY amax partials, the Q / K
                                 rebuild with its MX epilogue: q8 / q_T8 / k8 / k_T8 from a 32-token tile, v8) and EPILOGUE
                                 (dW_norm reduce, the dual-axis canonical dqkvg cast): block-range dispatch over the bodies
+    qsa_score_paged.py          the decode indexer's SCORER over the PAGED compressed-key cache (one compressed row per 4 tokens
+                                on the main block table): fp32 ReLU-summed head scores per visible block + the per-row visible
+                                counts -- the input contract of the decode top-k; CUDA-core, one SMEM query staging, one barrier,
+                                any CuTe DSL device; its standalone selector ``qsa_select_decode_paged`` (scorer + radix top-k) is
+                                the DSL-free host entry ``../qsa_select_paged.py``, which also owns the kernel's host-side facts
+                                and gates the DSL floor BEFORE importing this module (Rule 7)
 
 **The SDPA stage owns no file here.**  It drives the shipped forward adapter
 ``cudnn.sdpa.fwd.api_dsl.SdpaFwdDslSm100`` in EVERY configuration; the
