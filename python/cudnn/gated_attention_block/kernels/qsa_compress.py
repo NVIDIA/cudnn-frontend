@@ -127,6 +127,51 @@ is threaded identically to the prefill form (0.0 = the pre-folded ``(1 + w)``,
 Degenerate rows of the decode form: ``n_commit = 0`` (a finished sequence in
 the batch) -> no ring write, no block, every slot ``-1``; ``pos0 < 0`` is
 clamped to 0; a ragged last CTA computes on clamped loads and stores nothing.
+
+The PAGED decode form -- the serving stack's two side caches, taken as they are
+--------------------------------------------------------------------------------
+
+A serving stack keeps the compressor state PAGED, and the decode step must read and write it in place (a per-step gather of
+a dense per-sequence copy would double the long-context HBM term).  The raw-key ring is ONE block of ``cap`` rows per
+sequence inside ``index_state_cache [num_ring_blocks, cap, 1, D]`` behind ``index_state_block_table [B, 1]`` (vLLM's
+``CircularBufferSpec``: ``cap`` 4 without speculative rows, 8 with 1-4; block 0 is the NULL block that padding requests sit
+on); the compressed-key cache is ``index_kv_cache [num_pages, P / POOL, 1, D]`` on the MAIN block table
+``block_table [B, max_pages]`` (vLLM's ``MLAAttentionSpec(tokens_per_state=POOL)``: ``P / POOL`` compressed rows per
+attention page of ``P`` tokens).  ``frost_qsa_compress_step`` takes both AS THEY ARE (``paged=True``, a compile key) -- no
+gather, no conversion -- through ONE shared addressing helper per table (:func:`ring_row_address`, :func:`paged_block_row`;
+the fused prepare launch of ``qsa_prepare.py`` calls the same two) and derives every position in-kernel
+(:func:`step_position`)::
+
+    pos0[b]          = kv_lens[b] - S_q                             # kv_lens = the KV length AFTER the step
+    pos              = pos0[b] + j                                  # row j of sequence b
+    ring row of pos  = (index_state_block_table[b, 0], pos % cap)   # == the slot  block * cap + pos % cap
+    kbar row of blk  = (block_table[b, blk // (P / POOL)], blk % (P / POOL))
+
+The ring's two forms address the SAME row through one formula: the dense ``[B, RING, D]`` row ``(b, p % RING)`` and the paged
+``[blocks, cap, 1, D]`` row ``(table[b, 0], p % cap)`` are both ``base + entry * stride[0] + (p % shape[1]) * stride[1]``;
+:func:`ring_row_address` takes the entry (``b`` or the state block) and the position.  ``index_state_slot_mapping [T]``
+(the stack's own ring slots, int32 or int64, ``-1`` = no write) is accepted as an OPTIONAL alternative source of the WRITE
+row (``ring_slots=True``, a compile key; the read rows of a completing block always come from the table) -- the two forms
+are pinned bitwise.
+
+Rows and their handling in the paged form: a row at a NEGATIVE position (``kv_lens[b] < S_q``; a padding sequence has
+``kv_lens 0`` and sits on the null block) is dead -- no ring row, no block, slot ``-1`` -- so the step derives "nothing to
+commit" from ``kv_lens == 0`` itself and the null block and page 0 are never written for it; a sequence whose state-table
+entry is ``<= 0`` or past the ring's blocks (``>= index_state_cache.shape[0]``) owns no ring (the stack's own mapping writes a
+ring row only for ``physical_block > 0``; an entry past the ring reads as the null block, in-bounds): it writes no ring row,
+and a block of its that needs ring rows -- a block starting below ``pos0`` -- reports ``-2`` and writes nothing, so the null
+block's rows are never pooled into a live sequence's block (a block pooled from this step's rows alone is still written); a
+completing row whose block lies past the table's width, on a negative (unassigned) page or on a page past the
+cache reports ``-2`` and writes nothing (the capacity rule of the dense form); ``n_commit`` keeps its meaning.  The aliasing
+argument of the dense form holds unchanged: a completing row of this step reads ring positions ``pos0 - POOL + 1 ..
+pos0 - 1`` while the step writes positions ``pos0 .. pos0 + S_q - 1``, disjoint rows whenever ``cap >= S_q + POOL - 1``
+(``min_ring_rows``; a cap of 4 serves ``S_q = 1``, 8 serves ``S_q <= 5``), so within a launch no row is read after another
+row writes it.  The e4m3 compressed-key STORE (an e4m3 indexer cache at decode) is a follow-up and is declined by name: the
+paged arms store the activation dtype; the raw-key ring is a bit copy of the step's raw keys and is never quantized (an e4m3
+ring is a form error naming that rule, not the decline).
+
+Still no shared memory, no mbarrier, no TMA, no tcgen05 in either form: the barrier table and the SMEM table of this kernel
+stay EMPTY by construction.
 """
 
 from typing import NamedTuple, Optional
@@ -142,7 +187,7 @@ from cudnn.frost.buffers import cutedsl_requirement_error
 from cudnn.frost.device import current_device
 from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16, rmsnorm_rstd, rope_rotate_half
-from cudnn.frost.tile_dsl.tma import ld_global, ld_global_v4, st_global, st_global_v4
+from cudnn.frost.tile_dsl.tma import ld_global, ld_global_v2, ld_global_v4, st_global, st_global_v4
 
 from .qk_norm_rope import ACCESS_BYTES, ELEMS_PER_ACCESS, lanes_per_row, validate_shape, vec_chunks
 
@@ -576,7 +621,14 @@ def moved_bytes(batch: int, seq_len: int, d: int, *, pool: int = DEFAULT_POOL, e
 SLOT_NO_BLOCK = -1
 """``compressed_slot`` value: this row completes no block, or is an uncommitted draft."""
 SLOT_CAPACITY = -2
-"""``compressed_slot`` value: the row completes a block past the compressed-key cache or the RoPE table; nothing written."""
+"""``compressed_slot`` value: the row completes a block past the compressed-key cache or the RoPE table, or (paged form) a block
+that needs ring rows the sequence does not own; nothing written."""
+
+_RING_SLOT_DTYPES = (torch.int32, torch.int64)
+E4M3_STORE_DECLINE = (
+    "the e4m3 compressed-key cache store (an e4m3 indexer cache at decode) is a follow-up: the paged compress arms store the activation dtype (bf16 / f16)"
+)
+"""The typed decline of the e4m3 compressed-key cache on the paged arms (compile and execute, both directions)."""
 
 
 def min_ring_rows(rows_per_step: int, pool: int = DEFAULT_POOL) -> int:
@@ -587,17 +639,110 @@ def min_ring_rows(rows_per_step: int, pool: int = DEFAULT_POOL) -> int:
     return int(rows_per_step) + int(pool) - 1
 
 
+# -- the shared paged-addressing helpers: ONE formula per table, called by the step kernel and by the fused prepare launch --
+
+
+@cute.jit
+def step_position(mPos0: Optional[cute.Tensor], mKvLens: Optional[cute.Tensor], b: cutlass.Int32, s_q: cutlass.Int32) -> cutlass.Int32:
+    """The position of row 0 of sequence ``b``: ``kv_lens[b] - S_q`` from the KV length AFTER the step (the paged form -- a
+    negative value marks the rows below position 0 dead), or the ``pos0`` vector clamped at 0 (the dense form -- a negative
+    ``pos0`` is the first step of a sequence).  Exactly one of the two vectors is bound (the host checks)."""
+    pos0 = cutlass.Int32(0)
+    if cutlass.const_expr(mKvLens is not None):
+        pos0 = ld_global(mKvLens.iterator.toint() + b.to(cutlass.Int64) * cutlass.Int64(4), cutlass.Int32) - s_q
+    else:
+        p0 = ld_global(mPos0.iterator.toint() + b.to(cutlass.Int64) * cutlass.Int64(4), cutlass.Int32)
+        pos0 = p0 if p0 > cutlass.Int32(0) else cutlass.Int32(0)
+    return pos0
+
+
+@cute.jit
+def ring_entry(mStateTable: cute.Tensor, b: cutlass.Int32, mRing: cute.Tensor):
+    """The sequence's ring block from ``index_state_block_table [B, 1]`` as ``(entry, owns_ring)``, range-checked against the ring
+    ``mRing [blocks, cap, 1, D]`` on BOTH sides: block 0 is the null block (a live request's entry is ``> 0``), a negative entry is
+    unassigned, and an entry ``>= blocks`` lies past the allocation (a ring of one block per request while the ids start at 1);
+    every one of them reads as block 0 -- in-bounds, since the ring holds at least one block -- with ``owns_ring`` False, so the
+    row writes no ring row and pools no ring row (the callers report ``-2`` for a block that would need one)."""
+    blk = ld_global(mStateTable.iterator.toint() + b.to(cutlass.Int64) * cutlass.Int64(mStateTable.stride[0]) * cutlass.Int64(4), cutlass.Int32)
+    owns = (blk > cutlass.Int32(0)) & (blk < cutlass.Int32(mRing.shape[0]))
+    entry = blk if owns else cutlass.Int32(0)
+    return entry, owns
+
+
+@cute.jit
+def ring_row_address(mRing: cute.Tensor, entry: cutlass.Int32, pos: cutlass.Int32, bpe: cutlass.Int64) -> cutlass.Int64:
+    """Byte address of the ring row of position ``pos`` in ring ``entry``: ``base + entry * stride[0] + (pos % shape[1]) * stride[1]``
+    -- the dense ring ``[B, RING, D]`` (``entry`` = the sequence) and the paged ``[blocks, cap, 1, D]`` (``entry`` = the
+    sequence's state block; the slot ``block * cap + pos % cap`` in rows) through ONE formula.  ``pos`` is >= 0 (the callers
+    clamp a dead row's position to 0 and store nothing for it)."""
+    ring_n = cutlass.Int32(mRing.shape[1])
+    return (
+        mRing.iterator.toint()
+        + (entry.to(cutlass.Int64) * cutlass.Int64(mRing.stride[0]) + (pos % ring_n).to(cutlass.Int64) * cutlass.Int64(mRing.stride[1])) * bpe
+    )
+
+
+@cute.jit
+def ring_slot_address(mRing: cute.Tensor, mSlots: cute.Tensor, t: cutlass.Int32, slot_i64: cutlass.Constexpr[bool], bpe: cutlass.Int64):
+    """The ring WRITE row named by the stack's own slot mapping: ``index_state_slot_mapping[t]`` is the flat row
+    ``block * cap + pos % cap`` of a ring whose blocks are contiguous (``stride[0] == cap * stride[1]``, host-checked), ``-1`` =
+    no write.  Returns ``(byte address, live)``, the address clamped to row 0 when the slot is out of range.  int64 slots are
+    read as two 32-bit halves so a slot >= 2^31 can never alias an in-range one."""
+    t64 = t.to(cutlass.Int64)
+    if cutlass.const_expr(slot_i64):
+        lo, hi = ld_global_v2(mSlots.iterator.toint() + t64 * cutlass.Int64(8), cutlass.Int32)
+        slot = (hi.to(cutlass.Int64) * cutlass.Int64(1 << 32)) + (lo.to(cutlass.Int64) & cutlass.Int64(0xFFFFFFFF))
+    else:
+        slot = ld_global(mSlots.iterator.toint() + t64 * cutlass.Int64(4), cutlass.Int32).to(cutlass.Int64)
+    n_rows = cutlass.Int64(mRing.shape[0]) * cutlass.Int64(mRing.shape[1])
+    live = (slot >= cutlass.Int64(0)) & (slot < n_rows)
+    slot_r = slot if live else cutlass.Int64(0)
+    addr = mRing.iterator.toint() + slot_r * cutlass.Int64(mRing.stride[1]) * bpe
+    return addr, live
+
+
+@cute.jit
+def paged_block_row(mCache: cute.Tensor, mTable: cute.Tensor, b: cutlass.Int32, blk: cutlass.Int32, bpe: cutlass.Int64):
+    """The compressed-key cache row of block ``blk`` of sequence ``b`` through the MAIN block table -- page
+    ``table[b, blk // rpp]``, row ``blk % rpp`` with ``rpp = cache.shape[1]`` (= P / POOL: the compressed rows per attention
+    page) -- as ``(byte address, fits)``: ``fits`` is False past the table's width, on a negative (unassigned) page and on a
+    page past the cache; the address is then clamped in-bounds (page 0, the block's row) so a lane group that stores nothing
+    still loads inside the allocation.  ``blk`` is >= 0 (the callers clamp)."""
+    rpp = cutlass.Int32(mCache.shape[1])
+    n_pages = cutlass.Int32(mCache.shape[0])
+    width = cutlass.Int32(mTable.shape[1])
+    lblk = blk // rpp
+    row = blk - lblk * rpp
+    in_table = lblk < width
+    lblk_r = lblk if in_table else width - cutlass.Int32(1)
+    page = ld_global(
+        mTable.iterator.toint()
+        + (b.to(cutlass.Int64) * cutlass.Int64(mTable.stride[0]) + lblk_r.to(cutlass.Int64) * cutlass.Int64(mTable.stride[1])) * cutlass.Int64(4),
+        cutlass.Int32,
+    )
+    fits = in_table & (page >= cutlass.Int32(0)) & (page < n_pages)
+    page_r = page if fits else cutlass.Int32(0)
+    addr = (
+        mCache.iterator.toint() + (page_r.to(cutlass.Int64) * cutlass.Int64(mCache.stride[0]) + row.to(cutlass.Int64) * cutlass.Int64(mCache.stride[1])) * bpe
+    )
+    return addr, fits
+
+
 @cute.kernel
 def frost_qsa_compress_step(
     mKnew: cute.Tensor,  # [B, S_q, D] io dtype; batch / token strides symbolic (a column slice of the projection slab is fine)
-    mRing: cute.Tensor,  # [B, RING, D] io dtype, compact: row p % RING holds the raw key of position p
-    mOut: cute.Tensor,  # [B, NB, D] io dtype, compact: the compressed-key cache, row blk = block blk
+    mRing: cute.Tensor,  # dense: [B, RING, D] compact, row p % RING = position p's raw key; paged: [blocks, cap, 1, D] behind mStateTable
+    mOut: cute.Tensor,  # dense: [B, NB, D] compact, row blk = block blk; paged: [num_pages, P / POOL, 1, D] behind mBlockTable
     mW: cute.Tensor,  # [D] io dtype
     mCos: cute.Tensor,  # [Bc, S_pos, ROPE_DIM] 16-bit, Bc in {1, B}
     mSin: cute.Tensor,  # same shape and dtype as mCos
-    mPos0: cute.Tensor,  # [B] int32: the position of row 0 (= the KV length before the step)
+    mPos0: Optional[cute.Tensor],  # [B] int32: the position of row 0 (= the KV length before the step); None on the paged form
     mNCommit: Optional[cute.Tensor],  # [B] int32: the accepted prefix of the step's rows, or None (= every row)
     mSlot: cute.Tensor,  # [B, S_q] int32 out: the block id written by the row, -1 (none) or -2 (capacity)
+    mKvLens: Optional[cute.Tensor],  # [B] int32: the KV length AFTER the step (the paged form's position source), or None
+    mBlockTable: Optional[cute.Tensor],  # [B, max_pages] int32: the MAIN block table (the paged form), or None
+    mStateTable: Optional[cute.Tensor],  # [B, 1] int32: the ring's block table (the paged form), or None
+    mRingSlots: Optional[cute.Tensor],  # [B * S_q] int32 / int64: the stack's own ring slots (paged, ring_slots), or None
     eps: cutlass.Float32,
     w_offset: cutlass.Float32,
     d: cutlass.Constexpr[int],
@@ -605,6 +750,7 @@ def frost_qsa_compress_step(
     pool: cutlass.Constexpr[int],
     threads_per_cta: cutlass.Constexpr[int],
     use_pdl: cutlass.Constexpr[bool],
+    ring_slot_i64: cutlass.Constexpr[bool],
 ) -> None:
     """One lane group (``lanes_per_row(d)`` lanes) per NEW ROW of the step.
 
@@ -614,12 +760,16 @@ def frost_qsa_compress_step(
     step's rows) and runs the prefill kernel's fp32 chain -- the same operations in the same order.  Every other
     group runs the arithmetic on clamped, in-bounds loads (so every lane of the warp reaches the butterfly
     shuffles) and stores nothing.  The ring writes and the ring reads of one launch never alias (host rule
-    ``RING >= S_q + pool - 1``), so there is no intra-launch ordering requirement.
+    ``RING >= S_q + pool - 1``), so there is no intra-launch ordering requirement.  The dense and the paged form
+    (``mBlockTable`` present) differ ONLY in where a position's ring row and a block's cache row live
+    (:func:`ring_row_address`, :func:`paged_block_row`) and in the position source (:func:`step_position`).
     """
     if cutlass.const_expr(use_pdl):
         wait_on_dependent_grids()
 
     has_n_commit = cutlass.const_expr(mNCommit is not None)
+    paged = cutlass.const_expr(mBlockTable is not None)
+    has_ring_slots = cutlass.const_expr(mRingSlots is not None)
     lanes = cutlass.const_expr(lanes_per_row(d))
     chunks = cutlass.const_expr(vec_chunks(d))
     groups_per_cta = cutlass.const_expr(threads_per_cta // lanes)
@@ -634,26 +784,37 @@ def frost_qsa_compress_step(
     j = cutlass.Int32(cute.arch.block_idx()[0]) * cutlass.Int32(groups_per_cta) + grp
 
     s_q = cutlass.Int32(mKnew.shape[1])
-    ring_n = cutlass.Int32(mRing.shape[1])
-    n_cap = cutlass.Int32(mOut.shape[1])
     s_pos = cutlass.Int32(mCos.shape[1])
     b64 = b.to(cutlass.Int64)
 
     in_row = j < s_q
     jr = j if in_row else s_q - cutlass.Int32(1)  # the ragged last CTA computes on the last row and stores nothing
-    pos0 = ld_global(mPos0.iterator.toint() + b64 * cutlass.Int64(4), cutlass.Int32)
-    pos0 = pos0 if pos0 > cutlass.Int32(0) else cutlass.Int32(0)
+    pos0 = step_position(mPos0, mKvLens, b, s_q)
     n_commit = s_q
     if cutlass.const_expr(has_n_commit):
         nc = ld_global(mNCommit.iterator.toint() + b64 * cutlass.Int64(4), cutlass.Int32)
         nc = nc if nc > cutlass.Int32(0) else cutlass.Int32(0)
         n_commit = nc if nc < s_q else s_q
-    p = pos0 + jr
-    committed = in_row & (jr < n_commit)
+    p_raw = pos0 + jr
+    pos_ok = p_raw >= cutlass.Int32(0)  # always true on the dense form (pos0 clamped); a dead row of the paged form otherwise
+    p = p_raw if pos_ok else cutlass.Int32(0)
+    committed = in_row & (jr < n_commit) & pos_ok
     completes = (p % cutlass.Int32(pool)) == cutlass.Int32(pool - 1)
     blk = p // cutlass.Int32(pool)
     tok0 = blk * cutlass.Int32(pool)
-    fits = blk < n_cap
+    # the ring entry (the sequence, or its state block) and the block's cache row -- the one place the two forms differ
+    if cutlass.const_expr(paged):
+        entry, owns_ring = ring_entry(mStateTable, b, mRing)
+        out_row, fits = paged_block_row(mOut, mBlockTable, b, blk, bpe)
+        # a block that needs ring rows (it starts below pos0) from a sequence that owns no ring: -2, never the null block's rows
+        fits = fits & (owns_ring | (tok0 >= pos0))
+    else:
+        entry = b
+        owns_ring = cutlass.Boolean(True)
+        n_cap = cutlass.Int32(mOut.shape[1])
+        fits = blk < n_cap
+        blk_r = blk if fits else n_cap - cutlass.Int32(1)
+        out_row = mOut.iterator.toint() + (b64 * cutlass.Int64(mOut.stride[0]) + blk_r.to(cutlass.Int64) * cutlass.Int64(mOut.stride[1])) * bpe
     if cutlass.const_expr(rope_dim > 0):
         fits = fits & (tok0 < s_pos)
     write_blk = committed & completes & fits
@@ -661,13 +822,16 @@ def frost_qsa_compress_step(
     lane_off = lane.to(cutlass.Int64) * cutlass.Int64(ACCESS_BYTES)
     knew_tok = cutlass.Int64(mKnew.stride[1]) * bpe
     knew_b = mKnew.iterator.toint() + b64 * cutlass.Int64(mKnew.stride[0]) * bpe
-    ring_row = cutlass.Int64(mRing.stride[1]) * bpe
-    ring_b = mRing.iterator.toint() + b64 * cutlass.Int64(mRing.stride[0]) * bpe
 
     # --- (1) the committed row's raw key enters the ring: a bit copy, 16 B per lane ----
-    if committed:
+    ring_write = committed & owns_ring
+    if cutlass.const_expr(has_ring_slots):
+        dst, slot_live = ring_slot_address(mRing, mRingSlots, b * s_q + jr, ring_slot_i64, bpe)
+        ring_write = ring_write & slot_live
+    else:
+        dst = ring_row_address(mRing, entry, p, bpe)
+    if ring_write:
         src = knew_b + jr.to(cutlass.Int64) * knew_tok
-        dst = ring_b + (p % ring_n).to(cutlass.Int64) * ring_row
         for c in cutlass.range_constexpr(chunks):
             off = cutlass.Int64((c * lanes) * ACCESS_BYTES) + lane_off
             words = ld_global_v4(src + off, cutlass.Int32)
@@ -684,7 +848,7 @@ def frost_qsa_compress_step(
         row_new = row_new if row_new > cutlass.Int32(0) else cutlass.Int32(0)
         row_new = row_new if row_new < s_q else s_q - cutlass.Int32(1)
         addr_new = knew_b + row_new.to(cutlass.Int64) * knew_tok
-        addr_ring = ring_b + (q % ring_n).to(cutlass.Int64) * ring_row
+        addr_ring = ring_row_address(mRing, entry, q, bpe)
         row_base = addr_new if from_new else addr_ring
         for c in cutlass.range_constexpr(chunks):
             off = cutlass.Int64((c * lanes) * ACCESS_BYTES) + lane_off
@@ -734,12 +898,11 @@ def frost_qsa_compress_step(
 
     # --- the ONE rounding, into the block's own cache row ---------------------------
     if write_blk:
-        out_base = mOut.iterator.toint() + (b64 * cutlass.Int64(mOut.stride[0]) + blk.to(cutlass.Int64) * cutlass.Int64(mOut.stride[1])) * bpe
         for c in cutlass.range_constexpr(chunks):
             off = cutlass.Int64((c * lanes) * ACCESS_BYTES) + lane_off
             y = ys[c]
             packed = [fp32_to_fp16(y[i], y[i + 1], dtype=mOut.element_type) for i in range(0, ELEMS_PER_ACCESS, 2)]
-            st_global_v4(out_base + off, packed, cutlass.Int32)
+            st_global_v4(out_row + off, packed, cutlass.Int32)
 
     # --- the per-row report: the block id written, -1 (no block / draft), -2 (capacity) ----
     slot_val = cutlass.Int32(SLOT_CAPACITY) if (committed & completes) else cutlass.Int32(SLOT_NO_BLOCK)
@@ -760,9 +923,13 @@ def qsa_compress_step_launch(
     w: cute.Tensor,
     cos: cute.Tensor,
     sin: cute.Tensor,
-    pos0: cute.Tensor,
+    pos0: Optional[cute.Tensor],
     n_commit: Optional[cute.Tensor],
     slot: cute.Tensor,
+    kv_lens: Optional[cute.Tensor],
+    block_table: Optional[cute.Tensor],
+    state_table: Optional[cute.Tensor],
+    ring_slots: Optional[cute.Tensor],
     eps: cutlass.Float32,
     w_offset: cutlass.Float32,
     grid_x: cutlass.Int32,
@@ -772,11 +939,32 @@ def qsa_compress_step_launch(
     pool: cutlass.Constexpr[int],
     threads_per_cta: cutlass.Constexpr[int],
     use_pdl: cutlass.Constexpr[bool],
+    ring_slot_i64: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
-    frost_qsa_compress_step(k_new, ring, out, w, cos, sin, pos0, n_commit, slot, eps, w_offset, d, rope_dim, pool, threads_per_cta, use_pdl).launch(
-        grid=(grid_x, grid_y, 1), block=(threads_per_cta, 1, 1), stream=stream, use_pdl=use_pdl
-    )
+    frost_qsa_compress_step(
+        k_new,
+        ring,
+        out,
+        w,
+        cos,
+        sin,
+        pos0,
+        n_commit,
+        slot,
+        kv_lens,
+        block_table,
+        state_table,
+        ring_slots,
+        eps,
+        w_offset,
+        d,
+        rope_dim,
+        pool,
+        threads_per_cta,
+        use_pdl,
+        ring_slot_i64,
+    ).launch(grid=(grid_x, grid_y, 1), block=(threads_per_cta, 1, 1), stream=stream, use_pdl=use_pdl)
 
 
 step_compiled_cache = {}
@@ -784,8 +972,9 @@ step_compiled_cache = {}
 
 class QsaCompressStepRecipe(NamedTuple):
     """Build-time facts of one decode-step compress launch (a legal compile key): dtypes, head dim, rope dim, pool,
-    whether an accepted-prefix vector is bound.  Batch, rows per step, ring depth and the cache capacity are
-    ``cute.sym_int`` and ride in as runtime shapes: one artifact serves every step shape and every ring."""
+    whether an accepted-prefix vector is bound, whether the state is PAGED and whether the ring's write rows come from the
+    stack's own slot mapping (and its dtype).  Batch, rows per step, ring depth, the cache capacity and the page geometry
+    are ``cute.sym_int`` and ride in as runtime shapes: one artifact serves every step shape, every ring and every page size."""
 
     compiled: object
     d: int
@@ -795,6 +984,37 @@ class QsaCompressStepRecipe(NamedTuple):
     has_n_commit: bool
     dtype: object
     table_dtype: object
+    paged: bool = False
+    ring_slots: bool = False
+    ring_slot_dtype: object = torch.int64
+
+
+def _fake_i32_table(shape, stride):
+    """An int32 table ``[B, cols]`` with a symbolic (or fixed) column count and a SYMBOLIC row stride -- a row slice of a
+    wider table binds too -- declared 4-byte aligned (scalar loads; a slice's base is a multiple of 4 only)."""
+    return cute.runtime.make_fake_tensor(dtype=cutlass.Int32, shape=shape, stride=stride, assumed_align=4)
+
+
+def _fake_ring_slots(slot_dtype):
+    """``[T]`` contiguous int32 / int64 with a symbolic length; 4- / 8-byte aligned (the natural alignment of its element)."""
+    i64 = slot_dtype == torch.int64
+    return cute.runtime.make_fake_compact_tensor(cutlass.Int64 if i64 else cutlass.Int32, (cute.sym_int(),), stride_order=(0,), assumed_align=8 if i64 else 4)
+
+
+def _fake_paged_state(dtype, d):
+    """``[blocks, rows, 1, D]`` -- the paged ring or the paged compressed-key cache -- with D contiguous and every other
+    stride symbolic (the stack's own strides bind, no repack)."""
+    return _fake_strided(dtype, (cute.sym_int(), cute.sym_int(), 1, d), (cute.sym_int(), cute.sym_int(), cute.sym_int(), 1))
+
+
+def check_index_cache_dtype(index_cache_dtype, dtype) -> None:
+    """The compressed-key cache's dtype against the paged arms' contract: ``None`` or the activation dtype is served; the e4m3
+    store is the typed decline :data:`E4M3_STORE_DECLINE` (a follow-up); any other dtype is a ``ValueError``."""
+    if index_cache_dtype is None or index_cache_dtype == dtype:
+        return
+    if index_cache_dtype == torch.float8_e4m3fn:
+        raise NotImplementedError(E4M3_STORE_DECLINE)
+    raise ValueError(f"the compressed-key cache must hold the activation dtype {dtype} on the paged arms, got {index_cache_dtype}")
 
 
 def compile_qsa_compress_step(
@@ -807,9 +1027,20 @@ def compile_qsa_compress_step(
     table_dtype=None,
     threads_per_cta: int = DEFAULT_THREADS_PER_CTA,
     use_pdl: bool = False,
+    paged: bool = False,
+    ring_slots: bool = False,
+    ring_slot_dtype=torch.int64,
+    index_cache_dtype=None,
 ) -> QsaCompressStepRecipe:
     """Build the decode-step artifact from SHAPES ALONE -- no device allocation, no launch (see
-    :func:`compile_qsa_compress` for the io / table dtype rules, which are the same here)."""
+    :func:`compile_qsa_compress` for the io / table dtype rules, which are the same here).
+
+    ``paged=True`` traces the PAGED form (module docstring): the ring ``[blocks, cap, 1, D]`` behind ``index_state_block_table``,
+    the compressed-key cache ``[num_pages, P / pool, 1, D]`` behind the main ``block_table``, positions from ``kv_lens``;
+    ``ring_slots=True`` (paged only) takes the ring WRITE rows from ``index_state_slot_mapping`` of ``ring_slot_dtype``
+    instead of deriving them; ``index_cache_dtype`` names the cache's dtype (``None`` = the activation dtype; e4m3 is the
+    typed decline of a follow-up).  Every flag is in the cache key.
+    """
     too_old = cutedsl_requirement_error("qsa_compress_step")
     if too_old is not None:
         raise NotImplementedError(too_old)
@@ -819,20 +1050,48 @@ def compile_qsa_compress_step(
     table_dtype = dtype if table_dtype is None else table_dtype
     if table_dtype not in _IO_DTYPES:
         raise ValueError(f"qsa_compress_step takes 16-bit cos / sin tables (bf16/f16), got table_dtype={table_dtype}")
+    if ring_slots and not paged:
+        raise ValueError("ring_slots=True takes the ring write rows from the stack's slot mapping of the PAGED ring; it needs paged=True")
+    if ring_slot_dtype not in _RING_SLOT_DTYPES:
+        raise ValueError(f"ring_slot_dtype must be int32 or int64, got {ring_slot_dtype}")
+    check_index_cache_dtype(index_cache_dtype, dtype)
 
-    key = (str(dtype), str(table_dtype), int(d), int(rope_dim), int(pool), int(threads_per_cta), bool(has_n_commit), bool(use_pdl), current_device())
+    key = (
+        str(dtype),
+        str(table_dtype),
+        int(d),
+        int(rope_dim),
+        int(pool),
+        int(threads_per_cta),
+        bool(has_n_commit),
+        bool(use_pdl),
+        current_device(),
+        bool(paged),
+        bool(ring_slots),
+        str(ring_slot_dtype) if ring_slots else None,
+    )
     if key not in step_compiled_cache:
         batch = cute.sym_int()
         rows = cute.sym_int()
         k_new = _fake_strided(dtype, (batch, rows, d), (cute.sym_int(), cute.sym_int(), 1))
-        ring = _fake_compact(dtype, (batch, cute.sym_int(), d), (2, 1, 0))
-        out = _fake_compact(dtype, (batch, cute.sym_int(), d), (2, 1, 0))
         w = _fake_compact(dtype, (d,), (0,))
         table_dim = rope_dim if rope_dim else 1
         tables = [_fake_strided(table_dtype, (cute.sym_int(), cute.sym_int(), table_dim), (cute.sym_int(), cute.sym_int(), 1)) for _ in range(2)]
-        pos0 = _fake_compact(torch.int32, (batch,), (0,))
         n_commit = _fake_compact(torch.int32, (batch,), (0,)) if has_n_commit else None
         slot = _fake_compact(torch.int32, (batch, rows), (1, 0))
+        if paged:
+            ring = _fake_paged_state(dtype, d)
+            out = _fake_paged_state(dtype, d)
+            pos0 = None
+            kv_lens = _fake_compact(torch.int32, (batch,), (0,))
+            block_table = _fake_i32_table((batch, cute.sym_int()), (cute.sym_int(), 1))
+            state_table = _fake_i32_table((batch, 1), (cute.sym_int(), 1))
+            slots = _fake_ring_slots(ring_slot_dtype) if ring_slots else None
+        else:
+            ring = _fake_compact(dtype, (batch, cute.sym_int(), d), (2, 1, 0))
+            out = _fake_compact(dtype, (batch, cute.sym_int(), d), (2, 1, 0))
+            pos0 = _fake_compact(torch.int32, (batch,), (0,))
+            kv_lens = block_table = state_table = slots = None
         step_compiled_cache[key] = cute.compile(
             qsa_compress_step_launch,
             k_new,
@@ -843,6 +1102,10 @@ def compile_qsa_compress_step(
             pos0,
             n_commit,
             slot,
+            kv_lens,
+            block_table,
+            state_table,
+            slots,
             cutlass.Float32(1e-6),  # eps       ) runtime values: the literals pin
             cutlass.Float32(0.0),  # w_offset   ) their TYPE at trace time only
             cutlass.Int32(1),  # grid_x
@@ -852,6 +1115,7 @@ def compile_qsa_compress_step(
             int(pool),
             int(threads_per_cta),
             bool(use_pdl),
+            bool(ring_slots and ring_slot_dtype == torch.int64),
             _FAKE_STREAM,
             options="--enable-tvm-ffi",
         )
@@ -864,6 +1128,9 @@ def compile_qsa_compress_step(
         has_n_commit=bool(has_n_commit),
         dtype=dtype,
         table_dtype=table_dtype,
+        paged=bool(paged),
+        ring_slots=bool(ring_slots),
+        ring_slot_dtype=ring_slot_dtype,
     )
 
 
@@ -871,6 +1138,110 @@ def _check_int32_vector(name: str, x: torch.Tensor, shape: tuple) -> None:
     if not isinstance(x, torch.Tensor) or x.dtype != torch.int32 or tuple(x.shape) != tuple(shape) or not x.is_contiguous() or not x.is_cuda:
         got = None if not isinstance(x, torch.Tensor) else f"{x.dtype} {tuple(x.shape)} contiguous={x.is_contiguous()} cuda={x.is_cuda}"
         raise ValueError(f"{name} must be a contiguous int32 CUDA tensor of shape {tuple(shape)}, got {got}")
+
+
+def check_paged_state(name: str, x: torch.Tensor, *, dtype, d: int, min_rows: int, what: str, cache: bool = False) -> None:
+    """A paged state tensor ``[blocks >= 1, rows >= min_rows, 1, D]`` of the activation dtype whose rows the kernels move in 16-B
+    vectors (the stack's ring ``[num_ring_blocks, cap, 1, D]`` or compressed-key cache ``[num_pages, P / pool, 1, D]``).  The e4m3
+    form of the compressed-key CACHE (``cache=True``) is the typed decline of a follow-up, :data:`E4M3_STORE_DECLINE`; an e4m3
+    ring is a ``ValueError`` naming the ring's rule (a bit copy of the step's raw keys, never quantized), as is every other dtype
+    mismatch; typed and naming the operand."""
+    if not isinstance(x, torch.Tensor):
+        raise ValueError(f"{name} must be a 4-D [blocks, rows, 1, D={d}] {what}, got {type(x).__name__}")
+    if x.dtype == torch.float8_e4m3fn and dtype != torch.float8_e4m3fn:
+        if cache:
+            raise NotImplementedError(E4M3_STORE_DECLINE)
+        raise ValueError(
+            f"{name} must hold the activation dtype {dtype}: the raw-key ring is a bit copy of this step's raw keys and is never quantized "
+            f"(the e4m3 form of the paged arms is the compressed-key cache's, a follow-up), got {x.dtype}"
+        )
+    if x.dim() != 4 or int(x.shape[2]) != 1 or int(x.shape[3]) != d or int(x.shape[0]) < 1:
+        raise ValueError(f"{name} must be a 4-D [blocks >= 1, rows, 1, D={d}] {what}, got shape {tuple(x.shape)}")
+    if int(x.shape[1]) < min_rows:
+        raise ValueError(f"{name} holds {int(x.shape[1])} rows per block; this launch needs at least {min_rows} ({what})")
+    if not x.is_cuda:
+        raise ValueError(f"{name} must be a CUDA tensor, got device {x.device}")
+    _check_row_tensor(name, x, dtype=dtype, last_dim=d)
+
+
+def check_block_table(name: str, x: torch.Tensor, *, batch: int, cols: Optional[int] = None) -> None:
+    """A block table ``[B, cols]`` (``cols`` fixed, or any ``>= 1`` when None) of int32 on the device, columns contiguous, rows at
+    any stride (a row slice of a wider table binds); the VALUES are device data the kernels range-check."""
+    if not isinstance(x, torch.Tensor) or x.dim() != 2 or x.dtype != torch.int32 or not x.is_cuda:
+        got = None if not isinstance(x, torch.Tensor) else f"{x.dtype} {tuple(x.shape)} cuda={x.is_cuda}"
+        raise ValueError(f"{name} must be a 2-D int32 CUDA block table [B={batch}, {'cols' if cols is None else cols}], got {got}")
+    if int(x.shape[0]) != batch or (cols is None and int(x.shape[1]) < 1) or (cols is not None and int(x.shape[1]) != cols):
+        raise ValueError(f"{name} must be [B={batch}, {'cols >= 1' if cols is None else cols}], got shape {tuple(x.shape)}")
+    if int(x.stride(1)) != 1:
+        raise ValueError(f"{name} must have contiguous columns (stride 1 on the last axis), got strides {tuple(x.stride())}")
+
+
+def check_ring_slots(name: str, x: torch.Tensor, *, t: int, dtype) -> None:
+    """The stack's own ring slot mapping: a contiguous 1-D ``[T]`` tensor of the recipe's ``ring_slot_dtype`` on the device."""
+    if not isinstance(x, torch.Tensor) or x.dim() != 1 or int(x.numel()) != t or x.dtype != dtype or not x.is_contiguous() or not x.is_cuda:
+        got = None if not isinstance(x, torch.Tensor) else f"{x.dtype} {tuple(x.shape)} contiguous={x.is_contiguous()} cuda={x.is_cuda}"
+        raise ValueError(f"{name} must be a contiguous {dtype} CUDA tensor of shape ({t},) (one flat ring row per step row, -1 = no write), got {got}")
+
+
+def check_paged_step_operands(
+    *,
+    paged: bool,
+    ring_slots: bool,
+    ring_slot_dtype,
+    batch: int,
+    rows: int,
+    pos0,
+    kv_lens,
+    block_table,
+    index_state_block_table,
+    index_state_slot_mapping,
+    ring: torch.Tensor,
+) -> None:
+    """The position source and the tables against the recipe's form, BOTH directions typed: the paged form takes ``kv_lens`` +
+    the two block tables (+ the slot mapping iff traced) and REFUSES ``pos0``; the dense form takes ``pos0`` and REFUSES every
+    paged operand (it would be silently ignored).  Shared by the step form and the fused prepare launch."""
+    if paged:
+        if pos0 is not None:
+            raise ValueError("pos0 is refused on the paged form: positions derive in-kernel from kv_lens (the KV length after the step) -- pass pos0=None")
+        if kv_lens is None or block_table is None or index_state_block_table is None:
+            raise ValueError(
+                "this artifact traced the PAGED compress arms: kv_lens [B] int32, block_table [B, max_pages] int32 and index_state_block_table [B, 1] int32 must be bound (no silent dense fallback)"
+            )
+        _check_int32_vector("kv_lens", kv_lens, (batch,))
+        check_block_table("block_table", block_table, batch=batch)
+        check_block_table("index_state_block_table", index_state_block_table, batch=batch, cols=1)
+        if ring_slots:
+            if index_state_slot_mapping is None:
+                raise ValueError(
+                    "this artifact traced the ring's slot-mapping arm (ring_slots=True); bind index_state_slot_mapping [T] (no silent derived fallback)"
+                )
+            check_ring_slots("index_state_slot_mapping", index_state_slot_mapping, t=batch * rows, dtype=ring_slot_dtype)
+            if int(ring.stride(0)) != int(ring.shape[1]) * int(ring.stride(1)):
+                raise ValueError(
+                    f"index_state_slot_mapping names flat ring rows (block x cap + pos % cap), which needs the ring's blocks contiguous "
+                    f"(stride[0] == cap x stride[1]); got shape {tuple(ring.shape)} strides {tuple(ring.stride())}"
+                )
+        elif index_state_slot_mapping is not None:
+            raise ValueError(
+                "this artifact derives the ring rows from index_state_block_table (ring_slots=False); index_state_slot_mapping would be silently ignored -- pass None"
+            )
+    else:
+        extra = [
+            nm
+            for nm, x in (
+                ("kv_lens", kv_lens),
+                ("block_table", block_table),
+                ("index_state_block_table", index_state_block_table),
+                ("index_state_slot_mapping", index_state_slot_mapping),
+            )
+            if x is not None
+        ]
+        if extra:
+            raise ValueError(
+                f"{', '.join(extra)}: this artifact was compiled WITHOUT the paged compress arms (dense ring / cache, positions from pos0) and would silently ignore them -- compile paged=True, or pass None"
+            )
+        if pos0 is None:
+            raise ValueError("the dense form needs pos0 [B] int32 (the position of row 0 of every sequence)")
 
 
 def run_qsa_compress_step(
@@ -881,15 +1252,19 @@ def run_qsa_compress_step(
     w: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
-    pos0: torch.Tensor,
+    pos0: Optional[torch.Tensor],
     slot_out: torch.Tensor,
     n_commit: Optional[torch.Tensor] = None,
     *,
     eps: float,
     norm_weight_offset: float = 0.0,
     stream,
+    kv_lens: Optional[torch.Tensor] = None,
+    block_table: Optional[torch.Tensor] = None,
+    index_state_block_table: Optional[torch.Tensor] = None,
+    index_state_slot_mapping: Optional[torch.Tensor] = None,
 ) -> None:
-    """The lowered decode-step launch: validation and address arithmetic only -- no conversion, no allocation.
+    """The lowered decode-step launch: validation and address arithmetic only -- no conversion, no allocation, no device read.
 
     ``k_new`` ``[B, S_q, D]`` this step's raw keys (any batch / token stride with 16-B aligned rows), ``ring``
     ``[B, RING, D]`` compact with ``RING >= S_q + pool - 1``, ``out`` ``[B, NB, D]`` compact (the compressed-key
@@ -897,6 +1272,12 @@ def run_qsa_compress_step(
     rope_dim]`` (a block whose start position is past ``S_pos`` is reported ``-2``), ``pos0`` ``[B]`` int32 (the
     position of row 0), ``slot_out`` ``[B, S_q]`` int32 (written for every row), ``n_commit`` ``[B]`` int32 iff the
     recipe traced it (the accepted prefix of the step's rows).  ``norm_weight_offset`` as in the prefill form.
+
+    On a PAGED recipe the SAME positional slots carry the paged state: ``ring`` is the stack's ring ``[blocks >= 1, cap >= S_q + pool - 1,
+    1, D]``, ``out`` its compressed-key cache ``[num_pages >= 1, P / pool, 1, D]``, ``pos0`` must be ``None`` (REFUSED: the positions
+    derive from ``kv_lens``) and the appended keywords bind the rest: ``kv_lens`` ``[B]`` int32 (the KV length AFTER the step),
+    ``block_table`` ``[B, max_pages]`` int32, ``index_state_block_table`` ``[B, 1]`` int32, ``index_state_slot_mapping`` ``[B * S_q]``
+    iff the recipe traced ``ring_slots``.  A dense recipe REFUSES every paged keyword (it would be silently ignored).
     """
     if k_new.ndim != 3:
         raise ValueError(f"k_new must be [B, S_q, D], got shape {tuple(k_new.shape)}")
@@ -906,18 +1287,29 @@ def run_qsa_compress_step(
     if rows < 1:
         raise ValueError("k_new must hold at least one row per sequence")
     _check_row_tensor("k_new", k_new, dtype=r.dtype, last_dim=r.d)
-    if ring.ndim != 3 or int(ring.shape[0]) != batch or int(ring.shape[2]) != r.d or not ring.is_contiguous():
-        raise ValueError(f"ring must be a compact [B={batch}, RING, D={r.d}] tensor, got shape {tuple(ring.shape)}")
     need = min_ring_rows(rows, r.pool)
-    if int(ring.shape[1]) < need:
-        raise ValueError(
-            f"ring holds {int(ring.shape[1])} rows per sequence; a step of {rows} rows needs at least {need} (rows + pool - 1 = {rows} + {r.pool} - 1) "
-            "so this launch's ring writes never alias its ring reads and no committed key a later step pools is overwritten by a draft"
+    if r.paged:
+        check_paged_state(
+            "ring",
+            ring,
+            dtype=r.dtype,
+            d=r.d,
+            min_rows=need,
+            what=f"raw-key ring: a step of {rows} rows needs rows + pool - 1 = {rows} + {r.pool} - 1 so this launch's ring writes never alias its ring reads",
         )
-    _check_row_tensor("ring", ring, dtype=r.dtype, last_dim=r.d)
-    if out.ndim != 3 or int(out.shape[0]) != batch or int(out.shape[2]) != r.d or int(out.shape[1]) < 1 or not out.is_contiguous():
-        raise ValueError(f"out must be a compact [B={batch}, NB >= 1, D={r.d}] tensor, got shape {tuple(out.shape)}")
-    _check_row_tensor("out", out, dtype=r.dtype, last_dim=r.d)
+        check_paged_state("out", out, dtype=r.dtype, d=r.d, min_rows=1, what="compressed-key cache, P / pool rows per attention page", cache=True)
+    else:
+        if ring.ndim != 3 or int(ring.shape[0]) != batch or int(ring.shape[2]) != r.d or not ring.is_contiguous():
+            raise ValueError(f"ring must be a compact [B={batch}, RING, D={r.d}] tensor, got shape {tuple(ring.shape)}")
+        if int(ring.shape[1]) < need:
+            raise ValueError(
+                f"ring holds {int(ring.shape[1])} rows per sequence; a step of {rows} rows needs at least {need} (rows + pool - 1 = {rows} + {r.pool} - 1) "
+                "so this launch's ring writes never alias its ring reads and no committed key a later step pools is overwritten by a draft"
+            )
+        _check_row_tensor("ring", ring, dtype=r.dtype, last_dim=r.d)
+        if out.ndim != 3 or int(out.shape[0]) != batch or int(out.shape[2]) != r.d or int(out.shape[1]) < 1 or not out.is_contiguous():
+            raise ValueError(f"out must be a compact [B={batch}, NB >= 1, D={r.d}] tensor, got shape {tuple(out.shape)}")
+        _check_row_tensor("out", out, dtype=r.dtype, last_dim=r.d)
     if w.ndim != 1 or int(w.shape[0]) != r.d or not w.is_contiguous():
         raise ValueError(f"w must be a contiguous [{r.d}] norm weight, got shape {tuple(w.shape)}")
     _check_row_tensor("w", w, dtype=r.dtype, last_dim=r.d)
@@ -932,7 +1324,21 @@ def run_qsa_compress_step(
             _check_row_tensor(name, t, dtype=r.table_dtype, last_dim=r.rope_dim)
         if tuple(cos.shape) != tuple(sin.shape):
             raise ValueError(f"cos and sin must share a shape, got {tuple(cos.shape)} and {tuple(sin.shape)}")
-    _check_int32_vector("pos0", pos0, (batch,))
+    check_paged_step_operands(
+        paged=r.paged,
+        ring_slots=r.ring_slots,
+        ring_slot_dtype=r.ring_slot_dtype,
+        batch=batch,
+        rows=rows,
+        pos0=pos0,
+        kv_lens=kv_lens,
+        block_table=block_table,
+        index_state_block_table=index_state_block_table,
+        index_state_slot_mapping=index_state_slot_mapping,
+        ring=ring,
+    )
+    if not r.paged:
+        _check_int32_vector("pos0", pos0, (batch,))
     _check_int32_vector("slot_out", slot_out, (batch, rows))
     if r.has_n_commit:
         if n_commit is None:
@@ -951,6 +1357,10 @@ def run_qsa_compress_step(
         pos0,
         n_commit,
         slot_out,
+        kv_lens,
+        block_table,
+        index_state_block_table,
+        index_state_slot_mapping,
         cutlass.Float32(eps),
         cutlass.Float32(norm_weight_offset),
         cutlass.Int32(grid_x),
@@ -966,7 +1376,7 @@ def build_qsa_compress_step(
     w: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
-    pos0: torch.Tensor,
+    pos0: Optional[torch.Tensor],
     slot_out: torch.Tensor,
     n_commit: Optional[torch.Tensor] = None,
     *,
@@ -977,11 +1387,17 @@ def build_qsa_compress_step(
     threads_per_cta: int = DEFAULT_THREADS_PER_CTA,
     use_pdl: bool = False,
     stream,
+    kv_lens: Optional[torch.Tensor] = None,
+    block_table: Optional[torch.Tensor] = None,
+    index_state_block_table: Optional[torch.Tensor] = None,
+    index_state_slot_mapping: Optional[torch.Tensor] = None,
 ) -> QsaCompressStepRecipe:
     """Compile (cached) and run one decode step -- the convenience form for tests.  Production callers split it:
-    :func:`compile_qsa_compress_step` at plan time, :func:`run_qsa_compress_step` per step."""
+    :func:`compile_qsa_compress_step` at plan time, :func:`run_qsa_compress_step` per step.  The paged form is traced
+    when ``block_table`` is given (its slot-mapping arm when ``index_state_slot_mapping`` is)."""
     if k_new.ndim != 3:
         raise ValueError(f"k_new must be [B, S_q, D], got shape {tuple(k_new.shape)}")
+    paged = block_table is not None
     r = compile_qsa_compress_step(
         dtype=k_new.dtype,
         d=int(k_new.shape[2]),
@@ -991,8 +1407,30 @@ def build_qsa_compress_step(
         table_dtype=cos.dtype,
         threads_per_cta=threads_per_cta,
         use_pdl=use_pdl,
+        paged=paged,
+        ring_slots=paged and index_state_slot_mapping is not None,
+        ring_slot_dtype=index_state_slot_mapping.dtype if (paged and index_state_slot_mapping is not None) else torch.int64,
+        index_cache_dtype=out.dtype if paged else None,
     )
-    run_qsa_compress_step(r, k_new, ring, out, w, cos, sin, pos0, slot_out, n_commit, eps=eps, norm_weight_offset=norm_weight_offset, stream=stream)
+    run_qsa_compress_step(
+        r,
+        k_new,
+        ring,
+        out,
+        w,
+        cos,
+        sin,
+        pos0,
+        slot_out,
+        n_commit,
+        eps=eps,
+        norm_weight_offset=norm_weight_offset,
+        stream=stream,
+        kv_lens=kv_lens,
+        block_table=block_table,
+        index_state_block_table=index_state_block_table,
+        index_state_slot_mapping=index_state_slot_mapping,
+    )
     return r
 
 

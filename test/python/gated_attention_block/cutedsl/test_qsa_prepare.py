@@ -20,6 +20,14 @@ The block knob ``fuse_prepare`` (a performance knob: the same function): its dec
 the block with the knob on BITWISE the block with it off -- ``out``, the LSE, the pools, the raw-key pool -- on the dense
 block and on the block-sparse band block at a decode shape and a prefill shape, with the block's launch census one (two
 with the band) shorter.
+
+The PAGED compress arm (the serving stack's ring and compressed-key cache through their block tables, positions from
+``kv_lens``), the ring's slot-mapping form and the RoPE-table arm: the fused launch BITWISE the step form's paged arms fed
+the same tokens (two call sites of ONE addressing helper per table), the slot form bitwise the derived form, the table arm
+bitwise the per-token form, a padding sequence (``kv_lens 0``) writing nothing, a live sequence whose state entry is the null
+block or lies past the ring owning no ring in BOTH kernels (no ring row anywhere, a ring-fed block ``-2``), the table arm's host
+bound (a table of exactly the addressable positions served, one row short refused by form), the refusals in both directions,
+and the decode form's census -- four unfused launches, one fused.
 """
 
 import os
@@ -149,9 +157,16 @@ class _Chain:
         band=True,
         seed=1234,
         pad_every=5,
+        paged=False,
+        page=_PAGE,
+        cap=None,
+        ring_slots=False,
+        rope_table=False,
+        padding=(),
     ):
         dev = "cuda"
         self.dtype, self.slot_dtype, self.layout, self.apply_norm, self.band = dtype, slot_dtype, layout, apply_norm, band
+        self.paged, self.page, self.ring_slots, self.rope_table, self.padding = paged, page, ring_slots, rope_table, tuple(padding)
         self.h_q, self.h_kv, self.d, self.rope = geom["h_q"], geom["h_kv"], geom["d"], geom["rope"]
         self.h_i, self.d_i = _INDEX["heads"], _INDEX["head_dim"]
         self.B, self.S_q = batch, rows
@@ -163,7 +178,21 @@ class _Chain:
         self.arms = (
             arms
             if arms is not None
-            else (QsaPrepareIndexArms(heads=h_i, head_dim=d_i, raw_pool=True, query=True, compress=True, n_commit=n_commit is not None) if band else None)
+            else (
+                QsaPrepareIndexArms(
+                    heads=h_i,
+                    head_dim=d_i,
+                    raw_pool=True,
+                    query=True,
+                    compress=True,
+                    n_commit=n_commit is not None,
+                    paged=paged,
+                    ring_slots=ring_slots,
+                    rope_table=rope_table,
+                )
+                if band
+                else None
+            )
         )
         gen = torch.Generator(device=dev).manual_seed(seed)
 
@@ -173,13 +202,26 @@ class _Chain:
         self.slab0 = rnd(T, self.n)
         self.w_q, self.w_k = (1.0 + 0.05 * rnd(d).float()).to(dtype), (1.0 - 0.05 * rnd(d).float()).to(dtype)
         self.w_iq, self.w_ik = (1.0 + 0.03 * rnd(d_i).float()).to(dtype), (1.0 + 0.02 * rnd(d_i).float()).to(dtype)
-        self.pos0 = torch.tensor(list(pos0) if pos0 is not None else [0] * batch, dtype=torch.int32, device=dev)
+        pos0_list = list(pos0) if pos0 is not None else [0] * batch
+        self.pos0 = torch.tensor(pos0_list, dtype=torch.int32, device=dev)
+        # the paged form derives pos0 = kv_lens - S_q in-kernel: kv_lens = the KV length AFTER the step; a padding sequence has 0
+        self.kv_lens = torch.tensor([0 if b in self.padding else p + rows for b, p in enumerate(pos0_list)], dtype=torch.int32, device=dev)
         self.n_commit = None if n_commit is None else torch.tensor(list(n_commit), dtype=torch.int32, device=dev)
-        s_pos = int(self.pos0.max().item()) + rows + 8
+        # the position table holds EXACTLY the positions the compress arm's cache can address -- NB x pool on the dense form,
+        # max_pages x P on the paged one -- which is the RoPE-table arm's host bound, met with equality (the accept cell at the bound)
+        s_need = int(self.pos0.max().item()) + rows + 8
+        self.nb_cap = (s_need + _POOL - 1) // _POOL
+        self.rpp = page // _POOL
+        self.n_lpages = (self.nb_cap + self.rpp - 1) // self.rpp
+        s_pos = self.n_lpages * page if paged else self.nb_cap * _POOL
+        self.s_pos = s_pos
         inv = 1.0 / (1e7 ** (torch.arange(0, self.rope, 2, device=dev, dtype=torch.float32) / self.rope))
         emb = torch.cat([torch.arange(s_pos, device=dev, dtype=torch.float32)[:, None] * inv] * 2, -1)
         self.cos_pos, self.sin_pos = emb.cos().to(dtype)[None], emb.sin().to(dtype)[None]  # [1, S_pos, rope]: every sequence
-        tok_pos = (self.pos0[:, None].long() + torch.arange(rows, device=dev)[None, :]).reshape(T)
+        # the per-token rows at the positions the kernels derive (paged: kv_lens - S_q + j, a padding sequence's rows clamp to 0 --
+        # the RoPE-table arm's in-bounds clamp, so the table arm and the per-token form rotate every row identically)
+        eff_pos0 = (self.kv_lens.long() - rows) if paged else self.pos0.long()
+        tok_pos = (eff_pos0[:, None] + torch.arange(rows, device=dev)[None, :]).reshape(T).clamp_(0, s_pos - 1)
         self.cos_t, self.sin_t = self.cos_pos[0, tok_pos].contiguous(), self.sin_pos[0, tok_pos].contiguous()  # [T, rope] per token
         self.n_pages = T // _PAGE + 3
         self.slot = torch.randperm(self.n_pages * _PAGE, generator=gen, device=dev)[:T].to(slot_dtype)
@@ -188,13 +230,35 @@ class _Chain:
         if T > 2:
             self.slot[2] = self.n_pages * _PAGE + 7  # past the pool: writes nothing
         self.live = (self.slot >= 0) & (self.slot < self.n_pages * _PAGE)
-        self.ring_n = max(8, min_ring_rows(rows, _POOL))
-        self.ring0 = rnd(batch, self.ring_n, d_i)
-        self.nb_cap = (s_pos + _POOL - 1) // _POOL
+        self.ring_n = max(8, min_ring_rows(rows, _POOL)) if cap is None else cap
         self.sent = torch.full((), -7777.0, dtype=dtype).float().item()  # the sentinel AS THE DTYPE HOLDS IT
-        self.comp0 = torch.full((batch, self.nb_cap, d_i), self.sent, device=dev, dtype=dtype)
+        if paged:
+            # the stack's two side caches: ring blocks 1..B (block 0 null) of `cap` rows; a compressed-key cache of P / 4 rows per page
+            # behind a PERMUTED block table (page 0 unused by a live sequence); the padding sequences sit on block 0 / page 0
+            n_lpages = self.n_lpages
+            self.n_kbar_pages = 1 + batch * n_lpages  # the compressed-key cache's pages (self.n_pages is the K / V pools')
+            perm = torch.randperm(self.n_kbar_pages - 1, generator=gen, device=dev) + 1
+            self.block_table = perm.view(batch, n_lpages).to(torch.int32).contiguous()
+            self.state_table = torch.arange(1, batch + 1, device=dev, dtype=torch.int32).view(batch, 1)
+            for b in self.padding:
+                self.block_table[b] = 0
+                self.state_table[b] = 0
+            self.ring0 = rnd(batch + 1, self.ring_n, 1, d_i)
+            self.comp0 = torch.full((self.n_kbar_pages, self.rpp, 1, d_i), self.sent, device=dev, dtype=dtype)
+            pos = eff_pos0[:, None] + torch.arange(rows, device=dev)[None, :]
+            live = (pos >= 0) & (self.state_table.long() > 0)
+            self.ring_slots_t = torch.where(live, self.state_table.long() * self.ring_n + pos % self.ring_n, torch.full_like(pos, -1)).reshape(T).to(slot_dtype)
+        else:
+            self.ring0 = rnd(batch, self.ring_n, d_i)
+            self.comp0 = torch.full((batch, self.nb_cap, d_i), self.sent, device=dev, dtype=dtype)
         self.A = self._fresh()
         self.Bf = self._fresh()
+
+    def kbar_row(self, X, b, blk):
+        """Block ``blk`` of sequence ``b`` in copy ``X``'s compressed-key cache, dense or through the block table."""
+        if self.paged:
+            return X["comp"][int(self.block_table[b, blk // self.rpp]), blk % self.rpp, 0]
+        return X["comp"][b, blk]
 
     def _pool(self, h, d):
         if self.layout == "hnd":
@@ -232,7 +296,17 @@ class _Chain:
             compile_qsa_compress(dtype=dt, d=self.d_i, rope_dim=self.rope, pool=1, has_seq_lens=False, table_dtype=dt) if (a is not None and a.query) else None
         )
         self.r_step = (
-            compile_qsa_compress_step(dtype=dt, d=self.d_i, rope_dim=self.rope, pool=_POOL, has_n_commit=a.n_commit, table_dtype=dt)
+            compile_qsa_compress_step(
+                dtype=dt,
+                d=self.d_i,
+                rope_dim=self.rope,
+                pool=_POOL,
+                has_n_commit=a.n_commit,
+                table_dtype=dt,
+                paged=self.paged,
+                ring_slots=self.ring_slots,
+                ring_slot_dtype=sd,
+            )
             if (a is not None and a.compress)
             else None
         )
@@ -252,7 +326,7 @@ class _Chain:
             run_qsa_compress(
                 self.r_q1, self.cols(s, self.o_iq, self.h_i, self.d_i), X["qi"], self.w_iq, cq, sq, None, eps=_EPS, norm_weight_offset=0.0, stream=st
             )
-        if self.r_step is not None:  # the ring + the block each committed row completes
+        if self.r_step is not None:  # the ring + the block each committed row completes (the paged tables when the chain is paged)
             k_new = torch.as_strided(s, (self.B, self.S_q, self.d_i), (self.S_q * self.n, self.n, 1), s.storage_offset() + self.o_ik)
             run_qsa_compress_step(
                 self.r_step,
@@ -262,13 +336,23 @@ class _Chain:
                 self.w_ik,
                 self.cos_pos,
                 self.sin_pos,
-                self.pos0,
+                None if self.paged else self.pos0,
                 X["cslot"],
                 self.n_commit,
                 eps=_EPS,
                 norm_weight_offset=0.0,
                 stream=st,
+                **self.paged_kwargs(),
             )
+
+    def paged_kwargs(self) -> dict:
+        """The paged form's position source and tables (the step form and the fused launch share the keyword names)."""
+        if not self.paged:
+            return {}
+        kw = dict(kv_lens=self.kv_lens, block_table=self.block_table, index_state_block_table=self.state_table)
+        if self.ring_slots:
+            kw["index_state_slot_mapping"] = self.ring_slots_t
+        return kw
 
     # -- the fused launch -------------------------------------------------------------------------------------------
     def compile_fused(self):
@@ -302,10 +386,11 @@ class _Chain:
                     w_ik_norm=self.w_ik,
                     cos_pos=self.cos_pos,
                     sin_pos=self.sin_pos,
-                    pos0=self.pos0,
+                    pos0=None if self.paged else self.pos0,
                     compressed_slot=X["cslot"],
                     seq_q=self.S_q,
                     n_commit=self.n_commit,
+                    **self.paged_kwargs(),
                 )
         return kw
 
@@ -313,6 +398,7 @@ class _Chain:
         X = self.Bf if X is None else X
         s = X["slab"]
         wq, wk = (self.w_q, self.w_k) if self.apply_norm else (None, None)
+        cos_t, sin_t = (None, None) if self.rope_table else (self.cos_t, self.sin_t)  # the RoPE-table arm reads cos_pos / sin_pos at pos0 + j
         run_qsa_prepare(
             self.r_fused,
             self.cols(s, self.o_q, self.h_q, self.d),
@@ -322,8 +408,8 @@ class _Chain:
             None,
             wq,
             wk,
-            self.cos_t,
-            self.sin_t,
+            cos_t,
+            sin_t,
             X["k_pool"],
             X["v_pool"],
             self.slot,
@@ -858,3 +944,249 @@ def test_qsa_band_block_with_fuse_prepare_is_bitwise_the_two_stage_block(batch, 
     on, off = _run_block_pair(_FLASH_NEXT, batch, seq_len, qsa=qsa, pad_every=13)
     _assert_block_pair_bitwise(on, off, f"fn24-2 band B={batch} S={seq_len}")
     _assert_block_census(on, off, f"fn24-2 band B={batch} S={seq_len}", expect_fewer=2)
+
+
+# ---------------------------------------------------------------------------
+# The PAGED compress arm, the ring's slot form and the RoPE-table arm: bitwise the step form's paged arms (any CUDA device)
+# ---------------------------------------------------------------------------
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "geom, batch, rows, dtype, slot_dtype, layout, pos0, n_commit, page, cap, padding",
+    [
+        pytest.param(_GEOM_FN, 4, 4, BF16, torch.int32, "hnd", (7, 0, 13, 2048), None, 16, 8, (), id="fn_b4_r4_bf16_i32_p16_cap8"),
+        pytest.param(_GEOM_FN, 4, 1, F16, torch.int64, "nhd", (3, 0, 11, 2050), None, 32, 4, (), id="fn_b4_r1_f16_i64_p32_cap4"),
+        pytest.param(_GEOM_D128, 3, 5, BF16, torch.int64, "hnd", (2, 7, 0), (1, 3, 0), 64, 8, (), id="d128_b3_r5_commit_prefixes_p64"),
+        pytest.param(_GEOM_SMALL, 2, 3, BF16, torch.int32, "nhd", (1, 5), (3, 2), 16, 8, (), id="small_b2_r3_boundaries_p16"),
+        pytest.param(_GEOM_SMALL, 3, 4, BF16, torch.int32, "hnd", (9, 0, 4), None, 16, 8, (1,), id="small_b3_r4_padding_sequence"),
+    ],
+)
+def test_paged_fused_prepare_is_bitwise_the_paged_step_form(geom, batch, rows, dtype, slot_dtype, layout, pos0, n_commit, page, cap, padding):
+    """The decode step's prepare with the PAGED compress arm -- the ring blocks behind the state table, the compressed-key cache
+    through a permuted block table at P 16 / 32 / 64, the positions from ``kv_lens`` -- bitwise the unfused chain whose step form
+    runs the SAME paged arms (two call sites of one addressing helper per table): Q / K, the pools, the indexer queries, the ring,
+    the cache and the slot report; V / GATE / INDEX untouched; the padding sequence (``kv_lens 0`` on the null block / page 0)
+    writes nothing and reports -1."""
+    ch = _chain(
+        geom,
+        batch=batch,
+        rows=rows,
+        dtype=dtype,
+        slot_dtype=slot_dtype,
+        layout=layout,
+        pos0=pos0,
+        n_commit=n_commit,
+        paged=True,
+        page=page,
+        cap=cap,
+        padding=padding,
+    )
+    ch.assert_bitwise(f"paged {batch}x{rows} {dtype} {slot_dtype} {layout} P{page} cap{cap}")
+    cs = ch.Bf["cslot"]
+    if n_commit is not None:
+        for b, nc in enumerate(n_commit):
+            assert (cs[b, nc:] == -1).all(), f"sequence {b}: rows past n_commit={nc} must report -1"
+    for b in padding:
+        assert (cs[b] == -1).all(), f"padding sequence {b} must report -1 on every row"
+    if padding:
+        # the null ring block keeps the chain's prior random state bit for bit (nothing is written there); page 0 keeps its sentinel
+        assert _same(ch.Bf["ring"][0], ch.ring0[0]) and bool((ch.Bf["comp"][0].float() == ch.sent).all()), "the null ring block / page 0 were written"
+    # the compressed rows the slot report names are the blocks of their sequences, through the table
+    for b in range(batch):
+        for j, blk in enumerate(cs[b].tolist()):
+            if blk >= 0:
+                assert bool((ch.kbar_row(ch.Bf, b, blk).float() != ch.sent).any()), f"sequence {b} row {j}: block {blk} reported but its cache row is untouched"
+
+
+@requires_cuda
+@pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64], ids=["slots_i32", "slots_i64"])
+def test_paged_ring_slot_form_is_bitwise_the_derived_form(slot_dtype):
+    """The ring's WRITE rows named by the stack's own slot mapping (``block x cap + pos % cap``, ``-1`` on a dead row; the slots share
+    the artifact's slot dtype) against the rows the kernel derives from the state table: the fused launch and the step form,
+    bitwise -- ring, cache, slot report -- with a padding sequence in the batch."""
+    kw = dict(batch=3, rows=4, slot_dtype=slot_dtype, pos0=(5, 0, 14), paged=True, page=16, cap=8, padding=(1,))
+    derived = _chain(_GEOM_SMALL, **kw)
+    derived.assert_bitwise("paged, derived ring rows")
+    explicit = _chain(_GEOM_SMALL, ring_slots=True, **kw)
+    explicit.assert_bitwise("paged, the stack's ring slots")
+    assert explicit.arms.ring_slots and explicit.r_fused.index.ring_slots and explicit.r_step.ring_slots
+    for key in ("slab", "qi", "ring", "comp", "cslot"):
+        assert _same(explicit.Bf[key], derived.Bf[key]), key
+    assert int((explicit.ring_slots_t < 0).sum()) == 4, "the padding sequence's four rows carry slot -1"
+
+
+@requires_cuda
+def test_paged_state_entry_past_the_ring_or_null_owns_no_ring_in_both_kernels():
+    """A LIVE sequence whose state-table entry lies one past the ring's last block (the off-by-one of a ring allocated one block per
+    request while the ids start at 1) or is the null block owns no ring in the fused launch AND in the step form (the one shared
+    ``ring_entry``): not one ring byte changes for it, a block pooled from this step's rows alone is still written, a block that
+    needs ring rows it does not own reports ``-2`` and keeps its page row at the sentinel; the two kernels bitwise each other."""
+    ch = _Chain(_GEOM_SMALL, batch=3, rows=4, pos0=(8, 5, 0), paged=True, page=16, cap=8)
+    ch.state_table[0, 0] = int(ch.ring0.shape[0])  # one past the ring's blocks 0 .. B
+    ch.state_table[1, 0] = 0  # the null block, kv_lens 9: the row at position 7 completes block 1, which needs ring row 4
+    ch.compile_unfused()
+    ch.compile_fused()
+    ch.run_unfused()
+    ch.run_fused()
+    ch.assert_bitwise("state entries past the ring / null")
+    cs = ch.Bf["cslot"].tolist()
+    assert cs == [[-1, -1, -1, 2], [-1, -1, -2, -1], [-1, -1, -1, 0]], cs
+    # ring blocks 0 .. 2 keep the chain's prior state bit for bit (no ring row for sequences 0 / 1); sequence 2's block 3 holds its raw keys
+    assert _same(ch.Bf["ring"][:3], ch.ring0[:3]), "a sequence that owns no ring wrote a ring row"
+    raw = ch.cols(ch.slab0, ch.o_ik, 1, ch.d_i)
+    for j in range(4):
+        assert _same(ch.Bf["ring"][3, j % ch.ring_n, 0], raw[2 * 4 + j, 0]), j
+    # the page rows: sequence 0's block 2 written (its own four rows), sequence 1's block 1 at the sentinel
+    assert bool((ch.kbar_row(ch.Bf, 0, 2).float() != ch.sent).any()) and bool((ch.kbar_row(ch.Bf, 1, 1).float() == ch.sent).all())
+
+
+@requires_cuda
+@pytest.mark.parametrize("paged", [False, True], ids=["dense_state", "paged_state"])
+def test_rope_table_arm_is_bitwise_the_per_token_form(paged):
+    """``cos`` / ``sin`` None: the Q / K rows and the indexer-query rows read the position-indexed ``cos_pos`` / ``sin_pos`` at
+    ``pos0 + j`` -- bitwise the per-token form fed the rows gathered at the same positions (the padding sequence's rows at the
+    table's row 0, the arm's in-bounds clamp), on the dense and the paged compress arm; the unfused chain stays the per-token form."""
+    kw = dict(batch=3, rows=4, pos0=(6, 0, 21), paged=paged, page=16, cap=8, padding=(1,) if paged else ())
+    per_token = _chain(_GEOM_SMALL, **kw)
+    per_token.assert_bitwise(f"per-token rows, paged={paged}")
+    table = _chain(_GEOM_SMALL, rope_table=True, **kw)
+    table.assert_bitwise(f"RoPE-table arm, paged={paged}")
+    assert table.r_fused.index.rope_table
+    for key in ("slab", "qi", "ring", "comp", "cslot"):
+        assert _same(table.Bf[key], per_token.Bf[key]), key
+    assert _same(table.Bf["k_pool"].contiguous(), per_token.Bf["k_pool"].contiguous())
+    # the table arm's host bound: the table must cover every position the compress arm's cache can address (paged: the block table's
+    # width x P; dense: NB x pool).  The chain's table holds EXACTLY that many rows (the accept cell at the bound, run above); one row
+    # short is refused BY FORM, so the in-kernel clamp is never a live row's path.
+    bound = table.n_lpages * table.page if paged else table.nb_cap * _POOL
+    assert table.cos_pos.shape[1] == bound, (table.cos_pos.shape, bound)
+    X = table.Bf
+    short = dict(table.fused_kwargs(X))
+    short.update(cos_pos=table.cos_pos[:, : bound - 1].contiguous(), sin_pos=table.sin_pos[:, : bound - 1].contiguous())
+    with pytest.raises(ValueError, match=f"hand a table of at least {bound} rows"):
+        run_qsa_prepare(
+            table.r_fused,
+            table.cols(X["slab"], table.o_q, table.h_q, table.d),
+            table.cols(X["slab"], table.o_k, table.h_kv, table.d),
+            table.cols(X["slab"], table.o_v, table.h_kv, table.d),
+            None,
+            None,
+            table.w_q,
+            table.w_k,
+            None,
+            None,
+            X["k_pool"],
+            X["v_pool"],
+            table.slot,
+            index_eps=_EPS,
+            index_norm_weight_offset=0.0,
+            stream=_stream(),
+            **short,
+        )
+
+
+@requires_cuda
+@pytest.mark.parametrize("rows", [1, 4], ids=["one_token", "mtp_four_rows"])
+def test_paged_decode_form_census_four_unfused_one_fused(rows):
+    """MEASURED, not asserted from the code: the decode indexer's prepare chain with the arms the serving step binds
+    (``raw_pool=False, query=True, compress=True, paged=True``: no raw-key pool -- the ring replaces it) is FOUR kernel launches
+    unfused -- norm + RoPE, the K / V cache write, the indexer queries' norm, the paged ring + compress -- and ONE fused, by the
+    CUDA profiler's census; the outputs bitwise."""
+    arms = QsaPrepareIndexArms(heads=4, head_dim=128, raw_pool=False, query=True, compress=True, paged=True)
+    ch = _Chain(_GEOM_FN, batch=4, rows=rows, pos0=(7, 0, 13, 2048), arms=arms, paged=True, page=16, cap=8)
+    ch.compile_unfused()
+    ch.compile_fused()
+    names = _launch_names(ch.run_unfused, ch.run_fused)
+    if names is None:
+        pytest.skip("the CUDA profiler recorded no kernel activity on this box (CUPTI unavailable); the bitwise cells stand")
+    unfused, fused = names
+    print(
+        f"paged census B=4 rows={rows}: unfused {len(unfused)} {[n.split('_tensorptr')[0] for n in unfused]}; fused {len(fused)} {[n.split('_tensorptr')[0] for n in fused]}"
+    )
+    assert len(fused) == 1 and "frost_qsa_prepare" in fused[0]
+    assert len(unfused) == 4 and sum("frost_qsa_compress_step" in n for n in unfused) == 1
+    ch.assert_bitwise(f"paged census B=4 rows={rows}")
+
+
+@requires_cuda
+def test_paged_run_rejects_contract_violations():
+    """Typed refusals, both directions: ``pos0`` on the paged arm, the paged operands missing or handed to a dense recipe, the
+    stack's slots on a recipe that derives the rows (and the other way round), a dense 3-D ring on the paged arm, the e4m3
+    cache, ``cos`` / ``sin`` handed to the RoPE-table arm or missing without it."""
+    ch = _Chain(_GEOM_SMALL, batch=2, rows=4, pos0=(0, 8), paged=True, page=16, cap=8)
+    ch.compile_fused()
+    X = ch.Bf
+    base = ch.fused_kwargs(X)
+    q, k, v = ch.cols(X["slab"], ch.o_q, ch.h_q, ch.d), ch.cols(X["slab"], ch.o_k, ch.h_kv, ch.d), ch.cols(X["slab"], ch.o_v, ch.h_kv, ch.d)
+
+    def run(r=None, cos_t=ch.cos_t, sin_t=ch.sin_t, **over):
+        kw = dict(base)
+        kw.update(over)
+        run_qsa_prepare(
+            ch.r_fused if r is None else r, q, k, v, None, None, ch.w_q, ch.w_k, cos_t, sin_t, X["k_pool"], X["v_pool"], ch.slot, stream=_stream(), **kw
+        )
+
+    with pytest.raises(ValueError, match="pos0 is refused on the paged form"):
+        run(pos0=ch.pos0)
+    with pytest.raises(ValueError, match="kv_lens .* block_table .* index_state_block_table .* must be bound"):
+        run(block_table=None)
+    with pytest.raises(ValueError, match="index_state_slot_mapping would be silently ignored"):
+        run(index_state_slot_mapping=torch.full((ch.T,), -1, dtype=torch.int32, device="cuda"))
+    with pytest.raises(ValueError, match=r"ring must be a 4-D \[blocks >= 1, rows, 1, D=128\]"):
+        run(ring=torch.empty(2, 8, 128, device="cuda", dtype=BF16))
+    with pytest.raises(ValueError, match="ring holds 4 rows per block; this launch needs at least 7"):
+        run(ring=torch.empty(3, 4, 1, 128, device="cuda", dtype=BF16))
+    with pytest.raises(NotImplementedError, match="e4m3 compressed-key cache store"):
+        run(index_k_compressed=torch.empty(ch.n_kbar_pages, ch.rpp, 1, 128, device="cuda", dtype=torch.float8_e4m3fn))
+    with pytest.raises(ValueError, match="raw-key ring is a bit copy .* never quantized"):  # an e4m3 RING is a form error, not the cache's decline
+        run(ring=torch.empty(3, 8, 1, 128, device="cuda", dtype=torch.float8_e4m3fn))
+    with pytest.raises(ValueError, match="kv_lens must be a contiguous int32"):
+        run(kv_lens=ch.kv_lens.to(torch.int64))
+    # the dense recipe refuses every paged keyword; the paged recipe's compress arm cannot be bound a dense ring
+    dense = compile_qsa_prepare(dtype=BF16, h_q=ch.h_q, h_kv=ch.h_kv, d=ch.d, rope_dim=ch.rope, eps=_EPS, page_size=_PAGE, index=ch.arms._replace(paged=False))
+    with pytest.raises(ValueError, match="compiled WITHOUT the paged compress arms"):
+        run(dense, ring=torch.empty(2, 8, 128, device="cuda", dtype=BF16), index_k_compressed=torch.empty(2, 16, 128, device="cuda", dtype=BF16), pos0=ch.pos0)
+    # the ring's slot arm, both directions
+    slots = compile_qsa_prepare(
+        dtype=BF16, h_q=ch.h_q, h_kv=ch.h_kv, d=ch.d, rope_dim=ch.rope, eps=_EPS, page_size=_PAGE, index=ch.arms._replace(ring_slots=True)
+    )
+    with pytest.raises(ValueError, match="bind index_state_slot_mapping"):
+        run(slots)
+    with pytest.raises(ValueError, match="index_state_slot_mapping must be a contiguous torch.int32"):
+        run(slots, index_state_slot_mapping=torch.full((ch.T,), -1, dtype=torch.int64, device="cuda"))
+    # the RoPE-table arm, both directions
+    table = compile_qsa_prepare(
+        dtype=BF16, h_q=ch.h_q, h_kv=ch.h_kv, d=ch.d, rope_dim=ch.rope, eps=_EPS, page_size=_PAGE, index=ch.arms._replace(rope_table=True)
+    )
+    with pytest.raises(ValueError, match="cos / sin are refused on a recipe that traced the RoPE-table arm"):
+        run(table)
+    with pytest.raises(ValueError, match="per-token tables are required"):
+        run(cos_t=None, sin_t=None)
+
+
+@requires_cuda
+def test_compile_rejects_unsupported_paged_declarations_and_keys_the_arms():
+    """``paged`` needs ``compress``; ``ring_slots`` needs ``paged``; ``rope_table`` needs ``compress`` and a rotation; the e4m3 cache is
+    the typed decline of a follow-up; a non-io cache dtype a ``ValueError``.  Every arm is a compile key: the paged, the slot and
+    the table artifacts are distinct from the dense one and from each other, and the same key returns the same artifact."""
+    base = dict(dtype=BF16, h_q=8, h_kv=2, d=256, rope_dim=64, eps=_EPS, page_size=16)
+    with pytest.raises(ValueError, match="index.paged .* needs index.compress=True"):
+        compile_qsa_prepare(index=QsaPrepareIndexArms(heads=4, head_dim=128, compress=False, paged=True), **base)
+    with pytest.raises(ValueError, match="index.ring_slots .* needs index.paged=True"):
+        compile_qsa_prepare(index=QsaPrepareIndexArms(heads=4, head_dim=128, compress=True, ring_slots=True), **base)
+    with pytest.raises(ValueError, match="index.rope_table .* needs index.compress=True"):
+        compile_qsa_prepare(index=QsaPrepareIndexArms(heads=4, head_dim=128, compress=False, rope_table=True), **base)
+    with pytest.raises(ValueError, match="rope_dim=0"):
+        compile_qsa_prepare(index=QsaPrepareIndexArms(heads=4, head_dim=128, compress=True, rope_table=True), **dict(base, rope_dim=0))
+    with pytest.raises(NotImplementedError, match="e4m3 compressed-key cache store"):
+        compile_qsa_prepare(index=QsaPrepareIndexArms(heads=4, head_dim=128, compress=True, paged=True), index_cache_dtype=torch.float8_e4m3fn, **base)
+    with pytest.raises(ValueError, match="must hold the activation dtype"):
+        compile_qsa_prepare(index=QsaPrepareIndexArms(heads=4, head_dim=128, compress=True, paged=True), index_cache_dtype=torch.float32, **base)
+    arms = QsaPrepareIndexArms(heads=4, head_dim=128, raw_pool=False, query=True, compress=True)
+    recipes = [
+        compile_qsa_prepare(index=a, **base)
+        for a in (arms, arms._replace(paged=True), arms._replace(paged=True, ring_slots=True), arms._replace(paged=True, rope_table=True))
+    ]
+    assert len({id(r.compiled) for r in recipes}) == 4
+    assert compile_qsa_prepare(index=arms._replace(paged=True), **base).compiled is recipes[1].compiled

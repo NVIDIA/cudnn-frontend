@@ -10,6 +10,14 @@ finishing at different steps) produces the prefill compress of the same tokens b
 an incomplete group, and a rejected draft (a row past the accepted prefix) leaves no trace in the ring or in the
 cache -- the next step with the true tokens recovers the prefill result.  Plain vectorized LDG/STG plus warp
 shuffles, so these tests run on whatever CUDA device is at hand.
+
+The PAGED form (the serving stack's ring blocks behind a state table and its compressed-key cache through the main block
+table, positions from ``kv_lens``): a token stream through the paged form is bitwise the dense form and the prefill
+compress at every page size, the derived ring rows are the stack's own ``block x cap + pos % cap`` slots and the explicit
+slot form is bitwise the derived one, a padding sequence (``kv_lens 0``) writes nothing, a block past the table or on an
+unassigned page reports ``-2``, a live sequence whose state entry is the null block or lies past the ring owns no ring (no ring
+row anywhere; a block needing ring rows ``-2``, one from the step's rows alone written), one artifact serves every page size and
+ring capacity, the launch is ONE kernel with no allocation, and every refusal is typed in both directions.
 """
 
 import os
@@ -26,6 +34,7 @@ if requirement_error:
 
 from cudnn.gated_attention_block.kernels.qsa_compress import (
     DEFAULT_POOL,
+    E4M3_STORE_DECLINE,
     SLOT_CAPACITY,
     SLOT_NO_BLOCK,
     QsaCompressStepRecipe,
@@ -453,3 +462,561 @@ def test_compile_rejects_unsupported_dtypes():
         compile_qsa_compress_step(dtype=torch.float32, d=_D, rope_dim=_ROPE)
     with pytest.raises(ValueError, match="16-bit cos"):
         compile_qsa_compress_step(dtype=torch.bfloat16, d=_D, rope_dim=_ROPE, table_dtype=torch.float32)
+
+
+# ---------------------------------------------------------------------------
+# The PAGED form: the stack's ring and compressed-key cache through their block tables, bitwise the dense step form
+# ---------------------------------------------------------------------------
+
+
+def _sent_of(dtype) -> float:
+    """The sentinel AS THE DTYPE HOLDS IT (bf16 rounds -7777.0): the only value a 'row untouched' check may compare against."""
+    return torch.full((), _SENTINEL, dtype=dtype).float().item()
+
+
+class _Paged:
+    """The serving stack's two side caches for a batch: ring blocks ``1 .. B`` (block 0 is the null block) of ``cap`` rows each,
+    and a compressed-key cache of ``P / 4`` rows per attention page behind a PERMUTED block table (page 0 unused by any live
+    sequence); the sequences in ``padding`` sit on block 0 / page 0 with ``kv_lens 0``."""
+
+    def __init__(self, batch, s_tok, dtype, *, page, cap, padding=(), seed=0, table_pages=None):
+        self.rpp, self.cap, self.page, self.batch, self.dtype = page // _POOL, cap, page, batch, dtype
+        n_lpages = (s_tok // _POOL + self.rpp - 1) // self.rpp if table_pages is None else table_pages
+        self.n_pages = 1 + batch * max(n_lpages, 1)
+        g = torch.Generator(device="cuda").manual_seed(seed + 100)
+        perm = torch.randperm(self.n_pages - 1, generator=g, device="cuda") + 1
+        self.block_table = perm[: batch * n_lpages].view(batch, n_lpages).to(torch.int32).contiguous()
+        self.state_table = torch.arange(1, batch + 1, device="cuda", dtype=torch.int32).view(batch, 1)
+        for b in padding:
+            self.block_table[b] = 0
+            self.state_table[b] = 0
+        self.ring = _sentinel(batch + 1, cap, 1, _D, dtype=dtype)
+        self.cache = _sentinel(self.n_pages, self.rpp, 1, _D, dtype=dtype)
+        self.sent = _sent_of(dtype)
+
+    def kbar_row(self, b, blk):
+        return self.cache[int(self.block_table[b, blk // self.rpp]), blk % self.rpp, 0]
+
+    def ring_row(self, b, pos):
+        return self.ring[int(self.state_table[b, 0]), pos % self.cap, 0]
+
+    def rows_written(self) -> int:
+        return int((self.cache.float() != self.sent).any(-1).sum())
+
+    def fill_ring_from_prefix(self, k_raw, pos0):
+        """The ring state after committing positions ``[0, pos0[b])``: row ``p % cap`` of the sequence's block holds the raw key of
+        position ``p`` for the last ``cap`` committed positions (the paged twin of ``_ring_from_prefix``)."""
+        for b in range(self.batch):
+            for p in range(max(0, int(pos0[b]) - self.cap), int(pos0[b])):
+                self.ring[int(self.state_table[b, 0]), p % self.cap, 0] = k_raw[b, p]
+
+    def ring_slots(self, kv_lens, rows, dtype=torch.int64) -> torch.Tensor:
+        """The stack's own ring slot mapping, ``block x cap + pos % cap`` for a live row (``pos >= 0``, a ring block ``> 0``) and
+        ``-1`` otherwise -- the CircularBufferSpec formula, spelled on the host as the kernel's derived form must agree with it."""
+        pos = torch.tensor([[kv - rows + j for j in range(rows)] for kv in kv_lens], device="cuda", dtype=torch.int64)
+        blk = self.state_table.long()
+        live = (pos >= 0) & (blk > 0)
+        return torch.where(live, blk * self.cap + pos % self.cap, torch.full_like(pos, -1)).reshape(-1).to(dtype)
+
+
+def _step_paged(pg: _Paged, k_new, w, cos, sin, kv_lens, n_commit=None, *, offset=1.0, ring_slots=None, **kw):
+    """One paged decode step; returns the per-row slot report."""
+    slot = torch.full(tuple(k_new.shape[:2]), -9, dtype=torch.int32, device="cuda")
+    build_qsa_compress_step(
+        k_new,
+        pg.ring,
+        pg.cache,
+        w,
+        cos,
+        sin,
+        None,
+        slot,
+        n_commit,
+        rope_dim=_ROPE,
+        eps=_EPS,
+        norm_weight_offset=offset,
+        stream=_stream(),
+        kv_lens=_i32(kv_lens),
+        block_table=pg.block_table,
+        index_state_block_table=pg.state_table,
+        index_state_slot_mapping=ring_slots,
+        **kw,
+    )
+    torch.cuda.synchronize()
+    return slot
+
+
+def _run_stream_paged(k_raw, lens, schedule, *, w, cos, sin, offset, page, cap, padding=(), seed=0, use_slots=None):
+    """The paged twin of ``_run_stream``: every step carries ``rows`` rows per sequence with ``kv_lens = pos + rows`` (the KV length
+    after the step, the stack's ``seq_lens``) and the accepted prefix in ``n_commit``; a padding sequence keeps ``kv_lens 0``."""
+    batch, s_tok, _ = k_raw.shape
+    pg = _Paged(batch, s_tok, k_raw.dtype, page=page, cap=cap, padding=padding, seed=seed)
+    pos = [0] * batch
+    slots = [[] for _ in range(batch)]
+    step = 0
+    while any(pos[b] < lens[b] for b in range(batch)):
+        rows = schedule[step % len(schedule)]
+        step += 1
+        k_new = torch.full((batch, rows, _D), float("nan"), device="cuda", dtype=k_raw.dtype)
+        n_commit, kv_lens = [], []
+        for b in range(batch):
+            take = max(0, min(rows, lens[b] - pos[b]))
+            if take:
+                k_new[b, :take] = k_raw[b, pos[b] : pos[b] + take]
+            n_commit.append(take)
+            kv_lens.append(pos[b] + rows if b not in padding else 0)
+        rs = pg.ring_slots(kv_lens, rows, dtype=use_slots) if use_slots is not None else None
+        slot = _step_paged(pg, k_new, w, cos, sin, kv_lens, _i32(n_commit), offset=offset, ring_slots=rs)
+        for b in range(batch):
+            slots[b].extend(slot[b].tolist())
+            pos[b] += n_commit[b]
+    return pg, slots
+
+
+@requires_cuda
+@pytest.mark.parametrize("page", [16, 32, 64], ids=["p16", "p32", "p64"])
+@pytest.mark.parametrize("schedule", [[1], [4], [1, 4, 2, 3, 5, 1, 2, 4]], ids=["one_row_steps", "four_row_steps", "mixed_steps"])
+def test_paged_step_stream_is_bitwise_the_dense_step_and_the_prefill_compress(schedule, page):
+    """The same token stream through the dense step form and the PAGED one (ring blocks behind the state table, the cache's rows
+    through a permuted block table at P 16 / 32 / 64 -- 4 / 8 / 16 compressed rows per page, so the blocks cross page boundaries):
+    every compressed row the paged form writes is bitwise the dense form's and the prefill kernel's, the slot reports are
+    identical step by step, exactly the live blocks are written (page 0 and the null ring block untouched -- the padding
+    sequence has ``kv_lens 0``), and the ring holds the last ``cap`` raw keys of every live sequence bit for bit."""
+    dtype, cap = torch.bfloat16, 8  # cap 8 serves steps of up to 5 rows (min_ring_rows(5) == 8)
+    s_tok, lens = 517, [517, 510, 37, 0]
+    batch = len(lens)
+    k_raw, w, cos, sin = _make(batch, s_tok, dtype, seed=21)
+    ref, n_blocks = _prefill(k_raw, w, cos, sin, _i32(lens), offset=1.0)
+    out_d, ring_d, slots_d = _run_stream(k_raw, lens, schedule, w=w, cos=cos, sin=sin, offset=1.0)
+    pg, slots_p = _run_stream_paged(k_raw, lens, schedule, w=w, cos=cos, sin=sin, offset=1.0, page=page, cap=cap, padding=(3,))
+    assert slots_p == slots_d, "the paged form's slot reports differ from the dense form's"
+    for b in range(batch):
+        nb = int(n_blocks[b])
+        for blk in range(nb):
+            row = pg.kbar_row(b, blk)
+            assert torch.equal(
+                row.view(torch.int16), ref[b, blk].view(torch.int16)
+            ), f"sequence {b} block {blk}: the paged compress differs from the prefill compress"
+            assert torch.equal(
+                row.view(torch.int16), out_d[b, blk].view(torch.int16)
+            ), f"sequence {b} block {blk}: the paged compress differs from the dense step form"
+        for p in range(max(0, lens[b] - cap), lens[b]):
+            assert torch.equal(pg.ring_row(b, p).view(torch.int16), k_raw[b, p].view(torch.int16)), f"sequence {b}: ring row of position {p} is not its raw key"
+    assert pg.rows_written() == sum(int(n) for n in n_blocks), "rows written != the live blocks"
+    assert bool((pg.cache[0].float() == pg.sent).all()) and bool((pg.ring[0].float() == pg.sent).all()), "page 0 / the null ring block were written"
+
+
+@requires_cuda
+@pytest.mark.parametrize("k", [16, 19], ids=["first_row_of_a_page", "last_row_of_a_page"])
+def test_a_block_completes_at_the_fourth_token_on_either_side_of_a_page_boundary(k):
+    """P = 16 (four compressed rows per page): block ``k`` completes at its 4th token from the step's own rows and lands on row
+    ``k % 4`` of page ``block_table[b, k // 4]`` -- the first row of a page at k = 16, the last at k = 19 -- bitwise the prefill row;
+    the four raw keys enter the ring; nothing else moves."""
+    dtype, s_tok = torch.bfloat16, 128
+    k_raw, w, cos, sin = _make(2, s_tok, dtype, seed=22)
+    ref, _ = _prefill(k_raw, w, cos, sin, _i32([s_tok, s_tok]))
+    pg = _Paged(2, s_tok, dtype, page=16, cap=8, seed=22)
+    cache_before, ring_before = pg.cache.clone(), pg.ring.clone()
+    pos0 = 4 * k
+    slot = _step_paged(pg, k_raw[:, pos0 : pos0 + 4].contiguous(), w, cos, sin, [pos0 + 4] * 2)
+    assert slot.tolist() == [[-1, -1, -1, k]] * 2
+    for b in range(2):
+        assert torch.equal(pg.kbar_row(b, k).view(torch.int16), ref[b, k].view(torch.int16))
+        page, row = int(pg.block_table[b, k // 4]), k % 4
+        assert row == (0 if k == 16 else 3)
+        cache_before[page, row, 0] = pg.cache[page, row, 0]
+        for p in range(pos0, pos0 + 4):
+            assert torch.equal(pg.ring_row(b, p).view(torch.int16), k_raw[b, p].view(torch.int16))
+            ring_before[int(pg.state_table[b, 0]), p % 8, 0] = pg.ring_row(b, p)
+    assert torch.equal(pg.cache.view(torch.int16), cache_before.view(torch.int16)) and torch.equal(pg.ring.view(torch.int16), ring_before.view(torch.int16))
+
+
+@requires_cuda
+@pytest.mark.parametrize("cap, rows", [(4, 1), (8, 1), (8, 2), (8, 3), (8, 4)], ids=["cap4_sq1", "cap8_sq1", "cap8_sq2", "cap8_sq3", "cap8_sq4"])
+@pytest.mark.parametrize("slot_dtype", [torch.int64, torch.int32], ids=["slots_i64", "slots_i32"])
+def test_derived_ring_rows_are_the_circular_buffer_slots_and_the_slot_form_is_bitwise(cap, rows, slot_dtype):
+    """After one step the ring rows the kernel derived are exactly the stack's own slots ``block x cap + pos % cap`` (``_Paged.ring_slots``,
+    the CircularBufferSpec formula; the ring capacities a stack allocates: 4 at one row per step, 8 with speculative rows), and
+    the explicit-slot form fed those slots (int64 or int32) is bitwise the derived form -- ring, cache and slot report."""
+    dtype, s_tok, batch = torch.float16, 64, 3
+    k_raw, w, cos, sin = _make(batch, s_tok, dtype, seed=23)
+    pos0 = [4 * 5 + 1, 4 * 3, 4 * 7 + 3]  # the ring rows land on different residues of cap
+    k_new = torch.stack([k_raw[b, p : p + rows] for b, p in enumerate(pos0)]).contiguous()
+    kv_lens = [p + rows for p in pos0]
+    derived = _Paged(batch, s_tok, dtype, page=16, cap=cap, seed=23)
+    slot_d = _step_paged(derived, k_new, w, cos, sin, kv_lens)
+    flat = derived.ring.view(-1, _D)  # the ring's blocks are contiguous: flat row = block x cap + row
+    slots = derived.ring_slots(kv_lens, rows, dtype=slot_dtype)
+    for b in range(batch):
+        for j in range(rows):
+            s = int(slots[b * rows + j])
+            assert s == int(derived.state_table[b, 0]) * cap + (pos0[b] + j) % cap
+            assert torch.equal(flat[s].view(torch.int16), k_new[b, j].view(torch.int16)), f"sequence {b} row {j}: the derived ring row is not slot {s}"
+    n_rows_written = int((derived.ring.float() != derived.sent).any(-1).sum())
+    assert n_rows_written == batch * rows
+    explicit = _Paged(batch, s_tok, dtype, page=16, cap=cap, seed=23)
+    slot_e = _step_paged(explicit, k_new, w, cos, sin, kv_lens, ring_slots=slots)
+    assert torch.equal(explicit.ring.view(torch.int16), derived.ring.view(torch.int16)) and torch.equal(
+        explicit.cache.view(torch.int16), derived.cache.view(torch.int16)
+    )
+    assert torch.equal(slot_e, slot_d)
+
+
+@requires_cuda
+def test_kv_lens_zero_rows_write_nothing_and_report_minus_one():
+    """A padding sequence (``kv_lens 0``, the null ring block, page 0 in its table row) between two live ones: its rows are dead --
+    no ring row, no block, every slot ``-1`` -- and the null block and page 0 keep their sentinel bit for bit; the live sequences
+    are served bitwise the dense step form.  The dense form has no such row (a negative ``pos0`` is its first step), so the
+    padding sequence there is a finished one (``n_commit 0``)."""
+    dtype, s_tok, batch = torch.bfloat16, 96, 3
+    k_raw, w, cos, sin = _make(batch, s_tok, dtype, seed=24)
+    ref, _ = _prefill(k_raw, w, cos, sin, _i32([s_tok] * batch))
+    pos0 = [4 * 6, 0, 4 * 9]  # the padding sequence's pos0 is irrelevant: kv_lens 0 -> every position negative
+    kv_lens = [pos0[0] + 4, 0, pos0[2] + 4]
+    k_new = torch.stack([k_raw[b, p : p + 4] for b, p in enumerate(pos0)]).contiguous()
+    k_new[1] = torch.randn(4, _D, device="cuda").to(dtype)  # whatever a padding row carries must never be read into a write
+    pg = _Paged(batch, s_tok, dtype, page=16, cap=8, padding=(1,), seed=24)
+    slot = _step_paged(pg, k_new, w, cos, sin, kv_lens)
+    assert slot.tolist() == [[-1, -1, -1, 6], [-1, -1, -1, -1], [-1, -1, -1, 9]]
+    assert bool((pg.ring[0].float() == pg.sent).all()), "the null ring block was written"
+    assert bool((pg.cache[0].float() == pg.sent).all()), "page 0 was written"
+    assert pg.rows_written() == 2
+    for b, k in ((0, 6), (2, 9)):
+        assert torch.equal(pg.kbar_row(b, k).view(torch.int16), ref[b, k].view(torch.int16))
+    # the dense twin on the live sequences (the padding one as a finished sequence): the same rows, bit for bit
+    ring_d = _ring_from_prefix(k_raw, pos0, _RING)
+    out_d = _sentinel(batch, s_tok // _POOL, _D, dtype=dtype)
+    slot_d = _step(k_new, ring_d, out_d, w, cos, sin, _i32(pos0), _i32([4, 0, 4]))
+    assert slot_d.tolist() == slot.tolist()
+    for b, k in ((0, 6), (2, 9)):
+        assert torch.equal(pg.kbar_row(b, k).view(torch.int16), out_d[b, k].view(torch.int16))
+
+
+@requires_cuda
+def test_rows_below_position_zero_are_dead_and_the_rest_are_served():
+    """``kv_lens < S_q`` (a sequence's very first step has fewer real tokens than the step's rows): the rows at negative positions are
+    dead (``-1``), the rows at positions ``0 .. kv_lens - 1`` enter the ring, and the block completing at position 3 is pooled from
+    the step's own rows -- bitwise the prefill compress of those tokens."""
+    dtype, s_tok = torch.bfloat16, 64
+    k_raw, w, cos, sin = _make(1, s_tok, dtype, seed=25)
+    ref, _ = _prefill(k_raw, w, cos, sin, _i32([s_tok]))
+    rows = 5
+    k_new = torch.full((1, rows, _D), float("nan"), device="cuda", dtype=dtype)
+    k_new[0, 1:] = k_raw[0, :4]  # kv_lens 4 with 5 rows: row 0 sits at position -1
+    pg = _Paged(1, s_tok, dtype, page=16, cap=8, seed=25)
+    slot = _step_paged(pg, k_new, w, cos, sin, [4])
+    assert slot.tolist() == [[-1, -1, -1, -1, 0]]
+    assert torch.equal(pg.kbar_row(0, 0).view(torch.int16), ref[0, 0].view(torch.int16))
+    for p in range(4):
+        assert torch.equal(pg.ring_row(0, p).view(torch.int16), k_raw[0, p].view(torch.int16))
+    assert int((pg.ring.float() != pg.sent).any(-1).sum()) == 4 and pg.rows_written() == 1
+
+
+@requires_cuda
+def test_paged_capacity_reports_minus_two_and_writes_nothing():
+    """A completing row whose block lies past the block table's width, on a negative (unassigned) page, or on a page past the
+    cache reports ``-2`` and writes no block; its raw key still enters the ring (it is committed)."""
+    dtype, s_tok = torch.bfloat16, 128
+    k_raw, w, cos, sin = _make(1, s_tok, dtype, seed=26)
+    k = 7
+    pos0 = 4 * k
+    k_new = k_raw[:, pos0 : pos0 + 4].contiguous()
+    # (a) a table of 1 page (4 compressed rows) holds blocks 0 .. 3 only
+    pg = _Paged(1, s_tok, dtype, page=16, cap=8, seed=26, table_pages=1)
+    assert pg.block_table.shape == (1, 1)
+    slot = _step_paged(pg, k_new, w, cos, sin, [pos0 + 4])
+    assert slot.tolist() == [[-1, -1, -1, SLOT_CAPACITY]] and pg.rows_written() == 0
+    assert torch.equal(pg.ring_row(0, pos0 + 3).view(torch.int16), k_raw[0, pos0 + 3].view(torch.int16))
+    # (b) the block's page is unassigned (-1)
+    pg = _Paged(1, s_tok, dtype, page=16, cap=8, seed=26)
+    pg.block_table[0, k // 4] = -1
+    slot = _step_paged(pg, k_new, w, cos, sin, [pos0 + 4])
+    assert slot.tolist() == [[-1, -1, -1, SLOT_CAPACITY]] and pg.rows_written() == 0
+    # (c) the block's page lies past the cache
+    pg = _Paged(1, s_tok, dtype, page=16, cap=8, seed=26)
+    pg.block_table[0, k // 4] = pg.n_pages + 5
+    slot = _step_paged(pg, k_new, w, cos, sin, [pos0 + 4])
+    assert slot.tolist() == [[-1, -1, -1, SLOT_CAPACITY]] and pg.rows_written() == 0
+    # (d) the RoPE table ends before the block's start position (the dense form's rule, unchanged)
+    pg = _Paged(1, s_tok, dtype, page=16, cap=8, seed=26)
+    slot = _step_paged(pg, k_new, w, cos[:, :pos0].contiguous(), sin[:, :pos0].contiguous(), [pos0 + 4])
+    assert slot.tolist() == [[-1, -1, -1, SLOT_CAPACITY]] and pg.rows_written() == 0
+
+
+@requires_cuda
+def test_state_entry_past_the_ring_or_null_owns_no_ring_and_a_ring_fed_block_reports_minus_two():
+    """A LIVE sequence whose state-table entry is one past the ring's last block (the off-by-one of a ring allocated one block per
+    request while the ids start at 1), the null block (0) or negative owns no ring: not one ring byte changes (the rows past the
+    allocation included), a block pooled from this step's rows alone is still written -- bitwise the prefill -- and a block that
+    needs ring rows the sequence does not own reports ``-2`` and leaves its page row at the sentinel: the null block's rows are
+    never pooled into a live sequence's block.  The same step on an owned ring writes that block."""
+    dtype, s_tok, batch = torch.bfloat16, 128, 3
+    k_raw, w, cos, sin = _make(batch, s_tok, dtype, seed=30)
+    ref, _ = _prefill(k_raw, w, cos, sin, _i32([s_tok] * batch))
+    pg = _Paged(batch, s_tok, dtype, page=16, cap=8, seed=30)
+    pg.state_table[0, 0] = int(pg.ring.shape[0])  # one past the last ring block
+    pg.state_table[1, 0] = 0  # the null block, with a LIVE kv_lens
+    pg.state_table[2, 0] = -3  # unassigned
+    ring_before = pg.ring.clone()
+    # (a) S_q 4 at a block-aligned pos0: the completing block pools this step's four rows only -> written; no ring row anywhere
+    k = 5
+    pos0 = 4 * k
+    slot = _step_paged(pg, k_raw[:, pos0 : pos0 + 4].contiguous(), w, cos, sin, [pos0 + 4] * batch)
+    assert slot.tolist() == [[-1, -1, -1, k]] * batch
+    assert torch.equal(pg.ring.view(torch.int16), ring_before.view(torch.int16)), "a sequence that owns no ring wrote a ring row"
+    for b in range(batch):
+        assert torch.equal(pg.kbar_row(b, k).view(torch.int16), ref[b, k].view(torch.int16))
+    assert pg.rows_written() == batch
+    # (b) S_q 1 at pos0 = 4 k2 + 3: the completing block needs ring rows 4 k2 .. 4 k2 + 2 the sequence does not own -> -2, nothing written
+    k2 = 9
+    pos1 = 4 * k2 + 3
+    slot = _step_paged(pg, k_raw[:, pos1 : pos1 + 1].contiguous(), w, cos, sin, [pos1 + 1] * batch)
+    assert slot.tolist() == [[SLOT_CAPACITY]] * batch
+    assert torch.equal(pg.ring.view(torch.int16), ring_before.view(torch.int16))
+    assert pg.rows_written() == batch, "(b) wrote a block from rows the sequence does not own"
+    for b in range(batch):
+        assert bool((pg.kbar_row(b, k2).float() == pg.sent).all())
+    # the rule is about ownership, not the block: the same step on sequences that own their ring blocks writes block k2 bitwise the prefill
+    owned = _Paged(batch, s_tok, dtype, page=16, cap=8, seed=30)
+    owned.fill_ring_from_prefix(k_raw, [pos1] * batch)
+    slot = _step_paged(owned, k_raw[:, pos1 : pos1 + 1].contiguous(), w, cos, sin, [pos1 + 1] * batch)
+    assert slot.tolist() == [[k2]] * batch
+    for b in range(batch):
+        assert torch.equal(owned.kbar_row(b, k2).view(torch.int16), ref[b, k2].view(torch.int16))
+        assert torch.equal(owned.ring_row(b, pos1).view(torch.int16), k_raw[b, pos1].view(torch.int16))
+
+
+@requires_cuda
+def test_one_paged_artifact_serves_every_page_size_and_cap():
+    """One compile per (dtype, d, rope_dim, pool, n_commit, paged, ring_slots): the page geometry, the ring capacity, the batch and the
+    rows ride in as runtime shapes."""
+    dtype = torch.bfloat16
+    r = compile_qsa_compress_step(dtype=dtype, d=_D, rope_dim=_ROPE, has_n_commit=False, paged=True)
+    assert isinstance(r, QsaCompressStepRecipe) and r.paged and not r.ring_slots
+    assert compile_qsa_compress_step(dtype=dtype, d=_D, rope_dim=_ROPE, has_n_commit=False, paged=True).compiled is r.compiled
+    assert compile_qsa_compress_step(dtype=dtype, d=_D, rope_dim=_ROPE, has_n_commit=False).compiled is not r.compiled
+    k_raw, w, cos, sin = _make(2, 256, dtype, seed=27)
+    ref, _ = _prefill(k_raw, w, cos, sin, _i32([256, 256]))
+    for page, cap, rows in ((16, 4, 1), (32, 8, 3), (64, 8, 5), (16, 8, 4)):
+        pg = _Paged(2, 256, dtype, page=page, cap=cap, seed=27)
+        pos0 = 4 * 20 + (3 - (rows - 1) % 4)  # the last row completes a block, pooling the ring's rows below pos0
+        pg.fill_ring_from_prefix(k_raw, [pos0, pos0])
+        slot = torch.full((2, rows), -9, dtype=torch.int32, device="cuda")
+        run_qsa_compress_step(
+            r,
+            k_raw[:, pos0 : pos0 + rows].contiguous(),
+            pg.ring,
+            pg.cache,
+            w,
+            cos,
+            sin,
+            None,
+            slot,
+            None,
+            eps=_EPS,
+            norm_weight_offset=1.0,
+            stream=_stream(),
+            kv_lens=_i32([pos0 + rows] * 2),
+            block_table=pg.block_table,
+            index_state_block_table=pg.state_table,
+        )
+        torch.cuda.synchronize()
+        blk = (pos0 + rows - 1) // _POOL
+        assert slot[:, rows - 1].tolist() == [blk, blk], (page, cap, rows)
+        for b in range(2):
+            assert torch.equal(pg.kbar_row(b, blk).view(torch.int16), ref[b, blk].view(torch.int16)), (page, cap, rows, b)
+
+
+@requires_cuda
+def test_paged_step_is_one_launch_and_allocates_nothing():
+    """MEASURED: the paged step is ONE kernel launch (``torch.profiler``'s census), it allocates nothing and never synchronises
+    (``torch.cuda.set_sync_debug_mode("error")`` around the launch; the caching allocator's allocation count unchanged)."""
+    from torch.profiler import ProfilerActivity, profile
+
+    dtype, s_tok = torch.bfloat16, 64
+    k_raw, w, cos, sin = _make(2, s_tok, dtype, seed=28)
+    pg = _Paged(2, s_tok, dtype, page=16, cap=8, seed=28)
+    r = compile_qsa_compress_step(dtype=dtype, d=_D, rope_dim=_ROPE, has_n_commit=True, paged=True)
+    k_new = k_raw[:, 8:12].contiguous()
+    slot = torch.full((2, 4), -9, dtype=torch.int32, device="cuda")
+    kv, nc = _i32([12, 12]), _i32([4, 4])
+
+    def launch():
+        run_qsa_compress_step(
+            r,
+            k_new,
+            pg.ring,
+            pg.cache,
+            w,
+            cos,
+            sin,
+            None,
+            slot,
+            nc,
+            eps=_EPS,
+            stream=_stream(),
+            kv_lens=kv,
+            block_table=pg.block_table,
+            index_state_block_table=pg.state_table,
+        )
+
+    launch()  # warm: the first call pays nothing either, but the census below must count kernels only
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_stats()["allocation.all.allocated"]
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        for _ in range(3):
+            launch()
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == before, "the paged step allocated on the execute path"
+    prof = profile(activities=[ProfilerActivity.CUDA])
+    try:
+        prof.start()
+    except Exception:  # noqa: BLE001 -- CUPTI unavailable on this box: the bitwise cells stand
+        pytest.skip("the CUDA profiler recorded no kernel activity on this box (CUPTI unavailable)")
+    try:
+        launch()
+        torch.cuda.synchronize()
+    finally:
+        prof.stop()
+    names = [
+        e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA and "memset" not in e.name.lower() and "memcpy" not in e.name.lower()
+    ]
+    if not names:
+        pytest.skip("the CUDA profiler recorded no kernel activity on this box (CUPTI unavailable)")
+    assert len(names) == 1 and "frost_qsa_compress_step" in names[0], names
+
+
+# ---------------------------------------------------------------------------
+# Host-side contract of the paged form: every refusal typed, both directions
+# ---------------------------------------------------------------------------
+
+
+@requires_cuda
+def test_paged_run_rejects_contract_violations():
+    dtype, s_tok, batch, rows = torch.bfloat16, 64, 2, 4
+    k_raw, w, cos, sin = _make(batch, s_tok, dtype, seed=29)
+    pg = _Paged(batch, s_tok, dtype, page=16, cap=8, seed=29)
+    k_new = k_raw[:, :rows].contiguous()
+    slot = torch.zeros(batch, rows, dtype=torch.int32, device="cuda")
+    kv = _i32([rows, rows])
+    paged = compile_qsa_compress_step(dtype=dtype, d=_D, rope_dim=_ROPE, has_n_commit=False, paged=True)
+    slots_r = compile_qsa_compress_step(dtype=dtype, d=_D, rope_dim=_ROPE, has_n_commit=False, paged=True, ring_slots=True, ring_slot_dtype=torch.int64)
+    dense = compile_qsa_compress_step(dtype=dtype, d=_D, rope_dim=_ROPE, has_n_commit=False)
+
+    def run(r, k=k_new, rg=None, o=None, p=None, sl=slot, kvl=kv, bt=None, st=None, sm=None):
+        rg = pg.ring if rg is None else rg
+        o = pg.cache if o is None else o
+        bt = pg.block_table if bt is None else bt
+        st = pg.state_table if st is None else st
+        run_qsa_compress_step(
+            r,
+            k,
+            rg,
+            o,
+            w,
+            cos,
+            sin,
+            p,
+            sl,
+            None,
+            eps=_EPS,
+            stream=_stream(),
+            kv_lens=kvl,
+            block_table=bt,
+            index_state_block_table=st,
+            index_state_slot_mapping=sm,
+        )
+
+    # the position source, both directions
+    with pytest.raises(ValueError, match="pos0 is refused on the paged form"):
+        run(paged, p=_i32([0, 0]))
+    with pytest.raises(ValueError, match="kv_lens .* block_table .* index_state_block_table .* must be bound"):
+        run(paged, kvl=None)
+    with pytest.raises(ValueError, match="compiled WITHOUT the paged compress arms"):
+        run_qsa_compress_step(
+            dense,
+            k_new,
+            _sentinel(batch, _RING, _D, dtype=dtype),
+            _sentinel(batch, 16, _D, dtype=dtype),
+            w,
+            cos,
+            sin,
+            _i32([0, 0]),
+            slot,
+            None,
+            eps=_EPS,
+            stream=_stream(),
+            kv_lens=kv,
+        )
+    with pytest.raises(ValueError, match="the dense form needs pos0"):
+        run_qsa_compress_step(
+            dense,
+            k_new,
+            _sentinel(batch, _RING, _D, dtype=dtype),
+            _sentinel(batch, 16, _D, dtype=dtype),
+            w,
+            cos,
+            sin,
+            None,
+            slot,
+            None,
+            eps=_EPS,
+            stream=_stream(),
+        )
+    # the ring: 4-D, the capacity rule, the dtype, the alignment
+    with pytest.raises(ValueError, match=r"ring must be a 4-D \[blocks >= 1, rows, 1, D=128\]"):
+        run(paged, rg=_sentinel(batch, 8, _D, dtype=dtype))
+    with pytest.raises(ValueError, match="ring holds 4 rows per block; this launch needs at least 7"):
+        run(paged, rg=_sentinel(batch + 1, 4, 1, _D, dtype=dtype))
+    with pytest.raises(ValueError, match="dtype"):
+        run(paged, rg=_sentinel(batch + 1, 8, 1, _D, dtype=torch.float16))
+    with pytest.raises(ValueError, match="16-B aligned"):
+        n = (batch + 1) * 8 * (_D + 8)
+        run(paged, rg=torch.empty(n + 8, device="cuda", dtype=dtype)[4 : 4 + n].view(batch + 1, 8, 1, _D + 8)[..., :_D])  # an 8-byte base offset
+    # the cache: 4-D, the e4m3 store declined by name, the alignment
+    with pytest.raises(ValueError, match=r"out must be a 4-D \[blocks >= 1, rows, 1, D=128\]"):
+        run(paged, o=_sentinel(batch, 16, _D, dtype=dtype))
+    with pytest.raises(NotImplementedError, match="e4m3 compressed-key cache store"):
+        run(paged, o=torch.empty(pg.n_pages, pg.rpp, 1, _D, device="cuda", dtype=torch.float8_e4m3fn))
+    with pytest.raises(ValueError, match="raw-key ring is a bit copy .* never quantized"):  # an e4m3 RING is a form error, not the cache's decline
+        run(paged, rg=torch.empty(batch + 1, 8, 1, _D, device="cuda", dtype=torch.float8_e4m3fn))
+    with pytest.raises(ValueError, match="multiple of 8 elements"):
+        run(paged, o=torch.empty(pg.n_pages, pg.rpp, 1, _D + 4, device="cuda", dtype=dtype)[..., :_D])
+    # the tables and the lengths
+    with pytest.raises(ValueError, match="block_table must be a 2-D int32 CUDA block table"):
+        run(paged, bt=pg.block_table.to(torch.int64))
+    with pytest.raises(ValueError, match=r"block_table must be \[B=2, cols >= 1\]"):
+        run(paged, bt=pg.block_table[:1])
+    with pytest.raises(ValueError, match="contiguous columns"):
+        run(paged, bt=pg.block_table.t().contiguous().t())
+    with pytest.raises(ValueError, match=r"index_state_block_table must be \[B=2, 1\]"):
+        run(paged, st=torch.zeros(batch, 2, dtype=torch.int32, device="cuda"))
+    with pytest.raises(ValueError, match="kv_lens must be a contiguous int32"):
+        run(paged, kvl=kv.to(torch.int64))
+    # the slot-mapping arm, both directions
+    with pytest.raises(ValueError, match="bind index_state_slot_mapping"):
+        run(slots_r)
+    with pytest.raises(ValueError, match="index_state_slot_mapping would be silently ignored"):
+        run(paged, sm=pg.ring_slots([rows, rows], rows))
+    with pytest.raises(ValueError, match="index_state_slot_mapping must be a contiguous torch.int64"):
+        run(slots_r, sm=pg.ring_slots([rows, rows], rows, dtype=torch.int32))
+    with pytest.raises(ValueError, match="needs the ring's blocks contiguous"):
+        gapped = _sentinel(batch + 1, 10, 1, _D, dtype=dtype)[:, :8]  # 8 of 10 rows per block: block stride != cap x row stride
+        run(slots_r, rg=gapped, sm=pg.ring_slots([rows, rows], rows))
+    # the row-count rule stays
+    with pytest.raises(ValueError, match="k_new must hold at least one row"):
+        run(paged, k=k_raw[:, :0].contiguous(), sl=torch.zeros(batch, 0, dtype=torch.int32, device="cuda"))
+
+
+def test_paged_compile_rejects_unsupported_declarations():
+    with pytest.raises(ValueError, match="needs paged=True"):
+        compile_qsa_compress_step(dtype=torch.bfloat16, d=_D, rope_dim=_ROPE, ring_slots=True)
+    with pytest.raises(ValueError, match="ring_slot_dtype must be int32 or int64"):
+        compile_qsa_compress_step(dtype=torch.bfloat16, d=_D, rope_dim=_ROPE, paged=True, ring_slots=True, ring_slot_dtype=torch.int16)
+    with pytest.raises(NotImplementedError, match="e4m3 compressed-key cache store"):
+        compile_qsa_compress_step(dtype=torch.bfloat16, d=_D, rope_dim=_ROPE, paged=True, index_cache_dtype=torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match="must hold the activation dtype"):
+        compile_qsa_compress_step(dtype=torch.bfloat16, d=_D, rope_dim=_ROPE, paged=True, index_cache_dtype=torch.float32)
