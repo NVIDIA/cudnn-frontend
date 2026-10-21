@@ -849,3 +849,12 @@ kernel copies raw bytes and does not convert FP16 to FP32. Exercise every accept
 state dtype with forward and backward aliasing, padded storage, and changed-state
 CUDA-graph replay. The overwrite and replay cases in
 `linear_attention/test_gdn2_frost_steep_decay.py` cover these paths.
+
+Pairing sparse queries requires per-query masking before dQ arithmetic when a
+key is nonfinite: a key valid for one query can be masked for its neighbor,
+and zero dS multiplied by that key still produces NaN. A union mask alone is
+insufficient, including across an unaligned packed sequence boundary. Keep any
+nonfinite fallback entirely on device and re-evaluate it on each graph replay.
+The detector is `QSA/cutedsl/test_qsa.py::test_paired_backward_nonfinite_isolation`,
+which changes finite/nonfinite inputs under one captured graph for both shared
+and separate packed sequences.
