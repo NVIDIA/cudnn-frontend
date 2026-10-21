@@ -313,7 +313,7 @@ def test_DSA_sparse_attention_backward_sm100_h96_deterministic_composition():
         (64, 512, "generic_m64", False),
         (64, 576, "generic_m64", False),
         (96, 512, "generic_m64", False),
-        (96, 576, "h96_h64_h32", True),
+        (96, 576, "h96_d576_2cta_m64", True),
         (128, 512, "h128_2cta_m64", False),
     ],
 )
