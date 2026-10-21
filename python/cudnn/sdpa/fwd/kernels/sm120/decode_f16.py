@@ -265,9 +265,10 @@ class SM120DecodeForward:
         Exact head dims issue ONE rank-5 copy whose descriptor pre-splits the
         head dim into swizzle-span chunks. Envelope head dims (actual d < tile)
         issue one copy per chunk over a rank-4 descriptor that keeps the ACTUAL
-        head extent innermost, so TMA zero-fills the pad columns (see
-        ``sm120/prefill_f16.py:load_one_kv_tile``). The caller arms the stage's
-        full barrier with both regions' bytes first.
+        head extent innermost: TMA bounds-checks each descriptor dimension on
+        its own, so it zero-fills the pad columns only when the head boundary is
+        one dimension, not split across the chunk dimensions. The caller arms
+        the stage's full barrier with both regions' bytes first.
         """
         chunks = self.v_tma_swizzle_chunks if is_v else self.k_tma_swizzle_chunks
         chunk_elems = self.v_swizzle_chunk_elems if is_v else self.k_swizzle_chunk_elems
@@ -465,7 +466,10 @@ class SM120DecodeForward:
 
         With per-batch KV lengths, the keys past a batch's length are memory the
         TMA loads (it zero-fills only past the tensor): their P is 0, but
-        ``0 x NaN = NaN``, so their V halves are zeroed before the MMA.
+        ``0 x NaN = NaN``, so their V halves are zeroed before the MMA. The mask
+        runs on every stage, not only the one that reaches past the length:
+        branching each stage between a masked and an unmasked body costs more
+        than the four ANDs per V fragment.
         """
         v_row_in_frag_pair = (bp.lane_div8 % 2) * 8 + bp.lane_mod8
         v_col_in_frag_pair = (bp.lane_div8 // 2) * 8
@@ -883,10 +887,11 @@ class SM120DecodeForward:
         if cutlass.const_expr(self.has_sink != (sinks is not None)):
             raise ValueError("sinks must be provided exactly when the kernel is configured with has_sink")
 
-        # K/V TMA descriptors over the tensors' own strides (see
-        # sm120/prefill_f16.py): rank-5 with the head dim pre-split into
-        # swizzle-span chunks when exact, rank-4 keeping the actual head extent
-        # innermost (zero-filled pad columns) in the envelope.
+        # K/V TMA descriptors over the tensors' own strides, not packed
+        # recomputations, so a view with a wider token stride (K or V sliced
+        # from an interleaved buffer) loads as declared: rank-5 with the head
+        # dim pre-split into swizzle-span chunks when exact, rank-4 keeping the
+        # actual head extent innermost (zero-filled pad columns) in the envelope.
         def kv_tma_desc(t, head_dim, head_tile, swizzle, swizzle_chunks, swizzle_chunk_elems):
             if cutlass.const_expr(head_dim == head_tile):
                 layout = cute.make_layout(

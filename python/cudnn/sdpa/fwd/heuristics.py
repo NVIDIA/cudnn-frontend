@@ -1184,7 +1184,7 @@ def _sm120_decode_tile_m(caps: Capabilities, facts) -> int:
     units keep the prefill rule (MQA at 64 heads: the 128-row packed tile reads
     the shared KV head once per 128 rows).
     """
-    if not any(m in caps.tile_ms for m in _SM120_DECODE_Q_TILES) or facts.is_fp8 or facts.is_mxfp8 or facts.thd:
+    if facts.is_fp8 or facts.is_mxfp8 or facts.thd:
         return 0
     if max(facts.d_qk, facts.d_v) > _SM120_GENERAL_HEAD_TILE_MAX or facts.h_kv <= 0 or facts.h_q % facts.h_kv != 0:
         return 0

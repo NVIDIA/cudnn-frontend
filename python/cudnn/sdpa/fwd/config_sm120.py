@@ -87,12 +87,14 @@ def is_decode_tile(q_tile: int) -> bool:
     return q_tile in DECODE_Q_TILES
 
 
-# The decode tile streams K/V in stages of about DECODE_STAGE_BYTES (the K and V
-# halves of ``decode_kv_stage`` keys). Every key group owns its own slots of the
-# ring (``decode_slots_per_group`` each, at most DECODE_MAX_SLOTS_PER_GROUP), so
-# several stages of every group are in flight while its warps compute and every
-# slot has one waiter, which consumes its uses in order (an mbarrier parity wait
-# cannot tell a phase from the one two phases later).
+# The decode tile streams K/V in stages of at most DECODE_STAGE_BYTES (the K and
+# V halves of ``decode_kv_stage`` keys) wherever the 16-key floor allows: head
+# tiles summing past 256 overrun it, up to twice at 256 + 256. Every key group
+# owns its own slots of the ring (``decode_slots_per_group`` each, at most
+# DECODE_MAX_SLOTS_PER_GROUP), so several stages of every group are in flight
+# while its warps compute and every slot has one waiter, which consumes its uses
+# in order (an mbarrier parity wait cannot tell a phase from the one two phases
+# later).
 DECODE_STAGE_BYTES = 8192
 DECODE_MAX_SLOTS_PER_GROUP = 6
 # Consumer warps of the decode tile: ``q_tile // 16`` M-groups x the key groups
@@ -111,8 +113,11 @@ def decode_kv_groups(q_tile: int) -> int:
 
 def decode_kv_stage(head_tile_qk: int, head_tile_v: int) -> int:
     """Keys per K/V stage of the decode tile: the largest multiple of 16 (one
-    P@V k-step) whose K and V half tiles fit DECODE_STAGE_BYTES, between 16 and
-    64 -- at equal Q/K and V head tiles 64 up to 32, 32 at 48 and 64, 16 from 80."""
+    P@V k-step) whose K and V half tiles fit DECODE_STAGE_BYTES, clamped to
+    16..64 -- at equal Q/K and V head tiles 64 up to 32, 32 at 48 and 64, 16
+    from 80. The 16-key floor overruns DECODE_STAGE_BYTES once the head tiles
+    sum past 256 (a 256 + 256 stage is 16 KiB); :func:`decode_stage_bytes` is
+    the stage's actual size."""
     keys = DECODE_STAGE_BYTES // (2 * (head_tile_qk + head_tile_v))
     return max(16, min(64, keys // 16 * 16))
 

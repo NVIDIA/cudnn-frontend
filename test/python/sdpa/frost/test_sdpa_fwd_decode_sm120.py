@@ -486,6 +486,7 @@ _L0_CASES = [
     (32, 8, 1, 4133, 128, 16, 8, False),  # ragged tail under a split
     (24, 4, 1, 2000, 256, 16, 4, False),  # GQA 6: 6 live rows of 16, d256 16-key stages
     (24, 4, 2, 777, 128, 16, 1, False),  # GQA 6 x 2 tokens = 12 live rows, causal
+    (24, 4, 5, 1500, 128, 16, 2, False),  # GQA 6 over three tiles: dead rows name the next tile's first token
     (64, 8, 1, 3000, 64, 16, 1, True),  # d64 sink, unsplit fold
     (64, 8, 1, 3000, 64, 16, 6, True),  # d64 sink folded by the combine
     (64, 8, 3, 515, 64, 32, 3, True),  # 24 packed rows on the 32-row tile, causal, split sink
@@ -505,16 +506,15 @@ def test_decode_tile_matches_reference(h_q, h_kv, s_q, s_kv, d, tile_m, split, s
 
 
 @requires_blackwell_geforce
-@pytest.mark.L0
 @pytest.mark.parametrize(
     "d,d_v,split",
     [
-        (72, 72, 1),  # head tile 80: TMA zero-fills the pad columns, one copy per swizzle chunk
-        (88, 88, 3),  # head tile 96, 16-key stages
-        (128, 120, 2),  # V envelope only
-        (16, 16, 1),  # 64-key stages, 32-byte swizzle
-        (32, 32, 4),  # 64-key stages, 64-byte swizzle
-        (48, 48, 2),  # 32-key stages, 32-byte swizzle
+        pytest.param(72, 72, 1, marks=pytest.mark.L0),  # head tile 80: TMA zero-fills the pad columns, one copy per swizzle chunk
+        pytest.param(88, 88, 3, marks=pytest.mark.L1),  # head tile 96, 16-key stages
+        pytest.param(128, 120, 2, marks=pytest.mark.L1),  # V envelope only
+        pytest.param(16, 16, 1, marks=pytest.mark.L1),  # 64-key stages, 32-byte swizzle
+        pytest.param(32, 32, 4, marks=pytest.mark.L1),  # 64-key stages, 64-byte swizzle
+        pytest.param(48, 48, 2, marks=pytest.mark.L1),  # 32-key stages, 32-byte swizzle
     ],
 )
 def test_decode_tile_head_dim_envelopes_and_stage_widths(d, d_v, split):
@@ -522,29 +522,36 @@ def test_decode_tile_head_dim_envelopes_and_stage_widths(d, d_v, split):
 
 
 @requires_blackwell_geforce
-@pytest.mark.L0
+@pytest.mark.L1
 @pytest.mark.parametrize("tile_m,s_q", [(16, 5), (32, 7)])
 @pytest.mark.parametrize("bottom_right", [True, False])
 @pytest.mark.parametrize("split", [1, 2])
 def test_decode_tile_dead_rows_never_store_over_the_next_tiles_token(tile_m, s_q, bottom_right, split):
     """GQA 6 over several Q tiles: a 16-row tile holds two tokens in 12 live rows (32 rows: five tokens in 30), so
-    its dead rows name the first token of the next tile. Only the live rows may store O and LSE."""
+    its dead rows name the first token of the next tile. Only the live rows may store O and LSE. One such case runs
+    at L0 in ``_L0_CASES``."""
     run = _decode_case(24, 4, s_q, 1500, d=128, tile_m=tile_m, split_kv=split, bottom_right=bottom_right, with_lse=True)
     assert run.api.q_tile == tile_m and run.api.pack_gqa
     _assert_close(run)
 
 
 @requires_blackwell_geforce
-@pytest.mark.L0
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("stats_log2", [False, True])
+@pytest.mark.parametrize(
+    "dtype,stats_log2",
+    [
+        pytest.param(torch.bfloat16, True, marks=pytest.mark.L0),
+        pytest.param(torch.bfloat16, False, marks=pytest.mark.L1),
+        pytest.param(torch.float16, True, marks=pytest.mark.L1),
+        pytest.param(torch.float16, False, marks=pytest.mark.L1),
+    ],
+)
 def test_decode_tile_dtypes_and_stats_base(dtype, stats_log2):
     for split in (1, 4):
         _assert_close(_decode_case(32, 4, 1, 5000, d=128, split_kv=split, with_lse=True, stats_log2=stats_log2, dtype=dtype), dtype)
 
 
 @requires_blackwell_geforce
-@pytest.mark.L0
+@pytest.mark.L1
 def test_decode_tile_mixed_head_dims_and_unpacked_gqa():
     _assert_close(_decode_case(16, 4, 1, 1500, d=192, d_v=128, split_kv=3, with_lse=True))
     # Unpacked: one query head per CTA, each streaming its KV head.
@@ -552,7 +559,7 @@ def test_decode_tile_mixed_head_dims_and_unpacked_gqa():
 
 
 @requires_blackwell_geforce
-@pytest.mark.L0
+@pytest.mark.L1
 def test_decode_tile_window_and_padded_lengths():
     # A left window cuts the leading stages; per-batch lengths bound the keys (unsplit: padded graphs do not split).
     _assert_close(_decode_case(32, 8, 2, 4096, d=128, window_left=129, with_lse=True))
@@ -591,7 +598,7 @@ def test_decode_tile_masks_scale_and_padded_queries(case):
 
 
 @requires_blackwell_geforce
-@pytest.mark.L0
+@pytest.mark.L1
 @pytest.mark.parametrize("d,tile_m,split", [(128, 16, 1), (128, 16, 16), (256, 16, 4), (128, 32, 8), (64, 16, 2)])
 def test_decode_tile_ring_reuse_is_race_free(d, tile_m, split):
     """A long KV reuses every ring slot hundreds of times. Each slot has one waiting key group: a parity wait cannot
@@ -630,6 +637,25 @@ def test_decode_tile_declines_what_it_cannot_serve():
     # The stage width is fixed by the head tiles.
     with pytest.raises(ValueError, match="16-key K/V stages"):
         SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=k, sample_o=o, tile_m=16, tile_n=128).check_support()
+
+
+@requires_blackwell_geforce
+@pytest.mark.L0
+def test_decode_tile_wrapper_keys_an_unset_kv_tile_apart_from_an_explicit_one():
+    """The standalone wrapper caches one adapter per key. An unset kv_tile resolves to the decode tile's stage width,
+    so it keys apart from any explicit value: a kv_tile the decode tile cannot run still raises after an unset call
+    built and cached the 16-key plan."""
+    from cudnn.sdpa.fwd import sdpa_fwd_wrapper_dsl_sm120
+
+    torch.manual_seed(0)
+    q = torch.randn(1, 1, 32, 128, device="cuda", dtype=torch.float16).transpose(1, 2)
+    k = torch.randn(1, 512, 8, 128, device="cuda", dtype=torch.float16).transpose(1, 2)
+    v = torch.randn(1, 512, 8, 128, device="cuda", dtype=torch.float16).transpose(1, 2)
+    o_tensor, _ = sdpa_fwd_wrapper_dsl_sm120(q, k, v, q_tile=16)
+    ref_o, _ = _reference(q, k, v, causal=False)
+    torch.testing.assert_close(o_tensor.float(), ref_o, rtol=0, atol=2e-2)
+    with pytest.raises(ValueError, match="16-key K/V stages"):
+        sdpa_fwd_wrapper_dsl_sm120(q, k, v, q_tile=16, kv_tile=128)
 
 
 @requires_blackwell_geforce

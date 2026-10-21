@@ -6176,8 +6176,8 @@ def sdpa_fwd_wrapper_dsl_sm120(
         seq_q_lens_present=seq_q_lens is not None,
         seq_kv_lens_present=seq_kv_lens is not None,
         has_sink=sinks is not None,
-        tile_m=_SM120_Q_TILES[0] if q_tile is None else q_tile,
-        tile_n=_SM120_KV_TILES[0] if kv_tile is None else kv_tile,
+        tile_m=q_tile,
+        tile_n=kv_tile,
     )
     sdpa_fwd = _get_or_create_api(
         cache_key,
