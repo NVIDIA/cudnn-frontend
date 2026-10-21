@@ -3,18 +3,24 @@
 
 """``qsa_select``: top-k block selection of the block-sparse indexer over the DSA compact-logits scorer.
 
-The reject / gate tests run on any CUDA device (the declines fire before a kernel is compiled); the accept
-cells need an SM100-family GPU (the scorer is a tcgen05 kernel) and compare the selected SETS against
+The reject / gate tests run on any CUDA device (the declines fire before a kernel is compiled; the gates BEHIND the
+CuTe DSL floor -- the head groups, the target, the device family -- skip below it, where the version decline answers
+first); the accept cells need an SM100-family GPU (the scorer is a tcgen05 kernel) and compare the selected SETS against
 ``torch.topk`` of an fp64 re-derivation of the indexer score (Qwen3.8 QSA, Eq. 15-16: ReLU-summed 4-head
 scores over the complete 4-token blocks a token can see, scaled by ``1 / sqrt(128)``), up to ties at the
 k-th boundary.
 """
 
+import os
+import sys
+
 import pytest
 import torch
 
 import cudnn.gated_attention_block.qsa_select as qsa_mod
-from cudnn.gated_attention_block.qsa_select import QSA_BLOCK_SIZE, QSA_TOP_K, qsa_select
+from cudnn.frost.buffers import cutedsl_requirement_error
+
+QSA_BLOCK_SIZE, QSA_TOP_K, qsa_select = qsa_mod.QSA_BLOCK_SIZE, qsa_mod.QSA_TOP_K, qsa_mod.qsa_select  # the module imported ONE way
 
 pytestmark = pytest.mark.L0
 
@@ -29,6 +35,11 @@ def _cc():
 
 needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="a CUDA device is needed for the input tensors")
 needs_sm100_family = pytest.mark.skipif(_cc() is None or _cc()[0] != 10, reason=f"the scorer is a tcgen05 kernel (cc 10.x); found {_cc()}")
+# Below FROST's CuTe DSL floor the selector declines by VERSION ahead of its later gates (the head groups, the target, the device family)
+# and ahead of any scorer launch (Rule 7): the cells that expect one of those later answers, and every accept cell, skip there instead of
+# failing; the form checks ahead of the gate and the version-decline cell itself run on any DSL.
+_CUTEDSL_REQUIREMENT = cutedsl_requirement_error("qsa_select")  # None at or above the floor
+needs_dsl_floor = pytest.mark.skipif(_CUTEDSL_REQUIREMENT is not None, reason=str(_CUTEDSL_REQUIREMENT))
 
 
 def _cu(lengths, device):
@@ -100,6 +111,7 @@ def _inputs(lengths, n_blocks_max, device, seed=0, n_heads=_H):
 
 
 @needs_cuda
+@needs_dsl_floor
 @pytest.mark.parametrize("n_heads", [2, 3, 12, 128])
 def test_qsa_select_declines_unsupported_head_counts(n_heads):
     device = torch.device("cuda")
@@ -165,6 +177,7 @@ def test_qsa_select_declines_below_the_dsl_floor_by_version(monkeypatch):
 
 
 @needs_cuda
+@needs_dsl_floor
 def test_qsa_select_declines_a_dsl_without_the_target(monkeypatch):
     device = torch.device("cuda")
     qi, kbar, cu = _inputs([8], 4, device)
@@ -176,6 +189,7 @@ def test_qsa_select_declines_a_dsl_without_the_target(monkeypatch):
 
 
 @needs_cuda
+@needs_dsl_floor
 def test_qsa_select_declines_devices_below_the_sm100_family(monkeypatch):
     device = torch.device("cuda")
     qi, kbar, cu = _inputs([8], 4, device)
@@ -200,9 +214,78 @@ def test_qsa_select_rejects_a_mixed_or_unsupported_cache_dtype():
         qsa_select(qi.to(_E4M3), kbar.to(_E4M3), cu, top_k=2, w=torch.ones(8, _H, dtype=torch.float32, device=device))
 
 
+def _poison_the_weight_bucket(numel: int, device) -> int:
+    """The constant-weight bucket for ``numel`` elements made COLD (a fresh cache dict; the previous bucket stays referenced, so its block is
+    never recycled) and the allocator block its creation on torch's CURRENT stream would reuse filled with ZEROS first (freed right away):
+    a fill that has not landed cannot hide behind stale right values.  Returns the poisoned block's address (a premise diagnostic)."""
+    capacity = 1 << (max(1, numel) - 1).bit_length()
+    poison = torch.zeros(capacity, dtype=torch.bfloat16, device=device)
+    torch.cuda.synchronize()
+    ptr = poison.data_ptr()
+    del poison
+    return ptr
+
+
+@needs_cuda
+@needs_dsl_floor
+def test_qsa_select_creates_its_constants_on_the_launch_stream_with_the_ambient_stream_parked(monkeypatch):
+    """Rule 5 on the selector's OWN operands, the scorer stubbed so any CUDA device runs it: ``qsa_select(..., stream=S)`` with a COLD
+    constant-weight bucket and a WARM packed-K prefix (a cold prefix's host upload used to block the host on the issuing stream and hide
+    the race; warm, nothing blocks) while torch's default (ambient) stream is parked by a long spin.  The previous form built the bf16
+    ones on the ambient stream and handed the scorer on S a buffer whose fill sat behind the spin: the stub, reading on S as the scorer
+    does, sees the allocator's recycled bytes (poisoned to zeros here) and is called with the ambient stream current; now every operand
+    is created on S, the stub reads ones and runs with S current.  The premise -- the ambient stream still busy when the call was issued,
+    the bucket created by the call -- is asserted, never assumed."""
+    if not hasattr(torch.cuda, "_sleep"):
+        pytest.skip("torch.cuda._sleep is the park; the matmul fallback is too short")
+    import cuda.bindings.driver as cuda_drv
+
+    import cudnn.deepseek_sparse_attention.indexer_forward as dsa_fwd
+
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from gated_block_stream_probe import park_the_default_stream
+
+    device = torch.device("cuda")
+    lengths, n_blocks, top_k = [256], 64, 16
+    qi, kbar, cu = _inputs(lengths, n_blocks, device, seed=5)
+    total = sum(lengths)
+    ambient, side = torch.cuda.default_stream(), torch.cuda.Stream()
+    assert torch.cuda.current_stream() == ambient and side != ambient
+    seen = {}
+
+    def stub(q, k, weights, **kw):
+        # what the scorer does: read the head weights on the LAUNCH stream; and where torch was when the wrapper was called
+        seen["called_on"] = torch.cuda.current_stream().cuda_stream
+        seen["weights_ptr"] = weights.data_ptr()
+        with torch.cuda.stream(side):
+            seen["not_one"] = (weights.float() != 1.0).sum()
+        return {"indices": torch.full((total, kw["top_k"]), -1, dtype=torch.int32, device=device), "logits": torch.zeros(total, kw["top_k"], device=device)}
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 0))  # the scorer's family; the stub never launches it
+    monkeypatch.setattr(dsa_fwd, "indexer_forward_top_k_wrapper", stub)
+    qsa_select(qi, kbar, cu, top_k=top_k)  # the control on the ambient stream: warms the packed-K prefix (and a bucket this test discards)
+    torch.cuda.synchronize()
+    monkeypatch.setattr(qsa_mod, "_ones_cache", {})
+    poison_ptr = _poison_the_weight_bucket(total * _H, device)
+    seen.clear()
+    park_the_default_stream(3.0)  # the AMBIENT stream is busy from here, through the call and past its issue
+    qsa_select(qi, kbar, cu, top_k=top_k, stream=cuda_drv.CUstream(side.cuda_stream))
+    parked_at_issue = not ambient.query()
+    with torch.cuda.stream(side):
+        not_one = int(seen["not_one"].cpu())  # read back through the LAUNCH stream only (the ambient one is still parked)
+    side.synchronize()
+    assert parked_at_issue, "the premise: the ambient stream must still be busy when the call was issued"
+    assert len(qsa_mod._ones_cache) == 1, "the premise: the call created the weight bucket (it was cold)"
+    print(f"wrapper called on 0x{seen['called_on']:x} (launch 0x{side.cuda_stream:x}); weights at 0x{seen['weights_ptr']:x}, poisoned block 0x{poison_ptr:x}")
+    assert not_one == 0, f"{not_one} of {total * _H} constant head weights read on the launch stream were not 1.0 (the fill sat on the parked ambient stream)"
+    assert seen["called_on"] == side.cuda_stream, "the scorer wrapper was called with a stream other than the launch stream current"
+    torch.cuda.synchronize()
+
+
 # --------------------------------------------------------------------------------------------- accept cells
 
 
+@needs_dsl_floor
 @needs_sm100_family
 @pytest.mark.parametrize("n_blocks", [1, 7, 512, 513, 8192, 65536])
 def test_qsa_select_matches_topk_of_the_fp64_reference(n_blocks):
@@ -237,6 +320,7 @@ def test_qsa_select_matches_topk_of_the_fp64_reference(n_blocks):
         assert torch.equal((result["block_ids"][~full] >= 0).sum(dim=-1), visible[~full])
 
 
+@needs_dsl_floor
 @needs_sm100_family
 def test_qsa_select_thd_tails_and_chunked_prefill():
     """Three packed sequences: 5 tokens (one complete block), 2051 tokens (the identity bound: the last token
@@ -270,6 +354,7 @@ def test_qsa_select_thd_tails_and_chunked_prefill():
     assert int(seq2.max()) < n_blocks[2]
 
 
+@needs_dsl_floor
 @needs_sm100_family
 def test_qsa_select_deterministic_ties_keep_the_smaller_block_ids():
     """Identical compressed keys tie every visible block; with deterministic=True the kept set is the 512
@@ -291,6 +376,7 @@ def test_qsa_select_deterministic_ties_keep_the_smaller_block_ids():
     _assert_selection(result["block_ids"], result["scores"], ref, QSA_TOP_K, tie_tol=1e-4)
 
 
+@needs_dsl_floor
 @needs_sm100_family
 def test_qsa_select_constant_weight_matches_explicit_w_and_reads_a_strided_slab():
     """``w=None`` (the constant 1 / sqrt(128)) is bitwise the explicit all-ones ``w`` with the same scale, and a
@@ -316,6 +402,7 @@ def test_qsa_select_constant_weight_matches_explicit_w_and_reads_a_strided_slab(
     _assert_selection(base["block_ids"], base["scores"], ref, 64)
 
 
+@needs_dsl_floor
 @needs_sm100_family
 def test_qsa_select_preallocated_outputs_and_scratch():
     """Caller-owned outputs and the compact-logits scratch (the CUDA-graph form) are written in place."""
@@ -355,6 +442,81 @@ def test_qsa_select_preallocated_outputs_and_scratch():
     _assert_selection(pre["block_ids"], pre["scores"], ref, 128)
 
 
+@needs_dsl_floor
+@needs_sm100_family
+def test_qsa_select_on_an_explicit_stream_with_a_cold_weight_bucket_matches_the_synchronised_selection():
+    """The delayed-producer pin with the REAL scorer: one dense 256-token sequence over 64 compressed keys, top_k 16 (every row past
+    token 66 sees more blocks than the list holds, so the selection is a real one), preallocated outputs and scratch (the CUDA-graph form:
+    nothing read back inside the call).  A synchronised control on torch's default stream first (it warms the packed-K prefix, whose cold
+    host upload would otherwise block the host and hide the race); then the constant-weight bucket is made COLD, the allocator block it
+    would reuse poisoned with zeros, the default (ambient) stream parked by a long spin, and the SAME selection issued on a side stream.
+    The previous form filled the weights on the parked ambient stream: the scorer read zeros, every score was 0 and the selected sets were
+    the smallest ids of each row (a zero tie), not the control's; every operand created on the launch stream gives the control's sets and
+    scores bitwise.  The premise -- the ambient stream still busy at the issue, the bucket created by the call -- is asserted."""
+    if not hasattr(torch.cuda, "_sleep"):
+        pytest.skip("torch.cuda._sleep is the park; the matmul fallback is too short")
+    import cuda.bindings.driver as cuda_drv
+
+    from cudnn import DSA
+
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from gated_block_stream_probe import park_the_default_stream
+
+    device = torch.device("cuda")
+    lengths, n_blocks, top_k = [256], 64, 16
+    qi, kbar, cu = _inputs(lengths, n_blocks, device, seed=19)
+    total = sum(lengths)
+    cu_k = torch.arange(len(lengths) + 1, dtype=torch.int32, device=device) * n_blocks
+    cand_offsets, cand_floats = DSA.compress_topk_cand_buffer_size_thd(cu, cu_k, QSA_BLOCK_SIZE, None)
+    cand = torch.empty(cand_floats, dtype=torch.float32, device=device)
+    outs = {
+        name: (torch.full((total, top_k), -7, dtype=torch.int32, device=device), torch.full((total, top_k), 3.0, dtype=torch.float32, device=device))
+        for name in ("control", "side")
+    }
+    kw = dict(top_k=top_k, max_seqlen_q=total, cand_buffer=cand, cand_batch_offsets=cand_offsets)
+    ambient, side = torch.cuda.default_stream(), torch.cuda.Stream()
+    assert torch.cuda.current_stream() == ambient and side != ambient
+
+    control = qsa_select(qi, kbar, cu, block_ids_out=outs["control"][0], scores_out=outs["control"][1], **kw)
+    torch.cuda.synchronize()
+    ref = _qsa_reference(qi, kbar, cu, None, QSA_BLOCK_SIZE, _D**-0.5)
+    _assert_selection(control["block_ids"], control["scores"], ref, top_k)
+    sparse = torch.isfinite(ref).sum(dim=-1) > top_k
+    assert int(sparse.sum()) == total - (QSA_BLOCK_SIZE * top_k + QSA_BLOCK_SIZE - 1)
+    smallest = torch.arange(top_k, device=device, dtype=torch.int32)
+    zero_tie_rows = (torch.sort(control["block_ids"][sparse], dim=-1).values == smallest).all(dim=-1)
+    # The zero-score selection (every score 0, the smallest ids win the tie) must be distinguishable from the control: a sparse row that sees
+    # barely more blocks than top_k may legitimately select the smallest ids (the top 16 of 17 with probability 1 / 17), the last row (64
+    # visible blocks) cannot, and at most a couple of rows may -- the race then shows on every other sparse row.
+    assert (
+        not bool(zero_tie_rows[-1]) and int(zero_tie_rows.sum()) <= 2
+    ), f"{int(zero_tie_rows.sum())} of {int(sparse.sum())} sparse control rows are the smallest-ids selection"
+
+    monkeypatch_cache = dict(qsa_mod._ones_cache)  # the live cache is restored below; a fresh dict makes the bucket cold
+    qsa_mod._ones_cache = {}
+    try:
+        poison_ptr = _poison_the_weight_bucket(total * _H, device)
+        park_the_default_stream(3.0)  # the AMBIENT stream is busy from here, through the call and past its issue
+        qsa_select(qi, kbar, cu, block_ids_out=outs["side"][0], scores_out=outs["side"][1], stream=cuda_drv.CUstream(side.cuda_stream), **kw)
+        parked_at_issue = not ambient.query()
+        side.synchronize()  # the LAUNCH stream only
+        created = len(qsa_mod._ones_cache)
+        entry = next(iter(qsa_mod._ones_cache.values()), None)
+    finally:
+        qsa_mod._ones_cache = monkeypatch_cache
+    torch.cuda.synchronize()
+    weights_ptr = (entry[0] if isinstance(entry, tuple) else entry).data_ptr() if entry is not None else 0
+    print(f"premise: parked_at_issue={parked_at_issue} buckets_created={created}; weights at 0x{weights_ptr:x}, poisoned block 0x{poison_ptr:x}")
+    assert parked_at_issue, "the premise: the ambient stream must still be busy when the call was issued"
+    assert created == 1, "the premise: the call created the weight bucket (it was cold)"
+    ids_side, ids_ctl = torch.sort(outs["side"][0], dim=-1).values, torch.sort(outs["control"][0], dim=-1).values
+    differ = int((ids_side != ids_ctl).any(dim=-1).sum())
+    assert (
+        differ == 0
+    ), f"{differ} of {total} rows selected on the side stream differ from the synchronised control (the weights' fill sat on the parked ambient stream)"
+    assert torch.equal(torch.sort(outs["side"][1], dim=-1).values, torch.sort(outs["control"][1], dim=-1).values), "the scores differ from the control's"
+
+
 # --------------------------------------------------------------------------------------------- the fp8 indexer cache arm
 
 
@@ -381,6 +543,7 @@ def test_qsa_select_refuses_a_scale_prefix_on_the_bf16_arm_and_a_malformed_one()
             qsa_select(q8, k8, cu, top_k=2, cu_seqlens_q_scale_padded=bad)
 
 
+@needs_dsl_floor
 @needs_sm100_family
 def test_qsa_select_e4m3_cache_takes_a_precomputed_scale_prefix():
     """The e4m3 arm with the padded Q scale prefix handed in (the block's plan constant: ``_fp8_q_scale_prefix``, every length rounded up to
@@ -404,6 +567,7 @@ def test_qsa_select_e4m3_cache_takes_a_precomputed_scale_prefix():
     _assert_selection(given["block_ids"], given["scores"], ref, QSA_TOP_K)
 
 
+@needs_dsl_floor
 @needs_sm100_family
 @pytest.mark.parametrize("n_blocks", [7, 513, 8192])
 def test_qsa_select_e4m3_cache_matches_the_fp64_reference_on_the_e4m3_values(n_blocks):
@@ -441,6 +605,7 @@ def test_qsa_select_e4m3_cache_matches_the_fp64_reference_on_the_e4m3_values(n_b
         ), f"{int(differs.sum())} ids differ between the e4m3 and the upcast-bf16 kernels beyond a tie"
 
 
+@needs_dsl_floor
 @needs_sm100_family
 def test_qsa_select_e4m3_cache_thd_tails_and_chunked_prefill():
     """Packed e4m3 sequences whose lengths are not multiples of the 32-token scale span of a 4-head MXFP8 tile: 5 tokens
@@ -469,6 +634,7 @@ def test_qsa_select_e4m3_cache_thd_tails_and_chunked_prefill():
     assert int(seq2.max()) < n_blocks[2]
 
 
+@needs_dsl_floor
 @needs_sm100_family
 def test_qsa_select_e4m3_cache_flips_only_at_the_rank_boundary_against_the_bf16_selection():
     """The acceptance measurement of the fp8 cache in miniature: one dense sequence of 4096 unit-variance tokens (1024

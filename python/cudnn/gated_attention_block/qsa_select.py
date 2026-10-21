@@ -44,6 +44,14 @@ Contract (prefill, THD-packed queries):
   S = 4096, 97.4 % at 32768 and 96.5 % at 131072 (sparse rows; every flipped block within the row's own e4m3 score
   noise of the k-th score), against 99.8 % for bf16 vs fp32. A mixed pair (one bf16, one e4m3) is refused.
 
+**Streams (Rule 5).** Every torch operation of a call runs on the LAUNCH stream (``stream``, else torch's current stream), resolved
+first: the cached constants' creation (the constant head weights, the packed-K row offsets, the e4m3 arm's unit scale blobs), the
+e4m3 arm's per-call padded Q prefix, and the scorer wrapper's own work.  A cached constant filled on one stream and read by a later
+call on another is ordered behind its fill through the event recorded when it was created (``wait_event`` on the reading stream).
+Inside a stream capture neither the record nor the wait is issued (an event recorded outside a capture cannot be waited on inside
+one), so a captured call's constants are warmed up on the capture stream first -- one call outside the capture at the same
+``(B, n_blocks_max)``, head count and cache dtype -- the rule every capture of the gated attention block already follows.
+
 The DECODE form is :func:`qsa_select_decode` (one to a few query rows per sequence, the verify rows sharing the
 step-0 list): the dense DSA scorer at the smallest MMA tile plus the radix top-k kernel with one length per row.
 """
@@ -56,6 +64,7 @@ from typing import Optional, Sequence, Union
 
 import torch
 
+from cudnn._torch_stream import _raw_current_stream, stream_context
 from cudnn.api_base import TupleDict
 from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
 
@@ -81,7 +90,7 @@ _SF_VEC_SIZE = 32  # elements per E8M0 scale of the MXFP8 scorer (head_dim 128 -
 _SF_ATOM_ROWS = 128  # packed (token, head) rows per scale atom: every scale span is a multiple of it
 _MXFP8_TILE_ROWS = 128  # the MXFP8 scorer's packed-row tile (fixed; the bf16 scorer's m_block_size knob does not apply)
 
-_ones_cache: dict = {}
+_ones_cache: dict = {}  # (device index, capacity) -> (the bf16 ones buffer, the handle of the stream that filled it, its fill event or None)
 _ones_cache_lock = Lock()
 
 
@@ -95,26 +104,59 @@ def indexer_scorer_head_groups() -> tuple:
     return tuple(SUPPORTED_QHEAD_PER_KV_HEAD_BF16)
 
 
-_cu_k_cache: dict = {}
+_cu_k_cache: dict = {}  # (device index, B, n_blocks_max) -> (the int32 row offsets, the filling stream's handle, its fill event or None)
 _cu_k_cache_lock = Lock()
-_unit_scale_cache: dict = {}
+_unit_scale_cache: dict = {}  # (device index, shape) -> (the E8M0 ones blob, the filling stream's handle, its fill event or None)
 _unit_scale_cache_lock = Lock()
+
+
+def _device_index(device: torch.device) -> int:
+    return torch.cuda.current_device() if device.index is None else device.index
+
+
+def _current_stream_handle(index: int) -> int:
+    """torch's current stream on device ``index`` as a raw handle -- the identity the constant caches compare (torch's raw getter, ~0.07 us;
+    the Stream object only where that getter is absent)."""
+    raw = _raw_current_stream(torch, index)
+    return int(raw) if raw is not None else torch.cuda.current_stream(index).cuda_stream
+
+
+def _cached_constant(cache: dict, lock: Lock, key: tuple, index: int, make):
+    """A process-lifetime device constant of the selector (never evicted: a CUDA graph may retain the address captured at warm-up), created
+    by ``make()`` on the stream torch is CURRENTLY on -- the caller has entered the launch stream's context, so the fill is ordered ahead of
+    the scorer that reads it (Rule 5) -- with an event recorded behind the fill.  A later caller whose launch stream is not the one that filled
+    the constant first waits on that event (``wait_event`` on its own stream: the read is ordered behind the fill whatever the filling stream
+    is doing -- the previous form handed a scorer on a side stream a buffer whose fill sat on torch's parked default stream).  Inside a stream
+    capture neither the record nor the wait is issued (an event recorded outside a capture cannot be waited on inside one): the constants of
+    a captured call are warmed up on the capture stream beforehand (the module docstring)."""
+    with lock:
+        entry = cache.get(key)
+        if entry is None:
+            value = make()
+            event = None
+            if not torch.cuda.is_current_stream_capturing():
+                event = torch.cuda.Event()
+                event.record(torch.cuda.current_stream(index))
+            cache[key] = (value, _current_stream_handle(index), event)
+            return value
+    value, producer, event = entry
+    if event is not None and _current_stream_handle(index) != producer and not torch.cuda.is_current_stream_capturing():
+        torch.cuda.current_stream(index).wait_event(event)
+    return value
 
 
 def _constant_weights(numel: int, device: torch.device) -> torch.Tensor:
     """A cached bf16 ones buffer (power-of-two capacity buckets, never evicted) -- the constant head weight.
 
     Mirrors the DSA denominator placeholder: a CUDA graph may retain the address captured at warm-up, so a
-    bucket is never replaced; one allocation per (device, capacity) for the life of the process.
+    bucket is never replaced; one allocation per (device, capacity) for the life of the process.  Created on the
+    launch stream of the call that first needs the bucket and ordered for every other stream (:func:`_cached_constant`).
     """
-    index = torch.cuda.current_device() if device.index is None else device.index
+    index = _device_index(device)
     capacity = 1 << (max(1, numel) - 1).bit_length()
-    key = (index, capacity)
-    with _ones_cache_lock:
-        buf = _ones_cache.get(key)
-        if buf is None:
-            buf = torch.ones((capacity,), dtype=torch.bfloat16, device=torch.device("cuda", index))
-            _ones_cache[key] = buf
+    buf = _cached_constant(
+        _ones_cache, _ones_cache_lock, (index, capacity), index, lambda: torch.ones((capacity,), dtype=torch.bfloat16, device=torch.device("cuda", index))
+    )
     return buf[:numel]
 
 
@@ -123,15 +165,17 @@ def _unit_scale_blob(shape: tuple, device: torch.device) -> torch.Tensor:
 
     Every byte is 127 (= 2^0), so the MXFP8 scorer multiplies by 1.0 and computes the plain e4m3 x e4m3 dot. Cached per
     exact shape and never evicted (a CUDA graph may retain the address captured at warm-up); the blob is 1/32 of the data.
+    Created on the launch stream of the first call that needs it and ordered for every other stream (:func:`_cached_constant`).
     """
-    index = torch.cuda.current_device() if device.index is None else device.index
-    key = (index, tuple(int(x) for x in shape))
-    with _unit_scale_cache_lock:
-        blob = _unit_scale_cache.get(key)
-        if blob is None:
-            blob = torch.ones(key[1], dtype=torch.float32, device=torch.device("cuda", index)).to(_E8M0)
-            _unit_scale_cache[key] = blob
-    return blob
+    index = _device_index(device)
+    dims = tuple(int(x) for x in shape)
+    return _cached_constant(
+        _unit_scale_cache,
+        _unit_scale_cache_lock,
+        (index, dims),
+        index,
+        lambda: torch.ones(dims, dtype=torch.float32, device=torch.device("cuda", index)).to(_E8M0),
+    )
 
 
 def _round_up(x: int, m: int) -> int:
@@ -155,18 +199,20 @@ def _fp8_q_scale_prefix(cu_seqlens_q: torch.Tensor, n_heads: int) -> torch.Tenso
 
 
 def _padded_cu_seqlens_k(batch: int, n_blocks_max: int, device: torch.device) -> torch.Tensor:
-    """``[0, n, 2n, ..., B n]`` int32: the row offsets of a ``[B, n_blocks_max, D]`` key buffer seen as packed."""
-    index = torch.cuda.current_device() if device.index is None else device.index
-    key = (index, batch, n_blocks_max)
-    with _cu_k_cache_lock:
-        t = _cu_k_cache.get(key)
-        if t is None:
-            t = torch.arange(batch + 1, dtype=torch.int64) * n_blocks_max
-            if int(t[-1]) >= 2**31:
-                raise ValueError(f"kbar holds {batch} x {n_blocks_max} rows; the packed row offsets must fit int32")
-            t = t.to(dtype=torch.int32, device=torch.device("cuda", index))
-            _cu_k_cache[key] = t
-    return t
+    """``[0, n, 2n, ..., B n]`` int32: the row offsets of a ``[B, n_blocks_max, D]`` key buffer seen as packed -- built ON DEVICE (two
+    small launches on the launch stream, no host upload: the pageable upload of the previous form blocked the host on the stream it
+    was issued on) the first time a ``(device, B, n_blocks_max)`` is seen, cached and ordered for every stream (:func:`_cached_constant`)."""
+    index = _device_index(device)
+    batch, n_blocks_max = int(batch), int(n_blocks_max)
+    if batch * n_blocks_max >= 2**31:
+        raise ValueError(f"kbar holds {batch} x {n_blocks_max} rows; the packed row offsets must fit int32")
+    return _cached_constant(
+        _cu_k_cache,
+        _cu_k_cache_lock,
+        (index, batch, n_blocks_max),
+        index,
+        lambda: torch.arange(batch + 1, dtype=torch.int32, device=torch.device("cuda", index)) * n_blocks_max,
+    )
 
 
 def _as_host_ints(values, name: str) -> list:
@@ -324,50 +370,54 @@ def qsa_select(
 
     if scale is None:
         scale = head_dim**-0.5
-    weights = w if w is not None else _constant_weights(total_q * n_heads, qi.device).view(total_q, n_heads)
-    cu_seqlens_k = _padded_cu_seqlens_k(batch, n_blocks_max, qi.device)
-    fp8_kwargs = {}
-    if fp8:
-        # The plain-e4m3 scorer = the MXFP8 arm with all-ones scales. Its scale storage is per 128 packed rows: the Q
-        # prefix rounds every sequence up to 128 // gcd(128, n_heads) tokens (32 for 4 heads) -- the caller's precomputed
-        # one (a plan constant of the block's indexer stage, Rule 1) or derived here on device (no sync) --, the blob
-        # covers the largest padded extent that prefix can reach; the K prefix is host-known (kbar is padded per
-        # sequence to n_blocks_max rows, its scale span to the next multiple of 128).
-        sf_groups = head_dim // _SF_VEC_SIZE
-        q_align = _SF_ATOM_ROWS // math.gcd(_SF_ATOM_ROWS, n_heads)
-        q_rows_bound = _round_up((total_q + batch * (q_align - 1)) * n_heads, _SF_ATOM_ROWS)
-        k_rows_per_seq = _round_up(n_blocks_max, _SF_ATOM_ROWS)
-        fp8_kwargs = dict(
-            precision="mxfp8",
-            q_scale=_unit_scale_blob((1, q_rows_bound, sf_groups), qi.device),
-            k_scale=_unit_scale_blob((1, batch * k_rows_per_seq, sf_groups), qi.device),
-            cu_seqlens_q_scale_padded=cu_seqlens_q_scale_padded if cu_seqlens_q_scale_padded is not None else _padded_prefix(cu_seqlens_q, q_align),
-            cu_seqlens_k_scale_padded=_padded_cu_seqlens_k(batch, k_rows_per_seq, qi.device),
-            sf_vec_size=_SF_VEC_SIZE,
+    # Rule 5: the LAUNCH stream first.  Every torch operation below -- the cached constants' creation and their cross-stream ordering
+    # (_cached_constant), the e4m3 arm's per-call prefix, the scorer wrapper's own work -- runs on it; stream=None is torch's current
+    # stream, where the context is a no-op (recipe R1: the one stream helper, never a hand-rolled ExternalStream).
+    with stream_context(stream, qi.device):
+        weights = w if w is not None else _constant_weights(total_q * n_heads, qi.device).view(total_q, n_heads)
+        cu_seqlens_k = _padded_cu_seqlens_k(batch, n_blocks_max, qi.device)
+        fp8_kwargs = {}
+        if fp8:
+            # The plain-e4m3 scorer = the MXFP8 arm with all-ones scales. Its scale storage is per 128 packed rows: the Q
+            # prefix rounds every sequence up to 128 // gcd(128, n_heads) tokens (32 for 4 heads) -- the caller's precomputed
+            # one (a plan constant of the block's indexer stage, Rule 1) or derived here on device (no sync) --, the blob
+            # covers the largest padded extent that prefix can reach; the K prefix is host-known (kbar is padded per
+            # sequence to n_blocks_max rows, its scale span to the next multiple of 128).
+            sf_groups = head_dim // _SF_VEC_SIZE
+            q_align = _SF_ATOM_ROWS // math.gcd(_SF_ATOM_ROWS, n_heads)
+            q_rows_bound = _round_up((total_q + batch * (q_align - 1)) * n_heads, _SF_ATOM_ROWS)
+            k_rows_per_seq = _round_up(n_blocks_max, _SF_ATOM_ROWS)
+            fp8_kwargs = dict(
+                precision="mxfp8",
+                q_scale=_unit_scale_blob((1, q_rows_bound, sf_groups), qi.device),
+                k_scale=_unit_scale_blob((1, batch * k_rows_per_seq, sf_groups), qi.device),
+                cu_seqlens_q_scale_padded=cu_seqlens_q_scale_padded if cu_seqlens_q_scale_padded is not None else _padded_prefix(cu_seqlens_q, q_align),
+                cu_seqlens_k_scale_padded=_padded_cu_seqlens_k(batch, k_rows_per_seq, qi.device),
+                sf_vec_size=_SF_VEC_SIZE,
+            )
+        result = indexer_forward_top_k_wrapper(
+            qi,
+            kbar.view(batch * n_blocks_max, 1, head_dim),
+            weights,
+            top_k=top_k,
+            ratio=block_size,
+            qhead_per_kv_head=n_heads,
+            sm_scale=float(scale),
+            stream=stream,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=n_blocks_max,
+            q_causal_offsets=q_pos0,
+            topk_indices_global=False,
+            cand_buffer=cand_buffer,
+            out_indices=block_ids_out,
+            out_logits=scores_out,
+            cand_batch_offsets=cand_batch_offsets,
+            return_softmax=False,
+            deterministic=deterministic,
+            **fp8_kwargs,
         )
-    result = indexer_forward_top_k_wrapper(
-        qi,
-        kbar.view(batch * n_blocks_max, 1, head_dim),
-        weights,
-        top_k=top_k,
-        ratio=block_size,
-        qhead_per_kv_head=n_heads,
-        sm_scale=float(scale),
-        stream=stream,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_k,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=n_blocks_max,
-        q_causal_offsets=q_pos0,
-        topk_indices_global=False,
-        cand_buffer=cand_buffer,
-        out_indices=block_ids_out,
-        out_logits=scores_out,
-        cand_batch_offsets=cand_batch_offsets,
-        return_softmax=False,
-        deterministic=deterministic,
-        **fp8_kwargs,
-    )
     return TupleDict(block_ids=result["indices"], scores=result["logits"])
 
 
@@ -561,7 +611,8 @@ def qsa_select_decode(
     if scale is None:
         scale = head_dim**-0.5
     rows = 1 if list_per_sequence else rows_per_seq
-    with torch_stream_context(stream):
+    # Rule 5: every torch operation on the launch stream (the operands' device named: the context's default is the current device)
+    with torch_stream_context(stream, qi.device):
         positions, n_vis = decode_row_positions_and_counts(kv_lens, rows_per_seq, block_size, n_blocks_max, list_per_sequence=list_per_sequence)
         pos0 = positions if list_per_sequence else positions[:, 0].contiguous()
         q_rows = qi if not list_per_sequence else qi[:, :1]

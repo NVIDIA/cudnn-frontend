@@ -8080,6 +8080,17 @@ class GatedAttentionBlockFwd(APIBase):
                 _check_index_tensor(block_ids_out, "block_ids_out", (t, top_k), (self.batch, self.seq_len, top_k), h.device)
             if block_lens_out is not None:
                 _check_index_tensor(block_lens_out, "block_lens_out", (t,), (self.batch, self.seq_len), h.device)
+            # The 16-byte rule of the caller-list form's block_ids (below), on every buffer the indexer reads or writes in 16-byte vectors:
+            # the compress kernel moves the two norm weights and the compressed-key cache in 128-bit accesses (its own check would refuse
+            # a storage-offset view, but only at stage (4i), after the projection, the norm + RoPE and a declared write-through have run),
+            # the cast kernel writes the e4m3 cache the same way, and block_ids_out becomes the list the sparse core binds as a TMA /
+            # bulk-copy base.  Refused HERE, before any stage, so the refusal modifies nothing; block_lens_out is a plain row copy.
+            for nm, x in (("w_iq_norm", w_iq_norm), ("w_ik_norm", w_ik_norm), ("index_k_compressed", index_k_compressed), ("block_ids_out", block_ids_out)):
+                if x is not None and int(x.data_ptr()) % 16:
+                    raise ValueError(
+                        f"{nm} must start at a 16-byte aligned address (the indexer reads / writes it in 16-byte vectors; block_ids_out becomes "
+                        f"the sparse core's TMA / bulk-copy base) -- a storage-offset view is refused before any stage runs; got data_ptr=0x{int(x.data_ptr()):x}"
+                    )
             return
         if indexer_args:
             raise ValueError(

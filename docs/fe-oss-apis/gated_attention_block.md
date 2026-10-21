@@ -413,11 +413,15 @@ valid ids then `-1`, so the sparse core takes it without `block_lens`.
 
 | the stack hands in / gets back | form | meaning |
 |---|---|---|
-| `w_iq_norm`, `w_ik_norm` | `[index_head_dim]` activation dtype, contiguous; REQUIRED | the indexer's two RMSNorm weights in the pre-folded `(1 + w)` form the attention's `w_q_norm` / `w_k_norm` use (the loader's convention) |
+| `w_iq_norm`, `w_ik_norm` | `[index_head_dim]` activation dtype, contiguous, 16-byte-aligned base; REQUIRED | the indexer's two RMSNorm weights in the pre-folded `(1 + w)` form the attention's `w_q_norm` / `w_k_norm` use (the loader's convention) |
 | `block_ids` / `block_lens` | -- | REFUSED: the block derives the selection |
-| `block_ids_out` | int32 `[T, top_k]` or `[B, S_q, top_k]`, contiguous; optional | the block's OWN selection in canonical order (ids descending, then `-1`), written in place (the step-0 list a speculative-decoding caller reuses for the drafted rows) |
+| `block_ids_out` | int32 `[T, top_k]` or `[B, S_q, top_k]`, contiguous, 16-byte-aligned base; optional | the block's OWN selection in canonical order (ids descending, then `-1`), written in place (the step-0 list a speculative-decoding caller reuses for the drafted rows) |
 | `block_lens_out` | int32 `[T]` or `[B, S_q]`, contiguous; optional | the valid-prefix length of every row of that list, `min(top_k, floor((pos + 1) / 4))` -- the position rule, padding rows included |
-| `index_k_compressed` | the indexer cache dtype (`QsaSpec.index_cache_dtype`: the activation dtype by default, `torch.float8_e4m3fn` under the fp8 indexer cache) `[B, >= floor(S / 4), index_head_dim]`, contiguous; optional | the compressed-key cache: the compress writes rows `[0, floor(S_b / 4))` of every sequence (its complete blocks) and never touches the rest, so a cache sized for a longer context keeps its later rows |
+| `index_k_compressed` | the indexer cache dtype (`QsaSpec.index_cache_dtype`: the activation dtype by default, `torch.float8_e4m3fn` under the fp8 indexer cache) `[B, >= floor(S / 4), index_head_dim]`, contiguous, 16-byte-aligned base; optional | the compressed-key cache: the compress writes rows `[0, floor(S_b / 4))` of every sequence (its complete blocks) and never touches the rest, so a cache sized for a longer context keeps its later rows |
+
+A storage-offset view of the two norm weights, the cache or `block_ids_out` that starts a few bytes off a 16-byte boundary is refused by
+name at `execute`, before any stage runs (the compress and cast kernels move those buffers in 16-byte vectors; the list is the sparse
+core's TMA / bulk-copy base) -- the rule the caller-list form applies to `block_ids`.
 
 **The RoPE tables are the attention's own.** The compress reads `cos` / `sin` at row `4j` for block `j` (every block start
 is a position of the prefill) and the query norm at row `pos`: no appended block-start table and no position ids. A
@@ -470,6 +474,9 @@ constants (the query prefix, the scratch offsets, the counts, the identity list,
 at `compile()` and uploaded on the launch stream by the first `execute()` after it, never written at `compile()` on the ambient
 stream; a CUDA graph that captures a block's FIRST execute records those uploads with their values (constants: a replay
 re-writes the same ones), so warm the block up on the capture stream before capturing, as every capture of the block does.
+`qsa_select` itself creates its cached constants (the constant head weights, the packed-K row offsets, the e4m3 arm's unit scale
+blobs) on the launch stream of the first call that needs them and orders a later call on another stream behind that fill through
+an event recorded at the creation (not inside a capture, where no such event can be waited on -- the warm-up rule above covers it).
 
 **What the suite asserts** (`test_block_qsa_end_to_end.py`, the two-stage oracle): the selection as a SET against the
 top-k of the scores recomputed in fp64 from the kernel's own bf16 queries and compressed keys up to ties; against the

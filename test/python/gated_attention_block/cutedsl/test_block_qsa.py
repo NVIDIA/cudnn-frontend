@@ -357,7 +357,14 @@ _DECLINES = [
         id="indexer_head_dim",
     ),
     pytest.param(
-        {}, QsaSpec(index_source="indexer", index_band=True, index_heads=3), {}, torch.bfloat16, NotImplementedError, "head groups", id="indexer_heads"
+        {},
+        QsaSpec(index_source="indexer", index_band=True, index_heads=3),
+        {},
+        torch.bfloat16,
+        NotImplementedError,
+        "head groups",
+        id="indexer_heads",
+        marks=_needs_dsl_floor,  # the head-group read sits behind the floor gate: below it the version decline answers first
     ),
     pytest.param(dict(d_head=128), QsaSpec(), {}, torch.bfloat16, NotImplementedError, "d_head == 256", id="d_head"),
     # the fp8 indexer cache on f16 activations: the indexer's own dtype row speaks (the scorer packs bf16 queries and keys)
@@ -1076,6 +1083,46 @@ def test_the_dsl_floor_declines_through_the_block_before_any_kernel_import(monke
 # ---------------------------------------------------------------------------
 
 
+@_needs_dsl_floor
+@pytest.mark.parametrize("buffer", ["w_iq_norm", "w_ik_norm", "index_k_compressed", "block_ids_out"])
+def test_execute_refuses_a_misaligned_indexer_buffer_before_any_stage_runs(buffer):
+    """The indexer form's 16-byte rule -- the caller-list form's ``block_ids`` rule (below) on every buffer the indexer reads or writes in
+    16-byte vectors: the two norm weights and the compressed-key cache (the compress kernel's own check would refuse a storage-offset
+    view, but only at stage (4i), after the projection, the norm + RoPE and a declared write-through have run) and ``block_ids_out``
+    (the list stage (4) binds as a TMA / bulk-copy base).  A view a few bytes off a 16-byte boundary -- contiguous, the right dtype,
+    shape and device -- is refused by name HERE, before the first stage runs; the same view at a 16-byte offset is the control and passes
+    every form check (the next refusal is the plan's).  Form only, no host sync."""
+    spec = QsaSpec(index_source="indexer", index_band=True)
+    geom = GatedAttentionBlockGeometry(**_SMALL_D256, qsa=spec)
+    b, s = 2, 8
+    kw = _samples(geom, batch=b, seq_len=s)
+    args = tuple(kw[k] for k in ("sample_h", "sample_w_qkvg", "sample_w_q_norm", "sample_w_k_norm", "sample_cos", "sample_sin", "sample_w_o", "sample_out"))
+    ws = torch.zeros(16, dtype=torch.uint8, device=_DEV)
+    w = torch.ones(spec.index_head_dim, dtype=torch.bfloat16, device=_DEV)
+    forms = {
+        "w_iq_norm": ((spec.index_head_dim,), torch.bfloat16, 1.0),
+        "w_ik_norm": ((spec.index_head_dim,), torch.bfloat16, 1.0),
+        "index_k_compressed": ((b, s // spec.block_size, spec.index_head_dim), torch.bfloat16, 0.0),
+        "block_ids_out": ((b * s, spec.top_k), torch.int32, 0),
+    }
+    shape, dtype, fill = forms[buffer]
+    e = _itemsize(dtype)
+
+    def offset_view(offset_elems):
+        flat = torch.full((torch.Size(shape).numel() + offset_elems,), fill, dtype=dtype, device=_DEV)
+        return flat[offset_elems:].view(*shape)
+
+    bad, good = offset_view(1), offset_view(16 // e)  # one element (2 or 4 bytes) off a 16-byte boundary; 16 bytes off = aligned
+    assert bad.data_ptr() % 16 == e and good.data_ptr() % 16 == 0 and bad.is_contiguous() and good.is_contiguous()
+    base = dict(w_iq_norm=w, w_ik_norm=w)
+    with _no_host_sync():
+        blk = GatedAttentionBlockFwd(**kw, geometry=geom)
+        with pytest.raises(ValueError, match=rf"{buffer} must start at a 16-byte aligned address"):
+            blk.execute(*args, ws, **{**base, buffer: bad})
+        with pytest.raises(RuntimeError, match="call compile"):  # the control passes every form check: the next refusal is the plan's
+            blk.execute(*args, ws, **{**base, buffer: good})
+
+
 def test_execute_form_checks_on_the_index_tensors():
     geom = GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec())
     dense_geom = GatedAttentionBlockGeometry(**_SMALL_D256)
@@ -1169,6 +1216,7 @@ def _bf16_ulp(x: torch.Tensor) -> torch.Tensor:
     return torch.ldexp(torch.ones_like(x, dtype=torch.float32), e - 8)
 
 
+@_needs_dsl_floor  # the block's stages answer here (the sparse adapter declines by version below the floor): skip, never fail, there
 @requires_rubin
 def test_unfused_projection_serves_the_indexer_band_at_flash_next():
     """Stage (1) at N = 13952 (the four dense bands + the 640-column indexer band) through the block's own stage objects,
@@ -1269,6 +1317,7 @@ def test_unfused_projection_serves_the_indexer_band_at_flash_next():
     assert (ws[lay.o : lay.o + 16] == 0x7F).all()
 
 
+@_needs_dsl_floor
 def test_an_e4m3_indexer_cache_declaration_appends_its_slots_and_the_cache_dtype_flips_the_execute_contract():
     """``QsaSpec(index_source="indexer", index_band=True, index_cache_dtype=torch.float8_e4m3fn)`` -- the fp8 indexer cache --
     CONSTRUCTS (no host sync): past the identity bound the carve is the bf16 indexer block's seven slots followed by the two e4m3

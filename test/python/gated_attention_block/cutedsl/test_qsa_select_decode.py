@@ -6,8 +6,9 @@
 A decode step has one to a few query rows per sequence (the step-0 token plus speculative drafts); the selector
 scores them with the dense DSA unified scorer at the smallest MMA tile and selects per row with the radix top-k
 kernel, one visible-block count per row.  The reject / gate tests and the count-rule tests run anywhere (CPU or any
-CUDA device: the declines fire before a kernel is compiled); the accept cells need an SM100-family GPU (the scorer
-is a tcgen05 kernel) and compare
+CUDA device: the declines fire before a kernel is compiled; the gates BEHIND the CuTe DSL floor -- the target, the device
+family, the head groups -- skip below it, where the version decline answers first); the accept cells need an SM100-family
+GPU (the scorer is a tcgen05 kernel) and compare
 
 * the selected SETS against ``torch.topk`` of an fp64 re-derivation of the indexer score on the SAME bf16 inputs,
   up to ties at the k-th boundary (the sharp check), and
@@ -23,7 +24,11 @@ import pytest
 import torch
 
 import cudnn.gated_attention_block.qsa_select as qsa_mod
-from cudnn.gated_attention_block.qsa_select import QSA_BLOCK_SIZE, QSA_TOP_K, TOP_K_KERNEL_MAX, decode_row_positions_and_counts, qsa_select, qsa_select_decode
+from cudnn.frost.buffers import cutedsl_requirement_error
+
+# the module imported ONE way: its names read off the module object
+QSA_BLOCK_SIZE, QSA_TOP_K, TOP_K_KERNEL_MAX = qsa_mod.QSA_BLOCK_SIZE, qsa_mod.QSA_TOP_K, qsa_mod.TOP_K_KERNEL_MAX
+decode_row_positions_and_counts, qsa_select, qsa_select_decode = qsa_mod.decode_row_positions_and_counts, qsa_mod.qsa_select, qsa_mod.qsa_select_decode
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -42,6 +47,11 @@ def _cc():
 
 needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="a CUDA device is needed for the input tensors")
 needs_sm100_family = pytest.mark.skipif(_cc() is None or _cc()[0] != 10, reason=f"the scorer is a tcgen05 kernel (cc 10.x); found {_cc()}")
+# Below FROST's CuTe DSL floor the decode selector declines by VERSION ahead of its later gates (the target, the device family, the head
+# groups) and ahead of any scorer launch (Rule 7): the cells that expect one of those later answers, and every accept cell, skip there
+# instead of failing; the form checks and the count rule ahead of the gate, and the version-decline cell itself, run on any DSL.
+_CUTEDSL_REQUIREMENT = cutedsl_requirement_error("qsa_select_decode")  # None at or above the floor
+needs_dsl_floor = pytest.mark.skipif(_CUTEDSL_REQUIREMENT is not None, reason=str(_CUTEDSL_REQUIREMENT))
 
 
 def _inputs(batch, rows_per_seq, n_blocks_max, device, *, seed=0, n_heads=_H):
@@ -217,6 +227,7 @@ def test_decode_declines_below_the_dsl_floor_by_version(monkeypatch):
 
 
 @needs_cuda
+@needs_dsl_floor
 def test_decode_declines_a_dsl_without_the_target(monkeypatch):
     device = torch.device("cuda")
     qi, kbar = _inputs(1, 1, 8, device)
@@ -228,6 +239,7 @@ def test_decode_declines_a_dsl_without_the_target(monkeypatch):
 
 
 @needs_cuda
+@needs_dsl_floor
 def test_decode_declines_devices_below_the_sm100_family(monkeypatch):
     device = torch.device("cuda")
     qi, kbar = _inputs(1, 1, 8, device)
@@ -237,6 +249,7 @@ def test_decode_declines_devices_below_the_sm100_family(monkeypatch):
 
 
 @needs_cuda
+@needs_dsl_floor
 @pytest.mark.parametrize("n_heads", [2, 3, 12, 128])
 def test_decode_declines_unsupported_head_counts(n_heads, monkeypatch):
     """The head set is named after the DSL / device gates pass (the decline needs the scorer's own table); the
@@ -252,6 +265,7 @@ def test_decode_declines_unsupported_head_counts(n_heads, monkeypatch):
 # --------------------------------------------------------------------------------------------- accept cells
 
 
+@needs_dsl_floor
 @needs_sm100_family
 @pytest.mark.parametrize("n_blocks_max", [8, 520, 4096])
 @pytest.mark.parametrize("rows_per_seq", [1, 2, 3, 4])
@@ -286,6 +300,7 @@ def test_decode_per_row_lists_match_the_fp64_reference_and_the_oracle_counts(row
         assert torch.equal(torch.sort(result["block_ids"], dim=-1).values, torch.sort(want_ids.to(device), dim=-1).values)
 
 
+@needs_dsl_floor
 @needs_sm100_family
 def test_decode_shared_list_is_the_step0_row_and_is_reused_by_the_verify_rows():
     """``list_per_sequence=True`` returns the step-0 row's list ([B, top_k]); it equals the per-row form's row 0 and
@@ -337,6 +352,7 @@ def test_decode_shared_list_is_the_step0_row_and_is_reused_by_the_verify_rows():
             assert bool(visible[rows_per_seq - 1, QSA_BLOCK_SIZE * blk : QSA_BLOCK_SIZE * blk + QSA_BLOCK_SIZE].all())
 
 
+@needs_dsl_floor
 @needs_sm100_family
 def test_decode_ties_keep_the_smaller_block_ids():
     """Identical compressed keys tie every visible block: ``tie_break = 1`` (the default) keeps the smallest ids of
@@ -364,6 +380,7 @@ def test_decode_ties_keep_the_smaller_block_ids():
     )
 
 
+@needs_dsl_floor
 @needs_sm100_family
 def test_decode_agrees_with_the_prefill_selector_on_the_same_rows():
     """The prefill selector (compact-logits + fused top-k, THD) over the last rows of each sequence and the decode
@@ -394,6 +411,7 @@ def test_decode_agrees_with_the_prefill_selector_on_the_same_rows():
             assert bool(((ref[r, diff] - kth[r]).abs() <= 1e-4).all()), f"row {r}: {len(a ^ b)} ids differ beyond a tie"
 
 
+@needs_dsl_floor
 @needs_sm100_family
 def test_decode_scorer_tile_is_a_knob():
     """``m_block_size`` changes the scorer's schedule only: 16 (the default, four tokens of four heads) and 32 give
@@ -427,6 +445,7 @@ def test_decode_rejects_a_mixed_cache_dtype_and_the_tile_knob_with_e4m3():
         qsa_select_decode(qi.to(_E4M3), kbar.to(_E4M3), kv, m_block_size=16)
 
 
+@needs_dsl_floor
 @needs_sm100_family
 @pytest.mark.parametrize("rows_per_seq", [1, 4])
 def test_decode_e4m3_cache_matches_the_fp64_reference_on_the_e4m3_values(rows_per_seq):
