@@ -179,6 +179,7 @@ class BlockScaledContiguousGroupedGemmKernel:
         discrete_col_sfd: bool,
         expert_cnt: int,
         use_mono_increase_expert_idx: bool = True,
+        deterministic: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel.
 
@@ -215,6 +216,10 @@ class BlockScaledContiguousGroupedGemmKernel:
         :param use_mono_increase_expert_idx: Enable monotonic expert index optimization.
             Uses N-major rasterization to guarantee expert_idx monotonicity. Default: True.
         :type use_mono_increase_expert_idx: bool
+        :param deterministic: Write ``dprob`` into one slot per N-tile, ``(valid_m, n_slots, 1)``, with a
+            plain store instead of a float32 atomic add across N-tiles, for the caller to reduce in a fixed
+            order; see docs/fe-oss-apis/gemm_fusions/grouped_gemm_dswiglu.md. Default: False.
+        :type deterministic: bool
         """
         self.sf_vec_size = sf_vec_size
         self.expert_cnt = expert_cnt
@@ -222,6 +227,7 @@ class BlockScaledContiguousGroupedGemmKernel:
         self.use_2cta_instrs = use_2cta_instrs
         self.cluster_shape_mn = cluster_shape_mn
         self.use_mono_increase_expert_idx = use_mono_increase_expert_idx
+        self.deterministic = deterministic
         # K dimension is deferred in _setup_attributes
         self.mma_tiler = (*mma_tiler_mn, 1)
 
@@ -3086,11 +3092,15 @@ class BlockScaledContiguousGroupedGemmKernel:
                     )
 
                 if cutlass.const_expr(self.generate_dprob):
-                    # write dProb result to global memory
-                    _ = atomic_add_float32(
-                        ptr=dprob[(mPosition, None, None)].iterator.llvm_ptr,
-                        value=dProbVal,
-                    )
+                    if cutlass.const_expr(self.deterministic):
+                        # One epilogue thread owns each (token, tile_n) slot, so a plain store suffices.
+                        dprob[(mPosition, tile_info[1], 0)] = dProbVal
+                    else:
+                        # write dProb result to global memory
+                        _ = atomic_add_float32(
+                            ptr=dprob[(mPosition, None, None)].iterator.llvm_ptr,
+                            value=dProbVal,
+                        )
 
             #
             # Dealloc the tensor memory buffer

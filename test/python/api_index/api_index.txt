@@ -717,7 +717,9 @@ cudnn.gemm.cutedsl.grouped.GroupedGemmDsreluSm100.reduce_dprob_workspace
 cudnn.gemm.cutedsl.grouped.GroupedGemmDswigluSm100
 cudnn.gemm.cutedsl.grouped.GroupedGemmDswigluSm100.check_support
 cudnn.gemm.cutedsl.grouped.GroupedGemmDswigluSm100.compile
+cudnn.gemm.cutedsl.grouped.GroupedGemmDswigluSm100.dprob_workspace_shape
 cudnn.gemm.cutedsl.grouped.GroupedGemmDswigluSm100.execute
+cudnn.gemm.cutedsl.grouped.GroupedGemmDswigluSm100.reduce_dprob_workspace
 cudnn.gemm.cutedsl.grouped.GroupedGemmGluHadamardQuantSm100
 cudnn.gemm.cutedsl.grouped.GroupedGemmGluHadamardQuantSm100.check_support
 cudnn.gemm.cutedsl.grouped.GroupedGemmGluHadamardQuantSm100.compile

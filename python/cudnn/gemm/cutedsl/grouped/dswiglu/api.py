@@ -92,6 +92,8 @@ class GroupedGemmDswigluSm100(APIBase):
         m_aligned: int = 256,
         discrete_col_sfd: bool = False,
         epilogue_op: Optional[str] = None,
+        deterministic: bool = False,
+        sample_dprob_workspace: Optional[torch.Tensor] = None,
     ):
         """Initialize the GroupedGemmDswigluSm100 API.
 
@@ -119,6 +121,12 @@ class GroupedGemmDswigluSm100(APIBase):
         :param m_aligned: Alignment for group M dimension
         :param discrete_col_sfd: Boolean, True to generate discrete col-major scale factor tensor
         :param epilogue_op: Optional epilogue operation. Valid values: None, "none", "identity", "relu", "srelu"
+        :param deterministic: Compute dprob run-to-run bit-exactly. dprob keeps its shape; the kernel writes
+            one partial per (token, N-tile) into ``sample_dprob_workspace`` instead, and the caller reduces it
+            into dprob with ``reduce_dprob_workspace`` after execute(). grouped_gemm_dswiglu_wrapper_sm100
+            allocates and reduces the workspace for you.
+        :param sample_dprob_workspace: Determinism scratch, required iff ``deterministic``:
+            ``dprob_workspace_shape(valid_m, n)``, float32, zero-initialized
         """
         framework = "torch" if isinstance(sample_a, TensorDesc) else detect_framework(sample_a)
         if sample_a is not None and framework != "torch":
@@ -164,6 +172,9 @@ class GroupedGemmDswigluSm100(APIBase):
         self.beta_desc = self._make_tensor_desc(sample_beta, name="sample_beta", canonical=True)
         self.prob_desc = self._make_tensor_desc(sample_prob, name="sample_prob", canonical=True)
         self.dprob_desc = self._make_tensor_desc(sample_dprob, name="sample_dprob", canonical=True)
+        # Determinism scratch, kept apart from dprob so dprob means the same thing in both modes.
+        self.dprob_workspace_desc = self._make_tensor_desc(sample_dprob_workspace, name="sample_dprob_workspace", canonical=True)
+        self.deterministic = deterministic
 
         # Optional quantization outputs
         self.sfd_row_desc = self._make_tensor_desc(sample_sfd_row, name="sample_sfd_row", canonical=True)
@@ -202,6 +213,25 @@ class GroupedGemmDswigluSm100(APIBase):
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
         self._logger.debug(f"setting num_cluster_overlap_margin: {self.num_cluster_overlap_margin}")
         self._logger.debug(f"__init__ completed")
+
+    @staticmethod
+    def dprob_workspace_shape(valid_m: int, n: int, mma_tiler_mn: Tuple[int, int] = (256, 256), cluster_shape_mn: Optional[Tuple[int, int]] = None):
+        """Shape of ``sample_dprob_workspace`` -- one fp32 slot per (token, N-tile)."""
+        from ..dsrelu.api import _dprob_n_slots
+
+        return (valid_m, _dprob_n_slots(n, mma_tiler_mn, cluster_shape_mn, True), 1)
+
+    @staticmethod
+    def reduce_dprob_workspace(dprob_workspace, dprob_tensor=None, current_stream=None):
+        """Collapse the dprob slots into ``(valid_m, 1, 1)`` in a fixed order; accumulates onto dprob_tensor if given."""
+        from ..dsrelu.api import _reduce_dprob_slots
+
+        return _reduce_dprob_slots(dprob_workspace, dprob_tensor, current_stream)
+
+    @property
+    def _kernel_dprob_desc(self):
+        """The dprob descriptor the kernel writes: the per-N-tile scratch under determinism."""
+        return self.dprob_workspace_desc if self.deterministic else self.dprob_desc
 
     def check_support(self) -> bool:
         """Check if the kernel configuration is supported.
@@ -243,6 +273,13 @@ class GroupedGemmDswigluSm100(APIBase):
         self._check_tensor_shape(self.beta_desc, (l,), "beta")
         self._check_tensor_shape(self.prob_desc, (tensor_m, 1, 1), "prob")
         self._check_tensor_shape(self.dprob_desc, (tensor_m, 1, 1), "dprob")
+        if self.deterministic and self.dprob_workspace_desc is None:
+            raise ValueError("deterministic=True requires sample_dprob_workspace of shape dprob_workspace_shape(valid_m, n), float32")
+        if not self.deterministic and self.dprob_workspace_desc is not None:
+            raise ValueError("sample_dprob_workspace is only used when deterministic=True")
+        self._check_tensor_shape(
+            self.dprob_workspace_desc, self.dprob_workspace_shape(tensor_m, n, self.mma_tiler_mn, self.cluster_shape_mn), "dprob_workspace"
+        )
         self._check_tensor_shape(self.amax_desc, (l, 2, 1), "amax")
         self._check_tensor_shape(self.norm_const_desc, (1,), "norm_const")
 
@@ -290,6 +327,7 @@ class GroupedGemmDswigluSm100(APIBase):
         self._check_dtype(self.acc_dtype, dtype=cutlass.Float32, name="Accumulator", extra_error_msg="Accumulator must be float32")
         self._check_dtype(self.prob_desc, dtype=[cutlass.Float32, cutlass.BFloat16], name="Prob", extra_error_msg="Prob must be float32 or bfloat16")
         self._check_dtype(self.dprob_desc, dtype=cutlass.Float32, name="Dprob", extra_error_msg="Dprob must be float32")
+        self._check_dtype(self.dprob_workspace_desc, dtype=cutlass.Float32, name="Dprob workspace", extra_error_msg="dprob workspace must be float32")
         self.c_dtype = self._check_dtype(
             self.c_desc,
             dtype=[cutlass.Float32, cutlass.Float16, cutlass.BFloat16, cutlass.Float8E4M3FN, cutlass.Float8E5M2],
@@ -402,6 +440,7 @@ class GroupedGemmDswigluSm100(APIBase):
             discrete_col_sfd=self.discrete_col_sfd,
             expert_cnt=self.expert_cnt,
             use_mono_increase_expert_idx=True,
+            deterministic=self.deterministic,
         )
 
         hardware_info = cutlass.utils.HardwareInfo()
@@ -445,9 +484,9 @@ class GroupedGemmDswigluSm100(APIBase):
                 stride_order=self.prob_desc.stride_order,
             )
             dprob_cute_fake = self._make_fake_cute_compact_tensor(
-                dtype=self.dprob_desc.dtype,
-                shape=(valid_m, 1, 1),
-                stride_order=self.dprob_desc.stride_order,
+                dtype=self._kernel_dprob_desc.dtype,
+                shape=(valid_m, *self._kernel_dprob_desc.shape[1:]),
+                stride_order=self._kernel_dprob_desc.stride_order,
             )
 
             tensor_m_128 = cute.sym_int()
@@ -536,9 +575,9 @@ class GroupedGemmDswigluSm100(APIBase):
                 stride_order=self.prob_desc.stride_order,
             )
             dprob_cute_fake = self._make_fake_cute_compact_tensor(
-                dtype=self.dprob_desc.dtype,
-                shape=(valid_m, 1, 1),
-                stride_order=self.dprob_desc.stride_order,
+                dtype=self._kernel_dprob_desc.dtype,
+                shape=(valid_m, *self._kernel_dprob_desc.shape[1:]),
+                stride_order=self._kernel_dprob_desc.stride_order,
             )
 
             if self.sfa_is_flat:
@@ -612,7 +651,8 @@ class GroupedGemmDswigluSm100(APIBase):
             alpha=self._make_fake_cute_tensor_from_desc(self.alpha_desc, assumed_align=16),
             beta=self._make_fake_cute_tensor_from_desc(self.beta_desc, assumed_align=16),
             prob=canonical_prob_fake(prob_cute_fake, self.canonical_prob),
-            dprob=canonical_prob_fake(dprob_cute_fake, self.canonical_dprob),
+            # The determinism scratch is always the (valid_m, n_slots, 1) kernel-facing form.
+            dprob=canonical_prob_fake(dprob_cute_fake, self.canonical_dprob and not self.deterministic),
             max_active_clusters=max_active_clusters,
             epilogue_op=self.epilogue_op,
             stream=fake_stream,
@@ -682,6 +722,7 @@ class GroupedGemmDswigluSm100(APIBase):
         amax_tensor: Optional[torch.Tensor] = None,
         norm_const_tensor: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
+        dprob_workspace_tensor: Optional[torch.Tensor] = None,
     ) -> None:
         """Execute the compiled kernel.
 
@@ -702,6 +743,8 @@ class GroupedGemmDswigluSm100(APIBase):
         :param amax_tensor: Optional amax tensor
         :param norm_const_tensor: Optional normalization constant
         :param current_stream: CUDA stream
+        :param dprob_workspace_tensor: Determinism scratch, required iff the op was built with deterministic=True.
+            The kernel writes it instead of dprob_tensor; reduce it with reduce_dprob_workspace afterwards.
         """
         self._logger.debug("Entering execute")
         if current_stream is None:
@@ -711,6 +754,12 @@ class GroupedGemmDswigluSm100(APIBase):
 
         if self._compiled_kernel is None:
             raise RuntimeError("Kernel not compiled; call compile() first")
+        if self.deterministic:
+            if dprob_workspace_tensor is None:
+                raise ValueError("dprob_workspace_tensor is required when the op was built with deterministic=True")
+            dprob_tensor = dprob_workspace_tensor
+        elif dprob_workspace_tensor is not None:
+            raise ValueError("dprob_workspace_tensor is only used when the op was built with deterministic=True")
         self._logger.debug("Executing grouped_gemm_dswiglu kernel")
         self._compiled_kernel(
             a_tensor=a_tensor,
@@ -766,6 +815,7 @@ def grouped_gemm_dswiglu_wrapper_sm100(
     current_stream: Optional[cuda.CUstream] = None,
     dprob_tensor_buf: Optional[torch.Tensor] = None,
     amax_tensor_buf: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
 ) -> TupleDict:
     """Convenience wrapper for grouped GEMM dSwiGLU backward operation.
 
@@ -808,6 +858,9 @@ def grouped_gemm_dswiglu_wrapper_sm100(
         discrete_col_sfd: Boolean, True to generate discrete col-major scale factor tensor
         epilogue_op: Optional epilogue operation. Valid values: None, "none", "identity", "relu", "srelu"
         current_stream: CUDA stream
+        deterministic: Make dprob bit-exact run to run (torch only). dprob keeps its shape; a zeroed
+            per-N-tile workspace and its fixed-order reduction are internal to the wrapper.
+            See docs/fe-oss-apis/gemm_fusions/grouped_gemm_dswiglu.md#deterministic-dprob.
 
     Returns:
         TupleDict: A dictionary-like object containing output tensors that can also be unpacked as a tuple.
@@ -831,6 +884,8 @@ def grouped_gemm_dswiglu_wrapper_sm100(
         from .jax_api import grouped_gemm_dswiglu
         from ..canonical_jax import check_jax_wrapper_options
 
+        if deterministic:
+            raise ValueError("deterministic is unsupported for the JAX MXFP8 path")
         check_jax_wrapper_options(
             acc_dtype=acc_dtype,
             cd_major=cd_major,
@@ -859,6 +914,9 @@ def grouped_gemm_dswiglu_wrapper_sm100(
             discrete_col_sfd=discrete_col_sfd,
         )
     import torch
+
+    from ..backend_utils import _torch_stream_context
+    from ..dsrelu.api import _dprob_n_slots
 
     acc_dtype = _convert_to_cutlass_data_type(acc_dtype) if acc_dtype is not None else cutlass.Float32
     d_dtype = _convert_to_cutlass_data_type(d_dtype) if d_dtype is not None else cutlass.BFloat16
@@ -920,6 +978,9 @@ def grouped_gemm_dswiglu_wrapper_sm100(
         dprob_tensor_buf.ndim if dprob_tensor_buf is not None else (1 if canonical_outputs else 3),
         (is_flat_sf(sfa_tensor), sfa_tensor.ndim),
         (is_flat_sf(sfb_tensor), sfb_tensor.ndim),
+        # The determinism scratch compiles with a static slot count, which follows n even when n is dynamic.
+        deterministic,
+        _dprob_n_slots(n, mma_tiler_mn, cluster_shape_mn, deterministic),
     )
 
     # Allocate M-dependent output tensors fresh every call (M varies across MoE steps).
@@ -949,6 +1010,14 @@ def grouped_gemm_dswiglu_wrapper_sm100(
             sfd_row_tensor=None,
             sfd_col_tensor=None,
         )
+
+    dprob_workspace = None
+    if deterministic:
+        # Zeroed so rows past padded_offsets[-1], which no tile writes, reduce to zero as on the atomic path.
+        with _torch_stream_context(current_stream, a_tensor.device):
+            dprob_workspace = torch.zeros(
+                GroupedGemmDswigluSm100.dprob_workspace_shape(valid_m, n, mma_tiler_mn, cluster_shape_mn), dtype=torch.float32, device=a_tensor.device
+            )
 
     sfd_row_tensor = None
     sfd_col_tensor = None
@@ -1023,6 +1092,8 @@ def grouped_gemm_dswiglu_wrapper_sm100(
             m_aligned=m_aligned,
             discrete_col_sfd=discrete_col_sfd,
             epilogue_op=epilogue_op,
+            deterministic=deterministic,
+            sample_dprob_workspace=dprob_workspace,
         )
 
         assert grouped_gemm_dswiglu.check_support(), "Unsupported configuration"
@@ -1047,7 +1118,11 @@ def grouped_gemm_dswiglu_wrapper_sm100(
         amax_tensor=amax_tensor,
         norm_const_tensor=norm_const_tensor,
         current_stream=current_stream,
+        dprob_workspace_tensor=dprob_workspace,
     )
+    if dprob_workspace is not None:
+        # In place through the (valid_m, 1, 1) view, so canonical (valid_m,) dprob is filled too.
+        GroupedGemmDswigluSm100.reduce_dprob_workspace(dprob_workspace, normalize_prob(dprob_tensor)[1], current_stream)
 
     return TupleDict(
         d_row_tensor=d_row_tensor,

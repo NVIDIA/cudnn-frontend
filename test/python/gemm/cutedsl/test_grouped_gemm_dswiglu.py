@@ -10,7 +10,7 @@ with dSwiGLU activation gradient for MoE (Mixture of Experts) workloads.
 
 import torch
 import pytest
-from test_utils import torch_fork_set_rng
+from test_utils import assert_bitwise_runs, bitwise_bits, torch_fork_set_rng
 from gemm.cutedsl.test_grouped_gemm_swiglu_utils import (
     grouped_gemm_swiglu_init,
     allocate_grouped_gemm_input_tensors as allocate_grouped_gemm_input_tensors_base,
@@ -306,6 +306,119 @@ def test_grouped_gemm_dswiglu_wrapper_cache_zero_m_before_compile_full_dynamic_s
 
     assert compile_count == 1
     assert cache_entries == 1
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize(
+    "ab_dtype",
+    [
+        pytest.param(torch.float8_e4m3fn, id="fp8"),
+        pytest.param(torch.float4_e2m1fn_x2, id="fp4"),
+    ],
+)
+def test_grouped_gemm_dswiglu_wrapper_deterministic_dprob(request, ab_dtype):
+    """deterministic=True: dprob is bit-exact run to run and matches the atomic path; the other outputs are unchanged.
+
+    Four N-tiles per row, so the order of the default path's atomic adds can matter, and at least three
+    tiles per persistent cluster, so the overlapping-accumulator subtile order alternates within a CTA.
+    """
+    try:
+        from cudnn import grouped_gemm_dswiglu_wrapper_sm100
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    fp8 = ab_dtype == torch.float8_e4m3fn
+    cfg = grouped_gemm_swiglu_init(
+        request=request,
+        ab_dtype=ab_dtype,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.float8_e4m3fn if fp8 else torch.bfloat16,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        b_major="k",
+    )
+    n_tiles = 4
+    cfg["n"] = n_tiles * cfg["mma_tiler_mn"][1]
+    # Each 2-CTA cluster owns one (256-row, N-tile) tile at a time; size M for three tiles per cluster.
+    clusters = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count // 2
+    group_m = cfg["m_aligned"] * -(-3 * clusters // (n_tiles * cfg["l"]))
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    inputs = allocate_grouped_gemm_input_tensors(
+        n=cfg["n"],
+        k=cfg["k"],
+        l=cfg["l"],
+        group_m_list=[group_m] * cfg["l"],
+        ab_dtype=cfg["ab_dtype"],
+        b_major=cfg["b_major"],
+        sf_dtype=cfg["sf_dtype"],
+        sf_vec_size=cfg["sf_vec_size"],
+        m_aligned=cfg["m_aligned"],
+    )
+    inputs, _ = allocate_grouped_gemm_dswiglu_tensors(
+        tensor_m=inputs["tensor_m"],
+        n=cfg["n"],
+        l=cfg["l"],
+        ab_dtype=cfg["ab_dtype"],
+        c_dtype=cfg["c_dtype"],
+        d_dtype=cfg["d_dtype"],
+        cd_major=cfg["cd_major"],
+        sf_dtype=cfg["sf_dtype"],
+        sf_vec_size=cfg["sf_vec_size"],
+        input_tensors=inputs,
+    )
+
+    def run(deterministic):
+        return grouped_gemm_dswiglu_wrapper_sm100(
+            a_tensor=inputs["a_tensor"],
+            b_tensor=inputs["b_tensor"],
+            c_tensor=inputs["c_tensor"],
+            sfa_tensor=inputs["sfa_tensor"],
+            sfb_tensor=inputs["sfb_tensor"],
+            padded_offsets=inputs["padded_offsets_tensor"],
+            alpha_tensor=inputs["alpha_tensor"],
+            beta_tensor=inputs["beta_tensor"],
+            prob_tensor=inputs["prob_tensor"],
+            norm_const_tensor=inputs.get("norm_const_tensor"),
+            acc_dtype=cfg["acc_dtype"],
+            d_dtype=cfg["d_dtype"],
+            cd_major=cfg["cd_major"],
+            mma_tiler_mn=cfg["mma_tiler_mn"],
+            cluster_shape_mn=cfg["cluster_shape_mn"],
+            sf_vec_size=cfg["sf_vec_size"],
+            vector_f32=cfg["vector_f32"],
+            m_aligned=cfg["m_aligned"],
+            discrete_col_sfd=cfg["discrete_col_sfd"],
+            current_stream=stream,
+            deterministic=deterministic,
+        )
+
+    atomic = run(False)
+    deterministic = run(True)
+    torch.cuda.synchronize()
+
+    assert deterministic["dprob_tensor"].shape == atomic["dprob_tensor"].shape == (inputs["tensor_m"], 1, 1)
+    # D_col and the scale factors are written only with SFD outputs (FP8 D); without them D_col stays unwritten.
+    written = ("d_row_tensor", "d_col_tensor", "sfd_row_tensor", "sfd_col_tensor") if atomic["sfd_row_tensor"] is not None else ("d_row_tensor",)
+    for name in written:
+        # Flattened first: the (m, 2n, 1) outputs have a non-unit stride on their trailing unit dim.
+        same = torch.equal(bitwise_bits(deterministic[name].reshape(-1)), bitwise_bits(atomic[name].reshape(-1)))
+        assert same, f"{name} changed with deterministic=True"
+    valid_m = inputs["valid_m"]
+    expected = atomic["dprob_tensor"][:valid_m]
+    # Only the summation order of the per-N-tile partials differs from the atomic path.
+    torch.testing.assert_close(deterministic["dprob_tensor"][:valid_m], expected, rtol=1e-5, atol=1e-5 * max(expected.abs().max().item(), 1.0))
+    check_ref_grouped_gemm_dswiglu(inputs, deterministic, cfg, skip_ref=cfg["skip_ref"])
+
+    assert_bitwise_runs(lambda: (run(True)["dprob_tensor"],), label="deterministic dswiglu dprob")
 
 
 """

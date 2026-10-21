@@ -248,9 +248,12 @@ api.execute(
   - Dtype: `float32`
 
 - **Output tensor dprob**: `dprob_tensor` (wrapper) or `sample_dprob` (class)
-  - Shape: `(valid_m, 1, 1)`
+  - Shape: `(valid_m, 1, 1)`, whether or not `deterministic` is set
   - Dtype: `float32`
   - Must be zero-initialized.
+  - Under `deterministic=True` the class API also takes `sample_dprob_workspace` / `dprob_workspace_tensor`
+    (`dprob_workspace_shape(valid_m, n)`, float32, zero-initialized), and the caller calls
+    `reduce_dprob_workspace` after `execute()`; see [Deterministic dprob](#deterministic-dprob)
 
 - **Scale factor tensors**
   - **SFA** (A scale factor): `sfa_tensor` (wrapper) or `sample_sfa`, `sfa_tensor` (class)
@@ -328,7 +331,30 @@ api.execute(
   - Optional epilogue operation. Valid values: `None`, `"none"`, `"identity"`, `"relu"`, `"srelu"`
   - Default: `None`
 
+- `deterministic: bool`
+  - Makes `dprob` bit-exact run to run — see [Deterministic dprob](#deterministic-dprob)
+  - Default: `False`
+
 - CUDA stream (`current_stream` in class API, `current_stream` in wrapper)
+
+### Deterministic dprob
+
+By default every N-tile adds its partial of `dprob[token]` with an fp32 atomic, so the summation
+order follows tile scheduling and `dprob` can differ in the last bits between identical runs. With
+`deterministic=True` the kernel stores each `(token, N-tile)` partial in its own fp32 slot, and the
+slots are summed in a fixed order into `dprob`. The kernel schedules tiles statically, so for a
+given GPU and launch grid each tile's subtile loop (reversed on alternate tiles when the accumulator
+overlaps) runs in the same order on every run. The other outputs are unchanged.
+
+The wrapper allocates a zeroed `dprob_workspace_shape(valid_m, n)` workspace on the launch stream
+and runs the reduction (`torch.sum` over dim 1, then an in-place add into `dprob`). The class API
+takes the workspace as `sample_dprob_workspace` / `dprob_workspace_tensor` and leaves the reduction
+to the caller: `GroupedGemmDswigluSm100.reduce_dprob_workspace(workspace, dprob, stream)`.
+
+The workspace has `ceil_div(n, TILE_N × cluster_n) × cluster_n` slots per token: the scheduler
+counts whole clusters and then expands to CTAs, so this is not `ceil_div(n, TILE_N)` unless
+`cluster_n` is 1. Deterministic and non-deterministic configurations compile and cache separately.
+Torch only; the JAX path raises `ValueError`.
 
 ### Wrapper-specific Parameters: `grouped_gemm_dswiglu_wrapper_sm100`
 
@@ -353,10 +379,14 @@ Returns a `TupleDict` - a dictionary-like object that also supports tuple unpack
 
 - `sample_a`, `sample_b`, `sample_c`, `sample_d_row`, `sample_d_col`, `sample_sfa`, `sample_sfb`, `sample_padded_offsets`, `sample_alpha`, `sample_beta`, `sample_prob`, `sample_dprob`, `sample_sfd_row`, `sample_sfd_col`, `sample_amax`, `sample_norm_const` - see Input/Output tensors
   - Note: `sample_sfd_row`, `sample_sfd_col`, `sample_norm_const` must be all `None` or all not `None`
+- `deterministic`, `sample_dprob_workspace` - see [Deterministic dprob](#deterministic-dprob). The workspace
+  is required iff `deterministic=True`.
 
 #### `GroupedGemmDswigluSm100.execute`
 
 - `a_tensor`, `b_tensor`, `c_tensor`, `d_row_tensor`, `d_col_tensor`, `sfa_tensor`, `sfb_tensor`, `padded_offsets`, `alpha_tensor`, `beta_tensor`, `prob_tensor`, `dprob_tensor`, `sfd_row_tensor`, `sfd_col_tensor`, `amax_tensor`, `norm_const_tensor` - see Input/Output tensors. Must have same layout as sample tensors provided in constructor.
+- `dprob_workspace_tensor` - required iff the op was built with `deterministic=True`; the kernel writes it
+  instead of `dprob_tensor`
 
 ---
 
@@ -440,7 +470,7 @@ result = compiled(**jax_inputs)
 On the wrapper's JAX path, unsupported options raise `ValueError`: non-FP32
 accumulation, non-`n` output layout, scale-vector size other than 32,
 `vector_f32=True`, non-default `m_aligned`, and caller streams, plus caller
-output buffers and non-identity backward epilogues.
+output buffers, non-identity backward epilogues, and `deterministic=True`.
 
 This initial bridge supports FP8 e4m3/e5m2 A/B and e4m3 D, with E8M0 block
 scales of vector size 32. The packed backward quantizer does not support e5m2 D.
