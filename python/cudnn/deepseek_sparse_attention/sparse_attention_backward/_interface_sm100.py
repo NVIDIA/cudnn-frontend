@@ -12,7 +12,7 @@ import cutlass.cute as cute
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.runtime import device_capability as _device_capability, resolve_stream
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
-from cudnn.frost.buffers import memset_zero_async
+from cudnn.frost.buffers import cutedsl_requirement_error, memset_zero_async
 from ._interface_sm100_common import (
     _BLACKWELL_CAPABILITIES,
     _align_workspace_bytes,
@@ -193,7 +193,12 @@ def _get_sm100_kernel_class(
     if deterministic:
         if total_s_q is None or total_s_kv is None or head_dim is None:
             raise ValueError("deterministic SM100 kernel selection requires total_s_q, total_s_kv, and head_dim")
-        return deterministic_kernel_class(total_s_q, total_s_kv, head_dim, num_heads)
+        kernel_cls = deterministic_kernel_class(total_s_q, total_s_kv, head_dim, num_heads)
+        if getattr(kernel_cls, "dkv_relay_cluster_size", 1) > 1:
+            dsl_error = cutedsl_requirement_error("deterministic DSA backward cluster relay")
+            if dsl_error is not None:
+                raise RuntimeError(dsl_error)
+        return kernel_cls
     return FlashAttentionDSABackwardSm100
 
 

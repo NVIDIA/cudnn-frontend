@@ -4663,13 +4663,42 @@ def test_DSA_sparse_attention_backward_check_support_validates_contract(monkeypa
 
     from cudnn.frost import buffers
 
+    def metadata_case(case_s_q, case_s_kv, case_heads, case_head_dim, case_topk):
+        """Build value-free CUDA tensors for support-only route coverage."""
+        case_head_dim_v = 512 if case_head_dim == 576 else case_head_dim
+        return dict(
+            sample_q=torch.empty(case_s_q, case_heads, case_head_dim, dtype=torch.bfloat16, device=device),
+            sample_kv=torch.empty(case_s_kv, case_head_dim, dtype=torch.bfloat16, device=device),
+            sample_out=torch.empty(case_s_q, case_heads, case_head_dim_v, dtype=torch.bfloat16, device=device),
+            sample_dout=torch.empty(case_s_q, case_heads, case_head_dim_v, dtype=torch.bfloat16, device=device),
+            sample_lse=torch.empty(case_s_q, case_heads, dtype=torch.float32, device=device),
+            sample_attn_sink=torch.empty(case_heads, dtype=torch.float32, device=device),
+            sample_topk_idxs=torch.empty(case_s_q, case_topk, dtype=torch.int32, device=device),
+            sample_topk_length=torch.empty(case_s_q, dtype=torch.int32, device=device),
+        )
+
     with monkeypatch.context() as old_dsl:
         old_dsl.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.6.2")))
-        with pytest.raises(RuntimeError, match=r"deterministic DSA backward requires nvidia-cutlass-dsl >= 4\.7\.0; found 4\.6\.2"):
-            SparseAttentionBackward(**good, deterministic=True).check_support()
-        # The new relay primitives do not change the established dependency
-        # contract of the non-deterministic backend.
+        # CuTe DSL 4.7 is a relay-only requirement. Preserve the repository's
+        # 4.6.2 floor for the established short-context and two-CTA paths.
+        assert SparseAttentionBackward(**good, deterministic=True).check_support()
+        for route in (
+            metadata_case(4, 128, 96, 576, 64),  # H96 composite
+            metadata_case(4, 128, 128, 512, 128),  # H128 D512 two-CTA
+            metadata_case(4, 128, 96, 576, 128),  # H96 D576 two-CTA
+            metadata_case(4, 128, 128, 576, 128),  # H128 D576 two-CTA
+        ):
+            assert SparseAttentionBackward(**route, deterministic=True).check_support()
+
+        relay = metadata_case(257, 65537, 16, 512, 64)
+        with pytest.raises(RuntimeError, match=r"deterministic DSA backward cluster relay requires nvidia-cutlass-dsl >= 4\.7\.0; found 4\.6\.2"):
+            SparseAttentionBackward(**relay, deterministic=True).check_support()
+
+        # Neither the relay implementation nor its version floor changes the
+        # established non-deterministic backend.
         assert SparseAttentionBackward(**good).check_support()
+
+    assert SparseAttentionBackward(**relay, deterministic=True).check_support()
 
     deterministic_h32 = dict(good)
     deterministic_h32["sample_q"] = q[:, :32].contiguous()

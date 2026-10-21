@@ -21,7 +21,6 @@ from cudnn.deepseek_sparse_attention.utils.runtime import device_capability
 from cudnn.api_base import APIBase, TupleDict
 from cudnn._torch_stream import contiguous_on_stream, copy_into_on_stream
 from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream, torch_stream_context
-from cudnn.frost.buffers import cutedsl_requirement_error
 
 from . import _interface_sm100 as _iface_sm100
 from . import _interface_sm100_d576 as _iface_d576
@@ -180,10 +179,6 @@ class SparseAttentionBackward(APIBase):
             self.deterministic and (major != 10 or num_heads not in _iface_sm100._DETERMINISTIC_HEAD_COUNTS),
             f"deterministic DSA backward requires SM100 and heads in {_iface_sm100._DETERMINISTIC_HEAD_COUNTS}, found SM{major} H{num_heads}",
         )
-        if self.deterministic:
-            dsl_error = cutedsl_requirement_error("deterministic DSA backward")
-            if dsl_error is not None:
-                raise RuntimeError(dsl_error)
         # The SM100 kernel is tiled only for head_dim in {512, 576} (the 576
         # MLA case splits QK=576 / V=512); any other head_dim compiles to a
         # layout that indexes shared memory out of bounds and crashes.
@@ -250,6 +245,18 @@ class SparseAttentionBackward(APIBase):
                 self.deterministic,
                 self._backend,
                 include_workspace=self._backend not in _iface_d576.BACKENDS,
+            )
+        if self.deterministic and self._backend == "generic_m64":
+            # Resolve the shape-dependent policy during support checking so a
+            # relay-only DSL requirement fails before compilation. Ordinary
+            # shard and tuned deterministic routes retain the 4.6.2 floor.
+            _iface_sm100._get_sm100_kernel_class(
+                self._backend,
+                True,
+                total_s_q,
+                self.kv_desc.shape[0],
+                head_dim,
+                num_heads,
             )
         if self._backend in _iface_d576.BACKENDS:
             self._value_error_if(total_s_q <= 0 or self.kv_desc.shape[0] <= 0, "Q and KV sequence extents must be positive")
