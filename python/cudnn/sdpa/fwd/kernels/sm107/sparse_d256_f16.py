@@ -224,17 +224,23 @@ sits above one.  Per role, every global read, and where its wait is:
                   ``_decode_item`` -- every global write of the role is below it.
     scheduler     reads nothing global on the BSHD / CLC form (the CLC responses are hardware; the payload ring is SMEM): no wait.
     spare warp    exits after the init sync: no wait.
-    the release   ONE ``griddepcontrol.launch_dependents`` (``launch_dependent_grids()``) per CTA, issued by every thread right after
-                  ``fence_mbarrier_init + barrier_cta_sync`` and before the role dispatch -- the prologue (the mbarrier inits, the once
-                  per CTA sQ tail-row zeroing) is behind the CTA, the dependent grid (the split combine, or the next stage) stages its own
-                  prologue on the idle SMs while the mainloop runs; its own wait still blocks on this grid's completion and memory flush,
-                  wherever the trigger sits, so the placement is a performance choice, never a correctness one.  A thread that issues the
-                  instruction twice is harmless; a CTA counts once.  The release precedes the MMA warp's TMEM allocation (the dense
-                  decode tile's follows its own wait): safe HERE because no dependent CTA can co-reside with this one -- the CTA's
-                  226,688 B of SMEM (the table above) take the 227 KiB carveout and the kernel runs one CTA per SM -- so a dependent that
-                  allocates TMEM before its own wait can never hold columns this CTA's later allocation needs while it waits on this grid
-                  (the deadlock class a release above the allocation opens once a smaller-footprint dependent lands beside it); a kernel
-                  that copies this placement names its own footprint argument here, or moves the release below its allocation.
+    the release   NONE explicit: no CTA executes ``griddepcontrol.launch_dependents``, so each CTA counts as released when it EXITS (the
+                  PTX rule) and the dependent grid (the split combine, or the out projection at split 1) launches at this grid's
+                  completion through the programmatic edge.  Its own wait blocks on this grid's completion and memory flush wherever a
+                  trigger would sit, so the placement is a performance choice, never a correctness one -- and it is a MEASURED one
+                  (2026-10-21, the cc 10.7 class: a 212-SM gate of the switched block chain and a per-kernel timeline of one replay on
+                  a 204-SM part under two instruments).  The first form of this paragraph released right after ``fence_mbarrier_init +
+                  barrier_cta_sync``, before the role dispatch: the combine's CTAs then sat resident on the idle SMs from this grid's
+                  first microsecond, spinning in their wait through the whole mainloop, and after this grid completed they needed
+                  7.4-7.9 us for 2.75 us of work (+4.6-5.1 us at that one link) while this kernel ran 0.4-0.7 us slower with them
+                  resident -- the whole 3.2-4.4 us per-step loss the switched chain showed at B <= 4 (the graph's launch overhead did
+                  not move with the number of programmatic nodes).  The SAME edge triggered at this grid's completion cost nothing
+                  (2.85 vs 2.75 us), and the dependents the norm + RoPE, cache-write and combine kernels launch early (short, non-CLC
+                  primaries) gain 0.2-0.8 us each.  Rule for a long CLC-scheduled primary: no release above its mainloop (trigger at
+                  completion, or after the CTA's last item); a prologue release is a measured exception.  The TMEM-footprint argument
+                  the prologue release needed (no dependent CTA could co-reside with this one -- 226,688 B of the 227 KiB carveout, one
+                  CTA per SM -- so a dependent allocating TMEM before its own wait could never hold columns this CTA's later allocation
+                  needs) is moot: nothing is released above the MMA warp's allocation, or at all.
 
 The PRE-DISPATCH prologue holds ONE global read ABOVE every role wait: ``exit_if_dead_thd_cluster(seq_kv_lens_tensor, ...)`` under
 ``CFG.THD_VARLEN == 1`` reads the live-unit total ``meta[4B + 2]`` -- the SETUP LAUNCH's device value, written by the kernel launched
@@ -242,7 +248,7 @@ right before this one on the same stream -- before any mbarrier init, and the TH
 same way.  A dependent launch of the THD rendering would therefore read the metadata the setup launch has not written yet, so THD x
 ``use_pdl`` is a typed decline of the adapter (``SparseGqaFwdDslSm107.check_support``: ``thd=True`` with ``use_pdl=True``), never a wait
 placed above the exit (which would serialize every CTA of the grid behind the predecessor anyway).  The early-exit CTAs of the THD form
-never reach the release and count as released by completing.  The PDL scope is the dense BSHD and paged decode chain.
+count as released by completing, like every CTA of this kernel.  The PDL scope is the dense BSHD and paged decode chain.
 
 THE ONE HELPER ``_item_bounds``: n_tiles, count, the tail block id(s), dead and the split chunk are computed by ONE pure
 helper at the item-start site of EVERY role that loops over tiles (softmax, MMA, the 8 gather warps, the TMA warp) over the
@@ -463,7 +469,7 @@ from cutlass.experimental import primitives as prims
 import cutlass.cute as cute
 import cuda.bindings.driver as _cuda_driver  # noqa: F401
 
-from cudnn.frost.tile_dsl.barrier import MBarrier, PipelineState, Producer, advance, launch_dependent_grids, wait, wait_on_dependent_grids
+from cudnn.frost.tile_dsl.barrier import MBarrier, PipelineState, Producer, advance, wait, wait_on_dependent_grids
 from cudnn.frost.tile_dsl.mma import mma_ss
 from cudnn.frost.tile_dsl.tma import TMA_L2_EVICT_LAST, bulk_copy, opaque_i64, tma_gather4, tma_load_tile
 from cudnn.frost.tile_dsl.handles import GmemTileTma, MmaDesc, SmemTile
@@ -1843,8 +1849,9 @@ def _kernel(
     # one) and is never read -- CFG.EPILOGUE_GATE stays the single fold flag.
     tma_gate_desc: cutlass.GridConstant[tmap.TensorMap] = None,
     # Programmatic dependent launch (the launch attribute is set by the host entry under the same flag; header, PDL SITES): every role
-    # waits on the dependent grid before its first global read of a predecessor's output, and the CTA releases its dependents once
-    # after the prologue.  Appended LAST; the False rendering traces the program above unchanged.
+    # waits on the dependent grid before its first global read of a predecessor's output; no explicit release -- the CTA exit triggers
+    # the dependent grid at this grid's completion (the measured placement).  Appended LAST; the False rendering traces the program
+    # above unchanged.
     use_pdl: cutlass.Constexpr[bool] = False,
 ) -> None:
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -1979,11 +1986,9 @@ def _kernel(
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync()
     # No CTA-wide barrier-0 sync may follow this one: the spare warp exits here.
-    if cutlass.const_expr(use_pdl):
-        # PDL (header, PDL SITES): the prologue -- the mbarrier inits, the once-per-CTA sQ tail-row zeroing -- is behind this CTA; release
-        # the dependent grid so it stages its own prologue on the idle SMs while the mainloop runs (its wait still blocks on this grid's
-        # completion and memory flush).  ONE site per CTA, every thread; each role's own wait follows in its body.
-        launch_dependent_grids()
+    # PDL (header, PDL SITES): NO release here, or anywhere -- the CTA exit is the trigger of the dependent grid (a release at this
+    # point made the split combine's CTAs resident through the core's whole run and cost 3.2-4.4 us per step at B <= 4 on the cc 10.7
+    # class, the measured placement); each role's own wait follows in its body.
 
     if warp_idx < SOFTMAX_WARPS:
         _softmax_warp_group(
@@ -2307,8 +2312,9 @@ def compile(  # noqa: A001
     Head dims are the config's (d_qk = d_v = 256, exact); shapes and strides are runtime arguments.  SPLIT_KV > 1 (the
     config's): the O pointer is the fp32 PARTIAL slab and ``has_lse`` must be True (the per-split LSE drives the combine).
     ``use_pdl`` (appended; in the key) traces the programmatic-dependent-launch form: the launch attribute plus the per-role
-    ``griddepcontrol`` wait before the first dependent global read and the one release per CTA after the prologue (header, PDL
-    SITES) -- the same math, bitwise; the False rendering is the program as before."""
+    ``griddepcontrol`` wait before the first dependent global read, and NO explicit release -- the CTA exit triggers the dependent
+    grid at this grid's completion (header, PDL SITES: the measured placement) -- the same math, bitwise; the False rendering is the
+    program as before."""
     if SPLIT_KV > 1 and not has_lse:
         raise ValueError("sparse_d256_f16: split_kv > 1 requires has_lse=True (the per-split LSE partial drives the combine)")
     _cache_key = _template_key(globals(), locals(), "compile")

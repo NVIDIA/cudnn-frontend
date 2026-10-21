@@ -3238,26 +3238,30 @@ def test_adapter_serves_use_pdl_and_declines_it_with_thd_by_name(sm107_host_targ
         )
     assert pdl_decline_reason(thd=True) in str(eb.value), str(eb.value)
     code = _code(_kernel_source())
-    assert "from cudnn.frost.tile_dsl.barrier import MBarrier, PipelineState, Producer, advance, launch_dependent_grids, wait, wait_on_dependent_grids" in code
+    assert "from cudnn.frost.tile_dsl.barrier import MBarrier, PipelineState, Producer, advance, wait, wait_on_dependent_grids" in code
     assert (
         code.count("        wait_on_dependent_grids()") == 4
     ), "one dependent-grid wait per role that reads a predecessor's output (TMA, gather, MMA, softmax)"
-    assert code.count("        launch_dependent_grids()") == 1, "ONE release per CTA"
+    # A PLACEMENT pin (never a tolerance): the core triggers its dependent grid at its COMPLETION -- no explicit release anywhere.  A
+    # release at the prologue (the first form) left the split combine's CTAs resident through the core's whole run and cost 3.2-4.4 us
+    # per step at B <= 4 on the cc 10.7 class; the same programmatic edge triggered at completion costs nothing (the header's PDL SITES).
+    assert code.count("        launch_dependent_grids()") == 0, "no explicit release: the CTA exit is the trigger (the measured placement)"
+    assert "launch_dependent_grids" not in code, "the helper is not even imported: nothing may release above the mainloop"
     assert (
-        code.count("if cutlass.const_expr(use_pdl):") == 5
-    ), "the four waits and the release, each a const_expr arm (the False rendering traces the program as before)"
-    # the release sits after the init fence + CTA sync and before the role dispatch
+        code.count("if cutlass.const_expr(use_pdl):") == 4
+    ), "the four waits, each a const_expr arm, and nothing else (the False rendering traces the program as before)"
+    # the former release site -- between the init fence + CTA sync and the role dispatch -- holds no dependent-grid instruction at all
     i_sync = code.index("nvvm.fence_mbarrier_init()\n    nvvm.barrier_cta_sync()")
-    i_rel = code.index("        launch_dependent_grids()")
     i_disp = code.index("if warp_idx < SOFTMAX_WARPS:\n        _softmax_warp_group(")
-    assert i_sync < i_rel < i_disp
-    # every role's wait precedes its first decode / bounds / issue, and the pre-dispatch THD exit stays ABOVE every wait (the declined composition)
+    assert i_sync < i_disp and "dependent_grids" not in code[i_sync:i_disp]
+    # every role's wait precedes its first decode / bounds / issue, and the pre-dispatch THD exit stays ABOVE the init sync, hence above
+    # every wait (the declined composition)
     for role in ("_tmaldg_warp_group", "_gather_warp_group", "_mma_warp_group", "_softmax_warp_group"):
         body = code[code.index(f"def {role}(") :]
         body = body[: body.index("\ndef ", 1)]
         assert "use_pdl: cutlass.Constexpr[bool] = False" in body, f"{role} takes the constexpr"
         assert body.index("        wait_on_dependent_grids()") < body.index("= _decode_item("), f"{role}: the wait precedes the first decode"
-    assert code.index("exit_if_dead_thd_cluster(seq_kv_lens_tensor, n_batch, 1)") < i_rel
+    assert code.index("exit_if_dead_thd_cluster(seq_kv_lens_tensor, n_batch, 1)") < i_sync
     assert code.count("use_pdl=use_pdl,") == 5, "the four role calls and the launch attribute"
     assert "use_pdl: cutlass.Constexpr[bool] = False,\n) -> None:\n    warp_idx = cute.arch.make_warp_uniform" in code, "the kernel's constexpr, appended last"
     assert "    use_pdl: cutlass.Constexpr[bool] = False,\n    stream: _cuda_driver.CUstream = None," in code, "the host's constexpr before the stream"

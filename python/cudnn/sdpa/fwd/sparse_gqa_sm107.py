@@ -64,8 +64,9 @@ arithmetic there, the combine module's order statement -- and within fp32 roundi
 chain partials with ``exp(m_c - m)`` factors; the final O rounds once either way).  :meth:`SparseGqaFwdDslSm107.combine_form` reads the
 pinned value back.  ``use_pdl`` (appended, default False) is the programmatic-dependent-launch form of the chain's two launches -- a
 PERFORMANCE knob, the same function bitwise: the sparse core launches with the programmatic-stream-serialization attribute and carries
-its ``griddepcontrol`` sites (every role's wait before its first dependent global read, one release per CTA after the prologue -- the
-kernel header's PDL SITES paragraph), and the combine's entry takes the switch too (``compile_ptr(use_pdl=)``: every form's pair).  THD x
+its ``griddepcontrol`` sites (every role's wait before its first dependent global read; no explicit release -- the CTA exit triggers the
+dependent grid at the core's completion, the measured placement of the kernel header's PDL SITES paragraph), and the combine's entry
+takes the switch too (``compile_ptr(use_pdl=)``: every form's pair).  THD x
 ``use_pdl`` is a typed decline by name (:meth:`SparseGqaFwdDslSm107.check_support`; the text is :func:`pdl_decline_reason`'s, the ONE
 statement of the fact that the gated attention block's declaration-time decline carries too): the packed form reads the setup launch's
 metadata above every role wait (the pre-dispatch dead-CTA exit, the claim-counter scheduler), so a dependent launch of it would read
@@ -391,7 +392,8 @@ class SparseGqaFwdDslSm107:
         self.q, self.k, self.v, self.o, self.lse = q, k, v, o, lse
         # Programmatic dependent launch (appended 2026-10-21; a PERFORMANCE knob of the chain's two launches -- the same function, bitwise):
         # the launch attribute plus the griddepcontrol sites in both kernels it reaches -- the sparse core (compile(use_pdl=): every role's
-        # wait before its first dependent global read, one release per CTA after the prologue) and the split combine's entry
+        # wait before its first dependent global read; no explicit release, the CTA exit triggers the dependent at the core's completion)
+        # and the split combine's entry
         # (compile_ptr(use_pdl=), every form's pair).  THD x use_pdl is check_support's typed decline (knob honoured or ineligible).
         self.use_pdl = bool(use_pdl)
         # The softmax SPLIT (appended; a PERFORMANCE knob of the kernel's softmax role, the same function bitwise): 0 = the module

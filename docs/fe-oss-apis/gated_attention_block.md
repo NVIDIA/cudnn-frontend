@@ -1111,11 +1111,14 @@ served -- another part, an unserved dtype; the per-step reading is `decode.pdl_d
 decode.route(s_q, batch).pdl_capable`, a prefill-route step launching plain).  **The block-sparse decode mode takes the switch too**
 (a `QsaSpec` geometry over bf16 / f16 pools): under `use_pdl=True` the sparse core launches with the attribute and carries its
 `griddepcontrol` sites (every role's wait before its first read of a predecessor's output -- the slab, the pools, the block list, the
-lengths, the table -- and one release per CTA after its prologue) and its split combine takes the pair, bitwise the plain chain eagerly
+lengths, the table -- and no explicit release: the CTA exit triggers the dependent grid at the core's completion, the placement measured
+on the cc 10.7 class, where a release at the core's prologue left the split combine's CTAs resident through the core's whole run and
+cost 3.2-4.4 us per step at `B <= 4`) and its split combine takes the pair, bitwise the plain chain eagerly
 and under capture (the first execute of a fresh switched declaration, captured with no warm-up, replays bitwise the eager plain chain);
 `blk.pdl_stages` then names `sdpa_sparse` (the `sdpa` kind) beside the norm + RoPE pass, the write-through and the separate gate.  Its
-AUTO reading stays `False` until the switched sparse chain is measured (`SPARSE_DECODE_PDL_DEFAULT_CCS`, empty today: a part enters it
-with its measurement), and `use_pdl=True` with `thd=True` on a `QsaSpec` geometry is a typed decline (the packed form reads the setup
+AUTO reading stays `False` (`SPARSE_DECODE_PDL_DEFAULT_CCS`, empty: a part enters it only with a measurement meeting the flip bar of
+>= 1.0 us and >= 5 % per step at B 1 x 8K and B 1 x 32K; the 212-SM cc 10.7 class read +2.1 % / 0.80 us and +4.1 % / 1.54 us there,
++2.6 % geomean over the B <= 4 cells and no cell slower -- a gain below the bar, taken through the explicit `use_pdl=True`), and `use_pdl=True` with `thd=True` on a `QsaSpec` geometry is a typed decline (the packed form reads the setup
 launch's metadata above every role wait). Measured on a 212-SM cc 10.7
 part: 1.1-1.5 us per decode step at B 1 (B 1 x KV 4K +5.0 %, 32K +4.0 %, 128K +2.5 %; +2.8 % geomean over the B 1 .. 4 cells), flat within
 the control pair where the tile dominates; with the write-through folded in, B 1 x KV 4K 32.3 -> 29.3 us (+10.2 %) against the plain

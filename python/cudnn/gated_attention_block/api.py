@@ -630,8 +630,9 @@ DECODE_PDL_STAGES = ("qk_norm_rope", "cache_write", "sigmoid_gate", "sdpa")
 cache write, the sigmoid gate when it is its own launch, and stage (4) on a DECODE-TILE route only (``DecodeRoute.pdl_capable``: the
 tile and its split combine carry the griddepcontrol pair; the prefill route's paged d256 prefill tile does not and launches plain --
 the link serializes, which PDL's semantics keep correct) or, under a ``QsaSpec`` geometry, the block-sparse core and its split combine
-(stage name ``sdpa_sparse``: the ``sdpa`` kind; the core's every role waits before its first dependent read and releases once after its
-prologue, the combine's every form carries the pair -- appended 2026-10-21).  The FROST GEMM stages launch with the attribute by their
+(stage name ``sdpa_sparse``: the ``sdpa`` kind; the core's every role waits before its first dependent read and the core triggers its
+dependent at its completion -- no release above its mainloop, the measured placement --, the combine's every form carries the pair --
+appended 2026-10-21).  The FROST GEMM stages launch with the attribute by their
 own constant and are not switched.  Per declaration ``GatedAttentionBlockFwd.pdl_stages`` names the ones the chain holds and
 ``use_pdl_effective`` whether every switched stage took it; ``DecodeEnvelope.pdl_stages`` carries this tuple on both decode forms."""
 
@@ -665,9 +666,11 @@ reads False -- the unfused twin -- and an explicit ``fuse_prepare=True`` is serv
 SPARSE_DECODE_PDL_DEFAULT_CCS: Tuple[Tuple[int, int], ...] = ()
 """The parts on which the AUTO reading of ``use_pdl`` (``None``) resolves True on the BLOCK-SPARSE decode mode (``kv_source="paged"`` on a
 dense ``[B, S_q]`` ``QsaSpec`` declaration over bf16 / f16 pools): the sparse core and its split combine carry the griddepcontrol sites since
-2026-10-21 and an explicit ``use_pdl=True`` is served there (bitwise the plain chain), but the default stays OFF until the switched chain
-is measured on an exclusive part of the class (the measured-default rule of :data:`DECODE_PDL_DEFAULT_CCS`: a part enters this tuple with
-its measurement -- the quick-gate cells PDL on vs off, the no-loss guard on the 128-row cells -- never ahead of it).  EMPTY today."""
+2026-10-21 and an explicit ``use_pdl=True`` is served there (bitwise the plain chain), but the default stays OFF: the measured-default rule
+of :data:`DECODE_PDL_DEFAULT_CCS` admits a part only with a measurement meeting the flip bar (>= 1.0 us AND >= 5 % per step at B 1 x 8K
+and B 1 x 32K, no loss beyond the control band on the 128-row cells), and the 212-SM cc 10.7 class, measured 2026-10-22 (CUDA-graph
+replay, the switched chain vs the plain one in one process), read +2.1 % / 0.80 us and +4.1 % / 1.54 us there (+2.6 % geomean over the
+B <= 4 cells, no cell slower): a gain, below the bar -- so cc 10.7 stays OUT and the explicit switch is the way to take it.  EMPTY today."""
 
 CACHE_WRITE_SMALL_M_DEFAULT_MAX_ROWS = 128
 """The AUTO reading of ``fuse_cache_write_small_m`` (``None``, the default) folds the paged K / V write-through into the norm + RoPE
@@ -8200,7 +8203,8 @@ class GatedAttentionBlockFwd(APIBase):
         # launch with the attribute regardless (their module constant USE_PDL).  The same kernels, the same math: `out` is BITWISE the
         # use_pdl=False block's, eagerly and under CUDA-graph capture.  An explicit True is served for the bf16 / f16 block only (no quant, no
         # e4m3 KV cache: a typed decline; pools in the activation dtype, kv_cache_dtype None or that dtype, are the bf16 / f16 block); a QsaSpec
-        # geometry takes the switch on its dense [B, S_q] forms (the block-sparse core's sites and its combine's pair, 2026-10-21; AUTO False
+        # geometry takes the switch on its dense [B, S_q] forms (the block-sparse core's waits -- it triggers its dependent at its completion,
+        # not at its prologue: the measured placement -- and its combine's pair, 2026-10-21; AUTO False
         # there until measured, SPARSE_DECODE_PDL_DEFAULT_CCS), thd=True x QsaSpec declined by name; AUTO reads False on the declined pipelines
         # and never True where the explicit True is refused.  A PER-STAGE fact (2026-10-15): a stage whose
         # kernel carries no sites -- the paged d256 prefill tile of the DECODE form's prefill route and of the EXTEND form, the dense prefill
@@ -10321,12 +10325,13 @@ class GatedAttentionBlockFwd(APIBase):
             claimed_max_s_q=DECODE_CLAIMED_MAX_S_Q,
             q_tile_max=q_tile_max,
             # the stage kinds the switch reaches on this form: the dense chain's (stage (4) on a decode-tile route) and, under the sparse
-            # core, the same four kinds (the sparse core + its combine are the `sdpa` kind; appended 2026-10-21)
-            pdl_stages=DECODE_PDL_STAGES,
+            # core on a caller list, the same four kinds (the sparse core + its combine are the `sdpa` kind; appended 2026-10-21); NONE under
+            # the in-block indexer, where the explicit switch is a typed decline (its kernels would take it unmeasured)
+            pdl_stages=() if indexer else DECODE_PDL_STAGES,
             # the AUTO reading of the switch on this part for a SERVED form (the measured default on cc 10.7 for the dense form; the sparse
-            # core's own tuple, empty until measured): False wherever the form is not served (`decode_reason`: another part, an unserved
-            # dtype, a geometry row, no DSL target); the per-step reading is `pdl_default and route(s_q, batch).pdl_capable`
-            pdl_default=(decode_reason is None) and cc in (SPARSE_DECODE_PDL_DEFAULT_CCS if sparse else DECODE_PDL_DEFAULT_CCS),
+            # core's own tuple, empty until measured; never under the indexer): False wherever the form is not served (`decode_reason`:
+            # another part, an unserved dtype, a geometry row, no DSL target); the per-step reading is `pdl_default and route(s_q, batch).pdl_capable`
+            pdl_default=(decode_reason is None) and not indexer and cc in (SPARSE_DECODE_PDL_DEFAULT_CCS if sparse else DECODE_PDL_DEFAULT_CCS),
             # the list form (QsaSpec.index_list_form) at this geometry: the indexer over the pools selects per row; caller lists take the
             # shared step-0 list at S_q <= the record's cap (requires spells it) or the per-row list at any S_q
             index_list_forms=((QSA_INDEX_LIST_FORM_PER_ROW,) if indexer else (QSA_INDEX_LIST_FORM_SHARED, QSA_INDEX_LIST_FORM_PER_ROW)) if sparse else (),
