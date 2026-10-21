@@ -69,7 +69,6 @@ LOGIT_RTOL = 1e-5
 TIE_TOL = 1e-4  # the set oracle's tie window at the k-th boundary (the dense decode selector's test constant)
 _E4M3 = torch.float8_e4m3fn
 _DEV = torch.device("cuda") if torch.cuda.is_available() else None
-_KERNEL_MODULE = "cudnn.gated_attention_block.kernels.qsa_score_paged"
 
 
 def _cc():
@@ -930,10 +929,13 @@ def test_paged_entry_agrees_with_the_dense_selector_when_that_module_is_present(
     rows, n_blocks_max = 4, 2048
     case = _Case(3, rows, n_blocks_max, 16, [4 * 1500 + 1 + rows, 4 * 2000 + 3 + rows, 4 * 300 + rows], seed=14)
     paged = fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, seq_q=rows)
+    dense, decline = None, None
     try:
         dense = dense_mod.qsa_select_decode(case.qi.view(3, rows, H, D), case.dense().contiguous(), case.kv_lens, list_per_sequence=False)
     except NotImplementedError as error:
-        pytest.skip(f"the dense selector declines on this device: {error}")
+        decline = str(error)
+    if dense is None:
+        pytest.skip(f"the dense selector declines on this device: {decline}")
     torch.cuda.synchronize()
     ref = case.reference(D**-0.5).view(-1, n_blocks_max)
     dense_ids = dense["block_ids"].view(-1, TOP_K)

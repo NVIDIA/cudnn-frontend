@@ -51,6 +51,8 @@ __all__ = [
     "MAX_QUERY_ROWS",
     "UNITS_PER_WARP_CHOICES",
     "RING_DEPTH_CHOICES",
+    "K_STEPS",  # the MMA geometry the kernel module imports from here (Rule 7 placement: the facts live in the DSL-free module)
+    "CHUNKS_PER_LANE",
     "QueryRowMap",
     "padded_heads",
     "query_row_map",

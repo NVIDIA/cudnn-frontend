@@ -168,7 +168,7 @@ from cudnn.frost.device import compute_capability, current_device
 from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
 from cudnn.frost.tile_dsl.mma import mma_m16n8k16_f32
 from cudnn.frost.tile_dsl.pointwise import opaque_f32_zero, opaque_i32
-from cudnn.frost.tile_dsl.tma import ld_global, ld_global_v4, st_global, st_global_v2
+from cudnn.frost.tile_dsl.tma import ld_global, st_global, st_global_v2
 from cutlass.cute.arch.nvvm_wrappers import inline_ptx
 
 # the kernel's host-side facts live in the DSL-free front door (Rule 7: a declaration reads them without importing this module)
@@ -197,6 +197,7 @@ __all__ = [
     "dsl_decline_reason",
     "compile_qsa_score_paged",
     "run_qsa_score_paged",
+    "FROST_SOURCE_DIGEST",  # read from OUTSIDE this module: the compiled-plan cache key (through ``template_key(globals(), ...)``), the tests, the run attestations
 ]
 
 _FAKE_STREAM = None
@@ -379,7 +380,6 @@ def frost_qsa_score_paged(
     sA = cutlass.Array(cutlass.Int32, rm.m_tiles * _A_TILE_ELEMS, alignment=128, space=cutlass.AddressSpace.smem)
     n_groups = rm.m_tiles // rm.tiles_per_query  # query groups per lane at P' >= 2 (one head-sum each)
     has_lens = cutlass.const_expr(mBlockLens is not None)
-    pair_rows = cutlass.const_expr(rm.tile_rows > 1)  # the lane's two rows are two heads of ONE query (else two queries)
     tidx = cutlass.Int32(cute.arch.thread_idx()[0])
     lane = tidx & cutlass.Int32(31)
     warp = tidx >> cutlass.Int32(5)
@@ -394,7 +394,6 @@ def frost_qsa_score_paged(
     b64 = b.to(cutlass.Int64)
     zero_i = cutlass.Int32(0)
     s_q_i = cutlass.Int32(s_q)
-    h_i_i = cutlass.Int32(h_i)
     t0 = b * s_q_i
     k_warp0 = chunk_id * cutlass.Int32(blocks_per_cta(units_per_warp)) + warp * cutlass.Int32(keys_per_warp(units_per_warp))
     # ---- the prologue: every load independent, all issued before any wait (ONE round trip ahead of the first key byte)
@@ -524,9 +523,9 @@ def frost_qsa_score_paged(
                     cute.arch.cp_async_commit_group()
             # the batch's MMAs: k-step outer, n-tile and m-tile inner -- `len(batch) x m_tiles` independent accumulator chains
             accs = []
-            for bi in cutlass.range_constexpr(len(batch)):
+            for _ in cutlass.range_constexpr(len(batch)):
                 acc = []
-                for t in cutlass.range_constexpr(rm.m_tiles):
+                for _ in cutlass.range_constexpr(rm.m_tiles):
                     acc.append([zeros[0], zeros[1], zeros[2], zeros[3]])
                 accs.append(acc)
             for kappa in cutlass.range_constexpr(K_STEPS):
