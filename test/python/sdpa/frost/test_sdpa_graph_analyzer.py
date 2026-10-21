@@ -1107,6 +1107,7 @@ def test_capabilities_positional_prefix_is_append_only():
         "kv_mask",
         "kv_mask_dtypes",
         "tile_ns_by_d_shape",
+        "pack_gqa_requires_divisible",
     )
     legacy_order = [n for n in names if n not in appended]
     caps = engines.Capabilities(*[legacy_value(n) for n in legacy_order])
@@ -1118,6 +1119,7 @@ def test_capabilities_positional_prefix_is_append_only():
     assert caps.dense_only_d_shapes == frozenset()
     assert caps.bias_d_shapes is None and caps.bias_io_dtype_only is False and caps.kv_mask is False and caps.kv_mask_dtypes == frozenset()
     assert caps.tile_ns_by_d_shape == ()
+    assert caps.pack_gqa_requires_divisible is True
     assert caps.zero_scale is False
     assert caps.attn_scale_prefolded_d_shapes is None
     assert caps.epilogue_gate is False
@@ -1127,7 +1129,8 @@ def test_capabilities_positional_prefix_is_append_only():
     start = names.index("pack_gqa_d_shapes")
     assert names[start : start + len(legacy_tail)] == legacy_tail, names[start:]
     # ... and every later field is appended after it, in the order it landed (the zero-scale and pre-folded-scale fields,
-    # then the resident-bias / kv_mask fields of the Rubin small tiles and their per-shape TILE_N domain, last).
+    # then the resident-bias / kv_mask fields of the Rubin small tiles and their per-shape TILE_N domain, then the PackGQA
+    # divisibility rule, last).
     assert names[start + len(legacy_tail) :] == list(appended), names[start:]
 
     bwd_names = [f.name for f in dataclasses.fields(bwd_engines.Capabilities)]
