@@ -745,18 +745,25 @@ def test_fuse_prepare_declaration_rows():
     with pytest.raises(NotImplementedError, match="fuse_prepare=True with thd=True"):
         _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=16, fuse_prepare=True, thd=True, num_sequences=1, max_seq_len=64)
     mk = lambda *shape, dt=BF16: torch.empty(*shape, dtype=dt, device=_DEV)  # noqa: E731
-    with pytest.raises(NotImplementedError, match="fuse_prepare=True with kv_source='paged'"):
-        _make_block(
-            dict(_SMALL_D256, causal_bottom_right=True),
-            1,
-            1,
-            paged_kv_page_size=16,
-            fuse_prepare=True,
-            kv_source="paged",
-            sample_k_cache=mk(4, 2, 16, 256),
-            sample_v_cache=mk(4, 2, 16, 256),
-            sample_block_table=mk(1, 4, dt=torch.int32),
-        )
+    paged = dict(
+        paged_kv_page_size=16,
+        kv_source="paged",
+        sample_k_cache=mk(4, 2, 16, 256),
+        sample_v_cache=mk(4, 2, 16, 256),
+        sample_block_table=mk(1, 4, dt=torch.int32),
+    )
+    with pytest.raises(NotImplementedError, match="fuse_prepare=True with kv_source='paged' on a dense geometry \\(the DECODE form\\)"):
+        _make_block(dict(_SMALL_D256, causal_bottom_right=True), 1, 1, fuse_prepare=True, **paged)
+    # the block-sparse decode mode over the pools takes the fusion (2026-10-21): the caller-list band block's prepare launch carries the
+    # raw-key pool arm in place of the K / V-only write-through + the raw key's own write, its default the measured one (False until measured)
+    from cudnn.gated_attention_block.api import SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS
+
+    band, *_ = _make_block(dict(_SMALL_D256, causal_bottom_right=True), 1, 1, qsa=QsaSpec(index_band=True), fuse_prepare=True, **paged)
+    assert band.fuse_prepare is True and band.fuse_prepare_requested is True and isinstance(band._prepare, _QsaPrepare) and band._cache_write is None
+    assert band.sparse_decode and not band.indexer_decode and not band._prepare.decode_arms and band._prepare._index_arms().raw_pool
+    auto, *_ = _make_block(dict(_SMALL_D256, causal_bottom_right=True), 1, 1, qsa=QsaSpec(index_band=True), **paged)
+    assert auto.fuse_prepare is False and auto.fuse_prepare_requested is None and auto._prepare is None and SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS == ()
+    assert _make_block(dict(_SMALL_D256, causal_bottom_right=True), 1, 1, qsa=QsaSpec(index_band=True), fuse_prepare=False, **paged)[0]._prepare is None
     with pytest.raises(NotImplementedError, match="fuse_prepare=True with kv_cache_dtype=torch.float8_e4m3fn"):
         _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=16, fuse_prepare=True, kv_cache_dtype=torch.float8_e4m3fn)
     blk, *_ = _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=16, fuse_prepare=True)

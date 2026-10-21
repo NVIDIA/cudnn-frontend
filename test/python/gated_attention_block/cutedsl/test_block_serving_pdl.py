@@ -148,7 +148,8 @@ def test_auto_and_the_explicit_switch_answer_for_one_domain_on_the_measured_part
     the knob answer for one domain.  Pools declared in the activation dtype (``kv_cache_dtype=torch.bfloat16``, the ``None`` spelling)
     take the default and the explicit True alike -- a serving stack that spells the dtype can form its own A/B --, a 16-bit pool of the
     other width hears the attribute's own ``ValueError``, not the switch's decline.  On every pipeline the default excludes -- the EXTEND
-    form, ``kv_source="self"``, a QuantSpec pipeline, a QsaSpec geometry (with and without the indexer band), the e4m3 cache -- AUTO
+    form, ``kv_source="self"``, a QuantSpec pipeline, a QsaSpec geometry (with and without the indexer band; the decode indexer over the
+    pools on both readings of ``fuse_prepare``), the e4m3 cache -- AUTO
     reads False with no stage switched; the explicit True is served per stage on the two bf16 forms without a decode route (their
     prefill tiles carry no sites) and is the typed decline on the other three."""
     import test_block_qsa_decode as _qsa
@@ -210,6 +211,14 @@ def test_auto_and_the_explicit_switch_answer_for_one_domain_on_the_measured_part
         _qsa._declare(_qsa.GEOM_SMALL, 2, 1, n_pages=4, use_pdl=True)
     band = _qsa._declare(_qsa.GEOM_SMALL, 4, 1, n_pages=6, index_band=True, fuse_norm_rope=False)[0]
     assert off(band) and band.geom.index_band
+    # the in-block indexer's DECODE step over the pools (2026-10-21): AUTO False on both readings of fuse_prepare (its stage threads the
+    # switch it is handed -- `pdl_names` spells the kernels that would take it -- and is handed False), the explicit True the same decline
+    for fused in (False, True):
+        ix = _qsa._declare_indexer(_qsa.GEOM_SMALL, 2, 1, fuse_prepare=fused)
+        assert off(ix) and ix.indexer_decode and ix._indexer_decode.use_pdl is False and ix.fuse_prepare is fused
+        assert ix._indexer_decode.pdl_names == ((("qsa_compress_step",) if not fused else ()) + ("qsa_score", "qsa_topk"))
+        with pytest.raises(NotImplementedError, match=decline):
+            _qsa._declare_indexer(_qsa.GEOM_SMALL, 2, 1, fuse_prepare=fused, use_pdl=True)
     e4m3 = _qkv._declare(_qkv.GEOM_SMALL, 2, 1, fuse_norm_rope=False)[0]
     assert off(e4m3) and e4m3.kv_cache_e4m3 and e4m3.decode_route is None
     with pytest.raises(NotImplementedError, match="no e4m3 KV cache"):

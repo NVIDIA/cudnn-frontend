@@ -311,6 +311,93 @@ def test_workspace_carve_is_the_dense_one_plus_the_band_columns():
     assert lay_b.o - lay_d.o == _align_up(t * 640 * e) == t * band.qsa.index_band_cols * e
 
 
+def test_workspace_carve_of_the_decode_indexer_is_the_caller_list_carve_plus_five_slots_at_the_end():
+    """The in-block indexer's DECODE step over the pools (2026-10-21) carves FIVE slots after everything the caller-list band block's
+    decode carve holds -- `ix_q [T, index_heads, index_head_dim]`, `ix_logits [T, n_blocks_max]` fp32, `ix_counts [T]` int32, `ix_ids
+    [T, top_k]` int32, `ix_cslot [B, S_q]` int32 -- in that order, each 16-byte aligned, and nothing else moves: every other field of the
+    two carves is equal, the prefill indexer's slots stay unused (-1), and the total grows by exactly the five aligned sizes.  The planner's
+    `qsa_indexer_decode` is the logits width (the table's reach in compressed rows); the DSL-free ring rule equals the kernel's."""
+    import dataclasses
+
+    from cudnn.gated_attention_block.api import _index_state_ring_extra_rows, _qsa_indexer_decode_slots
+
+    b, s, n_blocks_max, e = 2, 4, 32 * 4, _itemsize(torch.bfloat16)
+    t = b * s
+    geom = GatedAttentionBlockGeometry(**_SMALL_D256, causal_bottom_right=True, qsa=QsaSpec(index_source="indexer", index_band=True))
+    lay_c = _plan_workspace(geom, b, s, torch.bfloat16, True, False, True)
+    lay_i = _plan_workspace(geom, b, s, torch.bfloat16, True, False, True, qsa_indexer_decode=n_blocks_max)
+    five = ["ix_q", "ix_logits", "ix_counts", "ix_ids", "ix_cslot"]
+    slots = _qsa_indexer_decode_slots(geom, b, s, e, n_blocks_max)
+    assert [nm for nm, _ in slots] == five
+    q = geom.qsa
+    assert [nbytes for _, nbytes in slots] == [t * q.index_heads * q.index_head_dim * e, t * n_blocks_max * 4, t * 4, t * q.top_k * 4, b * s * 4]
+    for f in dataclasses.fields(lay_c):
+        if f.name in five or f.name in ("engine_scratch", "total_bytes"):
+            continue  # the five slots sit before the engines' scratch, which the planner keeps at the END of the carve
+        assert getattr(lay_c, f.name) == getattr(lay_i, f.name), f.name
+    assert all(getattr(lay_c, nm) == -1 for nm in five) and lay_i.ix_kbar == lay_i.ix_scores == lay_i.ix_cand == lay_i.ix_ids_sorted == -1
+    acc = lay_c.total_bytes
+    for nm, nbytes in slots:
+        assert getattr(lay_i, nm) == acc and acc % 16 == 0, nm
+        acc += _align_up(nbytes)
+    assert lay_i.total_bytes == lay_i.engine_scratch == acc and lay_c.engine_scratch == lay_c.total_bytes
+    assert _index_state_ring_extra_rows(q.block_size) == q.block_size - 1 == 3  # == kernels.qsa_compress.min_ring_rows(0, 4), checked at plan time
+
+
+def test_decode_indexer_declines_are_published_row_by_row_and_the_envelope_names_the_indexer_facts():
+    """The decode indexer's decline rows (`_qsa_decode_decline_texts`) reach the envelope VERBATIM under a sparse geometry on every reading,
+    each carrying its one shared token, and the FlashInfer-read indexer facts are published by name on a Rubin reading: `index_sources`
+    (`"caller"`, `"indexer"` at bf16 x head dim 128; `"caller"` alone at f16), the cache dtype, the head dims / KV heads / block sizes, the
+    `top_k` range, the 64-row query envelope, the ring's extra rows, the page sizes the paged scorer serves, `fuse_prepare_default` False
+    until measured; a DENSE geometry publishes none of them (any device, no host sync)."""
+    import dataclasses
+
+    from cudnn.gated_attention_block import DecodeEnvelope
+    from cudnn.gated_attention_block.api import SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS, _qsa_decode_decline_texts
+
+    tokens = {
+        "shared_list_rows": "tail covers at most two blocks",
+        "indexer_f16": "needs bf16 activations",
+        "indexer_head_dim": "packs 128-wide heads",
+        "indexer_thd": "scores dense [B, S] prompts",
+        "indexer_query_rows": "query rows per sequence (at most 64",
+        "indexer_page_size": "a power-of-two count of compressed rows",
+        "indexer_e4m3_cache": "e4m3 read arm",
+        "indexer_e4m3_pool": "in-kernel dequant arm",
+        "indexer_shared_list": "selects per row",
+        "fuse_prepare_rope_tables_unfused": "the unfused query norm reads the per-token",
+    }
+    geom = GatedAttentionBlockGeometry(**_SMALL_D256, causal_bottom_right=True, qsa=QsaSpec(index_source="indexer", index_band=True))
+    for dtype in (torch.bfloat16, torch.float16):
+        texts = _qsa_decode_decline_texts(geom, dtype)
+        assert set(texts) == set(tokens) and all(tok in texts[nm] for nm, tok in tokens.items())
+        d = GatedAttentionBlockFwd.serving_envelope(geom, dtype, _DEV, device_cc=(10, 7)).decode
+        assert all(d.declines[nm] == texts[nm] for nm in texts), "a decline row reaches the envelope reworded"
+        assert d.index_sources == (("caller", "indexer") if dtype == torch.bfloat16 else ("caller",))
+        assert d.index_cache_dtypes == ((torch.bfloat16,) if dtype == torch.bfloat16 else ())
+        assert d.index_head_dims == (128,) and d.index_kv_heads == (1,) and d.index_block_sizes == (4,) and d.index_top_k_range == (4, 512, 4)
+        assert d.index_query_rows_max == 64 and d.index_state_rows_extra == 3 and d.index_page_sizes == (16, 32, 64, 128)
+        assert d.fuse_prepare_default is False and SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS == ()
+        assert d.index_list_forms == ("per_row",) and d.index_list_form_default == "per_row"
+    dense = GatedAttentionBlockFwd.serving_envelope(
+        GatedAttentionBlockGeometry(**_SMALL_D256, causal_bottom_right=True), torch.bfloat16, _DEV, device_cc=(10, 7)
+    ).decode
+    assert dense.index_sources == () and dense.index_page_sizes == () and dense.index_query_rows_max == 0 and dense.fuse_prepare_default is False
+    assert not (set(tokens) & set(dense.declines))
+    assert [f.name for f in dataclasses.fields(DecodeEnvelope)][-10:] == [
+        "index_sources",
+        "index_cache_dtypes",
+        "index_head_dims",
+        "index_kv_heads",
+        "index_block_sizes",
+        "index_top_k_range",
+        "index_query_rows_max",
+        "index_state_rows_extra",
+        "index_page_sizes",
+        "fuse_prepare_default",
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Declaration-time declines (any GPU; no host sync)
 # ---------------------------------------------------------------------------
