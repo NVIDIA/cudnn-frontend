@@ -6,7 +6,7 @@ BF16 packed THD, D256, block size 4, and seed 17. The synthetic selector keeps u
 
 Each implementation runs in a fresh process. Input and saved-state hashes match within every comparison. All six outputs pass the independent FP32 reference before timing; both backward calls use the same reference FP32 output and LSE. TF32 is disabled, including the environment override. Checks use atol=rtol=0.04 and relative L2 error <=0.025.
 
-Full calls include metadata compaction, allocation, helper kernels and casts. B200/B300 results use the median of seven synchronized wall-time samples after two warmups. Rubin uses 15 samples after five warmups. Compilation, reference evaluation and input generation are excluded. CUDA event times, raw samples and memory measurements are retained in JSON.
+Full calls include metadata compaction, allocation, helper kernels and casts. B200/B300 results use the median of seven synchronized wall-time samples after two warmups. Compilation, reference evaluation and input generation are excluded. CUDA event times, raw samples and memory measurements are retained in JSON.
 
 ## B200
 
@@ -36,23 +36,6 @@ Full calls include metadata compaction, allocation, helper kernels and casts. B2
 
 `*` includes empty attention rows.
 
-## Rubin native validation and timing
-
-Rubin SM107 passed 38 focused source tests, the known-output 128K forward/backward checks, and all six reference checks for every row below. These are full public-call synchronized wall medians, with five warmups and 15 samples. No Miles comparison or ratio is reported for Rubin.
-
-| T / packed sequences / Q:KV heads | Fwd native | Bwd native |
-|---|---:|---:|
-| 4096 / 3 / 12:1 | 0.321746 | 1.064338 |
-| 4096 / 3 / 24:2 | 0.500849 | 1.513752 |
-| 16384 / 3 / 12:1 | 1.825442 | 8.386977 |
-| 16384 / 3 / 24:2 | 3.430113 | 12.608435 |
-| 32768 / 1 / 12:1 | 5.101868 | 19.812229 |
-| 32768 / 1 / 24:2 | 9.686264 | 30.514730 |
-| 131072 / 1 / 12:1 | 27.670829 | 88.674185 |
-| 131072 / 1 / 24:2 | 47.489123 | 168.656884 |
-
-The raw receipt reports the GPU as NVIDIA Graphics Device, compute capability 10.7, with 278.54 GiB CUDA-visible memory and driver 620.62. CUDA, PyTorch, Triton and CuTeDSL versions match those listed below. The actual source package ran with a matching ARM native extension. The QSA implementation and benchmark hashes match Blackwell; the Rubin reference hash is listed separately. These runs do not establish identical inputs across GPU models.
-
 ## B200/B300 128K validation
 
 All native outputs pass at 131072 tokens for both head layouts. The original Miles forward fails at this length on B200 and B300, so no 128K ratio is reported. A separate B300 control used identical inputs and changed only three bitmap row-offset multiplications to Int64: the original failed and the control passed. The original baseline remains unchanged.
@@ -80,13 +63,10 @@ Frontend base commit: `d8b0a7ed56cd8e62bc1e05f367f339624f6dbb4e`. The hashes bel
 | _contract.py | `0b0dda4fbafa19a7a52ab939e25779cc6445fb94a78912e71bc724e7bd91ecd9` |
 | _metadata.py | `126882d50e94c5596ffa22cb32e7c733701ebe32c57619a54f656121e071dcb5` |
 | kernels/fprop_sm100.py | `663ae53de2c847df1526a7d3d1bd983fd20b3e2cabb7f54276045718bcf9eeab` |
-| kernels/fprop_sm107.py | `a34652b5a8b487614dbbf048efbe236a7e2d6a84b6d9c6d5c41496408593b21e` |
 | kernels/bprop_sm100.py | `8169f09b5b5f3359af4b5f48778e60bd479a1606b1fd371778ee056973052523` |
-| kernels/bprop_sm107.py | `d35e1ffde851e17610fea0c0157e3634ca223f529b5570ef6b68bac0c569b7bd` |
 | kernels/bprop_helpers.py | `22121e371c0456b8c48ac45e8e02358822c8407639d53314771210f897b44a05` |
 | benchmark_qsa.py | `fd3831b3efc01b7fe4da59108960478609a223d2cc85a7c38280334bd3a0da48` |
 | reference.py (B200/B300) | `a069f4314d9257540cd5f6172eaa49d7ba123da6c1bf0a6205a9d7e00b241ece` |
-| reference.py (Rubin) | `530318d5597daeb0fcc4a4d624d8cda71e9d7a2c5b4f9a5407289fc544d6c8d3` |
 | Native extension (x86_64) | `04afbade3c56e96db84d3e6ac2201628b921c31d82dbf2ba919f51b63395edc3` |
 | Original Miles block_sparse_attention.py | `18542596944a5c3f4a231ce53f9d660f65a23246072ff060223a23e2d1cfbae1` |
 
