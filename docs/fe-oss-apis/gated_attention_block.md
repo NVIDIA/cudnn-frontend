@@ -498,7 +498,7 @@ queries and compressed keys within one bf16 ulp of the once-rounded fp32 chain; 
 EXACT given the kernel's selection -- the block oracle on the kernel's list within the dense suites' budgets.
 
 **The paged decode scorer (standalone).** The first piece of that decode-step indexer ships on its own:
-`cudnn.gated_attention_block.qsa_select_paged.qsa_select_decode_paged(qi, kbar, block_table, kv_lens, seq_q=, top_k=512)`
+`cudnn.gated_attention_block.qsa_select_paged.qsa_select_decode_paged(qi, kbar, block_table, kv_lens, seq_q=1, top_k=512)`
 scores a decode step's `seq_q` indexer query rows per sequence (`qi [B x seq_q, index_heads, 128]` bf16) against the compressed
 keys of the complete 4-token blocks each row can see, read from the PAGED compressed-key cache the serving stacks keep on the
 main block table (`kbar [num_pages, page_size / 4, 1, 128]` bf16: block `j` of sequence `b` is row `j % (page_size / 4)` of page
