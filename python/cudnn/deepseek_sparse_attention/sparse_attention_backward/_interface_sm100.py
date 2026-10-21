@@ -16,6 +16,7 @@ from cudnn.frost.buffers import memset_zero_async
 from ._interface_sm100_common import (
     _BLACKWELL_CAPABILITIES,
     _align_workspace_bytes,
+    _requires_wide_data_addressing,
     _workspace_shapes_sm100,
     flash_attn_bwd_sm100_workspace_size,
 )
@@ -221,22 +222,35 @@ def _compile_sm100_artifact(
     kernel_cls,
     block_tile: int,
     dkv_planes: int,
+    wide_addressing: bool,
 ):
     """Build an SM100 launchable from tensor metadata without allocating storage."""
-    total_s_q = cute.sym_int()
-    q = _fake_runtime_tensor(element_dtype, 3, divisibility=head_dim)
-    kv = _fake_runtime_tensor(element_dtype, 2, divisibility=head_dim)
-    out = _fake_runtime_tensor(element_dtype, 3, divisibility=head_dim_v)
-    dout = _fake_runtime_tensor(element_dtype, 3, divisibility=head_dim_v)
-    lse = _fake_runtime_tensor(cutlass.Float32, 2, alignment=8)
-    sink = _fake_runtime_tensor(cutlass.Float32, 1)
+    total_s_q, total_s_kv = cute.sym_int(), cute.sym_int()
+    if wide_addressing:
+        q = _fake_runtime_tensor(element_dtype, 3, divisibility=head_dim)
+        kv = _fake_runtime_tensor(element_dtype, 2, divisibility=head_dim)
+        out = _fake_runtime_tensor(element_dtype, 3, divisibility=head_dim_v)
+        dout = _fake_runtime_tensor(element_dtype, 3, divisibility=head_dim_v)
+        lse = _fake_runtime_tensor(cutlass.Float32, 2, alignment=8)
+        sink = _fake_runtime_tensor(cutlass.Float32, 1)
+        lengths = _fake_runtime_tensor(cutlass.Int32, 1, alignment=4) if has_topk_length else None
+        dq = _fake_runtime_tensor(element_dtype, 3, divisibility=head_dim)
+        dkv = _fake_runtime_tensor(element_dtype, 2, divisibility=head_dim)
+        d_sink = _fake_runtime_tensor(cutlass.Float32, 1)
+        workspace_lse = _fake_runtime_tensor(cutlass.Uint8, 4)
+        workspace_dkv = _fake_runtime_tensor(cutlass.Uint8, 4)
+    else:
+        q = _fake_compact_tensor(element_dtype, (total_s_q, num_heads, head_dim))
+        kv = _fake_compact_tensor(element_dtype, (total_s_kv, head_dim))
+        out = _fake_compact_tensor(element_dtype, (total_s_q, num_heads, head_dim_v))
+        dout = out
+        lse = _fake_compact_tensor(cutlass.Float32, (total_s_q, num_heads), alignment=8)
+        sink = _fake_compact_tensor(cutlass.Float32, (num_heads,))
+        lengths = _fake_compact_tensor(cutlass.Int32, (total_s_q,), alignment=4) if has_topk_length else None
+        dq, dkv, d_sink = q, kv, sink
+        workspace_lse = _fake_compact_tensor(cutlass.Uint8, (1, num_heads, cute.sym_int(), 8))
+        workspace_dkv = _fake_compact_tensor(cutlass.Uint8, (1, dkv_planes, cute.sym_int(), head_dim * 4))
     indices = _fake_compact_tensor(cutlass.Int32, (total_s_q, max_topk))
-    lengths = _fake_runtime_tensor(cutlass.Int32, 1, alignment=4) if has_topk_length else None
-    dq = _fake_runtime_tensor(element_dtype, 3, divisibility=head_dim)
-    dkv = _fake_runtime_tensor(element_dtype, 2, divisibility=head_dim)
-    d_sink = _fake_runtime_tensor(cutlass.Float32, 1)
-    workspace_lse = _fake_runtime_tensor(cutlass.Uint8, 4)
-    workspace_dkv = _fake_runtime_tensor(cutlass.Uint8, 4)
     problem_shape = (
         cutlass.Int32(1),
         cutlass.Int32(1),
@@ -285,6 +299,7 @@ def _compile_deterministic_sm100(
     max_topk: int,
     has_topk_length: bool,
     deterministic_shards: int,
+    wide_addressing: bool = False,
 ):
     """Compile one device-owned, shape-dynamic artifact from plan metadata.
 
@@ -318,6 +333,7 @@ def _compile_deterministic_sm100(
         kernel_cls=kernel_cls,
         block_tile=64,
         dkv_planes=deterministic_shards,
+        wide_addressing=wide_addressing,
     )
 
 
@@ -333,6 +349,7 @@ def _compile_nondeterministic_sm100(
     max_topk: int,
     has_topk_length: bool,
     block_tile: int,
+    wide_addressing: bool = False,
 ):
     """Compile one ordinary, device-owned, shape-dynamic plan artifact."""
     if backend in ("h96_d576_2cta_m64", "h128_d576_2cta_m64"):
@@ -351,6 +368,7 @@ def _compile_nondeterministic_sm100(
         kernel_cls=_get_sm100_kernel_class(backend),
         block_tile=block_tile,
         dkv_planes=1,
+        wide_addressing=wide_addressing,
     )
 
 

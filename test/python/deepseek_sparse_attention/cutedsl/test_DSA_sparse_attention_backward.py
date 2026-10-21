@@ -989,6 +989,7 @@ def test_DSA_sparse_attention_backward_sm100_h96_d576_uses_i64_query_offsets():
     )
     assert plan.check_support()
     assert plan._backend == "h96_d576_2cta_m64"
+    assert plan._wide_addressing
     plan.compile()
     try:
         workspace = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device=device)
@@ -1295,11 +1296,11 @@ def test_DSA_sparse_attention_backward_sm100_ordinary_compile_cache_is_device_sc
     from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100 as interface
 
     compile_artifact = interface._compile_nondeterministic_sm100
-    compiled_devices = []
+    compiled = []
 
     def fake_compile(device_index, *args, **kwargs):
-        """Return a unique launchable stand-in and record its owning device."""
-        compiled_devices.append(device_index)
+        """Return a unique launchable and record its device/address class."""
+        compiled.append((device_index, kwargs["wide_addressing"]))
         return object()
 
     compile_artifact.cache_clear()
@@ -1308,12 +1309,34 @@ def test_DSA_sparse_attention_backward_sm100_ordinary_compile_cache_is_device_sc
     try:
         device0 = compile_artifact(0, *args)
         assert compile_artifact(0, *args) is device0
+        device0_wide = compile_artifact(0, *args, True)
         device1 = compile_artifact(1, *args)
     finally:
         compile_artifact.cache_clear()
 
     assert device1 is not device0
-    assert compiled_devices == [0, 1]
+    assert device0_wide is not device0
+    assert compiled == [(0, False), (0, True), (1, False)]
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm100_address_class_covers_data_and_workspace():
+    """Choose Int64 only when a compact data/workspace offset can overflow."""
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100_common import _requires_wide_data_addressing
+
+    limit = 1 << 31
+    heads, dim, dv = 96, 576, 512
+    safe_q = limit // (heads * dim)
+    common = (2048, dim, dv, heads, True, "h96_d576_2cta_m64")
+    assert not _requires_wide_data_addressing(safe_q, *common, include_workspace=False)
+    assert _requires_wide_data_addressing(safe_q + 1, *common, include_workspace=False)
+
+    # Generic deterministic H64 uses 32 byte-shaped dKV planes at this Q.
+    # KV=32768 occupies exactly 2^31 bytes and remains addressable; one more
+    # row requires the dynamic Int64 workspace descriptor.
+    generic = (1, 512, 512, 64, True, "generic_m64")
+    assert not _requires_wide_data_addressing(generic[0], 32768, *generic[1:], include_workspace=True)
+    assert _requires_wide_data_addressing(generic[0], 32769, *generic[1:], include_workspace=True)
 
 
 @pytest.mark.L0
@@ -1343,6 +1366,7 @@ def test_DSA_sparse_attention_backward_sm100_artifact_is_shape_dynamic(monkeypat
     compile_artifact.cache_clear()
     first, *_ = _plan_case(64, 512, 64, s_q=8, s_kv=256, has_topk_length=True, deterministic=deterministic)
     first_info = compile_artifact.cache_info()
+    assert not first._wide_addressing
 
     def forbidden_compile(*args, **kwargs):
         """Fail when a dynamic-extent cache hit unexpectedly recompiles."""
@@ -1360,6 +1384,7 @@ def test_DSA_sparse_attention_backward_sm100_artifact_is_shape_dynamic(monkeypat
     )
     second_info = compile_artifact.cache_info()
 
+    assert not second._wide_addressing
     assert second._compiled_kernel is first._compiled_kernel
     assert first_info.misses == second_info.misses == 1
     assert second_info.hits == first_info.hits + 1

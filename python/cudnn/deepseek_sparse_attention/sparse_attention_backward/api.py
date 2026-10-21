@@ -71,6 +71,7 @@ class SparseAttentionBackward(APIBase):
         self._device_major = None
         self._two_cta_split_count = 1
         self._qcluster_plan = None
+        self._wide_addressing = False
 
     def _validate_compiled_inputs(self, q, kv, out, dout, lse, attn_sink, topk_idxs, topk_length) -> None:
         """Require execution inputs to match the plan's compiled contract."""
@@ -222,6 +223,7 @@ class SparseAttentionBackward(APIBase):
         # callers of ``flash_attn_bwd_sm100``.
         self._backend = None
         self._backend_block_tile = None
+        self._wide_addressing = False
         if major == 10:
             self._backend, self._backend_block_tile = _iface_sm100._select_sm100_backend(
                 num_heads,
@@ -232,6 +234,16 @@ class SparseAttentionBackward(APIBase):
                 device_capability=capability,
                 deterministic=self.deterministic,
                 is_contiguous=all(desc.is_contiguous() for desc in descriptors),
+            )
+            self._wide_addressing = _iface_sm100._requires_wide_data_addressing(
+                total_s_q,
+                self.kv_desc.shape[0],
+                head_dim,
+                head_dim_v,
+                num_heads,
+                self.deterministic,
+                self._backend,
+                include_workspace=self._backend not in _iface_d576.BACKENDS,
             )
         if self._backend in _iface_d576.BACKENDS:
             self._value_error_if(total_s_q <= 0 or self.kv_desc.shape[0] <= 0, "Q and KV sequence extents must be positive")
@@ -296,6 +308,7 @@ class SparseAttentionBackward(APIBase):
                         if self.deterministic
                         else 74
                     ),
+                    self._wide_addressing,
                 )
             return
         if self.deterministic:
@@ -315,6 +328,7 @@ class SparseAttentionBackward(APIBase):
                     self.topk_idxs_desc.shape[1],
                     self.topk_length_desc is not None,
                     shards,
+                    self._wide_addressing,
                 )
             return
         if self._device_major == 10:
@@ -331,6 +345,7 @@ class SparseAttentionBackward(APIBase):
                     self.topk_idxs_desc.shape[1],
                     self.topk_length_desc is not None,
                     self._backend_block_tile,
+                    self._wide_addressing,
                 )
             return
         # SM90 owns concrete-tensor caches and retains first-execute JIT.
