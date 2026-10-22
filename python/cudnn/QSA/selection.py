@@ -65,7 +65,7 @@ from typing import Optional, Sequence, Union
 import torch
 
 from cudnn._torch_stream import _raw_current_stream, stream_context
-from cudnn.api_base import TupleDict
+from cudnn._tupledict import TupleDict  # the DSL-free home of the result type (Rule 7: this module's import must not execute the DSL)
 from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
 
 __all__ = [

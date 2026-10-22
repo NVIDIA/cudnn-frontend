@@ -358,6 +358,18 @@ DSL satisfies your kernel.**
   `cudnn/frost/tile_dsl` inherits it) → 4.7.0.
   Native im2col tensor-map creation used by `conv/cutedsl/conv3d_postops`
   (`cutlass.experimental.cuda.create_tensor_map_im2col`) → 4.9.
+  `cp.async.cg.shared.global.L2::cache_hint` with a `createpolicy` register (the paged decode
+  scorer's key copies, `gated_attention_block/kernels/qsa_score_paged.py`) → a DSL compiling
+  with CUDA 13.4 or later, i.e. the cu13 toolchain of 4.8.0 (the DSL binds its cu13 flavour
+  only under a CUDA 13 driver): the 13.3 PTX assembler of the public 4.7.0 cu13 wheel
+  mis-encodes the hinted copy's uniform operands on sm_90 / sm_100 (an illegal-instruction
+  trap at the first copy; the PTX is identical), and the cu12 flavour of both public wheels,
+  4.7.0 and 4.8.0 -- what the DSL binds under a CUDA 12 driver -- reports CUDA 12.9, whose
+  assembler emits the same encoding (compile-only dumps), so the kernel reads `CUDA_VERSION`
+  (`L2_HINT_MIN_COMPILER`), traces the plain copy below the floor and declines a forced
+  `l2_hint=True` by name -- the decline states the defect as observed (never as a property of
+  the compiler it found) and prescribes the cu13 flavour under a CUDA 13 driver, not a wheel
+  number.
 - Tests that import a kernel module directly `pytest.skip` on a too-old DSL —
   they do not fail. CI runs the `oss:` lanes across the supported DSL versions
   (`ci/stages/oss_tests/jobs.yml` in internal CI); a lane below your floor

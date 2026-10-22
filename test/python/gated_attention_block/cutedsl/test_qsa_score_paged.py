@@ -7,17 +7,20 @@
 Host cells (any machine): the MMA row map of the (s, h) query rows (a bijection onto the padded rows; the head-sum geometry per
 head count), the knob's default rule at both sides of every threshold, the compile-key envelope (typed ``ValueError``), the byte model, the
 compile site's persistent-cache key (the module digest), the Rule 7 gates (the DSL floor, the ``sm_107a`` target, the radix top-k's
-cc 9.0 and PDL's cc 9.0 -- each a ``NotImplementedError`` naming the version or the device, raised BEFORE any compile), the e4m3 pair
-refused BY NAME, the form checks naming their fault; with a CUDA device: the front door's import-time contract in a FRESH process (the
-DSL modeled as the public 4.6.2 wheel: the typed decline, the kernel module never imported) and the launch-stream resolution with both
-kernels stubbed (a ``torch.cuda.Stream`` / a raw handle / ``None``: every torch operation on the launch stream).
+cc 9.0 and PDL's cc 9.0, then the L2-hint arm's compiler floor -- each a ``NotImplementedError`` naming the version or the device, raised
+BEFORE any compile; the compiler floor modeled at the seam the kernel reads: the default follows it, a forced hint below it declines),
+the e4m3 pair refused BY NAME, the form checks naming their fault; with a CUDA device: the import-time contract of BOTH front doors (the
+paged and the dense selector) in a FRESH process (the DSL modeled as the public 4.6.2 wheel: the typed decline, neither the kernel
+modules nor the DSL itself imported) and the launch-stream resolution with both kernels stubbed (a ``torch.cuda.Stream`` / a raw handle /
+``None``: every torch operation on the launch stream).
 
 Scorer cells (ANY CuTe DSL device from sm_80 -- the kernel is one warp-level ``mma.sync.m16n8k16`` per 8 keys x 16 D, loads,
 shuffles, no barrier): the fp32 logits of every
 visible column against an fp64 re-derivation of the indexer score on the SAME bf16 inputs gathered through the table
 (``relu(q_h . kbar_j)`` summed over heads, times the scale), the per-row counts against the QSA oracle's count rule, the
-columns at or past a row's count NEVER written (a sentinel proves it), two launches bitwise, the ``units_per_warp`` knob and the
-PDL arm bitwise the plain launch, the degenerate matrix of the module docstring (a padding sequence, a sequence shorter than the
+columns at or past a row's count NEVER written (a sentinel proves it), two launches bitwise, the ``units_per_warp`` and ``ring_depth``
+knobs, the ``l2_hint`` arm (the hinted and the plain key copies where the DSL's compiler serves both; the forced hint a typed decline
+below its floor) and the PDL arm bitwise the plain launch, the degenerate matrix of the module docstring (a padding sequence, a sequence shorter than the
 step, a visible count inside a page, a ``-1`` / out-of-range table page under a visible block and past the visible range), at
 ``n_blocks_max`` {8, 520, 4096, 8192, 32768} x rows 1..4 x page sizes {16, 32, 64}; every branch of the row map (``H_i`` 1 / 2 / 3 /
 8 / 16 / 32, several m-tiles, a query spanning two tiles) against the same reference; a fresh variant reaching the compiled-plan cache.
@@ -316,6 +319,11 @@ def test_validate_params_rejects_outside_the_envelope_and_accepts_inside():
             fd.validate_params(h_i=4, s_q=1, page_size=16, units_per_warp=1, ring_depth=depth)
     for depth in fd.RING_DEPTH_CHOICES:
         fd.validate_params(h_i=4, s_q=1, page_size=16, units_per_warp=1, ring_depth=depth)
+    for hint in ("yes", 1, 0, "True"):  # a tri-state knob: None (the DSL's compiler decides), True, False -- never a truthy stand-in
+        with pytest.raises(ValueError, match="l2_hint must be None"):
+            fd.validate_params(h_i=4, s_q=1, page_size=16, units_per_warp=1, l2_hint=hint)
+    for hint in (None, True, False):
+        fd.validate_params(h_i=4, s_q=1, page_size=16, units_per_warp=1, l2_hint=hint)
     for h_i, s_q, page, units in ((4, 4, 16, 1), (4, 16, 64, 4), (64, 1, 8, 2), (8, 8, 32, 2), (16, 4, 256, 1), (3, 16, 16, 8), (5, 8, 16, 1)):
         fd.validate_params(h_i=h_i, s_q=s_q, page_size=page, units_per_warp=units)
 
@@ -346,17 +354,20 @@ def test_compile_site_keys_on_the_module_digest():
     assert "cute.compile(" not in src and 'symbol="cudnn_block_qsa_score_paged"' in src and '"compile_qsa_score_paged")' in src
 
 
-@needs_cuda
-def test_front_door_declines_by_version_in_a_fresh_process_without_importing_the_kernel_module():
-    """Rule 7 at the DOCUMENTED import path, in a fresh interpreter (in this process the kernel module is already imported, so an in-process
-    check would pass for the wrong reason).  The installed DSL is modeled as the public 4.6.2 wheel two ways at once -- the version
-    discovery answers 4.6.2 AND ``cutlass.experimental`` (the 4.7.0-only API every tile_dsl helper imports at module scope) is made
-    unimportable -- then the front door is imported and the selector called on real CUDA operands: the import touched neither the kernel
-    module nor ``cudnn.frost.tile_dsl``, the call raises the typed ``NotImplementedError`` naming the floor and the found version, and
-    afterwards the kernel module, ``cudnn.frost.tile_dsl`` and the radix top-k's package are still not imported."""
-    probe = r"""
+# The fresh-process probes' shared prelude: the installed DSL modeled as the public 4.6.2 wheel two ways at once -- the version discovery
+# answers 4.6.2 AND ``cutlass.experimental`` (the 4.7.0-only API every tile_dsl helper imports at module scope) is made unimportable; the
+# public 4.7.0 wheel's own ``cutlass/__init__`` imports ``cutlass.experimental`` too, so under that wheel ANY import of the DSL on the way
+# to the decline is the untyped ``ModuleNotFoundError`` Rule 7 forbids, which is why both probes also pin that ``cutlass`` stays out of
+# ``sys.modules`` (a delta against the interpreter's start-up set: a .pth hook's imports are never blamed on a front door).
+_FRESH_PROCESS_PRELUDE = r"""
 import importlib.abc
 import sys
+
+_STARTUP = set(sys.modules)
+
+
+def _dsl_modules():
+    return sorted(m for m in sys.modules if (m == "cutlass" or m.startswith("cutlass.")) and m not in _STARTUP)
 
 
 class _NoExperimental(importlib.abc.MetaPathFinder):
@@ -372,11 +383,31 @@ import torch
 import cudnn.frost.buffers as buffers
 
 buffers._DSL_STATE = (True, ("nvidia-cutlass-dsl", "4.6.2"))
+"""
+
+
+def _run_fresh_process(probe: str, marker: str) -> None:
+    run = subprocess.run([sys.executable, "-c", _FRESH_PROCESS_PRELUDE + probe], capture_output=True, text=True, timeout=900)
+    assert run.returncode == 0, f"rc {run.returncode}\n{run.stderr[-3000:]}"
+    assert marker in run.stdout, run.stdout[-2000:]
+
+
+@needs_cuda
+def test_front_door_declines_by_version_in_a_fresh_process_without_importing_the_kernel_module():
+    """Rule 7 at the DOCUMENTED import path, in a fresh interpreter (in this process the kernel module is already imported, so an in-process
+    check would pass for the wrong reason).  The installed DSL modeled as the public 4.6.2 wheel (the prelude), then the front door is
+    imported and the selector called on real CUDA operands: the import touched neither the kernel module nor ``cudnn.frost.tile_dsl`` nor
+    the DSL itself (``cutlass`` stays out of ``sys.modules``: the front door's helpers -- the stream context, ``TupleDict`` -- are DSL-free
+    modules, never ``api_base``, which imports the DSL at module scope), the call raises the typed ``NotImplementedError`` naming the
+    floor and the found version, and afterwards the kernel module, ``cudnn.frost.tile_dsl``, the DSL and the radix top-k's package are
+    still not imported."""
+    probe = r"""
 from cudnn.QSA import selection_paged as fd
 
 KERNEL = "cudnn.gated_attention_block.kernels.qsa_score_paged"
 assert KERNEL not in sys.modules, "importing the front door imported the kernel module"
 assert "cudnn.frost.tile_dsl" not in sys.modules, "importing the front door imported tile_dsl"
+assert not _dsl_modules(), f"importing the front door imported the DSL: {_dsl_modules()}"
 qi = torch.zeros(1, 4, 128, dtype=torch.bfloat16, device="cuda")
 pool = torch.zeros(3, 4, 1, 128, dtype=torch.bfloat16, device="cuda")
 table = torch.tensor([[0, 1]], dtype=torch.int32, device="cuda")
@@ -389,25 +420,57 @@ else:
     raise AssertionError("the selector ran on a sub-floor DSL")
 assert KERNEL not in sys.modules, "the decline imported the kernel module"
 assert "cudnn.frost.tile_dsl" not in sys.modules, "the decline imported tile_dsl"
+assert not _dsl_modules(), f"the decline imported the DSL: {_dsl_modules()}"
 assert not any(m.startswith("cudnn.deepseek_sparse_attention") for m in sys.modules), "the decline imported the radix top-k's package"
 print("@@FRONT_DOOR_OK")
 """
-    run = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, timeout=900)
-    assert run.returncode == 0, f"rc {run.returncode}\n{run.stderr[-3000:]}"
-    assert "@@FRONT_DOOR_OK" in run.stdout, run.stdout[-2000:]
+    _run_fresh_process(probe, "@@FRONT_DOOR_OK")
+
+
+@needs_cuda
+def test_dense_front_door_declines_by_version_in_a_fresh_process_without_importing_the_dsl():
+    """The dense-cache decode selector (``cudnn.QSA.selection``) is the paged front door's sibling and carries the same import-time contract:
+    under the modeled 4.6.2 wheel its import executes no DSL and no kernel package, ``qsa_select_decode_forward`` on real CUDA operands
+    raises the typed decline naming the floor and the found version, and afterwards the DSL and the DSA kernel packages are still not
+    imported."""
+    probe = r"""
+from cudnn.QSA import selection as dense
+
+assert not _dsl_modules(), f"importing the dense selector imported the DSL: {_dsl_modules()}"
+assert not any(m.startswith("cudnn.deepseek_sparse_attention") for m in sys.modules), "importing the dense selector imported the DSA package"
+qi = torch.zeros(1, 1, 4, 128, dtype=torch.bfloat16, device="cuda")
+kbar = torch.zeros(1, 8, 128, dtype=torch.bfloat16, device="cuda")
+kv_lens = torch.tensor([9], dtype=torch.int32, device="cuda")
+try:
+    dense.qsa_select_decode_forward(qi, kbar, kv_lens)
+except NotImplementedError as error:
+    assert "qsa_select_decode_forward requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2" in str(error), str(error)
+else:
+    raise AssertionError("the dense selector ran on a sub-floor DSL")
+assert not _dsl_modules(), f"the decline imported the DSL: {_dsl_modules()}"
+assert not any(m.startswith("cudnn.deepseek_sparse_attention") for m in sys.modules), "the decline imported the DSA package"
+print("@@DENSE_FRONT_DOOR_OK")
+"""
+    _run_fresh_process(probe, "@@DENSE_FRONT_DOOR_OK")
 
 
 @needs_cuda
 def test_rule7_gates_run_before_any_compile(monkeypatch):
-    """The DSL floor, then the sm_107a target, then the radix top-k's and PDL's cc 9.0: each a NotImplementedError that names the
-    version or the device, raised by the compile entry (the kernel module's own gate) and by the selector (the front door's gate)
-    BEFORE any kernel is compiled or imported -- each module's binding patched, since each gates for itself."""
+    """The DSL floor, then the sm_107a target, then the radix top-k's and PDL's cc 9.0, then the L2-hint arm's compiler floor (a device
+    gate before a form's gate): each a NotImplementedError that names the version or the device, raised by the compile entry (the kernel
+    module's own gate) and by the selector (the front door's gate) BEFORE any kernel is compiled or imported -- each module's binding
+    patched, since each gates for itself; the compiler seam is held BELOW the hint's floor throughout, so every earlier gate is pinned
+    ahead of a LIVE hint decline."""
     case = _Case(1, 1, 8, 16, [9], seed=1)
     kw = dict(seq_q=1)
+    monkeypatch.setattr(sp, "_bundled_cuda_version", lambda: (13, 3))  # the hint's decline is live from here on
+    assert sp.l2_hint_requirement_error() is not None
     for mod in (sp, fd):
         monkeypatch.setattr(mod, "cutedsl_requirement_error", lambda what: f"{what} requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2")
     with pytest.raises(NotImplementedError, match="qsa_score_paged requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2"):
         sp.compile_qsa_score_paged(h_i=H, s_q=1, page_size=16)
+    with pytest.raises(NotImplementedError, match="qsa_score_paged requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2"):
+        sp.compile_qsa_score_paged(h_i=H, s_q=1, page_size=16, l2_hint=True)
     with pytest.raises(NotImplementedError, match="qsa_select_decode_paged_forward requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2"):
         fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, **kw)
     for mod in (sp, fd):
@@ -418,6 +481,8 @@ def test_rule7_gates_run_before_any_compile(monkeypatch):
     with pytest.raises(NotImplementedError, match="sm_107a"):
         sp.compile_qsa_score_paged(h_i=H, s_q=1, page_size=16)
     with pytest.raises(NotImplementedError, match="sm_107a"):
+        sp.compile_qsa_score_paged(h_i=H, s_q=1, page_size=16, l2_hint=True)
+    with pytest.raises(NotImplementedError, match="sm_107a"):
         fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, **kw)
     for mod in (sp, fd):
         monkeypatch.setattr(mod, "cutedsl_arch_requirement_error", lambda cc: None)
@@ -427,6 +492,68 @@ def test_rule7_gates_run_before_any_compile(monkeypatch):
         fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, **kw)
     with pytest.raises(NotImplementedError, match=r"griddepcontrol.*cc 8\.0"):
         sp.compile_qsa_score_paged(h_i=H, s_q=1, page_size=16, use_pdl=True)
+    # the L2-hint arm's compiler floor comes AFTER PDL's cc gate: with both live, use_pdl=True names griddepcontrol; without PDL the forced
+    # hint names the compiler, the floor and the wheel
+    with pytest.raises(NotImplementedError, match=r"griddepcontrol.*cc 8\.0"):
+        sp.compile_qsa_score_paged(h_i=H, s_q=1, page_size=16, use_pdl=True, l2_hint=True)
+    with pytest.raises(NotImplementedError, match=r"l2_hint=True.*bundled CUDA compiler is 13\.4 or later.*compiles with CUDA 13\.3"):
+        sp.compile_qsa_score_paged(h_i=H, s_q=1, page_size=16, l2_hint=True)
+
+
+@needs_cuda
+def _assert_l2_hint_decline_text(why, found):
+    """The forced hint's decline (Rule 7) states the defect as OBSERVED -- the 13.3 PTX assembler of the public 4.7.0 cu13 wheel, and the
+    cu12 flavour's 12.9 assembler emitting the same encoding -- names the installed wheel and the compiler it found, and prescribes the cu13
+    flavour of 4.8.0 or later under a CUDA 13 driver (the DSL binds its cu13 toolchain only there).  It never attributes the defect to the
+    FOUND version by interpolation (``13.1`` was never observed) and never prescribes a bare wheel upgrade: a 4.8.0 user whose driver bound
+    the cu12 flavour already has the wheel, and ``pip install -U`` would change nothing."""
+    assert why is not None and f"compiles with CUDA {found}" in why, why
+    assert "13.3 PTX assembler of the public nvidia-cutlass-dsl 4.7.0" in why, why
+    assert "cu12 flavour" in why and "12.9" in why, why
+    assert "nvidia-cutlass-dsl[cu13]>=4.8.0" in why and "CUDA 13 compatible driver" in why, why
+    assert "pip install -U" not in why and "nvidia-cutlass-dsl>=4.8.0'" not in why, why
+    assert "l2_hint=None or False" in why, why
+    if found not in ("13.3", "12.9"):
+        assert f"{found} PTX assembler" not in why and f"{found} assembler" not in why, why
+
+
+def test_l2_hint_follows_the_dsl_compiler_and_the_forced_hint_declines_below_its_floor(monkeypatch):
+    """The key copies' L2 evict-first hint is a compile-time arm selected by the DSL's bundled CUDA compiler, read at ONE seam
+    (``_bundled_cuda_version``, ``cutlass.base_dsl.version_info.CUDA_VERSION``: the cu12 / cu13 flavour the DSL bound by the driver, never
+    the wheel's number): below ``L2_HINT_MIN_COMPILER`` = 13.4 (the first PTX assembler that encodes the hinted copies' uniform operands
+    correctly on sm_90 / sm_100; the 13.3 one bundled with the public 4.7.0 cu13 wheel traps on the first copy, the cu12 flavour's 12.9
+    one emits the same encoding) the default resolves to the plain copies and ``l2_hint=True`` is a typed decline naming the compiler,
+    the floor, the wheel and the cu13 remedy -- raised by the compile entry BEFORE any compile (the DSL floor and the target gates modeled
+    open, so the cell runs on every device); at and above the floor the hint is available, the default resolves to it and nothing declines.
+    Modeled, so it runs under any installed DSL."""
+    for mod in (sp, fd):
+        monkeypatch.setattr(mod, "cutedsl_requirement_error", lambda what: None)
+        monkeypatch.setattr(mod, "cutedsl_arch_requirement_error", lambda cc: None)
+    assert sp.L2_HINT_MIN_COMPILER == (13, 4)
+    live = sp._bundled_cuda_version()
+    assert isinstance(live, tuple) and len(live) == 2 and all(isinstance(x, int) for x in live), live
+    monkeypatch.setattr(sp, "_bundled_cuda_version", lambda: (13, 3))
+    assert sp.l2_hint_available() is False and sp._resolve_l2_hint(None) is False and sp._resolve_l2_hint(False) is False
+    why = sp.l2_hint_requirement_error()
+    assert why is not None and "l2_hint=True" in why and "13.4" in why and "CUDA 13.3" in why and "nvidia-cutlass-dsl" in why, why
+    _assert_l2_hint_decline_text(why, found="13.3")
+    with pytest.raises(NotImplementedError, match=r"l2_hint=True.*bundled CUDA compiler is 13\.4 or later.*compiles with CUDA 13\.3"):
+        sp.compile_qsa_score_paged(h_i=H, s_q=1, page_size=16, l2_hint=True)
+    with pytest.raises(NotImplementedError, match=r"compiles with CUDA 13\.3"):
+        sp._resolve_l2_hint(True)
+    # the cu12 flavour of ANY wheel (the DSL binds it under a CUDA 12 driver, a 4.8.0 wheel included) reports CUDA 12.9: the plain copies by
+    # the same rule, and the forced hint's decline names the observed defect and the cu13 remedy; a compiler nobody observed (13.1) is
+    # never named as the defect
+    for found in ((12, 9), (13, 1)):
+        monkeypatch.setattr(sp, "_bundled_cuda_version", lambda v=found: v)
+        assert sp.l2_hint_available() is False and sp._resolve_l2_hint(None) is False, found
+        _assert_l2_hint_decline_text(sp.l2_hint_requirement_error(), found=f"{found[0]}.{found[1]}")
+    for version in ((13, 4), (13, 6), (14, 0)):
+        monkeypatch.setattr(sp, "_bundled_cuda_version", lambda v=version: v)
+        assert sp.l2_hint_available() is True and sp.l2_hint_requirement_error() is None, version
+        assert sp._resolve_l2_hint(None) is True and sp._resolve_l2_hint(True) is True and sp._resolve_l2_hint(False) is False
+    with pytest.raises(ValueError, match="l2_hint must be None"):
+        sp.compile_qsa_score_paged(h_i=H, s_q=1, page_size=16, l2_hint="yes")
 
 
 @needs_cuda
@@ -708,6 +835,36 @@ def test_ring_depth_is_a_knob():
         assert torch.equal(_bits(outs[0][0]), _bits(logits)) and torch.equal(outs[0][1], counts) and torch.equal(outs[0][2], lens)
     with pytest.raises(ValueError, match="ring_depth must be one of"):
         sp.compile_qsa_score_paged(h_i=H, s_q=3, page_size=16, units_per_warp=2, ring_depth=5)
+
+
+@needs_scorer
+def test_l2_hint_is_a_knob_and_the_forced_hint_declines_below_its_compiler_floor():
+    """The key copies' L2 evict-first hint (``cp.async ... .L2::cache_hint`` with a ``createpolicy`` register) is a cache-policy annotation:
+    the hinted and the plain copies move the same bytes into the same slots, so the logits are BITWISE across the knob.  The default
+    follows the DSL's bundled CUDA compiler (``l2_hint_available``: hinted from 13.4, plain below -- the 13.3 assembler of the public
+    4.7.0 wheel mis-encodes the hinted copies on sm_90 / sm_100), ``False`` is the plain copy on every DSL, and ``True`` below the floor
+    is the typed decline naming both versions (Rule 7): under a 4.8.0 wheel this cell compares the three artifacts, under a 4.7.0 wheel
+    the two plain ones and pins the decline.  The recipe records the arm that was built, and the default's compile key keeps its identity."""
+    case = _Case(3, 2, 1032, 16, [4 * 1032 - 1, 4 * 700 + 2, 4 * 3 + 3], seed=33)
+    default = sp.compile_qsa_score_paged(h_i=H, s_q=2, page_size=16)
+    assert default.l2_hint == sp.l2_hint_available() == (sp.l2_hint_requirement_error() is None)
+    assert (H, 2, 16, 1, True, False, default.device) in sp.compiled_cache
+    plain = sp.compile_qsa_score_paged(h_i=H, s_q=2, page_size=16, l2_hint=False)
+    assert plain.l2_hint is False and plain.ring_depth == default.ring_depth
+    outs = [case.run(default), case.run(plain)]
+    why = sp.l2_hint_requirement_error()
+    if why is None:
+        hinted = sp.compile_qsa_score_paged(h_i=H, s_q=2, page_size=16, l2_hint=True)
+        assert hinted.l2_hint is True
+        outs.append(case.run(hinted))
+    else:
+        with pytest.raises(NotImplementedError, match=r"l2_hint=True.*bundled CUDA compiler is 13\.4 or later.*compiles with CUDA \d+\.\d+") as info:
+            sp.compile_qsa_score_paged(h_i=H, s_q=2, page_size=16, l2_hint=True)
+        live = sp._bundled_cuda_version()
+        _assert_l2_hint_decline_text(str(info.value), found=f"{live[0]}.{live[1]}")  # the live wheel's text: the observed defect + the cu13 remedy
+    _assert_scorer(case, *outs[0])
+    for logits, counts, lens in outs[1:]:
+        assert torch.equal(_bits(outs[0][0]), _bits(logits)) and torch.equal(outs[0][1], counts) and torch.equal(outs[0][2], lens), "the hint changed a logit"
 
 
 @needs_scorer

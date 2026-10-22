@@ -585,6 +585,16 @@ def pytest_configure(config):
         print(f"PyTorch Path: {torch.__file__}")
         print(f"PyTorch CUDA Version: {torch.version.cuda}")
         print(f"PyTorch cuDNN Version: {torch.backends.cudnn.version()}")
+    try:
+        # The CuTe DSL wheel and the CUDA toolchain it bound (its cu12 / cu13 flavour, picked by the driver): the compiler floors of the
+        # OSS kernels (python/cudnn/AGENTS.md Rule 7) read THIS, never torch.version.cuda, so a lane's log names the compiler it ran.
+        import cutlass as _cutlass
+        from cutlass.base_dsl.version_info import CUDA_VERSION as _dsl_cuda
+    except Exception as e:  # noqa: BLE001 -- no DSL, or an unusable one: the OSS tests decline or skip for themselves
+        print(f"CuTe DSL: not available ({type(e).__name__}: {str(e)[:160]})")
+    else:
+        print(f"CuTe DSL Version: {_cutlass.__version__} (compiles with CUDA {_dsl_cuda.major}.{_dsl_cuda.minor})")
+        print(f"CuTe DSL Path: {_cutlass.__file__}")
 
 # fmt: off
 def pytest_addoption(parser):

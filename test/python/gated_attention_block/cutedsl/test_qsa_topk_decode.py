@@ -49,6 +49,10 @@ needs_pdl_gpu = pytest.mark.skipif(_cc() is None or _cc() < (9, 0), reason=f"gri
 needs_cluster_gpu = pytest.mark.skipif(_cc() is None or _cc() < (9, 0), reason=f"thread-block clusters and DSMEM need cc 9.0+; found {_cc()}")
 _TARGET = cutedsl_arch_requirement_error(_cc()) if _cc() is not None else None
 needs_dsl_target = pytest.mark.skipif(_TARGET is not None, reason=str(_TARGET))
+# the cluster form's own DSL floor (``CLUSTER_FORM_MIN_DSL`` = 4.8.0 on the public wheel): its cells SKIP with the typed decline's text
+# below it -- the released 4.7.0 is admitted by the FROST floor, so without this mark they failed there with that very message
+_CLUSTER_DSL = topk_mod.cluster_form_requirement_error(topk_mod.CLUSTER_SIZES[1]) if topk_mod is not None else None
+needs_cluster_dsl = pytest.mark.skipif(_CLUSTER_DSL is not None, reason=str(_CLUSTER_DSL))
 
 K = 512
 SENTINEL = -2  # never produced by the kernel (ids are >= 0, the padding is -1): a slot still holding it after a launch was never written
@@ -56,8 +60,10 @@ THREADS = (512, 1024)
 
 
 def _cluster_sizes():
+    """The cluster sizes this device AND this DSL serve: ``[1]`` below cc 9.0 (no clusters) or on a public wheel below the cluster
+    form's floor (the ``needs_cluster_dsl`` decline), else the whole domain."""
     cc = _cc()
-    return [1] if cc is None or cc < (9, 0) else [1, 4, 8, 16]
+    return [1] if cc is None or cc < (9, 0) or _CLUSTER_DSL is not None else [1, 4, 8, 16]
 
 
 def reference_canonical(logits: torch.Tensor, counts: torch.Tensor, top_k: int) -> torch.Tensor:
@@ -256,7 +262,8 @@ def test_other_list_widths(top_k):
 @needs_cuda
 @needs_dsl_target
 def test_every_knob_value_is_bitwise_the_same_function():
-    """The thread count is a performance knob: every value gives the same bits (and ``cluster_ctas = 1``, the served value)."""
+    """The thread count is a performance knob: every value gives the same bits (``cluster_ctas = 1``, the served value on every part;
+    the cluster sizes are the next cell's, so a wheel below the cluster form's floor skips THAT one and still runs this one)."""
     device = torch.device("cuda")
     logits, counts = _case(8, 8192, K, seed=5, device=device)
     ref = reference_canonical(logits, counts, K)
@@ -264,7 +271,23 @@ def test_every_knob_value_is_bitwise_the_same_function():
         out = _run(logits, counts, K, cluster_ctas=1, threads_per_cta=threads)
         torch.cuda.synchronize()
         assert torch.equal(out, ref), f"threads_per_cta={threads} differs"
-    for cluster_ctas in _cluster_sizes()[1:]:
+
+
+@needs_cuda
+@needs_cluster_gpu
+@needs_cluster_dsl
+@needs_dsl_target
+def test_every_cluster_size_is_bitwise_the_single_cta_function():
+    """The cluster size is a performance knob too: 4 / 8 / 16 CTAs per row give the single-CTA form's bits.  Its own cell, split from
+    the thread-count cell: below ``CLUSTER_FORM_MIN_DSL`` it skips with the typed decline's text instead of failing (the 2026-10-22
+    nightly on the released 4.7.0) or leaving an empty loop behind -- where the marks admit it, the sizes are asserted to be the whole
+    domain, so the loop is never silently empty."""
+    sizes = _cluster_sizes()[1:]
+    assert sizes == [4, 8, 16], f"the marks admit the cluster form here, so every size must be served; got {sizes}"
+    device = torch.device("cuda")
+    logits, counts = _case(8, 8192, K, seed=5, device=device)
+    ref = reference_canonical(logits, counts, K)
+    for cluster_ctas in sizes:
         out = _run(logits, counts, K, cluster_ctas=cluster_ctas, threads_per_cta=1024)
         torch.cuda.synchronize()
         assert torch.equal(out, ref), f"cluster_ctas={cluster_ctas} differs"
@@ -272,6 +295,7 @@ def test_every_knob_value_is_bitwise_the_same_function():
 
 @needs_cuda
 @needs_cluster_gpu
+@needs_cluster_dsl
 @needs_dsl_target
 @pytest.mark.parametrize("cluster_ctas", [4, 8, 16])
 @pytest.mark.parametrize("cols", [520, 8192, 32768])
@@ -290,6 +314,7 @@ def test_the_cluster_form_matches_the_exact_canonical_reference(cols, cluster_ct
 
 @needs_cuda
 @needs_cluster_gpu
+@needs_cluster_dsl
 @needs_dsl_target
 @pytest.mark.parametrize("cluster_ctas", [4, 8, 16])
 @pytest.mark.parametrize("cols", [8192, 32768])
@@ -319,6 +344,7 @@ def test_the_cluster_form_union_list_passes_and_the_id_rank_on_a_spread_tie(cols
 
 @needs_cuda
 @needs_cluster_gpu
+@needs_cluster_dsl
 @needs_dsl_target
 def test_the_cluster_form_finds_the_tied_cutoff_past_the_first_1024_union_candidates():
     """The union list holds up to ``cluster_ctas x UNION_CAP`` = 2032 candidates at 16 CTAs -- more than the CTA has threads -- and the
@@ -530,8 +556,11 @@ def test_declines_below_the_dsl_floor_by_version_before_any_compile(monkeypatch)
 def test_declines_the_cluster_form_on_a_dsl_below_its_vector_store_floor(monkeypatch):
     """The cluster form's exchanges store four words per thread with one tuple-valued ``store_async_dsmem``; the released CuTe DSL 4.7.0
     -- admitted by the FROST floor -- evaluates ``Int32(value)`` on that tuple and fails the cluster form's compile (the 2026-10-22
-    review's finding), so ``cluster_ctas > 1`` declines by name below ``CLUSTER_FORM_MIN_DSL`` BEFORE any compile, the default knob
-    chooser keeps one CTA per row there, the single-CTA form is untouched, and an internal build is not judged (the floor's rule)."""
+    review's finding), so ``cluster_ctas > 1`` declines by name below ``CLUSTER_FORM_MIN_DSL`` BEFORE any compile and AFTER the device
+    gates (the device is modeled: cc 10.0 with its target, so the cell reads the form's floor on any part), the default knob chooser
+    keeps one CTA per row there, the single-CTA form is untouched, and an internal build is not judged (the floor's rule)."""
+    monkeypatch.setattr(topk_mod, "compute_capability", lambda device: (10, 0))
+    monkeypatch.setattr(topk_mod, "cutedsl_arch_requirement_error", lambda cc: None)
     monkeypatch.setattr(topk_mod, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.7.0")))
     monkeypatch.setattr(topk_mod, "compile_cached", lambda *a, **k: (_ for _ in ()).throw(AssertionError("compile reached below the cluster form's floor")))
     assert topk_mod.CLUSTER_FORM_MIN_DSL == (4, 8, 0)
@@ -557,11 +586,20 @@ def test_declines_a_dsl_without_the_device_target(monkeypatch):
 @needs_cuda
 def test_declines_clusters_and_pdl_below_cc_9(monkeypatch):
     """Thread-block clusters, DSMEM and griddepcontrol exist from Hopper: both arms decline by name on an older part (modeled); the
-    single-CTA plain arm has no such gate."""
+    single-CTA plain arm has no such gate.  The ORDER is pinned with both declines live: the DSL is modeled as the public 4.7.0 (below
+    the cluster form's floor) and the part as cc 8.0, and the device gate is the one that names -- a device gate before a form's DSL
+    gate, so an older part is told what it lacks whatever wheel it runs (the 2026-10-22 nightly on the released 4.7.0 read the DSL
+    text here).  The cluster gate precedes the PDL gate (both arms asked: the cluster text), and the PDL arm reads its own text under
+    the same live state (with ``cluster_ctas = 1`` the form's floor is moot)."""
     monkeypatch.setattr(topk_mod, "compute_capability", lambda device: (8, 0))
     monkeypatch.setattr(topk_mod, "cutedsl_arch_requirement_error", lambda cc: None)
-    with pytest.raises(NotImplementedError, match=r"cluster_ctas = 8 needs thread-block clusters and DSMEM \(cc 9\.0\+\); found cc 8\.0"):
+    monkeypatch.setattr(topk_mod, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.7.0")))
+    assert topk_mod.cluster_form_requirement_error(8) is not None, "the premise: the cluster form's DSL decline is live as well"
+    cluster_text = r"cluster_ctas = 8 needs thread-block clusters and DSMEM \(cc 9\.0\+\); found cc 8\.0"
+    with pytest.raises(NotImplementedError, match=cluster_text):
         topk_mod.compile_qsa_topk_decode(cols_cap=8192, top_k=K, cluster_ctas=8, threads_per_cta=1024)
+    with pytest.raises(NotImplementedError, match=cluster_text):
+        topk_mod.compile_qsa_topk_decode(cols_cap=8192, top_k=K, cluster_ctas=8, threads_per_cta=1024, use_pdl=True)
     with pytest.raises(NotImplementedError, match=r"use_pdl=True needs griddepcontrol \(cc 9\.0\+\); found cc 8\.0"):
         topk_mod.compile_qsa_topk_decode(cols_cap=1024, top_k=K, threads_per_cta=1024, use_pdl=True)
 

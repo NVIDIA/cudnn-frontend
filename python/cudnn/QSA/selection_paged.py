@@ -16,8 +16,9 @@ page); the scorer kernel reads them there and the deterministic radix top-k foll
     block_lens[t] = min(top_k, n_vis_t)
     block_ids[t]  = the top_k of logits[t, :counts[t]], ASCENDING, -1 past block_lens[t]
 
-**Placement (Rule 7).**  This module imports no CuTe DSL -- torch, the stream helpers and the version gates only -- so the
-documented import path resolves on every installed DSL, the public 4.6.2 wheel (the floor vLLM and SGLang pin) included.
+**Placement (Rule 7).**  This module imports no CuTe DSL -- torch, the stream helpers, the version gates and the DSL-free
+``TupleDict`` (``cudnn._tupledict``; never ``cudnn.api_base``, whose import executes the DSL) only -- so the documented import path
+resolves on every installed DSL, the public 4.6.2 wheel (the floor vLLM and SGLang pin) included.
 :func:`qsa_select_decode_paged_forward` checks every operand's FORM first, then gates the DSL floor, the ``sm_107a`` target on cc 10.7
 and the radix top-k's cc 9.0 -- each a typed ``NotImplementedError`` naming the version or the device -- and only THEN imports
 the kernel module (whose import executes the DSL, like its neighbours) inside the function body.  The kernel's host-side
@@ -39,7 +40,7 @@ from typing import NamedTuple, Optional
 import torch
 
 from cudnn._torch_stream import launch_stream, stream_context
-from cudnn.api_base import TupleDict
+from cudnn._tupledict import TupleDict
 from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
 
 __all__ = [
@@ -173,10 +174,11 @@ def default_units_per_warp(n_blocks_max: int, batch: int = 1, num_sms: Optional[
     return UNITS_DEFAULT
 
 
-def validate_params(*, h_i: int, s_q: int, page_size: int, units_per_warp: int, ring_depth: int = NTILES_IN_FLIGHT) -> None:
+def validate_params(*, h_i: int, s_q: int, page_size: int, units_per_warp: int, ring_depth: int = NTILES_IN_FLIGHT, l2_hint: Optional[bool] = None) -> None:
     """The compile-key facts, typed (never an assert): the head count and the rows per sequence (their PADDED product is the
     register envelope of the resident query fragments), the page size (a power of two of at least two compressed rows: the
-    in-kernel page / row split is a shift), the units knob."""
+    in-kernel page / row split is a shift), the units knob, the ring depth, and the VALUE of the ``l2_hint`` arm (``None`` / ``True`` /
+    ``False``; which arm ``None`` resolves to is the kernel module's reading of the DSL's compiler, not a host fact)."""
     if int(h_i) < 1:
         raise ValueError(f"h_i must be >= 1, got {h_i}")
     if int(s_q) < 1:
@@ -196,6 +198,8 @@ def validate_params(*, h_i: int, s_q: int, page_size: int, units_per_warp: int, 
         raise ValueError(f"units_per_warp must be one of {UNITS_PER_WARP_CHOICES}, got {units_per_warp}")
     if int(ring_depth) not in RING_DEPTH_CHOICES:
         raise ValueError(f"ring_depth must be one of {RING_DEPTH_CHOICES}, got {ring_depth}")
+    if l2_hint is not None and not isinstance(l2_hint, bool):
+        raise ValueError(f"l2_hint must be None (the DSL's compiler decides), True or False, got {l2_hint!r}")
 
 
 def _check_i32_1d(t, name: str, n: int, device) -> None:

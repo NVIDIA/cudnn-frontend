@@ -1413,8 +1413,9 @@ def compile_qsa_topk_decode(
     """Build the artifact from the geometry ALONE -- no device allocation, no launch.
 
     Order of the gates (Rule 7 first): the CuTe DSL floor, the geometry, the DSL's target for the current device, the device's
-    PDL support (cc 9.0+), the dynamic shared memory against the device's opt-in limit.  ``NotImplementedError`` names the
-    version, the target or the limit; ``ValueError`` names the malformed geometry.
+    cluster / DSMEM and PDL support (cc 9.0+), the cluster form's own DSL floor (``CLUSTER_FORM_MIN_DSL``: a device gate before a
+    form's DSL gate, so a part below cc 9.0 is named whatever wheel it runs), the dynamic shared memory against the device's
+    opt-in limit.  ``NotImplementedError`` names the version, the target or the limit; ``ValueError`` names the malformed geometry.
     """
     global _FAKE_STREAM
     too_old = cutedsl_requirement_error("qsa_topk_decode")
@@ -1422,9 +1423,6 @@ def compile_qsa_topk_decode(
         raise NotImplementedError(too_old)
     cols_cap, top_k, cluster_ctas, threads_per_cta = int(cols_cap), int(top_k), int(cluster_ctas), int(threads_per_cta)
     validate_topk_geometry(cols_cap, top_k, cluster_ctas, threads_per_cta)
-    cluster_problem = cluster_form_requirement_error(cluster_ctas)
-    if cluster_problem is not None:
-        raise NotImplementedError(cluster_problem)
     device = current_device()
     cc = compute_capability(device)
     arch_problem = cutedsl_arch_requirement_error(cc)
@@ -1436,6 +1434,9 @@ def compile_qsa_topk_decode(
         )
     if use_pdl and cc < (9, 0):
         raise NotImplementedError(f"qsa_topk_decode with use_pdl=True needs griddepcontrol (cc 9.0+); found cc {cc[0]}.{cc[1]}")
+    cluster_problem = cluster_form_requirement_error(cluster_ctas)  # after the device gates: an older part is named whatever wheel it runs
+    if cluster_problem is not None:
+        raise NotImplementedError(cluster_problem)
     smem_bytes = smem_bytes_for(cols_cap, cluster_ctas, threads_per_cta, top_k)
     limit = shared_memory_per_block_optin(device)
     if smem_bytes > limit:
