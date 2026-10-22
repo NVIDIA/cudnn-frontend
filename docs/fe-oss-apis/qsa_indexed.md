@@ -62,6 +62,57 @@ with 16 GiB for bitmap-forward IDs or 8 GiB for paired bitmap-backward IDs. The
 4 GiB bitmap is also unnecessary. These are metadata sizes, not total process
 memory; saved state, outputs and FP32 gradient accumulators are additional.
 
+## Complete blocks and causal tails
+
+For RedNote's top-512-block selection, backward can use the bounded-workspace
+two-pass implementation through the same public entry point:
+
+```python
+# cu_seqlens is a CUDA int32 tensor, for example [0, 43691, 87382, 131072].
+out, out_fp32, lse = qsa_indexed_forward(q, k, v, indices)
+dq, dk, dv = qsa_indexed_backward(
+    grad_out, q, k, v, out_fp32, lse, indices,
+    selection_mode="causal_topk", cu_seqlens=cu_seqlens,
+    max_seq_len=43691,
+)
+```
+
+`selection_mode="general"` remains the default. The new mode declares the
+following stricter input contract; it is never inferred from tensor shapes:
+
+- Q/K/V, grad_out and saved FP32 output are finite. LSE is finite and comes
+  from forward with the same indices and scale. The general path's nonfinite
+  fallback does not apply to this mode.
+- `W=2052` and `scale=1/16`. For query position `p` within its document, select
+  exactly `min((p + 1) // 4, 512)` distinct, complete four-token blocks from
+  that document's causal prefix, followed by its incomplete causal tail.
+  Complete blocks fill consecutive groups starting at column zero, in any
+  order. No padding holes or empty selections are allowed. Before 512 blocks
+  are available, pad the unused groups with `-1`; the tail may follow the
+  complete blocks or occupy the last four slots, as in Relax. After 512 blocks
+  are available, the tail occupies the last four slots. Invalid tail slots
+  and all unused slots are `-1`.
+- Packed inputs require `cu_seqlens`: contiguous device int32 prefix sums
+  `[B + 1]`, starting at zero, ending at `T`, and nondecreasing. Empty documents
+  and document starts not divisible by four are supported. Indices use
+  absolute packed token IDs; block origins restart at each document boundary.
+  Without `cu_seqlens`, all `T` tokens are one document.
+- Optional `max_seq_len` is a host integer in `[1, T]` bounding every document
+  length. It defaults to `T`. Every replay must respect this bound. The kernel
+  rereads device `cu_seqlens` on replay; boundaries are not cached.
+
+These device-value promises are caller contracts, not host-side checks.
+Use `general` for arbitrary selections. Passing `cu_seqlens` or `max_seq_len`
+with `general` is rejected because that mode obtains its bounds from indices.
+The new keyword-only arguments preserve existing positional calls.
+
+Sparse 12Q/1KV two-pass execution requires the **CUDA 13 CuTeDSL compiler** in
+addition to CuTeDSL >= 4.7 and SM100/SM103. A CUDA 13 PyTorch build alone does
+not establish the DSL compiler version; unsupported compiler builds are
+rejected before kernel compilation. See [two-pass details](qsa_two_pass.md)
+for the bounded records and workspace sizing. At 128K, 12Q/1KV uses about
+2.487 GiB of workspace, including 0.376 GiB of reusable sparse records.
+
 The indexed entry is useful when a producer already has token IDs. It can be
 slightly slower than the bitmap entry at some lengths. Use the unchanged Relax
 comparison in `benchmark/qsa/benchmark_relax.py` for the intended workload;

@@ -90,16 +90,30 @@ external files unchanged, records input/source hashes, creates BF16 4Q/D128
 indexer scores, selects 512 complete causal blocks, and appends the incomplete
 tail. It does not substitute the Miles implementation for the Relax baseline.
 
+For the public bounded-workspace backward, add `--causal-topk`. This declares
+the stricter [canonical selection contract](../../docs/fe-oss-apis/qsa_indexed.md#complete-blocks-and-causal-tails)
+and passes packed `cu_seqlens` and the maximum document length to the public
+entry point. Sparse 12Q/1KV requires the CUDA 13 CuTeDSL compiler. Add
+`--compare-general` to measure the default indexed backward on the same saved
+state. For example, use `--indexed --causal-topk --compare-general --lengths
+43691,43691,43690` for an unaligned packed 128K comparison.
+
 All six outputs must pass cross-comparison and an independent chunked FP32
 oracle before any timings are emitted. Relax backward consumes the saved state from its own `grouped._Grouped.forward`
 call; native backward consumes `out_fp32` and `lse` from its own QSA forward call
-(`qsa_indexed_forward` with `--indexed`). Both timing orders are retained, and native outputs are checked
-again after timing. Reported times cover warm full attention calls, including
+(`qsa_indexed_forward` with `--indexed`). Both timing orders are retained, and both implementations are checked
+again after timing. Forward, backward, and combined forward-plus-backward are
+timed directly; combined times are not sums of separately measured stages.
+Reported times cover warm full attention calls, including
 allocations, metadata, backward preparation and final casts. They exclude
 compilation, selector/top-k, token expansion and framework/TP overhead. Peak
-extra allocated bytes are measured over the same live fixture state; bitmap
-and token-index fixtures remain live in this comparison. Metadata sizes are
-also reported explicitly. These figures are synthetic component measurements.
+extra allocated bytes are measured over the same live fixture state. Indexed
+runs use a direct token-gather FP32 oracle and do not allocate a quadratic
+bitmap. Metadata sizes are reported separately where applicable; peak extra
+allocation includes outputs and workspace, not just sparse records. The JSON
+also records hostname, scheduler allocation, GPU memory/SM count, and a full
+`nvidia-smi -q` snapshot so production GPU provenance and operating limits can
+be checked. These figures are synthetic attention measurements.
 
 For selector and route-expansion attribution, run Relax's own unchanged
 `examples/models/qwen3.8-flash-next/benchmark_qsa.py` with both `--selector eager`

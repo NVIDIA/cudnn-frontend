@@ -4,10 +4,13 @@
 
 import argparse
 import importlib.util
+from itertools import accumulate
 import json
 import os
 from pathlib import Path
 import statistics
+import socket
+import subprocess
 import sys
 import time
 
@@ -30,12 +33,18 @@ def main():
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--output", required=True)
     parser.add_argument("--indexed", action="store_true")
+    parser.add_argument("--causal-topk", action="store_true", help="Use the public indexed backward's complete-block and causal-tail mode")
+    parser.add_argument("--compare-general", action="store_true", help="Also measure the default indexed backward on identical saved state")
     args = parser.parse_args()
     lengths = tuple(map(int, args.lengths.split(",")))
     if not lengths or min(lengths) < 1 or sum(lengths) > 131072 or args.repeats < 3 or args.warmup < 2:
         parser.error("Require positive packed lengths totaling at most 131072 and at least three samples and two warmups")
     if args.indexed and args.heads != 12:
         parser.error("The indexed path supports 12Q/1KV")
+    if args.causal_topk and not args.indexed:
+        parser.error("--causal-topk requires --indexed")
+    if args.compare_general and not args.causal_topk:
+        parser.error("--compare-general requires --causal-topk")
     import torch
     import cudnn
     import importlib.metadata
@@ -47,6 +56,7 @@ def main():
     reference = load(Path(__file__).with_name("reference.py"), "qsa_independent_reference")
     from benchmark_qsa import tensor_hash, file_hash, save
     from cudnn.ops import qsa_forward, qsa_backward, qsa_indexed_forward, qsa_indexed_backward
+    from cudnn.QSA.two_pass.api import _dsl_cuda_version
 
     os.environ["RELAX_QWEN38_QSA_GROUPED_BACKWARD_BLOCK_K"] = "32"
     os.environ["RELAX_QWEN38_QSA_GROUPED_BACKWARD_STAGES"] = "3"
@@ -69,6 +79,10 @@ def main():
         origins.extend([start] * length)
         bases.extend([base] * length)
         keys = torch.randn((length // 4, 128), device="cuda", dtype=torch.bfloat16)
+        if length < 4:
+            start += length
+            base += len(starts)
+            continue
         for a in range(start, start + length, 512):
             b = min(a + 512, start + length)
             positions = torch.arange(a - start, b - start, device="cuda")
@@ -78,7 +92,7 @@ def main():
             selected[a:b, : ids.shape[1]] = ids.masked_fill(values == -torch.inf, -1).int()
         start += length
         base += len(starts)
-    del iq, keys, logits, visible, values, ids
+    del iq, keys
     origins, bases, first, last = [torch.tensor(x, dtype=torch.int32, device="cuda") for x in (origins, bases, first, last)]
     positions = torch.arange(total, device="cuda", dtype=torch.int32) - origins
     offsets = torch.arange(4, device="cuda", dtype=torch.int32)
@@ -88,15 +102,18 @@ def main():
     tail = tail.masked_fill(tail > (origins + positions)[:, None], -1)
     indices = torch.cat((complete, tail), dim=1).contiguous()
     del complete, tail
-    # The extra sentinel column prevents invalid -1 slots from overwriting block zero.
-    sel = torch.zeros((total, base + 1), dtype=torch.uint8, device="cuda")
-    global_blocks = torch.where(selected >= 0, selected + bases[:, None], base).long()
-    sel.scatter_(1, global_blocks, 1)
-    partial = (positions + 1) % 4 != 0
-    rows = torch.arange(total, device="cuda")[partial]
-    sel[rows, (bases[partial] + positions[partial] // 4).long()] = 1
-    sel = sel[:, :base].contiguous()
-    del global_blocks
+    sel = None
+    if not args.indexed:
+        # The extra sentinel column prevents invalid -1 slots from overwriting block zero.
+        sel = torch.zeros((total, base + 1), dtype=torch.uint8, device="cuda")
+        global_blocks = torch.where(selected >= 0, selected + bases[:, None], base).long()
+        sel.scatter_(1, global_blocks, 1)
+        partial = (positions + 1) % 4 != 0
+        rows = torch.arange(total, device="cuda")[partial]
+        sel[rows, (bases[partial] + positions[partial] // 4).long()] = 1
+        sel = sel[:, :base].contiguous()
+        del global_blocks
+    cu_seqlens = torch.tensor([0, *accumulate(lengths)], dtype=torch.int32, device="cuda")
     inputs = dict(
         q=q,
         k=k,
@@ -111,6 +128,7 @@ def main():
         scale=1 / 16,
         block_size=4,
     )
+    reference_inputs = dict(inputs, selection_indices=indices) if args.indexed else inputs
 
     class Context:
         needs_input_grad = (True, True, True, False, False, False, False, False)
@@ -129,7 +147,8 @@ def main():
             return qsa_indexed_forward(q, k, v, indices, 1 / 16)
 
         def qsa_backward(**kwargs):
-            return qsa_indexed_backward(kwargs["grad_out"], q, k, v, kwargs["out_fp32"], kwargs["lse"], indices, 1 / 16)
+            options = dict(selection_mode="causal_topk", cu_seqlens=cu_seqlens, max_seq_len=max(lengths)) if args.causal_topk else {}
+            return qsa_indexed_backward(kwargs["grad_out"], q, k, v, kwargs["out_fp32"], kwargs["lse"], indices, 1 / 16, **options)
 
     def native_forward():
         return qsa_forward(**inputs)
@@ -143,26 +162,40 @@ def main():
         lengths=lengths,
         heads=[hq, hkv],
         gpu=torch.cuda.get_device_properties(0).name,
+        total_memory_bytes=torch.cuda.get_device_properties(0).total_memory,
         sms=torch.cuda.get_device_properties(0).multi_processor_count,
         cc=torch.cuda.get_device_capability(),
+        hostname=socket.gethostname(),
+        allocation={key: os.environ.get(key) for key in ("SLURM_JOB_ID", "SLURM_JOB_NODELIST", "SLURM_JOB_GPUS", "CUDA_VISIBLE_DEVICES")},
+        nvidia_smi=subprocess.run(["nvidia-smi", "-q"], capture_output=True, text=True, check=True).stdout,
         torch=torch.__version__,
+        torch_cuda=torch.version.cuda,
+        cudnn_backend=cudnn.backend_version(),
+        triton=importlib.metadata.version("triton"),
         dsl=importlib.metadata.version("nvidia-cutlass-dsl"),
+        dsl_compiler=_dsl_cuda_version(),
         source=cudnn.__file__,
         boundary="Warm full attention calls including allocation, metadata, gradient preparation and casts; selector, route expansion, compilation and TP communication excluded",
         reference_sha256={name: file_hash(args.relax_source / name) for name in ("grouped.py", "selector.py")},
+        harness_sha256={name: file_hash(Path(__file__).with_name(name)) for name in ("benchmark_relax.py", "reference.py")},
         frontend_sha256={
             str(path.relative_to(Path(cudnn.__file__).parent)): file_hash(path)
             for folder in ("QSA",)
             for path in sorted((Path(cudnn.__file__).parent / folder).rglob("*.py"))
         },
-        input_sha256={name: tensor_hash(value) for name, value in dict(q=q, k=k, v=v, grad_out=grad, indices=indices).items()},
+        input_sha256={name: tensor_hash(value) for name, value in dict(q=q, k=k, v=v, grad_out=grad, indices=indices, cu_seqlens=cu_seqlens).items()},
         indexed=args.indexed,
+        selection_mode="causal_topk" if args.causal_topk else "general",
         warmup=args.warmup,
         repeats=args.repeats,
         indices_shape=list(indices.shape),
-        bitmap_bytes=sel.numel(),
+        bitmap_bytes=0 if sel is None else sel.numel(),
         compact_forward_bytes=total * 513 * 4 if args.indexed else sel.numel() * 4,
-        compact_backward_bytes=((total + 1) // 2) * 1026 * 4 if args.indexed else ((total + 1) // 2) * sel.shape[1] * 4 if hkv == 1 else sel.numel() * 4,
+        compact_backward_bytes=(
+            None
+            if args.causal_topk
+            else ((total + 1) // 2) * 1026 * 4 if args.indexed else ((total + 1) // 2) * sel.shape[1] * 4 if hkv == 1 else sel.numel() * 4
+        ),
         checks={},
         timings={},
     )
@@ -170,11 +203,17 @@ def main():
     actual_native = dict(zip(names, (*native, *native_grads)))
     actual_relax = dict(zip(names, (out_relax, ctx.saved_tensors[-2], ctx.saved_tensors[-1].T.contiguous(), *relax_grads)))
     report["checks"]["native_vs_relax"] = reference.compare(actual_relax, actual_native)
-    expected_fwd = reference.forward_reference(**inputs)
+    expected_fwd = reference.forward_reference(**reference_inputs)
     for arm, actual in (("native", actual_native), ("relax", actual_relax)):
         # Test the exact saved state consumed by each backward separately.
-        expected_bwd = reference.backward_reference(**dict(inputs, grad_out=grad, out_fp32=actual["out_fp32"], lse=actual["lse"]))
+        expected_bwd = reference.backward_reference(**dict(reference_inputs, grad_out=grad, out_fp32=actual["out_fp32"], lse=actual["lse"]))
         report["checks"][arm + "_vs_fp32"] = reference.compare(dict(zip(names, (*expected_fwd, *expected_bwd))), actual)
+
+    def general_backward():
+        return qsa_indexed_backward(grad, q, k, v, native["out_fp32"], native["lse"], indices)
+
+    if args.compare_general:
+        report["checks"]["general_vs_native"] = reference.compare(dict(zip(names[3:], native_grads)), dict(zip(names[3:], general_backward())))
     report["passed"] = all(r["passed"] for group in report["checks"].values() for r in group.values())
     save(args.output, report)
     print("All pre-timing output checks:", report["passed"], flush=True)
@@ -207,13 +246,27 @@ def main():
             peak_extra_allocated_bytes=torch.cuda.max_memory_allocated() - before_allocated,
         )
 
-    # Reverse order across rounds exposes drift without composing separate stages.
+    def native_forward_backward():
+        saved = native_forward()
+        grads = qsa_backward(**dict(inputs, grad_out=grad, out_fp32=saved["out_fp32"], lse=saved["lse"]))
+        return (*saved, *grads)
+
+    def relax_forward_backward():
+        output, context = relax_forward()
+        grads = grouped._Grouped.backward(context, grad)[:3]
+        return output, context, grads
+
+    # Time combined calls directly; do not add independently measured components.
     functions = dict(
         relax_fwd=relax_forward,
         native_fwd=native_forward,
         relax_bwd=lambda: grouped._Grouped.backward(ctx, grad)[:3],
         native_bwd=lambda: qsa_backward(**back_inputs),
+        relax_fwd_bwd=relax_forward_backward,
+        native_fwd_bwd=native_forward_backward,
     )
+    if args.compare_general:
+        functions["general_bwd"] = general_backward
     for round_id, order in enumerate((list(functions), list(reversed(functions)))):
         for name in order:
             row = measure(functions[name])
@@ -221,7 +274,13 @@ def main():
             save(args.output, report)
             print(name, round_id, json.dumps(row), flush=True)
     # Recheck after timed kernels have reused all scratch and accumulation paths.
-    report["checks"]["native_after_timing"] = reference.compare(actual_native, dict(zip(names, (*native_forward(), *qsa_backward(**back_inputs)))))
+    report["checks"]["native_after_timing"] = reference.compare(actual_native, dict(zip(names, native_forward_backward())))
+    post_out, post_ctx, post_grads = relax_forward_backward()
+    report["checks"]["relax_after_timing"] = reference.compare(
+        actual_relax, dict(zip(names, (post_out, post_ctx.saved_tensors[-2], post_ctx.saved_tensors[-1].T.contiguous(), *post_grads)))
+    )
+    if args.compare_general:
+        report["checks"]["general_after_timing"] = reference.compare(dict(zip(names[3:], native_grads)), dict(zip(names[3:], general_backward())))
     report["passed"] = all(r["passed"] for group in report["checks"].values() for r in group.values())
     save(args.output, report)
     if not report["passed"]:
