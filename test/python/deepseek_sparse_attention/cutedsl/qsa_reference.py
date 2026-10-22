@@ -14,28 +14,39 @@ SCALE = D**-0.5
 CHUNK = 512  # query rows per gather, which bounds the fp32 K / V gathers to a few GB
 
 
-def make_topk_idxs(seq_len, generator):
-    """Index rows in the QSA indexer layout, selecting uniformly random complete blocks."""
+def make_topk_idxs(seq_len, generator, cu_seqlens=None, width=W):
+    """Index rows in the QSA indexer layout, selecting uniformly random complete blocks.
+
+    Rows are packed-buffer token ids. With ``cu_seqlens`` (a Python list of sequence bounds) the blocks of every
+    sequence start at its first token and the rows of its tokens select among them only.
+    """
     device = generator.device
-    pos = torch.arange(seq_len, device=device)
-    ncb = (pos + 1) // BLOCK
-    nsel = ncb.clamp(max=TOPK_BLOCKS)
-    idx = torch.full((seq_len, W + 1), -1, dtype=torch.int64, device=device)
-    for r0 in range(0, seq_len, 4096):  # rows per batch, which bounds the random-score tensor
-        r1 = min(r0 + 4096, seq_len)
-        nb = int(ncb[r1 - 1])
-        if nb == 0:
+    bounds = [0, seq_len] if cu_seqlens is None else list(cu_seqlens)
+    idx = torch.full((seq_len, width + 1), -1, dtype=torch.int64, device=device)
+    for s, e in zip(bounds[:-1], bounds[1:]):
+        L = e - s
+        if L == 0:
             continue
-        scores = torch.rand((r1 - r0, nb), device=device, generator=generator)
-        scores.masked_fill_(torch.arange(nb, device=device)[None, :] >= ncb[r0:r1, None], -1.0)
-        top = scores.topk(min(TOPK_BLOCKS, nb), dim=1).indices
-        top = top.masked_fill(torch.arange(top.shape[1], device=device)[None, :] >= nsel[r0:r1, None], -1)
-        tok = torch.where(top[:, :, None] >= 0, top[:, :, None] * BLOCK + torch.arange(BLOCK, device=device), -1)
-        idx[r0:r1, : tok.shape[1] * BLOCK] = tok.flatten(1)
-    j = torch.arange(BLOCK - 1, device=device)
-    in_tail = j[None, :] < ((pos + 1) % BLOCK)[:, None]
-    idx.scatter_(1, torch.where(in_tail, nsel[:, None] * BLOCK + j, W), torch.where(in_tail, ncb[:, None] * BLOCK + j, -1))
-    return idx[:, :W].to(torch.int32).contiguous()
+        pos = torch.arange(L, device=device)
+        ncb = (pos + 1) // BLOCK
+        nsel = ncb.clamp(max=TOPK_BLOCKS)
+        rows = torch.full((L, width + 1), -1, dtype=torch.int64, device=device)
+        for r0 in range(0, L, 4096):  # rows per batch, which bounds the random-score tensor
+            r1 = min(r0 + 4096, L)
+            nb = int(ncb[r1 - 1])
+            if nb == 0:
+                continue
+            scores = torch.rand((r1 - r0, nb), device=device, generator=generator)
+            scores.masked_fill_(torch.arange(nb, device=device)[None, :] >= ncb[r0:r1, None], -1.0)
+            top = scores.topk(min(TOPK_BLOCKS, nb), dim=1).indices
+            top = top.masked_fill(torch.arange(top.shape[1], device=device)[None, :] >= nsel[r0:r1, None], -1)
+            tok = torch.where(top[:, :, None] >= 0, s + top[:, :, None] * BLOCK + torch.arange(BLOCK, device=device), -1)
+            rows[r0:r1, : tok.shape[1] * BLOCK] = tok.flatten(1)
+        j = torch.arange(BLOCK - 1, device=device)
+        in_tail = j[None, :] < ((pos + 1) % BLOCK)[:, None]
+        rows.scatter_(1, torch.where(in_tail, nsel[:, None] * BLOCK + j, width), torch.where(in_tail, s + ncb[:, None] * BLOCK + j, -1))
+        idx[s:e] = rows
+    return idx[:, :width].to(torch.int32).contiguous()
 
 
 def reference_forward(q, k, v, topk_idxs):
@@ -90,8 +101,12 @@ def reference_backward(q, k, v, out, dout, lse, topk_idxs):
     return dq, dk, dv
 
 
-def make_inputs(seq_len, seed, grad_scale=1.0, device="cuda", h_kv=2):
-    """Random QSA backward operands. ``grad_scale`` shrinks dO to training-like gradient magnitudes."""
+def make_inputs(seq_len, seed, grad_scale=1.0, device="cuda", h_kv=2, cu_seqlens=None, width=W):
+    """Random QSA backward operands. ``grad_scale`` shrinks dO to training-like gradient magnitudes.
+
+    ``cu_seqlens`` (a Python list) packs several sequences into the T rows; the returned dict then carries it as an
+    int32 device tensor.
+    """
     generator = torch.Generator(device=device).manual_seed(seed)
     h_q = GROUP * h_kv
 
@@ -100,9 +115,12 @@ def make_inputs(seq_len, seed, grad_scale=1.0, device="cuda", h_kv=2):
 
     q, k, v = randn(seq_len, h_q, D), randn(seq_len, h_kv, D), randn(seq_len, h_kv, D)
     dout = (torch.randn((seq_len, h_q, D), device=device, generator=generator) * grad_scale).to(torch.bfloat16)
-    topk_idxs = make_topk_idxs(seq_len, generator)
+    topk_idxs = make_topk_idxs(seq_len, generator, cu_seqlens, width)
     out, lse = reference_forward(q, k, v, topk_idxs)
-    return {"q": q, "k": k, "v": v, "out": out, "dout": dout, "lse": lse, "topk_idxs": topk_idxs}
+    inputs = {"q": q, "k": k, "v": v, "out": out, "dout": dout, "lse": lse, "topk_idxs": topk_idxs}
+    if cu_seqlens is not None:
+        inputs["cu_seqlens"] = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
+    return inputs
 
 
 def assert_grads_close(name, actual, expected, rel_l2_tol=1e-2, row_rel_tol=5e-2, row_floor=0.1):

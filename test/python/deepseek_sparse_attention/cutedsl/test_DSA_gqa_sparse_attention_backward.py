@@ -64,6 +64,37 @@ def test_qsa_backward_matches_reference(seq_len, grad_scale, h_kv):
     _check_against_reference(inputs, (grads["dq"], grads["dk"], grads["dv"]))
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize("h_kv", [2, 1])
+@pytest.mark.parametrize(
+    "cu_seqlens",
+    [
+        [0, 3, 2054, 24583],  # a 3-token sequence, a whole-prefix one starting at 3 and one past the crossover starting at 2054 (both off the 4-token grid)
+        [0, 4100, 28105, 28107],  # dense, sparse with a 3525-query remainder, then 2 tokens starting at 28105
+        [0, 500, 500, 3000],  # an empty sequence between two dense ones
+        [0, 1000, 3051, 5102],  # every sequence within 2051 tokens, so the bitmap is filled without the bitmap kernel
+        [0, 24000],  # one sequence through the packed path
+    ],
+)
+def test_qsa_backward_packed_sequences(cu_seqlens, h_kv):
+    from cudnn import DSA
+
+    inputs = make_inputs(cu_seqlens[-1], seed=cu_seqlens[-1], h_kv=h_kv, cu_seqlens=cu_seqlens)
+    max_seq_len = max(e - s for s, e in zip(cu_seqlens[:-1], cu_seqlens[1:]))
+    grads = DSA.gqa_sparse_attention_backward_wrapper(*(inputs[name] for name in _INPUT_NAMES), cu_seqlens=inputs["cu_seqlens"], max_seq_len=max_seq_len)
+    _check_against_reference(inputs, (grads["dq"], grads["dk"], grads["dv"]))
+
+
+@pytest.mark.L0
+def test_qsa_backward_accepts_the_padded_index_width():
+    from cudnn import DSA
+
+    # 2052 columns: the fourth tail slot is never read, only the row stride changes
+    inputs = make_inputs(24000, seed=11, h_kv=1, width=2052)
+    grads = DSA.gqa_sparse_attention_backward_wrapper(*(inputs[name] for name in _INPUT_NAMES))
+    _check_against_reference(inputs, (grads["dq"], grads["dk"], grads["dv"]))
+
+
 @pytest.mark.L1
 @pytest.mark.gpu_exclusive
 @pytest.mark.xdist_group(name="gpu_exclusive")
@@ -218,6 +249,38 @@ def test_check_support_accepts_both_head_counts():
     for h_kv in (1, 2):
         descs = _sample_descs(h_kv=h_kv)
         assert DSA.GqaSparseAttentionBackward(*(descs[n] for n in _INPUT_NAMES)).check_support()
+
+
+@pytest.mark.L0
+def test_check_support_declines_malformed_sequence_bounds():
+    from cudnn import DSA
+
+    descs = _sample_descs()
+    args = [descs[n] for n in _INPUT_NAMES]
+    cu = _metadata(torch.tensor([0, 30, 64], dtype=torch.int32, device="cuda"))
+    assert DSA.GqaSparseAttentionBackward(*args, sample_cu_seqlens=cu, max_seq_len=34).check_support()
+    with pytest.raises(ValueError, match="cu_seqlens"):
+        DSA.GqaSparseAttentionBackward(*args, sample_cu_seqlens=_metadata(torch.tensor([0, 30, 64], dtype=torch.int64, device="cuda"))).check_support()
+    with pytest.raises(ValueError, match="cu_seqlens"):
+        DSA.GqaSparseAttentionBackward(*args, sample_cu_seqlens=_metadata(torch.tensor([64], dtype=torch.int32, device="cuda"))).check_support()
+    with pytest.raises(ValueError, match="max_seq_len"):
+        DSA.GqaSparseAttentionBackward(*args, sample_cu_seqlens=cu, max_seq_len=65).check_support()
+
+
+@pytest.mark.L0
+def test_execute_requires_the_sampled_sequence_bounds():
+    from cudnn import DSA
+
+    inputs = make_inputs(64, seed=9, cu_seqlens=[0, 30, 64])
+    args = [inputs[name] for name in _INPUT_NAMES]
+    plan = DSA.GqaSparseAttentionBackward(*args, sample_cu_seqlens=inputs["cu_seqlens"])
+    plan.compile()
+    outputs = [torch.empty_like(inputs[name]) for name in ("q", "k", "v")]
+    workspace = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match="cu_seqlens"):
+        plan.execute(*args, *outputs, workspace=workspace)
+    plan.execute(*args, *outputs, workspace=workspace, cu_seqlens=inputs["cu_seqlens"])
+    _check_against_reference(inputs, outputs)
 
 
 @pytest.mark.L0

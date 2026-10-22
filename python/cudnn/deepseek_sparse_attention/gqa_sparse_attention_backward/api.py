@@ -17,7 +17,7 @@ from cudnn.frost.buffers import cutedsl_requirement_error
 GROUP_SIZE = 12  # query heads per KV head
 NUM_KV_HEADS = (1, 2)  # 24 / 2 is the full model, 12 / 1 is one tensor-parallel rank of two
 HEAD_DIM = 256
-TOPK_WIDTH = 2051  # 512 blocks x 4 tokens + 3 tail tokens
+TOPK_WIDTHS = (2051, 2052)  # 512 blocks x 4 tokens + 3 tail tokens, or with a fourth, always empty tail slot
 SOFTMAX_SCALE = HEAD_DIM**-0.5
 _SUPPORTED_CAPABILITIES = ((10, 0), (10, 3))
 
@@ -35,10 +35,13 @@ class GqaSparseAttentionBackward(APIBase):
     """QSA backward: dQ, dK and dV from Q, K, V, O, dO, the forward LSE and the selected token indices.
 
     The geometry is 12 query heads per KV head with 2 KV heads (the model) or 1 (one of two tensor-parallel ranks),
-    read from the sample shapes. ``topk_idxs`` row ``i`` lists the first token of each of its ``min((i + 1) // 4, 512)``
-    complete 4-token blocks (the four ids of a block are consecutive), then the ``(i + 1) % 4`` tail tokens, then
-    ``-1``. Up to ``T = 2051`` every row is therefore its whole causal prefix. The kernels read the block ids only and
-    derive the tail block from the position. Rows that break this layout are not checked.
+    read from the sample shapes. The T rows are one sequence, or with ``cu_seqlens`` (int32 ``[B + 1]`` prefix sums)
+    B packed sequences of at most ``max_seq_len`` tokens that attend within themselves. ``topk_idxs`` row ``i`` lists
+    the first token (its row in the packed buffer) of each of its ``min((p + 1) // 4, 512)`` complete 4-token blocks,
+    p the row's position in its sequence (the four ids of a block are consecutive and the blocks start at the
+    sequence's first token), then the ``(p + 1) % 4`` tail tokens, then ``-1``. Up to 2051 tokens every row is
+    therefore its whole causal prefix. The kernels read the block ids only and derive the tail block from the
+    position. Rows that break this layout are not checked.
     """
 
     def __init__(
@@ -49,11 +52,13 @@ class GqaSparseAttentionBackward(APIBase):
         sample_out: torch.Tensor,  # (T, 12 * H_kv, 256) bf16
         sample_dout: torch.Tensor,  # (T, 12 * H_kv, 256) bf16
         sample_lse: torch.Tensor,  # (T, 12 * H_kv) fp32, natural-log LSE of the scaled scores
-        sample_topk_idxs: torch.Tensor,  # (T, 2051) int32
+        sample_topk_idxs: torch.Tensor,  # (T, 2051) or (T, 2052) int32
         sample_dq: Optional[torch.Tensor] = None,
         sample_dk: Optional[torch.Tensor] = None,
         sample_dv: Optional[torch.Tensor] = None,
         softmax_scale: Optional[float] = None,
+        sample_cu_seqlens: Optional[torch.Tensor] = None,  # (B + 1,) int32 sequence bounds of the packed rows
+        max_seq_len: Optional[int] = None,  # longest packed sequence, T when omitted
     ):
         """Capture the sample tensor contract. Missing output samples default to the input layouts."""
         super().__init__()
@@ -70,7 +75,10 @@ class GqaSparseAttentionBackward(APIBase):
             "dk": self._make_tensor_desc(sample_k if sample_dk is None else sample_dk, name="sample_dk"),
             "dv": self._make_tensor_desc(sample_v if sample_dv is None else sample_dv, name="sample_dv"),
         }
+        if sample_cu_seqlens is not None:
+            self.descs["cu_seqlens"] = self._make_tensor_desc(sample_cu_seqlens, name="sample_cu_seqlens")
         self.softmax_scale = softmax_scale
+        self.max_seq_len = max_seq_len
         self._kernel_module = None
         self._plan = None
 
@@ -99,6 +107,8 @@ class GqaSparseAttentionBackward(APIBase):
             f"{self.__class__.__name__} supports {NUM_KV_HEADS} KV heads with {GROUP_SIZE} query heads each, got k shape {k_desc.shape}",
         )
         num_q_heads = GROUP_SIZE * num_kv_heads
+        idx_desc = self.descs["topk_idxs"]
+        topk_width = idx_desc.shape[1] if idx_desc.ndim == 2 and idx_desc.shape[1] in TOPK_WIDTHS else TOPK_WIDTHS[0]
         expected = {
             "q": ((seq_len, num_q_heads, HEAD_DIM), torch.bfloat16),
             "k": ((seq_len, num_kv_heads, HEAD_DIM), torch.bfloat16),
@@ -106,11 +116,17 @@ class GqaSparseAttentionBackward(APIBase):
             "out": ((seq_len, num_q_heads, HEAD_DIM), torch.bfloat16),
             "dout": ((seq_len, num_q_heads, HEAD_DIM), torch.bfloat16),
             "lse": ((seq_len, num_q_heads), torch.float32),
-            "topk_idxs": ((seq_len, TOPK_WIDTH), torch.int32),
+            "topk_idxs": ((seq_len, topk_width), torch.int32),
             "dq": ((seq_len, num_q_heads, HEAD_DIM), torch.bfloat16),
             "dk": ((seq_len, num_kv_heads, HEAD_DIM), torch.bfloat16),
             "dv": ((seq_len, num_kv_heads, HEAD_DIM), torch.bfloat16),
         }
+        num_seqs = 0
+        if "cu_seqlens" in self.descs:
+            cu_desc = self.descs["cu_seqlens"]
+            self._value_error_if(cu_desc.ndim != 1 or cu_desc.shape[0] < 2, f"cu_seqlens must be 1-D with at least 2 entries, got {cu_desc.shape}")
+            num_seqs = cu_desc.shape[0] - 1
+            expected["cu_seqlens"] = ((num_seqs + 1,), torch.int32)
         for name, (shape, dtype) in expected.items():
             desc = self.descs[name]
             self._value_error_if(desc.shape != shape, f"{name} must have shape {shape}, got {desc.shape}")
@@ -121,16 +137,18 @@ class GqaSparseAttentionBackward(APIBase):
                 not desc.is_contiguous(),
                 f"{self.__class__.__name__} addresses only contiguous {name}, got shape {desc.shape} strides {desc.stride}",
             )
+        max_seq_len = seq_len if self.max_seq_len is None else int(self.max_seq_len)
+        self._value_error_if(not 1 <= max_seq_len <= seq_len, f"max_seq_len must be in [1, {seq_len}], got {max_seq_len}")
 
         from . import qsa_bwd_sm100 as kernel
 
-        max_seq_len = kernel.max_seq_len(num_kv_heads)
+        max_len = kernel.max_packed_len(num_kv_heads)
         self._value_error_if(
-            not 1 <= seq_len <= max_seq_len,
-            f"sequence length must be in [1, {max_seq_len}], got {seq_len}",
+            not 1 <= seq_len <= max_len,
+            f"sequence length must be in [1, {max_len}], got {seq_len}",
         )
         self._kernel_module = kernel
-        self._plan = kernel.LaunchPlan(seq_len, torch.cuda.get_device_properties(q_desc.device).multi_processor_count, num_kv_heads)
+        self._plan = kernel.LaunchPlan(seq_len, torch.cuda.get_device_properties(q_desc.device).multi_processor_count, num_kv_heads, num_seqs, max_seq_len)
         self._is_supported = True
         return True
 
@@ -161,10 +179,15 @@ class GqaSparseAttentionBackward(APIBase):
         dv: torch.Tensor,
         workspace: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
     ):
         """Launch the backward on ``current_stream`` and return ``(dq, dk, dv)``."""
         self._runtime_error_if(self._compiled_kernel is None, "plan not compiled; call compile() first")
         tensors = {"q": q, "k": k, "v": v, "out": out, "dout": dout, "lse": lse, "topk_idxs": topk_idxs, "dq": dq, "dk": dk, "dv": dv}
+        if ("cu_seqlens" in self.descs) != (cu_seqlens is not None):
+            raise ValueError("cu_seqlens must be passed exactly when the plan was built with sample_cu_seqlens")
+        if cu_seqlens is not None:
+            tensors["cu_seqlens"] = cu_seqlens
         for name, tensor in tensors.items():
             desc = self.descs[name]
             if not isinstance(tensor, torch.Tensor):
@@ -173,7 +196,7 @@ class GqaSparseAttentionBackward(APIBase):
                 raise ValueError(f"{name} must match the compiled shape {desc.shape} and strides {desc.stride}")
             if tensor.dtype != desc.dtype or tensor.device != desc.device:
                 raise ValueError(f"{name} must match the compiled dtype {desc.dtype} and device {desc.device}")
-            alignment = 4 if name == "topk_idxs" else 16
+            alignment = 4 if name in ("topk_idxs", "cu_seqlens") else 16
             if tensor.data_ptr() % alignment:
                 raise ValueError(f"{name} must be {alignment}-byte aligned")
         spans = {name: _byte_span(tensor) for name, tensor in tensors.items()}
@@ -190,7 +213,7 @@ class GqaSparseAttentionBackward(APIBase):
         scratch = self._plan.carve(WorkspaceCarver(workspace, self.scratch_workspace_bytes(), self.__class__.__name__))
         with device_context(q.device):
             stream = self._get_default_stream(current_stream)
-            self._kernel_module.launch(self._plan, self._compiled_kernel, q, k, v, out, dout, lse, topk_idxs, dq, dk, dv, scratch, stream)
+            self._kernel_module.launch(self._plan, self._compiled_kernel, q, k, v, out, dout, lse, topk_idxs, dq, dk, dv, scratch, stream, cu_seqlens)
         return dq, dk, dv
 
 
@@ -211,14 +234,18 @@ def gqa_sparse_attention_backward_wrapper(
     stream: Optional[cuda.CUstream] = None,
     workspace: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    max_seq_len: Optional[int] = None,
 ) -> TupleDict:
     """High-level wrapper returning ``{'dq', 'dk', 'dv'}``."""
     inputs = (q, k, v, out, dout, lse, topk_idxs)
-    key = (q.device, softmax_scale) + tuple((tuple(t.shape), t.stride(), t.dtype) for t in inputs)
-    key += tuple(None if t is None else (tuple(t.shape), t.stride(), t.dtype) for t in (dq, dk, dv))
+    key = (q.device, softmax_scale, max_seq_len) + tuple((tuple(t.shape), t.stride(), t.dtype) for t in inputs)
+    key += tuple(None if t is None else (tuple(t.shape), t.stride(), t.dtype) for t in (dq, dk, dv, cu_seqlens))
     obj = _cache_of_GqaSparseAttentionBackwardObjects.get(key)
     if obj is None:
-        obj = GqaSparseAttentionBackward(*inputs, sample_dq=dq, sample_dk=dk, sample_dv=dv, softmax_scale=softmax_scale)
+        obj = GqaSparseAttentionBackward(
+            *inputs, sample_dq=dq, sample_dk=dk, sample_dv=dv, softmax_scale=softmax_scale, sample_cu_seqlens=cu_seqlens, max_seq_len=max_seq_len
+        )
         obj.check_support()
         obj.compile()
         _cache_of_GqaSparseAttentionBackwardObjects[key] = obj
@@ -229,5 +256,5 @@ def gqa_sparse_attention_backward_wrapper(
         dv = torch.empty_like(v) if dv is None else dv
         if workspace is None:
             workspace = torch.empty(obj.scratch_workspace_bytes(), dtype=torch.uint8, device=q.device)
-    obj.execute(*inputs, dq, dk, dv, workspace=workspace, current_stream=stream)
+    obj.execute(*inputs, dq, dk, dv, workspace=workspace, current_stream=stream, cu_seqlens=cu_seqlens)
     return TupleDict(dq=dq, dk=dk, dv=dv)
