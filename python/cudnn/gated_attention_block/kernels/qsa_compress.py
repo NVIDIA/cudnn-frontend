@@ -194,10 +194,11 @@ from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_depende
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16, rmsnorm_rstd, rope_rotate_half
 from cudnn.frost.tile_dsl.tma import ld_global, ld_global_v2, ld_global_v4, st_global, st_global_v4
 
+from ..cache_write_contract import DEFAULT_POOL  # tokens per compressed block (the QSA compress ratio): defined DSL-free, re-exported here
 from .qk_norm_rope import ACCESS_BYTES, ELEMS_PER_ACCESS, lanes_per_row, validate_shape, vec_chunks
 
-DEFAULT_POOL = 4
-"""Tokens per compressed block -- the QSA compress ratio (``indexer_compress_ratio``)."""
+# ``DEFAULT_POOL`` -- tokens per compressed block, the QSA compress ratio (``indexer_compress_ratio``) -- is imported above from the DSL-free
+# contract module (the block's declaration reads it through ``QsaPrepareIndexArms``; Rule 7) and keeps its name here for this kernel's callers.
 DEFAULT_THREADS_PER_CTA = 128
 
 _IO_DTYPES = (torch.bfloat16, torch.float16)

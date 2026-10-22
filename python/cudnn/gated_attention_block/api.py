@@ -1011,7 +1011,8 @@ class DecodeEnvelope:
     # at decode (the activation dtype; the e4m3 cache is a typed decline), the scorer's head dim / KV heads / block size, the ``top_k`` range
     # ``(min, max, align)``, the decode scorer's query-row envelope (``S_q x next_pow2(index_heads) <= index_query_rows_max``), the rows the
     # raw-key ring needs beyond the step's (``cap >= S_q + index_state_rows_extra``), the page sizes the paged scorer addresses, and the AUTO
-    # reading of ``fuse_prepare`` on this part (:data:`SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS`).
+    # reading of ``fuse_prepare`` on this part for the in-place pipeline (:data:`SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS`; a block declared
+    # out of place reads False -- the AUTO reading is never True where an explicit True is declined).
     index_sources: Tuple[str, ...] = ()
     index_cache_dtypes: Tuple[torch.dtype, ...] = ()
     index_head_dims: Tuple[int, ...] = ()
@@ -6202,7 +6203,7 @@ class _QsaPrepare(_Stage):
     def _index_arms(self):
         """The indexer arms the launch traces: the block's record (the decode step's three paged arms), else -- on a band declaration --
         the raw-key pool alone; ``None`` without the band."""
-        from .kernels.qsa_prepare import QsaPrepareIndexArms
+        from .cache_write_contract import QsaPrepareIndexArms  # DSL-free (the kernel module re-exports it): callable at declaration
 
         if self._arms is not None:
             return self._arms
@@ -7901,7 +7902,8 @@ class GatedAttentionBlockFwd(APIBase):
     6 unsplit), the unfused twin ``(1) -> (2)+(3) -> (4w) -> (4i: the pool-1 query norm, the paged compress step, the scorer,
     the top-k) -> ...`` (11 / 9) under ``fuse_prepare=False``, bitwise; ``fuse_prepare=None`` is the MEASURED default
     (:data:`SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS`: True on cc 10.7 since the 2026-10-21 end-to-end gate measured the fused step
-    +9.6 .. +14.5 % at B <= 4 and +4.4 .. +10.0 % at B 32, bitwise; False on every other part until measured).  The declaration adds the three
+    +9.6 .. +14.5 % at B <= 4 and +4.4 .. +10.0 % at B 32, bitwise; False on every other part until measured, and False out of place --
+    ``inplace_qkv=False`` -- on every part: the AUTO reading is never True where an explicit True is declined).  The declaration adds the three
     side-cache SAMPLES (``sample_index_kv_cache`` ``[num_pages, P / 4, 1, 128]``, ``sample_index_state_cache`` ``[num_ring_blocks,
     cap >= S_q + 3, 1, 128]``, ``sample_index_state_block_table`` ``[B, 1]`` int32: their FORM, never their strides) and three
     input-contract flags (``index_state_slot_mapping_present``, ``index_commit_present`` -- a typed decline --,
@@ -8111,8 +8113,9 @@ class GatedAttentionBlockFwd(APIBase):
         # PERFORMANCE knob -- the same function, every output bitwise the two-stage form; needs paged_kv_page_size > 0 and
         # the in-place bf16 / f16 pipeline (typed otherwise).  None = AUTO (the type widened from bool, the position kept; False keeps
         # its meaning everywhere): the MEASURED default -- True on the in-block indexer's DECODE step over the pools on the parts of
-        # SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS (cc 10.7 since the 2026-10-21 measurement; `fuse_prepare_default` on the envelope),
-        # False on every other form; `fuse_prepare_requested` keeps the declaration, `fuse_prepare` the resolved knob.
+        # SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS (cc 10.7 since the 2026-10-21 measurement; `fuse_prepare_default` on the envelope) where the
+        # fused form is admissible -- False out of place (inplace_qkv=False: the unfused twin serves that layout) and on every other form, never
+        # True where an explicit True is declined; `fuse_prepare_requested` keeps the declaration, `fuse_prepare` the resolved knob.
         fuse_prepare: Optional[bool] = None,
         # APPENDED (serving, the e4m3 KV cache): the POOLS' dtype.  None = the activation dtype (the pools as before).  torch.float8_e4m3fn =
         # the serving stacks' fp8 KV cache: the write-through quantizes the post-RoPE K / V into e4m3 codes under per-tensor fp32 DEscales
@@ -8818,7 +8821,9 @@ class GatedAttentionBlockFwd(APIBase):
         if self.fuse_prepare:
             arms = None
             if self.indexer_decode:
-                from .kernels.qsa_prepare import QsaPrepareIndexArms
+                # the record's home is the DSL-free contract module: a DECLARATION never imports the kernel module (Rule 7 -- the stage's
+                # check_support gates the DSL floor before the kernel is loaded; test_import_boundaries pins this declaration)
+                from .cache_write_contract import QsaPrepareIndexArms
 
                 q = self.qsa
                 arms = QsaPrepareIndexArms(
@@ -9567,11 +9572,25 @@ class GatedAttentionBlockFwd(APIBase):
 
     def _fuse_prepare_default(self) -> bool:
         """The AUTO reading of ``fuse_prepare`` (None): True iff this is the in-block indexer's DECODE step over the pools (the form the
-        fused launch's three paged arms serve) and the sample's device is one of :data:`SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS` -- cc 10.7
-        since the 2026-10-21 end-to-end gate measured the fused step +9.6 .. +14.5 % at B <= 4 against the unfused twin on an exclusive part
-        (the measured-default rule; every other part waits for its own measurement) --; False everywhere else (the knob's former default).  Never True where an explicit True is declined.
+        fused launch's three paged arms serve), the fused form is ADMISSIBLE on this declaration, and the sample's device is one of
+        :data:`SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS` -- cc 10.7 since the 2026-10-21 end-to-end gate measured the fused step +9.6 .. +14.5 %
+        at B <= 4 against the unfused twin on an exclusive part (the measured-default rule; every other part waits for its own measurement)
+        --; False everywhere else (the knob's former default).  Never True where an explicit True is declined: the reading walks the explicit
+        rows of :meth:`_check_fuse_prepare_declaration` (the write-through attribute, ``fuse_norm_rope``, the in-place pipeline, ``thd``), the
+        e4m3 cache's row and the fused stage's own ``rope_dim`` row (``_QsaPrepare.check_support``), and reads False -- the unfused twin --
+        where any one holds, so a legal out-of-place declaration (``inplace_qkv=False``) constructs under the measured default instead of
+        being refused for a knob it never set (an explicit True keeps its typed decline there).  A performance knob: both readings compute
+        the same function.
         """
-        return bool(self.indexer_decode and _device_cc_of(self.device) in SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS)
+        admissible = (
+            bool(self.paged_kv_page_size)
+            and not self.fuse_norm_rope
+            and self.inplace_qkv
+            and not self.thd
+            and not self.kv_cache_e4m3
+            and self.geom.rope_dim > 0
+        )
+        return bool(self.indexer_decode and admissible and _device_cc_of(self.device) in SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS)
 
     def _check_fuse_prepare_declaration(self, fuse_prepare) -> bool:
         """``fuse_prepare`` at declaration: ``None`` (the measured default, :meth:`_fuse_prepare_default`), ``True`` or ``False``

@@ -3328,7 +3328,8 @@ step with a split); under `False` the unfused twin -- the norm + RoPE pass, the 
 write-through (no raw-key pool arm) -- four for the stage (11); `None` is the MEASURED default (`SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS
 = ((10, 7),)`: the end-to-end gate on an exclusive 212-SM cc 10.7 part at the 2376 MHz lock, CUDA-graph replay A/B/A 3 x 100, read
 unfused / fused - 1 = +9.6 .. +14.5 % at B <= 4 and +4.4 .. +10.0 % at B 32 over the 19 decode cells, geomean +11.9 % over B <= 4, bitwise
-on out and the list; the control pairs -0.5 .. -1.3 %, a capture-order bias against the fused arm -- so cc 10.7 reads True and every other
+on out and the list; the control pairs -0.5 .. -1.3 %, a capture-order bias against the fused arm -- so cc 10.7 reads True on the in-place
+pipeline (False out of place, `inplace_qkv=False`: the AUTO reading is never True where an explicit True is declined) and every other
 part False until measured; `serving_envelope(...).decode.fuse_prepare_default`), the two readings bitwise.  The caller-list band form takes the knob too (`raw_pool=True`: the paged write-through + the raw key's write in
 the prepare launch; the `caller-list band + fuse_prepare` row).  `index_state_slot_mapping_present=True` takes the ring's write rows from
 `execute(index_state_slot_mapping=)` (`block x cap + pos % cap`, `-1` dead; `slot_mapping`'s dtype) -- bitwise the derived rows;

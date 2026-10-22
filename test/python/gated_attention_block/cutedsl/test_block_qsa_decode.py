@@ -421,7 +421,7 @@ def _declare_indexer(geom_kw=GEOM_FLASH_NEXT, batch=1, s_q=1, *, page=16, n_page
     if samples:
         kw.update(_indexer_samples(batch, page=page, n_pages=n_pages, cap=cap, dtype=dtype, qsa_over=qsa_over))
     kw.update(blk_kw)
-    tables = (None, None) if blk_kw.get("rope_position_tables_only") else (mk(batch, s_q, ROPE), mk(batch, s_q, ROPE))
+    tables = (None, None) if blk_kw.get("rope_position_tables_only") else (mk(batch, s_q, geom.rope_dim), mk(batch, s_q, geom.rope_dim))
     return GatedAttentionBlockFwd(
         mk(batch, s_q, geom.d_model),
         mk(geom.n_qkvg, geom.d_model),
@@ -1397,7 +1397,9 @@ def test_decode_indexer_declaration_facts_carve_and_the_envelope_rows(monkeypatc
     unfused twin -- the norm + RoPE pass, a K / V-only cache write (no raw-key pool arm), the stage's four launches --, under ``True`` the
     prepare launch with the three paged arms and the stage's two launches; the knob's AUTO reading (``None``: the MEASURED default --
     ``SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS == ((10, 7),)`` since the 2026-10-21 end-to-end gate, so cc 10.7 reads True on the indexer's
-    decode step and every other part / the caller-list band form read False) and its readback; the switch's AUTO reading False and an explicit ``use_pdl=True`` the existing typed
+    decode step and every other part / the caller-list band form read False; admissibility-aware: out of place -- ``inplace_qkv=False`` -- and on
+    the ``rope_dim=0`` geometry it reads False on every part, the unfused twin, never a refusal blaming a knob the caller never set, while an
+    explicit True keeps its typed decline there) and its readback; the switch's AUTO reading False and an explicit ``use_pdl=True`` the existing typed
     decline (the switch is the sparse chain's follow-up); the carve = the caller-list band block's + the five slots appended at the END in
     the stage's order; the envelope's indexer rows on a Rubin reading (every one read off the host facts, the FlashInfer-read names pinned
     by signature), ``kv_cache_dtypes`` narrowed to the activation dtype under the indexer; the ring rule's two spellings equal."""
@@ -1478,6 +1480,18 @@ def test_decode_indexer_declaration_facts_carve_and_the_envelope_rows(monkeypatc
             ), cc
             band = _declare(GEOM_SMALL, 1, 1, n_pages=4, index_band=True, index_list_form="per_row")[0]
             assert band.fuse_prepare is False and band.fuse_prepare_requested is None and band._prepare is None, cc
+            # the AUTO reading is ADMISSIBILITY-AWARE (never True where an explicit True is declined): out of place the fused launch is refused
+            # by its own row, so the measured default reads False there on EVERY part -- the unfused twin (the K / V-only write, the stage's
+            # four launches) -- and an explicit True keeps its ValueError; the fused stage's rope_dim row (its check_support decline) the same way
+            oop = _declare_indexer(GEOM_SMALL, 1, 1, inplace_qkv=False)
+            assert oop.fuse_prepare is False and oop.fuse_prepare_requested is None and oop._prepare is None and not oop.inplace_qkv, cc
+            assert oop._cache_write is not None and oop._indexer_decode.fused is False and oop._indexer_decode.launches_per_execute() == 4, cc
+            with pytest.raises(ValueError, match="inplace_qkv=False"):
+                _declare_indexer(GEOM_SMALL, 1, 1, inplace_qkv=False, fuse_prepare=True)
+            rope0 = _declare_indexer(GEOM_SMALL, 1, 1, geom_over=dict(rope_dim=0, qk_norm=True))
+            assert rope0.fuse_prepare is False and rope0.fuse_prepare_requested is None and rope0._prepare is None and rope0.geom.rope_dim == 0, cc
+            with pytest.raises(ValueError, match="fuse_prepare=True with geometry.rope_dim=0"):
+                _declare_indexer(GEOM_SMALL, 1, 1, geom_over=dict(rope_dim=0, qk_norm=True), fuse_prepare=True)._prepare.check_support()
         monkeypatch.undo()
         # the ring rule's DSL-free spelling
         assert _index_state_ring_extra_rows(BS) == 3

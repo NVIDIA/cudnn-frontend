@@ -69,7 +69,8 @@ the launch stream through events, overlapping the SDPA backward chain) -- see [B
   (`kv_source="paged"` on a `QsaSpec` geometry, 2026-10-21: the prepare kernel's paged arms -- the raw-key pool under caller lists, the
   indexer's query + compress arms under `index_source="indexer"`; `fuse_prepare=None` is the MEASURED default there: True on cc 10.7
   (2026-10-21: the fused step +9.6 .. +14.5 % at B <= 4 and +4.4 .. +10.0 % at B 32 over 19 decode cells, bitwise), `False` on every other
-  part until measured); `fuse_norm_rope` together with it is a typed decline (pick one), as are `thd=True` and
+  part until measured, and `False` out of place (`inplace_qkv=False`) on every part -- the AUTO reading is never True where an explicit
+  True is declined); `fuse_norm_rope` together with it is a typed decline (pick one), as are `thd=True` and
   `kv_source="paged"` on a DENSE geometry (the prepare kernel's packed arm and the dense DECODE form's are follow-ups) and
   `kv_cache_dtype=torch.float8_e4m3fn` (the e4m3 cache's write-through quantizes in its own stage); a geometry with `rope_dim=0`
   (RMSNorm only) is a `ValueError` at `check_support` naming the zero-width RoPE table operands the fused launch would bind.
@@ -681,7 +682,7 @@ blk = GatedAttentionBlockFwd(
     sample_k_cache=None, sample_v_cache=None, sample_block_table=None,   # kv_source="paged" only: the pools' and the table's shape / dtype / strides (compiled in; any table row stride)
     max_kv_len=None,             # the DECODE form: the logical KV bound kv_lens[b] <= max_kv_len; None = max_pages * P
     decode_split_kv=None,        # the DECODE form: the decode tile's split-KV; None = the decode split model (fp32 partials in the workspace + one combine)
-    fuse_prepare=None,           # serving: stages (2)+(3) and that write-through as ONE launch (needs paged_kv_page_size > 0; same function); None = False on the dense forms and the caller-list band form, the MEASURED default on the indexer's DECODE step over the pools (True on cc 10.7 since 2026-10-21, False on other parts) -- "The in-block indexer's DECODE step over the pools"
+    fuse_prepare=None,           # serving: stages (2)+(3) and that write-through as ONE launch (needs paged_kv_page_size > 0; same function); None = False on the dense forms and the caller-list band form, the MEASURED default on the indexer's DECODE step over the pools (True on cc 10.7 since 2026-10-21 where the fused form is admissible, False out of place and on other parts) -- "The in-block indexer's DECODE step over the pools"
     kv_cache_dtype=None,         # serving: None = the activation dtype; torch.float8_e4m3fn = the e4m3 KV cache (per-tensor k_scale / v_scale at execute) -- "Serving: the e4m3 KV cache"
     decode_route_policy=None,    # the DECODE form: None = "single_unit" (the decode tile in one unit, else the packed prefill tile where the step fills the part); "token_units" = the adapter's route -- "Serving: the decode form"
     decode_q_tile_max=None,      # the DECODE form: None = the decode tile's whole width table (16, 32, 64); 32 = the route before the 64-column width landed (a performance-only cap)
@@ -1278,7 +1279,8 @@ top-k, the sparse tile, the combine, the out projection and its split-K reducer)
 query compress, the step compress (`frost_qsa_compress_step`) and the K / V write-through run as their own launches -- eleven;
 `None` is the MEASURED default (`serving_envelope(...).decode.fuse_prepare_default`: True on cc 10.7 -- the 2026-10-21 end-to-end
 gate on an exclusive 212-SM part measured the fused step +9.6 .. +14.5 % faster at B <= 4 and +4.4 .. +10.0 % at B 32 over 19 decode cells,
-bitwise --, `False` on every other part until measured); every output, the ring and the cache are BITWISE between the two readings.  `index_state_slot_mapping_present=True`
+bitwise --, `False` on every other part until measured, and `False` out of place -- `inplace_qkv=False` -- on every part: the AUTO reading is
+never True where an explicit True is declined); every output, the ring and the cache are BITWISE between the two readings.  `index_state_slot_mapping_present=True`
 takes the ring's write rows from `execute(index_state_slot_mapping=)` (`block x cap + pos % cap`, `-1` on a dead row; int32 or
 int64 = `slot_mapping`'s dtype) instead of deriving them from the ring table -- bitwise the derived form;
 `rope_position_tables_only=True` (fused only) refuses `cos` / `sin` and rotates Q / K and the indexer queries from
