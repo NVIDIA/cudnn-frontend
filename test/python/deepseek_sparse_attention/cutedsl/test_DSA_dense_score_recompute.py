@@ -1143,6 +1143,24 @@ def test_DSA_dense_score_recompute_wrapper_mxfp4_rejects_mismatched_inputs():
     k_wide = torch.cat([k.view(torch.uint8)] * 2, dim=-1).view(k.dtype)
     with pytest.raises(ValueError, match=r"q last dim \(\d+\) != k last dim"):
         DSA.dense_indexer_score_recompute_wrapper(q, k_wide, weights, **common)
+    # THD reports the same mismatch.
+    cu_q = torch.tensor([0, s_q], dtype=torch.int32, device=device)
+    cu_k = torch.tensor([0, s_k], dtype=torch.int32, device=device)
+    q_scale_thd, k_scale_thd, cu_q_scale, cu_k_scale = pack_mxfp8_scales_thd(q_scale_logical[0], k_scale_logical[0], cu_q, cu_k, h_q)
+    thd = dict(
+        qhead_per_kv_head=h_q,
+        precision="mxfp4",
+        q_scale=q_scale_thd,
+        k_scale=k_scale_thd,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_k,
+        cu_seqlens_q_scale_padded=cu_q_scale,
+        cu_seqlens_k_scale_padded=cu_k_scale,
+        max_seqlen_q=s_q,
+        max_seqlen_k=s_k,
+    )
+    with pytest.raises(ValueError, match=r"q last dim \(64\) != k last dim \(128\)"):
+        DSA.dense_indexer_score_recompute_wrapper(q[0], k_wide[0], weights[0], **thd)
     # A last dim of head_dim instead of head_dim // 2 names the packed width.
     q_wide = torch.cat([q.view(torch.uint8)] * 2, dim=-1).view(q.dtype)
     with pytest.raises(ValueError, match="stored as q/k last dim 64"):
@@ -1156,6 +1174,40 @@ def test_DSA_dense_score_recompute_wrapper_mxfp4_rejects_mismatched_inputs():
     lse = torch.zeros(b, s_q, h_q, dtype=torch.float32, device=device)
     with pytest.raises(ValueError, match="precision must be 'bf16' or 'mxfp8', got 'mxfp4'"):
         DSA.dense_attn_score_recompute_wrapper(q, k, lse, 1.0, **common)
+
+
+@pytest.mark.L0
+def test_DSA_dense_attn_score_recompute_wrapper_mxfp8_rejects_mismatched_inputs(request):
+    """MXFP8 dense attention score inputs that break the contract are refused on the host."""
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    from deepseek_sparse_attention.cutedsl import mxfp8_scale_reference as scale_utils
+
+    cfg = dsa_init(
+        request=request,
+        head_dim=128,
+        qhead_per_kv_head=64,
+        score_type="attention",
+        min_compute_capability=100,
+        b_default=1,
+        s_q_default=8,
+        s_kv_default=128,
+    )
+    q, k, _, _, q_scale, k_scale = _allocate_mxfp8_qk(cfg, scale_utils)
+    lse = torch.zeros(q.shape[:3], dtype=torch.float32, device=q.device)
+    common = dict(qhead_per_kv_head=cfg["qhead_per_kv_head"], precision="mxfp8", q_scale=q_scale, k_scale=k_scale)
+
+    with pytest.raises(ValueError, match="requires q_scale and k_scale"):
+        DSA.dense_attn_score_recompute_wrapper(q, k, lse, 1.0, qhead_per_kv_head=cfg["qhead_per_kv_head"], precision="mxfp8")
+    with pytest.raises(TypeError, match="lse to be torch.float32"):
+        DSA.dense_attn_score_recompute_wrapper(q, k, lse.bfloat16(), 1.0, **common)
+    with pytest.raises(ValueError, match="sf_vec_size=32"):
+        DSA.dense_attn_score_recompute_wrapper(q, k, lse, 1.0, sf_vec_size=16, **common)
+    with pytest.raises(ValueError, match="q_scale packed shape"):
+        DSA.dense_attn_score_recompute_wrapper(q, k, lse, 1.0, **{**common, "q_scale": k_scale})
 
 
 @pytest.mark.L0

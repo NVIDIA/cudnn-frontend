@@ -572,12 +572,17 @@ def test_indexer_forward_support_tables_are_the_shared_contract():
     point of indexer_forward applies come from one module, and read as documented."""
     try:
         from cudnn.deepseek_sparse_attention.indexer_forward import _support
+        from cudnn.deepseek_sparse_attention.score_recompute._block_scaled import SM100_INDEXER_PRECISIONS
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     assert _support.supported_qhead_per_kv_head("bf16") == (4, 8, 16, 32, 64)
     assert _support.supported_qhead_per_kv_head("mxfp8") == (4, 8, 16, 32, 64)
     assert _support.supported_qhead_per_kv_head("mxfp4") == (4, 8, 16, 32, 64)
+    # Every SM100 indexer precision has a row; a precision without one raises.
+    assert all(_support.supported_qhead_per_kv_head(precision) for precision in SM100_INDEXER_PRECISIONS)
+    with pytest.raises(ValueError, match="no qhead_per_kv_head groups are defined for precision='fp8x'"):
+        _support.supported_qhead_per_kv_head("fp8x")
     with pytest.raises(ValueError, match=r"qhead_per_kv_head in \(4, 8, 16, 32, 64\), got 12"):
         _support.validate_qhead_per_kv_head(12, "bf16")
     with pytest.raises(ValueError, match=r"precision='mxfp8' indexer requires qhead_per_kv_head in \(4, 8, 16, 32, 64\), got 12"):

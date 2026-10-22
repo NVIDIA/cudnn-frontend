@@ -85,6 +85,8 @@ def _normalize_dense_precision(
     precision = precision.lower()
     if precision not in ("bf16", "mxfp8"):
         raise ValueError(f"precision must be 'bf16' or 'mxfp8', got {precision!r}")
+    # validate_indexer_precision reports a format dtype missing from the installed torch by name, not as a dtype mismatch.
+    precision = validate_indexer_precision(precision)
     if precision == "bf16" and (q_scale is not None or k_scale is not None or cu_seqlens_q_scale_padded is not None or cu_seqlens_k_scale_padded is not None):
         raise ValueError("MXFP8 scales and scale padded cu_seqlens require precision='mxfp8'")
     return precision
@@ -104,7 +106,7 @@ def _normalize_dense_indexer_precision(
     return precision
 
 
-def _validate_dense_block_scaled_contract(
+def _validate_dense_block_scaled_inputs(
     *,
     precision: str,
     q: torch.Tensor,
@@ -113,25 +115,14 @@ def _validate_dense_block_scaled_contract(
     per_head_name: str,
     q_scale: Optional[torch.Tensor],
     k_scale: Optional[torch.Tensor],
-    cu_seqlens_q_scale_padded: Optional[torch.Tensor],
-    cu_seqlens_k_scale_padded: Optional[torch.Tensor],
-    qhead_per_kv_head: int,
-    head_dim: int,
-    seqlen_q: int,
-    seqlen_k: int,
-    bs: int,
-    n_heads_q: int,
-    n_heads_kv: int,
     sf_vec_size: int,
-    is_varlen: bool,
 ) -> None:
-    """Check the dtype, scale-vector, head and packed-scale-shape contract of a block-scaled dense score.
+    """Check the dtype, device and sf_vec_size contract of a block-scaled dense score's Q/K, per-head tensor and scales.
 
-    ``head_dim`` is the logical head dim (twice the stored last dim for packed FP4).
+    ``precision`` is a validated block-scaled precision. Run it before any shape check, so Q/K of another format
+    are reported as a dtype mismatch rather than as a wrong head_dim.
     """
-    # validate_indexer_precision reports a format dtype missing from the installed torch by name, not as a dtype mismatch.
-    fmt = BLOCK_SCALED_FORMATS[validate_indexer_precision(precision)]
-    label = precision.upper()
+    fmt = BLOCK_SCALED_FORMATS[precision]
     if q.dtype != fmt.data_dtype or k.dtype != fmt.data_dtype:
         raise TypeError(f"precision={precision!r} requires q and k to be {fmt.data_dtype}")
     if per_head_name == "weights" and per_head.dtype != torch.bfloat16:
@@ -145,8 +136,34 @@ def _validate_dense_block_scaled_contract(
     for scale, reference, name in ((q_scale, q, "q_scale"), (k_scale, k, "k_scale")):
         if scale.device != reference.device:
             raise ValueError(f"{name} must be on the same device as its data tensor")
-    if sf_vec_size != fmt.sf_vec_size:
-        raise ValueError(f"precision={precision!r} currently requires sf_vec_size={fmt.sf_vec_size}")
+    validate_sf_vec_size(precision, sf_vec_size)
+
+
+def _validate_dense_block_scaled_contract(
+    *,
+    precision: str,
+    q: torch.Tensor,
+    per_head_name: str,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    cu_seqlens_q_scale_padded: Optional[torch.Tensor],
+    cu_seqlens_k_scale_padded: Optional[torch.Tensor],
+    qhead_per_kv_head: int,
+    head_dim: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    bs: int,
+    n_heads_q: int,
+    n_heads_kv: int,
+    sf_vec_size: int,
+    is_varlen: bool,
+) -> None:
+    """Check the head and packed-scale-shape contract of a block-scaled dense score.
+
+    ``q_scale`` / ``k_scale`` are present and dtype-checked. ``head_dim`` is the logical head dim (twice the
+    stored last dim for packed FP4).
+    """
+    label = precision.upper()
     if head_dim != 128 and not (per_head_name == "lse" and head_dim == 512):
         raise ValueError(f"precision={precision!r} currently supports head_dim=128, " "or attention head_dim=512")
     if n_heads_kv != 1:
@@ -893,7 +910,17 @@ def _dense_indexer_score_recompute(
         cu_seqlens_k_scale_padded,
     )
     is_block_scaled = precision in BLOCK_SCALED_FORMATS
-    validate_sf_vec_size(precision, sf_vec_size)
+    if is_block_scaled:
+        _validate_dense_block_scaled_inputs(
+            precision=precision,
+            q=q,
+            k=k,
+            per_head=weights,
+            per_head_name="weights",
+            q_scale=q_scale,
+            k_scale=k_scale,
+            sf_vec_size=sf_vec_size,
+        )
     is_varlen_q = cu_seqlens_q is not None
     is_varlen_k = cu_seqlens_k is not None
     assert is_varlen_q == is_varlen_k, "THD input requires both cu_seqlens_q and cu_seqlens_k"
@@ -947,8 +974,6 @@ def _dense_indexer_score_recompute(
         _validate_dense_block_scaled_contract(
             precision=precision,
             q=q,
-            k=k,
-            per_head=weights,
             per_head_name="weights",
             q_scale=q_scale,
             k_scale=k_scale,
@@ -1210,6 +1235,17 @@ def _dense_attn_score_recompute(
         cu_seqlens_q_scale_padded,
         cu_seqlens_k_scale_padded,
     )
+    if precision == "mxfp8":
+        _validate_dense_block_scaled_inputs(
+            precision=precision,
+            q=q,
+            k=k,
+            per_head=lse,
+            per_head_name="lse",
+            q_scale=q_scale,
+            k_scale=k_scale,
+            sf_vec_size=sf_vec_size,
+        )
 
     is_varlen_q = cu_seqlens_q is not None
     is_varlen_k = cu_seqlens_k is not None
@@ -1246,8 +1282,6 @@ def _dense_attn_score_recompute(
         _validate_dense_block_scaled_contract(
             precision=precision,
             q=q,
-            k=k,
-            per_head=lse,
             per_head_name="lse",
             q_scale=q_scale,
             k_scale=k_scale,

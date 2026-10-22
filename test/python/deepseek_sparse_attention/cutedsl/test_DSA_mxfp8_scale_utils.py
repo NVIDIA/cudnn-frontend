@@ -379,7 +379,6 @@ def test_blockscaled_mma_op_adapter_maps_scale_and_major_modes_host_only():
     op = SimpleNamespace(
         a_dtype=cutlass.Float8E4M3FN,
         b_dtype=cutlass.Float8E5M2,
-        sf_dtype=cutlass.Float8E8M0FNU,
         shape_mnk=(128, 256, 64),
         a_major_mode=cute.nvgpu.tcgen05.mma.OperandMajorMode.K,
         b_major_mode=cute.nvgpu.tcgen05.mma.OperandMajorMode.MN,

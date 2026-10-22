@@ -356,14 +356,12 @@ def indexer_fwd_compress_topk(
     if q.ndim != 4 or k.ndim != 4 or w.ndim != 3:
         raise ValueError("compress-topk expects BSHD q (bs,sq,Hq,D), k (bs,sk,Hkv,D), w (bs,sq,Hq)")
     if precision == "bf16" and (q_scale is not None or k_scale is not None):
-        # Match the dense path: reject stray scales (silently ignored otherwise,
-        # and they would also pollute the compile cache key).
+        # Stray scales would be silently ignored and would pollute the compile cache key.
         raise ValueError(f"q_scale and k_scale are only valid with precision={BLOCK_SCALED_PRECISION_NAMES}")
     if precision == "bf16" and not (q.dtype == torch.bfloat16 and k.dtype == torch.bfloat16 and w.dtype in (torch.bfloat16, torch.float32)):
         raise TypeError("precision='bf16' requires bfloat16 q/k and bfloat16 or float32 w")
     if is_block_scaled:
-        # Same dtype/device checks as the dense path; a mismatch would otherwise
-        # fail cryptically at compile or run time.
+        # A dtype/device mismatch would otherwise fail cryptically at compile or run time.
         validate_block_scaled_inputs(precision, q, k, w, q_scale, k_scale)
     validate_sf_vec_size(precision, sf_vec_size)
 
