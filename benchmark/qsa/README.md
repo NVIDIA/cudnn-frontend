@@ -91,8 +91,9 @@ indexer scores, selects 512 complete causal blocks, and appends the incomplete
 tail. It does not substitute the Miles implementation for the Relax baseline.
 
 All six outputs must pass cross-comparison and an independent chunked FP32
-oracle before any timings are emitted. Each backward consumes its own forward's
-FP32 saved state. Both timing orders are retained, and native outputs are checked
+oracle before any timings are emitted. Relax backward consumes the saved state from its own `grouped._Grouped.forward`
+call; native backward consumes `out_fp32` and `lse` from its own QSA forward call
+(`qsa_indexed_forward` with `--indexed`). Both timing orders are retained, and native outputs are checked
 again after timing. Reported times cover warm full attention calls, including
 allocations, metadata, backward preparation and final casts. They exclude
 compilation, selector/top-k, token expansion and framework/TP overhead. Peak

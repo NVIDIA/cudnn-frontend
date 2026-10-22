@@ -1,5 +1,9 @@
 # Indexed QSA training
 
+These attention calls **consume existing indices**; they do not compute the
+indexer score or top-k. See [QSA entry points and the indexer](qsa.md#finding-qsa-attention-and-its-indexer)
+for block selection, bitmap training and the fixed-geometry two-pass backward.
+
 `cudnn.ops.qsa_indexed_forward` and `qsa_indexed_backward` accept packed token
 indices directly. They are also available through `cudnn.DSA`. The implementation
 lives in the DSA family and shares QSA's attention kernels. It supports BF16

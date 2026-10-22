@@ -65,11 +65,13 @@ class _QsaIndexedPlan(APIBase):
         self.workspace_bytes = sum(ws_align(math.prod(shape) * dtype.itemsize) for _, shape, dtype in self.layouts)
 
     def check_support(self):
-        from cudnn.frost.buffers import cutedsl_requirement_error, cutedsl_state, cutedsl_too_old
+        from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_requirement_error, cutedsl_state, cutedsl_too_old
 
         installed, version = cutedsl_state()
         if not installed or cutedsl_too_old(version):
-            raise ImportError(cutedsl_requirement_error("Indexed QSA") or "Indexed QSA requires nvidia-cutlass-dsl >= 4.7.0")
+            raise ImportError(
+                cutedsl_requirement_error("Indexed QSA") or f"Indexed QSA requires nvidia-cutlass-dsl >= {'.'.join(str(x) for x in CUTEDSL_MIN_VERSION)}"
+            )
         cc = torch.cuda.get_device_capability(self.device)
         if cc not in ((10, 0), (10, 3)):
             raise NotImplementedError(f"Indexed QSA requires SM100 or SM103, got SM{cc[0]}{cc[1]}")

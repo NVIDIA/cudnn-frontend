@@ -50,6 +50,43 @@ Both calls return a `TupleDict`. Tuple unpacking follows the order above; string
 keys have the same names. Forward and backward are explicit calls. The forward
 call does not register a PyTorch autograd function.
 
+## Finding QSA attention and its indexer
+
+QSA entry points currently live in several implementation packages. Start here
+when choosing the operation; the package location does not identify a separate
+attention algorithm.
+
+| Need | Entry point | Contract |
+|---|---|---|
+| Packed training with a block-selection bitmap | `cudnn.ops.qsa_forward`, `qsa_backward` | The bitmap API documented on this page; 12Q/1KV or 24Q/2KV |
+| Packed training with selected token IDs | [`cudnn.ops.qsa_indexed_forward`, `qsa_indexed_backward`](qsa_indexed.md) | 12Q/1KV on SM100/SM103; also exported by `cudnn.DSA`; shares the QSA attention kernels |
+| Two-pass backward for the fixed original geometry | `cudnn.DSA.GqaSparseAttentionBackward`, `gqa_sparse_attention_backward_wrapper` | 24Q/2KV, single sequence, canonical `[T, 2051]` token lists; BF16 saved output and `[T, 24]` natural-log LSE |
+| Generate selected blocks from indexer Q and compressed K | `cudnn.gated_attention_block.qsa_select.qsa_select` | QSA selector wrapper over the shared DSA scorer and top-k; returns local block IDs, not token IDs |
+| Integrated projection, compression, selection and attention | [`GatedAttentionBlockFwd` with `QsaSpec(index_source="indexer")`](gated_attention_block.md) | Use the integrated block's own architecture, layout and inference support matrix |
+
+**Indexed attention consumes indices; the indexer generates them.** The indexed
+training calls do not run scoring or top-k. The selector's local block IDs need
+expansion to the attention input format, including the incomplete causal tail
+and the packed sequence's token origin. Its standalone wrapper can be imported
+as follows:
+
+```python
+from cudnn.gated_attention_block.qsa_select import qsa_select
+```
+
+QSA's selector scores each complete compressed block as
+`scale * sum_h relu(qi[t, h] @ kbar[block])`. The existing
+`cudnn.DSA.indexer_forward_top_k_wrapper` provides this ratio-causal scorer and
+top-k operation with compression ratio four and constant head weights. Sharing
+these kernels avoids a second implementation. QSA-specific compression, block
+visibility and tail handling remain part of the QSA contract; this reuse does
+not make QSA and DeepSeek attention interchangeable. Numerical rounding and
+top-k tie rules must also be checked before replacing an external selector.
+
+The two backward implementations have different saved-state and selection
+contracts. Do not interchange their saved tensors or infer packed support for
+the fixed-geometry two-pass entry from the bitmap or indexed APIs.
+
 ## Tensors
 
 `T` is the total packed token count. `NB` is the total number of blocks across
