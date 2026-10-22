@@ -99,6 +99,7 @@ def main():
             visible = torch.arange(keys.shape[0], device="cuda")[None] < (positions[:, None] + 1) // 4
             values, ids = logits.masked_fill(~visible, -torch.inf).topk(min(512, keys.shape[0]), dim=-1)
             selected[a:b, : ids.shape[1]] = ids.masked_fill(values == -torch.inf, -1).int()
+            del logits, visible, values, ids
         start += length
         base += len(starts)
     del iq, keys
