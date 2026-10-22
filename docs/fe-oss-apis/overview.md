@@ -9,6 +9,7 @@ The GEMM CuTeDSL APIs are type-erased and torch-lazy: torch is imported only whe
 - **proj_rope_mxfp8**: JAX eager support on both input paths with `w_out_in=True` (the transposed [in, out] weight view is torch-only), plus the `jax.jit`-compatible `gemm_proj_rope_mxfp8_jax_sm100` entry point.
 
 This folder documents the Python FE APIs implemented under `python/cudnn`. New APIs follow the [Python API Naming Conventions](api_conventions.md). For details on currently implemented operations, see:
+- [Ahead-of-time attention for SM120](aot_sm120_attention.md) — prebuilt sm_120a attention forward behind a header-only C++ API (dlopen), no runtime compilation
 - [Causal Conv1d](causal_conv1d.md) and [Decode Update](causal_conv1d_update.md)
 - [FLA Integration Shims](fla.md)
 - [Kimi Delta Attention in JAX](kda_jax.md)
