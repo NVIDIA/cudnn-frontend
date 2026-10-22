@@ -1827,6 +1827,63 @@ def _seq_fill_host(
     )
 
 
+@cute.kernel
+def qsa_bwd_window_kernel(
+    queries: cute.Tensor,
+    seq_id: cute.Tensor,
+    total_count: cute.Tensor,
+    window_count: cute.Tensor,
+    range_base: cute.Tensor,
+    key_counts: cute.Tensor,
+    offset: I32,
+    capacity: I32,
+    NR: I32,
+):
+    # The query list is a view into the full compacted list. All content-dependent
+    # counts and range boundaries are rebuilt on device for this window/replay.
+    tid = cute.arch.block_idx()[0] * 256 + cute.arch.thread_idx()[0]
+    if tid < cute.size(key_counts):
+        key_counts[tid] = I32(0)
+    if tid == 0:
+        count = total_count[0] - offset
+        if count < 0:
+            count = I32(0)
+        if count > capacity:
+            count = capacity
+        window_count[0] = count
+        acc = I32(0)
+        for r in cutlass.range(NR, unroll=1):
+            range_base[r] = acc
+            end = (r + 1) * QR
+            if end > count:
+                end = count
+            if r * QR < count:
+                qi = queries[end - 1]
+                acc = acc + (qi >> 2) + seq_id[qi] + 1
+        range_base[NR] = acc
+
+
+qsa_bwd_window_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
+@cute.jit
+def _window_host(
+    queries: cute.Tensor,
+    seq_id: cute.Tensor,
+    total_count: cute.Tensor,
+    window_count: cute.Tensor,
+    range_base: cute.Tensor,
+    key_counts: cute.Tensor,
+    offset: I32,
+    capacity: I32,
+    NR: I32,
+    stream: cuda_driver.CUstream,
+):
+    qsa_bwd_window_kernel(queries, seq_id, total_count, window_count, range_base, key_counts, offset, capacity, NR).launch(
+        grid=(cute.ceil_div(cute.size(key_counts), 256), 1, 1), block=(256, 1, 1), stream=stream
+    )
+
+
 # ----------------------------------------------------------------------------- KV-pass partition and inverted index
 # The query-major kernel walks (KV pass, query) items pass-major so that one pass's K/V blocks stay L2 resident.
 # sparse_blocks[j] holds the first token of every selected block of sparse query j (and of its tail block) grouped by
@@ -1840,6 +1897,7 @@ POS = 64  # offset row stride in int32, a power of two well above the 11 passes 
 # slots of a key are contiguous (key_slot_offsets[key] .. + key_pair_counts[key]) and key_tokens[key] is its first token.
 # The query-major kernel writes the pair's P / dS record (bf16, [4 tokens][12 * HKV heads] each, see _rec_w) into its
 # slot, and the key-major kernel walks the keys.
+SPARSE_WINDOW_QUERIES = 4096  # Reuse at most two ranges of P/dS records, including for packed inputs.
 QR = 2048  # queries per range: a range's Q / dO rows stay L2 resident while the key-major kernel walks its keys
 QR_SH = 11  # log2(QR)
 RANGE_PAIRS = 513 * QR  # slots per range: every query has 512 blocks and at most one tail block
@@ -2930,10 +2988,12 @@ class LaunchPlan:
         # Sparse queries: exactly T - dense_cap of a single sequence, up to T of packed ones (counted on the device).
         nsq = 0 if not self.has_sparse else (T - dense_cap if num_seqs == 0 else T)
         self.nsq_cap = nsq
+        self.window_capacity = min(nsq, SPARSE_WINDOW_QUERIES)
+        self.query_windows = tuple((lo, min(lo + SPARSE_WINDOW_QUERIES, nsq)) for lo in range(0, nsq, SPARSE_WINDOW_QUERIES))
         # the query-major kernel's item is a query, or a pair of queries with one KV head
-        self.sparse_ctas = min(num_sms, (nsq + 1) // 2 if hkv == 1 else nsq)
+        self.sparse_ctas = min(num_sms, (self.window_capacity + 1) // 2 if hkv == 1 else self.window_capacity)
         # inverted index of the sparse queries: ranges of QR queries, one key per (range, block), one slot per pair
-        self.num_ranges = (nsq + QR - 1) // QR
+        self.num_ranges = (self.window_capacity + QR - 1) // QR
         # key tables are sized for the widest range, the kernels read each range's key base from range_base
         self.num_keys = self.num_ranges * ((T >> 2) + 1 + self.seq_count)
         self.dense_cap = dense_cap
@@ -2960,14 +3020,15 @@ class LaunchPlan:
             ("seq_lens", (4 if num_seqs == 0 else 0,), torch.int32),
             ("seq_sparse_base", ((self.seq_count + 3) // 4 * 4,), torch.int32),
             ("sparse_count", (4,), torch.int32),
+            ("window_count", (4 if sp else 0,), torch.int32),
             ("range_base", ((self.num_ranges + 1 + 3) // 4 * 4,), torch.int32),
             ("seq_start", ((T + 3) // 4 * 4,), torch.int32),
             ("seq_end", ((T + 3) // 4 * 4,), torch.int32),
             ("seq_id", ((T + 3) // 4 * 4,), torch.int32),
             ("sparse_queries", ((nsq + 3) // 4 * 4 if sp else 0,), torch.int32),
-            ("sparse_blocks", (nsq * PART_W + 16 if sp else 0,), torch.int32),
-            ("sparse_pass_offsets", (nsq * POS + 16 if sp else 0,), torch.int32),
-            ("sparse_block_slots", (nsq * PART_W + 16 if sp else 0,), torch.int32),
+            ("sparse_blocks", (self.window_capacity * PART_W + 16 if sp else 0,), torch.int32),
+            ("sparse_pass_offsets", (self.window_capacity * POS + 16 if sp else 0,), torch.int32),
+            ("sparse_block_slots", (self.window_capacity * PART_W + 16 if sp else 0,), torch.int32),
             ("key_pair_counts", (keys if sp else 0,), torch.int32),
             ("key_slot_offsets", (keys if sp else 0,), torch.int32),
             ("key_slot_cursors", (keys if sp else 0,), torch.int32),
@@ -3004,7 +3065,7 @@ def compile_kernels(plan: LaunchPlan) -> dict:
     Every extent is symbolic, so one set of artifacts serves all sequence lengths of a path.
     """
     if plan.has_sparse:
-        names = ("prep", "bitmap", "part", "scan", "fill", "query", plan.key_name, "dense_pdl", "fin_sparse")
+        names = ("prep", "bitmap", "window", "part", "scan", "fill", "query", plan.key_name, "dense_pdl", "fin_sparse")
     else:
         names = ("prep", "bitmap", "dense", "fin")
     if plan.num_seqs:
@@ -3034,6 +3095,7 @@ def compile_kernels(plan: LaunchPlan) -> dict:
         dense_fakes = (f_kv, f_kv, f_q, f_q, f_lse, f_lse, f_i(), f_dq_acc, f_dense_dkv, f_dense_dkv, f_i(), f_c(), I32(1), I32(1), I32(1), I32(1), I32(1))
         fin_fakes = (f_h, f_h, f_dense_dkv, f_dense_dkv, f_dq_acc, f_kv, f_kv, f_q, I32(1))
         builders = {
+            "window": lambda: (_window_host, f_i(), f_i(), f_i(), f_i(), f_i(), f_i(), I32(0), I32(1), I32(1), stream),
             "seq_scan": lambda: (_seq_scan_host, f_c(), f_i(), f_i(), f_i(), I32(1), I32(1), stream),
             "seq_fill": lambda: (_seq_fill_host, f_c(), f_i(), f_i(), f_i(), f_i(), f_i(), I32(1), I32(1), stream),
             "prep": lambda: (
@@ -3151,38 +3213,6 @@ def launch(plan: LaunchPlan, fns: dict, q, k, v, out, dout, lse, topk_idxs, dq, 
         plan.num_ranges,
         stream,
     )
-    if plan.has_sparse:
-        fns["part"](
-            topk_idxs,
-            s["sparse_queries"],
-            s["seq_start"],
-            s["seq_id"],
-            sparse_count,
-            s["sparse_blocks"],
-            s["sparse_pass_offsets"],
-            s["key_pair_counts"],
-            s["key_tokens"],
-            s["range_base"],
-            plan.nsq_cap,
-            plan.pass_tokens // 4,
-            plan.num_passes,
-            stream,
-        )
-        fns["scan"](s["key_pair_counts"], s["key_slot_offsets"], s["key_slot_cursors"], s["range_base"], plan.num_ranges, stream)
-        fns["fill"](
-            s["sparse_queries"],
-            s["seq_id"],
-            sparse_count,
-            s["sparse_blocks"],
-            s["sparse_pass_offsets"],
-            s["key_slot_cursors"],
-            s["sparse_block_slots"],
-            s["slot_queries"],
-            s["range_base"],
-            plan.nsq_cap,
-            plan.num_passes,
-            stream,
-        )
     if not plan.every_block_selected:
         fns["bitmap"](topk_idxs, s["seq_start"], s["seq_end"], s["dense_block_bitmap"], plan.nw, stream)
     dense_args = (
@@ -3217,42 +3247,88 @@ def launch(plan: LaunchPlan, fns: dict, q, k, v, out, dout, lse, topk_idxs, dq, 
         stream,
     )
     if plan.has_sparse:
-        fns["query"](
-            q,
-            k,
-            v,
-            dout,
-            lse,
-            s["delta"],
-            s["dq_acc"],
-            s["sparse_blocks"],
-            s["sparse_pass_offsets"],
-            s["sparse_block_slots"],
-            s["pair_records"],
-            s["sparse_queries"],
-            s["seq_start"],
-            sparse_count,
-            plan.sparse_ctas,
-            plan.num_passes,
-            stream,
-        )
-        # The key-major grid is a normal launch, so the PDL-launched dense grid sees every index table and record. It
-        # holds every SM until its items run out, and the dense grid backfills the tail.
-        fns[plan.key_name](
-            q,
-            dout,
-            s["pair_records"],
-            s["key_slot_offsets"],
-            s["key_pair_counts"],
-            s["slot_queries"],
-            s["sparse_dk_acc"],
-            s["sparse_dv_acc"],
-            s["key_tokens"],
-            s["range_base"],
-            plan.num_ranges,
-            plan.key_ctas,
-            stream,
-        )
+        window_count = s["window_count"]
+        for qlo, qhi in plan.query_windows:
+            queries = s["sparse_queries"][qlo : (qhi + 3) // 4 * 4]
+            fns["window"](
+                queries,
+                s["seq_id"],
+                sparse_count,
+                window_count,
+                s["range_base"],
+                s["key_pair_counts"],
+                qlo,
+                qhi - qlo,
+                plan.num_ranges,
+                stream,
+            )
+            fns["part"](
+                topk_idxs,
+                queries,
+                s["seq_start"],
+                s["seq_id"],
+                window_count,
+                s["sparse_blocks"],
+                s["sparse_pass_offsets"],
+                s["key_pair_counts"],
+                s["key_tokens"],
+                s["range_base"],
+                qhi - qlo,
+                plan.pass_tokens // 4,
+                plan.num_passes,
+                stream,
+            )
+            fns["scan"](s["key_pair_counts"], s["key_slot_offsets"], s["key_slot_cursors"], s["range_base"], plan.num_ranges, stream)
+            fns["fill"](
+                queries,
+                s["seq_id"],
+                window_count,
+                s["sparse_blocks"],
+                s["sparse_pass_offsets"],
+                s["key_slot_cursors"],
+                s["sparse_block_slots"],
+                s["slot_queries"],
+                s["range_base"],
+                qhi - qlo,
+                plan.num_passes,
+                stream,
+            )
+            fns["query"](
+                q,
+                k,
+                v,
+                dout,
+                lse,
+                s["delta"],
+                s["dq_acc"],
+                s["sparse_blocks"],
+                s["sparse_pass_offsets"],
+                s["sparse_block_slots"],
+                s["pair_records"],
+                queries,
+                s["seq_start"],
+                window_count,
+                plan.sparse_ctas,
+                plan.num_passes,
+                stream,
+            )
+            # Consume the window before its records and inverted index are reused.
+            fns[plan.key_name](
+                q,
+                dout,
+                s["pair_records"],
+                s["key_slot_offsets"],
+                s["key_pair_counts"],
+                s["slot_queries"],
+                s["sparse_dk_acc"],
+                s["sparse_dv_acc"],
+                s["key_tokens"],
+                s["range_base"],
+                plan.num_ranges,
+                plan.key_ctas,
+                stream,
+            )
+        # The dense grid backfills only the final key-major grid; compute it once.
         fns["dense_pdl"](*dense_args, stream)
         fns["fin_sparse"](*fin_args)
     else:

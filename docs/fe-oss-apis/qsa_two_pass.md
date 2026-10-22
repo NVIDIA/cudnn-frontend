@@ -34,9 +34,16 @@ block-to-query index lets the key-major pass accumulate dK/dV locally instead
 of scattering every query's contribution through global floating-point atomics.
 A separate dense kernel handles the early prefix, while long inputs are divided
 into KV passes. The records trade memory for reduced contention and reuse:
-the records still grow with the sparse query count. Packed plans reserve for
-all rows being sparse; exact scratch requirements come from the internal plan.
-This is not yet a bounded-record implementation.
+sparse queries are processed in windows of at most 4096 compacted query IDs.
+Each window rebuilds its inverted index and consumes its records before reusing
+the same storage. dK/dV accumulate across windows; the dense prefix is computed
+once. All sequence and window counts stay on the device.
+
+P/dS records are bounded to approximately 0.376 GiB for 12Q/1KV and 0.752 GiB
+for 24Q/2KV. At 128K, total plan scratch is approximately 2.49 GiB and 4.87 GiB,
+respectively, for a single sequence or three packed sequences. Inputs and final
+outputs are additional. Gradient accumulators and sequence tables still grow
+with the total token count; the entire workspace is not constant-size.
 
 The internal APIBase plan retains explicit compilation and caller-owned
 workspace. Execution checks current tensor layouts and storage; it does not
