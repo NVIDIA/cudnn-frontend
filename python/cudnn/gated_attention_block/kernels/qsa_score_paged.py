@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """``qsa_score_paged`` -- the decode indexer's scorer over the PAGED compressed-key cache; its standalone selector is the host entry
-``gated_attention_block/qsa_select_paged.py``.
+``QSA/selection_paged.py``.
 
 A decode step of a block-sparse (``QsaSpec``) layer scores each of its ``S_q`` query rows per sequence against the compressed
 keys of the complete 4-token blocks the row can see, and the top-k of those scores is the row's block list.  The serving
@@ -18,7 +18,7 @@ page), so this kernel reads them there -- once, in page order, never through a d
 The ``logits [T, n_blocks_max]`` fp32 + ``counts [T]`` int32 pair is the input contract of the decode top-k that follows
 (the radix kernel today, a FROST top-k later): the top-k reads row ``t``'s columns ``[0, counts[t])`` -- nothing else of the
 row is written here -- and pads its output with ``-1`` past ``min(top_k, counts[t])``.  The host entry
-``qsa_select_paged.qsa_select_decode_paged`` (a DSL-free module, so its import path resolves on every installed DSL) pairs the
+``selection_paged.qsa_select_decode_paged`` (a DSL-free module, so its import path resolves on every installed DSL) pairs the
 scorer with the deterministic radix top-k (the smaller block id wins a tie at the cutoff, the selected ids come back in ASCENDING
 order, so two calls are bitwise) and no torch prologue: the positions and the counts are derived on device by this kernel.
 
@@ -46,7 +46,7 @@ Work decomposition (every constant below is a module constant or a compile key; 
   granules' words (no shuffle, no ``ldmatrix``).  A per m-tile: ``reg0 / reg1`` = rows ``g`` / ``g + 8`` at word ``2 r``, ``reg2 /
   reg3`` the same rows at word ``2 r + 1``; B per n-tile: key ``n = g``'s words ``2 r`` / ``2 r + 1``; C: lane ``(g, q)`` holds rows
   ``g`` / ``g + 8`` for keys ``2q, 2q + 1``;
-* **the row map** (``qsa_select_paged.query_row_map``): a query's heads pad to ``P = next_pow2(H_i)`` rows; ``P' = min(P, 16)``
+* **the row map** (``selection_paged.query_row_map``): a query's heads pad to ``P = next_pow2(H_i)`` rows; ``P' = min(P, 16)``
   of them share a 16-row m-tile with ``QPT = 16 / P'`` queries, a query wider than a tile spans ``TPQ = P / 16`` tiles
   (``m_tiles = ceil(S_q x P / 16) <= 4``, the ``MAX_QUERY_ROWS`` envelope); with ``P' >= 2`` the two rows a lane holds are heads
   ``2 gi`` / ``2 gi + 1`` of ONE query (``gi = g % G``, ``G = P' / 2``) and the remaining heads sit in the ``G`` consecutive ``g``
@@ -143,10 +143,10 @@ cache's read arm is a follow-up of this kernel: the bf16 pair is served).
 
 Bytes per launch (the SOL denominator): ``sum_b n_vis_max(b) x 256 B`` of compressed rows read once; ``sum_t n_vis_t x 4 B`` of
 logits written; the query tile per live CTA (``m_tiles x 4 KiB``, L2-resident) and one table word per page --
-``qsa_select_paged.moved_bytes``.
+``selection_paged.moved_bytes``.
 
 Rule 7: this module imports the DSL at import time like its neighbours, so the documented host entry lives in the DSL-free
-front door ``gated_attention_block/qsa_select_paged.py`` -- ``qsa_select_decode_paged`` gates the DSL floor, the ``sm_107a``
+front door ``QSA/selection_paged.py`` -- ``qsa_select_decode_paged`` gates the DSL floor, the ``sm_107a``
 target on cc 10.7 and the radix top-k's cc 9.0 BEFORE importing this module -- and the kernel's host-side facts (the row map,
 the compile-key validator, the knob defaults, the byte model) are defined there and imported here, never the other way round
 at module scope.  :func:`compile_qsa_score_paged`, the kernel-level entry a caller may reach directly, gates the floor and the
@@ -172,7 +172,7 @@ from cudnn.frost.tile_dsl.tma import ld_global, st_global, st_global_v2
 from cutlass.cute.arch.nvvm_wrappers import inline_ptx
 
 # the kernel's host-side facts live in the DSL-free front door (Rule 7: a declaration reads them without importing this module)
-from ..qsa_select_paged import (
+from cudnn.QSA.selection_paged import (
     BLOCK_SIZE,
     CHUNKS_PER_LANE,
     INDEX_HEAD_DIM,

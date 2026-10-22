@@ -1057,7 +1057,7 @@ def test_the_dsl_floor_declines_through_the_block_before_any_kernel_import(monke
     # groups are read off the DSA tree, whose package imports its kernel modules, so the version decline must come first -- and
     # from the stage's own check_support; the sm_107a target from the stage.  The head-group reader is replaced by a failing
     # stub, so REACHING it below the floor is the failure, never an import error from inside the DSL.
-    import cudnn.gated_attention_block.qsa_select as qsa_select
+    import cudnn.QSA.selection as qsa_select
 
     real_groups = qsa_select.indexer_scorer_head_groups
     geom_ix = GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec(index_source="indexer", index_band=True))

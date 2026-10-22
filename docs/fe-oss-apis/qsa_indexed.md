@@ -5,8 +5,8 @@ indexer score or top-k. See [QSA entry points and the indexer](qsa.md#finding-qs
 for block selection, bitmap training and the fixed-geometry two-pass backward.
 
 `cudnn.ops.qsa_indexed_forward` and `qsa_indexed_backward` accept packed token
-indices directly. They are also available through `cudnn.DSA`. The implementation
-lives in the DSA family and shares QSA's attention kernels. It supports BF16
+indices directly. The implementation lives in `cudnn.QSA.indexed` and shares
+QSA's attention kernels. It supports BF16
 12Q/1KV, head dimension 256, and SM100/SM103 with CuTeDSL >= 4.7.
 
 ```python

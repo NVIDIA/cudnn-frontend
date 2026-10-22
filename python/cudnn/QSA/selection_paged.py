@@ -390,10 +390,10 @@ def qsa_select_decode_paged(
             "(the scorer alone, kernels.qsa_score_paged.run_qsa_score_paged, runs on this device)"
         )
 
-    # only now the two kernel modules: the paged scorer (this package) and the radix top-k (the DSA package)
+    # only now the two kernel modules: the paged scorer (the integrated block package) and the radix top-k (the DSA package)
     from cudnn.deepseek_sparse_attention.indexer_top_k import indexer_top_k_wrapper
 
-    from .kernels.qsa_score_paged import compile_qsa_score_paged, run_qsa_score_paged
+    from cudnn.gated_attention_block.kernels.qsa_score_paged import compile_qsa_score_paged, run_qsa_score_paged
 
     dev = qi.device.index if qi.device.index is not None else torch.cuda.current_device()
     # The operand device is SELECTED for the compile and the whole launch setup -- the house rule for a direct standalone entry:

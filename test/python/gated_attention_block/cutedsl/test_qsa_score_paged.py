@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """``kernels/qsa_score_paged.py`` -- the decode indexer's scorer over the PAGED compressed-key cache -- and its DSL-free host entry
-``gated_attention_block/qsa_select_paged.py`` (the standalone selector + the kernel's host-side facts).
+``QSA/selection_paged.py`` (the standalone selector + the kernel's host-side facts).
 
 Host cells (any machine): the MMA row map of the (s, h) query rows (a bijection onto the padded rows; the head-sum geometry per
 head count), the knob's default rule at both sides of every threshold, the compile-key envelope (typed ``ValueError``), the byte model, the
@@ -54,7 +54,7 @@ requirement_error = cutedsl_requirement_error("the paged decode scorer's tests (
 if requirement_error is not None:
     pytest.skip(requirement_error, allow_module_level=True)
 
-from cudnn.gated_attention_block import qsa_select_paged as fd  # noqa: E402  (the DSL-free front door: the selector + the host-side facts)
+from cudnn.QSA import selection_paged as fd  # noqa: E402  (the DSL-free front door: the selector + the host-side facts)
 from cudnn.gated_attention_block.kernels import qsa_score_paged as sp  # noqa: E402  (the kernel module: the compile + run entries)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -372,7 +372,7 @@ import torch
 import cudnn.frost.buffers as buffers
 
 buffers._DSL_STATE = (True, ("nvidia-cutlass-dsl", "4.6.2"))
-from cudnn.gated_attention_block import qsa_select_paged as fd
+from cudnn.QSA import selection_paged as fd
 
 KERNEL = "cudnn.gated_attention_block.kernels.qsa_score_paged"
 assert KERNEL not in sys.modules, "importing the front door imported the kernel module"
@@ -934,12 +934,12 @@ def test_selector_with_another_device_current():
 
 @needs_selector
 def test_paged_entry_agrees_with_the_dense_selector_when_that_module_is_present():
-    """The dense-cache decode selector (``cudnn.gated_attention_block.qsa_select``) is a sibling change: probed BY NAME -- skipped by
+    """The dense-cache decode selector (``cudnn.QSA.selection``) is a sibling change: probed BY NAME -- skipped by
     name where the tree lacks it, imported unguarded where it is present -- then both selectors over the same keys (the dense form
     through the gathered cache) select the same SET per row up to ties at the k-th boundary."""
-    if importlib.util.find_spec("cudnn.gated_attention_block.qsa_select") is None:
-        pytest.skip("the dense decode selector module cudnn.gated_attention_block.qsa_select is absent from this tree (a sibling change)")
-    dense_mod = importlib.import_module("cudnn.gated_attention_block.qsa_select")
+    if importlib.util.find_spec("cudnn.QSA.selection") is None:
+        pytest.skip("the dense decode selector module cudnn.QSA.selection is absent from this tree (a sibling change)")
+    dense_mod = importlib.import_module("cudnn.QSA.selection")
     rows, n_blocks_max = 4, 2048
     case = _Case(3, rows, n_blocks_max, 16, [4 * 1500 + 1 + rows, 4 * 2000 + 3 + rows, 4 * 300 + rows], seed=14)
     paged = fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, seq_q=rows)

@@ -4,8 +4,6 @@
 from importlib import import_module
 
 _SYMBOLS = {
-    "qsa_indexed_forward": (".qsa_training", "qsa_indexed_forward"),
-    "qsa_indexed_backward": (".qsa_training", "qsa_indexed_backward"),
     "sparse_attention": (".training", "sparse_attention"),
     "sparse_attention_score_recompute": (".training", "sparse_attention_score_recompute"),
     "SparseAttentionForward": (".sparse_attention_forward", "SparseAttentionForward"),
@@ -14,8 +12,6 @@ _SYMBOLS = {
     "aligned_hca_backward_wrapper": (".aligned_hca_backward", "aligned_hca_backward_wrapper"),
     "SparseAttentionBackward": (".sparse_attention_backward", "SparseAttentionBackward"),
     "sparse_attention_backward_wrapper": (".sparse_attention_backward", "sparse_attention_backward_wrapper"),
-    "GqaSparseAttentionBackward": (".gqa_sparse_attention_backward", "GqaSparseAttentionBackward"),
-    "gqa_sparse_attention_backward_wrapper": (".gqa_sparse_attention_backward", "gqa_sparse_attention_backward_wrapper"),
     "IndexerForward": (".indexer_forward", "IndexerForward"),
     "indexer_forward_wrapper": (".indexer_forward", "indexer_forward_wrapper"),
     "indexer_forward_top_k_wrapper": (".indexer_forward", "indexer_forward_top_k_wrapper"),

@@ -56,6 +56,12 @@ and tune a serialized/reloaded plan whose engine-config list is absent.
 
 ## Python tests (`test/python`)
 
+When moving Python modules, build the validation wheel with fresh Python build
+output. Reusing `build/lib.*` can ship removed modules even when the source tree
+and its import tests are clean. Inspect the wheel's module paths, then run the
+API inventory against that wheel. QSA's package-move regression in
+`core/test_import_boundaries.py` also checks that removed imports do not resolve.
+
 Run from `test/python` so `pytest.ini` and `conftest.py` apply:
 
 ```bash

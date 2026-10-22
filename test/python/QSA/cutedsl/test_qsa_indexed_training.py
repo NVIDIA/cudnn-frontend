@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from cudnn.ops import qsa_indexed_forward, qsa_indexed_backward
-from cudnn.deepseek_sparse_attention.qsa_training.api import _plan
+from cudnn.QSA.indexed.api import _plan
 from QSA.cutedsl.test_qsa import make_inputs, reference, assert_close, supported_gpu
 
 pytestmark = pytest.mark.L0
@@ -142,14 +142,14 @@ import cudnn.ops
 assert "torch" not in sys.modules and "cutlass" not in sys.modules
 from cudnn.ops import qsa_indexed_forward, qsa_indexed_backward
 assert callable(qsa_indexed_forward) and callable(qsa_indexed_backward)
-assert cudnn.DSA.qsa_indexed_backward is qsa_indexed_backward
+assert not hasattr(cudnn.DSA, "qsa_indexed_backward")
 """
     subprocess.run([sys.executable, "-c", code], check=True)
 
 
 @pytest.mark.parametrize("version", [None, ("nvidia-cutlass-dsl", "4.6.2")])
 def test_indexed_dsl_gate_precedes_kernel_import(supported_gpu, monkeypatch, version):
-    from cudnn.deepseek_sparse_attention.qsa_training.api import _QsaIndexedPlan
+    from cudnn.QSA.indexed.api import _QsaIndexedPlan
     from cudnn.frost import buffers
 
     plan = _QsaIndexedPlan(7, 4, torch.device("cuda", torch.cuda.current_device()), "bprop")

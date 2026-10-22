@@ -17,7 +17,7 @@ import sys
 import pytest
 import torch
 
-import cudnn.gated_attention_block.qsa_select as qsa_mod
+import cudnn.QSA.selection as qsa_mod
 from cudnn.frost.buffers import cutedsl_requirement_error
 
 QSA_BLOCK_SIZE, QSA_TOP_K, qsa_select = qsa_mod.QSA_BLOCK_SIZE, qsa_mod.QSA_TOP_K, qsa_mod.qsa_select  # the module imported ONE way

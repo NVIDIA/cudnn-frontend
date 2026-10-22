@@ -1440,7 +1440,7 @@ def test_indexer_execute_allocates_nothing_of_its_own_and_never_synchronizes(cac
         f"R9 census ({cache_dtype}): block 3 executes {n1 - n0} allocation(s), torch.sort's own {sort_allocs[0]} over {sort_calls[0]} windows, the block's own 0"
     )
     if cache_dtype is E4M3:
-        from cudnn.gated_attention_block.qsa_select import qsa_select
+        from cudnn.QSA.selection import qsa_select
 
         st = blk._indexer
         v = st.views(ws, blk._layout())

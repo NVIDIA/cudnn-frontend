@@ -152,7 +152,7 @@ def main():
         reference_sha256={name: file_hash(args.relax_source / name) for name in ("grouped.py", "selector.py")},
         frontend_sha256={
             str(path.relative_to(Path(cudnn.__file__).parent)): file_hash(path)
-            for folder in ("QSA", "deepseek_sparse_attention/qsa_training")
+            for folder in ("QSA",)
             for path in sorted((Path(cudnn.__file__).parent / folder).rglob("*.py"))
         },
         input_sha256={name: tensor_hash(value) for name, value in dict(q=q, k=k, v=v, grad_out=grad, indices=indices).items()},

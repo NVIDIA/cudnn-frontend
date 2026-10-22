@@ -1066,7 +1066,7 @@ class QsaSpec:
     index_heads, index_kv_heads, index_head_dim, index_norm_eps
         The indexer's geometry.  Under ``index_source="caller"`` they SIZE THE BAND ONLY (no kernel reads them); under
         ``"indexer"`` they are the scorer's: ``index_heads`` a head group the indexer scorer packs, ``index_head_dim``
-        its head dim, ``index_norm_eps`` the epsilon of both indexer RMSNorms (``cudnn.gated_attention_block.qsa_select``
+        its head dim, ``index_norm_eps`` the epsilon of both indexer RMSNorms (``cudnn.QSA.selection``
         names the two).  ``index_kv_heads`` is 1 (one raw key head, the checkpoint's own validator pins it);
         ``index_head_dim`` is a multiple of ``QKVG_TILE_ALIGN`` so every indexer head keeps the band tile-aligned.
 
@@ -1074,7 +1074,7 @@ class QsaSpec:
         The INDEXER CACHE's element type under ``index_source="indexer"`` (appended): ``None`` -- the activation dtype, bf16:
         the compressed keys and the indexer queries as the compress kernel writes them -- or ``torch.float8_e4m3fn``, the fp8
         indexer cache: both as plain e4m3 of the same RMSNormed + rotated values (no scales), scored through the scorer's
-        MXFP8 arm with unit scale factors (``cudnn.gated_attention_block.qsa_select``'s e4m3 arm), the caller's
+        MXFP8 arm with unit scale factors (``cudnn.QSA.selection``'s e4m3 arm), the caller's
         ``index_k_compressed`` then an e4m3 buffer.  NUMERICS-CHANGING (3 mantissa bits move the weakest selected blocks at
         the k-th boundary: the selection agrees with the bf16 one on 99.0 % of the blocks at S = 4096, 97.4 % at 32768 and
         96.5 % at 131072 on synthetic activations, every flip a rank-boundary flip), so an attribute of ``QsaSpec`` itself, never
@@ -6158,7 +6158,7 @@ def _check_qsa_indexer_geometry(geom: GatedAttentionBlockGeometry, dtype: torch.
     stage's ``check_support`` so the stage stays honest on its own."""
     from cudnn.frost.buffers import cutedsl_requirement_error
 
-    from .qsa_select import INDEXER_SCORER_HEAD_DIM, indexer_scorer_head_groups
+    from cudnn.QSA.selection import INDEXER_SCORER_HEAD_DIM, indexer_scorer_head_groups
 
     q = geom.qsa
     if dtype != torch.bfloat16:
@@ -6389,7 +6389,7 @@ class _Indexer(_Stage):
             )
         host.update(cu_seqlens_q=cu_q, cand_batch_offsets=offsets.cpu())
         if self.fp8:
-            from .qsa_select import _fp8_q_scale_prefix
+            from cudnn.QSA.selection import _fp8_q_scale_prefix
 
             # The e4m3 scorer's padded Q scale prefix (every sequence rounded up to the scale span of its heads): a plan constant, so
             # qsa_select builds nothing per execute (Rule 1).
@@ -6439,7 +6439,7 @@ class _Indexer(_Stage):
 
     def _select(self, qi: torch.Tensor, kbar: torch.Tensor, ids: torch.Tensor, scores: torch.Tensor, cand: torch.Tensor, *, stream: int) -> torch.Tensor:
         """The scorer + top-k on the block's stream, every buffer preallocated (the CUDA-graph form of :func:`qsa_select`)."""
-        from .qsa_select import qsa_select
+        from cudnn.QSA.selection import qsa_select
 
         q = self.geom.qsa
         return qsa_select(

@@ -417,7 +417,7 @@ the slab's query columns, bitwise the block's own norm + RoPE chain on those row
 COMPRESSED KEYS -- the band's raw key head mean-pooled in fp32 per complete 4-token block, RMSNormed with `w_ik_norm` and
 rotated at the block START position `4j`, one rounding -- the same kernel over the slab's raw-key slice; (3) the
 SELECTION -- the indexer scorer `sum_h relu(q_h . kbar_j) / sqrt(index_head_dim)` over the blocks below
-`floor((pos + 1) / 4)` and the fused radix top-k (ties to the smaller id) -- `cudnn.gated_attention_block.qsa_select`, the
+`floor((pos + 1) / 4)` and the fused radix top-k (ties to the smaller id) -- `cudnn.ops.qsa_select`, the
 DSA compressed-logits path, so the dense `[T, n_blocks]` score tensor is never materialized; (4) the CANONICAL ORDER -- the
 top-k's set is reproducible but its slot order is not, and the core accumulates in list order, so each row is sorted (the
 selected ids descending, the `-1` padding last) before the core: two executes of the block are bitwise, and the list a caller
@@ -456,7 +456,7 @@ which attention never reads.
 
 **The fp8 indexer cache (`QsaSpec(index_source="indexer", index_band=True, index_cache_dtype=torch.float8_e4m3fn)`).** The
 compressed keys and the indexer queries as plain e4m3 of the RMSNormed + rotated values (no scales -- the serving stacks' fp8 indexer
-cache recipe), scored through `cudnn.gated_attention_block.qsa_select`'s e4m3 arm: the DSA MXFP8 unified scorer with all-ones E8M0
+cache recipe), scored through `cudnn.ops.qsa_select`'s e4m3 arm: the DSA MXFP8 unified scorer with all-ones E8M0
 scale blobs, i.e. `sum_h relu(e4m3(q_h) . e4m3(kbar_j)) / sqrt(128)`. No new kernel: the two compress launches keep writing bf16
 (the one-rounding chain) and the FP8 pipeline's per-tensor cast (`sat_e4m3(row x 1.0)` -- round-to-nearest-even, saturating at
 448, never a NaN) writes the e4m3 operands into two workspace slots appended after the indexer's seven (every layout without the
@@ -502,7 +502,7 @@ queries and compressed keys within one bf16 ulp of the once-rounded fp32 chain; 
 EXACT given the kernel's selection -- the block oracle on the kernel's list within the dense suites' budgets.
 
 **The paged decode scorer (standalone).** The first piece of that decode-step indexer ships on its own:
-`cudnn.gated_attention_block.qsa_select_paged.qsa_select_decode_paged(qi, kbar, block_table, kv_lens, seq_q=1, top_k=512)`
+`cudnn.ops.qsa_select_decode_paged(qi, kbar, block_table, kv_lens, seq_q=1, top_k=512)`
 scores a decode step's `seq_q` indexer query rows per sequence (`qi [B x seq_q, index_heads, 128]` bf16) against the compressed
 keys of the complete 4-token blocks each row can see, read from the PAGED compressed-key cache the serving stacks keep on the
 main block table (`kbar [num_pages, page_size / 4, 1, 128]` bf16: block `j` of sequence `b` is row `j % (page_size / 4)` of page

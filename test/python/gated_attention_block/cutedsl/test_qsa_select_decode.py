@@ -23,12 +23,14 @@ import sys
 import pytest
 import torch
 
-import cudnn.gated_attention_block.qsa_select as qsa_mod
+import cudnn.QSA.selection as qsa_mod
 from cudnn.frost.buffers import cutedsl_requirement_error
 
 # the module imported ONE way: its names read off the module object
 QSA_BLOCK_SIZE, QSA_TOP_K, TOP_K_KERNEL_MAX = qsa_mod.QSA_BLOCK_SIZE, qsa_mod.QSA_TOP_K, qsa_mod.TOP_K_KERNEL_MAX
-decode_row_positions_and_counts, qsa_select, qsa_select_decode = qsa_mod.decode_row_positions_and_counts, qsa_mod.qsa_select, qsa_mod.qsa_select_decode
+from cudnn.ops import qsa_select, qsa_select_decode
+
+decode_row_positions_and_counts = qsa_mod.decode_row_positions_and_counts
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
