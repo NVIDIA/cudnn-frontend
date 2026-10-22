@@ -85,6 +85,7 @@ def make_fprop_cache_key(
     plan_name,
     overwrite_initial_state,
     state_pool_rows=None,
+    checkpoint_dtype=None,
 ):
     return (
         "fprop",
@@ -114,6 +115,7 @@ def make_fprop_cache_key(
         plan_name,
         bool(overwrite_initial_state),
         state_pool_rows,
+        checkpoint_dtype,
     )
 
 
@@ -148,6 +150,7 @@ def build_fprop_graph(
     overwrite_initial_state=False,
     state_indices_dtype=None,
     state_pool_rows=None,
+    checkpoint_dtype=None,
 ):
     graph = cudnn.pygraph()
     q_t = graph.tensor([total, G, K], data_type=io_dtype, name="q")
@@ -195,6 +198,8 @@ def build_fprop_graph(
         overwrite_initial_state=overwrite_initial_state or None,
         name="mamba2",
     )
+    if state_checkpoints_t is not None:
+        state_checkpoints_t.set_data_type(cudnn.data_type.FLOAT if checkpoint_dtype == torch.float32 else io_dtype)
     return graph, dict(
         q=q_t,
         k=k_t,
@@ -240,6 +245,7 @@ def run_mamba2_fwd(
     plan_name: Optional[str] = None,
     final_state_out: Optional[torch.Tensor] = None,
     state_indices: Optional[torch.Tensor] = None,
+    checkpoint_dtype: Optional[torch.dtype] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Internal Mamba-2 forward over a cached single-node MAMBA2 pygraph in THD layout.
 
@@ -247,7 +253,8 @@ def run_mamba2_fwd(
     zero-size tensors when ``output_final_state`` is ``False`` / ``checkpoint_every_n_tokens`` is ``0`` /
     ``output_pre_gate`` is ``False`` or ``z`` is absent.  ``final_state_out`` binds the final_state output to a caller
     buffer (the in-place op passes ``initial_state``); ``state_indices`` (int32 ``[N]``) makes ``initial_state`` a
-    pool whose row ``state_indices[i]`` seeds sequence ``i`` and receives its final state.
+    pool whose row ``state_indices[i]`` seeds sequence ``i`` and receives its final state.  ``checkpoint_dtype`` is the
+    checkpoint row dtype: ``None`` (the io dtype) or ``torch.float32``.
     """
     total, H, V = x.shape
     G, K = C.shape[1], C.shape[2]
@@ -320,6 +327,10 @@ def run_mamba2_fwd(
     state0 = initial_state if initial_state is not None else None
     state_out_dtype = state0.dtype if state0 is not None else torch.float32
     checkpoint = int(checkpoint_every_n_tokens)
+    if checkpoint_dtype not in (None, torch.float32, x.dtype):
+        raise ValueError(f"mamba2: checkpoint_dtype must be None, torch.float32 or the io dtype ({x.dtype}), got {checkpoint_dtype}")
+    if checkpoint_dtype is None:
+        checkpoint_dtype = x.dtype
     want_pre = bool(output_pre_gate) and z is not None
     cache_key = make_fprop_cache_key(
         total,
@@ -348,6 +359,7 @@ def run_mamba2_fwd(
         plan_name,
         final_state_out is not None,
         state_pool_rows,
+        checkpoint_dtype,
     )
     if cache_key not in fprop_cache:
         fprop_cache[cache_key] = build_fprop_graph(
@@ -376,6 +388,7 @@ def run_mamba2_fwd(
             overwrite_initial_state=final_state_out is not None,
             state_indices_dtype=torch_dtype_to_cudnn(state_indices.dtype) if state_indices is not None else None,
             state_pool_rows=state_pool_rows,
+            checkpoint_dtype=checkpoint_dtype,
         )
         select_plan(fprop_cache[cache_key][0], plan_name)
 
@@ -411,7 +424,7 @@ def run_mamba2_fwd(
     state_checkpoints = torch.empty(0, dtype=x.dtype, device=device)
     if checkpoint > 0:
         total_checkpoints = max(total // checkpoint + N, 1)
-        state_checkpoints = torch.empty(total_checkpoints, H, V, K, dtype=x.dtype, device=device)
+        state_checkpoints = torch.empty(total_checkpoints, H, V, K, dtype=checkpoint_dtype, device=device)
         variant_pack[t["state_checkpoints"]] = state_checkpoints
     y_pre = torch.empty(0, dtype=x.dtype, device=device)
     if want_pre:
@@ -442,6 +455,7 @@ def mamba2_fwd_op(
     dt_max: Optional[float] = None,
     batch_invariant: bool = False,
     plan_name: Optional[str] = None,
+    checkpoint_dtype: Optional[torch.dtype] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Functional Mamba-2 forward: :func:`run_mamba2_fwd` with fresh outputs; the autograd formula registers below."""
     return run_mamba2_fwd(
@@ -463,6 +477,7 @@ def mamba2_fwd_op(
         dt_max=dt_max,
         batch_invariant=batch_invariant,
         plan_name=plan_name,
+        checkpoint_dtype=checkpoint_dtype,
     )
 
 
@@ -486,6 +501,7 @@ def mamba2_fwd_overwrite_state_op(
     plan_name: Optional[str] = None,
     state_indices: Optional[torch.Tensor] = None,
     output_final_state: bool = True,
+    checkpoint_dtype: Optional[torch.dtype] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """In-place Mamba-2 forward: the final state overwrites ``initial_state`` (or the ``state_indices`` rows of the
     pool it addresses).  Inference only: no autograd formula."""
@@ -509,6 +525,7 @@ def mamba2_fwd_overwrite_state_op(
         plan_name=plan_name,
         final_state_out=initial_state if output_final_state else None,
         state_indices=state_indices,
+        checkpoint_dtype=checkpoint_dtype,
     )
     return y, state_checkpoints
 
@@ -533,6 +550,7 @@ def mamba2_fwd_fake(
     dt_max=None,
     batch_invariant=False,
     plan_name: Optional[str] = None,
+    checkpoint_dtype=None,
 ):
     total, H, V = x.shape
     K = C.shape[2]
@@ -546,7 +564,7 @@ def mamba2_fwd_fake(
     final = x.new_empty((N, H, V, K) if output_final_state else (0,), dtype=state_dtype)
     if checkpoint_every_n_tokens > 0:
         total_checkpoints = max(total // int(checkpoint_every_n_tokens) + N, 1)
-        state_checkpoints = x.new_empty(total_checkpoints, H, V, K)
+        state_checkpoints = x.new_empty(total_checkpoints, H, V, K, dtype=torch.float32 if checkpoint_dtype == torch.float32 else x.dtype)
     else:
         state_checkpoints = x.new_empty(0)
     y_pre = x.new_empty((total, H, V) if (output_pre_gate and z is not None) else (0,))
@@ -573,6 +591,7 @@ def mamba2_fwd_overwrite_state_fake(
     plan_name=None,
     state_indices=None,
     output_final_state=True,
+    checkpoint_dtype=None,
 ):
     y, _, state_checkpoints, _ = mamba2_fwd_fake(
         x=x,
@@ -592,6 +611,7 @@ def mamba2_fwd_overwrite_state_fake(
         dt_max=dt_max,
         batch_invariant=batch_invariant,
         plan_name=plan_name,
+        checkpoint_dtype=checkpoint_dtype,
     )
     return y, state_checkpoints
 
@@ -628,6 +648,7 @@ def build_bprop_graph(
     dt_softplus,
     dt_min,
     dt_max,
+    checkpoint_dtype=None,
 ):
     graph = cudnn.pygraph()
     q_t = graph.tensor([total, G, K], data_type=io_dtype, name="q")
@@ -639,7 +660,7 @@ def build_bprop_graph(
     dO_t = graph.tensor([total, H, V], data_type=io_dtype, name="dO")
     checkpoints_t = None
     if checkpoint_rows is not None:
-        checkpoints_t = graph.tensor([checkpoint_rows, H, V, K], data_type=io_dtype, name="state_checkpoints")
+        checkpoints_t = graph.tensor([checkpoint_rows, H, V, K], data_type=checkpoint_dtype, name="state_checkpoints")
     state0_t = None
     if state_dtype is not None:
         state0_t = graph.tensor([N, H, V, K], data_type=state_dtype, name="initial_state")
@@ -731,8 +752,8 @@ def mamba2_bwd_op(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Internal Mamba-2 backward over a cached single-node MAMBA2_BWD pygraph in THD layout.
 
-    ``state_checkpoints`` is the forward's per-chunk state series (io dtype, chunk cadence); when given at the kernel
-    chunk cadence the engine consumes it instead of regenerating it.  ``y_pre`` is the forward's pre-gate output,
+    ``state_checkpoints`` is the forward's state series (io or fp32 rows); io rows at the kernel chunk cadence are
+    consumed in place of the regenerated series, any other rows leave the engine regenerating it.  ``y_pre`` is the forward's pre-gate output,
     required with ``z``.  Returns ``(dx, ddt, dA, dB, dC, dD, ddt_bias, dz, d_initial_state)``; the gradients of
     absent inputs come back as zero-size tensors.
     """
@@ -753,7 +774,7 @@ def mamba2_bwd_op(
             raise ValueError("mamba2: the backward of the z gate needs the forward's pre-gate output, shaped like x")
         check_dtype("y_pre", y_pre, x.dtype)
     if state_checkpoints is not None:
-        check_dtype("state_checkpoints", state_checkpoints, x.dtype)
+        check_dtype("state_checkpoints", state_checkpoints, (x.dtype, torch.float32))
     dstate_dtype = initial_state.dtype if initial_state is not None else torch.float32
     if d_final_state is not None:
         check_dtype("d_final_state", d_final_state, (torch.float32, torch.bfloat16, torch.float16))
@@ -779,6 +800,7 @@ def mamba2_bwd_op(
         initial_state.dtype if initial_state is not None else None,
         d_final_state.dtype if d_final_state is not None else None,
         state_checkpoints.shape[0] if state_checkpoints is not None else None,
+        state_checkpoints.dtype if state_checkpoints is not None else None,
         checkpoint,
         batch_invariant,
         dt_softplus,
@@ -811,6 +833,7 @@ def mamba2_bwd_op(
             bool(dt_softplus),
             float(dt_min),
             dt_max_value,
+            checkpoint_dtype=torch_dtype_to_cudnn(state_checkpoints.dtype) if state_checkpoints is not None else None,
         )
         select_plan(bprop_cache[cache_key][0], plan_name)
 
@@ -923,9 +946,12 @@ def mamba2_setup_context(ctx, inputs, output):
         dt_max,
         batch_invariant,
         plan_name,
+        checkpoint_dtype,
     ) = inputs
     saved = [x, dt, A, B, C, cu_seqlens]
-    ctx.checkpoint_reuse = checkpoint_every_n_tokens > 0 and checkpoint_every_n_tokens % 128 == 0 and output[2].numel() > 0
+    ctx.checkpoint_reuse = (
+        checkpoint_every_n_tokens > 0 and checkpoint_every_n_tokens % 128 == 0 and output[2].numel() > 0 and checkpoint_dtype != torch.float32
+    )
     ctx.checkpoint_every_n_tokens = checkpoint_every_n_tokens if ctx.checkpoint_reuse else 0
     if ctx.checkpoint_reuse:
         saved.append(output[2])
@@ -1004,6 +1030,7 @@ def mamba2_backward(ctx, dy, dFinal, dstate_checkpoints, dy_pre):
         None,
         None,
         None,
+        None,
     )
 
 
@@ -1039,6 +1066,7 @@ def mamba2(
     state_indices: Optional[torch.Tensor] = None,
     overwrite_initial_state: bool = False,
     plan_name: Optional[str] = None,
+    checkpoint_dtype: Optional[torch.dtype] = None,
 ):
     """Mamba-2 state space duality (SSD) layer, the chunked scan of ``mamba_chunk_scan_combined``.
 
@@ -1073,10 +1101,12 @@ def mamba2(
             ``final_state`` comes back in the same dtype.
         output_final_state: if ``True``, also return the per-sequence state after the last token.
         checkpoint_every_n_tokens: if ``> 0``, also return the per-chunk recurrent state series
-            ``state_checkpoints`` (``[total_checkpoints, H, P, N]`` io dtype, V-major like
+            ``state_checkpoints`` (``[total_checkpoints, H, P, N]``, dtype per ``checkpoint_dtype``, V-major like
             ``final_state``, one entry per N tokens strictly before each sequence end; the FROST
             engine requires a positive multiple of the kernel chunk size, 128).  The series is a
             non-differentiable dump.
+        checkpoint_dtype: ``None`` stores io-dtype rows; ``torch.float32`` stores fp32 rows for the caller.  The backward
+            reuses io rows at the chunk cadence, regenerates the dense series from coarser io rows and never keeps fp32 rows.
         dt_softplus: apply the softplus to ``dt + dt_bias`` (``False`` takes ``dt + dt_bias`` as is).
         dt_min, dt_max: clamp range for the transformed ``dt`` (``dt_max=None`` is unbounded); the
             gradient is zero where the clamp is active.
@@ -1125,6 +1155,7 @@ def mamba2(
             plan_name=plan_name,
             state_indices=state_indices,
             output_final_state=bool(output_final_state) or bool(overwrite_initial_state),
+            checkpoint_dtype=checkpoint_dtype,
         )
         final_state = initial_state if (output_final_state or overwrite_initial_state) else initial_state.new_empty(0)
     else:
@@ -1147,6 +1178,7 @@ def mamba2(
             dt_max=None if dt_max is None else float(dt_max),
             batch_invariant=bool(batch_invariant),
             plan_name=plan_name,
+            checkpoint_dtype=checkpoint_dtype,
         )
     if checkpoint_every_n_tokens > 0:
         return y, final_state, state_checkpoints

@@ -67,10 +67,10 @@ Mamba-2 uses the SSD vocabulary: `x` plays `v`, `B` plays `k`, `C` plays `q`, `d
 
 - **States and checkpoints.** `output_final_state=True` returns the per-sequence state after the last token.
   `checkpoint_every_n_tokens > 0` also returns the state series, one entry every `n` tokens strictly before each
-  sequence end, as a non-differentiable dump that the backward reuses instead of recomputing. The rows are io dtype; the
-  four delta-rule variants (GDN, GDP, KDA, GDN-2) also take `checkpoint_dtype=torch.float32` for fp32 rows (the backward
-  reuses io rows at the chunk cadence and regenerates the dense series from any other rows), while Mamba-2 has no
-  `checkpoint_dtype` and stores io-dtype rows only. `state_indices`
+  sequence end, as a non-differentiable dump that the backward reuses instead of recomputing. The rows are io dtype by
+  default; every variant also takes `checkpoint_dtype=torch.float32` for fp32 rows, which are an output for the caller
+  only (the backward reuses io rows at the chunk cadence, regenerates the dense series from coarser io rows and never
+  keeps fp32 rows). `state_indices`
   turns `initial_state` into a pool `[N_pool, ...]` addressed per sequence, written back in place; forward only
   and exclusive with checkpoints.
 - **Summaries.** `<op>_summary` returns the end state of each sequence from a given start state together with the
