@@ -898,10 +898,15 @@ def sparse_decode_split_choice(*, batch: int, h_kv: int, s_q: int, top_k: int, s
     runs ONE work item per (sequence, KV head, query row) -- ``B x H_kv x S_q`` items of at most ``ceil((top_k + 1) / 32)`` 32-row
     tiles each -- so an under-full launch cuts every item into enough chunks to put one on each SM (``ceil(SMs / items)``), never
     more than the item's tile count (a larger split has an empty chunk, a dead work item, on every item -- the adapter's own bound)
-    and never more than :data:`SPARSE_DECODE_SPLIT_CAP` = 8 chunks (MEASURED on a 212-SM part at B 4 x S_kv 32K x S_q 1: the step at
-    split 1 / 2 / 4 / 8 / 17 = 69.2 / 64.3 / 59.9 / 59.8 / 65.0 us -- the core flattens past 4-8 chunks while the combine's cost grows
-    with the partial count, 2.9 us at 4, 12.2 us at 17), 1 for a launch that already fills the part and for a non-CUDA reading
-    (``sm_count`` 0, declined at ``check_support`` anyway).  A PERFORMANCE choice only (the fp32 partials ride the workspace, the
+    and never more than :data:`SPARSE_DECODE_SPLIT_CAP` = 16 chunks (MEASURED with the pinned combine forms -- Rubin cc 10.7, 212 SMs at
+    the 2376 MHz lock, CUDA-graph replay, the decode-grid combine pinned per grid by ``sparse_gqa_sm107._sparse_combine_decode_grid``:
+    the B 1 x S_kv 32K x S_q 1 step 39.0 us at split 8 -> 38.1 at 16 -> 37.7 at 17, the B 4 x S_kv 32K x S_q 1 step 37.1 -> 36.2 (16)
+    -> 36.4 (17), the former combine entry's step turning UP past 16 (its cost grows with the partial count: 3.3 / 4.5 / 6.5 us at
+    8 / 16 / 17 at B 1, where the decode-grid kernel stays at 2.8-3.1 us); 16 is within 1 % of the best on both cells, and the adapter's
+    bound at ``top_k`` 512 is 17.  The sweep behind the former cap of 8 (B 4 x 32K x 1: 69.2 / 64.3 / 59.9 / 59.8 / 65.0 us at split
+    1 / 2 / 4 / 8 / 17) ran the combine module's OWN forms, the entry compiled without a form -- its knee was that combine's growth
+    (2.9 us at 4, 12.2 us at 17); the pinned forms moved the knee and the cap moved with the measurement, never ahead of it), 1 for a
+    launch that already fills the part and for a non-CUDA reading (``sm_count`` 0, declined at ``check_support`` anyway).  A PERFORMANCE choice only (the fp32 partials ride the workspace, the
     combine is one more launch): the same function under every value, so a caller may pin any split in ``[1, ceil((top_k + 1) / 32)]``
     (the cap binds the DEFAULT only)."""
     max_tiles = -(-(int(top_k) + 1) // 32)
@@ -912,7 +917,9 @@ def sparse_decode_split_choice(*, batch: int, h_kv: int, s_q: int, top_k: int, s
 
 
 SPARSE_DECODE_SPLIT_CAP = (
-    8  # the fill rule's cap on the DEFAULT split of the block-sparse decode mode (the 4 x 32K x 1 sweep above); a pinned split may exceed it
+    16  # the fill rule's cap on the DEFAULT split of the block-sparse decode mode: the B 1 / B 4 x 32K x S_q 1 sweeps above, taken with
+    # the pinned decode-grid combine on a 212-SM cc 10.7 part (the former cap of 8 came from the combine module's own forms, whose cost
+    # grew with the partial count); a pinned split may exceed it, up to the item's tile count
 )
 
 
@@ -1052,7 +1059,10 @@ class QsaSpec:
         columns below V: the indexer's query heads first, its single raw key head last (the checkpoint's own row
         order, so the indexer weight concatenates unchanged).  Served on the UNFUSED projection (the FROST GEMM writes
         the wider slab; :func:`index_k_raw_view` exposes the raw key); the fused projection fork renders 256-column
-        tiles and declines a 640-column band, typed.
+        tiles and declines a 640-column band, typed.  At decode row counts (``T = B x S_q <= 128``) the slab GEMM takes the
+        small-M route's 128-row swap-AB tile (N 13952 = 109 x 128: the route's overflow branch admits the one N off the 256
+        grid whose 128-row tiles divide it), so a band declaration over the pools compiles without the opt-in flag and is
+        capture-safe like the four-band one; past 128 rows the band slab keeps the graph route.
     index_heads, index_kv_heads, index_head_dim, index_norm_eps
         The indexer's geometry.  Under ``index_source="caller"`` they SIZE THE BAND ONLY (no kernel reads them); under
         ``"indexer"`` they are the scorer's: ``index_heads`` a head group the indexer scorer packs, ``index_head_dim``
@@ -2942,6 +2952,19 @@ class _Projection(_Stage):
             raise NotImplementedError(
                 f"{self.name}: a per-weight dtype (A {self.dtype}, W {self.w_dtype}) exists only as a block-scale row; the dense GEMM takes one dtype"
             )
+
+    def resolves_a_jit_tile(self) -> bool:
+        """Whether ``tile_config="auto"`` names a JIT tile for this stage's own ``(M, N, K)`` -- asked of the driver's ONE resolver
+        (``kernels.proj_gemm._auto_tile_name``: the small-M route at ``M <= SMALL_M_MAX``, else the forced 256-wide tile where 256
+        divides N) with the operands :meth:`compile` hands ``build_proj_gemm`` (K-major A and B, this stage's dtype / alpha /
+        block_scale).  True is the JIT-only route (no backend plan, no cuDNN handle at execute: what a ``capture_safe`` declaration
+        needs to compile); False is the graph route, where ``capture_safe=True`` would be the driver's typed decline at ``compile()``
+        -- so the block sets the flag only where this reads True.  The indexer band's slab (N 13952, off the 256 grid) reads True
+        at decode row counts through the small-M route's 128-row swap-AB tile and False past 128 rows.  A host query (no device
+        sync): the SM count and the compiler family it reads are device properties."""
+        from .kernels.proj_gemm import _auto_tile_name
+
+        return _auto_tile_name(self.m, self.n, self.k, dtype=self.dtype, a_major="k", b_major="k", block_scale=self.block_scale, alpha=self.alpha) is not None
 
     def compile(self) -> None:
         from .kernels.proj_gemm import build_proj_gemm
@@ -7048,7 +7071,7 @@ _SPARSE_DECODE_REQUIRES = (
     "S_q <= 4: ONE list per sequence -- execute(block_ids=) [B, top_k] int32 (+ block_lens [B]) selected at the step-0 position kv_lens[b] - S_q and shared by the step's rows "
     "(row j sees the listed blocks plus every token from the step-0 tail start to its own position); S_q > 4: one list per row, block_ids [B, S_q, top_k] / [B x S_q, top_k] "
     "(+ block_lens [B, S_q] / [B x S_q]) at positions kv_lens[b] - S_q + j (the extend-with-prefix form)",
-    "decode_split_kv=None (the fill rule: ceil(SMs / (B x H_kv x S_q)) chunks, at most min(8, ceil((top_k + 1) / 32))) or an int in [1, ceil((top_k + 1) / 32)]: performance only",
+    "decode_split_kv=None (the fill rule: ceil(SMs / (B x H_kv x S_q)) chunks, at most min(16, ceil((top_k + 1) / 32))) or an int in [1, ceil((top_k + 1) / 32)]: performance only",
     "execute(block_table=, kv_lens=, k_cache=, v_cache=, slot_mapping=, block_ids=[, block_lens=]) with seq_lens=None (kv_lens binds the KV side only; a row at a negative position is dead)",
     "kv_cache_dtype=None (bf16 / f16 pools) or torch.float8_e4m3fn (bf16 activations, S_q <= 4, return_lse=False, decode_split_kv None / 1, fuse_norm_rope=False, "
     "inplace_qkv None / False: the pools' e4m3 codes under per-tensor fp32 k_scale / v_scale at execute -- the write-through quantizes, the step reads through the "
@@ -7174,7 +7197,7 @@ class GatedAttentionBlockFwd(APIBase):
     (row ``j`` sees the listed blocks plus every token from the step-0 tail start to its own position -- the contract page's
     MTP definition); past four rows one list per row (``[B, S_q, top_k]``) at positions ``kv_lens[b] - S_q + j`` -- a chunked
     prefill over a cached prefix -- at any ``S_q`` (no 32-row cap: one sparse work item per row).  ``decode_split_kv``
-    (``None`` = the fill rule :func:`sparse_decode_split_choice`, at most ``min(8, ceil((top_k + 1) / 32))``) is the one performance
+    (``None`` = the fill rule :func:`sparse_decode_split_choice`, at most ``min(16, ceil((top_k + 1) / 32))``) is the one performance
     knob (fp32 partials in the workspace, the split combine as a second launch); ``fuse_gate`` rides the core's epilogue
     unsplit and the combine under a split; ``return_lse`` is served (``[B, H_q, S_q]`` fp32).  A dead sequence
     (``kv_lens = 0``) and a row at a negative position (a sequence shorter than the step) yield ``out = 0`` / ``LSE = -inf``
@@ -8073,20 +8096,24 @@ class GatedAttentionBlockFwd(APIBase):
         # The SERVING declaration (kv_source="paged") is captured by a serving stack with vLLM's defaults -- the FIRST execute
         # of a fresh declaration inside a CUDA-graph capture on a new stream, no eager warm-up -- so both dense projection
         # stages are declared capture-safe here.  The flag is consumed by the projection GEMM driver's capture-safe route
-        # (build_proj_gemm(capture_safe=True): the forced-tile JIT route by construction, never a ranked list, no cuDNN handle
-        # at the first execute; a shape without a forced tile is a typed NotImplementedError at compile()), which
+        # (build_proj_gemm(capture_safe=True): the JIT-only route by construction, never a ranked list, no cuDNN handle at the
+        # first execute; a shape the driver resolves no JIT tile for is a typed NotImplementedError at compile()), which
         # `_Projection.compile` forwards it to when the driver takes the kwarg (the CUDA-graph capture-refusal change of
         # kernels/proj_gemm.py); on a tree without that route the flag is recorded on the stage and the projections take the
         # driver's existing route (the serving suite's capture cell skips there).  The fused norm + RoPE projection builds no
         # build_proj_gemm plan, so the flag is set on the two dense projection stages only.
-        # The forced tile exists only for an N that 256 divides: the indexer band (QsaSpec.index_band: + 640 columns) leaves n_qkvg
-        # off that grid, so a band geometry over the pools keeps the driver's own route -- its steps run eagerly and a capture is the
-        # driver's typed refusal at the first captured execute (the block-sparse decode mode's documented limit until the band is
-        # padded to 256 columns); the capture-safe flag would otherwise decline the whole block at compile.
-        if self.kv_source == KV_SOURCE_PAGED and geometry.n_qkvg % 256 == 0:
-            for st in (self._proj, self._out_proj):
-                if isinstance(st, _Projection):
-                    st.capture_safe = True
+        # Per stage, iff the driver's "auto" resolver names a JIT tile for the stage's OWN (M, N, K) (`_Projection.resolves_a_jit_tile`):
+        # the forced 256-wide tile where 256 divides N (every dense served geometry: n_qkvg, d_model and h_q * d_head), or the small-M
+        # route's tile at T = B x S_q <= 128 -- which is how the indexer band's slab (QsaSpec.index_band: n_qkvg = 13312 + 640 = 13952,
+        # off the 256 grid) is capture-safe at decode row counts: its 218 64-row tiles overflow a wave and the route takes the 128-row
+        # swap-AB tile that divides it exactly (109 CTAs), the same JIT-only route as the four-band slab, no opt-in flag at compile().
+        # A band declaration past 128 rows resolves no tile and keeps the driver's own route -- its steps run eagerly and a capture is
+        # the driver's typed refusal at the first captured execute (the band's prefill / extend forms' documented limit); setting the
+        # flag there would decline the whole block at compile.  Read off the resolver `build_proj_gemm` itself runs, never re-spelled,
+        # so this predicate cannot drift from the route -- and read AGAIN at compile() on the compiling device
+        # (`_flag_capture_safe_projections`): the SM count the small-M route reads is a device property, so a declaration and its
+        # compile on different parts would otherwise carry a stale flag into the driver.
+        self._flag_capture_safe_projections()
         # Stage order == pipeline order.  `_quant_o` is listed only where it is a
         # DISTINCT stage (MXFP8: quantize_o, or quantize_fp4_o under o_fp4); under
         # FP8 it aliases `_quant_q`, listed once.
@@ -9328,10 +9355,24 @@ class GatedAttentionBlockFwd(APIBase):
 
     # -- compile ------------------------------------------------------------
 
+    def _flag_capture_safe_projections(self) -> None:
+        """Per paged projection stage (``kv_source="paged"``), ``capture_safe`` iff the driver's "auto" resolver names a JIT tile for
+        the stage's OWN (M, N, K) (:meth:`_Projection.resolves_a_jit_tile`; the predicate the declaration documents at its stage list).
+        Set at declaration (the host facts) and read AGAIN at :meth:`compile`, on the compiling device: the SM count the small-M route
+        reads is a device property, so a declaration and its compile on different parts would otherwise carry a stale flag into
+        ``build_proj_gemm`` -- its typed refusal where the flag says True and the route resolves no tile, the eager graph route where
+        it says False and the route has one.  A host query, no device sync."""
+        if self.kv_source != KV_SOURCE_PAGED:
+            return
+        for st in (self._proj, self._out_proj):
+            if isinstance(st, _Projection):
+                st.capture_safe = st.resolves_a_jit_tile()
+
     def compile(self) -> None:
         """Build all five artifacts. Plan-time keys only, so every execute-path
         dispatch is a guaranteed cache hit (Rule 4)."""
         self._ensure_support_checked()
+        self._flag_capture_safe_projections()  # on the compiling device (the method's docstring)
         for st in self._stages:
             st.compile()
         self._ws = self._layout()

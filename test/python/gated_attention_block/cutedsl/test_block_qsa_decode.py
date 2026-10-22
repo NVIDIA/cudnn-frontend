@@ -72,6 +72,7 @@ requires_rubin = pytest.mark.requires_rubin  # the suite's registered marker (co
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from gated_block_census import cupti_kernels as _cupti_kernels  # noqa: E402
 from gated_block_qsa_reference import qsa_visible_mask, random_block_ids  # noqa: E402
 from gated_block_reference import RefGeometry, build_rope_tables, gated_attention_block_reference  # noqa: E402
 
@@ -196,23 +197,78 @@ def test_declaration_facts_of_the_sparse_decode_mode(s_q, fuse_gate):
     with _no_host_sync():
         pinned, _ = _declare(GEOM_SMALL, 4, s_q, n_pages=6, fuse_gate=fuse_gate, decode_split_kv=3, max_kv_len=70, return_lse=True)
     assert pinned.decode_split_kv == 3 == pinned._sdpa.split_kv and pinned.max_kv_len == 70 and pinned.return_lse and pinned._sdpa.want_lse
-    # the serving declaration's capture-safe projections (the forced-tile JIT route) exist where 256 divides N: the indexer band (+640
-    # columns) leaves it, so a band geometry over the pools keeps the driver's route (eager steps; a capture is the driver's typed refusal)
+    # the serving declaration's capture-safe projections: set per stage iff the GEMM driver's "auto" resolver names a JIT tile for the
+    # stage's own shape -- the forced tile where 256 divides N (this geometry's two projections), the small-M route's tile at T <= 128
+    # (the indexer band's 13952-column slab of the 24 / 2 geometry: its own cell below).  THIS small geometry's band slab (N 5120 + 640
+    # = 5760 = 45 x 128, off the 256 grid) is not that case on any served part: its 90 64-row tiles FIT one wave at 90 SMs and more,
+    # where the route keeps the driver's graph route (eager steps; a capture is the driver's typed refusal); a part with fewer SMs
+    # overflows the wave and takes the route's 128-row tile at T <= 128.  So the expectation is read off the live resolver, as the
+    # 13952 cell reads it, and the one-wave fact is asserted where the live part has it; the out projection (N 512, on the 256 grid)
+    # is capture-safe throughout
+    from cudnn.gated_attention_block.kernels.proj_gemm import SMALL_M_MAX, _auto_tile_name
+    from cudnn.gemm.frost import arch_family
+
     assert blk._proj.capture_safe and blk._out_proj.capture_safe
     with _no_host_sync():
-        band, _ = _declare(GEOM_SMALL, 4, s_q, n_pages=6, index_band=True)
-    assert band.geom.n_qkvg % 256 != 0 and not getattr(band._proj, "capture_safe", False) and not getattr(band._out_proj, "capture_safe", False)
+        band, baux = _declare(GEOM_SMALL, 4, s_q, n_pages=6, index_band=True)
+    g = baux["geom"]
+    assert g.n_qkvg % 256 != 0 and g.n_qkvg % 128 == 0
+    name = _auto_tile_name(4 * s_q, g.n_qkvg, g.d_model, dtype=BF16, a_major="k", b_major="k", block_scale=False, alpha=False)
+    resolves = name is not None
+    if _DEV == "cuda" and arch_family.active_family() == "sm100":
+        one_wave = -(-g.n_qkvg // 64) <= sm  # the slab's 90 64-row tiles fit one wave: every served part
+        assert resolves is (4 * s_q <= SMALL_M_MAX and not one_wave), (sm, name)
+    else:
+        assert not resolves, name  # the sm120 family's forced-tile fallback has no tile off the 256 grid
+    assert getattr(band._proj, "capture_safe", False) is resolves and band._proj.resolves_a_jit_tile() is resolves and band._out_proj.capture_safe
+
+
+@pytest.mark.parametrize(
+    "batch, s_q, jit", [(1, 1, True), (4, 1, True), (32, 4, True), (4, 64, False)], ids=["B1-Sq1-T1", "B4-Sq1-T4", "B32-Sq4-T128", "B4-Sq64-T256"]
+)
+def test_the_indexer_band_declaration_over_the_pools_is_capture_safe_at_decode_row_counts(batch, s_q, jit):
+    """The 24 / 2 geometry WITH the indexer band over the pools (N = 13312 + 640 = 13952, off the 256 grid): at decode row counts
+    (``T = B x S_q <= 128``) the slab GEMM takes the small-M route's 128-row swap-AB tile (13952 = 109 x 128; its 218 64-row tiles
+    overflow a wave on every served part), so BOTH projection stages are declared capture-safe -- exactly where the driver's own
+    resolver names a tile (the predicate is read off it, never re-spelled); past 128 rows the band slab has no tile (256 does not
+    divide it) and keeps the graph route: the slab stage is not flagged (a capture is the driver's typed refusal), the out projection
+    (N 2560, on the 256 grid) is.  Declared on empty tensors with no host sync (any device)."""
+    from cudnn.gated_attention_block.kernels.proj_gemm import SMALL_M_MAX, _auto_tile_name
+    from cudnn.gemm.frost import arch_family
+    from cudnn.gemm.frost.tile_config import _sm_count
+
+    with _no_host_sync():
+        blk, aux = _declare(GEOM_FLASH_NEXT, batch, s_q, n_pages=6, index_band=True)
+    g = aux["geom"]
+    t = batch * s_q
+    assert g.n_qkvg == 13952 and g.n_qkvg % 256 != 0 and g.n_qkvg % 128 == 0 and (t <= SMALL_M_MAX) is jit
+    # the resolver the block's predicate reads (its arch-family gate included), at the live part's SM count: on the sm100 family the
+    # small-M route's 128-row swap-AB tile below 218 SMs; the sm120 family keeps the forced-tile fallback, which has no tile off the 256 grid
+    name = _auto_tile_name(t, g.n_qkvg, g.d_model, dtype=BF16, a_major="k", b_major="k", block_scale=False, alpha=False)
+    resolves = name is not None
+    if arch_family.active_family() == "sm100":
+        assert name is None or (name.startswith("CONFIG_sm100_128x") and name.endswith("_swapAB"))
+        # the one-wave boundary the route reads off the live SM count: the slab's 218 64-row tiles overflow the wave of every served part
+        # (<= 212 SMs) -> the small-M tile at T <= 128; a part with 218 SMs or more holds them in one wave and keeps the graph route
+        assert resolves is (jit and _sm_count() < -(-g.n_qkvg // 64)), (_sm_count(), name)
+    assert getattr(blk._proj, "capture_safe", False) is resolves and blk._out_proj.capture_safe is True
+    assert blk._proj.resolves_a_jit_tile() is resolves and blk._out_proj.resolves_a_jit_tile() is True
 
 
 def test_the_sparse_split_rule_fills_the_machine_and_stays_inside_the_item():
     """The split the sparse decode mode lowers with when ``decode_split_kv=None``: enough chunks to put one work item per SM
-    (``ceil(SMs / (B x H_kv x S_q))``), never more than the item's tile count ``ceil((top_k + 1) / 32)`` nor than the measured cap of 8
-    (the 4 x 32K x 1 split sweep on a 212-SM part: the combine's cost grows with the partial count), 1 for a full launch and
+    (``ceil(SMs / (B x H_kv x S_q))``), never more than the item's tile count ``ceil((top_k + 1) / 32)`` nor than the measured cap of 16
+    (the B 1 / B 4 x 32K x S_q 1 split sweeps on a 212-SM part with the pinned decode-grid combine: the step keeps falling to 16-17
+    chunks where the former combine entry, whose cost grows with the partial count, turned up past 16), 1 for a full launch and
     for a non-CUDA reading (0 SMs) -- a performance choice only: the same function under every value."""
+    from cudnn.gated_attention_block.api import SPARSE_DECODE_SPLIT_CAP
     from cudnn.gated_attention_block.api import sparse_decode_split_choice as pick
 
-    assert pick(batch=4, h_kv=2, s_q=1, top_k=512, sm_count=212) == 8  # 212 / 8 = 27 -> the measured cap of 8 (below the 17 tiles of a 512-list item)
-    assert pick(batch=1, h_kv=2, s_q=1, top_k=512, sm_count=212) == 8  # 2 items: the cap again
+    assert SPARSE_DECODE_SPLIT_CAP == 16
+    assert pick(batch=4, h_kv=2, s_q=1, top_k=512, sm_count=212) == 16  # 212 / 8 = 27 -> the measured cap of 16 (below the 17 tiles of a 512-list item)
+    assert pick(batch=1, h_kv=2, s_q=1, top_k=512, sm_count=212) == 16  # 2 items: the cap again
+    assert pick(batch=1, h_kv=2, s_q=1, top_k=256, sm_count=212) == 9  # ceil(257 / 32) = 9 tiles at top_k 256: the item's tile count binds under the cap
+    assert pick(batch=32, h_kv=2, s_q=1, top_k=512, sm_count=212) == 4  # ceil(212 / 64) = 4: the fill rule, under either cap
     assert pick(batch=4, h_kv=2, s_q=4, top_k=512, sm_count=212) == 7  # ceil(212 / 32)
     assert pick(batch=32, h_kv=2, s_q=4, top_k=512, sm_count=212) == 1  # 256 items: a full launch never splits
     assert pick(batch=2, h_kv=2, s_q=1, top_k=64, sm_count=212) == 3  # ceil(65 / 32) = 3 tiles at top_k 64
@@ -929,3 +985,183 @@ def test_capture_of_the_first_execute_replays_bitwise_and_takes_new_lengths_tabl
         ), "the replay over new lengths / tables / lists / slots differs from the eager run over them"
     finally:
         graph.reset()
+
+
+# ---------------------------------------------------------------------------
+# Rubin: the split combine's FORM per grid -- the census names the kernel, two executes bitwise
+# ---------------------------------------------------------------------------
+
+# The kernel names the CUDA profiler reports for the shared combine module's forms (its own pins name them the same way).
+_COMBINE_KERNELS = {
+    "decode_grid": ("cudnn_kernel__combine_decode_grid_kernel",),
+    "lean_walk": ("cudnn_kernel__combine_lean_walk_kernel",),
+    "own": ("cudnn_kernel__combine_kernel", "cudnn_kernel__combine_decode_kernel"),
+}
+# (geometry, S_q, kv_lens, pinned split, the form the sparse stage pins its combine entry to): the decode-grid kernel on a small grid
+# from split 8 (B 2 x 8 heads: 16 lean blocks / 16 rows), the module's own forms on the same grid below split 8, the lean group walk on
+# an overflow grid at split <= 4 (B 6 x 24 heads: 144 lean blocks, past the decode-grid bound of 128), the module's own forms on the
+# B 4 x S_q 4 grid at split 7 (128 rows -- a small grid, but below split 8).
+_COMBINE_FORM_CELLS = [
+    pytest.param(GEOM_SMALL, 1, (2052, 300), 8, "decode_grid", 51, id="B2-Sq1-split8-decode-grid"),
+    pytest.param(GEOM_SMALL, 1, (2052, 300), 4, "own", 52, id="B2-Sq1-split4-own-forms"),
+    pytest.param(GEOM_FLASH_NEXT, 1, (2052, 300, 1000, 77, 4097, 64), 4, "lean_walk", 53, id="B6-Sq1-24-2-split4-lean-walk"),
+    pytest.param(GEOM_SMALL, 4, (2052, 300, 1000, 77), 7, "own", 54, id="B4-Sq4-split7-own-forms"),
+]
+
+
+@requires_rubin
+@pytest.mark.parametrize("geom_kw, s_q, kv_lens, split, form, seed", _COMBINE_FORM_CELLS)
+def test_the_split_combine_takes_the_pinned_form_per_grid_and_two_executes_are_bitwise(geom_kw, s_q, kv_lens, split, form, seed):
+    """The block's sparse stage compiles its split combine with the FORM the adapter pins per plan on the sparse grid ``(B, H_q, S_q)``
+    (``SparseGqaFwdDslSm107.combine_form``: the dense adapter's rule -- the decode-grid kernel on a small grid from split 8, the lean
+    group walk on an overflow grid at split <= 4, the module's own forms otherwise); the CUDA profiler's census of one execute names
+    exactly that combine kernel; the step is within the budget vs the oracle (the gate in the combine), two executes bitwise."""
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
+
+    want = {"decode_grid": comb.DECODE_GRID_AUTO, "lean_walk": comb.DECODE_GRID_LEAN_WALK, "own": comb.DECODE_GRID_OFF}[form]
+    case = _Case(geom_kw, s_q, kv_lens, page=16, seed=seed, split=split, fuse_gate=True, return_lse=True)
+    case.compile()
+    impl = case.blk._sdpa._impl
+    assert case.blk.decode_split_kv == split == impl.split_kv and impl.combine_form() == want == impl._combine_form, (form, impl._combine_form)
+    _two_launches(case, f"combine form {form}")
+    kernels, _ = _cupti_kernels(lambda: case.execute())
+    if kernels is None:
+        pytest.skip("torch.profiler recorded no CUDA event (CUPTI unavailable on this node): the combine kernel's name is unverified here")
+    combines = [k for k in kernels if k.startswith("cudnn_kernel__combine")]
+    assert len(combines) == 1 and combines[0].startswith(_COMBINE_KERNELS[form]), (form, combines)
+    others = tuple(k for f, ks in _COMBINE_KERNELS.items() if f != form for k in ks)
+    assert not combines[0].startswith(others), (form, combines)
+    print(f"\n{case.label()} combine form {form}: the census saw {combines[0]} among {len(kernels)} kernels")
+
+
+_FLAG = "CUDNN_FRONTEND_ENABLE_FROST_ENGINES"
+
+
+@requires_rubin
+def test_capture_of_the_first_execute_on_the_indexer_band_geometry_replays_bitwise_with_the_slab_on_the_small_m_tile(monkeypatch):
+    """The 24 / 2 geometry WITH the indexer band over the pools (N 13952) under the serving stack's defaults: the block compiled with
+    ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES`` DELETED from the environment (the flag is read live at compile; the suite's conftest sets
+    it per test) -- both projections capture-safe on the ``jit-only`` route, the slab on the small-M route's 128-row swap-AB tile
+    (13952 = 109 x 128), no ranked list, no cuDNN handle created -- then its FIRST execute captured on a NEW stream with no eager
+    warm-up under ``set_sync_debug_mode("error")``: the capture launches nothing (``out``, the pools and the raw-key pool untouched),
+    the replay is BITWISE a fresh eager run (``out``, the LSE, the raw indexer key's pool rows), and a new step through the captured
+    tensors (one length a token shorter and one a token longer, a re-laid-out table, new lists / slots / inputs) replays bitwise the
+    eager run over it."""
+    from cudnn.gated_attention_block.kernels import proj_gemm
+    from cudnn.gated_attention_block.kernels.proj_gemm import small_m_tile_config
+
+    monkeypatch.delenv(_FLAG, raising=False)
+    handles_before = dict(proj_gemm._GRAPH_HANDLES)
+    case = _Case(GEOM_FLASH_NEXT, 1, (4096, 60), page=16, seed=51, split=8, fuse_gate=True, return_lse=True, index_band=True)  # fresh: never executed
+    assert case.blk.geom.n_qkvg == 13952 and case.blk._proj.capture_safe and case.blk._out_proj.capture_safe
+    case.blk.check_support()
+    case.blk.compile()
+    for st in (case.blk._proj, case.blk._out_proj):
+        assert st._plan.capture_safe and st._plan.route == "jit-only" and st._plan.jit is not None and st._plan.graph.plans == [], (st.name, st._plan.route)
+    slab = case.blk._proj._plan.tile_config_name
+    assert slab == small_m_tile_config(2, 13952, 2560, dtype=BF16) and slab.startswith("CONFIG_sm100_128x8x128_") and slab.endswith("_swapAB"), slab
+    assert dict(proj_gemm._GRAPH_HANDLES) == handles_before, "the jit-only route created a cuDNN handle"
+    case.ws = torch.full((case.blk.get_workspace_size(),), 0x7F, dtype=torch.uint8, device=_DEV)
+    case.out.fill_(float("nan"))
+    case.lse.fill_(float("nan"))
+    k_before, ix_before = _written(case.k_cache), _written(case.index_cache)
+    torch.cuda.synchronize()
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            prev = torch.cuda.get_sync_debug_mode()
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                case.execute()  # the FIRST execute of this declaration, captured
+            finally:
+                torch.cuda.set_sync_debug_mode(prev)
+        torch.cuda.synchronize()
+        assert torch.isnan(case.out).all() and _written(case.k_cache) == k_before and _written(case.index_cache) == ix_before, "the capture launched work"
+        graph.replay()
+        torch.cuda.synchronize()
+        replayed, replayed_lse, replayed_ix = case.out.clone(), case.lse.clone(), _bits(case.index_cache).clone()
+        case.check(replayed, lse=replayed_lse, what="band replay")
+        case.out.fill_(float("nan"))
+        case.lse.fill_(float("nan"))
+        case.index_cache.fill_(float("nan"))
+        case.execute()
+        torch.cuda.synchronize()
+        assert (
+            torch.equal(_bits(case.out), _bits(replayed)) and torch.equal(case.lse, replayed_lse) and torch.equal(_bits(case.index_cache), replayed_ix)
+        ), "the replay of the captured first execute differs from the eager run"
+        # a NEW step through the captured tensors: one length a token shorter and one a token longer (every slot, list and tail moves;
+        # the page counts stay 256 + 4, so the captured table keeps its shape), a re-laid-out table, new lists / counts / slots / h / RoPE
+        # rows / weights -- the oracle of the new step through a sibling case over the same shapes
+        sib = _Case(GEOM_FLASH_NEXT, 1, (4095, 61), page=16, seed=53, split=8, fuse_gate=True, return_lse=True, index_band=True, n_pages=case.n_pages)
+        assert sib.block_table.shape == case.block_table.shape and sib.k_cache.shape == case.k_cache.shape
+        for name in ("k_cache", "v_cache", "block_table", "kv_lens_t", "slot_mapping", "block_ids", "block_lens", "h", "cos", "sin", "index_cache"):
+            getattr(case, name).copy_(getattr(sib, name))
+        case.w["w_qkvg"].copy_(sib.w["w_qkvg"])
+        case.w["w_o"].copy_(sib.w["w_o"])
+        case.prefix_bits = (_bits(case.k_cache).clone(), _bits(case.v_cache).clone())
+        case.ref_out, case.ref_o_gated, case.ref_lse, case.live_rows, case.kv_lens = sib.ref_out, sib.ref_o_gated, sib.ref_lse, sib.live_rows, sib.kv_lens
+        case.out.fill_(float("nan"))
+        case.lse.fill_(float("nan"))
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        replayed2, replayed2_lse, replayed2_ix = case.out.clone(), case.lse.clone(), _bits(case.index_cache).clone()
+        case.check(replayed2, lse=replayed2_lse, what="band replay over new lengths / table / lists / slots / inputs")
+        case.out.fill_(float("nan"))
+        case.lse.fill_(float("nan"))
+        case.index_cache.fill_(float("nan"))
+        case.execute()
+        torch.cuda.synchronize()
+        assert (
+            torch.equal(_bits(case.out), _bits(replayed2)) and torch.equal(case.lse, replayed2_lse) and torch.equal(_bits(case.index_cache), replayed2_ix)
+        ), "the replay over new lengths / tables / lists / slots differs from the eager run over them"
+    finally:
+        graph.reset()
+
+
+@requires_rubin
+def test_the_band_chain_census_is_one_launch_above_the_band_off_chain_with_the_slab_on_one_small_m_kernel():
+    """The CUPTI census of the 24 / 2 decode step (B 1 x KV 4096, S_q 1, split 8, the gate in the combine) with and without the indexer
+    band: the band-ON chain is exactly ONE kernel longer -- the raw indexer key's separate cache write -- and its slab GEMM is ONE
+    kernel carrying the small-M route's 128-row swap-AB geometry for N 13952 (the kernel symbol spells the config's geometry token).
+    The band-OFF slab carries the route's tile for N 13312 at the part's SM count -- the 64-row ``cluster2x1`` tile where its 208
+    64-row tiles fit one wave (a 212-SM part), the same 128-row tile where they overflow it (a 204-SM part) -- so the two chains differ
+    by the raw-key write alone, or by it plus the slab's name.  No split-K reducer on the slab, no graph-route kernel, no hidden copy
+    on either execute path.  The pin names THIS tree's chain -- slab, norm + RoPE, the K / V cache write [+ the raw-key write], the
+    sparse tile, the combine, the out projection and its split-K reducer: 7 / 8 kernels; ``out`` within the oracle's budget on both."""
+    from collections import Counter
+
+    from cudnn.gemm.frost.tile_config import by_name
+    from cudnn.gated_attention_block.kernels.proj_gemm import small_m_tile_config
+
+    cells = {}
+    for band in (False, True):
+        cells[band] = _Case(GEOM_FLASH_NEXT, 1, (4096,), page=16, seed=61, split=8, fuse_gate=True, index_band=band).compile()
+    k_off, m_off = _cupti_kernels(lambda: cells[False].execute())
+    k_on, m_on = _cupti_kernels(lambda: cells[True].execute())
+    if k_off is None or k_on is None:
+        pytest.skip("torch.profiler recorded no CUDA events (CUPTI unavailable on this node); the launch count is unverified here")
+    print(f"\nband OFF: {len(k_off)} kernels + {len(m_off)} memset/memcpy:\n  " + "\n  ".join(n[:140] for n in k_off))
+    print(f"band ON:  {len(k_on)} kernels + {len(m_on)} memset/memcpy:\n  " + "\n  ".join(n[:140] for n in k_on))
+    geo_on = by_name(small_m_tile_config(1, 13952, 2560, dtype=BF16)).geometry_name  # 128x8x128_..._cluster1x1_1ctamma_swapAB
+    geo_off = by_name(small_m_tile_config(1, 13312, 2560, dtype=BF16)).geometry_name  # 64x8 cluster2x1 at 212 SMs, 128x8 at 204 SMs
+    assert geo_on.startswith("128x8x128_") and "splitK" not in geo_on and geo_on.endswith("_swapAB"), geo_on
+    assert sum(geo_on in n for n in k_on) == 1 and sum(geo_off in n for n in k_off) == 1, (geo_on, geo_off)
+    same_slab = geo_on == geo_off
+    print(f"slab geometry: band ON {geo_on}; band OFF {geo_off} ({'the same tile' if same_slab else 'a different tile'} at this SM count)")
+    if not same_slab:
+        assert not any(geo_on in n for n in k_off) and not any(geo_off in n for n in k_on)
+    extra = Counter(k_on) - Counter(k_off)
+    gone = Counter(k_off) - Counter(k_on)
+    # + the raw-key write (and the slab's name, where the two N resolve to different tiles)
+    assert sum(extra.values()) == (1 if same_slab else 2) and sum(gone.values()) == (0 if same_slab else 1), (extra, gone)
+    assert sum(v for n, v in extra.items() if "frost_cache_write" in n) == 1, extra
+    assert sum("frost_cache_write" in n for n in k_on) == sum("frost_cache_write" in n for n in k_off) + 1
+    assert not any("nvjet" in n.lower() or "cublas" in n.lower() for n in k_on + k_off), "a non-FROST GEMM kernel on the chain"
+    assert not [n for n in m_on + m_off if "memcpy" in n.lower()], "a hidden copy on an execute path"
+    assert (len(k_off), len(k_on)) == (7, 8), (len(k_off), len(k_on))
+    torch.cuda.synchronize()
+    for band, case in cells.items():
+        case.run()
+        case.check(what=f"census band={'on' if band else 'off'}")

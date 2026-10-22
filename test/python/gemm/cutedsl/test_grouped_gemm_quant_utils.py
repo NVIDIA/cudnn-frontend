@@ -10,6 +10,7 @@ Reference: continugous_blockscaled_grouped_gemm_quant.py
 
 import torch
 import pytest
+from gemm.cutedsl.test_grouped_gemm_dsrelu_utils import assert_close_quantized
 from typing import Optional, Tuple, List, Dict, Any
 from core.cutedsl.test_fe_api_utils import (
     ceil_div,
@@ -453,6 +454,7 @@ def run_grouped_gemm_quant_ref(
         ref_sfd_col_rcp_expanded = ref_sfd_col_rcp_expanded[:, :n_col, :]
 
         ref_after_col_quant = torch.einsum("mnl,mnl->mnl", ref_col, ref_sfd_col_rcp_expanded)
+        ref_tensors["d_col_unrounded"] = ref_after_col_quant.clone().permute(1, 0, 2)
 
         ref_col_f8_torch = torch.empty(*(1, valid_m_col, n_col), dtype=torch.uint8, device="cuda").permute(1, 2, 0)
         ref_col_f8 = from_dlpack(ref_col_f8_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1)
@@ -547,9 +549,12 @@ def check_ref_grouped_gemm_quant(
 
             d_gpu = outputs["d_tensor"]
             d_ref = ref_tensors["d_ref"]
-            torch.testing.assert_close(
+            # Keep the unrounded reference so an FP32 accumulation difference
+            # at an FP8 midpoint uses the same policy as grouped dSReLU.
+            assert_close_quantized(
                 d_gpu.cpu().float(),
                 d_ref.to(cfg["d_dtype"]).to(torch.float32).cpu(),
+                d_ref.cpu(),
                 atol=atol,
                 rtol=rtol,
             )
@@ -593,9 +598,10 @@ def check_ref_grouped_gemm_quant(
 
             d_col_gpu = outputs["d_col_tensor"]
             d_col_ref = ref_tensors["d_col_ref"]
-            torch.testing.assert_close(
+            assert_close_quantized(
                 d_col_gpu.cpu().float(),
                 d_col_ref.to(cfg["d_dtype"]).to(torch.float32).cpu(),
+                ref_tensors["d_col_unrounded"].cpu(),
                 atol=atol,
                 rtol=rtol,
             )

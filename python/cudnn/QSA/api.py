@@ -30,6 +30,8 @@ def _implementation(q, direction):
         raise NotImplementedError(reason)
     arch = cc[0] * 10 + cc[1]
     family = 107 if arch == 107 else 100
+    if direction == "bprop" and q.shape[1] == 12:
+        family = 100
     return importlib.import_module(f".kernels.{direction}_sm{family}", __package__), arch
 
 
@@ -43,7 +45,7 @@ def _compact(sel_blocks, lo, hi, block_first, block_last, arch, stream):
 
 
 def _compact_backward(sel_blocks, lo, hi, block_first, block_last, arch, stream, kv_heads):
-    if arch in (100, 103) and kv_heads == 1:
+    if kv_heads == 1:
         from ._metadata import compile_group_kernel
         from .kernels.bprop_sm100 import NQ, BLK_BITS
 

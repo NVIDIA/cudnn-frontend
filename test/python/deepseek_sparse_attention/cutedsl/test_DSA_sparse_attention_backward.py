@@ -226,7 +226,7 @@ def test_DSA_sparse_attention_backward_sm100_auto_dispatch(
 
 @pytest.mark.L0
 def test_DSA_sparse_attention_backward_sm100_h96_dispatch():
-    """Select the H96 composition for ordinary and deterministic execution."""
+    """Select native H96 only inside the validated two-CTA envelope."""
     try:
         from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100 import _select_sm100_backend
     except ImportError:
@@ -235,6 +235,15 @@ def test_DSA_sparse_attention_backward_sm100_h96_dispatch():
     assert _select_sm100_backend(96, 576, max_topk=512) == ("h96_h64_h32", 64)
     assert _select_sm100_backend(96, 576, max_topk=1024) == ("h96_h64_h32", 64)
     assert _select_sm100_backend(96, 576, max_topk=2048, deterministic=True) == ("h96_h64_h32", 64)
+    assert _select_sm100_backend(
+        96,
+        576,
+        head_dim_v=512,
+        dtype=torch.bfloat16,
+        max_topk=2048,
+        device_capability=(10, 0),
+        deterministic=False,
+    ) == ("h96_d576_2cta_m64", 64)
     assert _select_sm100_backend(
         96,
         576,
@@ -253,6 +262,21 @@ def test_DSA_sparse_attention_backward_sm100_h96_dispatch():
         device_capability=(10, 7),
         deterministic=True,
     ) == ("h96_h64_h32", 64)
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_h96_ordinary_skips_padded_dkv_generation():
+    """Ordinary H96 produces 12 useful round operands; deterministic H96 retains its fixed 16."""
+    module = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_h128_d576_2cta")
+    common = (module.BFloat16, 576, 512, 64, 128)
+
+    ordinary_h96 = module.FlashAttentionDSABackwardSm100H128D576TwoCTA(*common, num_heads=96)
+    ordinary_h128 = module.FlashAttentionDSABackwardSm100H128D576TwoCTA(*common, num_heads=128)
+    deterministic_h96 = module.FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic(*common, num_heads=96)
+
+    assert (ordinary_h96.round_gens_per_group, ordinary_h96.round_gens_per_tile) == (3, 12)
+    assert (ordinary_h128.round_gens_per_group, ordinary_h128.round_gens_per_tile) == (4, 16)
+    assert (deterministic_h96.round_gens_per_group, deterministic_h96.round_gens_per_tile) == (4, 16)
 
 
 @pytest.mark.L0
@@ -289,7 +313,7 @@ def test_DSA_sparse_attention_backward_sm100_h96_deterministic_composition():
         (64, 512, "generic_m64", False),
         (64, 576, "generic_m64", False),
         (96, 512, "generic_m64", False),
-        (96, 576, "h96_h64_h32", True),
+        (96, 576, "h96_d576_2cta_m64", True),
         (128, 512, "h128_2cta_m64", False),
     ],
 )
@@ -921,6 +945,101 @@ def test_DSA_sparse_attention_backward_sm100_d576_two_cta_repeat1000(num_heads):
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
 
+@pytest.mark.L2
+def test_DSA_sparse_attention_backward_sm100_h96_d576_uses_i64_query_offsets():
+    """The first Q extent past INT32 element addressing stays finite and exact."""
+    _require_sm100()
+    if torch.cuda.get_device_capability() not in _TWO_CTA_CAPABILITIES:
+        pytest.skip("H96/D576 two-CTA requires compute capability 10.0 or 10.3")
+    try:
+        from cuda.bindings import driver as cuda
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+        return
+
+    num_heads, head_dim, head_dim_v, topk = 96, 576, 512, 2048
+    i32_max = torch.iinfo(torch.int32).max
+    s_q = i32_max // (num_heads * head_dim) + 1
+    assert (s_q - 1) * num_heads * head_dim <= i32_max < s_q * num_heads * head_dim
+    device = torch.device("cuda")
+    try:
+        q = torch.zeros((s_q, num_heads, head_dim), dtype=torch.bfloat16, device=device)
+        kv = torch.zeros((topk, head_dim), dtype=torch.bfloat16, device=device)
+        out = torch.zeros((s_q, num_heads, head_dim_v), dtype=torch.bfloat16, device=device)
+        dout = torch.full_like(out, 1.0 / s_q)
+        q[-1, :, -1] = 2.0
+        kv[0, 0] = 1.0
+        out[:, :, 0] = 0.5
+        # DSA forward LSE covers sparse keys only; backward folds in the sink.
+        lse = torch.zeros((s_q, num_heads), dtype=torch.float32, device=device)
+        attn_sink = torch.zeros((num_heads,), dtype=torch.float32, device=device)
+        topk_idxs = torch.zeros((s_q, topk), dtype=torch.int32, device=device)
+        topk_length = torch.ones((s_q,), dtype=torch.int32, device=device)
+    except torch.OutOfMemoryError:
+        pytest.skip("requires enough GPU memory to cross the INT32 query-offset boundary")
+        return
+    scale = head_dim**-0.5
+
+    plan = DSA.SparseAttentionBackward(
+        q,
+        kv,
+        out,
+        dout,
+        lse,
+        attn_sink,
+        topk_idxs,
+        sample_topk_length=topk_length,
+        softmax_scale=scale,
+        deterministic=True,
+    )
+    assert plan.check_support()
+    assert plan._backend == "h96_d576_2cta_m64"
+    assert plan._wide_addressing
+    plan.compile()
+    try:
+        workspace = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device=device)
+        dq, dkv, d_sink = torch.empty_like(q), torch.empty_like(kv), torch.empty_like(attn_sink)
+    except torch.OutOfMemoryError:
+        pytest.skip("requires enough GPU memory to cross the INT32 query-offset boundary")
+        return
+    dq.fill_(math.nan)
+    dkv.fill_(math.nan)
+    d_sink.fill_(math.nan)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    actual = plan.execute(
+        q,
+        kv,
+        out,
+        dout,
+        lse,
+        attn_sink,
+        topk_idxs,
+        dq,
+        dkv,
+        topk_length=topk_length,
+        softmax_scale=scale,
+        current_stream=stream,
+        workspace=workspace,
+        d_sink=d_sink,
+    )
+    assert actual == (dq, dkv, d_sink)
+    dout_value = float(dout[0, 0, 0])
+    expected_ds = 0.25 * dout_value
+    expected_dq = torch.tensor(expected_ds * scale, dtype=torch.bfloat16, device=device)
+    assert torch.count_nonzero(dq[:, :, 0] != expected_dq).item() == 0
+    assert torch.count_nonzero(dq[:, :, 1:]).item() == 0
+    expected_dv = torch.tensor(0.5 * dout_value * s_q * num_heads, dtype=torch.bfloat16, device=device)
+    assert torch.count_nonzero(dkv[0, :head_dim_v] != expected_dv).item() == 0
+    assert torch.count_nonzero(dkv[0, head_dim_v:-1]).item() == 0
+    expected_tail_dk = torch.tensor(expected_ds * 2.0 * scale * num_heads, dtype=torch.bfloat16, device=device)
+    assert dkv[0, -1] == expected_tail_dk
+    assert torch.count_nonzero(dkv[1:]).item() == 0
+    expected_d_sink = torch.full_like(d_sink, -0.25 * dout_value * s_q)
+    torch.testing.assert_close(d_sink, expected_d_sink, rtol=2e-5, atol=2e-5)
+
+
 @pytest.mark.L1
 @torch_fork_set_rng(seed=20261021)
 def test_DSA_sparse_attention_backward_sm100_h96_d576_topk2048_repeat():
@@ -1186,30 +1305,87 @@ def test_DSA_sparse_attention_backward_sm100_d576_deterministic_workspace_requir
 
 
 @pytest.mark.L0
-def test_DSA_sparse_attention_backward_sm100_ordinary_compile_cache_is_device_scoped(monkeypatch):
-    """Ordinary launchables compiled in one CUDA context are not reused by another."""
+@pytest.mark.parametrize("deterministic", [False, True], ids=["ordinary", "deterministic"])
+def test_DSA_sparse_attention_backward_sm100_compile_cache_is_device_and_address_scoped(monkeypatch, deterministic):
+    """Launchables are isolated by CUDA context and address-width specialization."""
     from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100 as interface
 
-    compile_artifact = interface._compile_nondeterministic_sm100
-    compiled_devices = []
+    compile_artifact = interface._compile_deterministic_sm100 if deterministic else interface._compile_nondeterministic_sm100
+    compiled = []
 
     def fake_compile(device_index, *args, **kwargs):
-        """Return a unique launchable stand-in and record its owning device."""
-        compiled_devices.append(device_index)
+        """Return a unique launchable and record its device/address class."""
+        compiled.append((device_index, kwargs["wide_addressing"]))
         return object()
 
     compile_artifact.cache_clear()
     monkeypatch.setattr(interface, "_compile_sm100_artifact", fake_compile)
-    args = ((10, 0), "generic_m64", torch.bfloat16, 512, 512, 64, 64, True, 64)
+    args = ((10, 0), "generic_m64", torch.bfloat16, 512, 512, 64, 64, True, 32 if deterministic else 64)
     try:
         device0 = compile_artifact(0, *args)
         assert compile_artifact(0, *args) is device0
+        device0_wide = compile_artifact(0, *args, True)
         device1 = compile_artifact(1, *args)
     finally:
         compile_artifact.cache_clear()
 
     assert device1 is not device0
-    assert compiled_devices == [0, 1]
+    assert device0_wide is not device0
+    assert compiled == [(0, False), (0, True), (1, False)]
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm100_d576_compile_cache_separates_address_width(monkeypatch):
+    """The shared H96/H128 D576 compiler never reuses compact code for a wide plan."""
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100_d576 as interface
+
+    compile_artifact = interface._compile_d576_2cta
+    compiled = []
+
+    def fake_compile(*args, **kwargs):
+        compiled.append(object())
+        return compiled[-1]
+
+    compile_artifact.cache_clear()
+    monkeypatch.setattr(interface.cute, "compile", fake_compile)
+    monkeypatch.setattr(interface, "compile_options", lambda: "")
+    args = ((10, 3), 2048, True, False, False, True, 96, 76)
+    try:
+        narrow = compile_artifact(*args)
+        assert compile_artifact(*args) is narrow
+        wide = compile_artifact(*args, True)
+    finally:
+        compile_artifact.cache_clear()
+
+    assert wide is not narrow
+    assert len(compiled) == 2
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm100_address_class_covers_data_and_workspace():
+    """Choose Int64 only when a compact data/workspace offset can overflow."""
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100_common import _requires_wide_data_addressing
+
+    limit = 1 << 31
+    heads, dim, dv = 96, 576, 512
+    safe_q = limit // (heads * dim)
+    common = (2048, dim, dv, heads, 2048, True, "h96_d576_2cta_m64")
+    assert not _requires_wide_data_addressing(safe_q, *common, include_workspace=False)
+    assert _requires_wide_data_addressing(safe_q + 1, *common, include_workspace=False)
+
+    # Top-K indices can be the first tensor to cross the boundary for a small
+    # head count, so their row span participates in the same address class.
+    safe_topk_q = limit // 2048
+    topk_limited = (1, 512, 512, 1, 2048, False, "generic_m64")
+    assert not _requires_wide_data_addressing(safe_topk_q, *topk_limited, include_workspace=False)
+    assert _requires_wide_data_addressing(safe_topk_q + 1, *topk_limited, include_workspace=False)
+
+    # Generic deterministic H64 uses 32 byte-shaped dKV planes at this Q.
+    # KV=32768 occupies exactly 2^31 bytes and remains addressable; one more
+    # row requires the dynamic Int64 workspace descriptor.
+    generic = (1, 512, 512, 64, 2048, True, "generic_m64")
+    assert not _requires_wide_data_addressing(generic[0], 32768, *generic[1:], include_workspace=True)
+    assert _requires_wide_data_addressing(generic[0], 32769, *generic[1:], include_workspace=True)
 
 
 @pytest.mark.L0
@@ -1239,6 +1415,7 @@ def test_DSA_sparse_attention_backward_sm100_artifact_is_shape_dynamic(monkeypat
     compile_artifact.cache_clear()
     first, *_ = _plan_case(64, 512, 64, s_q=8, s_kv=256, has_topk_length=True, deterministic=deterministic)
     first_info = compile_artifact.cache_info()
+    assert not first._wide_addressing
 
     def forbidden_compile(*args, **kwargs):
         """Fail when a dynamic-extent cache hit unexpectedly recompiles."""
@@ -1256,6 +1433,7 @@ def test_DSA_sparse_attention_backward_sm100_artifact_is_shape_dynamic(monkeypat
     )
     second_info = compile_artifact.cache_info()
 
+    assert not second._wide_addressing
     assert second._compiled_kernel is first._compiled_kernel
     assert first_info.misses == second_info.misses == 1
     assert second_info.hits == first_info.hits + 1
@@ -1373,7 +1551,7 @@ def test_DSA_sparse_attention_backward_sm100_h128_two_cta_dispatch_is_fail_close
     assert _select_sm100_backend(128, 512, **supported, deterministic=True) == ("h128_2cta_m64", 64)
     assert _select_sm100_backend(128, 512, **supported, deterministic=True, is_contiguous=False) == ("generic_m64", 64)
     assert _select_sm100_backend(96, 576, **supported, deterministic=True) == ("h96_d576_2cta_m64", 64)
-    assert _select_sm100_backend(96, 576, **supported, deterministic=False) == ("h96_h64_h32", 64)
+    assert _select_sm100_backend(96, 576, **supported, deterministic=False) == ("h96_d576_2cta_m64", 64)
     assert _select_sm100_backend(96, 576, **supported, deterministic=True, is_contiguous=False) == ("h96_h64_h32", 64)
     assert _select_sm100_backend(16, 576, deterministic=True) == ("generic_m64", 64)
 
@@ -1972,8 +2150,8 @@ def test_DSA_sparse_attention_backward_wrapper_h128(topk, has_topk_length, deter
 @pytest.mark.xdist_group(name="gpu_exclusive")
 @pytest.mark.parametrize("has_topk_length", [False, True], ids=["full-topk", "lengths"])
 @torch_fork_set_rng(seed=96)
-def test_DSA_sparse_attention_backward_wrapper_h96_composite(has_topk_length, request):
-    """Validate the H64 plus H32 composition against the FP32 reference."""
+def test_DSA_sparse_attention_backward_wrapper_h96_d576(has_topk_length, request):
+    """Validate the native H96 route, or its device fallback, against the FP32 reference."""
     _run_DSA_sparse_attention_backward_wrapper(
         dtype=torch.bfloat16,
         acc_dtype=torch.float32,
@@ -1989,16 +2167,18 @@ def test_DSA_sparse_attention_backward_wrapper_h96_composite(has_topk_length, re
 @pytest.mark.L0
 @pytest.mark.parametrize("has_topk_length", [False, True], ids=["sentinel-padding", "lengths"])
 @torch_fork_set_rng(seed=960)
-def test_DSA_sparse_attention_backward_sm100_h96_composite_boundaries(has_topk_length, monkeypatch):
-    """Cover empty, partial, and multi-tile rows in both H96 components."""
+def test_DSA_sparse_attention_backward_sm100_h96_native_boundaries(has_topk_length, monkeypatch):
+    """Cover empty, partial, and multi-tile rows in the native H96 backend."""
     _require_sm100()
+    if torch.cuda.get_device_capability() not in _TWO_CTA_CAPABILITIES:
+        pytest.skip("H96 two-CTA requires compute capability 10.0 or 10.3")
     try:
         from cudnn import DSA
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     device = torch.device("cuda")
-    s_q, s_kv, topk_width = 4, 129, 256
+    s_q, s_kv, topk_width = 4, 129, 512
     num_heads, head_dim = 96, 576
     softmax_scale = 1.0 / math.sqrt(head_dim)
     lengths = torch.tensor([0, 1, 65, 129], dtype=torch.int32, device=device)
@@ -2054,7 +2234,7 @@ def test_DSA_sparse_attention_backward_sm100_h96_composite_boundaries(has_topk_l
         atol=5e-2,
         rtol=5e-2,
     )
-    _assert_prepared_sm100_backend(prepared_calls, "h96_h64_h32")
+    _assert_prepared_sm100_backend(prepared_calls, "h96_d576_2cta_m64")
 
 
 @pytest.mark.parametrize(
@@ -4289,6 +4469,7 @@ def test_DSA_sparse_attention_backward_sm90_execute_allocates_nothing_and_never_
         pytest.param(32, 576, 64, False, "off", "h32_m64", id="h32"),
         pytest.param(64, 576, 64, False, "off", "generic_m64", id="h64"),
         pytest.param(96, 576, 64, False, "off", "h96_h64_h32", id="h96"),
+        pytest.param(96, 576, 128, False, "off", "h96_d576_2cta_m64", id="h96-d576-2cta"),
         pytest.param(128, 512, 64, False, "off", "generic_m64", id="h128-generic"),
         pytest.param(128, 512, 128, False, "off", "h128_2cta_m64", id="h128-2cta"),
         pytest.param(128, 576, 128, False, "off", "h128_d576_2cta_m64", id="h128-d576-2cta"),

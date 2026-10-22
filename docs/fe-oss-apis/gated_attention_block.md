@@ -265,8 +265,12 @@ Served today:
 
 - the layout: `qkvg_blocks` / `qkvg_block_widths` / `qkvg_offsets` / `qkvg_heads` / `qkvg_head_dims` grow a fifth entry iff
   `index_band` (at `d_model=2560, h_q=24, h_kv=2`: `N = 13312 + 640 = 13952`, offsets `0, 6144, 12288, 12800, 13312`; a
-  256-column tile plan is not defined there, a 64- or 128-column one is); a geometry without the band keeps exactly its four-band
-  tuples. Enumerate `geometry.qkvg_blocks`, never `ProjBlock` itself.
+  256-column tile plan is not defined there, a 64- or 128-column one is -- at decode row counts, `B x S_q <= 128`, the slab GEMM
+  takes the small-M route's 128-row swap-AB tile, 109 CTAs, so the band declaration over the pools compiles with the opt-in flag
+  unset and is capture-safe like the four-band one; past 128 rows the band slab keeps the graph route.  The route reads the
+  part's SM count: the 128-row tile is its overflow branch, taken where the slab's 218 64-row tiles exceed one wave -- every
+  served part (<= 212 SMs); a part with 218 or more SMs would keep the band slab on the graph route at every row count); a
+  geometry without the band keeps exactly its four-band tuples. Enumerate `geometry.qkvg_blocks`, never `ProjBlock` itself.
 - the loader: `qkvg_from_hf(..., index_qk_proj_weight=attn.index_qk_proj.weight)` and `build_fused_qkvg_weight(...,
   index_qk_proj_weight=)` append the band (required iff declared, refused otherwise); `qkvg_from_vllm` takes it the same way, or
   appended to the merged weight's rows (a serving stack that packs the indexer projection into its QKV GEMM).
@@ -496,6 +500,29 @@ within `tol` of the row's k-th oracle score, `tol` the measured perturbation of 
 operands (not a tuned number); the same against the HF-rounding oracle (the pooled key cast to bf16 before its norm); the
 queries and compressed keys within one bf16 ulp of the once-rounded fp32 chain; the count rule on every row; and attention
 EXACT given the kernel's selection -- the block oracle on the kernel's list within the dense suites' budgets.
+
+**The paged decode scorer (standalone).** The first piece of that decode-step indexer ships on its own:
+`cudnn.gated_attention_block.qsa_select_paged.qsa_select_decode_paged(qi, kbar, block_table, kv_lens, seq_q=1, top_k=512)`
+scores a decode step's `seq_q` indexer query rows per sequence (`qi [B x seq_q, index_heads, 128]` bf16) against the compressed
+keys of the complete 4-token blocks each row can see, read from the PAGED compressed-key cache the serving stacks keep on the
+main block table (`kbar [num_pages, page_size / 4, 1, 128]` bf16: block `j` of sequence `b` is row `j % (page_size / 4)` of page
+`block_table[b, j // (page_size / 4)]`; a power-of-two page size of at least 8), and selects the `top_k` per row with the
+deterministic radix top-k. Row `s` of sequence `b` sits at position `kv_lens[b] - seq_q + s` and sees
+`counts = clamp(floor((pos + 1) / 4), 0, n_blocks_max)` complete blocks; the scorer kernel writes `logits[t, 0:counts[t]]`
+(`scale x sum_h relu(qi[t, h] . kbar[b, j])` in fp32: the ReLU-summed, head-reduced indexer score) and the counts on device -- no torch
+prologue -- and the top-k returns `block_ids [T, top_k]` int32 in ASCENDING order with `-1` past `block_lens = min(top_k, counts)`
+(ties to the smaller id), so two calls are bitwise. A `-1` table entry under a visible block reads as a zero key (logit 0);
+a padding sequence (`kv_lens == 0`) writes nothing but its counts (0) and never reads the cache. The scorer kernel alone
+(`kernels.qsa_score_paged.compile_qsa_score_paged` / `run_qsa_score_paged`: one warp-level `mma.sync.m16n8k16` per 8 keys x 16 D
+over the `seq_q x index_heads` query rows padded to 16 -- the query tile staged once per CTA in shared memory behind one CTA
+barrier, the keys streamed by `cp.async` through a per-warp ring into the B fragments; the programmatic-dependent-launch pair under
+`use_pdl`) runs on any CuTe DSL device from sm_80; the paired selector needs the radix top-k's cc 9.0. The e4m3 indexer cache is a
+typed decline by name (the paged scorer's e4m3 read arm is a follow-up); `units_per_warp` (1 / 2 / 4 / 8 units of 32 compressed rows
+per warp, default 1) and `use_pdl` are performance knobs -- the same function. The entry's
+module imports no CuTe DSL: the DSL floor, the `sm_107a` target on cc 10.7 and the radix top-k's cc 9.0 are typed
+`NotImplementedError`s raised BEFORE the kernel module is imported, so the import path resolves on the public 4.6.2 wheel too;
+`stream` takes a `torch.cuda.Stream`, a raw stream handle or `None` (torch's current stream), and every torch operation of the
+call runs on it. The dense-cache form of this selection and the in-block binding of this scorer are follow-ups.
 
 **The CuTe DSL floor.** The Rubin sparse core needs the public `nvidia-cutlass-dsl` 4.8.0 wheel (the `sm_107a`
 target); below it `check_support()` raises a typed `NotImplementedError` that names the installed version, BEFORE any
@@ -1149,7 +1176,7 @@ sparse core runs one work item per query row: no 32-row cap, no decode-tile rout
 `sample_block_table` must be CONTIGUOUS (the sparse core binds the whole `[B, max_pages]` table, and `execute(block_table=)` is
 exactly that table -- a row slice of a wider table is a typed `ValueError`); `return_lse` is served (`[B, H_q, S_q]` fp32,
 natural log); `fuse_gate` is served at every split (the core's epilogue unsplit, the split combine otherwise); `decode_split_kv`
-is `None` (the fill rule: `ceil(SMs / (B x H_kv x S_q))` chunks, at most `min(8, ceil((top_k + 1) / 32))` -- the cap from a split sweep on a 212-SM part) or an int in
+is `None` (the fill rule: `ceil(SMs / (B x H_kv x S_q))` chunks, at most `min(16, ceil((top_k + 1) / 32))` -- the cap from the B 1 / B 4 x 32K x S_q 1 split sweeps on a 212-SM part with the pinned decode-grid combine) or an int in
 `[1, ceil((top_k + 1) / 32)]` -- the one performance knob (fp32 partials inside `get_workspace_size()`, one combine launch), the
 same function under every value; `max_kv_len` keeps its contract (at most the table's reach).  Typed declines: the packed
 (`thd=True`) form (the serving table's `sparse` row: the sparse core serves packed sequences and paged pools one at a time), the
@@ -1161,7 +1188,8 @@ shared and 8 / 64 per row, `B` 1 / 2 / 4, `kv_lens` up to 20000 with dead and sh
 on all three layouts, bf16 / f16, splits 1 / 2 / 4 / 17 and the rule, the gate fused and separate, the LSE, the indexer band's
 raw-key write-through, the 24 / 2 Flash-Next geometry; the MTP residues on a short sequence; the block's form BITWISE the
 standalone adapter on the same views; the workspace sentinel; CUDA-graph capture of the first execute and the replay over new
-lengths / tables / lists / slots / inputs bitwise eager).
+lengths / tables / lists / slots / inputs bitwise eager -- on the four-band geometry and on the indexer-band one at N 13952, whose
+slab rides the small-M route's 128-row tile; the band chain's launch census one above the band-off chain's, the raw-key write).
 
 ### Backward
 
@@ -1488,14 +1516,17 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
   GEMM plan's ranked list is built at `compile()` -- not once at `import cudnn` -- and a host module must never set it for
   the process (it flips every opt-in engine into every FE graph the process builds). The block does not need it: a dense
   bf16 / f16 projection whose `N` the forced 256-wide GEMM tile divides (`n_qkvg`, `d_model` and `h_q * d_head` all
-  `% 256 == 0`, as at every served geometry) compiles with the flag UNSET on FROST's JIT-only route (`plan.route ==
-  "jit-only"`: no backend plan, no cuDNN handle at execute; `frost_gemm` never enters a ranked list), and the block-scale
-  (MXFP8 / fp4-weight) projections log a warning and take the same route. With the flag set a plain declaration's backend
-  admits the graph and pins the same JIT by name (`graph+jit`); a `capture_safe=True` declaration never enters the ranked
-  list whatever the flag says. What still needs the flag: a dense shape WITHOUT a forced tile (the graph
-  route IS the plan there) and the per-tensor-fp8 projections -- a `RuntimeError` at `compile()` whose message names the
-  flag (the GEMM plan is built there, not at `check_support()`). Nothing ever falls back to a cuDNN backend plan, so an
-  unset flag is never a silently slower block. The SDPA stage binds its FROST class directly and does not consult the flag.
+  `% 256 == 0`, as at every served geometry), or whose shape the small-M route names a tile for (`B x S_q <= 128` on a dense
+  bf16 / f16 projection whose N the route's tile grid divides -- the indexer band's 13952-column slab included: 109 x 128-row
+  tiles), compiles with the flag UNSET on FROST's JIT-only route
+  (`plan.route == "jit-only"`: no backend plan, no cuDNN handle at execute; `frost_gemm` never enters a ranked list), and the
+  block-scale (MXFP8 / fp4-weight) projections log a warning and take the same route. With the flag set a plain declaration's
+  backend admits the graph and pins the same JIT by name (`graph+jit`); a `capture_safe=True` declaration never enters the
+  ranked list whatever the flag says. What still needs the flag: a dense shape WITHOUT a JIT tile (the graph route IS the plan
+  there: the band slab past 128 rows, an N off both tile grids) and the per-tensor-fp8 projections -- a `RuntimeError` at
+  `compile()` whose message names the flag (the GEMM plan is built there, not at `check_support()`). Nothing ever falls back
+  to a cuDNN backend plan, so an unset flag is never a silently slower block. The SDPA stage binds its FROST class directly and
+  does not consult the flag.
 - CUDA-graph capture of a serving stack (the FIRST execute of a fresh declaration captured on a NEW stream, with no eager
   warm-up): on the forced-tile JIT route the captured first execute launches nothing and replays bitwise an eager run; the
   GRAPH GEMM route (no forced tile) creates a cuDNN handle at its first execute per `(device, stream)`, which cannot happen
@@ -1505,8 +1536,11 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
   `build_proj_gemm(capture_safe=True)`, never enters the ranked list -- no backend plan, no FROST-engine compile, whether
   the flag is set or not -- so the plan is on the JIT route by construction: a refused forced compile is a typed
   `NotImplementedError` naming the tile and the reason, never the warning + graph-heuristic fallback the plain declaration
-  takes. The quantized block's first-execute scale write is NOT refused under capture (the warm-up / re-capture contract
-  above is the rule): `test_block_serving_capture.py`.
+  takes. The block sets `capture_safe` on each dense projection stage of a paged declaration iff the driver's `auto` resolver
+  names a JIT tile for the stage's own shape -- so the indexer band's slab (N 13952) is capture-safe at decode row counts
+  through the small-M route (the band capture / replay cell of `test_block_qsa_decode.py`) and eager past 128 rows, where a
+  capture is the driver's typed refusal. The quantized block's first-execute scale write is NOT refused under capture (the
+  warm-up / re-capture contract above is the rule): `test_block_serving_capture.py`.
 - Rubin (SM107) only; cuDNN 9.x, `nvidia-cutlass-dsl >= 4.8.0.dev0` (the Rubin arch names), torch.
 - Backward: bf16 / fp16 (both against fp64 autograd on Rubin: `test_block_backward.py`) -- and per-tensor fp8 over the fp8
   training record (`quant=QuantSpec`: bf16 `dy` and gradients, dense or packed (`thd=True`), any `B*S`, head counts the TMA Q / K rebuild tiles),

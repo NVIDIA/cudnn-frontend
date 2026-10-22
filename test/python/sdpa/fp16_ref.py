@@ -298,13 +298,12 @@ def compute_ref_backward(
     if dropout_prob != 0.0:
         assert dropout_mask is not None, "PyTorch reference must have dropout_mask for dropout"
 
-    # Pass 1: row log-sum-exp (includes the sink as a virtual first column).
+    # Pass 1: row maximum and shifted sum (includes the sink as a virtual first column).
     m_old, l_old = _init_softmax_state(b, h_q, s_q, sink_token, device)
     for _, _, s_block in _score_blocks(q, k, attn_scale, mask):
         m_new = torch.maximum(m_old, s_block.max(dim=-1, keepdim=True).values)
         l_old = l_old * torch.exp(m_old - m_new).nan_to_num() + torch.exp(s_block - m_new).nan_to_num().sum(dim=-1, keepdim=True)
         m_old = m_new
-    lse = m_old + torch.log(l_old)
 
     # D = sum(o * dO, dim=-1)
     D = (o * dO).sum(dim=-1, keepdim=True)
@@ -315,9 +314,11 @@ def compute_ref_backward(
     dBias = torch.zeros((1, h_q, s_q, s_kv), dtype=torch.float32, device=device) if bias is not None else None
 
 
-    # Pass 2: P = exp(S - lse) per block; all-masked rows give exp(-inf - -inf) -> nan -> 0.
+    # Keep the maximum and normalizer separate: adding log(l_old) to a large
+    # row maximum loses low bits in FP32 and can change dS's half rounding.
+    # All-masked rows give exp(-inf - -inf) / 0 -> nan -> 0.
     for start, end, s_block in _score_blocks(q, k, attn_scale, mask):
-        p = torch.exp(s_block - lse).nan_to_num()
+        p = (torch.exp(s_block - m_old) / l_old).nan_to_num()
 
         # dP = dO @ V^T, then apply dropout mask
         dP = _qk(dO, v[:, :, start:end, :], h_v)
@@ -347,7 +348,7 @@ def compute_ref_backward(
     dSink_token = None
     if sink_token is not None:
         sink = sink_token.to(dtype=torch.float32, device=device).expand(b, h_q, s_q, 1)
-        p_sink = torch.exp(sink - lse).nan_to_num()
+        p_sink = (torch.exp(sink - m_old) / l_old).nan_to_num()
         if mask.q_row_mask is not None:
             p_sink = p_sink.masked_fill(mask.q_row_mask, 0.0)
         dSink_token = (-p_sink * D).sum(dim=(0, 2), keepdim=True)

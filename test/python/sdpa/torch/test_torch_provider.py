@@ -31,21 +31,21 @@ if not torch.cuda.is_available():
     pytest.skip("CUDA device required", allow_module_level=True)
 
 try:
-    from torch.nn.attention import SDPBackend, activate_flash_attention_impl, restore_flash_attention_impl, sdpa_kernel
+    from torch.nn.attention import SDPBackend, sdpa_kernel
     from torch.nn.attention.varlen import AuxRequest, varlen_attn
 except ImportError:
-    pytest.skip("torch.nn.attention flash-impl registry required (torch >= 2.13)", allow_module_level=True)
+    pytest.skip("torch.nn.attention.varlen required (torch >= 2.13)", allow_module_level=True)
 
 import torch.nn.functional as F  # noqa: E402
 
-import cudnn.torch as provider  # noqa: E402  (registers the "CUDNN" provider)
+import cudnn.torch as provider  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
 def _activate_provider():
-    activate_flash_attention_impl("CUDNN")
+    overrides = provider.install_sdpa_overrides()
     yield
-    restore_flash_attention_impl()
+    overrides.remove()
 
 
 def math_ref(q, k, v, is_causal, scale, enable_gqa=False):

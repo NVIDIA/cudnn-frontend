@@ -13,7 +13,13 @@ import cutlass.cute as cute
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream, torch_stream_context
 
-from ._interface_sm100_common import _BLACKWELL_CAPABILITIES, _align_workspace_bytes, _workspace_shapes_sm100, flash_attn_bwd_sm100_workspace_size
+from ._interface_sm100_common import (
+    _BLACKWELL_CAPABILITIES,
+    _align_workspace_bytes,
+    _requires_wide_data_addressing,
+    _workspace_shapes_sm100,
+    flash_attn_bwd_sm100_workspace_size,
+)
 
 BACKEND = "h128_d576_2cta_m64"
 H96_BACKEND = "h96_d576_2cta_m64"
@@ -59,6 +65,7 @@ def _compile_d576_2cta(
     deterministic: bool = False,
     num_heads: int = 128,
     compact_slots: int = 74,
+    wide_addressing: bool = False,
 ):
     """Compile from metadata; sequence extents and scale remain runtime inputs."""
     if device_capability not in _BLACKWELL_CAPABILITIES:
@@ -74,13 +81,41 @@ def _compile_d576_2cta(
         """Fake compact row-major tensor whose leading extent stays symbolic."""
         return cute.runtime.make_fake_compact_tensor(dtype, shape, stride_order=tuple(reversed(range(len(shape)))), assumed_align=alignment)
 
-    q = tensor(cutlass.BFloat16, (sq, num_heads, 576))
-    kv = tensor(cutlass.BFloat16, (skv, 576))
-    out = tensor(cutlass.BFloat16, (sq, num_heads, 512))
-    lse = tensor(cutlass.Float32, (sq, num_heads), 8)
-    sink = tensor(cutlass.Float32, (num_heads,))
-    indices = tensor(cutlass.Int32, (sq, max_topk))
-    lengths = tensor(cutlass.Int32, (sq,), 4) if has_topk_length else None
+    def runtime_tensor(dtype, rank, alignment=16, divisibility=1):
+        """Mirror the dynamic DLPack tensor type rebound by the executor."""
+        shape = [cute.sym_int() for _ in range(rank)]
+        if divisibility != 1:
+            shape[-1] = cute.sym_int(divisibility=divisibility)
+        stride = [cute.sym_int64(divisibility=divisibility) for _ in range(rank - 1)] + [1]
+        return cute.runtime.make_fake_tensor(dtype, tuple(shape), tuple(stride), assumed_align=alignment)
+
+    if wide_addressing:
+        q = runtime_tensor(cutlass.BFloat16, 3, divisibility=576)
+        kv = runtime_tensor(cutlass.BFloat16, 2, divisibility=576)
+        out = runtime_tensor(cutlass.BFloat16, 3, divisibility=512)
+        dout = runtime_tensor(cutlass.BFloat16, 3, divisibility=512)
+        lse = runtime_tensor(cutlass.Float32, 2, 8)
+        sink = runtime_tensor(cutlass.Float32, 1)
+        lengths = runtime_tensor(cutlass.Int32, 1, 4) if has_topk_length else None
+        dq = runtime_tensor(cutlass.BFloat16, 3, divisibility=576)
+        dkv = runtime_tensor(cutlass.BFloat16, 2, divisibility=576)
+        d_sink = runtime_tensor(cutlass.Float32, 1)
+        indices = cute.runtime.make_fake_tensor(
+            cutlass.Int32,
+            (cute.sym_int(), max_topk),
+            (cute.sym_int64(divisibility=max(max_topk, 1)), 1),
+            assumed_align=16,
+        )
+    else:
+        q = tensor(cutlass.BFloat16, (sq, num_heads, 576))
+        kv = tensor(cutlass.BFloat16, (skv, 576))
+        out = tensor(cutlass.BFloat16, (sq, num_heads, 512))
+        dout = out
+        lse = tensor(cutlass.Float32, (sq, num_heads), 8)
+        sink = tensor(cutlass.Float32, (num_heads,))
+        lengths = tensor(cutlass.Int32, (sq,), 4) if has_topk_length else None
+        dq, dkv, d_sink = q, kv, sink
+        indices = tensor(cutlass.Int32, (sq, max_topk))
     # Deterministic dKV scratch exceeds 2 GiB for long sequences. Its byte
     # extent must remain wide when TVM-FFI binds the caller-owned workspace.
     stats_workspace = tensor(cutlass.Uint8, (cute.sym_int64(),))
@@ -104,14 +139,14 @@ def _compile_d576_2cta(
         q,
         kv,
         out,
-        out,
+        dout,
         lse,
         sink,
         indices,
         lengths,
-        q,
-        kv,
-        sink,
+        dq,
+        dkv,
+        d_sink,
         stats_workspace,
         dkv_workspace,
         cutlass.Float32(1.0),
@@ -253,6 +288,17 @@ def flash_attn_bwd_sm100_d576_2cta(
             deterministic,
             num_heads,
             compact_slots,
+            _requires_wide_data_addressing(
+                sq,
+                skv,
+                576,
+                512,
+                num_heads,
+                max_topk,
+                deterministic,
+                H96_BACKEND if num_heads == 96 else BACKEND,
+                include_workspace=False,
+            ),
         )
         current_stream = resolve_stream(current_stream)
         with torch_stream_context(current_stream):
