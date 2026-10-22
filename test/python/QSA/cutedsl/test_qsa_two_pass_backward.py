@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for the GQA index-list sparse (QSA) backward on SM100 / SM103, ``cudnn.DSA.GqaSparseAttentionBackward``."""
+"""Tests for the GQA index-list sparse (QSA) backward on SM100 / SM103, the internal two-pass backend."""
 
 from unittest.mock import patch
 
@@ -9,10 +9,11 @@ import pytest
 import torch
 from cuda.bindings import driver as cuda
 
+from cudnn.QSA.two_pass.api import _QsaTwoPassBackward, _backward
 from cudnn.api_base import TensorDesc
 from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
 
-from deepseek_sparse_attention.cutedsl.qsa_reference import assert_grads_close, make_inputs, reference_backward
+from QSA.cutedsl.two_pass_reference import assert_grads_close, make_inputs, reference_backward
 
 _INPUT_NAMES = ("q", "k", "v", "out", "dout", "lse", "topk_idxs")
 
@@ -56,10 +57,9 @@ def _check_against_reference(inputs, grads):
     ],
 )
 def test_qsa_backward_matches_reference(seq_len, grad_scale):
-    from cudnn import DSA
 
     inputs = make_inputs(seq_len, seed=seq_len, grad_scale=grad_scale)
-    grads = DSA.gqa_sparse_attention_backward_wrapper(*(inputs[name] for name in _INPUT_NAMES))
+    grads = _backward(*(inputs[name] for name in _INPUT_NAMES))
     _check_against_reference(inputs, (grads["dq"], grads["dk"], grads["dv"]))
 
 
@@ -68,17 +68,15 @@ def test_qsa_backward_matches_reference(seq_len, grad_scale):
 @pytest.mark.xdist_group(name="gpu_exclusive")
 @pytest.mark.parametrize("seq_len", [65536, 262144])
 def test_qsa_backward_long_sequences(seq_len):
-    from cudnn import DSA
 
     inputs = make_inputs(seq_len, seed=seq_len)
-    grads = DSA.gqa_sparse_attention_backward_wrapper(*(inputs[name] for name in _INPUT_NAMES))
+    grads = _backward(*(inputs[name] for name in _INPUT_NAMES))
     _check_against_reference(inputs, (grads["dq"], grads["dk"], grads["dv"]))
 
 
 @pytest.mark.L0
 def test_wrapper_on_explicit_stream_with_preallocated_outputs(monkeypatch):
-    from cudnn import DSA
-    from cudnn.deepseek_sparse_attention.gqa_sparse_attention_backward import qsa_bwd_sm100 as kernel
+    from cudnn.QSA.two_pass import qsa_bwd_sm100 as kernel
 
     streams = []
     launch = kernel.launch
@@ -97,7 +95,7 @@ def test_wrapper_on_explicit_stream_with_preallocated_outputs(monkeypatch):
     dq, dk, dv = torch.empty_like(inputs["q"]), torch.empty_like(inputs["k"]), torch.empty_like(inputs["v"])
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
-    grads = DSA.gqa_sparse_attention_backward_wrapper(*args, dq=dq, dk=dk, dv=dv, stream=cuda.CUstream(side.cuda_stream))
+    grads = _backward(*args, dq=dq, dk=dk, dv=dv, stream=cuda.CUstream(side.cuda_stream))
     torch.cuda.current_stream().wait_stream(side)
     assert streams == [side.cuda_stream] * 9  # one launch per kernel of the dense + sparse sequence
     assert grads["dq"] is dq and grads["dk"] is dk and grads["dv"] is dv
@@ -107,14 +105,13 @@ def test_wrapper_on_explicit_stream_with_preallocated_outputs(monkeypatch):
 @pytest.mark.L0
 @pytest.mark.parametrize("seq_len", [4099, 28000])  # the dense-only and the dense + sparse launch sequences
 def test_execute_allocates_nothing_and_never_synchronizes(seq_len, monkeypatch, compile_allocates_nothing):
-    from cudnn import DSA
-    from cudnn.deepseek_sparse_attention.gqa_sparse_attention_backward import qsa_bwd_sm100 as kernel
+    from cudnn.QSA.two_pass import qsa_bwd_sm100 as kernel
 
     # An empty artifact cache makes this a cold compile.
     monkeypatch.setattr(kernel, "_COMPILED", {})
     inputs = make_inputs(seq_len, seed=5)
     args = [inputs[name] for name in _INPUT_NAMES]
-    plan = DSA.GqaSparseAttentionBackward(*args)
+    plan = _QsaTwoPassBackward(*args)
     assert plan.check_support()
     compile_allocates_nothing(plan)
     outputs = [torch.empty_like(inputs[name]) for name in ("q", "k", "v")]
@@ -135,15 +132,14 @@ def test_execute_allocates_nothing_and_never_synchronizes(seq_len, monkeypatch, 
 @pytest.mark.L0
 @pytest.mark.parametrize("seq_len", [4099, 28000])  # the dense-only and the dense + sparse launch sequences
 def test_first_execute_under_cuda_graph_capture_replays_new_inputs(seq_len, monkeypatch):
-    from cudnn import DSA
-    from cudnn.deepseek_sparse_attention.gqa_sparse_attention_backward import qsa_bwd_sm100 as kernel
+    from cudnn.QSA.two_pass import qsa_bwd_sm100 as kernel
 
     # Fresh artifacts make the capture hold their first launch.
     monkeypatch.setattr(kernel, "_COMPILED", {})
     first, second = make_inputs(seq_len, seed=21), make_inputs(seq_len, seed=22)
     static = {name: first[name].clone() for name in _INPUT_NAMES}
     args = [static[name] for name in _INPUT_NAMES]
-    plan = DSA.GqaSparseAttentionBackward(*args)
+    plan = _QsaTwoPassBackward(*args)
     plan.compile()
     grads = [torch.empty_like(first[name]) for name in ("q", "k", "v")]
     workspace = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda")
@@ -159,11 +155,10 @@ def test_first_execute_under_cuda_graph_capture_replays_new_inputs(seq_len, monk
 
 @pytest.mark.L0
 def test_execute_requires_workspace_and_compiled_contract():
-    from cudnn import DSA
 
     inputs = make_inputs(64, seed=7)
     args = [inputs[name] for name in _INPUT_NAMES]
-    plan = DSA.GqaSparseAttentionBackward(*args)
+    plan = _QsaTwoPassBackward(*args)
     plan.compile()
     outputs = [torch.empty_like(inputs[name]) for name in ("q", "k", "v")]
     with pytest.raises(ValueError, match="workspace"):
@@ -200,26 +195,23 @@ def _with(descs, name, **changes):
     ],
 )
 def test_check_support_declines(name, changes, error, match):
-    from cudnn import DSA
 
     descs = _with(_sample_descs(), name, **changes)
     with pytest.raises(error, match=match):
-        DSA.GqaSparseAttentionBackward(*(descs[n] for n in _INPUT_NAMES)).check_support()
+        _QsaTwoPassBackward(*(descs[n] for n in _INPUT_NAMES)).check_support()
 
 
 @pytest.mark.L0
 def test_check_support_declines_other_softmax_scales():
-    from cudnn import DSA
 
     descs = _sample_descs()
-    assert DSA.GqaSparseAttentionBackward(*(descs[n] for n in _INPUT_NAMES), softmax_scale=1 / 16).check_support()
+    assert _QsaTwoPassBackward(*(descs[n] for n in _INPUT_NAMES), softmax_scale=1 / 16).check_support()
     with pytest.raises(NotImplementedError, match="softmax_scale"):
-        DSA.GqaSparseAttentionBackward(*(descs[n] for n in _INPUT_NAMES), softmax_scale=0.1).check_support()
+        _QsaTwoPassBackward(*(descs[n] for n in _INPUT_NAMES), softmax_scale=0.1).check_support()
 
 
 @pytest.mark.L0
 def test_check_support_bounds_the_sequence_length():
-    from cudnn import DSA
 
     seq_len = (2**31 - 1) // (24 * 256) + 1
     descs = {}
@@ -235,18 +227,17 @@ def test_check_support_bounds_the_sequence_length():
         stride = tuple(int(torch.tensor(shape[i + 1 :]).prod()) for i in range(len(shape)))
         descs[name] = TensorDesc(dtype, shape, stride, tuple(reversed(range(len(shape)))), torch.device("cuda", torch.cuda.current_device()))
     with pytest.raises(ValueError, match="sequence length"):
-        DSA.GqaSparseAttentionBackward(*(descs[n] for n in _INPUT_NAMES)).check_support()
+        _QsaTwoPassBackward(*(descs[n] for n in _INPUT_NAMES)).check_support()
 
 
 @pytest.mark.L0
 def test_old_dsl_and_other_architecture_rejected():
-    from cudnn import DSA
 
     descs = _sample_descs()
     old_dsl = (True, ("nvidia-cutlass-dsl", "4.6.2"))
     with patch("cudnn.frost.buffers.cutedsl_state", return_value=old_dsl):
         with pytest.raises(NotImplementedError, match="4.7"):
-            DSA.GqaSparseAttentionBackward(*(descs[n] for n in _INPUT_NAMES)).check_support()
+            _QsaTwoPassBackward(*(descs[n] for n in _INPUT_NAMES)).check_support()
     with patch.object(torch.cuda, "get_device_capability", return_value=(9, 0)):
         with pytest.raises(NotImplementedError, match="SM100"):
-            DSA.GqaSparseAttentionBackward(*(descs[n] for n in _INPUT_NAMES)).check_support()
+            _QsaTwoPassBackward(*(descs[n] for n in _INPUT_NAMES)).check_support()

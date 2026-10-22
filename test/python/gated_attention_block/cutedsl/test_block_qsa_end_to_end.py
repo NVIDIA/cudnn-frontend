@@ -1386,7 +1386,7 @@ def test_indexer_execute_allocates_nothing_of_its_own_and_never_synchronizes(cac
     caching allocator's ``allocation.all.allocated`` moves by exactly ``torch.sort``'s index template, ONE per 4096-row window of the row
     sort per execute (torch builds an ``arange(top_k)`` int64 inside ``sort`` even into preallocated outputs: its own transient, measured
     by wrapping ``torch.sort``), and by nothing else (Rule 1), with no host sync (Rule 3).  The e4m3 arm pays nothing the bf16 arm does
-    not: its padded scale prefix is a plan constant handed to ``qsa_select``; the standalone selector without one derives it per call, and
+    not: its padded scale prefix is a plan constant handed to ``qsa_select_forward``; the standalone selector without one derives it per call, and
     the same census sees THAT allocate -- the detector is live -- and with the plan's prefix handed in it is quiet."""
     from cudnn.gated_attention_block.api import _QSA_SORT_ROWS
 
@@ -1440,7 +1440,7 @@ def test_indexer_execute_allocates_nothing_of_its_own_and_never_synchronizes(cac
         f"R9 census ({cache_dtype}): block 3 executes {n1 - n0} allocation(s), torch.sort's own {sort_allocs[0]} over {sort_calls[0]} windows, the block's own 0"
     )
     if cache_dtype is E4M3:
-        from cudnn.gated_attention_block.qsa_select import qsa_select
+        from cudnn.QSA.selection import qsa_select_forward
 
         st = blk._indexer
         v = st.views(ws, blk._layout())
@@ -1455,10 +1455,10 @@ def test_indexer_execute_allocates_nothing_of_its_own_and_never_synchronizes(cac
             cand_batch_offsets=st._const["cand_batch_offsets"],
         )
         m0 = stat()
-        qsa_select(v["qi8"], v["kbar8"], st._const["cu_seqlens_q"], **sel_kw)  # the standalone form: the prefix derived per call
+        qsa_select_forward(v["qi8"], v["kbar8"], st._const["cu_seqlens_q"], **sel_kw)  # the standalone form: the prefix derived per call
         m1 = stat()
         assert m1 > m0, "the detector is dead: the standalone e4m3 selector without a precomputed prefix made no allocation"
-        qsa_select(v["qi8"], v["kbar8"], st._const["cu_seqlens_q"], cu_seqlens_q_scale_padded=st._const["cu_seqlens_q_scale_padded"], **sel_kw)
+        qsa_select_forward(v["qi8"], v["kbar8"], st._const["cu_seqlens_q"], cu_seqlens_q_scale_padded=st._const["cu_seqlens_q_scale_padded"], **sel_kw)
         m2 = stat()
         assert m2 == m1, f"the e4m3 selector allocated {m2 - m1} block(s) although the scale prefix was handed in"
         torch.cuda.synchronize()

@@ -68,3 +68,42 @@ multiplications to int64: the original failed and the control passed all three
 forward checks. The default command keeps the original baseline and its failure.
 The labeled 128K table in [results.md](results.md) uses the Int64-only control;
 those ratios are not unchanged-Miles results.
+
+## Unchanged Relax reference
+
+Use the public `qsa_mixed_ops` directory at Relax commit
+[`d16f2e3`](https://github.com/xiaoliang0601/Relax/tree/d16f2e3ec45be059db6377295090b1d49257892c/relax/backends/megatron/megatron_patch/qsa_mixed_ops).
+Its unchanged `grouped.py` has SHA256
+`2168d82a28514243fe015d0e6e45ad6487c06c9350936814f2937dee9d583f36`.
+The same grouped source is present at `77f717d`.
+
+```bash
+python benchmark/qsa/benchmark_relax.py \
+  --relax-source /path/to/Relax/relax/backends/megatron/megatron_patch/qsa_mixed_ops \
+  --frontend-source "$PWD" --indexed --lengths 131072 --output relax-128k.json
+```
+
+Omit `--indexed` to compare the bitmap API. Use `--lengths 4099,8193` for unaligned
+packed boundaries. `--frontend-source` verifies the actual imported checkout;
+it raises if an editable install still points elsewhere. The harness loads both
+external files unchanged, records input/source hashes, creates BF16 4Q/D128
+indexer scores, selects 512 complete causal blocks, and appends the incomplete
+tail. It does not substitute the Miles implementation for the Relax baseline.
+
+All six outputs must pass cross-comparison and an independent chunked FP32
+oracle before any timings are emitted. Relax backward consumes the saved state from its own `grouped._Grouped.forward`
+call; native backward consumes `out_fp32` and `lse` from its own QSA forward call
+(`qsa_indexed_forward` with `--indexed`). Both timing orders are retained, and native outputs are checked
+again after timing. Reported times cover warm full attention calls, including
+allocations, metadata, backward preparation and final casts. They exclude
+compilation, selector/top-k, token expansion and framework/TP overhead. Peak
+extra allocated bytes are measured over the same live fixture state; bitmap
+and token-index fixtures remain live in this comparison. Metadata sizes are
+also reported explicitly. These figures are synthetic component measurements.
+
+For selector and route-expansion attribution, run Relax's own unchanged
+`examples/models/qwen3.8-flash-next/benchmark_qsa.py` with both `--selector eager`
+and `--selector compile`. That script models a selector TP row shard and forces
+grouped attention over the full pack. It excludes full projection/pooling/RoPE,
+collectives, the mixed Flash/Flex dispatcher, and model training. The BF16-input
+DSA wide-top-k draft is not a direct replacement for these FP32 selector scores.

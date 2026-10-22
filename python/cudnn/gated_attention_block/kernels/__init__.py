@@ -43,7 +43,7 @@ stage of the pipeline in ``api.py``::
                                 counts -- the input contract of the decode top-k; one warp-level mma.sync per 8 keys x 16 D over
                                 the (s, h) query rows padded to 16, the query tile staged once per CTA (one CTA barrier), the keys
                                 streamed by cp.async through a per-warp SMEM ring, any CuTe DSL device from sm_80; its standalone selector
-                                ``qsa_select_decode_paged`` (scorer + radix top-k) is the DSL-free host entry ``../qsa_select_paged.py``,
+                                ``qsa_select_decode_paged_forward`` (scorer + radix top-k) is the DSL-free host entry ``../../QSA/selection_paged.py``,
                                 which also owns the kernel's host-side facts and gates the DSL floor BEFORE importing this module (Rule 7)
 
 **The SDPA stage owns no file here.**  It drives the shipped forward adapter
