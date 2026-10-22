@@ -1002,6 +1002,7 @@ def make_sdpa_helpers(
     lpt_head_group: int = 1,
     lpt_q_tiles: int = 0,
     kv_shared_cluster: bool = False,
+    thd_work_prefix=None,
 ) -> SdpaHelpers:
     """Decode / bounds / THD closures for a flavor.
 
@@ -1231,6 +1232,13 @@ def make_sdpa_helpers(
         return scalar_seqlen_q
 
     _thd_on = int(getattr(CFG, "THD_VARLEN", 0))
+    # THD unit decode through the setup launch's remap-ordered work prefix (a
+    # binary search) instead of the O(B) walk over every sequence. The
+    # predicate's paged-split path by default; a flavor whose host ALSO writes
+    # the prefix (setup launch ``work_prefix`` + ``sdpa_operand_tensors``
+    # ``work_prefix``) opts in with ``thd_work_prefix=True`` -- the three must
+    # agree, or the decode reads an unwritten table.
+    _thd_prefix_on = bool(thd_work_prefix_enabled(CFG)) if thd_work_prefix is None else bool(thd_work_prefix)
 
     @cute.jit
     def _thd_decode_prefix(linear_cta, meta_t, n_batch, n_qh, cta_in_pair):
@@ -1272,7 +1280,7 @@ def make_sdpa_helpers(
 
     @cute.jit
     def _thd_decode(linear_cta, seq_kv_lens_t, n_batch, n_qh, cta_in_pair):
-        if cutlass.const_expr(thd_work_prefix_enabled(CFG)):
+        if cutlass.const_expr(_thd_prefix_on):
             return _thd_decode_prefix(linear_cta, seq_kv_lens_t, n_batch, n_qh, cta_in_pair)
         u = linear_cta // cutlass.Int32(CFG.CGA_M)
         split = cutlass.Int32(0)

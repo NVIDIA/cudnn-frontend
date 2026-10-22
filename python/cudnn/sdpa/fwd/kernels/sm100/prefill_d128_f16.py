@@ -355,7 +355,14 @@ THD_PERSISTENT = True
 # count must be in CGA-tile (cluster) units (q_tiles = n_q_supers // CTA_MMA),
 # not per-CTA super-row units; the legacy default over-counts by CTA_MMA and
 # scrambles LPT tile assignment (cf. ctm_lpt_decode_qtiles_bug; dsv4/qwen sm100).
-_sdpa_h = make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units=True)
+# THD unit decode through the setup launch's remap-ordered work prefix (binary
+# search) instead of the O(B) walk over every sequence: that walk is a chain of
+# dependent metadata loads plus integer divisions per sequence, re-run by every
+# decoding warp at every unit, and it dominates short-unit batches (B >= 32
+# sequences of 2-3 KV tiles each). The same constant drives the setup launch
+# (which writes the prefix) and the operand view (which sizes the metadata).
+_THD_WORK_PREFIX = bool(CFG.THD_VARLEN)
+_sdpa_h = make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units=True, thd_work_prefix=_THD_WORK_PREFIX)
 _decode_initial = _sdpa_h.decode_initial
 _decode_payload = _sdpa_h.decode_payload
 # qtrim variant: collapses the KV loop for CGA tiles entirely past the
@@ -3478,6 +3485,7 @@ def _host(
         thd=CFG.THD_VARLEN,
         split_kv=SPLIT_KV,
         tensor_map_qwords=_TENSOR_MAP_QWORDS,
+        work_prefix=_THD_WORK_PREFIX,
         paged=PAGED_KV,
         page_size=PAGE_SIZE,
         block_table_ptr=block_table_ptr,
@@ -3597,6 +3605,7 @@ def _host(
             # Prefix requests can have short Q but long KV. Schedule their
             # expensive tiles first; full prefill has identical Q/KV ordering.
             rank_by_kv=PAGED_KV and bool(CFG.BOTTOM_RIGHT) and (CFG.MASK_FLAGS & MASK_SWA) == 0,
+            work_prefix=_THD_WORK_PREFIX,
         ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
     else:
