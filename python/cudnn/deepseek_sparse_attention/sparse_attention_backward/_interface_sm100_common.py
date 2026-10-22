@@ -69,6 +69,7 @@ def _requires_wide_data_addressing(
     head_dim: int,
     head_dim_v: int,
     num_heads: int,
+    max_topk: int,
     deterministic: bool,
     backend: Optional[str],
     *,
@@ -85,6 +86,7 @@ def _requires_wide_data_addressing(
         total_s_q * num_heads * head_dim,
         total_s_q * num_heads * head_dim_v,
         total_s_q * num_heads,
+        total_s_q * max_topk,
         total_s_kv * head_dim,
     ]
     if include_workspace:

@@ -241,6 +241,7 @@ class SparseAttentionBackward(APIBase):
                 head_dim,
                 head_dim_v,
                 num_heads,
+                self.topk_idxs_desc.shape[1],
                 self.deterministic,
                 self._backend,
                 include_workspace=self._backend not in _iface_d576.BACKENDS,

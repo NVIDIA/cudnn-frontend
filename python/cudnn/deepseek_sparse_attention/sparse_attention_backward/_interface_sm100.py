@@ -239,6 +239,12 @@ def _compile_sm100_artifact(
         d_sink = _fake_runtime_tensor(cutlass.Float32, 1)
         workspace_lse = _fake_runtime_tensor(cutlass.Uint8, 4)
         workspace_dkv = _fake_runtime_tensor(cutlass.Uint8, 4)
+        indices = cute.runtime.make_fake_tensor(
+            cutlass.Int32,
+            (cute.sym_int(), max_topk),
+            (cute.sym_int64(divisibility=max(max_topk, 1)), 1),
+            assumed_align=16,
+        )
     else:
         q = _fake_compact_tensor(element_dtype, (total_s_q, num_heads, head_dim))
         kv = _fake_compact_tensor(element_dtype, (total_s_kv, head_dim))
@@ -250,7 +256,7 @@ def _compile_sm100_artifact(
         dq, dkv, d_sink = q, kv, sink
         workspace_lse = _fake_compact_tensor(cutlass.Uint8, (1, num_heads, cute.sym_int(), 8))
         workspace_dkv = _fake_compact_tensor(cutlass.Uint8, (1, dkv_planes, cute.sym_int(), head_dim * 4))
-    indices = _fake_compact_tensor(cutlass.Int32, (total_s_q, max_topk))
+        indices = _fake_compact_tensor(cutlass.Int32, (total_s_q, max_topk))
     problem_shape = (
         cutlass.Int32(1),
         cutlass.Int32(1),

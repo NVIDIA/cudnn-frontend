@@ -100,6 +100,12 @@ def _compile_d576_2cta(
         dq = runtime_tensor(cutlass.BFloat16, 3, divisibility=576)
         dkv = runtime_tensor(cutlass.BFloat16, 2, divisibility=576)
         d_sink = runtime_tensor(cutlass.Float32, 1)
+        indices = cute.runtime.make_fake_tensor(
+            cutlass.Int32,
+            (cute.sym_int(), max_topk),
+            (cute.sym_int64(divisibility=max(max_topk, 1)), 1),
+            assumed_align=16,
+        )
     else:
         q = tensor(cutlass.BFloat16, (sq, num_heads, 576))
         kv = tensor(cutlass.BFloat16, (skv, 576))
@@ -109,7 +115,7 @@ def _compile_d576_2cta(
         sink = tensor(cutlass.Float32, (num_heads,))
         lengths = tensor(cutlass.Int32, (sq,), 4) if has_topk_length else None
         dq, dkv, d_sink = q, kv, sink
-    indices = tensor(cutlass.Int32, (sq, max_topk))
+        indices = tensor(cutlass.Int32, (sq, max_topk))
     # Deterministic dKV scratch exceeds 2 GiB for long sequences. Its byte
     # extent must remain wide when TVM-FFI binds the caller-owned workspace.
     stats_workspace = tensor(cutlass.Uint8, (cute.sym_int64(),))
@@ -288,6 +294,7 @@ def flash_attn_bwd_sm100_d576_2cta(
                 576,
                 512,
                 num_heads,
+                max_topk,
                 deterministic,
                 H96_BACKEND if num_heads == 96 else BACKEND,
                 include_workspace=False,
