@@ -92,6 +92,13 @@ def test_accumulation_matches_fp64(dt, causal, sq, sk):
     _case(dt=dt, causal=causal, b=2, h=3, sq=sq, sk=sk, accumulation=True)
 
 
+@pytest.mark.parametrize("dt", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+def test_accumulation_single_key_numerics(dt):
+    """One key: the oracle's dQ / dK are identically zero, so they are compared by absolute tolerance; dV keeps the fp64 gate."""
+    _require_accumulation()
+    _case(dt=dt, b=2, h=3, sq=65, sk=1, accumulation=True, allow_zero=True)
+
+
 @pytest.mark.parametrize("dt,causal", [(torch.bfloat16, False), (torch.float16, True)], ids=["bf16-unmasked", "fp16-causal"])
 def test_negative_scale_preserves_recompute_route(dt, causal):
     _require_accumulation()
