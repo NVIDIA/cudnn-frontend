@@ -316,7 +316,7 @@ The backward implementation builds a bucketed K-to-Q CSR task layout on the
 GPU. `bucket_size_blocks` is an optional tuning override; leaving it unset uses
 the backend default.
 
-With contiguous per-row count metadata, at least two KV blocks and at least
+For blk64, with contiguous per-row count metadata, at least two KV blocks and at least
 1024 (batch, head, KV block) tasks, backward pairs KV neighborhoods to reuse
 common Q/dO loads and dQ accumulation; smaller problems do not recover the
 per-call pairing cost and use regular tasks.
@@ -340,8 +340,11 @@ target GPU are required before drawing performance conclusions.
 
 Backward defaults to blk64 on SM90 and blk128 on SM100/SM103. Pass the same
 explicit `sparse_block_size` used by forward when selecting the Blackwell blk64
-path. SM100/SM103 blk128 backward does not yet consume `block_sizes`; it
-therefore requires full physical KV blocks and `block_sizes=None`.
+path. SM100/SM103 blk128 backward accepts one-dimensional `block_sizes`
+(`int32`, shape `(N_kv,)`) and masks each KV block's padded suffix consistently
+with forward. Valid tokens occupy the prefix of each physical block; callers
+zero `dout` for padded queries and discard their outputs. SM110 blk128 backward
+still requires `block_sizes=None`.
 
 ## Current support
 

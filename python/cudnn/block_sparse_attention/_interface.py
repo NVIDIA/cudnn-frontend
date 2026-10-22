@@ -2999,9 +2999,9 @@ def bsa_attn_bwd(
 
     if arch // 10 != 9 and sparse_block_size == SM100_BLK128_BWD_SPARSE_BLOCK_SIZE:
         if bucket_size_blocks is None or bucket_size_blocks <= 0:
-            bucket_size_blocks = sm100_blk128_bwd_default_bucketed_k2q_size_blocks(
-                num_q_blocks,
-                num_heads,
+            # Long sequences benefit from fewer Q groups and dK/dV postprocessing passes.
+            bucket_size_blocks = (
+                2048 if arch in (100, 103) and num_q_blocks >= 1500 else sm100_blk128_bwd_default_bucketed_k2q_size_blocks(num_q_blocks, num_heads)
             )
         bucketed_k2q_offsets, bucketed_k2q_indices, _num_q_groups, _max_k2q_rows_per_group = _build_bucketed_k2q_csr(
             q2k_block_index,
@@ -3009,6 +3009,7 @@ def bsa_attn_bwd(
             num_kv_blocks,
             bucket_size_blocks=bucket_size_blocks,
             q2k_block_nums=q2k_block_nums,
+            parallel_offsets=arch in (100, 103),
         )
         dq_out, dk_out, dv_out = bsa_sm100_blk128_bwd_bucketed_k2q_csr(
             dout_bwd,
@@ -3023,6 +3024,7 @@ def bsa_attn_bwd(
             dq=dq_bwd,
             dk=dk_bwd,
             dv=dv_bwd,
+            block_sizes=maybe_contiguous(block_sizes),
         )
         if layout == "bshd":
             return (
