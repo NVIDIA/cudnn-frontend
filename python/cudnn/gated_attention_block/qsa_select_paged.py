@@ -325,6 +325,12 @@ def qsa_select_decode_paged(
         )
     t, h_i, d = (int(x) for x in qi.shape)
     batch, max_pages = (int(x) for x in block_table.shape)
+    # the table's device and column stride and the lengths' form HERE, ahead of the gates below and the compile: a malformed operand is the
+    # operand-form ValueError, never a NotImplementedError from a gate it reached first, and never a kernel import / compile before the error
+    # (the kernel runner re-checks the same facts at the launch)
+    if int(block_table.stride(1)) != 1 or block_table.device != qi.device:
+        raise ValueError(f"block_table needs a unit column stride on {qi.device}, got strides {tuple(block_table.stride())} on {block_table.device}")
+    _check_i32_1d(kv_lens, "kv_lens", batch, qi.device)
     if d != INDEX_HEAD_DIM or (kbar.dim() == 4 and int(kbar.shape[3]) != INDEX_HEAD_DIM) or (kbar.dim() == 3 and int(kbar.shape[2]) != INDEX_HEAD_DIM):
         raise ValueError(f"qsa_select_decode_paged scores head_dim {INDEX_HEAD_DIM} indexer heads, got qi {tuple(qi.shape)} and kbar {tuple(kbar.shape)}")
     rows_per_page = int(kbar.shape[1])

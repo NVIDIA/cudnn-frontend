@@ -463,6 +463,20 @@ def test_selector_form_checks_name_the_fault():
         fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, scale=0.0, **kw)
     with pytest.raises(ValueError, match="block_table must be an int32"):
         fd.qsa_select_decode_paged(case.qi, case.pool, case.table.to(torch.int64), case.kv_lens, **kw)
+    with pytest.raises(ValueError, match="block_table needs a unit column stride"):
+        fd.qsa_select_decode_paged(case.qi, case.pool, case.table.t().contiguous().t(), case.kv_lens, **kw)
+    with pytest.raises(ValueError, match=r"kv_lens must be an int32 \[2\]"):
+        fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens.to(torch.int64), **kw)
+    with pytest.raises(ValueError, match=r"kv_lens must be an int32 \[2\]"):
+        fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens[:1], **kw)
+    with pytest.raises(ValueError, match="kv_lens must be contiguous"):
+        fd.qsa_select_decode_paged(case.qi, case.pool, case.table, torch.stack([case.kv_lens, case.kv_lens], 1)[:, 0], **kw)
+    if torch.cuda.device_count() > 1:
+        other_dev = torch.device("cuda", 1 if torch.device(_DEV).index in (None, 0) else 0)
+        with pytest.raises(ValueError, match="kv_lens must live on"):
+            fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens.to(other_dev), **kw)
+        with pytest.raises(ValueError, match="block_table needs a unit column stride on"):
+            fd.qsa_select_decode_paged(case.qi, case.pool, case.table.to(other_dev), case.kv_lens, **kw)
     with pytest.raises(ValueError, match="units_per_warp must be one of"):
         fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, units_per_warp=3, **kw)
     with pytest.raises(ValueError, match="one compressed row"):
@@ -901,7 +915,7 @@ def test_selector_with_another_device_current():
         assert torch.cuda.current_device() == other
     torch.cuda.synchronize(target)
     _assert_scorer(case, logits, counts, lens)
-    wrong = sp.compile_qsa_score_paged(h_i=H, s_q=3, page_size=16, device=other)
+    wrong = r._replace(device=other)  # the same artifact re-labelled for the other device: the runner's check reads the recipe's device
     with pytest.raises(ValueError, match="compiled for CUDA device"):
         sp.run_qsa_score_paged(
             wrong,
