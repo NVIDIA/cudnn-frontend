@@ -1771,7 +1771,7 @@ def _sm100_d128_spec() -> EngineSpec:
     """Dense and packed d128 with plan-time prepared implementation selection.
 
     Dense MHA declarations retain the SM100-106 envelope. Packed or grouped
-    accumulation requires exact SM100, DSL >= 4.8 and positive FP32 scale.
+    accumulation requires SM100 or SM103, DSL >= 4.8 and positive FP32 scale.
     Grouped variants fold native per-Q-head dK/dV partials in FP32.
     """
     return EngineSpec(
