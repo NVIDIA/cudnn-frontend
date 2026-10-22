@@ -2,6 +2,10 @@
 
 The internal backend in `cudnn.QSA.two_pass` computes the gradients of the original
 12Q/1KV or 24Q/2KV, D256 QSA geometry on SM100/SM103. It requires CuTeDSL >= 4.7.0.
+The 12Q/1KV sparse path additionally requires the CUDA 13 compiler flavor
+(`pip install 'nvidia-cutlass-dsl[cu13]>=4.7.0'` and a CUDA 13 compatible driver);
+the CUDA 12 flavor is rejected before its known compiler crash. The 24Q/2KV
+path also supports the CUDA 12 flavor.
 It supports one sequence or packed documents described by int32 `cu_seqlens`
 and a host upper bound `max_seq_len`. For the public packed training interface,
 use [indexed QSA](qsa_indexed.md). These are implementation notes,
@@ -13,9 +17,10 @@ device. The softmax scale is fixed at `1 / 16`.
 
 | Tensor | Shape | Dtype |
 |---|---|---|
-| Q, saved out, dout, dQ | `[T, 12 * Hkv, 256]` | BF16 |
+| Q, dout, dQ | `[T, 12 * Hkv, 256]` | BF16 |
 | K, V, dK, dV | `[T, Hkv, 256]` | BF16 |
-| Natural-log LSE | `[T, 12 * Hkv]` | FP32 |
+| Saved output | `[T, 12 * Hkv, 256]` | FP32 (preferred) or BF16 |
+| Natural-log LSE | `[12 * Hkv, T]` with FP32 saved output; `[T, 12 * Hkv]` with BF16 saved output | FP32 |
 | topk_idxs | `[T, 2051]` or `[T, 2052]` | int32 |
 
 For row `i` at position `p` in its sequence, the indices contain `min((p+1)//4, 512)` distinct complete
@@ -25,9 +30,12 @@ of four relative to the sequence origin. Each selected block belongs to that
 sequence's causal prefix. Token IDs address rows of the packed buffer. Up to `T=2051`,
 every row contains its entire causal prefix. The kernel derives the tail from
 the query position; it does not validate these device-value relationships.
-`1 <= T <= floor(INT32_MAX / (12 * Hkv * 256))` is supported. This selection format and the saved BF16
-output differ from the bitmap and indexed APIs; their saved tensors cannot be
-substituted directly.
+`1 <= T <= floor(INT32_MAX / (12 * Hkv * 256))` is supported. The FP32 saved-output mode reads the same output dtype and head-major LSE
+layout as the public FE/Miles-oriented interface natively, without a cast or
+repack. The BF16 mode retains the earlier internal saved-state contract.
+Selection remains restricted to the canonical complete-block-plus-tail format
+above, and packed execution also needs `cu_seqlens`; this backend is not yet
+dispatched by the more general public bitmap or indexed entry points.
 
 The query-major pass computes dQ and writes BF16 P/dS records. An inverted
 block-to-query index lets the key-major pass accumulate dK/dV locally instead

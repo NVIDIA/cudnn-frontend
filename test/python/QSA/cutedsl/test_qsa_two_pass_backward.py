@@ -19,11 +19,16 @@ _INPUT_NAMES = ("q", "k", "v", "out", "dout", "lse", "topk_idxs")
 
 
 @pytest.fixture(autouse=True)
-def supported_device():
+def supported_device(request):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("QSA backward requires SM100 or SM103")
     if cutedsl_too_old(cutedsl_state()[1]):
         pytest.skip("QSA backward requires CuTe DSL >= 4.7.0")
+    if getattr(request.node, "callspec", None) is not None and request.node.callspec.params.get("h_kv") == 1:
+        from cudnn.QSA.two_pass.api import _dsl_cuda_version
+
+        if _dsl_cuda_version()[0] < 13:
+            pytest.skip("QSA 12Q/1KV requires the CUDA 13 build of CuTe DSL")
 
 
 def _metadata(tensor):
@@ -85,11 +90,42 @@ def test_qsa_backward_packed_sequences(cu_seqlens, h_kv):
 
 
 @pytest.mark.L0
-def test_qsa_backward_accepts_the_padded_index_width():
+@pytest.mark.parametrize("h_kv", [1, 2])
+def test_qsa_backward_accepts_the_padded_index_width(h_kv):
     # 2052 columns: the fourth tail slot is never read, only the row stride changes
-    inputs = make_inputs(24000, seed=11, h_kv=1, width=2052)
+    inputs = make_inputs(24000, seed=11, h_kv=h_kv, width=2052)
     grads = _backward(*(inputs[name] for name in _INPUT_NAMES))
     _check_against_reference(inputs, (grads["dq"], grads["dk"], grads["dv"]))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("h_kv", [1, 2])
+@pytest.mark.parametrize("grad_scale", [1.0, 1e-7])
+@pytest.mark.parametrize("seq_len, cu_seqlens", [(4099, None), (32769, None), (32769, [0, 3, 32769])])
+def test_fp32_output_and_head_major_lse(seq_len, cu_seqlens, h_kv, grad_scale):
+    inputs = make_inputs(
+        seq_len,
+        seed=seq_len,
+        h_kv=h_kv,
+        cu_seqlens=cu_seqlens,
+        width=2052,
+        grad_scale=grad_scale,
+        saved_output_dtype=torch.float32,
+    )
+    grads = _backward(*(inputs[name] for name in _INPUT_NAMES), cu_seqlens=inputs.get("cu_seqlens"), max_seq_len=seq_len)
+    _check_against_reference(inputs, tuple(grads))
+
+
+@pytest.mark.L0
+def test_native_head_major_lse_needs_only_scalar_alignment():
+    inputs = make_inputs(17, seed=42, h_kv=2, saved_output_dtype=torch.float32)
+    storage = torch.empty(inputs["lse"].numel() + 1, dtype=torch.float32, device="cuda")
+    lse = storage[1:].view_as(inputs["lse"])
+    lse.copy_(inputs["lse"])
+    inputs["lse"] = lse
+    assert lse.data_ptr() % 16 == 4
+    grads = _backward(*(inputs[name] for name in _INPUT_NAMES))
+    _check_against_reference(inputs, tuple(grads))
 
 
 @pytest.mark.L0
@@ -109,11 +145,12 @@ def test_two_pass_records_workspace_is_bounded(h_kv, num_seqs):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("h_kv", [1, 2])
-def test_packed_window_graph_rebuilds_changed_sequence_metadata(h_kv):
+@pytest.mark.parametrize("saved_output_dtype", [torch.bfloat16, torch.float32])
+def test_packed_window_graph_rebuilds_changed_sequence_metadata(h_kv, saved_output_dtype):
     # The same plan crosses windows for one input, has only dense queries for
     # the next, then crosses sparse windows and sequence origins on the third.
     bounds = ([0, 3, 32769], [0, 16384, 32769], [0, 2, 32769])
-    samples = [make_inputs(32769, seed=101 + i, h_kv=h_kv, cu_seqlens=cu) for i, cu in enumerate(bounds)]
+    samples = [make_inputs(32769, seed=101 + i, h_kv=h_kv, cu_seqlens=cu, saved_output_dtype=saved_output_dtype) for i, cu in enumerate(bounds)]
     static = {name: value.clone() for name, value in samples[0].items()}
     args = [static[name] for name in _INPUT_NAMES]
     plan = _QsaTwoPassBackward(*args, sample_cu_seqlens=static["cu_seqlens"], max_seq_len=32769)
@@ -174,12 +211,13 @@ def test_wrapper_on_explicit_stream_with_preallocated_outputs(monkeypatch):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("seq_len", [4099, 28000])  # the dense-only and the dense + sparse launch sequences
-def test_execute_allocates_nothing_and_never_synchronizes(seq_len, monkeypatch, compile_allocates_nothing):
+@pytest.mark.parametrize("saved_output_dtype", [torch.bfloat16, torch.float32])
+def test_execute_allocates_nothing_and_never_synchronizes(seq_len, saved_output_dtype, monkeypatch, compile_allocates_nothing):
     from cudnn.QSA.two_pass import qsa_bwd_sm100 as kernel
 
     # An empty artifact cache makes this a cold compile.
     monkeypatch.setattr(kernel, "_COMPILED", {})
-    inputs = make_inputs(seq_len, seed=5)
+    inputs = make_inputs(seq_len, seed=5, saved_output_dtype=saved_output_dtype)
     args = [inputs[name] for name in _INPUT_NAMES]
     plan = _QsaTwoPassBackward(*args)
     assert plan.check_support()
@@ -274,10 +312,24 @@ def test_check_support_declines(name, changes, error, match):
 
 
 @pytest.mark.L0
-def test_check_support_accepts_both_head_counts():
-    for h_kv in (1, 2):
-        descs = _sample_descs(h_kv=h_kv)
-        assert _QsaTwoPassBackward(*(descs[n] for n in _INPUT_NAMES)).check_support()
+@pytest.mark.parametrize("h_kv", [1, 2])
+def test_check_support_accepts_both_head_counts(h_kv):
+    descs = _sample_descs(h_kv=h_kv)
+    assert _QsaTwoPassBackward(*(descs[n] for n in _INPUT_NAMES)).check_support()
+
+
+@pytest.mark.L0
+def test_one_kv_head_declines_the_cuda12_compiler(monkeypatch):
+    from cudnn.QSA.two_pass import api
+
+    monkeypatch.setattr(api, "_dsl_cuda_version", lambda: (12, 9))
+    descs = _sample_descs(seq_len=24000, h_kv=1)
+    with pytest.raises(NotImplementedError, match="CUDA 13 build"):
+        _QsaTwoPassBackward(*(descs[n] for n in _INPUT_NAMES)).check_support()
+    descs = _sample_descs(h_kv=1)  # dense-only geometry does not compile the affected key kernel
+    assert _QsaTwoPassBackward(*(descs[n] for n in _INPUT_NAMES)).check_support()
+    descs = _sample_descs(h_kv=2)
+    assert _QsaTwoPassBackward(*(descs[n] for n in _INPUT_NAMES)).check_support()
 
 
 @pytest.mark.L0

@@ -22,6 +22,12 @@ SOFTMAX_SCALE = HEAD_DIM**-0.5
 _SUPPORTED_CAPABILITIES = ((10, 0), (10, 3))
 
 
+def _dsl_cuda_version() -> tuple[int, int]:
+    from cutlass.base_dsl.version_info import CUDA_VERSION
+
+    return CUDA_VERSION.major, CUDA_VERSION.minor
+
+
 def _byte_span(tensor: torch.Tensor) -> tuple[int, int]:
     # Exact for the contiguous layouts check_support admits.
     return tensor.data_ptr(), tensor.data_ptr() + tensor.numel() * tensor.element_size()
@@ -41,7 +47,8 @@ class _QsaTwoPassBackward(APIBase):
     p the row's position in its sequence (the four ids of a block are consecutive and the blocks start at the
     sequence's first token), then the ``(p + 1) % 4`` tail tokens, then ``-1``. Up to 2051 tokens every row is
     therefore its whole causal prefix. The kernels read the block ids only and derive the tail block from the
-    position. Rows that break this layout are not checked.
+    position. Rows that break this layout are not checked. FP32 saved output pairs with head-major ``[Hq, T]`` LSE
+    and is read natively; BF16 saved output pairs with the earlier token-major ``[T, Hq]`` LSE contract.
     """
 
     def __init__(
@@ -49,9 +56,9 @@ class _QsaTwoPassBackward(APIBase):
         sample_q: torch.Tensor,  # (T, 12 * H_kv, 256) bf16
         sample_k: torch.Tensor,  # (T, H_kv, 256) bf16, H_kv in (1, 2)
         sample_v: torch.Tensor,  # (T, H_kv, 256) bf16
-        sample_out: torch.Tensor,  # (T, 12 * H_kv, 256) bf16
+        sample_out: torch.Tensor,  # (T, 12 * H_kv, 256) bf16 or fp32
         sample_dout: torch.Tensor,  # (T, 12 * H_kv, 256) bf16
-        sample_lse: torch.Tensor,  # (T, 12 * H_kv) fp32, natural-log LSE of the scaled scores
+        sample_lse: torch.Tensor,  # fp32 natural-log LSE: (Hq, T) with fp32 out, otherwise (T, Hq)
         sample_topk_idxs: torch.Tensor,  # (T, 2051) or (T, 2052) int32
         sample_dq: Optional[torch.Tensor] = None,
         sample_dk: Optional[torch.Tensor] = None,
@@ -107,15 +114,18 @@ class _QsaTwoPassBackward(APIBase):
             f"{self.__class__.__name__} supports {NUM_KV_HEADS} KV heads with {GROUP_SIZE} query heads each, got k shape {k_desc.shape}",
         )
         num_q_heads = GROUP_SIZE * num_kv_heads
+        out_dtype = self.descs["out"].dtype
+        self._value_error_if(out_dtype not in (torch.bfloat16, torch.float32), "out must be BF16 or FP32")
+        fp32_saved_state = out_dtype == torch.float32
         idx_desc = self.descs["topk_idxs"]
         topk_width = idx_desc.shape[1] if idx_desc.ndim == 2 and idx_desc.shape[1] in TOPK_WIDTHS else TOPK_WIDTHS[0]
         expected = {
             "q": ((seq_len, num_q_heads, HEAD_DIM), torch.bfloat16),
             "k": ((seq_len, num_kv_heads, HEAD_DIM), torch.bfloat16),
             "v": ((seq_len, num_kv_heads, HEAD_DIM), torch.bfloat16),
-            "out": ((seq_len, num_q_heads, HEAD_DIM), torch.bfloat16),
+            "out": ((seq_len, num_q_heads, HEAD_DIM), out_dtype),
             "dout": ((seq_len, num_q_heads, HEAD_DIM), torch.bfloat16),
-            "lse": ((seq_len, num_q_heads), torch.float32),
+            "lse": ((num_q_heads, seq_len) if fp32_saved_state else (seq_len, num_q_heads), torch.float32),
             "topk_idxs": ((seq_len, topk_width), torch.int32),
             "dq": ((seq_len, num_q_heads, HEAD_DIM), torch.bfloat16),
             "dk": ((seq_len, num_kv_heads, HEAD_DIM), torch.bfloat16),
@@ -148,7 +158,18 @@ class _QsaTwoPassBackward(APIBase):
             f"sequence length must be in [1, {max_len}], got {seq_len}",
         )
         self._kernel_module = kernel
-        self._plan = kernel.LaunchPlan(seq_len, torch.cuda.get_device_properties(q_desc.device).multi_processor_count, num_kv_heads, num_seqs, max_seq_len)
+        self._plan = kernel.LaunchPlan(
+            seq_len, torch.cuda.get_device_properties(q_desc.device).multi_processor_count, num_kv_heads, num_seqs, max_seq_len, fp32_saved_state
+        )
+        if num_kv_heads == 1 and self._plan.has_sparse:
+            # The cu12 compiler crashes compiling the four-query key-major kernel
+            # in both DSL 4.7 and 4.8. Gate the actual compiler, not torch/CUDA_HOME.
+            compiler_cuda = _dsl_cuda_version()
+            self._not_implemented_error_if(
+                compiler_cuda[0] < 13,
+                f"QSA 12Q/1KV sparse backward requires the CUDA 13 build of CuTe DSL; found compiler CUDA {compiler_cuda[0]}.{compiler_cuda[1]}. "
+                "Install 'nvidia-cutlass-dsl[cu13]>=4.7.0' with a CUDA 13 compatible driver.",
+            )
         self._is_supported = True
         return True
 
@@ -196,7 +217,8 @@ class _QsaTwoPassBackward(APIBase):
                 raise ValueError(f"{name} must match the compiled shape {desc.shape} and strides {desc.stride}")
             if tensor.dtype != desc.dtype or tensor.device != desc.device:
                 raise ValueError(f"{name} must match the compiled dtype {desc.dtype} and device {desc.device}")
-            alignment = 4 if name in ("topk_idxs", "cu_seqlens") else 16
+            scalar_lse = name == "lse" and self.descs["out"].dtype == torch.float32
+            alignment = 4 if name in ("topk_idxs", "cu_seqlens") or scalar_lse else 16
             if tensor.data_ptr() % alignment:
                 raise ValueError(f"{name} must be {alignment}-byte aligned")
         spans = {name: _byte_span(tensor) for name, tensor in tensors.items()}

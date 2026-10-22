@@ -186,6 +186,22 @@ def _prefetch_block(tmap, tok, PAIR: cutlass.Constexpr[bool]):
 
 
 # ----------------------------------------------------------------------------- query-major kernel (dQ, P / dS records)
+
+
+@cute.jit
+def _load_lse4(lse: cute.Tensor, flat: I32, HQ: cutlass.Constexpr[int], HEAD_MAJOR: cutlass.Constexpr[bool]):
+    if cutlass.const_expr(HEAD_MAJOR):
+        # Native Miles/FE [Hq, T] addressing; no saved-state cast or repack.
+        qi = flat // HQ
+        head = flat % HQ
+        values = []
+        for i in cutlass.range_constexpr(4):
+            values.append(lse[head + i, qi])
+        return cutlass.Vector.from_elements(values, F32)
+    else:
+        return (lse.iterator.raw_ptr() + flat).load(count=4, alignment=16)
+
+
 @cute.kernel
 def qsa_bwd_sparse_query_kernel(
     tma_q: cutlass.GridConstant[cuda.TensorMap],
@@ -205,6 +221,7 @@ def qsa_bwd_sparse_query_kernel(
     nctas: I32,
     NP: I32,
     HKV: cutlass.Constexpr[int],
+    LSE_HEAD_MAJOR: cutlass.Constexpr[bool],
 ):
     # An item is one sparse query (two KV heads) or two consecutive ones of the compacted list (one KV head), see the
     # SMEM layout note.
@@ -285,7 +302,6 @@ def qsa_bwd_sparse_query_kernel(
     tmem_col0 = tmem_raw & I32(0xFFFF)
     tmem_row0 = tmem_raw >> I32(16)
 
-    p_lse = g_lse.iterator.raw_ptr()
     p_delta = g_delta.iterator.raw_ptr()
     p_dq = g_dq.iterator.raw_ptr()
     p_sparse_blocks = g_sparse_blocks.iterator.raw_ptr()
@@ -626,9 +642,9 @@ def qsa_bwd_sparse_query_kernel(
                     if mpf >= nblk_r:
                         mpf = I32(0)
                     pnx = (prow_pp + mpf).load()
-                    lse_a = (p_lse + lbase).load(count=4, alignment=16)
-                    lse_b = (p_lse + lbase + 4).load(count=4, alignment=16)
-                    lse_c = (p_lse + lbase + 8).load(count=4, alignment=16)
+                    lse_a = _load_lse4(g_lse, lbase, HQ, LSE_HEAD_MAJOR)
+                    lse_b = _load_lse4(g_lse, lbase + 4, HQ, LSE_HEAD_MAJOR)
+                    lse_c = _load_lse4(g_lse, lbase + 8, HQ, LSE_HEAD_MAJOR)
                     del_a = (p_delta + lbase).load(count=4, alignment=16)
                     del_b = (p_delta + lbase + 4).load(count=4, alignment=16)
                     del_c = (p_delta + lbase + 8).load(count=4, alignment=16)
@@ -937,6 +953,7 @@ def _sparse_query_host(
     nctas: I32,
     NP: I32,
     HKV: cutlass.Constexpr[int],
+    LSE_HEAD_MAJOR: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
 ):
     T = q.shape[0]
@@ -977,6 +994,7 @@ def _sparse_query_host(
         nctas,
         NP,
         HKV,
+        LSE_HEAD_MAJOR,
     ).launch(grid=(nctas, 1, 1), block=(NTHREADS, 1, 1), stream=stream)
 
 
@@ -2287,6 +2305,7 @@ def qsa_bwd_dense_pair_kernel(
     U: I32,
     PDL: cutlass.Constexpr[int],
     HKV: cutlass.Constexpr[int],
+    LSE_HEAD_MAJOR: cutlass.Constexpr[bool],
 ):
     HQ = GQ * HKV
     tidx, _, _ = cute.arch.thread_idx()
@@ -2385,7 +2404,6 @@ def qsa_bwd_dense_pair_kernel(
         tmem_raw = tmem_slot.load()
         tmem_col0 = tmem_raw & I32(0xFFFF)
         tmem_row0 = tmem_raw >> I32(16)
-        p_lse = g_lse.iterator.raw_ptr()
         p_delta = g_delta.iterator.raw_ptr()
         p_dense_block_bitmap = g_dense_block_bitmap.iterator.raw_ptr()
         p_dense_dk_acc = g_dense_dk_acc.iterator.raw_ptr()
@@ -2605,9 +2623,9 @@ def qsa_bwd_dense_pair_kernel(
                     ab = (s0 + qc) * HQ + hk * GQ
                     av_n.append(
                         [
-                            (p_lse + ab).load(count=4, alignment=16),
-                            (p_lse + ab + 4).load(count=4, alignment=16),
-                            (p_lse + ab + 8).load(count=4, alignment=16),
+                            _load_lse4(g_lse, ab, HQ, LSE_HEAD_MAJOR),
+                            _load_lse4(g_lse, ab + 4, HQ, LSE_HEAD_MAJOR),
+                            _load_lse4(g_lse, ab + 8, HQ, LSE_HEAD_MAJOR),
                         ]
                     )
                 for k in cutlass.range(nk, unroll=1):
@@ -2628,9 +2646,9 @@ def qsa_bwd_dense_pair_kernel(
                         ab = (s0 + qc) * HQ + hk * GQ
                         av_n.append(
                             [
-                                (p_lse + ab).load(count=4, alignment=16),
-                                (p_lse + ab + 4).load(count=4, alignment=16),
-                                (p_lse + ab + 8).load(count=4, alignment=16),
+                                _load_lse4(g_lse, ab, HQ, LSE_HEAD_MAJOR),
+                                _load_lse4(g_lse, ab + 4, HQ, LSE_HEAD_MAJOR),
+                                _load_lse4(g_lse, ab + 8, HQ, LSE_HEAD_MAJOR),
                             ]
                         )
                     _wait(b_sf, k & 1)
@@ -2887,6 +2905,7 @@ def _dpair_host(
     nparts: I32,
     PDL: cutlass.Constexpr[int],
     HKV: cutlass.Constexpr[int],
+    LSE_HEAD_MAJOR: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
 ):
     HQ = GQ * HKV
@@ -2920,6 +2939,7 @@ def _dpair_host(
         U,
         PDL,
         HKV,
+        LSE_HEAD_MAJOR,
     ).launch(grid=(num_seqs * nparts * ntiles * 2 * HKV, 1, 1), block=(DP_THREADS, 1, 1), cluster=(2, 1, 1), stream=stream, use_pdl=(PDL == 1))
 
 
@@ -2953,7 +2973,7 @@ class LaunchPlan:
     ``num_seqs`` sequences of at most ``max_seq_len`` tokens, and the per-sequence split is decided on the device.
     """
 
-    def __init__(self, seq_len: int, num_sms: int, hkv: int = 2, num_seqs: int = 0, max_seq_len: Optional[int] = None):
+    def __init__(self, seq_len: int, num_sms: int, hkv: int = 2, num_seqs: int = 0, max_seq_len: Optional[int] = None, fp32_saved_state: bool = False):
         T = int(seq_len)
         assert hkv in (1, 2), f"{hkv} KV heads"
         assert 1 <= T <= max_packed_len(hkv), f"sequence length {T} outside [1, {max_packed_len(hkv)}]"
@@ -2962,6 +2982,7 @@ class LaunchPlan:
         REC_W = _rec_w(hkv)
         PAD = _pad(hkv)
         self.hkv = hkv
+        self.fp32_saved_state = bool(fp32_saved_state)
         self.seq_len = T
         self.num_seqs = num_seqs
         self.seq_count = max(num_seqs, 1)
@@ -3072,14 +3093,16 @@ def compile_kernels(plan: LaunchPlan) -> dict:
         names = ("seq_scan", "seq_fill") + names
     hkv = plan.hkv
     HQ = GQ * hkv
-    cache = _COMPILED.setdefault(hkv, {})
+    cache = _COMPILED.setdefault((hkv, plan.fp32_saved_state), {})
     missing = [name for name in names if name not in cache]
     if missing:
         sym_t = cute.sym_int64()
         f_q = _fake(BF16, (None, HQ, D), sym_t)
         f_kv = _fake(BF16, (None, hkv, D), sym_t)
         f_idx = make_fake_compact_tensor(I32, (sym_t, cute.sym_int64()), stride_order=(1, 0), assumed_align=4)
-        f_lse = _fake(F32, (None, HQ), sym_t)
+        f_out = _fake(F32 if plan.fp32_saved_state else BF16, (None, HQ, D), sym_t)
+        f_lse = _fake(F32, (HQ, None) if plan.fp32_saved_state else (None, HQ), sym_t, align=4 if plan.fp32_saved_state else 16)
+        f_delta = _fake(F32, (None, HQ), sym_t)
         f_h = _fake(F32, (None,), cute.sym_int64(divisibility=8))
         f_dq_acc = _fake(F32, (None,), cute.sym_int64(divisibility=8))
         f_dense_dkv = _fake(F32, (None,), cute.sym_int64(divisibility=8))
@@ -3092,7 +3115,7 @@ def compile_kernels(plan: LaunchPlan) -> dict:
             return _fake(I32, (None,), cute.sym_int64(), align=4)
 
         stream = make_fake_stream(use_tvm_ffi_env_stream=False)
-        dense_fakes = (f_kv, f_kv, f_q, f_q, f_lse, f_lse, f_i(), f_dq_acc, f_dense_dkv, f_dense_dkv, f_i(), f_c(), I32(1), I32(1), I32(1), I32(1), I32(1))
+        dense_fakes = (f_kv, f_kv, f_q, f_q, f_lse, f_delta, f_i(), f_dq_acc, f_dense_dkv, f_dense_dkv, f_i(), f_c(), I32(1), I32(1), I32(1), I32(1), I32(1))
         fin_fakes = (f_h, f_h, f_dense_dkv, f_dense_dkv, f_dq_acc, f_kv, f_kv, f_q, I32(1))
         builders = {
             "window": lambda: (_window_host, f_i(), f_i(), f_i(), f_i(), f_i(), f_i(), I32(0), I32(1), I32(1), stream),
@@ -3100,9 +3123,9 @@ def compile_kernels(plan: LaunchPlan) -> dict:
             "seq_fill": lambda: (_seq_fill_host, f_c(), f_i(), f_i(), f_i(), f_i(), f_i(), I32(1), I32(1), stream),
             "prep": lambda: (
                 _prep_host,
+                f_out,
                 f_q,
-                f_q,
-                f_lse,
+                f_delta,
                 f_h,
                 f_h,
                 f_i(),
@@ -3135,7 +3158,7 @@ def compile_kernels(plan: LaunchPlan) -> dict:
                 f_kv,
                 f_q,
                 f_lse,
-                f_lse,
+                f_delta,
                 f_dq_acc,
                 f_i(),
                 f_i(),
@@ -3147,10 +3170,11 @@ def compile_kernels(plan: LaunchPlan) -> dict:
                 I32(1),
                 I32(1),
                 hkv,
+                plan.fp32_saved_state,
                 stream,
             ),
-            "dense": lambda: (_dpair_host, *dense_fakes, 0, hkv, stream),
-            "dense_pdl": lambda: (_dpair_host, *dense_fakes, 1, hkv, stream),
+            "dense": lambda: (_dpair_host, *dense_fakes, 0, hkv, plan.fp32_saved_state, stream),
+            "dense_pdl": lambda: (_dpair_host, *dense_fakes, 1, hkv, plan.fp32_saved_state, stream),
             "fin": lambda: (_fin_host, *fin_fakes, 0, hkv, stream),
             "fin_sparse": lambda: (_fin_host, *fin_fakes, 1, hkv, stream),
         }

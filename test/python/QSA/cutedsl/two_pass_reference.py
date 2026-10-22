@@ -49,11 +49,11 @@ def make_topk_idxs(seq_len, generator, cu_seqlens=None, width=W):
     return idx[:, :width].to(torch.int32).contiguous()
 
 
-def reference_forward(q, k, v, topk_idxs):
+def reference_forward(q, k, v, topk_idxs, output_dtype=torch.bfloat16):
     """bf16 output and fp32 natural-log LSE of the scaled scores, the backward's saved tensors."""
     h_kv = k.shape[1]
     h_q = GROUP * h_kv
-    out = torch.empty_like(q)
+    out = torch.empty_like(q, dtype=output_dtype)
     lse = torch.empty((q.shape[0], h_q), dtype=torch.float32, device=q.device)
     kf, vf = k.float(), v.float()
     for r0 in range(0, q.shape[0], CHUNK):
@@ -76,6 +76,8 @@ def reference_backward(q, k, v, out, dout, lse, topk_idxs):
 
     Not autograd: rows with few keys cancel in dP - Delta, so a Delta from the unrounded O misses the tolerance.
     """
+    if out.dtype == torch.float32:
+        lse = lse.T
     h_kv = k.shape[1]
     h_q = GROUP * h_kv
     kf, vf = k.float(), v.float()
@@ -101,7 +103,7 @@ def reference_backward(q, k, v, out, dout, lse, topk_idxs):
     return dq, dk, dv
 
 
-def make_inputs(seq_len, seed, grad_scale=1.0, device="cuda", h_kv=2, cu_seqlens=None, width=W):
+def make_inputs(seq_len, seed, grad_scale=1.0, device="cuda", h_kv=2, cu_seqlens=None, width=W, saved_output_dtype=torch.bfloat16):
     """Random QSA backward operands. ``grad_scale`` shrinks dO to training-like gradient magnitudes.
 
     ``cu_seqlens`` (a Python list) packs several sequences into the T rows; the returned dict then carries it as an
@@ -116,7 +118,9 @@ def make_inputs(seq_len, seed, grad_scale=1.0, device="cuda", h_kv=2, cu_seqlens
     q, k, v = randn(seq_len, h_q, D), randn(seq_len, h_kv, D), randn(seq_len, h_kv, D)
     dout = (torch.randn((seq_len, h_q, D), device=device, generator=generator) * grad_scale).to(torch.bfloat16)
     topk_idxs = make_topk_idxs(seq_len, generator, cu_seqlens, width)
-    out, lse = reference_forward(q, k, v, topk_idxs)
+    out, lse = reference_forward(q, k, v, topk_idxs, saved_output_dtype)
+    if saved_output_dtype == torch.float32:
+        lse = lse.T.contiguous()
     inputs = {"q": q, "k": k, "v": v, "out": out, "dout": dout, "lse": lse, "topk_idxs": topk_idxs}
     if cu_seqlens is not None:
         inputs["cu_seqlens"] = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
