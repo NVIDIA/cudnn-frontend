@@ -13,7 +13,7 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass._mlir.dialects import arith, nvvm, vector
+from cutlass._mlir.dialects import nvvm
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.typing import Float32, Int32, Int64
 from cutlass.cutlass_dsl import dsl_user_op
@@ -1869,6 +1869,7 @@ class FlashAttentionDSABackwardSm100:
             # The P wait above proves compute has consumed S; the loop-carried
             # dKV4 T2R barrier orders these columns before the next S.
             if cutlass.const_expr(not self.same_hdim_kv):
+                mma_reduce_dKV_pipeline.producer_acquire(mma_reduce_dKV_producer_state)
                 dKV4_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
                 for k_block in cutlass.range(0, cute.size(tdKVrdS_4, mode=[2]), unroll=2):
                     cute.gemm(
@@ -1880,7 +1881,7 @@ class FlashAttentionDSABackwardSm100:
                     )
                     dKV4_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
-                # Commit dKV4 on pipeline (no acquire needed) to notify consumer
+                # Publish dKV4 to the reducer after acquiring its pipeline phase.
                 mma_reduce_dKV_pipeline.producer_commit(mma_reduce_dKV_producer_state)
                 mma_reduce_dKV_producer_state.advance()
 
