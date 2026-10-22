@@ -20,7 +20,7 @@ _ENGINE = "sdpa_bwd_sm100_d128"
 @contextmanager
 def _recompute_route():
     """Pin the one-launch recompute kernel: SM100 / SM103 select accumulation for every dense shape, so its
-    coverage below forces the host-side selection the way an older compiler or a non-positive scale would."""
+    coverage below forces the host-side selection the way an older compiler or a negative scale would."""
     from cudnn.sdpa.bwd import api_dsl_sm100_d128
     from cudnn.sdpa.bwd.d128_contract import RECOMPUTE
 

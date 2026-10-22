@@ -348,7 +348,7 @@ the allocation contract. All scratch is initialized each execution.
 | Unmasked / top-left causal | ✅ |
 | IO layout | Compact BSHD rows; THD uses each port's ragged origins and ignores logical batch pitch |
 | Stats | Dense: contiguous FP32 natural-log LSE; THD: packed token-major or head-major with declared physical capacity |
-| Workspace / kernel launches | MHA: dense accumulation (any lengths) / 3, retained dense recompute (older CuTeDSL, non-positive scale) / 1, THD accumulation / 4. GQA/MQA: append native dK/dV partials and an FP32 group fold; dense / 4, THD / 5 |
+| Workspace / kernel launches | MHA: dense accumulation (any lengths) / 3, retained dense recompute (older CuTeDSL, negative scale) / 1, THD accumulation / 4. GQA/MQA: append native dK/dV partials and an FP32 group fold; dense / 4, THD / 5 |
 | THD MHA | ✅ cc 10.0 or 10.3, public CuTeDSL >= 4.8, positive FP32 scale, positive declared capacities; actual empty sequences and tails supported |
 | GQA / MQA | ✅ BF16 only, cc 10.0 or 10.3, public CuTeDSL >= 4.8, positive FP32 scale, Hq > Hkv with integral ratio; dense Sq/Skv must be multiples of 128, THD accepts tails and empty actual sequences |
 | Bottom-right causal, sliding window, dense padding mask, right-band widening | ❌ |
