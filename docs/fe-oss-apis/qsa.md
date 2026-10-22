@@ -84,10 +84,11 @@ not make QSA and DeepSeek attention interchangeable. Numerical rounding and
 top-k tie rules must also be checked before replacing an external selector.
 
 The [internal two-pass backend](qsa_two_pass.md) currently has a different
-saved-state and selection contract: fixed 24Q/2KV, a single sequence, BF16
-saved output and `[T, 24]` LSE. It is not dispatched by the public training
-functions yet. Do not interchange its saved tensors or infer packed support
-from the bitmap or indexed APIs. Its implementation remains under `cudnn.QSA`
+saved-state and selection contract: 12Q/1KV or 24Q/2KV, canonical block lists,
+optional packed `cu_seqlens`, and native FP32 saved output / `[Hq, T]` LSE
+(or the earlier BF16 saved output / `[T, Hq]` LSE pair). It is not dispatched by the public training
+functions yet. Use the documented saved-state pair and canonical selection format; the public
+bitmap and indexed calls accept more general selections. Its implementation remains under `cudnn.QSA`
 while its contract is adapted; no public op class or algorithm-specific entry
 is added.
 
