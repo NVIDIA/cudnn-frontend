@@ -32,7 +32,6 @@ def _compact_chunk(sel, lo, hi, first, last, ids, row, lane, base, count, vector
         block = base + item
         take = Boolean(False)
         if block < sel.shape[1]:
-            marked = Boolean(False)
             if cutlass.const_expr(vectorized):
                 marked = packed[item] != 0
             else:
