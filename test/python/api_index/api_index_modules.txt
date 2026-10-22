@@ -1,5 +1,4 @@
 cudnn
-cudnn.QSA.two_pass
 cudnn.block_sparse_attention
 cudnn.causal_conv1d_bulk_sm100
 cudnn.causal_conv1d_update_sm100

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""``qsa_select_decode``: the decode form of the block-sparse indexer's top-k block selection.
+"""``qsa_select_decode_forward``: the decode form of the block-sparse indexer's top-k block selection.
 
 A decode step has one to a few query rows per sequence (the step-0 token plus speculative drafts); the selector
 scores them with the dense DSA unified scorer at the smallest MMA tile and selects per row with the radix top-k
@@ -28,7 +28,7 @@ from cudnn.frost.buffers import cutedsl_requirement_error
 
 # the module imported ONE way: its names read off the module object
 QSA_BLOCK_SIZE, QSA_TOP_K, TOP_K_KERNEL_MAX = qsa_mod.QSA_BLOCK_SIZE, qsa_mod.QSA_TOP_K, qsa_mod.TOP_K_KERNEL_MAX
-from cudnn.ops import qsa_select, qsa_select_decode
+from cudnn.ops import qsa_select_forward, qsa_select_decode_forward
 
 decode_row_positions_and_counts = qsa_mod.decode_row_positions_and_counts
 
@@ -52,7 +52,7 @@ needs_sm100_family = pytest.mark.skipif(_cc() is None or _cc()[0] != 10, reason=
 # Below FROST's CuTe DSL floor the decode selector declines by VERSION ahead of its later gates (the target, the device family, the head
 # groups) and ahead of any scorer launch (Rule 7): the cells that expect one of those later answers, and every accept cell, skip there
 # instead of failing; the form checks and the count rule ahead of the gate, and the version-decline cell itself, run on any DSL.
-_CUTEDSL_REQUIREMENT = cutedsl_requirement_error("qsa_select_decode")  # None at or above the floor
+_CUTEDSL_REQUIREMENT = cutedsl_requirement_error("qsa_select_decode_forward")  # None at or above the floor
 needs_dsl_floor = pytest.mark.skipif(_CUTEDSL_REQUIREMENT is not None, reason=str(_CUTEDSL_REQUIREMENT))
 
 
@@ -165,9 +165,9 @@ def test_decode_declines_top_k_past_the_radix_kernel_bound():
     qi, kbar = _inputs(2, 1, 8, device)
     kv = _kv_lens([3, 7], 1, device)
     with pytest.raises(ValueError, match=str(TOP_K_KERNEL_MAX)):
-        qsa_select_decode(qi, kbar, kv, top_k=TOP_K_KERNEL_MAX + 1)
+        qsa_select_decode_forward(qi, kbar, kv, top_k=TOP_K_KERNEL_MAX + 1)
     with pytest.raises(ValueError, match="top_k"):
-        qsa_select_decode(qi, kbar, kv, top_k=0)
+        qsa_select_decode_forward(qi, kbar, kv, top_k=0)
 
 
 @needs_cuda
@@ -176,31 +176,31 @@ def test_decode_rejects_malformed_inputs():
     qi, kbar = _inputs(2, 4, 16, device)
     kv = _kv_lens([3, 7], 4, device)
     with pytest.raises(ValueError, match=r"\[B, rows_per_seq, n_heads, head_dim\]"):
-        qsa_select_decode(qi[0], kbar, kv)
+        qsa_select_decode_forward(qi[0], kbar, kv)
     with pytest.raises(ValueError, match="head_dim 128"):
-        qsa_select_decode(qi[..., :64], kbar[..., :64], kv)
+        qsa_select_decode_forward(qi[..., :64], kbar[..., :64], kv)
     with pytest.raises(ValueError, match="bfloat16"):
-        qsa_select_decode(qi.half(), kbar, kv)
+        qsa_select_decode_forward(qi.half(), kbar, kv)
     with pytest.raises(ValueError, match="B = 2 sequences but kbar holds 1"):
-        qsa_select_decode(qi, kbar[:1], kv)
+        qsa_select_decode_forward(qi, kbar[:1], kv)
     with pytest.raises(ValueError, match="multiple of 8"):
-        qsa_select_decode(qi, kbar[:, :12].contiguous(), kv)
+        qsa_select_decode_forward(qi, kbar[:, :12].contiguous(), kv)
     with pytest.raises(ValueError, match="contiguous"):
-        qsa_select_decode(qi, kbar.transpose(1, 2).contiguous().transpose(1, 2), kv)
+        qsa_select_decode_forward(qi, kbar.transpose(1, 2).contiguous().transpose(1, 2), kv)
     with pytest.raises(ValueError, match="unit last stride"):
-        qsa_select_decode(qi.transpose(2, 3).contiguous().transpose(2, 3), kbar, kv)
+        qsa_select_decode_forward(qi.transpose(2, 3).contiguous().transpose(2, 3), kbar, kv)
     with pytest.raises(ValueError, match="kv_lens"):
-        qsa_select_decode(qi, kbar, kv.to(torch.int64))
+        qsa_select_decode_forward(qi, kbar, kv.to(torch.int64))
     with pytest.raises(ValueError, match="kv_lens"):
-        qsa_select_decode(qi, kbar, kv.cpu())
+        qsa_select_decode_forward(qi, kbar, kv.cpu())
     with pytest.raises(ValueError, match="kv_lens"):
-        qsa_select_decode(qi, kbar, kv[:1])
+        qsa_select_decode_forward(qi, kbar, kv[:1])
     with pytest.raises(ValueError, match="tie_break"):
-        qsa_select_decode(qi, kbar, kv, tie_break=3)
+        qsa_select_decode_forward(qi, kbar, kv, tie_break=3)
     with pytest.raises(ValueError, match="m_block_size"):
-        qsa_select_decode(qi, kbar, kv, m_block_size=24)
+        qsa_select_decode_forward(qi, kbar, kv, m_block_size=24)
     with pytest.raises(ValueError, match="block_size"):
-        qsa_select_decode(qi, kbar, kv, block_size=0)
+        qsa_select_decode_forward(qi, kbar, kv, block_size=0)
 
 
 @needs_cuda
@@ -209,13 +209,13 @@ def test_decode_host_geometry_check_names_the_sequence():
     qi, kbar = _inputs(2, 4, 16, device)
     kv = _kv_lens([13, 60], 4, device)  # pos0 17 and 64 -> kv 17 / 64 hold 4 / 16 complete blocks
     with pytest.raises(ValueError, match="sequence 1: a KV length of 64 holds"):
-        qsa_select_decode(qi, kbar, kv, n_blocks_per_seq=[4, 15])
+        qsa_select_decode_forward(qi, kbar, kv, n_blocks_per_seq=[4, 15])
     with pytest.raises(ValueError, match="kbar holds 16 rows"):
-        qsa_select_decode(qi, kbar, kv, n_blocks_per_seq=[4, 17])
+        qsa_select_decode_forward(qi, kbar, kv, n_blocks_per_seq=[4, 17])
     with pytest.raises(ValueError, match="entries for B = 2"):
-        qsa_select_decode(qi, kbar, kv, n_blocks_per_seq=[4])
+        qsa_select_decode_forward(qi, kbar, kv, n_blocks_per_seq=[4])
     with pytest.raises(ValueError, match="sequence 0: kv_lens = 2 is shorter than the 4 new rows"):
-        qsa_select_decode(qi, kbar, torch.tensor([2, 64], dtype=torch.int32, device=device), n_blocks_per_seq=[0, 16])
+        qsa_select_decode_forward(qi, kbar, torch.tensor([2, 64], dtype=torch.int32, device=device), n_blocks_per_seq=[0, 16])
 
 
 @needs_cuda
@@ -224,8 +224,8 @@ def test_decode_declines_below_the_dsl_floor_by_version(monkeypatch):
     device = torch.device("cuda")
     qi, kbar = _inputs(1, 1, 8, device)
     monkeypatch.setattr(qsa_mod, "cutedsl_requirement_error", lambda what: f"{what} requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2")
-    with pytest.raises(NotImplementedError, match="qsa_select_decode requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2"):
-        qsa_select_decode(qi, kbar, _kv_lens([5], 1, device))
+    with pytest.raises(NotImplementedError, match="qsa_select_decode_forward requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2"):
+        qsa_select_decode_forward(qi, kbar, _kv_lens([5], 1, device))
 
 
 @needs_cuda
@@ -237,7 +237,7 @@ def test_decode_declines_a_dsl_without_the_target(monkeypatch):
         qsa_mod, "cutedsl_arch_requirement_error", lambda cc: "SM107 requires a CuTe DSL build supporting sm_107a; found 4.7.0 without that target"
     )
     with pytest.raises(NotImplementedError, match="sm_107a"):
-        qsa_select_decode(qi, kbar, _kv_lens([5], 1, device))
+        qsa_select_decode_forward(qi, kbar, _kv_lens([5], 1, device))
 
 
 @needs_cuda
@@ -247,7 +247,7 @@ def test_decode_declines_devices_below_the_sm100_family(monkeypatch):
     qi, kbar = _inputs(1, 1, 8, device)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (9, 0))
     with pytest.raises(NotImplementedError, match=r"cc 10\.x.*found cc 9\.0"):
-        qsa_select_decode(qi, kbar, _kv_lens([5], 1, device))
+        qsa_select_decode_forward(qi, kbar, _kv_lens([5], 1, device))
 
 
 @needs_cuda
@@ -261,7 +261,7 @@ def test_decode_declines_unsupported_head_counts(n_heads, monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 7))
     monkeypatch.setattr(qsa_mod, "cutedsl_arch_requirement_error", lambda cc: None)
     with pytest.raises(NotImplementedError, match=r"n_heads in \(4, 8, 16, 32, 64\)"):
-        qsa_select_decode(qi, kbar, _kv_lens([5], 1, device))
+        qsa_select_decode_forward(qi, kbar, _kv_lens([5], 1, device))
 
 
 # --------------------------------------------------------------------------------------------- accept cells
@@ -282,7 +282,7 @@ def test_decode_per_row_lists_match_the_fp64_reference_and_the_oracle_counts(row
     qi, kbar = _inputs(batch, rows_per_seq, n_blocks_max, device, seed=n_blocks_max + rows_per_seq)
     kv = _kv_lens(pos0, rows_per_seq, device)
 
-    result = qsa_select_decode(qi, kbar, kv, list_per_sequence=False, n_blocks_per_seq=[n_blocks_max] * batch)
+    result = qsa_select_decode_forward(qi, kbar, kv, list_per_sequence=False, n_blocks_per_seq=[n_blocks_max] * batch)
     torch.cuda.synchronize()
 
     positions = torch.tensor(pos0, device=device)[:, None] + torch.arange(rows_per_seq, device=device)[None, :]
@@ -316,9 +316,11 @@ def test_decode_shared_list_is_the_step0_row_and_is_reused_by_the_verify_rows():
     qi, kbar = _inputs(batch, rows_per_seq, n_blocks_max, device, seed=23)
     kv = _kv_lens(pos0, rows_per_seq, device)
 
-    shared = qsa_select_decode(qi, kbar, kv, list_per_sequence=True)
-    per_row = qsa_select_decode(qi, kbar, kv, list_per_sequence=False)
-    single = qsa_select_decode(qi[:, :1].contiguous(), kbar, torch.tensor([p + 1 for p in pos0], dtype=torch.int32, device=device), list_per_sequence=True)
+    shared = qsa_select_decode_forward(qi, kbar, kv, list_per_sequence=True)
+    per_row = qsa_select_decode_forward(qi, kbar, kv, list_per_sequence=False)
+    single = qsa_select_decode_forward(
+        qi[:, :1].contiguous(), kbar, torch.tensor([p + 1 for p in pos0], dtype=torch.int32, device=device), list_per_sequence=True
+    )
     torch.cuda.synchronize()
 
     assert shared["block_ids"].shape == (batch, QSA_TOP_K) and shared["block_lens"].shape == (batch,)
@@ -366,7 +368,7 @@ def test_decode_ties_keep_the_smaller_block_ids():
     kbar = kbar[:, :1].expand(-1, n_blocks_max, -1).contiguous()
     kv = _kv_lens(pos0, rows_per_seq, device)
 
-    result = qsa_select_decode(qi, kbar, kv, list_per_sequence=False)
+    result = qsa_select_decode_forward(qi, kbar, kv, list_per_sequence=False)
     torch.cuda.synchronize()
 
     expected0 = torch.arange(QSA_TOP_K, device=device, dtype=torch.int32)
@@ -394,9 +396,9 @@ def test_decode_agrees_with_the_prefill_selector_on_the_same_rows():
     qi, kbar = _inputs(batch, rows_per_seq, n_blocks_max, device, seed=31)
     kv = _kv_lens(pos0, rows_per_seq, device)
 
-    decode = qsa_select_decode(qi, kbar, kv, list_per_sequence=False)
+    decode = qsa_select_decode_forward(qi, kbar, kv, list_per_sequence=False)
     cu = torch.arange(batch + 1, dtype=torch.int32, device=device) * rows_per_seq
-    prefill = qsa_select(qi.reshape(batch * rows_per_seq, _H, _D), kbar, cu, q_pos0=torch.tensor(pos0, dtype=torch.int32, device=device))
+    prefill = qsa_select_forward(qi.reshape(batch * rows_per_seq, _H, _D), kbar, cu, q_pos0=torch.tensor(pos0, dtype=torch.int32, device=device))
     torch.cuda.synchronize()
 
     positions = torch.tensor(pos0, device=device)[:, None] + torch.arange(rows_per_seq, device=device)[None, :]
@@ -423,8 +425,8 @@ def test_decode_scorer_tile_is_a_knob():
     pos0 = [4 * 900 + 2, 4 * 50]
     qi, kbar = _inputs(2, rows_per_seq, n_blocks_max, device, seed=37)
     kv = _kv_lens(pos0, rows_per_seq, device)
-    a = qsa_select_decode(qi, kbar, kv, list_per_sequence=False)
-    b = qsa_select_decode(qi, kbar, kv, list_per_sequence=False, m_block_size=32)
+    a = qsa_select_decode_forward(qi, kbar, kv, list_per_sequence=False)
+    b = qsa_select_decode_forward(qi, kbar, kv, list_per_sequence=False, m_block_size=32)
     torch.cuda.synchronize()
     assert torch.equal(torch.sort(a["block_ids"], dim=-1).values, torch.sort(b["block_ids"], dim=-1).values)
     assert torch.equal(torch.sort(a["scores"], dim=-1).values, torch.sort(b["scores"], dim=-1).values)
@@ -440,11 +442,11 @@ def test_decode_rejects_a_mixed_cache_dtype_and_the_tile_knob_with_e4m3():
     qi, kbar = _inputs(2, 1, 16, device)
     kv = _kv_lens([40, 41], 1, device)
     with pytest.raises(ValueError, match="both be bfloat16, or both float8_e4m3fn"):
-        qsa_select_decode(qi.to(_E4M3), kbar, kv)
+        qsa_select_decode_forward(qi.to(_E4M3), kbar, kv)
     with pytest.raises(ValueError, match="both be bfloat16, or both float8_e4m3fn"):
-        qsa_select_decode(qi, kbar.to(_E4M3), kv)
+        qsa_select_decode_forward(qi, kbar.to(_E4M3), kv)
     with pytest.raises(ValueError, match="fixed 128-row tile"):
-        qsa_select_decode(qi.to(_E4M3), kbar.to(_E4M3), kv, m_block_size=16)
+        qsa_select_decode_forward(qi.to(_E4M3), kbar.to(_E4M3), kv, m_block_size=16)
 
 
 @needs_dsl_floor
@@ -461,8 +463,8 @@ def test_decode_e4m3_cache_matches_the_fp64_reference_on_the_e4m3_values(rows_pe
     q8, k8 = qi.to(_E4M3), kbar.to(_E4M3)
     kv = _kv_lens(pos0, rows_per_seq, device)
 
-    per_row = qsa_select_decode(q8, k8, kv, list_per_sequence=False, n_blocks_per_seq=[n_blocks_max] * batch)
-    shared = qsa_select_decode(q8, k8, kv, list_per_sequence=True)
+    per_row = qsa_select_decode_forward(q8, k8, kv, list_per_sequence=False, n_blocks_per_seq=[n_blocks_max] * batch)
+    shared = qsa_select_decode_forward(q8, k8, kv, list_per_sequence=True)
     torch.cuda.synchronize()
 
     positions = torch.tensor(pos0, device=device)[:, None] + torch.arange(rows_per_seq, device=device)[None, :]

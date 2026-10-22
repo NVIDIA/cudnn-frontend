@@ -1057,20 +1057,20 @@ def test_the_dsl_floor_declines_through_the_block_before_any_kernel_import(monke
     # groups are read off the DSA tree, whose package imports its kernel modules, so the version decline must come first -- and
     # from the stage's own check_support; the sm_107a target from the stage.  The head-group reader is replaced by a failing
     # stub, so REACHING it below the floor is the failure, never an import error from inside the DSL.
-    import cudnn.QSA.selection as qsa_select
+    import cudnn.QSA.selection as qsa_select_forward
 
-    real_groups = qsa_select.indexer_scorer_head_groups
+    real_groups = qsa_select_forward.indexer_scorer_head_groups
     geom_ix = GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec(index_source="indexer", index_band=True))
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     blk_ix = GatedAttentionBlockFwd(**_samples(geom_ix), geometry=geom_ix)  # declared AT the floor (4.8.0 above): the stage arms run on it
-    monkeypatch.setattr(qsa_select, "indexer_scorer_head_groups", lambda: pytest.fail("the scorer's package was imported below the DSL floor"))
+    monkeypatch.setattr(qsa_select_forward, "indexer_scorer_head_groups", lambda: pytest.fail("the scorer's package was imported below the DSL floor"))
     monkeypatch.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.6.2")))
     with pytest.raises(NotImplementedError, match=re.escape("found 4.6.2")):
         GatedAttentionBlockFwd(**_samples(geom_ix), geometry=geom_ix)  # the declaration-time arm
     with pytest.raises(NotImplementedError, match=re.escape("found 4.6.2")):
         blk_ix._indexer.check_support()  # the stage on its own
     assert blk_ix._indexer._k_recipe is None and blk_ix._sdpa._impl is None  # nothing compiled; no stage past the indexer was asked
-    monkeypatch.setattr(qsa_select, "indexer_scorer_head_groups", real_groups)
+    monkeypatch.setattr(qsa_select_forward, "indexer_scorer_head_groups", real_groups)
     monkeypatch.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.8.0")))
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: False)  # the capability still reads (10, 7) from above
     with pytest.raises(NotImplementedError, match="sm_107a"):

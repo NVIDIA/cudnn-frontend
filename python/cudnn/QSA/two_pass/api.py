@@ -31,7 +31,7 @@ def _overlaps(lhs: tuple[int, int], rhs: tuple[int, int]) -> bool:
     return lhs[0] < rhs[1] and rhs[0] < lhs[1]
 
 
-class QsaTwoPassBackward(APIBase):
+class _QsaTwoPassBackward(APIBase):
     """QSA backward: dQ, dK and dV from Q, K, V, O, dO, the forward LSE and the selected token indices.
 
     ``topk_idxs`` row ``i`` lists the first token of each of its ``min((i + 1) // 4, 512)`` complete 4-token blocks (the
@@ -185,10 +185,10 @@ class QsaTwoPassBackward(APIBase):
         return dq, dk, dv
 
 
-_cache_of_QsaTwoPassBackwardObjects: dict = {}
+_cache_of__QsaTwoPassBackwardObjects: dict = {}
 
 
-def qsa_two_pass_backward(
+def _backward(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -207,12 +207,12 @@ def qsa_two_pass_backward(
     inputs = (q, k, v, out, dout, lse, topk_idxs)
     key = (q.device, softmax_scale) + tuple((tuple(t.shape), t.stride(), t.dtype) for t in inputs)
     key += tuple(None if t is None else (tuple(t.shape), t.stride(), t.dtype) for t in (dq, dk, dv))
-    obj = _cache_of_QsaTwoPassBackwardObjects.get(key)
+    obj = _cache_of__QsaTwoPassBackwardObjects.get(key)
     if obj is None:
-        obj = QsaTwoPassBackward(*inputs, sample_dq=dq, sample_dk=dk, sample_dv=dv, softmax_scale=softmax_scale)
+        obj = _QsaTwoPassBackward(*inputs, sample_dq=dq, sample_dk=dk, sample_dv=dv, softmax_scale=softmax_scale)
         obj.check_support()
         obj.compile()
-        _cache_of_QsaTwoPassBackwardObjects[key] = obj
+        _cache_of__QsaTwoPassBackwardObjects[key] = obj
 
     with torch.cuda.device(q.device), stream_context(stream, q.device):
         dq = torch.empty_like(q) if dq is None else dq

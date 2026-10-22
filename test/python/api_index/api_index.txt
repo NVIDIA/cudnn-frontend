@@ -145,13 +145,6 @@ cudnn.NodeType.TRANSPOSE
 cudnn.NodeType.name
 cudnn.NodeType.value
 cudnn.Nvfp4AttentionQatBackward
-cudnn.QSA.two_pass
-cudnn.QSA.two_pass.QsaTwoPassBackward
-cudnn.QSA.two_pass.QsaTwoPassBackward.check_support
-cudnn.QSA.two_pass.QsaTwoPassBackward.compile
-cudnn.QSA.two_pass.QsaTwoPassBackward.execute
-cudnn.QSA.two_pass.QsaTwoPassBackward.scratch_workspace_bytes
-cudnn.QSA.two_pass.qsa_two_pass_backward
 cudnn.RmsNormRhtAmaxSm100
 cudnn.RmsNormSiluPadSm100
 cudnn.RopeQDQInplace
@@ -1367,10 +1360,9 @@ cudnn.ops.qsa_backward
 cudnn.ops.qsa_forward
 cudnn.ops.qsa_indexed_backward
 cudnn.ops.qsa_indexed_forward
-cudnn.ops.qsa_select
-cudnn.ops.qsa_select_decode
-cudnn.ops.qsa_select_decode_paged
-cudnn.ops.qsa_two_pass_backward
+cudnn.ops.qsa_select_decode_forward
+cudnn.ops.qsa_select_decode_paged_forward
+cudnn.ops.qsa_select_forward
 cudnn.pack_backward_weights
 cudnn.pack_causal_conv3d_weight_sm100
 cudnn.pack_conv3d_weight_sm100

@@ -18,7 +18,7 @@ page), so this kernel reads them there -- once, in page order, never through a d
 The ``logits [T, n_blocks_max]`` fp32 + ``counts [T]`` int32 pair is the input contract of the decode top-k that follows
 (the radix kernel today, a FROST top-k later): the top-k reads row ``t``'s columns ``[0, counts[t])`` -- nothing else of the
 row is written here -- and pads its output with ``-1`` past ``min(top_k, counts[t])``.  The host entry
-``selection_paged.qsa_select_decode_paged`` (a DSL-free module, so its import path resolves on every installed DSL) pairs the
+``selection_paged.qsa_select_decode_paged_forward`` (a DSL-free module, so its import path resolves on every installed DSL) pairs the
 scorer with the deterministic radix top-k (the smaller block id wins a tie at the cutoff, the selected ids come back in ASCENDING
 order, so two calls are bitwise) and no torch prologue: the positions and the counts are derived on device by this kernel.
 
@@ -120,7 +120,7 @@ follows the prologue's copies, BEFORE the counts and the logits are written.  Th
 grid: a kernel launched with the programmatic-stream-serialization attribute behind this one may start while this one still runs and
 MUST issue its own ``griddepcontrol.wait`` before it touches anything this kernel reads or writes (``logits``, ``counts``,
 ``block_lens``, and the inputs it could overwrite); the wait returns only after this grid has completed and flushed.  The standalone
-selector (``qsa_select_decode_paged``) launches the radix top-k WITHOUT the attribute, so the pair is inert there (the top-k starts
+selector (``qsa_select_decode_paged_forward``) launches the radix top-k WITHOUT the attribute, so the pair is inert there (the top-k starts
 after the scorer completes, as any stream-ordered launch); it matters in the fused decode chain, whose nodes carry the attribute and
 wait.  Without PDL (``use_pdl=False``, the standalone default) neither instruction is traced and the kernel runs on any CuTe DSL
 device from sm_80 (``mma.sync.m16n8k16``, ``cp.async``).
@@ -146,7 +146,7 @@ logits written; the query tile per live CTA (``m_tiles x 4 KiB``, L2-resident) a
 ``selection_paged.moved_bytes``.
 
 Rule 7: this module imports the DSL at import time like its neighbours, so the documented host entry lives in the DSL-free
-front door ``QSA/selection_paged.py`` -- ``qsa_select_decode_paged`` gates the DSL floor, the ``sm_107a``
+front door ``QSA/selection_paged.py`` -- ``qsa_select_decode_paged_forward`` gates the DSL floor, the ``sm_107a``
 target on cc 10.7 and the radix top-k's cc 9.0 BEFORE importing this module -- and the kernel's host-side facts (the row map,
 the compile-key validator, the knob defaults, the byte model) are defined there and imported here, never the other way round
 at module scope.  :func:`compile_qsa_score_paged`, the kernel-level entry a caller may reach directly, gates the floor and the

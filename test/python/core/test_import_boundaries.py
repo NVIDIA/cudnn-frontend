@@ -122,6 +122,7 @@ def test_qsa_public_entries_resolve_after_package_move(implementation_first):
     """The unreleased QSA APIs have one documented prefix and no DSA/GAB shims."""
     _modules(f"""
 import importlib
+import inspect
 import cudnn.ops
 
 targets = {{
@@ -129,19 +130,20 @@ targets = {{
     "qsa_backward": "cudnn.QSA.api",
     "qsa_indexed_forward": "cudnn.QSA.indexed",
     "qsa_indexed_backward": "cudnn.QSA.indexed",
-    "qsa_two_pass_backward": "cudnn.QSA.two_pass",
-    "qsa_select": "cudnn.QSA.selection",
-    "qsa_select_decode": "cudnn.QSA.selection",
-    "qsa_select_decode_paged": "cudnn.QSA.selection_paged",
+    "qsa_select_forward": "cudnn.QSA.selection",
+    "qsa_select_decode_forward": "cudnn.QSA.selection",
+    "qsa_select_decode_paged_forward": "cudnn.QSA.selection_paged",
 }}
 for name, module in targets.items():
     if {implementation_first!r}:
         implementation = importlib.import_module(module)
     entry = getattr(cudnn.ops, name)
     implementation = importlib.import_module(module)
-    assert callable(entry) and entry is getattr(implementation, name), name
+    assert inspect.isfunction(entry) and entry is getattr(implementation, name), name
+    assert name.endswith(("_forward", "_backward")), name
     assert getattr(cudnn.ops, name) is entry, name
 
+assert not hasattr(cudnn.ops, "qsa_two_pass_backward")
 for name in ("qsa_indexed_forward", "qsa_indexed_backward",
              "GqaSparseAttentionBackward", "gqa_sparse_attention_backward_wrapper"):
     assert not hasattr(cudnn.DSA, name), name

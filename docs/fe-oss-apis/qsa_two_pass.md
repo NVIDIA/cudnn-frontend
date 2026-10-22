@@ -1,18 +1,13 @@
-# QSA two-pass backward
+# QSA two-pass backend implementation notes
 
-`cudnn.ops.qsa_two_pass_backward` computes the gradients of the original
+The internal backend in `cudnn.QSA.two_pass` computes the gradients of the original
 24Q/2KV, D256 QSA geometry on SM100/SM103. It requires CuTeDSL >= 4.7.0.
 It supports one sequence, not packed documents or 12Q/1KV. For packed training
-with 12Q/1KV, use [indexed QSA](qsa_indexed.md).
+with 12Q/1KV, use [indexed QSA](qsa_indexed.md). These are implementation notes,
+not a public API. The backend is retained for further integration into the
+common QSA functions after its contracts are aligned.
 
-```python
-from cudnn.ops import qsa_two_pass_backward
-
-dq, dk, dv = qsa_two_pass_backward(q, k, v, out, dout, lse, topk_idxs)
-```
-
-The result is a `TupleDict` with keys `dq`, `dk`, `dv` in that order. There is
-no autograd registration. All tensors must be contiguous on the same CUDA
+All tensors must be contiguous on the same CUDA
 device. The softmax scale is fixed at `1 / 16`.
 
 | Tensor | Shape | Dtype |
@@ -40,14 +35,10 @@ into KV passes. The records trade memory for reduced contention and reuse:
 the current 128K plan requires approximately 24.56 GiB of workspace, in addition
 to inputs and outputs. This is not a bounded-workspace implementation.
 
-The function accepts optional preallocated `dq`, `dk`, `dv`, `stream`, and
-`workspace`. For explicit compilation and allocation ownership, construct
-`cudnn.QSA.two_pass.QsaTwoPassBackward` with sample tensors, call
-`check_support()` and `compile()`, allocate `scratch_workspace_bytes()` bytes,
-then call `execute()` with current tensors and that workspace. Execution checks
-current tensor layouts and storage; it does not allocate or read indices to the
-host. The convenience function allocates omitted outputs and workspace. Warm up
-before CUDA graph capture.
+The internal APIBase plan retains explicit compilation and caller-owned
+workspace. Execution checks current tensor layouts and storage; it does not
+allocate or read indices to the host. The backend's regressions exercise dense
+and sparse crossovers, changed-input replay and explicit stream handling.
 
 See [all QSA entry points](qsa.md#finding-qsa-attention-and-its-indexer) for
 selection and the other attention contracts.

@@ -60,9 +60,8 @@ Choose an entry by its input and saved-state contract:
 |---|---|---|
 | Packed training with a block-selection bitmap | `cudnn.ops.qsa_forward`, `qsa_backward` | The bitmap API documented on this page; 12Q/1KV or 24Q/2KV |
 | Packed training with selected token IDs | [`cudnn.ops.qsa_indexed_forward`, `qsa_indexed_backward`](qsa_indexed.md) | 12Q/1KV on SM100/SM103; shares the QSA attention kernels |
-| Two-pass backward for the fixed original geometry | [`cudnn.ops.qsa_two_pass_backward`](qsa_two_pass.md) | 24Q/2KV, single sequence, canonical `[T, 2051]` token lists; BF16 saved output and `[T, 24]` natural-log LSE |
-| Generate selected blocks from indexer Q and compressed K | `cudnn.ops.qsa_select`, `qsa_select_decode` | QSA selector over the shared DSA scorer and top-k; returns local block IDs, not token IDs |
-| Decode selection over a paged compressed-key cache | `cudnn.ops.qsa_select_decode_paged` | BF16 indexer cache; see the paged selector's architecture and layout requirements in its docstring |
+| Generate selected blocks from indexer Q and compressed K | `cudnn.ops.qsa_select_forward`, `qsa_select_decode_forward` | QSA selector over the shared DSA scorer and top-k; returns local block IDs, not token IDs |
+| Decode selection over a paged compressed-key cache | `cudnn.ops.qsa_select_decode_paged_forward` | BF16 indexer cache; see the paged selector's architecture and layout requirements in its docstring |
 | Integrated projection, compression, selection and attention | [`GatedAttentionBlockFwd` with `QsaSpec(index_source="indexer")`](gated_attention_block.md) | Use the integrated block's own architecture, layout and inference support matrix |
 
 **Indexed attention consumes indices; the indexer generates them.** The indexed
@@ -72,7 +71,7 @@ and the packed sequence's token origin. Its standalone wrapper can be imported
 as follows:
 
 ```python
-from cudnn.ops import qsa_select, qsa_select_decode, qsa_select_decode_paged
+from cudnn.ops import qsa_select_forward, qsa_select_decode_forward, qsa_select_decode_paged_forward
 ```
 
 QSA's selector scores each complete compressed block as
@@ -84,9 +83,13 @@ visibility and tail handling remain part of the QSA contract; this reuse does
 not make QSA and DeepSeek attention interchangeable. Numerical rounding and
 top-k tie rules must also be checked before replacing an external selector.
 
-The two backward implementations have different saved-state and selection
-contracts. Do not interchange their saved tensors or infer packed support for
-the fixed-geometry two-pass entry from the bitmap or indexed APIs.
+The [internal two-pass backend](qsa_two_pass.md) currently has a different
+saved-state and selection contract: fixed 24Q/2KV, a single sequence, BF16
+saved output and `[T, 24]` LSE. It is not dispatched by the public training
+functions yet. Do not interchange its saved tensors or infer packed support
+from the bitmap or indexed APIs. Its implementation remains under `cudnn.QSA`
+while its contract is adapted; no public op class or algorithm-specific entry
+is added.
 
 The experimental QSA entries previously under `cudnn.DSA` and
 `cudnn.gated_attention_block.qsa_select*` have moved without compatibility

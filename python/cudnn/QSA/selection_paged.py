@@ -18,13 +18,13 @@ page); the scorer kernel reads them there and the deterministic radix top-k foll
 
 **Placement (Rule 7).**  This module imports no CuTe DSL -- torch, the stream helpers and the version gates only -- so the
 documented import path resolves on every installed DSL, the public 4.6.2 wheel (the floor vLLM and SGLang pin) included.
-:func:`qsa_select_decode_paged` checks every operand's FORM first, then gates the DSL floor, the ``sm_107a`` target on cc 10.7
+:func:`qsa_select_decode_paged_forward` checks every operand's FORM first, then gates the DSL floor, the ``sm_107a`` target on cc 10.7
 and the radix top-k's cc 9.0 -- each a typed ``NotImplementedError`` naming the version or the device -- and only THEN imports
 the kernel module (whose import executes the DSL, like its neighbours) inside the function body.  The kernel's host-side
 facts a declaration may need before any kernel is reached -- the MMA row map of the query rows, the compile-key validator, the
 knob defaults, the byte model -- live here for the same reason, and the kernel module imports them from here (never the other way
 round at module scope).  The kernel's SMEM table, barrier table, PDL sites and degenerate-input matrix are in the kernel
-module's docstring; :func:`qsa_select_decode_paged` documents the selection's contract.
+module's docstring; :func:`qsa_select_decode_paged_forward` documents the selection's contract.
 
 **Streams (Rule 5).**  The call resolves ONE torch stream from ``stream`` first (:func:`cudnn._torch_stream.launch_stream`: a
 ``torch.cuda.Stream``, a raw handle or a ``cuda.CUstream``; ``None`` = torch's current stream on the operands' device) and
@@ -43,7 +43,7 @@ from cudnn.api_base import TupleDict
 from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
 
 __all__ = [
-    "qsa_select_decode_paged",
+    "qsa_select_decode_paged_forward",
     "INDEX_HEAD_DIM",
     "BLOCK_SIZE",
     "QSA_TOP_K",
@@ -243,7 +243,7 @@ def _kbar_rows_view(kbar: torch.Tensor, rows_per_page: int, device) -> torch.Ten
     return view
 
 
-def qsa_select_decode_paged(
+def qsa_select_decode_paged_forward(
     qi: torch.Tensor,
     kbar: torch.Tensor,
     block_table: torch.Tensor,
@@ -310,7 +310,7 @@ def qsa_select_decode_paged(
         raise ValueError(f"kbar must be a [num_pages, page_size / {BLOCK_SIZE}, 1, {INDEX_HEAD_DIM}] tensor, got {getattr(kbar, 'shape', type(kbar).__name__)}")
     if qi.dtype == _E4M3 and kbar.dtype == _E4M3:
         raise NotImplementedError(
-            "qsa_select_decode_paged scores the bf16 indexer cache; the e4m3 pair (qi and kbar float8_e4m3fn, the fp8 indexer cache) is the "
+            "qsa_select_decode_paged_forward scores the bf16 indexer cache; the e4m3 pair (qi and kbar float8_e4m3fn, the fp8 indexer cache) is the "
             "paged scorer's e4m3 read arm, a follow-up -- pass the bf16 pair, or select over a dense e4m3 cache with the dense decode selector"
         )
     if qi.dtype != torch.bfloat16 or kbar.dtype != torch.bfloat16:
@@ -332,7 +332,9 @@ def qsa_select_decode_paged(
         raise ValueError(f"block_table needs a unit column stride on {qi.device}, got strides {tuple(block_table.stride())} on {block_table.device}")
     _check_i32_1d(kv_lens, "kv_lens", batch, qi.device)
     if d != INDEX_HEAD_DIM or (kbar.dim() == 4 and int(kbar.shape[3]) != INDEX_HEAD_DIM) or (kbar.dim() == 3 and int(kbar.shape[2]) != INDEX_HEAD_DIM):
-        raise ValueError(f"qsa_select_decode_paged scores head_dim {INDEX_HEAD_DIM} indexer heads, got qi {tuple(qi.shape)} and kbar {tuple(kbar.shape)}")
+        raise ValueError(
+            f"qsa_select_decode_paged_forward scores head_dim {INDEX_HEAD_DIM} indexer heads, got qi {tuple(qi.shape)} and kbar {tuple(kbar.shape)}"
+        )
     rows_per_page = int(kbar.shape[1])
     page_size = rows_per_page * BLOCK_SIZE
     if t != batch * int(seq_q):
@@ -377,7 +379,7 @@ def qsa_select_decode_paged(
     # Rule 7 first: the DSL floor (device-free), then the target, then the device family of the radix top-k -- BEFORE the kernel
     # module (whose import executes the DSL) or any kernel module of the DSA package is imported, so a sub-floor DSL gets the typed
     # message and never a DSL-internal import error.
-    why = cutedsl_requirement_error("qsa_select_decode_paged")
+    why = cutedsl_requirement_error("qsa_select_decode_paged_forward")
     if why is not None:
         raise NotImplementedError(why)
     device_cc = tuple(torch.cuda.get_device_capability(qi.device))
@@ -386,7 +388,7 @@ def qsa_select_decode_paged(
         raise NotImplementedError(why)
     if device_cc < (9, 0):
         raise NotImplementedError(
-            f"qsa_select_decode_paged pairs the paged scorer with the radix top-k kernel, which requires cc 9.0 or later; found cc {device_cc[0]}.{device_cc[1]} "
+            f"qsa_select_decode_paged_forward pairs the paged scorer with the radix top-k kernel, which requires cc 9.0 or later; found cc {device_cc[0]}.{device_cc[1]} "
             "(the scorer alone, kernels.qsa_score_paged.run_qsa_score_paged, runs on this device)"
         )
 

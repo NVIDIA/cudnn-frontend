@@ -382,9 +382,9 @@ pool = torch.zeros(3, 4, 1, 128, dtype=torch.bfloat16, device="cuda")
 table = torch.tensor([[0, 1]], dtype=torch.int32, device="cuda")
 kv_lens = torch.tensor([9], dtype=torch.int32, device="cuda")
 try:
-    fd.qsa_select_decode_paged(qi, pool, table, kv_lens, seq_q=1)
+    fd.qsa_select_decode_paged_forward(qi, pool, table, kv_lens, seq_q=1)
 except NotImplementedError as error:
-    assert "qsa_select_decode_paged requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2" in str(error), str(error)
+    assert "qsa_select_decode_paged_forward requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2" in str(error), str(error)
 else:
     raise AssertionError("the selector ran on a sub-floor DSL")
 assert KERNEL not in sys.modules, "the decline imported the kernel module"
@@ -408,8 +408,8 @@ def test_rule7_gates_run_before_any_compile(monkeypatch):
         monkeypatch.setattr(mod, "cutedsl_requirement_error", lambda what: f"{what} requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2")
     with pytest.raises(NotImplementedError, match="qsa_score_paged requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2"):
         sp.compile_qsa_score_paged(h_i=H, s_q=1, page_size=16)
-    with pytest.raises(NotImplementedError, match="qsa_select_decode_paged requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, **kw)
+    with pytest.raises(NotImplementedError, match="qsa_select_decode_paged_forward requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2"):
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, **kw)
     for mod in (sp, fd):
         monkeypatch.setattr(mod, "cutedsl_requirement_error", lambda what: None)
         monkeypatch.setattr(
@@ -418,13 +418,13 @@ def test_rule7_gates_run_before_any_compile(monkeypatch):
     with pytest.raises(NotImplementedError, match="sm_107a"):
         sp.compile_qsa_score_paged(h_i=H, s_q=1, page_size=16)
     with pytest.raises(NotImplementedError, match="sm_107a"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, **kw)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, **kw)
     for mod in (sp, fd):
         monkeypatch.setattr(mod, "cutedsl_arch_requirement_error", lambda cc: None)
     monkeypatch.setattr(sp, "compute_capability", lambda dev: (8, 0))
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (8, 0))
     with pytest.raises(NotImplementedError, match=r"cc 9\.0 or later; found cc 8\.0"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, **kw)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, **kw)
     with pytest.raises(NotImplementedError, match=r"griddepcontrol.*cc 8\.0"):
         sp.compile_qsa_score_paged(h_i=H, s_q=1, page_size=16, use_pdl=True)
 
@@ -433,13 +433,13 @@ def test_rule7_gates_run_before_any_compile(monkeypatch):
 def test_e4m3_pair_is_refused_by_name_and_a_mixed_pair_is_a_form_error():
     case = _Case(1, 1, 8, 16, [9], seed=2)
     with pytest.raises(NotImplementedError, match="e4m3"):
-        fd.qsa_select_decode_paged(case.qi.to(_E4M3), case.pool.to(_E4M3), case.table, case.kv_lens, seq_q=1)
+        fd.qsa_select_decode_paged_forward(case.qi.to(_E4M3), case.pool.to(_E4M3), case.table, case.kv_lens, seq_q=1)
     with pytest.raises(ValueError, match="both be bfloat16"):
-        fd.qsa_select_decode_paged(case.qi.to(_E4M3), case.pool, case.table, case.kv_lens, seq_q=1)
+        fd.qsa_select_decode_paged_forward(case.qi.to(_E4M3), case.pool, case.table, case.kv_lens, seq_q=1)
     with pytest.raises(ValueError, match="both be bfloat16"):
-        fd.qsa_select_decode_paged(case.qi, case.pool.to(_E4M3), case.table, case.kv_lens, seq_q=1)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool.to(_E4M3), case.table, case.kv_lens, seq_q=1)
     with pytest.raises(ValueError, match="both be bfloat16"):
-        fd.qsa_select_decode_paged(case.qi.half(), case.pool, case.table, case.kv_lens, seq_q=1)
+        fd.qsa_select_decode_paged_forward(case.qi.half(), case.pool, case.table, case.kv_lens, seq_q=1)
 
 
 @needs_cuda
@@ -448,47 +448,47 @@ def test_selector_form_checks_name_the_fault():
     case = _Case(2, 2, 16, 16, [9, 40], seed=3)
     kw = dict(seq_q=2)
     with pytest.raises(ValueError, match=r"head_dim 128"):
-        fd.qsa_select_decode_paged(case.qi[..., :64], case.pool, case.table, case.kv_lens, **kw)
+        fd.qsa_select_decode_paged_forward(case.qi[..., :64], case.pool, case.table, case.kv_lens, **kw)
     with pytest.raises(ValueError, match="T must be B x seq_q"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, seq_q=3)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, seq_q=3)
     with pytest.raises(ValueError, match="seq_q must be >= 1"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, seq_q=0)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, seq_q=0)
     with pytest.raises(ValueError, match="multiple of 8"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, n_blocks_max=12, **kw)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, n_blocks_max=12, **kw)
     with pytest.raises(ValueError, match="top_k must be in"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, top_k=0, **kw)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, top_k=0, **kw)
     with pytest.raises(ValueError, match="top_k must be in"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, top_k=fd.TOP_K_KERNEL_MAX + 1, **kw)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, top_k=fd.TOP_K_KERNEL_MAX + 1, **kw)
     with pytest.raises(ValueError, match="scale must be positive"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, scale=0.0, **kw)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, scale=0.0, **kw)
     with pytest.raises(ValueError, match="block_table must be an int32"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table.to(torch.int64), case.kv_lens, **kw)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table.to(torch.int64), case.kv_lens, **kw)
     with pytest.raises(ValueError, match="block_table needs a unit column stride"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table.t().contiguous().t(), case.kv_lens, **kw)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table.t().contiguous().t(), case.kv_lens, **kw)
     with pytest.raises(ValueError, match=r"kv_lens must be an int32 \[2\]"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens.to(torch.int64), **kw)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens.to(torch.int64), **kw)
     with pytest.raises(ValueError, match=r"kv_lens must be an int32 \[2\]"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens[:1], **kw)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens[:1], **kw)
     with pytest.raises(ValueError, match="kv_lens must be contiguous"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table, torch.stack([case.kv_lens, case.kv_lens], 1)[:, 0], **kw)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, torch.stack([case.kv_lens, case.kv_lens], 1)[:, 0], **kw)
     if torch.cuda.device_count() > 1:
         other_dev = torch.device("cuda", (case.qi.device.index + 1) % torch.cuda.device_count())  # a device other than the operands' own
         with pytest.raises(ValueError, match="kv_lens must live on"):
-            fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens.to(other_dev), **kw)
+            fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens.to(other_dev), **kw)
         with pytest.raises(ValueError, match="block_table needs a unit column stride on"):
-            fd.qsa_select_decode_paged(case.qi, case.pool, case.table.to(other_dev), case.kv_lens, **kw)
+            fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table.to(other_dev), case.kv_lens, **kw)
     with pytest.raises(ValueError, match="units_per_warp must be one of"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, units_per_warp=3, **kw)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, units_per_warp=3, **kw)
     with pytest.raises(ValueError, match="one compressed row"):
-        fd.qsa_select_decode_paged(case.qi, case.pool.expand(-1, -1, 2, -1), case.table, case.kv_lens, **kw)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool.expand(-1, -1, 2, -1), case.table, case.kv_lens, **kw)
     t, n = case.qi.shape[0], case.n_blocks_max
     buf = torch.empty(t * n + 4, dtype=torch.float32, device=_DEV)
     with pytest.raises(ValueError, match="32-byte aligned"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, logits_out=buf[4:].view(t, n), **kw)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, logits_out=buf[4:].view(t, n), **kw)
     with pytest.raises(ValueError, match="logits_out must be a contiguous"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, logits_out=torch.empty(t, n + 8, device=_DEV)[:, :n], **kw)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, logits_out=torch.empty(t, n + 8, device=_DEV)[:, :n], **kw)
     with pytest.raises(ValueError, match="counts_out must be a contiguous"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, counts_out=torch.empty(t, dtype=torch.int64, device=_DEV), **kw)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, counts_out=torch.empty(t, dtype=torch.int64, device=_DEV), **kw)
 
 
 @needs_cuda
@@ -527,7 +527,7 @@ def test_selector_resolves_one_launch_stream_and_runs_every_torch_op_on_it(monke
     assert side.cuda_stream != ambient.cuda_stream
     for arg, want in ((side, side.cuda_stream), (side.cuda_stream, side.cuda_stream), (None, ambient.cuda_stream)):
         seen.clear()
-        out = fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, seq_q=1, stream=arg)
+        out = fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, seq_q=1, stream=arg)
         assert [s[0] for s in seen] == ["compile", "scorer", "topk"], seen
         assert seen[1][1] == want and seen[1][2] == want, (arg, seen[1])
         assert seen[2][1] == want and seen[2][2] == want, (arg, seen[2])
@@ -773,7 +773,7 @@ def test_paged_selection_matches_the_fp64_topk_set_up_to_ties(n_blocks_max, rows
     case = _Case(4, rows, n_blocks_max, page_size, _step_kv_lens(n_blocks_max, rows), seed=n_blocks_max + 11 * rows + page_size)
     # the capacity is passed where the table's reach (whole pages) exceeds it (8 blocks on a 16-row page); where it equals, the default is exercised
     cap = dict(n_blocks_max=n_blocks_max) if case.max_pages * case.rpp != n_blocks_max else {}
-    out = fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, seq_q=rows, **cap)
+    out = fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, seq_q=rows, **cap)
     torch.cuda.synchronize()
     t = 4 * rows
     assert out["block_ids"].shape == (t, TOP_K) and out["scores"].shape == (t, TOP_K) and out["logits"].shape == (t, n_blocks_max)
@@ -786,7 +786,7 @@ def test_paged_selection_matches_the_fp64_topk_set_up_to_ties(n_blocks_max, rows
     if n_blocks_max <= TOP_K:
         want_ids, want_lens = full_block_ids(case.positions(), TOP_K, BS)
         assert torch.equal(out["block_ids"], want_ids.view(t, TOP_K).to(torch.int32)) and torch.equal(out["block_lens"], want_lens.view(-1).to(torch.int32))
-    again = fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, seq_q=rows, **cap)
+    again = fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, seq_q=rows, **cap)
     torch.cuda.synchronize()
     for key in ("block_ids", "counts", "block_lens"):
         assert torch.equal(out[key], again[key]), f"two calls differ in {key}"
@@ -802,8 +802,8 @@ def test_selector_preallocated_outputs_are_written_in_place_and_match():
     logits = torch.full((t, 1024), SENTINEL, dtype=torch.float32, device=_DEV)
     counts = torch.full((t,), -7, dtype=torch.int32, device=_DEV)
     lens = torch.full((t,), -7, dtype=torch.int32, device=_DEV)
-    out = fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, seq_q=2, logits_out=logits, counts_out=counts, block_lens_out=lens)
-    base = fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, seq_q=2)
+    out = fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, seq_q=2, logits_out=logits, counts_out=counts, block_lens_out=lens)
+    base = fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, seq_q=2)
     torch.cuda.synchronize()
     assert out["logits"].data_ptr() == logits.data_ptr() and out["counts"].data_ptr() == counts.data_ptr() and out["block_lens"].data_ptr() == lens.data_ptr()
     _assert_scorer(case, logits, counts, lens)
@@ -815,9 +815,9 @@ def test_selector_preallocated_outputs_are_written_in_place_and_match():
 def test_selector_knobs_are_the_same_function():
     """``units_per_warp`` and ``use_pdl`` (cc 9.0+) are performance knobs of the selector: block_ids and scores bitwise."""
     case = _Case(2, 3, 4096, 16, [4 * 4096 - 2, 4 * 1000 + 1], seed=13)
-    base = fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, seq_q=3)
+    base = fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, seq_q=3)
     for kw in (dict(units_per_warp=1), dict(units_per_warp=4), dict(use_pdl=True)):
-        other = fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, seq_q=3, **kw)
+        other = fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, seq_q=3, **kw)
         torch.cuda.synchronize()
         assert torch.equal(base["block_ids"], other["block_ids"]) and torch.equal(_bits(base["scores"]), _bits(other["scores"])), kw
 
@@ -838,12 +838,12 @@ def test_selector_on_a_side_stream_with_the_ambient_stream_parked_matches_the_sy
     case = _Case(3, 2, 4096, 16, [4 * 4096 - 2, 4 * 1000 + 1, 4 * 20 + 2], seed=16)
     ambient, side = torch.cuda.default_stream(), torch.cuda.Stream()
     assert torch.cuda.current_stream() == ambient and side != ambient
-    control = fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, seq_q=2)
+    control = fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, seq_q=2)
     torch.cuda.synchronize()
     ref = case.reference(D**-0.5).view(6, 4096)
     _assert_rows(control["block_ids"], control["scores"], control["block_lens"], ref, TOP_K)
     park_the_default_stream(3.0)  # the AMBIENT stream is busy from here, through the call and past the comparison
-    out = fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, seq_q=2, stream=side)
+    out = fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, seq_q=2, stream=side)
     parked_at_issue = not ambient.query()
     side.synchronize()  # the LAUNCH stream only
     with torch.cuda.stream(side):
@@ -876,7 +876,7 @@ def test_selector_with_another_device_current():
     target = torch.cuda.current_device()
     other = next(i for i in range(torch.cuda.device_count()) if i != target)
     case = _Case(2, 3, 1032, 16, [4 * 1032 - 1, 4 * 300 + 2], seed=23)
-    control = fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, seq_q=3)
+    control = fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, seq_q=3)
     torch.cuda.synchronize(target)
     ref = case.reference(D**-0.5).view(6, 1032)
     _assert_rows(control["block_ids"], control["scores"], control["block_lens"], ref, TOP_K)
@@ -885,7 +885,7 @@ def test_selector_with_another_device_current():
         _evict_scorer_memo(H, 3, 16)  # the scorer compiles COLD under the foreign device each time (the control above would otherwise have warmed it)
         with torch.cuda.device(other):
             with torch.cuda.stream(torch.cuda.default_stream(other)):  # the default-stream sentinel of a FOREIGN device
-                out = fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, seq_q=3, stream=arg)
+                out = fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, seq_q=3, stream=arg)
                 assert torch.cuda.current_device() == other, "the caller's current device was not restored"
         torch.cuda.synchronize(target)
         assert out["logits"].device.index == target and out["block_ids"].device.index == target
@@ -942,10 +942,10 @@ def test_paged_entry_agrees_with_the_dense_selector_when_that_module_is_present(
     dense_mod = importlib.import_module("cudnn.QSA.selection")
     rows, n_blocks_max = 4, 2048
     case = _Case(3, rows, n_blocks_max, 16, [4 * 1500 + 1 + rows, 4 * 2000 + 3 + rows, 4 * 300 + rows], seed=14)
-    paged = fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, seq_q=rows)
+    paged = fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, seq_q=rows)
     dense, decline = None, None
     try:
-        dense = dense_mod.qsa_select_decode(case.qi.view(3, rows, H, D), case.dense().contiguous(), case.kv_lens, list_per_sequence=False)
+        dense = dense_mod.qsa_select_decode_forward(case.qi.view(3, rows, H, D), case.dense().contiguous(), case.kv_lens, list_per_sequence=False)
     except NotImplementedError as error:
         decline = str(error)
     if dense is None:

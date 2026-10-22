@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for the GQA index-list sparse (QSA) backward on SM100 / SM103, ``cudnn.ops.qsa_two_pass_backward``."""
+"""Tests for the GQA index-list sparse (QSA) backward on SM100 / SM103, the internal two-pass backend."""
 
 from unittest.mock import patch
 
@@ -9,8 +9,7 @@ import pytest
 import torch
 from cuda.bindings import driver as cuda
 
-from cudnn import ops
-from cudnn.QSA.two_pass import QsaTwoPassBackward
+from cudnn.QSA.two_pass.api import _QsaTwoPassBackward, _backward
 from cudnn.api_base import TensorDesc
 from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
 
@@ -60,7 +59,7 @@ def _check_against_reference(inputs, grads):
 def test_qsa_backward_matches_reference(seq_len, grad_scale):
 
     inputs = make_inputs(seq_len, seed=seq_len, grad_scale=grad_scale)
-    grads = ops.qsa_two_pass_backward(*(inputs[name] for name in _INPUT_NAMES))
+    grads = _backward(*(inputs[name] for name in _INPUT_NAMES))
     _check_against_reference(inputs, (grads["dq"], grads["dk"], grads["dv"]))
 
 
@@ -71,7 +70,7 @@ def test_qsa_backward_matches_reference(seq_len, grad_scale):
 def test_qsa_backward_long_sequences(seq_len):
 
     inputs = make_inputs(seq_len, seed=seq_len)
-    grads = ops.qsa_two_pass_backward(*(inputs[name] for name in _INPUT_NAMES))
+    grads = _backward(*(inputs[name] for name in _INPUT_NAMES))
     _check_against_reference(inputs, (grads["dq"], grads["dk"], grads["dv"]))
 
 
@@ -96,7 +95,7 @@ def test_wrapper_on_explicit_stream_with_preallocated_outputs(monkeypatch):
     dq, dk, dv = torch.empty_like(inputs["q"]), torch.empty_like(inputs["k"]), torch.empty_like(inputs["v"])
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
-    grads = ops.qsa_two_pass_backward(*args, dq=dq, dk=dk, dv=dv, stream=cuda.CUstream(side.cuda_stream))
+    grads = _backward(*args, dq=dq, dk=dk, dv=dv, stream=cuda.CUstream(side.cuda_stream))
     torch.cuda.current_stream().wait_stream(side)
     assert streams == [side.cuda_stream] * 9  # one launch per kernel of the dense + sparse sequence
     assert grads["dq"] is dq and grads["dk"] is dk and grads["dv"] is dv
@@ -112,7 +111,7 @@ def test_execute_allocates_nothing_and_never_synchronizes(seq_len, monkeypatch, 
     monkeypatch.setattr(kernel, "_COMPILED", {})
     inputs = make_inputs(seq_len, seed=5)
     args = [inputs[name] for name in _INPUT_NAMES]
-    plan = QsaTwoPassBackward(*args)
+    plan = _QsaTwoPassBackward(*args)
     assert plan.check_support()
     compile_allocates_nothing(plan)
     outputs = [torch.empty_like(inputs[name]) for name in ("q", "k", "v")]
@@ -140,7 +139,7 @@ def test_first_execute_under_cuda_graph_capture_replays_new_inputs(seq_len, monk
     first, second = make_inputs(seq_len, seed=21), make_inputs(seq_len, seed=22)
     static = {name: first[name].clone() for name in _INPUT_NAMES}
     args = [static[name] for name in _INPUT_NAMES]
-    plan = QsaTwoPassBackward(*args)
+    plan = _QsaTwoPassBackward(*args)
     plan.compile()
     grads = [torch.empty_like(first[name]) for name in ("q", "k", "v")]
     workspace = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda")
@@ -159,7 +158,7 @@ def test_execute_requires_workspace_and_compiled_contract():
 
     inputs = make_inputs(64, seed=7)
     args = [inputs[name] for name in _INPUT_NAMES]
-    plan = QsaTwoPassBackward(*args)
+    plan = _QsaTwoPassBackward(*args)
     plan.compile()
     outputs = [torch.empty_like(inputs[name]) for name in ("q", "k", "v")]
     with pytest.raises(ValueError, match="workspace"):
@@ -199,16 +198,16 @@ def test_check_support_declines(name, changes, error, match):
 
     descs = _with(_sample_descs(), name, **changes)
     with pytest.raises(error, match=match):
-        QsaTwoPassBackward(*(descs[n] for n in _INPUT_NAMES)).check_support()
+        _QsaTwoPassBackward(*(descs[n] for n in _INPUT_NAMES)).check_support()
 
 
 @pytest.mark.L0
 def test_check_support_declines_other_softmax_scales():
 
     descs = _sample_descs()
-    assert QsaTwoPassBackward(*(descs[n] for n in _INPUT_NAMES), softmax_scale=1 / 16).check_support()
+    assert _QsaTwoPassBackward(*(descs[n] for n in _INPUT_NAMES), softmax_scale=1 / 16).check_support()
     with pytest.raises(NotImplementedError, match="softmax_scale"):
-        QsaTwoPassBackward(*(descs[n] for n in _INPUT_NAMES), softmax_scale=0.1).check_support()
+        _QsaTwoPassBackward(*(descs[n] for n in _INPUT_NAMES), softmax_scale=0.1).check_support()
 
 
 @pytest.mark.L0
@@ -228,7 +227,7 @@ def test_check_support_bounds_the_sequence_length():
         stride = tuple(int(torch.tensor(shape[i + 1 :]).prod()) for i in range(len(shape)))
         descs[name] = TensorDesc(dtype, shape, stride, tuple(reversed(range(len(shape)))), torch.device("cuda", torch.cuda.current_device()))
     with pytest.raises(ValueError, match="sequence length"):
-        QsaTwoPassBackward(*(descs[n] for n in _INPUT_NAMES)).check_support()
+        _QsaTwoPassBackward(*(descs[n] for n in _INPUT_NAMES)).check_support()
 
 
 @pytest.mark.L0
@@ -238,7 +237,7 @@ def test_old_dsl_and_other_architecture_rejected():
     old_dsl = (True, ("nvidia-cutlass-dsl", "4.6.2"))
     with patch("cudnn.frost.buffers.cutedsl_state", return_value=old_dsl):
         with pytest.raises(NotImplementedError, match="4.7"):
-            QsaTwoPassBackward(*(descs[n] for n in _INPUT_NAMES)).check_support()
+            _QsaTwoPassBackward(*(descs[n] for n in _INPUT_NAMES)).check_support()
     with patch.object(torch.cuda, "get_device_capability", return_value=(9, 0)):
         with pytest.raises(NotImplementedError, match="SM100"):
-            QsaTwoPassBackward(*(descs[n] for n in _INPUT_NAMES)).check_support()
+            _QsaTwoPassBackward(*(descs[n] for n in _INPUT_NAMES)).check_support()
