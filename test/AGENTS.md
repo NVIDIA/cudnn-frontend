@@ -109,6 +109,13 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 
 ### Conventions for new tests
 
+- Host-only compile-cache tests that replace `cute.compile` must also isolate
+  architecture-dependent compiler options evaluated before that call. Mock
+  `compile_options()` when no compilation is intended, so an otherwise valid
+  test does not query the real GPU and fail on supported non-DSA CI hosts.
+  Detector: `test_DSA_sparse_attention_backward_sm100_d576_compile_cache_separates_address_width`
+  on A100 with CuTe DSL 4.6.2.
+
 - Source-routing regexes must handle long multiline non-matches without
   exponential backtracking. A negated character class already includes newlines;
   do not repeat an overlapping newline alternative under `*`.
