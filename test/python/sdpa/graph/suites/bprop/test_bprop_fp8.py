@@ -15,6 +15,7 @@ from sdpa.random_config import (
     SlidingWindowMaskGenerator,
 )
 from sdpa.graph.suites.common import (
+    Fixed,
     COMMON_FUZZ,
     MASK_FUZZ,
     SuiteSpec,
@@ -22,6 +23,7 @@ from sdpa.graph.suites.common import (
     run_suite,
 )
 from sdpa.graph.suites.knobs import (
+    BPROP_SCORE_CELLS_FP8,
     DIAG_BOTH,
     SW_FULL,
 )
@@ -32,11 +34,12 @@ def fp8_bwd():
         batches=RandomBatchSize(min=1, max=4, with_high_probability=[1, 2]),
         s_q_s_kv=RandomSequenceLength(
             s_q_min=64,
-            s_q_max=8192,
+            s_q_max=16384,
             s_kv_min=64,
-            s_kv_max=8192,
+            s_kv_max=16384,
             s_q_distribution={"s_q=1": 0, "s_q=s_kv": 5, "s_q=random": 5},
         ),
+        max_score_cells=Fixed(BPROP_SCORE_CELLS_FP8),
         d_qk_d_v=RandomHiddenDimSize(
             d_qk_min=64,
             d_qk_max=192,
@@ -76,11 +79,12 @@ def fp8_thd_bwd():
         batches=RandomBatchSize(min=1, max=4, with_high_probability=[1, 2]),
         s_q_s_kv=RandomSequenceLength(
             s_q_min=64,
-            s_q_max=8192,
+            s_q_max=16384,
             s_kv_min=64,
-            s_kv_max=8192,
+            s_kv_max=16384,
             s_q_distribution={"s_q=1": 0, "s_q=s_kv": 5, "s_q=random": 5},
         ),
+        max_score_cells=Fixed(BPROP_SCORE_CELLS_FP8),
         d_qk_d_v=RandomHiddenDimSize(
             d_qk_min=64,
             d_qk_max=128,
