@@ -1426,6 +1426,7 @@ def test_DSA_sparse_attention_backward_sm100_cluster4_fp16():
         pytest.param(96, 576, 64, torch.bfloat16, False, "h96_h64_h32", id="h96"),
         pytest.param(128, 512, 128, torch.bfloat16, False, "h128_2cta_m64", id="h128-two-cta"),
         pytest.param(64, 512, 64, torch.bfloat16, True, "generic_m64", id="deterministic-generic-bf16"),
+        pytest.param(64, 576, 129, torch.bfloat16, True, "generic_m64", id="deterministic-generic-d576-bf16"),
         pytest.param(64, 512, 64, torch.float16, True, "generic_m64", id="deterministic-generic-fp16"),
         pytest.param(96, 576, 128, torch.bfloat16, True, "h96_d576_2cta_m64", id="deterministic-h96-d576-two-cta"),
         pytest.param(128, 512, 128, torch.bfloat16, True, "h128_2cta_m64", id="deterministic-h128-two-cta"),
@@ -2465,6 +2466,27 @@ def test_DSA_sparse_attention_backward_wrapper_generic_d512_reducer_generations(
         request=request,
         allow_unsupported=False,
         s_q_default=3,
+    )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("deterministic", [False, True], ids=["ordinary", "deterministic"])
+@torch_fork_set_rng(seed=425)
+def test_DSA_sparse_attention_backward_wrapper_generic_d576_reducer_generations(deterministic, request):
+    """Exercise three sparse tiles through every generic D576 reducer mode."""
+    _require_sm100()
+    _run_DSA_sparse_attention_backward_wrapper(
+        dtype=torch.bfloat16,
+        acc_dtype=torch.float32,
+        head_dim=576,
+        head_dim_v=512,
+        num_heads=64,
+        topk=129,
+        has_topk_length=False,
+        request=request,
+        allow_unsupported=False,
+        s_q_default=3,
+        deterministic=deterministic,
     )
 
 
