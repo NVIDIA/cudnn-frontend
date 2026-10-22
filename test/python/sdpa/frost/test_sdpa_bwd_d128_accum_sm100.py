@@ -33,9 +33,7 @@ def test_implementation_selection_is_plan_time():
         {"dsl_version": ("nvidia-cutlass-dsl", "4.7.1")},
         {"dsl_version": ("nvidia-cutlass-dsl-internal", "0.3.0")},
         {"dsl_version": None},
-        {"sq": 129},
-        {"skv": 129},
-        {"sq": 1},
+        {"sq": 0},
         {"batch": 65536},
         {"heads": 65536},
         {"batch": 65535, "heads": 257},
@@ -48,7 +46,9 @@ def test_implementation_selection_is_plan_time():
         {"scale": 3e38},
     ):
         assert select_implementation(**(args | changed)) == RECOMPUTE, changed
-    assert select_implementation(**(args | {"sq": 256, "skv": 128})) == ACCUMULATION
+    # Unaligned sequence lengths stay on the accumulation route: tail tiles are zero-filled on load and clipped on store.
+    for changed in ({"sq": 256, "skv": 128}, {"sq": 129}, {"skv": 129}, {"sq": 1}, {"skv": 1}):
+        assert select_implementation(**(args | changed)) == ACCUMULATION, changed
 
 
 def test_accumulation_sequence_scalars_fit_int32():
@@ -78,6 +78,13 @@ def test_accumulation_scheduler_divisor_fits_int32():
         (torch.bfloat16, True, 128, 256),
         (torch.float16, False, 256, 128),
         (torch.float16, True, 128, 128),
+        # Tail tiles on either side: zero-filled loads, clipped stores, -inf Stats.  (Not sk=1: a single key makes
+        # the oracle's dQ / dK identically zero, an exact-zero gate the separately rounded delta launch cannot meet.)
+        (torch.bfloat16, False, 65, 129),
+        (torch.float16, True, 257, 193),
+        (torch.bfloat16, True, 333, 333),
+        (torch.float16, False, 65, 3),
+        (torch.bfloat16, False, 1, 65),
     ],
 )
 def test_accumulation_matches_fp64(dt, causal, sq, sk):
@@ -85,10 +92,54 @@ def test_accumulation_matches_fp64(dt, causal, sq, sk):
     _case(dt=dt, causal=causal, b=2, h=3, sq=sq, sk=sk, accumulation=True)
 
 
+@pytest.mark.parametrize("dt", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+def test_accumulation_tail_keys_with_negative_lse(dt):
+    """A tail KV tile whose zero-filled key rows meet a very negative LSE: Q = 3 and K = -4 + randn put every row's
+    LSE near -130, so an unmasked tail row would exponentiate exp(-LSE) to inf and poison dQ through inf * 0.  The
+    tail rows are masked before the exponent, so every gradient matches the fp64 oracle.  (The noise on K keeps dQ
+    well conditioned: with a constant K the oracle's dQ is a pure cancellation residual.)"""
+    _require_accumulation()
+    from frost_test_utils import select_engine
+    from test_sdpa_bwd_d128_sm100 import _ENGINE
+    from test_sdpa_bwd_dsl_sm107 import _bshd_empty, _build_graph, _check
+
+    b, h, sq, sk = 1, 1, 65, 129
+    gen = torch.Generator(device="cpu").manual_seed(731)
+    q = torch.full((b, sq, h, 128), 3.0).to(device="cuda", dtype=dt).permute(0, 2, 1, 3)
+    k = (torch.full((b, sk, h, 128), -4.0) + torch.randn(b, sk, h, 128, generator=gen)).to(device="cuda", dtype=dt).permute(0, 2, 1, 3)
+    v = torch.randn(b, sk, h, 128, generator=gen).to(device="cuda", dtype=dt).permute(0, 2, 1, 3)
+    do = torch.randn(b, sq, h, 128, generator=gen).to(device="cuda", dtype=dt).permute(0, 2, 1, 3)
+    o64, lse, _, *expected = _reference64(q, k, v, do)
+    assert lse.max().item() < -100, "the regression needs exp(-LSE) to overflow FP32"
+    tensors = dict(q=q, k=k, v=v, do=do, o=_bshd_empty(b, sq, h, 128, dt).copy_(o64), stats=lse.float().unsqueeze(-1).contiguous())
+    tensors.update(
+        dq=_bshd_empty(b, sq, h, 128, dt, fill=float("nan")),
+        dk=_bshd_empty(b, sk, h, 128, dt, fill=float("nan")),
+        dv=_bshd_empty(b, sk, h, 128, dt, fill=float("nan")),
+    )
+    graph, refs, outputs = _build_graph(b=b, hq=h, sq=sq, skv=sk, d=128, dt=dt, use_causal_mask=False, scale="default")
+    select_engine(graph, _ENGINE)
+    graph.check_support()
+    graph.build_plans()
+    assert graph._compiled_plans[graph._plan_index]._prepared.spec.artifact.implementation == "accumulation"
+    refs.update(zip(("dq", "dk", "dv"), outputs))
+    workspace = torch.empty(graph.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    graph.execute({refs[name]: value for name, value in tensors.items()}, workspace)
+    for name, want in zip(("dq", "dk", "dv"), expected):
+        _check(name, tensors[name], want, dt)
+
+
+@pytest.mark.parametrize("dt", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+def test_accumulation_single_key_numerics(dt):
+    """One key: the oracle's dQ / dK are identically zero, so they are compared by absolute tolerance; dV keeps the fp64 gate."""
+    _require_accumulation()
+    _case(dt=dt, b=2, h=3, sq=65, sk=1, accumulation=True, allow_zero=True)
+
+
 @pytest.mark.parametrize("dt,causal", [(torch.bfloat16, False), (torch.float16, True)], ids=["bf16-unmasked", "fp16-causal"])
 def test_negative_scale_preserves_recompute_route(dt, causal):
     _require_accumulation()
-    _case(dt=dt, causal=causal, sq=128, sk=256, scale=-0.125)
+    _case(dt=dt, causal=causal, sq=128, sk=256, scale=-0.125, accumulation=None)
 
 
 @pytest.mark.parametrize("dt,causal", [(torch.bfloat16, True)])

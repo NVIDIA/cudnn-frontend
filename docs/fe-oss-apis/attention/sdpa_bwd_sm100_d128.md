@@ -19,15 +19,17 @@ graph.execute(variant_pack, workspace)
 ```
 
 Plan construction selects the implementation from declarations and the build
-device. On SM100 or SM103 with public CuTeDSL 4.8 or newer, positive attention scale and
-both sequence lengths divisible by 128, the MHA three-kernel chain computes the row
-delta while initializing FP32 dQ scratch, accumulates dQ and writes dK/dV,
-then converts dQ to the output type. The output conversion applies no extra
-scale. Its scratch size is `4 * B * H * S_q * 129 + 240` bytes. The final 240
-bytes cover internal alignment for any valid 16-byte-aligned caller workspace.
+device. On SM100 or SM103 with public CuTeDSL 4.8 or newer and a positive attention
+scale, the MHA three-kernel chain computes the row delta while initializing FP32 dQ
+scratch, accumulates dQ and writes dK/dV, then converts dQ to the output type.
+Sequence lengths need not be multiples of 128: the tail tiles' loads are zero-filled,
+their stores and dQ reductions are clipped, and the tail Stats rows contribute nothing.
+The output conversion applies no extra scale. Its scratch size is
+`4 * B * H * round_up(S_q, 128) * 129 + 240` bytes. The final 240 bytes cover internal
+alignment for any valid 16-byte-aligned caller workspace.
 
-Other dense MHA declarations in the existing envelope, including sequence tails and
-negative finite nonzero scales, retain the one-kernel implementation with
+Other dense MHA declarations in the existing envelope, including negative finite
+nonzero scales and older CuTeDSL releases, retain the one-kernel implementation with
 zero workspace. Always query the plan's size rather than assuming either
 implementation. Zero and nonfinite scales are unsupported.
 
