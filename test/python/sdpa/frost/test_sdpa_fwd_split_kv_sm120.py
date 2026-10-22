@@ -503,15 +503,17 @@ def test_sm120_split_stats_base(d, stats_log2):
 
 
 @requires_blackwell_geforce
-@pytest.mark.parametrize("fp8", [False, True], ids=["f16", "fp8"])
+@pytest.mark.parametrize("fp8,q_tile", [(False, 64), (False, 16), (True, 64)], ids=["f16", "f16-decode", "fp8"])
 @pytest.mark.parametrize("splits", [1, 4], ids=["unsplit", "split4"])
 @pytest.mark.parametrize("stats_log2", [False, True], ids=["ln", "log2"])
-def test_sm120_direct_template_stats_base(fp8, splits, stats_log2):
+def test_sm120_direct_template_stats_base(fp8, q_tile, splits, stats_log2):
     """Direct callers may enable log2 even on a partial-producing template.
 
     The adapter clears that flag before compiling partials, so going through
     it cannot detect a missing kernel-entry guard. Check the actual partial
-    LSE units here, then feed them to the real natural-log combiner.
+    LSE units here, then feed them to the real natural-log combiner. The half
+    decode tile (``q_tile`` 16, 16-key stages at d128) is a separate template
+    with its own guard; its splits cover the same 128-key chunks.
     """
     import cutlass
     import cuda.bindings.driver as cuda
@@ -536,8 +538,8 @@ def test_sm120_direct_template_stats_base(fp8, splits, stats_log2):
     params = TemplateParams(
         dtype_qkv=DTYPE_E4M3 if fp8 else DTYPE_FP16,
         dtype_o=DTYPE_FP16,
-        q_tile=64,
-        kv_tile=128,
+        q_tile=q_tile,
+        kv_tile=16 if q_tile == 16 else 128,
         split_kv=splits,
         stats_log2=stats_log2,
     )

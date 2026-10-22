@@ -550,13 +550,15 @@ def test_sm120_split_model_counts_whole_tokens_per_packed_tile():
 def test_sm120_pack_gqa_sets_split_for_their_own_launch(monkeypatch, over):
     """The split chooser (mocked) sees each set's own launch -- G-head packed units, or G x as many unpacked -- so
     the unpacked runner of a packed lead carries its own answer, not the packed launch's split, and so does a tile
-    runner: at S_q = 31 the 128-row packed lead launches two Q tiles per KV head, its 64-row runner four."""
+    runner: at S_q = 31 the 128-row packed lead launches two Q tiles per KV head, its 64-row runner four.  The decode
+    tile's own chooser is mocked with the same rule over its unit count."""
     from cudnn.sdpa.fwd import heuristics
 
     def by_units(*, q_tiles, heads_q, batch, **_):
         return max(1, 256 // (q_tiles * heads_q * batch))
 
     monkeypatch.setattr(heuristics, "choose_split_kv", by_units)
+    monkeypatch.setattr(heuristics, "choose_sm120_decode_split_kv", lambda *, units, **_: max(1, 256 // units))
     monkeypatch.setattr(heuristics, "_MAX_SETS_PER_ENGINE", 64)
     facts = _sm120_gqa6_facts(**{**dict(s_q=1, s_kv=16384, causal=False), **over})
     sets = heuristics._knob_sets(_sm120_spec(), facts)

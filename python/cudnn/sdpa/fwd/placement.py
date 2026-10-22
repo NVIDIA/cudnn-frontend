@@ -94,6 +94,11 @@ SM120 PackGQA now also packs those groups (tile_q % G != 0); packed, they still 
 FROST/backend 1.00-1.44 over G = 3 / 5 / 6 / 12, b 1-16, KV 4k-128k (2026-10-20, same part and cuDNN, SM
 and memory clocks locked, profiler kernel time, median of three alternating pairs, CV <= 0.6%): 1.35-1.44 at
 b = 1 on a 4k cache, within 2% from 64k or 8 batches up -> still TRAIL.
+The 16- / 32-row decode tile leaves ``s_q == 1`` backend-first: FROST/backend 0.96-1.25 over 120 cases
+(GQA 2 / 4 / 6 / 8, d64 / d128 / d256, b 1-16, KV 4k-128k; RTX PRO 6000 Server Edition, SM / memory clocks
+locked at 2100 / 12481 MHz, cuDNN 9.27.0.42, profiler kernel time, median of three alternating pairs, CV <=
+1.2%): 1.11-1.24 at b = 1 on a 4k cache, within 4% from a 64k cache, and the d256 leads at 12+ KV units
+run 1.00-1.05 -> the rule above stands.
 
 SM90 f16/bf16 row (H100 SXM; d512 only, the row floors its envelope at 256): prefill 0.22-0.40 and
 ``2 <= s_q <= 16`` 0.02-0.63 on every cell. There is no split-KV on SM90, so ``s_q == 1`` wins only
