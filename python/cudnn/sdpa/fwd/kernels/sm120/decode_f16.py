@@ -793,10 +793,17 @@ class SM120DecodeForward:
                         sinks_arr = cutlass.make_array_view(sinks)
                         sink_logit = cutlass.Float32(sinks_arr[q_head_base + row_in_cta % self.group])
                         new_max = cute.arch.fmax(row_max_nat, sink_logit)
-                        alpha = cute.math.exp(row_max_nat - new_max, fastmath=True)
-                        new_sum = row_sum[row_half] * alpha + cute.math.exp(sink_logit - new_max, fastmath=True)
-                        row_sum_inv[row_half] = alpha / new_sum
-                        row_lse[row_half] = new_max + cute.math.log(new_sum, fastmath=True)
+                        # A keyless row whose sink is -inf (disabled) weighs nothing:
+                        # O := 0 / LSE := -inf, not exp(-inf - -inf) = NaN.
+                        inv = cutlass.Float32(0.0)
+                        lse_val = -cutlass.Float32.inf
+                        if new_max > -cutlass.Float32.inf:
+                            alpha = cute.math.exp(row_max_nat - new_max, fastmath=True)
+                            new_sum = row_sum[row_half] * alpha + cute.math.exp(sink_logit - new_max, fastmath=True)
+                            inv = alpha / new_sum
+                            lse_val = new_max + cute.math.log(new_sum, fastmath=True)
+                        row_sum_inv[row_half] = inv
+                        row_lse[row_half] = lse_val
                     else:
                         inv = cutlass.Float32(0.0)
                         if row_sum[row_half] > 0.0:

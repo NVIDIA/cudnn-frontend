@@ -94,6 +94,7 @@ def _decode_case(
     pack_gqa: bool = True,
     split_kv: int = 1,
     sink: bool = False,
+    sink_off: tuple = (),
     causal: Optional[bool] = None,
     bottom_right: bool = True,
     window_left: Optional[int] = None,
@@ -108,7 +109,8 @@ def _decode_case(
     nan_kv_tail: bool = False,
 ) -> _DecodeRun:
     """Run one explicit plan through SdpaFwdDslSm120 over the serving layout
-    (BSHD storage viewed as BHSD). ``nan_kv_tail`` hands the kernel K / V whose
+    (BSHD storage viewed as BHSD). ``sink_off`` lists query heads whose sink
+    logit is -inf (a disabled sink). ``nan_kv_tail`` hands the kernel K / V whose
     rows past each batch's ``seq_kv`` length are NaN; the oracle reads the
     finite originals."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
@@ -122,6 +124,8 @@ def _decode_case(
     o = torch.full((batch, s_q, h_q, d_v), float("nan"), device="cuda", dtype=dtype).transpose(1, 2)
     lse = torch.full((batch, h_q, s_q), float("nan"), device="cuda", dtype=torch.float32) if with_lse else None
     sinks = torch.randn(h_q, device="cuda", dtype=torch.float32) if sink else None
+    if sink_off:
+        sinks[list(sink_off)] = float("-inf")
     seq_q_t = None if seq_q is None else torch.tensor(seq_q, device="cuda", dtype=torch.int32)
     seq_kv_t = None if seq_kv is None else torch.tensor(seq_kv, device="cuda", dtype=torch.int32)
     api = SdpaFwdDslSm120(
@@ -589,6 +593,9 @@ def test_decode_tile_keeps_a_nan_kv_tail_out_of_o(h_q, h_kv, s_q, d, tile_m):
         dict(h_q=32, h_kv=8, s_q=4, s_kv=700, batch=3, seq_q=[4, 1, 0], seq_kv=[700, 33, 5], sink=True),  # padded queries
         dict(h_q=32, h_kv=8, s_q=4, s_kv=2, split_kv=2),  # rows 0-1 see no key; one split chunk is empty
         dict(h_q=32, h_kv=8, s_q=4, s_kv=2, split_kv=2, sink=True),  # the same rows land on the sink
+        dict(h_q=32, h_kv=8, s_q=4, s_kv=2, sink=True, sink_off=(0, 5)),  # ... or stay O := 0 / LSE := -inf where the sink is -inf
+        dict(h_q=32, h_kv=8, s_q=4, s_kv=2, split_kv=2, sink=True, sink_off=(0, 5)),  # the same through the combine
+        dict(h_q=32, h_kv=8, s_q=1, s_kv=64, batch=2, seq_kv=[64, 0], sink=True, sink_off=(0, 5)),  # a batch with no keys
     ],
 )
 def test_decode_tile_masks_scale_and_padded_queries(case):
