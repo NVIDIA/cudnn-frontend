@@ -1182,6 +1182,74 @@ def test_unsplit_leg_accounting_moves_the_wide_head_flavors_too():
 
 
 @pytest.mark.L0
+def test_sm100_d192_half_proposals_are_admissible_and_transport_the_chooser(monkeypatch):
+    """Every set the SM100 f16 row proposes for a dense half-input d192x128 MHA graph passes mismatch() and sits in
+    the flavor's width domain at the sequence lengths around the 512-row pair geometry, masked or not; and the lead
+    set carries exactly the width and scheduler select_d192_auto_knobs returns (transport, the chooser mocked both
+    ways).  Which width wins where is the chooser's measured business, not a contract of this test."""
+    from cudnn.sdpa.fwd import heuristics as heur
+
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _F16)
+
+    def facts(**over):
+        base = dict(b=8, h_q=64, h_kv=64, d_qk=192, d_v=128, dtype=cudnn.data_type.BFLOAT16)
+        base.update(over)
+        return _facts(**base)
+
+    for s in (128, 256, 384, 512, 768, 1024, 1280, 1792, 2048):
+        for causal in (True, False):
+            f = facts(s_q=s, s_kv=s, causal=causal)
+            plans = [p for p in recommend("A", f, _OFFERED) if p.engine_id == 20500]
+            assert plans, (s, causal)
+            for p in plans:
+                assert engines.mismatch(spec.capabilities, f, p.knobs) is None, (s, causal, p.knobs)
+                assert p.knobs.cga in engines.effective_cgas(spec.capabilities, f), (s, causal, p.knobs)
+    for forced in ((SCHED_LPT, 1), (SCHED_NATURAL, 2)):
+        # The split leg keeps the real chooser's answer (the pair): only the unsplit lead is forced.
+        monkeypatch.setattr(heur, "select_d192_auto_knobs", lambda params, _forced=forced, **kw: _forced if params.split_kv == 1 else (SCHED_NATURAL, 2))
+        lead = [p for p in recommend("A", facts(s_q=640, s_kv=640), _OFFERED) if p.engine_id == 20500][0]
+        assert (lead.knobs.sched_policy, lead.knobs.cga) == forced
+
+
+@pytest.mark.L0
+def test_d192_half_default_width_constructs_on_both_targets():
+    """The width select_d192_auto_knobs returns for a dense causal half-input MHA graph constructs a configuration on
+    the target it was asked about: the SM100 factory for cc 10.0 / 10.3, the SM107 factory for cc 10.7 -- whose d192
+    tile has no single-CTA configuration, so the selector must leave that target on the pair."""
+    from dataclasses import replace
+
+    from cudnn.sdpa.fwd import config_sm100 as c100
+    from cudnn.sdpa.fwd import config_sm107 as c107
+    from cudnn.sdpa.fwd.heuristics import select_d192_auto_knobs
+
+    for cc, cfgmod in (((10, 0), c100), ((10, 3), c100), ((10, 7), c107)):
+        for s in (128, 256, 384, 512, 768, 1024):
+            params = cfgmod.TemplateParams(window_right=0)  # top-left causal
+            sched, cga = select_d192_auto_knobs(params, pertensor=False, s_q=s, s_kv=s, device_cc=cc)
+            cfg, _ = cfgmod.make_cfg_d192(replace(params, cta_mma=cga, sched_policy=sched))
+            assert cfg.CTA_MMA == cga, (cc, s)
+            if cc == (10, 7):
+                assert cga == 2, (cc, s)
+
+
+@pytest.mark.L0
+def test_sm100_d192_half_single_cta_ring_geometry():
+    """The half-input single-CTA d192 tile runs K as three 16 KiB D-subtile slots over one stage and V double-buffered
+    (208 KiB under the Q u O slab); the pair and the FP8 single-CTA tile keep one depth for both rings
+    (config_sm100.CfgD192.STAGES_K / STAGES_V / K_SUB)."""
+    from cudnn.frost.tile_dsl.constants import DTYPE_E4M3
+    from cudnn.sdpa.fwd.config_sm100 import _SM100_MAX_DYN_SMEM, TemplateParams, _d192_smem_bytes, make_cfg_d192
+
+    one, _ = make_cfg_d192(TemplateParams(cta_mma=1))
+    assert (one.STAGES_KV, one.STAGES_K, one.STAGES_V, one.K_SUB) == (1, 1, 2, 3)
+    assert _d192_smem_bytes(one) == 208 * 1024 <= _SM100_MAX_DYN_SMEM
+    two, _ = make_cfg_d192(TemplateParams(cta_mma=2))
+    assert (two.STAGES_KV, two.STAGES_K, two.STAGES_V, two.K_SUB) == (2, 2, 2, 1)
+    fp8, _ = make_cfg_d192(TemplateParams(cta_mma=1, dtype_qkv=DTYPE_E4M3))
+    assert (fp8.STAGES_KV, fp8.STAGES_K, fp8.STAGES_V, fp8.K_SUB) == (2, 2, 2, 1)
+
+
+@pytest.mark.L0
 def test_d128_cga_request_domain():
     """The f16 row admits cga1 AND cga2 on d128, split or not (cga1 is the
     decode tile, validated split and unsplit); a width the flavor has no

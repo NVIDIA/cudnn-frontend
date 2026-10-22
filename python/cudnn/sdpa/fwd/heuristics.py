@@ -1474,12 +1474,19 @@ def select_d192_auto_knobs(
     pertensor: bool,
     s_q: int,
     s_kv: int,
+    paged: bool = False,
+    has_sink: bool = False,
+    gqa_ratio: int = 1,
+    device_cc: Optional[tuple[int, int]] = None,
 ) -> tuple[int, int]:
     """Select the measured D192 scheduler and CGA defaults.
 
     This function is shared by graph heuristics and standalone callers. It
     chooses public knobs only; lowering canonicalizations and private codegen
-    fields are derived separately in ``config_sm100``.
+    fields are derived separately in ``config_sm100``.  ``paged`` / ``has_sink`` /
+    ``gqa_ratio`` (Q heads per KV head) / ``device_cc`` (the build target) are
+    the facts the half-input single-CTA rule reads; the graph-side ``params``
+    carry their defaults, and a caller that passes no target gets the pair.
     """
 
     if params.split_kv > 1:
@@ -1527,7 +1534,42 @@ def select_d192_auto_knobs(
         elif masked:
             mx_cga1 = params.dtype_qkv == DTYPE_E4M3 or sliding or s_kv <= 4096
     mx_cga1 = mx_cga1 or mx_dense_mid_causal_cga1
-    return sched_policy, 1 if pt_cga1 or mx_cga1 else 2
+
+    # Half input, dense MHA, unsplit, plain mask (top-left causal or none): the single-CTA tile wherever the 2-CTA
+    # pair's second CTA would have no rows -- a tail of at most 256 rows past a 512-row multiple (that CTA still
+    # walks the pair's whole union KV range) -- and on the one 512-row sequence, where the pair's two wasted
+    # diagonal steps outweigh the tile's own.  The tile's K ring releases per TMA D-subtile, V is double-buffered
+    # (config_sm100.CfgD192.K_SUB / STAGES_V) and its unit prologue loads K and V ahead of the Q u O alias wait --
+    # the LPT walk below pays only together with that prologue order.  MEASURED on B300 (cuDNN 9.30
+    # yardstick, harness medians, 2026-10-22; cga2 / cga1, ms): S 128 b256 0.948 / 0.505, S 256 b128 0.736 / 0.443,
+    # S 512 b64 0.583 / 0.564, S 768 b32 0.629 / 0.516, S 1280 b16 0.632 / 0.587, S 1792 b16 1.034 / 0.990; at the
+    # other 512-row multiples (S 1024 0.753 / 0.811, S 2048 0.161 / 0.172, S 4096 0.483 / 0.497) and where the
+    # tile's own last unit is the half-empty one (S 384 0.475 / 0.568) the pair stays ahead.  The single-CTA tile
+    # walks LPT up to 1536 rows (NATURAL -> LPT: S 256 0.530 -> 0.443, S 512 0.620 -> 0.564, S 1280 0.613 -> 0.587)
+    # and NATURAL above (S 1792 1.042 vs 0.990); a mask-free graph has nothing to balance.
+    # GQA, paged, sink, THD, SWA, bottom-right, padded and non-square (S_kv != S_q) graphs keep the pair: not
+    # measured on the tile.  So does every other target: the rule is measured on cc 10.0 / 10.3, and the SM107 d192
+    # tile has no single-CTA configuration (config_sm107.make_cfg_d192 rejects it) although the standalone adapter
+    # asks this selector there.
+    half_pair_tail_cga1 = (
+        not fp8
+        and device_cc is not None
+        and tuple(device_cc) in ((10, 0), (10, 3))
+        and not params.thd_varlen
+        and not paged
+        and not has_sink
+        and gqa_ratio == 1
+        and window_left is None
+        and window_right in (None, 0)
+        and not params.bottom_right
+        and not params.seq_q_lens_present
+        and not params.seq_kv_lens_present
+        and s_kv == s_q
+        and (0 < s_q % 512 <= 256 or s_q == 512)
+    )
+    if half_pair_tail_cga1:
+        sched_policy = SCHED_LPT if (window_right == 0 and s_q <= 1536) else SCHED_NATURAL
+    return sched_policy, 1 if pt_cga1 or mx_cga1 or half_pair_tail_cga1 else 2
 
 
 def select_d256_auto_knobs(
@@ -1953,7 +1995,16 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
     if selected_shape != (192, 128) or not any(shape == (192, 128) for shape, _ in caps.cgas_by_d_shape):
         return sched_policy, _sole(domain)
     params = _sm100_params_from_facts(facts, split_kv=split_kv, sched_policy=sched_policy)
-    selected_sched, selected_cga = select_d192_auto_knobs(params, pertensor=facts.is_fp8, s_q=facts.s_q, s_kv=facts.s_kv)
+    selected_sched, selected_cga = select_d192_auto_knobs(
+        params,
+        pertensor=facts.is_fp8,
+        s_q=facts.s_q,
+        s_kv=facts.s_kv,
+        paged=bool(facts.has_paged_kv),
+        has_sink=bool(facts.has_sink),
+        gqa_ratio=int(facts.h_q) // max(int(facts.h_kv), 1),
+        device_cc=tuple(facts.device_cc) if facts.device_cc is not None else None,
+    )
     if selected_cga not in domain:
         raise ValueError(f"D192 heuristic selected cga={selected_cga} outside the declared domain {sorted(domain)}")
     return _in_flavor_sched_domain(caps, facts, selected_sched, sched_policy), selected_cga

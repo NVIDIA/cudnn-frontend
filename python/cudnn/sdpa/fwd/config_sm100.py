@@ -3818,6 +3818,8 @@ def derive_d192_internal_params(
 
 
 def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
+    """The SM100 d192x128 configuration for one set of public knobs: the 2-CTA pair, or the single-CTA tile with its
+    per-D-subtile K ring and second V stage on half input."""
     _validate_params("d192", params)
     b = bpe(params.dtype_qkv)
     fp8 = params.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
