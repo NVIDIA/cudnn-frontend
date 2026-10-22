@@ -950,12 +950,13 @@ def test_DSA_sparse_attention_backward_sm100_h96_d576_uses_i64_query_offsets():
     """The first Q extent past INT32 element addressing stays finite and exact."""
     _require_sm100()
     if torch.cuda.get_device_capability() not in _TWO_CTA_CAPABILITIES:
-        return pytest.skip("H96/D576 two-CTA requires compute capability 10.0 or 10.3")
+        pytest.skip("H96/D576 two-CTA requires compute capability 10.0 or 10.3")
     try:
         from cuda.bindings import driver as cuda
         from cudnn import DSA
     except ImportError:
-        return pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+        return
 
     num_heads, head_dim, head_dim_v, topk = 96, 576, 512, 2048
     i32_max = torch.iinfo(torch.int32).max
@@ -976,7 +977,8 @@ def test_DSA_sparse_attention_backward_sm100_h96_d576_uses_i64_query_offsets():
         topk_idxs = torch.zeros((s_q, topk), dtype=torch.int32, device=device)
         topk_length = torch.ones((s_q,), dtype=torch.int32, device=device)
     except torch.OutOfMemoryError:
-        return pytest.skip("requires enough GPU memory to cross the INT32 query-offset boundary")
+        pytest.skip("requires enough GPU memory to cross the INT32 query-offset boundary")
+        return
     scale = head_dim**-0.5
 
     plan = DSA.SparseAttentionBackward(
@@ -999,7 +1001,8 @@ def test_DSA_sparse_attention_backward_sm100_h96_d576_uses_i64_query_offsets():
         workspace = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device=device)
         dq, dkv, d_sink = torch.empty_like(q), torch.empty_like(kv), torch.empty_like(attn_sink)
     except torch.OutOfMemoryError:
-        return pytest.skip("requires enough GPU memory to cross the INT32 query-offset boundary")
+        pytest.skip("requires enough GPU memory to cross the INT32 query-offset boundary")
+        return
     dq.fill_(math.nan)
     dkv.fill_(math.nan)
     d_sink.fill_(math.nan)
