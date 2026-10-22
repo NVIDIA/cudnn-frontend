@@ -10,7 +10,9 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
+from cutlass._mlir.dialects import nvvm
 from cutlass.cute.typing import Float32, Int32, Int64, Uint32
+from cutlass.cutlass_dsl import dsl_user_op
 
 from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 
@@ -19,6 +21,18 @@ _LARGE_CONTEXT_WORKSPACE_BYTES = 16 << 30
 _RELAY_WORKSPACE_BUDGET_BYTES = 32 << 30
 _RELAY_WAVE_CTAS = 128
 _CLUSTER4_MIN_Q = 8192
+
+
+@dsl_user_op
+def _partial_cta_sync(barrier_id: int, thread_count: int, *, loc=None, ip=None):
+    """Synchronize a named-barrier subset without an aligned-CTA promise."""
+    nvvm.barrier_cta_sync(
+        Int32(barrier_id).ir_value(loc=loc, ip=ip),
+        thread_count=Int32(thread_count).ir_value(loc=loc, ip=ip),
+        aligned=False,
+        loc=loc,
+        ip=ip,
+    )
 
 
 @cute.jit
@@ -522,7 +536,7 @@ class _FlashAttentionDSABackwardSm100DeterministicRelay(FlashAttentionDSABackwar
         # those observations to every reducer thread before it touches the
         # shared plane; the GPU fence keeps the following GMEM updates after
         # that handoff.
-        self.dkv_relay_barrier.arrive_and_wait()
+        _partial_cta_sync(self.dkv_relay_barrier.barrier_id, self.dkv_relay_barrier.num_threads)
         cute.arch.fence_acq_rel_gpu()
 
     @cute.jit
@@ -544,7 +558,7 @@ class _FlashAttentionDSABackwardSm100DeterministicRelay(FlashAttentionDSABackwar
         # Publish every reducer thread's relaxed FP32 atomics through the CTA
         # barrier before a slot lane release-clears this rank's ownership bit.
         cute.arch.fence_acq_rel_gpu()
-        self.dkv_relay_barrier.arrive_and_wait()
+        _partial_cta_sync(self.dkv_relay_barrier.barrier_id, self.dkv_relay_barrier.num_threads)
         if tidx_in_wg < self.block_tile:
             tile_begin = tile_index * self.block_tile
             slot = tile_begin + tidx_in_wg
@@ -560,7 +574,7 @@ class _FlashAttentionDSABackwardSm100DeterministicRelay(FlashAttentionDSABackwar
                     if (row_mask & ~current_bit) != Uint32(0):
                         keep_mask = ~(Uint32(1) << bit_shift)
                         cute.arch.atomic_and(mask_ptr.llvm_ptr, keep_mask, sem="release", scope="gpu")
-        self.dkv_relay_barrier.arrive_and_wait()
+        _partial_cta_sync(self.dkv_relay_barrier.barrier_id, self.dkv_relay_barrier.num_threads)
 
     @cute.kernel
     def fold_dKV_shards(self, mdKV_acc: cute.Tensor, seqlen: Int32):

@@ -4698,7 +4698,9 @@ def test_DSA_sparse_attention_backward_check_support_validates_contract(monkeypa
         # established non-deterministic backend.
         assert SparseAttentionBackward(**good).check_support()
 
-    assert SparseAttentionBackward(**relay, deterministic=True).check_support()
+    with monkeypatch.context() as supported_dsl:
+        supported_dsl.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.7.0")))
+        assert SparseAttentionBackward(**relay, deterministic=True).check_support()
 
     deterministic_h32 = dict(good)
     deterministic_h32["sample_q"] = q[:, :32].contiguous()
