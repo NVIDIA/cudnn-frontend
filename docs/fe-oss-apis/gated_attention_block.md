@@ -515,12 +515,20 @@ prologue -- and the top-k returns `block_ids [T, top_k]` int32 in ASCENDING orde
 a padding sequence (`kv_lens == 0`) writes nothing but its counts (0) and never reads the cache. The scorer kernel alone
 (`kernels.qsa_score_paged.compile_qsa_score_paged` / `run_qsa_score_paged`: one warp-level `mma.sync.m16n8k16` per 8 keys x 16 D
 over the `seq_q x index_heads` query rows padded to 16 -- the query tile staged once per CTA in shared memory behind one CTA
-barrier, the keys streamed by `cp.async` through a per-warp ring into the B fragments; the programmatic-dependent-launch pair under
-`use_pdl`) runs on any CuTe DSL device from sm_80; the paired selector needs the radix top-k's cc 9.0. The e4m3 indexer cache is a
-typed decline by name (the paged scorer's e4m3 read arm is a follow-up); `units_per_warp` (1 / 2 / 4 / 8 units of 32 compressed rows
-per warp, default 1) and `use_pdl` are performance knobs -- the same function. The entry's
-module imports no CuTe DSL: the DSL floor, the `sm_107a` target on cc 10.7 and the radix top-k's cc 9.0 are typed
-`NotImplementedError`s raised BEFORE the kernel module is imported, so the import path resolves on the public 4.6.2 wheel too;
+barrier, the keys streamed by `cp.async` through a per-warp ring into the B fragments -- with an L2 evict-first hint on those copies
+where the installed DSL's bundled CUDA compiler is 13.4 or later, i.e. the cu13 toolchain of the 4.8.0 wheel, which the DSL binds only
+under a CUDA 13 driver (`l2_hint`, a compile key of the kernel-level entry: `None` = that rule; the 13.3 PTX assembler of the public
+4.7.0 cu13 wheel mis-encodes the hinted copy on sm_90 / sm_100 and the 12.9 assembler of the cu12 flavour -- what any wheel, 4.8.0
+included, binds under a CUDA 12 driver -- emits the same encoding, so below 13.4 the plain copy is traced -- the same bytes, bitwise the
+same logits; `True` forced on such a DSL is a typed decline naming the compiler it found, the wheel and the remedy, the cu13 flavour of
+4.8.0 or later under a CUDA 13 driver; `False` the plain copy on any DSL); the programmatic-dependent-launch pair under `use_pdl`) runs
+on any CuTe DSL device from sm_80; the
+paired selector needs the radix top-k's cc 9.0. The e4m3 indexer cache is a typed decline by name (the paged scorer's e4m3 read arm is a
+follow-up); `units_per_warp` (1 / 2 / 4 / 8 units of 32 compressed rows per warp, default 1) and `use_pdl` are performance knobs of the
+entry, `ring_depth` (2 / 4 / 8 n-tiles of keys in flight per warp, default 4) and `l2_hint` of the kernel-level compile -- each the same
+function. The entry's module and its helpers import no CuTe DSL: the DSL floor, the `sm_107a` target on cc 10.7 and the radix top-k's
+cc 9.0 are typed `NotImplementedError`s raised BEFORE the kernel module is imported, so the import path resolves on the public 4.6.2
+wheel too;
 `stream` takes a `torch.cuda.Stream`, a raw stream handle or `None` (torch's current stream), and every torch operation of the
 call runs on it. The dense-cache form of this selection and the in-block binding of this scorer are follow-ups.
 

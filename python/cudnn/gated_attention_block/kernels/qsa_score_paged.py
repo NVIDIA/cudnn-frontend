@@ -28,9 +28,9 @@ accumulate), so one MMA per 8 keys per 16 of the 128 D scores EVERY column at on
 term is negligible against the bytes (131 k MAC per 16 KB of keys).  The padded query tile is staged ONCE per CTA in shared memory
 (``cp.async``, every thread a 16-B granule, zero-fill for the padding rows) behind the kernel's one CTA barrier and read into A
 fragments; the keys stream through a per-warp ring of ``cp.async`` groups -- page part by page part, whole 128-B lines per
-request, an L2 evict-first policy (the keys pass through L2 once; the logits' write-combining lines and the table stay), a
-zero-filled copy for a dead page -- into B fragments read with ``ld.shared.v4``; relu, the head sum and the scale run on the fp32
-accumulator fragment.  No TMA, no TMEM, no cluster: the first key byte is requested ONE memory round trip after the launch
+request, an L2 evict-first policy where the DSL's compiler serves it (the keys pass through L2 once; the logits' write-combining
+lines and the table stay; the ``l2_hint`` arm below), a zero-filled copy for a dead page -- into B fragments read with
+``ld.shared.v4``; relu, the head sum and the scale run on the fp32 accumulator fragment.  No TMA, no TMEM, no cluster: the first key byte is requested ONE memory round trip after the launch
 (``kv_lens``, the table words and the query tile are all in flight together), nothing holds a register while it waits, and the
 kernel's roofline term is the HBM bytes of the compressed rows it streams (plus the fp32 logits it writes).
 
@@ -114,6 +114,22 @@ name                  kind                                    issuing lanes     
 ``shfl.sync.idx``     warp-collective (mask ``0xffffffff``)    all 32 lanes, one per page part      32                   the same branch (the copies' table word from a constant source lane)
 ====================  ======================================  ==================================  ===================  ===============================================================================
 
+**The ``l2_hint`` arm** (a compile key, ``None`` by default): the key copies are ``cp.async.cg.shared.global.L2::cache_hint [dst],
+[src], 16, size, policy`` with ``policy`` from ``createpolicy.fractional.L2::evict_first.b64`` where the installed CuTe DSL compiles
+with CUDA ``L2_HINT_MIN_COMPILER`` = 13.4 or later, and the plain ``cp.async.cg.shared.global [dst], [src], 16, size`` below it -- the
+13.3 PTX assembler bundled with the public nvidia-cutlass-dsl 4.7.0 cu13 wheel mis-encodes the hinted copy's uniform operands on sm_90 /
+sm_100 (it builds the policy word and the ring base in two uniform registers and encodes all 16 hinted ``LDGSTS`` to read two OTHER
+uniform registers nothing in the kernel writes: a ``Warp Illegal Instruction Parameter`` trap, ``cudaErrorIllegalInstruction``, at the
+first key copy), the 12.9 assembler of the wheels' cu12 flavour emits the same encoding (a compile-only dump; the DSL binds that flavour
+under a CUDA 12 driver whatever the wheel's number, a 4.8.0 wheel included, and reports it as CUDA 12.9), and the 13.4 assembler of the
+4.8.0 wheel's cu13 toolchain (bound only under a CUDA 13 driver) encodes the operands it defined; the PTX is identical in all three.  The
+hint is a cache-policy annotation: both arms move the same bytes into the same slots in the same order, so the logits are bitwise across
+the arm (the knob cell pins it).  The compiler version is read from ``cutlass.base_dsl.version_info.CUDA_VERSION`` (present in both
+wheels: the flavour the DSL bound, never the wheel's own number) at ONE seam, :func:`_bundled_cuda_version`; ``l2_hint=False`` traces
+the plain copy on any DSL, ``l2_hint=True`` the hinted copy or -- below the floor -- a typed ``NotImplementedError`` (Rule 7) that names
+the installed wheel and the compiler it found, states the defect as observed (never as a property of the found version) and prescribes
+the cu13 flavour of 4.8.0 or later under a CUDA 13 driver, gated AFTER PDL's cc gate (a device gate before a form's gate).
+
 PDL sites (under the ``use_pdl`` compile key, the launch attribute set with it): ``griddepcontrol.wait`` is the kernel's first
 instruction -- ahead of the ``kv_lens`` / table / ``qi`` reads and so of every cache read --, ``griddepcontrol.launch_dependents``
 follows the prologue's copies, BEFORE the counts and the logits are written.  That early trigger puts an obligation on the dependent
@@ -150,7 +166,8 @@ front door ``QSA/selection_paged.py`` -- ``qsa_select_decode_paged_forward`` gat
 target on cc 10.7 and the radix top-k's cc 9.0 BEFORE importing this module -- and the kernel's host-side facts (the row map,
 the compile-key validator, the knob defaults, the byte model) are defined there and imported here, never the other way round
 at module scope.  :func:`compile_qsa_score_paged`, the kernel-level entry a caller may reach directly, gates the floor and the
-target again BEFORE any compile, so a too-old DSL reads as a version decline there too; the tests skip below the floor.
+target again BEFORE any compile -- then PDL's cc 9.0, then the ``l2_hint`` arm's compiler floor --, so a too-old DSL reads as a
+version decline there too; the tests skip below the floor.
 """
 
 import hashlib
@@ -162,7 +179,7 @@ import cutlass
 import cutlass.cute as cute
 import torch
 
-from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
+from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error, cutedsl_state
 from cudnn.frost.compiled_cache import compile_cached, template_key
 from cudnn.frost.device import compute_capability, current_device
 from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
@@ -197,6 +214,9 @@ __all__ = [
     "dsl_decline_reason",
     "compile_qsa_score_paged",
     "run_qsa_score_paged",
+    "L2_HINT_MIN_COMPILER",
+    "l2_hint_available",
+    "l2_hint_requirement_error",
     "FROST_SOURCE_DIGEST",  # read from OUTSIDE this module: the compiled-plan cache key (through ``template_key(globals(), ...)``), the tests, the run attestations
 ]
 
@@ -212,6 +232,68 @@ _SLOT_BYTES = KEYS_PER_NTILE * _ROW_BYTES  # one n-tile of 8 rows in the ring: 2
 _SLOT_ELEMS = _SLOT_BYTES // 4
 _A_TILE_BYTES = MMA_M * _ROW_BYTES  # one m-tile of the padded query tile: 16 rows x 256 B
 _A_TILE_ELEMS = _A_TILE_BYTES // 4
+
+L2_HINT_MIN_COMPILER = (13, 4)
+"""The key copies carry the L2 evict-first hint (``cp.async.cg.shared.global.L2::cache_hint`` with a ``createpolicy`` register) only when
+the installed CuTe DSL compiles with CUDA 13.4 or later.  The 13.3 PTX assembler bundled with the public nvidia-cutlass-dsl 4.7.0 wheel
+mis-encodes that instruction on sm_90 / sm_100: it builds the policy word and the ring base in two uniform registers and encodes all 16
+hinted ``LDGSTS`` to read two OTHER uniform registers that nothing in the kernel ever writes -- a ``Warp Illegal Instruction Parameter``
+trap (``cudaErrorIllegalInstruction``) at the first key copy; the 12.9 assembler of the wheels' cu12 flavour emits the same encoding (a
+compile-only dump), and the 13.4 assembler of the 4.8.0 wheel's cu13 toolchain encodes the operands it defined; the PTX is identical in
+all three.  So the arm is selected at trace time: below the floor the copies are the plain ``cp.async.cg.shared.global`` (the same bytes
+into the same slots, so the logits are bitwise across the arm).  The version is the DSL's bundled compiler
+(``cutlass.base_dsl.version_info.CUDA_VERSION``, present in both wheels), never the wheel's own number: the DSL binds its cu12 or its
+cu13 flavour by the driver's CUDA major (a 4.8.0 wheel reports 13.4 under a CUDA 13 driver and 12.9 under a CUDA 12 one), and a wheel
+built with a newer toolkit keeps the hint."""
+
+
+def _bundled_cuda_version() -> tuple:
+    """``(major, minor)`` of the CUDA toolkit the installed CuTe DSL compiles with (its bundled ptxas: the cu12 or the cu13 flavour the
+    DSL bound by the driver's CUDA major), from ``cutlass.base_dsl.version_info.CUDA_VERSION`` -- the ONE seam the ``l2_hint`` arm reads
+    (``torch.version.cuda``, ``CUDA_HOME`` and the wheel's own number do not identify the DSL's compiler; Rule 7); the tests model a
+    compiler by patching this function."""
+    from cutlass.base_dsl.version_info import CUDA_VERSION
+
+    return (int(CUDA_VERSION.major), int(CUDA_VERSION.minor))
+
+
+def l2_hint_available() -> bool:
+    """Whether this DSL's compiler serves the hinted key copies (``L2_HINT_MIN_COMPILER``): the arm ``l2_hint=None`` resolves to."""
+    return tuple(_bundled_cuda_version()) >= L2_HINT_MIN_COMPILER
+
+
+def l2_hint_requirement_error() -> Optional[str]:
+    """The typed reason ``l2_hint=True`` is refused on this DSL (Rule 7), else None: the floor, the defect as OBSERVED (the 13.3 assembler
+    of the public 4.7.0 cu13 wheel natively, the cu12 flavour's 12.9 assembler in a compile-only dump -- never the found version by
+    interpolation), the installed wheel with the compiler it found, and the remedy -- the cu13 flavour of 4.8.0 or later under a CUDA 13
+    driver, not a bare wheel upgrade: a 4.8.0 wheel bound to its cu12 flavour already is the wheel."""
+    cuda = tuple(_bundled_cuda_version())
+    if cuda >= L2_HINT_MIN_COMPILER:
+        return None
+    _, version = cutedsl_state()
+    wheel = "an unknown nvidia-cutlass-dsl build" if version is None else " ".join(version)
+    need = ".".join(str(x) for x in L2_HINT_MIN_COMPILER)
+    return (
+        f"qsa_score_paged with l2_hint=True (the L2 evict-first hint on the key copies: cp.async.cg.shared.global.L2::cache_hint with a "
+        f"createpolicy register) needs a CuTe DSL whose bundled CUDA compiler is {need} or later; below that floor the hint is not served: "
+        f"the 13.3 PTX assembler of the public nvidia-cutlass-dsl 4.7.0 cu13 wheel mis-encodes those copies' uniform operands on sm_90 / "
+        f"sm_100 (an illegal-instruction trap at the first key copy) and the cu12 flavour's 12.9 assembler emits the same encoding. The "
+        f"installed {wheel} compiles with CUDA {cuda[0]}.{cuda[1]} -- use l2_hint=None or False (the plain copies: the same function) there, "
+        f"or install 'nvidia-cutlass-dsl[cu13]>=4.8.0' and run under a CUDA 13 compatible driver (the DSL binds its cu13 toolchain only there)"
+    )
+
+
+def _resolve_l2_hint(l2_hint: Optional[bool]) -> bool:
+    """The arm an artifact is built with: ``None`` follows the compiler (:func:`l2_hint_available`), ``False`` is the plain copy on every
+    DSL, ``True`` the hinted copy -- or, below the floor, the typed decline."""
+    if l2_hint is None:
+        return l2_hint_available()
+    if l2_hint:
+        why = l2_hint_requirement_error()
+        if why is not None:
+            raise NotImplementedError(why)
+        return True
+    return False
 
 
 # --------------------------------------------------------------------------------------------- the kernel
@@ -242,6 +324,7 @@ def _copy_ntile(
     k_tile0: cutlass.Int32,
     policy: cutlass.Int64,
     rows_per_page: cutlass.Constexpr[int],
+    l2_hint: cutlass.Constexpr[bool],
 ):
     """The n-tile's 8 compressed rows into one ring slot, PAGE PART by page part (``min(R, 8)`` rows of one page): per part ONE
     shuffle (the part's table word from the lane that read it -- a constant source lane), one validity check, one ``mul.wide``
@@ -249,7 +332,8 @@ def _copy_ntile(
     (lanes 0-15) and ``2 e + 1`` (lanes 16-31), each row's two 128-B halves by eight consecutive lanes (whole lines per request).
     A part on a ``-1`` / out-of-range page is ZERO-FILLED (``src-size 0``: nothing of the cache is read; the address is page 0, a
     real row, either way).  A row at or past the visible count or the capacity reads a real row (its table word was clamped to
-    the capacity) and is never stored: its products stay in its own accumulator column."""
+    the capacity) and is never stored: its products stay in its own accumulator column.  ``l2_hint`` picks the copy's form (the module
+    docstring's arm): the ``.L2::cache_hint`` copy carrying ``policy``, or the plain copy, which takes no policy operand."""
     rows_pp = min(rows_per_page, KEYS_PER_NTILE)
     zero_i = cutlass.Int32(0)
     for part in cutlass.range_constexpr(KEYS_PER_NTILE // rows_pp):
@@ -266,9 +350,14 @@ def _copy_ntile(
             # every cp.async gets its OWN address registers (an opaque offset, never base + immediate): four back-to-back LDGSTS on one
             # base register serialised on the register scoreboard under HBM latency (2x at B 32 x 128K, measured 2026-10-21)
             off_e = opaque_i32(cutlass.Int32(e * 2 * _ROW_BYTES)).to(cutlass.Int64)
-            inline_ptx(
-                "cp.async.cg.shared.global.L2::cache_hint [$0], [$1], 16, $2, $3;", write_only_types=[], read_only_args=[dst + off_e, src + off_e, size, policy]
-            )
+            if cutlass.const_expr(l2_hint):
+                inline_ptx(
+                    "cp.async.cg.shared.global.L2::cache_hint [$0], [$1], 16, $2, $3;",
+                    write_only_types=[],
+                    read_only_args=[dst + off_e, src + off_e, size, policy],
+                )
+            else:
+                inline_ptx("cp.async.cg.shared.global [$0], [$1], 16, $2;", write_only_types=[], read_only_args=[dst + off_e, src + off_e, size])
 
 
 @cute.jit
@@ -363,9 +452,10 @@ def frost_qsa_score_paged(
     units_per_warp: cutlass.Constexpr[int],
     ring_depth: cutlass.Constexpr[int],
     use_pdl: cutlass.Constexpr[bool],
+    l2_hint: cutlass.Constexpr[bool],
 ) -> None:
     """One CTA = chunk ``blockIdx.x`` of ``blocks_per_cta`` compressed rows of sequence ``blockIdx.y``, four independent warps of
-    ``keys_per_warp`` rows each (module docstring)."""
+    ``keys_per_warp`` rows each (module docstring); ``l2_hint`` = the key copies' form (the module docstring's arm)."""
     if cutlass.const_expr(use_pdl):
         wait_on_dependent_grids()
     rm = query_row_map(s_q, h_i)  # the (s, h) -> MMA-row map (host facts, compile-time)
@@ -439,9 +529,12 @@ def frost_qsa_score_paged(
     src_lane_off = half * cutlass.Int32(_ROW_BYTES) + c_lane * cutlass.Int32(_CHUNK_BYTES)
     dst_lane_off = half * cutlass.Int32(_ROW_BYTES) + (c_lane ^ (half * cutlass.Int32(4))) * cutlass.Int32(_CHUNK_BYTES)
     dst_lane = sK.data_ptr().toint() + (ring_elems * cutlass.Int32(4) + dst_lane_off).to(cutlass.Int64)  # the cp.async destination base of slot 0
-    # the keys stream through L2 ONCE: an evict-first policy on their copies keeps the logits' write-combining lines and the table (vLLM's
-    # scorer marks its key loads the same way)
-    policy = inline_ptx("createpolicy.fractional.L2::evict_first.b64 $0, 1.0;", write_only_types=[cutlass.Int64], read_only_args=[])
+    if cutlass.const_expr(l2_hint):
+        # the keys stream through L2 ONCE: an evict-first policy on their copies keeps the logits' write-combining lines and the table (vLLM's
+        # scorer marks its key loads the same way) -- where the DSL's compiler encodes the hinted copy (L2_HINT_MIN_COMPILER)
+        policy = inline_ptx("createpolicy.fractional.L2::evict_first.b64 $0, 1.0;", write_only_types=[cutlass.Int64], read_only_args=[])
+    else:
+        policy = cutlass.Int64(0)  # the plain copies take no policy operand: never read
     if live_warp:
         for i in cutlass.range_constexpr(min(depth, n_tiles)):
             _copy_ntile(
@@ -454,6 +547,7 @@ def frost_qsa_score_paged(
                 k_warp0 + cutlass.Int32(i * KEYS_PER_NTILE),
                 policy,
                 rows_per_page,
+                l2_hint,
             )
             cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(min(depth, n_tiles))  # this thread's query-tile copies complete (the key groups may still fly)
@@ -519,6 +613,7 @@ def frost_qsa_score_paged(
                         k_warp0 + cutlass.Int32((i + depth) * KEYS_PER_NTILE),
                         policy,
                         rows_per_page,
+                        l2_hint,
                     )
                     cute.arch.cp_async_commit_group()
             # the batch's MMAs: k-step outer, n-tile and m-tile inner -- `len(batch) x m_tiles` independent accumulator chains
@@ -619,10 +714,11 @@ def qsa_score_paged_launch(
     units_per_warp: cutlass.Constexpr[int],
     ring_depth: cutlass.Constexpr[int],
     use_pdl: cutlass.Constexpr[bool],
+    l2_hint: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     frost_qsa_score_paged(
-        mQ, mKbar, mTable, mKvLens, mLogits, mCounts, mBlockLens, top_k, scale, h_i, s_q, rows_per_page, units_per_warp, ring_depth, use_pdl
+        mQ, mKbar, mTable, mKvLens, mLogits, mCounts, mBlockLens, top_k, scale, h_i, s_q, rows_per_page, units_per_warp, ring_depth, use_pdl, l2_hint
     ).launch(grid=(n_chunks, batch, 1), block=(THREADS, 1, 1), stream=stream, use_pdl=use_pdl)
 
 
@@ -632,8 +728,9 @@ compiled_cache = {}
 
 
 class QsaScorePagedRecipe(NamedTuple):
-    """Build-time facts of one artifact (Rule 4: one artifact per (H_i, S_q, page size, units knob, block_lens presence, PDL));
-    the batch, the cache capacity, the table width, the page count and every stride ride in at runtime."""
+    """Build-time facts of one artifact (Rule 4: one artifact per (H_i, S_q, page size, units knob, block_lens presence, PDL, ring depth,
+    the key copies' L2-hint arm)); the batch, the cache capacity, the table width, the page count and every stride ride in at runtime.
+    ``l2_hint`` is the arm that was BUILT (the resolved value, never ``None``)."""
 
     compiled: object
     h_i: int
@@ -645,6 +742,7 @@ class QsaScorePagedRecipe(NamedTuple):
     use_pdl: bool
     device: int
     ring_depth: int = NTILES_IN_FLIGHT
+    l2_hint: bool = True  # the arm built before the field existed: the hinted copies
 
 
 def _fake_q(h_i: int):
@@ -695,12 +793,16 @@ def compile_qsa_score_paged(
     use_pdl: bool = False,
     device: Optional[int] = None,
     ring_depth: int = NTILES_IN_FLIGHT,
+    l2_hint: Optional[bool] = None,
 ) -> QsaScorePagedRecipe:
-    """Build from SHAPES ALONE (no allocation, no launch).  The DSL / arch gate runs BEFORE the compile (Rule 7): a decline
-    is a ``NotImplementedError`` naming the version or the target, never an error from inside the DSL.  ``ring_depth`` (the
-    n-tiles of keys in flight per warp, ``RING_DEPTH_CHOICES``) is a performance knob: the same function."""
+    """Build from SHAPES ALONE (no allocation, no launch).  The gates run BEFORE the compile, in this order (Rule 7 first): the DSL
+    floor, the ``sm_107a`` target, PDL's cc 9.0, then the ``l2_hint`` arm's compiler floor (a device gate before a form's gate) -- a
+    decline is a ``NotImplementedError`` naming the version, the target, the device or the compiler, never an error from inside the DSL.
+    ``ring_depth`` (the n-tiles of keys in flight per warp, ``RING_DEPTH_CHOICES``) is a performance knob: the same function; so is
+    ``l2_hint`` (``None`` = the hinted key copies where the DSL's compiler serves them -- :func:`l2_hint_available` --, else the plain
+    ones; ``True`` / ``False`` force an arm, ``True`` below the floor is the typed decline)."""
     global _FAKE_STREAM
-    validate_params(h_i=h_i, s_q=s_q, page_size=page_size, units_per_warp=units_per_warp, ring_depth=ring_depth)
+    validate_params(h_i=h_i, s_q=s_q, page_size=page_size, units_per_warp=units_per_warp, ring_depth=ring_depth, l2_hint=l2_hint)
     dev = current_device() if device is None else int(device)
     why = dsl_decline_reason(dev)
     if why is not None:
@@ -710,14 +812,20 @@ def compile_qsa_score_paged(
         raise NotImplementedError(
             f"use_pdl=True traces the programmatic-dependent-launch pair (griddepcontrol), an instruction of cc 9.0 and later; this device is cc {cc[0]}.{cc[1]}"
         )
+    hinted = _resolve_l2_hint(l2_hint)  # after the device gates: a forced hint below the compiler floor is the typed decline
     if _FAKE_STREAM is None:
         from cutlass.cute.runtime import make_fake_stream
 
         _FAKE_STREAM = make_fake_stream(use_tvm_ffi_env_stream=False)
     rows_per_page = int(page_size) // BLOCK_SIZE
-    key = (int(h_i), int(s_q), int(page_size), int(units_per_warp), bool(has_block_lens), bool(use_pdl), dev) + (
-        () if int(ring_depth) == NTILES_IN_FLIGHT else (int(ring_depth),)
-    )
+    # the memo key, append-only: the defaults keep their seven-tuple identity (the persistent cache's entries too); a non-default ring depth
+    # appends it; an explicit l2_hint appends the ring depth and the arm (a default arm needs no key: it is one per process -- the DSL's
+    # compiler -- and the persistent cache names the DSL version in its environment)
+    key = (int(h_i), int(s_q), int(page_size), int(units_per_warp), bool(has_block_lens), bool(use_pdl), dev)
+    if int(ring_depth) != NTILES_IN_FLIGHT or l2_hint is not None:
+        key += (int(ring_depth),)
+    if l2_hint is not None:
+        key += (bool(l2_hint),)
     if key not in compiled_cache:
         # The dict is the in-process memo; behind it sits the persistent compiled-plan cache, keyed by this file's digest
         # (``FROST_SOURCE_DIGEST`` above) + the key's plain values: a second process reloads the object instead of re-tracing.
@@ -742,6 +850,7 @@ def compile_qsa_score_paged(
                 int(units_per_warp),
                 int(ring_depth),
                 bool(use_pdl),
+                bool(hinted),
                 _FAKE_STREAM,
                 options="--enable-tvm-ffi",
                 cache_key=cache_key,
@@ -758,6 +867,7 @@ def compile_qsa_score_paged(
         use_pdl=bool(use_pdl),
         device=dev,
         ring_depth=int(ring_depth),
+        l2_hint=bool(hinted),
     )
 
 
