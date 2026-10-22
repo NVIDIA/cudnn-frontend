@@ -527,6 +527,25 @@ def test_declines_below_the_dsl_floor_by_version_before_any_compile(monkeypatch)
 
 
 @needs_cuda
+def test_declines_the_cluster_form_on_a_dsl_below_its_vector_store_floor(monkeypatch):
+    """The cluster form's exchanges store four words per thread with one tuple-valued ``store_async_dsmem``; the released CuTe DSL 4.7.0
+    -- admitted by the FROST floor -- evaluates ``Int32(value)`` on that tuple and fails the cluster form's compile (the 2026-10-22
+    review's finding), so ``cluster_ctas > 1`` declines by name below ``CLUSTER_FORM_MIN_DSL`` BEFORE any compile, the default knob
+    chooser keeps one CTA per row there, the single-CTA form is untouched, and an internal build is not judged (the floor's rule)."""
+    monkeypatch.setattr(topk_mod, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.7.0")))
+    monkeypatch.setattr(topk_mod, "compile_cached", lambda *a, **k: (_ for _ in ()).throw(AssertionError("compile reached below the cluster form's floor")))
+    assert topk_mod.CLUSTER_FORM_MIN_DSL == (4, 8, 0)
+    assert topk_mod.cluster_form_requirement_error(1) is None and not topk_mod.cluster_form_available()
+    with pytest.raises(NotImplementedError, match=r"cluster_ctas = 8 .* needs nvidia-cutlass-dsl >= 4\.8\.0 .*; found 4\.7\.0"):
+        topk_mod.compile_qsa_topk_decode(cols_cap=32768, top_k=K, cluster_ctas=8, threads_per_cta=1024)
+    assert topk_mod.default_knobs_for(4, 32768, (10, 0)) == (1, topk_mod.DEFAULT_THREADS_PER_CTA)  # the wide-row block that picks 8 CTAs on 4.8.0
+    monkeypatch.setattr(topk_mod, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.8.0")))
+    assert topk_mod.cluster_form_requirement_error(8) is None and topk_mod.default_knobs_for(4, 32768, (10, 0)) == (8, topk_mod.CLUSTER_THREADS)
+    monkeypatch.setattr(topk_mod, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl-internal", "0.3.0+2026")))
+    assert topk_mod.cluster_form_requirement_error(16) is None
+
+
+@needs_cuda
 def test_declines_a_dsl_without_the_device_target(monkeypatch):
     monkeypatch.setattr(
         topk_mod, "cutedsl_arch_requirement_error", lambda cc: "SM107 requires a CuTe DSL build supporting sm_107a; found 4.7.0 without that target"

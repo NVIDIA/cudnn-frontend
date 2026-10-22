@@ -586,7 +586,9 @@ measured on an exclusive GPU).  Typed declines: a CuTe DSL below the floor or wi
 `use_pdl=True` below cc 9.0 (`griddepcontrol` exists from Hopper), a per-CTA shared-memory need above the device's opt-in limit (the
 bytes named: `smem_bytes_for(cols_cap, cluster_ctas, threads_per_cta, top_k)` -- the 32 KB histogram plus a pool sized by the
 fast path's staging regions (`threads / 32 x (top_k + 128)` words, at most 96 KB) or the fallback's list and ballot words, about
-114 KB at 32768 columns x 1024 threads x `top_k` 512, above the 99 KB opt-in limit of some parts, which serve 512 threads); `cluster_ctas > 1` below cc 9.0 (clusters and DSMEM exist from Hopper); `ValueError` on any malformed form -- a cluster size outside
+114 KB at 32768 columns x 1024 threads x `top_k` 512, above the 99 KB opt-in limit of some parts, which serve 512 threads); `cluster_ctas > 1` below cc 9.0 (clusters and DSMEM exist from Hopper) or on a public CuTe DSL wheel below 4.8.0 (the cluster
+exchanges' vector `st.async` stores fail to compile on the released 4.7.0; the single-CTA form serves and the convenience entry picks it
+there); `ValueError` on any malformed form -- a cluster size outside
 1 / 4 / 8 / 16, a thread count outside the domain (1024 for the cluster form), more than 64 keys per thread, a row block of more than 65535
 rows.  The
 in-block decode indexer that binds it over the paged compressed-key cache is a follow-up; until then the dense standalone selector keeps

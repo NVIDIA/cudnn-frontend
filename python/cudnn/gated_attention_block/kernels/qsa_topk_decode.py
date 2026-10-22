@@ -181,8 +181,10 @@ the regions would exceed ``STAGE_POOL_MAX_BYTES`` and the kernel is compiled as 
 <= ``MAX_EPT x cluster_ctas x threads_per_cta``) sizes the register tile; one artifact serves every ``n_blocks_max`` up to it.
 Requirements: a CuTe DSL at or above the FROST floor with the device's target (Rule 7, gated before anything else), a cc 9.0+ device
 for ``cluster_ctas > 1`` (thread-block clusters, DSMEM) and for ``use_pdl`` (``griddepcontrol``; both exist from Hopper; the single-CTA
-form runs on any CuTe DSL target), and the per-CTA dynamic shared memory within the device's opt-in limit (named in the decline
-otherwise).  No performance number is claimed here; the lane's RECORD.md carries the ranking and the gate's RESULT the number of record.
+form runs on any CuTe DSL target), the public CuTe DSL wheel at or above ``CLUSTER_FORM_MIN_DSL`` = 4.8.0 for ``cluster_ctas > 1`` (its
+vector ``st.async`` exchanges: the released 4.7.0 fails that compile -- a typed decline naming the version, the single-CTA form serving
+and the default knob chooser picking it there), and the per-CTA dynamic shared memory within the device's opt-in limit (named in the
+decline otherwise).  No performance number is claimed here; the lane's RECORD.md carries the ranking and the gate's RESULT the number of record.
 
 Importing THIS module already needs the floor: it imports the CuTe DSL and ``cudnn.frost.tile_dsl`` at module scope, so on a DSL
 below the floor the import fails inside the DSL before any gate here can name the version.  The entry a caller hits is the
@@ -201,7 +203,7 @@ import cutlass.cute as cute
 import torch
 
 from cudnn._cutlass_compat import SmemAllocator
-from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
+from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error, cutedsl_state
 from cudnn.frost.compiled_cache import compile_cached, template_key
 from cudnn.frost.device import compute_capability, current_device, shared_memory_per_block_optin
 from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
@@ -267,12 +269,50 @@ def _is_pow2(x: int) -> bool:
     return x >= 1 and (x & (x - 1)) == 0
 
 
+CLUSTER_FORM_MIN_DSL = (4, 8, 0)
+"""The cluster form's exchanges store four words per thread with one tuple-valued ``store_async_dsmem`` (the vector ``st.async``); the
+released CuTe DSL 4.7.0 -- admitted by the FROST floor -- evaluates ``Int32(value)`` on that tuple and fails the cluster form's compile
+(the single-CTA form compiles there).  The public wheel at or above this version compiles it; an internal build is not judged (the
+floor's own rule), and a version that does not parse is not refused."""
+
+
+def cluster_form_requirement_error(cluster_ctas: int) -> Optional[str]:
+    """Message naming the installed DSL version when ``cluster_ctas > 1`` and the public wheel is below ``CLUSTER_FORM_MIN_DSL``, else
+    None -- a device-free gate, read before any compile (the single-CTA form is the way out it names)."""
+    if int(cluster_ctas) <= 1:
+        return None
+    installed, version = cutedsl_state()
+    if not installed or not version or version[0] != "nvidia-cutlass-dsl":
+        return None
+    parts = []
+    for piece in str(version[1]).split("."):
+        digits = "".join(ch for ch in piece if ch.isdigit())
+        if not digits:
+            break
+        parts.append(int(digits))
+    if not parts or tuple(parts) >= CLUSTER_FORM_MIN_DSL:
+        return None
+    need = ".".join(str(x) for x in CLUSTER_FORM_MIN_DSL)
+    return (
+        f"qsa_topk_decode with cluster_ctas = {int(cluster_ctas)} (the row-split cluster form) needs nvidia-cutlass-dsl >= {need} for its vector "
+        f"st.async exchanges; found {version[1]} -- use cluster_ctas = 1 (the single-CTA form) there, or upgrade with: pip install -U 'nvidia-cutlass-dsl>={need}'"
+    )
+
+
+def cluster_form_available() -> bool:
+    """Whether the installed DSL compiles the cluster form: the default knob chooser's capability read."""
+    return cluster_form_requirement_error(CLUSTER_SIZES[1]) is None
+
+
 def default_knobs_for(rows: int, n_blocks_max: int, cc=None) -> tuple:
     """The knob pair ``(cluster_ctas, threads_per_cta)`` the convenience entry picks for a row block: the row-split cluster form only
     where it earned its exchanges on the ranking -- rows of more than 8192 blocks (128K tokens and beyond) at up to 32 rows (8 CTAs
     per row up to 16 rows, 4 at 17 .. 32: 32 x 8 CTAs would outnumber the SMs and run in waves); every other block runs one 1024-thread
-    CTA per row.  Below cc 9.0 (no clusters) always ``(1, 1024)``.  A caller with its own measurement passes the knobs explicitly."""
+    CTA per row.  Below cc 9.0 (no clusters) and on a public CuTe DSL wheel below ``CLUSTER_FORM_MIN_DSL`` (the cluster form does not
+    compile there) always ``(1, 1024)``.  A caller with its own measurement passes the knobs explicitly."""
     if cc is not None and tuple(cc) < (9, 0):
+        return (1, DEFAULT_THREADS_PER_CTA)
+    if not cluster_form_available():
         return (1, DEFAULT_THREADS_PER_CTA)
     if n_blocks_max > 8192:
         if rows <= 16:
@@ -1382,6 +1422,9 @@ def compile_qsa_topk_decode(
         raise NotImplementedError(too_old)
     cols_cap, top_k, cluster_ctas, threads_per_cta = int(cols_cap), int(top_k), int(cluster_ctas), int(threads_per_cta)
     validate_topk_geometry(cols_cap, top_k, cluster_ctas, threads_per_cta)
+    cluster_problem = cluster_form_requirement_error(cluster_ctas)
+    if cluster_problem is not None:
+        raise NotImplementedError(cluster_problem)
     device = current_device()
     cc = compute_capability(device)
     arch_problem = cutedsl_arch_requirement_error(cc)
