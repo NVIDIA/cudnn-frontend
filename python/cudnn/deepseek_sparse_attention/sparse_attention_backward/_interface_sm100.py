@@ -104,8 +104,9 @@ def _select_sm100_backend(
     selected only for the Blackwell SM100/SM103 BF16 envelopes validated by
     their kernels (H128 D512, and contiguous H96/H128 D576 with D_v512); every other
     supported configuration retains the established backend.
-    Deterministic H96/H128 D576 execution uses the two-CTA Tensor Core kernel;
-    other deterministic envelopes use the established generic M64 kernel.
+    H96/H128 D576 execution uses the two-CTA Tensor Core kernel inside the
+    validated envelope; other deterministic envelopes use the established
+    generic M64 kernel.
     """
     if (
         device_capability in _BLACKWELL_CAPABILITIES
@@ -130,8 +131,7 @@ def _select_sm100_backend(
         # contiguous inputs; strided inputs keep the generic path below.
         return "h128_d576_2cta_m64", 64
     if (
-        deterministic
-        and device_capability in _BLACKWELL_CAPABILITIES
+        device_capability in _BLACKWELL_CAPABILITIES
         and dtype == torch.bfloat16
         and num_heads == 96
         and head_dim == 576
@@ -141,8 +141,8 @@ def _select_sm100_backend(
     ):
         return "h96_d576_2cta_m64", 64
     if num_heads == 96 and head_dim == 576:
-        # Ordinary execution and deterministic configurations outside the
-        # native two-CTA envelope compose H64 with the tuned H32 tail.
+        # Unsupported H96 layouts, top-k widths, and devices compose H64 with
+        # the tuned H32 tail.
         return "h96_h64_h32", 64
     if deterministic:
         return "generic_m64", 64
