@@ -472,7 +472,7 @@ def test_selector_form_checks_name_the_fault():
     with pytest.raises(ValueError, match="kv_lens must be contiguous"):
         fd.qsa_select_decode_paged(case.qi, case.pool, case.table, torch.stack([case.kv_lens, case.kv_lens], 1)[:, 0], **kw)
     if torch.cuda.device_count() > 1:
-        other_dev = torch.device("cuda", 1 if torch.device(_DEV).index in (None, 0) else 0)
+        other_dev = torch.device("cuda", (case.qi.device.index + 1) % torch.cuda.device_count())  # a device other than the operands' own
         with pytest.raises(ValueError, match="kv_lens must live on"):
             fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens.to(other_dev), **kw)
         with pytest.raises(ValueError, match="block_table needs a unit column stride on"):
