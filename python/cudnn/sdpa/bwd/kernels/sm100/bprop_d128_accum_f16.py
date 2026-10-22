@@ -6,8 +6,10 @@ The five-product pipeline retains 33 live mbarriers. Native output TMA stores
 are warp-uniform, dQ reductions elected; both return 32-lane credits.
 
 Sequence lengths need not be tile multiples: the tail Q / K / V / dO boxes
-zero-fill, the tail dK / dV stores and dQ reductions clip, and the tail Stats
-rows publish -inf so every tail P and dS column is exactly zero.
+zero-fill, the tail dK / dV stores and dQ reductions clip, the tail Stats rows
+publish -inf and the tail key rows are masked before the exponent, so every tail
+P and dS entry is exactly zero (a zero-filled key row must not exponentiate
+exp(-LSE), which overflows for a very negative LSE).
 """
 
 from typing import NamedTuple
@@ -218,7 +220,7 @@ def _stats(slab, lse, delta, row, group, qbase, sq, batch, head, scale):
 
 
 @cute.jit
-def _p_values(slab, tmem_base, row, group, block, qtile, lo, scale, causal: cutlass.Constexpr[bool], dtype: cutlass.Constexpr):
+def _p_values(slab, tmem_base, row, group, block, qtile, lo, skv, scale, causal: cutlass.Constexpr[bool], dtype: cutlass.Constexpr):
     address = tmem_base + group * 64
     a = _tmem_load(address, 32)
     b = _tmem_load(address + 32, 32)
@@ -227,6 +229,13 @@ def _p_values(slab, tmem_base, row, group, block, qtile, lo, scale, causal: cutl
     p = []
     packed = []
     scaled = scale * cutlass.Float32(LOG2E)
+    neg_inf = cutlass.Float32(float("-inf"))
+    kr = block * CFG.M + row
+    # The tail KV tile's zero-filled key rows (kr >= skv) must not exponentiate:
+    # exp2(-stat) overflows for a very negative LSE, and inf times their zero K
+    # would put NaN into dQ.  Only the last KV tile pays the select.
+    key_tail = (block + 1) * CFG.M > skv
+    key_valid = kr < skv
     for chunk in cutlass.range_constexpr(16):
         stat = _view(slab, CFG.STATS, cutlass.Float32, CFG.N).subview(group * 64 + chunk * 4).load(vector_size=4, alignment=16)
         for pair in cutlass.range_constexpr(2):
@@ -234,10 +243,12 @@ def _p_values(slab, tmem_base, row, group, block, qtile, lo, scale, causal: cutl
             s0, s1 = scores[i], scores[i + 1]
             if cutlass.const_expr(causal):
                 if qtile == lo:
-                    kr = block * CFG.M + row
                     qc = qtile * CFG.N + group * 64 + i
-                    s0 = cutlass.Float32(arith.select((kr <= qc).ir_value(), s0.ir_value(), cutlass.Float32(float("-inf")).ir_value()))
-                    s1 = cutlass.Float32(arith.select((kr <= qc + 1).ir_value(), s1.ir_value(), cutlass.Float32(float("-inf")).ir_value()))
+                    s0 = cutlass.Float32(arith.select((kr <= qc).ir_value(), s0.ir_value(), neg_inf.ir_value()))
+                    s1 = cutlass.Float32(arith.select((kr <= qc + 1).ir_value(), s1.ir_value(), neg_inf.ir_value()))
+            if key_tail:
+                s0 = cutlass.Float32(arith.select(key_valid.ir_value(), s0.ir_value(), neg_inf.ir_value()))
+                s1 = cutlass.Float32(arith.select(key_valid.ir_value(), s1.ir_value(), neg_inf.ir_value()))
             e0, e1 = ffma2(scaled, scaled, s0, s1, stat[pair * 2], stat[pair * 2 + 1])
             p0 = cute.math.exp2(e0, fastmath=True)
             p1 = cute.math.exp2(e1, fastmath=True)
@@ -277,6 +288,7 @@ def _softmax_loop(
     head,
     batch,
     sq,
+    skv,
     nk,
     nheads,
     batch_heads: cutlass.Constexpr[int],
@@ -300,7 +312,7 @@ def _softmax_loop(
             _stats(slab, lse, delta, row, group, lo * CFG.N, sq, batch, head, scale)
         for qtile in cutlass.range(lo, hi, 1, unroll=1):
             _wait_tcgen(bars.s_done, state.phase)
-            p = _p_values(slab, tmem_base, row, group, block, qtile, lo, scale, causal, dtype)
+            p = _p_values(slab, tmem_base, row, group, block, qtile, lo, skv, scale, causal, dtype)
             nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
             nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
             bars.p_ready.arrive()
@@ -680,7 +692,7 @@ def bprop_d128_accum_kernel(
     nvvm.barrier_cta_sync()
     tmem_base = tmem_slot.load()
     if warp < 8:
-        _softmax_loop(slab, bars, sched, tmem_base, lse, delta, block, head, batch, sq, nk, nheads, batch_heads, swizzle, scale, causal, dtype)
+        _softmax_loop(slab, bars, sched, tmem_base, lse, delta, block, head, batch, sq, skv, nk, nheads, batch_heads, swizzle, scale, causal, dtype)
     elif warp < 12:
         _epilogue_loop(slab, bars, sched, tmem_base, block, head, batch, sq, nk, nheads, batch_heads, swizzle, causal, dtype)
     elif warp == 12:
