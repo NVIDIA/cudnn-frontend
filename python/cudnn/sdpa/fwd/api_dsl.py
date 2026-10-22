@@ -552,7 +552,8 @@ def _quant_kind(fp8: bool, pertensor: bool) -> str:
 # FMA pipe takes a quarter of every row's exp2 columns.  MEASURED on B200 (same-node A/B/A/B, kernel time, gpt-oss d64 full attention with a sink,
 # all four tp shards): -8..-9 % from 8 sequences x 32K keys up (b=128 x 128K keys 919 -> 841 us at tp8), -3..-6 % at 2K keys, 0 at b=1 x 2K; S_q = 4
 # -4..-5 %.  The kernel folds the split out of the sliding-window builds (a unit there is one or two KV tiles: +2..+5 % at S_q >= 2).  The d128 decode
-# tile is not listed (it is HBM-bound where it is measured); the d64 prefill tile stays off (unmeasured).
+# tile keeps the dense path off (HBM-bound where measured). Its THD split form separately uses the existing f16/d128 flag with a kernel-local
+# packed-partials gate; the d64 prefill tile stays off (unmeasured).
 _EXP2_FMA_SPLIT_DECODE_KERNELS: frozenset[tuple[str, tuple[int, int]]] = frozenset({("f16", (64, 64))})
 
 
@@ -3485,8 +3486,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
     def _decode_early_q(self, params) -> bool:
         """Whether the decode tile (sm100/decode_d128_f16.py: the d64 decode tile, the d128 cga1 tile) takes its early-Q form (``TemplateParams.early_q``)
-        on this build: the measured cc, and a dense / paged plan -- the THD legs keep the staged O store their per-batch runtime descriptors place."""
-        if tuple(self._device_cc) not in _EARLY_Q_CC or self.thd or self._fp8:
+        on this build. Unsplit THD keeps its staged O store; split THD writes FP32 partials directly and leaves the Q slab free."""
+        if tuple(self._device_cc) not in _EARLY_Q_CC or self._fp8:
+            return False
+        if self.thd and not (tuple(self._device_cc) == (10, 0) and tuple(self.flavor) == _SM100_DECODE_FLAVOR and params.cta_mma == 1 and params.split_kv > 1):
             return False
         return bool(params.decode_tile) or (tuple(self.flavor) == _SM100_DECODE_FLAVOR and params.cta_mma == 1)
 
