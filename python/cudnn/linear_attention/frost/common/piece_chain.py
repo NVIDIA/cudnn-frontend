@@ -32,7 +32,7 @@ import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
 from cutlass.cute.runtime import from_dlpack
 
-from cudnn.frost.buffers import DeviceView
+from cudnn.frost.buffers import DeviceView, cutedsl_requirement_error
 from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fadd2, ffma2, fp32_to_fp16
 from cudnn.frost.tile_dsl.tma import (
@@ -902,6 +902,7 @@ class CompiledStateChain(NamedTuple):
     summary_dtype: str
     device: int
     has_seed_indices: bool
+    merge_precision: str = "ieee"
 
 
 def chain_rows_per_cta(dim_v, dim_k, num_seqs, heads_out, num_sm):
@@ -931,6 +932,7 @@ def build_state_chain(
     device,
     opt_level,
     has_seed_indices=False,
+    merge_precision="ieee",
 ) -> CompiledStateChain:
     """Compile (cached per state geometry, flags, dtypes, device and ``opt_level``, the family's main-kernel level so the
     standalone chain is the one its hosts nest; ``heads_out`` and ``pieces`` are launch arguments and
@@ -939,8 +941,17 @@ def build_state_chain(
     and ``emit_summary`` one-slot sequences receive the seed copy and only multi-piece sequences are summarized, with
     either every filled slot carries a summary and the tail / product come out of the one-slot walk too.
     ``summary_dtype`` is the dtype of ``summary_m`` (fp32 or bf16, round to nearest even); ``has_seed_indices`` binds an int32
-    ``[num_seqs]`` table naming the row of ``seed`` each sequence reads."""
+    ``[num_seqs]`` table naming the row of ``seed`` each sequence reads.
+    ``merge_precision`` selects multiplication operands only: legacy IEEE FP32
+    FMA (default), or Tensor Core BF16 / TF32 / three-product TF32. The running
+    state/product, H addition and FP32 outputs remain FP32 in all modes.
+    This does not change the precision used to generate local summaries.
+    """
+    if merge_precision not in ("ieee", "bf16", "tf32", "tf32x3"):
+        raise ValueError("merge_precision must be 'ieee', 'bf16', 'tf32', or 'tf32x3'")
     HO, V, K, P = int(heads_out), int(dim_v), int(dim_k), int(pieces)
+    if merge_precision != "ieee" and (K not in (64, 128, 256) or V not in (64, 128, 256)):
+        raise ValueError("Tensor Core state merge requires dim_k and dim_v in (64, 128, 256)")
     rows = V // 8 if rows_per_cta is None else int(rows_per_cta)
     walk_state = bool(has_seed or has_tail or not emit_summary)
     seed_name = dtype_name(seed_dtype) if has_seed else "float32"
@@ -961,20 +972,10 @@ def build_state_chain(
         int(device),
         int(opt_level),
         bool(has_seed_indices),
+        merge_precision,
     )
     if key not in state_chain_cache:
-        state_chain_cache[key] = cute.compile(
-            launch_state_chain,
-            cutlass.Int32(HO),
-            V,
-            K,
-            rows,
-            cutlass.Int32(P),
-            bool(transpose),
-            bool(has_seed),
-            bool(has_tail),
-            bool(emit_summary),
-            cutlass.Int32(1),
+        samples = (
             from_dlpack(DeviceView(256, (1, HO, V, K), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3) if walk_state else None,
             from_dlpack(DeviceView(256, (1, HO, K, K), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3),
             from_dlpack(DeviceView(256, (1, HO, V, K), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3) if walk_state else None,
@@ -987,9 +988,45 @@ def build_state_chain(
             ),
             from_dlpack(DeviceView(256, (1,), "int32", int(device)), assumed_align=4).mark_layout_dynamic() if filled_only else None,
             from_dlpack(DeviceView(256, (1,), "int32", int(device)), assumed_align=4).mark_layout_dynamic() if has_seed_indices else None,
-            cuda.CUstream(0),
-            options=f"--enable-tvm-ffi --opt-level {int(opt_level)}",
         )
+        if merge_precision == "ieee":
+            compile_target = launch_state_chain
+            compile_args = (
+                cutlass.Int32(HO),
+                V,
+                K,
+                rows,
+                cutlass.Int32(P),
+                bool(transpose),
+                bool(has_seed),
+                bool(has_tail),
+                bool(emit_summary),
+                cutlass.Int32(1),
+                *samples,
+                cuda.CUstream(0),
+            )
+        else:
+            error = cutedsl_requirement_error("Tensor Core state merge")
+            if error:
+                raise NotImplementedError(error)
+            from .state_merge_mma import launch_state_merge_mma
+
+            compile_target = launch_state_merge_mma
+            compile_args = (
+                cutlass.Int32(HO),
+                V,
+                K,
+                cutlass.Int32(P),
+                bool(transpose),
+                bool(has_seed),
+                bool(has_tail),
+                bool(emit_summary),
+                merge_precision,
+                cutlass.Int32(1),
+                *samples,
+                cuda.CUstream(0),
+            )
+        state_chain_cache[key] = cute.compile(compile_target, *compile_args, options=f"--enable-tvm-ffi --opt-level {int(opt_level)}")
     return CompiledStateChain(
         state_chain_cache[key],
         HO,
@@ -1007,6 +1044,7 @@ def build_state_chain(
         summary_name,
         int(device),
         bool(has_seed_indices),
+        merge_precision,
     )
 
 
