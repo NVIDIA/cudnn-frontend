@@ -318,6 +318,37 @@ def test_the_cluster_form_union_list_passes_and_the_id_rank_on_a_spread_tie(cols
 
 
 @needs_cuda
+@needs_cluster_gpu
+@needs_dsl_target
+def test_the_cluster_form_finds_the_tied_cutoff_past_the_first_1024_union_candidates():
+    """The union list holds up to ``cluster_ctas x UNION_CAP`` = 2032 candidates at 16 CTAs -- more than the CTA has threads -- and the
+    exact-key id rank behind the narrowing passes must visit ALL of them: a cutoff candidate past union slot 1023 was owned by no
+    thread (the 2026-10-22 review's finding: the fourth record word stayed unwritten, the compaction read a stale cutoff and every
+    output slot kept its sentinel on a 16-CTA launch while 1 and 8 CTAs passed).  One 32768-column row, every value -1 but the first
+    ``m`` of each CTA's 2048-column slice: 1.0001 on slices 0..9 and 1.0002 on slices 10..15 -- the 16 x m candidates share the first
+    pass's top bin (each slice under ``UNION_CAP``: the union path; more than ``RANK_CAP``: the narrowing passes), the 6 x m entries at
+    1.0002 exceed ``K`` and the 5 x m of them before the last slice fall short of it, so the take-th smallest id at the exact key lies in
+    the LAST CTA's slice, past union slot 1023.  Bitwise the single-CTA form and the canonical reference; the fp64 oracle on the set."""
+    device = torch.device("cuda")
+    cols, C = 32768, 16
+    width = cols // C
+    m = K // 6 + 8  # 93 at K = 512
+    assert 6 * m > K > 5 * m and m <= topk_mod.UNION_CAP and C * m > topk_mod.RANK_CAP, (m, K)
+    logits = torch.full((1, cols), -1.0, dtype=torch.float32, device=device)
+    for s in range(C):
+        logits[0, s * width : s * width + m] = 1.0001 if s < 10 else 1.0002
+    counts = torch.tensor([cols], dtype=torch.int32, device=device)
+    want = _check(logits, counts, K, cluster_ctas=1, threads_per_cta=1024)
+    assert int(want[0, 0]) >= (C - 1) * width, "the premise: the selection's largest id (the cutoff) lies in the last slice"
+    for cluster_ctas in (8, C):
+        out = _run(logits, counts, K, cluster_ctas=cluster_ctas, threads_per_cta=1024)
+        torch.cuda.synchronize()
+        assert bool((out != SENTINEL).all()), f"{cluster_ctas} CTAs: a slot was never written (the sentinel survives)"
+        assert torch.equal(out, want), f"{cluster_ctas} CTAs: the cluster form differs from the single-CTA form"
+    assert_set_matches_fp64_topk(logits, counts, out)
+
+
+@needs_cuda
 @needs_dsl_target
 def test_many_rows_one_block_each():
     """128 rows (the B 32 x S_q 4 cell) at 8192 blocks: one CTA per row, every row independent."""
@@ -556,6 +587,28 @@ def test_geometry_refusals_name_the_rule():
     assert topk_mod.cols_cap_for(8, 1, 1024) == 1024 and topk_mod.cols_cap_for(2049, 1, 1024) == 4096 and topk_mod.cols_cap_for(32768, 1, 512) == 32768
     assert topk_mod.cols_cap_for(8, 16, 1024) == 16384 and topk_mod.cols_cap_for(32768, 8, 1024) == 32768
     assert topk_mod.CLUSTER_SIZES == (1, 4, 8, 16) and topk_mod.DEFAULT_CLUSTER_CTAS == 1 and topk_mod.THREAD_COUNTS == (512, 1024)
+
+
+@needs_cuda
+@needs_dsl_target
+def test_a_row_stride_past_the_int32_range_passes_the_binder_and_matches_the_compact_launch():
+    """The contract takes ANY row stride on ``logits`` and ``block_ids`` and both kernels widen the row arithmetic to 64 bits, so the
+    compiled host's argument fakes declare the row stride 64-bit as well (the 2026-10-22 review's finding: a default-width symbolic stride
+    made the binder refuse a stride past the int32 range with a range error after the wrapper's form checks had passed).  A one-row
+    view with a row stride of 2^32 + 64 elements over the compact row's storage (a singleton axis carries any stride without a larger
+    allocation): the binder takes it and the launch is bitwise the compact one."""
+    device = torch.device("cuda")
+    g = torch.Generator(device=device).manual_seed(11)
+    logits = torch.randn(1, 2048, device=device, dtype=torch.float32, generator=g) * 3.0
+    counts = torch.tensor([2048], dtype=torch.int32, device=device)
+    want = _check(logits, counts, K, threads_per_cta=1024)
+    wide_in = logits.as_strided((1, 2048), (2**32 + 64, 1))
+    out = torch.full((1, K), SENTINEL, dtype=torch.int32, device=device)
+    wide_out = out.as_strided((1, K), (2**32 + 64, 1))
+    assert wide_in.stride(0) > 2**31 and wide_out.stride(0) > 2**31, "the premise: row strides past the int32 range"
+    topk_mod.qsa_topk_decode(wide_in, counts, wide_out, threads_per_cta=1024)
+    torch.cuda.synchronize()
+    assert torch.equal(out, want), "the wide-stride launch differs from the compact one"
 
 
 @needs_cuda

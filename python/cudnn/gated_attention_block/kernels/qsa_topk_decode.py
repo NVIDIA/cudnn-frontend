@@ -1170,11 +1170,14 @@ def frost_qsa_topk_decode_cluster(
                     kstar = (lo - cutlass.Uint32(1)) if lo > cutlass.Uint32(0) else cutlass.Uint32(0)
                     idstar = n - one
                     if (lo == hi) & (take < cnt_b):
-                        # the take-th smallest id among the union's entries with the exact key: an all-pairs rank over ids (<= CAND_CAP)
+                        # the take-th smallest id among the union's entries with the exact key: an all-pairs rank over ids (<= CAND_CAP).
+                        # The union holds up to C x UNION_CAP = 2032 entries at 16 CTAs -- more than the CTA's threads -- so the owner
+                        # loop STRIDES over the whole list: an entry past slot 1023 owned by no thread left the fourth word unwritten and
+                        # the compaction read a stale cutoff (every output slot kept its sentinel; the 2026-10-22 review's finding)
                         kstar = lo
-                        if tidx < ncand:
-                            key_c = s_cand[tidx]
-                            id_c = s_cand_id[tidx]
+                        for c in range(tidx, ncand, threads_per_cta):
+                            key_c = s_cand[c]
+                            id_c = s_cand_id[c]
                             if key_c == kstar:
                                 rnk = zero
                                 for j in range(ncand):
@@ -1354,8 +1357,9 @@ class QsaTopkDecodeRecipe(NamedTuple):
 
 
 def _fake_rows(dtype):
-    """``[rows, cols]`` with a symbolic row stride and a unit column stride, 16-B aligned base."""
-    return cute.runtime.make_fake_tensor(dtype=dtype, shape=(cute.sym_int(), cute.sym_int()), stride=(cute.sym_int(), 1), assumed_align=16)
+    """``[rows, cols]`` with a 64-BIT symbolic row stride (the contract takes any row stride and both kernels widen the row arithmetic to
+    64 bits; a default-width symbolic stride made the binder refuse one past the int32 range) and a unit column stride, 16-B aligned base."""
+    return cute.runtime.make_fake_tensor(dtype=dtype, shape=(cute.sym_int(), cute.sym_int()), stride=(cute.sym_int64(), 1), assumed_align=16)
 
 
 def compile_qsa_topk_decode(
