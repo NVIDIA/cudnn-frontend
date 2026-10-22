@@ -1666,7 +1666,8 @@ def test_DSA_sparse_attention_backward_sm100_compile_cache_is_device_and_address
 
     compile_artifact.cache_clear()
     monkeypatch.setattr(interface, "_compile_sm100_artifact", fake_compile)
-    args = ((10, 0), "generic_m64", torch.bfloat16, 512, 512, 64, 64, True, 32 if deterministic else 64)
+    args = ((10, 0), "generic_m64", torch.bfloat16, 512, 512, 64, 64, True)
+    args += (32, 1) if deterministic else (64,)
     try:
         device0 = compile_artifact(0, *args)
         assert compile_artifact(0, *args) is device0
