@@ -176,7 +176,9 @@ class _MetadataPushRouter(KernelComponent):
     @classmethod
     def impl_desc_require(cls) -> dict[str, type]:
         return {"token_padding_block": int, "promised_launchable_sm_count": int, "drop_on_overflow": bool,
-                "input_dedup_mode": OptionalRequirement(str)}
+                "input_dedup_mode": OptionalRequirement(str),
+                "sf_padding_block": OptionalRequirement(int),
+                "tokens_per_fc1_ready_slot": OptionalRequirement(int)}
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
         self._validate_desc_inputs(problem_desc, impl_desc)
@@ -202,14 +204,32 @@ class _MetadataPushRouter(KernelComponent):
         # readiness only after every local fanout store has completed.
         self.input_dedup_store_mode = "batched" if self.input_dedup_mode != "off" else "serial"
         self.input_dedup_order = "expert" if self.input_dedup_mode != "off" else "token"
-        if self.input_dedup_mode != "off":
-            if (self.world_size, self.expert_count, self.topk, self.token_padding_block,
-                self.max_recv_size_per_rank, self.apply_topk_at_fc1) != (
-                4, 32, 8, 128, 4 * self.max_tokens_per_rank * 8, True
-            ) or self.max_tokens_per_rank > 4096:
-                raise ValueError("Input dedup currently requires uncapped EP4/E32/K8 backward, T<=4096")
         self._validate_router_configuration()
         token_capacity = self.receive_capacity(self.token_padding_block)
+        if self.input_dedup_mode != "off":
+            # Route encoding uses three 20-bit row/ready fields. The smallest
+            # destination row selects the owner without encoding an expert ID.
+            if not self.apply_topk_at_fc1:
+                raise ValueError("Input dedup requires backward routing")
+            self.sf_padding_block = impl_desc["sf_padding_block"]
+            self.tokens_per_fc1_ready_slot = impl_desc["tokens_per_fc1_ready_slot"]
+            if self.sf_padding_block <= 0 or self.tokens_per_fc1_ready_slot <= 0:
+                raise ValueError("Input dedup requires positive SF padding and ready-slot granularity")
+            if self.max_recv_size_per_rank != self.world_size * self.max_tokens_per_rank * self.topk:
+                raise ValueError("Input dedup requires uncapped receive capacity")
+            # The low field stores pool_row + 1; zero denotes an unused route.
+            if token_capacity.padded_route_count >= (1 << 20):
+                raise ValueError("Input dedup requires padded receive capacity < 2**20 rows")
+            # SF rows and ready slots have separate zero-based 20-bit fields.
+            sf_capacity = self.receive_capacity(self.sf_padding_block).padded_route_count
+            ready_slots = (
+                self.receive_capacity(self.tokens_per_fc1_ready_slot).padded_route_count
+                // self.tokens_per_fc1_ready_slot
+            )
+            if sf_capacity > (1 << 20):
+                raise ValueError("Input dedup requires padded SF capacity <= 2**20 rows")
+            if ready_slots > (1 << 20):
+                raise ValueError("Input dedup requires at most 2**20 ready slots")
         self.raw_route_count = token_capacity.raw_route_count
         self.logical_route_capacity = token_capacity.logical_route_count
         required_token_capacity = token_capacity.padded_route_count
@@ -780,12 +800,21 @@ class _MetadataPushRouter(KernelComponent):
                 local_expert = global_expert % Int32(self.experts_per_rank)
                 global_sizes = self._device_workspace.tensor(self.sizes_region)
                 pool_begin = Int32(0)
+                sf_begin = Int32(0)
                 ready_begin = Int32(0)
                 for earlier in cutlass.range_constexpr(self.experts_per_rank):
                     if Int32(earlier) < local_expert:
                         count = global_sizes[destination_rank * Int32(self.experts_per_rank) + Int32(earlier)]
-                        pool_begin = pool_begin + ((count + Int32(127)) // Int32(128)) * Int32(128)
-                        ready_begin = ready_begin + (count + Int32(255)) // Int32(256)
+                        pool_begin = pool_begin + (
+                            (count + Int32(self.token_padding_block - 1)) // Int32(self.token_padding_block)
+                        ) * Int32(self.token_padding_block)
+                        sf_begin = sf_begin + (
+                            (count + Int32(self.sf_padding_block - 1)) // Int32(self.sf_padding_block)
+                        ) * Int32(self.sf_padding_block)
+                        ready_begin = ready_begin + (
+                            (count + Int32(self.tokens_per_fc1_ready_slot - 1))
+                            // Int32(self.tokens_per_fc1_ready_slot)
+                        )
             route_round_count = (route_count + Int32(31)) // Int32(32)
             for route_round in cutlass.range(route_round_count, unroll=1):
                 route = Int32(route_round) * Int32(32) + self._router_lane_idx
@@ -803,10 +832,15 @@ class _MetadataPushRouter(KernelComponent):
                         source_token = Int32(metadata & Int64(0xFFFFFFFF))
                         source_slot = Int32((metadata >> Int64(32)) & Int64(0xFFFF))
                         route_index = (self._router_local_rank * Int32(self.max_tokens_per_rank) + source_token) * Int32(self.topk) + source_slot
-                        ready_slot = ready_begin + (destination_position - pool_begin) // Int32(256)
-                        # Data and SF both use 128-row expert padding in this specialization.
-                        # Three 20-bit fields plus a 3-bit expert fit a positive i64.
-                        packed_route = (Int64(local_expert) << Int64(60)) | (Int64(ready_slot) << Int64(40)) | (Int64(destination_position) << Int64(20)) | Int64(destination_position + Int32(1))
+                        token_in_expert = destination_position - pool_begin
+                        sf_position = sf_begin + token_in_expert
+                        ready_slot = ready_begin + token_in_expert // Int32(self.tokens_per_fc1_ready_slot)
+                        # Zero denotes an absent route; the destination row
+                        # also gives each source token/receiver a unique owner.
+                        packed_route = (
+                            (Int64(ready_slot) << Int64(40)) | (Int64(sf_position) << Int64(20))
+                            | Int64(destination_position + Int32(1))
+                        )
                         stg_b64(destination_routes_address + Int64(route_index) * Int64(8), packed_route, physical_store)
                     if cutlass.const_expr(self.apply_topk_at_fc1):
                         score = cute.arch.load(source_scores + source_position, cutlass.Float32)
@@ -1418,12 +1452,8 @@ class TokenCommDeterministic(KernelComponent):
         self.input_dedup_mode = self._router.input_dedup_mode
         self.input_dedup_store_mode = self._router.input_dedup_store_mode
         self.input_dedup_order = self._router.input_dedup_order
-        if self.input_dedup_mode != "off" and (
-            self.hidden_size, self.quant_kind, self.sf_padding_block,
-            self.tokens_per_fc1_ready_slot, self.token_in_flag_batch,
-            self.transfer_warp_count, self.token_back_mode
-        ) != (7168, "mxfp8_e4m3", 128, 256, 1, 4, "epi_warps"):
-            raise ValueError("Input dedup requires the validated H7168/M256/SF128/four-warp backward protocol")
+        if self.input_dedup_mode != "off" and self.quant_kind not in ("mxfp8_e4m3", "mxfp8_e5m2"):
+            raise ValueError("Input dedup requires MXFP8")
         self._nvlink_barrier = NvlinkBarrier(world_size=self.world_size, barrier_id=self.grid_sync_barrier_id)
         self._device_workspace = None
         self._token_comm_args = None
@@ -1865,6 +1895,19 @@ class TokenCommDeterministic(KernelComponent):
         return device_workspace.tensor(self.pre_reduced_activation_sf_region)
 
     @cute.jit
+    def _load_input_dedup_route_batch(
+        self, routes: cute.Pointer, source_global_token: Int32, route_batch: Int32,
+    ) -> Int64:
+        """Keep one route per lane; predicate the final partial batch."""
+        route_slot = route_batch * Int32(32) + self._lane_idx
+        record = Int64(0)
+        if route_slot < Int32(self.topk):
+            record = cute.arch.load(
+                routes + source_global_token * Int32(self.topk) + route_slot, Int64
+            )
+        return record
+
+    @cute.jit
     def _token_in_deduplicated(self, smem_workspace: SmemWorkspace, smem_base: cute.Pointer) -> None:
         """One remote TMA payload per source token/receiver group, original row outputs.
 
@@ -1876,7 +1919,7 @@ class TokenCommDeterministic(KernelComponent):
         iket.range_push("token_in.deduplicated_payload")
         lane_idx = self._lane_idx
         transfer_warp_idx = self._transfer_warp_idx
-        group_count = 1
+        route_batch_count = ceil_div(self.topk, 32)
         global_warp_idx = self._linear_cta_idx * Int32(self.transfer_warp_count) + transfer_warp_idx
         global_warp_count = Int32(self.promised_launchable_sm_count * self.transfer_warp_count)
         routes = self._device_workspace.ptr(self._router.input_dedup_routes_region)
@@ -1897,7 +1940,6 @@ class TokenCommDeterministic(KernelComponent):
         flags = make_flag_batch_tracker(use_async=self.token_in_async_flags, flag_address=Int64(0),
                     accumulated_flags=Int32(0), phase=Int32(0), thread_idx=lane_idx)
         pull_phase = Int32(0)
-        work_limit = Int32(self.world_size * self.max_tokens_per_rank * group_count)
         # Traverse the same dense, expert-major valid rows as original
         # token_in; physical pool padding never becomes a work item.
         owned_sizes = smem_workspace.tensor(self.expert_sizes_smem_region, smem_base)
@@ -1920,36 +1962,31 @@ class TokenCommDeterministic(KernelComponent):
             pool_row = pool_bases[current_expert] + work - expert_valid_begin
             source_rank_from_row = Int32(0)
             source_token_from_row = Int32(0)
-            source_slot_from_row = Int32(0)
             if lane_idx == Int32(0):
                 metadata = TokenSrcMetadata.load(
                     metadata_pointer.toint() + Int64(pool_row) * Int64(TokenSrcMetadata.nbytes)
                 )
                 source_rank_from_row = metadata.src_rank
                 source_token_from_row = metadata.src_token
-                source_slot_from_row = metadata.src_topk
             source_rank_from_row = Int32(cute.arch.shuffle_sync(source_rank_from_row, Int32(0)))
             source_token_from_row = Int32(cute.arch.shuffle_sync(source_token_from_row, Int32(0)))
-            source_slot_from_row = Int32(cute.arch.shuffle_sync(source_slot_from_row, Int32(0)))
             source_global_token = source_rank_from_row * Int32(self.max_tokens_per_rank) + source_token_from_row
-            group = Int32(0)
-            earlier_owner = Int32(0)
-            # One lane per route; shuffle keeps every subsequent payload branch uniform.
-            record = Int64(0)
-            if lane_idx < Int32(self.topk):
-                record = cute.arch.load(routes + source_global_token * Int32(self.topk) + lane_idx, Int64)
-                route_expert = Int32((record >> Int64(60)) & Int64(7))
-                # Select one owner per source token/receiver group even if
-                # top-k repeats an expert: smallest (expert, source slot).
-                earlier_owner = Int32(record != Int64(0)) & Int32(
-                    (route_expert < current_expert)
-                    | ((route_expert == current_expert) & (lane_idx < source_slot_from_row))
-                )
-            has_earlier_owner = cute.arch.vote_ballot_sync(earlier_owner != Int32(0))
-            if has_earlier_owner != Int32(0):
-                record = Int64(0)
-            active = cute.arch.vote_ballot_sync(record != Int64(0))
-            if active != 0:
+            # Every route owns a distinct destination row. Select the smallest
+            # row across ALL batches, preserving expert-major ownership without
+            # packing a local expert ID. Repeated experts still have distinct rows.
+            record = self._load_input_dedup_route_batch(routes, source_global_token, Int32(0))
+            route_row = Int32(record & Int64(0xFFFFF))
+            earlier_owner = (route_row != Int32(0)) & (route_row < pool_row + Int32(1))
+            has_earlier_owner = cute.arch.vote_ballot_sync(earlier_owner)
+            if cutlass.const_expr(self.topk > 32):
+                for route_batch in cutlass.range(1, route_batch_count, unroll=1):
+                    other = self._load_input_dedup_route_batch(routes, source_global_token, route_batch)
+                    other_row = Int32(other & Int64(0xFFFFF))
+                    earlier_owner = (other_row != Int32(0)) & (other_row < pool_row + Int32(1))
+                    has_earlier_owner = has_earlier_owner | cute.arch.vote_ballot_sync(earlier_owner)
+            # The current valid row guarantees at least one local route, even
+            # when this receiver's first matching route is in a later batch.
+            if has_earlier_owner == Int32(0):
                 source_rank = source_global_token // Int32(self.max_tokens_per_rank)
                 source_token = source_global_token % Int32(self.max_tokens_per_rank)
                 peer_offset = self._token_comm_args.peer_rank_ptr_mapper.map(Int64(0), source_rank, Int64(0))
@@ -1965,28 +2002,35 @@ class TokenCommDeterministic(KernelComponent):
                     tma_load_1d(sf_stage.iterator, remote_sf[Int64(source_token), None].iterator, barrier, Int32(sf_bytes))
                 cute.arch.sync_warp()
                 cute.arch.mbarrier_wait(barrier, pull_phase)
-                for slot in cutlass.range_constexpr(self.topk):
-                    lo = cute.arch.shuffle_sync(Int32(record & Int64(0xFFFFFFFF)), Int32(slot))
-                    hi = cute.arch.shuffle_sync(Int32(record >> Int64(32)), Int32(slot))
-                    route = (Int64(hi) << Int64(32)) | (Int64(lo) & Int64(0xFFFFFFFF))
-                    if route != Int64(0):
-                        pool_row = Int32(route & Int64(0xFFFFF)) - Int32(1)
-                        sf_row = Int32((route >> Int64(20)) & Int64(0xFFFFF))
-                        ready_slot = Int32((route >> Int64(40)) & Int64(0xFFFFF))
-                        dst = cute.make_ptr(self.activation_dtype,
-                            destination_data.toint() + Int64(pool_row) * Int64(self.bytes_per_token),
-                            AddressSpace.gmem, assumed_align=16)
-                        with cute.arch.elect_one():
-                            cp_async_bulk_s2g(dst, stage.iterator, Int32(activation_bytes))
-                        cute.arch.sync_warp()
-                        sf_row_view = destination_sf[Int64(sf_row), ((None, None), None)]
-                        sf_values = cute.group_modes(cute.slice_(sf_row_view, (0, None, None)), 0, 2)
-                        sf_vectors = cute.zipped_divide(sf_values, (4,))
-                        for sf_round in cutlass.range_constexpr(ceil_div(cute.size(sf_vectors, mode=[1]), 32)):
-                            vector = Int32(sf_round * 32) + lane_idx
-                            if vector < Int32(cute.size(sf_vectors, mode=[1])):
-                                cute.copy(sf_atom, source_sf_vectors[None, vector], sf_vectors[None, vector])
-                # All fanout destinations are distinct pool rows. Their S2G
+                for route_batch in cutlass.range(route_batch_count, unroll=1):
+                    batch_record = record
+                    if cutlass.const_expr(self.topk > 32):
+                        if route_batch != Int32(0):
+                            batch_record = self._load_input_dedup_route_batch(
+                                routes, source_global_token, route_batch
+                            )
+                    for slot in cutlass.range_constexpr(min(self.topk, 32)):
+                        lo = cute.arch.shuffle_sync(Int32(batch_record & Int64(0xFFFFFFFF)), Int32(slot))
+                        hi = cute.arch.shuffle_sync(Int32(batch_record >> Int64(32)), Int32(slot))
+                        route = (Int64(hi) << Int64(32)) | (Int64(lo) & Int64(0xFFFFFFFF))
+                        if route != Int64(0):
+                            destination_row = Int32(route & Int64(0xFFFFF)) - Int32(1)
+                            sf_row = Int32((route >> Int64(20)) & Int64(0xFFFFF))
+                            dst = cute.make_ptr(self.activation_dtype,
+                                destination_data.toint() + Int64(destination_row) * Int64(self.bytes_per_token),
+                                AddressSpace.gmem, assumed_align=16)
+                            with cute.arch.elect_one():
+                                cp_async_bulk_s2g(dst, stage.iterator, Int32(activation_bytes))
+                            cute.arch.sync_warp()
+                            sf_row_view = destination_sf[Int64(sf_row), ((None, None), None)]
+                            sf_values = cute.group_modes(cute.slice_(sf_row_view, (0, None, None)), 0, 2)
+                            sf_vectors = cute.zipped_divide(sf_values, (4,))
+                            for sf_round in cutlass.range_constexpr(ceil_div(cute.size(sf_vectors, mode=[1]), 32)):
+                                vector = Int32(sf_round * 32) + lane_idx
+                                if vector < Int32(cute.size(sf_vectors, mode=[1])):
+                                    cute.copy(sf_atom, source_sf_vectors[None, vector], sf_vectors[None, vector])
+                # Every batch has issued its stores before any ready is
+                # published. All destinations are distinct pool rows. Their S2G
                 # copies may share one bulk async-group without write-order
                 # dependencies. Keep both source stages immutable until the
                 # full wait below; .read alone is insufficient for ready.
@@ -1996,14 +2040,23 @@ class TokenCommDeterministic(KernelComponent):
                 # Join every bulk issuer and every generic SF writer before
                 # the elected lane publishes any destination's release flag.
                 cute.arch.sync_warp()
-                for slot in cutlass.range_constexpr(self.topk):
-                    lo = cute.arch.shuffle_sync(Int32(record & Int64(0xFFFFFFFF)), Int32(slot))
-                    hi = cute.arch.shuffle_sync(Int32(record >> Int64(32)), Int32(slot))
-                    route = (Int64(hi) << Int64(32)) | (Int64(lo) & Int64(0xFFFFFFFF))
-                    if route != Int64(0):
-                        ready_slot = Int32((route >> Int64(40)) & Int64(0xFFFFF))
-                        flags = flags.accumulate(Int32(0), 1, (ready + ready_slot).toint())
-                        cute.arch.sync_warp()
+                for route_batch in cutlass.range(route_batch_count, unroll=1):
+                    batch_record = record
+                    if cutlass.const_expr(self.topk > 32):
+                        if route_batch != Int32(0):
+                            batch_record = self._load_input_dedup_route_batch(
+                                routes, source_global_token, route_batch
+                            )
+                    for slot in cutlass.range_constexpr(min(self.topk, 32)):
+                        lo = cute.arch.shuffle_sync(Int32(batch_record & Int64(0xFFFFFFFF)), Int32(slot))
+                        hi = cute.arch.shuffle_sync(Int32(batch_record >> Int64(32)), Int32(slot))
+                        route = (Int64(hi) << Int64(32)) | (Int64(lo) & Int64(0xFFFFFFFF))
+                        if route != Int64(0):
+                            ready_slot = Int32((route >> Int64(40)) & Int64(0xFFFFF))
+                            flags = flags.accumulate(
+                                Int32(0), self.token_in_flag_batch, (ready + ready_slot).toint()
+                            )
+                            cute.arch.sync_warp()
                 pull_phase = pull_phase ^ Int32(1)
             work = work + global_warp_count
         flags.fire()

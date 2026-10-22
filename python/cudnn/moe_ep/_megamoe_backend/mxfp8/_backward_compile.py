@@ -86,7 +86,7 @@ def _dgrad_selector_kwargs(
     """Map the public MoeEP profile to upstream selector flags."""
 
     return {
-        "enable_dgrad_optimizations": (config.dgrad_optimization == "ds3_ep4_v1"),
+        "enable_dgrad_optimizations": (config.dgrad_optimization == "ds3_ep4_pattern"),
         "dgrad_schedule": ("optimized" if config.dgrad_optimization == "rolling" else None),
     }
 
@@ -101,7 +101,7 @@ def _validate_resolved_dgrad_profile(
     expected_upstream_profile = {
         "baseline": "explicit",
         "rolling": "optimized",
-        "ds3_ep4_v1": "ds3_ep4_v1",
+        "ds3_ep4_pattern": "ds3_ep4_v1",
     }[config.dgrad_optimization]
     actual_upstream_profile = resolved_dgrad["dgrad_optimization_profile"]
     if actual_upstream_profile != expected_upstream_profile:
@@ -111,8 +111,10 @@ def _validate_resolved_dgrad_profile(
             f"resolved {actual_upstream_profile!r}, expected "
             f"{expected_upstream_profile!r}"
         )
-    if config.dgrad_optimization == "ds3_ep4_v1" and resolved_dgrad["dgrad_optimization_overrides"]:
-        raise RuntimeError("Rubin ds3_ep4_v1 resolved with unexpected downstream " f"overrides: {resolved_dgrad['dgrad_optimization_overrides']!r}")
+    if config.dgrad_optimization == "ds3_ep4_pattern" and resolved_dgrad["dgrad_optimization_overrides"]:
+        raise RuntimeError(
+            "Rubin ds3_ep4_v1 profile for ds3_ep4_pattern resolved with " f"unexpected downstream overrides: {resolved_dgrad['dgrad_optimization_overrides']!r}"
+        )
 
 
 def prepare_backward_kernel(

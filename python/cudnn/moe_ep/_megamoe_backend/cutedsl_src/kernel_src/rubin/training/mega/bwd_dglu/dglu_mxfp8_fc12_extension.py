@@ -26,8 +26,9 @@ class DgluMxFp8Fc12SchedExtension(GluMxFp8Fc12SchedExtension):
         super().__post_init__()
         if self.expert_token_sizes is None:
             raise ValueError("dGLU auxiliaries require expert_token_sizes.")
-        if self.token_padding_block != self.sf_padding_block or self.token_padding_block % 128 != 0:
-            raise ValueError("dGLU auxiliaries require equal token/SF padding divisible by 128.")
+        if any(padding <= 0 or padding % 128 != 0
+               for padding in (self.token_padding_block, self.sf_padding_block)):
+            raise ValueError("dGLU auxiliaries require positive token/SF padding divisible by 128.")
 
     def __extract_mlir_values__(self) -> list:
         values = super().__extract_mlir_values__()
