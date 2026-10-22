@@ -501,6 +501,29 @@ operands (not a tuned number); the same against the HF-rounding oracle (the pool
 queries and compressed keys within one bf16 ulp of the once-rounded fp32 chain; the count rule on every row; and attention
 EXACT given the kernel's selection -- the block oracle on the kernel's list within the dense suites' budgets.
 
+**The paged decode scorer (standalone).** The first piece of that decode-step indexer ships on its own:
+`cudnn.gated_attention_block.qsa_select_paged.qsa_select_decode_paged(qi, kbar, block_table, kv_lens, seq_q=1, top_k=512)`
+scores a decode step's `seq_q` indexer query rows per sequence (`qi [B x seq_q, index_heads, 128]` bf16) against the compressed
+keys of the complete 4-token blocks each row can see, read from the PAGED compressed-key cache the serving stacks keep on the
+main block table (`kbar [num_pages, page_size / 4, 1, 128]` bf16: block `j` of sequence `b` is row `j % (page_size / 4)` of page
+`block_table[b, j // (page_size / 4)]`; a power-of-two page size of at least 8), and selects the `top_k` per row with the
+deterministic radix top-k. Row `s` of sequence `b` sits at position `kv_lens[b] - seq_q + s` and sees
+`counts = clamp(floor((pos + 1) / 4), 0, n_blocks_max)` complete blocks; the scorer kernel writes `logits[t, 0:counts[t]]`
+(`scale x sum_h relu(qi[t, h] . kbar[b, j])` in fp32: the ReLU-summed, head-reduced indexer score) and the counts on device -- no torch
+prologue -- and the top-k returns `block_ids [T, top_k]` int32 in ASCENDING order with `-1` past `block_lens = min(top_k, counts)`
+(ties to the smaller id), so two calls are bitwise. A `-1` table entry under a visible block reads as a zero key (logit 0);
+a padding sequence (`kv_lens == 0`) writes nothing but its counts (0) and never reads the cache. The scorer kernel alone
+(`kernels.qsa_score_paged.compile_qsa_score_paged` / `run_qsa_score_paged`: one warp-level `mma.sync.m16n8k16` per 8 keys x 16 D
+over the `seq_q x index_heads` query rows padded to 16 -- the query tile staged once per CTA in shared memory behind one CTA
+barrier, the keys streamed by `cp.async` through a per-warp ring into the B fragments; the programmatic-dependent-launch pair under
+`use_pdl`) runs on any CuTe DSL device from sm_80; the paired selector needs the radix top-k's cc 9.0. The e4m3 indexer cache is a
+typed decline by name (the paged scorer's e4m3 read arm is a follow-up); `units_per_warp` (1 / 2 / 4 / 8 units of 32 compressed rows
+per warp, default 1) and `use_pdl` are performance knobs -- the same function. The entry's
+module imports no CuTe DSL: the DSL floor, the `sm_107a` target on cc 10.7 and the radix top-k's cc 9.0 are typed
+`NotImplementedError`s raised BEFORE the kernel module is imported, so the import path resolves on the public 4.6.2 wheel too;
+`stream` takes a `torch.cuda.Stream`, a raw stream handle or `None` (torch's current stream), and every torch operation of the
+call runs on it. The dense-cache form of this selection and the in-block binding of this scorer are follow-ups.
+
 **The CuTe DSL floor.** The Rubin sparse core needs the public `nvidia-cutlass-dsl` 4.8.0 wheel (the `sm_107a`
 target); below it `check_support()` raises a typed `NotImplementedError` that names the installed version, BEFORE any
 kernel module is imported -- never a `KeyError` from inside the DSL. An `index_source="indexer"` block raises the same
