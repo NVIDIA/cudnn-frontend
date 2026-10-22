@@ -102,7 +102,7 @@ Backward compacts the current selection, computes
 and LSE, and forms dQ/dK/dV. Accumulation uses FP32; output gradients use BF16.
 K/V gradient contributions from all query heads are summed. Floating-point
 atomic reductions can change low bits between runs.
-On Blackwell, the 12:1 path pairs adjacent queries and gathers their selected
+On Blackwell and Rubin, the 12:1 path pairs adjacent queries and gathers their selected
 block union. Owner bits retain each query's mask while sharing K/V loads.
 A device-side K/V scan selects a per-query fallback when nonfinite values are
 present. The fallback reuses the compact union but applies each query's owner
@@ -151,16 +151,18 @@ The public functions select one of two architecture families internally:
 | Family | Forward kernel | Backward kernel |
 |---|---|---|
 | Blackwell SM100/SM103 | `cudnn_frost_qsa_fprop_sm100` | `cudnn_frost_qsa_bprop_sm100` |
-| Rubin SM107 | `cudnn_frost_qsa_fprop_sm107` | `cudnn_frost_qsa_bprop_sm107` |
+| Rubin SM107 | `cudnn_frost_qsa_fprop_sm107` | Paired `cudnn_frost_qsa_bprop_sm100` (12:1), `cudnn_frost_qsa_bprop_sm107` (24:2) |
 
-The four kernel symbols are implementation details. CuTeDSL 4.7 or newer is
+Kernel symbols are implementation details; Rubin kernels compile for SM107.
+Rubin compaction scans 16 selection bytes per lane and preserves block order.
+CuTeDSL 4.7 or newer is
 required; Rubin also requires a build with the `sm_107a` target.
 
 Calls allocate outputs and scratch on the input device and enqueue work on its
 current PyTorch CUDA stream. Warm up the chosen head geometry before CUDA graph
 capture. Compiled kernels reuse symbolic token and block extents; metadata is
 rebuilt from the current bitmap on each call. Forward scratch includes an int32
-`[T, NB]` compact-index buffer and int32 `[T]` counts. Blackwell 12:1 backward
+`[T, NB]` compact-index buffer and int32 `[T]` counts. The 12:1 backward path on both families
 uses `[ceil(T/2), NB]` indices and `[ceil(T/2)]` counts; other backward paths use
 the forward shapes. Backward also uses FP32 gradient accumulators and `[T, Hq]`
 delta. The paired backward safety scan also uses four int32 flags per 1024

@@ -129,6 +129,7 @@ def frost_qsa_pack_bits(
     ranges: cute.Tensor,
     ids: cute.Tensor,
     counts: cute.Tensor,
+    vectorized: cutlass.Constexpr = False,
 ):
     tid = cute.arch.thread_idx()[0]
     row = Int64(cute.arch.block_idx()[0]) * 4 + tid // 32
@@ -159,18 +160,37 @@ def frost_qsa_pack_bits(
                                     word = word | mask
                 bits[row, Int64(word_index)] = word
         else:
-            _metadata._compact_row(sel, lo, hi, first, last, ids, counts, row, lane)
+            _metadata._compact_row(sel, lo, hi, first, last, ids, counts, row, lane, vectorized)
 
 
 frost_qsa_pack_bits.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit
-def prepare(k, v, sel, lo, hi, bases, origins, first, last, partials, modes, ranges, bits, order, ids, counts, stream: cuda.CUstream):
+def prepare(
+    k,
+    v,
+    sel,
+    lo,
+    hi,
+    bases,
+    origins,
+    first,
+    last,
+    partials,
+    modes,
+    ranges,
+    bits,
+    order,
+    ids,
+    counts,
+    stream: cuda.CUstream,
+    vectorized: cutlass.Constexpr = False,
+):
     frost_qsa_scan_kv(k, v, partials).launch(grid=(cute.ceil_div(k.shape[0], 1024), 1, 1), block=(128, 1, 1), stream=stream)
     frost_qsa_tile_bounds(lo, hi, partials, modes, ranges).launch(grid=(cute.ceil_div(lo.shape[0], TILE_M), 1, 1), block=(128, 1, 1), stream=stream)
     frost_qsa_schedule(modes, ranges, order).launch(grid=(1, 1, 1), block=(128, 1, 1), stream=stream)
-    frost_qsa_pack_bits(sel, lo, hi, bases, origins, first, last, bits, modes, ranges, ids, counts).launch(
+    frost_qsa_pack_bits(sel, lo, hi, bases, origins, first, last, bits, modes, ranges, ids, counts, vectorized).launch(
         grid=(cute.ceil_div(bits.shape[0], 4), 1, 1), block=(128, 1, 1), stream=stream
     )
 
@@ -201,6 +221,7 @@ def compile_kernel(arch):
         tensor(Int32, (total, blocks)),
         row,
         make_fake_stream(use_tvm_ffi_env_stream=False),
+        arch == 107,
         cache_key=template_key(globals(), {"arch": arch, "source": DIGEST, "metadata": _metadata.FROST_SOURCE_DIGEST}, "prepare"),
         symbol="qsa_hybrid_prepare",
         options=f"--enable-tvm-ffi --gpu-arch=sm_{arch}a",
