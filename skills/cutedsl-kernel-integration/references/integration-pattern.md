@@ -48,7 +48,7 @@ Use this routing table before choosing the package namespace:
 Follow the closest template instead of inventing a new lifecycle.
 
 - Public functions:
-  - Name each function `<op_name>_<direction>` (PyTorch) or `<op_name>_<direction>_jax` (JAX), following `docs/fe-oss-apis/api_conventions.md`.
+  - Name each function `cudnn.ops.<op_name>_<direction>` (PyTorch) or `cudnn.ops.<op_name>_<direction>_jax` (JAX), following `docs/fe-oss-apis/api_conventions.md`.
   - Validate dtype, shape, stride, tiling, architecture, and unsupported combinations before compiling.
   - For fused kernels, validate epilogue-specific constraints: activation mode, auxiliary inputs/outputs, output shape/stride contract, dtype compatibility, and unsupported activation/config combinations.
   - For dense blockscaled epilogue kernels, model every public output explicitly. Common contracts include `C` plus `AB12`, split `D1/D2`, `amax`, `SFC`, `SFD1/SFD2`, or probability inputs such as `prob_tensor`.
@@ -136,15 +136,13 @@ Do not expose `_get_rubin_kernel()` or Rubin module paths in public docs unless 
 
 ## Public Exports
 
-Add lazy top-level exports in `python/cudnn/__init__.py` for public APIs intended to be imported as `from cudnn import ...`.
+Export public functions from `cudnn.ops`, so callers import them as `from cudnn.ops import ...`.
 
-Expose the public functions and keep `__all__` aligned with the public surface. For nested families, re-export through the operation and family `__init__.py` files whenever callers are expected to import from that family namespace.
-
-Use the existing `_LAZY_OPTIONAL_IMPORTS` table rather than eager optional imports. Add entries that route public names through the family module when one exists:
+Add each function to the `_LAZY_EXPORTS` table in `python/cudnn/ops/__init__.py` rather than importing it eagerly; `__all__` follows the table. For an op in a family (see `docs/fe-oss-apis/api_conventions.md`), use the table in `python/cudnn/ops/<family>/__init__.py`. Route the name to the module that implements it:
 
 ```python
-_LAZY_OPTIONAL_IMPORTS = {
-    "public_function": (".family_module", "public_function"),
+_LAZY_EXPORTS = {
+    "public_function_forward": ("cudnn.gemm.cutedsl.grouped.family_module.api", "public_function_forward"),
 }
 ```
 
@@ -153,8 +151,6 @@ The loader already formats optional dependency failures as:
 ```python
 raise ImportError(f"{name} requires optional dependencies. {_OPTIONAL_DEPENDENCY_INSTALL_HINT}: {e}") from e
 ```
-
-For family modules such as `gemm.cutedsl.grouped`, `gemm.cutedsl.discrete_grouped`, or `sdpa`, also update the family `__init__.py` (and the lazy-export table in `python/cudnn/__init__.py`) if the function should be available from that namespace.
 
 ## Dependencies
 

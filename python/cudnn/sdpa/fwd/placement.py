@@ -86,10 +86,19 @@ on those three, LEAD everywhere else.
 Re-measured 2026-10-08 against public cuDNN 9.27.0.42 (same part, CUDA-graph replay, 399 cases incl. a
 random hold-out): prefill and ``2 <= s_q <= 16`` still lead (prefill median 0.42, decode-shaped
 0.02-0.45 for d64/d128/d256), but ``s_q == 1`` changed: d64/d128 decode is backend-first at every
-batch (FROST 0.96-3.5x), query groups FROST cannot pack (5, 6, 12) re-read K/V per head (1.5-5.6x),
-and d256 needs 12 KV units -> TRAIL outside those (mean regret over the 399 cases 8.5% -> 2.2%). The
+batch (FROST 0.96-3.5x), query groups the tile does not divide (5, 6, 12) re-read K/V per head unpacked
+(1.5-5.6x), and d256 needs 12 KV units -> TRAIL outside those (mean regret over the 399 cases 8.5% -> 2.2%). The
 hold-out informed these bounds, so it is no longer out-of-sample. The d512 one-KV-head shortcut keeps its 128k bound: 32/1 heads won 0.29-0.75 from
 6k KV here but ran 1.31x slower at 6k on an RTX 5090.
+SM120 PackGQA now also packs those groups (tile_q % G != 0); packed, they still trail at d256:
+FROST/backend 1.00-1.44 over G = 3 / 5 / 6 / 12, b 1-16, KV 4k-128k (2026-10-20, same part and cuDNN, SM
+and memory clocks locked, profiler kernel time, median of three alternating pairs, CV <= 0.6%): 1.35-1.44 at
+b = 1 on a 4k cache, within 2% from 64k or 8 batches up -> still TRAIL.
+The 16- / 32-row decode tile leaves ``s_q == 1`` backend-first: FROST/backend 0.96-1.25 over 120 cases
+(GQA 2 / 4 / 6 / 8, d64 / d128 / d256, b 1-16, KV 4k-128k; RTX PRO 6000 Server Edition, SM / memory clocks
+locked at 2100 / 12481 MHz, cuDNN 9.27.0.42, profiler kernel time, median of three alternating pairs, CV <=
+1.2%): 1.11-1.24 at b = 1 on a 4k cache, within 4% from a 64k cache, and the d256 leads at 12+ KV units
+run 1.00-1.05 -> the rule above stands.
 
 SM90 f16/bf16 row (H100 SXM; d512 only, the row floors its envelope at 256): prefill 0.22-0.40 and
 ``2 <= s_q <= 16`` 0.02-0.63 on every cell. There is no split-KV on SM90, so ``s_q == 1`` wins only
@@ -615,7 +624,7 @@ def _place_sm120_f16(caps: Capabilities, facts) -> str:
             return LEAD if units >= SM120_SQ1_MIN_KV_UNITS or (facts.h_q >= SQ1_MQA_MIN_Q_HEADS and facts.s_kv >= SQ1_MQA_MIN_KV_TOKENS) else TRAIL
         group = facts.h_q // max(facts.h_kv, 1)
         if _selected_d_shape(caps, facts) in ((64, 64), (128, 128)) or group & (group - 1):
-            return TRAIL  # d64/d128 and unpackable groups (5, 6, 12): 0.96-3.5x and 1.5-5.6x on cuDNN 9.27
+            return TRAIL  # d64/d128 (0.96-3.5x) and groups the tile does not divide, packed (d256: 1.00-1.44x) on cuDNN 9.27
         need = SM120_SQ1_D256_MIN_KV_UNITS if _selected_d_shape(caps, facts) == (256, 256) else SM120_SQ1_MIN_KV_UNITS
         return LEAD if units >= need else TRAIL
     if facts.window_left is not None and facts.s_q == facts.s_kv:

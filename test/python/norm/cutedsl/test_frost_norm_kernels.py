@@ -7,14 +7,7 @@ BatchNorm), fprop + bprop, for fp32 / fp16 / bf16 I/O, validated against PyTorch
 autograd. Requires a Blackwell (sm_100) GPU and the internal CUTLASS DSL
 (``nvidia-cutlass-dsl-internal``).
 
-Run standalone (no built cuDNN extension required):
-
-    pytest test/python/norm/cutedsl/test_frost_norm_kernels.py
-
-A lightweight stub ``cudnn`` package (with a dummy ``pygraph`` so the shared
-``cudnn.frost`` lifecycle patch installs) is registered so the pure-Python
-``cudnn.norm`` subtree — and ``cudnn.frost.tile_dsl`` — import without the
-compiled cuDNN frontend.
+Unsupported DSL builds skip before kernel imports.
 """
 
 import os
@@ -27,6 +20,12 @@ import torch
 import torch.nn.functional as F
 
 pytest.importorskip("cudnn.norm", reason="frost norm engines require a built cudnn frontend")
+
+from cudnn.norm._lazy import dsl_unavailable
+
+requirement_error = dsl_unavailable("FROST norm tests")
+if requirement_error:
+    pytest.skip(requirement_error, allow_module_level=True)
 
 from cudnn.norm import NormVariant, norm_bprop, norm_fprop
 

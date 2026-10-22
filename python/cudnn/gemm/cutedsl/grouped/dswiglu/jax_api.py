@@ -7,6 +7,7 @@ import cutlass
 import cutlass.cute as cute
 
 from cudnn.api_base import TupleDict
+from cudnn.jax import zeros_init
 from ..canonical_jax import check_jax_inputs, grouped_call, grouped_plan, output_type, sf_array, sf_shape
 from .api import GroupedGemmDswigluSm100
 
@@ -96,7 +97,7 @@ def grouped_gemm_dswiglu(
         mac,
         tuple(output_type(t.shape, t.dtype) for t in inputs.values()),
         tuple(outputs.values()),
-        zero_dprob=True,
+        initialized=((2, zeros_init),),
     )(*inputs.values())
     return TupleDict(
         d_row_tensor=result[0],

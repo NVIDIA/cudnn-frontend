@@ -9,6 +9,30 @@ $\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d}}\right)V$
 using the FlashAttention-2 algorithm as described in the paper [FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning](https://arxiv.org/abs/2307.08691). It is applicable for both training and inference phases, with an option to generate a stats tensor to be used for backwards training computation.
 
 
+## Accumulation type for unified forward SDPA
+
+The existing C++ `SDPA_attributes::set_compute_data_type()` and Python
+`compute_data_type` argument specify the requested accumulation type. An unset
+operation inherits the graph's compute type; if both are unset, unified SDPA
+defaults to `FLOAT`. This is independent of Q/K/V/O storage types: `HALF` or
+`BFLOAT16` tensors do not themselves request reduced-precision accumulation.
+
+```cpp
+auto options = cudnn_frontend::graph::SDPA_attributes()
+    .set_implementation(cudnn_frontend::AttentionImplementation_t::UNIFIED)
+    .set_generate_stats(false)
+    .set_compute_data_type(cudnn_frontend::DataType_t::FLOAT);
+```
+
+Development backends with `CUDNN_HAS_SDPA_FWD_COMP_TYPE` expose
+`CUDNN_ATTR_OPERATION_SDPA_FWD_COMP_TYPE`. The frontend forwards non-default
+requests through that attribute. `FLOAT` retains compatibility with older
+headers and backends; a `HALF` request fails if the attribute is unavailable.
+The matching backend currently rejects `HALF` at descriptor finalization:
+this change adds precision plumbing, not an FP16-accumulator kernel.
+Other accumulation types are rejected. Softmax reductions and statistics
+remain FP32. Composite SDPA and backward SDPA are unchanged.
+
 ## Support Matrix
 
 cudnn SDPA operation requires SM80 (Ampere) or newer architectures and cuda toolkit 12.x or newer.
@@ -307,6 +331,8 @@ graph.sdpa(
     diagonal_band_right_bound=None,       # Right bound for causal mask (0 = causal, None = no bound)
     dropout=None,                         # Dropout config: (prob, seed, offset) or (mask, scale)
     rng_dump=None,                        # Debug: output tensor for RNG dropout mask
+    score_max=None,                       # Side output: per-row softmax max (natural units), fp32 (B, H_q, S_q, 1)
+    score_sum_exp=None,                   # Side output: per-row sum of exp(s - max), fp32 (B, H_q, S_q, 1)
     paged_attention_k_table=None,         # Page table for K container
     paged_attention_v_table=None,         # Page table for V container
     paged_attention_max_seq_len_kv=None,  # Max KV sequence length for paged attention
@@ -341,6 +367,8 @@ graph.sdpa(
 - `diagonal_band_right_bound` (Optional[int]): Right bound for causal masking. Set to 0 for causal mask. Masks columns beyond `row_idx + right_bound`.
 - `dropout` (Optional[tuple]): Dropout configuration. Either `(probability, seed, offset)` for Philox RNG or `(mask, scale)` for custom mask.
 - `rng_dump` (Optional[cudnn_tensor]): Debug tensor to capture the Philox RNG dropout mask.
+- `score_max` (Optional[cudnn_tensor]): Side output, fp32 $(B, H_q, S_q, 1)$: per query row the maximum of the (scaled) attention scores the softmax normalizes against, in natural units; with an attention sink the sink logit counts as one more column. See [Score side outputs](#score-side-outputs-score_max-score_sum_exp).
+- `score_sum_exp` (Optional[cudnn_tensor]): Side output, fp32 $(B, H_q, S_q, 1)$: per query row $\sum_j e^{s_j - \max}$, the fp32 sum of exponentials normalized by `score_max` (the softmax denominator). `stats` $= $ `score_max` $+ \ln$ `score_sum_exp`.
 - `paged_attention_k_table` (Optional[cudnn_tensor]): Page table with block offsets into the K container.
 - `paged_attention_v_table` (Optional[cudnn_tensor]): Page table with block offsets into the V container.
 - `paged_attention_max_seq_len_kv` (Optional[int]): Maximum sequence length for K/V caches. Recommended when using paged attention.
@@ -409,6 +437,59 @@ graph.sdpa(
 - **Generate stats** (`generate_stats`): When `True`, outputs softmax statistics needed for backward pass during training. Set to `True` for training, `False` for inference.
 
 - **Stats in base 2** (`stats_use_log2`): Returns `stats` as $\log_2(e)\,[\max + \ln(\sum e^{s - \max})]$ rather than the natural-log default. The value is exactly the natural-log stats times $\log_2 e$, so it is a convention switch, not a different quantity; the backward pass is unaffected and continues to take natural-log stats.
+
+#### Per-key mask (`kv_mask`, python engines only)
+
+`kv_mask` is an optional input tensor of shape $(1 \mid B, 1, 1, S_{kv})$ (one entry per key, contiguous along $S_{kv}$; a
+batch extent of 1 broadcasts one row over the batch) in one of two forms:
+
+- **BOOLEAN** (the bit-word form): a key whose entry is `False` is excluded from every query's softmax, exactly like a key
+  at or past `seq_len_kv`. A query whose every key is masked follows this frontend's empty-row convention (`O = 0`,
+  `stats = −inf`), not the uniform average an eager finite `−1e9` bias produces — see the conventions paragraph below.
+- **An additive vector** in the Q/K/V dtype or FLOAT: its values are added to the scaled scores of every query row
+  (`s·scale + v`, the eager models' finite `−1e9` fold applied as a VALUE), so a key at `−1e9` contributes `exp(−1e9) = 0`
+  while a row whose every key is `−1e9` is the uniform average of V, exactly as in eager math; a `−inf` entry reproduces the
+  BOOLEAN form. The vector is read as 16-byte granules: $S_{kv}$ must be a multiple of 8 and a batch stride a 16-byte
+  multiple (a 16-bit vector must be the Q/K/V dtype; cast an fp16 vector for a bf16 graph). An fp32 vector together with the
+  additive `bias` runs the 64-wide KV tile only: the heuristics pick `TILE_N = 64` for that pair (its 128-wide rendering spills on
+  the softmax role), an explicit `TILE_N = 128` request is declined typed rather than degraded, and casting the fp32 mask to the
+  Q/K/V dtype is the fast path.
+
+Both forms compose with the padding mask, every diagonal band (bottom-right causal included) and the additive `bias` (the
+graph contract does not admit bottom-right causal together with `bias`). The cuDNN backend has no field for `kv_mask`, so a
+graph that binds it is served by the python engines that fold it (today the SM107 f16/bf16 32- and 64-wide tiles at any
+$S_{kv}$ -- neither form stages anything in shared memory; the same tiles take the additive `bias` as a resident SMEM block up
+to the sequence lengths listed in the support matrix, and the heuristics then pick the narrowest cluster width whose block
+holds the sequence); binding it on any other configuration makes the graph unsupported rather than silently unmasked.
+
+#### Score side outputs (`score_max`, `score_sum_exp`)
+
+The two optional ports expose the operands the softmax statistics are built from, per query row and in natural units:
+`score_max` $= \max_j s_j$ over the row's unmasked (scaled, biased) scores and `score_sum_exp` $= \sum_j e^{s_j - \max}$ as the
+fp32 sum of exponentials, so `stats` $=$ `score_max` $+ \ln$ `score_sum_exp` to fp32 rounding. `score_max` is the raw row
+maximum of the scaled scores themselves (the value a reference computes as `scores.amax(-1)`), not the $\log_2 e$-scaled
+maximum a flash-attention-style kernel carries internally: it is the same quantity cuEquivariance's `triangle_attention`
+returns as `max`, so the two compare directly. With an attention sink the
+sink logit is one more softmax column: it enters the max and contributes $e^{\text{sink} - \max}$ to the sum. `stats_use_log2`
+scales `stats` alone; the two side outputs keep their natural units. Both tensors are fp32 $(B, H_q, S_q, 1)$ in any
+non-overlapping B/H/S stride order, and either may be requested without the other and without `generate_stats`.
+
+**Rows without a single valid key** — a batch with `seq_len_kv = 0`, a bottom-right row above the diagonal, a query row at or
+past `seq_len_q` — follow the same convention as `O` and `stats` on this frontend's engines (`O = 0`, `stats = −inf`):
+`score_max = −inf` and `score_sum_exp = 0`; with a sink the row holds the sink's mass alone, `score_max = sink_logit`,
+`score_sum_exp = 1` (`stats = sink_logit`). Two other conventions are in circulation and matter when results are compared
+across libraries: cuEquivariance's triangle attention zeroes such rows (`o = lse = max = 0`) when the mask is given as
+per-row key lengths, while its dense-mask route leaves them un-zeroed with the model's finite mask value
+(`lse = max = −1e9`, `o` = the uniform average of `V`); eager PyTorch with a finite additive mask likewise returns the uniform
+average. Compare rows that have at least one key, and assert the degenerate rows against the convention of the implementation
+under test.
+
+Under `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` the FROST f16/bf16 forward engines serve both ports on their d128 prefill flavor
+(SM100 / SM103 and SM107: dense, unsplit, unpaged plans of the 2-CTA tile; the outputs are stored by the kernel's epilogue
+next to `stats`, with `O` bitwise unchanged and `stats` within one fp32 rounding of the plan without them), and decline every
+other selection so the cuDNN backend serves it. Unlike the backend's composite softmax, which outputs `stats` alone or the
+pair alone, these engines serve any combination of the three. See
+`python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md`.
 
 #### Limitations
 

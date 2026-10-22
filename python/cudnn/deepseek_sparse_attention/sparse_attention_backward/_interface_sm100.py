@@ -12,11 +12,18 @@ import cutlass.cute as cute
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.runtime import device_capability as _device_capability, resolve_stream
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
-from cudnn.frost.buffers import memset_zero_async
+from cudnn.frost.buffers import cutedsl_requirement_error, memset_zero_async
+from ._interface_sm100_common import (
+    _BLACKWELL_CAPABILITIES,
+    _align_workspace_bytes,
+    _requires_wide_data_addressing,
+    _workspace_shapes_sm100,
+    flash_attn_bwd_sm100_workspace_size,
+)
 from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 from .dsa_bwd_sm100_deterministic import (
     FlashAttentionDSABackwardSm100Deterministic,
-    _deterministic_kernel_class_for_shards,
+    _deterministic_kernel_class_for_config,
     deterministic_kernel_class,
 )
 
@@ -26,15 +33,21 @@ torch2cute_dtype_map = {
     torch.float32: cutlass.Float32,
 }
 
-_BLACKWELL_CAPABILITIES = ((10, 0), (10, 3))
 _SM100_FAMILY_ARCH_FLAGS = {
     (10, 0): "sm_100a",
     (10, 3): "sm_103a",
     (10, 7): "sm_107a",
 }
-_WORKSPACE_ALIGNMENT = 128
 _DETERMINISTIC_HEAD_COUNTS = (16, 32, 64, 96, 128)
-_STATIC_TOPK_STRIDE_BACKENDS = ("h16_m128", "h32_m64", "h96_h64_h32")
+_STATIC_TOPK_STRIDE_BACKENDS = ("h16_m128", "h32_m64", "h96_h64_h32", "h96_d576_2cta_m64")
+
+
+def _sm100_gpu_arch_flag(device_capability: Tuple[int, int]) -> str:
+    """Return the architecture-specific CuTe target for a supported device."""
+    gpu_arch = _SM100_FAMILY_ARCH_FLAGS.get(device_capability)
+    if gpu_arch is None:
+        raise ValueError(f"SM100 DSA backward does not support compute capability {device_capability}")
+    return gpu_arch
 
 
 def _topk_indices_compile_tensor(topk_idxs: torch.Tensor, max_topk: int, backend: str):
@@ -42,74 +55,6 @@ def _topk_indices_compile_tensor(topk_idxs: torch.Tensor, max_topk: int, backend
     if backend in _STATIC_TOPK_STRIDE_BACKENDS:
         return cute.runtime.make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(), max_topk), stride_order=(1, 0), assumed_align=16)
     return to_cute_tensor(topk_idxs)
-
-
-def _align_workspace_bytes(num_bytes: int) -> int:
-    """Round a workspace segment size up to the shared alignment boundary."""
-    return -(-int(num_bytes) // _WORKSPACE_ALIGNMENT) * _WORKSPACE_ALIGNMENT
-
-
-def _workspace_shapes_sm100(
-    total_s_q: int,
-    total_s_kv: int,
-    head_dim: int,
-    num_heads: int,
-    deterministic: bool,
-    backend: Optional[str] = None,
-) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
-    """Return byte-shaped LSE/OdO and dKV scratch layouts for one launch.
-
-    Generic deterministic M64 launches use the adaptive shard specialization.
-    An unspecified backend remains conservative because the deterministic
-    H128 two-CTA kernels retain their fixed 128-plane public workspace.
-    """
-    acc_dtype = cutlass.Float32
-    workspace_lse_odo_shape = FlashAttentionDSABackwardSm100._get_workspace_size_LSE_OdO(
-        total_s_q,
-        head_dim,
-        num_heads,
-        1,
-        acc_dtype,
-    )
-    if deterministic:
-        dkv_kernel_cls = deterministic_kernel_class(total_s_q) if backend == "generic_m64" else FlashAttentionDSABackwardSm100Deterministic
-    else:
-        dkv_kernel_cls = FlashAttentionDSABackwardSm100
-    workspace_dkv_shape = dkv_kernel_cls._get_workspace_size_dKV(
-        total_s_kv,
-        head_dim,
-        1,
-        acc_dtype,
-    )
-    return workspace_lse_odo_shape, workspace_dkv_shape
-
-
-def flash_attn_bwd_sm100_workspace_size(
-    total_s_q: int,
-    total_s_kv: int,
-    head_dim: int,
-    num_heads: int,
-    deterministic: bool = False,
-    *,
-    backend: Optional[str] = None,
-) -> int:
-    """Return the reusable caller scratch required by one SM100 launch.
-
-    The generic deterministic M64 backend selects a 32-, 64-, or 128-plane
-    dKV layout from ``total_s_q``. H128 two-CTA and unspecified backends use
-    the conservative fixed 128-plane layout. The result includes alignment
-    padding and is the minimum byte count for a contiguous ``torch.uint8``
-    workspace; :func:`flash_attn_bwd_sm100` also accepts a larger buffer.
-    """
-    workspace_lse_odo_shape, workspace_dkv_shape = _workspace_shapes_sm100(
-        total_s_q,
-        total_s_kv,
-        head_dim,
-        num_heads,
-        deterministic,
-        backend,
-    )
-    return _align_workspace_bytes(math.prod(workspace_lse_odo_shape)) + _align_workspace_bytes(math.prod(workspace_dkv_shape))
 
 
 def _carve_workspace_sm100(
@@ -157,11 +102,12 @@ def _select_sm100_backend(
     """Return the tuned SM100 kernel variant and its sparse-row tile size.
 
     The two-CTA specializations are deliberately fail-closed.  They are
-    selected only for the Blackwell SM100/SM103 BF16 H128 envelopes validated
-    by their kernels (D512, and contiguous D576 with D_v512); every other
+    selected only for the Blackwell SM100/SM103 BF16 envelopes validated by
+    their kernels (H128 D512, and contiguous H96/H128 D576 with D_v512); every other
     supported configuration retains the established backend.
-    Deterministic H128 execution retains the two-CTA Tensor Core kernels;
-    other deterministic envelopes use the established generic M64 kernel.
+    H96/H128 D576 execution uses the two-CTA Tensor Core kernel inside the
+    validated envelope; other deterministic envelopes use the established
+    generic M64 kernel.
     """
     if (
         device_capability in _BLACKWELL_CAPABILITIES
@@ -185,6 +131,20 @@ def _select_sm100_backend(
         # The D576 two-CTA plan launches without copies, so it only accepts
         # contiguous inputs; strided inputs keep the generic path below.
         return "h128_d576_2cta_m64", 64
+    if (
+        device_capability in _BLACKWELL_CAPABILITIES
+        and dtype == torch.bfloat16
+        and num_heads == 96
+        and head_dim == 576
+        and head_dim_v == 512
+        and max_topk in (128, 512, 1024, 1152, 2048)
+        and is_contiguous
+    ):
+        return "h96_d576_2cta_m64", 64
+    if num_heads == 96 and head_dim == 576:
+        # Unsupported H96 layouts, top-k widths, and devices compose H64 with
+        # the tuned H32 tail.
+        return "h96_h64_h32", 64
     if deterministic:
         return "generic_m64", 64
     if num_heads == 16 and head_dim == 576:
@@ -193,15 +153,17 @@ def _select_sm100_backend(
         return "h16_m128", 128
     if num_heads == 32 and head_dim == 576:
         return "h32_m64", 64
-    if num_heads == 96 and head_dim == 576:
-        # Compose the established H64 kernel with the tuned H32 tail. Both
-        # components accumulate into one FP32 dKV workspace, which is cleared
-        # by H64 and converted once after H32 completes.
-        return "h96_h64_h32", 64
     return "generic_m64", 64
 
 
-def _get_sm100_kernel_class(backend: str, deterministic: bool = False, total_s_q: Optional[int] = None):
+def _get_sm100_kernel_class(
+    backend: str,
+    deterministic: bool = False,
+    total_s_q: Optional[int] = None,
+    total_s_kv: Optional[int] = None,
+    head_dim: Optional[int] = None,
+    num_heads: int = 64,
+):
     """Load the selected implementation without perturbing other variants.
 
     Each variant lives in its own CuTe DSL class: embedding variant
@@ -212,7 +174,7 @@ def _get_sm100_kernel_class(backend: str, deterministic: bool = False, total_s_q
         from .dsa_bwd_sm100_h128_2cta import FlashAttentionDSABackwardSm100H128TwoCTA, FlashAttentionDSABackwardSm100H128TwoCTADeterministic
 
         return FlashAttentionDSABackwardSm100H128TwoCTADeterministic if deterministic else FlashAttentionDSABackwardSm100H128TwoCTA
-    if backend == "h128_d576_2cta_m64":
+    if backend in ("h96_d576_2cta_m64", "h128_d576_2cta_m64"):
         from .dsa_bwd_sm100_h128_d576_2cta import FlashAttentionDSABackwardSm100H128D576TwoCTA, FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic
 
         return FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic if deterministic else FlashAttentionDSABackwardSm100H128D576TwoCTA
@@ -225,13 +187,18 @@ def _get_sm100_kernel_class(backend: str, deterministic: bool = False, total_s_q
 
         return FlashAttentionDSABackwardSm100H32
     if backend == "h96_h64_h32":
-        from .dsa_bwd_sm100_h96 import FlashAttentionDSABackwardSm100H96
+        from .dsa_bwd_sm100_h96 import FlashAttentionDSABackwardSm100H96, FlashAttentionDSABackwardSm100H96Deterministic
 
-        return FlashAttentionDSABackwardSm100H96
+        return FlashAttentionDSABackwardSm100H96Deterministic if deterministic else FlashAttentionDSABackwardSm100H96
     if deterministic:
-        if total_s_q is None:
-            raise ValueError("deterministic SM100 kernel selection requires total_s_q")
-        return deterministic_kernel_class(total_s_q)
+        if total_s_q is None or total_s_kv is None or head_dim is None:
+            raise ValueError("deterministic SM100 kernel selection requires total_s_q, total_s_kv, and head_dim")
+        kernel_cls = deterministic_kernel_class(total_s_q, total_s_kv, head_dim, num_heads)
+        if getattr(kernel_cls, "dkv_relay_cluster_size", 1) > 1:
+            dsl_error = cutedsl_requirement_error("deterministic DSA backward cluster relay")
+            if dsl_error is not None:
+                raise RuntimeError(dsl_error)
+        return kernel_cls
     return FlashAttentionDSABackwardSm100
 
 
@@ -243,6 +210,99 @@ def _fake_compact_tensor(dtype, shape, alignment=16):
         stride_order=tuple(reversed(range(len(shape)))),
         assumed_align=alignment,
     )
+
+
+def _fake_runtime_tensor(dtype, rank, *, divisibility=1, alignment=16):
+    """Mirror the dynamic DLPack tensor type rebound by the plan executor."""
+    shape = [cute.sym_int() for _ in range(rank)]
+    if divisibility != 1:
+        shape[-1] = cute.sym_int(divisibility=divisibility)
+    stride = [cute.sym_int64(divisibility=divisibility) for _ in range(rank - 1)] + [1]
+    return cute.runtime.make_fake_tensor(dtype, tuple(shape), tuple(stride), assumed_align=alignment)
+
+
+def _compile_sm100_artifact(
+    device_index: int,
+    device_capability: Tuple[int, int],
+    element_dtype,
+    head_dim: int,
+    head_dim_v: int,
+    num_heads: int,
+    max_topk: int,
+    has_topk_length: bool,
+    *,
+    kernel_cls,
+    block_tile: int,
+    dkv_planes: int,
+    wide_addressing: bool,
+):
+    """Build an SM100 launchable from tensor metadata without allocating storage."""
+    total_s_q, total_s_kv = cute.sym_int(), cute.sym_int()
+    if wide_addressing:
+        q = _fake_runtime_tensor(element_dtype, 3, divisibility=head_dim)
+        kv = _fake_runtime_tensor(element_dtype, 2, divisibility=head_dim)
+        out = _fake_runtime_tensor(element_dtype, 3, divisibility=head_dim_v)
+        dout = _fake_runtime_tensor(element_dtype, 3, divisibility=head_dim_v)
+        lse = _fake_runtime_tensor(cutlass.Float32, 2, alignment=8)
+        sink = _fake_runtime_tensor(cutlass.Float32, 1)
+        lengths = _fake_runtime_tensor(cutlass.Int32, 1, alignment=4) if has_topk_length else None
+        dq = _fake_runtime_tensor(element_dtype, 3, divisibility=head_dim)
+        dkv = _fake_runtime_tensor(element_dtype, 2, divisibility=head_dim)
+        d_sink = _fake_runtime_tensor(cutlass.Float32, 1)
+        workspace_lse = _fake_runtime_tensor(cutlass.Uint8, 4)
+        workspace_dkv = _fake_runtime_tensor(cutlass.Uint8, 4)
+        indices = cute.runtime.make_fake_tensor(
+            cutlass.Int32,
+            (cute.sym_int(), max_topk),
+            (cute.sym_int64(divisibility=max(max_topk, 1)), 1),
+            assumed_align=16,
+        )
+    else:
+        q = _fake_compact_tensor(element_dtype, (total_s_q, num_heads, head_dim))
+        kv = _fake_compact_tensor(element_dtype, (total_s_kv, head_dim))
+        out = _fake_compact_tensor(element_dtype, (total_s_q, num_heads, head_dim_v))
+        dout = out
+        lse = _fake_compact_tensor(cutlass.Float32, (total_s_q, num_heads), alignment=8)
+        sink = _fake_compact_tensor(cutlass.Float32, (num_heads,))
+        lengths = _fake_compact_tensor(cutlass.Int32, (total_s_q,), alignment=4) if has_topk_length else None
+        dq, dkv, d_sink = q, kv, sink
+        workspace_lse = _fake_compact_tensor(cutlass.Uint8, (1, num_heads, cute.sym_int(), 8))
+        workspace_dkv = _fake_compact_tensor(cutlass.Uint8, (1, dkv_planes, cute.sym_int(), head_dim * 4))
+        indices = _fake_compact_tensor(cutlass.Int32, (total_s_q, max_topk))
+    problem_shape = (
+        cutlass.Int32(1),
+        cutlass.Int32(1),
+        cutlass.Int32(head_dim),
+        (cutlass.Int32(num_heads), cutlass.Int32(1)),
+    )
+    kernel = kernel_cls(
+        element_dtype=element_dtype,
+        head_dim=head_dim,
+        head_dim_v=head_dim_v,
+        block_tile=block_tile,
+        max_topk=max_topk,
+    )
+    with torch.cuda.device(device_index):
+        return cute.compile(
+            kernel,
+            problem_shape,
+            q,
+            kv,
+            out,
+            dout,
+            lse,
+            sink,
+            indices,
+            lengths,
+            dq,
+            dkv,
+            d_sink,
+            workspace_lse,
+            workspace_dkv,
+            cutlass.Float32(1.0),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+            options=compile_options(gpu_arch=_sm100_gpu_arch_flag(device_capability)),
+        )
 
 
 @lru_cache(maxsize=None)
@@ -257,76 +317,84 @@ def _compile_deterministic_sm100(
     max_topk: int,
     has_topk_length: bool,
     deterministic_shards: int,
+    deterministic_relay_cluster_size: int,
+    wide_addressing: bool = False,
 ):
     """Compile one device-owned, shape-dynamic artifact from plan metadata.
 
     Query and KV extents remain symbolic, while dtype, head geometry, top-k
-    width, optional-length presence, and shard count are compile-time facts.
+    width, optional-length presence, plane count, relay width, and address
+    width are compile-time facts.
     The returned launchable belongs to ``device_index``'s CUDA context and may
     be reused only for plans with the same cached signature.
     """
-    gpu_arch = _SM100_FAMILY_ARCH_FLAGS.get(device_capability)
-    if gpu_arch is None:
+    if device_capability not in _SM100_FAMILY_ARCH_FLAGS:
         raise ValueError(f"deterministic SM100 DSA backward requires an SM100-family device, got {device_capability}")
     if dtype not in (torch.float16, torch.bfloat16):
         raise ValueError(f"unsupported deterministic SM100 dtype {dtype}")
 
     if backend == "generic_m64":
-        kernel_cls = _deterministic_kernel_class_for_shards(deterministic_shards)
+        kernel_cls = _deterministic_kernel_class_for_config(deterministic_shards, deterministic_relay_cluster_size)
     else:
         kernel_cls = _get_sm100_kernel_class(backend, True)
         required_shards = kernel_cls.num_dkv_shards
+        required_relay_cluster_size = getattr(kernel_cls, "dkv_relay_cluster_size", 1)
         if required_shards != deterministic_shards:
             raise ValueError(f"deterministic backend {backend!r} requires {required_shards} workspace planes, got {deterministic_shards}")
+        if required_relay_cluster_size != deterministic_relay_cluster_size:
+            raise ValueError(
+                f"deterministic backend {backend!r} requires relay cluster size {required_relay_cluster_size}, " f"got {deterministic_relay_cluster_size}"
+            )
 
-    element_dtype = torch2cute_dtype_map[dtype]
-    total_s_q, total_s_kv = cute.sym_int(), cute.sym_int()
-    q = _fake_compact_tensor(element_dtype, (total_s_q, num_heads, head_dim))
-    kv = _fake_compact_tensor(element_dtype, (total_s_kv, head_dim))
-    out = _fake_compact_tensor(element_dtype, (total_s_q, num_heads, head_dim_v))
-    lse = _fake_compact_tensor(cutlass.Float32, (total_s_q, num_heads), alignment=8)
-    sink = _fake_compact_tensor(cutlass.Float32, (num_heads,))
-    indices = _fake_compact_tensor(cutlass.Int32, (total_s_q, max_topk))
-    lengths = _fake_compact_tensor(cutlass.Int32, (total_s_q,), alignment=4) if has_topk_length else None
-    workspace_lse = _fake_compact_tensor(cutlass.Uint8, (1, num_heads, cute.sym_int(), 8))
-    workspace_dkv = _fake_compact_tensor(cutlass.Uint8, (1, deterministic_shards, cute.sym_int(), head_dim * 4))
-    problem_shape = (
-        cutlass.Int32(1),
-        cutlass.Int32(1),
-        cutlass.Int32(head_dim),
-        (cutlass.Int32(num_heads), cutlass.Int32(1)),
-    )
-    kernel = kernel_cls(
-        element_dtype=element_dtype,
+    return _compile_sm100_artifact(
+        device_index,
+        device_capability,
+        torch2cute_dtype_map[dtype],
         head_dim=head_dim,
         head_dim_v=head_dim_v,
-        block_tile=64,
+        num_heads=num_heads,
         max_topk=max_topk,
+        has_topk_length=has_topk_length,
+        kernel_cls=kernel_cls,
+        block_tile=64,
+        dkv_planes=deterministic_shards,
+        wide_addressing=wide_addressing,
     )
-    # Compile under the declared plan device. ``device_index`` is also part of
-    # this function's cache key because CuTe launchables belong to the CUDA
-    # context that compiled them.
-    with torch.cuda.device(device_index):
-        return cute.compile(
-            kernel,
-            problem_shape,
-            q,
-            kv,
-            out,
-            out,
-            lse,
-            sink,
-            indices,
-            lengths,
-            q,
-            kv,
-            sink,
-            workspace_lse,
-            workspace_dkv,
-            cutlass.Float32(1.0),
-            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
-            options=compile_options(gpu_arch=gpu_arch),
-        )
+
+
+@lru_cache(maxsize=None)
+def _compile_nondeterministic_sm100(
+    device_index: int,
+    device_capability: Tuple[int, int],
+    backend: str,
+    dtype: torch.dtype,
+    head_dim: int,
+    head_dim_v: int,
+    num_heads: int,
+    max_topk: int,
+    has_topk_length: bool,
+    block_tile: int,
+    wide_addressing: bool = False,
+):
+    """Compile one ordinary, device-owned, shape-dynamic plan artifact."""
+    if backend in ("h96_d576_2cta_m64", "h128_d576_2cta_m64"):
+        raise ValueError("the D576 two-CTA backend has its own prepared compiler")
+    if dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(f"unsupported SM100 dtype {dtype}")
+    return _compile_sm100_artifact(
+        device_index,
+        device_capability,
+        torch2cute_dtype_map[dtype],
+        head_dim=head_dim,
+        head_dim_v=head_dim_v,
+        num_heads=num_heads,
+        max_topk=max_topk,
+        has_topk_length=has_topk_length,
+        kernel_cls=_get_sm100_kernel_class(backend),
+        block_tile=block_tile,
+        dkv_planes=1,
+        wide_addressing=wide_addressing,
+    )
 
 
 def flash_attn_bwd_sm100(
@@ -353,8 +421,10 @@ def flash_attn_bwd_sm100(
     Accepts flat (unbatched) contiguous tensors with global topk indices.
     Internally wraps as batch=1 for the CuTe DSL kernel and never repacks.
     ``dq``/``dkv``/``d_sink`` must be caller-provided (``None`` raises
-    ``ValueError``). The D576 direct entry point may allocate omitted scratch;
-    other routes require caller-provided workspace.
+    ``ValueError``). Prepared plans pass their compiled launchable; direct
+    callers retain lazy compilation on first use. The D576 direct entry point
+    may allocate omitted scratch; other routes require caller-provided
+    workspace.
 
     Args:
         q: (total_S_q, nheads, headdim) float16 or bfloat16
@@ -369,16 +439,18 @@ def flash_attn_bwd_sm100(
         dq: preallocated (total_S_q, nheads, headdim), same dtype as q
         dkv: preallocated (total_S_kv, headdim), same dtype as kv
         d_sink: preallocated (nheads,) float32
-        deterministic: use ordered bounded-wave scratch accumulation; the
-            supported BF16 H128 envelopes retain their two-CTA kernels
+        deterministic: use ordered bounded-wave scratch accumulation; large
+            generic-M64 plans use row-aware four-, eight-, or sixteen-CTA
+            cluster relays, while supported BF16 H96/H128 envelopes retain
+            their two-CTA kernels
         current_stream: CUDA stream handle for all initialization, main, and
             reduction launches; defaults to the current CUDA stream (the plan
             API selects Q's device context before entering this function)
         workspace: reusable uint8 scratch sized by
             ``flash_attn_bwd_sm100_workspace_size``
-        _compiled_kernel: internal plan-owned launchable whose compile-time
-            metadata must match the runtime tensors; direct callers should
-            leave this unset to use the lazy compile cache
+        _compiled_kernel: internal plan-owned launchable passed only after the
+            plan validates its runtime tensor contract; direct callers leave
+            this unset to retain low-level validation and lazy compilation
 
     Returns:
         (dq, dkv, d_sink) -- flat layout gradients
@@ -394,37 +466,45 @@ def flash_attn_bwd_sm100(
     ), f"deterministic SM100 DSA backward supports heads in {_DETERMINISTIC_HEAD_COUNTS}, got H{num_head}"
     head_dim_v = 512 if head_dim == 576 else head_dim
     device = q.device
+    # Prepared plans validate their exact runtime contract before passing the
+    # launchable; direct low-level calls retain the checks below.
+    plan_inputs_validated = _compiled_kernel is not None
 
-    assert q.dtype in [torch.float16, torch.bfloat16]
-    assert q.dtype == kv.dtype == out.dtype == dout.dtype
-    assert lse.dtype == torch.float32
-    assert attn_sink.dtype == torch.float32
-    assert topk_idxs.dtype == torch.int32
-    tensors_to_check = [q, kv, out, dout, lse, attn_sink, topk_idxs]
-    if topk_length is not None:
-        tensors_to_check.append(topk_length)
-    assert all(t.is_cuda and t.device == device for t in tensors_to_check), f"all inputs must be CUDA tensors on {device}"
+    if not plan_inputs_validated:
+        assert q.dtype in [torch.float16, torch.bfloat16]
+        assert q.dtype == kv.dtype == out.dtype == dout.dtype
+        assert lse.dtype == torch.float32
+        assert attn_sink.dtype == torch.float32
+        assert topk_idxs.dtype == torch.int32
+        tensors_to_check = [q, kv, out, dout, lse, attn_sink, topk_idxs]
+        if topk_length is not None:
+            tensors_to_check.append(topk_length)
+        assert all(t.is_cuda and t.device == device for t in tensors_to_check), f"all inputs must be CUDA tensors on {device}"
 
     # Cross-tensor shape validation: every tensor below is indexed with
     # coordinates derived from q, so a mismatched shape silently reads or
     # writes out of place instead of failing.
-    assert kv.ndim == 2 and kv.shape[1] == head_dim, f"kv shape mismatch: expected (total_S_kv, {head_dim}), got {tuple(kv.shape)}"
-    expected_o_shape = (total_S_q, num_head, head_dim_v)
-    assert out.shape == expected_o_shape, f"out shape mismatch: expected {expected_o_shape}, got {tuple(out.shape)}"
-    assert dout.shape == expected_o_shape, f"dout shape mismatch: expected {expected_o_shape}, got {tuple(dout.shape)}"
-    assert lse.shape == (total_S_q, num_head), f"lse shape mismatch: expected {(total_S_q, num_head)}, got {tuple(lse.shape)}"
-    assert attn_sink.shape == (num_head,), f"attn_sink shape mismatch: expected {(num_head,)}, got {tuple(attn_sink.shape)}"
-    assert topk_idxs.ndim == 2 and topk_idxs.shape[0] == total_S_q, f"topk_idxs shape mismatch: expected ({total_S_q}, topk_max), got {tuple(topk_idxs.shape)}"
-    if topk_length is not None:
-        assert topk_length.dtype == torch.int32, f"topk_length dtype mismatch: expected torch.int32, got {topk_length.dtype}"
-        assert topk_length.shape == (total_S_q,), f"topk_length shape mismatch: expected {(total_S_q,)}, got {tuple(topk_length.shape)}"
+    if not plan_inputs_validated:
+        assert kv.ndim == 2 and kv.shape[1] == head_dim, f"kv shape mismatch: expected (total_S_kv, {head_dim}), got {tuple(kv.shape)}"
+        expected_o_shape = (total_S_q, num_head, head_dim_v)
+        assert out.shape == expected_o_shape, f"out shape mismatch: expected {expected_o_shape}, got {tuple(out.shape)}"
+        assert dout.shape == expected_o_shape, f"dout shape mismatch: expected {expected_o_shape}, got {tuple(dout.shape)}"
+        assert lse.shape == (total_S_q, num_head), f"lse shape mismatch: expected {(total_S_q, num_head)}, got {tuple(lse.shape)}"
+        assert attn_sink.shape == (num_head,), f"attn_sink shape mismatch: expected {(num_head,)}, got {tuple(attn_sink.shape)}"
+        assert (
+            topk_idxs.ndim == 2 and topk_idxs.shape[0] == total_S_q
+        ), f"topk_idxs shape mismatch: expected ({total_S_q}, topk_max), got {tuple(topk_idxs.shape)}"
+        if topk_length is not None:
+            assert topk_length.dtype == torch.int32, f"topk_length dtype mismatch: expected torch.int32, got {topk_length.dtype}"
+            assert topk_length.shape == (total_S_q,), f"topk_length shape mismatch: expected {(total_S_q,)}, got {tuple(topk_length.shape)}"
 
     # check_support() declines strided inputs; execute re-validates (Rule 1) and never repacks (Rule 2).
-    for name, tensor in zip(("q", "kv", "out", "dout", "lse", "attn_sink", "topk_idxs", "topk_length"), tensors_to_check):
-        if not tensor.is_contiguous():
-            raise ValueError(f"{name} must be contiguous; got shape {tuple(tensor.shape)} strides {tuple(tensor.stride())}")
-    if lse.data_ptr() % 8 != 0:
-        raise ValueError(f"lse must be 8-byte aligned for the SM100 FP32 pair-copy path; got data_ptr=0x{lse.data_ptr():x}")
+    if not plan_inputs_validated:
+        for name, tensor in zip(("q", "kv", "out", "dout", "lse", "attn_sink", "topk_idxs", "topk_length"), tensors_to_check):
+            if not tensor.is_contiguous():
+                raise ValueError(f"{name} must be contiguous; got shape {tuple(tensor.shape)} strides {tuple(tensor.stride())}")
+        if lse.data_ptr() % 8 != 0:
+            raise ValueError(f"lse must be 8-byte aligned for the SM100 FP32 pair-copy path; got data_ptr=0x{lse.data_ptr():x}")
 
     # The compile cache is keyed without output strides, so a caller-provided
     # output must match the contiguous layout the kernel was compiled for (it
@@ -460,13 +540,13 @@ def flash_attn_bwd_sm100(
         device_capability=device_capability,
         deterministic=deterministic,
     )
-    if backend == "h128_d576_2cta_m64":
+    if backend in ("h96_d576_2cta_m64", "h128_d576_2cta_m64"):
         # The D576 two-CTA kernel has its own plan-time compile and launch
         # contract (see ``_interface_sm100_d576``); it shares this entry point
         # only so direct callers get the same selection as the plan.
-        from ._interface_sm100_d576 import flash_attn_bwd_sm100_h128_d576
+        from ._interface_sm100_d576 import flash_attn_bwd_sm100_d576_2cta
 
-        return flash_attn_bwd_sm100_h128_d576(
+        return flash_attn_bwd_sm100_d576_2cta(
             q,
             kv,
             out,
@@ -483,8 +563,9 @@ def flash_attn_bwd_sm100(
             workspace=workspace,
             deterministic=deterministic,
         )
-    kernel_cls = _get_sm100_kernel_class(backend, deterministic, total_S_q)
+    kernel_cls = _get_sm100_kernel_class(backend, deterministic, total_S_q, total_S_kv, head_dim, num_head)
     deterministic_shards = kernel_cls.num_dkv_shards if deterministic else 0
+    deterministic_relay_cluster_size = getattr(kernel_cls, "dkv_relay_cluster_size", 1) if deterministic else 0
     uses_h128_two_cta = backend == "h128_2cta_m64"
     batch_size = 1
 
@@ -534,6 +615,7 @@ def flash_attn_bwd_sm100(
         num_head,
         block_tile,
         deterministic_shards,
+        deterministic_relay_cluster_size,
         device.index,
         max_topk,
         has_topk_length,
@@ -586,7 +668,7 @@ def flash_attn_bwd_sm100(
                 workspace_dKV_tensor,
                 softmax_scale,
                 current_stream,
-                options=compile_options(),
+                options=compile_options(gpu_arch=_sm100_gpu_arch_flag(device_capability)),
             )
     if compiled_kernel is None:
         compiled_kernel = flash_attn_bwd_sm100.compile_cache[compile_key]

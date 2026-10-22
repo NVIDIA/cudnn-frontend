@@ -844,6 +844,18 @@ def test_backward_fills_uninitialized_buffers(lens, d, ratio, coff, pad, tok_pad
 
 
 @pytest.mark.L0
+def test_ratio4_deterministic_workspace_includes_hierarchical_stage():
+    """Ratio 4 reserves disjoint producer and stage-1 planes."""
+    from cudnn.csa.compressor.compressor_sm100 import bwd_dape_workspace_bytes
+
+    nb_total, ratio, d, coff = 65536, 4, 128, 1
+    npartials = (nb_total + 7) // 8
+    nelems = ratio * coff * d
+    ngroups = (npartials + 31) // 32
+    assert bwd_dape_workspace_bytes(nb_total, ratio, d, coff) == (npartials + ngroups) * nelems * 4
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("coff", [1, 2])
 def test_backward_rejects_deterministic_mode(coff):
     """The backward raises under torch.use_deterministic_algorithms (dAPE fp32 atomics)."""

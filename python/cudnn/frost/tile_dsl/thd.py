@@ -20,10 +20,10 @@ Metadata buffer, in int32 words (``THD_META_WORDS(B)`` of them)::
 
     [ seq_kv_lens(B) | cu_seqlens_q(B+1) | cu_seqlens_k(B+1) | batch_remap(B) | live | ctr ]
 
-``batch_remap`` is a permutation of ``[0, B)`` by DESCENDING Q length, so the
-tile scheduler walks the longest sequences first (longest-processing-time): the
-tail of a THD launch is then made of short sequences, which is what bounds the
-ragged last wave.  ``live`` is the total unit count (device-computed — the host
+``batch_remap`` is a permutation of ``[0, B)`` by descending work length.
+The default ranks Q lengths; eligible forward prefix splits rank KV lengths
+because each query tile traverses its KV partition. The tile scheduler visits
+longer work first to reduce the ragged last wave.  ``live`` is the total unit count (device-computed — the host
 cannot know ``SUM_b ceil(s_b/tile)*QH`` without a D2H) and ``ctr`` is the
 persistent scheduler's claim counter.
 """
@@ -42,6 +42,10 @@ TENSOR_MAP_ALIGN = 128
 TENSOR_MAP_BIT21 = 1 << 21  # qword 1: encoder's "tensor >= 128 KiB" flag; tensormap.replace does not update it (issue #1013)
 
 THD_META_WORDS = lambda b: 4 * b + 4  # noqa: E731
+# Optional forward extension: tile-work prefixes in batch-remap order.
+# Existing metadata offsets, including the live count and counter, stay fixed.
+THD_WORK_PREFIX_OFF = lambda b: 4 * b + 4  # noqa: E731
+THD_WORK_META_WORDS = lambda b: 5 * b + 5  # noqa: E731
 THD_CU_K_TOTAL_OFF = lambda b: 3 * b + 1  # noqa: E731   cu_k[B]: the live packed kv total (cu_q occupies [B, 2B], cu_k [2B+1, 3B+1])
 THD_CU_Q_TOTAL_OFF = lambda b: 2 * b  # noqa: E731   cu_q[B]: the live packed q total (the last word of cu_q; a packed dQ fold's row limit)
 THD_REMAP_OFF = lambda b: 3 * b + 2  # noqa: E731
@@ -253,8 +257,12 @@ def write_thd_row_offsets(meta, n_batch: cutlass.Int32, gran: cutlass.Int32, cu0
 
 
 @cute.jit
-def write_thd_batch_remap(meta, n_batch: cutlass.Int32, tid: cutlass.Int32, nthreads: cutlass.Int32) -> None:
-    """Fill ``batch_remap`` with ``[0, B)`` sorted by descending Q length.
+def write_thd_batch_remap(meta, n_batch: cutlass.Int32, tid: cutlass.Int32, nthreads: cutlass.Int32, rank_by_kv: cutlass.Constexpr[bool] = False) -> None:
+    """Fill ``batch_remap`` with ``[0, B)`` sorted by descending work length.
+
+    Forward split callers rank by KV length: each query tile traverses KV,
+    and a short-query request can still carry a long-running partition.
+    Other callers retain Q-length ordering. Equal lengths keep batch order.
 
     Rank-by-counting rather than a sort network: each thread owns a batch and
     counts how many sequences outrank it, which is O(B^2) comparisons but fully
@@ -262,16 +270,22 @@ def write_thd_batch_remap(meta, n_batch: cutlass.Int32, tid: cutlass.Int32, nthr
     original index, so the permutation is stable and reproducible run to run.
 
     WHOLE-BLOCK (not elected).  Must be called AFTER :func:`write_thd_meta`
-    (it reads the ``cu_seqlens_q`` it wrote) with a barrier in between.
+    (it reads the Q prefixes or KV lengths it wrote) with a barrier in between.
     """
     cuq0 = n_batch
     remap0 = cutlass.Int32(3) * n_batch + cutlass.Int32(2)
     i = tid
     while i < n_batch:
-        len_i = cutlass.Int32(meta[cuq0 + i + cutlass.Int32(1)]) - cutlass.Int32(meta[cuq0 + i])
+        if cutlass.const_expr(rank_by_kv):
+            len_i = cutlass.Int32(meta[i])
+        else:
+            len_i = cutlass.Int32(meta[cuq0 + i + cutlass.Int32(1)]) - cutlass.Int32(meta[cuq0 + i])
         rank = cutlass.Int32(0)
         for j in cutlass.range(0, n_batch, 1, unroll=1):
-            len_j = cutlass.Int32(meta[cuq0 + j + cutlass.Int32(1)]) - cutlass.Int32(meta[cuq0 + j])
+            if cutlass.const_expr(rank_by_kv):
+                len_j = cutlass.Int32(meta[j])
+            else:
+                len_j = cutlass.Int32(meta[cuq0 + j + cutlass.Int32(1)]) - cutlass.Int32(meta[cuq0 + j])
             # Descending by length; ties resolved by the lower original index.
             outranks = (len_j > len_i) | ((len_j == len_i) & (j < i))
             rank = rank + cutlass.Int32(arith.select(outranks.ir_value(), cutlass.Int32(1).ir_value(), cutlass.Int32(0).ir_value()))
@@ -328,6 +342,41 @@ def write_thd_live_and_ctr(
         if tidx == cutlass.Int32(0):
             meta[cutlass.Int32(4) * n_batch + cutlass.Int32(2)] = live * cutlass.Int32(splits)
             meta[cutlass.Int32(4) * n_batch + cutlass.Int32(3)] = n_ctas
+
+
+@cute.jit
+def write_thd_work_prefix(meta, n_batch, n_qh, unit_rows, n_ctas, tidx, splits: cutlass.Constexpr[int]):
+    """Prepare a remap-ordered tile prefix in the existing setup launch.
+
+    Each entry counts query-tile/head work before splitting. A single batch
+    needs no lookup table and retains the existing live-count fast path.
+    The caller has barriered after publishing Q prefixes and batch remapping.
+    """
+    if n_batch <= cutlass.Int32(1):
+        write_thd_live_and_ctr(meta, n_batch, n_qh, unit_rows, n_ctas, tidx, splits)
+    elif tidx < cutlass.Int32(32):
+        prefix0 = THD_WORK_PREFIX_OFF(n_batch)
+        carry = cutlass.Int32(0)
+        for start in cutlass.range(0, n_batch, 32, unroll=1):
+            rank = start + tidx
+            work = cutlass.Int32(0)
+            if rank < n_batch:
+                b = cutlass.Int32(meta[THD_REMAP_OFF(n_batch) + rank])
+                q_len = cutlass.Int32(meta[n_batch + b + 1]) - cutlass.Int32(meta[n_batch + b])
+                work = ((q_len + unit_rows - 1) // unit_rows) * n_qh
+            for bit in cutlass.range_constexpr(5):
+                delta = 1 << bit
+                prior = cute.arch.shuffle_sync_up(work, offset=delta, mask_and_clamp=0)
+                if tidx >= delta:
+                    work = work + prior
+            prefix = carry + work
+            if rank < n_batch:
+                meta[prefix0 + rank + 1] = prefix
+            carry = cute.arch.shuffle_sync(prefix, 31)
+        if tidx == cutlass.Int32(0):
+            meta[prefix0] = cutlass.Int32(0)
+            meta[THD_LIVE_OFF(n_batch)] = carry * cutlass.Int32(splits)
+            meta[THD_CTR_OFF(n_batch)] = n_ctas
 
 
 @cute.jit

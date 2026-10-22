@@ -48,8 +48,8 @@ is the approved deterministic tolerance contract (reduction reorders + fast-exp
 buckets).
 The default ``dAPE`` path uses one fp32 atomic per ``(k, dim)`` per CTA and is not
 run-to-run deterministic. ``deterministic=True`` replaces those atomics with
-CTA-local partial planes in caller-owned workspace plus a fixed-order second-stage
-reduction, making the complete backward bitwise run-to-run deterministic and valid
+CTA-local partial planes in caller-owned workspace plus fixed-order reduction stages,
+making the complete backward bitwise run-to-run deterministic and valid
 under ``torch.use_deterministic_algorithms(True)``.
 """
 
@@ -448,8 +448,8 @@ class CSACompressorBackward(_CSACompressorBase):
     ``deterministic=True``, ``scratch_workspace_bytes()`` reports the required
     caller-owned same-device contiguous uint8 scratch. The buffer must be 16-byte
     aligned, must not overlap any operand, and must have at least the reported
-    capacity. ``execute(..., workspace=...)`` launches a fixed-order second-stage
-    reduction, and ``grad_ape`` is fully overwritten (so it need not be initialized
+    capacity. ``execute(..., workspace=...)`` launches fixed-order reduction stages,
+    and ``grad_ape`` is fully overwritten (so it need not be initialized
     and graph replays do not accumulate). The atomic plan requires ``workspace=None``;
     supplying deterministic scratch to it is rejected rather than changing the
     compiled reduction. Incoming gradients on static-capacity padding rows

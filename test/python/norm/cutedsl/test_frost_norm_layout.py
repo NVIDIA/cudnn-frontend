@@ -67,8 +67,7 @@ def _install_repo_cudnn_stub():
     Deliberately NOT done at import time under pytest: ``sys.modules["cudnn"]`` is
     process-global, so a stub installed during collection replaces the real module for
     every other test in the session -- ``norm/graph/test_batchnorm.py`` and friends
-    need the genuine frontend and fail to import against a stub. Under pytest this
-    file uses the same plain importorskip as its siblings.
+    need the genuine frontend. Pytest checks DSL support before importing kernels.
     """
     if "cudnn" in sys.modules:
         return
@@ -101,6 +100,12 @@ if __name__ == "__main__":
     _install_repo_cudnn_stub()
 
 pytest.importorskip("cudnn.norm", reason="frost norm kernels require a built cudnn frontend")
+
+from cudnn.norm._lazy import dsl_unavailable
+
+requirement_error = dsl_unavailable("FROST norm tests")
+if requirement_error:
+    pytest.skip(requirement_error, allow_module_level=True)
 
 from cudnn.norm import NormVariant, norm_bprop, norm_fprop  # noqa: E402
 

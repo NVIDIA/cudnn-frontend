@@ -231,6 +231,7 @@ class pygraph:
         device_property: Any = None,
         is_dynamic_shape_enabled: bool = False,
         is_override_shape_enabled: bool = False,
+        cuda_graph_retention: Any = None,
         *,
         is_cuda_graph_replay_expected: bool = False,
         **kwargs,
@@ -250,6 +251,7 @@ class pygraph:
             ("sm_version", sm_version),
             ("kernel_cache", kernel_cache),
             ("device_property", device_property),
+            ("cuda_graph_retention", cuda_graph_retention),
         ):
             if _v is not None:
                 self._cpp_graph_kwargs[_k] = _v
@@ -2563,6 +2565,15 @@ class pygraph:
 
         return {uid: _ptr(d) for uid, d in uid_to_data.items()}, (_ptr(workspace) if workspace is not None else 0)
 
+    def get_cuda_graph_retention(self):
+        """The CUDA graph retention mode in effect for this graph: the one passed as
+        ``cuda_graph_retention``, else the ``CUDNN_CUDA_GRAPH_RETENTION`` environment variable, else
+        ``cuda_graph_retention.PER_GRAPH``. Available before the graph is lowered."""
+        lowered = self.__dict__.get("_lowered_graph")
+        if lowered is not None:
+            return lowered.get_cuda_graph_retention()
+        return _pybind_module._effective_cuda_graph_retention(self._cpp_graph_kwargs.get("cuda_graph_retention"))
+
     def __getattr__(self, name: str):
         # Plan-configuration and query methods (deselect_engines,
         # get_engine_and_knobs_at_index, key, populate_cuda_graph, ...) operate
@@ -2583,11 +2594,12 @@ class pygraph:
 
         return json.dumps(self.inspect(), default=str, indent=2)
 
-    def serialize(self):
-        """Serialize the graph (classic passthrough).
+    def serialize(self, *, as_bytes: bool = False):
+        """Serialize the graph's cuDNN backend execution plan.
 
-        Returns the C++ binding's serialized form unchanged; C++
-        ``deserialize`` accepts exactly this form back.
+        Returns a list of byte values by default. Set ``as_bytes=True`` to
+        return the same binary data as compact ``bytes`` without constructing
+        a Python list. ``deserialize`` accepts either representation.
         """
         if self._lowered_graph is None:
             # Serialization is the cuDNN graph format by definition — lower on
@@ -2603,7 +2615,7 @@ class pygraph:
                 self._lowered_graph = self._lower_to_cpp()
                 self._lowered_graph.validate()
                 self._verify_uid_ownership()
-        return self._lowered_graph.serialize()
+        return self._lowered_graph.serialize(as_bytes=as_bytes)
 
     def deserialize(self, *args, **kwargs) -> None:
         """Deserialize a graph. This is the one genuinely ambiguous classic
@@ -2611,7 +2623,8 @@ class pygraph:
         so it stays a passthrough. The handle can arrive as the first positional
         or as the ``handle_`` keyword (the pybind overload's name); unwrap a
         Handle to its backend int and leave the ``data`` blob (the other overload)
-        untouched."""
+        untouched. Binary data may be ``bytes`` or the legacy list of byte
+        values; JSON strings retain their structural-graph meaning."""
         if args and isinstance(args[0], Handle):
             args = (args[0].backend_handle,) + args[1:]
         if isinstance(kwargs.get("handle_"), Handle):
@@ -2628,7 +2641,7 @@ class pygraph:
                 # a deserialized plan carries its own context; forcing FLOAT here
                 # would change existing one-argument deserialize(blob) callers.
                 deser_kwargs = {}
-                for _k in ("name", "kernel_cache", "device_property"):
+                for _k in ("name", "kernel_cache", "device_property", "cuda_graph_retention"):
                     if _k in self._cpp_graph_kwargs:
                         deser_kwargs[_k] = self._cpp_graph_kwargs[_k]
                 backend_handle = self._backend_handle_for_lowering(deser_kwargs)
@@ -3952,6 +3965,15 @@ _CAPTURED_OPS = {
         # engine applies no softmax scale (attn_scale must stay unset); False
         # counts as unset.  Served by the cc 10.7 python engines only.
         python_only_attrs=("softmax_precision", "attn_scale_prefolded"),
+        # ``kv_mask``: a per-key mask ``(1|B, 1, 1, S_kv)`` (broadcast over the heads
+        # and the query rows) the backend has no field for -- an INPUT python engines
+        # fold in-kernel; a graph that binds it is python-engines-only (see
+        # sdpa_mxfp8's scale_o).  BOOLEAN: False = the key is masked for every query,
+        # like a key past ``seq_len_kv`` (a query whose every key is masked reads
+        # O = 0 and Stats = -inf, the FROST empty-row contract).  The Q/K/V dtype or
+        # FLOAT: an ADDITIVE per-key vector added to the scaled scores (the models'
+        # finite -1e9 fold as a value; S_kv % 8 == 0, 16-byte strides).
+        python_only_in_kwargs=("kv_mask",),
     ),
     "sdpa_backward": dict(
         node_type=NodeType.SDPA_BWD,

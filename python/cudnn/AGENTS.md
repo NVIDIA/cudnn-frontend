@@ -345,12 +345,31 @@ DSL satisfies your kernel.**
   public 4.7.0 lacks `sm_107a`; check the actual target capability before
   admitting SM107 plans. Test graph and standalone declines with the real
   unsupported wheel as well as a controlled missing-target probe.
+- Check the DSL compiler's CUDA version separately when a kernel depends on
+  its toolkit flavor: `from cutlass.base_dsl.version_info import CUDA_VERSION`.
+  `torch.version.cuda` and `CUDA_HOME` do not identify the compiler selected by
+  the DSL wheel. QSA's 12Q/1KV two-pass key kernel, for example, compiles with
+  the CUDA 13 flavor but crashes the CUDA 12 compiler in DSL 4.7/4.8; its
+  `check_support` rejects that compiler before JIT compilation, and its tests
+  exercise the rejection rather than crashing or silently skipping the gate.
 - Known floors — extend this list when you take a dependency on a newer API,
   and say so in the PR body if it raises the floor of a user-facing op:
   `cutlass.experimental.*` (primitives, `cuda.tensor_map`; everything under
   `cudnn/frost/tile_dsl` inherits it) → 4.7.0.
   Native im2col tensor-map creation used by `conv/cutedsl/conv3d_postops`
   (`cutlass.experimental.cuda.create_tensor_map_im2col`) → 4.9.
+  `cp.async.cg.shared.global.L2::cache_hint` with a `createpolicy` register (the paged decode
+  scorer's key copies, `gated_attention_block/kernels/qsa_score_paged.py`) → a DSL compiling
+  with CUDA 13.4 or later, i.e. the cu13 toolchain of 4.8.0 (the DSL binds its cu13 flavour
+  only under a CUDA 13 driver): the 13.3 PTX assembler of the public 4.7.0 cu13 wheel
+  mis-encodes the hinted copy's uniform operands on sm_90 / sm_100 (an illegal-instruction
+  trap at the first copy; the PTX is identical), and the cu12 flavour of both public wheels,
+  4.7.0 and 4.8.0 -- what the DSL binds under a CUDA 12 driver -- reports CUDA 12.9, whose
+  assembler emits the same encoding (compile-only dumps), so the kernel reads `CUDA_VERSION`
+  (`L2_HINT_MIN_COMPILER`), traces the plain copy below the floor and declines a forced
+  `l2_hint=True` by name -- the decline states the defect as observed (never as a property of
+  the compiler it found) and prescribes the cu13 flavour under a CUDA 13 driver, not a wheel
+  number.
 - Tests that import a kernel module directly `pytest.skip` on a too-old DSL —
   they do not fail. CI runs the `oss:` lanes across the supported DSL versions
   (`ci/stages/oss_tests/jobs.yml` in internal CI); a lane below your floor
@@ -671,7 +690,9 @@ python/cudnn/gemm/
 ├── frost/                           # the FROST GEMM engine (JIT fused matmul chains from cuDNN graphs)
 │   ├── sm100/, sm120/               #   one tree per arch family: compiler.py + epilogue_codegen.py + kernel_templates/
 │   ├── compiler.py, epilogue_codegen.py  # facades: become the active family's module (arch_family.py)
-│   └── kernel_templates/            #   template code SHARED by both trees (split-K reduction)
+│   ├── kernel_templates/            #   template code SHARED by both trees (split-K reduction)
+│   └── ln_prologue/                 #   the LayerNorm-prologue gated dual GEMM substrate: host (__init__.py) + ONE RENDERED body per arch (two arms: pairing=columns = TriMul K1, pairing=accumulators = TriMul K3)
+│                                    #   (sm107_dual_gemm.py; a rendering for one arch is not a registry template, so not under kernel_templates/)
 ├── ops/                             # backend-independent torch custom-op contracts
 └── reference/                       # pure-PyTorch MATMUL/POINTWISE correctness engine
 ```
@@ -693,6 +714,12 @@ Hoisting an 11-line block that ran correctly inline into a
 helper *call* was the problem. Duplicating the block across flavors is the
 correct trade here. Factor only host-side code, or code you can mark
 `@cute.jit`.
+
+Never reuse a persistent loop index in a nested unrolled loop. In GDN-2 prep,
+reusing `j` for operand packing changed the next raw-stage refill index.
+The GDN-2 `test_prep_fwd_matches_uncut_and_reference` and
+`test_prep_checkpoint_series` cases in `linear_attention/test_la.py` exercise
+multiple work items per CTA and detect this regression.
 
 Related: inside a kernel body, `for x in (a, b)` over a Python tuple is
 rewritten into a dynamic `ir_loop` and cannot iterate heterogeneous objects
@@ -741,13 +768,13 @@ not by itself justify another compile-cache specialization.
 
 ## The public function contract
 
-Public functions (`<op>_<direction>(...)` / `<op>_<direction>_jax(...)`, see `docs/fe-oss-apis/api_conventions.md`) allocate outputs and return them in a stable, documented order. PyTorch functions return a **`TupleDict`** (dict that also unpacks as a tuple). JAX functions return a plain tuple or dict: `jax.jit` rejects `TupleDict`, which is not a registered pytree.
+Public functions (`cudnn.ops.<op>_<direction>(...)` / `cudnn.ops.<op>_<direction>_jax(...)`, see `docs/fe-oss-apis/api_conventions.md`) allocate outputs and return them in a stable, documented order. PyTorch functions return a **`TupleDict`** (dict that also unpacks as a tuple). JAX functions return a plain tuple or dict: `jax.jit` rejects `TupleDict`, which is not a registered pytree.
 
 ## Adding a new frontend-only API — required checklist
 
 1. Kernel package under the closest existing family (layout above).
 2. Public functions in `api.py`.
-3. Exports: family `__init__.py` `__all__` **and** `_LAZY_OPTIONAL_IMPORTS` in `python/cudnn/__init__.py`; register any new package dir in `pyproject.toml` packages list.
+3. Exports: `_LAZY_EXPORTS` in `python/cudnn/ops/__init__.py` (or `python/cudnn/ops/<family>/__init__.py` for an op in a family); register any new package dir in `pyproject.toml` packages list.
 4. Docs: page under `docs/fe-oss-apis/` (family subdir) + link it from `docs/fe-oss-apis/overview.md`.
 5. Tests: `test/python/<op>/cutedsl/test_<op>.py` (+ `_utils.py`/reference), covering supported and unsupported configurations and numerical reference comparison.
 6. DSL version gate (Rule 7): the route declines with a version-naming error below `CUTEDSL_MIN_VERSION`, and the tests skip there instead of failing.
@@ -773,3 +800,80 @@ entries, and normalize over retained slots after summing heads. Never reuse
 compacted training indices as the caller-visible target order. Detector:
 `deepseek_sparse_attention/cutedsl/test_DSA_training.py::test_native_training_and_original_score_slots`
 checks holes, duplicates, bounded lengths, all-masked rows and target alignment.
+
+## Linear-attention decay factorisation range
+
+A chunk kernel that splits a decay `2^(g[t] - g[s])` into `exp2(+g[t])` on one MMA
+operand and `rcp(exp2(g[s]))` on the other is exact only while each factor stays
+in the operand's range: an in-tile log2 prefix of -126 with bf16 operands (`exp2`
+goes subnormal, `rcp(..., ftz=True)` returns inf, `0 * inf` is NaN), and about -16
+with fp16 operands (`k * 2^-g` overflows). Both lie inside the documented gate range,
+`alpha = exp(g)` in (0, 1], and a test drawing `alpha` from `uniform(0.5, 1)` misses them.
+
+- Route such tiles through `linear_attention/frost/common/steep_decay.py`, which keeps every
+  exponent at `g[t] - g[s] <= 0`. Its module docstring holds the dispatch and
+  synchronisation invariants.
+- Keep the exact path out of the fast kernel. Compiled in behind a never-taken branch,
+  it cost the backward 13%.
+- Bound the inverse operand with the key magnitude as well as the gate prefix:
+  unnormalized `k=5` overflows fp16 at a prefix of -13.75.
+- Sum individual token logs over the interval. Never subtract inclusive fp32 prefixes:
+  a -1e8 gate erases the following -1 gates from both.
+- Reduce corrections in a fixed order, including when several channels are steep.
+- Use `encode_gate_exchange` for scan classification and exchange encoding. Keep stage selection and
+  barriers in each schedule. All six chunk schedules share gate conditioning, scans, row normalization
+  and operand packing through the `@cute.jit` stages in `common/gdn2_operands.py`. The rolled FP32
+  backward scan retains its local load/store schedule. Read exchange scales before releasing a raw
+  stage; register-only packing may follow that release. `encode_gate_exchange` accepts log2 prefixes
+  only, and returns exponentials or exact token logs according to the channel ballot. Size scratch
+  with `common/steep_scratch.py` for both separate forward arrays and backward bank-fill regions;
+  check bank-fill capacity before compilation.
+- Range tests must vary state-gradient magnitude independently of gate magnitude. A large finite
+  FP32 seed, or a carry accumulated from finite FP16 output gradients, can overflow an undecayed
+  FP16 state operand even when the decayed carry and all returned gradients fit. The large-seed
+  and large-carry regressions in `test_gdn2_frost_steep_decay.py` cover both backward implementations.
+- Keep steep state gradients and bounded key operands in FP32 through their projections
+  (`common/gdn2_state_grad.py`). Narrowing a bounded key first can erase a term that becomes
+  representable after multiplication by the state gradient. The caller-owned per-CTA workspace
+  uses `state_gradient_scratch_layout`; state publication uses `mb_dstate_input_ready`, and the
+  key ring uses `mb_k_decay_inv_ready` / `mb_decay_done`. Scalar readers acquire these
+  thread-produced barriers directly, including `mb_u_smem_ready` for restored dK; tensor-core
+  completion only orders the async tensor-core operations. Full backward's
+  CG2 release protects both that workspace and U until the restored-key projection finishes,
+  including the last chunk before the persistent CTA takes another work item.
+- Check mild state-operand range independently: FP16 inputs, `g=0`, zero Q/K/V/initial
+  state and an FP32 final-state gradient of 70000 isolate overflow in the mild path
+  at `e4896ef2`, with finite FP64 reference gradients. Steep-gate coverage does not
+  establish arbitrary FP32 state-gradient support for that path.
+- Replay the same CUDA graph and workspace through mild, steep and mild gates. Replaying fixed
+  inputs does not check whether the steep flag and scheduler tickets reset. Check finiteness before
+  bitwise equality; matching NaN bit patterns are not a successful numerical replay.
+- An exact relaunch must not read what the fast launch wrote. Seed overwrite-capable plans
+  from a state snapshot (`common/state_snapshot.py`), chosen from the graph contract, never
+  from first-call pointer equality: a graph can bind separate state buffers at warmup and
+  alias them later. A forward graph without a final-state output cannot overwrite its seeds;
+  indexed input pools in such graphs need no snapshot.
+
+Detectors, all in `linear_attention/test_gdn2_frost_steep_decay.py`: `test_fwd_bwd_steep_channel_decay`
+(and its fp16 twin), `test_fp16_inverse_range_without_normalization`,
+`test_multiple_steep_channels_are_repeatable`, `test_forward_state_alias_after_graph_warmup`,
+`test_steep_channel_decay_overwrite_initial_state`, `test_steep_channel_decay_backward_overwrite_initial_state`,
+`test_read_only_state_pool_needs_no_snapshot`, `test_strided_state_overwrite` and
+`test_steep_summary_matches_reference`. Scratch bounds are checked by
+`linear_attention/test_gdn2_frost_steep_scratch.py`; `test_steep_schedule_geometry` checks schedule case
+selection across SM counts without changing the kernel launch limits.
+
+State snapshots preserve both the source dtype and its element width. The snapshot
+kernel copies raw bytes and does not convert FP16 to FP32. Exercise every accepted
+state dtype with forward and backward aliasing, padded storage, and changed-state
+CUDA-graph replay. The overwrite and replay cases in
+`linear_attention/test_gdn2_frost_steep_decay.py` cover these paths.
+
+Pairing sparse queries requires per-query masking before dQ arithmetic when a
+key is nonfinite: a key valid for one query can be masked for its neighbor,
+and zero dS multiplied by that key still produces NaN. A union mask alone is
+insufficient, including across an unaligned packed sequence boundary. Keep any
+nonfinite fallback entirely on device and re-evaluate it on each graph replay.
+The detector is `QSA/cutedsl/test_qsa.py::test_paired_backward_nonfinite_isolation`,
+which changes finite/nonfinite inputs under one captured graph for both shared
+and separate packed sequences.

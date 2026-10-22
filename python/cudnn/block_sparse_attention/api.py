@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 from functools import lru_cache
 from typing import Optional
 
@@ -211,8 +212,8 @@ def block_sparse_attention_forward(
     if sparse_block_size not in {64, 128}:
         raise ValueError("sparse_block_size must be 64 or 128")
     if arch_family == 9:
-        if isinstance(kv_splits, str) or not 1 <= int(kv_splits) <= 256:
-            raise ValueError("SM90 kv_splits must be an integer in [1, 256]")
+        if kv_splits != "auto" and (isinstance(kv_splits, str) or not 1 <= int(kv_splits) <= 256):
+            raise ValueError("SM90 kv_splits must be 'auto' or an integer in [1, 256]")
 
     if arch_family == 9:
         if head_dim not in {64, 96, 128} or value_dim not in {64, 96, 128}:
@@ -321,22 +322,48 @@ def block_sparse_attention_fp8_forward(
     *,
     softmax_scale: Optional[float] = None,
     sparse_block_size: int = 64,
+    kv_splits: int = 1,
 ) -> TupleDict:
-    """Run Sage FP8 BSA; SM120 additionally supports native sparse_block_size=128."""
+    """Run Sage FP8 BSA, including native sparse_block_size=128 on SM90, SM100/SM103 and SM120."""
     batch, heads, seqlen_q, seqlen_k = _validate_sage_inputs(q_tensor, k_tensor, v_tensor)
+    # Sage FP8 folds the softmax scale into its per-group Q*K dequantization scales, so a zero or negative scale turns
+    # a fully masked group's -inf maximum into NaN/+inf. NaN is rejected as well.
+    if softmax_scale is not None and not softmax_scale > 0.0:
+        raise ValueError(f"Sage FP8 softmax_scale must be positive, got {softmax_scale}")
     arch = _device_arch(q_tensor)
     arch_family = arch // 10
-    if arch_family not in {10, 11, 12}:
-        raise RuntimeError(f"Sage FP8 block sparse attention requires SM100-SM120, found SM{arch}")
-    if sparse_block_size not in (64, 128):
+    if not isinstance(sparse_block_size, int) or sparse_block_size not in (64, 128):
         raise ValueError("Sage FP8 sparse_block_size must be 64 or 128")
-    if sparse_block_size == 128 and arch_family != 12:
-        raise NotImplementedError("Sage FP8 native blk128 requires SM120")
-    if arch_family in {10, 11}:
+    if arch_family not in {9, 10, 11, 12}:
+        raise RuntimeError(f"Sage FP8 block sparse attention requires SM90-SM120, found SM{arch}")
+    native_sm100_blk128 = sparse_block_size == 128 and arch in {100, 103}
+    if sparse_block_size == 128 and arch_family not in {9, 12} and not native_sm100_blk128:
+        raise NotImplementedError("Sage FP8 native blk128 requires SM90, SM100/SM103, or SM120")
+    if type(kv_splits) is not int or not 1 <= kv_splits <= 256:
+        raise ValueError("kv_splits must be an integer in [1, 256]")
+    if kv_splits != 1 and not native_sm100_blk128:
+        raise NotImplementedError("Explicit FP8 kv_splits requires SM100/SM103 blk128")
+    if (
+        native_sm100_blk128
+        and softmax_scale is not None
+        and (not isinstance(softmax_scale, (int, float)) or not math.isfinite(softmax_scale) or softmax_scale <= 0)
+    ):
+        raise ValueError("SM100/SM103 FP8 blk128 softmax_scale must be a positive finite host scalar")
+    if arch_family in {10, 11} and not native_sm100_blk128:
         if seqlen_q % 64 or seqlen_k % 64:
             raise NotImplementedError("SM100/SM110 Sage FP8 requires Sq and Sk to be multiples of 64")
         if q2k_block_nums is not None or block_sizes is not None:
             raise NotImplementedError("q2k_block_nums and block_sizes are supported by Sage FP8 only on SM120")
+
+    if arch_family == 9:
+        if seqlen_q % sparse_block_size or seqlen_k % sparse_block_size:
+            raise NotImplementedError(f"SM90 Sage FP8 requires Sq and Sk to be multiples of {sparse_block_size}")
+        if q2k_block_nums is not None or block_sizes is not None:
+            raise NotImplementedError("SM90 Sage FP8 supports only fixed counts and full blocks")
+        if softmax_scale is not None and (not isinstance(softmax_scale, (int, float)) or not math.isfinite(softmax_scale)):
+            raise ValueError("softmax_scale must be a finite host scalar")
+        if block_sparse_num is not None and not isinstance(block_sparse_num, int):
+            raise ValueError("block_sparse_num must be a host integer")
 
     expected_prefix = (batch, heads, (seqlen_q + sparse_block_size - 1) // sparse_block_size)
     _validate_sparse_metadata(
@@ -346,7 +373,7 @@ def block_sparse_attention_fp8_forward(
         expected_prefix=expected_prefix,
         num_kv_blocks=(seqlen_k + sparse_block_size - 1) // sparse_block_size,
         device=q_tensor.device,
-        allowed_block_size_ranks=(1, 2, 3) if arch_family == 12 else (1,),
+        allowed_block_size_ranks=(1, 2, 3) if arch_family == 12 or native_sm100_blk128 else (1,),
     )
     if block_sparse_num is None:
         block_sparse_num = int(q2k_block_index.shape[-1])
@@ -361,6 +388,7 @@ def block_sparse_attention_fp8_forward(
         from . import _interface
 
         forward = _interface.bsa_fp8_blk128_fwd if sparse_block_size == 128 else _interface.bsa_fp8_blk64_fwd
+        kwargs = {"kv_splits": kv_splits} if native_sm100_blk128 else {}
         out = forward(
             q_tensor,
             k_tensor,
@@ -370,6 +398,7 @@ def block_sparse_attention_fp8_forward(
             softmax_scale,
             block_sizes=block_sizes,
             q2k_block_nums=q2k_block_nums,
+            **kwargs,
         )
     return TupleDict(o_tensor=out)
 

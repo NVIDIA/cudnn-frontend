@@ -94,6 +94,22 @@ class ApiIndexTest(unittest.TestCase):
         self.write("cudnn/_impl.py", "class Builder:\n    def build(self): pass")
         self.assertEqual(self.names(), {"cudnn", "cudnn.Builder", "cudnn.Builder.build"})
 
+    def test_lazy_optional_imports_are_recorded_by_name(self):
+        self.write(
+            "cudnn/__init__.py",
+            """
+            __all__ = []
+            _LAZY_OPTIONAL_IMPORTS = {'Builder': ('._impl', 'Builder'), '_hidden': ('._impl', 'Builder')}
+            def __getattr__(name):
+                if name in _LAZY_OPTIONAL_IMPORTS:
+                    from ._impl import Builder
+                    return Builder
+                raise AttributeError(name)
+            """,
+        )
+        self.write("cudnn/_impl.py", "class Builder:\n    def build(self): pass")
+        self.assertEqual(self.names(), {"cudnn", "cudnn.Builder"})
+
     def test_enum_instance_properties_and_export_aliases(self):
         for base in ("Enum", "IntEnum"):
             with self.subTest(base=base):
@@ -137,6 +153,7 @@ class ApiIndexTest(unittest.TestCase):
             "__all__ = 'invalid'",
             "__all__ = [1]",
             "def unlisted(): pass",
+            "__all__ = []\n_LAZY_OPTIONAL_IMPORTS = {'gone': ('._impl', 'gone')}",
         ):
             with self.subTest(source=source):
                 self.write("cudnn/__init__.py", source)

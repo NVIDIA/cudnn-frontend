@@ -5,7 +5,7 @@
 The GEMM CuTeDSL APIs are type-erased and torch-lazy: torch is imported only when torch tensors are passed. JAX arrays are additionally accepted wherever the kernel's tensor layouts are expressible as row-major arrays (each API's page has a "JAX support" section with its exact contract):
 
 - **Dense fusions** (amax, swiglu, srelu, dsrelu): full JAX eager support, plus `jax.jit`-compatible XLA custom-call entry points for all four (built on `cudnn.jax.call` / CuTeDSL's native `cutlass.jax` bridge; see `gemm_amax.md` "Using JAX arrays").
-- **Grouped / discrete-grouped**: JAX eager support in discrete (pointer-array) weight modes — unfused grouped GEMM, glu/dglu (BF16), dsrelu (FP8), wgrad (BF16), and discrete-grouped swiglu/dswiglu (FP8) — plus a `jax.jit`-compatible `*_jax_sm100` entry point for each of those same families (built on `cudnn.jax.call`; each API page documents its exact jit contract). Contiguous grouped MXFP8 SwiGLU/dSwiGLU wrappers accept Torch tensors and canonical JAX arrays, including under `jax.jit`, with explicit FP8 output dtype and `sf_vec_size=32` for JAX. The unified GLU wrapper likewise dispatches canonical MXFP8 JAX inputs to `grouped_gemm_glu_jax_sm100` (SwiGLU/GeGLU), which runs the Rubin GLU kernel on SM107. The unified dGLU and wgrad wrappers likewise dispatch canonical MXFP8 JAX inputs to `grouped_gemm_dglu_jax_sm100` (dSwiGLU/dGeGLU) and `grouped_gemm_wgrad_jax_sm100`, which run the Rubin kernels on SM107. Existing Torch behavior and wrapper defaults are unchanged. Other dense weight modes, column-major bias layouts, and grouped srelu/quant and glu_hadamard backends reject JAX with clear errors.
+- **Grouped / discrete-grouped**: JAX eager support in discrete (pointer-array) weight modes — unfused grouped GEMM, glu/dglu (BF16), dsrelu (FP8), wgrad (BF16), and discrete-grouped swiglu/dswiglu (FP8) — plus a `jax.jit`-compatible `*_jax_sm100` entry point for each of those same families (built on `cudnn.jax.call`; each API page documents its exact jit contract). Contiguous grouped MXFP8 SwiGLU/dSwiGLU wrappers accept Torch tensors and canonical JAX arrays, including under `jax.jit`, with explicit FP8 output dtype and `sf_vec_size=32` for JAX. The unified GLU wrapper likewise dispatches canonical MXFP8 JAX inputs to `grouped_gemm_glu_jax_sm100` (SwiGLU/GeGLU), which runs the Rubin GLU kernel on SM107. The unified dGLU, wgrad and quant wrappers likewise dispatch canonical JAX inputs to `grouped_gemm_dglu_jax_sm100` (dSwiGLU/dGeGLU), `grouped_gemm_wgrad_jax_sm100` and `grouped_gemm_quant_jax_forward`, which run the Rubin kernels on SM107. The grouped SReLU, dSReLU, GLU+Hadamard and GLU+Hadamard+quant wrappers dispatch to `grouped_gemm_srelu_jax_forward`, `grouped_gemm_dsrelu_jax_sm100`, `grouped_gemm_glu_hadamard_jax_forward` and `grouped_gemm_glu_hadamard_quant_jax_forward` (SM100+, as in Torch; GLU+Hadamard+quant runs its Rubin kernel on SM107). These canonical entries take dense weights in MXFP8 or packed FP4 (as `uint8`, with E4M3 scales per 16 for NVFP4), and GLU, dGLU and wgrad also take BF16; each page lists its formats. Existing Torch behavior and wrapper defaults are unchanged. Discrete block-scaled weights, column-major bias layouts and the op classes reject JAX with clear errors.
 - **proj_rope_mxfp8**: JAX eager support on both input paths with `w_out_in=True` (the transposed [in, out] weight view is torch-only), plus the `jax.jit`-compatible `gemm_proj_rope_mxfp8_jax_sm100` entry point.
 
 This folder documents the Python FE APIs implemented under `python/cudnn`. New APIs follow the [Python API Naming Conventions](api_conventions.md). For details on currently implemented operations, see:
@@ -14,7 +14,9 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. New A
 - [Kimi Delta Attention in JAX](kda_jax.md)
 - [GEMM + Amax](gemm_fusions/gemm_amax.md)
 - [GEMM + RoPE + MXFP8 Projection](gemm_fusions/gemm_proj_rope_mxfp8.md)
-- [Gated Attention Block (SM107)](gated_attention_block.md) — projection, QK-norm + RoPE, SDPA, sigmoid gate, out projection as one FROST block (bf16 / FP8 / MXFP8, optional MXFP4 weights and NVFP4 / MXFP4 output)
+- [Gated Attention Block (SM107)](gated_attention_block.md) — projection, QK-norm + RoPE, SDPA, sigmoid gate, out projection as one FROST block (bf16 / FP8 / MXFP8, optional MXFP4 weights and NVFP4 / MXFP4 output); index-list sparse attention (`QsaSpec`) and write-through into a paged KV cache
+- [Triangle Multiplicative Update (SM100 / SM103 / SM107)](triangle_multiplicative_update.md) — the AlphaFold-class outgoing / incoming triangle multiplication as three FROST launches behind cuEquivariance's `triangle_multiplicative_update` signature (bf16)
+- [Triangle Attention (SM107)](triangle_attention.md) — the AlphaFold-class attention with a pair bias and a key mask (right-padded lengths or a dense boolean mask) on the FROST SDPA engine behind cuEquivariance's `triangle_attention` signature (bf16 / fp16, D <= 64)
 - [Tail RoPE + Microscaled QDQ](rope_qdq.md)
 - [Prepared BF16 Tail RoPE](rope_tail.md)
 - [GEMM + SwiGLU](gemm_fusions/gemm_swiglu.md)
@@ -36,6 +38,9 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. New A
 - [Grouped GEMM + Quant (Unified)](gemm_fusions/grouped_gemm_quant_unified.md)
 - [Grouped GEMM + Wgrad](gemm_fusions/grouped_gemm_wgrad.md)
 - [Block Sparse Attention (BSA)](bsa.md)
+- [Query Sparse Attention (QSA): attention and indexer entry points](qsa.md)
+- [QSA training from existing token indices](qsa_indexed.md)
+- [QSA two-pass backend implementation notes](qsa_two_pass.md)
 - [DeepSeek Sparse Attention (DSA)](dsa.md)
 - [Flex Attention](attention/flex_attention.md) and [mask plan design](attention/flex_attention_design.md)
 - [HSTU Attention (Blackwell SM100/SM103)](hstu/hstu_attention.md)
@@ -46,7 +51,7 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. New A
 - [DSv4.1 Vision RoPE Backward](attention/vision_rope_backward.md)
 - [Engram Saved-State Gate](/fe-oss-apis/engram_saved_gate)
 - [RMSNorm + RHT + Amax](rmsnorm_rht_amax.md)
-- [SDPA Backward, d = 128, dense and THD MHA/GQA/MQA (SM100)](attention/sdpa_bwd_sm100_d128.md)
+- [SDPA Backward, d = 128, dense and THD MHA/GQA/MQA (SM100 / SM103)](attention/sdpa_bwd_sm100_d128.md)
 - [SDPA Backward (SM120)](attention/sdpa_bwd_sm120.md)
 - [SDPA Backward, d = 256 and d in (256, 512] (SM107 / Rubin; SM100 / SM103 via the 2x2-datapath body)](attention/sdpa_bwd_sm107.md)
 - [Compact GQA Backward (SM107)](attention/compact_gqa_backward.md)

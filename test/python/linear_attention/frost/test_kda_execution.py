@@ -22,7 +22,7 @@ from cudnn.frost.workspace import Workspace
 from cudnn.linear_attention.frost.kda_engine import build_kda
 from cudnn.linear_attention.ops import kimi_delta_attention
 
-from linear_attention.test_la import CUDNN_DTYPE, LEAF_NAMES, make_case, thd_tensors
+from linear_attention.test_la import Backend, CUDNN_DTYPE, LEAF_NAMES, assert_bwd_parity, make_case, thd_tensors
 
 pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 
@@ -159,6 +159,144 @@ def test_frost_native_kda_backward_respects_output_strides(total, heads):
     for name, reference in outputs.items():
         torch.testing.assert_close(strided[name], reference, rtol=0, atol=0)
         assert torch.isnan(padded[name][..., reference.shape[-1] :]).all(), f"{name} wrote into output padding"
+
+
+@pytest.mark.parametrize("dim", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("inputs", ["ordinary", "small_norm", "cancellation"])
+def test_kda_bwd_l2norm_reference(dim, dtype, inputs):
+    """Compare output and every input gradient to the suite's FP64 recurrence."""
+    case = make_case("kda", dtype, T=65, H=2, K=dim, V=dim, seed=418)
+    if inputs == "small_norm":
+        case.q[:, ::3] *= 1e-6
+        case.k[:, 1::3] *= 1e-6
+    elif inputs == "cancellation":
+        # Correlated keys and opposite values stress the L2 projection's subtraction.
+        case.k.copy_(case.k[:, :1].clone().expand_as(case.k))
+        case.v[:, 1::2].copy_(-case.v[:, :-1:2])
+    assert_bwd_parity(Backend("frost"), case, l2norm=True)
+
+
+@pytest.mark.parametrize("dim", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("checkpoint", [0, 16])
+def test_uncut_bwd_raw_ring_wraps_and_changed_input_replay(monkeypatch, dim, dtype, checkpoint):
+    """Five chunks cover raw-ring phase wraps, a tail and fresh replay operands."""
+    from cudnn.linear_attention.ops import kda as ops
+
+    monkeypatch.setattr(ops, "bprop_cache", {})
+    generator = torch.Generator().manual_seed(418)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        shape = (65, 1, dim)
+        q, k, v = [torch.randn(shape, dtype=dtype, generator=generator).cuda().requires_grad_(True) for _ in range(3)]
+        g = (torch.randn(shape, generator=generator) - 4).cuda().requires_grad_(True)
+        beta = torch.randn(shape[:2], generator=generator).cuda().requires_grad_(True)
+        cu = torch.tensor([0, shape[0]], device="cuda", dtype=torch.int32)
+        do = torch.randn(shape, dtype=dtype, generator=generator).cuda()
+        leaves = [q, k, v, g, beta]
+        options = dict(use_qk_l2norm_in_kernel=True, use_beta_sigmoid_in_kernel=True, safe_gate=True, batch_invariant=True, plan_name="kda_frost")
+        if checkpoint == 0:
+            state = torch.randn((1, 1, dim, dim), generator=generator).cuda().requires_grad_(True)
+            a_log = torch.zeros(1, device="cuda", requires_grad=True)
+            dt_bias = torch.zeros((1, dim), device="cuda", requires_grad=True)
+            options.update(initial_state=state, a_log=a_log, dt_bias=dt_bias)
+            leaves.extend((state, a_log, dt_bias))
+
+        def call():
+            """Use the public autograd path, including checkpoint/recompute work."""
+            output = kimi_delta_attention(q, k, v, g, beta, cu, checkpoint_every_n_tokens=checkpoint, **options)[0]
+            return torch.autograd.grad(output, leaves, do)
+
+        call()
+        baseline = call()
+        assert len(ops.bprop_cache) == 1
+        host_graph, _ = next(iter(ops.bprop_cache.values()))
+        assert not host_graph._compiled_plans[host_graph._plan_index].compiled.chain
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(graph, stream=stream):
+                actual = call()
+            for _ in range(2):
+                graph.replay()
+                for got, want in zip(actual, baseline, strict=True):
+                    torch.testing.assert_close(got, want, rtol=0, atol=0)
+            with torch.no_grad():
+                v.add_(0.25)
+            baseline = call()
+            graph.replay()
+            for got, want in zip(actual, baseline, strict=True):
+                assert torch.isfinite(got).all()
+                torch.testing.assert_close(got, want, rtol=0, atol=0)
+        finally:
+            stream.synchronize()
+            graph.reset()
+
+
+@pytest.mark.parametrize("dim", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("optional", [False, True])
+@pytest.mark.parametrize("schedule", ["uncut", "chain"])
+def test_kda_backward_only_changed_input_replay(monkeypatch, dim, dtype, optional, schedule):
+    """Exercise both backward schedules without forward checkpoint generation.
+
+    Chain still builds its M summary through recompute. Sanitizer reports from
+    that auxiliary kernel must remain visible, not counted as a clean backward.
+    """
+    from cudnn.linear_attention.ops import kda as ops
+
+    monkeypatch.setattr(ops, "bprop_cache", {})
+    generator = torch.Generator().manual_seed(419)
+    shape = (65 if schedule == "uncut" else 513, 2, dim)
+    q, k, v, do = [(torch.randn(shape, generator=generator) * 0.1).to(dtype).cuda() for _ in range(4)]
+    g = torch.full(shape, -4.0, device="cuda")
+    beta = torch.zeros(shape[:2], device="cuda")
+    cu = torch.tensor([0, shape[0]], device="cuda", dtype=torch.int32)
+    checkpoints = (torch.randn(shape[0] // 16 + 1, 2, dim, dim, generator=generator) * 0.01).to(dtype).cuda()
+    options = dict(
+        state_checkpoints=checkpoints,
+        checkpoint_every_n_tokens=16,
+        use_qk_l2norm_in_kernel=True,
+        use_beta_sigmoid_in_kernel=True,
+        safe_gate=True,
+        batch_invariant=schedule == "uncut",
+        plan_name="kda_frost",
+    )
+    if optional:
+        state = torch.zeros((1, 2, dim, dim), device="cuda")
+        options.update(
+            initial_state=state, d_final_state=torch.full_like(state, 0.125), a_log=torch.zeros(2, device="cuda"), dt_bias=torch.zeros(2, dim, device="cuda")
+        )
+
+    def call():
+        """Execute backward with caller checkpoints and the current live input contents."""
+        return ops.kda_bwd(do, q, k, v, g, beta, cu, dim**-0.5, **options)
+
+    call()
+    assert len(ops.bprop_cache) == 1
+    host_graph, _ = next(iter(ops.bprop_cache.values()))
+    assert host_graph._compiled_plans[host_graph._plan_index].compiled.chain == (schedule == "chain")
+    expected = tuple(t.clone() for t in call())
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            actual = call()
+        graph.replay()
+        for got, want in zip(actual, expected, strict=True):
+            assert torch.isfinite(got).all()
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
+        do.add_(0.125)
+        v.add_(0.25)
+        expected = tuple(t.clone() for t in call())
+        graph.replay()
+        for got, want in zip(actual, expected, strict=True):
+            assert torch.isfinite(got).all()
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
+    finally:
+        torch.cuda.synchronize()
+        graph.reset()
 
 
 @pytest.mark.parametrize("optional", [False, True])

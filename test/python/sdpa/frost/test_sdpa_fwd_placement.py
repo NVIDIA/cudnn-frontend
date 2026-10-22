@@ -156,6 +156,21 @@ def test_decode_shaped_rows_lead_at_every_kv_length(d, s_q, s_kv):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("h_q", [12, 20, 24, 48], ids=["g3", "g5", "g6", "g12"])
+@pytest.mark.parametrize("b", [1, 4, 16])
+def test_sm120_d256_decode_of_a_group_the_tile_does_not_divide_trails(h_q, b):
+    """SM120 packs a group the tile does not divide (tile_q % G != 0), yet at d256 s_q == 1 its plan still trails
+    the backend (1.00-1.44x over b 1-16, KV 4k-128k; module docstring), so the backend leads at every KV unit count;
+    a power-of-two group leads from 12 KV units."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(spec for spec in ENGINE_SPECS if spec.name == _SM120)
+    facts = dict(b=b, h_kv=4, d_qk=256, d_v=256, s_kv=65536, causal=False, bottom_right=False, device_cc=(12, 0), device_sm_count=188)
+    assert placement.place(spec, _facts(h_q=h_q, **facts)) == placement.TRAIL
+    assert placement.place(spec, _facts(h_q=16, **facts)) == (placement.LEAD if b * 4 >= placement.SM120_SQ1_D256_MIN_KV_UNITS else placement.TRAIL)
+
+
+@pytest.mark.L0
 def test_paged_d512_decode_trails_until_its_decode_tile():
     """Paged d512 at s_q == 1 runs the role-split prefill tile (no d512 decode tile) and
     measured behind the backend's paged decode engine, so it TRAILS by default, while the
@@ -321,7 +336,9 @@ def test_sm107_sink_decode_shard_stays_inside_its_configured_domain(monkeypatch,
         assert placement.place(spec, _facts(**dict(values, causal=False, bottom_right=False, s_q=1))) == placement.LEAD
         assert placement.place(spec, _facts(**dict(values, s_q=16, h_q=64, h_kv=4))) == placement.LEAD
         assert placement.place(spec, _facts(**dict(values, dtype=cudnn.data_type.HALF))) == placement.LEAD
-        assert placement.place(spec, _facts(**dict(values, d_qk=64, d_v=64))) == placement.LEAD
+        # The d64 envelope selects the row's native 64-wide prefill tile (a dense-only tile without a measured decode cell), not
+        # the shared decode tile: the row trails there.
+        assert placement.place(spec, _facts(**dict(values, d_qk=64, d_v=64))) == placement.TRAIL
         assert placement.place(spec, _facts(**dict(values, d_qk=96, d_v=96))) == placement.LEAD
         assert placement.place(spec, _facts(**dict(values, b=8, s_kv=16384))) == placement.LEAD
         assert placement.place(spec, _facts(**dict(values, b=8, h_q=16, h_kv=4, s_q=4))) == placement.LEAD

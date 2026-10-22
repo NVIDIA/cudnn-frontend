@@ -56,7 +56,8 @@ DSA_SPARSE_ATTENTION_BACKWARD_PARAM_MARKS = [
 
 DSA_INDEXER_FORWARD_PARAM_MARKS = [
     pytest.mark.parametrize("head_dim", [128]),
-    pytest.mark.parametrize("qhead_per_kv_head", [32, 64]),
+    # the SM100 unified kernel packs 4 .. 64 heads per KV head (one accept cell per member); SM90 serves 16 / 32 / 64
+    pytest.mark.parametrize("qhead_per_kv_head", [4, 8, 16, 32, 64]),
     pytest.mark.parametrize("ratio", [4]),
 ]
 
@@ -197,23 +198,20 @@ def pack_mxfp8_scales_thd(
     k_alignment: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build padded prefixes and packed Q/K scales for THD MXFP8 tests."""
-    from cudnn.deepseek_sparse_attention.utils.sm100.mxfp8_scale_utils import (
-        make_scale_cu_seqlens_padded,
-        pack_k_scale_thd,
-        pack_q_scale_thd,
-    )
+    from cudnn.deepseek_sparse_attention.utils.sm100.mxfp8_scale_utils import make_scale_cu_seqlens_padded
+    from deepseek_sparse_attention.cutedsl import mxfp8_scale_reference
 
     if q_alignment is None:
         q_alignment = 128 // math.gcd(128, qhead_per_kv_head)
     cu_q_scale = make_scale_cu_seqlens_padded(cu_seqlens_q, q_alignment)
     cu_k_scale = make_scale_cu_seqlens_padded(cu_seqlens_k, k_alignment)
-    q_scale = pack_q_scale_thd(
+    q_scale = mxfp8_scale_reference.pack_q_scale_thd(
         q_scale_logical,
         cu_seqlens_q,
         cu_q_scale,
         qhead_per_kv_head,
     )
-    k_scale = pack_k_scale_thd(k_scale_logical, cu_seqlens_k, cu_k_scale)
+    k_scale = mxfp8_scale_reference.pack_k_scale_thd(k_scale_logical, cu_seqlens_k, cu_k_scale)
     return q_scale, k_scale, cu_q_scale, cu_k_scale
 
 

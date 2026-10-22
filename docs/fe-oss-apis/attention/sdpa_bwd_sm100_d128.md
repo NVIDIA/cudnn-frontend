@@ -5,7 +5,7 @@ BF16 or FP16 inputs and gradients, compact BSHD physical storage, and
 contiguous FP32 natural-log Stats. It supports unmasked and top-left causal
 attention, including rectangular query and key/value lengths. Packed THD MHA
 supports both dtypes. Dense and THD GQA/MQA initially support BF16 only. Packed
-and grouped paths require exact SM100 (cc 10.0), CuTeDSL 4.8 or newer and
+and grouped paths require SM100 or SM103 (cc 10.0 or 10.3), CuTeDSL 4.8 or newer and
 positive FP32 attention scale. Grouped dense lengths must be multiples of 128;
 packed grouped lengths may have tails or empty actual sequences. Other masks,
 bias, sinks, dropout and deterministic requests are declined.
@@ -19,15 +19,17 @@ graph.execute(variant_pack, workspace)
 ```
 
 Plan construction selects the implementation from declarations and the build
-device. On SM100 with public CuTeDSL 4.8 or newer, positive attention scale and
-both sequence lengths divisible by 128, the MHA three-kernel chain computes the row
-delta while initializing FP32 dQ scratch, accumulates dQ and writes dK/dV,
-then converts dQ to the output type. The output conversion applies no extra
-scale. Its scratch size is `4 * B * H * S_q * 129 + 240` bytes. The final 240
-bytes cover internal alignment for any valid 16-byte-aligned caller workspace.
+device. On SM100 or SM103 with public CuTeDSL 4.8 or newer and a positive attention
+scale, the MHA three-kernel chain computes the row delta while initializing FP32 dQ
+scratch, accumulates dQ and writes dK/dV, then converts dQ to the output type.
+Sequence lengths need not be multiples of 128: the tail tiles' loads are zero-filled,
+their stores and dQ reductions are clipped, and the tail Stats rows contribute nothing.
+The output conversion applies no extra scale. Its scratch size is
+`4 * B * H * round_up(S_q, 128) * 129 + 240` bytes. The final 240 bytes cover internal
+alignment for any valid 16-byte-aligned caller workspace.
 
-Other dense MHA declarations in the existing envelope, including sequence tails and
-negative finite nonzero scales, retain the one-kernel implementation with
+Other dense MHA declarations in the existing envelope, including negative finite
+nonzero scales and older CuTeDSL releases, retain the one-kernel implementation with
 zero workspace. Always query the plan's size rather than assuming either
 implementation. Zero and nonfinite scales are unsupported.
 
@@ -50,7 +52,7 @@ initializes its scratch each time, and performs no allocation, layout copy or
 device-to-host read. The plan supports CUDA-graph capture and replay. FP32 dQ
 atomic accumulation does not promise bitwise repeatability.
 
-The three-kernel implementation is selected only on SM100. Existing support
+The three-kernel implementation is selected on SM100 and SM103. Existing support
 on other pre-Rubin Blackwell devices retains the previous implementation.
 The engine remains opt-in while performance qualification proceeds.
 
@@ -70,7 +72,7 @@ workspace size. Execution reads lengths and offsets on the device and
 performs no allocation, tensor conversion or host read of metadata. Gradient
 outputs and workspace must also be disjoint from all metadata operands.
 Declared capacities must be positive even when every actual sequence is
-empty. This path requires exact cc 10.0 and both scale and scale*log2(e)
+empty. This path requires cc 10.0 or 10.3 and both scale and scale*log2(e)
 finite and positive in FP32.
 
 GQA/MQA requires `Hq > Hkv > 0` and an integral `Hq/Hkv`; ratios need not

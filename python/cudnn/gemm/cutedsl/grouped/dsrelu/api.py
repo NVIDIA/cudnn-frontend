@@ -1744,10 +1744,47 @@ def grouped_gemm_dsrelu_wrapper_sm100(
 
     if framework == "jax":
         if is_dense:
-            raise ValueError(
-                "Dense weight mode (b_tensor/sfb_tensor) is not expressible as JAX arrays "
-                "(the expert-outermost strided B layout (n, k, l) has no row-major equivalent); "
-                "use discrete mode (b_ptrs/sfb_ptrs) with per-expert weight pointers"
+            from ..canonical_jax import check_jax_wrapper_options
+            from .jax_api import grouped_gemm_dsrelu_jax_sm100
+
+            check_jax_wrapper_options(
+                acc_dtype=acc_dtype,
+                cd_major=cd_major,
+                sf_vec_size=sf_vec_size,
+                vector_f32=vector_f32,
+                m_aligned=m_aligned,
+                current_stream=current_stream,
+                dprob_tensor_buf=dprob_tensor,
+                sfb_ptrs=sfb_ptrs,
+                b_major=b_major,
+                use_dynamic_sched=use_dynamic_sched,
+                sf_vec_sizes=(16, 32),
+            )
+            for name, rejected in (
+                ("n", n is not None),
+                ("b_dtype", b_dtype is not None),
+                ("generate_dbias", generate_dbias),
+                ("use_dsrelu_reuse", use_dsrelu_reuse),
+                ("deterministic", bool(deterministic)),
+                ("tanh_clamp_scale", tanh_clamp_scale is not None),
+            ):
+                if rejected:
+                    raise ValueError(f"{name} is unsupported for the JAX block-scaled path")
+            return grouped_gemm_dsrelu_jax_sm100(
+                a_tensor,
+                c_tensor,
+                sfa_tensor,
+                padded_offsets,
+                alpha_tensor,
+                prob_tensor,
+                norm_const_tensor=norm_const_tensor,
+                d_dtype=d_dtype,
+                mma_tiler_mn=mma_tiler_mn,
+                cluster_shape_mn=cluster_shape_mn,
+                sf_vec_size=sf_vec_size,
+                discrete_col_sfd=discrete_col_sfd,
+                b_tensor=b_tensor,
+                sfb_tensor=sfb_tensor,
             )
         if _convert_to_cutlass_data_type(a_tensor.dtype) in (cutlass.Float4E2M1FN, cutlass.Uint8) or b_dtype in (cutlass.Float4E2M1FN, cutlass.Uint8):
             raise ValueError(

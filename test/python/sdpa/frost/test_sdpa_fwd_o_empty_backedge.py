@@ -58,7 +58,12 @@ def test_softmax_top_of_tile_wait_is_on_the_warpgroups_own_o_slot(kernel):
     assert not re.search(
         r"mb_o_empty\[0\].*epilogue_state", code
     ), f"{kernel}: a softmax warpgroup waits slot 0 of mb_o_empty at the top of the tile (no back-edge from warpgroup 1)"
-    assert len(re.findall(r"mb_o_empty\[sub_tile_id\].*epilogue_state", code)) == 1, f"{kernel}: expected exactly one per-warpgroup top-of-tile mb_o_empty wait"
+    # One own-slot wait per tile body: the sm107 d128 kernel carries a second body (the resident-bias pair-step tile) whose
+    # top-of-step wait follows the same slot discipline; every other kernel has one body.
+    waits = len(re.findall(r"mb_o_empty\[sub_tile_id\].*epilogue_state", code))
+    assert waits == (
+        2 if kernel == "sm107/prefill_d128_f16.py" else 1
+    ), f"{kernel}: expected one per-warpgroup top-of-tile mb_o_empty wait per tile body, found {waits}"
 
 
 _CHILD = textwrap.dedent(r"""
@@ -134,7 +139,7 @@ _D512_SWA_CHILD = textwrap.dedent(r"""
     original_load = api_dsl.load_template
     served = []
 
-    def delayed(path, params, tag="template"):
+    def delayed(path, params, tag="template", **kwargs):
         p = Path(path)
         if p.parent.name == "sm100" and p.name == "prefill_d512_mxfp8.py":
             source = p.read_text()
@@ -153,7 +158,7 @@ _D512_SWA_CHILD = textwrap.dedent(r"""
             )
             target = Path(work) / "template_d512_delayed_softmax.py"
             target.write_text(source[:begin] + section.replace(anchor, delay + anchor) + source[end:])
-            module = original_load(str(target), params, tag)
+            module = original_load(str(target), params, tag, **kwargs)
             assert module._SWA_REUSE_P, "the two-output-slice path was not exercised"
             if params.thd_varlen:
                 # This kernel's THD claim loop normally gets the full envelope
@@ -162,7 +167,7 @@ _D512_SWA_CHILD = textwrap.dedent(r"""
                 module.THD_PERSISTENT = True
             served.append(dict(sha256=hashlib.sha256(source.encode()).hexdigest(), params=repr(params)))
             return module
-        return original_load(path, params, tag)
+        return original_load(path, params, tag, **kwargs)
 
     api_dsl.load_template = delayed
     original_execute = cudnn.pygraph.execute

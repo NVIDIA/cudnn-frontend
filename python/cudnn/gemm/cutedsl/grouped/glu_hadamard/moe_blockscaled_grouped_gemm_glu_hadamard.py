@@ -29,6 +29,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cudnn._cutlass_helpers.warp_reduce import warp_amax_with_nan
 from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator, get_smem_capacity_in_bytes
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu import OperandMajorMode
@@ -942,7 +943,7 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
 
     @cute.jit
     def amax_reduction_per_warp_and_cta(self, amax_fp32, warp_idx, amax_smem, amax_gmem):
-        warp_amax = cute.arch.warp_redux_sync(value=amax_fp32, kind="fmax", mask_and_clamp=0xFFFFFFFF, nan=True)
+        warp_amax = warp_amax_with_nan(amax_fp32)
         if cute.arch.lane_idx() == 0:
             amax_smem[warp_idx & 0x3] = cutlass.Float32(warp_amax)
         self.epilog_sync_barrier_group0.arrive_and_wait()
@@ -954,7 +955,7 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
 
     @cute.jit
     def post_rht_amax_reduction_per_warp_and_cta(self, amax_fp32, warp_idx, amax_smem, amax_gmem):
-        warp_amax = cute.arch.warp_redux_sync(value=amax_fp32, kind="fmax", mask_and_clamp=0xFFFFFFFF, nan=True)
+        warp_amax = warp_amax_with_nan(amax_fp32)
         if cute.arch.lane_idx() == 0:
             amax_smem[warp_idx & 0x3] = cutlass.Float32(warp_amax)
         self.epilog_sync_barrier_group1.arrive_and_wait()

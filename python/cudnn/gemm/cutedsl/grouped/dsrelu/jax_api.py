@@ -1,12 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""JAX-native (XLA custom call) entry point for the grouped GEMM dSReLU backward
-(discrete weight mode, FP8/blockscaled), built on :func:`cudnn.jax.call`.
+"""JAX-native (XLA custom call) entry points for the grouped GEMM dSReLU backward,
+built on :func:`cudnn.jax.call`.
 
-Discrete mode only (dense mode's expert-outermost strided B/SFB layouts have no
-row-major JAX equivalent) and fp8 inputs only (JAX has no packed fp4 dtype) --
-the same contract the eager wrapper enforces for JAX arrays. Scale-factor
+``grouped_gemm_dsrelu_jax_sm100`` serves two modes. With ``b_tensor`` it is the
+canonical block-scaled backward with dense weights: MXFP8 or packed FP4 A
+``(m, k)``, B ``(experts, n, k)``, saved C ``(m, n)`` and already MMA-packed scale
+bytes. With ``b_ptrs`` it is the discrete FP8 mode, the same contract the eager
+wrapper enforces for JAX arrays. Scale-factor
 tensors travel in the physical C-contiguous atom shape ``(L, MN', K', 32, 4, 4)``:
 the kernel rebuilds each SF layout from the GEMM shapes via
 ``tile_atom_to_shape_SF`` and consumes only the SF base pointers, so the
@@ -29,10 +31,12 @@ import cutlass.cute as cute
 import cutlass.utils
 from cutlass.cute.nvgpu import OperandMajorMode
 
-from cudnn.api_base import ceil_div
+from cudnn.api_base import TupleDict, ceil_div
 from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.tensor_adapter import framework_dtype
-from cudnn.jax import TensorSpec, call, gemm_operand_spec, zeros_init
+from cudnn.tensor_adapter import framework_dtype, get_compute_capability
+from cudnn.jax import TensorSpec, call, gemm_operand_spec, neg_inf_init, zeros_init
+from ..canonical import kernel_facing_b, kernel_facing_fp4, kernel_facing_mx, kernel_facing_prob
+from ..canonical_jax import check_block_scaled_operands, check_jax_inputs, check_packed_sf_size, fp8_dtypes, grouped_call, output_type, sf_array, sf_shape
 from ..moe_utils import MoEWeightMode
 from ..unfused.jax_api import _pointer_count
 from .moe_blockscaled_grouped_gemm_dsrelu_quant import BlockScaledMoEGroupedGemmQuantBwdKernel, EpilogueType
@@ -199,10 +203,10 @@ def grouped_gemm_dsrelu_jax_sm100(
     padded_offsets: Any,
     alpha_tensor: Any,
     prob_tensor: Any,
-    b_ptrs: Any,
-    sfb_ptrs: Any,
-    n: int,
-    norm_const_tensor: Any,
+    b_ptrs: Any = None,
+    sfb_ptrs: Any = None,
+    n: Optional[int] = None,
+    norm_const_tensor: Any = None,
     b_dtype: Any = None,
     b_major: str = "k",
     d_dtype: Any = cutlass.Float8E4M3FN,
@@ -215,8 +219,29 @@ def grouped_gemm_dsrelu_jax_sm100(
     discrete_col_sfd: bool = False,
     use_dynamic_sched: bool = False,
     use_dsrelu_reuse: bool = False,
-) -> Tuple[Any, ...]:
-    """Grouped GEMM dSReLU backward (discrete FP8 weights) as an XLA custom call.
+    *,
+    b_tensor: Any = None,
+    sfb_tensor: Any = None,
+) -> Any:
+    """Grouped GEMM dSReLU backward as an XLA custom call.
+
+    With ``b_tensor``: canonical block-scaled dense weights, eagerly or under
+    jax.jit. A (m,k), B (experts,n,k), saved C (m,n), prob (m,) fp32/bf16,
+    explicit alpha (experts,) fp32, and int32 padded_offsets (experts,). Offsets
+    must be nondecreasing multiples of 256 within [0,m]; m is padded to 256. A/B
+    are MXFP8, or packed FP4 as uint8 with two values per byte (K is twice the
+    array extent). SF buffers contain packed MMA-tiled bytes at any dense rank:
+    E8M0 with ``sf_vec_size=32`` for MXFP8 (uint8 bit patterns also accepted),
+    E8M0 or E4M3 (NVFP4, ``sf_vec_size=16``) for FP4. Returns a TupleDict with
+    the eager wrapper's keys. An FP8 ``d_dtype`` needs MXFP8 inputs and
+    norm_const (1,) fp32, and returns D_row, D_col, D_srelu (m,n) and the
+    physical 6-D SFD buffers. A BF16/FP16 ``d_dtype`` returns D_row, D_srelu and
+    the per-expert amax (experts,1). dprob (m,) is zero-initialized for
+    accumulation; other rows at or past padded_offsets[-1] are unspecified.
+    dbias, dynamic scheduling and dSReLU reuse are unsupported. SM100+, as in
+    Torch.
+
+    With ``b_ptrs``: discrete FP8 weights.
 
     Same contract as the eager wrapper's JAX (discrete, fp8) mode: ``a (m, k, 1)``
     k-major C-contiguous fp8, ``c (m, n, 1)`` n-major forward activations,
@@ -237,6 +262,40 @@ def grouped_gemm_dsrelu_jax_sm100(
     d_dtype = _convert_to_cutlass_data_type(d_dtype)
     acc_dtype = _convert_to_cutlass_data_type(acc_dtype)
     b_dtype = _convert_to_cutlass_data_type(b_dtype) if b_dtype is not None else None
+    if b_tensor is not None:
+        unsupported = {
+            "b_ptrs": b_ptrs is not None,
+            "sfb_ptrs": sfb_ptrs is not None,
+            "n": n is not None,
+            "b_dtype": b_dtype is not None,
+            "b_major": b_major != "k",
+            "acc_dtype": acc_dtype is not cutlass.Float32,
+            "generate_dbias": generate_dbias,
+            "vector_f32": vector_f32,
+            "use_dynamic_sched": use_dynamic_sched,
+            "use_dsrelu_reuse": use_dsrelu_reuse,
+        }
+        for name, rejected in unsupported.items():
+            if rejected:
+                raise ValueError(f"{name} is unsupported for the JAX block-scaled path")
+        return blockscaled_dsrelu_jax(
+            a_tensor=a_tensor,
+            b_tensor=b_tensor,
+            c_tensor=c_tensor,
+            sfa_tensor=sfa_tensor,
+            sfb_tensor=sfb_tensor,
+            padded_offsets=padded_offsets,
+            alpha_tensor=alpha_tensor,
+            prob_tensor=prob_tensor,
+            norm_const_tensor=norm_const_tensor,
+            d_dtype=d_dtype,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            discrete_col_sfd=discrete_col_sfd,
+            sf_vec_size=sf_vec_size,
+        )
+    if b_ptrs is None or sfb_ptrs is None or sfb_tensor is not None:
+        raise ValueError("Discrete weights take b_ptrs and sfb_ptrs; pass b_tensor and sfb_tensor for canonical dense weights")
 
     if len(a_tensor.shape) != 3 or a_tensor.shape[2] != 1:
         raise ValueError(f"a_tensor must have shape (m, k, 1), got {tuple(a_tensor.shape)}")
@@ -411,3 +470,180 @@ def grouped_gemm_dsrelu_jax_sm100(
     # Eager wrapper key order: (d_row, d_col, d_srelu, dprob, dbias, amax, sfd_row,
     # sfd_col, sfd_col_d_srelu); amax is always None (fp8 D produces SFD, not amax).
     return d_row, d_col, d_srelu, dprob, dbias, None, sfd_row, sfd_col, sfd_col_d_srelu
+
+
+kernel_cache = {}
+validated_configs = set()
+
+
+@cute.jit
+def grouped_dsrelu_dense_adapter(stream, a, b, c, sfa, sfb, padded_offsets, alpha, prob, *rest, kernel, mac, low_precision):
+    # rest: [norm_const], then d_row, d_col, d_srelu, dprob, sfd_row, sfd_col, sfd_col_d_srelu for FP8 output
+    # or d_row, d_srelu, dprob, amax otherwise
+    norm_const = rest[0] if cutlass.const_expr(low_precision) else None
+    outputs = rest[int(low_precision) :]
+    d_row = kernel_facing_mx(outputs[0])
+    kernel(
+        a=kernel_facing_mx(kernel_facing_fp4(a)),
+        b=kernel_facing_b(kernel_facing_fp4(b)),
+        sfb=sfb,
+        n=cutlass.Int32(0),
+        k=cutlass.Int32(0),
+        b_stride_size=cutlass.Int64(0),
+        b_major_mode=OperandMajorMode.K,
+        workspace_ptr=cute.make_ptr(cutlass.Uint8, 0, cute.AddressSpace.gmem, assumed_align=128),
+        c=kernel_facing_mx(c),
+        d=d_row,
+        # Without quantization the kernel only needs a D_col descriptor and does not write through it.
+        d_col=kernel_facing_mx(outputs[1]) if cutlass.const_expr(low_precision) else d_row,
+        sfa=sfa,
+        sfd_row_tensor=outputs[4] if cutlass.const_expr(low_precision) else None,
+        sfd_col_tensor=outputs[5] if cutlass.const_expr(low_precision) else None,
+        amax_tensor=None if cutlass.const_expr(low_precision) else outputs[3],
+        norm_const_tensor=norm_const,
+        padded_offsets=padded_offsets,
+        alpha=alpha,
+        prob=kernel_facing_prob(prob),
+        dprob=kernel_facing_prob(outputs[3] if cutlass.const_expr(low_precision) else outputs[2]),
+        dbias_tensor=None,
+        d_srelu=kernel_facing_mx(outputs[2] if cutlass.const_expr(low_precision) else outputs[1]),
+        sfd_col_d_srelu_tensor=outputs[6] if cutlass.const_expr(low_precision) else None,
+        max_active_clusters=mac,
+        stream=stream,
+    )
+
+
+def dsrelu_plan(inputs, outputs, mma_tiler_mn, cluster_shape_mn, discrete_col_sfd, sf_vec_size):
+    a, b = inputs["a"], inputs["b"]
+    m, k = a.shape
+    experts, n, b_k = b.shape
+    if m <= 0 or experts <= 0 or k != b_k:
+        raise ValueError("Expected nonempty A/B with matching K and at least one expert")
+    if m % 256:
+        raise ValueError("A rows must be padded to a multiple of 256")
+    ab_dtype, sf_dtype = check_block_scaled_operands(a, b, inputs["sfa"], inputs["sfb"], sf_vec_size)
+    if ab_dtype is cutlass.Float4E2M1FN:
+        k *= 2
+    if inputs["c"].shape != (m, n) or _convert_to_cutlass_data_type(inputs["c"].dtype) not in _c_dtypes:
+        raise ValueError(f"C must have shape {(m, n)} and dtype fp32, fp16, bf16, or fp8")
+    for name, shape in (("alpha", (experts,)), ("norm_const", (1,))):
+        if name in inputs and (tuple(inputs[name].shape) != shape or _convert_to_cutlass_data_type(inputs[name].dtype) is not cutlass.Float32):
+            raise ValueError(f"{name} must have shape {shape} and dtype float32")
+    if inputs["prob"].shape != (m,) or _convert_to_cutlass_data_type(inputs["prob"].dtype) not in (cutlass.Float32, cutlass.BFloat16):
+        raise ValueError("prob must have shape (m,) and dtype float32 or bfloat16")
+    if inputs["padded_offsets"].shape != (experts,) or _convert_to_cutlass_data_type(inputs["padded_offsets"].dtype) is not cutlass.Int32:
+        raise ValueError("padded_offsets must have shape (experts,) and dtype int32")
+    d_dtype = _convert_to_cutlass_data_type(outputs["d_row"].dtype)
+    low_precision = d_dtype in fp8_dtypes
+    if low_precision != (ab_dtype in fp8_dtypes):
+        raise ValueError("MXFP8 inputs require an FP8 d_dtype and FP4 inputs a BF16 or FP16 d_dtype")
+    use_2cta_instrs = mma_tiler_mn[0] == 256
+    cluster_shape_mn = tuple(cluster_shape_mn or ((2, 1) if use_2cta_instrs else (1, 1)))
+    margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
+    config = (experts, tuple(mma_tiler_mn), cluster_shape_mn, margin, discrete_col_sfd, low_precision, sf_vec_size)
+    validation_key = (config, tuple((name, tuple(t.shape), str(t.dtype)) for name, t in (*inputs.items(), *outputs.items())))
+    if validation_key not in validated_configs:
+        check_packed_sf_size(inputs, (("sfa", m, 1), ("sfb", n, experts)), ceil_div(ceil_div(k, sf_vec_size), 4))
+        if experts > 1024:
+            raise ValueError(f"expert count must be <= 1024, got {experts}")
+        if not BlockScaledMoEGroupedGemmQuantBwdKernel.can_implement(
+            ab_dtype,
+            sf_dtype,
+            sf_vec_size,
+            cutlass.Float32,
+            d_dtype,
+            use_2cta_instrs,
+            tuple(mma_tiler_mn),
+            cluster_shape_mn,
+            m,
+            n,
+            k,
+            experts,
+            "k",
+            "k",
+            "n",
+            BlockScaledMoEGroupedGemmQuantBwdKernel.FIX_PAD_SIZE,
+        ):
+            raise ValueError("Unsupported grouped GEMM dSReLU dtype, tile, cluster, alignment, or layout configuration")
+        validated_configs.add(validation_key)
+    if config not in kernel_cache:
+        major, minor = get_compute_capability()
+        if major < 10:
+            raise RuntimeError(f"Grouped GEMM dSReLU requires SM100+, found SM{major}{minor}")
+        mac = cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]) - margin
+        if mac <= 0:
+            raise ValueError("CUDNNFE_CLUSTER_OVERLAP_MARGIN leaves no active clusters")
+        kernel = BlockScaledMoEGroupedGemmQuantBwdKernel(
+            sf_vec_size=sf_vec_size,
+            acc_dtype=cutlass.Float32,
+            use_2cta_instrs=use_2cta_instrs,
+            mma_tiler_mn=tuple(mma_tiler_mn),
+            cluster_shape_mn=cluster_shape_mn,
+            vectorized_f32=False,
+            generate_sfd=low_precision,
+            discrete_col_sfd=discrete_col_sfd,
+            expert_cnt=experts,
+            weight_mode=MoEWeightMode.DENSE,
+            epilogue_type=EpilogueType.DSRELU.value,
+            generate_d_srelu=True,
+        )
+        kernel_cache[config] = (kernel, mac)
+    return kernel_cache[config]
+
+
+def blockscaled_dsrelu_jax(
+    *,
+    a_tensor,
+    b_tensor,
+    c_tensor,
+    sfa_tensor,
+    sfb_tensor,
+    padded_offsets,
+    alpha_tensor,
+    prob_tensor,
+    norm_const_tensor,
+    d_dtype,
+    mma_tiler_mn,
+    cluster_shape_mn,
+    discrete_col_sfd,
+    sf_vec_size,
+):
+    low_precision = d_dtype in fp8_dtypes
+    inputs = dict(a=a_tensor, b=b_tensor, c=c_tensor, sfa=sfa_tensor, sfb=sfb_tensor, padded_offsets=padded_offsets, alpha=alpha_tensor, prob=prob_tensor)
+    if low_precision:
+        inputs["norm_const"] = norm_const_tensor
+    check_jax_inputs(inputs)
+    inputs["sfa"] = sf_array(sfa_tensor)
+    inputs["sfb"] = sf_array(sfb_tensor)
+    m = a_tensor.shape[0]
+    experts, n = b_tensor.shape[:2]
+    d = output_type((m, n), d_dtype)
+    dprob = output_type((m,), cutlass.Float32)
+    if low_precision:
+        sfd_col = output_type(sf_shape(n, m, sf_vec_size), cutlass.Float8E8M0FNU)
+        outputs = dict(d_row=d, d_col=d, d_srelu=d, dprob=dprob, sfd_row=output_type(sf_shape(m, n, sf_vec_size), cutlass.Float8E8M0FNU), sfd_col=sfd_col)
+        outputs["sfd_col_d_srelu"] = sfd_col
+    else:
+        outputs = dict(d_row=d, d_srelu=d, dprob=dprob, amax=output_type((experts, 1), cutlass.Float32))
+    kernel, mac = dsrelu_plan(inputs, outputs, mma_tiler_mn, cluster_shape_mn, discrete_col_sfd, sf_vec_size)
+    result = grouped_call(
+        grouped_dsrelu_dense_adapter,
+        kernel,
+        mac,
+        tuple(output_type(t.shape, t.dtype) for t in inputs.values()),
+        tuple(outputs.values()),
+        initialized=((3, zeros_init),) if low_precision else ((2, zeros_init), (3, neg_inf_init)),
+        low_precision=low_precision,
+    )(*inputs.values())
+    result = dict(zip(outputs, result))
+    return TupleDict(
+        d_row_tensor=result["d_row"],
+        d_col_tensor=result.get("d_col"),
+        d_srelu_tensor=result["d_srelu"],
+        dprob_tensor=result["dprob"],
+        dbias_tensor=None,
+        amax_tensor=result.get("amax"),
+        sfd_row_tensor=result.get("sfd_row"),
+        sfd_col_tensor=result.get("sfd_col"),
+        sfd_col_d_srelu_tensor=result.get("sfd_col_d_srelu"),
+    )

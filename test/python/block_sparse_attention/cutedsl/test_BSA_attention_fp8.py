@@ -4,13 +4,13 @@
 import importlib
 import math
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
 
 from cudnn.api_base import TupleDict
-from block_sparse_attention.cutedsl.bsa_reference import attention_reference, block_sparse_mask
+from block_sparse_attention.cutedsl.bsa_reference import attention_reference, block_sparse_mask, assert_fp8_quantization_matches_fp32
 from test_utils import torch_fork_set_rng
 
 pytestmark = [pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
@@ -18,10 +18,10 @@ pytestmark = [pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclu
 
 def _import_bsa():
     try:
-        from cudnn import BSA
+        from cudnn import ops
 
         importlib.import_module("cudnn.block_sparse_attention._interface")
-        return BSA
+        return ops
     except (ImportError, OSError) as error:
         pytest.skip(f"block sparse attention optional dependencies are unavailable: {error}")
 
@@ -101,8 +101,9 @@ def test_bsa_fp8_runtime_gate_precedes_quantizer_import(monkeypatch, version):
 def test_bsa_fp8_interface_quantizes_before_private_launch(monkeypatch):
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
     monkeypatch.setattr(interface, "_require_sage_fp8_cutedsl", lambda: None)
+    monkeypatch.setattr(interface, "_get_device_arch_for_device", lambda device: 100)
 
-    q, k, v = object(), object(), object()
+    q, k, v = SimpleNamespace(device=SimpleNamespace(index=0)), object(), object()
     q2k, block_sizes, q2k_nums = object(), object(), object()
     quantized = tuple(object() for _ in range(6))
     expected = object()
@@ -139,7 +140,7 @@ def test_bsa_fp8_interface_quantizes_before_private_launch(monkeypatch):
 @pytest.mark.L0
 @pytest.mark.parametrize(("batch", "heads"), ((1, 4), (1, 3), (2, 3)))
 def test_bsa_fp8_forward_accepts_positive_batch_and_head_counts(monkeypatch, batch, heads):
-    BSA = _import_bsa()
+    ops = _import_bsa()
     api = importlib.import_module("cudnn.block_sparse_attention.api")
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
     monkeypatch.setattr(api, "_device_arch", lambda tensor: 100)
@@ -160,7 +161,7 @@ def test_bsa_fp8_forward_accepts_positive_batch_and_head_counts(monkeypatch, bat
         return expected
 
     monkeypatch.setattr(interface, "bsa_fp8_blk64_fwd", fake_forward)
-    result = BSA.block_sparse_attention_fp8_forward(
+    result = ops.block_sparse_attention_fp8_forward(
         q,
         k,
         v,
@@ -200,14 +201,14 @@ def test_bsa_fp8_private_cutedsl_quantizer_matches_recipe(batch, heads):
     k_fp8 = (k_blocks / k_scale[..., None, None]).to(torch.float8_e4m3fn).reshape_as(k)
 
     v_scale = v.abs().float().amax(dim=(0, 2)).clamp_min(1.0e-3) / 448.0
-    v_reciprocal = v_scale.reciprocal().to(torch.bfloat16)
-    v_fp8 = (v * v_reciprocal[None, :, None, :]).to(torch.float8_e4m3fn)
+    v_reciprocal = v_scale.reciprocal()
+    v_fp8 = (v.float() * v_reciprocal[None, :, None, :]).to(torch.float8_e4m3fn)
 
     expected = (q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale)
     assert all(tensor.is_contiguous() for tensor in actual)
     assert torch.equal(actual[0].float(), expected[0].float())
     assert torch.allclose(actual[1].float(), expected[1].float(), atol=4.0, rtol=0.0)
-    assert torch.equal(actual[2].float(), expected[2].float())
+    assert_fp8_quantization_matches_fp32(actual[2], v.float() * v_reciprocal[None, :, None, :])
     assert torch.equal(actual[3], expected[3])
     assert torch.allclose(actual[4], expected[4], atol=1.0e-6, rtol=0.0)
     assert torch.equal(actual[5], expected[5])
@@ -328,7 +329,7 @@ def test_bsa_fp8_split_workspace_estimate_uses_bf16_output_size():
 @pytest.mark.parametrize(("batch", "heads"), ((1, 4), (2, 3)))
 @torch_fork_set_rng(seed=2026)
 def test_bsa_fp8_sm100_bf16_forward_matches_reference(batch, heads):
-    BSA = _require_sm100_fp8()
+    ops = _require_sm100_fp8()
     seqlen_q, seqlen_k, head_dim, topk = 128, 640, 128, 5
     q = torch.randn((batch, heads, seqlen_q, head_dim), device="cuda", dtype=torch.bfloat16) * 0.5
     k = torch.randn((batch, heads, seqlen_k, head_dim), device="cuda", dtype=torch.bfloat16) * 0.5
@@ -340,7 +341,7 @@ def test_bsa_fp8_sm100_bf16_forward_matches_reference(batch, heads):
     softmax_scale = head_dim**-0.5
     reference, _ = attention_reference(q, k, v, mask, softmax_scale)
 
-    result = BSA.block_sparse_attention_fp8_forward(
+    result = ops.block_sparse_attention_fp8_forward(
         q,
         k,
         v,
@@ -357,3 +358,45 @@ def test_bsa_fp8_sm100_bf16_forward_matches_reference(batch, heads):
     difference = (actual.float() - reference).abs()
     assert difference.max().item() < 0.2
     assert (difference.mean() / reference.abs().mean().clamp_min(1e-8)).item() < 0.04
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("arch", (90, 120))
+def test_bsa_fp8_blk128_dispatch_preserves_v_layout_and_metadata(monkeypatch, arch):
+    """The two native blk128 paths share an API but require different V storage."""
+    api = importlib.import_module("cudnn.block_sparse_attention.api")
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    monkeypatch.setattr(api, "_device_arch", lambda tensor: arch)
+    monkeypatch.setattr(interface, "_get_device_arch_for_device", lambda device: arch)
+    q = torch.zeros((1, 1, 128, 128), device="cuda", dtype=torch.bfloat16)
+    indices = torch.zeros((1, 1, 1, 1), device="cuda", dtype=torch.int32)
+    sizes = torch.full((1,), 128, device="cuda", dtype=torch.int32) if arch == 120 else None
+    counts = torch.ones((1, 1, 1), device="cuda", dtype=torch.int32) if arch == 120 else None
+    quantized = tuple(object() for _ in range(6))
+    expected = object()
+    calls = []
+    fake_quantizer = ModuleType("cudnn.block_sparse_attention._fp8_quant")
+
+    def quantize(actual_q, actual_k, actual_v, **kwargs):
+        assert actual_q is actual_k is actual_v is q
+        assert kwargs == ({"v_layout": "bhds"} if arch == 90 else {"v_block_size": 128})
+        calls.append("quantize")
+        return quantized
+
+    def launch(*args, **kwargs):
+        assert args[:6] == quantized
+        assert args[6] is indices and args[7:] == (1, 0.125)
+        assert kwargs == ({} if arch == 90 else dict(block_sizes=sizes, q2k_block_nums=counts, sparse_block_size=128, v_block_size=128))
+        calls.append("launch")
+        return expected, None
+
+    def wrong_arch(*args, **kwargs):
+        pytest.fail("blk128 dispatched to the wrong architecture")
+
+    fake_quantizer._quantize_sage_bhsd = quantize
+    monkeypatch.setitem(sys.modules, fake_quantizer.__name__, fake_quantizer)
+    monkeypatch.setattr(interface, "_bsa_attn_fwd_sm90_fp8_blk128", launch if arch == 90 else wrong_arch)
+    monkeypatch.setattr(interface, "_bsa_attn_fwd_sm120_fp8", launch if arch == 120 else wrong_arch)
+    result = api.block_sparse_attention_fp8_forward(q, q, q, indices, 1, sizes, counts, sparse_block_size=128, softmax_scale=0.125)
+    assert result["o_tensor"] is expected
+    assert calls == ["quantize", "launch"]
