@@ -93,6 +93,84 @@ for page_size, fuse_prepare in ((0, False), (16, False), (16, True)):
     assert "cudnn.frost.tile_dsl" not in modules
 
 
+@pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="the gated attention block requires torch")
+def test_indexer_decode_declaration_under_fuse_prepare_does_not_import_the_prepare_kernel():
+    """The in-block indexer's DECODE step over the pools (``QsaSpec(index_source="indexer")`` with ``kv_source="paged"``), declared on
+    CPU samples with the prepare fusion -- an explicit ``fuse_prepare=True`` and the measured default (``None``) on a part that reads it
+    True -- builds the fused launch's arms record (``QsaPrepareIndexArms``) at DECLARATION.  The record's home is the DSL-free contract
+    module, so neither the prepare kernel module nor the DSL is imported before the stage's ``check_support`` gates the floor (Rule 7):
+    on a sub-floor DSL the constructor must raise the typed version decline, never die inside ``cudnn.frost.tile_dsl``."""
+    modules = _modules("""
+import torch
+import cudnn.gated_attention_block.api as api
+from cudnn.gated_attention_block import GatedAttentionBlockFwd, GatedAttentionBlockGeometry, QsaSpec
+
+g = GatedAttentionBlockGeometry(d_model=512, h_q=8, h_kv=2, d_head=256, rope_dim=64, causal_bottom_right=True,
+                                qsa=QsaSpec(index_source="indexer", index_band=True))
+def empty(*shape, dtype=torch.bfloat16):
+    return torch.empty(shape, dtype=dtype, device="cpu")
+page, n_pages = 16, 4
+args = (empty(1, 1, 512), empty(g.n_qkvg, 512), torch.ones(256, dtype=torch.bfloat16), torch.ones(256, dtype=torch.bfloat16),
+        empty(1, 1, 64), empty(1, 1, 64), empty(512, 8 * 256), empty(1, 1, 512))
+samples = dict(paged_kv_page_size=page, kv_source="paged", sample_k_cache=empty(n_pages, 2, page, 256),
+               sample_v_cache=empty(n_pages, 2, page, 256), sample_block_table=torch.zeros(1, n_pages, dtype=torch.int32),
+               sample_index_kv_cache=empty(n_pages, page // 4, 1, 128), sample_index_state_cache=empty(2, 8, 1, 128),
+               sample_index_state_block_table=torch.zeros(1, 1, dtype=torch.int32))
+explicit = GatedAttentionBlockFwd(*args, g, fuse_prepare=True, **samples)
+assert explicit.fuse_prepare is True and explicit._prepare is not None and explicit._prepare.decode_arms
+api._device_cc_of = lambda device: (10, 7)  # the measured part's reading of the AUTO knob, on a CPU sample
+auto = GatedAttentionBlockFwd(*args, g, **samples)
+assert auto.fuse_prepare is True and auto.fuse_prepare_requested is None and auto._prepare is not None
+""")
+    assert "cudnn.gated_attention_block.kernels.qsa_prepare" not in modules
+    assert "cudnn.gated_attention_block.kernels.qsa_compress" not in modules
+    assert "cudnn.gated_attention_block.kernels.cache_write" not in modules
+    assert "cudnn.frost.tile_dsl" not in modules
+
+
+@pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="the gated attention block requires torch")
+def test_indexer_decode_declaration_declines_old_dsl_at_check_support_not_at_construction():
+    """The same declaration on the package's supported DSL floor (4.6.2, simulated through the buffers hook as the NVFP4 cell does): it
+    CONSTRUCTS under the prepare fusion, and the fused prepare stage and the indexer stage each decline at ``check_support`` with the
+    typed version error naming the floor and the installed version -- never a ``ModuleNotFoundError`` from inside the DSL at construction
+    (Rule 7), and the kernel module stays unimported through both declines."""
+    probe = """
+import sys
+from cudnn.frost import buffers
+buffers._DSL_STATE = (True, ("nvidia-cutlass-dsl", "4.6.2"))
+import torch
+import cudnn.gated_attention_block.api as api
+from cudnn.gated_attention_block import GatedAttentionBlockFwd, GatedAttentionBlockGeometry, QsaSpec
+
+g = GatedAttentionBlockGeometry(d_model=512, h_q=8, h_kv=2, d_head=256, rope_dim=64, causal_bottom_right=True,
+                                qsa=QsaSpec(index_source="indexer", index_band=True))
+def empty(*shape, dtype=torch.bfloat16):
+    return torch.empty(shape, dtype=dtype, device="cpu")
+page, n_pages = 16, 4
+args = (empty(1, 1, 512), empty(g.n_qkvg, 512), torch.ones(256, dtype=torch.bfloat16), torch.ones(256, dtype=torch.bfloat16),
+        empty(1, 1, 64), empty(1, 1, 64), empty(512, 8 * 256), empty(1, 1, 512))
+samples = dict(paged_kv_page_size=page, kv_source="paged", sample_k_cache=empty(n_pages, 2, page, 256),
+               sample_v_cache=empty(n_pages, 2, page, 256), sample_block_table=torch.zeros(1, n_pages, dtype=torch.int32),
+               sample_index_kv_cache=empty(n_pages, page // 4, 1, 128), sample_index_state_cache=empty(2, 8, 1, 128),
+               sample_index_state_block_table=torch.zeros(1, 1, dtype=torch.int32))
+api._device_cc_of = lambda device: (10, 7)
+for kw in (dict(fuse_prepare=True), dict()):
+    block = GatedAttentionBlockFwd(*args, g, **samples, **kw)
+    assert block.fuse_prepare is True and block._prepare is not None, kw
+    for stage in (block._prepare, block._indexer_decode):
+        try:
+            stage.check_support()
+        except NotImplementedError as error:
+            assert "4.7.0" in str(error) and "4.6.2" in str(error), (stage.name, str(error))
+        else:
+            raise AssertionError(f"{stage.name} accepted the unsupported DSL 4.6.2")
+assert "cudnn.gated_attention_block.kernels.qsa_prepare" not in sys.modules
+assert "cudnn.frost.tile_dsl" not in sys.modules
+"""
+    run = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+
+
 @pytest.mark.L0
 def test_gnn_import_failure_has_optional_dependency_guidance():
     code = """

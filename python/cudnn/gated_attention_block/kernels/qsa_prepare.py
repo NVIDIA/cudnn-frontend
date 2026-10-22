@@ -106,7 +106,7 @@ from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_depende
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16, rmsnorm_rstd, rope_rotate_half
 from cudnn.frost.tile_dsl.tma import ld_global, ld_global_v2, ld_global_v4, st_global, st_global_v4
 
-from ..cache_write_contract import check_pool, check_slot_mapping
+from ..cache_write_contract import QsaPrepareIndexArms, check_pool, check_slot_mapping  # the arms record: re-exported for this kernel's callers
 from .cache_write import _fake_pool, _fake_slot
 from .qk_norm_rope import (
     ACCESS_BYTES,
@@ -785,39 +785,8 @@ def qsa_prepare_launch(
 compiled_cache = {}
 
 
-class QsaPrepareIndexArms(NamedTuple):
-    """Which indexer arms an artifact traces (every one a compile key), and the band geometry they address.
-
-    ``raw_pool``: the raw indexer key's write-through pool (the cache-write kernel's second launch); ``query``: the
-    indexer queries' norm + RoPE into a compact ``[T, H_i, D_i]`` buffer (the compress kernel at pool 1); ``compress``:
-    the ring + the compressed-key cache (the compress kernel's step form; ``n_commit`` traces its accepted-prefix load).
-    ``heads`` / ``head_dim`` are the band's ``index_heads`` / ``index_head_dim``; ``pool`` the compress ratio.
-
-    Appended (the serving step's forms, each a compile key): ``paged`` -- the compress arm over the stack's PAGED ring and
-    compressed-key cache through their block tables with the positions from ``kv_lens`` (needs ``compress``);
-    ``ring_slots`` -- the ring WRITE rows from the stack's own slot mapping (needs ``paged``; the slots share the
-    artifact's slot dtype); ``rope_table`` -- the Q / K and indexer-query rotations read from the position-indexed
-    ``cos_pos`` / ``sin_pos`` at ``pos0 + j`` instead of per-token rows (needs ``compress`` and a rotation)."""
-
-    heads: int
-    head_dim: int
-    raw_pool: bool = True
-    query: bool = False
-    compress: bool = False
-    n_commit: bool = False
-    pool: int = DEFAULT_POOL
-    paged: bool = False
-    ring_slots: bool = False
-    rope_table: bool = False
-
-    @property
-    def raw(self) -> bool:
-        """Whether the raw-key arm exists at all (any of its three jobs)."""
-        return bool(self.raw_pool or self.compress)
-
-    @property
-    def any(self) -> bool:
-        return bool(self.raw or self.query)
+# ``QsaPrepareIndexArms`` -- which indexer arms an artifact traces (every one a compile key) -- lives in ``cache_write_contract.py``: the
+# block builds the record at DECLARATION, which must not import this module (the DSL at module scope; Rule 7).  Re-exported above.
 
 
 class QsaPrepareRecipe(NamedTuple):

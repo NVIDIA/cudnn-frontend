@@ -250,7 +250,11 @@ _ABSENT = dict(
     ix_q8=-1,
     ix_kbar8=-1,
     decode_q_lens=-1,
-)  # the in-block indexer's seven slots, the e4m3 KV cache's five, the fp8 indexer cache's two, the DECODE form's prefill-route Q lengths
+    ix_logits=-1,
+    ix_counts=-1,
+    ix_cslot=-1,
+)  # the in-block indexer's seven slots, the e4m3 KV cache's five, the fp8 indexer cache's two, the DECODE form's prefill-route Q lengths,
+# the indexer's DECODE step's three (`ix_logits` / `ix_counts` / `ix_cslot`, appended last)
 _NO_Q8 = dict(q8=-1, k8=-1, v8=-1, o8=-1, gate16=-1)
 _NO_SF = dict(sf_q=-1, sf_k=-1, sf_v=-1)
 _SNAPSHOT = {
