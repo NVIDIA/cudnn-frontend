@@ -388,8 +388,8 @@ compressed column 0.
     prefixes from `make_scale_cu_seqlens_padded` for THD.
     `sf_vec_size` is fixed at 32, and THD inputs take the same
     `cu_seqlens_q_scale_padded`/`cu_seqlens_k_scale_padded` scale-prefix
-    contract. It runs the MXFP8 kernel with tcgen05 `kind::mxf4` MMAs
-    (K = 64 per MMA). Requires a PyTorch build with
+    contract. Its kernel differs from the MXFP8 one only in the MMA:
+    tcgen05 `kind::mxf4`, K = 64 per MMA. Requires a PyTorch build with
     `torch.float4_e2m1fn_x2`; otherwise `precision="mxfp4"` raises
     `NotImplementedError`.
 - **Constraints** — `head_dim == 128`. The SM90 direct path supports

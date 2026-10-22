@@ -1087,12 +1087,12 @@ def test_DSA_indexer_forward_mxfp4_two_mmas_per_k_chunk(monkeypatch, ratio):
     _require_mxfp4_indexer()
     from cudnn.deepseek_sparse_attention.indexer_forward import _interface
     from cudnn.deepseek_sparse_attention.score_recompute import _block_scaled
-    from cudnn.deepseek_sparse_attention.score_recompute.indexer_score_unified_sm100_mxfp8 import IndexerScoreUnifiedSm100Mxfp8
+    from cudnn.deepseek_sparse_attention.score_recompute.indexer_score_unified_sm100_mxfp4 import IndexerScoreUnifiedSm100Mxfp4
     from deepseek_sparse_attention.cutedsl import mxfp8_scale_reference as scale_utils
 
     constructed = []
 
-    class WideKChunk(IndexerScoreUnifiedSm100Mxfp8):
+    class WideKChunk(IndexerScoreUnifiedSm100Mxfp4):
         def __init__(self, *args, **kwargs):
             constructed.append(kwargs)
             super().__init__(*args, **{**kwargs, "k_block_size": 128, "kv_stage": 12})

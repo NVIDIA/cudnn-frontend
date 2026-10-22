@@ -23,7 +23,7 @@ SUPPORTED_QHEAD_PER_KV_HEAD_BF16 = (4, 8, 16, 32, 64)
 # ``128 // group`` tokens per tile, split between the two epilogue warpgroups. Same set as BF16; a
 # plain-e4m3 scorer is the MXFP8 kernel with all-ones E8M0 scale blobs.
 SUPPORTED_QHEAD_PER_KV_HEAD_MXFP8 = (4, 8, 16, 32, 64)
-# MXFP4 runs the MXFP8 kernel on packed E2M1 Q/K, so it serves the same groups.
+# The MXFP4 kernel differs from the MXFP8 one only in its MMA, so it serves the same groups.
 SUPPORTED_QHEAD_PER_KV_HEAD_MXFP4 = SUPPORTED_QHEAD_PER_KV_HEAD_MXFP8
 # Head groups keyed by precision.
 _SUPPORTED_QHEAD_PER_KV_HEAD = {

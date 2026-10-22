@@ -18,6 +18,7 @@ import torch
 
 from cudnn.deepseek_sparse_attention.utils.runtime import ceil_div
 from .indexer_score_unified_sm100 import IndexerScoreUnifiedSm100
+from .indexer_score_unified_sm100_mxfp4 import IndexerScoreUnifiedSm100Mxfp4
 from .indexer_score_unified_sm100_mxfp8 import IndexerScoreUnifiedSm100Mxfp8
 
 
@@ -60,7 +61,7 @@ BLOCK_SCALED_FORMATS = {
         scale_dtype_name="float8_e8m0fnu",
         sf_vec_size=32,
         elems_per_storage=2,
-        kernel_cls=IndexerScoreUnifiedSm100Mxfp8,
+        kernel_cls=IndexerScoreUnifiedSm100Mxfp4,
     ),
 }
 SM100_INDEXER_PRECISIONS = ("bf16", *BLOCK_SCALED_FORMATS)
