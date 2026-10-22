@@ -1450,14 +1450,17 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle, *, plan_pin=None):
                 stats=stats_bwd,
             )
 
-            for actual, expected, name in (
-                (dQ_gpu, dQ_ref, "dQ"),
-                (dK_gpu, dK_ref, "dK"),
-                (dV_gpu, dV_ref, "dV"),
+            for actual, expected, name, keys in (
+                (dQ_gpu, dQ_ref, "dQ", s_kv),
+                (dK_gpu, dK_ref, "dK", s_qo),
+                (dV_gpu, dV_ref, "dV", s_qo),
             ):
-                # dV carries the largest magnitudes, so it needs one wider step than fp8.
-                error = compare_tensors(actual, expected, 0.125, 0.20, name)
-                assert error == 0, f"{name} mismatch: {error} elements differ"
+                # dV carries the largest magnitudes, so it needs one wider step than fp8.  The kernel and
+                # the reference round P and dS to E4M3 independently; a value on a code midpoint moves the
+                # d-row it feeds by one code step times the operand (assert_close_fp8_grad), e.g. one dS
+                # flip against a constant |Q| = 16 column shifted a whole dK row by 0.25 on SM103
+                # (bprop.mxfp8.dense test236).
+                assert_close_fp8_grad(actual, expected, 0.125, 0.20, tag=name, keys=keys)
 
             if with_sink_token and dSink_token_ref is not None:
                 dSink_err = compare_tensors(dSink_token_gpu, dSink_token_ref, 0.08, 0.20, "dSink_token")
