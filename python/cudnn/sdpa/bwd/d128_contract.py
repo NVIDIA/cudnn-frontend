@@ -53,9 +53,13 @@ def validate_accumulation_scale(scale):
         raise ValueError("dense d128 accumulation requires scale and scale*log2(e) finite and positive in FP32") from None
 
 
+# Compute capabilities the accumulation chain (dense, THD and grouped) is qualified on.
+ACCUMULATION_CCS = ((10, 0), (10, 3))
+
+
 def select_implementation(cc, dsl_version, batch, heads, sq, skv, scale):
     """Choose from plan facts, preserving the existing recompute envelope."""
-    if tuple(cc) != (10, 0) or not dsl_version or dsl_version[0] != "nvidia-cutlass-dsl":
+    if tuple(cc) not in ACCUMULATION_CCS or not dsl_version or dsl_version[0] != "nvidia-cutlass-dsl":
         return RECOMPUTE
     match = re.match(r"^(\d+)\.(\d+)\.(\d+)", dsl_version[1])
     if match is None or tuple(map(int, match.groups())) < (4, 8, 0):

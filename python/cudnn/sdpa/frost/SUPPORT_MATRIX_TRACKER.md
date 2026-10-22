@@ -323,7 +323,7 @@ half-precision d512 row and ᵍ for the MXFP8 row; the d256 BPROP column reads �
 for the half-precision d256 row and ᵍ for the MXFP8 row.
 
 The opt-in **d128 backward** (`sdpa_bwd_sm100_d128`, engine 20609) selects
-its implementation at plan build. On SM100 with public CuTeDSL >= 4.8, positive
+its implementation at plan build. On SM100 or SM103 with public CuTeDSL >= 4.8, positive
 FP32-representable scale and query/key lengths divisible by 128, it launches
 row delta plus dQ initialization, the five-product main kernel, then an FP32
 to output-dtype dQ conversion. The main kernel writes dK/dV directly and
@@ -348,20 +348,29 @@ the allocation contract. All scratch is initialized each execution.
 | IO layout | Compact BSHD rows; THD uses each port's ragged origins and ignores logical batch pitch |
 | Stats | Dense: contiguous FP32 natural-log LSE; THD: packed token-major or head-major with declared physical capacity |
 | Workspace / kernel launches | MHA: dense aligned accumulation / 3, retained dense recompute / 1, THD accumulation / 4. GQA/MQA: append native dK/dV partials and an FP32 group fold; dense / 4, THD / 5 |
-| THD MHA | ✅ exact cc 10.0, public CuTeDSL >= 4.8, positive FP32 scale, positive declared capacities; actual empty sequences and tails supported |
-| GQA / MQA | ✅ BF16 only, exact cc 10.0, public CuTeDSL >= 4.8, positive FP32 scale, Hq > Hkv with integral ratio; dense Sq/Skv must be multiples of 128, THD accepts tails and empty actual sequences |
+| THD MHA | ✅ cc 10.0 or 10.3, public CuTeDSL >= 4.8, positive FP32 scale, positive declared capacities; actual empty sequences and tails supported |
+| GQA / MQA | ✅ BF16 only, cc 10.0 or 10.3, public CuTeDSL >= 4.8, positive FP32 scale, Hq > Hkv with integral ratio; dense Sq/Skv must be multiples of 128, THD accepts tails and empty actual sequences |
 | Bottom-right causal, sliding window, dense padding mask, right-band widening | ❌ |
 | Bias / dBias, sink / dSink, dropout, deterministic request | ❌ |
 | Zero attention scale | ❌ |
 
 A compiled accumulation plan accepts runtime scalar overrides only when both
 scale and scale*log2(e) remain finite and positive in FP32. Changing the scale
-never silently changes implementation. SM100 is the runtime qualification
-target; the new chain is not selected on SM103. The row remains opt-in, and
+never silently changes implementation. SM100 and SM103 are the runtime
+qualification targets. The row remains opt-in, and
 performance qualification is separate from capability tests. The graph tests
 in `test_sdpa_bwd_d128_sm100.py` and `test_sdpa_bwd_d128_accum_sm100.py` cover
 all three gradients, launch counts, workspace bounds, buffer rebinding and
 capture/replay. Native frame tests cover the prepared hosts.
+
+**Measured** on B300 (cc 10.3) 2026-10-22, develop `4e27a6fa` plus the SM103
+admission, CuTeDSL 4.8.1, cuDNN 9.27.0, torch 2.14.1+cu130: the eight d128
+backward files (`test_sdpa_bwd_d128_{sm100,accum_sm100,thd_sm100,grouped_sm100,
+thd_eligibility,grouped_eligibility,dense_bounds,stats_span}.py`) pass 214/214,
+including accumulation 15, THD 24 and grouped 23; before the change the same
+three files skip 12, 24 and 22 cases on cc 10.3. The THD and grouped hosts
+compile for the build device's arch (`sm_103a` on B300) instead of a fixed
+`sm_100a`. Capability only; no B300 performance claim.
 
 Packed d128 adds metadata/map setup before the three accumulation launches.
 It binds each port's INT32/INT64 ragged offsets and positive element multiplier
@@ -2471,7 +2480,7 @@ envelope and fused bias/sinks remain unavailable to THD.
 | MXFP8 forward | SM90 and SM80 (SM107 is served — see the SM107 table; d512 is ⚠️ⁱᵛ, correct but with no test module -- covered through the graph API by `test_mhas_v2.py::test_sdpa_mxfp8_fwd_default_walk_cc107_L0` and `::test_sdpa_mxfp8_fwd_cc107_L0`, d512 being one of the four exact flavors drawn; a dedicated module is still open; SM120 serves d ≤ 512 — see the SM120 table) |
 | Per-tensor FP8 backward | every arch except SM107 d = 256 E4M3 (`sdpa_bwd_sm107_fp8`, ᵇ) |
 | MXFP8 backward outside SM100/SM103 d = 256 and SM107 d = 256 (`sdpa_bwd_sm107_mxfp8`, ᵐˣ) | every arch |
-| THD / ragged backward | SM120, the SM107 d512 row (ᵇ³) and the SM100/SM103 MXFP8 and f16/bf16 d256 (ᵇ²) rows (the SM100/SM103 f16/bf16 d512 row serves it — see ʰ; the SM107 f16/bf16 and per-tensor FP8 rows — see ᵇ; the SM107 MXFP8 row — see ᵐˣ; SM80 — see ᵏ). The d128 row serves THD only on exact cc 10.0 with public CuTeDSL ≥ 4.8 and positive FP32 scale: BF16/FP16 MHA and BF16 GQA/MQA; SM103 d128 remains unsupported for THD. |
+| THD / ragged backward | SM120, the SM107 d512 row (ᵇ³) and the SM100/SM103 MXFP8 and f16/bf16 d256 (ᵇ²) rows (the SM100/SM103 f16/bf16 d512 row serves it — see ʰ; the SM107 f16/bf16 and per-tensor FP8 rows — see ᵇ; the SM107 MXFP8 row — see ᵐˣ; SM80 — see ᵏ). The d128 row serves THD only on cc 10.0 or 10.3 with public CuTeDSL ≥ 4.8 and positive FP32 scale: BF16/FP16 MHA and BF16 GQA/MQA. |
 | THD forward outside native-flavor dims or compact packed Q/K/V/O | SM80 — the graph path serves only the four native head-dim pairs and copy-free packed BSHD buffers |
 | **Decode tile on the Rubin line outside the d256 f16/bf16 flavor** | **SM107** — d128 / d192×d128 / d512 decode and every fp8 / mxfp8 decode run their flavor's prefill kernel; the d256 f16/bf16 decode tile (ᵈʳ: whole-group PackGQA, dense / paged split-KV, the MTP step in token units of the 32-column tile ᵐᵗᵖ) is the only Rubin decode tile today |
 | **Paged d256 decode-tile default placement outside its measured bands** | **SM107** — the MTP rows (`S_q` 2-4 on 24/2 and 32/2, the 32-column tile in up to two token units ᵐᵗᵖ) and group 32 (64/2, the 32-column tile in one unit) LEAD by default inside their measured bands since the follow-up to the first arm (the MTP box b 1-128 × KV 1k-128k at page 16 bf16: 0.01-0.31 of the backend's default plan, which costs 6.8-142 ms per launch at KV 128k; group 32 from 4 units and 2¹⁷ KV tokens in flight: 0.27-0.79) although the 32-column tile still trails FlashInfer's own fa2 decode kernel on part of them (6 % at q 2, 21-22 % at q 3-4; 7-9 % on group 32, at the medians) -- its per-CTA issue-rate gap at 24-64 packed rows (212-SM cc 10.7 perf class, cuDNN 9.27.0, 2026-10-13), a kernel lever, not a placement fact: FE's verdict is against the backend's plan. Still backend-first because unmeasured: the MTP rows at page 32 / 64 and in f16 and on the 12/1 / 16/1 geometries (the same groups, unmeasured at `S_q > 1`), group 32 on 32/1 (the same group, unmeasured), at page 32 / 64 (measured on 24/2 only), below 2¹⁷ tokens in flight (its 2¹⁶ step holds a parity cell) or with fewer than 4 units; Stats, sinks, a mask or window at `S_q = 1`, page 128, fewer than 4 units (1-2 units led only at the 128k endpoint), above 512 units or past 128k declared KV, a dense (unpaged) d256 cache at `S_q = 1` (measured against the prefill body only), THD queries, the fused gate, a paged decode without per-request KV lengths (no padding mask: every band cell carried one). The head-major in-page pool layout (each head's page contiguous, vLLM's `[blocks, 2, H_kv, block, D]`) is admitted beside the token-major one the band measured: measured 2026-10-14 on the 24/2 core geometry with the same protocol on an EXCLUSIVE GPU of the same 212-SM cc 10.7 class (lock 2376 sampled: busy median 2364; cuDNN 9.27.0 build 9.27.0.21; b 1-128 x declared KV 1k-128k at page 16 bf16, 48 cells x 2 regimes): the tile 0.36-0.92 of the backend on EVERY in-band cell in both regimes (32 cells per regime, all quotable; medians 0.45 replay / 0.45 eager), the out-of-band cells mixed 0.73-2.00 as in the token-major band. Follow-up: the kernel fix of the 32-column tile reopens both holds (a placement constant each); the Stats / page-128 twins are one measured chunk each (`placement._sm107_paged_d256_decode_tile_leads`) |
