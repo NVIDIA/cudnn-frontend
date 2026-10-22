@@ -18,7 +18,7 @@ def _require_accumulation():
     from cudnn.sdpa.bwd.d128_contract import ACCUMULATION, select_implementation
 
     if select_implementation(torch.cuda.get_device_capability(), cutedsl_state()[1], 1, 1, 128, 128, 0.125) != ACCUMULATION:
-        pytest.skip("dense d128 accumulation requires SM100 and public CuTeDSL >= 4.8")
+        pytest.skip("dense d128 accumulation requires SM100 / SM103 and public CuTeDSL >= 4.8")
 
 
 def test_implementation_selection_is_plan_time():
@@ -26,8 +26,9 @@ def test_implementation_selection_is_plan_time():
 
     args = dict(cc=(10, 0), dsl_version=("nvidia-cutlass-dsl", "4.8.0"), batch=2, heads=3, sq=128, skv=256, scale=0.125)
     assert select_implementation(**args) == ACCUMULATION
+    assert select_implementation(**(args | {"cc": (10, 3)})) == ACCUMULATION
     for changed in (
-        {"cc": (10, 3)},
+        {"cc": (10, 1)},
         {"cc": (10, 7)},
         {"dsl_version": ("nvidia-cutlass-dsl", "4.7.1")},
         {"dsl_version": ("nvidia-cutlass-dsl-internal", "0.3.0")},
