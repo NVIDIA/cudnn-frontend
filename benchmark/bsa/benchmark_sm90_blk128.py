@@ -89,7 +89,6 @@ def main():
     sources = [
         "api.py",
         "_interface.py",
-        "_sm90_blk128.py",
         "csrc/bwd/bucketed_k2q_csr.py",
         "csrc/utils/sm90_barriers.py",
         "csrc/fwd/sm90_blk128/bsa_fwd_sm90.py",
