@@ -4,6 +4,10 @@
 
 The five-product pipeline retains 33 live mbarriers. Native output TMA stores
 are warp-uniform, dQ reductions elected; both return 32-lane credits.
+
+Sequence lengths need not be tile multiples: the tail Q / K / V / dO boxes
+zero-fill, the tail dK / dV stores and dQ reductions clip, and the tail Stats
+rows publish -inf so every tail P and dS column is exactly zero.
 """
 
 from typing import NamedTuple
@@ -186,22 +190,29 @@ def _bounds(block, sq, causal: cutlass.Constexpr[bool]):
     lo = cutlass.Int32(0)
     if cutlass.const_expr(causal):
         lo = block
-    return lo, sq // CFG.N
+    return lo, (sq + CFG.N - 1) // CFG.N
 
 
 @cute.jit
-def _stats(slab, lse, delta, row, group, qbase, batch, head, scale):
+def _stats(slab, lse, delta, row, group, qbase, sq, batch, head, scale):
     # Every one of256 lanes participates in both named barriers. Each group
     # writes a different128-float vector, one row per lane.
     named_barrier_fence(CFG.SOFTMAX_BARRIER, CFG.SOFTMAX_LANES)
+    idx = qbase + row
+    valid = idx < sq
     if group == 0:
-        val = cutlass.Float32(lse[batch, head, qbase + row])
+        # Tail rows past S_q read the last Stats row (in bounds) and publish
+        # -inf: their zero-filled Q / dO columns then yield exp2(-inf) = 0.
+        clamped = cutlass.Int32(arith.select(valid.ir_value(), idx.ir_value(), (sq - 1).ir_value()))
+        val = cutlass.Float32(lse[batch, head, clamped])
         stat = -cutlass.Float32(LOG2E) * val
         if val == cutlass.Float32(float("-inf")):
             stat = cutlass.Float32(0.0)
+        stat = cutlass.Float32(arith.select(valid.ir_value(), stat.ir_value(), cutlass.Float32(float("-inf")).ir_value()))
         _view(slab, CFG.STATS, cutlass.Float32, CFG.N).subview(row).store(stat)
     else:
-        stat = -scale * cutlass.Float32(delta[batch, head, qbase + row])
+        # delta spans the rounded S_q; dot_do_o_kernel zeroes its tail rows.
+        stat = -scale * cutlass.Float32(delta[batch, head, idx])
         _view(slab, CFG.DELTA, cutlass.Float32, CFG.N).subview(row).store(stat)
     named_barrier_fence(CFG.SOFTMAX_BARRIER, CFG.SOFTMAX_LANES)
 
@@ -286,7 +297,7 @@ def _softmax_loop(
             _credit(bars.sched_empty[sched_state.idx])
         lo, hi = _bounds(block, sq, causal)
         if lo < hi:
-            _stats(slab, lse, delta, row, group, lo * CFG.N, batch, head, scale)
+            _stats(slab, lse, delta, row, group, lo * CFG.N, sq, batch, head, scale)
         for qtile in cutlass.range(lo, hi, 1, unroll=1):
             _wait_tcgen(bars.s_done, state.phase)
             p = _p_values(slab, tmem_base, row, group, block, qtile, lo, scale, causal, dtype)
@@ -299,7 +310,7 @@ def _softmax_loop(
             nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
             bars.ds_ready.arrive()
             if qtile + 1 < hi:
-                _stats(slab, lse, delta, row, group, (qtile + 1) * CFG.N, batch, head, scale)
+                _stats(slab, lse, delta, row, group, (qtile + 1) * CFG.N, sq, batch, head, scale)
             state = advance(state, 1)
         if cutlass.const_expr(causal):
             _credit(bars.sched_empty[sched_state.idx])
@@ -646,7 +657,7 @@ def bprop_d128_accum_kernel(
 ):
     warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     x, y, z = cute.arch.block_idx()
-    nk = skv // CFG.M
+    nk = (skv + CFG.M - 1) // CFG.M
     if cutlass.const_expr(causal):
         block, head, batch = _decode_flat(x, nheads, nk, swizzle, batch_heads)
     else:
@@ -708,9 +719,9 @@ def host(
         raise ValueError("dense d128 accumulation requires BF16/FP16")
     if cutlass.const_expr(q.shape[3] != CFG.D or k.shape[3] != CFG.D or q.shape[2] != k.shape[2]):
         raise ValueError("dense d128 accumulation requires dense MHA d128")
-    if cutlass.const_expr(q.shape[1] <= 0 or k.shape[1] <= 0 or q.shape[1] % CFG.N or k.shape[1] % CFG.M):
-        raise ValueError("dense d128 accumulation requires positive Sq/Skv multiples of 128")
-    nk = k.shape[1] // CFG.M
+    if cutlass.const_expr(q.shape[1] <= 0 or k.shape[1] <= 0):
+        raise ValueError("dense d128 accumulation requires positive Sq/Skv")
+    nk = (k.shape[1] + CFG.M - 1) // CFG.M
     heads_per_l2 = (50 * 1024 * 1024) // (q.shape[1] * (CFG.D + CFG.D) * CFG.BPE)
     swizzle = 1 << (heads_per_l2.bit_length() - 1) if heads_per_l2 > 0 else 1
     grid = (nk * q.shape[2] * q.shape[0], 1, 1) if causal else (nk, q.shape[2], q.shape[0])

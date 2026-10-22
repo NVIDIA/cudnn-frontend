@@ -323,19 +323,20 @@ half-precision d512 row and ᵍ for the MXFP8 row; the d256 BPROP column reads �
 for the half-precision d256 row and ᵍ for the MXFP8 row.
 
 The opt-in **d128 backward** (`sdpa_bwd_sm100_d128`, engine 20609) selects
-its implementation at plan build. On SM100 or SM103 with public CuTeDSL >= 4.8, positive
-FP32-representable scale and query/key lengths divisible by 128, it launches
-row delta plus dQ initialization, the five-product main kernel, then an FP32
-to output-dtype dQ conversion. The main kernel writes dK/dV directly and
-accumulates dQ in FP32 caller workspace. The cast applies no additional scale.
+its implementation at plan build. On SM100 or SM103 with public CuTeDSL >= 4.8 and a
+positive FP32-representable scale it launches row delta plus dQ initialization, the
+five-product main kernel, then an FP32 to output-dtype dQ conversion, for any
+query/key lengths (tail tiles are zero-filled on load and clipped on store). The main
+kernel writes dK/dV directly and accumulates dQ in FP32 caller workspace. The cast
+applies no additional scale.
 
 Other dense MHA declarations in the existing envelope retain the one-launch recompute
-implementation with zero workspace, including tails and negative scales.
+implementation with zero workspace, including negative scales and older CuTeDSL.
 Both dense paths decline declarations beyond safe Int32 tile rounding, Stats
 indexing or combined Q/KV grid bounds, or the tensor-map byte-stride range;
 the exact conservative limits are documented in the d128 backward API page.
 Both use the same prepared nine-buffer API and the caller's launch stream.
-The accumulation implementation requires `4*B*H*S_q*129 + 240` workspace
+The accumulation implementation requires `4*B*H*round_up(S_q,128)*129 + 240` workspace
 bytes; the extra 240 bytes align its internal payload to 256 bytes when the
 caller's allocation is only 16-byte aligned. `graph.get_workspace_size()` is
 the allocation contract. All scratch is initialized each execution.
@@ -347,7 +348,7 @@ the allocation contract. All scratch is initialized each execution.
 | Unmasked / top-left causal | ✅ |
 | IO layout | Compact BSHD rows; THD uses each port's ragged origins and ignores logical batch pitch |
 | Stats | Dense: contiguous FP32 natural-log LSE; THD: packed token-major or head-major with declared physical capacity |
-| Workspace / kernel launches | MHA: dense aligned accumulation / 3, retained dense recompute / 1, THD accumulation / 4. GQA/MQA: append native dK/dV partials and an FP32 group fold; dense / 4, THD / 5 |
+| Workspace / kernel launches | MHA: dense accumulation (any lengths) / 3, retained dense recompute (older CuTeDSL, non-positive scale) / 1, THD accumulation / 4. GQA/MQA: append native dK/dV partials and an FP32 group fold; dense / 4, THD / 5 |
 | THD MHA | ✅ cc 10.0 or 10.3, public CuTeDSL >= 4.8, positive FP32 scale, positive declared capacities; actual empty sequences and tails supported |
 | GQA / MQA | ✅ BF16 only, cc 10.0 or 10.3, public CuTeDSL >= 4.8, positive FP32 scale, Hq > Hkv with integral ratio; dense Sq/Skv must be multiples of 128, THD accepts tails and empty actual sequences |
 | Bottom-right causal, sliding window, dense padding mask, right-band widening | ❌ |

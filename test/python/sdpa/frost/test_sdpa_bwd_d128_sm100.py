@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Dense d128 backward: graph eligibility, one launch, zero workspace, replay."""
 
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -13,6 +15,17 @@ from test_sdpa_bwd_dsl_sm107 import _adapter, _bshd_empty, _build_graph, _causal
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 _ENGINE = "sdpa_bwd_sm100_d128"
+
+
+@contextmanager
+def _recompute_route():
+    """Pin the one-launch recompute kernel: SM100 / SM103 select accumulation for every dense shape, so its
+    coverage below forces the host-side selection the way an older compiler or a non-positive scale would."""
+    from cudnn.sdpa.bwd import api_dsl_sm100_d128
+    from cudnn.sdpa.bwd.d128_contract import RECOMPUTE
+
+    with mock.patch.object(api_dsl_sm100_d128, "select_implementation", return_value=RECOMPUTE):
+        yield
 
 
 def _spec():
@@ -126,6 +139,8 @@ def test_adapter_backstops_decline_unsupported_declarations(monkeypatch, kw, tok
 
 
 def _case(dt=torch.bfloat16, causal=False, b=1, h=2, sq=65, sk=129, seed=729, check_build=False, accumulation=False, scale=None):
+    """``accumulation`` True = the default accumulation route; False = pin the recompute kernel (``_recompute_route``);
+    None = leave the selection alone and expect recompute as the natural fallback (e.g. a negative scale)."""
     gen = torch.Generator(device="cpu").manual_seed(seed)
 
     def draw(s):
@@ -140,20 +155,23 @@ def _case(dt=torch.bfloat16, causal=False, b=1, h=2, sq=65, sk=129, seed=729, ch
         dk=_bshd_empty(b, sk, h, 128, dt, fill=float("nan")),
         dv=_bshd_empty(b, sk, h, 128, dt, fill=float("nan")),
     )
-    graph, refs, outputs = _build_graph(b=b, hq=h, sq=sq, skv=sk, d=128, dt=dt, use_causal_mask=causal, scale="default" if scale is None else scale)
-    select_engine(graph, _ENGINE)
-    before = torch.cuda.memory_allocated()
-    if check_build:
-        torch.cuda.set_sync_debug_mode("error")
-    try:
-        graph.check_support()
-        graph.build_plans()
-    finally:
+    # The implementation is chosen while the plans are created, so the pin spans the whole build.
+    with _recompute_route() if accumulation is False else nullcontext():
+        graph, refs, outputs = _build_graph(b=b, hq=h, sq=sq, skv=sk, d=128, dt=dt, use_causal_mask=causal, scale="default" if scale is None else scale)
+        select_engine(graph, _ENGINE)
+        before = torch.cuda.memory_allocated()
         if check_build:
-            torch.cuda.set_sync_debug_mode("default")
+            torch.cuda.set_sync_debug_mode("error")
+        try:
+            graph.check_support()
+            graph.build_plans()
+        finally:
+            if check_build:
+                torch.cuda.set_sync_debug_mode("default")
     if check_build:
         assert torch.cuda.memory_allocated() == before
-    required = 4 * b * h * sq * 129 + 240 if accumulation else 0
+    rounded = (sq + 127) // 128 * 128  # the accumulation workspace covers whole dQ tiles
+    required = 4 * b * h * rounded * 129 + 240 if accumulation else 0
     assert graph.get_workspace_size() == required
     refs.update(zip(("dq", "dk", "dv"), outputs))
     pack = {refs[n]: value for n, value in tensors.items()}
