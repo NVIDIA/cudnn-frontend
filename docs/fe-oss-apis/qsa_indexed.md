@@ -64,7 +64,7 @@ memory; saved state, outputs and FP32 gradient accumulators are additional.
 
 ## Complete blocks and causal tails
 
-For RedNote's top-512-block selection, backward can use the bounded-workspace
+For top-512-block selection, backward can use the bounded-workspace
 two-pass implementation through the same public entry point:
 
 ```python

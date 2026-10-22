@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Same-input comparison against the customer's unchanged grouped.py."""
+"""Same-input comparison against the public Relax implementation in grouped.py."""
 
 import argparse
 import importlib.util
