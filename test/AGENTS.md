@@ -1,5 +1,14 @@
 # test — Agent Guide
 
+MXFP8 backward's element-count allowance needs the same magnitude cap as its
+row-count allowance: an isolated large error can preserve amax and still fit
+the element budget. `assert_close_mxfp8_grad` caps every extra mismatch;
+`sdpa/test_mxfp8_grad_budget.py` pins a non-maximum 0-to-8 rejection and bounded
+row acceptance. When emulating the backward exponent's FP32 FFMA, round the
+scalar multiplier and the separately formed Stats term before the final fused
+rounding. Keep the independent dS-policy recipe bitwise and pin the exponent
+before exp2 in `sdpa/test_mxfp8_ref_quantize_ds.py`.
+
 For deterministic DSA indexer backward, cover large TopK with more than twice
 as many query rows as producer planes, so persistent CTAs consume at least
 three rows. Restore score inputs and poison workspace/outputs before each run;

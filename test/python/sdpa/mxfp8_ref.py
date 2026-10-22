@@ -212,6 +212,7 @@ def compute_ref_backward(q_fp8, q_t_fp8, k_fp8, k_t_fp8, v_fp8, o_f16, dO_f16, d
 
     from .mxfp8 import quantize_to_mxfp8
     _log2e = math.log2(math.e)
+    scale_log2e = torch.tensor(attn_scale * _log2e, dtype=torch.float32, device=device)
 
     dQ = torch.zeros((b, h_q, s_q, d_qk), dtype=torch.float32, device=device)
     dK = torch.zeros((b, h_k, s_kv, d_qk), dtype=torch.float32, device=device)
@@ -236,9 +237,11 @@ def compute_ref_backward(q_fp8, q_t_fp8, k_fp8, k_t_fp8, v_fp8, o_f16, dO_f16, d
         # in FP32 here rounds twice (product, then difference) and moves P by a few ulp, enough
         # to flip P*256 ~ 248.0 (the E4M3 midpoint between 240 and 256) on rows with P near 1:
         # bprop.mxfp8.dense test169 on SM103 lost 0.19 in one dV element that way. Evaluate the
-        # exponent in FP64 and round it once.
+        # exponent in FP64 and round it once, AFTER rounding the scalar multiplier and the
+        # separately computed Stats * log2(e) term to FP32, as the kernel does.
         if stats is not None:
-            x = (s_raw.double() * (attn_scale * _log2e) - lse.double() * _log2e).float()
+            lse_log2e = lse * _log2e
+            x = (s_raw.double() * scale_log2e.double() - lse_log2e.double()).float()
             p = torch.pow(2.0, x).nan_to_num().float()
         else:
             p = torch.exp(s_raw * attn_scale - lse).nan_to_num().float()

@@ -21,6 +21,7 @@ tile loop written out per tile.  No kernel runs; the SM100 MXFP8 GPU suite that 
 """
 
 import math
+import struct
 
 import pytest
 import torch
@@ -113,7 +114,12 @@ class _Problem:
         start, end, s_raw = blocks[0]
         lse = self.stats.float().reshape(b, h_q, s_q, 1)
         D = (self.o_f16.float() * self.dO_f16.float()).reshape(b, h_q, s_q, d).sum(dim=-1, keepdim=True)
-        p = torch.pow(2.0, s_raw * (self.scale * _LOG2E) - lse * _LOG2E).nan_to_num().float()
+        # Scalar conversion is independent of the oracle's tensor scalar construction. Round the FFMA's
+        # multiplier and separately formed Stats term first, then round the fused difference once.
+        scale_log2e = struct.unpack("f", struct.pack("f", self.scale * _LOG2E))[0]
+        shift = (lse * _LOG2E).double()
+        exponent = (s_raw.double() * scale_log2e - shift).float()
+        p = torch.pow(2.0, exponent).nan_to_num().float()
         p_fp8 = (p * 256.0).to(_E4M3).float() * (1.0 / 256.0)
         dP = _qk(dO_dq, v_dq[:, :, start:end, :], h_k)
         dS = p * (dP - D) * self.scale
@@ -173,6 +179,38 @@ def test_false_holds_ds_in_fp32_like_the_fp8_suites_recipe(prob):
     dq_t, dk_t, dv_t = prob.oracle(quantize_ds=True)
     assert not torch.equal(got[0], dq_t) and not torch.equal(got[1], dk_t), "the dS rounding must be visible in dQ / dK"
     assert torch.equal(got[2], dv_t), "dV does not depend on the dS treatment"
+
+
+@pytest.mark.parametrize("score, scale, stats", [(5.75, 0.125, 0.7504987120628357), (5.75, 1.0 / math.sqrt(112), 0.65)])
+def test_probability_exponent_uses_rounded_fp32_ffma_operands(monkeypatch, score, scale, stats):
+    """Pin the exponent before exp2/FP8 quantization: keep both operand roundings and one final fused rounding.
+
+    The first case sits at an E4M3 P midpoint; the second also checks a non-power-of-two attention scale.
+    The scalar FP32 recipe is independent of the reference's vector expression.
+    """
+    from sdpa import mxfp8_ref
+
+    def f32(x):
+        return struct.unpack("f", struct.pack("f", x))[0]
+
+    prob = _Problem()
+    prob.scale = scale
+    prob.stats.fill_(stats)
+    scores = torch.full((prob.b, prob.h_q, prob.s_q, prob.s_kv), score, dtype=torch.float32)
+    monkeypatch.setattr(mxfp8_ref, "_score_blocks", lambda *args: iter([(0, prob.s_kv, scores)]))
+    original_pow = torch.pow
+    exponents = []
+
+    def observe_pow(base, exponent, *args, **kwargs):
+        if isinstance(base, (int, float)) and base == 2.0 and exponent.shape == scores.shape:
+            exponents.append(exponent.clone())
+        return original_pow(base, exponent, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "pow", observe_pow)
+    prob.oracle(quantize_ds=False)
+    want = f32(f32(score) * f32(scale * _LOG2E) - f32(f32(stats) * f32(_LOG2E)))
+    assert len(exponents) == 1
+    assert torch.equal(exponents[0], torch.full_like(scores, want))
 
 
 def test_tile_32x32_is_one_e8m0_per_tile_along_both_orientations(prob):

@@ -130,6 +130,21 @@ def compare_amax(actual, expected, rtol=0.02, tag="amax"):
     print(f"amax: gpu={amax_gpu:.6e}, ref={amax_ref:.6e}, diff={amax_diff:.2e}, tol={amax_atol:.2e} for '{tag}'")
     return amax_diff < amax_atol
 
+def assert_close_mxfp8_grad(actual, expected, atol, rtol, tag, keys):
+    """Keep the FP8 mismatch-count budget, with the same 4*atol magnitude cap on EVERY budgeted element.
+
+    The shared comparison caps its row-budget arm only; its element-budget arm can admit an arbitrarily large
+    error. Preserve the ordinary elementwise tolerance and cap any extra mismatch before either budget can accept
+    it. This bounded allowance does not attribute an error to a code flip; lifting the cap would require reference
+    intermediate evidence. Non-finite values on either side are never allowed.
+    """
+    actual_f32, expected_f32 = actual.detach().float(), expected.detach().float()
+    diff = (actual_f32 - expected_f32).abs()
+    ordinary = diff <= atol + rtol * expected_f32.abs()
+    bounded = torch.isfinite(actual_f32) & torch.isfinite(expected_f32) & (ordinary | (diff <= 4 * atol))
+    assert bool(bounded.all()), f"{tag}: gradient error exceeds the ordinary tolerance and 4*atol budget cap ({4 * atol}); max |diff|={diff.max().item()}"
+    assert_close_fp8_grad(actual, expected, atol, rtol, tag=tag, keys=keys)
+
 def assert_o_within_one_p_code_flip(o_cmp, o_ref, atol, rtol, *, v_absmax, torch_itype, tag):
     """Magnitude cap for the budgeted O compare (assert_close_fp8_grad): its element-count branch admits a few elements
     with NO bound on their deviation, so cap every element first.  The kernel and the reference quantize P independently
@@ -1460,7 +1475,7 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle, *, plan_pin=None):
                 # d-row it feeds by one code step times the operand (assert_close_fp8_grad), e.g. one dS
                 # flip against a constant |Q| = 16 column shifted a whole dK row by 0.25 on SM103
                 # (bprop.mxfp8.dense test236).
-                assert_close_fp8_grad(actual, expected, 0.125, 0.20, tag=name, keys=keys)
+                assert_close_mxfp8_grad(actual, expected, 0.125, 0.20, tag=name, keys=keys)
 
             if with_sink_token and dSink_token_ref is not None:
                 dSink_err = compare_tensors(dSink_token_gpu, dSink_token_ref, 0.08, 0.20, "dSink_token")
