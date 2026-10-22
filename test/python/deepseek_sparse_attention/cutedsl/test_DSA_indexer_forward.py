@@ -1129,12 +1129,18 @@ def test_DSA_indexer_forward_imports_without_block_scaled_torch_dtypes():
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
     package_root = os.path.dirname(os.path.dirname(cudnn.__file__))
+    # The cudnn directory the indexer was imported from; a conftest may have put a source tree ahead of the installed
+    # package on cudnn.__path__.
+    source_cudnn = os.path.dirname(os.path.dirname(os.path.dirname(_block_scaled.__file__)))
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [package_root, os.environ.get("PYTHONPATH")]))}
     script = (
         "import torch\n"
         "for name in ('float8_e8m0fnu', 'float4_e2m1fn_x2'):\n"
         "    if hasattr(torch, name):\n"
         "        delattr(torch, name)\n"
+        "import cudnn\n"
+        f"if {source_cudnn!r} not in cudnn.__path__:\n"
+        f"    cudnn.__path__.insert(0, {source_cudnn!r})\n"
         "from cudnn.deepseek_sparse_attention.score_recompute import _block_scaled\n"
         f"assert _block_scaled.__file__ == {_block_scaled.__file__!r}, _block_scaled.__file__\n"
         "import cudnn.deepseek_sparse_attention.indexer_forward\n"
