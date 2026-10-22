@@ -70,6 +70,14 @@ existing paged KV graphs and split plans with NHD or HND pools and separate K/V
 page tables. Page counts, table and pool strides bind at execution time; the
 compiled pool layout and page size stay fixed.
 
+On exact SM107, nonpaged FP16/BF16 D128/V128 THD also supports explicit
+PackGQA with two CTAs and no split, using the existing shared SM100 body.
+Partial groups pack the largest divisor of the head ratio that divides the
+tile, as on SM100. Packed NH/HN and padded Stats retain their declared layout;
+the shared body applies scaling in-kernel and rejects pre-folded Q scaling.
+Automatic candidate proposals and placement are unchanged. The THD packing,
+mask/sink, padded-Stats and changed-length replay tests exercise this support.
+
 Paged K and V may independently use HND or NHD physical storage on every
 existing paged forward row: SM100/SM103 half D64/D128/D192x128/D256/D512,
 per-tensor FP8 D64/D128, MXFP8 D128/D192x128/D256/D512; SM107 half THD

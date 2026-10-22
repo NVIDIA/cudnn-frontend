@@ -874,8 +874,8 @@ def test_sm107_f16_split_coverage_and_pack_gqa_gate():
         ) != (128, 128), d
     for feature in (dict(thd=True, padded=True), dict(padded=True), dict(has_sink=True)):
         assert engines.mismatch(caps, _f16_facts(**feature), engines.SdpaFwdKnobs(split_kv=2)) is not None
-    # THD nonpaged d128 unsplit has no packed leg (dense d128 packs on the shared SM100 body since issue #1472, below).
-    assert engines.mismatch(caps, _f16_facts(thd=True, padded=True), engines.SdpaFwdKnobs(pack_gqa=True)) is not None
+    # D128 unsplit THD packing now shares the two-CTA SM100 body with dense packing.
+    assert engines.mismatch(caps, _f16_facts(thd=True, padded=True), engines.SdpaFwdKnobs(pack_gqa=True)) is None
 
     for d_qk, d_v, paged in ((128, 128, True), (192, 128, False)):
         facts = _f16_facts(d_qk=d_qk, d_v=d_v, thd=True, padded=True, has_paged_kv=paged, page_size=16 if paged else 0)
@@ -967,6 +967,26 @@ def test_sm107_paged_d256_pack_gqa_support_contract(dtype_name, group):
         assert engines.mismatch(caps, facts, dataclasses.replace(knobs, **changed)) is not None, changed
     blackwell = dataclasses.replace(facts, device_cc=(10, 0))
     assert engines.mismatch(_caps("sdpa_fwd_prefill_sm100"), blackwell, knobs) is not None
+
+
+@pytest.mark.parametrize("dtype_name", ["HALF", "BFLOAT16"])
+@pytest.mark.parametrize("group", [2, 4, 6, 8, 12, 16])
+def test_sm107_nonpaged_d128_thd_pack_gqa_contract(dtype_name, group):
+    """Explicit unsplit ragged packing serves both half types, including partial groups."""
+    import cudnn
+    from cudnn.sdpa.fwd import engines
+
+    dt = getattr(cudnn.data_type, dtype_name)
+    facts = _f16_facts(h_q=group * 2, h_kv=2, dtype=dt, dtype_o=dt, thd=True, padded=True)
+    caps = _caps("sdpa_fwd_prefill_sm107")
+    knobs = engines.SdpaFwdKnobs(cga=2, split_kv=1, pack_gqa=True)
+    for extra in ({}, dict(has_sink=True), dict(wants_stats=True, shape_overrides=True, max_total_seq_len_q=facts.b * facts.s_q)):
+        assert engines.mismatch(caps, dataclasses.replace(facts, **extra), knobs) is None
+    # Shared bodies apply scale in-kernel; accepting a pre-scaled Q would scale it twice.
+    assert "attn_scale_prefolded" in engines.mismatch(caps, dataclasses.replace(facts, attn_scale_prefolded=True), knobs)
+    for shape in ((192, 128), (256, 256), (512, 512)):
+        assert engines.mismatch(caps, dataclasses.replace(facts, d_qk=shape[0], d_v=shape[1]), knobs) is not None
+    assert engines.mismatch(caps, facts, dataclasses.replace(knobs, cga=1)) is not None
 
 
 def test_sm107_fp8_pack_gqa_is_d128_only():
@@ -5662,6 +5682,10 @@ def test_rubin_shared_dense_legs_decline_the_prefolded_scale_on_the_adapter(monk
         with pytest.raises(NotImplementedError, match="apply the scale in-kernel"):
             _gate_api(**common, softmax_scale_prefolded=True, scale_softmax=None, **kw).check_support()
     assert _gate_api(**common, cga=2, softmax_scale_prefolded=True, scale_softmax=None).check_support(), "the Rubin cga2 body keeps the fold"
+    ragged_pack = dict(common, thd=True, seq_kv_lens_present=True, cga=2, pack_gqa=True)
+    assert _gate_api(**ragged_pack).check_support()
+    with pytest.raises(NotImplementedError, match="apply the scale in-kernel"):
+        _gate_api(**ragged_pack, softmax_scale_prefolded=True, scale_softmax=None).check_support()
     with pytest.raises(NotImplementedError, match="decode tile"):
         _gate_api(**common, thd=True, seq_kv_lens_present=True, cga=1, split_kv=1).check_support()
 

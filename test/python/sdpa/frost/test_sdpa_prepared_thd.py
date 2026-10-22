@@ -119,6 +119,7 @@ def _thd_graph(
     arch="sm100",
     stats_head_stride=0,
     has_sink=False,
+    stats_log2=False,
 ):
     """A THD bf16 graph the way FlashInfer declares it: BHSD dims with ragged offsets, cu_seq_len
     lengths, token-major Stats. ``ragged_batch_stride`` mimics FlashInfer's small declared batch
@@ -152,6 +153,7 @@ def _thd_graph(
         v=tv,
         generate_stats=True,
         attn_scale=1.0 / math.sqrt(d),
+        stats_use_log2=stats_log2,
         use_causal_mask=causal,
         use_padding_mask=True,
         cu_seq_len_q=t_cu_q,
@@ -277,6 +279,101 @@ def test_thd_f16_plan_is_prepared_and_binds_the_variant_pack():
     o_ref, lse_ref = _reference(bufs, b, ql, kl, hq, hk, d)
     torch.testing.assert_close(bufs["o"].float(), o_ref, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(bufs["lse"], lse_ref, atol=1e-3, rtol=1e-3)
+
+
+@requires_blackwell
+@requires_dsl
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("head_major", [False, True])
+@pytest.mark.parametrize("stats_log2", [False, True])
+def test_rubin_ragged_pack_rebind_and_changed_lengths_replay(dtype, head_major, stats_log2):
+    """An explicit packed plan binds fresh storage and reads changed device prefixes on old captures."""
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("Rubin ragged packing qualification")
+    b, ql, kl, hq, hk, d = 3, 257, 1025, 12, 2, 128
+    cap = b * ql
+    dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
+    g, t = _thd_graph(b, ql, kl, hq, hk, d, dtype=dt, arch="sm107", stats_head_stride=cap if head_major else 0, stats_log2=stats_log2)
+    engine, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
+    knobs.update({cudnn.knob_type.PACK_GQA: 1, cudnn.knob_type.TILE_CGA_M: 2, cudnn.knob_type.SPLIT_KV: 1})
+    g.create_execution_plan(engine, knobs)
+    g.select_plan(g.get_execution_plan_count() - 1)
+    g.check_support()
+    g.build_plans()
+    ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
+
+    def inputs(seed):
+        bufs = _buffers(b, ql, kl, hq, hk, d, seed=seed, dtype=dtype)
+        if head_major:
+            bufs["lse"] = torch.empty(hq, cap, device=DEV)
+        return bufs
+
+    def lengths(bufs, qs, ks):
+        cq, ck = [0, *accumulate(qs)], [0, *accumulate(ks)]
+        bufs["cu_q"].copy_(torch.tensor(cq, dtype=torch.int32, device=DEV))
+        bufs["cu_kv"].copy_(torch.tensor(ck, dtype=torch.int32, device=DEV))
+        bufs["off_q"].copy_(bufs["cu_q"] * hq * d)
+        bufs["off_kv"].copy_(bufs["cu_kv"] * hk * d)
+        bufs["off_lse"].copy_(bufs["cu_q"] * (1 if head_major else hq))
+        # The unused allocation may contain NaNs; runtime prefixes delimit the live operands.
+        bufs["q"][cq[-1] :].fill_(torch.nan)
+        bufs["k"][ck[-1] :].fill_(torch.nan)
+        bufs["v"][ck[-1] :].fill_(torch.nan)
+        return cq, ck
+
+    def poison(bufs):
+        bufs["o"].fill_(19)
+        bufs["lse"].fill_(19)
+
+    def check(bufs, cq, ck):
+        torch.cuda.synchronize()
+        lse = bufs["lse"].T if head_major else bufs["lse"]
+        for i in range(b):
+            lo, hi, klo, khi = cq[i], cq[i + 1], ck[i], ck[i + 1]
+            if lo == hi:
+                continue
+            q = bufs["q"][lo:hi].transpose(0, 1).double()
+            k = bufs["k"][klo:khi].transpose(0, 1).double().repeat_interleave(hq // hk, 0)
+            v = bufs["v"][klo:khi].transpose(0, 1).double().repeat_interleave(hq // hk, 0)
+            score = q @ k.transpose(1, 2) / math.sqrt(d)
+            mask = torch.arange(khi - klo, device=DEV)[None, :] > torch.arange(hi - lo, device=DEV)[:, None]
+            score.masked_fill_(mask, -torch.inf)
+            out = (torch.nan_to_num(score.softmax(-1), nan=0.0) @ v).transpose(0, 1)
+            torch.testing.assert_close(bufs["o"][lo:hi].double(), out, atol=4e-3, rtol=4e-3)
+            expected_lse = score.logsumexp(-1).T * (math.log2(math.e) if stats_log2 else 1)
+            torch.testing.assert_close(lse[lo:hi].double(), expected_lse, atol=4e-4, rtol=0)
+        assert torch.all(bufs["o"][cq[-1] :] == 19)
+        assert torch.all(lse[cq[-1] :] == 19)
+
+    a, fresh = inputs(1907), inputs(1908)
+    qa, ka = lengths(a, [257, 0, 73], [1025, 0, 117])
+    qf, kf = lengths(fresh, [17, 129, 0], [65, 513, 0])
+    poison(a)
+    g.execute(_pack(t, a), ws)
+    check(a, qa, ka)
+    capture = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(capture):
+            g.execute(_pack(t, a), ws)
+        poison(fresh)
+        previous = torch.cuda.get_sync_debug_mode()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            g.execute(_pack(t, fresh), ws)
+        finally:
+            torch.cuda.set_sync_debug_mode(previous)
+        check(fresh, qf, kf)
+        # Rebinding another call must not retarget the old capture. Mutate its own data and prefixes.
+        a["q"].mul_(0.5)
+        a["v"].mul_(0.75)
+        qa, ka = lengths(a, [31, 7, 0], [40, 19, 0])
+        poison(a)
+        ws.fill_(255)
+        capture.replay()
+        check(a, qa, ka)
+        check(fresh, qf, kf)
+    finally:
+        capture.reset()
 
 
 @requires_pre_rubin_blackwell

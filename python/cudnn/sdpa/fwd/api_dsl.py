@@ -107,6 +107,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     supports_paged_split_sink,
     supports_paged_prefill_cga1,
     supports_paged_d256_pack_gqa,
+    supports_nonpaged_d128_thd_pack_gqa,
     _PAGED_KV_FLAVORS as _SM100_PAGED_KV_FLAVORS,
     TemplateParams as Sm100TemplateParams,
     SM100_THD_PACK_GQA_SHAPES,
@@ -704,8 +705,15 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
         # version-0 descriptor window) -- the dense twin of the single-CTA THD leg above (issue #1472).  THD_VARLEN at cga1
         # is the two-slab paged prefill (above) or the single-Q split (above); never this body.
         return _load_kernel_template(_SM100_DECODE_KERNEL_FILE, params, f"sdpa_fwd_sm107_{tag}_decode")
-    if rubin and not fp8 and flavor == _SM100_DECODE_FLAVOR and params.pack_gqa and not params.thd_varlen and not params.paged_kv:
-        # Dense packed d128 half at cga2 on cc 10.7: the shared SM100 prefill body (CfgD128 at cga2, 192 KiB) carries the
+    if (
+        rubin
+        and not fp8
+        and flavor == _SM100_DECODE_FLAVOR
+        and params.pack_gqa
+        and not params.paged_kv
+        and (not params.thd_varlen or (params.cta_mma == 2 and params.split_kv == 1))
+    ):
+        # Dense or unsplit ragged packed d128 half at cga2 on cc 10.7: the shared SM100 prefill body (192 KiB) carries the
         # PACK_GQA arm and the row_head_idx sink fold the Rubin sibling lacks (issue #1472); unpacked cga2 stays on the
         # sibling below.  Tag spelling keys the module cache: keep it distinct from the paged and single_q tags.
         return _load_kernel_template(_SM100_KERNEL_FILES[flavor], params, f"sdpa_fwd_sm107_{tag}_packed")
@@ -2085,6 +2093,18 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and (self.cga == 1 or self.pack_gqa)
         )
 
+    def _rubin_shared_thd_pack_leg(self) -> bool:
+        """Unsplit nonpaged D128 THD packing on the shared two-CTA body."""
+        return self.pack_gqa and supports_nonpaged_d128_thd_pack_gqa(
+            self.flavor,
+            device_cc=self._device_cc,
+            fp8=self._fp8,
+            thd=self.thd,
+            paged=self.paged,
+            cga=self.cga,
+            split_kv=self.split_kv,
+        )
+
     def check_support(self) -> bool:
         """Validate the call against the kernel contract on metadata alone (dtypes, shapes, strides, masks, knobs, the CGA
         width) and record the outcome in ``_is_supported``; raises the typed decline for an unsupported combination."""
@@ -2483,9 +2503,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 and not self._fp8
                 and not self.paged
                 and not self.packed_thd_split
+                and not self._rubin_shared_thd_pack_leg()
                 and not (self.flavor == _SM100_DECODE_FLAVOR and not self.thd)
                 and not self._decode_q_tile_for(int(s_qo), int(h_qo), int(h_kv)),
-                "Rubin half PackGQA requires paged KV, the D128 packed split, a dense D128 GQA graph without the pre-folded scale (the shared SM100 body), or the d256 decode tile (a decode-shaped graph: S_q x G packed rows within its routed envelope)",
+                "Rubin half PackGQA requires paged KV, the D128 packed split, an unsplit dense or ragged D128 GQA graph without the pre-folded scale (the shared SM100 body), or the d256 decode tile (a decode-shaped graph: S_q x G packed rows within its routed envelope)",
             )
             self._not_implemented_error_if(
                 self.thd
@@ -2501,7 +2522,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     split_kv=self.split_kv,
                 )
                 and not (
-                    (self._device_cc != (10, 7) or self.paged)
+                    (self._device_cc != (10, 7) or self.paged or self._rubin_shared_thd_pack_leg())
                     and not self._fp8
                     and (int(d_qk), int(d_v)) in SM100_THD_PACK_GQA_SHAPES
                     and (self.cga in (None, 2) or paged_prefill_cga1)
@@ -2510,9 +2531,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 "THD PackGQA requires half D128 cga2 unsplit/cga1 split, Rubin paged D128 cga1 unsplit, or Rubin paged D256 cga2 unsplit",
             )
             # Partial PackGQA (the largest divisor of the group that divides the
-            # tile) is wired in the pre-Rubin d128 / d256 f16 kernels only; every
-            # other flavor / quantization keeps the full-ratio contract.
-            _partial = not self._fp8 and self._device_cc != (10, 7) and self.flavor in _SM100_PARTIAL_PACK_GQA_FLAVORS
+            # tile) is wired in the shared SM100 d128 / d256 f16 kernels, including
+            # Rubin's unsplit ragged D128 reuse. Other flavors keep the full-ratio contract.
+            _partial = (not self._fp8 and self._device_cc != (10, 7) and self.flavor in _SM100_PARTIAL_PACK_GQA_FLAVORS) or self._rubin_shared_thd_pack_leg()
             # The d256 DECODE tile packs the WHOLE group whenever it fits its Q tile
             # (HEADS_PER_TILE = QH_PER_KH; 24/2 puts its 12 heads in the 16-row tile, four
             # tail rows zero-filled; two tokens x 12 heads in the 32-row tile on cc 10.7), so
@@ -2945,7 +2966,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self.softmax_scale_prefolded and self._scale_softmax_requested,
             "softmax_scale_prefolded: leave scale_softmax unset -- Q already carries attn_scale * log2(e) and the kernel applies no scale",
         )
-        if self.softmax_scale_prefolded and (self.paged or self.packed_thd_split or self._single_cta_half_leg() or self._rubin_shared_dense_leg()):
+        if self.softmax_scale_prefolded and (
+            self.paged or self.packed_thd_split or self._single_cta_half_leg() or self._rubin_shared_dense_leg() or self._rubin_shared_thd_pack_leg()
+        ):
             # These shared packed-split / single-CTA / paged / dense D128 half bodies
             # (_load_sm100_kernel_module), which apply the scale in-kernel.  A decline, so the plan walk
             # moves to the cga2 prefill body of the same flavor (engines.mismatch / effective_cgas mirror this rule).

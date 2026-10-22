@@ -528,6 +528,11 @@ def supports_paged_d256_pack_gqa(d_shape, *, device_cc, fp8, thd, paged, cga, sp
     return device_cc == (10, 7) and d_shape == (256, 256) and not fp8 and thd and paged and cga in (None, 2) and split_kv == 1
 
 
+def supports_nonpaged_d128_thd_pack_gqa(d_shape, *, device_cc, fp8, thd, paged, cga, split_kv):
+    """Rubin's unsplit ragged D128 packing uses the shared two-CTA half body."""
+    return device_cc == (10, 7) and d_shape == (128, 128) and not fp8 and thd and not paged and cga in (None, 2) and split_kv == 1
+
+
 def d256_mxfp8_pair_leg(*, device_cc, pertensor, thd, paged, split_kv) -> bool:
     """The d256 MXFP8 legs that run the 2-CTA pair (cta_group::2, K/V halved per CTA) on cc 10.7: dense queries,
     unsplit, not THD, not paged.  Measured 2026-10-12 on cc 10.7 (B1 H32/8 GQA, CUDA-graph replay interleaved with the
