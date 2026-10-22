@@ -112,11 +112,8 @@ def test_compressed_indexer_mxfp8_rejects_unsupported_qhead_group_before_launch(
 def test_indexer_mxfp4_rejects_unsupported_qhead_group_before_launch(layout, qhead_per_kv_head):
     """An MXFP4 head group outside (4, 8, 16, 32, 64) declines on the host from both the dense and top-k wrappers."""
     _require_mxfp4_indexer()
-    try:
-        from cudnn import DSA
-        from deepseek_sparse_attention.cutedsl.mxfp8_scale_reference import pack_k_scale_bshd, pack_q_scale_bshd
-    except ImportError:
-        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed", exc_type=ImportError).DSA
+    from deepseek_sparse_attention.cutedsl.mxfp8_scale_reference import pack_k_scale_bshd, pack_q_scale_bshd
 
     device = torch.device("cuda")
     s_q, s_k, d = 8, 2, 128
@@ -1490,10 +1487,7 @@ def test_DSA_compressed_indexer_forward_thd_mxfp8_lse(deterministic, h_q):
 def test_DSA_compressed_indexer_forward_thd_mxfp4_lse(deterministic, h_q):
     """THD MXFP4 top-k indices, logits, preallocated LSE and fused softmax match the fp64 reference on the dequantized Q/K."""
     _require_mxfp4_indexer()
-    try:
-        from cudnn import DSA
-    except ImportError:
-        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed", exc_type=ImportError).DSA
 
     device = torch.device("cuda")
     shapes = [(127, 32), (129, 64)]
@@ -1559,10 +1553,7 @@ def test_DSA_compressed_indexer_forward_thd_mxfp4_lse(deterministic, h_q):
 @pytest.mark.L0
 def test_DSA_compress_topk_cand_buffer_size_block_scaled_is_single_launch():
     """Block-scaled sizing never microbatches and admits the launch's query tail of up to ratio - 1 tokens past ratio * seqlen_k."""
-    try:
-        from cudnn import DSA
-    except ImportError:
-        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed", exc_type=ImportError).DSA
 
     b, s_q, s_k, ratio = 1, 32768, 8192, 4
     full = DSA.compress_topk_cand_buffer_size(b, s_q, s_k, ratio, microbatch_rows=0)
@@ -1595,11 +1586,8 @@ def test_DSA_compress_topk_cand_buffer_size_block_scaled_is_single_launch():
 def test_DSA_compressed_indexer_forward_bshd_mxfp4_lse(h_q, offsets):
     """BSHD MXFP4 top-k indices, logits, LSE and fused softmax match the fp64 reference, with and without per-batch causal offsets."""
     _require_mxfp4_indexer()
-    try:
-        from cudnn import DSA
-        from deepseek_sparse_attention.cutedsl.mxfp8_scale_reference import pack_k_scale_bshd, pack_q_scale_bshd
-    except ImportError:
-        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed", exc_type=ImportError).DSA
+    from deepseek_sparse_attention.cutedsl.mxfp8_scale_reference import pack_k_scale_bshd, pack_q_scale_bshd
 
     device = torch.device("cuda")
     b, s_q, s_k, d = 2, 128, 64, 128

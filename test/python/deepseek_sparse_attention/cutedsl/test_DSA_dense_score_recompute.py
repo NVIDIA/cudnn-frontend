@@ -966,11 +966,8 @@ def test_DSA_dense_score_recompute_wrapper_thd_mxfp8_compact_padded_scales(
 @torch_fork_set_rng(seed=31)
 def test_DSA_dense_indexer_score_recompute_wrapper_mxfp4_matches_dequant_reference(h_q, b, s_q, s_k, ratio, offsets):
     """MXFP4 dense indexer scores and LSE match an FP32 reference on dequantized inputs; signed weights pin the ReLU before weighting."""
-    try:
-        from cudnn import DSA
-        from cuda.bindings import driver as cuda
-    except ImportError:
-        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed", exc_type=ImportError).DSA
+    cuda = pytest.importorskip("cuda.bindings.driver", reason="Environment not supported: cudnn[cutedsl] not installed", exc_type=ImportError)
     _require_mxfp4_indexer()
 
     from deepseek_sparse_attention.cutedsl import mxfp8_scale_reference as scale_utils
@@ -1027,11 +1024,8 @@ def test_DSA_dense_indexer_score_recompute_wrapper_mxfp4_matches_dequant_referen
 )
 def test_DSA_dense_indexer_score_recompute_wrapper_thd_mxfp4_compact_padded_scales(h_q, shapes, offsets, q_alignment):
     """THD MXFP4 dense indexer scores and LSE match the per-segment reference through compact padded scale prefixes."""
-    try:
-        from cudnn import DSA
-        from cuda.bindings import driver as cuda
-    except ImportError:
-        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed", exc_type=ImportError).DSA
+    cuda = pytest.importorskip("cuda.bindings.driver", reason="Environment not supported: cudnn[cutedsl] not installed", exc_type=ImportError)
     _require_mxfp4_indexer()
 
     device = torch.device("cuda")
@@ -1104,10 +1098,7 @@ def test_DSA_dense_indexer_score_recompute_wrapper_thd_mxfp4_compact_padded_scal
 @pytest.mark.L0
 def test_DSA_dense_score_recompute_wrapper_mxfp4_rejects_mismatched_inputs():
     """MXFP4 dense indexer score inputs that break the contract are refused on the host; the dense attention score declines MXFP4."""
-    try:
-        from cudnn import DSA
-    except ImportError:
-        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed", exc_type=ImportError).DSA
     _require_mxfp4_indexer()
 
     from deepseek_sparse_attention.cutedsl import mxfp8_scale_reference as scale_utils
@@ -1179,10 +1170,7 @@ def test_DSA_dense_score_recompute_wrapper_mxfp4_rejects_mismatched_inputs():
 @pytest.mark.L0
 def test_DSA_dense_attn_score_recompute_wrapper_mxfp8_rejects_mismatched_inputs(request):
     """MXFP8 dense attention score inputs that break the contract are refused on the host."""
-    try:
-        from cudnn import DSA
-    except ImportError:
-        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed", exc_type=ImportError).DSA
 
     from deepseek_sparse_attention.cutedsl import mxfp8_scale_reference as scale_utils
 
@@ -1215,10 +1203,9 @@ def test_DSA_dense_indexer_score_recompute_wrapper_sm90_declines_block_scales(mo
     """On SM90 the dense indexer score declines the block-scaled precisions and stray block scales as SM100-only."""
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
-    try:
-        from cudnn.deepseek_sparse_attention.score_recompute import api
-    except ImportError:
-        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    api = pytest.importorskip(
+        "cudnn.deepseek_sparse_attention.score_recompute.api", reason="Environment not supported: cudnn[cutedsl] not installed", exc_type=ImportError
+    )
 
     monkeypatch.setattr(api, "device_capability", lambda device=None: (9, 0))
     q = torch.zeros(1, 8, 64, 128, dtype=torch.bfloat16, device="cuda")
