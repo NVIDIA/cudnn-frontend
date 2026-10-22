@@ -61,7 +61,7 @@ import cuda.bindings.driver as cuda_driver
 import cutlass
 import cutlass.cute as cute
 import cutlass.experimental.cuda as cuda
-from cutlass._mlir.dialects import nvvm
+from cutlass._mlir.dialects import llvm, nvvm
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.experimental import primitives as prims
 
@@ -377,6 +377,23 @@ def warpgroup_barrier_sync(barrier_id: int, thread_count: int, *, loc=None, ip=N
         loc=loc,
         ip=ip,
     )
+
+
+@cute.jit
+def opaque_f64(value):
+    """``value`` behind a ``mov.b64`` the optimizer cannot see through, so it cannot recompute the value where it is
+    used and must keep it live (tile_dsl.pointwise.opaque_f32_zero is the FP32 twin). Raw ``llvm.inline_asm``, as
+    tile_dsl/wgmma.py issues the RS WGMMA."""
+    moved = llvm.inline_asm(
+        cutlass.Float64.mlir_type,
+        [value.ir_value()],
+        "mov.b64 $0, $1;",
+        "=d,d",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return cutlass.Float64(moved)
 
 
 @cute.jit
@@ -1405,6 +1422,11 @@ class SM90FusedMultiHeadAttentionForward:
         the launch only."""
         scale_log2 = scale * cutlass.Float32(LOG2_E)
         scale_log2_wide = cutlass.Float64(scale) * cutlass.Float64(LOG2_E)
+        if cutlass.const_expr(self.mask_flags & MASK_CAUSAL):
+            # A causal persistent record with two Q tiles had NVVM recompute this product inside the KV loop (the scale
+            # reloaded, F2F and DMUL ahead of the wide test, every step), and that FP64 multiply waits behind the other
+            # warpgroup's WGMMA. Behind an asm move it stays a per-CTA value the compiler cannot rematerialize.
+            scale_log2_wide = opaque_f64(scale_log2_wide)
         wide_uniform, wide_limit = cutlass.Boolean(False), cutlass.Float32(0.0)
         if cutlass.const_expr(self.scale_mode == SCALE_POSITIVE):
             # Launch-uniform: decide the scale-only guard once, in setup. The row limit is
