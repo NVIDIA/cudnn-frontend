@@ -113,7 +113,10 @@ bitmap. Metadata sizes are reported separately where applicable; peak extra
 allocation includes outputs and workspace, not just sparse records. The JSON
 also records hostname, scheduler allocation, GPU memory/SM count, and a full
 `nvidia-smi -q` snapshot so production GPU provenance and operating limits can
-be checked. These figures are synthetic attention measurements.
+be checked. If that optional CLI is unavailable or fails, the report retains
+`nvidia_smi=null` and `nvidia_smi_error`; CUDA validation and timing can still
+proceed. Such a report needs separate hardware verification before claiming
+production GPU qualification. These figures are synthetic attention measurements.
 
 For selector and route-expansion attribution, run Relax's own unchanged
 `examples/models/qwen3.8-flash-next/benchmark_qsa.py` with both `--selector eager`

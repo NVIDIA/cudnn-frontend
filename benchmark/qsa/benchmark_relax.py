@@ -23,6 +23,15 @@ def load(path, name):
     return module
 
 
+def nvidia_smi_snapshot():
+    """Keep optional CLI diagnostics from preventing CUDA benchmark execution."""
+    try:
+        result = subprocess.run(["nvidia-smi", "-q"], capture_output=True, text=True, check=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as error:
+        return {"nvidia_smi": None, "nvidia_smi_error": str(error)}
+    return {"nvidia_smi": result.stdout, "nvidia_smi_error": None}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--relax-source", type=Path, required=True, help="Directory containing unchanged grouped.py and selector.py")
@@ -167,7 +176,7 @@ def main():
         cc=torch.cuda.get_device_capability(),
         hostname=socket.gethostname(),
         allocation={key: os.environ.get(key) for key in ("SLURM_JOB_ID", "SLURM_JOB_NODELIST", "SLURM_JOB_GPUS", "CUDA_VISIBLE_DEVICES")},
-        nvidia_smi=subprocess.run(["nvidia-smi", "-q"], capture_output=True, text=True, check=True).stdout,
+        **nvidia_smi_snapshot(),
         torch=torch.__version__,
         torch_cuda=torch.version.cuda,
         cudnn_backend=cudnn.backend_version(),
