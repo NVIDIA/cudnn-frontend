@@ -64,7 +64,10 @@ THD_CTR_OFF = lambda b: 4 * b + 3  # noqa: E731    persistent-scheduler claim co
 #
 #   [ ...the forward layout... | row_off(B+1) ]
 THD_ROWOFF_OFF = lambda b: 4 * b + 4  # noqa: E731
-THD_BWD_META_WORDS = lambda b: 5 * b + 5  # noqa: E731
+# ... | row_off(B+1) | unit prefix(B+1) ]: the backward's remap-ordered unit prefix (write_thd_work_prefix with
+# prefix0=THD_BWD_WORK_PREFIX_OFF; Q- or KV-blocked units through cu0) that thd_decode_unit_prefix binary-searches.
+THD_BWD_WORK_PREFIX_OFF = lambda b: 5 * b + 5  # noqa: E731
+THD_BWD_META_WORDS = lambda b: 6 * b + 6  # noqa: E731
 
 # --- optional TENSOR-MAP extension -----------------------------------------
 # For a launch ABI with no descriptor operand: the ``B + 3`` tensor maps follow the
@@ -346,24 +349,31 @@ def write_thd_live_and_ctr(
 
 
 @cute.jit
-def write_thd_work_prefix(meta, n_batch, n_qh, unit_rows, n_ctas, tidx, splits: cutlass.Constexpr[int]):
+def write_thd_work_prefix(meta, n_batch, n_qh, unit_rows, n_ctas, tidx, splits: cutlass.Constexpr[int], cu0=None, prefix0=None):
     """Prepare a remap-ordered tile prefix in the existing setup launch.
 
     Each entry counts query-tile/head work before splitting. A single batch
     needs no lookup table and retains the existing live-count fast path.
     The caller has barriered after publishing Q prefixes and batch remapping.
+
+    ``cu0`` / ``prefix0`` (appended, defaults = the forward layout): the prefix
+    the units are counted along (``cu0 = 2B + 1`` for kv-block units) and the
+    word the table is written at (``THD_BWD_WORK_PREFIX_OFF`` in the backward
+    layout, where ``row_off`` occupies the forward slot).
     """
     if n_batch <= cutlass.Int32(1):
-        write_thd_live_and_ctr(meta, n_batch, n_qh, unit_rows, n_ctas, tidx, splits)
+        write_thd_live_and_ctr(meta, n_batch, n_qh, unit_rows, n_ctas, tidx, splits, cu0=cu0)
     elif tidx < cutlass.Int32(32):
-        prefix0 = THD_WORK_PREFIX_OFF(n_batch)
+        # Fresh names: a parameter rebound to another type inside this region fails the DSL's region join.
+        cuq0 = n_batch if cutlass.const_expr(cu0 is None) else cu0
+        pfx0 = THD_WORK_PREFIX_OFF(n_batch) if cutlass.const_expr(prefix0 is None) else prefix0
         carry = cutlass.Int32(0)
         for start in cutlass.range(0, n_batch, 32, unroll=1):
             rank = start + tidx
             work = cutlass.Int32(0)
             if rank < n_batch:
                 b = cutlass.Int32(meta[THD_REMAP_OFF(n_batch) + rank])
-                q_len = cutlass.Int32(meta[n_batch + b + 1]) - cutlass.Int32(meta[n_batch + b])
+                q_len = cutlass.Int32(meta[cuq0 + b + 1]) - cutlass.Int32(meta[cuq0 + b])
                 work = ((q_len + unit_rows - 1) // unit_rows) * n_qh
             for bit in cutlass.range_constexpr(5):
                 delta = 1 << bit
@@ -372,10 +382,10 @@ def write_thd_work_prefix(meta, n_batch, n_qh, unit_rows, n_ctas, tidx, splits: 
                     work = work + prior
             prefix = carry + work
             if rank < n_batch:
-                meta[prefix0 + rank + 1] = prefix
+                meta[pfx0 + rank + 1] = prefix
             carry = cute.arch.shuffle_sync(prefix, 31)
         if tidx == cutlass.Int32(0):
-            meta[prefix0] = cutlass.Int32(0)
+            meta[pfx0] = cutlass.Int32(0)
             meta[THD_LIVE_OFF(n_batch)] = carry * cutlass.Int32(splits)
             meta[THD_CTR_OFF(n_batch)] = n_ctas
 
@@ -443,6 +453,8 @@ def thd_decode_unit_prefix(
     n_qh: cutlass.Int32,
     q_tile: cutlass.Int32,
     reverse_rows: bool,
+    cu0=None,
+    prefix0=None,
 ) -> tuple:
     """:func:`thd_decode_unit`'s ``(q_tile_idx, batch, head)`` through the remap-ordered work prefix
     :func:`write_thd_work_prefix` published at ``THD_WORK_PREFIX_OFF`` -- a binary search over ``B + 1``
@@ -454,26 +466,27 @@ def thd_decode_unit_prefix(
     (the setup launch's ``cga_tile_m`` / ``n_qh``), a uid past the live total keeps ``batch == n_batch``,
     the head is the major axis within a sequence (consecutive units sweep one head's tiles) and
     ``reverse_rows`` walks a sequence's tiles from the diagonal back.  ``n_batch == 1`` reads no prefix
-    (the setup launch publishes only the live total there).  KV-prefix units (``cu0 = 2B + 1``) are not
-    served here: their prefix is not the one the setup launch writes.
+    (the setup launch publishes only the live total there).  ``cu0`` / ``prefix0`` (defaults = the forward
+    layout) select the prefix the units run along (``2B + 1`` for kv-block units) and the table's word --
+    the SAME pair the setup launch's :func:`write_thd_work_prefix` was given.
     """
-    cuq0 = n_batch
+    cuq0 = n_batch if cutlass.const_expr(cu0 is None) else cu0
     remap0 = THD_REMAP_OFF(n_batch)
-    prefix0 = THD_WORK_PREFIX_OFF(n_batch)
+    pfx0 = THD_WORK_PREFIX_OFF(n_batch) if cutlass.const_expr(prefix0 is None) else prefix0
     b, local = n_batch, cutlass.Int32(0)
     if n_batch == cutlass.Int32(1):
         b, local = cutlass.Int32(0), uid
     elif n_batch > cutlass.Int32(1):
-        if uid < cutlass.Int32(meta[prefix0 + n_batch]):
+        if uid < cutlass.Int32(meta[pfx0 + n_batch]):
             lo, hi = cutlass.Int32(0), n_batch
             while lo < hi:
                 mid = (lo + hi) >> 1
-                if cutlass.Int32(meta[prefix0 + mid + 1]) <= uid:
+                if cutlass.Int32(meta[pfx0 + mid + 1]) <= uid:
                     lo = mid + 1
                 else:
                     hi = mid
             b = cutlass.Int32(meta[remap0 + lo])
-            local = uid - cutlass.Int32(meta[prefix0 + lo])
+            local = uid - cutlass.Int32(meta[pfx0 + lo])
     f_batch, f_head, f_qt = n_batch, cutlass.Int32(0), cutlass.Int32(0)
     if b < n_batch:
         s_b = cutlass.Int32(meta[cuq0 + b + cutlass.Int32(1)]) - cutlass.Int32(meta[cuq0 + b])
@@ -676,6 +689,7 @@ __all__ = [
     "THD_BWD_MAPS_META_WORDS",
     "THD_BWD_MAPS_OFF",
     "THD_BWD_META_WORDS",
+    "THD_BWD_WORK_PREFIX_OFF",
     "THD_CTR_OFF",
     "THD_LIVE_OFF",
     "THD_MAPS_META_WORDS",

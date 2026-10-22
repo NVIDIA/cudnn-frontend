@@ -20,6 +20,7 @@ from cuda.bindings import driver as cuda
 from cudnn.api_base import APIBase, TensorDesc, TupleDict
 from cudnn.frost.template_loader import load_template
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16
+from cudnn.frost.tile_dsl.thd import THD_BWD_META_WORDS
 from cudnn.sdpa.bwd.config_sm120 import (
     ROW_ROUND as _SM120_ROW_ROUND,
     SEQ_KV_TILES as _SM120_KV_TILES,
@@ -2210,7 +2211,7 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             # descriptor scratches the kernels patch for themselves.
             delta = ws_align(self.h_q * (-(-self._t_q_cap // 128) * 128) * 4)
             ws = ws_align(self._qh_chunk * self._ws_rows_cap * self._skv_pad * self._bpe)
-            meta = ws_align((5 * self.batch_size + 5) * 4)
+            meta = ws_align(THD_BWD_META_WORDS(self.batch_size) * 4)
             desc = ws_align(_THD_STAGE2_DESC_SLOTS * 128) + ws_align((self.batch_size + 1) * 128)
             total = delta + 2 * ws + meta + desc
         else:

@@ -19,6 +19,7 @@ import math
 
 import pytest
 import torch
+from cudnn.frost.tile_dsl.thd import THD_BWD_META_WORDS
 
 from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell
 
@@ -983,6 +984,7 @@ _STAGE2_PROBE_BODY = r"""
 import cutlass
 import cutlass.cute as cute
 from cudnn.frost.template_loader import load_template
+from cudnn.frost.tile_dsl.thd import THD_BWD_META_WORDS
 from cudnn.frost.tile_dsl.constants import DTYPE_FP16
 from cudnn.sdpa.bwd.api_dsl import _sm100_kernel_path
 from cudnn.sdpa.bwd.config_sm100 import TemplateParams, TemplateParams2x2, TemplateParamsDbg
@@ -1005,7 +1007,7 @@ def probe(entry: cutlass.Constexpr, q_ptr: cute.Pointer, k_ptr: cute.Pointer, v_
     row = cute.make_layout((B, H, S), stride=(H * S, S, 1))
     entry(cute.make_tensor(q_ptr, bshd), cute.make_tensor(k_ptr, bshd), cute.make_tensor(v_ptr, bshd), cute.make_tensor(do_ptr, bshd),
           cute.make_tensor(s_ptr, ws), cute.make_tensor(ds_ptr, ws), cute.make_tensor(lse_ptr, row), cute.make_tensor(dd_ptr, row),
-          cute.make_tensor(meta_ptr, cute.make_layout((5 * B + 5,), stride=(1,))), cute.make_tensor(desc_ptr, cute.make_layout((64,), stride=(1,))),
+          cute.make_tensor(meta_ptr, cute.make_layout((THD_BWD_META_WORDS(B),), stride=(1,))), cute.make_tensor(desc_ptr, cute.make_layout((64,), stride=(1,))),
           PROBLEM, cutlass.Float32(0.5), cutlass.Float32(0.7), cutlass.Float32(0.5), cutlass.Int32(0), cutlass.Int32(0), stream)
 
 def ptr(t, align=16):

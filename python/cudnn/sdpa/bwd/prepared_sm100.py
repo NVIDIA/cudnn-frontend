@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
 from cudnn.frost.compiled_cache import positional_entry
+from cudnn.frost.tile_dsl.thd import THD_BWD_META_WORDS
 from .prepared import BwdLaunchSpec, Operand, ROLES
 
 
@@ -66,7 +67,7 @@ def compile_plan(api, stage2, mm_lo, mm_hi):
     delta = region((actual_batch, h, (tq + 127) // 128 * 128), 4)
     scores = region((actual_batch, api._qh_chunk, rows, api._skv_pad), 2)
     dscores = region((actual_batch, api._qh_chunk, rows, api._skv_pad), 2)
-    meta = region((5 * b + 5 if api.thd else b,), 4)
+    meta = region((THD_BWD_META_WORDS(b) if api.thd else b,), 4)
     desc2 = region((4 * 16 if api.thd else 1,), 8)
     desc3 = region(((b + 1) * 16,), 8) if api.thd else None
     dkw = region((actual_batch, tk, h, d), 2) if hk != h else None
