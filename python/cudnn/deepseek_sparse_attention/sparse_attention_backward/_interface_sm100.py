@@ -323,8 +323,8 @@ def _compile_deterministic_sm100(
     """Compile one device-owned, shape-dynamic artifact from plan metadata.
 
     Query and KV extents remain symbolic, while dtype, head geometry, top-k
-    width, optional-length presence, plane count, and relay width are
-    compile-time facts.
+    width, optional-length presence, plane count, relay width, and address
+    width are compile-time facts.
     The returned launchable belongs to ``device_index``'s CUDA context and may
     be reused only for plans with the same cached signature.
     """
