@@ -446,6 +446,17 @@ class RandomizationContext:
         randoms_.d_qk, randoms_.d_v = randoms["d_qk_d_v"]
         randoms_.h_q, randoms_.h_k, randoms_.h_v = randoms["head_count"]
 
+        # Optional joint bound on b * h_q * s_q * s_kv. The backend's deterministic
+        # backward workspace and the dBias gradient are both (b, h_q, s_q, s_kv)-sized,
+        # so a suite that fuzzes long sequences shrinks the batch of a draw that
+        # would otherwise not fit, instead of lowering its sequence cap for every
+        # draw. Applied before the per-batch lengths, which are drawn per batch.
+        max_score_cells = randoms.get("max_score_cells")
+        if max_score_cells is not None:
+            per_batch = randoms_.h_q * randoms_.s_q * randoms_.s_kv
+            if per_batch > 0:
+                randoms_.batches = max(1, min(randoms_.batches, max_score_cells // per_batch))
+
         randoms_.is_ragged = randoms["is_ragged_or_padded_or_full"] in ("ragged", "cu_ragged", "ragged_mult", "cu_ragged_mult")
         randoms_.is_padding = randoms["is_ragged_or_padded_or_full"] in ("padded", "ragged", "cu_padded", "cu_ragged", "ragged_mult", "cu_ragged_mult")
         randoms_.is_cu_seq_len = randoms["is_ragged_or_padded_or_full"] in ("cu_padded", "cu_ragged", "cu_ragged_mult")

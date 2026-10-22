@@ -1382,3 +1382,67 @@ def test_an_e4m3_indexer_cache_declaration_appends_its_slots_and_the_cache_dtype
             blk.execute(*args, ws, w_iq_norm=w, w_ik_norm=w, index_k_compressed=kb(5, _E4M3))
         with pytest.raises(RuntimeError, match="call compile"):
             blk.execute(*args, ws, w_iq_norm=w, w_ik_norm=w)
+
+
+@_needs_dsl_floor  # the block's stage (1) answers here (its CuTe DSL GEMM is compiled): skip, never fail, below the floor
+@requires_rubin
+@pytest.mark.parametrize("b, s", [(4, 1), (1, 128)], ids=["B4-Sq1-T4", "B1-S128-T128"])
+def test_unfused_projection_band_slab_takes_the_small_m_route_capture_safe_and_flag_free_at_decode_row_counts(monkeypatch, b, s):
+    """Stage (1) at N = 13952 at DECODE row counts (``T = B x S_q <= 128``): the slab GEMM takes the small-M route's 128-row
+    swap-AB tile (13952 = 109 x 128 on the route's overflow branch -- the one N off the 256 grid it names a tile for), so the stage
+    compiles with ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES`` DELETED from the environment (the suite's conftest sets it per test; the
+    flag is read live at compile) and with ``capture_safe=True`` on the stage (what the paged serving declaration sets) on the
+    ``jit-only`` route at the route's own name -- no ranked list, no cuDNN handle created.  The band equals ``h @ W_i^T`` to the GEMM
+    suite's bf16 bar and the four dense bands equal the four-band projection's over the same rows, as in the prefill cell above;
+    the raw indexer key reads back as the zero-copy view at the band's last 128 columns."""
+    from cudnn.gated_attention_block.api import _qkv_gate_projection
+    from cudnn.gated_attention_block.kernels import proj_gemm
+    from cudnn.gated_attention_block.kernels.proj_gemm import _FORCED_TILE_NAME, small_m_tile_config
+
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    dev = "cuda"
+    geom, dense = GEOM_BAND, GEOM_DENSE
+    t, dm = b * s, geom.d_model
+    gen = torch.Generator(device=dev).manual_seed(1)
+    rnd = lambda *shape, std=0.02: (torch.randn(*shape, generator=gen, device=dev, dtype=torch.float32) * std).to(torch.bfloat16)  # noqa: E731
+    h = rnd(b, s, dm, std=1.0)
+    w_dense = rnd(dense.n_qkvg, dm)
+    w_i = rnd(geom.qsa.index_band_cols, dm)
+    w_qkvg = torch.cat([w_dense, w_i], dim=0).contiguous()
+    stream = torch.cuda.current_stream().cuda_stream
+    handles_before = dict(proj_gemm._GRAPH_HANDLES)
+    expect = small_m_tile_config(t, geom.n_qkvg, dm, dtype=torch.bfloat16)  # the live part's SM count: the overflow branch below 218 SMs
+    assert expect is not None and expect != _FORCED_TILE_NAME and expect.startswith("CONFIG_sm100_128x") and expect.endswith("_swapAB"), expect
+
+    def project(block_geom, weight):
+        st = _qkv_gate_projection(block_geom, batch=b, seq_len=s, dtype=torch.bfloat16)
+        assert st.resolves_a_jit_tile()
+        st.capture_safe = True  # the paged serving declaration's flag on the stage
+        st.check_support()
+        st.compile()
+        assert st._plan.capture_safe and st._plan.route == "jit-only" and st._plan.jit is not None, (st._plan.route, st._plan.jit)
+        assert st._plan.graph.plans == [], "the capture-safe stage built a ranked list"
+        proj = torch.full((t, block_geom.n_qkvg), float("nan"), device=dev, dtype=torch.bfloat16)
+        ws = torch.empty(max(st.workspace_bytes(), 16), dtype=torch.uint8, device=dev)
+        st.execute(h.view(t, dm), weight, proj, ws, stream=stream)
+        torch.cuda.synchronize()
+        return st, proj
+
+    st5, proj = project(geom, w_qkvg)
+    st4, proj4 = project(dense, w_dense)
+    assert st5._plan.tile_config_name == expect, (st5._plan.tile_config_name, expect)
+    assert st4._plan.tile_config_name == small_m_tile_config(t, dense.n_qkvg, dm, dtype=torch.bfloat16)
+    assert dict(proj_gemm._GRAPH_HANDLES) == handles_before, "the jit-only route created a cuDNN handle"
+    assert proj.shape == (t, 13952) and torch.isfinite(proj.float()).all()
+    ref = h.view(t, dm).double() @ w_qkvg.double().t()
+    o_i = geom.qkvg_offsets[ProjBlock.INDEX]
+    band, ref_band = proj[:, o_i:].float(), ref[:, o_i:].float()
+    err, scale = (band - ref_band).abs(), ref_band.abs().max().item()
+    cos_band = torch.nn.functional.cosine_similarity(band.flatten(), ref_band.flatten(), dim=0).item()
+    print(f"\n[T={t}] band slab on {st5._plan.tile_config_name}: band cos {cos_band:.7f}, max|err| {err.max().item():.3e} (scale {scale:.3e})")
+    assert cos_band > 0.9999
+    assert err.max().item() <= 2.0 * scale * 2.0**-8 + 1e-3 * scale
+    err_d, scale_d = (proj[:, :o_i].float() - proj4.float()).abs(), proj4.float().abs().max().item()
+    assert err_d.max().item() <= 2.0 * scale_d * 2.0**-8 + 1e-3 * scale_d
+    k_raw = index_k_raw_view(proj, geom, b, s)
+    assert k_raw.shape == (b, s, 1, 128) and k_raw.data_ptr() == proj.data_ptr() + geom.index_k_raw_offset * 2

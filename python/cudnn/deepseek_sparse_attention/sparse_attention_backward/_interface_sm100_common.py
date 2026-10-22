@@ -13,6 +13,7 @@ from .dsa_bwd_sm100_deterministic import FlashAttentionDSABackwardSm100Determini
 
 _BLACKWELL_CAPABILITIES = ((10, 0), (10, 3))
 _WORKSPACE_ALIGNMENT = 128
+_INT32_ADDRESSABLE_ELEMENTS = 1 << 31
 
 
 def _align_workspace_bytes(num_bytes: int) -> int:
@@ -60,6 +61,47 @@ def _workspace_shapes_sm100(
         acc_dtype,
     )
     return workspace_lse_odo_shape, workspace_dkv_shape
+
+
+def _requires_wide_data_addressing(
+    total_s_q: int,
+    total_s_kv: int,
+    head_dim: int,
+    head_dim_v: int,
+    num_heads: int,
+    max_topk: int,
+    deterministic: bool,
+    backend: Optional[str],
+    *,
+    include_workspace: bool,
+) -> bool:
+    """Return whether a compact plan tensor can exceed signed Int32 offsets.
+
+    All public SM100 DSA backward tensors are contiguous. Their largest
+    element offset is therefore ``numel - 1``. The generic compiler also
+    describes byte-shaped workspaces with compact layouts, while the D576
+    compiler already gives those workspace extents an Int64 ABI independently.
+    """
+    spans = [
+        total_s_q * num_heads * head_dim,
+        total_s_q * num_heads * head_dim_v,
+        total_s_q * num_heads,
+        total_s_q * max_topk,
+        total_s_kv * head_dim,
+    ]
+    if include_workspace:
+        spans.extend(
+            math.prod(shape)
+            for shape in _workspace_shapes_sm100(
+                total_s_q,
+                total_s_kv,
+                head_dim,
+                num_heads,
+                deterministic,
+                backend,
+            )
+        )
+    return any(span > _INT32_ADDRESSABLE_ELEMENTS for span in spans)
 
 
 def flash_attn_bwd_sm100_workspace_size(
