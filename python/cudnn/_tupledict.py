@@ -33,6 +33,13 @@ class TupleDict(dict):
         # Store keys in order for tuple unpacking
         self._keys = list(self.keys())
 
+    def __eq__(self, other):
+        # Equality is the dict's own: ``_keys`` is a derived view of the insertion order, never part of the value
+        # (the same behaviour as before this class carried its own ``__eq__``; stated explicitly for CodeQL py/missing-equals).
+        return dict.__eq__(self, other)
+
+    __hash__ = None  # a dict is unhashable; an explicit ``__eq__`` keeps it so
+
     def __iter__(self):
         """Iterate over values in insertion order for tuple unpacking."""
         return (self[k] for k in self._keys)

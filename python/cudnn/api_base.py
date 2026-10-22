@@ -24,7 +24,9 @@ from cudnn._experimental_warnings import warn_experimental_api_once
 
 # ``TupleDict`` lives in the DSL-free ``cudnn._tupledict`` (the QSA front doors return it without importing this module, whose import
 # executes the DSL) and is re-exported here, so every ``from cudnn.api_base import TupleDict`` keeps resolving.
-from cudnn._tupledict import TupleDict  # noqa: F401
+from cudnn import _tupledict as _tupledict_mod
+
+TupleDict = _tupledict_mod.TupleDict  # the re-export: ``from cudnn.api_base import TupleDict`` keeps resolving
 from cudnn.datatypes import _convert_to_cutlass_data_type, _convert_to_cutlass_data_type_or_none
 from cudnn.tensor_adapter import (
     Device,
