@@ -109,6 +109,12 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 
 ### Conventions for new tests
 
+- Source-routing regexes must handle long multiline non-matches without
+  exponential backtracking. A negated character class already includes newlines;
+  do not repeat an overlapping newline alternative under `*`.
+  `gemm/cutedsl/test_sm110_amax_reduction.py::test_direct_redux_scan_handles_multiline_call`
+  covers matching and non-matching reduction calls with long argument lists.
+
 - Coverage-shape selectors raise when they cannot select the requested schedule.
   Only the device-dependent fixture may convert that error into a skip.
   Fixed supported-device geometry tests must fail if a schedule becomes unavailable.
