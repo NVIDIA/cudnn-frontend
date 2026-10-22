@@ -235,6 +235,7 @@ def test_the_indexer_band_declaration_over_the_pools_is_capture_safe_at_decode_r
     (N 2560, on the 256 grid) is.  Declared on empty tensors with no host sync (any device)."""
     from cudnn.gated_attention_block.kernels.proj_gemm import SMALL_M_MAX, _auto_tile_name
     from cudnn.gemm.frost import arch_family
+    from cudnn.gemm.frost.tile_config import _sm_count
 
     with _no_host_sync():
         blk, aux = _declare(GEOM_FLASH_NEXT, batch, s_q, n_pages=6, index_band=True)
@@ -246,7 +247,10 @@ def test_the_indexer_band_declaration_over_the_pools_is_capture_safe_at_decode_r
     name = _auto_tile_name(t, g.n_qkvg, g.d_model, dtype=BF16, a_major="k", b_major="k", block_scale=False, alpha=False)
     resolves = name is not None
     if arch_family.active_family() == "sm100":
-        assert resolves is jit and (name is None or (name.startswith("CONFIG_sm100_128x") and name.endswith("_swapAB")))
+        assert name is None or (name.startswith("CONFIG_sm100_128x") and name.endswith("_swapAB"))
+        # the one-wave boundary the route reads off the live SM count: the slab's 218 64-row tiles overflow the wave of every served part
+        # (<= 212 SMs) -> the small-M tile at T <= 128; a part with 218 SMs or more holds them in one wave and keeps the graph route
+        assert resolves is (jit and _sm_count() < -(-g.n_qkvg // 64)), (_sm_count(), name)
     assert getattr(blk._proj, "capture_safe", False) is resolves and blk._out_proj.capture_safe is True
     assert blk._proj.resolves_a_jit_tile() is resolves and blk._out_proj.resolves_a_jit_tile() is True
 

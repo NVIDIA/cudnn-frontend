@@ -1108,6 +1108,7 @@ def test_small_m_route_admits_the_indexer_band_slab_off_the_256_grid_and_keeps_o
     (13376 = 13312 + 64) on every branch, and one that 128 divides but 256 does not whose 64-row tiles FIT one wave (13440 =
     13312 + 128: 210 tiles on 212 SMs, unmeasured on the route) -- None, the graph route."""
     from cudnn.gemm.frost import arch_family
+    from cudnn.gemm.frost.tile_config import _sm_count
     from cudnn.gated_attention_block.kernels.proj_gemm import _auto_tile_name
 
     monkeypatch.setattr(arch_family, "active_family", lambda: "sm100")
@@ -1116,7 +1117,13 @@ def test_small_m_route_admits_the_indexer_band_slab_off_the_256_grid_and_keeps_o
     assert n % 256 and n % 128 == 0 and -(-n // 64) > _RUBIN_SMS
     band = "CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_swapAB"
     assert small_m_tile_config(1, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS) == band
-    assert _auto_tile_name(1, n, k, **kw) == small_m_tile_config(1, n, k, dtype=torch.bfloat16) == band
+    ctas_64 = -(-n // 64)  # 218: the route's one-wave boundary for this N, one over any served part's SM count
+    assert ctas_64 == 218
+    assert small_m_tile_config(1, n, k, dtype=torch.bfloat16, sm_count=ctas_64 - 1) == band  # the largest part that overflows the wave
+    assert small_m_tile_config(1, n, k, dtype=torch.bfloat16, sm_count=ctas_64) is None  # a wave that holds the 64-row tiles: the graph route
+    # the live resolver reads the live part's SM count: the band tile below the boundary, None at or above it (no served part today)
+    live = small_m_tile_config(1, n, k, dtype=torch.bfloat16)
+    assert _auto_tile_name(1, n, k, **kw) == live and live == (band if _sm_count() < ctas_64 else None), (_sm_count(), live)
     assert small_m_tile_config(SMALL_M_MAX + 1, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS) is None
     assert _auto_tile_name(SMALL_M_MAX + 1, n, k, **kw) is None
     with pytest.raises(NotImplementedError, match="capture_safe=True needs the forced-tile JIT route.*small-M route"):
