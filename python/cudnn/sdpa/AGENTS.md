@@ -1023,6 +1023,12 @@ empty sequences and nonaligned tails. `test_paged_thd_split_capture_lengths_and_
 checks changed device lengths under retained captures and protects tails
 with sentinels; the combine tests poison dead partials with NaNs.
 
+A finite partial LSE can still produce a zero combine weight after exponentiation,
+including when a sink dominates the row. Mask its partial O by the computed
+weight before arithmetic; testing only `LSE == -inf` misses `0 * NaN` contamination.
+`test_packed_prefetch_excludes_zero_weight_partials` compares explicit reducer
+specializations with FP64, including sink-dominated rows and changed-total replay.
+
 Oversized Q/O backing allocations do not enlarge a split plan's live-Q bound.
 Without an explicit packed-total hint, the split workspace is still bounded by
 `B * S_q`. Clamp the observed extent to that bound before checking logical HN
