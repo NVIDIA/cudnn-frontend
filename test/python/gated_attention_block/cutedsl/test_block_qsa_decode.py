@@ -72,6 +72,7 @@ requires_rubin = pytest.mark.requires_rubin  # the suite's registered marker (co
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from gated_block_census import cupti_kernels as _cupti_kernels  # noqa: E402
 from gated_block_qsa_reference import qsa_visible_mask, random_block_ids  # noqa: E402
 from gated_block_reference import RefGeometry, build_rope_tables, gated_attention_block_reference  # noqa: E402
 
@@ -199,13 +200,27 @@ def test_declaration_facts_of_the_sparse_decode_mode(s_q, fuse_gate):
     # the serving declaration's capture-safe projections: set per stage iff the GEMM driver's "auto" resolver names a JIT tile for the
     # stage's own shape -- the forced tile where 256 divides N (this geometry's two projections), the small-M route's tile at T <= 128
     # (the indexer band's 13952-column slab of the 24 / 2 geometry: its own cell below).  THIS small geometry's band slab (N 5120 + 640
-    # = 5760 = 45 x 128, off the 256 grid, and its 90 64-row tiles FIT one wave) is not that case: it keeps the driver's graph route
-    # (eager steps; a capture is the driver's typed refusal) while its out projection (N 512, on the 256 grid) is capture-safe
+    # = 5760 = 45 x 128, off the 256 grid) is not that case on any served part: its 90 64-row tiles FIT one wave at 90 SMs and more,
+    # where the route keeps the driver's graph route (eager steps; a capture is the driver's typed refusal); a part with fewer SMs
+    # overflows the wave and takes the route's 128-row tile at T <= 128.  So the expectation is read off the live resolver, as the
+    # 13952 cell reads it, and the one-wave fact is asserted where the live part has it; the out projection (N 512, on the 256 grid)
+    # is capture-safe throughout
+    from cudnn.gated_attention_block.kernels.proj_gemm import SMALL_M_MAX, _auto_tile_name
+    from cudnn.gemm.frost import arch_family
+
     assert blk._proj.capture_safe and blk._out_proj.capture_safe
     with _no_host_sync():
-        band, _ = _declare(GEOM_SMALL, 4, s_q, n_pages=6, index_band=True)
-    assert band.geom.n_qkvg % 256 != 0 and band.geom.n_qkvg % 128 == 0
-    assert not getattr(band._proj, "capture_safe", False) and not band._proj.resolves_a_jit_tile() and band._out_proj.capture_safe
+        band, baux = _declare(GEOM_SMALL, 4, s_q, n_pages=6, index_band=True)
+    g = baux["geom"]
+    assert g.n_qkvg % 256 != 0 and g.n_qkvg % 128 == 0
+    name = _auto_tile_name(4 * s_q, g.n_qkvg, g.d_model, dtype=BF16, a_major="k", b_major="k", block_scale=False, alpha=False)
+    resolves = name is not None
+    if _DEV == "cuda" and arch_family.active_family() == "sm100":
+        one_wave = -(-g.n_qkvg // 64) <= sm  # the slab's 90 64-row tiles fit one wave: every served part
+        assert resolves is (4 * s_q <= SMALL_M_MAX and not one_wave), (sm, name)
+    else:
+        assert not resolves, name  # the sm120 family's forced-tile fallback has no tile off the 256 grid
+    assert getattr(band._proj, "capture_safe", False) is resolves and band._proj.resolves_a_jit_tile() is resolves and band._out_proj.capture_safe
 
 
 @pytest.mark.parametrize(
@@ -997,8 +1012,6 @@ def test_the_split_combine_takes_the_pinned_form_per_grid_and_two_executes_are_b
     (``SparseGqaFwdDslSm107.combine_form``: the dense adapter's rule -- the decode-grid kernel on a small grid from split 8, the lean
     group walk on an overflow grid at split <= 4, the module's own forms otherwise); the CUDA profiler's census of one execute names
     exactly that combine kernel; the step is within the budget vs the oracle (the gate in the combine), two executes bitwise."""
-    from gated_block_census import cupti_kernels as _cupti_kernels
-
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 
     want = {"decode_grid": comb.DECODE_GRID_AUTO, "lean_walk": comb.DECODE_GRID_LEAN_WALK, "own": comb.DECODE_GRID_OFF}[form]
@@ -1101,23 +1114,6 @@ def test_capture_of_the_first_execute_on_the_indexer_band_geometry_replays_bitwi
         ), "the replay over new lengths / tables / lists / slots differs from the eager run over them"
     finally:
         graph.reset()
-
-
-def _cupti_kernels(fn):
-    """The CUDA kernel names of one call under torch.profiler (CUPTI) after one warm call, memsets / memcpys split out; ``(None, None)``
-    when the node records nothing (the serving decode module's helper, one copy per module)."""
-    from torch.profiler import ProfilerActivity, profile
-
-    fn()
-    torch.cuda.synchronize()
-    with profile(activities=[ProfilerActivity.CUDA]) as prof:
-        fn()
-        torch.cuda.synchronize()
-    names = [e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA]
-    if not names:
-        return None, None
-    kernels = [n for n in names if "memset" not in n.lower() and "memcpy" not in n.lower()]
-    return kernels, [n for n in names if n not in kernels]
 
 
 @requires_rubin

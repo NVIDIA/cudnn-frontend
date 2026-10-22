@@ -8110,11 +8110,10 @@ class GatedAttentionBlockFwd(APIBase):
         # A band declaration past 128 rows resolves no tile and keeps the driver's own route -- its steps run eagerly and a capture is
         # the driver's typed refusal at the first captured execute (the band's prefill / extend forms' documented limit); setting the
         # flag there would decline the whole block at compile.  Read off the resolver `build_proj_gemm` itself runs, never re-spelled,
-        # so this predicate cannot drift from the route.
-        if self.kv_source == KV_SOURCE_PAGED:
-            for st in (self._proj, self._out_proj):
-                if isinstance(st, _Projection) and st.resolves_a_jit_tile():
-                    st.capture_safe = True
+        # so this predicate cannot drift from the route -- and read AGAIN at compile() on the compiling device
+        # (`_flag_capture_safe_projections`): the SM count the small-M route reads is a device property, so a declaration and its
+        # compile on different parts would otherwise carry a stale flag into the driver.
+        self._flag_capture_safe_projections()
         # Stage order == pipeline order.  `_quant_o` is listed only where it is a
         # DISTINCT stage (MXFP8: quantize_o, or quantize_fp4_o under o_fp4); under
         # FP8 it aliases `_quant_q`, listed once.
@@ -9356,10 +9355,24 @@ class GatedAttentionBlockFwd(APIBase):
 
     # -- compile ------------------------------------------------------------
 
+    def _flag_capture_safe_projections(self) -> None:
+        """Per paged projection stage (``kv_source="paged"``), ``capture_safe`` iff the driver's "auto" resolver names a JIT tile for
+        the stage's OWN (M, N, K) (:meth:`_Projection.resolves_a_jit_tile`; the predicate the declaration documents at its stage list).
+        Set at declaration (the host facts) and read AGAIN at :meth:`compile`, on the compiling device: the SM count the small-M route
+        reads is a device property, so a declaration and its compile on different parts would otherwise carry a stale flag into
+        ``build_proj_gemm`` -- its typed refusal where the flag says True and the route resolves no tile, the eager graph route where
+        it says False and the route has one.  A host query, no device sync."""
+        if self.kv_source != KV_SOURCE_PAGED:
+            return
+        for st in (self._proj, self._out_proj):
+            if isinstance(st, _Projection):
+                st.capture_safe = st.resolves_a_jit_tile()
+
     def compile(self) -> None:
         """Build all five artifacts. Plan-time keys only, so every execute-path
         dispatch is a guaranteed cache hit (Rule 4)."""
         self._ensure_support_checked()
+        self._flag_capture_safe_projections()  # on the compiling device (the method's docstring)
         for st in self._stages:
             st.compile()
         self._ws = self._layout()
