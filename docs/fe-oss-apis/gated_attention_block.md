@@ -563,6 +563,37 @@ How a stack's vocabulary maps onto it (the shim is a renaming, not a conversion)
 | the open tail, the causal mask, the per-row `visible_blocks` clamp | nothing -- the kernel derives all three from the position and the KV length |
 | the output gate | nothing -- stage (5) is the block's (`sigmoid(gate)` after the dead-row select); a split merge is internal |
 
+**The decode top-k kernel (standalone today).** `cudnn.gated_attention_block.qsa_topk.qsa_topk_decode(logits, counts, block_ids, *,
+cluster_ctas=None, threads_per_cta=None, use_pdl=False, stream=None)` -- the DSL-free host entry: the kernel module
+`kernels/qsa_topk_decode.py` behind it imports the CuTe DSL at module scope, so the entry gates the DSL version FIRST and imports the
+kernel module lazily (a DSL below the floor reads as a typed `NotImplementedError` naming the version, never as an error from inside
+the DSL; `qsa_topk_decode_kernel_module()` hands the gated module, with its plan-time / per-execute split, to an engine) -- selects,
+per query row, the top-k block ids of the decode scorer's fp32 logits: `logits [T, n_blocks_max]` fp32 (row `t` scored in columns
+`[0, counts[t])`; the columns past them never influence the result -- the kernel may read them, so they must be addressable, which
+they are inside the tensor), `counts [T]` int32 (the VISIBLE-block count per row, clamped in-kernel to `[0, n_blocks_max]`; a row with more than
+`top_k` visible blocks gets the score-based top-k, a row with at most `top_k` the identity list of every visible block -- so never pass
+the list length `min(top_k, n_vis)` as the count: every row with more visible blocks than `top_k` would then read as exactly `top_k`,
+take the identity path and return its oldest `top_k` blocks instead of a selection, with no error), `block_ids [T, top_k]` int32 -- the CALLER's buffer, nothing is allocated -- written in
+CANONICAL order: the `min(top_k, counts[t])` selected ids strictly descending, then `-1`.  The set is the exact top-k of the fp32 values
+(every selected logit at or above every unselected one; a tie at the k-th value keeps the smaller ids), so two launches are bitwise and
+the list is the form the sparse core's list stage consumes without a sort.  One thread block per row (`threads_per_cta` 512 / 1024), or
+the row split over a thread-block cluster of `cluster_ctas` 4 / 8 / 16 CTAs (1024 threads each; the histogram merged cluster-wide by
+`st.async` + mbarrier, no release-ordered cluster barrier): the row's keys stay in registers, ONE 4096-bin histogram over the eight
+octaves below the row maximum finds the k-th bin, its candidates are ranked exactly (an all-pairs rank up to 128 of them, narrowing
+passes beyond), and a per-warp ballot compaction writes the canonical list.  Both knobs are
+performance-only (every served value is the same function, pinned bitwise by the tests; no performance number is quoted until one is
+measured on an exclusive GPU).  Typed declines: a CuTe DSL below the floor or without the device's target (the version / target named),
+`use_pdl=True` below cc 9.0 (`griddepcontrol` exists from Hopper), a per-CTA shared-memory need above the device's opt-in limit (the
+bytes named: `smem_bytes_for(cols_cap, cluster_ctas, threads_per_cta, top_k)` -- the 32 KB histogram plus a pool sized by the
+fast path's staging regions (`threads / 32 x (top_k + 128)` words, at most 96 KB) or the fallback's list and ballot words, about
+114 KB at 32768 columns x 1024 threads x `top_k` 512, above the 99 KB opt-in limit of some parts, which serve 512 threads); `cluster_ctas > 1` below cc 9.0 (clusters and DSMEM exist from Hopper) or on a public CuTe DSL wheel below 4.8.0 (the cluster
+exchanges' vector `st.async` stores fail to compile on the released 4.7.0; the single-CTA form serves and the convenience entry picks it
+there); `ValueError` on any malformed form -- a cluster size outside
+1 / 4 / 8 / 16, a thread count outside the domain (1024 for the cluster form), more than 64 keys per thread, a row block of more than 65535
+rows.  The
+in-block decode indexer that binds it over the paged compressed-key cache is a follow-up; until then the dense standalone selector keeps
+the radix top-k it binds today.
+
 
 ### Serving: write-through into a paged KV cache (`paged_kv_page_size`)
 
