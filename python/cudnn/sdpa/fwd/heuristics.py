@@ -1092,69 +1092,32 @@ def choose_decode_tile_split_kv(
     return pick
 
 
-# --- KV split on the SM120 decode tile (see choose_sm120_decode_split_kv) ----
-# sm120/decode_f16.py is one CTA per (Q tile, batch, KV-head group, split) unit
-# streaming ~8-16 KB K/V stages through a TMA ring, one CTA per SM (the ring fills
-# the SMEM). Its main kernel is the slower of two bounds: the longest unit's stage
-# chain run by a lone CTA, and every unit's bytes over the DRAM bandwidth; the
-# split path adds the combine. Fitted on RTX PRO 6000 Blackwell Workstation
-# (188 SMs, SM 2400 / memory 14001 MHz locks) over 72 split ladders -- S_q 1 / 2 /
-# 4 x GQA 32/8, 32/4, 24/4 d256, 16/2 d256, 32/16, 64/8 d64 + sink x KV 4K-128K x
-# splits 1-128: mean regret 0.3 %, worst 5 %. The DRAM saturates near 64-128 CTAs
-# (1.54-1.59 TB/s at 128K keys); past that a split only grows the combine.
-#
-# The rate one CTA streams its stages at when it is the only stream, bytes / us
-# (the fitted value; it sits below a lone CTA's raw stream rate).
-_SM120_DECODE_LONE_BYTES_PER_US = 4.0e4
-# The DRAM read rate the streams share, bytes / us.
-_SM120_DECODE_BYTES_PER_US = 1.55e6
-# What a CTA costs beyond its stage chain (launch ramp, Q load, merge, epilogue), us.
-_SM120_DECODE_CTA_US = 3.0
-# The split path's combine launch, us, and what each partial adds to it per 128 O
-# columns (2.8 / 4.2 / 5.8 / 9.1 us at 16 / 32 / 64 / 128 splits, d128).
-_SM120_DECODE_COMBINE_US = 2.0
-_SM120_DECODE_COMBINE_PER_SPLIT_US = 0.055
-
-
-def _sm120_decode_cost(split: int, *, units: int, kv_stages: int, stage_bytes: int, d_v: int, sm_count: int) -> float:
-    waves = _ceil_div(units * split, sm_count)
-    chain = waves * _ceil_div(kv_stages, split) * stage_bytes / _SM120_DECODE_LONE_BYTES_PER_US
-    bandwidth = units * kv_stages * stage_bytes / _SM120_DECODE_BYTES_PER_US
-    cost = max(chain, bandwidth) + _SM120_DECODE_CTA_US
-    if split > 1:
-        cost += _SM120_DECODE_COMBINE_US + split * _SM120_DECODE_COMBINE_PER_SPLIT_US * d_v / 128
-    return cost
-
-
 def choose_sm120_decode_split_kv(*, units: int, kv_stages: int, stage_bytes: int, d_v: int, sm_count: int) -> int:
     """How many KV chunks the SM120 decode tile cuts each unit into; 1 = do not split.
 
     ``units`` is the launch's CTA count before splitting (Q tiles x batch x
     packed KV-head groups, or query heads unpacked); ``kv_stages`` the K/V
-    stages of the longest unit (``config_sm120.decode_kv_stage`` keys each,
-    ``stage_bytes`` of K and V); ``d_v`` the O width the combine reduces.
+    stages of the longest unit, ``stage_bytes`` each; ``d_v`` the O width the
+    combine reduces.
 
-        chain(s)     = ceil(units * s / sm_count) * ceil(kv_stages / s) * stage_bytes / LONE_BYTES_PER_US
-        bandwidth    = units * kv_stages * stage_bytes / BYTES_PER_US
-        cost(s)      = max(chain(s), bandwidth) + CTA_US
-                     + [s > 1] * (COMBINE_US + s * COMBINE_PER_SPLIT_US * d_v / 128)
-
-    An under-filled launch splits until the bandwidth bound takes over from the
-    stage chain; past it a split only adds to the combine. Candidates are the
-    powers of two of :func:`split_kv_candidates` (``split_kv`` is a compile
-    specialization) bounded by the stage count; ties go to the smaller split.
+    The tile streams K/V from DRAM, one CTA per SM. Its time is the longer of
+    the longest unit's stage chain at one CTA's stream rate and all the units'
+    bytes at the DRAM rate, so a split pays until the DRAM bound takes over and
+    past it only adds combine work. The rates are an RTX PRO 6000 Blackwell
+    Workstation's. Candidates are :func:`split_kv_candidates`; ties keep the
+    smaller split.
     """
     if min(units, kv_stages, stage_bytes, d_v, sm_count) <= 0:
         return 1
-    kw = dict(units=units, kv_stages=kv_stages, stage_bytes=stage_bytes, d_v=d_v, sm_count=sm_count)
-    best, best_cost = 1, _sm120_decode_cost(1, **kw)
-    for split in split_kv_candidates(sm_count=sm_count, kv_tiles=kv_stages, min_tiles=1):
-        if split <= 1:
-            continue
-        cost = _sm120_decode_cost(split, **kw)
-        if cost < best_cost:
-            best, best_cost = split, cost
-    return best
+    cta_rate, dram_rate = 4.0e4, 1.55e6  # bytes / us: one CTA streaming alone; all CTAs together
+    dram_us = units * kv_stages * stage_bytes / dram_rate
+
+    def cost_us(split: int) -> float:
+        chain_us = _ceil_div(units * split, sm_count) * _ceil_div(kv_stages, split) * stage_bytes / cta_rate
+        combine_us = 2.0 + split * 0.055 * d_v / 128 if split > 1 else 0.0
+        return max(chain_us, dram_us) + combine_us
+
+    return min(split_kv_candidates(sm_count=sm_count, kv_tiles=kv_stages, min_tiles=1), key=cost_us)
 
 
 def _sm120_envelope(facts) -> Tuple[int, int]:
