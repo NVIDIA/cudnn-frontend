@@ -286,6 +286,11 @@ cudnn.csa.csa_compressor_backward_wrapper
 cudnn.csa.csa_compressor_forward_wrapper
 cudnn.csa_compressor_backward_wrapper
 cudnn.csa_compressor_forward_wrapper
+cudnn.cuda_graph_retention
+cudnn.cuda_graph_retention.NONE
+cudnn.cuda_graph_retention.PER_GRAPH
+cudnn.cuda_graph_retention.name
+cudnn.cuda_graph_retention.value
 cudnn.cudnnGraphNotSupportedError
 cudnn.cudnnGraphNotSupportedError.add_note
 cudnn.cudnnGraphNotSupportedError.args
@@ -1436,6 +1441,7 @@ cudnn.pygraph.gen_index
 cudnn.pygraph.genstats
 cudnn.pygraph.get_behavior_notes
 cudnn.pygraph.get_behavior_notes_for_plan_at_index
+cudnn.pygraph.get_cuda_graph_retention
 cudnn.pygraph.get_engine_and_knobs_at_index
 cudnn.pygraph.get_execution_plan_count
 cudnn.pygraph.get_inputs
