@@ -3641,6 +3641,14 @@ class CfgD192(CfgD128):
     QO_ALIAS: int = 1
     SOFTMAX_REGS: int = 192
     CORRECTION_REGS: int = 88
+    # Separate K and V ring depths: the half-precision cga1 tile cannot afford two full K+V stages (256 KiB), but a
+    # second V stage alone fits (208 KiB), so the V reload is double-buffered while K stays single-stage.  Every other
+    # d192 configuration keeps both rings at STAGES_KV.
+    STAGES_K: int = 2
+    STAGES_V: int = 2
+    # K sub-stages per tile: the TMA D-subtile count (3 x 16 KiB for half input) on the cga1 tile, so each subtile
+    # is reloaded for the next tile as soon as BMM1 has read it, instead of after the whole 48 KiB tile; 1 elsewhere.
+    K_SUB: int = 1
 
 
 def _d192_smem_bytes(cfg) -> int:
@@ -3652,12 +3660,13 @@ def _d192_smem_bytes(cfg) -> int:
         cga2, STAGES_KV=2 : 96(Q u O) + 48(K) + 32(V) = 176 KiB
         cga1, STAGES_KV=2 : 96        + 96    + 64    = 256 KiB  (over cap)
         cga1, STAGES_KV=1 : 96        + 48    + 32    = 176 KiB
+        cga1, K=1 / V=2   : 96        + 48    + 64    = 208 KiB  (half input: STAGES_K=1, STAGES_V=2)
     """
     q_slab = cfg.TILE_M * cfg.TILE_K * cfg.BPE
     o_slab = cfg.TILE_M * cfg.TILE_O * cfg.BPE_O // cfg.O_PACK_DIV
     qo = cfg.TILES_Q * (max(q_slab, o_slab) if cfg.QO_ALIAS else q_slab + o_slab)
-    k = cfg.STAGES_KV * (cfg.TILE_N * cfg.TILE_K * cfg.BPE // cfg.CTA_MMA)
-    v = cfg.STAGES_KV * (cfg.TILE_O * cfg.TILE_N * cfg.BPE_V // cfg.CTA_MMA)
+    k = cfg.STAGES_K * (cfg.TILE_N * cfg.TILE_K * cfg.BPE // cfg.CTA_MMA)
+    v = cfg.STAGES_V * (cfg.TILE_O * cfg.TILE_N * cfg.BPE_V // cfg.CTA_MMA)
     return qo + k + v
 
 
@@ -3676,6 +3685,14 @@ def _validate_cfg_d192(cfg: CfgD192) -> None:
         (
             cfg.STAGES_KV == ((3 if cfg.CTA_MMA == 2 else 1) if cfg.PV_BF16 else (2 if fp8 else 1) * cfg.CTA_MMA),
             "d192: STAGES_KV must be 3/1 for BF16 PV at cga2/cga1, otherwise follow the input-dtype pipeline depth",
+        ),
+        (
+            cfg.STAGES_K == cfg.STAGES_KV and cfg.STAGES_V == (2 if (not fp8 and cfg.CTA_MMA == 1) else cfg.STAGES_KV),
+            "d192: the K ring is STAGES_KV deep; the V ring is 2 deep on the half-input cga1 tile and STAGES_KV elsewhere",
+        ),
+        (
+            cfg.K_SUB == ((cfg.TILE_K * cfg.BPE) // 128 if (not fp8 and cfg.CTA_MMA == 1) else 1),
+            "d192: K is released per TMA D-subtile on the half-input cga1 tile only",
         ),
         (
             _d192_smem_bytes(cfg) <= _SM100_MAX_DYN_SMEM,
@@ -3820,6 +3837,10 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
     wide_role_regs = thd_swa or e5_dense_causal_regs
     b_v = 2 if params.pv_bf16 else b
     stages_kv = (3 if params.cta_mma == 2 else 1) if params.pv_bf16 else (2 if fp8 else 1) * params.cta_mma
+    # Half input at cga1: one full K stage (48 KiB) plus TWO V stages (64 KiB) under the 96 KiB Q u O slab -- the V
+    # reload then overlaps a whole iteration instead of the PV->PV window a single stage leaves it.
+    stages_v = 2 if (not fp8 and params.cta_mma == 1) else stages_kv
+    k_sub = (192 * b) // 128 if (not fp8 and params.cta_mma == 1) else 1  # one slot per 128 B TMA D-subtile
     cfg = CfgD192(
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,
@@ -3840,6 +3861,9 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
         TILE_K_HW_BMM1=32 if fp8 else tile_k_hw(params.dtype_qkv),
         TILE_K_HW_BMM2=16 if params.pv_bf16 else (32 if fp8 else tile_k_hw(params.dtype_qkv)),
         STAGES_KV=stages_kv,
+        STAGES_K=stages_kv,
+        STAGES_V=stages_v,
+        K_SUB=k_sub,
         SCHEDULER_STAGES=3 if e4_thd_swa and not params.bottom_right else 2,
         MASK_FLAGS=mask_flags,
         WINDOW_LEFT=params.window_left or 0,
