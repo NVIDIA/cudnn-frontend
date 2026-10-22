@@ -2529,30 +2529,28 @@ class UnifiedSDPABackwardNode : public SDPABackwardNodeBase<UnifiedSDPABackwardN
         CHECK_CUDNN_FRONTEND_ERROR(
             set_tensor_desc(attributes.inputs, input_names::SEQ_LEN_KV, CUDNN_ATTR_OPERATION_SDPA_BWD_SEQ_LEN_KVDESC));
 
-        // Cumulative sequence lengths (cu_seqlens, b + 1 entries per side) need cuDNN 9.28.0.
-        // TODO(nvbugs/5102117): bump the floor to the release these land in.
+        // Cumulative sequence lengths (cu_seqlens, b + 1 entries per side); the unified backward needs cuDNN 9.29.0.
         if (has_input(input_names::CU_SEQ_LEN_Q) || has_input(input_names::CU_SEQ_LEN_KV)) {
-            auto v928_error =
+            auto v929_error =
                 error_t{error_code_t::GRAPH_NOT_SUPPORTED,
-                        "Cumulative sequence lengths in the unified SDPA backward node require cuDNN 9.28.0"};
-#if (CUDNN_VERSION >= 92800)
-            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92800, v928_error);
+                        "Cumulative sequence lengths in the unified SDPA backward node require cuDNN 9.29.0"};
+#if (CUDNN_VERSION >= 92900)
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92900, v929_error);
             CHECK_CUDNN_FRONTEND_ERROR(set_tensor_desc(
                 attributes.inputs, input_names::CU_SEQ_LEN_Q, CUDNN_ATTR_OPERATION_SDPA_BWD_CU_SEQ_LEN_QDESC));
             CHECK_CUDNN_FRONTEND_ERROR(set_tensor_desc(
                 attributes.inputs, input_names::CU_SEQ_LEN_KV, CUDNN_ATTR_OPERATION_SDPA_BWD_CU_SEQ_LEN_KVDESC));
 #else
-            return v928_error;
+            return v929_error;
 #endif
         }
 
-        // Dropout: the backward regenerates the forward's Philox mask from the same seed / offset (cuDNN 9.28.0).
-        // TODO(nvbugs/5102117): bump the floor to the release this lands in.
+        // Dropout: the backward regenerates the forward's Philox mask from the same seed / offset.
         if (attributes.dropout_probability.has_value() && attributes.dropout_probability.value() != 0.0f) {
-            auto v928_error = error_t{error_code_t::GRAPH_NOT_SUPPORTED,
-                                      "Dropout in the unified SDPA backward node requires cuDNN 9.28.0"};
-#if (CUDNN_VERSION >= 92800)
-            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92800, v928_error);
+            auto v929_error = error_t{error_code_t::GRAPH_NOT_SUPPORTED,
+                                      "Dropout in the unified SDPA backward node requires cuDNN 9.29.0"};
+#if (CUDNN_VERSION >= 92900)
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92900, v929_error);
             float dropout_prob = attributes.dropout_probability.value();
             _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_bwd_operation->get_backend_descriptor(),
                                                            CUDNN_ATTR_OPERATION_SDPA_BWD_DROPOUT_PROBABILITY,
@@ -2564,20 +2562,20 @@ class UnifiedSDPABackwardNode : public SDPABackwardNodeBase<UnifiedSDPABackwardN
             CHECK_CUDNN_FRONTEND_ERROR(set_tensor_desc(
                 attributes.inputs, input_names::Offset, CUDNN_ATTR_OPERATION_SDPA_BWD_DROPOUT_OFFSET_DESC));
 #else
-            return v928_error;
+            return v929_error;
 #endif
         }
 
-        // dBias: gradient of the additive bias in the score-modifier subgraph (cuDNN 9.28.0).
+        // dBias: gradient of the additive bias in the score-modifier subgraph.
         if (has_output(output_names::dBias)) {
-            auto v928_error = error_t{error_code_t::GRAPH_NOT_SUPPORTED,
-                                      "dBias in the unified SDPA backward node requires cuDNN 9.28.0"};
-#if (CUDNN_VERSION >= 92800)
-            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92800, v928_error);
+            auto v929_error = error_t{error_code_t::GRAPH_NOT_SUPPORTED,
+                                      "dBias in the unified SDPA backward node requires cuDNN 9.29.0"};
+#if (CUDNN_VERSION >= 92900)
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92900, v929_error);
             CHECK_CUDNN_FRONTEND_ERROR(
                 set_tensor_desc(attributes.outputs, output_names::dBias, CUDNN_ATTR_OPERATION_SDPA_BWD_DBIAS_DESC));
 #else
-            return v928_error;
+            return v929_error;
 #endif
         }
 

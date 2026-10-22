@@ -87,7 +87,7 @@ def validate_config(cfg):
 
     if cfg.is_cu_seq_len:
         assert cfg.is_padding == True, "is_cu_seq_len=True requires is_padding=True"
-        # cu_seq_len_q / cu_seq_len_kv reach the backward graph too (unified backward, cuDNN 9.28+); the composite
+        # cu_seq_len_q / cu_seq_len_kv reach the backward graph too (unified backward, cuDNN 9.29+); the composite
         # backward waives them through the support surface.
         assert cfg.cu_seq_len_sides in ("both", "q", "kv"), f"invalid cu_seq_len_sides={cfg.cu_seq_len_sides}"
 
@@ -115,9 +115,9 @@ def validate_config(cfg):
         print("@@@@ Overall result: WAIVED, unified SDPA implementation requires cudnn 9.13.1 or higher.")
         pytest.skip("unified SDPA implementation requires cudnn 9.13.1 or higher")
 
-    if cudnn_version < "9.27.0" and cfg.is_train and cfg.implementation == cudnn.attention_implementation.UNIFIED:
-        print("@@@@ Overall result: WAIVED, unified SDPA backward implementation requires cudnn 9.27.0 or higher.")
-        pytest.skip("unified SDPA backward implementation requires cudnn 9.27.0 or higher")
+    if cudnn_version < "9.29.0" and cfg.is_train and cfg.implementation == cudnn.attention_implementation.UNIFIED:
+        print("@@@@ Overall result: WAIVED, unified SDPA backward implementation requires cudnn 9.29.0 or higher.")
+        pytest.skip("unified SDPA backward implementation requires cudnn 9.29.0 or higher")
 
     if cfg.s_q == cfg.s_kv == 1:
         print("@@@@ Overall result: WAIVED, skipping known issue of s_q == s_kv == 1.")

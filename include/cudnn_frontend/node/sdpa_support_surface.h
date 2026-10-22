@@ -1014,15 +1014,14 @@ SDPA_backward_attributes::verify_sdpa_backward_support_surface_for_implementatio
             }
             break;
         case AttentionImplementation_t::UNIFIED: {
-            // cuDNN 9.27.0 is the first release whose heuristics can select the unified SDPA bprop
-            // engines (before that the engine existed but was never proposed, so a plan could not be
-            // built through the normal path). Basic FP16/BF16 single-kernel bprop is available on
-            // SM80, SM90, SM100 and SM107 from that version; the backend, not this surface, decides
-            // per-architecture availability.
+            // The unified SDPA backward is supported from cuDNN 9.29, the release with its full feature set
+            // (masks, bias / dBias, score modifiers, dropout, sink, padded and ragged layouts, the deterministic
+            // algorithm). Earlier releases have parts of it but are not targeted. The backend, not this surface,
+            // decides per-architecture availability beyond the layout rule below.
             auto effective_cudnn_ver = std::min(detail::get_backend_version(), detail::get_compiled_version());
-            RETURN_CUDNN_FRONTEND_ERROR_IF(effective_cudnn_ver < 92700,
+            RETURN_CUDNN_FRONTEND_ERROR_IF(effective_cudnn_ver < 92900,
                                            error_code_t::GRAPH_NOT_SUPPORTED,
-                                           "Unified SDPA backward node requires cuDNN 9.27.0");
+                                           "Unified SDPA backward node requires cuDNN 9.29.0");
 
             RETURN_CUDNN_FRONTEND_ERROR_IF(
                 context.get_dynamic_shape_enabled(),
@@ -1035,59 +1034,38 @@ SDPA_backward_attributes::verify_sdpa_backward_support_surface_for_implementatio
                 "Unified SDPA backward node supports only FP16/BF16 Q/K/V/O/dO/dQ/dK/dV I/O; "
                 "the requested I/O data type is not supported by the unified implementation.");
 
-            // TODO(nvbugs/5102117): the feature-parity backend MRs lift these one by one (deterministic
-            // multi-kernel, masks/bias/score modifiers, dropout, paged/variable-length, FP8). Until then
-            // every feature below routes to the composite implementation under AUTO.
-            // Ragged (THD) layouts, padding masks and max_total_seq_len reach the unified engine on SM100/SM107
-            // from the dev line that follows 9.28.0 (the SM80/SM90 generic emitters are wired in a later MR).
-            // TODO(nvbugs/5102117): bump the floor to the release these land in.
+            // Padded (per-batch sequence lengths, cu_seqlens) and ragged (THD) layouts reach the unified engine on
+            // SM80, SM90, SM100 and SM107.
             int32_t const unified_sm_major = context.get_sm_version() / 10;
-            bool const unified_layouts_ok  = effective_cudnn_ver >= 92800 &&
-                                            (unified_sm_major == 10 || unified_sm_major == 9 || unified_sm_major == 8);
+            bool const unified_layouts_ok  = unified_sm_major == 10 || unified_sm_major == 9 || unified_sm_major == 8;
             std::unordered_set<SDPA_backward_attributes::input_names> allowed_input_names{input_names::Q,
                                                                                           input_names::K,
                                                                                           input_names::V,
                                                                                           input_names::O,
                                                                                           input_names::dO,
                                                                                           input_names::Stats,
-                                                                                          input_names::Attn_scale};
-            // Attention sink (and its gradient) share the same dev-line floor as the layouts above.
-            bool const unified_sink_ok = effective_cudnn_ver >= 92800;
+                                                                                          input_names::Attn_scale,
+                                                                                          input_names::SINK_TOKEN,
+                                                                                          input_names::Bias,
+                                                                                          input_names::Seed,
+                                                                                          input_names::Offset};
             if (unified_layouts_ok) {
                 allowed_input_names.insert(input_names::SEQ_LEN_Q);
                 allowed_input_names.insert(input_names::SEQ_LEN_KV);
                 allowed_input_names.insert(input_names::CU_SEQ_LEN_Q);
                 allowed_input_names.insert(input_names::CU_SEQ_LEN_KV);
             }
-            if (unified_sink_ok) {
-                allowed_input_names.insert(input_names::SINK_TOKEN);
-            }
-            // Additive bias is applied to the recomputed scores in the kernel; its gradient (dBias) is a node
-            // output backed by the same cuDNN release.
-            bool const unified_bias_ok = effective_cudnn_ver >= 92800;
-            if (unified_bias_ok) {
-                allowed_input_names.insert(input_names::Bias);
-            }
-            if (effective_cudnn_ver >= 92800) {
-                allowed_input_names.insert(input_names::Seed);
-                allowed_input_names.insert(input_names::Offset);
-            }
             for (const auto& [key, value] : inputs) {
                 if (allowed_input_names.find(key) == allowed_input_names.end() && value != nullptr) {
                     return {error_code_t::GRAPH_NOT_SUPPORTED,
                             "Unified SDPA backward node doesn't yet support inputs other than Q, K, V, O, dO, Stats, "
-                            "Attn_scale, the sequence lengths and the sink token"};
+                            "Attn_scale, the sequence lengths, the sink token, the bias and the dropout seed / offset"};
                 }
             }
 
+            // dSink and dBias (the gradient of the additive bias applied to the recomputed scores).
             std::unordered_set<SDPA_backward_attributes::output_names> allowed_output_names{
-                output_names::dQ, output_names::dK, output_names::dV};
-            if (unified_sink_ok) {
-                allowed_output_names.insert(output_names::DSINK_TOKEN);
-            }
-            if (unified_bias_ok) {
-                allowed_output_names.insert(output_names::dBias);
-            }
+                output_names::dQ, output_names::dK, output_names::dV, output_names::DSINK_TOKEN, output_names::dBias};
             for (const auto& [key, value] : outputs) {
                 if (allowed_output_names.find(key) == allowed_output_names.end() && value != nullptr) {
                     return {error_code_t::GRAPH_NOT_SUPPORTED,
@@ -1096,59 +1074,36 @@ SDPA_backward_attributes::verify_sdpa_backward_support_surface_for_implementatio
                 }
             }
 
-            // Alibi is lowered as a score-modifier subgraph (gen_index / slope chain) on the recomputed scores; it
-            // needs the same dev-line floor as the layouts above.
-            if (alibi_mask && effective_cudnn_ver < 92800) {
-                return {error_code_t::GRAPH_NOT_SUPPORTED,
-                        "Unified SDPA backward node doesn't yet support alibi before cuDNN 9.28"};
-            }
             if (padding_mask && !unified_layouts_ok) {
                 return {error_code_t::GRAPH_NOT_SUPPORTED,
-                        "Unified SDPA backward node doesn't yet support padding masks on this device / cuDNN version"};
+                        "Unified SDPA backward node doesn't yet support padding masks on this device"};
             }
-            // Diagonal-band masks (causal, bottom-right causal, sliding window) are lowered as a score-modifier
-            // subgraph on the recomputed scores; they need the same dev-line floor as the layouts above.
-            if ((left_bound.has_value() || right_bound.has_value()) && effective_cudnn_ver < 92800) {
-                return {error_code_t::GRAPH_NOT_SUPPORTED,
-                        "Unified SDPA backward node doesn't yet support diagonal-band masks before cuDNN 9.28"};
-            }
-            // The forward score modifier is replayed on the recomputed scores inside the backend kernel; a
-            // user-provided backward modifier (score_mod_bprop) has no backend counterpart yet.
-            if (attention_score_modifier != nullptr && effective_cudnn_ver < 92800) {
-                return {error_code_t::GRAPH_NOT_SUPPORTED,
-                        "Unified SDPA backward node doesn't yet support attention score modifiers before cuDNN 9.28"};
-            }
+            // ALiBi, diagonal-band masks (causal, bottom-right causal, sliding window) and the forward score modifier
+            // are lowered as a score-modifier subgraph and replayed on the recomputed scores inside the backend
+            // kernel; a user-provided backward modifier (score_mod_bprop) has no backend counterpart.
             if (attention_score_modifier_bprop != nullptr) {
                 return {error_code_t::GRAPH_NOT_SUPPORTED,
                         "Unified SDPA backward node doesn't yet support attention_score_modifier_bprop "
                         "(score_mod_bprop); use the composite implementation"};
             }
-            // Dropout: the backward regenerates the forward's Philox mask from the seed / offset (cuDNN 9.28 dev line).
-            if (dropout_probability.has_value() && dropout_probability.value() != 0.0f && effective_cudnn_ver < 92800) {
-                return {error_code_t::GRAPH_NOT_SUPPORTED,
-                        "Unified SDPA backward node doesn't yet support dropout before cuDNN 9.28"};
-            }
-            // Deterministic dQ, via the engine's STAGES knob pinned by the node: kv-ordered workspace reduction on
-            // SM90, split dK/dV and dQ kernels on SM10x, and the dS workspace with a post-kernel dQ matmul on SM8x /
-            // SM12x (the SM80 variant).
-            if (is_deterministic_algorithm && effective_cudnn_ver < 92900) {
-                return {error_code_t::GRAPH_NOT_SUPPORTED,
-                        "Unified SDPA backward node supports the deterministic algorithm from cuDNN 9.29"};
-            }
+            // Dropout: the backward regenerates the forward's Philox mask from the seed / offset.
+            // Deterministic dQ: via the engine's STAGES knob pinned by the node (kv-ordered workspace reduction on
+            // SM90, split dK/dV and dQ kernels on SM10x, the dS workspace with a post-kernel dQ matmul on SM8x /
+            // SM12x).
             if (!unified_layouts_ok && (max_total_seq_len_q.has_value() || max_total_seq_len_kv.has_value())) {
                 return {error_code_t::GRAPH_NOT_SUPPORTED,
-                        "Unified SDPA backward node doesn't yet support max_total_seq_len_q/kv"};
+                        "Unified SDPA backward node doesn't yet support max_total_seq_len_q/kv on this device"};
             }
             for (const auto& [key, value] : inputs) {
                 if (!unified_layouts_ok && value != nullptr && value->get_ragged_offset() != nullptr) {
                     return {error_code_t::GRAPH_NOT_SUPPORTED,
-                            "Unified SDPA backward node doesn't yet support ragged (packed) layouts"};
+                            "Unified SDPA backward node doesn't yet support ragged (packed) layouts on this device"};
                 }
             }
             for (const auto& [key, value] : outputs) {
                 if (!unified_layouts_ok && value != nullptr && value->get_ragged_offset() != nullptr) {
                     return {error_code_t::GRAPH_NOT_SUPPORTED,
-                            "Unified SDPA backward node doesn't yet support ragged (packed) layouts"};
+                            "Unified SDPA backward node doesn't yet support ragged (packed) layouts on this device"};
                 }
             }
 

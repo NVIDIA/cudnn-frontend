@@ -244,7 +244,7 @@ def test_sdpa_random_bwd_L0(env_info, test_no, request, cudnn_handle):
 # # =====================================================
 
 # Dense FP16/BF16 backward without masks, bias, dropout, sink or the deterministic algorithm: the
-# feature set the unified backward node accepts today (cuDNN 9.27+, SM80 and up). Forces the
+# feature set the unified backward node accepts today (cuDNN 9.29+, SM80 and up). Forces the
 # UNIFIED implementation on the backward graph (overridable with --implementation) and compares
 # dQ/dK/dV against the reference like every other backward test; configs the unified node still
 # rejects route to COMPOSITE under AUTO, so this test is the one that must actually run unified.

@@ -252,8 +252,8 @@ def test_sdpa_bprop_with_causal_score_mod_vs_reference(cudnn_handle, implementat
     cudnn_version = LooseVersion(cudnn.backend_version_string())
     if cudnn_version < "9.6.0":
         pytest.skip("SDPA with flexible graphs requires cudnn 9.6.0 or higher")
-    if implementation == cudnn.attention_implementation.UNIFIED and cudnn_version < "9.28.0":
-        pytest.skip("unified SDPA backward with score modifiers requires cudnn 9.28.0 or higher")
+    if implementation == cudnn.attention_implementation.UNIFIED and cudnn_version < "9.29.0":
+        pytest.skip("unified SDPA backward with score modifiers requires cudnn 9.29.0 or higher")
 
     q_gpu = torch.randn(b, h, s_q, d, dtype=torch.float16, device="cuda")
     k_gpu = torch.randn(b, h, s_kv, d, dtype=torch.float16, device="cuda")
