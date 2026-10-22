@@ -501,6 +501,18 @@ cudnn.gated_attention_block.DECODE_ROUTE_SINGLE_UNIT
 cudnn.gated_attention_block.DECODE_ROUTE_TOKEN_UNITS
 cudnn.gated_attention_block.DecodeEnvelope
 cudnn.gated_attention_block.DecodeEnvelope.claimed_max_s_q
+cudnn.gated_attention_block.DecodeEnvelope.fuse_prepare_default
+cudnn.gated_attention_block.DecodeEnvelope.index_block_sizes
+cudnn.gated_attention_block.DecodeEnvelope.index_cache_dtypes
+cudnn.gated_attention_block.DecodeEnvelope.index_head_dims
+cudnn.gated_attention_block.DecodeEnvelope.index_kv_heads
+cudnn.gated_attention_block.DecodeEnvelope.index_list_form_default
+cudnn.gated_attention_block.DecodeEnvelope.index_list_forms
+cudnn.gated_attention_block.DecodeEnvelope.index_page_sizes
+cudnn.gated_attention_block.DecodeEnvelope.index_query_rows_max
+cudnn.gated_attention_block.DecodeEnvelope.index_sources
+cudnn.gated_attention_block.DecodeEnvelope.index_state_rows_extra
+cudnn.gated_attention_block.DecodeEnvelope.index_top_k_range
 cudnn.gated_attention_block.DecodeEnvelope.inference_only
 cudnn.gated_attention_block.DecodeEnvelope.kv_cache_dtypes
 cudnn.gated_attention_block.DecodeEnvelope.pdl_default
@@ -601,6 +613,9 @@ cudnn.gated_attention_block.ProjBlock.real
 cudnn.gated_attention_block.ProjBlock.to_bytes
 cudnn.gated_attention_block.ProjBlock.value
 cudnn.gated_attention_block.QKVG_TILE_ALIGN
+cudnn.gated_attention_block.QSA_INDEX_LIST_FORMS
+cudnn.gated_attention_block.QSA_INDEX_LIST_FORM_PER_ROW
+cudnn.gated_attention_block.QSA_INDEX_LIST_FORM_SHARED
 cudnn.gated_attention_block.QsaSpec
 cudnn.gated_attention_block.QsaSpec.block_size
 cudnn.gated_attention_block.QsaSpec.identity_bound
@@ -611,6 +626,7 @@ cudnn.gated_attention_block.QsaSpec.index_cache_e4m3
 cudnn.gated_attention_block.QsaSpec.index_head_dim
 cudnn.gated_attention_block.QsaSpec.index_heads
 cudnn.gated_attention_block.QsaSpec.index_kv_heads
+cudnn.gated_attention_block.QsaSpec.index_list_form
 cudnn.gated_attention_block.QsaSpec.index_norm_eps
 cudnn.gated_attention_block.QsaSpec.index_source
 cudnn.gated_attention_block.QsaSpec.top_k

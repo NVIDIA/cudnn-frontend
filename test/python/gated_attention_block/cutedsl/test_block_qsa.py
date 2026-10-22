@@ -344,17 +344,25 @@ def test_workspace_carve_of_the_decode_indexer_is_the_caller_list_carve_plus_fiv
     assert _index_state_ring_extra_rows(q.block_size) == q.block_size - 1 == 3  # == kernels.qsa_compress.min_ring_rows(0, 4), checked at plan time
 
 
-def test_decode_indexer_declines_are_published_row_by_row_and_the_envelope_names_the_indexer_facts():
+def test_decode_indexer_declines_are_published_row_by_row_and_the_envelope_names_the_indexer_facts(monkeypatch):
     """The decode indexer's decline rows (`_qsa_decode_decline_texts`) reach the envelope VERBATIM under a sparse geometry on every reading,
     each carrying its one shared token, and the FlashInfer-read indexer facts are published by name on a Rubin reading: `index_sources`
     (`"caller"`, `"indexer"` at bf16 x head dim 128; `"caller"` alone at f16), the cache dtype, the head dims / KV heads / block sizes, the
     `top_k` range, the 64-row query envelope, the ring's extra rows, the page sizes the paged scorer serves, `fuse_prepare_default` True on the measured part (cc 10.7,
-    2026-10-21) for the bf16 indexer geometry and False off it; a DENSE geometry publishes none of them (any device, no host sync)."""
+    2026-10-21) for the bf16 indexer geometry and False off it -- the DSL state MODELED as the served one (the facts are a reading of the SERVED
+    form, never of this host's wheel); a DENSE geometry publishes none of them (any device, no host sync)."""
     import dataclasses
 
+    from cudnn.frost import buffers as _buffers
     from cudnn.gated_attention_block import DecodeEnvelope
     from cudnn.gated_attention_block.api import SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS, _qsa_decode_decline_texts
 
+    # the DSL state MODELED as the served one (the public 4.8.0 wheel with the sm_107a target, the version-gate cell's convention): the facts
+    # published for the measured part are a reading of the SERVED form, never of this host's wheel -- under a DSL at the floor but without
+    # the Rubin target (the public 4.7 wheels) `serving_envelope(..., device_cc=(10, 7))` reports decode unserved and the knob's AUTO reading
+    # False, the rule this cell is not about
+    monkeypatch.setattr(_buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.8.0")))
+    monkeypatch.setattr(_buffers, "_cutedsl_has_sm107", lambda: True)
     tokens = {
         "shared_list_rows": "tail covers at most two blocks",
         "indexer_f16": "needs bf16 activations",

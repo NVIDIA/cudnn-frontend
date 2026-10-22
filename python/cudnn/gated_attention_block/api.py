@@ -309,7 +309,7 @@ stages exist to be honest about.
 
 from __future__ import annotations
 
-import logging
+import math
 import os
 import warnings
 from abc import ABC, abstractmethod
@@ -323,10 +323,6 @@ from cuda.bindings import driver as cuda
 
 from cudnn._torch_stream import as_torch_stream
 from cudnn.api_base import APIBase, TensorDesc, TupleDict
-from cudnn.frost.workspace import WorkspaceLayout
-
-_logger = logging.getLogger(__name__)
-
 
 # ---------------------------------------------------------------------------
 # 1. Stage (1) layout — exactly what the QKV+GATE matmul computes and where it lands
@@ -2767,7 +2763,7 @@ class QuantSpec:
             raise NotImplementedError(f"QuantSpec: only torch.float8_e4m3fn is served, got {self.dtype}")
         for name in ("descale_h", "descale_w_qkvg", "descale_w_o", "scale_q", "scale_k", "scale_v", "scale_o"):
             v = float(getattr(self, name))
-            if not (v > 0.0) or v != v or v in (float("inf"),):
+            if not (v > 0.0) or math.isnan(v) or v in (float("inf"),):
                 raise ValueError(f"QuantSpec.{name} must be a finite positive float, got {v}")
 
     @property
@@ -2928,7 +2924,7 @@ class MxQuantSpec:
             raise NotImplementedError(f"MxQuantSpec.o_fp4 needs torch.float4_e2m1fn_x2 for the packed e2m1 O and W_o (torch {torch.__version__} has none)")
         for name in ("descale_w_o", "scale_o"):
             v = float(getattr(self, name))
-            if not (v > 0.0) or v != v or v in (float("inf"),):
+            if not (v > 0.0) or math.isnan(v) or v in (float("inf"),):
                 raise ValueError(f"MxQuantSpec.{name} must be a finite positive float, got {v}")
         if self.o_fp4 is not None:
             # No global scale on either fp4 side (plan section 1): the O quantizer writes local block scales

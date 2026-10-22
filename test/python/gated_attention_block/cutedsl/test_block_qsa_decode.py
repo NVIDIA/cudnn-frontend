@@ -68,14 +68,13 @@ import torch
 from cudnn.frost.buffers import cutedsl_requirement_error
 from cudnn.gated_attention_block import (
     KV_SOURCE_PAGED,
-    KV_SOURCE_SELF,
     DecodeEnvelope,
     GatedAttentionBlockFwd,
     GatedAttentionBlockGeometry,
     QsaSpec,
     index_k_raw_view,
 )
-from cudnn.gated_attention_block.api import _EXTEND_DECLINES, _cols, _IndexerDecode, _qsa_decode_decline_texts, _QsaPrepare, _SparseSdpa, _view, ProjBlock
+from cudnn.gated_attention_block.api import _EXTEND_DECLINES, _cols, _IndexerDecode, _QsaPrepare, _SparseSdpa, _view, ProjBlock
 
 requirement_error = cutedsl_requirement_error("the gated attention block's sparse decode tests")
 if requirement_error:
@@ -647,7 +646,126 @@ def _attend(ref, allowed, p_live, scale, dtype, h_q, G):
     return og, lse
 
 
-class _Case:
+class _CaseBase:
+    """The methods the two sparse-decode cases share -- ``_Case`` (the caller-list step) and ``_IndexerCase`` (the in-block indexer's step):
+    compile / execute / run over the declared block, the slab views, the label and the oracle check.  Each case's ``__init__`` builds its
+    own state from its own inputs (the indexer's case declares a different geometry and primes the ring and the compressed cache), so the
+    base has none: neither case skips a base initializer."""
+
+    def compile(self):
+        assert self.blk.check_support()
+        self.blk.compile()
+        self.ws = torch.full((self.blk.get_workspace_size(),), 0x7F, dtype=torch.uint8, device=_DEV)
+        return self
+
+    def execute(
+        self, *, out=None, ws=None, lse=None, h=None, cos=None, sin=None, kv_lens=None, block_table=None, slot_mapping=None, ids=None, lens=None, stream=None
+    ):
+        out = self.out if out is None else out
+        self.blk.execute(
+            self.h if h is None else h,
+            self.w["w_qkvg"],
+            self.w["w_q_norm"],
+            self.w["w_k_norm"],
+            self.cos if cos is None else cos,
+            self.sin if sin is None else sin,
+            self.w["w_o"],
+            out,
+            self.ws if ws is None else ws,
+            lse=(self.lse if lse is None else lse) if self.return_lse else None,
+            block_ids=self.block_ids if ids is None else ids,
+            block_lens=(self.block_lens if lens is None else lens) if self.block_lens_given else None,
+            k_cache=self.k_cache,
+            v_cache=self.v_cache,
+            block_table=self.block_table if block_table is None else block_table,
+            kv_lens=self.kv_lens_t if kv_lens is None else kv_lens,
+            slot_mapping=self.slot_mapping if slot_mapping is None else slot_mapping,
+            index_k_raw=self.index_cache,
+            current_stream=stream,
+        )
+        return out
+
+    def run(self):
+        if self.ws is None:
+            self.compile()
+        self.out.fill_(_sentinel(self.dtype))
+        if self.lse is not None:
+            self.lse.fill_(_sentinel(self.dtype))
+        self.execute()
+        torch.cuda.synchronize()
+        return self.out
+
+    def slab_views(self, ws=None):
+        """The post-norm-RoPE Q band, the GATE band, the K / V bands of the slab the last execute left in the workspace, as the
+        sparse stage's ``[B, S_q, H, D]`` views at the slab's token stride, and the O slot."""
+        ws = self.ws if ws is None else ws
+        g, lay = self.geom, self.blk._ws
+        B, S = self.blk.batch, self.blk.seq_len
+        t = B * S
+        proj = _view(ws, lay.proj, (t, g.n_qkvg), self.dtype)
+        o_q, o_g, o_k, o_v = g.qkvg_offsets[:4]
+        q = _cols(proj, o_q, g.h_q, g.d_head).view(B, S, g.h_q, g.d_head)
+        gate = _cols(proj, o_g, g.h_q, g.d_head).view(B, S, g.h_q, g.d_head)
+        k = _cols(proj, o_k, g.h_kv, g.d_head).view(B, S, g.h_kv, g.d_head)
+        v = _cols(proj, o_v, g.h_kv, g.d_head).view(B, S, g.h_kv, g.d_head)
+        o = _view(ws, lay.o, (t, g.h_q, g.d_head), self.dtype).view(B, S, g.h_q, g.d_head)
+        return q, gate, k, v, o, proj
+
+    def label(self):
+        form = f"{'shared' if self.shared else 'per-row'}{'' if self.index_list_form is None else ' (declared)'}"
+        return f"[{self.geom.h_q}/{self.geom.h_kv} S_q={self.s_q} {form} p{self.page} {self.layout} {self.dtype} split={self.blk.decode_split_kv} gate={'fused' if self.fuse_gate else 'launch'} lse={self.return_lse} lens={self.kv_lens}]"
+
+    def check(self, out=None, ws=None, lse=None, *, what="out"):
+        """The standard assertions: finite, no sentinel, dead rows exact, within the budget vs the oracle (out, the gated O slot, the
+        LSE), the pools' step rows bitwise the slab's K / V bands, the prefix rows and the NULL block untouched."""
+        out = self.out if out is None else out
+        ws = self.ws if ws is None else ws
+        lse = self.lse if lse is None else lse
+        sent = _sentinel(self.dtype)
+        live = self.live_rows
+        dead = ~live
+        q, gate, k, v, o, proj = self.slab_views(ws)
+        assert torch.isfinite(out.float()).all(), f"{what}: non-finite out"
+        assert not (out.float() == sent).any(), f"{what}: a sentinel survived in out"
+        assert torch.isfinite(o.float()).all(), f"{what}: non-finite gated O (a row the sparse core never wrote keeps the workspace fill)"
+        if dead.any():
+            assert (out[dead] == 0).all() and (o[dead] == 0).all(), f"{what}: a dead row's out and O must be exactly 0"
+        c = _cos(out[live], self.ref_out[live])
+        d_out = float((out[live].float() - self.ref_out[live].float()).abs().max())
+        d_o = float((o[live].float() - self.ref_o_gated[live].float()).abs().max())
+        d_lse = 0.0
+        if self.return_lse:
+            assert lse is not None and not (lse == sent).any(), f"{what}: a sentinel survived in LSE"
+            dead_bhs = dead[:, None, :].expand_as(lse)
+            if dead.any():
+                assert torch.isinf(lse[dead_bhs]).all() and (lse[dead_bhs] < 0).all(), f"{what}: a dead row's LSE must be -inf exactly"
+            d_lse = float((lse[~dead_bhs] - self.ref_lse[~dead_bhs]).abs().max()) if live.any() else 0.0
+            assert d_lse <= ATOL, f"{what}: LSE off the oracle by {d_lse} (budget {ATOL})"
+        assert c > COS_OUT, f"{what}: cos(out) {c} <= {COS_OUT}"
+        assert d_o <= ATOL, f"{what}: gated O off the oracle by {d_o} (budget {ATOL})"
+        # the write-through: the step's live rows are the slab's post-RoPE K / V rows, bitwise; nothing else moved
+        slot = self.slot_mapping
+        lv = slot >= 0
+        s_ = slot[lv].long()
+        kf, vf = k.reshape(-1, self.geom.h_kv, D), v.reshape(-1, self.geom.h_kv, D)
+        assert torch.equal(_bits(self.k_cache[s_ // self.page, :, s_ % self.page, :]), _bits(kf[lv])), f"{what}: the K pool rows are not the slab's rows"
+        assert torch.equal(_bits(self.v_cache[s_ // self.page, :, s_ % self.page, :]), _bits(vf[lv])), f"{what}: the V pool rows are not the slab's rows"
+        for pool, before in zip((self.k_cache, self.v_cache), self.prefix_bits):
+            now = _bits(pool)
+            touched = (now != before).any(dim=-1).any(dim=1)  # [n_pages, page] rows whose bits moved
+            rows_moved = touched.nonzero()
+            written = set((int(p) for p in (s_ // self.page * self.page + s_ % self.page).tolist()))
+            assert all(int(pg) * self.page + int(off) in written for pg, off in rows_moved), f"{what}: a pool row outside the step's slots moved"
+            assert not touched[0].any(), f"{what}: the NULL block moved"
+        if self.index_cache is not None:
+            raw = index_k_raw_view(proj, self.geom, self.blk.batch, self.blk.seq_len)  # [B, S, 1, index_head_dim]
+            assert torch.equal(_bits(self.index_cache[s_ // self.page, s_ % self.page, :]), _bits(raw.reshape(-1, raw.shape[-1])[lv]))
+            assert (~torch.isnan(self.index_cache.float())).all(-1).sum().item() == int(lv.sum())
+        print(f"\n{self.label()} {what}: cos(out) {c:.6f} max|d out| {d_out:.4e} max|d O_gated| {d_o:.4e} max|d LSE| {d_lse:.2e} dead rows {int(dead.sum())}")
+        return dict(cos=c, d_out=d_out, d_o=d_o, d_lse=d_lse, dead=int(dead.sum()))
+
+
+class _Case(_CaseBase):
     """One sparse DECODE step over a batch of sequences with lengths ``kv_lens`` (0 = a dead entry; a length below ``s_q`` leaves
     the rows with a negative position dead): the whole-sequence inputs per entry, the step's inputs (its last ``s_q`` positions),
     the NaN-filled pools holding the ORACLE's prefix K / V, the block table (page 0 = the NULL block of a dead entry, ``-1`` past a
@@ -802,118 +920,6 @@ class _Case:
         assert isinstance(self.blk._sdpa, _SparseSdpa) and self.blk.sparse_decode and self.blk.qsa_shared_list is self.shared
         self.ws = None
 
-    def compile(self):
-        assert self.blk.check_support()
-        self.blk.compile()
-        self.ws = torch.full((self.blk.get_workspace_size(),), 0x7F, dtype=torch.uint8, device=_DEV)
-        return self
-
-    def execute(
-        self, *, out=None, ws=None, lse=None, h=None, cos=None, sin=None, kv_lens=None, block_table=None, slot_mapping=None, ids=None, lens=None, stream=None
-    ):
-        out = self.out if out is None else out
-        self.blk.execute(
-            self.h if h is None else h,
-            self.w["w_qkvg"],
-            self.w["w_q_norm"],
-            self.w["w_k_norm"],
-            self.cos if cos is None else cos,
-            self.sin if sin is None else sin,
-            self.w["w_o"],
-            out,
-            self.ws if ws is None else ws,
-            lse=(self.lse if lse is None else lse) if self.return_lse else None,
-            block_ids=self.block_ids if ids is None else ids,
-            block_lens=(self.block_lens if lens is None else lens) if self.block_lens_given else None,
-            k_cache=self.k_cache,
-            v_cache=self.v_cache,
-            block_table=self.block_table if block_table is None else block_table,
-            kv_lens=self.kv_lens_t if kv_lens is None else kv_lens,
-            slot_mapping=self.slot_mapping if slot_mapping is None else slot_mapping,
-            index_k_raw=self.index_cache,
-            current_stream=stream,
-        )
-        return out
-
-    def run(self):
-        if self.ws is None:
-            self.compile()
-        self.out.fill_(_sentinel(self.dtype))
-        if self.lse is not None:
-            self.lse.fill_(_sentinel(self.dtype))
-        self.execute()
-        torch.cuda.synchronize()
-        return self.out
-
-    def slab_views(self, ws=None):
-        """The post-norm-RoPE Q band, the GATE band, the K / V bands of the slab the last execute left in the workspace, as the
-        sparse stage's ``[B, S_q, H, D]`` views at the slab's token stride, and the O slot."""
-        ws = self.ws if ws is None else ws
-        g, lay = self.geom, self.blk._ws
-        B, S = self.blk.batch, self.blk.seq_len
-        t = B * S
-        proj = _view(ws, lay.proj, (t, g.n_qkvg), self.dtype)
-        o_q, o_g, o_k, o_v = g.qkvg_offsets[:4]
-        q = _cols(proj, o_q, g.h_q, g.d_head).view(B, S, g.h_q, g.d_head)
-        gate = _cols(proj, o_g, g.h_q, g.d_head).view(B, S, g.h_q, g.d_head)
-        k = _cols(proj, o_k, g.h_kv, g.d_head).view(B, S, g.h_kv, g.d_head)
-        v = _cols(proj, o_v, g.h_kv, g.d_head).view(B, S, g.h_kv, g.d_head)
-        o = _view(ws, lay.o, (t, g.h_q, g.d_head), self.dtype).view(B, S, g.h_q, g.d_head)
-        return q, gate, k, v, o, proj
-
-    def label(self):
-        form = f"{'shared' if self.shared else 'per-row'}{'' if self.index_list_form is None else ' (declared)'}"
-        return f"[{self.geom.h_q}/{self.geom.h_kv} S_q={self.s_q} {form} p{self.page} {self.layout} {self.dtype} split={self.blk.decode_split_kv} gate={'fused' if self.fuse_gate else 'launch'} lse={self.return_lse} lens={self.kv_lens}]"
-
-    def check(self, out=None, ws=None, lse=None, *, what="out"):
-        """The standard assertions: finite, no sentinel, dead rows exact, within the budget vs the oracle (out, the gated O slot, the
-        LSE), the pools' step rows bitwise the slab's K / V bands, the prefix rows and the NULL block untouched."""
-        out = self.out if out is None else out
-        ws = self.ws if ws is None else ws
-        lse = self.lse if lse is None else lse
-        sent = _sentinel(self.dtype)
-        live = self.live_rows
-        dead = ~live
-        q, gate, k, v, o, proj = self.slab_views(ws)
-        assert torch.isfinite(out.float()).all(), f"{what}: non-finite out"
-        assert not (out.float() == sent).any(), f"{what}: a sentinel survived in out"
-        assert torch.isfinite(o.float()).all(), f"{what}: non-finite gated O (a row the sparse core never wrote keeps the workspace fill)"
-        if dead.any():
-            assert (out[dead] == 0).all() and (o[dead] == 0).all(), f"{what}: a dead row's out and O must be exactly 0"
-        c = _cos(out[live], self.ref_out[live])
-        d_out = float((out[live].float() - self.ref_out[live].float()).abs().max())
-        d_o = float((o[live].float() - self.ref_o_gated[live].float()).abs().max())
-        d_lse = 0.0
-        if self.return_lse:
-            assert lse is not None and not (lse == sent).any(), f"{what}: a sentinel survived in LSE"
-            dead_bhs = dead[:, None, :].expand_as(lse)
-            if dead.any():
-                assert torch.isinf(lse[dead_bhs]).all() and (lse[dead_bhs] < 0).all(), f"{what}: a dead row's LSE must be -inf exactly"
-            d_lse = float((lse[~dead_bhs] - self.ref_lse[~dead_bhs]).abs().max()) if live.any() else 0.0
-            assert d_lse <= ATOL, f"{what}: LSE off the oracle by {d_lse} (budget {ATOL})"
-        assert c > COS_OUT, f"{what}: cos(out) {c} <= {COS_OUT}"
-        assert d_o <= ATOL, f"{what}: gated O off the oracle by {d_o} (budget {ATOL})"
-        # the write-through: the step's live rows are the slab's post-RoPE K / V rows, bitwise; nothing else moved
-        slot = self.slot_mapping
-        lv = slot >= 0
-        s_ = slot[lv].long()
-        kf, vf = k.reshape(-1, self.geom.h_kv, D), v.reshape(-1, self.geom.h_kv, D)
-        assert torch.equal(_bits(self.k_cache[s_ // self.page, :, s_ % self.page, :]), _bits(kf[lv])), f"{what}: the K pool rows are not the slab's rows"
-        assert torch.equal(_bits(self.v_cache[s_ // self.page, :, s_ % self.page, :]), _bits(vf[lv])), f"{what}: the V pool rows are not the slab's rows"
-        for pool, before in zip((self.k_cache, self.v_cache), self.prefix_bits):
-            now = _bits(pool)
-            touched = (now != before).any(dim=-1).any(dim=1)  # [n_pages, page] rows whose bits moved
-            rows_moved = touched.nonzero()
-            written = set((int(p) for p in (s_ // self.page * self.page + s_ % self.page).tolist()))
-            assert all(int(pg) * self.page + int(off) in written for pg, off in rows_moved), f"{what}: a pool row outside the step's slots moved"
-            assert not touched[0].any(), f"{what}: the NULL block moved"
-        if self.index_cache is not None:
-            raw = index_k_raw_view(proj, self.geom, self.blk.batch, self.blk.seq_len)  # [B, S, 1, index_head_dim]
-            assert torch.equal(_bits(self.index_cache[s_ // self.page, s_ % self.page, :]), _bits(raw.reshape(-1, raw.shape[-1])[lv]))
-            assert (~torch.isnan(self.index_cache.float())).all(-1).sum().item() == int(lv.sum())
-        print(f"\n{self.label()} {what}: cos(out) {c:.6f} max|d out| {d_out:.4e} max|d O_gated| {d_o:.4e} max|d LSE| {d_lse:.2e} dead rows {int(dead.sum())}")
-        return dict(cos=c, d_out=d_out, d_o=d_o, d_lse=d_lse, dead=int(dead.sum()))
-
 
 def _two_launches(case: _Case, what: str):
     a = case.run().clone()
@@ -1057,7 +1063,6 @@ def test_the_block_form_equals_the_standalone_adapter_bitwise_on_the_same_views(
         case.run()
         case.check(what=f"adapter twin split {split}")
         q, gate, _k, _v, o, _proj = case.slab_views()
-        B, S = case.blk.batch, case.blk.seq_len
         o2 = torch.full_like(o, _sentinel(case.dtype))
         lse2 = torch.full_like(case.lse, _sentinel(case.dtype))
         a = SparseGqaFwdDslSm107(
@@ -1465,7 +1470,7 @@ def test_decode_indexer_declaration_facts_carve_and_the_envelope_rows(monkeypatc
             _declare_indexer(GEOM_SMALL, 1, 1, use_pdl=True)
         # the knob's AUTO reading: the measured part (cc 10.7) resolves True on the indexer's decode step, every other part False, the
         # caller-list band form False everywhere; an explicit value wins on every part; the declaration is kept beside the resolved knob
-        import cudnn.gated_attention_block.api as _api
+        from cudnn.gated_attention_block import api as _api
 
         for cc, want in (((10, 7), True), ((10, 0), False), ((10, 3), False), ((9, 0), False), (None, False)):
             monkeypatch.setattr(_api, "_device_cc_of", lambda device, _cc=cc: _cc)
@@ -1495,7 +1500,15 @@ def test_decode_indexer_declaration_facts_carve_and_the_envelope_rows(monkeypatc
         monkeypatch.undo()
         # the ring rule's DSL-free spelling
         assert _index_state_ring_extra_rows(BS) == 3
-        # the envelope on a Rubin reading: the indexer rows a serving stack READS (never re-spells), pinned by name
+        # the envelope on a Rubin reading, the DSL state MODELED as the served one (the public 4.8.0 wheel with the sm_107a target, the
+        # sibling modules' pin): the facts published for the measured part are a reading of the SERVED form, never of this host's wheel --
+        # a DSL at the floor but without the Rubin target (the public 4.7 wheels) reports decode unserved and the knob's AUTO reading False,
+        # the rule this cell is not about
+        from cudnn.frost import buffers as _buffers
+
+        monkeypatch.setattr(_buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.8.0")))
+        monkeypatch.setattr(_buffers, "_cutedsl_has_sm107", lambda: True)
+        # the indexer rows a serving stack READS (never re-spells), pinned by name
         geom = _declare_indexer(GEOM_SMALL, 1, 1).geom
         env = GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV, device_cc=_SM107)
         d = env.decode
@@ -1773,7 +1786,7 @@ def _set_vs_topk(in_set: torch.Tensor, scores: torch.Tensor, top_k: int, tol: fl
     return flips, int(differs.any(dim=-1).sum()), float(gap.max())
 
 
-class _IndexerCase(_Case):
+class _IndexerCase(_CaseBase):
     """One decode step of the IN-BLOCK INDEXER over the pools: ``_Case``'s batch of sequences (the whole-sequence inputs per entry, the
     dense reference's Q / K / V / gate, the NaN pools holding the oracle's prefix K / V, the table, the slots) plus the indexer's state --
     the band's raw keys of every position from the oracle's own projection, the PREFIX blocks compressed through the compress kernel

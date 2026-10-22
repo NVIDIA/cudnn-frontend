@@ -2146,7 +2146,9 @@ def test_decode_indexer_steps_after_a_prefill_carry_the_ring_and_the_paged_cache
     them: four at ``S_q`` 1 (the step at 303 completes block 75 from three ring rows + its own key), then ``S_q`` 4 with a rejected draft
     (two of four accepted; the draft's completing row had written block 76 -- outside the accepted reach) RE-STEPPED over the same
     positions (block 76 rewritten from the accepted keys), a three-of-four acceptance, a full one.  After EVERY step: the counts are the
-    visible counts (a completing row sees its OWN block), the list a valid descending prefix, the attention of every row within the
+    visible counts (a completing row sees its OWN block), the list EXACTLY the visible set in descending order (``top_k`` above every
+    visible count, so the scorer's top-k is that set in closed form; the binding top-k is the decode module's ladder), the attention of
+    every row within the
     budget of the fp32 oracle fed the kernel's list (the two-stage oracle over the ACCEPTED prefix + the step's own tokens), the ring
     rows of the step the slab's raw keys, the pools' step rows the slab's K / V; and the cache's rows for every complete block of the
     ACCEPTED stream BITWISE a from-scratch prefill compress of that stream's raw keys (the compress kernel's dense form over the keys
@@ -2279,6 +2281,12 @@ def test_decode_indexer_steps_after_a_prefill_carry_the_ring_and_the_paged_cache
         assert torch.equal(valid, torch.arange(top_k, device="cuda")[None, :] < lens_out.view(s_q, 1)), f"{label}: the valid prefix"
         assert bool(((ids[:, :-1] - ids[:, 1:]).masked_fill(~valid[:, 1:], 1) > 0).all()), f"{label}: a list is not strictly descending"
         assert bool((torch.where(valid, ids, torch.full_like(ids, -1)).amax(-1) < counts).all()), f"{label}: an id at or past the visible count"
+        # the expected list in closed form: with top_k (512) above every visible count (<= 79 blocks here) the scorer's top-k IS the visible set,
+        # so the complete returned list must be exactly `count - 1 .. 0` then padding -- a wrong yet well-formed selection cannot hide in the
+        # shape checks above; the BINDING top-k (fewer slots than visible blocks) is compared against the fp64 top-k of the kernel's own
+        # operands in the decode module's ladder (`check_selection`) and, for the prefill form, by `_indexer_two_stage` here
+        want_ids = torch.where(valid, counts[:, None] - 1 - torch.arange(top_k, device="cuda", dtype=torch.int32)[None, :], torch.full_like(ids, -1))
+        assert torch.equal(torch.where(valid, ids, torch.full_like(ids, -1)), want_ids), f"{label}: the list is not the complete visible set, descending"
         for j in range(s_q):
             if (pos0 + j + 1) % BS == 0:
                 k = (pos0 + j) // BS
