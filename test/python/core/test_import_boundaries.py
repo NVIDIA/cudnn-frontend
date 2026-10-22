@@ -116,6 +116,45 @@ def test_importing_cudnn_ops_pulls_no_framework():
     _assert_absent(_imported_by("import cudnn\nimport cudnn.ops"), "import cudnn.ops")
 
 
+@pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="QSA operations require torch")
+@pytest.mark.parametrize("implementation_first", [False, True])
+def test_qsa_public_entries_resolve_after_package_move(implementation_first):
+    """The unreleased QSA APIs have one documented prefix and no DSA/GAB shims."""
+    _modules(f"""
+import importlib
+import inspect
+import cudnn.ops
+
+targets = {{
+    "qsa_forward": "cudnn.QSA.api",
+    "qsa_backward": "cudnn.QSA.api",
+    "qsa_indexed_forward": "cudnn.QSA.indexed",
+    "qsa_indexed_backward": "cudnn.QSA.indexed",
+    "qsa_select_forward": "cudnn.QSA.selection",
+    "qsa_select_decode_forward": "cudnn.QSA.selection",
+    "qsa_select_decode_paged_forward": "cudnn.QSA.selection_paged",
+}}
+for name, module in targets.items():
+    if {implementation_first!r}:
+        implementation = importlib.import_module(module)
+    entry = getattr(cudnn.ops, name)
+    implementation = importlib.import_module(module)
+    assert inspect.isfunction(entry) and entry is getattr(implementation, name), name
+    assert name.endswith(("_forward", "_backward")), name
+    assert getattr(cudnn.ops, name) is entry, name
+
+assert not hasattr(cudnn.ops, "qsa_two_pass_backward")
+for name in ("qsa_indexed_forward", "qsa_indexed_backward",
+             "GqaSparseAttentionBackward", "gqa_sparse_attention_backward_wrapper"):
+    assert not hasattr(cudnn.DSA, name), name
+for module in ("cudnn.deepseek_sparse_attention.qsa_training",
+               "cudnn.deepseek_sparse_attention.gqa_sparse_attention_backward",
+               "cudnn.gated_attention_block.qsa_select",
+               "cudnn.gated_attention_block.qsa_select_paged"):
+    assert importlib.util.find_spec(module) is None, module
+""")
+
+
 @pytest.mark.L0
 @pytest.mark.parametrize("module", ["cudnn.ops.norm", "cudnn.experimental.ops"])
 def test_importing_norm_op_packages_pulls_no_framework(module):

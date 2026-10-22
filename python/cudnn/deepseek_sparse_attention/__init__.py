@@ -12,8 +12,6 @@ _SYMBOLS = {
     "aligned_hca_backward_wrapper": (".aligned_hca_backward", "aligned_hca_backward_wrapper"),
     "SparseAttentionBackward": (".sparse_attention_backward", "SparseAttentionBackward"),
     "sparse_attention_backward_wrapper": (".sparse_attention_backward", "sparse_attention_backward_wrapper"),
-    "GqaSparseAttentionBackward": (".gqa_sparse_attention_backward", "GqaSparseAttentionBackward"),
-    "gqa_sparse_attention_backward_wrapper": (".gqa_sparse_attention_backward", "gqa_sparse_attention_backward_wrapper"),
     "IndexerForward": (".indexer_forward", "IndexerForward"),
     "indexer_forward_wrapper": (".indexer_forward", "indexer_forward_wrapper"),
     "indexer_forward_top_k_wrapper": (".indexer_forward", "indexer_forward_top_k_wrapper"),

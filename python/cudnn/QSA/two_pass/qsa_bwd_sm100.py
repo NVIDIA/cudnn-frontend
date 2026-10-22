@@ -5,7 +5,7 @@
 
 The launch sequence is a dense key-tile kernel for the queries below the crossover, and for the remaining queries a
 query-major kernel (S, dP, dQ and the P / dS records of every selected block) followed by a key-major kernel that
-accumulates dK / dV from those records. ``api.GqaSparseAttentionBackward`` describes the index contract.
+accumulates dK / dV from those records. ``api._QsaTwoPassBackward`` describes the index contract.
 """
 
 import math

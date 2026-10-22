@@ -31,7 +31,7 @@ def _overlaps(lhs: tuple[int, int], rhs: tuple[int, int]) -> bool:
     return lhs[0] < rhs[1] and rhs[0] < lhs[1]
 
 
-class GqaSparseAttentionBackward(APIBase):
+class _QsaTwoPassBackward(APIBase):
     """QSA backward: dQ, dK and dV from Q, K, V, O, dO, the forward LSE and the selected token indices.
 
     The geometry is 12 query heads per KV head with 2 KV heads (the model) or 1 (one of two tensor-parallel ranks),
@@ -217,10 +217,10 @@ class GqaSparseAttentionBackward(APIBase):
         return dq, dk, dv
 
 
-_cache_of_GqaSparseAttentionBackwardObjects: dict = {}
+_cache_of__QsaTwoPassBackwardObjects: dict = {}
 
 
-def gqa_sparse_attention_backward_wrapper(
+def _backward(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -241,14 +241,14 @@ def gqa_sparse_attention_backward_wrapper(
     inputs = (q, k, v, out, dout, lse, topk_idxs)
     key = (q.device, softmax_scale, max_seq_len) + tuple((tuple(t.shape), t.stride(), t.dtype) for t in inputs)
     key += tuple(None if t is None else (tuple(t.shape), t.stride(), t.dtype) for t in (dq, dk, dv, cu_seqlens))
-    obj = _cache_of_GqaSparseAttentionBackwardObjects.get(key)
+    obj = _cache_of__QsaTwoPassBackwardObjects.get(key)
     if obj is None:
-        obj = GqaSparseAttentionBackward(
+        obj = _QsaTwoPassBackward(
             *inputs, sample_dq=dq, sample_dk=dk, sample_dv=dv, softmax_scale=softmax_scale, sample_cu_seqlens=cu_seqlens, max_seq_len=max_seq_len
         )
         obj.check_support()
         obj.compile()
-        _cache_of_GqaSparseAttentionBackwardObjects[key] = obj
+        _cache_of__QsaTwoPassBackwardObjects[key] = obj
 
     with torch.cuda.device(q.device), stream_context(stream, q.device):
         dq = torch.empty_like(q) if dq is None else dq

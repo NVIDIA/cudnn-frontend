@@ -1066,7 +1066,7 @@ class QsaSpec:
     index_heads, index_kv_heads, index_head_dim, index_norm_eps
         The indexer's geometry.  Under ``index_source="caller"`` they SIZE THE BAND ONLY (no kernel reads them); under
         ``"indexer"`` they are the scorer's: ``index_heads`` a head group the indexer scorer packs, ``index_head_dim``
-        its head dim, ``index_norm_eps`` the epsilon of both indexer RMSNorms (``cudnn.gated_attention_block.qsa_select``
+        its head dim, ``index_norm_eps`` the epsilon of both indexer RMSNorms (``cudnn.QSA.selection``
         names the two).  ``index_kv_heads`` is 1 (one raw key head, the checkpoint's own validator pins it);
         ``index_head_dim`` is a multiple of ``QKVG_TILE_ALIGN`` so every indexer head keeps the band tile-aligned.
 
@@ -1074,7 +1074,7 @@ class QsaSpec:
         The INDEXER CACHE's element type under ``index_source="indexer"`` (appended): ``None`` -- the activation dtype, bf16:
         the compressed keys and the indexer queries as the compress kernel writes them -- or ``torch.float8_e4m3fn``, the fp8
         indexer cache: both as plain e4m3 of the same RMSNormed + rotated values (no scales), scored through the scorer's
-        MXFP8 arm with unit scale factors (``cudnn.gated_attention_block.qsa_select``'s e4m3 arm), the caller's
+        MXFP8 arm with unit scale factors (``cudnn.QSA.selection``'s e4m3 arm), the caller's
         ``index_k_compressed`` then an e4m3 buffer.  NUMERICS-CHANGING (3 mantissa bits move the weakest selected blocks at
         the k-th boundary: the selection agrees with the bf16 one on 99.0 % of the blocks at S = 4096, 97.4 % at 32768 and
         96.5 % at 131072 on synthetic activations, every flip a rank-boundary flip), so an attribute of ``QsaSpec`` itself, never
@@ -6158,7 +6158,7 @@ def _check_qsa_indexer_geometry(geom: GatedAttentionBlockGeometry, dtype: torch.
     stage's ``check_support`` so the stage stays honest on its own."""
     from cudnn.frost.buffers import cutedsl_requirement_error
 
-    from .qsa_select import INDEXER_SCORER_HEAD_DIM, indexer_scorer_head_groups
+    from cudnn.QSA.selection import INDEXER_SCORER_HEAD_DIM, indexer_scorer_head_groups
 
     q = geom.qsa
     if dtype != torch.bfloat16:
@@ -6209,7 +6209,7 @@ class _Indexer(_Stage):
        ``ix_kbar`` slot ``[B, floor(S / bs), D_i]`` and, when the caller passes ``index_k_compressed``, into that buffer
        as well (its rows at or past a sequence's complete blocks are never written: a cache sized for a longer context
        keeps them).
-    3. The SELECTION -- :func:`qsa_select` (the indexer scorer ``sum_h relu(q_h . kbar_j) / sqrt(D_i)`` over the blocks
+    3. The SELECTION -- :func:`qsa_select_forward` (the indexer scorer ``sum_h relu(q_h . kbar_j) / sqrt(D_i)`` over the blocks
        below ``floor((pos + 1) / bs)`` + the fused radix top-k, ties to the smaller id) into ``ix_ids`` / ``ix_scores``:
        ``[T, top_k]`` int32, the ``min(top_k, floor((pos + 1) / bs))`` selected ids then ``-1`` -- exactly the count rule
        the sparse core derives, so stage (4) needs no ``block_lens``.  The top-k's SET is reproducible but its slot order
@@ -6238,7 +6238,7 @@ class _Indexer(_Stage):
     (the one-rounding chain above); the FP8 pipeline's per-tensor cast (``kernels/quantize.py``, ``sat_e4m3(row x 1.0)`` -- the
     plan-constant scale word 1.0 makes the code exactly the saturating round-to-nearest-even e4m3 of the bf16 value, never a NaN
     from an out-of-range value) then writes the e4m3 queries into ``ix_q8`` and the e4m3 compressed keys into ``ix_kbar8``, and
-    :func:`qsa_select` scores the e4m3 pair through the DSA MXFP8 scorer with unit scale blobs
+    :func:`qsa_select_forward` scores the e4m3 pair through the DSA MXFP8 scorer with unit scale blobs
     (``sum_h relu(e4m3(q_h) . e4m3(kbar_j)) / sqrt(D_i)``).  The caller's ``index_k_compressed`` is an e4m3 buffer written by one
     more cast from the bf16 slot over the ``floor(S / bs)`` rows of every sequence -- under ``seq_lens`` the rows
     ``[floor(S_b / bs), floor(S / bs))`` of a padded sequence receive ZEROS (the slot is zero-filled per execute, so the cast
@@ -6389,10 +6389,10 @@ class _Indexer(_Stage):
             )
         host.update(cu_seqlens_q=cu_q, cand_batch_offsets=offsets.cpu())
         if self.fp8:
-            from .qsa_select import _fp8_q_scale_prefix
+            from cudnn.QSA.selection import _fp8_q_scale_prefix
 
             # The e4m3 scorer's padded Q scale prefix (every sequence rounded up to the scale span of its heads): a plan constant, so
-            # qsa_select builds nothing per execute (Rule 1).
+            # qsa_select_forward builds nothing per execute (Rule 1).
             host["cu_seqlens_q_scale_padded"] = _fp8_q_scale_prefix(cu_q, q.index_heads)
         self._set_const(host)
         # Warm the scorer GEMM and the radix top-k at the REAL (B, S, n_blocks): their compile keys carry the shape, so a smaller
@@ -6438,11 +6438,11 @@ class _Indexer(_Stage):
                     dst.record_stream(ts)  # the allocator reuses the block only once this stream's work on it is done (R1)
 
     def _select(self, qi: torch.Tensor, kbar: torch.Tensor, ids: torch.Tensor, scores: torch.Tensor, cand: torch.Tensor, *, stream: int) -> torch.Tensor:
-        """The scorer + top-k on the block's stream, every buffer preallocated (the CUDA-graph form of :func:`qsa_select`)."""
-        from .qsa_select import qsa_select
+        """The scorer + top-k on the block's stream, every buffer preallocated (the CUDA-graph form of :func:`qsa_select_forward`)."""
+        from cudnn.QSA.selection import qsa_select_forward
 
         q = self.geom.qsa
-        return qsa_select(
+        return qsa_select_forward(
             qi,
             kbar,
             self._const["cu_seqlens_q"],
@@ -7226,7 +7226,7 @@ class GatedAttentionBlockFwd(APIBase):
 
     **The fp8 indexer cache (``QsaSpec(index_source="indexer", index_cache_dtype=torch.float8_e4m3fn)``; 2026-10-14)** -- the
     in-block indexer's compressed keys and queries as plain e4m3 of the RMSNormed + rotated values (no scales; the caller's
-    ``index_k_compressed`` is then an e4m3 buffer), scored through :func:`qsa_select`'s e4m3 arm (the DSA MXFP8 scorer with unit
+    ``index_k_compressed`` is then an e4m3 buffer), scored through :func:`qsa_select_forward`'s e4m3 arm (the DSA MXFP8 scorer with unit
     scale blobs).  A declaration attribute of ``QsaSpec`` itself, never a knob (3 mantissa bits move the weakest selected blocks at the
     k-th boundary: 99.0 / 97.4 / 96.5 % set agreement with the bf16 selection at S = 4096 / 32768 / 131072 on synthetic
     activations; bf16 stays the default and the reference).  No new kernel: the compress launches write bf16 as before and the
