@@ -1812,6 +1812,8 @@ def test_training_graph_error_mode_overflow_asserts_on_all_ep2_ranks():
     _require_distributed_sm107(2)
     env = os.environ.copy()
     env.setdefault("NVIDIA_IMEX_CHANNELS", "0")
+    # The probe runs in a fresh interpreter and imports moe_ep.*, so test/python must be on its path.
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, (str(Path(__file__).resolve().parents[1]), env.get("PYTHONPATH"))))
     probe = Path(__file__).with_name("probe_moe_ep_training_graph.py")
     result = subprocess.run(
         [
@@ -1845,6 +1847,8 @@ def test_training_graph_drop_mode_overflow_completes_forward_and_backward():
     _require_distributed_sm107(2)
     env = os.environ.copy()
     env.setdefault("NVIDIA_IMEX_CHANNELS", "0")
+    # The probe runs in a fresh interpreter and imports moe_ep.*, so test/python must be on its path.
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, (str(Path(__file__).resolve().parents[1]), env.get("PYTHONPATH"))))
     probe = Path(__file__).with_name("probe_moe_ep_training_graph.py")
     result = subprocess.run(
         [
