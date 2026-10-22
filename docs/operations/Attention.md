@@ -24,10 +24,13 @@ auto options = cudnn_frontend::graph::SDPA_attributes()
     .set_compute_data_type(cudnn_frontend::DataType_t::FLOAT);
 ```
 
-Development backends with `CUDNN_HAS_SDPA_FWD_COMP_TYPE` expose
+cuDNN 9.29.0 and newer expose
 `CUDNN_ATTR_OPERATION_SDPA_FWD_COMP_TYPE`. The frontend forwards non-default
-requests through that attribute. `FLOAT` retains compatibility with older
-headers and backends; a `HALF` request fails if the attribute is unavailable.
+requests through that attribute, gated on the header version and, for dynamic
+loading, the runtime backend version. `FLOAT` retains compatibility with older
+headers and backends; a `HALF` request requires 9.29.0 or newer. Early 9.29.0
+development builds predating the attribute are not supported; use a daily
+build that includes it.
 The matching backend currently rejects `HALF` at descriptor finalization:
 this change adds precision plumbing, not an FP16-accumulator kernel.
 Other accumulation types are rejected. Softmax reductions and statistics
