@@ -65,7 +65,8 @@ from cudnn.sdpa.fwd.kernels.thd_helpers import (
     build_thd_meta_kernel,
     sanitize_v_tail,
     thd_claim_next,
-    thd_decode_unit,
+    THD_BATCH_OF_WORK_META_WORDS,
+    thd_decode_unit_prefix,
     THD_SETUP_THREADS,
 )
 from cudnn.sdpa.fwd.kernels.sm120._common import (
@@ -921,7 +922,7 @@ class SM120FusedMultiHeadAttentionForward:
             # [seq_kv(B) | cu_q(B+1) | cu_k(B+1) | remap(B) | live | ctr].
             # Per-sequence lengths come from the prefix sums; the bases offset
             # every packed (1, T, H, D) access below.
-            n_batch = (seq_kv_lens.shape[0] - 4) // 4
+            n_batch = THD_BATCH_OF_WORK_META_WORDS(seq_kv_lens.shape[0])
             meta = cutlass.make_array_view(seq_kv_lens)
             # batch_idx is a real batch index here: whichever dispatch produced
             # it has already resolved the longest-first batch_remap.
@@ -1401,7 +1402,7 @@ class SM120FusedMultiHeadAttentionForward:
             # more CTAs than there is work is harmless — the extra ones fail the
             # loop test and retire.
             _meta = cutlass.make_array_view(seq_kv_lens)
-            _nb = (seq_kv_lens.shape[0] - 4) // 4
+            _nb = THD_BATCH_OF_WORK_META_WORDS(seq_kv_lens.shape[0])
             _live = cutlass.Int32(_meta[4 * _nb + 2])
             _slot = cutlass.Array(cutlass.Int32, 1, space=cutlass.AddressSpace.smem, alignment=16)
             _bidx, _, _ = cute.arch.block_idx()
@@ -1411,7 +1412,7 @@ class SM120FusedMultiHeadAttentionForward:
             # phase up where the previous one left it.
             _phase = cutlass.Int32(0)
             while _uid < _live:
-                _qt, _b, _h = thd_decode_unit(
+                _qt, _b, _h = thd_decode_unit_prefix(
                     _meta,
                     cutlass.Int32(_nb),
                     _uid,
@@ -1488,7 +1489,7 @@ class SM120FusedMultiHeadAttentionForward:
                 # the ragged tail of the launch to short sequences whose
                 # over-length tiles retire without work.
                 _m = cutlass.make_array_view(seq_kv_lens)
-                _n = (seq_kv_lens.shape[0] - 4) // 4
+                _n = THD_BATCH_OF_WORK_META_WORDS(seq_kv_lens.shape[0])
                 batch_idx = cutlass.Int32(_m[3 * _n + 2 + batch_idx])
                 o_batch_idx = batch_idx
             self._run_unit(
@@ -1688,7 +1689,7 @@ class SM120FusedMultiHeadAttentionForward:
         # Prepared THD carries the current batch in the metadata extent; tensor
         # entries retain their compile-time batch. Device readers already derive
         # the same batch from this layout, so setup and consumers stay in step.
-        thd_batch = (seq_kv_lens.shape[0] - 4) // 4 if cutlass.const_expr(prepared and self.thd_varlen) else self.thd_batch
+        thd_batch = THD_BATCH_OF_WORK_META_WORDS(seq_kv_lens.shape[0]) if cutlass.const_expr(prepared and self.thd_varlen) else self.thd_batch
         if cutlass.const_expr(self.thd_varlen):
             # Build the [kv|cu_q|cu_k|remap|live|ctr] metadata buffer DEVICE-side
             # from the caller's length tensors (no host cumsum, no H2D — issue
@@ -1702,6 +1703,7 @@ class SM120FusedMultiHeadAttentionForward:
                 cutlass.Int32(q.shape[2]),
                 cutlass.Int32(self.q_tile),
                 thd_n_ctas,
+                True,  # work_prefix: the unit decode binary-searches the prefix (THD_WORK_META_WORDS(B) metadata)
             ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         # Grid geometry. THD: ceil(max_seq_q / q_tile) tiles per sequence over the
         # REAL batch count (the packed view's batch mode is 1); tiles past a shorter

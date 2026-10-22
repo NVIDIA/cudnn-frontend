@@ -2993,9 +2993,9 @@ def test_sm107_gate_lpt_is_bitwise_natural():
 _THD_GATE_CUBIN_RECORD = {
     "nvidia-cutlass-dsl": "4.8.0",
     "dense_gated_bf16_lse": "fde505d05124f3978d1f106b7b47891b",
-    "thd_ungated_bf16_head": "2a3467773a4dfa420660002a49c59fe0",
+    "thd_ungated_bf16_head": "0ef74afd0cc3bf72ed771a4ae7af936c",  # re-recorded: THD unit decode through the work prefix
     # the THD-gated rendering itself (the packed gate map): recorded WITH the descriptor, so the next change to it is seen
-    "thd_gated_bf16_head": "88a6956e90cc110697611583095ac47f",
+    "thd_gated_bf16_head": "f90bfeac779eb29ca384ea3dfe817e4e",  # re-recorded with the ungated twin (same decode change)
 }
 _THD_GATE_CUBIN_RENDERINGS = {
     # (TemplateParams fields the adapter derives on cc 10.7 for the bf16 causal cga2 d256 plan, compile kwargs)

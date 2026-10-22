@@ -6155,8 +6155,12 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             # kernel (issue #552). No sinks-dummy chunk: the kernel None-specializes
             # on sinks. No O-descriptor chunk: SM120 stores O with plain
             # guarded GMEM stores, so THD needs no per-sequence tensor maps.
-            b = self.batch_size
-            return ws_align((4 * b + 4) * 4)
+            from cudnn.frost.tile_dsl.thd import THD_WORK_META_WORDS
+
+            # [kv | cu_q | cu_k | remap | live | ctr | unit prefix]: the setup
+            # launch publishes the remap-ordered unit prefix the kernel's unit
+            # decode binary-searches (thd_decode_unit_prefix).
+            return ws_align(THD_WORK_META_WORDS(self.batch_size) * 4)
         if self.split_kv > 1:
             # Split-major partial slabs (see the SM100 sibling): O_s in the O
             # dtype (half) + lse_s fp32, carved from the caller's workspace.

@@ -234,12 +234,7 @@ from cudnn.sdpa.fwd.kernels._thd_split_host import host as _host_thd_split, comp
 
 _TENSOR_MAP_QWORDS = TENSOR_MAP_QWORDS
 
-# Prefix (binary-search) THD unit decode for EVERY THD config, not only the
-# packed-split path the shared predicate admits: the unsplit paged THD route
-# (short units, B >= 32) pays the same O(B) walk per unit. One constant for the
-# decode, the setup launch and the operand view.
-_THD_WORK_PREFIX = bool(CFG.THD_VARLEN)
-_sdpa_h = make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units=True, thd_work_prefix=_THD_WORK_PREFIX)
+_sdpa_h = make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units=True)
 # qtrim variant: collapses the KV loop for tiles entirely past the per-batch
 # actual Q length (SEQ_Q_LENS_PRESENT; folds to plain bounds otherwise).
 _bounds_for_tile = _sdpa_h.bounds_for_tile_qtrim
@@ -2527,7 +2522,6 @@ def _launch(
             not PAGED_KV,  # clamp_kv: paged pools have no packed KV total to clamp to
             SPLIT_KV,
             SPLIT_KV > 1 and bool(CFG.BOTTOM_RIGHT) and (CFG.MASK_FLAGS & MASK_SWA) == 0,
-            _THD_WORK_PREFIX,
         ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
     else:
@@ -2655,7 +2649,6 @@ def _host(
         thd=CFG.THD_VARLEN,
         split_kv=SPLIT_KV,
         tensor_map_qwords=16,
-        work_prefix=_THD_WORK_PREFIX,
         paged=PAGED_KV,
         page_size=PAGE_SIZE,
         block_table_ptr=block_table_ptr,

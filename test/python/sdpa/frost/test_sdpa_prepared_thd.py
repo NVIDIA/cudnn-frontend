@@ -28,26 +28,6 @@ pytestmark = [pytest.mark.L0]
 DEV = torch.device("cuda")
 
 
-@pytest.mark.parametrize("family", ["CfgD32", "CfgD64", "CfgD128", "CfgD128Decode", "CfgD192", "CfgD256", "CfgD256Decode", "CfgD512", "CfgD512X2"])
-@pytest.mark.parametrize("thd", [0, 1])
-def test_thd_work_prefix_declines_other_config_families(family, thd):
-    from cudnn.sdpa.fwd import config_sm100 as config
-
-    # Shared task decoding also sees configs without paged-KV fields (D512X2).
-    # Neither dense nor nonpaged THD requires the paged prefix metadata.
-    cfg_type = getattr(config, family)
-    cfg = cfg_type(**({"THD_VARLEN": thd} if "THD_VARLEN" in cfg_type.__dataclass_fields__ else {}))
-    assert not config.thd_work_prefix_enabled(cfg)
-
-
-@pytest.mark.parametrize("pack_gqa", [0, 1])
-def test_thd_work_prefix_accepts_paged_d128(pack_gqa):
-    from cudnn.sdpa.fwd.config_sm100 import CfgD128Decode, thd_work_prefix_enabled
-
-    cfg = CfgD128Decode(THD_VARLEN=1, PAGED_KV=1, PACK_GQA=pack_gqa, SPLIT_KV=2, BOTTOM_RIGHT=1)
-    assert thd_work_prefix_enabled(cfg)
-
-
 @requires_blackwell
 @requires_dsl
 @pytest.mark.parametrize("b", [3, 13])
@@ -2039,6 +2019,32 @@ if _dsl_installed():
 
     _prefix_probe.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
+    from cudnn.frost.tile_dsl.thd import thd_decode_unit, thd_decode_unit_prefix
+
+    @cute.kernel
+    def _decode_probe(meta_t, out_t, b: cutlass.Int32, n_uid: cutlass.Int32, reverse_rows: cutlass.Constexpr[bool]):
+        tid, _, _ = cute.arch.thread_idx()
+        bid, _, _ = cute.arch.block_idx()
+        uid = cutlass.Int32(bid) * 128 + cutlass.Int32(tid)
+        if uid < n_uid:
+            meta = cutlass.make_array_view(meta_t)
+            out = cutlass.make_array_view(out_t)
+            # Same (n_qh, q_tile) as _prefix_probe's write_thd_work_prefix(meta, b, 3, 16, ...)
+            qt, bb, hh = thd_decode_unit(meta, b, uid, cutlass.Int32(3), cutlass.Int32(16), reverse_rows)
+            pqt, pb, ph = thd_decode_unit_prefix(meta, b, uid, cutlass.Int32(3), cutlass.Int32(16), reverse_rows)
+            out[uid * 6 + 0] = qt
+            out[uid * 6 + 1] = bb
+            out[uid * 6 + 2] = hh
+            out[uid * 6 + 3] = pqt
+            out[uid * 6 + 4] = pb
+            out[uid * 6 + 5] = ph
+
+    _decode_probe.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+    @cute.jit
+    def _decode_host(m, out, b: cutlass.Int32, n_uid: cutlass.Int32, reverse_rows: cutlass.Constexpr[bool], stream):
+        _decode_probe(m, out, b, n_uid, reverse_rows).launch(grid=((n_uid + 127) // 128, 1, 1), block=(128, 1, 1), stream=stream)
+
     @cute.jit
     def _prefix_host(m, q, k, b: cutlass.Int32, flags: cutlass.Int32, rank_by_kv: cutlass.Constexpr[bool], work_prefix: cutlass.Constexpr[bool], stream):
         _prefix_probe(m, q, k, b, flags, rank_by_kv, work_prefix).launch(grid=(1, 1, 1), block=(64, 1, 1), stream=stream)
@@ -2134,6 +2140,51 @@ def test_thd_work_prefix_replay_matches_live_tiles(b, flags, _prefix_runner):
             assert torch.all(storage[:4] == -12345) and torch.all(storage[-4:] == -12345)
     finally:
         capture.reset()
+
+
+@requires_blackwell
+@requires_dsl
+@pytest.mark.parametrize("b", [1, 2, 7, 32, 33, 257])
+@pytest.mark.parametrize("reverse_rows", [False, True])
+@pytest.mark.parametrize("zero_lengths", [False, True])
+def test_thd_decode_unit_prefix_matches_walk(b, reverse_rows, zero_lengths, _prefix_runner):
+    """The binary-search unit decode is the walk, unit for unit: every live uid maps to the same
+    (q_tile, batch, head), every uid past the live total keeps batch == B, zero-length sequences own no unit."""
+    from cudnn.frost.tile_dsl.thd import THD_WORK_META_WORDS
+
+    q = ((torch.arange(b, dtype=torch.int32) * 17) % 65) + 1
+    if zero_lengths:
+        q[::3] = 0
+    k = ((torch.arange(b, dtype=torch.int32).flip(0) * 31) % 129) + 1
+    meta = torch.full((THD_WORK_META_WORDS(b),), -12345, dtype=torch.int32, device=DEV)
+    _prefix_runner(meta, q.to(DEV), k.to(DEV), b, 0, False, True)
+    live = int(((q + 15) // 16).sum()) * 3  # units before the probe's splits=3 factor
+    n_uid = live + 40
+    out = torch.full((n_uid * 6,), -7, dtype=torch.int32, device=DEV)
+    args = (
+        from_dlpack(meta, assumed_align=16).mark_layout_dynamic(leading_dim=0),
+        from_dlpack(out, assumed_align=16).mark_layout_dynamic(leading_dim=0),
+        cutlass.Int32(b),
+        cutlass.Int32(n_uid),
+        reverse_rows,
+        _prefix_cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+    cute.compile(_decode_host, *args)(*args[:4], args[-1])
+    torch.cuda.synchronize()
+    got = out.cpu().view(n_uid, 6)
+    walk, prefix = got[:, :3], got[:, 3:]
+    torch.testing.assert_close(prefix, walk, rtol=0, atol=0)
+    # and both are the documented mapping: longest sequence first, head-major within a sequence
+    remap = sorted(range(b), key=lambda i: (-int(q[i]), i))
+    expect = []
+    for i in remap:
+        tb = (int(q[i]) + 15) // 16
+        for head in range(3):
+            for qt in range(tb):
+                expect.append((tb - 1 - qt if reverse_rows else qt, i, head))
+    assert len(expect) == live
+    expect += [(0, b, 0)] * (n_uid - live)
+    torch.testing.assert_close(walk, torch.tensor(expect, dtype=torch.int32), rtol=0, atol=0)
 
 
 @requires_blackwell

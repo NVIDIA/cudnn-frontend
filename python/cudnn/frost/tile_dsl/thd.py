@@ -46,6 +46,7 @@ THD_META_WORDS = lambda b: 4 * b + 4  # noqa: E731
 # Existing metadata offsets, including the live count and counter, stay fixed.
 THD_WORK_PREFIX_OFF = lambda b: 4 * b + 4  # noqa: E731
 THD_WORK_META_WORDS = lambda b: 5 * b + 5  # noqa: E731
+THD_BATCH_OF_WORK_META_WORDS = lambda n: (n - 5) // 5  # noqa: E731   B from a THD_WORK_META_WORDS(B)-word metadata tensor (never from 4B+4)
 THD_CU_K_TOTAL_OFF = lambda b: 3 * b + 1  # noqa: E731   cu_k[B]: the live packed kv total (cu_q occupies [B, 2B], cu_k [2B+1, 3B+1])
 THD_CU_Q_TOTAL_OFF = lambda b: 2 * b  # noqa: E731   cu_q[B]: the live packed q total (the last word of cu_q; a packed dQ fold's row limit)
 THD_REMAP_OFF = lambda b: 3 * b + 2  # noqa: E731
@@ -435,6 +436,58 @@ def thd_decode_unit(
 
 
 @cute.jit
+def thd_decode_unit_prefix(
+    meta,
+    n_batch: cutlass.Int32,
+    uid: cutlass.Int32,
+    n_qh: cutlass.Int32,
+    q_tile: cutlass.Int32,
+    reverse_rows: bool,
+) -> tuple:
+    """:func:`thd_decode_unit`'s ``(q_tile_idx, batch, head)`` through the remap-ordered work prefix
+    :func:`write_thd_work_prefix` published at ``THD_WORK_PREFIX_OFF`` -- a binary search over ``B + 1``
+    words instead of a walk over every sequence.  The walk is a dependent-load chain plus two integer
+    divisions PER SEQUENCE, repeated by every decoding warp at every unit; with many short sequences it
+    dominated the unit (the gpt-oss-style batch of 32-64 requests, 2-3 KV tiles each).
+
+    Same contract as the walk: the prefix was built from the Q prefix with THIS ``q_tile`` and ``n_qh``
+    (the setup launch's ``cga_tile_m`` / ``n_qh``), a uid past the live total keeps ``batch == n_batch``,
+    the head is the major axis within a sequence (consecutive units sweep one head's tiles) and
+    ``reverse_rows`` walks a sequence's tiles from the diagonal back.  ``n_batch == 1`` reads no prefix
+    (the setup launch publishes only the live total there).  KV-prefix units (``cu0 = 2B + 1``) are not
+    served here: their prefix is not the one the setup launch writes.
+    """
+    cuq0 = n_batch
+    remap0 = THD_REMAP_OFF(n_batch)
+    prefix0 = THD_WORK_PREFIX_OFF(n_batch)
+    b, local = n_batch, cutlass.Int32(0)
+    if n_batch == cutlass.Int32(1):
+        b, local = cutlass.Int32(0), uid
+    elif n_batch > cutlass.Int32(1):
+        if uid < cutlass.Int32(meta[prefix0 + n_batch]):
+            lo, hi = cutlass.Int32(0), n_batch
+            while lo < hi:
+                mid = (lo + hi) >> 1
+                if cutlass.Int32(meta[prefix0 + mid + 1]) <= uid:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            b = cutlass.Int32(meta[remap0 + lo])
+            local = uid - cutlass.Int32(meta[prefix0 + lo])
+    f_batch, f_head, f_qt = n_batch, cutlass.Int32(0), cutlass.Int32(0)
+    if b < n_batch:
+        s_b = cutlass.Int32(meta[cuq0 + b + cutlass.Int32(1)]) - cutlass.Int32(meta[cuq0 + b])
+        tb = (s_b + q_tile - cutlass.Int32(1)) // q_tile
+        if local < tb * n_qh:
+            head = local // tb
+            qt = local % tb
+            if cutlass.const_expr(reverse_rows):
+                qt = tb - cutlass.Int32(1) - qt
+            f_batch, f_head, f_qt = b, head, qt
+    return f_qt, f_batch, f_head
+
+
+@cute.jit
 def thd_claim_next(meta_t: cute.Tensor, ctr_off: cutlass.Int32, slot, tidx: cutlass.Int32) -> cutlass.Int32:
     """Take the next unit from the device-side claim counter.
 
@@ -631,12 +684,16 @@ __all__ = [
     "THD_REMAP_OFF",
     "THD_ROWOFF_OFF",
     "THD_SETUP_THREADS",
+    "THD_BATCH_OF_WORK_META_WORDS",
+    "THD_WORK_META_WORDS",
+    "THD_WORK_PREFIX_OFF",
     "emit_clamped_desc",
     "emit_seq_descs",
     "exit_if_dead_thd_cluster",
     "set_tensor_map_bit21",
     "thd_claim_next",
     "thd_decode_unit",
+    "thd_decode_unit_prefix",
     "thd_port_origin",
     "write_thd_batch_remap",
     "write_thd_live_and_ctr",

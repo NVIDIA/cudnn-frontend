@@ -210,7 +210,7 @@ _thd_sf_tile_bases = _sdpa_h.thd_sf_tile_bases
 from cudnn.sdpa.fwd.kernels.thd_helpers import (
     THD_SETUP_THREADS,
     build_thd_meta_o_kv_descs_kernel as _build_thd_meta_o_kv_descs_kernel,
-    thd_decode_unit,
+    thd_decode_unit_prefix,
     TENSOR_MAP_QWORDS,
 )
 
@@ -222,7 +222,7 @@ _THD_REVERSE_CAUSAL_ROWS = CFG.THD_VARLEN and CFG.MASK_FLAGS == (MASK_CAUSAL | M
 def _thd_decode_causal(linear_cta, seq_kv_lens_t, n_batch, n_qh, cta_in_pair):
     meta = cutlass.make_array_view(seq_kv_lens_t)
     unit = linear_cta // cutlass.Int32(CFG.CGA_M)
-    q_tile, batch, head = thd_decode_unit(
+    q_tile, batch, head = thd_decode_unit_prefix(
         meta,
         n_batch,
         unit,
