@@ -2425,6 +2425,71 @@ def test_fp8_negative_attn_scale(d_qk, d_v, mask):
 
 
 @pytest.mark.L0
+@pytest.mark.skipif(not 100 <= _SM < 107, reason="the SM100 D192 FP8 rotated-P template")
+@pytest.mark.parametrize("mask", ["none", "causal"])
+@pytest.mark.parametrize("s_kv", [128, 256, 512])
+def test_fp8_d192_final_p1_reuse_under_mma_skew(monkeypatch, mask, s_kv):
+    """Delay the prior P1 consumer: the final synthetic score credit must wait
+    for its PV completion. Single-KV tiles have no prior P1 to protect.
+
+    The injected delay is a correctness stressor, never a timing assertion or
+    tuning knob. Before the repair, the two-KV dense case can lap the second
+    P-chunk readiness phase and hang, or consume the overwritten probability.
+    """
+    import hashlib
+    import importlib.util
+    from pathlib import Path
+
+    from cudnn.sdpa.fwd import api_dsl
+
+    original_loader = api_dsl.load_template
+    loaded = {}
+
+    def load_skewed(path, params, tag="template", extra_key=None):
+        if Path(path).name != "prefill_d192_d128_fp8.py" or Path(path).parent.name != "sm100":
+            return original_loader(path, params, tag=tag, extra_key=extra_key)
+        key = (path, params, extra_key)
+        if key not in loaded:
+            # Include both specialization and test seam in the compiled key.
+            digest = hashlib.sha256(Path(path).read_bytes() + repr((params, extra_key, "p1-delay-100")).encode()).hexdigest()
+            spec = importlib.util.spec_from_file_location(f"cudnn.frost._templates.p1_skew_{digest}", path)
+            mod = importlib.util.module_from_spec(spec)
+            mod.FROST_TEMPLATE_PARAMS = params
+            mod.FROST_SOURCE_DIGEST = digest
+            mod.FROST_D192_FP8_DEBUG_MMA_P1_DELAY_US = 100
+            spec.loader.exec_module(mod)
+            loaded[key] = mod
+        return loaded[key]
+
+    monkeypatch.setattr(api_dsl, "load_template", load_skewed)
+    results = []
+    for sign in (-1.0, 1.0):
+        torch.manual_seed(0)
+        result = _run(
+            2,
+            8,
+            8,
+            256,
+            s_kv,
+            "e4m3",
+            torch.float16,
+            scale=sign * 0.7 / math.sqrt(192),
+            sdpa_kwargs=_MASKS[mask],
+            d_qk=192,
+            d_v=128,
+            negate_q=sign > 0,
+            return_lse=True,
+        )
+        _check(result.output, result.reference, torch.float16, "e4m3", result.amax, result.reference_amax)
+        torch.testing.assert_close(result.stats, result.reference_stats, rtol=3e-2, atol=_half_atol("e4m3"))
+        results.append(result)
+    assert loaded, "the intended skewed template must execute"
+    assert torch.equal(results[0].output, results[1].output)
+    assert torch.equal(results[0].stats, results[1].stats)
+    assert results[0].amax == results[1].amax
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("scale_sign", [-1.0, 1.0], ids=["neg_scale", "pos_scale"])
 @pytest.mark.parametrize("d_qk,d_v", [(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)])
 @pytest.mark.parametrize("mask", ["none", "causal"])

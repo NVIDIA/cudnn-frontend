@@ -169,6 +169,13 @@ ordered after that read.**
   as an unchanged control.
 
 
+- A synthetic final ownership event must preserve the consumer-completion
+  dependency supplied by a real lookahead event. In the D192 FP8 rotated-P
+  schedule, S0[j+1] also orders reuse after PV1[j-1]; the synthetic final S0
+  event must therefore wait for that PV completion. A thread arrive alone
+  can overwrite P1 and even lap the chunk-ready parity. Detector:
+  `test_fp8_d192_final_p1_reuse_under_mma_skew` delays the previous P1 reader.
+
 **Rule S4 — Split-K partial Stats keep the combiner's log base.**
 
 - `stats_use_log2` changes final Stats only. Partial LSE consumed by a
