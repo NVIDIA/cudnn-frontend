@@ -21,10 +21,10 @@ Metadata buffer, in int32 words (``THD_META_WORDS(B)`` of them)::
     [ seq_kv_lens(B) | cu_seqlens_q(B+1) | cu_seqlens_k(B+1) | batch_remap(B) | live | ctr ]
 
 ``batch_remap`` is a permutation of ``[0, B)`` by descending work length.
-The default ranks Q lengths; eligible forward prefix splits rank KV lengths
-because each query tile traverses its KV partition. The tile scheduler visits
-longer work first to reduce the ragged last wave.  ``live`` is the total unit count (device-computed — the host
-cannot know ``SUM_b ceil(s_b/tile)*QH`` without a D2H) and ``ctr`` is the
+The default ranks Q lengths; eligible forward prefix paths rank KV lengths
+because each query tile traverses its KV range. The tile scheduler visits
+longer work first to reduce the ragged last wave. ``live`` is the total unit
+count (device-computed — the host cannot know ``SUM_b ceil(s_b/tile)*QH`` without a D2H) and ``ctr`` is the
 persistent scheduler's claim counter.
 """
 
