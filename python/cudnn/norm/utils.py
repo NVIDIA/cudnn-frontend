@@ -54,17 +54,13 @@ def is_aligned_contiguous_vector(t):
     return t is None or (t.stride(0) == 1 and t.data_ptr() % 16 == 0)
 
 
-def sm_count():
-    """Multiprocessor count of the current device (cached)."""
-    global _SM_COUNT
-    if _SM_COUNT is None:
-        import torch
+def sm_count() -> int:
+    """Multiprocessor count of the build or current CUDA device, cached per device."""
+    from cudnn.frost.device import current_device, multiprocessor_count
 
-        _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
-    return _SM_COUNT
+    return multiprocessor_count(current_device())
 
 
-_SM_COUNT = None
 _COOP_OCC = {}
 COOP_OCC_MAX = 4
 
