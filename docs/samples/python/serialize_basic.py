@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Complete standalone Python sample.
 API page: docs/api/python/serialize.md
 API: serialize
@@ -6,7 +9,6 @@ Source: adapted from `test/python/test_kernel_cache.py`.
 """
 
 import cudnn
-import torch
 
 
 def sample():

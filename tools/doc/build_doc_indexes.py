@@ -368,7 +368,7 @@ def render_compatibility(data: dict) -> str:
             "## Verification limits",
             "",
             "- Windows behavior and architecture-specific OSS ranges are source-verified but were not executed in the recorded Linux Blackwell environment.",
-            "- The recorded environment used CUTLASS DSL 4.5.2 while `pyproject.toml` pins 4.5.0. Successful imports verify the observed environment, not the pinned extra.",
+            "- The recorded environment used CUTLASS DSL 4.5.2. That is historical execution evidence only: the package floor is now 4.6.2, FROST-derived kernels require 4.7.0 or newer, and individual engines can require later releases.",
             "",
         ]
     )

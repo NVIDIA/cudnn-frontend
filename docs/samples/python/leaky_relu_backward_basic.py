@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Complete standalone Python sample.
 API page: docs/api/python/leaky_relu_backward.md
 API: leaky_relu_backward
@@ -40,7 +43,9 @@ def sample():
     ) as graph:
         dY = graph.tensor(name="dY", dim=dY_data.shape, stride=dY_data.stride())
         X = graph.tensor(name="X", dim=x.shape, stride=x.stride())
-        dX = graph.leaky_relu_backward(loss=dY, input=X, negative_slope=0.01, name="leaky_relu_backward")
+        dX = graph.leaky_relu_backward(
+            loss=dY, input=X, negative_slope=0.01, name="leaky_relu_backward"
+        )
         dX.set_output(True).set_name("dX")
     out = graph(dY_data, x)
     print(f"leaky_relu_backward output: shape={tuple(out.shape)}, dtype={out.dtype}")

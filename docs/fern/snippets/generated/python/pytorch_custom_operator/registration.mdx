@@ -10,5 +10,5 @@ def cudnn_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 @cudnn_matmul.register_fake
 def cudnn_matmul_fake(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    return torch.empty((a.shape[0], a.shape[1], b.shape[2]), device=a.device, dtype=a.dtype)
+    return torch.matmul(a, b)
 ```

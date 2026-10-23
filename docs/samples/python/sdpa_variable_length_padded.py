@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Complete standalone Python sample.
 API page: docs/api/python/sdpa.md
 API: sdpa
@@ -62,7 +65,9 @@ def sample():
         stride=(1, 1, 1, 1),
         data_type=cudnn.data_type.INT64,
     )
-    q = graph.tensor(name="q", dim=(B, Hq, S, D), stride=q_stride, data_type=cudnn.data_type.BFLOAT16)
+    q = graph.tensor(
+        name="q", dim=(B, Hq, S, D), stride=q_stride, data_type=cudnn.data_type.BFLOAT16
+    )
     q.set_ragged_offset(q_offsets)
     k = graph.tensor(
         name="k",
@@ -100,7 +105,9 @@ def sample():
         seq_len_kv=seq_kv,
         generate_stats=False,
     )
-    out.set_output(True).set_name("out").set_dim((B, Hq, S, D)).set_stride(q_stride).set_data_type(cudnn.data_type.BFLOAT16)
+    out.set_output(True).set_name("out").set_dim((B, Hq, S, D)).set_stride(q_stride).set_data_type(
+        cudnn.data_type.BFLOAT16
+    )
     out.set_ragged_offset(o_offsets)
     graph.validate()
     print("sdpa variable-length graph validated")

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 // Complete standalone C++ sample.
 // API page: docs/api/cpp/key.md
 // API: key
@@ -52,7 +55,8 @@ build_and_execute(fe::graph::Graph& graph, VariantPack& variant_pack) {
         if (workspace_size > 0) {
             cudaError_t cuda_status = cudaMalloc(&workspace, workspace_size);
             if (cuda_status != cudaSuccess) {
-                throw std::runtime_error(std::string("cudaMalloc(workspace): ") + cudaGetErrorString(cuda_status));
+                throw std::runtime_error(std::string("cudaMalloc(workspace): ") +
+                                         cudaGetErrorString(cuda_status));
             }
         }
 
@@ -63,7 +67,8 @@ build_and_execute(fe::graph::Graph& graph, VariantPack& variant_pack) {
 
         cudaError_t cuda_status = cudaDeviceSynchronize();
         if (cuda_status != cudaSuccess) {
-            throw std::runtime_error(std::string("cudaDeviceSynchronize: ") + cudaGetErrorString(cuda_status));
+            throw std::runtime_error(std::string("cudaDeviceSynchronize: ") +
+                                     cudaGetErrorString(cuda_status));
         }
     } catch (...) {
         if (workspace) cudaFree(workspace);
@@ -74,7 +79,8 @@ build_and_execute(fe::graph::Graph& graph, VariantPack& variant_pack) {
     if (workspace) {
         cudaError_t cuda_status = cudaFree(workspace);
         if (cuda_status != cudaSuccess) {
-            throw std::runtime_error(std::string("cudaFree(workspace): ") + cudaGetErrorString(cuda_status));
+            throw std::runtime_error(std::string("cudaFree(workspace): ") +
+                                     cudaGetErrorString(cuda_status));
         }
     }
 
@@ -96,7 +102,8 @@ main() {
         for (int64_t i = 0; i < (b * m * k); ++i) A_dev[i] = __float2bfloat16(dis(gen));
         for (int64_t i = 0; i < (b * k * n); ++i) B_dev[i] = __float2bfloat16(dis(gen));
         fe::graph::Graph graph{};
-        graph.set_intermediate_data_type(fe::DataType_t::FLOAT).set_compute_data_type(fe::DataType_t::FLOAT);
+        graph.set_intermediate_data_type(fe::DataType_t::FLOAT)
+            .set_compute_data_type(fe::DataType_t::FLOAT);
         auto A = graph.tensor(fe::graph::Tensor_attributes()
                                   .set_name("A")
                                   .set_dim({b, m, k})
@@ -107,8 +114,11 @@ main() {
                                   .set_dim({b, k, n})
                                   .set_stride({k * n, n, 1})
                                   .set_data_type(fe::DataType_t::BFLOAT16));
-        auto C = graph.matmul(
-            A, B, fe::graph::Matmul_attributes().set_name("matmul").set_compute_data_type(fe::DataType_t::FLOAT));
+        auto C =
+            graph.matmul(A,
+                         B,
+                         fe::graph::Matmul_attributes().set_name("matmul").set_compute_data_type(
+                             fe::DataType_t::FLOAT));
         C->set_output(true)
             .set_name("C")
             .set_data_type(fe::DataType_t::FLOAT)

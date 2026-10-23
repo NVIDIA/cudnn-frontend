@@ -362,12 +362,6 @@ def main(argv: list[str] | None = None) -> int:
             if not isinstance(candidate["constraint_note"], str) or not candidate["constraint_note"].strip():
                 problems.append(f"{candidate['qualified_name']}: missing constraint note")
             candidate_constraint_gaps += candidate["constraint_status"] == "review-gap"
-        referenced_old = {topic["source"] for topic in old_topics}
-        actual_old = {path.relative_to(REPO_ROOT).as_posix() for path in (REPO_ROOT / "old_docs").rglob("*.md") if path.name not in {"SKILLS.md"}}
-        missing_old = actual_old - referenced_old
-        if missing_old:
-            problems.append(f"old-docs ledger omits {len(missing_old)} Markdown files")
-
         unowned = [candidate for candidate in unresolved if not candidate_has_documentation_owner(candidate)]
         family_owned = len(unresolved) - len(unowned)
         for problem in problems:

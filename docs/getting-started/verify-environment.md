@@ -24,7 +24,7 @@ Example output:
 
 ```text
 cudnn_file=/path/to/python3.13/site-packages/cudnn/__init__.py
-frontend=1.27.0
+frontend=1.32.0
 backend=9.15.1
 torch=2.10.0+cu130
 torch_cuda=13.0

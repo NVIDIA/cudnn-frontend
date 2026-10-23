@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Register a cached cuDNN Graph as a PyTorch custom operator."""
 
 from __future__ import annotations
@@ -6,27 +9,23 @@ import torch
 
 import cudnn
 
-GraphKey = tuple[
+TensorKey = tuple[
     str,
     torch.dtype,
     tuple[int, ...],
     tuple[int, ...],
-    tuple[int, ...],
-    tuple[int, ...],
 ]
+GraphKey = tuple[TensorKey, TensorKey]
 GRAPH_CACHE: dict[GraphKey, cudnn.Graph] = {}
 
 
 # --8<-- [start:cache]
+def tensor_key(tensor: torch.Tensor) -> TensorKey:
+    return str(tensor.device), tensor.dtype, tuple(tensor.shape), tuple(tensor.stride())
+
+
 def graph_key(a: torch.Tensor, b: torch.Tensor) -> GraphKey:
-    return (
-        str(a.device),
-        a.dtype,
-        tuple(a.shape),
-        tuple(a.stride()),
-        tuple(b.shape),
-        tuple(b.stride()),
-    )
+    return tensor_key(a), tensor_key(b)
 
 
 def build_graph(a: torch.Tensor, b: torch.Tensor) -> cudnn.Graph:
@@ -66,7 +65,7 @@ def cudnn_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 @cudnn_matmul.register_fake
 def cudnn_matmul_fake(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    return torch.empty((a.shape[0], a.shape[1], b.shape[2]), device=a.device, dtype=a.dtype)
+    return torch.matmul(a, b)
 
 
 # --8<-- [end:registration]
@@ -80,7 +79,9 @@ def setup_context(ctx, inputs, output) -> None:
 
 def backward(ctx, grad_output: torch.Tensor):
     a, b = ctx.saved_tensors
-    return grad_output @ b.transpose(-2, -1), a.transpose(-2, -1) @ grad_output
+    grad_a = (grad_output @ b.transpose(-2, -1)).sum_to_size(a.shape)
+    grad_b = (a.transpose(-2, -1) @ grad_output).sum_to_size(b.shape)
+    return grad_a, grad_b
 
 
 torch.library.register_autograd(
@@ -93,7 +94,7 @@ torch.library.register_autograd(
 
 def main() -> None:
     torch.manual_seed(11)
-    a = torch.randn(2, 32, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    a = torch.randn(1, 32, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     b = torch.randn(2, 64, 48, device="cuda", dtype=torch.bfloat16, requires_grad=True)
 
     actual = cudnn_matmul(a, b)

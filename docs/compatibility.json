@@ -96,8 +96,8 @@
       "platforms": ["Linux (imports and one normalization kernel executed; other kernels source-verified)", "Windows (not claimed)"],
       "backends": ["CUTLASS DSL OSS engines", "cuDNN graph integration"],
       "languages": ["Python", "C++ engine selection"],
-      "dependencies": ["nvidia-cutlass-dsl[cu13]", "PyTorch", "cuda-python", "apache-tvm-ffi", "torch-c-dlpack-ext"],
-      "verification": "All current optional exports imported with installed CUTLASS DSL 4.5.2 on SM100, although the project extra pins 4.5.0; the BF16 RMSNorm+SiLU Graph fusion executed and matched a PyTorch reference; other kernels remain source-verified unless an owning page records a numerical run",
+      "dependencies": ["nvidia-cutlass-dsl[cu13]>=4.6.2", "apache-tvm-ffi>=0.1.11", "cuda-python", "a supported tensor framework for framework-specific APIs"],
+      "verification": "The package floor is CUTLASS DSL 4.6.2; FROST-derived kernels require 4.7.0 or newer and individual engines can require later releases. Each engine checks its effective floor at runtime. The recorded CUTLASS DSL 4.5.2 run predates this source contract and is retained only as historical execution evidence.",
       "evidence": ["pyproject.toml", "python/cudnn/__init__.py", "python/cudnn/*/__init__.py", "include/cudnn_frontend/experimental/sm100_rms_norm_silu_engine.h", "docs/samples/python/oss_rmsnorm_silu.py"]
     },
     {

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Complete standalone Python sample.
 API page: docs/api/python/logical_not.md
 API: logical_not
@@ -30,7 +33,9 @@ def run_sample(sample):
 def sample():
     x = torch.rand((2, 3, 8), device="cuda") > 0.5
     with cudnn.Graph(io_data_type=torch.bool, inputs=["X"], outputs=["Y"], handle="auto") as graph:
-        X = graph.tensor(name="X", dim=x.shape, stride=x.stride(), data_type=cudnn.data_type.BOOLEAN)
+        X = graph.tensor(
+            name="X", dim=x.shape, stride=x.stride(), data_type=cudnn.data_type.BOOLEAN
+        )
         Y = graph.logical_not(input=X, name="logical_not")
         Y.set_output(True).set_name("Y").set_data_type(cudnn.data_type.BOOLEAN)
     y = graph(x)

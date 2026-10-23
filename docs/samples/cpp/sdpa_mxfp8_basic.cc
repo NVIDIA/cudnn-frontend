@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 // Complete standalone C++ sample.
 // API page: docs/api/cpp/sdpa_mxfp8.md
 // API: sdpa_mxfp8
@@ -52,7 +55,8 @@ build_and_execute(fe::graph::Graph& graph, VariantPack& variant_pack) {
         if (workspace_size > 0) {
             cudaError_t cuda_status = cudaMalloc(&workspace, workspace_size);
             if (cuda_status != cudaSuccess) {
-                throw std::runtime_error(std::string("cudaMalloc(workspace): ") + cudaGetErrorString(cuda_status));
+                throw std::runtime_error(std::string("cudaMalloc(workspace): ") +
+                                         cudaGetErrorString(cuda_status));
             }
         }
 
@@ -63,7 +67,8 @@ build_and_execute(fe::graph::Graph& graph, VariantPack& variant_pack) {
 
         cudaError_t cuda_status = cudaDeviceSynchronize();
         if (cuda_status != cudaSuccess) {
-            throw std::runtime_error(std::string("cudaDeviceSynchronize: ") + cudaGetErrorString(cuda_status));
+            throw std::runtime_error(std::string("cudaDeviceSynchronize: ") +
+                                     cudaGetErrorString(cuda_status));
         }
     } catch (...) {
         if (workspace) cudaFree(workspace);
@@ -74,7 +79,8 @@ build_and_execute(fe::graph::Graph& graph, VariantPack& variant_pack) {
     if (workspace) {
         cudaError_t cuda_status = cudaFree(workspace);
         if (cuda_status != cudaSuccess) {
-            throw std::runtime_error(std::string("cudaFree(workspace): ") + cudaGetErrorString(cuda_status));
+            throw std::runtime_error(std::string("cudaFree(workspace): ") +
+                                     cudaGetErrorString(cuda_status));
         }
     }
 
@@ -122,30 +128,30 @@ main() {
         graph.set_io_data_type(fe::DataType_t::FP8_E4M3)
             .set_intermediate_data_type(fe::DataType_t::FLOAT)
             .set_compute_data_type(fe::DataType_t::FLOAT);
-        auto dims        = std::vector<int64_t>{B, H, S, D};
-        auto qkv_strides = std::vector<int64_t>{S * 3 * H * D, D, 3 * H * D, 1};
-        auto o_strides   = std::vector<int64_t>{S * H * D, D, H * D, 1};
-        auto Q           = graph.tensor(fe::graph::Tensor_attributes()
+        auto dims          = std::vector<int64_t>{B, H, S, D};
+        auto qkv_strides   = std::vector<int64_t>{S * 3 * H * D, D, 3 * H * D, 1};
+        auto o_strides     = std::vector<int64_t>{S * H * D, D, H * D, 1};
+        auto Q             = graph.tensor(fe::graph::Tensor_attributes()
                                   .set_name("Q")
                                   .set_dim(dims)
                                   .set_stride(qkv_strides)
                                   .set_data_type(fe::DataType_t::FP8_E4M3));
-        auto K           = graph.tensor(fe::graph::Tensor_attributes()
+        auto K             = graph.tensor(fe::graph::Tensor_attributes()
                                   .set_name("K")
                                   .set_dim(dims)
                                   .set_stride(qkv_strides)
                                   .set_data_type(fe::DataType_t::FP8_E4M3));
-        auto V           = graph.tensor(fe::graph::Tensor_attributes()
+        auto V             = graph.tensor(fe::graph::Tensor_attributes()
                                   .set_name("V")
                                   .set_dim(dims)
                                   .set_stride(qkv_strides)
                                   .set_data_type(fe::DataType_t::FP8_E4M3));
-        auto sf_qk_dims  = std::vector<int64_t>{B, H, s_padded, d_scale_padded};
-        auto sf_qk_strides =
-            std::vector<int64_t>{H * s_padded * d_scale_padded, s_padded * d_scale_padded, d_scale_padded, 1};
-        auto sf_v_dims = std::vector<int64_t>{B, H, s_scale_padded, d_padded};
-        auto sf_v_strides =
-            std::vector<int64_t>{H * s_scale_padded * d_padded, s_scale_padded * d_padded, 1, s_scale_padded};
+        auto sf_qk_dims    = std::vector<int64_t>{B, H, s_padded, d_scale_padded};
+        auto sf_qk_strides = std::vector<int64_t>{
+            H * s_padded * d_scale_padded, s_padded * d_scale_padded, d_scale_padded, 1};
+        auto sf_v_dims    = std::vector<int64_t>{B, H, s_scale_padded, d_padded};
+        auto sf_v_strides = std::vector<int64_t>{
+            H * s_scale_padded * d_padded, s_scale_padded * d_padded, 1, s_scale_padded};
         auto SF_Q  = graph.tensor(fe::graph::Tensor_attributes()
                                      .set_name("SF_Q")
                                      .set_dim(sf_qk_dims)
@@ -170,9 +176,16 @@ main() {
                          .set_causal_mask(true)
                          .set_attn_scale(1.0f / std::sqrt(static_cast<float>(D)));
         auto [O, Stats, AmaxO] = graph.sdpa_fp8(Q, K, V, SF_Q, SF_K, SF_V, attrs);
-        O->set_output(true).set_dim(dims).set_stride(o_strides).set_data_type(fe::DataType_t::BFLOAT16);
-        Stats->set_output(true).set_dim({B, H, S, 1}).set_stride({H * S, S, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
-        AmaxO->set_output(true).set_dim({1, 1, 1, 1}).set_stride({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
+        O->set_output(true).set_dim(dims).set_stride(o_strides).set_data_type(
+            fe::DataType_t::BFLOAT16);
+        Stats->set_output(true)
+            .set_dim({B, H, S, 1})
+            .set_stride({H * S, S, 1, 1})
+            .set_data_type(fe::DataType_t::FLOAT);
+        AmaxO->set_output(true)
+            .set_dim({1, 1, 1, 1})
+            .set_stride({1, 1, 1, 1})
+            .set_data_type(fe::DataType_t::FLOAT);
         VariantPack variant_pack = {{Q, QKV_dev},
                                     {K, QKV_dev + H * D},
                                     {V, QKV_dev + 2 * H * D},

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 // Complete standalone C++ sample.
 // API page: docs/api/cpp/rmsnorm_backward.md
 // API: rmsnorm_backward
@@ -52,7 +55,8 @@ build_and_execute(fe::graph::Graph& graph, VariantPack& variant_pack) {
         if (workspace_size > 0) {
             cudaError_t cuda_status = cudaMalloc(&workspace, workspace_size);
             if (cuda_status != cudaSuccess) {
-                throw std::runtime_error(std::string("cudaMalloc(workspace): ") + cudaGetErrorString(cuda_status));
+                throw std::runtime_error(std::string("cudaMalloc(workspace): ") +
+                                         cudaGetErrorString(cuda_status));
             }
         }
 
@@ -63,7 +67,8 @@ build_and_execute(fe::graph::Graph& graph, VariantPack& variant_pack) {
 
         cudaError_t cuda_status = cudaDeviceSynchronize();
         if (cuda_status != cudaSuccess) {
-            throw std::runtime_error(std::string("cudaDeviceSynchronize: ") + cudaGetErrorString(cuda_status));
+            throw std::runtime_error(std::string("cudaDeviceSynchronize: ") +
+                                     cudaGetErrorString(cuda_status));
         }
     } catch (...) {
         if (workspace) cudaFree(workspace);
@@ -74,7 +79,8 @@ build_and_execute(fe::graph::Graph& graph, VariantPack& variant_pack) {
     if (workspace) {
         cudaError_t cuda_status = cudaFree(workspace);
         if (cuda_status != cudaSuccess) {
-            throw std::runtime_error(std::string("cudaFree(workspace): ") + cudaGetErrorString(cuda_status));
+            throw std::runtime_error(std::string("cudaFree(workspace): ") +
+                                     cudaGetErrorString(cuda_status));
         }
     }
 
@@ -107,7 +113,8 @@ main() {
         for (int64_t i = 0; i < stat_count; ++i) InvVar_dev[i] = std::fabs(InvVar_dev[i]) + 0.5f;
 
         fe::graph::Graph graph{};
-        graph.set_intermediate_data_type(fe::DataType_t::FLOAT).set_compute_data_type(fe::DataType_t::FLOAT);
+        graph.set_intermediate_data_type(fe::DataType_t::FLOAT)
+            .set_compute_data_type(fe::DataType_t::FLOAT);
         auto X      = graph.tensor(fe::graph::Tensor_attributes()
                                   .set_name("X")
                                   .set_data_type(fe::DataType_t::FLOAT)
@@ -135,8 +142,12 @@ main() {
         auto [DX, DScale, DBias] = graph.rmsnorm_backward(DY, X, Scale, InvVar, attrs);
         DX->set_output(true).set_data_type(fe::DataType_t::FLOAT);
         DScale->set_output(true).set_data_type(fe::DataType_t::FLOAT);
-        VariantPack variant_pack = {
-            {X, X_dev}, {DY, DY_dev}, {Scale, Scale_dev}, {InvVar, InvVar_dev}, {DX, DX_dev}, {DScale, DScale_dev}};
+        VariantPack variant_pack = {{X, X_dev},
+                                    {DY, DY_dev},
+                                    {Scale, Scale_dev},
+                                    {InvVar, InvVar_dev},
+                                    {DX, DX_dev},
+                                    {DScale, DScale_dev}};
         build_and_execute(graph, variant_pack);
         std::cout << "rmsnorm_backward executed successfully\n";
         cudaFree(X_dev);

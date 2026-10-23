@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Build structured documentation ledgers from authored pages and canonical samples."""
+"""Build API and sample manifests from source, authored pages, and canonical samples."""
 
 from __future__ import annotations
 
@@ -1507,124 +1507,6 @@ def build_sample_manifest() -> dict:
     return {"schema_version": 1, "generated_by": "tools/doc/build_doc_manifests.py", "samples": rows}
 
 
-def build_old_docs_ledger() -> dict:
-    guide_map = {
-        "installation": "getting-started/installation.md",
-        "quickstart": "getting-started/quickstart.md",
-        "quickstart_shorter": "tutorials/first-graph.md",
-        "graph_lifecycle": "how-to/explicit-lifecycle.md",
-        "python_graph_wrapper": "how-to/python-graph.md",
-        "matmul": "how-to/matmul-layouts.md",
-        "pointwise": "tutorials/pointwise-reduction.md",
-        "convolutions": "tutorials/convolution.md",
-        "normalizations": "tutorials/normalization.md",
-        "attention": "tutorials/attention.md",
-        "attention_recipes": "how-to/attention-recipes.md",
-        "pytorch_integration": "tutorials/pytorch-integration.md",
-        "pytorch_custom_ops": "how-to/pytorch-custom-operator.md",
-        "block_scaling": "tutorials/block-scaling.md",
-        "moe_grouped_matmul": "tutorials/moe-grouped-matmul.md",
-        "rope": "how-to/rope.md",
-        "resampling": "how-to/resampling.md",
-        "causal_conv1d": "how-to/causal-convolution.md",
-        "concatenate": "how-to/shape-operations.md#concatenate",
-        "reshape": "how-to/shape-operations.md#reshape",
-        "slice": "how-to/shape-operations.md#slice",
-        "transpose": "how-to/shape-operations.md#transpose",
-        "index": "index.md",
-    }
-    v1_map = {
-        "CompileTimeConstants": "how-to/scalars-and-constants.md",
-        "adding_torch_custom_ops": "how-to/pytorch-custom-operator.md",
-        "cuda-graphs": "how-to/cuda-graphs.md",
-        "custom-execution-plan": "how-to/engine-knobs.md#build-a-custom-plan",
-        "deviceless-ahead-of-time-compilation": "how-to/deployment.md#run-the-three-stage-deviceless-flow",
-        "dynamic-kernel-cache": "how-to/dynamic-shapes.md#query-runtime-workspace-before-allocation",
-    }
-    operation_map = {
-        "Attention": "concepts/attention-support-history.md",
-        "BlockScaling": "tutorials/block-scaling.md",
-        "CausalConv1d": "how-to/causal-convolution.md",
-        "Concatenate": "how-to/shape-operations.md#concatenate",
-        "Convolutions": "tutorials/convolution.md",
-        "Matmul": "how-to/matmul-layouts.md",
-        "MoeGroupedMatmul": "tutorials/moe-grouped-matmul.md",
-        "Normalizations": "tutorials/normalization.md",
-        "Pointwise": "tutorials/pointwise-reduction.md",
-        "Resampling": "how-to/resampling.md",
-        "Reshape": "how-to/shape-operations.md#reshape",
-        "RoPE": "how-to/rope.md",
-        "Slice": "how-to/shape-operations.md#slice",
-        "Transpose": "how-to/shape-operations.md#transpose",
-    }
-    oss_map = {
-        "sdpa_bwd_d256": "reference/oss-sdpa-d256.md#sdpa_bwd_wrapper_sm100_d256",
-        "sdpa_fwd_d256": "reference/oss-sdpa-d256.md#sdpa_fwd_wrapper_sm100_d256",
-        "bsa": "reference/oss-block-sparse-attention.md",
-        "dsa": "reference/oss-deepseek-sparse-attention.md",
-        "nsa": "reference/oss-native-sparse-attention.md",
-        "overview": "reference/oss-engines.md",
-        "rmsnorm_rht_amax": "reference/oss-normalization.md#rmsnorm_rht_amax_wrapper_sm100",
-        "rmsnorm_silu": "reference/oss-normalization.md#run-the-rmsnorm-silu-graph-fusion",
-    }
-    topics: list[dict] = []
-    for path in sorted((REPO_ROOT / "old_docs").rglob("*.md")):
-        relative = path.relative_to(REPO_ROOT).as_posix()
-        if path.name == "SKILLS.md":
-            topics.append(
-                {
-                    "source": relative,
-                    "disposition": "excluded",
-                    "destination": None,
-                    "reason": "Internal authoring instructions, not user documentation.",
-                }
-            )
-            continue
-        parts = path.parts
-        if "api" in parts and path.parent.name in {"python", "cpp"}:
-            destination = f"api/{path.parent.name}/{path.name}"
-            disposition = "retained"
-            reason = "Per-call contract retained and reconciled against current declarations."
-        elif "user_guide" in parts:
-            destination = guide_map.get(path.stem, "index.md")
-            disposition = "merged"
-            reason = "Topic moved into the grouped learning model."
-        elif "fe-oss-apis" in parts:
-            if path.stem.startswith("discrete_grouped_gemm_"):
-                destination = f"reference/oss-discrete-grouped-gemm.md#{path.stem}_wrapper_sm100"
-            elif path.stem.startswith("grouped_gemm_"):
-                destination = f"reference/oss-grouped-gemm.md#{path.stem.removesuffix('_unified')}_wrapper_sm100"
-            elif path.stem.startswith("gemm_"):
-                destination = f"reference/oss-dense-gemm.md#{path.stem}_wrapper_sm100"
-            else:
-                destination = oss_map[path.stem]
-            disposition = "merged"
-            if path.stem == "rmsnorm_silu":
-                reason = "The former standalone name is mapped to the current Graph-pattern OSS engine and its execution constraints."
-            elif path.stem == "grouped_gemm_quant_unified":
-                reason = "The old unified entry point is covered by the current grouped_gemm_quant wrapper contract."
-            else:
-                reason = "Current API-local contract and support constraints are retained in the corresponding OSS family guide."
-        elif "operations" in parts and path.stem in operation_map:
-            destination = operation_map[path.stem]
-            disposition = "merged"
-            reason = "Operation-family guidance moved to the grouped learning model."
-        elif path.stem in v1_map:
-            destination = v1_map[path.stem]
-            disposition = "merged"
-            reason = "End-user workflow retained in the current grouped documentation."
-        elif path.stem == "python_graph_and_execution_backends":
-            destination = "concepts/python-ir-routing.md"
-            disposition = "merged"
-            reason = "Python graph routing, plan spaces, UID ownership, and backend selection moved to a dedicated concepts page."
-        else:
-            destination = "samples/index.md" if path.name == "samples.md" else None
-            disposition = "merged" if destination else "excluded"
-            reason = "Mapped to the published sample catalog." if destination else "Non-user authoring material."
-        topics.append({"source": relative, "disposition": disposition, "destination": destination, "reason": reason})
-    return {"schema_version": 1, "topics": topics}
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true")
@@ -1632,7 +1514,6 @@ def main(argv: list[str] | None = None) -> int:
     outputs = {
         API_ROOT / "manifest.json": build_api_manifest(),
         SAMPLE_ROOT / "manifest.json": build_sample_manifest(),
-        DOCS_ROOT / "old-docs-disposition.json": build_old_docs_ledger(),
     }
     drift = [path for path, data in outputs.items() if not write_or_check(path, data, args.check)]
     if drift:

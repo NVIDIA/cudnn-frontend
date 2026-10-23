@@ -190,7 +190,7 @@ def my_op(x, w, eps=1e-5, bias=None):
 | Component | Cost (us) | Notes |
 |---|---|---|
 | torch.ops dispatch + autograd | ~25 | PyTorch-side, unavoidable with torch.Library |
-| `set_stream` | ~5 | pybind11 cross-language call |
+| `set_stream` | ~5 | nanobind cross-language call |
 | `torch.empty` per output tensor | ~2 each | consider `out=` or pre-alloc |
 | cache key build + lookup | ~1.5 | tuple construction + dict hash |
 | uid→tensor dict + list comp | ~1 | Python overhead |

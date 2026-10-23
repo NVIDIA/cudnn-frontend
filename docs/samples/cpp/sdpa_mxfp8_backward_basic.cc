@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 // Complete standalone C++ sample.
 // API page: docs/api/cpp/sdpa_mxfp8_backward.md
 // API: sdpa_mxfp8_backward
@@ -52,7 +55,8 @@ build_and_execute(fe::graph::Graph& graph, VariantPack& variant_pack) {
         if (workspace_size > 0) {
             cudaError_t cuda_status = cudaMalloc(&workspace, workspace_size);
             if (cuda_status != cudaSuccess) {
-                throw std::runtime_error(std::string("cudaMalloc(workspace): ") + cudaGetErrorString(cuda_status));
+                throw std::runtime_error(std::string("cudaMalloc(workspace): ") +
+                                         cudaGetErrorString(cuda_status));
             }
         }
 
@@ -63,7 +67,8 @@ build_and_execute(fe::graph::Graph& graph, VariantPack& variant_pack) {
 
         cudaError_t cuda_status = cudaDeviceSynchronize();
         if (cuda_status != cudaSuccess) {
-            throw std::runtime_error(std::string("cudaDeviceSynchronize: ") + cudaGetErrorString(cuda_status));
+            throw std::runtime_error(std::string("cudaDeviceSynchronize: ") +
+                                     cudaGetErrorString(cuda_status));
         }
     } catch (...) {
         if (workspace) cudaFree(workspace);
@@ -74,7 +79,8 @@ build_and_execute(fe::graph::Graph& graph, VariantPack& variant_pack) {
     if (workspace) {
         cudaError_t cuda_status = cudaFree(workspace);
         if (cuda_status != cudaSuccess) {
-            throw std::runtime_error(std::string("cudaFree(workspace): ") + cudaGetErrorString(cuda_status));
+            throw std::runtime_error(std::string("cudaFree(workspace): ") +
+                                     cudaGetErrorString(cuda_status));
         }
     }
 
@@ -158,44 +164,62 @@ main() {
         auto strides      = std::vector<int64_t>{S * H * D, D, H * D, 1};
         auto stat_dims    = std::vector<int64_t>{B, H, S, 1};
         auto stat_strides = std::vector<int64_t>{H * S, S, 1, 1};
-        auto Q =
-            graph.tensor(fe::graph::Tensor_attributes().set_name("Q").set_dim(dims).set_stride(strides).set_data_type(
-                fe::DataType_t::FP8_E4M3));
-        auto QT =
-            graph.tensor(fe::graph::Tensor_attributes().set_name("Q_T").set_dim(dims).set_stride(strides).set_data_type(
-                fe::DataType_t::FP8_E4M3));
-        auto K =
-            graph.tensor(fe::graph::Tensor_attributes().set_name("K").set_dim(dims).set_stride(strides).set_data_type(
-                fe::DataType_t::FP8_E4M3));
-        auto KT =
-            graph.tensor(fe::graph::Tensor_attributes().set_name("K_T").set_dim(dims).set_stride(strides).set_data_type(
-                fe::DataType_t::FP8_E4M3));
-        auto V =
-            graph.tensor(fe::graph::Tensor_attributes().set_name("V").set_dim(dims).set_stride(strides).set_data_type(
-                fe::DataType_t::FP8_E4M3));
-        auto O = graph.tensor(
-            fe::graph::Tensor_attributes().set_name("O_f16").set_dim(dims).set_stride(strides).set_data_type(
-                fe::DataType_t::BFLOAT16));
-        auto DOF16 = graph.tensor(
-            fe::graph::Tensor_attributes().set_name("dO_f16").set_dim(dims).set_stride(strides).set_data_type(
-                fe::DataType_t::BFLOAT16));
-        auto DO =
-            graph.tensor(fe::graph::Tensor_attributes().set_name("dO").set_dim(dims).set_stride(strides).set_data_type(
-                fe::DataType_t::FP8_E4M3));
-        auto DOT = graph.tensor(
-            fe::graph::Tensor_attributes().set_name("dO_T").set_dim(dims).set_stride(strides).set_data_type(
-                fe::DataType_t::FP8_E4M3));
-        auto Stats     = graph.tensor(fe::graph::Tensor_attributes()
+        auto Q            = graph.tensor(fe::graph::Tensor_attributes()
+                                  .set_name("Q")
+                                  .set_dim(dims)
+                                  .set_stride(strides)
+                                  .set_data_type(fe::DataType_t::FP8_E4M3));
+        auto QT           = graph.tensor(fe::graph::Tensor_attributes()
+                                   .set_name("Q_T")
+                                   .set_dim(dims)
+                                   .set_stride(strides)
+                                   .set_data_type(fe::DataType_t::FP8_E4M3));
+        auto K            = graph.tensor(fe::graph::Tensor_attributes()
+                                  .set_name("K")
+                                  .set_dim(dims)
+                                  .set_stride(strides)
+                                  .set_data_type(fe::DataType_t::FP8_E4M3));
+        auto KT           = graph.tensor(fe::graph::Tensor_attributes()
+                                   .set_name("K_T")
+                                   .set_dim(dims)
+                                   .set_stride(strides)
+                                   .set_data_type(fe::DataType_t::FP8_E4M3));
+        auto V            = graph.tensor(fe::graph::Tensor_attributes()
+                                  .set_name("V")
+                                  .set_dim(dims)
+                                  .set_stride(strides)
+                                  .set_data_type(fe::DataType_t::FP8_E4M3));
+        auto O            = graph.tensor(fe::graph::Tensor_attributes()
+                                  .set_name("O_f16")
+                                  .set_dim(dims)
+                                  .set_stride(strides)
+                                  .set_data_type(fe::DataType_t::BFLOAT16));
+        auto DOF16        = graph.tensor(fe::graph::Tensor_attributes()
+                                      .set_name("dO_f16")
+                                      .set_dim(dims)
+                                      .set_stride(strides)
+                                      .set_data_type(fe::DataType_t::BFLOAT16));
+        auto DO           = graph.tensor(fe::graph::Tensor_attributes()
+                                   .set_name("dO")
+                                   .set_dim(dims)
+                                   .set_stride(strides)
+                                   .set_data_type(fe::DataType_t::FP8_E4M3));
+        auto DOT          = graph.tensor(fe::graph::Tensor_attributes()
+                                    .set_name("dO_T")
+                                    .set_dim(dims)
+                                    .set_stride(strides)
+                                    .set_data_type(fe::DataType_t::FP8_E4M3));
+        auto Stats        = graph.tensor(fe::graph::Tensor_attributes()
                                       .set_name("Stats")
                                       .set_dim(stat_dims)
                                       .set_stride(stat_strides)
                                       .set_data_type(fe::DataType_t::FLOAT));
-        auto sf_d_dims = std::vector<int64_t>{B, H, s_padded, d_scale_padded};
-        auto sf_d_strides =
-            std::vector<int64_t>{H * s_padded * d_scale_padded, s_padded * d_scale_padded, d_scale_padded, 1};
-        auto sf_t_dims = std::vector<int64_t>{B, H, s_scale_padded, d_padded};
-        auto sf_t_strides =
-            std::vector<int64_t>{H * s_scale_padded * d_padded, s_scale_padded * d_padded, s_scale_padded, 1};
+        auto sf_d_dims    = std::vector<int64_t>{B, H, s_padded, d_scale_padded};
+        auto sf_d_strides = std::vector<int64_t>{
+            H * s_padded * d_scale_padded, s_padded * d_scale_padded, d_scale_padded, 1};
+        auto sf_t_dims    = std::vector<int64_t>{B, H, s_scale_padded, d_padded};
+        auto sf_t_strides = std::vector<int64_t>{
+            H * s_scale_padded * d_padded, s_scale_padded * d_padded, s_scale_padded, 1};
         auto SF_Q   = graph.tensor(fe::graph::Tensor_attributes()
                                      .set_name("SF_Q")
                                      .set_dim(sf_d_dims)
@@ -243,14 +267,42 @@ main() {
                          .set_causal_mask(true)
                          .set_attn_scale(1.0f / std::sqrt(static_cast<float>(D)))
                          .set_deterministic_algorithm(true);
-        auto [DQ, DK, DV, AmaxDQ, AmaxDK, AmaxDV] = graph.sdpa_fp8_backward(
-            Q, QT, K, KT, V, O, DOF16, DO, DOT, Stats, SF_Q, SF_QT, SF_K, SF_KT, SF_V, SF_DO, SF_DOT, attrs);
-        DQ->set_output(true).set_dim(dims).set_stride(strides).set_data_type(fe::DataType_t::BFLOAT16);
-        DK->set_output(true).set_dim(dims).set_stride(strides).set_data_type(fe::DataType_t::BFLOAT16);
-        DV->set_output(true).set_dim(dims).set_stride(strides).set_data_type(fe::DataType_t::BFLOAT16);
-        AmaxDQ->set_output(true).set_dim({1, 1, 1, 1}).set_stride({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
-        AmaxDK->set_output(true).set_dim({1, 1, 1, 1}).set_stride({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
-        AmaxDV->set_output(true).set_dim({1, 1, 1, 1}).set_stride({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
+        auto [DQ, DK, DV, AmaxDQ, AmaxDK, AmaxDV] = graph.sdpa_fp8_backward(Q,
+                                                                            QT,
+                                                                            K,
+                                                                            KT,
+                                                                            V,
+                                                                            O,
+                                                                            DOF16,
+                                                                            DO,
+                                                                            DOT,
+                                                                            Stats,
+                                                                            SF_Q,
+                                                                            SF_QT,
+                                                                            SF_K,
+                                                                            SF_KT,
+                                                                            SF_V,
+                                                                            SF_DO,
+                                                                            SF_DOT,
+                                                                            attrs);
+        DQ->set_output(true).set_dim(dims).set_stride(strides).set_data_type(
+            fe::DataType_t::BFLOAT16);
+        DK->set_output(true).set_dim(dims).set_stride(strides).set_data_type(
+            fe::DataType_t::BFLOAT16);
+        DV->set_output(true).set_dim(dims).set_stride(strides).set_data_type(
+            fe::DataType_t::BFLOAT16);
+        AmaxDQ->set_output(true)
+            .set_dim({1, 1, 1, 1})
+            .set_stride({1, 1, 1, 1})
+            .set_data_type(fe::DataType_t::FLOAT);
+        AmaxDK->set_output(true)
+            .set_dim({1, 1, 1, 1})
+            .set_stride({1, 1, 1, 1})
+            .set_data_type(fe::DataType_t::FLOAT);
+        AmaxDV->set_output(true)
+            .set_dim({1, 1, 1, 1})
+            .set_stride({1, 1, 1, 1})
+            .set_data_type(fe::DataType_t::FLOAT);
         VariantPack variant_pack = {{Q, Q_dev},
                                     {QT, QT_dev},
                                     {K, K_dev},

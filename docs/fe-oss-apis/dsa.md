@@ -970,7 +970,7 @@ result = DSA.dense_indexer_backward_wrapper(
 
 ## Limitations
 
-- **CuTe DSL requirement** — install `nvidia-cutlass-dsl[cu13]>=4.5.0`.
+- **CuTe DSL requirement** — install `nvidia-cutlass-dsl[cu13]>=4.6.2`.
   Sparse Attention Forward emits the few SM100 instructions that are not yet
   exposed by the public CuTe facade through the MLIR LLVM inline-assembly
   interface shared by CuTe DSL 4.5 and newer releases.

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 // Complete standalone C++ sample.
 // API page: docs/api/cpp/sdpa_backward.md
 // API: sdpa_backward
@@ -52,7 +55,8 @@ build_and_execute(fe::graph::Graph& graph, VariantPack& variant_pack) {
         if (workspace_size > 0) {
             cudaError_t cuda_status = cudaMalloc(&workspace, workspace_size);
             if (cuda_status != cudaSuccess) {
-                throw std::runtime_error(std::string("cudaMalloc(workspace): ") + cudaGetErrorString(cuda_status));
+                throw std::runtime_error(std::string("cudaMalloc(workspace): ") +
+                                         cudaGetErrorString(cuda_status));
             }
         }
 
@@ -63,7 +67,8 @@ build_and_execute(fe::graph::Graph& graph, VariantPack& variant_pack) {
 
         cudaError_t cuda_status = cudaDeviceSynchronize();
         if (cuda_status != cudaSuccess) {
-            throw std::runtime_error(std::string("cudaDeviceSynchronize: ") + cudaGetErrorString(cuda_status));
+            throw std::runtime_error(std::string("cudaDeviceSynchronize: ") +
+                                     cudaGetErrorString(cuda_status));
         }
     } catch (...) {
         if (workspace) cudaFree(workspace);
@@ -74,7 +79,8 @@ build_and_execute(fe::graph::Graph& graph, VariantPack& variant_pack) {
     if (workspace) {
         cudaError_t cuda_status = cudaFree(workspace);
         if (cuda_status != cudaSuccess) {
-            throw std::runtime_error(std::string("cudaFree(workspace): ") + cudaGetErrorString(cuda_status));
+            throw std::runtime_error(std::string("cudaFree(workspace): ") +
+                                     cudaGetErrorString(cuda_status));
         }
     }
 
@@ -117,35 +123,48 @@ main() {
             .set_compute_data_type(fe::DataType_t::FLOAT);
         auto dims    = std::vector<int64_t>{B, H, S, D};
         auto strides = std::vector<int64_t>{H * S * D, S * D, D, 1};
-        auto Q =
-            graph.tensor(fe::graph::Tensor_attributes().set_name("Q").set_dim(dims).set_stride(strides).set_data_type(
-                fe::DataType_t::BFLOAT16));
-        auto K =
-            graph.tensor(fe::graph::Tensor_attributes().set_name("K").set_dim(dims).set_stride(strides).set_data_type(
-                fe::DataType_t::BFLOAT16));
-        auto V =
-            graph.tensor(fe::graph::Tensor_attributes().set_name("V").set_dim(dims).set_stride(strides).set_data_type(
-                fe::DataType_t::BFLOAT16));
-        auto O =
-            graph.tensor(fe::graph::Tensor_attributes().set_name("O").set_dim(dims).set_stride(strides).set_data_type(
-                fe::DataType_t::BFLOAT16));
-        auto DO =
-            graph.tensor(fe::graph::Tensor_attributes().set_name("dO").set_dim(dims).set_stride(strides).set_data_type(
-                fe::DataType_t::BFLOAT16));
-        auto Stats = graph.tensor(fe::graph::Tensor_attributes()
+        auto Q       = graph.tensor(fe::graph::Tensor_attributes()
+                                  .set_name("Q")
+                                  .set_dim(dims)
+                                  .set_stride(strides)
+                                  .set_data_type(fe::DataType_t::BFLOAT16));
+        auto K       = graph.tensor(fe::graph::Tensor_attributes()
+                                  .set_name("K")
+                                  .set_dim(dims)
+                                  .set_stride(strides)
+                                  .set_data_type(fe::DataType_t::BFLOAT16));
+        auto V       = graph.tensor(fe::graph::Tensor_attributes()
+                                  .set_name("V")
+                                  .set_dim(dims)
+                                  .set_stride(strides)
+                                  .set_data_type(fe::DataType_t::BFLOAT16));
+        auto O       = graph.tensor(fe::graph::Tensor_attributes()
+                                  .set_name("O")
+                                  .set_dim(dims)
+                                  .set_stride(strides)
+                                  .set_data_type(fe::DataType_t::BFLOAT16));
+        auto DO      = graph.tensor(fe::graph::Tensor_attributes()
+                                   .set_name("dO")
+                                   .set_dim(dims)
+                                   .set_stride(strides)
+                                   .set_data_type(fe::DataType_t::BFLOAT16));
+        auto Stats   = graph.tensor(fe::graph::Tensor_attributes()
                                       .set_name("Stats")
                                       .set_dim({B, H, S, 1})
                                       .set_stride({H * S, S, 1, 1})
                                       .set_data_type(fe::DataType_t::FLOAT));
-        auto attrs = fe::graph::SDPA_backward_attributes()
+        auto attrs   = fe::graph::SDPA_backward_attributes()
                          .set_name("sdpa_backward")
                          .set_causal_mask(true)
                          .set_attn_scale(1.0f / std::sqrt(static_cast<float>(D)))
                          .set_compute_data_type(fe::DataType_t::FLOAT);
         auto [DQ, DK, DV] = graph.sdpa_backward(Q, K, V, O, DO, Stats, attrs);
-        DQ->set_output(true).set_dim(dims).set_stride(strides).set_data_type(fe::DataType_t::BFLOAT16);
-        DK->set_output(true).set_dim(dims).set_stride(strides).set_data_type(fe::DataType_t::BFLOAT16);
-        DV->set_output(true).set_dim(dims).set_stride(strides).set_data_type(fe::DataType_t::BFLOAT16);
+        DQ->set_output(true).set_dim(dims).set_stride(strides).set_data_type(
+            fe::DataType_t::BFLOAT16);
+        DK->set_output(true).set_dim(dims).set_stride(strides).set_data_type(
+            fe::DataType_t::BFLOAT16);
+        DV->set_output(true).set_dim(dims).set_stride(strides).set_data_type(
+            fe::DataType_t::BFLOAT16);
         VariantPack variant_pack = {{Q, Q_dev},
                                     {K, K_dev},
                                     {V, V_dev},

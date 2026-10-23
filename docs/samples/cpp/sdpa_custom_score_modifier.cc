@@ -1,8 +1,12 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 // Complete standalone C++ sample.
 // API page: docs/api/cpp/sdpa.md
 // API: sdpa
 // Use case: Custom score modifier function
-// Source: adapted from the `Softcap` helper in `include/cudnn_frontend/utils/attn_score_modifiers.h`.
+// Source: adapted from the `Softcap` helper in
+// `include/cudnn_frontend/utils/attn_score_modifiers.h`.
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -52,7 +56,8 @@ build_and_execute(fe::graph::Graph& graph, VariantPack& variant_pack) {
         if (workspace_size > 0) {
             cudaError_t cuda_status = cudaMalloc(&workspace, workspace_size);
             if (cuda_status != cudaSuccess) {
-                throw std::runtime_error(std::string("cudaMalloc(workspace): ") + cudaGetErrorString(cuda_status));
+                throw std::runtime_error(std::string("cudaMalloc(workspace): ") +
+                                         cudaGetErrorString(cuda_status));
             }
         }
 
@@ -63,7 +68,8 @@ build_and_execute(fe::graph::Graph& graph, VariantPack& variant_pack) {
 
         cudaError_t cuda_status = cudaDeviceSynchronize();
         if (cuda_status != cudaSuccess) {
-            throw std::runtime_error(std::string("cudaDeviceSynchronize: ") + cudaGetErrorString(cuda_status));
+            throw std::runtime_error(std::string("cudaDeviceSynchronize: ") +
+                                     cudaGetErrorString(cuda_status));
         }
     } catch (...) {
         if (workspace) cudaFree(workspace);
@@ -74,7 +80,8 @@ build_and_execute(fe::graph::Graph& graph, VariantPack& variant_pack) {
     if (workspace) {
         cudaError_t cuda_status = cudaFree(workspace);
         if (cuda_status != cudaSuccess) {
-            throw std::runtime_error(std::string("cudaFree(workspace): ") + cudaGetErrorString(cuda_status));
+            throw std::runtime_error(std::string("cudaFree(workspace): ") +
+                                     cudaGetErrorString(cuda_status));
         }
     }
 
@@ -123,26 +130,26 @@ main() {
                          .set_generate_stats(false)
                          .set_attn_scale(1.0f / std::sqrt(static_cast<float>(D)))
                          .set_compute_data_type(fe::DataType_t::FLOAT);
-        attrs.set_score_mod(
-            [Softcap](std::shared_ptr<fe::graph::Graph> g, std::shared_ptr<fe::graph::Tensor_attributes> scores) {
-                auto div = g->pointwise(scores,
-                                        Softcap,
-                                        fe::graph::Pointwise_attributes()
-                                            .set_name("softcap_div")
-                                            .set_mode(fe::PointwiseMode_t::DIV)
-                                            .set_compute_data_type(fe::DataType_t::FLOAT));
-                auto t   = g->pointwise(div,
-                                      fe::graph::Pointwise_attributes()
-                                          .set_name("softcap_tanh")
-                                          .set_mode(fe::PointwiseMode_t::TANH_FWD)
-                                          .set_compute_data_type(fe::DataType_t::FLOAT));
-                return g->pointwise(t,
+        attrs.set_score_mod([Softcap](std::shared_ptr<fe::graph::Graph> g,
+                                      std::shared_ptr<fe::graph::Tensor_attributes> scores) {
+            auto div = g->pointwise(scores,
                                     Softcap,
                                     fe::graph::Pointwise_attributes()
-                                        .set_name("softcap_mul")
-                                        .set_mode(fe::PointwiseMode_t::MUL)
+                                        .set_name("softcap_div")
+                                        .set_mode(fe::PointwiseMode_t::DIV)
                                         .set_compute_data_type(fe::DataType_t::FLOAT));
-            });
+            auto t   = g->pointwise(div,
+                                  fe::graph::Pointwise_attributes()
+                                      .set_name("softcap_tanh")
+                                      .set_mode(fe::PointwiseMode_t::TANH_FWD)
+                                      .set_compute_data_type(fe::DataType_t::FLOAT));
+            return g->pointwise(t,
+                                Softcap,
+                                fe::graph::Pointwise_attributes()
+                                    .set_name("softcap_mul")
+                                    .set_mode(fe::PointwiseMode_t::MUL)
+                                    .set_compute_data_type(fe::DataType_t::FLOAT));
+        });
         auto outputs = graph.sdpa(Q, K, V, attrs);
         outputs[0]
             ->set_output(true)

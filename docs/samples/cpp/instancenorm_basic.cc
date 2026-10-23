@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 // Complete standalone C++ sample.
 // API page: docs/api/cpp/instancenorm.md
 // API: instancenorm
@@ -52,7 +55,8 @@ build_and_execute(fe::graph::Graph& graph, VariantPack& variant_pack) {
         if (workspace_size > 0) {
             cudaError_t cuda_status = cudaMalloc(&workspace, workspace_size);
             if (cuda_status != cudaSuccess) {
-                throw std::runtime_error(std::string("cudaMalloc(workspace): ") + cudaGetErrorString(cuda_status));
+                throw std::runtime_error(std::string("cudaMalloc(workspace): ") +
+                                         cudaGetErrorString(cuda_status));
             }
         }
 
@@ -63,7 +67,8 @@ build_and_execute(fe::graph::Graph& graph, VariantPack& variant_pack) {
 
         cudaError_t cuda_status = cudaDeviceSynchronize();
         if (cuda_status != cudaSuccess) {
-            throw std::runtime_error(std::string("cudaDeviceSynchronize: ") + cudaGetErrorString(cuda_status));
+            throw std::runtime_error(std::string("cudaDeviceSynchronize: ") +
+                                     cudaGetErrorString(cuda_status));
         }
     } catch (...) {
         if (workspace) cudaFree(workspace);
@@ -74,7 +79,8 @@ build_and_execute(fe::graph::Graph& graph, VariantPack& variant_pack) {
     if (workspace) {
         cudaError_t cuda_status = cudaFree(workspace);
         if (cuda_status != cudaSuccess) {
-            throw std::runtime_error(std::string("cudaFree(workspace): ") + cudaGetErrorString(cuda_status));
+            throw std::runtime_error(std::string("cudaFree(workspace): ") +
+                                     cudaGetErrorString(cuda_status));
         }
     }
 
@@ -109,8 +115,10 @@ main() {
         graph.set_io_data_type(fe::DataType_t::BFLOAT16)
             .set_intermediate_data_type(fe::DataType_t::FLOAT)
             .set_compute_data_type(fe::DataType_t::FLOAT);
-        auto X = graph.tensor(
-            fe::graph::Tensor_attributes().set_name("X").set_dim({N, C, H, W}).set_stride({C * H * W, 1, C * W, C}));
+        auto X       = graph.tensor(fe::graph::Tensor_attributes()
+                                  .set_name("X")
+                                  .set_dim({N, C, H, W})
+                                  .set_stride({C * H * W, 1, C * W, C}));
         auto Scale   = graph.tensor(fe::graph::Tensor_attributes()
                                       .set_name("scale")
                                       .set_dim({1, C, 1, 1})
@@ -131,8 +139,12 @@ main() {
         Y->set_output(true).set_data_type(fe::DataType_t::BFLOAT16);
         Mean->set_output(true).set_data_type(fe::DataType_t::FLOAT);
         InvVar->set_output(true).set_data_type(fe::DataType_t::FLOAT);
-        VariantPack variant_pack = {
-            {X, X_dev}, {Scale, Scale_dev}, {Bias, Bias_dev}, {Y, Y_dev}, {Mean, Mean_dev}, {InvVar, InvVar_dev}};
+        VariantPack variant_pack = {{X, X_dev},
+                                    {Scale, Scale_dev},
+                                    {Bias, Bias_dev},
+                                    {Y, Y_dev},
+                                    {Mean, Mean_dev},
+                                    {InvVar, InvVar_dev}};
         build_and_execute(graph, variant_pack);
         std::cout << "instancenorm executed successfully\n";
         cudaFree(X_dev);

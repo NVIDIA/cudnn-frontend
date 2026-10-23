@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Complete standalone Python sample.
 API page: docs/api/python/scale.md
 API: scale
@@ -30,7 +33,9 @@ def run_sample(sample):
 def sample():
     x = torch.randn((2, 3, 4), device="cuda", dtype=torch.float32)
     scale = torch.randn((1, 3, 1), device="cuda", dtype=torch.float32)
-    with cudnn.Graph(io_data_type=torch.float32, inputs=["X", "scale"], outputs=["Y"], handle="auto") as graph:
+    with cudnn.Graph(
+        io_data_type=torch.float32, inputs=["X", "scale"], outputs=["Y"], handle="auto"
+    ) as graph:
         X = graph.tensor(name="X", dim=x.shape, stride=x.stride())
         S = graph.tensor(name="scale", dim=scale.shape, stride=scale.stride())
         Y = graph.scale(input=X, scale=S, compute_data_type=cudnn.data_type.FLOAT, name="scale")

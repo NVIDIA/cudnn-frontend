@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Complete standalone Python sample.
 API page: docs/api/python/bias.md
 API: bias
@@ -30,7 +33,9 @@ def run_sample(sample):
 def sample():
     x = torch.randn((2, 3, 4), device="cuda", dtype=torch.float32)
     bias = torch.randn((1, 3, 1), device="cuda", dtype=torch.float32)
-    with cudnn.Graph(io_data_type=torch.float32, inputs=["X", "bias"], outputs=["Y"], handle="auto") as graph:
+    with cudnn.Graph(
+        io_data_type=torch.float32, inputs=["X", "bias"], outputs=["Y"], handle="auto"
+    ) as graph:
         X = graph.tensor(name="X", dim=x.shape, stride=x.stride())
         B = graph.tensor(name="bias", dim=bias.shape, stride=bias.stride())
         Y = graph.bias(input=X, bias=B, compute_data_type=cudnn.data_type.FLOAT, name="bias")

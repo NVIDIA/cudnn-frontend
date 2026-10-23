@@ -1,13 +1,10 @@
 ```python maxLines=0
+def tensor_key(tensor: torch.Tensor) -> TensorKey:
+    return str(tensor.device), tensor.dtype, tuple(tensor.shape), tuple(tensor.stride())
+
+
 def graph_key(a: torch.Tensor, b: torch.Tensor) -> GraphKey:
-    return (
-        str(a.device),
-        a.dtype,
-        tuple(a.shape),
-        tuple(a.stride()),
-        tuple(b.shape),
-        tuple(b.stride()),
-    )
+    return tensor_key(a), tensor_key(b)
 
 
 def build_graph(a: torch.Tensor, b: torch.Tensor) -> cudnn.Graph:

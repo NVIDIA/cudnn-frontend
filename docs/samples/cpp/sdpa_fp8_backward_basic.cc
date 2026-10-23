@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 // Complete standalone C++ sample.
 // API page: docs/api/cpp/sdpa_fp8_backward.md
 // API: sdpa_fp8_backward
@@ -52,7 +55,8 @@ build_and_execute(fe::graph::Graph& graph, VariantPack& variant_pack) {
         if (workspace_size > 0) {
             cudaError_t cuda_status = cudaMalloc(&workspace, workspace_size);
             if (cuda_status != cudaSuccess) {
-                throw std::runtime_error(std::string("cudaMalloc(workspace): ") + cudaGetErrorString(cuda_status));
+                throw std::runtime_error(std::string("cudaMalloc(workspace): ") +
+                                         cudaGetErrorString(cuda_status));
             }
         }
 
@@ -63,7 +67,8 @@ build_and_execute(fe::graph::Graph& graph, VariantPack& variant_pack) {
 
         cudaError_t cuda_status = cudaDeviceSynchronize();
         if (cuda_status != cudaSuccess) {
-            throw std::runtime_error(std::string("cudaDeviceSynchronize: ") + cudaGetErrorString(cuda_status));
+            throw std::runtime_error(std::string("cudaDeviceSynchronize: ") +
+                                     cudaGetErrorString(cuda_status));
         }
     } catch (...) {
         if (workspace) cudaFree(workspace);
@@ -74,7 +79,8 @@ build_and_execute(fe::graph::Graph& graph, VariantPack& variant_pack) {
     if (workspace) {
         cudaError_t cuda_status = cudaFree(workspace);
         if (cuda_status != cudaSuccess) {
-            throw std::runtime_error(std::string("cudaFree(workspace): ") + cudaGetErrorString(cuda_status));
+            throw std::runtime_error(std::string("cudaFree(workspace): ") +
+                                     cudaGetErrorString(cuda_status));
         }
     }
 
@@ -136,34 +142,38 @@ main() {
                                   .set_dim(dims)
                                   .set_stride(qkv_strides)
                                   .set_data_type(fe::DataType_t::FP8_E4M3));
-        auto O =
-            graph.tensor(fe::graph::Tensor_attributes().set_name("O").set_dim(dims).set_stride(o_strides).set_data_type(
-                fe::DataType_t::FP8_E4M3));
-        auto DO = graph.tensor(
-            fe::graph::Tensor_attributes().set_name("dO").set_dim(dims).set_stride(o_strides).set_data_type(
-                fe::DataType_t::FP8_E4M3));
-        auto Stats     = graph.tensor(fe::graph::Tensor_attributes()
+        auto O            = graph.tensor(fe::graph::Tensor_attributes()
+                                  .set_name("O")
+                                  .set_dim(dims)
+                                  .set_stride(o_strides)
+                                  .set_data_type(fe::DataType_t::FP8_E4M3));
+        auto DO           = graph.tensor(fe::graph::Tensor_attributes()
+                                   .set_name("dO")
+                                   .set_dim(dims)
+                                   .set_stride(o_strides)
+                                   .set_data_type(fe::DataType_t::FP8_E4M3));
+        auto Stats        = graph.tensor(fe::graph::Tensor_attributes()
                                       .set_name("Stats")
                                       .set_dim(stat_dims)
                                       .set_stride(stat_strides)
                                       .set_data_type(fe::DataType_t::FLOAT));
-        auto DescaleQ  = graph.tensor(fe::graph::Tensor_attributes()
+        auto DescaleQ     = graph.tensor(fe::graph::Tensor_attributes()
                                          .set_name("Descale_Q")
                                          .set_dim({1, 1, 1, 1})
                                          .set_stride({1, 1, 1, 1})
                                          .set_data_type(fe::DataType_t::FLOAT));
-        auto DescaleK  = graph.tensor_like(DescaleQ, "Descale_K");
-        auto DescaleV  = graph.tensor_like(DescaleQ, "Descale_V");
-        auto DescaleO  = graph.tensor_like(DescaleQ, "Descale_O");
-        auto DescaleDO = graph.tensor_like(DescaleQ, "Descale_dO");
-        auto DescaleS  = graph.tensor_like(DescaleQ, "Descale_S");
-        auto DescaleDP = graph.tensor_like(DescaleQ, "Descale_dP");
-        auto ScaleS    = graph.tensor_like(DescaleQ, "Scale_S");
-        auto ScaleDQ   = graph.tensor_like(DescaleQ, "Scale_dQ");
-        auto ScaleDK   = graph.tensor_like(DescaleQ, "Scale_dK");
-        auto ScaleDV   = graph.tensor_like(DescaleQ, "Scale_dV");
-        auto ScaleDP   = graph.tensor_like(DescaleQ, "Scale_dP");
-        auto attrs     = fe::graph::SDPA_fp8_backward_attributes()
+        auto DescaleK     = graph.tensor_like(DescaleQ, "Descale_K");
+        auto DescaleV     = graph.tensor_like(DescaleQ, "Descale_V");
+        auto DescaleO     = graph.tensor_like(DescaleQ, "Descale_O");
+        auto DescaleDO    = graph.tensor_like(DescaleQ, "Descale_dO");
+        auto DescaleS     = graph.tensor_like(DescaleQ, "Descale_S");
+        auto DescaleDP    = graph.tensor_like(DescaleQ, "Descale_dP");
+        auto ScaleS       = graph.tensor_like(DescaleQ, "Scale_S");
+        auto ScaleDQ      = graph.tensor_like(DescaleQ, "Scale_dQ");
+        auto ScaleDK      = graph.tensor_like(DescaleQ, "Scale_dK");
+        auto ScaleDV      = graph.tensor_like(DescaleQ, "Scale_dV");
+        auto ScaleDP      = graph.tensor_like(DescaleQ, "Scale_dP");
+        auto attrs        = fe::graph::SDPA_fp8_backward_attributes()
                          .set_name("sdpa_fp8_backward")
                          .set_causal_mask(true)
                          .set_attn_scale(1.0f / std::sqrt(static_cast<float>(D)));
@@ -186,13 +196,34 @@ main() {
                                                                                     ScaleDV,
                                                                                     ScaleDP,
                                                                                     attrs);
-        DQ->set_output(true).set_dim(dims).set_stride(qkv_strides).set_data_type(fe::DataType_t::FP8_E4M3);
-        DK->set_output(true).set_dim(dims).set_stride(qkv_strides).set_data_type(fe::DataType_t::FP8_E4M3);
-        DV->set_output(true).set_dim(dims).set_stride(qkv_strides).set_data_type(fe::DataType_t::FP8_E4M3);
-        AmaxDQ->set_output(true).set_dim({1, 1, 1, 1}).set_stride({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
-        AmaxDK->set_output(true).set_dim({1, 1, 1, 1}).set_stride({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
-        AmaxDV->set_output(true).set_dim({1, 1, 1, 1}).set_stride({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
-        AmaxDP->set_output(true).set_dim({1, 1, 1, 1}).set_stride({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
+        DQ->set_output(true)
+            .set_dim(dims)
+            .set_stride(qkv_strides)
+            .set_data_type(fe::DataType_t::FP8_E4M3);
+        DK->set_output(true)
+            .set_dim(dims)
+            .set_stride(qkv_strides)
+            .set_data_type(fe::DataType_t::FP8_E4M3);
+        DV->set_output(true)
+            .set_dim(dims)
+            .set_stride(qkv_strides)
+            .set_data_type(fe::DataType_t::FP8_E4M3);
+        AmaxDQ->set_output(true)
+            .set_dim({1, 1, 1, 1})
+            .set_stride({1, 1, 1, 1})
+            .set_data_type(fe::DataType_t::FLOAT);
+        AmaxDK->set_output(true)
+            .set_dim({1, 1, 1, 1})
+            .set_stride({1, 1, 1, 1})
+            .set_data_type(fe::DataType_t::FLOAT);
+        AmaxDV->set_output(true)
+            .set_dim({1, 1, 1, 1})
+            .set_stride({1, 1, 1, 1})
+            .set_data_type(fe::DataType_t::FLOAT);
+        AmaxDP->set_output(true)
+            .set_dim({1, 1, 1, 1})
+            .set_stride({1, 1, 1, 1})
+            .set_data_type(fe::DataType_t::FLOAT);
         VariantPack variant_pack = {{Q, QKV_dev},
                                     {K, QKV_dev + H * D},
                                     {V, QKV_dev + 2 * H * D},

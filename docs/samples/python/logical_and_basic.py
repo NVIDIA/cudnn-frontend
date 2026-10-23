@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Complete standalone Python sample.
 API page: docs/api/python/logical_and.md
 API: logical_and
@@ -30,10 +33,18 @@ def run_sample(sample):
 def sample():
     a = torch.rand((2, 3, 8), device="cuda") > 0.5
     b = torch.rand((2, 3, 8), device="cuda") > 0.5
-    with cudnn.Graph(io_data_type=torch.bool, inputs=["A", "B"], outputs=["Y"], handle="auto") as graph:
-        A = graph.tensor(name="A", dim=a.shape, stride=a.stride(), data_type=cudnn.data_type.BOOLEAN)
-        B = graph.tensor(name="B", dim=b.shape, stride=b.stride(), data_type=cudnn.data_type.BOOLEAN)
-        Y = graph.logical_and(a=A, b=B, compute_data_type=cudnn.data_type.BOOLEAN, name="logical_and")
+    with cudnn.Graph(
+        io_data_type=torch.bool, inputs=["A", "B"], outputs=["Y"], handle="auto"
+    ) as graph:
+        A = graph.tensor(
+            name="A", dim=a.shape, stride=a.stride(), data_type=cudnn.data_type.BOOLEAN
+        )
+        B = graph.tensor(
+            name="B", dim=b.shape, stride=b.stride(), data_type=cudnn.data_type.BOOLEAN
+        )
+        Y = graph.logical_and(
+            a=A, b=B, compute_data_type=cudnn.data_type.BOOLEAN, name="logical_and"
+        )
         Y.set_output(True).set_name("Y").set_data_type(cudnn.data_type.BOOLEAN)
     y = graph(a, b)
     print(f"logical_and output: shape={tuple(y.shape)}, dtype={y.dtype}")

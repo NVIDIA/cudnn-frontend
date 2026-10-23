@@ -32,7 +32,11 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
+      # Manifest generation reads declarations from the commit pinned in
+      # docs/compatibility.json, so the checkout must include repository history.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:

@@ -1,9 +1,12 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 // Complete standalone C++ sample.
 // API page: docs/api/cpp/sdpa.md
 // API: sdpa
 // Use case: Variable-length padded or THD attention
-// Source: adapted from sequence-length setup in `samples/cpp/sdpa/fp16_fwd.cpp` and ragged-offset setup in
-// `samples/cpp/sdpa/fp16_fwd_paged_decode_and_prefill.cpp`.
+// Source: adapted from sequence-length setup in `samples/cpp/sdpa/fp16_fwd.cpp` and ragged-offset
+// setup in `samples/cpp/sdpa/fp16_fwd_paged_decode_and_prefill.cpp`.
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -53,7 +56,8 @@ build_and_execute(fe::graph::Graph& graph, VariantPack& variant_pack) {
         if (workspace_size > 0) {
             cudaError_t cuda_status = cudaMalloc(&workspace, workspace_size);
             if (cuda_status != cudaSuccess) {
-                throw std::runtime_error(std::string("cudaMalloc(workspace): ") + cudaGetErrorString(cuda_status));
+                throw std::runtime_error(std::string("cudaMalloc(workspace): ") +
+                                         cudaGetErrorString(cuda_status));
             }
         }
 
@@ -64,7 +68,8 @@ build_and_execute(fe::graph::Graph& graph, VariantPack& variant_pack) {
 
         cudaError_t cuda_status = cudaDeviceSynchronize();
         if (cuda_status != cudaSuccess) {
-            throw std::runtime_error(std::string("cudaDeviceSynchronize: ") + cudaGetErrorString(cuda_status));
+            throw std::runtime_error(std::string("cudaDeviceSynchronize: ") +
+                                     cudaGetErrorString(cuda_status));
         }
     } catch (...) {
         if (workspace) cudaFree(workspace);
@@ -75,7 +80,8 @@ build_and_execute(fe::graph::Graph& graph, VariantPack& variant_pack) {
     if (workspace) {
         cudaError_t cuda_status = cudaFree(workspace);
         if (cuda_status != cudaSuccess) {
-            throw std::runtime_error(std::string("cudaFree(workspace): ") + cudaGetErrorString(cuda_status));
+            throw std::runtime_error(std::string("cudaFree(workspace): ") +
+                                     cudaGetErrorString(cuda_status));
         }
     }
 
@@ -152,8 +158,12 @@ main() {
                 .set_dim({B, Hq, S, 1})
                 .set_stride({Hq * S, S, 1, 1})
                 .set_data_type(fe::DataType_t::FLOAT);
-        VariantPack variant_pack = {
-            {Q, Q_dev}, {K, K_dev}, {V, V_dev}, {outputs[0], O_dev}, {SeqQ, SeqQ_dev}, {SeqKV, SeqKV_dev}};
+        VariantPack variant_pack = {{Q, Q_dev},
+                                    {K, K_dev},
+                                    {V, V_dev},
+                                    {outputs[0], O_dev},
+                                    {SeqQ, SeqQ_dev},
+                                    {SeqKV, SeqKV_dev}};
         if (outputs[1] != nullptr) variant_pack[outputs[1]] = Stats_dev;
         build_and_execute(graph, variant_pack);
         std::cout << "sdpa executed successfully\n";

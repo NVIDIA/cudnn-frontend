@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 // Complete standalone C++ sample.
 // API page: docs/api/cpp/execute_plan_at_index.md
 // API: execute_plan_at_index
@@ -45,7 +48,8 @@ main() {
         for (int64_t i = 0; i < (b * m * k); ++i) A_dev[i] = __float2bfloat16(dis(gen));
         for (int64_t i = 0; i < (b * k * n); ++i) B_dev[i] = __float2bfloat16(dis(gen));
         fe::graph::Graph graph{};
-        graph.set_intermediate_data_type(fe::DataType_t::FLOAT).set_compute_data_type(fe::DataType_t::FLOAT);
+        graph.set_intermediate_data_type(fe::DataType_t::FLOAT)
+            .set_compute_data_type(fe::DataType_t::FLOAT);
         auto A = graph.tensor(fe::graph::Tensor_attributes()
                                   .set_name("A")
                                   .set_dim({b, m, k})
@@ -56,8 +60,11 @@ main() {
                                   .set_dim({b, k, n})
                                   .set_stride({k * n, n, 1})
                                   .set_data_type(fe::DataType_t::BFLOAT16));
-        auto C = graph.matmul(
-            A, B, fe::graph::Matmul_attributes().set_name("matmul").set_compute_data_type(fe::DataType_t::FLOAT));
+        auto C =
+            graph.matmul(A,
+                         B,
+                         fe::graph::Matmul_attributes().set_name("matmul").set_compute_data_type(
+                             fe::DataType_t::FLOAT));
         C->set_output(true)
             .set_name("C")
             .set_data_type(fe::DataType_t::FLOAT)
@@ -67,7 +74,8 @@ main() {
         cudnnHandle_t handle       = nullptr;
         cudnnStatus_t cudnn_status = cudnnCreate(&handle);
         if (cudnn_status != CUDNN_STATUS_SUCCESS) {
-            throw std::runtime_error(std::string("cudnnCreate: ") + cudnnGetErrorString(cudnn_status));
+            throw std::runtime_error(std::string("cudnnCreate: ") +
+                                     cudnnGetErrorString(cudnn_status));
         }
         {
             auto status = graph.validate();
@@ -78,13 +86,16 @@ main() {
         {
             auto status = graph.build_operation_graph(handle);
             if (!status.is_good()) {
-                throw std::runtime_error(std::string("build_operation_graph: ") + status.get_message());
+                throw std::runtime_error(std::string("build_operation_graph: ") +
+                                         status.get_message());
             }
         }
         {
-            auto status = graph.create_execution_plans({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK});
+            auto status =
+                graph.create_execution_plans({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK});
             if (!status.is_good()) {
-                throw std::runtime_error(std::string("create_execution_plans: ") + status.get_message());
+                throw std::runtime_error(std::string("create_execution_plans: ") +
+                                         status.get_message());
             }
         }
         {
@@ -104,18 +115,21 @@ main() {
         if (workspace_size > 0) {
             cudaError_t cuda_status = cudaMalloc(&workspace, workspace_size);
             if (cuda_status != cudaSuccess) {
-                throw std::runtime_error(std::string("cudaMalloc(workspace): ") + cudaGetErrorString(cuda_status));
+                throw std::runtime_error(std::string("cudaMalloc(workspace): ") +
+                                         cudaGetErrorString(cuda_status));
             }
         }
         {
             auto status = graph.execute_plan_at_index(handle, variant_pack, workspace, 0);
             if (!status.is_good()) {
-                throw std::runtime_error(std::string("execute_plan_at_index: ") + status.get_message());
+                throw std::runtime_error(std::string("execute_plan_at_index: ") +
+                                         status.get_message());
             }
         }
         cudaError_t cuda_status = cudaDeviceSynchronize();
         if (cuda_status != cudaSuccess) {
-            throw std::runtime_error(std::string("cudaDeviceSynchronize: ") + cudaGetErrorString(cuda_status));
+            throw std::runtime_error(std::string("cudaDeviceSynchronize: ") +
+                                     cudaGetErrorString(cuda_status));
         }
         if (workspace) cudaFree(workspace);
         std::cout << "execute_plan_at_index executed successfully\n";

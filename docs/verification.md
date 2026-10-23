@@ -6,7 +6,7 @@ Verification date: 2026-10-22.
 
 | Component | Verified environment |
 | --- | --- |
-| cuDNN Frontend | 1.27.0 from this checkout's `python/` directory |
+| cuDNN Frontend | 1.32.0 Python source from this checkout, with a compatible prebuilt extension |
 | Python | 3.13.2 in the `pt` pyenv environment |
 | PyTorch | 2.10.0+cu130 |
 | CUDA reported by PyTorch | 13.0 |
@@ -75,8 +75,10 @@ syntax fallbacks.
   environment.
 - Execution coverage was limited to Linux and SM100. Windows, other GPU
   architectures, and older CUDA toolkits were not available.
-- The environment contained CUTLASS DSL 4.5.2 while the project extra pins
-  4.5.0, so the pinned optional-engine dependency combination was not verified.
+- The recorded environment contained CUTLASS DSL 4.5.2, below the package's
+  current 4.6.2 floor and the 4.7.0 floor used by FROST-derived kernels. Those
+  historical OSS results do not verify the current source dependency contract;
+  individual engines can require still newer releases and check at runtime.
 - API source links are commit-pinned. Historical APIs absent from the current
   surface link to the class or fallback source that establishes that status.
 

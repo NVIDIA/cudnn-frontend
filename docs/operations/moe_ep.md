@@ -675,8 +675,8 @@ new operator preparation; caller-address changes require recapture.
 - NVIDIA Rubin SM107 GPUs (compute capability 10.7).
 - CUDA and PyTorch execution.
 - `nvidia-cutlass-dsl>=4.8.0` for the Rubin kernels. The package-wide
-  `cutedsl` extra retains its 4.5.0 installation floor so other cuDNN Frontend
-  operations remain usable with older compatible DSL versions.
+  dependency floor remains 4.6.2 so other cuDNN Frontend operations remain
+  usable with older compatible DSL versions.
 - Fused SwiGLU with contiguous expert sharding.
 - `apply_topk_in_fc1=True`.
 - `hidden_size` divisible by 128.

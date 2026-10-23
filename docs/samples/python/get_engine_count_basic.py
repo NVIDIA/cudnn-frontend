@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Complete standalone Python sample.
 API page: docs/api/python/get_engine_count.md
 API: get_engine_count
@@ -49,7 +52,9 @@ def sample():
             data_type=cudnn.data_type.BFLOAT16,
         )
         C = graph.matmul(A=A, B=B, compute_data_type=cudnn.data_type.FLOAT, name="matmul")
-        C.set_output(True).set_name("C").set_dim((2, 4, 8)).set_stride((32, 8, 1)).set_data_type(cudnn.data_type.BFLOAT16)
+        C.set_output(True).set_name("C").set_dim((2, 4, 8)).set_stride((32, 8, 1)).set_data_type(
+            cudnn.data_type.BFLOAT16
+        )
         graph.validate()
         graph.build_operation_graph()
         graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])

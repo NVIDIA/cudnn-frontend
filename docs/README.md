@@ -79,6 +79,8 @@ python tools/doc/run_doc_samples.py --list
 These checks validate navigation coverage, Fern component sources, generated
 regions, manifests, API-local availability contracts, and the sample catalog.
 GitHub Actions runs the Fern and repository checks for documentation changes.
+The tracked `old-docs-disposition.json` file is the canonical historical-topic
+inventory; builds do not require a separate checkout of the former docs tree.
 
 Optional live preview (`fern docs dev --broken-links` at
 `http://localhost:3000`) performs the full MDX bundle and link check. It may

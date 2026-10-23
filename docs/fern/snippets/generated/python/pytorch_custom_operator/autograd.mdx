@@ -6,7 +6,9 @@ def setup_context(ctx, inputs, output) -> None:
 
 def backward(ctx, grad_output: torch.Tensor):
     a, b = ctx.saved_tensors
-    return grad_output @ b.transpose(-2, -1), a.transpose(-2, -1) @ grad_output
+    grad_a = (grad_output @ b.transpose(-2, -1)).sum_to_size(a.shape)
+    grad_b = (a.transpose(-2, -1) @ grad_output).sum_to_size(b.shape)
+    return grad_a, grad_b
 
 
 torch.library.register_autograd(

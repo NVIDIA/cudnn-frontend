@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Execute the OSS RMSNorm-SiLU Graph fusion and check a PyTorch reference."""
 
 import torch

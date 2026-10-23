@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Complete standalone Python sample.
 API page: docs/api/python/sdpa.md
 API: sdpa
@@ -48,7 +51,9 @@ def sample():
         Q = graph.tensor(name="q", dim=q_shape, stride=q_stride)
         K = graph.tensor(name="k", dim=kv_shape, stride=kv_stride)
         V = graph.tensor(name="v", dim=kv_shape, stride=kv_stride)
-        out, stats = graph.sdpa(q=Q, k=K, v=V, is_inference=True, attn_scale=float(D) ** -0.5, name="sdpa")
+        out, stats = graph.sdpa(
+            q=Q, k=K, v=V, is_inference=True, attn_scale=float(D) ** -0.5, name="sdpa"
+        )
         out.set_output(True).set_name("out").set_dim(q_shape).set_stride(q_stride)
         if stats is not None:
             stats.set_output(True).set_name("stats").set_data_type(cudnn.data_type.FLOAT)

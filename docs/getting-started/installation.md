@@ -4,8 +4,8 @@ Using cuDNN Frontend requires a compatible CUDA, cuDNN, driver, and GPU stack. D
 
 ## Requirements
 
-- Python 3.9 or newer for the Python package.
-- CMake 3.23 or newer and a C++17 compiler for repository CMake builds.
+- Python 3.10 or newer for the Python package.
+- CMake 3.26 or newer and a C++17 compiler for repository CMake builds.
 - An NVIDIA driver, CUDA toolkit/runtime, and cuDNN release that support the selected feature.
 - Linux or Windows for the core package. Optional CUTLASS DSL packages can have narrower platform support.
 
@@ -15,20 +15,19 @@ Using cuDNN Frontend requires a compatible CUDA, cuDNN, driver, and GPU stack. D
 
 ## Python
 
-You can install the released core package and the optional kernel dependencies:
+Install the released package from PyPI:
 
 ```bash
-# Install the core package
 pip install nvidia-cudnn-frontend
-
-# Optional: Install the CUTLASS DSL kernels and their pinned dependencies
-pip install nvidia-cudnn-frontend[cutedsl]
-
-# Optional: Install the dependent Python packages explicitly
-pip install nvidia-cuda-runtime nvidia-cudnn-cu13 nvidia-cutlass-dsl-libs-cu13
 ```
 
-You may also install from source:
+The base package includes the graph API and the framework-neutral CuTeDSL
+dependencies on supported platforms. The compatibility extra
+`nvidia-cudnn-frontend[cutedsl]` still resolves, but currently adds only
+`cuda-python`. Install a CUDA-enabled PyTorch or JAX build separately when an
+API uses that framework.
+
+To install from source, clone the repository and run:
 
 ```bash
 # optional: Set the paths if CUDA or cuDNN are not in default system locations
@@ -36,20 +35,18 @@ export CUDAToolkit_ROOT=/path/to/cuda
 export CUDA_PATH=/path/to/cuda
 export CUDNN_PATH=/path/to/cudnn
 
-# Install from source
-pip install git+https://github.com/NVIDIA/cudnn-frontend.git
+# Install the graph API and framework-neutral CuTeDSL dependencies
+pip install -e .
+
+# Optional: Add a tensor framework for framework-specific CuTeDSL APIs
+pip install --group torch
+# or: pip install --group jax
 ```
 
-The source build uses CMake and pybind11 to build `cudnn._compiled_module`. Set `CUDAToolkit_ROOT` or `CUDA_PATH` when CMake cannot find the intended toolkit. Set `CUDNN_PATH` when cuDNN headers or libraries are outside normal discovery paths.
-
-After activating the Python environment you want to test, run the probe from
-the repository root:
-
-```bash
-python docs/samples/python/verify_environment.py
-```
-
-The path printed as `cudnn_file` must resolve under this checkout when verifying unreleased source behavior. A site-packages path tests the installed wheel instead.
+The source build uses CMake and nanobind to build `cudnn._compiled_module`.
+Set `CUDAToolkit_ROOT` or `CUDA_PATH` when CMake cannot find the intended
+toolkit. Set `CUDNN_PATH` when cuDNN headers or libraries are outside normal
+discovery paths.
 
 ## Verify the installation
 
@@ -60,7 +57,8 @@ the repository root:
 python docs/samples/python/verify_environment.py
 ```
 
-The path printed as `cudnn_file` shows the installed path of the Python package, usually a site-packages path if installed from wheel.
+The path printed as `cudnn_file` must resolve under this checkout when testing
+unreleased source behavior. A site-packages path tests the installed wheel.
 
 </Tab>
 <Tab title="C++" language="cpp">

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Complete standalone causal GQA forward and backward sample.
 
 API pages: docs/api/python/sdpa.md and docs/api/python/sdpa_backward.md

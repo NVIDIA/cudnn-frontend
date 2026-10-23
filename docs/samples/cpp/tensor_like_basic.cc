@@ -1,9 +1,12 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 // Complete standalone C++ sample.
 // API page: docs/api/cpp/tensor_like.md
 // API: tensor_like
 // Use case: Basic
-// Source: adapted from `include/cudnn_frontend/graph_interface.h` tensor-like implementation and common graph
-// construction patterns.
+// Source: adapted from `include/cudnn_frontend/graph_interface.h` tensor-like implementation and
+// common graph construction patterns.
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -53,7 +56,8 @@ build_and_execute(fe::graph::Graph& graph, VariantPack& variant_pack) {
         if (workspace_size > 0) {
             cudaError_t cuda_status = cudaMalloc(&workspace, workspace_size);
             if (cuda_status != cudaSuccess) {
-                throw std::runtime_error(std::string("cudaMalloc(workspace): ") + cudaGetErrorString(cuda_status));
+                throw std::runtime_error(std::string("cudaMalloc(workspace): ") +
+                                         cudaGetErrorString(cuda_status));
             }
         }
 
@@ -64,7 +68,8 @@ build_and_execute(fe::graph::Graph& graph, VariantPack& variant_pack) {
 
         cudaError_t cuda_status = cudaDeviceSynchronize();
         if (cuda_status != cudaSuccess) {
-            throw std::runtime_error(std::string("cudaDeviceSynchronize: ") + cudaGetErrorString(cuda_status));
+            throw std::runtime_error(std::string("cudaDeviceSynchronize: ") +
+                                     cudaGetErrorString(cuda_status));
         }
     } catch (...) {
         if (workspace) cudaFree(workspace);
@@ -75,7 +80,8 @@ build_and_execute(fe::graph::Graph& graph, VariantPack& variant_pack) {
     if (workspace) {
         cudaError_t cuda_status = cudaFree(workspace);
         if (cuda_status != cudaSuccess) {
-            throw std::runtime_error(std::string("cudaFree(workspace): ") + cudaGetErrorString(cuda_status));
+            throw std::runtime_error(std::string("cudaFree(workspace): ") +
+                                     cudaGetErrorString(cuda_status));
         }
     }
 
@@ -98,9 +104,11 @@ main() {
         graph.set_io_data_type(fe::DataType_t::FLOAT)
             .set_intermediate_data_type(fe::DataType_t::FLOAT)
             .set_compute_data_type(fe::DataType_t::FLOAT);
-        auto X =
-            graph.tensor(fe::graph::Tensor_attributes().set_name("X").set_dim({2, 3}).set_stride({3, 1}).set_data_type(
-                fe::DataType_t::FLOAT));
+        auto X = graph.tensor(fe::graph::Tensor_attributes()
+                                  .set_name("X")
+                                  .set_dim({2, 3})
+                                  .set_stride({3, 1})
+                                  .set_data_type(fe::DataType_t::FLOAT));
         auto Y = graph.pointwise(X,
                                  fe::graph::Pointwise_attributes()
                                      .set_name("identity")

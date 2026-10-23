@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Complete standalone Python sample.
 API page: docs/api/python/execute.md
 API: execute
@@ -49,7 +52,9 @@ def sample():
             data_type=cudnn.data_type.BFLOAT16,
         )
         C = graph.matmul(A=A, B=B, compute_data_type=cudnn.data_type.FLOAT, name="matmul")
-        C.set_output(True).set_name("C").set_dim((2, 4, 8)).set_stride((32, 8, 1)).set_data_type(cudnn.data_type.BFLOAT16)
+        C.set_output(True).set_name("C").set_dim((2, 4, 8)).set_stride((32, 8, 1)).set_data_type(
+            cudnn.data_type.BFLOAT16
+        )
         a = torch.randn((2, 4, 16), device="cuda", dtype=torch.bfloat16)
         b = torch.randn((2, 16, 8), device="cuda", dtype=torch.bfloat16)
         c = torch.empty((2, 4, 8), device="cuda", dtype=torch.bfloat16)
@@ -58,7 +63,9 @@ def sample():
         graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
         graph.check_support()
         graph.build_plans()
-        workspace = torch.empty(max(1, graph.get_workspace_size()), device="cuda", dtype=torch.uint8)
+        workspace = torch.empty(
+            max(1, graph.get_workspace_size()), device="cuda", dtype=torch.uint8
+        )
         graph.execute({A: a, B: b, C: c}, workspace, handle=handle)
         print("execute: ok")
     finally:

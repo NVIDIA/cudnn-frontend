@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 // Complete standalone C++ sample.
 // API page: docs/api/cpp/sdpa_fp8.md
 // API: sdpa_fp8
@@ -52,7 +55,8 @@ build_and_execute(fe::graph::Graph& graph, VariantPack& variant_pack) {
         if (workspace_size > 0) {
             cudaError_t cuda_status = cudaMalloc(&workspace, workspace_size);
             if (cuda_status != cudaSuccess) {
-                throw std::runtime_error(std::string("cudaMalloc(workspace): ") + cudaGetErrorString(cuda_status));
+                throw std::runtime_error(std::string("cudaMalloc(workspace): ") +
+                                         cudaGetErrorString(cuda_status));
             }
         }
 
@@ -63,7 +67,8 @@ build_and_execute(fe::graph::Graph& graph, VariantPack& variant_pack) {
 
         cudaError_t cuda_status = cudaDeviceSynchronize();
         if (cuda_status != cudaSuccess) {
-            throw std::runtime_error(std::string("cudaDeviceSynchronize: ") + cudaGetErrorString(cuda_status));
+            throw std::runtime_error(std::string("cudaDeviceSynchronize: ") +
+                                     cudaGetErrorString(cuda_status));
         }
     } catch (...) {
         if (workspace) cudaFree(workspace);
@@ -74,7 +79,8 @@ build_and_execute(fe::graph::Graph& graph, VariantPack& variant_pack) {
     if (workspace) {
         cudaError_t cuda_status = cudaFree(workspace);
         if (cuda_status != cudaSuccess) {
-            throw std::runtime_error(std::string("cudaFree(workspace): ") + cudaGetErrorString(cuda_status));
+            throw std::runtime_error(std::string("cudaFree(workspace): ") +
+                                     cudaGetErrorString(cuda_status));
         }
     }
 
@@ -159,9 +165,16 @@ main() {
                          .set_attn_scale(1.0f / std::sqrt(static_cast<float>(D)));
         auto [O, Stats, AmaxS, AmaxO] =
             graph.sdpa_fp8(Q, K, V, DescaleQ, DescaleK, DescaleV, DescaleS, ScaleS, ScaleO, attrs);
-        O->set_output(true).set_dim(dims).set_stride(o_strides).set_data_type(fe::DataType_t::FP8_E4M3);
-        AmaxS->set_output(true).set_dim({1, 1, 1, 1}).set_stride({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
-        AmaxO->set_output(true).set_dim({1, 1, 1, 1}).set_stride({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT);
+        O->set_output(true).set_dim(dims).set_stride(o_strides).set_data_type(
+            fe::DataType_t::FP8_E4M3);
+        AmaxS->set_output(true)
+            .set_dim({1, 1, 1, 1})
+            .set_stride({1, 1, 1, 1})
+            .set_data_type(fe::DataType_t::FLOAT);
+        AmaxO->set_output(true)
+            .set_dim({1, 1, 1, 1})
+            .set_stride({1, 1, 1, 1})
+            .set_data_type(fe::DataType_t::FLOAT);
         VariantPack variant_pack = {{Q, QKV_dev},
                                     {K, QKV_dev + H * D},
                                     {V, QKV_dev + 2 * H * D},

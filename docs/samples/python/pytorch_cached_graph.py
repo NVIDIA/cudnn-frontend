@@ -1,28 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Cache a cudnn.Graph by the PyTorch tensor metadata that defines its contract."""
 
 import cudnn
 import torch
 
-GraphKey = tuple[
+TensorKey = tuple[
     str,
     torch.dtype,
     tuple[int, ...],
     tuple[int, ...],
-    tuple[int, ...],
-    tuple[int, ...],
 ]
+GraphKey = tuple[TensorKey, TensorKey]
 GRAPH_CACHE: dict[GraphKey, cudnn.Graph] = {}
 
 
+def tensor_key(tensor: torch.Tensor) -> TensorKey:
+    return str(tensor.device), tensor.dtype, tuple(tensor.shape), tuple(tensor.stride())
+
+
 def graph_key(a: torch.Tensor, b: torch.Tensor) -> GraphKey:
-    return (
-        str(a.device),
-        a.dtype,
-        tuple(a.shape),
-        tuple(a.stride()),
-        tuple(b.shape),
-        tuple(b.stride()),
-    )
+    return tensor_key(a), tensor_key(b)
 
 
 def build_graph(a: torch.Tensor, b: torch.Tensor) -> cudnn.Graph:
@@ -56,6 +55,7 @@ def main() -> None:
         expected = torch.matmul(a.float(), b.float()).to(torch.bfloat16)
         torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
 
+    assert graph_key(a, b) != graph_key(a, b.float())
     assert len(GRAPH_CACHE) == 1
     print("cached cudnn.Graph ok: builds=1 executions=2")
 

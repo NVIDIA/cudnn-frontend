@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Complete standalone Python sample.
 API page: docs/api/python/sdpa.md
 API: sdpa
@@ -39,7 +42,9 @@ def sample():
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
     )
-    q = graph.tensor(name="q", dim=(B, Hq, S, D), stride=q_stride, data_type=cudnn.data_type.BFLOAT16)
+    q = graph.tensor(
+        name="q", dim=(B, Hq, S, D), stride=q_stride, data_type=cudnn.data_type.BFLOAT16
+    )
     k = graph.tensor(
         name="k_cache",
         dim=(B * blocks, Hkv, block_size, D),
@@ -89,7 +94,9 @@ def sample():
         paged_attention_max_seq_len_kv=S,
         generate_stats=False,
     )
-    out.set_output(True).set_name("out").set_dim((B, Hq, S, D)).set_stride(q_stride).set_data_type(cudnn.data_type.BFLOAT16)
+    out.set_output(True).set_name("out").set_dim((B, Hq, S, D)).set_stride(q_stride).set_data_type(
+        cudnn.data_type.BFLOAT16
+    )
     graph.validate()
     print("sdpa paged cache graph validated")
 

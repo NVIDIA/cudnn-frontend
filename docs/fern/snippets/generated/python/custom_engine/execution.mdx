@@ -1,5 +1,7 @@
 ```python maxLines=0
     workspace = torch.empty(max(1, graph.get_workspace_size()), device="cuda", dtype=torch.uint8)
     graph.execute({A: a, B: b, C: result}, workspace)
-    torch.testing.assert_close(result, torch.matmul(a.float(), b.float()).to(torch.bfloat16), rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(
+        result, torch.matmul(a.float(), b.float()).to(torch.bfloat16), rtol=1e-2, atol=1e-2
+    )
 ```

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Inspect automatic Python-engine and backend plan selection."""
 
 import cudnn
@@ -41,7 +44,9 @@ def main() -> None:
     # --8<-- [start:execution]
     workspace = torch.empty(max(1, graph.get_workspace_size()), device="cuda", dtype=torch.uint8)
     graph.execute({A: a, B: b, C: result}, workspace)
-    torch.testing.assert_close(result, torch.matmul(a.float(), b.float()).to(torch.bfloat16), rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(
+        result, torch.matmul(a.float(), b.float()).to(torch.bfloat16), rtol=1e-2, atol=1e-2
+    )
     # --8<-- [end:execution]
 
     print(f"selected plan owner: {owner}")

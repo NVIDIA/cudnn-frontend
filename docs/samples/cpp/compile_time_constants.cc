@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 // Construct an FMA graph whose scale and bias are compile-time constants.
 
 #include <cudnn_frontend.h>
@@ -10,9 +13,11 @@ main() {
     using fe::graph::ScalarType;
 
     fe::graph::Graph graph;
-    auto x = graph.tensor(
-        fe::graph::Tensor_attributes().set_name("X").set_dim({1, 1024}).set_stride({1024, 1}).set_data_type(
-            fe::DataType_t::FLOAT));
+    auto x = graph.tensor(fe::graph::Tensor_attributes()
+                              .set_name("X")
+                              .set_dim({1, 1024})
+                              .set_stride({1024, 1})
+                              .set_data_type(fe::DataType_t::FLOAT));
 
     auto scale = graph.tensor(2.5f, ScalarType::COMPILE_TIME_CONST);
     scale->set_name("scale").set_dim({1, 1}).set_stride({1, 1});
