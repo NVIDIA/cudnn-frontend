@@ -849,6 +849,7 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
 
     situ_beta1_cache_signature = float(situ_beta1) if act_func == "situglu" else None
     cache_key = (
+        a_tensor.device,
         weight_mode,
         act_func,
         situ_beta1_cache_signature,
