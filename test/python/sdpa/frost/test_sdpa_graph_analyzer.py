@@ -1467,7 +1467,7 @@ def test_packed_thd_split_adapter_declines_nonpaged_pack_gqa(monkeypatch, dtype,
 @pytest.mark.parametrize(
     "changed,knobs",
     [
-        ({"device_cc": (10, 7)}, {}),
+        ({"device_cc": (10, 7)}, {"cga": 1}),
         ({"d_qk": 64, "d_v": 64}, {}),
         ({"d_qk": 256, "d_v": 256}, {}),
         ({"h_q": 24}, {}),
