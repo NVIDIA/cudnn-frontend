@@ -77,7 +77,17 @@ def _body(src: str) -> str:
 def _params(**kw):
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
-    base = dict(dtype_qkv=2, cta_mma=1, pack_gqa=True, qh_per_kh=12, qsa_block_topk=512, qsa_block_size=4, seq_kv_lens_present=True, bottom_right=True, qsa_list_per_sequence=True)
+    base = dict(
+        dtype_qkv=2,
+        cta_mma=1,
+        pack_gqa=True,
+        qh_per_kh=12,
+        qsa_block_topk=512,
+        qsa_block_size=4,
+        seq_kv_lens_present=True,
+        bottom_right=True,
+        qsa_list_per_sequence=True,
+    )
     base.update(kw)
     return TemplateParams(**base)
 
@@ -106,7 +116,17 @@ def test_lean_config_pins_the_body_geometry():
         assert make_cfg_d256_sparse_lean(_params(), sub_tiles_per_cta=k) == c
     assert make_cfg_d256_sparse_lean(_params(split_kv=33), sub_tiles_per_cta=2).SUB_TILES_PER_CTA == 2
     # accepted arms: G 1 / 12 / 16, dense + paged (16 / 48 / 64), f16, block_lens is a compile() axis (not a config field), top_k 8 / 64 / 256 / 512
-    for kw in (dict(qh_per_kh=1), dict(qh_per_kh=16), dict(paged_kv=True, page_size=16), dict(paged_kv=True, page_size=48), dict(paged_kv=True, page_size=64), dict(dtype_qkv=3), dict(qsa_block_topk=8), dict(qsa_block_topk=64), dict(qsa_block_topk=256)):
+    for kw in (
+        dict(qh_per_kh=1),
+        dict(qh_per_kh=16),
+        dict(paged_kv=True, page_size=16),
+        dict(paged_kv=True, page_size=48),
+        dict(paged_kv=True, page_size=64),
+        dict(dtype_qkv=3),
+        dict(qsa_block_topk=8),
+        dict(qsa_block_topk=64),
+        dict(qsa_block_topk=256),
+    ):
         c = make_cfg_d256_sparse_lean(_params(**kw))
         assert c.THREADS == 128 and c.N_KEYS == 32, kw
     # typed declines, by name
@@ -165,7 +185,19 @@ def test_lean_kernel_source_pins():
     src = _lean_source()
     code = _code(_body(src))
     low = code.lower()
-    for tok in ("tcgen05", "tmem", "clusterlaunchcontrol", "tensormap", "tma_gather", "tma_load", "mbarrier", "pipelinestate", "setmaxnreg", "atomic", "elect_sync"):
+    for tok in (
+        "tcgen05",
+        "tmem",
+        "clusterlaunchcontrol",
+        "tensormap",
+        "tma_gather",
+        "tma_load",
+        "mbarrier",
+        "pipelinestate",
+        "setmaxnreg",
+        "atomic",
+        "elect_sync",
+    ):
         assert tok not in low, f"the lean body must not carry the token {tok!r}"
     # the denominator floor: ONE constant, used exactly twice (the log and the reciprocal of each row pair), each followed by the row_dead SELECT
     assert code.count("TINY = cutlass.Float32(1e-30)") == 1 and code.count("1e-30") == 1
@@ -202,7 +234,9 @@ def test_lean_kernel_source_pins():
     kbody = code[code.index("def _kernel(") :]  # the helpers above the kernel hold the load SITES; the ORDER question is the kernel body's
     i_pdl = kbody.index("wait_on_dependent_grids()")
     assert kbody.index("launch_dependent_grids()") > i_pdl
-    first_read = min(kbody.index(s) for s in ("visible_bounds(\n        zero", "ld_global(", "_issue_subtile("))  # the lengths / counts, Q, the ids + table + pool rows
+    first_read = min(
+        kbody.index(s) for s in ("visible_bounds(\n        zero", "ld_global(", "_issue_subtile(")
+    )  # the lengths / counts, Q, the ids + table + pool rows
     assert i_pdl < first_read, "the PDL wait must precede every global read of the kernel body"
     assert "if cutlass.const_expr(use_pdl):" in kbody
     # the shared helper: visible_bounds + block_id_at are the only visible-set arithmetic (no local count / tail / dead derivation)
@@ -219,7 +253,14 @@ def test_lean_kernel_source_pins():
     assert re.search(r"^assert\b", code, re.M) is None, "no module-level assert (the config validator raises)"
     assert "EXPLICIT_ABI = True" in code
     # the geometry is CFG's, never a literal: the body's constants derive from CFG fields
-    for name in ("N_KEYS = CFG.N_KEYS", "SUB_TILES_PER_CTA = CFG.SUB_TILES_PER_CTA", "SPLIT = CFG.SPLIT", "STAGES = CFG.STAGES", "THREADS = CFG.THREADS", "G = CFG.QH_PER_KH"):
+    for name in (
+        "N_KEYS = CFG.N_KEYS",
+        "SUB_TILES_PER_CTA = CFG.SUB_TILES_PER_CTA",
+        "SPLIT = CFG.SPLIT",
+        "STAGES = CFG.STAGES",
+        "THREADS = CFG.THREADS",
+        "G = CFG.QH_PER_KH",
+    ):
         assert name in code, name
 
 
@@ -275,23 +316,69 @@ def test_shared_item_helper_carries_the_visible_set_and_the_tcgen05_module_calls
 _LIFT_RECORD = _RENDERINGS / "md5_sparse_d256_item_lift_sm_107a.txt"
 # The tcgen05 renderings of the record (TemplateParams kwargs + compile() kwargs); each a separate process at PYTHONHASHSEED=0.
 _LIFT_RENDERINGS = {
-    "prefill_dense_bf16_g12": (dict(dtype_qkv=2, cta_mma=1, pack_gqa=True, qh_per_kh=12, qsa_block_topk=512, qsa_block_size=4), dict(has_lse=True, has_block_lens=True)),
-    "prefill_dense_f16_g16_top4": (dict(dtype_qkv=3, cta_mma=1, pack_gqa=True, qh_per_kh=16, qsa_block_topk=4, qsa_block_size=4), dict(has_lse=True, has_block_lens=False)),
-    "prefill_gated_bf16_g12": (dict(dtype_qkv=2, cta_mma=1, pack_gqa=True, qh_per_kh=12, qsa_block_topk=512, qsa_block_size=4, epilogue_gate=True), dict(has_lse=False, has_block_lens=True)),
+    "prefill_dense_bf16_g12": (
+        dict(dtype_qkv=2, cta_mma=1, pack_gqa=True, qh_per_kh=12, qsa_block_topk=512, qsa_block_size=4),
+        dict(has_lse=True, has_block_lens=True),
+    ),
+    "prefill_dense_f16_g16_top4": (
+        dict(dtype_qkv=3, cta_mma=1, pack_gqa=True, qh_per_kh=16, qsa_block_topk=4, qsa_block_size=4),
+        dict(has_lse=True, has_block_lens=False),
+    ),
+    "prefill_gated_bf16_g12": (
+        dict(dtype_qkv=2, cta_mma=1, pack_gqa=True, qh_per_kh=12, qsa_block_topk=512, qsa_block_size=4, epilogue_gate=True),
+        dict(has_lse=False, has_block_lens=True),
+    ),
     "prefill_thd_bf16_g12": (
         dict(dtype_qkv=2, cta_mma=1, pack_gqa=True, qh_per_kh=12, qsa_block_topk=512, qsa_block_size=4, thd_varlen=True, seq_kv_lens_present=True),
         dict(has_lse=True, has_block_lens=True),
     ),
     "decode_paged16_split16_bf16_g12": (
-        dict(dtype_qkv=2, cta_mma=1, pack_gqa=True, qh_per_kh=12, qsa_block_topk=512, qsa_block_size=4, paged_kv=True, page_size=16, seq_kv_lens_present=True, bottom_right=True, qsa_list_per_sequence=True, split_kv=16),
+        dict(
+            dtype_qkv=2,
+            cta_mma=1,
+            pack_gqa=True,
+            qh_per_kh=12,
+            qsa_block_topk=512,
+            qsa_block_size=4,
+            paged_kv=True,
+            page_size=16,
+            seq_kv_lens_present=True,
+            bottom_right=True,
+            qsa_list_per_sequence=True,
+            split_kv=16,
+        ),
         dict(has_lse=True, has_block_lens=True),
     ),
     "decode_paged16_split16_bf16_g12_pdl": (
-        dict(dtype_qkv=2, cta_mma=1, pack_gqa=True, qh_per_kh=12, qsa_block_topk=512, qsa_block_size=4, paged_kv=True, page_size=16, seq_kv_lens_present=True, bottom_right=True, qsa_list_per_sequence=True, split_kv=16),
+        dict(
+            dtype_qkv=2,
+            cta_mma=1,
+            pack_gqa=True,
+            qh_per_kh=12,
+            qsa_block_topk=512,
+            qsa_block_size=4,
+            paged_kv=True,
+            page_size=16,
+            seq_kv_lens_present=True,
+            bottom_right=True,
+            qsa_list_per_sequence=True,
+            split_kv=16,
+        ),
         dict(has_lse=True, has_block_lens=True, use_pdl=True),
     ),
     "decode_dense_split3_bf16_g1": (
-        dict(dtype_qkv=2, cta_mma=1, pack_gqa=True, qh_per_kh=1, qsa_block_topk=64, qsa_block_size=4, seq_kv_lens_present=True, bottom_right=True, qsa_list_per_sequence=True, split_kv=3),
+        dict(
+            dtype_qkv=2,
+            cta_mma=1,
+            pack_gqa=True,
+            qh_per_kh=1,
+            qsa_block_topk=64,
+            qsa_block_size=4,
+            seq_kv_lens_present=True,
+            bottom_right=True,
+            qsa_list_per_sequence=True,
+            split_kv=3,
+        ),
         dict(has_lse=True, has_block_lens=False),
     ),
     "prefill_paged64_bf16_g12_blocklens": (
@@ -362,7 +449,13 @@ def _render(tmp_path, module_file: str, pkw: dict, ckw: dict, tag: str, *, need_
     dump = tmp_path / f"{tag}_{hashlib.md5(json.dumps([pkw, ckw], sort_keys=True).encode()).hexdigest()[:8]}"
     dump.mkdir()
     env = dict(os.environ, PYTHONHASHSEED="0")
-    proc = subprocess.run([sys.executable, "-c", _RENDER_SRC, str(dump), module_file, json.dumps(pkw), json.dumps(ckw), *cands], capture_output=True, text=True, timeout=900, env=env)
+    proc = subprocess.run(
+        [sys.executable, "-c", _RENDER_SRC, str(dump), module_file, json.dumps(pkw), json.dumps(ckw), *cands],
+        capture_output=True,
+        text=True,
+        timeout=900,
+        env=env,
+    )
     assert proc.returncode == 0, f"sm_107a trace-compile of {tag} failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
     out = proc.stdout.splitlines()
     res = {"md5": next(ln.split()[1] for ln in out if ln.startswith("CUBIN_MD5 "))}
@@ -411,12 +504,24 @@ def test_item_helper_lift_keeps_the_tcgen05_cubins_byte_identical(tmp_path, rend
         pytest.skip(f"the md5 record was rendered with {dsl}; installed {have}: the cubin is a function of the DSL build, re-render the record")
     pkw, ckw = _LIFT_RENDERINGS[rendering]
     res = _render(tmp_path, "sparse_d256_f16.py", pkw, ckw, f"lift_{rendering}", need_sass=False)
-    assert res["md5"] == want[rendering], f"{rendering}: cubin md5 {res['md5']} != the pre-lift record's {want[rendering]} -- the lift changed the tcgen05 rendering"
+    assert (
+        res["md5"] == want[rendering]
+    ), f"{rendering}: cubin md5 {res['md5']} != the pre-lift record's {want[rendering]} -- the lift changed the tcgen05 rendering"
 
 
 # ============================================================================ host: every S_q = 1 rendering within the register budget
 def _lean_pkw(**kw):
-    base = dict(dtype_qkv=2, cta_mma=1, pack_gqa=True, qh_per_kh=12, qsa_block_topk=512, qsa_block_size=4, seq_kv_lens_present=True, bottom_right=True, qsa_list_per_sequence=True)
+    base = dict(
+        dtype_qkv=2,
+        cta_mma=1,
+        pack_gqa=True,
+        qh_per_kh=12,
+        qsa_block_topk=512,
+        qsa_block_size=4,
+        seq_kv_lens_present=True,
+        bottom_right=True,
+        qsa_list_per_sequence=True,
+    )
     base.update(kw)
     return base
 
@@ -521,7 +626,14 @@ class LeanRun:
         split = lean_sparse_split(top_k, k)
         self.split = split
         dtype_code = 2 if q.dtype == torch.bfloat16 else 3
-        params = _params(dtype_qkv=dtype_code, qh_per_kh=H // KH, qsa_block_topk=top_k, paged_kv=self.paged, page_size=self.P if self.paged else 0, split_kv=split if split > 1 else 1)
+        params = _params(
+            dtype_qkv=dtype_code,
+            qh_per_kh=H // KH,
+            qsa_block_topk=top_k,
+            paged_kv=self.paged,
+            page_size=self.P if self.paged else 0,
+            split_kv=split if split > 1 else 1,
+        )
         self.mod = load_template(str(_kernels_dir() / "sparse_lean_d256_f16.py"), params, tag="sdpa_fwd_sm107_sparse_lean")
         assert self.mod.CFG.SPLIT == split and self.mod.CFG.SUB_TILES_PER_CTA == k, (self.mod.CFG.SPLIT, split, self.mod.CFG.SUB_TILES_PER_CTA, k)
         compile_kernel = getattr(self.mod.compile, "__wrapped__", self.mod.compile)
@@ -606,7 +718,16 @@ class LeanRun:
         owner = compile_combine(dtype_o=tag, dtype_partial="f32", has_lse=True, stats_log2=False, gate=False, dtype_gate=None, decode_grid=form, use_pdl=False)
         entry = positional_entry(owner)
         assert entry is not None
-        args = [self.o_part.data_ptr(), self.lse_part.data_ptr(), o.data_ptr(), lse.data_ptr(), (B, H, 1, D), self.split, tuple(o.stride()[:4]), tuple(lse.stride()[:3])]
+        args = [
+            self.o_part.data_ptr(),
+            self.lse_part.data_ptr(),
+            o.data_ptr(),
+            lse.data_ptr(),
+            (B, H, 1, D),
+            self.split,
+            tuple(o.stride()[:4]),
+            tuple(lse.stride()[:3]),
+        ]
         entry(*args, int(_stream()))
         torch.cuda.synchronize()
         return o, lse, form
@@ -646,7 +767,24 @@ def _check_outputs(o, lse, ref_o, ref_lse, *, what: str):
     return max_o, max_lse
 
 
-def _lean_cell(*, B, SKV, kv_lens, H=24, KH=2, dtype=torch.bfloat16, top_k=512, list_kind="shuffled", k=1, paged=None, seed=0, block_lens=True, scale=None, pdl=False, vs_core=True):
+def _lean_cell(
+    *,
+    B,
+    SKV,
+    kv_lens,
+    H=24,
+    KH=2,
+    dtype=torch.bfloat16,
+    top_k=512,
+    list_kind="shuffled",
+    k=1,
+    paged=None,
+    seed=0,
+    block_lens=True,
+    scale=None,
+    pdl=False,
+    vs_core=True,
+):
     """One lean cell: two launches bitwise, the slab audit, the exact combine within ATOL of the fp32 oracle, the pinned combine within ATOL
     too, and -- ``vs_core`` -- the lean O / LSE against the UNSPLIT tcgen05 core within the DERIVED budget (never bitwise across tiles); a
     paged twin (``paged = (P, hnd)``) BITWISE the dense slab."""
@@ -680,7 +818,9 @@ def _lean_cell(*, B, SKV, kv_lens, H=24, KH=2, dtype=torch.bfloat16, top_k=512, 
             pr = LeanRun(q, (kp, vp, table, P), ids, lens_arg, kv_lens, top_k, scale, k=k, pdl=pdl)
             pr.run()
             torch.cuda.synchronize()
-        assert torch.equal(pr.o_part, run.o_part) and torch.equal(pr.lse_part, run.lse_part), f"paged page {P} {'HND' if hnd else 'NHD'}: the slab differs from the dense read of the same tokens"
+        assert torch.equal(pr.o_part, run.o_part) and torch.equal(
+            pr.lse_part, run.lse_part
+        ), f"paged page {P} {'HND' if hnd else 'NHD'}: the slab differs from the dense read of the same tokens"
     if vs_core:
         core = S._launch_decode(q, (kk, vv), ids, lens_arg, kv_lens, top_k, scale, split=1, launches=1)
         co, cl = core[0][0], core[0][1]
@@ -688,7 +828,9 @@ def _lean_cell(*, B, SKV, kv_lens, H=24, KH=2, dtype=torch.bfloat16, top_k=512, 
         live = ~torch.isinf(ref_lse).permute(0, 2, 1)  # [B, S, H]
         d, ratio = S._split_vs_unsplit(o_x.to(dtype).float(), co.float(), dtype, pv_abs, live)
         lse_d = float((lse_x - cl)[~torch.isinf(ref_lse)].abs().max()) if live.any() else 0.0
-        assert ratio <= 1.0, f"lean vs the unsplit tcgen05 core: {ratio:.3f} of the derived budget (max |dO| {d:.3e}); the two tiles differ beyond one rounding + the P quantisation"
+        assert (
+            ratio <= 1.0
+        ), f"lean vs the unsplit tcgen05 core: {ratio:.3f} of the derived budget (max |dO| {d:.3e}); the two tiles differ beyond one rounding + the P quantisation"
         assert lse_d <= ATOL, f"lean vs core LSE differ by {lse_d}"
         res.update(core_max_d=d, core_ratio=ratio, core_lse_d=lse_d)
     return res, run
@@ -720,8 +862,10 @@ def _lean_cell(*, B, SKV, kv_lens, H=24, KH=2, dtype=torch.bfloat16, top_k=512, 
 )
 def test_lean_tile_ladder(B, SKV, kv_lens, H, KH, dtype, top_k, list_kind, k, paged, block_lens):
     res, _ = _lean_cell(B=B, SKV=SKV, kv_lens=kv_lens, H=H, KH=KH, dtype=dtype, top_k=top_k, list_kind=list_kind, k=k, paged=paged, block_lens=block_lens)
-    print(f"\nlean ladder B={B} S_kv={SKV} lens={kv_lens} {H}/{KH} {dtype} top_k={top_k} k={k} split={res['split']} paged={paged}: exact-combine max|dO| {res['max_o']:.5f} max|dLSE| {res['max_lse']:.6f}; "
-          f"pinned combine (form {res['combine_form']}) max|dO| {res['combine_max_o']:.5f}; vs unsplit tcgen05 core max|dO| {res['core_max_d']:.3e} = {res['core_ratio']:.3f} of the derived budget, |dLSE| {res['core_lse_d']:.2e}; dead rows {res['dead']}")
+    print(
+        f"\nlean ladder B={B} S_kv={SKV} lens={kv_lens} {H}/{KH} {dtype} top_k={top_k} k={k} split={res['split']} paged={paged}: exact-combine max|dO| {res['max_o']:.5f} max|dLSE| {res['max_lse']:.6f}; "
+        f"pinned combine (form {res['combine_form']}) max|dO| {res['combine_max_o']:.5f}; vs unsplit tcgen05 core max|dO| {res['core_max_d']:.3e} = {res['core_ratio']:.3f} of the derived budget, |dLSE| {res['core_lse_d']:.2e}; dead rows {res['dead']}"
+    )
 
 
 # ============================================================================ Rubin: the degenerate matrix, row by row
@@ -889,7 +1033,9 @@ def test_paged_stale_rows_past_the_length_are_never_read(P, hnd):
             pr = LeanRun(q, (kp, vp, table, P), ids, lens, kv_lens, top_k, scale)
             pr.run()
             torch.cuda.synchronize()
-        assert torch.equal(pr.o_part, dense.o_part) and torch.equal(pr.lse_part, dense.lse_part), f"paged {P} {'HND' if hnd else 'NHD'} fill {fill}: differs from the dense read"
+        assert torch.equal(pr.o_part, dense.o_part) and torch.equal(
+            pr.lse_part, dense.lse_part
+        ), f"paged {P} {'HND' if hnd else 'NHD'} fill {fill}: differs from the dense read"
     print(f"\npaged {P} {'HND' if hnd else 'NHD'}: NaN and other-sequence stale rows never reach the MMA (bitwise the dense slab)")
 
 
