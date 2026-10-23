@@ -464,10 +464,10 @@ def test_entry_points_select_the_tensors_device_with_another_device_current(expl
     logits, counts = _case(6, 8192, K, seed=61, device=device)
     ref = reference_canonical(logits, counts, K)
     side = torch.cuda.Stream(device=target)
-    side.wait_stream(torch.cuda.current_stream(target))
     handed = side.cuda_stream if explicit_stream else None
     # (a) the convenience entry with another device current: compiled for the tensors' device, launched there, the caller restored
     out = torch.full((6, K), SENTINEL, dtype=torch.int32, device=device)
+    side.wait_stream(torch.cuda.current_stream(target))
     with torch.cuda.device(other):
         topk_mod.qsa_topk_decode(logits, counts, out, stream=handed)
         assert torch.cuda.current_device() == other, "the caller's device must be restored"
@@ -487,6 +487,7 @@ def test_entry_points_select_the_tensors_device_with_another_device_current(expl
 
     r2 = r._replace(compiled=checked)
     out2 = torch.full((6, K), SENTINEL, dtype=torch.int32, device=device)
+    side.wait_stream(torch.cuda.current_stream(target))
     with torch.cuda.device(other):
         topk_mod.run_qsa_topk_decode(r2, logits, counts, out2, stream=handed)
         assert torch.cuda.current_device() == other
