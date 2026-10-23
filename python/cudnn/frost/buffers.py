@@ -569,7 +569,7 @@ def cutedsl_state():
     return _DSL_STATE
 
 
-def cutedsl_too_old(version):
+def cutedsl_too_old(version, min_version=CUTEDSL_MIN_VERSION):
     """``(distribution, version)`` is the public wheel, below the floor.
 
     Absent, unparsable, or an internal RC counts as NOT too old: internal builds
@@ -598,7 +598,7 @@ def cutedsl_too_old(version):
     # A short public version ("4.6") means the omitted components are zero
     # ("4.6.0"), so it compares against the floor instead of slipping past it.
     parts += [0] * (3 - len(parts))
-    return tuple(parts) < CUTEDSL_MIN_VERSION
+    return tuple(parts) < min_version
 
 
 @lru_cache(maxsize=1)
@@ -660,7 +660,7 @@ def cutedsl_primitives_error(what):
     )
 
 
-def cutedsl_requirement_error(what):
+def cutedsl_requirement_error(what, min_version=CUTEDSL_MIN_VERSION):
     """Message naming the installed DSL version when it is below the floor, else None.
 
     Route checks and the lazy-import wrappers use it so a too-old DSL reads as a
@@ -670,8 +670,8 @@ def cutedsl_requirement_error(what):
     installed, version = cutedsl_state()
     if not installed:
         return None
-    floor = ".".join(str(x) for x in CUTEDSL_MIN_VERSION)
-    if cutedsl_too_old(version):
+    floor = ".".join(str(x) for x in min_version)
+    if cutedsl_too_old(version, min_version):
         return f"{what} requires nvidia-cutlass-dsl >= {floor}; found {version[1]}. " f"Upgrade with: pip install -U 'nvidia-cutlass-dsl>={floor}'"
     return None
 

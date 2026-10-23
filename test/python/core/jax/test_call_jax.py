@@ -6,7 +6,7 @@ import pytest
 
 from cudnn.frost.buffers import cutedsl_requirement_error
 
-requirement_error = cutedsl_requirement_error("JAX bridge tests")
+requirement_error = cutedsl_requirement_error("JAX bridge tests", min_version=(4, 7, 1))
 if requirement_error:
     pytest.skip(requirement_error, allow_module_level=True)
 
