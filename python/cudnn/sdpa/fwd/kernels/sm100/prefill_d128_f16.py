@@ -3594,6 +3594,9 @@ def _host(
             cutlass.Int32(CGA_TILE_M // HEADS_PER_TILE),
             n_thd_units,
             not PAGED_KV,  # clamp_kv: paged pools have no packed KV total to clamp to
+            # Prefix requests can have short Q but long KV. Schedule their
+            # expensive tiles first; full prefill has identical Q/KV ordering.
+            rank_by_kv=PAGED_KV and bool(CFG.BOTTOM_RIGHT) and (CFG.MASK_FLAGS & MASK_SWA) == 0,
         ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
     else:
