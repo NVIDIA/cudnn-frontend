@@ -22,6 +22,8 @@ import cudnn
 from cudnn.linear_attention.ops.gdn2 import gated_delta_net_v2
 from cudnn.linear_attention.frost import gdn2_engine
 
+import reference_gdn2
+
 NAMES = ("q", "k", "v", "g", "b", "w")
 
 
@@ -42,15 +44,9 @@ def inputs(tokens, steep):
 
 def reference(xs, do):
     """Compute output and all six gradients with a CPU FP64 recurrence."""
-    q, k, v, g, b, w = refs = [x.detach().cpu().double().requires_grad_() for x in xs]
-    state = torch.zeros(1, 64, 64, dtype=torch.float64)
-    outputs = []
-    for t in range(q.shape[0]):
-        decayed = state * g[t].exp().unsqueeze(-1)
-        erase = torch.einsum("hk,hkv->hv", b[t] * k[t], decayed)
-        state = decayed + k[t].unsqueeze(-1) * (w[t] * v[t] - erase).unsqueeze(-2)
-        outputs.append(torch.einsum("hk,hkv->hv", q[t], state) * 64**-0.5)
-    output = torch.stack(outputs)
+    refs = [x.detach().cpu().double().requires_grad_() for x in xs]
+    output, _ = reference_gdn2.gdn2_reference(*(x.unsqueeze(0) for x in refs), scale=64**-0.5)
+    output = output.squeeze(0)
     grads = torch.autograd.grad(output, refs, do.cpu().double())
     return [output.detach(), *(x.detach() for x in grads)]
 
@@ -211,6 +207,7 @@ def main():
         "dsl": importlib.metadata.version("nvidia-cutlass-dsl"),
         "helper_sha256": hashlib.sha256(helper.read_bytes()).hexdigest(),
         "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "reference_sha256": hashlib.sha256(Path(reference_gdn2.__file__).read_bytes()).hexdigest(),
         "results": [],
     }
     for tokens in (16, 256):
