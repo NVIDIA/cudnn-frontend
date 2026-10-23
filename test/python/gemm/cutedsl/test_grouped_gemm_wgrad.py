@@ -976,7 +976,7 @@ def test_blockscaled_wgrad_execute_uses_caller_workspace(monkeypatch):
 
     launch_workspaces = []
 
-    def compiled_kernel(*args):
+    def compiled_kernel(*args, launch=True):
         launch_workspaces.append(args[6])
 
     api._compiled_kernel = compiled_kernel
@@ -1032,7 +1032,7 @@ def test_blockscaled_discrete_wgrad_execute_uses_caller_workspace(monkeypatch):
 
     launch_workspaces = []
 
-    def compiled_kernel(*args):
+    def compiled_kernel(*args, launch=True):
         launch_workspaces.append(args[6])
 
     api._compiled_kernel = compiled_kernel

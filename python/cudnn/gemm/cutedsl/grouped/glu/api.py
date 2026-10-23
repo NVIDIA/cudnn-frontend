@@ -32,6 +32,7 @@ from ..backend_utils import (
 )
 from ..canonical import b_nkl, check_canonical_contiguous, check_packed_sf, is_canonical_b, is_flat_sf
 from ..moe_utils import MoEWeightMode
+from ..plan import GroupedGemmPlan, offer, planned, planning
 from ..scheduler_counter import validate_scheduler_counter
 from cuda.bindings import driver as cuda
 import logging
@@ -361,7 +362,9 @@ class GroupedGemmGluSm100(APIBase):
         current_stream: Optional[cuda.CUstream] = None,
         *,
         scheduler_counter_tensor: Optional[torch.Tensor] = None,
-    ) -> None:
+        launch: bool = True,
+    ):
+        """``launch=False`` returns the launch, ``(compiled kernel, positional arguments)``, instead of issuing it."""
         if self._implementation is None:
             raise RuntimeError("Kernel not compiled; call compile() first")
         if self.backend is GroupedGemmBackend.BF16:
@@ -390,7 +393,7 @@ class GroupedGemmGluSm100(APIBase):
                 raise ValueError(f"grouped_gemm_glu_sm100: BF16 forbids scale control " f"{forbidden[0]}")
             if linear_offset is None:
                 linear_offset = 1.0 if self._implementation.act_func == "geglu" else 0.0
-            self._implementation.execute(
+            stated = self._implementation.execute(
                 a_tensor=a_tensor,
                 c_tensor=c_tensor,
                 d_tensor=d_tensor,
@@ -402,9 +405,10 @@ class GroupedGemmGluSm100(APIBase):
                 prob_tensor=prob_tensor,
                 linear_offset=linear_offset,
                 current_stream=current_stream,
+                launch=launch,
             )
         else:
-            self._implementation.execute(
+            stated = self._implementation.execute(
                 a_tensor=a_tensor,
                 c_tensor=c_tensor,
                 d_tensor=d_tensor,
@@ -430,9 +434,11 @@ class GroupedGemmGluSm100(APIBase):
                 situ_beta2=situ_beta2,
                 current_stream=current_stream,
                 scheduler_counter_tensor=scheduler_counter_tensor,
+                launch=launch,
             )
         self._is_supported = self._implementation._is_supported
         self._compiled_kernel = self._implementation._compiled_kernel
+        return stated
 
 
 # --------------------------------------------------------------------------- #
@@ -897,14 +903,13 @@ def glu_block_scaled_run(
     situ_beta2,
     current_stream,
     scheduler_counter_tensor,
+    plan=False,
 ) -> TupleDict:
-    """Allocate fresh outputs and execute with the current call operands."""
+    """Allocate fresh outputs and execute with the current call operands; ``plan``: also plan the call."""
     if outputs is None:
         outputs = glu_block_scaled_outputs(valid_m, n_full, n_out, l, c_dtype, d_dtype, sf_dtype, sf_vec_size, a_tensor.device, a_tensor.ndim == 2)
-    api.execute(
+    arguments = dict(
         a_tensor=a_tensor,
-        c_tensor=outputs["c_tensor"],
-        d_tensor=outputs["d_tensor"],
         sfa_tensor=sfa_tensor,
         padded_offsets=padded_offsets,
         alpha_tensor=alpha_tensor,
@@ -913,22 +918,46 @@ def glu_block_scaled_run(
         bias_tensor=bias_tensor,
         b_ptrs=b_ptrs,
         sfb_ptrs=sfb_ptrs,
-        d_col_tensor=outputs["d_col_tensor"],
-        sfd_row_tensor=outputs["sfd_row_tensor"],
-        sfd_col_tensor=outputs["sfd_col_tensor"],
-        amax_tensor=outputs["amax_tensor"],
         norm_const_tensor=norm_const_tensor,
         prob_tensor=prob_tensor,
+        scheduler_counter_tensor=scheduler_counter_tensor,
         linear_offset=linear_offset,
         geglu_alpha=geglu_alpha,
         glu_clamp_max=glu_clamp_max,
         glu_clamp_min=glu_clamp_min,
         situ_beta1=situ_beta1,
         situ_beta2=situ_beta2,
-        current_stream=current_stream,
-        scheduler_counter_tensor=scheduler_counter_tensor,
     )
+    api.execute(**arguments, **outputs, current_stream=current_stream)
+    if plan and planning():
+        offer(
+            GroupedGemmPlan(
+                api.execute,
+                arguments,
+                inputs=_GLU_INPUTS,
+                outputs=dict(outputs.items()),
+                init={"amax_tensor": float("-inf")},
+                result={name: name for name in outputs.keys()},
+                stream=current_stream,
+            )
+        )
     return outputs
+
+
+_GLU_INPUTS = (
+    "a_tensor",
+    "sfa_tensor",
+    "padded_offsets",
+    "alpha_tensor",
+    "b_tensor",
+    "sfb_tensor",
+    "bias_tensor",
+    "b_ptrs",
+    "sfb_ptrs",
+    "norm_const_tensor",
+    "prob_tensor",
+    "scheduler_counter_tensor",
+)
 
 
 def _normalize_glu_call(call: GluCall) -> tuple[GluCall, GroupedGemmBackend]:
@@ -1244,6 +1273,7 @@ def _grouped_gemm_glu_bf16_call(call: GluCall, memo_key: Optional[tuple] = None)
     )
 
 
+@planned
 def grouped_gemm_glu_wrapper_sm100(
     a_tensor: torch.Tensor,
     sfa_tensor: Optional[torch.Tensor],
@@ -1393,10 +1423,8 @@ def grouped_gemm_glu_wrapper_sm100(
         canonical = len(get_shape(a_tensor)) == 2
         c_out = _glu_allocate_output(framework, *row_major_layout(valid_m, n_full, canonical), memo_c_dtype, a_tensor.device)
         d_out = _glu_allocate_output(framework, *row_major_layout(valid_m, n_out, canonical), memo_d_dtype, a_tensor.device)
-        api.execute(
+        arguments = dict(
             a_tensor=a_tensor,
-            c_tensor=c_out,
-            d_tensor=d_out,
             sfa_tensor=None,
             padded_offsets=padded_offsets,
             alpha_tensor=alpha_tensor,
@@ -1415,8 +1443,27 @@ def grouped_gemm_glu_wrapper_sm100(
             geglu_alpha=geglu_alpha,
             glu_clamp_max=glu_clamp_max,
             glu_clamp_min=glu_clamp_min,
-            current_stream=current_stream,
         )
+        api.execute(**arguments, c_tensor=c_out, d_tensor=d_out, current_stream=current_stream)
+        if planning() and framework == "torch":
+            offer(
+                GroupedGemmPlan(
+                    api.execute,
+                    arguments,
+                    inputs=("a_tensor", "padded_offsets", "alpha_tensor", "b_tensor", "bias_tensor", "b_ptrs", "prob_tensor"),
+                    outputs={"c_tensor": c_out, "d_tensor": d_out},
+                    init={},
+                    result={
+                        "c_tensor": "c_tensor" if generate_c else None,
+                        "d_tensor": "d_tensor",
+                        "d_col_tensor": None,
+                        "amax_tensor": None,
+                        "sfd_row_tensor": None,
+                        "sfd_col_tensor": None,
+                    },
+                    stream=current_stream,
+                )
+            )
         return TupleDict(
             c_tensor=c_out if generate_c else None,
             d_tensor=d_out,
@@ -1448,6 +1495,7 @@ def grouped_gemm_glu_wrapper_sm100(
             situ_beta2=situ_beta2,
             current_stream=current_stream,
             scheduler_counter_tensor=scheduler_counter_tensor,
+            plan=True,
         )
 
     call = GluCall(

@@ -410,9 +410,10 @@ class GroupedGemmGluBf16API(APIBase):
             prob_tensor: torch.Tensor,
             stream: cuda.CUstream,
             linear_offset: float,
-        ) -> None:
+            launch: bool = True,
+        ):
             b_arg = b_tensor if self.weight_mode == MoEWeightMode.DENSE else int(get_data_ptr(b_ptrs))
-            raw_compiled(
+            args = (
                 a_tensor,
                 b_arg,
                 cached_n,
@@ -428,6 +429,9 @@ class GroupedGemmGluBf16API(APIBase):
                 stream,
                 cutlass.Float32(linear_offset),
             )
+            if not launch:
+                return raw_compiled, args
+            raw_compiled(*args)
 
         self._compiled_kernel = tensor_api
 
@@ -512,7 +516,10 @@ class GroupedGemmGluBf16API(APIBase):
         prob_tensor: Optional[torch.Tensor] = None,
         linear_offset: float = 0.0,
         current_stream: Optional[cuda.CUstream] = None,
-    ) -> None:
+        *,
+        launch: bool = True,
+    ):
+        """``launch=False`` returns the launch, ``(compiled kernel, positional arguments)``, instead of issuing it."""
         if current_stream is None:
             # torch inputs stay ordered with the caller's current torch stream;
             # other frameworks (e.g. JAX) default to the CUDA legacy default stream.
@@ -545,7 +552,9 @@ class GroupedGemmGluBf16API(APIBase):
             debug_validate_pointer_values(b_ptrs, "b_ptrs", stream=current_stream)
             self._record_pointer_stream(b_ptrs, current_stream)
 
-        self._compiled_kernel(
+        if not launch and b_ptrs is not None:
+            return None
+        return self._compiled_kernel(
             a_tensor,
             c_tensor,
             d_tensor,
@@ -557,4 +566,5 @@ class GroupedGemmGluBf16API(APIBase):
             prob_tensor,
             current_stream,
             linear_offset,
+            launch=launch,
         )

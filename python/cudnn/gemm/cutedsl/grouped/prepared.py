@@ -233,7 +233,9 @@ def prepare_grouped_gemm(kind, *, reuse_row_outputs=False, **kwargs):
     api = compiled_apis.setdefault(compile_key, api)
     api.compile()
     implementation = api._implementation if kind == "glu" else api
-    runtime_names = tuple(name for name in inspect.signature(implementation.execute).parameters if name not in samples and name != "current_stream")
+    runtime_names = tuple(
+        name for name in inspect.signature(implementation.execute).parameters if name not in samples and name not in ("current_stream", "launch")
+    )
     plan = PreparedGroupedGemm(
         api=api,
         execute=implementation.execute,

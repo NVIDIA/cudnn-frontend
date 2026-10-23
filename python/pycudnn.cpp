@@ -150,6 +150,10 @@ init_gnn_submodule(py::module_ &);
 void
 init_variant_pack(py::module_ &);
 
+// pybinds for cudnn_frontend::ops
+void
+init_ops_submodule(py::module_ &);
+
 void
 set_dlhandle_cudnn(std::intptr_t dlhandle) {
 #ifdef _WIN32
@@ -167,6 +171,7 @@ NB_MODULE(_compiled_module, m) {
     init_pygraph_submodule(m);
     init_gnn_submodule(m);
     init_variant_pack(m);
+    init_ops_submodule(m);
 
     m.def("_set_dlhandle_cudnn", &set_dlhandle_cudnn);
 

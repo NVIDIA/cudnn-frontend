@@ -31,6 +31,7 @@ from ..backend_utils import (
     select_grouped_gemm_backend,
     wrapper_operand_meta,
 )
+from ..plan import GroupedGemmPlan, offer, planned, planning
 from ..moe_utils import MoEWeightMode, WGradInputOrder, WgradSfTensormapConstructor
 
 
@@ -239,7 +240,9 @@ class GroupedGemmWgradSm100(APIBase):
         current_stream: Optional[cuda.CUstream] = None,
         *,
         descriptor_workspace: Optional[torch.Tensor] = None,
-    ) -> None:
+        launch: bool = True,
+    ):
+        """``launch=False`` returns the launch, ``(compiled kernel, positional arguments)``, instead of issuing it."""
         if self._implementation is None:
             raise RuntimeError("Kernel not compiled; call compile() first")
         if descriptor_workspace is not None and not isinstance(
@@ -261,7 +264,7 @@ class GroupedGemmWgradSm100(APIBase):
         )
         if descriptor_workspace is not None:
             execute_kwargs["descriptor_workspace"] = descriptor_workspace
-        self._implementation.execute(**execute_kwargs)
+        return self._implementation.execute(**execute_kwargs, launch=launch)
 
 
 def _wgrad_tensor_signature(tensor: Optional[torch.Tensor], *, dynamic_dims: tuple[int, ...] = (), exact_stride: bool):
@@ -296,6 +299,7 @@ def wgrad_allocate_output(framework, wgrad_shape, wgrad_dtype, accumulate_on_out
 _wgrad_wrapper_memo: dict = {}
 
 
+@planned
 def grouped_gemm_wgrad_wrapper_sm100(
     a_tensor: torch.Tensor,
     b_tensor: torch.Tensor,
@@ -376,21 +380,47 @@ def grouped_gemm_wgrad_wrapper_sm100(
     memo = _wgrad_wrapper_memo.get(memo_key)
     if memo is not None:
         op, framework, wgrad_shape, memo_wgrad_dtype = memo
-        if wgrad_tensor is None and wgrad_ptrs is None:
+        allocated = wgrad_tensor is None and wgrad_ptrs is None
+        if allocated:
             wgrad_tensor = wgrad_allocate_output(framework, wgrad_shape, memo_wgrad_dtype, accumulate_on_output, a_tensor, current_stream)
-        op.execute(
+        arguments = dict(
             a_tensor=a_tensor,
             b_tensor=b_tensor,
             sfa_tensor=sfa_tensor,
             sfb_tensor=sfb_tensor,
             offsets_tensor=offsets_tensor,
-            wgrad_tensor=wgrad_tensor,
             wgrad_ptrs=wgrad_ptrs,
             descriptor_workspace=descriptor_workspace,
             global_scale_a=global_scale_a,
             global_scale_b=global_scale_b,
-            current_stream=current_stream,
         )
+        op.execute(**arguments, wgrad_tensor=wgrad_tensor, current_stream=current_stream)
+        if planning() and framework == "torch":
+            inputs = (
+                "a_tensor",
+                "b_tensor",
+                "sfa_tensor",
+                "sfb_tensor",
+                "offsets_tensor",
+                "wgrad_ptrs",
+                "descriptor_workspace",
+                "global_scale_a",
+                "global_scale_b",
+            )
+            if not allocated:
+                arguments["wgrad_tensor"], inputs = wgrad_tensor, inputs + ("wgrad_tensor",)
+            offer(
+                GroupedGemmPlan(
+                    op.execute,
+                    arguments,
+                    inputs=inputs,
+                    outputs={"wgrad_tensor": wgrad_tensor} if allocated else {},
+                    init={"wgrad_tensor": 0} if accumulate_on_output else {},
+                    result={"wgrad_tensor": "wgrad_tensor"},
+                    stream=current_stream,
+                    stream_outputs=("wgrad_tensor",),
+                )
+            )
         return TupleDict(wgrad_tensor=wgrad_tensor)
 
     framework = detect_framework(a_tensor)

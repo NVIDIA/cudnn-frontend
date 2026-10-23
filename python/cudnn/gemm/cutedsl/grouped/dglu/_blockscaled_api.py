@@ -1102,7 +1102,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             dbias_tensor: Optional[torch.Tensor],
             workspace_ptr: int,
             stream: cuda.CUstream,
-        ) -> None:
+            launch: bool = True,
+        ):
             norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
             kernel_args = (
                 a_tensor,
@@ -1127,9 +1128,12 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
                 dprob_tensor,
             )
             if self._is_rubin_kernel:
-                _compiled_kernel(*kernel_args, cutlass.Float32(self.linear_offset), dbias_tensor, stream)
+                args = (*kernel_args, cutlass.Float32(self.linear_offset), dbias_tensor, stream)
             else:
-                _compiled_kernel(*kernel_args, dbias_tensor, stream)
+                args = (*kernel_args, dbias_tensor, stream)
+            if not launch:
+                return _compiled_kernel, args
+            _compiled_kernel(*args)
 
         self._compiled_kernel = tensor_api
 
@@ -1378,7 +1382,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         current_stream: Optional[cuda.CUstream] = None,
         *,
         workspace=None,
-    ) -> None:
+        launch: bool = True,
+    ):
         """Execute the compiled kernel.
 
         For dense mode, supply ``b_tensor`` and ``sfb_tensor``.
@@ -1406,6 +1411,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         :param current_stream: CUDA stream
         :param workspace: Device buffer of at least ``scratch_workspace_bytes()`` bytes,
             128-byte aligned, that the launch carves (recipe R2). Required.
+        :param launch: ``False`` returns the dense launch, ``(compiled kernel, positional arguments)``, instead of issuing it.
         """
         self._logger.debug("Entering execute")
         current_stream = self._get_default_stream(current_stream)
@@ -1451,7 +1457,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         )
 
         if self.weight_mode == MoEWeightMode.DENSE:
-            self._compiled_kernel(
+            return self._compiled_kernel(
                 a_tensor=a_tensor,
                 b_tensor=b_tensor,
                 c_tensor=c_tensor,
@@ -1471,8 +1477,9 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
                 dbias_tensor=dbias_tensor,
                 workspace_ptr=ws_view.data_ptr(),
                 stream=current_stream,
+                launch=launch,
             )
-        else:
+        elif launch:
             self._record_pointer_stream(b_ptrs, current_stream)
             self._record_pointer_stream(sfb_ptrs, current_stream)
             self._compiled_kernel(

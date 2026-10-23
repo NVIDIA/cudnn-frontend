@@ -439,8 +439,9 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             stream: cuda.CUstream,
             global_scale_a: Optional[torch.Tensor],
             global_scale_b: Optional[torch.Tensor],
-        ) -> None:
-            compiled(
+            launch: bool = True,
+        ):
+            args = (
                 a_tensor,
                 b_tensor,
                 sfa_tensor,
@@ -453,6 +454,9 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
                 global_scale_b,
                 None,
             )
+            if not launch:
+                return compiled, args
+            compiled(*args)
 
         self._compiled_kernel = tensor_api
 
@@ -581,7 +585,10 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         global_scale_a: Optional[torch.Tensor] = None,
         global_scale_b: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
-    ) -> None:
+        *,
+        launch: bool = True,
+    ):
+        """``launch=False`` returns the dense launch, ``(compiled kernel, positional arguments)``, instead of issuing it."""
         import torch
 
         current_stream = self._get_default_stream(current_stream)
@@ -623,7 +630,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
                     assumed_align=128,
                     enable_tvm_ffi=True,
                 )
-            self._compiled_kernel(
+            return self._compiled_kernel(
                 a_tensor,
                 b_tensor,
                 sfa_tensor,
@@ -634,8 +641,10 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
                 current_stream,
                 global_scale_a,
                 global_scale_b,
+                launch=launch,
             )
-            return
+        if not launch:
+            return None
 
         if wgrad_ptrs is None:
             self._value_error_if(wgrad_tensor is None, "Provide wgrad_tensor or wgrad_ptrs in discrete mode")

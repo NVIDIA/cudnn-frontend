@@ -176,3 +176,47 @@ For a discrete class instance, replace `sample_b` with
   their existing FP4/FP8 block-scaled backends. For BF16 on those fused APIs,
   scale-factor controls are `None`; see their operation pages for the exact
   dispatch and return contracts.
+
+## Drop-in C++ execution
+
+`grouped_gemm_wrapper_sm100`, `grouped_gemm_glu_wrapper_sm100`,
+`grouped_gemm_dglu_wrapper_sm100`, `grouped_gemm_quant_wrapper_sm100` and
+`grouped_gemm_wgrad_wrapper_sm100` plan each repeated call once and execute
+it through the C++ op `cudnn_frontend::ops::GroupedGemm`
+(`include/cudnn_frontend/ops/grouped_gemm.h`).
+
+- **First call** for a set of keyword arguments (each tensor's dtype, shape and
+  strides, the other arguments' values, the device): derives, checks and
+  compiles, as before.
+- **Second call:** also asks the API's `execute(..., launch=False)` for the
+  launch (the compiled kernel and its positional arguments) and records how each
+  argument follows from the call: an operand (a caller tensor or an output the
+  wrapper allocates), a view into one, the stream, a workspace address, or a
+  constant. It registers the kernel with that binding for C++ and creates the C++
+  op.
+- **Later calls:** allocate the outputs and pass the operands' addresses and the
+  stream to the C++ op, which launches the kernel. The wrapper and `execute()` do
+  not run. Results are bitwise identical to the unplanned call.
+
+A call whose tensors are less aligned than the planned call's (up to 16 bytes)
+runs the wrapper. Positional calls, JAX arrays, and the discrete (per-expert
+pointer) weight paths are not planned. `CUDNN_FRONTEND_GROUPED_GEMM_PLANS=0`,
+read at import, turns plans off.
+
+C++ code in the same process calls the same op on a kernel Python registered:
+
+```cpp
+#include <cudnn_frontend/ops/grouped_gemm.h>
+namespace ops = cudnn_frontend::ops;
+
+// The wrapper's tensor arguments and the outputs it allocates, by name; the options are its other
+// keyword arguments as JSON, e.g. {"act_func": "swiglu", ...}.
+std::vector<ops::GroupedGemmOperand> operands = {{"a_tensor", a}, {"b_tensor", b}, /* ... */ {"d_tensor", d}};
+ops::GroupedGemm op;
+ops::GroupedGemm::create("glu", operands, options, ops::KernelLibrary::registry(), op);  // never compiles
+op.execute(operands, workspace, stream);  // workspace of op.workspace_size() bytes, 128-byte aligned
+```
+
+Outputs the kernel accumulates into must be initialized first: `amax_tensor` to
+-inf and the dGLU `dbias_tensor` to zero; with `accumulate=True`, `wgrad_tensor`
+adds to what it holds.
