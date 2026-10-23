@@ -27,7 +27,13 @@ from .sparse_score_recompute_sm100 import SparseScoreRecomputeSm100
 from .dense_score_recompute_sm100 import DenseScoreRecomputeSm100
 from .dense_score_recompute_sm100_mxfp8 import BwdDenseAttnScoreSm100Mxfp8
 from .indexer_score_unified_sm100 import IndexerScoreUnifiedSm100
-from .indexer_score_unified_sm100_mxfp8 import IndexerScoreUnifiedSm100Mxfp8
+from ._block_scaled import (
+    BLOCK_SCALED_FORMATS,
+    BLOCK_SCALED_PRECISION_NAMES,
+    logical_head_dim,
+    resolve_sf_vec_size,
+    validate_indexer_precision,
+)
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.runtime import (
     ceil_div as _ceil_div,
@@ -84,8 +90,23 @@ def _normalize_dense_precision(
     return precision
 
 
-def _validate_dense_mxfp8_contract(
+def _normalize_dense_indexer_precision(
+    precision: str,
+    q_scale: Optional[torch.Tensor],
+    k_scale: Optional[torch.Tensor],
+    cu_seqlens_q_scale_padded: Optional[torch.Tensor] = None,
+    cu_seqlens_k_scale_padded: Optional[torch.Tensor] = None,
+) -> str:
+    """Normalize a dense indexer score ``precision`` and reject block scales passed with ``precision='bf16'``."""
+    precision = validate_indexer_precision(precision)
+    if precision == "bf16" and (q_scale is not None or k_scale is not None or cu_seqlens_q_scale_padded is not None or cu_seqlens_k_scale_padded is not None):
+        raise ValueError(f"Block scales and scale padded cu_seqlens require precision={BLOCK_SCALED_PRECISION_NAMES}")
+    return precision
+
+
+def _validate_dense_block_scaled_contract(
     *,
+    precision: str,
     q: torch.Tensor,
     k: torch.Tensor,
     per_head: torch.Tensor,
@@ -104,33 +125,40 @@ def _validate_dense_mxfp8_contract(
     sf_vec_size: int,
     is_varlen: bool,
 ) -> None:
-    if q.dtype != torch.float8_e4m3fn or k.dtype != torch.float8_e4m3fn:
-        raise TypeError("precision='mxfp8' requires q and k to be torch.float8_e4m3fn")
+    """Check the dtype, scale-vector, head and packed-scale-shape contract of a block-scaled dense score.
+
+    ``head_dim`` is the logical head dim (twice the stored last dim for packed FP4).
+    """
+    # validate_indexer_precision reports a format dtype missing from the installed torch by name, not as a dtype mismatch.
+    fmt = BLOCK_SCALED_FORMATS[validate_indexer_precision(precision)]
+    label = precision.upper()
+    if q.dtype != fmt.data_dtype or k.dtype != fmt.data_dtype:
+        raise TypeError(f"precision={precision!r} requires q and k to be {fmt.data_dtype}")
     if per_head_name == "weights" and per_head.dtype != torch.bfloat16:
-        raise TypeError("precision='mxfp8' requires weights to be torch.bfloat16")
+        raise TypeError(f"precision={precision!r} requires weights to be torch.bfloat16")
     if per_head_name == "lse" and per_head.dtype != torch.float32:
-        raise TypeError("precision='mxfp8' requires lse to be torch.float32")
+        raise TypeError(f"precision={precision!r} requires lse to be torch.float32")
     if q_scale is None or k_scale is None:
-        raise ValueError("precision='mxfp8' requires q_scale and k_scale")
-    if q_scale.dtype != torch.float8_e8m0fnu or k_scale.dtype != torch.float8_e8m0fnu:
-        raise TypeError("precision='mxfp8' requires q_scale and k_scale to be " "torch.float8_e8m0fnu")
+        raise ValueError(f"precision={precision!r} requires q_scale and k_scale")
+    if q_scale.dtype != fmt.scale_dtype or k_scale.dtype != fmt.scale_dtype:
+        raise TypeError(f"precision={precision!r} requires q_scale and k_scale to be {fmt.scale_dtype}")
     for scale, reference, name in ((q_scale, q, "q_scale"), (k_scale, k, "k_scale")):
         if scale.device != reference.device:
             raise ValueError(f"{name} must be on the same device as its data tensor")
-    if sf_vec_size != 32:
-        raise ValueError("precision='mxfp8' currently requires sf_vec_size=32")
+    if sf_vec_size != fmt.sf_vec_size:
+        raise ValueError(f"precision={precision!r} currently requires sf_vec_size={fmt.sf_vec_size}")
     if head_dim != 128 and not (per_head_name == "lse" and head_dim == 512):
-        raise ValueError("precision='mxfp8' currently supports head_dim=128, " "or attention head_dim=512")
+        raise ValueError(f"precision={precision!r} currently supports head_dim=128, " "or attention head_dim=512")
     if n_heads_kv != 1:
-        raise ValueError("precision='mxfp8' dense score currently requires n_heads_kv=1")
+        raise ValueError(f"precision={precision!r} dense score currently requires n_heads_kv=1")
     if n_heads_q != n_heads_kv * qhead_per_kv_head:
-        raise ValueError("n_heads_q must equal n_heads_kv * qhead_per_kv_head for " "precision='mxfp8'")
+        raise ValueError(f"n_heads_q must equal n_heads_kv * qhead_per_kv_head for precision={precision!r}")
 
     sf_groups = _ceil_div(head_dim, sf_vec_size)
     sf_groups_padded = _ceil_div(sf_groups, 4) * 4
     if is_varlen:
         if cu_seqlens_q_scale_padded is None or cu_seqlens_k_scale_padded is None:
-            raise ValueError("THD MXFP8 requires Q/K scale padded cu_seqlens")
+            raise ValueError(f"THD {label} requires Q/K scale padded cu_seqlens")
         for prefix, name in (
             (cu_seqlens_q_scale_padded, "cu_seqlens_q_scale_padded"),
             (cu_seqlens_k_scale_padded, "cu_seqlens_k_scale_padded"),
@@ -142,7 +170,7 @@ def _validate_dense_mxfp8_contract(
                 raise ValueError(f"THD {name} must have shape ({n_heads_kv}, multiple_of_128, " f"{sf_groups_padded}), got {tuple(scale.shape)}")
     else:
         if cu_seqlens_q_scale_padded is not None or cu_seqlens_k_scale_padded is not None:
-            raise ValueError("BSHD MXFP8 requires scale padded cu_seqlens to be None")
+            raise ValueError(f"BSHD {label} requires scale padded cu_seqlens to be None")
         q_mn = seqlen_q * qhead_per_kv_head
         q_shape = (
             bs * n_heads_kv,
@@ -787,11 +815,10 @@ def _dispatch_dense_indexer_tile_params(
     """Select (m_block_size, n_block_size, k_block_size) for indexer score recompute.
 
     M128 packs four query tokens for 32 heads or two for 64 heads.
+    ``head_dim`` is the logical head dim.
     """
     assert head_dim == 128, f"Indexer score requires head_dim=128, got {head_dim}"
-    precision = precision.lower()
-    if precision not in ("bf16", "mxfp8"):
-        raise ValueError(f"precision must be 'bf16' or 'mxfp8', got {precision!r}")
+    validate_indexer_precision(precision)
     return 128, 128, 64 if k_block_size is None else k_block_size
 
 
@@ -821,7 +848,7 @@ def _dense_indexer_score_recompute(
     k_scale: Optional[torch.Tensor] = None,
     cu_seqlens_q_scale_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_scale_padded: Optional[torch.Tensor] = None,
-    sf_vec_size: int = 32,
+    sf_vec_size: Optional[int] = None,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -841,6 +868,10 @@ def _dense_indexer_score_recompute(
         out: required (total_q, max_seqlen_k) [FP32], contiguous
         denom_out: required (total_q,) [FP32], contiguous
 
+    Block-scaled precisions (``BLOCK_SCALED_FORMATS``) take Q/K in the
+    format's dtype (packed FP4 has last dim ``head_dim // 2``) plus packed
+    ``q_scale`` / ``k_scale``.
+
     Inputs need a unit innermost stride; layout/dtype mismatches raise
     ``ValueError`` (nothing is copied or cast here).
 
@@ -854,13 +885,15 @@ def _dense_indexer_score_recompute(
     current_stream = _resolve_stream(current_stream)
     for t, name in ((q, "q"), (k, "k"), (weights, "weights"), (q_scale, "q_scale"), (k_scale, "k_scale")):
         _require_unit_innermost(t, name)
-    precision = _normalize_dense_precision(
+    precision = _normalize_dense_indexer_precision(
         precision,
         q_scale,
         k_scale,
         cu_seqlens_q_scale_padded,
         cu_seqlens_k_scale_padded,
     )
+    is_block_scaled = precision in BLOCK_SCALED_FORMATS
+    sf_vec_size = resolve_sf_vec_size(precision, sf_vec_size)
     is_varlen_q = cu_seqlens_q is not None
     is_varlen_k = cu_seqlens_k is not None
     assert is_varlen_q == is_varlen_k, "THD input requires both cu_seqlens_q and cu_seqlens_k"
@@ -879,35 +912,40 @@ def _dense_indexer_score_recompute(
         bs = cu_seqlens_q.shape[0] - 1
         seqlen_q = int(max_seqlen_q)
         seqlen_k = int(max_seqlen_k)
-        assert head_dim == head_dim_k
+        if head_dim != head_dim_k:
+            raise ValueError(f"q head_dim ({head_dim}) != k head_dim ({head_dim_k})")
         assert weights.shape == (total_q, n_heads_q)
         assert cu_seqlens_q.shape == (bs + 1,) and cu_seqlens_k.shape == (bs + 1,)
     else:
         bs, seqlen_q, n_heads_q, head_dim = q.shape
-        _, seqlen_k, n_heads_kv, _ = k.shape
+        _, seqlen_k, n_heads_kv, head_dim_k = k.shape
+        if head_dim != head_dim_k:
+            raise ValueError(f"q head_dim ({head_dim}) != k head_dim ({head_dim_k})")
+    head_dim = logical_head_dim(precision, head_dim)
     q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(bs), q.device, stream=current_stream)
 
     if qhead_per_kv_head is None:
         qhead_per_kv_head = n_heads_q // n_heads_kv
-    if precision == "mxfp8":
+    if is_block_scaled:
         if qhead_per_kv_head not in (32, 64):
-            raise ValueError("precision='mxfp8' dense indexer requires qhead_per_kv_head=32 or 64")
+            raise ValueError(f"precision={precision!r} dense indexer requires qhead_per_kv_head=32 or 64")
         if m_block_size is not None and m_block_size != 128:
-            raise ValueError("precision='mxfp8' dense indexer requires m_block_size=128")
+            raise ValueError(f"precision={precision!r} dense indexer requires m_block_size=128")
         if n_block_size != 128:
-            raise ValueError("precision='mxfp8' dense indexer requires n_block_size=128")
+            raise ValueError(f"precision={precision!r} dense indexer requires n_block_size=128")
         m_block_size = 128
         # k_block_size is locked to 64 (the D128 two-chunk plan): kv_stage is
         # hardcoded to 24 below, which keeps K-SMEM within the SM100 budget only
         # at k_block=64 (k_block>64 overflows SMEM; k_block<64 under-pipelines).
         k_block_size = 64 if k_block_size is None else k_block_size
         if k_block_size != 64:
-            raise ValueError("precision='mxfp8' dense indexer requires k_block_size=64; " f"got {k_block_size}")
+            raise ValueError(f"precision={precision!r} dense indexer requires k_block_size=64; got {k_block_size}")
     elif m_block_size is None:
         m_block_size = qhead_per_kv_head
 
-    if precision == "mxfp8":
-        _validate_dense_mxfp8_contract(
+    if is_block_scaled:
+        _validate_dense_block_scaled_contract(
+            precision=precision,
             q=q,
             k=k,
             per_head=weights,
@@ -933,20 +971,20 @@ def _dense_indexer_score_recompute(
     if k_block_size is None:
         k_block_size = _select_dense_k_block_size(head_dim_padded, m_block_size, n_block_size, per_head_elem_bytes=2)
     kv_stage = _compute_dense_kv_stage(head_dim_padded, m_block_size, n_block_size, k_block_size, per_head_elem_bytes=2)
-    if precision == "mxfp8":
-        # K-SMEM = n_block * k_block_size(=64) * kv_stage (fp8); 24 fits the
-        # SM100 SMEM budget. k_block is locked to 64 above, so this is constant.
+    if is_block_scaled:
+        # K-SMEM = n_block * k_block_size(=64) * kv_stage at <= 1 byte per element;
+        # 24 fits the SM100 SMEM budget, and k_block is locked to 64 above.
         kv_stage = 24
 
     compute_capability = _get_device_capability()
     if compute_capability < 10:
         raise NotImplementedError(f"Dense indexer backward requires SM100+ (got {compute_capability}).")
 
-    if precision == "mxfp8":
+    if is_block_scaled:
         assert q_scale is not None and k_scale is not None
         compile_key = (
             "dense_indexer",
-            "mxfp8",
+            precision,
             q.dtype,
             k.dtype,
             weights.dtype,
@@ -986,15 +1024,15 @@ def _dense_indexer_score_recompute(
         denom_cute = to_cute_tensor(denom_out)
         cu_q_cute = to_cute_tensor(cu_seqlens_q, leading_dim=0) if is_varlen else None
         cu_k_cute = to_cute_tensor(cu_seqlens_k, leading_dim=0) if is_varlen else None
-        cu_q_scale_cute = to_cute_tensor(cu_seqlens_q_scale_padded, leading_dim=0) if is_varlen and precision == "mxfp8" else None
-        cu_k_scale_cute = to_cute_tensor(cu_seqlens_k_scale_padded, leading_dim=0) if is_varlen and precision == "mxfp8" else None
+        cu_q_scale_cute = to_cute_tensor(cu_seqlens_q_scale_padded, leading_dim=0) if is_varlen and is_block_scaled else None
+        cu_k_scale_cute = to_cute_tensor(cu_seqlens_k_scale_padded, leading_dim=0) if is_varlen and is_block_scaled else None
         q_offsets_cute = to_cute_tensor(q_causal_offsets, leading_dim=0) if q_causal_offsets is not None else None
 
-        if precision == "mxfp8":
+        if is_block_scaled:
             assert q_scale is not None and k_scale is not None
             q_scale_cute = to_cute_tensor(q_scale)
             k_scale_cute = to_cute_tensor(k_scale)
-            kernel_obj = IndexerScoreUnifiedSm100Mxfp8(
+            kernel_obj = BLOCK_SCALED_FORMATS[precision].kernel_cls(
                 head_dim=head_dim,
                 qhead_per_kvhead=qhead_per_kv_head,
                 m_block_size=m_block_size,
@@ -1026,7 +1064,7 @@ def _dense_indexer_score_recompute(
         max_q_arg = cutlass.Int32(seqlen_q)
         max_k_arg = cutlass.Int32(seqlen_k)
 
-        if precision == "mxfp8":
+        if is_block_scaled:
             _dense_indexer_score_recompute.compile_cache[compile_key] = cute.compile(
                 kernel_obj,
                 q_cute,
@@ -1073,7 +1111,7 @@ def _dense_indexer_score_recompute(
     max_q_arg = cutlass.Int32(seqlen_q)
     max_k_arg = cutlass.Int32(seqlen_k)
     with torch.cuda.nvtx.range("dense_indexer_score_recompute"):
-        if precision == "mxfp8":
+        if is_block_scaled:
             _dense_indexer_score_recompute.compile_cache[compile_key](
                 q,
                 k,
@@ -1205,7 +1243,8 @@ def _dense_attn_score_recompute(
         m_block_size = qhead_per_kv_head
 
     if precision == "mxfp8":
-        _validate_dense_mxfp8_contract(
+        _validate_dense_block_scaled_contract(
+            precision=precision,
             q=q,
             k=k,
             per_head=lse,
@@ -1449,7 +1488,7 @@ def dense_indexer_score_recompute(
     k_scale: Optional[torch.Tensor] = None,
     cu_seqlens_q_scale_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_scale_padded: Optional[torch.Tensor] = None,
-    sf_vec_size: int = 32,
+    sf_vec_size: Optional[int] = None,
     k_block_size: Optional[int] = None,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1465,24 +1504,34 @@ def dense_indexer_score_recompute(
 
     Args:
         q: BSHD ``(bs, seqlen_q, n_heads_q, head_dim)`` or THD
-           ``(total_q, n_heads_q, head_dim)`` [BF16]
+           ``(total_q, n_heads_q, head_dim)`` [BF16, or the block-scaled
+           precision's dtype; packed FP4 has last dim ``head_dim // 2``]
         k: BSHD ``(bs, seqlen_k, n_heads_kv, head_dim)`` or THD
-           ``(total_k, n_heads_kv, head_dim)`` [BF16]
+           ``(total_k, n_heads_kv, head_dim)`` [same dtype as ``q``]
         weights: BSH ``(bs, seqlen_q, n_heads_q)`` or TH ``(total_q, n_heads_q)`` [BF16]
         out: required, contiguous. BSHD ``(bs, seqlen_q, seqlen_k)``;
              THD ``(total_q, max_seqlen_k)`` [FP32]
         denom_out: required, contiguous. BSHD ``(bs, seqlen_q)`` ; THD ``(total_q,)`` [FP32]
         sm_scale: scalar applied to fp32 score post head-reduce; default 1.0
         ratio, cu_seqlens_*, max_seqlen_*: see causal mask + THD docs.
+        precision: ``"bf16"``, ``"mxfp8"`` (E4M3 Q/K, E8M0 scale per 32) or
+            ``"nvfp4"`` (packed E2M1 Q/K, non-negative E4M3 scale per 16).
+            Block-scaled precisions need packed ``q_scale`` / ``k_scale`` (and,
+            for THD, ``cu_seqlens_*_scale_padded``); ``sf_vec_size=None``
+            selects the format's scale vector size.
 
     Returns:
         (out, denom_out)
     """
     if qhead_per_kv_head is None:
         qhead_per_kv_head = (q.shape[-2] // k.shape[-2]) if q.ndim == 3 else (q.shape[2] // k.shape[2])
-    head_dim = q.shape[-1]
 
-    precision = _normalize_dense_precision(precision, q_scale, k_scale)
+    precision = _normalize_dense_indexer_precision(precision, q_scale, k_scale)
+    fmt = BLOCK_SCALED_FORMATS.get(precision)
+    # Check the Q/K dtype first: logical_head_dim trusts ``precision`` and would report a mismatch as a wrong head_dim.
+    if fmt is not None and (q.dtype != fmt.data_dtype or k.dtype != fmt.data_dtype):
+        raise TypeError(f"precision={precision!r} requires q and k to be {fmt.data_dtype}")
+    head_dim = logical_head_dim(precision, q.shape[-1])
     m, n, kbs = _dispatch_dense_indexer_tile_params(
         head_dim,
         qhead_per_kv_head,

@@ -1,7 +1,7 @@
 ## DSA module
 
 - **Sparse Attention Forward**: SM100 sparse-prefill CuTe-DSL kernels for H64/D512 or D576 and H128/D512 small-top-k Prefill MQA shapes. Supports arbitrary logical K, invalid/OOB and duplicate indices, per-query lengths, attention sinks, and indexer LSE.
-- **Indexer Forward**: `indexer_forward_wrapper` materializes dense scores on SM90/SM100; `indexer_forward_top_k_wrapper` is the separate SM100 compact-logits path that runs radix Top-K and its fused softmax without materializing the dense score tensor (BSHD/THD BF16 and MXFP8, with optional LSE).
+- **Indexer Forward**: `indexer_forward_wrapper` materializes dense scores on SM90/SM100; `indexer_forward_top_k_wrapper` is the separate SM100 compact-logits path that runs radix Top-K and its fused softmax without materializing the dense score tensor (BSHD/THD BF16, MXFP8, and NVFP4, with optional LSE).
 - **Indexer Top-K**: SM90+ CuTe-DSL radix top-K kernel with per-row ``seq_lens``.
 - **Sparse Attention Backward**: DSA backward for flat MQA tensors on SM90/SM100; consumes the forward wrapper's `out` and KV-only `lse`.
 - **Sparse Indexer / Attention Score Recompute**: Sparse (top-K) recomputation of indexer and attention scores for training loss.

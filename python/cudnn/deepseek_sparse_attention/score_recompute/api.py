@@ -27,6 +27,7 @@ from cudnn._torch_stream import contiguous_on_stream, copy_into_on_stream, recor
 from cudnn.api_base import APIBase, TupleDict
 
 from . import _interface_sm100 as _iface_sm100
+from ._block_scaled import BLOCK_SCALED_PRECISION_NAMES
 
 # ---------------------------------------------------------------------------
 # Base helpers
@@ -868,10 +869,19 @@ def dense_indexer_score_recompute_wrapper(
     k_scale: Optional[torch.Tensor] = None,
     cu_seqlens_q_scale_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_scale_padded: Optional[torch.Tensor] = None,
-    sf_vec_size: int = 32,
+    sf_vec_size: Optional[int] = None,
     stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
     """High-level wrapper. Returns ``{'out': scores, 'denom': logsumexp}``.
+
+    ``precision`` is ``"bf16"`` (SM90 and SM100+) or an SM100 block-scaled
+    precision: ``"mxfp8"`` (E4M3 Q/K, E8M0 scale per 32) or ``"nvfp4"``
+    (``torch.float4_e2m1fn_x2`` Q/K with last dim ``head_dim // 2``,
+    non-negative E4M3 scale per 16). Block-scaled precisions take packed
+    ``q_scale`` / ``k_scale`` (and, for THD, ``cu_seqlens_*_scale_padded``);
+    ``sf_vec_size=None`` selects the format's scale vector size. For NVFP4,
+    pass ``sm_scale * g_q * g_k``, where ``g_q`` and ``g_k`` are the
+    per-tensor dequantization multipliers of Q and K.
 
     THD (``cu_seqlens_q``/``cu_seqlens_k`` given) runs natively on SM100+; on
     SM90 the wrapper adapts it per batch from a host copy of ``cu_seqlens``
@@ -902,7 +912,9 @@ def dense_indexer_score_recompute_wrapper(
     if precision != "bf16" or q_scale is not None or k_scale is not None or cu_seqlens_q_scale_padded is not None or cu_seqlens_k_scale_padded is not None:
         major, _ = device_capability()
         if major == 9:
-            raise NotImplementedError("Dense indexer score FP8/MXFP8 is SM100-only")
+            raise NotImplementedError(
+                f"Dense indexer score with block scales (precision={BLOCK_SCALED_PRECISION_NAMES}) is SM100-only; SM90 supports precision='bf16'"
+            )
         o, d = _iface_sm100.dense_indexer_score_recompute(
             q,
             k,

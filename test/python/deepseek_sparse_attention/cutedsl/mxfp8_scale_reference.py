@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""PyTorch reference implementation of the Blackwell MXFP8 scale layout."""
+"""PyTorch reference implementation of the Blackwell MXFP8/NVFP4 scale layout."""
 
 import math
 
@@ -77,6 +77,11 @@ def _blockscaled_indices(mn: int, sf_groups: int, l_size: int, *, device: torch.
     return base.unsqueeze(0) + l_offsets * sf_per_l
 
 
+def _is_byte_float(scale: torch.Tensor) -> bool:
+    """Return whether ``scale`` is a one-byte float encoding (E8M0 or E4M3), copied as raw bytes."""
+    return scale.dtype.is_floating_point and scale.element_size() == 1
+
+
 def pack_blockscaled_scale_mkl(scale_mkl: torch.Tensor) -> torch.Tensor:
     """Pack logical ``(MN, groups, L)`` scales with PyTorch operations."""
     if scale_mkl.ndim != 3:
@@ -89,8 +94,7 @@ def pack_blockscaled_scale_mkl(scale_mkl: torch.Tensor) -> torch.Tensor:
     )
     packed = torch.zeros(shape, device=scale_mkl.device, dtype=scale_mkl.dtype)
     indices = _blockscaled_indices(mn, sf_groups, l_size, device=scale_mkl.device).reshape(-1)
-    e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
-    if e8m0_dtype is not None and scale_mkl.dtype == e8m0_dtype:
+    if _is_byte_float(scale_mkl):
         source = scale_mkl.view(torch.uint8).permute(2, 0, 1).reshape(-1)
         packed.view(torch.uint8).reshape(-1)[indices] = source
     else:
@@ -102,10 +106,9 @@ def pack_blockscaled_scale_mkl(scale_mkl: torch.Tensor) -> torch.Tensor:
 def unpack_blockscaled_scale_mkl(scale_packed: torch.Tensor, mn: int, sf_groups: int) -> torch.Tensor:
     """Unpack physical scales to logical ``(MN, groups, L)`` order."""
     indices = _blockscaled_indices(mn, sf_groups, scale_packed.shape[0], device=scale_packed.device)
-    e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
-    if e8m0_dtype is not None and scale_packed.dtype == e8m0_dtype:
+    if _is_byte_float(scale_packed):
         unpacked = scale_packed.view(torch.uint8).reshape(-1)[indices].permute(1, 2, 0).contiguous()
-        return unpacked.view(e8m0_dtype)
+        return unpacked.view(scale_packed.dtype)
     return scale_packed.reshape(-1)[indices].permute(1, 2, 0).contiguous()
 
 

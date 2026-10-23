@@ -1,8 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""CUDA-only MXFP8 scale packing helpers for the SM100 Indexer DSL path.
+"""CUDA-only MXFP8 and NVFP4 scale packing helpers for the SM100 Indexer DSL path.
 
+MXFP8 E8M0 and NVFP4 E4M3 scales are both one byte, so they share the packed layout.
 Runtime packing requires contiguous one-byte CUDA inputs, a supported GPU, and
 the CuTe DSL version required by the DSA kernels. PyTorch reference packing is
 kept in the test suite and is deliberately not a runtime fallback.
@@ -28,7 +29,7 @@ def make_scale_cu_seqlens_padded(cu_seqlens: torch.Tensor, token_alignment: int)
     """Return per-sequence padded token prefixes for a compact THD tensor.
 
     ``cu_seqlens`` remains the prefix for compact Q/K data. The returned
-    ``(B+1,)`` int32 tensor is the prefix for independently padded MXFP8 scale
+    ``(B+1,)`` int32 tensor is the prefix for independently padded scale
     storage, where each sequence length is minimally rounded up to
     ``token_alignment``. Callers may instead pass the THD scale packers any
     span that covers the logical sequence and is a multiple of

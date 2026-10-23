@@ -31,6 +31,28 @@ def _require_exact_sm100():
         pytest.skip("SM100 (10, 0) GPU required")
 
 
+def _require_nvfp4_indexer():
+    """Skip unless the GPU, torch build and CuTe DSL support the NVFP4 indexer."""
+    _require_sm100()
+    if getattr(torch, "float4_e2m1fn_x2", None) is None:
+        pytest.skip("NVFP4 indexer requires torch.float4_e2m1fn_x2")
+    from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error, cutedsl_state
+    from cudnn.deepseek_sparse_attention.utils.compiler import gpu_arch_flag
+
+    if not cutedsl_state()[0]:
+        pytest.skip("NVFP4 indexer requires CuTe DSL")
+    requirement_error = cutedsl_requirement_error("NVFP4 DSA indexer")
+    if requirement_error is not None:
+        pytest.skip(requirement_error)
+    arch_error = cutedsl_arch_requirement_error(torch.cuda.get_device_capability())
+    if arch_error is not None:
+        pytest.skip(arch_error)
+    try:
+        gpu_arch_flag()
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+
 # Parameterization marks shared by every DSA test
 DSA_PARAM_MARKS = [
     pytest.mark.parametrize("dtype", [torch.bfloat16]),
@@ -187,6 +209,59 @@ def quantize_mxfp8(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return (x.float() / expand_mxfp8_scale(scale, x.shape[-1])).to(torch.float8_e4m3fn)
 
 
+# E2M1 magnitudes of codes 0b000..0b111 and the round-to-nearest midpoints between them.
+_E2M1_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+_E2M1_MIDPOINTS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
+
+
+def make_random_nvfp4_scale(
+    shape: Tuple[int, ...],
+    *,
+    device: torch.device | str,
+    seed: Optional[int] = None,
+    exponent_min: int = -2,
+    exponent_max: int = 2,
+) -> torch.Tensor:
+    """Create random E4M3 NVFP4 scales ``2**e * (1 + m / 8)`` that exercise all three mantissa bits."""
+    if exponent_min > exponent_max:
+        raise ValueError("exponent_min must be <= exponent_max")
+    generator = None
+    if seed is not None:
+        generator = torch.Generator(device=device)
+        generator.manual_seed(seed)
+    exponents = torch.randint(exponent_min, exponent_max + 1, shape, device=device, generator=generator, dtype=torch.int32)
+    mantissas = torch.randint(0, 8, shape, device=device, generator=generator, dtype=torch.int32)
+    values = torch.ldexp(1.0 + mantissas.float() / 8.0, exponents)
+    return values.to(torch.float8_e4m3fn)
+
+
+def quantize_nvfp4(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    sf_vec_size: int = 16,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize ``x`` to packed NVFP4 using logical E4M3 block scales.
+
+    Rounds to the nearest E2M1 value (ties to even, saturating at 6). Returns ``(packed, dequantized)``:
+    ``packed`` is ``torch.float4_e2m1fn_x2`` with element ``2i`` in the low nibble of byte ``i``;
+    ``dequantized`` is the FP32 value of each stored code, used as the reference input.
+    """
+    scale_full = expand_mxfp8_scale(scale, x.shape[-1], sf_vec_size)
+    y = x.float() / scale_full
+    sign = (y < 0).to(torch.uint8)
+    magnitude = y.abs().clamp(max=6.0)
+    midpoints = torch.tensor(_E2M1_MIDPOINTS, device=x.device)
+    code_tie_down = torch.bucketize(magnitude, midpoints, right=False)
+    code_tie_up = torch.bucketize(magnitude, midpoints, right=True)
+    # The two differ only on an exact midpoint; take the even code there.
+    magnitude_code = torch.where(code_tie_down % 2 == 1, code_tie_up, code_tie_down).to(torch.uint8)
+    codes = magnitude_code | (sign << 3)
+    packed = (codes[..., 0::2] | (codes[..., 1::2] << 4)).contiguous().view(torch.float4_e2m1fn_x2)
+    magnitudes = torch.tensor(_E2M1_MAGNITUDES, device=x.device)
+    dequantized = magnitudes[magnitude_code.long()] * (1.0 - 2.0 * sign.float()) * scale_full
+    return packed, dequantized
+
+
 def pack_mxfp8_scales_thd(
     q_scale_logical: torch.Tensor,
     k_scale_logical: torch.Tensor,
@@ -197,7 +272,7 @@ def pack_mxfp8_scales_thd(
     q_alignment: Optional[int] = None,
     k_alignment: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build padded prefixes and packed Q/K scales for THD MXFP8 tests."""
+    """Build padded prefixes and packed Q/K scales for THD MXFP8 (E8M0) and NVFP4 (E4M3) tests."""
     from cudnn.deepseek_sparse_attention.utils.sm100.mxfp8_scale_utils import make_scale_cu_seqlens_padded
     from deepseek_sparse_attention.cutedsl import mxfp8_scale_reference
 

@@ -9,11 +9,14 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from deepseek_sparse_attention.cutedsl.dsa_utils import (
+    _require_nvfp4_indexer,
     dsa_init,
     expand_mxfp8_scale,
     make_random_mxfp8_scale,
+    make_random_nvfp4_scale,
     pack_mxfp8_scales_thd,
     quantize_mxfp8,
+    quantize_nvfp4,
     with_dsa_score_recompute_params,
 )
 from deepseek_sparse_attention.cutedsl.dsa_reference import (
@@ -941,3 +944,238 @@ def test_DSA_dense_score_recompute_wrapper_thd_mxfp8_compact_padded_scales(
             atol_denom=5e-3,
             rtol_denom=5e-3,
         )
+
+
+@pytest.mark.parametrize(
+    "h_q,b,s_q,s_k,ratio,offsets",
+    [
+        pytest.param(64, 1, 128, 128, 4, (16,), marks=pytest.mark.L0, id="qh64_ratio4"),
+        pytest.param(32, 1, 5, 128, 4, (16,), marks=pytest.mark.L0, id="qh32_query_tail"),
+        # Two batches exercise the packed-scale L index; batch 0 reaches the S_k=200 key tail (one full and one partial KV block).
+        pytest.param(64, 2, 64, 200, 1, (136, 100), marks=pytest.mark.L1, id="qh64_ratio1_b2_key_tail"),
+        # Batch 0's ratio-causal limit (up to 264) exceeds S_k=200, so the KV length bounds its rows.
+        pytest.param(64, 2, 64, 200, 1, (200, 136), marks=pytest.mark.L1, id="qh64_ratio1_b2_kv_clamp"),
+        # Three KV blocks per tile rotate the accumulator and K-scale TMEM slots on the direct-PTX (ratio 4) and CuTe GEMM (ratio 1)
+        # paths, with the single-token (QH64) and token-pair (QH32) LSE epilogues.
+        pytest.param(64, 1, 128, 384, 4, (1408,), marks=pytest.mark.L0, id="qh64_ratio4_three_kv_blocks"),
+        pytest.param(32, 1, 40, 384, 4, (1496,), marks=pytest.mark.L1, id="qh32_ratio4_three_kv_blocks"),
+        pytest.param(32, 1, 40, 320, 1, (280,), marks=pytest.mark.L0, id="qh32_ratio1_three_kv_blocks"),
+        # More query tiles than SMs: persistent CTAs carry TMEM slot phases across tiles, and 2..4 KV blocks per tile wrap the three-slot ring unevenly.
+        pytest.param(64, 1, 1024, 512, 4, (1024,), marks=pytest.mark.L0, id="qh64_ratio4_persistent_mixed_blocks"),
+    ],
+)
+@torch_fork_set_rng(seed=31)
+def test_DSA_dense_indexer_score_recompute_wrapper_nvfp4_matches_dequant_reference(h_q, b, s_q, s_k, ratio, offsets):
+    """NVFP4 dense indexer scores and LSE match an FP32 reference on the dequantized inputs.
+
+    The per-tensor Q/K global scales are folded into ``sm_scale``; signed head weights pin the ReLU before the weighting.
+    """
+    try:
+        from cudnn import DSA
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    _require_nvfp4_indexer()
+
+    from deepseek_sparse_attention.cutedsl import mxfp8_scale_reference as scale_utils
+
+    device = "cuda"
+    d = 128
+    q_global_scale, k_global_scale = 0.5, 0.75
+    q_scale_logical = make_random_nvfp4_scale((b, s_q, h_q, d // 16), device=device, seed=301)
+    k_scale_logical = make_random_nvfp4_scale((b, s_k, 1, d // 16), device=device, seed=303)
+    q, q_deq = quantize_nvfp4(torch.randn(b, s_q, h_q, d, device=device), q_scale_logical)
+    k, k_deq = quantize_nvfp4(torch.randn(b, s_k, 1, d, device=device), k_scale_logical)
+    weights = torch.randn(b, s_q, h_q, dtype=torch.bfloat16, device=device) * 0.1
+    q_causal_offsets = torch.tensor(offsets, dtype=torch.int32, device=device).expand(b).contiguous()
+
+    result = DSA.dense_indexer_score_recompute_wrapper(
+        q,
+        k,
+        weights,
+        qhead_per_kv_head=h_q,
+        sm_scale=q_global_scale * k_global_scale,
+        ratio=ratio,
+        q_causal_offsets=q_causal_offsets,
+        precision="nvfp4",
+        q_scale=scale_utils.pack_q_scale_bshd(q_scale_logical, qhead_per_kv_head=h_q),
+        k_scale=scale_utils.pack_k_scale_bshd(k_scale_logical),
+        stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+    torch.cuda.synchronize()
+
+    assert result["out"].shape == (b, s_q, s_k)
+    check_ref_dense_score_recompute(
+        "indexer",
+        q_deq * q_global_scale,
+        k_deq * k_global_scale,
+        weights,
+        result["out"],
+        result["denom"],
+        ratio=ratio,
+        q_causal_offsets=q_causal_offsets,
+        atol_scores=1e-3,
+        rtol_scores=1e-3,
+        atol_denom=1e-3,
+        rtol_denom=1e-3,
+    )
+
+
+@torch_fork_set_rng(seed=37)
+@pytest.mark.parametrize(
+    "h_q,shapes,offsets,q_alignment",
+    [
+        # Segment 0's ratio-causal limit (up to 47) exceeds its 32 keys.
+        pytest.param(64, [(127, 32), (129, 64)], (64, 17), 256, marks=pytest.mark.L0, id="qh64_kv_clamp"),
+        pytest.param(32, [(127, 32), (129, 64)], (64, 17), 256, marks=pytest.mark.L1, id="qh32_kv_clamp"),
+        # The packer's minimal Q alignment puts segment 1's scale prefix at a token offset that is not a multiple of 128.
+        pytest.param(64, [(63, 32), (129, 64)], (1, 17), None, marks=pytest.mark.L1, id="qh64_tight_q_alignment"),
+        pytest.param(32, [(61, 32), (129, 64)], (1, 17), None, marks=pytest.mark.L0, id="qh32_tight_q_alignment"),
+    ],
+)
+def test_DSA_dense_indexer_score_recompute_wrapper_thd_nvfp4_compact_padded_scales(h_q, shapes, offsets, q_alignment):
+    try:
+        from cudnn import DSA
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    _require_nvfp4_indexer()
+
+    device = torch.device("cuda")
+    ratio, d = 4, 128
+    q_lengths = [s_q for s_q, _ in shapes]
+    k_lengths = [s_k for _, s_k in shapes]
+    cu_q = torch.tensor([0, *torch.tensor(q_lengths).cumsum(0).tolist()], dtype=torch.int32, device=device)
+    cu_k = torch.tensor([0, *torch.tensor(k_lengths).cumsum(0).tolist()], dtype=torch.int32, device=device)
+    total_q, total_k = int(cu_q[-1]), int(cu_k[-1])
+    max_q, max_k = max(q_lengths), max(k_lengths)
+
+    q_scale_logical = make_random_nvfp4_scale((total_q, h_q, d // 16), device=device, seed=311)
+    k_scale_logical = make_random_nvfp4_scale((total_k, 1, d // 16), device=device, seed=313)
+    q, q_deq = quantize_nvfp4(torch.randn(total_q, h_q, d, device=device), q_scale_logical)
+    k, k_deq = quantize_nvfp4(torch.randn(total_k, 1, d, device=device), k_scale_logical)
+    weights = torch.randn(total_q, h_q, dtype=torch.bfloat16, device=device) * 0.1
+    q_scale, k_scale, cu_q_scale, cu_k_scale = pack_mxfp8_scales_thd(
+        q_scale_logical,
+        k_scale_logical,
+        cu_q,
+        cu_k,
+        h_q,
+        q_alignment=q_alignment,
+        k_alignment=256,
+    )
+    q_causal_offsets = torch.tensor(offsets, dtype=torch.int32, device=device)
+
+    result = DSA.dense_indexer_score_recompute_wrapper(
+        q,
+        k,
+        weights,
+        qhead_per_kv_head=h_q,
+        ratio=ratio,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_k,
+        max_seqlen_q=max_q,
+        max_seqlen_k=max_k,
+        q_causal_offsets=q_causal_offsets,
+        precision="nvfp4",
+        q_scale=q_scale,
+        k_scale=k_scale,
+        cu_seqlens_q_scale_padded=cu_q_scale,
+        cu_seqlens_k_scale_padded=cu_k_scale,
+        stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+    torch.cuda.synchronize()
+
+    assert result["out"].shape == (total_q, max_k)
+    assert result["denom"].shape == (total_q,)
+    cu_q_host, cu_k_host = cu_q.tolist(), cu_k.tolist()
+    for batch, (_, s_k) in enumerate(shapes):
+        q0, q1 = cu_q_host[batch : batch + 2]
+        k0, k1 = cu_k_host[batch : batch + 2]
+        # Columns past a segment's own keys are padding and stay -inf.
+        assert torch.isneginf(result["out"][q0:q1, s_k:]).all()
+        check_ref_dense_score_recompute(
+            "indexer",
+            q_deq[q0:q1].unsqueeze(0),
+            k_deq[k0:k1].unsqueeze(0),
+            weights[q0:q1].unsqueeze(0),
+            result["out"][q0:q1, :s_k].unsqueeze(0),
+            result["denom"][q0:q1].unsqueeze(0),
+            ratio=ratio,
+            q_causal_offsets=q_causal_offsets[batch : batch + 1],
+            atol_scores=1e-3,
+            rtol_scores=1e-3,
+            atol_denom=1e-3,
+            rtol_denom=1e-3,
+        )
+
+
+@pytest.mark.L0
+def test_DSA_dense_score_recompute_wrapper_nvfp4_rejects_mismatched_inputs():
+    """NVFP4 dense score validation fails on the host, before any kernel compiles."""
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    _require_nvfp4_indexer()
+
+    from deepseek_sparse_attention.cutedsl import mxfp8_scale_reference as scale_utils
+
+    device = "cuda"
+    b, s_q, s_k, h_q, d = 1, 8, 128, 64, 128
+    q_scale_logical = make_random_nvfp4_scale((b, s_q, h_q, d // 16), device=device, seed=1)
+    k_scale_logical = make_random_nvfp4_scale((b, s_k, 1, d // 16), device=device, seed=2)
+    q, _ = quantize_nvfp4(torch.randn(b, s_q, h_q, d, device=device), q_scale_logical)
+    k, _ = quantize_nvfp4(torch.randn(b, s_k, 1, d, device=device), k_scale_logical)
+    weights = torch.rand(b, s_q, h_q, dtype=torch.bfloat16, device=device)
+    q_scale = scale_utils.pack_q_scale_bshd(q_scale_logical, qhead_per_kv_head=h_q)
+    k_scale = scale_utils.pack_k_scale_bshd(k_scale_logical)
+    common = dict(qhead_per_kv_head=h_q, precision="nvfp4", q_scale=q_scale, k_scale=k_scale)
+
+    with pytest.raises(TypeError, match="q_scale and k_scale"):
+        DSA.dense_indexer_score_recompute_wrapper(q, k, weights, **{**common, "q_scale": q_scale.view(torch.float8_e8m0fnu)})
+    with pytest.raises(TypeError, match="q and k"):
+        DSA.dense_indexer_score_recompute_wrapper(q.view(torch.uint8), k.view(torch.uint8), weights, **common)
+    with pytest.raises(TypeError, match="weights to be torch.bfloat16"):
+        DSA.dense_indexer_score_recompute_wrapper(q, k, weights.float(), **common)
+    with pytest.raises(ValueError, match="sf_vec_size=16"):
+        DSA.dense_indexer_score_recompute_wrapper(q, k, weights, sf_vec_size=32, **common)
+    with pytest.raises(ValueError, match="q_scale packed shape"):
+        DSA.dense_indexer_score_recompute_wrapper(q, k, weights, **{**common, "q_scale": k_scale})
+    # Unpacked E4M3 Q/K are named as a dtype error, not as a doubled head_dim.
+    q8, k8 = (torch.randn(*t.shape[:-1], d, device=device).to(torch.float8_e4m3fn) for t in (q, k))
+    with pytest.raises(TypeError, match="q and k"):
+        DSA.dense_indexer_score_recompute_wrapper(q8, k8, weights, **common)
+    k_wide = torch.cat([k.view(torch.uint8)] * 2, dim=-1).view(k.dtype)
+    with pytest.raises(ValueError, match=r"q head_dim \(\d+\) != k head_dim"):
+        DSA.dense_indexer_score_recompute_wrapper(q, k_wide, weights, **common)
+    # A last dim of head_dim instead of head_dim // 2 names the packed width.
+    q_wide = torch.cat([q.view(torch.uint8)] * 2, dim=-1).view(q.dtype)
+    with pytest.raises(ValueError, match="stored as q/k last dim 64"):
+        DSA.dense_indexer_score_recompute_wrapper(q_wide, k_wide, weights, **common)
+    # The dense attention score has no NVFP4 kernel.
+    lse = torch.zeros(b, s_q, h_q, dtype=torch.float32, device=device)
+    with pytest.raises(ValueError, match="precision must be 'bf16' or 'mxfp8'"):
+        DSA.dense_attn_score_recompute_wrapper(q, k, lse, 1.0, **common)
+
+
+@pytest.mark.L0
+def test_DSA_dense_indexer_score_recompute_wrapper_sm90_declines_block_scales(monkeypatch):
+    """On SM90 the dense indexer score declines the block-scaled precisions and stray block scales as SM100-only."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    try:
+        from cudnn.deepseek_sparse_attention.score_recompute import api
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    monkeypatch.setattr(api, "device_capability", lambda device=None: (9, 0))
+    q = torch.zeros(1, 8, 64, 128, dtype=torch.bfloat16, device="cuda")
+    k = torch.zeros(1, 8, 1, 128, dtype=torch.bfloat16, device="cuda")
+    w = torch.zeros(1, 8, 64, dtype=torch.bfloat16, device="cuda")
+    declined = r"Dense indexer score with block scales \(precision='mxfp8' or 'nvfp4'\) is SM100-only"
+    for precision in ("mxfp8", "NVFP4"):
+        with pytest.raises(NotImplementedError, match=declined):
+            api.dense_indexer_score_recompute_wrapper(q, k, w, precision=precision)
+    with pytest.raises(NotImplementedError, match=declined):
+        api.dense_indexer_score_recompute_wrapper(q, k, w, q_scale=torch.zeros(1, dtype=torch.uint8, device="cuda"))
