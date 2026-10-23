@@ -833,7 +833,8 @@ def test_fuse_prepare_builds_one_stage_in_place_of_two_and_keeps_the_carve(band,
     ``cache_write``; without it both; the workspace carve is identical (the stage reserves nothing); the fused stage's
     byte count is the two stages' minus nothing but the second read of K.  The fused stage takes the block's resolved ``use_pdl``
     and hands it to the compile (both slot recipes), as the two stages it replaces do: False under the AUTO reading off the decode
-    form, True when the dense bf16 block declares it; on the band block an explicit True is the block's own typed decline."""
+    form, True when the block declares it -- the dense bf16 block and the caller-list band block alike (the band's switched chain is
+    served; the in-block indexer is the remaining typed decline, pinned elsewhere)."""
     qsa = QsaSpec(index_band=True) if band else None
     kw = dict(qsa=qsa, paged_kv_page_size=16)
     off, *_ = _make_block(_SMALL_D256, 2, 128, **kw)
@@ -852,13 +853,9 @@ def test_fuse_prepare_builds_one_stage_in_place_of_two_and_keeps_the_carve(band,
     # the knob's PDL arm: the stage carries the block's switch and compiles both recipes with it
     assert on.use_pdl is False and on._prepare.use_pdl is False
     _assert_prepare_compiles_with_pdl(on._prepare, False, monkeypatch)
-    if band:
-        with pytest.raises(NotImplementedError, match="use_pdl=True is served for the bf16 / f16 block only"):
-            _make_block(_SMALL_D256, 2, 128, fuse_prepare=True, use_pdl=True, **kw)
-    else:
-        pdl, *_ = _make_block(_SMALL_D256, 2, 128, fuse_prepare=True, use_pdl=True, **kw)
-        assert pdl.use_pdl is True and pdl._prepare.use_pdl is True
-        _assert_prepare_compiles_with_pdl(pdl._prepare, True, monkeypatch)
+    pdl, *_ = _make_block(_SMALL_D256, 2, 128, fuse_prepare=True, use_pdl=True, **kw)
+    assert pdl.use_pdl is True and pdl.use_pdl_requested is True and pdl._prepare.use_pdl is True and pdl._prepare.index_band == band
+    _assert_prepare_compiles_with_pdl(pdl._prepare, True, monkeypatch)
 
 
 def _run_block_pair(geom_kw, batch, seq_len, *, qsa=None, slot_dtype=torch.int32, pad_every=0, seed=7, **blk_kw):
