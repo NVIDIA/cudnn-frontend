@@ -4659,11 +4659,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             units = min(env, resident)
             cfg = self._k_mod.CFG
             if (
-                self._device_cc == (10, 0)
+                ((self._device_cc == (10, 0) and self.paged) or (self._device_cc == (10, 7) and not self.paged))
                 and self.dtype == torch.bfloat16
                 and self.head_dim_qk == self.head_dim_v == 128
                 and self.batch_size == 1
-                and self.paged
                 and self.is_causal
                 and self.window_left is None
                 and self.window_right == 0
