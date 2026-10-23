@@ -22,6 +22,7 @@ args = parser.parse_args()
 labels = ("base-A1", "patch-B1", "patch-B2", "base-A2")
 runs = {label: json.loads((args.results / f"{label}.json").read_text()) for label in labels}
 require(len({r["script_sha256"] for r in runs.values()}) == 1, "Benchmark script hashes differ")
+require(len({r["reference_sha256"] for r in runs.values()}) == 1, "FP64 reference hashes differ")
 for field in ("torch", "cuda", "dsl", "cudnn_backend", "gpu", "capability", "seed"):
     require(len({json.dumps(r[field], allow_nan=False) for r in runs.values()}) == 1, f"Environment differs: {field}")
 for a, b in (("base-A1", "base-A2"), ("patch-B1", "patch-B2")):
@@ -64,7 +65,12 @@ for index in range(6):
     for flags in row["backward_scheduler_flags"].values():
         require(flags and all(flag > 1 if first["steep_channels"] else flag == 0 for flag in flags), f"Unexpected backward scheduler flags in case {index}")
     rows.append(row)
-summary = {"results": rows, "helper_hashes": {label: r["helper_sha256"] for label, r in runs.items()}, "script_hash": runs[labels[0]]["script_sha256"]}
+summary = {
+    "results": rows,
+    "helper_hashes": {label: r["helper_sha256"] for label, r in runs.items()},
+    "script_hash": runs[labels[0]]["script_sha256"],
+    "reference_hash": runs[labels[0]]["reference_sha256"],
+}
 serialized = json.dumps(summary, indent=2, allow_nan=False)
 (args.results / "summary.json").write_text(serialized + "\n")
 print(serialized)

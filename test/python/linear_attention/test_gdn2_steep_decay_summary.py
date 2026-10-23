@@ -24,6 +24,7 @@ def runs():
         records[label] = {
             "label": label,
             "script_sha256": "script",
+            "reference_sha256": "reference",
             "helper_sha256": label.split("-")[0],
             **dict.fromkeys(("torch", "cuda", "dsl", "cudnn_backend", "gpu", "capability", "seed"), "same"),
             "results": [
@@ -56,6 +57,7 @@ def test_complete_summary(tmp_path, runs):
     assert result.returncode == 0, result.stderr
     summary = json.loads((tmp_path / "summary.json").read_text(), parse_constant=lambda value: pytest.fail(f"Nonstandard JSON: {value}"))
     assert len(summary["results"]) == 6
+    assert summary["reference_hash"] == "reference"
     for row in summary["results"]:
         for mode in ("eager", "gpu_busy"):
             assert row[mode]["base_ms"] == 2.0
@@ -98,7 +100,7 @@ def test_invalid_error_cannot_hide_behind_pass_flag(tmp_path, runs, value):
 
 
 @pytest.mark.parametrize("optimized", [False, True])
-@pytest.mark.parametrize("fault", ["environment", "helper", "case", "pass_flag", "scheduler", "missing_gradient"])
+@pytest.mark.parametrize("fault", ["environment", "helper", "reference", "case", "pass_flag", "scheduler", "missing_gradient"])
 def test_validation_survives_optimized_python(tmp_path, runs, optimized, fault):
     """Reject incomplete or mismatched records in both Python execution modes."""
     run = runs["patch-B2"]
@@ -106,6 +108,8 @@ def test_validation_survives_optimized_python(tmp_path, runs, optimized, fault):
         run["torch"] = "different"
     elif fault == "helper":
         run["helper_sha256"] = "different"
+    elif fault == "reference":
+        run["reference_sha256"] = "different"
     elif fault == "case":
         run["results"].pop()
     elif fault == "pass_flag":

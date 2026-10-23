@@ -9,6 +9,7 @@ Cases use 16 or 256 tokens, one head, key/value dimensions 64, and 0/1/64 steep 
 Q/K are normalized random vectors. Q/K/V and erase/write gates use BF16; log gates use FP32.
 Mild log gates are -0.02, steep gates are -6, and erase/write gates are 0.5.
 The output and all six gradients must match a CPU FP64 recurrence within 1% relative Frobenius error.
+The benchmark uses the shared `reference_gdn2.gdn2_reference` oracle.
 
 An untimed diagnostic checks the backward exact-path scheduler counter: zero for mild cases and above one for steep cases.
 It temporarily wraps internal plan methods and restores them before timing. Use this script in a single process.
@@ -76,7 +77,7 @@ Copy the result directory out before removing the container.
 If running against another kernel revision, update the pinned base and compare runtime manifests again.
 Do not use an editable installation that resolves to another checkout. Each JSON records the actual import path and helper hash.
 
-The summarizer checks identical script/environment identities, repeated helper hashes, all six cases, and the FP64 pass flags.
+The summarizer checks identical script/reference hashes and environment identities, repeated helper hashes, all six cases, and the FP64 pass flags.
 It also checks finite errors for the output and all six gradients against the 1% tolerance.
 Timing medians must be finite and positive. Derived measurements must be finite.
 These checks remain active under optimized Python (`-O`). Both scripts write strict JSON.
