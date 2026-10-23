@@ -1279,12 +1279,15 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         # for the measured prefill families below.
         if 100 <= caps.sm_lo < 120 and not (facts.is_fp8 or facts.is_mxfp8) and _selected_d_shape(caps, facts) in ((64, 64), (128, 128), (256, 256)):
             primary = SCHED_NATURAL
+            # The SM100 d64 half THD prefill takes LPT under a sliding window
+            # as well, with or without an attention sink.
+            d64_banded = caps.sm_lo == 100 and (facts.d_qk, facts.d_v) == (64, 64) and facts.causal and facts.window_left is not None
             if (
                 SCHED_LPT in domain
                 and (_prefer_thd_pack_gqa(caps, facts) or (caps.sm_lo == 100 and (facts.d_qk, facts.d_v) == (64, 64) and facts.causal))
-                and facts.window_left is None
+                and (facts.window_left is None or d64_banded)
                 and not facts.right_band_widening
-                and not (facts.has_sink and not _sm107_paged_half(caps, facts))
+                and (not facts.has_sink or _sm107_paged_half(caps, facts) or d64_banded)
             ):
                 # Packing does not remove the causal load imbalance: order the
                 # live token tiles by their GPU-resident lengths. The decoder

@@ -3494,11 +3494,18 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # widths at d64): the decode tile is cga1-only (make_cfg_d64_decode),
             # so a pinned or autotuned cga2 must not reach it through this flag.
             return False
-        if self.thd:
-            return self.packed_thd_split
         pack_g = (self.h_q // self.h_kv) if self.pack_gqa else 1
         # the Q extent: s_q_max once check_support resolved it, the declared Q shape before (the padded tail form's eligibility asks earlier)
         s_q = int(self.s_q_max) if self.s_q_max is not None else int(self.q_desc.shape[2])
+        if self.thd:
+            # Paged THD: the packed split (the combine places the rows) or, unsplit, a declared S_q that fits
+            # one 128-row tile -- FlashInfer's paged extend at up to 128 new tokens per request, where the
+            # 256-row prefill unit would run a dead second sub-tile for every unit. A taller declared S_q
+            # stays on the prefill unit: multi-tile decode units only break even under a sliding window and
+            # lose without one. The ragged (non-paged) K/V leg stays on the prefill tile, whose packed-total
+            # clamped descriptors it needs.
+            fits = self.paged and self.split_kv == 1 and not self.pack_gqa and s_q <= _D64_DECODE_TILE_ROWS
+            return self.packed_thd_split or fits
         return s_q * pack_g <= _D64_DECODE_TILE_ROWS
 
     def _d64_decode_quad(self) -> bool:
@@ -3940,7 +3947,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             return self._split_workspace_bytes()
         if self.thd:
             b = self.batch_size
-            return ws_align((4 * b + 4) * 4) + ws_align((b + 3) * 16 * 8) + (0 if self.has_sink else ws_align(self.h_q * 4))
+            return ws_align(self._thd_meta_words() * 4) + ws_align((b + 3) * 16 * 8) + (0 if self.has_sink else ws_align(self.h_q * 4))
         return 0
 
     def _explicit_compile_kwargs(self) -> dict:
@@ -4623,12 +4630,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         return self.batch_size * ((s_q_decl + cga_tile_m - 1) // cga_tile_m) * self.h_q
 
     def _thd_meta_words(self):
-        from cudnn.frost.tile_dsl.thd import THD_META_WORDS, THD_WORK_META_WORDS
+        from cudnn.frost.tile_dsl.thd import THD_WORK_META_WORDS
 
-        # Workspace queries are legal before compile(). Reserve the split
-        # metadata tail from checked geometry; variants without indexed
-        # lookup leave these B+1 words unused. No compiled module is needed.
-        return THD_WORK_META_WORDS(self.batch_size) if self.packed_thd_split else THD_META_WORDS(self.batch_size)
+        # Workspace queries are legal before compile(). Reserve the work-prefix
+        # tail ([4B+4, 5B+5): the remap-ordered unit prefix the f16 d128-family
+        # prefill / decode kernels and the packed split decode through) for
+        # every THD plan; kernels that still walk the sequences leave these B+1
+        # words unused. No compiled module is needed.
+        return THD_WORK_META_WORDS(self.batch_size)
 
     def _thd_workspace_layout(self):
         b, qh = self.batch_size, self.h_q
@@ -6121,8 +6130,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
     def _prepared_quant_offset(self):
         if self.split_kv > 1:
             return self._split_workspace_bytes()
-        # SM120 has metadata but no per-sequence TMA O descriptor array.
-        return ws_align((4 * self.batch_size + 4) * 4) if self.thd else 0
+        # SM120 has metadata (the work prefix included) but no per-sequence TMA O descriptor array.
+        from cudnn.frost.tile_dsl.thd import THD_WORK_META_WORDS
+
+        return ws_align(THD_WORK_META_WORDS(self.batch_size) * 4) if self.thd else 0
 
     def scratch_workspace_bytes(self) -> int:
         self._ensure_support_checked()
@@ -6146,8 +6157,12 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             # kernel (issue #552). No sinks-dummy chunk: the kernel None-specializes
             # on sinks. No O-descriptor chunk: SM120 stores O with plain
             # guarded GMEM stores, so THD needs no per-sequence tensor maps.
-            b = self.batch_size
-            return ws_align((4 * b + 4) * 4)
+            from cudnn.frost.tile_dsl.thd import THD_WORK_META_WORDS
+
+            # [kv | cu_q | cu_k | remap | live | ctr | unit prefix]: the setup
+            # launch publishes the remap-ordered unit prefix the kernel's unit
+            # decode binary-searches (thd_decode_unit_prefix).
+            return ws_align(THD_WORK_META_WORDS(self.batch_size) * 4)
         if self.split_kv > 1:
             # Split-major partial slabs (see the SM100 sibling): O_s in the O
             # dtype (half) + lse_s fp32, carved from the caller's workspace.

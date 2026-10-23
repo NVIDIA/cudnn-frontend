@@ -2993,9 +2993,9 @@ def test_sm107_gate_lpt_is_bitwise_natural():
 _THD_GATE_CUBIN_RECORD = {
     "nvidia-cutlass-dsl": "4.8.0",
     "dense_gated_bf16_lse": "fde505d05124f3978d1f106b7b47891b",
-    "thd_ungated_bf16_head": "2a3467773a4dfa420660002a49c59fe0",
+    "thd_ungated_bf16_head": "0ef74afd0cc3bf72ed771a4ae7af936c",  # re-recorded: THD unit decode through the work prefix
     # the THD-gated rendering itself (the packed gate map): recorded WITH the descriptor, so the next change to it is seen
-    "thd_gated_bf16_head": "88a6956e90cc110697611583095ac47f",
+    "thd_gated_bf16_head": "f90bfeac779eb29ca384ea3dfe817e4e",  # re-recorded with the ungated twin (same decode change)
 }
 _THD_GATE_CUBIN_RENDERINGS = {
     # (TemplateParams fields the adapter derives on cc 10.7 for the bf16 causal cga2 d256 plan, compile kwargs)
@@ -3413,18 +3413,20 @@ def test_sm107_thd_gate_keyless_sequence_is_exactly_zero_and_a_zero_length_seque
 # them is seen).  Keyed by the DSL that produced them; another toolchain re-records (the probe prints the md5 it saw).
 # Re-recorded under nvidia-cutlass-dsl 4.8.0 after #1547 (one scheduler publisher on the dense CLC path, under `not CFG.THD_VARLEN`):
 # the two dense arms moved on sm_100a and sm_107a alike; the eight THD / paged / gated arms re-rendered byte-identical.
+# Re-recorded under nvidia-cutlass-dsl 4.8.0 for the THD unit decode through the work prefix: the eight THD / paged / gated
+# arms moved on sm_100a and sm_107a alike; the two dense arms re-rendered byte-identical.
 _PAGED_GATE_CUBIN_RECORD = {
     "nvidia-cutlass-dsl": "4.8.0",
     "sm_100a_dense": "7db6daaf02f536bd9fbfd7e36e671fd8",
-    "sm_100a_thd": "71f32b147b7c86af413a227f1c2408a5",
-    "sm_100a_paged_thd": "5f2ccc374d24b90239ab99a8a1d529ff",
-    "sm_100a_paged_thd_pack": "ee82153f5d070035d98e32582d9e30e2",
+    "sm_100a_thd": "d10d4f3814461e315a33778705e1920c",
+    "sm_100a_paged_thd": "066bb542a059b0c1c1083f85f60fddcb",
+    "sm_100a_paged_thd_pack": "a812d2551488e2b3b19177b470003278",
     "sm_107a_dense": "63d9b3efb571b4ba00f3a4625fd280bc",
-    "sm_107a_thd": "b07ad1515c7755c604986b8cd352d768",
-    "sm_107a_paged_thd": "a1651799d5f6116d5726df3667e0a39a",
-    "sm_107a_paged_thd_pack": "9d83e9ff26a04c5c3d0840f85c876c3a",
-    "sm_107a_gated_paged_thd": "71c7923b876901019935a596d15a8e25",
-    "sm_107a_gated_paged_thd_pack": "b076ab4545fe42942a91b5bf0d6ea4d1",
+    "sm_107a_thd": "38403df53e25b064f21b0e0eb3471af3",
+    "sm_107a_paged_thd": "3c106cb810219e1d3f1eab0433049b80",
+    "sm_107a_paged_thd_pack": "cb43d702cddfa33ef699cfbe22441edb",
+    "sm_107a_gated_paged_thd": "d62622a3ced6820bc54c34296c933e37",
+    "sm_107a_gated_paged_thd_pack": "76d2d9014cc9be46a002141c6ce59a4d",
 }
 _PAGED_GATE_BASE = dict(dtype_qkv=2, dtype_o=2, window_right=0, qh_per_kh=4, cta_mma=2)
 _PAGED_GATE_PAGED = dict(_PAGED_GATE_BASE, bottom_right=True, thd_varlen=True, seq_kv_lens_present=True, paged_kv=True, page_size=16)
