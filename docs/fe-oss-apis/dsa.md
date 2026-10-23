@@ -414,10 +414,26 @@ compressed column 0.
   a 16-byte-aligned layout, so the fp32 row stride must be a multiple of 4
   elements and at least `ceil4(S_k)`. When `S_k % 4 != 0` the returned tensor
   is therefore a strided view, not a fresh contiguous copy. A caller-provided
-  `out` must be such a view (`ValueError` otherwise); nothing is staged or
-  copied back. `IndexerForward` takes the contiguous padded
+  `out` that is such a view is bound directly; `indexer_forward_wrapper`
+  stages any other layout of the logical shape through a padded buffer and
+  copies the result back, so the caller's tensor keeps its identity.
+  `IndexerForward` takes the contiguous padded
   `(B, S_q, S_k_padded)` buffer both at construction and in `execute()`, binds
   `out[..., :S_k]` directly, and never writes columns `[S_k, S_k_padded)`.
+- **`clean_logits`** (keyword-only, default `True`) — by default the dense
+  output is filled with `-inf` before the score kernel runs, so every masked
+  position reads `-inf`. `clean_logits=False` (on `indexer_forward_wrapper`
+  and `IndexerForward`) skips that full-tensor write: only each row's
+  ratio-causal prefix `k_local < clamp((q_causal_offsets[b] + q_local + 1) // ratio, 0, seqlen_k_b)`
+  is written, and every other element (masked columns, THD columns beyond a
+  segment's own `seqlen_k_b`, THD rows not covered by `cu_seqlens_q`) is
+  unspecified — stale or uninitialized, possibly NaN. Use it only when every
+  consumer reads each row's causal prefix and nothing else, e.g.
+  `indexer_top_k_wrapper(scores, seq_lens, top_k, next_n=1)` with per-row
+  `seq_lens` no larger than that limit. Under `clean_logits=False` a caller
+  `out` that would be staged and copied back is rejected with `ValueError`:
+  the whole-buffer copy-back costs as much as the skipped fill. The flag is
+  not part of any compile key; one compiled kernel serves both settings.
 - **Strided inputs** — `IndexerForward.check_support()` declines `q`/`k`/`w`
   whose innermost stride is not 1 with `NotImplementedError` (the kernel
   addresses them natively; nothing is repacked), and `execute()` raises

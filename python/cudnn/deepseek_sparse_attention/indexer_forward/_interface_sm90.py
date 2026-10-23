@@ -94,6 +94,7 @@ def indexer_fwd(
     return_lse: bool = False,
     lse_out: Optional[torch.Tensor] = None,
     current_stream=None,
+    clean_logits: bool = True,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Indexer QK forward pass using the direct SM90 CuTe DSL port.
 
@@ -102,6 +103,17 @@ def indexer_fwd(
     ``torch.float8_e4m3fn`` and ``q_scale``/``k_scale`` are FP32 descale
     tensors with one value per token/head.  W may be BF16, or FP32 when it has
     already been pre-scaled by ``q_scale * sm_scale``.
+
+    ``clean_logits=True`` (default) fills ``out`` with ``-inf`` before the
+    kernel runs so every masked position reads ``-inf``. ``clean_logits=False``
+    skips the fill: only columns
+    ``k_local < clamp((q_causal_offsets[b] + q_local + 1) // ratio, 0, seqlen_k_b)``
+    of each row are written; every other element (masked columns, THD columns
+    beyond a segment's ``seqlen_k_b``, THD rows not covered by
+    ``cu_seqlens_q``) is unspecified (stale or uninitialized, possibly NaN).
+    Use it only when every consumer reads each row's causal prefix, e.g.
+    ``indexer_top_k`` with ``next_n=1`` and per-row ``seq_lens`` no larger
+    than that limit. LSE is unaffected. Not part of the compile key.
     """
     precision = precision.lower()
     use_fp8_scales = precision == "fp8"
@@ -269,8 +281,9 @@ def indexer_fwd(
             options=compile_options(),
         )
 
-    with _torch_stream_context(current_stream):
-        out.fill_(float("-inf"))
+    if clean_logits:
+        with _torch_stream_context(current_stream):
+            out.fill_(float("-inf"))
     with torch.cuda.nvtx.range("indexer_fwd_kernel_sm90_direct_dsl"):
         _compile_cache[compile_key](
             q,
