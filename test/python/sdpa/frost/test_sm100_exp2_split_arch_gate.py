@@ -42,7 +42,7 @@ _FLAVORS = [(128, 128), (192, 128), (256, 256), (512, 512)]
 # it, its tuned default; off at cc 10.3: DSv3 dense S=2K 1.17x -> 1.02x of cuDNN, kimi-K3 1.16x -> 1.00x).
 # d128 bf16 / fp16 (2026-10-05, B200 / cuDNN 9.28 control): the kernel's _E2E_* block is a dense-band win and a causal
 # loss (dense +3.9 % alone, causal -1 .. -2.4 %), so the field is ON for the kernel and the kernel itself folds the split
-# out of the causal / sliding-window builds (``_E2E_DENSE_BAND``, see test_d128_f16_folds_the_split_out_of_the_band_builds).
+# out of the dense/nonpaged causal and sliding-window builds. Paged causal THD can separately mix interior tiles.
 _ON = {("mxfp8", (128, 128)), ("fp8", (128, 128)), ("fp8", (192, 128)), ("mxfp8", (192, 128)), ("f16", (192, 128)), ("f16", (128, 128))}
 # Measured on B200 and deliberately OFF.  The ADDITIONAL _E2E_*
 # blocks measured on d192x128 fp8 (dense +1 %, causal -1.6 %) and d192x128 mxfp8 (-3.3..-4.0 % dense) were never
@@ -153,9 +153,8 @@ def test_gated_kernel_module_folds_the_split_on_the_param(kind, flavor, load_kw,
     ids=["causal", "causal_swa", "causal_thd"],
 )
 def test_d128_f16_folds_the_split_out_of_the_band_builds(band_kw):
-    """The d128 f16 kernel takes the cc 10.0 field like the other gated kernels but folds its split OUT of every build
-    with a causal / sliding-window bit in CFG.MASK_FLAGS (``_E2E_DENSE_BAND``): the split measured a loss on those
-    builds on B200.  Padding alone is not a band and keeps the split.  Trace-time only."""
+    """Dense/nonpaged causal and sliding-window builds retain their all-MUFU path. Paged causal THD has a
+    separate interior-tile specialization. Padding alone is not a band and keeps the dense split. Trace-time only."""
     from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
 
     base = dict(dtype_qkv=2, dtype_o=2, cta_mma=2, qh_per_kh=8, exp2_fma_split=True)

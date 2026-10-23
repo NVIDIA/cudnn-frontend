@@ -2274,6 +2274,9 @@ def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page,
         ("d128_split_gqa", "NH", False, 2),
         ("d128_split_gqa", "HN", True, 3),
         ("d128_prefill_b1_default_cga_gqa", "HN", True, 1),
+        ("d128_prefill_default_cga_mixed_gqa", "HN", True, 1),
+        ("d128_prefill_default_cga_mixed_gqa8_gqa", "NH", False, 1),
+        ("d128_prefill_default_cga_mha", "HN", False, 1),
         ("d128_prefill_b1_gqa16_gqa", "HN", True, 1),
         ("d128_prefill_gqa", "padded", False, 1),
         ("d128_split_b1", "HN", False, 4),
@@ -2337,7 +2340,7 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
         h, hk = 16, 1
     elif "_gqa8_" in geometry:
         h, hk = 32, 4
-    elif "_mha_" in geometry:
+    elif "mha" in geometry.split("_"):
         hk = h
     dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
     rng = torch.Generator(device=DEV).manual_seed(191)
@@ -2430,6 +2433,8 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
         g.create_execution_plan(engine, chosen)
         g.build_plan_at_index(g.get_execution_plan_count() - 1)
         api = inspect.getclosurevars(_plan(g)._compiled.default_stream).nonlocals["api"]
+        if "mha" in geometry.split("_"):
+            assert api.h_q == api.h_kv
         workspace_bytes = g.get_workspace_size()
         spec = _plan(g)._prepared.spec
         assert spec.native is not None
