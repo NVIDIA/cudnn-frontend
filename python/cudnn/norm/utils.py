@@ -47,17 +47,13 @@ def fake_rows(dtype, *cols, rows=None, align=16):
     return cute.runtime.make_fake_compact_tensor(dtype, shape, stride_order=tuple(range(len(shape) - 1, -1, -1)), assumed_align=align)
 
 
-def sm_count():
-    """Multiprocessor count of the current device (cached)."""
-    global _SM_COUNT
-    if _SM_COUNT is None:
-        import torch
+def sm_count() -> int:
+    """Multiprocessor count of the build or current CUDA device, cached per device."""
+    from cudnn.frost.device import current_device, multiprocessor_count
 
-        _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
-    return _SM_COUNT
+    return multiprocessor_count(current_device())
 
 
-_SM_COUNT = None
 _COOP_OCC = {}
 COOP_OCC_MAX = 4
 
