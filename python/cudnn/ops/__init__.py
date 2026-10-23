@@ -84,6 +84,8 @@ _LAZY_EXPORTS = {
     "hstu_attention_backward_jax": ("cudnn.hstu.hstu_attention.jax_api", "hstu_attention_backward"),
     "hstu_lmsd_forward_jax": ("cudnn.hstu.hstu_lmsd.jax_api", "hstu_lmsd_forward"),
     "hstu_lmsd_backward_jax": ("cudnn.hstu.hstu_lmsd.jax_api", "hstu_lmsd_backward"),
+    "layer_norm_forward_jax": ("cudnn.norm.jax_api", "layer_norm_forward_jax"),
+    "rms_norm_forward_jax": ("cudnn.norm.jax_api", "rms_norm_forward_jax"),
 }
 
 # Op families are subpackages; they resolve lazily like the ops above.

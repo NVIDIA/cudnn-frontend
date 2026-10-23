@@ -502,19 +502,21 @@ _CTAS_CAP = 0  # test override; 0 = use the formula
 _SM_COUNT = None
 
 
-def _persist_cap(full_ctas, block_threads, wn, ldgs):
+def _persist_cap(full_ctas, block_threads, wn, ldgs, *, multiprocessors=None):
     global _SM_COUNT
     if _CTAS_CAP:
         return min(full_ctas, _CTAS_CAP)
-    if _SM_COUNT is None:
-        import torch
+    if multiprocessors is None:
+        if _SM_COUNT is None:
+            import torch
 
-        _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
+            _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
+        multiprocessors = _SM_COUNT
     if wn > 1:
         mult = max(2, min(16, round(4096 / (block_threads * ldgs))))
     else:
         mult = 8
-    return min(full_ctas, _SM_COUNT * mult)
+    return min(full_ctas, multiprocessors * mult)
 
 
 _KCACHE = {}
@@ -556,14 +558,16 @@ def _pipe_stages(C):
     return 3 if C <= 2048 else _PIPE_STAGES
 
 
-def _pipe_cap(full_ctas, C):
+def _pipe_cap(full_ctas, C, *, multiprocessors=None):
     global _SM_COUNT
-    if _SM_COUNT is None:
-        import torch
+    if multiprocessors is None:
+        if _SM_COUNT is None:
+            import torch
 
-        _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
+            _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
+        multiprocessors = _SM_COUNT
     mult = max(2, min(6, round(16384 / C)))  # >6x overshoots at tiny C (qwen-2048)
-    return min(full_ctas, _SM_COUNT * mult)
+    return min(full_ctas, multiprocessors * mult)
 
 
 def _pipe_eligible(C, wn, has_beta, eb):
