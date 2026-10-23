@@ -220,6 +220,14 @@ _THD_REVERSE_CAUSAL_ROWS = CFG.THD_VARLEN and CFG.MASK_FLAGS == (MASK_CAUSAL | M
 
 @cute.jit
 def _thd_decode_causal(linear_cta, seq_kv_lens_t, n_batch, n_qh, cta_in_pair):
+    """THD unit decode for the padded top-left causal flavors.
+
+    The prefix decode with the rows reversed (the diagonal-heavy tiles of a
+    sequence come first); when a full group of four heads is available, the
+    (head, tile) pair is re-interleaved so consecutive units sweep that group's
+    diagonal tiles together.  Returns ``(q_super, head, batch)``; a unit past
+    the live total keeps ``batch == n_batch``.
+    """
     meta = cutlass.make_array_view(seq_kv_lens_t)
     unit = linear_cta // cutlass.Int32(CFG.CGA_M)
     q_tile, batch, head = thd_decode_unit_prefix(
