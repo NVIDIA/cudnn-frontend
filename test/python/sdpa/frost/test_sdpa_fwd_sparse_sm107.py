@@ -91,6 +91,14 @@ def _kernel_source() -> str:
     return open(path).read()
 
 
+def _item_common_source() -> str:
+    """The visible-set helper both sparse bodies share (sm107/_sparse_item_common.py; the arithmetic that lived in this kernel)."""
+    import cudnn.sdpa.fwd.config_sm107 as c107
+
+    path = os.path.join(os.path.dirname(os.path.abspath(c107.__file__)), "kernels", "sm107", "_sparse_item_common.py")
+    return open(path).read()
+
+
 def _adapter_source() -> str:
     import cudnn.sdpa.fwd.sparse_gqa_sm107 as adapter
 
@@ -900,32 +908,41 @@ def test_sparse_kernel_decode_form_source_pins():
     pointer is fp32 under a split and the per-split LSE is required; no new barrier, SMEM tile or ring wait (the counts stay 15 /
     4 / 11)."""
     code = _code(_kernel_source())
+    common = _code(_item_common_source())  # the visible-set arithmetic lives in the shared helper (one helper for both bodies)
     for name in ("SPLIT_KV = CFG.SPLIT_KV", "LIST_PER_SEQUENCE = CFG.LIST_PER_SEQUENCE", "BOTTOM_RIGHT = CFG.BOTTOM_RIGHT"):
         assert name in code, name
     assert code.count("cutlass.const_expr(SPLIT_KV > 1)") >= 5, "the split arm folds at the decode, the bounds, both list-read sites and the store"
-    assert code.count("cutlass.const_expr(LIST_PER_SEQUENCE == 1)") >= 4 and code.count("cutlass.const_expr(BOTTOM_RIGHT == 1)") == 3
+    # the per-sequence / bottom-right arms fold in the kernel (the decode, the host, the store) AND in the shared helper (as constexpr parameters)
+    assert code.count("cutlass.const_expr(LIST_PER_SEQUENCE == 1)") >= 2 and code.count("cutlass.const_expr(BOTTOM_RIGHT == 1)") == 1
+    assert common.count("cutlass.const_expr(list_per_sequence == 1)") >= 2 and common.count("cutlass.const_expr(bottom_right == 1)") == 2
     assert "live_row = tok < eff_seqlen_q" in code, "under the bottom-right diagonal the store predicate is the Q row's liveness"
     # the prefill form keeps its own tail spelling (one tail id at most) so the dense rendering traces the same program as before
     assert (
-        "n_tail = _select_i32((n_vis % bs) != zero, 1, 0)" in code
-        and "tail = _select_i32((idx == count) & (n_tail != cutlass.Int32(0)), tail_lo, cutlass.Int32(-1))" in code
+        "n_tail = _select_i32((n_vis % bs) != zero, 1, 0)" in common
+        and "tail = _select_i32((idx == count) & (n_tail != cutlass.Int32(0)), tail_lo, cutlass.Int32(-1))" in common
     )
     assert "split = cute.arch.make_warp_uniform(x // seqlen_q)" in code and "tok = x - split * seqlen_q" in code
     assert "return tok, head, batch, item_row, kv_row_base, eff_seqlen_q, out_tok, out_batch, split" in code
-    # the one helper: anchor / tail count / chunk
-    i_ib = code.index("def _item_bounds(")
-    ib = code[i_ib : code.index("\ndef ", i_ib + 1)]
+    # the one helper: the anchor / tail count in the shared helper, the chunk cut here (the tcgen05 geometry)
     for frag in (
         "pos = tok + (eff_seqlen_kv - eff_seqlen_q)",
         "anchor = eff_seqlen_kv - eff_seqlen_q",
         "n_tail = cute.math.max((n_vis + bs - one) // bs - tail_lo, zero)",
+        "return pos, count, n_tail, tail_lo, dead, n_listed, eff_seqlen_kv",
+    ):
+        assert frag in common, frag
+    i_ib = code.index("def _item_bounds(")
+    ib = code[i_ib : code.index("\ndef ", i_ib + 1)]
+    for frag in (
+        "= visible_bounds(",
         "tile0 = split * per + cute.math.min(split, rem)",
         "dead = dead | (n_sp == zero)",
         "n_tiles = cute.math.max(cutlass.Int32(1), n_sp)",
         "return pos, count, n_tail, tail_lo, dead, n_tiles, eff_seqlen_kv, tile0",
     ):
         assert frag in ib, frag
-    assert "tail = _select_i32((rel >= cutlass.Int32(0)) & (rel < n_tail), tail_lo + rel, cutlass.Int32(-1))" in code
+    assert "tail = _select_i32((rel >= cutlass.Int32(0)) & (rel < n_tail), tail_lo + rel, cutlass.Int32(-1))" in common
+    assert "from cudnn.sdpa.fwd.kernels.sm107._sparse_item_common import _select_f32, _select_i32, block_id_at, visible_bounds" in code
     # the list reads offset by the chunk's first tile; the stores at the partial batch
     assert "_gather_block_ids(sIds_raw, slot_base, tile0, w, count, n_tail, tail_lo, dead)" in code
     assert "t_next = tile0 + t_next" in code and "t_abs = tile0 + i" in code
