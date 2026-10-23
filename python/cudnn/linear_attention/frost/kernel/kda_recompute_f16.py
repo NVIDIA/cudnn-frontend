@@ -34,7 +34,7 @@ Algorithm overview (per chunk c, tokens [cC, (c+1)C)):
   KK (register MMA) : W_kk[BT,BT] = K decay @ K inv^T;  L = Beta * tril(W_kk, -1)
   T_inv (register MMA) : T_inv = (I + L)^-1 blockwise, 4x4 diagonal blocks then the 4 -> 8 and 8 -> 16 corrections
   K*state GEMM   : KS[BT,DV] = K decay @ S_prev    (key applied to state)
-  U GEMM         : U[BT,DV]  = T_inv @ Y,  Y = Beta * (V - KS)
+  U GEMM         : U[BT,DV]  = T_inv @ Y,  Y = Beta * (V - KS) (BF16: fp32 residual and Beta multiply, then one Y rounding)
   KV update GEMM : S_upd[DK,DV] = K restore^T @ U   (state update, BT contraction, left then right key half)
 
   Epilogue:
@@ -106,10 +106,10 @@ from cudnn.frost.tile_dsl.pointwise import (
     fadd2,
     fmul2,
     ffma2,
-    mul_f16x2,
     fp32_to_fp16,
-    sub_f16x2,
 )
+
+from ..common.kda_residual import residual_operand
 
 USE_PDL = True
 
@@ -1185,7 +1185,13 @@ def compute1_warp_group(
     bars,
 ) -> None:
     """CG1 warp-group role (warps 8-11): persistent scheduler loop staging the
-    value-side TMEM operands and storing the checkpoint/final states."""
+    value-side TMEM operands and storing the checkpoint/final states.
+
+    Rebuild Y with forward's precision rule: BF16 projection subtraction and
+    beta scaling stay FP32 until packing; FP16 retains packed arithmetic.
+    State-mode and identity-seeded M paths use the same rule without changing
+    checkpoint representation, projection waits or Y publication barriers.
+    """
     nvvm.setmaxregister(
         cfg.num_regs_compute_group_1,
         nvvm.SetMaxRegisterAction.INCREASE if cfg.num_regs_compute_group_1 >= 65536 // cfg.threads_per_cta else nvvm.SetMaxRegisterAction.DECREASE,
@@ -1504,12 +1510,12 @@ def compute1_warp_group(
                         nvvm.MMALayout.COL,
                     )
             bars.mb_beta_ready[raw_index.idx].wait(raw_index.phase)
-            beta_pack = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.rmem)
+            beta_fp32 = cutlass.Array(cutlass.Float32, 8, space=cutlass.AddressSpace.rmem)
             for reg_idx in cutlass.range_constexpr(4):
                 token0 = ((reg_idx // 2) * 4 + (lane_idx & 3)) * 2
                 beta0 = (sBeta_ptr + token0).load().to(cutlass.Float32)
                 beta1 = (sBeta_ptr + token0 + 1).load().to(cutlass.Float32)
-                beta_pack[reg_idx] = fp32_to_fp16(beta0, beta1, dtype=cfg.io_dtype)
+                beta_fp32[2 * reg_idx], beta_fp32[2 * reg_idx + 1] = beta0, beta1
 
             y_lo = [cutlass.Int32(0) for _ in range(4)]
             y_hi = [cutlass.Int32(0) for _ in range(4)]
@@ -1520,24 +1526,42 @@ def compute1_warp_group(
                     state_k_vec_lo = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_lo_addr + statek_col_id, cutlass.Float32), num=2)
                     for reg_idx in cutlass.range_constexpr(4):
                         frag_pair = reg_idx * 2
-                        state_k_lo = fp32_to_fp16(state_k_vec_lo[frag_pair], state_k_vec_lo[frag_pair + 1], dtype=cfg.io_dtype)
-                        y_lo[reg_idx] = mul_f16x2(beta_pack[reg_idx], sub_f16x2(raw_v_frag_lo[reg_idx], state_k_lo, cfg.io_dtype), cfg.io_dtype)
+                        y_lo[reg_idx] = residual_operand(
+                            raw_v_frag_lo[reg_idx],
+                            state_k_vec_lo[frag_pair],
+                            state_k_vec_lo[frag_pair + 1],
+                            beta_fp32[2 * reg_idx],
+                            beta_fp32[2 * reg_idx + 1],
+                            dtype=cfg.io_dtype,
+                        )
                     if cutlass.const_expr(cfg.d_v == 128):
                         state_k_vec_hi = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_hi_addr + statek_col_id, cutlass.Float32), num=2)
                         for reg_idx in cutlass.range_constexpr(4):
                             frag_pair = reg_idx * 2
-                            state_k_hi = fp32_to_fp16(state_k_vec_hi[frag_pair], state_k_vec_hi[frag_pair + 1], dtype=cfg.io_dtype)
-                            y_hi[reg_idx] = mul_f16x2(beta_pack[reg_idx], sub_f16x2(raw_v_frag_hi[reg_idx], state_k_hi, cfg.io_dtype), cfg.io_dtype)
+                            y_hi[reg_idx] = residual_operand(
+                                raw_v_frag_hi[reg_idx],
+                                state_k_vec_hi[frag_pair],
+                                state_k_vec_hi[frag_pair + 1],
+                                beta_fp32[2 * reg_idx],
+                                beta_fp32[2 * reg_idx + 1],
+                                dtype=cfg.io_dtype,
+                            )
                 else:
                     for reg_idx in cutlass.range_constexpr(4):
-                        y_lo[reg_idx] = mul_f16x2(beta_pack[reg_idx], raw_v_frag_lo[reg_idx], cfg.io_dtype)
+                        y_lo[reg_idx] = residual_operand(
+                            raw_v_frag_lo[reg_idx], None, None, beta_fp32[2 * reg_idx], beta_fp32[2 * reg_idx + 1], dtype=cfg.io_dtype
+                        )
                         if cutlass.const_expr(cfg.d_v == 128):
-                            y_hi[reg_idx] = mul_f16x2(beta_pack[reg_idx], raw_v_frag_hi[reg_idx], cfg.io_dtype)
+                            y_hi[reg_idx] = residual_operand(
+                                raw_v_frag_hi[reg_idx], None, None, beta_fp32[2 * reg_idx], beta_fp32[2 * reg_idx + 1], dtype=cfg.io_dtype
+                            )
             else:
                 for reg_idx in cutlass.range_constexpr(4):
-                    y_lo[reg_idx] = mul_f16x2(beta_pack[reg_idx], raw_v_frag_lo[reg_idx], cfg.io_dtype)
+                    y_lo[reg_idx] = residual_operand(raw_v_frag_lo[reg_idx], None, None, beta_fp32[2 * reg_idx], beta_fp32[2 * reg_idx + 1], dtype=cfg.io_dtype)
                     if cutlass.const_expr(cfg.d_v == 128):
-                        y_hi[reg_idx] = mul_f16x2(beta_pack[reg_idx], raw_v_frag_hi[reg_idx], cfg.io_dtype)
+                        y_hi[reg_idx] = residual_operand(
+                            raw_v_frag_hi[reg_idx], None, None, beta_fp32[2 * reg_idx], beta_fp32[2 * reg_idx + 1], dtype=cfg.io_dtype
+                        )
 
             y_input_pack_lo = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.rmem)
             y_input_pack_hi = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.rmem)
@@ -1707,26 +1731,18 @@ def compute1_warp_group(
             if cutlass.const_expr(cfg.d_v == 128):
                 state_k_vec_hi = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_hi_addr + statek_col_id, cutlass.Float32), num=2)
 
-            beta_pack = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.rmem)
+            beta_fp32 = cutlass.Array(cutlass.Float32, 8, space=cutlass.AddressSpace.rmem)
             for reg_idx in cutlass.range_constexpr(4):
                 token0 = ((reg_idx // 2) * 4 + (lane_idx & 3)) * 2
                 beta0 = (sBeta_ptr + token0).load().to(cutlass.Float32)
                 beta1 = (sBeta_ptr + token0 + 1).load().to(cutlass.Float32)
-                beta_pack[reg_idx] = fp32_to_fp16(beta0, beta1, dtype=cfg.io_dtype)
+                beta_fp32[2 * reg_idx], beta_fp32[2 * reg_idx + 1] = beta0, beta1
             y_input_pack_lo = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.rmem)
             for reg_idx in cutlass.range_constexpr(4):
                 frag_pair = reg_idx * 2
                 state_k_val0, state_k_val1 = state_k_vec_lo[frag_pair], state_k_vec_lo[frag_pair + 1]
-                state_k_pair = fp32_to_fp16(state_k_val0, state_k_val1, dtype=cfg.io_dtype)
-                diff_pair = sub_f16x2(
-                    raw_v_frag_lo[reg_idx],
-                    state_k_pair,
-                    cfg.io_dtype,
-                )
-                y_input_pack_lo[reg_idx] = mul_f16x2(
-                    beta_pack[reg_idx],
-                    diff_pair,
-                    cfg.io_dtype,
+                y_input_pack_lo[reg_idx] = residual_operand(
+                    raw_v_frag_lo[reg_idx], state_k_val0, state_k_val1, beta_fp32[2 * reg_idx], beta_fp32[2 * reg_idx + 1], dtype=cfg.io_dtype
                 )
 
             y_input_pack_hi = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.rmem)
@@ -1734,16 +1750,8 @@ def compute1_warp_group(
                 for reg_idx in cutlass.range_constexpr(4):
                     frag_pair = reg_idx * 2
                     state_k_val0, state_k_val1 = state_k_vec_hi[frag_pair], state_k_vec_hi[frag_pair + 1]
-                    state_k_pair = fp32_to_fp16(state_k_val0, state_k_val1, dtype=cfg.io_dtype)
-                    diff_pair = sub_f16x2(
-                        raw_v_frag_hi[reg_idx],
-                        state_k_pair,
-                        cfg.io_dtype,
-                    )
-                    y_input_pack_hi[reg_idx] = mul_f16x2(
-                        beta_pack[reg_idx],
-                        diff_pair,
-                        cfg.io_dtype,
+                    y_input_pack_hi[reg_idx] = residual_operand(
+                        raw_v_frag_hi[reg_idx], state_k_val0, state_k_val1, beta_fp32[2 * reg_idx], beta_fp32[2 * reg_idx + 1], dtype=cfg.io_dtype
                     )
 
             nvvm.tcgen05_st("16x128b", nvvm.make_tmem_ptr(row_lo_addr + y_input_col_id, cutlass.Int8), y_input_pack_lo[0:4])

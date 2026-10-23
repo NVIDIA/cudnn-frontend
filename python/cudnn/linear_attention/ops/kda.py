@@ -1282,6 +1282,12 @@ def kimi_delta_attention(
     and ``final_state`` and the state gradients (``d_final_state``,
     ``d_initial_state``) follow it.
 
+    FROST BF16 paths retain FP32 projection residuals and apply beta in FP32
+    before rounding the Y operand. Prep-fed paths already fold beta into their
+    records and round only after the FP32 residual subtraction. This does not
+    upgrade the MMA operands, chunk inverse, or checkpoint storage to FP32;
+    FP16 retains the existing packed residual arithmetic.
+
     Args:
         g: per-key-channel decay: log-space by default (``alpha = exp(g) in
             (0, 1]^K``), the linear decay ``alpha`` itself when
@@ -2040,6 +2046,10 @@ def kimi_delta_attention_summary(
     M_buf + X_H`` and ``X_dh0 = X_dht @ M_buf^T + X_G``.  Both outputs are non-differentiable.  THD layout and gate
     semantics match :func:`kimi_delta_attention` (k ``[total_tokens, HK, K]``, v ``[total_tokens, HV, V]``, g
     ``[total_tokens, HO, K]`` per-key-channel log decay, beta ``[total_tokens, HO]``, cu_seqlens ``[N+1]``); ``initial_state`` is float32.
+
+    FROST BF16 H/M projection accumulators, residual subtraction and beta
+    multiplication remain FP32 until the Y operand is rounded to BF16. MMA
+    operands and the chunk inverse are not upgraded; FP16 arithmetic is unchanged.
 
     Args:
         use_beta_sigmoid_in_kernel: apply ``sigmoid(beta)`` in the kernel; ``beta`` then holds raw logits.
