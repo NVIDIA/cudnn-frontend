@@ -109,7 +109,7 @@ def _forward_call(config):
         )
     dtype = {"bf16": jnp.bfloat16, "fp16": jnp.float16, "fp32": jnp.float32}[config.dtype]
     stats = jax.ShapeDtypeStruct((spec.R,), jnp.float32)
-    outputs = (jax.ShapeDtypeStruct((spec.R, spec.M), dtype),) + (stats,) * (2 if spec.has_mean else 1)
+    outputs = (jax.ShapeDtypeStruct((spec.R, spec.M), dtype), stats if spec.has_mean else None, stats)
     return call(launch, output_shape_dtype=outputs, use_static_tensors=True)
 
 
@@ -119,7 +119,7 @@ def _backward_call(config):
 
     spec = config.spec
     with build_device(config.device):
-        launch, partial_shapes = make_backward(
+        launch, partial_shape = make_backward(
             spec.R,
             spec.M,
             config.dtype,
@@ -129,17 +129,24 @@ def _backward_call(config):
         )
     dtype = {"bf16": jnp.bfloat16, "fp16": jnp.float16, "fp32": jnp.float32}[config.dtype]
     parameter = jax.ShapeDtypeStruct((spec.M,), jnp.float32)
-    outputs = (jax.ShapeDtypeStruct((spec.R, spec.M), dtype), parameter) + ((parameter,) if config.has_beta else ())
-    outputs += tuple(jax.ShapeDtypeStruct(shape, jnp.float32) for shape in partial_shapes)
-    initialized = {index: zeros_init for index in range(1, 3 if config.has_beta else 2)}
+    partials = jax.ShapeDtypeStruct(partial_shape, jnp.float32) if partial_shape is not None else None
+    outputs = (
+        jax.ShapeDtypeStruct((spec.R, spec.M), dtype),
+        parameter,
+        parameter if config.has_beta else None,
+        partials,
+        partials if config.has_beta else None,
+    )
+    initialized = {1: zeros_init}
+    if config.has_beta:
+        initialized[2] = zeros_init
     return call(launch, output_shape_dtype=outputs, initialized_outputs=initialized, use_static_tensors=True)
 
 
 def _forward(config, x, weight, bias):
     gamma = jnp.ones((config.spec.M,), dtype=x.dtype) if weight is None else weight.reshape(-1)
     beta = gamma if bias is None else bias.reshape(-1)
-    y, *stats = _forward_call(config)(x.reshape(config.spec.R, config.spec.M), gamma, beta)
-    mean, rstd = stats if config.spec.has_mean else (stats[0], stats[0])
+    y, mean, rstd = _forward_call(config)(x.reshape(config.spec.R, config.spec.M), gamma, beta)
     return y.reshape(x.shape), (x, weight, bias, gamma, mean, rstd)
 
 
@@ -151,9 +158,9 @@ def _normalize(config, x, weight, bias):
 def _backward(config, residual, dy):
     x, weight, bias, gamma, mean, rstd = residual
     shape = (config.spec.R, config.spec.M)
-    dx, dgamma, *rest = _backward_call(config)(dy.reshape(shape), x.reshape(shape), gamma, mean, rstd)
+    dx, dgamma, dbeta, _, _ = _backward_call(config)(dy.reshape(shape), x.reshape(shape), gamma, mean, rstd)
     dweight = None if weight is None else dgamma.reshape(weight.shape).astype(weight.dtype)
-    dbias = None if bias is None else rest[0].reshape(bias.shape).astype(bias.dtype)
+    dbias = None if bias is None else dbeta.reshape(bias.shape).astype(bias.dtype)
     return dx.reshape(x.shape), dweight, dbias
 
 
