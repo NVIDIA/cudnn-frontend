@@ -396,16 +396,16 @@ The K columns are assumed to be a compressed-KV prefix starting at global
 compressed column 0.
 
 - **Inputs**
-  - `q`: `(B, S_q, H_q, D)` BF16, or the architecture-specific FP8 format
-    described below.
-  - `k`: `(B, S_k, H_kv, D)` BF16, or the architecture-specific FP8 format
-    described below.
+  - `q`: `(B, S_q, H_q, D)` BF16, or the architecture-specific FP8 or FP4
+    format described below (packed FP4 stores `D // 2` per row).
+  - `k`: `(B, S_k, H_kv, D)` BF16, or the architecture-specific FP8 or FP4
+    format described below.
   - `w`: `(B, S_q, H_q)` BF16 or FP32 with BF16 Q/K, on SM90 and SM100.
     FP32 head weights retain their precision through score generation, without
     changing the Q/K dtype; FP32 W requires unit stride in its last dimension.
     Unsupported strides are rejected instead of copied. The SM90 FP8 path also
     accepts FP32 when weights have already been pre-scaled by
-    `q_scale * sm_scale`; SM100 MXFP8 requires BF16 weights.
+    `q_scale * sm_scale`; SM100 MXFP8 and MXFP4 require BF16 weights.
   - `q_causal_offsets` (optional): CUDA INT32 tensor with one entry per
     batch/THD segment, on the same device as `q`.
 - **Output** — `scores`: `(B, S_q, S_k)` FP32. On SM100 this is the
@@ -428,7 +428,9 @@ compressed column 0.
 - **Scope** — FP32 weights are supported by Indexer Forward and Combined
   Indexer Forward + Top-K. The separate indexer score-recompute and backward
   APIs still require BF16 weights.
-- **Precision paths**
+- **Precision paths** — selected by `precision` on `indexer_forward_wrapper`
+  and `indexer_forward_top_k_wrapper`; the `IndexerForward` class is
+  BF16-only.
   - SM90 `precision="fp8"`: Q/K use E4M3 and `q_scale`/`k_scale` are FP32
     descales with one value per token/head. Set `return_lse=True` (or provide
     `lse_out`) to compute LSE in the same kernel invocation.
@@ -446,15 +448,32 @@ compressed column 0.
     packed-row alignment (each Q span times `qhead_per_kv_head` is a multiple
     of 128 rows; each K span is a multiple of 128 tokens), and stays within
     the packed scale storage.
+  - SM100 `precision="mxfp4"`: Q/K are `torch.float4_e2m1fn_x2`, two E2M1
+    values per byte with element `2i` in the low nibble, so their last dim is
+    `D // 2` (64); a packed `uint8` buffer passes zero-copy through
+    `.view(torch.float4_e2m1fn_x2)`. `q_scale`/`k_scale` are the MXFP8 E8M0
+    scales unchanged: one per 32 head_dim values, so `D // 32` (4) per row
+    although the last dim is `D // 2`, in the same packed layout, built
+    from logical `(..., D // 32)` scales by the packers in
+    `cudnn.deepseek_sparse_attention.utils.sm100.mxfp8_scale_utils`:
+    `pack_q_scale_bshd`/`pack_k_scale_bshd` for BSHD, and
+    `pack_q_scale_thd`/`pack_k_scale_thd` into a caller-provided `out` with
+    prefixes from `make_scale_cu_seqlens_padded` for THD.
+    `sf_vec_size` is fixed at 32, and THD inputs take the same
+    `cu_seqlens_q_scale_padded`/`cu_seqlens_k_scale_padded` scale-prefix
+    contract. Its kernel differs from the MXFP8 one only in the MMA:
+    tcgen05 `kind::mxf4`, K = 64 per MMA. Requires a PyTorch build with
+    `torch.float4_e2m1fn_x2`; otherwise `precision="mxfp4"` raises
+    `NotImplementedError`.
 - **Constraints** — `head_dim == 128`. The SM90 direct path supports
   `qhead_per_kv_head ∈ {16, 32, 64}` and currently requires `H_kv == 1`;
   SM100 BF16 dense and combined Top-K paths support
   `qhead_per_kv_head ∈ {4, 8, 16, 32, 64}` (a group packs up to 8 query
   tokens per MMA tile: 4 heads x 8 tokens = 32 columns, ..., 64 heads x 2
-  tokens = 128), their MXFP8 paths the same set at a fixed 128-row tile
-  (4 heads x 32 tokens, ..., 64 heads x 2 tokens). All currently require
-  `H_kv == 1` (MQA). A query may be up to `ratio - 1` tokens longer than
-  `ratio * seqlen_k` (its trailing tokens have not completed a compressed
+  tokens = 128), their MXFP8 and MXFP4 paths the same set at a fixed
+  128-row tile (4 heads x 32 tokens, ..., 64 heads x 2 tokens). All currently
+  require `H_kv == 1` (MQA). A query may be up to `ratio - 1` tokens longer
+  than `ratio * seqlen_k` (its trailing tokens have not completed a compressed
   block and score the complete blocks only); a longer one is refused.
 
 ```python
@@ -480,25 +499,27 @@ reproducible across launches. This does not sort the output slots; the default
 `False` path retains the faster scheduling-dependent tie-break.
 
 The combined compressed path is SM100-only. Both BSHD and THD support
-BF16 Q/K with BF16 or FP32 weights, and MXFP8 Q/K with BF16 weights.
+BF16 Q/K with BF16 or FP32 weights, and MXFP8 or MXFP4 Q/K with BF16 weights.
 `topk_indices_global=True` is the default. Optional caller-owned
 candidate/output/softmax/LSE buffers avoid per-call allocations; size the
 candidate buffer with `compress_topk_cand_buffer_size` for BSHD or
 `compress_topk_cand_buffer_size_thd` for THD. LSE is supported for BSHD and THD
-with both BF16 and MXFP8. Explicit microbatching is BF16 BSHD-only and cannot
+with BF16, MXFP8, and MXFP4. Explicit microbatching is BF16 BSHD-only and cannot
 be combined with LSE or explicit `q_causal_offsets`. BSHD with explicit
 `q_causal_offsets` currently computes its per-batch candidate offsets eagerly
 and is not CUDA-graph-capturable; THD capture requires the caller-provided
 offsets and buffers returned by `compress_topk_cand_buffer_size_thd`. Compact
 addressing requires `0 <= q_causal_offsets[b]`; rows extending beyond the KV
-prefix are clamped to `seqlen_k_b`. THD MXFP8 uses the same caller-guaranteed
-device-side scale-prefix contract described in §3; the interface does not
-validate prefix values with a device-to-host copy.
+prefix are clamped to `seqlen_k_b`. THD MXFP8 and MXFP4 use the same
+caller-guaranteed device-side scale-prefix contract described in §3; the
+interface does not validate prefix values with a device-to-host copy.
 
 Leave `microbatch_rows=-1` to use the BSHD long-sequence memory policy; it
 enables windowing only for compatible BF16 shapes. Pass `0` to force one
 launch, or a positive value only when deliberately controlling the scratch
-footprint, and pass the same value to `compress_topk_cand_buffer_size`.
+footprint. Size the buffer with the launch's `microbatch_rows` and
+`precision`: `compress_topk_cand_buffer_size` sizes MXFP8 and MXFP4 launches,
+which never microbatch, for one full launch.
 
 Global versus local ids is primarily an interoperability and allocation
 choice, not an Indexer Backward tuning choice. Keep the default global ids
@@ -514,6 +535,7 @@ conversion when comparing end-to-end performance.
 ```python
 cand_floats = DSA.compress_topk_cand_buffer_size(
     B, S_q, S_k, ratio=4, return_lse=True,
+    precision="bf16",  # must match the launch
 )
 cand = torch.empty(cand_floats, dtype=torch.float32, device=q.device)
 
@@ -695,6 +717,13 @@ while dense indexer score recompute runs it with `compute_lse=True` and a live
 Dense Attention Score Recompute has a separate MXFP8 kernel because its score
 and normalization semantics differ from the indexer path.
 
+- **Precision** — on SM100, `dense_indexer_score_recompute_wrapper` takes
+  `precision="bf16"`, `"mxfp8"`, or `"mxfp4"` with the Q/K and scale
+  contract of Indexer Forward (§3); its block-scaled precisions require
+  `qhead_per_kv_head ∈ {32, 64}`. `dense_attn_score_recompute_wrapper` takes
+  `"bf16"` or `"mxfp8"` and rejects `"mxfp4"`. The
+  `DenseIndexerScoreRecompute` and `DenseAttnScoreRecompute` classes, and
+  SM90, are BF16-only.
 - **Layouts** — BSHD on SM90 and SM100+. THD packed (`cu_seqlens_q`/`cu_seqlens_k`
   with `q`: `(total_q, H_q, D)`, `out`: `(total_q, max_seqlen_k)`) on SM100+ only:
   SM90 declines THD in `check_support()` with `NotImplementedError` because its
@@ -798,8 +827,8 @@ forward used `topk_indices_global=False`. The public sparse
 `indexer_backward_wrapper` has a
 BSHD-shaped interface; BF16 THD tensors can use zero-copy `B=1` views (squeeze
 the singleton K head and add a batch dimension) together with global Top-K
-indices. FP8 and MXFP8 indexer backward are not currently supported because
-the backward wrapper requires BF16 Q/K/W inputs.
+indices. FP8, MXFP8, and MXFP4 indexer backward are not currently supported
+because the backward wrapper requires BF16 Q/K/W inputs.
 
 For the default SM100 backend, `topk_indices_global` describes the input
 encoding; it is not a performance-tuning switch. When Gather4 is available,
@@ -988,16 +1017,17 @@ result = DSA.dense_indexer_backward_wrapper(
   uses a feature-local LLVM inline-assembly bridge with the compiler-owned TMA
   descriptor; the issued data movement remains hardware TMA `gather4`.
 - **Indexer Forward only supports `head_dim = 128`**. SM90 supports
-  `qhead_per_kv_head ∈ {16, 32, 64}` with `H_kv = 1`; SM100 BF16 and MXFP8
-  support `qhead_per_kv_head ∈ {4, 8, 16, 32, 64}`. Both the dense and
-  combined Top-K paths require `H_kv = 1`.
+  `qhead_per_kv_head ∈ {16, 32, 64}` with `H_kv = 1`; SM100 BF16, MXFP8, and
+  MXFP4 support `qhead_per_kv_head ∈ {4, 8, 16, 32, 64}`. Both the dense and
+  combined Top-K paths require `H_kv = 1`. MXFP4 runs on the SM100-family
+  capabilities 10.0, 10.3, and 10.7 (no SM90 path).
 - **Standalone Top-K only up to 2048**; `top_k > 2048` is not supported by
   its radix Top-K kernel. The combined compressed path uses a separate stage-2
   implementation.
 - **Compressed-path limits** — the stage-1 compact score kernel is MQA-only
-  (`H_kv = 1`); MXFP8 keeps its 128-row tile for every head group; explicit
-  microbatching cannot be combined with MXFP8, LSE, or explicit per-batch
-  causal offsets.
+  (`H_kv = 1`); MXFP8 and MXFP4 keep their 128-row tile for every head
+  group; explicit microbatching cannot be combined with MXFP8, MXFP4, LSE, or
+  explicit per-batch causal offsets.
 
 
 ## Native PyTorch training composition
