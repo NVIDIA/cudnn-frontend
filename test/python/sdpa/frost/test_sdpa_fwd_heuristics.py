@@ -848,6 +848,25 @@ def test_rubin_mxfp8_row_names_its_thd_and_paged_gap(sm107_metadata_target):
 
 
 @pytest.mark.L0
+def test_sm100_mxfp8_row_serves_a_ragged_mask_free_kv_tail():
+    """The SM100 MXFP8 row admits a dense, mask-free S_kv off the 128-key tile (skv_tail_via_padding); the lowering
+    predicate selects that graph and not a covered causal tail or real per-batch lengths; the split gate keeps it
+    unsplit."""
+    caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
+    sm100 = caps[engines.engine_name(mxfp8=True)]
+    quant = dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_mxfp8=True)
+    ragged = dict(s_q=2100, s_kv=2100, causal=False, **quant)
+    assert sm100.skv_tail_via_padding
+    assert engines.mismatch(sm100, _facts(**ragged)) is None
+    assert engines._synth_kv_padding(sm100, _facts(**ragged))
+    assert not engines._synth_kv_padding(sm100, _facts(**dict(ragged, causal=True)))
+    assert not engines._synth_kv_padding(sm100, _facts(padded=True, **ragged))
+    assert engines.mismatch(sm100, _facts(**dict(ragged, causal=True))) is None
+    why = engines.mismatch(sm100, _facts(**ragged), engines.SdpaFwdKnobs(split_kv=2))
+    assert why is not None and "split_kv" in why
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("kind", ["A", "FALLBACK"])
 def test_rubin_d256_mxfp8_masked_sets_stay_in_the_flavor_sched_domain(kind, sm107_metadata_target):
     """The measured D256 picker says LPT for a masked block-scale graph; the cc 10.7 MXFP8 row claims NATURAL only at

@@ -389,6 +389,7 @@ from cudnn.sdpa.fwd.kernels._common_blackwell import (
     make_sdpa_helpers,
     assert_tile_n_supported,
     sanitize_mxfp8_thd_v_sf_padding,
+    sanitize_mxfp8_v_sf_padding_pair,
 )
 
 assert_tile_n_supported(CFG)
@@ -522,6 +523,9 @@ _FP32_PARTIALS = SPLIT_KV > 1
 MAY_BE_EMPTY = _split_h.MAY_BE_EMPTY
 
 PAGED_KV = bool(CFG.PAGED_KV)
+# Replace the tail tile's fully padded V scale blocks before BMM2: THD, and the padded mask compiled against the scalar
+# S_kv with no lengths buffer (kv_tail_mask).  Not in the BF16-PV build, which has no V scale slab (sV_SF aliases sK_SF).
+SANITIZE_V_SF_TAIL: bool = (not CFG.PV_BF16) and (bool(CFG.THD_VARLEN) or ((CFG.MASK_FLAGS & MASK_PADDED) != 0 and not CFG.SEQ_KV_LENS_PRESENT))
 PAGE_SIZE = CFG.PAGE_SIZE if PAGED_KV else 0
 if PAGED_KV and PAGE_SIZE % CFG.TILE_N != 0:
     # A page holds whole 128-row F8_128x4 SF atoms (config_sm100 cannot tell MXFP8 from per-tensor FP8).
@@ -1164,6 +1168,7 @@ def _kernel(
                     n_batch=n_batch,
                     mcast_mask=mcast_mask,
                     cta_in_pair=cta_in_pair,
+                    leader_cta_id=leader_cta_id,
                 )
             else:
                 _mma_warp_quiet(
@@ -1202,6 +1207,7 @@ def _kernel(
                 n_batch=n_batch,
                 mcast_mask=mcast_mask,
                 cta_in_pair=cta_in_pair,
+                leader_cta_id=leader_cta_id,
             )
 
     elif warp_idx == CFG.TMALDG_WARP_ID:
@@ -1821,6 +1827,7 @@ def _mma_warp_group(
     n_batch,
     mcast_mask,
     cta_in_pair,
+    leader_cta_id,
 ):
     """Leader MMA warp — block-scale MMA stream for BMM1 + BMM2.
 
@@ -2196,8 +2203,10 @@ def _mma_warp_group(
                         _utccp_bmm2_p_sf(tmem_SF_P0, desc_P_SF_0)
 
                 bars.mb_v_full[old_state.idx].wait(old_state.phase)
-                if cutlass.const_expr(CFG.THD_VARLEN):
-                    sanitize_mxfp8_thd_v_sf_padding(sV_SF[old_state.idx], kv_loop - cutlass.Int32(1), eff_seqlen_kv)
+                if cutlass.const_expr(SANITIZE_V_SF_TAIL):
+                    sanitize_mxfp8_v_sf_padding_pair(
+                        sV_SF[old_state.idx], kv_loop - cutlass.Int32(1), eff_seqlen_kv, leader_cta_id + cutlass.Int32(1), CFG.CTA_MMA
+                    )
                 desc_V = sV[old_state.idx].desc()
                 desc_V_SF = sV_SF[old_state.idx].desc()
                 is_not_first_bmm2 = cutlass.Boolean(kv_loop != (kv_left + cutlass.Int32(1)))
@@ -2316,8 +2325,8 @@ def _mma_warp_group(
                     if nvvm.elect_sync():
                         _utccp_bmm2_p_sf(tmem_SF_P0, desc_P_SF_0)
             bars.mb_v_full[kv_state.idx].wait(kv_state.phase)
-            if cutlass.const_expr(CFG.THD_VARLEN):
-                sanitize_mxfp8_thd_v_sf_padding(sV_SF[kv_state.idx], kv_right - cutlass.Int32(1), eff_seqlen_kv)
+            if cutlass.const_expr(SANITIZE_V_SF_TAIL):
+                sanitize_mxfp8_v_sf_padding_pair(sV_SF[kv_state.idx], kv_right - cutlass.Int32(1), eff_seqlen_kv, leader_cta_id + cutlass.Int32(1), CFG.CTA_MMA)
             desc_V = sV[kv_state.idx].desc()
             desc_V_SF = sV_SF[kv_state.idx].desc()
             is_not_first_bmm2_epi = cutlass.Boolean((kv_right - kv_left) != cutlass.Int32(1))

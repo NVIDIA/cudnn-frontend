@@ -65,6 +65,31 @@ def sanitize_mxfp8_thd_v_sf_padding(sv_sf, kv_tile_idx, seqlen_kv):
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
 
 
+@cute.jit
+def sanitize_mxfp8_v_sf_padding_pair(sv_sf, kv_tile_idx, seqlen_kv, peer_cta_id, cta_group: cutlass.Constexpr[int]):
+    """Replace the fully padded V scale blocks in this CTA's slab and, under ``cta_group`` 2, in the peer CTA's slab at
+    the same offset through cluster-mapped loads and stores.
+
+    Called by the leader's MMA warp after its ``mb_v_full`` wait and before the ``tcgen05.cp`` that reads each CTA's
+    slab into that CTA's tensor memory; the peer runs no MMA warp of its own.
+    """
+    sanitize_mxfp8_thd_v_sf_padding(sv_sf, kv_tile_idx, seqlen_kv)
+    if cutlass.const_expr(cta_group == 2):
+        remaining = seqlen_kv - kv_tile_idx * cutlass.Int32(128)
+        valid_blocks = (remaining + cutlass.Int32(31)) // cutlass.Int32(32)
+        if valid_blocks < cutlass.Int32(4):
+            lane = cute.arch.thread_idx()[0] % cutlass.Int32(32)
+            keep_mask = (cutlass.Int32(1) << (valid_blocks * cutlass.Int32(8))) - cutlass.Int32(1)
+            fill_mask = cutlass.Int32(0x7F7F7F7F) & ~keep_mask
+            for row_group in cutlass.range_constexpr(4):
+                byte_offset = lane * cutlass.Int32(16) + cutlass.Int32(row_group * 4)
+                peer_word = nvvm.mapa(sv_sf.base.subview(byte_offset), peer_cta_id).ir_value()
+                old = nvvm.inline_ptx("ld.shared::cluster.b32 $0, [$1];", write_only_types=[cutlass.Int32], read_only_args=[peer_word])
+                nvvm.inline_ptx("st.shared::cluster.b32 [$0], $1;", read_only_args=[peer_word, (old & keep_mask) | fill_mask])
+            nvvm.inline_ptx("fence.proxy.async.shared::cluster;")
+            nvvm.bar_warp_sync(cute.arch.FULL_MASK)
+
+
 class Bars(NamedTuple):
     mb_q_full: object
     mb_q_empty: object
