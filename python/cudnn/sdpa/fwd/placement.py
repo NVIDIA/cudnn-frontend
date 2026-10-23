@@ -722,6 +722,26 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
             return TRAIL
         return TRAIL  # d64 / d128 / d192: the backend decode engine is ahead (1.04-2.4x)
     # prefill-shaped
+    # Full/near-full paged prefill benefits from the existing packed unsplit
+    # recommendation too; keep longer prefixes on the split-selection path.
+    if (
+        512 <= facts.s_q <= 8192
+        and facts.device_cc == (10, 0)
+        and facts.dtype == cudnn.data_type.BFLOAT16
+        and (facts.d_qk, facts.d_v) == (128, 128)
+        and facts.thd
+        and facts.has_paged_kv
+        and facts.page_size == 16
+        and 1 <= facts.b <= 4
+        and 16 <= facts.h_q <= 64
+        and facts.h_q in (4 * facts.h_kv, 8 * facts.h_kv)
+        and facts.s_q <= facts.s_kv <= 2 * facts.s_q
+        and facts.bottom_right
+        and facts.window_left is None
+        and not (facts.has_sink or facts.right_band_widening)
+        and _prefer_thd_pack_gqa(caps, facts)
+    ):
+        return LEAD
     if _in_paged_d256_prefill_domain(facts) or _d128_one_decode_tile_wave(caps, facts):
         return LEAD
     if (
