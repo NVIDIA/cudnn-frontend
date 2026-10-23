@@ -22,6 +22,13 @@ ring capacity, the launch is ONE kernel with no allocation, and every refusal is
 The RoPE table is the CEILING on positions in both forms: a committed row at or past it (completing or not) reports ``-2`` and
 writes nothing -- no ring row, no block -- while the row below the ceiling is served; the cache capacity is not the ceiling (a
 position past the cache inside the table is served, and only a block past the cache is ``-2``).
+
+The e4m3 STORE arm (``index_cache_dtype=torch.float8_e4m3fn``; sm_89+ -- the cells skip below it and are UNCOVERED there): the dense
+and the paged step arms on the SAME token stream write rows BITWISE each other and bitwise the bf16 arm's rows ``.to(float8_e4m3fn)``
+(the e4m3 cast of the bf16 row: one rounding convention across every writer), the slot reports identical, the ring untouched in bf16, the
+block completing at the 4th token and the page boundaries served; the e4m3 artifact distinct from the bf16 one; the dtype refusals both
+ways (an e4m3 cache under a bf16 recipe and a bf16 cache under an e4m3 recipe name the recipe's dtype; an e4m3 RING stays the ring's rule;
+f16 io has no e4m3 arm).
 """
 
 import os
@@ -38,7 +45,6 @@ if requirement_error:
 
 from cudnn.gated_attention_block.kernels.qsa_compress import (
     DEFAULT_POOL,
-    E4M3_STORE_DECLINE,
     SLOT_CAPACITY,
     SLOT_NO_BLOCK,
     QsaCompressStepRecipe,
@@ -56,6 +62,10 @@ from gated_block_reference import build_rope_tables  # noqa: E402
 pytestmark = pytest.mark.L0
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+_CC = tuple(torch.cuda.get_device_capability()) if torch.cuda.is_available() else None
+# the e4m3 store arm's cvt.rn.satfinite.e4m3x2 is an sm_89+ instruction: its accept cells skip (UNCOVERED) on an older part
+requires_sm89 = pytest.mark.skipif(_CC is None or _CC < (8, 9), reason=f"the e4m3 store arm needs sm_89+ (found {_CC})")
+_E4M3 = torch.float8_e4m3fn
 
 _EPS = 1e-6
 _D = 128
@@ -86,8 +96,19 @@ def _make(batch, s_tok, dtype, *, seed=0, table_batch=1):
     return k_raw, w, cos, sin
 
 
+def _sentinel_value(dtype) -> float:
+    """The sentinel fill per dtype: -7777 for the 16-bit dtypes; -448 for e4m3 (its max magnitude: representable -- torch.full refuses a value
+    past the dtype's range -- and never a written row: the e4m3 cells assert |bf16 row| < 448 first)."""
+    return -448.0 if dtype == _E4M3 else _SENTINEL
+
+
 def _sentinel(*shape, dtype):
-    return torch.full(shape, _SENTINEL, device="cuda", dtype=dtype)
+    return torch.full(shape, _sentinel_value(dtype), device="cuda", dtype=dtype)
+
+
+def _bits(x: torch.Tensor) -> torch.Tensor:
+    """The bit patterns of a 16-bit or an 8-bit tensor (a NaN-safe bitwise comparison)."""
+    return x.contiguous().view(torch.int8 if x.element_size() == 1 else torch.int16)
 
 
 def _prefill(k_raw, w, cos, sin, seq_lens, *, offset=1.0):
@@ -118,12 +139,13 @@ def _step(k_new, ring, out, w, cos, sin, pos0, n_commit=None, *, offset=1.0, rop
     return slot
 
 
-def _run_stream(k_raw, lens, schedule, *, w, cos, sin, offset, ring_rows=_RING, n_blocks_cap=None):
+def _run_stream(k_raw, lens, schedule, *, w, cos, sin, offset, ring_rows=_RING, n_blocks_cap=None, cache_dtype=None):
     """Feed every sequence its tokens step by step (``schedule`` = rows per step, cycled; the batch shares the step
-    shape, a sequence past its length commits nothing) and return the cache, the ring and the slot reports."""
+    shape, a sequence past its length commits nothing) and return the cache, the ring and the slot reports.  ``cache_dtype``
+    (``None`` = the io dtype) is the cache's dtype: ``float8_e4m3fn`` runs the e4m3 store arm (the ring stays the io dtype)."""
     batch, s_tok, _ = k_raw.shape
     nb = s_tok // _POOL if n_blocks_cap is None else n_blocks_cap
-    out = _sentinel(batch, nb, _D, dtype=k_raw.dtype)
+    out = _sentinel(batch, nb, _D, dtype=k_raw.dtype if cache_dtype is None else cache_dtype)
     ring = _sentinel(batch, ring_rows, _D, dtype=k_raw.dtype)
     pos = [0] * batch
     slots = [[] for _ in range(batch)]
@@ -477,8 +499,8 @@ def test_compile_rejects_unsupported_dtypes():
 
 
 def _sent_of(dtype) -> float:
-    """The sentinel AS THE DTYPE HOLDS IT (bf16 rounds -7777.0): the only value a 'row untouched' check may compare against."""
-    return torch.full((), _SENTINEL, dtype=dtype).float().item()
+    """The sentinel AS THE DTYPE HOLDS IT (bf16 rounds -7777.0; e4m3 holds -448.0): the only value a 'row untouched' check may compare against."""
+    return torch.full((), _sentinel_value(dtype), dtype=dtype).float().item()
 
 
 class _Paged:
@@ -486,8 +508,9 @@ class _Paged:
     and a compressed-key cache of ``P / 4`` rows per attention page behind a PERMUTED block table (page 0 unused by any live
     sequence); the sequences in ``padding`` sit on block 0 / page 0 with ``kv_lens 0``."""
 
-    def __init__(self, batch, s_tok, dtype, *, page, cap, padding=(), seed=0, table_pages=None):
+    def __init__(self, batch, s_tok, dtype, *, page, cap, padding=(), seed=0, table_pages=None, cache_dtype=None):
         self.rpp, self.cap, self.page, self.batch, self.dtype = page // _POOL, cap, page, batch, dtype
+        self.cache_dtype = dtype if cache_dtype is None else cache_dtype  # the compressed-key cache's dtype (e4m3 = the e4m3 store arm)
         n_lpages = (s_tok // _POOL + self.rpp - 1) // self.rpp if table_pages is None else table_pages
         self.n_pages = 1 + batch * max(n_lpages, 1)
         g = torch.Generator(device="cuda").manual_seed(seed + 100)
@@ -498,8 +521,8 @@ class _Paged:
             self.block_table[b] = 0
             self.state_table[b] = 0
         self.ring = _sentinel(batch + 1, cap, 1, _D, dtype=dtype)
-        self.cache = _sentinel(self.n_pages, self.rpp, 1, _D, dtype=dtype)
-        self.sent = _sent_of(dtype)
+        self.cache = _sentinel(self.n_pages, self.rpp, 1, _D, dtype=self.cache_dtype)
+        self.sent = _sent_of(self.cache_dtype)  # the CACHE's sentinel as its dtype holds it (e4m3 saturates it to -448)
 
     def kbar_row(self, b, blk):
         return self.cache[int(self.block_table[b, blk // self.rpp]), blk % self.rpp, 0]
@@ -553,11 +576,12 @@ def _step_paged(pg: _Paged, k_new, w, cos, sin, kv_lens, n_commit=None, *, offse
     return slot
 
 
-def _run_stream_paged(k_raw, lens, schedule, *, w, cos, sin, offset, page, cap, padding=(), seed=0, use_slots=None):
+def _run_stream_paged(k_raw, lens, schedule, *, w, cos, sin, offset, page, cap, padding=(), seed=0, use_slots=None, cache_dtype=None):
     """The paged twin of ``_run_stream``: every step carries ``rows`` rows per sequence with ``kv_lens = pos + rows`` (the KV length
-    after the step, the stack's ``seq_lens``) and the accepted prefix in ``n_commit``; a padding sequence keeps ``kv_lens 0``."""
+    after the step, the stack's ``seq_lens``) and the accepted prefix in ``n_commit``; a padding sequence keeps ``kv_lens 0``.
+    ``cache_dtype`` as in ``_run_stream`` (the e4m3 store arm when ``float8_e4m3fn``)."""
     batch, s_tok, _ = k_raw.shape
-    pg = _Paged(batch, s_tok, k_raw.dtype, page=page, cap=cap, padding=padding, seed=seed)
+    pg = _Paged(batch, s_tok, k_raw.dtype, page=page, cap=cap, padding=padding, seed=seed, cache_dtype=cache_dtype)
     pos = [0] * batch
     slots = [[] for _ in range(batch)]
     step = 0
@@ -1066,12 +1090,18 @@ def test_paged_run_rejects_contract_violations():
     with pytest.raises(ValueError, match="16-B aligned"):
         n = (batch + 1) * 8 * (_D + 8)
         run(paged, rg=torch.empty(n + 8, device="cuda", dtype=dtype)[4 : 4 + n].view(batch + 1, 8, 1, _D + 8)[..., :_D])  # an 8-byte base offset
-    # the cache: 4-D, the e4m3 store declined by name, the alignment
+    # the cache: 4-D, the recipe's dtype BOTH ways (INVERTED 2026-10-21: the e4m3 store arm is served -- an e4m3 cache under the bf16 recipe
+    # and a bf16 cache under the e4m3 recipe each name the recipe's dtype; an e4m3 RING stays the ring's own rule), the alignment
     with pytest.raises(ValueError, match=r"out must be a 4-D \[blocks >= 1, rows, 1, D=128\]"):
         run(paged, o=_sentinel(batch, 16, _D, dtype=dtype))
-    with pytest.raises(NotImplementedError, match="e4m3 compressed-key cache store"):
+    with pytest.raises(ValueError, match=r"out is float8_e4m3fn but this artifact stores the compressed-key cache in torch.bfloat16"):
         run(paged, o=torch.empty(pg.n_pages, pg.rpp, 1, _D, device="cuda", dtype=torch.float8_e4m3fn))
-    with pytest.raises(ValueError, match="raw-key ring is a bit copy .* never quantized"):  # an e4m3 RING is a form error, not the cache's decline
+    if _CC >= (8, 9):
+        e4 = compile_qsa_compress_step(dtype=dtype, d=_D, rope_dim=_ROPE, has_n_commit=False, paged=True, index_cache_dtype=torch.float8_e4m3fn)
+        assert e4.index_cache_dtype == torch.float8_e4m3fn and e4.compiled is not paged.compiled
+        with pytest.raises(ValueError, match=r"out must have dtype torch.float8_e4m3fn \(the recipe's\), got torch.bfloat16"):
+            run(e4)
+    with pytest.raises(ValueError, match="raw-key ring is a bit copy .* never quantized"):  # an e4m3 RING is a form error, not the cache's dtype
         run(paged, rg=torch.empty(batch + 1, 8, 1, _D, device="cuda", dtype=torch.float8_e4m3fn))
     with pytest.raises(ValueError, match="multiple of 8 elements"):
         run(paged, o=torch.empty(pg.n_pages, pg.rpp, 1, _D + 4, device="cuda", dtype=dtype)[..., :_D])
@@ -1106,7 +1136,88 @@ def test_paged_compile_rejects_unsupported_declarations():
         compile_qsa_compress_step(dtype=torch.bfloat16, d=_D, rope_dim=_ROPE, ring_slots=True)
     with pytest.raises(ValueError, match="ring_slot_dtype must be int32 or int64"):
         compile_qsa_compress_step(dtype=torch.bfloat16, d=_D, rope_dim=_ROPE, paged=True, ring_slots=True, ring_slot_dtype=torch.int16)
-    with pytest.raises(NotImplementedError, match="e4m3 compressed-key cache store"):
-        compile_qsa_compress_step(dtype=torch.bfloat16, d=_D, rope_dim=_ROPE, paged=True, index_cache_dtype=torch.float8_e4m3fn)
-    with pytest.raises(ValueError, match="must hold the activation dtype"):
+    # INVERTED 2026-10-21: the e4m3 store arm compiles on sm_89+ (a distinct artifact, keyed; the bf16 spelling of the io dtype is the SAME
+    # artifact as None) and is a typed decline naming the instruction below it; float32 stays a ValueError; f16 io has no e4m3 arm
+    with pytest.raises(ValueError, match="must hold the io dtype .* or torch.float8_e4m3fn"):
         compile_qsa_compress_step(dtype=torch.bfloat16, d=_D, rope_dim=_ROPE, paged=True, index_cache_dtype=torch.float32)
+    with pytest.raises(ValueError, match="needs bf16 io"):
+        compile_qsa_compress_step(dtype=torch.float16, d=_D, rope_dim=_ROPE, paged=True, index_cache_dtype=torch.float8_e4m3fn)
+    if _CC is not None and _CC < (8, 9):
+        with pytest.raises(NotImplementedError, match=r"cvt.rn.satfinite.e4m3x2.f32\) needs sm_89 or later"):
+            compile_qsa_compress_step(dtype=torch.bfloat16, d=_D, rope_dim=_ROPE, paged=True, index_cache_dtype=torch.float8_e4m3fn)
+    elif _CC is not None:
+        bf = compile_qsa_compress_step(dtype=torch.bfloat16, d=_D, rope_dim=_ROPE, paged=True)
+        assert compile_qsa_compress_step(dtype=torch.bfloat16, d=_D, rope_dim=_ROPE, paged=True, index_cache_dtype=torch.bfloat16).compiled is bf.compiled
+        e4 = compile_qsa_compress_step(dtype=torch.bfloat16, d=_D, rope_dim=_ROPE, paged=True, index_cache_dtype=torch.float8_e4m3fn)
+        e4d = compile_qsa_compress_step(dtype=torch.bfloat16, d=_D, rope_dim=_ROPE, paged=False, index_cache_dtype=torch.float8_e4m3fn)
+        assert e4.compiled is not bf.compiled and e4d.compiled is not e4.compiled and e4.index_cache_dtype == e4d.index_cache_dtype == torch.float8_e4m3fn
+        assert bf.index_cache_dtype == torch.bfloat16
+
+
+# ---------------------------------------------------------------------------
+# The e4m3 store arm (sm_89+): the dense and the paged step arms write the e4m3 cast of the bf16 row
+# ---------------------------------------------------------------------------
+
+
+@requires_sm89
+@pytest.mark.parametrize("page", [16, 32, 64], ids=["p16", "p32", "p64"])
+@pytest.mark.parametrize("schedule", [[1], [4], [1, 4, 2, 3, 5, 1, 2, 4]], ids=["one_row_steps", "four_row_steps", "mixed_steps"])
+def test_e4m3_step_stream_dense_and_paged_are_bitwise_the_bf16_rows_cast(schedule, page):
+    """The e4m3 store arm (``index_cache_dtype=torch.float8_e4m3fn``) on the SAME token stream as the bf16 arm, dense AND paged: every
+    compressed row the two e4m3 arms write is bitwise each other and bitwise the bf16 arm's row ``.to(float8_e4m3fn)`` (the e4m3 cast of
+    the bf16 row -- the serving stacks' convention and the prefill form's), with ``|bf16 row| < 448`` asserted first; the slot reports
+    identical step by step; the ring (bf16, a bit copy) identical to the bf16 arm's; the padding sequence writes nothing; page 0 and the
+    null ring block keep their sentinels (the e4m3 cache's sentinel is -448, the dtype's max magnitude)."""
+    dtype, cap = torch.bfloat16, 8
+    s_tok, lens = 517, [517, 510, 37, 0]
+    batch = len(lens)
+    k_raw, w, cos, sin = _make(batch, s_tok, dtype, seed=41)
+    ref, n_blocks = _prefill(k_raw, w, cos, sin, _i32(lens), offset=1.0)
+    out16, ring16, slots16 = _run_stream(k_raw, lens, schedule, w=w, cos=cos, sin=sin, offset=1.0)
+    out8, ring8, slots8 = _run_stream(k_raw, lens, schedule, w=w, cos=cos, sin=sin, offset=1.0, cache_dtype=_E4M3)
+    pg, slots_p = _run_stream_paged(k_raw, lens, schedule, w=w, cos=cos, sin=sin, offset=1.0, page=page, cap=cap, padding=(3,), seed=41, cache_dtype=_E4M3)
+    assert out8.dtype == pg.cache.dtype == _E4M3 and ring8.dtype == pg.ring.dtype == dtype
+    assert slots8 == slots16 and slots_p == slots16, "the e4m3 arms' slot reports differ from the bf16 arm's"
+    assert torch.equal(_bits(ring8), _bits(ring16)), "the e4m3 arm changed the ring (a bf16 bit copy)"
+    for b in range(batch):
+        nb = int(n_blocks[b])
+        if nb:
+            assert float(ref[b, :nb].float().abs().max()) < 448.0, f"sequence {b}: a bf16 row at or past the e4m3 range"
+            want = ref[b, :nb].to(_E4M3)
+            assert torch.equal(_bits(out8[b, :nb]), _bits(want)), f"sequence {b}: the dense e4m3 arm is not the e4m3 cast of the bf16 rows"
+            assert torch.equal(_bits(out16[b, :nb].to(_E4M3)), _bits(want))
+        for blk in range(nb):
+            row = pg.kbar_row(b, blk)
+            assert torch.equal(_bits(row), _bits(out8[b, blk])), f"sequence {b} block {blk}: the paged e4m3 arm differs from the dense e4m3 arm"
+        for p in range(max(0, lens[b] - cap), lens[b]):
+            assert torch.equal(_bits(pg.ring_row(b, p)), _bits(k_raw[b, p])), f"sequence {b}: ring row of position {p} is not its raw key"
+    sent8 = _sent_of(_E4M3)
+    assert sent8 == -448.0 and pg.sent == sent8
+    assert bool((out8[3].float() == sent8).all()) and bool((ring8[3] == _sent_of(dtype)).all())
+    assert pg.rows_written() == sum(int(n) for n in n_blocks) == int((out8.float() != sent8).any(-1).sum())
+    assert bool((pg.cache[0].float() == sent8).all()) and bool((pg.ring[0].float() == _sent_of(dtype)).all()), "page 0 / the null ring block were written"
+
+
+@requires_sm89
+@pytest.mark.parametrize("k", [16, 19], ids=["first_row_of_a_page", "last_row_of_a_page"])
+def test_e4m3_block_completes_at_the_fourth_token_on_either_side_of_a_page_boundary(k):
+    """The e4m3 paged arm at P 16: block ``k`` completes at its 4th token on the first (k = 16) or the last (k = 19) row of a page,
+    bitwise the prefill row's e4m3 cast; the four raw keys enter the bf16 ring; nothing else moves (the 8-bit sentinel elsewhere)."""
+    dtype, s_tok = torch.bfloat16, 128
+    k_raw, w, cos, sin = _make(2, s_tok, dtype, seed=42)
+    ref, _ = _prefill(k_raw, w, cos, sin, _i32([s_tok, s_tok]))
+    pg = _Paged(2, s_tok, dtype, page=16, cap=8, seed=42, cache_dtype=_E4M3)
+    cache_before, ring_before = pg.cache.clone(), pg.ring.clone()
+    pos0 = 4 * k
+    slot = _step_paged(pg, k_raw[:, pos0 : pos0 + 4].contiguous(), w, cos, sin, [pos0 + 4] * 2)
+    assert slot.tolist() == [[-1, -1, -1, k]] * 2
+    for b in range(2):
+        assert float(ref[b, k].float().abs().max()) < 448.0
+        assert torch.equal(_bits(pg.kbar_row(b, k)), _bits(ref[b, k].to(_E4M3)))
+        page, row = int(pg.block_table[b, k // 4]), k % 4
+        assert row == (0 if k == 16 else 3)
+        cache_before[page, row, 0] = pg.cache[page, row, 0]
+        for p in range(pos0, pos0 + 4):
+            assert torch.equal(_bits(pg.ring_row(b, p)), _bits(k_raw[b, p]))
+            ring_before[int(pg.state_table[b, 0]), p % 8, 0] = pg.ring_row(b, p)
+    assert torch.equal(_bits(pg.cache), _bits(cache_before)) and torch.equal(_bits(pg.ring), _bits(ring_before))

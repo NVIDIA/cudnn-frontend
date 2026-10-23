@@ -1058,7 +1058,7 @@ class DecodeEnvelope:
     # appended (the in-block indexer's DECODE step over the pools; a QsaSpec geometry only, empty / 0 otherwise) -- the facts a serving
     # stack's dispatch predicate READS instead of re-spelling them (one copy of every rule): the index sources the geometry serves at decode
     # (``("caller", "indexer")`` with bf16 activations and the scorer's head dim, ``("caller",)`` otherwise), the indexer cache dtypes served
-    # at decode (the activation dtype; the e4m3 cache is a typed decline), the scorer's head dim / KV heads / block size, the ``top_k`` range
+    # at decode (bf16 and -- the e4m3 compressed-key cache, served 2026-10-21 -- float8_e4m3fn), the scorer's head dim / KV heads / block size, the ``top_k`` range
     # ``(min, max, align)``, the decode scorer's query-row envelope (``S_q x next_pow2(index_heads) <= index_query_rows_max``), the rows the
     # raw-key ring needs beyond the step's (``cap >= S_q + index_state_rows_extra``), the page sizes the paged scorer addresses, and the AUTO
     # reading of ``fuse_prepare`` on this part for the in-place pipeline (:data:`SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS`; a block declared
@@ -1172,7 +1172,10 @@ class QsaSpec:
         the k-th boundary: the selection agrees with the bf16 one on 99.0 % of the blocks at S = 4096, 97.4 % at 32768 and
         96.5 % at 131072 on synthetic activations, every flip a rank-boundary flip), so an attribute of ``QsaSpec`` itself, never
         a knob; bf16 stays the default and the reference.  Refused under ``index_source="caller"``: nothing of the block
-        reads or writes an indexer cache there.
+        reads or writes an indexer cache there.  Measured (2026-10-22/23, one exclusive Rubin cc 10.7 GPU, 212 SMs, A/B/A in one process
+        per cell): the e4m3 cache's lever over bf16 is the scorer's bytes -- +10.8 % of the decode step at B 32 x 128K x S_q 1, +1.6 %
+        geomean over 13 cells, within +-1 % at B <= 4 (the two B 1 x 8K cells -1.1 / -1.0 %: the e4m3 path's fixed cost at a 0.26 MB
+        cache) -- an opt-in for long contexts at batch; the docs carry the table.
 
     index_list_form
         The LIST FORM of the block-sparse DECODE mode (``kv_source="paged"`` on a dense ``[B, S_q]`` declaration; appended):
@@ -1967,7 +1970,9 @@ class _Intermediates:
     # The in-block indexer (``QsaSpec.index_source="indexer"``, ``S`` past the identity bound) only (-1 otherwise), at the END of
     # the layout: the normed + rotated indexer queries, the compressed keys the scorer reads, the selection (ids + scores) and
     # the scorer's compact-logits scratch -- :func:`_qsa_indexer_slots`.  Every layout without the indexer is byte-identical.
-    ix_q: int = -1  # [T, index_heads, index_head_dim] activation dtype
+    ix_q: int = (
+        -1
+    )  # [T, index_heads, index_head_dim] activation dtype (the decode form over the pools: the indexer CACHE dtype -- e4m3 at 1 B under the attribute)
     ix_kbar: int = -1  # [B, floor(S / block_size), index_head_dim] activation dtype
     ix_ids: int = -1  # [T, top_k] int32: the top-k's output (its slot order unspecified)
     ix_scores: int = -1  # [T, top_k] fp32
@@ -2056,6 +2061,7 @@ def _plan_workspace(
     qsa_indexer_cand_floats: Optional[int] = None,
     qsa_indexer_e4m3: bool = False,
     qsa_indexer_decode: Optional[int] = None,
+    qsa_indexer_decode_cache_bytes: Optional[int] = None,
 ) -> _Intermediates:
     """Reserve every intermediate, in stage order, and report the total.
 
@@ -2063,6 +2069,8 @@ def _plan_workspace(
     logits width ``n_blocks_max`` (the main block table's reach in compressed rows, ``max_pages x P / block_size``) -- the five slots
     of :func:`_qsa_indexer_decode_slots` go at the very END of the layout (after ``decode_q_lens``), so every layout without the
     form is byte-identical to before; a form of the bf16 inference pipeline, never beside the prefill indexer's slots.
+    ``qsa_indexer_decode_cache_bytes`` (appended; ``None`` = the activation dtype's size) is the indexer cache dtype's element size: the
+    ``ix_q`` slot is carved at it (1 under the e4m3 indexer cache -- the e4m3 queries; every bf16 carve byte-identical).
 
     ``kv_cache_e4m3`` / ``upcast_items`` (appended; the e4m3 KV cache): the quantizing write-through's compact e4m3 ``kc8`` /
     ``vc8`` rows (``t * h_kv * d_head`` bytes each) and the two inverse scales ``kv_inv``, and -- ``upcast_items > 0``, the
@@ -2310,7 +2318,7 @@ def _plan_workspace(
     if qsa_indexer_decode is not None:
         # The in-block indexer's DECODE step over the pools: its queries, the scorer's logits and counts, the list, the slot report -- at the
         # very END, so every layout without the form is byte-identical to before.
-        slots += _qsa_indexer_decode_slots(geom, b, s, e, int(qsa_indexer_decode))
+        slots += _qsa_indexer_decode_slots(geom, b, s, e, int(qsa_indexer_decode), qsa_indexer_decode_cache_bytes)
     for name, nbytes in slots:
         offsets[name] = off
         off += _align_up(nbytes)
@@ -2419,9 +2427,11 @@ def _qsa_indexer_slots(geom: GatedAttentionBlockGeometry, b: int, s: int, e: int
     return slots
 
 
-def _qsa_indexer_decode_slots(geom: GatedAttentionBlockGeometry, b: int, s: int, e: int, n_blocks_max: int) -> list:
+def _qsa_indexer_decode_slots(geom: GatedAttentionBlockGeometry, b: int, s: int, e: int, n_blocks_max: int, cache_e: Optional[int] = None) -> list:
     """The in-block indexer's DECODE-step slots over the pools, in the order its launches write them: the normed + rotated indexer
-    queries ``ix_q`` ``[T, index_heads, index_head_dim]`` (the prepare's query arm / the pool-1 compress), the scorer's fp32 logits
+    queries ``ix_q`` ``[T, index_heads, index_head_dim]`` (the prepare's query arm / the pool-1 compress) in the indexer CACHE dtype --
+    ``cache_e`` bytes per element (appended; ``None`` = ``e``, the activation dtype; 1 under ``QsaSpec.index_cache_dtype=torch.float8_e4m3fn``:
+    the e4m3 queries the e4m3 scorer arm reads, half the slot; every bf16 carve is byte-identical) --, the scorer's fp32 logits
     ``ix_logits`` ``[T, n_blocks_max]`` (rows 16-byte aligned: ``n_blocks_max`` is a multiple of 4, the page a multiple of 16) and visible
     counts ``ix_counts`` ``[T]``, the top-k's canonical list ``ix_ids`` ``[T, top_k]`` int32 (skipped when a caller hands ``block_ids_out``
     in -- the top-k writes the caller's buffer directly) and the compress arm's slot report ``ix_cslot`` ``[B, S_q]`` int32.  No
@@ -2429,8 +2439,9 @@ def _qsa_indexer_decode_slots(geom: GatedAttentionBlockGeometry, b: int, s: int,
     writes the canonical order)."""
     q = geom.qsa
     t = b * s
+    ce = e if cache_e is None else int(cache_e)
     return [
-        ("ix_q", t * q.index_heads * q.index_head_dim * e),
+        ("ix_q", t * q.index_heads * q.index_head_dim * ce),
         ("ix_logits", t * int(n_blocks_max) * _itemsize(torch.float32)),
         ("ix_counts", t * _itemsize(torch.int32)),
         ("ix_ids", t * q.top_k * _itemsize(torch.int32)),
@@ -2671,21 +2682,28 @@ def _check_norm_weights_agree(qk_norm: bool, w_q_norm, w_k_norm, *, prefix: str 
 
 def _check_index_side_cache(x, name: str, *, rows: int, exact_rows: bool, dtype, d: int, device, what: str, rows_contiguous: bool) -> None:
     """FORM checks of one paged side cache of the decode indexer (the compressed-key cache or the raw-key ring; a declaration sample or
-    the execute tensor; Rule 3: never a value, never a sync): a 4-D ``[blocks >= 1, rows, 1, d]`` tensor of ``dtype`` (an e4m3 ring is
-    refused by the ring's rule: a bit copy of the step's raw keys, never quantized) with ``D`` contiguous, every other stride a whole
-    number of 16-byte vectors (the kernels move rows in 128-bit accesses), ``rows`` exactly (the cache: ``P / block_size`` rows per page)
+    the execute tensor; Rule 3: never a value, never a sync): a 4-D ``[blocks >= 1, rows, 1, d]`` tensor of ``dtype`` -- the cache in the
+    DECLARED indexer cache dtype (``QsaSpec.index_cache_dtype``: bf16, or e4m3 since 2026-10-21; refused both ways), the ring in the
+    activation dtype (an e4m3 ring is refused by the ring's rule: a bit copy of the step's raw keys, never quantized) -- with ``D``
+    contiguous, every other stride a whole number of 16-byte vectors (the kernels move rows in 128-bit accesses: 8 elements at 16 bits, 16 at
+    e4m3), ``rows`` exactly (the cache: ``P / block_size`` rows per page)
     or at least (the ring: the ring rule), the rows contiguous inside a page when ``rows_contiguous`` (the scorer reads a page's compressed
     rows as one block), the page stride below 2 GiB (the scorer's 32-bit page stride), on ``device``.  Typed ``ValueError`` naming the
     tensor; the strides beyond these rules are the stack's (never compiled in)."""
     if not isinstance(x, torch.Tensor):
         raise ValueError(f"{name} must be a 4-D [blocks >= 1, {'rows' if not exact_rows else rows}, 1, {d}] {dtype} tensor ({what}), got {type(x).__name__}")
     if x.dtype != dtype:
+        is_ring = "state" in name
         why = (
-            " (the raw-key ring is a bit copy of the step's raw keys and is never quantized; the e4m3 compressed-key cache is a typed decline of the declaration)"
-            if x.dtype == torch.float8_e4m3fn
-            else ""
+            " (the raw-key ring is a bit copy of the step's raw keys and is never quantized; the compressed-key cache takes the dtype QsaSpec.index_cache_dtype declares)"
+            if (x.dtype == torch.float8_e4m3fn and is_ring)
+            else (
+                " (the compressed-key cache is in the dtype QsaSpec.index_cache_dtype declares -- bf16, or torch.float8_e4m3fn for the e4m3 indexer cache -- never a silent cast)"
+                if not is_ring
+                else ""
+            )
         )
-        raise ValueError(f"{name} must be {dtype} (the activation dtype), got {x.dtype}{why}")
+        raise ValueError(f"{name} must be {dtype} ({'the activation dtype' if is_ring else 'the declared indexer cache dtype'}), got {x.dtype}{why}")
     shape = tuple(int(n) for n in x.shape)
     if x.dim() != 4 or shape[0] < 1 or shape[2] != 1 or shape[3] != d or (shape[1] != rows if exact_rows else shape[1] < rows):
         raise ValueError(f"{name} must be [blocks >= 1, {'exactly' if exact_rows else 'at least'} {rows}, 1, {d}] ({what}), got shape {shape}")
@@ -6244,12 +6262,16 @@ class _QsaPrepare(_Stage):
         page_size: int,
         use_pdl: bool = False,
         index_arms=None,  # appended: the QsaPrepareIndexArms record the block builds (None = the band's raw-key pool arm alone, as before)
+        index_cache_dtype=None,  # appended: the indexer cache dtype of the decode arms (None = the activation dtype; e4m3 = the e4m3 store arm)
     ) -> None:
         self.geom = geometry
         self.batch = int(batch)
         self.seq_len = int(seq_len)
         self.dtype = dtype
         self.page_size = int(page_size)
+        # The indexer cache dtype the decode arms write (QsaSpec.index_cache_dtype, resolved by the block): the query arm's ix_q and the compress
+        # arm's paged cache in e4m3 under the attribute (kernels/qsa_prepare.py's e4m3 store arm: the e4m3 cast of the bf16 row); bf16 as before.
+        self.index_cache_dtype = dtype if index_cache_dtype is None else index_cache_dtype
         # The kernel's programmatic-dependent-launch form (kernels/qsa_prepare.py: the launch attribute + the griddepcontrol pair -- the wait
         # before the first global read, the release after the body's last store), taken from the block as the two stages it replaces take it.
         self.use_pdl = bool(use_pdl)
@@ -6319,6 +6341,7 @@ class _QsaPrepare(_Stage):
                 index=self._index_arms(),
                 threads_per_cta=_ELEMENTWISE_THREADS,
                 use_pdl=self.use_pdl,
+                index_cache_dtype=self.index_cache_dtype,
             )
             for slot_dtype in (torch.int32, torch.int64)
         }
@@ -6329,7 +6352,14 @@ class _QsaPrepare(_Stage):
 
         g = self.geom
         return moved_bytes(
-            self.batch * self.seq_len, g.h_q, g.h_kv, g.d_head, elem_bytes=_itemsize(self.dtype), slot_bytes=_itemsize(slot_dtype), index=self._index_arms()
+            self.batch * self.seq_len,
+            g.h_q,
+            g.h_kv,
+            g.d_head,
+            elem_bytes=_itemsize(self.dtype),
+            slot_bytes=_itemsize(slot_dtype),
+            index=self._index_arms(),
+            index_cache_bytes=_itemsize(self.index_cache_dtype),
         )
 
     def execute(
@@ -6471,7 +6501,8 @@ def _check_qsa_indexer_geometry(
     dtype the scorer packs, its head dim, the packed form; then, on the PREFILL form, the prefill scorer's head groups (read off the
     DSA tree behind the DSL floor), and on the PAGED form (``paged``, appended: the decode step over the pools) the decode scorer's
     own rows instead -- its query-row envelope at ``s_q`` (``S_q x next_pow2(index_heads) <= 64``), the page's power-of-two row count
-    (``page_size``), the e4m3 indexer cache, the e4m3 pool (``kv_cache_dtype``) and the shared list form -- all DSL-free (the
+    (``page_size``), the e4m3 pool (``kv_cache_dtype``) and the shared list form -- all DSL-free (the e4m3 indexer CACHE is served there
+    since 2026-10-21: the compress arms' e4m3 store, the paged scorer's e4m3 read arm); (the
     scorer's host facts live in ``cudnn.QSA.selection_paged``, never the kernel module).  Called at declaration
     (``GatedAttentionBlockFwd._check_qsa_declaration``) and again by the stage's ``check_support`` so the stage stays honest on its own."""
     from cudnn.frost.buffers import cutedsl_requirement_error
@@ -6499,8 +6530,6 @@ def _check_qsa_indexer_geometry(
                 validate_params(h_i=q.index_heads, s_q=1, page_size=int(page_size), units_per_warp=1)
             except ValueError as exc:
                 raise NotImplementedError(texts["indexer_page_size"]) from exc
-        if q.index_cache_e4m3:
-            raise NotImplementedError(texts["indexer_e4m3_cache"])
         if kv_cache_dtype == KV_CACHE_E4M3:
             raise NotImplementedError(texts["indexer_e4m3_pool"])
         if q.index_list_form == QSA_INDEX_LIST_FORM_SHARED:
@@ -6991,11 +7020,20 @@ class _IndexerDecode(_Stage):
     rules; the host refuses a table shorter than ``max_pages x P`` positions by form).  Barrier / SMEM tables: the prepare and the
     compress kernels have neither (their module docstrings); the scorer's and the top-k's are in their modules.
 
+    **The e4m3 indexer cache (``QsaSpec(index_cache_dtype=torch.float8_e4m3fn)``; served 2026-10-21).**  ``self.cache_dtype`` (the
+    declared cache dtype; ``self.fp8``) threads through every kernel of the step: the prepare's query + compress arms (fused) or the pool-1
+    compress + the step form (unfused) STORE e4m3 directly -- the e4m3 cast of the bf16 row the bf16 form stores (the compress kernels' e4m3
+    store arm; no cast kernel, the launch census unchanged), so ``ix_q`` (carved at 1 B per element) and ``index_kv_cache`` are plain e4m3 at
+    unit scale (the serving stacks' fp8 indexer-cache recipe and the prefill form's convention: a cache primed from the prefill form's e4m3
+    rows and appended by this step is ONE chain, bitwise); the paged scorer runs its e4m3 READ arm (``mma.sync.m16n8k32 .e4m3``, 128-B rows,
+    half the SMEM ring; every product exact in fp32).  A different selection function (3 mantissa bits), chosen at declaration; bf16 stays
+    the default and the reference; the ring stays bf16 (a bit copy, never quantized).
+
     Typed declines: at declaration (:func:`_check_qsa_indexer_geometry`, ``paged=True``) f16 activations, another head dim, the
-    query-row envelope (``S_q x next_pow2(index_heads) <= 64``), a page off the powers of two, the e4m3 indexer cache, the e4m3
-    pool, the shared list form -- each the envelope's row; at ``check_support`` the CuTe DSL floor and the device's target BEFORE any
-    kernel module is imported (Rule 7: the facades ``cudnn.QSA.selection_paged`` / ``qsa_topk`` gate first), a device outside the cc 10.x
-    family, a top-k geometry past the kernel's reach, the shared-memory opt-in limit.
+    query-row envelope (``S_q x next_pow2(index_heads) <= 64``), a page off the powers of two, the e4m3 pool, the shared list form --
+    each the envelope's row; at ``check_support`` the CuTe DSL floor and the device's target BEFORE any kernel module is imported (Rule
+    7: the facades ``cudnn.QSA.selection_paged`` / ``qsa_topk`` gate first), a device outside the cc 10.x family, a top-k geometry past the
+    kernel's reach, the shared-memory opt-in limit.
     """
 
     name = "qsa_indexer"
@@ -7025,6 +7063,10 @@ class _IndexerDecode(_Stage):
         self.seq_len = int(seq_len)
         self.dtype = dtype
         self.device = device
+        # the indexer cache dtype (QsaSpec.index_cache_dtype; None = the activation dtype): e4m3 = the e4m3 indexer cache (the class docstring) --
+        # the compress arms store it, the scorer reads it, ix_q is carved at it
+        self.cache_dtype = q.index_cache_dtype if q.index_cache_dtype is not None else dtype
+        self.fp8 = self.cache_dtype == INDEX_CACHE_E4M3
         self.page_size = int(page_size)
         self.rows_per_page = self.page_size // q.block_size  # compressed rows per attention page
         self.n_blocks_max = int(n_blocks_max)  # the logits width = the main table's reach in compressed rows (max_pages x rows_per_page)
@@ -7129,7 +7171,14 @@ class _IndexerDecode(_Stage):
         units = int(default_units_per_warp(self.n_blocks_max, self.batch, torch.cuda.get_device_properties(self.device).multi_processor_count, self.seq_len))
         self._score = {
             hb: compile_qsa_score_paged(
-                h_i=q.index_heads, s_q=self.seq_len, page_size=self.page_size, units_per_warp=units, has_block_lens=hb, use_pdl=self.use_pdl, device=dev
+                h_i=q.index_heads,
+                s_q=self.seq_len,
+                page_size=self.page_size,
+                units_per_warp=units,
+                has_block_lens=hb,
+                use_pdl=self.use_pdl,
+                device=dev,
+                cache_dtype=self.cache_dtype,
             )
             for hb in (True, False)
         }
@@ -7140,7 +7189,9 @@ class _IndexerDecode(_Stage):
         if not self.fused:
             from .kernels.qsa_compress import compile_qsa_compress, compile_qsa_compress_step
 
-            self._q_recipe = compile_qsa_compress(dtype=self.dtype, d=q.index_head_dim, rope_dim=g.rope_dim, pool=1, has_seq_lens=False, table_dtype=self.dtype)
+            self._q_recipe = compile_qsa_compress(
+                dtype=self.dtype, d=q.index_head_dim, rope_dim=g.rope_dim, pool=1, has_seq_lens=False, table_dtype=self.dtype, out_dtype=self.cache_dtype
+            )
             self._step = {
                 sd: compile_qsa_compress_step(
                     dtype=self.dtype,
@@ -7153,7 +7204,7 @@ class _IndexerDecode(_Stage):
                     paged=True,
                     ring_slots=self.ring_slots,
                     ring_slot_dtype=sd,
-                    index_cache_dtype=None,
+                    index_cache_dtype=self.cache_dtype,
                 )
                 for sd in (torch.int32, torch.int64)
             }
@@ -7163,7 +7214,7 @@ class _IndexerDecode(_Stage):
         q, b, s = self.geom.qsa, self.batch, self.seq_len
         t = b * s
         return dict(
-            qi=_view(workspace, lay.ix_q, (t, q.index_heads, q.index_head_dim), self.dtype),
+            qi=_view(workspace, lay.ix_q, (t, q.index_heads, q.index_head_dim), self.cache_dtype),  # the indexer cache dtype (e4m3 at 1 B under the attribute)
             logits=_view(workspace, lay.ix_logits, (t, self.n_blocks_max), torch.float32),
             counts=_view(workspace, lay.ix_counts, (t,), torch.int32),
             ids=_view(workspace, lay.ix_ids, (t, q.top_k), torch.int32),
@@ -7737,8 +7788,8 @@ _SPARSE_DECODE_REQUIRES = (
     "kv_source='paged'",
     "geometry.is_causal=True, geometry.causal_bottom_right=True, window_left=-1, window_right in (-1, 0), qsa=QsaSpec(index_source='caller' | 'indexer'), d_head=256",
     "sample_k_cache / sample_v_cache (the pools' [num_pages, H_kv, P, D] shape / dtype / strides) and sample_block_table ([B, max_pages] int32, CONTIGUOUS: the sparse core binds the whole table)",
-    "index_source='indexer' (the in-block indexer's DECODE step over the pools; bf16, index_band=True, S_q x next_pow2(index_heads) <= 64, a power-of-two page, bf16 pools "
-    "and indexer cache): the three side-cache samples at declaration -- sample_index_kv_cache [num_pages, P / 4, 1, 128] (the paged compressed-key cache on the MAIN block "
+    "index_source='indexer' (the in-block indexer's DECODE step over the pools; bf16, index_band=True, S_q x next_pow2(index_heads) <= 64, a power-of-two page, bf16 main pools "
+    "and raw-key ring; the compressed-key cache bf16 or e4m3 per QsaSpec.index_cache_dtype): the three side-cache samples at declaration -- sample_index_kv_cache [num_pages, P / 4, 1, 128] (the paged compressed-key cache on the MAIN block "
     "table), sample_index_state_cache [num_ring_blocks, cap >= S_q + 3, 1, 128] (the raw-key ring), sample_index_state_block_table [B, 1] int32 -- and at execute "
     "index_kv_cache, index_state_cache, index_state_block_table, cos_pos / sin_pos [1 or B, >= max_pages x P, rope_dim] (the position-indexed tables), w_iq_norm / w_ik_norm; "
     "index_state_slot_mapping [T] iff index_state_slot_mapping_present, cos / sin None iff rope_position_tables_only; the list comes back through block_ids_out / block_lens_out "
@@ -7765,8 +7816,9 @@ def _qsa_decode_decline_texts(geometry: GatedAttentionBlockGeometry, dtype: torc
     for byte).  Each row carries ONE shared token the tests pin: ``shared_list_rows`` ``tail covers at most two blocks``;
     ``indexer_f16`` ``needs bf16 activations``; ``indexer_head_dim`` ``packs 128-wide heads``; ``indexer_thd`` ``scores dense [B, S]
     prompts``; ``indexer_query_rows`` ``query rows per sequence (at most 64``; ``indexer_page_size`` ``a power-of-two count of compressed
-    rows``; ``indexer_e4m3_cache`` ``e4m3 read arm``; ``indexer_e4m3_pool`` ``in-kernel dequant arm``; ``indexer_shared_list`` ``selects per
-    row``; ``fuse_prepare_rope_tables_unfused`` ``the unfused query norm reads the per-token``.  The host facts come from the DSL-free
+    rows``; ``indexer_e4m3_pool`` ``in-kernel dequant arm``; ``indexer_shared_list`` ``selects per row``; ``fuse_prepare_rope_tables_unfused``
+    ``the unfused query norm reads the per-token``.  (The ``indexer_e4m3_cache`` row retired 2026-10-21: the e4m3 compressed-key cache is
+    SERVED at decode -- a served form has no decline row; ``decode.index_cache_dtypes`` lists it.)  The host facts come from the DSL-free
     modules (``cudnn.QSA.selection`` / ``cudnn.QSA.selection_paged``) and the sparse record, never from a kernel module."""
     from cudnn.QSA.selection import INDEXER_SCORER_HEAD_DIM
     from cudnn.QSA.selection_paged import MAX_QUERY_ROWS, MMA_M, padded_heads
@@ -7802,11 +7854,6 @@ def _qsa_decode_decline_texts(geometry: GatedAttentionBlockGeometry, dtype: torc
             "QsaSpec(index_source='indexer') over the pools: the decode scorer splits a block id into its page and row by a shift, so "
             "paged_kv_page_size must hold a power-of-two count of compressed rows (16 / 32 / 64 / 128 at block size 4) -- declare one of "
             "those pages, or hand the step's lists in under index_source='caller'"
-        ),
-        "indexer_e4m3_cache": (
-            "QsaSpec(index_source='indexer', index_cache_dtype=torch.float8_e4m3fn) over the pools: the paged compressed-key cache is served in "
-            "the activation dtype at decode -- the paged scorer's e4m3 read arm and the compress arm's e4m3 store are a follow-up; declare "
-            "index_cache_dtype=None"
         ),
         "indexer_e4m3_pool": (
             "QsaSpec(index_source='indexer') with kv_cache_dtype=torch.float8_e4m3fn: the block-sparse decode mode over e4m3 pools runs the "
@@ -7972,7 +8019,8 @@ class GatedAttentionBlockFwd(APIBase):
     (the prepare runs first on the same stream), the list is canonical (ids descending, ``-1`` last) and the first execute of a
     fresh declaration captures with no warm-up (no plan constant, no allocation, no host read, no torch op on the path).  Typed
     declines (the envelope's rows): f16 activations, another head dim, ``S_q x next_pow2(index_heads) > 64``, a page off the
-    powers of two, the e4m3 indexer cache, the e4m3 pool, the shared list form, ``index_commit_present=True``,
+    powers of two, the e4m3 MAIN pool together with the indexer (``indexer_e4m3_pool``; the compressed-key cache itself may be e4m3
+    through ``QsaSpec.index_cache_dtype``, served since 2026-10-21), the shared list form, ``index_commit_present=True``,
     ``rope_position_tables_only`` with the unfused twin; the envelope publishes the indexer facts (``decode.index_*``,
     ``decode.fuse_prepare_default``) so a serving stack reads them instead of re-spelling them.
 
@@ -8002,7 +8050,13 @@ class GatedAttentionBlockFwd(APIBase):
     activations; bf16 stays the default and the reference).  No new kernel: the compress launches write bf16 as before and the
     FP8 pipeline's per-tensor cast writes the e4m3 operands (two launches more; :class:`_Indexer`).  Typed declines: e5m2 and any
     other dtype; the attribute under ``index_source="caller"``; f16 activations (the indexer's row); a cache of the other dtype at
-    execute, both ways; THD and the decode mode as for the bf16 indexer.
+    execute, both ways; THD as for the bf16 indexer.  OVER THE POOLS (the in-block indexer's DECODE step, served 2026-10-21): the e4m3
+    compressed-key cache ``sample_index_kv_cache`` / ``execute(index_kv_cache=)`` ``[num_pages, P / 4, 1, 128]`` in e4m3 (REQUIRED in the
+    declared dtype, both ways), the ring bf16 -- the prepare / compress kernels STORE e4m3 directly (the e4m3 cast of the bf16 row, one
+    rounding convention with the prefill form's rows: a cache a stack primes from them and this step appends is one chain, bitwise), the
+    paged scorer reads it on its fp8 ``mma.sync`` arm, no cast kernel (the launch census is the bf16 form's); ``ix_q`` is carved at 1 B;
+    ``decode.index_cache_dtypes`` reads ``(bf16, e4m3)``.  The selection is pinned EXACTLY against the fp64 top-k of the kernel's own e4m3
+    operands (up to ties); the bf16-vs-e4m3 agreement is a statistic, never a gate.
 
     **MXFP8** (an :class:`MxQuantSpec` + e4m3 codes + F8_128x4 SF blobs for ``h`` /
     ``W_qkvg``), UNFUSED (9 stages = 9 kernel launches)::
@@ -8585,6 +8639,9 @@ class GatedAttentionBlockFwd(APIBase):
         # declined the forms the core does not serve ("shared" past the cap, "shared" under the indexer); the cap is read off the record.
         self.sparse_decode = self.kv_source == KV_SOURCE_PAGED and self.qsa is not None
         self.indexer_decode = self.sparse_decode and self.qsa.index_source == "indexer"
+        # the indexer CACHE dtype over the pools (QsaSpec.index_cache_dtype; None = the activation dtype): the compressed-key cache sample / tensor
+        # and the ix_q slot are in it (e4m3 = the e4m3 indexer cache, served 2026-10-21); the ring stays the activation dtype
+        self.index_cache_dtype = (self.qsa.index_cache_dtype if self.qsa.index_cache_dtype is not None else self.act_dtype) if self.indexer_decode else None
         list_form = self.qsa.index_list_form if self.qsa is not None else None
         self.qsa_shared_list = self.sparse_decode and (
             list_form == QSA_INDEX_LIST_FORM_SHARED
@@ -8918,7 +8975,14 @@ class GatedAttentionBlockFwd(APIBase):
                     rope_table=self.rope_position_tables_only,
                 )
             self._prepare = _QsaPrepare(
-                geometry, batch=self.batch, seq_len=self.seq_len, dtype=act, page_size=self.paged_kv_page_size, use_pdl=self.use_pdl, index_arms=arms
+                geometry,
+                batch=self.batch,
+                seq_len=self.seq_len,
+                dtype=act,
+                page_size=self.paged_kv_page_size,
+                use_pdl=self.use_pdl,
+                index_arms=arms,
+                index_cache_dtype=self.index_cache_dtype if self.indexer_decode else None,
             )
             self._norm_rope = None
             self._cache_write = None
@@ -9279,10 +9343,11 @@ class GatedAttentionBlockFwd(APIBase):
     ) -> Tuple[bool, bool, bool]:
         """The decode indexer's three side-cache SAMPLES and three input-contract flags at declaration, device-free: each flag a bool
         (``TypeError`` otherwise); on the form (``indexer_decode``) the samples REQUIRED -- the paged compressed-key cache ``[num_pages >= 1,
-        P / block_size, 1, index_head_dim]`` with its rows contiguous inside a page (the scorer's read), the raw-key ring ``[num_ring_blocks
-        >= 1, cap >= S_q + block_size - 1, 1, index_head_dim]`` (``cap`` is the ring rule, a ``ValueError`` naming the bound; its blocks
-        contiguous under the ring-slots arm), both in the activation dtype with 16-byte-vector strides (an e4m3 ring is refused by its own
-        rule: a bit copy, never quantized), the ring block table ``[B, 1]`` int32 -- and ``index_commit_present=True`` a typed decline (the
+        P / block_size, 1, index_head_dim]`` with its rows contiguous inside a page (the scorer's read) in the DECLARED indexer cache dtype
+        (``QsaSpec.index_cache_dtype``: bf16, or e4m3 -- refused both ways), the raw-key ring ``[num_ring_blocks >= 1, cap >= S_q + block_size - 1,
+        1, index_head_dim]`` (``cap`` is the ring rule, a ``ValueError`` naming the bound; its blocks contiguous under the ring-slots arm) in the
+        activation dtype with 16-byte-vector strides (an e4m3 ring is refused by its own rule: a bit copy, never quantized), the ring block
+        table ``[B, 1]`` int32 -- and ``index_commit_present=True`` a typed decline (the
         two-phase commit is a follow-up: the serving stacks commit every row of the step); off the form every one of the six REFUSED
         (``ValueError`` naming them).  Returns the three flags.  The samples' strides are never compiled in (the kernels bind them
         symbolically), so ``execute`` matches dims and dtype, never strides."""
@@ -9313,9 +9378,10 @@ class GatedAttentionBlockFwd(APIBase):
         if missing:
             raise ValueError(
                 f"QsaSpec(index_source='indexer') over the pools needs {', '.join(missing)} at declaration: sample_index_kv_cache [num_pages, "
-                f"{self.paged_kv_page_size // self.qsa.block_size}, 1, {self.qsa.index_head_dim}] (the paged compressed-key cache on the main block table), "
-                f"sample_index_state_cache [num_ring_blocks, cap >= {self.seq_len + _index_state_ring_extra_rows(self.qsa.block_size)}, 1, "
-                f"{self.qsa.index_head_dim}] (the raw-key ring) in the activation dtype, and sample_index_state_block_table [B={self.batch}, 1] int32"
+                f"{self.paged_kv_page_size // self.qsa.block_size}, 1, {self.qsa.index_head_dim}] (the paged compressed-key cache on the main block table) in "
+                f"the declared indexer cache dtype {self.index_cache_dtype}, sample_index_state_cache [num_ring_blocks, cap >= "
+                f"{self.seq_len + _index_state_ring_extra_rows(self.qsa.block_size)}, 1, {self.qsa.index_head_dim}] (the raw-key ring) in the activation dtype, "
+                f"and sample_index_state_block_table [B={self.batch}, 1] int32"
             )
         if commit_present:
             raise NotImplementedError(
@@ -9348,7 +9414,7 @@ class GatedAttentionBlockFwd(APIBase):
             f"{prefix}index_kv_cache",
             rows=rpp,
             exact_rows=True,
-            dtype=act,
+            dtype=self.index_cache_dtype,  # the DECLARED cache dtype (QsaSpec.index_cache_dtype): bf16, or e4m3 -- both ways
             d=d_i,
             device=dev,
             what=f"the paged compressed-key cache: P / {bs} = {rpp} compressed rows per attention page, one row per {bs}-token block",
@@ -10360,7 +10426,8 @@ class GatedAttentionBlockFwd(APIBase):
         """The in-block indexer's rows of :class:`DecodeEnvelope` for a QsaSpec geometry (empty for a dense one) -- every value READ off the
         DSL-free host modules (``cudnn.QSA.selection`` / ``cudnn.QSA.selection_paged``) and the block's own rules, never a second literal: the index sources
         the geometry serves at decode (the indexer needs bf16 activations and the scorer's head dim: the ``indexer_f16`` / ``indexer_head_dim``
-        rows), the indexer cache dtypes at decode (the activation dtype; e4m3 is the ``indexer_e4m3_cache`` row), the scorer's head dim / KV
+        rows), the indexer cache dtypes at decode (bf16 and e4m3 -- the e4m3 compressed-key cache served since 2026-10-21 on every part the
+        indexer is served on: the fp8 ``cvt`` and ``mma.sync`` are sm_89+ instructions and the block serves cc 10.x), the scorer's head dim / KV
         heads / block size, the ``top_k`` range, the query-row envelope, the ring's extra rows, the pages the paged scorer addresses
         (``SERVING_PAGE_SIZES`` through its own validator), and the AUTO reading of ``fuse_prepare`` on this part."""
         if geometry.qsa is None:
@@ -10380,7 +10447,7 @@ class GatedAttentionBlockFwd(APIBase):
 
         return dict(
             index_sources=("caller", "indexer") if indexer_served else ("caller",),
-            index_cache_dtypes=(torch.bfloat16,) if indexer_served else (),
+            index_cache_dtypes=(torch.bfloat16, INDEX_CACHE_E4M3) if indexer_served else (),
             index_head_dims=(INDEXER_SCORER_HEAD_DIM,),
             index_kv_heads=(1,),  # QsaSpec.validate pins one raw key head (the checkpoint's own validator)
             index_block_sizes=(QSA_BLOCK_SIZE,),
@@ -10587,8 +10654,10 @@ class GatedAttentionBlockFwd(APIBase):
             # the prefill route's [B] int32 Q lengths (a declaration fact: the route is read at declaration, so get_workspace_size()
             # before compile() already counts the slot)
             decode_q_lens=self.batch if (self.decode_route is not None and self.decode_route.prefill_tile) else 0,
-            # the decode indexer over the pools: its five slots at the end (the logits width = the main table's reach in compressed rows)
+            # the decode indexer over the pools: its five slots at the end (the logits width = the main table's reach in compressed rows;
+            # the ix_q slot at the indexer cache dtype's element size -- 1 under the e4m3 cache)
             qsa_indexer_decode=self._indexer_decode.n_blocks_max if self._indexer_decode is not None else None,
+            qsa_indexer_decode_cache_bytes=_itemsize(self._indexer_decode.cache_dtype) if self._indexer_decode is not None else None,
         )
 
     def get_workspace_size(self) -> int:

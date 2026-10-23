@@ -260,7 +260,7 @@ top_k=512`). It is a DECLARATION ATTRIBUTE -- it changes the function -- never a
 | `top_k` (`512`) | blocks per query in the caller's list: a multiple of 4 in `[4, 512]` (it sizes the kernel's index staging) |
 | `index_source` (`"caller"`) | `"caller"`: `execute(block_ids=)` carries the selection; `"indexer"`: the block runs the indexer over its own band and derives the selection (bf16, `index_band=True`; "The in-block indexer" below) |
 | `index_band` (`False`) | `W_qkvg` carries a fifth band `ProjBlock.INDEX` of `(index_heads + index_kv_heads) * index_head_dim` columns below V |
-| `index_cache_dtype` (`None`) | appended: the indexer cache's dtype under `index_source="indexer"` -- `None` / `torch.bfloat16` (the compressed keys and the queries as the compress kernel writes them) or `torch.float8_e4m3fn` (the fp8 indexer cache: both as plain e4m3 of the same values, no scales, scored through the scorer's MXFP8 arm with unit scale factors; `index_k_compressed` is then an e4m3 buffer). Numerics-changing (3 mantissa bits move the weakest selected blocks at the k-th boundary: 99.0 / 97.4 / 96.5 % set agreement with the bf16 selection at S = 4096 / 32768 / 131072 on synthetic activations, every flip a rank-boundary flip), so an attribute, never a knob; bf16 stays the default and the reference. Refused under `index_source="caller"` (nothing of the block reads or writes an indexer cache there); e5m2 named |
+| `index_cache_dtype` (`None`) | appended: the indexer cache's dtype under `index_source="indexer"` -- `None` / `torch.bfloat16` (the compressed keys and the queries as the compress kernel writes them) or `torch.float8_e4m3fn` (the fp8 indexer cache: both as plain e4m3 of the same values, no scales; on the prefill form scored through the scorer's MXFP8 arm with unit scale factors, `index_k_compressed` then an e4m3 buffer; AT DECODE over the pools (2026-10-21) the paged `index_kv_cache` is e4m3 -- the prepare / compress kernels store the e4m3 cast of the bf16 row directly and the paged scorer reads it on its fp8 `mma.sync` arm, no cast kernel). Numerics-changing (3 mantissa bits move the weakest selected blocks at the k-th boundary: 99.0 / 97.4 / 96.5 % set agreement with the bf16 selection at S = 4096 / 32768 / 131072 on synthetic activations, every flip a rank-boundary flip), so an attribute, never a knob; bf16 stays the default and the reference. Refused under `index_source="caller"` (nothing of the block reads or writes an indexer cache there); e5m2 named |
 | `index_list_form` (`None`) | appended: the block-sparse DECODE mode's list form (`kv_source="paged"` on a dense `[B, S_q]` block) -- `"shared"`: ONE list per sequence, `[B, top_k]`, selected at the step-0 position `kv_lens[b] - S_q` and shared by the step's rows (the MTP form; `S_q <= 4`, the sparse core's shared-list cap); `"per_row"`: one list per row, `[B, S_q, top_k]` / `[T, top_k]`, at the row's own position (the serving stacks' per-row selection) at ANY `S_q`; `None`: `"shared"` at `S_q <= 4` and `"per_row"` past it under caller lists (the former derivation), `"per_row"` under the in-block indexer over the pools. A declaration attribute (numerics-changing: which keys the speculative rows see), never a knob. Typed declines: `"shared"` past four rows (`shared_list_rows`), `"shared"` under the indexer over the pools; `"shared"` on the block's own K / V (`kv_source="self"`) is refused by name. The envelope publishes `decode.index_list_forms` / `decode.index_list_form_default` |
 | `index_heads`, `index_kv_heads`, `index_head_dim`, `index_norm_eps` (`4`, `1`, `128`, `1e-6`) | the indexer's geometry; they size the band (and `index_kv_heads x index_head_dim` the raw indexer key's write-through pool); under `index_source="indexer"` the scorer reads them (`index_heads` one of its packed head groups, `index_head_dim` its head dim) |
 
@@ -482,8 +482,29 @@ score; bf16 vs fp32 agrees at 99.8 %), so the dtype is a declaration attribute, 
 the model-quality question of serving it is the caller's. The e4m3 block's selection is pinned against the top-k of the fp64
 scores of its own e4m3 operands (exact up to ties), against the fp32-operand oracle under the margin rule, and against the bf16
 block on the same inputs (the agreement reported, every flip within 8 % of the row's top score); its first execute captures and
-replays bitwise (`test_block_qsa_end_to_end.py`). The compress kernel's e4m3 store arm would fold the casts away (a lever, not
-built); the decode step over an e4m3 indexer cache is `qsa_select_decode_forward`'s e4m3 arm, outside the block like the bf16 one.
+replays bitwise (`test_block_qsa_end_to_end.py`). The compress kernel's e4m3 store arm would fold the prefill form's casts away (a lever,
+not built: the padded-row zero-fill contract decides).
+
+**At decode over the pools (2026-10-21).** The in-block indexer's DECODE step ("The in-block indexer's DECODE step over the pools"
+below) serves the attribute WITHOUT casts: the fused prepare's query + compress arms, the step form and the pool-1 compress STORE e4m3
+directly -- each row is the bf16 form's packed words rounded once more by `cvt.rn.satfinite.e4m3x2.f32` (round-to-nearest-even,
+saturating at +-448, never a NaN), i.e. **the e4m3 cache is the e4m3 cast of the bf16 row** -- plain e4m3 at unit scale, no scale field
+anywhere; the ring stays bf16 (a bit copy). That is the serving stacks' indexer-cache chain and the prefill form's own convention, so a
+paged cache a stack primes from the prefill form's e4m3 `index_k_compressed` rows and the step appends is ONE chain, bitwise (the
+multi-step cell). The paged scorer reads the e4m3 pair on its fp8 `mma.sync.m16n8k32` arm (128-B rows, 4 k-steps, half the shared-memory
+ring; every e4m3 x e4m3 product exact in fp32). `sample_index_kv_cache` / `index_kv_cache` are REQUIRED in the declared dtype (refused both
+ways, at declaration and at execute); the `ix_q` workspace slot is carved at 1 B per element (every bf16 carve byte-identical); the launch
+census is the bf16 form's (8 fused / 11 unfused; no cast kernel). The oracle is EXACT: the step's set == the fp64 top-k of the kernel's own
+e4m3 `(ix_q, kbar)` up to ties, the cache rows bitwise the bf16 twin's cast, fused == unfused, two launches / the first-execute capture
+bitwise, the multi-step uniform cache; the bf16-vs-e4m3 agreement is a statistic (every flipped block at the rank boundary). The envelope
+publishes `decode.index_cache_dtypes == (bf16, e4m3)`; the e4m3 MAIN pool together with the indexer stays declined (`indexer_e4m3_pool`).
+Performance (measured 2026-10-22/23: one exclusive Rubin cc 10.7 GPU, 212 SMs at the locked clock, every arm in one process per cell, A/B/A
+CUDA-graph replay; speed-ups positive = faster): the lever of the e4m3 cache over the bf16 cache is the scorer's bytes -- +10.8 % (7.4 us)
+of the decode step at B 32 x 128K x S_q 1 (the paged scorer 23.8 -> 16.8 us), +1.6 % geomean over 13 page-16 cells, +4.6 % over the B 32
+cells, within +-1 % at B <= 4 except the two B 1 x 8K cells (-1.1 / -1.0 %: the e4m3 path's fixed cost in the small prepare / score /
+top-k kernels at a 0.26 MB cache, where halving the bytes buys nothing); the block over the e4m3 cache against the serving baseline's own
+fp8 indexer path +7.5 % geomean over those 13 cells; the selection exact up to ties and the cache rows bitwise the bf16 twin's cast on
+every measured cell. The e4m3 column is a different function in every table; bf16 stays the default and the reference.
 
 **What it costs.** Past the bound the workspace grows by the indexer's queries (`T x index_heads x index_head_dim x 2` B),
 the compressed keys (`B x S / 4 x index_head_dim x 2` B), the list, its sorted copy and its scores (`T x top_k x 12` B), the
@@ -534,8 +555,9 @@ included, binds under a CUDA 12 driver -- emits the same encoding, so below 13.4
 same logits; `True` forced on such a DSL is a typed decline naming the compiler it found, the wheel and the remedy, the cu13 flavour of
 4.8.0 or later under a CUDA 13 driver; `False` the plain copy on any DSL); the programmatic-dependent-launch pair under `use_pdl`) runs
 on any CuTe DSL device from sm_80; the
-paired selector needs the radix top-k's cc 9.0. The e4m3 indexer cache is a typed decline by name (the paged scorer's e4m3 read arm is a
-follow-up); `units_per_warp` (1 / 2 / 4 / 8 units of 32 compressed rows per warp, default 1) and `use_pdl` are performance knobs of the
+paired selector needs the radix top-k's cc 9.0. The e4m3 pair (`qi` and `kbar`
+`float8_e4m3fn`: the fp8 indexer cache) is served since 2026-10-21 by the scorer's e4m3 READ arm -- `mma.sync.m16n8k32 .e4m3` on 128-B rows,
+sm_89+, a different selection function chosen by the operands' dtype; a mixed pair is a form error; `units_per_warp` (1 / 2 / 4 / 8 units of 32 compressed rows per warp, default 1) and `use_pdl` are performance knobs of the
 entry, `ring_depth` (2 / 4 / 8 n-tiles of keys in flight per warp, default 4) and `l2_hint` of the kernel-level compile -- each the same
 function. The entry's module and its helpers import no CuTe DSL: the DSL floor, the `sm_107a` target on cc 10.7 and the radix top-k's
 cc 9.0 are typed `NotImplementedError`s raised BEFORE the kernel module is imported, so the import path resolves on the public 4.6.2
@@ -1310,19 +1332,22 @@ int64 = `slot_mapping`'s dtype) instead of deriving them from the ring table -- 
 declaration captures into a CUDA graph without a warm-up, and the replay over a new step's tensors is bitwise eager.  The
 workspace carve is the caller-list band block's plus five slots at the end (`ix_q`, the logits `[T, max_pages x P / 4]` fp32,
 the counts, the ids, the compressed-slot report).  The envelope publishes the facts a serving stack reads (never re-spells):
-`decode.index_sources` (`("caller", "indexer")` at bf16 x `index_head_dim` 128), `index_cache_dtypes` (`(bf16,)`),
+`decode.index_sources` (`("caller", "indexer")` at bf16 x `index_head_dim` 128), `index_cache_dtypes` (`(bf16, e4m3)`: the e4m3
+compressed-key cache served at decode since 2026-10-21, "At decode over the pools" above),
 `index_head_dims` (`(128,)`), `index_kv_heads` (`(1,)`), `index_block_sizes` (`(4,)`), `index_top_k_range` (`(4, 512, 4)`),
 `index_query_rows_max` (64: `S_q x next_pow2(index_heads)` rows per sequence), `index_state_rows_extra` (3: `cap >= S_q + 3`),
 `index_page_sizes` (`(16, 32, 64, 128)`: `P / 4` a power of two), `fuse_prepare_default`; `decode.kv_cache_dtypes` is `(bf16,)`
 under the indexer (the e4m3 pools wait for the sparse core's in-kernel dequant arm: `indexer_e4m3_pool`).  Typed declines by
 row name (`decode.declines`, each the text the declaration raises): `indexer_query_rows`, `indexer_page_size`,
-`indexer_e4m3_cache` (the paged scorer's e4m3 read arm), `indexer_e4m3_pool`, `indexer_shared_list`,
-`fuse_prepare_rope_tables_unfused`, `indexer_f16`, `indexer_head_dim`, `indexer_thd`; `use_pdl=True` under the indexer keeps
+`indexer_e4m3_pool`, `indexer_shared_list`, `fuse_prepare_rope_tables_unfused`, `indexer_f16`, `indexer_head_dim`, `indexer_thd`
+(the `indexer_e4m3_cache` row retired 2026-10-21: the e4m3 cache is served); `use_pdl=True` under the indexer keeps
 a typed decline by name (the caller-list sparse chain serves the switch; the indexer's step threads the switch it is handed and is
 handed `False` until its own switched chain is measured).  **Limitation:** there is no FROST writer
 of the paged compressed-key cache at PREFILL yet -- the prefill form writes `index_k_compressed` densely (`[B, >= floor(S / 4),
 128]`); a serving stack scatters those rows into the pages through its table and primes the ring with the prompt's last `cap`
-raw keys (the band's `index_k_raw` rows or the slab's band), exactly as the multi-step cell of the end-to-end module does.
+raw keys (the band's `index_k_raw` rows or the slab's band), exactly as the multi-step cell of the end-to-end module does -- under the
+e4m3 indexer cache the prefill form's e4m3 rows prime the paged e4m3 cache (one rounding convention, so the scatter is bitwise the step's
+own rows).
 Validated on Rubin against the two-stage oracle (the step's set equals the fp64 top-k of the block's own operands up to ties; the
 attention of every row within the budget of the fp32 oracle fed the kernel's list; the ring rows and the completed cache rows
 bitwise the compress kernel; dead rows exact): `S_q` 1 .. 4 x `B` 1 / 2 / 4 x `kv_lens` 2 .. 32768 with dead and
