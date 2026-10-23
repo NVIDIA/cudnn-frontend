@@ -83,7 +83,12 @@ class EngineSpec:
 
 
 ENGINE_NAME = "norm_fprop_sm100"
-ENGINE_SPECS = (EngineSpec(name=ENGINE_NAME, capabilities=Capabilities()),)
+# The SM90 row runs the same kernels: they need cp.async.bulk, clusters and mapa
+# (all Hopper), and BatchNorm NHWC skips its TMEM cache tier where there is no TMEM.
+ENGINE_SPECS = (
+    EngineSpec(name=ENGINE_NAME, capabilities=Capabilities()),
+    EngineSpec(name="norm_fprop_sm90", capabilities=Capabilities(arch=(9, 0))),
+)
 
 
 def analyze_for(graph):

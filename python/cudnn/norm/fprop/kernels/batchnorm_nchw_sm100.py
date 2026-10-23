@@ -49,7 +49,7 @@ import cutlass.cute as cute
 import cutlass.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
-from cudnn.norm.utils import ws_bytes, ws_empty, ws_reset, ws_zeros, cur_stream, dyn, fake_stream, smem_budget, smem_per_sm
+from cudnn.norm.utils import ws_bytes, ws_empty, ws_reset, ws_zeros, cur_stream, dyn, fake_stream, smem_budget, smem_per_sm, coop_launch_too_large
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 
 _CTA_SS = nvvm.SharedSpace.shared_cta
@@ -923,7 +923,7 @@ def forward(
             _OCC[okey] = occ
             return y3d, saved_mean, saved_rstd
         except Exception as e:
-            if "TOO_LARGE" in str(e) and occ == 2:
+            if coop_launch_too_large(e) and occ == 2:
                 continue
             raise
     return y3d, saved_mean, saved_rstd

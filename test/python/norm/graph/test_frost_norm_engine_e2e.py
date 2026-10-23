@@ -86,10 +86,21 @@ def _tol(dt, base):
     return base if dt != torch.float32 else base * 5e-3
 
 
+def _specs_for_device():
+    """The forward and backward rows serving the current device, or None where no row does."""
+    cc = torch.cuda.get_device_capability()
+    fspec = next((s for s in fe.ENGINE_SPECS if s.capabilities.arch == cc), None)
+    bspec = next((s for s in be.ENGINE_SPECS if s.capabilities.arch == cc), None)
+    return (fspec, bspec) if fspec is not None and bspec is not None else None
+
+
 def main():
     assert torch.cuda.is_available(), "CUDA required"
-    fspec = fe.ENGINE_SPECS[0]
-    bspec = be.ENGINE_SPECS[0]
+    specs = _specs_for_device()
+    if specs is None:
+        print(f"no norm engine row for cc {torch.cuda.get_device_capability()}")
+        return
+    fspec, bspec = specs
 
     for dt in (torch.float16, torch.float32):
         print(f"\n=== dtype={dt} ===")
@@ -173,6 +184,8 @@ if __name__ == "__main__":
 @pytest.mark.L0
 def test_frost_norm_engine_e2e():
     """pytest entry point; this module also runs standalone via ``__main__``."""
+    if not torch.cuda.is_available() or _specs_for_device() is None:
+        pytest.skip("no norm engine row serves this device")
     try:
         main()
     except SystemExit as exc:

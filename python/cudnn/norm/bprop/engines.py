@@ -68,7 +68,11 @@ class EngineSpec:
 
 
 ENGINE_NAME = "norm_bprop_sm100"
-ENGINE_SPECS = (EngineSpec(name=ENGINE_NAME, capabilities=Capabilities()),)
+# The SM90 row runs the same kernels (cp.async.bulk, clusters and mapa are all Hopper).
+ENGINE_SPECS = (
+    EngineSpec(name=ENGINE_NAME, capabilities=Capabilities()),
+    EngineSpec(name="norm_bprop_sm90", capabilities=Capabilities(arch=(9, 0))),
+)
 
 
 def analyze_for(graph):

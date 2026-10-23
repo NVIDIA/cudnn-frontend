@@ -110,6 +110,27 @@ def smem_budget(preferred_bytes):
     return min(int(preferred_bytes), smem_capacity())
 
 
+def coop_launch_too_large(exc):
+    """Whether ``exc`` is a cooperative launch whose grid cannot co-reside. The driver spells
+    it CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE, the runtime cudaErrorCooperativeLaunchTooLarge,
+    and the DSL can surface either."""
+    return "COOPERATIVELAUNCHTOOLARGE" in str(exc).upper().replace("_", "")
+
+
+_HAS_TMEM = None
+
+
+def has_tmem():
+    """Whether the current device has tensor memory (``tcgen05``): the SM10x/SM11x
+    parts. On SM90 the TMEM cache tiers are disabled and the smem tiers serve."""
+    global _HAS_TMEM
+    if _HAS_TMEM is None:
+        import torch
+
+        _HAS_TMEM = torch.cuda.get_device_capability()[0] in (10, 11)
+    return _HAS_TMEM
+
+
 _SMEM_PER_SM = None
 
 
