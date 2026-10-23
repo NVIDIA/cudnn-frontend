@@ -260,8 +260,8 @@ def write_thd_row_offsets(meta, n_batch: cutlass.Int32, gran: cutlass.Int32, cu0
 def write_thd_batch_remap(meta, n_batch: cutlass.Int32, tid: cutlass.Int32, nthreads: cutlass.Int32, rank_by_kv: cutlass.Constexpr[bool] = False) -> None:
     """Fill ``batch_remap`` with ``[0, B)`` sorted by descending work length.
 
-    Forward split callers rank by KV length: each query tile traverses KV,
-    and a short-query request can still carry a long-running partition.
+    Eligible forward callers rank by KV length: each query tile traverses KV,
+    and a short-query request can still carry a long-running tile.
     Other callers retain Q-length ordering. Equal lengths keep batch order.
 
     Rank-by-counting rather than a sort network: each thread owns a batch and

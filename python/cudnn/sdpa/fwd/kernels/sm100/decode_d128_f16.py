@@ -2522,7 +2522,7 @@ def _launch(
             n_thd_units,
             not PAGED_KV,  # clamp_kv: paged pools have no packed KV total to clamp to
             SPLIT_KV,
-            bool(CFG.BOTTOM_RIGHT) and (CFG.MASK_FLAGS & MASK_SWA) == 0,
+            SPLIT_KV > 1 and bool(CFG.BOTTOM_RIGHT) and (CFG.MASK_FLAGS & MASK_SWA) == 0,
             thd_work_prefix_enabled(CFG),
         ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
