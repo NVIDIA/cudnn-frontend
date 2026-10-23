@@ -10,6 +10,11 @@ import pytest
 
 import torch
 from cudnn.frost import cutedsl_runtime_available
+from cudnn.frost.buffers import cutedsl_requirement_error
+
+requirement_error = cutedsl_requirement_error("JAX KDA tests", floor=(4, 7, 1))
+if requirement_error:
+    pytest.skip(requirement_error, allow_module_level=True)
 
 if not torch.cuda.is_available() or not cutedsl_runtime_available(torch.cuda.get_device_capability()):
     pytest.skip("JAX KDA tests need a GPU the installed nvidia-cutlass-dsl can run the FROST engines on", allow_module_level=True)
