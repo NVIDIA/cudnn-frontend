@@ -51,6 +51,7 @@ def summarize(tmp_path, runs, optimized=False):
 
 
 def test_complete_summary(tmp_path, runs):
+    """Preserve valid measurements and write JSON that strict readers accept."""
     result = summarize(tmp_path, runs)
     assert result.returncode == 0, result.stderr
     summary = json.loads((tmp_path / "summary.json").read_text(), parse_constant=lambda value: pytest.fail(f"Nonstandard JSON: {value}"))
@@ -67,6 +68,7 @@ def test_complete_summary(tmp_path, runs):
 @pytest.mark.parametrize("mode", ["eager", "gpu_busy"])
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf"), 0.0, -1.0])
 def test_invalid_timing_does_not_replace_summary(tmp_path, runs, mode, value):
+    """Reject invalid medians before overwriting a previous summary."""
     sentinel = tmp_path / "summary.json"
     sentinel.write_text("previous summary\n")
     runs["patch-B1"]["results"][0][mode]["median_ms"] = value
@@ -78,6 +80,7 @@ def test_invalid_timing_does_not_replace_summary(tmp_path, runs, mode, value):
 
 @pytest.mark.parametrize("base,patch", [(1e308, 1e-308), (1e-308, 1e308)])
 def test_derived_overflow_is_rejected(tmp_path, runs, base, patch):
+    """Reject ratios that overflow despite finite positive inputs."""
     for label, run in runs.items():
         run["results"][0]["gpu_busy"]["median_ms"] = base if label.startswith("base") else patch
     result = summarize(tmp_path, runs)
@@ -87,6 +90,7 @@ def test_derived_overflow_is_rejected(tmp_path, runs, base, patch):
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -0.001, 0.02])
 def test_invalid_error_cannot_hide_behind_pass_flag(tmp_path, runs, value):
+    """Check each relative error independently of the saved pass flag."""
     runs["patch-B2"]["results"][0]["errors_fp64"]["q"]["relative_frobenius"] = value
     result = summarize(tmp_path, runs)
     assert result.returncode != 0
@@ -96,6 +100,7 @@ def test_invalid_error_cannot_hide_behind_pass_flag(tmp_path, runs, value):
 @pytest.mark.parametrize("optimized", [False, True])
 @pytest.mark.parametrize("fault", ["environment", "helper", "case", "pass_flag", "scheduler", "missing_gradient"])
 def test_validation_survives_optimized_python(tmp_path, runs, optimized, fault):
+    """Reject incomplete or mismatched records in both Python execution modes."""
     run = runs["patch-B2"]
     if fault == "environment":
         run["torch"] = "different"
