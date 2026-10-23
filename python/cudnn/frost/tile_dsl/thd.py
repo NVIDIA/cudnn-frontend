@@ -35,6 +35,10 @@ import cutlass
 import cutlass.cute as cute
 from cutlass._mlir.dialects import arith
 
+# The backward layout's word count is defined DSL-free in ``constants`` (host sizing imports it before the DSL version
+# gate has run -- see there) and re-exported here with the offsets it closes.
+from cudnn.frost.tile_dsl.constants import THD_BWD_META_WORDS
+
 # int64 words per 128-byte TMA descriptor.
 TENSOR_MAP_QWORDS = 128 // 8
 # Byte alignment every tensor-map object must sit on: CUtensorMap is declared `alignas(128)`
@@ -67,7 +71,7 @@ THD_ROWOFF_OFF = lambda b: 4 * b + 4  # noqa: E731
 # ... | row_off(B+1) | unit prefix(B+1) ]: the backward's remap-ordered unit prefix (write_thd_work_prefix with
 # prefix0=THD_BWD_WORK_PREFIX_OFF; Q- or KV-blocked units through cu0) that thd_decode_unit_prefix binary-searches.
 THD_BWD_WORK_PREFIX_OFF = lambda b: 5 * b + 5  # noqa: E731
-THD_BWD_META_WORDS = lambda b: 6 * b + 6  # noqa: E731
+# THD_BWD_META_WORDS = 6 * b + 6, this layout's total: defined in ``constants`` and imported above (host sizing needs it DSL-free).
 
 # --- optional TENSOR-MAP extension -----------------------------------------
 # For a launch ABI with no descriptor operand: the ``B + 3`` tensor maps follow the
