@@ -225,6 +225,13 @@ not become a compile key.
   context; no invalid cross-device GPU launch is needed. See the sparse SDPA
   tests `test_compilation_and_launch_preserve_the_declared_or_resolved_device`
   and `test_compilation_bypasses_argument_only_caches_across_devices`.
+  Standalone wrapper caches also need the input device in their key when an
+  object retains a launchable or workspace. A device-aware outer memo cannot
+  protect an inner cache that omits it. The grouped GLU detector
+  `test_block_scaled_wrapper_cache_separates_devices` alternates two devices
+  without clearing caches and replays captures from each after changing inputs.
+  Use an explicit per-device capture stream in that detector: Torch's implicit
+  `graph.default_capture_stream` can retain the first device's stream.
 - **Issue #604 is closed**: SM80 THD compiles use symbolic packed extents.
   The prepared backward host takes Int64 capacities and launch bounds at
   runtime, including the compact Stats head pitch and deterministic-counter
