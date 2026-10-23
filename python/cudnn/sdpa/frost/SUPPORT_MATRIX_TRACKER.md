@@ -3379,7 +3379,7 @@ the kernel's list, the ring rows bitwise the slab's raw band, the completed cach
 | indexer e4m3 multi-step (2026-10-21) | 1 then 4 / per row: eight carried steps after a 301-token e4m3 PREFILL | 1 | L1 page 16 | the fill rule | fused and unfused / LSE | e4m3 ✅ (`test_block_qsa_end_to_end.py`: the prefill form's e4m3 `index_k_compressed` rows scattered into the paged e4m3 cache, the ring primed bf16; after every step the cache rows BITWISE a from-scratch e4m3 compress of the accepted stream -- one rounding convention across the prefill form, the step form and the fused prepare) |
 
 **Served since 2026-10-21 -- the e4m3 compressed-key (indexer) cache at DECODE** (`QsaSpec(index_source="indexer", index_band=True,
-index_cache_dtype=torch.float8_e4m3fn)` on the block-sparse DECODE mode above; bf16 activations, bf16 / f16 pools; the `indexer e4m3 ...` rows
+index_cache_dtype=torch.float8_e4m3fn)` on the block-sparse DECODE mode above; bf16 activations, **bf16 main pools** (the block's cache-write check requires the pools in the resolved activation dtype; the e4m3 indexer cache is the independently declared dtype); the `indexer e4m3 ...` rows
 of the table): the paged compressed-key cache `sample_index_kv_cache` / `execute(index_kv_cache=)` `[n_pages, P / 4, 1, 128]` is **e4m3**
 (REQUIRED in the declared dtype -- a bf16 cache under the attribute and an e4m3 cache under a bf16 declaration are refused by name, at
 declaration and at execute), the ring stays bf16 (a bit copy, never quantized), `ix_q` is carved at 1 B per element (every bf16 carve

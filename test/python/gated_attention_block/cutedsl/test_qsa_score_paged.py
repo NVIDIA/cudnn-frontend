@@ -127,15 +127,17 @@ class _Case:
             self.poison_unmapped_rows(kv_lens)
 
     def poison_unmapped_rows(self, kv_lens):
-        """NaN into every compressed row no sequence's VISIBLE blocks map to (the rows past ``n_vis_max`` inside the last visible page included)."""
-        visible = torch.zeros(self.num_pages, self.rpp, dtype=torch.bool, device=_DEV)
-        for b, kv in enumerate(kv_lens):
-            n_vis = max(0, min(int(kv) // BS, self.n_blocks_max))
-            for j in range(n_vis):
-                pg = int(self.table[b, j // self.rpp])
-                if 0 <= pg < self.num_pages:
-                    visible[pg, j % self.rpp] = True
-        self.pool[~visible] = torch.full((), float("nan"), dtype=self.cache_dtype, device=_DEV)
+        """NaN into every compressed row no sequence's VISIBLE blocks map to (the rows past ``n_vis_max`` inside the last visible page included).
+        Host-side set algebra: ONE copy of the table, one gather of its rows, one scatter of the visible mask, one device write (no per-block
+        device read or indexing launch -- at ``n_blocks_max`` 32768 x 4 sequences that was ~131k synchronizing iterations per case)."""
+        table = self.table.cpu().long()  # [B, max_pages]
+        n_vis = torch.tensor([max(0, min(int(kv) // BS, self.n_blocks_max)) for kv in kv_lens], dtype=torch.long)  # [B]
+        j = torch.arange(self.n_blocks_max)  # the block index within a sequence; j // rpp < max_pages by construction
+        pg = table[:, j // self.rpp]  # [B, n_blocks_max]: the page of every block slot
+        ok = (j[None, :] < n_vis[:, None]) & (pg >= 0) & (pg < self.num_pages)  # visible, through a mapped page
+        visible = torch.zeros(self.num_pages, self.rpp, dtype=torch.bool)
+        visible[pg[ok], (j % self.rpp).expand_as(pg)[ok]] = True
+        self.pool[~visible.to(_DEV)] = torch.full((), float("nan"), dtype=self.cache_dtype, device=_DEV)
 
     def dense(self, table=None):
         """``[B, n_blocks_max, D]`` in the cache dtype: the compressed keys gathered through the table (a ``-1`` / out-of-range page -> zeros)."""
