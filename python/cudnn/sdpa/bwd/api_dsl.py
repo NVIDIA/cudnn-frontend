@@ -19,8 +19,10 @@ from cuda.bindings import driver as cuda
 
 from cudnn.api_base import APIBase, TensorDesc, TupleDict
 from cudnn.frost.template_loader import load_template
-from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16
-from cudnn.frost.tile_dsl.thd import THD_BWD_META_WORDS
+
+# THD_BWD_META_WORDS from the DSL-free ``constants``, never from ``tile_dsl.thd`` at module scope: this module is the SM80
+# wrapper's entry and must import without the DSL for the wrapper to decline a too-old one by version (Rule 7).
+from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16, THD_BWD_META_WORDS
 from cudnn.sdpa.bwd.config_sm120 import (
     ROW_ROUND as _SM120_ROW_ROUND,
     SEQ_KV_TILES as _SM120_KV_TILES,
