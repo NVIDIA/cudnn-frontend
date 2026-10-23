@@ -8,10 +8,13 @@ interface and the compressed-logits orchestration cannot drift apart:
 
 * which ``qhead_per_kv_head`` groups the unified score kernel serves per precision,
 * how many query tokens one MMA tile packs for a head group (``m_block_size = qhead_per_kv_head * q_tokens``),
-* the geometry sanity check between a query length and the compressed key length it is scored against.
+* the geometry sanity check between a query length and the compressed key length it is scored against,
+* the paged-K contract (page pool + block table + per-sequence key counts).
 """
 
 from __future__ import annotations
+
+import torch
 
 # Head groups the BF16 unified score kernel packs along the MMA N axis. The epilogue head-reduce walks
 # ``qhead_per_kv_head`` TMEM columns per query token in pairs, so a group must be even and the N tile
@@ -82,3 +85,50 @@ def check_q_covered_by_k(seqlen_q: int, seqlen_k: int, ratio: int, *, what_q: st
             f"{what_q} ({seqlen_q}) must be <= {what_k} * ratio + (ratio - 1) ({seqlen_k * ratio + ratio - 1}): "
             f"its last row would see more compressed keys than {what_k} holds"
         )
+
+
+def resolve_paged_k(
+    k: torch.Tensor,
+    block_table: torch.Tensor,
+    kv_lens: torch.Tensor | None,
+    cu_seqlens_k: torch.Tensor | None,
+    *,
+    n_block_size: int,
+    batch: int,
+    device: torch.device,
+) -> tuple[int, int]:
+    """Paged-K contract shared by the dense and compressed-logits entries; returns ``(page_size, max_pages)``.
+
+    ``k`` is a page pool ``(num_pages, page_size, n_heads_kv, head_dim)``: sequence ``b`` reads its ``i``-th page
+    at pool row ``block_table[b, i]`` and scores ``kv_lens[b]`` compressed keys. The kernel streams K in
+    ``min(page_size, n_block_size)``-row TMA boxes that never straddle a page and stack in 8-row swizzle atoms.
+    """
+    if kv_lens is None:
+        raise ValueError("block_table requires kv_lens: a (batch,) int32 tensor of visible compressed keys per sequence")
+    if cu_seqlens_k is not None:
+        raise ValueError("paged K takes its per-sequence key counts from kv_lens; cu_seqlens_k must be None")
+    if k.ndim != 4:
+        raise ValueError(f"paged k must be a (num_pages, page_size, n_heads_kv, head_dim) pool, got {tuple(k.shape)}")
+    page_size = int(k.shape[1])
+    if page_size % 8 != 0 or (page_size % n_block_size != 0 and n_block_size % page_size != 0):
+        raise ValueError(f"page_size ({page_size}) must be a multiple of 8 that divides {n_block_size} or is a multiple of {n_block_size}")
+    if (
+        block_table.dtype != torch.int32
+        or block_table.ndim != 2
+        or tuple(block_table.shape[:1]) != (batch,)
+        or block_table.shape[1] < 1
+        or block_table.stride(1) != 1
+        or not block_table.is_cuda
+        or block_table.device != device
+    ):
+        raise ValueError(f"block_table must be a CUDA int32 ({batch}, max_pages) tensor with unit column stride on {device}")
+    if (
+        kv_lens.dtype != torch.int32
+        or kv_lens.ndim != 1
+        or kv_lens.shape[0] != batch
+        or not kv_lens.is_contiguous()
+        or not kv_lens.is_cuda
+        or kv_lens.device != device
+    ):
+        raise ValueError(f"kv_lens must be a contiguous CUDA int32 ({batch},) tensor on {device}")
+    return page_size, int(block_table.shape[1])

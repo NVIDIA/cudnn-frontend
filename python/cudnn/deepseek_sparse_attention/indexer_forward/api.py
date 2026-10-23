@@ -234,6 +234,8 @@ def indexer_forward_wrapper(
     sf_vec_size: int = 32,
     return_lse: bool = False,
     lse_out: Optional[torch.Tensor] = None,
+    block_table: Optional[torch.Tensor] = None,
+    kv_lens: Optional[torch.Tensor] = None,
 ) -> TupleDict:
     """High-level wrapper. Allocates the output buffer with TMA padding on S_k.
 
@@ -242,6 +244,14 @@ def indexer_forward_wrapper(
     positions outside the valid KV range with -inf. ``q_causal_offsets`` may
     specify the global uncompressed token index for each batch/THD segment's
     local q[0].
+
+    ``block_table`` ((B, max_pages) int32) with ``kv_lens`` ((B,) int32) reads
+    ``k`` as a page pool ``(num_pages, page_size, 1, D)`` or
+    ``(num_pages, page_size, D)`` (SM100, BF16, ``page_size`` a multiple of 8
+    that divides 128 or is a multiple of it): sequence ``b`` owns pages
+    ``block_table[b, :ceil(kv_lens[b] / page_size)]`` and scores its first
+    ``kv_lens[b]`` keys; ``cu_seqlens_k`` must be ``None`` and the score width
+    is ``max_seqlen_k`` (default ``max_pages * page_size``).
 
     On SM100 the kernel writes a ``(B, S_q, ceil4(S_k))`` (THD:
     ``(total_q, ceil4(max_seqlen_k))``) padded buffer through its ``[..., :S_k]``
@@ -257,6 +267,8 @@ def indexer_forward_wrapper(
     if device_major() == 9:
         if cu_seqlens_q_scale_padded is not None or cu_seqlens_k_scale_padded is not None:
             raise NotImplementedError("MXFP8 scale padded cu_seqlens are only supported on SM100+")
+        if block_table is not None or kv_lens is not None:
+            raise NotImplementedError("paged K is only supported on SM100+")
         unsupported = []
         if m_block_size != 128:
             unsupported.append(f"m_block_size={m_block_size}")
@@ -328,6 +340,8 @@ def indexer_forward_wrapper(
         cu_seqlens_q_scale_padded=cu_seqlens_q_scale_padded,
         cu_seqlens_k_scale_padded=cu_seqlens_k_scale_padded,
         sf_vec_size=sf_vec_size,
+        block_table=block_table,
+        kv_lens=kv_lens,
         current_stream=stream,
     )
     return TupleDict(scores=scores)
@@ -368,6 +382,8 @@ def indexer_forward_top_k_wrapper(
     out_logits: Optional[torch.Tensor] = None,
     cand_batch_offsets: Optional[torch.Tensor] = None,
     deterministic: bool = False,
+    block_table: Optional[torch.Tensor] = None,
+    kv_lens: Optional[torch.Tensor] = None,
 ) -> TupleDict:
     """Combined SM100 indexer score generation and Top-K selection API.
 
@@ -390,6 +406,14 @@ def indexer_forward_top_k_wrapper(
     Set ``deterministic=True`` to resolve exact-value ties at the K-th boundary
     toward the smallest local KV indices. This makes the selected set
     reproducible, although output slot order remains unspecified.
+
+    ``block_table`` ((B, max_pages) int32) with ``kv_lens`` ((B,) int32) reads
+    ``k`` as a page pool ``(num_pages, page_size, 1, D)`` or
+    ``(num_pages, page_size, D)`` (BF16, ``page_size`` a multiple of 8 that
+    divides 128 or is a multiple of it): sequence ``b`` owns pages
+    ``block_table[b, :ceil(kv_lens[b] / page_size)]`` and scores its first
+    ``kv_lens[b]`` keys. ``cu_seqlens_k`` must be ``None``, and the ids are
+    local, so pass ``topk_indices_global=False``.
     """
     if device_major() < 10:
         raise NotImplementedError("compressed indexer forward is SM100-only; standalone IndexerTopK remains SM90+")
@@ -430,6 +454,8 @@ def indexer_forward_top_k_wrapper(
         return_softmax=return_softmax,
         softmax_out=softmax_out,
         deterministic=deterministic,
+        block_table=block_table,
+        kv_lens=kv_lens,
         current_stream=stream,
     )
 
