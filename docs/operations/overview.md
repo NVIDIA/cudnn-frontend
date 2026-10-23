@@ -29,7 +29,7 @@ The experimental API catalog includes:
 - [FLA Integration Shims](/operations/LinearAttention/fla)
 - [Kimi Delta Attention in JAX](/operations/LinearAttention/kda_jax)
 - [Fused GDN Decode / Verify Steps as a FlashInfer Backend (SM100 / SM120)](/operations/LinearAttention/gdn_decode_flashinfer_backend) — the fused Gated DeltaNet decode step and MTP verify step of a Qwen 3.5-architecture dense model's GDN sub-layer as one FROST launch each, registered as the `frost_fe` backend of FlashInfer's experimental Qwen 3.5 GDN block (bf16 operands, fp32 state, FP8 output)
-- [LayerNorm and RMSNorm in JAX](/operations/Normalizations/norm_jax)
+- [LayerNorm and RMSNorm in JAX](/operations/Normalizations/norm_jax) ([GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/normalizations/norm_jax.md))
 - [GEMM + Amax](/operations/Matmul/gemm_fusions/gemm_amax)
 - [GEMM + RoPE + MXFP8 Projection](/operations/Matmul/gemm_fusions/gemm_proj_rope_mxfp8)
 - [Gated Attention Block (SM107)](/operations/Attention/gated_attention_block) — projection, QK-norm + RoPE, SDPA, sigmoid gate, out projection as one FROST block (bf16 / FP8 / MXFP8, optional MXFP4 weights and NVFP4 / MXFP4 output); index-list sparse attention (`QsaSpec`) with the in-block indexer's decode and extend steps over the paged side caches, and write-through into a paged KV cache
@@ -92,9 +92,9 @@ The Triton NVFP4 attention QAT backward API additionally requires the
 Those required dependencies are framework-neutral. Install your tensor framework separately — from a checkout, the PEP 735 dependency groups pin the right companion packages:
 ```bash
 pip install --group torch   # torch + torch-c-dlpack-ext
-pip install --group jax     # jax >= 0.5 (XLA entry points via cutlass.jax, shipped with nvidia-cutlass-dsl)
+pip install --group jax     # jax >= 0.5 + nvidia-cutlass-dsl[cu13] >= 4.7.1
 ```
-(For the published wheel, `pip install torch torch-c-dlpack-ext` or `pip install "jax>=0.5"` directly.)
+(For the published wheel, `pip install torch torch-c-dlpack-ext` or `pip install "jax>=0.5" "nvidia-cutlass-dsl[cu13]>=4.7.1"` directly.)
 
 After installation, you can import the APIs directly from the `cudnn` package, i.e. `from cudnn import {your_operation}`
 
