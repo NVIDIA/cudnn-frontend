@@ -2262,7 +2262,8 @@ def _bsa_attn_fwd_sm100_fp8_blk128(
                 int(topk),
                 metadata(block_nums),
                 stream,
-                options="--enable-tvm-ffi",
+                # The DSL default (--opt-level 3) makes this kernel ~2.4x slower on SM103 (B1 H40 S128k topk256: 98.8 ms vs 41.9 ms).
+                options="--enable-tvm-ffi --opt-level 2",
             )
         with torch.cuda.nvtx.range("bsa_attn_fwd_sm100_fp8_blk128_kernel"):
             _bsa_attn_fwd_sm100_fp8_blk128.compile_cache[cache_key](
