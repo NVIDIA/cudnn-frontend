@@ -20,7 +20,7 @@ RUN git clone https://github.com/NVIDIA/cudnn-frontend.git
 RUN pip install -v /workspace/cudnn-frontend
 
 # Clone flash-attention
-RUN pip install fa4 nvidia-cutlass-dsl[cu13]==4.5.0
+RUN pip install fa4 nvidia-cutlass-dsl[cu13]==4.7.1
 
 # Install additional dependencies for benchmarking
 RUN pip install seaborn

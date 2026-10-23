@@ -329,12 +329,12 @@ SDPA-specific hard rules (cited as Rule S1, S2, ...) live in
 **Rule 7 — gate the CuTe DSL version at runtime; never assume the installed
 DSL satisfies your kernel.**
 
-- The `pyproject.toml` floor on `nvidia-cutlass-dsl` (`>=4.6.2`) is the
-  **downstream** floor, not ours: vLLM and SGLang inherit quack-kernels'
-  `==4.6.2`, and a higher floor would make this package uninstallable next to
-  them. The FROST-derived kernels need more (`CUTEDSL_MIN_VERSION`, 4.7.0). So
-  an installed DSL that satisfies pip can still be below what a kernel needs,
-  and every backend/kernel must cope with that at runtime.
+- The `pyproject.toml` floor on `nvidia-cutlass-dsl` is `>=4.7.1`. The JAX
+  dependency group requires `jax>=0.6.0`, matching
+  [CuTeDSL 4.7.1's minimum](https://github.com/NVIDIA/cutlass/blob/v4.7.1/python/CuTeDSL/cutlass/jax/__init__.py).
+  The package floor covers the shared FROST requirement (`CUTEDSL_MIN_VERSION`,
+  4.7.0); retain defensive runtime gates and check stronger requirements when
+  a kernel needs newer APIs or target support.
 - Before a path imports a DSL-version-specific API, check the installed version
   with `cudnn.frost.buffers.cutedsl_state()` / `cutedsl_too_old()` (floor:
   `CUTEDSL_MIN_VERSION`) and **decline, or raise an error that names the
@@ -377,10 +377,10 @@ DSL satisfies your kernel.**
   `l2_hint=True` by name -- the decline states the defect as observed (never as a property of
   the compiler it found) and prescribes the cu13 flavour under a CUDA 13 driver, not a wheel
   number.
-- Tests that import a kernel module directly `pytest.skip` on a too-old DSL —
-  they do not fail. CI runs the `oss:` lanes across the supported DSL versions
-  (`ci/stages/oss_tests/jobs.yml` in internal CI); a lane below your floor
-  must show skips, not errors.
+- Do not add test skips or version-dependent test paths for DSL versions below
+  the package floor. CI's `oss:` lanes must install a supported DSL version
+  (`ci/stages/oss_tests/jobs.yml` in internal CI). Existing gates for kernels
+  requiring a newer DSL remain applicable.
 - Keep declaration and execute-preflight metadata validators outside modules
   that import newer DSL kernel APIs. A correctly gated stage cannot protect
   an earlier constructor import of its validator. Exercise the public
@@ -414,8 +414,8 @@ DSL satisfies your kernel.**
   `deepseek_sparse_attention/score_recompute/`). Detector: the kernel's
   numerics tests on a 4.7 lane.
 - Why: PR #799's `causal_conv1d_update` imported `frost.tile_dsl` from a route
-  with no version check and broke the 4.6.2 lane — the version vLLM and SGLang
-  ship — with a bare `ModuleNotFoundError: cutlass.experimental`; the bulk
+  with no version check and broke the then-supported 4.6.2 lane with a bare
+  `ModuleNotFoundError: cutlass.experimental`; the bulk
   route next to it had the check and declined cleanly. Earlier, PR #854's
   module-scope `set_name_prefix(..., remove_cutlass_symbol=True)` failed the
   same way on a since-dropped 4.5.x lane, reported as "install optional
@@ -794,7 +794,7 @@ Public functions (`cudnn.ops.<op>_<direction>(...)` / `cudnn.ops.<op>_<direction
 3. Exports: `_LAZY_EXPORTS` in `python/cudnn/ops/__init__.py` (or `python/cudnn/ops/<family>/__init__.py` for an op in a family); register any new package dir in `pyproject.toml` packages list.
 4. Docs: page under `docs/fe-oss-apis/` (family subdir) + link it from `docs/fe-oss-apis/overview.md`.
 5. Tests: `test/python/<op>/cutedsl/test_<op>.py` (+ `_utils.py`/reference), covering supported and unsupported configurations and numerical reference comparison.
-6. DSL version gate (Rule 7): the route declines with a version-naming error below `CUTEDSL_MIN_VERSION`, and the tests skip there instead of failing.
+6. DSL version gate (Rule 7): retain runtime declines for unsupported DSL versions; do not add test skips for versions below the package floor.
 
 The `cutedsl-kernel-integration` skill (`skills/cutedsl-kernel-integration/`) documents this workflow in detail, including how to classify a kernel into a family — follow it for any kernel integration.
 

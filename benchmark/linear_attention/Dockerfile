@@ -20,7 +20,7 @@ RUN git clone https://github.com/NVIDIA/cudnn-frontend.git
 RUN pip install -v /workspace/cudnn-frontend
 
 # Install the Cutlass DSL runtime (cuDNN FROST engines).
-RUN pip install nvidia-cutlass-dsl[cu13]==4.7.0 apache-tvm-ffi
+RUN pip install nvidia-cutlass-dsl[cu13]==4.7.1 apache-tvm-ffi
 
 # Install the cuTile runtime (cuDNN cuTile engines).
 RUN pip install cuda-tile==1.5.0

@@ -47,7 +47,7 @@ pip install -e .              # graph API + the OSS CuTeDSL kernels (nvidia-cutl
                               # ".[cutedsl]" still resolves -- it now holds only cuda-python, which the DSL pulls in anyway
 pip install -e ".[cutile]"    # + the cuTile linear-attention engines (cuda-tile; needs a system tileiras)
 pip install --group torch      # + torch for the CuTeDSL APIs (torch, torch-c-dlpack-ext)
-pip install --group jax        # + jax for the CuTeDSL APIs (jax >= 0.5; XLA entry points via cutlass.jax)
+pip install --group jax        # + jax for the CuTeDSL APIs (jax >= 0.6.0; XLA entry points via cutlass.jax)
 ```
 
 `setup.py` honors env vars: `CUDNN_PATH`, `CUDA_PATH` / `CUDAToolkit_ROOT`, `DEBUG=1` (debug build), `CMAKE_BUILD_PARALLEL_LEVEL`, `CMAKE_GENERATOR`.
@@ -87,7 +87,7 @@ First invocation builds the hook environments and can take >5 minutes; later run
 - `include/` is header-only: no `.cpp` files, no new required dependencies. Vendored third-party code lives in `include/cudnn_frontend/thirdparty/`.
 - Every new frontend-only Python API needs: public functions, lazy export in `python/cudnn/ops/__init__.py`, docs under `docs/fe-oss-apis/`, and pytest coverage under `test/python/fe_api/`. Full recipe: [python/cudnn/AGENTS.md](python/cudnn/AGENTS.md) and the `cutedsl-kernel-integration` skill.
 - Frontend-only OSS APIs are experimental; keep the lazy-import boundary intact (no eager `torch`/`cutlass` imports at `cudnn` import time). CuTeDSL is a required dependency now, but a tensor framework is not, and `import cudnn` still has to stay cheap.
-- The `pyproject.toml` floor on `nvidia-cutlass-dsl` (`>=4.6.2`) is the **downstream** floor (vLLM/SGLang inherit quack-kernels' `==4.6.2`), and it is **below** what the FROST-derived kernels need (`CUTEDSL_MIN_VERSION`, 4.7.0). Every backend/kernel gates the DSL version at runtime and declines with an error that names the version — never assume the installed DSL satisfies your kernel. [python/cudnn/AGENTS.md](python/cudnn/AGENTS.md) **Rule 7** is canonical; cite it in review.
+- The `pyproject.toml` floor on `nvidia-cutlass-dsl` is `>=4.7.1`; the JAX dependency group requires `jax>=0.6.0`, matching CuTeDSL 4.7.1's minimum. Do not add test skips for DSL versions below the package floor. Kernels that need newer APIs or target support still gate those requirements at runtime. [python/cudnn/AGENTS.md](python/cudnn/AGENTS.md) **Rule 7** is canonical; cite it in review.
 - Version lives in three places that must stay in sync: `CMakeLists.txt` (`project(... VERSION ...)`), `include/cudnn_frontend_version.h`, `python/cudnn/__init__.py` (`__version__`).
 - Runtime debugging: set `CUDNN_FRONTEND_LOG_INFO=1` and `CUDNN_FRONTEND_LOG_FILE=stderr` for FE logs; backend logs via `CUDNN_LOGLEVEL_DBG=3 CUDNN_LOGDEST_DBG=stderr`.
 - Public-API signatures evolve **append-only**: new parameters go at the end (with defaults), never inserted mid-signature — positional callers across C++, pybind, and Python wrappers break silently otherwise (review on PR #266).

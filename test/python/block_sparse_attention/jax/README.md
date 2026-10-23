@@ -9,7 +9,7 @@ CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false python -m pytest test
 The suite spans three directories; only this directory's conftest is loaded, so
 `--require-sm100` (below) stands in for the other directories' GPU checks.
 
-Requires CuTeDSL >=4.7 and JAX >=0.9.1 with CUDA support. The `--confcutdir`
+Requires CuTeDSL >=4.7.1 and JAX >=0.9.1 with CUDA support. The `--confcutdir`
 option excludes the torch-based parent conftest for this standalone invocation. Fresh-process tests block every torch import, including
 when torch and TVM-FFI are installed. Keep torch parity tests under
 `test/python/block_sparse_attention/cutedsl/test_BSA_jax_parity.py`.
@@ -21,14 +21,13 @@ ordering in the shared bridge. Compiled forward HLO checks apply to compact
 standalone inputs; they do not promise arbitrary surrounding JAX graphs avoid
 layout conversions.
 
-The normal `test/python` sweep collects these tests. The CI SM100
-CuTeDSL 4.7 jobs can run these tests; the regular CuTeDSL 4.6.2 jobs skip them.
-Missing JAX or an older CuTeDSL skips the modules before kernel imports.
+The normal `test/python` sweep collects these tests. Run them in SM100 jobs
+with a compatible JAX installation and the package's CuTeDSL dependency.
 Torch-free checks use fresh subprocesses even in the normal torch-based suite.
 
 ## Container qualification
 
-The [Dockerfile](Dockerfile) pins the NGC JAX 26.07 image and CuTeDSL 4.7.0,
+The [Dockerfile](Dockerfile) pins the NGC JAX 26.07 image and CuTeDSL 4.7.1,
 builds this checkout's frontend wheel from source, and runs the isolated suite
 without torch installed. Build from committed sources to exclude local venvs,
 build artifacts and planning files:
@@ -44,9 +43,9 @@ The default command is `python -m pytest test/python/block_sparse_attention/jax 
 visible GPUs an error instead of a skipped qualification run. Select the idle
 SM100 device appropriate to the host with Docker's `--gpus` option.
 
-For a torch-free container, use the standalone command above. A CuTeDSL 4.6.x
-job cannot qualify BSA JAX; qualification requires a compatible JAX installation
-and CuTeDSL >=4.7 on SM100. Use `--require-sm100` to reject an unavailable GPU.
+For a torch-free container, use the standalone command above. Qualification
+requires a compatible JAX installation and CuTeDSL >=4.7.1 on SM100.
+Use `--require-sm100` to reject an unavailable GPU.
 
 Validated on SM100 on 2026-09-10: **28 passed** in the torch-free image. A
 CPU-only run with `JAX_PLATFORMS=cpu` and `--require-sm100` exited with status 4.
