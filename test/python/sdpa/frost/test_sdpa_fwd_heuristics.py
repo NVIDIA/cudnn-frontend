@@ -1577,8 +1577,10 @@ def test_sm107_d128_cga_and_pack_admission(sm107_metadata_target):
     cga=2, and PackGQA for every group that divides the 128-row tile (4 / 8 / 16; the d64 envelope too); a group that
     does not (96/8) is declined with the divisibility reason, dense d256 packs on the d256 decode tile within its route
     (S_q x G within two token units of the 32-column tile) and keeps its paged-THD-only PackGQA past it, THD nonpaged
-    keeps the cga2 prefill pipeline (cga=1 outside its domain, no packed leg), and dense PAGED queries -- not wired on
+    keeps the cga2 prefill pipeline and admits unsplit packing (cga=1 outside its domain), and dense PAGED queries -- not wired on
     cc 10.7 outside the d256 decode tile -- never see the d128 tile."""
+    from dataclasses import replace
+
     from cudnn.sdpa.fwd.engines import effective_cgas
 
     caps = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16).capabilities
@@ -1598,7 +1600,9 @@ def test_sm107_d128_cga_and_pack_admission(sm107_metadata_target):
     assert past_route is not None and "decode tile" in past_route, past_route
     thd = _sm107_d128_facts(thd=True, padded=True)
     assert "outside this engine's domain" in engines.mismatch(caps, thd, engines.SdpaFwdKnobs(cga=1))
-    assert engines.mismatch(caps, thd, pack) is not None
+    assert engines.mismatch(caps, thd, pack) is None
+    assert engines.mismatch(caps, replace(thd, h_q=96), pack) is None
+    assert engines.mismatch(caps, thd, replace(pack, split_kv=2)) is not None
     assert 1 not in effective_cgas(caps, _sm107_d128_facts(has_paged_kv=True, page_size=16, padded=True))
 
 
