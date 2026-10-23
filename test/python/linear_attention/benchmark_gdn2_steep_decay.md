@@ -91,14 +91,17 @@ The [evidence archive](https://github.com/alfredclwong/cudnn-frontend/releases/t
 The release includes a SHA256 checksum. Generated results do not belong in this checkout.
 The archive retains the measured scripts. Later validation fixes change the benchmark script hash and require fresh ABBA records for new comparisons.
 
-## CPU summary tests
+## CPU validation tests
 
 The summary command needs only the Python standard library. Its regression tests need pytest and no GPU.
+The benchmark validation tests also need PyTorch. They use CPU tensors and replace GPU calls with test doubles.
+Both suites check normal and optimized Python execution.
 Run them without the GPU test harness:
 
 ```bash
 python -m pytest --noconftest -c test/python/pytest.ini -o addopts= \
-  test/python/linear_attention/test_gdn2_steep_decay_summary.py
+  test/python/linear_attention/test_gdn2_steep_decay_summary.py \
+  test/python/linear_attention/test_gdn2_steep_decay_benchmark.py
 ```
 
 ## Upstream correctness tests

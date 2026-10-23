@@ -196,6 +196,10 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
   Serialize with `allow_nan=False`. Check all expected numerical errors against
   their tolerance instead of trusting a saved pass flag. The CPU subprocess
   tests in `linear_attention/test_gdn2_steep_decay_summary.py` cover these cases.
+  Benchmark producers must also use explicit checks for scheduler activation,
+  finite tensors, profiler activity, and numerical acceptance. The CPU tests in
+  `linear_attention/test_gdn2_steep_decay_benchmark.py` exercise the real producer
+  functions with mocked GPU calls under normal and optimized Python.
 - Memo-key regression tests should observe the actual lookup and the selected plan, rather than relying on positional offsets in private key tuples. Appending an independent cache axis must not break an unrelated test; keep the miss count, selected configuration, and A-B-A identity checks. `test_block_scaled_memo_respects_overlap_margin` records the lookup key through its test memo.
 - Workspace device checks compare storage with the declared launch device, not a fixed CUDA ordinal or the ambient current device. Match the diagnostic's actual expected/observed ordinals; the wrong-device message need not contain the word "device". `core/cutedsl/test_workspace_device.py` covers the diagnostic with one GPU and both storage-device directions when two are visible, including DLPack-only and CUDA-array-interface-only buffers.
 - **A dispatch fact that reads the device's SM count is asserted against the live resolver, never as a constant.** The small-M
