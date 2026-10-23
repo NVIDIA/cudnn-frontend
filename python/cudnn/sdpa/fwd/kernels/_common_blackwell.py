@@ -1282,10 +1282,7 @@ def make_sdpa_helpers(
 
         Through the remap-ordered work prefix the setup launch publishes
         (``write_thd_work_prefix``; ``THD_WORK_PREFIX_OFF``): a binary search over
-        B + 1 words. The former walk over every sequence -- a dependent-load chain
-        plus two integer divisions per sequence, repeated by every decoding warp
-        at every unit -- dominated batches of many short sequences (B >= 32 of
-        2-3 KV tiles each). Dead units (uid past the live total) keep
+        B + 1 words. Dead units (uid past the live total) keep
         ``batch == n_batch``: in-bounds metadata reads make every downstream
         consumer a no-op (empty KV range, no O/LSE writes).
         """

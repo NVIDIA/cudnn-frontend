@@ -1279,13 +1279,8 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         # for the measured prefill families below.
         if 100 <= caps.sm_lo < 120 and not (facts.is_fp8 or facts.is_mxfp8) and _selected_d_shape(caps, facts) in ((64, 64), (128, 128), (256, 256)):
             primary = SCHED_NATURAL
-            # The SM100 d64 half THD walk takes LPT under a sliding window too,
-            # with or without an attention sink: a windowed unit's walk is a
-            # few KV tiles whatever its position, so the heads-fastest LPT
-            # order keeps the group's shared K/V tiles adjacent in L2 --
-            # MEASURED on B200 and B300 (64/8 d64 bf16, window 128..1024, b1
-            # S8192 and b32 S512, sink on and off): LPT 0.84-0.93x of NATURAL
-            # on every cell, LPT_L2 between the two.
+            # The SM100 d64 half THD prefill takes LPT under a sliding window
+            # as well, with or without an attention sink.
             d64_banded = caps.sm_lo == 100 and (facts.d_qk, facts.d_v) == (64, 64) and facts.causal and facts.window_left is not None
             if (
                 SCHED_LPT in domain

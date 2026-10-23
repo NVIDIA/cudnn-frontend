@@ -459,9 +459,7 @@ def thd_decode_unit_prefix(
 ) -> tuple:
     """:func:`thd_decode_unit`'s ``(q_tile_idx, batch, head)`` through the remap-ordered work prefix
     :func:`write_thd_work_prefix` published at ``THD_WORK_PREFIX_OFF`` -- a binary search over ``B + 1``
-    words instead of a walk over every sequence.  The walk is a dependent-load chain plus two integer
-    divisions PER SEQUENCE, repeated by every decoding warp at every unit; with many short sequences it
-    dominated the unit (the gpt-oss-style batch of 32-64 requests, 2-3 KV tiles each).
+    words instead of a walk over every sequence.
 
     Same contract as the walk: the prefix was built from the Q prefix with THIS ``q_tile`` and ``n_qh``
     (the setup launch's ``cga_tile_m`` / ``n_qh``), a uid past the live total keeps ``batch == n_batch``,
