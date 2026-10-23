@@ -22,8 +22,16 @@ import cutlass.cute as cute
 from cudnn.deepseek_sparse_attention.score_recompute.indexer_score_unified_sm100 import (
     IndexerScoreUnifiedSm100,
 )
-from cudnn.deepseek_sparse_attention.score_recompute.indexer_score_unified_sm100_mxfp8 import (
-    IndexerScoreUnifiedSm100Mxfp8,
+from cudnn.deepseek_sparse_attention.score_recompute._block_scaled import (
+    BLOCK_SCALED_FORMATS,
+    BLOCK_SCALED_PRECISION_NAMES,
+    bshd_packed_scale_shape,
+    kernel_qk_view,
+    logical_head_dim,
+    validate_block_scaled_inputs,
+    validate_indexer_precision,
+    validate_sf_vec_size,
+    validate_thd_scale_contract,
 )
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.runtime import (
@@ -42,54 +50,6 @@ from ._support import (
     resolve_paged_k as _resolve_paged_k,
     validate_qhead_per_kv_head as _validate_indexer_qhead_per_kv_head,
 )
-
-
-def _packed_mxfp8_scale_shape(
-    *,
-    bs: int,
-    seqlen: int,
-    n_heads_kv: int,
-    sf_groups: int,
-    pack_q_heads: int = 1,
-) -> tuple[int, int, int]:
-    mn = seqlen * pack_q_heads
-    return (
-        bs * n_heads_kv,
-        _ceil_div(mn, 128) * 128,
-        _ceil_div(sf_groups, 4) * 4,
-    )
-
-
-def _validate_thd_mxfp8_scale_contract(
-    q_scale: torch.Tensor,
-    k_scale: torch.Tensor,
-    cu_seqlens_q_scale_padded: Optional[torch.Tensor],
-    cu_seqlens_k_scale_padded: Optional[torch.Tensor],
-    *,
-    bs: int,
-    n_heads_kv: int,
-    sf_groups: int,
-    device: torch.device,
-) -> None:
-    if cu_seqlens_q_scale_padded is None or cu_seqlens_k_scale_padded is None:
-        raise ValueError("THD MXFP8 requires Q/K scale padded cu_seqlens")
-
-    for prefix, name in (
-        (cu_seqlens_q_scale_padded, "cu_seqlens_q_scale_padded"),
-        (cu_seqlens_k_scale_padded, "cu_seqlens_k_scale_padded"),
-    ):
-        if prefix.dtype != torch.int32 or prefix.ndim != 1 or prefix.shape[0] != bs + 1 or not prefix.is_contiguous() or prefix.device != device:
-            raise ValueError(f"{name} must be contiguous int32 shape ({bs + 1},) on {device}")
-
-    sf_padded = _ceil_div(sf_groups, 4) * 4
-    for scale, name in ((q_scale, "q_scale"), (k_scale, "k_scale")):
-        if scale.ndim != 3:
-            raise ValueError(f"{name} must be a 3D packed scale tensor")
-        if scale.shape[0] != n_heads_kv or scale.shape[1] % 128 != 0 or scale.shape[2] != sf_padded:
-            raise ValueError(f"THD {name} must have shape ({n_heads_kv}, multiple_of_128, " f"{sf_padded}), got {tuple(scale.shape)}")
-        if scale.device != device:
-            raise ValueError("q_scale/k_scale must be on the same device as q/k")
-
 
 _compile_cache: dict = {}
 
@@ -168,9 +128,8 @@ def _use_cand_2d(precision: str, pbf: int) -> bool:
     buffer: the column index ``row_offset(q)+pos < pbf`` must fit Int32, while the
     batch base ``batch_idx*pbf`` is computed in 64-bit by CuTe's crd2idx, so
     ``bs*pbf`` may exceed 2^31 with no overflow (verified at ``bs*pbf=2.2e9`` by the
-    opt-in ``test_indexer_fwd_dsl_compress_cand_2d_high_offset_64bit``).  bf16 BSHD only
-    — mxfp8 has its own epilogue and varlen keeps the tight 1D path, both falling
-    back here.
+    opt-in ``test_indexer_fwd_dsl_compress_cand_2d_high_offset_64bit``).  bf16 BSHD only:
+    the block-scaled (MXFP8/MXFP4) epilogue and varlen use the 1D store.
     """
     return precision == "bf16" and pbf < (1 << 31)
 
@@ -183,6 +142,7 @@ def compress_topk_cand_buffer_size(
     microbatch_rows: int = -1,
     return_lse: bool = False,
     q_causal_offsets: torch.Tensor | None = None,
+    precision: str = "bf16",
 ) -> int:
     """Number of float32 elements a caller-provided ``cand_buffer`` must hold for
     ``indexer_fwd_compress_topk`` at this BSHD shape.  It is ``bs * per_batch_floats``; for a
@@ -197,10 +157,19 @@ def compress_topk_cand_buffer_size(
     long sequence with the auto default (-1) but launching with LSE would otherwise
     UNDER-size the buffer and the launch would raise "cand_buffer too small".  To
     match the launch contract, ``return_lse=True`` with an explicit
-    ``microbatch_rows > 0`` raises here too (microbatch + LSE is unsupported)."""
+    ``microbatch_rows > 0`` raises here too (microbatch + LSE is unsupported).
+
+    Pass the launch's ``precision``: block-scaled precisions (``"mxfp8"``, ``"mxfp4"``)
+    always run a single launch, so this returns the full buffer and an explicit
+    ``microbatch_rows > 0`` raises, as at launch."""
     from ..indexer_top_k.compress_top_k_sm100 import per_batch_floats
 
     _check_q_covered_by_k(seqlen_q, seqlen_k, ratio)
+    precision = validate_indexer_precision(precision)
+    if precision in BLOCK_SCALED_FORMATS:
+        if microbatch_rows > 0:
+            raise NotImplementedError(f"microbatch_rows is not supported with precision={precision!r} " "(per-window scale repacking is not implemented)")
+        microbatch_rows = 0
     if q_causal_offsets is not None:
         if not q_causal_offsets.is_cuda or q_causal_offsets.dtype != torch.int32 or q_causal_offsets.ndim != 1 or q_causal_offsets.shape[0] != bs:
             raise ValueError(f"q_causal_offsets must be a 1D CUDA int32 tensor of shape ({bs},)")
@@ -245,7 +214,8 @@ def _resolve_cand_buffer(
         raise ValueError(f"cand_buffer device {cand_buffer.device} != input device {device}")
     if cand_buffer.numel() < required_floats:
         raise ValueError(
-            f"cand_buffer too small: need >= {required_floats} float32 elements " f"(use compress_topk_cand_buffer_size(...)), got {cand_buffer.numel()}"
+            f"cand_buffer too small: need >= {required_floats} float32 elements "
+            f"(size it with compress_topk_cand_buffer_size(...), passing this launch's precision), got {cand_buffer.numel()}"
         )
     if not cand_buffer.is_contiguous():
         # A caller-provided buffer is written in place; reshape()-ing a
@@ -309,9 +279,9 @@ def indexer_fwd_compress_topk(
 ) -> tuple[torch.Tensor, ...]:
     """Compress-logits + top-k (CuTe DSL, BSHD).
 
-    ``precision`` is ``"bf16"`` (default) or ``"mxfp8"``.  For ``"mxfp8"``, q/k
-    are ``float8_e4m3fn`` and ``q_scale``/``k_scale`` are the blockscaled-packed
-    E8M0 scales (same packing as ``indexer_fwd``); microbatching is bf16-only.
+    ``precision`` is ``"bf16"`` (default), ``"mxfp8"``, or ``"mxfp4"``.  The
+    block-scaled precisions take blockscaled-packed E8M0 ``q_scale``/``k_scale``
+    (same packing as ``indexer_fwd``).  Microbatching is bf16-only.
 
     ``block_table`` ((bs, max_pages) int32) + ``kv_lens`` ((bs,) int32) read K
     from a page pool ``(num_pages, page_size, 1, head_dim)`` instead of a dense
@@ -323,10 +293,12 @@ def indexer_fwd_compress_topk(
     materialised) — then the CuTeDSL stage-2 radix top-k over that buffer.
 
     Args:
-        q: BSHD ``(bs, seqlen_q, n_heads_q, head_dim)`` BF16
-        k: BSHD ``(bs, seqlen_k, n_heads_kv, head_dim)`` BF16
+        q: BSHD ``(bs, seqlen_q, n_heads_q, head_dim)`` [BF16; E4M3 with
+            precision="mxfp8"; packed ``float4_e2m1fn_x2`` with last dim
+            ``head_dim // 2`` with precision="mxfp4"]
+        k: BSHD ``(bs, seqlen_k, n_heads_kv, head_dim)`` [same dtype rules as q]
         w: BSH  ``(bs, seqlen_q, n_heads_q)`` BF16 or FP32 for BF16 Q/K;
-            BF16 for MXFP8 Q/K.
+            BF16 for block-scaled Q/K.
         topk: top-k width K
         ratio: compression ratio
         sm_scale: scalar applied to the fp32 head-reduced score (same as
@@ -344,7 +316,7 @@ def indexer_fwd_compress_topk(
             per-window KV bound stays integral. Default ``-1`` enables the
             long-sequence auto policy; pass ``0`` to force a single launch.
         cand_buffer: optional caller-provided float32 CUDA scratch buffer for the
-            stage-1 compact logits.  Size it with ``compress_topk_cand_buffer_size``;
+            stage-1 compact logits.  Size it with ``compress_topk_cand_buffer_size(..., precision=precision)``;
             lets callers reuse one allocation across calls.  ``None`` = allocate
             internally.
         out_indices / out_logits: optional caller-provided ``(bs, seqlen_q, topk)``
@@ -374,7 +346,7 @@ def indexer_fwd_compress_topk(
     ``(indices, logits, softmax, lse)``.
 
     When ``return_lse=True`` (or a caller-provided ``lse_out`` is given), the
-    stage-1 epilogue also returns the per-row LSE for BF16 or MXFP8. An explicit
+    stage-1 epilogue also returns the per-row LSE (all precisions). An explicit
     ``microbatch_rows > 0`` remains unsupported with LSE.
     """
     from ..indexer_top_k.compress_top_k_sm100 import (
@@ -384,35 +356,22 @@ def indexer_fwd_compress_topk(
 
     if return_softmax is None:
         return_softmax = _RETURN_SOFTMAX_DEFAULT
-    precision = precision.lower()
-    if precision not in ("bf16", "mxfp8"):
-        raise ValueError(f"precision must be 'bf16' or 'mxfp8', got {precision!r}")
+    precision = validate_indexer_precision(precision)
+    is_block_scaled = precision in BLOCK_SCALED_FORMATS
     if precision == "bf16" and w.dtype == torch.float32 and w.stride(-1) != 1:
         raise NotImplementedError(f"FP32 w requires unit last stride, got strides {w.stride()}")
     q, k, w = [_maybe_contiguous(t) for t in (q, k, w)]
     if q.ndim != 4 or k.ndim != 4 or w.ndim != 3:
         raise ValueError("compress-topk expects BSHD q (bs,sq,Hq,D), k (bs,sk,Hkv,D), w (bs,sq,Hq)")
     if precision == "bf16" and (q_scale is not None or k_scale is not None):
-        # Match the dense path: reject stray scales (silently ignored otherwise,
-        # and they would also pollute the compile cache key).
-        raise ValueError("q_scale and k_scale are only valid with precision='mxfp8'")
+        # Stray scales would be silently ignored and would pollute the compile cache key.
+        raise ValueError(f"q_scale and k_scale are only valid with precision={BLOCK_SCALED_PRECISION_NAMES}")
     if precision == "bf16" and not (q.dtype == torch.bfloat16 and k.dtype == torch.bfloat16 and w.dtype in (torch.bfloat16, torch.float32)):
         raise TypeError("precision='bf16' requires bfloat16 q/k and bfloat16 or float32 w")
-    if precision == "mxfp8":
-        if q.dtype != torch.float8_e4m3fn or k.dtype != torch.float8_e4m3fn:
-            raise TypeError("precision='mxfp8' requires q and k to be torch.float8_e4m3fn")
-        if w.dtype != torch.bfloat16:
-            raise TypeError("precision='mxfp8' requires w to be torch.bfloat16")
-        if q_scale is None or k_scale is None:
-            raise ValueError("precision='mxfp8' requires q_scale and k_scale")
-        # Match the dense path: scales must be E8M0 and co-located with q/k (a
-        # wrong dtype/device becomes a cryptic compile- or run-time failure).
-        if q_scale.dtype != torch.float8_e8m0fnu or k_scale.dtype != torch.float8_e8m0fnu:
-            raise TypeError("precision='mxfp8' requires q_scale and k_scale to be " "torch.float8_e8m0fnu")
-        if q_scale.device != q.device or k_scale.device != k.device:
-            raise ValueError("q_scale/k_scale must be on the same device as q/k")
-        if sf_vec_size != 32:
-            raise ValueError("precision='mxfp8' currently requires sf_vec_size=32")
+    if is_block_scaled:
+        # A dtype/device mismatch would otherwise fail cryptically at compile or run time.
+        validate_block_scaled_inputs(precision, q, k, w, q_scale, k_scale)
+    validate_sf_vec_size(precision, sf_vec_size)
 
     bs, seqlen_q, n_heads_q, head_dim = q.shape
     paged = block_table is not None
@@ -435,13 +394,14 @@ def indexer_fwd_compress_topk(
     # Cross-tensor shape / device consistency (the compressed-logits path is public; reject
     # malformed inputs here instead of as a kernel OOB / cryptic failure).
     if (not paged and k.shape[0] != bs) or k.shape[3] != head_dim:
-        raise ValueError(f"k must be (bs={bs}, seqlen_k, n_heads_kv, head_dim={head_dim}), " f"got {tuple(k.shape)}")
+        raise ValueError(f"k must be (bs={bs}, seqlen_k, n_heads_kv, last dim={head_dim}), " f"got {tuple(k.shape)}")
+    head_dim = logical_head_dim(precision, head_dim)
     if tuple(w.shape) != (bs, seqlen_q, n_heads_q):
         raise ValueError(f"w shape must be (bs={bs}, seqlen_q={seqlen_q}, n_heads_q={n_heads_q}), " f"got {tuple(w.shape)}")
     if k.device != q.device or w.device != q.device:
         raise ValueError("q, k, w must be on the same device")
     # qhead_per_kv_head (GQA group size) contract: a
-    # wrong head mapping corrupts head-reduce, tile mapping and the MXFP8 scale
+    # wrong head mapping corrupts head-reduce, tile mapping and the block-scale
     # layout, so n_heads_q must be divisible by n_heads_kv and an explicit value
     # must equal the derived ratio.
     if n_heads_q % n_heads_kv != 0:
@@ -461,10 +421,10 @@ def indexer_fwd_compress_topk(
     device = q.device
 
     # Per-batch causal offsets (q_causal_offsets, (bs,) int32; default None = 0 = top-left,
-    # matching the dense indexer).  Supported for BOTH bf16 and mxfp8: each epilogue has a
+    # matching the dense indexer).  Supported for every precision: each epilogue has a
     # cand_batch_offsets branch, so an explicit per-batch offset routes the BSHD path
     # through the tight per-batch cand_batch_offsets slab (like THD) and the flat 1D store
-    # (the 2D compact store needs a uniform pbf; mxfp8 is 1D-only regardless).  Microbatch
+    # (the 2D compact store needs a uniform pbf; block-scaled is 1D-only regardless).  Microbatch
     # windowing assumes the default offset-0 and is rejected with explicit offsets below.
     q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(bs), device)
 
@@ -525,13 +485,13 @@ def indexer_fwd_compress_topk(
         microbatch_rows = 0
 
     # Resolve auto microbatch (microbatch_rows < 0).  Long-sequence auto-policy
-    # applies to bf16 only; mxfp8 microbatch is unsupported (per-window scale
-    # repacking is not implemented), LSE needs a single launch, and explicit
+    # applies to bf16 only; block-scaled microbatch is unsupported (per-window
+    # scale repacking is not implemented), LSE needs a single launch, and explicit
     # q_causal_offsets are not composable with the windowing — all stay single-launch.
     if microbatch_rows < 0:
-        microbatch_rows = 0 if (precision == "mxfp8" or want_lse or q_causal_offsets is not None) else _select_microbatch_rows(seqlen_q, bs, ratio)
-    if precision == "mxfp8" and microbatch_rows > 0:
-        raise NotImplementedError("microbatch_rows is not supported with precision='mxfp8' " "(per-window scale repacking is not implemented)")
+        microbatch_rows = 0 if (is_block_scaled or want_lse or q_causal_offsets is not None) else _select_microbatch_rows(seqlen_q, bs, ratio)
+    if is_block_scaled and microbatch_rows > 0:
+        raise NotImplementedError(f"microbatch_rows is not supported with precision={precision!r} " "(per-window scale repacking is not implemented)")
 
     # --- Microbatch: process query rows in windows, REUSING ONE cand buffer ---
     # Each window [rs, rs+mb) is an independent ratio-causal sub-problem
@@ -653,16 +613,16 @@ def indexer_fwd_compress_topk(
     lse_buf = (lse_out if lse_out is not None else torch.empty((bs, seqlen_q), dtype=torch.float32, device=device)) if want_lse else None
     denom_tmp = lse_buf
 
-    if precision == "mxfp8":
+    if is_block_scaled:
         sf_groups = _ceil_div(head_dim, sf_vec_size)
-        q_shape = _packed_mxfp8_scale_shape(
+        q_shape = bshd_packed_scale_shape(
             bs=bs,
             seqlen=seqlen_q,
             n_heads_kv=n_heads_kv,
             sf_groups=sf_groups,
             pack_q_heads=qhead_per_kv_head,
         )
-        k_shape = _packed_mxfp8_scale_shape(
+        k_shape = bshd_packed_scale_shape(
             bs=bs,
             seqlen=seqlen_k,
             n_heads_kv=n_heads_kv,
@@ -680,8 +640,8 @@ def indexer_fwd_compress_topk(
         bool(cand_2d),
         q_causal_offsets is not None,  # per-batch offset path (mQCausalOffsets/cand_batch_offsets)
         q.dtype,
-        # MXFP8 bakes scale/TMA layout from bs*n_heads_kv and the q/k/w/scale
-        # dtypes; bf16 ignores the scale dtypes
+        # Block-scaled kernels bake scale/TMA layout from bs*n_heads_kv and the
+        # q/k/w/scale dtypes; bf16 ignores the scale dtypes
         # (None) but the extra fields are harmless.
         k.dtype,
         w.dtype,
@@ -702,10 +662,12 @@ def indexer_fwd_compress_topk(
         seqlen_k,
         page_size,
     )
+    q_kernel = kernel_qk_view(precision, q)
+    k_kernel = kernel_qk_view(precision, k)
 
     if compile_key not in _compile_cache:
-        q_cute = _to_cute_tensor(q)
-        k_cute = _to_cute_tensor(k)
+        q_cute = _to_cute_tensor(q_kernel)
+        k_cute = _to_cute_tensor(k_kernel)
         w_cute = _to_cute_tensor(w)
         cand_cute = _to_cute_tensor(cand_gemm, leading_dim=1 if cand_2d else 0)
         denom_cute = _to_cute_tensor(denom_tmp) if denom_tmp is not None else None
@@ -718,10 +680,10 @@ def indexer_fwd_compress_topk(
         max_q_arg = cutlass.Int32(seqlen_q)
         max_k_arg = cutlass.Int32(seqlen_k)
 
-        if precision == "mxfp8":
+        if is_block_scaled:
             q_scale_cute = _to_cute_tensor(q_scale)
             k_scale_cute = _to_cute_tensor(k_scale)
-            kernel_obj = IndexerScoreUnifiedSm100Mxfp8(
+            kernel_obj = BLOCK_SCALED_FORMATS[precision].kernel_cls(
                 head_dim=head_dim,
                 qhead_per_kvhead=qhead_per_kv_head,
                 m_block_size=m_block_size,
@@ -797,10 +759,10 @@ def indexer_fwd_compress_topk(
     # No out.fill_(-inf): every compact slot in [0, per_batch_floats) is a valid
     # ratio-causal position and is written exactly once by the GEMM epilogue.
     with torch.cuda.nvtx.range("indexer_fwd_compress_gemm"):
-        if precision == "mxfp8":
+        if is_block_scaled:
             _compile_cache[compile_key](
-                q,
-                k,
+                q_kernel,
+                k_kernel,
                 w,
                 q_scale,
                 k_scale,
@@ -969,7 +931,7 @@ def _run_compress_gemm_varlen(
     block_table=None,
     kv_lens=None,
 ):
-    """Native varlen compress-logits GEMM (BF16 or MXFP8): one launch writes the
+    """Native varlen compress-logits GEMM (BF16 or block-scaled): one launch writes the
     per-batch tight compact cand_buffer (slab b at ``cand_batch_offsets[b]``). Returns
     ``(cand, cand_batch_offsets)``.  When both ``cand_buffer`` and
     ``cand_batch_offsets`` are caller-supplied (from
@@ -978,20 +940,21 @@ def _run_compress_gemm_varlen(
     ``page_size > 0`` reads K from a page pool through ``block_table`` / ``kv_lens``
     (BF16 only); ``cu_seqlens_k`` is then ``None``.
 
-    ``precision='mxfp8'`` runs the blockscaled MXFP8 logits GEMM: ``q``/``k`` are
-    ``float8_e4m3fn`` and ``q_scale``/``k_scale`` are the blockscaled-packed E8M0
-    scales. THD concatenates per-sequence padded scale regions along ``MN`` and keeps
+    A block-scaled ``precision`` (``'mxfp8'`` or ``'mxfp4'``) runs the blockscaled
+    logits GEMM on the format's Q/K and packed scales (see ``indexer_fwd_compress_topk``).
+    THD concatenates per-sequence padded scale regions along ``MN`` and keeps
     only KV heads in ``L``. The user-provided Q/K scale prefixes are consumed
     verbatim. Each Q span times ``qhead_per_kv_head`` and each K span must be a
     multiple of 128 MN rows. The Q/K data remains compact under the original
     ``cu_seqlens``.
-    MXFP8 keeps the tight 1D compact store (single-launch).
+    Block-scaled precisions keep the tight 1D compact store (single-launch).
 
     ``q_causal_offsets`` ((bs,) int32, default None=0 = top-left, matches dense): the
     per-batch causal offset; the caller-supplied ``cand_batch_offsets`` must have been
     sized with the SAME offsets (``compress_topk_cand_buffer_size_thd``)."""
     device = q.device
     total_q, n_heads_q, head_dim = q.shape
+    head_dim = logical_head_dim(precision, head_dim)
     n_heads_kv = k.shape[-2]
     bs = cu_seqlens_q.numel() - 1
     if cand_batch_offsets is None:
@@ -1014,14 +977,14 @@ def _run_compress_gemm_varlen(
     unified_k_block_size = 64 if head_dim_padded % 64 == 0 else head_dim_padded
     unified_kv_stage = 4
 
-    if precision == "mxfp8":
+    if precision in BLOCK_SCALED_FORMATS:
         # Data uses compact cu_seqlens offsets. Scale regions are independently padded
         # per sequence, concatenated along MN, and addressed by the two required
         # scale-padded prefixes; L contains only the KV head.
         # No host-side max_seqlen slab is part of the THD scale ABI. The sole
         # caller validates the complete scale contract before entering here.
         compile_key = (
-            "mxfp8_varlen_compress",
+            f"{precision}_varlen_compress",
             q.dtype,
             k.dtype,
             w.dtype,
@@ -1041,9 +1004,11 @@ def _run_compress_gemm_varlen(
             q_causal_offsets is not None,
             bool(want_lse),
         )
+        q_kernel = kernel_qk_view(precision, q)
+        k_kernel = kernel_qk_view(precision, k)
         if compile_key not in _compile_cache:
-            q_cute = _to_cute_tensor(q)
-            k_cute = _to_cute_tensor(k)
+            q_cute = _to_cute_tensor(q_kernel)
+            k_cute = _to_cute_tensor(k_kernel)
             w_cute = _to_cute_tensor(w)
             q_scale_cute = _to_cute_tensor(q_scale)
             k_scale_cute = _to_cute_tensor(k_scale)
@@ -1056,7 +1021,7 @@ def _run_compress_gemm_varlen(
             offs_cute = _to_cute_tensor(offsets, leading_dim=0)
             qco_cute = _to_cute_tensor(q_causal_offsets, leading_dim=0) if q_causal_offsets is not None else None
             stream = resolve_stream(None)
-            kernel_obj = IndexerScoreUnifiedSm100Mxfp8(
+            kernel_obj = BLOCK_SCALED_FORMATS[precision].kernel_cls(
                 head_dim=head_dim,
                 qhead_per_kvhead=qhead_per_kv_head,
                 m_block_size=m_block_size,
@@ -1091,10 +1056,10 @@ def _run_compress_gemm_varlen(
                 options=compile_options(),
             )
         stream = resolve_stream(None)
-        with torch.cuda.nvtx.range("indexer_fwd_compress_gemm_varlen_mxfp8"):
+        with torch.cuda.nvtx.range(f"indexer_fwd_compress_gemm_varlen_{precision}"):
             _compile_cache[compile_key](
-                q,
-                k,
+                q_kernel,
+                k_kernel,
                 w,
                 q_scale,
                 k_scale,
@@ -1237,14 +1202,16 @@ def _indexer_fwd_compress_topk_thd(
     block_table: Optional[torch.Tensor] = None,
     kv_lens: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, ...]:
-    """THD/varlen compressed-logits top-k, supporting BF16 and MXFP8.
+    """THD/varlen compressed-logits top-k, supporting BF16, MXFP8, and MXFP4.
 
     ``block_table`` ((bs, max_pages) int32) + ``kv_lens`` ((bs,) int32) read K from a
     page pool ``(num_pages, page_size, 1, head_dim)`` (BF16, local ids); ``cu_seqlens_k``
     is then ``None`` and ``max_seqlen_k`` defaults to ``max_pages * page_size``.
 
-    ``precision='mxfp8'`` runs the blockscaled logits GEMM: ``q``/``k`` are
-    ``float8_e4m3fn`` and ``q_scale``/``k_scale`` are blockscaled-packed E8M0 scales.
+    A block-scaled ``precision`` runs the blockscaled logits GEMM with
+    blockscaled-packed E8M0 scales: for ``'mxfp8'``, ``q``/``k`` are
+    ``float8_e4m3fn``; for ``'mxfp4'``, they are packed ``float4_e2m1fn_x2``
+    (last dim ``head_dim // 2``).
     THD requires both scale-padded prefixes and concatenates per-sequence scale regions
     along ``MN``. The user-provided prefix values are consumed verbatim; spans may
     exceed the logical lengths, but each Q span times ``qhead_per_kv_head`` and
@@ -1291,21 +1258,13 @@ def _indexer_fwd_compress_topk_thd(
 
     if return_softmax is None:
         return_softmax = _RETURN_SOFTMAX_DEFAULT
-    precision = precision.lower()
-    if precision not in ("bf16", "mxfp8"):
-        raise ValueError(f"precision must be 'bf16' or 'mxfp8', got {precision!r}")
+    precision = validate_indexer_precision(precision)
+    is_block_scaled = precision in BLOCK_SCALED_FORMATS
     if precision == "bf16" and (q_scale is not None or k_scale is not None or cu_seqlens_q_scale_padded is not None or cu_seqlens_k_scale_padded is not None):
-        raise ValueError("MXFP8 scales and scale padded cu_seqlens require precision='mxfp8'")
-    if precision == "mxfp8":
-        # THD scale regions are concatenated along MN and addressed through the
-        # required padded prefixes; L contains only the KV head. The complete
-        # scale contract is validated once below after bs/head metadata is known.
-        if q_scale is None or k_scale is None:
-            raise ValueError("THD precision='mxfp8' requires q_scale and k_scale")
-        if q_scale.dtype != torch.float8_e8m0fnu or k_scale.dtype != torch.float8_e8m0fnu:
-            raise TypeError("precision='mxfp8' requires q_scale and k_scale to be " "torch.float8_e8m0fnu")
-        if sf_vec_size != 32:
-            raise ValueError("precision='mxfp8' currently requires sf_vec_size=32")
+        raise ValueError(f"Block scales and scale padded cu_seqlens require precision={BLOCK_SCALED_PRECISION_NAMES}")
+    # The THD scale contract (regions concatenated along MN, addressed by the padded
+    # prefixes, L = KV head only) is validated below once bs/head metadata is known.
+    validate_sf_vec_size(precision, sf_vec_size)
     paged = block_table is not None
     if q.ndim != 3 or k.ndim != (4 if paged else 3) or w.ndim != 2:
         raise ValueError("THD compressed-logits top-k expects q (T_q,H,D), k (T_k,Hkv,D) or a page pool (num_pages,page,Hkv,D), w (T_q,H)")
@@ -1314,7 +1273,7 @@ def _indexer_fwd_compress_topk_thd(
     # Shape / dtype / device consistency: reject malformed inputs here rather than
     # a kernel OOB / cryptic failure.
     if k.shape[-1] != head_dim:
-        raise ValueError(f"q head_dim ({head_dim}) != k head_dim ({k.shape[-1]})")
+        raise ValueError(f"q last dim ({head_dim}) != k last dim ({k.shape[-1]})")
     if tuple(w.shape) != (total_q, n_heads_q):
         raise ValueError(f"w shape must be (total_q={total_q}, n_heads_q={n_heads_q}), " f"got {tuple(w.shape)}")
     if k.device != device or w.device != device:
@@ -1325,10 +1284,9 @@ def _indexer_fwd_compress_topk_thd(
         if w.dtype == torch.float32 and w.stride(-1) != 1:
             raise NotImplementedError(f"FP32 w requires unit last stride, got strides {w.stride()}")
     else:
-        if q.dtype != torch.float8_e4m3fn or k.dtype != torch.float8_e4m3fn:
-            raise TypeError("precision='mxfp8' requires q and k to be torch.float8_e4m3fn")
-        if w.dtype != torch.bfloat16:
-            raise TypeError("precision='mxfp8' requires w to be torch.bfloat16")
+        validate_block_scaled_inputs(precision, q, k, w, q_scale, k_scale)
+    # After the dtype checks, so a wrong Q/K dtype is reported as such, not as a bad head_dim.
+    head_dim = logical_head_dim(precision, head_dim)
     # cu_seqlens are consumed directly by the kernel: enforce the same int32 /
     # contiguous / same-device contract as the dense THD path (avoids a silent
     # .to() copy or a wrong-device kernel arg).
@@ -1366,12 +1324,13 @@ def _indexer_fwd_compress_topk_thd(
             max_seqlen_k = max_pages * page_size
     else:
         page_size = 0
-    if precision == "mxfp8":
-        _validate_thd_mxfp8_scale_contract(
+    if is_block_scaled:
+        validate_thd_scale_contract(
             q_scale,
             k_scale,
             cu_seqlens_q_scale_padded,
             cu_seqlens_k_scale_padded,
+            precision=precision,
             bs=bs,
             n_heads_kv=n_heads_kv,
             sf_groups=_ceil_div(head_dim, sf_vec_size),

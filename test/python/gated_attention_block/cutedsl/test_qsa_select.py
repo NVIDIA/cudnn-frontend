@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""``qsa_select``: top-k block selection of the block-sparse indexer over the DSA compact-logits scorer.
+"""``qsa_select_forward``: top-k block selection of the block-sparse indexer over the DSA compact-logits scorer.
 
 The reject / gate tests run on any CUDA device (the declines fire before a kernel is compiled; the gates BEHIND the
 CuTe DSL floor -- the head groups, the target, the device family -- skip below it, where the version decline answers
@@ -17,10 +17,10 @@ import sys
 import pytest
 import torch
 
-import cudnn.gated_attention_block.qsa_select as qsa_mod
+import cudnn.QSA.selection as qsa_mod
 from cudnn.frost.buffers import cutedsl_requirement_error
 
-QSA_BLOCK_SIZE, QSA_TOP_K, qsa_select = qsa_mod.QSA_BLOCK_SIZE, qsa_mod.QSA_TOP_K, qsa_mod.qsa_select  # the module imported ONE way
+QSA_BLOCK_SIZE, QSA_TOP_K, qsa_select_forward = qsa_mod.QSA_BLOCK_SIZE, qsa_mod.QSA_TOP_K, qsa_mod.qsa_select_forward  # the module imported ONE way
 
 pytestmark = pytest.mark.L0
 
@@ -38,7 +38,7 @@ needs_sm100_family = pytest.mark.skipif(_cc() is None or _cc()[0] != 10, reason=
 # Below FROST's CuTe DSL floor the selector declines by VERSION ahead of its later gates (the head groups, the target, the device family)
 # and ahead of any scorer launch (Rule 7): the cells that expect one of those later answers, and every accept cell, skip there instead of
 # failing; the form checks ahead of the gate and the version-decline cell itself run on any DSL.
-_CUTEDSL_REQUIREMENT = cutedsl_requirement_error("qsa_select")  # None at or above the floor
+_CUTEDSL_REQUIREMENT = cutedsl_requirement_error("qsa_select_forward")  # None at or above the floor
 needs_dsl_floor = pytest.mark.skipif(_CUTEDSL_REQUIREMENT is not None, reason=str(_CUTEDSL_REQUIREMENT))
 
 
@@ -117,7 +117,7 @@ def test_qsa_select_declines_unsupported_head_counts(n_heads):
     device = torch.device("cuda")
     qi, kbar, cu = _inputs([8], 4, device, n_heads=n_heads)
     with pytest.raises(NotImplementedError, match=r"n_heads in \(4, 8, 16, 32, 64\)"):
-        qsa_select(qi, kbar, cu, top_k=2)
+        qsa_select_forward(qi, kbar, cu, top_k=2)
 
 
 @needs_cuda
@@ -125,25 +125,25 @@ def test_qsa_select_rejects_malformed_inputs():
     device = torch.device("cuda")
     qi, kbar, cu = _inputs([8, 8], 4, device)
     with pytest.raises(ValueError, match="head_dim 128"):
-        qsa_select(qi[..., :64], kbar[..., :64], cu, top_k=2)
+        qsa_select_forward(qi[..., :64], kbar[..., :64], cu, top_k=2)
     with pytest.raises(ValueError, match="bfloat16"):
-        qsa_select(qi.half(), kbar, cu, top_k=2)
+        qsa_select_forward(qi.half(), kbar, cu, top_k=2)
     with pytest.raises(ValueError, match="B \\+ 1"):
-        qsa_select(qi, kbar, cu[:2], top_k=2)
+        qsa_select_forward(qi, kbar, cu[:2], top_k=2)
     with pytest.raises(ValueError, match="contiguous"):
-        qsa_select(qi, kbar.transpose(1, 2).contiguous().transpose(1, 2), cu, top_k=2)
+        qsa_select_forward(qi, kbar.transpose(1, 2).contiguous().transpose(1, 2), cu, top_k=2)
     with pytest.raises(ValueError, match="unit last stride"):
-        qsa_select(qi.transpose(1, 2).contiguous().transpose(1, 2), kbar, cu, top_k=2)
+        qsa_select_forward(qi.transpose(1, 2).contiguous().transpose(1, 2), kbar, cu, top_k=2)
     with pytest.raises(ValueError, match="top_k"):
-        qsa_select(qi, kbar, cu, top_k=0)
+        qsa_select_forward(qi, kbar, cu, top_k=0)
     with pytest.raises(ValueError, match=r"\[B, n_blocks_max, head_dim\]"):
-        qsa_select(qi, kbar.unsqueeze(2), cu, top_k=2)
+        qsa_select_forward(qi, kbar.unsqueeze(2), cu, top_k=2)
     with pytest.raises(ValueError, match="q_pos0"):
-        qsa_select(qi, kbar, cu, top_k=2, q_pos0=torch.zeros(2, dtype=torch.int64, device=device))
+        qsa_select_forward(qi, kbar, cu, top_k=2, q_pos0=torch.zeros(2, dtype=torch.int64, device=device))
     with pytest.raises(ValueError, match="w must be"):
-        qsa_select(qi, kbar, cu, top_k=2, w=torch.ones(16, 8, dtype=torch.bfloat16, device=device))
+        qsa_select_forward(qi, kbar, cu, top_k=2, w=torch.ones(16, 8, dtype=torch.bfloat16, device=device))
     with pytest.raises(ValueError, match="int32 CUDA"):
-        qsa_select(qi, kbar, cu.cpu(), top_k=2)
+        qsa_select_forward(qi, kbar, cu.cpu(), top_k=2)
 
 
 @needs_cuda
@@ -155,15 +155,15 @@ def test_qsa_select_host_geometry_check_names_the_sequence():
     qsa_select_kwargs = dict(top_k=2)
     # 17 tokens from position 0 see floor(17 / 4) = 4 blocks: 3 is too few
     with pytest.raises(ValueError, match="sequence 1: 17 query tokens from position 0 see"):
-        qsa_select(qi, kbar, cu, n_blocks_per_seq=[1, 3], **qsa_select_kwargs)
+        qsa_select_forward(qi, kbar, cu, n_blocks_per_seq=[1, 3], **qsa_select_kwargs)
     # 5 rows claimed for a 4-row kbar
     with pytest.raises(ValueError, match="kbar holds 4 rows"):
-        qsa_select(qi, kbar, cu, n_blocks_per_seq=[1, 5], **qsa_select_kwargs)
+        qsa_select_forward(qi, kbar, cu, n_blocks_per_seq=[1, 5], **qsa_select_kwargs)
     with pytest.raises(ValueError, match="entries for B = 2"):
-        qsa_select(qi, kbar, cu, n_blocks_per_seq=[1, 4, 4], **qsa_select_kwargs)
+        qsa_select_forward(qi, kbar, cu, n_blocks_per_seq=[1, 4, 4], **qsa_select_kwargs)
     # chunked prefill: 5 tokens from position 11 see floor(16 / 4) = 4 blocks
     with pytest.raises(ValueError, match="sequence 0: 5 query tokens from position 11 see"):
-        qsa_select(qi, kbar, cu, n_blocks_per_seq=[3, 4], q_pos0=torch.tensor([11, 0], dtype=torch.int32, device=device), **qsa_select_kwargs)
+        qsa_select_forward(qi, kbar, cu, n_blocks_per_seq=[3, 4], q_pos0=torch.tensor([11, 0], dtype=torch.int32, device=device), **qsa_select_kwargs)
 
 
 @needs_cuda
@@ -172,8 +172,8 @@ def test_qsa_select_declines_below_the_dsl_floor_by_version(monkeypatch):
     device = torch.device("cuda")
     qi, kbar, cu = _inputs([8], 4, device)
     monkeypatch.setattr(qsa_mod, "cutedsl_requirement_error", lambda what: f"{what} requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2")
-    with pytest.raises(NotImplementedError, match="qsa_select requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2"):
-        qsa_select(qi, kbar, cu, top_k=2)
+    with pytest.raises(NotImplementedError, match="qsa_select_forward requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2"):
+        qsa_select_forward(qi, kbar, cu, top_k=2)
 
 
 @needs_cuda
@@ -185,7 +185,7 @@ def test_qsa_select_declines_a_dsl_without_the_target(monkeypatch):
         qsa_mod, "cutedsl_arch_requirement_error", lambda cc: "SM107 requires a CuTe DSL build supporting sm_107a; found 4.7.0 without that target"
     )
     with pytest.raises(NotImplementedError, match="sm_107a"):
-        qsa_select(qi, kbar, cu, top_k=2)
+        qsa_select_forward(qi, kbar, cu, top_k=2)
 
 
 @needs_cuda
@@ -195,7 +195,7 @@ def test_qsa_select_declines_devices_below_the_sm100_family(monkeypatch):
     qi, kbar, cu = _inputs([8], 4, device)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (9, 0))
     with pytest.raises(NotImplementedError, match=r"cc 10\.x.*found cc 9\.0"):
-        qsa_select(qi, kbar, cu, top_k=2)
+        qsa_select_forward(qi, kbar, cu, top_k=2)
 
 
 @needs_cuda
@@ -205,13 +205,13 @@ def test_qsa_select_rejects_a_mixed_or_unsupported_cache_dtype():
     device = torch.device("cuda")
     qi, kbar, cu = _inputs([8], 4, device)
     with pytest.raises(ValueError, match="both be bfloat16, or both float8_e4m3fn"):
-        qsa_select(qi.to(_E4M3), kbar, cu, top_k=2)
+        qsa_select_forward(qi.to(_E4M3), kbar, cu, top_k=2)
     with pytest.raises(ValueError, match="both be bfloat16, or both float8_e4m3fn"):
-        qsa_select(qi, kbar.to(_E4M3), cu, top_k=2)
+        qsa_select_forward(qi, kbar.to(_E4M3), cu, top_k=2)
     with pytest.raises(ValueError, match="both be bfloat16, or both float8_e4m3fn"):
-        qsa_select(qi.half(), kbar.half(), cu, top_k=2)
+        qsa_select_forward(qi.half(), kbar.half(), cu, top_k=2)
     with pytest.raises(ValueError, match="bfloat16 head weights"):
-        qsa_select(qi.to(_E4M3), kbar.to(_E4M3), cu, top_k=2, w=torch.ones(8, _H, dtype=torch.float32, device=device))
+        qsa_select_forward(qi.to(_E4M3), kbar.to(_E4M3), cu, top_k=2, w=torch.ones(8, _H, dtype=torch.float32, device=device))
 
 
 def _poison_the_weight_bucket(numel: int, device) -> int:
@@ -229,7 +229,7 @@ def _poison_the_weight_bucket(numel: int, device) -> int:
 @needs_cuda
 @needs_dsl_floor
 def test_qsa_select_creates_its_constants_on_the_launch_stream_with_the_ambient_stream_parked(monkeypatch):
-    """Rule 5 on the selector's OWN operands, the scorer stubbed so any CUDA device runs it: ``qsa_select(..., stream=S)`` with a COLD
+    """Rule 5 on the selector's OWN operands, the scorer stubbed so any CUDA device runs it: ``qsa_select_forward(..., stream=S)`` with a COLD
     constant-weight bucket and a WARM packed-K prefix (a cold prefix's host upload used to block the host on the issuing stream and hide
     the race; warm, nothing blocks) while torch's default (ambient) stream is parked by a long spin.  The previous form built the bf16
     ones on the ambient stream and handed the scorer on S a buffer whose fill sat behind the spin: the stub, reading on S as the scorer
@@ -263,13 +263,13 @@ def test_qsa_select_creates_its_constants_on_the_launch_stream_with_the_ambient_
 
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 0))  # the scorer's family; the stub never launches it
     monkeypatch.setattr(dsa_fwd, "indexer_forward_top_k_wrapper", stub)
-    qsa_select(qi, kbar, cu, top_k=top_k)  # the control on the ambient stream: warms the packed-K prefix (and a bucket this test discards)
+    qsa_select_forward(qi, kbar, cu, top_k=top_k)  # the control on the ambient stream: warms the packed-K prefix (and a bucket this test discards)
     torch.cuda.synchronize()
     monkeypatch.setattr(qsa_mod, "_ones_cache", {})
     poison_ptr = _poison_the_weight_bucket(total * _H, device)
     seen.clear()
     park_the_default_stream(3.0)  # the AMBIENT stream is busy from here, through the call and past its issue
-    qsa_select(qi, kbar, cu, top_k=top_k, stream=cuda_drv.CUstream(side.cuda_stream))
+    qsa_select_forward(qi, kbar, cu, top_k=top_k, stream=cuda_drv.CUstream(side.cuda_stream))
     parked_at_issue = not ambient.query()
     with torch.cuda.stream(side):
         not_one = int(seen["not_one"].cpu())  # read back through the LAUNCH stream only (the ambient one is still parked)
@@ -343,7 +343,7 @@ def test_qsa_select_unit_scale_blobs_share_one_bucket_per_capacity_and_are_creat
 
     def select(total, stream=side):
         q8, k8, cu = prepared[total]
-        qsa_select(q8, k8, cu, top_k=16, stream=None if stream is None else cuda_drv.CUstream(stream.cuda_stream))
+        qsa_select_forward(q8, k8, cu, top_k=16, stream=None if stream is None else cuda_drv.CUstream(stream.cuda_stream))
         return seen.pop("blobs")
 
     def packed_q_rows(total):  # the e4m3 arm's Q scale rows: (T + 31) tokens x 4 heads, rounded up to the 128-row scale atom
@@ -440,7 +440,7 @@ def test_qsa_select_matches_topk_of_the_fp64_reference(n_blocks):
     qi, kbar, cu = _inputs([s_q], n_blocks, device, seed=n_blocks)
     q_pos0 = torch.tensor([pos0], dtype=torch.int32, device=device)
 
-    result = qsa_select(qi, kbar, cu, q_pos0=q_pos0, n_blocks_per_seq=[n_blocks])
+    result = qsa_select_forward(qi, kbar, cu, q_pos0=q_pos0, n_blocks_per_seq=[n_blocks])
     torch.cuda.synchronize()
 
     ref = _qsa_reference(qi, kbar, cu, q_pos0, QSA_BLOCK_SIZE, _D**-0.5)
@@ -469,7 +469,7 @@ def test_qsa_select_thd_tails_and_chunked_prefill():
     qi, kbar, cu = _inputs(lengths, max(n_blocks), device, seed=7)
     q_pos0 = torch.tensor(pos0, dtype=torch.int32, device=device)
 
-    result = qsa_select(qi, kbar, cu, q_pos0=q_pos0, n_blocks_per_seq=n_blocks, max_seqlen_q=max(lengths))
+    result = qsa_select_forward(qi, kbar, cu, q_pos0=q_pos0, n_blocks_per_seq=n_blocks, max_seqlen_q=max(lengths))
     torch.cuda.synchronize()
 
     assert result["block_ids"].shape == (sum(lengths), QSA_TOP_K)
@@ -504,7 +504,7 @@ def test_qsa_select_deterministic_ties_keep_the_smaller_block_ids():
     kbar = kbar[:, :1].expand(1, n_blocks, _D).contiguous()
     q_pos0 = torch.tensor([pos0], dtype=torch.int32, device=device)
 
-    result = qsa_select(qi, kbar, cu, q_pos0=q_pos0, deterministic=True)
+    result = qsa_select_forward(qi, kbar, cu, q_pos0=q_pos0, deterministic=True)
     torch.cuda.synchronize()
 
     expected = torch.arange(QSA_TOP_K, device=device, dtype=torch.int32)
@@ -528,9 +528,9 @@ def test_qsa_select_constant_weight_matches_explicit_w_and_reads_a_strided_slab(
     strided = slab[:, : _H * _D].view(total, _H, _D)
     assert strided.stride(0) != _H * _D and strided.stride(-1) == 1
 
-    base = qsa_select(qi, kbar, cu, top_k=64)
-    explicit = qsa_select(qi, kbar, cu, top_k=64, w=torch.ones(total, _H, dtype=torch.bfloat16, device=device), scale=_D**-0.5)
-    from_slab = qsa_select(strided, kbar, cu, top_k=64)
+    base = qsa_select_forward(qi, kbar, cu, top_k=64)
+    explicit = qsa_select_forward(qi, kbar, cu, top_k=64, w=torch.ones(total, _H, dtype=torch.bfloat16, device=device), scale=_D**-0.5)
+    from_slab = qsa_select_forward(strided, kbar, cu, top_k=64)
     torch.cuda.synchronize()
 
     for other in (explicit, from_slab):
@@ -558,7 +558,7 @@ def test_qsa_select_preallocated_outputs_and_scratch():
     ids_out = torch.full((total, 128), -7, dtype=torch.int32, device=device)
     scores_out = torch.full((total, 128), 3.0, dtype=torch.float32, device=device)
 
-    pre = qsa_select(
+    pre = qsa_select_forward(
         qi,
         kbar,
         cu,
@@ -570,7 +570,7 @@ def test_qsa_select_preallocated_outputs_and_scratch():
         cand_buffer=cand,
         cand_batch_offsets=cand_offsets,
     )
-    plain = qsa_select(qi, kbar, cu, top_k=128, q_pos0=q_pos0)
+    plain = qsa_select_forward(qi, kbar, cu, top_k=128, q_pos0=q_pos0)
     torch.cuda.synchronize()
 
     assert pre["block_ids"].data_ptr() == ids_out.data_ptr() and pre["scores"].data_ptr() == scores_out.data_ptr()
@@ -615,7 +615,7 @@ def test_qsa_select_on_an_explicit_stream_with_a_cold_weight_bucket_matches_the_
     ambient, side = torch.cuda.default_stream(), torch.cuda.Stream()
     assert torch.cuda.current_stream() == ambient and side != ambient
 
-    control = qsa_select(qi, kbar, cu, block_ids_out=outs["control"][0], scores_out=outs["control"][1], **kw)
+    control = qsa_select_forward(qi, kbar, cu, block_ids_out=outs["control"][0], scores_out=outs["control"][1], **kw)
     torch.cuda.synchronize()
     ref = _qsa_reference(qi, kbar, cu, None, QSA_BLOCK_SIZE, _D**-0.5)
     _assert_selection(control["block_ids"], control["scores"], ref, top_k)
@@ -635,7 +635,7 @@ def test_qsa_select_on_an_explicit_stream_with_a_cold_weight_bucket_matches_the_
     try:
         poison_ptr = _poison_the_weight_bucket(total * _H, device)
         park_the_default_stream(3.0)  # the AMBIENT stream is busy from here, through the call and past its issue
-        qsa_select(qi, kbar, cu, block_ids_out=outs["side"][0], scores_out=outs["side"][1], stream=cuda_drv.CUstream(side.cuda_stream), **kw)
+        qsa_select_forward(qi, kbar, cu, block_ids_out=outs["side"][0], scores_out=outs["side"][1], stream=cuda_drv.CUstream(side.cuda_stream), **kw)
         parked_at_issue = not ambient.query()
         side.synchronize()  # the LAUNCH stream only
         created = len(qsa_mod._ones_cache)
@@ -674,11 +674,11 @@ def test_qsa_select_refuses_a_scale_prefix_on_the_bf16_arm_and_a_malformed_one()
     device = torch.device("cuda")
     qi, kbar, cu = _inputs([8, 8], 4, device)
     with pytest.raises(ValueError, match="e4m3 arm"):
-        qsa_select(qi, kbar, cu, top_k=2, cu_seqlens_q_scale_padded=cu)
+        qsa_select_forward(qi, kbar, cu, top_k=2, cu_seqlens_q_scale_padded=cu)
     q8, k8 = qi.to(_E4M3), kbar.to(_E4M3)
     for bad in (cu[:2], cu.to(torch.int64), cu.cpu()):
         with pytest.raises(ValueError, match=r"cu_seqlens_q_scale_padded must be a \[B \+ 1 = 3\] int32 CUDA tensor"):
-            qsa_select(q8, k8, cu, top_k=2, cu_seqlens_q_scale_padded=bad)
+            qsa_select_forward(q8, k8, cu, top_k=2, cu_seqlens_q_scale_padded=bad)
 
 
 @needs_dsl_floor
@@ -696,8 +696,8 @@ def test_qsa_select_e4m3_cache_takes_a_precomputed_scale_prefix():
     prefix = qsa_mod._fp8_q_scale_prefix(cu, _H)
     assert prefix.dtype == torch.int32 and torch.equal(prefix, qsa_mod._padded_prefix(cu, 32))
     assert torch.equal(prefix.cpu(), qsa_mod._fp8_q_scale_prefix(cu.cpu(), _H)), "the host-built prefix (the plan's form) differs from the device one"
-    per_call = qsa_select(q8, k8, cu, q_pos0=q_pos0, n_blocks_per_seq=[n_blocks_max] * 3)
-    given = qsa_select(q8, k8, cu, q_pos0=q_pos0, n_blocks_per_seq=[n_blocks_max] * 3, cu_seqlens_q_scale_padded=prefix)
+    per_call = qsa_select_forward(q8, k8, cu, q_pos0=q_pos0, n_blocks_per_seq=[n_blocks_max] * 3)
+    given = qsa_select_forward(q8, k8, cu, q_pos0=q_pos0, n_blocks_per_seq=[n_blocks_max] * 3, cu_seqlens_q_scale_padded=prefix)
     torch.cuda.synchronize()
     assert torch.equal(torch.sort(given["block_ids"], dim=-1).values, torch.sort(per_call["block_ids"], dim=-1).values)
     assert torch.equal(torch.sort(given["scores"], dim=-1).values, torch.sort(per_call["scores"], dim=-1).values)
@@ -722,8 +722,8 @@ def test_qsa_select_e4m3_cache_matches_the_fp64_reference_on_the_e4m3_values(n_b
     q8, k8 = qi.to(_E4M3), kbar.to(_E4M3)
     q_pos0 = torch.tensor([pos0], dtype=torch.int32, device=device)
 
-    fp8 = qsa_select(q8, k8, cu, q_pos0=q_pos0, n_blocks_per_seq=[n_blocks])
-    upcast = qsa_select(q8.to(torch.bfloat16), k8.to(torch.bfloat16), cu, q_pos0=q_pos0, n_blocks_per_seq=[n_blocks])
+    fp8 = qsa_select_forward(q8, k8, cu, q_pos0=q_pos0, n_blocks_per_seq=[n_blocks])
+    upcast = qsa_select_forward(q8.to(torch.bfloat16), k8.to(torch.bfloat16), cu, q_pos0=q_pos0, n_blocks_per_seq=[n_blocks])
     torch.cuda.synchronize()
 
     ref = _qsa_reference(q8, k8, cu, q_pos0, QSA_BLOCK_SIZE, _D**-0.5)
@@ -757,7 +757,7 @@ def test_qsa_select_e4m3_cache_thd_tails_and_chunked_prefill():
     q8, k8 = qi.to(_E4M3), kbar.to(_E4M3)
     q_pos0 = torch.tensor(pos0, dtype=torch.int32, device=device)
 
-    result = qsa_select(q8, k8, cu, q_pos0=q_pos0, n_blocks_per_seq=n_blocks, max_seqlen_q=max(lengths))
+    result = qsa_select_forward(q8, k8, cu, q_pos0=q_pos0, n_blocks_per_seq=n_blocks, max_seqlen_q=max(lengths))
     torch.cuda.synchronize()
 
     ref = _qsa_reference(q8, k8, cu, q_pos0, QSA_BLOCK_SIZE, _D**-0.5)
@@ -793,8 +793,8 @@ def test_qsa_select_e4m3_cache_flips_only_at_the_rank_boundary_against_the_bf16_
     qi, kbar, cu = _inputs([s_q], n_blocks, device, seed=31)
     q8, k8 = qi.to(_E4M3), kbar.to(_E4M3)
 
-    bf16 = qsa_select(qi, kbar, cu, n_blocks_per_seq=[n_blocks], max_seqlen_q=s_q)
-    fp8 = qsa_select(q8, k8, cu, n_blocks_per_seq=[n_blocks], max_seqlen_q=s_q)
+    bf16 = qsa_select_forward(qi, kbar, cu, n_blocks_per_seq=[n_blocks], max_seqlen_q=s_q)
+    fp8 = qsa_select_forward(q8, k8, cu, n_blocks_per_seq=[n_blocks], max_seqlen_q=s_q)
     torch.cuda.synchronize()
 
     ref16 = _qsa_reference(qi, kbar, cu, None, QSA_BLOCK_SIZE, _D**-0.5)

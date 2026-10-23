@@ -956,7 +956,8 @@ _SNAPSHOT_ARMS = {
 }
 # Every slot no pre-existing pipeline reserves reads -1: the gate copies, the fp4 O pair, the in-block indexer's seven
 # (`ix_q .. ix_sort_idx`, a QsaSpec(index_source="indexer") block past its identity bound -- test_block_qsa.py pins their carve), the e4m3
-# KV cache's five, the fp8 indexer cache's two and the DECODE form's prefill-route Q lengths (the same set as the training-forward twin's _ABSENT).
+# KV cache's five, the fp8 indexer cache's two, the DECODE form's prefill-route Q lengths and the indexer's DECODE step's three (`ix_logits` /
+# `ix_counts` / `ix_cslot`, appended last; test_block_qsa.py pins their carve) -- the same set as the training-forward twin's _ABSENT.
 _COMMON = dict(
     gate=-1,
     o_gated=-1,
@@ -978,6 +979,9 @@ _COMMON = dict(
     ix_q8=-1,
     ix_kbar8=-1,
     decode_q_lens=-1,
+    ix_logits=-1,
+    ix_counts=-1,
+    ix_cslot=-1,
 )
 _SNAPSHOT = {
     ("test", "bf16_inplace"): dict(

@@ -2,22 +2,25 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """``kernels/qsa_score_paged.py`` -- the decode indexer's scorer over the PAGED compressed-key cache -- and its DSL-free host entry
-``gated_attention_block/qsa_select_paged.py`` (the standalone selector + the kernel's host-side facts).
+``QSA/selection_paged.py`` (the standalone selector + the kernel's host-side facts).
 
 Host cells (any machine): the MMA row map of the (s, h) query rows (a bijection onto the padded rows; the head-sum geometry per
 head count), the knob's default rule at both sides of every threshold, the compile-key envelope (typed ``ValueError``), the byte model, the
 compile site's persistent-cache key (the module digest), the Rule 7 gates (the DSL floor, the ``sm_107a`` target, the radix top-k's
-cc 9.0 and PDL's cc 9.0 -- each a ``NotImplementedError`` naming the version or the device, raised BEFORE any compile), the e4m3 pair
-refused BY NAME, the form checks naming their fault; with a CUDA device: the front door's import-time contract in a FRESH process (the
-DSL modeled as the public 4.6.2 wheel: the typed decline, the kernel module never imported) and the launch-stream resolution with both
-kernels stubbed (a ``torch.cuda.Stream`` / a raw handle / ``None``: every torch operation on the launch stream).
+cc 9.0 and PDL's cc 9.0, the e4m3 read arm's sm_89, then the L2-hint arm's compiler floor -- each a ``NotImplementedError`` naming the
+version or the device, raised BEFORE any compile; the compiler floor modeled at the seam the kernel reads: the default follows it, a forced
+hint below it declines), a mixed / an unserved dtype pair refused as a form error, the form checks naming their fault; with a CUDA device:
+the import-time contract of BOTH front doors (the paged and the dense selector) in a FRESH process (the DSL modeled as the public 4.6.2
+wheel: the typed decline, neither the kernel modules nor the DSL itself imported) and the launch-stream resolution with both kernels
+stubbed (a ``torch.cuda.Stream`` / a raw handle / ``None``: every torch operation on the launch stream).
 
 Scorer cells (ANY CuTe DSL device from sm_80 -- the kernel is one warp-level ``mma.sync.m16n8k16`` per 8 keys x 16 D, loads,
 shuffles, no barrier): the fp32 logits of every
 visible column against an fp64 re-derivation of the indexer score on the SAME bf16 inputs gathered through the table
 (``relu(q_h . kbar_j)`` summed over heads, times the scale), the per-row counts against the QSA oracle's count rule, the
-columns at or past a row's count NEVER written (a sentinel proves it), two launches bitwise, the ``units_per_warp`` knob and the
-PDL arm bitwise the plain launch, the degenerate matrix of the module docstring (a padding sequence, a sequence shorter than the
+columns at or past a row's count NEVER written (a sentinel proves it), two launches bitwise, the ``units_per_warp`` and ``ring_depth``
+knobs, the ``l2_hint`` arm (the hinted and the plain key copies where the DSL's compiler serves both; the forced hint a typed decline
+below its floor) and the PDL arm bitwise the plain launch, the degenerate matrix of the module docstring (a padding sequence, a sequence shorter than the
 step, a visible count inside a page, a ``-1`` / out-of-range table page under a visible block and past the visible range), at
 ``n_blocks_max`` {8, 520, 4096, 8192, 32768} x rows 1..4 x page sizes {16, 32, 64}; every branch of the row map (``H_i`` 1 / 2 / 3 /
 8 / 16 / 32, several m-tiles, a query spanning two tiles) against the same reference; a fresh variant reaching the compiled-plan cache.
@@ -28,6 +31,14 @@ region (fewer than ``top_k`` visible blocks selects every one), two calls BITWIS
 on a side stream with the ambient stream parked bitwise a synchronised control, the selection with ANOTHER device current bitwise
 the same-device control (two visible devices); the agreement with the dense-cache selector runs where that module is present
 (probed by name, skipped by name otherwise).
+
+The e4m3 READ arm (``cache_dtype=torch.float8_e4m3fn``: the e4m3 pair served since 2026-10-21; sm_89+ -- its accept cells skip below
+it and are UNCOVERED there): the logits against the fp64 reference on the SAME e4m3 values (the module's atol / rtol, never widened; every
+e4m3 x e4m3 product is exact in fp32), every row-map branch, pages 8 / 16 / 32 / 64 (page 8 = two page parts per copy instruction, the
+per-lane shuffle source), the degenerate matrix with NaN sentinels outside the visible rows and a dead page inside, bitwise across
+``units_per_warp`` / ``ring_depth`` and across two launches, ``cache_dtype`` a compile key (a distinct artifact; the bf16 keys unchanged),
+the SMEM declaration half the bf16 arm's (18 KiB at the defaults), the selector on the e4m3 pair == the selector on the SAME values upcast
+to bf16 (exact: the two selections agree as sets up to the accumulation order's ties); the sub-sm_89 decline through a modeled cc.
 """
 
 import hashlib
@@ -54,7 +65,7 @@ requirement_error = cutedsl_requirement_error("the paged decode scorer's tests (
 if requirement_error is not None:
     pytest.skip(requirement_error, allow_module_level=True)
 
-from cudnn.gated_attention_block import qsa_select_paged as fd  # noqa: E402  (the DSL-free front door: the selector + the host-side facts)
+from cudnn.QSA import selection_paged as fd  # noqa: E402  (the DSL-free front door: the selector + the host-side facts)
 from cudnn.gated_attention_block.kernels import qsa_score_paged as sp  # noqa: E402  (the kernel module: the compile + run entries)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -97,20 +108,39 @@ class _Case:
     """One decode step over a paged cache: ``batch`` sequences, ``s_q`` rows each, a shuffled page table into a pool with spare
     pages, and the fp64 reference through the SAME table (independent of the kernel's addressing)."""
 
-    def __init__(self, batch, s_q, n_blocks_max, page_size, kv_lens, *, seed, h=H, extra_pages=5):
+    def __init__(self, batch, s_q, n_blocks_max, page_size, kv_lens, *, seed, h=H, extra_pages=5, cache_dtype=torch.bfloat16, nan_pages=False):
         self.batch, self.s_q, self.n_blocks_max, self.page_size, self.h = batch, s_q, n_blocks_max, page_size, h
+        self.cache_dtype = cache_dtype  # bf16, or e4m3: the e4m3 read arm's pair (the SAME random values, cast once: the oracle runs on the e4m3 values)
         self.rpp = page_size // BS
         self.max_pages = -(-n_blocks_max // self.rpp)
         g = torch.Generator(device=_DEV).manual_seed(seed)
-        self.qi = torch.randn(batch * s_q, h, D, dtype=torch.bfloat16, device=_DEV, generator=g)
+        self.qi = torch.randn(batch * s_q, h, D, dtype=torch.bfloat16, device=_DEV, generator=g).to(cache_dtype)
         self.num_pages = batch * self.max_pages + extra_pages
-        self.pool = torch.randn(self.num_pages, self.rpp, 1, D, dtype=torch.bfloat16, device=_DEV, generator=g)
+        self.pool = torch.randn(self.num_pages, self.rpp, 1, D, dtype=torch.bfloat16, device=_DEV, generator=g).to(cache_dtype)
         self.table = torch.randperm(self.num_pages, device=_DEV, generator=g)[: batch * self.max_pages].view(batch, self.max_pages).to(torch.int32).contiguous()
         self.kv_lens = torch.tensor(list(kv_lens), dtype=torch.int32, device=_DEV)
         assert self.kv_lens.numel() == batch
+        if nan_pages:
+            # NaN sentinels on every row NO visible block maps to (the e4m3 arm's byte-accounting detector: a copy that reaches past a
+            # visible row, or past a page's rows, would poison a logit); a dead page under a visible block is zero-filled by the kernel.
+            # After the table draw (the poison consults it; it draws nothing itself, so the bf16 cells' data is unchanged).
+            self.poison_unmapped_rows(kv_lens)
+
+    def poison_unmapped_rows(self, kv_lens):
+        """NaN into every compressed row no sequence's VISIBLE blocks map to (the rows past ``n_vis_max`` inside the last visible page included).
+        Host-side set algebra: ONE copy of the table, one gather of its rows, one scatter of the visible mask, one device write (no per-block
+        device read or indexing launch -- at ``n_blocks_max`` 32768 x 4 sequences that was ~131k synchronizing iterations per case)."""
+        table = self.table.cpu().long()  # [B, max_pages]
+        n_vis = torch.tensor([max(0, min(int(kv) // BS, self.n_blocks_max)) for kv in kv_lens], dtype=torch.long)  # [B]
+        j = torch.arange(self.n_blocks_max)  # the block index within a sequence; j // rpp < max_pages by construction
+        pg = table[:, j // self.rpp]  # [B, n_blocks_max]: the page of every block slot
+        ok = (j[None, :] < n_vis[:, None]) & (pg >= 0) & (pg < self.num_pages)  # visible, through a mapped page
+        visible = torch.zeros(self.num_pages, self.rpp, dtype=torch.bool)
+        visible[pg[ok], (j % self.rpp).expand_as(pg)[ok]] = True
+        self.pool[~visible.to(_DEV)] = torch.full((), float("nan"), dtype=self.cache_dtype, device=_DEV)
 
     def dense(self, table=None):
-        """``[B, n_blocks_max, D]`` bf16: the compressed keys gathered through the table (a ``-1`` / out-of-range page -> zeros)."""
+        """``[B, n_blocks_max, D]`` in the cache dtype: the compressed keys gathered through the table (a ``-1`` / out-of-range page -> zeros)."""
         table = self.table if table is None else table
         idx = table.long()
         ok = (idx >= 0) & (idx < self.num_pages)
@@ -125,9 +155,11 @@ class _Case:
         return torch.div(self.positions() + 1, BS, rounding_mode="floor").clamp(0, self.n_blocks_max)
 
     def reference(self, scale, table=None):
-        """fp64 ``[B, s_q, n_blocks_max]``, ``-inf`` at or past the row's visible count."""
+        """fp64 ``[B, s_q, n_blocks_max]`` on the kernel's OWN operand values (bf16 or e4m3, exactly widened), ``-inf`` at or past the row's
+        visible count; a NaN-poisoned row (``nan_pages``) that is visible would poison the reference too -- none is, by construction."""
         q = self.qi.view(self.batch, self.s_q, self.h, D).double()
-        scores = torch.relu(torch.einsum("brhd,bnd->brhn", q, self.dense(table).double())).sum(dim=2) * scale
+        dense = self.dense(table).double()
+        scores = torch.relu(torch.einsum("brhd,bnd->brhn", q, torch.nan_to_num(dense, nan=0.0))).sum(dim=2) * scale
         visible = torch.arange(self.n_blocks_max, device=_DEV).view(1, 1, -1) < self.n_vis().view(self.batch, self.s_q, 1)
         return scores.masked_fill(~visible, float("-inf"))
 
@@ -316,6 +348,11 @@ def test_validate_params_rejects_outside_the_envelope_and_accepts_inside():
             fd.validate_params(h_i=4, s_q=1, page_size=16, units_per_warp=1, ring_depth=depth)
     for depth in fd.RING_DEPTH_CHOICES:
         fd.validate_params(h_i=4, s_q=1, page_size=16, units_per_warp=1, ring_depth=depth)
+    for hint in ("yes", 1, 0, "True"):  # a tri-state knob: None (the DSL's compiler decides), True, False -- never a truthy stand-in
+        with pytest.raises(ValueError, match="l2_hint must be None"):
+            fd.validate_params(h_i=4, s_q=1, page_size=16, units_per_warp=1, l2_hint=hint)
+    for hint in (None, True, False):
+        fd.validate_params(h_i=4, s_q=1, page_size=16, units_per_warp=1, l2_hint=hint)
     for h_i, s_q, page, units in ((4, 4, 16, 1), (4, 16, 64, 4), (64, 1, 8, 2), (8, 8, 32, 2), (16, 4, 256, 1), (3, 16, 16, 8), (5, 8, 16, 1)):
         fd.validate_params(h_i=h_i, s_q=s_q, page_size=page, units_per_warp=units)
 
@@ -346,17 +383,20 @@ def test_compile_site_keys_on_the_module_digest():
     assert "cute.compile(" not in src and 'symbol="cudnn_block_qsa_score_paged"' in src and '"compile_qsa_score_paged")' in src
 
 
-@needs_cuda
-def test_front_door_declines_by_version_in_a_fresh_process_without_importing_the_kernel_module():
-    """Rule 7 at the DOCUMENTED import path, in a fresh interpreter (in this process the kernel module is already imported, so an in-process
-    check would pass for the wrong reason).  The installed DSL is modeled as the public 4.6.2 wheel two ways at once -- the version
-    discovery answers 4.6.2 AND ``cutlass.experimental`` (the 4.7.0-only API every tile_dsl helper imports at module scope) is made
-    unimportable -- then the front door is imported and the selector called on real CUDA operands: the import touched neither the kernel
-    module nor ``cudnn.frost.tile_dsl``, the call raises the typed ``NotImplementedError`` naming the floor and the found version, and
-    afterwards the kernel module, ``cudnn.frost.tile_dsl`` and the radix top-k's package are still not imported."""
-    probe = r"""
+# The fresh-process probes' shared prelude: the installed DSL modeled as the public 4.6.2 wheel two ways at once -- the version discovery
+# answers 4.6.2 AND ``cutlass.experimental`` (the 4.7.0-only API every tile_dsl helper imports at module scope) is made unimportable; the
+# public 4.7.0 wheel's own ``cutlass/__init__`` imports ``cutlass.experimental`` too, so under that wheel ANY import of the DSL on the way
+# to the decline is the untyped ``ModuleNotFoundError`` Rule 7 forbids, which is why both probes also pin that ``cutlass`` stays out of
+# ``sys.modules`` (a delta against the interpreter's start-up set: a .pth hook's imports are never blamed on a front door).
+_FRESH_PROCESS_PRELUDE = r"""
 import importlib.abc
 import sys
+
+_STARTUP = set(sys.modules)
+
+
+def _dsl_modules():
+    return sorted(m for m in sys.modules if (m == "cutlass" or m.startswith("cutlass.")) and m not in _STARTUP)
 
 
 class _NoExperimental(importlib.abc.MetaPathFinder):
@@ -372,44 +412,96 @@ import torch
 import cudnn.frost.buffers as buffers
 
 buffers._DSL_STATE = (True, ("nvidia-cutlass-dsl", "4.6.2"))
-from cudnn.gated_attention_block import qsa_select_paged as fd
+"""
+
+
+def _run_fresh_process(probe: str, marker: str) -> None:
+    run = subprocess.run([sys.executable, "-c", _FRESH_PROCESS_PRELUDE + probe], capture_output=True, text=True, timeout=900)
+    assert run.returncode == 0, f"rc {run.returncode}\n{run.stderr[-3000:]}"
+    assert marker in run.stdout, run.stdout[-2000:]
+
+
+@needs_cuda
+def test_front_door_declines_by_version_in_a_fresh_process_without_importing_the_kernel_module():
+    """Rule 7 at the DOCUMENTED import path, in a fresh interpreter (in this process the kernel module is already imported, so an in-process
+    check would pass for the wrong reason).  The installed DSL modeled as the public 4.6.2 wheel (the prelude), then the front door is
+    imported and the selector called on real CUDA operands: the import touched neither the kernel module nor ``cudnn.frost.tile_dsl`` nor
+    the DSL itself (``cutlass`` stays out of ``sys.modules``: the front door's helpers -- the stream context, ``TupleDict`` -- are DSL-free
+    modules, never ``api_base``, which imports the DSL at module scope), the call raises the typed ``NotImplementedError`` naming the
+    floor and the found version, and afterwards the kernel module, ``cudnn.frost.tile_dsl``, the DSL and the radix top-k's package are
+    still not imported."""
+    probe = r"""
+from cudnn.QSA import selection_paged as fd
 
 KERNEL = "cudnn.gated_attention_block.kernels.qsa_score_paged"
 assert KERNEL not in sys.modules, "importing the front door imported the kernel module"
 assert "cudnn.frost.tile_dsl" not in sys.modules, "importing the front door imported tile_dsl"
+assert not _dsl_modules(), f"importing the front door imported the DSL: {_dsl_modules()}"
 qi = torch.zeros(1, 4, 128, dtype=torch.bfloat16, device="cuda")
 pool = torch.zeros(3, 4, 1, 128, dtype=torch.bfloat16, device="cuda")
 table = torch.tensor([[0, 1]], dtype=torch.int32, device="cuda")
 kv_lens = torch.tensor([9], dtype=torch.int32, device="cuda")
 try:
-    fd.qsa_select_decode_paged(qi, pool, table, kv_lens, seq_q=1)
+    fd.qsa_select_decode_paged_forward(qi, pool, table, kv_lens, seq_q=1)
 except NotImplementedError as error:
-    assert "qsa_select_decode_paged requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2" in str(error), str(error)
+    assert "qsa_select_decode_paged_forward requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2" in str(error), str(error)
 else:
     raise AssertionError("the selector ran on a sub-floor DSL")
 assert KERNEL not in sys.modules, "the decline imported the kernel module"
 assert "cudnn.frost.tile_dsl" not in sys.modules, "the decline imported tile_dsl"
+assert not _dsl_modules(), f"the decline imported the DSL: {_dsl_modules()}"
 assert not any(m.startswith("cudnn.deepseek_sparse_attention") for m in sys.modules), "the decline imported the radix top-k's package"
 print("@@FRONT_DOOR_OK")
 """
-    run = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, timeout=900)
-    assert run.returncode == 0, f"rc {run.returncode}\n{run.stderr[-3000:]}"
-    assert "@@FRONT_DOOR_OK" in run.stdout, run.stdout[-2000:]
+    _run_fresh_process(probe, "@@FRONT_DOOR_OK")
+
+
+@needs_cuda
+def test_dense_front_door_declines_by_version_in_a_fresh_process_without_importing_the_dsl():
+    """The dense-cache decode selector (``cudnn.QSA.selection``) is the paged front door's sibling and carries the same import-time contract:
+    under the modeled 4.6.2 wheel its import executes no DSL and no kernel package, ``qsa_select_decode_forward`` on real CUDA operands
+    raises the typed decline naming the floor and the found version, and afterwards the DSL and the DSA kernel packages are still not
+    imported."""
+    probe = r"""
+from cudnn.QSA import selection as dense
+
+assert not _dsl_modules(), f"importing the dense selector imported the DSL: {_dsl_modules()}"
+assert not any(m.startswith("cudnn.deepseek_sparse_attention") for m in sys.modules), "importing the dense selector imported the DSA package"
+qi = torch.zeros(1, 1, 4, 128, dtype=torch.bfloat16, device="cuda")
+kbar = torch.zeros(1, 8, 128, dtype=torch.bfloat16, device="cuda")
+kv_lens = torch.tensor([9], dtype=torch.int32, device="cuda")
+try:
+    dense.qsa_select_decode_forward(qi, kbar, kv_lens)
+except NotImplementedError as error:
+    assert "qsa_select_decode_forward requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2" in str(error), str(error)
+else:
+    raise AssertionError("the dense selector ran on a sub-floor DSL")
+assert not _dsl_modules(), f"the decline imported the DSL: {_dsl_modules()}"
+assert not any(m.startswith("cudnn.deepseek_sparse_attention") for m in sys.modules), "the decline imported the DSA package"
+print("@@DENSE_FRONT_DOOR_OK")
+"""
+    _run_fresh_process(probe, "@@DENSE_FRONT_DOOR_OK")
 
 
 @needs_cuda
 def test_rule7_gates_run_before_any_compile(monkeypatch):
-    """The DSL floor, then the sm_107a target, then the radix top-k's and PDL's cc 9.0: each a NotImplementedError that names the
-    version or the device, raised by the compile entry (the kernel module's own gate) and by the selector (the front door's gate)
-    BEFORE any kernel is compiled or imported -- each module's binding patched, since each gates for itself."""
+    """The DSL floor, then the sm_107a target, then the radix top-k's and PDL's cc 9.0, then the L2-hint arm's compiler floor (a device
+    gate before a form's gate): each a NotImplementedError that names the version or the device, raised by the compile entry (the kernel
+    module's own gate) and by the selector (the front door's gate) BEFORE any kernel is compiled or imported -- each module's binding
+    patched, since each gates for itself; the compiler seam is held BELOW the hint's floor throughout, so every earlier gate is pinned
+    ahead of a LIVE hint decline."""
     case = _Case(1, 1, 8, 16, [9], seed=1)
     kw = dict(seq_q=1)
+    monkeypatch.setattr(sp, "_bundled_cuda_version", lambda: (13, 3))  # the hint's decline is live from here on
+    assert sp.l2_hint_requirement_error() is not None
     for mod in (sp, fd):
         monkeypatch.setattr(mod, "cutedsl_requirement_error", lambda what: f"{what} requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2")
     with pytest.raises(NotImplementedError, match="qsa_score_paged requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2"):
         sp.compile_qsa_score_paged(h_i=H, s_q=1, page_size=16)
-    with pytest.raises(NotImplementedError, match="qsa_select_decode_paged requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, **kw)
+    with pytest.raises(NotImplementedError, match="qsa_score_paged requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2"):
+        sp.compile_qsa_score_paged(h_i=H, s_q=1, page_size=16, l2_hint=True)
+    with pytest.raises(NotImplementedError, match="qsa_select_decode_paged_forward requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2"):
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, **kw)
     for mod in (sp, fd):
         monkeypatch.setattr(mod, "cutedsl_requirement_error", lambda what: None)
         monkeypatch.setattr(
@@ -418,28 +510,111 @@ def test_rule7_gates_run_before_any_compile(monkeypatch):
     with pytest.raises(NotImplementedError, match="sm_107a"):
         sp.compile_qsa_score_paged(h_i=H, s_q=1, page_size=16)
     with pytest.raises(NotImplementedError, match="sm_107a"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, **kw)
+        sp.compile_qsa_score_paged(h_i=H, s_q=1, page_size=16, l2_hint=True)
+    with pytest.raises(NotImplementedError, match="sm_107a"):
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, **kw)
     for mod in (sp, fd):
         monkeypatch.setattr(mod, "cutedsl_arch_requirement_error", lambda cc: None)
     monkeypatch.setattr(sp, "compute_capability", lambda dev: (8, 0))
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (8, 0))
     with pytest.raises(NotImplementedError, match=r"cc 9\.0 or later; found cc 8\.0"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, **kw)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, **kw)
     with pytest.raises(NotImplementedError, match=r"griddepcontrol.*cc 8\.0"):
         sp.compile_qsa_score_paged(h_i=H, s_q=1, page_size=16, use_pdl=True)
+    # the L2-hint arm's compiler floor comes AFTER PDL's cc gate: with both live, use_pdl=True names griddepcontrol; without PDL the forced
+    # hint names the compiler, the floor and the wheel
+    with pytest.raises(NotImplementedError, match=r"griddepcontrol.*cc 8\.0"):
+        sp.compile_qsa_score_paged(h_i=H, s_q=1, page_size=16, use_pdl=True, l2_hint=True)
+    with pytest.raises(NotImplementedError, match=r"l2_hint=True.*bundled CUDA compiler is 13\.4 or later.*compiles with CUDA 13\.3"):
+        sp.compile_qsa_score_paged(h_i=H, s_q=1, page_size=16, l2_hint=True)
 
 
 @needs_cuda
-def test_e4m3_pair_is_refused_by_name_and_a_mixed_pair_is_a_form_error():
+def _assert_l2_hint_decline_text(why, found):
+    """The forced hint's decline (Rule 7) states the defect as OBSERVED -- the 13.3 PTX assembler of the public 4.7.0 cu13 wheel, and the
+    cu12 flavour's 12.9 assembler emitting the same encoding -- names the installed wheel and the compiler it found, and prescribes the cu13
+    flavour of 4.8.0 or later under a CUDA 13 driver (the DSL binds its cu13 toolchain only there).  It never attributes the defect to the
+    FOUND version by interpolation (``13.1`` was never observed) and never prescribes a bare wheel upgrade: a 4.8.0 user whose driver bound
+    the cu12 flavour already has the wheel, and ``pip install -U`` would change nothing."""
+    assert why is not None and f"compiles with CUDA {found}" in why, why
+    assert "13.3 PTX assembler of the public nvidia-cutlass-dsl 4.7.0" in why, why
+    assert "cu12 flavour" in why and "12.9" in why, why
+    assert "nvidia-cutlass-dsl[cu13]>=4.8.0" in why and "CUDA 13 compatible driver" in why, why
+    assert "pip install -U" not in why and "nvidia-cutlass-dsl>=4.8.0'" not in why, why
+    assert "l2_hint=None or False" in why, why
+    if found not in ("13.3", "12.9"):
+        assert f"{found} PTX assembler" not in why and f"{found} assembler" not in why, why
+
+
+def test_l2_hint_follows_the_dsl_compiler_and_the_forced_hint_declines_below_its_floor(monkeypatch):
+    """The key copies' L2 evict-first hint is a compile-time arm selected by the DSL's bundled CUDA compiler, read at ONE seam
+    (``_bundled_cuda_version``, ``cutlass.base_dsl.version_info.CUDA_VERSION``: the cu12 / cu13 flavour the DSL bound by the driver, never
+    the wheel's number): below ``L2_HINT_MIN_COMPILER`` = 13.4 (the first PTX assembler that encodes the hinted copies' uniform operands
+    correctly on sm_90 / sm_100; the 13.3 one bundled with the public 4.7.0 cu13 wheel traps on the first copy, the cu12 flavour's 12.9
+    one emits the same encoding) the default resolves to the plain copies and ``l2_hint=True`` is a typed decline naming the compiler,
+    the floor, the wheel and the cu13 remedy -- raised by the compile entry BEFORE any compile (the DSL floor and the target gates modeled
+    open, so the cell runs on every device); at and above the floor the hint is available, the default resolves to it and nothing declines.
+    Modeled, so it runs under any installed DSL."""
+    for mod in (sp, fd):
+        monkeypatch.setattr(mod, "cutedsl_requirement_error", lambda what: None)
+        monkeypatch.setattr(mod, "cutedsl_arch_requirement_error", lambda cc: None)
+    assert sp.L2_HINT_MIN_COMPILER == (13, 4)
+    live = sp._bundled_cuda_version()
+    assert isinstance(live, tuple) and len(live) == 2 and all(isinstance(x, int) for x in live), live
+    monkeypatch.setattr(sp, "_bundled_cuda_version", lambda: (13, 3))
+    assert sp.l2_hint_available() is False and sp._resolve_l2_hint(None) is False and sp._resolve_l2_hint(False) is False
+    why = sp.l2_hint_requirement_error()
+    assert why is not None and "l2_hint=True" in why and "13.4" in why and "CUDA 13.3" in why and "nvidia-cutlass-dsl" in why, why
+    _assert_l2_hint_decline_text(why, found="13.3")
+    with pytest.raises(NotImplementedError, match=r"l2_hint=True.*bundled CUDA compiler is 13\.4 or later.*compiles with CUDA 13\.3"):
+        sp.compile_qsa_score_paged(h_i=H, s_q=1, page_size=16, l2_hint=True)
+    with pytest.raises(NotImplementedError, match=r"compiles with CUDA 13\.3"):
+        sp._resolve_l2_hint(True)
+    # the cu12 flavour of ANY wheel (the DSL binds it under a CUDA 12 driver, a 4.8.0 wheel included) reports CUDA 12.9: the plain copies by
+    # the same rule, and the forced hint's decline names the observed defect and the cu13 remedy; a compiler nobody observed (13.1) is
+    # never named as the defect
+    for found in ((12, 9), (13, 1)):
+        monkeypatch.setattr(sp, "_bundled_cuda_version", lambda v=found: v)
+        assert sp.l2_hint_available() is False and sp._resolve_l2_hint(None) is False, found
+        _assert_l2_hint_decline_text(sp.l2_hint_requirement_error(), found=f"{found[0]}.{found[1]}")
+    for version in ((13, 4), (13, 6), (14, 0)):
+        monkeypatch.setattr(sp, "_bundled_cuda_version", lambda v=version: v)
+        assert sp.l2_hint_available() is True and sp.l2_hint_requirement_error() is None, version
+        assert sp._resolve_l2_hint(None) is True and sp._resolve_l2_hint(True) is True and sp._resolve_l2_hint(False) is False
+    with pytest.raises(ValueError, match="l2_hint must be None"):
+        sp.compile_qsa_score_paged(h_i=H, s_q=1, page_size=16, l2_hint="yes")
+
+
+@needs_cuda
+def test_mixed_or_unserved_dtype_pairs_are_form_errors_and_the_e4m3_arm_gates_on_sm89(monkeypatch):
+    """INVERTED 2026-10-21 (the e4m3 pair was a typed decline by name until the e4m3 read arm landed): a mixed pair and an f16 pair are
+    form errors naming the two served pairs; the e4m3 pair reaches the compile entry, where a device below sm_89 is a ``NotImplementedError``
+    naming ``mma.sync.m16n8k32 .e4m3`` (the cc modeled through the module's binding), a device at or above it compiles the arm (the device
+    cell below).  ``cache_dtype`` outside ``CACHE_DTYPES`` is a ``ValueError`` at the compile entry."""
     case = _Case(1, 1, 8, 16, [9], seed=2)
-    with pytest.raises(NotImplementedError, match="e4m3"):
-        fd.qsa_select_decode_paged(case.qi.to(_E4M3), case.pool.to(_E4M3), case.table, case.kv_lens, seq_q=1)
-    with pytest.raises(ValueError, match="both be bfloat16"):
-        fd.qsa_select_decode_paged(case.qi.to(_E4M3), case.pool, case.table, case.kv_lens, seq_q=1)
-    with pytest.raises(ValueError, match="both be bfloat16"):
-        fd.qsa_select_decode_paged(case.qi, case.pool.to(_E4M3), case.table, case.kv_lens, seq_q=1)
-    with pytest.raises(ValueError, match="both be bfloat16"):
-        fd.qsa_select_decode_paged(case.qi.half(), case.pool, case.table, case.kv_lens, seq_q=1)
+    for a, b in ((case.qi.to(_E4M3), case.pool), (case.qi, case.pool.to(_E4M3)), (case.qi.half(), case.pool), (case.qi.half(), case.pool.half())):
+        with pytest.raises(ValueError, match="both be bfloat16 or both float8_e4m3fn"):
+            fd.qsa_select_decode_paged_forward(a, b, case.table, case.kv_lens, seq_q=1)
+    with pytest.raises(ValueError, match="cache_dtype must be one of"):
+        sp.compile_qsa_score_paged(h_i=H, s_q=1, page_size=16, cache_dtype=torch.float16)
+    assert fd.CACHE_DTYPES == (torch.bfloat16, _E4M3) and fd.K_STEP_BYTES == 32
+    assert (fd.row_bytes(2), fd.row_bytes(1), fd.k_steps(2), fd.k_steps(1), fd.chunks_per_lane(2), fd.chunks_per_lane(1), fd.mma_k(2), fd.mma_k(1)) == (
+        256,
+        128,
+        8,
+        4,
+        4,
+        2,
+        16,
+        32,
+    )
+    assert fd.cache_elem_bytes(torch.bfloat16) == 2 and fd.cache_elem_bytes(_E4M3) == 1
+    with pytest.raises(ValueError, match="serves the cache dtypes"):
+        fd.cache_elem_bytes(torch.float16)
+    monkeypatch.setattr(sp, "compute_capability", lambda dev: (8, 0))
+    with pytest.raises(NotImplementedError, match=r"mma.sync.m16n8k32 .e4m3, an instruction of sm_89 and later.*cc 8\.0"):
+        sp.compile_qsa_score_paged(h_i=H, s_q=1, page_size=16, cache_dtype=_E4M3)
+    sp.compile_qsa_score_paged(h_i=H, s_q=1, page_size=16, cache_dtype=torch.bfloat16)  # the bf16 arm has no such gate (sm_80 serves it)
 
 
 @needs_cuda
@@ -448,47 +623,47 @@ def test_selector_form_checks_name_the_fault():
     case = _Case(2, 2, 16, 16, [9, 40], seed=3)
     kw = dict(seq_q=2)
     with pytest.raises(ValueError, match=r"head_dim 128"):
-        fd.qsa_select_decode_paged(case.qi[..., :64], case.pool, case.table, case.kv_lens, **kw)
+        fd.qsa_select_decode_paged_forward(case.qi[..., :64], case.pool, case.table, case.kv_lens, **kw)
     with pytest.raises(ValueError, match="T must be B x seq_q"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, seq_q=3)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, seq_q=3)
     with pytest.raises(ValueError, match="seq_q must be >= 1"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, seq_q=0)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, seq_q=0)
     with pytest.raises(ValueError, match="multiple of 8"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, n_blocks_max=12, **kw)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, n_blocks_max=12, **kw)
     with pytest.raises(ValueError, match="top_k must be in"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, top_k=0, **kw)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, top_k=0, **kw)
     with pytest.raises(ValueError, match="top_k must be in"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, top_k=fd.TOP_K_KERNEL_MAX + 1, **kw)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, top_k=fd.TOP_K_KERNEL_MAX + 1, **kw)
     with pytest.raises(ValueError, match="scale must be positive"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, scale=0.0, **kw)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, scale=0.0, **kw)
     with pytest.raises(ValueError, match="block_table must be an int32"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table.to(torch.int64), case.kv_lens, **kw)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table.to(torch.int64), case.kv_lens, **kw)
     with pytest.raises(ValueError, match="block_table needs a unit column stride"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table.t().contiguous().t(), case.kv_lens, **kw)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table.t().contiguous().t(), case.kv_lens, **kw)
     with pytest.raises(ValueError, match=r"kv_lens must be an int32 \[2\]"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens.to(torch.int64), **kw)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens.to(torch.int64), **kw)
     with pytest.raises(ValueError, match=r"kv_lens must be an int32 \[2\]"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens[:1], **kw)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens[:1], **kw)
     with pytest.raises(ValueError, match="kv_lens must be contiguous"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table, torch.stack([case.kv_lens, case.kv_lens], 1)[:, 0], **kw)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, torch.stack([case.kv_lens, case.kv_lens], 1)[:, 0], **kw)
     if torch.cuda.device_count() > 1:
         other_dev = torch.device("cuda", (case.qi.device.index + 1) % torch.cuda.device_count())  # a device other than the operands' own
         with pytest.raises(ValueError, match="kv_lens must live on"):
-            fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens.to(other_dev), **kw)
+            fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens.to(other_dev), **kw)
         with pytest.raises(ValueError, match="block_table needs a unit column stride on"):
-            fd.qsa_select_decode_paged(case.qi, case.pool, case.table.to(other_dev), case.kv_lens, **kw)
+            fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table.to(other_dev), case.kv_lens, **kw)
     with pytest.raises(ValueError, match="units_per_warp must be one of"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, units_per_warp=3, **kw)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, units_per_warp=3, **kw)
     with pytest.raises(ValueError, match="one compressed row"):
-        fd.qsa_select_decode_paged(case.qi, case.pool.expand(-1, -1, 2, -1), case.table, case.kv_lens, **kw)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool.expand(-1, -1, 2, -1), case.table, case.kv_lens, **kw)
     t, n = case.qi.shape[0], case.n_blocks_max
     buf = torch.empty(t * n + 4, dtype=torch.float32, device=_DEV)
     with pytest.raises(ValueError, match="32-byte aligned"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, logits_out=buf[4:].view(t, n), **kw)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, logits_out=buf[4:].view(t, n), **kw)
     with pytest.raises(ValueError, match="logits_out must be a contiguous"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, logits_out=torch.empty(t, n + 8, device=_DEV)[:, :n], **kw)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, logits_out=torch.empty(t, n + 8, device=_DEV)[:, :n], **kw)
     with pytest.raises(ValueError, match="counts_out must be a contiguous"):
-        fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, counts_out=torch.empty(t, dtype=torch.int64, device=_DEV), **kw)
+        fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, counts_out=torch.empty(t, dtype=torch.int64, device=_DEV), **kw)
 
 
 @needs_cuda
@@ -527,7 +702,7 @@ def test_selector_resolves_one_launch_stream_and_runs_every_torch_op_on_it(monke
     assert side.cuda_stream != ambient.cuda_stream
     for arg, want in ((side, side.cuda_stream), (side.cuda_stream, side.cuda_stream), (None, ambient.cuda_stream)):
         seen.clear()
-        out = fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, seq_q=1, stream=arg)
+        out = fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, seq_q=1, stream=arg)
         assert [s[0] for s in seen] == ["compile", "scorer", "topk"], seen
         assert seen[1][1] == want and seen[1][2] == want, (arg, seen[1])
         assert seen[2][1] == want and seen[2][2] == want, (arg, seen[2])
@@ -711,6 +886,36 @@ def test_ring_depth_is_a_knob():
 
 
 @needs_scorer
+def test_l2_hint_is_a_knob_and_the_forced_hint_declines_below_its_compiler_floor():
+    """The key copies' L2 evict-first hint (``cp.async ... .L2::cache_hint`` with a ``createpolicy`` register) is a cache-policy annotation:
+    the hinted and the plain copies move the same bytes into the same slots, so the logits are BITWISE across the knob.  The default
+    follows the DSL's bundled CUDA compiler (``l2_hint_available``: hinted from 13.4, plain below -- the 13.3 assembler of the public
+    4.7.0 wheel mis-encodes the hinted copies on sm_90 / sm_100), ``False`` is the plain copy on every DSL, and ``True`` below the floor
+    is the typed decline naming both versions (Rule 7): under a 4.8.0 wheel this cell compares the three artifacts, under a 4.7.0 wheel
+    the two plain ones and pins the decline.  The recipe records the arm that was built, and the default's compile key keeps its identity."""
+    case = _Case(3, 2, 1032, 16, [4 * 1032 - 1, 4 * 700 + 2, 4 * 3 + 3], seed=33)
+    default = sp.compile_qsa_score_paged(h_i=H, s_q=2, page_size=16)
+    assert default.l2_hint == sp.l2_hint_available() == (sp.l2_hint_requirement_error() is None)
+    assert (H, 2, 16, 1, True, False, default.device) in sp.compiled_cache
+    plain = sp.compile_qsa_score_paged(h_i=H, s_q=2, page_size=16, l2_hint=False)
+    assert plain.l2_hint is False and plain.ring_depth == default.ring_depth
+    outs = [case.run(default), case.run(plain)]
+    why = sp.l2_hint_requirement_error()
+    if why is None:
+        hinted = sp.compile_qsa_score_paged(h_i=H, s_q=2, page_size=16, l2_hint=True)
+        assert hinted.l2_hint is True
+        outs.append(case.run(hinted))
+    else:
+        with pytest.raises(NotImplementedError, match=r"l2_hint=True.*bundled CUDA compiler is 13\.4 or later.*compiles with CUDA \d+\.\d+") as info:
+            sp.compile_qsa_score_paged(h_i=H, s_q=2, page_size=16, l2_hint=True)
+        live = sp._bundled_cuda_version()
+        _assert_l2_hint_decline_text(str(info.value), found=f"{live[0]}.{live[1]}")  # the live wheel's text: the observed defect + the cu13 remedy
+    _assert_scorer(case, *outs[0])
+    for logits, counts, lens in outs[1:]:
+        assert torch.equal(_bits(outs[0][0]), _bits(logits)) and torch.equal(outs[0][1], counts) and torch.equal(outs[0][2], lens), "the hint changed a logit"
+
+
+@needs_scorer
 def test_block_lens_output_is_optional_and_the_artifact_pins_its_presence():
     case = _Case(2, 2, 64, 32, [4 * 64 - 1, 4 * 10], seed=8)
     with_lens = sp.compile_qsa_score_paged(h_i=H, s_q=2, page_size=32, has_block_lens=True)
@@ -759,6 +964,178 @@ def test_scale_scales_the_logits_and_a_strided_query_slab_reads_in_place():
     assert torch.equal(_bits(logits), _bits(one[0])) and torch.equal(counts, one[1])
 
 
+# --------------------------------------------------------------------------------------------- the e4m3 read arm (sm_89+)
+
+_CC_E4M3 = _cc() is not None and _cc() >= (8, 9)
+needs_e4m3 = pytest.mark.skipif(_SCORER_WHY is not None or not _CC_E4M3, reason=_SCORER_WHY or f"the e4m3 read arm needs sm_89+ (found {_cc()})")
+
+
+def _bits8(x):
+    return x.contiguous().view(torch.int8)
+
+
+@needs_e4m3
+@pytest.mark.parametrize("page_size", [8, 16, 32, 64])
+@pytest.mark.parametrize("rows", [1, 2, 3, 4])
+@pytest.mark.parametrize("n_blocks_max", [8, 520, 4096, 32768])
+def test_e4m3_arm_matches_the_fp64_reference_on_the_e4m3_values_and_writes_only_the_visible_columns(n_blocks_max, rows, page_size):
+    """The e4m3 read arm on four sequences whose positions cover every residue (the last sees every block): counts = the oracle's rule,
+    block_lens = min(top_k, counts), every visible logit within the module's budget of the fp64 reference on the SAME e4m3 values (every
+    e4m3 x e4m3 product is exact: the budget is the fp32 accumulation's), every other column untouched, a second launch bitwise; the
+    rows no visible block maps to hold NaN (a copy past a visible row or a page's rows would poison a logit) -- pages 8 (two parts per
+    copy instruction, the per-lane shuffle source) / 16 / 32 / 64."""
+    kv = _step_kv_lens(n_blocks_max, rows)
+    case = _Case(4, rows, n_blocks_max, page_size, kv, seed=n_blocks_max + 7 * rows + page_size, cache_dtype=_E4M3, nan_pages=True)
+    r = sp.compile_qsa_score_paged(h_i=H, s_q=rows, page_size=page_size, cache_dtype=_E4M3)
+    assert r.cache_dtype == _E4M3
+    logits, counts, lens = case.run(r)
+    _assert_scorer(case, logits, counts, lens)
+    logits2, counts2, lens2 = case.run(r)
+    assert torch.equal(_bits(logits), _bits(logits2)) and torch.equal(counts, counts2) and torch.equal(lens, lens2), "two launches differ"
+
+
+@needs_e4m3
+@pytest.mark.parametrize(
+    "h_i,s_q,n_blocks_max,page_size", [(1, 20, 72, 16), (2, 3, 72, 32), (3, 2, 136, 16), (8, 2, 72, 8), (16, 3, 72, 64), (17, 2, 136, 16), (4, 5, 136, 8)]
+)
+def test_e4m3_arm_row_map_branches_match_the_fp64_reference(h_i, s_q, n_blocks_max, page_size):
+    """Every branch of the row map under the e4m3 arm (the query tile at 128-B rows: ONE cp.async per thread per m-tile; several m-tiles;
+    a query spanning two tiles), with NaN sentinels on the unmapped rows."""
+    kv = [4 * n_blocks_max + s_q - 1, 4 * 30 + s_q + 2, s_q]
+    case = _Case(3, s_q, n_blocks_max, page_size, kv, seed=100 * h_i + s_q, h=h_i, cache_dtype=_E4M3, nan_pages=True)
+    r = sp.compile_qsa_score_paged(h_i=h_i, s_q=s_q, page_size=page_size, cache_dtype=_E4M3)
+    logits, counts, lens = case.run(r)
+    _assert_scorer(case, logits, counts, lens)
+    logits2, counts2, lens2 = case.run(r)
+    assert torch.equal(_bits(logits), _bits(logits2)) and torch.equal(counts, counts2) and torch.equal(lens, lens2)
+
+
+@needs_e4m3
+def test_e4m3_arm_degenerate_rows_and_dead_pages():
+    """The degenerate matrix under the e4m3 arm: a padding sequence, a sequence shorter than the step, a count inside a page, a dead page
+    past the range (harmless, bitwise) and UNDER visible blocks (logit exactly 0, every other column unchanged)."""
+    rows, n_blocks_max, page = 3, 520, 16
+    kv = [0, 5, 4 * 50 + 1, 4 * n_blocks_max + rows - 1, 4 * 130 + 2]
+    case = _Case(5, rows, n_blocks_max, page, kv, seed=5, cache_dtype=_E4M3)
+    case.table[0] = -1
+    r = sp.compile_qsa_score_paged(h_i=H, s_q=rows, page_size=page, cache_dtype=_E4M3)
+    logits, counts, lens = case.run(r)
+    _assert_scorer(case, logits, counts, lens)
+    assert counts[:rows].tolist() == [0, 0, 0] and bool((logits[:rows] == SENTINEL).all())
+    assert counts[rows : 2 * rows].tolist() == [0, 1, 1] and counts[2 * rows : 3 * rows].tolist() == [49, 50, 50]
+    table = case.table.clone()
+    table[4, 40] = -1
+    table[4, 41] = case.num_pages + 3
+    logits_b, counts_b, lens_b = case.run(r, table=table)
+    assert torch.equal(_bits(logits), _bits(logits_b)) and torch.equal(counts, counts_b) and torch.equal(lens, lens_b)
+    table[4, 10] = -1
+    table[4, 11] = case.num_pages + 3
+    logits_c, counts_c, lens_c = case.run(r, table=table)
+    _assert_scorer(case, logits_c, counts_c, lens_c, table=table)
+    for s in range(rows):
+        row = logits_c[4 * rows + s]
+        assert bool((row[40:48] == 0.0).all())
+        keep = torch.ones(n_blocks_max, dtype=torch.bool, device=_DEV)
+        keep[40:48] = False
+        assert torch.equal(_bits(row[keep]), _bits(logits[4 * rows + s][keep]))
+    assert torch.equal(counts, counts_c) and torch.equal(lens, lens_c)
+
+
+@needs_e4m3
+@pytest.mark.parametrize("page_size", [8, 16, 64])
+def test_e4m3_arm_knobs_are_the_same_function_and_the_artifacts_are_keyed(page_size):
+    """``units_per_warp`` 1 / 2 / 4 / 8 and ``ring_depth`` 2 / 4 / 8 under the e4m3 arm: the logits BITWISE across the knobs (the same MMA
+    chain per key, whichever warp owns it, whatever is in flight); every e4m3 artifact distinct from its bf16 twin and the bf16 keys
+    unchanged (the module memo holds the bf16 key without a dtype element); the recipe records the dtype."""
+    case = _Case(3, 2, 1032, page_size, [4 * 1032 - 1, 4 * 700 + 2, 4 * 3 + 3], seed=6 + page_size, cache_dtype=_E4M3, nan_pages=True)
+    outs = []
+    for units in fd.UNITS_PER_WARP_CHOICES:
+        for depth in (fd.RING_DEPTH_CHOICES if units == 2 else (fd.NTILES_IN_FLIGHT,)):
+            r = sp.compile_qsa_score_paged(h_i=H, s_q=2, page_size=page_size, units_per_warp=units, ring_depth=depth, cache_dtype=_E4M3)
+            r16 = sp.compile_qsa_score_paged(h_i=H, s_q=2, page_size=page_size, units_per_warp=units, ring_depth=depth)
+            assert r.compiled is not r16.compiled and r.cache_dtype == _E4M3 and r16.cache_dtype == torch.bfloat16
+            outs.append(case.run(r))
+    dev = torch.cuda.current_device()
+    assert (H, 2, page_size, 1, True, False, dev) in sp.compiled_cache and (H, 2, page_size, 1, True, False, dev, str(_E4M3)) in sp.compiled_cache
+    _assert_scorer(case, *outs[0])
+    for logits, counts, lens in outs[1:]:
+        assert torch.equal(_bits(outs[0][0]), _bits(logits)) and torch.equal(outs[0][1], counts) and torch.equal(outs[0][2], lens)
+
+
+@needs_e4m3
+def test_e4m3_arm_run_form_checks_name_the_dtype_both_ways_and_the_alignment_in_bytes():
+    """The kernel-level entry under the e4m3 arm: a bf16 ``qi`` / ``kbar`` on the e4m3 artifact and an e4m3 one on the bf16 artifact are
+    refused naming the artifact's dtype (no silent cast); the 16-byte rule is checked in BYTES (a 136-element e4m3 row stride is 136 B:
+    refused; the 128-B stride of the serving layout accepted); a strided e4m3 query slab reads in place bitwise the compact copy."""
+    case = _Case(2, 2, 16, 16, [9, 40], seed=4, cache_dtype=_E4M3)
+    r8 = sp.compile_qsa_score_paged(h_i=H, s_q=2, page_size=16, cache_dtype=_E4M3)
+    r16 = sp.compile_qsa_score_paged(h_i=H, s_q=2, page_size=16)
+    logits, counts, lens = case.outputs()
+    ok = dict(top_k=TOP_K, scale=D**-0.5, stream=_stream())
+    with pytest.raises(ValueError, match="qi must be float8_e4m3fn for this artifact"):
+        sp.run_qsa_score_paged(r8, case.qi.to(torch.bfloat16), case.pool, case.table, case.kv_lens, logits, counts, lens, **ok)
+    with pytest.raises(ValueError, match="kbar must be torch.float8_e4m3fn for this artifact"):
+        sp.run_qsa_score_paged(r8, case.qi, case.pool.to(torch.bfloat16), case.table, case.kv_lens, logits, counts, lens, **ok)
+    with pytest.raises(ValueError, match="qi must be bfloat16 for this artifact"):
+        sp.run_qsa_score_paged(r16, case.qi, case.pool.to(torch.bfloat16), case.table, case.kv_lens, logits, counts, lens, **ok)
+    with pytest.raises(ValueError, match="kbar must be torch.bfloat16 for this artifact"):
+        sp.run_qsa_score_paged(r16, case.qi.to(torch.bfloat16), case.pool, case.table, case.kv_lens, logits, counts, lens, **ok)
+    wide = torch.zeros(case.num_pages, case.rpp, 1, 136, dtype=_E4M3, device=_DEV)[..., :D]  # a 136-B row stride: not a whole 16-B vector
+    with pytest.raises(ValueError, match="row stride 128"):
+        sp.run_qsa_score_paged(r8, case.qi, wide, case.table, case.kv_lens, logits, counts, lens, **ok)
+    assert bool((logits == SENTINEL).all()), "a refused call wrote an output"
+    base = case.run(r8)
+    _assert_scorer(case, *base)
+    slab = torch.zeros(case.qi.shape[0], 640, dtype=_E4M3, device=_DEV)
+    slab[:, 64 : 64 + H * D] = case.qi.view(case.qi.shape[0], H * D)
+    strided = slab[:, 64 : 64 + H * D].view(case.qi.shape[0], H, D)
+    assert strided.data_ptr() == slab.data_ptr() + 64 and strided.stride(0) == 640
+    logits, counts, lens = case.outputs()
+    sp.run_qsa_score_paged(r8, strided, case.pool, case.table, case.kv_lens, logits, counts, lens, **ok)
+    torch.cuda.synchronize()
+    assert torch.equal(_bits(logits), _bits(base[0])) and torch.equal(counts, base[1])
+
+
+@needs_e4m3
+@pytest.mark.parametrize("units, want16, want8", [(1, 36, 18), (2, 44, 22)], ids=["units1", "units2"])
+def test_e4m3_arm_smem_is_half_the_bf16_arms(units, want16, want8):
+    """The two arms' DYNAMIC shared memory per CTA (the DSL sizes the allocation from the two Arrays; no ``smem=`` at the launch), read off
+    the profiler's kernel record (the chrome trace's ``shared memory`` of ``cudnn_block_qsa_score_paged``): bf16 36 KiB at the defaults
+    (units 1 = 4 n-tiles, depth 4: 4 slots of 2 KiB per warp + one 4 KiB m-tile), e4m3 18 KiB (1 KiB slots, a 2 KiB m-tile); 44 / 22 KiB
+    from units 2 (5 slots).  Pinned exactly: a ring byte miscounted would move it."""
+    import json
+    import tempfile
+
+    from torch.profiler import ProfilerActivity, profile
+
+    case16 = _Case(2, 1, 1032, 16, [4 * 1032 - 1, 4 * 300], seed=23 + units)
+    case8 = _Case(2, 1, 1032, 16, [4 * 1032 - 1, 4 * 300], seed=23 + units, cache_dtype=_E4M3)
+    found = {}
+    for cd, case in ((torch.bfloat16, case16), (_E4M3, case8)):
+        r = sp.compile_qsa_score_paged(h_i=H, s_q=1, page_size=16, units_per_warp=units, cache_dtype=cd)
+        case.run(r)  # warm: the census below holds launches only
+        prof = profile(activities=[ProfilerActivity.CUDA])
+        try:
+            prof.start()
+        except Exception:  # noqa: BLE001 -- CUPTI unavailable: the bitwise cells stand
+            pytest.skip("the CUDA profiler recorded no kernel activity on this box (CUPTI unavailable)")
+        try:
+            case.run(r)
+        finally:
+            prof.stop()
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            path = f.name
+        prof.export_chrome_trace(path)
+        with open(path) as f:
+            events = json.load(f)["traceEvents"]
+        kern = [e for e in events if e.get("cat") == "kernel" and "qsa_score_paged" in e.get("name", "")]
+        if not kern or "shared memory" not in kern[0].get("args", {}):
+            pytest.skip("the profiler's kernel record carries no shared-memory field on this box; the SMEM pin needs it")
+        found[cd] = int(kern[0]["args"]["shared memory"])
+    assert found == {torch.bfloat16: want16 * 1024, _E4M3: want8 * 1024}, found
+    print(f"paged scorer dynamic SMEM at units {units}: bf16 {found[torch.bfloat16]} B, e4m3 {found[_E4M3]} B")
+
+
 # --------------------------------------------------------------------------------------------- the selector (cc 9.0+)
 
 
@@ -773,7 +1150,7 @@ def test_paged_selection_matches_the_fp64_topk_set_up_to_ties(n_blocks_max, rows
     case = _Case(4, rows, n_blocks_max, page_size, _step_kv_lens(n_blocks_max, rows), seed=n_blocks_max + 11 * rows + page_size)
     # the capacity is passed where the table's reach (whole pages) exceeds it (8 blocks on a 16-row page); where it equals, the default is exercised
     cap = dict(n_blocks_max=n_blocks_max) if case.max_pages * case.rpp != n_blocks_max else {}
-    out = fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, seq_q=rows, **cap)
+    out = fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, seq_q=rows, **cap)
     torch.cuda.synchronize()
     t = 4 * rows
     assert out["block_ids"].shape == (t, TOP_K) and out["scores"].shape == (t, TOP_K) and out["logits"].shape == (t, n_blocks_max)
@@ -786,7 +1163,7 @@ def test_paged_selection_matches_the_fp64_topk_set_up_to_ties(n_blocks_max, rows
     if n_blocks_max <= TOP_K:
         want_ids, want_lens = full_block_ids(case.positions(), TOP_K, BS)
         assert torch.equal(out["block_ids"], want_ids.view(t, TOP_K).to(torch.int32)) and torch.equal(out["block_lens"], want_lens.view(-1).to(torch.int32))
-    again = fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, seq_q=rows, **cap)
+    again = fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, seq_q=rows, **cap)
     torch.cuda.synchronize()
     for key in ("block_ids", "counts", "block_lens"):
         assert torch.equal(out[key], again[key]), f"two calls differ in {key}"
@@ -796,14 +1173,49 @@ def test_paged_selection_matches_the_fp64_topk_set_up_to_ties(n_blocks_max, rows
 
 
 @needs_selector
+@pytest.mark.skipif(not _CC_E4M3, reason=f"the e4m3 read arm needs sm_89+ (found {_cc()})")
+@pytest.mark.parametrize("page_size", [8, 16, 64])
+@pytest.mark.parametrize("rows, n_blocks_max", [(1, 520), (4, 8192), (2, 32768)])
+def test_paged_selection_on_the_e4m3_pair_is_the_selection_on_the_same_values_upcast(rows, n_blocks_max, page_size):
+    """The selector on the e4m3 pair against the selector on the SAME e4m3 values upcast to bf16 (exact: e4m3 is a subset of bf16, so the
+    two arms score the same numbers -- their fp32 accumulations differ by order only, and the two selections agree as SETS up to ties at
+    the k-th boundary); each against the fp64 reference on those values; canonical order, two calls bitwise."""
+    case = _Case(3, rows, n_blocks_max, page_size, _step_kv_lens(n_blocks_max, rows, batch=3), seed=n_blocks_max + 13 * rows + page_size, cache_dtype=_E4M3)
+    cap = dict(n_blocks_max=n_blocks_max) if case.max_pages * case.rpp != n_blocks_max else {}
+    out8 = fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, seq_q=rows, **cap)
+    out16 = fd.qsa_select_decode_paged_forward(case.qi.to(torch.bfloat16), case.pool.to(torch.bfloat16), case.table, case.kv_lens, seq_q=rows, **cap)
+    torch.cuda.synchronize()
+    t = 3 * rows
+    ref = case.reference(D**-0.5).view(t, n_blocks_max)
+    for out in (out8, out16):
+        _assert_rows(out["block_ids"], out["scores"], out["block_lens"], ref, TOP_K)
+        _assert_canonical(out["block_ids"], out["block_lens"])
+    assert torch.equal(out8["counts"], out16["counts"]) and torch.equal(out8["block_lens"], out16["block_lens"])
+    kth = torch.topk(ref, min(TOP_K, n_blocks_max), dim=-1).values[:, -1]
+    n_diff = 0
+    for r_ in range(t):
+        a, b = set(out8["block_ids"][r_].tolist()) - {-1}, set(out16["block_ids"][r_].tolist()) - {-1}
+        if a != b:
+            diff = torch.tensor(sorted(a ^ b), device=_DEV)
+            assert bool(((ref[r_, diff] - kth[r_]).abs() <= TIE_TOL).all()), f"row {r_}: {len(a ^ b)} ids differ between the e4m3 and the bf16 arm beyond a tie"
+            n_diff += len(a ^ b)
+    again = fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, seq_q=rows, **cap)
+    torch.cuda.synchronize()
+    assert torch.equal(out8["block_ids"], again["block_ids"]) and torch.equal(_bits(out8["scores"]), _bits(again["scores"]))
+    live = torch.arange(n_blocks_max, device=_DEV)[None, :] < out8["counts"][:, None]
+    assert torch.equal(_bits(out8["logits"][live]), _bits(again["logits"][live]))
+    print(f"e4m3 vs bf16 arm on the same values: {n_diff} ids differ within the tie window over {t} rows")
+
+
+@needs_selector
 def test_selector_preallocated_outputs_are_written_in_place_and_match():
     case = _Case(3, 2, 1024, 32, [4 * 1024 - 1, 4 * 300 + 2, 0], seed=12)
     t = 6
     logits = torch.full((t, 1024), SENTINEL, dtype=torch.float32, device=_DEV)
     counts = torch.full((t,), -7, dtype=torch.int32, device=_DEV)
     lens = torch.full((t,), -7, dtype=torch.int32, device=_DEV)
-    out = fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, seq_q=2, logits_out=logits, counts_out=counts, block_lens_out=lens)
-    base = fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, seq_q=2)
+    out = fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, seq_q=2, logits_out=logits, counts_out=counts, block_lens_out=lens)
+    base = fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, seq_q=2)
     torch.cuda.synchronize()
     assert out["logits"].data_ptr() == logits.data_ptr() and out["counts"].data_ptr() == counts.data_ptr() and out["block_lens"].data_ptr() == lens.data_ptr()
     _assert_scorer(case, logits, counts, lens)
@@ -815,9 +1227,9 @@ def test_selector_preallocated_outputs_are_written_in_place_and_match():
 def test_selector_knobs_are_the_same_function():
     """``units_per_warp`` and ``use_pdl`` (cc 9.0+) are performance knobs of the selector: block_ids and scores bitwise."""
     case = _Case(2, 3, 4096, 16, [4 * 4096 - 2, 4 * 1000 + 1], seed=13)
-    base = fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, seq_q=3)
+    base = fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, seq_q=3)
     for kw in (dict(units_per_warp=1), dict(units_per_warp=4), dict(use_pdl=True)):
-        other = fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, seq_q=3, **kw)
+        other = fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, seq_q=3, **kw)
         torch.cuda.synchronize()
         assert torch.equal(base["block_ids"], other["block_ids"]) and torch.equal(_bits(base["scores"]), _bits(other["scores"])), kw
 
@@ -838,12 +1250,12 @@ def test_selector_on_a_side_stream_with_the_ambient_stream_parked_matches_the_sy
     case = _Case(3, 2, 4096, 16, [4 * 4096 - 2, 4 * 1000 + 1, 4 * 20 + 2], seed=16)
     ambient, side = torch.cuda.default_stream(), torch.cuda.Stream()
     assert torch.cuda.current_stream() == ambient and side != ambient
-    control = fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, seq_q=2)
+    control = fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, seq_q=2)
     torch.cuda.synchronize()
     ref = case.reference(D**-0.5).view(6, 4096)
     _assert_rows(control["block_ids"], control["scores"], control["block_lens"], ref, TOP_K)
     park_the_default_stream(3.0)  # the AMBIENT stream is busy from here, through the call and past the comparison
-    out = fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, seq_q=2, stream=side)
+    out = fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, seq_q=2, stream=side)
     parked_at_issue = not ambient.query()
     side.synchronize()  # the LAUNCH stream only
     with torch.cuda.stream(side):
@@ -876,7 +1288,7 @@ def test_selector_with_another_device_current():
     target = torch.cuda.current_device()
     other = next(i for i in range(torch.cuda.device_count()) if i != target)
     case = _Case(2, 3, 1032, 16, [4 * 1032 - 1, 4 * 300 + 2], seed=23)
-    control = fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, seq_q=3)
+    control = fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, seq_q=3)
     torch.cuda.synchronize(target)
     ref = case.reference(D**-0.5).view(6, 1032)
     _assert_rows(control["block_ids"], control["scores"], control["block_lens"], ref, TOP_K)
@@ -885,7 +1297,7 @@ def test_selector_with_another_device_current():
         _evict_scorer_memo(H, 3, 16)  # the scorer compiles COLD under the foreign device each time (the control above would otherwise have warmed it)
         with torch.cuda.device(other):
             with torch.cuda.stream(torch.cuda.default_stream(other)):  # the default-stream sentinel of a FOREIGN device
-                out = fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, seq_q=3, stream=arg)
+                out = fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, seq_q=3, stream=arg)
                 assert torch.cuda.current_device() == other, "the caller's current device was not restored"
         torch.cuda.synchronize(target)
         assert out["logits"].device.index == target and out["block_ids"].device.index == target
@@ -934,18 +1346,18 @@ def test_selector_with_another_device_current():
 
 @needs_selector
 def test_paged_entry_agrees_with_the_dense_selector_when_that_module_is_present():
-    """The dense-cache decode selector (``cudnn.gated_attention_block.qsa_select``) is a sibling change: probed BY NAME -- skipped by
+    """The dense-cache decode selector (``cudnn.QSA.selection``) is a sibling change: probed BY NAME -- skipped by
     name where the tree lacks it, imported unguarded where it is present -- then both selectors over the same keys (the dense form
     through the gathered cache) select the same SET per row up to ties at the k-th boundary."""
-    if importlib.util.find_spec("cudnn.gated_attention_block.qsa_select") is None:
-        pytest.skip("the dense decode selector module cudnn.gated_attention_block.qsa_select is absent from this tree (a sibling change)")
-    dense_mod = importlib.import_module("cudnn.gated_attention_block.qsa_select")
+    if importlib.util.find_spec("cudnn.QSA.selection") is None:
+        pytest.skip("the dense decode selector module cudnn.QSA.selection is absent from this tree (a sibling change)")
+    dense_mod = importlib.import_module("cudnn.QSA.selection")
     rows, n_blocks_max = 4, 2048
     case = _Case(3, rows, n_blocks_max, 16, [4 * 1500 + 1 + rows, 4 * 2000 + 3 + rows, 4 * 300 + rows], seed=14)
-    paged = fd.qsa_select_decode_paged(case.qi, case.pool, case.table, case.kv_lens, seq_q=rows)
+    paged = fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, seq_q=rows)
     dense, decline = None, None
     try:
-        dense = dense_mod.qsa_select_decode(case.qi.view(3, rows, H, D), case.dense().contiguous(), case.kv_lens, list_per_sequence=False)
+        dense = dense_mod.qsa_select_decode_forward(case.qi.view(3, rows, H, D), case.dense().contiguous(), case.kv_lens, list_per_sequence=False)
     except NotImplementedError as error:
         decline = str(error)
     if dense is None:

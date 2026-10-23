@@ -256,7 +256,7 @@ def test_sm120_fp8_blk128_v_quantization_rounding():
     values = torch.cat((neighbors, -neighbors, torch.tensor([0.0, -0.0], device="cuda", dtype=torch.bfloat16)))
     scales = torch.linspace(0.73, 1.37, 128, device="cuda").view(1, 128)
     v = values.repeat((128 * 128 + values.numel() - 1) // values.numel())[: 128 * 128].view(1, 1, 128, 128)
-    expected = (v * scales.reciprocal().to(torch.bfloat16)).to(torch.float8_e4m3fn)
+    expected = (v.float() * scales.reciprocal()).to(torch.float8_e4m3fn)
     actual = torch.empty((1, 1, 1, 128, 128), device="cuda", dtype=torch.float8_e4m3fn)
     tensors = tuple(from_dlpack(t.view(-1), assumed_align=16) for t in (v, actual, scales))
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -310,7 +310,10 @@ def test_sm120_fp8_blk128_never_launches_blk64(monkeypatch):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize(("arch", "block_size", "error", "message"), ((100, 128, NotImplementedError, "requires SM120"), (120, 32, ValueError, "64 or 128")))
+@pytest.mark.parametrize(
+    ("arch", "block_size", "error", "message"),
+    ((110, 128, NotImplementedError, "requires SM90, SM100/SM103, or SM120"), (120, 32, ValueError, "64 or 128")),
+)
 def test_sm120_fp8_blk128_support_validation(monkeypatch, arch, block_size, error, message):
     ops = _require_sm120()
     api = importlib.import_module("cudnn.block_sparse_attention.api")

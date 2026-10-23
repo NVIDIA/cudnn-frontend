@@ -1691,10 +1691,10 @@ def _sm100_d128_declaration_mismatch(facts: "ga.SdpaGraphFacts", version) -> Opt
     label = "d128 grouped" if grouped else "d128 THD"
     import re
 
-    from .d128_contract import validate_accumulation_scale
+    from .d128_contract import ACCUMULATION_CCS, validate_accumulation_scale
 
-    if facts.device_cc != (10, 0):
-        return f"{label} requires SM100 (cc 10.0)"
+    if facts.device_cc not in ACCUMULATION_CCS:
+        return f"{label} requires SM100 or SM103 (cc 10.0 / 10.3)"
     match = re.match(r"^(\d+)\.(\d+)\.(\d+)", version[1]) if version and version[0] == "nvidia-cutlass-dsl" else None
     if match is None or tuple(map(int, match.groups())) < (4, 8, 0):
         return f"{label} requires nvidia-cutlass-dsl >= 4.8.0; found {version}"
@@ -1771,7 +1771,7 @@ def _sm100_d128_spec() -> EngineSpec:
     """Dense and packed d128 with plan-time prepared implementation selection.
 
     Dense MHA declarations retain the SM100-106 envelope. Packed or grouped
-    accumulation requires exact SM100, DSL >= 4.8 and positive FP32 scale.
+    accumulation requires SM100 or SM103, DSL >= 4.8 and positive FP32 scale.
     Grouped variants fold native per-Q-head dK/dV partials in FP32.
     """
     return EngineSpec(

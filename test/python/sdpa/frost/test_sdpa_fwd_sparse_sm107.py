@@ -2255,7 +2255,12 @@ def test_sparse_kernel_gate_arm_source_pins():
     assert "GATE_TX_BYTES = CFG.GATE_TX_BYTES" in code and "n_bytes=Q_SLOT_BYTES" not in code and "n_bytes=6144" not in code
     i_sig = code.index("def _kernel(")
     sig = code[i_sig : code.index(") -> None:", i_sig)]
-    assert sig.rstrip().endswith("tma_gate_desc: cutlass.GridConstant[tmap.TensorMap] = None,"), "the gate descriptor is the LAST kernel parameter"
+    # the LAST RUNTIME parameter: a trailing ``cutlass.Constexpr`` (the programmatic-dependent-launch switch, a compile-time specialization
+    # the compiled call never carries) may follow it without moving any parameter offset
+    runtime_params = [ln for ln in sig.splitlines() if ln.strip() and "cutlass.Constexpr[" not in ln]
+    assert (
+        runtime_params[-1].strip() == "tma_gate_desc: cutlass.GridConstant[tmap.TensorMap] = None,"
+    ), "the gate descriptor is the LAST runtime kernel parameter"
     # the ungated rendering keeps its drains; the gated one consumes mb_gate_empty in ORDER as well as in count: the exit-path wait
     # BEFORE the last item's gate (a parity wait two completions behind a single-stage barrier never returns), then x STAGES_GATE
     assert "cutlass.range_constexpr(CFG.STAGES_GATE + 1)" not in code, "the drain is STAGES_GATE deep once the exit path waits before the last gate"
@@ -3154,6 +3159,12 @@ def test_adapter_compiles_the_combine_with_the_pinned_form_and_the_pdl_switch(mo
         seen.append(dict(kwargs))
         return lambda *a: None
 
+    kernel_kw = []
+
+    def kernel_recording(**kwargs):
+        kernel_kw.append(dict(kwargs))
+        return lambda **kw: None
+
     monkeypatch.setattr(loader, "load_template", lambda *a, **kw: SimpleNamespace(compile=kernel))
     monkeypatch.setattr(comb, "compile_ptr", combine)
     monkeypatch.setattr(cache, "positional_entry", lambda owner: owner)
@@ -3171,27 +3182,91 @@ def test_adapter_compiles_the_combine_with_the_pinned_form_and_the_pdl_switch(mo
     kw.update(epilogue_gate=_T((4, 1, 24, D), (24 * D, 24 * D, D, 1), "torch.bfloat16"))
     SparseGqaFwdDslSm107(**kw).compile()
     assert seen[-1]["gate"] is True and seen[-1]["dtype_gate"] == "bf16" and seen[-1]["decode_grid"] == comb.DECODE_GRID_AUTO
+    # the switch reaches BOTH compiles: the kernel's compile key (use_pdl=) and the combine's entry (use_pdl=)
+    monkeypatch.setattr(loader, "load_template", lambda *a, **kw: SimpleNamespace(compile=kernel_recording))
+    for pdl in (False, True):
+        SparseGqaFwdDslSm107(**_decode_operands(B=1, S=1, H=24, KH=2, split_kv=8), use_pdl=pdl).compile()
+        assert seen[-1]["use_pdl"] is pdl and seen[-1]["decode_grid"] == comb.DECODE_GRID_AUTO
+        assert kernel_kw[-1]["use_pdl"] is pdl and kernel_kw[-1]["has_lse"] is True, kernel_kw[-1]  # the declared block_lens variant's compile
 
 
-def test_adapter_declines_use_pdl_by_name_until_the_core_carries_the_sites(sm107_host_target):
-    """``use_pdl=True`` on the sparse adapter is a typed decline naming the missing sites (the kernel body carries no ``griddepcontrol``
-    site on this tree, so a dependent launch of it with the attribute would read its operands before the predecessor's writes land); the
-    default (``False``) is served, and the flag is a recorded constructor fact.  The kernel source has no site (the pin that inverts when
-    the sites land)."""
-    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+def test_adapter_serves_use_pdl_and_declines_it_with_thd_by_name(sm107_host_target):
+    """``use_pdl=True`` on the sparse adapter is SERVED on the dense BSHD and paged forms (the decode form split and unsplit, the prefill
+    form): the flag is a recorded constructor fact that reaches the kernel's compile key and the combine's entry; ``thd=True`` with the
+    switch is a typed decline naming the measured fact (the packed form reads the setup launch's metadata above every role wait).  The
+    inversion of the former decline pin.  The kernel source carries the sites: the pair imported from ``tile_dsl.barrier``, ONE wait per
+    role that reads a predecessor's output (TMA, gather, MMA, softmax: four), ONE release per CTA after ``fence_mbarrier_init +
+    barrier_cta_sync`` and before the role dispatch, the constexpr threaded ``_kernel`` -> every role and ``_host`` -> the launch attribute,
+    ``compile(use_pdl=)`` in the key -- and NO new barrier, ring, SMEM tile or ring wait.  ONE source of the THD fact: the adapter raises
+    ``pdl_decline_reason(thd=True)`` verbatim and the gated attention block's declaration-time decline carries the same statement -- the two
+    sites are pinned equal here, so neither text drifts alone when the kernel's PDL scope moves."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107, pdl_decline_reason
 
-    kw = _decode_operands(B=1, S=1, H=24, KH=2, split_kv=8)
-    off = SparseGqaFwdDslSm107(**kw)
-    assert off.use_pdl is False and off.check_support() is True
-    on = SparseGqaFwdDslSm107(**kw, use_pdl=True)
-    assert on.use_pdl is True
-    with pytest.raises(NotImplementedError, match="use_pdl=True is not served by the kernel body yet") as e:
-        on.check_support()
-    assert "griddepcontrol" in str(e.value) and "declare use_pdl=False" in str(e.value)
-    with pytest.raises(NotImplementedError, match="use_pdl=True is not served by the kernel body yet"):
-        SparseGqaFwdDslSm107(**_operands(S=8), use_pdl=True).check_support()  # the prefill form alike: one switch, one decline
+    for kw in (_decode_operands(B=1, S=1, H=24, KH=2, split_kv=8), _decode_operands(B=4, S=1, H=24, KH=2, split_kv=1, P=16), _operands(S=8)):
+        off = SparseGqaFwdDslSm107(**kw)
+        assert off.use_pdl is False and off.check_support() is True
+        on = SparseGqaFwdDslSm107(**kw, use_pdl=True)
+        assert on.use_pdl is True and on.check_support() is True
+    thd = _operands(B=1, S=64, H=24, KH=2)
+    thd.update(thd=True, seq_q_lens=_T((2,), (1,), "torch.int32"), seq_kv_lens=_T((2,), (1,), "torch.int32"))
+    assert SparseGqaFwdDslSm107(**thd).check_support() is True
+    with pytest.raises(NotImplementedError, match="thd=True with use_pdl=True is not served") as e:
+        SparseGqaFwdDslSm107(**thd, use_pdl=True).check_support()
+    assert "setup launch" in str(e.value) and "declare use_pdl=False" in str(e.value)
+    assert str(e.value) == f"sparse d256 forward (sm107): {pdl_decline_reason(thd=True)}" and pdl_decline_reason(thd=False) is None
+    from cudnn.gated_attention_block import GatedAttentionBlockFwd, GatedAttentionBlockGeometry, QsaSpec
+
+    geom = GatedAttentionBlockGeometry(d_model=512, h_q=8, h_kv=2, d_head=D, rope_dim=64, qsa=QsaSpec())
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    mk = lambda *shape: torch.empty(*shape, dtype=torch.bfloat16, device=dev)  # noqa: E731
+    with pytest.raises(NotImplementedError) as eb:  # the block's packed QsaSpec declaration with the switch: the adapter's statement verbatim
+        GatedAttentionBlockFwd(
+            mk(32, 512),
+            mk(geom.n_qkvg, 512),
+            mk(D),
+            mk(D),
+            mk(32, 64),
+            mk(32, 64),
+            mk(512, 8 * D),
+            mk(32, 512),
+            geom,
+            thd=True,
+            num_sequences=2,
+            max_seq_len=32,
+            token_capacity=32,
+            use_pdl=True,
+        )
+    assert pdl_decline_reason(thd=True) in str(eb.value), str(eb.value)
     code = _code(_kernel_source())
-    assert "griddepcontrol" not in code and "wait_on_dependent_grids" not in code and "launch_dependent_grids" not in code
+    assert "from cudnn.frost.tile_dsl.barrier import MBarrier, PipelineState, Producer, advance, wait, wait_on_dependent_grids" in code
+    assert (
+        code.count("        wait_on_dependent_grids()") == 4
+    ), "one dependent-grid wait per role that reads a predecessor's output (TMA, gather, MMA, softmax)"
+    # A PLACEMENT pin (never a tolerance): the core triggers its dependent grid at its COMPLETION -- no explicit release anywhere.  A
+    # release at the prologue (the first form) left the split combine's CTAs resident through the core's whole run and cost 3.2-4.4 us
+    # per step at B <= 4 on the cc 10.7 class; the same programmatic edge triggered at completion costs nothing (the header's PDL SITES).
+    assert code.count("        launch_dependent_grids()") == 0, "no explicit release: the CTA exit is the trigger (the measured placement)"
+    assert "launch_dependent_grids" not in code, "the helper is not even imported: nothing may release above the mainloop"
+    assert (
+        code.count("if cutlass.const_expr(use_pdl):") == 4
+    ), "the four waits, each a const_expr arm, and nothing else (the False rendering traces the program as before)"
+    # the former release site -- between the init fence + CTA sync and the role dispatch -- holds no dependent-grid instruction at all
+    i_sync = code.index("nvvm.fence_mbarrier_init()\n    nvvm.barrier_cta_sync()")
+    i_disp = code.index("if warp_idx < SOFTMAX_WARPS:\n        _softmax_warp_group(")
+    assert i_sync < i_disp and "dependent_grids" not in code[i_sync:i_disp]
+    # every role's wait precedes its first decode / bounds / issue, and the pre-dispatch THD exit stays ABOVE the init sync, hence above
+    # every wait (the declined composition)
+    for role in ("_tmaldg_warp_group", "_gather_warp_group", "_mma_warp_group", "_softmax_warp_group"):
+        body = code[code.index(f"def {role}(") :]
+        body = body[: body.index("\ndef ", 1)]
+        assert "use_pdl: cutlass.Constexpr[bool] = False" in body, f"{role} takes the constexpr"
+        assert body.index("        wait_on_dependent_grids()") < body.index("= _decode_item("), f"{role}: the wait precedes the first decode"
+    assert code.index("exit_if_dead_thd_cluster(seq_kv_lens_tensor, n_batch, 1)") < i_sync
+    assert code.count("use_pdl=use_pdl,") == 5, "the four role calls and the launch attribute"
+    assert "use_pdl: cutlass.Constexpr[bool] = False,\n) -> None:\n    warp_idx = cute.arch.make_warp_uniform" in code, "the kernel's constexpr, appended last"
+    assert "    use_pdl: cutlass.Constexpr[bool] = False,\n    stream: _cuda_driver.CUstream = None," in code, "the host's constexpr before the stream"
+    assert "    use_pdl: bool = False,\n) -> Callable:" in code and "        bool(use_pdl),\n        stream=cute.runtime.make_fake_stream" in code
+    assert code.count("MBarrier(_alloc(") == 13 and code.count("SmemTile(") == 4 and code.count("spin=SPIN_RING_WAITS") == 11
 
 
 def _combine_kernels_of(fn):
@@ -3219,9 +3294,10 @@ def _former_combine_entry(gate: bool):
     )
 
 
-def _pinned_form_cell(B, S_q, split, gate, with_lse, seed):
-    """One decode cell through the adapter with the pinned combine form: returns ``(adapter, o, lse, ws, gate_t, ref_o, ref_lse, run)`` --
-    ``run`` executes the adapter once more into the same O / LSE / workspace (the census hook)."""
+def _pinned_form_cell(B, S_q, split, gate, with_lse, seed, use_pdl=False):
+    """One decode cell through the adapter with the pinned combine form (and, ``use_pdl``, the programmatic-dependent-launch form of both
+    launches): returns ``(adapter, o, lse, ws, gate_t, ref_o, ref_lse, run)`` -- ``run`` executes the adapter once more into the same O /
+    LSE / workspace (the census hook)."""
     from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
 
     H, KH, top_k, dtype = 24, 2, 512, torch.bfloat16
@@ -3253,13 +3329,14 @@ def _pinned_form_cell(B, S_q, split, gate, with_lse, seed):
         bottom_right=True,
         split_kv=split,
         epilogue_gate=gate_t,
+        use_pdl=use_pdl,
     )
     assert a.check_support()
     a.compile()
-    ws = torch.full((a.scratch_workspace_bytes() // 4,), 1.5e30, device=dev, dtype=torch.float32)
+    ws = torch.full((max(a.scratch_workspace_bytes(), 16) // 4,), 1.5e30, device=dev, dtype=torch.float32)
 
     def run():
-        a.execute(stream=_stream(), workspace=ws)
+        a.execute(stream=_stream(), workspace=ws if split > 1 else None)
 
     run()
     torch.cuda.synchronize()
@@ -3335,3 +3412,69 @@ def test_decode_form_combine_launches_the_pinned_kernel(B, S_q, split, gate, wit
     others = {k for f, ks in _FORM_KERNEL.items() if f != form for k in ks}
     assert not any(next(iter(names)).startswith(w) for w in others), (form, names)
     print(f"\npinned combine form {form} B={B} S_q={S_q} split={split}: the profiler saw {sorted(names)}")
+
+
+# ============================================================================ programmatic dependent launch on the sparse core (use_pdl): bitwise the plain arm
+_PDL_CELLS = [
+    pytest.param(1, 1, 8, False, True, id="B1-Sq1-split8-decode-grid-lse"),
+    pytest.param(4, 1, 8, True, True, id="B4-Sq1-split8-decode-grid-gated-lse"),
+    pytest.param(6, 1, 4, True, True, id="B6-Sq1-split4-lean-walk-gated-lse"),
+    pytest.param(1, 1, 1, True, True, id="B1-Sq1-unsplit-epilogue-gate-lse"),
+    pytest.param(4, 2, 1, False, False, id="B4-Sq2-unsplit-shared-list-no-lse"),
+]
+
+
+@requires_rubin
+@pytest.mark.parametrize("B, S_q, split, gate, with_lse", _PDL_CELLS)
+def test_decode_form_pdl_arm_is_bitwise_the_plain_arm(B, S_q, split, gate, with_lse):
+    """The decode form with ``use_pdl=True`` (the core launched with the attribute and its griddepcontrol sites, the combine's pair) is
+    BITWISE the plain arm on O and LSE over the same inputs -- split (the decode-grid kernel and the lean group walk behind it) and unsplit
+    (the kernel's own epilogue gate; no combine) -- within the budget vs the oracle, two launches bitwise."""
+    off = _pinned_form_cell(B, S_q, split, gate, with_lse, seed=300 + split, use_pdl=False)
+    on = _pinned_form_cell(B, S_q, split, gate, with_lse, seed=300 + split, use_pdl=True)
+    a_off, o_off, lse_off, ws_off, _g, ref_o, ref_lse, _run_off = off
+    a_on, o_on, lse_on, ws_on, _g2, _ref_o, _ref_lse, run_on = on
+    assert a_on.use_pdl is True and a_off.use_pdl is False and a_on.combine_form() == a_off.combine_form()
+    H = 24
+    lse_check_off = lse_off if with_lse else ws_off[a_off._split_workspace_layout()[2] // 4 :][: B * H * S_q].view(B, H, S_q) if split > 1 else None
+    lse_check_on = lse_on if with_lse else ws_on[a_on._split_workspace_layout()[2] // 4 :][: B * H * S_q].view(B, H, S_q) if split > 1 else None
+    if lse_check_off is not None:
+        max_o, max_lse = _check([(o_on, lse_check_on)], ref_o, ref_lse)
+        assert torch.equal(lse_check_on, lse_check_off), "the LSE differs with use_pdl"
+    else:
+        max_o = float((o_on.float() - ref_o).abs().max())
+        max_lse = 0.0
+        assert max_o <= ATOL
+    assert torch.equal(o_on, o_off), f"O differs with use_pdl (max|d| {(o_on.float() - o_off.float()).abs().max().item():.3e})"
+    o1 = o_on.clone()
+    run_on()
+    torch.cuda.synchronize()
+    assert torch.equal(o_on, o1), "two switched launches are not bitwise"
+    print(f"\npdl arm B={B} S_q={S_q} split={split} gate={gate} lse={with_lse}: bitwise the plain arm; max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}")
+
+
+@requires_rubin
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
+def test_prefill_form_pdl_arm_is_bitwise_the_plain_arm(dtype):
+    """The prefill form (top-left, per-token lists, the block's own K / V) with ``use_pdl=True``: bitwise the plain arm on O and LSE at
+    S = 384 (three tiles: the ring depth) over 24 / 2 heads, the full list; within the budget vs the oracle."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    B, S, H, KH, top_k = 1, 384, 24, 2, 512
+    q, k, v, g = _inputs(B, S, H, KH, dtype, 9)
+    ids, lens = _lists("full", B, S, top_k, g)
+    scale = 1.0 / math.sqrt(D)
+    ref_o, ref_lse = _reference(q, k, v, ids, lens, None, scale, top_k)
+    outs = {}
+    for pdl in (False, True):
+        o = torch.full((B, S, H, D), _sentinel(dtype), device=q.device, dtype=dtype)
+        lse = torch.full((B, H, S), _sentinel(dtype), device=q.device, dtype=torch.float32)
+        a = SparseGqaFwdDslSm107(q=q, k=k, v=v, o=o, lse=lse, block_ids=ids, block_lens=lens, top_k=top_k, scale=scale, use_pdl=pdl)
+        assert a.check_support() and a.use_pdl is pdl
+        a.compile()
+        a.execute(stream=_stream())
+        torch.cuda.synchronize()
+        outs[pdl] = (o, lse)
+    max_o, max_lse = _check([outs[True]], ref_o, ref_lse)
+    _assert_bitwise(outs[True], outs[False], f"prefill {dtype} use_pdl vs plain")
+    print(f"\nprefill pdl arm {dtype}: bitwise the plain arm; max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}")

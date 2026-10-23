@@ -83,22 +83,22 @@ class SageFp8VQuantizerSm120Blk128:
         )
         if tidx == 0:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom)
-        # Reuse the exact BF16 reciprocal for 64 tokens per thread instead
+        # Reuse the FP32 reciprocal for 64 tokens per thread instead
         # of recomputing it in a separate CTA for every sequence row.
-        reciprocal_bf16 = cute.math.div(
+        reciprocal = cute.math.div(
             cutlass.Float32(1.0),
             mVScale[head_idx * 128 + dim_idx],
             full=True,
-        ).to(cutlass.BFloat16)
+        )
         for offset in cutlass.range(64, unroll=1):
             token = token_begin + offset
             seq_idx = kv_block * 128 + token
             # Zero padded tokens explicitly; the layout includes a full tile.
-            scaled_bf16 = cutlass.BFloat16(0.0)
+            scaled = cutlass.Float32(0.0)
             if seq_idx < seqlen_k:
                 value = mV[(group_idx * seqlen_k + seq_idx) * 128 + dim_idx]
-                scaled_bf16 = (value * reciprocal_bf16).to(cutlass.BFloat16)
-            sV[dim_idx, token] = scaled_bf16.to(cutlass.Float8E4M3FN)
+                scaled = value.to(cutlass.Float32) * reciprocal
+            sV[dim_idx, token] = scaled.to(cutlass.Float8E4M3FN)
         # One coalesced TMA store performs the final layout write. There is
         # no separate transpose/repack kernel on the public path.
         cute.arch.fence_view_async_shared()

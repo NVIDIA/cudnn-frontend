@@ -695,12 +695,35 @@ ordered by CTA barriers. Check prefix lengths around warp boundaries and
 zero-length sequences (`test_parallel_thd_metadata_matches_lengths_and_normalized_cu`),
 and run racecheck/memcheck before changing this shared setup again.
 
-Shared compile-time predicates must reject unrelated head geometry before
-reading family-specific config fields. The D512 two-by-two config has no
-`PAGED_KV`; D256 decode has no `THD_VARLEN`. A D128-only optimization can break
-their compilation through a shared decoder even when its own tests pass.
-Exercise real config objects (`test_thd_work_prefix_declines_other_config_families`)
-and the existing D512 `test_two_by_two_thd` compile-and-execute test.
+The shared THD unit decode (`_common_blackwell._thd_decode`,
+`tile_dsl.thd.thd_decode_unit_prefix`) binary-searches the remap-ordered work
+prefix for EVERY THD flavor, forward and backward, so three sites must agree
+or units decode garbage from an unwritten table: the setup launch publishes
+the prefix along the blocked axis (`write_thd_work_prefix`: Q rows by default,
+`cu0 = 2B+1` for kv-block units, `prefix0 = THD_BWD_WORK_PREFIX_OFF` in the
+backward layout, whose forward slot holds `row_off`), the host reserves
+`THD_WORK_META_WORDS` / `THD_BWD_META_WORDS` words, and the decode is handed
+the same `cu0` / `prefix0`. A kernel that derives its batch count from the
+metadata tensor's length (the SM120 prefill family) must do it through
+`THD_BATCH_OF_WORK_META_WORDS`: the old `(n - 4) // 4` read B = 5 for B = 4 on
+the 5B+5-word tensor and faulted only once units outnumbered CTAs
+(`test_dsl_sm120_thd_multi_unit_per_cta`). Shared decoders still see configs
+without family-specific fields (the D512 two-by-two config has no `PAGED_KV`;
+D256 decode has no `THD_VARLEN`), so read those through defaults, and keep the
+D512 `test_two_by_two_thd` compile-and-execute test green. Detectors:
+`test_thd_decode_unit_prefix_matches_walk` (prefix == walk unit for unit, B 1
+to 257, zero-length sequences, reversed rows), `test_parallel_bwd_setup_prefixes`
+(asserts the whole backward buffer, prefix words included) and
+`test_thd_work_prefix_replay_matches_live_tiles`. Two DSL traps met on the way:
+inside a `@cute.kernel` that already has `Constexpr` parameters, hand a
+`@cute.jit` helper's `Constexpr` argument through a kernel `Constexpr` parameter
+rather than a literal (the fp8/mxfp8 setup kernel failed with `requires a code
+object with 0 free vars, not 2` while its f16 twin passing `splits` compiled);
+and inside a `@cute.jit` helper never rebind a None-defaulted parameter to a
+staged value within a dynamic region (`TYPE_UNSTABLE_JOIN` at the region join)
+-- assign a fresh local (`cuq0 = n_batch if const_expr(cu0 is None) else cu0`)
+and re-run the callers that use the default whenever a shared helper changes,
+since callers passing the value explicitly compile fine.
 
 Standalone scratch queries after `check_support()` must not depend on a
 compiled module. Reserve metadata from checked plan geometry and keep the
@@ -1022,6 +1045,12 @@ partial store and combine read must use live token coordinates, including
 empty sequences and nonaligned tails. `test_paged_thd_split_capture_lengths_and_stats`
 checks changed device lengths under retained captures and protects tails
 with sentinels; the combine tests poison dead partials with NaNs.
+
+A finite partial LSE can still produce a zero combine weight after exponentiation,
+including when a sink dominates the row. Mask its partial O by the computed
+weight before arithmetic; testing only `LSE == -inf` misses `0 * NaN` contamination.
+`test_packed_prefetch_excludes_zero_weight_partials` compares explicit reducer
+specializations with FP64, including sink-dominated rows and changed-total replay.
 
 Oversized Q/O backing allocations do not enlarge a split plan's live-Q bound.
 Without an explicit packed-total hint, the split workspace is still bounded by

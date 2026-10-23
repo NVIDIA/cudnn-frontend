@@ -903,7 +903,8 @@ init_pygraph_submodule(py::module_& m) {
                       std::shared_ptr<KernelCache>,
                       std::shared_ptr<cudnn_frontend::DeviceProperties>,
                       bool,
-                      bool>(),
+                      bool,
+                      std::optional<cudnn_frontend::CudaGraphRetention_t>>(),
              py::arg("name")                      = "test_graph",
              py::arg("io_data_type")              = cudnn_frontend::DataType_t::NOT_SET,
              py::arg("intermediate_data_type")    = cudnn_frontend::DataType_t::NOT_SET,
@@ -914,7 +915,16 @@ init_pygraph_submodule(py::module_& m) {
              py::arg("kernel_cache")              = py::none(),
              py::arg("device_property")           = py::none(),
              py::arg("is_dynamic_shape_enabled")  = false,
-             py::arg("is_override_shape_enabled") = false)
+             py::arg("is_override_shape_enabled") = false,
+             py::arg("cuda_graph_retention")      = py::none())
+        .def(
+            "get_cuda_graph_retention",
+            [](PyGraph const& self) { return self.graph->get_cuda_graph_retention(); },
+            R"pbdoc(
+                The CUDA graph retention mode in effect for this graph: the one passed as
+                cuda_graph_retention, else the CUDNN_CUDA_GRAPH_RETENTION environment variable,
+                else cuda_graph_retention.PER_GRAPH.
+            )pbdoc")
         .def("tensor_like",
              py::overload_cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> const&, std::string const&>(
                  &PyGraph::tensor_like),

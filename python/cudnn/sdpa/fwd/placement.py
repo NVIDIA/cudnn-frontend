@@ -94,6 +94,11 @@ SM120 PackGQA now also packs those groups (tile_q % G != 0); packed, they still 
 FROST/backend 1.00-1.44 over G = 3 / 5 / 6 / 12, b 1-16, KV 4k-128k (2026-10-20, same part and cuDNN, SM
 and memory clocks locked, profiler kernel time, median of three alternating pairs, CV <= 0.6%): 1.35-1.44 at
 b = 1 on a 4k cache, within 2% from 64k or 8 batches up -> still TRAIL.
+The 16- / 32-row decode tile leaves ``s_q == 1`` backend-first: FROST/backend 0.96-1.25 over 120 cases
+(GQA 2 / 4 / 6 / 8, d64 / d128 / d256, b 1-16, KV 4k-128k; RTX PRO 6000 Server Edition, SM / memory clocks
+locked at 2100 / 12481 MHz, cuDNN 9.27.0.42, profiler kernel time, median of three alternating pairs, CV <=
+1.2%): 1.11-1.24 at b = 1 on a 4k cache, within 4% from a 64k cache, and the d256 leads at 12+ KV units
+run 1.00-1.05 -> the rule above stands.
 
 SM90 f16/bf16 row (H100 SXM; d512 only, the row floors its envelope at 256): prefill 0.22-0.40 and
 ``2 <= s_q <= 16`` 0.02-0.63 on every cell. There is no split-KV on SM90, so ``s_q == 1`` wins only
@@ -245,7 +250,7 @@ arch range) TRAIL until measured.
 
 SM107 per-tensor FP8 row (``sdpa_fwd_prefill_sm107_fp8``, offered by default since 2026-10-16): LEAD on exact
 cc 10.7 at exact d256 / d512, dense, E4M3, causal (top-left or bottom-right) or mask-free, Stats on or off; TRAIL
-for one KV tile with at most 8 Q tiles, for d128 / d192, and for every feature the A/B did not cover (THD, paged
+for one KV tile with at most 8 Q tiles, for d192, for d128 outside the chunk arm below, and for every feature the A/B did not cover (THD, paged
 KV, padding mask, window, right band, sink, block-scaled O, fused gate, E5M2). Measured 2026-10-16 on a 216-SM
 cc 10.7 board, cuDNN 9.27.0.42 GA, ab.py (same graph, Amax_S virtual), CUDA-graph replay, two rounds with the
 arm order swapped, warm and cold L2; FROST time over backend time on the led graphs:
@@ -257,6 +262,19 @@ arm order swapped, warm and cold L2; FROST time over backend time on the led gra
 Mean regret against the faster provider on d256 / d512: 67-152 % (backend only) -> 0-1.3 %, no lead slower than
 1.03x warm or cold. The hold-out set was visible when the head-dim split was chosen; the KV-tile floor was fitted
 on the other sets.
+
+d128 chunks (2026-10-22, same board and harness): LEAD when the GQA group is a power of two (the Q tile packs it) and
+either bottom-right causal with s_q <= 512 and S_kv >= 8192, or S_kv >= 4096 and S_kv >= 64 s_q; or mask-free with
+s_q <= 128 and S_kv on the KV tile. The backend's bottom-right causal plan does not split KV at short s_q
+(issue #1788): q16 kv128k runs 737 us at 8/1 and at 64/8, against 29 / 101 us on FROST. Fitted on a 184-case grid
+(s_q 16-2048, S_kv 1k-128k, 8/1, 64/8, 32/4 b4, 8/1 b8), then checked on random hold-outs; each hold-out changed the
+rule once:
+  - hold-out 1 (60): mask-free off the KV tile cannot split (2-5x slower) -> on-tile only; at s_q > 512 FROST's
+    512-row cluster doubles its waves before the backend's (b8 8/1 q576-768 kv13k: 1.76x at every split) -> s_q <= 512;
+    the ratio arm got the 4096 floor (b2 40/8 q29 kv3246: 1.05x)
+  - hold-out 2 (100): GQA groups 5 / 6 run unpacked and lose 1.3-1.75x at b > 1 -> power-of-two groups only
+  - hold-out 3 (100, fresh, after freezing; groups 1-16 incl. 3 / 5 / 6 / 12): 30 led at 0.15-0.97, no lead-loss
+Mean regret: fit 137.5 % -> 7.8 %, hold-out 3 78.4 % -> 23.4 %; led graphs on the grid 0.04-0.97.
 
 Rows with no measurement (SM80, SM100 mxfp8) keep the historical order (LEAD); they are still
 opt-in, so the order is only observable with ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``.
@@ -358,6 +376,11 @@ FP8_D128_ANY_TILES_MAX_S_Q = 128  # d128 chunks with s_q <= 128 win at 64-512 ti
 FP8_SYNTH_KV_MIN_TILE_KV = 2**21  # S_kv off the KV tile, mask-free: Q tiles * s_kv from which FROST wins (0.41-0.89)
 SM107_FP8_TINY_MAX_KV = 128  # cc 10.7 FP8 d256 / d512: a single KV tile ...
 SM107_FP8_TINY_MAX_Q_TILES = 8  # ... and at most 8 Q tiles is launch-bound; the backend keeps it
+SM107_FP8_D128_CAUSAL_MAX_S_Q = 512  # above, FROST's 512-row cluster doubles its waves first (b8 8/1 q576-768: 1.76x)
+SM107_FP8_D128_LONG_KV = 8192  # bottom-right causal chunk from this cache length: 0.04-0.97
+SM107_FP8_D128_MIN_KV = 4096  # ... or from this length when the cache is at least
+SM107_FP8_D128_KV_PER_Q = 64  # ... this many times the query length
+SM107_FP8_D128_MASKFREE_MAX_S_Q = 128  # mask-free chunk on the KV tile: 0.28-0.96
 
 
 def _q_tiles(facts) -> int:
@@ -593,11 +616,30 @@ def _place_sm107_fp8(caps: Capabilities, facts) -> str:
         or facts.dtype != cudnn.data_type.FP8_E4M3
     ):
         return TRAIL
+    if (facts.d_qk, facts.d_v) == (128, 128):
+        return LEAD if _sm107_fp8_d128_chunk_leads(caps, facts) else TRAIL
     if (facts.d_qk, facts.d_v) not in ((256, 256), (512, 512)):
-        return TRAIL  # d128 squares 1.08-1.09 (median), d192 0.88-1.14 with tails to 1.88
+        return TRAIL  # d192 0.88-1.14 with tails to 1.88; FROST loses 1.25-1.82x at b * h_q >= 128
     if facts.s_kv <= SM107_FP8_TINY_MAX_KV and _q_tiles(facts) <= SM107_FP8_TINY_MAX_Q_TILES:
         return TRAIL  # one KV tile, <= 8 Q tiles: both ~7 us; d512 b1 8/1 q32 kv128 loses 1.07-1.12 (graph and eager)
     return LEAD  # d256 0.16-0.96, d512 0.13-0.81 (module docstring); the backend does not build s_q == 1 here (NVRTC)
+
+
+def _sm107_fp8_d128_chunk_leads(caps: Capabilities, facts) -> bool:
+    """cc 10.7 per-tensor FP8 d128 chunks (module docstring, "SM107 per-tensor FP8 row")."""
+    if not 1 < facts.s_q < facts.s_kv or not facts.h_kv or facts.h_q % facts.h_kv:
+        return False  # squares lose 1.04-1.58x
+    group = facts.h_q // facts.h_kv
+    if group & (group - 1):
+        return False  # group does not divide the Q tile: unpacked, b > 1 loses 1.3-1.75x
+    if not facts.causal:
+        # off the KV tile the mask-free graph cannot split (2-5x slower)
+        return facts.s_q <= SM107_FP8_D128_MASKFREE_MAX_S_Q and not _synth_kv_padding(caps, facts)
+    return (
+        facts.bottom_right
+        and facts.s_q <= SM107_FP8_D128_CAUSAL_MAX_S_Q
+        and (facts.s_kv >= SM107_FP8_D128_LONG_KV or (facts.s_kv >= SM107_FP8_D128_MIN_KV and facts.s_kv >= SM107_FP8_D128_KV_PER_Q * facts.s_q))
+    )
 
 
 def _place_sm90_f16(caps: Capabilities, facts) -> str:
@@ -680,6 +722,26 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
             return TRAIL
         return TRAIL  # d64 / d128 / d192: the backend decode engine is ahead (1.04-2.4x)
     # prefill-shaped
+    # Full/near-full paged prefill benefits from the existing packed unsplit
+    # recommendation too; keep longer prefixes on the split-selection path.
+    if (
+        512 <= facts.s_q <= 8192
+        and facts.device_cc == (10, 0)
+        and facts.dtype == cudnn.data_type.BFLOAT16
+        and (facts.d_qk, facts.d_v) == (128, 128)
+        and facts.thd
+        and facts.has_paged_kv
+        and facts.page_size == 16
+        and 1 <= facts.b <= 4
+        and 16 <= facts.h_q <= 64
+        and facts.h_q in (4 * facts.h_kv, 8 * facts.h_kv)
+        and facts.s_q <= facts.s_kv <= 2 * facts.s_q
+        and facts.bottom_right
+        and facts.window_left is None
+        and not (facts.has_sink or facts.right_band_widening)
+        and _prefer_thd_pack_gqa(caps, facts)
+    ):
+        return LEAD
     if _in_paged_d256_prefill_domain(facts) or _d128_one_decode_tile_wave(caps, facts):
         return LEAD
     if (

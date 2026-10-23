@@ -849,11 +849,14 @@ def convert_c_layout_to_a_layout(c, a):
 
 
 @cute.jit
-def make_acc_into_op(acc, operand_layout_tv, Element):
-    operand = cute.make_rmem_tensor_like(
-        convert_c_layout_to_a_layout(acc.layout, operand_layout_tv.shape[1]),
-        Element,
-    )
+def make_acc_into_op(acc, operand_layout_tv, Element, operand=None):
+    # An overlapped PV keeps its operand live until wait_group(0). Callers can
+    # then reuse that allocation, including the complete FP8 permutation.
+    if cutlass.const_expr(operand is None):
+        operand = cute.make_rmem_tensor_like(
+            convert_c_layout_to_a_layout(acc.layout, operand_layout_tv.shape[1]),
+            Element,
+        )
     operand_as_acc = cute.make_tensor(operand.iterator, acc.layout)
     acc_vec = acc.load()
     operand_as_acc.store(acc_vec.to(Element))

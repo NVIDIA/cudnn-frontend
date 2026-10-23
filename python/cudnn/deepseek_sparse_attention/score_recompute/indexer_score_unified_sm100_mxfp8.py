@@ -75,6 +75,10 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
     # The tile stays 128 packed rows wide for every group (the scale atom), so the
     # smallest group (4 heads) packs 32 tokens; 64 / 32 heads pack 2 / 4 as before.
     max_q_tokens_per_tile = 32
+    # Block-scaled format of Q/K, named in errors.  E4M3 Q/K run tcgen05
+    # kind::mxf8f6f4, whose MMA reads K=32 values and one E8M0 scale per row.
+    format_name = "MXFP8"
+    mma_inst_k = 32
 
     def __init__(
         self,
@@ -95,23 +99,28 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         # the compile keys constrained avoids dragging attention/D512 branches
         # into the generated code.
         if head_dim != 128:
-            raise ValueError("SM100 unified indexer MXFP8 currently requires head_dim=128")
+            raise ValueError(f"SM100 unified indexer {self.format_name} currently requires head_dim=128")
         if sf_vec_size != 32:
-            raise ValueError("SM100 dense score MXFP8 currently requires sf_vec_size=32")
+            raise ValueError(f"SM100 dense score {self.format_name} currently requires sf_vec_size=32")
         if m_block_size != 128 or n_block_size != 128:
-            raise ValueError("SM100 dense score MXFP8 currently requires m_block_size=n_block_size=128")
+            raise ValueError(f"SM100 dense score {self.format_name} currently requires m_block_size=n_block_size=128")
         if qhead_per_kvhead not in (4, 8, 16, 32, 64):
-            raise ValueError("SM100 unified indexer MXFP8 requires qhead_per_kvhead in (4, 8, 16, 32, 64), " f"got {qhead_per_kvhead}")
+            raise ValueError(f"SM100 unified indexer {self.format_name} requires qhead_per_kvhead in (4, 8, 16, 32, 64), got {qhead_per_kvhead}")
         k_block_size = 64 if k_block_size is None else k_block_size
         # k_block_size is an internal K-split knob (num_k_chunks = head_dim_padded //
         # k_block_size; the per-chunk scale phase + base-class SMEM derive from it), so
-        # any multiple of sf_vec_size that divides head_dim_padded is valid (default 64).
+        # any multiple of sf_vec_size and of the MMA K that divides head_dim_padded is
+        # valid (default 64).
         _hd_padded = ((head_dim + 15) // 16) * 16
         if k_block_size <= 0 or k_block_size % sf_vec_size != 0 or _hd_padded % k_block_size != 0:
             raise ValueError(
-                "SM100 unified indexer MXFP8 requires k_block_size to be a "
+                f"SM100 unified indexer {self.format_name} requires k_block_size to be a "
                 f"positive multiple of sf_vec_size ({sf_vec_size}) that divides "
                 f"head_dim_padded ({_hd_padded}); got {k_block_size}"
+            )
+        if k_block_size % self.mma_inst_k != 0:
+            raise ValueError(
+                f"SM100 unified indexer {self.format_name} requires k_block_size to be a multiple of the MMA K ({self.mma_inst_k}); got {k_block_size}"
             )
 
         # Reduce prefetch depth only for the dense H64 ratio-four LSE schedule.
@@ -186,6 +195,23 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         self.KScale_mbar_size = 2 * self.k_scale_stage
         self.S_mbar_size = 2 * self.num_tmem_slots
 
+    @staticmethod
+    def _qk_tensor(t: cute.Tensor) -> cute.Tensor:
+        """Q or K as this kernel reads it, from the tensor it is launched with (the same tensor here)."""
+        return t
+
+    def _make_data_tiled_mma(self, blockscaled_tiled_mma_qk, cta_group):
+        """Tiled MMA that lays out and partitions the Q/K data tiles: the unscaled E4M3 MMA of the QK tile."""
+        return _make_trivial_tiled_mma(
+            self.q_dtype,
+            self.q_dtype,
+            self.k_major_mode,
+            self.q_major_mode,
+            self.qk_acc_dtype,
+            cta_group,
+            self.mma_tiler_qk[:2],
+        )
+
     @cute.jit
     def __call__(
         self,
@@ -211,6 +237,8 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         # Runtime tensor metadata is needed to build CuTe layouts and compile
         # the matching kernel.  The element dtypes become compile-time constants
         # inside cute.compile.
+        mQ = self._qk_tensor(mQ)
+        mK = self._qk_tensor(mK)
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
         self.sf_dtype = mQScale.element_type
@@ -276,18 +304,9 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         self.q_major_mode = LayoutEnum.from_tensor(mQ).mma_major_mode()
         self.k_major_mode = LayoutEnum.from_tensor(mK).mma_major_mode()
 
-        # Two MMA descriptors are built from the same logical tile:
-        #   tiled_mma_qk: ordinary shape/partition helper for data tensors,
-        #   blockscaled_tiled_mma_qk: actual MXFP8 UMMA op with SFA/SFB fields.
-        tiled_mma_qk = _make_trivial_tiled_mma(
-            self.q_dtype,
-            self.q_dtype,
-            self.k_major_mode,
-            self.q_major_mode,
-            self.qk_acc_dtype,
-            cta_group,
-            self.mma_tiler_qk[:2],
-        )
+        # blockscaled_tiled_mma_qk is the UMMA op with SFA/SFB fields.  tiled_mma_qk
+        # (``_make_data_tiled_mma``) lays out and partitions the data tensors; it may
+        # be the block-scaled op itself.
         blockscaled_tiled_mma_qk = _make_blockscaled_trivial_tiled_mma(
             self.k_dtype,
             self.k_dtype,
@@ -298,6 +317,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
             cta_group,
             self.mma_tiler_qk[:2],
         )
+        tiled_mma_qk = self._make_data_tiled_mma(blockscaled_tiled_mma_qk, cta_group)
 
         self.cluster_shape_mnk = (*self.cluster_shape_mn, 1)
         self.cluster_layout_vmnk = cute.tiled_divide(
@@ -305,7 +325,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
             (tiled_mma_qk.thr_id.shape,),
         )
 
-        # Data SMEM follows ordinary UMMA layouts; scale SMEM follows CUTLASS
+        # Data SMEM follows the data tiled MMA's layouts; scale SMEM follows CUTLASS
         # blockscaled SFA/SFB layouts so tcgen05 can consume E8M0 factors from
         # TMEM fields rather than doing explicit dequant math in registers.
         sK_layout = _make_smem_layout_a(
@@ -339,7 +359,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         self.sQScale_layout = sQScale_layout
         self.sKScale_layout = sKScale_layout
 
-        # Data TMA atoms load FP8 Q/K tiles into SMEM.  Scale TMA atoms load
+        # Data TMA atoms load the Q/K tiles into SMEM.  Scale TMA atoms load
         # packed E8M0 factors as Int16 internally because CUTLASS blockscaled
         # layouts store two E8M0 bytes per logical compact element.
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(cta_group)
@@ -507,8 +527,8 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
             )
             return
 
-        # Generic blockscaled CuTe path.  kphase_offset selects the correct
-        # E8M0 scale group when k_block_size=64 accumulates two chunks.
+        # Generic blockscaled CuTe path.  kphase_offset, the index of this chunk's
+        # first MMA along K, selects its E8M0 scale group.
         num_kphases = cute.size(tSrK_stage, mode=[2])
         for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
             kphase_coord = (None, None, kphase_idx)
@@ -1667,7 +1687,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
                                 tSrQ_kc = tSrQ[None, None, None, _kc]
                                 sK_stage = sK[None, None, None, K_mma_state.index]
                                 sQ_stage = sQ[None, None, None, _kc]
-                                kphase_offset = const_expr(_kc * (self.k_block_size // self.sf_vec_size))
+                                kphase_offset = const_expr(_kc * (self.k_block_size // self.mma_inst_k))
                                 self._gemm_blockscaled_qk(
                                     blockscaled_tiled_mma_qk,
                                     tStS_cur,

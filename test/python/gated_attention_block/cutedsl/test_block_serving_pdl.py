@@ -41,7 +41,7 @@ import torch
 import cudnn.gated_attention_block.api as _api
 from cudnn.frost import buffers as _buffers
 from cudnn.frost.buffers import cutedsl_requirement_error
-from cudnn.gated_attention_block import GatedAttentionBlockFwd, GatedAttentionBlockGeometry, QuantSpec, decode_route
+from cudnn.gated_attention_block import GatedAttentionBlockFwd, GatedAttentionBlockGeometry, QsaSpec, QuantSpec, decode_route
 from cudnn.gated_attention_block.api import (
     DECODE_PDL_DEFAULT_CCS,
     DECODE_PDL_STAGES,
@@ -148,9 +148,12 @@ def test_auto_and_the_explicit_switch_answer_for_one_domain_on_the_measured_part
     the knob answer for one domain.  Pools declared in the activation dtype (``kv_cache_dtype=torch.bfloat16``, the ``None`` spelling)
     take the default and the explicit True alike -- a serving stack that spells the dtype can form its own A/B --, a 16-bit pool of the
     other width hears the attribute's own ``ValueError``, not the switch's decline.  On every pipeline the default excludes -- the EXTEND
-    form, ``kv_source="self"``, a QuantSpec pipeline, a QsaSpec geometry (with and without the indexer band), the e4m3 cache -- AUTO
+    form, ``kv_source="self"``, a QuantSpec pipeline, a QsaSpec geometry (with and without the indexer band; the decode indexer over the
+    pools on both readings of ``fuse_prepare``), the e4m3 cache -- AUTO
     reads False with no stage switched; the explicit True is served per stage on the two bf16 forms without a decode route (their
-    prefill tiles carry no sites) and is the typed decline on the other three."""
+    prefill tiles carry no sites), SERVED on the block-sparse decode mode (the sparse core and its combine carry the sites; its own AUTO
+    tuple is empty until measured) and is the typed decline on the QuantSpec pipeline, the e4m3 cache, the sparse core's packed form and the
+    in-block indexer (its kernels would take the switch unmeasured)."""
     import test_block_qsa_decode as _qsa
     import test_block_qsa_fp8_kv as _qkv
     import test_block_serving_extend as _ext
@@ -203,17 +206,62 @@ def test_auto_and_the_explicit_switch_answer_for_one_domain_on_the_measured_part
     assert off(GatedAttentionBlockFwd(*qargs, quant=spec))
     with pytest.raises(NotImplementedError, match=decline):
         GatedAttentionBlockFwd(*qargs, quant=spec, use_pdl=True)
-    # the block-sparse decode mode: a QsaSpec geometry, the indexer band, the e4m3 cache -- AUTO False, the explicit True declined
+    # the block-sparse decode mode: a QsaSpec geometry (with and without the indexer band) -- AUTO False (the sparse chain's own measured-parts
+    # tuple is EMPTY until the switched chain is measured), the explicit True SERVED: the sparse core and its split combine carry the sites,
+    # so the sparse stage takes the switch beside the chain's other switched stages (the inversion of the former decline pin)
+    assert _api.SPARSE_DECODE_PDL_DEFAULT_CCS == ()
     sparse = _qsa._declare(_qsa.GEOM_SMALL, 2, 1, n_pages=4)[0]
     assert off(sparse) and sparse.decode_route is None and sparse.sparse_decode
-    with pytest.raises(NotImplementedError, match=decline):
-        _qsa._declare(_qsa.GEOM_SMALL, 2, 1, n_pages=4, use_pdl=True)
+    sparse_on = _qsa._declare(_qsa.GEOM_SMALL, 2, 1, n_pages=4, use_pdl=True)[0]
+    assert sparse_on.use_pdl is True and sparse_on.use_pdl_requested is True and sparse_on._sdpa.use_pdl is True and sparse_on.sparse_decode
+    assert "sdpa_sparse" in sparse_on.pdl_stages and sparse_on.use_pdl_effective is True
+    assert sparse_on.pdl_stages == tuple(st.name for st in sparse_on._stages if getattr(st, "use_pdl", False))
+    assert _qsa._declare(_qsa.GEOM_SMALL, 2, 1, n_pages=4, use_pdl=False)[0].pdl_stages == ()
     band = _qsa._declare(_qsa.GEOM_SMALL, 4, 1, n_pages=6, index_band=True, fuse_norm_rope=False)[0]
     assert off(band) and band.geom.index_band
+    # the in-block indexer's DECODE step over the pools (2026-10-21): AUTO False on both readings of fuse_prepare (its stage threads the
+    # switch it is handed -- `pdl_names` spells the kernels that would take it -- and is handed False), the explicit True the same decline
+    for fused in (False, True):
+        ix = _qsa._declare_indexer(_qsa.GEOM_SMALL, 2, 1, fuse_prepare=fused)
+        assert off(ix) and ix.indexer_decode and ix._indexer_decode.use_pdl is False and ix.fuse_prepare is fused
+        assert ix._indexer_decode.pdl_names == ((("qsa_compress_step",) if not fused else ()) + ("qsa_score", "qsa_topk"))
+        with pytest.raises(NotImplementedError, match=decline):
+            _qsa._declare_indexer(_qsa.GEOM_SMALL, 2, 1, fuse_prepare=fused, use_pdl=True)
+    band_on = _qsa._declare(_qsa.GEOM_SMALL, 4, 1, n_pages=6, index_band=True, fuse_norm_rope=False, use_pdl=True)[0]
+    assert band_on.use_pdl is True and "sdpa_sparse" in band_on.pdl_stages and "cache_write" in band_on.pdl_stages and band_on.use_pdl_effective is True
+    # the sparse core's PACKED form with the switch: declined by name at declaration (the setup launch's metadata is read above every role wait)
+    with pytest.raises(NotImplementedError, match="thd=True with use_pdl=True is not served") as e_thd:
+        _declare_sparse_thd(use_pdl=True)
+    assert "on a QsaSpec geometry" in str(e_thd.value) and "setup launch" in str(e_thd.value)  # the adapter's one statement, carried by the block
     e4m3 = _qkv._declare(_qkv.GEOM_SMALL, 2, 1, fuse_norm_rope=False)[0]
     assert off(e4m3) and e4m3.kv_cache_e4m3 and e4m3.decode_route is None
     with pytest.raises(NotImplementedError, match="no e4m3 KV cache"):
         _qkv._declare(_qkv.GEOM_SMALL, 2, 1, fuse_norm_rope=False, use_pdl=True)
+
+
+def _declare_sparse_thd(**blk_kw):
+    """A PACKED (thd=True) QsaSpec declaration on the block's own K / V (the sparse core's THD arm; top-left) -- the one sparse form the switch
+    never reaches."""
+    import test_block_qsa_decode as _qsa
+
+    geom = GatedAttentionBlockGeometry(**_qsa.GEOM_SMALL, qsa=QsaSpec())
+    mk = lambda *shape: torch.empty(*shape, dtype=torch.bfloat16, device=_DEV)  # noqa: E731
+    return GatedAttentionBlockFwd(
+        mk(32, geom.d_model),
+        mk(geom.n_qkvg, geom.d_model),
+        mk(_D),
+        mk(_D),
+        mk(32, _ROPE),
+        mk(32, _ROPE),
+        mk(geom.d_model, geom.h_q * _D),
+        mk(32, geom.d_model),
+        geom,
+        thd=True,
+        num_sequences=2,
+        max_seq_len=32,
+        token_capacity=32,
+        **blk_kw,
+    )
 
 
 def test_the_prefill_route_keeps_the_switch_off_stage_four_and_reads_back_which_stages_took_it(monkeypatch):

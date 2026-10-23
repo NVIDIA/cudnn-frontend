@@ -31,6 +31,28 @@ def _require_exact_sm100():
         pytest.skip("SM100 (10, 0) GPU required")
 
 
+def _require_mxfp4_indexer():
+    """Skip unless the GPU, torch build and CuTe DSL support the MXFP4 indexer."""
+    _require_sm100()
+    if getattr(torch, "float4_e2m1fn_x2", None) is None:
+        pytest.skip("MXFP4 indexer requires torch.float4_e2m1fn_x2")
+    from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error, cutedsl_state
+    from cudnn.deepseek_sparse_attention.utils.compiler import gpu_arch_flag
+
+    if not cutedsl_state()[0]:
+        pytest.skip("MXFP4 indexer requires CuTe DSL")
+    requirement_error = cutedsl_requirement_error("MXFP4 DSA indexer")
+    if requirement_error is not None:
+        pytest.skip(requirement_error)
+    arch_error = cutedsl_arch_requirement_error(torch.cuda.get_device_capability())
+    if arch_error is not None:
+        pytest.skip(arch_error)
+    try:
+        gpu_arch_flag()
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+
 # Parameterization marks shared by every DSA test
 DSA_PARAM_MARKS = [
     pytest.mark.parametrize("dtype", [torch.bfloat16]),
@@ -187,6 +209,57 @@ def quantize_mxfp8(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return (x.float() / expand_mxfp8_scale(scale, x.shape[-1])).to(torch.float8_e4m3fn)
 
 
+# E2M1 magnitudes of codes 0b000..0b111 and the round-to-nearest midpoints between them.
+_E2M1_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+_E2M1_MIDPOINTS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
+
+
+def quantize_e2m1(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    sf_vec_size: int = 32,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize ``x`` to packed E2M1 using logical block scales (MXFP4: E8M0, one per 32 elements).
+
+    Rounds to the nearest E2M1 value (ties to even, saturating at 6). Returns ``(packed, dequantized)``:
+    ``packed`` is ``torch.float4_e2m1fn_x2`` with element ``2i`` in the low nibble of byte ``i``;
+    ``dequantized`` is the FP32 value of each stored code, used as the reference input.
+    """
+    scale_full = expand_mxfp8_scale(scale, x.shape[-1], sf_vec_size)
+    y = x.float() / scale_full
+    sign = (y < 0).to(torch.uint8)
+    magnitude = y.abs().clamp(max=6.0)
+    midpoints = torch.tensor(_E2M1_MIDPOINTS, device=x.device)
+    code_tie_down = torch.bucketize(magnitude, midpoints, right=False)
+    code_tie_up = torch.bucketize(magnitude, midpoints, right=True)
+    # The two differ only on an exact midpoint; take the even code there.
+    magnitude_code = torch.where(code_tie_down % 2 == 1, code_tie_up, code_tie_down).to(torch.uint8)
+    codes = magnitude_code | (sign << 3)
+    packed = (codes[..., 0::2] | (codes[..., 1::2] << 4)).contiguous().view(torch.float4_e2m1fn_x2)
+    magnitudes = torch.tensor(_E2M1_MAGNITUDES, device=x.device)
+    dequantized = magnitudes[magnitude_code.long()] * (1.0 - 2.0 * sign.float()) * scale_full
+    return packed, dequantized
+
+
+def make_random_mxfp4(
+    shape: Tuple[int, ...],
+    *,
+    device: torch.device | str,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Random MXFP4 values of ``shape`` (last dim = logical head_dim) with power-of-two E8M0 scales per 32 elements.
+
+    Returns ``(packed, dequantized, scale)``: ``float4_e2m1fn_x2`` data with last dim ``head_dim // 2``, the FP32 value
+    of every stored code (the reference input) and the logical ``(..., head_dim // 32)`` scales.
+    """
+    scale = make_random_mxfp8_scale((*shape[:-1], shape[-1] // 32), device=device, seed=seed, exponent_min=-2, exponent_max=3)
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed + 1)
+    values = torch.randn(shape, device=device, generator=generator)
+    packed, dequantized = quantize_e2m1(values * expand_mxfp8_scale(scale, shape[-1]), scale)
+    return packed, dequantized, scale
+
+
 def pack_mxfp8_scales_thd(
     q_scale_logical: torch.Tensor,
     k_scale_logical: torch.Tensor,
@@ -197,7 +270,7 @@ def pack_mxfp8_scales_thd(
     q_alignment: Optional[int] = None,
     k_alignment: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build padded prefixes and packed Q/K scales for THD MXFP8 tests."""
+    """Build padded prefixes and packed Q/K scales for THD MXFP8 and MXFP4 tests."""
     from cudnn.deepseek_sparse_attention.utils.sm100.mxfp8_scale_utils import make_scale_cu_seqlens_padded
     from deepseek_sparse_attention.cutedsl import mxfp8_scale_reference
 

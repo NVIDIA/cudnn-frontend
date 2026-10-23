@@ -106,13 +106,14 @@ is consumed. Values in the inactive suffix are ignored.
   `[0, K_max]` when `allow_empty_block_nums=True`, and in `[1, K_max]`
   otherwise. Backward variable counts may be in `[0, K_max]`.
 - With fixed counts, `block_sparse_num` must be in `[1, K_max]`. The
-  SM100/SM103 blk128 path additionally requires an even value, i.e. an even
+  FP16/BF16 SM100/SM103 blk128 path additionally requires an even value, i.e. an even
   `block_sparse_num` in `[2, K_max]`.
 - The `block_sizes` entry for every physical KV block referenced by an active
   `q2k_block_index` value must be in `[1, sparse_block_size]`. Entries for
   unreferenced physical KV blocks are ignored. A zero-sized referenced block is
-  not supported; use `q2k_block_nums` (or the sparse index prefix) to drop the
-  block instead.
+  not supported by regular FP16/BF16 attention; use `q2k_block_nums` (or the
+  sparse index prefix) to drop the block instead. FP8 SM100/SM103 blk128 also
+  accepts zero-sized blocks, as specified in its architecture contract below.
 
 Tensor value ranges and per-row uniqueness are not validated at runtime.
 Violating the contract is unsupported and may produce invalid results or
@@ -151,7 +152,15 @@ package-wide downstream dependency floor is unchanged.
 
 `kv_splits=2..256` computes FP32 partial outputs and combines them, with
 workspace growing linearly in the split count. SM90 accepts an explicit integer
-split count. The SM100/SM103 blk64 path also accepts `kv_splits="auto"`; CLC is
+split count or `kv_splits="auto"` (the default stays 1). On SM90 the split
+count is chosen so one split's K/V region of a head fits in about 3/4 of L2:
+once a head's K/V exceeds L2 the unsplit kernel turns DRAM-bound, and a split
+grid orders every Q tile of one KV range before the next. The BF16/FP16 MHA
+policy applies at one head per wave (`ceil(S_q / 64)` at least `3 * SMs`), at most 25% density and fixed
+counts, and declines (one split) otherwise; it was measured on H100 with
+independent random indices (64 MiB K/V per head: 2 splits, +20%; 128 MiB: 4,
++70%; 256 MiB: 8, +94%; dense lists lose 12%). A caller-provided output
+also resolves to one split. The SM100/SM103 blk64 path also accepts `kv_splits="auto"`; CLC is
 compatible with split execution. Pass `use_clc=True` to use persistent CLC
 scheduling with `kv_splits>1`, or `use_clc=False` to use one tile per CTA. The
 default `use_clc=None` keeps CLC disabled for split execution because the
@@ -186,9 +195,9 @@ that budget raises `RuntimeError`.
 
 ## Sage FP8 forward
 
-Sage FP8 is forward-only and supports blk64 on SM100/SM103 and SM120, plus
-native blk128 on SM120. Its public wrapper accepts contiguous BF16 Q, K, and V
-tensors in `BHSD` layout and performs FP8 quantization internally:
+Sage FP8 is forward-only and supports blk64 on SM90, SM100/SM103, and SM120,
+plus native blk128 on SM90, SM100/SM103, and SM120. Its public wrapper accepts contiguous
+BF16 Q, K, and V tensors in `BHSD` layout and performs FP8 quantization internally:
 
 ```python
 fp8_result = block_sparse_attention_fp8_forward(
@@ -215,27 +224,68 @@ inputs or outputs.
 physical 128-token KV blocks, so they must be in `[0, ceil(S_kv / 128))`.
 For `block_sizes`, use `N_kv = ceil(S_kv / 128)` and valid-token counts in
 `[1, 128]` for referenced blocks. The native kernel consumes this metadata
-directly. Other architectures reject `sparse_block_size=128` for FP8.
+directly. SM100/SM103 also support this blk128 metadata layout, with the
+additional empty-block and split-KV semantics below.
+
+On SM90, pass `sparse_block_size=128` with indices shaped
+`(B, H, S_q // 128, capacity)` and KV block IDs measured in units of 128 tokens.
 
 The result is a one-key `TupleDict` containing `o_tensor`, a contiguous BF16
 tensor of shape `(B, H, S_q, 128)`. This API does not return LSE and has no
 backward implementation.
 
+V quantization keeps the reciprocal and multiplication in FP32 until the
+final E4M3 conversion, including the internal BHDS and blocked V layouts.
+Q retains the Sage BF16 intermediate-rounding recipe; K uses FP32 centering.
+FP32 rounding near an FP8 midpoint can select an adjacent E4M3 value across
+implementations.
+
+The SM100/SM103 blk128 kernel retains the upstream rounded-probability
+normalization: P uses a factor of 128, and its denominator is accumulated from
+the same rounded FP8 probabilities by the widened PV Tensor Core operation.
+Other FP8 kernels use their existing normalization. Outputs are approximate
+and are not expected to be bitwise equal across block sizes or architectures.
+
 The architecture-specific FP8 contracts are:
 
-- SM100/SM103 supports only blk64, accepts any positive batch and head counts,
+- SM90 accepts any positive batch and head counts and requires both sequence
+  lengths to be multiples of the selected `sparse_block_size` (64 or 128).
+  It uses fixed `block_sparse_num` with full KV blocks of that size.
+  Native blk128 shares each K/V tile between two compute warpgroups.
+  Sparse indices may be non-contiguous (including prefix
+  slices, stepped slices, permuted views, and broadcasts); their strides are
+  consumed directly without an index copy. `q2k_block_nums` and `block_sizes`
+  are not supported. It does not use split-KV. V quantization
+  writes sequence-contiguous BHDS storage internally, so the attention kernel
+  directly loads V for Hopper FP8 WGMMA without an in-kernel transpose.
+  Both block sizes accumulate PV directly into FP32 output registers using
+  FP8 WGMMA, accepting its reduced internal accumulation precision instead
+  of promoting each KV tile with a separate FP32 addition.
+- SM100/SM103 blk64 accepts any positive batch and head counts,
   and requires both sequence lengths to be multiples of 64. It uses fixed
   `block_sparse_num` with full 64-token KV blocks; `q2k_block_nums` and
   `block_sizes` are not supported. Split-KV is selected internally, and the
   public FP8 API does not expose `kv_splits` or `use_clc`.
+- SM100/SM103 native blk128 accepts positive arbitrary Q/KV lengths, including
+  physical tails, with MHA and D=128. Fixed counts may be odd; variable
+  `q2k_block_nums` may be zero, producing zero output. `block_sizes` accepts
+  rank 1, 2, or 3 and values in `[0, 128]`; zero masks a whole block, and the
+  physical final-block length always limits the supplied extent. Inactive
+  index capacity is ignored. Sparse metadata views are materialized as needed.
+  The optional `kv_splits=1..256` partitions the live KV list using FP32 partials
+  and the existing combine kernel; the default is one. Other FP8 paths require
+  the new keyword to remain at its default. `softmax_scale`, when supplied,
+  must be a positive finite host scalar. This implementation is limited to
+  compute capabilities 10.0 and 10.3 and requires CuTe DSL >= 4.6.2.
 - SM120 supports blk64 and blk128, accepts any positive batch and head counts,
   non-aligned Q/KV sequence tails, fixed or per-query-block counts, and
   `block_sizes` shaped `(N_kv,)`, `(B, N_kv)`, or `(B, H, N_kv)`. It does not
   use split-KV.
 
 `block_sparse_attention_fp8_forward` relies on functionality introduced in
-CuTe DSL 4.6.1; package-supported installations provide CuTe DSL 4.6.2 or
-newer. Its internal Q/K/V quantizer is also implemented in CuTe DSL and is
+CuTe DSL 4.6.1; the SM90 blk128 path requires 4.6.2. Package-supported
+installations provide CuTe DSL 4.6.2 or newer.
+Its internal Q/K/V quantizer is also implemented in CuTe DSL and is
 loaded lazily, so importing `cudnn` does not eagerly import it.
 
 ## Backward
@@ -266,7 +316,13 @@ The backward implementation builds a bucketed K-to-Q CSR task layout on the
 GPU. `bucket_size_blocks` is an optional tuning override; leaving it unset uses
 the backend default.
 
-With contiguous per-row count metadata, at least two KV blocks and at least
+For SM100/SM103 blk128, long-query automatic buckets retain at least one SM
+wave of logical `(batch, head, KV block, query group)` tasks, or the previous
+default's task count when it is smaller. Otherwise, the previous bucket
+default is used. This shape-based guard does not inspect device-side mask
+contents; explicit `bucket_size_blocks` overrides remain authoritative.
+
+For blk64, with contiguous per-row count metadata, at least two KV blocks and at least
 1024 (batch, head, KV block) tasks, backward pairs KV neighborhoods to reuse
 common Q/dO loads and dQ accumulation; smaller problems do not recover the
 per-call pairing cost and use regular tasks.
@@ -290,8 +346,11 @@ target GPU are required before drawing performance conclusions.
 
 Backward defaults to blk64 on SM90 and blk128 on SM100/SM103. Pass the same
 explicit `sparse_block_size` used by forward when selecting the Blackwell blk64
-path. SM100/SM103 blk128 backward does not yet consume `block_sizes`; it
-therefore requires full physical KV blocks and `block_sizes=None`.
+path. SM100/SM103 blk128 backward accepts one-dimensional `block_sizes`
+(`int32`, shape `(N_kv,)`) and masks each KV block's padded suffix consistently
+with forward. Valid tokens occupy the prefix of each physical block; callers
+zero `dout` for padded queries and discard their outputs. SM110 blk128 backward
+still requires `block_sizes=None`.
 
 ## Current support
 
@@ -300,15 +359,18 @@ therefore requires full physical KV blocks and `block_sizes=None`.
 | Architecture | Sparse block | Public input / kernel dtype | QK / V dimensions | Attention |
 | --- | ---: | --- | --- | --- |
 | SM90 | 64 or 128 (explicit) | FP16, BF16 | each of 64, 96, 128 | MHA, GQA, MQA |
+| SM90 | 64 | BF16 / FP8 E4M3 | QK=128, V=128 | MHA |
+| SM90 | 128 (explicit) | BF16 / FP8 E4M3 | QK=128, V=128 | MHA |
 | SM100/SM103 | 128 | FP16, BF16 | QK=V=64, 96, or 128 | MHA, GQA, MQA |
 | SM100/SM103 | 64 (explicit) | BF16 | QK=128, V=128 | MHA |
 | SM100/SM103 | 64 | BF16 / FP8 E4M3 | QK=128, V=128 | MHA |
+| SM100/SM103 | 128 (explicit) | BF16 / FP8 E4M3 | QK=128, V=128 | MHA |
 | SM120 | 64 | FP16, BF16 | QK=128, V=128 | MHA, GQA, MQA |
 | SM120 | 128 (explicit) | FP16, BF16 | QK=128, V=128 | MHA, GQA, MQA |
 | SM120 | 64 | BF16 / FP8 E4M3 | QK=128, V=128 | MHA |
 | SM120 | 128 (explicit) | BF16 / FP8 E4M3 | QK=128, V=128 | MHA |
 
-SM90 blk64 requires `S_q` to be a multiple of 64; native blk128 supports
+For FP16/BF16, SM90 blk64 requires `S_q` to be a multiple of 64; native blk128 supports
 positive arbitrary Q/KV lengths, including partial final blocks. Its fixed count may be
 any positive value. The SM100/SM103 blk128 fixed count must be even and at
 least two; SM120 and the explicit Blackwell blk64 path accept any positive
@@ -318,6 +380,8 @@ produce `O = 0` and `LSE = -inf`. SM90 blk64 selects the empty-row handling as a
 compile-time specialization, so the default non-empty configuration keeps its
 branch-free fast path. Its split-KV execution excludes empty rows. Native SM90
 blk128 supports empty rows and empty splits with `kv_splits=1..256`.
+Sage FP8 uses the architecture-specific contracts above. SM100/SM103 native
+blk128 supports empty rows and explicit split-KV; its default remains unsplit.
 
 ### Backward
 
@@ -364,6 +428,18 @@ lifecycle for BSA.
 
 Correctness tests and FP32 references are under
 `test/python/block_sparse_attention/cutedsl`.
+
+## SM100/SM103 FP8 blk128 source
+
+The native producer and its private transfer/epilogue helpers are adapted from
+[NVIDIA-JerryChen/Block-Sparse-Attention, f953680](https://github.com/NVIDIA-JerryChen/Block-Sparse-Attention/tree/f953680ff93a2ef2321ad7dc4291451eea4a9c3c/csrc/fwd/sm100_blk128):
+`bsa_fwd_sm100_fp8_fused_pv.py` and `bsa_fwd_sm100_fp8.py` map to the same
+filenames under `python/cudnn/block_sparse_attention/csrc/fwd/sm100_blk128/`.
+The 16-token TMEM row-max helper is incorporated into the private blk128 helper
+module. The integration uses cuDNN's existing quantizer, allocating Torch API,
+device-specific JIT cache, current-stream execution, and split combine.
+Standalone upstream package entry points and native AOT deployment are not
+part of this API.
 
 ## Acknowledgements
 

@@ -225,6 +225,13 @@ not become a compile key.
   context; no invalid cross-device GPU launch is needed. See the sparse SDPA
   tests `test_compilation_and_launch_preserve_the_declared_or_resolved_device`
   and `test_compilation_bypasses_argument_only_caches_across_devices`.
+  Standalone wrapper caches also need the input device in their key when an
+  object retains a launchable or workspace. A device-aware outer memo cannot
+  protect an inner cache that omits it. The grouped GLU detector
+  `test_block_scaled_wrapper_cache_separates_devices` alternates two devices
+  without clearing caches and replays captures from each after changing inputs.
+  Use an explicit per-device capture stream in that detector: Torch's implicit
+  `graph.default_capture_stream` can retain the first device's stream.
 - **Issue #604 is closed**: SM80 THD compiles use symbolic packed extents.
   The prepared backward host takes Int64 capacities and launch bounds at
   runtime, including the compact Stats head pitch and deterministic-counter
@@ -345,12 +352,31 @@ DSL satisfies your kernel.**
   public 4.7.0 lacks `sm_107a`; check the actual target capability before
   admitting SM107 plans. Test graph and standalone declines with the real
   unsupported wheel as well as a controlled missing-target probe.
+- Check the DSL compiler's CUDA version separately when a kernel depends on
+  its toolkit flavor: `from cutlass.base_dsl.version_info import CUDA_VERSION`.
+  `torch.version.cuda` and `CUDA_HOME` do not identify the compiler selected by
+  the DSL wheel. QSA's 12Q/1KV two-pass key kernel, for example, compiles with
+  the CUDA 13 flavor but crashes the CUDA 12 compiler in DSL 4.7/4.8; its
+  `check_support` rejects that compiler before JIT compilation, and its tests
+  exercise the rejection rather than crashing or silently skipping the gate.
 - Known floors — extend this list when you take a dependency on a newer API,
   and say so in the PR body if it raises the floor of a user-facing op:
   `cutlass.experimental.*` (primitives, `cuda.tensor_map`; everything under
   `cudnn/frost/tile_dsl` inherits it) → 4.7.0.
   Native im2col tensor-map creation used by `conv/cutedsl/conv3d_postops`
   (`cutlass.experimental.cuda.create_tensor_map_im2col`) → 4.9.
+  `cp.async.cg.shared.global.L2::cache_hint` with a `createpolicy` register (the paged decode
+  scorer's key copies, `gated_attention_block/kernels/qsa_score_paged.py`) → a DSL compiling
+  with CUDA 13.4 or later, i.e. the cu13 toolchain of 4.8.0 (the DSL binds its cu13 flavour
+  only under a CUDA 13 driver): the 13.3 PTX assembler of the public 4.7.0 cu13 wheel
+  mis-encodes the hinted copy's uniform operands on sm_90 / sm_100 (an illegal-instruction
+  trap at the first copy; the PTX is identical), and the cu12 flavour of both public wheels,
+  4.7.0 and 4.8.0 -- what the DSL binds under a CUDA 12 driver -- reports CUDA 12.9, whose
+  assembler emits the same encoding (compile-only dumps), so the kernel reads `CUDA_VERSION`
+  (`L2_HINT_MIN_COMPILER`), traces the plain copy below the floor and declines a forced
+  `l2_hint=True` by name -- the decline states the defect as observed (never as a property of
+  the compiler it found) and prescribes the cu13 flavour under a CUDA 13 driver, not a wheel
+  number.
 - Tests that import a kernel module directly `pytest.skip` on a too-old DSL —
   they do not fail. CI runs the `oss:` lanes across the supported DSL versions
   (`ci/stages/oss_tests/jobs.yml` in internal CI); a lane below your floor
@@ -377,6 +403,16 @@ DSL satisfies your kernel.**
   whenever `S` is true. Give such loop-local names their own spelling.
   Detector: rerun the kernel's tests with quack imported first (for example,
   a `-p` plugin that does `import quack`).
+- **Packed FP4 crosses the launch as bytes.** Below 4.8,
+  `from_dlpack(..., enable_tvm_ffi=True)` binds a real
+  `torch.float4_e2m1fn_x2` tensor with its packed shape and strides (two
+  values per unit), while the kernel is compiled for the E2M1 ones. The kernel
+  then reads the wrong bytes along the packed dim and returns wrong numbers
+  without an error. Launch a `torch.uint8` view and recast it inside the
+  `@cute.jit` entry with `cute.recast_tensor(t, cutlass.Float4E2M1FN)`
+  (`kernel_qk_view` and `IndexerScoreUnifiedSm100Mxfp4._qk_tensor` in
+  `deepseek_sparse_attention/score_recompute/`). Detector: the kernel's
+  numerics tests on a 4.7 lane.
 - Why: PR #799's `causal_conv1d_update` imported `frost.tile_dsl` from a route
   with no version check and broke the 4.6.2 lane — the version vLLM and SGLang
   ship — with a bare `ModuleNotFoundError: cutlass.experimental`; the bulk

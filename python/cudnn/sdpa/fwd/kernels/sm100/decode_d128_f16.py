@@ -163,7 +163,6 @@ from cudnn.frost.tile_dsl.tma import (
     ld_shared_v2,
     ld_shared_v4,
 )
-from cudnn.sdpa.fwd.config_sm100 import thd_work_prefix_enabled
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, GmemTileTma, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 from cudnn.frost.tile_dsl.mask import (
@@ -272,9 +271,9 @@ _FP32_PARTIALS = SPLIT_KV > 1
 # handshake), so the TMA-LDG warp loads the NEXT tile's Q while this tile is still in its tail -- a tile of one or two KV steps (a sliding window,
 # a short cache at batch) no longer pays the O drain + alias round trip + Q load latency in series.  It needs O out of the slab: the fp32 split
 # partials already go straight from TMEM to the workspace, and the dense / paged half output is stored directly by the correction warps
-# (DIRECT_O).  The THD legs keep the staged TMA store: their per-batch runtime descriptors place the rows.  ``PARAMS.early_q`` (the adapter's claim of
-# the measured cc) gates it: a part nobody measured keeps the staged store.
-EARLY_Q = bool(PARAMS.early_q) and (not CFG.THD_VARLEN) and (not RAGGED_Q)
+# (DIRECT_O). Unsplit THD keeps the staged TMA store; split THD writes FP32 partials directly, so it can release Q after the final BMM1 too.
+# ``PARAMS.early_q`` (the adapter's claim of the measured cc) gates it: a part nobody measured keeps the staged store.
+EARLY_Q = bool(PARAMS.early_q) and (not CFG.THD_VARLEN or _FP32_PARTIALS) and (not RAGGED_Q)
 DIRECT_O = EARLY_Q and not _FP32_PARTIALS
 # Quadrant-cooperative softmax (``PARAMS.decode_quad``, the d64 flavor).  A decode step has at most QUAD_ROWS = 32 live Q rows (S_q x PACK_G), a quarter
 # of the tile's 128 TMEM lanes, yet each of the four softmax warps -- one per lane quadrant -- exponentiates all 128 key columns of its 32 lanes, so the
@@ -295,14 +294,19 @@ if QUAD and not (
 # exp2 split MUFU / FMA (``_E2E_*``), the d128 prefill kernel's pattern (sm100/prefill_d128_f16.py): of every _E2E_FREQ P columns the LAST _E2E_RES are
 # evaluated on the FMA pipe (``exp2_emul_pair``), the rest on MUFU.EX2.  On cc 10.0 the d64 tile's one softmax warpgroup is MUFU-bound at a long KV (16
 # EX2 per clk per SM, and the 128 rows of a tile exponentiate whether live or not), so the FMA pipe takes a quarter of every row's columns.  Gate:
-# ``PARAMS.exp2_fma_split`` (api_dsl._exp2_fma_split_for: cc 10.0 x the d64 decode tile) and ``PARAMS.decode_tile`` (the d64 flavor of this file), and not on
-# a sliding-window build (its units are one or two KV tiles: a latency chain the polynomial's dependent FMAs lengthen, with no MUFU-bound loop to relieve);
+# ``PARAMS.exp2_fma_split`` supplies the measured cc gate. This tile enables it for d64 decode and the measured d128 THD FP32-partial form;
+# d192 THD remains all-MUFU because the split mix did not show a consistent benefit. Do not enable it on a sliding-window build (its units are one or two KV tiles: a latency chain the polynomial's dependent FMAs lengthen, with no MUFU-bound loop to relieve);
 # off, both exp2 sites trace the plain MUFU spelling and the module is IR-identical to the unsplit kernel.  The quadrant softmax (QUAD) leaves it off:
 # a warp exponentiates a quarter of the columns, so the MUFU pipe is no longer the bound.
 _E2E_FREQ = 16
 _E2E_RES = 4
 _E2E_CHUNK = 64  # tcgen05_ld width of one softmax chunk (see _softmax_kv_body CHUNK)
-_E2E_ENABLED = bool(PARAMS.exp2_fma_split) and bool(PARAMS.decode_tile) and (CFG.MASK_FLAGS & MASK_SWA) == 0 and not QUAD
+_E2E_ENABLED = (
+    bool(PARAMS.exp2_fma_split)
+    and (bool(PARAMS.decode_tile) or (CFG.THD_VARLEN and _FP32_PARTIALS and CFG.TILE_K == 128 and CFG.TILE_O == 128))
+    and (CFG.MASK_FLAGS & MASK_SWA) == 0
+    and not QUAD
+)
 
 
 def _e2e_pairs(chunk: int) -> frozenset:
@@ -2517,8 +2521,7 @@ def _launch(
             n_thd_units,
             not PAGED_KV,  # clamp_kv: paged pools have no packed KV total to clamp to
             SPLIT_KV,
-            bool(CFG.BOTTOM_RIGHT) and (CFG.MASK_FLAGS & MASK_SWA) == 0,
-            thd_work_prefix_enabled(CFG),
+            SPLIT_KV > 1 and bool(CFG.BOTTOM_RIGHT) and (CFG.MASK_FLAGS & MASK_SWA) == 0,
         ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
     else:
@@ -2646,7 +2649,6 @@ def _host(
         thd=CFG.THD_VARLEN,
         split_kv=SPLIT_KV,
         tensor_map_qwords=16,
-        work_prefix=thd_work_prefix_enabled(CFG),
         paged=PAGED_KV,
         page_size=PAGE_SIZE,
         block_table_ptr=block_table_ptr,

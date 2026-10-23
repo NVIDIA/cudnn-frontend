@@ -221,22 +221,55 @@ python -m cudnn.collect_env
 
 If `import cudnn` itself fails, download [collect_env.py](python/cudnn/collect_env.py) and run it standalone with any Python.
 
+### CUDA graph retention
+
+A CUDA graph recorded from a graph (stream capture of `execute()`, or `populate_cuda_graph()`) holds references to the execution plans and kernel code it launches, so it stays valid after the graph is destroyed. Launching a CUDA graph that holds such references takes slightly longer. Applications can turn the references off if they keep each graph's execution plans and host-copy data alive and unchanged until every CUDA graph recorded from it (and every clone and graph exec of one) has finished and been destroyed. Keeping the graph object alive is not enough if it is rebuilt or deserialized again in the meantime, since that replaces them:
+
+```cpp
+graph.set_cuda_graph_retention(cudnn_frontend::CudaGraphRetention_t::NONE);  // before building plans
+```
+
+```python
+graph = cudnn.pygraph(..., cuda_graph_retention=cudnn.cuda_graph_retention.NONE)
+```
+
+or for the whole process, for graphs that do not set it:
+
+```bash
+export CUDNN_CUDA_GRAPH_RETENTION=none   # default: per_graph
+```
+
+The variable is shared with the cuDNN backend, so with cuDNN 9.28 or newer it turns off the backend's references too; the graph setting is also passed to the backend. With cuDNN 9.27, whose backend always keeps its references, only the frontend's are removed.
+
 ### Overriding the CUDA runtime library
 
-When the frontend is built with dynamic loading enabled, it locates the CUDA runtime
-(`libcudart.so.*`) at runtime by searching for the supported major versions. In some
+On Linux, when the frontend is built with dynamic loading enabled, it locates the
+CUDA runtime (`libcudart.so.*`) by searching CUDA 12 followed by CUDA 13. In some
 environments (for example, containers such as GKE where the TCPXO NCCL plugin mounts a
 different `libcudart` major version from the host) multiple versions of `libcudart` may be
-visible on the library search path, and the automatic detection aborts with a
-`Multiple libcudart libraries found` error.
+visible on the library search path. Automatic detection warns with
+`Multiple libcudart libraries found` and keeps the first match.
 
-To resolve this, set the `CUDNN_FRONTEND_CUDART_LIB_NAME` environment variable to the
-library name (or full path) that should be loaded. This bypasses the automatic detection:
+To select a particular runtime, set `CUDNN_FRONTEND_CUDART_LIB_NAME` to the library
+name or full path. This bypasses automatic detection:
 
 ```bash
 export CUDNN_FRONTEND_CUDART_LIB_NAME=libcudart.so.13
 # or an absolute path
 export CUDNN_FRONTEND_CUDART_LIB_NAME=/usr/local/cuda/lib64/libcudart.so.13
+```
+
+On Windows, dynamic loading currently requires CUDA 13 headers and a CUDA 13
+runtime (`cudart64_13.dll`). The loader calls `cudaRuntimeGetVersion` and rejects
+other runtime majors, including when using an explicit override. Support for
+additional Windows CUDA versions can be added separately. The loader searches
+registered DLL directories, including those added through Python's
+`os.add_dll_directory()`, and retains a PATH fallback. Keep Python DLL-directory
+handles alive for as long as library discovery may occur.
+
+```powershell
+$env:CUDNN_FRONTEND_CUDART_LIB_NAME = "cudart64_13.dll"
+# or the full path to the selected CUDA 13 runtime DLL
 ```
 
 ## License

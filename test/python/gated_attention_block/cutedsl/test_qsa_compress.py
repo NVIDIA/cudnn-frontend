@@ -18,6 +18,12 @@ kernel owes no block.
 The kernel is plain vectorized LDG/STG plus warp shuffles -- no tcgen05, no TMA
 -- so these tests deliberately do NOT gate on Rubin: they run on whatever CUDA
 device is at hand.
+
+The e4m3 STORE arm (``compile_qsa_compress(out_dtype=torch.float8_e4m3fn)``: the unfused decode step's pool-1 query path, and the
+compressed rows at pool 4; sm_89+ -- the cell skips below it and is UNCOVERED there): the e4m3 run is bitwise the bf16 run's rows
+``.to(float8_e4m3fn)`` (the e4m3 cast of the bf16 row, ``|bf16 row| < 448`` asserted first); ``out_dtype`` is a compile key (a distinct
+artifact; the bf16 spelling is the io dtype's artifact); a wrong ``out`` dtype is refused both ways naming the recipe's; f16 io has no
+e4m3 arm; float32 stays a ``ValueError``; below sm_89 the arm is a typed decline naming the instruction.
 """
 
 import os
@@ -49,6 +55,9 @@ from gated_block_reference import build_rope_tables  # noqa: E402
 pytestmark = pytest.mark.L0
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+_CC = tuple(torch.cuda.get_device_capability()) if torch.cuda.is_available() else None
+requires_sm89 = pytest.mark.skipif(_CC is None or _CC < (8, 9), reason=f"the e4m3 store arm needs sm_89+ (found {_CC})")
+_E4M3 = torch.float8_e4m3fn
 
 _EPS = 1e-6
 _D = 128  # the indexer head dim
@@ -191,6 +200,26 @@ def test_compile_rejects_unsupported_dtypes():
         compile_qsa_compress(dtype=torch.float32, d=_D, rope_dim=_ROPE)
     with pytest.raises(ValueError, match="16-bit cos"):
         compile_qsa_compress(dtype=torch.bfloat16, d=_D, rope_dim=_ROPE, table_dtype=torch.float32)
+    # the e4m3 store arm's rows: a non-io, non-e4m3 output dtype and f16 io with an e4m3 output are ValueErrors naming the rule
+    with pytest.raises(ValueError, match="must hold the io dtype .* or torch.float8_e4m3fn"):
+        compile_qsa_compress(dtype=torch.bfloat16, d=_D, rope_dim=_ROPE, out_dtype=torch.float32)
+    with pytest.raises(ValueError, match="needs bf16 io"):
+        compile_qsa_compress(dtype=torch.float16, d=_D, rope_dim=_ROPE, out_dtype=_E4M3)
+
+
+@requires_cuda
+def test_e4m3_out_arm_is_a_typed_decline_below_sm89_and_keyed_above_it():
+    """Below sm_89 the e4m3 store arm is a ``NotImplementedError`` naming the instruction (never a ptxas error); from sm_89 it compiles as
+    a DISTINCT artifact whose recipe records ``out_dtype``, while the bf16 spelling of the io dtype is the io artifact itself."""
+    if _CC < (8, 9):
+        with pytest.raises(NotImplementedError, match=r"cvt.rn.satfinite.e4m3x2.f32\) needs sm_89 or later"):
+            compile_qsa_compress(dtype=torch.bfloat16, d=_D, rope_dim=_ROPE, out_dtype=_E4M3)
+        return
+    bf = compile_qsa_compress(dtype=torch.bfloat16, d=_D, rope_dim=_ROPE, pool=1, has_seq_lens=False)
+    assert compile_qsa_compress(dtype=torch.bfloat16, d=_D, rope_dim=_ROPE, pool=1, has_seq_lens=False, out_dtype=torch.bfloat16).compiled is bf.compiled
+    e4 = compile_qsa_compress(dtype=torch.bfloat16, d=_D, rope_dim=_ROPE, pool=1, has_seq_lens=False, out_dtype=_E4M3)
+    assert e4.compiled is not bf.compiled and e4.out_dtype == _E4M3 and bf.out_dtype == torch.bfloat16
+    assert compile_qsa_compress(dtype=torch.bfloat16, d=_D, rope_dim=_ROPE, pool=1, has_seq_lens=False, out_dtype=_E4M3).compiled is e4.compiled
 
 
 # ---------------------------------------------------------------------------
@@ -377,6 +406,42 @@ def test_two_launches_are_bitwise():
     build_qsa_compress(k_raw, b, w, cos, sin, seq_lens, rope_dim=_ROPE, eps=_EPS, norm_weight_offset=1.0, stream=_stream())
     torch.cuda.synchronize()
     assert torch.equal(a, b)
+
+
+@requires_sm89
+@pytest.mark.parametrize(
+    "pool, s_tok, offset", [(1, 4, 0.0), (1, 77, 0.0), (4, 2051, 1.0), (4, 4096, 1.0)], ids=["pool1_T4", "pool1_T77", "pool4_S2051", "pool4_S4096"]
+)
+def test_e4m3_out_is_bitwise_the_bf16_run_cast(pool, s_tok, offset):
+    """The e4m3 store arm against the bf16 arm on the SAME inputs: every written row of the e4m3 ``out`` is bitwise ``bf16_out.to(e4m3)``
+    (``|bf16 row| < 448`` first), the unwritten rows keep the 8-bit sentinel (-448: the dtype's max magnitude, never a written row); pool 1 at a token
+    count = the unfused decode step's indexer-query path (``[T, H_i, D]`` as ``[B=T, S=H_i, D]``), pool 4 the compressed rows; the
+    bf16 run is the one-rounding oracle's as before.  A wrong ``out`` dtype is refused BOTH ways, naming the recipe's dtype."""
+    dtype, batch = torch.bfloat16, 3
+    k_raw, w, cos, sin = _make(batch, s_tok, dtype, seed=40 + s_tok)
+    seq_lens = torch.tensor([s_tok, max(s_tok - 7 * (pool // 4), 0), 0], device="cuda", dtype=torch.int32) if pool == 4 else None
+    nb = s_tok // pool
+    out16 = _sentinel(batch, nb, dtype)
+    out8 = torch.full(
+        (batch, nb, _D), -448.0, device="cuda", dtype=_E4M3
+    )  # the e4m3 sentinel: its max magnitude (torch.full refuses -7777 at e4m3); never a written row
+    r16 = build_qsa_compress(k_raw, out16, w, cos, sin, seq_lens, rope_dim=_ROPE, eps=_EPS, norm_weight_offset=offset, pool=pool, stream=_stream())
+    r8 = build_qsa_compress(k_raw, out8, w, cos, sin, seq_lens, rope_dim=_ROPE, eps=_EPS, norm_weight_offset=offset, pool=pool, stream=_stream())
+    torch.cuda.synchronize()
+    assert r8.out_dtype == _E4M3 and r16.out_dtype == dtype and r8.compiled is not r16.compiled
+    want, n_blocks = compress_reference(k_raw, w, cos, sin, seq_lens, pool=pool, norm_weight_offset=offset)
+    mask = _valid_mask(n_blocks, nb)
+    _assert_one_rounding(out16, want, mask, f"bf16 twin pool={pool} S={s_tok}")
+    assert float(out16[mask].float().abs().max()) < 448.0, "a bf16 row at or past the e4m3 range"
+    bits8 = out8.view(torch.int8)
+    assert torch.equal(bits8[mask], out16.to(_E4M3).view(torch.int8)[mask]), "the e4m3 out is not the e4m3 cast of the bf16 rows"
+    sent8 = -448.0
+    assert bool((out8.float()[~mask] == sent8).all()), "a row the kernel does not own was written"
+    with pytest.raises(ValueError, match=r"out must have dtype torch.float8_e4m3fn \(the recipe's\), got torch.bfloat16"):
+        run_qsa_compress(r8, k_raw, out16, w, cos, sin, seq_lens, eps=_EPS, norm_weight_offset=offset, stream=_stream())
+    with pytest.raises(ValueError, match=r"out must have dtype torch.bfloat16 \(the recipe's\), got torch.float8_e4m3fn"):
+        run_qsa_compress(r16, k_raw, out8, w, cos, sin, seq_lens, eps=_EPS, norm_weight_offset=offset, stream=_stream())
+    print(f"e4m3 store arm pool={pool} S={s_tok}: {int(mask.sum())} elements bitwise the bf16 cast")
 
 
 @requires_cuda

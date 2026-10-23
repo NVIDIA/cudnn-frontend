@@ -10,7 +10,7 @@ ACCUMULATION = "accumulation"
 RECOMPUTE = "recompute"
 WORKSPACE_ALIGNMENT = 256
 WORKSPACE_SLACK = WORKSPACE_ALIGNMENT - 16
-ABI_VERSION = 2
+ABI_VERSION = 3
 
 
 def validate_dense_bounds(batch, heads, sq, skv):
@@ -53,24 +53,38 @@ def validate_accumulation_scale(scale):
         raise ValueError("dense d128 accumulation requires scale and scale*log2(e) finite and positive in FP32") from None
 
 
+# Compute capabilities the accumulation chain (dense, THD and grouped) is qualified on.
+ACCUMULATION_CCS = ((10, 0), (10, 3))
+
+
 def select_implementation(cc, dsl_version, batch, heads, sq, skv, scale):
-    """Choose from plan facts, preserving the existing recompute envelope."""
-    if tuple(cc) != (10, 0) or not dsl_version or dsl_version[0] != "nvidia-cutlass-dsl":
+    """Choose from plan facts; recompute stays the fallback outside the accumulation envelope.
+
+    The accumulation kernels round both sequence lengths up to whole 128-row
+    tiles: TMA zero-fills the tail loads and clips the tail stores and dQ
+    reductions, and the tail Stats rows publish -inf, so unaligned S_q / S_kv
+    take the same path as aligned ones.
+    """
+    if tuple(cc) not in ACCUMULATION_CCS or not dsl_version or dsl_version[0] != "nvidia-cutlass-dsl":
         return RECOMPUTE
     match = re.match(r"^(\d+)\.(\d+)\.(\d+)", dsl_version[1])
     if match is None or tuple(map(int, match.groups())) < (4, 8, 0):
         return RECOMPUTE
-    if any(type(n) is not int or n <= 0 for n in (batch, heads, sq, skv)) or sq % 128 or skv % 128:
+    if any(type(n) is not int or n <= 0 for n in (batch, heads, sq, skv)):
         return RECOMPUTE
-    if max(sq, skv) > 2**31 - 1:
+    # The tile rounding and the one-past-tile endpoints must stay Int32.
+    if max(sq, skv) > 2**31 - 128:
         return RECOMPUTE
-    if batch > 65535 or heads > 65535 or batch * heads * sq > 2**31 - 1 or batch * heads * (skv // 128) > 2**31 - 1:
+    q_tiles, k_tiles = (sq + 127) // 128, (skv + 127) // 128
+    # Stats / delta rows are indexed over the rounded S_q; the grid holds one
+    # work item per (batch, head, KV tile).
+    if batch > 65535 or heads > 65535 or batch * heads * q_tiles * 128 > 2**31 - 1 or batch * heads * k_tiles > 2**31 - 1:
         return RECOMPUTE
     # The causal scheduler divides Int32 tile ids by swizzle * num_k_tiles.
     # Use the compiled host's fixed d128, 16-bit L2 grouping for either mask.
     heads_per_l2 = (50 * 1024 * 1024) // (sq * (128 + 128) * 2)
     swizzle = 1 << (heads_per_l2.bit_length() - 1) if heads_per_l2 > 0 else 1
-    if swizzle * (skv // 128) > 2**31 - 1:
+    if swizzle * k_tiles > 2**31 - 1:
         return RECOMPUTE
     if max(sq, skv) * heads * 128 * 2 >= 2**40:
         return RECOMPUTE

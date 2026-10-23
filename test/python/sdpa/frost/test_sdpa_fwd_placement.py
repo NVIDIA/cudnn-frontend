@@ -471,6 +471,30 @@ def test_sm107_fp8_placement_trails_one_kv_tile_with_few_q_tiles():
 
 
 @pytest.mark.L0
+def test_sm107_fp8_d128_chunk_placement_structure():
+    """The d128 chunk arm reads every bound from the module, so this pins the gate's structure, not a measured boundary."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107_fp8")
+    long_kv, max_q = placement.SM107_FP8_D128_LONG_KV, placement.SM107_FP8_D128_CAUSAL_MAX_S_Q
+    chunk = {**_SM107_FP8_DENSE, **_SM107_FP8_QUANT, "d_qk": 128, "d_v": 128, "b": 1, "h_q": 64, "h_kv": 8, "s_q": max_q, "s_kv": long_kv}
+    place = lambda **over: placement.place(spec, _facts(device_cc=(10, 7), **{**chunk, **over}))
+    assert place() == placement.LEAD
+    assert place(s_q=max_q + 1) == placement.TRAIL
+    assert place(s_kv=long_kv - 128) == placement.TRAIL  # below the long cache and under the KV-per-Q ratio
+    ratio_q = placement.SM107_FP8_D128_MIN_KV // placement.SM107_FP8_D128_KV_PER_Q
+    assert place(s_q=ratio_q, s_kv=placement.SM107_FP8_D128_MIN_KV) == placement.LEAD
+    assert place(s_q=ratio_q, s_kv=placement.SM107_FP8_D128_MIN_KV - 128) == placement.TRAIL
+    assert place(s_q=long_kv, s_kv=long_kv) == placement.TRAIL  # square
+    assert place(h_q=48, h_kv=8) == placement.TRAIL  # GQA group 6 cannot pack
+    assert place(bottom_right=False) == placement.TRAIL  # top-left causal chunks were not measured
+    free = {"causal": False, "bottom_right": False, "s_q": placement.SM107_FP8_D128_MASKFREE_MAX_S_Q}
+    assert place(**free) == placement.LEAD
+    assert place(**{**free, "s_kv": long_kv + 1}) == placement.TRAIL  # off the KV tile: the mask-free graph cannot split
+    assert place(**{**free, "s_q": placement.SM107_FP8_D128_MASKFREE_MAX_S_Q + 1}) == placement.TRAIL
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("kind", ["A", "FALLBACK"])
 def test_propose_ranks_the_rubin_fp8_row_first_without_the_flag(monkeypatch, kind):
     """The arm is wired into place(): with recommend mocked and the flag deleted, propose puts the row ahead of the backend

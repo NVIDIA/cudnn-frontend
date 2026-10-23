@@ -97,7 +97,7 @@ def test_dense_declaration_rejects_unrepresentable_geometry(geometry, token, cau
     "geometry,implementation",
     [
         ({}, "accumulation"),
-        ({"sq": 129, "sk": 257}, "recompute"),
+        ({"sq": 129, "sk": 257}, "accumulation"),
         ({"sq": 2**31 - 128}, "accumulation"),
         ({"sk": 2**31 - 128}, "recompute"),
         ({"b": 2**30 - 1, "sq": 1}, "recompute"),
