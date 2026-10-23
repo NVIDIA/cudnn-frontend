@@ -166,8 +166,8 @@ def indexer_fwd(
              kept). Strided q/k/w/q_scale/k_scale are made contiguous here.
              ``_indexer_fwd_bound`` is the strict, allocation-free entry.
         sm_scale: scalar applied to fp32 score post head-reduce; default 1.0.
-        precision: ``"bf16"``, ``"mxfp8"`` or ``"mxfp4"``; the block-scaled two
-            share one SM100 kernel.
+        precision: ``"bf16"``, ``"mxfp8"`` or ``"mxfp4"``; the two SM100
+            block-scaled kernels differ only in the MMA (``kind::mxf4`` for MXFP4).
         q_scale: blockscaled-packed E8M0 Q scales.
         k_scale: blockscaled-packed K scales (same dtype as ``q_scale``).
         cu_seqlens_q_scale_padded: required THD prefix of the Q scale storage.

@@ -380,7 +380,8 @@ compressed column 0.
     values per byte with element `2i` in the low nibble, so their last dim is
     `D // 2` (64); a packed `uint8` buffer passes zero-copy through
     `.view(torch.float4_e2m1fn_x2)`. `q_scale`/`k_scale` are the MXFP8 E8M0
-    scales unchanged: one per 32 elements in the same packed layout, built
+    scales unchanged: one per 32 head_dim values, so `D // 32` (4) per row
+    although the last dim is `D // 2`, in the same packed layout, built
     from logical `(..., D // 32)` scales by the packers in
     `cudnn.deepseek_sparse_attention.utils.sm100.mxfp8_scale_utils`:
     `pack_q_scale_bshd`/`pack_k_scale_bshd` for BSHD, and

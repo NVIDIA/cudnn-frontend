@@ -239,8 +239,9 @@ def indexer_forward_wrapper(
 
     With ``precision='bf16'``, Q/K are BF16 and per-head W may be BF16 or FP32.
     The block-scaled SM100 precisions take BF16 W and blockscaled-packed E8M0
-    ``q_scale`` / ``k_scale``, one scale per 32 elements: ``'mxfp8'`` (E4M3 Q/K)
-    or ``'mxfp4'`` (``float4_e2m1fn_x2`` Q/K with last dim ``head_dim // 2``).
+    ``q_scale`` / ``k_scale``, one scale per 32 head_dim values (``head_dim // 32``
+    per row): ``'mxfp8'`` (E4M3 Q/K) or ``'mxfp4'`` (``float4_e2m1fn_x2`` Q/K with
+    last dim ``head_dim // 2``, still ``head_dim // 32`` scales per row).
     SM90 offers ``'fp8'`` with per-token scales instead.
     Returns ``{'scores': (B, S_q, S_k) FP32}``. The ratio causal mask marks
     positions outside the valid KV range with -inf. ``q_causal_offsets`` may

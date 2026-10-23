@@ -196,11 +196,6 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         self.S_mbar_size = 2 * self.num_tmem_slots
 
     @staticmethod
-    def _qk_dtype():
-        """Element type of the Q/K tensors this kernel reads."""
-        return cutlass.Float8E4M3FN
-
-    @staticmethod
     def _qk_tensor(t: cute.Tensor) -> cute.Tensor:
         """Q or K as this kernel reads it, from the tensor it is launched with (the same tensor here)."""
         return t
@@ -248,10 +243,6 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         self.k_dtype = mK.element_type
         self.sf_dtype = mQScale.element_type
         is_varlen = mCuSeqlensQ is not None
-        # The class fixes the Q/K format, and with it the MMA kind and K.
-        qk_dtype = self._qk_dtype()
-        if const_expr(self.q_dtype is not qk_dtype or self.k_dtype is not qk_dtype):
-            raise TypeError(f"SM100 unified indexer {self.format_name} expects {qk_dtype} Q/K, got {self.q_dtype} / {self.k_dtype}")
 
         # The API accepts either BSHD or packed THD.  The compile key records
         # is_varlen, and these asserts make accidental mismatches fail during

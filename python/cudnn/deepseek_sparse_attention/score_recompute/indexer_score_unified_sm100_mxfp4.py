@@ -25,11 +25,6 @@ class IndexerScoreUnifiedSm100Mxfp4(IndexerScoreUnifiedSm100Mxfp8):
     mma_inst_k = 64
 
     @staticmethod
-    def _qk_dtype():
-        """Element type of the Q/K tensors this kernel reads."""
-        return cutlass.Float4E2M1FN
-
-    @staticmethod
     def _qk_tensor(t: cute.Tensor) -> cute.Tensor:
         """Q or K as this kernel reads it: launched as packed ``Uint8`` bytes, read as two E2M1 values per byte."""
         if t.element_type is not cutlass.Uint8:

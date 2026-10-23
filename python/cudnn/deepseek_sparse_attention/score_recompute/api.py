@@ -877,7 +877,8 @@ def dense_indexer_score_recompute_wrapper(
     ``precision`` is ``"bf16"`` (SM90 and SM100+) or an SM100 block-scaled
     precision: ``"mxfp8"`` (E4M3 Q/K) or ``"mxfp4"``
     (``torch.float4_e2m1fn_x2`` Q/K with last dim ``head_dim // 2``), both with
-    one E8M0 scale per 32 elements. Block-scaled precisions take packed
+    one E8M0 scale per 32 head_dim values (``head_dim // 32`` per row, for
+    MXFP4 too). Block-scaled precisions take packed
     ``q_scale`` / ``k_scale`` (and, for THD, ``cu_seqlens_*_scale_padded``).
 
     THD (``cu_seqlens_q``/``cu_seqlens_k`` given) runs natively on SM100+; on
