@@ -2023,6 +2023,7 @@ if _dsl_installed():
 
     @cute.kernel
     def _decode_probe(meta_t, out_t, b: cutlass.Int32, n_uid: cutlass.Int32, reverse_rows: cutlass.Constexpr[bool]):
+        """One thread per unit id: the walk's and the prefix's (q_tile, batch, head), side by side in ``out_t``."""
         tid, _, _ = cute.arch.thread_idx()
         bid, _, _ = cute.arch.block_idx()
         uid = cutlass.Int32(bid) * 128 + cutlass.Int32(tid)
@@ -2043,6 +2044,7 @@ if _dsl_installed():
 
     @cute.jit
     def _decode_host(m, out, b: cutlass.Int32, n_uid: cutlass.Int32, reverse_rows: cutlass.Constexpr[bool], stream):
+        """Launch ``_decode_probe`` over ``n_uid`` unit ids."""
         _decode_probe(m, out, b, n_uid, reverse_rows).launch(grid=((n_uid + 127) // 128, 1, 1), block=(128, 1, 1), stream=stream)
 
     @cute.jit

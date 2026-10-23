@@ -19,7 +19,6 @@ import math
 
 import pytest
 import torch
-from cudnn.frost.tile_dsl.thd import THD_BWD_META_WORDS
 
 from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell
 

@@ -53,6 +53,7 @@ from cudnn.sdpa.fwd.kernels.thd_helpers import (
     sanitize_v_tail,
     thd_claim_next,
     THD_BATCH_OF_WORK_META_WORDS,
+    THD_WORK_META_WORDS,
     thd_decode_unit_prefix,
     THD_SETUP_THREADS,
 )
@@ -2010,8 +2011,8 @@ class SM120FusedMultiHeadAttentionForward:
             if cutlass.const_expr(self.thd_varlen):
                 if cutlass.const_expr(q.shape[0] != 1):
                     raise ValueError("THD Q/K/V/O must be packed batch-1 views")
-                if cutlass.const_expr(seq_kv_lens.shape != (4 * self.thd_batch + 4,)):
-                    raise ValueError("THD seq_kv_lens must be the (4*B+4,) metadata tensor")
+                if cutlass.const_expr(seq_kv_lens.shape != (THD_WORK_META_WORDS(self.thd_batch),)):
+                    raise ValueError("THD seq_kv_lens must be the (THD_WORK_META_WORDS(B),) metadata tensor")
 
         # Split D into I contiguous C-element chunks while preserving the
         # per-tensor TMA descriptor over the declared (B, S, H, D) strides.

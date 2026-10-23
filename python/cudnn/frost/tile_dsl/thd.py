@@ -71,10 +71,11 @@ THD_BWD_META_WORDS = lambda b: 6 * b + 6  # noqa: E731
 
 # --- optional TENSOR-MAP extension -----------------------------------------
 # For a launch ABI with no descriptor operand: the ``B + 3`` tensor maps follow the
-# forward layout on the next ``TENSOR_MAP_ALIGN`` boundary of a buffer based on one.
+# forward layout -- the work prefix included, since the shared setup launches
+# always publish it -- on the next ``TENSOR_MAP_ALIGN`` boundary of a buffer based on one.
 #
-#   [ ...the forward layout... | pad | maps((B+3) * TENSOR_MAP_QWORDS int64) ]
-THD_MAPS_OFF = lambda b: -(-THD_META_WORDS(b) * 4 // TENSOR_MAP_ALIGN) * TENSOR_MAP_ALIGN // 4  # noqa: E731   int32 words
+#   [ ...the forward layout incl. the unit prefix... | pad | maps((B+3) * TENSOR_MAP_QWORDS int64) ]
+THD_MAPS_OFF = lambda b: -(-THD_WORK_META_WORDS(b) * 4 // TENSOR_MAP_ALIGN) * TENSOR_MAP_ALIGN // 4  # noqa: E731   int32 words
 THD_MAPS_META_WORDS = lambda b: THD_MAPS_OFF(b) + (b + 3) * TENSOR_MAP_QWORDS * 2  # noqa: E731
 # The BACKWARD twin: ``n_maps`` tensor maps after the backward layout (``row_off`` included) on the
 # next ``TENSOR_MAP_ALIGN`` boundary -- for a backward main kernel whose launch ABI has no descriptor

@@ -6130,8 +6130,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
     def _prepared_quant_offset(self):
         if self.split_kv > 1:
             return self._split_workspace_bytes()
-        # SM120 has metadata but no per-sequence TMA O descriptor array.
-        return ws_align((4 * self.batch_size + 4) * 4) if self.thd else 0
+        # SM120 has metadata (the work prefix included) but no per-sequence TMA O descriptor array.
+        from cudnn.frost.tile_dsl.thd import THD_WORK_META_WORDS
+
+        return ws_align(THD_WORK_META_WORDS(self.batch_size) * 4) if self.thd else 0
 
     def scratch_workspace_bytes(self) -> int:
         self._ensure_support_checked()
