@@ -220,6 +220,14 @@ detector in error mode, through rebound buffers, and under CUDA-graph replay,
 bit-identical to eager. No kernel change was needed. Other DSL versions are
 unverified.
 
+GH200 validation (2026-10-26, on `4cd4e613`; DSL 4.8.1, cuDNN 9.27.0, torch
+2.14.1+cu130, CUDA 13.2 toolkit, driver 595.58, aarch64; the same counts on
+`f2aa360e` on 2026-10-23). The in-tree SM90 files
+(`test_sdpa_fwd_dsl_sm90.py`, `test_sdpa_native_sm90_binding.py`,
+`test_sdpa_prepared_sm90.py`) at `-m "L0 or L1"` with the FROST engines opted
+in: 271 passed, 0 skipped, 0 failed. The 21 conformance files above are not in
+this tree and were not run.
+
 | Feature | Native (512, 512) / envelope (256, 512], independently ×8ʷ |
 |---|:--:|
 | FP16 / BF16 Q/K/V/O | ✅ / ⚠️ |
