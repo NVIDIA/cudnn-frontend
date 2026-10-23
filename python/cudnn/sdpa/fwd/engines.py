@@ -2438,6 +2438,11 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             right_band_widening=True,
             swa=True,
             padded=True,
+            # Ragged S_kv with an uncovered tail: the adapter compiles the
+            # padded mask against the scalar S_kv (kv_tail_mask, #1425).  The
+            # SF tile count is already ceil(S_kv / 128) and the kernels
+            # replace the fully padded V scale blocks of that tail tile.
+            skv_tail_via_padding=True,
             sink=True,
             stats=True,
             stats_log2=True,

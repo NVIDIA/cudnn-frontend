@@ -114,7 +114,9 @@ SM120/SM121 per-tensor FP8 also supports prepared dense, dense split-KV and THD
 across its general and D512 head envelopes, with device scales, all four scalar
 output dtypes and native KV-tail masking. THD retains per-batch length inputs;
 CU-prefix-sum graph inputs remain unsupported on this FP8 row.
-SM100/SM103 MXFP8 uses prepared launches for scalar outputs with fixed dense or bounded THD geometry.
+SM100/SM103 MXFP8 uses prepared launches for scalar outputs with fixed dense or bounded THD geometry;
+a mask-free dense `S_kv` off the 128-key tile is served through the KV-tail mask like the f16 and per-tensor
+FP8 rows (#1425), the kernels replacing the tail tile's fully padded V scale blocks before BMM2.
 SM120/SM121 MXFP8 uses prepared launches for scalar outputs with fixed dense (unsplit and split) or THD geometry,
 and for the block-scaled MXFP8 O on fixed dense unsplit plans;
 dense conversion layouts use staged copies around a prepared compact plan, with the scale tensors bound unchanged.

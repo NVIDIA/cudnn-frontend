@@ -127,6 +127,24 @@ def _cdiv(a, b):
     return (a + b - 1) // b
 
 
+def _poison_sf_padding(sfk, sfv, l, s, skp, dsc, ssc, dvp, which="kv"):
+    """Overwrite the K / V scale bytes that belong to no key with E8M0 NaN (0xFF): K's rows ``s..skp`` of the
+    128-row atom padding and V's fully padded 32-key blocks (``ceil(s / 32)..ssc``).  ``which`` selects the
+    tensors ("k", "v" or "kv").  The tensors are the quantizer's swizzled uint8 scale planes (``[l * skp, dsc]``
+    rowwise, ``[l * ssc, dvp]`` columnwise); the same F8_128x4 reorder applied to a selection mask finds their
+    physical bytes."""
+    from sdpa.mxfp8_quant import swizzle_sf_columnwise, swizzle_sf_rowwise
+
+    if "k" in which:
+        rows = torch.zeros(l, skp, dsc, dtype=torch.uint8, device=sfk.device)
+        rows[:, s:, :] = 1
+        sfk[swizzle_sf_rowwise(rows.reshape(l * skp, dsc)) == 1] = 0xFF
+    if "v" in which:
+        blocks = torch.zeros(l, ssc, dvp, dtype=torch.uint8, device=sfv.device)
+        blocks[:, _cdiv(s, _BLOCK) :, :] = 1
+        sfv[swizzle_sf_columnwise(blocks.reshape(l * ssc, dvp)) == 1] = 0xFF
+
+
 def _quantize(t, b, h, s, d, fp8, *, columnwise):
     """MXFP8-quantize [b,h,s,d] fp32 → (fp8_data[b,h,s,d], swizzled SF, per-elem dequant
     scale[b,h,s,d], (scale_padded, dblock_padded)). columnwise=True scales along S (V),
@@ -248,6 +266,7 @@ def _run(
     scale_o=None,
     capture_first: bool = False,
     negate_q: bool = False,
+    poison_sf_padding: bool = False,
 ):
     """Quantize, build the sdpa_mxfp8 graph, route to the frost engine, execute.
 
@@ -282,6 +301,8 @@ def _run(
     Q8, sfq, dqq, (sqp, dsc) = _quantize(Qf, B, H_q, S, d_qk, fp8, columnwise=False)
     K8, sfk, dqk, (skp, _) = _quantize(Kf, B, H_kv, S, d_qk, fp8, columnwise=False)
     V8, sfv, dqv, (ssc, dvp) = _quantize(Vf, B, H_kv, S, d_v, fp8, columnwise=True)
+    if poison_sf_padding:
+        _poison_sf_padding(sfk, sfv, B * H_kv, S, skp, dsc, ssc, dvp, which=poison_sf_padding if isinstance(poison_sf_padding, str) else "kv")
 
     def bshd(x8):
         return x8.permute(0, 2, 1, 3).contiguous().transpose(1, 2)
@@ -606,6 +627,48 @@ def test_mxfp8_qk_bf16_pv_direct_experiment(h_q, h_kv, d_qk, d_v):
         rtol=0.0,
         atol=_half_atol("e4m3", d_qk),
     )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128)], ids=["d128", "d192_d128"])
+@torch_fork_set_rng(seed=61)
+def test_mxfp8_qk_bf16_pv_direct_ragged_kv_tail(d_qk, d_v):
+    """The direct BF16-PV build over a dense, mask-free S = 300 (two KV tiles, a 44-key tail) with K's padding scale
+    bytes set to E8M0 NaN, more Q units than SMs; the build has no V scale slab."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    if torch.cuda.get_device_capability() == (10, 7):
+        pytest.skip("SM107 serves per-tensor FP8 d128, not block-scaled MXFP8")
+
+    b, h, s = 2, 80, 300
+    dev = "cuda"
+    scale = d_qk**-0.5
+    qf = torch.randn(b, h, s, d_qk, device=dev) * 0.5
+    kf = torch.randn(b, h, s, d_qk, device=dev) * 0.5
+    v = (torch.randn(b, h, s, d_v, device=dev) * 0.5).to(torch.bfloat16)
+    q, sf_q, dq, _ = _quantize(qf, b, h, s, d_qk, torch.float8_e4m3fn, columnwise=False)
+    k, sf_k, dk, (skp, dsc) = _quantize(kf, b, h, s, d_qk, torch.float8_e4m3fn, columnwise=False)
+    _poison_sf_padding(sf_k, None, b * h, s, skp, dsc, 0, 0, which="k")
+    o = torch.empty(b, h, s, d_v, device=dev, dtype=torch.bfloat16)
+
+    api = SdpaFwdDslSm100(
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_o=o,
+        is_causal=False,
+        scale_softmax=scale,
+        dtype_o=torch.bfloat16,
+        split_kv=1,
+        pv_bf16=True,
+    )
+    assert api.check_support()
+    api.compile()
+    workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device=dev)
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sf_q=sf_q, sf_k=sf_k, workspace=workspace)
+    torch.cuda.synchronize()
+    o_ref = _ref(q.float() * dq, k.float() * dk, v.float(), scale=scale)
+    _check(o, o_ref, torch.bfloat16, "e4m3", d_qk=d_qk)
 
 
 @pytest.mark.L0
@@ -1540,6 +1603,40 @@ def test_mxfp8_dense_padding(in_key, causal):
     o_out, o_ref, amax = _run(2, 8, 8, 256, in_key, torch.float16, scale=scale, sdpa_kwargs=sk, seq_lens_kv=[256, 192], stats=False)
     _check(o_out, o_ref, torch.float16, in_key)
     assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
+
+
+_RAGGED_TAIL_FLAVORS = [
+    pytest.param(64, 64, id="d64", marks=pytest.mark.skipif(_SM == 107, reason="the Rubin MXFP8 row has no d64 flavor")),
+    pytest.param(128, 128, id="d128"),
+    pytest.param(192, 128, id="d192_d128"),
+    pytest.param(256, 256, id="d256"),
+    pytest.param(512, 512, id="d512"),
+]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", _RAGGED_TAIL_FLAVORS)
+@pytest.mark.parametrize("S", [180, 1060], ids=["s180", "s1060"])
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_dense_ragged_kv_tail(d_qk, d_v, S):
+    """A dense, mask-free S_kv off the 128-key tile runs through the KV-tail mask (skv_tail_via_padding) and matches
+    the reference with the K / V scale bytes of the tail tile's padding poisoned (E8M0 NaN) on cc 10.0 / 10.3.
+    S=180: two KV tiles, the tail keeps one partial 32-key block; S=1060: nine tiles, a 36-key tail."""
+    scale = 1.0 / math.sqrt(d_qk)
+    O, O_ref, amax = _run(2, 4, 4, S, "e4m3", torch.float16, scale=scale, sdpa_kwargs={}, d_qk=d_qk, d_v=d_v, poison_sf_padding=_SM in (100, 103))
+    _check(O, O_ref, torch.float16, "e4m3", d_qk=d_qk)
+    assert abs(amax.item() - O_ref.abs().max().item()) <= 0.03
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("in_key", _INS)
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_dense_ragged_kv_tail_s2100(in_key):
+    """Dense d128 MXFP8 attention over S_q = S_kv = 2100 (16 full KV tiles + 52 keys) with a bf16 output, both FP8
+    input types, the tail tile's padding scale bytes poisoned."""
+    O, O_ref, amax = _run(1, 4, 4, 2100, in_key, torch.bfloat16, scale=1.0 / math.sqrt(128), sdpa_kwargs={}, poison_sf_padding=_SM in (100, 103))
+    _check(O, O_ref, torch.bfloat16, in_key)
+    assert abs(amax.item() - O_ref.abs().max().item()) <= 0.03
 
 
 @pytest.mark.L0
