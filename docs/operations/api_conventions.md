@@ -22,9 +22,6 @@ cudnn.ops.<op_name>_<direction>_standalone    # no framework
 
 Each name is a function exported from `cudnn.ops` or from one of its families.
 Ops are imperative: forward and backward are separate calls.
-JAX forward functions may register first-order reverse-mode derivatives; their
-backward implementation may remain private unless an explicit backward API is
-part of the operation's contract.
 
 ## Families
 
