@@ -30,6 +30,7 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 from ..common.host import get_dtype
+from ..common.state_snapshot import snapshot_states
 from . import gdn2_bprop_f16, gdn2_recompute_f16, gdn2_summary_f16
 
 uncut_backward_cache = {}
@@ -84,8 +85,15 @@ def uncut_backward_host(
     scheduler_bwd: cute.Tensor,
     recompute_words: Optional[cute.Tensor],
     bprop_words: cute.Tensor,
+    dstate_scratch: cute.Tensor,
+    dstate_snapshot: Optional[cute.Tensor],
     stream: cuda.CUstream,
 ) -> None:
+    dstate_seed = dstate_in
+    if cutlass.const_expr(dstate_snapshot is not None):
+        # d_initial_state overwrites the d_final_state the bprop's exact twin would reread: read it from a copy.
+        snapshot_states(dstate_in, dstate_snapshot, None, stream)
+        dstate_seed = dstate_snapshot
     heads_out = cutlass.Int32(gate.shape[1])
     q_ratio = heads_out // cutlass.Int32(q.shape[1])
     k_ratio = heads_out // cutlass.Int32(k.shape[1])
@@ -172,11 +180,12 @@ def uncut_backward_host(
         dw,
         cu_seqlens,
         dstate0,
-        dstate_in,
+        dstate_seed,
         work_items,
         work_count,
         scheduler_bwd,
         bprop_words,
+        dstate_scratch,
         scale,
         stream,
     )
@@ -215,6 +224,7 @@ def build_uncut_backward(
     scheduler_bwd,
     recompute_words,
     bprop_words,
+    dstate_scratch,
     num_sm,
     b_t,
     recompute,
@@ -233,6 +243,7 @@ def build_uncut_backward(
     scale,
     device,
     stream,
+    dstate_snapshot=None,
 ):
     """Compile (cached per static config) the uncut backward launch over the buffers of one plan.  The placeholders
     repeat the marks of the standalone builds so every kernel compiles as it does there; the recompute or the bprop
@@ -277,6 +288,7 @@ def build_uncut_backward(
         bool(use_beta_sigmoid),
         bool(allow_neg_eigval),
         bool(beta_guard),
+        dstate_snapshot is not None,
     )
     if key not in uncut_backward_cache:
         flags = dict(
@@ -367,6 +379,8 @@ def build_uncut_backward(
             from_dlpack(scheduler_bwd, assumed_align=4).mark_layout_dynamic(),
             from_dlpack(recompute_words, assumed_align=128).mark_layout_dynamic() if recompute else None,
             from_dlpack(bprop_words, assumed_align=128).mark_layout_dynamic(),
+            from_dlpack(dstate_scratch, assumed_align=16).mark_layout_dynamic(),
+            from_dlpack(dstate_snapshot, assumed_align=16).mark_layout_dynamic(leading_dim=3) if dstate_snapshot is not None else None,
             cuda.CUstream(int(stream)),
             options="--enable-tvm-ffi --opt-level 2",
         )
@@ -408,6 +422,7 @@ def run_uncut_backward(
     scheduler_bwd,
     recompute_words,
     bprop_words,
+    dstate_scratch,
     b_t,
     recompute,
     recompute_orders,
@@ -419,6 +434,7 @@ def run_uncut_backward(
     beta_guard,
     scale,
     stream,
+    dstate_snapshot=None,
 ) -> None:
     """Replay the uncut backward: one crossing into the DSL.  The plan validated the contract at build, so nothing here
     raises."""
@@ -462,5 +478,7 @@ def run_uncut_backward(
         scheduler_bwd,
         recompute_words if recompute else None,
         bprop_words,
+        dstate_scratch,
+        dstate_snapshot,
         cuda.CUstream(int(stream)),
     )

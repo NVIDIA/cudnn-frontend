@@ -88,11 +88,10 @@ from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, tma_slice_runtime_de
 from cudnn.frost.tile_dsl.mma import desc_opaque, mma_ts_step
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor_128b
 from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait, tma_tensormap_acquire
-from cudnn.frost.tile_dsl.pointwise import opaque_i32, sigmoid, fmul2, mul_f16x2, opaque_f32_zero, fp32_to_fp16, sub_f16x2
+from cudnn.frost.tile_dsl.pointwise import opaque_i32, fmul2, mul_f16x2, opaque_f32_zero, fp32_to_fp16, sub_f16x2
 
 USE_PDL = True
 
-LOG2_E: float = 1.4426950408889634
 DEFAULT_GATE_LOWER_BOUND: float = -5.0
 L2_NORM_EPS: float = 1.0e-6
 
@@ -761,17 +760,6 @@ def tmaldg_warp(
         tile_idx, scheduler_state = scheduler_publish_next(cfg, bars, sScheduler, mScheduler, scheduler_state, num_ctas, elect_one)
     if cutlass.const_expr(USE_PDL):
         launch_dependent_grids()
-
-
-@cute.jit
-def gate_scale(cfg, raw_gate: cutlass.Float32) -> cutlass.Float32:
-    """Map raw gate to the log2-domain decay increment."""
-
-    if cutlass.const_expr(cfg.safe_gate):
-        return cfg.gate_scale_log2 * sigmoid(raw_gate)
-    if cutlass.const_expr(cfg.log_gate):
-        return raw_gate * cutlass.Float32(LOG2_E)
-    return cute.math.log2(raw_gate + cutlass.Float32(1e-10), fastmath=True)
 
 
 @cute.jit

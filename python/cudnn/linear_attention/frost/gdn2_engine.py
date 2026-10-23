@@ -260,6 +260,12 @@ class CompiledGdn2:
                 prefill_module = kernel_module
             self.tensormap_bytes = tensormap_workspace_bytes(prefill_module, B)
             regions.append(("tensormaps", layout.add(self.tensormap_bytes, align=128), "int64", (self.tensormap_bytes // 8,)))
+            seed = node.inputs.get("initial_state")
+            if self.has_final_state and not self.prep and seed is not None and (self.overwrite_initial_state or "state_indices" in node.inputs):
+                # The final state may overwrite the seeds (the graph contract, not this call's pointers: buffers can alias
+                # after warmup), so the prefill seeds from a copy its exact twin can reread (common/state_snapshot.py).
+                seed_name, seed_bytes = {"BFLOAT16": ("bfloat16", 2), "HALF": ("float16", 2)}.get(seed.get_data_type().name, ("float32", 4))
+                regions.append(("state_snapshot", layout.add(B * HO * V * K * seed_bytes, align=128), seed_name, (B, HO, V, K)))
         self.workspace_size = layout.size
         self.carve_names = [name for name, off, dt, shape in regions]
         self.carve = carve_plan(self.plan_name, [(off, dt, shape) for name, off, dt, shape in regions])
@@ -334,6 +340,7 @@ class CompiledGdn2:
             prep_words=region.get("prep_tensormaps"),
             prep_rows=region.get("prep_rows"),
             prep_row_count=region.get("prep_row_count"),
+            state_snapshot=region.get("state_snapshot"),
         )
         if self.uncut_launch is None:
             self.uncut_launch = self.build_uncut_forward(
@@ -455,6 +462,7 @@ class CompiledGdn2Bwd:
         from .common.gate_bwd import GATE_BWD_BLOCKS, channel_gate_bwd
         from .common.head_reduce import head_group_reduce
         from .common.host import tensormap_workspace_bytes
+        from .common.steep_scratch import state_gradient_scratch_layout
 
         self.head_group_reduce = head_group_reduce
         self.channel_gate_bwd = channel_gate_bwd
@@ -508,6 +516,10 @@ class CompiledGdn2Bwd:
 
         layout = WorkspaceLayout()
         regions = []
+        # One FP32 state and bounded-key ring per persistent CTA; sequential backward kernels share the arena.
+        state_grad_layout = state_gradient_scratch_layout(d_k=K, d_v=V, b_t=self.b_t, decay_stages=bwd_module.CFG.SMEM_DECAY_STAGES)
+        dstate_scratch_elements = max(1, min(self.num_sm, self.num_pieces * HO)) * (state_grad_layout.nbytes // 4)
+        regions.append(("dstate_scratch", layout.add(dstate_scratch_elements * 4), "float32", (dstate_scratch_elements,)))
         off_scheduler = layout.add(40 if self.chain else 16)
         regions += [
             ("scheduler_recompute", off_scheduler, "int32", (2,)),
@@ -597,6 +609,11 @@ class CompiledGdn2Bwd:
             if not self.has_state_checkpoints:
                 regions.append(("state_h", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape))
                 regions.append(("state_x", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape))
+        d_final = node.inputs.get("d_final_state")
+        if not self.chain and self.overwrite_initial_state and d_final is not None:
+            # d_initial_state overwrites d_final_state: the bprop reads a copy so its exact twin can redo it.
+            d_name, d_bytes = {"BFLOAT16": ("bfloat16", 2), "HALF": ("float16", 2)}.get(d_final.get_data_type().name, ("float32", 4))
+            regions.append(("dstate_snapshot", layout.add(B * HO * V * K * d_bytes, align=128), d_name, (B, HO, V, K)))
         self.order_in_recompute = not self.has_state_checkpoints
         self.workspace_size = layout.size
         self.carve_names = [name for name, off, dt, shape in regions]
@@ -722,6 +739,8 @@ class CompiledGdn2Bwd:
                 scheduler_bwd=region["scheduler_bwd"],
                 recompute_words=region.get("recompute_tensormaps"),
                 bprop_words=region["bwd_tensormaps"],
+                dstate_scratch=region["dstate_scratch"],
+                dstate_snapshot=region.get("dstate_snapshot"),
             )
             schedule = dict(
                 b_t=self.b_t,
@@ -823,6 +842,7 @@ class CompiledGdn2Bwd:
             series_words=region.get("recompute_tensormaps_series"),
             bprop_summary_words=region["summary_tensormaps"],
             bprop_words=region["bwd_tensormaps"],
+            dstate_scratch=region["dstate_scratch"],
             checkpoints=checkpoint_series,
             seed_checkpoints=state_checkpoints if coarse else None,
             dq=dq_out,
@@ -1290,6 +1310,7 @@ class CompiledGdn2SummaryBwd:
 
     def __init__(self, node, summary_module):
         from .common.host import tensormap_workspace_bytes
+        from .common.steep_scratch import state_gradient_scratch_layout
         from .common.piece_chain import build_state_chain, chain_rows_per_cta, choose_pieces, piece_table_layout, run_state_chain
         from .kernel.gdn2_chain_prologue_f16 import run_chain_prologue
         from .common.split_k import WORK_ITEM_FIELDS
@@ -1352,6 +1373,10 @@ class CompiledGdn2SummaryBwd:
         self.num_pieces = B * self.pieces if self.chain else B
         layout = WorkspaceLayout()
         regions = []
+        # One FP32 state and bounded-key ring per persistent CTA; sequential backward kernels share the arena.
+        state_grad_layout = state_gradient_scratch_layout(d_k=K, d_v=V, b_t=self.b_t, decay_stages=summary_module.CFG.SMEM_DECAY_STAGES)
+        dstate_scratch_elements = max(1, min(self.num_sm, self.num_pieces * HO)) * (state_grad_layout.nbytes // 4)
+        regions.append(("dstate_scratch", layout.add(dstate_scratch_elements * 4), "float32", (dstate_scratch_elements,)))
         if self.chain:
             from .kernel import gdn2_recompute_f16 as recompute_module
 
@@ -1461,6 +1486,7 @@ class CompiledGdn2SummaryBwd:
                 stream,
                 a_log=a_log if self.safe_gate else None,
                 dt_bias=dt_bias if self.safe_gate else None,
+                dstate_scratch=region["dstate_scratch"],
             )
             if self.has_transition:
                 self.run_transition(k, g, beta, cu, transition, a_log, dt_bias, region, stream)
@@ -1494,6 +1520,7 @@ class CompiledGdn2SummaryBwd:
             device=self.device,
             num_sm=self.num_sm,
             stream=stream,
+            dstate_scratch=region["dstate_scratch"],
         )
         if self.has_transition:
             self.run_transition(k, g, beta, cu, transition, a_log, dt_bias, region, stream)
@@ -1649,6 +1676,7 @@ class CompiledGdn2SummaryBwd:
                 a_log=gate_a,
                 dt_bias=gate_dt,
                 own_prologue=False,
+                dstate_scratch=region["dstate_scratch"],
             )
         else:
             self.state_m_cache = self.recompute.chunk_gdn2_recompute(
@@ -1709,6 +1737,7 @@ class CompiledGdn2SummaryBwd:
                 num_sm=self.num_sm,
                 stream=stream,
                 own_prologue=False,
+                dstate_scratch=region["dstate_scratch"],
             )
             self.chain_reverse = self.build_state_chain(
                 heads_out=self.n_heads_out,
