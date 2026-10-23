@@ -165,6 +165,28 @@ def _in_axis_order_of(shape, stride, reference_stride):
     return tuple(shape[a] for a in permutation), tuple(stride[a] for a in permutation)
 
 
+def _python_plan_deserialize_args(args: tuple, kwargs: Dict[str, Any]):
+    """``(handle, data, enforce_precompiled)`` when a deserialize call carries a python-engine
+    plan blob, else None. Mirrors the two classic overloads: ``(data)`` and
+    ``(handle, data, enforce_precompiled=...)``, positional or by the pybind names."""
+    from . import _plan_serdes
+
+    rest = list(args)
+    handle = kwargs.get("handle_")
+    data = kwargs.get("pyobj")
+    if data is not None and handle is None and rest:
+        handle = rest.pop(0)
+    elif data is None and rest and _plan_serdes.is_python_plan(rest[0]):
+        data = rest.pop(0)
+    elif data is None and len(rest) >= 2 and _plan_serdes.is_python_plan(rest[1]):
+        handle, data = rest[0], rest[1]
+        rest = rest[2:]
+    if data is None or not _plan_serdes.is_python_plan(data):
+        return None
+    enforce = kwargs.get("enforce_precompiled", rest[0] if rest else False)
+    return handle, data, bool(enforce)
+
+
 def cudnn_graph_not_supported(message: str) -> Exception:
     """The classic unsupported-graph error (built lazily: importing cudnn at
     module scope here would be circular)."""
@@ -289,6 +311,7 @@ class pygraph:
         self._backend_heuristics: Optional[List] = None  # heur modes for a backend plan
         self._cpp_plans_created: bool = False  # C++ create_execution_plans ran
         self._compiled_plans: Dict[int, Any] = {}  # plan_index -> CompiledPlan (python plans)
+        self._plan_kernel_entries: Dict[int, List[Any]] = {}  # plan_index -> compiled_cache entries its build used (serialize)
         self._cpp_bog_done: bool = False  # C++ build_operation_graph ran
         self._cpp_tensors: Dict[int, Any] = {}  # IR uid -> lowered C++ tensor
         self._reserved_uids: set = set()  # user-specified uids _alloc_uid must skip
@@ -1825,7 +1848,11 @@ class pygraph:
         eng = self._engine_for(cfg)
         if eng is not None:
             if index not in self._compiled_plans:
-                self._compiled_plans[index] = eng.build_plan(self, cfg, ctx or self._build_context())
+                from .frost import compiled_cache
+
+                with compiled_cache.record_entries() as entries:
+                    self._compiled_plans[index] = eng.build_plan(self, cfg, ctx or self._build_context())
+                self._plan_kernel_entries[index] = entries
             self._prepare_ordered_binding_schema()
             return
         cfg = self._materialize_backend_plan(index)
@@ -2592,16 +2619,27 @@ class pygraph:
 
         return json.dumps(self.inspect(), default=str, indent=2)
 
-    def serialize(self, *, as_bytes: bool = False):
-        """Serialize the graph's cuDNN backend execution plan.
+    def serialize(self, *, as_bytes: bool = False, include_kernels: bool = True):
+        """Serialize the graph's selected execution plan.
 
         Returns a list of byte values by default. Set ``as_bytes=True`` to
         return the same binary data as compact ``bytes`` without constructing
         a Python list. ``deserialize`` accepts either representation.
+
+        A backend plan serializes in the cuDNN backend's format. A python-engine
+        plan (FROST, ...) serializes as the graph plus its ``(engine_id, knobs)``
+        and, with ``include_kernels``, its compiled kernels (see
+        ``cudnn._plan_serdes``); only ``pygraph.deserialize`` reads that format.
         """
+        if self._planning_done and self.selected_engine is not None:
+            from . import _plan_serdes
+
+            if not self._is_built or self._plan_index not in self._compiled_plans:
+                raise RuntimeError("serialize(): build the selected plan first (build_plans())")
+            blob = _plan_serdes.serialize(self, include_kernels=include_kernels)
+            return blob if as_bytes else list(blob)
         if self._lowered_graph is None:
-            # Serialization is the cuDNN graph format by definition — lower on
-            # demand (independent of which plan is selected for execution).
+            # Backend-selected or unplanned: the cuDNN graph format — lower on demand.
             node = self._unlowerable_node()
             if node is not None:
                 # As key(): the format has no field for what the backend cannot
@@ -2622,7 +2660,17 @@ class pygraph:
         or as the ``handle_`` keyword (the pybind overload's name); unwrap a
         Handle to its backend int and leave the ``data`` blob (the other overload)
         untouched. Binary data may be ``bytes`` or the legacy list of byte
-        values; JSON strings retain their structural-graph meaning."""
+        values; JSON strings retain their structural-graph meaning. A
+        python-engine blob from ``serialize()`` is rebuilt here, into an empty
+        graph, and its plan built."""
+        python_plan = _python_plan_deserialize_args(args, kwargs)
+        if python_plan is not None:
+            from . import _plan_serdes
+
+            handle, data, enforce_precompiled = python_plan
+            _plan_serdes.deserialize(self, data, handle=handle, enforce_precompiled=enforce_precompiled)
+            self._sorted_uids = None
+            return
         if args and isinstance(args[0], Handle):
             args = (args[0].backend_handle,) + args[1:]
         if isinstance(kwargs.get("handle_"), Handle):
