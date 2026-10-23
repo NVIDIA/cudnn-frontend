@@ -25,11 +25,12 @@ def _parameters(io_dtype, has_mean, has_beta):
 
 @lru_cache(maxsize=128)
 def make_forward(rows, cols, io_dtype, *, has_mean, has_beta, epsilon, sm_count):
-    """Return ``launch(stream, x, gamma, beta, y, [mean,] rstd)``.
+    """Return ``launch(stream, x, gamma, beta, y, mean, rstd)``.
 
     X/Y are contiguous [rows, cols], affine operands [cols], and statistics
-    FP32 [rows]. The unused beta operand may alias gamma. ``sm_count`` keys
-    the cache because the shared helpers derive launch geometry from the device.
+    FP32 [rows]; mean is None for RMSNorm. The unused beta operand may alias gamma.
+    ``sm_count`` keys the cache because the shared helpers derive launch geometry
+    from the device.
     """
     params = _parameters(io_dtype, has_mean, has_beta)
     spec = rowwise_spec(params.variant, (rows, cols))
@@ -59,8 +60,7 @@ def make_forward(rows, cols, io_dtype, *, has_mean, has_beta, epsilon, sm_count)
         constants = (cols, cfg.V, cfg.block_threads, eb, cfg.stage_mode, cfg.vec, has_mean, has_beta)
 
     @cute.jit
-    def launch(stream, x, gamma, beta, y, *stats):
-        mean, rstd = stats[0], stats[-1]
+    def launch(stream, x, gamma, beta, y, mean, rstd):
         if cutlass.const_expr(route == "cga"):
             flat_x = cute.make_tensor(x.iterator, cute.make_layout(rows * cols))
             flat_y = cute.make_tensor(y.iterator, cute.make_layout(rows * cols))
@@ -82,12 +82,13 @@ def _finalize_geometry(cols, partitions):
 
 @lru_cache(maxsize=128)
 def make_backward(rows, cols, io_dtype, *, has_mean, has_beta, sm_count):
-    """Return a launcher and the shapes of its FP32 partial-gradient outputs.
+    """Return a launcher and the shape of each FP32 partial-gradient output, or None.
 
-    ABI: ``launch(stream, dy, x, gamma, mean, rstd, dx, dgamma, [dbeta,] *partials)``.
+    ABI: ``launch(stream, dy, x, gamma, mean, rstd, dx, dgamma, dbeta,
+    dgamma_partials, dbeta_partials)``.
     DY/X/DX are contiguous [rows, cols], gamma/dgamma/dbeta [cols], statistics
     FP32 [rows]. Dgamma and optional dbeta MUST be initialized to zero. Scratch
-    outputs are fully overwritten; mean may alias rstd for RMSNorm.
+    outputs are fully overwritten. Absent mean, dbeta, and partial buffers are None.
     """
     params = _parameters(io_dtype, has_mean, has_beta)
     eb, et = DTYPE_BYTES[io_dtype], DTYPE_TO_CUTLASS[io_dtype]
@@ -154,22 +155,48 @@ def make_backward(rows, cols, io_dtype, *, has_mean, has_beta, sm_count):
         constants = (cols, cfg.V, cfg.block_threads, eb, cfg.stage_mode, cfg.vec, has_mean, has_beta)
 
     @cute.jit
-    def launch(stream, dy, x, gamma, mean, rstd, dx, dgamma, *extra):
-        dbeta = extra[0] if cutlass.const_expr(has_beta) else dgamma
+    def launch(stream, dy, x, gamma, mean, rstd, dx, dgamma, dbeta, dgamma_partials, dbeta_partials):
         if cutlass.const_expr(route == "row"):
             host(dy, x, gamma, mean, rstd, dx, dgamma, dbeta, cutlass.Int32(rows), *constants, stream)
+        elif cutlass.const_expr(route == "cga"):
+            flat_dy = cute.make_tensor(dy.iterator, cute.make_layout(rows * cols))
+            flat_x = cute.make_tensor(x.iterator, cute.make_layout(rows * cols))
+            flat_dx = cute.make_tensor(dx.iterator, cute.make_layout(rows * cols))
+            host(
+                flat_dy,
+                flat_x,
+                flat_dx,
+                gamma,
+                mean,
+                rstd,
+                dgamma_partials,
+                dbeta_partials,
+                dgamma,
+                dbeta,
+                cutlass.Int32(rows),
+                cutlass.Int32(partitions),
+                *constants,
+                stream,
+            )
+        elif cutlass.const_expr(route == "tiled"):
+            host(dy, x, dx, gamma, rstd, dgamma_partials, dgamma, cutlass.Int32(rows), cutlass.Int32(partitions), *constants, stream)
         else:
-            dgp = extra[int(has_beta)]
-            dbp = extra[2] if cutlass.const_expr(has_beta) else dgp
-            if cutlass.const_expr(route == "cga"):
-                flat_dy = cute.make_tensor(dy.iterator, cute.make_layout(rows * cols))
-                flat_x = cute.make_tensor(x.iterator, cute.make_layout(rows * cols))
-                flat_dx = cute.make_tensor(dx.iterator, cute.make_layout(rows * cols))
-                host(flat_dy, flat_x, flat_dx, gamma, mean, rstd, dgp, dbp, dgamma, dbeta, cutlass.Int32(rows), cutlass.Int32(partitions), *constants, stream)
-            elif cutlass.const_expr(route == "tiled"):
-                host(dy, x, dx, gamma, rstd, dgp, dgamma, cutlass.Int32(rows), cutlass.Int32(partitions), *constants, stream)
-            else:
-                host(dy, x, dx, gamma, mean, rstd, dgp, dbp, dgamma, dbeta, cutlass.Int32(rows), cutlass.Int32(partitions), *constants, stream)
+            host(
+                dy,
+                x,
+                dx,
+                gamma,
+                mean,
+                rstd,
+                dgamma_partials,
+                dbeta_partials,
+                dgamma,
+                dbeta,
+                cutlass.Int32(rows),
+                cutlass.Int32(partitions),
+                *constants,
+                stream,
+            )
 
-    partial_shapes = ((partitions * cols,),) * (2 if has_beta else 1) if partitions else ()
-    return launch, partial_shapes
+    partial_shape = (partitions * cols,) if partitions else None
+    return launch, partial_shape
