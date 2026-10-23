@@ -3710,6 +3710,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 pertensor=self._pertensor,
                 s_q=self.s_q_max,
                 s_kv=self.s_k_max,
+                paged=bool(self.paged),
+                has_sink=bool(self.has_sink),
+                gqa_ratio=int(params.qh_per_kh),
+                device_cc=self._device_cc,
             )
             params = replace(
                 params,
