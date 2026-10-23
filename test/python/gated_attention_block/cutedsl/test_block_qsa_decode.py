@@ -2747,8 +2747,8 @@ def test_pdl_auto_stays_off_on_the_sparse_form_until_measured_and_the_envelope_s
     is EMPTY: a part enters it with its measurement); the arm exists behind the tuple -- with the tuple patched to the measured dense part
     AUTO resolves True on the sparse form and the switch reaches the sparse stage; an explicit value wins either way.  The envelope names
     the switched stage kinds on the sparse form (``DECODE_PDL_STAGES``, the same four) and reads ``pdl_default`` off the sparse tuple."""
-    import cudnn.gated_attention_block.api as _api
     from cudnn.frost import buffers
+    from cudnn.gated_attention_block import api as _api
 
     assert _api.SPARSE_DECODE_PDL_DEFAULT_CCS == ()
     monkeypatch.setattr(_api, "_device_cc_of", lambda device: (10, 7))
@@ -2784,6 +2784,28 @@ def test_pdl_auto_stays_off_on_the_sparse_form_until_measured_and_the_envelope_s
     assert GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV, device_cc=(10, 0)).decode.pdl_default is False
     dense = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**GEOM_SMALL, causal_bottom_right=True), BF16, _DEV, device_cc=_SM107)
     assert dense.decode.pdl_default is True and not dense.decode.sparse_core, "the dense form keeps its own measured tuple"
+
+
+def test_pdl_auto_never_resolves_true_under_the_in_block_indexer_whatever_the_tuple_holds(monkeypatch):
+    """The AUTO reading of ``use_pdl`` under ``QsaSpec(index_source="indexer")`` is False even with the sample's part IN
+    ``SPARSE_DECODE_PDL_DEFAULT_CCS``: the two readings answer for ONE domain -- the explicit True is declined by name there (the scorer /
+    top-k / step kernels would take the switch unmeasured), so a future measured entry in the tuple must not flip the indexer block through
+    the back door.  The caller-list block on the same patched tuple and part resolves True (the arm itself is live); the envelope agrees
+    (``pdl_default`` False on the indexer form)."""
+    from cudnn.gated_attention_block import api as _api
+
+    monkeypatch.setattr(_api, "_device_cc_of", lambda device: (10, 7))
+    monkeypatch.setattr(_api, "SPARSE_DECODE_PDL_DEFAULT_CCS", ((10, 7),))
+    with _no_host_sync():
+        indexer = _declare_indexer()
+        caller_list = _declare(GEOM_SMALL, 2, 1, n_pages=4)[0]
+    assert indexer.use_pdl_requested is None and indexer.use_pdl is False and indexer.pdl_stages == () and indexer.use_pdl_effective is False
+    assert caller_list.use_pdl_requested is None and caller_list.use_pdl is True and "sdpa_sparse" in caller_list.pdl_stages
+    with pytest.raises(NotImplementedError, match="use_pdl=True is served for the bf16 / f16 block only"):
+        with _no_host_sync():
+            _declare_indexer(use_pdl=True)
+    env = GatedAttentionBlockFwd.serving_envelope(indexer.geom, BF16, _DEV, device_cc=_SM107)
+    assert env.decode.pdl_default is False and env.decode.pdl_stages == ()
 
 
 def test_pdl_is_declined_on_e4m3_pools_and_on_the_packed_sparse_form_by_name():
@@ -2884,7 +2906,8 @@ def test_capture_of_the_first_pdl_execute_of_the_sparse_chain_replays_bitwise_th
             try:  # best effort: the graph's DOT (cudaGraphDebugDotPrint) -- the kernel-node census beside the verdict, never the verdict
                 path = str(tmp_path / "sparse_pdl_decode_graph.dot")
                 graph.debug_dump(path)
-                dot = open(path).read()
+                with open(path) as fh:
+                    dot = fh.read()
                 dumped = dict(kernel_nodes=dot.count("KERNEL"), programmatic=sum(dot.lower().count(w) for w in ("programmatic", "port")))
             except Exception as exc:  # noqa: BLE001 -- the dump is a record, never the verdict
                 dumped = f"debug_dump unavailable ({type(exc).__name__})"

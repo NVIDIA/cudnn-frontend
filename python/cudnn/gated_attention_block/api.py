@@ -9540,7 +9540,8 @@ class GatedAttentionBlockFwd(APIBase):
         """The AUTO reading of ``use_pdl`` (None): True iff this is the dense DECODE form on a decode-tile route (``DecodeRoute.pdl_capable``:
         the tile and its split combine carry the griddepcontrol pair), the bf16 / f16 block (no ``quant``, no e4m3 cache, no ``QsaSpec``) and
         the sample's device is one of :data:`DECODE_PDL_DEFAULT_CCS` (cc 10.7, where the default was measured) -- OR the block-sparse DECODE
-        mode (``sparse_decode``: a ``QsaSpec`` geometry over bf16 / f16 pools, whose core and combine carry the sites) on a part of
+        mode (``sparse_decode``: a caller-list ``QsaSpec`` geometry over bf16 / f16 pools, whose core and combine carry the sites; never
+        ``index_source="indexer"``, whose explicit True is declined) on a part of
         :data:`SPARSE_DECODE_PDL_DEFAULT_CCS`, EMPTY until that chain is measured, so the sparse arm reads False everywhere today; False
         everywhere else -- the EXTEND form, ``kv_source="self"``, the DECODE form's prefill route, the quantized pipelines, every other part
         and no CUDA device.  Never True where an explicit True is refused: the two readings of the knob answer for ONE domain (no ``quant``,
@@ -9549,8 +9550,14 @@ class GatedAttentionBlockFwd(APIBase):
             return False
         if self.qsa is not None:
             # the decode mode's fact from the two attributes already set here (`sparse_decode` itself is derived from them later in the
-            # constructor): the paged form on a dense [B, S_q] QsaSpec declaration
-            return bool(self.kv_source == KV_SOURCE_PAGED and not self.thd and _device_cc_of(self.device) in SPARSE_DECODE_PDL_DEFAULT_CCS)
+            # constructor): the paged form on a dense [B, S_q] QsaSpec declaration -- and the CALLER-LIST form only: the in-block indexer
+            # (`index_source="indexer"`) refuses the explicit True above, so AUTO never resolves True there either, whatever the tuple holds
+            return bool(
+                self.kv_source == KV_SOURCE_PAGED
+                and not self.thd
+                and self.qsa.index_source != "indexer"
+                and _device_cc_of(self.device) in SPARSE_DECODE_PDL_DEFAULT_CCS
+            )
         return bool(self.decode_route is not None and self.decode_route.pdl_capable and _device_cc_of(self.device) in DECODE_PDL_DEFAULT_CCS)
 
     def _resolve_cache_write_small_m(self, requested: Optional[bool], quant) -> bool:
