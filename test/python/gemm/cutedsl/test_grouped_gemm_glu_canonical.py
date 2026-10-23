@@ -154,25 +154,32 @@ def test_block_scaled_wrapper_cache_separates_devices(monkeypatch, entry):
         )
 
     retained = {}
-    for device in (first, other):
-        with torch.cuda.device(device):
-            inputs = {name: value.to(device=device) if isinstance(value, torch.Tensor) else value for name, value in host.items()}
-            call(inputs)  # Compile once on each device, without clearing the shared caches.
-            stream = torch.cuda.Stream(device=device)
-            stream.wait_stream(torch.cuda.current_stream(device))
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, stream=stream):
-                captured = call(inputs)
-            retained[device] = inputs, graph, captured
+    graphs = []
+    try:
+        for device in (first, other):
+            with torch.cuda.device(device):
+                inputs = {name: value.to(device=device) if isinstance(value, torch.Tensor) else value for name, value in host.items()}
+                call(inputs)  # Compile once on each device, without clearing the shared caches.
+                stream = torch.cuda.Stream(device=device)
+                stream.wait_stream(torch.cuda.current_stream(device))
+                graph = torch.cuda.CUDAGraph()
+                graphs.append((device, graph))
+                with torch.cuda.graph(graph, stream=stream):
+                    captured = call(inputs)
+                retained[device] = inputs, graph, captured
 
-    for device in (first, other, first):
-        with torch.cuda.device(device):
-            inputs, graph, captured = retained[device]
-            inputs["alpha_tensor"].mul_(0.5)
-            expected = call(inputs)
-            graph.replay()
-            torch.cuda.synchronize()
-            assert_outputs_equal(captured, expected, 1024)
+        for device in (first, other, first):
+            with torch.cuda.device(device):
+                inputs, graph, captured = retained[device]
+                inputs["alpha_tensor"].mul_(0.5)
+                expected = call(inputs)
+                graph.replay()
+                torch.cuda.synchronize()
+                assert_outputs_equal(captured, expected, 1024)
+    finally:
+        for device, graph in graphs:
+            with torch.cuda.device(device):
+                graph.reset()
 
 
 @pytest.mark.parametrize("natural_operand", ["a_tensor", "b_tensor", "sfa_tensor", "sfb_tensor", "prob_tensor"])
