@@ -1,0 +1,2045 @@
+{
+  "schema_version": 1,
+  "topics": [
+    {
+      "source": "old_docs/docs_v1/CompileTimeConstants.md",
+      "disposition": "merged",
+      "destination": "how-to/scalars-and-constants.md",
+      "reason": "End-user workflow retained in the current grouped documentation."
+    },
+    {
+      "source": "old_docs/docs_v1/adding_torch_custom_ops.md",
+      "disposition": "merged",
+      "destination": "how-to/pytorch-custom-operator.md",
+      "reason": "End-user workflow retained in the current grouped documentation."
+    },
+    {
+      "source": "old_docs/docs_v1/cuda-graphs.md",
+      "disposition": "merged",
+      "destination": "how-to/cuda-graphs.md",
+      "reason": "End-user workflow retained in the current grouped documentation."
+    },
+    {
+      "source": "old_docs/docs_v1/custom-execution-plan.md",
+      "disposition": "merged",
+      "destination": "how-to/engine-knobs.md#build-a-custom-plan",
+      "reason": "End-user workflow retained in the current grouped documentation."
+    },
+    {
+      "source": "old_docs/docs_v1/deviceless-ahead-of-time-compilation.md",
+      "disposition": "merged",
+      "destination": "how-to/deployment.md#run-the-three-stage-deviceless-flow",
+      "reason": "End-user workflow retained in the current grouped documentation."
+    },
+    {
+      "source": "old_docs/docs_v1/dynamic-kernel-cache.md",
+      "disposition": "merged",
+      "destination": "how-to/dynamic-shapes.md#query-runtime-workspace-before-allocation",
+      "reason": "End-user workflow retained in the current grouped documentation."
+    },
+    {
+      "source": "old_docs/docs_v1/fe-oss-apis/attention/sdpa_bwd_d256.md",
+      "disposition": "merged",
+      "destination": "reference/oss-sdpa-d256.md#sdpa_bwd_wrapper_sm100_d256",
+      "reason": "Current API-local contract and support constraints are retained in the corresponding OSS family guide."
+    },
+    {
+      "source": "old_docs/docs_v1/fe-oss-apis/attention/sdpa_fwd_d256.md",
+      "disposition": "merged",
+      "destination": "reference/oss-sdpa-d256.md#sdpa_fwd_wrapper_sm100_d256",
+      "reason": "Current API-local contract and support constraints are retained in the corresponding OSS family guide."
+    },
+    {
+      "source": "old_docs/docs_v1/fe-oss-apis/bsa.md",
+      "disposition": "merged",
+      "destination": "reference/oss-block-sparse-attention.md",
+      "reason": "Current API-local contract and support constraints are retained in the corresponding OSS family guide."
+    },
+    {
+      "source": "old_docs/docs_v1/fe-oss-apis/dsa.md",
+      "disposition": "merged",
+      "destination": "reference/oss-deepseek-sparse-attention.md",
+      "reason": "Current API-local contract and support constraints are retained in the corresponding OSS family guide."
+    },
+    {
+      "source": "old_docs/docs_v1/fe-oss-apis/gemm_fusions/discrete_grouped_gemm_dswiglu.md",
+      "disposition": "merged",
+      "destination": "reference/oss-discrete-grouped-gemm.md#discrete_grouped_gemm_dswiglu_wrapper_sm100",
+      "reason": "Current API-local contract and support constraints are retained in the corresponding OSS family guide."
+    },
+    {
+      "source": "old_docs/docs_v1/fe-oss-apis/gemm_fusions/discrete_grouped_gemm_swiglu.md",
+      "disposition": "merged",
+      "destination": "reference/oss-discrete-grouped-gemm.md#discrete_grouped_gemm_swiglu_wrapper_sm100",
+      "reason": "Current API-local contract and support constraints are retained in the corresponding OSS family guide."
+    },
+    {
+      "source": "old_docs/docs_v1/fe-oss-apis/gemm_fusions/gemm_amax.md",
+      "disposition": "merged",
+      "destination": "reference/oss-dense-gemm.md#gemm_amax_wrapper_sm100",
+      "reason": "Current API-local contract and support constraints are retained in the corresponding OSS family guide."
+    },
+    {
+      "source": "old_docs/docs_v1/fe-oss-apis/gemm_fusions/gemm_dsrelu.md",
+      "disposition": "merged",
+      "destination": "reference/oss-dense-gemm.md#gemm_dsrelu_wrapper_sm100",
+      "reason": "Current API-local contract and support constraints are retained in the corresponding OSS family guide."
+    },
+    {
+      "source": "old_docs/docs_v1/fe-oss-apis/gemm_fusions/gemm_proj_rope_mxfp8.md",
+      "disposition": "merged",
+      "destination": "reference/oss-dense-gemm.md#gemm_proj_rope_mxfp8_wrapper_sm100",
+      "reason": "Current API-local contract and support constraints are retained in the corresponding OSS family guide."
+    },
+    {
+      "source": "old_docs/docs_v1/fe-oss-apis/gemm_fusions/gemm_srelu.md",
+      "disposition": "merged",
+      "destination": "reference/oss-dense-gemm.md#gemm_srelu_wrapper_sm100",
+      "reason": "Current API-local contract and support constraints are retained in the corresponding OSS family guide."
+    },
+    {
+      "source": "old_docs/docs_v1/fe-oss-apis/gemm_fusions/gemm_swiglu.md",
+      "disposition": "merged",
+      "destination": "reference/oss-dense-gemm.md#gemm_swiglu_wrapper_sm100",
+      "reason": "Current API-local contract and support constraints are retained in the corresponding OSS family guide."
+    },
+    {
+      "source": "old_docs/docs_v1/fe-oss-apis/gemm_fusions/grouped_gemm_dglu.md",
+      "disposition": "merged",
+      "destination": "reference/oss-grouped-gemm.md#grouped_gemm_dglu_wrapper_sm100",
+      "reason": "Current API-local contract and support constraints are retained in the corresponding OSS family guide."
+    },
+    {
+      "source": "old_docs/docs_v1/fe-oss-apis/gemm_fusions/grouped_gemm_dsrelu.md",
+      "disposition": "merged",
+      "destination": "reference/oss-grouped-gemm.md#grouped_gemm_dsrelu_wrapper_sm100",
+      "reason": "Current API-local contract and support constraints are retained in the corresponding OSS family guide."
+    },
+    {
+      "source": "old_docs/docs_v1/fe-oss-apis/gemm_fusions/grouped_gemm_dswiglu.md",
+      "disposition": "merged",
+      "destination": "reference/oss-grouped-gemm.md#grouped_gemm_dswiglu_wrapper_sm100",
+      "reason": "Current API-local contract and support constraints are retained in the corresponding OSS family guide."
+    },
+    {
+      "source": "old_docs/docs_v1/fe-oss-apis/gemm_fusions/grouped_gemm_glu.md",
+      "disposition": "merged",
+      "destination": "reference/oss-grouped-gemm.md#grouped_gemm_glu_wrapper_sm100",
+      "reason": "Current API-local contract and support constraints are retained in the corresponding OSS family guide."
+    },
+    {
+      "source": "old_docs/docs_v1/fe-oss-apis/gemm_fusions/grouped_gemm_glu_hadamard.md",
+      "disposition": "merged",
+      "destination": "reference/oss-grouped-gemm.md#grouped_gemm_glu_hadamard_wrapper_sm100",
+      "reason": "Current API-local contract and support constraints are retained in the corresponding OSS family guide."
+    },
+    {
+      "source": "old_docs/docs_v1/fe-oss-apis/gemm_fusions/grouped_gemm_quant.md",
+      "disposition": "merged",
+      "destination": "reference/oss-grouped-gemm.md#grouped_gemm_quant_wrapper_sm100",
+      "reason": "Current API-local contract and support constraints are retained in the corresponding OSS family guide."
+    },
+    {
+      "source": "old_docs/docs_v1/fe-oss-apis/gemm_fusions/grouped_gemm_quant_unified.md",
+      "disposition": "merged",
+      "destination": "reference/oss-grouped-gemm.md#grouped_gemm_quant_wrapper_sm100",
+      "reason": "The old unified entry point is covered by the current grouped_gemm_quant wrapper contract."
+    },
+    {
+      "source": "old_docs/docs_v1/fe-oss-apis/gemm_fusions/grouped_gemm_srelu.md",
+      "disposition": "merged",
+      "destination": "reference/oss-grouped-gemm.md#grouped_gemm_srelu_wrapper_sm100",
+      "reason": "Current API-local contract and support constraints are retained in the corresponding OSS family guide."
+    },
+    {
+      "source": "old_docs/docs_v1/fe-oss-apis/gemm_fusions/grouped_gemm_swiglu.md",
+      "disposition": "merged",
+      "destination": "reference/oss-grouped-gemm.md#grouped_gemm_swiglu_wrapper_sm100",
+      "reason": "Current API-local contract and support constraints are retained in the corresponding OSS family guide."
+    },
+    {
+      "source": "old_docs/docs_v1/fe-oss-apis/gemm_fusions/grouped_gemm_wgrad.md",
+      "disposition": "merged",
+      "destination": "reference/oss-grouped-gemm.md#grouped_gemm_wgrad_wrapper_sm100",
+      "reason": "Current API-local contract and support constraints are retained in the corresponding OSS family guide."
+    },
+    {
+      "source": "old_docs/docs_v1/fe-oss-apis/nsa.md",
+      "disposition": "merged",
+      "destination": "reference/oss-native-sparse-attention.md",
+      "reason": "Current API-local contract and support constraints are retained in the corresponding OSS family guide."
+    },
+    {
+      "source": "old_docs/docs_v1/fe-oss-apis/overview.md",
+      "disposition": "merged",
+      "destination": "reference/oss-engines.md",
+      "reason": "Current API-local contract and support constraints are retained in the corresponding OSS family guide."
+    },
+    {
+      "source": "old_docs/docs_v1/fe-oss-apis/rmsnorm_rht_amax.md",
+      "disposition": "merged",
+      "destination": "reference/oss-normalization.md#rmsnorm_rht_amax_wrapper_sm100",
+      "reason": "Current API-local contract and support constraints are retained in the corresponding OSS family guide."
+    },
+    {
+      "source": "old_docs/docs_v1/fe-oss-apis/rmsnorm_silu.md",
+      "disposition": "merged",
+      "destination": "reference/oss-normalization.md#run-the-rmsnorm-silu-graph-fusion",
+      "reason": "The former standalone name is mapped to the current Graph-pattern OSS engine and its execution constraints."
+    },
+    {
+      "source": "old_docs/docs_v1/operations/Attention.md",
+      "disposition": "merged",
+      "destination": "concepts/attention-support-history.md",
+      "reason": "Operation-family guidance moved to the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v1/operations/BlockScaling.md",
+      "disposition": "merged",
+      "destination": "tutorials/block-scaling.md",
+      "reason": "Operation-family guidance moved to the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v1/operations/CausalConv1d.md",
+      "disposition": "merged",
+      "destination": "how-to/causal-convolution.md",
+      "reason": "Operation-family guidance moved to the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v1/operations/Concatenate.md",
+      "disposition": "merged",
+      "destination": "how-to/shape-operations.md#concatenate",
+      "reason": "Operation-family guidance moved to the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v1/operations/Convolutions.md",
+      "disposition": "merged",
+      "destination": "tutorials/convolution.md",
+      "reason": "Operation-family guidance moved to the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v1/operations/Matmul.md",
+      "disposition": "merged",
+      "destination": "how-to/matmul-layouts.md",
+      "reason": "Operation-family guidance moved to the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v1/operations/MoeGroupedMatmul.md",
+      "disposition": "merged",
+      "destination": "tutorials/moe-grouped-matmul.md",
+      "reason": "Operation-family guidance moved to the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v1/operations/Normalizations.md",
+      "disposition": "merged",
+      "destination": "tutorials/normalization.md",
+      "reason": "Operation-family guidance moved to the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v1/operations/Pointwise.md",
+      "disposition": "merged",
+      "destination": "tutorials/pointwise-reduction.md",
+      "reason": "Operation-family guidance moved to the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v1/operations/Resampling.md",
+      "disposition": "merged",
+      "destination": "how-to/resampling.md",
+      "reason": "Operation-family guidance moved to the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v1/operations/Reshape.md",
+      "disposition": "merged",
+      "destination": "how-to/shape-operations.md#reshape",
+      "reason": "Operation-family guidance moved to the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v1/operations/RoPE.md",
+      "disposition": "merged",
+      "destination": "how-to/rope.md",
+      "reason": "Operation-family guidance moved to the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v1/operations/Slice.md",
+      "disposition": "merged",
+      "destination": "how-to/shape-operations.md#slice",
+      "reason": "Operation-family guidance moved to the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v1/operations/Transpose.md",
+      "disposition": "merged",
+      "destination": "how-to/shape-operations.md#transpose",
+      "reason": "Operation-family guidance moved to the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v1/python_graph_and_execution_backends.md",
+      "disposition": "merged",
+      "destination": "concepts/python-ir-routing.md",
+      "reason": "Python graph routing, plan spaces, UID ownership, and backend selection moved to a dedicated concepts page."
+    },
+    {
+      "source": "old_docs/docs_v2/api/SKILLS.md",
+      "disposition": "excluded",
+      "destination": null,
+      "reason": "Internal authoring instructions, not user documentation."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/abs.md",
+      "disposition": "retained",
+      "destination": "api/cpp/abs.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/adalayernorm.md",
+      "disposition": "retained",
+      "destination": "api/cpp/adalayernorm.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/adalayernorm_backward.md",
+      "disposition": "retained",
+      "destination": "api/cpp/adalayernorm_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/add.md",
+      "disposition": "retained",
+      "destination": "api/cpp/add.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/add_square.md",
+      "disposition": "retained",
+      "destination": "api/cpp/add_square.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/apply_oss_slot_indices_to_plans.md",
+      "disposition": "retained",
+      "destination": "api/cpp/apply_oss_slot_indices_to_plans.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/autotune.md",
+      "disposition": "retained",
+      "destination": "api/cpp/autotune.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/batchnorm.md",
+      "disposition": "retained",
+      "destination": "api/cpp/batchnorm.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/batchnorm_backward.md",
+      "disposition": "retained",
+      "destination": "api/cpp/batchnorm_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/batchnorm_inference.md",
+      "disposition": "retained",
+      "destination": "api/cpp/batchnorm_inference.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/bias.md",
+      "disposition": "retained",
+      "destination": "api/cpp/bias.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/binary_select.md",
+      "disposition": "retained",
+      "destination": "api/cpp/binary_select.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/block_scale_dequantize.md",
+      "disposition": "retained",
+      "destination": "api/cpp/block_scale_dequantize.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/block_scale_quantize.md",
+      "disposition": "retained",
+      "destination": "api/cpp/block_scale_quantize.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/bn_finalize.md",
+      "disposition": "retained",
+      "destination": "api/cpp/bn_finalize.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/build.md",
+      "disposition": "retained",
+      "destination": "api/cpp/build.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/build_operation_graph.md",
+      "disposition": "retained",
+      "destination": "api/cpp/build_operation_graph.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/build_plan_at_index.md",
+      "disposition": "retained",
+      "destination": "api/cpp/build_plan_at_index.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/build_plans.md",
+      "disposition": "retained",
+      "destination": "api/cpp/build_plans.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/ceil.md",
+      "disposition": "retained",
+      "destination": "api/cpp/ceil.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/check_support.md",
+      "disposition": "retained",
+      "destination": "api/cpp/check_support.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/cmp_eq.md",
+      "disposition": "retained",
+      "destination": "api/cpp/cmp_eq.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/cmp_ge.md",
+      "disposition": "retained",
+      "destination": "api/cpp/cmp_ge.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/cmp_gt.md",
+      "disposition": "retained",
+      "destination": "api/cpp/cmp_gt.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/cmp_le.md",
+      "disposition": "retained",
+      "destination": "api/cpp/cmp_le.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/cmp_lt.md",
+      "disposition": "retained",
+      "destination": "api/cpp/cmp_lt.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/cmp_neq.md",
+      "disposition": "retained",
+      "destination": "api/cpp/cmp_neq.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/concatenate.md",
+      "disposition": "retained",
+      "destination": "api/cpp/concatenate.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/conv_dgrad.md",
+      "disposition": "retained",
+      "destination": "api/cpp/conv_dgrad.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/conv_fprop.md",
+      "disposition": "retained",
+      "destination": "api/cpp/conv_fprop.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/conv_wgrad.md",
+      "disposition": "retained",
+      "destination": "api/cpp/conv_wgrad.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/cos.md",
+      "disposition": "retained",
+      "destination": "api/cpp/cos.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/create_execution_plan.md",
+      "disposition": "retained",
+      "destination": "api/cpp/create_execution_plan.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/create_execution_plans.md",
+      "disposition": "retained",
+      "destination": "api/cpp/create_execution_plans.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/dbn_weight.md",
+      "disposition": "retained",
+      "destination": "api/cpp/dbn_weight.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/deselect_behavior_notes.md",
+      "disposition": "retained",
+      "destination": "api/cpp/deselect_behavior_notes.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/deselect_engines.md",
+      "disposition": "retained",
+      "destination": "api/cpp/deselect_engines.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/deselect_numeric_notes.md",
+      "disposition": "retained",
+      "destination": "api/cpp/deselect_numeric_notes.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/deselect_shared_mem_greater_than.md",
+      "disposition": "retained",
+      "destination": "api/cpp/deselect_shared_mem_greater_than.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/deselect_workspace_greater_than.md",
+      "disposition": "retained",
+      "destination": "api/cpp/deselect_workspace_greater_than.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/deserialize.md",
+      "disposition": "retained",
+      "destination": "api/cpp/deserialize.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/diagonal_band_mask.md",
+      "disposition": "retained",
+      "destination": "api/cpp/diagonal_band_mask.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/div.md",
+      "disposition": "retained",
+      "destination": "api/cpp/div.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/elu.md",
+      "disposition": "retained",
+      "destination": "api/cpp/elu.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/elu_backward.md",
+      "disposition": "retained",
+      "destination": "api/cpp/elu_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/erf.md",
+      "disposition": "retained",
+      "destination": "api/cpp/erf.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/estimate_run_times.md",
+      "disposition": "retained",
+      "destination": "api/cpp/estimate_run_times.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/execute.md",
+      "disposition": "retained",
+      "destination": "api/cpp/execute.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/execute_plan_at_index.md",
+      "disposition": "retained",
+      "destination": "api/cpp/execute_plan_at_index.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/exp.md",
+      "disposition": "retained",
+      "destination": "api/cpp/exp.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/floor.md",
+      "disposition": "retained",
+      "destination": "api/cpp/floor.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/gelu.md",
+      "disposition": "retained",
+      "destination": "api/cpp/gelu.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/gelu_approx_tanh.md",
+      "disposition": "retained",
+      "destination": "api/cpp/gelu_approx_tanh.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/gelu_approx_tanh_backward.md",
+      "disposition": "retained",
+      "destination": "api/cpp/gelu_approx_tanh_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/gelu_backward.md",
+      "disposition": "retained",
+      "destination": "api/cpp/gelu_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/gen_index.md",
+      "disposition": "retained",
+      "destination": "api/cpp/gen_index.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/genstats.md",
+      "disposition": "retained",
+      "destination": "api/cpp/genstats.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/get_autotune_workspace_size.md",
+      "disposition": "retained",
+      "destination": "api/cpp/get_autotune_workspace_size.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/get_behavior_notes.md",
+      "disposition": "retained",
+      "destination": "api/cpp/get_behavior_notes.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/get_behavior_notes_for_plan_at_index.md",
+      "disposition": "retained",
+      "destination": "api/cpp/get_behavior_notes_for_plan_at_index.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/get_engine_count.md",
+      "disposition": "retained",
+      "destination": "api/cpp/get_engine_count.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/get_execution_plan_count.md",
+      "disposition": "retained",
+      "destination": "api/cpp/get_execution_plan_count.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/get_knobs_for_engine.md",
+      "disposition": "retained",
+      "destination": "api/cpp/get_knobs_for_engine.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/get_plan_name.md",
+      "disposition": "retained",
+      "destination": "api/cpp/get_plan_name.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/get_plan_name_at_index.md",
+      "disposition": "retained",
+      "destination": "api/cpp/get_plan_name_at_index.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/get_variant_pack_uids_sorted.md",
+      "disposition": "retained",
+      "destination": "api/cpp/get_variant_pack_uids_sorted.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/get_workspace_size.md",
+      "disposition": "retained",
+      "destination": "api/cpp/get_workspace_size.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/get_workspace_size_plan_at_index.md",
+      "disposition": "retained",
+      "destination": "api/cpp/get_workspace_size_plan_at_index.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/identity.md",
+      "disposition": "retained",
+      "destination": "api/cpp/identity.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/index.md",
+      "disposition": "retained",
+      "destination": "api/cpp/index.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/instancenorm.md",
+      "disposition": "retained",
+      "destination": "api/cpp/instancenorm.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/instancenorm_backward.md",
+      "disposition": "retained",
+      "destination": "api/cpp/instancenorm_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/key.md",
+      "disposition": "retained",
+      "destination": "api/cpp/key.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/layernorm.md",
+      "disposition": "retained",
+      "destination": "api/cpp/layernorm.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/layernorm_backward.md",
+      "disposition": "retained",
+      "destination": "api/cpp/layernorm_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/leaky_relu.md",
+      "disposition": "retained",
+      "destination": "api/cpp/leaky_relu.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/leaky_relu_backward.md",
+      "disposition": "retained",
+      "destination": "api/cpp/leaky_relu_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/log.md",
+      "disposition": "retained",
+      "destination": "api/cpp/log.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/logical_and.md",
+      "disposition": "retained",
+      "destination": "api/cpp/logical_and.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/logical_not.md",
+      "disposition": "retained",
+      "destination": "api/cpp/logical_not.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/logical_or.md",
+      "disposition": "retained",
+      "destination": "api/cpp/logical_or.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/matmul.md",
+      "disposition": "retained",
+      "destination": "api/cpp/matmul.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/max.md",
+      "disposition": "retained",
+      "destination": "api/cpp/max.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/min.md",
+      "disposition": "retained",
+      "destination": "api/cpp/min.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/mod.md",
+      "disposition": "retained",
+      "destination": "api/cpp/mod.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/moe_grouped_matmul.md",
+      "disposition": "retained",
+      "destination": "api/cpp/moe_grouped_matmul.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/moe_grouped_matmul_bwd.md",
+      "disposition": "retained",
+      "destination": "api/cpp/moe_grouped_matmul_bwd.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/mul.md",
+      "disposition": "retained",
+      "destination": "api/cpp/mul.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/neg.md",
+      "disposition": "retained",
+      "destination": "api/cpp/neg.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/populate_cuda_graph.md",
+      "disposition": "retained",
+      "destination": "api/cpp/populate_cuda_graph.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/pow.md",
+      "disposition": "retained",
+      "destination": "api/cpp/pow.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/prepare_variant_pack_template.md",
+      "disposition": "retained",
+      "destination": "api/cpp/prepare_variant_pack_template.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/print.md",
+      "disposition": "retained",
+      "destination": "api/cpp/print.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/query_tensor_attributes_of_uid.md",
+      "disposition": "retained",
+      "destination": "api/cpp/query_tensor_attributes_of_uid.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/reciprocal.md",
+      "disposition": "retained",
+      "destination": "api/cpp/reciprocal.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/reduction.md",
+      "disposition": "retained",
+      "destination": "api/cpp/reduction.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/relu.md",
+      "disposition": "retained",
+      "destination": "api/cpp/relu.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/relu_backward.md",
+      "disposition": "retained",
+      "destination": "api/cpp/relu_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/resample.md",
+      "disposition": "retained",
+      "destination": "api/cpp/resample.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/reshape.md",
+      "disposition": "retained",
+      "destination": "api/cpp/reshape.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/rmsnorm.md",
+      "disposition": "retained",
+      "destination": "api/cpp/rmsnorm.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/rmsnorm_backward.md",
+      "disposition": "retained",
+      "destination": "api/cpp/rmsnorm_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/rng.md",
+      "disposition": "retained",
+      "destination": "api/cpp/rng.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/rope.md",
+      "disposition": "retained",
+      "destination": "api/cpp/rope.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/rope_backward.md",
+      "disposition": "retained",
+      "destination": "api/cpp/rope_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/rsqrt.md",
+      "disposition": "retained",
+      "destination": "api/cpp/rsqrt.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/scale.md",
+      "disposition": "retained",
+      "destination": "api/cpp/scale.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/sdpa.md",
+      "disposition": "retained",
+      "destination": "api/cpp/sdpa.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/sdpa_backward.md",
+      "disposition": "retained",
+      "destination": "api/cpp/sdpa_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/sdpa_fp8.md",
+      "disposition": "retained",
+      "destination": "api/cpp/sdpa_fp8.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/sdpa_fp8_backward.md",
+      "disposition": "retained",
+      "destination": "api/cpp/sdpa_fp8_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/sdpa_mxfp8.md",
+      "disposition": "retained",
+      "destination": "api/cpp/sdpa_mxfp8.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/sdpa_mxfp8_backward.md",
+      "disposition": "retained",
+      "destination": "api/cpp/sdpa_mxfp8_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/select_behavior_notes.md",
+      "disposition": "retained",
+      "destination": "api/cpp/select_behavior_notes.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/select_numeric_notes.md",
+      "disposition": "retained",
+      "destination": "api/cpp/select_numeric_notes.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/serialize.md",
+      "disposition": "retained",
+      "destination": "api/cpp/serialize.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/set_compute_data_type.md",
+      "disposition": "retained",
+      "destination": "api/cpp/set_compute_data_type.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/set_device_properties.md",
+      "disposition": "retained",
+      "destination": "api/cpp/set_device_properties.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/set_dynamic_shape_enabled.md",
+      "disposition": "retained",
+      "destination": "api/cpp/set_dynamic_shape_enabled.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/set_intermediate_data_type.md",
+      "disposition": "retained",
+      "destination": "api/cpp/set_intermediate_data_type.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/set_io_data_type.md",
+      "disposition": "retained",
+      "destination": "api/cpp/set_io_data_type.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/set_kernel_cache.md",
+      "disposition": "retained",
+      "destination": "api/cpp/set_kernel_cache.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/set_name.md",
+      "disposition": "retained",
+      "destination": "api/cpp/set_name.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/set_override_shape_enabled.md",
+      "disposition": "retained",
+      "destination": "api/cpp/set_override_shape_enabled.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/set_sm_count.md",
+      "disposition": "retained",
+      "destination": "api/cpp/set_sm_count.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/set_sm_version.md",
+      "disposition": "retained",
+      "destination": "api/cpp/set_sm_version.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/sigmoid.md",
+      "disposition": "retained",
+      "destination": "api/cpp/sigmoid.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/sigmoid_backward.md",
+      "disposition": "retained",
+      "destination": "api/cpp/sigmoid_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/sin.md",
+      "disposition": "retained",
+      "destination": "api/cpp/sin.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/slice.md",
+      "disposition": "retained",
+      "destination": "api/cpp/slice.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/softplus.md",
+      "disposition": "retained",
+      "destination": "api/cpp/softplus.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/softplus_backward.md",
+      "disposition": "retained",
+      "destination": "api/cpp/softplus_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/sqrt.md",
+      "disposition": "retained",
+      "destination": "api/cpp/sqrt.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/sub.md",
+      "disposition": "retained",
+      "destination": "api/cpp/sub.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/swish.md",
+      "disposition": "retained",
+      "destination": "api/cpp/swish.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/swish_backward.md",
+      "disposition": "retained",
+      "destination": "api/cpp/swish_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/tan.md",
+      "disposition": "retained",
+      "destination": "api/cpp/tan.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/tanh.md",
+      "disposition": "retained",
+      "destination": "api/cpp/tanh.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/tanh_backward.md",
+      "disposition": "retained",
+      "destination": "api/cpp/tanh_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/tensor.md",
+      "disposition": "retained",
+      "destination": "api/cpp/tensor.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/tensor_like.md",
+      "disposition": "retained",
+      "destination": "api/cpp/tensor_like.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/tensor_scalar.md",
+      "disposition": "retained",
+      "destination": "api/cpp/tensor_scalar.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/transpose.md",
+      "disposition": "retained",
+      "destination": "api/cpp/transpose.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/update_cuda_graph.md",
+      "disposition": "retained",
+      "destination": "api/cpp/update_cuda_graph.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/validate.md",
+      "disposition": "retained",
+      "destination": "api/cpp/validate.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/cpp/warmup.md",
+      "disposition": "retained",
+      "destination": "api/cpp/warmup.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/abs.md",
+      "disposition": "retained",
+      "destination": "api/python/abs.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/adalayernorm.md",
+      "disposition": "retained",
+      "destination": "api/python/adalayernorm.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/adalayernorm_backward.md",
+      "disposition": "retained",
+      "destination": "api/python/adalayernorm_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/add.md",
+      "disposition": "retained",
+      "destination": "api/python/add.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/add_square.md",
+      "disposition": "retained",
+      "destination": "api/python/add_square.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/batchnorm.md",
+      "disposition": "retained",
+      "destination": "api/python/batchnorm.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/batchnorm_backward.md",
+      "disposition": "retained",
+      "destination": "api/python/batchnorm_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/batchnorm_inference.md",
+      "disposition": "retained",
+      "destination": "api/python/batchnorm_inference.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/bias.md",
+      "disposition": "retained",
+      "destination": "api/python/bias.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/binary_select.md",
+      "disposition": "retained",
+      "destination": "api/python/binary_select.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/block_scale_dequantize.md",
+      "disposition": "retained",
+      "destination": "api/python/block_scale_dequantize.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/block_scale_quantize.md",
+      "disposition": "retained",
+      "destination": "api/python/block_scale_quantize.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/build.md",
+      "disposition": "retained",
+      "destination": "api/python/build.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/build_operation_graph.md",
+      "disposition": "retained",
+      "destination": "api/python/build_operation_graph.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/build_plan_at_index.md",
+      "disposition": "retained",
+      "destination": "api/python/build_plan_at_index.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/build_plans.md",
+      "disposition": "retained",
+      "destination": "api/python/build_plans.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/ceil.md",
+      "disposition": "retained",
+      "destination": "api/python/ceil.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/check_support.md",
+      "disposition": "retained",
+      "destination": "api/python/check_support.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/cmp_eq.md",
+      "disposition": "retained",
+      "destination": "api/python/cmp_eq.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/cmp_ge.md",
+      "disposition": "retained",
+      "destination": "api/python/cmp_ge.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/cmp_gt.md",
+      "disposition": "retained",
+      "destination": "api/python/cmp_gt.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/cmp_le.md",
+      "disposition": "retained",
+      "destination": "api/python/cmp_le.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/cmp_lt.md",
+      "disposition": "retained",
+      "destination": "api/python/cmp_lt.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/cmp_neq.md",
+      "disposition": "retained",
+      "destination": "api/python/cmp_neq.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/concatenate.md",
+      "disposition": "retained",
+      "destination": "api/python/concatenate.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/conv_dgrad.md",
+      "disposition": "retained",
+      "destination": "api/python/conv_dgrad.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/conv_fprop.md",
+      "disposition": "retained",
+      "destination": "api/python/conv_fprop.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/conv_wgrad.md",
+      "disposition": "retained",
+      "destination": "api/python/conv_wgrad.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/cos.md",
+      "disposition": "retained",
+      "destination": "api/python/cos.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/create_execution_plan.md",
+      "disposition": "retained",
+      "destination": "api/python/create_execution_plan.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/create_execution_plans.md",
+      "disposition": "retained",
+      "destination": "api/python/create_execution_plans.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/deselect_behavior_notes.md",
+      "disposition": "retained",
+      "destination": "api/python/deselect_behavior_notes.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/deselect_engines.md",
+      "disposition": "retained",
+      "destination": "api/python/deselect_engines.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/deselect_numeric_notes.md",
+      "disposition": "retained",
+      "destination": "api/python/deselect_numeric_notes.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/deselect_workspace_greater_than.md",
+      "disposition": "retained",
+      "destination": "api/python/deselect_workspace_greater_than.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/deserialize.md",
+      "disposition": "retained",
+      "destination": "api/python/deserialize.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/div.md",
+      "disposition": "retained",
+      "destination": "api/python/div.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/elu.md",
+      "disposition": "retained",
+      "destination": "api/python/elu.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/elu_backward.md",
+      "disposition": "retained",
+      "destination": "api/python/elu_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/erf.md",
+      "disposition": "retained",
+      "destination": "api/python/erf.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/estimate_run_times.md",
+      "disposition": "retained",
+      "destination": "api/python/estimate_run_times.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/execute.md",
+      "disposition": "retained",
+      "destination": "api/python/execute.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/execute_plan_at_index.md",
+      "disposition": "retained",
+      "destination": "api/python/execute_plan_at_index.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/exp.md",
+      "disposition": "retained",
+      "destination": "api/python/exp.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/floor.md",
+      "disposition": "retained",
+      "destination": "api/python/floor.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/gelu.md",
+      "disposition": "retained",
+      "destination": "api/python/gelu.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/gelu_approx_tanh.md",
+      "disposition": "retained",
+      "destination": "api/python/gelu_approx_tanh.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/gelu_approx_tanh_backward.md",
+      "disposition": "retained",
+      "destination": "api/python/gelu_approx_tanh_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/gelu_backward.md",
+      "disposition": "retained",
+      "destination": "api/python/gelu_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/gen_index.md",
+      "disposition": "retained",
+      "destination": "api/python/gen_index.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/genstats.md",
+      "disposition": "retained",
+      "destination": "api/python/genstats.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/get_behavior_notes.md",
+      "disposition": "retained",
+      "destination": "api/python/get_behavior_notes.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/get_behavior_notes_for_plan_at_index.md",
+      "disposition": "retained",
+      "destination": "api/python/get_behavior_notes_for_plan_at_index.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/get_engine_count.md",
+      "disposition": "retained",
+      "destination": "api/python/get_engine_count.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/get_execution_plan_count.md",
+      "disposition": "retained",
+      "destination": "api/python/get_execution_plan_count.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/get_knobs_for_engine.md",
+      "disposition": "retained",
+      "destination": "api/python/get_knobs_for_engine.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/get_plan_name_at_index.md",
+      "disposition": "retained",
+      "destination": "api/python/get_plan_name_at_index.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/get_workspace_size.md",
+      "disposition": "retained",
+      "destination": "api/python/get_workspace_size.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/get_workspace_size_plan_at_index.md",
+      "disposition": "retained",
+      "destination": "api/python/get_workspace_size_plan_at_index.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/identity.md",
+      "disposition": "retained",
+      "destination": "api/python/identity.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/index.md",
+      "disposition": "retained",
+      "destination": "api/python/index.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/instancenorm.md",
+      "disposition": "retained",
+      "destination": "api/python/instancenorm.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/instancenorm_backward.md",
+      "disposition": "retained",
+      "destination": "api/python/instancenorm_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/key.md",
+      "disposition": "retained",
+      "destination": "api/python/key.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/layernorm.md",
+      "disposition": "retained",
+      "destination": "api/python/layernorm.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/layernorm_backward.md",
+      "disposition": "retained",
+      "destination": "api/python/layernorm_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/leaky_relu.md",
+      "disposition": "retained",
+      "destination": "api/python/leaky_relu.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/leaky_relu_backward.md",
+      "disposition": "retained",
+      "destination": "api/python/leaky_relu_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/log.md",
+      "disposition": "retained",
+      "destination": "api/python/log.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/logical_and.md",
+      "disposition": "retained",
+      "destination": "api/python/logical_and.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/logical_not.md",
+      "disposition": "retained",
+      "destination": "api/python/logical_not.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/logical_or.md",
+      "disposition": "retained",
+      "destination": "api/python/logical_or.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/matmul.md",
+      "disposition": "retained",
+      "destination": "api/python/matmul.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/max.md",
+      "disposition": "retained",
+      "destination": "api/python/max.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/min.md",
+      "disposition": "retained",
+      "destination": "api/python/min.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/mod.md",
+      "disposition": "retained",
+      "destination": "api/python/mod.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/moe_grouped_matmul.md",
+      "disposition": "retained",
+      "destination": "api/python/moe_grouped_matmul.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/moe_grouped_matmul_bwd.md",
+      "disposition": "retained",
+      "destination": "api/python/moe_grouped_matmul_bwd.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/mul.md",
+      "disposition": "retained",
+      "destination": "api/python/mul.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/neg.md",
+      "disposition": "retained",
+      "destination": "api/python/neg.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/populate_cuda_graph.md",
+      "disposition": "retained",
+      "destination": "api/python/populate_cuda_graph.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/pow.md",
+      "disposition": "retained",
+      "destination": "api/python/pow.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/query_tensor_attributes_of_uid.md",
+      "disposition": "retained",
+      "destination": "api/python/query_tensor_attributes_of_uid.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/reciprocal.md",
+      "disposition": "retained",
+      "destination": "api/python/reciprocal.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/reduction.md",
+      "disposition": "retained",
+      "destination": "api/python/reduction.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/relu.md",
+      "disposition": "retained",
+      "destination": "api/python/relu.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/relu_backward.md",
+      "disposition": "retained",
+      "destination": "api/python/relu_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/reshape.md",
+      "disposition": "retained",
+      "destination": "api/python/reshape.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/rmsnorm.md",
+      "disposition": "retained",
+      "destination": "api/python/rmsnorm.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/rmsnorm_backward.md",
+      "disposition": "retained",
+      "destination": "api/python/rmsnorm_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/rope.md",
+      "disposition": "retained",
+      "destination": "api/python/rope.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/rope_backward.md",
+      "disposition": "retained",
+      "destination": "api/python/rope_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/rsqrt.md",
+      "disposition": "retained",
+      "destination": "api/python/rsqrt.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/scale.md",
+      "disposition": "retained",
+      "destination": "api/python/scale.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/sdpa.md",
+      "disposition": "retained",
+      "destination": "api/python/sdpa.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/sdpa_backward.md",
+      "disposition": "retained",
+      "destination": "api/python/sdpa_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/sdpa_fp8.md",
+      "disposition": "retained",
+      "destination": "api/python/sdpa_fp8.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/sdpa_fp8_backward.md",
+      "disposition": "retained",
+      "destination": "api/python/sdpa_fp8_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/sdpa_mxfp8.md",
+      "disposition": "retained",
+      "destination": "api/python/sdpa_mxfp8.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/sdpa_mxfp8_backward.md",
+      "disposition": "retained",
+      "destination": "api/python/sdpa_mxfp8_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/select_behavior_notes.md",
+      "disposition": "retained",
+      "destination": "api/python/select_behavior_notes.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/select_numeric_notes.md",
+      "disposition": "retained",
+      "destination": "api/python/select_numeric_notes.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/serialize.md",
+      "disposition": "retained",
+      "destination": "api/python/serialize.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/sigmoid.md",
+      "disposition": "retained",
+      "destination": "api/python/sigmoid.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/sigmoid_backward.md",
+      "disposition": "retained",
+      "destination": "api/python/sigmoid_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/sin.md",
+      "disposition": "retained",
+      "destination": "api/python/sin.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/slice.md",
+      "disposition": "retained",
+      "destination": "api/python/slice.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/softplus.md",
+      "disposition": "retained",
+      "destination": "api/python/softplus.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/softplus_backward.md",
+      "disposition": "retained",
+      "destination": "api/python/softplus_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/sqrt.md",
+      "disposition": "retained",
+      "destination": "api/python/sqrt.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/sub.md",
+      "disposition": "retained",
+      "destination": "api/python/sub.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/swish.md",
+      "disposition": "retained",
+      "destination": "api/python/swish.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/swish_backward.md",
+      "disposition": "retained",
+      "destination": "api/python/swish_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/tan.md",
+      "disposition": "retained",
+      "destination": "api/python/tan.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/tanh.md",
+      "disposition": "retained",
+      "destination": "api/python/tanh.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/tanh_backward.md",
+      "disposition": "retained",
+      "destination": "api/python/tanh_backward.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/tensor.md",
+      "disposition": "retained",
+      "destination": "api/python/tensor.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/tensor_like.md",
+      "disposition": "retained",
+      "destination": "api/python/tensor_like.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/tensor_scalar.md",
+      "disposition": "retained",
+      "destination": "api/python/tensor_scalar.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/transpose.md",
+      "disposition": "retained",
+      "destination": "api/python/transpose.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/update_cuda_graph.md",
+      "disposition": "retained",
+      "destination": "api/python/update_cuda_graph.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/python/validate.md",
+      "disposition": "retained",
+      "destination": "api/python/validate.md",
+      "reason": "Per-call contract retained and reconciled against current declarations."
+    },
+    {
+      "source": "old_docs/docs_v2/api/samples.md",
+      "disposition": "merged",
+      "destination": "samples/index.md",
+      "reason": "Mapped to the published sample catalog."
+    },
+    {
+      "source": "old_docs/docs_v2/user_guide/SKILLS.md",
+      "disposition": "excluded",
+      "destination": null,
+      "reason": "Internal authoring instructions, not user documentation."
+    },
+    {
+      "source": "old_docs/docs_v2/user_guide/attention.md",
+      "disposition": "merged",
+      "destination": "tutorials/attention.md",
+      "reason": "Topic moved into the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v2/user_guide/attention_recipes.md",
+      "disposition": "merged",
+      "destination": "how-to/attention-recipes.md",
+      "reason": "Topic moved into the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v2/user_guide/block_scaling.md",
+      "disposition": "merged",
+      "destination": "tutorials/block-scaling.md",
+      "reason": "Topic moved into the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v2/user_guide/causal_conv1d.md",
+      "disposition": "merged",
+      "destination": "how-to/causal-convolution.md",
+      "reason": "Topic moved into the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v2/user_guide/concatenate.md",
+      "disposition": "merged",
+      "destination": "how-to/shape-operations.md#concatenate",
+      "reason": "Topic moved into the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v2/user_guide/convolutions.md",
+      "disposition": "merged",
+      "destination": "tutorials/convolution.md",
+      "reason": "Topic moved into the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v2/user_guide/graph_lifecycle.md",
+      "disposition": "merged",
+      "destination": "how-to/explicit-lifecycle.md",
+      "reason": "Topic moved into the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v2/user_guide/index.md",
+      "disposition": "merged",
+      "destination": "index.md",
+      "reason": "Topic moved into the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v2/user_guide/installation.md",
+      "disposition": "merged",
+      "destination": "getting-started/installation.md",
+      "reason": "Topic moved into the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v2/user_guide/matmul.md",
+      "disposition": "merged",
+      "destination": "how-to/matmul-layouts.md",
+      "reason": "Topic moved into the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v2/user_guide/moe_grouped_matmul.md",
+      "disposition": "merged",
+      "destination": "tutorials/moe-grouped-matmul.md",
+      "reason": "Topic moved into the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v2/user_guide/normalizations.md",
+      "disposition": "merged",
+      "destination": "tutorials/normalization.md",
+      "reason": "Topic moved into the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v2/user_guide/pointwise.md",
+      "disposition": "merged",
+      "destination": "tutorials/pointwise-reduction.md",
+      "reason": "Topic moved into the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v2/user_guide/python_graph_wrapper.md",
+      "disposition": "merged",
+      "destination": "how-to/python-graph.md",
+      "reason": "Topic moved into the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v2/user_guide/pytorch_custom_ops.md",
+      "disposition": "merged",
+      "destination": "how-to/pytorch-custom-operator.md",
+      "reason": "Topic moved into the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v2/user_guide/pytorch_integration.md",
+      "disposition": "merged",
+      "destination": "tutorials/pytorch-integration.md",
+      "reason": "Topic moved into the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v2/user_guide/quickstart.md",
+      "disposition": "merged",
+      "destination": "getting-started/quickstart.md",
+      "reason": "Topic moved into the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v2/user_guide/quickstart_shorter.md",
+      "disposition": "merged",
+      "destination": "tutorials/first-graph.md",
+      "reason": "Topic moved into the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v2/user_guide/resampling.md",
+      "disposition": "merged",
+      "destination": "how-to/resampling.md",
+      "reason": "Topic moved into the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v2/user_guide/reshape.md",
+      "disposition": "merged",
+      "destination": "how-to/shape-operations.md#reshape",
+      "reason": "Topic moved into the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v2/user_guide/rope.md",
+      "disposition": "merged",
+      "destination": "how-to/rope.md",
+      "reason": "Topic moved into the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v2/user_guide/slice.md",
+      "disposition": "merged",
+      "destination": "how-to/shape-operations.md#slice",
+      "reason": "Topic moved into the grouped learning model."
+    },
+    {
+      "source": "old_docs/docs_v2/user_guide/transpose.md",
+      "disposition": "merged",
+      "destination": "how-to/shape-operations.md#transpose",
+      "reason": "Topic moved into the grouped learning model."
+    }
+  ]
+}

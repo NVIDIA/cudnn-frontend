@@ -7,11 +7,32 @@ repos:
 -   repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v21.1.6
     hooks:
+    # for docs
     -   id: clang-format
+        name: clang-docs
+        files: ^docs/
+        args: ["-style={BasedOnStyle: InheritParentConfig, ColumnLimit: 100}"]
+        types_or: [c++, c, cuda]
+    # for all other files
+    -   id: clang-format
+        name: clang
+        exclude: ^docs/
         types_or: [c++, c, cuda]
 -   repo: https://github.com/psf/black-pre-commit-mirror
     rev: 26.3.1
     hooks:
+    # for docs
+    -   id: black
+        name: black-docs
+        description: "Black: The uncompromising Python code formatter"
+        entry: black
+        language: python
+        minimum_pre_commit_version: 2.9.2
+        require_serial: true
+        types_or: [python, pyi]
+        files: ^docs/
+        args: ["--line-length", "100", "--target-version=py313"]
+    # for all other files
     -   id: black
         name: black
         description: "Black: The uncompromising Python code formatter"
@@ -20,6 +41,7 @@ repos:
         minimum_pre_commit_version: 2.9.2
         require_serial: true
         types_or: [python, pyi]
+        exclude: ^docs/
         args: ["--line-length", "160", "--fast"]
     -   id: black-jupyter
         name: black-jupyter
@@ -31,6 +53,7 @@ repos:
         require_serial: true
         types_or: [python, pyi, jupyter]
         additional_dependencies: [".[jupyter]"]
+        exclude: ^docs/
         args: ["--line-length", "160"]
 -   repo: local
     hooks:

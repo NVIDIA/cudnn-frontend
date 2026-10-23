@@ -8,13 +8,13 @@ Last two dimensions of input dimensions are interpreted as M, N, K. All other pr
 
 ## C++ API
 
-```
+```cpp
 std::shared_ptr<Tensor_attributes>
 Matmul(std::shared_ptr<Tensor_attributes> a, std::shared_ptr<Tensor_attributes> b, Matmul_attributes);
 ```
 
 Matmul attributes is a lightweight structure with setters:  
-```
+```cpp
 Matmul_attributes&
 set_name(std::string const&)
 

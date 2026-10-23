@@ -276,7 +276,7 @@ Served today:
   takes the small-M route's 128-row swap-AB tile, 109 CTAs, so the band declaration over the pools compiles with the opt-in flag
   unset and is capture-safe like the four-band one; past 128 rows the band slab keeps the graph route.  The route reads the
   part's SM count: the 128-row tile is its overflow branch, taken where the slab's 218 64-row tiles exceed one wave -- every
-  served part (<= 212 SMs); a part with 218 or more SMs would keep the band slab on the graph route at every row count); a
+  served part (≤ 212 SMs); a part with 218 or more SMs would keep the band slab on the graph route at every row count); a
   geometry without the band keeps exactly its four-band tuples. Enumerate `geometry.qkvg_blocks`, never `ProjBlock` itself.
 - the loader: `qkvg_from_hf(..., index_qk_proj_weight=attn.index_qk_proj.weight)` and `build_fused_qkvg_weight(...,
   index_qk_proj_weight=)` append the band (required iff declared, refused otherwise); `qkvg_from_vllm` takes it the same way, or

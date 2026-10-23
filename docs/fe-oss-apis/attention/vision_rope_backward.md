@@ -12,7 +12,7 @@ are original to this implementation.
 
 For each Q or K gradient, split the last dimension into two halves `(a, b)`:
 
-```
+```text
 dx_first  = a * cosine + b * sine
 dx_second = b * cosine - a * sine
 ```

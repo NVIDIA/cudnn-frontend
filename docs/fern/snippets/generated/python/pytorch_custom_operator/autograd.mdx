@@ -1,0 +1,17 @@
+```python maxLines=0
+def setup_context(ctx, inputs, output) -> None:
+    del output
+    ctx.save_for_backward(*inputs)
+
+
+def backward(ctx, grad_output: torch.Tensor):
+    a, b = ctx.saved_tensors
+    return grad_output @ b.transpose(-2, -1), a.transpose(-2, -1) @ grad_output
+
+
+torch.library.register_autograd(
+    "cudnn_docs::matmul",
+    backward,
+    setup_context=setup_context,
+)
+```

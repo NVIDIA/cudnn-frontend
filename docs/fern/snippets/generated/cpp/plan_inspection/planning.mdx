@@ -1,0 +1,7 @@
+```cpp maxLines=0
+    check(graph.create_execution_plans({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}));
+    graph.deselect_shared_mem_greater_than(128 * 1024);
+    check(graph.check_support());
+    check(graph.build_plans(fe::BuildPlanPolicy_t::ALL));
+    std::cout << "built supported plans" << std::endl;
+```

@@ -8,9 +8,10 @@ The docs here describe installation and the graph-oriented frontend APIs (Python
 
 | Area | Path | Contents |
 |------|------|----------|
-| Pages | `*.mdx`, `**/*.md` | Landing page, quick start, samples, installation, developer guide, frontend API reference (`operations/`, `utilities/`, `fe-oss-apis/`), reference material |
+| Pages | `*.mdx`, `**/*.md` | Product landing pages, the Frontend Guide, developer material, and API reference |
+| Verified samples | `samples/` | Canonical Python, C++, shell, and CMake examples displayed by the Frontend Guide |
 | Images | `images/` | Figures referenced from pages (stored in Git LFS) |
-| Fern config | `fern/` | `fern.config.json`, `docs.yml` (site settings, redirects), `versions/latest.yml` (left navigation) |
+| Fern config | `fern/` | Site settings, navigation, and generated reusable sample-region snippets |
 
 ## Layout
 
@@ -19,6 +20,13 @@ docs/
   index.mdx                 # landing page
   quickstart.mdx
   samples.mdx
+  index.md                  # Frontend Guide landing page
+  getting-started/
+  tutorials/
+  how-to/
+  concepts/
+  api/{python,cpp}/
+  samples/{python,cpp,...}/ # canonical executable examples
   installation/*.mdx
   developer/*.mdx
   operations/*.md
@@ -30,9 +38,22 @@ docs/
     fern.config.json
     docs.yml                # instances, theme, redirects
     versions/latest.yml     # navigation (paths are ../../<page>)
+    snippets/generated/     # generated sample regions; do not edit
 ```
 
-Every page must be listed in `fern/versions/latest.yml` to be built. Page `slug`s are the source file names, so links between pages use `/section/page` (for example `/developer/graph-api`), never file paths.
+Every page must be listed in `fern/versions/latest.yml` or discovered by one
+of its `folder` entries. Links between pages use published paths such as
+`/tutorials/attention`, never source-file-relative paths. Fern converts
+underscore-separated filenames discovered through a folder into hyphenated
+slugs; for example, `api/python/sdpa_backward.md` is published at
+`/api/python/sdpa-backward`.
+
+Use Fern's `<Tabs>` and `<Tab>` components for paired Python and C++ material.
+Display a complete canonical sample with `<Code src="..." />`. For a selected
+sample region, add region markers to the canonical source and run the index
+generator; pages include the resulting file from `/snippets/generated/` with a
+`<Markdown>` component. Do not edit generated snippets or duplicate executable
+examples in a page.
 
 ## Building locally
 
@@ -40,14 +61,29 @@ Prerequisites: Node.js 22+ and Git LFS.
 
 ```bash
 git lfs pull                     # fetch images
-npm install -g fern-api
+npm install -g fern-api@5.56.3
 cd docs/fern
-fern check                       # validate config, navigation, and MDX (no login required)
+fern check --warnings            # validate Fern configuration and navigation
 ```
 
-`fern check` is enough to catch navigation drift and MDX issues before opening a pull request; GitHub Actions runs the same command on doc changes.
+Run the repository checks from the repository root as well:
 
-Optional live preview (`fern docs dev` at `http://localhost:3000`) uses the Fern CLI and may require `fern login --email <you@example.com>` with a Fern account that can access this docs project. Preview is not required to contribute content fixes.
+```bash
+python tools/doc/build_doc_manifests.py --check
+python tools/doc/build_doc_indexes.py --check
+python tools/doc/check_doc_coverage.py --mode release
+python -m pytest tools/doc/tests -q
+python tools/doc/run_doc_samples.py --list
+```
+
+These checks validate navigation coverage, Fern component sources, generated
+regions, manifests, API-local availability contracts, and the sample catalog.
+GitHub Actions runs the Fern and repository checks for documentation changes.
+
+Optional live preview (`fern docs dev --broken-links` at
+`http://localhost:3000`) performs the full MDX bundle and link check. It may
+require Fern authentication and can upload documentation artifacts to Fern's
+preview service, so use it only in an approved environment.
 
 ## CI and publishing
 

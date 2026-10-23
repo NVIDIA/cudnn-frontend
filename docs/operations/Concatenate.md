@@ -4,14 +4,14 @@ The Concatenate operation merges two or more tensors into one, along the specifi
 
 ## C++ API
 
-```
+```cpp
 std::shared_ptr<Tensor_attributes>
 concatenate(std::vector<std::shared_ptr<Tensor_attributes>>, Concatenate_attributes);
 ```
 
 Concatenate attributes is a lightweight structure with inputs, outputs, and setters:
 
-```
+```cpp
 std::vector<std::shared_ptr<Tensor_attributes>> inputs;
 
 std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;

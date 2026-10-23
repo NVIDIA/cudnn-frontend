@@ -1,0 +1,8 @@
+```cpp maxLines=0
+    std::string plan_name;
+    check(graph.get_plan_name(plan_name));
+    check(graph.prepare_variant_pack_template());
+    auto const uids = graph.get_variant_pack_uids_sorted();
+    graph.apply_oss_slot_indices_to_plans();
+    std::cout << "plan=" << plan_name << ", uids=" << uids.size() << "\n";
+```

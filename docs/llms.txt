@@ -1,0 +1,95 @@
+# cuDNN Frontend Documentation
+
+> Build, validate, plan, and execute cuDNN operation graphs from Python or C++. Links in this index point directly to the current Markdown sources without requiring HTML conversion.
+
+## Start here
+
+- [Documentation home](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/index.md): Choose a learning path and locate the main documentation sections.
+- [Installation](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/getting-started/installation.md): Install the Python package or C++ headers and optional dependencies.
+- [Verify the environment](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/getting-started/verify-environment.md): Confirm CUDA, cuDNN, Python, and GPU compatibility.
+- [Quick start](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/getting-started/quickstart.md): Build and execute a first graph in Python or C++.
+- [Choose an interface](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/getting-started/choose-interface.md): Select the Python Graph API, C++ Graph API, or a higher-level integration.
+- [Compatibility](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/getting-started/compatibility.md): Check version, platform, and feature requirements.
+- [Verification record](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/verification.md): Review the environment, test results, and limits behind documentation claims.
+
+## Tutorials
+
+- [Tutorial overview](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/tutorials/index.md): Follow the recommended learning order.
+- [Build and extend a graph](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/tutorials/first-graph.md): Build, execute, and extend a graph with multiple operations.
+- [Scaled dot-product attention](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/tutorials/attention.md): Run SDPA forward and backward from Python or C++.
+- [Pointwise and reduction](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/tutorials/pointwise-reduction.md): Run pointwise, broadcast, and reduction graphs.
+- [Train a convolution](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/tutorials/convolution.md): Connect convolution forward and gradient graphs.
+- [Train with normalization](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/tutorials/normalization.md): Build normalization forward and backward graphs.
+- [PyTorch integration](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/tutorials/pytorch-integration.md): Integrate graph execution with PyTorch.
+- [Block scaling](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/tutorials/block-scaling.md): Use block-scaled low-precision data.
+- [MoE grouped matmul](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/tutorials/moe-grouped-matmul.md): Build Mixture-of-Experts grouped matrix multiplication.
+
+## Concepts
+
+- [Concepts overview](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/concepts/index.md): Locate conceptual explanations and terminology.
+- [Glossary](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/concepts/glossary.md): Resolve cuDNN Frontend terms.
+- [API layers and lifecycle](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/concepts/api-layers.md): Understand API layers and graph lifecycle stages.
+- [Python IR routing](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/concepts/python-ir-routing.md): Understand Python engine routing and verification.
+- [Graphs and tensors](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/concepts/graphs-and-tensors.md): Understand tensor identity, virtual values, ownership, and fusion.
+- [Fusion patterns](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/concepts/fusion-patterns.md): Enumerate explicit fusion surfaces and distinguish them from runtime-discovered backend support.
+- [Layouts and types](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/concepts/layouts.md): Understand dimensions, strides, broadcasting, and data types.
+- [Operations and training](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/concepts/operations-training.md): Understand forward and backward dataflow.
+- [Engines and plans](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/concepts/execution-plans.md): Understand heuristics, plan selection, and autotuning.
+- [Runtime resources](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/concepts/runtime-resources.md): Understand handles, streams, workspace, and ownership.
+- [Compilation and caching](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/concepts/compilation-caching.md): Understand graph identity, compilation, and reuse.
+- [Attention](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/concepts/attention.md): Understand attention layouts, masks, and saved state.
+- [Attention support history](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/concepts/attention-support-history.md): Check versioned attention capabilities and benchmarks.
+- [Numerical precision](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/concepts/numerical-precision.md): Understand compute precision and block scaling.
+- [OSS engines and stability](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/concepts/oss-stability.md): Understand OSS package boundaries and fallback behavior.
+
+## How-to guides
+
+- [How-to overview](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/how-to/index.md): Find a task-oriented guide.
+- [Use the Python Graph API](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/how-to/python-graph.md): Build graphs with `cudnn.Graph`.
+- [Control the explicit lifecycle](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/how-to/explicit-lifecycle.md): Validate, create the graph representation, plan, and build explicitly.
+- [Cache decorated graphs](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/how-to/graph-cache.md): Reuse decorated Python graphs.
+- [Configure matmul layouts](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/how-to/matmul-layouts.md): Choose compatible matrix dimensions and strides.
+- [Choose a normalization](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/how-to/normalization.md): Select and configure a normalization operation.
+- [Apply RoPE](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/how-to/rope.md): Apply rotary positional embeddings.
+- [Resample and pool](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/how-to/resampling.md): Configure resampling and pooling graphs.
+- [Use shape operations](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/how-to/shape-operations.md): Reshape, transpose, slice, and concatenate tensors.
+- [Build convolution variants](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/how-to/convolution-variants.md): Configure convolution forward and gradients.
+- [Run causal Conv1d](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/how-to/causal-convolution.md): Use fused causal convolution operators.
+- [Configure attention recipes](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/how-to/attention-recipes.md): Configure attention masks, layouts, and inference modes.
+- [Diagnose failures](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/how-to/troubleshoot.md): Interpret graph, plan, and execution failures.
+- [Select and autotune plans](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/how-to/plan-selection.md): Filter, benchmark, and select execution plans.
+- [Manage runtime resources](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/how-to/runtime-resources.md): Manage handles, streams, workspace, and lifetimes.
+- [Run dynamic shapes](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/how-to/dynamic-shapes.md): Configure and execute dynamic-shape graphs.
+- [Serialize and deploy](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/how-to/deployment.md): Serialize graphs and deploy built plans.
+- [Use CUDA Graphs](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/how-to/cuda-graphs.md): Capture and update CUDA Graph execution.
+- [Register a PyTorch operator](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/how-to/pytorch-custom-operator.md): Wrap cuDNN execution as a PyTorch custom operator.
+- [Inspect Python engine selection](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/how-to/custom-engine.md): Inspect manifest-discovered Python engines, ranked plans, and backend fallback.
+- [Pin a C++ engine](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/how-to/engine-knobs.md): Select a backend engine and knob values.
+- [Use scalars and constants](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/how-to/scalars-and-constants.md): Bind scalar inputs and compile-time constants.
+- [Migrate legacy C++](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/how-to/legacy-migration.md): Move legacy frontend code to the Graph API.
+- [Use low precision](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/how-to/low-precision.md): Configure FP8, MXFP8, and related scale metadata.
+
+## OSS kernels
+
+- [Optional kernel contracts](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/reference/index.md): Navigate architecture-specific OSS wrapper and fusion-family contracts.
+- [Select an OSS engine](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/reference/oss-engines.md): Choose an OSS heuristic or direct kernel entry point.
+- [Block-sparse attention](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/reference/oss-block-sparse-attention.md): Use BSA forward and backward kernels.
+- [DeepSeek sparse attention](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/reference/oss-deepseek-sparse-attention.md): Use DSA score, selection, recomputation, and gradient stages.
+- [Native Sparse Attention](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/reference/oss-native-sparse-attention.md): Compose NSA compression, selection, and sliding-window stages.
+- [SDPA D=256](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/reference/oss-sdpa-d256.md): Use fixed SM100 SDPA forward and backward kernels.
+- [Dense GEMM fusions](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/reference/oss-dense-gemm.md): Use dense GEMM epilogue fusions.
+- [Grouped GEMM fusions](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/reference/oss-grouped-gemm.md): Use MoE grouped GEMM fusion families.
+- [Discrete grouped GEMM](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/reference/oss-discrete-grouped-gemm.md): Use pointer-array grouped GEMM fusion families.
+- [Normalization fusions](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/reference/oss-normalization.md): Use RMSNorm fusion paths.
+
+## API reference and samples
+
+- [API lookup](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/api/index.md): Choose Python or C++ API reference entries by task.
+- [Sample guide](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/samples/guide.md): Find concise, paired Python and C++ examples by task.
+- [Python sample sources](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/samples/python/README.md): Browse the canonical Python programs included by learning and reference pages.
+- [C++ sample sources](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/docs/samples/cpp/README.md): Browse the canonical C++ programs included by learning and reference pages.
+
+## Optional
+
+- [Repository README](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/README.md): Review project scope, installation summary, and release highlights.
+- [Contributing](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/CONTRIBUTING.md): Follow contribution and review expectations.

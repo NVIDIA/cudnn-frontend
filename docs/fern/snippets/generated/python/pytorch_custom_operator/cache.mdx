@@ -1,0 +1,33 @@
+```python maxLines=0
+def graph_key(a: torch.Tensor, b: torch.Tensor) -> GraphKey:
+    return (
+        str(a.device),
+        a.dtype,
+        tuple(a.shape),
+        tuple(a.stride()),
+        tuple(b.shape),
+        tuple(b.stride()),
+    )
+
+
+def build_graph(a: torch.Tensor, b: torch.Tensor) -> cudnn.Graph:
+    with cudnn.Graph(
+        io_data_type=a.dtype,
+        compute_data_type=torch.float32,
+        inputs=["matmul::A", "matmul::B"],
+        outputs=["C"],
+        handle="auto",
+    ) as graph:
+        output = graph.matmul(name="matmul", A=a, B=b)
+        output.set_name("C").set_output(True).set_data_type(a.dtype)
+    return graph
+
+
+def cached_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    key = graph_key(a, b)
+    graph = GRAPH_CACHE.get(key)
+    if graph is None:
+        graph = build_graph(a, b)
+        GRAPH_CACHE[key] = graph
+    return graph(a, b)
+```

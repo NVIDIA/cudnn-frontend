@@ -1,0 +1,10 @@
+```cpp maxLines=0
+    fe::graph::Graph dbn_graph;
+    auto dy           = tensor(dbn_graph, "dY");
+    auto x            = tensor(dbn_graph, "X");
+    auto mean         = tensor(dbn_graph, "mean");
+    auto inv_variance = tensor(dbn_graph, "inv_variance");
+    auto dbn_scale    = tensor(dbn_graph, "scale");
+    auto dbn_outputs  = dbn_graph.dbn_weight(
+        dy, x, mean, inv_variance, dbn_scale, fe::graph::DBN_weight_attributes());
+```

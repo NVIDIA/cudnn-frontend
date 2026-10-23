@@ -73,7 +73,7 @@ The support matrix is based on cuDNN backend version 9.18.1. Later sections note
 &nbsp;&nbsp; Batch with sequences "aa" (length 2) and "bbb" (length 3), max length `S=8`:
   - `seq_len_q = [2, 3]`
   - `seq_len_kv = [2, 3]`
-    ```
+    ```text
     Q[b=0] = aa000000  (6 padding tokens)
     Q[b=1] = bbb00000  (5 padding tokens)
     ```
@@ -107,7 +107,7 @@ The support matrix is based on cuDNN backend version 9.18.1. Later sections note
   - `seq_len_q = [2, 3]`<br />
   - `seq_len_kv = [2, 3]`<br />
 
-      ```
+      ```text
       Q = aabbb  (no padding, T=5 total tokens)
       ```
 
@@ -120,7 +120,7 @@ The support matrix is based on cuDNN backend version 9.18.1. Later sections note
   &nbsp;&nbsp;&nbsp;&nbsp; Tokens within each batch can be contiguous without being globally packed.<br />
 
   - Ragged offset: $[0, 4 \times H \times D, 7 \times H \times D] = [0, 256, 448]$
-      ```
+      ```text
       Q = aa00bbb0  (batch 0 at offset 0, batch 1 at offset 4)
       ```
 
@@ -129,7 +129,7 @@ The support matrix is based on cuDNN backend version 9.18.1. Later sections note
   &nbsp;&nbsp;&nbsp;&nbsp; Tokens that are not contiguous within a batch cannot be represented.
 
   - `seq_len_q = [2, 3]`
-      ```
+      ```text
       Q = a0abbb00bb000000  (tokens interleaved - NOT SUPPORTED)
       ```
 &nbsp;&nbsp; **Note that Q,K,V and their gradients can be individually ragged or not.**<br /> 
@@ -1071,7 +1071,7 @@ graph.sdpa_fp8(
 )
 ```
 
-```
+```text
 Args:
     q (cudnn_tensor): The query data.
     k (cudnn_tensor): The key data.
@@ -1259,7 +1259,7 @@ graph.sdpa_fp8_backward(
 )
 ```
 
-```
+```text
 Args:
     q (cudnn_tensor): The query data.
     k (cudnn_tensor): The key data.

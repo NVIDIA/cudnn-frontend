@@ -6,7 +6,7 @@ The pointwise operation performs an elementwise operation on one, two, or three 
 
 ### C++ API
 
-```
+```cpp
 std::shared_ptr<Tensor_attributes>
 pointwise(std::shared_ptr<Tensor_attributes>,
           Pointwise_attributes);
@@ -25,7 +25,7 @@ pointwise(std::shared_ptr<Tensor_attributes>,
 The pointwise mode dictates the API among the choices above. Refer to the documentation of `cudnn_frontend::PointwiseMode_t` for details.
 
 Pointwise attributes is a lightweight structure with setters:  
-```
+```cpp
 Pointwise_attributes&
 set_mode(PointwiseMode_t)
 
@@ -103,13 +103,13 @@ The reduction operation reduces an input tensor using an operation controlled by
 
 ### C++ API
 
-```
+```cpp
 std::shared_ptr<Tensor_attributes>
 reduction(std::shared_ptr<Tensor_attributes> input, Reduction_attributes);
 ```
 
 Reduction attributes is a lightweight structure with setters:  
-```
+```cpp
 Reduction_attributes&
 set_mode(ReductionMode_t)
 

@@ -1,0 +1,7463 @@
+{
+  "schema_version": 1,
+  "generated_by": "tools/doc/build_doc_manifests.py",
+  "samples": [
+    {
+      "id": "python-abs-basic",
+      "path": "samples/python/abs_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/abs.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.abs"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-add-basic",
+      "path": "samples/python/add_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/add.md",
+        "tutorials/pointwise-reduction.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.add"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-add-broadcast",
+      "path": "samples/python/add_broadcast.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python broadcasting sample.",
+      "owners": [
+        "api/python/add.md",
+        "tutorials/pointwise-reduction.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.add"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-add-square-basic",
+      "path": "samples/python/add_square_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/add_square.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.add_square"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-bias-basic",
+      "path": "samples/python/bias_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/bias.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.bias"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-binary-select-basic",
+      "path": "samples/python/binary_select_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/binary_select.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.binary_select"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-block-scaled-matmul",
+      "path": "samples/python/block_scaled_matmul.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Run an MXFP8 dequantize, matmul, and block-scale quantize graph.",
+      "owners": [
+        "api/python/block_scale_dequantize.md",
+        "api/python/block_scale_quantize.md",
+        "tutorials/block-scaling.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.block_scale_dequantize",
+        "cudnn.pygraph.matmul",
+        "cudnn.pygraph.block_scale_quantize"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda",
+        "sm100",
+        "cudnn>=91400"
+      ],
+      "timeout_seconds": 180,
+      "expected": "MXFP8 block-scaled matmul ok: zero result and output scales produced",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-build-basic",
+      "path": "samples/python/build_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/build.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.build"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-build-operation-graph-basic",
+      "path": "samples/python/build_operation_graph_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/build_operation_graph.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.build_operation_graph"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-build-plan-at-index-basic",
+      "path": "samples/python/build_plan_at_index_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/build_plan_at_index.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.build_plan_at_index"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-build-plans-basic",
+      "path": "samples/python/build_plans_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/build_plans.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.build_plans"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-causal-conv1d",
+      "path": "samples/python/causal_conv1d.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Verify Causal Conv1d forward, backward, and torch.compile integration.",
+      "owners": [
+        "how-to/causal-convolution.md"
+      ],
+      "apis": [
+        "cudnn.ops.causal_conv1d"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda",
+        "causal_conv1d_bindings"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "syntax-checked and source-verified; installed extension lacks optional Causal Conv1d bindings",
+      "fallback_command": [
+        "{python}",
+        "-m",
+        "py_compile",
+        "{path}"
+      ]
+    },
+    {
+      "id": "python-ceil-basic",
+      "path": "samples/python/ceil_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/ceil.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.ceil"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-check-support-basic",
+      "path": "samples/python/check_support_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/check_support.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.check_support"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-concatenate-basic",
+      "path": "samples/python/concatenate_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Concatenate tensors and compare with PyTorch.",
+      "owners": [
+        "api/python/concatenate.md",
+        "how-to/shape-operations.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.concatenate"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda",
+        "sm100",
+        "cudnn>=92200"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "syntax-checked; execution requires CUDA 13.1+, cuDNN 9.22+, and SM100+",
+      "fallback_command": [
+        "{python}",
+        "-m",
+        "py_compile",
+        "{path}"
+      ]
+    },
+    {
+      "id": "python-conv-dgrad-basic",
+      "path": "samples/python/conv_dgrad_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/conv_dgrad.md",
+        "tutorials/convolution.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.conv_dgrad"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-conv-fprop-basic",
+      "path": "samples/python/conv_fprop_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/conv_fprop.md",
+        "tutorials/convolution.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.conv_fprop"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-conv-wgrad-basic",
+      "path": "samples/python/conv_wgrad_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/conv_wgrad.md",
+        "tutorials/convolution.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.conv_wgrad"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-cos-basic",
+      "path": "samples/python/cos_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/cos.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.cos"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-create-execution-plan-basic",
+      "path": "samples/python/create_execution_plan_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/create_execution_plan.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.create_execution_plan"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-create-execution-plans-basic",
+      "path": "samples/python/create_execution_plans_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/create_execution_plans.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.create_execution_plans"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-custom-engine",
+      "path": "samples/python/custom_engine.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Inspect automatic Python-engine and backend plan selection.",
+      "owners": [
+        "how-to/custom-engine.md",
+        "api/python/context.md",
+        "api/python/find_tensor.md",
+        "api/python/get_inputs.md",
+        "api/python/get_node.md",
+        "api/python/get_outputs.md",
+        "api/python/inspect.md",
+        "api/python/nodes.md",
+        "api/python/plans.md",
+        "api/python/select_plan.md",
+        "api/python/selected_engine.md",
+        "api/python/tensors.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.plans",
+        "cudnn.pygraph.select_plan",
+        "cudnn.pygraph.selected_engine"
+      ],
+      "regions": [
+        "inspection",
+        "routing",
+        "execution"
+      ],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-deselect-behavior-notes-basic",
+      "path": "samples/python/deselect_behavior_notes_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/deselect_behavior_notes.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.deselect_behavior_notes"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-deselect-engines-basic",
+      "path": "samples/python/deselect_engines_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/deselect_engines.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.deselect_engines"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-deselect-numeric-notes-basic",
+      "path": "samples/python/deselect_numeric_notes_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/deselect_numeric_notes.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.deselect_numeric_notes"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-deselect-workspace-greater-than-basic",
+      "path": "samples/python/deselect_workspace_greater_than_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/deselect_workspace_greater_than.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.deselect_workspace_greater_than"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-deserialize-basic",
+      "path": "samples/python/deserialize_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/deserialize.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.deserialize"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-div-basic",
+      "path": "samples/python/div_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/div.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.div"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-elu-backward-basic",
+      "path": "samples/python/elu_backward_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/elu_backward.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.elu_backward"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-elu-basic",
+      "path": "samples/python/elu_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/elu.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.elu"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-erf-basic",
+      "path": "samples/python/erf_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/erf.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.erf"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-execute-basic",
+      "path": "samples/python/execute_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/execute.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.execute"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-execute-plan-at-index-basic",
+      "path": "samples/python/execute_plan_at_index_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/execute_plan_at_index.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.execute_plan_at_index"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-exp-basic",
+      "path": "samples/python/exp_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/exp.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.exp"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-floor-basic",
+      "path": "samples/python/floor_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/floor.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.floor"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-fusion",
+      "path": "samples/python/fusion.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Execute matmul, bias, and ReLU in one cuDNN graph.",
+      "owners": [
+        "samples/python/README.md",
+        "tutorials/first-graph.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.matmul",
+        "cudnn.pygraph.bias",
+        "cudnn.pygraph.relu"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-gelu-approx-tanh-backward-basic",
+      "path": "samples/python/gelu_approx_tanh_backward_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/gelu_approx_tanh_backward.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.gelu_approx_tanh_backward"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-gelu-approx-tanh-basic",
+      "path": "samples/python/gelu_approx_tanh_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/gelu_approx_tanh.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.gelu_approx_tanh"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-gelu-backward-basic",
+      "path": "samples/python/gelu_backward_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/gelu_backward.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.gelu_backward"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-gelu-basic",
+      "path": "samples/python/gelu_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/gelu.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.gelu"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-gen-index-basic",
+      "path": "samples/python/gen_index_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/gen_index.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.gen_index"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-genstats-basic",
+      "path": "samples/python/genstats_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/genstats.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.genstats"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-get-behavior-notes-basic",
+      "path": "samples/python/get_behavior_notes_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/get_behavior_notes.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.get_behavior_notes"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-get-behavior-notes-for-plan-at-index-basic",
+      "path": "samples/python/get_behavior_notes_for_plan_at_index_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/get_behavior_notes_for_plan_at_index.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.get_behavior_notes_for_plan_at_index"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-get-engine-count-basic",
+      "path": "samples/python/get_engine_count_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/get_engine_count.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.get_engine_count"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-get-execution-plan-count-basic",
+      "path": "samples/python/get_execution_plan_count_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/get_execution_plan_count.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.get_execution_plan_count"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-get-knobs-for-engine-basic",
+      "path": "samples/python/get_knobs_for_engine_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/get_knobs_for_engine.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.get_knobs_for_engine"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-get-plan-name-at-index-basic",
+      "path": "samples/python/get_plan_name_at_index_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/get_plan_name_at_index.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.get_plan_name_at_index"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-get-workspace-size-basic",
+      "path": "samples/python/get_workspace_size_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/get_workspace_size.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.get_workspace_size"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-get-workspace-size-plan-at-index-basic",
+      "path": "samples/python/get_workspace_size_plan_at_index_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/get_workspace_size_plan_at_index.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.get_workspace_size_plan_at_index"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-identity-basic",
+      "path": "samples/python/identity_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/identity.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.identity"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-key-basic",
+      "path": "samples/python/key_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/key.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.key"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-layernorm-backward-basic",
+      "path": "samples/python/layernorm_backward_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/layernorm_backward.md",
+        "tutorials/normalization.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.layernorm_backward"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-layernorm-basic",
+      "path": "samples/python/layernorm_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/layernorm.md",
+        "tutorials/normalization.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.layernorm"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-leaky-relu-backward-basic",
+      "path": "samples/python/leaky_relu_backward_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/leaky_relu_backward.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.leaky_relu_backward"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-leaky-relu-basic",
+      "path": "samples/python/leaky_relu_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/leaky_relu.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.leaky_relu"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-log-basic",
+      "path": "samples/python/log_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/log.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.log"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-logical-and-basic",
+      "path": "samples/python/logical_and_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/logical_and.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.logical_and"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-logical-not-basic",
+      "path": "samples/python/logical_not_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/logical_not.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.logical_not"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-logical-or-basic",
+      "path": "samples/python/logical_or_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/logical_or.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.logical_or"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-matmul",
+      "path": "samples/python/matmul.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Build and execute the Python BF16 matmul quick start.",
+      "owners": [
+        "api/python/matmul.md",
+        "getting-started/quickstart.md",
+        "how-to/python-graph.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.matmul"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-matmul-basic",
+      "path": "samples/python/matmul_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/matmul.md",
+        "how-to/matmul-layouts.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.matmul"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-matmul-example-2",
+      "path": "samples/python/matmul_example_2.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/matmul.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.matmul"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-max-basic",
+      "path": "samples/python/max_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/max.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.max"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-min-basic",
+      "path": "samples/python/min_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/min.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.min"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-mod-basic",
+      "path": "samples/python/mod_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/mod.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.mod"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-moe-grouped-matmul",
+      "path": "samples/python/moe_grouped_matmul.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Execute and numerically check MoE grouped matmul in NONE routing mode.",
+      "owners": [
+        "api/python/moe_grouped_matmul.md",
+        "tutorials/moe-grouped-matmul.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.moe_grouped_matmul"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda",
+        "cudnn>=91800"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "syntax-checked and source-verified; installed cuDNN 9.15.1 is below the current test gate",
+      "fallback_command": [
+        "{python}",
+        "-m",
+        "py_compile",
+        "{path}"
+      ]
+    },
+    {
+      "id": "python-moe-grouped-matmul-backward",
+      "path": "samples/python/moe_grouped_matmul_backward.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Compute and verify MoE grouped weight gradients in NONE routing mode.",
+      "owners": [
+        "api/python/moe_grouped_matmul_bwd.md",
+        "tutorials/moe-grouped-matmul.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.moe_grouped_matmul_bwd"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda",
+        "sm90",
+        "cudnn>=92200",
+        "cublaslt>=130500"
+      ],
+      "timeout_seconds": 180,
+      "expected": "moe grouped matmul backward ok: dweight verified per expert",
+      "verification": "syntax-checked and source-verified; execution requires cuDNN 9.22+ and cublasLt 13.5+",
+      "fallback_command": [
+        "{python}",
+        "-m",
+        "py_compile",
+        "{path}"
+      ]
+    },
+    {
+      "id": "python-mul-basic",
+      "path": "samples/python/mul_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/mul.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.mul"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-neg-basic",
+      "path": "samples/python/neg_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/neg.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.neg"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-oss-rmsnorm-silu",
+      "path": "samples/python/oss_rmsnorm_silu.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Execute the OSS RMSNorm-SiLU Graph fusion and check a PyTorch reference.",
+      "owners": [
+        "reference/oss-normalization.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.rmsnorm"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda",
+        "sm100"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-pow-basic",
+      "path": "samples/python/pow_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/pow.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.pow"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-pytorch-autograd",
+      "path": "samples/python/pytorch_autograd.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Wrap cached cuDNN ReLU graphs in a PyTorch autograd.Function.",
+      "owners": [
+        "tutorials/pytorch-integration.md"
+      ],
+      "apis": [
+        "cudnn.Graph",
+        "torch.autograd.Function"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "PyTorch autograd integration ok: forward=1 backward=1",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-pytorch-cached-graph",
+      "path": "samples/python/pytorch_cached_graph.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Cache a cudnn.Graph by the PyTorch tensor metadata that defines its contract.",
+      "owners": [
+        "tutorials/pytorch-integration.md"
+      ],
+      "apis": [
+        "cudnn.Graph"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-pytorch-custom-operator",
+      "path": "samples/python/pytorch_custom_operator.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Register a cached cuDNN Graph as a PyTorch custom operator.",
+      "owners": [
+        "how-to/pytorch-custom-operator.md"
+      ],
+      "apis": [
+        "torch.ops.cudnn_docs.matmul"
+      ],
+      "regions": [
+        "cache",
+        "registration",
+        "autograd"
+      ],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-query-tensor-attributes-of-uid-basic",
+      "path": "samples/python/query_tensor_attributes_of_uid_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/query_tensor_attributes_of_uid.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.query_tensor_attributes_of_uid"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-reciprocal-basic",
+      "path": "samples/python/reciprocal_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/reciprocal.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.reciprocal"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-reduction-basic",
+      "path": "samples/python/reduction_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/reduction.md",
+        "tutorials/pointwise-reduction.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.reduction"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-relu-backward-basic",
+      "path": "samples/python/relu_backward_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/relu_backward.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.relu_backward"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-relu-basic",
+      "path": "samples/python/relu_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/relu.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.relu"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-reshape-basic",
+      "path": "samples/python/reshape_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/reshape.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.reshape"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-rmsnorm-backward-basic",
+      "path": "samples/python/rmsnorm_backward_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/rmsnorm_backward.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.rmsnorm_backward"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-rmsnorm-basic",
+      "path": "samples/python/rmsnorm_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/rmsnorm.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.rmsnorm"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-rope-backward-basic",
+      "path": "samples/python/rope_backward_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/rope_backward.md",
+        "how-to/rope.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.rope_backward"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda",
+        "cudnn>=92400"
+      ],
+      "timeout_seconds": 180,
+      "expected": "rope backward matches reference",
+      "verification": "syntax-checked; execution requires cuDNN 9.24+",
+      "fallback_command": [
+        "{python}",
+        "-m",
+        "py_compile",
+        "{path}"
+      ]
+    },
+    {
+      "id": "python-rope-basic",
+      "path": "samples/python/rope_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/rope.md",
+        "how-to/rope.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.rope"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda",
+        "cudnn>=92400"
+      ],
+      "timeout_seconds": 180,
+      "expected": "rope result matches reference",
+      "verification": "syntax-checked; execution requires cuDNN 9.24+",
+      "fallback_command": [
+        "{python}",
+        "-m",
+        "py_compile",
+        "{path}"
+      ]
+    },
+    {
+      "id": "python-rsqrt-basic",
+      "path": "samples/python/rsqrt_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/rsqrt.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.rsqrt"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-scale-basic",
+      "path": "samples/python/scale_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/scale.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.scale"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-sdpa-bf16-causal",
+      "path": "samples/python/sdpa_bf16_causal.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone causal GQA forward and backward sample.",
+      "owners": [
+        "api/python/sdpa.md",
+        "api/python/sdpa_backward.md",
+        "tutorials/attention.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.sdpa",
+        "cudnn.pygraph.sdpa_backward"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-sdpa-dropout",
+      "path": "samples/python/sdpa_dropout.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/sdpa.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.sdpa_dropout"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-sdpa-inference-no-stats",
+      "path": "samples/python/sdpa_inference_no_stats.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/sdpa.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.sdpa_inference_no_stats"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-sdpa-paged-kv-cache",
+      "path": "samples/python/sdpa_paged_kv_cache.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/sdpa.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.sdpa_paged_kv_cache"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-sdpa-sink-token",
+      "path": "samples/python/sdpa_sink_token.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/sdpa.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.sdpa_sink_token"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-sdpa-sliding-window-chunked-prefill",
+      "path": "samples/python/sdpa_sliding_window_chunked_prefill.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/sdpa.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.sdpa_sliding_window_chunked_prefill"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-sdpa-variable-length-padded",
+      "path": "samples/python/sdpa_variable_length_padded.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/sdpa.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.sdpa_variable_length_padded"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-select-behavior-notes-basic",
+      "path": "samples/python/select_behavior_notes_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/select_behavior_notes.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.select_behavior_notes"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-select-numeric-notes-basic",
+      "path": "samples/python/select_numeric_notes_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/select_numeric_notes.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.select_numeric_notes"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-serialize-basic",
+      "path": "samples/python/serialize_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/serialize.md",
+        "how-to/deployment.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.serialize"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-sigmoid-backward-basic",
+      "path": "samples/python/sigmoid_backward_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/sigmoid_backward.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.sigmoid_backward"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-sigmoid-basic",
+      "path": "samples/python/sigmoid_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/sigmoid.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.sigmoid"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-sin-basic",
+      "path": "samples/python/sin_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/sin.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.sin"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-slice-basic",
+      "path": "samples/python/slice_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Slice a tensor and compare with PyTorch.",
+      "owners": [
+        "api/python/slice.md",
+        "how-to/shape-operations.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.slice"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda",
+        "sm100",
+        "cudnn>=92200"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "syntax-checked; standalone execution requires CUDA 13.1+, cuDNN 9.22+, and SM100+",
+      "fallback_command": [
+        "{python}",
+        "-m",
+        "py_compile",
+        "{path}"
+      ]
+    },
+    {
+      "id": "python-softplus-backward-basic",
+      "path": "samples/python/softplus_backward_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/softplus_backward.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.softplus_backward"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-softplus-basic",
+      "path": "samples/python/softplus_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/softplus.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.softplus"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-sqrt-basic",
+      "path": "samples/python/sqrt_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/sqrt.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.sqrt"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-sub-basic",
+      "path": "samples/python/sub_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/sub.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.sub"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-swish-backward-basic",
+      "path": "samples/python/swish_backward_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/swish_backward.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.swish_backward"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-swish-basic",
+      "path": "samples/python/swish_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/swish.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.swish"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-tan-basic",
+      "path": "samples/python/tan_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/tan.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.tan"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-tanh-backward-basic",
+      "path": "samples/python/tanh_backward_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/tanh_backward.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.tanh_backward"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-tanh-basic",
+      "path": "samples/python/tanh_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/tanh.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.tanh"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-tensor-basic",
+      "path": "samples/python/tensor_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/tensor.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.tensor"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-tensor-example-2",
+      "path": "samples/python/tensor_example_2.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/tensor.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.tensor"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-tensor-like-basic",
+      "path": "samples/python/tensor_like_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/tensor_like.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.tensor_like"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-tensor-like-example-2",
+      "path": "samples/python/tensor_like_example_2.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/tensor_like.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.tensor_like"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-tensor-scalar-basic",
+      "path": "samples/python/tensor_scalar_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/tensor_scalar.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.tensor_scalar"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-tensor-scalar-example-2",
+      "path": "samples/python/tensor_scalar_example_2.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/tensor_scalar.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.tensor_scalar"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-transpose-basic",
+      "path": "samples/python/transpose_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Transpose a tensor and compare with PyTorch.",
+      "owners": [
+        "api/python/transpose.md",
+        "how-to/shape-operations.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.transpose"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda",
+        "sm100",
+        "cudnn>=92200"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "syntax-checked; execution requires CUDA 13.1+, cuDNN 9.22+, and SM100+",
+      "fallback_command": [
+        "{python}",
+        "-m",
+        "py_compile",
+        "{path}"
+      ]
+    },
+    {
+      "id": "python-validate-basic",
+      "path": "samples/python/validate_basic.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Complete standalone Python sample.",
+      "owners": [
+        "api/python/validate.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.validate"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "python-verify-environment",
+      "path": "samples/python/verify_environment.py",
+      "language": "python",
+      "mode": "execute",
+      "purpose": "Report the imported frontend, backend, CUDA, toolchain, and GPU environment.",
+      "owners": [
+        "samples/python/README.md",
+        "getting-started/verify-environment.md"
+      ],
+      "apis": [
+        "cudnn.pygraph.verify_environment"
+      ],
+      "regions": [],
+      "command": [
+        "{python}",
+        "{path}",
+        "--strict"
+      ],
+      "requirements": [
+        "python",
+        "cuda"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.0/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-abs-basic",
+      "path": "samples/cpp/abs_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/abs.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::abs"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-adalayernorm-backward-basic",
+      "path": "samples/cpp/adalayernorm_backward_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/adalayernorm_backward.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::adalayernorm_backward"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-adalayernorm-basic",
+      "path": "samples/cpp/adalayernorm_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/adalayernorm.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::adalayernorm"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-add-basic",
+      "path": "samples/cpp/add_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/add.md",
+        "tutorials/pointwise-reduction.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::add"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-add-broadcast",
+      "path": "samples/cpp/add_broadcast.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ broadcasting sample.",
+      "owners": [
+        "api/cpp/add.md",
+        "tutorials/pointwise-reduction.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::add"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-add-square-basic",
+      "path": "samples/cpp/add_square_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/add_square.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::add_square"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-advanced-operations",
+      "path": "samples/cpp/advanced_operations.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Construct advanced Graph operations that do not have Python counterparts.",
+      "owners": [
+        "samples/cpp/README.md",
+        "api/cpp/bn_finalize.md",
+        "api/cpp/dbn_weight.md",
+        "api/cpp/diagonal_band_mask.md",
+        "api/cpp/rng.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::advanced_operations"
+      ],
+      "regions": [
+        "bn-finalize",
+        "dbn-weight",
+        "diagonal-mask",
+        "resample",
+        "rng"
+      ],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-batchnorm-backward-basic",
+      "path": "samples/cpp/batchnorm_backward_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/batchnorm_backward.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::batchnorm_backward"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-batchnorm-basic",
+      "path": "samples/cpp/batchnorm_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/batchnorm.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::batchnorm"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-bias-basic",
+      "path": "samples/cpp/bias_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/bias.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::bias"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-binary-select-basic",
+      "path": "samples/cpp/binary_select_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/binary_select.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::binary_select"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-block-scaled-matmul",
+      "path": "samples/cpp/block_scaled_matmul.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/block_scale_dequantize.md",
+        "api/cpp/block_scale_quantize.md",
+        "tutorials/block-scaling.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::block_scale_dequantize",
+        "cudnn_frontend::graph::Graph::matmul",
+        "cudnn_frontend::graph::Graph::block_scale_quantize"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc",
+        "sm100",
+        "cudnn>=91400"
+      ],
+      "timeout_seconds": 180,
+      "expected": "MXFP8 block-scaled matmul ok: zero result and output scales produced",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-build-basic",
+      "path": "samples/cpp/build_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/build.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::build"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-build-operation-graph-basic",
+      "path": "samples/cpp/build_operation_graph_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/build_operation_graph.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::build_operation_graph"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-build-plan-at-index-basic",
+      "path": "samples/cpp/build_plan_at_index_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/build_plan_at_index.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::build_plan_at_index"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-build-plans-basic",
+      "path": "samples/cpp/build_plans_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/build_plans.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::build_plans"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-ceil-basic",
+      "path": "samples/cpp/ceil_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/ceil.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::ceil"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-check-support-basic",
+      "path": "samples/cpp/check_support_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/check_support.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::check_support"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-compile-time-constants",
+      "path": "samples/cpp/compile_time_constants.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Construct an FMA graph whose scale and bias are compile-time constants.",
+      "owners": [
+        "how-to/scalars-and-constants.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::tensor"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc",
+        "cudnn>=92200"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "compiled against current headers; execution requires cuDNN 9.22+ and CUDA 13.1+",
+      "fallback_command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ]
+    },
+    {
+      "id": "cpp-concatenate-basic",
+      "path": "samples/cpp/concatenate_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Concatenate tensors and compare with an index-based reference.",
+      "owners": [
+        "api/cpp/concatenate.md",
+        "how-to/shape-operations.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::concatenate"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc",
+        "sm100",
+        "cudnn>=92200"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "compiled against current headers; execution requires CUDA 13.1+, cuDNN 9.22+, and SM100+",
+      "fallback_command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ]
+    },
+    {
+      "id": "cpp-conv-dgrad-basic",
+      "path": "samples/cpp/conv_dgrad_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/conv_dgrad.md",
+        "tutorials/convolution.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::conv_dgrad"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-conv-fprop-basic",
+      "path": "samples/cpp/conv_fprop_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/conv_fprop.md",
+        "tutorials/convolution.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::conv_fprop"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-conv-wgrad-basic",
+      "path": "samples/cpp/conv_wgrad_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/conv_wgrad.md",
+        "tutorials/convolution.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::conv_wgrad"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-cos-basic",
+      "path": "samples/cpp/cos_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/cos.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::cos"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-create-execution-plan-basic",
+      "path": "samples/cpp/create_execution_plan_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/create_execution_plan.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::create_execution_plan"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-create-execution-plans-basic",
+      "path": "samples/cpp/create_execution_plans_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/create_execution_plans.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::create_execution_plans"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-deselect-behavior-notes-basic",
+      "path": "samples/cpp/deselect_behavior_notes_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/deselect_behavior_notes.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::deselect_behavior_notes"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-deselect-engines-basic",
+      "path": "samples/cpp/deselect_engines_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/deselect_engines.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::deselect_engines"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-deselect-numeric-notes-basic",
+      "path": "samples/cpp/deselect_numeric_notes_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/deselect_numeric_notes.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::deselect_numeric_notes"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-deselect-workspace-greater-than-basic",
+      "path": "samples/cpp/deselect_workspace_greater_than_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/deselect_workspace_greater_than.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::deselect_workspace_greater_than"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-deserialize-basic",
+      "path": "samples/cpp/deserialize_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/deserialize.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::deserialize"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-div-basic",
+      "path": "samples/cpp/div_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/div.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::div"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-elu-backward-basic",
+      "path": "samples/cpp/elu_backward_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/elu_backward.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::elu_backward"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-elu-basic",
+      "path": "samples/cpp/elu_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/elu.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::elu"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-erf-basic",
+      "path": "samples/cpp/erf_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/erf.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::erf"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-execute-basic",
+      "path": "samples/cpp/execute_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/execute.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::execute"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-execute-plan-at-index-basic",
+      "path": "samples/cpp/execute_plan_at_index_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/execute_plan_at_index.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::execute_plan_at_index"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-exp-basic",
+      "path": "samples/cpp/exp_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/exp.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::exp"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-floor-basic",
+      "path": "samples/cpp/floor_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/floor.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::floor"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-fusion",
+      "path": "samples/cpp/fusion.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Execute matmul, bias, and ReLU in one cuDNN graph.",
+      "owners": [
+        "samples/cpp/README.md",
+        "tutorials/first-graph.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::matmul",
+        "cudnn_frontend::graph::Graph::pointwise"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-gelu-approx-tanh-backward-basic",
+      "path": "samples/cpp/gelu_approx_tanh_backward_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/gelu_approx_tanh_backward.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::gelu_approx_tanh_backward"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-gelu-approx-tanh-basic",
+      "path": "samples/cpp/gelu_approx_tanh_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/gelu_approx_tanh.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::gelu_approx_tanh"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-gelu-backward-basic",
+      "path": "samples/cpp/gelu_backward_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/gelu_backward.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::gelu_backward"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-gelu-basic",
+      "path": "samples/cpp/gelu_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/gelu.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::gelu"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-gen-index-basic",
+      "path": "samples/cpp/gen_index_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/gen_index.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::gen_index"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-get-behavior-notes-basic",
+      "path": "samples/cpp/get_behavior_notes_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/get_behavior_notes.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::get_behavior_notes"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-get-behavior-notes-for-plan-at-index-basic",
+      "path": "samples/cpp/get_behavior_notes_for_plan_at_index_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/get_behavior_notes_for_plan_at_index.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::get_behavior_notes_for_plan_at_index"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-get-engine-count-basic",
+      "path": "samples/cpp/get_engine_count_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/get_engine_count.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::get_engine_count"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-get-execution-plan-count-basic",
+      "path": "samples/cpp/get_execution_plan_count_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/get_execution_plan_count.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::get_execution_plan_count"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-get-knobs-for-engine-basic",
+      "path": "samples/cpp/get_knobs_for_engine_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/get_knobs_for_engine.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::get_knobs_for_engine"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-get-plan-name-at-index-basic",
+      "path": "samples/cpp/get_plan_name_at_index_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/get_plan_name_at_index.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::get_plan_name_at_index"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-get-workspace-size-basic",
+      "path": "samples/cpp/get_workspace_size_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/get_workspace_size.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::get_workspace_size"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-get-workspace-size-plan-at-index-basic",
+      "path": "samples/cpp/get_workspace_size_plan_at_index_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/get_workspace_size_plan_at_index.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::get_workspace_size_plan_at_index"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-graph-cache",
+      "path": "samples/cpp/graph_cache.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Cache a built C++ frontend graph by the tensor metadata that defines its contract.",
+      "owners": [
+        "tutorials/pytorch-integration.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "C++ graph cache ok: builds=1 executions=2",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-graph-configuration",
+      "path": "samples/cpp/graph_configuration.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Configure graph-wide types, target properties, caches, and diagnostics.",
+      "owners": [
+        "samples/cpp/README.md",
+        "api/cpp/print.md",
+        "api/cpp/set_compute_data_type.md",
+        "api/cpp/set_device_properties.md",
+        "api/cpp/set_dynamic_shape_enabled.md",
+        "api/cpp/set_intermediate_data_type.md",
+        "api/cpp/set_io_data_type.md",
+        "api/cpp/set_kernel_cache.md",
+        "api/cpp/set_name.md",
+        "api/cpp/set_override_shape_enabled.md",
+        "api/cpp/set_sm_count.md",
+        "api/cpp/set_sm_version.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::graph_configuration"
+      ],
+      "regions": [
+        "configuration",
+        "print"
+      ],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-identity-basic",
+      "path": "samples/cpp/identity_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/identity.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::identity"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-instancenorm-backward-basic",
+      "path": "samples/cpp/instancenorm_backward_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/instancenorm_backward.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::instancenorm_backward"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-instancenorm-basic",
+      "path": "samples/cpp/instancenorm_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/instancenorm.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::instancenorm"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-key-basic",
+      "path": "samples/cpp/key_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/key.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::key"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-layernorm-backward-basic",
+      "path": "samples/cpp/layernorm_backward_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/layernorm_backward.md",
+        "tutorials/normalization.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::layernorm_backward"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-layernorm-basic",
+      "path": "samples/cpp/layernorm_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/layernorm.md",
+        "tutorials/normalization.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::layernorm"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-leaky-relu-backward-basic",
+      "path": "samples/cpp/leaky_relu_backward_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/leaky_relu_backward.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::leaky_relu_backward"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-leaky-relu-basic",
+      "path": "samples/cpp/leaky_relu_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/leaky_relu.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::leaky_relu"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-log-basic",
+      "path": "samples/cpp/log_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/log.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::log"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-logical-and-basic",
+      "path": "samples/cpp/logical_and_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/logical_and.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::logical_and"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-logical-not-basic",
+      "path": "samples/cpp/logical_not_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/logical_not.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::logical_not"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-logical-or-basic",
+      "path": "samples/cpp/logical_or_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/logical_or.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::logical_or"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-matmul",
+      "path": "samples/cpp/matmul.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Build and execute the C++ BF16 matmul quick start.",
+      "owners": [
+        "api/cpp/matmul.md",
+        "getting-started/quickstart.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::matmul"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-matmul-basic",
+      "path": "samples/cpp/matmul_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/matmul.md",
+        "how-to/matmul-layouts.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::matmul"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-max-basic",
+      "path": "samples/cpp/max_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/max.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::max"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-min-basic",
+      "path": "samples/cpp/min_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/min.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::min"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-mod-basic",
+      "path": "samples/cpp/mod_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/mod.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::mod"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-moe-grouped-matmul-backward",
+      "path": "samples/cpp/moe_grouped_matmul_backward.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/moe_grouped_matmul_bwd.md",
+        "tutorials/moe-grouped-matmul.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::moe_grouped_matmul_bwd"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc",
+        "sm90",
+        "cudnn>=92200",
+        "cublaslt>=130500"
+      ],
+      "timeout_seconds": 180,
+      "expected": "moe grouped matmul backward ok: dweight verified per expert",
+      "verification": "compiled against current headers; execution requires cuDNN 9.22+ and cublasLt 13.5+",
+      "fallback_command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ]
+    },
+    {
+      "id": "cpp-moe-grouped-matmul-basic",
+      "path": "samples/cpp/moe_grouped_matmul_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/moe_grouped_matmul.md",
+        "tutorials/moe-grouped-matmul.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::moe_grouped_matmul"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-mul-basic",
+      "path": "samples/cpp/mul_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/mul.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::mul"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-neg-basic",
+      "path": "samples/cpp/neg_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/neg.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::neg"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-plan-inspection",
+      "path": "samples/cpp/plan_inspection.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Build, filter, autotune, and inspect plans for a small BF16 matmul.",
+      "owners": [
+        "samples/cpp/README.md",
+        "api/cpp/apply_oss_slot_indices_to_plans.md",
+        "api/cpp/autotune.md",
+        "api/cpp/deselect_shared_mem_greater_than.md",
+        "api/cpp/get_autotune_workspace_size.md",
+        "api/cpp/get_plan_name.md",
+        "api/cpp/get_variant_pack_uids_sorted.md",
+        "api/cpp/prepare_variant_pack_template.md",
+        "how-to/plan-selection.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::plan_inspection"
+      ],
+      "regions": [
+        "planning",
+        "autotune",
+        "inspection"
+      ],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-pow-basic",
+      "path": "samples/cpp/pow_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/pow.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::pow"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-query-tensor-attributes-of-uid-basic",
+      "path": "samples/cpp/query_tensor_attributes_of_uid_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/query_tensor_attributes_of_uid.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::query_tensor_attributes_of_uid"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-reciprocal-basic",
+      "path": "samples/cpp/reciprocal_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/reciprocal.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::reciprocal"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-reduction-basic",
+      "path": "samples/cpp/reduction_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/reduction.md",
+        "tutorials/pointwise-reduction.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::reduction"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-relu-backward-basic",
+      "path": "samples/cpp/relu_backward_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/relu_backward.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::relu_backward"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-relu-basic",
+      "path": "samples/cpp/relu_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/relu.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::relu"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-resample-basic",
+      "path": "samples/cpp/resample_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Execute 2-D max pooling and compare with an index-based reference.",
+      "owners": [
+        "api/cpp/resample.md",
+        "how-to/resampling.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::resample"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "max-pooling output: shape=[1, 1, 2, 2], values=[6, 8, 14, 16]",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-rmsnorm-backward-basic",
+      "path": "samples/cpp/rmsnorm_backward_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/rmsnorm_backward.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::rmsnorm_backward"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-rmsnorm-basic",
+      "path": "samples/cpp/rmsnorm_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/rmsnorm.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::rmsnorm"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-rope-backward-basic",
+      "path": "samples/cpp/rope_backward_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/rope_backward.md",
+        "how-to/rope.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::rope_backward"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc",
+        "cudnn>=92400"
+      ],
+      "timeout_seconds": 180,
+      "expected": "rope backward matches reference",
+      "verification": "compiled against current headers; execution requires cuDNN 9.24+",
+      "fallback_command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ]
+    },
+    {
+      "id": "cpp-rope-basic",
+      "path": "samples/cpp/rope_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/rope.md",
+        "how-to/rope.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::rope"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc",
+        "cudnn>=92400"
+      ],
+      "timeout_seconds": 180,
+      "expected": "rope result matches reference",
+      "verification": "compiled against current headers; execution requires cuDNN 9.24+",
+      "fallback_command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ]
+    },
+    {
+      "id": "cpp-rsqrt-basic",
+      "path": "samples/cpp/rsqrt_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/rsqrt.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::rsqrt"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-scale-basic",
+      "path": "samples/cpp/scale_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/scale.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::scale"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-sdpa-backward-basic",
+      "path": "samples/cpp/sdpa_backward_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/sdpa_backward.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::sdpa_backward"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-sdpa-bf16-causal",
+      "path": "samples/cpp/sdpa_bf16_causal.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone causal GQA forward and backward sample.",
+      "owners": [
+        "api/cpp/sdpa.md",
+        "tutorials/attention.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::sdpa",
+        "cudnn_frontend::graph::Graph::sdpa_backward"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-sdpa-block-mask",
+      "path": "samples/cpp/sdpa_block_mask.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone packed-UINT8 block-mask SDPA sample.",
+      "owners": [
+        "api/cpp/sdpa.md",
+        "api/python/sdpa.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::sdpa"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc",
+        "sm100",
+        "cudnn>=92600"
+      ],
+      "timeout_seconds": 180,
+      "expected": "packed UINT8 block-mask SDPA passed",
+      "verification": "compiled with CUDA 13.1 headers; SM100 execution requires cuDNN 9.26+",
+      "fallback_command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ]
+    },
+    {
+      "id": "cpp-sdpa-custom-score-modifier",
+      "path": "samples/cpp/sdpa_custom_score_modifier.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/sdpa.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::sdpa_custom_score_modifier"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-sdpa-dropout",
+      "path": "samples/cpp/sdpa_dropout.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/sdpa.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::sdpa_dropout"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-sdpa-fp8-backward-basic",
+      "path": "samples/cpp/sdpa_fp8_backward_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/sdpa_fp8_backward.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::sdpa_fp8_backward"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-sdpa-fp8-basic",
+      "path": "samples/cpp/sdpa_fp8_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/sdpa_fp8.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::sdpa_fp8"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-sdpa-inference-no-stats",
+      "path": "samples/cpp/sdpa_inference_no_stats.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/sdpa.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::sdpa_inference_no_stats"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-sdpa-mxfp8-backward-basic",
+      "path": "samples/cpp/sdpa_mxfp8_backward_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/sdpa_mxfp8_backward.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::sdpa_mxfp8_backward"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-sdpa-mxfp8-basic",
+      "path": "samples/cpp/sdpa_mxfp8_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/sdpa_mxfp8.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::sdpa_mxfp8"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-sdpa-paged-kv-cache",
+      "path": "samples/cpp/sdpa_paged_kv_cache.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/sdpa.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::sdpa_paged_kv_cache"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-sdpa-sink-token",
+      "path": "samples/cpp/sdpa_sink_token.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/sdpa.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::sdpa_sink_token"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-sdpa-sliding-window-chunked-prefill",
+      "path": "samples/cpp/sdpa_sliding_window_chunked_prefill.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/sdpa.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::sdpa_sliding_window_chunked_prefill"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-sdpa-variable-length-padded",
+      "path": "samples/cpp/sdpa_variable_length_padded.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/sdpa.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::sdpa_variable_length_padded"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-select-behavior-notes-basic",
+      "path": "samples/cpp/select_behavior_notes_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/select_behavior_notes.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::select_behavior_notes"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-select-numeric-notes-basic",
+      "path": "samples/cpp/select_numeric_notes_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/select_numeric_notes.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::select_numeric_notes"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-serialize-basic",
+      "path": "samples/cpp/serialize_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/serialize.md",
+        "api/cpp/warmup.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::serialize"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-sigmoid-backward-basic",
+      "path": "samples/cpp/sigmoid_backward_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/sigmoid_backward.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::sigmoid_backward"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-sigmoid-basic",
+      "path": "samples/cpp/sigmoid_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/sigmoid.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::sigmoid"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-sin-basic",
+      "path": "samples/cpp/sin_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/sin.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::sin"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-slice-basic",
+      "path": "samples/cpp/slice_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Slice a tensor and compare with an index-based reference.",
+      "owners": [
+        "api/cpp/slice.md",
+        "how-to/shape-operations.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::slice"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc",
+        "sm100",
+        "cudnn>=92200"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "compiled against current headers; standalone execution requires CUDA 13.1+, cuDNN 9.22+, and SM100+",
+      "fallback_command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ]
+    },
+    {
+      "id": "cpp-softplus-backward-basic",
+      "path": "samples/cpp/softplus_backward_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/softplus_backward.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::softplus_backward"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-softplus-basic",
+      "path": "samples/cpp/softplus_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/softplus.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::softplus"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-sqrt-basic",
+      "path": "samples/cpp/sqrt_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/sqrt.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::sqrt"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-sub-basic",
+      "path": "samples/cpp/sub_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/sub.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::sub"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-swish-backward-basic",
+      "path": "samples/cpp/swish_backward_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/swish_backward.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::swish_backward"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-swish-basic",
+      "path": "samples/cpp/swish_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/swish.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::swish"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-tan-basic",
+      "path": "samples/cpp/tan_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/tan.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::tan"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-tanh-backward-basic",
+      "path": "samples/cpp/tanh_backward_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/tanh_backward.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::tanh_backward"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-tanh-basic",
+      "path": "samples/cpp/tanh_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/tanh.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::tanh"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-tensor-basic",
+      "path": "samples/cpp/tensor_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/tensor.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::tensor"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-tensor-like-basic",
+      "path": "samples/cpp/tensor_like_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/tensor_like.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::tensor_like"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-tensor-scalar-basic",
+      "path": "samples/cpp/tensor_scalar_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/tensor_scalar.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::tensor_scalar"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cpp-transpose-basic",
+      "path": "samples/cpp/transpose_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Transpose a tensor and compare with an index-based reference.",
+      "owners": [
+        "api/cpp/transpose.md",
+        "how-to/shape-operations.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::transpose"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc",
+        "sm100",
+        "cudnn>=92200"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "compiled against current headers; execution requires CUDA 13.1+, cuDNN 9.22+, and SM100+",
+      "fallback_command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ]
+    },
+    {
+      "id": "cpp-validate-basic",
+      "path": "samples/cpp/validate_basic.cc",
+      "language": "cpp",
+      "mode": "compile-run",
+      "purpose": "Complete standalone C++ sample.",
+      "owners": [
+        "api/cpp/validate.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::validate"
+      ],
+      "regions": [],
+      "command": [
+        "nvcc",
+        "-std=c++17",
+        "-Iinclude",
+        "{path}",
+        "-lcudnn",
+        "-lnvrtc",
+        "-o",
+        "{binary}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 180,
+      "expected": "exit:0",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "shell-install-python",
+      "path": "samples/shell/install_python.sh",
+      "language": "shell",
+      "mode": "execute",
+      "purpose": "Install the released package, optional OSS dependencies, or this source checkout.",
+      "owners": [
+        "getting-started/installation.md"
+      ],
+      "apis": [],
+      "regions": [],
+      "command": [
+        "bash",
+        "{path}"
+      ],
+      "requirements": [
+        "bash",
+        "disposable_python_environment"
+      ],
+      "timeout_seconds": 300,
+      "expected": "exit:0",
+      "verification": "bash syntax checked",
+      "fallback_command": [
+        "bash",
+        "-n",
+        "{path}"
+      ]
+    },
+    {
+      "id": "shell-run-quickstarts",
+      "path": "samples/shell/run_quickstarts.sh",
+      "language": "shell",
+      "mode": "execute",
+      "purpose": "Run the published Python and C++ quick starts.",
+      "owners": [
+        "getting-started/verify-environment.md",
+        "getting-started/quickstart.md"
+      ],
+      "apis": [],
+      "regions": [
+        "python",
+        "cpp"
+      ],
+      "command": [
+        "bash",
+        "{path}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc"
+      ],
+      "timeout_seconds": 300,
+      "expected": "matmul ok",
+      "verification": "executed on CUDA 13.1/cuDNN 9.15.1/SM100"
+    },
+    {
+      "id": "cmake-source-integration",
+      "path": "samples/cmake/CMakeLists.txt",
+      "language": "cmake",
+      "mode": "configure-build",
+      "purpose": "Configure and compile the C++ quick start through the exported frontend target.",
+      "owners": [
+        "getting-started/installation.md"
+      ],
+      "apis": [
+        "cudnn_frontend::graph::Graph::matmul"
+      ],
+      "regions": [],
+      "command": [
+        "cmake",
+        "-S",
+        "docs/samples/cmake",
+        "-B",
+        "{build_dir}",
+        "-DCUDNN_FRONTEND_SOURCE={repo}"
+      ],
+      "requirements": [
+        "linux",
+        "cuda",
+        "nvcc",
+        "cmake"
+      ],
+      "timeout_seconds": 300,
+      "expected": "exit:0",
+      "verification": "configured and compiled with CMake 3.31.4 and CUDA 13.1"
+    }
+  ]
+}

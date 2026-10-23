@@ -1,0 +1,15 @@
+```cpp maxLines=0
+    fe::graph::Graph bn_graph;
+    auto sum               = tensor(bn_graph, "sum");
+    auto sq_sum            = tensor(bn_graph, "sq_sum");
+    auto scale             = tensor(bn_graph, "scale");
+    auto bias              = tensor(bn_graph, "bias");
+    auto previous_mean     = tensor(bn_graph, "previous_mean");
+    auto previous_variance = tensor(bn_graph, "previous_variance");
+    auto epsilon           = bn_graph.tensor(0.001f, fe::graph::ScalarType::COMPILE_TIME_CONST);
+    auto momentum          = bn_graph.tensor(0.1f, fe::graph::ScalarType::COMPILE_TIME_CONST);
+    auto count      = bn_graph.tensor(int64_t{16}, fe::graph::ScalarType::COMPILE_TIME_CONST);
+    auto bn_options = fe::graph::BN_finalize_attributes().set_previous_running_stats(
+        previous_mean, previous_variance, momentum);
+    auto bn_outputs = bn_graph.bn_finalize(sum, sq_sum, scale, bias, epsilon, count, bn_options);
+```

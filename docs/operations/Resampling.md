@@ -16,7 +16,7 @@ The output array contains two tensors:
 
 The Resample_attributes class is used to configure the resampling operation. It provides the following setters:
 
-```
+```cpp
 # The resampling mode, such as average pooling, max pooling, bi-linear, or cubic.
 auto set_resampling_mode(ResampleMode_t const& value) -> Resample_attributes&;
 

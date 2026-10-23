@@ -146,12 +146,12 @@ two channel-major planes plus `y` (bf16, the inner axis padded to a multiple of 
 outgoing contraction over-reads at `N % 8 != 0`. The performance knobs come from `cudnn.triangle_multiplicative_update.heuristics`:
 `recommend(N, c, B, direction)` returns the measured default `TriMulKnobs` -- a bucket table keyed by (hidden width, N bucket) carries the
 complete knob set, and a short refinement table overrides one axis per (batch bucket, direction) where a measured cell beat the bucket's pick
-decisively in every pass that measured it. The bucket picks: the contraction tile (the 1-CTA 128x128 tile at N <= 128 and at 384, the 2-CTA
+decisively in every pass that measured it. The bucket picks: the contraction tile (the 1-CTA 128x128 tile at N ≤ 128 and at 384, the 2-CTA
 pair tile at 129-256 and 768, with the A operand multicast across 2 CTAs at 512 and across 4 from 1024), the projection stage's tile order
 (`interleaved` at c = 128 below N = 512, `major` elsewhere), the output stage's prologue form (`transpose` at c = 128, `mn_major` at c = 256)
 and the scheduler ring depth (1 from N >= 384 at c = 128 and from N >= 129 at c = 256, else 2). The refinements: at c = 128 the ring is 1 deep
-at N <= 128 for the incoming direction with B = 1, 1 deep with the pass-major projection order at 256 <= N < 384 from B >= 4, and 4 deep at
-384 <= N < 512 with B = 1; at c = 256 the ring is 1 deep at N <= 128 from B >= 4. Batch sizes
+at N ≤ 128 for the incoming direction with B = 1, 1 deep with the pass-major projection order for N from 256 through 383 when B >= 4, and 4 deep
+for N from 384 through 511 with B = 1; at c = 256 the ring is 1 deep at N ≤ 128 from B >= 4. Batch sizes
 other than 1 and 4 take the nearest measured batch bucket below (B >= 4 -> the B = 4 picks, else the B = 1 picks), an N between two buckets
 the first bucket at or below it. Every pick is the best of a three-pass measured sweep on one GPU of a 212-SM Rubin perf node (both directions,
 B = 1 and 4, a control pair per cell; the second and third passes re-measured every alternative against the table they shipped). The
@@ -181,7 +181,7 @@ window CLEAN) against that node's HBM pin of a read + write copy kernel (10 237 
 (its only route on this architecture) measured on the SAME GPU in the same reserved session with the same protocol (graph replay vs graph
 replay; 600-iteration competitor windows so the clock sampler sees the small cells -- the two N = 128 cells at 6000 iterations with the
 sampler's busy threshold at 20 % GPU utilization, because a 36-40 us call keeps the GPU at ~30 % busy and would otherwise leave no clock
-sample; and every competitor cell whose call is under ~200 us (N <= 512 here) in its OWN process at 1200 iterations, because a profiler
+sample; and every competitor cell whose call is under ~200 us (N ≤ 512 here) in its OWN process at 1200 iterations, because a profiler
 session earlier in the same process leaves CUPTI attached and adds 3.5-4.5 us of launch latency to every later graph replay, which a
 short call cannot hide -- see the paragraph below the table).
 Speed-ups are `t_cuEq / t_FROST - 1` (positive = FROST faster); the all-valid mask, biases present, `c = c_z`. Three columns, three
@@ -214,11 +214,11 @@ at N = 2048 and `C = 256, B = 1` at N = 2048, where `2 * 256 * 2048 * 2048` is e
 - `C = 128, B = 1` (15 cells): 12.4-34.2 % of the pin; vs cuEquivariance +24 / +34 % at N = 128, +44 % at 217, +0.9 / +1.3 % at 256,
   +5.1-7.7 % from 512 to 2048, and **-21.7 / -22.1 % at N = 384** (the projection kernels' 256-row tiles waste a quarter of their rows at
   `N % 256 == 128`).
-- `C = 128, B = 4` (13 cells, N <= 1024): 23.6-35.3 % of the pin; vs cuEquivariance +1.2 / +1.0 % at 128, +39 % at 217, +5.3 / +5.3 % at 256,
+- `C = 128, B = 4` (13 cells, N ≤ 1024): 23.6-35.3 % of the pin; vs cuEquivariance +1.2 / +1.0 % at 128, +39 % at 217, +5.3 / +5.3 % at 256,
   +6.2-7.9 % from 512 to 1024, -19.6 / -19.8 % at 384.
-- `C = 256, B = 1` (13 cells, N <= 1024): 7.0-13.7 % of the pin; **slower than cuEquivariance by 20-44 %** at N >= 217 (-32 % at 217, -38 % at
+- `C = 256, B = 1` (13 cells, N ≤ 1024): 7.0-13.7 % of the pin; **slower than cuEquivariance by 20-44 %** at N >= 217 (-32 % at 217, -38 % at
   256, -44 % at 384, -24 % at 512, -22 % at 768, -20 % at 1024); +96 % at N = 128, where cuEquivariance's own route takes 207 us.
-- `C = 256, B = 4` (11 cells, N <= 768): 10.4-13.8 % of the pin; slower than cuEquivariance by 13-40 % (-38 % at 128, -13 % at 217, -24 % at
+- `C = 256, B = 4` (11 cells, N ≤ 768): 10.4-13.8 % of the pin; slower than cuEquivariance by 13-40 % (-38 % at 128, -13 % at 217, -24 % at
   256, -40 % at 384, -21 % at 512, -20 % at 768).
 
 At `C = 128` the two LayerNorm-prologue GEMMs (K1 + K3) are 81-90 % of the chain's device time (85 % at N = 128, 86-88 % at 217-1024, 81 % at
@@ -235,13 +235,13 @@ the exception at 5 % slower here (105.8 vs 100.6 us). Of the competitor windows 
 2352 MHz busy clock (one step under the lock, -1.0 %; CLOCK-DEGRADED by the protocol) -- its incoming twin read CLEAN at 2364 MHz; across the
 52-cell grid the competitor's degraded windows are five N = 2048 cells (`C = 128, B = 1` outgoing, `C = 128, B = 4` and `C = 256, B = 4` in
 both directions). Every FROST window is CLEAN; every competitor window of the table holds 30 or more busy clock samples (the FROST windows
-22-140). The competitor figures at N <= 512 come from one process per cell: measured in one process after another cell's profiler session
+22-140). The competitor figures at N ≤ 512 come from one process per cell: measured in one process after another cell's profiler session
 (this table's first pass) the same calls read 3.9-4.6 us slower -- 68.0 us at N = 256 for the 64.0 here, 80.6 for the 76.5 at N = 217,
 67.4 / 67.7 for the 63.2 / 63.1 at N = 128, B = 4 -- which had turned +0.9 / +1.3 % into +7.2 / +7.5 % at N = 256 and +1.2 / +1.0 % into
 +7.9 / +8.4 % at N = 128, B = 4; the cells above ~120 us per call were unchanged within 1 %. The FROST column is not exposed to it: the
 sweep interleaves twenty slots per iteration, so a graph replay never starts on an idle device, and the derivation pass (no profiler
 session) agrees with these figures within the +-1.3 % stated above. cuEquivariance's eager host floor on this GPU is 217-289 us
-per call; the FROST class API's is 96-101 us at `C = 128`, `B = 1` (86-95 us on the derivation node) -- at N <= 256 an eager call is
+per call; the FROST class API's is 96-101 us at `C = 128`, `B = 1` (86-95 us on the derivation node) -- at N ≤ 256 an eager call is
 host-bound (device 29-63 us), which the captured CUDA graph removes.
 
 Byte count (Nsight Compute `dram__bytes.sum` over the three kernels, warm L2 between launches, measured on the pre-heuristics defaults):
@@ -257,7 +257,7 @@ with the CuTe-DSL kernel launch's `use_pdl` attribute, so K2's prologue overlaps
 pre-heuristics defaults on another GPU of the same node class: against the same three kernels rendered without PDL, the eager chain is
 +0.2..+2.5 % faster with it at every N except 384 (-1.2 %, where the eager PDL chain pays more than it overlaps; the graph replay of the PDL-on
 chain is still the fastest form there); the captured CUDA graph keeps the PDL edges and adds +1.1..+3.5 % over the eager PDL-on chain at
-N <= 384, +0.3..+0.5 % at 512 and nothing above (vs the PDL-off eager chain: +3.9 % at 256 down to +0.3 % at 2048). An earlier revision of this
+N ≤ 384, +0.3..+0.5 % at 512 and nothing above (vs the PDL-off eager chain: +3.9 % at 256 down to +0.3 % at 2048). An earlier revision of this
 page stated that programmatic dependent launch was "not an arm of this API" because the launch path carried no such attribute; that was
 wrong -- the chain had PDL on all along, and the PDL-off column was the baseline it was missing.
 

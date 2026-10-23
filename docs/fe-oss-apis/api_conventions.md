@@ -7,7 +7,7 @@ the API pruning plan, not this document.
 
 ## Name pattern
 
-```
+```text
 cudnn.ops.<op_name>_<direction>               # PyTorch
 cudnn.ops.<op_name>_<direction>_jax           # JAX
 cudnn.ops.<op_name>_<direction>_standalone    # no framework
@@ -27,7 +27,7 @@ Ops are imperative: forward and backward are separate calls.
 
 A family groups related ops under `cudnn.ops.<family>`:
 
-```
+```text
 cudnn.ops.<family>.<op_name>_<direction>      # plus _jax / _standalone
 ```
 

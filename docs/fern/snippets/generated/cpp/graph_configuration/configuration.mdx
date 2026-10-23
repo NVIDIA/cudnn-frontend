@@ -1,0 +1,13 @@
+```cpp maxLines=0
+    fe::graph::Graph graph;
+    graph.set_name("configured_graph")
+        .set_io_data_type(fe::DataType_t::HALF)
+        .set_intermediate_data_type(fe::DataType_t::FLOAT)
+        .set_compute_data_type(fe::DataType_t::FLOAT)
+        .set_dynamic_shape_enabled(true)
+        .set_override_shape_enabled(true)
+        .set_sm_count(120)
+        .set_sm_version(100)
+        .set_kernel_cache(kernel_cache)
+        .set_device_properties(properties);
+```

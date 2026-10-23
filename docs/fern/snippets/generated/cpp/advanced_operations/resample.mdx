@@ -1,0 +1,13 @@
+```cpp maxLines=0
+    fe::graph::Graph resample_graph;
+    auto image  = tensor(resample_graph, "image", fe::DataType_t::HALF);
+    auto pooled = resample_graph.resample(image,
+                                          fe::graph::Resample_attributes()
+                                              .set_generate_index(true)
+                                              .set_resampling_mode(fe::ResampleMode_t::MAXPOOL)
+                                              .set_padding_mode(fe::PaddingMode_t::NEG_INF_PAD)
+                                              .set_window({2, 2})
+                                              .set_stride({2, 2})
+                                              .set_pre_padding({0, 0})
+                                              .set_post_padding({0, 0}));
+```

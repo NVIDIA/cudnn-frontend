@@ -76,7 +76,7 @@ planning.
 Let `T` be the source token count and `R` the routed row count. Supply token
 `[1,T,K]`, weight `[E,K,N]`, INT32 `token_index` `[1,R,1]` with contiguous rows,
 and INT32 or INT64 `first_token_offset` `[G+1,1,1]`. The result is `[1,R,N]`.
-Offsets are nondecreasing boundaries beginning at zero, with final endpoint <= R;
+Offsets are nondecreasing boundaries beginning at zero, with final endpoint ≤ R;
 group `g` uses expert `g % E`, and empty groups are supported. Each index is a
 source row in `[0,T)`, so repeated source tokens are allowed.
 

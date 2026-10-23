@@ -10,14 +10,14 @@ $$ response = image * filter $$
 ### C++ API
 
 
-```
+```cpp
 std::shared_ptr<Tensor_attributes> conv_fprop(std::shared_ptr<Tensor_attributes> image,
                                                   std::shared_ptr<Tensor_attributes> filter,
                                                   Conv_fprop_attributes);
 ```
 
 Conv_fprop_attributes is a lightweight structure with setters:  
-```
+```cpp
 Conv_fprop_attributes&
 set_padding(std::vector<int64_t>)
 
@@ -89,14 +89,14 @@ Convolution dgrad computes data gradient during backpropagation.
 
 ### C++ API
 
-```
+```cpp
 std::shared_ptr<Tensor_attributes> conv_dgrad(std::shared_ptr<Tensor_attributes> image,
                                                   std::shared_ptr<Tensor_attributes> filter,
                                                   Conv_dgrad_attributes);
 ```
 
 Conv_dgrad_attributes is a lightweight structure with setters:  
-```
+```cpp
 Conv_dgrad_attributes&
 set_padding(std::vector<int64_t>)
 
@@ -137,14 +137,14 @@ Convolution wgrad computes weight gradient during backpropagation.
 
 ### C++ API
 
-```
+```cpp
 std::shared_ptr<Tensor_attributes> conv_wgrad(std::shared_ptr<Tensor_attributes> image,
                                                   std::shared_ptr<Tensor_attributes> filter,
                                                   Conv_wgrad_attributes);
 ```
 
 Conv_wgrad_attributes is a lightweight structure with setters:  
-```
+```cpp
 Conv_wgrad_attributes&
 set_padding(std::vector<int64_t>)
 

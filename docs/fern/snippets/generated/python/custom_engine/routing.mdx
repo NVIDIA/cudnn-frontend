@@ -1,0 +1,10 @@
+```python maxLines=0
+    graph.validate()
+    graph.build_operation_graph()
+    graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.B])
+    assert graph.plans
+    graph.select_plan(0)
+    graph.check_support()
+    graph.build_plans()
+    owner = graph.selected_engine.name if graph.selected_engine else "cuDNN backend"
+```

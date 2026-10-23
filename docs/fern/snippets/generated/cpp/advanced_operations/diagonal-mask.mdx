@@ -1,0 +1,16 @@
+```cpp maxLines=0
+    fe::graph::Graph mask_graph;
+    auto scores            = tensor(mask_graph, "scores");
+    auto negative_infinity = mask_graph.tensor(-std::numeric_limits<float>::infinity(),
+                                               fe::graph::ScalarType::COMPILE_TIME_CONST);
+    auto masked            = mask_graph.diagonal_band_mask(
+        scores,
+        negative_infinity,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        fe::graph::DiagonalBandMask_attributes().set_comparison_mode(fe::PointwiseMode_t::CMP_GE));
+```

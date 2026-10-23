@@ -23,14 +23,14 @@ Where:
 
 ### C++ API
 
-```
+```cpp
 std::array<std::shared_ptr<Tensor_attributes>, 2> block_scale_quantize(std::shared_ptr<Tensor_attributes> x,
                                                                        Block_scale_quantize_attributes);
 ```
 where the output array is in the order of `[y, scale]`
 
 Block_scale_quantize_attributes is a lightweight structure with setters:
-```
+```cpp
 Block_scale_quantize_attributes&
 set_block_size(int32_t const value)
 
@@ -56,14 +56,14 @@ Where:
 
 ### C++ API
 
-```
+```cpp
 std::shared_ptr<Tensor_attributes> block_scale_dequantize(std::shared_ptr<Tensor_attributes> x,
                                                           std::shared_ptr<Tensor_attributes> scale,
                                                           Block_scale_dequantize_attributes);
 ```
 
 Block_scale_dequantize_attributes is a lightweight structure with setters:
-```
+```cpp
 Block_scale_dequantize_attributes&
 set_block_size(int32_t const value, int32_t idx = 0)
 

@@ -15,7 +15,7 @@ NSA combines multiple attention strategies to efficiently process long sequences
 
 ### Architecture
 
-```
+```text
                                      Query (Q)
                                          |
             +----------------------------+---------------+

@@ -9,6 +9,235 @@ navigation:
   - page: Samples
     path: ../../samples.mdx
     slug: samples
+  - section: Frontend Guide
+    path: ../../index.md
+    slug: frontend
+    skip-slug: true
+    contents:
+      - section: Getting Started
+        slug: getting-started
+        contents:
+          - page: Installation
+            path: ../../getting-started/installation.md
+            slug: installation
+          - page: Verify the Environment
+            path: ../../getting-started/verify-environment.md
+            slug: verify-environment
+          - page: Quick Start
+            path: ../../getting-started/quickstart.md
+            slug: quickstart
+          - page: Choose an Interface
+            path: ../../getting-started/choose-interface.md
+            slug: choose-interface
+          - page: Compatibility
+            path: ../../getting-started/compatibility.md
+            slug: compatibility
+      - section: Tutorials
+        path: ../../tutorials/index.md
+        slug: tutorials
+        contents:
+          - page: Build and Extend a Graph
+            path: ../../tutorials/first-graph.md
+            slug: first-graph
+          - page: Scaled Dot-Product Attention
+            path: ../../tutorials/attention.md
+            slug: attention
+          - page: Pointwise and Reduction
+            path: ../../tutorials/pointwise-reduction.md
+            slug: pointwise-reduction
+          - page: Train a Convolution
+            path: ../../tutorials/convolution.md
+            slug: convolution
+          - page: Train with Normalization
+            path: ../../tutorials/normalization.md
+            slug: normalization
+          - page: PyTorch Integration
+            path: ../../tutorials/pytorch-integration.md
+            slug: pytorch-integration
+          - page: Block Scaling
+            path: ../../tutorials/block-scaling.md
+            slug: block-scaling
+          - page: MoE Grouped Matmul
+            path: ../../tutorials/moe-grouped-matmul.md
+            slug: moe-grouped-matmul
+      - section: How-to Guides
+        path: ../../how-to/index.md
+        slug: how-to
+        contents:
+          - page: Use cudnn.Graph
+            path: ../../how-to/python-graph.md
+            slug: python-graph
+          - page: Control the Explicit Lifecycle
+            path: ../../how-to/explicit-lifecycle.md
+            slug: explicit-lifecycle
+          - page: Cache Decorated Graphs
+            path: ../../how-to/graph-cache.md
+            slug: graph-cache
+          - page: Configure Matmul Layouts
+            path: ../../how-to/matmul-layouts.md
+            slug: matmul-layouts
+          - page: Choose a Normalization
+            path: ../../how-to/normalization.md
+            slug: normalization
+          - page: Apply RoPE
+            path: ../../how-to/rope.md
+            slug: rope
+          - page: Resample and Pool
+            path: ../../how-to/resampling.md
+            slug: resampling
+          - page: Use Shape Operations
+            path: ../../how-to/shape-operations.md
+            slug: shape-operations
+          - page: Build Convolution Variants
+            path: ../../how-to/convolution-variants.md
+            slug: convolution-variants
+          - page: Run Causal Conv1d
+            path: ../../how-to/causal-convolution.md
+            slug: causal-convolution
+          - page: Configure Attention Recipes
+            path: ../../how-to/attention-recipes.md
+            slug: attention-recipes
+          - page: Diagnose Failures
+            path: ../../how-to/troubleshoot.md
+            slug: troubleshoot
+          - page: Select and Autotune Plans
+            path: ../../how-to/plan-selection.md
+            slug: plan-selection
+          - page: Manage Runtime Resources
+            path: ../../how-to/runtime-resources.md
+            slug: runtime-resources
+          - page: Run Dynamic Shapes
+            path: ../../how-to/dynamic-shapes.md
+            slug: dynamic-shapes
+          - page: Serialize and Deploy
+            path: ../../how-to/deployment.md
+            slug: deployment
+          - page: Use CUDA Graphs
+            path: ../../how-to/cuda-graphs.md
+            slug: cuda-graphs
+          - page: Register a PyTorch Operator
+            path: ../../how-to/pytorch-custom-operator.md
+            slug: pytorch-custom-operator
+          - page: Inspect Python Engine Selection
+            path: ../../how-to/custom-engine.md
+            slug: custom-engine
+          - page: Pin a C++ Engine
+            path: ../../how-to/engine-knobs.md
+            slug: engine-knobs
+          - page: Use Scalars and Constants
+            path: ../../how-to/scalars-and-constants.md
+            slug: scalars-and-constants
+          - page: Migrate Legacy C++
+            path: ../../how-to/legacy-migration.md
+            slug: legacy-migration
+          - page: Use Low Precision
+            path: ../../how-to/low-precision.md
+            slug: low-precision
+      - section: Concepts
+        path: ../../concepts/index.md
+        slug: concepts
+        contents:
+          - page: Glossary
+            path: ../../concepts/glossary.md
+            slug: glossary
+          - page: API Layers and Lifecycle
+            path: ../../concepts/api-layers.md
+            slug: api-layers
+          - page: Python IR Routing
+            path: ../../concepts/python-ir-routing.md
+            slug: python-ir-routing
+          - page: Graphs and Tensors
+            path: ../../concepts/graphs-and-tensors.md
+            slug: graphs-and-tensors
+          - page: Fusion Patterns
+            path: ../../concepts/fusion-patterns.md
+            slug: fusion-patterns
+          - page: Layouts and Types
+            path: ../../concepts/layouts.md
+            slug: layouts
+          - page: Operations and Training
+            path: ../../concepts/operations-training.md
+            slug: operations-training
+          - page: Engines and Plans
+            path: ../../concepts/execution-plans.md
+            slug: execution-plans
+          - page: Runtime Resources
+            path: ../../concepts/runtime-resources.md
+            slug: runtime-resources
+          - page: Compilation and Caching
+            path: ../../concepts/compilation-caching.md
+            slug: compilation-caching
+          - page: Attention
+            path: ../../concepts/attention.md
+            slug: attention
+          - page: Attention History and Benchmarks
+            path: ../../concepts/attention-support-history.md
+            slug: attention-support-history
+          - page: Numerical Precision
+            path: ../../concepts/numerical-precision.md
+            slug: numerical-precision
+          - page: OSS Engines and Stability
+            path: ../../concepts/oss-stability.md
+            slug: oss-stability
+      - section: Optional Kernel Contracts
+        path: ../../reference/index.md
+        slug: optional-kernels
+        contents:
+          - page: Choose an OSS Engine
+            path: ../../reference/oss-engines.md
+            slug: oss-engines
+          - page: Block-Sparse Attention
+            path: ../../reference/oss-block-sparse-attention.md
+            slug: oss-block-sparse-attention
+          - page: DeepSeek Sparse Attention
+            path: ../../reference/oss-deepseek-sparse-attention.md
+            slug: oss-deepseek-sparse-attention
+          - page: Native Sparse Attention
+            path: ../../reference/oss-native-sparse-attention.md
+            slug: oss-native-sparse-attention
+          - page: SDPA D=256
+            path: ../../reference/oss-sdpa-d256.md
+            slug: oss-sdpa-d256
+          - page: Dense GEMM Fusions
+            path: ../../reference/oss-dense-gemm.md
+            slug: oss-dense-gemm
+          - page: Grouped GEMM Fusions
+            path: ../../reference/oss-grouped-gemm.md
+            slug: oss-grouped-gemm
+          - page: Discrete Grouped GEMM
+            path: ../../reference/oss-discrete-grouped-gemm.md
+            slug: oss-discrete-grouped-gemm
+          - page: Normalization Fusions
+            path: ../../reference/oss-normalization.md
+            slug: oss-normalization
+      - section: API Reference
+        path: ../../api/index.md
+        slug: api
+        contents:
+          - folder: ../../api/python
+            title: Python
+            slug: python
+          - folder: ../../api/cpp
+            title: C++
+            slug: cpp
+      - section: Verified Documentation Samples
+        slug: verified-samples
+        contents:
+          - page: Guide
+            path: ../../samples/guide.md
+            slug: guide
+          - page: Complete Catalog
+            path: ../../samples/index.md
+            slug: catalog
+          - page: Python Samples
+            path: ../../samples/python/README.md
+            slug: python
+          - page: C++ Samples
+            path: ../../samples/cpp/README.md
+            slug: cpp
+      - page: Verification Record
+        path: ../../verification.md
+        slug: verification
   - link: Release Notes
     href: https://github.com/NVIDIA/cudnn-frontend/releases
   - section: API Reference

@@ -15,7 +15,7 @@ $$next\_running\_variance = (1 - momentum)*previous\_running\_variance + momentu
 
 ### C++ API
 
-```
+```cpp
 std::array<std::shared_ptr<Tensor_attributes>, 5> batchnorm(std::shared_ptr<Tensor_attributes>& input,
                                                             std::shared_ptr<Tensor_attributes>& scale,
                                                             std::shared_ptr<Tensor_attributes>& bias,
@@ -24,7 +24,7 @@ std::array<std::shared_ptr<Tensor_attributes>, 5> batchnorm(std::shared_ptr<Tens
 Where the output array has tensors in order of: `[output, saved_mean, saved_invariance, next_running_mean, next_running_variance]`
 
 Batchnorm attributes is a lightweight structure with setters for providing optional input tensors and other operation attributes:  
-```
+```cpp
 Batchnorm_attributes&
 set_previous_running_stats(std::shared_ptr<Tensor_attributes>& previous_running_mean,
                             std::shared_ptr<Tensor_attributes>& previous_running_variance,
@@ -56,7 +56,7 @@ The `bn_finalize` operation calculates the statistics required for the next iter
 
 ### C++ API
 
-```
+```cpp
     std::array<std::shared_ptr<Tensor_attributes>, 6> bn_finalize(std::shared_ptr<Tensor_attributes>,
                                                                   std::shared_ptr<Tensor_attributes>,
                                                                   std::shared_ptr<Tensor_attributes>,
@@ -74,7 +74,7 @@ The DBN operation computes data gradient, scale gradient, bias gradient during b
 
 ### C++ API
 
-```
+```cpp
 std::array<std::shared_ptr<Tensor_attributes>, 3> batchnorm_backward(std::shared_ptr<Tensor_attributes> loss,
                                                                          std::shared_ptr<Tensor_attributes> input,
                                                                          std::shared_ptr<Tensor_attributes> scale,
@@ -83,7 +83,7 @@ std::array<std::shared_ptr<Tensor_attributes>, 3> batchnorm_backward(std::shared
 The output array has tensors in order of: `[input gradient, scale gradient, bias gradient]`.
 
 DBN attributes is a lightweight structure with setters:  
-```
+```cpp
 Batchnorm_backward_attributes&
 set_saved_mean_and_inv_variance(std::shared_ptr<Tensor_attributes> saved_mean,
                                 std::shared_ptr<Tensor_attributes> saved_inverse_variance)
@@ -105,14 +105,14 @@ The Genstats operation computes the sum and sum of squares per-channel dimension
 
 ### C++ API
 
-```
+```cpp
 std::array<std::shared_ptr<Tensor_attributes>, 2>
 cudnn_frontend::graph::genstats(std::shared_ptr<Tensor_attributes>, Genstats_attributes);
 ```
 The output array has tensors in order of: `[sum, square_sum]`
 
 Genstats attributes is a lightweight structure with setters:  
-```
+```cpp
 Genstats_attributes&
 set_name(std::string const&)
 
@@ -137,7 +137,7 @@ Normalization happens across features, independently for each sample.
 
 ### C++ API
 
-```
+```cpp
 std::array<std::shared_ptr<Tensor_attributes>, 3> layernorm(std::shared_ptr<Tensor_attributes>& input,
                                                             std::shared_ptr<Tensor_attributes>& scale,
                                                             std::shared_ptr<Tensor_attributes>& bias,
@@ -146,7 +146,7 @@ std::array<std::shared_ptr<Tensor_attributes>, 3> layernorm(std::shared_ptr<Tens
 The output array has tensors in order of: `[output, mean, variance]`
 
 Layernorm_attributes is a lightweight structure with setters for providing optional input tensors and other operation attributes:
-```
+```cpp
 Layernorm_attributes&
 set_name(std::string const&)
 
@@ -192,7 +192,7 @@ The DLN operation computes data gradient, scale gradient, and bias gradient duri
 
 ### C++ API
 
-```
+```cpp
 std::array<std::shared_ptr<Tensor_attributes>, 3>
             layernorm_backward(std::shared_ptr<Tensor_attributes> dy,
                           std::shared_ptr<Tensor_attributes> x,
@@ -206,7 +206,7 @@ The output array has tensors in order of: `[input gradient, scale gradient, bias
 Ampere and Blackwell with 9.27; older backends were not qualified.
 
 Layernorm_backward_attributes is a lightweight structure with setters for providing optional input tensors and other operation attributes:
-```
+```cpp
 Layernorm_backward_attributes&
 set_name(std::string const&)
 
@@ -276,7 +276,7 @@ Normalization happens across features, independently for each sample.
 
 ### C++ API
 
-```
+```cpp
 std::array<std::shared_ptr<Tensor_attributes>, 3> adalayernorm(std::shared_ptr<Tensor_attributes>& input,
                                                             std::shared_ptr<Tensor_attributes>& scale,
                                                             std::shared_ptr<Tensor_attributes>& bias,
@@ -285,7 +285,7 @@ std::array<std::shared_ptr<Tensor_attributes>, 3> adalayernorm(std::shared_ptr<T
 The output array has tensors in order of: `[output, mean, variance]`
 
 AdaLayernorm_attributes is a lightweight structure with setters for providing optional input tensors and other operation attributes:  
-```
+```cpp
 AdaLayernorm_attributes&
 set_name(std::string const&)
 
@@ -313,7 +313,7 @@ The DADALN operation computes data gradient, scale gradient, and bias gradient d
 
 ### C++ API
 
-```
+```cpp
 std::array<std::shared_ptr<Tensor_attributes>, 3>
             adalayernorm_backward(std::shared_ptr<Tensor_attributes> dy,
                           std::shared_ptr<Tensor_attributes> x,
@@ -323,7 +323,7 @@ std::array<std::shared_ptr<Tensor_attributes>, 3>
 The output array has tensors in order of: `[input gradient, scale gradient, bias gradient]`.
 
 AdaLayernorm_backward_attributes is a lightweight structure with setters for providing optional input tensors and other operation attributes:  
-```
+```cpp
 AdaLayernorm_backward_attributes&
 set_name(std::string const&)
 
@@ -352,7 +352,7 @@ Normalization happens across each sample.
 
 ### C++ API
 
-```
+```cpp
 std::array<std::shared_ptr<Tensor_attributes>, 3> instancenorm(std::shared_ptr<Tensor_attributes>& input,
                                                             std::shared_ptr<Tensor_attributes>& scale,
                                                             std::shared_ptr<Tensor_attributes>& bias,
@@ -361,7 +361,7 @@ std::array<std::shared_ptr<Tensor_attributes>, 3> instancenorm(std::shared_ptr<T
 The output array has tensors in order of: `[output, mean, variance]`.
 
 Instancenorm_attributes is a lightweight structure with setters for providing optional input tensors and other operation attributes:  
-```
+```cpp
 Instancenorm_attributes&
 set_name(std::string const&)
 
@@ -387,7 +387,7 @@ The DIN operation computes data gradient, scale gradient, and bias gradient duri
 
 ### C++ API
 
-```
+```cpp
 std::array<std::shared_ptr<Tensor_attributes>, 3>
             instancenorm_backward(std::shared_ptr<Tensor_attributes> dy,
                           std::shared_ptr<Tensor_attributes> x,
@@ -397,7 +397,7 @@ std::array<std::shared_ptr<Tensor_attributes>, 3>
 The output array has tensors in order of: `[input gradient, scale gradient, bias gradient]`.
 
 Instancenorm_backward_attributes is a lightweight structure with setters for providing optional input tensors and other operation attributes:
-```
+```cpp
 Instancenorm_backward_attributes&
 set_saved_mean_and_inv_variance(std::shared_ptr<Tensor_attributes> mean,
                                 std::shared_ptr<Tensor_attributes> inv_variance)

@@ -1,0 +1,7 @@
+```python maxLines=0
+    assert graph.find_tensor("A") is A
+    assert graph.get_node("matmul") is graph.nodes[0]
+    assert graph.get_inputs() == [A, B]
+    assert graph.get_outputs() == [C]
+    assert graph.inspect()["nodes"][0]["name"] == "matmul"
+```

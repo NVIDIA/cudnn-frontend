@@ -53,7 +53,7 @@ jobs:
           node-version: "22"
 
       - name: Install Fern CLI
-        run: npm install -g fern-api
+        run: npm install -g fern-api@5.56.3
 
       - name: Check for FERN_TOKEN
         id: gate

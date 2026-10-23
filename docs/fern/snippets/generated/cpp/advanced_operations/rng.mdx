@@ -1,0 +1,12 @@
+```cpp maxLines=0
+    fe::graph::Graph rng_graph;
+    auto seed   = tensor(rng_graph, "seed", fe::DataType_t::INT32);
+    auto offset = tensor(rng_graph, "offset", fe::DataType_t::INT32);
+    auto random = rng_graph.rng(seed,
+                                offset,
+                                fe::graph::Rng_attributes()
+                                    .set_distribution(fe::RngDistribution_t::BERNOULLI)
+                                    .set_bernoulli_probability(0.9)
+                                    .set_dim({1, 1, 4, 4})
+                                    .set_stride({16, 16, 4, 1}));
+```

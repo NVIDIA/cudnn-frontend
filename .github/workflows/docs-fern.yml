@@ -1,8 +1,7 @@
 name: Docs check
 
-# Validates the Fern docs project under docs/fern: the navigation in
-# versions/latest.yml must stay in sync with the MDX/Markdown under docs/,
-# and the Markdown must stay MDX-parseable.
+# Validates the Fern project under docs/fern and runs the repository checks for
+# navigation coverage, generated content, components, and canonical samples.
 #
 # `fern check` needs no credentials. Publishing (`fern generate`) does, and
 # is deliberately not wired up here — it needs FERN_TOKEN from #cdd-fern.
@@ -15,6 +14,7 @@ on:
       - ready_for_review
     paths:
       - "docs/**"
+      - "tools/doc/**"
       - ".github/workflows/docs-fern.yml"
   push:
     branches:
@@ -22,6 +22,7 @@ on:
       - main
     paths:
       - "docs/**"
+      - "tools/doc/**"
 
 permissions:
   contents: read
@@ -37,8 +38,23 @@ jobs:
         with:
           node-version: "22"
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Install Fern CLI
-        run: npm install -g fern-api
+        run: npm install -g fern-api@5.56.3
+
+      - name: Install documentation test dependencies
+        run: python -m pip install pytest PyYAML
+
+      - name: Check generated documentation
+        run: |
+          python tools/doc/build_doc_manifests.py --check
+          python tools/doc/build_doc_indexes.py --check
+          python tools/doc/check_doc_coverage.py --mode release
+          python tools/doc/run_doc_samples.py --list > /dev/null
+          python -m pytest tools/doc/tests -q
 
       # MDX renders <img> as JSX, where an unclosed tag is a parse error.
       - name: Lint for unclosed <img> tags
@@ -52,4 +68,4 @@ jobs:
 
       - name: fern check
         working-directory: docs/fern
-        run: fern check
+        run: fern check --warnings
