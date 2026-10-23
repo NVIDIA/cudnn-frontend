@@ -286,16 +286,17 @@ def test_thd_f16_plan_is_prepared_and_binds_the_variant_pack():
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("head_major", [False, True])
 @pytest.mark.parametrize("stats_log2", [False, True])
-def test_rubin_ragged_pack_rebind_and_changed_lengths_replay(dtype, head_major, stats_log2):
+@pytest.mark.parametrize("geometry", ["mixed", "single_large"])
+def test_rubin_ragged_pack_rebind_and_changed_lengths_replay(dtype, head_major, stats_log2, geometry):
     """An explicit packed plan binds fresh storage and reads changed device prefixes on old captures."""
     if torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("Rubin ragged packing qualification")
-    b, ql, kl, hq, hk, d = 3, 257, 1025, 12, 2, 128
+    b, ql, kl, hq, hk, d = (3, 257, 1025, 12, 2, 128) if geometry == "mixed" else (1, 2048, 2305, 32, 8, 128)
     cap = b * ql
     dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
     g, t = _thd_graph(b, ql, kl, hq, hk, d, dtype=dt, arch="sm107", stats_head_stride=cap if head_major else 0, stats_log2=stats_log2)
     engine, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
-    knobs.update({cudnn.knob_type.PACK_GQA: 1, cudnn.knob_type.TILE_CGA_M: 2, cudnn.knob_type.SPLIT_KV: 1})
+    knobs.update({cudnn.knob_type.PACK_GQA: 1, cudnn.knob_type.TILE_CGA_M: 2, cudnn.knob_type.SPLIT_KV: 1, cudnn.knob_type.SCHED_POLICY: 1})
     g.create_execution_plan(engine, knobs)
     g.select_plan(g.get_execution_plan_count() - 1)
     g.check_support()
@@ -346,8 +347,8 @@ def test_rubin_ragged_pack_rebind_and_changed_lengths_replay(dtype, head_major, 
         assert torch.all(lse[cq[-1] :] == 19)
 
     a, fresh = inputs(1907), inputs(1908)
-    qa, ka = lengths(a, [257, 0, 73], [1025, 0, 117])
-    qf, kf = lengths(fresh, [17, 129, 0], [65, 513, 0])
+    qa, ka = lengths(a, [257, 0, 73] if b == 3 else [2048], [1025, 0, 117] if b == 3 else [2305])
+    qf, kf = lengths(fresh, [17, 129, 0] if b == 3 else [513], [65, 513, 0] if b == 3 else [1025])
     poison(a)
     g.execute(_pack(t, a), ws)
     check(a, qa, ka)
@@ -366,7 +367,7 @@ def test_rubin_ragged_pack_rebind_and_changed_lengths_replay(dtype, head_major, 
         # Rebinding another call must not retarget the old capture. Mutate its own data and prefixes.
         a["q"].mul_(0.5)
         a["v"].mul_(0.75)
-        qa, ka = lengths(a, [31, 7, 0], [40, 19, 0])
+        qa, ka = lengths(a, [31, 7, 0] if b == 3 else [31], [40, 19, 0] if b == 3 else [40])
         poison(a)
         ws.fill_(255)
         capture.replay()
