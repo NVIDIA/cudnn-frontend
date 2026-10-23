@@ -242,7 +242,8 @@ init_properties(py::module_& m) {
         .value("FP8_E5M3", cudnn_frontend::DataType_t::FP8_E5M3)
         .value("FP4_E2M1", cudnn_frontend::DataType_t::FP4_E2M1)
         .value("INT4", cudnn_frontend::DataType_t::INT4)
-        .value("NOT_SET", cudnn_frontend::DataType_t::NOT_SET);
+        .value("NOT_SET", cudnn_frontend::DataType_t::NOT_SET)
+        .value("BYTE_BOOLEAN", cudnn_frontend::DataType_t::BYTE_BOOLEAN);
 
     bind_enum<cudnn_frontend::TensorReordering_t>(m, "tensor_reordering")
         .value("NONE", cudnn_frontend::TensorReordering_t::NONE)
