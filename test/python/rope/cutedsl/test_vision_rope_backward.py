@@ -17,8 +17,10 @@ pytestmark = [pytest.mark.L0]
 
 @pytest.fixture(autouse=True)
 def supported_device():
-    if torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("vision RoPE backward requires SM100")
+    from cudnn.frost.device import PORTABLE_ELEMENTWISE_CCS
+
+    if torch.cuda.get_device_capability() not in PORTABLE_ELEMENTWISE_CCS:
+        pytest.skip(f"vision RoPE backward requires cc {PORTABLE_ELEMENTWISE_CCS}")
     if cutedsl_too_old(cutedsl_state()[1]):
         pytest.skip("vision RoPE backward requires CuTe DSL >= 4.7.0")
 
@@ -208,6 +210,6 @@ def test_old_dsl_and_other_architecture_rejected():
     with patch.object(api, "cutedsl_state", return_value=old_dsl), patch("cudnn.frost.buffers.cutedsl_state", return_value=old_dsl):
         with pytest.raises(RuntimeError, match="4.7"):
             cudnn.VisionRoPEBackward(*args).check_support()
-    with patch.object(torch.cuda, "get_device_capability", return_value=(9, 0)):
-        with pytest.raises(NotImplementedError, match="SM100"):
+    with patch.object(torch.cuda, "get_device_capability", return_value=(8, 0)):
+        with pytest.raises(NotImplementedError, match=r"got \(8, 0\)"):
             cudnn.VisionRoPEBackward(*args).check_support()
