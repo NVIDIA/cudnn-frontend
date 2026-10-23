@@ -12,6 +12,10 @@ lets the same kernel shape run either as:
 
 The implementation lives under ``score_recompute``. Indexer forward imports
 the same kernel and disables the optional LSE epilogue.
+
+The dense score output may be FP32 or BF16 (the element type of ``mOut``).
+Accumulation and the weighted head reduction are FP32 either way; a BF16
+output rounds the finished FP32 score once at the store.
 """
 
 import math
@@ -26,6 +30,21 @@ from .dense_score_recompute_sm100 import (
     add_packed_f32x2,
     fma_packed_f32x2,
 )
+
+
+def round_score_for_store(score, out_dtype):
+    """Value the dense epilogue stores for one FP32 head-reduced ``score``.
+
+    An FP32 output stores the score as is. A narrower float output (BF16) gets
+    exactly one round-to-nearest-even of that FP32 value: ``Float32.to`` lowers to
+    ``arith.truncf`` with the default rounding mode, i.e. ``cvt.rn.bf16.f32``. The
+    per-head products and their sum are never rounded below FP32. Plain Python
+    (no ``@cute.jit``): ``out_dtype`` is the compiled output tensor's element type,
+    so the branch is resolved at trace time and the FP32 IR is unchanged.
+    """
+    if out_dtype == Float32:
+        return score
+    return score.to(out_dtype)
 
 
 class IndexerScoreUnifiedSm100(DenseScoreRecomputeSm100):
@@ -242,7 +261,7 @@ class IndexerScoreUnifiedSm100(DenseScoreRecomputeSm100):
                     elif cutlass.const_expr(self.is_compressed_logits):
                         mOut[cand_batch_base + cand_row_offsets[qi] + Int64(pos)] = score
                     else:
-                        mOut[q_token_idx, pos] = score
+                        mOut[q_token_idx, pos] = round_score_for_store(score, mOut.element_type)
 
                     if cutlass.const_expr(self.compute_lse):
                         # Online log-sum-exp over the full score row. This runs

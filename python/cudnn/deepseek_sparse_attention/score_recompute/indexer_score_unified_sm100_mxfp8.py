@@ -10,7 +10,8 @@ High-level flow:
   1. reinterpret FP8 Q/K and packed E8M0 scales into CuTe/TMA layouts,
   2. load Q/K and SFB/SFA scales into SMEM,
   3. copy scales into TMEM SFB/SFA fields and issue blockscaled QK UMMA,
-  4. reduce heads in FP32 to write scores and optional LSE.
+  4. reduce heads in FP32 to write scores and optional LSE. A BF16 dense score
+     output rounds the FP32 score once at the store (``round_score_for_store``).
 
 Head groups: the tile is always 128 packed (token, head) rows -- the blockscaled
 scale atom is 128 rows, so the Q scale packing (``packed_m = token * group + head``)
@@ -60,7 +61,7 @@ from cudnn.deepseek_sparse_attention.utils import copy as copy_utils
 from cudnn.deepseek_sparse_attention.utils.sm100.gemm import (
     gemm_ptx_partial_mxfp8 as _gemm_ptx_partial_mxfp8,
 )
-from .indexer_score_unified_sm100 import IndexerScoreUnifiedSm100
+from .indexer_score_unified_sm100 import IndexerScoreUnifiedSm100, round_score_for_store
 from cudnn.deepseek_sparse_attention.utils.seqlen import SeqlenInfoQK
 from .dense_score_recompute_sm100 import (
     add_packed_f32x2,
@@ -672,7 +673,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
                 if cutlass.const_expr(self.is_compressed_logits):
                     mOut[cand_batch_base + cand_row_offset + Int64(pos)] = score
                 else:
-                    mOut[q_token_idx, pos] = score
+                    mOut[q_token_idx, pos] = round_score_for_store(score, mOut.element_type)
 
                 if cutlass.const_expr(self.compute_lse):
                     # Online LSE is numerically stable and avoids rereading the
@@ -896,7 +897,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
                     if cutlass.const_expr(self.is_compressed_logits):
                         mOut[cand_batch_base + cand_row_offsets[qi] + Int64(pos)] = score
                     else:
-                        mOut[q_token_idx, pos] = score
+                        mOut[q_token_idx, pos] = round_score_for_store(score, mOut.element_type)
 
                     if cutlass.const_expr(self.compute_lse):
                         new_max = score if score > local_max[qi] else local_max[qi]
@@ -1124,7 +1125,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
                     if cutlass.const_expr(self.is_compressed_logits):
                         mOut[cand_batch_base + cand_row_offsets[qi] + Int64(pos)] = score
                     else:
-                        mOut[q_token_idx, pos] = score
+                        mOut[q_token_idx, pos] = round_score_for_store(score, mOut.element_type)
 
                     if cutlass.const_expr(self.compute_lse):
                         new_max = score if score > local_max[qi] else local_max[qi]
