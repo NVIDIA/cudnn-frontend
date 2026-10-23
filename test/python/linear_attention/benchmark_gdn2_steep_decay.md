@@ -77,6 +77,9 @@ If running against another kernel revision, update the pinned base and compare r
 Do not use an editable installation that resolves to another checkout. Each JSON records the actual import path and helper hash.
 
 The summarizer checks identical script/environment identities, repeated helper hashes, all six cases, and the FP64 pass flags.
+It also checks finite errors for the output and all six gradients against the 1% tolerance.
+Timing medians must be finite and positive. Derived measurements must be finite.
+These checks remain active under optimized Python (`-O`). Both scripts write strict JSON.
 It averages the two per-arm medians for each variant. Keep all samples, including the mild controls.
 Synthetic output/gradient snapshots are saved alongside the JSON for paired numerical comparisons.
 
@@ -85,6 +88,17 @@ Synthetic output/gradient snapshots are saved alongside the JSON for paired nume
 Measured results and qualification counts are in [PR #1816](https://github.com/NVIDIA/cudnn-frontend/pull/1816).
 The [evidence archive](https://github.com/alfredclwong/cudnn-frontend/releases/tag/evidence-pr-1816-20261023) contains raw samples, logs, JUnit reports, environment records, and the measured scripts.
 The release includes a SHA256 checksum. Generated results do not belong in this checkout.
+The archive retains the measured scripts. Later validation fixes change the benchmark script hash and require fresh ABBA records for new comparisons.
+
+## CPU summary tests
+
+The summary command needs only the Python standard library. Its regression tests need pytest and no GPU.
+Run them without the GPU test harness:
+
+```bash
+python -m pytest --noconftest -c test/python/pytest.ini -o addopts= \
+  test/python/linear_attention/test_gdn2_steep_decay_summary.py
+```
 
 ## Upstream correctness tests
 
