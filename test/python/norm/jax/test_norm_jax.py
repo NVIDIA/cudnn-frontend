@@ -157,6 +157,21 @@ def test_rejects_tracing_with_multiple_visible_devices(monkeypatch):
         jax.jit(layer_norm_forward_jax).lower(jax.ShapeDtypeStruct((2, 8), jnp.float32))
 
 
+def test_sm_count_follows_ambient_and_build_devices(monkeypatch):
+    from cudnn.frost import device
+    from cudnn.norm.utils import sm_count
+
+    counts = {0: 68, 1: 148}
+    monkeypatch.setattr(device, "multiprocessor_count", lambda ordinal: counts[ordinal])
+    monkeypatch.setattr(device, "ambient_device", lambda: 0)
+    assert sm_count() == 68
+    with device.build_device(1):
+        assert sm_count() == 148
+    assert sm_count() == 68
+    monkeypatch.setattr(device, "ambient_device", lambda: 1)
+    assert sm_count() == 148
+
+
 def test_torch_free_forward_and_gradients():
     script = """
 import sys
@@ -168,13 +183,14 @@ sys.meta_path.insert(0, RejectTorch())
 import jax
 import jax.numpy as jnp
 from cudnn.ops import layer_norm_forward_jax, rms_norm_forward_jax
-x = jnp.arange(3 * 31, dtype=jnp.float32).reshape(3, 31) / 100
-weight = jnp.linspace(0.5, 1.5, 31)
-bias = jnp.linspace(-0.2, 0.2, 31)
-for op, args in ((layer_norm_forward_jax, (x, weight, bias)), (rms_norm_forward_jax, (x, weight))):
-    run = jax.jit(jax.value_and_grad(lambda args: jnp.square(op(*args)[0]).sum()))
-    value, gradients = jax.block_until_ready(run(args))
-    assert jnp.isfinite(value) and all(jnp.all(jnp.isfinite(g)) for g in gradients)
+for rows, cols in ((3, 31), (2, 16384)):
+    x = jnp.arange(rows * cols, dtype=jnp.float32).reshape(rows, cols) / (rows * cols)
+    weight = jnp.linspace(0.5, 1.5, cols, dtype=jnp.float32)
+    bias = jnp.linspace(-0.2, 0.2, cols, dtype=jnp.float32)
+    for op, args in ((layer_norm_forward_jax, (x, weight, bias)), (rms_norm_forward_jax, (x, weight))):
+        run = jax.jit(jax.value_and_grad(lambda args: jnp.square(op(*args)[0]).sum()))
+        value, gradients = jax.block_until_ready(run(args))
+        assert jnp.isfinite(value) and all(jnp.all(jnp.isfinite(g)) for g in gradients)
 assert "torch" not in sys.modules
 """
     subprocess.run(

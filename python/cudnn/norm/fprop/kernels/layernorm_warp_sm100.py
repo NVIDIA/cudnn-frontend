@@ -27,7 +27,7 @@ import cutlass.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
-from cudnn.norm.utils import cur_stream, dyn, fake_stream, smem_capacity
+from cudnn.norm.utils import cur_stream, dyn, fake_stream, sm_count, smem_capacity
 
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
 
@@ -499,24 +499,16 @@ _MBPM = 0
 # 8x collapses to 0.77x. For wn==1 (small C, cheap 1-2-ldg rows) latency is hidden by
 # raw occupancy, so fill the machine (mult=8; clamped to full_ctas for huge-N shapes).
 _CTAS_CAP = 0  # test override; 0 = use the formula
-_SM_COUNT = None
 
 
-def _persist_cap(full_ctas, block_threads, wn, ldgs, *, multiprocessors=None):
-    global _SM_COUNT
+def _persist_cap(full_ctas, block_threads, wn, ldgs):
     if _CTAS_CAP:
         return min(full_ctas, _CTAS_CAP)
-    if multiprocessors is None:
-        if _SM_COUNT is None:
-            import torch
-
-            _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
-        multiprocessors = _SM_COUNT
     if wn > 1:
         mult = max(2, min(16, round(4096 / (block_threads * ldgs))))
     else:
         mult = 8
-    return min(full_ctas, multiprocessors * mult)
+    return min(full_ctas, sm_count() * mult)
 
 
 _KCACHE = {}
@@ -558,16 +550,9 @@ def _pipe_stages(C):
     return 3 if C <= 2048 else _PIPE_STAGES
 
 
-def _pipe_cap(full_ctas, C, *, multiprocessors=None):
-    global _SM_COUNT
-    if multiprocessors is None:
-        if _SM_COUNT is None:
-            import torch
-
-            _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
-        multiprocessors = _SM_COUNT
+def _pipe_cap(full_ctas, C):
     mult = max(2, min(6, round(16384 / C)))  # >6x overshoots at tiny C (qwen-2048)
-    return min(full_ctas, multiprocessors * mult)
+    return min(full_ctas, sm_count() * mult)
 
 
 def _pipe_eligible(C, wn, has_beta, eb):
