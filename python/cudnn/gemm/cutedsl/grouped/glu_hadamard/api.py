@@ -796,6 +796,7 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
     check_canonical_contiguous(a_tensor, b_tensor, prob_tensor)
     k_physical = a_tensor.shape[1]
     if is_dense:
+        b_shape = None  # the discrete-mode B shape; the dense branch passes sample_b instead
         weight_mode = MoEWeightMode.DENSE
         n_full, _, l = b_nkl(b_tensor)
         if sfb_tensor is None:
