@@ -466,28 +466,38 @@ def steep_grad_corrections(
     dkd_mma = cutlass.Float32(0.0)
     dk_inv = cutlass.Float32(0.0)
     tile = cutlass.const_expr(cfg.b_t * cfg.b_t)
-    for s in cutlass.range(cfg.b_t, unroll=1):
-        if s != t:
-            k_s = (raw_k_ptr + raw_offset(cfg, s, channel)).load().to(cutlass.Float32)
-            if cutlass.const_expr(cfg.l2norm):
-                k_s = k_s * (k_norm_ptr + s).load()
-            if s < t:
-                k_inv_s = (k_s * steep_restore_scale(cfg, exchange_ptr, log_last_ptr, s, channel)).to(cfg.io_dtype).to(cutlass.Float32)
-                decay = cute.math.exp2(steep_interval_log(cfg, exchange_ptr, log_last_ptr, s + 1, t + 1, channel), fastmath=True)
-                da = (dadm_ptr + t * cfg.b_t + s).load().to(cutlass.Float32)
-                dm = (dadm_ptr + tile + t * cfg.b_t + s).load().to(cutlass.Float32)
-                dq_attn = dq_attn + da * (k_s * decay)
-                dq_mma = dq_mma + da * k_inv_s
-                dkd_attn = dkd_attn + dm * (k_s * decay)
-                dkd_mma = dkd_mma + dm * k_inv_s
-            else:
-                q_s = (raw_q_ptr + raw_offset(cfg, s, channel)).load().to(cutlass.Float32)
-                if cutlass.const_expr(cfg.l2norm):
-                    q_s = q_s * (q_norm_ptr + s).load()
-                decay = cute.math.exp2(steep_interval_log(cfg, exchange_ptr, log_last_ptr, t + 1, s + 1, channel), fastmath=True)
-                da = (dadm_ptr + s * cfg.b_t + t).load().to(cutlass.Float32)
-                dm = (dadm_ptr + tile + s * cfg.b_t + t).load().to(cutlass.Float32)
-                dk_inv = dk_inv + ((q_s * scale) * da - (k_s * steep_beta(cfg, beta_ptr, s, channel)) * dm) * decay
+    # Grow bounded intervals directly. Never subtract cumulative prefixes: a
+    # large negative spike can erase later mild gates in FP32.
+    interval = cutlass.Float32(0.0)
+    restore = steep_interval_log(cfg, exchange_ptr, log_last_ptr, t + 1, cfg.b_t, channel)
+    for distance in cutlass.range(1, t + 1, unroll=1):
+        s = t - distance
+        gate = steep_token_log(cfg, exchange_ptr, log_last_ptr, s + 1, channel)
+        interval = interval + gate
+        restore = restore + gate
+        k_s = (raw_k_ptr + raw_offset(cfg, s, channel)).load().to(cutlass.Float32)
+        if cutlass.const_expr(cfg.l2norm):
+            k_s = k_s * (k_norm_ptr + s).load()
+        k_inv_s = (k_s * cute.math.exp2(restore, fastmath=True)).to(cfg.io_dtype).to(cutlass.Float32)
+        decay = cute.math.exp2(interval, fastmath=True)
+        da = (dadm_ptr + t * cfg.b_t + s).load().to(cutlass.Float32)
+        dm = (dadm_ptr + tile + t * cfg.b_t + s).load().to(cutlass.Float32)
+        dq_attn = dq_attn + da * (k_s * decay)
+        dq_mma = dq_mma + da * k_inv_s
+        dkd_attn = dkd_attn + dm * (k_s * decay)
+        dkd_mma = dkd_mma + dm * k_inv_s
+    interval = cutlass.Float32(0.0)
+    for s in cutlass.range(t + 1, cfg.b_t, unroll=1):
+        interval = interval + steep_token_log(cfg, exchange_ptr, log_last_ptr, s, channel)
+        k_s = (raw_k_ptr + raw_offset(cfg, s, channel)).load().to(cutlass.Float32)
+        q_s = (raw_q_ptr + raw_offset(cfg, s, channel)).load().to(cutlass.Float32)
+        if cutlass.const_expr(cfg.l2norm):
+            k_s = k_s * (k_norm_ptr + s).load()
+            q_s = q_s * (q_norm_ptr + s).load()
+        decay = cute.math.exp2(interval, fastmath=True)
+        da = (dadm_ptr + s * cfg.b_t + t).load().to(cutlass.Float32)
+        dm = (dadm_ptr + tile + s * cfg.b_t + t).load().to(cutlass.Float32)
+        dk_inv = dk_inv + ((q_s * scale) * da - (k_s * steep_beta(cfg, beta_ptr, s, channel)) * dm) * decay
     exp_t = steep_decay_scale(cfg, exchange_ptr, log_last_ptr, t, channel)
     k_t = (raw_k_ptr + raw_offset(cfg, t, channel)).load().to(cutlass.Float32)
     if cutlass.const_expr(cfg.l2norm):
