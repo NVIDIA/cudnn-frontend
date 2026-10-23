@@ -67,6 +67,19 @@ y, sm, sr = norm_fprop(NormVariant.BATCH_NORM, x, gamma, beta, training=True,
                        momentum=0.1, running_mean=rm, running_var=rv)
 ```
 
+## JAX
+
+`cudnn.ops.layer_norm_forward_jax` and `cudnn.ops.rms_norm_forward_jax`
+reuse the SM100 forward and backward kernels through XLA custom calls. They
+return `(y,)`, containing the normalized array, and support `jax.jit` and first-order
+`jax.grad`/`jax.vjp`, including gradients for optional affine parameters.
+Inputs and affine parameters share a bf16, fp16 or fp32 dtype; parameter
+gradients accumulate in fp32 and are cast to the parameter dtype at the VJP
+boundary. PyTorch is not required.
+
+See [LayerNorm and RMSNorm in JAX](../../../docs/fe-oss-apis/norm_jax.md)
+for signatures, trailing-dimension semantics and the support matrix.
+
 ## How the kernels use CUTLASS primitives
 
 Norms are memory-bound (no tensor cores), so the primitives that matter are
