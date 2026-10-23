@@ -26,6 +26,7 @@ NAMES = ("q", "k", "v", "g", "b", "w")
 
 
 def inputs(tokens, steep):
+    """Create seeded inputs with the requested number of steep channels."""
     generator = torch.Generator().manual_seed(7082)
     shape = (tokens, 1, 64)
     q = F.normalize(torch.randn(shape, generator=generator), dim=-1).bfloat16()
@@ -40,6 +41,7 @@ def inputs(tokens, steep):
 
 
 def reference(xs, do):
+    """Compute output and all six gradients with a CPU FP64 recurrence."""
     q, k, v, g, b, w = refs = [x.detach().cpu().double().requires_grad_() for x in xs]
     state = torch.zeros(1, 64, 64, dtype=torch.float64)
     outputs = []
@@ -55,12 +57,14 @@ def reference(xs, do):
 
 @contextlib.contextmanager
 def observe_schedulers(records):
+    """Record scheduler scratch during an untimed call and restore plan methods."""
     originals = {}
     for cls in (gdn2_engine.CompiledGdn2, gdn2_engine.CompiledGdn2Bwd):
         original = cls.run
         originals[cls] = original
 
         def observed(self, views, workspace, stream, _original=original):
+            """Run the plan and read its scheduler counters before workspace release."""
             _original(self, views, workspace, stream)
             # Diagnostic only. Read while the caller still owns the workspace.
             regions = dict(zip(self.carve_names, workspace.carve(self.carve)))
@@ -78,6 +82,7 @@ def observe_schedulers(records):
 
 
 def timed(fn, repeats=30, inner=1):
+    """Measure per-call CUDA-event latency, including host enqueue gaps."""
     samples = []
     start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     for _ in range(repeats):
@@ -91,10 +96,12 @@ def timed(fn, repeats=30, inner=1):
 
 
 def run_case(tokens, steep, output_dir, label):
+    """Check one case against FP64 and measure eager latency and GPU busy time."""
     xs, do = inputs(tokens, steep)
     offsets = torch.tensor([0, tokens], device="cuda", dtype=torch.int32)
 
     def call():
+        """Execute forward and backward with fixed inputs."""
         output, _ = gated_delta_net_v2(
             *xs,
             offsets,
@@ -110,7 +117,7 @@ def run_case(tokens, steep, output_dir, label):
         return [output, *grads]
 
     for _ in range(5):
-        result = call()
+        call()
     torch.cuda.synchronize()
     records = []
     with observe_schedulers(records):
@@ -175,11 +182,12 @@ def run_case(tokens, steep, output_dir, label):
         "gpu_busy": replay,
         "gpu_events": events,
     }
-    print(json.dumps({key: value for key, value in row.items() if key != "gpu_events"}), flush=True)
+    print(json.dumps({key: value for key, value in row.items() if key != "gpu_events"}, allow_nan=False), flush=True)
     return row
 
 
 def main():
+    """Write incremental benchmark records for the six synthetic cases."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--label", required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -208,8 +216,8 @@ def main():
     for tokens in (16, 256):
         for steep in (0, 1, 64):
             record["results"].append(run_case(tokens, steep, args.output.parent, args.label))
-            args.output.write_text(json.dumps(record, indent=2) + "\n")
-    args.output.write_text(json.dumps(record, indent=2) + "\n")
+            args.output.write_text(json.dumps(record, indent=2, allow_nan=False) + "\n")
+    args.output.write_text(json.dumps(record, indent=2, allow_nan=False) + "\n")
     assert all(r["correct_within_one_percent"] for r in record["results"]), "FP64 tolerance failed; inspect saved errors"
 
 
