@@ -316,6 +316,12 @@ The backward implementation builds a bucketed K-to-Q CSR task layout on the
 GPU. `bucket_size_blocks` is an optional tuning override; leaving it unset uses
 the backend default.
 
+For SM100/SM103 blk128, long-query automatic buckets retain at least one SM
+wave of logical `(batch, head, KV block, query group)` tasks, or the previous
+default's task count when it is smaller. Otherwise, the previous bucket
+default is used. This shape-based guard does not inspect device-side mask
+contents; explicit `bucket_size_blocks` overrides remain authoritative.
+
 For blk64, with contiguous per-row count metadata, at least two KV blocks and at least
 1024 (batch, head, KV block) tasks, backward pairs KV neighborhoods to reuse
 common Q/dO loads and dQ accumulation; smaller problems do not recover the
