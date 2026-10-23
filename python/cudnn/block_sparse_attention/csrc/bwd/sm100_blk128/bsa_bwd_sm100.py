@@ -28,7 +28,7 @@ from cudnn.block_sparse_attention.csrc.utils.cute_dsl_utils import (
 )
 from cudnn.block_sparse_attention.csrc.utils import copy_utils
 from cudnn.block_sparse_attention.csrc.utils import pipeline
-from cudnn.block_sparse_attention.csrc.utils.tcgen05_mma_helpers import gemm_w_idx, gemm_ptx_w_idx
+from cudnn.block_sparse_attention.csrc.utils.tcgen05_mma_helpers import gemm_ptx_w_idx
 from cudnn.block_sparse_attention.csrc.utils.seqlen_info import SeqlenInfoQK
 from cudnn.block_sparse_attention.csrc.utils.block_info import BlockInfo
 from cudnn.block_sparse_attention.csrc.utils.cute_dsl_utils import ParamsBase, sub_packed_f32x2
@@ -38,6 +38,7 @@ from cudnn.block_sparse_attention.csrc.utils.tile_scheduler import (
 )
 
 from cudnn.block_sparse_attention.csrc.utils.named_barrier import NamedBarrierBwdSm100
+from cudnn.block_sparse_attention.csrc.utils.subset_barrier import _SubsetNamedBarrier
 
 
 class BsaK2qCsrTensors(NamedTuple):
@@ -260,11 +261,11 @@ class BlockSparseAttnBackwardSm100Blk128:
                 self.empty_warp_id,
             )
         )
-        self.compute_sync_barrier = cutlass.pipeline.NamedBarrier(
+        self.compute_sync_barrier = _SubsetNamedBarrier(
             barrier_id=int(NamedBarrierBwdSm100.Compute),
             num_threads=len(self.compute_warp_ids) * cute.arch.WARP_SIZE,
         )
-        self.reduce_sync_barrier = cutlass.pipeline.NamedBarrier(
+        self.reduce_sync_barrier = _SubsetNamedBarrier(
             barrier_id=int(NamedBarrierBwdSm100.dQaccReduce),
             num_threads=len(self.reduce_warp_ids) * cute.arch.WARP_SIZE,
         )
@@ -487,6 +488,7 @@ class BlockSparseAttnBackwardSm100Blk128:
         softmax_scale: Float32,
         bsa_k2q_csr_tensors: BsaK2qCsrTensors,
         stream: cuda.CUstream = None,
+        mBlockSizes: Optional[cute.Tensor] = None,
     ):
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
@@ -767,6 +769,7 @@ class BlockSparseAttnBackwardSm100Blk128:
             softmax_scale_log2,
             tile_sched_params,
             bsa_k2q_csr_tensors,
+            mBlockSizes,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -821,6 +824,7 @@ class BlockSparseAttnBackwardSm100Blk128:
         softmax_scale_log2: cutlass.Float32,
         tile_sched_params: ParamsBase,
         bsa_k2q_csr_tensors: Optional[BsaK2qCsrTensors] = None,
+        mBlockSizes: Optional[cute.Tensor] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
@@ -845,7 +849,7 @@ class BlockSparseAttnBackwardSm100Blk128:
         smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
-        tmem_alloc_barrier = cutlass.pipeline.NamedBarrier(
+        tmem_alloc_barrier = _SubsetNamedBarrier(
             barrier_id=int(NamedBarrierBwdSm100.TmemPtr),
             num_threads=cute.arch.WARP_SIZE * len((self.mma_warp_id, *self.compute_warp_ids, *self.reduce_warp_ids)),
         )
@@ -1079,7 +1083,7 @@ class BlockSparseAttnBackwardSm100Blk128:
 
             # Alloc tmem buffer
             tmem.allocate(self.tmem_alloc_cols)
-            tmem.wait_for_alloc()
+            tmem_alloc_barrier.arrive_and_wait()
             tmem_ptr = tmem.retrieve_ptr(Float32)
 
             self.mma(
@@ -1114,6 +1118,7 @@ class BlockSparseAttnBackwardSm100Blk128:
                 SeqlenInfoCls,
                 TileSchedulerCls,
                 bsa_k2q_csr_tensors,
+                mBlockSizes,
             )
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()
@@ -1124,7 +1129,7 @@ class BlockSparseAttnBackwardSm100Blk128:
         # (4, 5, 6, 7, 8, 9, 10, 11) --> 8 warps
         if warp_idx >= self.compute_warp_ids[0] and warp_idx <= self.compute_warp_ids[-1]:
             cute.arch.setmaxregister_increase(self.num_regs_compute)  # 8 warps
-            tmem.wait_for_alloc()
+            tmem_alloc_barrier.arrive_and_wait()
             tmem_ptr = tmem.retrieve_ptr(Float32)
             self.compute_loop(
                 thr_mma_S,
@@ -1159,6 +1164,7 @@ class BlockSparseAttnBackwardSm100Blk128:
                 tma_atom_dK,
                 tiled_copy_r2s_dKV,
                 bsa_k2q_csr_tensors,
+                mBlockSizes,
             )
             tmem_alloc_barrier.arrive()
 
@@ -1166,7 +1172,7 @@ class BlockSparseAttnBackwardSm100Blk128:
         # (0, 1, 2, 3) - dQ
         if warp_idx >= self.reduce_warp_ids[0] and warp_idx <= self.reduce_warp_ids[-1]:
             cute.arch.setmaxregister_increase(self.num_regs_reduce)
-            tmem.wait_for_alloc()
+            tmem_alloc_barrier.arrive_and_wait()
             tmem_ptr = tmem.retrieve_ptr(Float32)
             self.dQacc_reduce(
                 mdQaccum,
@@ -1368,6 +1374,7 @@ class BlockSparseAttnBackwardSm100Blk128:
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
         bsa_k2q_csr_tensors: Optional[BsaK2qCsrTensors] = None,
+        mBlockSizes: Optional[cute.Tensor] = None,
     ):
         # S = K @ Q.T
         tSrK = tiled_mma_S.make_fragment_A(sK)
@@ -1417,13 +1424,11 @@ class BlockSparseAttnBackwardSm100Blk128:
             tA_addr=self.tmem_P_offset,
         )
         mma_dsk_fn = partial(
-            gemm_w_idx,
+            self._gemm_dq_prefix,
             tiled_mma_dQ,
             tdQtdQ,
             tdQrdS,
             tdQrK,
-            zero_init=True,
-            num_unroll_groups=1,
         )
         mma_dsq_fn = partial(
             gemm_ptx_w_idx,
@@ -1460,6 +1465,9 @@ class BlockSparseAttnBackwardSm100Blk128:
                 q_group,
                 n_block,
             )
+            valid_k = cutlass.min(self.tile_n, seqlen.seqlen_k - n_block * self.tile_n)
+            if const_expr(mBlockSizes is not None):
+                valid_k = cutlass.min(valid_k, mBlockSizes[n_block])
             process_tile = block_iter_count > Int32(0)
 
             if process_tile:
@@ -1504,7 +1512,7 @@ class BlockSparseAttnBackwardSm100Blk128:
                     handle_Q.release()
 
                     # (3) dQ = dS @ K
-                    mma_dsk_fn()
+                    mma_dsk_fn(valid_k=valid_k)
                     pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
                     pipeline_dS.consumer_release(consumer_state_dS)
                     consumer_state_dS.advance()
@@ -1536,7 +1544,7 @@ class BlockSparseAttnBackwardSm100Blk128:
                 pipeline_dKV.sync_object_full.arrive(1, pipeline_dKV.producer_mask, cta_group)
                 producer_phase_dKV ^= 1
 
-                mma_dsk_fn()
+                mma_dsk_fn(valid_k=valid_k)
                 pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
                 handle_Q.release()
                 pipeline_dS.consumer_release(consumer_state_dS)
@@ -1545,6 +1553,16 @@ class BlockSparseAttnBackwardSm100Blk128:
                 producer_phase_acc ^= 1
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
+
+    @cute.jit
+    def _gemm_dq_prefix(self, tiled_mma: cute.TiledMma, acc: cute.Tensor, tCrA: cute.Tensor, tCrB: cute.Tensor, valid_k: Int32):
+        mma_atom = cute.make_mma_atom(tiled_mma.op)
+        k_tile = self.tile_n // cute.size(tCrA.shape[2])
+        # Always initialize dQ, including zero-length prefixes.
+        for k in cutlass.range_constexpr(cute.size(tCrA.shape[2])):
+            if k == 0 or k * k_tile < valid_k:
+                mma_atom.set(tcgen05.Field.ACCUMULATE, k != 0)
+                cute.gemm(mma_atom, acc, tCrA[None, None, k], tCrB[None, None, k], acc)
 
     @cute.jit
     def split_wg(
@@ -1597,10 +1615,14 @@ class BlockSparseAttnBackwardSm100Blk128:
         tScS_t2r: cute.Tensor,
         n_block: Int32,
         seqlen,
+        mBlockSizes: Optional[cute.Tensor] = None,
     ):
         col = 0
         thr_col_offset = tScS_t2r[0][col]
-        seqlenk_col_limit = seqlen.seqlen_k - n_block * self.tile_n - thr_col_offset
+        valid_k = seqlen.seqlen_k - n_block * self.tile_n
+        if const_expr(mBlockSizes is not None):
+            valid_k = cutlass.min(valid_k, mBlockSizes[n_block])
+        seqlenk_col_limit = valid_k - thr_col_offset
         if seqlenk_col_limit <= 0:
             for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
                 acc_S[i] = -cutlass.Float32.inf
@@ -1640,6 +1662,7 @@ class BlockSparseAttnBackwardSm100Blk128:
         tma_atom_dK: Optional[cute.CopyAtom],
         tiled_copy_r2s_dKV: Optional[cute.TiledCopy],
         bsa_k2q_csr_tensors: Optional[BsaK2qCsrTensors] = None,
+        mBlockSizes: Optional[cute.Tensor] = None,
     ):
         sLSE_2D = cute.make_tensor(
             sLSE.iterator,
@@ -1746,14 +1769,18 @@ class BlockSparseAttnBackwardSm100Blk128:
                 tSrS_t2r = cute.make_rmem_tensor(tScS_t2r.shape, Float32)
                 cute.copy(thr_copy_t2r, tStS_t2r, tSrS_t2r)
 
-                self.apply_seqlen_k_mask(tSrS_t2r, tScS_t2r, n_block, seqlen)
+                self.apply_seqlen_k_mask(tSrS_t2r, tScS_t2r, n_block, seqlen, mBlockSizes)
                 num_stages = cute.size(tScS_t2r, mode=[1])
                 tSrP_r2t_f32 = cute.make_rmem_tensor(tScP_r2t.shape, Float32)  # 64
                 tSrP_r2t = cute.recast_tensor(tSrP_r2t_f32, self.q_dtype)
                 for stage in cutlass.range_constexpr(num_stages):
                     tSrS_cur = tSrS_t2r[None, stage, 0, 0]
-                    tSsLSE_cur = tSsLSE[None, stage, 0, 0, consumer_state_LSE.index]
-                    cute.autovec_copy(tSsLSE_cur, tSrLSE_s2r)
+                    # Each TMEM stage covers 32 Q positions shared by the lanes of a warp.
+                    # Load once per lane, then broadcast to each fragment's Q coordinate.
+                    base_q = tScS_t2r[0, stage, 0, 0][1]
+                    lane_lse = sLSE[base_q + tidx % 32, consumer_state_LSE.index]
+                    for j in cutlass.range_constexpr(cute.size(tSrLSE_s2r)):
+                        tSrLSE_s2r[j] = cute.arch.shuffle_sync(lane_lse, tScS_t2r[j, stage, 0, 0][1] - base_q)
                     tSrLSE = tSrLSE_s2r
                     for v in cutlass.range_constexpr(cute.size(tSrS_t2r, mode=[0]) // 2):
                         lse_pair = (tSrLSE[2 * v], tSrLSE[2 * v + 1])
@@ -1797,7 +1824,10 @@ class BlockSparseAttnBackwardSm100Blk128:
                     tSrS_cur = tSrS_t2r[None, stage, 0, 0]
                     tSsdPsum_cur = tSsdPsum[None, stage, 0, 0, consumer_state_dPsum.index]
                     tSrdPsum = cute.make_rmem_tensor_like(tSsdPsum_cur, Float32)
-                    cute.autovec_copy(tSsdPsum_cur, tSrdPsum)
+                    base_q = tScS_t2r[0, stage, 0, 0][1]
+                    lane_delta = sdPsum[base_q + tidx % 32, consumer_state_dPsum.index]
+                    for j in cutlass.range_constexpr(cute.size(tSrdPsum)):
+                        tSrdPsum[j] = cute.arch.shuffle_sync(lane_delta, tScS_t2r[j, stage, 0, 0][1] - base_q)
                     for v in cutlass.range_constexpr(cute.size(tdPrdP_t2r, mode=[0]) // 2):
                         dPsum_pair = (tSrdPsum[2 * v], tSrdPsum[2 * v + 1])
                         tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = sub_packed_f32x2((tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]), dPsum_pair)
@@ -2189,6 +2219,7 @@ def bsa_sm100_blk128_bwd_bucketed_k2q_csr(
     dq: Optional["torch.Tensor"] = None,
     dk: Optional["torch.Tensor"] = None,
     dv: Optional["torch.Tensor"] = None,
+    block_sizes: Optional["torch.Tensor"] = None,
 ) -> Tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]:
     """SM100/SM110 blk128 bwd entry receiving BSA bucketed k2q CSR."""
     import torch
@@ -2218,6 +2249,10 @@ def bsa_sm100_blk128_bwd_bucketed_k2q_csr(
     assert bucketed_k2q_offsets.ndim == 4
     assert bucketed_k2q_offsets.shape[-1] == num_kv_blocks + 1
     assert bucketed_k2q_indices.shape[:2] == (batch_size, num_heads)
+    if block_sizes is not None:
+        assert block_sizes.dtype == torch.int32
+        assert block_sizes.shape == (num_kv_blocks,)
+        assert block_sizes.device == q.device and block_sizes.is_contiguous()
     num_q_groups = bucketed_k2q_offsets.shape[2]
     use_dkv_postprocess = num_q_groups > 1
 
@@ -2304,6 +2339,7 @@ def bsa_sm100_blk128_bwd_bucketed_k2q_csr(
         get_broadcast_dims(v_bshd),
         get_broadcast_dims(dout_bshd),
         use_dkv_postprocess,
+        block_sizes is not None,
     )
     cache = bsa_sm100_blk128_bwd_bucketed_k2q_csr.compile_cache
     if compile_key not in cache:
@@ -2335,6 +2371,7 @@ def bsa_sm100_blk128_bwd_bucketed_k2q_csr(
             float(softmax_scale),
             bsa_csr_tensors,
             current_stream,
+            to_cute_tensor(block_sizes, assumed_align=4) if block_sizes is not None else None,
             options="--enable-tvm-ffi",
         )
 
@@ -2350,6 +2387,7 @@ def bsa_sm100_blk128_bwd_bucketed_k2q_csr(
         dv_accum if use_dkv_postprocess else dv_bshd,
         float(softmax_scale),
         (bucketed_k2q_offsets, bucketed_k2q_indices),
+        block_sizes,
     )
 
     _bwd_postprocess_convert(

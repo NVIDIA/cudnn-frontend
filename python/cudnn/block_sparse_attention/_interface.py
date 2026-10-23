@@ -95,6 +95,22 @@ def _get_device_arch():
     return _get_device_arch_for_device(torch.cuda.current_device())
 
 
+@lru_cache(maxsize=None)
+def _get_device_sm_count_for_device(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _sm100_blk128_bwd_auto_bucket_size_blocks(*, num_q_blocks: int, num_kv_blocks: int, batch_size: int, num_heads: int, num_sms: int) -> int:
+    """Keep the large bucket only when its logical grid retains enough parallel work."""
+    default_bucket = sm100_blk128_bwd_default_bucketed_k2q_size_blocks(num_q_blocks, num_heads)
+    tasks_per_group = batch_size * num_heads * num_kv_blocks
+    default_tasks = tasks_per_group * _ceil_div_int(num_q_blocks, default_bucket)
+    large_bucket_tasks = tasks_per_group * _ceil_div_int(num_q_blocks, 2048)
+    # Each (batch, head, KV block, Q group) is one CTA. Preserve a wave of work,
+    # or the default grid when it is smaller. Physical blocks can still be empty.
+    return 2048 if large_bucket_tasks >= min(num_sms, default_tasks) else default_bucket
+
+
 def _cutlass_dsl_version() -> tuple[int, int, int]:
     """Return the installed CUTLASS DSL version without adding a dependency."""
     version = getattr(cutlass, "__version__", None)
@@ -3000,16 +3016,23 @@ def bsa_attn_bwd(
 
     if arch // 10 != 9 and sparse_block_size == SM100_BLK128_BWD_SPARSE_BLOCK_SIZE:
         if bucket_size_blocks is None or bucket_size_blocks <= 0:
-            bucket_size_blocks = sm100_blk128_bwd_default_bucketed_k2q_size_blocks(
-                num_q_blocks,
-                num_heads,
-            )
+            if arch in (100, 103) and num_q_blocks >= 1500:
+                bucket_size_blocks = _sm100_blk128_bwd_auto_bucket_size_blocks(
+                    num_q_blocks=num_q_blocks,
+                    num_kv_blocks=num_kv_blocks,
+                    batch_size=batch_size,
+                    num_heads=num_heads,
+                    num_sms=_get_device_sm_count_for_device(q.device.index),
+                )
+            else:
+                bucket_size_blocks = sm100_blk128_bwd_default_bucketed_k2q_size_blocks(num_q_blocks, num_heads)
         bucketed_k2q_offsets, bucketed_k2q_indices, _num_q_groups, _max_k2q_rows_per_group = _build_bucketed_k2q_csr(
             q2k_block_index,
             block_sparse_num,
             num_kv_blocks,
             bucket_size_blocks=bucket_size_blocks,
             q2k_block_nums=q2k_block_nums,
+            parallel_offsets=arch in (100, 103),
         )
         dq_out, dk_out, dv_out = bsa_sm100_blk128_bwd_bucketed_k2q_csr(
             dout_bwd,
@@ -3024,6 +3047,7 @@ def bsa_attn_bwd(
             dq=dq_bwd,
             dk=dk_bwd,
             dv=dv_bwd,
+            block_sizes=maybe_contiguous(block_sizes),
         )
         if layout == "bshd":
             return (
