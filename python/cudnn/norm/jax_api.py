@@ -8,6 +8,8 @@ from functools import lru_cache, partial
 import math
 from numbers import Integral, Real
 
+from cudnn.jax import call, zeros_init
+
 import jax
 import jax.numpy as jnp
 
@@ -17,7 +19,6 @@ _requirement_error = dsl_unavailable("JAX normalization")
 if _requirement_error:
     raise ImportError(_requirement_error)
 
-from cudnn.jax import call, zeros_init
 from .config_sm100 import NormVariant, RowwiseSpec, rowwise_spec
 from .jax_kernels import make_backward, make_forward
 

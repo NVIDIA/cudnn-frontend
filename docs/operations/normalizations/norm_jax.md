@@ -45,8 +45,8 @@ inputs. Use a finite positive `eps` within the FP32 representable range.
 ## Usage
 
 Install the frontend and a CUDA-enabled JAX build. The frontend already depends
-on CuTeDSL; these kernels require a build at least version 4.7.0 that provides
-`cutlass.primitives`. No additional frontend dependency is introduced.
+on CuTeDSL; these kernels require a build at least version 4.7.1 that provides
+`cutlass.experimental.primitives`. No additional frontend dependency is introduced.
 
 Run in a single process with exactly one visible GPU. Select the SM100 device
 with `CUDA_VISIBLE_DEVICES` before importing JAX, for example
@@ -115,8 +115,8 @@ not establish GPU support; qualify the suite on SM100 with CUDA-enabled JAX
 and the required CuTeDSL runtime.
 
 Qualified on B200 with Python 3.12, JAX/jaxlib 0.9.1, CUDA 13, and the internal
-CuTeDSL build `4.9.0a0.dev0+internal.master.20261002010000.3617316` (which
-exports `cutlass.primitives`). Run the focused suite without the parent Torch
+CuTeDSL build `4.9.0a0.dev0+internal.master.20261002010000.3617316`.
+Run the focused suite without the parent Torch
 test fixtures:
 
 ```bash
