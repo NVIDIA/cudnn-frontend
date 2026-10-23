@@ -680,7 +680,7 @@ def test_grouped_gemm_glu_hadamard_wrapper_cache_separates_devices(request, monk
     from gemm.cutedsl.test_grouped_gemm_canonical_layouts import assert_same
 
     first = torch.cuda.current_device()
-    other = next((i for i in range(torch.cuda.device_count()) if i != first and torch.cuda.get_device_capability(i)[0] == 10), None)
+    other = next((i for i in range(torch.cuda.device_count()) if i != first and torch.cuda.get_device_capability(i)[0] >= 10), None)
     if other is None:
         pytest.skip("two SM100+ CUDA devices are required")
     monkeypatch.setattr(grouped_gemm_glu_hadamard_api, "_cache_of_GroupedGemmGluHadamardSm100Objects", {})
