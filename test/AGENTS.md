@@ -948,6 +948,13 @@ that invalid metadata causes no initialization or attention launch.
 
 ### Automatic handle caches
 
+Indexed execution must preserve the graph's selected plan throughout binding,
+not just restore it after returning. Coordinate two prebuilt indexed calls at
+stream resolution and assert which plan each actually executes, plus the retained
+selection after both finish. `core/test_dispatch.py::test_indexed_execution_keeps_each_callers_plan`
+is a CPU-only detector; shared backend/FROST numerical and capture checks remain
+in `core/graph/test_execute_overload.py`.
+
 Automatic cuDNN handle caches must isolate both device and calling thread;
 re-streaming a process-global handle races otherwise. Check A→B→A device reuse,
 coordinated threads with distinct streams, and destroy/recreate without exiting
