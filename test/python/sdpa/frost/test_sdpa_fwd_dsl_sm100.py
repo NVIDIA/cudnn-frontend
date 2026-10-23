@@ -3349,6 +3349,38 @@ def test_sm103_d192_f16_exp2_split_is_folded_out_sass_pins(tmp_path, spec):
     assert_no_new_spills(probe.stats, pins, f"[{spec}] ")
 
 
+@pytest.mark.L0
+@requires_dsl
+def test_sm100_d128_f16_exp2_split_pattern_follows_the_cutedsl_version(monkeypatch):
+    """The f16 d128 dense band's exp2 split interleave per mocked CuTe DSL version: 16/4 below cutlass-dsl 4.8.1, 8/2
+    from 4.8.1 on, 16/4 when the version cannot be read; the paged causal interior keeps 16/2 and a causal dense build
+    folds the split out.  The loads go through a test-local template cache, emptied before each load and restored
+    afterwards."""
+    from cudnn.frost import buffers, template_loader
+    from cudnn.frost.tile_dsl.constants import DTYPE_BF16
+    from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+
+    cache: dict = {}
+    monkeypatch.setattr(template_loader, "_MODULES", cache)
+
+    def pattern(version, **params):
+        cache.clear()
+        monkeypatch.setattr(buffers, "cutedsl_state", lambda: (True, version))
+        mod = _load_sm100_kernel_module((128, 128), TemplateParams(dtype_qkv=DTYPE_BF16, exp2_fma_split=True, **params))
+        return mod._E2E_ENABLED, mod._E2E_FREQ, mod._E2E_RES, mod._E2E_EMULATED_COLS
+
+    public = "nvidia-cutlass-dsl"
+    assert pattern((public, "4.8.0")) == (True, 16, 4, 32)
+    assert pattern((public, "4.8.1")) == (True, 8, 2, 32)
+    assert pattern((public, "4.9.0.dev0")) == (True, 8, 2, 32)
+    assert pattern(None) == (True, 16, 4, 32)
+    paged = dict(thd_varlen=True, paged_kv=True, page_size=16, seq_kv_lens_present=True, window_right=0)
+    assert pattern((public, "4.8.1"), **paged) == (True, 16, 2, 16)
+    assert pattern((public, "4.8.0"), **paged) == (True, 16, 2, 16)
+    assert pattern((public, "4.8.1"), window_right=0)[0] is False
+
+
 # The CI arch targets select this module explicitly; imported tests need L0.
 import test_sdpa_staged_forward_half as _staged_half_checks
 

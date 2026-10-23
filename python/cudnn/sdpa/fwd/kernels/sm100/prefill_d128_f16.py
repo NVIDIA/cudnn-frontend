@@ -94,6 +94,7 @@ paged-attention kernel has.  The per-batch length rides the existing
 ``max_pages * page_size``, so nothing is read back to the host (Rule 3).
 """
 
+from cudnn.frost.buffers import cutedsl_at_least as _cutedsl_at_least
 from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
 from functools import lru_cache
 from typing import Callable, Optional, Tuple
@@ -299,8 +300,10 @@ _NB_FENCE_P0 = 11
 # cc 10.0 only -- cc 10.3 retains its all-MUFU path) AND a tile/layout gate. Dense bands keep their
 # existing mix. Paged BF16 D128 causal THD mixes only unmasked interior tiles; diagonal, sliding-window,
 # bias and explicit KV-mask tiles retain MUFU. This extension does not change nonpaged or split-KV builds.
-_E2E_FREQ = 16
-_E2E_RES = 4
+#
+# The dense band's interleave follows the installed CuTe DSL: every 8-column block's last 2 from cutlass-dsl 4.8.1
+# on, every 16-column block's last 4 below it or when the version cannot be read.
+_E2E_FREQ, _E2E_RES = (8, 2) if _cutedsl_at_least((4, 8, 1)) else (16, 4)
 _E2E_LIMIT = CFG.TILE_N
 _SOFTMAX_CHUNK = 64  # tcgen05_ld width of one softmax chunk (see _softmax_kv_body CHUNK)
 _E2E_DENSE_BAND = (CFG.MASK_FLAGS & (MASK_CAUSAL | MASK_SWA)) == 0
@@ -315,7 +318,8 @@ _E2E_PAGED_INTERIOR = bool(
     and (CFG.MASK_FLAGS & (MASK_CAUSAL | MASK_SWA)) == MASK_CAUSAL
 )
 if _E2E_PAGED_INTERIOR:
-    _E2E_RES = 2
+    # The paged causal interior keeps its own, lighter pattern (every 16-column block's last 2) on every DSL.
+    _E2E_FREQ, _E2E_RES = 16, 2
 _E2E_ENABLED = bool(PARAMS.exp2_fma_split) and (_E2E_DENSE_BAND or _E2E_PAGED_INTERIOR)
 _E2E_EMULATED_COLS = (_E2E_LIMIT // _E2E_FREQ) * _E2E_RES if _E2E_ENABLED else 0
 if _E2E_ENABLED:

@@ -577,16 +577,24 @@ def cutedsl_too_old(version):
     judge, and refusing on a string we failed to read would decline on a machine
     that works.
     """
+    release = cutedsl_release(version)
+    return release is not None and release < CUTEDSL_MIN_VERSION
+
+
+def cutedsl_release(version):
+    """The public wheel's release as ``(major, minor, patch)``, or None when the
+    version is absent, from another distribution or unparsable.
+
+    Each release component keeps its leading integer ("4.6.2a0" -> 4.6.2), a
+    local label ("+...") is dropped, a dotted post/dev segment ("4.6.post1",
+    "4.6.2.dev0") ends the release, and omitted components are zero ("4.6" ->
+    4.6.0).
+    """
     if not version:
-        return False
+        return None
     dist, ver = version
     if dist != "nvidia-cutlass-dsl":
-        return False
-    # PEP 440 public versions: keep the leading integer of each release component
-    # so a prerelease of X ("4.6.2a0", "4.6.2rc1") compares as X -- below the
-    # floor it is too old, at/above it is not. Local labels ("+...") are dropped,
-    # and a dotted post/dev segment ("4.6.post1", "4.6.2.dev0") ends the release
-    # segment: what precedes it is the version being compared.
+        return None
     parts = []
     for component in ver.split("+", 1)[0].split(".")[:3]:
         m = _RELEASE_INT.match(component)
@@ -594,11 +602,18 @@ def cutedsl_too_old(version):
             break
         parts.append(int(m.group(1)))
     if not parts:
-        return False
-    # A short public version ("4.6") means the omitted components are zero
-    # ("4.6.0"), so it compares against the floor instead of slipping past it.
+        return None
     parts += [0] * (3 - len(parts))
-    return tuple(parts) < CUTEDSL_MIN_VERSION
+    return tuple(parts)
+
+
+def cutedsl_at_least(floor):
+    """True when the installed public CuTe DSL wheel's release is at or above
+    ``floor`` (a release tuple); False when the version is absent, from another
+    distribution or unparsable.  Reads the version on every call.
+    """
+    release = cutedsl_release(cutedsl_state()[1])
+    return release is not None and release >= tuple(floor)
 
 
 @lru_cache(maxsize=1)
