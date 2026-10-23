@@ -118,9 +118,10 @@ torch = [
 ]
 # The jax.jit-compatible XLA custom-call entry points (cudnn.jax, e.g.
 # gemm_amax_jax_sm100) build on the CuTeDSL JAX extensions (cutlass.jax,
-# shipped with nvidia-cutlass-dsl), which require jax >= 0.5.
+# shipped with nvidia-cutlass-dsl >= 4.7.1), which require jax >= 0.5.
 jax = [
     "jax>=0.5",
+    "nvidia-cutlass-dsl[cu13]>=4.7.1; sys_platform != 'win32' or platform_machine != 'ARM64'",
 ]
 
 [build-system]
