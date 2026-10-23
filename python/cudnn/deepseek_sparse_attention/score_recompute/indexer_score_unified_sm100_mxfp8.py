@@ -200,6 +200,11 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         """Element type of the Q/K tensors this kernel reads."""
         return cutlass.Float8E4M3FN
 
+    @staticmethod
+    def _qk_tensor(t: cute.Tensor) -> cute.Tensor:
+        """Q or K as this kernel reads it, from the tensor it is launched with (the same tensor here)."""
+        return t
+
     def _make_data_tiled_mma(self, blockscaled_tiled_mma_qk, cta_group):
         """Tiled MMA that lays out and partitions the Q/K data tiles: the unscaled E4M3 MMA of the QK tile."""
         return _make_trivial_tiled_mma(
@@ -237,6 +242,8 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         # Runtime tensor metadata is needed to build CuTe layouts and compile
         # the matching kernel.  The element dtypes become compile-time constants
         # inside cute.compile.
+        mQ = self._qk_tensor(mQ)
+        mK = self._qk_tensor(mK)
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
         self.sf_dtype = mQScale.element_type

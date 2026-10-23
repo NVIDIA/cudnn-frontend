@@ -26,6 +26,7 @@ from cudnn.deepseek_sparse_attention.score_recompute._block_scaled import (
     BLOCK_SCALED_FORMATS,
     BLOCK_SCALED_PRECISION_NAMES,
     bshd_packed_scale_shape,
+    kernel_qk_view,
     logical_head_dim,
     validate_block_scaled_inputs,
     validate_indexer_precision,
@@ -637,10 +638,12 @@ def indexer_fwd_compress_topk(
         seqlen_q,
         seqlen_k,
     )
+    q_kernel = kernel_qk_view(precision, q)
+    k_kernel = kernel_qk_view(precision, k)
 
     if compile_key not in _compile_cache:
-        q_cute = _to_cute_tensor(q)
-        k_cute = _to_cute_tensor(k)
+        q_cute = _to_cute_tensor(q_kernel)
+        k_cute = _to_cute_tensor(k_kernel)
         w_cute = _to_cute_tensor(w)
         cand_cute = _to_cute_tensor(cand_gemm, leading_dim=1 if cand_2d else 0)
         denom_cute = _to_cute_tensor(denom_tmp) if denom_tmp is not None else None
@@ -729,8 +732,8 @@ def indexer_fwd_compress_topk(
     with torch.cuda.nvtx.range("indexer_fwd_compress_gemm"):
         if is_block_scaled:
             _compile_cache[compile_key](
-                q,
-                k,
+                q_kernel,
+                k_kernel,
                 w,
                 q_scale,
                 k_scale,
@@ -963,9 +966,11 @@ def _run_compress_gemm_varlen(
             q_causal_offsets is not None,
             bool(want_lse),
         )
+        q_kernel = kernel_qk_view(precision, q)
+        k_kernel = kernel_qk_view(precision, k)
         if compile_key not in _compile_cache:
-            q_cute = _to_cute_tensor(q)
-            k_cute = _to_cute_tensor(k)
+            q_cute = _to_cute_tensor(q_kernel)
+            k_cute = _to_cute_tensor(k_kernel)
             w_cute = _to_cute_tensor(w)
             q_scale_cute = _to_cute_tensor(q_scale)
             k_scale_cute = _to_cute_tensor(k_scale)
@@ -1015,8 +1020,8 @@ def _run_compress_gemm_varlen(
         stream = resolve_stream(None)
         with torch.cuda.nvtx.range(f"indexer_fwd_compress_gemm_varlen_{precision}"):
             _compile_cache[compile_key](
-                q,
-                k,
+                q_kernel,
+                k_kernel,
                 w,
                 q_scale,
                 k_scale,

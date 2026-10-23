@@ -30,6 +30,7 @@ from .indexer_score_unified_sm100 import IndexerScoreUnifiedSm100
 from ._block_scaled import (
     BLOCK_SCALED_FORMATS,
     BLOCK_SCALED_PRECISION_NAMES,
+    kernel_qk_view,
     logical_head_dim,
     validate_indexer_precision,
     validate_sf_vec_size,
@@ -1041,9 +1042,11 @@ def _dense_indexer_score_recompute(
             q_causal_offsets is not None,
         )
         compile_key = ("dense_indexer",) + base_compile_key
+    q_kernel = kernel_qk_view(precision, q)
+    k_kernel = kernel_qk_view(precision, k)
     if compile_key not in _dense_indexer_score_recompute.compile_cache:
-        q_cute = to_cute_tensor(q)
-        k_cute = to_cute_tensor(k)
+        q_cute = to_cute_tensor(q_kernel)
+        k_cute = to_cute_tensor(k_kernel)
         w_cute = to_cute_tensor(weights)
         out_cute = to_cute_tensor(out)
         denom_cute = to_cute_tensor(denom_out)
@@ -1138,8 +1141,8 @@ def _dense_indexer_score_recompute(
     with torch.cuda.nvtx.range("dense_indexer_score_recompute"):
         if is_block_scaled:
             _dense_indexer_score_recompute.compile_cache[compile_key](
-                q,
-                k,
+                q_kernel,
+                k_kernel,
                 weights,
                 q_scale,
                 k_scale,

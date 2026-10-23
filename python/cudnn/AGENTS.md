@@ -377,6 +377,16 @@ DSL satisfies your kernel.**
   whenever `S` is true. Give such loop-local names their own spelling.
   Detector: rerun the kernel's tests with quack imported first (for example,
   a `-p` plugin that does `import quack`).
+- **Packed FP4 crosses the launch as bytes.** Below 4.8,
+  `from_dlpack(..., enable_tvm_ffi=True)` binds a real
+  `torch.float4_e2m1fn_x2` tensor with its packed shape and strides (two
+  values per unit), while the kernel is compiled for the E2M1 ones. The kernel
+  then reads the wrong bytes along the packed dim and returns wrong numbers
+  without an error. Launch a `torch.uint8` view and recast it inside the
+  `@cute.jit` entry with `cute.recast_tensor(t, cutlass.Float4E2M1FN)`
+  (`kernel_qk_view` and `IndexerScoreUnifiedSm100Mxfp4._qk_tensor` in
+  `deepseek_sparse_attention/score_recompute/`). Detector: the kernel's
+  numerics tests on a 4.7 lane.
 - Why: PR #799's `causal_conv1d_update` imported `frost.tile_dsl` from a route
   with no version check and broke the 4.6.2 lane — the version vLLM and SGLang
   ship — with a bare `ModuleNotFoundError: cutlass.experimental`; the bulk

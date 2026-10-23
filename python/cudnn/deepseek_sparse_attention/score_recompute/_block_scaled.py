@@ -130,6 +130,21 @@ def logical_head_dim(precision: str, storage_head_dim: int) -> int:
     return head_dim
 
 
+def kernel_qk_view(precision: str, t: torch.Tensor) -> torch.Tensor:
+    """Q or K as the ``precision`` kernel is compiled and launched with.
+
+    A packed format (more than one value per stored element) passes its raw bytes
+    as a ``torch.uint8`` view, which the kernel recasts to its element type: CuTe
+    DSL before 4.8 binds a ``torch.float4_e2m1fn_x2`` tensor with its packed shape
+    and strides, not the E2M1 ones the kernel is compiled for. Other precisions
+    pass ``t`` unchanged.
+    """
+    fmt = BLOCK_SCALED_FORMATS.get(precision)
+    if fmt is None or fmt.elems_per_storage == 1:
+        return t
+    return t.view(torch.uint8)
+
+
 def bshd_packed_scale_shape(
     *,
     bs: int,

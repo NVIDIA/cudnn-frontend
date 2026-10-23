@@ -23,6 +23,7 @@ from cudnn.deepseek_sparse_attention.score_recompute._block_scaled import (
     BLOCK_SCALED_FORMATS,
     BLOCK_SCALED_PRECISION_NAMES,
     bshd_packed_scale_shape,
+    kernel_qk_view,
     logical_head_dim,
     validate_block_scaled_inputs,
     validate_indexer_precision,
@@ -536,10 +537,12 @@ def _indexer_fwd_bound(
             sf_vec_size,
             q_causal_offsets is not None,
         )
+        q_kernel = kernel_qk_view(precision, q)
+        k_kernel = kernel_qk_view(precision, k)
 
         if compile_key not in _compile_cache:
-            q_cute = _to_cute_tensor(q)
-            k_cute = _to_cute_tensor(k)
+            q_cute = _to_cute_tensor(q_kernel)
+            k_cute = _to_cute_tensor(k_kernel)
             w_cute = _to_cute_tensor(w)
             q_scale_cute = _to_cute_tensor(q_scale)
             k_scale_cute = _to_cute_tensor(k_scale)
@@ -597,8 +600,8 @@ def _indexer_fwd_bound(
         max_k_arg = cutlass.Int32(seqlen_k_dim)
         with torch.cuda.nvtx.range(f"indexer_fwd_{precision}_kernel"):
             _compile_cache[compile_key](
-                q,
-                k,
+                q_kernel,
+                k_kernel,
                 w,
                 q_scale,
                 k_scale,
