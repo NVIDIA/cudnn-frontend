@@ -119,15 +119,18 @@ def run_case(tokens, steep, output_dir, label):
     with observe_schedulers(records):
         result = call()
     bwd = [r for r in records if r["plan"] == "CompiledGdn2Bwd"]
-    assert bwd, records
+    if not bwd:
+        raise ValueError(f"No backward scheduler records: {records}")
     flag = bwd[-1]["schedulers"]["scheduler_bwd"][1]
-    assert (flag > 1) if steep else (flag == 0), records
+    if not ((flag > 1) if steep else (flag == 0)):
+        raise ValueError(f"Unexpected backward scheduler flag: {records}")
     ref = reference(xs, do)
     errors = {}
     snapshots = {}
     for name, actual, expected in zip(("output", *NAMES), result, ref):
         actual = actual.detach().cpu().double()
-        assert torch.isfinite(actual).all() and torch.isfinite(expected).all()
+        if not (torch.isfinite(actual).all() and torch.isfinite(expected).all()):
+            raise ValueError(f"Non-finite {name} in output or FP64 reference")
         relative = ((actual - expected).norm() / expected.norm().clamp_min(1e-30)).item()
         errors[name] = {"relative_frobenius": relative, "max_abs": (actual - expected).abs().max().item()}
         snapshots[name] = actual
@@ -141,7 +144,8 @@ def run_case(tokens, steep, output_dir, label):
                 call()
             torch.cuda.synchronize()
         gpu = [e for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA]
-        assert gpu, "Profiler recorded no GPU activity"
+        if not gpu:
+            raise ValueError("Profiler recorded no GPU activity")
         intervals = sorted((e.time_range.start, e.time_range.end) for e in gpu)
         begin, end = intervals[0]
         busy = 0.0
@@ -215,7 +219,8 @@ def main():
             record["results"].append(run_case(tokens, steep, args.output.parent, args.label))
             args.output.write_text(json.dumps(record, indent=2, allow_nan=False) + "\n")
     args.output.write_text(json.dumps(record, indent=2, allow_nan=False) + "\n")
-    assert all(r["correct_within_one_percent"] for r in record["results"]), "FP64 tolerance failed; inspect saved errors"
+    if not all(r["correct_within_one_percent"] for r in record["results"]):
+        raise ValueError("FP64 tolerance failed; inspect saved errors")
 
 
 if __name__ == "__main__":
