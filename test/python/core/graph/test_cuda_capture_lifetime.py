@@ -174,7 +174,7 @@ def test_cuda_graph_retention_option(retention, cudnn_handle):
     x = torch.linspace(-2, 2, 1024, device="cuda").reshape(1, 32, 32)
     y = torch.empty_like(x)
     workspace = torch.empty(max(graph.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
-    previous_handle_stream = cudnn_handle.stream
+    previous_handle_stream = cudnn.get_stream(cudnn_handle)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     capture = torch.cuda.CUDAGraph()
