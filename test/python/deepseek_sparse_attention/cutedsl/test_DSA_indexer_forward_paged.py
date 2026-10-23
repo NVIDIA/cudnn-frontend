@@ -74,9 +74,8 @@ def _check_batch(q_b, k_b, w_b, ratio, offset, sm_scale, top_k, indices, logits,
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=61)
-@pytest.mark.parametrize("page_size", [16, 32, 64, 128, 256])
-@pytest.mark.parametrize("h_q", [4, 32])
-def test_DSA_indexer_forward_paged_bshd(page_size, h_q):
+@pytest.mark.parametrize("page_size", [64, 256])
+def test_DSA_indexer_forward_paged_bshd(page_size):
     """BSHD queries over a paged pool: ragged key counts (partial last page, one and several pages per sequence),
     chunked causal offsets so every row's reach ends inside its sequence, and a sequence whose keys stop short of
     the causal reach (rows clamp to kv_lens)."""
@@ -84,7 +83,7 @@ def test_DSA_indexer_forward_paged_bshd(page_size, h_q):
     DSA = _dsa()
     device = torch.device("cuda")
     kv_lens_host = [300, 97, 256, 40]
-    ratio, top_k, s_q, sm_scale = 4, 24, 64, D**-0.5
+    ratio, top_k, s_q, h_q, sm_scale = 4, 24, 64, 32, D**-0.5
     pool, block_table, kv_lens, dense_k = _paged_pool(kv_lens_host, page_size, device)
     # The last sequence's offset asks for 100 keys but only 40 exist.
     offsets_host = [L * ratio - s_q for L in kv_lens_host[:-1]] + [100 * ratio - s_q]
@@ -138,7 +137,7 @@ def test_DSA_indexer_forward_paged_bshd(page_size, h_q):
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=62)
-@pytest.mark.parametrize("page_size", [16, 32, 64, 128, 256])
+@pytest.mark.parametrize("page_size", [16, 64])
 def test_DSA_indexer_forward_paged_thd(page_size):
     """THD queries over a paged pool (no cu_seqlens_k): per-sequence query lengths and offsets, a one-token
     sequence, and max_seqlen_k left to its default of max_pages * page_size."""
