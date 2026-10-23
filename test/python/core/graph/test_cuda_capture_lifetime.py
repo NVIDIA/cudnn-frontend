@@ -174,10 +174,12 @@ def test_cuda_graph_retention_option(retention, cudnn_handle):
     x = torch.linspace(-2, 2, 1024, device="cuda").reshape(1, 32, 32)
     y = torch.empty_like(x)
     workspace = torch.empty(max(graph.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
-    stream = torch.cuda.ExternalStream(cudnn_handle.stream)
+    previous_handle_stream = cudnn_handle.stream
+    stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     capture = torch.cuda.CUDAGraph()
     try:
+        cudnn.set_stream(cudnn_handle, stream.cuda_stream)
         with torch.cuda.graph(capture, stream=stream):
             graph.execute({tx: x, ty: y}, workspace, handle=cudnn_handle)
         y.fill_(float("nan"))
@@ -186,6 +188,7 @@ def test_cuda_graph_retention_option(retention, cudnn_handle):
         torch.testing.assert_close(y, x.relu())
     finally:
         capture.reset()
+        cudnn.set_stream(cudnn_handle, previous_handle_stream)
 
     loaded = cudnn.pygraph(handle=cudnn_handle, cuda_graph_retention=mode)
     loaded.deserialize(cudnn_handle, graph.serialize())
