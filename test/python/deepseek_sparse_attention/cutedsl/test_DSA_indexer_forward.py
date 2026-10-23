@@ -884,8 +884,8 @@ def test_DSA_indexer_forward_wrapper_mxfp4_matches_dequant_reference(
     offsets,
 ):
     """Dense and compressed MXFP4 scores match an FP32 reference on the dequantized inputs."""
-    DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed", exc_type=ImportError).DSA
-    cuda = pytest.importorskip("cuda.bindings.driver", reason="Environment not supported: cudnn[cutedsl] not installed", exc_type=ImportError)
+    DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed").DSA
+    cuda = pytest.importorskip("cuda.bindings.driver", reason="Environment not supported: cudnn[cutedsl] not installed")
     _require_mxfp4_indexer()
 
     from deepseek_sparse_attention.cutedsl import mxfp8_scale_reference as scale_utils
@@ -965,8 +965,8 @@ def test_DSA_indexer_forward_wrapper_mxfp4_matches_dequant_reference(
 )
 def test_DSA_indexer_forward_wrapper_thd_mxfp4_compact_padded_scales(h_q):
     """THD MXFP4 scores with 256-token padded scale spans match an FP32 reference on the dequantized inputs."""
-    DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed", exc_type=ImportError).DSA
-    cuda = pytest.importorskip("cuda.bindings.driver", reason="Environment not supported: cudnn[cutedsl] not installed", exc_type=ImportError)
+    DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed").DSA
+    cuda = pytest.importorskip("cuda.bindings.driver", reason="Environment not supported: cudnn[cutedsl] not installed")
     _require_mxfp4_indexer()
 
     device = torch.device("cuda")
@@ -1074,7 +1074,7 @@ def test_DSA_indexer_forward_wrapper_mxfp4_scale_group_routing(ratio):
 @pytest.mark.parametrize("ratio", [4, 1], ids=["direct_ptx", "cute_gemm"])
 def test_DSA_indexer_forward_mxfp4_two_mmas_per_k_chunk(monkeypatch, ratio):
     """128-wide K chunks issue two K=64 MXFP4 MMAs per chunk, each reading its own pair of E8M0 scale groups."""
-    DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed", exc_type=ImportError).DSA
+    DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed").DSA
     _require_mxfp4_indexer()
     from cudnn.deepseek_sparse_attention.indexer_forward import _interface
     from cudnn.deepseek_sparse_attention.score_recompute import _block_scaled
@@ -1114,9 +1114,9 @@ def test_DSA_indexer_forward_imports_without_block_scaled_torch_dtypes():
     import subprocess
     import sys
 
-    cudnn = pytest.importorskip("cudnn", reason="Environment not supported: cudnn[cutedsl] not installed", exc_type=ImportError)
+    cudnn = pytest.importorskip("cudnn", reason="Environment not supported: cudnn[cutedsl] not installed")
     _block_scaled = pytest.importorskip(
-        "cudnn.deepseek_sparse_attention.score_recompute._block_scaled", reason="Environment not supported: cudnn[cutedsl] not installed", exc_type=ImportError
+        "cudnn.deepseek_sparse_attention.score_recompute._block_scaled", reason="Environment not supported: cudnn[cutedsl] not installed"
     )
     package_root = os.path.dirname(os.path.dirname(cudnn.__file__))
     # The cudnn directory the indexer was imported from; a conftest may have put a source tree ahead of the installed
@@ -1173,7 +1173,7 @@ def test_quantize_e2m1_rounds_ties_to_even(block_scale):
 @pytest.mark.L0
 def test_DSA_indexer_forward_wrapper_mxfp4_rejects_mismatched_inputs():
     """MXFP4 inputs that break the contract are refused on the host."""
-    DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed", exc_type=ImportError).DSA
+    DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed").DSA
     _require_mxfp4_indexer()
 
     from deepseek_sparse_attention.cutedsl import mxfp8_scale_reference as scale_utils
@@ -1222,7 +1222,7 @@ def test_DSA_indexer_forward_wrapper_mxfp4_rejects_mismatched_inputs():
 @pytest.mark.L0
 def test_DSA_indexer_forward_wrapper_rejects_mismatched_qk_last_dim():
     """BF16 Q/K whose last dims differ are refused on the host, in BSHD and THD."""
-    DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed", exc_type=ImportError).DSA
+    DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed").DSA
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("SM100-family GPU required")
 
@@ -1244,7 +1244,7 @@ def test_DSA_indexer_forward_wrapper_rejects_mismatched_qk_last_dim():
 def test_DSA_indexer_forward_wrapper_mxfp4_zero_key_query_tail(h_q):
     """With no compressed key (S_q 3 at ratio 4, S_k 0), MXFP4 dense scores are empty and top-k is all padding
     (-1 indices, -inf logits); S_q 4 is refused."""
-    DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed", exc_type=ImportError).DSA
+    DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed").DSA
     _require_mxfp4_indexer()
 
     from deepseek_sparse_attention.cutedsl import mxfp8_scale_reference as scale_utils
@@ -1279,9 +1279,7 @@ def test_DSA_indexer_forward_wrapper_mxfp4_zero_key_query_tail(h_q):
 @pytest.mark.parametrize("precision", ["mxfp8", "mxfp4"])
 def test_DSA_indexer_forward_wrapper_sm90_rejects_block_scaled_precisions(monkeypatch, precision):
     """On SM90 a block-scaled precision, in either case, fails the SM90 precision check, and its scale prefixes are SM100-only."""
-    api = pytest.importorskip(
-        "cudnn.deepseek_sparse_attention.indexer_forward.api", reason="Environment not supported: cudnn[cutedsl] not installed", exc_type=ImportError
-    )
+    api = pytest.importorskip("cudnn.deepseek_sparse_attention.indexer_forward.api", reason="Environment not supported: cudnn[cutedsl] not installed")
 
     monkeypatch.setattr(api, "device_major", lambda: 9)
     q = torch.zeros(1, 8, 64, 128, dtype=torch.bfloat16)
