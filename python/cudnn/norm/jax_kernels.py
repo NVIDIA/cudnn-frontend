@@ -28,7 +28,8 @@ def make_forward(rows, cols, io_dtype, *, has_mean, has_beta, epsilon, sm_count)
     """Return ``launch(stream, x, gamma, beta, y, [mean,] rstd)``.
 
     X/Y are contiguous [rows, cols], affine operands [cols], and statistics
-    FP32 [rows]. The unused beta operand may alias gamma.
+    FP32 [rows]. The unused beta operand may alias gamma. ``sm_count`` keys
+    the cache because the shared helpers derive launch geometry from the device.
     """
     params = _parameters(io_dtype, has_mean, has_beta)
     spec = rowwise_spec(params.variant, (rows, cols))
@@ -36,20 +37,20 @@ def make_forward(rows, cols, io_dtype, *, has_mean, has_beta, epsilon, sm_count)
     it = cutlass.Int16 if eb == 2 else cutlass.Int32
     wcfg = make_warp_cfg(params, cols)
     ctas = 0
-    if fwd_cga.should_use(cols, rows, eb, multiprocessors=sm_count):
-        cga, cs, vector, vpt = fwd_cga.cga_cfg(cols, rows, eb, multiprocessors=sm_count)
+    if fwd_cga.should_use(cols, rows, eb):
+        cga, cs, vector, vpt = fwd_cga.cga_cfg(cols, rows, eb)
         route, host = "cga", fwd_cga._ln_fwd_cga_host
         constants = (cols, cs, cga, fwd_cga._BT, vector, vpt, fwd_cga._KC, it, et, float(cols), epsilon, has_mean, has_beta, rows * cga)
     elif wcfg is not None and fwd_warp.eligible(spec, params, wcfg, has_beta):
         tpr, wn, intra, ldgs, rpc, threads, vector = wcfg
         if fwd_warp._pipe_eligible(cols, wn, has_beta, eb):
             stages = fwd_warp._pipe_stages(cols)
-            ctas = fwd_warp._pipe_cap(rows, cols, multiprocessors=sm_count)
+            ctas = fwd_warp._pipe_cap(rows, cols)
             shared = fwd_warp._pipe_smem(cols, has_beta, wn, stages, eb)
             route, host = "warp", fwd_warp._warp_fwd_pipe_host
             constants = (cols, vector, tpr, wn, ldgs, (wn + 1) * 32, et, it, eb, stages, has_mean, has_beta, shared)
         else:
-            ctas = fwd_warp._persist_cap((rows + rpc - 1) // rpc, threads, wn, ldgs, multiprocessors=sm_count)
+            ctas = fwd_warp._persist_cap((rows + rpc - 1) // rpc, threads, wn, ldgs)
             route, host = "warp", fwd_warp._warp_fwd_host
             constants = (cols, vector, tpr, wn, intra, ldgs, rpc, threads, et, it, intra.bit_length() - 1, intra == 32, has_mean, has_beta, fwd_warp._MBPM)
     else:
@@ -93,8 +94,8 @@ def make_backward(rows, cols, io_dtype, *, has_mean, has_beta, sm_count):
     it = cutlass.Int16 if eb == 2 else cutlass.Int32
     wcfg = bwd._bwd_pipe_cfg(cols, eb)
     partitions = 0
-    if bwd_cga.should_use(cols, rows, eb, multiprocessors=sm_count):
-        cga, cs, vector, vpt, stages = bwd_cga.cga_cfg(cols, rows, eb, multiprocessors=sm_count)
+    if bwd_cga.should_use(cols, rows, eb):
+        cga, cs, vector, vpt, stages = bwd_cga.cga_cfg(cols, rows, eb)
         partitions = min(rows, max(1, 4 * sm_count // cga))
         shared = 2 * stages * bwd_cga._BT * vector * eb + 8 + 2 * (bwd_cga._BT // 32) * 4 + 128
         route, host = "cga", bwd_cga._ln_bwd_cga_host
@@ -127,7 +128,7 @@ def make_backward(rows, cols, io_dtype, *, has_mean, has_beta, sm_count):
         tpr, wn, ldgs, vector = wcfg
         cache_xd = bwd._bwd_cache_xd(ldgs, vector, rows, cols, has_beta, wn, eb)
         stages = bwd._pipe_bwd_actual_stages(cache_xd)
-        partitions = bwd._pipe_bwd_cap(rows, wn, cols, cache_xd, eb, multiprocessors=sm_count)
+        partitions = bwd._pipe_bwd_cap(rows, wn, cols, cache_xd, eb)
         shared = bwd._pipe_bwd_smem(cols, wn, stages, eb)
         route, host = "pipe", bwd._ln_bwd_pipe_host
         constants = (

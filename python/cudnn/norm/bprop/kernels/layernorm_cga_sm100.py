@@ -113,13 +113,13 @@ def _block_sum2(v1, v2, tid, red, bt: cutlass.Constexpr):
     return a, b
 
 
-def cga_cfg(C, R, eb, block_threads=_BT, *, multiprocessors=None):
+def cga_cfg(C, R, eb, block_threads=_BT):
     """``(CGA, CS, V, VPT, KS)`` for a backward row split, or None."""
     V = 16 // eb
     lanes = block_threads * V
     if C % lanes:
         return None
-    cga = _pick_cga(C, R, V, block_threads, multiprocessors=multiprocessors)
+    cga = _pick_cga(C, R, V, block_threads)
     # One step wider than the forward wants: the per-column dgamma/dbeta partials are
     # 2*VPT*V registers per thread, so a narrower slice buys register headroom that
     # the forward (which holds no per-column state) does not need.
@@ -136,13 +136,13 @@ def cga_cfg(C, R, eb, block_threads=_BT, *, multiprocessors=None):
     return cga, cs, V, vpt, ks
 
 
-def eligible(C, R, eb, block_threads=_BT, *, multiprocessors=None):
-    return cga_cfg(C, R, eb, block_threads, multiprocessors=multiprocessors) is not None
+def eligible(C, R, eb, block_threads=_BT):
+    return cga_cfg(C, R, eb, block_threads) is not None
 
 
-def should_use(C, R, eb, block_threads=_BT, *, multiprocessors=None):
+def should_use(C, R, eb, block_threads=_BT):
     """True when splitting the row across a cluster beats the pipelined backward."""
-    if not eligible(C, R, eb, block_threads, multiprocessors=multiprocessors):
+    if not eligible(C, R, eb, block_threads):
         return False
     if C >= _CGA_MIN_C:
         return True
