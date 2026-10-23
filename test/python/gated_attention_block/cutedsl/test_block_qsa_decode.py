@@ -286,23 +286,110 @@ def test_the_indexer_band_declaration_over_the_pools_is_capture_safe_at_decode_r
 
 def test_the_sparse_split_rule_fills_the_machine_and_stays_inside_the_item():
     """The split the sparse decode mode lowers with when ``decode_split_kv=None``: enough chunks to put one work item per SM
-    (``ceil(SMs / (B x H_kv x S_q))``), never more than the item's tile count ``ceil((top_k + 1) / 32)`` nor than the measured cap of 16
-    (the B 1 / B 4 x 32K x S_q 1 split sweeps on a 212-SM part with the pinned decode-grid combine: the step keeps falling to 16-17
-    chunks where the former combine entry, whose cost grows with the partial count, turned up past 16), 1 for a full launch and
-    for a non-CUDA reading (0 SMs) -- a performance choice only: the same function under every value."""
-    from cudnn.gated_attention_block.api import SPARSE_DECODE_SPLIT_CAP
+    (the FILL rule, ``ceil(SMs / (B x H_kv x S_q))``), never more than the item's tile count ``ceil((top_k + 1) / 32)`` nor than the
+    measured cap of 16 (the B 1 / B 4 x 32K x S_q 1 split sweeps on a 212-SM part with the pinned decode-grid combine: the step keeps
+    falling to 16-17 chunks where the former combine entry, whose cost grows with the partial count, turned up past 16), 1 for a
+    non-CUDA reading (0 SMs) -- and where that fill leaves a SECOND WAVE of SMs (``B x H_kv x S_q x split > SMs``: a CTA streams its
+    chunk serially, so 256 equal items on 212 SMs cost two item durations, not 1.2) the WAVE rule: the split in ``[1, cap]`` that
+    minimizes ``waves x (tiles per chunk + 1)`` (the ``+ 1`` = the chunk-item's fixed cost in tile units), ties to the SMALLER split
+    -- the 256-item T 128 launch 1 -> 3, B 32 x S_q 1 4 -> 3, B 4 x S_q 4 7 -> 6; every launch the fill rule keeps in one wave is
+    untouched, bitwise.  A performance choice only: the same function under every value."""
+    from cudnn.gated_attention_block.api import SPARSE_DECODE_SPLIT_CAP, SPARSE_DECODE_SPLIT_ITEM_COST_TILES
     from cudnn.gated_attention_block.api import sparse_decode_split_choice as pick
 
-    assert SPARSE_DECODE_SPLIT_CAP == 16
-    assert pick(batch=4, h_kv=2, s_q=1, top_k=512, sm_count=212) == 16  # 212 / 8 = 27 -> the measured cap of 16 (below the 17 tiles of a 512-list item)
-    assert pick(batch=1, h_kv=2, s_q=1, top_k=512, sm_count=212) == 16  # 2 items: the cap again
+    assert SPARSE_DECODE_SPLIT_CAP == 16 and SPARSE_DECODE_SPLIT_ITEM_COST_TILES == 1
+    # ONE-wave launches: the fill rule as measured, untouched by the wave rule
+    assert (
+        pick(batch=4, h_kv=2, s_q=1, top_k=512, sm_count=212) == 16
+    )  # 212 / 8 = 27 -> the measured cap of 16 (below the 17 tiles of a 512-list item): 128 chunk-items, one wave
+    assert pick(batch=1, h_kv=2, s_q=1, top_k=512, sm_count=212) == 16  # 2 items: the cap again (32 chunk-items)
     assert pick(batch=1, h_kv=2, s_q=1, top_k=256, sm_count=212) == 9  # ceil(257 / 32) = 9 tiles at top_k 256: the item's tile count binds under the cap
-    assert pick(batch=32, h_kv=2, s_q=1, top_k=512, sm_count=212) == 4  # ceil(212 / 64) = 4: the fill rule, under either cap
-    assert pick(batch=4, h_kv=2, s_q=4, top_k=512, sm_count=212) == 7  # ceil(212 / 32)
-    assert pick(batch=32, h_kv=2, s_q=4, top_k=512, sm_count=212) == 1  # 256 items: a full launch never splits
     assert pick(batch=2, h_kv=2, s_q=1, top_k=64, sm_count=212) == 3  # ceil(65 / 32) = 3 tiles at top_k 64
+    assert pick(batch=53, h_kv=2, s_q=1, top_k=512, sm_count=212) == 2  # 106 items x 2 = 212 chunk-items: EXACTLY one wave, the fill rule stands
     assert pick(batch=1, h_kv=2, s_q=1, top_k=512, sm_count=0) == 1  # no CUDA device: declined at check_support anyway
     assert pick(batch=1, h_kv=1, s_q=1, top_k=4, sm_count=212) == 1  # a 4-list item is one tile
+    # SECOND-wave launches: the fill rule's pick overflows one wave of SMs, the wave rule takes over (cost = waves x (tiles per chunk + 1))
+    assert (
+        pick(batch=32, h_kv=2, s_q=4, top_k=512, sm_count=212) == 3
+    )  # T 128: 256 items unsplit = 2 waves x (17 + 1) = 36; 768 chunk-items of 6 / 6 / 5 tiles = 4 waves x 7 = 28, the least
+    assert (
+        pick(batch=32, h_kv=2, s_q=1, top_k=512, sm_count=212) == 3
+    )  # the fill rule's 4 = 256 chunk-items (2 waves x 6 = 12); 3 = 192, ONE wave of 6 / 6 / 5 (7)
+    assert (
+        pick(batch=4, h_kv=2, s_q=4, top_k=512, sm_count=212) == 6
+    )  # the fill rule's 7 = 224 chunk-items (2 waves x 4 = 8); 6 = 192, one wave of 3 / 3 / 3 / 3 / 3 / 2 (4)
+    assert pick(batch=16, h_kv=2, s_q=4, top_k=512, sm_count=212) == 3  # 128 items: the fill rule's 2 = 256 (2 waves x 10 = 20); 3 = 384 (2 waves x 7 = 14)
+    assert (
+        pick(batch=24, h_kv=2, s_q=1, top_k=512, sm_count=212) == 4
+    )  # 48 items: the fill rule's 5 = 240 (2 waves x 5 = 10); 4 = 192, one wave of 5 / 4 / 4 / 4 (6)
+    assert (
+        pick(batch=32, h_kv=2, s_q=1, top_k=256, sm_count=212) == 3
+    )  # 9 tiles at top_k 256: the fill rule's 4 = 256 (2 waves x 4 = 8); 3 = 192, one wave of 3 / 3 / 3 (4)
+    assert (
+        pick(batch=75, h_kv=2, s_q=1, top_k=512, sm_count=212) == 1
+    )  # 150 items: the fill rule's 2 = 300 chunk-items (2 waves x 10 = 20); the wave rule UNDOES it: one wave of 17 (18)
+    # the wave rule never fires on a one-wave schedule (the fill rule's pick, bitwise) ...
+    for b, s_q, top_k in ((1, 1, 512), (4, 1, 512), (1, 4, 512), (4, 4, 64), (2, 1, 256), (53, 1, 512), (106, 1, 512)):
+        units = b * 2 * s_q
+        fill = max(1, min(-(-(top_k + 1) // 32), SPARSE_DECODE_SPLIT_CAP, -(-212 // units)))
+        assert units * fill <= 212 and pick(batch=b, h_kv=2, s_q=s_q, top_k=top_k, sm_count=212) == fill, (b, s_q, top_k)
+    # ... and where it fires its pick stays inside the item and under the cap
+    for b, s_q, top_k in ((32, 4, 512), (32, 1, 512), (4, 4, 512), (16, 4, 512), (24, 1, 512), (75, 1, 512), (213, 1, 512), (32, 1, 256), (4, 4, 256)):
+        units = b * 2 * s_q
+        fill = max(1, min(-(-(top_k + 1) // 32), SPARSE_DECODE_SPLIT_CAP, -(-212 // units)))
+        s = pick(batch=b, h_kv=2, s_q=s_q, top_k=top_k, sm_count=212)
+        assert units * fill > 212 and 1 <= s <= min(-(-(top_k + 1) // 32), SPARSE_DECODE_SPLIT_CAP), (b, s_q, top_k, s)
+
+
+# The 19 decode cells of the block's end-to-end measurement on the 24 / 2 geometry (B 1 / 4 / 32 x KV 8K / 32K / 128K x S_q 1 / 4 and the
+# B 4 x 2K identity, top_k 512): the rule reads B, H_kv, S_q and top_k only, so the KV length is not an axis and the cells collapse onto six
+# (B, S_q) classes -- (B, S_q, the fill rule's split, the split of record on a 212-SM part, the split on a 204-SM part, cells in the class).
+_SPLIT_RULE_CELLS = (
+    # the ten ONE-wave cells: B <= 4 x S_q 1 (B 1 and B 4 at 8K / 32K / 128K + the B 4 x 2K identity) and B 1 x S_q 4 (8K / 32K / 128K)
+    (1, 1, 16, 16, 16, 3),
+    (4, 1, 16, 16, 16, 4),
+    (1, 4, 16, 16, 16, 3),
+    # the six TWO-wave cells: B 32 x S_q 1 (256 chunk-items at the fill rule's 4) and B 4 x S_q 4 (224 at its 7), each at 8K / 32K / 128K
+    (32, 1, 4, 3, 3, 3),
+    (4, 4, 7, 6, 6, 3),
+    # the three T 128 cells (B 32 x S_q 4: 256 unsplit 17-tile items, two waves)
+    (32, 4, 1, 3, 3, 3),
+)
+
+
+@pytest.mark.parametrize("sm_count", [212, 204], ids=["sms212", "sms204"])
+def test_the_sparse_split_rule_over_the_measured_decode_cells(sm_count):
+    """The rule over the 19 measured decode cells (:data:`_SPLIT_RULE_CELLS`) at the measured part's SM count (212) and at the development
+    part's (204): the ten one-wave cells keep the fill rule's split BITWISE (the number the former rule gave), the six two-wave cells
+    move (B 32 x S_q 1: 4 -> 3; B 4 x S_q 4: 7 -> 6) and the three T 128 cells split 1 -> 3 -- the same picks on both parts (the fill
+    rule's own pick is the same there too) -- and the combine FORM a moved cell's launch takes is the one pinned per grid and split
+    (``_sparse_combine_decode_grid``, the cc 10.7 rule): the lean group walk at B 32 x 24 heads at split 3 as at 4 (also on the T 128
+    grid: 768 lean blocks past the decode-grid bound, split <= 4), the combine module's own forms at B 4 x S_q 4 at split 6 as at 7
+    (below the decode-grid kernel's split 8)."""
+    from cudnn.gated_attention_block.api import SPARSE_DECODE_SPLIT_CAP
+    from cudnn.gated_attention_block.api import sparse_decode_split_choice as pick
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import _sparse_combine_decode_grid
+
+    h_kv, h_q, top_k = 2, 24, 512
+    max_tiles = -(-(top_k + 1) // 32)
+    assert sum(n for *_, n in _SPLIT_RULE_CELLS) == 19
+    moved = {}
+    for b, s_q, fill_of_record, split_212, split_204, _cells in _SPLIT_RULE_CELLS:
+        units = b * h_kv * s_q
+        fill = max(1, min(max_tiles, SPARSE_DECODE_SPLIT_CAP, -(-sm_count // units)))  # the fill rule alone = the former rule
+        assert fill == fill_of_record, (b, s_q, sm_count, fill)
+        got = pick(batch=b, h_kv=h_kv, s_q=s_q, top_k=top_k, sm_count=sm_count)
+        assert got == (split_212 if sm_count == 212 else split_204), (b, s_q, sm_count, got)
+        if units * fill <= sm_count:
+            assert got == fill, (b, s_q, sm_count, got)  # one wave: bitwise the former rule
+        else:
+            moved[(b, s_q)] = (fill, got)
+    assert moved == {(32, 1): (4, 3), (4, 4): (7, 6), (32, 4): (1, 3)}, moved
+    cc = (10, 7)
+    assert _sparse_combine_decode_grid(32, h_q, 1, 3, cc) == _sparse_combine_decode_grid(32, h_q, 1, 4, cc) == split_combine.DECODE_GRID_LEAN_WALK
+    assert _sparse_combine_decode_grid(32, h_q, 4, 3, cc) == split_combine.DECODE_GRID_LEAN_WALK
+    assert _sparse_combine_decode_grid(4, h_q, 4, 6, cc) == _sparse_combine_decode_grid(4, h_q, 4, 7, cc) == split_combine.DECODE_GRID_OFF
 
 
 def test_typed_declines_of_the_sparse_decode_mode():
