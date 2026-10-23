@@ -176,14 +176,14 @@ def _max_abs_reduction(vec):
 def _exp2_chunk0_mask_aware(vec, apply_mask):
     """Evaluate softmax chunk 0 with the precision required by each static path.
 
-    E5M2 mask-boundary tiles use native EXP2 because degree-2 emulation can
-    exceed the output tolerance there. The repeated unmasked path retains its
-    tuned emulation mix, while the E4M3 instruction mix remains unchanged.
+    Mask-boundary tiles use native EXP2: emulation can move a probability
+    across an FP8 midpoint, which is amplified when a row has few valid keys.
+    The repeated unmasked path retains its tuned emulation mix.
     With the split off (_E2E_ENABLED, cc != 10.0) every element takes native EXP2.
     """
     values = []
     for i in range(0, int(vec.shape[0]), 2):
-        if not _E2E_ENABLED or (CFG.DTYPE_QKV == 1 and apply_mask):
+        if not _E2E_ENABLED or apply_mask:
             x = cute.math.exp2(vec[i], fastmath=True)
             y = cute.math.exp2(vec[i + 1], fastmath=True)
         elif CFG.DTYPE_QKV == 1 and i < 32:

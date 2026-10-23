@@ -254,6 +254,7 @@ def _run(
     scale_o=1.0,
     negate_q: bool = False,
     negative_descale_q: bool = False,
+    qkv_float=None,
 ):
     """Append-only knobs (PR-A): ``gate`` (a bf16 BHSD-logical tensor of O's shape)
     adds the epilogue-gate tail ``sdpa(virtual O_v) -> sigmoid(G) -> mul`` and
@@ -264,11 +265,14 @@ def _run(
     import cudnn
 
     dev = "cuda"
-    Qf = torch.randn(B, H_q, S_q, d_qk, device=dev) * 0.5
+    if qkv_float is None:
+        Qf = torch.randn(B, H_q, S_q, d_qk, device=dev) * 0.5
+        Kf = torch.randn(B, H_kv, S_kv, d_qk, device=dev) * 0.5
+        Vf = torch.randn(B, H_kv, S_kv, d_v, device=dev) * 0.5
+    else:
+        Qf, Kf, Vf = qkv_float
     if negate_q:
         Qf = -Qf
-    Kf = torch.randn(B, H_kv, S_kv, d_qk, device=dev) * 0.5
-    Vf = torch.randn(B, H_kv, S_kv, d_v, device=dev) * 0.5
     Q8, dq = _quant(Qf, in_key)
     K8, dk = _quant(Kf, in_key)
     V8, dv = _quant(Vf, in_key)
@@ -2422,6 +2426,40 @@ def test_fp8_negative_attn_scale(d_qk, d_v, mask):
     assert not neg.output.isnan().any()
     assert torch.equal(neg.output, pos.output)
     assert neg.amax == pos.amax
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not 100 <= _SM < 107, reason="the SM100 D192 FP8 template")
+def test_fp8_d192_causal_probability_rounding():
+    """A fixed two-key causal row straddles an E4M3 probability midpoint.
+
+    P[0] = 0.78075 must round to 0.75, below the 0.78125 midpoint.
+    The old exp2 approximation moved it above the midpoint and rounded to
+    0.8125 instead. Fixed inputs keep this independent of CUDA RNG layout.
+    """
+    q = torch.zeros(1, 1, 128, 192, device="cuda")
+    k = torch.zeros_like(q)
+    v = torch.zeros(1, 1, 128, 128, device="cuda")
+    q[..., 0] = 1.0
+    k[:, :, 1, 0] = 1.0
+    v[:, :, 0, :] = 4.0
+    result = _run(
+        1,
+        1,
+        1,
+        128,
+        128,
+        "e4m3",
+        torch.float16,
+        scale=-math.log(0.78075),
+        sdpa_kwargs=_MASKS["causal"],
+        d_qk=192,
+        d_v=128,
+        return_lse=True,
+        qkv_float=(q, k, v),
+    )
+    _check(result.output, result.reference, torch.float16, "e4m3", result.amax, result.reference_amax)
+    torch.testing.assert_close(result.stats, result.reference_stats, rtol=3e-2, atol=_half_atol("e4m3"))
 
 
 @pytest.mark.L0
