@@ -1414,6 +1414,7 @@ cudnn.ops.fft_causal_conv1d
 cudnn.ops.kimi_delta_attention_backward_jax
 cudnn.ops.kimi_delta_attention_forward_jax
 cudnn.ops.kpage_prepare_layout
+cudnn.ops.layer_norm_forward_jax
 cudnn.ops.nvfp4_block_scale_dequantize
 cudnn.ops.nvfp4_block_scale_quantize
 cudnn.ops.qsa_backward
@@ -1423,6 +1424,7 @@ cudnn.ops.qsa_indexed_forward
 cudnn.ops.qsa_select_decode_forward
 cudnn.ops.qsa_select_decode_paged_forward
 cudnn.ops.qsa_select_forward
+cudnn.ops.rms_norm_forward_jax
 cudnn.pack_backward_weights
 cudnn.pack_causal_conv3d_weight_sm100
 cudnn.pack_conv3d_weight_sm100

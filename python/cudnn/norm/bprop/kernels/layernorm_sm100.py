@@ -836,13 +836,15 @@ def _pipe_bwd_eligible(C, wn, ldgs, V, R, has_beta, eb):
     return wn >= 1 and V >= 2 and _pipe_bwd_smem(C, wn, STAGES, eb) <= smem_capacity()
 
 
-def _pipe_bwd_cap(R, wn, C, cache_xd, eb):
+def _pipe_bwd_cap(R, wn, C, cache_xd, eb, *, multiprocessors=None):
     global _SM_COUNT
-    if _SM_COUNT is None:
-        import torch
+    if multiprocessors is None:
+        if _SM_COUNT is None:
+            import torch
 
-        _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
-    NSM = _SM_COUNT
+            _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
+        multiprocessors = _SM_COUNT
+    NSM = multiprocessors
     if cache_xd:
         # Occupancy-aware cap: the optimum balances three limits (measured by a
         # per-shape cap sweep -- this formula reproduces every mid-C optimum exactly).
