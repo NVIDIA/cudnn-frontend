@@ -76,7 +76,7 @@ def _block_sum2(v1, v2, tid, red, bt: cutlass.Constexpr):
     return a, b
 
 
-def _pick_cga(C, R, V, bt):
+def _pick_cga(C, R, V, bt, *, multiprocessors=None):
     """Cluster size for an ``R x C`` problem.
 
     The optimum depends on BOTH dimensions, which a slice-size heuristic cannot
@@ -101,7 +101,7 @@ def _pick_cga(C, R, V, bt):
     """
     from cudnn.norm.utils import sm_count
 
-    sm = sm_count()
+    sm = sm_count() if multiprocessors is None else multiprocessors
     cga = 2
     while cga < _MAX_CGA and R * cga < 4 * sm:
         cga *= 2
@@ -112,13 +112,13 @@ def _pick_cga(C, R, V, bt):
     return cga
 
 
-def cga_cfg(C, R, eb, block_threads=_BT):
+def cga_cfg(C, R, eb, block_threads=_BT, *, multiprocessors=None):
     """``(CGA, CS, V, VPT)`` for a row split across a cluster, or None."""
     V = 16 // eb
     lanes = block_threads * V  # elements one CTA covers per vector pass
     if C % lanes:
         return None
-    cga = _pick_cga(C, R, V, block_threads)
+    cga = _pick_cga(C, R, V, block_threads, multiprocessors=multiprocessors)
     while cga > 1 and (C % (cga * lanes) or (C // cga) < lanes):
         cga //= 2
     if cga < 2:
@@ -134,13 +134,13 @@ def cga_cfg(C, R, eb, block_threads=_BT):
 _CGA_MIN_C = 16384
 
 
-def eligible(C, R, eb, block_threads=_BT):
-    return cga_cfg(C, R, eb, block_threads) is not None
+def eligible(C, R, eb, block_threads=_BT, *, multiprocessors=None):
+    return cga_cfg(C, R, eb, block_threads, multiprocessors=multiprocessors) is not None
 
 
-def should_use(C, R, eb, block_threads=_BT):
+def should_use(C, R, eb, block_threads=_BT, *, multiprocessors=None):
     """True when the row is long enough that splitting it across a cluster wins."""
-    return C >= _CGA_MIN_C and eligible(C, R, eb, block_threads)
+    return C >= _CGA_MIN_C and eligible(C, R, eb, block_threads, multiprocessors=multiprocessors)
 
 
 @cute.kernel

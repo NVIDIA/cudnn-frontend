@@ -980,6 +980,12 @@ reject without changing the selected reduction mode.
 
 Public functions (`cudnn.ops.<op>_<direction>(...)` / `cudnn.ops.<op>_<direction>_jax(...)`, see `docs/operations/api_conventions.md`) allocate outputs and return them in a stable, documented order. PyTorch functions return a **`TupleDict`** (dict that also unpacks as a tuple). JAX functions return a plain tuple or dict: `jax.jit` rejects `TupleDict`, which is not a registered pytree.
 
+JAX tracers do not reveal eventual buffer placement. Do not choose device-specific
+launch geometry from `jax.local_devices()[0]` unless the API enforces a single
+visible device. Exercise that guard with `jax.jit(...).lower(ShapeDtypeStruct(...))`
+so validation of concrete eager arrays cannot mask a tracing-time mismatch (see
+`test/python/norm/jax/test_norm_jax.py`).
+
 ## Adding a new frontend-only API — required checklist
 
 1. Kernel package under the closest existing family (layout above).
