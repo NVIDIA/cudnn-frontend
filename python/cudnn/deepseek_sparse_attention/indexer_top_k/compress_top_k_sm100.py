@@ -308,9 +308,12 @@ class CompressTopkStage2:
                 seqlen_k_eff = seqlen_k
             ob = b
             oq = q
-        # Paged K: the per-batch key count comes from kv_lens, not from cu_seqlens_k.
+        # Paged K: the per-batch key count comes from kv_lens, not from cu_seqlens_k. It is
+        # bounded by the static key extent, like the score kernel bounds its writes.
         if const_expr(mKvLens is not None):
             seqlen_k_eff = mKvLens[b]
+            if seqlen_k_eff > seqlen_k:
+                seqlen_k_eff = seqlen_k
 
         # Per-batch causal offset (q_causal_offset; default 0 when mQCausalOffsets is
         # None) — same convention as the dense indexer.
@@ -803,7 +806,7 @@ def compress_stage2_topk(
     compile_key = (
         bs,
         seqlen_q,
-        seqlen_k,
+        seqlen_k if kv_lens is None else None,  # paged: the key extent is a runtime bound
         topk,
         ratio,
         block_threads,
@@ -936,7 +939,9 @@ def compress_stage2_topk_varlen(
     # cu_seqlens_q/k must have the SAME length bs+1: bs is derived from
     # cu_seqlens_q, and the kernel reads mCuSeqlensK[b+1] for every such batch b,
     # so a shorter cu_seqlens_k is an out-of-bounds read.  (Structural, sync-free.)
-    if bs < 1 or (cu_seqlens_k is not None and cu_seqlens_k.numel() != cu_seqlens_q.numel()):
+    if bs < 1:
+        raise ValueError(f"cu_seqlens_q must have length bs+1 >= 2; got numel {cu_seqlens_q.numel()}")
+    if cu_seqlens_k is not None and cu_seqlens_k.numel() != cu_seqlens_q.numel():
         raise ValueError("cu_seqlens_q and cu_seqlens_k must have equal length bs+1 (>= 2); got " f"numel {cu_seqlens_q.numel()} and {cu_seqlens_k.numel()}")
     if kv_lens is not None and kv_lens.numel() != bs:
         raise ValueError(f"kv_lens must have shape ({bs},), got {tuple(kv_lens.shape)}")

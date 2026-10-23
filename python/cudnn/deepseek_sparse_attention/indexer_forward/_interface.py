@@ -32,6 +32,7 @@ from cudnn.deepseek_sparse_attention.score_recompute._block_scaled import (
 )
 from .indexer_fwd_sm100 import IndexerForwardSm100
 from ._support import (
+    check_paged_args as _check_paged_args,
     check_q_covered_by_k as _check_q_covered_by_k,
     resolve_m_block_size as _resolve_m_block_size,
     resolve_paged_k as _resolve_paged_k,
@@ -192,7 +193,8 @@ def indexer_fwd(
             ``cu_seqlens_k`` must be ``None``; ``max_seqlen_k`` defaults to
             ``max_pages * page_size``. BF16 only, local key ids only.
         kv_lens: int32 ``(batch,)`` CUDA tensor of visible compressed keys per
-            sequence; required with ``block_table``.
+            sequence; required with ``block_table``. Keys at or past
+            ``max_seqlen_k`` are never scored.
 
     Returns:
         S_sum: BSHD ``(bs, seqlen_q, seqlen_k)`` or THD
@@ -200,7 +202,7 @@ def indexer_fwd(
     """
     current_stream = resolve_stream(current_stream)
     precision = validate_indexer_precision(precision)
-    paged = block_table is not None
+    paged = _check_paged_args(block_table, kv_lens)
     if paged and k.ndim == 3:
         k = k.unsqueeze(2)  # a single-head key cache may omit the head axis
     if paged and max_seqlen_k is None and k.ndim == 4 and block_table.ndim == 2:
@@ -431,7 +433,7 @@ def _indexer_fwd_bound(
     precision = validate_indexer_precision(precision)
     if ratio <= 0:
         raise ValueError(f"ratio must be > 0, got {ratio}")
-    paged = block_table is not None
+    paged = _check_paged_args(block_table, kv_lens)
     if paged and precision != "bf16":
         raise NotImplementedError("paged K is served by the BF16 indexer only")
 

@@ -418,8 +418,8 @@ compressed column 0.
     (`(B,)` INT32) its compressed-key count; the ratio-causal limit still
     applies on top. `cu_seqlens_k` must be `None` (THD queries keep
     `cu_seqlens_q`), and the score width is `max_seqlen_k`, which defaults to
-    `max_pages * page_size`. Pool rows past `kv_lens[b]` inside the last live
-    page are never scored.
+    `max_pages * page_size`; keys at or past it are never scored, nor are pool
+    rows past `kv_lens[b]` inside the last live page.
 - **Output** — `scores`: `(B, S_q, S_k)` FP32. On SM100 this is the
   `[..., :S_k]` view over a `(B, S_q, ceil4(S_k))` (THD:
   `(total_q, ceil4(max_seqlen_k))`) allocation: the kernel binds `out` through

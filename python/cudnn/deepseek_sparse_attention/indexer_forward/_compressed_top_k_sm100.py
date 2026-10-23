@@ -45,6 +45,7 @@ from cudnn.deepseek_sparse_attention.utils.tensor_conversion import (
 )
 
 from ._support import (
+    check_paged_args as _check_paged_args,
     check_q_covered_by_k as _check_q_covered_by_k,
     resolve_m_block_size as _resolve_m_block_size,
     resolve_paged_k as _resolve_paged_k,
@@ -374,7 +375,7 @@ def indexer_fwd_compress_topk(
     validate_sf_vec_size(precision, sf_vec_size)
 
     bs, seqlen_q, n_heads_q, head_dim = q.shape
-    paged = block_table is not None
+    paged = _check_paged_args(block_table, kv_lens)
     if paged:
         if precision != "bf16":
             raise NotImplementedError("paged K is served by the BF16 indexer only")
@@ -659,7 +660,7 @@ def indexer_fwd_compress_topk(
         sf_vec_size,
         float(sm_scale),
         seqlen_q,
-        seqlen_k,
+        None if paged else seqlen_k,  # paged: the key extent is max_pages * page_size, a runtime bound
         page_size,
     )
     q_kernel = kernel_qk_view(precision, q)
@@ -1093,7 +1094,7 @@ def _run_compress_gemm_varlen(
         unified_kv_stage,
         float(sm_scale),
         int(max_seqlen_q),
-        int(max_seqlen_k),
+        None if page_size else int(max_seqlen_k),  # paged: a runtime bound, not a layout parameter
         q_causal_offsets is not None,
         bool(want_lse),
         page_size,
@@ -1265,7 +1266,7 @@ def _indexer_fwd_compress_topk_thd(
     # The THD scale contract (regions concatenated along MN, addressed by the padded
     # prefixes, L = KV head only) is validated below once bs/head metadata is known.
     validate_sf_vec_size(precision, sf_vec_size)
-    paged = block_table is not None
+    paged = _check_paged_args(block_table, kv_lens)
     if q.ndim != 3 or k.ndim != (4 if paged else 3) or w.ndim != 2:
         raise ValueError("THD compressed-logits top-k expects q (T_q,H,D), k (T_k,Hkv,D) or a page pool (num_pages,page,Hkv,D), w (T_q,H)")
     device = q.device

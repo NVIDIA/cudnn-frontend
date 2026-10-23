@@ -30,9 +30,10 @@ def _require_sm100():
 def _dsa():
     try:
         from cudnn import DSA
+
+        return DSA
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    return DSA
 
 
 def _paged_pool(kv_lens_host, page_size, device, *, spare_pages=3):
@@ -258,6 +259,8 @@ def test_DSA_indexer_forward_paged_declines():
         DSA.indexer_forward_top_k_wrapper(q, pool[:, :48].contiguous(), w, **kwargs)
     with pytest.raises(ValueError, match="kv_lens"):
         DSA.indexer_forward_top_k_wrapper(q, pool, w, **{**kwargs, "kv_lens": None})
+    with pytest.raises(ValueError, match="kv_lens requires block_table"):
+        DSA.indexer_forward_top_k_wrapper(q, pool[:bs], w, **{**kwargs, "block_table": None})
     with pytest.raises(ValueError, match="cu_seqlens_k must be None"):
         cu = torch.tensor([0, 1, 2], dtype=torch.int32, device=device)
         DSA.indexer_forward_top_k_wrapper(

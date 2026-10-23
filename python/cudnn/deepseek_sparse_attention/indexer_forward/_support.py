@@ -98,6 +98,13 @@ def check_q_covered_by_k(seqlen_q: int, seqlen_k: int, ratio: int, *, what_q: st
         )
 
 
+def check_paged_args(block_table: torch.Tensor | None, kv_lens: torch.Tensor | None) -> bool:
+    """Whether K is paged. ``kv_lens`` only means something next to a ``block_table``, so alone it is an error."""
+    if kv_lens is not None and block_table is None:
+        raise ValueError("kv_lens requires block_table (a dense k has no per-sequence key count)")
+    return block_table is not None
+
+
 def resolve_paged_k(
     k: torch.Tensor,
     block_table: torch.Tensor,
