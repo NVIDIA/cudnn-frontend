@@ -735,6 +735,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall, memo_key: Optional[tuple]
 
     cache_key = backend_cache_key(
         GroupedGemmBackend.BLOCK_SCALED,
+        a_tensor.device,
         *cache_key,
         wrapper_operand_meta(call.scheduler_counter_tensor),
         is_flat_sf(sfa_tensor),
