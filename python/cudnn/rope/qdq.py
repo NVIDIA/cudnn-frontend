@@ -8,7 +8,7 @@ import math
 import torch
 
 from cudnn.api_base import APIBase, TupleDict
-from cudnn.frost.device import PORTABLE_ELEMENTWISE_CCS
+from cudnn.frost.device import FP4_CONVERT_CCS, PORTABLE_ELEMENTWISE_CCS
 
 
 @lru_cache(maxsize=1)
@@ -137,7 +137,7 @@ class RopeQDQInplace(APIBase):
         self._validate_layouts(self._descs)
         self._capability = torch.cuda.get_device_capability(self._device)
         # fp8 converts (e4m3x2) exist on every portable part; the fp4 ones (e2m1x2) need SM100.
-        served = PORTABLE_ELEMENTWISE_CCS if self._quantization == "fp8" else ((10, 0),)
+        served = PORTABLE_ELEMENTWISE_CCS if self._quantization == "fp8" else FP4_CONVERT_CCS
         if self._capability not in served:
             raise NotImplementedError(f"FROST RoPE QDQ {self._quantization} supports cc {served}; got {self._capability}")
         _compressed_kernel() if self._group_size == 16 else _kernel()

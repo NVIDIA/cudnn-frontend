@@ -20,14 +20,14 @@ def _uses_fp4(node):
 
 @pytest.fixture(autouse=True)
 def supported_device(request):
-    from cudnn.frost.device import PORTABLE_ELEMENTWISE_CCS
+    from cudnn.frost.device import FP4_CONVERT_CCS, PORTABLE_ELEMENTWISE_CCS
 
     pytest.importorskip("triton", minversion="3.7.0")
     cc = torch.cuda.get_device_capability()
     if cc not in PORTABLE_ELEMENTWISE_CCS:
         pytest.skip(f"FROST RoPE QDQ requires cc {PORTABLE_ELEMENTWISE_CCS}")
-    if cc != (10, 0) and _uses_fp4(request.node):
-        pytest.skip("FROST RoPE QDQ fp4 requires SM100 (e2m1x2 converts)")
+    if cc not in FP4_CONVERT_CCS and _uses_fp4(request.node):
+        pytest.skip(f"FROST RoPE QDQ fp4 requires cc {FP4_CONVERT_CCS} (e2m1x2 converts)")
 
 
 def reference(x, cache, positions, quantization, group_size=32):
@@ -319,9 +319,9 @@ def test_unsupported_format_combinations(quantization, group_size, scale_format)
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("cc", [(9, 0), (8, 0)])
+@pytest.mark.parametrize("cc", [(9, 0), (8, 0), (10, 3)])
 def test_architecture_gate_fp4_and_fp8(cc, monkeypatch):
-    """fp8 is served on every portable part; fp4 (e2m1x2 converts) only on SM100."""
+    """fp8 is served on every portable part; fp4 (e2m1x2 converts) only on SM100 / SM103."""
     from cudnn.rope import qdq
 
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: cc)
@@ -329,7 +329,7 @@ def test_architecture_gate_fp4_and_fp8(cc, monkeypatch):
         dim = 128 if (quantization, group_size) == ("fp4", 32) else 512
         x, cache, positions, *_ = inputs((4, 1, dim), quantization=quantization, group_size=group_size)
         op = cudnn.RopeQDQInplace(x, cache, positions, quantization=quantization, group_size=group_size, scale_format=scale_format)
-        if quantization == "fp8" and cc in qdq.PORTABLE_ELEMENTWISE_CCS:
+        if cc in (qdq.PORTABLE_ELEMENTWISE_CCS if quantization == "fp8" else qdq.FP4_CONVERT_CCS):
             assert op.check_support()
         else:
             with pytest.raises(NotImplementedError, match=rf"{quantization} supports cc .* got \({cc[0]}, {cc[1]}\)"):
