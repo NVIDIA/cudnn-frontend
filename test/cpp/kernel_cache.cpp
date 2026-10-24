@@ -473,3 +473,147 @@ TEST_CASE("KernelCache revision() grows with size()", "[kernel_cache][revision]"
         WARN("the shape ladder gave no cache hit or no cache insertion on this configuration");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Test 8 — to_json() content while the cache mutates
+//
+// to_json() reads the blob with a size query and then a fill.  The cache can
+// change between the two calls: ExecutionPlanBuilder_v8::build() copies the raw
+// descriptor out from under mutex_ and hands it to cuDNN, which then inserts
+// kernels under its own lock and never takes mutex_ again.
+//
+// A fill that writes fewer bytes than the query reported used to leave the tail
+// of the buffer as the zeros from resize().  to_json() then returned valid json
+// followed by NUL bytes and reported success.  A json lexer maps NUL to end of
+// input, so parsing alone never detected it.
+//
+// The race is not reachable on demand through the public API, so this case
+// cannot fail on the pre-fix code.  It pins the content contract instead.
+// ---------------------------------------------------------------------------
+TEST_CASE("KernelCache to_json() returns clean json while the cache mutates", "[kernel_cache][thread_safety]") {
+    namespace fe = cudnn_frontend;
+
+    if (fe::detail::get_backend_version() < 91000) {
+        SKIP("KernelCache to_json() requires cuDNN >= 9.10");
+    }
+
+    cudnnHandle_t handle;
+    cudnnCreate(&handle);
+
+    auto kc = std::make_shared<fe::KernelCache>();
+
+    // A read before build() must fail, and must not leave anything behind.
+    {
+        std::string early = "not-empty";
+        auto const status = kc->to_json(early);
+        REQUIRE(status.is_bad());
+        REQUIRE(early.empty());
+    }
+
+    // Finalize the cache and seed one entry.
+    auto seed = make_matmul_graph(handle, kc, revision_shape(16));
+    build_plan(handle, seed);
+    REQUIRE(kc->is_finalized());
+
+    // With nothing racing, the size query and the fill must agree.
+    {
+        std::string first, second;
+        REQUIRE(kc->to_json(first).is_good());
+        REQUIRE(kc->to_json(second).is_good());
+        REQUIRE(first == second);
+    }
+
+    constexpr int NUM_BUILDERS = 3;
+    constexpr int NUM_READS    = 40;
+
+    // Build every graph here.  setup_matmul_graph() and make_matmul_graph() use
+    // REQUIRE, which is not safe to call from a spawned thread.
+    std::vector<std::shared_ptr<fe::graph::Graph>> graphs;
+    for (int i = 0; i < NUM_BUILDERS; ++i) {
+        graphs.push_back(make_matmul_graph(handle, kc, revision_shape(32 + 16 * i)));
+    }
+
+    Barrier barrier(NUM_BUILDERS + 1);
+    std::atomic<int> good_reads{0};
+    std::atomic<bool> saw_padding{false};
+    std::atomic<bool> saw_parse_failure{false};
+    std::atomic<bool> saw_partial_failure{false};
+    std::atomic<bool> builders_ok{true};
+
+    std::vector<std::thread> builders;
+    for (int i = 0; i < NUM_BUILDERS; ++i) {
+        builders.emplace_back([&, i]() {
+            cudnnHandle_t h;
+            cudnnCreate(&h);
+            barrier.wait();
+            auto const& g = graphs[static_cast<size_t>(i)];
+            bool const ok = g->create_execution_plans({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good() &&
+                            g->check_support(h).is_good() &&
+                            g->build_plans(h, fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good();
+            if (!ok) {
+                builders_ok.store(false);
+            }
+            cudnnDestroy(h);
+        });
+    }
+
+    std::thread reader([&]() {
+        barrier.wait();
+        for (int i = 0; i < NUM_READS; ++i) {
+            std::string blob;
+            auto const status = kc->to_json(blob);
+            if (status.is_good()) {
+                // The gate on the padded tail.  Parsing alone does not catch it.
+                if (blob.find('\0') != std::string::npos) {
+                    saw_padding.store(true);
+                }
+                // Bind the result: gcc's warn_unused_result ignores a (void) cast.
+                try {
+                    json const parsed = json::parse(blob);
+                    if (!parsed.is_object()) {
+                        saw_parse_failure.store(true);
+                    }
+                } catch (...) {
+                    saw_parse_failure.store(true);
+                }
+                good_reads.fetch_add(1);
+            } else if (!blob.empty()) {
+                // A failure must never hand back a partial result.
+                saw_partial_failure.store(true);
+            }
+            std::this_thread::yield();
+        }
+    });
+
+    for (auto& t : builders) {
+        t.join();
+    }
+    reader.join();
+
+    REQUIRE(builders_ok.load());
+    REQUIRE_FALSE(saw_padding.load());
+    REQUIRE_FALSE(saw_parse_failure.load());
+    REQUIRE_FALSE(saw_partial_failure.load());
+    REQUIRE(good_reads.load() > 0);
+
+    // A read after every builder stopped must succeed and must round-trip.
+    std::string final_blob;
+    REQUIRE(kc->to_json(final_blob).is_good());
+    REQUIRE_FALSE(final_blob.empty());
+    REQUIRE(final_blob.find('\0') == std::string::npos);
+    json parsed_final;
+    REQUIRE_NOTHROW(parsed_final = json::parse(final_blob));
+    REQUIRE(parsed_final.is_object());
+
+    auto reloaded = std::make_shared<fe::KernelCache>();
+    REQUIRE(reloaded->from_json(final_blob).is_good());
+
+    // The builders must have changed the cache, else the case proves nothing.
+    if (fe::detail::get_backend_version() >= MIN_REVISION_VERSION) {
+        auto const state = read_state(kc);
+        REQUIRE(state.revision > 0);
+        REQUIRE(state.size > 0);
+    }
+
+    cudnnDestroy(handle);
+}
