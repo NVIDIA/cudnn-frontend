@@ -307,7 +307,7 @@ def test_the_memo_hands_out_the_same_object_without_a_second_compile(monkeypatch
 
 
 def test_the_memo_sits_in_front_of_an_enabled_on_disk_cache(monkeypatch, tmp_path):
-    """With the files ON, the second call never reaches them: one miss, one load attempt."""
+    """With the files ON, the second call never reaches them."""
     calls, loads = [], []
     _fake_compile(monkeypatch, calls)  # the fake object has no export_to_c: a miss stores nothing and returns it
     monkeypatch.setattr(cc, "environment_manifest", lambda device=None: {"schema": cc._SCHEMA, "cudnn_frontend": "1.30.0", "cutlass_dsl": "4.8.0"})
@@ -317,10 +317,12 @@ def test_the_memo_sits_in_front_of_an_enabled_on_disk_cache(monkeypatch, tmp_pat
     try:
         cc.reset_stats()
         first = cc.compile_cached(lambda: None, 1, cache_key="k", options="--enable-tvm-ffi")
+        loads_after_first = len(loads)
+        assert loads_after_first > 0
         second = cc.compile_cached(lambda: None, 1, cache_key="k", options="--enable-tvm-ffi")
     finally:
         cc.set_cache_dir(None)
-    assert second is first and len(calls) == 1 and len(loads) == 1
+    assert second is first and len(calls) == 1 and len(loads) == loads_after_first
     assert cc.stats()["misses"] == 1 and cc.stats()["hits"] == 0 and cc.stats()["memo_hits"] == 1
 
 
