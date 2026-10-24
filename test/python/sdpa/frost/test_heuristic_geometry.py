@@ -204,9 +204,11 @@ def test_nonpaged_d256_thd_gqa8_leads_from_the_measured_kv(device_cc):
     base = dict(h_q=32, h_kv=4, s_q=8192, s_kv=8192, d_qk=256, d_v=256, thd=True, padded=True, causal=True, bottom_right=True, device_cc=device_cc)
     assert placement._place_sm100_f16(SPEC.capabilities, _facts(**base)) == placement.LEAD
     assert placement._place_sm100_f16(SPEC.capabilities, _facts(**{**base, "b": 32, "s_q": 256, "s_kv": 256 + 512})) == placement.LEAD
-    # batch 64 of 256-768-token requests measured backend-first on fixed graphs; a shape-override graph declares
-    # the cache batch and takes the one-engine-per-class choice
-    assert placement._place_sm100_f16(SPEC.capabilities, _facts(**{**base, "b": 64, "s_q": 768, "s_kv": 768})) == placement.TRAIL
+    # batch 64 of 256-768-token requests, GQA2/4/16 and MHA: FROST led every measured cell after #1796
+    assert placement._place_sm100_f16(SPEC.capabilities, _facts(**{**base, "b": 64, "s_q": 768, "s_kv": 768})) == placement.LEAD
+    for h_kv in (2, 8, 16, 32):
+        assert placement._place_sm100_f16(SPEC.capabilities, _facts(**{**base, "h_kv": h_kv})) == placement.LEAD, h_kv
+    # a shape-override graph declares the cache batch and takes the same choice
     assert (
         placement._place_sm100_f16(
             SPEC.capabilities, _facts(**{**base, "b": 4096, "s_q": 65536, "s_kv": 65536, "shape_overrides": True, "max_total_seq_len_q": 16384})
@@ -216,8 +218,7 @@ def test_nonpaged_d256_thd_gqa8_leads_from_the_measured_kv(device_cc):
     for other in (
         dict(s_q=512, s_kv=512),  # the declared short class: the backend is 2.6-2.8x ahead
         dict(s_q=128, s_kv=1024),  # queries shorter than the measured 256 tokens per request
-        dict(h_kv=8),  # GQA4: not measured
-        dict(h_kv=32),  # MHA: not measured
+        dict(h_kv=3),  # a non-integral group
         dict(dtype=cudnn.data_type.HALF),
         dict(window_left=127),
         dict(has_sink=True),
