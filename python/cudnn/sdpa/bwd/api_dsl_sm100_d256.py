@@ -27,8 +27,12 @@ SM100-SM119 for the half chain), descriptor version 0.
 
 from __future__ import annotations
 
+import torch
+
+from cudnn.sdpa.bwd import api_dsl_sm107 as _sm107
 from cudnn.sdpa.bwd import config_d256_2x2 as _cfg2x2
 from cudnn.sdpa.bwd import config_sm107 as _cfg
+from cudnn.sdpa.bwd import prepared_sm107 as _prepared
 from cudnn.sdpa.bwd.api_dsl_sm107 import _2X2_KERNEL_FILE, _STAGE3_TILE_D256, SdpaBwdDslSm107
 
 _SM100_D256_TEMPLATE_TAG = "sdpa_bwd_sm100_d256_main"
@@ -40,11 +44,43 @@ class SdpaBwdDslSm100D256(SdpaBwdDslSm107):
     _FAMILY = _cfg.FAMILY_F16
     _NAME = "sdpa_bwd_sm100_d256"
     _BATCH_CHUNKING = True
+    _BATCH_PADDED_BSHD = True
+    _THD_SUPPORTED = False
     _IO_DTYPES = SdpaBwdDslSm107._IO_DTYPES
 
     # The half row serves per-batch kv lengths on its standalone surface (its body reads ``seq_kv_lens[b]`` under the
     # padded-mask arm); the 2x2 body's padded arm has not run, so this row keeps the decline (a typed error below).
     _PER_BATCH_KV_LENS = False
+
+    def _allow_head_subgroups(self) -> bool:
+        """The dense BF16 chain folds global dK/dV partials after all head chunks.
+
+        Smaller chunks share their group's single K head in the grouped dQ
+        rendering. Keep FP16, packed, per-member dQ and other arch lines on
+        their original whole-group choices.
+        """
+        return not self.thd and self.dtype == torch.bfloat16 and _sm107.DQ_SINGLE_LAUNCH and 100 <= _prepared._sm(self) <= 106
+
+    def _chunk_partials_enabled(self) -> bool:
+        """A complete GQA group can be folded before its partial buffer is reused."""
+        return (
+            not self.thd
+            and self.dtype == torch.bfloat16
+            and self._gqa_group > 1
+            and not self._q_padded
+            and not self._kv_padded
+            and self._qh_chunk % self._gqa_group == 0
+            and (self._b_chunk < self.batch_size or self._qh_chunk < self.h_q)
+        )
+
+    def _family_scratch_shapes(self, kv_rows: int, gqa: bool):
+        plan = super()._family_scratch_shapes(kv_rows, gqa)
+        if self._chunk_partials_enabled():
+            return [
+                (name, (self._b_chunk, kv_rows, self._qh_chunk, self.head_dim_qk), dtype) if name in ("dv_part", "dk_part") else (name, shape, dtype)
+                for name, shape, dtype in plan
+            ]
+        return plan
 
     def check_support(self) -> bool:
         """This row's own declines first (what the 2x2 body has not run), then the half row's backstops."""

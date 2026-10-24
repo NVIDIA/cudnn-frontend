@@ -987,7 +987,14 @@ the no-zero-fill contract are the Rubin row's (poisoned-workspace tests in
 `test/python/sdpa/frost/test_sdpa_bwd_d256_sm100.py`). Exact (256, 256), f16/bf16;
 dense, top-left and bottom-right causal (ragged S_q included), sliding window
 (left), MHA/GQA/MQA, any S_q / S_kv (padded to 128 / 256 and masked), BSHD-physical
-io, contiguous fp32 Stats. Declined, each asserted by a test: dense padding
+io, contiguous fp32 Stats. The dense BSHD declaration also accepts a nonoverlapping,
+16-byte aligned physical batch pitch with compact head/token/element strides. Existing
+padding and copy-out helpers preserve the declared pitch; no additional layout-repack
+kernel is inserted. This is a dense-layout contract, not THD/ragged support. The pinned
+`test_batch_pitch_rebind_and_replay` checks MHA/GQA, BF16/FP16, rectangular bottom-right
+calls, Q/KV tails, fresh bindings, explicit streams, poisoned-workspace replay and
+untouched physical padding. Other architecture/quantized rows keep their existing
+compact-layout checks. Declined, each asserted by a test: dense padding
 masks, sink / dSink, bias / dBias, right-band widening, THD, `dense_flex`, decode
 shapes, `use_deterministic_algorithm` (no atomics in the chain; the two-launch
 bitwise test passes, the claim waits on the bring-up sweep). **The native
