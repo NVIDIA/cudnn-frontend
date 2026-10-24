@@ -12,8 +12,9 @@ from cudnn.gnn import CscGraph
 def _require_gnn_mha(variant: str) -> None:
     if not hasattr(cudnn, f"gnn_mha_{variant}_forward") or not hasattr(cudnn, f"gnn_mha_{variant}_backward"):
         pytest.skip(f"cudnn-frontend was built without cudnnGnnMha{variant.title().replace('_', '')} support")
-    if cudnn.backend_version() < 92800:
-        pytest.skip("GNN MHA operators require cuDNN 9.28.0 or newer")
+    minimum_version = 92900 if variant == "simple" else 92800
+    if cudnn.backend_version() < minimum_version:
+        pytest.skip(f"GNN MHA {variant} requires cuDNN {minimum_version // 10000}.{(minimum_version // 100) % 100}.0 or newer")
 
 
 def _tolerances(dtype: torch.dtype) -> tuple[float, float]:

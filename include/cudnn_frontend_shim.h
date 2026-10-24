@@ -1301,7 +1301,7 @@ gnn_mha_simple_forward(cudaStream_t stream,
                        const gnn_mha_params_t *params,
                        cudnnDataType_t data_type) {
 #if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
-    if (get_backend_version() < 92800) return CUDNN_STATUS_NOT_SUPPORTED;
+    if (get_backend_version() < 92900) return CUDNN_STATUS_NOT_SUPPORTED;
     NV_FE_CALL_TO_BACKEND(gnn_mha_simple_forward,
                           cudnnGnnMhaSimpleForward,
                           stream,
@@ -1319,7 +1319,7 @@ gnn_mha_simple_forward(cudaStream_t stream,
                           norm_by_dim ? 1 : 0,
                           params,
                           data_type);
-#elif CUDNN_VERSION >= 92800
+#elif CUDNN_VERSION >= 92900
     return cudnnGnnMhaSimpleForward(stream,
                                     reinterpret_cast<const cudnnGnnCscGraph_t *>(graph),
                                     key_features,
@@ -1381,7 +1381,7 @@ gnn_mha_simple_backward(cudaStream_t stream,
                         cudnnDataType_t data_type,
                         cudnnDataType_t grad_type) {
 #if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
-    if (get_backend_version() < 92800) return CUDNN_STATUS_NOT_SUPPORTED;
+    if (get_backend_version() < 92900) return CUDNN_STATUS_NOT_SUPPORTED;
     NV_FE_CALL_TO_BACKEND(gnn_mha_simple_backward,
                           cudnnGnnMhaSimpleBackward,
                           stream,
@@ -1408,7 +1408,7 @@ gnn_mha_simple_backward(cudaStream_t stream,
                           params,
                           data_type,
                           grad_type);
-#elif CUDNN_VERSION >= 92800
+#elif CUDNN_VERSION >= 92900
     return cudnnGnnMhaSimpleBackward(stream,
                                      reinterpret_cast<const cudnnGnnCscGraph_t *>(graph),
                                      grad_output,

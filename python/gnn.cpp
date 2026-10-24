@@ -602,7 +602,7 @@ init_gnn_submodule([[maybe_unused]] py::module_ &m) {
            int num_heads,
            bool concat_heads,
            int data_type) {
-            require_gnn_backend_version(92800, "cudnnGnnMhaSimpleForward");
+            require_gnn_backend_version(92900, "cudnnGnnMhaSimpleForward");
             ensure_cuda_runtime_context();
             auto graph =
                 make_csc_graph(csc_offsets, csc_indices, map_csc_to_coo, n_src_nodes, n_dst_nodes, n_indices, idx_type);
@@ -682,7 +682,7 @@ init_gnn_submodule([[maybe_unused]] py::module_ &m) {
            std::intptr_t csc_rev_offsets,
            std::intptr_t map_rev_to_coo,
            int grad_type) {
-            require_gnn_backend_version(92800, "cudnnGnnMhaSimpleBackward");
+            require_gnn_backend_version(92900, "cudnnGnnMhaSimpleBackward");
             ensure_cuda_runtime_context();
             auto graph = make_csc_graph(csc_offsets,
                                         csc_indices,

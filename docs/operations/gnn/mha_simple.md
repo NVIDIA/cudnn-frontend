@@ -68,6 +68,6 @@ dtype used to accumulate leaf gradients.
 
 ## Availability
 
-The loaded cuDNN backend must provide `cudnnGnnMhaSimpleForward` and
-`cudnnGnnMhaSimpleBackward`. The operation requires an Ampere-class GPU or
-newer and is not available on Windows.
+The loaded cuDNN backend must be 9.29 or newer and provide
+`cudnnGnnMhaSimpleForward` and `cudnnGnnMhaSimpleBackward`. The operation
+requires an Ampere-class GPU or newer and is not available on Windows.
