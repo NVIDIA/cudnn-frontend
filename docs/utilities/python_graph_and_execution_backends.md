@@ -680,9 +680,8 @@ only to decline is why `closed_under` existed.
 - A missing or too-old DSL is a DECLINE at `check_support()`, probed without
   executing the module (`importlib.util.find_spec`, `importlib.metadata`).
   `CUTEDSL_MIN_VERSION` in `frost/buffers.py` is the floor these engines want;
-  `pyproject`'s required dependency deliberately sits below it (`>=4.6.2`),
-  since pinning that high would make cudnn-frontend incompatible with anything
-  holding the DSL back.
+  `pyproject` requires `>=4.8.0`. The runtime checks still protect environments
+  that bypass dependency resolution and kernels with newer API requirements.
 - `test/python/core/test_import_boundaries.py` holds all of this, in a fresh
   interpreter, measuring the delta against an empty one.
 
