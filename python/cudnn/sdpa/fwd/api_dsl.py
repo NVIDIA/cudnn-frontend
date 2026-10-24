@@ -107,6 +107,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     supports_paged_split_sink,
     supports_paged_prefill_cga1,
     supports_paged_d256_pack_gqa,
+    supports_nonpaged_d128_thd_prefill,
     supports_nonpaged_d128_thd_pack_gqa,
     _PAGED_KV_FLAVORS as _SM100_PAGED_KV_FLAVORS,
     TemplateParams as Sm100TemplateParams,
@@ -2083,8 +2084,20 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and (self.cga == 1 or self.pack_gqa)
         )
 
+    def _rubin_native_thd_prefill_leg(self) -> bool:
+        """The exact-D128 native THD prefill domain, shared with graph admission."""
+        return not self.softmax_scale_prefolded and supports_nonpaged_d128_thd_prefill(
+            (int(self.q_desc.shape[-1]), int(self.v_desc.shape[-1])),
+            device_cc=self._device_cc,
+            fp8=self._fp8,
+            thd=self.thd,
+            paged=self.paged,
+            cga=self.cga,
+            split_kv=self.split_kv,
+        )
+
     def _rubin_shared_thd_pack_leg(self) -> bool:
-        """Unsplit nonpaged D128 THD packing on the native two-CTA body."""
+        """Unsplit nonpaged D128 THD packing on the native prefill body."""
         return self.pack_gqa and supports_nonpaged_d128_thd_pack_gqa(
             self.flavor,
             device_cc=self._device_cc,
@@ -2515,7 +2528,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     (self._device_cc != (10, 7) or self.paged or self._rubin_shared_thd_pack_leg())
                     and not self._fp8
                     and (int(d_qk), int(d_v)) in SM100_THD_PACK_GQA_SHAPES
-                    and (self.cga in (None, 2) or paged_prefill_cga1)
+                    and (self.cga in (None, 2) or paged_prefill_cga1 or self._rubin_native_thd_prefill_leg())
                     and self.split_kv == 1
                 ),
                 "THD PackGQA requires half D128 cga2 unsplit/cga1 split, Rubin paged D128 cga1 unsplit, or Rubin paged D256 cga2 unsplit",
@@ -2645,7 +2658,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and self.cga == 1
             and not self._fp8
             and self.thd
-            and not (self.thd_decode_leg or self.packed_thd_split or paged_prefill_cga1),
+            and not (self.thd_decode_leg or self.packed_thd_split or paged_prefill_cga1 or self._rubin_native_thd_prefill_leg()),
             "cga=1 on the d128 flavor selects the decode tile, which serves ragged Q over paged K/V with ragged Stats at S_q == 1, or unpacked exact D128 with split_kv > 1; "
             "other THD (ragged) graphs run the cga2 prefill tile",
         )

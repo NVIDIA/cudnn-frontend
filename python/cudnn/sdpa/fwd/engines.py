@@ -45,6 +45,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     pack_gqa_supported,
     supports_paged_prefill_cga1,
     supports_paged_d256_pack_gqa,
+    supports_nonpaged_d128_thd_prefill,
     supports_nonpaged_d128_thd_pack_gqa,
     supports_thd_split,
     supports_scalar_kv_tail_split,
@@ -1070,6 +1071,20 @@ def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split
 
     _knobs = SdpaFwdKnobs(split_kv=split_kv, cga=cga) if (split_kv is not None or cga is not None) else None
     selected = _selected_d_shape(capabilities, facts, _knobs)
+    if (
+        capabilities.sm_lo == 107
+        and not facts.attn_scale_prefolded
+        and supports_nonpaged_d128_thd_prefill(
+            (facts.d_qk, facts.d_v),
+            device_cc=facts.device_cc,
+            fp8=facts.is_fp8 or facts.is_mxfp8,
+            thd=facts.thd,
+            paged=facts.has_paged_kv,
+            cga=cga,
+            split_kv=split_kv or 1,
+        )
+    ):
+        return frozenset({1, 2})
     if capabilities.sm_lo == 107 and supports_paged_prefill_cga1(
         (facts.d_qk, facts.d_v),
         device_cc=facts.device_cc,

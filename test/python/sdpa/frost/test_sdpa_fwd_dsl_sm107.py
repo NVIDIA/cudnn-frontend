@@ -970,22 +970,25 @@ def test_sm107_paged_d256_pack_gqa_support_contract(dtype_name, group):
 
 @pytest.mark.parametrize("dtype_name", ["HALF", "BFLOAT16"])
 @pytest.mark.parametrize("group", [2, 4, 6, 8, 12, 16])
-def test_sm107_nonpaged_d128_thd_pack_gqa_contract(dtype_name, group):
-    """Explicit unsplit ragged packing serves both half types, including partial groups."""
+@pytest.mark.parametrize("cga", [1, 2])
+def test_sm107_nonpaged_d128_thd_pack_gqa_contract(dtype_name, group, cga):
+    """Both native CTA widths serve unsplit ragged packing, including partial groups."""
     import cudnn
     from cudnn.sdpa.fwd import engines
 
     dt = getattr(cudnn.data_type, dtype_name)
     facts = _f16_facts(h_q=group * 2, h_kv=2, dtype=dt, dtype_o=dt, thd=True, padded=True)
     caps = _caps("sdpa_fwd_prefill_sm107")
-    knobs = engines.SdpaFwdKnobs(cga=2, split_kv=1, pack_gqa=True)
+    knobs = engines.SdpaFwdKnobs(cga=cga, split_kv=1, pack_gqa=True)
     for extra in ({}, dict(has_sink=True), dict(wants_stats=True, shape_overrides=True, max_total_seq_len_q=facts.b * facts.s_q)):
         assert engines.mismatch(caps, dataclasses.replace(facts, **extra), knobs) is None
     # Native packing retains the existing public pre-folded-scale admission boundary.
-    assert "attn_scale_prefolded" in engines.mismatch(caps, dataclasses.replace(facts, attn_scale_prefolded=True), knobs)
+    why = engines.mismatch(caps, dataclasses.replace(facts, attn_scale_prefolded=True), knobs)
+    assert why is not None
+    assert ("attn_scale_prefolded" if cga == 2 else "outside this engine's domain") in why
     for shape in ((192, 128), (256, 256), (512, 512)):
         assert engines.mismatch(caps, dataclasses.replace(facts, d_qk=shape[0], d_v=shape[1]), knobs) is not None
-    assert engines.mismatch(caps, facts, dataclasses.replace(knobs, cga=1)) is not None
+    assert engines.mismatch(caps, facts, dataclasses.replace(knobs, cga=4)) is not None
 
 
 def test_sm107_fp8_pack_gqa_is_d128_only():
