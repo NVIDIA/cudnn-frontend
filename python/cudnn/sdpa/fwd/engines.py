@@ -45,6 +45,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     pack_gqa_supported,
     supports_paged_prefill_cga1,
     supports_paged_d256_pack_gqa,
+    supports_nonpaged_d128_thd_prefill,
     supports_paged_d128_partial_pack_gqa,
     supports_nonpaged_d128_thd_pack_gqa,
     supports_thd_split,
@@ -765,11 +766,11 @@ def _thd_decode_leg_divisors(facts: "ga.SdpaGraphFacts") -> tuple:
 
 
 def rubin_dense_d128_shared_leg(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs] = None) -> bool:
-    """cc 10.7 half, DENSE (not THD, not paged) graph on the (128, 128) flavor (the d64 envelope included) without the
-    pre-folded scale: the legs that lower onto the shared SM100 d128 bodies compiled for cc 10.7
-    (api_dsl._load_sm100_kernel_module -- the decode tile at TILE_CGA_M=1, the prefill body under PackGQA at cga2;
-    issue #1472).  The Rubin sibling carries no PACK_GQA arm and is the only d128 body with the pre-folded-scale arm, so
-    pre-folded graphs stay on it.  Twin of SdpaFwdDslSm100._rubin_shared_dense_leg; keep in lockstep.
+    """Historical cc 10.7 dense half D128 decode/packing admission predicate (issue #1472).
+
+    This includes the d64 envelope and excludes the pre-folded scale. The loader uses the shared decode tile
+    at CGA1 and native SM107 prefill for packed CGA2. The historical predicate name and admission limits
+    are retained for policy consumers. Twin of SdpaFwdDslSm100._rubin_shared_dense_leg; keep the gates in lockstep.
 
     ``knobs``: the request being validated, when there is one -- on the d64 envelope the flavor depends on it (the row's
     native 64-wide tile carries the dense leg only, so a PackGQA or split request walks past it onto (128, 128) and the
@@ -1071,6 +1072,20 @@ def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split
 
     _knobs = SdpaFwdKnobs(split_kv=split_kv, cga=cga) if (split_kv is not None or cga is not None) else None
     selected = _selected_d_shape(capabilities, facts, _knobs)
+    if (
+        capabilities.sm_lo == 107
+        and not facts.attn_scale_prefolded
+        and supports_nonpaged_d128_thd_prefill(
+            (facts.d_qk, facts.d_v),
+            device_cc=facts.device_cc,
+            fp8=facts.is_fp8 or facts.is_mxfp8,
+            thd=facts.thd,
+            paged=facts.has_paged_kv,
+            cga=cga,
+            split_kv=split_kv or 1,
+        )
+    ):
+        return frozenset({1, 2})
     if capabilities.sm_lo == 107 and supports_paged_prefill_cga1(
         (facts.d_qk, facts.d_v),
         device_cc=facts.device_cc,
@@ -1411,8 +1426,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if sm120_tile_reason is not None:
             return sm120_tile_reason
         # D128 half cga1 uses the decode tile for ragged Q=1 and the split
-        # host, or the two-slab prefill body for unsplit SM100 paged Q>1.
-        # Other ragged graphs keep the cga2 prefill tile.
+        # host, or two-slab prefill for admitted paged graphs and native Rubin
+        # nonpaged exact D128. effective_cgas gates the unsplit prefill domain.
         # api_dsl.check_support mirrors these lines (keep them in lockstep).
         ragged_decode = knobs.cga == 1 and facts.thd and _thd_decode_leg(capabilities, facts)
         packed_split = packed_thd_split(capabilities, facts, knobs)
@@ -1445,7 +1460,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             and not rubin_dense_d128_shared_leg(capabilities, facts, knobs)
             and not ragged_pack
         ):
-            return "Rubin half PackGQA requires paged KV, the D128 packed split, an unsplit dense or ragged D128 GQA graph without the pre-folded scale (the shared SM100 body), or the d256 decode tile (a decode-shaped graph: S_q x G packed rows within its routed envelope)"
+            return "Rubin half PackGQA requires paged KV, the D128 packed split, an unsplit dense or ragged D128 GQA graph without the pre-folded scale, or the d256 decode tile (a decode-shaped graph: S_q x G packed rows within its routed envelope)"
         if (
             facts.attn_scale_prefolded
             and capabilities.sm_lo == 107
@@ -1453,10 +1468,10 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             and facts.thd
             and (packed_split or ragged_pack or (knobs.cga == 1 and _selected_d_shape(capabilities, facts) == (192, 128)))
         ):
-            # Packed splits, unsplit D128 packing and the D192 single-CTA leg load shared SM100
-            # bodies, which apply the scale in-kernel. Rubin's native unsplit
-            # prefill siblings serve the pre-folded scale.
-            return "attn_scale_prefolded is not wired in the shared half THD legs (packed split / D128 packing / D192 single-Q)"
+            # Preserve the existing public packing / single-Q attribute domain.
+            # Unsplit D128 packing now lowers to native SM107; this route migration
+            # does not expand the pre-folded-scale combinations.
+            return "attn_scale_prefolded is not admitted on the half THD packed split / D128 packing / D192 single-Q legs"
         if packed_split and not getattr(
             cudnn._pybind_module._SdpaThdBinder,
             (
@@ -2208,9 +2223,9 @@ def _sm107_spec() -> EngineSpec:
       On d256 the split is the decode tile's (dense or paged, packed or not:
       fp32 partials into the split-major workspace the shared combine reduces)
       and the paged THD packed split; the d256 prefill kernel has no dense split.
-    - ``pack_gqas``: D128 dense GQA graphs (the shared SM100 d128 bodies compiled for cc 10.7: the prefill body at
-      cga2, the decode tile at cga1 -- the Rubin sibling carries no PACK_GQA arm; not with the pre-folded scale;
-      issue #1472), D128 paged/nonpaged split THD and D256 paged unsplit THD use the shared half pipeline;
+    - ``pack_gqas``: D128 dense CGA2 and unsplit nonpaged THD use native SM107 prefill. Dense CGA1 uses the
+      shared decode tile; D128 paged/nonpaged split THD and D256 paged unsplit THD use the shared half pipeline.
+      Existing packing admission still excludes the pre-folded scale;
       d256 also packs on the decode tile (``pack_gqa_d_shapes`` carries (256, 256) for both routes --
       on the tile the WHOLE group, dense or paged, whatever tile_m; the dense d256 prefill kernel
       runs unpacked, so ``mismatch`` declines a packed dense d256 graph the tile does not serve).
