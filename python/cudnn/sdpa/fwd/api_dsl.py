@@ -108,6 +108,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     supports_paged_prefill_cga1,
     supports_paged_d256_pack_gqa,
     supports_nonpaged_d128_thd_prefill,
+    supports_paged_d128_partial_pack_gqa,
     supports_nonpaged_d128_thd_pack_gqa,
     _PAGED_KV_FLAVORS as _SM100_PAGED_KV_FLAVORS,
     TemplateParams as Sm100TemplateParams,
@@ -2535,9 +2536,21 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 "Rubin paged D128 cga1 unsplit, or Rubin paged D256 cga2 unsplit",
             )
             # Partial PackGQA (the largest divisor of the group that divides the
-            # tile) is wired in SM100 d128 / d256 half and native Rubin ragged D128.
-            # Other admitted legs keep their existing full-ratio contract.
-            _partial = (not self._fp8 and self._device_cc != (10, 7) and self.flavor in _SM100_PARTIAL_PACK_GQA_FLAVORS) or self._rubin_shared_thd_pack_leg()
+            # tile) is wired in SM100 d128 / d256 half, native Rubin ragged D128,
+            # and the qualified Rubin paged D128 routes. Other legs retain whole-group admission.
+            _partial = (
+                (not self._fp8 and self._device_cc != (10, 7) and self.flavor in _SM100_PARTIAL_PACK_GQA_FLAVORS)
+                or self._rubin_shared_thd_pack_leg()
+                or supports_paged_d128_partial_pack_gqa(
+                    (int(d_qk), int(d_v)),
+                    device_cc=self._device_cc,
+                    fp8=self._fp8,
+                    thd=self.thd,
+                    paged=self.paged,
+                    cga=self.cga,
+                    split_kv=self.split_kv,
+                )
+            )
             # The d256 DECODE tile packs the WHOLE group whenever it fits its Q tile
             # (HEADS_PER_TILE = QH_PER_KH; 24/2 puts its 12 heads in the 16-row tile, four
             # tail rows zero-filled; two tokens x 12 heads in the 32-row tile on cc 10.7), so

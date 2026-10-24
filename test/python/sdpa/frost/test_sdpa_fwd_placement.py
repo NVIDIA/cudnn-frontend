@@ -492,6 +492,13 @@ def test_sm107_fp8_d128_chunk_placement_structure():
     assert place(**free) == placement.LEAD
     assert place(**{**free, "s_kv": long_kv + 1}) == placement.TRAIL  # off the KV tile: the mask-free graph cannot split
     assert place(**{**free, "s_q": placement.SM107_FP8_D128_MASKFREE_MAX_S_Q + 1}) == placement.TRAIL
+    # MHA: one 2-SM cluster wave of units, causal only, within one 512-row Q tile
+    mha = {"h_q": 108, "h_kv": 108, "s_q": placement.SM107_FP8_D128_MHA_MAX_S_Q}
+    assert place(**mha) == placement.LEAD
+    assert place(**{**mha, "b": 2}) == placement.TRAIL
+    assert place(**{**mha, "device_sm_count": None}) == placement.TRAIL
+    assert place(**{**mha, "s_q": placement.SM107_FP8_D128_MHA_MAX_S_Q + 1}) == placement.TRAIL
+    assert place(**{**mha, **free}) == placement.TRAIL
 
 
 @pytest.mark.L0
@@ -783,3 +790,41 @@ def test_sm107_paged_d256_decode_tile_shard_stays_inside_its_measured_shape(outs
             placement.place(spec, _sm107_paged_d256_decode_facts(h_q=8, h_kv=1, b=64, k_t=_hnd_pool(1, 16))) == placement.LEAD
         )  # one KV head: one in-page order
         assert placement.place(spec, _sm107_paged_d256_decode_facts(h_q=8, h_kv=1, b=64, k_t=_nhd_pool(1, 16))) == placement.LEAD
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "row, cc, sms, quant",
+    [
+        ("sdpa_fwd_prefill_sm100", (10, 0), 148, {}),
+        ("sdpa_fwd_prefill_sm100_fp8", (10, 0), 148, _SM107_FP8_QUANT),
+        ("sdpa_fwd_prefill_sm90", (9, 0), 132, {}),
+        ("sdpa_fwd_prefill_sm107", (10, 7), 216, {}),
+        ("sdpa_fwd_prefill_sm107_fp8", (10, 7), 216, _SM107_FP8_QUANT),
+    ],
+)
+def test_d512_sliding_window_leads_inside_the_measured_box(row, cc, sms, quant, monkeypatch):
+    """Each d512 row admits a dense causal sliding window, proposes only admissible sets for it, and its window gate reads
+    the module's bounds (gate structure, not a measured winner)."""
+    from cudnn.sdpa.fwd import heuristics
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS, mismatch
+
+    if cc == (10, 7):
+        # metadata-only: the synthetic Rubin rows must not depend on the installed DSL's target set
+        from cudnn.frost import buffers
+
+        monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    spec = next(s for s in ENGINE_SPECS if s.name == row)
+    swa = {"b": 2, "h_q": 64, "h_kv": 1, "s_q": 4096, "s_kv": 4096, "d_qk": 512, "d_v": 512, "causal": True, "window_left": 128, **quant}
+    swa.update(device_cc=cc, device_sm_count=sms)
+
+    def facts(**over):
+        return _facts(**{**swa, **over})
+
+    assert mismatch(spec.capabilities, facts()) is None
+    offered = {row: _OFFERED[row]}
+    plans = [p for p in heuristics.recommend("A", facts(), offered) if p.engine_id == _OFFERED[row]]
+    assert plans and all(mismatch(spec.capabilities, facts(), p.knobs) is None for p in plans)
+    assert placement._d512_swa(facts(s_q=placement.D512_SWA_MIN_S_Q, s_kv=32768, bottom_right=True))
+    assert not placement._d512_swa(facts(s_q=placement.D512_SWA_MIN_S_Q - 1, s_kv=32768, bottom_right=True))
+    assert not placement._d512_swa(facts(s_q=placement.D512_SWA_MIN_KV // 2, s_kv=placement.D512_SWA_MIN_KV // 2))

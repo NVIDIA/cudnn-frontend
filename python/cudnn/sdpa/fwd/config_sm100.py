@@ -533,6 +533,11 @@ def supports_nonpaged_d128_thd_prefill(d_shape, *, device_cc, fp8, thd, paged, c
     return device_cc == (10, 7) and d_shape == (128, 128) and not fp8 and thd and not paged and cga in (None, 1, 2) and split_kv == 1
 
 
+def supports_paged_d128_partial_pack_gqa(d_shape, *, device_cc, fp8, thd, paged, cga, split_kv):
+    """Rubin's shared two-CTA D128 paged half body packs a divisor of the GQA group."""
+    return device_cc == (10, 7) and d_shape == (128, 128) and not fp8 and thd and paged and cga in (None, 2) and split_kv == 1
+
+
 def supports_nonpaged_d128_thd_pack_gqa(d_shape, *, device_cc, fp8, thd, paged, cga, split_kv):
     """Native Rubin ragged D128 packing shares the prefill CTA domain."""
     return supports_nonpaged_d128_thd_prefill(d_shape, device_cc=device_cc, fp8=fp8, thd=thd, paged=paged, cga=cga, split_kv=split_kv)
