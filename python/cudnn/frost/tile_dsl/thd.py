@@ -214,6 +214,86 @@ def write_thd_prefix_warp(
 
 
 @cute.jit
+def write_thd_small_batch_meta(
+    meta,
+    ql,
+    kl,
+    lens_form: cutlass.Int32,
+    n_batch: cutlass.Int32,
+    n_qh: cutlass.Int32,
+    unit_rows: cutlass.Int32,
+    n_ctas: cutlass.Int32,
+    lane: cutlass.Int32,
+    splits: cutlass.Constexpr[int],
+    rank_by_kv: cutlass.Constexpr[bool] = False,
+) -> None:
+    """One full warp publishes all forward metadata for 1 <= B <= 32.
+
+    Each lane retains one request's lengths, prefixes and tile count. Shuffles
+    compute the stable batch rank and preceding work without reading metadata
+    back from global memory. All lanes participate, including the batch tail;
+    the caller barriers before other warps consume the published metadata.
+    """
+    q_is_cu = (lens_form & 1) != 0
+    k_is_cu = (lens_form & 2) != 0
+    q_len, k_len = cutlass.Int32(0), cutlass.Int32(0)
+    q_end, k_end = cutlass.Int32(0), cutlass.Int32(0)
+    if lane < n_batch:
+        if q_is_cu:
+            q_next = cutlass.Int32(ql[lane + 1])
+            q_len = q_next - cutlass.Int32(ql[lane])
+            q_end = q_next - cutlass.Int32(ql[0])
+        else:
+            q_len = cutlass.Int32(ql[lane])
+            q_end = q_len
+        if k_is_cu:
+            k_next = cutlass.Int32(kl[lane + 1])
+            k_len = k_next - cutlass.Int32(kl[lane])
+            k_end = k_next - cutlass.Int32(kl[0])
+        else:
+            k_len = cutlass.Int32(kl[lane])
+            k_end = k_len
+    if not q_is_cu:
+        for bit in cutlass.range_constexpr(5):
+            delta = 1 << bit
+            prior = cute.arch.shuffle_sync_up(q_end, offset=delta, mask_and_clamp=0)
+            if lane >= delta:
+                q_end = q_end + prior
+    if not k_is_cu:
+        for bit in cutlass.range_constexpr(5):
+            delta = 1 << bit
+            prior = cute.arch.shuffle_sync_up(k_end, offset=delta, mask_and_clamp=0)
+            if lane >= delta:
+                k_end = k_end + prior
+
+    work = ((q_len + unit_rows - 1) // unit_rows) * n_qh
+    key = k_len if cutlass.const_expr(rank_by_kv) else q_len
+    rank, preceding = cutlass.Int32(0), cutlass.Int32(0)
+    for other in cutlass.range(0, n_batch, 1, unroll=1):
+        other_key = cute.arch.shuffle_sync(key, other)
+        other_work = cute.arch.shuffle_sync(work, other)
+        ahead = (other_key > key) | ((other_key == key) & (other < lane))
+        rank = rank + cutlass.Int32(arith.select(ahead.ir_value(), cutlass.Int32(1).ir_value(), cutlass.Int32(0).ir_value()))
+        preceding = preceding + cutlass.Int32(arith.select(ahead.ir_value(), other_work.ir_value(), cutlass.Int32(0).ir_value()))
+    total = work
+    for bit in cutlass.range_constexpr(5):
+        total = total + cute.arch.shuffle_sync_bfly(total, 1 << bit)
+
+    if lane < n_batch:
+        meta[lane] = k_len
+        meta[n_batch + lane + 1] = q_end
+        meta[2 * n_batch + lane + 2] = k_end
+        meta[THD_REMAP_OFF(n_batch) + rank] = lane
+        meta[THD_WORK_PREFIX_OFF(n_batch) + rank] = preceding
+    if lane == 0:
+        meta[n_batch] = cutlass.Int32(0)
+        meta[2 * n_batch + 1] = cutlass.Int32(0)
+        meta[THD_WORK_PREFIX_OFF(n_batch) + n_batch] = total
+        meta[THD_LIVE_OFF(n_batch)] = total * cutlass.Int32(splits)
+        meta[THD_CTR_OFF(n_batch)] = n_ctas
+
+
+@cute.jit
 def write_thd_row_offsets(meta, n_batch: cutlass.Int32, gran: cutlass.Int32, cu0=None) -> None:
     """Fill ``row_off(B+1)``: where each sequence's block starts in a ragged,
     row-BLOCKED workspace, plus the total at ``row_off[B]``.
