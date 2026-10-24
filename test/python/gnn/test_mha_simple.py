@@ -22,9 +22,13 @@ from gnn._mha_test_utils import _reference_mha_simple, _require_gnn_mha, _tolera
 @pytest.mark.parametrize(
     "use_edge,use_bias,use_weight,use_dropout,concat_heads,norm_by_dim,return_attention,deterministic",
     [
-        (False, False, False, False, True, True, False, False),
-        (True, True, True, True, True, True, True, False),
-        (True, False, True, False, False, False, True, True),
+        pytest.param(False, False, False, False, True, True, False, False, id="baseline"),
+        pytest.param(True, True, True, True, True, True, True, False, id="all-optional"),
+        pytest.param(True, False, True, False, False, False, True, True, id="edge-weight-no-scale-deterministic"),
+        pytest.param(False, True, False, False, True, True, True, False, id="bias-only"),
+        pytest.param(False, False, True, False, True, True, False, False, id="weight-only"),
+        pytest.param(True, False, False, False, True, True, False, False, id="edge-only"),
+        pytest.param(False, False, False, True, False, True, True, True, id="dropout-only-deterministic"),
     ],
 )
 def test_gnn_mha_simple_forward_backward(
@@ -637,11 +641,34 @@ def test_gnn_mha_simple_feature_gradient_dtype(small_reverse_csc_graph, dtype, h
 @pytest.mark.L2
 def test_gnn_mha_simple_medium_graph(medium_reverse_csc_graph):
     _require_gnn_mha("simple")
+    torch.manual_seed(2345)
     graph = medium_reverse_csc_graph
     key = torch.randn((graph.num_src_nodes, 32), device="cuda", requires_grad=True)
     query = torch.randn((graph.num_dst_nodes, 32), device="cuda", requires_grad=True)
     value = torch.randn((graph.num_src_nodes, 32), device="cuda", requires_grad=True)
-    output = mha_simple(graph, key, query, value, num_heads=4, deterministic=True)
-    assert output.shape == (graph.num_dst_nodes, 32)
-    output.square().mean().backward()
-    assert key.grad is not None and query.grad is not None and value.grad is not None
+    edge = torch.randn((graph.num_edges, 32), device="cuda", requires_grad=True)
+    score_bias = torch.randn((4, graph.num_edges), device="cuda", requires_grad=True)
+    score_weight = torch.randn((4, graph.num_edges), device="cuda", requires_grad=True)
+    actual_output, actual_attention = mha_simple(
+        graph,
+        key,
+        query,
+        value,
+        edge_features=edge,
+        score_bias=score_bias,
+        score_weight=score_weight,
+        num_heads=4,
+        return_attention_weights=True,
+        deterministic=True,
+    )
+    reference_inputs = [tensor.detach().clone().requires_grad_() for tensor in (key, query, value, edge, score_bias, score_weight)]
+    expected_output, expected_attention = _reference_mha_simple(graph, *reference_inputs, None, 4, True, True)
+    torch.testing.assert_close(actual_output, expected_output, atol=5e-4, rtol=5e-4)
+    torch.testing.assert_close(actual_attention, expected_attention, atol=5e-4, rtol=5e-4)
+
+    grad_output = torch.randn_like(actual_output)
+    grad_attention = torch.randn_like(actual_attention)
+    torch.autograd.backward((actual_output, actual_attention), (grad_output, grad_attention))
+    torch.autograd.backward((expected_output, expected_attention), (grad_output, grad_attention))
+    for actual_tensor, reference_tensor in zip((key, query, value, edge, score_bias, score_weight), reference_inputs):
+        torch.testing.assert_close(actual_tensor.grad, reference_tensor.grad, atol=6e-3, rtol=6e-3)
