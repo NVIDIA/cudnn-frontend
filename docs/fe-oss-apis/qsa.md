@@ -83,14 +83,15 @@ visibility and tail handling remain part of the QSA contract; this reuse does
 not make QSA and DeepSeek attention interchangeable. Numerical rounding and
 top-k tie rules must also be checked before replacing an external selector.
 
-The [internal two-pass backend](qsa_two_pass.md) currently has a different
+The [internal two-pass backend](qsa_two_pass.md) has a different
 saved-state and selection contract: 12Q/1KV or 24Q/2KV, canonical block lists,
 optional packed `cu_seqlens`, and native FP32 saved output / `[Hq, T]` LSE
-(or the earlier BF16 saved output / `[T, Hq]` LSE pair). It is not dispatched by the public training
-functions yet. Use the documented saved-state pair and canonical selection format; the public
-bitmap and indexed calls accept more general selections. Its implementation remains under `cudnn.QSA`
-while its contract is adapted; no public op class or algorithm-specific entry
-is added.
+(or the earlier BF16 saved output / `[T, Hq]` LSE pair). For 12Q/1KV, the public
+`qsa_indexed_backward(..., selection_mode="causal_topk")` selects this backend
+when the caller declares the stricter [complete-block and causal-tail contract](qsa_indexed.md#complete-blocks-and-causal-tails).
+The default indexed and bitmap calls retain their general selection contracts.
+The implementation remains under `cudnn.QSA`; no public op class or
+algorithm-specific entry is added.
 
 The experimental QSA entries previously under `cudnn.DSA` and
 `cudnn.gated_attention_block.qsa_select*` have moved without compatibility

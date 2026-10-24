@@ -63,15 +63,21 @@ def make_inputs(axes, device, seed):
     )
 
 
-def _gather(q, k, v, sel, lo, hi, first, last, begin, end, block_size):
-    count = max(1, int(sel[begin:end].count_nonzero(dim=1).max().item()))
-    ranks = (sel[begin:end] != 0).to(torch.int64) * sel.shape[1] - torch.arange(sel.shape[1], device=q.device)
-    values, blocks = ranks.topk(count, dim=1)
-    flags = values > 0
-    j = first[blocks.long(), None] + torch.arange(block_size, device=q.device)
-    valid = (flags[:, :, None] != 0) & (j <= last[blocks.long(), None]) & (j >= lo[begin:end, None, None]) & (j <= hi[begin:end, None, None])
-    j = j.reshape(end - begin, -1).long()
-    valid = valid.reshape(end - begin, -1)
+def _gather(q, k, v, sel, lo, hi, first, last, begin, end, block_size, selection_indices=None):
+    if selection_indices is None:
+        count = max(1, int(sel[begin:end].count_nonzero(dim=1).max().item()))
+        ranks = (sel[begin:end] != 0).to(torch.int64) * sel.shape[1] - torch.arange(sel.shape[1], device=q.device)
+        values, blocks = ranks.topk(count, dim=1)
+        flags = values > 0
+        j = first[blocks.long(), None] + torch.arange(block_size, device=q.device)
+        valid = (flags[:, :, None] != 0) & (j <= last[blocks.long(), None]) & (j >= lo[begin:end, None, None]) & (j <= hi[begin:end, None, None])
+        j = j.reshape(end - begin, -1).long()
+        valid = valid.reshape(end - begin, -1)
+    else:
+        # Direct token gathers avoid constructing a quadratic bitmap just for
+        # validation of long indexed inputs. This oracle does not use FE kernels.
+        j = selection_indices[begin:end].long()
+        valid = (j >= lo[begin:end, None]) & (j <= hi[begin:end, None])
     safe = j.clamp(0, k.shape[0] - 1)
     kk = k[safe].float().permute(0, 2, 1, 3)
     vv = v[safe].float().permute(0, 2, 1, 3)
@@ -80,13 +86,13 @@ def _gather(q, k, v, sel, lo, hi, first, last, begin, end, block_size):
 
 
 @torch.no_grad()
-def forward_reference(q, k, v, sel_blocks, lo, hi, blk_base, tok_base, block_first, block_last, scale, block_size):
+def forward_reference(q, k, v, sel_blocks, lo, hi, blk_base, tok_base, block_first, block_last, scale, block_size, selection_indices=None):
     total, hq, dim = q.shape
     out = torch.empty_like(q, dtype=torch.float32)
     lse = torch.empty(hq, total, device=q.device, dtype=torch.float32)
     for begin in range(0, total, 128):
         end = min(begin + 128, total)
-        qq, kk, vv, _, valid = _gather(q, k, v, sel_blocks, lo, hi, block_first, block_last, begin, end, block_size)
+        qq, kk, vv, _, valid = _gather(q, k, v, sel_blocks, lo, hi, block_first, block_last, begin, end, block_size, selection_indices)
         scores = (qq @ kk.transpose(-1, -2)) * scale
         scores.masked_fill_(~valid[:, None, None, :], -torch.inf)
         normalizer = torch.logsumexp(scores, dim=-1)
@@ -99,14 +105,16 @@ def forward_reference(q, k, v, sel_blocks, lo, hi, blk_base, tok_base, block_fir
 
 
 @torch.no_grad()
-def backward_reference(grad_out, q, k, v, out_fp32, lse, sel_blocks, lo, hi, blk_base, tok_base, block_first, block_last, scale, block_size):
+def backward_reference(
+    grad_out, q, k, v, out_fp32, lse, sel_blocks, lo, hi, blk_base, tok_base, block_first, block_last, scale, block_size, selection_indices=None
+):
     total, hq, dim = q.shape
     hkv = k.shape[1]
     dq = torch.empty_like(q, dtype=torch.float32)
     dk, dv = torch.zeros_like(k, dtype=torch.float32), torch.zeros_like(v, dtype=torch.float32)
     for begin in range(0, total, 128):
         end = min(begin + 128, total)
-        qq, kk, vv, indices, valid = _gather(q, k, v, sel_blocks, lo, hi, block_first, block_last, begin, end, block_size)
+        qq, kk, vv, indices, valid = _gather(q, k, v, sel_blocks, lo, hi, block_first, block_last, begin, end, block_size, selection_indices)
         do = grad_out[begin:end].float().reshape(end - begin, hkv, -1, dim)
         saved_lse = lse[:, begin:end].T.reshape(end - begin, hkv, -1)
         scores = (qq @ kk.transpose(-1, -2)) * scale
