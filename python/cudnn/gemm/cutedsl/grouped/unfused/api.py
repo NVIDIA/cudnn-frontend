@@ -28,6 +28,7 @@ from cudnn.tensor_adapter import (
 from ._bf16_api import GroupedGemmBf16API, _validate_pointer_tensor
 from ..backend_utils import row_major_layout
 from ..canonical import b_nkl, check_canonical_contiguous
+from ..plan import GroupedGemmPlan, offer, planned, planning
 from ..moe_utils import MoEWeightMode
 
 __all__ = ["GroupedGemmBf16API"]
@@ -97,10 +98,13 @@ class GroupedGemmSm100(APIBase):
         bias_tensor: Optional[torch.Tensor] = None,
         prob_tensor: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
-    ) -> None:
+        *,
+        launch: bool = True,
+    ):
+        """``launch=False`` returns the launch, ``(compiled kernel, positional arguments)``, instead of issuing it."""
         if self._implementation is None:
             raise RuntimeError("Kernel not compiled; call compile() first")
-        self._implementation.execute(
+        stated = self._implementation.execute(
             a_tensor=a_tensor,
             c_tensor=c_tensor,
             d_tensor=d_tensor,
@@ -111,9 +115,11 @@ class GroupedGemmSm100(APIBase):
             bias_tensor=bias_tensor,
             prob_tensor=prob_tensor,
             current_stream=current_stream,
+            launch=launch,
         )
         self._is_supported = self._implementation._is_supported
         self._compiled_kernel = self._implementation._compiled_kernel
+        return stated
 
 
 _cache_of_GroupedGemmSm100Objects: dict[tuple, GroupedGemmSm100] = {}
@@ -290,6 +296,7 @@ def _normalize_call(
     return is_dense, tensor_m, n, experts
 
 
+@planned
 def grouped_gemm_wrapper_sm100(
     a_tensor: torch.Tensor,
     padded_offsets: torch.Tensor,
@@ -353,18 +360,35 @@ def grouped_gemm_wrapper_sm100(
         op, framework, expected_shape, expected_stride, memo_c_dtype, memo_d_dtype, is_dense = memo
         internal_c = c_tensor if c_tensor is not None else _allocate_output(framework, expected_shape, expected_stride, memo_c_dtype, a_tensor.device)
         d_out = d_tensor if d_tensor is not None else _allocate_output(framework, expected_shape, expected_stride, memo_d_dtype, a_tensor.device)
-        op.execute(
+        arguments = dict(
             a_tensor=a_tensor,
-            c_tensor=internal_c,
-            d_tensor=d_out,
             padded_offsets=padded_offsets,
             alpha_tensor=alpha_tensor,
             b_tensor=b_tensor if is_dense else None,
             b_ptrs=None if is_dense else b_ptrs,
             bias_tensor=bias_tensor,
             prob_tensor=prob_tensor,
-            current_stream=current_stream,
         )
+        op.execute(**arguments, c_tensor=internal_c, d_tensor=d_out, current_stream=current_stream)
+        if planning() and framework == "torch":
+            inputs = ("a_tensor", "padded_offsets", "alpha_tensor", "b_tensor" if is_dense else "b_ptrs", "bias_tensor", "prob_tensor")
+            outputs = {}
+            for name, tensor, given in (("c_tensor", internal_c, c_tensor), ("d_tensor", d_out, d_tensor)):
+                if given is None:
+                    outputs[name] = tensor
+                else:
+                    arguments[name], inputs = tensor, inputs + (name,)
+            offer(
+                GroupedGemmPlan(
+                    op.execute,
+                    arguments,
+                    inputs=inputs,
+                    outputs=outputs,
+                    init={},
+                    result={"d_tensor": "d_tensor", "c_tensor": "c_tensor" if generate_c else None},
+                    stream=current_stream,
+                )
+            )
         return TupleDict(d_tensor=d_out, c_tensor=internal_c if generate_c else None)
 
     framework = detect_framework(a_tensor)

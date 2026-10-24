@@ -241,6 +241,14 @@ class CountingMemo(dict):
 
 
 def install_memo(monkeypatch, module, name):
+    """A counting memo, with the wrappers' plans out of the way: they would answer before the memo."""
+    import inspect
+
+    import cudnn
+
+    for wrapper in ("glu", "dglu", "quant", "wgrad"):
+        attr = f"grouped_gemm_{wrapper}_wrapper_sm100"
+        monkeypatch.setattr(cudnn, attr, inspect.unwrap(getattr(cudnn, attr)))
     memo = CountingMemo()
     monkeypatch.setattr(module, name, memo)
     return memo
