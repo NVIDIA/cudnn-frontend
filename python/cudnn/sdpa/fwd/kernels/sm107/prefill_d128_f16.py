@@ -1177,9 +1177,17 @@ def _kernel(
     # other rendering (never traced); the collective-geometry values above keep their cga1 values on this form.
     bias_mcast_rank = cute.arch.block_idx_in_cluster() if cutlass.const_expr(_BIAS_MCAST) else None
 
+    # The packed Stats rendering needs the shared half body's auxiliary-role
+    # budget. Keep the correction budget and entry pool unchanged; a rendering
+    # without Stats retains its existing split. Stats presence is a compile-time
+    # pointer-type fact, so this adds no runtime branch or preparation API.
+    packed_stats_regs = CFG.PACK_GQA and CFG.TILE_K == CFG.TILE_O == 128 and CFG.SOFTMAX_WARPGROUPS == 2 and lse_tensor is not None
+    softmax_regs = 184 if cutlass.const_expr(packed_stats_regs) else CFG.SOFTMAX_REGS
+    other_regs = 56 if cutlass.const_expr(packed_stats_regs) else CFG.OTHER_REGS
+
     # === Per-warp role dispatch ===
     if warp_idx >= CFG.SOFTMAX_WG0_BASE and warp_idx < CFG.SOFTMAX_WG0_BASE + CFG.SOFTMAX_WG_WARPS:
-        nvvm.setmaxregister(CFG.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
+        nvvm.setmaxregister(softmax_regs, nvvm.SetMaxRegisterAction.INCREASE)
         _softmax_warp_group(
             sub_tile_id=0,
             seqlen_q=seqlen_q,
@@ -1208,7 +1216,7 @@ def _kernel(
     elif warp_idx >= CFG.SOFTMAX_WG1_BASE and warp_idx < CFG.SOFTMAX_WG1_BASE + CFG.SOFTMAX_WG_WARPS * (CFG.SOFTMAX_WARPGROUPS - 1):
         # Softmax warp groups 1.. (one group per further Q sub-tile: WG1 alone on the classic body, WG1 + WG2 with the third softmax
         # warp group of the TILE_N-64 pair arm -- the range reads `SOFTMAX_WG1_BASE + 4` on the two-group body, as before).
-        nvvm.setmaxregister(CFG.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
+        nvvm.setmaxregister(softmax_regs, nvvm.SetMaxRegisterAction.INCREASE)
         if cutlass.const_expr(CFG.SOFTMAX_WARPGROUPS == 3):
             if warp_idx >= CFG.SOFTMAX_WG1_BASE + CFG.SOFTMAX_WG_WARPS:
                 _softmax_warp_group(
@@ -1316,7 +1324,7 @@ def _kernel(
 
     elif warp_idx == CFG.MMA_WARP_ID:
         # Under cga2 the non-leader CTA runs the quiet body (alloc + dealloc only).
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
+        nvvm.setmaxregister(other_regs, nvvm.SetMaxRegisterAction.DECREASE)
         if cutlass.const_expr(CFG.CTA_MMA == 2):
             if is_leader:
                 _mma_warp_group(
@@ -1362,7 +1370,7 @@ def _kernel(
             )
 
     elif warp_idx == CFG.TMALDG_WARP_ID:
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
+        nvvm.setmaxregister(other_regs, nvvm.SetMaxRegisterAction.DECREASE)
         nvvm.prefetch_tensormap(tma_q_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_k_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_v_desc.get_ptr())
@@ -1398,7 +1406,7 @@ def _kernel(
         )
 
     elif warp_idx == CFG.TMASTG_WARP_ID:
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
+        nvvm.setmaxregister(other_regs, nvvm.SetMaxRegisterAction.DECREASE)
         _tmastg_warp_group(
             tma_o_desc=tma_o_desc,
             sO=sO,
@@ -1418,7 +1426,7 @@ def _kernel(
         )
 
     else:  # warp_idx == CFG.SCHED_WARP_ID
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
+        nvvm.setmaxregister(other_regs, nvvm.SetMaxRegisterAction.DECREASE)
         # try_cancel.multicast::cluster::all — only (0,0,0) CTA issues; at cga1
         # cta_id_x == 0 always, so flag is 1 unconditionally.
         is_cga_first_cta = (bias_mcast_rank == cutlass.Int32(0)) if cutlass.const_expr(_BIAS_MCAST) else (cta_id_x == cutlass.Int32(0))
@@ -4590,50 +4598,6 @@ def _correction_warp_group(
                         # A trimmed row is dead even with a sink: max = -inf, sum_exp = 0, like its LSE.
                         score_max_val = cutlass.Float32(arith.select(row_trim.ir_value(), cutlass.Float32(float("-inf")).ir_value(), score_max_val.ir_value()))
                         score_sum_val = cutlass.Float32(arith.select(row_trim.ir_value(), cutlass.Float32(0.0).ir_value(), score_sum_val.ir_value()))
-                # Convert only the final Stats; -inf padding stays -inf.
-                if cutlass.const_expr(CFG.STATS_LOG2 and SPLIT_KV == 1):
-                    lse_val = lse_val * cutlass.Float32(1.4426950408889634)
-                if cutlass.const_expr(CFG.THD_VARLEN):
-                    # THD: q_row_global is sequence-local; LSE is packed [1,QH,T] →
-                    # index [0, head, cu_q[b] + local], bound by per-sequence Q len S_q_b.
-                    _cu = cutlass.make_array_view(seq_kv_lens_tensor)
-                    _cu_q_b = cutlass.Int32(_cu[n_batch + batch_idx])
-                    _s_q_b = cutlass.Int32(_cu[n_batch + batch_idx + cutlass.Int32(1)]) - _cu_q_b
-                    if cutlass.const_expr(lse_tensor is not None):
-                        if q_row_global < _s_q_b:
-                            lse_arr = cutlass.make_array_view(lse_tensor)
-                            # The packed ragged Stats buffer is written in the
-                            # CALLER's declared layout, selected by the STATIC rank
-                            # compile() baked in: token-major rank-2 [T, QH] (the
-                            # DEFAULT -- _thd_compile_kwargs only sets head-major
-                            # when the caller asks) or head-major rank-3
-                            # [1, QH, head_stride].  Serving only the rank-3 arm
-                            # would silently transpose every LSE on the common path.
-                            if cutlass.const_expr(len(lse_tensor.shape) == 2):
-                                lse_arr[_cu_q_b + q_row_global, row_head_idx] = lse_val
-                            else:
-                                if cutlass.const_expr(len(lse_tensor.shape) == 4):
-                                    # rank-4 = per-batch padded Stats (B, QH, s_max, 1) in the declared strides, no ragged offsets
-                                    lse_arr[batch_idx, row_head_idx, q_row_global, 0] = lse_val
-                                else:
-                                    lse_arr[cutlass.Int32(0), row_head_idx, _cu_q_b + q_row_global] = lse_val
-                else:
-                    if cutlass.const_expr(lse_tensor is not None):
-                        if _row_store:
-                            lse_arr = cutlass.make_array_view(lse_tensor)
-                            lse_arr[_partial_batch(batch_idx, split_idx, n_batch), row_head_idx, q_row_global] = lse_val
-                # Score side outputs: the DENSE, unsplit row (compile() rejects the THD and split builds), the
-                # same OOB-row guard as the dense LSE store, natural units whatever STATS_LOG2 says (the base-2
-                # convention is the Stats tensor's alone).  Each store folds out independently on None.
-                if cutlass.const_expr(score_max_tensor is not None):
-                    if _row_store:
-                        _smax_arr = cutlass.make_array_view(score_max_tensor)
-                        _smax_arr[batch_idx, row_head_idx, q_row_global] = score_max_val
-                if cutlass.const_expr(score_sum_exp_tensor is not None):
-                    if _row_store:
-                        _ssum_arr = cutlass.make_array_view(score_sum_exp_tensor)
-                        _ssum_arr[batch_idx, row_head_idx, q_row_global] = score_sum_val
-
                 sO_sub_base = sO[qs].base
 
                 if cutlass.const_expr(_FP32_PARTIALS):
@@ -4693,6 +4657,54 @@ def _correction_warp_group(
                     nvvm.fence_proxy("async.shared", space="cta")
 
                 bars.mb_o_full[qs].arrive()
+
+                # Publish O before the independent row-stat stores so TMA can
+                # drain O while correction writes Stats. All values and row
+                # predicates still belong to this item; scheduler advancement
+                # and correction completion remain after these stores.
+                # Convert only the final Stats; -inf padding stays -inf.
+                if cutlass.const_expr(CFG.STATS_LOG2 and SPLIT_KV == 1):
+                    lse_val = lse_val * cutlass.Float32(1.4426950408889634)
+                if cutlass.const_expr(CFG.THD_VARLEN):
+                    # THD: q_row_global is sequence-local; LSE is packed [1,QH,T] →
+                    # index [0, head, cu_q[b] + local], bound by per-sequence Q len S_q_b.
+                    _cu = cutlass.make_array_view(seq_kv_lens_tensor)
+                    _cu_q_b = cutlass.Int32(_cu[n_batch + batch_idx])
+                    _s_q_b = cutlass.Int32(_cu[n_batch + batch_idx + cutlass.Int32(1)]) - _cu_q_b
+                    if cutlass.const_expr(lse_tensor is not None):
+                        if q_row_global < _s_q_b:
+                            lse_arr = cutlass.make_array_view(lse_tensor)
+                            # The packed ragged Stats buffer is written in the
+                            # CALLER's declared layout, selected by the STATIC rank
+                            # compile() baked in: token-major rank-2 [T, QH] (the
+                            # DEFAULT -- _thd_compile_kwargs only sets head-major
+                            # when the caller asks) or head-major rank-3
+                            # [1, QH, head_stride].  Serving only the rank-3 arm
+                            # would silently transpose every LSE on the common path.
+                            if cutlass.const_expr(len(lse_tensor.shape) == 2):
+                                lse_arr[_cu_q_b + q_row_global, row_head_idx] = lse_val
+                            else:
+                                if cutlass.const_expr(len(lse_tensor.shape) == 4):
+                                    # rank-4 = per-batch padded Stats (B, QH, s_max, 1) in the declared strides, no ragged offsets
+                                    lse_arr[batch_idx, row_head_idx, q_row_global, 0] = lse_val
+                                else:
+                                    lse_arr[cutlass.Int32(0), row_head_idx, _cu_q_b + q_row_global] = lse_val
+                else:
+                    if cutlass.const_expr(lse_tensor is not None):
+                        if _row_store:
+                            lse_arr = cutlass.make_array_view(lse_tensor)
+                            lse_arr[_partial_batch(batch_idx, split_idx, n_batch), row_head_idx, q_row_global] = lse_val
+                # Score side outputs: the DENSE, unsplit row (compile() rejects the THD and split builds), the
+                # same OOB-row guard as the dense LSE store, natural units whatever STATS_LOG2 says (the base-2
+                # convention is the Stats tensor's alone).  Each store folds out independently on None.
+                if cutlass.const_expr(score_max_tensor is not None):
+                    if _row_store:
+                        _smax_arr = cutlass.make_array_view(score_max_tensor)
+                        _smax_arr[batch_idx, row_head_idx, q_row_global] = score_max_val
+                if cutlass.const_expr(score_sum_exp_tensor is not None):
+                    if _row_store:
+                        _ssum_arr = cutlass.make_array_view(score_sum_exp_tensor)
+                        _ssum_arr[batch_idx, row_head_idx, q_row_global] = score_sum_val
 
             stat_full_phase = stat_full_phase ^ 1
             o_empty_phase = o_empty_phase ^ 1
