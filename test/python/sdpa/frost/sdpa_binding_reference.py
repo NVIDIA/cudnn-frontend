@@ -562,7 +562,9 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
     # bounded by ceil(T / tile) + B - 1. Observe only host-known capacity;
     # device lengths may change during replay within this captured bound.
     # Keep a persistent kernel's smaller resident-cluster limit as well.
-    units = ((t_q - 1) // spec.cga_tile_m + geo.b) * spec.qh
+    wave_geometry = getattr(spec, "wave_geometry", None)
+    unit_rows, unit_heads = (spec.cga_tile_m, spec.qh) if wave_geometry is None else wave_geometry[:2]
+    units = ((t_q - 1) // unit_rows + geo.b) * unit_heads
     if split is not None:
         units *= split.splits
     frame[ix["n_thd_units"]] = min(frame[ix["n_thd_units"]], units)
@@ -570,7 +572,8 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
     if policy is not None:
         envelope, resident, initial_waves = policy
         bound = min(envelope, units)
-        frame[ix["n_thd_units"]] = bound if bound <= resident * initial_waves else resident
+        limit = resident * initial_waves if wave_geometry is None else wave_geometry[2]
+        frame[ix["n_thd_units"]] = bound if bound <= limit else resident
 
     sinks = facts.get("sinks")
     if spec.has_sink:

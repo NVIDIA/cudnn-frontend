@@ -195,6 +195,7 @@ class ThdLaunchSpec:
         "s_q_max",
         "cga_tile_m",
         "wave_policy",
+        "wave_geometry",
         "total_q",
         "total_kv",
         "fixed_batch",
@@ -312,6 +313,7 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
         s.lse_fill_plan = tuple(s.lse_fill_plan)
     s.cga_tile_m = int(plan.cga_tile_m)
     s.wave_policy = getattr(plan, "wave_policy", None)
+    s.wave_geometry = getattr(plan, "wave_geometry", None)
     s.total_q = None if plan.total_q is None else int(plan.total_q)
     s.total_kv = None if plan.total_kv is None else int(plan.total_kv)
     s.n_q_lens, s.n_kv_lens, s.lens_form = int(plan.n_q_lens), int(plan.n_kv_lens), int(plan.lens_form)
@@ -385,6 +387,8 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
         )
     if s.wave_policy is not None and not getattr(_pybind_module._SdpaThdBinder, "supports_initial_waves", False):
         raise NotImplementedError("cudnn.sdpa: this prepared THD launch requires runtime initial-wave binding; rebuild the extension")
+    if s.wave_geometry is not None and not getattr(_pybind_module._SdpaThdBinder, "supports_initial_wave_geometry", False):
+        raise NotImplementedError("cudnn.sdpa: this prepared THD launch requires packed initial-wave geometry; rebuild the extension")
     s.native = _pybind_module._SdpaThdBinder(s)
     return s
 

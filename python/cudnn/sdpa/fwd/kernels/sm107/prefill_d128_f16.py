@@ -566,6 +566,10 @@ THD_PERSISTENT = True
 # Assign up to two waves directly; beyond that, resident workers claim further
 # units. This avoids a counter-driven tail when a small envelope spans two waves.
 THD_INITIAL_WAVES = 2
+# The two-softmax-WG body benefits from a partial second wave, but near a
+# full second wave its persistent workers drain the tail more efficiently.
+# The adapter applies this budget to packed token tiles at each binding.
+THD_INITIAL_WORK_RATIO = (7, 4) if CFG.CTA_MMA == 2 and CFG.SPLIT_KV == 1 and CFG.SOFTMAX_WARPGROUPS == 2 else None
 
 
 # lpt_q_tiles_in_cga_units=True is REQUIRED under any non-NATURAL scheduler:
