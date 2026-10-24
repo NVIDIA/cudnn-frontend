@@ -803,12 +803,17 @@ def test_sm107_paged_d256_decode_tile_shard_stays_inside_its_measured_shape(outs
         ("sdpa_fwd_prefill_sm107_fp8", (10, 7), 216, _SM107_FP8_QUANT),
     ],
 )
-def test_d512_sliding_window_leads_inside_the_measured_box(row, cc, sms, quant):
+def test_d512_sliding_window_leads_inside_the_measured_box(row, cc, sms, quant, monkeypatch):
     """Each d512 row admits a dense causal sliding window, proposes only admissible sets for it, and its window gate reads
     the module's bounds (gate structure, not a measured winner)."""
     from cudnn.sdpa.fwd import heuristics
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS, mismatch
 
+    if cc == (10, 7):
+        # metadata-only: the synthetic Rubin rows must not depend on the installed DSL's target set
+        from cudnn.frost import buffers
+
+        monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     spec = next(s for s in ENGINE_SPECS if s.name == row)
     swa = {"b": 2, "h_q": 64, "h_kv": 1, "s_q": 4096, "s_kv": 4096, "d_qk": 512, "d_v": 512, "causal": True, "window_left": 128, **quant}
     swa.update(device_cc=cc, device_sm_count=sms)
