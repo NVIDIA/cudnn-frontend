@@ -30,8 +30,8 @@ shared with the SM100 chain.
 
 The CuTeDSL runtime (`nvidia-cutlass-dsl` + `apache-tvm-ffi`) and an SM120 or
 SM121 device are required. The runtimes are required package dependencies except
-on Windows ARM64, where neither ships packages. The base install does not enable
-this API on Windows ARM64.
+on Windows ARM64, where they are excluded from the base installation. The base
+install does not enable this API on Windows ARM64.
 
 ## API Usage
 

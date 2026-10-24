@@ -67,7 +67,7 @@ All Frontend OSS APIs come installed with the `nvidia-cudnn-frontend` package. E
 ```bash
 pip install nvidia-cudnn-frontend
 ```
-On Windows ARM64, the package omits these two runtime dependencies because they do not ship packages for that platform. The base install therefore does not provide a usable CuTeDSL runtime there.
+On Windows ARM64, these two runtime dependencies are excluded from the base installation, so the base install does not enable the CuTeDSL APIs there.
 
 (`pip install nvidia-cudnn-frontend[cutedsl]` still works; the `cutedsl` extra now names only `cuda-python`. A few APIs still want extras of their own — the cuTile linear-attention engines need `[cutile]`.)
 

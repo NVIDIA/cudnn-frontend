@@ -50,9 +50,8 @@ it JITs through is a required dependency and comes with it:
 pip install nvidia-cudnn-frontend
 ```
 
-Windows ARM64 is excluded from the CuTe DSL and TVM-FFI runtime dependencies
-because neither ships packages for that platform; the base install does not
-enable NSA there.
+On Windows ARM64, the CuTe DSL and TVM-FFI runtime dependencies are excluded
+from the base installation, so the base install does not enable NSA there.
 
 ---
 
