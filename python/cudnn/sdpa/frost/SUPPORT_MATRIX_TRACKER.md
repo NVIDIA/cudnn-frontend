@@ -2710,6 +2710,18 @@ partition on average; the final partition may contain a shorter tail. A full
 first wave keeps the unsplit plan. Packed Stats and bounded shape overrides
 use the same declared envelope; other requests retain their existing policy.
 
+### SM107 dense D128 partial PackGQA
+
+Explicit packed CGA2 plans on the native half D128 prefill body admit head
+ratios that share a factor with the 128-row tile (for example, G6 packs two
+heads per token and G12 packs four). This includes the existing D128 envelope
+and dense split-KV paths. Graph and standalone admission use one predicate;
+the native kernel addresses each subgroup without a gather or layout copy.
+Stats and sinks retain the original query-head coordinates. The existing
+prefolded-scale and sink-plus-split restrictions remain. Dense CGA1, paged
+and quantized partial packing retain their prior admission. This extension
+does not change automatic proposal or default ordering.
+
 ### SM107 paged D256 half PackGQA
 
 The existing two-CTA D256 paged half pipeline also serves explicit PackGQA

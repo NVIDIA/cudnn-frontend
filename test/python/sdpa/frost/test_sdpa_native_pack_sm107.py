@@ -3,6 +3,8 @@
 
 """Native SM107 D128 PackGQA replay matrix, kept outside the L0 smoke tier."""
 
+import math
+
 import pytest
 
 from frost_test_utils import requires_dsl
@@ -14,7 +16,25 @@ pytestmark = [pytest.mark.L1, requires_dsl]
 @pytest.mark.parametrize("dtype_name", ["bfloat16", "float16"])
 @pytest.mark.parametrize("sched_policy", [0, 1, 2])
 @pytest.mark.parametrize("with_stats", [False, True])
-@pytest.mark.parametrize("geometry", ["mha", "split", "keyless", "keyless_no_sink", "window", "envelope", "asymmetric"])
+@pytest.mark.parametrize(
+    "geometry",
+    [
+        "mha",
+        "split",
+        "keyless",
+        "keyless_no_sink",
+        "window",
+        "envelope",
+        "asymmetric",
+        "partial6",
+        "partial12",
+        "partial_keyless",
+        "partial_window",
+        "partial_envelope",
+        "partial_asymmetric",
+        "partial192",
+    ],
+)
 def test_native_d128_packing_dense_replay(dtype_name, sched_policy, with_stats, geometry):
     """Native PackGQA covers every scheduler, per-head sinks, keyless rows and FP32 partials."""
     import torch
@@ -29,8 +49,15 @@ def test_native_d128_packing_dense_replay(dtype_name, sched_policy, with_stats, 
         "window": (16, 513, 769, 1, True, True, 127, True),
         "envelope": (4, 513, 768, 2, False, False, None, False),
         "asymmetric": (4, 513, 769, 1, True, True, None, True),
+        "partial6": (6, 129, 257, 1, False, False, None, False),
+        "partial12": (12, 257, 513, 1, True, True, None, True),
+        "partial_keyless": (6, 257, 65, 1, True, True, None, False),
+        "partial_window": (12, 129, 257, 1, True, True, 47, True),
+        "partial_envelope": (24, 129, 385, 2, False, False, None, False),
+        "partial_asymmetric": (10, 129, 257, 1, True, True, None, True),
+        "partial192": (192, 9, 65, 1, False, False, None, False),
     }[geometry]
-    d_qk, d_v = {"envelope": (64, 64), "asymmetric": (96, 80)}.get(geometry, (128, 128))
+    d_qk, d_v = {"envelope": (64, 64), "asymmetric": (96, 80), "partial_envelope": (64, 64), "partial_asymmetric": (96, 80)}.get(geometry, (128, 128))
     api, t = _half_prefold_api(
         d_qk,
         d_v,
@@ -54,7 +81,7 @@ def test_native_d128_packing_dense_replay(dtype_name, sched_policy, with_stats, 
     api.compile()
     assert api._k_mod.__file__.endswith("sm107/prefill_d128_f16.py")
     cfg = api._k_mod.CFG
-    assert (cfg.PACK_G, cfg.STAGES_KV, cfg.SOFTMAX_WARPGROUPS) == (group, 4, 2)
+    assert (cfg.PACK_G, cfg.STAGES_KV, cfg.SOFTMAX_WARPGROUPS) == (math.gcd(group, 128), 4, 2)
     ws = torch.empty(max(api.scratch_workspace_bytes(), 1), dtype=torch.uint8, device="cuda")
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
