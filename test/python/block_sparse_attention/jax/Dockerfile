@@ -7,7 +7,7 @@ ENV XLA_PYTHON_CLIENT_PREALLOCATE=false \
     CMAKE_BUILD_PARALLEL_LEVEL=4 \
     CUDNN_PATH=/usr
 
-RUN python -m pip install --no-cache-dir "nvidia-cutlass-dsl[cu13]==4.7.0" pytest pytest-xdist
+RUN python -m pip install --no-cache-dir "nvidia-cutlass-dsl[cu13]==4.7.1" pytest pytest-xdist
 
 WORKDIR /opt/cudnn-frontend
 COPY . .

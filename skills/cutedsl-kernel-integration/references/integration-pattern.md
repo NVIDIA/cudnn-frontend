@@ -154,7 +154,7 @@ raise ImportError(f"{name} requires optional dependencies. {_OPTIONAL_DEPENDENCY
 
 ## Dependencies
 
-`pyproject.toml` already lists the CuTeDSL stack (`nvidia-cutlass-dsl[cu13]>=4.6.2`, `apache-tvm-ffi`) under `[project] dependencies`, so it is always installed, and the DSL pulls `cuda-python` in transitively. Reuse it by default; `[project.optional-dependencies].cutedsl` names only `cuda-python`.
+`pyproject.toml` already lists the CuTeDSL stack (`nvidia-cutlass-dsl[cu13]>=4.7.1`, `apache-tvm-ffi`) under `[project] dependencies`, so it is always installed, and the DSL pulls `cuda-python` in transitively. Reuse it by default; `[project.optional-dependencies].cutedsl` names only `cuda-python`.
 
 Only change dependencies when the new kernel requires a package not already covered by `cutedsl`. If adding one, document why it is needed and keep the dependency scoped to the optional extra.
 
