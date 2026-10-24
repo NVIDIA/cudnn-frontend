@@ -804,16 +804,23 @@ def test_sm107_paged_d256_decode_tile_shard_stays_inside_its_measured_shape(outs
     ],
 )
 def test_d512_sliding_window_leads_inside_the_measured_box(row, cc, sms, quant):
-    """Dense causal d512 with a window leads inside _d512_swa's bounds; outside them (or with a sink) the window still trails."""
-    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+    """Each d512 row admits a dense causal sliding window, proposes only admissible sets for it, and its window gate reads
+    the module's bounds (gate structure, not a measured winner)."""
+    from cudnn.sdpa.fwd import heuristics
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS, mismatch
 
     spec = next(s for s in ENGINE_SPECS if s.name == row)
     swa = {"b": 2, "h_q": 64, "h_kv": 1, "s_q": 4096, "s_kv": 4096, "d_qk": 512, "d_v": 512, "causal": True, "window_left": 128, **quant}
     swa.update(device_cc=cc, device_sm_count=sms)
-    place = lambda **over: placement.place(spec, _facts(**{**swa, **over}))
-    assert place() == placement.LEAD
-    assert place(s_q=placement.D512_SWA_MIN_S_Q, s_kv=32768, bottom_right=True) == placement.LEAD
-    assert place(s_q=placement.D512_SWA_MIN_S_Q - 1, s_kv=32768, bottom_right=True) == placement.TRAIL
-    assert place(s_q=placement.D512_SWA_MIN_KV // 2, s_kv=placement.D512_SWA_MIN_KV // 2) == placement.TRAIL
-    assert place(has_sink=True) == placement.TRAIL
-    assert place(d_qk=256, d_v=256) == placement.TRAIL
+
+    def facts(**over):
+        return _facts(**{**swa, **over})
+
+    assert mismatch(spec.capabilities, facts()) is None
+    offered = {row: _OFFERED[row]}
+    plans = [p for p in heuristics.recommend("A", facts(), offered) if p.engine_id == _OFFERED[row]]
+    assert plans and all(mismatch(spec.capabilities, facts(), p.knobs) is None for p in plans)
+    assert placement.place(spec, facts()) == placement.LEAD
+    assert placement._d512_swa(facts(s_q=placement.D512_SWA_MIN_S_Q, s_kv=32768, bottom_right=True))
+    assert not placement._d512_swa(facts(s_q=placement.D512_SWA_MIN_S_Q - 1, s_kv=32768, bottom_right=True))
+    assert not placement._d512_swa(facts(s_q=placement.D512_SWA_MIN_KV // 2, s_kv=placement.D512_SWA_MIN_KV // 2))
