@@ -252,6 +252,9 @@ def _run(
     block_scaled_o=None,
     sf_o_layout="planes",
     scale_o=1.0,
+    negate_q: bool = False,
+    negative_descale_q: bool = False,
+    qkv_float=None,
 ):
     """Append-only knobs (PR-A): ``gate`` (a bf16 BHSD-logical tensor of O's shape)
     adds the epilogue-gate tail ``sdpa(virtual O_v) -> sigmoid(G) -> mul`` and
@@ -262,12 +265,20 @@ def _run(
     import cudnn
 
     dev = "cuda"
-    Qf = torch.randn(B, H_q, S_q, d_qk, device=dev) * 0.5
-    Kf = torch.randn(B, H_kv, S_kv, d_qk, device=dev) * 0.5
-    Vf = torch.randn(B, H_kv, S_kv, d_v, device=dev) * 0.5
+    if qkv_float is None:
+        Qf = torch.randn(B, H_q, S_q, d_qk, device=dev) * 0.5
+        Kf = torch.randn(B, H_kv, S_kv, d_qk, device=dev) * 0.5
+        Vf = torch.randn(B, H_kv, S_kv, d_v, device=dev) * 0.5
+    else:
+        Qf, Kf, Vf = qkv_float
+    if negate_q:
+        Qf = -Qf
     Q8, dq = _quant(Qf, in_key)
     K8, dk = _quant(Kf, in_key)
     V8, dv = _quant(Vf, in_key)
+    if negative_descale_q:
+        # Same dequantized Q, with a negative descale_q * descale_k on the device.
+        Q8, dq = (-Q8.float()).to(Q8.dtype), -dq
 
     def bshd(x8):
         return x8.permute(0, 2, 1, 3).contiguous().transpose(1, 2)
@@ -2398,3 +2409,139 @@ def test_fp8_thd_batched_setup(batch, cu_lens):
     kv_lens = [([33, 0, 65, 127, 257][i % 5]) for i in range(batch)]
     out = _run_thd(q_lens, kv_lens, 2, 1, "e4m3", scale=1.0 / math.sqrt(128), cu_lens=cu_lens)
     _check(out[0], out[1], torch.float16, "e4m3", out[2], out[3])
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)])
+@pytest.mark.parametrize("mask", ["none", "causal"])
+def test_fp8_negative_attn_scale(d_qk, d_v, mask):
+    """A negative attn_scale negates S in BMM1 (a_negate) and runs at |scale| (#1435). FP8 negation is exact, so the
+    result must be bit-identical to the positive scale on -Q; this does not depend on the fp32 reference's edge."""
+    scale = 0.7 / math.sqrt(d_qk)
+    runs = []
+    for sign in (-1.0, 1.0):
+        torch.manual_seed(0)
+        runs.append(_run(2, 8, 8, 256, 256, "e4m3", torch.float16, scale=sign * scale, sdpa_kwargs=_MASKS[mask], d_qk=d_qk, d_v=d_v, negate_q=sign > 0))
+    neg, pos = runs
+    assert not neg.output.isnan().any()
+    assert torch.equal(neg.output, pos.output)
+    assert neg.amax == pos.amax
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not 100 <= _SM < 107, reason="the SM100 D192 FP8 template")
+def test_fp8_d192_causal_probability_rounding():
+    """A fixed two-key causal row straddles an E4M3 probability midpoint.
+
+    P[0] = 0.78075 must round to 0.75, below the 0.78125 midpoint.
+    The old exp2 approximation moved it above the midpoint and rounded to
+    0.8125 instead. Fixed inputs keep this independent of CUDA RNG layout.
+    """
+    q = torch.zeros(1, 1, 128, 192, device="cuda")
+    k = torch.zeros_like(q)
+    v = torch.zeros(1, 1, 128, 128, device="cuda")
+    q[..., 0] = 1.0
+    k[:, :, 1, 0] = 1.0
+    v[:, :, 0, :] = 4.0
+    result = _run(
+        1,
+        1,
+        1,
+        128,
+        128,
+        "e4m3",
+        torch.float16,
+        scale=-math.log(0.78075),
+        sdpa_kwargs=_MASKS["causal"],
+        d_qk=192,
+        d_v=128,
+        return_lse=True,
+        qkv_float=(q, k, v),
+    )
+    _check(result.output, result.reference, torch.float16, "e4m3", result.amax, result.reference_amax)
+    torch.testing.assert_close(result.stats, result.reference_stats, rtol=3e-2, atol=_half_atol("e4m3"))
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not 100 <= _SM < 107, reason="the SM100 D192 FP8 rotated-P template")
+@pytest.mark.parametrize("mask", ["none", "causal"])
+@pytest.mark.parametrize("s_kv", [128, 256, 512])
+def test_fp8_d192_final_p1_reuse_under_mma_skew(monkeypatch, mask, s_kv):
+    """Delay the prior P1 consumer: the final synthetic score credit must wait
+    for its PV completion. Single-KV tiles have no prior P1 to protect.
+
+    The injected delay is a correctness stressor, never a timing assertion or
+    tuning knob. Before the repair, the two-KV dense case can lap the second
+    P-chunk readiness phase and hang, or consume the overwritten probability.
+    """
+    import hashlib
+    import importlib.util
+    from pathlib import Path
+
+    from cudnn.sdpa.fwd import api_dsl
+
+    original_loader = api_dsl.load_template
+    loaded = {}
+
+    def load_skewed(path, params, tag="template", extra_key=None):
+        if Path(path).name != "prefill_d192_d128_fp8.py" or Path(path).parent.name != "sm100":
+            return original_loader(path, params, tag=tag, extra_key=extra_key)
+        key = (path, params, extra_key)
+        if key not in loaded:
+            # Include both specialization and test seam in the compiled key.
+            digest = hashlib.sha256(Path(path).read_bytes() + repr((params, extra_key, "p1-delay-100")).encode()).hexdigest()
+            spec = importlib.util.spec_from_file_location(f"cudnn.frost._templates.p1_skew_{digest}", path)
+            mod = importlib.util.module_from_spec(spec)
+            mod.FROST_TEMPLATE_PARAMS = params
+            mod.FROST_SOURCE_DIGEST = digest
+            mod.FROST_D192_FP8_DEBUG_MMA_P1_DELAY_US = 100
+            spec.loader.exec_module(mod)
+            loaded[key] = mod
+        return loaded[key]
+
+    monkeypatch.setattr(api_dsl, "load_template", load_skewed)
+    results = []
+    for sign in (-1.0, 1.0):
+        torch.manual_seed(0)
+        result = _run(
+            2,
+            8,
+            8,
+            256,
+            s_kv,
+            "e4m3",
+            torch.float16,
+            scale=sign * 0.7 / math.sqrt(192),
+            sdpa_kwargs=_MASKS[mask],
+            d_qk=192,
+            d_v=128,
+            negate_q=sign > 0,
+            return_lse=True,
+        )
+        _check(result.output, result.reference, torch.float16, "e4m3", result.amax, result.reference_amax)
+        torch.testing.assert_close(result.stats, result.reference_stats, rtol=3e-2, atol=_half_atol("e4m3"))
+        results.append(result)
+    assert loaded, "the intended skewed template must execute"
+    assert torch.equal(results[0].output, results[1].output)
+    assert torch.equal(results[0].stats, results[1].stats)
+    assert results[0].amax == results[1].amax
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("scale_sign", [-1.0, 1.0], ids=["neg_scale", "pos_scale"])
+@pytest.mark.parametrize("d_qk,d_v", [(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)])
+@pytest.mark.parametrize("mask", ["none", "causal"])
+def test_fp8_negative_descale_product(scale_sign, d_qk, d_v, mask):
+    """A negative device descale_q * descale_k flips BMM1's sign on the device, for either plan sign (#1435). The same
+    dequantized Q with a positive descale is the bit-exact reference."""
+    scale = scale_sign * 0.7 / math.sqrt(d_qk)
+    runs = []
+    for negative_descale_q in (True, False):
+        torch.manual_seed(0)
+        runs.append(
+            _run(1, 2, 1, 17, 65, "e4m3", torch.float16, scale=scale, sdpa_kwargs=_MASKS[mask], d_qk=d_qk, d_v=d_v, negative_descale_q=negative_descale_q)
+        )
+    flipped, plain = runs
+    assert not flipped.output.isnan().any()
+    assert torch.equal(flipped.output, plain.output)
+    assert flipped.amax == plain.amax

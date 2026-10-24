@@ -392,17 +392,11 @@ def validate_matmul_params(params: MatmulTemplateParams) -> None:
             f"SDPA bwd stage 3: block_scale dequantizes IN the MMA (the fp32 accumulator is the true-unit gradient), so its epilogue is EPI_NONE -- "
             f"a descale / quantize epilogue (epi_mode={epi_mode}) belongs to the per-tensor fp8 arm."
         )
-    if block_scale and int(getattr(params, "b_head_group", 1)) != 1:
-        # The ONE check that lifts this: the SFB load already takes B's grouped head (`_b_head(tile_h)`), so a grouped block-scale
-        # dQ needs only the host's SFB view windowed to the `n_head // b_head_group` kv heads -- and a Rubin twin of
-        # `test_stage3_single_launch_dq_is_bitwise_the_per_member_launches` on the block-scale arm (dense and THD) proving the
-        # single launch bitwise the per-member launches.  Until that twin is green the arm launches dQ once per group member.
-        raise ValueError(
-            f"SDPA bwd stage 3: block_scale indexes its B scale-factor descriptor per A / C head, so a block-scale record keeps b_head_group == 1 "
-            f"(the dQ GEMM runs once per GQA group member); got b_head_group={params.b_head_group}.  The single-launch dQ (b_head_group == the "
-            f"group) is the plain renderings' form; the block-scale arm takes it once its SFB view is windowed to the kv heads and the "
-            f"single launch is proven bitwise the per-member launches on the device."
-        )
+    # `b_head_group` is admitted on the block-scale arm exactly as on the plain renderings (1, or the GQA group of the dQ GEMM): the
+    # SFB load takes B's grouped head (`_b_head(tile_h)`) and the host windows the SFB view to the `n_head // b_head_group` kv heads
+    # (`prepared_host._stage3_block_scale`), so one launch over a whole head chunk pairs every Q head with its K head and its K
+    # scales -- bitwise the per-member launches (the Rubin twins on the MXFP8 row, dense and THD).  The positive-int check is below;
+    # a value that is neither 1 nor the runtime group is refused by `prepared_host._dq_launches` at trace time.
     if (epi_mode != EPI_NONE) != (fp8 and not block_scale):
         raise ValueError(
             f"SDPA bwd stage 3: the descale / quantize epilogue (epi_mode={epi_mode}) belongs to the fp8 arm and the fp8 arm requires one: an e4m3 dS "

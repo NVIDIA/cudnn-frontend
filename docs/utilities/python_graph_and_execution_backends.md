@@ -416,6 +416,35 @@ are close.
   checkpoint on a real-token boundary). `safe_gate`, `use_beta_sigmoid` and
   `allow_neg_eigval` (beta as `2 * sigmoid(x)`) all pass through. The op is
   `cudnn.linear_attention.ops.gated_delta_product`.
+- Mamba-2 SSD (`mamba2` / `mamba2_bwd`) is the gated delta rule without the
+  erase term: one scalar `g` per token (the raw `dt`, `[total_T, HO]`) is both
+  the decay exponent and the write strength, `dt_t = clamp(softplus(g_t +
+  dt_bias), dt_min, dt_max)`, `S_t = exp(A dt_t) S_{t-1} + dt_t k_t^T v_t`. The
+  node has no `beta`; it takes the decay rate `a` (A, `[HO]`), optional
+  `dt_bias`, an optional skip `d` (`[HO]` or
+  `[HO, V]`, `O += d v`) and an optional output gate `z` (`O *= z sigmoid(z)`,
+  with the pre-gate `O_pre` output the backward consumes). `q` / `k` (C / B)
+  may be grouped over the `v` (x) heads; `v` carries every head. `dt_softplus`,
+  `dt_min` and `dt_max` are attributes (the clamp zeroes the gate gradient
+  where active). `Mamba2FrostEngine` (`cudnn.linear_attention.frost.mamba2_engine`,
+  SM100/SM103/SM107, `d_qk == 128`, `d_v == 64`, chunk 128) is its only
+  engine; `mamba2_bwd` returns `dQ, dK, dV, dG, dA, d_initial_state,
+  d_dt_bias, dD, dZ` and regenerates the chunk-cadence state series with the
+  prefill when the graph passes none (or a coarser one). Long sequences on few
+  (sequence, head) tiles run the piece chain in both passes: the prefill in its
+  state-only mode summarizes every piece from a zero state (end state and the
+  log2 of the piece's decay product), a scalar axpy chain seeds the pieces, and
+  the main pass runs them as independent sequences; the backward adds the bprop
+  in its dstate-only mode (every piece's start gradient) and the reverse chain.
+  The CP summaries are the same two modes over whole sequences:
+  `mamba2_summary` (`k, v, g, a, cu_seqlens[, initial_state, dt_bias]` to
+  `final_state` and `transition`, `[N, HO]` fp32, the log2 decay product, so
+  that across spans `S_final = exp2(transition) S_init + S_H`) and
+  `mamba2_summary_bwd` (`q, k, g, a, cu_seqlens, dO[, d_final_state, dt_bias]`
+  to `d_initial_state` and `transition`), served by `Mamba2SummaryFrostEngine`.
+  The torch ops are `cudnn.linear_attention.ops.mamba2` (`A` bound to `a`
+  as is, `dA` returned as is),
+  `mamba2_summary` and `mamba2_summary_bwd`.
 - The FROST engines are pure pass-through: `check_support` requires the
   kernel-native dtypes (fp32/bf16/fp16 gates — io-dtype `beta`/`w` for GDN-2
   — int32 or int64 `cu_seqlens`, fp32-or-bf16 state ports with matching
@@ -651,9 +680,8 @@ only to decline is why `closed_under` existed.
 - A missing or too-old DSL is a DECLINE at `check_support()`, probed without
   executing the module (`importlib.util.find_spec`, `importlib.metadata`).
   `CUTEDSL_MIN_VERSION` in `frost/buffers.py` is the floor these engines want;
-  `pyproject`'s required dependency deliberately sits below it (`>=4.6.2`),
-  since pinning that high would make cudnn-frontend incompatible with anything
-  holding the DSL back.
+  `pyproject` requires `>=4.8.0`. The runtime checks still protect environments
+  that bypass dependency resolution and kernels with newer API requirements.
 - `test/python/core/test_import_boundaries.py` holds all of this, in a fresh
   interpreter, measuring the delta against an empty one.
 
@@ -724,6 +752,31 @@ only to decline is why `closed_under` existed.
   function, list the cell in `_TILE_RULE_CELLS`, and put the measurement in the
   commit.
 
+### Consumed by FlashInfer: the public surface, kept stable
+
+FlashInfer's cuDNN backend (`flashinfer/cudnn/{prefill,decode,utils}.py`)
+programs against this graph API and probes a handful of frontend facts before
+it routes work here. Those names are a caller boundary whatever their spelling
+(`python/cudnn/AGENTS.md` Rule 9: "a private method consumed outside FE is
+still a caller boundary"), so every one of them is public API, kept as
+spelled, with a public twin where the spelling was private.
+`test/python/sdpa/frost/test_flashinfer_consumed_surface.py` (host-only, L0)
+pins each name with its signature, so a rename fails this repository's CI
+instead of silently degrading FlashInfer to its fallback path.
+
+| what the caller asks | spelled today (kept) | public spelling |
+|---|---|---|
+| does the native SDPA binder honor a packed-split / stride contract? | `cudnn._pybind_module._SdpaThdBinder.supports_stats_stride_override`, `.supports_nonpaged_packed_split`, `.supports_paged_split_sink`, ... (static read-only properties, `True`) | `"<cap>" in cudnn.sdpa_capabilities()` -- the frozenset of every `supports_<cap>` flag the build provides; append-only, never renamed |
+| which engine serves the selected plan? | `graph.selected_engine` (`None` = the cuDNN backend; else `.name`) | the same property, documented: `.name` is the engine's manifest name, a stable identifier (`sdpa_fwd_prefill_sm100` / `sdpa_fwd_prefill_sm107` / `sdpa_fwd_prefill_sm120`, ...; manifest names and slots are append-only) |
+| can the cuDNN backend still serve this graph? | `graph.backend_plan_entries()` after `create_execution_plans` (`[]` = declined, guarded or not installed) | the same method, documented above |
+| can the FROST engines run on this install, for this GPU? | `cudnn.frost.buffers.cutedsl_state()` / `cutedsl_too_old(version)` / `CUTEDSL_MIN_VERSION` -- the version half only | `cudnn.frost.cutedsl_runtime_available(device_cc=None)`: the version half, plus -- given a `(major, minor)` cc -- the target half (`cutedsl_arch_requirement_error`). **The floor is 4.7.0 everywhere and 4.8.0 on cc 10.7** (the first public wheel whose `Arch` knows `sm_107a`): a device-blind probe on a cc 10.7 part with a 4.7.x DSL says True while every FROST row declines, so pass the GPU you route to |
+| the cuDNN dtype of a torch dtype | `cudnn.datatypes._torch_to_cudnn_data_type(dtype)` | `cudnn.datatypes.torch_to_cudnn_data_type(dtype)` (the private name is an alias of it) |
+| the unified attention implementation, the graph helpers, the caller hints | `cudnn.attention_implementation.UNIFIED`, `cudnn.graph_cache(key_fn=)`, `cudnn.jit(heur_modes=)`, `cudnn.graph(handle, **graph_kwargs)`, `cudnn.pygraph(is_override_shape_enabled=, is_cuda_graph_replay_expected=)` | already public; listed so the pin covers them |
+
+Nothing here changes a `Capabilities` row: the probes report what the engines
+already decide, and `import cudnn` stays as cheap as before (the device-blind
+probe reads package metadata; only the cc 10.7 target check imports the DSL).
+
 ### Knobs: one public vocabulary, and every python plan lists the knobs it will build
 
 - `KnobType_t` (`include/cudnn_frontend/knobs.h`, mirrored as `cudnn.knob_type`)
@@ -782,6 +835,36 @@ q.shape[2] != ...)` must nest its constant test outside; a `const_expr` on a
 dynamic extent or stride is an error, which is why the padded-Stats store
 selects on the fake's RANK (rank-4) and not on `shape[0] > 1`.
 
+### Per-port token origins from the bound ragged offsets (SDPA THD backward, SM80)
+
+A ragged graph binds one ragged-offset tensor per port, and a padded THD layout
+(TE's `cu_seqlens_padded`) puts a sequence's rows somewhere other than
+`prefix(lengths)`. The SM80 backward reads those values on device (issue
+#737). Its existing setup launch, which turns the lengths into the compact
+`cu_seqlens`, also writes one **token origin per port and sequence**,
+`org_p[b] = ro_p[b] × M_p / ts_p` (`M_p` the port's `ragged_offset_multiplier`,
+`ts_p` its token stride in the CALLER's buffer, Int64 arithmetic), into an Int64
+`[rows, B]` workspace region with one row per port that binds offsets. No extra
+launch; the host only binds the current offset pointers, so the origins follow
+the bound values on every execute and CUDA-graph replay.
+
+Two kinds of row origin then coexist. The **internal** packed buffers (the fp32
+dQ accumulator, `do_dot`, the GQA dK/dV partials) stay at `prefix(lengths)`,
+so their sizing and the masks and loop bounds do not change. The **caller's**
+ports are addressed at their origins: the Q/dO and K/V loads, the Stats read,
+the direct-bound dK/dV stores, and the O·dO dot, dQ cast and dK/dV fold, which
+walk `(sequence, row)` over the envelope and touch `origin + row` for
+`row < len[b]` only. Gap rows are never read or written. A staged port (a head
+dim inside the flavor envelope) keeps its origins: the staging copy moves every
+row in place, which is why origins are computed from the caller's token stride.
+
+`tile_dsl.thd.write_thd_port_origins` / `thd_port_origin` are the shared
+helpers; each path materializes only the ports it needs. Whole-token offsets
+are a supported-input precondition of the FROST engines, not a restriction of
+the cuDNN tensor API, and are not checked on device. When the backend cannot
+lower a graph, the Python-side variant-pack order includes each port's ragged
+offset tensor, so the offsets reach the engine as bound slots.
+
 ### Accept means run
 
 For a python plan, `check_support()` accepted ⇒ `build_plans()` and
@@ -817,9 +900,12 @@ records as `FROST_SOURCE_DIGEST`, joined with the function's name and its
 arguments, which pin shapes, strides and flags the way the params pin dtypes
 and masks (SDPA + GEMM suites: 5867 tests, 53:06 cold, 2:53 warm). An
 argument that is not a plain value (a tensor, a device, a stream) makes the
-key None and the call compiles as before. Not cached: the linear-attention
-templates (their `compile()` takes traced tensors) and the SDPA adapters'
-helper kernels in `api_dsl`, which compile from real tensors at call time. A
+key None and the call compiles as before. The GDN/GDP warmup forwards and GDN2/KDA uncut and piece-chain forwards
+also use this cache, with their existing static specialization tuples as keys.
+Those tuples include dtype, rank/layout specialization, device, schedule and
+gate/state flags; packed token totals remain dynamic. Other linear-attention
+compilers and the SDPA adapters'
+helper kernels in `api_dsl` still compile without persistent artifacts. A
 hit is the same object a miss produced, so the reloaded kernel is called
 exactly as the in-process one.
 
@@ -842,6 +928,16 @@ artifact can never be reused by accident:
   yields a loadable entry without its key.
 - **Anything doubtful is a miss**: missing, malformed, mismatched, or an
   object `load_module` refuses (an arch the device cannot run). Never an error.
+- **Concurrent cold callers share a compilation on POSIX.** A cache miss takes
+  an advisory lock for its environment and artifact key, then checks the cache
+  again before compiling. Different keys can compile concurrently; cache hits
+  do not acquire the lock. The OS releases it when a compiler exits, including
+  after a crash. If locking is unavailable, compilation and best-effort export
+  continue without deduplication. Empty lock files live in `<root>/.locks/`,
+  outside the prunable environments, and are retained to keep one stable lock
+  inode per key while other processes may be waiting. Do not unlink them while
+  the cache is in use. Filesystems must support POSIX advisory locking to
+  deduplicate callers sharing that cache.
 - **A hit and a miss run the same thing.** A reloaded tvm-ffi function is
   positional-only, so it is wrapped with the kwargs wrapper the DSL itself
   uses, rebuilt from the RUNTIME spec the record carries (`arg_names`,
@@ -851,8 +947,10 @@ artifact can never be reused by accident:
   after a constexpr one (the fp8 SDPA kernels have one). The miss path
   exports and then reloads, so a bad artifact fails at build time, not at the
   next start-up. Kernels whose in-process object converts raw pointer
-  arguments, takes a dataclass argument, or has a default JSON cannot carry
-  are not persisted.
+  arguments, takes a runtime dataclass argument, or has a default JSON cannot
+  carry are not persisted. Constexpr dataclasses are exportable when the DSL
+  executor can establish that they are absent from the runtime arguments; their
+  configuration must still be part of the caller's specialization key.
 - **One object per kernel per process.** In front of the files sits an
   in-process memo keyed by the device a build targets, the live CUDA device the
   compile is issued under (the DSL ties a compiled object's executor to a device
@@ -886,7 +984,7 @@ artifact can never be reused by accident:
   is a backstop, not a policy.
 
 Not yet routed: kernels compiled from real tensors at call time (the
-linear-attention `chunk_*` launchers, the SDPA adapters' `_dot_fn` /
+remaining linear-attention `chunk_*` launchers, the SDPA adapters' `_dot_fn` /
 `_reduce_fn` / `_setup_fn` helpers): a key for them has to spell the traced
 tensors' dtype, rank and dynamic marks; same hook once it does.
 
@@ -955,9 +1053,9 @@ the wrong arch — a green sweep on one box says nothing about the others:
 
 | target | covers |
 |---|---|
-| any GPU (CPU-only logic) | `test_dispatch.py`, `test_graph_native.py`, `test_import_boundaries.py` — the ranking contract, one-shot planning, the at-index APIs, manifest classification |
+| any GPU (CPU-only logic) | `test_dispatch.py`, `test_graph_native.py`, `test_import_boundaries.py`, `sdpa/frost/test_flashinfer_consumed_surface.py` — the ranking contract, one-shot planning, the at-index APIs, manifest classification, the surface FlashInfer consumes |
 | SM100 | every FROST SDPA-forward cell except sm120; the FROST GEMM family; `linear_attention` (GDN / KDA / GDN-2), which is where the cuTile-vs-FROST pin lives |
-| SM120 | `sdpa_fwd_prefill_sm120` and its tile rule; `test_mhas_v2` routing tallies |
+| SM120 | `sdpa_fwd_prefill_sm120` and its tile rule; `test_mhas_v2` routing tallies; the FROST GEMM family's sm120 tree (warp-level `mma.sync`; dense, block-scale and MoE grouped matmul with fused epilogues): `gemm/frost/sm120/` — the parent suites' sm120 copies, where a case still pinned to an sm100 config skips — plus the parents' own sm120 cases |
 
 Enumerate the device with `torch.cuda.get_device_properties(i).major` and pin
 it with `CUDA_VISIBLE_DEVICES` — CUDA's device order is not `nvidia-smi`'s, and

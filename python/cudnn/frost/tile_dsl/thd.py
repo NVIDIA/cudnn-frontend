@@ -20,11 +20,11 @@ Metadata buffer, in int32 words (``THD_META_WORDS(B)`` of them)::
 
     [ seq_kv_lens(B) | cu_seqlens_q(B+1) | cu_seqlens_k(B+1) | batch_remap(B) | live | ctr ]
 
-``batch_remap`` is a permutation of ``[0, B)`` by DESCENDING Q length, so the
-tile scheduler walks the longest sequences first (longest-processing-time): the
-tail of a THD launch is then made of short sequences, which is what bounds the
-ragged last wave.  ``live`` is the total unit count (device-computed — the host
-cannot know ``SUM_b ceil(s_b/tile)*QH`` without a D2H) and ``ctr`` is the
+``batch_remap`` is a permutation of ``[0, B)`` by descending work length.
+The default ranks Q lengths; eligible forward prefix paths rank KV lengths
+because each query tile traverses its KV range. The tile scheduler visits
+longer work first to reduce the ragged last wave. ``live`` is the total unit
+count (device-computed — the host cannot know ``SUM_b ceil(s_b/tile)*QH`` without a D2H) and ``ctr`` is the
 persistent scheduler's claim counter.
 """
 
@@ -35,6 +35,10 @@ import cutlass
 import cutlass.cute as cute
 from cutlass._mlir.dialects import arith
 
+# The backward layout's word count is defined DSL-free in ``constants`` (host sizing imports it before the DSL version
+# gate has run -- see there) and re-exported here with the offsets it closes.
+from cudnn.frost.tile_dsl.constants import THD_BWD_META_WORDS
+
 # int64 words per 128-byte TMA descriptor.
 TENSOR_MAP_QWORDS = 128 // 8
 # Byte alignment every tensor-map object must sit on: CUtensorMap is declared `alignas(128)`
@@ -42,6 +46,11 @@ TENSOR_MAP_ALIGN = 128
 TENSOR_MAP_BIT21 = 1 << 21  # qword 1: encoder's "tensor >= 128 KiB" flag; tensormap.replace does not update it (issue #1013)
 
 THD_META_WORDS = lambda b: 4 * b + 4  # noqa: E731
+# Optional forward extension: tile-work prefixes in batch-remap order.
+# Existing metadata offsets, including the live count and counter, stay fixed.
+THD_WORK_PREFIX_OFF = lambda b: 4 * b + 4  # noqa: E731
+THD_WORK_META_WORDS = lambda b: 5 * b + 5  # noqa: E731
+THD_BATCH_OF_WORK_META_WORDS = lambda n: (n - 5) // 5  # noqa: E731   B from a THD_WORK_META_WORDS(B)-word metadata tensor (never from 4B+4)
 THD_CU_K_TOTAL_OFF = lambda b: 3 * b + 1  # noqa: E731   cu_k[B]: the live packed kv total (cu_q occupies [B, 2B], cu_k [2B+1, 3B+1])
 THD_CU_Q_TOTAL_OFF = lambda b: 2 * b  # noqa: E731   cu_q[B]: the live packed q total (the last word of cu_q; a packed dQ fold's row limit)
 THD_REMAP_OFF = lambda b: 3 * b + 2  # noqa: E731
@@ -59,14 +68,18 @@ THD_CTR_OFF = lambda b: 4 * b + 3  # noqa: E731    persistent-scheduler claim co
 #
 #   [ ...the forward layout... | row_off(B+1) ]
 THD_ROWOFF_OFF = lambda b: 4 * b + 4  # noqa: E731
-THD_BWD_META_WORDS = lambda b: 5 * b + 5  # noqa: E731
+# ... | row_off(B+1) | unit prefix(B+1) ]: the backward's remap-ordered unit prefix (write_thd_work_prefix with
+# prefix0=THD_BWD_WORK_PREFIX_OFF; Q- or KV-blocked units through cu0) that thd_decode_unit_prefix binary-searches.
+THD_BWD_WORK_PREFIX_OFF = lambda b: 5 * b + 5  # noqa: E731
+# THD_BWD_META_WORDS = 6 * b + 6, this layout's total: defined in ``constants`` and imported above (host sizing needs it DSL-free).
 
 # --- optional TENSOR-MAP extension -----------------------------------------
 # For a launch ABI with no descriptor operand: the ``B + 3`` tensor maps follow the
-# forward layout on the next ``TENSOR_MAP_ALIGN`` boundary of a buffer based on one.
+# forward layout -- the work prefix included, since the shared setup launches
+# always publish it -- on the next ``TENSOR_MAP_ALIGN`` boundary of a buffer based on one.
 #
-#   [ ...the forward layout... | pad | maps((B+3) * TENSOR_MAP_QWORDS int64) ]
-THD_MAPS_OFF = lambda b: -(-THD_META_WORDS(b) * 4 // TENSOR_MAP_ALIGN) * TENSOR_MAP_ALIGN // 4  # noqa: E731   int32 words
+#   [ ...the forward layout incl. the unit prefix... | pad | maps((B+3) * TENSOR_MAP_QWORDS int64) ]
+THD_MAPS_OFF = lambda b: -(-THD_WORK_META_WORDS(b) * 4 // TENSOR_MAP_ALIGN) * TENSOR_MAP_ALIGN // 4  # noqa: E731   int32 words
 THD_MAPS_META_WORDS = lambda b: THD_MAPS_OFF(b) + (b + 3) * TENSOR_MAP_QWORDS * 2  # noqa: E731
 # The BACKWARD twin: ``n_maps`` tensor maps after the backward layout (``row_off`` included) on the
 # next ``TENSOR_MAP_ALIGN`` boundary -- for a backward main kernel whose launch ABI has no descriptor
@@ -253,8 +266,12 @@ def write_thd_row_offsets(meta, n_batch: cutlass.Int32, gran: cutlass.Int32, cu0
 
 
 @cute.jit
-def write_thd_batch_remap(meta, n_batch: cutlass.Int32, tid: cutlass.Int32, nthreads: cutlass.Int32) -> None:
-    """Fill ``batch_remap`` with ``[0, B)`` sorted by descending Q length.
+def write_thd_batch_remap(meta, n_batch: cutlass.Int32, tid: cutlass.Int32, nthreads: cutlass.Int32, rank_by_kv: cutlass.Constexpr[bool] = False) -> None:
+    """Fill ``batch_remap`` with ``[0, B)`` sorted by descending work length.
+
+    Eligible forward callers rank by KV length: each query tile traverses KV,
+    and a short-query request can still carry a long-running tile.
+    Other callers retain Q-length ordering. Equal lengths keep batch order.
 
     Rank-by-counting rather than a sort network: each thread owns a batch and
     counts how many sequences outrank it, which is O(B^2) comparisons but fully
@@ -262,16 +279,22 @@ def write_thd_batch_remap(meta, n_batch: cutlass.Int32, tid: cutlass.Int32, nthr
     original index, so the permutation is stable and reproducible run to run.
 
     WHOLE-BLOCK (not elected).  Must be called AFTER :func:`write_thd_meta`
-    (it reads the ``cu_seqlens_q`` it wrote) with a barrier in between.
+    (it reads the Q prefixes or KV lengths it wrote) with a barrier in between.
     """
     cuq0 = n_batch
     remap0 = cutlass.Int32(3) * n_batch + cutlass.Int32(2)
     i = tid
     while i < n_batch:
-        len_i = cutlass.Int32(meta[cuq0 + i + cutlass.Int32(1)]) - cutlass.Int32(meta[cuq0 + i])
+        if cutlass.const_expr(rank_by_kv):
+            len_i = cutlass.Int32(meta[i])
+        else:
+            len_i = cutlass.Int32(meta[cuq0 + i + cutlass.Int32(1)]) - cutlass.Int32(meta[cuq0 + i])
         rank = cutlass.Int32(0)
         for j in cutlass.range(0, n_batch, 1, unroll=1):
-            len_j = cutlass.Int32(meta[cuq0 + j + cutlass.Int32(1)]) - cutlass.Int32(meta[cuq0 + j])
+            if cutlass.const_expr(rank_by_kv):
+                len_j = cutlass.Int32(meta[j])
+            else:
+                len_j = cutlass.Int32(meta[cuq0 + j + cutlass.Int32(1)]) - cutlass.Int32(meta[cuq0 + j])
             # Descending by length; ties resolved by the lower original index.
             outranks = (len_j > len_i) | ((len_j == len_i) & (j < i))
             rank = rank + cutlass.Int32(arith.select(outranks.ir_value(), cutlass.Int32(1).ir_value(), cutlass.Int32(0).ir_value()))
@@ -331,6 +354,48 @@ def write_thd_live_and_ctr(
 
 
 @cute.jit
+def write_thd_work_prefix(meta, n_batch, n_qh, unit_rows, n_ctas, tidx, splits: cutlass.Constexpr[int], cu0=None, prefix0=None):
+    """Prepare a remap-ordered tile prefix in the existing setup launch.
+
+    Each entry counts query-tile/head work before splitting. A single batch
+    needs no lookup table and retains the existing live-count fast path.
+    The caller has barriered after publishing Q prefixes and batch remapping.
+
+    ``cu0`` / ``prefix0`` (appended, defaults = the forward layout): the prefix
+    the units are counted along (``cu0 = 2B + 1`` for kv-block units) and the
+    word the table is written at (``THD_BWD_WORK_PREFIX_OFF`` in the backward
+    layout, where ``row_off`` occupies the forward slot).
+    """
+    if n_batch <= cutlass.Int32(1):
+        write_thd_live_and_ctr(meta, n_batch, n_qh, unit_rows, n_ctas, tidx, splits, cu0=cu0)
+    elif tidx < cutlass.Int32(32):
+        # Fresh names: a parameter rebound to another type inside this region fails the DSL's region join.
+        cuq0 = n_batch if cutlass.const_expr(cu0 is None) else cu0
+        pfx0 = THD_WORK_PREFIX_OFF(n_batch) if cutlass.const_expr(prefix0 is None) else prefix0
+        carry = cutlass.Int32(0)
+        for start in cutlass.range(0, n_batch, 32, unroll=1):
+            rank = start + tidx
+            work = cutlass.Int32(0)
+            if rank < n_batch:
+                b = cutlass.Int32(meta[THD_REMAP_OFF(n_batch) + rank])
+                q_len = cutlass.Int32(meta[cuq0 + b + 1]) - cutlass.Int32(meta[cuq0 + b])
+                work = ((q_len + unit_rows - 1) // unit_rows) * n_qh
+            for bit in cutlass.range_constexpr(5):
+                delta = 1 << bit
+                prior = cute.arch.shuffle_sync_up(work, offset=delta, mask_and_clamp=0)
+                if tidx >= delta:
+                    work = work + prior
+            prefix = carry + work
+            if rank < n_batch:
+                meta[pfx0 + rank + 1] = prefix
+            carry = cute.arch.shuffle_sync(prefix, 31)
+        if tidx == cutlass.Int32(0):
+            meta[pfx0] = cutlass.Int32(0)
+            meta[THD_LIVE_OFF(n_batch)] = carry * cutlass.Int32(splits)
+            meta[THD_CTR_OFF(n_batch)] = n_ctas
+
+
+@cute.jit
 def thd_decode_unit(
     meta,
     n_batch: cutlass.Int32,
@@ -386,6 +451,59 @@ def thd_decode_unit(
 
 
 @cute.jit
+def thd_decode_unit_prefix(
+    meta,
+    n_batch: cutlass.Int32,
+    uid: cutlass.Int32,
+    n_qh: cutlass.Int32,
+    q_tile: cutlass.Int32,
+    reverse_rows: bool,
+    cu0=None,
+    prefix0=None,
+) -> tuple:
+    """:func:`thd_decode_unit`'s ``(q_tile_idx, batch, head)`` through the remap-ordered work prefix
+    :func:`write_thd_work_prefix` published at ``THD_WORK_PREFIX_OFF`` -- a binary search over ``B + 1``
+    words instead of a walk over every sequence.
+
+    Same contract as the walk: the prefix was built from the Q prefix with THIS ``q_tile`` and ``n_qh``
+    (the setup launch's ``cga_tile_m`` / ``n_qh``), a uid past the live total keeps ``batch == n_batch``,
+    the head is the major axis within a sequence (consecutive units sweep one head's tiles) and
+    ``reverse_rows`` walks a sequence's tiles from the diagonal back.  ``n_batch == 1`` reads no prefix
+    (the setup launch publishes only the live total there).  ``cu0`` / ``prefix0`` (defaults = the forward
+    layout) select the prefix the units run along (``2B + 1`` for kv-block units) and the table's word --
+    the SAME pair the setup launch's :func:`write_thd_work_prefix` was given.
+    """
+    cuq0 = n_batch if cutlass.const_expr(cu0 is None) else cu0
+    remap0 = THD_REMAP_OFF(n_batch)
+    pfx0 = THD_WORK_PREFIX_OFF(n_batch) if cutlass.const_expr(prefix0 is None) else prefix0
+    b, local = n_batch, cutlass.Int32(0)
+    if n_batch == cutlass.Int32(1):
+        b, local = cutlass.Int32(0), uid
+    elif n_batch > cutlass.Int32(1):
+        if uid < cutlass.Int32(meta[pfx0 + n_batch]):
+            lo, hi = cutlass.Int32(0), n_batch
+            while lo < hi:
+                mid = (lo + hi) >> 1
+                if cutlass.Int32(meta[pfx0 + mid + 1]) <= uid:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            b = cutlass.Int32(meta[remap0 + lo])
+            local = uid - cutlass.Int32(meta[pfx0 + lo])
+    f_batch, f_head, f_qt = n_batch, cutlass.Int32(0), cutlass.Int32(0)
+    if b < n_batch:
+        s_b = cutlass.Int32(meta[cuq0 + b + cutlass.Int32(1)]) - cutlass.Int32(meta[cuq0 + b])
+        tb = (s_b + q_tile - cutlass.Int32(1)) // q_tile
+        if local < tb * n_qh:
+            head = local // tb
+            qt = local % tb
+            if cutlass.const_expr(reverse_rows):
+                qt = tb - cutlass.Int32(1) - qt
+            f_batch, f_head, f_qt = b, head, qt
+    return f_qt, f_batch, f_head
+
+
+@cute.jit
 def thd_claim_next(meta_t: cute.Tensor, ctr_off: cutlass.Int32, slot, tidx: cutlass.Int32) -> cutlass.Int32:
     """Take the next unit from the device-side claim counter.
 
@@ -433,6 +551,8 @@ def emit_seq_descs(
     slot_base=0,
     first_batch=0,
     batch_step=1,
+    origins=None,
+    origin_row: cutlass.Constexpr[int] = -1,
 ) -> None:
     """Build a per-BATCH descriptor array over a packed ``[T, H, D]`` tensor.
 
@@ -442,15 +562,23 @@ def emit_seq_descs(
     buffer (``cu0 = THD cu_q / cu_k offset``).  ``row_stride`` is in ELEMENTS of
     the tensor's dtype (``.raw_ptr()`` is element-addressed). Keep it Int64
     through the caller and setup-kernel ABI: widening after an Int32 cast
-    cannot recover a legal strided output's high bits.  ``seq_ord`` is
-    innermost-first, so for ``[1, T, H, D]`` with D contiguous the sequence axis
-    is **2**, not 1.  ``slot_base`` (a RUNTIME value -- the arrays are B slots long and B is not
+    cannot recover a legal strided output's high bits. ``seq_ord`` follows the
+    consuming descriptor's innermost-first coordinate order, not the logical
+    tensor's rank: ``(D, H, T, B)`` uses **2**, whereas an explicit
+    ``(D, T, H, B)`` order (the d128 accumulation body) uses **1**.
+    ``slot_base`` (a RUNTIME value -- the arrays are B slots long and B is not
     a compile-time constant) lets several arrays share one buffer.
 
     Each participating warp elects one writer for batches
     ``first_batch, first_batch + batch_step, ...``. These ranges must be
     disjoint; defaults preserve the single-writer contract. The caller must
     issue a ``GENERIC -> TENSORMAP`` release fence on every writer afterwards.
+
+    ``origins`` / ``origin_row`` optionally select an independent caller-port
+    token origin.  The compact prefix still determines the sequence LENGTH;
+    a caller's gaps change only its base address.  Negative ``origin_row``
+    preserves the compact-prefix path and never reads ``origins``.  Explicit
+    origins are absolute within the bound port: do not subtract origin zero.
     """
     desc_base = desc_words.iterator.raw_ptr()
     src_words = Pointer(base_desc.get_ptr(), dtype=cutlass.Int64)
@@ -465,7 +593,8 @@ def emit_seq_descs(
         # more than 2^31 of them (128k tokens x 128 heads x 128 lanes already
         # does), so the Int32 form the inlined SDPA-forward version used was a
         # latent overflow. Matches the linear-attention sibling.
-        row_base = base + cutlass.Int64(cu_b) * cutlass.Int64(row_stride)
+        origin = thd_port_origin(origins, origin_row, b, cu_b)
+        row_base = base + origin * cutlass.Int64(row_stride)
         nvvm.tensormap_replace(
             nvvm.TensormapField.GLOBAL_ADDRESS,
             dptr,
@@ -516,12 +645,54 @@ def emit_clamped_desc(
     nvvm.tensormap_replace(nvvm.TensormapField.GLOBAL_DIM, dptr, new_value=extent, ord=seq_ord)
 
 
+# --- caller-buffer token origins (issue #737) -------------------------------
+# A ragged port's sequence b starts at element ``ro[b] * M`` of its buffer (M
+# the port's ragged_offset_multiplier).  FROST engines take whole-token offsets
+# as a supported-input precondition, so that is token ``ro[b] * M // ts`` (ts
+# the port's token stride in elements).  Origins are a separate Int64
+# ``[rows, B]`` array, one row per port a path materializes; they never replace
+# the compact cu_seqlens above, which keep addressing internal packed buffers.
+
+
+@cute.jit
+def write_thd_port_origins(
+    org,
+    ro,
+    row: cutlass.Constexpr[int],
+    mult: cutlass.Constexpr[int],
+    ts: cutlass.Constexpr[int],
+    n_batch: cutlass.Int32,
+    tid: cutlass.Int32,
+    nthreads: cutlass.Int32,
+) -> None:
+    """``org[row, b] = ro[b] * mult // ts`` for this thread's batches (strided by
+    ``nthreads``).  ``org`` is the Int64 origins tensor; ``ro`` the bound offset
+    tensor (Int32 or Int64).  Arithmetic is Int64 throughout."""
+    org_p = cutlass.make_array_view(org).data_ptr() + cutlass.Int64(row) * cutlass.Int64(org.stride[0])
+    ro_p = cutlass.make_array_view(ro).data_ptr()
+    for b in cutlass.range(tid, n_batch, nthreads, unroll=1):
+        v = cutlass.Int64(Pointer(ro_p + b, dtype=ro.element_type).load())
+        Pointer(org_p + b, dtype=cutlass.Int64).store((v * cutlass.Int64(mult)) // cutlass.Int64(ts))
+
+
+@cute.jit
+def thd_port_origin(org, row: cutlass.Constexpr[int], b: cutlass.Int32, compact: cutlass.Int32) -> cutlass.Int64:
+    """Token origin of sequence ``b`` in a port's buffer: the materialized origin
+    when ``row >= 0``, else the compact prefix ``compact`` (a port bound without
+    offsets, or an internal buffer; ``org`` is then never read)."""
+    origin = cutlass.Int64(compact)
+    if cutlass.const_expr(row >= 0):
+        origin = Pointer(cutlass.make_array_view(org).data_ptr() + cutlass.Int64(row) * cutlass.Int64(org.stride[0]) + b, dtype=cutlass.Int64).load()
+    return origin
+
+
 __all__ = [
     "TENSOR_MAP_ALIGN",
     "TENSOR_MAP_QWORDS",
     "THD_BWD_MAPS_META_WORDS",
     "THD_BWD_MAPS_OFF",
     "THD_BWD_META_WORDS",
+    "THD_BWD_WORK_PREFIX_OFF",
     "THD_CTR_OFF",
     "THD_LIVE_OFF",
     "THD_MAPS_META_WORDS",
@@ -530,15 +701,21 @@ __all__ = [
     "THD_REMAP_OFF",
     "THD_ROWOFF_OFF",
     "THD_SETUP_THREADS",
+    "THD_BATCH_OF_WORK_META_WORDS",
+    "THD_WORK_META_WORDS",
+    "THD_WORK_PREFIX_OFF",
     "emit_clamped_desc",
     "emit_seq_descs",
     "exit_if_dead_thd_cluster",
     "set_tensor_map_bit21",
     "thd_claim_next",
     "thd_decode_unit",
+    "thd_decode_unit_prefix",
+    "thd_port_origin",
     "write_thd_batch_remap",
     "write_thd_live_and_ctr",
     "write_thd_meta",
     "write_thd_prefix_warp",
+    "write_thd_port_origins",
     "write_thd_row_offsets",
 ]

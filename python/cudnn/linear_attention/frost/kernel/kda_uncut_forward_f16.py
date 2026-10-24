@@ -27,6 +27,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
+from cudnn.frost.compiled_cache import compile_cached
+
 from ..common.host import get_dtype
 from . import kda_prefill_f16, kda_prep_f16, kda_prep_prefill_f16
 
@@ -166,7 +168,9 @@ def uncut_forward_host(
     )
 
 
-def build_configs(io_dtype, state_dtype, gate_dtype, *, use_initial_state, store_final_state, enable_checkpoints, tiles_per_head, prep, **flags):
+def build_configs(
+    io_dtype, state_dtype, gate_dtype, *, use_initial_state, store_final_state, enable_checkpoints, checkpoint_dtype=None, tiles_per_head, prep, **flags
+):
     prefill_module = kda_prep_prefill_f16 if prep else kda_prefill_f16
     prefill_cfg = prefill_module.build_cfg(
         io_dtype,
@@ -175,6 +179,7 @@ def build_configs(io_dtype, state_dtype, gate_dtype, *, use_initial_state, store
         use_initial_state=use_initial_state,
         store_final_state=store_final_state,
         enable_checkpoints=enable_checkpoints,
+        checkpoint_dtype=checkpoint_dtype,
         tiles_per_head=tiles_per_head,
         **dict(flags, d_v=flags["d_v"] // tiles_per_head),
     )
@@ -270,6 +275,7 @@ def build_uncut_forward(
         seed_indices is not None,
         final_indices is not None,
         int(checkpoint_every_n_tokens) > 0,
+        str(checkpoints.dtype) if int(checkpoint_every_n_tokens) > 0 else "none",
         int(tiles_per_head),
         bool(prep),
     )
@@ -281,6 +287,7 @@ def build_uncut_forward(
             use_initial_state=state_in is not None,
             store_final_state=state_out is not None,
             enable_checkpoints=int(checkpoint_every_n_tokens) > 0,
+            checkpoint_dtype=get_dtype(checkpoints.dtype) if int(checkpoint_every_n_tokens) > 0 else None,
             l2norm=use_qk_l2norm,
             safe_gate=safe_gate,
             gate_scale_log2=float(gate_lower_bound) * kda_prefill_f16.LOG2_E,
@@ -304,7 +311,7 @@ def build_uncut_forward(
 
         work_items_placeholder = from_dlpack(work_items, assumed_align=16)
         work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        uncut_forward_cache[key] = cute.compile(
+        uncut_forward_cache[key] = compile_cached(
             uncut_forward_host,
             int(b_t),
             int(num_sm),
@@ -335,6 +342,8 @@ def build_uncut_forward(
             prep_cfg,
             *prep_placeholders,
             cuda.CUstream(int(stream)),
+            cache_key=repr((__name__, key)),
+            symbol="frost_la_kda_uncut_forward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
     return uncut_forward_cache[key]

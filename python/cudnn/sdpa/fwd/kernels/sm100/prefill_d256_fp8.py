@@ -26,7 +26,7 @@ from cutlass._mlir.dialects import arith
 import cutlass
 from cutlass.experimental import primitives as prims
 import cutlass.cute as cute
-from cudnn.sdpa.fwd.kernels._quantized import _initialize_split_amax, _scale_or_one
+from cudnn.sdpa.fwd.kernels._quantized import _descale_qk_negate_bit, _initialize_split_amax, _scale_or_one
 import cuda.bindings.driver as _cuda_driver  # noqa: F401
 
 from dataclasses import dataclass
@@ -161,7 +161,7 @@ TOKENS_PER_TILE = CFG.TILE_M // HEADS_PER_TILE
 from cudnn.sdpa.fwd.kernels.thd_helpers import (
     THD_SETUP_THREADS,
     build_thd_meta_o_kv_descs_kernel as _build_thd_meta_o_kv_descs_kernel,
-    thd_decode_unit,
+    thd_decode_unit_prefix,
     TENSOR_MAP_QWORDS,
 )
 
@@ -173,9 +173,17 @@ _THD_REVERSE_CAUSAL_ROWS = CFG.THD_VARLEN and _PADDED_TOP_LEFT_CAUSAL
 
 @cute.jit
 def _thd_decode_causal(linear_cta, seq_kv_lens_t, n_batch, n_qh, cta_in_pair):
+    """THD unit decode for the padded top-left causal flavors.
+
+    The prefix decode with the rows reversed (the diagonal-heavy tiles of a
+    sequence come first); when a full group of four heads is available, the
+    (head, tile) pair is re-interleaved so consecutive units sweep that group's
+    diagonal tiles together.  Returns ``(q_super, head, batch)``; a unit past
+    the live total keeps ``batch == n_batch``.
+    """
     meta = cutlass.make_array_view(seq_kv_lens_t)
     unit = linear_cta // cutlass.Int32(CFG.CGA_M)
-    q_tile, batch, head = thd_decode_unit(
+    q_tile, batch, head = thd_decode_unit_prefix(
         meta,
         n_batch,
         unit,
@@ -680,7 +688,7 @@ def _kernel(
 
     scale_log2_fused = scale_softmax_log2
     if cutlass.const_expr(not CFG.THD_VARLEN):
-        scale_log2_fused = (
+        scale_log2_fused = cute.math.abs(
             scale_softmax_log2 * cutlass.Float32(cutlass.make_array_view(descale_q_t)[0]) * cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
         )
     o_scale_fused = o_scale_fused * cutlass.Float32(cutlass.make_array_view(descale_v_t)[0]) * _scale_or_one(scale_o_t)
@@ -702,7 +710,7 @@ def _kernel(
     if warp_idx >= CFG.SOFTMAX_WG0_BASE and warp_idx < CFG.SOFTMAX_WG0_BASE + CFG.SOFTMAX_WG_WARPS:
         nvvm.setmaxregister(CFG.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
         if cutlass.const_expr(CFG.THD_VARLEN):
-            scale_log2_fused = (
+            scale_log2_fused = cute.math.abs(
                 scale_softmax_log2 * cutlass.Float32(cutlass.make_array_view(descale_q_t)[0]) * cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
             )
         _softmax_warp_group(
@@ -733,7 +741,7 @@ def _kernel(
     elif cutlass.const_expr(CFG.SOFTMAX_WARPGROUPS == 2) and warp_idx >= CFG.SOFTMAX_WG1_BASE and warp_idx < CFG.SOFTMAX_WG1_BASE + CFG.SOFTMAX_WG_WARPS:
         nvvm.setmaxregister(CFG.SOFTMAX_WG1_REGS, nvvm.SetMaxRegisterAction.INCREASE)
         if cutlass.const_expr(CFG.THD_VARLEN):
-            scale_log2_fused = (
+            scale_log2_fused = cute.math.abs(
                 scale_softmax_log2 * cutlass.Float32(cutlass.make_array_view(descale_q_t)[0]) * cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
             )
         _softmax_warp_group(
@@ -812,6 +820,8 @@ def _kernel(
                     qh_per_kh=qh_per_kh,
                     mcast_mask=mcast_mask,
                     cta_in_pair=cta_in_pair,
+                    descale_q_t=descale_q_t,
+                    descale_k_t=descale_k_t,
                 )
             else:
                 _mma_warp_quiet(tmem_ptr_i32, bars)
@@ -834,6 +844,8 @@ def _kernel(
                 qh_per_kh=qh_per_kh,
                 mcast_mask=mcast_mask,
                 cta_in_pair=cta_in_pair,
+                descale_q_t=descale_q_t,
+                descale_k_t=descale_k_t,
             )
 
     elif warp_idx == CFG.TMALDG_WARP_ID:
@@ -1078,8 +1090,9 @@ def _tmaldg_warp_group(
             )
 
             kv_main_start = cute.math.min(kv_left + cutlass.Int32(2), kv_right)
+            # Not the prologue's names: quack-kernels rewrites `if const_expr(S) and D` process-wide and would carry them in maybe-unset
             for kv_loop in cutlass.range(kv_main_start, kv_right, 1, unroll=1):
-                kv_row_base = kv_loop * cutlass.Int32(CFG.TILE_N)
+                kv_row_loop = kv_loop * cutlass.Int32(CFG.TILE_N)
 
                 bars.mb_k_empty[kv_state.idx].wait(kv_state.phase)
                 if cutlass.const_expr(CFG.CTA_MMA == 2):
@@ -1088,7 +1101,7 @@ def _tmaldg_warp_group(
                     bars.mb_k_full[kv_state.idx].arrive(n_bytes=kTmaTransactionBytes, pred=nvvm.elect_sync())
                 tma_load_tile(
                     sK[kv_state.idx],
-                    tma_k(cutlass.Int32(0), kv_row_base + K_ROW_OFFSET_PEER + kv_seq_off, cutlass.Int32(0), kv_head_idx, tma_batch),
+                    tma_k(cutlass.Int32(0), kv_row_loop + K_ROW_OFFSET_PEER + kv_seq_off, cutlass.Int32(0), kv_head_idx, tma_batch),
                     bars.mb_k_full[kv_state.idx].smem_ptr,
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=tma_mcast_mask,
@@ -1102,7 +1115,7 @@ def _tmaldg_warp_group(
                     bars.mb_v_full[kv_state.idx].arrive(n_bytes=vTmaTransactionBytes, pred=nvvm.elect_sync())
                 tma_load_tile(
                     sV[kv_state.idx],
-                    tma_v(cutlass.Int32(0), kv_row_base + kv_seq_off, cutlass.Int32(0), kv_head_idx, tma_batch),
+                    tma_v(cutlass.Int32(0), kv_row_loop + kv_seq_off, cutlass.Int32(0), kv_head_idx, tma_batch),
                     bars.mb_v_full[kv_state.idx].smem_ptr,
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=tma_mcast_mask,
@@ -1279,6 +1292,8 @@ def _mma_warp_group(
     qh_per_kh,
     mcast_mask,
     cta_in_pair,
+    descale_q_t,
+    descale_k_t,
 ):
     tmem_alloc(tmem_ptr_i32, LAYOUT.TOTAL_COLS, CTA_GROUP_KIND)
     nvvm.barrier_cta_arrive(1, 32 * (CFG.SOFTMAX_WARPGROUPS * CFG.SOFTMAX_WG_WARPS + 1))
@@ -1293,7 +1308,9 @@ def _mma_warp_group(
         n_dim=CFG.TILE_N,
         m_dim=CFG.TILE_M * CFG.CTA_MMA,
         k_dim=0,
+        a_negate=int(PARAMS.negate_scores),
     )
+    idesc_qk = idesc_qk ^ _descale_qk_negate_bit(descale_q_t, descale_k_t)
     idesc_pv = prims.Tcgen05InstrDesc.build(
         c_dtype=cutlass.Float32,
         a_dtype=STORAGE_DTYPE,

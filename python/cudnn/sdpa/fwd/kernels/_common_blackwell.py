@@ -3,6 +3,7 @@
 
 from typing import NamedTuple, Optional
 
+from cudnn.frost.tile_dsl.thd import THD_WORK_PREFIX_OFF, THD_WORK_META_WORDS, THD_REMAP_OFF
 import cutlass
 import cutlass.cute as cute
 from cutlass.base_dsl.typing import Pointer
@@ -30,7 +31,7 @@ from cudnn.frost.tile_dsl.mask import (  # noqa: F401
 )
 from cudnn.frost.tile_dsl.barrier import MBarrier, Producer, Scope
 from cudnn.frost.tile_dsl.pointwise import fmul2, ffma2, opaque_f32_zero, fmax_f32
-from cudnn.frost.tile_dsl.tma import st_global_v4, tma_load_tile
+from cudnn.frost.tile_dsl.tma import ld_shared_v4, st_global_v4, st_shared_v4, tma_load_tile
 
 # The O-swizzle selector lives on the base config line (config_sm107 carries a
 # byte-identical copy).  Importing it from config_sm100 keeps this cross-arch
@@ -62,6 +63,31 @@ def sanitize_mxfp8_thd_v_sf_padding(sv_sf, kv_tile_idx, seqlen_kv):
             word.store((word.load(alignment=4) & keep_mask) | fill_mask, alignment=4)
         nvvm.fence_proxy("async.shared", space="cta")
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
+
+
+@cute.jit
+def sanitize_mxfp8_v_sf_padding_pair(sv_sf, kv_tile_idx, seqlen_kv, peer_cta_id, cta_group: cutlass.Constexpr[int]):
+    """Replace the fully padded V scale blocks in this CTA's slab and, under ``cta_group`` 2, in the peer CTA's slab at
+    the same offset through cluster-mapped loads and stores.
+
+    Called by the leader's MMA warp after its ``mb_v_full`` wait and before the ``tcgen05.cp`` that reads each CTA's
+    slab into that CTA's tensor memory; the peer runs no MMA warp of its own.
+    """
+    sanitize_mxfp8_thd_v_sf_padding(sv_sf, kv_tile_idx, seqlen_kv)
+    if cutlass.const_expr(cta_group == 2):
+        remaining = seqlen_kv - kv_tile_idx * cutlass.Int32(128)
+        valid_blocks = (remaining + cutlass.Int32(31)) // cutlass.Int32(32)
+        if valid_blocks < cutlass.Int32(4):
+            lane = cute.arch.thread_idx()[0] % cutlass.Int32(32)
+            keep_mask = (cutlass.Int32(1) << (valid_blocks * cutlass.Int32(8))) - cutlass.Int32(1)
+            fill_mask = cutlass.Int32(0x7F7F7F7F) & ~keep_mask
+            for row_group in cutlass.range_constexpr(4):
+                byte_offset = lane * cutlass.Int32(16) + cutlass.Int32(row_group * 4)
+                peer_word = nvvm.mapa(sv_sf.base.subview(byte_offset), peer_cta_id).ir_value()
+                old = nvvm.inline_ptx("ld.shared::cluster.b32 $0, [$1];", write_only_types=[cutlass.Int32], read_only_args=[peer_word])
+                nvvm.inline_ptx("st.shared::cluster.b32 [$0], $1;", read_only_args=[peer_word, (old & keep_mask) | fill_mask])
+            nvvm.inline_ptx("fence.proxy.async.shared::cluster;")
+            nvvm.bar_warp_sync(cute.arch.FULL_MASK)
 
 
 class Bars(NamedTuple):
@@ -107,6 +133,36 @@ class Bars(NamedTuple):
     # arithmetic: make_d256_bars.
     mb_gate_full: object = None
     mb_gate_empty: object = None
+    # Resident additive-bias block handshake (the sm107 d128-file tiles at
+    # CFG.BIAS_MODE == 1); None unless built with bias_resident=True.  Two
+    # ITEM-level rows (lane ledger in make_classic_bars):
+    #   mb_bias_full   TMA_LOAD, init ONE_LANE: the TMA-LDG warp arms it once per
+    #                  non-empty work item (pred=elect_sync -> 1 lane) with the
+    #                  sum of the block's FULL tile boxes; both softmax WGs wait
+    #                  it once per item before their first bias read.
+    #   mb_bias_empty  THREAD, init BIAS_EMPTY_ARRIVERS = the softmax warps (8):
+    #                  each softmax warp arrives once per non-empty item after
+    #                  its LAST read of the block (`if elect_sync():` -> 1 lane x
+    #                  8 warps); the TMA-LDG warp waits it before the NEXT item's
+    #                  fill (consumer phase pre-armed at 1: the first fill waits
+    #                  on nothing).  An EMPTY item (zero kv tiles) touches
+    #                  neither row on either side.
+    mb_bias_full: object = None
+    mb_bias_empty: object = None
+    # The STREAMED bias ring (CFG.BIAS_MODE == 2; None unless built with bias_ring_stages > 0): STAGES_BIAS stages, one bias
+    # tile (BIAS_BLOCK_ROWS x TILE_N) per kv tile.
+    #   mb_bias_ring_full[s]   TMA_LOAD, init ONE_LANE: the TMA-LDG warp arms stage s once per kv tile (expect_tx = the tile's
+    #                          FULL boxes, one elected lane) and queues the tile; both softmax warpgroups wait it before the
+    #                          tile's first bias read (256 lanes wait; waits do not count).
+    #   mb_bias_ring_empty[s]  THREAD, init BIAS_EMPTY_ARRIVERS = the softmax warps (8): one elected arrive per softmax warp per
+    #                          kv tile after the stage's last bias word is consumed; the TMA-LDG warp waits it before refilling
+    #                          the stage (pre-armed on its side: the first STAGES_BIAS fills wait on nothing).  On the
+    #                          streamed_multicast ring (CFG.BIAS_MODE == 3) the init is BIAS_EMPTY_ARRIVERS x BIAS_MCAST_CTAS
+    #                          (make_classic_bars(bias_ring_empty_arrivers=): 8 own + 8 peer = 16): the PEER CTA's softmax warps
+    #                          credit this CTA's stage too, through the .release.cta cluster arrive (arrive_on_peer(release_cta=True),
+    #                          a read-then-credit across CTAs -- never the relaxed form; the kernel's barrier table has the row).
+    mb_bias_ring_full: object = None
+    mb_bias_ring_empty: object = None
 
 
 class D256Bars(NamedTuple):
@@ -349,8 +405,23 @@ def make_d512_2x2_bars(CFG, *, N_O_CHUNKS: int, STAT_STAGES: int = 2, cross_pair
     )
 
 
-def make_classic_bars(CFG, s_stages: Optional[int] = None, *, epilogue_gate: bool = False, q_full_arrivers: int = 1) -> Bars:
+def make_classic_bars(
+    CFG,
+    s_stages: Optional[int] = None,
+    *,
+    epilogue_gate: bool = False,
+    q_full_arrivers: int = 1,
+    o_parts: int = 1,
+    bias_resident: bool = False,
+    bias_ring_stages: int = 0,
+    bias_ring_empty_arrivers: Optional[int] = None,
+    stages_k: Optional[int] = None,
+    stages_v: Optional[int] = None,
+) -> Bars:
     """The classic pipeline's barrier set.
+
+    ``stages_k`` / ``stages_v``: the K and V ring depths when a kernel runs them at different depths (the d192
+    half-input cga1 tile: one K stage, two V stages); None (every other caller) = ``CFG.STAGES_KV`` for both.
 
     ``s_stages`` is the S/P TMEM slot ring depth the BMM1-done / BMM2-ready
     handshakes run over: one stage per Q sub-tile on the classic pipeline
@@ -358,7 +429,37 @@ def make_classic_bars(CFG, s_stages: Optional[int] = None, *, epilogue_gate: boo
     kernel alternates its S between so BMM1(i+1) can overlap softmax(i)
     (``sm100/decode_d128_f16.py`` passes 2).  Every other barrier keeps its
     per-sub-tile count.
+
+    ``bias_resident``: the two item-level rows of the resident additive-bias
+    block (``Bars.mb_bias_full`` / ``mb_bias_empty``; the issuing-lane ledger is on the
+    fields).  Init counts: ONE_LANE (one elected expect_tx arrive per item) and
+    ``CFG.BIAS_EMPTY_ARRIVERS`` (one elected THREAD arrive per softmax warp per
+    item = SOFTMAX_WARPGROUPS x SOFTMAX_WG_WARPS, pinned by the config
+    validator).  False (every other caller) leaves them None and traces the
+    pre-bias bundle byte-for-byte.
+
+    ``bias_ring_stages``: the STREAMED bias ring's two rows (``Bars.mb_bias_ring_full`` /
+    ``mb_bias_ring_empty``, that many stages each; the same two init counts per stage
+    -- ONE_LANE for the TMA-LDG warp's per-kv-tile expect_tx, ``CFG.BIAS_EMPTY_ARRIVERS``
+    for the softmax warps' per-kv-tile elected release).  0 (every other caller)
+    leaves them None.  A kernel passes one of ``bias_resident`` / ``bias_ring_stages``,
+    never both: the two bias forms fold on ``CFG.BIAS_MODE``.
+
+    ``bias_ring_empty_arrivers`` (appended): the ``mb_bias_ring_empty`` init count when it is NOT the CTA's own softmax
+    warps alone -- the ``streamed_multicast`` ring (``CFG.BIAS_MODE == 3``) releases every stage from BOTH CTAs of the
+    cluster (one elected local arrive + one elected ``.release.cta`` cluster arrive (``arrive_on_peer(release_cta=True)``,
+    a READ-then-credit across CTAs -- never the relaxed form) per softmax warp), so each CTA's ring counts
+    ``BIAS_EMPTY_ARRIVERS x 2`` per phase.  None (every other caller) = ``CFG.BIAS_EMPTY_ARRIVERS``.
     """
+    if bias_resident and bias_ring_stages:
+        raise ValueError("make_classic_bars: bias_resident and bias_ring_stages are the two bias FORMS (CFG.BIAS_MODE 1 / 2); pass one")
+    if bias_ring_stages < 0:
+        raise ValueError(f"make_classic_bars: bias_ring_stages must be >= 0 (got {bias_ring_stages})")
+    if bias_ring_empty_arrivers is not None and (not bias_ring_stages or int(bias_ring_empty_arrivers) < 1):
+        raise ValueError(f"make_classic_bars: bias_ring_empty_arrivers={bias_ring_empty_arrivers} needs a ring (bias_ring_stages={bias_ring_stages}) and >= 1")
+    # Read CFG.BIAS_EMPTY_ARRIVERS only when a bias form asks for it: the shared SM100 bodies (the d128 decode tile, the
+    # SM100 prefill files) build their bars through this factory with Cfg records that carry no bias fields.
+    ring_empty_count = int(bias_ring_empty_arrivers) if bias_ring_empty_arrivers is not None else (CFG.BIAS_EMPTY_ARRIVERS if bias_ring_stages else 0)
     # ``epilogue_gate``: same two LOCAL gate barriers as make_d256_bars (table
     # there); no classic (d128/d192) kernel passes True yet, so today every
     # caller gets None and traces unchanged.  The init counts (ONE_LANE /
@@ -372,6 +473,8 @@ def make_classic_bars(CFG, s_stages: Optional[int] = None, *, epilogue_gate: boo
     KV_EMPTY_ARRIVERS = (CFG.CGA_M // CFG.CTA_MMA) + CFG.CGA_N - 1
     N_BMM2_CHUNKS = CFG.N_BMM2_CHUNKS
     N_S = CFG.TILES_Q if s_stages is None else int(s_stages)
+    STAGES_K = CFG.STAGES_KV if stages_k is None else int(stages_k)
+    STAGES_V = CFG.STAGES_KV if stages_v is None else int(stages_v)
 
     def _alloc(n):
         return cutlass.Array(cutlass.Int64, n, alignment=16, space=cutlass.AddressSpace.smem)
@@ -380,11 +483,11 @@ def make_classic_bars(CFG, s_stages: Optional[int] = None, *, epilogue_gate: boo
         # q_full_arrivers > 1: besides the leader's expect_tx arrive, each peer CTA's TMA-LDG warp arrives once
         # after filling its own SF_Q tile by hand (the MXFP8 PackGQA gather, sm100/prefill_d128_mxfp8.py).
         mb_q_full=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.ONE_LANE + q_full_arrivers - 1, producer=Producer.TMA_LOAD),
-        mb_k_full=MBarrier(_alloc(CFG.STAGES_KV), stages=CFG.STAGES_KV, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD),
-        mb_v_full=MBarrier(_alloc(CFG.STAGES_KV), stages=CFG.STAGES_KV, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD),
+        mb_k_full=MBarrier(_alloc(STAGES_K), stages=STAGES_K, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD),
+        mb_v_full=MBarrier(_alloc(STAGES_V), stages=STAGES_V, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD),
         mb_q_empty=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),
-        mb_k_empty=MBarrier(_alloc(CFG.STAGES_KV), stages=CFG.STAGES_KV, init_count=KV_EMPTY_ARRIVERS, producer=Producer.MMA_COMMIT),
-        mb_v_empty=MBarrier(_alloc(CFG.STAGES_KV), stages=CFG.STAGES_KV, init_count=KV_EMPTY_ARRIVERS, producer=Producer.MMA_COMMIT),
+        mb_k_empty=MBarrier(_alloc(STAGES_K), stages=STAGES_K, init_count=KV_EMPTY_ARRIVERS, producer=Producer.MMA_COMMIT),
+        mb_v_empty=MBarrier(_alloc(STAGES_V), stages=STAGES_V, init_count=KV_EMPTY_ARRIVERS, producer=Producer.MMA_COMMIT),
         mb_bmm1_done=MBarrier(_alloc(N_S), stages=N_S, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),
         mb_bmm2_done=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),
         mb_bmm2_ready=MBarrier(
@@ -397,7 +500,8 @@ def make_classic_bars(CFG, s_stages: Optional[int] = None, *, epilogue_gate: boo
         mb_stat_full=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.SOFTMAX_LANES, producer=Producer.THREAD),
         mb_stat_empty=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.CORR_LANES, producer=Producer.THREAD),
         mb_stats_read=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CORR_LANES_TOTAL, producer=Producer.LEADER, scope=Scope.LEADER),
-        mb_o_full=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.CORR_LANES, producer=Producer.THREAD),
+        # ``o_parts`` > 1: the O slab of each sub-tile is published (and TMA-stored) per column block.
+        mb_o_full=MBarrier(_alloc(CFG.TILES_Q * o_parts), stages=CFG.TILES_Q * o_parts, init_count=CFG.CORR_LANES, producer=Producer.THREAD),
         mb_o_empty=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.ONE_WARP, producer=Producer.THREAD),
         mb_tmem_dealloc=MBarrier(_alloc(1), stages=1, init_count=CORR_LANES_TOTAL, producer=Producer.THREAD),
         mb_empty_mainloop=MBarrier(_alloc(1), stages=1, init_count=CORR_LANES_TOTAL, producer=Producer.LEADER, scope=Scope.LEADER),
@@ -416,6 +520,14 @@ def make_classic_bars(CFG, s_stages: Optional[int] = None, *, epilogue_gate: boo
         mb_qo_slab_free=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.ONE_WARP, producer=Producer.THREAD),
         mb_gate_full=(MBarrier(_alloc(1), stages=1, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD) if epilogue_gate else None),
         mb_gate_empty=(MBarrier(_alloc(1), stages=1, init_count=CFG.CORR_LANES, producer=Producer.THREAD) if epilogue_gate else None),
+        mb_bias_full=(MBarrier(_alloc(1), stages=1, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD) if bias_resident else None),
+        mb_bias_empty=(MBarrier(_alloc(1), stages=1, init_count=CFG.BIAS_EMPTY_ARRIVERS, producer=Producer.THREAD) if bias_resident else None),
+        mb_bias_ring_full=(
+            MBarrier(_alloc(bias_ring_stages), stages=bias_ring_stages, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD) if bias_ring_stages else None
+        ),
+        mb_bias_ring_empty=(
+            MBarrier(_alloc(bias_ring_stages), stages=bias_ring_stages, init_count=ring_empty_count, producer=Producer.THREAD) if bias_ring_stages else None
+        ),
     )
 
 
@@ -456,11 +568,68 @@ def row_max_for_exp2(total_max):
     )
 
 
+@cute.jit
+def running_max_step_finite_sentinel(raw_max, current_max, total_max, neg_inf, rescale_threshold, masked: cutlass.Constexpr[bool]):
+    """One KV tile's online-softmax running-max step for the kernels that mask with the FINITE sentinel
+    (``apply_mask_chunk``'s default ``_NEG_INF_BITS``, the ``neg_inf`` their running ``total_max`` also starts at).
+
+    ``raw_max`` is the tile's UNSCALED row max -- exactly ``neg_inf`` iff every column of this tile is masked --
+    and ``current_max`` the same max in the exp2 domain (``raw_max * scale_log2``, or ``raw_max`` itself under a
+    pre-folded scale).  Returns ``(total_max, alpha, exp_shift)``: the running max, the rescale factor of the
+    accumulator and the row-sum (``exp2(old - new)``; ``exp2(neg_inf) == 0`` on the row's first live tile, whose
+    stat the correction warp consumes unread), and the value this tile's scores are shifted by before ``exp2``.
+
+    The guard (``masked``; a MASK_NONE build has no masked column and folds it out, byte-identical): a tile that
+    is fully masked BEFORE the row's first live key -- a left band or a bottom-right diagonal clearing a whole
+    tile, the row's keys in a LATER tile -- is ``tile_dead``.  Letting the sentinel become the running max breaks
+    the shift: scaled by ``scale_log2 > 1`` it overflows to -inf and ``-inf - (-inf)`` is NaN (NaN P into BMM2,
+    NaN O); below that the shift reads 0 and every masked column publishes P = 1, mass that only ``alpha = 0`` at
+    the next live tile wipes -- a multiply by zero of garbage.  So the dead tile is SELECTED out of the state:
+    ``total_max`` stays ``neg_inf`` (``is_first`` then starts the online softmax at the first live tile), ``alpha``
+    is ``exp2(neg_inf - neg_inf) = 1`` exactly (the accumulator and the row-sum are still their zero-trip state)
+    and ``exp_shift`` is 0 -- :func:`row_max_for_exp2`'s form for the finite sentinel -- so every column lands at
+    ``exp2(sentinel * scale)`` = +0 on every arm (f32 ``ex2.approx``, the f16x2 arms, the fused f32x2 -> f16x2
+    shift): the path a masked column of a LIVE tile already takes, with a finite shift.  A dead tile AFTER a live
+    one needs nothing: the finite running max never clears the threshold, alpha is ``exp2(0) = 1`` and the masked
+    columns read ``sentinel * scale - m`` -> 0.  A row with no live key at all ends its loop at ``(neg_inf, 0)``
+    and stays with the epilogue's geometry select (``_kv_empty`` / ``_row_empty``)."""
+    old_total_max = total_max
+    is_first = total_max == neg_inf
+    update_cond = is_first | ((current_max - total_max) > rescale_threshold)
+    first_live = is_first
+    if cutlass.const_expr(masked):
+        tile_dead = is_first & (raw_max == neg_inf)
+        update_cond = update_cond & ~tile_dead
+        first_live = is_first & ~tile_dead
+    total_max = cutlass.Float32(arith.select(update_cond.ir_value(), current_max.ir_value(), total_max.ir_value()))
+    exp_input = cutlass.Float32(arith.select(first_live.ir_value(), neg_inf.ir_value(), (old_total_max - total_max).ir_value()))
+    alpha = cute.math.exp2(exp_input, fastmath=True)
+    exp_shift = total_max
+    if cutlass.const_expr(masked):
+        exp_shift = cutlass.Float32(arith.select(tile_dead.ir_value(), cutlass.Float32(0.0).ir_value(), total_max.ir_value()))
+    return total_max, alpha, exp_shift
+
+
 def assert_tile_n_supported(CFG):
     """Import-time gate: kernels on the ``reg_S_a``/``reg_S_b`` softmax body
     require N_BMM2_CHUNKS == 2 (TILE_N == 128)."""
     if CFG.N_BMM2_CHUNKS != 2:
         raise NotImplementedError(f"this kernel currently requires TILE_N=128 (got TILE_N={CFG.TILE_N})")
+
+
+def load_o_chunks_grouped(tmem_base, tmem_o_off, tile_o: int, chunk: int, group: int):
+    """Every fp32 O chunk (``tile_o // chunk`` of them, ``chunk`` columns each) of a TMEM accumulator, loaded ``group`` at a time with ONE wait per
+    group -- the per-chunk ``ld`` + ``wait`` of the original schedule pays a serialized TMEM round trip per chunk.  Every chunk stays live until the
+    caller consumes it, so ``tile_o`` fp32 registers per thread must fit the epilogue's budget."""
+    chunks = []
+    for g0 in range(0, tile_o // chunk, group):
+        loaded = [
+            nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(tmem_base + cutlass.Int32(tmem_o_off + (g0 + k) * chunk), cutlass.Float32), num=chunk)
+            for k in range(min(group, tile_o // chunk - g0))
+        ]
+        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+        chunks.extend(loaded)
+    return tuple(chunks)
 
 
 @cute.jit
@@ -476,6 +645,7 @@ def store_fp32_partial_tile(
     row_head_idx,
     tile_o: cutlass.Constexpr[int],
     chunk: cutlass.Constexpr[int],
+    load_group: cutlass.Constexpr[int] = 1,
 ) -> None:
     """Store one Q row's O tile as fp32, straight from TMEM to the workspace.
 
@@ -488,7 +658,8 @@ def store_fp32_partial_tile(
     ``chunk`` must be the flavor's OWN TMEM read width (its ``O_CHUNK``): the
     O region is not uniformly addressable across flavors, so reading it in a
     different stride than the staged epilogue does silently returns the wrong
-    columns rather than failing.
+    columns rather than failing.  ``load_group`` > 1 loads that many chunks per wait
+    (:func:`load_o_chunks_grouped`: the whole ``tile_o`` is live); 1 is the original wait per chunk.
 
     ``row_dead`` cannot be dropped in favour of the zeroed ``inv_sum`` every
     caller already computes: an empty mainloop never wrote O TMEM, so the load
@@ -505,10 +676,14 @@ def store_fp32_partial_tile(
     d_v = cutlass.const_expr(o_partial_f32.shape[3])
     # Use develop's 16-byte primitive when the current row supports it. Keep
     # the scalar fallback for legal narrow or unaligned caller bindings.
+    grouped = load_o_chunks_grouped(tmem_base, tmem_o_off, tile_o, chunk, load_group) if cutlass.const_expr(load_group > 1) else None
     for blk in cutlass.range_constexpr(tile_o // chunk):
-        addr = tmem_base + cutlass.Int32(tmem_o_off + blk * chunk)
-        vals = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(addr, cutlass.Float32), num=chunk)
-        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+        if cutlass.const_expr(grouped is None):
+            addr = tmem_base + cutlass.Int32(tmem_o_off + blk * chunk)
+            vals = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(addr, cutlass.Float32), num=chunk)
+            nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+        else:
+            vals = grouped[blk]
         scaled = vals * inv_sum
         if row_valid:
             row_out = op[o_batch, q_row_global, row_head_idx, :]
@@ -534,6 +709,81 @@ def store_fp32_partial_tile(
                         row_out[cutlass.Int32(blk * chunk + j)] = cutlass.Float32(
                             arith.select(row_dead.ir_value(), cutlass.Float32(0.0).ir_value(), scaled[j].ir_value())
                         )
+
+
+@cute.jit
+def store_fp32_partial_tile_coalesced(
+    o_partial_f32,
+    tmem_base,
+    tmem_o_off,
+    inv_sum,
+    row_dead,
+    row_valid,
+    o_batch,
+    q_row_global,
+    row_head_idx,
+    tile_o: cutlass.Constexpr[int],
+    chunk: cutlass.Constexpr[int],
+    scratch_addr,
+    lane,
+) -> None:
+    """:func:`store_fp32_partial_tile` with whole-line global stores.
+
+    The direct store writes one 16-byte piece of 32 DIFFERENT rows per warp
+    instruction (rows are D*4 or H*D*4 bytes apart), so every instruction is a
+    32-sector request with half of each sector unused, and a 256-row CTA's
+    128 KiB of partials costs ~8k sector writes.  Here each warp first parks
+    its 32-row x ``chunk``-column fp32 block in SMEM (``scratch_addr``: this
+    WARP's 32 * chunk * 4 bytes in the shared window, idle under the split
+    epilogue -- the O tile is never staged there), then reads it back
+    column-major: lane l stores 16-byte segment ``l % SEGS`` of row
+    ``l // SEGS``, so one instruction writes ``32 / SEGS`` complete rows of
+    ``chunk * 4`` contiguous bytes (whole 128-byte lines at chunk 32).  The
+    target row's coordinates come from the lane that owns it (three warp
+    shuffles); invalid rows (past S_q) are skipped, dead rows store zeros as
+    before.  The 16-byte segments are rotated by the row inside each 128-byte
+    bank row so both the row-major write and the column-major read are
+    bank-conflict free.  Requires the 16-byte-store conditions of the direct
+    path (d_v % 4 == 0, chunk % 4 == 0, unit D stride, 16-byte aligned slab);
+    the caller falls back to :func:`store_fp32_partial_tile` otherwise.
+    """
+    op = cutlass.make_array_view(o_partial_f32)
+    d_v = cutlass.const_expr(o_partial_f32.shape[3])
+    SEGS = chunk // 4
+    RPI = 32 // SEGS
+    ROW_BYTES = chunk * 4
+    ROWS_PER_BANKROW = max(1, 128 // ROW_BYTES)
+    zero = cutlass.Float32(0.0)
+    valid_i = cutlass.Int32(arith.select(row_valid.ir_value(), cutlass.Int32(1).ir_value(), cutlass.Int32(0).ir_value()))
+    my_seg_rot = lane // cutlass.Int32(ROWS_PER_BANKROW)
+    rd_row0 = lane // cutlass.Int32(SEGS)
+    rd_seg = lane % cutlass.Int32(SEGS)
+    for blk in cutlass.range_constexpr(tile_o // chunk):
+        addr = tmem_base + cutlass.Int32(tmem_o_off + blk * chunk)
+        vals = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(addr, cutlass.Float32), num=chunk)
+        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+        scaled = vals * inv_sum
+        for seg in cutlass.range_constexpr(SEGS):
+            values = [cutlass.Float32(arith.select(row_dead.ir_value(), zero.ir_value(), scaled[seg * 4 + j].ir_value())) for j in range(4)]
+            rot = (cutlass.Int32(seg) + my_seg_rot) % cutlass.Int32(SEGS)
+            st_shared_v4(scratch_addr + lane * cutlass.Int32(ROW_BYTES) + rot * cutlass.Int32(16), values, cutlass.Float32)
+        nvvm.bar_warp_sync(cute.arch.FULL_MASK)
+        for k in cutlass.range_constexpr(SEGS):
+            row = rd_row0 + cutlass.Int32(k * RPI)
+            rot = (rd_seg + row // cutlass.Int32(ROWS_PER_BANKROW)) % cutlass.Int32(SEGS)
+            v = ld_shared_v4(scratch_addr + row * cutlass.Int32(ROW_BYTES) + rot * cutlass.Int32(16), cutlass.Float32)
+            q_t = nvvm.shfl_sync(0xFFFFFFFF, q_row_global, row, 31, kind=nvvm.Shfl.IDX)
+            h_t = nvvm.shfl_sync(0xFFFFFFFF, row_head_idx, row, 31, kind=nvvm.Shfl.IDX)
+            ok_t = nvvm.shfl_sync(0xFFFFFFFF, valid_i, row, 31, kind=nvvm.Shfl.IDX)
+            col = cutlass.Int32(blk * chunk) + rd_seg * cutlass.Int32(4)
+            if (ok_t != cutlass.Int32(0)) & (col < cutlass.Int32(d_v)):
+                row_ptr = op.data_ptr((o_batch, q_t, h_t, 0))
+                st_global_v4(
+                    row_ptr.toint(cutlass.Int64) + cutlass.Int64(col) * cutlass.Int64(4),
+                    [cutlass.Float32(v[0]), cutlass.Float32(v[1]), cutlass.Float32(v[2]), cutlass.Float32(v[3])],
+                    cutlass.Float32,
+                )
+        nvvm.bar_warp_sync(cute.arch.FULL_MASK)
 
 
 class SplitHelpers(NamedTuple):
@@ -776,8 +1026,15 @@ def make_sdpa_helpers(
     lpt_head_group: int = 1,
     lpt_q_tiles: int = 0,
     kv_shared_cluster: bool = False,
+    bounded_thd_decode: bool = False,
 ) -> SdpaHelpers:
     """Decode / bounds / THD closures for a flavor.
+
+    ``bounded_thd_decode`` uses the device-sorted batch remap to locate a live
+    THD work item without scanning later sequences. Equal endpoint tile counts
+    admit direct indexing, including unequal lengths in the same tile bucket.
+    Callers opt in after qualifying their geometry; other flavors keep the
+    original decoder. Neither path reads sequence lengths on the host.
 
     ``kv_shared_cluster`` (default False = every existing kernel's trace, byte for byte): the
     CLUSTER-UNION geometry of the d512 2x2-datapath kernel, whose CGA_M CTAs each own their
@@ -797,7 +1054,12 @@ def make_sdpa_helpers(
     # Q super-tiles (TILES_Q * TILE_M-row CTA tiles) per cluster: the unit the blocked NATURAL
     # decode, the LPT q_super expansion, the THD unit decode and the bounds height all share.
     _q_supers_per_cluster = (_cga_m * getattr(CFG, "CGA_N", 1)) if kv_shared_cluster else _cta_mma
-    cga_tile_m = CFG.TILES_Q * CFG.TILE_M * _q_supers_per_cluster
+    # Live Q sub-tiles: TILES_Q, or CfgD128.Q_TILES_LIVE (1) under the two-KV-stream
+    # mode, where sub-tile 1 re-uses sub-tile 0's rows; the Q span, row bases and
+    # bounds follow it.  Read only when that mode is on: the decode-tile configs
+    # inherit CfgD128's field defaults with a TILES_Q of their own.
+    q_tiles_live = CFG.Q_TILES_LIVE if getattr(CFG, "DUAL_KV_STREAM", 0) else CFG.TILES_Q
+    cga_tile_m = q_tiles_live * CFG.TILE_M * _q_supers_per_cluster
     # PackGQA head grouping for the LPT_L2 decode: the grid's head axis is in
     # PACKED heads (QH / PACK_G) and QH_PER_KH // PACK_G of them read one KV
     # head -- 1 under full packing, G / p under partial packing (d128 / d256
@@ -916,7 +1178,7 @@ def make_sdpa_helpers(
         # Token capacity of one CGA super-tile: TILES_Q * TILE_M rows hold
         # rows / p tokens when packing (CFG.PACK_GQA; ``qh_per_kh`` is the
         # caller's packed group p = HEADS_PER_TILE), else one token per row.
-        tokens_per_super = (CFG.TILES_Q * CFG.TILE_M) // qh_per_kh if CFG.PACK_GQA else CFG.TILES_Q * CFG.TILE_M
+        tokens_per_super = (q_tiles_live * CFG.TILE_M) // qh_per_kh if CFG.PACK_GQA else q_tiles_live * CFG.TILE_M
         cga_base_super = q_super_idx - cta_in_pair
         q_row_coord = cga_base_super * cutlass.Int32(tokens_per_super)
         return compute_kv_loop_bounds(
@@ -956,7 +1218,7 @@ def make_sdpa_helpers(
         """
         b = _bounds_for_tile(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, qh_per_kh)
         if cutlass.const_expr(int(getattr(CFG, "SEQ_Q_LENS_PRESENT", 0)) == 1):
-            tokens_per_super = (CFG.TILES_Q * CFG.TILE_M) // qh_per_kh if CFG.PACK_GQA else CFG.TILES_Q * CFG.TILE_M
+            tokens_per_super = (q_tiles_live * CFG.TILE_M) // qh_per_kh if CFG.PACK_GQA else q_tiles_live * CFG.TILE_M
             cga_base_super = q_super_idx - cta_in_pair
             q_row_coord = cga_base_super * cutlass.Int32(tokens_per_super)
             arr = cute.make_tensor(cute.make_ptr(cutlass.Int32, seq_q_lens_addr, cute.AddressSpace.gmem, assumed_align=4), cute.make_layout(1 << 24))
@@ -1002,7 +1264,64 @@ def make_sdpa_helpers(
     _thd_on = int(getattr(CFG, "THD_VARLEN", 0))
 
     @cute.jit
+    def _thd_decode_prefix(linear_cta, meta_t, n_batch, n_qh, cta_in_pair):
+        u = linear_cta // cutlass.Int32(CFG.CGA_M)
+        split = u % cutlass.Int32(CFG.SPLIT_KV)
+        u = u // cutlass.Int32(CFG.SPLIT_KV)
+        meta = cutlass.make_array_view(meta_t)
+        b, local = n_batch, cutlass.Int32(0)
+        if n_batch == cutlass.Int32(1):
+            b, local = cutlass.Int32(0), u
+        elif n_batch > cutlass.Int32(1):
+            prefix0 = THD_WORK_PREFIX_OFF(n_batch)
+            if u < cutlass.Int32(meta[prefix0 + n_batch]):
+                lo, hi = cutlass.Int32(0), n_batch
+                while lo < hi:
+                    mid = (lo + hi) >> 1
+                    if cutlass.Int32(meta[prefix0 + mid + 1]) <= u:
+                        lo = mid + 1
+                    else:
+                        hi = mid
+                b = cutlass.Int32(meta[THD_REMAP_OFF(n_batch) + lo])
+                local = u - cutlass.Int32(meta[prefix0 + lo])
+        f_batch, f_head, f_qc = n_batch, cutlass.Int32(0), cutlass.Int32(0)
+        if b < n_batch:
+            q_len = cutlass.Int32(meta[n_batch + b + 1]) - cutlass.Int32(meta[n_batch + b])
+            cb = (q_len + cutlass.Int32(thd_token_tile_m - 1)) // cutlass.Int32(thd_token_tile_m)
+            if local < cb * n_qh:
+                # Policies reorder the SAME live THD work list; they never decode
+                # the padded rectangular cache-shape envelope. NATURAL retains
+                # head-major ascending rows. LPT visits the heavier causal rows
+                # across all heads first; LPT_L2 keeps a KV-sharing head group
+                # together while reversing its rows. Other flavors retain their
+                # head-major THD order until their policy contracts are validated.
+                head = local // cb
+                row = local % cb
+                if cutlass.const_expr(CFG.DTYPE_QKV in (2, 3) and CFG.TILE_K in (64, 128, 256)):
+                    if cutlass.const_expr(CFG.SCHEDULER_POLICY == SCHED_LPT):
+                        head = local % n_qh
+                        row = cb - 1 - local // n_qh
+                    elif cutlass.const_expr(CFG.SCHEDULER_POLICY == SCHED_LPT_L2):
+                        group = cutlass.Int32(_packed_heads_per_kv if CFG.PACK_GQA else CFG.QH_PER_KH)
+                        head = (local // (cb * group)) * group + local % group
+                        row = cb - 1 - (local // group) % cb
+                f_batch, f_head, f_qc = b, head, row
+        return f_qc * cutlass.Int32(_q_supers_per_cluster) + cta_in_pair, f_head, f_batch + split * n_batch
+
+    @cute.jit
     def _thd_decode(linear_cta, seq_kv_lens_t, n_batch, n_qh, cta_in_pair):
+        """Unit id -> (q_super, head, batch [+ split * n_batch]) for every THD flavor.
+
+        Through the remap-ordered work prefix the setup launch publishes
+        (``write_thd_work_prefix``; ``THD_WORK_PREFIX_OFF``): a binary search over
+        B + 1 words. Dead units (uid past the live total) keep
+        ``batch == n_batch``: in-bounds metadata reads make every downstream
+        consumer a no-op (empty KV range, no O/LSE writes).
+        """
+        return _thd_decode_prefix(linear_cta, seq_kv_lens_t, n_batch, n_qh, cta_in_pair)
+
+    @cute.jit
+    def _thd_decode_bounded(linear_cta, seq_kv_lens_t, n_batch, n_qh, cta_in_pair):
         u = linear_cta // cutlass.Int32(CFG.CGA_M)
         split = cutlass.Int32(0)
         if cutlass.const_expr(getattr(CFG, "SPLIT_KV", 1) > 1):
@@ -1023,50 +1342,69 @@ def make_sdpa_helpers(
         f_batch = n_batch
         f_head = cutlass.Int32(0)
         f_qc = cutlass.Int32(0)
+        found_cb = cutlass.Int32(1)
+        found_local = cutlass.Int32(0)
         done = cutlass.Int32(0)
-        # Sequences are visited LONGEST FIRST through batch_remap (built by the
-        # THD setup launch), so the ragged tail of the grid is short sequences.
         remap0 = cutlass.Int32(3) * n_batch + cutlass.Int32(2)
-        for i in cutlass.range(0, n_batch, 1, unroll=1):
+        search = cutlass.Int32(1)
+        # batch_remap is sorted by decreasing Q length. Rounding length to
+        # tile count is monotone, so equal endpoint counts prove that EVERY
+        # batch has the same count, including unequal lengths in one bucket.
+        # All observations are current device metadata; no host promise.
+        if n_batch > cutlass.Int32(0):
+            first_b = cutlass.Int32(cu[remap0])
+            last_b = cutlass.Int32(cu[remap0 + n_batch - cutlass.Int32(1)])
+            first_s = cutlass.Int32(cu[cuq0 + first_b + cutlass.Int32(1)]) - cutlass.Int32(cu[cuq0 + first_b])
+            last_s = cutlass.Int32(cu[cuq0 + last_b + cutlass.Int32(1)]) - cutlass.Int32(cu[cuq0 + last_b])
+            first_cb = (first_s + cutlass.Int32(thd_token_tile_m - 1)) // cutlass.Int32(thd_token_tile_m)
+            last_cb = (last_s + cutlass.Int32(thd_token_tile_m - 1)) // cutlass.Int32(thd_token_tile_m)
+            if first_cb == last_cb:
+                search = cutlass.Int32(0)
+                if first_cb > cutlass.Int32(0):
+                    per_batch = first_cb * n_qh
+                    ordinal = u // per_batch
+                    if ordinal < n_batch:
+                        f_batch = cutlass.Int32(cu[remap0 + ordinal])
+                        found_cb = first_cb
+                        found_local = u % per_batch
+                        done = cutlass.Int32(1)
+        i = cutlass.Int32(0)
+        # Preserve longest-first remapping and the DEAD-unit sentinel. Empty
+        # batches consume zero work. No host knowledge of lengths is needed.
+        while (i < n_batch) & (done == cutlass.Int32(0)) & (search != cutlass.Int32(0)):
             b = cutlass.Int32(cu[remap0 + i])
             s_i = cutlass.Int32(cu[cuq0 + b + cutlass.Int32(1)]) - cutlass.Int32(cu[cuq0 + b])
             cb = (s_i + cutlass.Int32(thd_token_tile_m - 1)) // cutlass.Int32(thd_token_tile_m)
             units_b = cb * n_qh
-            # A zero-length sequence gives cb == 0, and units_b == 0 with it, so
-            # in_rng is false and the quotient is discarded — but arith.select
-            # evaluates BOTH arms, so divide by a clamped copy to keep the dead
-            # arm defined. units_b keeps the true cb (thd_decode_unit's tb_nz).
-            cb_nz = cute.math.max(cb, cutlass.Int32(1))
-            in_rng = (done == cutlass.Int32(0)) & (u < acc + units_b)
-            local = u - acc
-            # Policies reorder the SAME live THD work list; they never decode
-            # the padded rectangular cache-shape envelope. NATURAL retains
-            # head-major ascending rows. LPT visits the heavier causal rows
-            # across all heads first; LPT_L2 keeps a KV-sharing head group
-            # together while reversing its rows. Other flavors retain their
-            # existing THD order until their policy contracts are validated.
-            head = local // cb_nz
-            row = local % cb_nz
+            if u < acc + units_b:
+                f_batch = b
+                found_cb = cb
+                found_local = u - acc
+                done = cutlass.Int32(1)
+            acc = acc + units_b
+            i = i + cutlass.Int32(1)
+        # Quotient/remainder decoding is needed only for the matching batch.
+        # cb is positive here; keep head/row zero for an unclaimed work unit.
+        if done != cutlass.Int32(0):
+            f_head = found_local // found_cb
+            f_qc = found_local % found_cb
             if cutlass.const_expr(CFG.DTYPE_QKV in (2, 3) and CFG.TILE_K in (64, 128, 256)):
                 if cutlass.const_expr(CFG.SCHEDULER_POLICY == SCHED_LPT):
-                    head = local % n_qh
-                    row = cb - cutlass.Int32(1) - local // n_qh
+                    f_head = found_local % n_qh
+                    f_qc = found_cb - cutlass.Int32(1) - found_local // n_qh
                 elif cutlass.const_expr(CFG.SCHEDULER_POLICY == SCHED_LPT_L2):
                     group = cutlass.Int32(_packed_heads_per_kv if CFG.PACK_GQA else CFG.QH_PER_KH)
-                    head = (local // (cb_nz * group)) * group + local % group
-                    row = cb - cutlass.Int32(1) - (local // group) % cb_nz
-            f_batch = cutlass.Int32(arith.select(in_rng.ir_value(), b.ir_value(), f_batch.ir_value()))
-            f_head = cutlass.Int32(arith.select(in_rng.ir_value(), head.ir_value(), f_head.ir_value()))
-            f_qc = cutlass.Int32(arith.select(in_rng.ir_value(), row.ir_value(), f_qc.ir_value()))
-            done = cutlass.Int32(arith.select(in_rng.ir_value(), cutlass.Int32(1).ir_value(), done.ir_value()))
-            acc = acc + units_b
+                    f_head = (found_local // (found_cb * group)) * group + found_local % group
+                    f_qc = found_cb - cutlass.Int32(1) - (found_local // group) % found_cb
         q_super = f_qc * cutlass.Int32(_q_supers_per_cluster) + cta_in_pair
         return q_super, f_head, f_batch + split * n_batch
+
+    _thd_decode_impl = _thd_decode_bounded if bounded_thd_decode else _thd_decode
 
     @cute.jit
     def _dispatch_decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh=None, seqlen_kv=None):
         if cutlass.const_expr(_thd_on):
-            return _thd_decode(bidx, seq_kv_lens_t, n_batch, n_qh, cta_in_pair)
+            return _thd_decode_impl(bidx, seq_kv_lens_t, n_batch, n_qh, cta_in_pair)
         if cutlass.const_expr(CFG.PACK_GQA):
             qh_per_kh = cutlass.Int32(_packed_heads_per_kv)
         return _decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh, seqlen_kv)
@@ -1074,7 +1412,7 @@ def make_sdpa_helpers(
     @cute.jit
     def _dispatch_decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh=None, seqlen_kv=None):
         if cutlass.const_expr(_thd_on):
-            return _thd_decode(t0, seq_kv_lens_t, n_batch, n_qh, cta_in_pair)
+            return _thd_decode_impl(t0, seq_kv_lens_t, n_batch, n_qh, cta_in_pair)
         if cutlass.const_expr(CFG.PACK_GQA):
             qh_per_kh = cutlass.Int32(_packed_heads_per_kv)
         return _decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh, seqlen_kv)
@@ -1111,7 +1449,7 @@ def make_sdpa_helpers(
         bounds_for_tile_qtrim=_bounds_for_tile_qtrim,
         resolve_seqlen_kv=_resolve_seqlen_kv,
         resolve_seqlen_q=_resolve_seqlen_q,
-        thd_decode=_thd_decode,
+        thd_decode=_thd_decode_impl,
         dispatch_decode_initial=_dispatch_decode_initial,
         dispatch_decode_payload=_dispatch_decode_payload,
         thd_tma_offsets=_thd_tma_offsets,
@@ -1426,8 +1764,8 @@ def sdpa_operand_tensors(
         lse = cute.make_tensor(lse_ptr, cute.make_layout((split_kv if packed_split else B * split_kv, QH, SQ), stride=(l0, l1, l2)))
     sinks = _vec(sinks_ptr, QH)
     if thd:
-        # [seq_kv(B) | cu_q(B+1) | cu_k(B+1) | remap(B) | live | ctr] and (B + 3) O/K/V descriptor slots
-        meta = _vec(meta_ptr, 4 * B + 4)
+        # [seq_kv(B) | cu_q(B+1) | cu_k(B+1) | remap(B) | live | ctr | unit prefix(B+1)] and (B + 3) O/K/V descriptor slots
+        meta = _vec(meta_ptr, THD_WORK_META_WORDS(B))
         o_desc = _vec(o_desc_ptr, (B + 3) * tensor_map_qwords)
         q_lens = None if thd_q_lens_ptr is None else _vec(thd_q_lens_ptr, B + (thd_lens_form & 1))
         kv_lens = None if thd_kv_lens_ptr is None else _vec(thd_kv_lens_ptr, B + ((thd_lens_form >> 1) & 1))
@@ -1444,10 +1782,52 @@ def sdpa_operand_tensors(
     return SdpaOperandTensors(q, k, v, o, lse, sinks, meta, o_desc, q_lens, kv_lens, o_partial, table, table_v)
 
 
-def sdpa_gate_tensor(gate_ptr, problem_size, d_v, gate_strides):
+def sdpa_gate_tensor(gate_ptr, problem_size, d_v, gate_strides, thd=False):
     """The fused epilogue gate G (O's (B, SQ, QH, d_v) shape) over the caller's (batch, seq, head)
-    strides; None folds the gate path out (the module's CFG.EPILOGUE_GATE must agree)."""
+    strides; None folds the gate path out (the module's CFG.EPILOGUE_GATE must agree).
+
+    ``thd`` (appended; the kernel passes its ``CFG.THD_VARLEN``): under THD the gate is the SAME packed
+    ``[1, T, QH, d_v]`` map Q / O take (``_bshd(..., thd=True)``: batch extent 1 binding the token stride,
+    never stepped), so the TMA-LDG warp's ``issue_gate_load(..., q_row_base + q_seq_off, tma_batch=0)``
+    addresses the gate rows of each sequence exactly as it addresses its Q rows.  The dense form is
+    unchanged (the default keeps every caller's trace byte-identical)."""
     if gate_ptr is None:
         return None
     B, QH, _, SQ, _, _ = problem_size
-    return _bshd(gate_ptr, B, SQ, QH, d_v, gate_strides, False)
+    return _bshd(gate_ptr, B, SQ, QH, d_v, gate_strides, thd)
+
+
+def sdpa_bias_tensor(bias_ptr, problem_size, bias_strides, bias_extents):
+    """The additive attention bias ``[B_b, H_b, S_q, S_kv]`` (``B_b`` in {1, B}, ``H_b`` in {1, QH}: the graph's
+    broadcast dims, bound as runtime extents so one artifact serves every broadcast form) over the caller's
+    (batch, head, q-row) element strides; the kv column is contiguous.  None folds the bias path out (the
+    module's CFG.BIAS_MODE must agree).  Dense only."""
+    if bias_ptr is None:
+        return None
+    _, _, _, SQ, SKV, _ = problem_size
+    b_b, h_b = bias_extents
+    sb, sh, sq = (cutlass.Int64(s) for s in bias_strides)
+    return cute.make_tensor(bias_ptr, cute.make_layout((b_b, h_b, SQ, SKV), stride=(sb, sh, sq, 1)))
+
+
+def sdpa_kv_mask_tensor(kv_mask_ptr, problem_size, kv_mask_batch_stride):
+    """The per-key boolean mask ``[B_m, S_kv]`` (the graph's ``[1|B, 1, 1, S_kv]`` BOOLEAN tensor read as bytes; a
+    batch stride of 0 broadcasts one row over the batch) in the caller's batch element stride; the key is
+    contiguous.  None folds the kv_mask path out (CFG.KV_MASK_FORM must agree)."""
+    if kv_mask_ptr is None:
+        return None
+    B, _, _, _, SKV, _ = problem_size
+    return cute.make_tensor(kv_mask_ptr, cute.make_layout((B, SKV), stride=(cutlass.Int64(kv_mask_batch_stride), 1)))
+
+
+def sdpa_score_tensor(score_ptr, problem_size, score_strides):
+    """One score side output (``score_max`` or ``score_sum_exp``): a dense fp32 ``(B, QH, SQ)`` row
+    statistic in the caller's declared (batch, head, row) element strides -- the Stats geometry
+    without its unit axis.  None folds the store out of the kernel (the DSL specializes on None),
+    so a plan that does not request the output traces byte-identically to before the slot existed.
+    Dense only: the THD / split builds decline the outputs at ``compile()``."""
+    if score_ptr is None:
+        return None
+    B, QH, _, SQ, _, _ = problem_size
+    s0, s1, s2 = score_strides
+    return cute.make_tensor(score_ptr, cute.make_layout((B, QH, SQ), stride=(s0, s1, s2)))

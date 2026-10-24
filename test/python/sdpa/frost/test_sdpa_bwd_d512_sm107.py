@@ -13,7 +13,7 @@ and a 9th stage at import (RED-first: both raise), its rendering is the committe
 (``renderings/md5_stage2_2x2_sm107a.txt``) and BITWISE the SM100 body at Rubin params on the board (``torch.equal`` on int16
 views of dQ / dK / dV and of the S / dS workspace -- the deltas are wait-form and constants, so a mismatch is a real body
 divergence); the sm_107a SASS pins (0 / 0 spills, the 64 UTCHMMA / 32 UTMALDG census, no GPU-scope drain, no DSMEM copy);
-forced head chunking; two-launch bitwise; the Rule S6 sm_100a lowering of the fork from any box.
+forced head chunking; two-launch bitwise; the Rule S6 sm_107a lowering of the fork from any box.
 
 Host pins run everywhere; GPU cases carry ``requires_rubin`` (the row's own range) and the wedge-prone arms run under
 ``process_watchdog``.  The contention case (a second context of the same chain time-slicing the GPU; the stage-3 GEMMs' hinted
@@ -416,7 +416,7 @@ def test_fork_source_pins():
     assert sorted(polled) == ["empty", "empty", "full"] and src.count("poll=_KV_SHARED,") == 3, polled
     inits = re.findall(r"init_count=CFG\.(\w+)", src)
     assert sorted(inits) == sorted(
-        ["ONE_LANE", "ONE_LANE", "ONE_LANE", "RING_EMPTY_ARRIVERS", "ONE_LANE", "ACC_EMPTY_ARRIVERS", "COMPUTE_LANES", "ONE_WARP", "TMEM_DEALLOC_ARRIVERS"]
+        ["ONE_LANE", "ONE_LANE", "CGA_M", "RING_EMPTY_ARRIVERS", "ONE_LANE", "ACC_EMPTY_ARRIVERS", "COMPUTE_LANES", "ONE_WARP", "TMEM_DEALLOC_ARRIVERS"]
     )
     assert src.count("@cute.kernel") == 2 == src.count('.set_name_prefix("cudnn", remove_cutlass_symbol=True)')
     assert _code_only(src).count(".launch(") == 2, "plain launches (the THD clamp kernel + the main kernel); the DSL launcher sets the oversized-SMEM attribute"
@@ -531,8 +531,7 @@ def _parse_md5_record_2x2(f):
 
 @pytest.mark.parametrize("record", list(_S2_MASKS))
 def test_fork_rendering_ptx_md5_is_recorded(tmp_path, record):
-    """The fork's sm_107a rendering is the committed record's (rendered on the board from the fork commit; the SM100 body at
-    the same parameters rendered the SAME md5s before the fork existed).  Compares only when the installed DSL build is the
+    """The fork's sm_107a rendering matches the committed record, refreshed deliberately for protocol changes.  Compares only when the installed DSL build is the
     recorded one (PTX text is a function of it) and knows sm_107a; skips otherwise (Rule 7)."""
     from cudnn.frost.buffers import cutedsl_state
 
@@ -551,13 +550,17 @@ def test_fork_rendering_ptx_md5_is_recorded(tmp_path, record):
 
 
 @pytest.mark.parametrize("record", ["dense_bf16", "causal_bf16"])
-def test_fork_trace_compiles_for_sm_100a(tmp_path, record):
-    """Rule S6: the other arch line's lowering of the fork, from any box whose DSL knows sm_100a (the public 4.7.0 does).  The
-    320 KiB arm does not FIT an SM100 CTA (227 KiB) -- dynamic SMEM is a launch attribute, not a PTX fact -- so this is a
-    lowering smoke only; the arm's own pins (``_require``) hold at import either way."""
-    if not arch_known_to_the_dsl("sm_100a"):
-        pytest.skip("this cutlass-dsl has no sm_100a")
-    out = _ptx_probe(tmp_path, "sm_100a", record)
+def test_fork_trace_compiles_for_sm_107a(tmp_path, record):
+    """Rule S6: lower the fork for its native sm_107a target from any host whose DSL/toolkit supports it.
+    The 320 KiB arm exceeds an SM100 CTA's 227 KiB capacity, which the compiler can validate before PTX emission.
+    This is a compile-only smoke; no SM107 GPU is required, and the arm's own pins (``_require``) hold at import."""
+    if not arch_known_to_the_dsl("sm_107a"):
+        pytest.skip("this cutlass-dsl has no sm_107a")
+    import cutlass
+
+    if cutlass.target_version(max_version="13.3"):
+        pytest.skip("sm_107a compilation requires a DSL built with CUDA newer than 13.3")
+    out = _ptx_probe(tmp_path, "sm_107a", record)
     assert out["DESC_VERSION"] == "0" and out["CLUSTER_Q_ROWS"] == "256" and out["N_CHUNKS"] == "8", out
 
 
@@ -1004,6 +1007,8 @@ def _dq_arm(monkeypatch, single, *, hq, hkv, sq, skv, chunks=False, **kw):
 
     monkeypatch.setattr(api_dsl, "DQ_SINGLE_LAUNCH", single)
     monkeypatch.setenv("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", "1")
+    # This probe observes host tracing, so bypass both disk reuse and the in-process memo.
+    monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO", "0")
     records, apis, dq_calls = {}, [], []
     original_load = api_dsl.load_template
 
@@ -1204,3 +1209,12 @@ def test_chain_survives_gpu_time_slicing(tmp_path):
         load.wait()
     (tmp_path / "twin.log").write_text(twin.stdout + "\n--- stderr ---\n" + twin.stderr)
     assert twin.returncode == 0 and "[twin] done 100 launches" in twin.stdout, f"rc={twin.returncode}\n{twin.stdout[-3000:]}\n{twin.stderr[-3000:]}"
+
+
+@requires_rubin
+@pytest.mark.xdist_group(name="gpu_exclusive")
+def test_chain_waits_for_delayed_empty_observer(tmp_path):
+    """The eight-stage ring also orders a passive observer before slot reuse across KV tiles."""
+    from frost_test_utils import run_d512_delayed_observer
+
+    run_d512_delayed_observer(tmp_path, _ENGINE)

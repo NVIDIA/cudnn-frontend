@@ -72,40 +72,42 @@ deterministic
 r128 tolerance contract (same values within the gate tolerances — absolute thresholds
 calibrated on the gate's documented input distribution — the eager reference's NaN/Inf
 propagation where its fp32 intermediates overflow, and fp64-oracle parity where the
-fp32 intermediates stay finite), NOT bitwise. ``dAPE`` keeps the
-ratio=4 contract (one fp32 atomic per ``(k, dim)`` per CTA into a caller-zeroed
-buffer, amortized over ``rows_per_cta`` rows; not run-to-run deterministic), and the
-kernel-side zero-writes to never-consumed ``dKV``/``dScore`` slots keep the ratio=4
-ownership rules verbatim, parallelized across the CTA (the zero classes are up to 127
-tokens at ratio=128).
+fp32 intermediates stay finite), NOT bitwise. The default ``dAPE`` path keeps the
+ratio=4 atomic contract. The opt-in deterministic path writes the same CTA-local
+register sums to caller-owned partial planes and reuses the generic family's
+fixed-order second-stage reduction. The kernel-side zero-writes to never-consumed
+``dKV``/``dScore`` slots keep the ratio=4 ownership rules verbatim, parallelized
+across the CTA (the zero classes are up to 127 tokens at ratio=128).
 
 This file intentionally does not touch the ratio=4 path; launch machinery mirrors
 ``compressor_sm100.py`` and reuses its cached fast-launcher infrastructure.
 """
 
 from __future__ import annotations
-from cudnn._cutlass_compat import SmemAllocator
 
 import threading
 
-import torch
 import cuda.bindings.driver as cuda_driver
-
 import cutlass
 import cutlass.cute as cute
 import cutlass.cute.arch as cute_arch
 import cutlass.cute.math as cute_math
+import torch
+
+from cudnn._cutlass_compat import SmemAllocator
 
 from .compressor_sm100 import (
     _EXT,
-    _FastCache,
     _NEG_INF,
     _bf16_ptr,
     _f32_ptr,
+    _FastCache,
     _ffma_rn,
     _fmul_rn,
     _i32_ptr,
     _raw_stream,
+    _run_dape_reduce,
+    precompile_dape_reduce,
 )
 
 # One (block row, dim vec-group) chunk-softmax partial: chunk max / exp-sum / weighted
@@ -125,9 +127,10 @@ from .compressor_sm100 import (
 # issued instructions at the instruction-bound buckets (B200 SASS audit).
 # exp(-inf) == +0 and NaN -> NaN are preserved by ex2.approx; ftz flushes only
 # sub-2^-126 results, which softmax consumes as exact zeros (den >= exp(0) = 1 always
-# survives).
+# survives in a window with a finite position).
 _L2E_HI = 1.4426950216293335  # fp32(log2(e))
 _L2E_LO = 1.925963033500011e-08  # fp32(log2(e) - _L2E_HI); residual ~4e-16
+_LOWEST_F32 = -3.4028234663852886e38  # lowest finite fp32: the forward's initial running max
 
 
 # ``cute.math.exp2``'s ``approx``/``ftz`` keywords are newer than the
@@ -250,11 +253,16 @@ def _compressor_fwd_r128_kernel(
         #
         # Both forms produce a (m, den, acc) partial with identical merge semantics;
         # both are run-to-run bitwise deterministic.
+        #
+        # The running max starts at the lowest finite fp32, not -inf: a -inf position
+        # seen before any finite one (a masked position, or a chunk with no finite
+        # position) then contributes exp(-inf) == 0, as in the eager softmax, instead of
+        # exp(-inf - -inf) == NaN. On finite inputs the output is bitwise unchanged.
         fr_m = cute.make_rmem_tensor((vec,), cutlass.Float32)
         fr_d = cute.make_rmem_tensor((vec,), cutlass.Float32)
         fr_a = cute.make_rmem_tensor((vec,), cutlass.Float32)
         for j in cutlass.range_constexpr(vec):
-            fr_m[j] = cutlass.Float32(_NEG_INF)
+            fr_m[j] = cutlass.Float32(_LOWEST_F32)
             fr_d[j] = cutlass.Float32(0.0)
             fr_a[j] = cutlass.Float32(0.0)
 
@@ -313,7 +321,8 @@ def _compressor_fwd_r128_kernel(
                         m_old = cutlass.Float32(fr_m[j])
                         if s > m_old:
                             # New running max: rescale den/acc by exp(m_old - s); the
-                            # first valid position rescales by exp(-inf) == 0 exactly.
+                            # first finite position rescales the empty (0, 0) partial by
+                            # exp(lowest - s) == 0 exactly.
                             if cutlass.const_expr(fastexp):
                                 scale = _exp_fast(m_old - s)
                             else:
@@ -347,9 +356,10 @@ def _compressor_fwd_r128_kernel(
         if col < ncol:
             if tidy == 0:
                 # Fixed-order serial merge of the tchunks partials per dim. Empty
-                # partials (den == 0: the skipped previous-block half) are ignored;
-                # every row has at least one valid position (the own half), so the
-                # merged den is >= 1 and the final division is safe.
+                # partials (den == 0: the skipped previous-block half, or a chunk
+                # whose positions are all -inf) are ignored; a NaN partial is merged.
+                # A window with a finite position has a merged den >= 1; an all -inf
+                # window gives 0 / 0 = NaN, as the eager softmax does.
                 cvec = col * vec
                 fr_o = cute.make_rmem_tensor((vec,), cutlass.BFloat16)
                 for j in cutlass.range_constexpr(vec):
@@ -359,14 +369,16 @@ def _compressor_fwd_r128_kernel(
                     for t in cutlass.range_constexpr(1, tchunks):
                         slot = (t * threads_x + tidx) * vec + j
                         d2 = cutlass.Float32(sD[slot])
-                        if d2 > 0:
+                        # A NaN partial (a NaN or +inf score in that chunk) is merged, so the output is NaN.
+                        if d2 != cutlass.Float32(0.0):
                             m2 = cutlass.Float32(sM[slot])
                             a2 = cutlass.Float32(sA[slot])
                             mn = m
                             if m2 > mn:
                                 mn = m2
-                            # exp(-inf - mn) == 0 handles a still-empty running
-                            # partial; both-empty never reaches here (d2 > 0).
+                            # The running partial may still be empty (den == acc == 0,
+                            # m the initial lowest finite value); den and acc stay 0
+                            # whatever exp(m - mn) is.
                             s1 = cute_math.exp(m - mn)
                             s2 = cute_math.exp(m2 - mn)
                             den = _ffma_rn(den, s1, _fmul_rn(d2, s2))
@@ -648,7 +660,7 @@ def _compressor_bwd_r128_kernel(
     mGO: cute.Tensor,  # flat [nb_total * d] bf16
     mGKV: cute.Tensor,  # flat [T * W] bf16 (fully written; may be uninitialized)
     mGS: cute.Tensor,  # flat [T * W] bf16 (fully written; may be uninitialized)
-    mGAPE: cute.Tensor,  # flat [ratio * W] fp32 (zero-initialized)
+    mDAPEOut: cute.Tensor,  # atomic: [ratio * W]; deterministic: [gridDim.x * ratio * W]
     nb_total: cutlass.Int32,
     n_seq: cutlass.Int32,
     total_tokens: cutlass.Int32,
@@ -661,6 +673,7 @@ def _compressor_bwd_r128_kernel(
     threads_x: cutlass.Constexpr,
     fastexp: cutlass.Constexpr,
     goreuse: cutlass.Constexpr,
+    deterministic: cutlass.Constexpr,
 ):
     """Backward: staged-smem chunk-parallel phases with fused reductions.
 
@@ -688,8 +701,9 @@ def _compressor_bwd_r128_kernel(
     4. **Store (chunk-parallel):** ``p_k = e_k * (1/den)`` (multiply, not divide),
        ``dkv_k = bf16(go * p_k)``, ``ds_k = bf16(fma.rn(p_k, -S, mul.rn(dp_k, p_k)))``.
        ``dAPE`` is accumulated into ``C * vec`` per-thread registers across the CTA's
-       ``rows_per_cta`` rows and reduced with one fp32 atomic per ``(k, dim)`` per CTA
-       at the end.
+       ``rows_per_cta`` rows. The default specialization emits one fp32 atomic per
+       ``(k, dim)`` per CTA; the deterministic specialization writes a disjoint
+       CTA-local partial plane for the shared fixed-order reduction kernel.
 
     The den/S reduction ORDER (per-chunk then fixed merge) and the reciprocal
     rounding differ from the eager serial scan — dKV/dScore are deterministic but
@@ -980,12 +994,19 @@ def _compressor_bwd_r128_kernel(
             # Tiles are reused by the next row's stage phase.
             cute.arch.barrier()
 
-    # One fp32 atomic per owned (k, dim) per CTA (amortized over rows_per_cta rows).
-    # Chunks that never ran (invalid halves, padding-row CTAs) accumulated 0.0.
+    # Default: one fp32 atomic per owned (k, dim) per CTA. Deterministic: disjoint
+    # partial planes, reduced later in fixed ascending-bidx order. Chunks that never
+    # ran (invalid halves, padding-row CTAs) accumulated 0.0 in either path.
     if col < ncol:
-        for kk in cutlass.range_constexpr(C):
-            for j in cutlass.range_constexpr(vec):
-                cute_arch.atomic_add(mGAPE.iterator + ((ape_row0 + kk) * W + colbase + j), cutlass.Float32(fr_dape[kk * vec + j]))
+        if cutlass.const_expr(deterministic):
+            for kk in cutlass.range_constexpr(C):
+                for j in cutlass.range_constexpr(vec):
+                    out_idx = (ape_row0 + kk) * W + colbase + j
+                    mDAPEOut[bidx * ratio * W + out_idx] = cutlass.Float32(fr_dape[kk * vec + j])
+        else:
+            for kk in cutlass.range_constexpr(C):
+                for j in cutlass.range_constexpr(vec):
+                    cute_arch.atomic_add(mDAPEOut.iterator + ((ape_row0 + kk) * W + colbase + j), cutlass.Float32(fr_dape[kk * vec + j]))
 
 
 @cute.jit
@@ -998,7 +1019,7 @@ def _compressor_bwd_r128_launch(
     go_ptr: cute.Pointer,
     gkv_ptr: cute.Pointer,
     gs_ptr: cute.Pointer,
-    gape_ptr: cute.Pointer,
+    dape_out_ptr: cute.Pointer,
     nb_total: cutlass.Int32,
     n_seq: cutlass.Int32,
     total_tokens: cutlass.Int32,
@@ -1012,6 +1033,7 @@ def _compressor_bwd_r128_launch(
     threads_x: cutlass.Constexpr,
     fastexp: cutlass.Constexpr,
     goreuse: cutlass.Constexpr,
+    deterministic: cutlass.Constexpr,
 ):
     """JIT entry point that wraps raw pointers into tensors and launches backward."""
     lay = cute.make_layout(_EXT)
@@ -1023,7 +1045,7 @@ def _compressor_bwd_r128_launch(
     mGO = cute.make_tensor(go_ptr, lay)
     mGKV = cute.make_tensor(gkv_ptr, lay)
     mGS = cute.make_tensor(gs_ptr, lay)
-    mGAPE = cute.make_tensor(gape_ptr, lay)
+    mDAPEOut = cute.make_tensor(dape_out_ptr, lay)
     ncol = d // vec
     gx = (nb_total + rows_per_cta - 1) // rows_per_cta
     gy = (ncol + threads_x - 1) // threads_x
@@ -1036,7 +1058,7 @@ def _compressor_bwd_r128_launch(
         mGO,
         mGKV,
         mGS,
-        mGAPE,
+        mDAPEOut,
         nb_total,
         n_seq,
         total_tokens,
@@ -1049,6 +1071,7 @@ def _compressor_bwd_r128_launch(
         threads_x,
         fastexp,
         goreuse,
+        deterministic,
     ).launch(grid=(gx, gy, 1), block=(threads_x, tchunks, 1), stream=stream)
 
 
@@ -1161,7 +1184,7 @@ def _bwd_rows_per_cta(nb_total, ratio, d, coff, dev):
     return max(1, min(16, -((nb_total * gy) // -slots)))
 
 
-def _compile_bwd_r128(key, args, ratio, d, coff, schedule):
+def _compile_bwd_r128(key, args, ratio, d, coff, schedule, deterministic=False):
     """JIT-compile the backward launch entry for ``key`` (capture-guarded)."""
     with _COMPILE_LOCK:
         fn = _COMPILED.get(key)
@@ -1172,12 +1195,12 @@ def _compile_bwd_r128(key, args, ratio, d, coff, schedule):
                     "CUDA graph capture (JIT compilation is not capture-safe); compile() "
                     "or run one eager step for this configuration before capturing."
                 )
-            fn = cute.compile(_compressor_bwd_r128_launch, *args, ratio, d, coff, *schedule)
+            fn = cute.compile(_compressor_bwd_r128_launch, *args, ratio, d, coff, *schedule, deterministic)
             _COMPILED[key] = fn
     return fn
 
 
-def precompile_bwd_r128(ratio, d, coff, device, nb_total=None):
+def precompile_bwd_r128(ratio, d, coff, device, nb_total=None, deterministic=False):
     """Ensure the ratio=128 backward kernel(s) for this configuration are JIT-compiled.
 
     With ``nb_total`` given, compiles exactly the schedule bucket that shape will use;
@@ -1211,28 +1234,58 @@ def precompile_bwd_r128(ratio, d, coff, device, nb_total=None):
             stream,
         )
         for schedule in schedules:
-            key = ("r128bwd", ratio, d, coff, schedule, device.index)
+            key = ("r128bwd", ratio, d, coff, schedule, bool(deterministic), device.index)
             if key in _COMPILED:
                 continue
-            _compile_bwd_r128(key, args, ratio, d, coff, schedule)
+            _compile_bwd_r128(key, args, ratio, d, coff, schedule, deterministic)
+        if deterministic:
+            precompile_dape_reduce(device)
 
 
-def run_bwd_r128(kv, score, ape, cu_i, cuc_i, go, gkv, gs, gape, nb_total, ratio, d, coff, stream_handle=None):
+def bwd_dape_workspace_bytes_r128(nb_total, ratio, d, coff, dev):
+    """Caller-owned fp32 partial-plane bytes for deterministic ratio=128 backward."""
+    if nb_total <= 0:
+        return 0
+    rows = _bwd_rows_per_cta(nb_total, ratio, d, coff, dev)
+    npartials = (nb_total + rows - 1) // rows
+    return npartials * ratio * coff * d * 4
+
+
+def run_bwd_r128(
+    kv,
+    score,
+    ape,
+    cu_i,
+    cuc_i,
+    go,
+    gkv,
+    gs,
+    gape,
+    nb_total,
+    ratio,
+    d,
+    coff,
+    stream_handle=None,
+    deterministic=False,
+    workspace=None,
+):
     """Launch the ratio=128 backward kernel (cached fast path -> slow path -> JIT).
 
     Same contract as ``compressor_sm100.run_bwd``: recompute-from-inputs (flat
     contiguous bf16 kv/score/grad_out, fp32 ape, int32 cu_seqlens/cu_seqlens_comp),
-    ``gkv``/``gs`` fully written (may be uninitialized), ``gape`` zero-initialized
-    (fp32 atomics), launch anchored in ``kv``'s device. ``nb_total == 0`` launches
-    nothing.
+    ``gkv``/``gs`` fully written (may be uninitialized). The atomic specialization
+    requires zero-initialized ``gape``; the deterministic specialization writes
+    caller workspace then fully overwrites ``gape``. Launches are anchored in ``kv``'s
+    device. ``nb_total == 0`` launches nothing.
     """
     if nb_total == 0:
         return
     dev = kv.device.index
     schedule = _bwd_schedule_r128(ratio, d, coff, nb_total)
-    key = ("r128bwd", ratio, d, coff, schedule, dev)
+    key = ("r128bwd", ratio, d, coff, schedule, bool(deterministic), dev)
     total_tokens = kv.numel() // (coff * d)
     rows = _bwd_rows_per_cta(nb_total, ratio, d, coff, dev)
+    partial_buffer = workspace if deterministic else gape
     if stream_handle is None:
         stream_handle = _raw_stream(dev)
     with torch.cuda.device(dev):
@@ -1247,33 +1300,36 @@ def run_bwd_r128(kv, score, ape, cu_i, cuc_i, go, gkv, gs, gape, nb_total, ratio
             slots[5].value = go.data_ptr()
             slots[6].value = gkv.data_ptr()
             slots[7].value = gs.data_ptr()
-            slots[8].value = gape.data_ptr()
+            slots[8].value = partial_buffer.data_ptr()
             slots[9].value = nb_total
             slots[10].value = cu_i.numel() - 1
             slots[11].value = total_tokens
             slots[12].value = rows
             slots[13].value = stream_handle
             launcher.launch()
-            return
-        stream = cuda_driver.CUstream(stream_handle)
-        args = (
-            _bf16_ptr(kv),
-            _bf16_ptr(score),
-            _f32_ptr(ape),
-            _i32_ptr(cu_i),
-            _i32_ptr(cuc_i),
-            _bf16_ptr(go),
-            _bf16_ptr(gkv),
-            _bf16_ptr(gs),
-            _f32_ptr(gape),
-            cutlass.Int32(nb_total),
-            cutlass.Int32(cu_i.numel() - 1),
-            cutlass.Int32(total_tokens),
-            cutlass.Int32(rows),
-            stream,
-        )
-        fn = _COMPILED.get(key)
-        if fn is None:
-            fn = _compile_bwd_r128(key, args, ratio, d, coff, schedule)
-        fn(*args)
-        _FAST.put(key, fn, args)
+        else:
+            stream = cuda_driver.CUstream(stream_handle)
+            args = (
+                _bf16_ptr(kv),
+                _bf16_ptr(score),
+                _f32_ptr(ape),
+                _i32_ptr(cu_i),
+                _i32_ptr(cuc_i),
+                _bf16_ptr(go),
+                _bf16_ptr(gkv),
+                _bf16_ptr(gs),
+                _f32_ptr(partial_buffer),
+                cutlass.Int32(nb_total),
+                cutlass.Int32(cu_i.numel() - 1),
+                cutlass.Int32(total_tokens),
+                cutlass.Int32(rows),
+                stream,
+            )
+            fn = _COMPILED.get(key)
+            if fn is None:
+                fn = _compile_bwd_r128(key, args, ratio, d, coff, schedule, deterministic)
+            fn(*args)
+            _FAST.put(key, fn, args)
+        if deterministic:
+            partials = (nb_total + rows - 1) // rows
+            _run_dape_reduce(workspace, gape, partials, ratio * coff * d, stream_handle)

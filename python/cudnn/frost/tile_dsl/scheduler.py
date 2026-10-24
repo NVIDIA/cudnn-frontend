@@ -56,6 +56,9 @@ def lpt_l2_tile_coords(linear, q_h, batch, q_tiles, heads_per_kv, seqlen_kv, kv_
             ag_min1.ir_value(),
         )
     )
+    # Same block count, groups spread evenly: a short last block leaves SMs idle at the tail.
+    budget_blocks = (num_groups + active_groups - cutlass.Int32(1)) // active_groups
+    active_groups = (num_groups + budget_blocks - cutlass.Int32(1)) // budget_blocks
 
     tiles_per_grp = q_tiles * heads_per_kv
     tiles_per_blk = active_groups * tiles_per_grp
@@ -194,6 +197,43 @@ def read_tile_id_arrive(mb, cga_size: int, predicated: cutlass.Constexpr[bool] =
             "mbarrier.arrive.release.cta.shared::cluster.b64 _, [{$r0}];",
             read_only_args=[peer_mb],
             predicate=pred,
+        )
+
+
+@cute.jit
+def read_tile_id_arrive_on_leader(mb, cga_size: int, predicated: cutlass.Constexpr[bool] = True):
+    """Credit the sole CLC publisher from a converged warp.
+
+    Dense CLC has no peer scheduler role. Its workers still wait for their
+    local payload, but credit only CTA 0 after decoding it. Peer credit
+    barriers receive zero arrives, never complete, and have no waiters.
+    Persistent THD and local predecode schedulers must keep the broadcast
+    helper above. As there, ``predicated`` selects the branch or predicated
+    DSL form; ptxas may if-convert a single-target branch. Both forms issue
+    one release-arrive to CTA 0 per warp.
+    """
+    if cutlass.const_expr(cga_size == 1):
+        if nvvm.elect_sync():
+            nvvm.mbarrier_arrive(mb)
+    elif cutlass.const_expr(not predicated):
+        lane = cute.arch.thread_idx()[0] & cutlass.Int32(31)
+        if lane == cutlass.Int32(0):
+            peer_mb = nvvm.mapa(mb, cutlass.Int32(0))
+            nvvm.mbarrier_arrive(peer_mb, scope=nvvm.MemScope.CTA)
+    else:
+        # Keep the broadcast helper's lane/address geometry for codegen.
+        # Only peer zero's designated lane arrives; other lanes merely map a
+        # valid shared address. Narrowing the predicate preserves CTA-0-only
+        # credits; this spelling avoids the extra softmax spills seen when
+        # the mapped address is uniform (DSL 4.7.0, sm_100a/sm_103a).
+        lane_stride, shift = _read_tile_id_lane_geometry(cga_size)
+        lane = cute.arch.thread_idx()[0] & cutlass.Int32(31)
+        peer = lane >> cutlass.Int32(shift)
+        peer_mb = nvvm.mapa(mb, peer)
+        nvvm.inline_ptx(
+            "mbarrier.arrive.release.cta.shared::cluster.b64 _, [{$r0}];",
+            read_only_args=[peer_mb],
+            predicate=((lane & cutlass.Int32(lane_stride - 1)) == cutlass.Int32(0)) & (peer == cutlass.Int32(0)),
         )
 
 
@@ -358,7 +398,10 @@ def scheduler_warp_loop(sched, sched_stages: int, is_cga_first_cta, cga_size: in
     argument turns that into a trace-time error rather than a cluster hang.
     """
     state = PipelineState.start()
-    is_valid = cutlass.Int32(1)
+    # Only the leader publishes CLC responses. Peer scheduler warps are not
+    # counted in read_tile_id credits, so letting them observe the ring lets
+    # the producer lap their parity wait. They have no work to do here.
+    is_valid = cutlass.Int32(is_cga_first_cta)
 
     while is_valid > cutlass.Int32(0):
         wait(sched.mb_read_tile_id.subview(state.idx), state.phase)

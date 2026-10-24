@@ -27,6 +27,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from cudnn.frost.tile_dsl.thd import THD_BWD_META_WORDS
 
 from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell
 
@@ -849,7 +850,7 @@ def _thd_meta_words(case, h, chunk, seen):
     delta = ws_align(h * (-(-case.cap_q // 128) * 128) * 4)
     slab = ws_align(chunk * seen["ws_rows"] * seen["s_kv"] * seen["bpe"])
     off = delta + 2 * slab
-    return case.workspace[off : off + (5 * b + 5) * 4].view(torch.int32).cpu()
+    return case.workspace[off : off + THD_BWD_META_WORDS(b) * 4].view(torch.int32).cpu()
 
 
 def _clusters():

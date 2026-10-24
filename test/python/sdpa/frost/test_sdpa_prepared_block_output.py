@@ -91,8 +91,8 @@ def _fp8_case(
     arch = "sm107" if cc == (10, 7) else "sm100" if cc in ((10, 0), (10, 3)) else "sm120"
     if cc not in ((10, 0), (10, 3), (10, 7), (12, 0), (12, 1)):
         pytest.skip("block-scaled output needs a supported Blackwell or Rubin GPU")
-    if mxfp8 and cc[0] == 12:
-        pytest.skip("SM120 has no MXFP8 input engine")
+    if mxfp8 and cc[0] == 12 and block == 16:
+        pytest.skip("SM120 MXFP8 serves the MXFP8 (32-element) O only; the NVFP4 O is per-tensor only")
     generator = torch.Generator(device="cuda").manual_seed(397)
     d = 128
     cols = d // block

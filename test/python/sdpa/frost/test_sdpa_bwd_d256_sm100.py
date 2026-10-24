@@ -255,6 +255,20 @@ def test_reject_thd(monkeypatch):
     assert _decline_reason(monkeypatch, thd=True) is not None
 
 
+@pytest.mark.parametrize("dt", _DTYPES, ids=_DTYPE_IDS)
+@pytest.mark.parametrize("kv_heads", [4, 2], ids=["mha", "gqa"])
+def test_standalone_adapter_rejects_thd(dt, kv_heads):
+    """A direct adapter must decline packed THD even when no graph capability filter runs."""
+    from cudnn.sdpa.bwd.api_dsl_sm100_d256 import SdpaBwdDslSm100D256
+    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107
+
+    options = dict(hq=4, hkv=kv_heads, dt=dt, thd=True, max_total_seq_len_q=1024, max_total_seq_len_kv=1024)
+    # These descriptors are valid for the parent row that implements packed THD.
+    assert _adapter(SdpaBwdDslSm107, **options).check_support()
+    with pytest.raises(ValueError, match="sdpa_bwd_sm100_d256: THD / ragged is not implemented"):
+        _adapter(SdpaBwdDslSm100D256, **options).check_support()
+
+
 def test_reject_decode_shaped(monkeypatch):
     assert _decline_reason(monkeypatch, sq=1) is not None
 
@@ -653,6 +667,261 @@ def test_prepared_backward_artifact_reloads_in_fresh_process(dtype, tmp_path):
 
 
 # =========================================================================== adapter host pins
+
+
+def test_head_subgroups_preserve_whole_group_choices_and_cover_each_kv_group():
+    from cudnn.sdpa.bwd.api_dsl_sm107 import _sm107_chunks
+    from cudnn.sdpa.bwd.config_sm107 import validate_head_chunk
+
+    per_head = 256 * 512 * 2
+    for group in (1, 2, 3, 4, 8):
+        hq, hkv = 2 * group, 2
+        for batch in (1, 2, 5):
+            for budget in (0, per_head // 2, per_head, 2 * per_head, group * per_head - 1, group * per_head, 2 * batch * group * per_head):
+                old = _sm107_chunks(batch, hq, group, 256, 512, 2, budget=budget)
+                new = _sm107_chunks(batch, hq, group, 256, 512, 2, budget=budget, allow_subgroups=True)
+                if group * per_head <= budget:
+                    assert new == old, (group, batch, budget, old, new)
+                else:
+                    assert new[0] == 1
+                    fitting = [n for n in range(1, group + 1) if group % n == 0 and n * per_head <= budget]
+                    assert new[1] == max(fitting, default=1)
+                bc, hc = new
+                validate_head_chunk(hq, hkv, hc, allow_subgroups=True)
+                assert batch % bc == hq % hc == 0
+                assert _sm107_chunks(batch, hq, group, 256, 512, 2, budget=budget, batch_chunking=False, allow_subgroups=True) == _sm107_chunks(
+                    batch, hq, group, 256, 512, 2, budget=budget, batch_chunking=False
+                ), "packed/non-batch-chunking rows retain whole groups"
+                visited = []
+                for hb in range(0, hq, hc):
+                    for local in range(hc):
+                        qh = hb + local
+                        assert hb // group + local // group == qh // group
+                        visited.append(qh)
+                assert visited == list(range(hq)), "all global per-Q-head partials must be written before the single fold"
+
+
+@pytest.mark.parametrize("h_q,h_kv,chunk", [(0, 1, 1), (8, 0, 1), (7, 2, 1), (8, 2, 0), (8, 2, 3), (12, 2, 4)])
+def test_head_subgroups_reject_invalid_or_crossing_chunks(h_q, h_kv, chunk):
+    from cudnn.sdpa.bwd.config_sm107 import validate_head_chunk
+
+    with pytest.raises(ValueError):
+        validate_head_chunk(h_q, h_kv, chunk, allow_subgroups=True)
+
+
+def test_head_subgroups_remain_an_explicit_validation_contract():
+    from cudnn.sdpa.bwd.config_sm107 import validate_head_chunk
+
+    for chunk in (1, 2):
+        with pytest.raises(ValueError, match="multiple of the GQA group"):
+            validate_head_chunk(8, 2, chunk)
+        validate_head_chunk(8, 2, chunk, allow_subgroups=True)
+
+
+def test_head_subgroup_rule_is_scoped_and_workspace_is_honest(monkeypatch):
+    from cudnn.sdpa.bwd import api_dsl_sm107 as sm107, prepared_sm107 as prepared
+    from cudnn.sdpa.bwd.api_dsl_sm100_d256 import SdpaBwdDslSm100D256
+
+    def plan(sequence=131072, **kwargs):
+        return _adapter(SdpaBwdDslSm100D256, b=4, hq=8, hkv=2, sq=sequence, skv=sequence, **kwargs)
+
+    for cc in (100, 103, 106):
+        monkeypatch.setattr(prepared, "_sm", lambda _api, value=cc: value)
+        candidate = plan()
+        assert (candidate._b_chunk, candidate._qh_chunk) == (1, 1)
+        with monkeypatch.context() as old:
+            old.setattr(SdpaBwdDslSm100D256, "_allow_head_subgroups", lambda _api: False)
+            # Isolate the subgroup dS saving from the independent whole-group
+            # partial-buffer reuse policy.
+            old.setattr(SdpaBwdDslSm100D256, "_chunk_partials_enabled", lambda _api: False)
+            baseline = plan()
+            baseline_workspace = baseline.scratch_workspace_bytes()
+        assert (baseline._b_chunk, baseline._qh_chunk) == (1, 4)
+        assert baseline_workspace - candidate.scratch_workspace_bytes() == 96 * 2**30
+        for sequence in (2048, 4096, 8192, 16384, 32768):
+            api = plan(sequence)
+            with monkeypatch.context() as old:
+                old.setattr(SdpaBwdDslSm100D256, "_allow_head_subgroups", lambda _api: False)
+                original = plan(sequence)
+            assert (api._b_chunk, api._qh_chunk, api.scratch_workspace_bytes()) == (original._b_chunk, original._qh_chunk, original.scratch_workspace_bytes())
+        assert plan(dt=torch.float16)._qh_chunk == 4
+        with monkeypatch.context() as per_member:
+            per_member.setattr(sm107, "DQ_SINGLE_LAUNCH", False)
+            assert plan()._qh_chunk == 4
+        assert not plan(thd=True)._allow_head_subgroups()
+    for cc in (90, 107, 110, 120):
+        monkeypatch.setattr(prepared, "_sm", lambda _api, value=cc: value)
+        assert plan()._qh_chunk == 4
+    monkeypatch.setattr(prepared, "_sm", lambda _api: 100)
+    assert not _adapter(sm107.SdpaBwdDslSm107, hq=8, hkv=2)._allow_head_subgroups()
+
+
+def test_chunk_partials_workspace_and_subgroup_boundary(monkeypatch):
+    from cudnn.sdpa.bwd import api_dsl_sm107 as sm107, prepared_sm107 as prepared
+    from cudnn.sdpa.bwd.api_dsl_sm100_d256 import SdpaBwdDslSm100D256
+
+    monkeypatch.setattr(prepared, "_sm", lambda _api: 100)
+    monkeypatch.setattr(sm107, "_SM107_WS_BUDGET_BYTES", 4 * 256 * 512 * 2)
+    kwargs = dict(b=2, hq=8, hkv=2, sq=256, skv=512)
+    candidate = _adapter(SdpaBwdDslSm100D256, **kwargs)
+    assert (candidate._b_chunk, candidate._qh_chunk) == (1, 4)
+    with monkeypatch.context() as old:
+        old.setattr(SdpaBwdDslSm100D256, "_chunk_partials_enabled", lambda _api: False)
+        baseline = _adapter(SdpaBwdDslSm100D256, **kwargs)
+        old_shapes = {name: shape for name, shape, _ in baseline._scratch_shapes()}
+        baseline_workspace = baseline.scratch_workspace_bytes()
+    new_shapes = {name: shape for name, shape, _ in candidate._scratch_shapes()}
+    assert old_shapes["ds_ws"] == new_shapes["ds_ws"]
+    for name in ("dk_part", "dv_part"):
+        assert old_shapes[name] == (2, 512, 8, 256)
+        assert new_shapes[name] == (1, 512, 4, 256), "Chunk partial workspace did not shrink"
+    assert baseline_workspace - candidate.scratch_workspace_bytes() == 2 * (2 * 8 - 1 * 4) * 512 * 256 * 2
+    for kw in (dict(dt=torch.float16), dict(thd=True), dict(hkv=8), dict(sq=255), dict(skv=511)):
+        control = _adapter(SdpaBwdDslSm100D256, **(kwargs | kw))
+        assert not control._chunk_partials_enabled()
+    # A chunk smaller than one GQA group cannot be folded independently.
+    monkeypatch.setattr(sm107, "_SM107_WS_BUDGET_BYTES", 256 * 512 * 2)
+    subgroup = _adapter(SdpaBwdDslSm100D256, **kwargs)
+    assert subgroup._qh_chunk == 1 and not subgroup._chunk_partials_enabled()
+    subgroup_shapes = {name: shape for name, shape, _ in subgroup._scratch_shapes()}
+    assert subgroup_shapes["dk_part"] == old_shapes["dk_part"]
+    assert subgroup_shapes["dv_part"] == old_shapes["dv_part"]
+
+
+@requires_pre_rubin_blackwell
+@pytest.mark.parametrize("b,hkv,group,budget_groups", [(2, 2, 4, 2), (4, 1, 4, 2), (2, 2, 4, 1), (2, 2, 2, 1)], ids=["heads", "batch", "both", "both-g2"])
+@pytest.mark.parametrize("mask", ["dense", "causal", "bottom-right", "window", "window-bottom-right"])
+def test_chunk_partials_match_full_partials(monkeypatch, b, hkv, group, budget_groups, mask):
+    """Reuse both partial buffers only after complete groups have been folded."""
+    from cudnn.sdpa.bwd import api_dsl_sm107 as sm107
+    from cudnn.sdpa.bwd.api_dsl_sm100_d256 import SdpaBwdDslSm100D256
+
+    sq, skv = 256, 512
+    monkeypatch.setattr(sm107, "_SM107_WS_BUDGET_BYTES", budget_groups * group * sq * skv * 2)
+    kwargs = dict(b=b, hq=hkv * group, hkv=hkv, sq=sq, skv=skv, poison=float("nan"), ws_poison=0xBD, runs=2)
+    if mask != "dense":
+        bottom_right = mask.endswith("bottom-right")
+        window = mask.startswith("window")
+        kwargs["keep"] = _causal_keep(sq, skv, bottom_right=bottom_right, **({"left": 128} if window else {}))
+        kwargs["use_causal_mask_bottom_right" if bottom_right else "use_causal_mask"] = True
+        if window:
+            kwargs["diagonal_band_left_bound"] = 128
+    seen = []
+    compile_plan = SdpaBwdDslSm100D256.compile
+
+    def compile_and_record(api):
+        result = compile_plan(api)
+        seen.append((api._chunk_partials_enabled(), api._b_chunk, api._qh_chunk, api.scratch_workspace_bytes()))
+        return result
+
+    monkeypatch.setattr(SdpaBwdDslSm100D256, "compile", compile_and_record)
+    with monkeypatch.context() as old:
+        old.setattr(SdpaBwdDslSm100D256, "_chunk_partials_enabled", lambda _api: False)
+        baseline = _run(**kwargs).check()
+    assert seen and all(not row[0] for row in seen)
+    baseline_plans = set(seen)
+    seen.clear()
+    candidate = _run(**kwargs).check()
+    assert seen and all(row[0] for row in seen)
+    assert len(set(seen)) == len(baseline_plans) == 1
+    (old_plan,) = baseline_plans
+    (new_plan,) = set(seen)
+    assert old_plan[1:3] == new_plan[1:3] and new_plan[3] < old_plan[3]
+    for before, after in zip(baseline.outs, candidate.outs):
+        for expected, actual in zip(before, after):
+            assert torch.equal(expected.view(torch.int16), actual.view(torch.int16))
+
+
+@requires_pre_rubin_blackwell
+def test_chunk_partials_preserve_per_member_dq(monkeypatch):
+    from cudnn.sdpa.bwd import api_dsl_sm107 as sm107
+
+    monkeypatch.setattr(sm107, "DQ_SINGLE_LAUNCH", False)
+    test_chunk_partials_match_full_partials(monkeypatch, 2, 2, 4, 1, "bottom-right")
+
+
+@requires_pre_rubin_blackwell
+def test_chunk_partials_rebind_stream_and_replay(monkeypatch):
+    from cudnn.sdpa.bwd import api_dsl_sm107 as sm107
+    from cudnn.sdpa.bwd.api_dsl_sm100_d256 import SdpaBwdDslSm100D256
+
+    monkeypatch.setattr(sm107, "_SM107_WS_BUDGET_BYTES", 2 * 512 * 512 * 2)
+    seen = []
+    compile_plan = SdpaBwdDslSm100D256.compile
+
+    def compile_and_record(api):
+        result = compile_plan(api)
+        seen.append(api._chunk_partials_enabled())
+        return result
+
+    monkeypatch.setattr(SdpaBwdDslSm100D256, "compile", compile_and_record)
+    test_prepared_rebind_stream_and_replay(torch.bfloat16, True)
+    assert seen and all(seen)
+
+
+@requires_pre_rubin_blackwell
+@pytest.mark.parametrize("group,chunk", [(2, 1), (3, 1), (4, 1), (4, 2), (8, 1), (8, 2), (8, 4)], ids=["g2c1", "g3c1", "g4c1", "g4c2", "g8c1", "g8c2", "g8c4"])
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+def test_head_subgroups_match_full_group_gradients(monkeypatch, group, chunk, causal):
+    """The same CPU-seeded inputs, all Q-head partials, poisoned workspace and a second launch."""
+    from cudnn.sdpa.bwd import api_dsl_sm107 as sm107
+    from cudnn.sdpa.bwd.api_dsl_sm100_d256 import SdpaBwdDslSm100D256
+
+    sq, skv = 256, 512
+    kwargs = dict(b=2, hq=2 * group, hkv=2, sq=sq, skv=skv, poison=float("nan"), ws_poison=0xBD, runs=2)
+    if causal:
+        kwargs.update(keep=_causal_keep(sq, skv), use_causal_mask=True)
+    original = _run(**kwargs).check()
+    seen = []
+    compile_plan = SdpaBwdDslSm100D256.compile
+
+    def compile_and_record(api):
+        result = compile_plan(api)
+        seen.append((api._b_chunk, api._qh_chunk, api._dq_b_head_group))
+        return result
+
+    monkeypatch.setattr(SdpaBwdDslSm100D256, "compile", compile_and_record)
+    monkeypatch.setattr(sm107, "_SM107_WS_BUDGET_BYTES", chunk * sq * skv * 2)
+    candidate = _run(**kwargs).check()
+    assert seen and set(seen) == {(1, chunk, group)}, seen
+    for reference, actual in zip(original.outs, candidate.outs):
+        for a, b in zip(reference, actual):
+            assert torch.equal(a.view(torch.int16), b.view(torch.int16))
+
+
+@requires_pre_rubin_blackwell
+@pytest.mark.parametrize("case", list(_MASK_POISON_CASES), ids=list(_MASK_POISON_CASES))
+def test_head_subgroups_preserve_mask_and_tail_gradients(monkeypatch, case):
+    from cudnn.sdpa.bwd import api_dsl_sm107 as sm107
+
+    shape, kwargs, keep = _mask_case_kw(_MASK_POISON_CASES[case])
+    shape.update(hq=8, hkv=2)
+    original = _run(**shape, **kwargs, keep=keep, poison=float("nan"), ws_poison=0xBD).check()
+    sq_pad = (shape["sq"] + 127) // 128 * 128
+    skv_pad = (shape["skv"] + 255) // 256 * 256
+    monkeypatch.setattr(sm107, "_SM107_WS_BUDGET_BYTES", sq_pad * skv_pad * 2)
+    candidate = _run(**shape, **kwargs, keep=keep, poison=float("nan"), ws_poison=0xBD).check()
+    for reference, actual in zip(original.outs[0], candidate.outs[0]):
+        assert torch.equal(reference.view(torch.int16), actual.view(torch.int16))
+
+
+@requires_pre_rubin_blackwell
+def test_head_subgroups_rebind_stream_replay_and_launch_count(monkeypatch):
+    from collections import Counter
+    from cudnn.sdpa.bwd import api_dsl_sm107 as sm107
+
+    # Force one Q head per chunk at small storage sizes through the real chooser.
+    monkeypatch.setattr(sm107, "_SM107_WS_BUDGET_BYTES", 512 * 512 * 2)
+    test_prepared_rebind_stream_and_replay(torch.bfloat16, True)
+    case = _prepared_case(b=2, hq=8, hkv=2, sq=512, skv=512)
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as profile:
+        case.graph.execute(case.pack, case.workspace)
+        torch.cuda.synchronize()
+    kernels = Counter(e.name for e in profile.events() if e.device_type == torch.autograd.DeviceType.CUDA)
+    for pattern, expected in (("cudnn_kernel__kernel", 16), ("bprop_matmul_bh_sm100_kernel", 32), ("dkv_reduce_kernel", 1)):
+        count = sum(n for name, n in kernels.items() if pattern in name)
+        assert count == expected, f"{pattern}: expected {expected}, observed {count}; {kernels}"
+    _check_prepared(case)
 
 
 @pytest.mark.parametrize(
@@ -1097,6 +1366,27 @@ def test_masked_arm_lowers_to_the_bit_word_form(tmp_path, arch, profile, mask):
     assert stats["R2P"] > 0, f"{arch} p{profile} {mask}: no R2P in the masked build -- the mask arm is the per-cell compare + select form"
 
 
+_RUBIN_PROFILE_PROBE = textwrap.dedent(r"""
+    from cudnn.frost.template_loader import load_template
+    from cudnn.frost.tile_dsl.constants import DTYPE_BF16
+    from cudnn.sdpa.bwd.api_dsl import _sm100_kernel_path
+    from cudnn.sdpa.bwd.config_sm107 import TemplateParams
+
+    mod = load_template(
+        _sm100_kernel_path("bprop_d256_2x2_f16.py"),
+        TemplateParams(dtype_qkv=DTYPE_BF16, datapath_2x2_profile=2),
+        tag="rubin_profile_trace",
+    )
+    assert mod.DESC_VERSION == 1 and mod.CFG.KV_SUBBLOCKS == 2 and mod.COLS_PER_LANE == 64 and mod.L_CNT == 256
+    try:
+        mod.compile(b=1, qh=2, kh=2, sq=256, skv=256)
+    except AttributeError as e:
+        if "tcgen05_mma_smem_desc_v2" not in str(e):
+            raise
+        print(f"SKIP profile 2 needs the version-1 tcgen05 SMEM descriptor intrinsic (nvidia-cutlass-dsl >= 4.8.0): {e}")
+""")
+
+
 def test_rubin_profile_traces_or_names_the_missing_dsl_intrinsic():
     """Rule S6: profile 2 (the Rubin interleaved twin) traces from this box.  Its descriptor version 1 lowers through the
     DSL's ``_tcgen05_mma_smem_desc_v2`` intrinsic (>= 4.8.0); a DSL without it fails the trace with that name, which this
@@ -1104,11 +1394,166 @@ def test_rubin_profile_traces_or_names_the_missing_dsl_intrinsic():
     PASSED on a cc 10.7 board 2026-10-01 (internal DSL 0.3.0: the trace at the device's sm_107a),
     where the twin's GPU matrix (``test_sdpa_bwd_dsl_sm107.py -k twox2``) and the sm_107a SASS rows above also ran -- the
     SKIP here is a 4.7.0-CI accommodation, not an untested path."""
-    mod = _load_kernel(2)
-    assert mod.DESC_VERSION == 1 and mod.CFG.KV_SUBBLOCKS == 2 and mod.COLS_PER_LANE == 64 and mod.L_CNT == 256
+    # Select before DSL import, independently of the runner GPU or an inherited target.
+    arch = "sm_107a" if arch_known_to_the_dsl("sm_107a") else "sm_100a"
+    env = dict(os.environ, CUTE_DSL_ARCH=arch, CUDNN_FRONTEND_DISABLE_COMPILED_CACHE="1")
+    proc = subprocess.run([sys.executable, "-c", _RUBIN_PROFILE_PROBE], capture_output=True, text=True, timeout=1500, env=env)
+    assert proc.returncode == 0, f"{arch} profile-2 trace failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
+    for line in proc.stdout.splitlines():
+        if line.startswith("SKIP "):
+            pytest.skip(line.removeprefix("SKIP "))
+
+
+# Batch-pitched BSHD views: the physical buffers retained by CP AllGather.
+_PITCH_ROLES = ("q", "k", "v", "o", "do", "stats", "dq", "dk", "dv")
+
+
+def _batch_pitch_case(sq, sk, kv_heads, dt, seed):
+    batch, pq, pk, heads, dim = 2, 256, 512, 8, 256
+    origin = 0 if sk <= pk // 2 else 128
+    gen = torch.Generator().manual_seed(seed)
+    cpu = {}
+    for role in ("q", "k", "v", "do"):
+        pitch, h = (pk, kv_heads) if role in ("k", "v") else (pq, heads)
+        cpu[role] = (torch.randn(batch, pitch, h, dim, generator=gen) * 0.5).to(dt)
+
+    def view(base, role):
+        begin, length = (0, sk) if role in ("k", "v", "dk", "dv") else (origin, sq)
+        return base[:, begin : begin + length].permute(0, 2, 1, 3)
+
+    q, k, v = [view(cpu[role], role).double().requires_grad_() for role in ("q", "k", "v")]
+    do = view(cpu["do"], "do").double()
+    group = heads // kv_heads
+    scores = q @ k.repeat_interleave(group, 1).transpose(-1, -2) * dim**-0.5
+    scores = scores.masked_fill(torch.arange(sk)[None, :] > torch.arange(sq)[:, None] + sk - sq, -torch.inf)
+    lse = scores.logsumexp(-1)
+    output = scores.softmax(-1) @ v.repeat_interleave(group, 1)
+    expected = torch.autograd.grad(output, (q, k, v), do)
+    for role in ("q", "k", "v", "do"):
+        begin, length = (0, sk) if role in ("k", "v") else (origin, sq)
+        cpu[role][:, :begin].fill_(13)
+        cpu[role][:, begin + length :].fill_(13)
+    cpu["o"] = torch.full_like(cpu["q"], 11)
+    view(cpu["o"], "o").copy_(output.detach().to(dt))
+    for role, base in (("dq", "q"), ("dk", "k"), ("dv", "v")):
+        cpu[role] = torch.full_like(cpu[base], 7)
+    bases = {role: value.cuda() for role, value in cpu.items()}
+    values = {role: view(base, role) for role, base in bases.items()}
+    values["stats"] = lse.detach().float().unsqueeze(-1).contiguous().cuda()
+    return bases, values, expected, origin
+
+
+def _batch_pitch_graph(values, dt):
+    dtype = cudnn.data_type.BFLOAT16 if dt == torch.bfloat16 else cudnn.data_type.HALF
+    graph = cudnn.pygraph(io_data_type=dtype, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    refs = {
+        role: graph.tensor(
+            name=role, dim=list(values[role].shape), stride=list(values[role].stride()), data_type=cudnn.data_type.FLOAT if role == "stats" else dtype
+        )
+        for role in _PITCH_ROLES[:6]
+    }
+    outputs = graph.sdpa_backward(
+        q=refs["q"],
+        k=refs["k"],
+        v=refs["v"],
+        o=refs["o"],
+        dO=refs["do"],
+        stats=refs["stats"],
+        attn_scale=256**-0.5,
+        use_causal_mask_bottom_right=True,
+        use_deterministic_algorithm=False,
+    )
+    for role, tensor in zip(_PITCH_ROLES[6:], outputs):
+        tensor.set_output(True).set_data_type(dtype).set_dim(list(values[role].shape)).set_stride(list(values[role].stride()))
+        refs[role] = tensor
+    graph.validate()
+    graph.build_operation_graph()
+    graph.create_execution_plan(_ENGINE_ID, {})
+    graph.build_plans()
+    assert graph._compiled_plans[graph._plan_index]._prepared.spec.name == _ENGINE
+    return graph, refs
+
+
+@requires_pre_rubin_blackwell
+@pytest.mark.parametrize("dt", _DTYPES, ids=_DTYPE_IDS)
+@pytest.mark.parametrize("kv_heads", [8, 2], ids=["mha", "gqa"])
+@pytest.mark.parametrize("sq,sk", [(128, 128), (128, 256), (128, 384), (128, 512), (96, 129)])
+def test_batch_pitch_rebind_and_replay(cudnn_handle, dt, kv_heads, sq, sk):
+    """CPU FP64 gradients and untouched physical holes under fresh bindings and poisoned-workspace replay.
+
+    Relaxing the old layout check alone fails on the second batch: the padding helper must preserve source AND destination
+    strides. The 96x129 arm exercises Q/dO and KV padding together; the other arms cover all four CP2 AllGather geometries.
+    """
+    bases, values, expected, origin = _batch_pitch_case(sq, sk, kv_heads, dt, 71)
+    graph, refs = _batch_pitch_graph(values, dt)
+    workspace = torch.empty(max(graph.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
+    stream, other = torch.cuda.Stream(), torch.cuda.Stream()
+    original_stream = cudnn.get_stream(cudnn_handle)
+    capture = None
+
+    def check():
+        for role in ("q", "k", "v", "o", "do"):
+            begin, length = (0, sk) if role in ("k", "v") else (origin, sq)
+            storage = bases[role].cpu()
+            canary = 11 if role == "o" else 13
+            assert (storage[:, :begin] == canary).all() and (storage[:, begin + length :] == canary).all(), role
+        for role, reference in zip(("dq", "dk", "dv"), expected):
+            actual = values[role].double().cpu()
+            torch.testing.assert_close(actual, reference, atol=0.025, rtol=0.025)
+            rrms = (actual - reference).square().mean().sqrt() / reference.square().mean().sqrt().clamp_min(1e-8)
+            assert rrms.item() < 0.02, (role, rrms)
+            begin, length = (0, sk) if role in ("dk", "dv") else (origin, sq)
+            storage = bases[role].cpu()
+            assert (storage[:, :begin] == 7).all() and (storage[:, begin + length :] == 7).all(), role
+
     try:
-        mod.compile(b=1, qh=2, kh=2, sq=256, skv=256)
-    except AttributeError as e:
-        if "tcgen05_mma_smem_desc_v2" in str(e):
-            pytest.skip(f"profile 2 needs the version-1 tcgen05 SMEM descriptor intrinsic (nvidia-cutlass-dsl >= 4.8.0): {e}")
-        raise
+        cudnn.set_stream(cudnn_handle, stream.cuda_stream)
+        for seed in (71, 89):
+            if seed != 71:
+                bases, values, expected, origin = _batch_pitch_case(sq, sk, kv_heads, dt, seed)
+            pack = {refs[role]: value for role, value in values.items()}
+            workspace.fill_(0xBD)
+            stream.wait_stream(torch.cuda.current_stream())
+            other.wait_stream(torch.cuda.current_stream())
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                with torch.cuda.stream(other):
+                    graph.execute(pack, workspace, handle=cudnn_handle)
+            finally:
+                torch.cuda.set_sync_debug_mode("default")
+            torch.cuda.current_stream().wait_stream(stream)
+            check()
+            stream.wait_stream(torch.cuda.current_stream())
+            capture = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(capture, stream=stream):
+                with torch.cuda.stream(other):
+                    graph.execute(pack, workspace, handle=cudnn_handle)
+            for role in ("dq", "dk", "dv"):
+                bases[role].fill_(7)
+            workspace.fill_(0xA5)
+            capture.replay()
+            torch.cuda.synchronize()
+            check()
+            capture.reset()
+            capture = None
+    finally:
+        if capture is not None:
+            capture.reset()
+        cudnn.set_stream(cudnn_handle, original_stream)
+
+
+@pytest.mark.parametrize("role", ["q", "k", "v", "o", "do", "dq", "dk", "dv"])
+@pytest.mark.parametrize("invalid", ["overlap", "alignment", "token", "head", "element"])
+def test_batch_pitch_rejects_invalid_port_strides(role, invalid):
+    """Every data port must retain compact rows and a nonoverlapping, 16-byte aligned batch pitch."""
+    from dataclasses import replace
+    from cudnn.sdpa.bwd.api_dsl_sm100_d256 import SdpaBwdDslSm100D256
+
+    api = _adapter(SdpaBwdDslSm100D256)
+    desc = getattr(api, role + "_desc")
+    strides = list(desc.stride)
+    axis, delta = {"overlap": (0, -8), "alignment": (0, 1), "token": (2, 8), "head": (1, 8), "element": (3, 1)}[invalid]
+    strides[axis] += delta
+    setattr(api, role + "_desc", replace(desc, stride=tuple(strides)))
+    with pytest.raises(ValueError, match="BSHD-physical"):
+        api.check_support()

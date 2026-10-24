@@ -153,6 +153,43 @@ def test_the_record_carries_the_in_process_calling_convention():
     assert cc._rebuild_wrapper(lambda *a: None, None) is None  # an entry from before the record carried a spec is a miss
 
 
+def test_constexpr_dataclasses_do_not_change_the_reloaded_runtime_abi():
+    import inspect
+    from dataclasses import dataclass
+    from types import SimpleNamespace
+
+    import cutlass
+    from cutlass.base_dsl.jit_executor import ExecutionArgs
+
+    @dataclass
+    class Config:
+        tile: int = 64
+
+    def host(config: cutlass.Constexpr, x: int, *, stream: int):
+        pass
+
+    def runtime_wrapper(x, *, stream):
+        pass
+
+    execution_args = ExecutionArgs(inspect.signature(host), "host")
+    if not hasattr(execution_args, "get_rectified_args_from_original_args"):
+        pytest.skip("this DSL executor cannot identify constexpr dataclass arguments")
+    compiled = SimpleNamespace(execution_args=execution_args, _kwargs_wrapper=runtime_wrapper)
+    spec = cc._wrapper_spec_of(compiled, (Config(), 7), {"stream": 11, "options": "--enable-tvm-ffi"})
+    assert spec == {"arg_names": ["x"], "arg_defaults": [], "kwonly_names": ["stream"], "kwonly_defaults": {}}
+    calls = []
+    reloaded = cc._rebuild_wrapper(lambda *args: calls.append(args), spec)
+    reloaded(7, stream=11)
+    assert calls == [(7, 11)]
+
+    def runtime_host(config, x: int, *, stream: int):
+        pass
+
+    compiled.execution_args = ExecutionArgs(inspect.signature(runtime_host), "runtime_host")
+    compiled._kwargs_wrapper = runtime_host
+    assert cc._wrapper_spec_of(compiled, (Config(), 7), {"stream": 11}) is None
+
+
 def test_template_key_joins_the_digest_with_plain_arguments_only():
     g = {"FROST_SOURCE_DIGEST": "abc123"}
     key = cc.template_key(g, {"b": 2, "qh": 8, "lse_stride": (1, 2, 3), "flag": True, "opt": None}, "compile")
@@ -307,7 +344,7 @@ def test_the_memo_hands_out_the_same_object_without_a_second_compile(monkeypatch
 
 
 def test_the_memo_sits_in_front_of_an_enabled_on_disk_cache(monkeypatch, tmp_path):
-    """With the files ON, the second call never reaches them: one miss, one load attempt."""
+    """With the files ON, the second call never reaches them."""
     calls, loads = [], []
     _fake_compile(monkeypatch, calls)  # the fake object has no export_to_c: a miss stores nothing and returns it
     monkeypatch.setattr(cc, "environment_manifest", lambda device=None: {"schema": cc._SCHEMA, "cudnn_frontend": "1.30.0", "cutlass_dsl": "4.8.0"})
@@ -317,10 +354,12 @@ def test_the_memo_sits_in_front_of_an_enabled_on_disk_cache(monkeypatch, tmp_pat
     try:
         cc.reset_stats()
         first = cc.compile_cached(lambda: None, 1, cache_key="k", options="--enable-tvm-ffi")
+        loads_after_first = len(loads)
+        assert loads_after_first > 0
         second = cc.compile_cached(lambda: None, 1, cache_key="k", options="--enable-tvm-ffi")
     finally:
         cc.set_cache_dir(None)
-    assert second is first and len(calls) == 1 and len(loads) == 1
+    assert second is first and len(calls) == 1 and len(loads) == loads_after_first
     assert cc.stats()["misses"] == 1 and cc.stats()["hits"] == 0 and cc.stats()["memo_hits"] == 1
 
 

@@ -159,12 +159,19 @@ def _dtype_name_to_cutlass_data_type(data_type, interpret_uint8_as_fp4x2: bool =
     return _get_dtype_name_to_cutlass_dict().get(name, None)
 
 
-# Returns None in case mapping is not available
-def _torch_to_cudnn_data_type(torch_data_type) -> cudnn_data_type:
+def torch_to_cudnn_data_type(torch_data_type) -> cudnn_data_type:
+    """The ``cudnn.data_type`` of a ``torch.dtype`` (``torch.bfloat16`` -> ``BFLOAT16``, ``torch.float8_e4m3fn`` ->
+    ``FP8_E4M3``, ...), or None when torch is not installed or the dtype has no cuDNN twin.
+
+    The public spelling of the mapping an integration reads to declare graph tensors from torch buffers; the private
+    name below is kept as an alias of it, so a caller written against that spelling keeps working."""
     if is_torch_available():
         return _torch_to_cudnn_data_type_dict.get(torch_data_type, None)
-    else:
-        return None
+    return None
+
+
+# Kept: a private name read outside this package is still a caller boundary (AGENTS.md Rule 9).
+_torch_to_cudnn_data_type = torch_to_cudnn_data_type
 
 
 # cuDNN enum -> the dtype NAME frost.buffers speaks (its DTYPES table is keyed

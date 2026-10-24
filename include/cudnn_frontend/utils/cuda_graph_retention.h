@@ -5,9 +5,13 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -16,7 +20,59 @@
 #include "../../cudnn_frontend_shim.h"
 
 namespace cudnn_frontend {
+
+//! How the CUDA graphs recorded from a graph's execution plans keep the plans' resources alive.
+//!
+//! A CUDA graph recorded from a graph (by populate_cuda_graph()/update_cuda_graph(), or by stream capture
+//! of execute()) keeps launching its execution plans' kernels for as long as the CUDA graph, any clone of
+//! it, or any graph exec instantiated from it exists. cuDNN releases runtime-compiled code with the plan.
+//!
+//! - PER_GRAPH (default): each such CUDA graph holds a reference (a CUDA user object) to what it uses, so
+//!   it stays valid after the graph is destroyed. Launching a CUDA graph that holds a user object takes
+//!   slightly longer.
+//! - NONE: no references. Until every CUDA graph recorded from the graph, and every clone and graph exec of
+//!   one, has finished its last launch and been destroyed, the application keeps the graph's execution plans
+//!   and host-copy data alive and unchanged. Keeping the Graph object alive is not enough if it is rebuilt or
+//!   deserialized again in the meantime: that replaces them, so retire the old CUDA graphs first.
+//!
+//! Set per graph with Graph::set_cuda_graph_retention(). Otherwise the CUDNN_CUDA_GRAPH_RETENTION
+//! environment variable ("per_graph" or "none"), which the cuDNN backend reads too, selects the mode.
+enum class CudaGraphRetention_t { PER_GRAPH, NONE };
+
 namespace detail {
+
+//! The mode selected by the CUDNN_CUDA_GRAPH_RETENTION environment variable, if any (read once). The
+//! variable is shared with the cuDNN backend (9.28+), which applies it to its own retention.
+inline std::optional<CudaGraphRetention_t>
+cuda_graph_retention_from_environment() {
+    static const std::optional<CudaGraphRetention_t> retention = []() -> std::optional<CudaGraphRetention_t> {
+        const char *value = get_environment("CUDNN_CUDA_GRAPH_RETENTION");
+        if (value == nullptr) {
+            return std::nullopt;
+        }
+        std::string lower(value);
+        std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        if (lower == "per_graph") {
+            return CudaGraphRetention_t::PER_GRAPH;
+        }
+        if (lower == "none") {
+            return CudaGraphRetention_t::NONE;
+        }
+        return std::nullopt;  // invalid values are ignored (the backend warns about them)
+    }();
+    return retention;
+}
+
+//! The mode in effect: `explicit_retention` if set, else the environment variable, else PER_GRAPH.
+inline CudaGraphRetention_t
+effective_cuda_graph_retention(std::optional<CudaGraphRetention_t> const &explicit_retention) {
+    if (explicit_retention.has_value()) {
+        return *explicit_retention;
+    }
+    return cuda_graph_retention_from_environment().value_or(CudaGraphRetention_t::PER_GRAPH);
+}
 
 // Keeps a host-side resource alive for as long as any CUDA graph that was recorded against it
 // exists, including graphExecs instantiated from it and clones of it.
@@ -35,13 +91,28 @@ namespace detail {
 // read from.
 //
 // CUDA forbids CUDA API calls in user-object destructors, and releasing a payload may make them
-// (e.g. cudnnBackendDestroyDescriptor frees device memory). The destructor therefore only
-// queues the payload. Those calls would also invalidate an active stream capture, so the queue
-// is drained by the next execution that is NOT being captured. A payload queued after the last
-// such execution stays alive until process exit.
+// (e.g. cudnnBackendDestroyDescriptor frees device memory and unloads code). The destructor
+// therefore only queues the payload, and the next destruction of a CudaGraphRetainedResource's
+// owner (an execution plan, a graph's host-copy storage, ...) releases it. Not an execution:
+// freeing memory or unloading code waits for all work on the device, and would make an otherwise
+// asynchronous execute block on, or deadlock with, unrelated streams. A payload queued after the
+// last such destruction stays alive until process exit.
 class CudaGraphRetainedResource {
    public:
     CudaGraphRetainedResource() = default;
+
+    // Destroying an owner is when payloads that graphs handed back are released (see class
+    // comment), this one's included if no graph holds it any more.
+    ~CudaGraphRetainedResource() {
+        state.reset();
+        drain_deferred_releases();
+    }
+    CudaGraphRetainedResource(CudaGraphRetainedResource const &) = default;
+    CudaGraphRetainedResource(CudaGraphRetainedResource &&)      = default;
+    CudaGraphRetainedResource &
+    operator=(CudaGraphRetainedResource const &) = default;
+    CudaGraphRetainedResource &
+    operator=(CudaGraphRetainedResource &&) = default;
 
     // Give `graph` one reference to the payload. `make_payload()` is invoked once, on the first
     // call, and must return a non-null std::shared_ptr<void> (or convertible) that owns
@@ -73,8 +144,7 @@ class CudaGraphRetainedResource {
         return cuda_graph_retain_user_object(graph, state->user_object, 1, /*flags=*/0);
     }
 
-    // Same as retain_on_graph() for the graph `stream` is currently capturing into. When the
-    // stream is not capturing, this is the point at which queued payloads are released instead.
+    // Same as retain_on_graph() for the graph `stream` is currently capturing into, if any.
     template <typename MakePayload>
     cudaError_t
     retain_on_capturing_stream(cudaStream_t stream, MakePayload &&make_payload) {
@@ -83,17 +153,12 @@ class CudaGraphRetainedResource {
         cudaError_t const query_status         = cuda_stream_get_capture_info(stream, &capture_status, &capture_graph);
         if (query_status == cudaErrorStreamCaptureImplicit) {
             // Legacy default stream while another stream captures in global mode: not our
-            // capture, and not a safe moment to release anything either. The recorded work
-            // itself reports the problem if there is one.
+            // capture. The recorded work itself reports the problem if there is one.
             (void)cuda_get_last_error();
             return cudaSuccess;
         }
         if (query_status != cudaSuccess) {
             return query_status;
-        }
-        if (capture_status == cudaStreamCaptureStatusNone) {
-            drain_deferred_releases();
-            return cudaSuccess;
         }
         if (capture_status != cudaStreamCaptureStatusActive || capture_graph == nullptr) {
             return cudaSuccess;
@@ -105,29 +170,6 @@ class CudaGraphRetainedResource {
     static bool
     has_deferred_releases() {
         return deferred_releases().pending.load(std::memory_order_acquire);
-    }
-
-    // Release queued payloads if `stream` is not being captured. For callers that retain nothing
-    // themselves; cheap (no CUDA call) when nothing is queued.
-    static cudaError_t
-    drain_deferred_releases_on_stream(cudaStream_t stream) {
-        if (!has_deferred_releases()) {
-            return cudaSuccess;
-        }
-        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
-        cudaGraph_t capture_graph              = nullptr;
-        cudaError_t const query_status         = cuda_stream_get_capture_info(stream, &capture_status, &capture_graph);
-        if (query_status == cudaErrorStreamCaptureImplicit) {
-            (void)cuda_get_last_error();
-            return cudaSuccess;
-        }
-        if (query_status != cudaSuccess) {
-            return query_status;
-        }
-        if (capture_status == cudaStreamCaptureStatusNone) {
-            drain_deferred_releases();
-        }
-        return cudaSuccess;
     }
 
     // Release payloads handed back by user-object destructors (see class comment).

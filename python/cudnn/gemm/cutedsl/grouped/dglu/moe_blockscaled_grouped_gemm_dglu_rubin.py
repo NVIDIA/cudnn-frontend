@@ -21,6 +21,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cudnn._cutlass_helpers.warp_reduce import warp_amax_with_nan
 from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator, get_smem_capacity_in_bytes, OperandMajorMode
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu.tcgen05 import CollectorOp
@@ -37,6 +38,7 @@ from cutlass._mlir import ir
 from cutlass._mlir.dialects import math, llvm
 from cutlass._mlir.dialects import vector, arith
 
+from ..canonical import kernel_facing_b, kernel_facing_mx, kernel_facing_prob
 from ..moe_persistent_scheduler import (
     MoEPersistentTileScheduler,
     MoESchedulerParams,
@@ -786,6 +788,14 @@ class BlockScaledMoEGroupedGemmDgluKernel:
         at the bounds. The optional probability gradient differentiates the
         routing multiplier, so it is not multiplied by that probability.
         """
+        a = kernel_facing_mx(a)
+        c = kernel_facing_mx(c)
+        d = kernel_facing_mx(d)
+        d_col = kernel_facing_mx(d_col)
+        prob = kernel_facing_prob(prob)
+        dprob = kernel_facing_prob(dprob)
+        if cutlass.const_expr(self.weight_mode == MoEWeightMode.DENSE):
+            b = kernel_facing_b(b, b_major_mode == OperandMajorMode.MN)
         # Setup static attributes before smem/grid/tma computation
         self.a_dtype: Type[cutlass.Numeric] = a.element_type
         self.b_dtype: Type[cutlass.Numeric] = a.element_type  # B must match A dtype
@@ -1281,12 +1291,7 @@ class BlockScaledMoEGroupedGemmDgluKernel:
     @cute.jit
     def amax_reduction_per_warp_and_cta(self, amax_fp32, warp_idx, amax_smem, amax_gmem) -> None:
         # Warp-level reduction using wrapper function
-        warp_amax = cute.arch.warp_redux_sync(
-            value=amax_fp32,
-            kind="fmax",
-            mask_and_clamp=0xFFFFFFFF,
-            nan=True,
-        )
+        warp_amax = warp_amax_with_nan(amax_fp32)
         # Each epilogue warp's lane 0 writes warp amax to shared memory
         lane_idx = cute.arch.thread_idx()[0] % 32
         if lane_idx == 0:
@@ -1493,38 +1498,10 @@ class BlockScaledMoEGroupedGemmDgluKernel:
         tidx, _, _ = cute.arch.thread_idx()
 
         for vi in cutlass.range_constexpr(0, acc_frg.shape[0], 4):
-            max_value0 = cutlass.Float32(
-                cute.arch.warp_redux_sync(
-                    value=acc_frg[vi, 0],
-                    kind="fmax",
-                    mask_and_clamp=0xFFFFFFFF,
-                    nan=True,
-                )
-            )
-            max_value1 = cutlass.Float32(
-                cute.arch.warp_redux_sync(
-                    value=acc_frg[vi + 1, 0],
-                    kind="fmax",
-                    mask_and_clamp=0xFFFFFFFF,
-                    nan=True,
-                )
-            )
-            max_value2 = cutlass.Float32(
-                cute.arch.warp_redux_sync(
-                    value=acc_frg[vi + 2, 0],
-                    kind="fmax",
-                    mask_and_clamp=0xFFFFFFFF,
-                    nan=True,
-                )
-            )
-            max_value3 = cutlass.Float32(
-                cute.arch.warp_redux_sync(
-                    value=acc_frg[vi + 3, 0],
-                    kind="fmax",
-                    mask_and_clamp=0xFFFFFFFF,
-                    nan=True,
-                )
-            )
+            max_value0 = cutlass.Float32(warp_amax_with_nan(acc_frg[vi, 0]))
+            max_value1 = cutlass.Float32(warp_amax_with_nan(acc_frg[vi + 1, 0]))
+            max_value2 = cutlass.Float32(warp_amax_with_nan(acc_frg[vi + 2, 0]))
+            max_value3 = cutlass.Float32(warp_amax_with_nan(acc_frg[vi + 3, 0]))
 
             scale = rcp_limit * norm_const
             max_value0, max_value1 = cute.arch.mul_packed_f32x2(

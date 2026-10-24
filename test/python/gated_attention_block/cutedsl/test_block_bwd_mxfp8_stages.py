@@ -53,7 +53,7 @@ from cudnn.gated_attention_block.kernels.proj_gemm import (  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from test_proj_gemm_bwd import _FORCED_TILE_K64, _GEOMS, _SENTINEL, _check_fp8_cell, _mx_operand, _stage_mkn  # noqa: E402
+from test_proj_gemm_bwd import _FORCED_TILE_K64, _GEOMS, _SENTINEL, _check_fp8_cell, _fp4_operand, _mx_operand, _stage_mkn  # noqa: E402
 
 # The REGISTERED marker of cutedsl/conftest.py (the skip is applied at collection).
 requires_rubin = pytest.mark.requires_rubin
@@ -62,6 +62,7 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs 
 _FP8 = getattr(torch, "float8_e4m3fn", None)
 _E2M1 = getattr(torch, "float4_e2m1fn_x2", None)
 needs_fp8 = pytest.mark.skipif(_FP8 is None, reason="this torch has no float8_e4m3fn")
+needs_fp4 = pytest.mark.skipif(_FP8 is None or _E2M1 is None, reason="this torch has no float8_e4m3fn / float4_e2m1fn_x2")
 
 # The two block-scale GEMMs of the MXFP8 backward and the two that stay per-tensor; `_stage_mkn` (the GEMM suite) spells
 # their (m, k, n) at the block's two geometries.
@@ -226,6 +227,149 @@ def test_mxfp8_gemm_stage_declines_are_typed():
         pt_st.execute(None, None, None, None, stream=0, alpha=one, sf_b=one)
 
 
+def _fp4_stage_kw(row: str) -> dict:
+    """The block-scale declaration of one fp4 row: the MIXED row (e4m3 A x e2m1 W; the pairing resolves E8M0 per 32) or the NVFP4 row
+    (e2m1 x e2m1 at block 16 with e4m3 scales spelled -- ``sf_dtype=None`` resolves to the same)."""
+    import cudnn
+
+    if row == "mixed":
+        return dict(w_dtype=_E2M1)
+    return dict(dtype=_E2M1, w_dtype=_E2M1, block_size=16, sf_dtype=cudnn.data_type.FP8_E4M3)
+
+
+# The fp4 weight modes' two dgrads as block-scale stages: B8 on the mixed row (an MXFP4 W_qkvg), B2 on the mixed row (an MXFP4 W_o with an
+# MX-rowwise e4m3 dY) and B2 on the NVFP4 row (an NVFP4 W_o with dY cast to NVFP4) -- the GEMM suite's `_fp4_operand` builds the e2m1 sides.
+_FP4_STAGE_CASES = [("B8_dh", "mixed"), ("B2_do_gated", "mixed"), ("B2_do_gated", "nvfp4")]
+
+
+@needs_fp4
+def test_fp4_gemm_stage_rows_are_typed():
+    """The block-scale stage serves the fp4 weight modes' two dgrad rows next to the MXFP8 one -- :attr:`_GemmStage.BLOCK_SCALE_ROWS`:
+    the MIXED row (e4m3 A, ``w_dtype`` e2m1; the pairing resolves E8M0 per 32) and the NVFP4 x NVFP4 row (``dtype = w_dtype`` e2m1,
+    ``block_size=16``, e4m3 scales -- spelled or resolved from None) pass ``check_support``, resolve the 64-byte MMA K and name the forced
+    tile's K64 twin through BOTH ``expected_tile_config_name()`` and the block's ``_forced_tile_name`` (the MXFP8 row's string);
+    ``compile()`` forwards the declaration as given.  Declines, typed by name: the mixed row the other way round (e2m1 A x e4m3 W) and
+    MXFP4 x MXFP4 (e2m1 x e2m1 at E8M0 per 32, also an e2m1 A with ``w_dtype`` None) -- rows no stage of this backward declares; the
+    mixed pair at block 16 and with e4m3 scales (the pairing's refusals); a bf16 A with an e2m1 W; alpha on the NVFP4 row; ``K % 16``
+    on the NVFP4 row; the e2m1 ``w_dtype`` on a per-tensor stage."""
+    import cudnn
+
+    m8, k8, n8 = _stage_mkn("B8_dh", "test", 2048)
+    m2, k2, n2 = _stage_mkn("B2_do_gated", "test", 2048)
+    for stage, row in _FP4_STAGE_CASES:
+        m, k, n = (m8, k8, n8) if stage == "B8_dh" else (m2, k2, n2)
+        st = _mx_stage(stage, m, k, n, **_fp4_stage_kw(row))
+        st.check_support()
+        assert st.block_scale and st.alpha is False and st.out_dtype == torch.bfloat16 and st.mma_tile_k_bytes == 64 and st.majors == ("k", "k")
+        assert (st.is_e4m3, st.is_e2m1) == ((True, False) if row == "mixed" else (False, True)), (stage, row)
+        assert st.expected_tile_config_name() == _FORCED_TILE_K64 == GatedAttentionBlockBwd._forced_tile_name(st), (stage, row)
+    for geom_id in _GEOMS:
+        for stage, row in _FP4_STAGE_CASES:
+            st = _mx_stage(stage, *_stage_mkn(stage, geom_id, 2048), **_fp4_stage_kw(row))
+            st.check_support()
+            assert st.expected_tile_config_name() == _FORCED_TILE_K64 == GatedAttentionBlockBwd._forced_tile_name(st), (stage, row, geom_id)
+    assert (_FP8, _E2M1, 32) in _GemmStage.BLOCK_SCALE_ROWS and (_E2M1, _E2M1, 16) in _GemmStage.BLOCK_SCALE_ROWS and _E2M1 in _GemmStage.BLOCK_SCALE_W_DTYPES
+    _mx_stage("B2_do_gated", m2, k2, n2, dtype=_E2M1, w_dtype=_E2M1, block_size=16).check_support()  # sf_dtype None resolves to e4m3 for two e2m1 sides at 16
+    _mx_stage("B2_do_gated", m2, k2, n2, w_dtype=_E2M1, sf_dtype=cudnn.data_type.FP8_E8M0).check_support()  # the mixed row's default spelled
+    # rows the pairing serves but no stage of this backward declares
+    with pytest.raises(NotImplementedError, match="A e2m1 x W e4m3") as ei:
+        _mx_stage("B2_do_gated", m2, k2, n2, dtype=_E2M1, w_dtype=_FP8).check_support()
+    assert "not a rendering this backward declares" in str(ei.value) and "A e4m3 x W e2m1 at one scale per 32" in str(ei.value), str(ei.value)
+    with pytest.raises(NotImplementedError, match="A e2m1 x W e2m1 at one scale per 32"):
+        _mx_stage("B2_do_gated", m2, k2, n2, dtype=_E2M1, w_dtype=_E2M1, block_size=32).check_support()  # MXFP4 x MXFP4
+    with pytest.raises(NotImplementedError, match="A e2m1 x W e2m1 at one scale per 32"):
+        _mx_stage("B2_do_gated", m2, k2, n2, dtype=_E2M1).check_support()  # w_dtype None = e2m1 at the default block 32: MXFP4 x MXFP4
+    # the pairing's own refusals through the stage
+    with pytest.raises(ValueError, match="no block-scale GEMM row"):
+        _mx_stage("B8_dh", m8, k8, n8, w_dtype=_E2M1, block_size=16).check_support()
+    with pytest.raises(ValueError, match="no block-scale GEMM row"):
+        _mx_stage("B8_dh", m8, k8, n8, w_dtype=_E2M1, sf_dtype=cudnn.data_type.FP8_E4M3).check_support()
+    with pytest.raises(NotImplementedError, match="block_scale"):
+        _mx_stage("B8_dh", m8, k8, n8, dtype=torch.bfloat16, w_dtype=_E2M1).check_support()
+    with pytest.raises(ValueError, match="alpha"):
+        _mx_stage("B2_do_gated", m2, k2, n2, alpha=True, **_fp4_stage_kw("nvfp4")).check_support()
+    with pytest.raises(ValueError, match="multiple of 16") as ei:
+        _mx_stage("B2_do_gated", m2, 520, n2, **_fp4_stage_kw("nvfp4")).check_support()
+    assert "float8_e4m3fn scale per 16-element K block" in str(ei.value) and "K=520" in str(ei.value), str(ei.value)
+    with pytest.raises(NotImplementedError, match="w_dtype"):
+        _QkvGateDgrad(m=m8, k=k8, n=n8, dtype=_FP8, label="b8", mma_tile_k_bytes=64, out_dtype=torch.bfloat16, alpha=True, w_dtype=_E2M1).check_support()
+
+
+@needs_fp4
+def test_fp4_gemm_stage_compile_forwards_the_fp4_declaration(monkeypatch):
+    """``compile()`` hands ``build_proj_gemm`` the fp4 rows' declarations as given -- the mixed row's ``w_dtype=e2m1`` at the defaults
+    ``block_size=32, sf_dtype=None``, the NVFP4 row's ``dtype=w_dtype=e2m1, block_size=16, sf_dtype=FP8_E4M3`` -- with the resolved
+    ``mma_tile_k_bytes=64``, ``alpha=False``, a bf16 ``out_dtype`` and the K-major majors (a spy stands in for the driver)."""
+    import cudnn
+
+    import cudnn.gated_attention_block.kernels.proj_gemm as pg
+
+    seen = {}
+
+    def spy(**kw):
+        """Stands in for ``build_proj_gemm``: records the kwargs the stage hands it, returns a placeholder plan."""
+        seen.clear()
+        seen.update(kw)
+        return "plan"
+
+    monkeypatch.setattr(pg, "build_proj_gemm", spy)
+    for stage, row in _FP4_STAGE_CASES:
+        m, k, n = _stage_mkn(stage, "test", 2048)
+        st = _mx_stage(stage, m, k, n, **_fp4_stage_kw(row))
+        st.check_support()
+        st.compile()
+        assert st.plan == "plan"
+        want = (True, _E2M1, 32, None) if row == "mixed" else (True, _E2M1, 16, cudnn.data_type.FP8_E4M3)
+        assert (seen["block_scale"], seen["w_dtype"], seen["block_size"], seen["sf_dtype"]) == want, (stage, row, seen)
+        assert seen["dtype"] == (_FP8 if row == "mixed" else _E2M1) and (seen["m"], seen["k"], seen["n"]) == (m, k, n), seen
+        assert (seen["a_major"], seen["b_major"]) == ("k", "k") and seen["mma_tile_k_bytes"] == 64 and seen["alpha"] is False, seen
+        assert seen["out_dtype"] == torch.bfloat16, seen
+
+
+@requires_rubin
+@needs_fp4
+@pytest.mark.parametrize("stage,row", _FP4_STAGE_CASES, ids=[f"{c[0]}-{c[1]}" for c in _FP4_STAGE_CASES])
+def test_fp4_gemm_stage_execute_matches_fp64_through_the_blobs(stage, row):
+    """The fp4 rows' stages at the test geometry (T = 2048): each plan IS the forced tile's K64 twin on the FROST JIT with the row's scale
+    dtype and block; ``execute(sf_a=, sf_b=)`` over the GEMM suite's operands -- the mixed row's e4m3 gradient x PACKED e2m1 weight, the
+    NVFP4 row's packed e2m1 gradient x packed e2m1 weight -- vs the fp64 product of the operands dequantized THROUGH THE BLOBS under the
+    bf16-output bound; two launches bitwise; bitwise the bare driver's result; a missing blob is a typed refusal before any launch."""
+    import cudnn
+
+    m, k, n = _stage_mkn(stage, "test", 2048)
+    st = _mx_stage(stage, m, k, n, **_fp4_stage_kw(row))
+    st.check_support()
+    st.compile()
+    plan = st.plan
+    assert plan.jit is not None, f"{stage} {row}: no JIT artifact -- the forced compile fell back to the graph heuristic (route {plan.route!r})"
+    assert plan.tile_config_name == _FORCED_TILE_K64 == st.expected_tile_config_name() == GatedAttentionBlockBwd._forced_tile_name(st), (
+        plan.tile_config_name,
+        plan.route,
+    )
+    assert plan.mma_tile_k_bytes == 64 == plan.jit.config.mma_tile_k_bytes and (plan.a_major, plan.b_major) == ("k", "k") and not plan.has_alpha
+    if row == "mixed":
+        assert (plan.dtype, plan.w_dtype, plan.block_size, plan.sf_dtype) == (_FP8, _E2M1, 32, cudnn.data_type.FP8_E8M0)
+        a, sf_a, a64 = _mx_operand(m, k, seed=1)
+        w, sf_w, w64 = _fp4_operand(n, k, "mxfp4", seed=2)
+    else:
+        assert (plan.dtype, plan.w_dtype, plan.block_size, plan.sf_dtype) == (_E2M1, _E2M1, 16, cudnn.data_type.FP8_E4M3)
+        a, sf_a, a64 = _fp4_operand(m, k, "nvfp4", seed=1)
+        w, sf_w, w64 = _fp4_operand(n, k, "nvfp4", seed=2)
+    ws = torch.empty(st.workspace_bytes(), dtype=torch.uint8, device="cuda")
+    out1 = torch.full((m, n), _SENTINEL, device="cuda", dtype=torch.bfloat16)
+    out2, out3 = out1.clone(), out1.clone()
+    stream = torch.cuda.current_stream().cuda_stream
+    st.execute(a, w, out1, ws, stream=stream, sf_a=sf_a, sf_b=sf_w)
+    st.execute(a, w, out2, ws, stream=stream, sf_a=sf_a, sf_b=sf_w)
+    run_dgrad_gemm_block_scale(plan, a, w, out3, ws, sf_dy=sf_a, sf_w_t=sf_w, stream=stream)
+    torch.cuda.synchronize()
+    _check_fp8_cell(out1, out2, a64 @ w64.T, f"fp4 {row} {stage} @ test, T=2048, {plan.tile_config_name} ({plan.route})")
+    assert torch.equal(out1, out3), f"{stage} {row}: the stage's output differs from the bare driver's"
+    with pytest.raises(ValueError, match="sf_b"):
+        st.execute(a, w, out1, ws, stream=stream, sf_a=sf_a)
+    print(f"\n{stage} {row}: {plan.tile_config_name}, route {plan.route}, workspace {plan.workspace_bytes} B")
+
+
 @needs_fp8
 def test_mxfp8_gemm_stage_compile_forwards_the_block_scale_declaration(monkeypatch):
     """``compile()`` hands ``build_proj_gemm`` the block-scale declaration as given -- ``block_scale=True``, ``w_dtype=None``,
@@ -276,7 +420,7 @@ def test_mxfp8_gemm_stage_execute_surfaces_the_drivers_operand_checks():
     sf_a = torch.zeros(sf_blob_bytes(n_qkvg, t), dtype=torch.uint8, device=dev)
     sf_w = torch.zeros(sf_blob_bytes(dm, t), dtype=torch.uint8, device=dev)
     with pytest.raises(
-        ValueError, match=r"dy_t \(dy_like\^T, \[rows, T\]\) has strides \(1, 5120\) but the plan declared a contiguous row-major \[5120, 2048\]"
+        ValueError, match=r"dy_t \(dy_like\^T, \[rows, T\]\) has strides \(1, 5120\) but this plan declared a contiguous row-major \[5120, 2048\]"
     ):
         st.execute(torch.zeros(t, n_qkvg, dtype=_FP8, device=dev).t(), w8, dw, ws, stream=stream, sf_a=sf_a, sf_b=sf_w)
     with pytest.raises(ValueError, match=r"x_t \(x\^T, \[cols, T\]\) has strides \(2112, 1\)"):

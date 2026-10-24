@@ -1,5 +1,6 @@
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
-# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT AND Apache-2.0
 # BSA attention interface for SM90/SM100 block-sparse kernels.
 
 import math
@@ -12,7 +13,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Float32
+from cutlass import Float32, Int32
 from cutlass.cute.runtime import from_dlpack
 from cudnn.block_sparse_attention.csrc.utils.cute_dsl_utils import _install_constexpr_tvm_ffi_converter
 
@@ -46,6 +47,8 @@ from cudnn.block_sparse_attention.csrc.bwd.sm100_blk64.bsa_bwd_sm100 import (
     sm100_bwd_auto_bucketed_k2q_size_blocks,
     sm100_bwd_default_bucketed_k2q_size_blocks,
 )
+
+from cudnn.block_sparse_attention.csrc.bwd.sm100_blk64.bsa_bwd_sm100_paired import MixedKvBackwardSm100
 
 try:
     from cudnn.block_sparse_attention.csrc.bwd.sm100_blk128.bsa_bwd_sm100 import (
@@ -92,6 +95,22 @@ def _get_device_arch():
     return _get_device_arch_for_device(torch.cuda.current_device())
 
 
+@lru_cache(maxsize=None)
+def _get_device_sm_count_for_device(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _sm100_blk128_bwd_auto_bucket_size_blocks(*, num_q_blocks: int, num_kv_blocks: int, batch_size: int, num_heads: int, num_sms: int) -> int:
+    """Keep the large bucket only when its logical grid retains enough parallel work."""
+    default_bucket = sm100_blk128_bwd_default_bucketed_k2q_size_blocks(num_q_blocks, num_heads)
+    tasks_per_group = batch_size * num_heads * num_kv_blocks
+    default_tasks = tasks_per_group * _ceil_div_int(num_q_blocks, default_bucket)
+    large_bucket_tasks = tasks_per_group * _ceil_div_int(num_q_blocks, 2048)
+    # Each (batch, head, KV block, Q group) is one CTA. Preserve a wave of work,
+    # or the default grid when it is smaller. Physical blocks can still be empty.
+    return 2048 if large_bucket_tasks >= min(num_sms, default_tasks) else default_bucket
+
+
 def _cutlass_dsl_version() -> tuple[int, int, int]:
     """Return the installed CUTLASS DSL version without adding a dependency."""
     version = getattr(cutlass, "__version__", None)
@@ -122,6 +141,34 @@ def _require_sage_fp8_cutedsl() -> None:
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+
+
+def _bshd_tma_compatible(t: torch.Tensor) -> bool:
+    """Check pointer and active outer-stride alignment before avoiding staging."""
+    return (
+        t.stride(-1) == 1
+        and t.data_ptr() % 16 == 0
+        and all(size <= 1 or (stride > 0 and stride * t.element_size() % 16 == 0) for size, stride in zip(t.shape[:-1], t.stride()[:-1]))
+    )
+
+
+# The paired-KV backward rebuilds its pairing metadata on every call and splits each KV block's edges between two
+# kernels that share an FP32 dK/dV workspace. Below this many (batch, head, KV block) tasks that fixed cost is not
+# recovered (measured 1.33-1.38x slower on 4K/1K-token problems); production-scale masks start well above it.
+_SM100_BLK64_PAIRED_KV_MIN_KV_TASKS = 1024
+
+
+def _sm100_blk64_use_paired_kv(q2k_block_index: torch.Tensor, q2k_block_nums: Optional[torch.Tensor], num_kv_blocks: int, pair_bytes: int) -> bool:
+    """Paired KV needs variable-count metadata it can rewrite, and enough KV tasks to amortize building it."""
+    batch, heads = q2k_block_index.shape[:2]
+    return (
+        q2k_block_nums is not None
+        and num_kv_blocks >= 2
+        and q2k_block_index.is_contiguous()
+        and q2k_block_nums.is_contiguous()
+        and pair_bytes <= 64 * 1024 * 1024
+        and batch * heads * num_kv_blocks >= _SM100_BLK64_PAIRED_KV_MIN_KV_TASKS
+    )
 
 
 def _to_cute_tensor(
@@ -396,8 +443,14 @@ def _sm100_blk64_auto_kv_splits(
     q2k_block_index: torch.Tensor,
     fixed_block_sparse_num: int,
     max_kv_splits: int = 16,
+    k: Optional[torch.Tensor] = None,
+    v: Optional[torch.Tensor] = None,
 ) -> int:
-    """Choose KV splits for the SM100 blk64 KV-bucketed target cases."""
+    """Choose splits assuming approximately uniform, independent KV indices across Q blocks.
+
+    This metadata-only policy cannot detect shared or local KV neighborhoods.
+    Such high-reuse masks should use explicitly benchmarked split counts.
+    """
     if not q.is_cuda:
         return 1
 
@@ -407,13 +460,40 @@ def _sm100_blk64_auto_kv_splits(
     if kv_blocks <= 1:
         return 1
 
-    # Large-Q workloads already expose enough independent Q tiles to fill the
-    # GPU. Splitting KV adds FP32 partial output traffic and a combine launch
-    # without providing useful extra parallelism.
     batch, heads, seqlen_q, _ = q.shape
     total_q_tiles = batch * heads * _ceil_div_int(seqlen_q, 64)
     if total_q_tiles >= 512:
-        return 1
+        # The large-Q region was measured on BF16 MHA D128 with random indices.
+        # Capacity is not row work for variable counts. Small Q extents, dense
+        # masks and cache-sized per-head K/V regressed despite long KV rows.
+        if (
+            fixed_block_sparse_num <= 0
+            or kv_blocks < 512
+            or seqlen_q < 262144
+            or q.dtype != torch.bfloat16
+            or q.shape[-1] != 128
+            or k is None
+            or v is None
+            or k.shape[1] != heads
+            or v.shape[1] != heads
+            or k.shape[-1] != 128
+            or v.shape[-1] != 128
+            or kv_blocks * 8 > _ceil_div_int(k.shape[2], 64)
+        ):
+            return 1
+        # Device properties are host metadata; never inspect device indices or
+        # counts to estimate reuse. Unknown cache size keeps the conservative path.
+        l2_bytes = getattr(torch.cuda.get_device_properties(q.device), "L2_cache_size", 0)
+        kv_bytes_per_head = k.shape[2] * k.shape[-1] * k.element_size() + v.shape[2] * v.shape[-1] * v.element_size()
+        if l2_bytes <= 0:
+            return 1
+        if kv_blocks >= 900 and kv_bytes_per_head > 2 * l2_bytes and (heads >= 4 or (heads == 1 and kv_blocks >= 1024)):
+            splits = 8
+        elif heads >= 4 and kv_bytes_per_head > l2_bytes:
+            splits = 4
+        else:
+            return 1
+        return max(1, min(splits, int(max_kv_splits), kv_blocks))
 
     if kv_blocks >= 900:
         splits = 8
@@ -590,11 +670,14 @@ def _empty_bwd_workspace_with_zeroed_accum(
     zero_dq_accum: bool,
     device: torch.device,
     zero_kv_accum: bool = True,
+    include_dkv_accum: bool = True,
 ) -> torch.Tensor:
     q_rounded = ((seqlen_q + round_q_to - 1) // round_q_to) * round_q_to
     k_rounded = ((seqlen_k + round_k_to - 1) // round_k_to) * round_k_to
     d_rounded = ((head_dim + round_d_to - 1) // round_d_to) * round_d_to
-    elems_per_bh = 2 * q_rounded + q_rounded * d_rounded + 2 * k_rounded * d_rounded
+    elems_per_bh = 2 * q_rounded + q_rounded * d_rounded
+    if include_dkv_accum:
+        elems_per_bh += 2 * k_rounded * d_rounded
     workspace = torch.empty(
         (
             batch_size,
@@ -606,7 +689,8 @@ def _empty_bwd_workspace_with_zeroed_accum(
     )
     # The (B, H, elems_per_bh) allocation shape is NOT how the kernels read this
     # buffer. They split the raw pointer field-major across all N = B * H entries:
-    #   [all N dPsum][all N LSE][all N dQ accum][all N dK accum][all N dV accum]
+    #   [all N dPsum][all N LSE][all N dQ accum]
+    # followed by dK/dV accumulators when include_dkv_accum is true.
     # so the flat start of each field is N * (per-BH elements of the preceding
     # fields), and the accumulator tail must be zeroed on the flattened view.
     # Rewriting this as workspace[..., accum_offset:].zero_() (per-(B,H) rows)
@@ -619,6 +703,47 @@ def _empty_bwd_workspace_with_zeroed_accum(
     if flat_accum_offset < flat_accum_end:
         workspace.reshape(-1)[flat_accum_offset:flat_accum_end].zero_()
     return workspace
+
+
+def _sm90_blk64_auto_kv_splits(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    fixed_block_sparse_num: int,
+    max_kv_splits: int = 16,
+) -> int:
+    """Choose SM90 blk64 splits so one split's K/V region of a head fits in L2.
+
+    The non-split kernel walks each Q tile's list in lockstep only while a wave starts together; once CTAs
+    retire and refill, the resident CTAs sit at random list positions and together touch the whole head's
+    K/V. When that exceeds L2 the kernel turns DRAM-bound (BF16 H100, 128K: L2 hit 40%, DRAM 85%). Lists are
+    ascending, so a split is a KV range, and the split grid orders all Q tiles of one split before the next:
+    the resident working set becomes kv_bytes_per_head / splits.
+
+    Measured on H100 BF16 MHA D128 with independent random indices, Sq == Sk, 12.5% density: 64 MB/head
+    -> 2 splits (+20%), 128 MB -> 4 (+70%), 256 MB -> 8 (+94%); more splits plateau. Dense lists (100%) lose
+    12%; 3% density gains 8% at 2 splits and loses at 4. This metadata-only policy cannot see shared or local
+    KV neighborhoods, which need explicitly benchmarked split counts. Unmeasured regimes return 1: GQA,
+    variable counts, Q tiles per head below the resident CTA count, density above 25%.
+    """
+    if not q.is_cuda or q.dtype not in (torch.float16, torch.bfloat16):
+        return 1
+    kv_blocks = int(fixed_block_sparse_num)
+    batch, heads, seqlen_q, _ = q.shape
+    num_kv_blocks = _ceil_div_int(k.shape[2], 64)
+    if kv_blocks < 32 or k.shape[1] != heads or kv_blocks * 4 > num_kv_blocks:
+        return 1
+    props = torch.cuda.get_device_properties(q.device)
+    l2_bytes = getattr(props, "L2_cache_size", 0)
+    # SM90 blk64 keeps up to 3 CTAs resident per SM (min_blocks_per_mp); fewer Q tiles per head would put
+    # several heads in one wave, a footprint this policy does not model.
+    if l2_bytes <= 0 or _ceil_div_int(seqlen_q, 64) < 3 * props.multi_processor_count:
+        return 1
+    kv_bytes_per_head = k.shape[2] * k.shape[-1] * k.element_size() + v.shape[2] * v.shape[-1] * v.element_size()
+    splits = 1
+    while kv_bytes_per_head > splits * l2_bytes * 3 // 4 and splits < max_kv_splits and kv_blocks // (splits * 2) >= 16:
+        splits *= 2
+    return splits
 
 
 def _bsa_attn_fwd_sm90_blk64(
@@ -1019,33 +1144,324 @@ def _bsa_attn_fwd_sm120_blk64(
     )
 
 
-def _bsa_attn_fwd_sm120_blk128(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
+def _sm90_blk128_leading_dim(t):
+    return next((i for i, stride in enumerate(t.stride()) if stride == 1), None)
+
+
+def _sm90_blk128_tensor_key(t):
+    # Match mark_layout_dynamic: extents and non-unit strides are runtime values.
+    return None if t is None else (t.dtype, t.ndim, _sm90_blk128_leading_dim(t), tuple(s == 0 for s in t.stride()))
+
+
+def _to_sm90_blk128_dynamic_tensor(t, assumed_align):
+    if t is None:
+        return None
+    return from_dlpack(t.detach(), assumed_align=assumed_align, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=_sm90_blk128_leading_dim(t))
+
+
+def _validate_sm90_blk128_tma(**tensors):
+    for name, t in tensors.items():
+        if t.stride(-1) != 1 or t.data_ptr() % 16 or any(s % 8 for n, s in zip(t.shape[:-1], t.stride()[:-1]) if n > 1):
+            raise NotImplementedError(f"SM90 blk128 requires 16-byte aligned rows for {name}; got shape={tuple(t.shape)}, strides={t.stride()}")
+
+
+def _require_sm90_blk128_cutedsl():
+    if _cutlass_dsl_version() < (4, 6, 2):
+        raise RuntimeError(f"SM90 blk128 BSA requires nvidia-cutlass-dsl>=4.6.2; found {cutlass.__version__}")
+
+
+def _bsa_attn_fwd_sm90_blk128(q, k, v, indices, count, sizes=None, counts=None, scale=None, layout="bhsd", splits=1):
+    _require_sm90_blk128_cutedsl()
+    from .csrc.fwd.sm90_blk128.bsa_fwd_sm90 import BlockSparseAttnForwardSm90Blk128
+
+    _validate_sm90_blk128_tma(q=q, k=k, v=v)
+    q, k, v = (q, k, v) if layout == "bhsd" else (q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
+    b, h, sq, d = q.shape
+    dv = v.shape[-1]
+    if splits == 1:
+        out = torch.empty((b, h, sq, dv) if layout == "bhsd" else (b, sq, h, dv), device=q.device, dtype=q.dtype)
+        out_bh = out if layout == "bhsd" else out.transpose(1, 2)
+    else:
+        out_bh = torch.empty((b, h * splits, sq, dv), device=q.device, dtype=torch.float32)
+    lse = torch.empty((b, h * splits, sq), device=q.device, dtype=torch.float32)
+    args = (
+        q.permute(2, 3, 1, 0),
+        k.permute(2, 3, 1, 0),
+        v.permute(3, 2, 1, 0),
+        out_bh.permute(2, 3, 1, 0),
+        lse.permute(2, 1, 0),
+        indices.permute(3, 2, 1, 0),
+        counts.permute(2, 1, 0) if counts is not None else indices,
+        sizes if sizes is not None else indices,
+    )
+    variable = counts is not None
+    stages = 1 if not variable and (count + splits - 1) // splits <= 1 else 2
+    has_kv_tail = k.shape[2] % 128 != 0
+    scale_nonpositive = scale is not None and scale <= 0
+    key = (
+        q.device.index,
+        d,
+        dv,
+        h // k.shape[1],
+        scale_nonpositive,
+        variable,
+        sizes.ndim if sizes is not None else 0,
+        splits,
+        stages,
+        has_kv_tail,
+        *map(_sm90_blk128_tensor_key, args),
+    )
+    stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
+    if key not in _bsa_attn_fwd_sm90_blk128.compile_cache:
+        kernel = BlockSparseAttnForwardSm90Blk128(
+            d, dv, h // k.shape[1], variable, sizes.ndim if sizes is not None else 0, splits, stages, scale_nonpositive, has_kv_tail
+        )
+        _bsa_attn_fwd_sm90_blk128.compile_cache[key] = cute.compile(
+            kernel,
+            *(_to_sm90_blk128_dynamic_tensor(t, 16 if i < 4 else 4) for i, t in enumerate(args)),
+            cutlass.Float32(1.0),
+            cutlass.Int32(0),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+            options="--enable-tvm-ffi",
+        )
+    with torch.cuda.nvtx.range("cudnn_bsa_sm90_blk128_fwd"):
+        _bsa_attn_fwd_sm90_blk128.compile_cache[key](*(t.detach() for t in args), d**-0.5 if scale is None else scale, count, stream)
+    if splits > 1:
+        out, lse = _combine_blk64_kv_bucketed_partials(q, out_bh, lse, splits)
+        if layout == "bshd":
+            out = out.transpose(1, 2).contiguous()
+    return out, lse
+
+
+_bsa_attn_fwd_sm90_blk128.compile_cache = {}
+
+
+def _bsa_attn_bwd_sm90_blk128(do, q, k, v, o, lse, indices, count, sizes=None, counts=None, scale=None, dq=None, dk=None, dv=None, bucket=None):
+    _require_sm90_blk128_cutedsl()
+    from .csrc.bwd.sm90_blk128.bsa_bwd_sm90 import BlockSparseAttnBackwardSm90Blk128
+
+    _validate_sm90_blk128_tma(q=q, k=k, v=v, o=o, do=do)
+    b, h, sq, d = q.shape
+    sk = k.shape[2]
+    bucket = 256 if bucket is None else bucket
+    if bucket <= 0:
+        raise ValueError("bucket_size_blocks must be positive")
+    offsets, edges, _, _ = build_bucketed_k2q_csr_cutedsl(indices, count, (sk + 127) // 128, bucket_size_blocks=bucket, q2k_block_nums=counts)
+    dq = torch.empty_like(q) if dq is None else dq
+    dk = torch.empty_like(k) if dk is None else dk
+    dv = torch.empty_like(v) if dv is None else dv
+    _validate_sm90_blk128_tma(dq=dq, dk=dk, dv=dv)
+    if sizes is not None and sizes.ndim == 1:
+        sizes = sizes[None, :].expand(b, -1)
+    workspace = _empty_bwd_workspace_with_zeroed_accum(
+        batch_size=b,
+        num_heads=h,
+        seqlen_q=sq,
+        seqlen_k=sk,
+        head_dim=d,
+        round_q_to=128,
+        round_k_to=128,
+        round_d_to=32,
+        zero_dq_accum=False,
+        device=q.device,
+        zero_kv_accum=offsets.shape[2] != 1,
+    )
+    args = (do, o, q, k, v, lse, dq, dk, dv, offsets, edges, sizes, workspace)
+    scale_nonpositive = scale is not None and scale <= 0
+    direct_kv = offsets.shape[2] == 1
+    has_kv_tail = sk % 128 != 0
+    key = (q.device.index, d, scale_nonpositive, direct_kv, has_kv_tail, *map(_sm90_blk128_tensor_key, args))
+    shape = (sq, sk, d, (h, b))
+    stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
+    if key not in _bsa_attn_bwd_sm90_blk128.compile_cache:
+        kernel = BlockSparseAttnBackwardSm90Blk128(
+            cutlass.BFloat16 if q.dtype == torch.bfloat16 else cutlass.Float16, d, d, scale_nonpositive, direct_kv, has_kv_tail
+        )
+        cargs = tuple(_to_sm90_blk128_dynamic_tensor(t, 4 if i in (5, 9, 10, 11) else 16) for i, t in enumerate(args))
+        _bsa_attn_bwd_sm90_blk128.compile_cache[key] = cute.compile(
+            kernel, shape, *cargs, cutlass.Float32(1.0), cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False), options="--enable-tvm-ffi"
+        )
+    with torch.cuda.nvtx.range("cudnn_bsa_sm90_blk128_bwd"):
+        _bsa_attn_bwd_sm90_blk128.compile_cache[key](shape, *args, d**-0.5 if scale is None else scale, stream)
+    return dq, dk, dv
+
+
+_bsa_attn_bwd_sm90_blk128.compile_cache = {}
+
+
+def _require_sm90_fp8_blk128_cutedsl() -> None:
+    if _cutlass_dsl_version() < (4, 6, 2):
+        raise RuntimeError(f"SM90 FP8 blk128 requires nvidia-cutlass-dsl>=4.6.2; found {cutlass.__version__}")
+
+
+def _bsa_attn_fwd_sm90_fp8(
+    q_fp8: torch.Tensor,
+    k_fp8: torch.Tensor,
+    v_fp8: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
     q2k_block_index: torch.Tensor,
     block_sparse_num: int,
-    block_sizes: Optional[torch.Tensor] = None,
-    q2k_block_nums: Optional[torch.Tensor] = None,
-    softmax_scale: Optional[float] = None,
-    out: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float],
+    sparse_block_size: int,
+    compile_cache: dict,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Launch the native SM120 blk128 sparse forward kernel."""
-    return _bsa_attn_fwd_sm120(
-        q,
-        k,
-        v,
+    """Run Hopper FP8 QK/PV with BHSD Q/K and pretransposed BHDS V."""
+    if sparse_block_size == 128:
+        _require_sm90_fp8_blk128_cutedsl()
+    else:
+        _require_sage_fp8_cutedsl()
+
+    if any(t.ndim != 4 for t in (q_fp8, k_fp8, v_fp8)):
+        raise ValueError("SM90 FP8 Q/K/V must be rank-4 tensors")
+    batch, heads, sq, dim = q_fp8.shape
+    sk = k_fp8.shape[2]
+    if min(batch, heads, sq, sk) < 1 or dim != 128 or sq % sparse_block_size or sk % sparse_block_size:
+        raise ValueError(f"SM90 FP8 requires positive B/H/Sq/Sk, D=128 and Sq/Sk multiples of {sparse_block_size}")
+    if k_fp8.shape != (batch, heads, sk, 128) or v_fp8.shape != (batch, heads, 128, sk):
+        raise ValueError("SM90 FP8 requires MHA BHSD Q/K and BHDS V")
+    for tensor in (q_fp8, k_fp8, v_fp8):
+        if tensor.dtype != torch.float8_e4m3fn or not tensor.is_contiguous():
+            raise ValueError("SM90 FP8 Q/K/V must be contiguous E4M3 in their declared layouts")
+    for tensor, shape in ((q_scale, (batch, heads, sq)), (k_scale, (batch, heads, sk // 16)), (v_scale, (heads, 128))):
+        if tensor.dtype != torch.float32 or tensor.shape != shape or not tensor.is_contiguous():
+            raise ValueError(f"SM90 FP8 scales must be contiguous FP32 with shape {shape}")
+    if q2k_block_index.ndim != 4 or q2k_block_index.dtype != torch.int32 or q2k_block_index.shape[:3] != (batch, heads, sq // sparse_block_size):
+        raise ValueError(f"SM90 FP8 indices must be int32 with shape (B,H,Sq/{sparse_block_size},capacity)")
+    if not isinstance(block_sparse_num, int) or not 1 <= block_sparse_num <= q2k_block_index.shape[-1]:
+        raise ValueError("SM90 FP8 block_sparse_num must be a positive integer within index capacity")
+    tensors = (q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, q2k_block_index)
+    if any(not t.is_cuda or t.device != q_fp8.device for t in tensors):
+        raise ValueError("SM90 FP8 tensors must share one CUDA device")
+    if any(t.data_ptr() % 16 for t in (q_fp8, k_fp8, v_fp8)):
+        raise ValueError("SM90 FP8 Q/K/V must have 16-byte aligned storage")
+    if torch.cuda.get_device_capability(q_fp8.device)[0] != 9:
+        raise ValueError("SM90 FP8 requires a Hopper device")
+    if softmax_scale is None:
+        softmax_scale = 128**-0.5
+    if not isinstance(softmax_scale, (int, float)) or not math.isfinite(softmax_scale):
+        raise ValueError("softmax_scale must be a finite host scalar")
+
+    with torch.cuda.device(q_fp8.device):
+        out = torch.empty((batch, heads, sq, 128), dtype=torch.bfloat16, device=q_fp8.device)
+        lse = torch.empty((batch, heads, sq), dtype=torch.float32, device=q_fp8.device)
+        runtime_tensors = (
+            q_fp8.permute(2, 3, 1, 0),
+            k_fp8.permute(2, 3, 1, 0),
+            v_fp8.permute(2, 3, 1, 0),
+            out.permute(2, 3, 1, 0),
+            lse.permute(2, 1, 0),
+            q2k_block_index.permute(3, 2, 1, 0),
+            q_scale.permute(2, 1, 0),
+            k_scale.permute(2, 1, 0),
+            v_scale.permute(1, 0),
+        )
+        # Sparse indices are scalar loads, so they can use their native
+        # strides, including prefix slices, stepped views and broadcasts.
+        # mark_layout_dynamic requires an explicitly selected leading axis
+        # to have stride 1; if none exists, leave every stride dynamic.
+        indices = runtime_tensors[5]
+        index_leading_dim = next((i for i, stride in enumerate(indices.stride()) if stride == 1), None)
+        leading_dims = (1, 1, 1, 1, 0, index_leading_dim, 0, 0, 0)
+        cute_tensors = tuple(
+            _to_cute_tensor(
+                t,
+                assumed_align=16 if i < 4 else 4,
+                leading_dim=leading_dims[i],
+                fully_dynamic=i == 5 and index_leading_dim is None,
+                enable_tvm_ffi=False,
+            )
+            for i, t in enumerate(runtime_tensors)
+        )
+        num_sms = torch.cuda.get_device_properties(q_fp8.device).multi_processor_count
+        # Record only static layout properties. In particular, changing a
+        # stepped view from stride 2 to 3 must not compile another kernel.
+        indices_layout_key = (indices.dtype, indices.ndim, index_leading_dim, tuple(stride == 0 for stride in indices.stride()))
+        key = _dynamic_tensors_compile_key(
+            f"sm90_fp8_blk{sparse_block_size}_bhds",
+            (_get_device_arch(), num_sms, indices_layout_key),
+            runtime_tensors[:5] + runtime_tensors[6:],
+            leading_dims=leading_dims[:5] + leading_dims[6:],
+        )
+        args = (*cute_tensors[:6], Int32(block_sparse_num), *cute_tensors[6:], Float32(softmax_scale))
+        if key not in compile_cache:
+            if sparse_block_size == 128:
+                from .csrc.fwd.sm90_blk128.bsa_fwd_sm90_fp8 import BlockSparseAttnForwardFp8Sm90Blk128
+
+                kernel = BlockSparseAttnForwardFp8Sm90Blk128()
+            else:
+                from .csrc.fwd.sm90_blk64.bsa_fwd_sm90_fp8 import BlockSparseAttnForwardFp8Sm90Blk64
+
+                kernel = BlockSparseAttnForwardFp8Sm90Blk64(num_sms)
+            compile_cache[key] = cute.compile(kernel, *args, cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False))
+        stream = cuda.CUstream(torch.cuda.current_stream(q_fp8.device).cuda_stream)
+        with torch.cuda.nvtx.range(f"bsa_attn_fwd_sm90_fp8_blk{sparse_block_size}_kernel"):
+            compile_cache[key](*args, stream)
+    return out, lse
+
+
+def _bsa_attn_fwd_sm90_fp8_blk64(
+    q_fp8: torch.Tensor,
+    k_fp8: torch.Tensor,
+    v_fp8: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    q2k_block_index: torch.Tensor,
+    block_sparse_num: int,
+    softmax_scale: Optional[float] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Run Hopper FP8 blk64 with BHSD Q/K and explicitly BHDS V."""
+    return _bsa_attn_fwd_sm90_fp8(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_scale,
+        k_scale,
+        v_scale,
         q2k_block_index,
         block_sparse_num,
-        SM120_BLK128_FWD_BLOCK_SIZE,
-        block_sizes=block_sizes,
-        q2k_block_nums=q2k_block_nums,
-        softmax_scale=softmax_scale,
-        out=out,
+        softmax_scale,
+        64,
+        _bsa_attn_fwd_sm90_fp8_blk64.compile_cache,
     )
 
 
-def _bsa_attn_fwd_sm120_fp8_blk64(
+_bsa_attn_fwd_sm90_fp8_blk64.compile_cache = {}
+
+
+def _bsa_attn_fwd_sm90_fp8_blk128(
+    q_fp8: torch.Tensor,
+    k_fp8: torch.Tensor,
+    v_fp8: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    q2k_block_index: torch.Tensor,
+    block_sparse_num: int,
+    softmax_scale: Optional[float] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Run Hopper FP8 blk128 with BHSD Q/K and explicitly BHDS V."""
+    return _bsa_attn_fwd_sm90_fp8(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_scale,
+        k_scale,
+        v_scale,
+        q2k_block_index,
+        block_sparse_num,
+        softmax_scale,
+        128,
+        _bsa_attn_fwd_sm90_fp8_blk128.compile_cache,
+    )
+
+
+_bsa_attn_fwd_sm90_fp8_blk128.compile_cache = {}
+
+
+def _bsa_attn_fwd_sm120_fp8(
     q_fp8: torch.Tensor,
     k_fp8: torch.Tensor,
     v_fp8: torch.Tensor,
@@ -1057,25 +1473,40 @@ def _bsa_attn_fwd_sm120_fp8_blk64(
     softmax_scale: float,
     block_sizes: Optional[torch.Tensor] = None,
     q2k_block_nums: Optional[torch.Tensor] = None,
+    *,
+    sparse_block_size: int = 64,
+    v_block_size: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Launch the JIT-only SM120 Sage FP8 blk64 kernel on BHSD tensors."""
+    """Launch native SM120 Sage FP8 with unchanged 64- or 128-block metadata."""
     _require_sage_fp8_cutedsl()
-    from cudnn.block_sparse_attention.csrc.fwd.sm120_blk64.bsa_fwd_sm120_fp8 import (
-        BlockSparseAttnForwardFp8Sm120Blk64,
-    )
+    assert sparse_block_size in (64, 128)
+    assert v_block_size in (0, 128)
+    assert v_block_size == 0 or sparse_block_size == 128
+    if sparse_block_size == 128:
+        from cudnn.block_sparse_attention.csrc.fwd.sm120_blk128.bsa_fwd_sm120_fp8 import (
+            BlockSparseAttnForwardFp8Sm120Blk128 as Kernel,
+        )
+    else:
+        from cudnn.block_sparse_attention.csrc.fwd.sm120_blk64.bsa_fwd_sm120_fp8 import (
+            BlockSparseAttnForwardFp8Sm120Blk64 as Kernel,
+        )
 
     batch, num_heads, seqlen_q, head_dim = q_fp8.shape
     seqlen_k = k_fp8.shape[2]
     assert q_fp8.dtype == torch.float8_e4m3fn
     assert k_fp8.dtype == q_fp8.dtype and v_fp8.dtype == q_fp8.dtype
     assert k_fp8.shape == (batch, num_heads, seqlen_k, head_dim)
-    assert v_fp8.shape == k_fp8.shape
+    if v_block_size == 128:
+        assert v_fp8.shape == (batch, num_heads, _ceil_div_int(seqlen_k, 128), head_dim, 128)
+        assert v_fp8.is_contiguous()
+    else:
+        assert v_fp8.shape == k_fp8.shape
     assert q_scale.shape == (batch, num_heads, seqlen_q)
     assert k_scale.shape == (batch, num_heads, _ceil_div_int(seqlen_k, 16))
     assert v_scale.shape == (num_heads, head_dim)
 
-    num_q_blocks = _ceil_div_int(seqlen_q, SM120_FWD_BLOCK_SIZE)
-    num_kv_blocks = _ceil_div_int(seqlen_k, SM120_FWD_BLOCK_SIZE)
+    num_q_blocks = _ceil_div_int(seqlen_q, sparse_block_size)
+    num_kv_blocks = _ceil_div_int(seqlen_k, sparse_block_size)
     assert q2k_block_index.dtype == torch.int32
     assert q2k_block_index.shape[:3] == (batch, num_heads, num_q_blocks)
     q2k_block_index = q2k_block_index.contiguous()
@@ -1121,7 +1552,7 @@ def _bsa_attn_fwd_sm120_fp8_blk64(
 
     q_t = q_fp8.permute(2, 3, 1, 0)
     k_t = k_fp8.permute(2, 3, 1, 0)
-    v_t = v_fp8.permute(3, 2, 1, 0)
+    v_t = v_fp8.permute(3, 4, 2, 1, 0) if v_block_size == 128 else v_fp8.permute(3, 2, 1, 0)
     out_t = out.permute(2, 3, 1, 0)
     lse_t = lse.permute(2, 1, 0)
     q_scale_t = q_scale.permute(2, 1, 0)
@@ -1149,35 +1580,41 @@ def _bsa_attn_fwd_sm120_fp8_blk64(
         _to_cute_tensor(
             tensor,
             assumed_align=(128 if index < 4 else 4 if index in (4, 5, 6, 7) else None),
-            leading_dim=(1 if index in (0, 1, 3) else 0),
+            leading_dim=(1 if index in (0, 1, 3) or (index == 2 and v_block_size == 128) else 0),
             enable_tvm_ffi=False,
         )
         for index, tensor in enumerate(runtime_tensors)
     )
     current_stream = cuda.CUstream(torch.cuda.current_stream(torch.cuda.current_device()).cuda_stream)
-    fwd_kernel = BlockSparseAttnForwardFp8Sm120Blk64(
+    fwd_kernel = Kernel(
         gqa_ratio=1,
         head_dim=head_dim,
         value_dim=head_dim,
-        blocksparse_blocksize_q=SM120_FWD_BLOCK_SIZE,
-        blocksparse_blocksize_k=SM120_FWD_BLOCK_SIZE,
+        blocksparse_blocksize_q=sparse_block_size,
+        blocksparse_blocksize_k=sparse_block_size,
         dtype=cutlass.Float8E4M3FN,
         acc_dtype=cutlass.Float32,
         has_block_sizes=has_block_sizes,
         has_block_nums=has_block_nums,
         block_sizes_mode=block_sizes_mode,
+        **({"v_block_size": v_block_size} if v_block_size else {}),
     )
+    compile_options = getattr(fwd_kernel, "_compile_options", "")
+    if has_block_nums or fixed_block_sparse_num < getattr(fwd_kernel, "_compile_min_blocks", 0):
+        compile_options = ""
     compile_key = _dynamic_tensors_compile_key(
-        "sm120_fp8_blk64",
+        f"sm120_fp8_blk{sparse_block_size}",
         (
             _get_device_arch(),
+            v_block_size,
             head_dim,
             has_block_nums,
             has_block_sizes,
             block_sizes_mode,
+            compile_options,
         ),
         runtime_tensors,
-        leading_dims=(1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0),
+        leading_dims=(1, 1, 1 if v_block_size == 128 else 0, 1, 0, 0, 0, 0, 0, 0, 0),
     )
     args = (
         *cute_tensors[:10],
@@ -1185,22 +1622,31 @@ def _bsa_attn_fwd_sm120_fp8_blk64(
         cute_tensors[10],
         softmax_scale,
     )
-    if compile_key not in _bsa_attn_fwd_sm120_fp8_blk64.compile_cache:
-        _bsa_attn_fwd_sm120_fp8_blk64.compile_cache[compile_key] = cute.compile(
+    if compile_key not in _bsa_attn_fwd_sm120_fp8.compile_cache:
+        _bsa_attn_fwd_sm120_fp8.compile_cache[compile_key] = cute.compile(
             fwd_kernel,
             *args,
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+            **({"options": compile_options} if compile_options else {}),
         )
 
-    with torch.cuda.nvtx.range("bsa_attn_fwd_sm120_fp8_blk64_kernel"):
-        _bsa_attn_fwd_sm120_fp8_blk64.compile_cache[compile_key](
+    with torch.cuda.nvtx.range(f"bsa_attn_fwd_sm120_fp8_blk{sparse_block_size}_kernel"):
+        _bsa_attn_fwd_sm120_fp8.compile_cache[compile_key](
             *args,
             current_stream,
         )
     return out, lse
 
 
-_bsa_attn_fwd_sm120_fp8_blk64.compile_cache = {}
+_bsa_attn_fwd_sm120_fp8.compile_cache = {}
+
+
+def _bsa_attn_fwd_sm120_fp8_blk64(*args, **kwargs):
+    """Keep the existing private blk64 launch entry point."""
+    return _bsa_attn_fwd_sm120_fp8(*args, **kwargs)
+
+
+_bsa_attn_fwd_sm120_fp8_blk64.compile_cache = _bsa_attn_fwd_sm120_fp8.compile_cache
 
 
 def _combine_blk64_kv_bucketed_partials(
@@ -1209,6 +1655,7 @@ def _combine_blk64_kv_bucketed_partials(
     lse_partial_phys: torch.Tensor,
     kv_splits: int,
     output_dtype: Optional[torch.dtype] = None,
+    layout: str = "bhsd",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Combine KV-bucketed partial outputs using the shared CuTeDSL combine kernel."""
     if BlockSparseAttnForwardCombine is None:
@@ -1243,16 +1690,19 @@ def _combine_blk64_kv_bucketed_partials(
             seqlen_q,
         ),
     )
-    out_bshd = torch.empty(
-        (batch, seqlen_q, num_heads, head_dim),
+    out_shape = (batch, num_heads, seqlen_q, head_dim) if layout == "bhsd" else (batch, seqlen_q, num_heads, head_dim)
+    out = torch.empty(
+        out_shape,
         dtype=output_dtype,
         device=q.device,
     )
-    lse_bsh = torch.empty(
-        (batch, seqlen_q, num_heads),
+    out_bshd = out.transpose(1, 2) if layout == "bhsd" else out
+    lse = torch.empty(
+        (batch, num_heads, seqlen_q),
         dtype=torch.float32,
         device=q.device,
     )
+    lse_bsh = lse.transpose(1, 2)
     dtype = torch2cute_dtype_map[output_dtype]
     log_max_splits = _ceil_log2_int(kv_splits)
     # Baseline combine geometry; a single configuration is easier to maintain.
@@ -1271,7 +1721,7 @@ def _combine_blk64_kv_bucketed_partials(
         log_max_splits,
         combine_num_threads,
         combine_stages,
-    )
+    ) + (layout, q.device.index)
     if compile_key not in _combine_blk64_kv_bucketed_partials.compile_cache:
         combine_kernel = BlockSparseAttnForwardCombine(
             dtype=dtype,
@@ -1298,13 +1748,14 @@ def _combine_blk64_kv_bucketed_partials(
             _to_cute_tensor_dynamic_compact_shape(
                 out_bshd,
                 mode=(0, 1, 2),
-                stride_order=(0, 1, 2, 3),
+                stride_order=(0, 2, 1, 3) if layout == "bhsd" else (0, 1, 2, 3),
             ),
             _to_cute_tensor_dynamic_compact_shape(
                 lse_bsh,
                 mode=(0, 1, 2),
                 assumed_align=4,
-                stride_order=(0, 1, 2),
+                leading_dim=1,
+                stride_order=(0, 2, 1),
             ),
             None,
             None,
@@ -1332,9 +1783,6 @@ def _combine_blk64_kv_bucketed_partials(
         current_stream,
     )
 
-    # Match the non-split BHSD/BHS output stride contract.
-    out = out_bshd.transpose(1, 2).contiguous()
-    lse = lse_bsh.transpose(1, 2).contiguous()
     return out, lse
 
 
@@ -1430,9 +1878,9 @@ def bsa_attn_fwd_blk64_cutedsl(
         q_bhsd, k_bhsd, v_bhsd = [maybe_contiguous(t) for t in (q, k, v)]
     else:
         assert layout == "bshd", f"layout must be 'bhsd' or 'bshd', got {layout!r}"
-        q_bhsd = q.transpose(1, 2).contiguous()
-        k_bhsd = k.transpose(1, 2).contiguous()
-        v_bhsd = v.transpose(1, 2).contiguous()
+        q_bhsd = q.transpose(1, 2) if _bshd_tma_compatible(q) else q.transpose(1, 2).contiguous()
+        k_bhsd = k.transpose(1, 2) if _bshd_tma_compatible(k) else k.transpose(1, 2).contiguous()
+        v_bhsd = v.transpose(1, 2) if _bshd_tma_compatible(v) else v.transpose(1, 2).contiguous()
 
     batch_size, num_head, seqlen_q, head_dim = q_bhsd.shape
     seqlen_k = k_bhsd.shape[2]
@@ -1517,6 +1965,8 @@ def bsa_attn_fwd_blk64_cutedsl(
                 q_bhsd,
                 q2k_block_index,
                 uniform_block_sparse_num,
+                k=k_bhsd,
+                v=v_bhsd,
             )
     kv_splits_i = _resolve_blk64_split_workspace(
         q_bhsd,
@@ -1541,6 +1991,9 @@ def bsa_attn_fwd_blk64_cutedsl(
     is_persistent = use_clc_scheduler
     pack_gqa = False
     input_layout = "bhsd_native"
+    # Short/medium KV lists are dominated by the per-tile ramp, which short_tile_opt shortens; near-dense lists (capacity of the
+    # sparse index >= 90% of the KV blocks, known on the host without a sync) hide the ramp and keep the original schedule.
+    short_tile_opt = int(q2k_block_index.shape[-1]) * 10 < ((seqlen_k + sparse_block_size - 1) // sparse_block_size) * 9
 
     split_offsets = None
     if kv_splits_i > 1:
@@ -1567,11 +2020,13 @@ def bsa_attn_fwd_blk64_cutedsl(
             device=q_bhsd.device,
         )
     else:
-        out_bhsd = torch.empty(
-            (batch_size, num_head, seqlen_q, head_dim_v),
+        out_shape = (batch_size, num_head, seqlen_q, head_dim_v) if layout == "bhsd" else (batch_size, seqlen_q, num_head, head_dim_v)
+        out = torch.empty(
+            out_shape,
             dtype=output_dtype,
             device=q_bhsd.device,
         )
+        out_bhsd = out if layout == "bhsd" else out.transpose(1, 2)
         lse = torch.empty(
             (batch_size, num_head, seqlen_q),
             dtype=torch.float32,
@@ -1580,6 +2035,9 @@ def bsa_attn_fwd_blk64_cutedsl(
 
     current_stream = cuda.CUstream(torch.cuda.current_stream(torch.cuda.current_device()).cuda_stream)
 
+    # NaN takes the masking-safe nonpositive path as well. Sage FP8 folds the scale into its dequantization scales and
+    # accepts positive scales only, so it never takes this path.
+    nonpositive_scale = not is_sage_fp8 and not (float(softmax_scale) > 0.0)
     compile_key = _dynamic_tensors_compile_key(
         "sm100_blk64_fwd",
         (
@@ -1603,6 +2061,8 @@ def bsa_attn_fwd_blk64_cutedsl(
             use_exact_kv_layout,
             use_int64_kv_strides,
             is_sage_fp8,
+            nonpositive_scale,
+            short_tile_opt,
         ),
         (
             q_bhsd,
@@ -1646,6 +2106,8 @@ def bsa_attn_fwd_blk64_cutedsl(
             num_splits=kv_splits_i,
             use_exact_kv_layout=use_exact_kv_layout,
             use_int64_kv_strides=use_int64_kv_strides,
+            nonpositive_scale=nonpositive_scale,
+            short_tile_opt=short_tile_opt,
         )
 
         bsa_attn_fwd_blk64_cutedsl.compile_cache[compile_key] = cute.compile(
@@ -1688,23 +2150,219 @@ def bsa_attn_fwd_blk64_cutedsl(
         )
 
     if kv_splits_i > 1:
-        out_bhsd, lse = _combine_blk64_kv_bucketed_partials(
+        out, lse = _combine_blk64_kv_bucketed_partials(
             q_bhsd,
             out_bhsd,
             lse,
             kv_splits_i,
             output_dtype=output_dtype,
+            layout=layout,
         )
         # Keep split_offsets alive through the combine launch on the same stream.
         _ = split_offsets
 
-    out = out_bhsd if layout == "bhsd" else out_bhsd.transpose(1, 2).contiguous()
     return out, lse
 
 
 bsa_attn_fwd_blk64_cutedsl.compile_cache = {}
 
 bsa_attn_fwd_blk64 = bsa_attn_fwd_blk64_cutedsl
+
+
+def _require_sm100_fp8_blk128_cutedsl() -> None:
+    if _cutlass_dsl_version() < (4, 6, 2):
+        raise RuntimeError(f"SM100 FP8 blk128 requires nvidia-cutlass-dsl>=4.6.2; found {cutlass.__version__}")
+
+
+def _bsa_attn_fwd_sm100_fp8_blk128(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    block_index: torch.Tensor,
+    topk: int,
+    softmax_scale: Optional[float],
+    block_sizes: Optional[torch.Tensor],
+    block_nums: Optional[torch.Tensor],
+    kv_splits: int = 1,
+) -> torch.Tensor:
+    _require_sm100_fp8_blk128_cutedsl()
+    assert type(kv_splits) is int and 1 <= kv_splits <= 256, "kv_splits must be an integer in [1, 256]"
+    assert q.ndim == k.ndim == v.ndim == 4
+    batch, heads, sq, dim = q.shape
+    assert batch > 0 and heads > 0 and sq > 0 and dim == 128
+    assert k.shape[:2] == (batch, heads) and k.shape[-1] == 128
+    assert v.shape == k.shape and k.shape[2] > 0
+    assert q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn
+    assert q.is_cuda and k.device == v.device == q.device
+    with torch.cuda.device(q.device):
+        # Match the public blk64 contract for valid views while retaining compact
+        # native descriptors. Already contiguous quantizer outputs are unchanged.
+        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+        arch = _get_device_arch_for_device(q.device.index)
+        assert arch in (100, 103), "FP8 blk128 requires SM100/SM103"
+        sk = k.shape[2]
+        q_blocks, kv_blocks = _ceil_div_int(sq, 128), _ceil_div_int(sk, 128)
+        assert block_index.ndim == 4 and block_index.shape[:3] == (batch, heads, q_blocks)
+        assert block_index.dtype == torch.int32 and block_index.device == q.device
+        assert block_index.shape[-1] >= 1
+        block_index = block_index.contiguous()
+        has_block_nums = block_nums is not None and block_nums.numel() > 0
+        if has_block_nums:
+            assert block_nums.dtype == torch.int32 and block_nums.device == q.device
+            assert block_nums.shape == (batch, heads, q_blocks)
+            block_nums = block_nums.contiguous()
+        else:
+            block_nums = None
+            assert 1 <= int(topk) <= block_index.shape[-1]
+
+        block_sizes_mode = 0
+        if block_sizes is not None and block_sizes.numel() > 0:
+            assert block_sizes.dtype == torch.int32 and block_sizes.device == q.device
+            shapes = {1: (kv_blocks,), 2: (batch, kv_blocks), 3: (batch, heads, kv_blocks)}
+            assert block_sizes.ndim in shapes and block_sizes.shape == shapes[block_sizes.ndim]
+            block_sizes_mode = block_sizes.ndim
+            block_sizes = block_sizes.contiguous()
+        else:
+            block_sizes = None
+        # Quantization already returns these shapes. Avoid allocating three view
+        # objects on each eager call, while retaining flattened/noncontiguous input.
+        q_scale = (q_scale if q_scale.shape == (batch, heads, sq) else q_scale.reshape(batch, heads, -1)).contiguous()
+        k_scale = (k_scale if k_scale.shape == (batch, heads, _ceil_div_int(sk, 16)) else k_scale.reshape(batch, heads, -1)).contiguous()
+        v_scale = (v_scale if v_scale.shape == (heads, 128) else v_scale.reshape(heads, 128)).contiguous()
+        assert q_scale.shape == (batch, heads, sq)
+        assert k_scale.shape == (batch, heads, _ceil_div_int(sk, 16))
+        for scale in (q_scale, k_scale, v_scale):
+            assert scale.dtype == torch.float32 and scale.device == q.device
+        softmax_scale = dim**-0.5 if softmax_scale is None else softmax_scale
+        out = torch.empty(
+            (batch, heads * kv_splits, sq, dim),
+            device=q.device,
+            dtype=torch.float32 if kv_splits > 1 else torch.bfloat16,
+        )
+        lse = torch.empty((batch, heads * kv_splits, sq), device=q.device, dtype=torch.float32) if kv_splits > 1 else None
+        # Every extent/stride except D is dynamic; ranks and layouts are validated
+        # above. Keep this cache separate from blk64 and from half-precision blk128.
+        cache_key = (arch, q.device.index, has_block_nums, block_sizes_mode, kv_splits)
+        stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
+        if cache_key not in _bsa_attn_fwd_sm100_fp8_blk128.compile_cache:
+            from .csrc.fwd.sm100_blk128.bsa_fwd_sm100_fp8_fused_pv import BlockSparseAttnForwardFp8FusedPvSm100Blk128
+
+            kernel = BlockSparseAttnForwardFp8FusedPvSm100Blk128(
+                128,
+                allow_empty_block_nums=has_block_nums,
+                has_block_sizes=block_sizes_mode != 0,
+                block_sizes_mode=block_sizes_mode,
+                num_splits=kv_splits,
+            )
+            q_c, k_c, v_c, o_c = [_to_cute_tensor_with_dynamic_modes(t, dynamic_modes=(0, 1, 2)) for t in (q, k, v, out)]
+
+            def metadata(t):
+                return _to_cute_tensor_with_dynamic_modes(t, dynamic_modes=tuple(range(t.ndim)), assumed_align=4) if t is not None else None
+
+            _bsa_attn_fwd_sm100_fp8_blk128.compile_cache[cache_key] = cute.compile(
+                kernel,
+                q_c,
+                k_c,
+                v_c,
+                o_c,
+                metadata(lse),
+                metadata(q_scale),
+                metadata(k_scale),
+                metadata(v_scale),
+                softmax_scale,
+                metadata(block_index),
+                metadata(block_sizes),
+                int(topk),
+                metadata(block_nums),
+                stream,
+                # The DSL default (--opt-level 3) makes this kernel ~2.4x slower on SM103 (B1 H40 S128k topk256: 98.8 ms vs 41.9 ms).
+                options="--enable-tvm-ffi --opt-level 2",
+            )
+        with torch.cuda.nvtx.range("bsa_attn_fwd_sm100_fp8_blk128_kernel"):
+            _bsa_attn_fwd_sm100_fp8_blk128.compile_cache[cache_key](
+                q,
+                k,
+                v,
+                out,
+                lse,
+                q_scale,
+                k_scale,
+                v_scale,
+                softmax_scale,
+                block_index,
+                block_sizes,
+                int(topk),
+                block_nums,
+                stream,
+            )
+        if kv_splits > 1:
+            out, _ = _combine_blk64_kv_bucketed_partials(q, out, lse, kv_splits, output_dtype=torch.bfloat16)
+        return out
+
+
+_bsa_attn_fwd_sm100_fp8_blk128.compile_cache = {}
+
+
+def bsa_fp8_blk128_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q2k_block_index: torch.Tensor,
+    block_sparse_num: int,
+    softmax_scale: Optional[float] = None,
+    *,
+    block_sizes: Optional[torch.Tensor] = None,
+    q2k_block_nums: Optional[torch.Tensor] = None,
+    kv_splits: int = 1,
+) -> torch.Tensor:
+    """Quantize BF16 inputs and launch native SM90, SM100/SM103, or SM120 FP8 blk128."""
+    arch = _get_device_arch_for_device(q.device.index)
+    arch_family = arch // 10
+    if arch in (100, 103):
+        _require_sm100_fp8_blk128_cutedsl()
+        from cudnn.block_sparse_attention._fp8_quant import _quantize_sage_bhsd
+
+        quantized = _quantize_sage_bhsd(q, k, v)
+        return _bsa_attn_fwd_sm100_fp8_blk128(
+            *quantized,
+            q2k_block_index,
+            block_sparse_num,
+            softmax_scale,
+            block_sizes,
+            q2k_block_nums,
+            kv_splits,
+        )
+    if kv_splits != 1:
+        raise NotImplementedError("Explicit FP8 kv_splits requires SM100/SM103 blk128")
+    if arch_family == 9:
+        _require_sm90_fp8_blk128_cutedsl()
+        if block_sizes is not None or q2k_block_nums is not None:
+            raise NotImplementedError("SM90 Sage FP8 supports only fixed counts and full blocks")
+        from cudnn.block_sparse_attention._fp8_quant import _quantize_sage_bhsd
+
+        quantized = _quantize_sage_bhsd(q, k, v, v_layout="bhds")
+        out, _ = _bsa_attn_fwd_sm90_fp8_blk128(*quantized, q2k_block_index, block_sparse_num, softmax_scale)
+        return out
+    _require_sage_fp8_cutedsl()
+    if arch_family != 12:
+        raise NotImplementedError("Sage FP8 native blk128 requires SM90, SM100/SM103, or SM120")
+    from cudnn.block_sparse_attention._fp8_quant import _quantize_sage_bhsd
+
+    quantized = _quantize_sage_bhsd(q, k, v, v_block_size=128)
+    out, _ = _bsa_attn_fwd_sm120_fp8(
+        *quantized,
+        q2k_block_index,
+        block_sparse_num,
+        128**-0.5 if softmax_scale is None else softmax_scale,
+        block_sizes=block_sizes,
+        q2k_block_nums=q2k_block_nums,
+        sparse_block_size=128,
+        v_block_size=128,
+    )
+    return out
 
 
 def bsa_fp8_blk64_fwd(
@@ -1722,6 +2380,12 @@ def bsa_fp8_blk64_fwd(
     _require_sage_fp8_cutedsl()
     from cudnn.block_sparse_attention._fp8_quant import _quantize_sage_bhsd
 
+    arch_family = _get_device_arch_for_device(q.device.index) // 10
+    if arch_family == 9:
+        if block_sizes is not None or q2k_block_nums is not None:
+            raise NotImplementedError("SM90 FP8 supports only fixed counts and full blocks")
+        quantized = _quantize_sage_bhsd(q, k, v, v_layout="bhds")
+        return _bsa_fp8_blk64_fwd_quantized(*quantized, q2k_block_index, block_sparse_num, softmax_scale, v_layout="bhds")
     quantized = _quantize_sage_bhsd(q, k, v)
     return _bsa_fp8_blk64_fwd_quantized(
         *quantized,
@@ -1746,9 +2410,20 @@ def _bsa_fp8_blk64_fwd_quantized(
     *,
     block_sizes: Optional[torch.Tensor] = None,
     q2k_block_nums: Optional[torch.Tensor] = None,
+    v_layout: str = "bhsd",
 ) -> torch.Tensor:
     """Launch Sage FP8 blk64 BSA from private quantized inputs."""
     _require_sage_fp8_cutedsl()
+    arch_family = _get_device_arch_for_device(q_fp8.device.index) // 10
+    if arch_family == 9:
+        if v_layout != "bhds":
+            raise ValueError("SM90 FP8 requires v_layout='bhds'")
+        if block_sizes is not None or q2k_block_nums is not None:
+            raise NotImplementedError("SM90 FP8 supports only fixed counts and full blocks")
+        out, _ = _bsa_attn_fwd_sm90_fp8_blk64(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, q2k_block_index, block_sparse_num, softmax_scale)
+        return out
+    if v_layout != "bhsd":
+        raise ValueError("SM100/SM110/SM120 FP8 requires v_layout='bhsd'")
     assert q_fp8.dim() == k_fp8.dim() == v_fp8.dim() == 4
     batch, heads, seqlen_q, head_dim = q_fp8.shape
     seqlen_k = k_fp8.shape[2]
@@ -1881,11 +2556,9 @@ def bsa_attn_fwd(
     if sparse_block_size is None:
         sparse_block_size = 64 if arch // 10 in (9, 12) else 128
     if arch // 10 == 9 and sparse_block_size == 128:
-        from ._sm90_blk128 import forward
-
         if out is not None or lse is not None:
             raise NotImplementedError("SM90 blk128 forward allocates its outputs")
-        result = forward(q, k, v, q2k_block_index, block_sparse_num, block_sizes, q2k_block_nums, softmax_scale, layout, int(kv_splits))
+        result = _bsa_attn_fwd_sm90_blk128(q, k, v, q2k_block_index, block_sparse_num, block_sizes, q2k_block_nums, softmax_scale, layout, int(kv_splits))
         return result if return_lse else result[0]
     if arch // 10 == 9:
         assert sparse_block_size == 64, "SM90 fwd only supports sparse_block_size=64 or 128"
@@ -1927,7 +2600,21 @@ def bsa_attn_fwd(
         assert q2k_block_index.shape[:3] == (batch_size, num_head, num_q_blocks_sm90), (
             f"SM90 blk64 fwd expects q2k_block_index shape prefix " f"{(batch_size, num_head, num_q_blocks_sm90)}, got {tuple(q2k_block_index.shape[:3])}"
         )
-        assert not isinstance(kv_splits, str), "SM90 kv_splits must be an integer"
+        if layout == "bhsd":
+            q_bhsd, k_bhsd, v_bhsd = q, k, v
+        else:
+            q_bhsd, k_bhsd, v_bhsd = (
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+            )
+        if isinstance(kv_splits, str):
+            assert kv_splits == "auto", "SM90 kv_splits string value must be 'auto'"
+            kv_splits = 1
+            # Split-KV writes FP32 partials, so it cannot honor a caller-provided output.
+            if out is None and q2k_block_nums is None:
+                kv_splits = _sm90_blk64_auto_kv_splits(q_bhsd, k_bhsd, v_bhsd, block_sparse_num)
+                kv_splits = _resolve_blk64_split_workspace(q_bhsd, head_dim_v, kv_splits, allow_fallback=True)
         sm90_is_split_kv = int(kv_splits) > 1
         if out is None and not sm90_is_split_kv:
             out_shape = (batch_size, num_head, seqlen_q, head_dim_v) if layout == "bhsd" else (batch_size, seqlen_q, num_head, head_dim_v)
@@ -1938,14 +2625,6 @@ def bsa_attn_fwd(
             assert out.shape == expected_out_shape
             assert out.dtype == q.dtype and out.is_cuda
             assert out.stride(-1) == 1, "SM90 blk64 fwd requires output head_dim to be contiguous"
-        if layout == "bhsd":
-            q_bhsd, k_bhsd, v_bhsd = q, k, v
-        else:
-            q_bhsd, k_bhsd, v_bhsd = (
-                q.transpose(1, 2),
-                k.transpose(1, 2),
-                v.transpose(1, 2),
-            )
         out_bhsd = None if sm90_is_split_kv else (out if layout == "bhsd" else out.transpose(1, 2))
         _out_bhsd, lse_sm90 = _bsa_attn_fwd_sm90_blk64(
             q_bhsd,
@@ -2316,9 +2995,7 @@ def bsa_attn_bwd(
         softmax_scale = 1.0 / math.sqrt(head_dim)
 
     if arch // 10 == 9 and sparse_block_size == 128:
-        from ._sm90_blk128 import backward
-
-        result = backward(
+        result = _bsa_attn_bwd_sm90_blk128(
             dout_bwd,
             q_bwd,
             k_bwd,
@@ -2339,16 +3016,23 @@ def bsa_attn_bwd(
 
     if arch // 10 != 9 and sparse_block_size == SM100_BLK128_BWD_SPARSE_BLOCK_SIZE:
         if bucket_size_blocks is None or bucket_size_blocks <= 0:
-            bucket_size_blocks = sm100_blk128_bwd_default_bucketed_k2q_size_blocks(
-                num_q_blocks,
-                num_heads,
-            )
+            if arch in (100, 103) and num_q_blocks >= 1500:
+                bucket_size_blocks = _sm100_blk128_bwd_auto_bucket_size_blocks(
+                    num_q_blocks=num_q_blocks,
+                    num_kv_blocks=num_kv_blocks,
+                    batch_size=batch_size,
+                    num_heads=num_heads,
+                    num_sms=_get_device_sm_count_for_device(q.device.index),
+                )
+            else:
+                bucket_size_blocks = sm100_blk128_bwd_default_bucketed_k2q_size_blocks(num_q_blocks, num_heads)
         bucketed_k2q_offsets, bucketed_k2q_indices, _num_q_groups, _max_k2q_rows_per_group = _build_bucketed_k2q_csr(
             q2k_block_index,
             block_sparse_num,
             num_kv_blocks,
             bucket_size_blocks=bucket_size_blocks,
             q2k_block_nums=q2k_block_nums,
+            parallel_offsets=arch in (100, 103),
         )
         dq_out, dk_out, dv_out = bsa_sm100_blk128_bwd_bucketed_k2q_csr(
             dout_bwd,
@@ -2363,6 +3047,7 @@ def bsa_attn_bwd(
             dq=dq_bwd,
             dk=dk_bwd,
             dv=dv_bwd,
+            block_sizes=maybe_contiguous(block_sizes),
         )
         if layout == "bshd":
             return (
@@ -2408,6 +3093,7 @@ def _build_bucketed_k2q_csr(
     *,
     bucket_size_blocks: int = 1152,
     q2k_block_nums: Optional[torch.Tensor] = None,
+    parallel_offsets: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
     """Build bucketed K-to-Q CSR metadata with CuTe DSL kernels.
 
@@ -2421,6 +3107,7 @@ def _build_bucketed_k2q_csr(
         num_kv_blocks,
         bucket_size_blocks=bucket_size_blocks,
         q2k_block_nums=q2k_block_nums,
+        parallel_offsets=parallel_offsets,
     )
 
 
@@ -2488,12 +3175,13 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
         assert q2k_block_nums.dtype == torch.int32
         assert q2k_block_nums.shape == (batch_size, num_heads, num_q_blocks)
 
-    bucketed_k2q_offsets, bucketed_k2q_indices, _num_q_groups, _max_k2q_rows_per_group = _build_bucketed_k2q_csr(
+    bucketed_k2q_offsets, bucketed_k2q_indices, num_q_groups, _max_k2q_rows_per_group = _build_bucketed_k2q_csr(
         q2k_block_index,
         block_sparse_num,
         num_kv_blocks,
         bucket_size_blocks=bucket_size_blocks,
         q2k_block_nums=q2k_block_nums,
+        parallel_offsets=True,
     )
 
     has_block_sizes = block_sizes is not None
@@ -2602,6 +3290,15 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
     if dv is None:
         dv = torch.empty_like(v)
 
+    pair_words = (num_q_blocks + 31) // 32
+    pair_count = (num_kv_blocks + 1) // 2
+    pair_bytes = batch_size * num_heads * (num_kv_blocks * pair_words + 2 * pair_count + num_kv_blocks + num_q_groups * num_kv_blocks) * 4
+    use_paired_kv = _sm100_blk64_use_paired_kv(q2k_block_index, q2k_block_nums, num_kv_blocks, pair_bytes)
+    # Paired and residual tasks share dK/dV, so they still need FP32 accumulation.
+    # One Q group in the regular path gives each KV block one unique CTA owner. For aligned
+    # physical KV64 tiles, that owner can scale/convert dK and dV directly
+    # instead of using FP32 atomic workspaces and postprocessing.
+    use_dkv_postprocess = use_paired_kv or num_q_groups > 1 or seqlen_k % sparse_block_size != 0
     workspace = _empty_bwd_workspace_with_zeroed_accum(
         batch_size=batch_size,
         num_heads=num_heads,
@@ -2613,18 +3310,30 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
         round_d_to=8,
         zero_dq_accum=True,
         device=q.device,
+        include_dkv_accum=use_dkv_postprocess,
     )
 
     problem_shape = (seqlen_q, seqlen_k, head_dim, (num_heads, batch_size))
     current_stream = cuda.CUstream(torch.cuda.current_stream(torch.cuda.current_device()).cuda_stream)
 
+    pair_tensors = ()
+    if use_paired_kv:
+        pair_bits = torch.empty((batch_size, num_heads, num_kv_blocks, pair_words), dtype=torch.int32, device=q.device)
+        pair_duplicates = torch.empty((batch_size, num_heads, pair_count), dtype=torch.int32, device=q.device)
+        pair_flags = torch.empty((batch_size, num_heads, num_kv_blocks + pair_count), dtype=torch.int32, device=q.device)
+        pair_residuals = torch.empty((batch_size, num_heads, num_q_groups, num_kv_blocks), dtype=torch.int32, device=q.device)
+        pair_tensors = (q2k_block_index, q2k_block_nums, pair_bits, pair_duplicates, pair_flags, pair_residuals)
+
     compile_key = (
         "sm100_bucketed_k2q",
+        use_paired_kv,
+        bucket_size_blocks if use_paired_kv else None,
         q.dtype,
         head_dim,
         sparse_block_size,
         arch,
         has_block_sizes,
+        use_dkv_postprocess,
         _tensor_layout_compile_key(dout),
         _tensor_layout_compile_key(out),
         _tensor_layout_compile_key(q),
@@ -2658,10 +3367,14 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
         var_bs_t = _to_cute_tensor(variable_block_sizes, leading_dim=1)
         ws_t = _to_cute_tensor(workspace, fully_dynamic=True)
 
-        bwd_kernel = BlockSparseAttnBackwardSm100Blk64(
-            sparse_block_size=sparse_block_size,
-            has_block_sizes=has_block_sizes,
-        )
+        if use_paired_kv:
+            bwd_kernel = MixedKvBackwardSm100(sparse_block_size, has_block_sizes, bucket_size_blocks)
+        else:
+            bwd_kernel = BlockSparseAttnBackwardSm100Blk64(
+                sparse_block_size=sparse_block_size,
+                has_block_sizes=has_block_sizes,
+                force_dkv_postprocess=use_dkv_postprocess,
+            )
 
         _bsa_attn_bwd_bucketed_k2q_csr.compile_cache[compile_key] = cute.compile(
             bwd_kernel,
@@ -2681,6 +3394,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
             ws_t,
             softmax_scale,
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+            *(_to_cute_tensor(t, assumed_align=4) for t in pair_tensors),
             options="--enable-tvm-ffi",
         )
 
@@ -2702,6 +3416,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
             workspace,
             softmax_scale,
             current_stream,
+            *pair_tensors,
         )
 
     return dq, dk, dv

@@ -312,3 +312,75 @@ def test_dense_metadata_keeps_sized_and_bare_pointer_contracts(role, span_known)
     main, _ = binding_reference.bind_dense_split(spec, facts, 0x100000, 17, 17)
     slot = {"sinks": "sinks_ptr", "seq_q_lens": "seq_q_lens_addr", "seq_kv_lens": "meta_ptr"}[role]
     assert main[spec.index[slot]] == 0x20000
+
+
+@pytest.mark.parametrize(
+    ("adapter", "expect_cc", "rule_line"),
+    [
+        pytest.param(SimpleNamespace(_device_cc=(10, 7)), (10, 7), True, id="sm100_adapter_cc10_7"),
+        pytest.param(SimpleNamespace(_device_cc=(10, 0)), (10, 0), False, id="sm100_adapter_cc10_0"),
+        pytest.param(SimpleNamespace(_device_cc=(10, 3)), (10, 3), False, id="sm100_adapter_cc10_3"),
+        # the SM120 adapter records compute_capability and leaves the base class's _device_cc at None
+        pytest.param(SimpleNamespace(_device_cc=None, compute_capability=(12, 0)), (12, 0), False, id="sm120_adapter_cc12_0"),
+        pytest.param(SimpleNamespace(_device_cc=None, compute_capability=(12, 1)), (12, 1), False, id="sm120_adapter_cc12_1"),
+        pytest.param(SimpleNamespace(_device_cc=(9, 0)), (9, 0), False, id="sm90_adapter_cc9_0"),
+    ],
+)
+def test_split_combine_form_pin_reads_the_plan_device_per_line(adapter, expect_cc, rule_line):
+    """``build_dense_spec`` pins a split plan's combine entry to a kernel FORM through ``_split_combine_decode_grid``, which
+    reads the device the adapter recorded at check_support (``_plan_device_cc``: the SM100 / SM90 adapters' ``_device_cc``,
+    the SM120 adapter's ``compute_capability``) -- on cc 10.7 the split-aware rule (AUTO where it selects the decode-grid
+    kernel, OFF where it pins the module's own forms inside the kernel module's bound, and the LEAN GROUP WALK on a launch
+    past the bound at a split of at most ``heuristics.DECODE_COMBINE_LEAN_WALK_MAX_SPLIT`` (4):
+    ``heuristics.decode_combine_lean_walk_selected``; AUTO past that split), on every other device OFF on every launch inside
+    the bound; outside the bound the AUTO entry is the module's own forms by construction on every line off cc 10.7 and past
+    the walk's split bound on cc 10.7 too.
+    RED before the seam existed: the SM120 adapter's plan read ``tuple(None)``; RED before the walk's restore: the cc 10.7
+    plan past the bound read AUTO."""
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
+
+    assert prep._plan_device_cc(adapter) == expect_cc
+
+    def grid(b, h, s_q, split):
+        return prep._split_combine_decode_grid(adapter, b, h, s_q, split)
+
+    if rule_line:
+        assert grid(1, 24, 1, 16) == comb.DECODE_GRID_AUTO and grid(1, 24, 1, 4) == comb.DECODE_GRID_OFF
+        assert grid(4, 24, 4, 16) == comb.DECODE_GRID_OFF and grid(4, 24, 4, 32) == comb.DECODE_GRID_AUTO
+    else:
+        assert all(grid(*g, s) == comb.DECODE_GRID_OFF for g in ((1, 24, 1), (4, 24, 4), (4, 32, 1)) for s in (4, 8, 16, 32, 128))
+    # 256 lean blocks: past the bound nothing is forced on any line -- the cc 10.7 plan names the restored lean group walk there
+    # up to its split bound (the measured B 32 / B 128 cells at split 2-3: 768 / 3072 blocks), every other line the AUTO entry
+    # (= the module's own forms by construction); past the walk's split bound (4) every line keeps the AUTO entry
+    past = comb.DECODE_GRID_LEAN_WALK if rule_line else comb.DECODE_GRID_AUTO
+    assert grid(8, 32, 1, 4) == past and grid(32, 24, 1, 2) == past and grid(128, 24, 4, 2) == past
+    assert grid(8, 32, 1, 32) == comb.DECODE_GRID_AUTO and grid(32, 24, 1, 8) == comb.DECODE_GRID_AUTO
+
+
+def test_split_combine_form_pin_reads_the_device_when_the_adapter_recorded_none(monkeypatch):
+    """A plan whose adapter recorded neither ``_device_cc`` nor ``compute_capability`` reads its Q tensor's device once more
+    (the adapters' own read) instead of defaulting to any line."""
+    import torch
+
+    seen = []
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: seen.append(device) or (12, 0))
+    api = SimpleNamespace(_device_cc=None, q_desc=SimpleNamespace(device="cuda:3"))
+    assert prep._plan_device_cc(api) == (12, 0) and seen == ["cuda:3"]
+
+
+def test_packed_role_capacity_helper_bounds_the_ragged_token_count():
+    """``_packed_role`` (the ragged-Q leg of the Python frame binder) ends in ``_capacity``: RED on the tree that carried the role binder
+    without the helper (``NameError`` at the capacity line; pyflakes F821), GREEN with it -- a bare address is a typed ValueError, a span
+    shorter than one row holds 0 tokens, else the largest token whose row ends inside the span."""
+    T, H, D = 300, 4, 64
+    f = prep.BufferFacts(ptr=4096, dtype="bfloat16", device=(prep._DLPACK_CUDA, 0), span=T * H * D, shape=(T, H, D), strides=(H * D, D, 1))
+    spec = SimpleNamespace(device_index=0)
+    assert prep._packed_role(spec, {"q": f}, "q", H, D, "bfloat16", tma=True) == (4096, H * D, D, T)
+    geo = (H * D, D, 1, (H - 1) * D + D)  # (token stride, head stride, elem stride, row span)
+    assert prep._capacity(f._replace(span=geo[3]), geo, "q") == 1
+    assert prep._capacity(f._replace(span=geo[3] - 1), geo, "q") == 0
+    assert prep._capacity(f._replace(span=geo[3] + 2 * H * D + 5), geo, "q") == 3
+    with pytest.raises(ValueError, match="bare address"):
+        prep._capacity(f._replace(span=-1), geo, "q")
+    with pytest.raises(ValueError, match="is required"):
+        prep._packed_role(spec, {}, "q", H, D, "bfloat16", tma=True)

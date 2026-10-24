@@ -1370,7 +1370,7 @@ def test_stage3_dq_record_groups_its_b_head_by_the_gqa_group(monkeypatch):
 def test_stage3_dq_launches_pair_every_q_head_with_its_k_head(hq, hkv, hc, bc, single):
     """The coordinate arithmetic of the dQ launches on a fake flat batch index, no GPU: the (b, h) fork decodes
     ``l -> (h = l % n_head, b = l // n_head)`` for A (dS) and C (dQ) and hands B (K) ``h // b_head_group`` (``_b_head``) against a B
-    descriptor ``n_head // b_head_group`` heads deep; ``prepared_host._stage3`` launches ``group // b_head_group`` times, launch
+    descriptor ``ceil(n_head / b_head_group)`` heads deep; ``prepared_host._stage3`` launches ``group // b_head_group`` times, launch
     ``member`` over the chunk's heads ``member :: n_launch`` against the chunk's ``kv_n`` K heads.  For every (b, h) of every
     launch the K head reached must be ``q_head // group`` -- the GQA convention the oracle, the analyzer and the kernels share --
     at ``b_head_group = group`` (one launch) exactly as at 1 (the per-member loop, the twin), and the rendered module carries the
@@ -1415,7 +1415,7 @@ def test_stage3_dq_launches_pair_every_q_head_with_its_k_head(hq, hkv, hc, bc, s
     assert body.count("tile_h_b = _b_head(tile_h)") == 1, "B's head coordinate goes through _b_head"
     assert body.count("tile_h_a = tile_h") == 1 and "(col, coord_m, tile_h, tile_b)" in body, "A and C keep the decoded head"
     assert "return tile_h if cutlass.const_expr(b_head_group == 1) else tile_h // cutlass.Int32(b_head_group)" in body
-    assert "b_h = n_head if cutlass.const_expr(b_head_group == 1) else n_head // b_head_group" in body, "B's descriptor head extent"
+    assert "b_h = n_head if cutlass.const_expr(b_head_group == 1) else (n_head + b_head_group - 1) // b_head_group" in body, "B's descriptor head extent"
     assert body.count("_decode_bh(") == 7, "the flat batch decode stays where it was: the definition + the TMA / MMA / epilogue warps' init and loop-tail sites"
 
 
@@ -1855,7 +1855,7 @@ def test_stage3_b_head_group_default_folds_out_of_the_template():
         [
             "b_head_group = int(getattr(PARAMS, , 1))",  # _code_only blanks the string literal
             "return tile_h if cutlass.const_expr(b_head_group == 1) else tile_h // cutlass.Int32(b_head_group)",
-            "b_h = n_head if cutlass.const_expr(b_head_group == 1) else n_head // b_head_group",
+            "b_h = n_head if cutlass.const_expr(b_head_group == 1) else (n_head + b_head_group - 1) // b_head_group",
         ]
     ), f"a use of b_head_group outside the const_expr fold reached the template: {reads}"
     # _b_head is a traced (@cute.jit) helper with that single return, applied at exactly one site: B's head coordinate
@@ -1884,6 +1884,33 @@ def test_stage3_b_head_group_default_folds_out_of_the_template():
 
     assert default_mod.b_head_group == legacy_mod.b_head_group == 1
     assert consts(default_mod) == consts(legacy_mod), "the default record and the record without the field render different module constants"
+
+
+@pytest.mark.parametrize(
+    "n_head,b_head_group",
+    [(1, 1), (3, 1), (1, 4), (2, 4), (3, 4), (4, 4), (6, 4), (8, 4), (1, 8), (4, 8), (8, 8), (9, 8)],
+)
+def test_stage3_b_descriptor_covers_partial_head_groups(n_head, b_head_group):
+    """Evaluate the template's actual descriptor expression against the K heads reached by every Q head.
+
+    A chunk smaller than its GQA group still reaches one K head. Whole groups and the default group=1 retain their extents.
+    This is a host arithmetic contract; GPU gradient tests separately cover the adapter's admitted subgroup chunks.
+    """
+    import ast
+
+    from cudnn.sdpa.bwd.api_dsl import _SM100_MATMUL_FILE, _sm100_kernel_path
+
+    path = _sm100_kernel_path(_SM100_MATMUL_FILE)
+    tree = ast.parse(Path(path).read_text(encoding="utf-8"))
+    assignments = [node for node in ast.walk(tree) if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "b_h" for t in node.targets)]
+    assert len(assignments) == 1, "exercise the actual grouped B descriptor extent"
+    expression = compile(ast.Expression(assignments[0].value), path, "eval")
+    extent = eval(expression, {"cutlass": types.SimpleNamespace(const_expr=bool), "n_head": n_head, "b_head_group": b_head_group})
+    reached_k_heads = {q_head // b_head_group for q_head in range(n_head)}
+    assert extent == len(reached_k_heads), (n_head, b_head_group, extent, reached_k_heads)
+    assert all(0 <= k_head < extent for k_head in reached_k_heads), "every addressed K head is inside the descriptor"
+    if b_head_group == 1:
+        assert extent == n_head, "the default arm preserves the original head extent"
 
 
 def test_stage3_cluster_tile_is_the_d256_one_on_the_rubin_line_only(monkeypatch):
@@ -2222,10 +2249,11 @@ def test_half_adapter_admits_thd_and_sizes_its_packed_workspace_at_build():
     """The half row's THD plan: declared totals tighten the token capacity (a MIN), the dS workspace is kv-BLOCKED at the
     kernel's 256-row block with every sequence padded to it, no staging and no batch chunking, the metadata region carries the
     main kernel's (5 + B) tensor maps, the GQA partials ride the packed kv capacity, and the two length operands join the launch record
-    (``length_form``)."""
+    (``length_form``) at slots 9 / 10, ahead of the appended standalone-only delta slot (``test_sdpa_bwd_thd_sm107.py`` holds its
+    contract)."""
     from cudnn.frost.tile_dsl.thd import THD_BWD_MAPS_META_WORDS
     from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107
-    from cudnn.sdpa.bwd.prepared_sm107 import ATTRIBUTES_F16_THD, ROLES_F16_THD
+    from cudnn.sdpa.bwd.prepared_sm107 import ATTRIBUTES_F16_THD, EXTERNAL_DELTA_ROLE, ROLES_F16_THD
 
     api = _adapter(SdpaBwdDslSm107, b=3, hq=4, hkv=2, sq=300, skv=500, thd=True, max_total_seq_len_q=628, max_total_seq_len_kv=5000)
     assert api.check_support()
@@ -2237,7 +2265,8 @@ def test_half_adapter_admits_thd_and_sizes_its_packed_workspace_at_build():
     assert plan["seq_kv"] == (THD_BWD_MAPS_META_WORDS(3, 8),) and plan["desc_words"] == (4 * 16,)
     assert plan["dv_part"] == (1, 1500, 4, 256) and plan["dk_part"] == (1, 1500, 4, 256) and "q_pad" not in plan and "k_pad" not in plan
     assert api._template_params().thd_varlen and not api._template_params().seq_kv_lens_present
-    assert ROLES_F16_THD[-2:] == ("seq_q", "seq_kv") and ATTRIBUTES_F16_THD[-2:] == ("seq_len_q", "seq_len_kv") and len(ROLES_F16_THD) == 11
+    assert ROLES_F16_THD[9:11] == ("seq_q", "seq_kv") and ATTRIBUTES_F16_THD[9:11] == ("seq_len_q", "seq_len_kv") and len(ROLES_F16_THD) == 12
+    assert ROLES_F16_THD[-1] == ATTRIBUTES_F16_THD[-1] == EXTERNAL_DELTA_ROLE, "the delta slot is appended LAST, after the two lengths"
     # The stage-3 records under THD: the THD arm on, rows KV-major, the SAME two-sided trim as the dense records (per sequence
     # in the template: a constant shift of 0, bottom-right spelled as `thd_causal_bottom_right`), dQ once per head chunk.
     from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, CAUSAL_K_LO, CAUSAL_K_NONE, validate_matmul_params
@@ -2441,8 +2470,9 @@ def test_half_adapter_external_delta_is_a_plan_fact_that_drops_the_region(monkey
     assert own.scratch_workspace_bytes() - ext.scratch_workspace_bytes() == ws_align(2 * 8 * 512 * 4)
     assert (own._b_chunk, own._qh_chunk, own._sq_pad, own._skv_pad) == (ext._b_chunk, ext._qh_chunk, ext._sq_pad, ext._skv_pad)
     e4m3 = torch.float8_e4m3fn
-    # The quantized rows take the flag too (DENSE only; their THD plans decline it): the carve drops ``delta`` under it and the
-    # standalone-only role is appended LAST on both role lists (after the per-batch kv lengths).  The fp8 kernel reads delta in
+    # The quantized rows take the flag too (the dense plans here; their THD plans serve it as well -- test_sdpa_bwd_thd_*_sm107.py):
+    # the carve drops ``delta`` under it and the standalone-only role is appended LAST on both role lists (after the per-batch kv
+    # lengths).  The fp8 kernel reads delta in
     # TRUE units unscaled, so a caller's bf16-derived delta binds AS IS; the mxfp8 delta is the dot of the f16 ports.
     for api_ext, api_own in (
         (_adapter(SdpaBwdDslSm107Fp8, dt=e4m3, grad_dt=e4m3, external_delta=True), _adapter(SdpaBwdDslSm107Fp8, dt=e4m3, grad_dt=e4m3)),
@@ -3685,8 +3715,21 @@ _SASS_PROBE = textwrap.dedent(r"""
         return sum(1 for ln in sass if all(sb in ln for sb in subs))
     # The main kernel's section only: a THD build's cubin also carries the one-shot setup kernel (descriptor patching, whose
     # GENERIC->TENSORMAP release fence lowers to MEMBAR.ALL.GPU + CGAERRBAR), which the per-tile drain pin must not read.
-    main_end = next((i for i, ln in enumerate(sass) if ".text." in ln and "setup_kernel" in ln), len(sass))
-    main_sass = sass[:main_end]
+    # Select by section symbol rather than assuming main precedes setup in the disassembly.
+    sections = [(i, ln) for i, ln in enumerate(sass) if re.match(r"^\s*\.section\s+", ln)]
+    sections.append((len(sass), ""))
+    main_sass = []
+    setup_lines = 0
+    for (start, header), (stop, _) in zip(sections, sections[1:]):
+        section = re.match(r"^\s*\.section\s+\.text\.([^,\s]+)", header)
+        if section is None:
+            continue
+        symbol = section.group(1)
+        if "setup_kernel" in symbol:
+            setup_lines += stop - start
+        elif "cudnn_kernel__kernel_" in symbol:
+            main_sass.extend(sass[start:stop])
+    assert main_sass, "No main kernel .text section found in the disassembly"
     def cnt_main(*subs):
         return sum(1 for ln in main_sass if all(sb in ln for sb in subs))
     print("SASS USETMAXREG", cnt_main("USETMAXREG"))
@@ -3694,7 +3737,7 @@ _SASS_PROBE = textwrap.dedent(r"""
     print("SASS LDL", cnt_main("LDL"))
     print("SASS MEMBAR_GPU", cnt_main("MEMBAR.ALL.GPU"))
     print("SASS CGAERRBAR", cnt_main("CGAERRBAR"))
-    print("SASS SETUP_KERNEL_LINES", len(sass) - main_end)
+    print("SASS SETUP_KERNEL_LINES", setup_lines)
     print("SASS SYNCS_PHASECHK", sum(1 for ln in sass if "SYNCS.PHASECHK" in ln and "USYNCS.PHASECHK" not in ln))
     print("SASS USYNCS_PHASECHK", cnt("USYNCS.PHASECHK"))
     print("SASS NANOSLEEP", cnt("NANOSLEEP"))

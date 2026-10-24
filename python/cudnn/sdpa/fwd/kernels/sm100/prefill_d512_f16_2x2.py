@@ -634,6 +634,12 @@ def _kernel(
 _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
+# Only the common dense CLC path has a single scheduler publisher.
+# THD/predecode retains local schedulers and broadcast credits.
+if not CFG.THD_VARLEN:
+    from cudnn.frost.tile_dsl.scheduler import read_tile_id_arrive_on_leader as read_tile_id_arrive
+
+
 @cute.jit
 def _tma_issue_k(sK, tma_k, bars, k_state, kv_loop, kv_head_idx, row_off, tma_batch, is_leader, kv_mcast_mask, k_share_col, k_share_smem):
     """Both 32 KiB d-half sub-chunks of K tile ``kv_loop`` (this CTA's 64 kv rows): wait the slot, leader expect_tx of
@@ -1062,6 +1068,7 @@ def _mma_warp_group(
         b_dtype=STORAGE_DTYPE,
         n_dim=CFG.TILE_N,
         m_dim=CFG.TILE_M * CFG.CTA_MMA,
+        a_negate=int(PARAMS.negate_scores),
     )
     idesc_pv = prims.Tcgen05InstrDesc.build(
         c_dtype=cutlass.Float32,

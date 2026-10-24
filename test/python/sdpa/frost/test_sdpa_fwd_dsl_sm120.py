@@ -400,6 +400,7 @@ def _run_thd_case(
     stats_layout: str = "token_major",
     cu_lens: bool = False,
     nan_capacity_tail: bool = False,
+    scale: float | None = None,
 ) -> None:
     """Run a THD (ragged) graph on the SM120 engine vs per-sequence references.
 
@@ -418,7 +419,7 @@ def _run_thd_case(
     s_q_max = max(max(seq_q_lens), 1)
     s_kv_max = max(max(seq_kv_lens), 1)
     d_v = head_dim if head_dim_v is None else head_dim_v
-    scale = 1.0 / math.sqrt(head_dim)
+    scale = 1.0 / math.sqrt(head_dim) if scale is None else scale
     q_seqs = [_bhsd(1, h_q, max(n, 1), head_dim, dtype)[:, :, :n] for n in seq_q_lens]
     k_seqs = [_bhsd(1, h_kv, max(n, 1), head_dim, dtype)[:, :, :n] for n in seq_kv_lens]
     v_seqs = [_bhsd(1, h_kv, max(n, 1), d_v, dtype)[:, :, :n] for n in seq_kv_lens]
@@ -1594,7 +1595,7 @@ def test_dsl_sm120_pack_gqa_tiles(s_q: int):
 @pytest.mark.L0
 @torch_fork_set_rng(seed=2)
 def test_dsl_sm120_pack_gqa_tile64():
-    """Packed at q_tile=64 (G must divide the smaller tile: 8/2 -> G=4)."""
+    """Packed at q_tile=64 with a group that divides it (8/2 -> G=4: 16 tokens in all 64 rows, no dead rows)."""
     _run_case(batch=2, h_q=8, h_kv=2, s_q=24, s_kv=192, head_dim=64, is_causal=True, q_tile=64, kv_tile=64, pack_gqa=True, check_stats=True)
 
 
@@ -1633,6 +1634,97 @@ def test_dsl_sm120_pack_gqa_features(mask: str):
 def test_dsl_sm120_pack_gqa_deep(dtype: torch.dtype, s_q: int, h_kv: int):
     """Packed multi-tile / odd-length row spaces, bf16."""
     _run_case(batch=1, h_q=64, h_kv=h_kv, s_q=s_q, s_kv=2048, head_dim=128, dtype=dtype, is_causal=True, pack_gqa=True)
+
+
+# --- PackGQA with tile_q % G != 0: q_tile // G tokens, the rows past them dead
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "h_q,head_dim,tiles",
+    [
+        (24, 128, (128, 128)),  # G=6: 21 tokens in 126 live rows
+        (24, 128, (64, 64)),  # G=6: 10 tokens in 60 live rows; the tile at token 60 crosses key 64
+        (20, 128, (128, 64)),  # G=5: 25 tokens in 125 live rows; the tile at token 50 crosses key 64
+        (12, 128, (64, 64)),  # G=3: 21 tokens in 63 live rows
+        (24, 256, (128, 64)),  # G=6 on the D=256 template: 21 tokens in 126 live rows
+        (28, 256, (128, 64)),  # G=7 on the D=256 template: 18 tokens in 126 live rows; token 54 crosses key 64
+        (24, 512, (64, 32)),  # G=6 on the D=512 template (TMA Q); the tile at token 30 crosses key 32
+    ],
+    ids=["g6_128x128", "g6_64x64", "g5_128x64", "g3_64x64", "g6_d256", "g7_d256", "g6_d512"],
+)
+@torch_fork_set_rng(seed=5)
+def test_dsl_sm120_pack_gqa_tile_q_not_divisible(h_q: int, head_dim: int, tiles: tuple[int, int]):
+    """A group the tile does not divide packs on every template; its dead rows (zero Q) never store, or
+    they would land on the next tile's first token. Top-left causal over 70 tokens starts
+    packed tiles off the KV grid, so the diagonal can straddle one more KV tile than the token span."""
+    _run_case(batch=2, h_q=h_q, h_kv=4, s_q=70, s_kv=280, head_dim=head_dim, is_causal=True, q_tile=tiles[0], kv_tile=tiles[1], pack_gqa=True, check_stats=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("mask", ["decode", "mtp_causal_br_sink", "swa_sink", "padded_qtrim"])
+@torch_fork_set_rng(seed=6)
+def test_dsl_sm120_pack_gqa_tile_q_not_divisible_features(mask: str):
+    """GQA 6 packed x the decode shapes (the heuristics' packed plan, split or not) and the dense
+    mask / sink / trim envelope, stats checked."""
+    kw: dict = dict(batch=2, h_q=24, h_kv=4, s_q=40, s_kv=256, head_dim=128, pack_gqa=True, check_stats=True)
+    if mask == "decode":
+        kw.update(s_q=1, s_kv=4133)
+    elif mask == "mtp_causal_br_sink":
+        kw.update(s_q=4, s_kv=4133, is_causal=True, causal_bottom_right=True, window_size_right=0, with_sink=True)
+    elif mask == "swa_sink":
+        kw.update(is_causal=True, window_size_left=16, with_sink=True)
+    elif mask == "padded_qtrim":
+        kw.update(
+            seq_q_lens=torch.tensor([37, 13], dtype=torch.int32, device="cuda"),
+            seq_kv_lens=torch.tensor([180, 240], dtype=torch.int32, device="cuda"),
+        )
+    _run_case(**kw)
+
+
+@pytest.mark.L0
+def test_dsl_sm120_pack_gqa_admits_any_ratio_up_to_the_tile():
+    """Every template packs any group up to the tile, and declines a group past it."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+
+    def api(h_q: int, h_kv: int, d: int, q_tile: int):
+        q = _bhsd(1, h_q, 8, d, torch.float16)
+        kv = _bhsd(1, h_kv, 64, d, torch.float16)
+        return SdpaFwdDslSm120(sample_q=q, sample_k=kv, sample_v=kv, sample_o=torch.empty_like(q), tile_m=q_tile, pack_gqa=True)
+
+    for d, q_tile in ((128, 64), (256, 128), (512, 64)):
+        assert api(24, 4, d, q_tile).check_support()
+        with pytest.raises(ValueError, match=rf"h_q/h_kv <= q_tile \({q_tile}\)"):
+            api(2 * q_tile, 1, d, q_tile).check_support()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("head_dim,kv_tile", [(128, 64), (512, 32)], ids=["d128", "d512"])
+@torch_fork_set_rng(seed=7)
+def test_dsl_sm120_pack_gqa_dead_rows_never_store(head_dim: int, kv_tile: int):
+    """A packed tile's dead rows map onto the next tile's first token (row r -> token r // G). Under LPT every
+    head's last Q tile is dispatched before any first one, and 384 of them outlast one wave, so a dead-row store
+    would land after the next tile's live store and overwrite it."""
+    _require_dsl()
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+
+    q = _bhsd(96, 24, 20, head_dim, torch.float16)
+    k = _bhsd(96, 4, 256, head_dim, torch.float16)
+    v = _bhsd(96, 4, 256, head_dim, torch.float16)
+    o = torch.empty_like(q)
+    lse = torch.empty(96, 24, 20, dtype=torch.float32, device="cuda")
+    # G = 6 at 64 rows: two tiles of 10 tokens per packed head, rows 60-63 dead.
+    api = SdpaFwdDslSm120(
+        sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, is_causal=True, tile_m=64, tile_n=kv_tile, pack_gqa=True, sched_policy=SCHED_LPT
+    )
+    assert api.check_support()
+    api.compile()
+    ws = torch.empty(max(api.scratch_workspace_bytes(), 1), dtype=torch.uint8, device="cuda")
+    api.execute(workspace=ws, q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse)
+    torch.cuda.synchronize()
+    expected, expected_lse = _ref_sdpa_full(q, k, v, scale=1.0 / math.sqrt(head_dim), is_causal=True, return_stats=True)
+    torch.testing.assert_close(o.float(), expected, atol=0.1, rtol=5e-2)
+    torch.testing.assert_close(lse, expected_lse, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.L0
@@ -1960,3 +2052,65 @@ def test_dsl_sm120_thd_parallel_prefix_batches(batch, cu_lens):
     q = [(0, 17, 63, 65, 129)[i % 5] for i in range(batch)]
     kv = [(31, 0, 65, 127, 257)[i % 5] for i in range(batch)]
     _run_thd_case(seq_q_lens=q, seq_kv_lens=kv, h_q=4, h_kv=2, head_dim=128, cu_lens=cu_lens, nan_capacity_tail=True, check_stats=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)], ids=["d64", "d128", "d192x128", "d256", "d512"])
+@pytest.mark.parametrize("mask", ["none", "causal", "padded_sink_bottom_right"])
+@torch_fork_set_rng(seed=31)
+def test_dsl_sm120_negative_attn_scale(d_qk, d_v, mask):
+    """A negative attn_scale is folded into Q's sign so the raw-score row max still bounds P (#1435); before, every
+    masked case returned NaN. The KV length is not a tile multiple, so "none" also masks a tail."""
+    kw = dict(batch=2, h_q=4, h_kv=2, s_q=160, s_kv=200, head_dim=d_qk, head_dim_v=d_v, scale=-0.7 / math.sqrt(d_qk), check_stats=True)
+    if mask == "causal":
+        kw.update(is_causal=True)
+    elif mask == "padded_sink_bottom_right":
+        kw.update(
+            is_causal=True,
+            causal_bottom_right=True,
+            with_sink=True,
+            seq_q_lens=torch.tensor([150, 160], dtype=torch.int32, device="cuda").view(2, 1, 1, 1),
+            seq_kv_lens=torch.tensor([180, 200], dtype=torch.int32, device="cuda").view(2, 1, 1, 1),
+        )
+    _run_case(**kw)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (256, 256), (512, 512)], ids=["d128", "d256", "d512"])
+@torch_fork_set_rng(seed=32)
+def test_dsl_sm120_thd_negative_attn_scale(d_qk, d_v):
+    """The packed path loads Q without TMA (the d512 kernel's register/shared-slot split included)."""
+    _run_thd_case(
+        seq_q_lens=[96, 0, 41],
+        seq_kv_lens=[130, 7, 41],
+        h_q=4,
+        h_kv=2,
+        head_dim=d_qk,
+        head_dim_v=d_v,
+        is_causal=True,
+        causal_bottom_right=True,
+        with_sink=True,
+        check_stats=True,
+        scale=-0.7 / math.sqrt(d_qk),
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=33)
+def test_dsl_sm120_execute_scale_sign_must_match_the_plan():
+    """The scale's sign is compiled into the plan (negate_scores), so an execute-time scale of the other sign is refused."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+
+    b, h, s, d = 1, 2, 128, 128
+    q, k, v = (_bhsd(b, h, s, d, torch.float16) for _ in range(3))
+    o = torch.empty_like(q)
+    for planned in (d**-0.5, -(d**-0.5)):
+        api = SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o, scale_softmax=planned)
+        assert api.check_support()
+        api.compile()
+        with pytest.raises(ValueError, match="sign"):
+            api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, scale_softmax=-planned)
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, scale_softmax=2 * planned)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(o.float(), _ref_sdpa_full(q, k, v, scale=2 * planned), atol=0.1, rtol=5e-2)

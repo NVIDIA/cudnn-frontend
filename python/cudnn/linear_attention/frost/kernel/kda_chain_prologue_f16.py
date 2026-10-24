@@ -29,7 +29,7 @@ import cutlass.experimental.cuda.tensor_map as tma
 import cutlass.experimental.primitives as nvvm
 from cutlass.cute.runtime import from_dlpack
 
-from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
+from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
 
 from ..common.piece_chain import piece_table_body
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, gen_interval_items, order_body
@@ -91,7 +91,6 @@ def frost_kda_chain_prologue(
 ) -> None:
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
-        launch_dependent_grids()
     tidx = cutlass.Int32(cute.arch.thread_idx()[0])
     widx = tidx // cutlass.Int32(32)
     bidx = cutlass.Int32(cute.arch.block_idx()[0])

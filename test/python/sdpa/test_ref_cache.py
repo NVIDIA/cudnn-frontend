@@ -319,15 +319,20 @@ def test_the_recipe_files_are_the_test_trees_frames_never_the_harness():
     test-tree frames must not end the walk, see the wrapper pin above)."""
     import sysconfig
 
+    import _pytest
+    import pluggy
+
+    # Where the harness actually lives -- site-packages, Debian's dist-packages, a venv: located by module, not by a path spelling.
+    harness = tuple(os.path.join(os.path.dirname(os.path.realpath(m.__file__)), "") for m in (_pytest, pluggy, torch))
+    harness += (os.path.join(os.path.realpath(sysconfig.get_paths()["stdlib"]), ""),)
     frame, raw = sys._getframe(), []
     while frame is not None:
-        raw.append(frame.f_code.co_filename)
+        raw.append(os.path.realpath(frame.f_code.co_filename))
         frame = frame.f_back
-    assert any("site-packages" in f for f in raw), "pytest's own frames are on this stack"
+    assert any(f.startswith(harness) for f in raw), "pytest's own frames are on this stack"
     files = ref_cache._recipe_files(lambda: None, sys._getframe())
-    library = (sysconfig.get_paths()["purelib"], sysconfig.get_paths()["stdlib"])
     assert os.path.realpath(__file__) in files, files
-    assert all(os.path.isfile(f) and not f.startswith(library) and "site-packages" not in f for f in files), files
+    assert all(os.path.isfile(f) and not f.startswith(harness) for f in files), files
 
 
 # ---- _REF_SOURCES is closed under its own imports: a listed reference module imports no unlisted test-tree module

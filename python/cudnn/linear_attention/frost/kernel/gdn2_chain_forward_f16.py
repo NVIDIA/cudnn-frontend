@@ -34,9 +34,49 @@ from cutlass.cute.runtime import from_dlpack
 
 from cudnn.frost.buffers import DeviceView
 
+from cudnn.frost.compiled_cache import compile_cached
+
 from ..common.host import get_dtype
 from ..common.piece_chain import dtype_name, launch_state_chain
 from . import gdn2_chain_prologue_f16, gdn2_prefill_f16, gdn2_summary_f16
+
+CHAIN_FORWARD_BUFFERS = (
+    "q",
+    "k",
+    "v",
+    "gate",
+    "beta",
+    "beta",
+    "w",
+    "a_log",
+    "dt_bias",
+    "o",
+    "cu_seqlens",
+    "cu_pieces",
+    "cu_pieces",
+    "main_rows",
+    "summary_rows",
+    "main_count",
+    "summary_count",
+    "work_items",
+    "work_items_summary",
+    "scheduler_all",
+    "scheduler_summary",
+    "scheduler_prefill",
+    "summary_words",
+    "prefill_words",
+    "state_h",
+    "state_m",
+    "state_h",
+    "state_m",
+    "state_x",
+    "seed",
+    "seed_indices",
+    "state_x",
+    "final_state",
+    "final_indices",
+    "checkpoints",
+)
 
 chain_forward_cache = {}
 
@@ -298,6 +338,7 @@ def build_chain_forward(
         bool(allow_neg_eigval),
         bool(beta_guard),
         int(checkpoint_every_n_tokens) > 0,
+        str(checkpoints.dtype) if int(checkpoint_every_n_tokens) > 0 else "none",
         final_state is not None,
         has_seed,
         seed_indices is not None,
@@ -327,6 +368,7 @@ def build_chain_forward(
             use_initial_state=True,
             store_final_state=final_state is not None,
             enable_checkpoints=int(checkpoint_every_n_tokens) > 0,
+            checkpoint_dtype=get_dtype(checkpoints.dtype) if int(checkpoint_every_n_tokens) > 0 else None,
             l2norm=use_qk_l2norm,
             safe_gate=safe_gate,
             gate_scale_log2=gate_scale_log2,
@@ -343,7 +385,7 @@ def build_chain_forward(
         work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
         work_items_summary_placeholder = from_dlpack(work_items_summary, assumed_align=16)
         work_items_summary_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        chain_forward_cache[key] = cute.compile(
+        chain_forward_cache[key] = compile_cached(
             chain_forward_host,
             int(unit_chunks),
             int(b_t),
@@ -395,6 +437,8 @@ def build_chain_forward(
             from_dlpack(final_indices, assumed_align=4).mark_layout_dynamic() if final_indices is not None else None,
             from_dlpack(checkpoints, assumed_align=16).mark_layout_dynamic(leading_dim=3) if checkpoints is not None else None,
             cuda.CUstream(int(stream)),
+            cache_key=repr((__name__, key)),
+            symbol="frost_la_gdn2_chain_forward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
     return chain_forward_cache[key]
@@ -442,46 +486,13 @@ def run_chain_forward(
 ) -> None:
     """Replay the chain forward: one crossing into the DSL for the four launches.  The plan validated the contract at build,
     so nothing here raises."""
+    buffers = locals()
     compiled(
         int(pieces),
         int(heads_out),
         int(num_seqs),
         int(checkpoint_every_n_tokens),
         float(scale),
-        q,
-        k,
-        v,
-        gate,
-        beta,
-        beta,
-        w,
-        a_log,
-        dt_bias,
-        o,
-        cu_seqlens,
-        cu_pieces,
-        cu_pieces,
-        main_rows,
-        summary_rows,
-        main_count,
-        summary_count,
-        work_items,
-        work_items_summary,
-        scheduler_all,
-        scheduler_summary,
-        scheduler_prefill,
-        summary_words,
-        prefill_words,
-        state_h,
-        state_m,
-        state_h,
-        state_m,
-        state_x,
-        seed,
-        seed_indices,
-        state_x,
-        final_state,
-        final_indices,
-        checkpoints,
+        *(buffers[name] for name in CHAIN_FORWARD_BUFFERS),
         cuda.CUstream(int(stream)),
     )

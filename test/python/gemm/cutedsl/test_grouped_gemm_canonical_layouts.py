@@ -153,18 +153,18 @@ def test_grouped_gemm_swiglu_canonical_bf16_prob(request):
     assert_same("c", canonical["c_tensor"], legacy["c_tensor"])
 
 
-def dswiglu_case(request):
+def dswiglu_case(request, ab_dtype=torch.float8_e4m3fn, d_dtype=torch.float8_e4m3fn, sf_vec_size=32, sf_dtype=torch.float8_e8m0fnu):
     cfg = grouped_gemm_swiglu_init(
         request=request,
-        ab_dtype=torch.float8_e4m3fn,
+        ab_dtype=ab_dtype,
         c_dtype=torch.bfloat16,
-        d_dtype=torch.float8_e4m3fn,
+        d_dtype=d_dtype,
         cd_major="n",
         acc_dtype=torch.float32,
         mma_tiler_mn=(256, 256),
         cluster_shape_mn=(2, 1),
-        sf_vec_size=32,
-        sf_dtype=torch.float8_e8m0fnu,
+        sf_vec_size=sf_vec_size,
+        sf_dtype=sf_dtype,
     )
     inputs = allocate_grouped_gemm_input_tensors(
         n=cfg["n"],

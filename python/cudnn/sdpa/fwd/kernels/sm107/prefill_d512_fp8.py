@@ -82,6 +82,7 @@ from cutlass._mlir.dialects import arith
 import cutlass
 from cutlass.experimental import primitives as prims
 import cutlass.cute as cute
+from cudnn.sdpa.fwd.kernels._quantized import _descale_qk_negate_bit
 from cutlass.base_dsl.typing import Pointer
 from cutlass.experimental.cuda import tensor_map as tmap
 from cudnn.frost.tile_dsl.tma import cp_async_bulk_shared_cluster_shared_cta
@@ -248,6 +249,7 @@ from cudnn.sdpa.fwd.kernels._common_blackwell import (
     compute_kv_loop_bounds,
     lpt_tile_coords,
     make_sdpa_helpers,
+    running_max_step_finite_sentinel,
 )
 
 # ----------------------------------------------------------------------------
@@ -704,7 +706,7 @@ def _kernel(
     _dsc_k = cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
     _dsc_v = cutlass.Float32(cutlass.make_array_view(descale_v_t)[0])
     _scl_o = cutlass.Float32(cutlass.make_array_view(scale_o_t)[0])
-    scale_softmax_log2 = scale_softmax_log2 * _dsc_q * _dsc_k
+    scale_softmax_log2 = cute.math.abs(scale_softmax_log2 * _dsc_q * _dsc_k)
     o_scale_fused = o_scale_fused * _dsc_v * _scl_o
 
     # ------------------------------------------------------------------
@@ -923,7 +925,7 @@ def _kernel(
     #   MMA       (warp 4): sg-conditional BMM1 (sg0) OR BMM2 (sg1);
     #                       non-leader CTAs run quiet (sg0) or forwarder (sg1).
     #   TMA-LDG   (warp 5): sg-conditional Q+K (sg0) OR V (sg1).
-    #   TMA-STG   (warp 6): sg1 only — O + LSE.  sg0 spins scheduler only.
+    #   TMA-STG   (warp 6): sg1 only — O + LSE.  sg0 does not enter the scheduler loop.
     #   Scheduler (warp 7): try_cancel; both sgs.
     # ------------------------------------------------------------------
     if warp_idx >= cutlass.Int32(CFG.SOFTMAX_WG0_BASE) and warp_idx < cutlass.Int32(CFG.SOFTMAX_WG0_BASE + CFG.SOFTMAX_WG_WARPS):
@@ -983,6 +985,8 @@ def _kernel(
                 mcast_mask=mcast_mask,
                 sg0_mcast_mask=sg0_mcast_mask,
                 cta_in_pair=cta_in_pair,
+                descale_q_t=descale_q_t,
+                descale_k_t=descale_k_t,
             )
         else:
             _mma_warp_non_leader(
@@ -1088,6 +1092,12 @@ _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 # kernel-local vars are passed as explicit args; constants come from
 # module-level (NEG_INF_F32, RESCALE_THRESHOLD_F32, P_*, SOFTMAX_*, etc.).
 # ============================================================================
+# Only the common dense CLC path has a single scheduler publisher.
+# THD/predecode retains local schedulers and broadcast credits.
+if not CFG.THD_VARLEN:
+    from cudnn.frost.tile_dsl.scheduler import read_tile_id_arrive_on_leader as read_tile_id_arrive
+
+
 @cute.jit
 def _sg0_softmax_kv_iter(
     apply_mask: cutlass.Constexpr[bool],
@@ -1173,33 +1183,28 @@ def _sg0_softmax_kv_iter(
             s_addr_base,
             num_elems=CFG.TILE_N,
         )
+    # current_max_raw is the tile's RAW row max -- exactly NEG_INF_F32 (the finite mask sentinel) iff every column of this
+    # tile is masked; running_max_step_finite_sentinel keys its dead-tile select on it.  scale_log2 carries the per-tensor
+    # descale fold, so the scaled sentinel stays finite under the quantizer's descales and overflows under unit ones.
     current_max = current_max_raw * scale_log2
 
-    # Online softmax (RESCALE_THRESHOLD skip).
-    old_total_max = total_max
-    is_first = total_max == NEG_INF_F32
-    update_cond = is_first | ((current_max - total_max) > RESCALE_THRESHOLD_F32)
-    total_max = cutlass.Float32(
-        arith.select(
-            update_cond.ir_value(),
-            current_max.ir_value(),
-            total_max.ir_value(),
-        )
+    # Online softmax with the RESCALE_THRESHOLD skip: the running max, alpha and the exp2 shift of this tile.  A tile that
+    # is fully masked AHEAD of the row's first live key is selected out of the state (total_max stays NEG_INF_F32, alpha = 1,
+    # shift 0 -> P = 0 on every column): the finite mask sentinel never becomes the running max (scaled by scale_log2 > 1
+    # it overflowed to -inf and the shift read -inf - (-inf) = NaN into P; below that every masked
+    # column published P = 1, mass that only alpha = 0 at the next live tile wiped -- a multiply by zero).  Folded out
+    # of the MASK_NONE build; a row with no live key at all still ends its loop at (NEG_INF_F32, 0) and is published by the
+    # epilogue's _row_empty select.
+    total_max, alpha, new_total_max = running_max_step_finite_sentinel(
+        current_max_raw, current_max, total_max, NEG_INF_F32, RESCALE_THRESHOLD_F32, masked=CFG.MASK_FLAGS != MASK_NONE
     )
-    exp_input = cutlass.Float32(
-        arith.select(
-            is_first.ir_value(),
-            NEG_INF_F32.ir_value(),
-            (old_total_max - total_max).ir_value(),
-        )
-    )
-    alpha = cute.math.exp2(exp_input, fastmath=True)
 
-    # reg_S = reg_S * scale_log2 - total_max (one FFMA2 per pair -- the per-tensor descale fold rides in scale_log2, so
-    # there is no pre-folded arm here); then exp2 and the FP8 pack.  Keep the FP32 RegTile (slice via .vec slicing) and
+    # reg_S = reg_S * scale_log2 - new_total_max (one FFMA2 per pair -- the per-tensor descale fold rides in scale_log2, so
+    # there is no pre-folded arm here; new_total_max is the running max, or 0 on a dead leading tile, whose columns then land
+    # at exp2(sentinel) = +0); then exp2 and the FP8 pack.  Keep the FP32 RegTile (slice via .vec slicing) and
     # cast each chunk to FP8 inside the P_TMA_ITERS loop — RegTile(Float8E4M3FN) is illegal at JIT, but slicing the FP32
     # RegTile then casting the slice is fine (per d256_fp8 pattern).
-    reg_S_scaled = reg_S_tile.vec * scale_log2 - total_max
+    reg_S_scaled = reg_S_tile.vec * scale_log2 - new_total_max
 
     # ---- Write P[tid, :] to SMEM xfer ring slot[parity] (K1 swizzle hoist + K2 fp8 pack) ----
     # K1: the Swizzle(3,4,3) XOR term of every 16-B vector of this lane's P row is LOOP-INVARIANT: the swizzle XORs bits
@@ -2094,6 +2099,8 @@ def _mma_warp_group(
     mcast_mask,
     sg0_mcast_mask,
     cta_in_pair,
+    descale_q_t,
+    descale_k_t,
 ):
     """MMA warp leader — sg-conditional BMM1 (sg0 leader) or BMM2 (sg1 leader).
 
@@ -2141,7 +2148,9 @@ def _mma_warp_group(
         n_dim=CFG.TILE_N,
         m_dim=CFG.TILE_M * CFG.CTA_MMA,
         k_dim=1,
+        a_negate=int(PARAMS.negate_scores),
     )
+    idesc_qk = idesc_qk ^ _descale_qk_negate_bit(descale_q_t, descale_k_t)
     # BMM2 idesc — N per call = 256 (NOT TILE_O); 2 calls per BMM2.
     idesc_pv = prims.Tcgen05InstrDesc.build(
         c_dtype=cutlass.Float32,
@@ -2696,10 +2705,8 @@ def _tmastg_warp_group(
 ):
     """sg1: persistent O-store + per-chunk mb_tma_o_empty drain.
 
-    sg0 TMASTG (port of C++ lines 1417-1428): idle — just spin scheduler so
-    persistent tile claims advance in lockstep with sg1.  Does NOT call
-    read_tile_id_arrive (per the READ_TILE_ARRIVERS = 25 derivation — sg0's
-    TMASTG slot is NOT in the arriver list).
+    sg0 has no store work and does not enter the scheduler loop. It is not
+    counted in READ_TILE_ARRIVERS, so it must not consume scheduler responses.
 
     sg1 TMASTG (port of C++ lines 1430-1467):
         Per tile:
@@ -2728,14 +2735,14 @@ def _tmastg_warp_group(
         n_batch,
         seq_kv_lens_tensor,
     )
-    is_valid_tile = cutlass.Int32(1)
+    # sg0 does not store O or contribute scheduler read credits. It must not
+    # observe the ring: the credited roles could reuse its slot twice before
+    # this idle warp consumes a response, losing the terminal phase.
+    is_valid_tile = cutlass.Int32(is_sg1)
     sched_state = PipelineState.start()
 
     while is_valid_tile > cutlass.Int32(0):
-        # sg0's TMA-STG slot is idle but spins the scheduler so persistent
-        # tile claims advance in lockstep with sg1.  sg0 does NOT call
-        # read_tile_id_arrive (per the READ_TILE_ARRIVERS=25 derivation —
-        # sg0's TMA-STG slot is intentionally NOT in the arriver list).
+        # Only sg1 consumes scheduler responses and returns their read credit.
         if is_sg1:
             read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
 

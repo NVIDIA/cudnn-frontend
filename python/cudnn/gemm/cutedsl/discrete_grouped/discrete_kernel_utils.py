@@ -48,7 +48,7 @@ def _require_pointer_tensor(ptrs: torch.Tensor, name: str, expected_len: int | N
     """Validate a torch int64 device pointer-array tensor (torch-only contract).
 
     Type-erased APIs that also accept JAX arrays should use the framework-neutral
-    ``_validate_pointer_tensor`` / ``_pointer_values`` helpers from
+    ``_validate_pointer_tensor`` helper from
     ``cudnn.gemm.cutedsl.grouped.unfused._bf16_api`` instead.
     """
     import torch

@@ -55,16 +55,18 @@ def gpu_arch_flag() -> str:
     return arch
 
 
-def compile_options(extra: str = "") -> str:
+def compile_options(extra: str = "", *, gpu_arch: str | None = None) -> str:
     """Build the ``options=`` string for ``cute.compile``.
 
     Always emits ``--enable-tvm-ffi`` and a runtime-chosen ``--gpu-arch``;
     pass any kernel-specific knobs (``--opt-level 3`` etc.) via ``extra``.
+    A separately qualified kernel may pass ``gpu_arch`` without extending
+    the shared architecture map, which also gates unrelated DSA kernels.
 
     Example:
         cute.compile(..., options=compile_options("--opt-level 3"))
     """
-    parts = ["--enable-tvm-ffi", f"--gpu-arch {gpu_arch_flag()}"]
+    parts = ["--enable-tvm-ffi", f"--gpu-arch {gpu_arch if gpu_arch is not None else gpu_arch_flag()}"]
     if extra:
         parts.append(extra)
     return " ".join(parts)

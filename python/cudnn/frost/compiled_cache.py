@@ -82,6 +82,7 @@ import stat
 import tempfile
 import threading
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 
@@ -371,15 +372,26 @@ def _wrapper_spec_of(compiled: Any, args: tuple, kwargs: Dict[str, Any]) -> Opti
     So the spec is taken the way the DSL takes it: ``execution_args`` names the
     parameters and their defaults; the in-process wrapper's own signature says
     which of them survived. None when it cannot be reproduced exactly -- no
-    wrapper, a default that JSON cannot carry, a dataclass argument (the DSL
-    unpacks those through a hook the record does not describe).
+    wrapper, a default that JSON cannot carry, or a runtime dataclass argument
+    (the DSL unpacks those through a hook the record does not describe).
+    A constexpr dataclass is absent from the runtime signature and needs no
+    conversion when the artifact is reloaded.
     """
     wrapper = getattr(compiled, "_kwargs_wrapper", None)
     execution_args = getattr(compiled, "execution_args", None)
     if wrapper is None or execution_args is None or not hasattr(execution_args, "get_kwargs_wrapper_spec"):
         return None
     if any(dataclasses.is_dataclass(a) and not isinstance(a, type) for a in list(args) + list(kwargs.values())):
-        return None
+        try:
+            # Let the DSL remove its own constexpr arguments. Guessing from
+            # annotations or positional offsets can silently shift the ABI.
+            signature = execution_args.original_signature
+            function_kwargs = {name: value for name, value in kwargs.items() if name in signature.parameters}
+            runtime_args = execution_args.get_rectified_args_from_original_args(args, function_kwargs)
+        except Exception:  # noqa: BLE001 -- older executors cannot establish this contract
+            return None
+        if any(dataclasses.is_dataclass(a) and not isinstance(a, type) for a in runtime_args):
+            return None
     try:
         survived = set(inspect.signature(wrapper).parameters)
         full = execution_args.get_kwargs_wrapper_spec(())
@@ -669,6 +681,55 @@ def _compile_persistent(fn: Callable, args: tuple, kwargs: Dict[str, Any], *, ca
     if loaded is not None:
         _count("hits")
         return loaded
+    with _entry_lock(root, entry):
+        # Another process may have published this exact artifact while we
+        # waited. Warm loads above need no lock, and different keys can compile
+        # concurrently. Keep the lock through export and reload.
+        loaded = _try_load(entry, cache_key, symbol)
+        if loaded is not None:
+            _count("hits")
+            return loaded
+        return _compile_and_export(fn, args, kwargs, root, entry, cache_key, symbol, manifest)
+
+
+@contextmanager
+def _entry_lock(root: Path, entry: Path):
+    """Best-effort process lock, released by the OS if the compiler dies.
+
+    Lock files live outside the prunable environment directories and are never
+    unlinked: replacing an inode while a waiter holds it would create two locks
+    for the same artifact. They contain no kernel data.
+    """
+    lock_file = None
+    try:
+        import fcntl
+
+        lock_dir = root / ".locks"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_file = (lock_dir / f"{entry.parent.name}-{entry.name}.lock").open("a+b")
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+    except (ImportError, OSError) as exc:
+        if lock_file is not None:
+            lock_file.close()
+            lock_file = None
+        # Persistence has always been optional; an unavailable lock must not
+        # prevent an otherwise valid compilation, or hide a compiler failure.
+        _LOG.warning("compiled-plan cache: cannot lock %s (%s); compiling without a process lock", entry, exc)
+    except BaseException:
+        if lock_file is not None:
+            lock_file.close()
+        raise
+    try:
+        yield
+    finally:
+        if lock_file is not None:
+            lock_file.close()
+
+
+def _compile_and_export(fn, args, kwargs, root, entry, cache_key, symbol, manifest):
+    """Compile a miss and return its reloaded artifact when export is supported."""
+    import cutlass.cute as cute
+
     compiled = cute.compile(fn, *args, **kwargs)
     _count("misses")
     execution_args = getattr(compiled, "execution_args", None)

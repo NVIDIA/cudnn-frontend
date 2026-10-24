@@ -122,9 +122,9 @@ def test_each_geometry_runner_recomputes_split_and_obeys_cap(monkeypatch):
     knobs = [p.knobs for p in plans]
     assert len(knobs) == len(set(knobs)) <= heur._MAX_SETS_PER_ENGINE
     assert {k.pack_gqa for k in knobs} == {False, True}
-    # The width follows each leg's own rows (decode-tile fit): 17 * 8 packed
-    # rows overflow one 128-row tile (cga 2); 17 unpacked rows fit (cga 1).
-    assert {k.cga for k in knobs if k.pack_gqa} == {2} and {k.cga for k in knobs if not k.pack_gqa} == {1}
+    # 17 unpacked rows fit one 128-row decode tile (cga 1); the 17 * 8 packed rows overflow it, so both widths serve
+    # the packed legs (the dense other-width runner).
+    assert {k.cga for k in knobs if k.pack_gqa} == {1, 2} and {k.cga for k in knobs if not k.pack_gqa} == {1}
     for k in knobs:
         assert mismatch(SPEC.capabilities, facts, k) is None
         group = heur._pack_gqa_group(SPEC.capabilities, facts, k.tile_m, k.pack_gqa)
@@ -266,17 +266,33 @@ def test_paged_split_public_request_declines_unsupported_geometry(overrides):
 
 @requires_dsl
 @pytest.mark.parametrize("wants_stats", [False, True])
-@pytest.mark.parametrize("d", [128, 192])
+@pytest.mark.parametrize("paged,d,arch", [(False, 128, "sm100"), (False, 192, "sm100"), (True, 128, "sm100"), (True, 128, "sm107")])
 @pytest.mark.parametrize("batch,heads,q,kv", [(1, 4, 128, 4096), (4, 8, 128, 8192), (1, 16, 512, 32768)])
-def test_bounded_overrides_use_declared_geometry(batch, heads, q, kv, d, wants_stats):
+def test_bounded_overrides_use_declared_geometry(batch, heads, q, kv, paged, d, arch, wants_stats, monkeypatch):
     # An explicit upper bound permits the same plan-time policy as the fixed
     # declaration. Do not pin a split count or a winning engine.
-    args = dict(b=batch, h_q=heads, h_kv=heads, s_q=q, s_kv=kv, device_sm_count=148, d_qk=d, wants_stats=wants_stats)
-    exact = _mla_split_facts(**args)
-    bounded = _mla_split_facts(**args, shape_overrides=True, max_total_seq_len_q=batch * q)
-    assert heur.nonpaged_thd_split_choice(SPEC.capabilities, bounded) == heur.nonpaged_thd_split_choice(SPEC.capabilities, exact)
-    unbounded = _mla_split_facts(**args, shape_overrides=True, max_total_seq_len_q=None)
-    assert heur.nonpaged_thd_split_choice(SPEC.capabilities, unbounded) == (1, False)
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_" + arch)
+    args = dict(
+        b=batch,
+        h_q=heads,
+        h_kv=heads // 4 if paged else heads,
+        s_q=q,
+        s_kv=kv,
+        device_sm_count=148,
+        device_cc=(10, 7) if arch == "sm107" else (10, 0),
+        d_qk=d,
+        wants_stats=wants_stats,
+    )
+    facts = _paged_split_facts if paged else _mla_split_facts
+    choose = heur.paged_thd_split_choice if paged else heur.nonpaged_thd_split_choice
+    exact = facts(**args)
+    bounded = facts(**args, shape_overrides=True, max_total_seq_len_q=batch * q)
+    assert choose(spec.capabilities, bounded) == choose(spec.capabilities, exact)
+    unbounded = facts(**args, shape_overrides=True, max_total_seq_len_q=None)
+    assert choose(spec.capabilities, unbounded) == (1, False)
 
 
 @requires_dsl
@@ -302,19 +318,68 @@ def test_nonpaged_d128_split_explicit_contract(device_cc, pack_gqa, monkeypatch)
 
 
 @requires_dsl
+@pytest.mark.parametrize("group", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("batch,q,kv", [(1, 2048, 2048), (4, 128, 16384), (8, 128, 512), (16, 128, 1024), (2, 1024, 32768)])
+@pytest.mark.parametrize("dtype", [cudnn.data_type.BFLOAT16, cudnn.data_type.HALF])
+def test_nonpaged_d128_thd_lead_serves_a_valid_packed_first_plan(group, causal, batch, q, kv, dtype):
+    """An unsplit THD lead is backed by the packed plan it puts first, and every first plan is legal."""
+    from cudnn.sdpa.fwd import placement
+
+    facts = _mla_split_facts(d_qk=128, b=batch, h_q=64, h_kv=64 // group, s_q=q, s_kv=kv, causal=causal, bottom_right=causal, dtype=dtype)
+    first = heur._knob_sets(SPEC, facts)[0]
+    assert mismatch(SPEC.capabilities, facts, first) is None
+    if placement._place_sm100_f16(SPEC.capabilities, facts) == placement.LEAD and heur.nonpaged_thd_split_choice(SPEC.capabilities, facts)[0] == 1:
+        assert first.pack_gqa and first.split_kv in (None, 1)
+
+
+@requires_dsl
 @pytest.mark.parametrize("batch,h_q,h_kv,q,kv", [(2, 8, 2, 128, 16384), (1, 32, 4, 64, 32768), (4, 16, 16, 257, 8192), (2, 16, 2, 8, 16384)])
-def test_nonpaged_d128_rubin_split_fills_one_unpacked_wave(monkeypatch, batch, h_q, h_kv, q, kv):
+@pytest.mark.parametrize("bounded_total", [False, True])
+def test_nonpaged_d128_rubin_split_obeys_physical_wave_budget(monkeypatch, batch, h_q, h_kv, q, kv, bounded_total):
     from cudnn.frost import buffers
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
-    facts = _mla_split_facts(d_qk=128, b=batch, h_q=h_q, h_kv=h_kv, s_q=q, s_kv=kv, device_cc=(10, 7), device_sm_count=204)
+    total = q + batch - 1 if bounded_total else None
+    facts = _mla_split_facts(d_qk=128, b=batch, h_q=h_q, h_kv=h_kv, s_q=q, s_kv=kv, device_cc=(10, 7), device_sm_count=204, max_total_seq_len_q=total)
     splits, packed = heur.nonpaged_thd_split_choice(spec.capabilities, facts)
     if splits > 1:
-        # Rubin's launch budget: unpacked 128-row CTAs, one wave.
-        assert not packed
-        assert batch * len(range(0, q, 128)) * h_q * splits <= 204
+        # Count the selected candidate's physical CTAs, including a possible
+        # partial tile per sequence, without pinning its split or pack choice.
+        group = h_q // h_kv if packed else 1
+        rows = 128 // group
+        # Independently enumerate the shortest sequence that needs each
+        # tile count, then all small-batch distributions within the capacity.
+        lengths = [0, *range(1, q + 1, rows)]
+        tiles = max(
+            sum(len(range(0, length, rows)) for length in batch_lengths)
+            for batch_lengths in product(lengths, repeat=batch)
+            if total is None or sum(batch_lengths) <= total
+        )
+        # Rubin's budget: two waves.
+        assert tiles * (h_q // group) * splits <= 2 * 204
         assert len(range(0, kv, 128)) // splits >= 4
+        assert mismatch(spec.capabilities, facts, heur.SdpaFwdKnobs(cga=1, split_kv=splits, pack_gqa=packed)) is None
+
+
+@requires_dsl
+def test_nonpaged_d128_rubin_short_kv_split_needs_the_cache_ratio(monkeypatch):
+    """Below 2048 tokens the cc 10.7 D128 nonpaged split is proposed only above the module's KV floor and only when the
+    cache holds the module's ratio of query rows; the SM100 line keeps its 2048 floor.  Bounds are read from the module,
+    so no measured boundary is pinned here."""
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    rubin = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    kv = (heur._SM107_THD_SPLIT_MIN_KV + 2048) // 2
+    fits = kv // heur._SM107_THD_SPLIT_SHORT_KV_RATIO
+    facts = lambda q, cc, sms: _mla_split_facts(d_qk=128, b=1, h_q=8, h_kv=2, s_q=q, s_kv=kv, device_cc=cc, device_sm_count=sms)
+    splits, packed = heur.nonpaged_thd_split_choice(rubin.capabilities, facts(fits, (10, 7), 204))
+    assert splits > 1, "an underfilled short-cache launch inside the ratio splits"
+    assert mismatch(rubin.capabilities, facts(fits, (10, 7), 204), heur.SdpaFwdKnobs(cga=1, split_kv=splits, pack_gqa=packed)) is None
+    assert heur.nonpaged_thd_split_choice(rubin.capabilities, facts(fits * 2, (10, 7), 204)) == (1, False), "past the ratio it does not"
+    assert heur.nonpaged_thd_split_choice(SPEC.capabilities, facts(fits, (10, 0), 148)) == (1, False), "SM100 keeps 2048"
 
 
 @pytest.mark.parametrize("split", [1, 2])
@@ -347,24 +412,33 @@ def test_sm107_paged_cga1_domain_is_distinct_from_dense_and_quantized(monkeypatc
         assert mismatch(spec.capabilities, facts, heur.SdpaFwdKnobs(cga=1, split_kv=1, pack_gqa=packing)) is None
     for other in (replace(facts, has_paged_kv=False), replace(facts, thd=False), replace(facts, d_qk=256, d_v=256), replace(facts, is_fp8=True)):
         assert 1 not in effective_cgas(spec.capabilities, other, 1)
+    # dense d128: cga1 is the shared decode tile (issue #1472); dense PAGED queries above stay on cga2 (not wired on cc 10.7)
+    assert 1 in effective_cgas(spec.capabilities, replace(facts, thd=False, has_paged_kv=False, page_size=0), 1)
 
 
 @requires_dsl
 @pytest.mark.parametrize("splits", [2, 3, 8])
 @pytest.mark.parametrize("cga", [None, 2])
-def test_paged_d256_split_explicit_contract(monkeypatch, splits, cga):
-    """The D256 packed ABI requires CGA2, paged half storage and its native binder."""
+@pytest.mark.parametrize("device_cc", [(10, 0), (10, 3), (10, 7)])
+@pytest.mark.parametrize("paged", [False, True])
+def test_d256_thd_split_explicit_contract(monkeypatch, splits, cga, device_cc, paged):
+    """The D256 packed ABI requires CGA2, half storage and its native binder."""
     from cudnn.frost import buffers
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
-    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
-    facts = _paged_split_facts(device_cc=(10, 7), d_qk=256, d_v=256)
+    spec = next(s for s in ENGINE_SPECS if s.name == ("sdpa_fwd_prefill_sm107" if device_cc == (10, 7) else "sdpa_fwd_prefill_sm100"))
+    facts = _paged_split_facts(device_cc=device_cc, d_qk=256, d_v=256, has_paged_kv=paged, page_size=16 if paged else 0)
     knobs = heur.SdpaFwdKnobs(cga=cga, split_kv=splits, pack_gqa=False)
     assert mismatch(spec.capabilities, facts, knobs) is None
     assert heur.SdpaFwdKnobs.from_public({int(k): v for k, v in knobs.to_public().items()}) == knobs
     for invalid in (replace(knobs, cga=1), replace(knobs, pack_gqa=True)):
         assert mismatch(spec.capabilities, facts, invalid) is not None
-    for invalid in (replace(facts, has_paged_kv=False), replace(facts, thd=False), replace(facts, has_sink=True), replace(facts, has_epilogue_gate=True)):
+    for invalid in (
+        replace(facts, has_sink=True),
+        replace(facts, has_epilogue_gate=True),
+        replace(facts, attn_scale_prefolded=True),
+        replace(facts, wants_stats=True, stats_t=SimpleNamespace(ragged_offset=None)),
+    ):
         assert mismatch(spec.capabilities, invalid, knobs) is not None
     previous = type("PreviousNativeBinder", (), {"supports_paged_packed_split": True})
     monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdBinder", previous)
@@ -434,3 +508,72 @@ def test_d128_thd_grid_bound_matches_all_ragged_partitions(batch, max_q, group):
         bounded = replace(facts, max_total_seq_len_q=total)
         assert heur._d128_thd_split_units(bounded, group) == worst
     assert heur._d128_thd_split_units(facts, group) == worst
+
+
+@requires_dsl
+@pytest.mark.parametrize("device_cc", [(10, 0), (10, 7)])
+@pytest.mark.parametrize("group", [1, 4, 8])
+@pytest.mark.parametrize("shape_overrides", [False, True])
+@pytest.mark.parametrize("wants_stats", [False, True])
+def test_paged_split_redundant_sequence_bound_preserves_geometry(device_cc, group, shape_overrides, wants_stats):
+    """A total-token bound already limits every sequence; extra rectangular slack adds no work."""
+    spec = next(s for s in ENGINE_SPECS if s.name == ("sdpa_fwd_prefill_sm107" if device_cc == (10, 7) else "sdpa_fwd_prefill_sm100"))
+    facts = _paged_split_facts(
+        device_cc=device_cc,
+        device_sm_count=204,
+        b=3,
+        h_q=4 * group,
+        h_kv=4,
+        s_q=127,
+        max_total_seq_len_q=127,
+        shape_overrides=shape_overrides,
+        wants_stats=wants_stats,
+    )
+    # Both declarations admit exactly the same query-length distributions.
+    # Compare them to each other, without pinning a winning split or packing.
+    assert heur.paged_thd_split_choice(spec.capabilities, facts) == heur.paged_thd_split_choice(spec.capabilities, replace(facts, s_q=1024))
+
+
+@requires_dsl
+def test_paged_split_empty_declared_capacity_has_no_division():
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    facts = _paged_split_facts(device_cc=(10, 7), max_total_seq_len_q=0)
+    assert heur.paged_thd_split_choice(spec.capabilities, facts)[0] == 1
+
+
+@requires_dsl
+@pytest.mark.parametrize(
+    "row,device_cc,sm_count,dtype",
+    [
+        ("sdpa_fwd_prefill_sm120", (12, 0), 188, cudnn.data_type.BFLOAT16),
+        ("sdpa_fwd_prefill_sm120_fp8", (12, 0), 188, cudnn.data_type.FP8_E4M3),
+        ("sdpa_fwd_prefill_sm100", (10, 0), 148, cudnn.data_type.BFLOAT16),
+    ],
+)
+def test_split_chooser_receives_the_row_cost_profile(monkeypatch, row, device_cc, sm_count, dtype):
+    """SM120 half hands its own split floor/coefficient to the shared chooser; FP8 and other rows keep the defaults."""
+    spec = next(s for s in ENGINE_SPECS if s.name == row)
+    seen = []
+    real = heur.choose_split_kv
+    monkeypatch.setattr(heur, "choose_split_kv", lambda **kw: seen.append(kw) or real(**kw))
+    heur._knob_sets(
+        spec,
+        _facts(
+            b=1,
+            h_q=8,
+            h_kv=1,
+            s_q=4,
+            s_kv=8192,
+            causal=True,
+            bottom_right=True,
+            device_cc=device_cc,
+            device_sm_count=sm_count,
+            dtype=dtype,
+            is_fp8=dtype == cudnn.data_type.FP8_E4M3,
+        ),
+    )
+    assert seen
+    sm120 = row == "sdpa_fwd_prefill_sm120"
+    for kw in seen:
+        assert kw.get("min_tiles") == (heur._SM120_SPLIT_KV_MIN_TILES if sm120 else None)
+        assert kw.get("combine_floor") == (heur._SM120_SPLIT_KV_COMBINE_FLOOR if sm120 else None)

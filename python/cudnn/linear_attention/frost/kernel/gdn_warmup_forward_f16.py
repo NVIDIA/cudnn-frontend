@@ -32,7 +32,9 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 from ..common import split_k
-from ..common.host import get_dtype
+from cudnn.frost.compiled_cache import compile_cached
+
+from ..common.host import get_dtype, family_slots
 from . import gdn_prefill_f16
 
 warmup_forward_cache = {}
@@ -42,7 +44,6 @@ warmup_forward_cache = {}
 def warmup_forward_host(
     split: cutlass.Constexpr[bool],
     b_t: cutlass.Constexpr[int],
-    scan_rows: cutlass.Constexpr[int],
     log_gate: cutlass.Constexpr[bool],
     safe_gate: cutlass.Constexpr[bool],
     overhead_chunks: cutlass.Constexpr[int],
@@ -59,7 +60,6 @@ def warmup_forward_host(
     batch_size: cutlass.Int32,
     log2_thresh: cutlass.Float32,
     n_scan_ctas: cutlass.Int32,
-    n_scan_blocks: cutlass.Int32,
     n_walk_ctas: cutlass.Int32,
     checkpoint_every_n: cutlass.Int32,
     scale: cutlass.Float32,
@@ -91,14 +91,16 @@ def warmup_forward_host(
     scheduler: cute.Tensor,
     workspace: cute.Tensor,
     stream: cuda.CUstream,
+    k_slots: cutlass.Constexpr[int] = 1,
+    v_slots: cutlass.Constexpr[int] = 1,
 ) -> None:
     if cutlass.const_expr(split):
         split_k.launch(
             split,
             b_t,
-            scan_rows,
             log_gate,
             safe_gate,
+            True,
             overhead_chunks,
             expand_num,
             warmup_cap,
@@ -118,7 +120,6 @@ def warmup_forward_host(
             work_count_table,
             scheduler,
             n_scan_ctas,
-            n_scan_blocks,
             n_walk_ctas,
             stream,
         )
@@ -142,6 +143,8 @@ def warmup_forward_host(
         workspace,
         stream,
         tiles_per_head,
+        k_slots,
+        v_slots,
     )
     gdn_prefill_f16.host(
         prefill_cfg,
@@ -210,9 +213,8 @@ def build_warmup_forward(
     """Compile (cached per static config: dtypes, heads, dims, gate flags, the split-K geometry, the d_v split, state and checkpoint
     presence, device) the warmup or uncut forward launch over the buffers of one plan.  The placeholders repeat the marks
     of the standalone split-table and prefill builds so every kernel compiles as it does there."""
-    _HQ, DK = q.shape[1], q.shape[2]
-    k.shape[1]
-    _HV, DV = v.shape[1], v.shape[2]
+    DK = q.shape[2]
+    DV = v.shape[-1]
     if not safe_gate:
         a_log = None
         dt_bias = None
@@ -232,6 +234,9 @@ def build_warmup_forward(
     io_dtype = get_dtype(q.dtype)
     state_src = state_in if state_in is not None else state_out
     state_dtype = get_dtype(state_src.dtype) if state_src is not None else cutlass.Float32
+    k_slots = family_slots(k, expand_num, 3)
+    v_slots = family_slots(v, expand_num, 3)
+    beta_slots = family_slots(beta, expand_num, 2) if beta is not None else 1
     key = (
         str(q.dtype),
         str(gate.dtype),
@@ -247,7 +252,6 @@ def build_warmup_forward(
         int(b_t),
         int(expand_num),
         bool(split),
-        facts.scan_rows,
         bool(log_gate),
         bool(safe_gate),
         bool(use_beta_sigmoid),
@@ -257,7 +261,14 @@ def build_warmup_forward(
         seed_indices is not None,
         final_indices is not None,
         int(checkpoint_every_n_tokens) > 0,
+        str(checkpoints.dtype) if int(checkpoint_every_n_tokens) > 0 else "none",
         int(tiles_per_head),
+        len(k.shape),
+        len(v.shape),
+        len(beta.shape) if beta is not None else 0,
+        k_slots,
+        v_slots,
+        beta_slots,
     )
     if key not in warmup_forward_cache:
         prefill_cfg = gdn_prefill_f16.build_cfg(
@@ -267,6 +278,7 @@ def build_warmup_forward(
             use_initial_state=state_in is not None,
             store_final_state=state_out is not None,
             enable_checkpoints=int(checkpoint_every_n_tokens) > 0,
+            checkpoint_dtype=get_dtype(checkpoints.dtype) if int(checkpoint_every_n_tokens) > 0 else None,
             log_gate=log_gate,
             safe_gate=safe_gate,
             beta_sigmoid=use_beta_sigmoid,
@@ -276,6 +288,9 @@ def build_warmup_forward(
             d_v=DV // tiles_per_head,
             expand_num=expand_num,
             tiles_per_head=tiles_per_head,
+            k_slots=k_slots,
+            v_slots=v_slots,
+            beta_slots=beta_slots,
         )
 
         gate_table_placeholder = None
@@ -308,11 +323,10 @@ def build_warmup_forward(
         state_out_placeholder = None
         if state_out is not None:
             state_out_placeholder = from_dlpack(state_out, assumed_align=16).mark_layout_dynamic(leading_dim=3)
-        warmup_forward_cache[key] = cute.compile(
+        warmup_forward_cache[key] = compile_cached(
             warmup_forward_host,
             facts.split,
             facts.b_t,
-            facts.scan_rows,
             facts.log_gate,
             facts.safe_gate,
             facts.overhead_chunks,
@@ -329,20 +343,19 @@ def build_warmup_forward(
             cutlass.Int32(facts.batch_size),
             cutlass.Float32(facts.log2_threshold),
             cutlass.Int32(facts.n_scan_ctas),
-            cutlass.Int32(facts.n_scan_blocks),
             cutlass.Int32(facts.n_walk_ctas),
             cutlass.Int32(int(checkpoint_every_n_tokens)),
             float(scale),
             from_dlpack(q, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=2),
+            from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=len(k.shape) - 1),
+            from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=len(v.shape) - 1),
             from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=1),
             gate_table_placeholder,
             from_dlpack(a_log, assumed_align=4).mark_layout_dynamic() if a_log is not None else None,
             from_dlpack(a_log, assumed_align=4).mark_layout_dynamic() if a_log is not None else None,
             from_dlpack(dt_bias, assumed_align=4).mark_layout_dynamic(leading_dim=len(dt_bias.shape) - 1) if dt_bias is not None else None,
             dt_bias_table_placeholder,
-            from_dlpack(beta, assumed_align=16).mark_layout_dynamic(leading_dim=1) if beta is not None else None,
+            from_dlpack(beta, assumed_align=16).mark_layout_dynamic(leading_dim=len(beta.shape) - 1) if beta is not None else None,
             from_dlpack(o, assumed_align=16).mark_layout_dynamic(leading_dim=2),
             from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic(),
             from_dlpack(cu_seqlens, assumed_align=4).mark_layout_dynamic(),
@@ -361,6 +374,10 @@ def build_warmup_forward(
             from_dlpack(scheduler, assumed_align=4).mark_layout_dynamic(),
             from_dlpack(workspace, assumed_align=128).mark_layout_dynamic(),
             cuda.CUstream(int(stream)),
+            k_slots,
+            v_slots,
+            cache_key=repr((__name__, key)),
+            symbol="frost_la_gdn_warmup_forward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
     compiled = warmup_forward_cache[key]
@@ -404,7 +421,6 @@ def run_warmup_forward(
         facts.batch_size,
         facts.log2_threshold,
         facts.n_scan_ctas,
-        facts.n_scan_blocks,
         facts.n_walk_ctas,
         int(checkpoint_every_n_tokens),
         float(scale),

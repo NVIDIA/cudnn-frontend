@@ -4,9 +4,13 @@
 
 ## JAX support
 
-Supports **JAX arrays** on the BF16 backend in discrete weight mode (swiglu and geglu): `b_ptrs` as a packed little-endian uint8 pointer array (8 bytes per pointer; int64 accepted with jax x64 mode), outputs allocated as n-major C-contiguous `jnp` arrays. Dense `b_tensor` (expert-outermost strides), column-major `bias_tensor`, and the block-scaled backend (MMA-interleaved scale-factor layouts) are not expressible as JAX arrays and raise clear errors. The wrapper is eager, on the CUDA legacy default stream: `block_until_ready` inputs, synchronize before reading outputs; keep weight arrays alive until the kernel completes.
+**Canonical MXFP8 (block-scaled, dense weights):** the `jax.jit`-compatible entry point `grouped_gemm_glu_jax_sm100` takes the canonical operands as keywords. They are `b_tensor` `(experts, n, k)`, already MMA-packed E8M0 `sfa_tensor`/`sfb_tensor` bytes (physical or flat), and an explicit `norm_const_tensor`, along with A `(m, k)`, prob `(m,)` fp32/bf16, alpha, an FP8 `d_dtype`, and `act_func` `"swiglu"` or `"geglu"`. It returns a `TupleDict` with the eager wrapper's keys. It runs the Rubin GLU kernel on SM107 and the SM100 kernel otherwise. The activation scalars are compile-time constants of the traced call. `discrete_col_sfd=True` packs column scales by expert, and C is returned only with `generate_c=True`. Outputs are not initialized, so rows at or past `padded_offsets[-1]` are unspecified, as in the Torch path. `grouped_gemm_glu_wrapper_sm100` dispatches JAX inputs with dense `b_tensor` and `sfa_tensor` to it; set `sf_vec_size=32` and an FP8 `d_dtype`. Bias, discrete weights, SiTU-GLU, dynamic scheduling, `b_major="n"`, and `sf_fp8_dtype_override` raise `ValueError`. `cudnn.jax.grouped_gemm_swiglu` remains as an alias for `act_func="swiglu"` with `generate_c=True`.
 
-For jitted JAX programs use the `jax.jit`-compatible XLA custom-call entry point `grouped_gemm_glu_jax_sm100` (built on `cudnn.jax.call`; discrete mode, no bias, `b_major="k"`): outputs are fresh XLA-managed arrays with rows at/past `padded_offsets[-1]` zero-filled, no manual synchronization needed. `linear_offset` is a compile-time constant (each distinct value compiles a new specialization). Under tracing the `padded_offsets` *values* cannot be host-validated, and the per-expert weight buffers behind `b_ptrs` must stay alive and unmoved across every execution of the traced computation.
+**Canonical FP4 and BF16 (dense weights):** the same entry also takes packed FP4 A/B with `sf_vec_size` (keyword). Packed FP4 operands travel as `uint8` with two values per byte (JAX has no packed FP4 dtype), so K is twice the array extent; their scale buffers are E4M3 with `sf_vec_size=16` for NVFP4, or E8M0. FP4 inputs take a BF16/FP16 `d_dtype` and no `norm_const_tensor`, and return D and the per-expert amax `(experts, 1)` instead of D_col and the SFD buffers. With a BF16 `b_tensor` `(experts, n, k)` and no scale tensors it runs the BF16 kernel on canonical A `(m, k)` and fp32 prob `(m,)`, returning C (with `generate_c`) and D. `grouped_gemm_glu_wrapper_sm100` dispatches JAX inputs with any dense `b_tensor` to the entry.
+
+**BF16 backend:** supports **JAX arrays** in discrete weight mode (swiglu and geglu): `b_ptrs` as a packed little-endian uint8 pointer array (8 bytes per pointer; int64 accepted with jax x64 mode), outputs allocated as n-major C-contiguous `jnp` arrays. Dense BF16 `b_tensor`, column-major `bias_tensor`, and discrete block-scaled weights are not expressible as JAX arrays and raise clear errors. The wrapper is eager, on the CUDA legacy default stream: `block_until_ready` inputs, synchronize before reading outputs; keep weight arrays alive until the kernel completes.
+
+For jitted BF16 JAX programs use the same entry point `grouped_gemm_glu_jax_sm100` with `b_ptrs` and `n` (built on `cudnn.jax.call`; discrete mode, no bias, `b_major="k"`): outputs are fresh XLA-managed arrays with rows at/past `padded_offsets[-1]` unspecified, as in the Torch path; no manual synchronization needed. `linear_offset` is a compile-time constant (each distinct value compiles a new specialization). Under tracing the `padded_offsets` *values* cannot be host-validated, and the per-expert weight buffers behind `b_ptrs` must stay alive and unmoved across every execution of the traced computation.
 
 ## Overview
 
@@ -63,6 +67,15 @@ experts, BF16 uses:
 - optional bias: `(N, L)`, stride `(1, N)`, BF16/FP16/FP32;
 - `C`: `(M, N, 1)`, stride `(N, 1, M*N)`;
 - `D`: `(M, N/2, 1)`, stride `(N/2, 1, M*N/2)`.
+
+Torch callers may instead pass the canonical layouts: contiguous `A` `(M, K)`, dense
+`B` `(L, N, K)`, and `prob` `(M,)`. With 2-D `A`, the wrapper returns `C` `(M, N)` and
+`D` `(M, N/2)`. The wrapper advertises `supports_bf16_canonical_layouts`.
+
+`padded_offsets` values and `b_ptrs` entries are a **device-data contract**: the kernel
+reads them on device and `execute()` does not copy them to the host. Set
+`CUDNN_FE_GROUPED_GEMM_VALIDATE_DEVICE_VALUES=1` (read once at import) to turn on
+blocking debug checks of those values at `execute()`.
 
 For expert `g`, first compute
 
