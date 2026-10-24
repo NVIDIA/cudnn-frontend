@@ -47,7 +47,7 @@ def test_native_dense_partial_graph_rebind(cudnn_handle, dtype_name, with_stats,
     _rubin_only()
     group, dims, sq, sk, splits, causal, sink = {
         "partial6": (6, (128, 128), 129, 257, 1, True, False),
-        "partial12_sink": (12, (96, 80), 257, 65, 1, True, True),
+        "partial12_sink": (12, (96, 80), 257, 257, 1, True, True),
         "partial24_split": (24, (64, 64), 129, 385, 2, False, False),
     }[geometry]
     api, bufs = _half_prefold_api(
@@ -69,9 +69,16 @@ def test_native_dense_partial_graph_rebind(cudnn_handle, dtype_name, with_stats,
     assert api.check_support(), "standalone admission must match the public graph"
     if with_stats:
         bufs["lse"] = bufs["lse"].unsqueeze(-1)
+    if geometry == "partial12_sink":
+        # Dense bottom-right graphs require Q capacity <= KV capacity. Device
+        # lengths still exercise keyless rows and changing live KV prefixes.
+        bufs["seq_q"] = torch.full((2, 1, 1, 1), sq, dtype=torch.int32, device="cuda")
+        bufs["seq_kv"] = torch.full((2, 1, 1, 1), 65, dtype=torch.int32, device="cuda")
     dt = cudnn.data_type.BFLOAT16 if dtype_name == "bfloat16" else cudnn.data_type.HALF
     g = cudnn.pygraph(io_data_type=dt, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     tensors = {n: g.tensor_like(bufs[n]) for n in ("q", "k", "v")}
+    if "seq_kv" in bufs:
+        tensors.update({n: g.tensor_like(bufs[n]) for n in ("seq_q", "seq_kv")})
     if sink:
         tensors["sinks"] = g.tensor_like(bufs["sinks"]).set_dim([1, 2 * group, 1, 1]).set_stride([2 * group, 1, 1, 1])
     tensors["out"], stats = g.sdpa(
@@ -82,6 +89,9 @@ def test_native_dense_partial_graph_rebind(cudnn_handle, dtype_name, with_stats,
         attn_scale=bufs["attn_scale"],
         use_causal_mask_bottom_right=causal,
         sink_token=tensors.get("sinks"),
+        use_padding_mask="seq_kv" in tensors,
+        seq_len_q=tensors.get("seq_q"),
+        seq_len_kv=tensors.get("seq_kv"),
     )
     tensors["out"].set_output(True).set_dim(list(bufs["out"].shape)).set_stride(list(bufs["out"].stride()))
     if with_stats:
@@ -132,8 +142,17 @@ def test_native_dense_partial_graph_rebind(cudnn_handle, dtype_name, with_stats,
             bindings.append((current, ws))
         assert bindings[0][0]["q"].data_ptr() != bindings[1][0]["q"].data_ptr()
         for capture, (current, ws) in zip(captures, bindings):
-            for _ in range(2):
+            for replay in range(2):
                 current["v"].neg_()
+                live_k = sk
+                if "seq_kv" in current:
+                    live_k = (65, 33)[replay]
+                    current["seq_kv"].fill_(live_k)
+                    current["k"].copy_(bufs["k"])
+                    current["v"].copy_(bufs["v"])
+                    current["v"].mul_(1 if replay == 0 else -1)
+                    current["k"][..., live_k:, :].fill_(31)
+                    current["v"][..., live_k:, :].fill_(37)
                 current["out"].fill_(torch.nan)
                 ws.fill_(0xA5)
                 if with_stats:
@@ -143,10 +162,10 @@ def test_native_dense_partial_graph_rebind(cudnn_handle, dtype_name, with_stats,
                 torch.cuda.synchronize()
                 ref_o, ref_lse = _half_oracle(
                     current["q"],
-                    current["k"],
-                    current["v"],
+                    current["k"][..., :live_k, :],
+                    current["v"][..., :live_k, :],
                     logit_scale=bufs["attn_scale"],
-                    masked=_dense_mask(sq, sk, causal=causal, bottom_right=causal),
+                    masked=_dense_mask(sq, live_k, causal=causal, bottom_right=causal),
                     sinks=current.get("sinks"),
                 )
                 torch.testing.assert_close(current["out"].double(), ref_o, atol=4e-3, rtol=4e-3)
