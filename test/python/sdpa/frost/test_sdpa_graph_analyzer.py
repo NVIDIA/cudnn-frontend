@@ -1428,6 +1428,78 @@ def test_thd_pack_gqa_admission_agrees_with_adapter(monkeypatch, cc, dtype, h_q,
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "group,cga,split,dim,accepted",
+    [
+        (6, 2, 1, 128, True),
+        (12, 2, 1, 128, True),
+        (24, None, 1, 128, True),
+        (3, 2, 1, 128, False),
+        (6, 1, 1, 128, False),
+        (6, 1, 2, 128, False),
+        (6, 2, 2, 128, False),
+        (6, 2, 1, 256, False),
+    ],
+)
+def test_sm107_paged_partial_pack_admission_agrees_with_adapter(monkeypatch, dtype, group, cga, split, dim, accepted):
+    """Both entry points admit the same paged partial-group domain before compilation."""
+    from cudnn.api_base import TensorDesc
+    from cudnn.frost import buffers
+    from cudnn.sdpa.fwd import api_dsl, config_sm100
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args: (10, 7))
+    io = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
+    facts = ga.SdpaGraphFacts(
+        b=3,
+        h_q=group * 2,
+        h_kv=2,
+        s_q=513,
+        s_kv=640,
+        d_qk=dim,
+        d_v=dim,
+        dtype=io,
+        dtype_o=io,
+        causal=True,
+        thd=True,
+        has_paged_kv=True,
+        page_size=16,
+        device_cc=(10, 7),
+    )
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    reason = engines.mismatch(caps, facts, engines.SdpaFwdKnobs(cga=cga, split_kv=split, pack_gqa=True))
+    assert (reason is None) == accepted, reason
+
+    def desc(heads, tokens):
+        return TensorDesc(dtype, (3, heads, tokens, dim), (tokens * heads * dim, dim, heads * dim, 1), (3, 1, 2, 0), "cuda:0")
+
+    q, k = desc(group * 2, 513), desc(2, 16)
+    api = api_dsl.SdpaFwdDslSm100(
+        q,
+        k,
+        k,
+        q,
+        is_causal=True,
+        seq_kv_lens_present=True,
+        cu_seq_q_lens=True,
+        thd=True,
+        cga=cga,
+        split_kv=split,
+        pack_gqa=True,
+        paged_page_size=16,
+        paged_max_seq_len_kv=640,
+    )
+    if accepted:
+        assert api.check_support()
+        cfg, _ = config_sm100.make_cfg_d128(api.template_params())
+        assert cfg.PACK_G == math.gcd(group, 128)
+        assert cfg.PACK_GQA and cfg.PAGED_KV and cfg.THD_VARLEN
+    else:
+        with pytest.raises(NotImplementedError):
+            api.check_support()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("paged,pack_gqa", [(False, True), (False, False), (True, True), (True, False)])
 def test_packed_thd_split_adapter_declines_nonpaged_pack_gqa(monkeypatch, dtype, paged, pack_gqa):
     """Standalone admission must reject D192 packing before kernel compilation."""

@@ -2711,6 +2711,16 @@ partition on average; the final partition may contain a shorter tail. A full
 first wave keeps the unsplit plan. Packed Stats and bounded shape overrides
 use the same declared envelope; other requests retain their existing policy.
 
+### SM107 paged D128 half partial PackGQA
+
+Exact D128/V128 FP16/BF16 paged THD also admits explicit partial PackGQA on
+the existing shared two-CTA, unsplit prefill body. A group such as 6, 12 or 24
+packs `gcd(group, 128)` heads per tile. The graph and standalone adapter use
+the same admission predicate. The single-CTA, split, D256 and quantized
+routes retain their existing packing limits. `test_sm107_paged_partial_pack_replay`
+checks NHD/HND pools, NATURAL/LPT, packed token/head-major Stats, changing
+device lengths/page tables and all-empty batches on a retained CUDA graph.
+
 ### SM107 paged D256 half PackGQA
 
 The existing two-CTA D256 paged half pipeline also serves explicit PackGQA

@@ -19,7 +19,7 @@ def _build_graph(q, k, v, cu, max_seqlen, stats_layout, pack, policy, monkeypatc
 
     batch, hq, hkv, dim = cu.numel() - 1, q.shape[1], k.shape[1], q.shape[2]
     capacity = q.shape[0]
-    io = cudnn.data_type.BFLOAT16
+    io = cudnn.data_type.BFLOAT16 if q.dtype == torch.bfloat16 else cudnn.data_type.HALF
     g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     bindings, inputs, origins = {}, {}, []
 
@@ -110,7 +110,7 @@ def _build_graph(q, k, v, cu, max_seqlen, stats_layout, pack, policy, monkeypatc
     with monkeypatch.context() as patch:
         patch.setattr(api_dsl, "_load_sm100_kernel_module", record_module)
         g.build_plans()
-    assert loaded and all(m._BOUNDED_THD_DECODE for m in loaded)
+    assert loaded and all(m._BOUNDED_THD_DECODE == (q.dtype == torch.bfloat16) for m in loaded)
     if page_tables is not None:
         assert all(m.CFG.PAGED_KV for m in loaded), "The paged bounded decoder must be exercised"
     workspace = torch.empty(max(1, g.get_workspace_size()), device=q.device, dtype=torch.uint8)
@@ -236,21 +236,39 @@ def _paged_reference(q, k, v, page_tables, q_lengths, kv_lengths):
 @torch_fork_set_rng(seed=17)
 def test_thd_work_lookup_paged_replay(hnd, policy, stats_layout, monkeypatch):
     """BF16 causal paged THD with unequal Q/KV lengths and partial PackGQA."""
-    from test_sdpa_fwd_paged_sm100 import _pools
-
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
         pytest.skip("Shared paged D128 kernel on SM100, SM103 and SM107")
     if torch.cuda.get_device_capability() == (10, 7) and policy == 2:
         pytest.skip("The SM107 graph row does not offer LPT_L2 for BF16")
+    _run_paged_replay(hnd, policy, stats_layout, monkeypatch, group=6, dtype=torch.bfloat16)
+
+
+@requires_dsl
+@pytest.mark.L1
+@pytest.mark.parametrize("hnd", [False, True], ids=["NHD", "HND"])
+@pytest.mark.parametrize("policy,stats_layout", [(0, "token"), (1, "head")])
+@pytest.mark.parametrize("group", [6, 12, 24])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@torch_fork_set_rng(seed=17)
+def test_sm107_paged_partial_pack_replay(hnd, policy, stats_layout, group, dtype, monkeypatch):
+    """Partial groups keep O/Stats and dead rows correct across changing page tables."""
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("SM107 paged partial PackGQA admission")
+    _run_paged_replay(hnd, policy, stats_layout, monkeypatch, group=group, dtype=dtype)
+
+
+def _run_paged_replay(hnd, policy, stats_layout, monkeypatch, *, group, dtype):
+    from test_sdpa_fwd_paged_sm100 import _pools
+
     monkeypatch.setenv("FROST_THD_CLUSTERS", "4")
-    batch, max_seqlen, hq, hkv, dim = 3, 513, 12, 2, 128
-    # Six query heads per KV head leave a partial group in the packing tile.
+    batch, max_seqlen, hq, hkv, dim = 3, 513, group * 2, 2, 128
+    # These GQA groups do not divide the tile's 128 rows.
     rng = torch.Generator(device="cuda").manual_seed(17)
-    _, _, k, v, table = _pools(batch, hkv, dim, 16, 40, hnd, torch.bfloat16, generator=rng)
+    _, _, k, v, table = _pools(batch, hkv, dim, 16, 40, hnd, dtype, generator=rng)
     k.mul_(0.5)
     v.mul_(0.5)
     page_tables = (table, table.flip(2))
-    q = torch.randn(batch * max_seqlen, hq, dim, device="cuda", dtype=torch.bfloat16, generator=rng) * 0.5
+    q = torch.randn(batch * max_seqlen, hq, dim, device="cuda", dtype=dtype, generator=rng) * 0.5
     cu = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * max_seqlen
     kv_lengths = torch.full((batch, 1, 1, 1), 640, device="cuda", dtype=torch.int32)
     execute, set_lengths, actual = _build_graph(q, k, v, cu, max_seqlen, stats_layout, 1, policy, monkeypatch, page_tables=page_tables, kv_lengths=kv_lengths)
