@@ -194,6 +194,7 @@ class ThdLaunchSpec:
         "lse_stride",
         "s_q_max",
         "cga_tile_m",
+        "wave_policy",
         "total_q",
         "total_kv",
         "fixed_batch",
@@ -310,6 +311,7 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
             raise ValueError("cudnn.sdpa: padded Stats strides must not overlap")
         s.lse_fill_plan = tuple(s.lse_fill_plan)
     s.cga_tile_m = int(plan.cga_tile_m)
+    s.wave_policy = getattr(plan, "wave_policy", None)
     s.total_q = None if plan.total_q is None else int(plan.total_q)
     s.total_kv = None if plan.total_kv is None else int(plan.total_kv)
     s.n_q_lens, s.n_kv_lens, s.lens_form = int(plan.n_q_lens), int(plan.n_kv_lens), int(plan.lens_form)
@@ -381,6 +383,8 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
             "cudnn.sdpa: the prepared THD binder of this build has no epilogue-gate role (the pybind extension predates the THD gate "
             "descriptor); rebuild the extension, or run the gate as its own stage"
         )
+    if s.wave_policy is not None and not getattr(_pybind_module._SdpaThdBinder, "supports_initial_waves", False):
+        raise NotImplementedError("cudnn.sdpa: this prepared THD launch requires runtime initial-wave binding; rebuild the extension")
     s.native = _pybind_module._SdpaThdBinder(s)
     return s
 

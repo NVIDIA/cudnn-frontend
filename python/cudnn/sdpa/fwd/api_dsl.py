@@ -4653,6 +4653,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # may assign a small envelope directly across its declared initial waves;
         # larger envelopes use one resident wave. The packed family below also
         # tightens the safety envelope to its known token-tile count.
+        wave_policy = None
         env = units = self._thd_unit_envelope()
         if self.packed_thd_split:
             env = units = env * self.split_kv
@@ -4661,6 +4662,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             resident = max(1, _device_sm_count(self.q_desc.device) // max(1, cluster_ctas))
             initial_waves = max(1, int(getattr(self._k_mod, "THD_INITIAL_WAVES", 1)))
             units = env if env <= initial_waves * resident else resident
+            wave_envelope = env
             cfg = self._k_mod.CFG
             if (
                 ((self._device_cc == (10, 0) and self.paged) or (self._device_cc == (10, 7) and not self.paged))
@@ -4686,9 +4688,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 packed_units = ((int(self.q_desc.shape[2]) * cfg.PACK_G + tile - 1) // tile) * (self.h_q // cfg.PACK_G)
                 if resident < packed_units <= 2 * resident:
                     units = min(env, packed_units)
+                    wave_envelope = units
             dbg = int(os.environ.get("FROST_THD_CLUSTERS", "0"))  # debug override
             if dbg > 0:
                 units = min(env, dbg)
+            elif initial_waves > 1:
+                # Re-evaluate the wave choice against each invocation's host-known
+                # capacity. Broad graph declarations must not freeze a one-wave
+                # cap when current storage fits the body's initial waves.
+                wave_policy = (wave_envelope, resident, initial_waves)
         n_meta = self._thd_meta_words()
         plan = SimpleNamespace(
             q=self._thd_decl(self.q_desc),
@@ -4696,6 +4704,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             v=self._thd_decl(self.v_desc),
             o=self._thd_decl(self.o_desc),
             units=units,
+            wave_policy=wave_policy,
             cga_tile_m=int(self._k_mod.CGA_TILE_M),
             n_q_lens=b + 1 if self.cu_seq_q_lens else b,
             n_kv_lens=b + 1 if self.cu_seq_kv_lens else b,

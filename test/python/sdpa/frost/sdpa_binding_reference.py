@@ -566,6 +566,11 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
     if split is not None:
         units *= split.splits
     frame[ix["n_thd_units"]] = min(frame[ix["n_thd_units"]], units)
+    policy = getattr(spec, "wave_policy", None)
+    if policy is not None:
+        envelope, resident, initial_waves = policy
+        bound = min(envelope, units)
+        frame[ix["n_thd_units"]] = bound if bound <= resident * initial_waves else resident
 
     sinks = facts.get("sinks")
     if spec.has_sink:
