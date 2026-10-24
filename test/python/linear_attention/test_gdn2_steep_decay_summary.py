@@ -87,6 +87,7 @@ def test_derived_overflow_is_rejected(tmp_path, runs, base, patch):
         run["results"][0]["gpu_busy"]["median_ms"] = base if label.startswith("base") else patch
     result = summarize(tmp_path, runs)
     assert result.returncode != 0
+    assert "ValueError: Non-finite derived gpu_busy measurement" in result.stderr
     assert not (tmp_path / "summary.json").exists()
 
 
@@ -96,6 +97,7 @@ def test_invalid_error_cannot_hide_behind_pass_flag(tmp_path, runs, value):
     runs["patch-B2"]["results"][0]["errors_fp64"]["q"]["relative_frobenius"] = value
     result = summarize(tmp_path, runs)
     assert result.returncode != 0
+    assert "ValueError: Invalid FP64 relative error for q" in result.stderr
     assert not (tmp_path / "summary.json").exists()
 
 
@@ -103,6 +105,15 @@ def test_invalid_error_cannot_hide_behind_pass_flag(tmp_path, runs, value):
 @pytest.mark.parametrize("fault", ["environment", "helper", "reference", "case", "pass_flag", "scheduler", "missing_gradient"])
 def test_validation_survives_optimized_python(tmp_path, runs, optimized, fault):
     """Reject incomplete or mismatched records in both Python execution modes."""
+    messages = {
+        "environment": "Environment differs: torch",
+        "helper": "Helper hashes differ",
+        "reference": "FP64 reference hashes differ",
+        "case": "Incomplete or reordered cases",
+        "pass_flag": "FP64 check failed",
+        "scheduler": "Unexpected backward scheduler flags",
+        "missing_gradient": "Incomplete FP64 checks",
+    }
     run = runs["patch-B2"]
     if fault == "environment":
         run["torch"] = "different"
@@ -120,4 +131,5 @@ def test_validation_survives_optimized_python(tmp_path, runs, optimized, fault):
         del run["results"][0]["errors_fp64"]["w"]
     result = summarize(tmp_path, runs, optimized)
     assert result.returncode != 0
+    assert f"ValueError: {messages[fault]}" in result.stderr
     assert not (tmp_path / "summary.json").exists()
