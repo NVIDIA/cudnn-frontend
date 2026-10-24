@@ -28,12 +28,7 @@ def _require_sm100():
 
 
 def _dsa():
-    try:
-        from cudnn import DSA
-
-        return DSA
-    except ImportError:
-        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    return pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed").DSA
 
 
 def _paged_pool(kv_lens_host, page_size, device, *, spare_pages=3):
@@ -134,6 +129,30 @@ def test_DSA_indexer_forward_paged_bshd(page_size):
             scores[b],
             L,
         )
+    # An explicit max_seqlen_k below the pool capacity caps the scored keys like a shorter kv_lens.
+    cap = 128
+    capped = DSA.indexer_forward_top_k_wrapper(
+        q,
+        pool,
+        w,
+        top_k=top_k,
+        ratio=ratio,
+        sm_scale=sm_scale,
+        q_causal_offsets=q_causal_offsets,
+        block_table=block_table,
+        kv_lens=kv_lens,
+        max_seqlen_k=cap,
+        topk_indices_global=False,
+        return_softmax=False,
+        deterministic=True,
+    )
+    torch.cuda.synchronize()
+    assert int(capped["indices"].max()) < cap
+    for b, L in enumerate(kv_lens_host):
+        ref = ref_indexer_forward(
+            q[b : b + 1], dense_k[b][: min(L, cap)].unsqueeze(0), w[b : b + 1], ratio, q_causal_offsets=q_causal_offsets[b : b + 1], compute_dtype=torch.float64
+        )
+        _assert_topk_sets_match(ref.squeeze(0) * sm_scale, capped["indices"][b], top_k, tie_tol=TOL, logits=capped["logits"][b])
 
 
 @pytest.mark.L0
@@ -165,7 +184,21 @@ def test_DSA_indexer_forward_paged_thd(page_size):
         kv_lens=kv_lens,
     )
 
-    fused = DSA.indexer_forward_top_k_wrapper(q, pool, w, top_k=top_k, topk_indices_global=False, return_softmax=False, deterministic=True, **common)
+    # Paged THD has no key prefix, so the preallocation helper sizes from the query side alone.
+    cand_offsets, cand_floats = DSA.compress_topk_cand_buffer_size_thd(cu_q, None, ratio, q_causal_offsets)
+    cand = torch.empty(cand_floats, dtype=torch.float32, device=device)
+    fused = DSA.indexer_forward_top_k_wrapper(
+        q,
+        pool,
+        w,
+        top_k=top_k,
+        topk_indices_global=False,
+        return_softmax=False,
+        deterministic=True,
+        cand_buffer=cand,
+        cand_batch_offsets=cand_offsets,
+        **common,
+    )
     scores = DSA.indexer_forward_wrapper(q, pool, w, **common)["scores"]
     torch.cuda.synchronize()
     assert fused["indices"].shape == (total_q, top_k)

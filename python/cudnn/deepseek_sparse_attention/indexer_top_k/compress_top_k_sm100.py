@@ -712,6 +712,11 @@ def _validate_out_buffer(t, name, out_shape, dtype, device):
     return t
 
 
+def _validate_i32_vector(t, name, device):
+    if not t.is_cuda or t.ndim != 1 or t.dtype != torch.int32 or t.stride(0) != 1 or t.device != device:
+        raise ValueError(f"{name} must be a contiguous 1D int32 CUDA tensor on the cand device")
+
+
 def compress_stage2_topk(
     cand_buffer: torch.Tensor,
     bs: int,
@@ -784,6 +789,11 @@ def compress_stage2_topk(
         )
 
     device = cand_buffer.device
+    if kv_lens is not None:
+        # The kernel reads kv_lens[b] for every batch, so a short vector is an out-of-bounds read.
+        _validate_i32_vector(kv_lens, "kv_lens", device)
+        if kv_lens.numel() != bs:
+            raise ValueError(f"kv_lens must have shape ({bs},), got {tuple(kv_lens.shape)}")
     out_shape = (bs, seqlen_q, topk)
     out_indices = _validate_out_buffer(out_indices, "out_indices", out_shape, torch.int32, device)
     out_logits = _validate_out_buffer(out_logits, "out_logits", out_shape, torch.float32, device)
@@ -934,8 +944,8 @@ def compress_stage2_topk_varlen(
     if (cu_seqlens_k is None) == (kv_lens is None):
         raise ValueError("compress_stage2_topk_varlen takes exactly one of cu_seqlens_k and kv_lens")
     for t, name in ((cu_seqlens_q, "cu_seqlens_q"), (cu_seqlens_k, "cu_seqlens_k"), (kv_lens, "kv_lens")):
-        if t is not None and (not t.is_cuda or t.ndim != 1 or t.dtype != torch.int32 or t.stride(0) != 1 or t.device != device):
-            raise ValueError(f"{name} must be a contiguous 1D int32 CUDA tensor on the cand device")
+        if t is not None:
+            _validate_i32_vector(t, name, device)
     # cu_seqlens_q/k must have the SAME length bs+1: bs is derived from
     # cu_seqlens_q, and the kernel reads mCuSeqlensK[b+1] for every such batch b,
     # so a shorter cu_seqlens_k is an out-of-bounds read.  (Structural, sync-free.)

@@ -277,6 +277,7 @@ def indexer_fwd_compress_topk(
     _cand_batch_offsets: Optional[torch.Tensor] = None,
     block_table: Optional[torch.Tensor] = None,
     kv_lens: Optional[torch.Tensor] = None,
+    max_seqlen_k: Optional[int] = None,
 ) -> tuple[torch.Tensor, ...]:
     """Compress-logits + top-k (CuTe DSL, BSHD).
 
@@ -286,7 +287,8 @@ def indexer_fwd_compress_topk(
 
     ``block_table`` ((bs, max_pages) int32) + ``kv_lens`` ((bs,) int32) read K
     from a page pool ``(num_pages, page_size, 1, head_dim)`` instead of a dense
-    ``(bs, seqlen_k, 1, head_dim)`` tensor (BF16, single launch, local ids).
+    ``(bs, seqlen_k, 1, head_dim)`` tensor (BF16, single launch, local ids);
+    ``max_seqlen_k`` is then the key extent (default ``max_pages * page_size``).
 
     Runs the logits GEMM in *compress* mode — the epilogue writes only the valid
     ratio-causal scores into a compact per-row variable-length cand_buffer
@@ -380,7 +382,8 @@ def indexer_fwd_compress_topk(
         if precision != "bf16":
             raise NotImplementedError("paged K is served by the BF16 indexer only")
         page_size, max_pages = _resolve_paged_k(k, block_table, kv_lens, None, n_block_size=n_block_size, batch=int(bs), device=q.device)
-        seqlen_k, n_heads_kv = max_pages * page_size, int(k.shape[2])
+        seqlen_k = max_pages * page_size if max_seqlen_k is None else int(max_seqlen_k)
+        n_heads_kv = int(k.shape[2])
     else:
         page_size = 0
         _, seqlen_k, n_heads_kv, _ = k.shape
@@ -660,7 +663,7 @@ def indexer_fwd_compress_topk(
         sf_vec_size,
         float(sm_scale),
         seqlen_q,
-        None if paged else seqlen_k,  # paged: the key extent is max_pages * page_size, a runtime bound
+        None if paged else seqlen_k,  # paged: the key extent is a runtime bound
         page_size,
     )
     q_kernel = kernel_qk_view(precision, q)
@@ -834,7 +837,7 @@ def indexer_fwd_compress_topk(
 
 def _compress_cand_batch_offsets(
     cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
+    cu_seqlens_k: torch.Tensor | None,
     ratio: int,
     q_causal_offsets: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -865,7 +868,7 @@ def _compress_cand_batch_offsets(
 
 def compress_topk_cand_buffer_size_thd(
     cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
+    cu_seqlens_k: torch.Tensor | None,
     ratio: int,
     q_causal_offsets: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, int]:
@@ -877,6 +880,9 @@ def compress_topk_cand_buffer_size_thd(
         offsets (``[b]`` = batch b's compact start; ``[bs]`` = total).
       * ``total_floats`` — float32 element count the ``cand_buffer`` must hold.
 
+    ``cu_seqlens_k`` is ``None`` for paged K (``block_table`` + ``kv_lens``): the
+    compact sizes depend on the query lengths and offsets only.
+
     Device values are consumed as provided; callers own the per-batch
     ratio-causal and non-negative offset contracts. Feed the returned
     ``cand_batch_offsets`` (plus a float32 ``cand_buffer`` with
@@ -886,7 +892,11 @@ def compress_topk_cand_buffer_size_thd(
     internal offset compute + ``.item()`` sync per call.  (Strictly zero extra
     transient allocation additionally needs ``topk_indices_global=False``; the
     default global-id conversion records transients into the graph pool — no sync.)"""
-    if cu_seqlens_q.ndim != 1 or cu_seqlens_k.ndim != 1 or cu_seqlens_q.numel() != cu_seqlens_k.numel() or cu_seqlens_q.numel() < 2:
+    if (
+        cu_seqlens_q.ndim != 1
+        or cu_seqlens_q.numel() < 2
+        or (cu_seqlens_k is not None and (cu_seqlens_k.ndim != 1 or cu_seqlens_k.numel() != cu_seqlens_q.numel()))
+    ):
         raise ValueError("cu_seqlens_q/k must be 1D of equal length (bs+1) >= 2")
     bs = cu_seqlens_q.numel() - 1
     if q_causal_offsets is not None:

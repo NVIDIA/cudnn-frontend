@@ -305,6 +305,7 @@ def indexer_fwd(
                     deterministic=deterministic,
                     block_table=block_table,
                     kv_lens=kv_lens,
+                    max_seqlen_k=max_seqlen_k,
                 )
 
     # Dense convenience layer (torch-op semantics; ``IndexerForward`` binds
