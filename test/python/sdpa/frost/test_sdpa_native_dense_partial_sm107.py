@@ -9,7 +9,6 @@ import math
 import pytest
 
 from frost_test_utils import requires_dsl
-from test_sdpa_fwd_dsl_sm107 import _caps, _dense_mask, _f16_facts, _half_oracle, _half_prefold_api, _rubin_only
 
 pytestmark = [pytest.mark.L1, requires_dsl]
 
@@ -18,6 +17,8 @@ pytestmark = [pytest.mark.L1, requires_dsl]
 def test_native_dense_partial_admission(group, monkeypatch):
     """A partial-group pin reaches the native tile and keeps other route boundaries."""
     import dataclasses
+
+    from test_sdpa_fwd_dsl_sm107 import _caps, _f16_facts
 
     from cudnn.frost import buffers
     from cudnn.sdpa.fwd import engines
@@ -43,6 +44,8 @@ def test_native_dense_partial_graph_rebind(cudnn_handle, dtype_name, with_stats,
     """Rebind both captures; retain the graph's existing LPT-L2 rejection."""
     import cudnn
     import torch
+
+    from test_sdpa_fwd_dsl_sm107 import _dense_mask, _half_oracle, _half_prefold_api, _rubin_only
 
     _rubin_only()
     group, dims, sq, sk, splits, causal, sink = {
