@@ -311,8 +311,10 @@ def test_rubin_ragged_pack_rebind_and_changed_lengths_replay(dtype, stats_layout
     assert api._k_mod.THD_INITIAL_WAVES == 2
     resident = max(1, torch.cuda.get_device_properties(DEV).multi_processor_count // api._k_mod.CGA_SIZE)
     assert api._thd_plan().units <= 2 * resident
-    if geometry == "two_wave_pair" and resident < 128 <= 2 * resident:
-        assert api._thd_plan().units == 128
+    if geometry == "two_wave_pair":
+        numerator, denominator = api._k_mod.THD_INITIAL_WORK_RATIO
+        initial_limit = resident * numerator // denominator
+        assert api._thd_plan().units == (128 if 128 <= initial_limit else resident)
     ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
 
     def inputs(seed):
@@ -2095,7 +2097,7 @@ if _dsl_installed():
         meta = cutlass.make_array_view(meta_t)
         fused = cutlass.Boolean(False)
         if cutlass.const_expr(small_batch):
-            fused = (b > 1) & (b <= 32)
+            fused = (b >= 1) & (b <= 32)
         if fused:
             if warp == 0:
                 write_thd_small_batch_meta(
@@ -2226,7 +2228,8 @@ def test_parallel_thd_metadata_matches_lengths_and_normalized_cu(b, flags, rank_
 @requires_dsl
 @pytest.mark.parametrize("b", [0, 1, 2, 31, 32, 33, 65, 257])
 @pytest.mark.parametrize("flags", [0, 3])
-def test_thd_work_prefix_replay_matches_live_tiles(b, flags, _prefix_runner):
+@pytest.mark.parametrize("small_batch", [False, True])
+def test_thd_work_prefix_replay_matches_live_tiles(b, flags, small_batch, _prefix_runner):
     """Remapped prefixes count real tile/head tasks, including empty requests."""
     from cudnn.frost.tile_dsl.thd import THD_WORK_META_WORDS, THD_WORK_PREFIX_OFF
 
@@ -2234,10 +2237,10 @@ def test_thd_work_prefix_replay_matches_live_tiles(b, flags, _prefix_runner):
     meta = storage[4:-4]
     q_in = torch.zeros(b + (flags & 1), dtype=torch.int32, device=DEV)
     k_in = torch.zeros(b + ((flags >> 1) & 1), dtype=torch.int32, device=DEV)
-    _prefix_runner(meta, q_in, k_in, b, flags, True, True)
+    _prefix_runner(meta, q_in, k_in, b, flags, True, True, small_batch)
     capture = torch.cuda.CUDAGraph()
     with torch.cuda.graph(capture):
-        _prefix_runner(meta, q_in, k_in, b, flags, True, True)
+        _prefix_runner(meta, q_in, k_in, b, flags, True, True, small_batch)
     try:
         for state in range(3):
             q = ((torch.arange(b, dtype=torch.int32) + state) * 17) % 65
@@ -2255,7 +2258,7 @@ def test_thd_work_prefix_replay_matches_live_tiles(b, flags, _prefix_runner):
             work = ((q[remap.long()] + 15) // 16) * 3
             expected = torch.cat((k, cq, ck, remap, torch.tensor([int(work.sum()) * 3, 7], dtype=torch.int32)))
             torch.testing.assert_close(got[: 4 * b + 4], expected, rtol=0, atol=0)
-            if b > 1:
+            if b > 1 or (small_batch and b == 1):
                 prefix = torch.cat((torch.zeros(1, dtype=torch.int32), work.cumsum(0, dtype=torch.int32)))
                 torch.testing.assert_close(got[THD_WORK_PREFIX_OFF(b) :], prefix, rtol=0, atol=0)
             assert torch.all(storage[:4] == -12345) and torch.all(storage[-4:] == -12345)
