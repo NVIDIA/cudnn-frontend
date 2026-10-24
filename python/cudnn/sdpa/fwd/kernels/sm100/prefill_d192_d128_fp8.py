@@ -58,6 +58,9 @@ from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d192
 # as a module global before this body runs; the default keeps direct import usable.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 CFG, _TMA = make_cfg_d192(PARAMS)
+# Test-only schedule skew; no plan/runtime API sets this, so ordinary builds
+# compile the delay out. Detector: test_fp8_d192_final_p1_reuse_under_mma_skew.
+_DEBUG_MMA_P1_DELAY_US = int(globals().get("FROST_D192_FP8_DEBUG_MMA_P1_DELAY_US", 0))
 if PARAMS.paged_kv:
     # config_sm100._PAGED_KV_FLAVORS names "d192" for the f16/bf16 kernel; this file has no PAGED_KV specialization.
     raise ValueError(
@@ -173,14 +176,14 @@ def _max_abs_reduction(vec):
 def _exp2_chunk0_mask_aware(vec, apply_mask):
     """Evaluate softmax chunk 0 with the precision required by each static path.
 
-    E5M2 mask-boundary tiles use native EXP2 because degree-2 emulation can
-    exceed the output tolerance there. The repeated unmasked path retains its
-    tuned emulation mix, while the E4M3 instruction mix remains unchanged.
+    Mask-boundary tiles use native EXP2: emulation can move a probability
+    across an FP8 midpoint, which is amplified when a row has few valid keys.
+    The repeated unmasked path retains its tuned emulation mix.
     With the split off (_E2E_ENABLED, cc != 10.0) every element takes native EXP2.
     """
     values = []
     for i in range(0, int(vec.shape[0]), 2):
-        if not _E2E_ENABLED or (CFG.DTYPE_QKV == 1 and apply_mask):
+        if not _E2E_ENABLED or apply_mask:
             x = cute.math.exp2(vec[i], fastmath=True)
             y = cute.math.exp2(vec[i + 1], fastmath=True)
         elif CFG.DTYPE_QKV == 1 and i < 32:
@@ -985,6 +988,7 @@ def _kernel(
             tmem_ptr_i32=tmem_ptr_i32,
             tidx=tidx,
             bars=bars,
+            score_bars=score_bars,
             sched=sched,
             lse_tensor=lse_tensor,
             sinks_tensor=sinks_tensor,
@@ -1722,6 +1726,9 @@ def _mma_warp_group(
                 bars.mb_bmm1_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
                 bars.mb_k_empty[kv_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
 
+                if cutlass.const_expr(_DEBUG_MMA_P1_DELAY_US > 0):
+                    for _us in cutlass.range(_DEBUG_MMA_P1_DELAY_US, unroll=1):
+                        nvvm.inline_ptx("nanosleep.u32 1000;", read_only_args=[])
                 _wait_mbarrier(bars.mb_bmm2_ready[1 * CFG.N_BMM2_CHUNKS + 0], bmm2_ready_phase)
                 desc_V = sV[old_state.idx].desc()
                 accum_b2 = is_not_first_bmm2
@@ -2363,8 +2370,9 @@ def _softmax_warp_group(
                 state,
             )
 
-        if sub_tile_id == 0:
-            # No S0[last+1] exists; release P1[last] with one synthetic event.
+        if sub_tile_id == 0 and bounds.right <= bounds.left + cutlass.Int32(1):
+            # No prior P1 exists for an empty/single-KV tile. Multi-KV tiles
+            # release the final P1 slot from correction after prior PV drains.
             score_bars.mb_s_consumed[0].arrive()
 
         # End-of-kv: publish (total_max, total_sum_final) — corr does LSE.
@@ -2410,6 +2418,7 @@ def _correction_warp_group(
     tmem_ptr_i32,
     tidx,
     bars,
+    score_bars,
     sched,
     lse_tensor: Optional[cute.Tensor],
     sinks_tensor: cute.Tensor,
@@ -2494,6 +2503,13 @@ def _correction_warp_group(
                 bars.mb_stat_empty[qs].arrive()
 
                 _wait_mbarrier(bars.mb_bmm2_done[qs], bmm2_done_phase)
+
+                if cutlass.const_expr(qs == 1):
+                    if kv_loop == bounds.right - cutlass.Int32(1):
+                        # Final S0 lookahead is synthetic: unlike a real S0
+                        # completion it does not order the previous P1 read.
+                        # Both correction and softmax have 128 lanes/CTA.
+                        score_bars.mb_s_consumed[0].arrive()
 
                 # Split O_CHUNK=16 into 2× O_HALF=8 LDTM/STTM issued back-to-back —
                 # distinct scoreboard slots overlap second LDTM with first's wait.

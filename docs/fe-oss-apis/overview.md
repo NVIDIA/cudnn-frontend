@@ -63,7 +63,7 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. New A
 
 ## Installation and setup
 
-All Frontend OSS APIs come installed with the `nvidia-cudnn-frontend` package, and so does the CuTeDSL runtime they JIT through — `nvidia-cutlass-dsl[cu13]>=4.6.2` and `apache-tvm-ffi` are required dependencies (and the DSL pulls `cuda-python` in transitively):
+All Frontend OSS APIs come installed with the `nvidia-cudnn-frontend` package, and so does the CuTeDSL runtime they JIT through — `nvidia-cutlass-dsl[cu13]>=4.8.0` and `apache-tvm-ffi` are required dependencies (and the DSL pulls `cuda-python` in transitively):
 ```bash
 pip install nvidia-cudnn-frontend
 ```

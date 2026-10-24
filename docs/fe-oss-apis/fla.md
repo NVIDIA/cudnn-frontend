@@ -64,10 +64,11 @@ Everything else executes the saved original FLA callable. Typed
 unsupported-kernel declines fall back, while unexpected native binding,
 allocation, and launch failures propagate.
 
-The current native kernel requires CUTLASS DSL 4.7 or newer. If only the
-package-wide `nvidia-cutlass-dsl>=4.6.2` floor is present and the native import is
-unavailable, the adapter catches that typed `ImportError` and executes FLA's
-original path. Hardware correctness coverage is SM80, SM89, SM90, and SM100;
+The current native kernel requires CUTLASS DSL 4.7 or newer, satisfied by the
+package-wide `nvidia-cutlass-dsl[cu13]>=4.8.0` floor. If an environment bypasses
+that dependency and the native import is unavailable, the adapter catches the
+typed `ImportError` and executes FLA's original path. Hardware correctness
+coverage is SM80, SM89, SM90, and SM100;
 the native kernel is additionally runtime-validated on SM103 and SM120.
 SM86, SM87, SM110, and SM121 are compile-validated only. The SM110 kernel
 cross-compiles with CUTLASS DSL 4.7, but no SM110 hardware execution is claimed.

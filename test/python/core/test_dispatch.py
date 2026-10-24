@@ -388,6 +388,72 @@ def test_compiled_plan_lifecycle_knobs_and_reuse(monkeypatch):
     assert compiled_log == [{"tile": 256}, {"tile": 128}]  # g2 compiled its own plan
 
 
+def test_indexed_execution_keeps_each_callers_plan(monkeypatch):
+    """Overlapping indexed calls must not borrow or change shared selection."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from cudnn.engines import CompiledPlan, PlanConfig
+
+    executed = []
+
+    class Plan(CompiledPlan):
+        def __init__(self, tag):
+            self.tag = tag
+
+        def execute(self, graph, tensor_data, ctx):
+            executed.append((ctx.workspace, self.tag))
+
+    class Engine(BaseEngine):
+        name = "indexed_recording"
+        engine_id = _FAKE + 40
+
+        def build_plan(self, graph, config, ctx=None):
+            return Plan(config.knobs["tile"])
+
+    engine = Engine()
+    _offer(monkeypatch, engine)
+    _ranking(monkeypatch, lambda *args: [PlanConfig(engine.engine_id, {"tile": tile}) for tile in (128, 256, 512)])
+    graph = pygraph()
+    output = graph.matmul(torch.randn(2, 2), torch.randn(2, 2))
+    graph.create_execution_plans()
+    indices = _python_indices(graph)
+    for index in indices:
+        graph.build_plan_at_index(index)
+    retained = (graph._plan_index, graph._plan_pinned, graph._is_built)
+
+    first_entered, second_entered, first_finished = (threading.Event() for _ in range(3))
+    local = threading.local()
+
+    def stream(handle):
+        if local.first:
+            first_entered.set()
+            assert second_entered.wait(10)
+        else:
+            second_entered.set()
+            assert first_finished.wait(10)
+        return None
+
+    monkeypatch.setattr(graph, "_resolve_stream", stream)
+
+    def call(index, first):
+        local.first = first
+        tag = graph.plans[index].knobs["tile"]
+        try:
+            graph.execute_plan_at_index({output: torch.empty(2, 2)}, workspace=tag, index=index)
+        finally:
+            if first:
+                first_finished.set()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(call, indices[0], True)
+        assert first_entered.wait(10)
+        second = pool.submit(call, indices[1], False)
+        first.result(timeout=20)
+        second.result(timeout=20)
+    assert executed == [(128, 128), (256, 256)]
+    assert (graph._plan_index, graph._plan_pinned, graph._is_built) == retained
+
+
 def _ranking(monkeypatch, fn):
     """Replace the ranking policy for one graph's planning.
 
