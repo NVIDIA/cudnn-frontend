@@ -48,7 +48,7 @@ def test_native_dense_partial_graph_rebind(cudnn_handle, dtype_name, with_stats,
     group, dims, sq, sk, splits, causal, sink = {
         "partial6": (6, (128, 128), 129, 257, 1, True, False),
         "partial12_sink": (12, (96, 80), 257, 257, 1, True, True),
-        "partial24_split": (24, (64, 64), 129, 385, 2, False, False),
+        "partial24_split": (24, (64, 64), 129, 385, 2, True, False),
     }[geometry]
     api, bufs = _half_prefold_api(
         *dims,

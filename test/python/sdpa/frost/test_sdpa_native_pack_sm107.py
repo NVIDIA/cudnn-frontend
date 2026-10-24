@@ -53,7 +53,7 @@ def test_native_d128_packing_dense_replay(dtype_name, sched_policy, with_stats, 
         "partial12": (12, 257, 513, 1, True, True, None, True),
         "partial_keyless": (6, 257, 65, 1, True, True, None, False),
         "partial_window": (12, 129, 257, 1, True, True, 47, True),
-        "partial_envelope": (24, 129, 385, 2, False, False, None, False),
+        "partial_envelope": (24, 129, 385, 2, True, True, None, False),
         "partial_asymmetric": (10, 129, 257, 1, True, True, None, True),
         "partial192": (192, 9, 65, 1, False, False, None, False),
     }[geometry]
