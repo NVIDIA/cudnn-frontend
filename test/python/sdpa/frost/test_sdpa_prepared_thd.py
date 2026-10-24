@@ -1930,7 +1930,7 @@ def test_thd_cache_shape_grid_tracks_runtime_capacity(d, arch, backend_lowering,
     _check_thd_cache_shape_grid(d, arch, backend_lowering, monkeypatch)
 
 
-def _check_thd_cache_shape_grid(d, arch, backend_lowering, monkeypatch, *, native_packed=None):
+def _check_thd_cache_shape_grid(d, arch, backend_lowering, monkeypatch, *, native_packed=None, native_heads=(16, 4), native_workloads=None):
     if not backend_lowering:
 
         def decline(self):
@@ -1938,7 +1938,7 @@ def _check_thd_cache_shape_grid(d, arch, backend_lowering, monkeypatch, *, nativ
 
         monkeypatch.setattr(cudnn.pygraph, "_backend_lowerable", lambda self: False)
         monkeypatch.setattr(cudnn.pygraph, "_lower_backend_graph", decline)
-    hq, hk = (4, 2) if native_packed is None else (16, 4)
+    hq, hk = (4, 2) if native_packed is None else native_heads
     g, t = _thd_graph(4096, 65536, 65536, hq, hk, d, override_enabled=True, arch=arch)
     if not backend_lowering:
         assert g._lowered_graph is None
@@ -1951,6 +1951,11 @@ def _check_thd_cache_shape_grid(d, arch, backend_lowering, monkeypatch, *, nativ
         g.build_plans()
     plan = _plan(g)
     spec = plan._prepared.spec
+    if native_packed is not None:
+        token_rows, tile_heads, limit = spec.wave_geometry
+        _, resident, waves = spec.wave_policy
+        assert token_rows * hq == spec.cga_tile_m * tile_heads
+        assert resident <= limit <= resident * waves
     template = list(spec.template)
     rec = _Recorder(spec)
     ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
@@ -1981,6 +1986,8 @@ def _check_thd_cache_shape_grid(d, arch, backend_lowering, monkeypatch, *, nativ
         workloads = ([517], [1, 3, 0, 513], [517])
         if native_packed is not None:
             workloads = ([2048, 2048], [4097, 4097], [1, 3, 0, 513], [2048, 2048])
+            if native_workloads is not None:
+                workloads = native_workloads
         for qlens in workloads:
             b, total = len(qlens), sum(qlens)
             klens = [n + 17 for n in qlens]
@@ -2026,8 +2033,13 @@ def _check_thd_cache_shape_grid(d, arch, backend_lowering, monkeypatch, *, nativ
             bound = ((total - 1) // spec.cga_tile_m + b) * hq
             if native_packed is not None:
                 envelope, resident, waves = spec.wave_policy
+                geometry = getattr(spec, "wave_geometry", None)
+                limit = resident * waves
+                if geometry is not None:
+                    token_rows, tile_heads, limit = geometry
+                    bound = ((total - 1) // token_rows + b) * tile_heads
                 bound = min(envelope, bound)
-                expected = bound if bound <= resident * waves else resident
+                expected = bound if bound <= limit else resident
                 assert rec.frames[-1]["n_thd_units"] == expected
             else:
                 assert rec.frames[-1]["n_thd_units"] <= bound

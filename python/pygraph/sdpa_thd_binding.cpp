@@ -364,6 +364,18 @@ class SdpaThdBinder {
                 invalid("invalid native THD initial-wave policy");
             initial_wave_limit_ = multiply(resident_units_, policy[2]);
         }
+        unit_rows_  = cga_tile_m_;
+        unit_heads_ = qh_;
+        if (py::hasattr(spec, "wave_geometry") && !spec.attr("wave_geometry").is_none()) {
+            const auto geometry = py::cast<std::array<int64_t, 3>>(spec.attr("wave_geometry"));
+            const int64_t rows = geometry[0], heads = geometry[1], limit = geometry[2];
+            if (!initial_wave_limit_ || rows <= 0 || heads <= 0 || qh_ % heads || heads % kh_ || cga_tile_m_ % rows ||
+                cga_tile_m_ / rows != qh_ / heads || limit < resident_units_ || limit > initial_wave_limit_)
+                invalid("invalid native THD initial-wave geometry");
+            unit_rows_          = rows;
+            unit_heads_         = heads;
+            initial_wave_limit_ = limit;
+        }
     }
 
     py::object
@@ -560,7 +572,7 @@ class SdpaThdBinder {
         put(frame, ProblemSize, py::make_tuple(b, qh_, kh_, tq, tkv, 0));
         // Sum of per-sequence ceil divisions <= ceil(total capacity / tile) + B - 1.
         // Rebind a safe grid without reading device lengths or mutating the plan.
-        const int64_t units  = multiply(multiply(add((tq - 1) / cga_tile_m_, b), qh_), splits_);
+        const int64_t units  = multiply(multiply(add((tq - 1) / unit_rows_, b), unit_heads_), splits_);
         int64_t launch_units = std::min(units_, units);
         if (initial_wave_limit_) {
             const int64_t bound = std::min(wave_envelope_, units);
@@ -872,6 +884,7 @@ class SdpaThdBinder {
     int64_t b_, qh_, kh_, device_, lens_form_, off_o_desc_, total_q_, total_kv_, lse_head_stride_;
     int64_t cga_tile_m_, units_, page_size_, workspace_alignment_;
     int64_t wave_envelope_ = 0, resident_units_ = 0, initial_wave_limit_ = 0;
+    int64_t unit_rows_, unit_heads_;
     int64_t splits_ = 1, split_capacity_ = 0, off_partial_o_ = 0, off_partial_lse_ = 0;
     int64_t sq_max_ = 0, lse_elements_ = 0, lse_span_ = 0, live_sq_max_ = -1;
     std::array<int64_t, 3> lse_strides_{};
@@ -886,6 +899,7 @@ init_sdpa_thd_binding(py::module_ &m) {
     py::class_<SdpaThdBinder>(m, "_SdpaThdBinder")
         .def(py::init<const py::object &>(), py::arg("spec"))
         .def_prop_ro_static("supports_initial_waves", [](py::object) { return true; })
+        .def_prop_ro_static("supports_initial_wave_geometry", [](py::object) { return true; })
         .def_prop_ro_static("supports_stats_stride_override", [](py::object) { return true; })
         .def_prop_ro_static("supports_paged_packed_split", [](py::object) { return true; })
         .def_prop_ro_static("supports_paged_split_sink", [](py::object) { return true; })

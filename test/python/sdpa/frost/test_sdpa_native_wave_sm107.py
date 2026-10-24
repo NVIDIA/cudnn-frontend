@@ -13,7 +13,8 @@ pytestmark = [pytest.mark.L1, requires_dsl]
 
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("backend_lowering", [False, True])
-def test_native_initial_waves_bind_current_work(packed, backend_lowering, monkeypatch):
+@pytest.mark.parametrize("heads,workloads", [((16, 4), None), ((64, 8), ([1025], [769], [1025]))], ids=["ragged", "many_heads"])
+def test_native_initial_waves_bind_current_work(packed, backend_lowering, heads, workloads, monkeypatch):
     if torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("native SM107 initial-wave policy")
-    _check_thd_cache_shape_grid(128, "sm107", backend_lowering, monkeypatch, native_packed=packed)
+    _check_thd_cache_shape_grid(128, "sm107", backend_lowering, monkeypatch, native_packed=packed, native_heads=heads, native_workloads=workloads)

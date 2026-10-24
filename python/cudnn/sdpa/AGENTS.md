@@ -347,6 +347,11 @@ production kernels gain no debug knob or timing-dependent assertion.
   use the resident wave; no device-length read is needed. Check native/reference
   frames and small-to-large-to-small rebinding, then changed-length graph replay
   (`test_native_initial_waves_bind_current_work`).
+- Packed runtime bounds use token rows per tile and packed head groups. Keep
+  the body's initial-work budget with that geometry in immutable plan metadata;
+  counting unpacked rows and all query heads can select an extra worker wave.
+  Check both packing modes and partial groups against explicit native frames
+  (`test_native_thd_initial_wave_geometry_rebinds`), including a broad declaration.
 - `test_native_d128_packing_dense_replay` compiles all three schedulers and
   checks changed-input replay, split partials and MHA's bitwise packing fold.
   The ragged changed-length tests cover partial packing and retained captures.
