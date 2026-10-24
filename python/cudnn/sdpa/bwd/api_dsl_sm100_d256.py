@@ -40,6 +40,8 @@ class SdpaBwdDslSm100D256(SdpaBwdDslSm107):
     _FAMILY = _cfg.FAMILY_F16
     _NAME = "sdpa_bwd_sm100_d256"
     _BATCH_CHUNKING = True
+    _BATCH_PADDED_BSHD = True
+    _THD_SUPPORTED = False
     _IO_DTYPES = SdpaBwdDslSm107._IO_DTYPES
 
     # The half row serves per-batch kv lengths on its standalone surface (its body reads ``seq_kv_lens[b]`` under the

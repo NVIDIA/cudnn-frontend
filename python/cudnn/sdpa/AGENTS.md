@@ -219,6 +219,13 @@ stay Int64. Widen operands before multiplication. The physical detector is
 separated above 2**32 and checks capture/replay. A wide fake extent alone only
 fixes binding; deliberately narrowing the plane stride must fail numerically.
 
+Padding helpers must preserve strides too: reinterpreting data as 32-bit words
+changes stride units, not physical layout. Both the input address and output store
+must use those strides. Pitched BSHD can look correct at batch zero and silently
+read the wrong K/V at batch one. The detector is
+`test_sdpa_bwd_d256_sm100.py::test_batch_pitch_rebind_and_replay`, including
+both source padding and output copy-out with canaries in unused physical rows.
+
 **Rule S6 — A kernel feature lands on every arch line's test file, and its
 other-arch lowerings are smoke-compiled from whatever GPU you have.**
 
@@ -1118,3 +1125,11 @@ carrying different strides; keep descriptor axes and loader coordinates
 consistent rather than changing one alone. The `independent_pool_layouts`
 tests pin FROST execution and compare O/Stats in both mixed directions,
 including one KV head; backend fallback must not count as kernel support.
+
+An adapter subclass must explicitly retain unsupported layout flags when its
+parent gains a new mode. Graph capability filtering does not protect direct
+adapter callers. `test_standalone_adapter_rejects_thd` checks the SM100 D256
+decline with otherwise valid descriptors and a positive parent-row control;
+it must fail if the subclass inherits the parent's THD admission. For pitched
+views, protect input and output padding with canaries as well as gradient
+padding, and check all of them after eager execution and graph replay.

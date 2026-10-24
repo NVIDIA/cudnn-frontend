@@ -255,6 +255,20 @@ def test_reject_thd(monkeypatch):
     assert _decline_reason(monkeypatch, thd=True) is not None
 
 
+@pytest.mark.parametrize("dt", _DTYPES, ids=_DTYPE_IDS)
+@pytest.mark.parametrize("kv_heads", [4, 2], ids=["mha", "gqa"])
+def test_standalone_adapter_rejects_thd(dt, kv_heads):
+    """A direct adapter must decline packed THD even when no graph capability filter runs."""
+    from cudnn.sdpa.bwd.api_dsl_sm100_d256 import SdpaBwdDslSm100D256
+    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107
+
+    options = dict(hq=4, hkv=kv_heads, dt=dt, thd=True, max_total_seq_len_q=1024, max_total_seq_len_kv=1024)
+    # These descriptors are valid for the parent row that implements packed THD.
+    assert _adapter(SdpaBwdDslSm107, **options).check_support()
+    with pytest.raises(ValueError, match="sdpa_bwd_sm100_d256: THD / ragged is not implemented"):
+        _adapter(SdpaBwdDslSm100D256, **options).check_support()
+
+
 def test_reject_decode_shaped(monkeypatch):
     assert _decline_reason(monkeypatch, sq=1) is not None
 
@@ -1133,3 +1147,158 @@ def test_rubin_profile_traces_or_names_the_missing_dsl_intrinsic():
     for line in proc.stdout.splitlines():
         if line.startswith("SKIP "):
             pytest.skip(line.removeprefix("SKIP "))
+
+
+# Batch-pitched BSHD views: the physical buffers retained by CP AllGather.
+_PITCH_ROLES = ("q", "k", "v", "o", "do", "stats", "dq", "dk", "dv")
+
+
+def _batch_pitch_case(sq, sk, kv_heads, dt, seed):
+    batch, pq, pk, heads, dim = 2, 256, 512, 8, 256
+    origin = 0 if sk <= pk // 2 else 128
+    gen = torch.Generator().manual_seed(seed)
+    cpu = {}
+    for role in ("q", "k", "v", "do"):
+        pitch, h = (pk, kv_heads) if role in ("k", "v") else (pq, heads)
+        cpu[role] = (torch.randn(batch, pitch, h, dim, generator=gen) * 0.5).to(dt)
+
+    def view(base, role):
+        begin, length = (0, sk) if role in ("k", "v", "dk", "dv") else (origin, sq)
+        return base[:, begin : begin + length].permute(0, 2, 1, 3)
+
+    q, k, v = [view(cpu[role], role).double().requires_grad_() for role in ("q", "k", "v")]
+    do = view(cpu["do"], "do").double()
+    group = heads // kv_heads
+    scores = q @ k.repeat_interleave(group, 1).transpose(-1, -2) * dim**-0.5
+    scores = scores.masked_fill(torch.arange(sk)[None, :] > torch.arange(sq)[:, None] + sk - sq, -torch.inf)
+    lse = scores.logsumexp(-1)
+    output = scores.softmax(-1) @ v.repeat_interleave(group, 1)
+    expected = torch.autograd.grad(output, (q, k, v), do)
+    for role in ("q", "k", "v", "do"):
+        begin, length = (0, sk) if role in ("k", "v") else (origin, sq)
+        cpu[role][:, :begin].fill_(13)
+        cpu[role][:, begin + length :].fill_(13)
+    cpu["o"] = torch.full_like(cpu["q"], 11)
+    view(cpu["o"], "o").copy_(output.detach().to(dt))
+    for role, base in (("dq", "q"), ("dk", "k"), ("dv", "v")):
+        cpu[role] = torch.full_like(cpu[base], 7)
+    bases = {role: value.cuda() for role, value in cpu.items()}
+    values = {role: view(base, role) for role, base in bases.items()}
+    values["stats"] = lse.detach().float().unsqueeze(-1).contiguous().cuda()
+    return bases, values, expected, origin
+
+
+def _batch_pitch_graph(values, dt):
+    dtype = cudnn.data_type.BFLOAT16 if dt == torch.bfloat16 else cudnn.data_type.HALF
+    graph = cudnn.pygraph(io_data_type=dtype, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    refs = {
+        role: graph.tensor(
+            name=role, dim=list(values[role].shape), stride=list(values[role].stride()), data_type=cudnn.data_type.FLOAT if role == "stats" else dtype
+        )
+        for role in _PITCH_ROLES[:6]
+    }
+    outputs = graph.sdpa_backward(
+        q=refs["q"],
+        k=refs["k"],
+        v=refs["v"],
+        o=refs["o"],
+        dO=refs["do"],
+        stats=refs["stats"],
+        attn_scale=256**-0.5,
+        use_causal_mask_bottom_right=True,
+        use_deterministic_algorithm=False,
+    )
+    for role, tensor in zip(_PITCH_ROLES[6:], outputs):
+        tensor.set_output(True).set_data_type(dtype).set_dim(list(values[role].shape)).set_stride(list(values[role].stride()))
+        refs[role] = tensor
+    graph.validate()
+    graph.build_operation_graph()
+    graph.create_execution_plan(_ENGINE_ID, {})
+    graph.build_plans()
+    assert graph._compiled_plans[graph._plan_index]._prepared.spec.name == _ENGINE
+    return graph, refs
+
+
+@requires_pre_rubin_blackwell
+@pytest.mark.parametrize("dt", _DTYPES, ids=_DTYPE_IDS)
+@pytest.mark.parametrize("kv_heads", [8, 2], ids=["mha", "gqa"])
+@pytest.mark.parametrize("sq,sk", [(128, 128), (128, 256), (128, 384), (128, 512), (96, 129)])
+def test_batch_pitch_rebind_and_replay(cudnn_handle, dt, kv_heads, sq, sk):
+    """CPU FP64 gradients and untouched physical holes under fresh bindings and poisoned-workspace replay.
+
+    Relaxing the old layout check alone fails on the second batch: the padding helper must preserve source AND destination
+    strides. The 96x129 arm exercises Q/dO and KV padding together; the other arms cover all four CP2 AllGather geometries.
+    """
+    bases, values, expected, origin = _batch_pitch_case(sq, sk, kv_heads, dt, 71)
+    graph, refs = _batch_pitch_graph(values, dt)
+    workspace = torch.empty(max(graph.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
+    stream, other = torch.cuda.Stream(), torch.cuda.Stream()
+    original_stream = cudnn.get_stream(cudnn_handle)
+    capture = None
+
+    def check():
+        for role in ("q", "k", "v", "o", "do"):
+            begin, length = (0, sk) if role in ("k", "v") else (origin, sq)
+            storage = bases[role].cpu()
+            canary = 11 if role == "o" else 13
+            assert (storage[:, :begin] == canary).all() and (storage[:, begin + length :] == canary).all(), role
+        for role, reference in zip(("dq", "dk", "dv"), expected):
+            actual = values[role].double().cpu()
+            torch.testing.assert_close(actual, reference, atol=0.025, rtol=0.025)
+            rrms = (actual - reference).square().mean().sqrt() / reference.square().mean().sqrt().clamp_min(1e-8)
+            assert rrms.item() < 0.02, (role, rrms)
+            begin, length = (0, sk) if role in ("dk", "dv") else (origin, sq)
+            storage = bases[role].cpu()
+            assert (storage[:, :begin] == 7).all() and (storage[:, begin + length :] == 7).all(), role
+
+    try:
+        cudnn.set_stream(cudnn_handle, stream.cuda_stream)
+        for seed in (71, 89):
+            if seed != 71:
+                bases, values, expected, origin = _batch_pitch_case(sq, sk, kv_heads, dt, seed)
+            pack = {refs[role]: value for role, value in values.items()}
+            workspace.fill_(0xBD)
+            stream.wait_stream(torch.cuda.current_stream())
+            other.wait_stream(torch.cuda.current_stream())
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                with torch.cuda.stream(other):
+                    graph.execute(pack, workspace, handle=cudnn_handle)
+            finally:
+                torch.cuda.set_sync_debug_mode("default")
+            torch.cuda.current_stream().wait_stream(stream)
+            check()
+            stream.wait_stream(torch.cuda.current_stream())
+            capture = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(capture, stream=stream):
+                with torch.cuda.stream(other):
+                    graph.execute(pack, workspace, handle=cudnn_handle)
+            for role in ("dq", "dk", "dv"):
+                bases[role].fill_(7)
+            workspace.fill_(0xA5)
+            capture.replay()
+            torch.cuda.synchronize()
+            check()
+            capture.reset()
+            capture = None
+    finally:
+        if capture is not None:
+            capture.reset()
+        cudnn.set_stream(cudnn_handle, original_stream)
+
+
+@pytest.mark.parametrize("role", ["q", "k", "v", "o", "do", "dq", "dk", "dv"])
+@pytest.mark.parametrize("invalid", ["overlap", "alignment", "token", "head", "element"])
+def test_batch_pitch_rejects_invalid_port_strides(role, invalid):
+    """Every data port must retain compact rows and a nonoverlapping, 16-byte aligned batch pitch."""
+    from dataclasses import replace
+    from cudnn.sdpa.bwd.api_dsl_sm100_d256 import SdpaBwdDslSm100D256
+
+    api = _adapter(SdpaBwdDslSm100D256)
+    desc = getattr(api, role + "_desc")
+    strides = list(desc.stride)
+    axis, delta = {"overlap": (0, -8), "alignment": (0, 1), "token": (2, 8), "head": (1, 8), "element": (3, 1)}[invalid]
+    strides[axis] += delta
+    setattr(api, role + "_desc", replace(desc, stride=tuple(strides)))
+    with pytest.raises(ValueError, match="BSHD-physical"):
+        api.check_support()

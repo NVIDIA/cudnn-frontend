@@ -143,7 +143,7 @@ def _zero_ds(ds_full, config: cutlass.Constexpr, stream):
 def _pad_rows(src: cute.Tensor, dst: cute.Tensor):
     """``dst[b, s, h, :] = src[b, s, h, :]`` for ``s < S_src``, zeros for the rows past it; ``dst``'s extent bounds the walk.
 
-    Both are the ``_words`` views of COMPACT ``[B, S, H, D]`` tensors of one dtype (the rows' BSHD-physical claim): 32-bit
+    Both are the ``_words`` views of row-contiguous ``[B, S, H, D]`` tensors of one dtype, retaining physical strides: 32-bit
     words, the row ``D * itemsize / 4`` wide, so the copy is dtype-agnostic and moves 16 bytes per thread step.  Serves the
     zero-padded Q / dO / K / V staging (``S_dst > S_src``) AND the real-row copy-out of a padded partial (``S_dst < S_src``:
     every row copied).
@@ -166,11 +166,13 @@ def _pad_rows(src: cute.Tensor, dst: cute.Tensor):
         bs = row // H
         s = bs % S_dst
         b = bs // S_dst
+        dst_offset = b * dst.stride[0] + s * dst.stride[1] + h * dst.stride[2] + col
         if s < S_src:
-            v = (src_ptr + ((b * S_src + s) * H + h) * row_words + col).load(count=4)
-            (dst_ptr + pos).store(v, alignment=16)
+            src_offset = b * src.stride[0] + s * src.stride[1] + h * src.stride[2] + col
+            v = (src_ptr + src_offset).load(count=4)
+            (dst_ptr + dst_offset).store(v, alignment=16)
         else:
-            (dst_ptr + pos).store(zeros, alignment=16)
+            (dst_ptr + dst_offset).store(zeros, alignment=16)
         i += cutlass.Int64(blocks) * _THREADS
 
 
@@ -529,16 +531,17 @@ def _matmul(
 
 @cute.jit
 def _words(tensor: cute.Tensor, itemsize: cutlass.Constexpr[int]):
-    """A compact ``[B, S, H, D]`` tensor as 32-bit words: ``[B, S, H, D * itemsize / 4]``, the dtype-agnostic copy view."""
+    """A row-contiguous tensor as 32-bit words, preserving physical batch, sequence and head strides."""
     b, s, h, d = tensor.shape
     w = d * itemsize // 4
     ptr = cute.make_ptr(cutlass.Int32, tensor.iterator.toint(), cute.AddressSpace.gmem, assumed_align=16)
-    return cute.make_tensor(ptr, cute.make_layout((b, s, h, w), stride=(s * h * w, h * w, w, 1)))
+    strides = tuple(tensor.stride[i] * itemsize // 4 for i in range(3)) + (1,)
+    return cute.make_tensor(ptr, cute.make_layout((b, s, h, w), stride=strides))
 
 
 @cute.jit
 def _pad_copy(src: cute.Tensor, dst: cute.Tensor, itemsize: cutlass.Constexpr[int], stream):
-    """Launch ``_pad_rows`` over the word views of two compact ``[B, S, H, D]`` tensors (rows past ``src``'s extent read as zero)."""
+    """Copy row-contiguous tensors using their physical strides; rows past ``src``'s extent read as zero."""
     d = _words(dst, itemsize)
     _pad_rows(_words(src, itemsize), d).launch(grid=(min((cute.size(d) // 4 + _THREADS - 1) // _THREADS, 4096), 1, 1), block=(_THREADS, 1, 1), stream=stream)
 
