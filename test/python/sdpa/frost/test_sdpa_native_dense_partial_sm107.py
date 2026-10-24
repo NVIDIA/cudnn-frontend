@@ -40,7 +40,7 @@ def test_native_dense_partial_admission(group, monkeypatch):
 @pytest.mark.parametrize("sched_policy", [0, 1, 2])
 @pytest.mark.parametrize("geometry", ["partial6", "partial12_sink", "partial24_split"])
 def test_native_dense_partial_graph_rebind(cudnn_handle, dtype_name, with_stats, sched_policy, geometry):
-    """Rebind distinct storage, then replay both captures with their original pointers."""
+    """Rebind both captures; retain the graph's existing LPT-L2 rejection."""
     import cudnn
     import torch
 
@@ -96,6 +96,13 @@ def test_native_dense_partial_graph_rebind(cudnn_handle, dtype_name, with_stats,
     g.create_execution_plan(engine, chosen)
     g.select_plan(g.get_execution_plan_count() - 1)
     g.check_support()
+    if sched_policy == 2:
+        # The direct dense kernel accepts LPT-L2, but the public graph's
+        # established scheduler domain is NATURAL/LPT. Partial-group admission
+        # must not silently widen that independent contract.
+        with pytest.raises(NotImplementedError, match=r"sched_policy=2 is outside this engine's domain \[0, 1\]"):
+            g.build_plans()
+        return
     g.build_plans()
     selected = g._compiled_plans[g._plan_index]
     compiled_api = inspect.getclosurevars(selected._compiled.default_stream).nonlocals["api"]
