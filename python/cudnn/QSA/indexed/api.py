@@ -175,11 +175,39 @@ def qsa_indexed_forward(q, k, v, indices, scale=1 / 16):
     return TupleDict(zip(("out", "out_fp32", "lse"), outputs))
 
 
-def qsa_indexed_backward(grad_out, q, k, v, out_fp32, lse, indices, scale=1 / 16):
-    """Return BF16 ``(dq, dk, dv)``; preserve forward's FP32 output and LSE."""
+def qsa_indexed_backward(grad_out, q, k, v, out_fp32, lse, indices, scale=1 / 16, *, selection_mode="general", cu_seqlens=None, max_seq_len=None):
+    """Return BF16 ``(dq, dk, dv)`` using forward's FP32 output and LSE.
+
+    ``general`` preserves arbitrary group ordering, padding holes and empty rows.
+    ``causal_topk`` declares the finite-input, top-512 complete four-token blocks
+    plus causal-tail contract described in ``docs/fe-oss-apis/qsa_indexed.md``.
+    Its packed form requires device int32 ``cu_seqlens``; ``max_seq_len`` is an
+    optional host upper bound. Values stay on the device and are caller contracts.
+    """
+    if not isinstance(selection_mode, str) or selection_mode not in ("general", "causal_topk"):
+        raise ValueError("selection_mode must be 'general' or 'causal_topk'")
+    if selection_mode == "general" and (cu_seqlens is not None or max_seq_len is not None):
+        raise ValueError("cu_seqlens and max_seq_len require selection_mode='causal_topk'; general selection encodes its bounds in indices")
     if grad_out is None:
         raise ValueError("grad_out is required")
     total, width = _validate(q, k, v, indices, scale, grad_out, out_fp32, lse)
+    if selection_mode == "causal_topk":
+        if width != 2052 or scale != 1 / 16:
+            raise NotImplementedError("causal_topk requires index width 2052 and scale=1/16")
+        if max_seq_len is not None and (type(max_seq_len) is not int or not 1 <= max_seq_len <= total):
+            raise ValueError(f"max_seq_len must be a host integer in [1, {total}]")
+        if cu_seqlens is None and max_seq_len is not None and max_seq_len != total:
+            raise ValueError("Without cu_seqlens, max_seq_len must equal the single sequence's token count")
+        if cu_seqlens is not None:
+            if not isinstance(cu_seqlens, torch.Tensor) or cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
+                raise ValueError("cu_seqlens must have shape [B + 1] with B >= 1")
+            check_tensor("cu_seqlens", cu_seqlens, cu_seqlens.shape, torch.int32, q.device)
+        # Explicit selection semantics admit this backend; tensor shape alone
+        # must never route general selections (notably empty rows) into it.
+        from cudnn.QSA.two_pass.api import _backward
+
+        with torch.cuda.device(q.device):
+            return _backward(q, k, v, out_fp32, grad_out, lse, indices, softmax_scale=scale, cu_seqlens=cu_seqlens, max_seq_len=max_seq_len)
     plan = _plan(total, width, q.device, "bprop")
     with torch.cuda.device(q.device):
         outputs = (torch.empty_like(q), torch.empty_like(k), torch.empty_like(v))
