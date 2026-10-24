@@ -981,7 +981,14 @@ the no-zero-fill contract are the Rubin row's (poisoned-workspace tests in
 `test/python/sdpa/frost/test_sdpa_bwd_d256_sm100.py`). Exact (256, 256), f16/bf16;
 dense, top-left and bottom-right causal (ragged S_q included), sliding window
 (left), MHA/GQA/MQA, any S_q / S_kv (padded to 128 / 256 and masked), BSHD-physical
-io, contiguous fp32 Stats. Declined, each asserted by a test: dense padding
+io, contiguous fp32 Stats. The dense BSHD declaration also accepts a nonoverlapping,
+16-byte aligned physical batch pitch with compact head/token/element strides. Existing
+padding and copy-out helpers preserve the declared pitch; no additional layout-repack
+kernel is inserted. This is a dense-layout contract, not THD/ragged support. The pinned
+`test_batch_pitch_rebind_and_replay` checks MHA/GQA, BF16/FP16, rectangular bottom-right
+calls, Q/KV tails, fresh bindings, explicit streams, poisoned-workspace replay and
+untouched physical padding. Other architecture/quantized rows keep their existing
+compact-layout checks. Declined, each asserted by a test: dense padding
 masks, sink / dSink, bias / dBias, right-band widening, THD, `dense_flex`, decode
 shapes, `use_deterministic_algorithm` (no atomics in the chain; the two-launch
 bitwise test passes, the claim waits on the bring-up sweep). **The native
@@ -2703,6 +2710,16 @@ sets the split budget, capped at 16 partitions and at least four KV tiles per
 partition on average; the final partition may contain a shorter tail. A full
 first wave keeps the unsplit plan. Packed Stats and bounded shape overrides
 use the same declared envelope; other requests retain their existing policy.
+
+### SM107 paged D128 half partial PackGQA
+
+Exact D128/V128 FP16/BF16 paged THD also admits explicit partial PackGQA on
+the existing shared two-CTA, unsplit prefill body. A group such as 6, 12 or 24
+packs `gcd(group, 128)` heads per tile. The graph and standalone adapter use
+the same admission predicate. The single-CTA, split, D256 and quantized
+routes retain their existing packing limits. `test_sm107_paged_partial_pack_replay`
+checks NHD/HND pools, NATURAL/LPT, packed token/head-major Stats, changing
+device lengths/page tables and all-empty batches on a retained CUDA graph.
 
 ### SM107 paged D256 half PackGQA
 

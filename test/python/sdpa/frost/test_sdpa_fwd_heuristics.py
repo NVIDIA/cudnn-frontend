@@ -2126,14 +2126,15 @@ def test_sm107_paged_thd_sink_sets_pack_and_order_like_their_sink_free_twins(sm1
 
 @pytest.mark.L0
 def test_sm107_paged_thd_rules_do_not_move_the_sm100_row():
-    """The cc 10.7 paged measurements widen nothing on the SM100 line: paged GQA16 stays unpacked-first there, a sink keeps
-    the NATURAL lead and the cga2 width (its own measured family, #1468 / PR #1469's domain)."""
+    """The cc 10.7 paged measurements do not move the SM100 line: a sink keeps the NATURAL lead and the cga2 width (its own
+    measured family, #1468 / PR #1469's domain). Paged GQA16 packs first on SM100 by the SM100 row's own measurement
+    (B200 full-prefill GQA16), not through the cc 10.7 half predicate."""
     from cudnn.sdpa.fwd.heuristics import _prefer_thd_pack_gqa, _sm107_paged_half
 
     caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _F16)
     sm100 = dict(device_cc=(10, 0), device_sm_count=148)
     gqa16 = _sm107_paged_thd_facts(h_kv=4, has_sink=False, **sm100)
-    assert not _sm107_paged_half(caps, gqa16) and not _prefer_thd_pack_gqa(caps, gqa16)
+    assert not _sm107_paged_half(caps, gqa16) and _prefer_thd_pack_gqa(caps, gqa16)
     sink = _sm107_paged_thd_facts(**sm100)
     plans = [p for p in recommend("A", sink, {_F16: 20500}) if p.engine_id == 20500]
     assert plans and all(engines.mismatch(caps, sink, p.knobs) is None for p in plans)
@@ -2216,6 +2217,48 @@ def test_explicit_paged_prefill_cga1_domain_and_tile_geometry(dtype, s_q, cc):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize(
+    "b, h_q, h_kv, s_q, s_kv, causal",
+    [
+        (8, 8, 1, 576, 13568, True),  # past one 512-row Q tile
+        (8, 8, 1, 640, 13568, False),
+        (4, 32, 4, 768, 13568, True),
+        (1, 64, 8, 2048, 2048, True),
+        (8, 16, 16, 576, 8192, True),  # MHA: nothing to pack
+    ],
+)
+def test_sm107_fp8_d128_proposes_admissible_pack_sets(sm107_metadata_target, b, h_q, h_kv, s_q, s_kv, causal):
+    """Rubin per-tensor FP8 dense d128 past one Q tile: GQA graphs list a packed set (admission, not which set wins), MHA
+    lists none, and every proposed set is admitted by mismatch()."""
+    facts = _facts(
+        b=b,
+        h_q=h_q,
+        h_kv=h_kv,
+        s_q=s_q,
+        s_kv=s_kv,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=cudnn.data_type.BFLOAT16,
+        is_fp8=True,
+        causal=causal,
+        bottom_right=causal,
+        device_cc=(10, 7),
+        device_sm_count=216,
+    )
+    plans = [p for p in recommend("A", facts, _RUBIN_OFFERED) if p.engine_id == _RUBIN_OFFERED[_RUBIN_FP8]]
+    assert plans
+    assert any(p.knobs.pack_gqa for p in plans) is (h_q != h_kv), [p.knobs for p in plans]
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_FP8)
+    assert all(engines.mismatch(spec.capabilities, facts, p.knobs) is None for p in plans)
+    import dataclasses
+
+    from cudnn.sdpa.fwd.heuristics import _sm107_fp8_dense_d128
+
+    assert _sm107_fp8_dense_d128(spec.capabilities, facts)
+    assert not _sm107_fp8_dense_d128(spec.capabilities, dataclasses.replace(facts, has_paged_kv=True, page_size=16))
+    assert not _sm107_fp8_dense_d128(spec.capabilities, dataclasses.replace(facts, padded=True))
+
+
+@pytest.mark.L0
 def test_sm107_paged_prefill_split_budget_spans_two_waves(sm107_metadata_target):
     """Past one Q tile the Rubin paged split budget is two waves of SMs: a mixed-length chunk whose declared capacity fills
     one wave still splits; at most one Q tile keeps the first-wave budget; far past two waves stays unsplit."""
@@ -2244,3 +2287,32 @@ def test_sm107_paged_prefill_split_budget_spans_two_waves(sm107_metadata_target)
     )
     assert paged_thd_split_choice(caps, _facts(**base))[0] > 1
     assert paged_thd_split_choice(caps, _facts(**dict(base, b=4, h_q=32, h_kv=8, s_q=751, s_kv=21650, max_total_seq_len_q=4 * 751)))[0] == 1
+    # MHA / group 2 keep the first-wave budget (the review's B3 32/32 and 32/16, Q 256, KV 16k, total 768 example)
+    for h_kv in (32, 16):
+        f = _facts(**dict(base, h_q=32, h_kv=h_kv, s_q=256, s_kv=16384, max_total_seq_len_q=768))
+        assert paged_thd_split_choice(caps, f)[0] == 1, h_kv
+    # The two-wave split stays the default; the first-wave split is listed second (review: B3 8/2, Q 256, KV 4096, total 768)
+    f = _facts(**dict(base, s_q=256, s_kv=4096, max_total_seq_len_q=768))
+    assert paged_thd_split_choice(caps, f)[0] == 8 and paged_thd_split_choice(caps, f, first_wave=True)[0] == 4
+    plans = _sm107_f16_plans(f)
+    assert [p.knobs.split_kv for p in plans[:2]] == [8, 4], [p.knobs for p in plans[:3]]
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16)
+    assert all(engines.mismatch(spec.capabilities, f, p.knobs) is None for p in plans)
+
+
+@pytest.mark.L0
+def test_paged_gqa16_admits_split_and_prefers_packing(sm107_metadata_target):
+    """GQA16 paged d128: Rubin's split domain admits group 16 (SM100 already did), and paged SM100 lists the packed set first."""
+    from types import SimpleNamespace
+
+    from cudnn.sdpa.fwd.heuristics import _prefer_thd_pack_gqa, paged_thd_split_choice
+
+    kt = SimpleNamespace(get_stride=lambda: (2 * 16 * 128, 16 * 128, 128, 1))
+    paged = dict(
+        b=1, h_q=32, h_kv=2, d_qk=128, d_v=128, dtype=cudnn.data_type.BFLOAT16, causal=True, thd=True, padded=True, has_paged_kv=True, page_size=16, k_t=kt
+    )
+    rubin = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16).capabilities
+    f = _facts(**paged, s_q=248, s_kv=32768, bottom_right=True, max_total_seq_len_q=248, device_cc=(10, 7), device_sm_count=216)
+    assert paged_thd_split_choice(rubin, f)[0] > 1
+    sm100 = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100").capabilities
+    assert _prefer_thd_pack_gqa(sm100, _facts(**paged, s_q=4096, s_kv=4096, max_total_seq_len_q=4096, device_cc=(10, 0), device_sm_count=148))

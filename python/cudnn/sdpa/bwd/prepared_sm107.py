@@ -743,4 +743,4 @@ def execute_standalone(api, tensors, workspace, current_stream, scale):
     device_context = nullcontext() if torch.cuda.current_device() == spec.device_index else torch.cuda.device(spec.device_index)
     with device_context:
         ensure_current_context(stream, spec.device_index)
-        execute(spec, facts, ws.ptr, stream, scale=scale, geometry=geometry)
+        execute(spec, facts, ws.ptr, stream, scale=scale, geometry=tuple(geometry))

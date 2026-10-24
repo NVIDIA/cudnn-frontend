@@ -27,13 +27,15 @@ BSA is implemented with Python CuTe DSL/JIT kernels.
 
 ## Installation
 
-The CuTe DSL runtime is a required dependency, so the base install is enough:
+Except on Windows ARM64, the CuTe DSL runtime is a required dependency, so the base install is enough:
 
 ```bash
 pip install nvidia-cudnn-frontend
 ```
 
-The package-wide `nvidia-cutlass-dsl[cu13]>=4.6.2` dependency floor applies to
+On Windows ARM64, the CuTe DSL and TVM-FFI runtime dependencies are excluded from the base installation, so the base install does not enable BSA there.
+
+The package-wide `nvidia-cutlass-dsl[cu13]>=4.8.0` dependency floor applies to
 BSA. Sage FP8 relies on functionality introduced in CuTe DSL 4.6.1, which the
 package floor already satisfies. A defensive runtime check remains for
 environments that force an older DSL.
@@ -284,7 +286,7 @@ The architecture-specific FP8 contracts are:
 
 `block_sparse_attention_fp8_forward` relies on functionality introduced in
 CuTe DSL 4.6.1; the SM90 blk128 path requires 4.6.2. Package-supported
-installations provide CuTe DSL 4.6.2 or newer.
+installations provide CuTe DSL 4.8.0 or newer.
 Its internal Q/K/V quantizer is also implemented in CuTe DSL and is
 loaded lazily, so importing `cudnn` does not eagerly import it.
 

@@ -184,7 +184,7 @@ def bprop_d128_accum_grouped_dense_kernel(
     nvvm.barrier_cta_sync()
     tmem_base = tmem_slot.load()
     if warp < 8:
-        dense._softmax_loop(slab, bars, sched, tmem_base, lse, delta, block, head, batch, sq, nk, nheads, batch_heads, swizzle, scale, causal, dtype)
+        dense._softmax_loop(slab, bars, sched, tmem_base, lse, delta, block, head, batch, sq, skv, nk, nheads, batch_heads, swizzle, scale, causal, dtype)
     elif warp < 12:
         dense._epilogue_loop(slab, bars, sched, tmem_base, block, head, batch, sq, nk, nheads, batch_heads, swizzle, causal, dtype)
     elif warp == 12:
