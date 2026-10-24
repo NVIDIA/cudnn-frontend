@@ -2217,18 +2217,18 @@ def test_explicit_paged_prefill_cga1_domain_and_tile_geometry(dtype, s_q, cc):
 
 @pytest.mark.L0
 @pytest.mark.parametrize(
-    "b, h_q, h_kv, s_q, s_kv, causal, packed_first",
+    "b, h_q, h_kv, s_q, s_kv, causal",
     [
-        (8, 8, 1, 576, 13568, True, True),  # past one 512-row Q tile
-        (8, 8, 1, 640, 13568, False, True),
-        (4, 32, 4, 768, 13568, True, True),
-        (8, 8, 1, 512, 13568, True, True),  # whole tiles: the packed causal band is still shorter
-        (1, 64, 8, 2048, 2048, True, True),
-        (8, 16, 16, 576, 8192, True, False),  # MHA: nothing to pack
+        (8, 8, 1, 576, 13568, True),  # past one 512-row Q tile
+        (8, 8, 1, 640, 13568, False),
+        (4, 32, 4, 768, 13568, True),
+        (1, 64, 8, 2048, 2048, True),
+        (8, 16, 16, 576, 8192, True),  # MHA: nothing to pack
     ],
 )
-def test_sm107_fp8_d128_packs_first(sm107_metadata_target, b, h_q, h_kv, s_q, s_kv, causal, packed_first):
-    """Rubin per-tensor FP8 dense d128 GQA: the packed set leads at every S_q."""
+def test_sm107_fp8_d128_proposes_admissible_pack_sets(sm107_metadata_target, b, h_q, h_kv, s_q, s_kv, causal):
+    """Rubin per-tensor FP8 dense d128 past one Q tile: GQA graphs list a packed set (admission, not which set wins), MHA
+    lists none, and every proposed set is admitted by mismatch()."""
     facts = _facts(
         b=b,
         h_q=h_q,
@@ -2245,6 +2245,6 @@ def test_sm107_fp8_d128_packs_first(sm107_metadata_target, b, h_q, h_kv, s_q, s_
     )
     plans = [p for p in recommend("A", facts, _RUBIN_OFFERED) if p.engine_id == _RUBIN_OFFERED[_RUBIN_FP8]]
     assert plans
-    assert bool(plans[0].knobs.pack_gqa) is packed_first, plans[0].knobs
+    assert any(p.knobs.pack_gqa for p in plans) is (h_q != h_kv), [p.knobs for p in plans]
     spec = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_FP8)
     assert all(engines.mismatch(spec.capabilities, facts, p.knobs) is None for p in plans)

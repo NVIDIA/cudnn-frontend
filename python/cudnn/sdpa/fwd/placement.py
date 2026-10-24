@@ -286,8 +286,9 @@ Hold-out 4 (102 random cases, rule frozen and code deployed before measuring, ev
 (2 exceeded the 600 s per-case audit budget, 1 had no plan). 31 led at 0.10-0.91, no lead-loss; mean regret
 34.4 % (previous rule) -> 29.7 %.
 
-d512 sliding window (2026-10-24): the d512 arms of the SM100 / SM107 half, SM100 / SM107 per-tensor FP8 and SM90 half rows lead a
-dense causal window at exact d512 (``_d512_swa``: s_q >= 128, S_kv >= 1024, no sink / right band). The nightly
+d512 sliding window (2026-10-24): the d512 arms of the SM100 / SM107 half, SM100 / SM107 per-tensor FP8 and SM90 half rows stop
+trailing a dense causal window at exact d512 (``_d512_swa``: s_q >= 128, S_kv >= 1024, no sink / right band); each row's
+existing d512 launch thresholds still apply after that gate (the SM100 half leads from S_kv >= 2048 or b * h_q * s_q >= 4096). The nightly
 attention_training run had FROST at 0.25-0.61 of the backend on DeepSeek-V4's SWA-128 MQA core on every GPU while
 every row trailed on the window. Re-measured with ab.py (CUDA-graph replay, warm and cold L2, cuDNN 9.27.0.42) over
 36 graphs per dtype: MQA 64/1 and 128/1 at b2, 16/1 and GQA 32/4 at b1; top-left squares S = 1k / 4k / 16k at
