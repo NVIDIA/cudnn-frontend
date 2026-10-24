@@ -33,6 +33,9 @@ from ..canonical import (
     normalize_b,
     normalize_mx,
     normalize_prob,
+    raw_desc,
+    raw_fake,
+    raw_uint8_dtype,
 )
 from ..moe_utils import MoEWeightMode
 from ..scheduler_counter import validate_scheduler_counter
@@ -138,6 +141,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         use_single_group_runtime_offsets: bool = False,
         *,
         sample_scheduler_counter: Optional[torch.Tensor] = None,
+        a_dtype: Optional[torch.dtype] = None,
     ):
         """Initialize the GroupedGemmGluSm100 API.
 
@@ -154,7 +158,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             Dense mode supports fp16/bfloat16/float32 bias; discrete mode supports fp16/bfloat16 bias.
         :param num_experts: (Discrete) Number of experts
         :param b_shape: (Discrete) Shape of a single expert B tensor, e.g. (n, k)
-        :param b_dtype: (Discrete) Data type of B tensors
+        :param b_dtype: (Discrete) Data type of B tensors. Dense mode: the dtype a raw uint8 B holds
         :param sample_sfd_row: Optional row scale factor for D
         :param sample_sfd_col: Optional column scale factor for D
         :param sample_amax: Optional amax tensor for quantization
@@ -178,6 +182,9 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             ``4.0`` enables an exact sigmoid-reuse specialization.
         :param b_major: Major dimension for B tensor, one of "k" or "n"
         :param use_dynamic_sched: Enable dynamic tile scheduling for load balancing
+        :param a_dtype: The dtype a raw uint8 A holds (float8_e4m3fn or float8_e5m2). Raw uint8
+            scale factors follow sf_vec_size: 32 is E8M0, 16 is E4M3. The kernel reads raw
+            operands as these dtypes with no host-side view.
         """
         from cudnn.tensor_adapter import detect_framework
 
@@ -237,11 +244,14 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             "norm_const",
         )
         self.prob_desc = layout_desc(self, sample_prob, "sample_prob")
+        self.raw_dtypes = {}
+        self.a_desc = raw_desc(self, "a", self.a_desc, raw_uint8_dtype(sample_a, a_dtype))
+        self.sfa_desc = raw_desc(self, "sfa", self.sfa_desc, raw_uint8_dtype(sample_sfa, sf_vec_size=sf_vec_size))
 
         # ---- Mode-specific state ----
         if self.weight_mode == MoEWeightMode.DENSE:
-            self.b_desc = layout_desc(self, sample_b, "sample_b")
-            self.sfb_desc = self._make_tensor_desc(sample_sfb, name="sample_sfb")
+            self.b_desc = raw_desc(self, "b", layout_desc(self, sample_b, "sample_b"), raw_uint8_dtype(sample_b, b_dtype))
+            self.sfb_desc = raw_desc(self, "sfb", self._make_tensor_desc(sample_sfb, name="sample_sfb"), raw_uint8_dtype(sample_sfb, sf_vec_size=sf_vec_size))
             self.expert_cnt = self.padded_offsets_desc.shape[0]
         else:
             self._value_error_if(num_experts == 0, "num_experts must be > 0")
@@ -720,6 +730,8 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             **({"sf_fp8_dtype_override": self.sf_fp8_dtype_override} if self.sf_fp8_dtype_override == "e5m3" else {}),
         )
 
+        gemm_glu.raw_dtypes = self.raw_dtypes
+
         hardware_info = cutlass.utils.HardwareInfo()
         max_active_clusters = hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1])
         max_active_clusters -= self.num_cluster_overlap_margin
@@ -945,9 +957,9 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         # Compile with keyword args (dense mode uses the unified __call__ positional order).
         # Activation offset, alpha, and clamp bounds are runtime scalars on both architectures.
         compile_kwargs = dict(
-            a=canonical_mx_fake(a_cute_fake, self.canonical_a),
-            b=canonical_b_fake(b_cute_fake, self.canonical_b),
-            sfb=sfb_cute_fake,
+            a=raw_fake(self, "a", canonical_mx_fake(a_cute_fake, self.canonical_a)),
+            b=raw_fake(self, "b", canonical_b_fake(b_cute_fake, self.canonical_b)),
+            sfb=raw_fake(self, "sfb", sfb_cute_fake),
             n=cutlass.Int32(0),
             k=cutlass.Int32(0),
             b_stride_size=cutlass.Int64(0),
@@ -956,7 +968,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             c=canonical_mx_fake(c_cute_fake, self.canonical_c),
             d=canonical_mx_fake(d_cute_fake, self.canonical_d),
             d_col=canonical_mx_fake(d_col_cute_fake, self.canonical_d_col),
-            sfa=sfa_cute_fake,
+            sfa=raw_fake(self, "sfa", sfa_cute_fake),
             sfd_row_tensor=sfd_row_fake,
             sfd_col_tensor=sfd_col_fake,
             amax_tensor=self._make_fake_cute_tensor_from_desc(self.amax_desc, assumed_align=16),
@@ -1161,7 +1173,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         self._logger.debug("Compiling discrete grouped GEMM GLU kernel")
         discrete_compile_args = (
             gemm_glu,
-            canonical_mx_fake(a_tensor, self.canonical_a),
+            raw_fake(self, "a", canonical_mx_fake(a_tensor, self.canonical_a)),
             b_ptrs_cute,
             sfb_ptrs_cute,
             cutlass.Int32(n),
@@ -1172,7 +1184,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             canonical_mx_fake(c_tensor, self.canonical_c),
             canonical_mx_fake(d_tensor, self.canonical_d),
             canonical_mx_fake(d_col_tensor, self.canonical_d_col),
-            sfa_tensor,
+            raw_fake(self, "sfa", sfa_tensor),
             sfd_row_tensor,
             sfd_col_tensor,
             amax_tensor,

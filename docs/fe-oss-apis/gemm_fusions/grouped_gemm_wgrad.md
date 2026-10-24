@@ -106,6 +106,13 @@ does not reinterpret these controls; it rejects them instead. `sfa_tensor` and
 `(round_up(rows, 128), round_up(ceil(tokens / sf_vec_size), 4))` view, which is checked on
 every call; the wrapper advertises `supports_canonical_layouts`.
 
+FP8 operands may also arrive as raw `uint8` storage with the dtype passed separately:
+`a_dtype` and `b_dtype` name the FP8 dtype of A and B, `float8_e4m3fn` or
+`float8_e5m2`. Raw `uint8` scale factors follow `sf_vec_size`: 32 is E8M0, 16 is E4M3. The
+kernel reads these operands as those dtypes, so the caller needs no `.view(dtype=...)`.
+Without `a_dtype`, `uint8` data keeps its packed-FP4 meaning. The wrapper advertises
+`supports_raw_uint8_operands`.
+
 Torch block-scaled callers in dense or discrete output mode that retain
 operations for CUDA Graph replay may provide a caller-owned
 `descriptor_workspace`; pass this extension by keyword. Allocate its size with

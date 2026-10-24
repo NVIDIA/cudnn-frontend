@@ -24,6 +24,7 @@ from cudnn.tensor_adapter import (
     get_strides,
 )
 
+from ..canonical import raw_uint8_dtype
 from ..backend_utils import (
     GroupedGemmBackend,
     _torch_stream_context,
@@ -139,6 +140,8 @@ class GroupedGemmWgradSm100(APIBase):
         sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
         accumulate_on_output: bool = False,
         input_order: WGradInputOrder | str = WGradInputOrder.Tensor2D,
+        a_dtype: Optional[torch.dtype] = None,
+        b_dtype: Optional[torch.dtype] = None,
     ) -> None:
         super().__init__()
         self._pending_init_kwargs = dict(locals())
@@ -153,8 +156,8 @@ class GroupedGemmWgradSm100(APIBase):
             kwargs = self._pending_init_kwargs
             backend = select_grouped_gemm_backend(
                 operation="grouped_gemm_wgrad_sm100",
-                a_dtype=kwargs["sample_a"].dtype,
-                b_dtype=kwargs["sample_b"].dtype,
+                a_dtype=raw_uint8_dtype(kwargs["sample_a"], kwargs["a_dtype"]) or kwargs["sample_a"].dtype,
+                b_dtype=raw_uint8_dtype(kwargs["sample_b"], kwargs["b_dtype"]) or kwargs["sample_b"].dtype,
                 scale_controls=(
                     ("sample_sfa", kwargs["sample_sfa"]),
                     ("sample_sfb", kwargs["sample_sfb"]),
@@ -167,7 +170,7 @@ class GroupedGemmWgradSm100(APIBase):
             )
             self.backend = backend
             if backend is GroupedGemmBackend.BF16:
-                self._implementation = GroupedGemmWgradBf16API(**kwargs)
+                self._implementation = GroupedGemmWgradBf16API(**{k: v for k, v in kwargs.items() if k not in ("a_dtype", "b_dtype")})
             else:
                 if detect_framework(kwargs["sample_a"]) == "jax":
                     raise ValueError(_BLOCK_SCALED_JAX_ERROR)
@@ -318,6 +321,8 @@ def grouped_gemm_wgrad_wrapper_sm100(
     current_stream: Optional[cuda.CUstream] = None,
     *,
     descriptor_workspace: Optional[torch.Tensor] = None,
+    a_dtype: Optional[torch.dtype] = None,
+    b_dtype: Optional[torch.dtype] = None,
 ) -> TupleDict:
     """Compile and execute grouped GEMM wgrad through the selected backend API."""
     if sfa_tensor is not None and detect_framework(a_tensor) == "jax":
@@ -371,6 +376,8 @@ def grouped_gemm_wgrad_wrapper_sm100(
         sf_fp8_dtype_override,
         accumulate_on_output,
         input_order,
+        a_dtype,
+        b_dtype,
         os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"),
     )
     memo = _wgrad_wrapper_memo.get(memo_key)
@@ -417,8 +424,8 @@ def grouped_gemm_wgrad_wrapper_sm100(
         _validate_pointer_tensor(wgrad_ptrs, "wgrad_ptrs", expert_cnt)
     backend = select_grouped_gemm_backend(
         operation="grouped_gemm_wgrad_sm100",
-        a_dtype=a_tensor.dtype,
-        b_dtype=b_tensor.dtype,
+        a_dtype=raw_uint8_dtype(a_tensor, a_dtype) or a_tensor.dtype,
+        b_dtype=raw_uint8_dtype(b_tensor, b_dtype) or b_tensor.dtype,
         scale_controls=(
             ("sfa_tensor", sfa_tensor),
             ("sfb_tensor", sfb_tensor),
@@ -489,6 +496,8 @@ def grouped_gemm_wgrad_wrapper_sm100(
             sf_fp8_dtype_override=sf_fp8_dtype_override,
             accumulate_on_output=accumulate_on_output,
             input_order=input_order,
+            a_dtype=a_dtype,
+            b_dtype=b_dtype,
         )
         if output_mode == "dense":
             common["sample_wgrad"] = wgrad_tensor
@@ -522,4 +531,5 @@ def grouped_gemm_wgrad_wrapper_sm100(
 
 
 grouped_gemm_wgrad_wrapper_sm100.supports_canonical_layouts = True
+grouped_gemm_wgrad_wrapper_sm100.supports_raw_uint8_operands = True
 grouped_gemm_wgrad_wrapper_sm100.supports_bf16_canonical_layouts = True
