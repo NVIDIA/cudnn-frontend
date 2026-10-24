@@ -331,12 +331,11 @@ SDPA-specific hard rules (cited as Rule S1, S2, ...) live in
 **Rule 7 — gate the CuTe DSL version at runtime; never assume the installed
 DSL satisfies your kernel.**
 
-- The `pyproject.toml` floor on `nvidia-cutlass-dsl` (`>=4.6.2`) is the
-  **downstream** floor, not ours: vLLM and SGLang inherit quack-kernels'
-  `==4.6.2`, and a higher floor would make this package uninstallable next to
-  them. The FROST-derived kernels need more (`CUTEDSL_MIN_VERSION`, 4.7.0). So
-  an installed DSL that satisfies pip can still be below what a kernel needs,
-  and every backend/kernel must cope with that at runtime.
+- The `pyproject.toml` floor on `nvidia-cutlass-dsl` is `>=4.8.0`, matching
+  vLLM v0.32.0 and SGLang v0.5.22, which both pin 4.8.0. Kernel-specific
+  requirements still need runtime checks: environments can bypass dependency
+  resolution, and newer kernels can require APIs or targets above the package
+  floor. Keep the existing version gates and actionable errors.
 - Before a path imports a DSL-version-specific API, check the installed version
   with `cudnn.frost.buffers.cutedsl_state()` / `cutedsl_too_old()` (floor:
   `CUTEDSL_MIN_VERSION`) and **decline, or raise an error that names the
@@ -417,8 +416,8 @@ DSL satisfies your kernel.**
   numerics tests on a 4.7 lane.
 - Why: PR #799's `causal_conv1d_update` imported `frost.tile_dsl` from a route
   with no version check and broke the 4.6.2 lane — the version vLLM and SGLang
-  ship — with a bare `ModuleNotFoundError: cutlass.experimental`; the bulk
-  route next to it had the check and declined cleanly. Earlier, PR #854's
+  shipped at the time — with a bare `ModuleNotFoundError: cutlass.experimental`;
+  the bulk route next to it had the check and declined cleanly. Earlier, PR #854's
   module-scope `set_name_prefix(..., remove_cutlass_symbol=True)` failed the
   same way on a since-dropped 4.5.x lane, reported as "install optional
   dependencies".

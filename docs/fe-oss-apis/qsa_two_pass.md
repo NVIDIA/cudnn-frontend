@@ -9,8 +9,8 @@ path also supports the CUDA 12 flavor.
 It supports one sequence or packed documents described by int32 `cu_seqlens`
 and a host upper bound `max_seq_len`. For the public packed training interface,
 use [indexed QSA](qsa_indexed.md). These are implementation notes,
-not a public API. The backend is retained for further integration into the
-common QSA functions after its contracts are aligned.
+not a public API. The public `qsa_indexed_backward` selects this backend for
+12Q/1KV when the caller explicitly declares `selection_mode="causal_topk"`.
 
 All tensors must be contiguous on the same CUDA
 device. The softmax scale is fixed at `1 / 16`.
@@ -34,8 +34,9 @@ the query position; it does not validate these device-value relationships.
 layout as the public FE/Miles-oriented interface natively, without a cast or
 repack. The BF16 mode retains the earlier internal saved-state contract.
 Selection remains restricted to the canonical complete-block-plus-tail format
-above, and packed execution also needs `cu_seqlens`; this backend is not yet
-dispatched by the more general public bitmap or indexed entry points.
+above, and packed execution also needs `cu_seqlens`. The public indexed mode
+requires native FP32 saved state and index width 2052; the more general default
+indexed and bitmap calls retain their existing implementation.
 
 The query-major pass computes dQ and writes BF16 P/dS records. An inverted
 block-to-query index lets the key-major pass accumulate dK/dV locally instead
