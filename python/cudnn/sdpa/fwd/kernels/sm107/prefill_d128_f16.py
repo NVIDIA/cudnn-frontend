@@ -1177,9 +1177,17 @@ def _kernel(
     # other rendering (never traced); the collective-geometry values above keep their cga1 values on this form.
     bias_mcast_rank = cute.arch.block_idx_in_cluster() if cutlass.const_expr(_BIAS_MCAST) else None
 
+    # The packed Stats rendering needs the shared half body's auxiliary-role
+    # budget. Keep the correction budget and entry pool unchanged; a rendering
+    # without Stats retains its existing split. Stats presence is a compile-time
+    # pointer-type fact, so this adds no runtime branch or preparation API.
+    packed_stats_regs = CFG.PACK_GQA and CFG.TILE_K == CFG.TILE_O == 128 and CFG.SOFTMAX_WARPGROUPS == 2 and lse_tensor is not None
+    softmax_regs = 184 if cutlass.const_expr(packed_stats_regs) else CFG.SOFTMAX_REGS
+    other_regs = 56 if cutlass.const_expr(packed_stats_regs) else CFG.OTHER_REGS
+
     # === Per-warp role dispatch ===
     if warp_idx >= CFG.SOFTMAX_WG0_BASE and warp_idx < CFG.SOFTMAX_WG0_BASE + CFG.SOFTMAX_WG_WARPS:
-        nvvm.setmaxregister(CFG.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
+        nvvm.setmaxregister(softmax_regs, nvvm.SetMaxRegisterAction.INCREASE)
         _softmax_warp_group(
             sub_tile_id=0,
             seqlen_q=seqlen_q,
@@ -1208,7 +1216,7 @@ def _kernel(
     elif warp_idx >= CFG.SOFTMAX_WG1_BASE and warp_idx < CFG.SOFTMAX_WG1_BASE + CFG.SOFTMAX_WG_WARPS * (CFG.SOFTMAX_WARPGROUPS - 1):
         # Softmax warp groups 1.. (one group per further Q sub-tile: WG1 alone on the classic body, WG1 + WG2 with the third softmax
         # warp group of the TILE_N-64 pair arm -- the range reads `SOFTMAX_WG1_BASE + 4` on the two-group body, as before).
-        nvvm.setmaxregister(CFG.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
+        nvvm.setmaxregister(softmax_regs, nvvm.SetMaxRegisterAction.INCREASE)
         if cutlass.const_expr(CFG.SOFTMAX_WARPGROUPS == 3):
             if warp_idx >= CFG.SOFTMAX_WG1_BASE + CFG.SOFTMAX_WG_WARPS:
                 _softmax_warp_group(
@@ -1316,7 +1324,7 @@ def _kernel(
 
     elif warp_idx == CFG.MMA_WARP_ID:
         # Under cga2 the non-leader CTA runs the quiet body (alloc + dealloc only).
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
+        nvvm.setmaxregister(other_regs, nvvm.SetMaxRegisterAction.DECREASE)
         if cutlass.const_expr(CFG.CTA_MMA == 2):
             if is_leader:
                 _mma_warp_group(
@@ -1362,7 +1370,7 @@ def _kernel(
             )
 
     elif warp_idx == CFG.TMALDG_WARP_ID:
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
+        nvvm.setmaxregister(other_regs, nvvm.SetMaxRegisterAction.DECREASE)
         nvvm.prefetch_tensormap(tma_q_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_k_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_v_desc.get_ptr())
@@ -1398,7 +1406,7 @@ def _kernel(
         )
 
     elif warp_idx == CFG.TMASTG_WARP_ID:
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
+        nvvm.setmaxregister(other_regs, nvvm.SetMaxRegisterAction.DECREASE)
         _tmastg_warp_group(
             tma_o_desc=tma_o_desc,
             sO=sO,
@@ -1418,7 +1426,7 @@ def _kernel(
         )
 
     else:  # warp_idx == CFG.SCHED_WARP_ID
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
+        nvvm.setmaxregister(other_regs, nvvm.SetMaxRegisterAction.DECREASE)
         # try_cancel.multicast::cluster::all — only (0,0,0) CTA issues; at cga1
         # cta_id_x == 0 always, so flag is 1 unconditionally.
         is_cga_first_cta = (bias_mcast_rank == cutlass.Int32(0)) if cutlass.const_expr(_BIAS_MCAST) else (cta_id_x == cutlass.Int32(0))
