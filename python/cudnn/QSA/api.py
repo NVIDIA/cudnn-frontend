@@ -29,35 +29,9 @@ def _implementation(q, direction):
     if reason:
         raise NotImplementedError(reason)
     arch = cc[0] * 10 + cc[1]
-    family = 107 if arch == 107 else 100
-    if direction == "bprop" and q.shape[1] == 12:
-        family = 100
-    return importlib.import_module(f".kernels.{direction}_sm{family}", __package__), arch
-
-
-def _compact(sel_blocks, lo, hi, block_first, block_last, arch, stream):
-    from ._metadata import compile_kernel
-
-    ids = torch.empty(sel_blocks.shape, dtype=torch.int32, device=sel_blocks.device)
-    counts = torch.empty((sel_blocks.shape[0],), dtype=torch.int32, device=sel_blocks.device)
-    compile_kernel(arch)(sel_blocks, lo, hi, block_first, block_last, ids, counts, stream)
-    return ids, counts
-
-
-def _compact_backward(sel_blocks, lo, hi, block_first, block_last, arch, stream, kv_heads):
-    if kv_heads == 1:
-        from ._metadata import compile_group_kernel
-        from .kernels.bprop_sm100 import NQ, BLK_BITS
-
-        total, blocks = sel_blocks.shape
-        if blocks > 1 << BLK_BITS:
-            raise NotImplementedError(f"Paired QSA requires NB <= {1 << BLK_BITS} for block-owner encoding")
-        groups = (total + NQ - 1) // NQ
-        ids = torch.empty((groups, blocks), dtype=torch.int32, device=sel_blocks.device)
-        counts = torch.empty(groups, dtype=torch.int32, device=sel_blocks.device)
-        compile_group_kernel(arch, NQ, BLK_BITS)(sel_blocks, lo, hi, block_first, block_last, ids, counts, total, stream)
-        return ids, counts
-    return _compact(sel_blocks, lo, hi, block_first, block_last, arch, stream)
+    # the forward has a Rubin flavor, the backward engine serves every architecture
+    name = f"fprop_sm{107 if arch == 107 else 100}" if direction == "fprop" else "bprop_sm100"
+    return importlib.import_module(f".kernels.{name}", __package__), arch
 
 
 @lru_cache(maxsize=1)
@@ -124,22 +98,4 @@ def qsa_backward(
     check_tensor("lse", lse, (hq, total), torch.float32, q.device)
     with torch.cuda.device(q.device):
         impl, arch = _implementation(q, "bprop")
-        import cutlass
-        from cuda.bindings import driver as cuda
-        from cudnn.api_base import TupleDict
-
-        stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
-        compiled = impl.compile_kernel(cutlass.BFloat16, hq, hkv, arch)
-        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
-        scratch = {
-            "delta": torch.empty((total, hq), dtype=torch.float32, device=q.device),
-            "dq_acc": torch.empty_like(q, dtype=torch.float32),
-            "dk_acc": torch.empty_like(k, dtype=torch.float32),
-            "dv_acc": torch.empty_like(v, dtype=torch.float32),
-        }
-        ids, counts = _compact_backward(sel_blocks, lo, hi, block_first, block_last, arch, stream, hkv)
-        num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
-        impl.launch(
-            compiled, grad_out, q, k, v, out_fp32, lse, ids, counts, lo, hi, block_first, block_last, dq, dk, dv, scratch, float(scale), stream, num_sms
-        )
-        return TupleDict(dq=dq, dk=dk, dv=dv)
+        return impl.backward(grad_out, q, k, v, out_fp32, lse, sel_blocks, lo, hi, tok_base, block_first, block_last, float(scale), arch)

@@ -168,103 +168,11 @@ def compile_kernel(arch, gated=False):
     )
 
 
-@cute.kernel
-def frost_qsa_compact_group(
-    sel: cute.Tensor,
-    lo: cute.Tensor,
-    hi: cute.Tensor,
-    first: cute.Tensor,
-    last: cute.Tensor,
-    ids: cute.Tensor,
-    counts: cute.Tensor,
-    total: Int32,
-    NQ: cutlass.Constexpr[int],
-    BLK_BITS: cutlass.Constexpr[int],
-):
-    """Union the selections of NQ consecutive queries; tag each block with its owners."""
-    tid = cute.arch.thread_idx()[0]
-    group = cute.arch.block_idx()[0] * 4 + tid // 32
-    lane = tid % 32
-    if group < ids.shape[0]:
-        base = Int32(group) * Int32(NQ)
-        rows, lows, highs, live = [], [], [], []
-        for i in cutlass.range_constexpr(NQ):
-            row = base + i
-            inside = row < total
-            if not inside:
-                row = total - 1
-            rows.append(row)
-            lows.append(lo[row])
-            highs.append(hi[row])
-            live.append(inside)
-        count = Int32(0)
-        lower_lanes = (Uint32(1) << Uint32(lane)) - Uint32(1)
-        for start in cutlass.range(0, Int32(sel.shape[1]), 32, unroll=1):
-            block = start + lane
-            mask = Int32(0)
-            if block < sel.shape[1]:
-                begin, end = first[block], last[block]
-                for i in cutlass.range_constexpr(NQ):
-                    taken = live[i] & (end >= lows[i]) & (begin <= highs[i]) & (lows[i] <= highs[i])
-                    if taken:
-                        taken = sel[Int64(rows[i]), Int64(block)] != 0
-                    if taken:
-                        mask = mask | Int32(1 << i)
-            selected = mask != Int32(0)
-            ballot = Uint32(cute.arch.vote_ballot_sync(selected))
-            if selected:
-                offset = count + Int32(cute.arch.popc(ballot & lower_lanes))
-                ids[Int64(group), Int64(offset)] = block | (mask << Int32(BLK_BITS))
-            count = count + Int32(cute.arch.popc(ballot))
-        if lane == 0:
-            counts[group] = count
+def compact(sel_blocks, lo, hi, block_first, block_last, arch, stream):
+    """Per-query block ids and counts of a selection bitmap, on the launch stream."""
+    import torch
 
-
-frost_qsa_compact_group.set_name_prefix("cudnn", remove_cutlass_symbol=True)
-
-
-@cute.jit
-def _compact_group_host(
-    sel, lo, hi, first, last, ids, counts, total: Int32, stream: cuda.CUstream, NQ: cutlass.Constexpr[int], BLK_BITS: cutlass.Constexpr[int]
-):
-    frost_qsa_compact_group(sel, lo, hi, first, last, ids, counts, total, NQ, BLK_BITS).launch(
-        grid=(cute.ceil_div(ids.shape[0], 4), 1, 1), block=(128, 1, 1), stream=stream
-    )
-
-
-@lru_cache(maxsize=None)
-def _compile_group_args():
-    """Cache storage-free grouped signatures."""
-    total, blocks, groups = cute.sym_int64(), cute.sym_int64(), cute.sym_int64()
-
-    def tensor(dtype, shape, alignment=4):
-        return make_fake_compact_tensor(dtype, shape, stride_order=tuple(reversed(range(len(shape)))), assumed_align=alignment)
-
-    sel = tensor(cutlass.Uint8, (total, blocks), 1)
-    rows, spans = tensor(Int32, (total,)), tensor(Int32, (blocks,))
-    ids = tensor(Int32, (groups, blocks))
-    gcounts = tensor(Int32, (groups,))
-    return (
-        sel,
-        rows,
-        rows,
-        spans,
-        spans,
-        ids,
-        gcounts,
-        Int32(1),
-        make_fake_stream(use_tvm_ffi_env_stream=False),
-    )
-
-
-def compile_group_kernel(arch, nq, blk_bits):
-    key = template_key(globals(), {"arch": arch, "nq": nq, "blk_bits": blk_bits}, "compile_group_kernel")
-    return compile_cached(
-        _compact_group_host,
-        *_compile_group_args(),
-        nq,
-        blk_bits,
-        options=f"--enable-tvm-ffi --gpu-arch=sm_{arch}a",
-        cache_key=key,
-        symbol="qsa_compact_group",
-    )
+    ids = torch.empty(sel_blocks.shape, dtype=torch.int32, device=sel_blocks.device)
+    counts = torch.empty((sel_blocks.shape[0],), dtype=torch.int32, device=sel_blocks.device)
+    compile_kernel(arch)(sel_blocks, lo, hi, block_first, block_last, ids, counts, stream)
+    return ids, counts

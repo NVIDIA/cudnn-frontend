@@ -16,13 +16,6 @@ from QSA.cutedsl.test_qsa import make_inputs, reference, assert_close, supported
 pytestmark = pytest.mark.L0
 
 
-@pytest.fixture(autouse=True)
-def indexed_supported_device():
-    # The shared bitmap-QSA fixture also admits SM107; this indexed API does not.
-    if torch.cuda.is_available() and torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("Indexed QSA requires SM100 or SM103")
-
-
 def indices_for(inputs):
     total, blocks = inputs["sel_blocks"].shape
     tokens = inputs["block_first"][None, :, None] + torch.arange(4, device="cuda", dtype=torch.int32)

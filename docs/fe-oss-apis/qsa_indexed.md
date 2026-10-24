@@ -2,23 +2,27 @@
 
 These attention calls **consume existing indices**; they do not compute the
 indexer score or top-k. See [QSA entry points and the indexer](qsa.md#finding-qsa-attention-and-its-indexer)
-for block selection, bitmap training and the internal two-pass backend.
+for block selection, bitmap training and the SM100 backward engine.
 
 `cudnn.ops.qsa_indexed_forward` and `qsa_indexed_backward` accept packed token
 indices directly. The implementation lives in `cudnn.QSA.indexed` and shares
 QSA's attention kernels. It supports BF16
-12Q/1KV, head dimension 256, and SM100/SM103 with CuTeDSL >= 4.7.
+12Q/1KV, head dimension 256, and SM100/SM103 with CuTeDSL >= 4.7 (the backward
+needs the CUDA 13 build of the DSL).
 
 ```python
 from cudnn.ops import qsa_indexed_forward, qsa_indexed_backward
 
 out, out_fp32, lse = qsa_indexed_forward(q, k, v, indices, scale=1 / 16)
-dq, dk, dv = qsa_indexed_backward(grad_out, q, k, v, out_fp32, lse, indices, scale=1 / 16)
+dq, dk, dv = qsa_indexed_backward(grad_out, q, k, v, out_fp32, lse, indices, scale=1 / 16, cu_seqlens=None)
 ```
 
 These explicit calls return `TupleDict` objects in the order shown. They do not
 register an autograd function. Save the original FP32 output and natural-log
-LSE; casting the BF16 output back to FP32 is insufficient.
+LSE; casting the BF16 output back to FP32 is insufficient. `cu_seqlens` (int32
+`[B + 1]` prefix sums) describes the documents of a packed buffer to the
+backward; without it the rows are one sequence, which stays exact for packed
+documents but serves only the first document on the dense prefix path.
 
 | Tensor | Shape | Dtype |
 |---|---|---|
@@ -48,9 +52,9 @@ padded explicitly by the caller; this API does not silently convert it. Empty
 rows produce zero output/gradients and negative-infinity LSE. Selection is not
 differentiated. Pass the same selection and scale to forward and backward.
 
-A GPU hash table compacts the selected starts. Backward unions adjacent queries'
-starts with owner bits, retaining each query's bounds and mask. Nonfinite K/V
-uses the device-side per-query fallback described in [QSA](qsa.md). Every call
+A GPU hash table compacts the selected starts. Backward runs the engine
+described in [QSA](qsa.md) over them; a nonfinite K/V value of a masked
+token adds exact zeros, one of a selected token poisons its queries. Every call
 rebuilds metadata, including during CUDA Graph replay. Warm up before capture.
 
 The public wrappers allocate outputs and one workspace. The internal APIBase
@@ -58,12 +62,11 @@ plan validates current storage and uses only caller-owned buffers in execute;
 its cache retains immutable geometry and compiled kernels. Indexed metadata
 storage is proportional to `T * W`, independent of the full key-block count.
 At 128K with W=2052, compact IDs occupy 256.5 MiB in either direction, compared
-with 16 GiB for bitmap-forward IDs or 8 GiB for paired bitmap-backward IDs. The
-4 GiB bitmap is also unnecessary. These are metadata sizes, not total process
+with 16 GiB for the bitmap entry's `[T, NB]` IDs. The 4 GiB bitmap is also
+unnecessary. These are metadata sizes, not total process
 memory; saved state, outputs and FP32 gradient accumulators are additional.
 
-The indexed entry is useful when a producer already has token IDs. It can be
-slightly slower than the bitmap entry at some lengths. Use the unchanged Relax
+The indexed entry is useful when a producer already has token IDs. Use the unchanged Relax
 comparison in `benchmark/qsa/benchmark_relax.py` for the intended workload;
 Miles ratios do not establish a speedup over Relax, and attention microbenchmarks
 do not measure selector, TE, tensor-parallel communication or model throughput.
