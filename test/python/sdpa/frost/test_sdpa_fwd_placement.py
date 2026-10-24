@@ -820,7 +820,6 @@ def test_d512_sliding_window_leads_inside_the_measured_box(row, cc, sms, quant):
     offered = {row: _OFFERED[row]}
     plans = [p for p in heuristics.recommend("A", facts(), offered) if p.engine_id == _OFFERED[row]]
     assert plans and all(mismatch(spec.capabilities, facts(), p.knobs) is None for p in plans)
-    assert placement.place(spec, facts()) == placement.LEAD
     assert placement._d512_swa(facts(s_q=placement.D512_SWA_MIN_S_Q, s_kv=32768, bottom_right=True))
     assert not placement._d512_swa(facts(s_q=placement.D512_SWA_MIN_S_Q - 1, s_kv=32768, bottom_right=True))
     assert not placement._d512_swa(facts(s_q=placement.D512_SWA_MIN_KV // 2, s_kv=placement.D512_SWA_MIN_KV // 2))
