@@ -1207,3 +1207,11 @@ decline with otherwise valid descriptors and a positive parent-row control;
 it must fail if the subclass inherits the parent's THD admission. For pitched
 views, protect input and output padding with canaries as well as gradient
 padding, and check all of them after eager execution and graph replay.
+
+
+An admission test must reach the rule it claims to protect. Keep other knob
+values inside the engine's legal domain; an earlier CGA or dtype decline can
+otherwise hide a missing attribute restriction. For example, the pre-folded
+scale case in `test_thd_pack_gqa_unsupported_flavors_decline` includes legal
+CGA2 as well as CGA1. Removing only the pre-folded-scale decline must make the
+CGA2 case fail while the unrelated-domain cases still pass.
