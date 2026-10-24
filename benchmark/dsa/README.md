@@ -1,29 +1,37 @@
 # DSA Sparse Attention Benchmarks
 
-Benchmarks for the cuDNN Frontend DeepSeek Sparse Attention (DSA) kernels
-(`cudnn.DSA.SparseAttentionForward` / `SparseAttentionBackward`). Two ways to
-run them:
+Benchmarks for the cuDNN Frontend DeepSeek Sparse Attention (DSA) kernels:
+the sparse core attention (`cudnn.DSA.SparseAttentionForward` /
+`SparseAttentionBackward`) and the lightning indexer
+(`cudnn.DSA.indexer_forward_top_k_wrapper`, `SparseIndexerScoreRecompute` +
+`IndexerTopK`, `IndexerBackward`). Two ways to run them:
 
 - **Configuration-based suite** (`runner.py` + `configs/`) — sweeps model
-  presets over sequence lengths and passes, writes a CSV and a fwd/bwd chart
-  per run. Arranged like [`../attention_training`](../attention_training/README.md)
-  and [`../attention_inference`](../attention_inference/README.md).
+  presets over sequence lengths, phases, components, KV storage formats and
+  flat/paged pools, writes a CSV and two charts per run. Arranged like
+  [`../attention_training`](../attention_training/README.md) and
+  [`../attention_inference`](../attention_inference/README.md).
 - **Single scripts** (`benchmark_dsa_sparse_attention_forward.py`,
   `benchmark_dsa_sparse_attention_backward.py`,
-  `benchmark_dsa_indexer_h32.py`) — ad-hoc shapes, execute-vs-wrapper split,
-  compact-H32 adapter comparisons, and `profile` mode for nsys/ncu.
+  `benchmark_dsa_indexer_h32.py`, `benchmark_dsa_indexer_top_k.py`) — ad-hoc
+  shapes, execute-vs-wrapper split, compact-H32 adapter comparisons, and
+  `profile` mode for nsys/ncu.
 
 ## Contents
 
 - `configs/` - Benchmark configuration files
-  - `deepseek_v4.py` - DeepSeek-V4 Flash (H64, K=640) and Pro (H128, K=1152), 2k..32k
-  - `deepseek_v41.py` - DeepSeek-V4.1 Flash (H64, K=640, same per-query gather as V4), 2k..32k
-  - `glm53.py` - GLM-5.3 (H64, d=576/512, K=2048) and GLM-5.3-Flash (H64, NoPE d=512, K=2048), 2k..32k
-- `runner.py` - Configuration-based benchmark runner (one subprocess per case)
+  - `deepseek_v4.py` - DeepSeek-V4 Flash (H64, K=640) and Pro (H128, K=1152), 2k..32k; core only (legacy axes)
+  - `deepseek_v41.py` - DeepSeek-V4.1 Flash core (H64, K=640) + 32-head indexer in dense and hierarchical modes; all axes
+  - `glm53.py` - GLM-5.3 (H64, d=576/512, K=2048) and GLM-5.3-Flash (H64, NoPE d=512, K=2048, 4-token pools) + 32-head indexers; all axes
+  - `qwen38_qsa.py` - Qwen3.8 QSA (GQA 24/2, d=256, separate K/V, 4-token blocks); every cell is a coverage row today; opt-in
+- `runner.py` - Configuration-based benchmark runner (one subprocess per servable case; skipped rows cost none)
 - `benchmark_single_dsa.py` - Single-case worker the runner calls; prints a `RESULT,` line
+- `support.py` - The one place every skip rule lives (`decide_support`), kernel variant table, byte footprints
+- `kv_pool.py` - Flat / paged KV pools, per-query top-k id lists, causal visible counts (torch, no cudnn)
 - `config_types.py` - `ModelPreset`, `DsaBenchmarkConfig`, `BenchmarkResult`
-- `charts.py` - Chart generation
-- `run_all.sh` - Runs configs and lands results in `results/<config>/<gpu>/`
+- `charts.py` - Chart generation (`<config>.webp` legacy figure, `<config>_extended.webp`)
+- `tests/` - CPU-only unit tests for enumeration, skip rules, generators, parsing and charts
+- `run_all.sh` - Runs configs and lands results in `results/<config>/<arch>/`
 - `results/` - Benchmark outputs (CSV and charts)
 
 ## Configuration-Based Suite
@@ -34,50 +42,171 @@ python -m benchmark.dsa.runner --list-configs
 python -m benchmark.dsa.runner --config deepseek_v4
 python -m benchmark.dsa.runner --config deepseek_v4 --dry-run
 python -m benchmark.dsa.runner --config deepseek_v4 --filter flash --pass fwd
+python -m benchmark.dsa.runner --config deepseek_v41 --component indexer --phase generation
+python -m benchmark.dsa.runner --config glm53 --kv-dtype mxfp8 --flat
 python -m benchmark.dsa.runner --config deepseek_v4 --output-dir benchmark/dsa/results/deepseek_v4/b200
 
-# all configs for one architecture label (optionally pinning a GPU)
+# all default configs for one architecture label (optionally pinning a GPU)
 benchmark/dsa/run_all.sh b200 GPU-<uuid>
+# qwen38_qsa is opt-in (not in the default list)
+benchmark/dsa/run_all.sh b200 GPU-<uuid> qwen38_qsa
 ```
 
-Requires an SM100-family GPU for the forward pass, SM90 or SM100 for the
-backward pass, PyTorch with CUDA, `pip install nvidia-cudnn-frontend[cutedsl]`
-(or a development install of this repository's `python/` package), and
-`pandas`/`matplotlib`/`seaborn` for CSV and charts. `pynvml` is optional; with
-it each row records the dense-MMA peak at the sampled SM clock
-(`peak_mma_tflops`) and the chart draws it as a dashed line.
+Filters: `--filter <model substring>`, `--backend`, `--dtype` (the Q /
+activation dtype), `--pass {fwd,bwd}`, `--component {core,indexer}`,
+`--phase {context,generation,bprop}`, `--kv-dtype <format>`, `--paged` /
+`--flat`.
 
-### What a case measures
+Requires a compute capability 10.x GPU for the forward passes and the
+indexer, compute capability 9.x or 10.x for the core backward, PyTorch with
+CUDA, `pip install nvidia-cudnn-frontend[cutedsl]` (or a development install
+of this repository's `python/` package), and `pandas`/`matplotlib`/`seaborn`
+for CSV and charts. `pynvml` is optional; with it each row records the
+dense-MMA peak at the sampled SM clock (`peak_mma_tflops`) and the legacy
+chart draws it as a dashed line. Pin one GPU with `CUDA_VISIBLE_DEVICES`: the
+shared CuTe DSL compiler and the indexer APIs read the *current* device.
 
-A case is one `(model, (s_q, s_kv), backend, dtype, pass)` tuple. Inputs are
-flat MQA tensors — `q (s_q, H, d_qk)`, one shared `kv (s_kv, d_qk)` record
-read as both K and V, and `topk_idxs (s_q, topk)` holding unique random rows of
-the KV pool for every query, plus per-head sink logits and a full-length
-`topk_length` (production passes it; it selects a different compiled variant).
+### Axes
 
-- **fwd** times `SparseAttentionForward.execute` with preallocated outputs
-  (`out`, `max_logits`, `lse`, and `lse_indexer` when `indexer_topk > 0`).
-- **bwd** times `SparseAttentionBackward.execute` with preallocated `dq`/`dkv`
-  and a reusable workspace; the `out`/`lse` it consumes come from a chunked
-  PyTorch reference so no forward launch is in the timed region. Gradient
-  zeroing the kernel performs itself is included, as a training step pays it.
-
-Timing is CUDA events around each call after a 256 MiB L2 flush, median of
-`num_iterations` after warmup (kernel compilation happens in warmup). Each
-case runs in its own subprocess: a clean CUDA context and CuTe DSL compile
-state, and one failure cannot take down the sweep. Shapes the kernels'
-`check_support` rejects are recorded as `skipped=True` rows, distinct from
-failures.
-
-TFLOPS count only the gathered rows:
+A case is one point of
 
 ```
-fwd FLOPs = 2 * s_q * H * topk * (d_qk + d_v)
-bwd FLOPs = 2 * s_q * H * topk * (3 * d_qk + 2 * d_v)
+model x (s_q, s_kv) x backend x data_type x phase        (context, bprop)
+model x kv_len x batch x q_tokens x backend x data_type  (generation)
+    x component x kv_dtype x paged x indexer_mode x deterministic_bwd
 ```
 
-so they are independent of `s_kv` and directly comparable to the dense
-suites' numbers.
+| Axis | Values | Meaning |
+|---|---|---|
+| `component` | `core`, `indexer` | sparse core attention over the gathered rows, or the lightning indexer (scoring + top-k) |
+| `phase` | `context`, `generation`, `bprop` | prefill (one request, `s_q == s_kv`), decode / MTP rows over a long cache (batched), training backward. `profile_pass` stays `fwd` for context and generation, `bwd` for bprop |
+| `kv_dtype` | `bfloat16`, `mxfp8`, `nvfp4` | **storage format** of the KV record (core) or the index-key pool (indexer); the compute precision follows the kernel. Formats no kernel consumes are enumerated as skipped coverage rows |
+| `paged` | `False`, `True` | flat `(rows, D)` pool, or a paged pool addressed through a per-request block table (`page_size` 64, pages assigned in random order so gathers scatter) |
+| `indexer_mode` | `dense`, `hierarchical` | indexer rows only: score every causally visible key, or score only the 16384 candidate positions the DSv4.1 source layer published |
+| `deterministic_bwd` | per config | bprop rows only |
+
+`q_seqlen` / `kv_seqlen` are **per request** in every phase: a generation row
+has `q_seqlen = q_tokens`, `kv_seqlen = kv_len` and `batch_size` requests;
+the worker derives the flat row count (`batch_size * q_tokens`) and the pool
+(`batch_size * kv_len` rows). Legacy configs (`components`, `kv_dtypes`,
+`paged`, `phases` left at their defaults) expand to exactly the same cases,
+labels and order as before; `deepseek_v4` is still 20 cases.
+
+Every architecture / dtype / shape / API-existence rule lives in
+`support.decide_support`, evaluated **in the runner** before anything is
+spawned: a skipped row costs no subprocess and carries the suite's own
+wording in `error_message`. A runner without torch or CUDA (compute
+capability unknown) treats every architecture-gated row as unservable and
+skips it with the same wording rather than spawning a worker to find out.
+The worker re-evaluates the same function and
+keeps the `UNSUPPORTED,<reason>` + exit-3 path only for declines the kernels
+raise themselves (`check_support`, or the one untimed probe call where the
+CuTe JIT happens). A compile or launch failure after that is an honest
+`success=False` row with the traceback tail, never a skip.
+
+### What each (component, phase) measures — and does not
+
+Inputs are random tensors in the kernels' layouts; the id lists come from
+`kv_pool.make_topk_ids`, unique ids inside the row's own request, not sorted
+by position (the real indexer emits sorted ids; the order changes the access
+pattern, not the kernel's work). Context and bprop rows gather the **full**
+top-k (every row `topk` unique random rows of the pool, the per-token upper
+bound, as the committed `results/` CSVs were measured); generation rows are
+causal to their position `kv_len - q_tokens + j` and padded with `-1` plus a
+matching `topk_length` when fewer than `topk` tokens are visible, which no
+shipped `kv_len` reaches. The worker declines (skipped row) a configuration
+that would hand the kernels a short row without `use_topk_length`, or a row
+with `topk_length < indexer_topk` (the forward kernel's indexer prefix
+contract). Timing is CUDA events around each steady-state call after a 256
+MiB L2 flush, median of `num_iterations` after warmup; the first untimed
+probe call compiles. Each case runs in its own subprocess.
+
+| component / phase | Timed call | Does not measure |
+|---|---|---|
+| core / context | `SparseAttentionForward.execute` with preallocated `out`, `max_logits`, `lse` (+ `lse_indexer` when `indexer_topk > 0`); flat ids or ids mapped through the block table (`backend_detail` carries `page=64`) | — |
+| core / generation | the same prefill kernel on `batch_size * q_tokens` flat rows gathering inside their own request's `kv_len`-token pool: `detail` says `flat-row prefill kernel; rows=..; no split-KV`. There is no decode / split-KV core kernel: one CTA per query row, so small `B x q_tokens` rows are latency numbers, not a decode SOL | a decode-shaped kernel; the Q-projection / RoPE / output-side work |
+| core / bprop | `SparseAttentionBackward.execute` with preallocated `dq`/`dkv` and a reusable workspace; `out`/`lse` come from a chunked PyTorch reference; gradient zeroing the kernel performs is included. Paged ids are allowed (the backward reads the same flat ids) | a forward launch |
+| indexer / context (dense) | `indexer_forward_top_k_wrapper` (fused scoring + top-k over the causal prefix) with caller-owned candidate buffer and outputs, `return_softmax=False`, so the timed call allocates nothing and does no host sync. `mxfp8` quantizes **both** Q and K to e4m3 with e8m0 block-32 scales packed once in setup (the kernel has no bf16-Q x mxfp8-K form) | the indexer's own RoPE and the MXFP4 quantization of Q / K (the `rope_qdq_inplace` contract in production); weights projection |
+| indexer / generation (dense) | the same wrapper in BSHD form, `q (B, q_tokens, H_idx, 128)`, `k (B, kv_len // ratio, 1, 128)`, `q_causal_offsets = kv_len - q_tokens`; `detail` carries `bytes_gathered = B * (kv_len // ratio) * key_bytes` so `gather_gbps` is the key-scan bandwidth | same as above |
+| indexer / hierarchical (context + generation, bf16 only) | the DSv4.1 **consumer** step: `SparseIndexerScoreRecompute` over 16384 synthesized causal-valid candidates per row (newest block pinned), then `IndexerTopK(top_k=512)` over the `(rows, 16384)` scores. `time_ms` = both steps; `time_step1_ms` / `time_step2_ms` hold them separately | the source layer's extra block-max / block-top-k emission (not a cuDNN kernel; the source's scoring cost *is* the dense row) |
+| indexer / bprop | `IndexerBackward` (default backend) with random fp32 scores and global int32 indices; the kernel overwrites `attn_score` in place, so a pristine copy is restored before every timed iteration, outside the window | — |
+
+TFLOPS count only the gathered / scored work:
+
+```
+core fwd FLOPs      = 2 * H * gathered * (d_qk + d_v)            gathered = sum(topk_length) (rows * topk without topk_length)
+core bwd FLOPs      = 2 * H * gathered * (3 * d_qk + 2 * d_v)
+indexer dense FLOPs = 2 * H_idx * 128 * sum_rows(n_vis)       n_vis(pos) = (pos + 1) // ratio, clamped to kv_len // ratio
+indexer hier. FLOPs = 2 * H_idx * 128 * sum_rows(min(pos + 1, 16384))   (valid candidates; top-k adds no FLOPs)
+indexer bprop FLOPs = 6 * S * H_idx * 128 * indexer_topk_select      (three GEMMs: dQ, dK, dW, as benchmark_dsa_indexer_h32.py counts them)
+```
+
+`n_vis` follows the FE kernels' completed-group rule (floor); the DSv4.1
+reference model also admits the open group (ceil), at most one key per row
+apart. With `index_granularity = 4` (GLM-5.3-Flash, QSA) a row selects
+complete 4-token blocks and the list expands to token ids, so the gather
+has the model's 4-row pool locality. The dense-MMA peak (`peak_mma_tflops`)
+uses the KV format for indexer rows (`mxfp8` = 2x the bf16 rate on compute
+capability 10.x) and `data_type` for core rows; there is no NVFP4 entry.
+
+### Skip matrix (what runs today)
+
+Cells the suite enumerates but no kernel serves are written as
+`skipped=True` rows (`success=False`, `time_ms = inf`) with the reason, so
+the CSV and the extended chart show the coverage gap. For `deepseek_v41`
+(324 cases) and `glm53` (384 cases):
+
+| component / phase | kv_dtype | paged | cc 9.0 | cc 10.0 | cc 10.7 |
+|---|---|---|---|---|---|
+| core / context, generation | bfloat16 | flat, paged | skip (forward needs 10.x) | run | run |
+| core / any | mxfp8 | any | skip | skip (no MXFP8-KV core kernel) | skip |
+| core / bprop | bfloat16 | flat, paged | run | run | run (shared compiler) |
+| indexer / context, generation (dense) | bfloat16, mxfp8 | flat | skip (needs 10.x) | run | run (shared compiler) |
+| indexer / context, generation (hierarchical) | bfloat16 | flat | skip | run | run (shared compiler) |
+| indexer / hierarchical | mxfp8 | flat | skip | skip (candidate-restricted scoring is bf16-only) | skip |
+| indexer / any | any | paged | skip | skip (dense BSHD/THD keys only) | skip |
+| indexer / bprop | bfloat16 | flat | skip for 32 heads (9.x needs 64) | run | run (shared compiler) |
+| any / bprop | mxfp8, nvfp4 | any | skip | skip (no low-precision backward) | skip |
+| any / any | nvfp4 | any | skip | skip (no NVFP4 / MXFP4 consumer) | skip |
+
+"Shared compiler" rows on compute capability 10.7 additionally require an
+installed CuTe DSL whose `Arch` table has the target for that part (public
+wheel 4.8.0 or newer); without it the runner
+skips them with `installed CuTe DSL lacks the target for compute capability
+10.7` (the core forward compiles its own `sm_100f` image and is unaffected).
+Servable cells: `deepseek_v41` 80 of 324 on cc 10.0 / 10.7 (26 with a DSL
+lacking the target), 10 on cc 9.0; `glm53` 118 of 384 (44), 20 on cc 9.0;
+`qwen38_qsa` 0 everywhere (see below).
+
+### Bytes per token
+
+`bytes_per_token` is a static column on every row (skipped ones included):
+the KV record a core row gathers, or the amortized index key an indexer row
+scans. `gather_gbps = bytes_gathered / time_ms` is filled only on success
+rows whose detail reports `bytes_gathered` (core and indexer generation).
+
+| record | bfloat16 | mxfp8 (e4m3 + e8m0 / 32) | nvfp4 (e2m1 + e4m3 / 16) |
+|---|---:|---:|---:|
+| core, shared K=V, d=512 (dsv4x, glm53_flash) | 1024 | 528 | 288 |
+| core, shared K=V, d=576 (glm53) | 1152 | 594 | 324 |
+| core, separate K and V, 2 heads x d=256 (qsa) | 2048 | 1056 | 576 |
+| index key, 128-dim, one per token | 256 | 132 | 68 (MXFP4: e2m1 + e8m0 / 32) |
+| index key, one per 4-token pool (glm53_flash, qsa) | 64 | 33 | 17 |
+
+Core generation `bytes_gathered = rows * topk * record + rows * topk * 4
+(ids) + rows * H * (d_qk + d_v) * 2 (Q read, O write)`, i.e. `gather_gbps`
+is the row's whole DRAM traffic, not the KV records alone; indexer generation
+`bytes_gathered = B * (kv_len // ratio) * key_bytes`.
+
+### Generation grid
+
+`generation_kv_lens` x `generation_batch_sizes` x `q_tokens in sorted({1,
+mtp_rows})` per model; the shipped configs use `kv_len in {8192, 131072}`,
+`B in {8, 128}` and `mtp_rows = 2` for dsv41_flash and glm53 (one MTP draft
+row), 1 otherwise. Query row `j` of a request sits at position `kv_len -
+q_tokens + j` and sees `pos + 1` tokens, so `q_tokens = 1` scans the whole
+cache. The bf16 pool at `B = 128 x 128k` is 16 GiB (d=512) / 18 GiB (d=576);
+the paged variant adds four spare pages.
 
 ### Model presets
 
@@ -88,47 +217,93 @@ last 128 tokens and a per-head sink; folding the window into the index list
 gives logical `K = 640` / `1152` with `indexer_topk = 512` / `1024` (the
 indexer-selected prefix whose LSE the forward kernel also emits). Heads: 64
 (Flash) / 128 (Pro). Sequence lengths 2k, 4k, 8k, 16k, 32k with `s_q == s_kv`;
-every query gathers the full top-k, i.e. the per-token upper bound.
+every query gathers the full top-k, i.e. the per-token upper bound. Core
+only, legacy axes (this config is the pinned legacy enumeration).
 
 `deepseek_v41` (`configs/deepseek_v41.py`): V4.1-Flash keeps the V4 sparse
 core (H=64, shared d=512 record, 512 indexer-selected entries + 128-token
 window, sink); its 2x-compressed / uncompressed pools and cross-layer KV and
 index sharing change what the indexer selects from, not the per-query
-gather, so the preset is V4-Flash's (`K = 640`, `indexer_topk = 512`). Only
-a Flash checkpoint is published.
+gather, so the core preset is V4-Flash's (`K = 640`, `indexer_topk = 512`).
+Indexer: 32 heads x 128, one key per token, top-k 512, `dense` and
+`hierarchical` modes; `mtp_rows = 2`. Only a Flash checkpoint is published.
 
 `glm53` (`configs/glm53.py`): GLM-5.3 (GLM-5.2's architecture) runs
 V3.2-style DSA on the MLA latent: the absorbed query attends a 576-wide
 shared record (512 KV latent + 64 RoPE) and reads the 512 latent channels
-back as V; token top-2048, no window fold, no sink, so `indexer_topk = 0`.
-`glm53_flash`'s sparse layers are NoPE MLA, so the record is 512 wide; its
-indexer selects 512 four-token pools = 2048 raw tokens (the incomplete tail
-pool, <= 3 tokens, is omitted). Like every preset here, the rows are
-gathered as independent random rows, not as 4-row pools.
+back as V; token top-2048, no window fold, no sink, so `indexer_topk = 0`;
+32-head indexer over one key per token, `mtp_rows = 2`. `glm53_flash`'s
+sparse layers are NoPE MLA, so the record is 512 wide; its indexer scores one
+key per four-token pool (`indexer_pool_ratio = 4`) and selects 512 pools =
+2048 raw tokens (`index_granularity = 4`; the incomplete tail pool, <= 3
+tokens, is omitted). `glm53` gathers independent random rows; `glm53_flash`
+gathers 512 random complete 4-token blocks, so its pool locality is modeled.
+
+`qwen38_qsa` (`configs/qwen38_qsa.py`, **opt-in**): Qwen3.8-Flash-Next QSA
+is GQA (24 query / 2 KV heads) with separate K and V of `d=256`, 2048 tokens
+selected as 512 four-token blocks, no sink, and a 4-head indexer over one key
+per 4-token block. Every cell is a skipped coverage row today: the core
+kernels serve the shared K=V latent only and the indexer kernels require 32
+or 64 query heads per KV head. It is not in `run_all.sh`'s default list; run
+`--config qwen38_qsa` by name.
 
 To add a model, copy `configs/deepseek_v4.py`, edit the `ModelPreset`s
 (`num_q_heads`, `head_dim_qk` in `{512, 576}`, `topk`, `indexer_topk`,
-`has_sink`) and the `DsaBenchmarkConfig` (`seqlens`, `profile_pass`,
-`deterministic_bwd`, iteration counts), and run `--config <name>`. Supported
-forward variants are `(H, d_qk)` in `{(64, 512), (64, 576), (128, 512)}` with
-`indexer_topk` in `{0, 512, 1024}` (`2048` for H64 too); backward accepts any
-head count with `d_qk` in `{512, 576}` and a deterministic mode on SM100 for
-H16/H32/H64/H96/H128.
+`has_sink`, and the appended indexer / GQA fields) and the
+`DsaBenchmarkConfig` (`seqlens`, `profile_pass` or `phases`, `components`,
+`kv_dtypes`, `paged`, generation grid, iteration counts), and run `--config
+<name>`. Core forward variants are `(H, d_qk)` in `{(64, 512), (64, 576),
+(128, 512)}` with `indexer_topk` in `{0, 512, 1024}` (`2048` for H64 too);
+keep `topk` a multiple of 64 so no hidden index padding sits in the timed
+region. Backward accepts any head count with `d_qk` in `{512, 576}` and a
+deterministic mode on compute capability 10.x for H16/H32/H64/H96/H128.
 
 ### Output
 
 ```
 results/<config>/<gpu>/
-    <config>_<timestamp>.csv   # one row per case (see BenchmarkResult)
-    <config>.webp               # fwd | bwd TFLOPS vs seqlen, one bar per model
+    <config>_<timestamp>.csv    # one row per case (see BenchmarkResult)
+    <config>.webp               # fwd | bwd TFLOPS vs seqlen for core bf16 flat rows (unchanged legacy figure)
+    <config>_extended.webp      # one panel per (component, phase) with cases beyond that set; hatched = skipped cell
+```
+
+The CSV keeps the legacy 25 columns first (`config_name` .. `backend_detail`)
+and appends `component, phase, kv_dtype, paged, batch_size, indexer_mode,
+bytes_per_token, gather_gbps, time_step1_ms, time_step2_ms`. The extended
+chart plots TFLOPS for core context / bprop and milliseconds otherwise, hue
+= `kv_dtype [paged] [hierarchical]`; a config whose rows are all skipped
+still gets the coverage grid.
+
+### Tests
+
+```bash
+# CPU-only contracts: legacy enumeration pin (deepseek_v4 = 20 cases), case counts,
+# decide_support matrix on cc (9,0) / (10,0) / (10,3) / (10,7), byte and FLOP constants,
+# make_topk_ids validity, RESULT / UNSUPPORTED parsing, CSV column order, charts
+python -m unittest discover -s benchmark/dsa/tests -v
+
+# the same contracts under pytest L0 plus a GPU smoke of six tiny cells (skips without cudnn[cutedsl] / a 10.x GPU)
+cd test/python && pytest deepseek_sparse_attention/cutedsl/test_DSA_benchmark_suite.py
 ```
 
 ### Results
 
-#### B200 - DeepSeek-V4
+#### GB200 - DeepSeek-V4
 
-![DeepSeek-V4 DSA on B200](results/deepseek_v4/b200/deepseek_v4.webp)
+![DeepSeek-V4 DSA on GB200](results/deepseek_v4/gb200/deepseek_v4.webp)
 - `dsv4_flash: H=64, d=512, K=640 (indexer_topk=512)`; `dsv4_pro: H=128, d=512, K=1152 (indexer_topk=1024)`; bf16, sink + `topk_length`, non-deterministic backward.
+
+### Follow-ups
+
+- QSA core rows via the compute capability 10.7 sparse GQA d256 kernel
+  (BSHD operands, 4-token block ids, paged pools with one block table, a
+  decode form with `S_q <= 4`): a third core setup, not the flat-row path.
+- NVFP4 KV / MXFP4 index keys once a consumer kernel exists (the rows and
+  byte footprints are already enumerated).
+- A decode-shaped (split-KV) core kernel; until then generation core rows are
+  the prefill kernel on flat rows.
+- The hierarchical source step (block-max emission + block top-k) if it
+  becomes a cuDNN kernel.
 
 ## Single Scripts
 
@@ -358,3 +533,8 @@ nsys profile -t cuda,nvtx --capture-range=cudaProfilerApi --capture-range-end=st
 ncu --profile-from-start off -o dsa_bwd \
   python benchmark_dsa_sparse_attention_backward.py profile --seqlens 8192 --topks 2048
 ```
+
+The suite worker has the same mode: `python benchmark/dsa/benchmark_single_dsa.py
+... --profile` runs one warmed call of the case inside
+`torch.cuda.profiler.start/stop` and an NVTX range and prints a `RESULT` line
+with that single timing.

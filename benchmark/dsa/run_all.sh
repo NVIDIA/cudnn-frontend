@@ -3,8 +3,10 @@
 # Usage:
 #   run_all.sh <arch_label> [gpu] [config ...]
 #     gpu    = CUDA_VISIBLE_DEVICES value (index or GPU-<uuid>), "" to skip
-#     config = subset of configs (default: all)
+#     config = subset of configs (default: deepseek_v4 deepseek_v41 glm53)
 # e.g. run_all.sh b200 GPU-4a901f61-...   |   run_all.sh gb300 "" deepseek_v4
+# qwen38_qsa is opt-in (every cell is a skipped coverage row until a sparse
+# GQA d256 kernel is wired):   run_all.sh <arch> <gpu> qwen38_qsa
 set -uo pipefail
 
 ARCH=${1:?usage: run_all.sh <arch_label> [gpu] [config ...]}
