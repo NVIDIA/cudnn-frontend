@@ -365,6 +365,8 @@ DSL satisfies your kernel.**
   and say so in the PR body if it raises the floor of a user-facing op:
   `cutlass.experimental.*` (primitives, `cuda.tensor_map`; everything under
   `cudnn/frost/tile_dsl` inherits it) → 4.7.0.
+  `cudnn.jax` (JAX bridge fixes for optional tensors and aliasing) → 4.7.1;
+  the JAX dependency group and runtime guard enforce this higher floor.
   Native im2col tensor-map creation used by `conv/cutedsl/conv3d_postops`
   (`cutlass.experimental.cuda.create_tensor_map_im2col`) → 4.9.
   `cp.async.cg.shared.global.L2::cache_hint` with a `createpolicy` register (the paged decode
@@ -788,6 +790,12 @@ not by itself justify another compile-cache specialization.
 ## The public function contract
 
 Public functions (`cudnn.ops.<op>_<direction>(...)` / `cudnn.ops.<op>_<direction>_jax(...)`, see `docs/fe-oss-apis/api_conventions.md`) allocate outputs and return them in a stable, documented order. PyTorch functions return a **`TupleDict`** (dict that also unpacks as a tuple). JAX functions return a plain tuple or dict: `jax.jit` rejects `TupleDict`, which is not a registered pytree.
+
+JAX tracers do not reveal eventual buffer placement. Do not choose device-specific
+launch geometry from `jax.local_devices()[0]` unless the API enforces a single
+visible device. Exercise that guard with `jax.jit(...).lower(ShapeDtypeStruct(...))`
+so validation of concrete eager arrays cannot mask a tracing-time mismatch (see
+`test/python/norm/jax/test_norm_jax.py`).
 
 ## Adding a new frontend-only API — required checklist
 

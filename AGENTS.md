@@ -47,7 +47,7 @@ pip install -e .              # graph API + the OSS CuTeDSL kernels (nvidia-cutl
                               # ".[cutedsl]" still resolves -- it now holds only cuda-python, which the DSL pulls in anyway
 pip install -e ".[cutile]"    # + the cuTile linear-attention engines (cuda-tile; needs a system tileiras)
 pip install --group torch      # + torch for the CuTeDSL APIs (torch, torch-c-dlpack-ext)
-pip install --group jax        # + jax for the CuTeDSL APIs (jax >= 0.5; XLA entry points via cutlass.jax)
+pip install --group jax        # + jax >= 0.5 and CuTeDSL >= 4.7.1 (XLA entry points via cutlass.jax)
 ```
 
 `setup.py` honors env vars: `CUDNN_PATH`, `CUDA_PATH` / `CUDAToolkit_ROOT`, `DEBUG=1` (debug build), `CMAKE_BUILD_PARALLEL_LEVEL`, `CMAKE_GENERATOR`.

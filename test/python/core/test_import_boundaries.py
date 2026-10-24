@@ -234,9 +234,11 @@ for module in ("cudnn.deepseek_sparse_attention.qsa_training",
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("module", ["cudnn.ops.norm", "cudnn.experimental.ops"])
+@pytest.mark.parametrize("module", ["cudnn.ops", "cudnn.ops.norm", "cudnn.experimental.ops"])
 def test_importing_norm_op_packages_pulls_no_framework(module):
-    _assert_absent(_imported_by(f"import cudnn\nimport {module}"), f"import {module}")
+    imported = _imported_by(f"import cudnn\nimport {module}")
+    _assert_absent(imported, f"import {module}")
+    assert "jax" not in imported, f"import {module} imported jax"
 
 
 @pytest.mark.L0
@@ -469,6 +471,39 @@ except ImportError as exc:
 else:
     raise AssertionError("NVFP4 conversion accepted unsupported DSL 4.6.2")
 assert "cudnn.ops._nvfp4_block_scale_kernels" not in sys.modules
+"""
+    run = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+
+
+@pytest.mark.parametrize("entry", ["package", "norm"])
+def test_jax_declines_old_dsl_before_importing_cutlass(entry):
+    probe = f"""
+import importlib
+import importlib.abc
+import sys
+from cudnn.frost import buffers
+
+class BlockCutlass(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "cutlass" or fullname.startswith("cutlass."):
+            raise AssertionError("CuTeDSL imported before the version decline: " + fullname)
+
+buffers._DSL_STATE = (True, ("nvidia-cutlass-dsl", "4.7.0"))
+sys.meta_path.insert(0, BlockCutlass())
+before = set(sys.modules)
+try:
+    if {entry!r} == "package":
+        importlib.import_module("cudnn.jax")
+    else:
+        getattr(importlib.import_module("cudnn.ops"), "layer_norm_forward_jax")
+except ImportError as exc:
+    assert "requires nvidia-cutlass-dsl >= 4.7.1" in str(exc), str(exc)
+    assert "found 4.7.0" in str(exc), str(exc)
+else:
+    raise AssertionError("JAX accepted unsupported DSL 4.7.0")
+assert "cudnn.jax.call" not in sys.modules
+assert not any(name == "cutlass" or name.startswith("cutlass.") for name in set(sys.modules) - before)
 """
     run = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
     assert run.returncode == 0, run.stderr

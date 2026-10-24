@@ -38,6 +38,8 @@ _LAZY_EXPORTS = {
     "kimi_delta_attention_backward_jax": ("cudnn.linear_attention.jax_api", "kimi_delta_attention_bwd"),
     "block_sparse_attention_forward_jax": ("cudnn.block_sparse_attention.jax_api", "block_sparse_attention_forward"),
     "block_sparse_attention_backward_jax": ("cudnn.block_sparse_attention.jax_api", "block_sparse_attention_backward"),
+    "layer_norm_forward_jax": ("cudnn.norm.jax_api", "layer_norm_forward_jax"),
+    "rms_norm_forward_jax": ("cudnn.norm.jax_api", "rms_norm_forward_jax"),
 }
 
 __all__ = list(_LAZY_EXPORTS)
