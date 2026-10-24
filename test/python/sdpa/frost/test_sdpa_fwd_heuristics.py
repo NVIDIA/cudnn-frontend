@@ -1661,10 +1661,10 @@ def test_sm107_d128_prefolded_graphs_keep_the_native_body(sm107_metadata_target)
 @pytest.mark.L0
 def test_sm107_d128_cga_and_pack_admission(sm107_metadata_target):
     """Explicit pins on the cc 10.7 half row (issue #1472): dense d128 half admits cga=1 (the shared decode tile) and
-    cga=2, and PackGQA for every group that divides the 128-row tile (4 / 8 / 16; the d64 envelope too); a group that
-    does not (96/8) is declined with the divisibility reason, dense d256 packs on the d256 decode tile within its route
+    cga=2, and PackGQA for every group that divides the 128-row tile (4 / 8 / 16; the d64 envelope too). Partial
+    groups (96/8) also run on native cga=2; shared cga=1 retains its divisibility rule. Dense d256 packs within its route
     (S_q x G within two token units of the 32-column tile) and keeps its paged-THD-only PackGQA past it, THD nonpaged
-    keeps the cga2 prefill pipeline and admits unsplit packing (cga=1 outside its domain), and dense PAGED queries -- not wired on
+    admits both native prefill widths and unsplit packing, and dense PAGED queries -- not wired on
     cc 10.7 outside the d256 decode tile -- never see the d128 tile."""
     from dataclasses import replace
 
@@ -1677,7 +1677,10 @@ def test_sm107_d128_cga_and_pack_admission(sm107_metadata_target):
     for h_kv in (16, 8, 4):
         assert engines.mismatch(caps, _sm107_d128_facts(h_kv=h_kv), pack) is None, h_kv
     assert engines.mismatch(caps, _sm107_d128_facts(d_qk=64, d_v=64), pack) is None
-    assert "divide" in engines.mismatch(caps, _sm107_d128_facts(h_q=96, h_kv=8), pack)
+    partial = _sm107_d128_facts(h_q=96, h_kv=8)
+    assert engines.mismatch(caps, partial, pack) is None
+    assert engines.mismatch(caps, partial, replace(pack, cga=2)) is None
+    assert "divide" in engines.mismatch(caps, partial, replace(pack, cga=1))
     # dense d256 (64/8 at S_q 8 = 64 packed rows = ONE unit of the 64-column tile; S_q 16 = 128 rows = two units of it): the d256
     # decode tile packs the whole group, so the request is ADMITTED; past the route (S_q 17 = 136 rows, a third unit) the dense d256
     # prefill kernel runs unpacked and the packed request is a typed decline naming the decode tile among the routes
@@ -1686,7 +1689,7 @@ def test_sm107_d128_cga_and_pack_admission(sm107_metadata_target):
     past_route = engines.mismatch(caps, _sm107_d128_facts(d_qk=256, d_v=256, s_q=17), pack)
     assert past_route is not None and "decode tile" in past_route, past_route
     thd = _sm107_d128_facts(thd=True, padded=True)
-    assert "outside this engine's domain" in engines.mismatch(caps, thd, engines.SdpaFwdKnobs(cga=1))
+    assert engines.mismatch(caps, thd, engines.SdpaFwdKnobs(cga=1)) is None
     assert engines.mismatch(caps, thd, pack) is None
     assert engines.mismatch(caps, replace(thd, h_q=96), pack) is None
     assert engines.mismatch(caps, thd, replace(pack, split_kv=2)) is not None

@@ -433,6 +433,93 @@ def test_native_thd_launch_bound_retains_persistent_cap():
     assert s.template[s.index["n_thd_units"]] == 7
 
 
+@pytest.mark.parametrize("envelope", [128, 4096 * 128 * 8])
+def test_native_thd_initial_waves_track_current_capacity(envelope):
+    """A broad declaration must not hide small runtime work from the wave policy."""
+    s, facts, _ = _fixture(layout=None, rank=3)
+    s.b, s.s_q_max, s.total_q = 4096, 65536, None
+    s.template[s.index["n_thd_units"]] = 102
+    s.wave_policy = (envelope, 102, 2)
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+    before = list(s.template)
+    # Cross the two-wave threshold, then return to a smaller fresh binding.
+    for batch, tokens, expected_bound in [(1, 1, 8), (2, 8192, 136), (2, 11777, 200), (2, 12289, 208), (1, 8192, 128)]:
+        current = dict(facts)
+        for role in ("q", "o"):
+            current[role] = facts[role]._replace(ptr=facts[role].ptr + tokens * 4096, shape=(tokens, s.qh, 128), span=tokens * s.qh * 128)
+        for role in ("q_lens", "kv_lens"):
+            current[role] = facts[role]._replace(shape=(batch + 1,), span=batch + 1)
+        bound = min(envelope, expected_bound)
+        expected = bound if bound <= 204 else 102
+        frame = _equal(s, current)
+        assert frame[s.index["n_thd_units"]] == expected
+        assert s.template == before and s.wave_policy == (envelope, 102, 2)
+
+
+@pytest.mark.parametrize("policy", [(0, 102, 2), (1000, 0, 2), (1000, 102, 1), (1000, 2**62, 4)])
+def test_native_thd_rejects_invalid_initial_wave_policy(policy):
+    s, _, _ = _fixture(layout=None)
+    s.wave_policy = policy
+    with pytest.raises(ValueError, match="initial-wave policy|fit in int64"):
+        cudnn._pybind_module._SdpaThdBinder(s)
+
+
+@pytest.mark.parametrize(
+    "hq,hk,pack,bindings",
+    [
+        (64, 8, 1, [(1, 1, 64), (1, 769, 128), (1, 1025, 102), (1, 769, 128)]),
+        (64, 8, 8, [(1, 1, 8), (1, 769, 104), (1, 1025, 136), (2, 2049, 102), (1, 1025, 136)]),
+        (48, 4, 4, [(2, 1090, 120), (2, 2049, 102), (1, 1025, 108)]),
+        (16, 4, 4, [(2, 4096, 132), (2, 8194, 102), (1, 1, 4)]),
+    ],
+    ids=["unpacked", "whole_group", "partial_group", "ragged"],
+)
+def test_native_thd_initial_wave_geometry_rebinds(hq, hk, pack, bindings):
+    """Packed token tiles and an explicit work budget survive changing bindings."""
+    s, facts, _ = _fixture(layout=None, rank=3)
+    s.b, s.s_q_max, s.total_q, s.qh, s.kh = 4096, 65536, None, hq, hk
+    for role, heads in (("q", hq), ("k", hk), ("v", hk), ("o", hq)):
+        tokens = facts[role].shape[0]
+        s.decl[role] = (heads, 128, heads * 128, 128, 1, heads * 128)
+        facts[role] = facts[role]._replace(shape=(tokens, heads, 128), strides=(heads * 128, 128, 1), span=tokens * heads * 128)
+    s.template[s.index["n_thd_units"]] = 102
+    s.wave_policy = (4096 * 128 * hq, 102, 2)
+    s.wave_geometry = (512 // pack, hq // pack, 178)
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+    before = list(s.template)
+    policy, geometry = s.wave_policy, s.wave_geometry
+    for batch, tokens, expected in bindings:
+        current = dict(facts)
+        for role in ("q", "o"):
+            current[role] = facts[role]._replace(ptr=facts[role].ptr + tokens * 4096, shape=(tokens, hq, 128), span=tokens * hq * 128)
+        for role in ("q_lens", "kv_lens"):
+            current[role] = facts[role]._replace(shape=(batch + 1,), span=batch + 1)
+        assert _equal(s, current)[s.index["n_thd_units"]] == expected
+        assert s.template == before and s.wave_policy == policy and s.wave_geometry == geometry
+
+
+@pytest.mark.parametrize(
+    "geometry,policy",
+    [
+        ((128, 2, 178), None),
+        ((0, 2, 178), (1000, 102, 2)),
+        ((128, 0, 178), (1000, 102, 2)),
+        ((128, 3, 178), (1000, 102, 2)),
+        ((128, 4, 178), (1000, 102, 2)),
+        ((64, 1, 178), (1000, 102, 2)),
+        ((129, 2, 178), (1000, 102, 2)),
+        ((128, 2, 101), (1000, 102, 2)),
+        ((128, 2, 205), (1000, 102, 2)),
+        ((2**62, 2, 178), (1000, 102, 2)),
+    ],
+)
+def test_native_thd_rejects_invalid_initial_wave_geometry(geometry, policy):
+    s, _, _ = _fixture(layout=None)
+    s.wave_policy, s.wave_geometry = policy, geometry
+    with pytest.raises(ValueError, match="initial-wave geometry"):
+        cudnn._pybind_module._SdpaThdBinder(s)
+
+
 def test_native_dynamic_hn_stride_keeps_invocation_frames_independent():
     s, facts, recorded = _fixture(layout="HN")
     s.lse_stride_override = True
