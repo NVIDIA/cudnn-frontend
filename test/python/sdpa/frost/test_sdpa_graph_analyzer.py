@@ -1463,6 +1463,7 @@ def test_sm107_paged_partial_pack_admission_agrees_with_adapter(monkeypatch, dty
         causal=True,
         thd=True,
         has_paged_kv=True,
+        padded=True,
         page_size=16,
         device_cc=(10, 7),
     )
