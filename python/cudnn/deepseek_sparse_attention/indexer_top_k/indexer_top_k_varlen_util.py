@@ -30,6 +30,16 @@ top-k varlen utils. could be used by prefill and decode phase.
 
 DETERMINISTIC_BITMAP_MAX_NUM_COLS = 262144
 
+# BF16 specializations wider than this bin their coarse histogram with FP32's FP16-derived key (see
+# IndexerTopKKernelVarlen.to_coarse_key). Up to it, every candidate fits the single shared-memory buffer of the
+# native BF16 key, which is also all that SM120's 99 KiB block budget holds at these widths.
+BF16_NATIVE_COARSE_KEY_MAX_NUM_COLS = 32768
+
+
+def bf16_uses_fp16_coarse_key(max_num_cols: int) -> bool:
+    """Whether a BF16 specialization for ``max_num_cols`` columns takes the FP16-derived coarse key."""
+    return max_num_cols > BF16_NATIVE_COARSE_KEY_MAX_NUM_COLS
+
 
 def resolve_deterministic_ordering(max_num_cols: int, deterministic: bool, ordering: str) -> str:
     """Resolve the internal canonical-ordering strategy for one specialization."""
@@ -97,8 +107,13 @@ class IndexerTopKKernelVarlen:
         self.indexer_topk_max_k = 2048
         # 8 bits for radix-based filter.
         self.radix = 256
+        # BF16's own top byte (sign + 7 exponent bits) spans two binades per coarse bin, so on long rows the
+        # threshold bin holds a large share of the row (gmem spill, long refine). Wide BF16 rows use FP32's
+        # FP16-derived coarse key instead: a quarter binade per bin, at the cost of a second refine round.
+        self.bf16_fp16_coarse_key = dtype == cute.BFloat16 and bf16_uses_fp16_coarse_key(max_num_cols)
 
-        if cutlass.const_expr(self.dtype == cutlass.Float32):
+        # Refine rounds alternate between two candidate buffers; a single-round key needs one.
+        if cutlass.const_expr(self.dtype == cutlass.Float32 or self.bf16_fp16_coarse_key):
             self.num_buffer_smem_input_idx = 2
         else:
             self.num_buffer_smem_input_idx = 1
@@ -165,8 +180,14 @@ class IndexerTopKKernelVarlen:
             self.num_refine_rounds = 4
         elif cutlass.const_expr(dtype in [cutlass.Float16, cute.BFloat16]):
             self.ordered_type = cute.Uint16
-            self.first_refine_shift = 0
-            self.num_refine_rounds = 1
+            if cutlass.const_expr(self.bf16_fp16_coarse_key):
+                # The FP16-derived bin does not fix the BF16 key's top byte: refine all 16 bits.
+                self.first_refine_shift = 8
+                self.num_refine_rounds = 2
+            else:
+                # The coarse bin is the key's top byte: one round resolves the low byte.
+                self.first_refine_shift = 0
+                self.num_refine_rounds = 1
 
         self.deterministic_sort_size = 1 << (self.top_k - 1).bit_length()
         self.use_deterministic_bitmap = self.deterministic_ordering == "bitmap"
@@ -214,9 +235,13 @@ class IndexerTopKKernelVarlen:
     def to_coarse_key(self, x):
         """Convert to coarse 8-bit key for histogram"""
 
-        if cutlass.const_expr(self.dtype == cutlass.Float32):
-            # Convert to FP16 and extract high 8 bits
-            h = x.to(cutlass.Float16)
+        if cutlass.const_expr(self.dtype == cutlass.Float32 or self.bf16_fp16_coarse_key):
+            # Convert to FP16 and extract high 8 bits. BF16 -> FP32 is exact and FP32 -> FP16 rounding is
+            # monotonic (saturating to inf above 65504), so the bins stay ordered by the exact key.
+            if cutlass.const_expr(self.dtype == cutlass.Float32):
+                h = x.to(cutlass.Float16)
+            else:
+                h = x.to(cutlass.Float32).to(cutlass.Float16)
             bits = half_as_ushort(h)
 
             key = cutlass.Uint16(0)

@@ -607,8 +607,9 @@ is `(n_rows, top_k)` in the input dtype, both contiguous and on `input_values`'
 device. `out_values` is required when the object was built with
 `return_val=True` and must be `None` otherwise. The radix scratch is carved from
 `workspace`, a CUDA `uint8` tensor of at least `scratch_workspace_bytes()` bytes
-(`n_rows * (2 for FP32, else 1) * num_cols * 4`, rounded up to 128) that is
-32-byte aligned; an absent or undersized workspace raises before launch.
+(`n_rows * buffers * num_cols * 4`, rounded up to 128, with `buffers` 2 for FP32
+and for BF16 wider than 32,768 columns, else 1) that is 32-byte aligned; an
+absent or undersized workspace raises before launch.
 The writable `out_indices`, optional `out_values`, and carved scratch byte
 ranges must not overlap one another or the read-only inputs. Disjoint views of
 the same backing allocation are valid. The class API also requires a 32-byte
