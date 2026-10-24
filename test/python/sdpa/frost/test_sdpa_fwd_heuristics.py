@@ -2213,3 +2213,38 @@ def test_explicit_paged_prefill_cga1_domain_and_tile_geometry(dtype, s_q, cc):
     else:
         assert reason is not None
     assert _pack_gqa_tile_q(caps, facts, 128, cga=1, split_kv=2) == 128
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "b, h_q, h_kv, s_q, s_kv, causal, packed_first",
+    [
+        (8, 8, 1, 576, 13568, True, True),  # past one 512-row Q tile
+        (8, 8, 1, 640, 13568, False, True),
+        (4, 32, 4, 768, 13568, True, True),
+        (8, 8, 1, 512, 13568, True, True),  # whole tiles: the packed causal band is still shorter
+        (1, 64, 8, 2048, 2048, True, True),
+        (8, 16, 16, 576, 8192, True, False),  # MHA: nothing to pack
+    ],
+)
+def test_sm107_fp8_d128_packs_first(sm107_metadata_target, b, h_q, h_kv, s_q, s_kv, causal, packed_first):
+    """Rubin per-tensor FP8 dense d128 GQA: the packed set leads at every S_q."""
+    facts = _facts(
+        b=b,
+        h_q=h_q,
+        h_kv=h_kv,
+        s_q=s_q,
+        s_kv=s_kv,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=cudnn.data_type.BFLOAT16,
+        is_fp8=True,
+        causal=causal,
+        bottom_right=causal,
+        device_cc=(10, 7),
+        device_sm_count=216,
+    )
+    plans = [p for p in recommend("A", facts, _RUBIN_OFFERED) if p.engine_id == _RUBIN_OFFERED[_RUBIN_FP8]]
+    assert plans
+    assert bool(plans[0].knobs.pack_gqa) is packed_first, plans[0].knobs
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_FP8)
+    assert all(engines.mismatch(spec.capabilities, facts, p.knobs) is None for p in plans)

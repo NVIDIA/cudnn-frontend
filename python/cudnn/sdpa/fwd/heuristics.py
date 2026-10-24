@@ -2312,9 +2312,18 @@ def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] 
             # 97.3 at parity.  Packing keeps the lead where no unpacked tile fits (b2 64/8 q256 KV 4k: packed 93.9 vs
             # unpacked 191.2) and under a band (_sm100_banded_gqa_packs below).  The packed set stays listed.
             wins = False
+        if _sm107_fp8_dense_d128(caps, facts):
+            # Packed never trails unpacked here at any S_q: unpacked pads every head's last 512-row tile (q576: 1.43-1.75x
+            # the backend vs packed 0.85-0.87) and walks the causal band per head (q2048 square: 1.09 vs 0.93).
+            wins = True
     if wins or (_sm120_d512_windowed(caps, facts) and not (facts.is_fp8 or facts.is_mxfp8)) or _sm100_banded_gqa_packs(caps, facts):
         return (True, False)
     return (False, True)
+
+
+def _sm107_fp8_dense_d128(caps: Capabilities, facts) -> bool:
+    """The cc 10.7 per-tensor FP8 dense (not THD) d128 prefill."""
+    return caps.sm_lo == 107 and facts.is_fp8 and not facts.is_mxfp8 and not facts.thd and _selected_d_shape(caps, facts) == (128, 128)
 
 
 def _sm100_f16(caps: Capabilities, facts) -> bool:

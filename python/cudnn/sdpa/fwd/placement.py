@@ -276,6 +276,26 @@ rule once:
   - hold-out 3 (100, fresh, after freezing; groups 1-16 incl. 3 / 5 / 6 / 12): 30 led at 0.15-0.97, no lead-loss
 Mean regret: fit 137.5 % -> 7.8 %, hold-out 3 78.4 % -> 23.4 %; led graphs on the grid 0.04-0.97.
 
+Revision (2026-10-24). The s_q > 512 "wave cliff" was the heuristic, not the kernel. Past one 512-row Q tile the
+unpacked plan pads every head's last tile (q576-768 1.28-1.87x), while PackGQA runs 0.85-0.96 at every S_q
+(heuristics ``_sm107_fp8_dense_d128``: packed first). A candidate audit timed every legal plan:
+  - packed GQA chunks at s_q 576-4096, S_kv 8k-32k: 0.78-0.94 -> causal cap 4096 for groups > 1
+  - MHA cannot pack. b * h_q units past one wave of 2-SM clusters lose 1.24-1.77x (128-256 units); 96 units run
+    0.90-0.97; mask-free MHA at 64-96 units loses 1.20 -> MHA leads only causal, s_q <= 512, b * h_q <= SMs / 2
+Hold-out 4 (102 random cases, rule frozen and code deployed before measuring, every legal plan timed): 99 scored
+(2 exceeded the 600 s per-case audit budget, 1 had no plan). 31 led at 0.10-0.91, no lead-loss; mean regret
+34.4 % (previous rule) -> 29.7 %.
+
+d512 sliding window (2026-10-24): the d512 arms of the SM100 / SM107 half, SM100 / SM107 per-tensor FP8 and SM90 half rows lead a
+dense causal window at exact d512 (``_d512_swa``: s_q >= 128, S_kv >= 1024, no sink / right band). The nightly
+attention_training run had FROST at 0.25-0.61 of the backend on DeepSeek-V4's SWA-128 MQA core on every GPU while
+every row trailed on the window. Re-measured with ab.py (CUDA-graph replay, warm and cold L2, cuDNN 9.27.0.42) over
+36 graphs per dtype: MQA 64/1 and 128/1 at b2, 16/1 and GQA 32/4 at b1; top-left squares S = 1k / 4k / 16k at
+window 128 / 512 / 4096; bottom-right chunks q128 / q2048 over a 32k cache at window 128:
+  B200 bf16 0.24-0.57, per-tensor FP8 0.32-0.90; H100 bf16 0.18-0.75 (the SM90 row serves no FP8)
+  Rubin (216 SMs; the SM107 half and per-tensor FP8 rows) bf16 0.33-0.97, FP8 0.40-0.73
+FP8 agrees with the backend within rel-RMS 0.04 (E4M3 O), bf16 within 0.003.
+
 Rows with no measurement (SM80, SM100 mxfp8) keep the historical order (LEAD); they are still
 opt-in, so the order is only observable with ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``.
 """
@@ -330,6 +350,8 @@ SM120_SQ1_MAX_GQA_GROUP = 64  # s_q == 1, d512: a 128-wide query group over one 
 
 # SM90 f16/bf16 thresholds.
 SM90_SQ1_MIN_Q_ROWS = 512  # s_q == 1 (no split-KV on SM90): b * h_q >= 512 wins 0.25-0.95; 256 is parity, below loses up to 33x
+D512_SWA_MIN_S_Q = 128  # d512 sliding-window prefill: measured from this query length ...
+D512_SWA_MIN_KV = 1024  # ... and this cache length (B200 / H100 / Rubin 0.18-0.97, module docstring)
 
 # SM107 half, dense d128 decode / verify WITH an attention sink on the shared SM100 bodies (the packed decode tile, or the
 # packed cga2 prefill body once S_q x G > 128): issue #1472; the measured band is in the module docstring (216-SM cc 10.7,
@@ -376,7 +398,8 @@ FP8_D128_ANY_TILES_MAX_S_Q = 128  # d128 chunks with s_q <= 128 win at 64-512 ti
 FP8_SYNTH_KV_MIN_TILE_KV = 2**21  # S_kv off the KV tile, mask-free: Q tiles * s_kv from which FROST wins (0.41-0.89)
 SM107_FP8_TINY_MAX_KV = 128  # cc 10.7 FP8 d256 / d512: a single KV tile ...
 SM107_FP8_TINY_MAX_Q_TILES = 8  # ... and at most 8 Q tiles is launch-bound; the backend keeps it
-SM107_FP8_D128_CAUSAL_MAX_S_Q = 512  # above, FROST's 512-row cluster doubles its waves first (b8 8/1 q576-768: 1.76x)
+SM107_FP8_D128_CAUSAL_MAX_S_Q = 4096  # packed GQA bottom-right causal chunk up to this query length: 0.78-0.94
+SM107_FP8_D128_MHA_MAX_S_Q = 512  # MHA cannot pack: past one 512-row Q tile it pads (q576-768: 1.28-1.87x)
 SM107_FP8_D128_LONG_KV = 8192  # bottom-right causal chunk from this cache length: 0.04-0.97
 SM107_FP8_D128_MIN_KV = 4096  # ... or from this length when the cache is at least
 SM107_FP8_D128_KV_PER_Q = 64  # ... this many times the query length
@@ -385,6 +408,17 @@ SM107_FP8_D128_MASKFREE_MAX_S_Q = 128  # mask-free chunk on the KV tile: 0.28-0.
 
 def _q_tiles(facts) -> int:
     return facts.b * facts.h_q * -(-facts.s_q // 128)
+
+
+def _d512_swa(facts) -> bool:
+    """Dense causal sliding window at exact d512 (DeepSeek-V4's SWA MQA core), inside the measured box (module docstring)."""
+    return (
+        (facts.d_qk, facts.d_v) == (512, 512)
+        and facts.causal
+        and not (facts.thd or facts.has_paged_kv or facts.has_sink or facts.right_band_widening)
+        and facts.s_q >= D512_SWA_MIN_S_Q
+        and facts.s_kv >= D512_SWA_MIN_KV
+    )
 
 
 def place(spec, facts) -> str:
@@ -528,7 +562,7 @@ def _place_sm107_f16(caps: Capabilities, facts) -> str:
         return LEAD
     if _d128_one_decode_tile_wave(caps, facts):
         return LEAD
-    if not (facts.thd or facts.has_paged_kv or facts.has_sink) and facts.window_left is None:
+    if not (facts.thd or facts.has_paged_kv or facts.has_sink) and (facts.window_left is None or _d512_swa(facts)):
         # Dense, measured on a gr100 board (216 SMs) against cuDNN 9.27 (2026-10-08).
         flavor = _selected_d_shape(caps, facts)
         if 2 <= facts.s_q <= DECODE_SHAPED_MAX_S_Q:
@@ -577,8 +611,8 @@ def _place_sm107_mxfp8(caps: Capabilities, facts) -> str:
 
 
 def _place_sm100_fp8(caps: Capabilities, facts) -> str:
-    # Measured: dense per-tensor E4M3, O E4M3 + Amax_O, no sink / window / block-scaled O.
-    if facts.thd or facts.has_paged_kv or facts.window_left is not None or facts.has_sink or facts.o_block_scale:
+    # Measured: dense per-tensor E4M3, O E4M3 + Amax_O, no sink / block-scaled O, a window only inside _d512_swa.
+    if facts.thd or facts.has_paged_kv or (facts.window_left is not None and not _d512_swa(facts)) or facts.has_sink or facts.o_block_scale:
         return TRAIL
     flavor = _selected_d_shape(caps, facts)
     if facts.s_q == 1:
@@ -608,7 +642,7 @@ def _place_sm107_fp8(caps: Capabilities, facts) -> str:
         or facts.thd
         or facts.has_paged_kv
         or facts.padded
-        or facts.window_left is not None
+        or (facts.window_left is not None and not _d512_swa(facts))
         or facts.right_band_widening
         or facts.has_sink
         or facts.o_block_scale
@@ -632,6 +666,9 @@ def _sm107_fp8_d128_chunk_leads(caps: Capabilities, facts) -> bool:
     group = facts.h_q // facts.h_kv
     if group & (group - 1):
         return False  # group does not divide the Q tile: unpacked, b > 1 loses 1.3-1.75x
+    if group == 1 and (not facts.causal or facts.b * facts.h_q > (facts.device_sm_count or 0) // 2 or facts.s_q > SM107_FP8_D128_MHA_MAX_S_Q):
+        # MHA past one wave of 2-SM clusters: 128 units 1.24-1.77x, 96 units 0.90-0.97; mask-free 64-96 units 1.20-1.22
+        return False
     if not facts.causal:
         # off the KV tile the mask-free graph cannot split (2-5x slower)
         return facts.s_q <= SM107_FP8_D128_MASKFREE_MAX_S_Q and not _synth_kv_padding(caps, facts)
@@ -643,8 +680,8 @@ def _sm107_fp8_d128_chunk_leads(caps: Capabilities, facts) -> bool:
 
 
 def _place_sm90_f16(caps: Capabilities, facts) -> str:
-    # Measured only dense, exact d512 without window/sink; everything else stays backend-first.
-    if facts.thd or facts.window_left is not None or facts.has_sink or (facts.d_qk, facts.d_v) not in caps.d_shapes:
+    # Measured only dense, exact d512 without a sink (a window only inside _d512_swa); everything else stays backend-first.
+    if facts.thd or (facts.window_left is not None and not _d512_swa(facts)) or facts.has_sink or (facts.d_qk, facts.d_v) not in caps.d_shapes:
         return TRAIL
     if facts.s_q == 1 and facts.b * facts.h_q < SM90_SQ1_MIN_Q_ROWS:
         return TRAIL
@@ -764,7 +801,7 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
         and _prefer_thd_pack_gqa(caps, facts)
     ):
         return LEAD  # unsplit packed causal GQA2/4/8/16
-    if facts.thd or facts.has_paged_kv or facts.window_left is not None:
+    if facts.thd or facts.has_paged_kv or (facts.window_left is not None and not _d512_swa(facts)):
         return TRAIL
     if flavor == (512, 512):  # exact or envelope-served (d320-d448: 0.32-0.65)
         return LEAD if facts.s_kv >= SHORT_QUERY_MIN_KV_TOKENS or facts.b * facts.h_q * facts.s_q >= D512_PREFILL_MIN_Q_ROWS else TRAIL
