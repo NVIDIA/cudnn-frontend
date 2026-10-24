@@ -2548,7 +2548,14 @@ def _mma_warp_group(
                     if cutlass.const_expr(_Q_TS):
                         mma_ts(bmm1_desc, tmem_Q[0], desc_K, (tmem_raw.subview(LAYOUT.S0_OFF)))
                     else:
-                        mma_ss(bmm1_desc, desc_Q0, desc_K, (tmem_raw.subview(LAYOUT.S0_OFF)))
+                        # Keep the packed Q descriptor increments local to this
+                        # work item instead of live across the persistent loop.
+                        q_desc = (
+                            desc_opaque(desc_Q0, q_full_phase)
+                            if cutlass.const_expr(CFG.PACK_GQA and CFG.TILE_K == CFG.TILE_O == 128 and CFG.SOFTMAX_WARPGROUPS == 2)
+                            else desc_Q0
+                        )
+                        mma_ss(bmm1_desc, q_desc, desc_K, (tmem_raw.subview(LAYOUT.S0_OFF)))
                     elect_p = nvvm.elect_sync()
                     bars.mb_bmm1_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
 
@@ -2558,7 +2565,12 @@ def _mma_warp_group(
                     if cutlass.const_expr(_Q_TS):
                         mma_ts(bmm1_desc, tmem_Q[1], desc_K, (tmem_raw.subview(LAYOUT.S1_OFF)))
                     else:
-                        mma_ss(bmm1_desc, desc_Q1, desc_K, (tmem_raw.subview(LAYOUT.S1_OFF)))
+                        q_desc = (
+                            desc_opaque(desc_Q1, q_full_phase)
+                            if cutlass.const_expr(CFG.PACK_GQA and CFG.TILE_K == CFG.TILE_O == 128 and CFG.SOFTMAX_WARPGROUPS == 2)
+                            else desc_Q1
+                        )
+                        mma_ss(bmm1_desc, q_desc, desc_K, (tmem_raw.subview(LAYOUT.S1_OFF)))
                     elect_p = nvvm.elect_sync()
                     bars.mb_bmm1_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
                     bars.mb_k_empty[kv_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
@@ -2601,7 +2613,12 @@ def _mma_warp_group(
                         if cutlass.const_expr(_Q_TS):
                             mma_ts(bmm1_desc, tmem_Q[0], desc_K, (tmem_raw.subview(LAYOUT.S0_OFF)))
                         else:
-                            mma_ss(bmm1_desc, desc_Q0, desc_K, (tmem_raw.subview(LAYOUT.S0_OFF)))
+                            q_desc = (
+                                desc_opaque(desc_Q0, kv_loop)
+                                if cutlass.const_expr(CFG.PACK_GQA and CFG.TILE_K == CFG.TILE_O == 128 and CFG.SOFTMAX_WARPGROUPS == 2)
+                                else desc_Q0
+                            )
+                            mma_ss(bmm1_desc, q_desc, desc_K, (tmem_raw.subview(LAYOUT.S0_OFF)))
                         elect_p = nvvm.elect_sync()
                         bars.mb_bmm1_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
 
@@ -2630,7 +2647,12 @@ def _mma_warp_group(
                         if cutlass.const_expr(_Q_TS):
                             mma_ts(bmm1_desc, tmem_Q[1], desc_K, (tmem_raw.subview(LAYOUT.S1_OFF)))
                         else:
-                            mma_ss(bmm1_desc, desc_Q1, desc_K, (tmem_raw.subview(LAYOUT.S1_OFF)))
+                            q_desc = (
+                                desc_opaque(desc_Q1, kv_loop)
+                                if cutlass.const_expr(CFG.PACK_GQA and CFG.TILE_K == CFG.TILE_O == 128 and CFG.SOFTMAX_WARPGROUPS == 2)
+                                else desc_Q1
+                            )
+                            mma_ss(bmm1_desc, q_desc, desc_K, (tmem_raw.subview(LAYOUT.S1_OFF)))
                         elect_p = nvvm.elect_sync()
                         bars.mb_bmm1_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
                         bars.mb_k_empty[kv_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
