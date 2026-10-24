@@ -508,11 +508,10 @@ class pygraph:
                 dim = list(template.shape)
                 stride = _row_major_stride(dim)
 
+        # Same lookup as execute(), so non-torch arrays are declared with their own dtype.
         data_type = None
         try:
-            import cudnn.datatypes
-
-            data_type = cudnn.datatypes._torch_to_cudnn_data_type(template.dtype)
+            data_type = _buffer_dtype_to_cudnn(template.dtype)
         except Exception:
             pass
 
