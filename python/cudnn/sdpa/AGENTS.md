@@ -212,6 +212,16 @@ can otherwise leave half the rows unwritten while corrupting padding. The
 SM107 detector is `test_sm107_fp8_stats_nonunit_row_stride`; MXFP8 also checks
 rebound padded and batch-inner layouts under CUDA Graph replay.
 
+Vector-load alignment must follow each input's declared base and physical
+strides. Inspect the original tensor iterator before `raw_ptr()` conversion,
+which can discard its alignment declaration; checking the converted pointer
+can leave an intended vector path scalar. Compile both aligned and misaligned
+controls and inspect the emitted loads, then check physical pitches, pointer
+rebinding and replay. `test_sdpa_bwd_dot_strides.py` covers the shared dot helper.
+Compact strides do not establish base-pointer alignment. Keep the declaration
+check for both inputs in the compact path too; the compact alignment-2 cases
+exercise O alone, dO alone, and both inputs, with matching PTX controls.
+
 Block-scaled SF_O uses byte addressing: its fake tensor extent, host geometry
 arguments, device parameters, and every intermediate offset product must all
 stay Int64. Widen operands before multiplication. The physical detector is
@@ -607,6 +617,25 @@ Backward (d512 stage 2):
 
 ## Stage-3 GEMM (`bwd/kernels/bprop_matmul_blackwell.py`) perf-method lessons
 
+- **A head subgroup is legal only when the final reduction covers all global
+  per-query-head partials.** The dense BF16 SM100 d256 chain can divide one GQA
+  group after whole-group choices exceed its workspace target. Every chunk must
+  divide the group, its grouped dQ tensor map must retain one K head (ceiling
+  division, never a zero-sized floor), and the global dK/dV fold must run once
+  after all chunks. Keep other chains' validation strict and gate inherited
+  chooser rules by dtype, layout and compute capability. Detectors in
+  `test_sdpa_bwd_d256_sm100.py`: `test_head_subgroups_match_full_group_gradients`,
+  `test_head_subgroups_preserve_mask_and_tail_gradients`,
+  `test_head_subgroups_rebind_stream_replay_and_launch_count` and
+  `test_head_subgroup_rule_is_scoped_and_workspace_is_honest`. They check
+  old/new bitwise gradients against an independent oracle, poisoned scratch,
+  stream/storage replay, exactly one fold and unchanged fitting choices.
+  Keep the stage-3 source pins consistent with ceiling division while retaining
+  the `b_head_group == 1` constant-fold checks. The SM107 suite's host-only
+  `test_stage3_b_descriptor_covers_partial_head_groups` evaluates the actual
+  template expression against the K heads reached by every Q head; restoring
+  floor division must fail for a subgroup smaller than one complete GQA group.
+
 Measured on the SM100 d512 backward's dV / dK / dQ GEMMs (B200, 148 SMs, 1155 MHz SW power cap, cuDNN 9.26.0.51, DSL 4.7.0,
 2026-10-01; the numbers quoted here are the per-GEMM CUPTI medians of CLEAN in-process round-robin A/B slots, and the constant's
 comment in `bwd/api_dsl.py` carries the full set).  Each lesson names its runnable detector; add to the list, do not restate.
@@ -674,6 +703,21 @@ comment in `bwd/api_dsl.py` carries the full set).  Each lesson names its runnab
   the causal cell of one tag in one process with an empty `XDG_CACHE_HOME`; the second must not inherit the first's LSE.
 
 ## Output initialization regressions
+
+D256 chunk-local GQA partial buffers may be reused only after a complete
+GQA group has been folded. Input batch/head origins remain global while the
+dV store and dK GEMM use independent local output origins. A head subgroup
+smaller than the GQA group still needs global partials until the final fold.
+`test_chunk_partials_workspace_and_subgroup_boundary` checks the allocation
+boundary; `test_chunk_partials_match_full_partials` checks batch, head and
+combined chunks against FP64 and the original fold, with poisoned workspace
+under dense, causal, bottom-right and sliding-window masks.
+`test_chunk_partials_preserve_per_member_dq` also retains the per-member dQ path.
+`test_chunk_partials_rebind_stream_and_replay` checks changed inputs and the
+caller's stream under capture.
+When a test monkeypatches the scratch policy, capture its shapes and byte
+count inside that context: these queries call the current policy dynamically,
+so restoring the class before reading the baseline silently changes the control.
 
 When removing wrapper-side output clears, verify that the prepared chain
 overwrites every element, including masked rows and partial tiles. Poison

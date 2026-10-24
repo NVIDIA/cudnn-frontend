@@ -108,6 +108,15 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
       yield
   ```
 
+### Native flavor routing assertions
+
+When a native head-dimension flavor replaces an envelope, update the exact
+template expectation in existing end-to-end routing tests as well as adding
+new flavor tests. Keep the routing assertion, numerical comparisons and shape
+unchanged. The SM107 GPT-OSS D64 case in
+`test_sdpa_fwd_cc107_decode_tile_envelope_pinned_L0` exercises native D64
+prefill; a short query alone does not imply the D128 decode template.
+
 ### Layout
 
 - `test/python/<operation>/<backend>/` — tests grouped by operation (`sdpa`, `gemm`, `conv`, `norm`, `rope`, `linear_attention`, ...), then by the backend or framework they exercise: `graph` (native cuDNN through `cudnn.pygraph`), `frost` (FROST engines), `cutedsl` (CuTe DSL frontend-only APIs), `torch` and `jax` (framework integrations), and engine names such as `linear_attention/cake`. Tests that span backends sit at the operation root (e.g. `linear_attention/test_la.py`).
@@ -858,6 +867,13 @@ host slot only for FP32 partials. Compare both main and combine frames with
 the actual host signature, then run output/Stats numerics and changed-input
 replay for FP16 and BF16; `test_sdpa_native_sm120_binding.py` is the detector.
 ### Native backward binding
+
+Exercise the actual standalone adapter as well as the prepared binder. A lower-level
+frame test can miss an incompatible metadata container built by the adapter.
+`test_shared_standalone_adapter_uses_current_native_storage` calls that boundary
+with the native and Python binders, optional external delta, changed storage and
+invalid current inputs; the native geometry transport must accept the adapter
+without falling back to Python.
 
 Derive the runtime frame from each actual host signature: SM80 has a partial
 that binds four launch bounds, SM107 dense and THD have different optional

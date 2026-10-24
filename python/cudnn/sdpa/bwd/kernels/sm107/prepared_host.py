@@ -763,6 +763,7 @@ def _stage3(
     dk_epi: cutlass.Constexpr = None,
     dq_epi: cutlass.Constexpr = None,
     dq_b_head_group: cutlass.Constexpr = 1,
+    dk_chunk_local: cutlass.Constexpr = False,
 ):
     """dK = dS . Q into ``dk_out[bb:bb+bc, :, hb:hb+hc]`` and dQ = dS^T . K into ``dq_out[bb:bb+bc, :, hb:hb+hc]`` for one (batch, head)
     chunk; ``ds`` is the chunk's REAL-extent ``[bc, hc, S_kv, S_q]`` workspace view, ``q`` / ``k`` the full ``[B, S, H, D]`` operands,
@@ -770,7 +771,10 @@ def _stage3(
     ``dq_b_head_group`` is the dQ rendering's ``MatmulTemplateParams.b_head_group`` (how it indexes its B = K head: ``h // group``
     at the GQA group, per head at 1), which decides the launch count (``_dq_launches``).  Every operand is a view; nothing is copied."""
     q_c = _window(_window(q, 0, bb, bc), 2, hb, hc)  # [bc, S_q, hc, D]
-    dk_c = _window(_window(dk_out, 0, bb, bc), 2, hb, hc)  # [bc, S_kv, hc, D]
+    if cutlass.const_expr(dk_chunk_local):
+        dk_c = dk_out  # [bc, S_kv, hc, D] reusable partial, independent of Q origin
+    else:
+        dk_c = _window(_window(dk_out, 0, bb, bc), 2, hb, hc)  # [bc, S_kv, hc, D]
     # dK = dS . Q: A = dS[kv, q] (M, K, H, B) K-major; B = Q (D, q, H, B); out (kv, D, H, B).
     _matmul(mm_dk, _permuted(ds, (2, 3, 1, 0)), _permuted(q_c, (3, 1, 2, 0)), _permuted(dk_c, (1, 3, 2, 0)), hc, bc, meta, desc, stream, dk_epi)
     # dQ = dS^T . K: A = dS^T[q, kv] (M, K, H, B) M-major; B = K (D, kv, H_kv, B); out (q, D, H, B).  Under GQA the K head is
@@ -779,7 +783,11 @@ def _stage3(
     # kv_n x (S_q / 256) x group clusters instead of kv_n x (S_q / 256), `group` times).  The per-head rendering
     # (`dq_b_head_group == 1`, the `DQ_SINGLE_LAUNCH = False` twin) runs once per group MEMBER over every `group`-th Q head, so
     # each launch's A / out heads line up with its B heads.  Both walk the same k tiles per output tile: bitwise-equal dQ.
-    kv_n = hc // group
+    if cutlass.const_expr(hc < group):
+        assert group % hc == 0 and dq_b_head_group == group, "head subgroups require grouped dQ and must evenly divide the GQA group"
+    # A subgroup still reads its one complete K head. Global per-Q-head dK/dV
+    # partials are folded only after every chunk has completed.
+    kv_n = max(1, hc // group)
     n_launch = _dq_launches(group, dq_b_head_group)
     heads = hc // n_launch  # Q heads per dQ launch: kv_n * dq_b_head_group
     k_c = _window(_window(k, 0, bb, bc), 2, hb // group, kv_n)  # [bc, S_kv, kv_n, D]
@@ -1109,7 +1117,12 @@ def host_f16(
     # stage 2's dV per Q head: the caller's dV only when MHA and no kv padding; stage 3's dK per Q head: the caller's dK when MHA.
     dv_k = _scratch(workspace, regions[R_DV_PART], dtype) if cutlass.const_expr(regions[R_DV_PART] is not None) else dv
     dk_tgt = _scratch(workspace, regions[R_DK_PART], dtype) if cutlass.const_expr(regions[R_DK_PART] is not None) else dk
-    dk_real = _extent(dk_tgt, (b, skv, h, d))  # stage 3 writes the real rows only
+    chunk_partials = cutlass.const_expr(group > 1 and regions[R_DK_PART] is not None and (regions[R_DK_PART][1][0] != b or regions[R_DK_PART][1][2] != h))
+    if cutlass.const_expr(chunk_partials):
+        assert not kv_padded and hc % group == 0
+        dk_real = _extent(dk_tgt, (bc, skv, hc, d))
+    else:
+        dk_real = _extent(dk_tgt, (b, skv, h, d))  # stage 3 writes the real rows only
     ds = _extent(ds_full, (bc, hc, skv, sq))  # what stage 3 reads: the real extents (padded rows / cols never reach a GEMM)
 
     # STAGE 1, hoisted out of the chunk loop: one streaming pass over O and dO -- unless the caller computed it
@@ -1127,12 +1140,38 @@ def host_f16(
             if cutlass.const_expr(zero_ws and seq_kv_ptr is not None):
                 _zero_ds(ds_full, config, stream)
             # STAGE 2: head_base / batch_base offset every full-tensor read; dS stays chunk-local.
-            main(q_k, do_k, k_k, v_k, dv_k, ds_full, lse_k, delta, seq_kv, (b, h, hk, sqp, skvp, hc, bc, sq, skv), scale, hb, bb, stream)
-            # STAGE 3: consume the chunk's workspace, write the outputs' (batch, head) slice.
-            _stage3(mm_dk, mm_dq, ds, q, k, dk_real, dq, bb, bc, hb, hc, group, seq_kv, desc, stream, dq_b_head_group=dq_bhg)
+            if cutlass.const_expr(chunk_partials):
+                main(
+                    q_k,
+                    do_k,
+                    k_k,
+                    v_k,
+                    dv_k,
+                    ds_full,
+                    lse_k,
+                    delta,
+                    seq_kv,
+                    (b, h, hk, sqp, skvp, hc, bc, sq, skv),
+                    scale,
+                    hb,
+                    bb,
+                    stream,
+                    cutlass.Int32(0),
+                    cutlass.Int32(0),
+                )
+                _stage3(mm_dk, mm_dq, ds, q, k, dk_real, dq, bb, bc, hb, hc, group, seq_kv, desc, stream, dq_b_head_group=dq_bhg, dk_chunk_local=True)
+                # Same BF16 per-Q-head partials and ordered FP32 fold. Every
+                # whole GQA group is consumed before its workspace is reused.
+                dk_out = _window(_window(dk, 0, bb, bc), 2, hb // group, hc // group)
+                dv_out = _window(_window(dv, 0, bb, bc), 2, hb // group, hc // group)
+                dkv_reduce_host(dk_tgt, dv_k, dk_out, dv_out, d, d, group, dtype, False, stream)
+            else:
+                main(q_k, do_k, k_k, v_k, dv_k, ds_full, lse_k, delta, seq_kv, (b, h, hk, sqp, skvp, hc, bc, sq, skv), scale, hb, bb, stream)
+                # STAGE 3: consume the chunk's workspace, write the outputs' (batch, head) slice.
+                _stage3(mm_dk, mm_dq, ds, q, k, dk_real, dq, bb, bc, hb, hc, group, seq_kv, desc, stream, dq_b_head_group=dq_bhg)
 
     # STAGE 4: fold the per-Q-head partials onto the KV heads (fixed order, deterministic); copy real rows out of a padded staging.
-    if cutlass.const_expr(group > 1):
+    if cutlass.const_expr(group > 1 and not chunk_partials):
         dk_out = _scratch(workspace, regions[R_DK_FOLD], dtype) if cutlass.const_expr(kv_padded) else dk
         dv_out = _scratch(workspace, regions[R_DV_FOLD], dtype) if cutlass.const_expr(kv_padded) else dv
         dkv_reduce_host(dk_tgt, dv_k, dk_out, dv_out, d, d, group, dtype, False, stream)
