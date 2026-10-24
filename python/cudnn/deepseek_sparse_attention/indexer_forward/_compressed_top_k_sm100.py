@@ -45,8 +45,10 @@ from cudnn.deepseek_sparse_attention.utils.tensor_conversion import (
 )
 
 from ._support import (
+    check_paged_args as _check_paged_args,
     check_q_covered_by_k as _check_q_covered_by_k,
     resolve_m_block_size as _resolve_m_block_size,
+    resolve_paged_k as _resolve_paged_k,
     validate_qhead_per_kv_head as _validate_indexer_qhead_per_kv_head,
 )
 
@@ -273,12 +275,20 @@ def indexer_fwd_compress_topk(
     deterministic: bool = False,
     _cand_total_floats: Optional[int] = None,
     _cand_batch_offsets: Optional[torch.Tensor] = None,
+    block_table: Optional[torch.Tensor] = None,
+    kv_lens: Optional[torch.Tensor] = None,
+    max_seqlen_k: Optional[int] = None,
 ) -> tuple[torch.Tensor, ...]:
     """Compress-logits + top-k (CuTe DSL, BSHD).
 
     ``precision`` is ``"bf16"`` (default), ``"mxfp8"``, or ``"mxfp4"``.  The
     block-scaled precisions take blockscaled-packed E8M0 ``q_scale``/``k_scale``
     (same packing as ``indexer_fwd``).  Microbatching is bf16-only.
+
+    ``block_table`` ((bs, max_pages) int32) + ``kv_lens`` ((bs,) int32) read K
+    from a page pool ``(num_pages, page_size, 1, head_dim)`` instead of a dense
+    ``(bs, seqlen_k, 1, head_dim)`` tensor (BF16, single launch, local ids);
+    ``max_seqlen_k`` is then the key extent (default ``max_pages * page_size``).
 
     Runs the logits GEMM in *compress* mode — the epilogue writes only the valid
     ratio-causal scores into a compact per-row variable-length cand_buffer
@@ -367,7 +377,16 @@ def indexer_fwd_compress_topk(
     validate_sf_vec_size(precision, sf_vec_size)
 
     bs, seqlen_q, n_heads_q, head_dim = q.shape
-    _, seqlen_k, n_heads_kv, _ = k.shape
+    paged = _check_paged_args(block_table, kv_lens)
+    if paged:
+        if precision != "bf16":
+            raise NotImplementedError("paged K is served by the BF16 indexer only")
+        page_size, max_pages = _resolve_paged_k(k, block_table, kv_lens, None, n_block_size=n_block_size, batch=int(bs), device=q.device)
+        seqlen_k = max_pages * page_size if max_seqlen_k is None else int(max_seqlen_k)
+        n_heads_kv = int(k.shape[2])
+    else:
+        page_size = 0
+        _, seqlen_k, n_heads_kv, _ = k.shape
     # Auto stage-2 block size (topk_block_threads<=0): resolved ONCE from the full
     # shape and applied to every microbatch window, NOT re-derived per window.
     # block_threads is occupancy-only (correctness-neutral — it just must divide
@@ -378,7 +397,7 @@ def indexer_fwd_compress_topk(
         topk_block_threads = _select_topk_block_threads(bs * seqlen_q, seqlen_k)
     # Cross-tensor shape / device consistency (the compressed-logits path is public; reject
     # malformed inputs here instead of as a kernel OOB / cryptic failure).
-    if k.shape[0] != bs or k.shape[3] != head_dim:
+    if (not paged and k.shape[0] != bs) or k.shape[3] != head_dim:
         raise ValueError(f"k must be (bs={bs}, seqlen_k, n_heads_kv, last dim={head_dim}), " f"got {tuple(k.shape)}")
     head_dim = logical_head_dim(precision, head_dim)
     if tuple(w.shape) != (bs, seqlen_q, n_heads_q):
@@ -460,6 +479,14 @@ def indexer_fwd_compress_topk(
     # bottom-right per-window geometry that does not compose with arbitrary offsets).
     if q_causal_offsets is not None and microbatch_rows > 0:
         raise NotImplementedError("microbatch_rows > 0 is not supported with explicit q_causal_offsets; " "pass microbatch_rows=0")
+    if paged:
+        # Microbatch windows slice k[:, :kw], which has no meaning on a page pool, and the
+        # global-id convention (b * seqlen_k + local) has no pool-row counterpart yet.
+        if microbatch_rows > 0:
+            raise NotImplementedError("microbatch_rows > 0 is not supported with paged K; pass microbatch_rows=0")
+        if topk_indices_global:
+            raise NotImplementedError("paged K returns local key ids only; pass topk_indices_global=False")
+        microbatch_rows = 0
 
     # Resolve auto microbatch (microbatch_rows < 0).  Long-sequence auto-policy
     # applies to bf16 only; block-scaled microbatch is unsupported (per-window
@@ -636,7 +663,8 @@ def indexer_fwd_compress_topk(
         sf_vec_size,
         float(sm_scale),
         seqlen_q,
-        seqlen_k,
+        None if paged else seqlen_k,  # paged: the key extent is a runtime bound
+        page_size,
     )
     q_kernel = kernel_qk_view(precision, q)
     k_kernel = kernel_qk_view(precision, k)
@@ -649,6 +677,8 @@ def indexer_fwd_compress_topk(
         denom_cute = _to_cute_tensor(denom_tmp) if denom_tmp is not None else None
         qco_cute = _to_cute_tensor(q_causal_offsets, leading_dim=0) if q_causal_offsets is not None else None
         cbo_cute = _to_cute_tensor(cand_batch_offsets, leading_dim=0) if cand_batch_offsets is not None else None
+        bt_cute = _to_cute_tensor(block_table, assumed_align=4, leading_dim=1) if paged else None
+        kvl_cute = _to_cute_tensor(kv_lens, assumed_align=4, leading_dim=0) if paged else None
         current_stream = resolve_stream(None)
         scale_arg = cutlass.Float32(sm_scale)
         max_q_arg = cutlass.Int32(seqlen_q)
@@ -704,6 +734,7 @@ def indexer_fwd_compress_topk(
                 compute_lse=want_lse,
                 is_compressed_logits=True,
                 cand_2d=cand_2d,
+                page_size=page_size,
             )
             _compile_cache[compile_key] = cute.compile(
                 kernel_obj,
@@ -720,6 +751,8 @@ def indexer_fwd_compress_topk(
                 qco_cute,  # mQCausalOffsets (None ⇒ offset 0; per-batch tensor otherwise)
                 current_stream,
                 cbo_cute,
+                bt_cute,
+                kvl_cute,
                 options=compile_options(),
             )
 
@@ -765,6 +798,8 @@ def indexer_fwd_compress_topk(
                 q_causal_offsets,  # mQCausalOffsets (None ⇒ offset 0)
                 current_stream,
                 cand_batch_offsets,
+                block_table,
+                kv_lens,
             )
 
     with torch.cuda.nvtx.range("indexer_fwd_compress_stage2_topk"):
@@ -784,6 +819,7 @@ def indexer_fwd_compress_topk(
             out_softmax=softmax_out,
             return_softmax=want_softmax,
             deterministic=deterministic,
+            kv_lens=kv_lens,
         )
     if want_softmax:
         topk_indices, topk_logits, topk_softmax = stage2_out
@@ -801,7 +837,7 @@ def indexer_fwd_compress_topk(
 
 def _compress_cand_batch_offsets(
     cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
+    cu_seqlens_k: torch.Tensor | None,
     ratio: int,
     q_causal_offsets: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -832,7 +868,7 @@ def _compress_cand_batch_offsets(
 
 def compress_topk_cand_buffer_size_thd(
     cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
+    cu_seqlens_k: torch.Tensor | None,
     ratio: int,
     q_causal_offsets: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, int]:
@@ -844,6 +880,9 @@ def compress_topk_cand_buffer_size_thd(
         offsets (``[b]`` = batch b's compact start; ``[bs]`` = total).
       * ``total_floats`` — float32 element count the ``cand_buffer`` must hold.
 
+    ``cu_seqlens_k`` is ``None`` for paged K (``block_table`` + ``kv_lens``): the
+    compact sizes depend on the query lengths and offsets only.
+
     Device values are consumed as provided; callers own the per-batch
     ratio-causal and non-negative offset contracts. Feed the returned
     ``cand_batch_offsets`` (plus a float32 ``cand_buffer`` with
@@ -853,7 +892,11 @@ def compress_topk_cand_buffer_size_thd(
     internal offset compute + ``.item()`` sync per call.  (Strictly zero extra
     transient allocation additionally needs ``topk_indices_global=False``; the
     default global-id conversion records transients into the graph pool — no sync.)"""
-    if cu_seqlens_q.ndim != 1 or cu_seqlens_k.ndim != 1 or cu_seqlens_q.numel() != cu_seqlens_k.numel() or cu_seqlens_q.numel() < 2:
+    if (
+        cu_seqlens_q.ndim != 1
+        or cu_seqlens_q.numel() < 2
+        or (cu_seqlens_k is not None and (cu_seqlens_k.ndim != 1 or cu_seqlens_k.numel() != cu_seqlens_q.numel()))
+    ):
         raise ValueError("cu_seqlens_q/k must be 1D of equal length (bs+1) >= 2")
     bs = cu_seqlens_q.numel() - 1
     if q_causal_offsets is not None:
@@ -895,12 +938,18 @@ def _run_compress_gemm_varlen(
     sf_vec_size=32,
     want_lse=False,
     lse_out=None,
+    page_size=0,
+    block_table=None,
+    kv_lens=None,
 ):
     """Native varlen compress-logits GEMM (BF16 or block-scaled): one launch writes the
     per-batch tight compact cand_buffer (slab b at ``cand_batch_offsets[b]``). Returns
     ``(cand, cand_batch_offsets)``.  When both ``cand_buffer`` and
     ``cand_batch_offsets`` are caller-supplied (from
     ``compress_topk_cand_buffer_size_thd``) the path does NO ``.item()`` sync.
+
+    ``page_size > 0`` reads K from a page pool through ``block_table`` / ``kv_lens``
+    (BF16 only); ``cu_seqlens_k`` is then ``None``.
 
     A block-scaled ``precision`` (``'mxfp8'`` or ``'mxfp4'``) runs the blockscaled
     logits GEMM on the format's Q/K and packed scales (see ``indexer_fwd_compress_topk``).
@@ -917,7 +966,7 @@ def _run_compress_gemm_varlen(
     device = q.device
     total_q, n_heads_q, head_dim = q.shape
     head_dim = logical_head_dim(precision, head_dim)
-    n_heads_kv = k.shape[1]
+    n_heads_kv = k.shape[-2]
     bs = cu_seqlens_q.numel() - 1
     if cand_batch_offsets is None:
         offsets = _compress_cand_batch_offsets(cu_seqlens_q, cu_seqlens_k, ratio, q_causal_offsets)
@@ -1055,9 +1104,10 @@ def _run_compress_gemm_varlen(
         unified_kv_stage,
         float(sm_scale),
         int(max_seqlen_q),
-        int(max_seqlen_k),
+        None if page_size else int(max_seqlen_k),  # paged: a runtime bound, not a layout parameter
         q_causal_offsets is not None,
         bool(want_lse),
+        page_size,
     )
     if compile_key not in _compile_cache:
         q_cute = _to_cute_tensor(q)
@@ -1066,9 +1116,11 @@ def _run_compress_gemm_varlen(
         cand_cute = _make_i64_cand_buffer_compile_tensor()
         denom_cute = _to_cute_tensor(denom_tmp) if denom_tmp is not None else None
         cu_q_cute = _to_cute_tensor(cu_seqlens_q, leading_dim=0)
-        cu_k_cute = _to_cute_tensor(cu_seqlens_k, leading_dim=0)
+        cu_k_cute = _to_cute_tensor(cu_seqlens_k, leading_dim=0) if cu_seqlens_k is not None else None
         offs_cute = _to_cute_tensor(offsets, leading_dim=0)
         qco_cute = _to_cute_tensor(q_causal_offsets, leading_dim=0) if q_causal_offsets is not None else None
+        bt_cute = _to_cute_tensor(block_table, assumed_align=4, leading_dim=1) if page_size else None
+        kvl_cute = _to_cute_tensor(kv_lens, assumed_align=4, leading_dim=0) if page_size else None
         stream = resolve_stream(None)
         kernel_obj = IndexerScoreUnifiedSm100(
             head_dim=head_dim,
@@ -1081,6 +1133,7 @@ def _run_compress_gemm_varlen(
             is_varlen=True,
             compute_lse=want_lse,
             is_compressed_logits=True,
+            page_size=page_size,
         )
         _compile_cache[compile_key] = cute.compile(
             kernel_obj,
@@ -1097,6 +1150,8 @@ def _run_compress_gemm_varlen(
             qco_cute,
             stream,
             offs_cute,
+            bt_cute,
+            kvl_cute,
             options=compile_options(),
         )
     stream = resolve_stream(None)
@@ -1115,6 +1170,8 @@ def _run_compress_gemm_varlen(
             q_causal_offsets,
             stream,
             offsets,
+            block_table,
+            kv_lens,
         )
     return cand, offsets
 
@@ -1127,7 +1184,7 @@ def _indexer_fwd_compress_topk_thd(
     ratio: int,
     qhead_per_kv_head: Optional[int],
     cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
+    cu_seqlens_k: Optional[torch.Tensor],
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
     m_block_size: int = 128,
@@ -1153,8 +1210,14 @@ def _indexer_fwd_compress_topk_thd(
     return_lse: bool = False,
     lse_out: Optional[torch.Tensor] = None,
     deterministic: bool = False,
+    block_table: Optional[torch.Tensor] = None,
+    kv_lens: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, ...]:
     """THD/varlen compressed-logits top-k, supporting BF16, MXFP8, and MXFP4.
+
+    ``block_table`` ((bs, max_pages) int32) + ``kv_lens`` ((bs,) int32) read K from a
+    page pool ``(num_pages, page_size, 1, head_dim)`` (BF16, local ids); ``cu_seqlens_k``
+    is then ``None`` and ``max_seqlen_k`` defaults to ``max_pages * page_size``.
 
     A block-scaled ``precision`` runs the blockscaled logits GEMM with
     blockscaled-packed E8M0 scales: for ``'mxfp8'``, ``q``/``k`` are
@@ -1213,14 +1276,15 @@ def _indexer_fwd_compress_topk_thd(
     # The THD scale contract (regions concatenated along MN, addressed by the padded
     # prefixes, L = KV head only) is validated below once bs/head metadata is known.
     validate_sf_vec_size(precision, sf_vec_size)
-    if q.ndim != 3 or k.ndim != 3 or w.ndim != 2:
-        raise ValueError("THD compressed-logits top-k expects q (T_q,H,D), k (T_k,Hkv,D), w (T_q,H)")
+    paged = _check_paged_args(block_table, kv_lens)
+    if q.ndim != 3 or k.ndim != (4 if paged else 3) or w.ndim != 2:
+        raise ValueError("THD compressed-logits top-k expects q (T_q,H,D), k (T_k,Hkv,D) or a page pool (num_pages,page,Hkv,D), w (T_q,H)")
     device = q.device
     total_q, n_heads_q, head_dim = q.shape
     # Shape / dtype / device consistency: reject malformed inputs here rather than
     # a kernel OOB / cryptic failure.
-    if k.shape[2] != head_dim:
-        raise ValueError(f"q last dim ({head_dim}) != k last dim ({k.shape[2]})")
+    if k.shape[-1] != head_dim:
+        raise ValueError(f"q last dim ({head_dim}) != k last dim ({k.shape[-1]})")
     if tuple(w.shape) != (total_q, n_heads_q):
         raise ValueError(f"w shape must be (total_q={total_q}, n_heads_q={n_heads_q}), " f"got {tuple(w.shape)}")
     if k.device != device or w.device != device:
@@ -1237,27 +1301,40 @@ def _indexer_fwd_compress_topk_thd(
     # cu_seqlens are consumed directly by the kernel: enforce the same int32 /
     # contiguous / same-device contract as the dense THD path (avoids a silent
     # .to() copy or a wrong-device kernel arg).
+    if cu_seqlens_k is None and not paged:
+        raise ValueError("THD compressed-logits top-k requires cu_seqlens_k (or block_table + kv_lens for paged K)")
     for t, name in ((cu_seqlens_q, "cu_seqlens_q"), (cu_seqlens_k, "cu_seqlens_k")):
-        if not t.is_cuda or t.ndim != 1 or t.dtype != torch.int32 or t.stride(0) != 1 or t.device != device:
+        if t is not None and (not t.is_cuda or t.ndim != 1 or t.dtype != torch.int32 or t.stride(0) != 1 or t.device != device):
             raise ValueError(f"{name} must be a contiguous 1D int32 CUDA tensor on the input device")
 
     bs = cu_seqlens_q.numel() - 1
-    if bs <= 0 or cu_seqlens_k.numel() != bs + 1:
+    if bs <= 0 or (cu_seqlens_k is not None and cu_seqlens_k.numel() != bs + 1):
         raise ValueError("cu_seqlens_q and cu_seqlens_k must have matching bs + 1 length")
+    n_heads_kv = int(k.shape[-2])
     # qhead_per_kv_head (GQA group size) contract: a
     # wrong head mapping corrupts head-reduce / tile mapping, so n_heads_q must be
     # divisible by n_heads_kv and an explicit value must equal the derived ratio.
-    if n_heads_q % k.shape[1] != 0:
-        raise ValueError(f"n_heads_q ({n_heads_q}) must be divisible by n_heads_kv ({k.shape[1]})")
+    if n_heads_q % n_heads_kv != 0:
+        raise ValueError(f"n_heads_q ({n_heads_q}) must be divisible by n_heads_kv ({n_heads_kv})")
     if qhead_per_kv_head is None:
-        qhead_per_kv_head = n_heads_q // k.shape[1]
-    elif qhead_per_kv_head != n_heads_q // k.shape[1]:
-        raise ValueError(f"qhead_per_kv_head ({qhead_per_kv_head}) must equal n_heads_q // " f"n_heads_kv ({n_heads_q // k.shape[1]})")
+        qhead_per_kv_head = n_heads_q // n_heads_kv
+    elif qhead_per_kv_head != n_heads_q // n_heads_kv:
+        raise ValueError(f"qhead_per_kv_head ({qhead_per_kv_head}) must equal n_heads_q // " f"n_heads_kv ({n_heads_q // n_heads_kv})")
     _validate_indexer_qhead_per_kv_head(qhead_per_kv_head, precision)
-    if k.shape[1] != 1:
+    if n_heads_kv != 1:
         raise ValueError(
-            "THD compress-logits top-k currently requires n_heads_kv=1 (MQA); " f"got n_heads_kv={k.shape[1]}. The stage-1 GEMM reads only KV head 0."
+            "THD compress-logits top-k currently requires n_heads_kv=1 (MQA); " f"got n_heads_kv={n_heads_kv}. The stage-1 GEMM reads only KV head 0."
         )
+    if paged:
+        if precision != "bf16":
+            raise NotImplementedError("paged K is served by the BF16 indexer only")
+        if topk_indices_global:
+            raise NotImplementedError("paged K returns local key ids only; pass topk_indices_global=False")
+        page_size, max_pages = _resolve_paged_k(k, block_table, kv_lens, cu_seqlens_k, n_block_size=n_block_size, batch=int(bs), device=device)
+        if max_seqlen_k is None:
+            max_seqlen_k = max_pages * page_size
+    else:
+        page_size = 0
     if is_block_scaled:
         validate_thd_scale_contract(
             q_scale,
@@ -1266,7 +1343,7 @@ def _indexer_fwd_compress_topk_thd(
             cu_seqlens_k_scale_padded,
             precision=precision,
             bs=bs,
-            n_heads_kv=k.shape[1],
+            n_heads_kv=n_heads_kv,
             sf_groups=_ceil_div(head_dim, sf_vec_size),
             device=device,
         )
@@ -1275,7 +1352,7 @@ def _indexer_fwd_compress_topk_thd(
     if m_block_size % qhead_per_kv_head != 0:
         raise ValueError(f"m_block_size ({m_block_size}) must be divisible by " f"qhead_per_kv_head ({qhead_per_kv_head})")
     cu_q32 = cu_seqlens_q.to(torch.int32)
-    cu_k32 = cu_seqlens_k.to(torch.int32)
+    cu_k32 = cu_seqlens_k.to(torch.int32) if cu_seqlens_k is not None else None
     capturing = torch.cuda.is_current_stream_capturing()
     # Deriving max_seqlen from cu_seqlens needs a .max().item() host sync, which is
     # ILLEGAL during CUDA-graph capture.  Graph contract: the caller MUST pass
@@ -1406,6 +1483,9 @@ def _indexer_fwd_compress_topk_thd(
         sf_vec_size=sf_vec_size,
         want_lse=want_lse,
         lse_out=lse_buf,
+        page_size=page_size,
+        block_table=block_table,
+        kv_lens=kv_lens,
     )
     # Stage 2: single launch over all total_q query tokens (writes the caller's
     # out_indices/out_logits in place when provided).
@@ -1429,6 +1509,7 @@ def _indexer_fwd_compress_topk_thd(
             out_softmax=softmax_out,
             return_softmax=want_softmax,
             deterministic=deterministic,
+            kv_lens=kv_lens,
         )
     if want_softmax:
         idx_out, val_out, sm_out = stage2_out
