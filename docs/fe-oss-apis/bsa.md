@@ -27,11 +27,13 @@ BSA is implemented with Python CuTe DSL/JIT kernels.
 
 ## Installation
 
-The CuTe DSL runtime is a required dependency, so the base install is enough:
+Except on Windows ARM64, the CuTe DSL runtime is a required dependency, so the base install is enough:
 
 ```bash
 pip install nvidia-cudnn-frontend
 ```
+
+Windows ARM64 is excluded from the CuTe DSL and TVM-FFI runtime dependencies because neither ships packages for that platform; the base install does not enable BSA there.
 
 The package-wide `nvidia-cutlass-dsl[cu13]>=4.8.0` dependency floor applies to
 BSA. Sage FP8 relies on functionality introduced in CuTe DSL 4.6.1, which the
