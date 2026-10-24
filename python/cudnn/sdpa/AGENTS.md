@@ -263,6 +263,18 @@ other-arch lowerings are smoke-compiled from whatever GPU you have.**
   closure needs into a local before the `def` (`o_ptr = o.iterator.raw_ptr()`,
   `sfo_base_ptr`) and let the closure add offsets only.
 
+A cold compile can spend its deadline in Python AST preprocessing before any
+GPU launch. CuTeDSL's Boolean rewrite can reuse the preceding expression
+multiple times per operand; a long flat `and`/`or` chain then expands
+exponentially for recursive AST visitors. Group a long constexpr predicate
+into short parenthesized clauses while preserving operand and short-circuit
+order. Do not remove alignment checks or raise the timeout to hide this cost.
+Detector: capture the child's stack during cold artifact compilation; if it
+lands in `ast.fix_missing_locations`, inspect the transformed AST's recursive
+visit count, not just its unique-node count. Retain fresh-process compile,
+artifact reload, and the affected kernel's numerical/layout checks; a cache
+hit alone bypasses the problematic preprocessing.
+
 **Rule S7 — Promote indices before stride multiplication when the addressed
 span needs Int64.**
 
