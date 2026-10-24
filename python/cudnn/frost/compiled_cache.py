@@ -372,15 +372,26 @@ def _wrapper_spec_of(compiled: Any, args: tuple, kwargs: Dict[str, Any]) -> Opti
     So the spec is taken the way the DSL takes it: ``execution_args`` names the
     parameters and their defaults; the in-process wrapper's own signature says
     which of them survived. None when it cannot be reproduced exactly -- no
-    wrapper, a default that JSON cannot carry, a dataclass argument (the DSL
-    unpacks those through a hook the record does not describe).
+    wrapper, a default that JSON cannot carry, or a runtime dataclass argument
+    (the DSL unpacks those through a hook the record does not describe).
+    A constexpr dataclass is absent from the runtime signature and needs no
+    conversion when the artifact is reloaded.
     """
     wrapper = getattr(compiled, "_kwargs_wrapper", None)
     execution_args = getattr(compiled, "execution_args", None)
     if wrapper is None or execution_args is None or not hasattr(execution_args, "get_kwargs_wrapper_spec"):
         return None
     if any(dataclasses.is_dataclass(a) and not isinstance(a, type) for a in list(args) + list(kwargs.values())):
-        return None
+        try:
+            # Let the DSL remove its own constexpr arguments. Guessing from
+            # annotations or positional offsets can silently shift the ABI.
+            signature = execution_args.original_signature
+            function_kwargs = {name: value for name, value in kwargs.items() if name in signature.parameters}
+            runtime_args = execution_args.get_rectified_args_from_original_args(args, function_kwargs)
+        except Exception:  # noqa: BLE001 -- older executors cannot establish this contract
+            return None
+        if any(dataclasses.is_dataclass(a) and not isinstance(a, type) for a in runtime_args):
+            return None
     try:
         survived = set(inspect.signature(wrapper).parameters)
         full = execution_args.get_kwargs_wrapper_spec(())
