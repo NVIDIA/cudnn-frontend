@@ -100,6 +100,7 @@ def _thd_graph(
     stats_head_stride=0,
     has_sink=False,
     stats_log2=False,
+    padded_stats=False,
 ):
     """A THD bf16 graph the way FlashInfer declares it: BHSD dims with ragged offsets, cu_seq_len
     lengths, token-major Stats. ``ragged_batch_stride`` mimics FlashInfer's small declared batch
@@ -142,7 +143,11 @@ def _thd_graph(
         max_total_seq_len_kv=b * kl,
     )
     to.set_output(True).set_dim([b, hq, ql, d]).set_stride([q_bs, d, hq * d, 1]).set_ragged_offset(off_q)
-    ts.set_output(True).set_dim([b, hq, ql, 1]).set_stride([ql * hq, 1, hq, 1]).set_data_type(cudnn.data_type.FLOAT).set_ragged_offset(off_lse)
+    ts.set_output(True).set_dim([b, hq, ql, 1]).set_stride([ql * hq, 1, hq, 1]).set_data_type(cudnn.data_type.FLOAT)
+    if padded_stats:
+        ts.set_stride([hq * ql, ql, 1, 1])
+    else:
+        ts.set_ragged_offset(off_lse)
     if stats_head_stride:
         ts.set_stride([hq * stats_head_stride, stats_head_stride, 1, 1])
     g.validate()
@@ -264,30 +269,67 @@ def test_thd_f16_plan_is_prepared_and_binds_the_variant_pack():
 @requires_blackwell
 @requires_dsl
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("head_major", [False, True])
+@pytest.mark.parametrize("stats_layout", ["token", "head", "padded"])
 @pytest.mark.parametrize("stats_log2", [False, True])
-@pytest.mark.parametrize("geometry", ["mixed", "single_large"])
-def test_rubin_ragged_pack_rebind_and_changed_lengths_replay(dtype, head_major, stats_log2, geometry):
+@pytest.mark.parametrize("geometry", ["mixed", "partial12", "single_large", "single_unpacked", "two_wave_pair"])
+def test_rubin_ragged_pack_rebind_and_changed_lengths_replay(dtype, stats_layout, stats_log2, geometry):
     """An explicit packed plan binds fresh storage and reads changed device prefixes on old captures."""
+    import inspect
+
     if torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("Rubin ragged packing qualification")
-    b, ql, kl, hq, hk, d = (3, 257, 1025, 12, 2, 128) if geometry == "mixed" else (1, 2048, 2305, 32, 8, 128)
+    b, ql, kl, hq, hk, d = {
+        "mixed": (3, 257, 1025, 12, 2, 128),
+        "partial12": (3, 257, 1025, 24, 2, 128),
+        "single_large": (1, 4096, 4609, 32, 8, 128),
+        "single_unpacked": (1, 4096, 4609, 32, 8, 128),
+        "two_wave_pair": (2, 2048, 2305, 16, 4, 128),
+    }[geometry]
+    padded = stats_layout == "padded"
+    head_major = stats_layout == "head"
     cap = b * ql
     dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
-    g, t = _thd_graph(b, ql, kl, hq, hk, d, dtype=dt, arch="sm107", stats_head_stride=cap if head_major else 0, stats_log2=stats_log2)
+    g, t = _thd_graph(
+        b, ql, kl, hq, hk, d, dtype=dt, arch="sm107", stats_head_stride=cap if head_major else 0, stats_log2=stats_log2, padded_stats=padded, has_sink=padded
+    )
     engine, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
-    knobs.update({cudnn.knob_type.PACK_GQA: 1, cudnn.knob_type.TILE_CGA_M: 2, cudnn.knob_type.SPLIT_KV: 1, cudnn.knob_type.SCHED_POLICY: 1})
+    knobs.update(
+        {
+            cudnn.knob_type.PACK_GQA: int(geometry != "single_unpacked"),
+            cudnn.knob_type.TILE_CGA_M: 2,
+            cudnn.knob_type.SPLIT_KV: 1,
+            cudnn.knob_type.SCHED_POLICY: 1,
+        }
+    )
     g.create_execution_plan(engine, knobs)
     g.select_plan(g.get_execution_plan_count() - 1)
     g.check_support()
     g.build_plans()
+    api = inspect.getclosurevars(_plan(g)._compiled.default_stream).nonlocals["api"]
+    assert api._k_mod.__file__.endswith("sm107/prefill_d128_f16.py")
+    assert api._k_mod.THD_PERSISTENT
+    assert api._k_mod.THD_INITIAL_WAVES == 2
+    resident = max(1, torch.cuda.get_device_properties(DEV).multi_processor_count // api._k_mod.CGA_SIZE)
+    assert api._thd_plan().units <= 2 * resident
+    if geometry == "two_wave_pair" and resident < 128 <= 2 * resident:
+        assert api._thd_plan().units == 128
     ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
 
     def inputs(seed):
         bufs = _buffers(b, ql, kl, hq, hk, d, seed=seed, dtype=dtype)
-        if head_major:
+        if padded:
+            bufs["lse"] = torch.empty(b, hq, ql, device=DEV)
+            bufs["sink"] = torch.linspace(-2.0, 6.0, hq, device=DEV)
+        elif head_major:
             bufs["lse"] = torch.empty(hq, cap, device=DEV)
         return bufs
+
+    def bindings(bufs):
+        pack = _pack(t, bufs)
+        if padded:
+            pack.pop(t["off_lse"])
+            pack[t["sink"]] = bufs["sink"]
+        return pack
 
     def lengths(bufs, qs, ks):
         cq, ck = [0, *accumulate(qs)], [0, *accumulate(ks)]
@@ -311,6 +353,8 @@ def test_rubin_ragged_pack_rebind_and_changed_lengths_replay(dtype, head_major, 
         lse = bufs["lse"].T if head_major else bufs["lse"]
         for i in range(b):
             lo, hi, klo, khi = cq[i], cq[i + 1], ck[i], ck[i + 1]
+            if padded:
+                assert torch.isneginf(lse[i, :, hi - lo :]).all()
             if lo == hi:
                 continue
             q = bufs["q"][lo:hi].transpose(0, 1).double()
@@ -319,35 +363,39 @@ def test_rubin_ragged_pack_rebind_and_changed_lengths_replay(dtype, head_major, 
             score = q @ k.transpose(1, 2) / math.sqrt(d)
             mask = torch.arange(khi - klo, device=DEV)[None, :] > torch.arange(hi - lo, device=DEV)[:, None]
             score.masked_fill_(mask, -torch.inf)
-            out = (torch.nan_to_num(score.softmax(-1), nan=0.0) @ v).transpose(0, 1)
+            if padded:
+                score = torch.cat((score, bufs["sink"].double()[:, None, None].expand(hq, hi - lo, 1)), dim=-1)
+            out = (torch.nan_to_num(score.softmax(-1), nan=0.0)[..., : khi - klo] @ v).transpose(0, 1)
             torch.testing.assert_close(bufs["o"][lo:hi].double(), out, atol=4e-3, rtol=4e-3)
             expected_lse = score.logsumexp(-1).T * (math.log2(math.e) if stats_log2 else 1)
-            torch.testing.assert_close(lse[lo:hi].double(), expected_lse, atol=4e-4, rtol=0)
+            live_lse = lse[i, :, : hi - lo].T if padded else lse[lo:hi]
+            torch.testing.assert_close(live_lse.double(), expected_lse, atol=4e-4, rtol=0)
         assert torch.all(bufs["o"][cq[-1] :] == 19)
-        assert torch.all(lse[cq[-1] :] == 19)
+        if not padded:
+            assert torch.all(lse[cq[-1] :] == 19)
 
     a, fresh = inputs(1907), inputs(1908)
-    qa, ka = lengths(a, [257, 0, 73] if b == 3 else [2048], [1025, 0, 117] if b == 3 else [2305])
-    qf, kf = lengths(fresh, [17, 129, 0] if b == 3 else [513], [65, 513, 0] if b == 3 else [1025])
+    qa, ka = lengths(a, {3: [257, 0, 73], 2: [2048, 257], 1: [2048]}[b], {3: [1025, 0, 117], 2: [2305, 1025], 1: [2305]}[b])
+    qf, kf = lengths(fresh, {3: [17, 129, 0], 2: [513, 17], 1: [513]}[b], {3: [65, 513, 0], 2: [1025, 65], 1: [1025]}[b])
     poison(a)
-    g.execute(_pack(t, a), ws)
+    g.execute(bindings(a), ws)
     check(a, qa, ka)
     capture = torch.cuda.CUDAGraph()
     try:
         with torch.cuda.graph(capture):
-            g.execute(_pack(t, a), ws)
+            g.execute(bindings(a), ws)
         poison(fresh)
         previous = torch.cuda.get_sync_debug_mode()
         torch.cuda.set_sync_debug_mode("error")
         try:
-            g.execute(_pack(t, fresh), ws)
+            g.execute(bindings(fresh), ws)
         finally:
             torch.cuda.set_sync_debug_mode(previous)
         check(fresh, qf, kf)
         # Rebinding another call must not retarget the old capture. Mutate its own data and prefixes.
         a["q"].mul_(0.5)
         a["v"].mul_(0.75)
-        qa, ka = lengths(a, [31, 7, 0] if b == 3 else [31], [40, 19, 0] if b == 3 else [40])
+        qa, ka = lengths(a, {3: [31, 7, 0], 2: [31, 0], 1: [31]}[b], {3: [40, 19, 0], 2: [40, 0], 1: [40]}[b])
         poison(a)
         ws.fill_(255)
         capture.replay()
@@ -1879,6 +1927,10 @@ def test_thd_cache_shape_grid_tracks_runtime_capacity(d, arch, backend_lowering,
     """One large cache-shape artifact, small changing batches and captured device lengths."""
     if torch.cuda.get_device_capability() == (10, 7):
         pytest.skip("SM107 overlaunch admission is qualified separately")
+    _check_thd_cache_shape_grid(d, arch, backend_lowering, monkeypatch)
+
+
+def _check_thd_cache_shape_grid(d, arch, backend_lowering, monkeypatch, *, native_packed=None, native_heads=(16, 4), native_workloads=None):
     if not backend_lowering:
 
         def decline(self):
@@ -1886,12 +1938,24 @@ def test_thd_cache_shape_grid_tracks_runtime_capacity(d, arch, backend_lowering,
 
         monkeypatch.setattr(cudnn.pygraph, "_backend_lowerable", lambda self: False)
         monkeypatch.setattr(cudnn.pygraph, "_lower_backend_graph", decline)
-    hq, hk = 4, 2
+    hq, hk = (4, 2) if native_packed is None else native_heads
     g, t = _thd_graph(4096, 65536, 65536, hq, hk, d, override_enabled=True, arch=arch)
     if not backend_lowering:
         assert g._lowered_graph is None
+    if native_packed is not None:
+        engine, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
+        knobs.update({cudnn.knob_type.PACK_GQA: int(native_packed), cudnn.knob_type.TILE_CGA_M: 2, cudnn.knob_type.SPLIT_KV: 1})
+        g.create_execution_plan(engine, knobs)
+        g.select_plan(g.get_execution_plan_count() - 1)
+        g.check_support()
+        g.build_plans()
     plan = _plan(g)
     spec = plan._prepared.spec
+    if native_packed is not None:
+        token_rows, tile_heads, limit = spec.wave_geometry
+        _, resident, waves = spec.wave_policy
+        assert token_rows * hq == spec.cga_tile_m * tile_heads
+        assert resident <= limit <= resident * waves
     template = list(spec.template)
     rec = _Recorder(spec)
     ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
@@ -1919,7 +1983,12 @@ def test_thd_cache_shape_grid_tracks_runtime_capacity(d, arch, backend_lowering,
 
     captured = None
     try:
-        for qlens in ([517], [1, 3, 0, 513], [517]):
+        workloads = ([517], [1, 3, 0, 513], [517])
+        if native_packed is not None:
+            workloads = ([2048, 2048], [4097, 4097], [1, 3, 0, 513], [2048, 2048])
+            if native_workloads is not None:
+                workloads = native_workloads
+        for qlens in workloads:
             b, total = len(qlens), sum(qlens)
             klens = [n + 17 for n in qlens]
             bufs = {
@@ -1962,7 +2031,18 @@ def test_thd_cache_shape_grid_tracks_runtime_capacity(d, arch, backend_lowering,
                 with torch.cuda.graph(captured):
                     run()
             bound = ((total - 1) // spec.cga_tile_m + b) * hq
-            assert rec.frames[-1]["n_thd_units"] <= bound
+            if native_packed is not None:
+                envelope, resident, waves = spec.wave_policy
+                geometry = getattr(spec, "wave_geometry", None)
+                limit = resident * waves
+                if geometry is not None:
+                    token_rows, tile_heads, limit = geometry
+                    bound = ((total - 1) // token_rows + b) * tile_heads
+                bound = min(envelope, bound)
+                expected = bound if bound <= limit else resident
+                assert rec.frames[-1]["n_thd_units"] == expected
+            else:
+                assert rec.frames[-1]["n_thd_units"] <= bound
             assert spec.template == template
             for lengths in (qlens, ([129, 129, 129, 130] if b == 4 else qlens)):
                 kv_lengths = [n + 17 for n in lengths]
