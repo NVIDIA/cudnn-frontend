@@ -46,6 +46,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     supports_paged_prefill_cga1,
     supports_paged_d256_pack_gqa,
     supports_nonpaged_d128_thd_prefill,
+    supports_paged_d128_partial_pack_gqa,
     supports_nonpaged_d128_thd_pack_gqa,
     supports_thd_split,
     supports_scalar_kv_tail_split,
@@ -1657,14 +1658,26 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 _pg_tile_m = max(m for m, _ in _sm120_tile_domain(facts.d_qk, facts.d_v, facts.is_fp8 or facts.is_mxfp8))
             else:
                 _pg_tile_m = max(capabilities.tile_ms)
-            _partial = pack_gqa_partial(capabilities, facts) or ragged_pack
-            _partial = _partial or _config_sm107.supports_native_d128_dense_partial_pack(
-                _selected_d_shape(capabilities, facts, knobs),
-                device_cc=facts.device_cc,
-                fp8=facts.is_fp8 or facts.is_mxfp8,
-                thd=facts.thd,
-                paged=facts.has_paged_kv,
-                cga=knobs.cga,
+            _partial = (
+                pack_gqa_partial(capabilities, facts)
+                or ragged_pack
+                or supports_paged_d128_partial_pack_gqa(
+                    (facts.d_qk, facts.d_v),
+                    device_cc=facts.device_cc,
+                    fp8=facts.is_fp8 or facts.is_mxfp8,
+                    thd=facts.thd,
+                    paged=facts.has_paged_kv,
+                    cga=knobs.cga,
+                    split_kv=knobs.split_kv or 1,
+                )
+                or _config_sm107.supports_native_d128_dense_partial_pack(
+                    _selected_d_shape(capabilities, facts, knobs),
+                    device_cc=facts.device_cc,
+                    fp8=facts.is_fp8 or facts.is_mxfp8,
+                    thd=facts.thd,
+                    paged=facts.has_paged_kv,
+                    cga=knobs.cga,
+                )
             )
             # The decode tile packs the WHOLE group into its 16-row Q tile whatever tile_m (24/2: 12 live
             # rows + 4 zero tail rows), so the prefill tiles' divisibility rule does not apply to a Rubin

@@ -1898,6 +1898,48 @@ def _store_o_tile_direct(
 
 
 @cute.jit
+def _store_fp32_partial_pairs(
+    o, tmem_base, offset, inv_sum, row_dead, row_live, batch, row, head, tile_o: cutlass.Constexpr[int], chunk: cutlass.Constexpr[int]
+):
+    # Pair adjacent TMEM rows: the even lane writes columns 0:4 and the odd
+    # lane writes 4:8 of each row. Together their 16-byte stores fill a
+    # 32-byte sector without shared scratch or an additional handoff.
+    lane = cute.arch.thread_idx()[0] % cutlass.Int32(32)
+    odd = (lane & cutlass.Int32(1)) != cutlass.Int32(0)
+    partner = lane ^ cutlass.Int32(1)
+    other_row = nvvm.shfl_sync(0xFFFFFFFF, row, partner, 31, kind=nvvm.Shfl.IDX)
+    other_head = nvvm.shfl_sync(0xFFFFFFFF, head, partner, 31, kind=nvvm.Shfl.IDX)
+    live_i = cutlass.Int32(arith.select(row_live.ir_value(), cutlass.Int32(1).ir_value(), cutlass.Int32(0).ir_value()))
+    other_live = nvvm.shfl_sync(0xFFFFFFFF, live_i, partner, 31, kind=nvvm.Shfl.IDX)
+    row0 = cutlass.Int32(arith.select(odd.ir_value(), other_row.ir_value(), row.ir_value()))
+    row1 = cutlass.Int32(arith.select(odd.ir_value(), row.ir_value(), other_row.ir_value()))
+    head0 = cutlass.Int32(arith.select(odd.ir_value(), other_head.ir_value(), head.ir_value()))
+    head1 = cutlass.Int32(arith.select(odd.ir_value(), head.ir_value(), other_head.ir_value()))
+    live0 = cutlass.Int32(arith.select(odd.ir_value(), other_live.ir_value(), live_i.ir_value()))
+    live1 = cutlass.Int32(arith.select(odd.ir_value(), live_i.ir_value(), other_live.ir_value()))
+    op = cutlass.make_array_view(o)
+    for blk in cutlass.range_constexpr(tile_o // chunk):
+        vals = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(tmem_base + cutlass.Int32(offset + blk * chunk), cutlass.Float32), num=chunk)
+        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+        scaled = vals * inv_sum
+        for group in cutlass.range_constexpr(chunk // 8):
+            lo = [cutlass.Float32(arith.select(row_dead.ir_value(), cutlass.Float32(0.0).ir_value(), scaled[group * 8 + j].ir_value())) for j in range(4)]
+            hi = [cutlass.Float32(arith.select(row_dead.ir_value(), cutlass.Float32(0.0).ir_value(), scaled[group * 8 + 4 + j].ir_value())) for j in range(4)]
+            # Each lane sends only the half that its partner will write.
+            send = [cutlass.Float32(arith.select(odd.ir_value(), a.ir_value(), b.ir_value())) for a, b in zip(lo, hi)]
+            received = [nvvm.shfl_sync(0xFFFFFFFF, x, partner, 31, kind=nvvm.Shfl.IDX) for x in send]
+            first = [cutlass.Float32(arith.select(odd.ir_value(), b.ir_value(), a.ir_value())) for a, b in zip(lo, received)]
+            second = [cutlass.Float32(arith.select(odd.ir_value(), b.ir_value(), a.ir_value())) for a, b in zip(received, hi)]
+            col = cutlass.Int32(blk * chunk + group * 8) + (lane & cutlass.Int32(1)) * cutlass.Int32(4)
+            if live0 != cutlass.Int32(0):
+                ptr = op.data_ptr((batch, row0, head0, 0)).toint(cutlass.Int64)
+                st_global_v4(ptr + cutlass.Int64(col) * cutlass.Int64(4), first, cutlass.Float32)
+            if live1 != cutlass.Int32(0):
+                ptr = op.data_ptr((batch, row1, head1, 0)).toint(cutlass.Int64)
+                st_global_v4(ptr + cutlass.Int64(col) * cutlass.Int64(4), second, cutlass.Float32)
+
+
+@cute.jit
 def _quad_stage_and_merge_stats(sMerge, quad_buf, tid_in_wg, tmem_base, m_w, l_w, bars, bounds, lane_live):
     """Quadrant softmax (QUAD), the correction warps' first half of a unit's epilogue.  Every lane stages its (max, sum) and its O row -- this quadrant's
     partial over its own keys -- in SMEM, hands the TMEM accumulators back to the softmax (``mb_o_empty``: the next unit's first PV overwrites them), and once
@@ -2299,20 +2341,30 @@ def _correction_warp_group(
                 partial_batch = split_idx
                 partial_row = partial_q_base + q_row_global
                 partial_live = q_row_global < partial_q_len
-            _store_fp32_partial_tile(
-                o_partial_f32,
-                tmem_base_epi,
-                LAYOUT.O0_OFF,
-                inv_sum,
-                row_dead,
-                partial_live,
-                partial_batch,
-                partial_row,
-                row_head_idx,
-                CFG.TILE_O,
-                O_CHUNK,
-                load_group=4 if CFG.TILE_O <= 64 else 1,
-            )
+            _pair_ok = cutlass.Int32(0) > cutlass.Int32(1)
+            if cutlass.const_expr(
+                CFG.THD_VARLEN and CFG.TILE_K == 128 and CFG.TILE_O == 128 and o_partial_f32.shape[3] == 128 and o_partial_f32.stride[3] == 1
+            ):
+                _pair_ok = (o_partial_f32.iterator.toint() & cutlass.Int64(15)) == cutlass.Int64(0)
+            if _pair_ok:
+                _store_fp32_partial_pairs(
+                    o_partial_f32, tmem_base_epi, LAYOUT.O0_OFF, inv_sum, row_dead, partial_live, partial_batch, partial_row, row_head_idx, CFG.TILE_O, O_CHUNK
+                )
+            else:
+                _store_fp32_partial_tile(
+                    o_partial_f32,
+                    tmem_base_epi,
+                    LAYOUT.O0_OFF,
+                    inv_sum,
+                    row_dead,
+                    partial_live,
+                    partial_batch,
+                    partial_row,
+                    row_head_idx,
+                    CFG.TILE_O,
+                    O_CHUNK,
+                    load_group=4 if CFG.TILE_O <= 64 else 1,
+                )
             if cutlass.const_expr(not EARLY_Q):
                 bars.mb_o_empty[0].wait(o_empty_phase)
         elif cutlass.const_expr(DIRECT_O):

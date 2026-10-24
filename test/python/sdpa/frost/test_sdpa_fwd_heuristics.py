@@ -2216,3 +2216,45 @@ def test_explicit_paged_prefill_cga1_domain_and_tile_geometry(dtype, s_q, cc):
     else:
         assert reason is not None
     assert _pack_gqa_tile_q(caps, facts, 128, cga=1, split_kv=2) == 128
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "b, h_q, h_kv, s_q, s_kv, causal",
+    [
+        (8, 8, 1, 576, 13568, True),  # past one 512-row Q tile
+        (8, 8, 1, 640, 13568, False),
+        (4, 32, 4, 768, 13568, True),
+        (1, 64, 8, 2048, 2048, True),
+        (8, 16, 16, 576, 8192, True),  # MHA: nothing to pack
+    ],
+)
+def test_sm107_fp8_d128_proposes_admissible_pack_sets(sm107_metadata_target, b, h_q, h_kv, s_q, s_kv, causal):
+    """Rubin per-tensor FP8 dense d128 past one Q tile: GQA graphs list a packed set (admission, not which set wins), MHA
+    lists none, and every proposed set is admitted by mismatch()."""
+    facts = _facts(
+        b=b,
+        h_q=h_q,
+        h_kv=h_kv,
+        s_q=s_q,
+        s_kv=s_kv,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=cudnn.data_type.BFLOAT16,
+        is_fp8=True,
+        causal=causal,
+        bottom_right=causal,
+        device_cc=(10, 7),
+        device_sm_count=216,
+    )
+    plans = [p for p in recommend("A", facts, _RUBIN_OFFERED) if p.engine_id == _RUBIN_OFFERED[_RUBIN_FP8]]
+    assert plans
+    assert any(p.knobs.pack_gqa for p in plans) is (h_q != h_kv), [p.knobs for p in plans]
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_FP8)
+    assert all(engines.mismatch(spec.capabilities, facts, p.knobs) is None for p in plans)
+    import dataclasses
+
+    from cudnn.sdpa.fwd.heuristics import _sm107_fp8_dense_d128
+
+    assert _sm107_fp8_dense_d128(spec.capabilities, facts)
+    assert not _sm107_fp8_dense_d128(spec.capabilities, dataclasses.replace(facts, has_paged_kv=True, page_size=16))
+    assert not _sm107_fp8_dense_d128(spec.capabilities, dataclasses.replace(facts, padded=True))
