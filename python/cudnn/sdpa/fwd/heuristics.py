@@ -2676,6 +2676,9 @@ def _d128_thd_split_wave_choice(facts, *, extra_waves: int = 1) -> Tuple[int, bo
     return 1, False
 
 
+SM107_PAGED_PREFILL_SPLIT_WAVES = 2  # Rubin paged d128 split budget for s_q > 128, in waves of SMs
+
+
 def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
     """Measured bounded-graph (split count, packing); one keeps the existing plan.
 
@@ -2733,8 +2736,10 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
         units = _d128_thd_split_units(facts, group)
         if not units:
             continue
-        # Keep four KV tiles per partition to amortize setup/combine.
-        budget = min(16, max(1, sm_count // units), max(1, kv_tiles // 4))
+        # Keep four KV tiles per partition to amortize setup/combine. Past one Q tile the declared capacity
+        # overstates mixed-length units, so prefill chunks get a two-wave budget (PREFILL_HEURISTICS_COLLAB).
+        waves = SM107_PAGED_PREFILL_SPLIT_WAVES if min(facts.s_q, facts.max_total_seq_len_q or facts.s_q) > 128 else 1
+        budget = min(16, max(1, waves * sm_count // units), max(1, kv_tiles // 4))
         loop_tiles = _ceil_div(kv_tiles, budget)
         splits = _ceil_div(kv_tiles, loop_tiles)
         if splits > 1:

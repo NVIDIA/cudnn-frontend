@@ -2213,3 +2213,34 @@ def test_explicit_paged_prefill_cga1_domain_and_tile_geometry(dtype, s_q, cc):
     else:
         assert reason is not None
     assert _pack_gqa_tile_q(caps, facts, 128, cga=1, split_kv=2) == 128
+
+
+@pytest.mark.L0
+def test_sm107_paged_prefill_split_budget_spans_two_waves(sm107_metadata_target):
+    """Past one Q tile the Rubin paged split budget is two waves of SMs: a mixed-length chunk whose declared capacity fills
+    one wave still splits; at most one Q tile keeps the first-wave budget; far past two waves stays unsplit."""
+    from types import SimpleNamespace
+
+    from cudnn.sdpa.fwd.heuristics import paged_thd_split_choice
+
+    caps = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16).capabilities
+    base = dict(
+        b=3,
+        h_q=8,
+        h_kv=2,
+        s_q=864,
+        s_kv=16384,
+        dtype=cudnn.data_type.BFLOAT16,
+        causal=True,
+        bottom_right=True,
+        thd=True,
+        padded=True,
+        has_paged_kv=True,
+        page_size=16,
+        k_t=SimpleNamespace(get_stride=lambda: (8192, 4096, 256, 1)),
+        max_total_seq_len_q=3 * 864,
+        device_cc=(10, 7),
+        device_sm_count=216,
+    )
+    assert paged_thd_split_choice(caps, _facts(**base))[0] > 1
+    assert paged_thd_split_choice(caps, _facts(**dict(base, b=4, h_q=32, h_kv=8, s_q=751, s_kv=21650, max_total_seq_len_q=4 * 751)))[0] == 1

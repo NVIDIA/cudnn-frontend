@@ -783,3 +783,46 @@ def test_sm107_paged_d256_decode_tile_shard_stays_inside_its_measured_shape(outs
             placement.place(spec, _sm107_paged_d256_decode_facts(h_q=8, h_kv=1, b=64, k_t=_hnd_pool(1, 16))) == placement.LEAD
         )  # one KV head: one in-page order
         assert placement.place(spec, _sm107_paged_d256_decode_facts(h_q=8, h_kv=1, b=64, k_t=_nhd_pool(1, 16))) == placement.LEAD
+
+
+def _sm107_paged_facts(**over):
+    from types import SimpleNamespace
+
+    base = dict(
+        b=3,
+        h_q=8,
+        h_kv=2,
+        s_q=864,
+        s_kv=16384,
+        d_qk=128,
+        d_v=128,
+        dtype=cudnn.data_type.BFLOAT16,
+        causal=True,
+        bottom_right=True,
+        thd=True,
+        padded=True,
+        has_paged_kv=True,
+        page_size=16,
+        k_t=SimpleNamespace(get_stride=lambda: (8192, 4096, 256, 1)),
+        max_total_seq_len_q=3 * 864,
+        device_cc=(10, 7),
+        device_sm_count=216,
+    )
+    base.update(over)
+    return _facts(**base)
+
+
+@pytest.mark.L0
+def test_sm107_paged_gqa_prefill_leads_inside_its_box():
+    """Rubin paged bf16 d128 GQA 4/8 prefill chunks lead; MHA, group 2, short queries and out-of-box batches keep the backend."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    place = lambda **over: placement.place(spec, _sm107_paged_facts(**over))
+    assert place() == placement.LEAD
+    assert place(h_q=32, h_kv=8, b=4, s_q=751, s_kv=21650, max_total_seq_len_q=4 * 751) == placement.LEAD
+    assert place(h_q=64, h_kv=64, s_q=628, s_kv=28240) == placement.TRAIL
+    assert place(h_q=64, h_kv=32) == placement.TRAIL
+    assert place(b=placement.SM107_PAGED_GQA_MAX_B + 1, max_total_seq_len_q=5 * 864) == placement.TRAIL
+    assert place(dtype=cudnn.data_type.HALF) == placement.TRAIL
+    assert place(s_kv=65536) == placement.TRAIL

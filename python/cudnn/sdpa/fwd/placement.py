@@ -276,6 +276,17 @@ rule once:
   - hold-out 3 (100, fresh, after freezing; groups 1-16 incl. 3 / 5 / 6 / 12): 30 led at 0.15-0.97, no lead-loss
 Mean regret: fit 137.5 % -> 7.8 %, hold-out 3 78.4 % -> 23.4 %; led graphs on the grid 0.04-0.97.
 
+Rubin paged bf16 d128 GQA prefill chunks (2026-10-24, ``_sm107_paged_gqa_prefill``): LEAD for GQA 4 / 8 at b 1-4,
+128 < s_q <= 1024, S_kv 2k-32k, bottom-right causal, page 16, head-major in-page K. Evidence: mixed-length paged
+holdouts run through the FlashInfer paged prefill wrapper (actual per-request lengths, bounded and exact
+declarations, CUDA-graph replay of every offered candidate, both traversal orders, full FP64 O / LSE checks,
+cuDNN 9.27.0.42). On those graphs the backend default is engine 18, and the plan this rule selects ran faster on
+every led shape in both orders; MHA and group 2 kept the backend. The same data set ``paged_thd_split_choice``'s
+Rubin budget to two waves of SMs past one Q tile: the declared capacity (b * max_q rows) overstates mixed-length
+units, so a one-wave budget refused splits that measured faster. The development holdout tuned the rule; a fresh
+frozen 16-geometry holdout (Stats on and off) validated it with no newly selected slower route. Rubin timings are
+kept internal.
+
 Rows with no measurement (SM80, SM100 mxfp8) keep the historical order (LEAD); they are still
 opt-in, so the order is only observable with ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``.
 """
@@ -374,6 +385,7 @@ FP8_MIN_KV_TOKENS = 1024  # below, a single-wave launch is host-bound: FROST's ~
 FP8_D192_MAX_Q_TILES = 64  # d192 chunks: 16-64 tiles win 0.34-0.90; 128 tiles lose 1.19-1.72
 FP8_D128_ANY_TILES_MAX_S_Q = 128  # d128 chunks with s_q <= 128 win at 64-512 tiles (0.21-0.68)
 FP8_SYNTH_KV_MIN_TILE_KV = 2**21  # S_kv off the KV tile, mask-free: Q tiles * s_kv from which FROST wins (0.41-0.89)
+SM107_PAGED_GQA_MAX_B = 4  # Rubin paged bf16 GQA prefill chunks: measured batch range (module docstring)
 SM107_FP8_TINY_MAX_KV = 128  # cc 10.7 FP8 d256 / d512: a single KV tile ...
 SM107_FP8_TINY_MAX_Q_TILES = 8  # ... and at most 8 Q tiles is launch-bound; the backend keeps it
 SM107_FP8_D128_CAUSAL_MAX_S_Q = 512  # above, FROST's 512-row cluster doubles its waves first (b8 8/1 q576-768: 1.76x)
@@ -489,6 +501,30 @@ def _sm107_paged_d256_decode_tile_leads(caps: Capabilities, facts) -> bool:
     return u_lo <= units <= u_hi and kv_lo <= facts.s_kv <= kv_hi
 
 
+def _sm107_paged_gqa_prefill(facts) -> bool:
+    """Rubin paged bf16 d128 GQA 4 / 8 prefill chunks, bottom-right causal, page 16, head-major in-page K (module docstring)."""
+    return (
+        facts.has_paged_kv
+        and not facts.shape_overrides
+        and facts.dtype == cudnn.data_type.BFLOAT16
+        and (facts.d_qk, facts.d_v) == (128, 128)
+        and 1 <= facts.b <= SM107_PAGED_GQA_MAX_B
+        and facts.h_kv > 0
+        and facts.h_q % facts.h_kv == 0
+        and facts.h_q // facts.h_kv in (4, 8)
+        and 128 < min(facts.s_q, facts.max_total_seq_len_q or facts.s_q)
+        and facts.s_q <= 1024
+        and 2048 <= facts.s_kv <= 32768
+        and facts.page_size == 16
+        and facts.causal
+        and facts.bottom_right
+        and facts.window_left is None
+        and not (facts.has_sink or facts.right_band_widening)
+        and facts.k_t is not None
+        and facts.k_t.get_stride()[2] < facts.k_t.get_stride()[1]
+    )
+
+
 def _place_sm107_f16(caps: Capabilities, facts) -> str:
     from .heuristics import _prefer_paged_d256_lpt, _prefer_thd_pack_gqa, nonpaged_thd_split_choice, paged_d256_prefix_launch, paged_thd_split_choice
 
@@ -538,6 +574,8 @@ def _place_sm107_f16(caps: Capabilities, facts) -> str:
                 return LEAD  # d512 and its d320-d448 envelope: 0.08-0.67
             if facts.s_q < facts.s_kv and facts.s_kv >= CHUNKED_MIN_KV_TOKENS and _q_tiles(facts) <= CHUNKED_MAX_Q_TILES:
                 return LEAD  # chunked, d64-d256: 0.04-1.00; squares and wider chunks stay mixed (up to 1.98x)
+    if _sm107_paged_gqa_prefill(facts):
+        return LEAD
     # The shared paged pipeline also benefits from GQA packing without a
     # split. Large-batch short queries recover unused Q rows without partials.
     # Smaller GPU-only gains do not reliably repay the host submission cost;
