@@ -59,6 +59,15 @@ SM100 f16/bf16 row (B200; SM103 runs the same thresholds, not re-measured there)
   B4 Q2k/KV16k; a 32k endpoint at 16/2 uses HND/page128. Independent B2/B3 full/chunk and
   irregular-length controls confirm the bounded interpolation below. This is a cuDNN route improvement, not a uniform win over
   FA4/TRTLLM. Keep unmeasured graph features and larger declarations backend-first.
+- paged THD, exact d128 BF16, full or near-full prefill (512 <= Q <= 8192, Q <= KV <= 2Q), B1..4, 16..64 query
+  heads at GQA4/8, bottom-right causal without window or sink: packed FROST leads the backend (#1809, B200, page
+  16). Extended 2026-10-23 to cc 10.3 and page 64 on the FlashInfer paged prefill shape: B300 SXM6 AC, cuDNN
+  9.24 (backend) vs 9.30 (FROST, the backend declines the mixed-form sequence lengths there), 32/8 heads, b 1,
+  Q = KV = 8192, page 64: FROST 0.22 of FA2 against the backend's 0.37-0.40. Re-measured with this tree
+  (after #1796) at page 16 and page 64, 32/8 and 32/4 heads, cuDNN 9.24 for the backend arm: inside the
+  domain FROST 0.22-1.00 against the backend's 0.28-3.28 (b 1 / 2 / 4, Q = KV 512 / 2k / 8k, KV = 1.5 Q), and
+  the long-prefix shapes outside it (b 8-64, KV 2-16x Q) FROST 0.23-0.76 against 0.48-2.02; those stay on the
+  split-selection path for a separate change. B200 with page 64 was not measured separately.
 - paged THD, exact d128 BF16, B1..4 with 4..64 query heads and integral GQA1/2/4/8/16:
   prepared single-CTA split plans cover Q64..1024 and KV2K..32K, with or without
   packed Stats. The shared split rule below owns the measured shape/layout
@@ -69,6 +78,19 @@ SM100 f16/bf16 row (B200; SM103 runs the same thresholds, not re-measured there)
   d128/v128 BF16 Blackwell prefixes without Stats reuse this first-wave rule
   for integral GQA1/2/4/8 and fixed graphs (B200, released cuDNN 9.27).
   The existing order remains when there is no first-wave split to use.
+- nonpaged THD, exact d256 BF16, bottom-right causal without window, sink or right band, integral GQA (2/4/8/16
+  and MHA measured alike), Q >= 256 tokens per request, KV > 512: the FlashInfer ragged prefill graph (one graph per
+  shape class at the shape-override cache shape, live batches through the override). Measured 2026-10-23 on B300
+  SXM6 AC against FlashInfer FA2 with this tree (after #1796), cuDNN 9.30 for the backend arm, medians of 20:
+  FROST 0.25 / 0.43 / 0.85 of FA2 at 1x8192 / 8x1024 / 32x256 against the backend's 0.28 / 0.65 / 1.28; over the
+  256-768-token crossover grid at batch 4 / 16 / 64, FROST 0.39-1.36 against the backend's 0.42-3.38, FROST ahead
+  in all 45 cells (five head configurations, mean 0.72 vs 1.30). Before #1796 the backend led the batch-64 cells
+  (0.41-0.92 vs 0.82-1.65); the work-prefix unit decode removed that. The backend engine of cuDNN 9.27 is much
+  closer than 9.24 / 9.30 (same grid: 0.36-1.47 of FA2): FROST stays ahead at batch 4 (1.30 vs 1.47, 0.85 vs
+  0.95, 0.63 vs 0.66) and runs within 8-17 % behind at batch 64 (0.76 vs 0.65, 0.49 vs 0.43, 0.39 vs 0.36), so
+  the lead is version-robust rather than a uniform win there. The declared short class (KV <= 512, e.g. 64x64)
+  keeps the backend first, where the two run within 3 % of each other (2.6-2.7x FA2). Queries shorter than 256
+  tokens per request and FP16 are not measured -> TRAIL.
 - nonpaged THD, d128 half, bottom-right causal GQA2/4/8/16 without window, sink or right band (the
   groups whose first plan is packed): unsplit
   FROST leads at KV > 512 with b * h_q * s_q >= 110 query rows per SM, or Q >= 256 at KV >= 1024 (B200,
@@ -307,6 +329,9 @@ D512_PREFILL_MIN_Q_ROWS = 4096  # d512 prefill below a 2k cache: b * h_q * s_q f
 CHUNKED_MAX_Q_TILES = 128  # <= 128 tiles wins from a 4k cache (0.30-0.89, d64-d256); 256 tiles loses 1.02-1.07 for d64/d128
 CHUNKED_MIN_KV_TOKENS = 4096
 THD_PACKED_MIN_KV_TOKENS = 512  # exclusive: unsplit packed THD at KV 512 measured 1.0-1.54x the backend
+NONPAGED_D256_THD_MIN_Q = 256  # per-request query length from which the d256 THD cells were measured
+PAGED_D128_FULL_PREFILL_CCS = ((10, 0), (10, 3))  # packed FROST paged D128 full prefill: B200 (#1809) and B300 (2026-10-23)
+PAGED_D128_FULL_PREFILL_PAGE_SIZES = (16, 64)  # page 16 measured on B200 (#1809), page 64 on B300 (2026-10-23)
 THD_PACKED_GQA2_MIN_KV_TOKENS = 4096  # GQA2 packs two heads a tile: large batches on a 1-2k cache lost up to 1.26x
 # Small unsplit packed launches lose to the backend (KV 576-1024 below ~110 query rows per SM: up to
 # 1.43x on B200 and a 68-SM SM100); 8192 rows lost on B200 (148 SMs) and won 0.71-0.89 on 68 SMs.
@@ -726,12 +751,12 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
     # recommendation too; keep longer prefixes on the split-selection path.
     if (
         512 <= facts.s_q <= 8192
-        and facts.device_cc == (10, 0)
+        and facts.device_cc in PAGED_D128_FULL_PREFILL_CCS
         and facts.dtype == cudnn.data_type.BFLOAT16
         and (facts.d_qk, facts.d_v) == (128, 128)
         and facts.thd
         and facts.has_paged_kv
-        and facts.page_size == 16
+        and facts.page_size in PAGED_D128_FULL_PREFILL_PAGE_SIZES
         and 1 <= facts.b <= 4
         and 16 <= facts.h_q <= 64
         and facts.h_q in (4 * facts.h_kv, 8 * facts.h_kv)
@@ -764,6 +789,23 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
         and _prefer_thd_pack_gqa(caps, facts)
     ):
         return LEAD  # unsplit packed causal GQA2/4/8/16
+    if (
+        # nonpaged THD, exact d256 BF16, bottom-right causal GQA8 without window, sink or right band: the
+        # FlashInfer ragged prefill shape of Qwen3.5-class models (module docstring, "nonpaged THD, exact d256").
+        facts.thd
+        and not facts.has_paged_kv
+        and facts.dtype == cudnn.data_type.BFLOAT16
+        and (facts.d_qk, facts.d_v) == (256, 256)
+        and facts.causal
+        and facts.bottom_right
+        and facts.window_left is None
+        and not (facts.has_sink or facts.right_band_widening or facts.has_epilogue_gate)
+        and facts.h_kv > 0
+        and facts.h_q % facts.h_kv == 0  # integral GQA2/4/8/16 and MHA measured alike
+        and facts.s_q >= NONPAGED_D256_THD_MIN_Q
+        and facts.s_kv > THD_PACKED_MIN_KV_TOKENS
+    ):
+        return LEAD  # unsplit d256 THD prefill: 0.39-1.36 of FA2 where the backend ran 0.42-3.38 (B300, every measured cell)
     if facts.thd or facts.has_paged_kv or facts.window_left is not None:
         return TRAIL
     if flavor == (512, 512):  # exact or envelope-served (d320-d448: 0.32-0.65)
