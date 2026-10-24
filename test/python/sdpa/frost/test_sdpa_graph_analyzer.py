@@ -1496,7 +1496,7 @@ def test_sm107_paged_partial_pack_admission_agrees_with_adapter(monkeypatch, dty
         assert cfg.PACK_G == math.gcd(group, 128)
         assert cfg.PACK_GQA and cfg.PAGED_KV and cfg.THD_VARLEN
     else:
-        with pytest.raises(NotImplementedError):
+        with pytest.raises((ValueError, NotImplementedError), match="PackGQA|split"):
             api.check_support()
 
 
