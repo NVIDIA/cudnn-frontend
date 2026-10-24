@@ -874,7 +874,7 @@ def test_sm107_f16_split_coverage_and_pack_gqa_gate():
         ) != (128, 128), d
     for feature in (dict(thd=True, padded=True), dict(padded=True), dict(has_sink=True)):
         assert engines.mismatch(caps, _f16_facts(**feature), engines.SdpaFwdKnobs(split_kv=2)) is not None
-    # D128 unsplit THD packing now shares the two-CTA SM100 body with dense packing.
+    # D128 unsplit THD and dense packing share the native two-CTA SM107 body.
     assert engines.mismatch(caps, _f16_facts(thd=True, padded=True), engines.SdpaFwdKnobs(pack_gqa=True)) is None
 
     for d_qk, d_v, paged in ((128, 128, True), (192, 128, False)):
@@ -904,9 +904,8 @@ def test_sm107_f16_split_coverage_and_pack_gqa_gate():
 
 
 def test_sm107_dense_d128_shared_legs_admission():
-    """Issue #1472: the cc 10.7 half row admits the shared SM100 d128 bodies on DENSE d128 half graphs -- PackGQA (the
-    shared prefill body at cga2) and cga1 (the shared decode tile) -- and keeps every other leg where it was: the
-    pre-folded scale stays on the Rubin body (its arm is not in the shared bodies), dense d256 PackGQA stays declined,
+    """Issue #1472: preserve the cc 10.7 dense D128 half admission for packed native prefill at CGA2 and shared decode
+    at CGA1. The pre-folded scale retains its existing unpacked domain; dense D256 PackGQA stays declined,
     THD nonpaged keeps the cga2 prefill pipeline, and the standalone cga domain mirrors the row (keep the three in
     lockstep).  An MHA PackGQA pin is the bit-exact unpacked fold (PACK_G = 1), honorable as on the SM100 row; the
     heuristics never propose it."""
@@ -982,7 +981,7 @@ def test_sm107_nonpaged_d128_thd_pack_gqa_contract(dtype_name, group):
     knobs = engines.SdpaFwdKnobs(cga=2, split_kv=1, pack_gqa=True)
     for extra in ({}, dict(has_sink=True), dict(wants_stats=True, shape_overrides=True, max_total_seq_len_q=facts.b * facts.s_q)):
         assert engines.mismatch(caps, dataclasses.replace(facts, **extra), knobs) is None
-    # Shared bodies apply scale in-kernel; accepting a pre-scaled Q would scale it twice.
+    # Native packing retains the existing public pre-folded-scale admission boundary.
     assert "attn_scale_prefolded" in engines.mismatch(caps, dataclasses.replace(facts, attn_scale_prefolded=True), knobs)
     for shape in ((192, 128), (256, 256), (512, 512)):
         assert engines.mismatch(caps, dataclasses.replace(facts, d_qk=shape[0], d_v=shape[1]), knobs) is not None
@@ -5649,11 +5648,8 @@ def test_prefolded_scale_declines_the_single_cta_half_legs_on_the_adapter(monkey
 
 
 @requires_dsl
-def test_rubin_dense_d128_legs_load_the_shared_sm100_bodies():
-    """The loader's two dense cc 10.7 arms (issue #1472): dense d128 half at cta_mma=1 -> the shared DECODE tile
-    (sm100/decode_d128_f16.py, packed or not), dense packed d128 half at cga2 -> the shared SM100 prefill body, dense
-    unpacked cga2 -> the Rubin sibling, and the paged THD cga1 unsplit leg -> the shared prefill body (the two-slab paged
-    prefill, never the tile)."""
+def test_rubin_d128_prefill_packing_loads_the_native_body():
+    """Packed and unpacked CGA2 share the native pipeline; decode and paged keep their own bodies."""
     from cudnn.frost.tile_dsl.constants import DTYPE_BF16
 
     def where(**params):
@@ -5662,7 +5658,9 @@ def test_rubin_dense_d128_legs_load_the_shared_sm100_bodies():
 
     assert where(cta_mma=1) == ("sm100", "decode_d128_f16.py")
     assert where(cta_mma=1, pack_gqa=True, qh_per_kh=8) == ("sm100", "decode_d128_f16.py")
-    assert where(cta_mma=2, pack_gqa=True, qh_per_kh=8) == ("sm100", "prefill_d128_f16.py")
+    assert where(cta_mma=2, pack_gqa=True, qh_per_kh=8) == ("sm107", "prefill_d128_f16.py")
+    assert where(cta_mma=2, pack_gqa=True, qh_per_kh=8, split_kv=2) == ("sm107", "prefill_d128_f16.py")
+    assert where(cta_mma=2, pack_gqa=True, qh_per_kh=6, thd_varlen=True) == ("sm107", "prefill_d128_f16.py")
     assert where(cta_mma=2) == ("sm107", "prefill_d128_f16.py")
     assert where(cta_mma=1, thd_varlen=True, paged_kv=True, page_size=16, seq_kv_lens_present=True, split_kv=1) == ("sm100", "prefill_d128_f16.py")
 
@@ -7383,6 +7381,7 @@ def _half_prefold_api(
     sink=False,
     seed=0,
     attn_scale=None,
+    pack_gqa=False,
 ):
     """The adapter of one leg (folded or unfolded) of a dense problem on the cc 10.7 half twin, plus its tensors.
     ``attn_scale`` defaults to d_qk ** -0.5; the leading-dead-tile cells pass 1.0 (scale_log2 > 1)."""
@@ -7409,7 +7408,7 @@ def _half_prefold_api(
         has_sink=sink,
         cga=2,
         split_kv=split_kv,
-        pack_gqa=False,
+        pack_gqa=pack_gqa,
         softmax_scale_prefolded=prefolded,
     )
     return api, dict(q=q, k=k, v=v, out=out, lse=lse, sinks=sinks, attn_scale=attn_scale)
