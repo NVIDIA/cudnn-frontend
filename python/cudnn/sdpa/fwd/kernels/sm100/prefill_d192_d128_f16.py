@@ -1170,6 +1170,11 @@ def _tmaldg_warp_group(
     back-edge, keeping the LDS.128 result in uniform registers).
     """
     q_empty_phase = cutlass.Int32(1)
+    # CGA2 loads one K and one V tile per iteration into equal-depth rings.
+    # Sharing their cursor on masked paths avoids keeping a second live
+    # index/phase across scheduler decodes (the SM103 spill regression in #1794).
+    # CGA1 needs independent K sub-stages and V stages; dense CGA2 keeps the
+    # independent form because its generated loader already has no spills.
     k_state = PipelineState.start(phase=1)
     v_state = PipelineState.start(phase=1)
 
@@ -1316,8 +1321,11 @@ def _tmaldg_warp_group(
                         mcast_mask=tma_mcast_mask,
                         acquire=not (CFG.THD_VARLEN and not PAGED_KV),
                     )
-                k_state = advance(k_state, K_SUB_STAGES)
+                if cutlass.const_expr(not (CFG.CTA_MMA == 2 and CFG.MASK_FLAGS != MASK_NONE)):
+                    k_state = advance(k_state, K_SUB_STAGES)
 
+            if cutlass.const_expr(CFG.CTA_MMA == 2 and CFG.MASK_FLAGS != MASK_NONE):
+                v_state = k_state
             _wait_mbarrier(bars.mb_v_empty[v_state.idx], v_state.phase)
             if cutlass.const_expr(CFG.CTA_MMA == 2):
                 bars.mb_v_full[v_state.idx].arrive(n_bytes=vTmaTransactionBytes, pred=is_leader & nvvm.elect_sync())
@@ -1350,6 +1358,8 @@ def _tmaldg_warp_group(
                     acquire=not (CFG.THD_VARLEN and not PAGED_KV),
                 )
             v_state = advance(v_state, CFG.STAGES_V)
+            if cutlass.const_expr(CFG.CTA_MMA == 2 and CFG.MASK_FLAGS != MASK_NONE):
+                k_state = v_state
 
             _wait_mbarrier(mb_q_reload[0], q_empty_phase)
             if cutlass.const_expr(IS_QO_ALIAS):
@@ -1427,8 +1437,11 @@ def _tmaldg_warp_group(
                             mcast_mask=tma_mcast_mask,
                             acquire=not (CFG.THD_VARLEN and not PAGED_KV),
                         )
-                    k_state = advance(k_state, K_SUB_STAGES)
+                    if cutlass.const_expr(not (CFG.CTA_MMA == 2 and CFG.MASK_FLAGS != MASK_NONE)):
+                        k_state = advance(k_state, K_SUB_STAGES)
 
+                if cutlass.const_expr(CFG.CTA_MMA == 2 and CFG.MASK_FLAGS != MASK_NONE):
+                    v_state = k_state
                 _wait_mbarrier(bars.mb_v_empty[v_state.idx], v_state.phase)
                 if cutlass.const_expr(CFG.CTA_MMA == 2):
                     bars.mb_v_full[v_state.idx].arrive(n_bytes=vTmaTransactionBytes, pred=is_leader & nvvm.elect_sync())
@@ -1462,6 +1475,8 @@ def _tmaldg_warp_group(
                     )
 
                 v_state = advance(v_state, CFG.STAGES_V)
+                if cutlass.const_expr(CFG.CTA_MMA == 2 and CFG.MASK_FLAGS != MASK_NONE):
+                    k_state = v_state
 
         if cutlass.const_expr(_PREDECODE_THD_SWA_SEGMENTS):
             wait(sched.mb_decoded.subview(sched_state.idx), sched_state.phase)
@@ -1515,12 +1530,18 @@ def _tmaldg_warp_group(
         for _qs in cutlass.range_constexpr(CFG.TILES_Q):
             _wait_mbarrier(mb_q_reload[_qs], q_empty_phase)
         q_empty_phase = q_empty_phase ^ cutlass.Int32(1)
-        for _ in cutlass.range_constexpr(K_SUB_STAGES):
-            _wait_mbarrier(bars.mb_k_empty[k_state.idx], k_state.phase)
-            k_state = advance(k_state, K_SUB_STAGES)
-        for _ in cutlass.range_constexpr(CFG.STAGES_V):
-            _wait_mbarrier(bars.mb_v_empty[v_state.idx], v_state.phase)
-            v_state = advance(v_state, CFG.STAGES_V)
+        if cutlass.const_expr(CFG.CTA_MMA == 2 and CFG.MASK_FLAGS != MASK_NONE):
+            for _ in cutlass.range_constexpr(CFG.STAGES_KV):
+                _wait_mbarrier(bars.mb_k_empty[k_state.idx], k_state.phase)
+                _wait_mbarrier(bars.mb_v_empty[k_state.idx], k_state.phase)
+                k_state = advance(k_state, CFG.STAGES_KV)
+        else:
+            for _ in cutlass.range_constexpr(K_SUB_STAGES):
+                _wait_mbarrier(bars.mb_k_empty[k_state.idx], k_state.phase)
+                k_state = advance(k_state, K_SUB_STAGES)
+            for _ in cutlass.range_constexpr(CFG.STAGES_V):
+                _wait_mbarrier(bars.mb_v_empty[v_state.idx], v_state.phase)
+                v_state = advance(v_state, CFG.STAGES_V)
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
 
 
