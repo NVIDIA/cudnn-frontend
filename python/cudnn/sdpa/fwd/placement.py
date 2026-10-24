@@ -277,14 +277,15 @@ rule once:
 Mean regret: fit 137.5 % -> 7.8 %, hold-out 3 78.4 % -> 23.4 %; led graphs on the grid 0.04-0.97.
 
 Rubin paged bf16 d128 GQA prefill chunks (2026-10-24, ``_sm107_paged_gqa_prefill``): LEAD for GQA 4 / 8 at b 1-4,
-128 < s_q <= 1024, S_kv 2k-32k, bottom-right causal, page 16, head-major in-page K. Evidence: a frozen 18-shape
-mixed-length paged holdout from the FlashInfer integration (actual per-request lengths, bounded and exact
-declarations, CUDA-graph replay of every offered and non-offered candidate, both traversal orders, cuDNN 9.27.0.42).
-The backend default there is engine 18; against it the FROST plan this rule selects runs 0.42-0.98 (geomean 0.72) on
-the 8 led shapes. MHA (64/64: 1.04-1.31) and group 2 (64/32: 1.31) keep the backend. The same data sets
-``paged_thd_split_choice``'s Rubin budget to two waves of SMs past one Q tile: the declared capacity (b * max_q rows)
-overstates mixed-length units, so a one-wave budget refused every split while cga1 2-6-way splits ran 0.37-0.64.
-That holdout tuned this rule, so it is development data; a fresh 18-shape holdout is frozen for validation.
+128 < s_q <= 1024, S_kv 2k-32k, bottom-right causal, page 16, head-major in-page K. Evidence: mixed-length paged
+holdouts run through the FlashInfer paged prefill wrapper (actual per-request lengths, bounded and exact
+declarations, CUDA-graph replay of every offered candidate, both traversal orders, full FP64 O / LSE checks,
+cuDNN 9.27.0.42). On those graphs the backend default is engine 18, and the plan this rule selects ran faster on
+every led shape in both orders; MHA and group 2 kept the backend. The same data set ``paged_thd_split_choice``'s
+Rubin budget to two waves of SMs past one Q tile: the declared capacity (b * max_q rows) overstates mixed-length
+units, so a one-wave budget refused splits that measured faster. The development holdout tuned the rule; a fresh
+frozen 16-geometry holdout (Stats on and off) validated it with no newly selected slower route. Rubin timings are
+kept internal.
 
 Rows with no measurement (SM80, SM100 mxfp8) keep the historical order (LEAD); they are still
 opt-in, so the order is only observable with ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``.
