@@ -677,7 +677,7 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
     path. Rubin uses its SM107 siblings except for the shared half packed
     split and paged pipelines, whose SMEM fits the version-0 descriptor window,
     and, on dense (128, 128) half graphs, the shared d128 decode tile at cga1
-    and the shared d128 prefill body under PackGQA (issue #1472)."""
+    and native D128 prefill under PackGQA."""
 
     tag = _flavor_tag(flavor)
     if rubin and not fp8 and getattr(params, "decode_q_tile", 0):
@@ -705,18 +705,6 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
         # version-0 descriptor window) -- the dense twin of the single-CTA THD leg above (issue #1472).  THD_VARLEN at cga1
         # is the two-slab paged prefill (above) or the single-Q split (above); never this body.
         return _load_kernel_template(_SM100_DECODE_KERNEL_FILE, params, f"sdpa_fwd_sm107_{tag}_decode")
-    if (
-        rubin
-        and not fp8
-        and flavor == _SM100_DECODE_FLAVOR
-        and params.pack_gqa
-        and not params.paged_kv
-        and (not params.thd_varlen or (params.cta_mma == 2 and params.split_kv == 1))
-    ):
-        # Dense or unsplit ragged packed d128 half at cga2 on cc 10.7: the shared SM100 prefill body (192 KiB) carries the
-        # PACK_GQA arm and the row_head_idx sink fold the Rubin sibling lacks (issue #1472); unpacked cga2 stays on the
-        # sibling below.  Tag spelling keys the module cache: keep it distinct from the paged and single_q tags.
-        return _load_kernel_template(_SM100_KERNEL_FILES[flavor], params, f"sdpa_fwd_sm107_{tag}_packed")
     if rubin:
         # Tag spelling is load-bearing: it keys the template-module cache, and
         # "sdpa_fwd_sm107_fp8_<flavor>" is what the shipped d128 FP8 row has
@@ -2080,10 +2068,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
 
     def _rubin_shared_dense_leg(self) -> bool:
-        """True when the loader picks a shared SM100 d128 body for a DENSE cc 10.7 half graph (``_load_sm100_kernel_module``):
-        cga=1 (the decode tile) or PackGQA at cga2 (the prefill body).  Those bodies apply the attention scale in-kernel, so
-        the pre-folded scale declines on them here and in engines (mismatch / effective_cgas); they also serve PackGQA with a
-        split as on the SM100 line.  Twin of engines.rubin_dense_d128_shared_leg; keep the three in lockstep (issue #1472)."""
+        """Historical dense D128 decode/packing admission predicate (issue #1472).
+
+        CGA1 uses the shared decode tile; packed CGA2 now uses native SM107 prefill.
+        The existing public pre-folded-scale and split admission gates still use this
+        predicate. Keep those gates in sync with engines.rubin_dense_d128_shared_leg.
+        """
         return bool(
             self._device_cc == (10, 7)
             and not self._fp8
@@ -2094,7 +2084,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
 
     def _rubin_shared_thd_pack_leg(self) -> bool:
-        """Unsplit nonpaged D128 THD packing on the shared two-CTA body."""
+        """Unsplit nonpaged D128 THD packing on the native two-CTA body."""
         return self.pack_gqa and supports_nonpaged_d128_thd_pack_gqa(
             self.flavor,
             device_cc=self._device_cc,
@@ -2506,7 +2496,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 and not self._rubin_shared_thd_pack_leg()
                 and not (self.flavor == _SM100_DECODE_FLAVOR and not self.thd)
                 and not self._decode_q_tile_for(int(s_qo), int(h_qo), int(h_kv)),
-                "Rubin half PackGQA requires paged KV, the D128 packed split, an unsplit dense or ragged D128 GQA graph without the pre-folded scale (the shared SM100 body), or the d256 decode tile (a decode-shaped graph: S_q x G packed rows within its routed envelope)",
+                "Rubin half PackGQA requires paged KV, the D128 packed split, an unsplit dense or ragged D128 GQA graph without the pre-folded scale, or the d256 decode tile (a decode-shaped graph: S_q x G packed rows within its routed envelope)",
             )
             self._not_implemented_error_if(
                 self.thd
@@ -2531,8 +2521,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 "THD PackGQA requires half D128 cga2 unsplit/cga1 split, Rubin paged D128 cga1 unsplit, or Rubin paged D256 cga2 unsplit",
             )
             # Partial PackGQA (the largest divisor of the group that divides the
-            # tile) is wired in the shared SM100 d128 / d256 f16 kernels, including
-            # Rubin's unsplit ragged D128 reuse. Other flavors keep the full-ratio contract.
+            # tile) is wired in SM100 d128 / d256 half and native Rubin ragged D128.
+            # Other admitted legs keep their existing full-ratio contract.
             _partial = (not self._fp8 and self._device_cc != (10, 7) and self.flavor in _SM100_PARTIAL_PACK_GQA_FLAVORS) or self._rubin_shared_thd_pack_leg()
             # The d256 DECODE tile packs the WHOLE group whenever it fits its Q tile
             # (HEADS_PER_TILE = QH_PER_KH; 24/2 puts its 12 heads in the 16-row tile, four
@@ -4659,17 +4649,18 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         if plan is not None:
             return plan
         b = self.batch_size
-        # Persistent THD kernels ordinarily launch one resident wave and pull further
-        # units from a device-bounded counter. For the packed family below, assign
-        # all declared work directly when it fits within two waves; otherwise keep
-        # one persistent wave. Page size does not affect this packed work count.
+        # Persistent THD kernels pull work from a device-bounded counter. A body
+        # may assign a small envelope directly across its declared initial waves;
+        # larger envelopes use one resident wave. The packed family below also
+        # tightens the safety envelope to its known token-tile count.
         env = units = self._thd_unit_envelope()
         if self.packed_thd_split:
             env = units = env * self.split_kv
         if getattr(self._k_mod, "THD_PERSISTENT", False):
             cluster_ctas = int(getattr(self._k_mod, "CGA_SIZE", 0) or getattr(self._k_mod, "CTA_MMA", 1))
             resident = max(1, _device_sm_count(self.q_desc.device) // max(1, cluster_ctas))
-            units = min(env, resident)
+            initial_waves = max(1, int(getattr(self._k_mod, "THD_INITIAL_WAVES", 1)))
+            units = env if env <= initial_waves * resident else resident
             cfg = self._k_mod.CFG
             if (
                 ((self._device_cc == (10, 0) and self.paged) or (self._device_cc == (10, 7) and not self.paged))

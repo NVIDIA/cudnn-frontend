@@ -326,6 +326,23 @@ delays softmax after publishing retained P, then checks dense/THD O, LSE and
 Amax after capture/replay. The delay lives in a private test template copy;
 production kernels gain no debug knob or timing-dependent assertion.
 
+**Rule S10 — Every warp role decodes a work item with the same scheduler inputs.**
+
+- LPT-L2 requires the runtime GQA ratio and KV length at both initial and
+  persistent decode calls, including the output-store warp. NATURAL/LPT and
+  THD can hide missing arguments because they do not read those inputs.
+- Packed tile heads and per-row query heads are different coordinates. Keep
+  the next decoded tile head in the scheduler variable; derive each output
+  head from it again for sinks, Stats and partial stores.
+- A THD body using the device-bounded persistent claim counter must declare
+  `THD_PERSISTENT = True` to the adapter. Otherwise its safety envelope becomes
+  the physical grid, adding unnecessary worker waves. Assert the module route
+  and declaration in changed-length replay tests; inspect the actual launch
+  grid when comparing persistent implementations.
+- `test_native_d128_packing_dense_replay` compiles all three schedulers and
+  checks changed-input replay, split partials and MHA's bitwise packing fold.
+  The ragged changed-length tests cover partial packing and retained captures.
+
 ## 2x2 datapath (cta_group::2, M=128 collective = 64 rows per CTA) lessons
 
 Kernels on this atom: forward `fwd/kernels/sm100/prefill_d512_f16_2x2.py` + `fwd/kernels/sm107/prefill_d512_f16_2x2.py`

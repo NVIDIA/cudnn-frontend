@@ -874,7 +874,7 @@ def test_sm107_f16_split_coverage_and_pack_gqa_gate():
         ) != (128, 128), d
     for feature in (dict(thd=True, padded=True), dict(padded=True), dict(has_sink=True)):
         assert engines.mismatch(caps, _f16_facts(**feature), engines.SdpaFwdKnobs(split_kv=2)) is not None
-    # D128 unsplit THD packing now shares the two-CTA SM100 body with dense packing.
+    # D128 unsplit THD and dense packing share the native two-CTA SM107 body.
     assert engines.mismatch(caps, _f16_facts(thd=True, padded=True), engines.SdpaFwdKnobs(pack_gqa=True)) is None
 
     for d_qk, d_v, paged in ((128, 128, True), (192, 128, False)):
@@ -904,9 +904,8 @@ def test_sm107_f16_split_coverage_and_pack_gqa_gate():
 
 
 def test_sm107_dense_d128_shared_legs_admission():
-    """Issue #1472: the cc 10.7 half row admits the shared SM100 d128 bodies on DENSE d128 half graphs -- PackGQA (the
-    shared prefill body at cga2) and cga1 (the shared decode tile) -- and keeps every other leg where it was: the
-    pre-folded scale stays on the Rubin body (its arm is not in the shared bodies), dense d256 PackGQA stays declined,
+    """Issue #1472: preserve the cc 10.7 dense D128 half admission for packed native prefill at CGA2 and shared decode
+    at CGA1. The pre-folded scale retains its existing unpacked domain; dense D256 PackGQA stays declined,
     THD nonpaged keeps the cga2 prefill pipeline, and the standalone cga domain mirrors the row (keep the three in
     lockstep).  An MHA PackGQA pin is the bit-exact unpacked fold (PACK_G = 1), honorable as on the SM100 row; the
     heuristics never propose it."""
@@ -982,7 +981,7 @@ def test_sm107_nonpaged_d128_thd_pack_gqa_contract(dtype_name, group):
     knobs = engines.SdpaFwdKnobs(cga=2, split_kv=1, pack_gqa=True)
     for extra in ({}, dict(has_sink=True), dict(wants_stats=True, shape_overrides=True, max_total_seq_len_q=facts.b * facts.s_q)):
         assert engines.mismatch(caps, dataclasses.replace(facts, **extra), knobs) is None
-    # Shared bodies apply scale in-kernel; accepting a pre-scaled Q would scale it twice.
+    # Native packing retains the existing public pre-folded-scale admission boundary.
     assert "attn_scale_prefolded" in engines.mismatch(caps, dataclasses.replace(facts, attn_scale_prefolded=True), knobs)
     for shape in ((192, 128), (256, 256), (512, 512)):
         assert engines.mismatch(caps, dataclasses.replace(facts, d_qk=shape[0], d_v=shape[1]), knobs) is not None
@@ -5649,11 +5648,8 @@ def test_prefolded_scale_declines_the_single_cta_half_legs_on_the_adapter(monkey
 
 
 @requires_dsl
-def test_rubin_dense_d128_legs_load_the_shared_sm100_bodies():
-    """The loader's two dense cc 10.7 arms (issue #1472): dense d128 half at cta_mma=1 -> the shared DECODE tile
-    (sm100/decode_d128_f16.py, packed or not), dense packed d128 half at cga2 -> the shared SM100 prefill body, dense
-    unpacked cga2 -> the Rubin sibling, and the paged THD cga1 unsplit leg -> the shared prefill body (the two-slab paged
-    prefill, never the tile)."""
+def test_rubin_d128_prefill_packing_loads_the_native_body():
+    """Packed and unpacked CGA2 share the native pipeline; decode and paged keep their own bodies."""
     from cudnn.frost.tile_dsl.constants import DTYPE_BF16
 
     def where(**params):
@@ -5662,7 +5658,9 @@ def test_rubin_dense_d128_legs_load_the_shared_sm100_bodies():
 
     assert where(cta_mma=1) == ("sm100", "decode_d128_f16.py")
     assert where(cta_mma=1, pack_gqa=True, qh_per_kh=8) == ("sm100", "decode_d128_f16.py")
-    assert where(cta_mma=2, pack_gqa=True, qh_per_kh=8) == ("sm100", "prefill_d128_f16.py")
+    assert where(cta_mma=2, pack_gqa=True, qh_per_kh=8) == ("sm107", "prefill_d128_f16.py")
+    assert where(cta_mma=2, pack_gqa=True, qh_per_kh=8, split_kv=2) == ("sm107", "prefill_d128_f16.py")
+    assert where(cta_mma=2, pack_gqa=True, qh_per_kh=6, thd_varlen=True) == ("sm107", "prefill_d128_f16.py")
     assert where(cta_mma=2) == ("sm107", "prefill_d128_f16.py")
     assert where(cta_mma=1, thd_varlen=True, paged_kv=True, page_size=16, seq_kv_lens_present=True, split_kv=1) == ("sm100", "prefill_d128_f16.py")
 
@@ -7383,6 +7381,7 @@ def _half_prefold_api(
     sink=False,
     seed=0,
     attn_scale=None,
+    pack_gqa=False,
 ):
     """The adapter of one leg (folded or unfolded) of a dense problem on the cc 10.7 half twin, plus its tensors.
     ``attn_scale`` defaults to d_qk ** -0.5; the leading-dead-tile cells pass 1.0 (scale_log2 > 1)."""
@@ -7409,7 +7408,7 @@ def _half_prefold_api(
         has_sink=sink,
         cga=2,
         split_kv=split_kv,
-        pack_gqa=False,
+        pack_gqa=pack_gqa,
         softmax_scale_prefolded=prefolded,
     )
     return api, dict(q=q, k=k, v=v, out=out, lse=lse, sinks=sinks, attn_scale=attn_scale)
@@ -8718,3 +8717,101 @@ def test_d256_pack_gqa_divisibility_rule_is_exempted_on_the_rubin_decode_tile_on
     a = api()
     assert a.check_support()
     assert a._decode_q_tile() == 16 and a._decode_q_tile_for(1, 15, 5) == 16
+
+
+@pytest.mark.parametrize("dtype_name", ["bfloat16", "float16"])
+@pytest.mark.parametrize("sched_policy", [0, 1, 2])
+@pytest.mark.parametrize("with_stats", [False, True])
+@pytest.mark.parametrize("geometry", ["mha", "split", "keyless", "keyless_no_sink", "window", "envelope", "asymmetric"])
+def test_native_d128_packing_dense_replay(dtype_name, sched_policy, with_stats, geometry):
+    """Native PackGQA covers every scheduler, per-head sinks, keyless rows and FP32 partials."""
+    import torch
+    from cuda.bindings import driver as cuda
+
+    _rubin_only()
+    group, sq, sk, split, causal, br, window, sink = {
+        "mha": (1, 33, 128, 1, False, False, None, False),
+        "split": (4, 513, 768, 2, False, False, None, False),
+        "keyless": (8, 257, 129, 1, True, True, None, True),
+        "keyless_no_sink": (8, 257, 129, 1, True, True, None, False),
+        "window": (16, 513, 769, 1, True, True, 127, True),
+        "envelope": (4, 513, 768, 2, False, False, None, False),
+        "asymmetric": (4, 513, 769, 1, True, True, None, True),
+    }[geometry]
+    d_qk, d_v = {"envelope": (64, 64), "asymmetric": (96, 80)}.get(geometry, (128, 128))
+    api, t = _half_prefold_api(
+        d_qk,
+        d_v,
+        getattr(torch, dtype_name),
+        prefolded=False,
+        with_stats=with_stats,
+        split_kv=split,
+        b=2,
+        hq=2 * group,
+        hkv=2,
+        s_q=sq,
+        s_kv=sk,
+        causal=causal,
+        bottom_right=br,
+        window_left=window,
+        sink=sink,
+        pack_gqa=True,
+    )
+    api.sched_policy = sched_policy
+    assert api.check_support()
+    api.compile()
+    assert api._k_mod.__file__.endswith("sm107/prefill_d128_f16.py")
+    cfg = api._k_mod.CFG
+    assert (cfg.PACK_G, cfg.STAGES_KV, cfg.SOFTMAX_WARPGROUPS) == (group, 4, 2)
+    ws = torch.empty(max(api.scratch_workspace_bytes(), 1), dtype=torch.uint8, device="cuda")
+    stream = torch.cuda.Stream()
+
+    def execute():
+        api.execute(
+            q_tensor=t["q"],
+            k_tensor=t["k"],
+            v_tensor=t["v"],
+            o_tensor=t["out"],
+            lse_tensor=t["lse"],
+            sinks=t["sinks"],
+            workspace=ws,
+            current_stream=cuda.CUstream(stream.cuda_stream),
+        )
+
+    with torch.cuda.stream(stream):
+        execute()
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            execute()
+        for _ in range(2):
+            t["v"].neg_()
+            t["out"].fill_(torch.nan)
+            if t["lse"] is not None:
+                t["lse"].fill_(torch.nan)
+            torch.cuda.synchronize()
+            graph.replay()
+            torch.cuda.synchronize()
+            mask = _dense_mask(sq, sk, causal=causal, bottom_right=br, window_left=window)
+            ref_o, ref_lse = _half_oracle(t["q"], t["k"], t["v"], logit_scale=t["attn_scale"], masked=mask, sinks=t["sinks"])
+            torch.testing.assert_close(t["out"].double(), ref_o, atol=4e-3, rtol=4e-3)
+            if t["lse"] is not None:
+                torch.testing.assert_close(t["lse"].double(), ref_lse, atol=4e-4, rtol=0)
+    finally:
+        graph.reset()
+
+    if geometry == "mha":
+        # PACK_G=1 must be the unpacked function, including exact rounding.
+        plain, u = _half_prefold_api(
+            128, 128, getattr(torch, dtype_name), prefolded=False, with_stats=with_stats, split_kv=1, b=2, hq=2, hkv=2, s_q=sq, s_kv=sk
+        )
+        plain.sched_policy = sched_policy
+        assert plain.check_support()
+        plain.compile()
+        plain_ws = torch.empty(max(plain.scratch_workspace_bytes(), 1), dtype=torch.uint8, device="cuda")
+        plain.execute(q_tensor=u["q"], k_tensor=u["k"], v_tensor=u["v"], o_tensor=u["out"], lse_tensor=u["lse"], workspace=plain_ws)
+        torch.cuda.synchronize()
+        assert torch.equal(t["out"], u["out"])
+        if with_stats:
+            assert torch.equal(t["lse"], u["lse"])

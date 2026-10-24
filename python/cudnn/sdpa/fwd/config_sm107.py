@@ -1791,6 +1791,7 @@ class _CfgSm107(D128FamilySmallTileFields):
     HAS_SINK: int = 0
     STATS_LOG2: int = 0
     PACK_GQA: int = 0
+    PACK_G: int = 0  # 0 preserves whole-group packing on flavors without an explicit group.
     QH_PER_KH: int = 1
     SPLIT_KV: int = 1
     SEQ_KV_LENS_PRESENT: int = 0
@@ -2250,6 +2251,7 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
         HAS_SINK=has_sink,
         STATS_LOG2=int(params.stats_log2),
         PACK_GQA=int(params.pack_gqa),
+        PACK_G=_pack_g(params, tile_m, partial=params.dtype_qkv > _DTYPE_E5M2),
         QH_PER_KH=params.qh_per_kh,
         SPLIT_KV=params.split_kv or 1,
         SEQ_KV_LENS_PRESENT=1 if params.thd_varlen else int(params.seq_kv_lens_present),

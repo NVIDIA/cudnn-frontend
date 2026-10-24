@@ -71,10 +71,16 @@ page tables. Page counts, table and pool strides bind at execution time; the
 compiled pool layout and page size stay fixed.
 
 On exact SM107, nonpaged FP16/BF16 D128/V128 THD also supports explicit
-PackGQA with two CTAs and no split, using the existing shared SM100 body.
+PackGQA with two CTAs and no split, using the native SM107 D128 body.
 Partial groups pack the largest divisor of the head ratio that divides the
 tile, as on SM100. Packed NH/HN and padded Stats retain their declared layout;
-the shared body applies scaling in-kernel and rejects pre-folded Q scaling.
+the existing public packing admission still rejects pre-folded Q scaling.
+Dense D128 CGA2 packing (including existing split-KV plans) also uses the native
+body. Packed and unpacked plans share its two softmax warpgroups and four KV
+stages, and declare their persistent THD scheduler to the launch adapter.
+An envelope of up to two resident waves is assigned directly; larger envelopes
+use one resident wave and claim further work on device.
+Decode, paged and single-Q split plans retain their existing bodies.
 Automatic candidate proposals and placement are unchanged. The THD packing,
 mask/sink, padded-Stats and changed-length replay tests exercise this support.
 
