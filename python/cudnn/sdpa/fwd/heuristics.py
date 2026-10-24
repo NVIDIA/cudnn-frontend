@@ -2322,7 +2322,7 @@ def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] 
 
 
 def _sm107_fp8_dense_d128(caps: Capabilities, facts) -> bool:
-    """The cc 10.7 per-tensor E4M3 dense (not THD) d128 prefill (the measured scope)."""
+    """The cc 10.7 per-tensor E4M3 dense (not THD, paged or padded) d128 prefill (the measured scope)."""
     return (
         caps.sm_lo == 107
         and facts.device_cc == (10, 7)
@@ -2330,6 +2330,8 @@ def _sm107_fp8_dense_d128(caps: Capabilities, facts) -> bool:
         and not facts.is_mxfp8
         and facts.dtype == cudnn.data_type.FP8_E4M3
         and not facts.thd
+        and not facts.has_paged_kv
+        and not facts.padded
         and _selected_d_shape(caps, facts) == (128, 128)
     )
 

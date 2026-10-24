@@ -2248,3 +2248,10 @@ def test_sm107_fp8_d128_proposes_admissible_pack_sets(sm107_metadata_target, b, 
     assert any(p.knobs.pack_gqa for p in plans) is (h_q != h_kv), [p.knobs for p in plans]
     spec = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_FP8)
     assert all(engines.mismatch(spec.capabilities, facts, p.knobs) is None for p in plans)
+    import dataclasses
+
+    from cudnn.sdpa.fwd.heuristics import _sm107_fp8_dense_d128
+
+    assert _sm107_fp8_dense_d128(spec.capabilities, facts)
+    assert not _sm107_fp8_dense_d128(spec.capabilities, dataclasses.replace(facts, has_paged_kv=True, page_size=16))
+    assert not _sm107_fp8_dense_d128(spec.capabilities, dataclasses.replace(facts, padded=True))
