@@ -594,6 +594,14 @@ def _dispatch_sparse_attn_tile_params(
     """
     m = qhead_per_kv_head
 
+    # H96 cannot use the default n64 attention epilogue: Ld16x64bOp would
+    # require Repetition(96 // 2), but 48 is not a supported TMEM repetition.
+    # The existing n128 epilogue uses its fixed Repetition(8) load and covers
+    # all 96 heads natively.  Split D576 into three K192 chunks to retain two
+    # KV pipeline stages within the SM100 shared-memory budget.
+    if head_dim == 576 and qhead_per_kv_head == 96:
+        return m, 128, 192
+
     if compact:
         # --- Compact tuned configs ---
         # hd=512
