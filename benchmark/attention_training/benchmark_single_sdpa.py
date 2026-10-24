@@ -1736,7 +1736,9 @@ else:
                 dropout_seed = torch.full((1, 1, 1, 1), 123456, dtype=torch.int64, device="cuda")
                 dropout_offset = torch.full((1, 1, 1, 1), 789, dtype=torch.int64, device="cuda")
 
-            # Only variant pack and workspace need to be updated for each iteration.
+            # Rebind the new tensors, but reuse the workspace allocated for these
+            # fixed graph plans. Replacing it here temporarily keeps two full
+            # workspaces alive and can OOM before an otherwise fitting launch.
             if run_bwd:
                 if args.data_type == "fp8":
                     variant_pack_fwd = {
@@ -1843,11 +1845,6 @@ else:
                         dK_bwd: dKey,
                         dV_bwd: dValue,
                     }
-                workspace = torch.empty(
-                    max(graph_fwd.get_workspace_size(), graph_bwd.get_workspace_size()),
-                    device="cuda",
-                    dtype=torch.uint8,
-                )
             else:
                 if args.data_type == "fp8":
                     variant_pack_fwd = {
@@ -1891,8 +1888,6 @@ else:
                     }
                     if not is_infer:
                         variant_pack_fwd[stats_fwd] = stats
-                workspace = torch.empty(graph_fwd.get_workspace_size(), device="cuda", dtype=torch.uint8)
-
             if is_dropout:
                 variant_pack_fwd[seed_fwd] = dropout_seed
                 variant_pack_fwd[offset_fwd] = dropout_offset
