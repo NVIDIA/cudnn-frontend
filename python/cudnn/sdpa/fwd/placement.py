@@ -792,6 +792,7 @@ def _sm100_paged_gqa_prefill(facts) -> bool:
         and 2048 <= facts.s_kv <= 32768
         and facts.page_size == 16
         and facts.causal
+        and (facts.bottom_right or facts.s_q == facts.s_kv)
         and facts.window_left is None
         and not (facts.has_sink or facts.right_band_widening)
         and facts.k_t is not None

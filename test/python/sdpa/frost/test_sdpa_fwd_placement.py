@@ -900,6 +900,7 @@ def test_sm100_paged_gqa_prefill_leads_inside_its_box():
     place = lambda **over: placement.place(spec, _sm107_paged_facts(**{**base, **over}))
     assert place() == placement.LEAD
     assert place(b=1, s_q=4096, s_kv=4096, bottom_right=False, max_total_seq_len_q=4096) == placement.LEAD
+    assert place(bottom_right=False) == placement.TRAIL  # top-left non-square chunk: outside the measured scope
     assert place(h_q=32, h_kv=4) == placement.TRAIL  # exact G8 with an exact total-Q declaration
     assert place(h_q=32, h_kv=4, max_total_seq_len_q=None) == placement.LEAD  # exact G8, no total-Q declaration
     assert place(h_q=32, h_kv=32, max_total_seq_len_q=None) == placement.TRAIL
