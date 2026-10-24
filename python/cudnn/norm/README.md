@@ -125,7 +125,7 @@ API (the kernel is still used for InstanceNorm graphs).
 
 ## Environment
 
-Requires Blackwell (sm_100), a CUDA 13-capable driver, and a CUTLASS DSL build
+Requires Blackwell (SM100 or SM103; Hopper SM90 through the opt-in `norm_*_sm90` rows), a CUDA 13-capable driver, and a CUTLASS DSL build
 >= 4.7.0 that exports `cutlass.primitives`. The norm entry points reject builds
 without this module. Check the active environment before running:
 

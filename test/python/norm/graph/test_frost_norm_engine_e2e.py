@@ -89,8 +89,8 @@ def _tol(dt, base):
 def _specs_for_device():
     """The forward and backward rows serving the current device, or None where no row does."""
     cc = torch.cuda.get_device_capability()
-    fspec = next((s for s in fe.ENGINE_SPECS if s.capabilities.arch == cc), None)
-    bspec = next((s for s in be.ENGINE_SPECS if s.capabilities.arch == cc), None)
+    fspec = next((s for s in fe.ENGINE_SPECS if cc in s.capabilities.archs), None)
+    bspec = next((s for s in be.ENGINE_SPECS if cc in s.capabilities.archs), None)
     return (fspec, bspec) if fspec is not None and bspec is not None else None
 
 

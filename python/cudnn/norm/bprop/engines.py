@@ -36,7 +36,8 @@ class NormBwdKnobs:
 @dataclass(frozen=True)
 class Capabilities:
     variants: frozenset = _ALL_VARIANTS
-    arch: tuple = (10, 0)
+    # Device ccs served, matched exactly: B200 / GB200 and B300 / GB300 run the same kernels.
+    archs: frozenset = frozenset({(10, 0), (10, 3)})
     phase: str = "bprop"
     dtypes: frozenset = _ALL_DTYPES
 
@@ -51,8 +52,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.NormGraphFacts", requested: 
         return f"engine serves {capabilities.phase}; graph is {facts.phase}"
     if facts.variant not in capabilities.variants:
         return f"engine does not serve norm variant {facts.variant.value}"
-    if facts.device_cc != capabilities.arch:
-        return f"requires SM{capabilities.arch[0]}{capabilities.arch[1]}; current device is {facts.device_cc}"
+    if facts.device_cc not in capabilities.archs:
+        return f"requires {' or '.join(f'SM{a}{b}' for a, b in sorted(capabilities.archs))}; current device is {facts.device_cc}"
     if facts.dtype not in capabilities.dtypes:
         return f"dtype {facts.dtype} not in {sorted(str(d) for d in capabilities.dtypes)}"
     if not facts.uniform_dtype:
@@ -71,7 +72,7 @@ ENGINE_NAME = "norm_bprop_sm100"
 # The SM90 row runs the same kernels (cp.async.bulk, clusters and mapa are all Hopper).
 ENGINE_SPECS = (
     EngineSpec(name=ENGINE_NAME, capabilities=Capabilities()),
-    EngineSpec(name="norm_bprop_sm90", capabilities=Capabilities(arch=(9, 0))),
+    EngineSpec(name="norm_bprop_sm90", capabilities=Capabilities(archs=frozenset({(9, 0)}))),
 )
 
 

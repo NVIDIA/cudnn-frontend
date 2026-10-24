@@ -134,7 +134,12 @@ def main():
     # stay cc 10.0 only.
     fspec = {spec.name: spec.capabilities for spec in fe.ENGINE_SPECS}
     bspec = {spec.name: spec.capabilities for spec in be.ENGINE_SPECS}
-    for cc, fwd_ok, bwd_ok in (((9, 0), "norm_fprop_sm90", "norm_bprop_sm90"), ((10, 0), "norm_fprop_sm100", "norm_bprop_sm100"), ((8, 0), None, None)):
+    for cc, fwd_ok, bwd_ok in (
+        ((9, 0), "norm_fprop_sm90", "norm_bprop_sm90"),
+        ((10, 0), "norm_fprop_sm100", "norm_bprop_sm100"),
+        ((10, 3), "norm_fprop_sm100", "norm_bprop_sm100"),
+        ((8, 0), None, None),
+    ):
         for name, cap in fspec.items():
             for facts in (f, fbn):
                 accepted = fe.mismatch(cap, dataclasses.replace(facts, device_cc=cc)) is None
