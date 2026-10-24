@@ -324,6 +324,16 @@ together at each caller; THD does not imply persistent scheduling in every
 kernel family. Detector:
 `test_sdpa_fwd_o_empty_backedge.py::test_scheduler_and_credit_target_select_the_same_layouts`.
 
+A completed mbarrier phase needs a successful wait before arrivals in the
+next phase, even when output ordering already protects the shared storage.
+The D128 backward store warp bootstraps four dQ source-credit barriers per
+CLC owner. Its native dV/dK epilogue waits on only slices 1/3, so explicitly
+observe all four terminal phases before publishing those outputs, including
+zero-trip owners. Keep dense and THD loops consistent; grouped kernels reuse
+them. Run `test_sdpa_bwd_d128_terminal_credits.py` under Compute Sanitizer
+synccheck as well as its ordinary FP64/canary and capture/replay checks:
+correct numerical output alone does not detect this protocol violation.
+
 Match barrier completion cadence to the consumer's loop. SM100 D512 MXFP8
 SWA=128 drains two Dv slices per tile, so a once-per-tile softmax wait must use
 the once-per-tile Q/O alias signal, including its explicit bootstrap phase,
