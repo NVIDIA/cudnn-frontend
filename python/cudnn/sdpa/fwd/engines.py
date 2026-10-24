@@ -1425,8 +1425,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if sm120_tile_reason is not None:
             return sm120_tile_reason
         # D128 half cga1 uses the decode tile for ragged Q=1 and the split
-        # host, or the two-slab prefill body for unsplit SM100 paged Q>1.
-        # Other ragged graphs keep the cga2 prefill tile.
+        # host, or two-slab prefill for admitted paged graphs and native Rubin
+        # nonpaged exact D128. effective_cgas gates the unsplit prefill domain.
         # api_dsl.check_support mirrors these lines (keep them in lockstep).
         ragged_decode = knobs.cga == 1 and facts.thd and _thd_decode_leg(capabilities, facts)
         packed_split = packed_thd_split(capabilities, facts, knobs)

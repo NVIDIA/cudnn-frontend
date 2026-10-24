@@ -2531,7 +2531,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     and (self.cga in (None, 2) or paged_prefill_cga1 or self._rubin_native_thd_prefill_leg())
                     and self.split_kv == 1
                 ),
-                "THD PackGQA requires half D128 cga2 unsplit/cga1 split, Rubin paged D128 cga1 unsplit, or Rubin paged D256 cga2 unsplit",
+                "THD PackGQA requires half D128 cga2 unsplit/cga1 split, native Rubin nonpaged D128 cga1/2 unsplit, "
+                "Rubin paged D128 cga1 unsplit, or Rubin paged D256 cga2 unsplit",
             )
             # Partial PackGQA (the largest divisor of the group that divides the
             # tile) is wired in SM100 d128 / d256 half and native Rubin ragged D128.
@@ -2649,17 +2650,18 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self.flavor == (192, 128) and self.split_kv > 1 and self.cga == 1 and not self.packed_thd_split,
             "D192 split_kv > 1 is validated only with cga=2",
         )
-        # Except for Rubin paged prefill, cga=1 on the d128 half flavor is the DECODE tile
-        # (sm100/decode_d128_f16.py). Paged THD uses either the one-query
-        # ragged-Q leg or the native unpacked packed-split host. Mirrors the
-        # engine row's mismatch line; keep both admissions in lockstep.
+        # D128 half cga1 uses the decode tile for one-query or split THD,
+        # and a two-slab prefill body for the admitted paged or native Rubin
+        # nonpaged unsplit legs. Keep these gates aligned with effective_cgas
+        # and the engine row's mismatch checks.
         self._not_implemented_error_if(
             self.flavor == _SM100_DECODE_FLAVOR
             and self.cga == 1
             and not self._fp8
             and self.thd
             and not (self.thd_decode_leg or self.packed_thd_split or paged_prefill_cga1 or self._rubin_native_thd_prefill_leg()),
-            "cga=1 on the d128 flavor selects the decode tile, which serves ragged Q over paged K/V with ragged Stats at S_q == 1, or unpacked exact D128 with split_kv > 1; "
+            "cga=1 on the d128 half flavor requires an admitted one-query/split THD decode leg, paged prefill, "
+            "or native Rubin nonpaged exact D128 unsplit prefill; "
             "other THD (ragged) graphs run the cga2 prefill tile",
         )
         # The per-tensor FP8 d128 flavor admits cga1 too, as its dense unsplit
