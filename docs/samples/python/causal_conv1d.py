@@ -6,7 +6,7 @@
 import torch
 import torch.nn.functional as F
 
-import cudnn
+from cudnn.ops.causal_conv1d import causal_conv1d
 
 
 def reference(
@@ -50,7 +50,6 @@ def main() -> None:
         requires_grad=True,
     )
 
-    causal_conv1d = getattr(cudnn.ops, "causal_conv1d")
     actual = causal_conv1d(x, weight, bias, activation="silu")
 
     reference_inputs = tuple(
