@@ -31,6 +31,7 @@ la_ops = pytest.importorskip("cudnn.linear_attention.ops")
 
 import torch.nn.functional as F  # noqa: E402
 import torch.utils.checkpoint  # noqa: E402
+from torch._subclasses.fake_tensor import FakeTensorMode  # noqa: E402
 
 from .conftest import gen_qkv  # noqa: E402
 from .reference_gdn import gdn_reference, gdp_reference, rms_ratio  # noqa: E402
@@ -3287,6 +3288,129 @@ def test_gdp_token_major_bitwise(backend, n, V, l2norm):
         o_m, fs_m, dq_m, dg_m, (djoint, dbeta_m) = run(k_t, v_t, beta_l, [joint_l, beta_l])
         dk_m, dv_m, _ = strided_grads(djoint, None)
         check("mixed", o_m, fs_m, dq_m, dg_m, dk_m, dv_m, dbeta_m)
+
+
+@pytest.mark.parametrize(
+    "n,V,heads,l2norm,checkpoint,chain",
+    [
+        pytest.param(1, 64, (2, 2, 2), False, 0, False, id="u1-v64-equal"),
+        pytest.param(2, 128, (2, 2, 2), False, 0, False, id="u2-v128-equal"),
+        pytest.param(3, 64, (2, 2, 2), False, 0, False, id="u3-v64-equal"),
+        pytest.param(3, 128, (2, 2, 2), False, 0, False, id="u3-v128-equal"),
+        pytest.param(3, 64, (9, 9, 18), False, 0, False, id="u3-v64-gva"),
+        pytest.param(3, 128, (9, 9, 18), False, 0, False, id="u3-v128-gva"),
+        pytest.param(3, 64, (4, 2, 2), False, 0, False, id="u3-v64-gqa"),
+        pytest.param(3, 128, (4, 2, 2), False, 0, False, id="u3-v128-gqa"),
+        pytest.param(4, 64, (2, 2, 2), True, 0, False, id="u4-v64-equal-norm"),
+        pytest.param(5, 128, (2, 2, 2), True, 0, False, id="u5-v128-equal-norm"),
+        pytest.param(3, 64, (9, 9, 18), False, 64, False, id="u3-v64-gva-checkpoint"),
+        pytest.param(3, 128, (9, 9, 18), True, 192, False, id="u3-v128-gva-coarse-norm"),
+        pytest.param(3, 64, (4, 2, 2), True, 192, False, id="u3-v64-gqa-coarse-norm"),
+        pytest.param(3, 128, (4, 2, 2), True, 0, False, id="u3-v128-gqa-norm"),
+        pytest.param(3, 128, (2, 2, 2), False, 64, False, id="u3-v128-equal-checkpoint"),
+        pytest.param(3, 64, (2, 2, 2), False, 0, True, id="u3-v64-chain"),
+        pytest.param(3, 128, (2, 2, 2), False, 0, True, id="u3-v128-chain"),
+    ],
+)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_gdp_head_major_grads(backend: Backend, n: int, V: int, heads: tuple[int, int, int], l2norm: bool, checkpoint: int, chain: bool) -> None:
+    """Exact [T,H,U,D] storage: head-major dK/dV match expanded rows and their fake metadata, including head folds.
+
+    U=3/5 make 64-update stores straddle tokens. Ragged boundaries cover leading/trailing partial tokens, a one-token
+    sequence and empty sequences. L2 normalization makes input K contiguous while its gradient stays head-major.
+    """
+    H, HK, HV = heads
+    seq_lens = [0, 1, 8193, 0] if chain else [0, 1, 21, 22, 43, 64, 65, 0]
+    case = make_case("gdp", torch.bfloat16, seq_lens=seq_lens, H=H, HK=HK, HV=HV, V=V, n=n)
+    q, k, v, g, beta = thd_tensors(case)
+    state0 = random_state(case)
+    dFS = random_state(case, seed=SEED + 2)
+    set_seed(SEED + 3)
+    dO = torch.randn(case.T, case.HO, case.V, device="cuda", dtype=case.dtype)
+    forward_kw = dict(
+        initial_state=state0,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=l2norm,
+        checkpoint_every_n_tokens=checkpoint,
+        batch_invariant=True,
+    )
+    backward_kw = dict(
+        initial_state=state0,
+        d_final_state=dFS,
+        use_qk_l2norm_in_kernel=l2norm,
+        checkpoint_every_n_tokens=checkpoint,
+        batch_invariant=True,
+        plan_name=backend.plan("gdp"),
+    )
+    bwd = torch.ops.cudnn.gated_delta_product_bwd
+    with waive_unsupported(backend, "gdp"):
+        expanded = pinned_op(backend, "gdp")(q, k, v, g, beta, case.cu, case.n, **forward_kw)
+        want = bwd(dO, q, k, v, g, beta, case.cu, case.n, float(case.K**-0.5), state_checkpoints=expanded[2] if checkpoint else None, **backward_kw)
+    check_cache = n == 3 and heads == (2, 2, 2) and checkpoint == 0 and not chain
+    if check_cache:
+        # Padded update-major inputs use the same input families as head-major inputs but different output families.
+        # Run them first so a graph-cache key that omits output layout cannot mask the head-major gradient change.
+        k_pad = k.new_empty((case.T, n * HK * case.K + 64))[:, : n * HK * case.K].view(case.T, n, HK, case.K)
+        v_pad = v.new_empty((case.T, n * HV * V + 64))[:, : n * HV * V].view(case.T, n, HV, V)
+        k_pad.copy_(k.view_as(k_pad))
+        v_pad.copy_(v.view_as(v_pad))
+        padded = bwd(dO, q, k_pad, v_pad, g, beta, case.cu, n, float(case.K**-0.5), **backward_kw)
+        for index in (1, 2):
+            assert_bitwise("padded gradient", padded[index].reshape(want[index].shape), want[index])
+            assert padded[index].is_contiguous(), "Padded update-major inputs must retain update-major gradient storage"
+        cache = importlib.import_module("cudnn.linear_attention.ops.gdp").bprop_cache
+        cache_keys = set(cache)
+    padding = 64 if l2norm or checkpoint or chain else 0
+    k_h = k.new_empty((case.T, HK * n * case.K + padding))[:, : HK * n * case.K].view(case.T, HK, n, case.K).transpose(1, 2)
+    v_h = v.new_empty((case.T, HV * n * V + padding))[:, : HV * n * V].view(case.T, HV, n, V).transpose(1, 2)
+    k_h.copy_(k.view_as(k_h))
+    v_h.copy_(v.view_as(v_h))
+    head_major = pinned_op(backend, "gdp")(q, k_h, v_h, g, beta, case.cu, case.n, **forward_kw)
+    assert_bitwise("head-major o", head_major[0], expanded[0])
+    assert_bitwise("head-major final_state", head_major[1], expanded[1])
+    args = (dO, q, k_h, v_h, g, beta, case.cu, case.n, float(case.K**-0.5))
+    backward_kw["state_checkpoints"] = head_major[2] if checkpoint else None
+    got = bwd(*args, **backward_kw)
+    if check_cache:
+        assert len(set(cache) - cache_keys) == 1, "This invocation needs a distinct destination-layout plan"
+    for name, actual, expected in zip(("dq", "dk", "dv", "dg", "dbeta", "dstate0", "da_log", "ddt_bias"), got, want):
+        assert_bitwise(f"head-major {name}", actual.reshape(expected.shape), expected)
+    for name, grad, source in (("dk", got[1], k_h), ("dv", got[2], v_h)):
+        _, updates, num_heads, width = source.shape
+        expected_strides = (num_heads * updates * width, width, updates * width, 1)
+        assert grad.stride() == expected_strides, f"{name} must have compact head-major strides: {grad.stride()} != {expected_strides}"
+        channels = grad.transpose(1, 2).view(case.T, -1)
+        assert channels.data_ptr() == grad.data_ptr(), f"{name} must flatten into head-major channels without a copy"
+    if n == 3 and heads == (2, 2, 2) and checkpoint == 0:
+        k_leaf = k_h.transpose(1, 2).view(case.T, -1).detach().requires_grad_(True)
+        v_leaf = v_h.transpose(1, 2).view(case.T, -1).detach().requires_grad_(True)
+        k_view = k_leaf.view(case.T, HK, n, case.K).transpose(1, 2)
+        v_view = v_leaf.view(case.T, HV, n, V).transpose(1, 2)
+        incoming = {}
+        k_view.register_hook(lambda grad: incoming.__setitem__("dk", grad))
+        v_view.register_hook(lambda grad: incoming.__setitem__("dv", grad))
+        output, final_state = pinned_op(backend, "gdp")(q, k_view, v_view, g, beta, case.cu, n, **forward_kw)
+        autograd_grads = torch.autograd.grad((output, final_state), (k_leaf, v_leaf), (dO, dFS))
+        for name, grad, expected in zip(("dk", "dv"), autograd_grads, got[1:3]):
+            assert_bitwise(f"autograd channel {name}", grad, expected.transpose(1, 2).view(case.T, -1))
+            assert grad.is_contiguous()
+            assert grad.data_ptr() == incoming[name].data_ptr(), "Autograd channel restoration must share gradient storage"
+    with FakeTensorMode(allow_non_fake_inputs=True):
+        meta = bwd(*args, **backward_kw)
+    for index, (actual, fake) in enumerate(zip(got, meta)):
+        assert (actual.shape, actual.stride(), actual.dtype) == (fake.shape, fake.stride(), fake.dtype), f"GDP backward fake metadata differs at output {index}"
+    if check_cache:
+        # Decide K and V destinations independently, then reuse the original update-major plan.
+        for k_m, v_m, expected_k, expected_v in ((k_h, v_pad, got[1], padded[2]), (k_pad, v_h, padded[1], got[2]), (k_pad, v_pad, padded[1], padded[2])):
+            mixed_args = (dO, q, k_m, v_m, g, beta, case.cu, n, float(case.K**-0.5))
+            mixed = bwd(*mixed_args, **backward_kw)
+            for actual, expected in zip(mixed, want):
+                assert_bitwise("mixed layout", actual.reshape(expected.shape), expected)
+            assert mixed[1].stride() == expected_k.stride()
+            assert mixed[2].stride() == expected_v.stride()
+            with FakeTensorMode(allow_non_fake_inputs=True):
+                mixed_meta = bwd(*mixed_args, **backward_kw)
+            assert [t.stride() for t in mixed] == [t.stride() for t in mixed_meta]
 
 
 @pytest.mark.parametrize("n", (1, 2, 3))

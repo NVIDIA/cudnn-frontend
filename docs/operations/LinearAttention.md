@@ -62,6 +62,22 @@ or token-major (`k` `[T, n, HK, K]`, `v` `[T, n, HV, V]`, `beta` `[T, n, HO]`, w
 per-token column slices of a joint `[V | K | Q]` projection (`[T, n * H * D]` viewed as `[T, n, H, D]`) are consumed in
 place; `dk`, `dv` and `dbeta` come back in the input's shape. `num_householder == 1` is exactly GDN.
 
+GDP selects compact head-major gradient storage independently for K and V when a rank-4 input has
+head-major inner strides: logical `[T, n, H, D]` with strides `(token_stride, D, n * D, 1)`.
+For these inputs, backward returns strides `(H * n * D, D, n * D, 1)`, including when the input's token
+stride has padding. This makes restoration to projection channels a view:
+
+```python
+kv = channels.view(T, H, n, D).transpose(1, 2)
+# After backward, dkv has the same logical shape and compact head-major storage.
+dchannels = dkv.transpose(1, 2).view(T, H * n * D)
+assert dchannels.data_ptr() == dkv.data_ptr()
+```
+
+Expanded-row and update-major inputs retain their existing gradient layout. Beta still requires unit head
+stride; packing head-major beta remains the caller's responsibility. Q, decay, output and sequence boundaries
+stay on the real-token timeline. This removes the separate K/V channel-restoration copies, not all backward temporaries.
+
 Mamba-2 uses the SSD vocabulary: `x` plays `v`, `B` plays `k`, `C` plays `q`, `dt` is the gate. The output is
 `y = C^T S + D x`, gated by `z sigmoid(z)` when `z` is given.
 
