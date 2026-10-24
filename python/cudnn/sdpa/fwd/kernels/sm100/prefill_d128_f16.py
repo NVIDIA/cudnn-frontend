@@ -296,28 +296,37 @@ _NB_FENCE_P0 = 11
 # exp2 split MUFU / FMA (``_E2E_*``): of every _E2E_FREQ P columns the LAST _E2E_RES are evaluated on the FMA
 # pipe (``exp2_emul_pair``, a degree-3 polynomial + exponent insert), the rest on MUFU.EX2 -- the sm100 d128
 # MXFP8 / FP8 kernels' pattern.  Two trace-time gates fold it in or out: ``PARAMS.exp2_fma_split`` (api_dsl,
-# cc 10.0 only -- cc 10.3 retains its all-MUFU path) AND a tile/layout gate. Dense bands retain
-# their existing mix. BF16 D128 causal THD also mixes interior tiles, where apply_mask is false;
-# its diagonal/masked tiles retain MUFU. Dense causal, sliding-window, FP16 causal THD, d64 THD,
-# paged THD, bias/KV-mask forms, and split-KV builds retain their previous behavior. Padding alone is not a causal/SWA band.
+# cc 10.0 only -- cc 10.3 retains its all-MUFU path) AND a tile/layout gate. Dense bands keep their
+# existing mix. BF16 D128 causal THD also mixes unmasked interior tiles (nonpaged, and paged without bias or an
+# explicit KV mask); diagonal, sliding-window and masked tiles retain MUFU. FP16 causal THD, d64 THD and
+# split-KV builds keep their previous behavior. Padding alone is not a causal/SWA band.
 _E2E_FREQ = 16
 _E2E_RES = 4
 _E2E_LIMIT = CFG.TILE_N
 _SOFTMAX_CHUNK = 64  # tcgen05_ld width of one softmax chunk (see _softmax_kv_body CHUNK)
 _E2E_DENSE_BAND = (CFG.MASK_FLAGS & (MASK_CAUSAL | MASK_SWA)) == 0
-# SM100 D128 BF16 nonpaged THD causal interior extension for CP workloads. Keep the
-# existing architecture gate and use MUFU on every masked/diagonal tile.
+_E2E_PAGED_INTERIOR = bool(
+    CFG.THD_VARLEN
+    and CFG.PAGED_KV
+    and CFG.DTYPE_QKV == 2
+    and PARAMS.d_flavor == 128
+    and CFG.SPLIT_KV == 1
+    and not CFG.BIAS_MODE
+    and not CFG.KV_MASK_FORM
+    and (CFG.MASK_FLAGS & (MASK_CAUSAL | MASK_SWA)) == MASK_CAUSAL
+)
+if _E2E_PAGED_INTERIOR:
+    _E2E_RES = 2
+# SM100 D128 BF16 nonpaged THD causal interior extension for CP workloads; masked/diagonal tiles stay on MUFU.
 _E2E_THD_INTERIOR = bool(
     CFG.THD_VARLEN
     and not CFG.PAGED_KV
-    and not CFG.BIAS_MODE
-    and not CFG.KV_MASK_FORM
     and CFG.DTYPE_QKV == 2
     and PARAMS.d_flavor == 128
     and CFG.SPLIT_KV == 1
     and (CFG.MASK_FLAGS & (MASK_CAUSAL | MASK_SWA)) == MASK_CAUSAL
 )
-_E2E_ENABLED = bool(PARAMS.exp2_fma_split) and (_E2E_DENSE_BAND or _E2E_THD_INTERIOR)
+_E2E_ENABLED = bool(PARAMS.exp2_fma_split) and (_E2E_DENSE_BAND or _E2E_PAGED_INTERIOR or _E2E_THD_INTERIOR)
 _E2E_EMULATED_COLS = (_E2E_LIMIT // _E2E_FREQ) * _E2E_RES if _E2E_ENABLED else 0
 if _E2E_ENABLED:
     if not (0 <= _E2E_RES <= _E2E_FREQ and _E2E_FREQ % 2 == 0 and _E2E_RES % 2 == 0 and _E2E_LIMIT % _E2E_FREQ == 0):
@@ -356,7 +365,23 @@ THD_PERSISTENT = True
 # count must be in CGA-tile (cluster) units (q_tiles = n_q_supers // CTA_MMA),
 # not per-CTA super-row units; the legacy default over-counts by CTA_MMA and
 # scrambles LPT tile assignment (cf. ctm_lpt_decode_qtiles_bug; dsv4/qwen sm100).
-_sdpa_h = make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units=True)
+# Qualify this integer-only lookup independently of the attention arithmetic.
+# Keep other geometries on their existing decoder until they are measured.
+# This also selects the shared paged body (including the SM107 paged route):
+# work ownership depends on packed Q tiles, not on K/V pool layout or length.
+_BOUNDED_THD_DECODE = (
+    CFG.THD_VARLEN == 1
+    and CFG.DTYPE_QKV == 2
+    and PARAMS.d_flavor == 128
+    and CFG.TILE_M == 128
+    and CFG.TILE_N == 128
+    and CFG.CGA_M == 2
+    and CFG.CGA_N == 1
+    and CFG.SPLIT_KV == 1
+    and (CFG.MASK_FLAGS & (MASK_CAUSAL | MASK_SWA)) == MASK_CAUSAL
+    and CFG.BOTTOM_RIGHT == 0
+)
+_sdpa_h = make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units=True, bounded_thd_decode=_BOUNDED_THD_DECODE)
 _decode_initial = _sdpa_h.decode_initial
 _decode_payload = _sdpa_h.decode_payload
 # qtrim variant: collapses the KV loop for CGA tiles entirely past the
@@ -3595,6 +3620,9 @@ def _host(
             cutlass.Int32(CGA_TILE_M // HEADS_PER_TILE),
             n_thd_units,
             not PAGED_KV,  # clamp_kv: paged pools have no packed KV total to clamp to
+            # Prefix requests can have short Q but long KV. Schedule their
+            # expensive tiles first; full prefill has identical Q/KV ordering.
+            rank_by_kv=PAGED_KV and bool(CFG.BOTTOM_RIGHT) and (CFG.MASK_FLAGS & MASK_SWA) == 0,
         ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
     else:

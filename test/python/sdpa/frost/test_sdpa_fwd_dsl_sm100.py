@@ -1373,7 +1373,7 @@ def test_dsl_sm100_q_trim_rejects_non_cuda_lengths(monkeypatch, length_device):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("storage_order", [(0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0), None])
-@pytest.mark.parametrize("pack_gqa", [False, pytest.param(True, marks=_skip_pack_gqa_on_rubin)], ids=["unpacked", "packed"])
+@pytest.mark.parametrize("pack_gqa", [False, True], ids=["unpacked", "packed"])
 @torch_fork_set_rng(seed=0)
 def test_dsl_sm100_thd_padded_stats_in_a_non_self_inverse_layout(storage_order, pack_gqa):
     """A padded Stats whose (b, h, s_max) storage order is (h, s_max, b) --
@@ -2302,7 +2302,13 @@ def _run_dsl_thd_graph(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch=_ARCH), pack_gqa=pack_gqa)
+    _select_engine(g, engine_name(arch=_ARCH))
+    if pack_gqa is not None:
+        # Exercise the requested support directly, independently of automatic candidate proposals.
+        engine, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
+        knobs.update({cudnn.knob_type.PACK_GQA: int(pack_gqa), cudnn.knob_type.TILE_CGA_M: 2, cudnn.knob_type.SPLIT_KV: 1})
+        g.create_execution_plan(engine, knobs)
+        g.select_plan(g.get_execution_plan_count() - 1)
     g.check_support()
     g.build_plans()
     if on_graph is not None:
@@ -2482,7 +2488,6 @@ def _run_thd_stats_case(
 
 
 @pytest.mark.L0
-@_skip_pack_gqa_on_rubin
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.parametrize("stats_layout", ["token_major", "head_major"])
 @pytest.mark.parametrize("H_q,H_kv", [(32, 8), (64, 8), (48, 8), (96, 8), (256, 1)])
@@ -2497,6 +2502,27 @@ def test_dsl_sm100_thd_pack_gqa_stats_capture(dtype, stats_layout, H_q, H_kv):
         H_kv=H_kv,
         mask="causal_br",
         stats_layout=stats_layout,
+        cu_lens=True,
+        pack_gqa=True,
+        capture=True,
+    )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("mask", ["none", "causal", "causal_br", "swa"])
+@pytest.mark.parametrize("with_sink", [False, True])
+@torch_fork_set_rng(seed=1909)
+def test_dsl_sm100_thd_pack_gqa_masks(mask, with_sink):
+    """Partial head groups preserve masks and the per-query-head sink under packing."""
+    _run_thd_stats_case(
+        seq_lens_q=[33, 129, 0],
+        seq_lens_kv=[65, 257, 0],
+        dtype=torch.bfloat16,
+        H_q=12,
+        H_kv=2,
+        mask=mask,
+        with_sink=with_sink,
+        stats_layout="head_major",
         cu_lens=True,
         pack_gqa=True,
         capture=True,

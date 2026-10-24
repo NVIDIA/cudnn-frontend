@@ -451,8 +451,8 @@ def block_sparse_attention_backward(
         raise NotImplementedError("blk64 backward requires head_dim=128")
     if sparse_block_size == 128 and head_dim not in {64, 128}:
         raise NotImplementedError("SM100/SM110 blk128 backward requires head_dim=64 or 128")
-    if arch_family != 9 and sparse_block_size == 128 and block_sizes is not None:
-        raise NotImplementedError("SM100/SM110 blk128 backward does not yet support block_sizes; " "use full physical KV blocks and pass block_sizes=None")
+    if arch_family != 9 and arch not in (100, 103) and sparse_block_size == 128 and block_sizes is not None:
+        raise NotImplementedError(f"SM{arch} blk128 backward does not yet support block_sizes; use full physical KV blocks and pass block_sizes=None")
 
     expected_prefix = (
         batch,
@@ -466,7 +466,7 @@ def block_sparse_attention_backward(
         expected_prefix=expected_prefix,
         num_kv_blocks=(seqlen_k + sparse_block_size - 1) // sparse_block_size,
         device=q_tensor.device,
-        allowed_block_size_ranks=(1, 2),
+        allowed_block_size_ranks=(1,) if arch in (100, 103) and sparse_block_size == 128 else (1, 2),
     )
     if block_sparse_num is None:
         block_sparse_num = int(q2k_block_index.shape[-1])

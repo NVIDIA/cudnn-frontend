@@ -55,6 +55,15 @@ name, no allocation on the execute path; the caller-list block fed the indexer's
 with no warm-up and replayed bitwise, over a new step too; the RoPE-table ceiling by form; the ring-slot form bitwise the derived
 one; the position-table arm bitwise the per-token form; the per-row MTP rows; the workspace sentinel; the typed declines, each equal
 to the envelope's row; the execute inputs refused in both directions.
+
+The e4m3 indexer cache at decode (``QsaSpec(index_source="indexer", index_cache_dtype=torch.float8_e4m3fn)`` over the pools; served
+2026-10-21): the ``_IndexerCase(index_cache_dtype=)`` cells -- the ladder's four e4m3 rows with the two-stage oracle on the kernel's OWN
+e4m3 operands (the set == their fp64 top-k up to ties), the cache rows and ``ix_q`` BITWISE the bf16 twin's ``.to(float8_e4m3fn)`` on the same
+inputs (one rounding convention across the fused prepare, the step form and the pool-1 compress), the bf16-vs-e4m3 set agreement a
+STATISTIC with the structural pin that every flipped block sits at the rank boundary; the identity region; the first-execute capture under
+e4m3; fused == unfused bitwise with the census by kernel name (no cast kernel); the declaration (the ``indexer_e4m3_cache`` decline row
+RETIRED, ``index_cache_dtypes == (bf16, e4m3)``, the ``ix_q`` slot at 1 B with every bf16 carve byte-identical); the samples and the execute
+tensors required in the declared dtype BOTH ways; the e4m3 pool still declined with the e4m3 indexer cache.
 """
 
 import contextlib
@@ -127,8 +136,8 @@ def _cos(a, b):
 
 
 def _bits(x: torch.Tensor) -> torch.Tensor:
-    """The 16-bit patterns of a bf16 / f16 tensor: a NaN-safe bitwise comparison."""
-    return x.contiguous().view(torch.int16)
+    """The bit patterns of a bf16 / f16 (16-bit) or an e4m3 (8-bit) tensor: a NaN-safe bitwise comparison."""
+    return x.contiguous().view(torch.int8 if x.element_size() == 1 else torch.int16)
 
 
 def _sentinel(dtype):
@@ -286,23 +295,110 @@ def test_the_indexer_band_declaration_over_the_pools_is_capture_safe_at_decode_r
 
 def test_the_sparse_split_rule_fills_the_machine_and_stays_inside_the_item():
     """The split the sparse decode mode lowers with when ``decode_split_kv=None``: enough chunks to put one work item per SM
-    (``ceil(SMs / (B x H_kv x S_q))``), never more than the item's tile count ``ceil((top_k + 1) / 32)`` nor than the measured cap of 16
-    (the B 1 / B 4 x 32K x S_q 1 split sweeps on a 212-SM part with the pinned decode-grid combine: the step keeps falling to 16-17
-    chunks where the former combine entry, whose cost grows with the partial count, turned up past 16), 1 for a full launch and
-    for a non-CUDA reading (0 SMs) -- a performance choice only: the same function under every value."""
-    from cudnn.gated_attention_block.api import SPARSE_DECODE_SPLIT_CAP
+    (the FILL rule, ``ceil(SMs / (B x H_kv x S_q))``), never more than the item's tile count ``ceil((top_k + 1) / 32)`` nor than the
+    measured cap of 16 (the B 1 / B 4 x 32K x S_q 1 split sweeps on a 212-SM part with the pinned decode-grid combine: the step keeps
+    falling to 16-17 chunks where the former combine entry, whose cost grows with the partial count, turned up past 16), 1 for a
+    non-CUDA reading (0 SMs) -- and where that fill leaves a SECOND WAVE of SMs (``B x H_kv x S_q x split > SMs``: a CTA streams its
+    chunk serially, so 256 equal items on 212 SMs cost two item durations, not 1.2) the WAVE rule: the split in ``[1, cap]`` that
+    minimizes ``waves x (tiles per chunk + 1)`` (the ``+ 1`` = the chunk-item's fixed cost in tile units), ties to the SMALLER split
+    -- the 256-item T 128 launch 1 -> 3, B 32 x S_q 1 4 -> 3, B 4 x S_q 4 7 -> 6; every launch the fill rule keeps in one wave is
+    untouched, bitwise.  A performance choice only: the same function under every value."""
+    from cudnn.gated_attention_block.api import SPARSE_DECODE_SPLIT_CAP, SPARSE_DECODE_SPLIT_ITEM_COST_TILES
     from cudnn.gated_attention_block.api import sparse_decode_split_choice as pick
 
-    assert SPARSE_DECODE_SPLIT_CAP == 16
-    assert pick(batch=4, h_kv=2, s_q=1, top_k=512, sm_count=212) == 16  # 212 / 8 = 27 -> the measured cap of 16 (below the 17 tiles of a 512-list item)
-    assert pick(batch=1, h_kv=2, s_q=1, top_k=512, sm_count=212) == 16  # 2 items: the cap again
+    assert SPARSE_DECODE_SPLIT_CAP == 16 and SPARSE_DECODE_SPLIT_ITEM_COST_TILES == 1
+    # ONE-wave launches: the fill rule as measured, untouched by the wave rule
+    assert (
+        pick(batch=4, h_kv=2, s_q=1, top_k=512, sm_count=212) == 16
+    )  # 212 / 8 = 27 -> the measured cap of 16 (below the 17 tiles of a 512-list item): 128 chunk-items, one wave
+    assert pick(batch=1, h_kv=2, s_q=1, top_k=512, sm_count=212) == 16  # 2 items: the cap again (32 chunk-items)
     assert pick(batch=1, h_kv=2, s_q=1, top_k=256, sm_count=212) == 9  # ceil(257 / 32) = 9 tiles at top_k 256: the item's tile count binds under the cap
-    assert pick(batch=32, h_kv=2, s_q=1, top_k=512, sm_count=212) == 4  # ceil(212 / 64) = 4: the fill rule, under either cap
-    assert pick(batch=4, h_kv=2, s_q=4, top_k=512, sm_count=212) == 7  # ceil(212 / 32)
-    assert pick(batch=32, h_kv=2, s_q=4, top_k=512, sm_count=212) == 1  # 256 items: a full launch never splits
     assert pick(batch=2, h_kv=2, s_q=1, top_k=64, sm_count=212) == 3  # ceil(65 / 32) = 3 tiles at top_k 64
+    assert pick(batch=53, h_kv=2, s_q=1, top_k=512, sm_count=212) == 2  # 106 items x 2 = 212 chunk-items: EXACTLY one wave, the fill rule stands
     assert pick(batch=1, h_kv=2, s_q=1, top_k=512, sm_count=0) == 1  # no CUDA device: declined at check_support anyway
     assert pick(batch=1, h_kv=1, s_q=1, top_k=4, sm_count=212) == 1  # a 4-list item is one tile
+    # SECOND-wave launches: the fill rule's pick overflows one wave of SMs, the wave rule takes over (cost = waves x (tiles per chunk + 1))
+    assert (
+        pick(batch=32, h_kv=2, s_q=4, top_k=512, sm_count=212) == 3
+    )  # T 128: 256 items unsplit = 2 waves x (17 + 1) = 36; 768 chunk-items of 6 / 6 / 5 tiles = 4 waves x 7 = 28, the least
+    assert (
+        pick(batch=32, h_kv=2, s_q=1, top_k=512, sm_count=212) == 3
+    )  # the fill rule's 4 = 256 chunk-items (2 waves x 6 = 12); 3 = 192, ONE wave of 6 / 6 / 5 (7)
+    assert (
+        pick(batch=4, h_kv=2, s_q=4, top_k=512, sm_count=212) == 6
+    )  # the fill rule's 7 = 224 chunk-items (2 waves x 4 = 8); 6 = 192, one wave of 3 / 3 / 3 / 3 / 3 / 2 (4)
+    assert pick(batch=16, h_kv=2, s_q=4, top_k=512, sm_count=212) == 3  # 128 items: the fill rule's 2 = 256 (2 waves x 10 = 20); 3 = 384 (2 waves x 7 = 14)
+    assert (
+        pick(batch=24, h_kv=2, s_q=1, top_k=512, sm_count=212) == 4
+    )  # 48 items: the fill rule's 5 = 240 (2 waves x 5 = 10); 4 = 192, one wave of 5 / 4 / 4 / 4 (6)
+    assert (
+        pick(batch=32, h_kv=2, s_q=1, top_k=256, sm_count=212) == 3
+    )  # 9 tiles at top_k 256: the fill rule's 4 = 256 (2 waves x 4 = 8); 3 = 192, one wave of 3 / 3 / 3 (4)
+    assert (
+        pick(batch=75, h_kv=2, s_q=1, top_k=512, sm_count=212) == 1
+    )  # 150 items: the fill rule's 2 = 300 chunk-items (2 waves x 10 = 20); the wave rule UNDOES it: one wave of 17 (18)
+    # the wave rule never fires on a one-wave schedule (the fill rule's pick, bitwise) ...
+    for b, s_q, top_k in ((1, 1, 512), (4, 1, 512), (1, 4, 512), (4, 4, 64), (2, 1, 256), (53, 1, 512), (106, 1, 512)):
+        units = b * 2 * s_q
+        fill = max(1, min(-(-(top_k + 1) // 32), SPARSE_DECODE_SPLIT_CAP, -(-212 // units)))
+        assert units * fill <= 212 and pick(batch=b, h_kv=2, s_q=s_q, top_k=top_k, sm_count=212) == fill, (b, s_q, top_k)
+    # ... and where it fires its pick stays inside the item and under the cap
+    for b, s_q, top_k in ((32, 4, 512), (32, 1, 512), (4, 4, 512), (16, 4, 512), (24, 1, 512), (75, 1, 512), (213, 1, 512), (32, 1, 256), (4, 4, 256)):
+        units = b * 2 * s_q
+        fill = max(1, min(-(-(top_k + 1) // 32), SPARSE_DECODE_SPLIT_CAP, -(-212 // units)))
+        s = pick(batch=b, h_kv=2, s_q=s_q, top_k=top_k, sm_count=212)
+        assert units * fill > 212 and 1 <= s <= min(-(-(top_k + 1) // 32), SPARSE_DECODE_SPLIT_CAP), (b, s_q, top_k, s)
+
+
+# The 19 decode cells of the block's end-to-end measurement on the 24 / 2 geometry (B 1 / 4 / 32 x KV 8K / 32K / 128K x S_q 1 / 4 and the
+# B 4 x 2K identity, top_k 512): the rule reads B, H_kv, S_q and top_k only, so the KV length is not an axis and the cells collapse onto six
+# (B, S_q) classes -- (B, S_q, the fill rule's split, the split of record on a 212-SM part, the split on a 204-SM part, cells in the class).
+_SPLIT_RULE_CELLS = (
+    # the ten ONE-wave cells: B <= 4 x S_q 1 (B 1 and B 4 at 8K / 32K / 128K + the B 4 x 2K identity) and B 1 x S_q 4 (8K / 32K / 128K)
+    (1, 1, 16, 16, 16, 3),
+    (4, 1, 16, 16, 16, 4),
+    (1, 4, 16, 16, 16, 3),
+    # the six TWO-wave cells: B 32 x S_q 1 (256 chunk-items at the fill rule's 4) and B 4 x S_q 4 (224 at its 7), each at 8K / 32K / 128K
+    (32, 1, 4, 3, 3, 3),
+    (4, 4, 7, 6, 6, 3),
+    # the three T 128 cells (B 32 x S_q 4: 256 unsplit 17-tile items, two waves)
+    (32, 4, 1, 3, 3, 3),
+)
+
+
+@pytest.mark.parametrize("sm_count", [212, 204], ids=["sms212", "sms204"])
+def test_the_sparse_split_rule_over_the_measured_decode_cells(sm_count):
+    """The rule over the 19 measured decode cells (:data:`_SPLIT_RULE_CELLS`) at the measured part's SM count (212) and at the development
+    part's (204): the ten one-wave cells keep the fill rule's split BITWISE (the number the former rule gave), the six two-wave cells
+    move (B 32 x S_q 1: 4 -> 3; B 4 x S_q 4: 7 -> 6) and the three T 128 cells split 1 -> 3 -- the same picks on both parts (the fill
+    rule's own pick is the same there too) -- and the combine FORM a moved cell's launch takes is the one pinned per grid and split
+    (``_sparse_combine_decode_grid``, the cc 10.7 rule): the lean group walk at B 32 x 24 heads at split 3 as at 4 (also on the T 128
+    grid: 768 lean blocks past the decode-grid bound, split <= 4), the combine module's own forms at B 4 x S_q 4 at split 6 as at 7
+    (below the decode-grid kernel's split 8)."""
+    from cudnn.gated_attention_block.api import SPARSE_DECODE_SPLIT_CAP
+    from cudnn.gated_attention_block.api import sparse_decode_split_choice as pick
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import _sparse_combine_decode_grid
+
+    h_kv, h_q, top_k = 2, 24, 512
+    max_tiles = -(-(top_k + 1) // 32)
+    assert sum(n for *_, n in _SPLIT_RULE_CELLS) == 19
+    moved = {}
+    for b, s_q, fill_of_record, split_212, split_204, _cells in _SPLIT_RULE_CELLS:
+        units = b * h_kv * s_q
+        fill = max(1, min(max_tiles, SPARSE_DECODE_SPLIT_CAP, -(-sm_count // units)))  # the fill rule alone = the former rule
+        assert fill == fill_of_record, (b, s_q, sm_count, fill)
+        got = pick(batch=b, h_kv=h_kv, s_q=s_q, top_k=top_k, sm_count=sm_count)
+        assert got == (split_212 if sm_count == 212 else split_204), (b, s_q, sm_count, got)
+        if units * fill <= sm_count:
+            assert got == fill, (b, s_q, sm_count, got)  # one wave: bitwise the former rule
+        else:
+            moved[(b, s_q)] = (fill, got)
+    assert moved == {(32, 1): (4, 3), (4, 4): (7, 6), (32, 4): (1, 3)}, moved
+    cc = (10, 7)
+    assert _sparse_combine_decode_grid(32, h_q, 1, 3, cc) == _sparse_combine_decode_grid(32, h_q, 1, 4, cc) == split_combine.DECODE_GRID_LEAN_WALK
+    assert _sparse_combine_decode_grid(32, h_q, 4, 3, cc) == split_combine.DECODE_GRID_LEAN_WALK
+    assert _sparse_combine_decode_grid(4, h_q, 4, 6, cc) == _sparse_combine_decode_grid(4, h_q, 4, 7, cc) == split_combine.DECODE_GRID_OFF
 
 
 def test_typed_declines_of_the_sparse_decode_mode():
@@ -392,12 +488,15 @@ def test_typed_declines_of_the_sparse_decode_mode():
         )
 
 
-def _indexer_samples(batch, page=16, n_pages=4, cap=8, dtype=BF16, qsa_over=None):
-    """The decode indexer's three side-cache samples on EMPTY tensors: the paged compressed-key cache ``[n_pages, P / 4, 1, 128]``, the ring
+def _indexer_samples(batch, page=16, n_pages=4, cap=8, dtype=BF16, qsa_over=None, cache_dtype=None):
+    """The decode indexer's three side-cache samples on EMPTY tensors: the paged compressed-key cache ``[n_pages, P / 4, 1, 128]`` in the
+    DECLARED cache dtype (``QsaSpec.index_cache_dtype`` of ``qsa_over``, or ``cache_dtype``; the activation dtype by default), the ring
     ``[batch + 1, cap, 1, 128]`` (block 0 the null block), the ring block table ``[B, 1]``."""
-    d_i = QsaSpec(**(qsa_over or {})).index_head_dim
+    spec = QsaSpec(**(qsa_over or {}))
+    d_i = spec.index_head_dim
+    cd = cache_dtype if cache_dtype is not None else (spec.index_cache_dtype if spec.index_cache_dtype is not None else dtype)
     return dict(
-        sample_index_kv_cache=torch.empty(n_pages, page // BS, 1, d_i, dtype=dtype, device=_DEV),
+        sample_index_kv_cache=torch.empty(n_pages, page // BS, 1, d_i, dtype=cd, device=_DEV),
         sample_index_state_cache=torch.empty(batch + 1, cap, 1, d_i, dtype=dtype, device=_DEV),
         sample_index_state_block_table=torch.zeros(batch, 1, dtype=torch.int32, device=_DEV),
     )
@@ -713,7 +812,7 @@ class _CaseBase:
 
     def label(self):
         form = f"{'shared' if self.shared else 'per-row'}{'' if self.index_list_form is None else ' (declared)'}"
-        return f"[{self.geom.h_q}/{self.geom.h_kv} S_q={self.s_q} {form} p{self.page} {self.layout} {self.dtype} split={self.blk.decode_split_kv} gate={'fused' if self.fuse_gate else 'launch'} lse={self.return_lse} lens={self.kv_lens}]"
+        return f"[{self.geom.h_q}/{self.geom.h_kv} S_q={self.s_q} {form} p{self.page} {self.layout} {self.dtype} split={self.blk.decode_split_kv} gate={'fused' if self.fuse_gate else 'launch'} lse={self.return_lse} pdl={self.blk.use_pdl} lens={self.kv_lens}]"
 
     def check(self, out=None, ws=None, lse=None, *, what="out"):
         """The standard assertions: finite, no sentinel, dead rows exact, within the budget vs the oracle (out, the gated O slot, the
@@ -794,9 +893,11 @@ class _Case(_CaseBase):
         shuffle=True,
         index_list_form=None,
         fuse_prepare=None,
+        use_pdl=None,
     ):
         self.s_q, self.kv_lens, self.page, self.layout, self.dtype, self.top_k = int(s_q), [int(x) for x in kv_lens], page, layout, dtype, top_k
         self.fuse_prepare = fuse_prepare
+        self.use_pdl = use_pdl
         self.block_lens_given, self.return_lse, self.fuse_gate, self.index_band = bool(block_lens), bool(return_lse), bool(fuse_gate), bool(index_band)
         # the list form: the S_q rule (one list per sequence up to the shared-list cap), or QsaSpec.index_list_form as declared
         self.index_list_form = index_list_form
@@ -908,6 +1009,7 @@ class _Case(_CaseBase):
             fuse_norm_rope=fuse_norm_rope,
             return_lse=return_lse,
             decode_split_kv=split,
+            use_pdl=use_pdl,
         )
         if fuse_prepare is not None:
             kw["fuse_prepare"] = fuse_prepare
@@ -1382,13 +1484,12 @@ def test_the_band_chain_census_is_one_launch_above_the_band_off_chain_with_the_s
 # The in-block indexer's DECODE step over the pools (QsaSpec(index_source="indexer") with kv_source="paged"; 2026-10-21)
 # ---------------------------------------------------------------------------
 
-_INDEXER_DECLINE_TOKENS = {
+_INDEXER_DECLINE_TOKENS = {  # the `indexer_e4m3_cache` row RETIRED 2026-10-21: the e4m3 indexer cache is served at decode (a served form has no decline row)
     "indexer_f16": "needs bf16 activations",
     "indexer_head_dim": "packs 128-wide heads",
     "indexer_thd": "scores dense [B, S] prompts",
     "indexer_query_rows": "query rows per sequence (at most 64",
     "indexer_page_size": "a power-of-two count of compressed rows",
-    "indexer_e4m3_cache": "e4m3 read arm",
     "indexer_e4m3_pool": "in-kernel dequant arm",
     "indexer_shared_list": "selects per row",
     "shared_list_rows": "tail covers at most two blocks",
@@ -1465,6 +1566,21 @@ def test_decode_indexer_declaration_facts_carve_and_the_envelope_rows(monkeypatc
                 acc += _align_up(nbytes)
             assert lay.total_bytes == acc and lay.ix_kbar == -1 and lay.ix_scores == -1 and lay.ix_cand == -1
             assert lay_c.ix_logits == -1 and lay_c.ix_counts == -1 and lay_c.ix_cslot == -1
+            # the e4m3 indexer cache (served 2026-10-21): the SAME declaration with index_cache_dtype=e4m3 CONSTRUCTS, the cache sample in e4m3
+            # (required in the declared dtype), ix_q carved at 1 B per element (half the slot; the four other slots follow it), every bf16
+            # carve byte-identical to before (the e4m3 element size enters the carve only under the attribute)
+            e4 = _declare_indexer(GEOM_SMALL, batch, s_q, cap=s_q + 3, fuse_prepare=False, qsa_over=dict(index_cache_dtype=torch.float8_e4m3fn))
+            assert e4.indexer_decode and e4.index_cache_dtype == torch.float8_e4m3fn and off.index_cache_dtype == BF16 and e4._indexer_decode.fp8
+            assert e4._indexer_decode.cache_dtype == torch.float8_e4m3fn and off._indexer_decode.cache_dtype == BF16 and not off._indexer_decode.fp8
+            lay8 = e4._layout()
+            slots8 = _qsa_indexer_decode_slots(e4.geom, batch, s_q, e, e4._indexer_decode.n_blocks_max, 1)
+            assert dict(slots8)["ix_q"] == t * 4 * 128 == dict(slots)["ix_q"] // 2 and slots8[1:] == slots[1:]
+            acc8 = lay_c.total_bytes
+            for nm, nbytes in slots8:
+                assert getattr(lay8, nm) == acc8, nm
+                acc8 += _align_up(nbytes)
+            assert lay8.total_bytes == acc8 and lay8.ix_q == lay.ix_q and lay8.total_bytes <= lay.total_bytes
+            assert _qsa_indexer_decode_slots(e4.geom, batch, s_q, e, e4._indexer_decode.n_blocks_max) == slots  # cache_e None = the activation dtype
         # the switch stays the sparse chain's follow-up: an explicit True is the existing typed decline, AUTO reads False
         with pytest.raises(NotImplementedError, match="use_pdl=True is served for the bf16 / f16 block only"):
             _declare_indexer(GEOM_SMALL, 1, 1, use_pdl=True)
@@ -1513,11 +1629,13 @@ def test_decode_indexer_declaration_facts_carve_and_the_envelope_rows(monkeypatc
         env = GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV, device_cc=_SM107)
         d = env.decode
         assert d.served and d.sparse_core
-        assert d.index_sources == ("caller", "indexer") and d.index_cache_dtypes == (BF16,) and d.index_head_dims == (128,) and d.index_kv_heads == (1,)
+        assert d.index_sources == ("caller", "indexer") and d.index_cache_dtypes == (BF16, torch.float8_e4m3fn) and d.index_head_dims == (128,)
+        assert d.index_kv_heads == (1,)  # the e4m3 indexer cache SERVED (2026-10-21): the FlashInfer probe reads two entries
         assert d.index_block_sizes == (4,) and d.index_top_k_range == (4, 512, 4) and d.index_query_rows_max == 64 and d.index_state_rows_extra == 3
         assert d.index_page_sizes == (16, 32, 64, 128) and d.fuse_prepare_default is True and d.kv_cache_dtypes == (BF16,)  # the measured part
         assert d.index_list_forms == ("per_row",) and d.index_list_form_default == "per_row" and d.pdl_stages == () and d.pdl_default is False
         assert set(_INDEXER_DECLINE_TOKENS) <= set(d.declines) and all(tok in d.declines[nm] for nm, tok in _INDEXER_DECLINE_TOKENS.items())
+        assert "indexer_e4m3_cache" not in d.declines, "a served form has no decline row"
         # the record's tail is append-only (a serving stack reads these by name; a new field goes after `fuse_prepare_default`)
         assert [f.name for f in dataclasses.fields(DecodeEnvelope)][-12:] == [
             "index_list_forms",
@@ -1556,15 +1674,16 @@ def test_decode_indexer_declaration_facts_carve_and_the_envelope_rows(monkeypatc
 def test_decode_indexer_typed_declines_equal_the_envelope_row_by_row():
     """One trip per row of the decode indexer's declines, each on a REAL declaration: the raised text EQUALS the envelope's row and carries
     the row's one shared token -- ``indexer_query_rows`` (S_q 17 at 4 heads; 8 heads at S_q 9), ``indexer_page_size`` (page 48),
-    ``indexer_e4m3_cache``, ``indexer_e4m3_pool``, ``indexer_shared_list``, ``fuse_prepare_rope_tables_unfused``, ``indexer_f16``,
-    ``indexer_head_dim``, ``shared_list_rows``; the ring rule (``cap < S_q + 3``), a missing sample, the commit flag, the
-    side caches off their form, and the samples / flags on a caller-list or a dense declaration -- ``ValueError`` naming them."""
+    ``indexer_e4m3_pool``, ``indexer_shared_list``, ``fuse_prepare_rope_tables_unfused``, ``indexer_f16``, ``indexer_head_dim``,
+    ``shared_list_rows`` (the ``indexer_e4m3_cache`` row RETIRED 2026-10-21: the e4m3 indexer cache CONSTRUCTS, with its sample in e4m3); the
+    ring rule (``cap < S_q + 3``), a missing sample, the commit flag, the side caches off their form -- the compressed-key cache sample in the
+    declared dtype BOTH ways, the 16-byte rule at 1 B --, the e4m3 pool with the e4m3 indexer cache, and the samples / flags on a caller-list
+    or a dense declaration -- ``ValueError`` naming them."""
     import re
 
     rows = {
         "indexer_query_rows": lambda: _declare_indexer(GEOM_SMALL, 1, 17, cap=20),
         "indexer_page_size": lambda: _declare_indexer(GEOM_SMALL, 1, 1, page=48),
-        "indexer_e4m3_cache": lambda: _declare_indexer(GEOM_SMALL, 1, 1, qsa_over=dict(index_cache_dtype=torch.float8_e4m3fn)),
         "indexer_shared_list": lambda: _declare_indexer(GEOM_SMALL, 1, 1, qsa_over=dict(index_list_form="shared")),
         "fuse_prepare_rope_tables_unfused": lambda: _declare_indexer(GEOM_SMALL, 1, 1, rope_position_tables_only=True, fuse_prepare=False),
         "indexer_f16": lambda: _declare_indexer(GEOM_SMALL, 1, 1, dtype=F16),
@@ -1585,12 +1704,43 @@ def test_decode_indexer_typed_declines_equal_the_envelope_row_by_row():
             with pytest.raises(NotImplementedError, match=re.escape(_INDEXER_DECLINE_TOKENS[name])) as e:
                 trip()
             assert str(e.value) == env.decode.declines[name], (name, str(e.value))
-        # the e4m3 pool: the sample pools in e4m3 under the attribute
+        # the e4m3 pool: the sample pools in e4m3 under the attribute -- declined with a bf16 AND with an e4m3 indexer cache (the in-kernel dequant arm)
         kc, vc = (torch.empty(4, 2, 16, D, dtype=torch.float8_e4m3fn, device=_DEV) for _ in range(2))
         with pytest.raises(NotImplementedError, match=re.escape(_INDEXER_DECLINE_TOKENS["indexer_e4m3_pool"])) as e:
             _declare_indexer(GEOM_SMALL, 1, 1, kv_cache_dtype=torch.float8_e4m3fn, sample_k_cache=kc, sample_v_cache=vc)
         env = GatedAttentionBlockFwd.serving_envelope(_declare_indexer(GEOM_SMALL, 1, 1).geom, BF16, _DEV, device_cc=_SM107)
         assert str(e.value) == env.decode.declines["indexer_e4m3_pool"]
+        e4_over = dict(index_cache_dtype=torch.float8_e4m3fn)
+        with pytest.raises(NotImplementedError, match=re.escape(_INDEXER_DECLINE_TOKENS["indexer_e4m3_pool"])) as e:
+            _declare_indexer(GEOM_SMALL, 1, 1, kv_cache_dtype=torch.float8_e4m3fn, sample_k_cache=kc, sample_v_cache=vc, qsa_over=e4_over)
+        assert str(e.value) == env.decode.declines["indexer_e4m3_pool"]
+        # INVERTED 2026-10-21: the e4m3 indexer cache CONSTRUCTS over bf16 pools -- with its sample in e4m3 (the declared dtype), refused BOTH ways
+        e4 = _declare_indexer(GEOM_SMALL, 1, 1, qsa_over=e4_over)
+        assert e4._indexer_decode is not None and e4.index_cache_dtype == torch.float8_e4m3fn and e4._indexer_decode.fp8
+        with pytest.raises(ValueError, match=r"sample_index_kv_cache must be torch.float8_e4m3fn \(the declared indexer cache dtype\), got torch.bfloat16"):
+            _declare_indexer(GEOM_SMALL, 1, 1, qsa_over=e4_over, sample_index_kv_cache=_indexer_samples(1)["sample_index_kv_cache"])
+        with pytest.raises(ValueError, match=r"sample_index_kv_cache must be torch.bfloat16 \(the declared indexer cache dtype\), got torch.float8_e4m3fn"):
+            _declare_indexer(GEOM_SMALL, 1, 1, sample_index_kv_cache=_indexer_samples(1, cache_dtype=torch.float8_e4m3fn)["sample_index_kv_cache"])
+        with pytest.raises(ValueError, match="never quantized"):  # an e4m3 RING stays the ring's rule under both declarations
+            _declare_indexer(
+                GEOM_SMALL, 1, 1, qsa_over=e4_over, sample_index_state_cache=_indexer_samples(1)["sample_index_state_cache"].to(torch.float8_e4m3fn)
+            )
+        # the 16-byte rule at 1 B per element: a 128-B row stride accepted (the serving layout), a 136-B one refused (not a whole 16-B vector)
+        ok8 = torch.empty(4, 4, 1, 128, dtype=torch.float8_e4m3fn, device=_DEV)
+        assert _declare_indexer(GEOM_SMALL, 1, 1, qsa_over=e4_over, sample_index_kv_cache=ok8)._indexer_decode is not None
+        wide8 = torch.empty(4, 4, 1, 136, dtype=torch.float8_e4m3fn, device=_DEV)
+        with pytest.raises(ValueError, match="must hold a page's compressed rows contiguously"):
+            _declare_indexer(GEOM_SMALL, 1, 1, qsa_over=e4_over, sample_index_kv_cache=wide8[..., :128])
+        with pytest.raises(
+            ValueError, match="must be a multiple of 16 elements"
+        ):  # a 520-element page stride: the rows contiguous, the page not a whole 16-B vector
+            _declare_indexer(
+                GEOM_SMALL,
+                1,
+                1,
+                qsa_over=e4_over,
+                sample_index_kv_cache=torch.empty(4 * 520 + 16, dtype=torch.float8_e4m3fn, device=_DEV).as_strided((4, 4, 1, 128), (520, 128, 128, 1)),
+            )
         # the query-row envelope at 8 heads: S_q 8 x 8 = 64 rows serves, 9 x 8 does not
         assert _declare_indexer(GEOM_SMALL, 1, 8, cap=11, qsa_over=dict(index_heads=8))._indexer_decode is not None
         with pytest.raises(NotImplementedError, match="at most 8 rows per sequence"):
@@ -1735,6 +1885,18 @@ def test_decode_indexer_execute_inputs_are_required_and_refused_in_both_directio
             run(index_kv_cache=flat[8 : 8 + 4 * 4 * 128].view(4, 4, 1, 128))  # the aligned storage-offset control passes every form check
         with pytest.raises(ValueError, match="never quantized"):
             run(index_state_cache=z(3, 4, 1, 128).to(torch.float8_e4m3fn))
+        # the e4m3 indexer cache at execute (2026-10-21): the cache tensor in the DECLARED dtype, both ways; the ring bf16 under both
+        z8 = lambda *shape: torch.zeros(*shape, dtype=torch.float8_e4m3fn, device=_DEV)  # noqa: E731
+        with pytest.raises(ValueError, match=r"index_kv_cache must be torch.bfloat16 \(the declared indexer cache dtype\), got torch.float8_e4m3fn"):
+            run(index_kv_cache=z8(4, 4, 1, 128))
+        with _no_host_sync():
+            blk8 = _declare_indexer(GEOM_SMALL, 2, 1, cap=4, qsa_over=dict(index_cache_dtype=torch.float8_e4m3fn))
+        with pytest.raises(ValueError, match=r"index_kv_cache must be torch.float8_e4m3fn \(the declared indexer cache dtype\), got torch.bfloat16"):
+            run(blk8)
+        with pytest.raises(ValueError, match="never quantized"):
+            run(blk8, index_kv_cache=z8(4, 4, 1, 128), index_state_cache=z(3, 4, 1, 128).to(torch.float8_e4m3fn))
+        with pytest.raises(RuntimeError, match="compile"):  # well-formed: the next refusal is the plan's
+            run(blk8, index_kv_cache=z8(4, 4, 1, 128))
         # the mirror image: a caller-list band block refuses the seven rather than ignoring them
         caller, aux = _declare(GEOM_SMALL, 2, 1, n_pages=4, index_band=True)
         for nm in ("index_kv_cache", "index_state_cache", "index_state_block_table", "index_state_slot_mapping", "cos_pos", "sin_pos", "n_commit"):
@@ -1816,13 +1978,18 @@ class _IndexerCase(_CaseBase):
         rope_tables_only=False,
         outputs=True,
         lens_out=True,
+        index_cache_dtype=None,
     ):
         self.s_q, self.kv_lens, self.page, self.layout, self.dtype, self.top_k = int(s_q), [int(x) for x in kv_lens], page, layout, dtype, top_k
         self.block_lens_given, self.return_lse, self.fuse_gate, self.index_band = False, bool(return_lse), bool(fuse_gate), True
         self.index_list_form, self.shared, self.fuse_prepare = None, False, fuse_prepare
         self.slot_form, self.rope_tables_only, self.outputs, self.lens_out = bool(slot_form), bool(rope_tables_only), bool(outputs), bool(lens_out)
+        # the indexer CACHE dtype (QsaSpec.index_cache_dtype): the paged compressed-key cache, ix_q and the prefix priming in it (e4m3 = the e4m3
+        # indexer cache, 2026-10-21: the compress kernel's e4m3 store arm primes the prefix exactly as a prefill form's cast would); the ring bf16
+        self.index_cache_dtype = index_cache_dtype
+        self.cache_dtype = dtype if index_cache_dtype is None else index_cache_dtype
         kw_g = dict(geom_kw, causal_bottom_right=True)
-        self.geom = GatedAttentionBlockGeometry(**kw_g, qsa=QsaSpec(top_k=top_k, index_source="indexer", index_band=True))
+        self.geom = GatedAttentionBlockGeometry(**kw_g, qsa=QsaSpec(top_k=top_k, index_source="indexer", index_band=True, index_cache_dtype=index_cache_dtype))
         self.ref_geom = RefGeometry(**kw_g)
         geom, ref_geom = self.geom, self.ref_geom
         h_q, h_kv, d_model, d_i, h_i = geom.h_q, geom.h_kv, geom.d_model, geom.qsa.index_head_dim, geom.qsa.index_heads
@@ -1890,7 +2057,7 @@ class _IndexerCase(_CaseBase):
         self.index_cache = None  # the raw-key pool of the caller-list band form: nothing here (the raw key lives in the ring)
         self.rpp = page // BS
         self.cap = int(cap) if cap is not None else (4 if s_q == 1 else 8)  # the serving stacks' ring: 4 without speculative rows, 8 with 1 .. 4
-        self.index_kv_cache = torch.full((self.n_pages, self.rpp, 1, d_i), float("nan"), dtype=dtype, device=_DEV)
+        self.index_kv_cache = torch.full((self.n_pages, self.rpp, 1, d_i), float("nan"), dtype=self.cache_dtype, device=_DEV)
         self.index_state_cache = torch.full((B + 1, self.cap, 1, d_i), float("nan"), dtype=dtype, device=_DEV)
         self.index_state_block_table = torch.zeros(B, 1, dtype=torch.int32, device=_DEV)
         self.pages = {}
@@ -1953,6 +2120,7 @@ class _IndexerCase(_CaseBase):
             and not self.blk.qsa_shared_list
             and isinstance(self.blk._indexer_decode, _IndexerDecode)
         )
+        assert self.blk.index_cache_dtype == self.cache_dtype and self.blk._indexer_decode.cache_dtype == self.cache_dtype
         self.ws = None
         self._compress = {}
 
@@ -1973,19 +2141,23 @@ class _IndexerCase(_CaseBase):
         torch.cuda.synchronize()
         self._primed = True
 
-    def compress(self, k_raw, cos, sin, pool=BS):
+    def compress(self, k_raw, cos, sin, pool=BS, out_dtype=None):
         """The compress kernel (``kernels/qsa_compress.py``, the prefill form) over ``k_raw [B', S, d_i]`` at ``pool`` with the tables
-        ``cos / sin [1 or B', S_pos, ROPE]`` -> ``[B', floor(S / pool), d_i]``; the one-rounding chain the block's own arms compute."""
+        ``cos / sin [1 or B', S_pos, ROPE]`` -> ``[B', floor(S / pool), d_i]`` in ``out_dtype`` (``None`` = the case's cache dtype: the
+        e4m3 store arm under the e4m3 cache -- the e4m3 cast of the bf16 row, what the block's own arms compute)."""
         from cudnn.gated_attention_block.kernels.qsa_compress import compile_qsa_compress, run_qsa_compress
 
         d_i = self.geom.qsa.index_head_dim
-        if pool not in self._compress:
-            self._compress[pool] = compile_qsa_compress(dtype=self.dtype, d=d_i, rope_dim=ROPE, pool=pool, has_seq_lens=False, table_dtype=self.dtype)
+        od = self.cache_dtype if out_dtype is None else out_dtype
+        if (pool, od) not in self._compress:
+            self._compress[(pool, od)] = compile_qsa_compress(
+                dtype=self.dtype, d=d_i, rope_dim=ROPE, pool=pool, has_seq_lens=False, table_dtype=self.dtype, out_dtype=od
+            )
         k_raw = k_raw.contiguous()
-        out = torch.full((int(k_raw.shape[0]), int(k_raw.shape[1]) // pool, d_i), float("nan"), dtype=self.dtype, device=_DEV)
+        out = torch.full((int(k_raw.shape[0]), int(k_raw.shape[1]) // pool, d_i), float("nan"), dtype=od, device=_DEV)
         w = self.w["w_ik_norm"] if pool == BS else self.w["w_iq_norm"]
         run_qsa_compress(
-            self._compress[pool],
+            self._compress[(pool, od)],
             k_raw,
             out,
             w,
@@ -2176,8 +2348,66 @@ class _IndexerCase(_CaseBase):
     def label(self):
         return (
             f"[indexer {self.geom.h_q}/{self.geom.h_kv} S_q={self.s_q} p{self.page} {self.layout} split={self.blk.decode_split_kv} "
-            f"gate={'fused' if self.fuse_gate else 'launch'} lse={self.return_lse} fuse_prepare={self.blk.fuse_prepare} cap={self.cap} lens={self.kv_lens}]"
+            f"gate={'fused' if self.fuse_gate else 'launch'} lse={self.return_lse} fuse_prepare={self.blk.fuse_prepare} cap={self.cap} "
+            f"cache={str(self.cache_dtype).replace('torch.', '')} lens={self.kv_lens}]"
         )
+
+    def check_e4m3_twin(self, twin: "_IndexerCase", what: str = "e4m3 twin") -> dict:
+        """The e4m3 cache against the bf16 TWIN on the same inputs (the oracle's item 2 + the agreement statistic): every cache row the step
+        completed (and every primed prefix row) and every indexer query is BITWISE the bf16 twin's row ``.to(float8_e4m3fn)`` (``|bf16 row| <
+        448`` asserted first: one rounding convention across the fused prepare, the step form and the pool-1 compress), the ring and the
+        counts identical; the bf16-vs-e4m3 set agreement is a STATISTIC (printed, returned) with the structural pin that every flipped block
+        sits at the rank boundary -- within 8 % of the row's top score of the bf16 twin's k-th score (the dense form's rule)."""
+        assert self.cache_dtype == torch.float8_e4m3fn and twin.cache_dtype == BF16 and self.kv_lens == twin.kv_lens and self.s_q == twin.s_q
+        B, s_q, top_k = len(self.kv_lens), self.s_q, self.top_k
+        assert torch.equal(_bits(self.index_state_cache), _bits(twin.index_state_cache)), f"{what}: the ring differs from the bf16 twin's"
+        assert torch.equal(self.kernel_counts(), twin.kernel_counts()), f"{what}: the counts differ from the bf16 twin's"
+        v8, v16 = self.views(), twin.views()
+        assert float(v16["qi"].float().abs().max()) < 448.0, f"{what}: a bf16 query at or past the e4m3 range"
+        assert torch.equal(_bits(v8["qi"]), _bits(v16["qi"].to(torch.float8_e4m3fn))), f"{what}: ix_q is not the e4m3 cast of the bf16 twin's queries"
+        written8 = ~torch.isnan(self.index_kv_cache.float()).any(-1)
+        written16 = ~torch.isnan(twin.index_kv_cache.float()).any(-1)
+        assert torch.equal(written8, written16), f"{what}: a cache row written / unwritten differently from the bf16 twin"
+        rows16 = twin.index_kv_cache[written16]
+        assert float(rows16.float().abs().max()) < 448.0, f"{what}: a bf16 cache row at or past the e4m3 range"
+        assert torch.equal(
+            _bits(self.index_kv_cache[written8]), _bits(rows16.to(torch.float8_e4m3fn))
+        ), f"{what}: the e4m3 cache is not the cast of the bf16 twin's"
+        ids8, ids16, n_vis = self.kernel_ids(), twin.kernel_ids(), self.n_vis()
+        d_i, h_i = self.geom.qsa.index_head_dim, self.geom.qsa.index_heads
+        agree_rows, same_rows, flips, max_rel = 0, 0, 0, 0.0
+        for b, L in enumerate(self.kv_lens):
+            n = int(n_vis[b].max())
+            if L == 0 or n == 0:
+                continue
+            pages = twin.block_table[b, : -(-n // twin.rpp)].long()
+            kbar16 = twin.index_kv_cache[pages][:, :, 0].reshape(-1, d_i)[:n].double()
+            qi16 = v16["qi"].view(B, s_q, h_i, d_i)[b].double()
+            sc16 = torch.relu(torch.einsum("shd,jd->shj", qi16, kbar16)).sum(1) / math.sqrt(d_i)  # the bf16 twin's fp64 scores [S_q, n]
+            for j in range(s_q):
+                if L - s_q + j < 0:
+                    continue
+                a, c = set(ids8[b, j].tolist()) - {-1}, set(ids16[b, j].tolist()) - {-1}
+                k_eff = min(top_k, int(n_vis[b, j]))
+                agree_rows += 1
+                if a == c:
+                    same_rows += 1
+                    continue
+                row = sc16[j, : int(n_vis[b, j])]
+                kth = torch.topk(row, k_eff).values[-1]
+                top = row.max()
+                diff = torch.tensor(sorted(a ^ c), device=_DEV)
+                rel = float(((row[diff] - kth).abs() / top.clamp_min(1e-12)).max())
+                flips += len(a ^ c)
+                max_rel = max(max_rel, rel)
+                assert rel <= 0.08, f"{what}: sequence {b} row {j}: a flipped block {rel:.3f} x the row's top score away from the bf16 k-th (bound 0.08)"
+        valid = int((ids16 >= 0).sum().item())
+        agreement = 1.0 - flips / 2 / max(valid, 1)
+        print(
+            f"\n{self.label()} {what}: bf16-vs-e4m3 set agreement {100 * agreement:.3f} % over {agree_rows} live rows ({same_rows} set-equal; {flips} flipped ids, "
+            f"max gap {max_rel:.4f} x top)"
+        )
+        return dict(agreement=agreement, rows=agree_rows, same_rows=same_rows, flips=flips, max_rel=max_rel)
 
 
 def _two_launches_indexer(case: _IndexerCase, what: str):
@@ -2199,30 +2429,54 @@ def _two_launches_indexer(case: _IndexerCase, what: str):
     return dict(m1, **m2)
 
 
-# (geometry, S_q, kv_lens, page, layout, split, fuse_gate, return_lse, fuse_prepare, cap, seed)
+_E4M3 = torch.float8_e4m3fn
+# (geometry, S_q, kv_lens, page, layout, split, fuse_gate, return_lse, fuse_prepare, cap, seed, index_cache_dtype)
 _INDEXER_LADDER = [
-    pytest.param(GEOM_SMALL, 1, (2052, 8192, 0, 4097), 16, "hnd", None, False, True, None, None, 101, id="Sq1-B4-p16-hnd-default-split-lse-auto-knob"),
-    pytest.param(GEOM_SMALL, 2, (300, 0, 2051, 77), 64, "nhd", 1, True, False, True, None, 102, id="Sq2-B4-p64-nhd-unsplit-fused-gate-fused-prepare"),
-    pytest.param(GEOM_SMALL, 3, (8192, 2052), 32, "unified", 4, True, True, True, None, 103, id="Sq3-B2-p32-unified-split4-fused-gate-lse-fused-prepare"),
+    pytest.param(GEOM_SMALL, 1, (2052, 8192, 0, 4097), 16, "hnd", None, False, True, None, None, 101, None, id="Sq1-B4-p16-hnd-default-split-lse-auto-knob"),
+    pytest.param(GEOM_SMALL, 2, (300, 0, 2051, 77), 64, "nhd", 1, True, False, True, None, 102, None, id="Sq2-B4-p64-nhd-unsplit-fused-gate-fused-prepare"),
+    pytest.param(GEOM_SMALL, 3, (8192, 2052), 32, "unified", 4, True, True, True, None, 103, None, id="Sq3-B2-p32-unified-split4-fused-gate-lse-fused-prepare"),
     pytest.param(
-        GEOM_SMALL, 4, (8191, 8190, 8189, 8188), 16, "hnd", 16, True, True, False, None, 104, id="Sq4-B4-every-residue-split16-fused-gate-lse-unfused"
+        GEOM_SMALL, 4, (8191, 8190, 8189, 8188), 16, "hnd", 16, True, True, False, None, 104, None, id="Sq4-B4-every-residue-split16-fused-gate-lse-unfused"
     ),
-    pytest.param(GEOM_FLASH_NEXT, 4, (4096,), 16, "hnd", None, True, False, True, None, 105, id="Sq4-B1-flash-next-24-2-default-split-fused"),
-    pytest.param(GEOM_SMALL, 4, (2, 4, 0, 20000), 16, "hnd", 2, False, True, None, None, 106, id="Sq4-B4-shorter-than-the-step-dead-20000-split2"),
-    pytest.param(GEOM_SMALL, 1, (32768, 300), 16, "hnd", None, True, True, True, 4, 107, id="Sq1-B2-32K-cluster-top-k-fused-prepare"),
-    pytest.param(GEOM_SMALL, 2, (8195, 8194), 16, "hnd", 1, False, True, False, 5, 108, id="Sq2-B2-cap5-mid-block-unfused"),
+    pytest.param(GEOM_FLASH_NEXT, 4, (4096,), 16, "hnd", None, True, False, True, None, 105, None, id="Sq4-B1-flash-next-24-2-default-split-fused"),
+    pytest.param(GEOM_SMALL, 4, (2, 4, 0, 20000), 16, "hnd", 2, False, True, None, None, 106, None, id="Sq4-B4-shorter-than-the-step-dead-20000-split2"),
+    pytest.param(GEOM_SMALL, 1, (32768, 300), 16, "hnd", None, True, True, True, 4, 107, None, id="Sq1-B2-32K-cluster-top-k-fused-prepare"),
+    pytest.param(GEOM_SMALL, 2, (8195, 8194), 16, "hnd", 1, False, True, False, 5, 108, None, id="Sq2-B2-cap5-mid-block-unfused"),
+    # the e4m3 indexer cache (2026-10-21): four rows re-parametrised with index_cache_dtype=e4m3 -- the bf16 twin on the same inputs runs beside each
+    pytest.param(
+        GEOM_SMALL, 1, (2052, 8192, 0, 4097), 16, "hnd", None, False, True, None, None, 101, _E4M3, id="Sq1-B4-p16-hnd-default-split-lse-auto-knob-e4m3"
+    ),
+    pytest.param(
+        GEOM_SMALL, 2, (300, 0, 2051, 77), 64, "nhd", 1, True, False, True, None, 102, _E4M3, id="Sq2-B4-p64-nhd-unsplit-fused-gate-fused-prepare-e4m3"
+    ),
+    pytest.param(
+        GEOM_SMALL,
+        4,
+        (8191, 8190, 8189, 8188),
+        16,
+        "hnd",
+        16,
+        True,
+        True,
+        False,
+        None,
+        104,
+        _E4M3,
+        id="Sq4-B4-every-residue-split16-fused-gate-lse-unfused-e4m3",
+    ),
+    pytest.param(GEOM_SMALL, 1, (32768, 300), 16, "hnd", None, True, True, True, 4, 107, _E4M3, id="Sq1-B2-32K-cluster-top-k-fused-prepare-e4m3"),
 ]
 
 
 @requires_rubin
-@pytest.mark.parametrize("geom_kw, s_q, kv_lens, page, layout, split, fuse_gate, return_lse, fuse_prepare, cap, seed", _INDEXER_LADDER)
-def test_decode_indexer_matches_the_two_stage_oracle(geom_kw, s_q, kv_lens, page, layout, split, fuse_gate, return_lse, fuse_prepare, cap, seed):
+@pytest.mark.parametrize("geom_kw, s_q, kv_lens, page, layout, split, fuse_gate, return_lse, fuse_prepare, cap, seed, cache_dtype", _INDEXER_LADDER)
+def test_decode_indexer_matches_the_two_stage_oracle(geom_kw, s_q, kv_lens, page, layout, split, fuse_gate, return_lse, fuse_prepare, cap, seed, cache_dtype):
     """The decode indexer's ladder (module docstring): per cell the selection against the kernel's own operands (stage 1), the attention
     within the budget of the fp32 oracle fed the kernel's list per row (stage 2), dead rows exact, the pools' step rows bitwise the slab,
-    the ring and the completed blocks bitwise the compress kernel, two launches bitwise -- fused and unfused prepare, both knob readings."""
-    case = _IndexerCase(
-        geom_kw, s_q, kv_lens, page=page, layout=layout, seed=seed, split=split, fuse_gate=fuse_gate, return_lse=return_lse, fuse_prepare=fuse_prepare, cap=cap
-    )
+    the ring and the completed blocks bitwise the compress kernel, two launches bitwise -- fused and unfused prepare, both knob readings.
+    The e4m3 rows add the bf16 twin on the same inputs: the cache rows and ``ix_q`` bitwise its cast, the agreement a statistic."""
+    kw = dict(page=page, layout=layout, seed=seed, split=split, fuse_gate=fuse_gate, return_lse=return_lse, fuse_prepare=fuse_prepare, cap=cap)
+    case = _IndexerCase(geom_kw, s_q, kv_lens, index_cache_dtype=cache_dtype, **kw)
     case.compile()
     if split is not None:
         assert case.blk.decode_split_kv == split
@@ -2234,13 +2488,24 @@ def test_decode_indexer_matches_the_two_stage_oracle(geom_kw, s_q, kv_lens, page
     assert case.blk.fuse_prepare is want and case.blk.fuse_prepare_requested is fuse_prepare
     m = _two_launches_indexer(case, "indexer ladder")
     print(f"\n{case.label()}: {m}")
+    if cache_dtype is not None:
+        assert case.index_kv_cache.dtype == case.views()["qi"].dtype == _E4M3 and case.index_state_cache.dtype == BF16
+        twin = _IndexerCase(geom_kw, s_q, kv_lens, **kw)
+        twin.compile()
+        _two_launches_indexer(twin, "indexer ladder (bf16 twin)")
+        m2 = case.check_e4m3_twin(twin, "e4m3 vs the bf16 twin")
+        print(f"\n{case.label()}: {m2}")
 
 
 @requires_rubin
-def test_decode_indexer_identity_region_is_the_full_list_and_bitwise_the_caller_list_block():
+@pytest.mark.parametrize("cache_dtype", [None, _E4M3], ids=["bf16", "e4m3"])
+def test_decode_indexer_identity_region_is_the_full_list_and_bitwise_the_caller_list_block(cache_dtype):
     """512 visible blocks (``kv_lens`` 2048 at ``S_q`` 1 = ``top_k``): the list is the identity ``511 .. 0`` on every row, and the block is
-    BITWISE the caller-list band block fed the full list (one core, one list, the same slab)."""
-    case = _IndexerCase(GEOM_SMALL, 1, (2048, 2048, 2048, 2048), page=16, seed=111, split=8, fuse_gate=True, return_lse=True, fuse_prepare=True)
+    BITWISE the caller-list band block fed the full list (one core, one list, the same slab) -- under the bf16 and the e4m3 indexer cache
+    (the identity region is dtype-free: every visible block is listed)."""
+    case = _IndexerCase(
+        GEOM_SMALL, 1, (2048, 2048, 2048, 2048), page=16, seed=111, split=8, fuse_gate=True, return_lse=True, fuse_prepare=True, index_cache_dtype=cache_dtype
+    )
     case.compile()
     _two_launches_indexer(case, "identity")
     ids = case.kernel_ids()
@@ -2279,8 +2544,9 @@ def test_decode_indexer_identity_region_is_the_full_list_and_bitwise_the_caller_
 
 
 @requires_rubin
+@pytest.mark.parametrize("cache_dtype", [None, _E4M3], ids=["bf16", "e4m3"])
 @pytest.mark.parametrize("s_q, kv_lens", [(1, (4096, 300, 0, 2051)), (4, (4095, 2, 0, 2052))], ids=["Sq1", "Sq4"])
-def test_decode_indexer_fused_and_unfused_prepare_are_bitwise_with_the_census_by_kernel_name(s_q, kv_lens):
+def test_decode_indexer_fused_and_unfused_prepare_are_bitwise_with_the_census_by_kernel_name(s_q, kv_lens, cache_dtype):
     """``fuse_prepare`` on vs off on the same inputs: ``out``, the LSE, the gated O, the pools, the ring, the paged cache, the list and the
     counts BITWISE; the CUPTI census by kernel NAME on the 24 / 2 geometry against the caller-list band block on the same shapes (the
     CONTROL: the slab's route and the out projection's reducer are the route's business) -- fused = the control's count (the prepare launch
@@ -2288,11 +2554,14 @@ def test_decode_indexer_fused_and_unfused_prepare_are_bitwise_with_the_census_by
     ``cudnn_qsa_topk_decode`` come in): 8 where the control is 8 (the slab, ``frost_qsa_prepare``, the scorer, the top-k, the sparse tile,
     the combine, the out projection and its split-K reducer); unfused = the control + 3 (``frost_qk_norm_rope``, the K / V-only
     ``frost_cache_write``, the pool-1 ``frost_qsa_compress``, ``frost_qsa_compress_step``, the scorer and the top-k; no raw-key write): 11
-    where the control is 8; no memcpy / memset on any of the three execute paths; no allocation, no host sync over three executes."""
+    where the control is 8; no memcpy / memset on any of the three execute paths; no allocation, no host sync over three executes.  Under the
+    e4m3 indexer cache the SAME census (no cast kernel: the prepare / compress kernels store e4m3 directly, the scorer reads it) and the same
+    bitwise pins on the e4m3 cache and ``ix_q``."""
     from collections import Counter
 
-    on = _IndexerCase(GEOM_FLASH_NEXT, s_q, kv_lens, page=16, seed=120 + s_q, split=4, fuse_gate=True, return_lse=True, fuse_prepare=True)
-    off = _IndexerCase(GEOM_FLASH_NEXT, s_q, kv_lens, page=16, seed=120 + s_q, split=4, fuse_gate=True, return_lse=True, fuse_prepare=False)
+    kw = dict(page=16, seed=120 + s_q, split=4, fuse_gate=True, return_lse=True, index_cache_dtype=cache_dtype)
+    on = _IndexerCase(GEOM_FLASH_NEXT, s_q, kv_lens, fuse_prepare=True, **kw)
+    off = _IndexerCase(GEOM_FLASH_NEXT, s_q, kv_lens, fuse_prepare=False, **kw)
     ctl = _Case(GEOM_FLASH_NEXT, s_q, kv_lens, page=16, seed=120 + s_q, split=4, fuse_gate=True, return_lse=True, index_band=True, index_list_form="per_row")
     ctl.compile()
     ctl.run()
@@ -2323,6 +2592,9 @@ def test_decode_indexer_fused_and_unfused_prepare_are_bitwise_with_the_census_by
     has = lambda names, tok: sum(tok in n for n in names)  # noqa: E731
     for names in (k_on, k_off):
         assert has(names, "qsa_score_paged") == 1 and has(names, "qsa_topk_decode") == 1, names
+        assert not any(
+            "quantize" in n.lower() or "cast" in n.lower() or "elementwise" in n.lower() for n in names
+        ), f"a cast kernel on the execute path: {names}"
     for names in (k_on, k_off, k_ctl):
         assert not any("nvjet" in n.lower() or "cublas" in n.lower() for n in names), "the slab left the FROST route"
     assert (
@@ -2378,15 +2650,17 @@ def test_decode_indexer_list_fed_to_a_caller_list_block_is_bitwise():
 
 
 @requires_rubin
+@pytest.mark.parametrize("cache_dtype", [None, _E4M3], ids=["bf16", "e4m3"])
 @pytest.mark.parametrize("fuse_prepare", [True, False], ids=["fused", "unfused"])
-def test_decode_indexer_first_execute_captures_without_warm_up_and_replays_bitwise(fuse_prepare):
+def test_decode_indexer_first_execute_captures_without_warm_up_and_replays_bitwise(fuse_prepare, cache_dtype):
     """The serving stack's defaults on the decode indexer: the FIRST execute of a fresh declaration captured on a NEW stream with no eager
     warm-up under ``set_sync_debug_mode("error")`` (no plan constant, no allocation, no host read on the path), the capture launches
     nothing, the replay is BITWISE a fresh eager run (``out``, the LSE, the list, the ring, the cache), and a new step through the captured
     tensors (new lengths / tables / slots / ring state / cache / inputs) replays bitwise the eager run over them."""
     # the 24 / 2 band geometry: its slab (N 13952) rides the small-M route's 128-row tile at B x S_q <= 128 rows, capture-safe from the
     # first execute (the band capture cell above); the 8 / 2 band slab (N 5760) takes the GEMM graph route, whose handle is created eagerly
-    case = _IndexerCase(GEOM_FLASH_NEXT, 2, (300, 0, 1000, 77), page=16, seed=141, split=4, fuse_gate=True, return_lse=True, fuse_prepare=fuse_prepare)
+    kw = dict(page=16, split=4, fuse_gate=True, return_lse=True, fuse_prepare=fuse_prepare, index_cache_dtype=cache_dtype)
+    case = _IndexerCase(GEOM_FLASH_NEXT, 2, (300, 0, 1000, 77), seed=141, **kw)
     case.prime_prefix()
     case.blk.check_support()
     case.blk.compile()
@@ -2424,9 +2698,7 @@ def test_decode_indexer_first_execute_captures_without_warm_up_and_replays_bitwi
         assert torch.equal(_bits(case.index_kv_cache), cache_r) and torch.equal(_bits(case.index_state_cache), ring_r), "the replay differs from the eager run"
         # a NEW step through the captured tensors: one length a token longer (its slot, its list, its ring position move), a re-laid-out
         # table, a new ring state and prefix cache, new inputs -- the oracle of the new step through a sibling case over the same shapes
-        sib = _IndexerCase(
-            GEOM_FLASH_NEXT, 2, (301, 0, 1000, 77), page=16, seed=143, split=4, fuse_gate=True, return_lse=True, fuse_prepare=fuse_prepare, n_pages=case.n_pages
-        )
+        sib = _IndexerCase(GEOM_FLASH_NEXT, 2, (301, 0, 1000, 77), seed=143, n_pages=case.n_pages, **kw)
         sib.prime_prefix()
         assert (
             sib.block_table.shape == case.block_table.shape
@@ -2605,3 +2877,360 @@ def test_caller_list_band_block_with_fuse_prepare_is_bitwise_the_two_stage_form(
     assert torch.equal(_bits(on.index_cache), _bits(off.index_cache)), "the raw-key pool differs"
     names_on, names_off = [st.name for st in on.blk._stages], [st.name for st in off.blk._stages]
     assert "qsa_prepare" in names_on and "cache_write" not in names_on and "qk_norm_rope" not in names_on and len(names_on) == len(names_off) - 1
+
+
+# ---------------------------------------------------------------------------
+# Programmatic dependent launch on the block-sparse decode chain (``use_pdl``): a KNOB -- bitwise the plain chain
+# ---------------------------------------------------------------------------
+
+# The ladder rows the PDL pair runs (indices into _LADDER): the shared list at S_q 1 / 3 / 4 over bf16 and f16 pools (the default split,
+# split 4 without block_lens, split 17 with the fused gate and the LSE), the 24 / 2 geometry, and the per-token form unsplit and split 2.
+_PDL_ROWS = [0, 2, 3, 4, 7, 8]
+
+
+def _stage_names(case):
+    return [st.name for st in case.blk._stages]
+
+
+@requires_rubin
+@pytest.mark.parametrize("row", _PDL_ROWS, ids=[_LADDER[i].id for i in _PDL_ROWS])
+def test_pdl_on_is_bitwise_pdl_off_on_the_decode_ladder(row):
+    """``use_pdl=True`` on the block-sparse DECODE mode: the same stages, the same kernels -- the sparse core launches with the
+    programmatic-stream-serialization attribute and carries its griddepcontrol sites, the split combine takes the pair -- and ``out``,
+    the gated O slot, the LSE and the pools are BITWISE the ``use_pdl=False`` block's on the same inputs; within the budget vs the
+    oracle; a second switched step bitwise the first.  The readback: ``use_pdl`` True, ``sdpa_sparse`` among ``pdl_stages``,
+    ``use_pdl_effective`` True (every switched stage of the chain took the attribute)."""
+    geom_kw, s_q, kv_lens, dtype, page, layout, split, fuse_gate, return_lse, block_lens, fuse_norm_rope, index_band, seed = _LADDER[row].values
+    kw = dict(page=page, layout=layout, dtype=dtype, seed=seed, split=split, fuse_gate=fuse_gate, return_lse=return_lse, block_lens=block_lens)
+    kw.update(fuse_norm_rope=fuse_norm_rope, index_band=index_band)
+    off = _Case(geom_kw, s_q, kv_lens, use_pdl=False, **kw).compile()
+    on = _Case(geom_kw, s_q, kv_lens, use_pdl=True, **kw).compile()
+    assert off.blk.use_pdl is False and off.blk.pdl_stages == () and on.blk.use_pdl is True and on.blk.use_pdl_requested is True
+    assert "sdpa_sparse" in on.blk.pdl_stages and on.blk.use_pdl_effective is True and on.blk._sdpa.use_pdl is True and on.blk._sdpa._impl.use_pdl is True
+    assert _stage_names(on) == _stage_names(off) and on.blk.decode_split_kv == off.blk.decode_split_kv
+    a = off.run().clone()
+    o_a = off.slab_views()[4].clone()
+    lse_a = None if off.lse is None else off.lse.clone()
+    b = on.run().clone()
+    o_b = on.slab_views()[4].clone()
+    on.check(what=f"pdl on {on.label()}")
+    assert torch.equal(_bits(a), _bits(b)) and torch.equal(
+        _bits(o_a), _bits(o_b)
+    ), f"out / O differ with use_pdl (max|d out| {(a.float() - b.float()).abs().max().item():.3e})"
+    if lse_a is not None:
+        assert torch.equal(lse_a, on.lse), "the LSE differs with use_pdl"
+    assert torch.equal(_bits(on.k_cache), _bits(off.k_cache)) and torch.equal(_bits(on.v_cache), _bits(off.v_cache)), "the write-through differs"
+    c = on.run().clone()
+    assert torch.equal(_bits(b), _bits(c)), "a second switched step is not bitwise the first"
+
+
+def test_pdl_auto_stays_off_on_the_sparse_form_until_measured_and_the_envelope_says_so(monkeypatch):
+    """The AUTO reading of ``use_pdl`` on the block-sparse decode mode is False on every part today (``SPARSE_DECODE_PDL_DEFAULT_CCS``
+    is EMPTY: a part enters it with its measurement); the arm exists behind the tuple -- with the tuple patched to the measured dense part
+    AUTO resolves True on the sparse form and the switch reaches the sparse stage; an explicit value wins either way.  The envelope names
+    the switched stage kinds on the sparse form (``DECODE_PDL_STAGES``, the same four) and reads ``pdl_default`` off the sparse tuple."""
+    from cudnn.frost import buffers
+    from cudnn.gated_attention_block import api as _api
+
+    assert _api.SPARSE_DECODE_PDL_DEFAULT_CCS == ()
+    monkeypatch.setattr(_api, "_device_cc_of", lambda device: (10, 7))
+    with _no_host_sync():
+        auto = _declare(GEOM_SMALL, 2, 1, n_pages=4)[0]
+        on = _declare(GEOM_SMALL, 2, 1, n_pages=4, use_pdl=True)[0]
+        off = _declare(GEOM_SMALL, 2, 1, n_pages=4, use_pdl=False)[0]
+    assert auto.use_pdl_requested is None and auto.use_pdl is False and auto.pdl_stages == () and auto.use_pdl_effective is False
+    assert on.use_pdl is True and "sdpa_sparse" in on.pdl_stages and on.use_pdl_effective is True and off.use_pdl is False and off.pdl_stages == ()
+    monkeypatch.setattr(_api, "SPARSE_DECODE_PDL_DEFAULT_CCS", ((10, 7),))
+    with _no_host_sync():
+        measured = _declare(GEOM_SMALL, 2, 1, n_pages=4)[0]
+        other_part = None
+    assert measured.use_pdl_requested is None and measured.use_pdl is True and "sdpa_sparse" in measured.pdl_stages and measured.use_pdl_effective is True
+    assert _declare(GEOM_SMALL, 2, 1, n_pages=4, use_pdl=False)[0].use_pdl is False
+    monkeypatch.setattr(_api, "_device_cc_of", lambda device: (10, 0))
+    with _no_host_sync():
+        other_part = _declare(GEOM_SMALL, 2, 1, n_pages=4)[0]
+    assert other_part.use_pdl is False, "a part outside the tuple reads False"
+    monkeypatch.undo()
+    # the envelope: the sparse form names the four switched stage kinds; pdl_default reads the sparse tuple (empty -> False; patched -> True)
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    geom, _ = _geom(GEOM_SMALL)
+    env = GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV, device_cc=_SM107)
+    assert (
+        env.decode.served
+        and env.decode.sparse_core
+        and env.decode.pdl_stages == _api.DECODE_PDL_STAGES == ("qk_norm_rope", "cache_write", "sigmoid_gate", "sdpa")
+    )
+    assert env.decode.pdl_default is False
+    monkeypatch.setattr(_api, "SPARSE_DECODE_PDL_DEFAULT_CCS", ((10, 7),))
+    assert GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV, device_cc=_SM107).decode.pdl_default is True
+    assert GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV, device_cc=(10, 0)).decode.pdl_default is False
+    dense = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**GEOM_SMALL, causal_bottom_right=True), BF16, _DEV, device_cc=_SM107)
+    assert dense.decode.pdl_default is True and not dense.decode.sparse_core, "the dense form keeps its own measured tuple"
+
+
+def test_pdl_auto_never_resolves_true_under_the_in_block_indexer_whatever_the_tuple_holds(monkeypatch):
+    """The AUTO reading of ``use_pdl`` under ``QsaSpec(index_source="indexer")`` is False even with the sample's part IN
+    ``SPARSE_DECODE_PDL_DEFAULT_CCS``: the two readings answer for ONE domain -- the explicit True is declined by name there (the scorer /
+    top-k / step kernels would take the switch unmeasured), so a future measured entry in the tuple must not flip the indexer block through
+    the back door.  The caller-list block on the same patched tuple and part resolves True (the arm itself is live); the envelope agrees
+    (``pdl_default`` False on the indexer form)."""
+    from cudnn.gated_attention_block import api as _api
+
+    monkeypatch.setattr(_api, "_device_cc_of", lambda device: (10, 7))
+    monkeypatch.setattr(_api, "SPARSE_DECODE_PDL_DEFAULT_CCS", ((10, 7),))
+    with _no_host_sync():
+        indexer = _declare_indexer()
+        caller_list = _declare(GEOM_SMALL, 2, 1, n_pages=4)[0]
+    assert indexer.use_pdl_requested is None and indexer.use_pdl is False and indexer.pdl_stages == () and indexer.use_pdl_effective is False
+    assert caller_list.use_pdl_requested is None and caller_list.use_pdl is True and "sdpa_sparse" in caller_list.pdl_stages
+    with pytest.raises(NotImplementedError, match="use_pdl=True is served for the bf16 / f16 block only"):
+        with _no_host_sync():
+            _declare_indexer(use_pdl=True)
+    env = GatedAttentionBlockFwd.serving_envelope(indexer.geom, BF16, _DEV, device_cc=_SM107)
+    assert env.decode.pdl_default is False and env.decode.pdl_stages == ()
+
+
+def test_pdl_is_declined_on_e4m3_pools_and_on_the_packed_sparse_form_by_name():
+    """The two kept declines around the sparse chain's switch: ``use_pdl=True`` over e4m3 pools under QsaSpec (the gathered cast and the
+    decode tile carry no threaded switch; the block's own clause) and ``use_pdl=True`` with ``thd=True`` on a QsaSpec geometry (the sparse
+    core's packed form reads the setup launch's metadata above every role wait) -- each typed, naming the switch; the paged bf16 form with
+    ``thd=False`` constructs with the switch."""
+    import test_block_qsa_fp8_kv as _qkv
+
+    with pytest.raises(NotImplementedError, match="no e4m3 KV cache"):
+        _qkv._declare(_qkv.GEOM_SMALL, 2, 1, fuse_norm_rope=False, use_pdl=True)
+    assert _qkv._declare(_qkv.GEOM_SMALL, 2, 1, fuse_norm_rope=False)[0].use_pdl is False
+    geom, _ = _geom(GEOM_SMALL, causal_bottom_right=False)
+    mk = lambda *shape: torch.empty(*shape, dtype=BF16, device=_DEV)  # noqa: E731
+    args = (
+        mk(32, geom.d_model),
+        mk(geom.n_qkvg, geom.d_model),
+        mk(D),
+        mk(D),
+        mk(32, ROPE),
+        mk(32, ROPE),
+        mk(geom.d_model, geom.h_q * D),
+        mk(32, geom.d_model),
+        geom,
+    )
+    thd_kw = dict(thd=True, num_sequences=2, max_seq_len=32, token_capacity=32)
+    with pytest.raises(NotImplementedError, match="thd=True with use_pdl=True is not served") as e:
+        GatedAttentionBlockFwd(*args, **thd_kw, use_pdl=True)
+    # ONE source of the kernel fact: the block's declaration-time text carries the adapter's statement verbatim (`pdl_decline_reason`), so
+    # the two sites cannot drift apart; the adapter's own check_support raises the same statement (the sparse adapter's suite pins that side)
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import pdl_decline_reason
+
+    assert "on a QsaSpec geometry" in str(e.value) and pdl_decline_reason(thd=True) in str(e.value) and "declare use_pdl=False" in str(e.value)
+    assert pdl_decline_reason(thd=False) is None
+    with _no_host_sync():
+        assert _declare(GEOM_SMALL, 2, 1, n_pages=4, use_pdl=True)[0].use_pdl is True
+
+
+@requires_rubin
+def test_pdl_census_names_the_same_kernels_as_the_plain_chain():
+    """The switch adds no launch and removes none: the CUDA profiler's census of one switched execute is the plain execute's kernel list
+    (the same names in the same order -- the sparse core, its combine and the chain's other kernels); the switched chain's time is never
+    attributed here (a functional node; the pdl-OFF arm is the attribution of a measurement)."""
+    from gated_block_census import cupti_kernels as _cupti_kernels
+
+    off = _Case(GEOM_SMALL, 2, (300, 0, 1000, 77), page=16, seed=61, split=4, fuse_gate=True, return_lse=True, use_pdl=False).compile()
+    on = _Case(GEOM_SMALL, 2, (300, 0, 1000, 77), page=16, seed=61, split=4, fuse_gate=True, return_lse=True, use_pdl=True).compile()
+    k_off, _ = _cupti_kernels(lambda: off.execute())
+    k_on, _ = _cupti_kernels(lambda: on.execute())
+    if k_off is None or k_on is None:
+        pytest.skip("torch.profiler recorded no CUDA event (CUPTI unavailable on this node): the census is unverified here")
+    assert k_on == k_off, (k_on, k_off)
+    assert any(k.startswith("cudnn_kernel__combine") for k in k_on) and len(k_on) >= 4, k_on  # the GEMMs, the norm + RoPE pass, the core, its combine
+    print(f"\ncensus with use_pdl: {k_on}")
+
+
+@requires_rubin
+def test_capture_of_the_first_pdl_execute_of_the_sparse_chain_replays_bitwise_the_eager_plain_and_switched_chains(tmp_path):
+    """The serving stack's defaults on the SWITCHED sparse declaration (the dense chain's cell of ``test_block_serving_pdl`` on the block-sparse
+    decode mode): the FIRST execute of a fresh ``use_pdl=True`` block captured on a NEW stream, no warm-up, under ``set_sync_debug_mode("error")``
+    -- the sparse core's and its split combine's programmatic edges are captured without error, the capture launches nothing, the replay is
+    BITWISE the eager plain (``use_pdl=False``) chain on ``out`` / the LSE / the pools and bitwise the eager switched chain, and stays bitwise
+    over repeated replays (a race across a programmatic edge would surface as a replay that differs).  The graph's kernel-node census and the
+    driver / runtime / torch / DSL versions are printed (the record of what served the capture)."""
+    from gated_block_pdl_probe import cuda_versions
+
+    print(f"\ncuda versions: {cuda_versions()}")
+    kw = dict(page=16, seed=67, split=4, fuse_gate=True, return_lse=True)
+    plain = _Case(GEOM_SMALL, 2, (300, 0, 1000, 77), use_pdl=False, **kw).compile()
+    ref = plain.run().clone()
+    ref_lse = plain.lse.clone()
+    plain.check(ref, lse=ref_lse, what="plain eager")
+    case = _Case(GEOM_SMALL, 2, (300, 0, 1000, 77), use_pdl=True, **kw)  # fresh: never executed
+    assert case.blk.use_pdl is True and "sdpa_sparse" in case.blk.pdl_stages and case.blk.use_pdl_effective is True
+    case.blk.check_support()
+    case.blk.compile()
+    case.ws = torch.full((case.blk.get_workspace_size(),), 0x7F, dtype=torch.uint8, device=_DEV)
+    case.out.fill_(float("nan"))
+    case.lse.fill_(float("nan"))
+    k_before = _written(case.k_cache)
+    torch.cuda.synchronize()
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    dumped = None
+    try:
+        if hasattr(graph, "enable_debug_mode"):
+            graph.enable_debug_mode()
+        with torch.cuda.graph(graph, stream=stream):
+            prev = torch.cuda.get_sync_debug_mode()
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                case.execute()  # the FIRST execute of this declaration, captured: the switched stages carry the attribute
+            finally:
+                torch.cuda.set_sync_debug_mode(prev)
+        torch.cuda.synchronize()
+        assert torch.isnan(case.out).all() and _written(case.k_cache) == k_before, "the capture launched work"
+        if hasattr(graph, "debug_dump"):
+            try:  # best effort: the graph's DOT (cudaGraphDebugDotPrint) -- the kernel-node census beside the verdict, never the verdict
+                path = str(tmp_path / "sparse_pdl_decode_graph.dot")
+                graph.debug_dump(path)
+                with open(path) as fh:
+                    dot = fh.read()
+                dumped = dict(kernel_nodes=dot.count("KERNEL"), programmatic=sum(dot.lower().count(w) for w in ("programmatic", "port")))
+            except Exception as exc:  # noqa: BLE001 -- the dump is a record, never the verdict
+                dumped = f"debug_dump unavailable ({type(exc).__name__})"
+        graph.replay()
+        torch.cuda.synchronize()
+        replayed, replayed_lse = case.out.clone(), case.lse.clone()
+        case.check(replayed, lse=replayed_lse, what="replay of the switched chain")
+        assert torch.equal(_bits(replayed), _bits(ref)) and torch.equal(
+            replayed_lse, ref_lse
+        ), "the replay of the captured switched chain differs from the eager plain chain"
+        assert torch.equal(_bits(case.k_cache), _bits(plain.k_cache)) and torch.equal(_bits(case.v_cache), _bits(plain.v_cache)), "the write-through differs"
+        case.out.fill_(float("nan"))
+        case.lse.fill_(float("nan"))
+        case.execute()
+        torch.cuda.synchronize()
+        assert torch.equal(_bits(case.out), _bits(replayed)) and torch.equal(case.lse, replayed_lse), "the eager switched chain differs from its replay"
+        case.out.fill_(float("nan"))
+        case.lse.fill_(float("nan"))
+        for _ in range(50):
+            graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(_bits(case.out), _bits(replayed)) and torch.equal(
+            case.lse, replayed_lse
+        ), "repeated replays of the switched chain are not bitwise (a race across a programmatic edge)"
+    finally:
+        graph.reset()
+    print(f"graph census: {dumped}")
+
+
+# -- the detector of a late wait on the sparse core (GREEN with the shipped kernel, RED with its wait removed) -----------------------
+
+_SPIN_US = (300.0, 3000.0)  # the primary's late write: well past any launch latency, so a core that does not wait reads the poison
+
+
+def _standalone_sparse(case, *, pdl):
+    """The block's sparse stage as a standalone adapter on the block's OWN views (Q / GATE at the slab's token stride, the pools, the table,
+    the lengths, the list), with the switch; returns ``(adapter, run, o_buf)``."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    q, gate, _k, _v, o, _proj = case.slab_views()
+    o2 = torch.full_like(o, _sentinel(case.dtype))
+    lse2 = torch.full_like(case.lse, _sentinel(case.dtype))
+    a = SparseGqaFwdDslSm107(
+        q=q,
+        k=case.k_cache,
+        v=case.v_cache,
+        o=o2,
+        lse=lse2,
+        block_ids=case.block_ids,
+        block_lens=case.block_lens,
+        seq_kv_lens=case.kv_lens_t,
+        top_k=case.top_k,
+        scale=case.geom.scale,
+        paged_kv=True,
+        page_size=case.page,
+        block_table=case.block_table,
+        list_per_sequence=True,
+        bottom_right=True,
+        split_kv=case.blk.decode_split_kv,
+        epilogue_gate=gate,
+        use_pdl=pdl,
+    )
+    assert a.check_support() and a.use_pdl is pdl
+    a.compile()
+    ws = torch.empty(max(a.scratch_workspace_bytes(), 16), dtype=torch.uint8, device=_DEV)
+
+    def run():
+        a.execute(workspace=ws)
+        return o2
+
+    return a, run, o2
+
+
+def _race_the_core(case, run, o_buf, ref):
+    """Ahead of each launch of the switched core: poison an operand (NaN over the slab or the K pool, -1 over the block list, 0 over the
+    lengths), then the primary that releases its dependent at once and restores the operand late.  Returns, per (operand, spin), whether
+    the core's output equals ``ref``."""
+    from gated_block_pdl_probe import delayed_write
+
+    _q, _g, _k, _v, _o, proj = case.slab_views()
+    operands = {
+        "slab": (proj, proj.clone(), lambda t: t.fill_(float("nan"))),
+        "k_pool": (case.k_cache, case.k_cache.clone(), lambda t: t.fill_(float("nan"))),
+        # the int32 operands as FLAT views of the same storage (the probe takes 1-D int32 as is; a bf16 buffer it reinterprets itself)
+        "block_ids": (case.block_ids.view(-1), case.block_ids.clone().view(-1), lambda t: t.fill_(-1)),
+        "kv_lens": (case.kv_lens_t.view(-1), case.kv_lens_t.clone().view(-1), lambda t: t.fill_(0)),
+    }
+    verdicts = {}
+    for spin in _SPIN_US:
+        for name, (t, saved, poison) in operands.items():
+            poison(t)
+            delayed_write(saved, t, spin_us=spin)
+            run()
+            torch.cuda.synchronize()
+            verdicts[(name, spin)] = torch.equal(o_buf, ref)
+            t.copy_(saved)
+    torch.cuda.synchronize()
+    return verdicts
+
+
+@requires_rubin
+def test_detector_the_sparse_core_reads_its_operands_only_after_its_dependent_wait():
+    """GREEN: the shipped sparse core, launched with the attribute right after a primary that released it at once and wrote the slab (the
+    Q / GATE bands), the K pool, the block list or the lengths late, produces the undisturbed output -- every role's first read of each
+    sits below its dependent-grid wait (the kernel header's PDL SITES paragraph)."""
+    case = _Case(GEOM_SMALL, 2, (300, 0, 1000, 77), page=16, seed=71, split=4, fuse_gate=True, return_lse=True, use_pdl=True).compile()
+    case.run()
+    _a, run, o_buf = _standalone_sparse(case, pdl=True)
+    ref = run().clone()
+    torch.cuda.synchronize()
+    assert torch.equal(_bits(ref), _bits(case.slab_views()[4])), "the standalone switched core differs from the block's own sparse stage"
+    verdicts = _race_the_core(case, run, o_buf, ref)
+    print(f"\ndetector (shipped sparse core): {verdicts}")
+    assert all(verdicts.values()), f"the sparse core read an operand before its dependent wait: {verdicts}"
+
+
+@requires_rubin
+def test_detector_turns_red_when_the_sparse_core_launches_with_the_attribute_but_does_not_wait(monkeypatch):
+    """The detector's sensitivity: the same cell with the core's dependent-grid wait swapped for a no-op (the launch attribute kept, the
+    kernel retraced) reads the slab / the pool / the list / the lengths during the primary's spin -- a deliberately absent wait turns the
+    cell RED on every operand at the longest spin.  Runs after the GREEN cell; the retrace is undone before the next test compiles."""
+    import cudnn.frost.compiled_cache as compiled_cache
+    from gated_block_pdl_probe import retrace
+
+    case = _Case(GEOM_SMALL, 2, (300, 0, 1000, 77), page=16, seed=71, split=4, fuse_gate=True, return_lse=True, use_pdl=True).compile()
+    case.run()
+    mod = case.blk._sdpa._impl._module  # the loaded sparse template module (one object per template params)
+    assert mod.__name__.startswith("cudnn.frost._templates.") and hasattr(mod, "wait_on_dependent_grids")
+    monkeypatch.setenv("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", "1")  # the on-disk artifact would be the SHIPPED kernel
+    monkeypatch.setattr(mod, "wait_on_dependent_grids", lambda: None)
+    retrace(mod.compile)
+    try:
+        _a, run, o_buf = _standalone_sparse(case, pdl=True)  # a fresh trace: the attribute on, the waits gone
+        ref = run().clone()  # unraced, the no-wait core is still correct: nothing is in flight ahead of it
+        torch.cuda.synchronize()
+        verdicts = _race_the_core(case, run, o_buf, ref)
+        print(f"\ndetector (sparse core WITHOUT its waits): {verdicts}")
+        assert not all(verdicts.values()), f"the detector did not turn red for a core that never waits: {verdicts}"
+        assert not any(verdicts[k] for k in verdicts if k[1] == max(_SPIN_US)), f"the longest spin must turn every operand red: {verdicts}"
+        del _a, run
+    finally:
+        monkeypatch.undo()
+        retrace(mod.compile)  # the memo held the no-wait object under the shipped key
+        compiled_cache.clear_memo()

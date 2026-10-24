@@ -349,8 +349,9 @@ def test_decode_indexer_declines_are_published_row_by_row_and_the_envelope_names
     each carrying its one shared token, and the FlashInfer-read indexer facts are published by name on a Rubin reading: `index_sources`
     (`"caller"`, `"indexer"` at bf16 x head dim 128; `"caller"` alone at f16), the cache dtype, the head dims / KV heads / block sizes, the
     `top_k` range, the 64-row query envelope, the ring's extra rows, the page sizes the paged scorer serves, `fuse_prepare_default` True on the measured part (cc 10.7,
-    2026-10-21) for the bf16 indexer geometry and False off it -- the DSL state MODELED as the served one (the facts are a reading of the SERVED
-    form, never of this host's wheel); a DENSE geometry publishes none of them (any device, no host sync)."""
+    2026-10-21) for the bf16 indexer geometry and False off it; the cache dtypes `(bf16, e4m3)` since the e4m3 indexer cache is served at decode (2026-10-21; the
+    `indexer_e4m3_cache` decline row retired) -- the DSL state MODELED as the served one (the facts are a reading of the SERVED form, never of this
+    host's wheel); a DENSE geometry publishes none of them (any device, no host sync)."""
     import dataclasses
 
     from cudnn.frost import buffers as _buffers
@@ -370,7 +371,6 @@ def test_decode_indexer_declines_are_published_row_by_row_and_the_envelope_names
         "indexer_thd": "scores dense [B, S] prompts",
         "indexer_query_rows": "query rows per sequence (at most 64",
         "indexer_page_size": "a power-of-two count of compressed rows",
-        "indexer_e4m3_cache": "e4m3 read arm",
         "indexer_e4m3_pool": "in-kernel dequant arm",
         "indexer_shared_list": "selects per row",
         "fuse_prepare_rope_tables_unfused": "the unfused query norm reads the per-token",
@@ -382,7 +382,10 @@ def test_decode_indexer_declines_are_published_row_by_row_and_the_envelope_names
         d = GatedAttentionBlockFwd.serving_envelope(geom, dtype, _DEV, device_cc=(10, 7)).decode
         assert all(d.declines[nm] == texts[nm] for nm in texts), "a decline row reaches the envelope reworded"
         assert d.index_sources == (("caller", "indexer") if dtype == torch.bfloat16 else ("caller",))
-        assert d.index_cache_dtypes == ((torch.bfloat16,) if dtype == torch.bfloat16 else ())
+        assert d.index_cache_dtypes == (
+            (torch.bfloat16, torch.float8_e4m3fn) if dtype == torch.bfloat16 else ()
+        )  # the e4m3 indexer cache served at decode (2026-10-21)
+        assert "indexer_e4m3_cache" not in d.declines  # the row retired: a served form has no decline row
         assert d.index_head_dims == (128,) and d.index_kv_heads == (1,) and d.index_block_sizes == (4,) and d.index_top_k_range == (4, 512, 4)
         assert d.index_query_rows_max == 64 and d.index_state_rows_extra == 3 and d.index_page_sizes == (16, 32, 64, 128)
         assert d.fuse_prepare_default is (dtype == torch.bfloat16) and SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS == (
@@ -465,7 +468,8 @@ _DECLINES = [
         marks=_needs_dsl_floor,  # the head-group read sits behind the floor gate: below it the version decline answers first
     ),
     pytest.param(dict(d_head=128), QsaSpec(), {}, torch.bfloat16, NotImplementedError, "d_head == 256", id="d_head"),
-    # the fp8 indexer cache on f16 activations: the indexer's own dtype row speaks (the scorer packs bf16 queries and keys)
+    # the fp8 indexer cache on f16 activations: the indexer's own dtype row speaks (the scorer packs bf16 queries and keys); on the decode form
+    # over the pools the e4m3 cache itself is served since 2026-10-21 (test_block_qsa_decode.py) -- the f16 row is what stays
     pytest.param(
         {},
         QsaSpec(index_source="indexer", index_band=True, index_cache_dtype=_E4M3),
@@ -473,7 +477,7 @@ _DECLINES = [
         torch.float16,
         NotImplementedError,
         "bf16 activations",
-        id="indexer_e4m3_cache_f16",
+        id="indexer_e4m3_cache_on_f16_activations",
     ),
     # THD composed with what the core does not carry under packed sequences: the in-block indexer (the paged write-through composes
     # with the packed sparse block since 2026-10-14: test_write_through_under_thd_builds_the_same_stage_beside_the_packed_sparse_stage)

@@ -848,6 +848,25 @@ def test_rubin_mxfp8_row_names_its_thd_and_paged_gap(sm107_metadata_target):
 
 
 @pytest.mark.L0
+def test_sm100_mxfp8_row_serves_a_ragged_mask_free_kv_tail():
+    """The SM100 MXFP8 row admits a dense, mask-free S_kv off the 128-key tile (skv_tail_via_padding); the lowering
+    predicate selects that graph and not a covered causal tail or real per-batch lengths; the split gate keeps it
+    unsplit."""
+    caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
+    sm100 = caps[engines.engine_name(mxfp8=True)]
+    quant = dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_mxfp8=True)
+    ragged = dict(s_q=2100, s_kv=2100, causal=False, **quant)
+    assert sm100.skv_tail_via_padding
+    assert engines.mismatch(sm100, _facts(**ragged)) is None
+    assert engines._synth_kv_padding(sm100, _facts(**ragged))
+    assert not engines._synth_kv_padding(sm100, _facts(**dict(ragged, causal=True)))
+    assert not engines._synth_kv_padding(sm100, _facts(padded=True, **ragged))
+    assert engines.mismatch(sm100, _facts(**dict(ragged, causal=True))) is None
+    why = engines.mismatch(sm100, _facts(**ragged), engines.SdpaFwdKnobs(split_kv=2))
+    assert why is not None and "split_kv" in why
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("kind", ["A", "FALLBACK"])
 def test_rubin_d256_mxfp8_masked_sets_stay_in_the_flavor_sched_domain(kind, sm107_metadata_target):
     """The measured D256 picker says LPT for a masked block-scale graph; the cc 10.7 MXFP8 row claims NATURAL only at
@@ -1179,6 +1198,74 @@ def test_unsplit_leg_accounting_moves_the_wide_head_flavors_too():
     for plans in (d256, d192):
         assert (plans[0].knobs.cga, plans[0].knobs.split_kv) == (2, 1), plans[0].knobs
         assert all(p.knobs.split_kv == 1 for p in plans), [p.knobs for p in plans]
+
+
+@pytest.mark.L0
+def test_sm100_d192_half_proposals_are_admissible_and_transport_the_chooser(monkeypatch):
+    """Every set the SM100 f16 row proposes for a dense half-input d192x128 MHA graph passes mismatch() and sits in
+    the flavor's width domain at the sequence lengths around the 512-row pair geometry, masked or not; and the lead
+    set carries exactly the width and scheduler select_d192_auto_knobs returns (transport, the chooser mocked both
+    ways).  Which width wins where is the chooser's measured business, not a contract of this test."""
+    from cudnn.sdpa.fwd import heuristics as heur
+
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _F16)
+
+    def facts(**over):
+        base = dict(b=8, h_q=64, h_kv=64, d_qk=192, d_v=128, dtype=cudnn.data_type.BFLOAT16)
+        base.update(over)
+        return _facts(**base)
+
+    for s in (128, 256, 384, 512, 768, 1024, 1280, 1792, 2048):
+        for causal in (True, False):
+            f = facts(s_q=s, s_kv=s, causal=causal)
+            plans = [p for p in recommend("A", f, _OFFERED) if p.engine_id == 20500]
+            assert plans, (s, causal)
+            for p in plans:
+                assert engines.mismatch(spec.capabilities, f, p.knobs) is None, (s, causal, p.knobs)
+                assert p.knobs.cga in engines.effective_cgas(spec.capabilities, f), (s, causal, p.knobs)
+    for forced in ((SCHED_LPT, 1), (SCHED_NATURAL, 2)):
+        # The split leg keeps the real chooser's answer (the pair): only the unsplit lead is forced.
+        monkeypatch.setattr(heur, "select_d192_auto_knobs", lambda params, _forced=forced, **kw: _forced if params.split_kv == 1 else (SCHED_NATURAL, 2))
+        lead = [p for p in recommend("A", facts(s_q=640, s_kv=640), _OFFERED) if p.engine_id == 20500][0]
+        assert (lead.knobs.sched_policy, lead.knobs.cga) == forced
+
+
+@pytest.mark.L0
+def test_d192_half_default_width_constructs_on_both_targets():
+    """The width select_d192_auto_knobs returns for a dense causal half-input MHA graph constructs a configuration on
+    the target it was asked about: the SM100 factory for cc 10.0 / 10.3, the SM107 factory for cc 10.7 -- whose d192
+    tile has no single-CTA configuration, so the selector must leave that target on the pair."""
+    from dataclasses import replace
+
+    from cudnn.sdpa.fwd import config_sm100 as c100
+    from cudnn.sdpa.fwd import config_sm107 as c107
+    from cudnn.sdpa.fwd.heuristics import select_d192_auto_knobs
+
+    for cc, cfgmod in (((10, 0), c100), ((10, 3), c100), ((10, 7), c107)):
+        for s in (128, 256, 384, 512, 768, 1024):
+            params = cfgmod.TemplateParams(window_right=0)  # top-left causal
+            sched, cga = select_d192_auto_knobs(params, pertensor=False, s_q=s, s_kv=s, device_cc=cc)
+            cfg, _ = cfgmod.make_cfg_d192(replace(params, cta_mma=cga, sched_policy=sched))
+            assert cfg.CTA_MMA == cga, (cc, s)
+            if cc == (10, 7):
+                assert cga == 2, (cc, s)
+
+
+@pytest.mark.L0
+def test_sm100_d192_half_single_cta_ring_geometry():
+    """The half-input single-CTA d192 tile runs K as three 16 KiB D-subtile slots over one stage and V double-buffered
+    (208 KiB under the Q u O slab); the pair and the FP8 single-CTA tile keep one depth for both rings
+    (config_sm100.CfgD192.STAGES_K / STAGES_V / K_SUB)."""
+    from cudnn.frost.tile_dsl.constants import DTYPE_E4M3
+    from cudnn.sdpa.fwd.config_sm100 import _SM100_MAX_DYN_SMEM, TemplateParams, _d192_smem_bytes, make_cfg_d192
+
+    one, _ = make_cfg_d192(TemplateParams(cta_mma=1))
+    assert (one.STAGES_KV, one.STAGES_K, one.STAGES_V, one.K_SUB) == (1, 1, 2, 3)
+    assert _d192_smem_bytes(one) == 208 * 1024 <= _SM100_MAX_DYN_SMEM
+    two, _ = make_cfg_d192(TemplateParams(cta_mma=2))
+    assert (two.STAGES_KV, two.STAGES_K, two.STAGES_V, two.K_SUB) == (2, 2, 2, 1)
+    fp8, _ = make_cfg_d192(TemplateParams(cta_mma=1, dtype_qkv=DTYPE_E4M3))
+    assert (fp8.STAGES_KV, fp8.STAGES_K, fp8.STAGES_V, fp8.K_SUB) == (2, 2, 2, 1)
 
 
 @pytest.mark.L0
@@ -1577,8 +1664,10 @@ def test_sm107_d128_cga_and_pack_admission(sm107_metadata_target):
     cga=2, and PackGQA for every group that divides the 128-row tile (4 / 8 / 16; the d64 envelope too); a group that
     does not (96/8) is declined with the divisibility reason, dense d256 packs on the d256 decode tile within its route
     (S_q x G within two token units of the 32-column tile) and keeps its paged-THD-only PackGQA past it, THD nonpaged
-    keeps the cga2 prefill pipeline (cga=1 outside its domain, no packed leg), and dense PAGED queries -- not wired on
+    keeps the cga2 prefill pipeline and admits unsplit packing (cga=1 outside its domain), and dense PAGED queries -- not wired on
     cc 10.7 outside the d256 decode tile -- never see the d128 tile."""
+    from dataclasses import replace
+
     from cudnn.sdpa.fwd.engines import effective_cgas
 
     caps = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16).capabilities
@@ -1598,7 +1687,9 @@ def test_sm107_d128_cga_and_pack_admission(sm107_metadata_target):
     assert past_route is not None and "decode tile" in past_route, past_route
     thd = _sm107_d128_facts(thd=True, padded=True)
     assert "outside this engine's domain" in engines.mismatch(caps, thd, engines.SdpaFwdKnobs(cga=1))
-    assert engines.mismatch(caps, thd, pack) is not None
+    assert engines.mismatch(caps, thd, pack) is None
+    assert engines.mismatch(caps, replace(thd, h_q=96), pack) is None
+    assert engines.mismatch(caps, thd, replace(pack, split_kv=2)) is not None
     assert 1 not in effective_cgas(caps, _sm107_d128_facts(has_paged_kv=True, page_size=16, padded=True))
 
 

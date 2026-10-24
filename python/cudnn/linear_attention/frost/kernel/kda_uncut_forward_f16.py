@@ -27,6 +27,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
+from cudnn.frost.compiled_cache import compile_cached
+
 from ..common.host import get_dtype
 from . import kda_prefill_f16, kda_prep_f16, kda_prep_prefill_f16
 
@@ -309,7 +311,7 @@ def build_uncut_forward(
 
         work_items_placeholder = from_dlpack(work_items, assumed_align=16)
         work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        uncut_forward_cache[key] = cute.compile(
+        uncut_forward_cache[key] = compile_cached(
             uncut_forward_host,
             int(b_t),
             int(num_sm),
@@ -340,6 +342,8 @@ def build_uncut_forward(
             prep_cfg,
             *prep_placeholders,
             cuda.CUstream(int(stream)),
+            cache_key=repr((__name__, key)),
+            symbol="frost_la_kda_uncut_forward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
     return uncut_forward_cache[key]

@@ -204,9 +204,11 @@ not become a compile key.
   `test_dsl_sm100_thd_compile_key_plan_time_only`), not by inspection.
 - **Prove artifact reuse across plans.** A stable key does not guarantee that
   `compile_cached` exported an artifact: its wrapper serializer declines
-  dataclass compile arguments, including `Constexpr` ones. Read an immutable
-  template module's `PARAMS` inside the host instead of passing the same
-  dataclass again. Build a second plan with `cute.compile` forbidden, assert
+  runtime dataclass arguments. A `Constexpr` dataclass is exportable only when
+  the DSL executor establishes that it is absent from the runtime arguments;
+  its baked configuration must still be represented in the specialization key.
+  An immutable template module can instead read its `PARAMS` inside the host.
+  Build a second plan with `cute.compile` forbidden, assert
   a real cache hit, and check the reloaded artifact's outputs and graph replay;
   `test_replan_reloads_prepared_artifact` is the SM80 detector. Such a test
   sets `CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO=0` for its own process
@@ -225,6 +227,13 @@ not become a compile key.
   context; no invalid cross-device GPU launch is needed. See the sparse SDPA
   tests `test_compilation_and_launch_preserve_the_declared_or_resolved_device`
   and `test_compilation_bypasses_argument_only_caches_across_devices`.
+  Standalone wrapper caches also need the input device in their key when an
+  object retains a launchable or workspace. A device-aware outer memo cannot
+  protect an inner cache that omits it. The grouped GLU detector
+  `test_block_scaled_wrapper_cache_separates_devices` alternates two devices
+  without clearing caches and replays captures from each after changing inputs.
+  Use an explicit per-device capture stream in that detector: Torch's implicit
+  `graph.default_capture_stream` can retain the first device's stream.
 - **Issue #604 is closed**: SM80 THD compiles use symbolic packed extents.
   The prepared backward host takes Int64 capacities and launch bounds at
   runtime, including the compact Stats head pitch and deterministic-counter
@@ -322,12 +331,11 @@ SDPA-specific hard rules (cited as Rule S1, S2, ...) live in
 **Rule 7 — gate the CuTe DSL version at runtime; never assume the installed
 DSL satisfies your kernel.**
 
-- The `pyproject.toml` floor on `nvidia-cutlass-dsl` (`>=4.6.2`) is the
-  **downstream** floor, not ours: vLLM and SGLang inherit quack-kernels'
-  `==4.6.2`, and a higher floor would make this package uninstallable next to
-  them. The FROST-derived kernels need more (`CUTEDSL_MIN_VERSION`, 4.7.0). So
-  an installed DSL that satisfies pip can still be below what a kernel needs,
-  and every backend/kernel must cope with that at runtime.
+- The `pyproject.toml` floor on `nvidia-cutlass-dsl` is `>=4.8.0`, matching
+  vLLM v0.32.0 and SGLang v0.5.22, which both pin 4.8.0. Kernel-specific
+  requirements still need runtime checks: environments can bypass dependency
+  resolution, and newer kernels can require APIs or targets above the package
+  floor. Keep the existing version gates and actionable errors.
 - Before a path imports a DSL-version-specific API, check the installed version
   with `cudnn.frost.buffers.cutedsl_state()` / `cutedsl_too_old()` (floor:
   `CUTEDSL_MIN_VERSION`) and **decline, or raise an error that names the
@@ -396,10 +404,20 @@ DSL satisfies your kernel.**
   whenever `S` is true. Give such loop-local names their own spelling.
   Detector: rerun the kernel's tests with quack imported first (for example,
   a `-p` plugin that does `import quack`).
+- **Packed FP4 crosses the launch as bytes.** Below 4.8,
+  `from_dlpack(..., enable_tvm_ffi=True)` binds a real
+  `torch.float4_e2m1fn_x2` tensor with its packed shape and strides (two
+  values per unit), while the kernel is compiled for the E2M1 ones. The kernel
+  then reads the wrong bytes along the packed dim and returns wrong numbers
+  without an error. Launch a `torch.uint8` view and recast it inside the
+  `@cute.jit` entry with `cute.recast_tensor(t, cutlass.Float4E2M1FN)`
+  (`kernel_qk_view` and `IndexerScoreUnifiedSm100Mxfp4._qk_tensor` in
+  `deepseek_sparse_attention/score_recompute/`). Detector: the kernel's
+  numerics tests on a 4.7 lane.
 - Why: PR #799's `causal_conv1d_update` imported `frost.tile_dsl` from a route
   with no version check and broke the 4.6.2 lane — the version vLLM and SGLang
-  ship — with a bare `ModuleNotFoundError: cutlass.experimental`; the bulk
-  route next to it had the check and declined cleanly. Earlier, PR #854's
+  shipped at the time — with a bare `ModuleNotFoundError: cutlass.experimental`;
+  the bulk route next to it had the check and declined cleanly. Earlier, PR #854's
   module-scope `set_name_prefix(..., remove_cutlass_symbol=True)` failed the
   same way on a since-dropped 4.5.x lane, reported as "install optional
   dependencies".

@@ -23,6 +23,14 @@ SUPPORTED_QHEAD_PER_KV_HEAD_BF16 = (4, 8, 16, 32, 64)
 # ``128 // group`` tokens per tile, split between the two epilogue warpgroups. Same set as BF16; a
 # plain-e4m3 scorer is the MXFP8 kernel with all-ones E8M0 scale blobs.
 SUPPORTED_QHEAD_PER_KV_HEAD_MXFP8 = (4, 8, 16, 32, 64)
+# The MXFP4 kernel differs from the MXFP8 one only in its MMA, so it serves the same groups.
+SUPPORTED_QHEAD_PER_KV_HEAD_MXFP4 = SUPPORTED_QHEAD_PER_KV_HEAD_MXFP8
+# Head groups keyed by precision.
+_SUPPORTED_QHEAD_PER_KV_HEAD = {
+    "bf16": SUPPORTED_QHEAD_PER_KV_HEAD_BF16,
+    "mxfp8": SUPPORTED_QHEAD_PER_KV_HEAD_MXFP8,
+    "mxfp4": SUPPORTED_QHEAD_PER_KV_HEAD_MXFP4,
+}
 
 # Query tokens packed per MMA tile at head_dim 128, keyed by head group. The 32 / 64 entries are the
 # measured SM100 picks of each path and stay as they were (the dense path packs 4 tokens x 32 heads, the
@@ -34,8 +42,11 @@ _COMPRESSED_Q_TOKENS_PER_TILE = {64: 2, 32: 2, 16: 8, 8: 8, 4: 8}
 
 
 def supported_qhead_per_kv_head(precision: str) -> tuple[int, ...]:
-    """Head groups the SM100 unified indexer-score kernel serves for ``precision``."""
-    return SUPPORTED_QHEAD_PER_KV_HEAD_MXFP8 if precision == "mxfp8" else SUPPORTED_QHEAD_PER_KV_HEAD_BF16
+    """Head groups the SM100 unified indexer-score kernel serves for ``precision`` (``ValueError`` without a row)."""
+    supported = _SUPPORTED_QHEAD_PER_KV_HEAD.get(precision)
+    if supported is None:
+        raise ValueError(f"no qhead_per_kv_head groups are defined for precision={precision!r}")
+    return supported
 
 
 def validate_qhead_per_kv_head(qhead_per_kv_head: int, precision: str) -> None:

@@ -48,6 +48,7 @@ import cutlass.cute as cute
 
 from cudnn.frost.tile_dsl.thd import (
     THD_BWD_META_WORDS,
+    THD_BWD_WORK_PREFIX_OFF,
     THD_ROWOFF_OFF,
     THD_SETUP_THREADS,
     write_thd_batch_remap,
@@ -56,6 +57,7 @@ from cudnn.frost.tile_dsl.thd import (
     write_thd_prefix_warp,
     write_thd_port_origins,
     write_thd_row_offsets,
+    write_thd_work_prefix,
 )
 from cudnn.sdpa.bwd.config_sm100 import STAGE3_THD_SF_CU_K_OFF, STAGE3_THD_SF_CU_Q_OFF, STAGE3_THD_SF_META_WORDS
 from cudnn.sdpa.bwd.config_sm107 import MX_BLOCK, SF_ATOM_BYTES, SF_ATOM_COLS, SF_ATOM_ROWS
@@ -228,7 +230,11 @@ def build_thd_bwd_setup_kernel(
     cute.arch.barrier()
     write_thd_batch_remap(cutlass.make_array_view(meta_t), n_batch, cutlass.Int32(tidx), cutlass.Int32(nthreads))
     cute.arch.barrier()
-    write_thd_live_and_ctr(cutlass.make_array_view(meta_t), n_batch, n_qh, cga_tile_m, n_clusters, cutlass.Int32(tidx), cu0=blk_cu0)
+    # Live total + claim counter + the remap-ordered unit prefix (THD_BWD_WORK_PREFIX_OFF) stage 2's
+    # decode binary-searches instead of walking every sequence, counted along the blocked axis.
+    write_thd_work_prefix(
+        cutlass.make_array_view(meta_t), n_batch, n_qh, cga_tile_m, n_clusters, cutlass.Int32(tidx), 1, cu0=blk_cu0, prefix0=THD_BWD_WORK_PREFIX_OFF(n_batch)
+    )
 
 
 build_thd_bwd_setup_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)

@@ -45,6 +45,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     pack_gqa_supported,
     supports_paged_prefill_cga1,
     supports_paged_d256_pack_gqa,
+    supports_nonpaged_d128_thd_pack_gqa,
     supports_thd_split,
     supports_scalar_kv_tail_split,
     supports_paged_split_sink,
@@ -1414,6 +1415,15 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         # api_dsl.check_support mirrors these lines (keep them in lockstep).
         ragged_decode = knobs.cga == 1 and facts.thd and _thd_decode_leg(capabilities, facts)
         packed_split = packed_thd_split(capabilities, facts, knobs)
+        ragged_pack = knobs.pack_gqa and supports_nonpaged_d128_thd_pack_gqa(
+            (facts.d_qk, facts.d_v),
+            device_cc=facts.device_cc,
+            fp8=facts.is_fp8 or facts.is_mxfp8,
+            thd=facts.thd,
+            paged=facts.has_paged_kv,
+            cga=knobs.cga,
+            split_kv=knobs.split_kv or 1,
+        )
         # The d256 DECODE tile (sm107/decode_d256_f16.py) packs the WHOLE group into its 16-row Q tile
         # over a dense or paged cache (HEADS_PER_TILE = QH_PER_KH) and writes the SM100 tile's fp32 split
         # partials for sm100/split_combine, so a decode-shaped half d256 graph packs and splits whatever
@@ -1432,19 +1442,20 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             and not packed_split
             and not decode_tile
             and not rubin_dense_d128_shared_leg(capabilities, facts, knobs)
+            and not ragged_pack
         ):
-            return "Rubin half PackGQA requires paged KV, the D128 packed split, a dense D128 GQA graph without the pre-folded scale (the shared SM100 body), or the d256 decode tile (a decode-shaped graph: S_q x G packed rows within its routed envelope)"
+            return "Rubin half PackGQA requires paged KV, the D128 packed split, an unsplit dense or ragged D128 GQA graph without the pre-folded scale (the shared SM100 body), or the d256 decode tile (a decode-shaped graph: S_q x G packed rows within its routed envelope)"
         if (
             facts.attn_scale_prefolded
             and capabilities.sm_lo == 107
             and not (facts.is_fp8 or facts.is_mxfp8)
             and facts.thd
-            and (packed_split or (knobs.cga == 1 and _selected_d_shape(capabilities, facts) == (192, 128)))
+            and (packed_split or ragged_pack or (knobs.cga == 1 and _selected_d_shape(capabilities, facts) == (192, 128)))
         ):
-            # Packed splits and the D192 single-CTA leg load shared SM100
+            # Packed splits, unsplit D128 packing and the D192 single-CTA leg load shared SM100
             # bodies, which apply the scale in-kernel. Rubin's native unsplit
             # prefill siblings serve the pre-folded scale.
-            return "attn_scale_prefolded is not wired in the shared half THD legs (packed split / D192 single-Q)"
+            return "attn_scale_prefolded is not wired in the shared half THD legs (packed split / D128 packing / D192 single-Q)"
         if packed_split and not getattr(
             cudnn._pybind_module._SdpaThdBinder,
             (
@@ -1631,7 +1642,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 _pg_tile_m = max(m for m, _ in _sm120_tile_domain(facts.d_qk, facts.d_v, facts.is_fp8 or facts.is_mxfp8))
             else:
                 _pg_tile_m = max(capabilities.tile_ms)
-            _partial = pack_gqa_partial(capabilities, facts)
+            _partial = pack_gqa_partial(capabilities, facts) or ragged_pack
             # The decode tile packs the WHOLE group into its 16-row Q tile whatever tile_m (24/2: 12 live
             # rows + 4 zero tail rows), so the prefill tiles' divisibility rule does not apply to a Rubin
             # graph that lowers onto it (api_dsl.check_support exempts the same graphs).  The SM100 line
@@ -2427,6 +2438,11 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             right_band_widening=True,
             swa=True,
             padded=True,
+            # Ragged S_kv with an uncovered tail: the adapter compiles the
+            # padded mask against the scalar S_kv (kv_tail_mask, #1425).  The
+            # SF tile count is already ceil(S_kv / 128) and the kernels
+            # replace the fully padded V scale blocks of that tail tile.
+            skv_tail_via_padding=True,
             sink=True,
             stats=True,
             stats_log2=True,

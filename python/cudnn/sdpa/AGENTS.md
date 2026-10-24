@@ -70,6 +70,12 @@ Under THD PackGQA, setup and decoding count **token** tiles
 (`CGA_TILE_M / PACK_G`), while Stats stores use the unpacked query head.
 Changing only one side misses or aliases rows. The packing/capture tests
 exercise partial groups and protect untouched tails with sentinels.
+The D128 BF16 top-left causal bounded work decoder also serves paged THD
+at 128x128, two CTAs and SPLIT_KV=1, including the shared SM107 paged body.
+Packed-KV tests alone do not cover it: `test_thd_work_lookup_paged_replay`
+asserts the paged bounded route and checks unequal Q/KV lengths, partial
+PackGQA, changing K/V tables and live/empty transitions under one capture.
+FP16 and sliding-window paged cases do not exercise this opt-in.
 A bounded second wave is a plan-time tuning choice; compute its workload
 from packed token tiles, rather than unpacked tiles times all query heads.
 
@@ -169,6 +175,13 @@ ordered after that read.**
   as an unchanged control.
 
 
+- A synthetic final ownership event must preserve the consumer-completion
+  dependency supplied by a real lookahead event. In the D192 FP8 rotated-P
+  schedule, S0[j+1] also orders reuse after PV1[j-1]; the synthetic final S0
+  event must therefore wait for that PV completion. A thread arrive alone
+  can overwrite P1 and even lap the chunk-ready parity. Detector:
+  `test_fp8_d192_final_p1_reuse_under_mma_skew` delays the previous P1 reader.
+
 **Rule S4 — Split-K partial Stats keep the combiner's log base.**
 
 - `stats_use_log2` changes final Stats only. Partial LSE consumed by a
@@ -199,12 +212,29 @@ can otherwise leave half the rows unwritten while corrupting padding. The
 SM107 detector is `test_sm107_fp8_stats_nonunit_row_stride`; MXFP8 also checks
 rebound padded and batch-inner layouts under CUDA Graph replay.
 
+Vector-load alignment must follow each input's declared base and physical
+strides. Inspect the original tensor iterator before `raw_ptr()` conversion,
+which can discard its alignment declaration; checking the converted pointer
+can leave an intended vector path scalar. Compile both aligned and misaligned
+controls and inspect the emitted loads, then check physical pitches, pointer
+rebinding and replay. `test_sdpa_bwd_dot_strides.py` covers the shared dot helper.
+Compact strides do not establish base-pointer alignment. Keep the declaration
+check for both inputs in the compact path too; the compact alignment-2 cases
+exercise O alone, dO alone, and both inputs, with matching PTX controls.
+
 Block-scaled SF_O uses byte addressing: its fake tensor extent, host geometry
 arguments, device parameters, and every intermediate offset product must all
 stay Int64. Widen operands before multiplication. The physical detector is
 `test_block_scaled_sf_plane_stride_above_int32`: it writes two live SF planes
 separated above 2**32 and checks capture/replay. A wide fake extent alone only
 fixes binding; deliberately narrowing the plane stride must fail numerically.
+
+Padding helpers must preserve strides too: reinterpreting data as 32-bit words
+changes stride units, not physical layout. Both the input address and output store
+must use those strides. Pitched BSHD can look correct at batch zero and silently
+read the wrong K/V at batch one. The detector is
+`test_sdpa_bwd_d256_sm100.py::test_batch_pitch_rebind_and_replay`, including
+both source padding and output copy-out with canaries in unused physical rows.
 
 **Rule S6 — A kernel feature lands on every arch line's test file, and its
 other-arch lowerings are smoke-compiled from whatever GPU you have.**
@@ -316,6 +346,16 @@ choice when changing the target. Check scheduler and credit-helper selection
 together at each caller; THD does not imply persistent scheduling in every
 kernel family. Detector:
 `test_sdpa_fwd_o_empty_backedge.py::test_scheduler_and_credit_target_select_the_same_layouts`.
+
+A completed mbarrier phase needs a successful wait before arrivals in the
+next phase, even when output ordering already protects the shared storage.
+The D128 backward store warp bootstraps four dQ source-credit barriers per
+CLC owner. Its native dV/dK epilogue waits on only slices 1/3, so explicitly
+observe all four terminal phases before publishing those outputs, including
+zero-trip owners. Keep dense and THD loops consistent; grouped kernels reuse
+them. Run `test_sdpa_bwd_d128_terminal_credits.py` under Compute Sanitizer
+synccheck as well as its ordinary FP64/canary and capture/replay checks:
+correct numerical output alone does not detect this protocol violation.
 
 Match barrier completion cadence to the consumer's loop. SM100 D512 MXFP8
 SWA=128 drains two Dv slices per tile, so a once-per-tile softmax wait must use
@@ -577,6 +617,25 @@ Backward (d512 stage 2):
 
 ## Stage-3 GEMM (`bwd/kernels/bprop_matmul_blackwell.py`) perf-method lessons
 
+- **A head subgroup is legal only when the final reduction covers all global
+  per-query-head partials.** The dense BF16 SM100 d256 chain can divide one GQA
+  group after whole-group choices exceed its workspace target. Every chunk must
+  divide the group, its grouped dQ tensor map must retain one K head (ceiling
+  division, never a zero-sized floor), and the global dK/dV fold must run once
+  after all chunks. Keep other chains' validation strict and gate inherited
+  chooser rules by dtype, layout and compute capability. Detectors in
+  `test_sdpa_bwd_d256_sm100.py`: `test_head_subgroups_match_full_group_gradients`,
+  `test_head_subgroups_preserve_mask_and_tail_gradients`,
+  `test_head_subgroups_rebind_stream_replay_and_launch_count` and
+  `test_head_subgroup_rule_is_scoped_and_workspace_is_honest`. They check
+  old/new bitwise gradients against an independent oracle, poisoned scratch,
+  stream/storage replay, exactly one fold and unchanged fitting choices.
+  Keep the stage-3 source pins consistent with ceiling division while retaining
+  the `b_head_group == 1` constant-fold checks. The SM107 suite's host-only
+  `test_stage3_b_descriptor_covers_partial_head_groups` evaluates the actual
+  template expression against the K heads reached by every Q head; restoring
+  floor division must fail for a subgroup smaller than one complete GQA group.
+
 Measured on the SM100 d512 backward's dV / dK / dQ GEMMs (B200, 148 SMs, 1155 MHz SW power cap, cuDNN 9.26.0.51, DSL 4.7.0,
 2026-10-01; the numbers quoted here are the per-GEMM CUPTI medians of CLEAN in-process round-robin A/B slots, and the constant's
 comment in `bwd/api_dsl.py` carries the full set).  Each lesson names its runnable detector; add to the list, do not restate.
@@ -645,6 +704,21 @@ comment in `bwd/api_dsl.py` carries the full set).  Each lesson names its runnab
 
 ## Output initialization regressions
 
+D256 chunk-local GQA partial buffers may be reused only after a complete
+GQA group has been folded. Input batch/head origins remain global while the
+dV store and dK GEMM use independent local output origins. A head subgroup
+smaller than the GQA group still needs global partials until the final fold.
+`test_chunk_partials_workspace_and_subgroup_boundary` checks the allocation
+boundary; `test_chunk_partials_match_full_partials` checks batch, head and
+combined chunks against FP64 and the original fold, with poisoned workspace
+under dense, causal, bottom-right and sliding-window masks.
+`test_chunk_partials_preserve_per_member_dq` also retains the per-member dQ path.
+`test_chunk_partials_rebind_stream_and_replay` checks changed inputs and the
+caller's stream under capture.
+When a test monkeypatches the scratch policy, capture its shapes and byte
+count inside that context: these queries call the current policy dynamically,
+so restoring the class before reading the baseline silently changes the control.
+
 When removing wrapper-side output clears, verify that the prepared chain
 overwrites every element, including masked rows and partial tiles. Poison
 fresh auxiliary outputs with NaNs, forbid the removed Torch clear calls, and
@@ -695,12 +769,35 @@ ordered by CTA barriers. Check prefix lengths around warp boundaries and
 zero-length sequences (`test_parallel_thd_metadata_matches_lengths_and_normalized_cu`),
 and run racecheck/memcheck before changing this shared setup again.
 
-Shared compile-time predicates must reject unrelated head geometry before
-reading family-specific config fields. The D512 two-by-two config has no
-`PAGED_KV`; D256 decode has no `THD_VARLEN`. A D128-only optimization can break
-their compilation through a shared decoder even when its own tests pass.
-Exercise real config objects (`test_thd_work_prefix_declines_other_config_families`)
-and the existing D512 `test_two_by_two_thd` compile-and-execute test.
+The shared THD unit decode (`_common_blackwell._thd_decode`,
+`tile_dsl.thd.thd_decode_unit_prefix`) binary-searches the remap-ordered work
+prefix for EVERY THD flavor, forward and backward, so three sites must agree
+or units decode garbage from an unwritten table: the setup launch publishes
+the prefix along the blocked axis (`write_thd_work_prefix`: Q rows by default,
+`cu0 = 2B+1` for kv-block units, `prefix0 = THD_BWD_WORK_PREFIX_OFF` in the
+backward layout, whose forward slot holds `row_off`), the host reserves
+`THD_WORK_META_WORDS` / `THD_BWD_META_WORDS` words, and the decode is handed
+the same `cu0` / `prefix0`. A kernel that derives its batch count from the
+metadata tensor's length (the SM120 prefill family) must do it through
+`THD_BATCH_OF_WORK_META_WORDS`: the old `(n - 4) // 4` read B = 5 for B = 4 on
+the 5B+5-word tensor and faulted only once units outnumbered CTAs
+(`test_dsl_sm120_thd_multi_unit_per_cta`). Shared decoders still see configs
+without family-specific fields (the D512 two-by-two config has no `PAGED_KV`;
+D256 decode has no `THD_VARLEN`), so read those through defaults, and keep the
+D512 `test_two_by_two_thd` compile-and-execute test green. Detectors:
+`test_thd_decode_unit_prefix_matches_walk` (prefix == walk unit for unit, B 1
+to 257, zero-length sequences, reversed rows), `test_parallel_bwd_setup_prefixes`
+(asserts the whole backward buffer, prefix words included) and
+`test_thd_work_prefix_replay_matches_live_tiles`. Two DSL traps met on the way:
+inside a `@cute.kernel` that already has `Constexpr` parameters, hand a
+`@cute.jit` helper's `Constexpr` argument through a kernel `Constexpr` parameter
+rather than a literal (the fp8/mxfp8 setup kernel failed with `requires a code
+object with 0 free vars, not 2` while its f16 twin passing `splits` compiled);
+and inside a `@cute.jit` helper never rebind a None-defaulted parameter to a
+staged value within a dynamic region (`TYPE_UNSTABLE_JOIN` at the region join)
+-- assign a fresh local (`cuq0 = n_batch if const_expr(cu0 is None) else cu0`)
+and re-run the callers that use the default whenever a shared helper changes,
+since callers passing the value explicitly compile fine.
 
 Standalone scratch queries after `check_support()` must not depend on a
 compiled module. Reserve metadata from checked plan geometry and keep the
@@ -1072,3 +1169,11 @@ carrying different strides; keep descriptor axes and loader coordinates
 consistent rather than changing one alone. The `independent_pool_layouts`
 tests pin FROST execution and compare O/Stats in both mixed directions,
 including one KV head; backend fallback must not count as kernel support.
+
+An adapter subclass must explicitly retain unsupported layout flags when its
+parent gains a new mode. Graph capability filtering does not protect direct
+adapter callers. `test_standalone_adapter_rejects_thd` checks the SM100 D256
+decline with otherwise valid descriptors and a positive parent-row control;
+it must fail if the subclass inherits the parent's THD admission. For pitched
+views, protect input and output padding with canaries as well as gradient
+padding, and check all of them after eager execution and graph replay.

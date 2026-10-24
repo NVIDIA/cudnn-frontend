@@ -874,8 +874,8 @@ def test_sm107_f16_split_coverage_and_pack_gqa_gate():
         ) != (128, 128), d
     for feature in (dict(thd=True, padded=True), dict(padded=True), dict(has_sink=True)):
         assert engines.mismatch(caps, _f16_facts(**feature), engines.SdpaFwdKnobs(split_kv=2)) is not None
-    # THD nonpaged d128 unsplit has no packed leg (dense d128 packs on the shared SM100 body since issue #1472, below).
-    assert engines.mismatch(caps, _f16_facts(thd=True, padded=True), engines.SdpaFwdKnobs(pack_gqa=True)) is not None
+    # D128 unsplit THD packing now shares the two-CTA SM100 body with dense packing.
+    assert engines.mismatch(caps, _f16_facts(thd=True, padded=True), engines.SdpaFwdKnobs(pack_gqa=True)) is None
 
     for d_qk, d_v, paged in ((128, 128, True), (192, 128, False)):
         facts = _f16_facts(d_qk=d_qk, d_v=d_v, thd=True, padded=True, has_paged_kv=paged, page_size=16 if paged else 0)
@@ -967,6 +967,26 @@ def test_sm107_paged_d256_pack_gqa_support_contract(dtype_name, group):
         assert engines.mismatch(caps, facts, dataclasses.replace(knobs, **changed)) is not None, changed
     blackwell = dataclasses.replace(facts, device_cc=(10, 0))
     assert engines.mismatch(_caps("sdpa_fwd_prefill_sm100"), blackwell, knobs) is not None
+
+
+@pytest.mark.parametrize("dtype_name", ["HALF", "BFLOAT16"])
+@pytest.mark.parametrize("group", [2, 4, 6, 8, 12, 16])
+def test_sm107_nonpaged_d128_thd_pack_gqa_contract(dtype_name, group):
+    """Explicit unsplit ragged packing serves both half types, including partial groups."""
+    import cudnn
+    from cudnn.sdpa.fwd import engines
+
+    dt = getattr(cudnn.data_type, dtype_name)
+    facts = _f16_facts(h_q=group * 2, h_kv=2, dtype=dt, dtype_o=dt, thd=True, padded=True)
+    caps = _caps("sdpa_fwd_prefill_sm107")
+    knobs = engines.SdpaFwdKnobs(cga=2, split_kv=1, pack_gqa=True)
+    for extra in ({}, dict(has_sink=True), dict(wants_stats=True, shape_overrides=True, max_total_seq_len_q=facts.b * facts.s_q)):
+        assert engines.mismatch(caps, dataclasses.replace(facts, **extra), knobs) is None
+    # Shared bodies apply scale in-kernel; accepting a pre-scaled Q would scale it twice.
+    assert "attn_scale_prefolded" in engines.mismatch(caps, dataclasses.replace(facts, attn_scale_prefolded=True), knobs)
+    for shape in ((192, 128), (256, 256), (512, 512)):
+        assert engines.mismatch(caps, dataclasses.replace(facts, d_qk=shape[0], d_v=shape[1]), knobs) is not None
+    assert engines.mismatch(caps, facts, dataclasses.replace(knobs, cga=1)) is not None
 
 
 def test_sm107_fp8_pack_gqa_is_d128_only():
@@ -2973,9 +2993,9 @@ def test_sm107_gate_lpt_is_bitwise_natural():
 _THD_GATE_CUBIN_RECORD = {
     "nvidia-cutlass-dsl": "4.8.0",
     "dense_gated_bf16_lse": "fde505d05124f3978d1f106b7b47891b",
-    "thd_ungated_bf16_head": "2a3467773a4dfa420660002a49c59fe0",
+    "thd_ungated_bf16_head": "0ef74afd0cc3bf72ed771a4ae7af936c",  # re-recorded: THD unit decode through the work prefix
     # the THD-gated rendering itself (the packed gate map): recorded WITH the descriptor, so the next change to it is seen
-    "thd_gated_bf16_head": "88a6956e90cc110697611583095ac47f",
+    "thd_gated_bf16_head": "f90bfeac779eb29ca384ea3dfe817e4e",  # re-recorded with the ungated twin (same decode change)
 }
 _THD_GATE_CUBIN_RENDERINGS = {
     # (TemplateParams fields the adapter derives on cc 10.7 for the bf16 causal cga2 d256 plan, compile kwargs)
@@ -3393,18 +3413,20 @@ def test_sm107_thd_gate_keyless_sequence_is_exactly_zero_and_a_zero_length_seque
 # them is seen).  Keyed by the DSL that produced them; another toolchain re-records (the probe prints the md5 it saw).
 # Re-recorded under nvidia-cutlass-dsl 4.8.0 after #1547 (one scheduler publisher on the dense CLC path, under `not CFG.THD_VARLEN`):
 # the two dense arms moved on sm_100a and sm_107a alike; the eight THD / paged / gated arms re-rendered byte-identical.
+# Re-recorded under nvidia-cutlass-dsl 4.8.0 for the THD unit decode through the work prefix: the eight THD / paged / gated
+# arms moved on sm_100a and sm_107a alike; the two dense arms re-rendered byte-identical.
 _PAGED_GATE_CUBIN_RECORD = {
     "nvidia-cutlass-dsl": "4.8.0",
     "sm_100a_dense": "7db6daaf02f536bd9fbfd7e36e671fd8",
-    "sm_100a_thd": "71f32b147b7c86af413a227f1c2408a5",
-    "sm_100a_paged_thd": "5f2ccc374d24b90239ab99a8a1d529ff",
-    "sm_100a_paged_thd_pack": "ee82153f5d070035d98e32582d9e30e2",
+    "sm_100a_thd": "d10d4f3814461e315a33778705e1920c",
+    "sm_100a_paged_thd": "066bb542a059b0c1c1083f85f60fddcb",
+    "sm_100a_paged_thd_pack": "a812d2551488e2b3b19177b470003278",
     "sm_107a_dense": "63d9b3efb571b4ba00f3a4625fd280bc",
-    "sm_107a_thd": "b07ad1515c7755c604986b8cd352d768",
-    "sm_107a_paged_thd": "a1651799d5f6116d5726df3667e0a39a",
-    "sm_107a_paged_thd_pack": "9d83e9ff26a04c5c3d0840f85c876c3a",
-    "sm_107a_gated_paged_thd": "71c7923b876901019935a596d15a8e25",
-    "sm_107a_gated_paged_thd_pack": "b076ab4545fe42942a91b5bf0d6ea4d1",
+    "sm_107a_thd": "38403df53e25b064f21b0e0eb3471af3",
+    "sm_107a_paged_thd": "3c106cb810219e1d3f1eab0433049b80",
+    "sm_107a_paged_thd_pack": "cb43d702cddfa33ef699cfbe22441edb",
+    "sm_107a_gated_paged_thd": "d62622a3ced6820bc54c34296c933e37",
+    "sm_107a_gated_paged_thd_pack": "76d2d9014cc9be46a002141c6ce59a4d",
 }
 _PAGED_GATE_BASE = dict(dtype_qkv=2, dtype_o=2, window_right=0, qh_per_kh=4, cta_mma=2)
 _PAGED_GATE_PAGED = dict(_PAGED_GATE_BASE, bottom_right=True, thd_varlen=True, seq_kv_lens_present=True, paged_kv=True, page_size=16)
@@ -5662,6 +5684,10 @@ def test_rubin_shared_dense_legs_decline_the_prefolded_scale_on_the_adapter(monk
         with pytest.raises(NotImplementedError, match="apply the scale in-kernel"):
             _gate_api(**common, softmax_scale_prefolded=True, scale_softmax=None, **kw).check_support()
     assert _gate_api(**common, cga=2, softmax_scale_prefolded=True, scale_softmax=None).check_support(), "the Rubin cga2 body keeps the fold"
+    ragged_pack = dict(common, thd=True, seq_kv_lens_present=True, cga=2, pack_gqa=True)
+    assert _gate_api(**ragged_pack).check_support()
+    with pytest.raises(NotImplementedError, match="apply the scale in-kernel"):
+        _gate_api(**ragged_pack, softmax_scale_prefolded=True, scale_softmax=None).check_support()
     with pytest.raises(NotImplementedError, match="decode tile"):
         _gate_api(**common, thd=True, seq_kv_lens_present=True, cga=1, split_kv=1).check_support()
 

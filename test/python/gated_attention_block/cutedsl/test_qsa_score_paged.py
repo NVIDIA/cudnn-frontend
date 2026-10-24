@@ -7,12 +7,12 @@
 Host cells (any machine): the MMA row map of the (s, h) query rows (a bijection onto the padded rows; the head-sum geometry per
 head count), the knob's default rule at both sides of every threshold, the compile-key envelope (typed ``ValueError``), the byte model, the
 compile site's persistent-cache key (the module digest), the Rule 7 gates (the DSL floor, the ``sm_107a`` target, the radix top-k's
-cc 9.0 and PDL's cc 9.0, then the L2-hint arm's compiler floor -- each a ``NotImplementedError`` naming the version or the device, raised
-BEFORE any compile; the compiler floor modeled at the seam the kernel reads: the default follows it, a forced hint below it declines),
-the e4m3 pair refused BY NAME, the form checks naming their fault; with a CUDA device: the import-time contract of BOTH front doors (the
-paged and the dense selector) in a FRESH process (the DSL modeled as the public 4.6.2 wheel: the typed decline, neither the kernel
-modules nor the DSL itself imported) and the launch-stream resolution with both kernels stubbed (a ``torch.cuda.Stream`` / a raw handle /
-``None``: every torch operation on the launch stream).
+cc 9.0 and PDL's cc 9.0, the e4m3 read arm's sm_89, then the L2-hint arm's compiler floor -- each a ``NotImplementedError`` naming the
+version or the device, raised BEFORE any compile; the compiler floor modeled at the seam the kernel reads: the default follows it, a forced
+hint below it declines), a mixed / an unserved dtype pair refused as a form error, the form checks naming their fault; with a CUDA device:
+the import-time contract of BOTH front doors (the paged and the dense selector) in a FRESH process (the DSL modeled as the public 4.6.2
+wheel: the typed decline, neither the kernel modules nor the DSL itself imported) and the launch-stream resolution with both kernels
+stubbed (a ``torch.cuda.Stream`` / a raw handle / ``None``: every torch operation on the launch stream).
 
 Scorer cells (ANY CuTe DSL device from sm_80 -- the kernel is one warp-level ``mma.sync.m16n8k16`` per 8 keys x 16 D, loads,
 shuffles, no barrier): the fp32 logits of every
@@ -31,6 +31,14 @@ region (fewer than ``top_k`` visible blocks selects every one), two calls BITWIS
 on a side stream with the ambient stream parked bitwise a synchronised control, the selection with ANOTHER device current bitwise
 the same-device control (two visible devices); the agreement with the dense-cache selector runs where that module is present
 (probed by name, skipped by name otherwise).
+
+The e4m3 READ arm (``cache_dtype=torch.float8_e4m3fn``: the e4m3 pair served since 2026-10-21; sm_89+ -- its accept cells skip below
+it and are UNCOVERED there): the logits against the fp64 reference on the SAME e4m3 values (the module's atol / rtol, never widened; every
+e4m3 x e4m3 product is exact in fp32), every row-map branch, pages 8 / 16 / 32 / 64 (page 8 = two page parts per copy instruction, the
+per-lane shuffle source), the degenerate matrix with NaN sentinels outside the visible rows and a dead page inside, bitwise across
+``units_per_warp`` / ``ring_depth`` and across two launches, ``cache_dtype`` a compile key (a distinct artifact; the bf16 keys unchanged),
+the SMEM declaration half the bf16 arm's (18 KiB at the defaults), the selector on the e4m3 pair == the selector on the SAME values upcast
+to bf16 (exact: the two selections agree as sets up to the accumulation order's ties); the sub-sm_89 decline through a modeled cc.
 """
 
 import hashlib
@@ -100,20 +108,39 @@ class _Case:
     """One decode step over a paged cache: ``batch`` sequences, ``s_q`` rows each, a shuffled page table into a pool with spare
     pages, and the fp64 reference through the SAME table (independent of the kernel's addressing)."""
 
-    def __init__(self, batch, s_q, n_blocks_max, page_size, kv_lens, *, seed, h=H, extra_pages=5):
+    def __init__(self, batch, s_q, n_blocks_max, page_size, kv_lens, *, seed, h=H, extra_pages=5, cache_dtype=torch.bfloat16, nan_pages=False):
         self.batch, self.s_q, self.n_blocks_max, self.page_size, self.h = batch, s_q, n_blocks_max, page_size, h
+        self.cache_dtype = cache_dtype  # bf16, or e4m3: the e4m3 read arm's pair (the SAME random values, cast once: the oracle runs on the e4m3 values)
         self.rpp = page_size // BS
         self.max_pages = -(-n_blocks_max // self.rpp)
         g = torch.Generator(device=_DEV).manual_seed(seed)
-        self.qi = torch.randn(batch * s_q, h, D, dtype=torch.bfloat16, device=_DEV, generator=g)
+        self.qi = torch.randn(batch * s_q, h, D, dtype=torch.bfloat16, device=_DEV, generator=g).to(cache_dtype)
         self.num_pages = batch * self.max_pages + extra_pages
-        self.pool = torch.randn(self.num_pages, self.rpp, 1, D, dtype=torch.bfloat16, device=_DEV, generator=g)
+        self.pool = torch.randn(self.num_pages, self.rpp, 1, D, dtype=torch.bfloat16, device=_DEV, generator=g).to(cache_dtype)
         self.table = torch.randperm(self.num_pages, device=_DEV, generator=g)[: batch * self.max_pages].view(batch, self.max_pages).to(torch.int32).contiguous()
         self.kv_lens = torch.tensor(list(kv_lens), dtype=torch.int32, device=_DEV)
         assert self.kv_lens.numel() == batch
+        if nan_pages:
+            # NaN sentinels on every row NO visible block maps to (the e4m3 arm's byte-accounting detector: a copy that reaches past a
+            # visible row, or past a page's rows, would poison a logit); a dead page under a visible block is zero-filled by the kernel.
+            # After the table draw (the poison consults it; it draws nothing itself, so the bf16 cells' data is unchanged).
+            self.poison_unmapped_rows(kv_lens)
+
+    def poison_unmapped_rows(self, kv_lens):
+        """NaN into every compressed row no sequence's VISIBLE blocks map to (the rows past ``n_vis_max`` inside the last visible page included).
+        Host-side set algebra: ONE copy of the table, one gather of its rows, one scatter of the visible mask, one device write (no per-block
+        device read or indexing launch -- at ``n_blocks_max`` 32768 x 4 sequences that was ~131k synchronizing iterations per case)."""
+        table = self.table.cpu().long()  # [B, max_pages]
+        n_vis = torch.tensor([max(0, min(int(kv) // BS, self.n_blocks_max)) for kv in kv_lens], dtype=torch.long)  # [B]
+        j = torch.arange(self.n_blocks_max)  # the block index within a sequence; j // rpp < max_pages by construction
+        pg = table[:, j // self.rpp]  # [B, n_blocks_max]: the page of every block slot
+        ok = (j[None, :] < n_vis[:, None]) & (pg >= 0) & (pg < self.num_pages)  # visible, through a mapped page
+        visible = torch.zeros(self.num_pages, self.rpp, dtype=torch.bool)
+        visible[pg[ok], (j % self.rpp).expand_as(pg)[ok]] = True
+        self.pool[~visible.to(_DEV)] = torch.full((), float("nan"), dtype=self.cache_dtype, device=_DEV)
 
     def dense(self, table=None):
-        """``[B, n_blocks_max, D]`` bf16: the compressed keys gathered through the table (a ``-1`` / out-of-range page -> zeros)."""
+        """``[B, n_blocks_max, D]`` in the cache dtype: the compressed keys gathered through the table (a ``-1`` / out-of-range page -> zeros)."""
         table = self.table if table is None else table
         idx = table.long()
         ok = (idx >= 0) & (idx < self.num_pages)
@@ -128,9 +155,11 @@ class _Case:
         return torch.div(self.positions() + 1, BS, rounding_mode="floor").clamp(0, self.n_blocks_max)
 
     def reference(self, scale, table=None):
-        """fp64 ``[B, s_q, n_blocks_max]``, ``-inf`` at or past the row's visible count."""
+        """fp64 ``[B, s_q, n_blocks_max]`` on the kernel's OWN operand values (bf16 or e4m3, exactly widened), ``-inf`` at or past the row's
+        visible count; a NaN-poisoned row (``nan_pages``) that is visible would poison the reference too -- none is, by construction."""
         q = self.qi.view(self.batch, self.s_q, self.h, D).double()
-        scores = torch.relu(torch.einsum("brhd,bnd->brhn", q, self.dense(table).double())).sum(dim=2) * scale
+        dense = self.dense(table).double()
+        scores = torch.relu(torch.einsum("brhd,bnd->brhn", q, torch.nan_to_num(dense, nan=0.0))).sum(dim=2) * scale
         visible = torch.arange(self.n_blocks_max, device=_DEV).view(1, 1, -1) < self.n_vis().view(self.batch, self.s_q, 1)
         return scores.masked_fill(~visible, float("-inf"))
 
@@ -557,16 +586,35 @@ def test_l2_hint_follows_the_dsl_compiler_and_the_forced_hint_declines_below_its
 
 
 @needs_cuda
-def test_e4m3_pair_is_refused_by_name_and_a_mixed_pair_is_a_form_error():
+def test_mixed_or_unserved_dtype_pairs_are_form_errors_and_the_e4m3_arm_gates_on_sm89(monkeypatch):
+    """INVERTED 2026-10-21 (the e4m3 pair was a typed decline by name until the e4m3 read arm landed): a mixed pair and an f16 pair are
+    form errors naming the two served pairs; the e4m3 pair reaches the compile entry, where a device below sm_89 is a ``NotImplementedError``
+    naming ``mma.sync.m16n8k32 .e4m3`` (the cc modeled through the module's binding), a device at or above it compiles the arm (the device
+    cell below).  ``cache_dtype`` outside ``CACHE_DTYPES`` is a ``ValueError`` at the compile entry."""
     case = _Case(1, 1, 8, 16, [9], seed=2)
-    with pytest.raises(NotImplementedError, match="e4m3"):
-        fd.qsa_select_decode_paged_forward(case.qi.to(_E4M3), case.pool.to(_E4M3), case.table, case.kv_lens, seq_q=1)
-    with pytest.raises(ValueError, match="both be bfloat16"):
-        fd.qsa_select_decode_paged_forward(case.qi.to(_E4M3), case.pool, case.table, case.kv_lens, seq_q=1)
-    with pytest.raises(ValueError, match="both be bfloat16"):
-        fd.qsa_select_decode_paged_forward(case.qi, case.pool.to(_E4M3), case.table, case.kv_lens, seq_q=1)
-    with pytest.raises(ValueError, match="both be bfloat16"):
-        fd.qsa_select_decode_paged_forward(case.qi.half(), case.pool, case.table, case.kv_lens, seq_q=1)
+    for a, b in ((case.qi.to(_E4M3), case.pool), (case.qi, case.pool.to(_E4M3)), (case.qi.half(), case.pool), (case.qi.half(), case.pool.half())):
+        with pytest.raises(ValueError, match="both be bfloat16 or both float8_e4m3fn"):
+            fd.qsa_select_decode_paged_forward(a, b, case.table, case.kv_lens, seq_q=1)
+    with pytest.raises(ValueError, match="cache_dtype must be one of"):
+        sp.compile_qsa_score_paged(h_i=H, s_q=1, page_size=16, cache_dtype=torch.float16)
+    assert fd.CACHE_DTYPES == (torch.bfloat16, _E4M3) and fd.K_STEP_BYTES == 32
+    assert (fd.row_bytes(2), fd.row_bytes(1), fd.k_steps(2), fd.k_steps(1), fd.chunks_per_lane(2), fd.chunks_per_lane(1), fd.mma_k(2), fd.mma_k(1)) == (
+        256,
+        128,
+        8,
+        4,
+        4,
+        2,
+        16,
+        32,
+    )
+    assert fd.cache_elem_bytes(torch.bfloat16) == 2 and fd.cache_elem_bytes(_E4M3) == 1
+    with pytest.raises(ValueError, match="serves the cache dtypes"):
+        fd.cache_elem_bytes(torch.float16)
+    monkeypatch.setattr(sp, "compute_capability", lambda dev: (8, 0))
+    with pytest.raises(NotImplementedError, match=r"mma.sync.m16n8k32 .e4m3, an instruction of sm_89 and later.*cc 8\.0"):
+        sp.compile_qsa_score_paged(h_i=H, s_q=1, page_size=16, cache_dtype=_E4M3)
+    sp.compile_qsa_score_paged(h_i=H, s_q=1, page_size=16, cache_dtype=torch.bfloat16)  # the bf16 arm has no such gate (sm_80 serves it)
 
 
 @needs_cuda
@@ -916,6 +964,178 @@ def test_scale_scales_the_logits_and_a_strided_query_slab_reads_in_place():
     assert torch.equal(_bits(logits), _bits(one[0])) and torch.equal(counts, one[1])
 
 
+# --------------------------------------------------------------------------------------------- the e4m3 read arm (sm_89+)
+
+_CC_E4M3 = _cc() is not None and _cc() >= (8, 9)
+needs_e4m3 = pytest.mark.skipif(_SCORER_WHY is not None or not _CC_E4M3, reason=_SCORER_WHY or f"the e4m3 read arm needs sm_89+ (found {_cc()})")
+
+
+def _bits8(x):
+    return x.contiguous().view(torch.int8)
+
+
+@needs_e4m3
+@pytest.mark.parametrize("page_size", [8, 16, 32, 64])
+@pytest.mark.parametrize("rows", [1, 2, 3, 4])
+@pytest.mark.parametrize("n_blocks_max", [8, 520, 4096, 32768])
+def test_e4m3_arm_matches_the_fp64_reference_on_the_e4m3_values_and_writes_only_the_visible_columns(n_blocks_max, rows, page_size):
+    """The e4m3 read arm on four sequences whose positions cover every residue (the last sees every block): counts = the oracle's rule,
+    block_lens = min(top_k, counts), every visible logit within the module's budget of the fp64 reference on the SAME e4m3 values (every
+    e4m3 x e4m3 product is exact: the budget is the fp32 accumulation's), every other column untouched, a second launch bitwise; the
+    rows no visible block maps to hold NaN (a copy past a visible row or a page's rows would poison a logit) -- pages 8 (two parts per
+    copy instruction, the per-lane shuffle source) / 16 / 32 / 64."""
+    kv = _step_kv_lens(n_blocks_max, rows)
+    case = _Case(4, rows, n_blocks_max, page_size, kv, seed=n_blocks_max + 7 * rows + page_size, cache_dtype=_E4M3, nan_pages=True)
+    r = sp.compile_qsa_score_paged(h_i=H, s_q=rows, page_size=page_size, cache_dtype=_E4M3)
+    assert r.cache_dtype == _E4M3
+    logits, counts, lens = case.run(r)
+    _assert_scorer(case, logits, counts, lens)
+    logits2, counts2, lens2 = case.run(r)
+    assert torch.equal(_bits(logits), _bits(logits2)) and torch.equal(counts, counts2) and torch.equal(lens, lens2), "two launches differ"
+
+
+@needs_e4m3
+@pytest.mark.parametrize(
+    "h_i,s_q,n_blocks_max,page_size", [(1, 20, 72, 16), (2, 3, 72, 32), (3, 2, 136, 16), (8, 2, 72, 8), (16, 3, 72, 64), (17, 2, 136, 16), (4, 5, 136, 8)]
+)
+def test_e4m3_arm_row_map_branches_match_the_fp64_reference(h_i, s_q, n_blocks_max, page_size):
+    """Every branch of the row map under the e4m3 arm (the query tile at 128-B rows: ONE cp.async per thread per m-tile; several m-tiles;
+    a query spanning two tiles), with NaN sentinels on the unmapped rows."""
+    kv = [4 * n_blocks_max + s_q - 1, 4 * 30 + s_q + 2, s_q]
+    case = _Case(3, s_q, n_blocks_max, page_size, kv, seed=100 * h_i + s_q, h=h_i, cache_dtype=_E4M3, nan_pages=True)
+    r = sp.compile_qsa_score_paged(h_i=h_i, s_q=s_q, page_size=page_size, cache_dtype=_E4M3)
+    logits, counts, lens = case.run(r)
+    _assert_scorer(case, logits, counts, lens)
+    logits2, counts2, lens2 = case.run(r)
+    assert torch.equal(_bits(logits), _bits(logits2)) and torch.equal(counts, counts2) and torch.equal(lens, lens2)
+
+
+@needs_e4m3
+def test_e4m3_arm_degenerate_rows_and_dead_pages():
+    """The degenerate matrix under the e4m3 arm: a padding sequence, a sequence shorter than the step, a count inside a page, a dead page
+    past the range (harmless, bitwise) and UNDER visible blocks (logit exactly 0, every other column unchanged)."""
+    rows, n_blocks_max, page = 3, 520, 16
+    kv = [0, 5, 4 * 50 + 1, 4 * n_blocks_max + rows - 1, 4 * 130 + 2]
+    case = _Case(5, rows, n_blocks_max, page, kv, seed=5, cache_dtype=_E4M3)
+    case.table[0] = -1
+    r = sp.compile_qsa_score_paged(h_i=H, s_q=rows, page_size=page, cache_dtype=_E4M3)
+    logits, counts, lens = case.run(r)
+    _assert_scorer(case, logits, counts, lens)
+    assert counts[:rows].tolist() == [0, 0, 0] and bool((logits[:rows] == SENTINEL).all())
+    assert counts[rows : 2 * rows].tolist() == [0, 1, 1] and counts[2 * rows : 3 * rows].tolist() == [49, 50, 50]
+    table = case.table.clone()
+    table[4, 40] = -1
+    table[4, 41] = case.num_pages + 3
+    logits_b, counts_b, lens_b = case.run(r, table=table)
+    assert torch.equal(_bits(logits), _bits(logits_b)) and torch.equal(counts, counts_b) and torch.equal(lens, lens_b)
+    table[4, 10] = -1
+    table[4, 11] = case.num_pages + 3
+    logits_c, counts_c, lens_c = case.run(r, table=table)
+    _assert_scorer(case, logits_c, counts_c, lens_c, table=table)
+    for s in range(rows):
+        row = logits_c[4 * rows + s]
+        assert bool((row[40:48] == 0.0).all())
+        keep = torch.ones(n_blocks_max, dtype=torch.bool, device=_DEV)
+        keep[40:48] = False
+        assert torch.equal(_bits(row[keep]), _bits(logits[4 * rows + s][keep]))
+    assert torch.equal(counts, counts_c) and torch.equal(lens, lens_c)
+
+
+@needs_e4m3
+@pytest.mark.parametrize("page_size", [8, 16, 64])
+def test_e4m3_arm_knobs_are_the_same_function_and_the_artifacts_are_keyed(page_size):
+    """``units_per_warp`` 1 / 2 / 4 / 8 and ``ring_depth`` 2 / 4 / 8 under the e4m3 arm: the logits BITWISE across the knobs (the same MMA
+    chain per key, whichever warp owns it, whatever is in flight); every e4m3 artifact distinct from its bf16 twin and the bf16 keys
+    unchanged (the module memo holds the bf16 key without a dtype element); the recipe records the dtype."""
+    case = _Case(3, 2, 1032, page_size, [4 * 1032 - 1, 4 * 700 + 2, 4 * 3 + 3], seed=6 + page_size, cache_dtype=_E4M3, nan_pages=True)
+    outs = []
+    for units in fd.UNITS_PER_WARP_CHOICES:
+        for depth in (fd.RING_DEPTH_CHOICES if units == 2 else (fd.NTILES_IN_FLIGHT,)):
+            r = sp.compile_qsa_score_paged(h_i=H, s_q=2, page_size=page_size, units_per_warp=units, ring_depth=depth, cache_dtype=_E4M3)
+            r16 = sp.compile_qsa_score_paged(h_i=H, s_q=2, page_size=page_size, units_per_warp=units, ring_depth=depth)
+            assert r.compiled is not r16.compiled and r.cache_dtype == _E4M3 and r16.cache_dtype == torch.bfloat16
+            outs.append(case.run(r))
+    dev = torch.cuda.current_device()
+    assert (H, 2, page_size, 1, True, False, dev) in sp.compiled_cache and (H, 2, page_size, 1, True, False, dev, str(_E4M3)) in sp.compiled_cache
+    _assert_scorer(case, *outs[0])
+    for logits, counts, lens in outs[1:]:
+        assert torch.equal(_bits(outs[0][0]), _bits(logits)) and torch.equal(outs[0][1], counts) and torch.equal(outs[0][2], lens)
+
+
+@needs_e4m3
+def test_e4m3_arm_run_form_checks_name_the_dtype_both_ways_and_the_alignment_in_bytes():
+    """The kernel-level entry under the e4m3 arm: a bf16 ``qi`` / ``kbar`` on the e4m3 artifact and an e4m3 one on the bf16 artifact are
+    refused naming the artifact's dtype (no silent cast); the 16-byte rule is checked in BYTES (a 136-element e4m3 row stride is 136 B:
+    refused; the 128-B stride of the serving layout accepted); a strided e4m3 query slab reads in place bitwise the compact copy."""
+    case = _Case(2, 2, 16, 16, [9, 40], seed=4, cache_dtype=_E4M3)
+    r8 = sp.compile_qsa_score_paged(h_i=H, s_q=2, page_size=16, cache_dtype=_E4M3)
+    r16 = sp.compile_qsa_score_paged(h_i=H, s_q=2, page_size=16)
+    logits, counts, lens = case.outputs()
+    ok = dict(top_k=TOP_K, scale=D**-0.5, stream=_stream())
+    with pytest.raises(ValueError, match="qi must be float8_e4m3fn for this artifact"):
+        sp.run_qsa_score_paged(r8, case.qi.to(torch.bfloat16), case.pool, case.table, case.kv_lens, logits, counts, lens, **ok)
+    with pytest.raises(ValueError, match="kbar must be torch.float8_e4m3fn for this artifact"):
+        sp.run_qsa_score_paged(r8, case.qi, case.pool.to(torch.bfloat16), case.table, case.kv_lens, logits, counts, lens, **ok)
+    with pytest.raises(ValueError, match="qi must be bfloat16 for this artifact"):
+        sp.run_qsa_score_paged(r16, case.qi, case.pool.to(torch.bfloat16), case.table, case.kv_lens, logits, counts, lens, **ok)
+    with pytest.raises(ValueError, match="kbar must be torch.bfloat16 for this artifact"):
+        sp.run_qsa_score_paged(r16, case.qi.to(torch.bfloat16), case.pool, case.table, case.kv_lens, logits, counts, lens, **ok)
+    wide = torch.zeros(case.num_pages, case.rpp, 1, 136, dtype=_E4M3, device=_DEV)[..., :D]  # a 136-B row stride: not a whole 16-B vector
+    with pytest.raises(ValueError, match="row stride 128"):
+        sp.run_qsa_score_paged(r8, case.qi, wide, case.table, case.kv_lens, logits, counts, lens, **ok)
+    assert bool((logits == SENTINEL).all()), "a refused call wrote an output"
+    base = case.run(r8)
+    _assert_scorer(case, *base)
+    slab = torch.zeros(case.qi.shape[0], 640, dtype=_E4M3, device=_DEV)
+    slab[:, 64 : 64 + H * D] = case.qi.view(case.qi.shape[0], H * D)
+    strided = slab[:, 64 : 64 + H * D].view(case.qi.shape[0], H, D)
+    assert strided.data_ptr() == slab.data_ptr() + 64 and strided.stride(0) == 640
+    logits, counts, lens = case.outputs()
+    sp.run_qsa_score_paged(r8, strided, case.pool, case.table, case.kv_lens, logits, counts, lens, **ok)
+    torch.cuda.synchronize()
+    assert torch.equal(_bits(logits), _bits(base[0])) and torch.equal(counts, base[1])
+
+
+@needs_e4m3
+@pytest.mark.parametrize("units, want16, want8", [(1, 36, 18), (2, 44, 22)], ids=["units1", "units2"])
+def test_e4m3_arm_smem_is_half_the_bf16_arms(units, want16, want8):
+    """The two arms' DYNAMIC shared memory per CTA (the DSL sizes the allocation from the two Arrays; no ``smem=`` at the launch), read off
+    the profiler's kernel record (the chrome trace's ``shared memory`` of ``cudnn_block_qsa_score_paged``): bf16 36 KiB at the defaults
+    (units 1 = 4 n-tiles, depth 4: 4 slots of 2 KiB per warp + one 4 KiB m-tile), e4m3 18 KiB (1 KiB slots, a 2 KiB m-tile); 44 / 22 KiB
+    from units 2 (5 slots).  Pinned exactly: a ring byte miscounted would move it."""
+    import json
+    import tempfile
+
+    from torch.profiler import ProfilerActivity, profile
+
+    case16 = _Case(2, 1, 1032, 16, [4 * 1032 - 1, 4 * 300], seed=23 + units)
+    case8 = _Case(2, 1, 1032, 16, [4 * 1032 - 1, 4 * 300], seed=23 + units, cache_dtype=_E4M3)
+    found = {}
+    for cd, case in ((torch.bfloat16, case16), (_E4M3, case8)):
+        r = sp.compile_qsa_score_paged(h_i=H, s_q=1, page_size=16, units_per_warp=units, cache_dtype=cd)
+        case.run(r)  # warm: the census below holds launches only
+        prof = profile(activities=[ProfilerActivity.CUDA])
+        try:
+            prof.start()
+        except Exception:  # noqa: BLE001 -- CUPTI unavailable: the bitwise cells stand
+            pytest.skip("the CUDA profiler recorded no kernel activity on this box (CUPTI unavailable)")
+        try:
+            case.run(r)
+        finally:
+            prof.stop()
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            path = f.name
+        prof.export_chrome_trace(path)
+        with open(path) as f:
+            events = json.load(f)["traceEvents"]
+        kern = [e for e in events if e.get("cat") == "kernel" and "qsa_score_paged" in e.get("name", "")]
+        if not kern or "shared memory" not in kern[0].get("args", {}):
+            pytest.skip("the profiler's kernel record carries no shared-memory field on this box; the SMEM pin needs it")
+        found[cd] = int(kern[0]["args"]["shared memory"])
+    assert found == {torch.bfloat16: want16 * 1024, _E4M3: want8 * 1024}, found
+    print(f"paged scorer dynamic SMEM at units {units}: bf16 {found[torch.bfloat16]} B, e4m3 {found[_E4M3]} B")
+
+
 # --------------------------------------------------------------------------------------------- the selector (cc 9.0+)
 
 
@@ -950,6 +1170,41 @@ def test_paged_selection_matches_the_fp64_topk_set_up_to_ties(n_blocks_max, rows
     assert torch.equal(_bits(out["scores"]), _bits(again["scores"]))
     live = torch.arange(n_blocks_max, device=_DEV)[None, :] < out["counts"][:, None]
     assert torch.equal(_bits(out["logits"][live]), _bits(again["logits"][live]))
+
+
+@needs_selector
+@pytest.mark.skipif(not _CC_E4M3, reason=f"the e4m3 read arm needs sm_89+ (found {_cc()})")
+@pytest.mark.parametrize("page_size", [8, 16, 64])
+@pytest.mark.parametrize("rows, n_blocks_max", [(1, 520), (4, 8192), (2, 32768)])
+def test_paged_selection_on_the_e4m3_pair_is_the_selection_on_the_same_values_upcast(rows, n_blocks_max, page_size):
+    """The selector on the e4m3 pair against the selector on the SAME e4m3 values upcast to bf16 (exact: e4m3 is a subset of bf16, so the
+    two arms score the same numbers -- their fp32 accumulations differ by order only, and the two selections agree as SETS up to ties at
+    the k-th boundary); each against the fp64 reference on those values; canonical order, two calls bitwise."""
+    case = _Case(3, rows, n_blocks_max, page_size, _step_kv_lens(n_blocks_max, rows, batch=3), seed=n_blocks_max + 13 * rows + page_size, cache_dtype=_E4M3)
+    cap = dict(n_blocks_max=n_blocks_max) if case.max_pages * case.rpp != n_blocks_max else {}
+    out8 = fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, seq_q=rows, **cap)
+    out16 = fd.qsa_select_decode_paged_forward(case.qi.to(torch.bfloat16), case.pool.to(torch.bfloat16), case.table, case.kv_lens, seq_q=rows, **cap)
+    torch.cuda.synchronize()
+    t = 3 * rows
+    ref = case.reference(D**-0.5).view(t, n_blocks_max)
+    for out in (out8, out16):
+        _assert_rows(out["block_ids"], out["scores"], out["block_lens"], ref, TOP_K)
+        _assert_canonical(out["block_ids"], out["block_lens"])
+    assert torch.equal(out8["counts"], out16["counts"]) and torch.equal(out8["block_lens"], out16["block_lens"])
+    kth = torch.topk(ref, min(TOP_K, n_blocks_max), dim=-1).values[:, -1]
+    n_diff = 0
+    for r_ in range(t):
+        a, b = set(out8["block_ids"][r_].tolist()) - {-1}, set(out16["block_ids"][r_].tolist()) - {-1}
+        if a != b:
+            diff = torch.tensor(sorted(a ^ b), device=_DEV)
+            assert bool(((ref[r_, diff] - kth[r_]).abs() <= TIE_TOL).all()), f"row {r_}: {len(a ^ b)} ids differ between the e4m3 and the bf16 arm beyond a tie"
+            n_diff += len(a ^ b)
+    again = fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, seq_q=rows, **cap)
+    torch.cuda.synchronize()
+    assert torch.equal(out8["block_ids"], again["block_ids"]) and torch.equal(_bits(out8["scores"]), _bits(again["scores"]))
+    live = torch.arange(n_blocks_max, device=_DEV)[None, :] < out8["counts"][:, None]
+    assert torch.equal(_bits(out8["logits"][live]), _bits(again["logits"][live]))
+    print(f"e4m3 vs bf16 arm on the same values: {n_diff} ids differ within the tie window over {t} rows")
 
 
 @needs_selector
