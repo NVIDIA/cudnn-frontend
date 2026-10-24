@@ -110,6 +110,16 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 
 ### Native flavor routing assertions
 
+PTX hash records also depend on imported helpers and the trace probe's fake
+tensor geometry. A scheduler or shared decoder change can invalidate a record
+even when the kernel file itself is unchanged. Before refreshing a record,
+render its historical source/probe and the current source/probe with the same
+recorded compiler distribution in separate processes, compare the PTX changes,
+and retain the existing SASS checks. Check distribution metadata as well as the
+import path: an internal build may print the public version in `cutlass.__version__`.
+`test_fork_rendering_ptx_md5_is_recorded` covers the SM107 D512 backward record;
+its dense scheduler and shared THD work-prefix changes require different attribution.
+
 When a native head-dimension flavor replaces an envelope, update the exact
 template expectation in existing end-to-end routing tests as well as adding
 new flavor tests. Keep the routing assertion, numerical comparisons and shape

@@ -528,6 +528,11 @@ def supports_paged_d256_pack_gqa(d_shape, *, device_cc, fp8, thd, paged, cga, sp
     return device_cc == (10, 7) and d_shape == (256, 256) and not fp8 and thd and paged and cga in (None, 2) and split_kv == 1
 
 
+def supports_paged_d128_partial_pack_gqa(d_shape, *, device_cc, fp8, thd, paged, cga, split_kv):
+    """Rubin's shared two-CTA D128 paged half body packs a divisor of the GQA group."""
+    return device_cc == (10, 7) and d_shape == (128, 128) and not fp8 and thd and paged and cga in (None, 2) and split_kv == 1
+
+
 def supports_nonpaged_d128_thd_pack_gqa(d_shape, *, device_cc, fp8, thd, paged, cga, split_kv):
     """Rubin's unsplit ragged D128 packing uses the shared two-CTA half body."""
     return device_cc == (10, 7) and d_shape == (128, 128) and not fp8 and thd and not paged and cga in (None, 2) and split_kv == 1
