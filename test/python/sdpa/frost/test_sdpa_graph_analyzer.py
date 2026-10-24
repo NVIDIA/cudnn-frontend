@@ -1541,6 +1541,7 @@ def test_packed_thd_split_adapter_declines_nonpaged_pack_gqa(monkeypatch, dtype,
     "changed,knobs",
     [
         ({"device_cc": (10, 7), "attn_scale_prefolded": True}, {"cga": 1}),
+        ({"device_cc": (10, 7), "attn_scale_prefolded": True}, {}),
         ({"d_qk": 64, "d_v": 64}, {}),
         ({"d_qk": 256, "d_v": 256}, {}),
         ({"h_q": 24}, {}),
