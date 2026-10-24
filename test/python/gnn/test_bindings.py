@@ -16,3 +16,5 @@ def test_gnn_mha_bindings_do_not_depend_on_build_headers():
     assert hasattr(cudnn, "gnn_mha_gat_backward")
     assert hasattr(cudnn, "gnn_mha_gat_v2_forward")
     assert hasattr(cudnn, "gnn_mha_gat_v2_backward")
+    assert hasattr(cudnn, "gnn_mha_simple_forward")
+    assert hasattr(cudnn, "gnn_mha_simple_backward")
