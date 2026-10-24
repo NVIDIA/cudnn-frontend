@@ -70,8 +70,9 @@ Under THD PackGQA, setup and decoding count **token** tiles
 (`CGA_TILE_M / PACK_G`), while Stats stores use the unpacked query head.
 Changing only one side misses or aliases rows. The packing/capture tests
 exercise partial groups and protect untouched tails with sentinels.
-A bounded second wave is a plan-time tuning choice; compute its workload
-from packed token tiles, rather than unpacked tiles times all query heads.
+The initial-wave limit is a plan-time choice evaluated against current host-known
+capacity at binding. Where an exact packed workload is available, count packed
+token tiles rather than unpacked tiles times all query heads.
 
 **Rule S2 — A change to any FROST SDPA `Capabilities` row updates
 `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md` in the same commit.**
@@ -335,10 +336,17 @@ production kernels gain no debug knob or timing-dependent assertion.
   the next decoded tile head in the scheduler variable; derive each output
   head from it again for sinks, Stats and partial stores.
 - A THD body using the device-bounded persistent claim counter must declare
-  `THD_PERSISTENT = True` to the adapter. Otherwise its safety envelope becomes
-  the physical grid, adding unnecessary worker waves. Assert the module route
+  `THD_PERSISTENT = True` to the adapter. Otherwise the launch cap retains the
+  declaration envelope and only the binder's runtime capacity tightens it,
+  which can still add unnecessary worker waves. Assert the module route
   and declaration in changed-length replay tests; inspect the actual launch
   grid when comparing persistent implementations.
+- Preserve the body's initial-wave policy through runtime binding. A broad
+  shape-override declaration must not freeze a one-wave cap before the binder
+  sees the current host-known Q capacity and batch. Larger runtime bounds still
+  use the resident wave; no device-length read is needed. Check native/reference
+  frames and small-to-large-to-small rebinding, then changed-length graph replay
+  (`test_native_initial_waves_bind_current_work`).
 - `test_native_d128_packing_dense_replay` compiles all three schedulers and
   checks changed-input replay, split partials and MHA's bitwise packing fold.
   The ragged changed-length tests cover partial packing and retained captures.

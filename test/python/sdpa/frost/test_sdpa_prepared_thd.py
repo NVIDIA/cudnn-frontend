@@ -1927,6 +1927,10 @@ def test_thd_cache_shape_grid_tracks_runtime_capacity(d, arch, backend_lowering,
     """One large cache-shape artifact, small changing batches and captured device lengths."""
     if torch.cuda.get_device_capability() == (10, 7):
         pytest.skip("SM107 overlaunch admission is qualified separately")
+    _check_thd_cache_shape_grid(d, arch, backend_lowering, monkeypatch)
+
+
+def _check_thd_cache_shape_grid(d, arch, backend_lowering, monkeypatch, *, native_packed=None):
     if not backend_lowering:
 
         def decline(self):
@@ -1934,10 +1938,17 @@ def test_thd_cache_shape_grid_tracks_runtime_capacity(d, arch, backend_lowering,
 
         monkeypatch.setattr(cudnn.pygraph, "_backend_lowerable", lambda self: False)
         monkeypatch.setattr(cudnn.pygraph, "_lower_backend_graph", decline)
-    hq, hk = 4, 2
+    hq, hk = (4, 2) if native_packed is None else (16, 4)
     g, t = _thd_graph(4096, 65536, 65536, hq, hk, d, override_enabled=True, arch=arch)
     if not backend_lowering:
         assert g._lowered_graph is None
+    if native_packed is not None:
+        engine, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
+        knobs.update({cudnn.knob_type.PACK_GQA: int(native_packed), cudnn.knob_type.TILE_CGA_M: 2, cudnn.knob_type.SPLIT_KV: 1})
+        g.create_execution_plan(engine, knobs)
+        g.select_plan(g.get_execution_plan_count() - 1)
+        g.check_support()
+        g.build_plans()
     plan = _plan(g)
     spec = plan._prepared.spec
     template = list(spec.template)
@@ -1967,7 +1978,10 @@ def test_thd_cache_shape_grid_tracks_runtime_capacity(d, arch, backend_lowering,
 
     captured = None
     try:
-        for qlens in ([517], [1, 3, 0, 513], [517]):
+        workloads = ([517], [1, 3, 0, 513], [517])
+        if native_packed is not None:
+            workloads = ([2048, 2048], [4097, 4097], [1, 3, 0, 513], [2048, 2048])
+        for qlens in workloads:
             b, total = len(qlens), sum(qlens)
             klens = [n + 17 for n in qlens]
             bufs = {
@@ -2010,7 +2024,13 @@ def test_thd_cache_shape_grid_tracks_runtime_capacity(d, arch, backend_lowering,
                 with torch.cuda.graph(captured):
                     run()
             bound = ((total - 1) // spec.cga_tile_m + b) * hq
-            assert rec.frames[-1]["n_thd_units"] <= bound
+            if native_packed is not None:
+                envelope, resident, waves = spec.wave_policy
+                bound = min(envelope, bound)
+                expected = bound if bound <= resident * waves else resident
+                assert rec.frames[-1]["n_thd_units"] == expected
+            else:
+                assert rec.frames[-1]["n_thd_units"] <= bound
             assert spec.template == template
             for lengths in (qlens, ([129, 129, 129, 130] if b == 4 else qlens)):
                 kv_lengths = [n + 17 for n in lengths]

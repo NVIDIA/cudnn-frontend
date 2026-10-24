@@ -433,6 +433,37 @@ def test_native_thd_launch_bound_retains_persistent_cap():
     assert s.template[s.index["n_thd_units"]] == 7
 
 
+@pytest.mark.parametrize("envelope", [128, 4096 * 128 * 8])
+def test_native_thd_initial_waves_track_current_capacity(envelope):
+    """A broad declaration must not hide small runtime work from the wave policy."""
+    s, facts, _ = _fixture(layout=None, rank=3)
+    s.b, s.s_q_max, s.total_q = 4096, 65536, None
+    s.template[s.index["n_thd_units"]] = 102
+    s.wave_policy = (envelope, 102, 2)
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+    before = list(s.template)
+    # Cross the two-wave threshold, then return to a smaller fresh binding.
+    for batch, tokens, expected_bound in [(1, 1, 8), (2, 8192, 136), (2, 11777, 200), (2, 12289, 208), (1, 8192, 128)]:
+        current = dict(facts)
+        for role in ("q", "o"):
+            current[role] = facts[role]._replace(ptr=facts[role].ptr + tokens * 4096, shape=(tokens, s.qh, 128), span=tokens * s.qh * 128)
+        for role in ("q_lens", "kv_lens"):
+            current[role] = facts[role]._replace(shape=(batch + 1,), span=batch + 1)
+        bound = min(envelope, expected_bound)
+        expected = bound if bound <= 204 else 102
+        frame = _equal(s, current)
+        assert frame[s.index["n_thd_units"]] == expected
+        assert s.template == before and s.wave_policy == (envelope, 102, 2)
+
+
+@pytest.mark.parametrize("policy", [(0, 102, 2), (1000, 0, 2), (1000, 102, 1), (1000, 2**62, 4)])
+def test_native_thd_rejects_invalid_initial_wave_policy(policy):
+    s, _, _ = _fixture(layout=None)
+    s.wave_policy = policy
+    with pytest.raises(ValueError, match="initial-wave policy|fit in int64"):
+        cudnn._pybind_module._SdpaThdBinder(s)
+
+
 def test_native_dynamic_hn_stride_keeps_invocation_frames_independent():
     s, facts, recorded = _fixture(layout="HN")
     s.lse_stride_override = True
