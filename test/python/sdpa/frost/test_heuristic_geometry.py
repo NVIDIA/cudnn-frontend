@@ -379,7 +379,30 @@ def test_nonpaged_d128_thd_lead_serves_a_valid_packed_first_plan(group, causal, 
     first = heur._knob_sets(SPEC, facts)[0]
     assert mismatch(SPEC.capabilities, facts, first) is None
     if placement._place_sm100_f16(SPEC.capabilities, facts) == placement.LEAD and heur.nonpaged_thd_split_choice(SPEC.capabilities, facts)[0] == 1:
-        assert first.pack_gqa and first.split_kv in (None, 1)
+        assert (first.pack_gqa or facts.h_q == facts.h_kv) and first.split_kv in (None, 1)  # MHA leads unpacked
+
+
+@pytest.mark.parametrize("device_cc", [(10, 0), (10, 3)])
+@pytest.mark.parametrize(
+    "batch,q,kv,expected",
+    [(1, 8192, 8192, "lead"), (16, 512, 512, "lead"), (4, 4096, 4096, "lead"), (64, 256, 256, "trail"), (16, 256, 1024, "lead"), (1, 256, 256, "trail")],
+)
+def test_nonpaged_d128_mha_thd_leads_from_512_declared_tokens(device_cc, batch, q, kv, expected):
+    """Unpacked MHA d128 causal THD leads when the declared Q rows fill the SMs or each sequence carries 512 declared tokens; small, HALF, non-causal and windowed graphs stay backend-first."""
+    from cudnn.sdpa.fwd import placement
+
+    base = dict(d_qk=128, b=batch, h_q=32, h_kv=32, s_q=q, s_kv=kv, causal=True, bottom_right=True, dtype=cudnn.data_type.BFLOAT16, device_cc=device_cc)
+    assert placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**base)) == getattr(placement, expected.upper())
+    if expected == "lead":
+        assert placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**base, "dtype": cudnn.data_type.HALF})) == placement.TRAIL
+        assert placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**base, "causal": False, "bottom_right": False})) == placement.TRAIL
+        assert placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**base, "window_left": 128})) == placement.TRAIL
+        assert placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**base, "max_total_seq_len_q": 128})) == placement.TRAIL
+    cache = dict(base, b=4096, s_q=65536, s_kv=65536)
+    assert placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**cache)) == placement.LEAD  # FlashInfer cache-shape declaration
+    assert (
+        placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**cache, "max_total_seq_len_q": 16384})) == placement.LEAD
+    )  # bounded total under CUDA graphs
 
 
 @requires_dsl

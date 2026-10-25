@@ -345,6 +345,12 @@ S = 2048 lost and group 2 was not covered.
 
 Rows with no measurement (SM80, SM100 mxfp8) keep the historical order (LEAD); they are still
 opt-in, so the order is only observable with ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``.
+SM100 / SM103 nonpaged BF16 d128 MHA causal THD (2026-10-25, ``NONPAGED_D128_MHA_THD_*``): one Q head per KV head cannot
+pack, so the lead is the unpacked FROST plan; it leads the backend when the declared Q rows fill the SMs or each
+sequence carries at least 512 declared tokens (Q and KV), on cc 10.0 and cc 10.3, and trails below that. FlashInfer's
+ragged declaration is one graph per shape class at its cache shape (or a bounded total under CUDA graphs), so the rule
+decides once per class.
+
 """
 
 from __future__ import annotations
@@ -386,6 +392,8 @@ THD_PACKED_GQA2_MIN_KV_TOKENS = 4096  # GQA2 packs two heads a tile: large batch
 THD_PACKED_MIN_Q_ROWS_PER_SM = 110  # h_q * (b * s_q, or a smaller declared token total) per SM
 THD_PACKED_LONG_Q = 256  # ... except long sequences (by declared total / b): Q256 KV1024 at 4096-8192 rows ran 0.79-0.81
 THD_PACKED_LONG_Q_MIN_KV = 1024
+NONPAGED_D128_MHA_THD_MIN_TOKENS = 512  # unpacked MHA d128 THD: declared per-sequence Q and KV extent from which FROST leads
+NONPAGED_D128_MHA_THD_CCS = ((10, 0), (10, 3))
 CHUNKED_SQUARE_MIN_KV_TOKENS = 32768  # s_q == s_kv at <= 128 tiles: kept from the 2026-09-18 bound, not re-measured
 
 # B200 paged THD prefill shard; conservative bounds on graph declarations.
@@ -980,6 +988,28 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
         and facts.s_kv > THD_PACKED_MIN_KV_TOKENS
     ):
         return LEAD  # unsplit d256 THD prefill
+    if (
+        # nonpaged BF16 d128 causal THD with one Q head per KV head (unpacked): declared per-sequence Q and KV extent
+        # of at least NONPAGED_D128_MHA_THD_MIN_TOKENS on the measured parts
+        facts.thd
+        and not facts.has_paged_kv
+        and facts.dtype == cudnn.data_type.BFLOAT16
+        and (facts.d_qk, facts.d_v) == (128, 128)
+        and facts.h_q == facts.h_kv
+        and facts.causal
+        and (facts.bottom_right or facts.s_q == facts.s_kv)
+        and facts.window_left is None
+        and not (facts.has_sink or facts.right_band_widening or facts.has_epilogue_gate)
+        and facts.device_cc in NONPAGED_D128_MHA_THD_CCS
+        and facts.s_kv >= NONPAGED_D128_MHA_THD_MIN_TOKENS
+        and (
+            # the declared Q rows fill the SMs (a bounded or cache-shape declaration), or each sequence is long
+            facts.h_q * min(facts.b * facts.s_q, facts.max_total_seq_len_q or facts.b * facts.s_q)
+            >= THD_PACKED_MIN_Q_ROWS_PER_SM * (facts.device_sm_count or 148)
+            or min(facts.s_q, -(-(facts.max_total_seq_len_q or facts.b * facts.s_q) // max(facts.b, 1))) >= NONPAGED_D128_MHA_THD_MIN_TOKENS
+        )
+    ):
+        return LEAD  # unpacked causal MHA d128 THD
     if facts.thd or facts.has_paged_kv or (facts.window_left is not None and not _d512_swa(facts)):
         return TRAIL
     if flavor == (512, 512):  # exact or envelope-served (d320-d448: 0.32-0.65)
