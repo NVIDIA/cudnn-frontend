@@ -133,9 +133,9 @@ DESC_VERSION: int = 0
 # +0.3 % on one) and is a no-op on every cga1 rendering by construction (the cluster arm folds out at CGA_SIZE 1; the cubins
 # are byte-identical), so this kernel carries no constant for it.
 SPIN_RING_WAITS: bool = True
-# Private feasibility switch: overlap the THD setup with the main kernel's
-# independent barrier initialization. It changes neither public admission nor
-# the caller's PDL contract. Dense and other head-size bodies stay unchanged.
+# Overlap THD setup with the main kernel's independent barrier initialization.
+# This internal dependency changes neither admission nor the caller's PDL
+# contract. Dense and other head-size bodies stay unchanged.
 THD_SETUP_PDL: bool = bool(CFG.THD_VARLEN and CFG.TILE_K == 128 and CFG.TILE_O == 128)
 # exp2 MUFU / FMA split -- the Rubin small-D PROBE (an experiment, never a default on cc 10.7).  ``tile_dsl.pointwise.exp2_emul_pair``
 # evaluates a compile-time subset of every row's exp2 on the FMA pipe (6 packed FP32 / INT instructions per pair, no MUFU.EX2): the
