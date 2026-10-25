@@ -38,3 +38,17 @@ def test_regret_flags_misrank_and_coverage_loss(tmp_path):
     assert "misranks (regret > 1.05): 1" in out.stdout and "| 2.00 |" in out.stdout
     assert "coverage losses (cudnn_auto failed, another leg ran): 1" in out.stdout
     assert run("--fail").returncode == 1
+
+
+def test_repeated_runs_stay_separate(tmp_path):
+    """Two timestamped CSVs of the same case are two cases, not one overwriting the other."""
+    _write(
+        tmp_path / "a.csv",
+        [dict(backend="cudnn", q_tokens=1024, kv_len=1024, time_ms="1.0"), dict(backend="cudnn_auto", q_tokens=1024, kv_len=1024, time_ms="2.0")],
+    )
+    _write(
+        tmp_path / "b.csv",
+        [dict(backend="cudnn", q_tokens=1024, kv_len=1024, time_ms="1.0"), dict(backend="cudnn_auto", q_tokens=1024, kv_len=1024, time_ms="1.0")],
+    )
+    out = subprocess.run([sys.executable, "-m", "benchmark.heuristics_regret", str(tmp_path)], capture_output=True, text=True)
+    assert "compared cases: 2" in out.stdout and "misranks (regret > 1.05): 1" in out.stdout, out.stdout

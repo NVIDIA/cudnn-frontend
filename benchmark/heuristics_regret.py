@@ -4,7 +4,9 @@
 
 Reads attention_training / attention_inference result CSVs and pairs, per identical case (every configuration column,
 data type included, except the backend and the measurement), the ``cudnn_auto`` row (default dispatch) with the
-``cudnn`` (native backend only) and ``cudnn_oss`` (FROST only) rows. ``regret = t(cudnn_auto) / min(t(cudnn),
+``cudnn`` (native backend only) and ``cudnn_oss`` (FROST only) rows of the same CSV. A runner writes one timestamped CSV per invocation, so legs are
+only paired within a file: repeated runs in one directory stay separate cases rather than overwriting each other.
+``regret = t(cudnn_auto) / min(t(cudnn),
 t(cudnn_oss))``: 1.0 means the heuristics picked the faster path; above ``--threshold`` is reported as a misrank.
 A case where ``cudnn_auto`` fails while another leg succeeds is reported as a coverage loss.
 
@@ -58,12 +60,14 @@ def _load(paths):
                 leg = row.get("backend")
                 if leg not in LEGS:
                     continue
-                key = (os.path.basename(os.path.dirname(f)),) + tuple(sorted((k, v) for k, v in row.items() if k and k not in NON_KEY))
+                key = (os.path.relpath(f),) + tuple(sorted((k, v) for k, v in row.items() if k and k not in NON_KEY))
                 ok = row.get("success") == "True" and row.get("skipped") != "True"
                 try:
                     t = float(row["time_ms"]) if ok else None
                 except (TypeError, ValueError):
                     t = None
+                if leg in cases[key]:
+                    raise SystemExit(f"{f}: two {leg} rows for one case; cannot tell which measurement to compare")
                 cases[key][leg] = (t if t and t > 0 else None, row.get("backend_detail") or "")
     return cases
 
