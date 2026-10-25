@@ -633,6 +633,7 @@ def emit_seq_descs(
     batch_step=1,
     origins=None,
     origin_row: cutlass.Constexpr[int] = -1,
+    compact_origin=0,
 ) -> None:
     """Build a per-BATCH descriptor array over a packed ``[T, H, D]`` tensor.
 
@@ -659,6 +660,9 @@ def emit_seq_descs(
     a caller's gaps change only its base address.  Negative ``origin_row``
     preserves the compact-prefix path and never reads ``origins``.  Explicit
     origins are absolute within the bound port: do not subtract origin zero.
+    ``compact_origin`` normalizes a sliced cumulative input without first
+    copying its prefix to metadata. It affects only the compact-prefix path;
+    independent caller-port origins retain their absolute meaning.
     """
     desc_base = desc_words.iterator.raw_ptr()
     src_words = Pointer(base_desc.get_ptr(), dtype=cutlass.Int64)
@@ -673,7 +677,7 @@ def emit_seq_descs(
         # more than 2^31 of them (128k tokens x 128 heads x 128 lanes already
         # does), so the Int32 form the inlined SDPA-forward version used was a
         # latent overflow. Matches the linear-attention sibling.
-        origin = thd_port_origin(origins, origin_row, b, cu_b)
+        origin = thd_port_origin(origins, origin_row, b, cu_b - compact_origin)
         row_base = base + origin * cutlass.Int64(row_stride)
         nvvm.tensormap_replace(
             nvvm.TensormapField.GLOBAL_ADDRESS,

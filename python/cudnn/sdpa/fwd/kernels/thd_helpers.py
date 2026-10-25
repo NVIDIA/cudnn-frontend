@@ -321,7 +321,58 @@ def build_thd_meta_o_descs_kernel(
     fused_meta = cutlass.Boolean(False)
     if cutlass.const_expr(small_batch_meta):
         fused_meta = (n_batch >= 1) & (n_batch <= 32)
-    if (n_batch <= cutlass.Int32(1)) & ~fused_meta:
+    # Cumulative inputs already provide the prefix needed by every descriptor.
+    # Keep the metadata warp independent of descriptor writers instead of
+    # publishing that prefix to GMEM only to read it back after a CTA barrier.
+    direct_prefix = fused_meta & ((lens_form & 1) != 0)
+    direct_prefix = direct_prefix & (cutlass.Int32(nthreads) >= cutlass.Int32(128 if clamp_kv else 64))
+    if cutlass.const_expr(clamp_kv):
+        direct_prefix = direct_prefix & ((lens_form & 2) != 0)
+    if direct_prefix:
+        warp = cutlass.Int32(tidx) // cutlass.Int32(32)
+        lane = cutlass.Int32(tidx) % cutlass.Int32(32)
+        nwarps = cutlass.Int32(nthreads) // cutlass.Int32(32)
+        if warp == 0:
+            write_thd_small_batch_meta(
+                meta,
+                cutlass.make_array_view(q_lens_t),
+                cutlass.make_array_view(kv_lens_t),
+                lens_form,
+                n_batch,
+                n_qh,
+                cga_tile_m,
+                n_clusters,
+                lane,
+                splits,
+                rank_by_kv,
+            )
+        else:
+            if nvvm.elect_sync():
+                descriptor_warps = nwarps - cutlass.Int32(3 if clamp_kv else 1)
+                if warp <= descriptor_warps:
+                    q_prefix = cutlass.make_array_view(q_lens_t)
+                    emit_seq_descs(
+                        base_o_desc,
+                        o_desc_words,
+                        q_prefix,
+                        cutlass.Int32(0),
+                        o_tensor,
+                        n_batch,
+                        o_row_stride,
+                        seq_ord=2,
+                        first_batch=warp - cutlass.Int32(1),
+                        batch_step=descriptor_warps,
+                        compact_origin=cutlass.Int32(q_prefix[0]),
+                    )
+                if cutlass.const_expr(clamp_kv):
+                    kv_prefix = cutlass.make_array_view(kv_lens_t)
+                    t_kv = cutlass.Int32(kv_prefix[n_batch]) - cutlass.Int32(kv_prefix[0])
+                    if warp == nwarps - cutlass.Int32(2):
+                        emit_clamped_desc(base_k_desc, o_desc_words, n_batch + cutlass.Int32(1), t_kv, seq_ord=2)
+                    if warp == nwarps - cutlass.Int32(1):
+                        emit_clamped_desc(base_v_desc, o_desc_words, n_batch + cutlass.Int32(2), t_kv, seq_ord=2)
+                nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
+    elif (n_batch <= cutlass.Int32(1)) & ~fused_meta:
         if nvvm.elect_sync() and tidx < cutlass.Int32(32):
             write_thd_meta(meta, cutlass.make_array_view(q_lens_t), cutlass.make_array_view(kv_lens_t), lens_form, n_batch)
             emit_seq_descs(base_o_desc, o_desc_words, meta, n_batch, o_tensor, n_batch, o_row_stride, seq_ord=2)
