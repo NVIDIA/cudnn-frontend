@@ -13,6 +13,39 @@ from cudnn.sdpa.fwd.api_dsl import SdpaFwdDsl, SdpaFwdDslSm80, SdpaFwdDslSm100, 
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("fp8", [False, True])
+def test_compile_parameter_names_reused_across_plans_and_refreshed_for_new_entry(monkeypatch, fp8):
+    """New plans share immutable function metadata, but a replaced entry cannot reuse it."""
+    from types import SimpleNamespace
+
+    def compile_entry(*, has_lse):
+        pass
+
+    def replacement(*, has_lse, has_amax):
+        pass
+
+    replacement.__name__ = compile_entry.__name__
+    signature = inspect.signature
+    inspected = []
+
+    def track(entry):
+        inspected.append(entry)
+        return signature(entry)
+
+    monkeypatch.setattr(inspect, "signature", track)
+    km = SimpleNamespace(compile=compile_entry, compile_prepared=compile_entry)
+    for _ in range(2):
+        plan = SimpleNamespace(_k_mod=km, _fp8=fp8)
+        assert SdpaFwdDslSm100._kernel_compile_accepts(plan) == {"has_lse"}
+    assert inspected == [compile_entry]
+
+    setattr(km, "compile_prepared" if fp8 else "compile", replacement)
+    plan._kernel_accepts = None  # compile() resets this when reloading the module
+    assert SdpaFwdDslSm100._kernel_compile_accepts(plan) == {"has_lse", "has_amax"}
+    assert inspected == [compile_entry, replacement]
+
+
+@pytest.mark.L0
 def test_new_constructor_parameters_follow_the_legacy_positional_prefix():
     """New optional operands must not change legacy positional bindings."""
     params = list(inspect.signature(SdpaFwdDsl.__init__).parameters)

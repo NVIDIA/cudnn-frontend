@@ -8,17 +8,18 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import math
 import os
 from abc import abstractmethod
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from types import SimpleNamespace
 from typing import Hashable, Iterator, Optional
 
 import torch
-
 from cudnn._torch_stream import stream_context
 from cuda.bindings import driver as cuda
 
@@ -143,6 +144,17 @@ from cudnn.sdpa.fwd.config_sm120 import (
     smem_bytes as _sm120_smem_bytes,
     tile_domain as _sm120_tile_domain,
 )
+
+
+@lru_cache(maxsize=256)
+def _parameter_names(entry) -> frozenset:
+    """Plan-time names shared across plans of the same adapter/kernel function.
+
+    Key the function itself so a replaced entry is inspected independently.
+    Cache only module/class functions and immutable names, never adapter
+    instances or compiled launchables.
+    """
+    return frozenset(inspect.signature(entry).parameters)
 
 
 def _q_lens_addr(t: Optional[torch.Tensor]) -> int:
@@ -3984,11 +3996,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             kind = "head"
         else:
             kind = "token"
-        import inspect
-
         km = self._k_mod
         compile_fn = km.compile_prepared if (getattr(self, "_prepared_fp8", False) or getattr(self, "_prepared_mxfp8", False)) else km.compile
-        accepted = inspect.signature(compile_fn).parameters
+        accepted = _parameter_names(compile_fn)
         kw = dict(has_lse=(self.lse_desc is not None) or self.split_kv > 1, lse_kind=kind)
         if "has_score_max" in accepted:
             # Score side outputs: each store is its own compile-time arm (None folds it out).
@@ -4617,10 +4627,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         (re)loads the module."""
         kc = getattr(self, "_kernel_accepts", None)
         if kc is None:
-            import inspect
-
             entry = self._k_mod.compile_prepared if self._fp8 else self._k_mod.compile
-            kc = frozenset(inspect.signature(entry).parameters)
+            kc = _parameter_names(entry)
             self._kernel_accepts = kc
         return kc
 
