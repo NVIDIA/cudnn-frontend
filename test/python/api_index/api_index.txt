@@ -1523,6 +1523,9 @@ cudnn.ops.dsa.indexer_forward
 cudnn.ops.dsa.indexer_forward_jax
 cudnn.ops.dsa.indexer_top_k_forward
 cudnn.ops.dsa.indexer_top_k_workspace_size
+cudnn.ops.dsa.pooled_cache_update_forward
+cudnn.ops.dsa.pooled_expand_forward
+cudnn.ops.dsa.pooled_indexer_forward
 cudnn.ops.dsa.sparse_attention_backward
 cudnn.ops.dsa.sparse_attention_backward_jax
 cudnn.ops.dsa.sparse_attention_forward

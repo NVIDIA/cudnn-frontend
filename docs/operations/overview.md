@@ -65,6 +65,7 @@ The experimental API catalog includes:
 - [Query Sparse Attention (QSA): attention and indexer entry points](/operations/sparse_attention/qsa)
 - [QSA training from existing token indices](/operations/sparse_attention/qsa/qsa_indexed)
 - [DeepSeek Sparse Attention (DSA)](/operations/sparse_attention/dsa)
+- [Pooled DSA](/operations/sparse_attention/pooled_dsa)
 - [Fused DSA indexer and exact top-k (Cake)](/operations/dsa_indexer_topk)
 - [Cake sparse-attention training](/operations/dsa_sparse_training)
 - [Cake deterministic DSA and Lightning indexer](/operations/dsa_deterministic)

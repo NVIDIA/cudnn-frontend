@@ -7,6 +7,7 @@ and related compression operations. The APIs are experimental and subject to cha
 | --- | --- |
 | [Native Sparse Attention (NSA)](/operations/sparse_attention/nsa) | Selection, compression, top-k, and sliding-window attention. |
 | [DeepSeek Sparse Attention (DSA)](/operations/sparse_attention/dsa) | Sparse attention and its indexer, score, and top-k operations. |
+| [Pooled DSA](/operations/sparse_attention/pooled_dsa) | Pooled indexer, cache update, and index expansion over pools of index keys. |
 | [Simplified Sparse Attention](/operations/sparse_attention/simplified_sparse_attention) | Packed attention with a trainable top-k indexer. |
 | [Query Sparse Attention (QSA)](/operations/sparse_attention/qsa) | Attention over selected four-token blocks, with bitmap and indexed training APIs. |
 | [HSTU Attention](/operations/sparse_attention/hstu_attention) | Masked attention for recommender models, with SiLU scores instead of softmax. |
