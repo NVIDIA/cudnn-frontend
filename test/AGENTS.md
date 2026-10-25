@@ -129,6 +129,11 @@ and retain the existing SASS checks. Check distribution metadata as well as the
 import path: an internal build may print the public version in `cutlass.__version__`.
 `test_fork_rendering_ptx_md5_is_recorded` covers the SM107 D512 backward record;
 its dense scheduler and shared THD work-prefix changes require different attribution.
+A store-order optimization qualified for one width must not silently move the
+other widths of a shared body. Preserve their established lowering, and compare
+both the historical small-width cubins and the optimized width before landing.
+The SM107 bias/off/streamed records detect D32/D64 epilogue changes that D128
+functional coverage alone misses; keep their hashes and SASS assertions intact.
 
 When a native head-dimension flavor replaces an envelope, update the exact
 template expectation in existing end-to-end routing tests as well as adding

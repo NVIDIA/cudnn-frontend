@@ -76,8 +76,9 @@ Packed-KV tests alone do not cover it: `test_thd_work_lookup_paged_replay`
 asserts the paged bounded route and checks unequal Q/KV lengths, partial
 PackGQA, changing K/V tables and live/empty transitions under one capture.
 FP16 and sliding-window paged cases do not exercise this opt-in.
-A bounded second wave is a plan-time tuning choice; compute its workload
-from packed token tiles, rather than unpacked tiles times all query heads.
+The initial-wave limit is a plan-time choice evaluated against current host-known
+capacity at binding. Where an exact packed workload is available, count packed
+token tiles rather than unpacked tiles times all query heads.
 
 **Rule S2 — A change to any FROST SDPA `Capabilities` row updates
 `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md` in the same commit.**
@@ -377,6 +378,35 @@ not the twice-per-tile O-empty signal. Detector:
 delays softmax after publishing retained P, then checks dense/THD O, LSE and
 Amax after capture/replay. The delay lives in a private test template copy;
 production kernels gain no debug knob or timing-dependent assertion.
+
+**Rule S10 — Every warp role decodes a work item with the same scheduler inputs.**
+
+- LPT-L2 requires the runtime GQA ratio and KV length at both initial and
+  persistent decode calls, including the output-store warp. NATURAL/LPT and
+  THD can hide missing arguments because they do not read those inputs.
+- Packed tile heads and per-row query heads are different coordinates. Keep
+  the next decoded tile head in the scheduler variable; derive each output
+  head from it again for sinks, Stats and partial stores.
+- A THD body using the device-bounded persistent claim counter must declare
+  `THD_PERSISTENT = True` to the adapter. Otherwise the launch cap retains the
+  declaration envelope and only the binder's runtime capacity tightens it,
+  which can still add unnecessary worker waves. Assert the module route
+  and declaration in changed-length replay tests; inspect the actual launch
+  grid when comparing persistent implementations.
+- Preserve the body's initial-wave policy through runtime binding. A broad
+  shape-override declaration must not freeze a one-wave cap before the binder
+  sees the current host-known Q capacity and batch. Larger runtime bounds still
+  use the resident wave; no device-length read is needed. Check native/reference
+  frames and small-to-large-to-small rebinding, then changed-length graph replay
+  (`test_native_initial_waves_bind_current_work`).
+- Packed runtime bounds use token rows per tile and packed head groups. Keep
+  the body's initial-work budget with that geometry in immutable plan metadata;
+  counting unpacked rows and all query heads can select an extra worker wave.
+  Check both packing modes and partial groups against explicit native frames
+  (`test_native_thd_initial_wave_geometry_rebinds`), including a broad declaration.
+- `test_native_d128_packing_dense_replay` compiles all three schedulers and
+  checks changed-input replay, split partials and MHA's bitwise packing fold.
+  The ragged changed-length tests cover partial packing and retained captures.
 
 ## 2x2 datapath (cta_group::2, M=128 collective = 64 rows per CTA) lessons
 
