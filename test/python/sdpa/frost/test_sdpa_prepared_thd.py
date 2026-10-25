@@ -2079,25 +2079,53 @@ if _dsl_installed():
     import cutlass
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
-    from cudnn.frost.tile_dsl.thd import write_thd_batch_remap, write_thd_live_and_ctr, write_thd_prefix_warp, write_thd_work_prefix
+    from cudnn.frost.tile_dsl.thd import write_thd_batch_remap, write_thd_live_and_ctr, write_thd_prefix_warp, write_thd_work_prefix, write_thd_small_batch_meta
 
     @cute.kernel
-    def _prefix_probe(meta_t, q, k, b: cutlass.Int32, flags: cutlass.Int32, rank_by_kv: cutlass.Constexpr[bool], work_prefix: cutlass.Constexpr[bool]):
+    def _prefix_probe(
+        meta_t,
+        q,
+        k,
+        b: cutlass.Int32,
+        flags: cutlass.Int32,
+        rank_by_kv: cutlass.Constexpr[bool],
+        work_prefix: cutlass.Constexpr[bool],
+        small_batch: cutlass.Constexpr[bool],
+    ):
         tid, _, _ = cute.arch.thread_idx()
         warp, lane = cutlass.Int32(tid) // 32, cutlass.Int32(tid) % 32
         meta = cutlass.make_array_view(meta_t)
-        if warp == 0:
-            write_thd_prefix_warp(meta, cutlass.make_array_view(q), b, b, (flags & 1) != 0, lane, store_lengths=False)
-        if warp == 1:
-            write_thd_prefix_warp(meta, cutlass.make_array_view(k), b, 2 * b + 1, (flags & 2) != 0, lane, store_lengths=True)
-
-        cute.arch.barrier()
-        write_thd_batch_remap(meta, b, cutlass.Int32(tid), cutlass.Int32(64), rank_by_kv=rank_by_kv)
-        cute.arch.barrier()
-        if cutlass.const_expr(work_prefix):
-            write_thd_work_prefix(meta, b, cutlass.Int32(3), cutlass.Int32(16), cutlass.Int32(7), cutlass.Int32(tid), 3)
+        fused = cutlass.Boolean(False)
+        if cutlass.const_expr(small_batch):
+            fused = (b > 1) & (b <= 32)
+        if fused:
+            if warp == 0:
+                write_thd_small_batch_meta(
+                    meta,
+                    cutlass.make_array_view(q),
+                    cutlass.make_array_view(k),
+                    flags,
+                    b,
+                    cutlass.Int32(3),
+                    cutlass.Int32(16),
+                    cutlass.Int32(7),
+                    lane,
+                    3,
+                    rank_by_kv,
+                )
         else:
-            write_thd_live_and_ctr(meta, b, cutlass.Int32(3), cutlass.Int32(128), cutlass.Int32(7), cutlass.Int32(tid))
+            if warp == 0:
+                write_thd_prefix_warp(meta, cutlass.make_array_view(q), b, b, (flags & 1) != 0, lane, store_lengths=False)
+            if warp == 1:
+                write_thd_prefix_warp(meta, cutlass.make_array_view(k), b, 2 * b + 1, (flags & 2) != 0, lane, store_lengths=True)
+
+            cute.arch.barrier()
+            write_thd_batch_remap(meta, b, cutlass.Int32(tid), cutlass.Int32(64), rank_by_kv=rank_by_kv)
+            cute.arch.barrier()
+            if cutlass.const_expr(work_prefix):
+                write_thd_work_prefix(meta, b, cutlass.Int32(3), cutlass.Int32(16), cutlass.Int32(7), cutlass.Int32(tid), 3)
+            else:
+                write_thd_live_and_ctr(meta, b, cutlass.Int32(3), cutlass.Int32(128), cutlass.Int32(7), cutlass.Int32(tid))
 
     _prefix_probe.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
@@ -2130,15 +2158,25 @@ if _dsl_installed():
         _decode_probe(m, out, b, n_uid, reverse_rows).launch(grid=((n_uid + 127) // 128, 1, 1), block=(128, 1, 1), stream=stream)
 
     @cute.jit
-    def _prefix_host(m, q, k, b: cutlass.Int32, flags: cutlass.Int32, rank_by_kv: cutlass.Constexpr[bool], work_prefix: cutlass.Constexpr[bool], stream):
-        _prefix_probe(m, q, k, b, flags, rank_by_kv, work_prefix).launch(grid=(1, 1, 1), block=(64, 1, 1), stream=stream)
+    def _prefix_host(
+        m,
+        q,
+        k,
+        b: cutlass.Int32,
+        flags: cutlass.Int32,
+        rank_by_kv: cutlass.Constexpr[bool],
+        work_prefix: cutlass.Constexpr[bool],
+        stream,
+        small_batch: cutlass.Constexpr[bool],
+    ):
+        _prefix_probe(m, q, k, b, flags, rank_by_kv, work_prefix, small_batch).launch(grid=(1, 1, 1), block=(64, 1, 1), stream=stream)
 
 
 @pytest.fixture(scope="module")
 def _prefix_runner():
     compiled = {}
 
-    def run(meta, q, k, b, flags, rank_by_kv, work_prefix=False):
+    def run(meta, q, k, b, flags, rank_by_kv, work_prefix=False, small_batch=False):
         tensor = lambda x: from_dlpack(x, assumed_align=16).mark_layout_dynamic(leading_dim=0)
         args = (
             tensor(meta),
@@ -2149,11 +2187,12 @@ def _prefix_runner():
             rank_by_kv,
             work_prefix,
             _prefix_cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+            small_batch,
         )
-        key = (rank_by_kv, work_prefix)
+        key = (rank_by_kv, work_prefix, small_batch)
         if key not in compiled:
             compiled[key] = cute.compile(_prefix_host, *args)
-        compiled[key](*args[:5], args[-1])
+        compiled[key](*args[:5], args[-2])
 
     return run
 
