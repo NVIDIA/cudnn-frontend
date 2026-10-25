@@ -54,5 +54,5 @@ CONFIG = InferenceBenchmarkConfig(
     # (128k) covers the throughput story (B300-measured).
     generation_batch_sizes=[1, 128],
     page_size=32,
-    backends=["cudnn", "cudnn_oss"],
+    backends=["cudnn", "cudnn_oss", "cudnn_auto"],
 )

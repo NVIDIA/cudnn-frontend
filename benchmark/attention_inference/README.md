@@ -14,11 +14,12 @@ forward/backward in `../attention_training`):
 
 ## Backends
 
-The configs sweep the two cuDNN frontend paths only:
+The configs sweep three cuDNN frontend paths:
 
 | Backend | What it measures |
 |---|---|
 | `cudnn` | cuDNN frontend graph API, native backend engines only (heur A + FALLBACK; the FROST SDPA engines are deselected by name, since the SM100/SM120 f16 rows are default candidates), contiguous KV |
+| `cudnn_auto` | the same graph with the frontend's **default dispatch**: no engine deselected or pinned, FROST opt-in unset, so graduated FROST rows compete through placement exactly as for a user; the plan the heuristics picked is recorded per case. Compare it with the faster of `cudnn` / `cudnn_oss` (`python -m benchmark.heuristics_regret`) |
 | `cudnn_oss` | the same graph planned with `heur_mode.OPENSOURCE` and `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`: only the frontend's open-source engines (frost python engines + the backend's OSS candidates) may serve it; the winning plan is recorded per case |
 
 Unsupported combinations are recorded (not hidden) and show up as blank slots

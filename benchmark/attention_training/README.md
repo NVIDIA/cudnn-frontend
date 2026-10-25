@@ -334,6 +334,7 @@ runner.save_csv(results, config)
 |---------|-------------|
 | `cudnn` | cuDNN (native, via cuDNN Frontend) |
 | `cudnn_oss` | cuDNN OSS FROST engines (open-source CuTe-DSL kernels, via cuDNN Frontend) |
+| `cudnn_auto` | cuDNN Frontend default dispatch: the plan the heuristics pick (native or FROST), nothing deselected or pinned. Should match the faster of `cudnn` / `cudnn_oss`; see `python -m benchmark.heuristics_regret` |
 | `flash_attention_4` | FlashAttention 4 |
 | `flash_attention_3` | FlashAttention 3 |
 | `pyt_flash_attention` | PyTorch FlashAttention |

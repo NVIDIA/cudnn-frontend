@@ -15,6 +15,9 @@ Phases:
 
 Backends:
   cudnn              cuDNN frontend graph API (contiguous KV).
+  cudnn_auto         Same graph with the frontend's default dispatch: no engine
+                     deselected or pinned and FROST opt-in unset, i.e. the plan the
+                     heuristics pick for a user (compare against cudnn / cudnn_oss).
   cudnn_oss          Same graph, planned with heur_mode.OPENSOURCE so only the
                      frontend's open-source engines (frost python engines +
                      the backend's OSS candidates) may serve it.
@@ -156,7 +159,7 @@ def time_fn(fn, num_warmup, num_iters) -> float:
 # ---------------------------------------------------------------------------
 
 
-def setup_cudnn(args, dtype, oss=False):
+def setup_cudnn(args, dtype, oss=False, auto=False):
     import cudnn
 
     b, hq, hkv = args.batch_size, args.num_q_heads, args.num_kv_heads
@@ -164,7 +167,7 @@ def setup_cudnn(args, dtype, oss=False):
     sq, skv = args.q_tokens, args.kv_len
 
     if args.kv_cache_dtype == "fp8_e4m3":
-        return setup_cudnn_fp8(args, cudnn, oss=oss)
+        return setup_cudnn_fp8(args, cudnn, oss=oss, auto=auto)
 
     # Allocate (B, S, H, D) and transpose to the logical (B, H, S, D) the graph
     # takes. Same logical tensor either way — only the physical stride order
@@ -224,7 +227,7 @@ def setup_cudnn(args, dtype, oss=False):
     graph.validate()
     graph.build_operation_graph()
     modes = [cudnn.heur_mode.OPENSOURCE] if oss else [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
-    if not oss:
+    if not (oss or auto):
         _deselect_frost_sdpa(graph)
     graph.create_execution_plans(modes)
     graph.check_support()
@@ -241,6 +244,8 @@ def setup_cudnn(args, dtype, oss=False):
 
     if oss:
         return fn, f"cudnn_oss plan={_require_python_oss_plan(graph)}"
+    if auto:
+        return fn, f"cudnn_auto plan={_built_plan_name(graph)}"
     return fn, f"cudnn {cudnn.backend_version_string()}"
 
 
@@ -281,7 +286,14 @@ def setup_cudnn_oss(args, dtype):
     return setup_cudnn(args, dtype, oss=True)
 
 
-def setup_cudnn_fp8(args, cudnn, oss=False):
+def setup_cudnn_auto(args, dtype):
+    """cuDNN frontend default dispatch: the plan the heuristics rank first for a user, with no engine deselected or
+    pinned. The FROST opt-in is cleared so graduated FROST rows compete through placement, as in production."""
+    os.environ.pop("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", None)
+    return setup_cudnn(args, dtype, auto=True)
+
+
+def setup_cudnn_fp8(args, cudnn, oss=False, auto=False):
     """FP8 attention graph (q/k/v e4m3 with unit descales) for the fp8-KV axis."""
     if args.has_sink:
         raise NotImplementedError("sink tokens are not wired into the fp8 attention graph")
@@ -343,7 +355,7 @@ def setup_cudnn_fp8(args, cudnn, oss=False):
     graph.validate()
     graph.build_operation_graph()
     modes = [cudnn.heur_mode.OPENSOURCE] if oss else [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
-    if not oss:
+    if not (oss or auto):
         _deselect_frost_sdpa(graph)
     graph.create_execution_plans(modes)
     graph.check_support()
@@ -359,6 +371,8 @@ def setup_cudnn_fp8(args, cudnn, oss=False):
 
     if oss:
         return fn, f"cudnn_oss fp8 plan={_require_python_oss_plan(graph)}"
+    if auto:
+        return fn, f"cudnn_auto fp8 plan={_built_plan_name(graph)}"
     return fn, f"cudnn fp8 {cudnn.backend_version_string()}"
 
 
@@ -764,6 +778,7 @@ def setup_flash_attention_4(args, dtype):
 SETUPS = {
     "cudnn": setup_cudnn,
     "cudnn_oss": setup_cudnn_oss,
+    "cudnn_auto": setup_cudnn_auto,
     "flashinfer": setup_flashinfer,
     "b12x": setup_b12x,
     "flash_mla": setup_flash_mla,
@@ -823,7 +838,7 @@ def main():
         sliding_window=args.sliding_window_size,
         kv_elt_size=1 if args.kv_cache_dtype == "fp8_e4m3" else 2,
         # the cudnn fp8 graph holds Q and O in e4m3 as well
-        qo_elt_size=1 if args.kv_cache_dtype == "fp8_e4m3" and args.backend in ("cudnn", "cudnn_oss") else 2,
+        qo_elt_size=1 if args.kv_cache_dtype == "fp8_e4m3" and args.backend in ("cudnn", "cudnn_oss", "cudnn_auto") else 2,
     )
     tflops = flops / (ms * 1e-3) / 1e12
     gbps = byts / (ms * 1e-3) / 1e9
