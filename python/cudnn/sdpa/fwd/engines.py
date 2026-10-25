@@ -44,6 +44,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     pack_gqa_supported,
     supports_paged_prefill_cga1,
     supports_paged_d256_pack_gqa,
+    supports_nonpaged_d128_thd_prefill,
     supports_paged_d128_partial_pack_gqa,
     supports_nonpaged_d128_thd_pack_gqa,
     supports_thd_split,
@@ -1070,6 +1071,20 @@ def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split
 
     _knobs = SdpaFwdKnobs(split_kv=split_kv, cga=cga) if (split_kv is not None or cga is not None) else None
     selected = _selected_d_shape(capabilities, facts, _knobs)
+    if (
+        capabilities.sm_lo == 107
+        and not facts.attn_scale_prefolded
+        and supports_nonpaged_d128_thd_prefill(
+            (facts.d_qk, facts.d_v),
+            device_cc=facts.device_cc,
+            fp8=facts.is_fp8 or facts.is_mxfp8,
+            thd=facts.thd,
+            paged=facts.has_paged_kv,
+            cga=cga,
+            split_kv=split_kv or 1,
+        )
+    ):
+        return frozenset({1, 2})
     if capabilities.sm_lo == 107 and supports_paged_prefill_cga1(
         (facts.d_qk, facts.d_v),
         device_cc=facts.device_cc,
@@ -1410,8 +1425,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if sm120_tile_reason is not None:
             return sm120_tile_reason
         # D128 half cga1 uses the decode tile for ragged Q=1 and the split
-        # host, or the two-slab prefill body for unsplit SM100 paged Q>1.
-        # Other ragged graphs keep the cga2 prefill tile.
+        # host, or two-slab prefill for admitted paged graphs and native Rubin
+        # nonpaged exact D128. effective_cgas gates the unsplit prefill domain.
         # api_dsl.check_support mirrors these lines (keep them in lockstep).
         ragged_decode = knobs.cga == 1 and facts.thd and _thd_decode_leg(capabilities, facts)
         packed_split = packed_thd_split(capabilities, facts, knobs)
