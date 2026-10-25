@@ -297,6 +297,30 @@ window 128 / 512 / 4096; bottom-right chunks q128 / q2048 over a 32k cache at wi
   Rubin (216 SMs; the SM107 half and per-tensor FP8 rows) bf16 0.33-0.97, FP8 0.40-0.73
 FP8 agrees with the backend within rel-RMS 0.04 (E4M3 O), bf16 within 0.003.
 
+Rubin paged bf16 d128 GQA prefill chunks (2026-10-24, ``_sm107_paged_gqa_prefill``): LEAD for GQA 4 / 8 at b 1-4,
+128 < s_q <= 1024, S_kv 2k-32k, bottom-right causal, page 16, head-major in-page K. MHA and group 2 retain the
+backend-first order. Past one Q tile, ``paged_thd_split_choice`` allows a two-wave budget: the declared capacity
+(b * max_q rows) can overstate the live work in a mixed-length batch. These remain graph-declaration policies;
+neither rule reads device lengths. Validation uses the FlashInfer paged prefill wrapper with actual per-request
+lengths, bounded and exact declarations, CUDA-graph replay of every offered candidate, both traversal orders,
+and full FP64 O / LSE checks on cuDNN 9.27.0.42. A separate frozen 16-geometry holdout exercises Stats on and off.
+Bounded (``shape_overrides``) chunks lead the same way, and GQA 4 / 8 / 16 also lead on full causal squares (either
+alignment) with 768 <= S <= 8192, exact or bounded; a bounded square is judged on its declared capacity, which
+FlashInfer's full prefill declares as Q = KV. Performance outcomes remain internal.
+
+SM100 paged bf16 d128 GQA prefill (2026-10-24, ``_sm100_paged_gqa_prefill``): GQA16 LEAD at b 1-4, 128 < effective Q
+<= 4096, S_kv 2k-32k, causal (bottom-right chunks and top-left full squares), page 16, head-major in-page K. Once
+paged SM100 lists the packed set first for GQA16, the FROST block's first plan (packed, LPT, unsplit cga2) runs
+0.67-0.97 of the backend's engine 10 on 10 of 11 GQA16 shapes in a mixed-length paged sweep (one at parity, 1.01;
+an engineering SM100 board, within-run ratios); the G8 control is at parity with that first plan and MHA (1.11) keeps
+the backend. Bounded declarations (``shape_overrides``, FlashInfer's rounded capacities) also lead GQA 4 / 8. The gap
+there is consistent with the backend working against the declared capacity while FROST runs the actual lengths; the
+mechanism is not verified. Bounded paged holdouts run through FlashInfer's wrapper on a B200 found an offered packed
+unsplit plan ahead of engine 10 on every bounded GQA 4 / 8 / 16 group; a separately frozen bounded holdout then saw
+every changed default faster in both orders but one, which was neutral. Exact G4 / G8 with an exact total-Q
+declaration and bounded MHA / group 2 showed no material gap and still trail. FlashInfer's exact declarations leave
+``max_total_seq_len_q`` unset (capacity b * max_q), so GQA 4 / 8 lead there too. Measured on cc 10.0 only.
+
 Rows with no measurement (SM80, SM100 mxfp8) keep the historical order (LEAD); they are still
 opt-in, so the order is only observable with ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``.
 """
@@ -397,6 +421,8 @@ FP8_MIN_KV_TOKENS = 1024  # below, a single-wave launch is host-bound: FROST's ~
 FP8_D192_MAX_Q_TILES = 64  # d192 chunks: 16-64 tiles win 0.34-0.90; 128 tiles lose 1.19-1.72
 FP8_D128_ANY_TILES_MAX_S_Q = 128  # d128 chunks with s_q <= 128 win at 64-512 tiles (0.21-0.68)
 FP8_SYNTH_KV_MIN_TILE_KV = 2**21  # S_kv off the KV tile, mask-free: Q tiles * s_kv from which FROST wins (0.41-0.89)
+SM100_PAGED_GQA16_MAX_B = 4  # SM100 paged bf16 GQA prefill: measured batch range (module docstring)
+SM107_PAGED_GQA_MAX_B = 4  # Rubin paged bf16 GQA prefill chunks: measured batch range (module docstring)
 SM107_FP8_TINY_MAX_KV = 128  # cc 10.7 FP8 d256 / d512: a single KV tile ...
 SM107_FP8_TINY_MAX_Q_TILES = 8  # ... and at most 8 Q tiles is launch-bound; the backend keeps it
 SM107_FP8_D128_CAUSAL_MAX_S_Q = 4096  # packed GQA bottom-right causal chunk up to this query length: 0.78-0.94
@@ -524,6 +550,29 @@ def _sm107_paged_d256_decode_tile_leads(caps: Capabilities, facts) -> bool:
     return u_lo <= units <= u_hi and kv_lo <= facts.s_kv <= kv_hi
 
 
+def _sm107_paged_gqa_prefill(facts) -> bool:
+    """Rubin paged bf16 d128 GQA prefill, page 16, head-major in-page K (module docstring): GQA 4 / 8 / 16 bottom-right
+    chunks on exact or bounded (``shape_overrides``) declarations, and on full causal squares."""
+    group = facts.h_q // facts.h_kv if facts.h_kv and facts.h_q % facts.h_kv == 0 else 0
+    common = (
+        facts.has_paged_kv
+        and facts.dtype == cudnn.data_type.BFLOAT16
+        and (facts.d_qk, facts.d_v) == (128, 128)
+        and 1 <= facts.b <= SM107_PAGED_GQA_MAX_B
+        and facts.page_size == 16
+        and facts.causal
+        and facts.window_left is None
+        and not (facts.has_sink or facts.right_band_widening)
+        and facts.k_t is not None
+        and facts.k_t.get_stride()[2] < facts.k_t.get_stride()[1]
+    )
+    if not common or group not in (4, 8, 16):
+        return False
+    chunk = facts.bottom_right and 128 < min(facts.s_q, facts.max_total_seq_len_q or facts.s_q) and facts.s_q <= 1024 and 2048 <= facts.s_kv <= 32768
+    square = facts.s_q == facts.s_kv and 768 <= facts.s_q <= 8192
+    return chunk or square
+
+
 def _place_sm107_f16(caps: Capabilities, facts) -> str:
     from .heuristics import _prefer_paged_d256_lpt, _prefer_thd_pack_gqa, nonpaged_thd_split_choice, paged_d256_prefix_launch, paged_thd_split_choice
 
@@ -573,6 +622,8 @@ def _place_sm107_f16(caps: Capabilities, facts) -> str:
                 return LEAD  # d512 and its d320-d448 envelope: 0.08-0.67
             if facts.s_q < facts.s_kv and facts.s_kv >= CHUNKED_MIN_KV_TOKENS and _q_tiles(facts) <= CHUNKED_MAX_Q_TILES:
                 return LEAD  # chunked, d64-d256: 0.04-1.00; squares and wider chunks stay mixed (up to 1.98x)
+    if _sm107_paged_gqa_prefill(facts):
+        return LEAD
     # The shared paged pipeline also benefits from GQA packing without a
     # split. Large-batch short queries recover unused Q rows without partials.
     # Smaller GPU-only gains do not reliably repay the host submission cost;
@@ -726,6 +777,29 @@ def _in_paged_d256_prefill_domain(facts) -> bool:
     )
 
 
+def _sm100_paged_gqa_prefill(facts) -> bool:
+    """cc 10.0 paged bf16 d128 GQA prefill, page 16, head-major in-page K (module docstring): GQA16 exact or bounded;
+    GQA 4 / 8 when the declared total-Q capacity is loose (``shape_overrides`` or no ``max_total_seq_len_q``)."""
+    group = facts.h_q // facts.h_kv if facts.h_kv and facts.h_q % facts.h_kv == 0 else 0
+    return (
+        facts.device_cc == (10, 0)
+        and facts.has_paged_kv
+        and (group == 16 or (group in (4, 8) and (bool(facts.shape_overrides) or facts.max_total_seq_len_q is None)))
+        and facts.dtype == cudnn.data_type.BFLOAT16
+        and (facts.d_qk, facts.d_v) == (128, 128)
+        and 1 <= facts.b <= SM100_PAGED_GQA16_MAX_B
+        and 128 < min(facts.s_q, facts.max_total_seq_len_q or facts.s_q) <= 4096
+        and 2048 <= facts.s_kv <= 32768
+        and facts.page_size == 16
+        and facts.causal
+        and (facts.bottom_right or facts.s_q == facts.s_kv)
+        and facts.window_left is None
+        and not (facts.has_sink or facts.right_band_widening)
+        and facts.k_t is not None
+        and facts.k_t.get_stride()[2] < facts.k_t.get_stride()[1]
+    )
+
+
 def _place_sm100_f16(caps: Capabilities, facts) -> str:
     from .heuristics import _prefer_thd_pack_gqa, nonpaged_thd_split_choice, paged_thd_split_choice
 
@@ -734,6 +808,8 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
     if paged_thd_split_choice(caps, facts)[0] > 1:
         return LEAD
     if nonpaged_thd_split_choice(caps, facts)[0] > 1:
+        return LEAD
+    if _sm100_paged_gqa_prefill(facts):
         return LEAD
     dense = not facts.thd
     if dense and 2 <= facts.s_q <= DECODE_SHAPED_MAX_S_Q:

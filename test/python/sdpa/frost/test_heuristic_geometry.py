@@ -188,7 +188,7 @@ def test_paged_split_proposal_preserves_selected_packing(monkeypatch, packed, ba
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107") if d == 256 else SPEC
     facts = _paged_split_facts(b=batch, h_q=h_q, h_kv=h_kv, d_qk=d, d_v=d, device_cc=device_cc, wants_stats=wants_stats)
-    monkeypatch.setattr(heur, "paged_thd_split_choice", lambda caps, facts: (3, packed), raising=False)
+    monkeypatch.setattr(heur, "paged_thd_split_choice", lambda caps, facts, **_: (3, packed), raising=False)
     selected = heur._knob_sets(spec, facts)[0]
     assert (selected.cga, selected.split_kv, selected.pack_gqa) == (cga, 3, packed)
     assert mismatch(spec.capabilities, facts, selected) is None

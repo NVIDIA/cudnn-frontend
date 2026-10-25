@@ -250,6 +250,12 @@ def _covering(shape: Tuple[int, ...], strides: Tuple[int, ...]) -> bool:
     return True
 
 
+@lru_cache(maxsize=256)
+def _host_parameter_order(host) -> Tuple[str, ...]:
+    """Immutable template-host slots; compiled wrappers are checked separately."""
+    return tuple(n for n, p in inspect.signature(host).parameters.items() if "Constexpr" not in str(p.annotation))
+
+
 def _positional_order(api) -> Tuple[Any, Any, List[str]]:
     """``(raw positional entry, compiled artifact, host slot order)`` of the adapter's compiled kernel;
     NotImplementedError when the artifact has no positional entry or the host is not the expected shape."""
@@ -261,7 +267,7 @@ def _positional_order(api) -> Tuple[Any, Any, List[str]]:
     raw = positional_entry(compiled)
     if raw is None:
         raise NotImplementedError("the compiled artifact exposes no positional tvm-ffi entry")
-    order = [n for n, p in inspect.signature(host).parameters.items() if "Constexpr" not in str(p.annotation)]
+    order = list(_host_parameter_order(host))
     if order[-1] != "stream":
         raise NotImplementedError(f"{km.__name__}: the host entry does not end with the stream parameter: {order[-3:]}")
     wrapper_sig = getattr(compiled, "_kwargs_wrapper", None) or compiled

@@ -84,6 +84,8 @@ from cutlass.cute.nvgpu import cpasync, warpgroup
 from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cudadrv
 
+from cudnn.frost.device import multiprocessor_count
+
 BF16 = cutlass.BFloat16
 F32 = cutlass.Float32
 I32 = cutlass.Int32
@@ -1101,18 +1103,19 @@ _CACHE = {}
 _WS = {}
 
 
-def _pick_nseg(T, N, H):
+def _pick_nseg(T, N, H, num_sm):
     """Pick the segment count from a measured cost model of the three phases.
 
     BUILD/EXPAND cost is (fixed + seglen * per_step); COMBINE is a serial scan
     over the NSEG operators.  Segments are capped so BUILD/EXPAND stay inside a
-    single 132-SM wave.  The single-segment path skips BUILD and COMBINE
+    single wave of the device's ``num_sm`` SMs (the constants were fit on a
+    132-SM H100 SXM).  The single-segment path skips BUILD and COMBINE
     entirely and reads the workspace once, so it gets a margin before a
     segmented schedule is allowed to take over.
     """
     L = T // max(N, 1)
     ncs = (L + 15) // 16
-    pmax = min(132 // max(N * H, 1), max(ncs // 2, 1))
+    pmax = min(num_sm // max(N * H, 1), max(ncs // 2, 1))
     best = 1
     bestc = (9.5 + ncs * 1.215) * 0.93
     for p in range(2, pmax + 1):
@@ -1199,12 +1202,13 @@ def run_cute(mQ, mK, mV, mG, mB, mCu, mIS, mO, mFS, T, H, D, N, device, stream_p
     """
     nch = T // 16 + N + 1
     prep_nch = (T + 15) // 16 + N - 1
-    nseg = _pick_nseg(T, N, H)
+    nseg = _pick_nseg(T, N, H, multiprocessor_count(device.index if device.index is not None else torch.cuda.current_device()))
 
     # Already CuTe tensors, converted once per shape (see _ws).
     ws = _ws(nch, H, N, nseg, device)
 
-    key = (T, H, N, D)
+    # nseg is baked into the compiled kernel and follows the device's SM count.
+    key = (T, H, N, D, nseg)
     fn = _CACHE.get(key)
     stream = cudadrv.CUstream(stream_ptr)
 
