@@ -890,6 +890,23 @@ def test_sm107_paged_gqa_prefill_leads_inside_its_box():
 
 
 @pytest.mark.L0
+def test_sm100_paged_full_square_leads_inside_its_box():
+    """cc 10.0 paged bf16 d128 full prefill squares lead: GQA 4/8/16 up to 8192, MHA / group 2 up to 2048."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    base = dict(b=2, s_q=1536, s_kv=1536, bottom_right=False, max_total_seq_len_q=None, device_cc=(10, 0), device_sm_count=148)
+    place = lambda **over: placement.place(spec, _sm107_paged_facts(**{**base, **over}))
+    for h_q, h_kv in ((8, 8), (16, 8), (16, 4), (8, 1), (64, 4)):
+        assert place(h_q=h_q, h_kv=h_kv) == placement.LEAD, (h_q, h_kv)
+    assert place(h_q=8, h_kv=1, b=1, s_q=8192, s_kv=8192) == placement.LEAD
+    assert place(h_q=16, h_kv=8, b=1, s_q=4096, s_kv=4096) == placement.TRAIL  # group 2 past 2048
+    assert place(h_q=8, h_kv=8, s_q=512, s_kv=512) == placement.TRAIL
+    assert place(h_q=8, h_kv=1, b=1, s_q=16384, s_kv=16384) == placement.TRAIL
+    assert place(h_q=8, h_kv=8, device_cc=(10, 3), device_sm_count=160) == placement.TRAIL
+
+
+@pytest.mark.L0
 def test_sm100_paged_gqa_prefill_leads_inside_its_box():
     """cc 10.0 paged bf16 d128 GQA prefill leads for GQA16 (exact or bounded) and bounded GQA 4 / 8; exact G8, MHA, G2,
     cc 10.3 and out-of-box shapes keep the backend."""

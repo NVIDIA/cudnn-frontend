@@ -321,6 +321,11 @@ every changed default faster in both orders but one, which was neutral. Exact G4
 declaration and bounded MHA / group 2 showed no material gap and still trail. FlashInfer's exact declarations leave
 ``max_total_seq_len_q`` unset (capacity b * max_q), so GQA 4 / 8 lead there too. Measured on cc 10.0 only.
 
+SM100 paged bf16 d128 full squares (2026-10-25, ``_sm100_paged_full_square``): Q = KV per graph (full paged prefill),
+b 1-4, page 16, head-major in-page K, causal, no window / sink. GQA 4 / 8 / 16 lead for 1024 <= S <= 8192, MHA and
+group 2 for 1024 <= S <= 2048. A legal-pool sweep over mixed-length full prefills found FROST's first plan ahead of
+engine 10 on every such shape except a single 4096-token group-2 square, which keeps the backend.
+
 Rows with no measurement (SM80, SM100 mxfp8) keep the historical order (LEAD); they are still
 opt-in, so the order is only observable with ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``.
 """
@@ -777,6 +782,27 @@ def _in_paged_d256_prefill_domain(facts) -> bool:
     )
 
 
+def _sm100_paged_full_square(facts) -> bool:
+    """cc 10.0 paged bf16 d128 full prefill (Q = KV), page 16, head-major in-page K (module docstring)."""
+    group = facts.h_q // facts.h_kv if facts.h_kv and facts.h_q % facts.h_kv == 0 else 0
+    max_s = 8192 if group in (4, 8, 16) else 2048 if group in (1, 2) else 0
+    return (
+        facts.device_cc == (10, 0)
+        and facts.has_paged_kv
+        and facts.dtype == cudnn.data_type.BFLOAT16
+        and (facts.d_qk, facts.d_v) == (128, 128)
+        and 1 <= facts.b <= SM100_PAGED_GQA16_MAX_B
+        and facts.s_q == facts.s_kv
+        and 1024 <= facts.s_q <= max_s
+        and facts.page_size == 16
+        and facts.causal
+        and facts.window_left is None
+        and not (facts.has_sink or facts.right_band_widening)
+        and facts.k_t is not None
+        and facts.k_t.get_stride()[2] < facts.k_t.get_stride()[1]
+    )
+
+
 def _sm100_paged_gqa_prefill(facts) -> bool:
     """cc 10.0 paged bf16 d128 GQA prefill, page 16, head-major in-page K (module docstring): GQA16 exact or bounded;
     GQA 4 / 8 when the declared total-Q capacity is loose (``shape_overrides`` or no ``max_total_seq_len_q``)."""
@@ -809,7 +835,7 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
         return LEAD
     if nonpaged_thd_split_choice(caps, facts)[0] > 1:
         return LEAD
-    if _sm100_paged_gqa_prefill(facts):
+    if _sm100_paged_gqa_prefill(facts) or _sm100_paged_full_square(facts):
         return LEAD
     dense = not facts.thd
     if dense and 2 <= facts.s_q <= DECODE_SHAPED_MAX_S_Q:
