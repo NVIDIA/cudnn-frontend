@@ -47,7 +47,7 @@ def test_small_batch_thd_work_prefix_replay_matches_live_tiles(b, flags, rank_by
             work = ((q[remap.long()] + 15) // 16) * 3
             expected = torch.cat((k, cq, ck, remap, torch.tensor([int(work.sum()) * 3, 7], dtype=torch.int32)))
             torch.testing.assert_close(got[: 4 * b + 4], expected, rtol=0, atol=0)
-            if b > 1:
+            if b >= 1:
                 prefix = torch.cat((torch.zeros(1, dtype=torch.int32), work.cumsum(0, dtype=torch.int32)))
                 torch.testing.assert_close(got[THD_WORK_PREFIX_OFF(b) :], prefix, rtol=0, atol=0)
             assert torch.all(storage[:4] == -12345) and torch.all(storage[-4:] == -12345)

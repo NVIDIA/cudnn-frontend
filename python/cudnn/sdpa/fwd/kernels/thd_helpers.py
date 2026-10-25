@@ -296,8 +296,9 @@ def build_thd_meta_o_descs_kernel(
 ) -> None:
     """Per-execute f16/bf16 THD metadata, O descriptors, and scheduler bounds.
 
-    A single request keeps the elected-thread path. For larger batches, one
-    warp builds each side's prefix and elected warp leaders patch disjoint O
+    Opted-in batches of one through 32 requests build metadata in one warp.
+    Other callers keep the elected-thread path for a single request. Larger
+    batches use one warp per prefix. Elected leaders patch disjoint O
     descriptors. The final two warps also patch the packed K/V extents; paged
     pools retain their pool-shaped descriptors. All work stays in the existing
     setup launch, before the attention kernel on the same stream.
@@ -319,8 +320,8 @@ def build_thd_meta_o_descs_kernel(
     meta = cutlass.make_array_view(meta_t)
     fused_meta = cutlass.Boolean(False)
     if cutlass.const_expr(small_batch_meta):
-        fused_meta = (n_batch > 1) & (n_batch <= 32)
-    if n_batch <= cutlass.Int32(1):
+        fused_meta = (n_batch >= 1) & (n_batch <= 32)
+    if (n_batch <= cutlass.Int32(1)) & ~fused_meta:
         if nvvm.elect_sync() and tidx < cutlass.Int32(32):
             write_thd_meta(meta, cutlass.make_array_view(q_lens_t), cutlass.make_array_view(kv_lens_t), lens_form, n_batch)
             emit_seq_descs(base_o_desc, o_desc_words, meta, n_batch, o_tensor, n_batch, o_row_stride, seq_ord=2)
