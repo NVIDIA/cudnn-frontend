@@ -337,8 +337,10 @@ def _check_rubin_ragged_pack_rebind(
     assert api._k_mod.THD_INITIAL_WAVES == 2
     resident = max(1, torch.cuda.get_device_properties(DEV).multi_processor_count // api._k_mod.CGA_SIZE)
     assert api._thd_plan().units <= 2 * resident
-    if geometry == "two_wave_pair" and cga == 2 and resident < 128 <= 2 * resident:
-        assert api._thd_plan().units == 128
+    if geometry == "two_wave_pair" and cga == 2:
+        numerator, denominator = api._k_mod.THD_INITIAL_WORK_RATIO
+        initial_limit = resident * numerator // denominator
+        assert api._thd_plan().units == (128 if 128 <= initial_limit else resident)
     ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
 
     def inputs(seed):

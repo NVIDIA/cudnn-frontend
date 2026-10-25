@@ -4620,113 +4620,119 @@ def _correction_warp_group(
                         # A trimmed row is dead even with a sink: max = -inf, sum_exp = 0, like its LSE.
                         score_max_val = cutlass.Float32(arith.select(row_trim.ir_value(), cutlass.Float32(float("-inf")).ir_value(), score_max_val.ir_value()))
                         score_sum_val = cutlass.Float32(arith.select(row_trim.ir_value(), cutlass.Float32(0.0).ir_value(), score_sum_val.ir_value()))
-                sO_sub_base = sO[qs].base
-
-                if cutlass.const_expr(_FP32_PARTIALS):
-                    _store_fp32_partial_tile(
-                        o_partial_f32,
-                        tmem_base_epi,
-                        tmem_O_off,
-                        inv_sum,
-                        _kv_empty,
-                        q_row_global < seqlen_q,
-                        _partial_batch(batch_idx, split_idx, n_batch),
-                        q_row_global,
-                        row_head_idx,
-                        CFG.TILE_O,
-                        O_CHUNK,
-                    )
-                    bars.mb_o_empty[qs].wait(o_empty_phase, spin=SPIN_RING_WAITS)
-                else:
-                    for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O):
-                        o_addr = tmem_base_epi + cutlass.Int32(tmem_O_off + chunk_idx * O_CHUNK)
-                        o_chunk = nvvm.tcgen05_ld(
-                            "32x32b",
-                            nvvm.make_tmem_ptr(o_addr, cutlass.Float32),
-                            num=O_CHUNK,
-                        )
-                        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                        o_scaled = o_chunk * inv_sum
-                        # SELECT the zero for an empty KV range -- see _kv_empty above.
-                        # NB: a plain `for` statement, not a comprehension -- the DSL
-                        # preprocessor only rewrites statement-level range_constexpr
-                        # loops ("range_constexpr should be preprocessed by preprocessor").
-                        _o_elems = []
-                        for _i in cutlass.range_constexpr(O_CHUNK):
-                            _o_elems.append(cutlass.Float32(arith.select(_kv_empty.ir_value(), cutlass.Float32(0.0).ir_value(), o_scaled[_i].ir_value())))
-                        o_scaled = cutlass.Vector.from_elements(tuple(_o_elems), cutlass.Float32)
-                        o_fp16 = o_scaled.to(STORAGE_DTYPE)
-
-                        col_offset_const = (chunk_idx * O_CHUNK) % D_BLOCK_SIZE
-                        block_idx_const = (chunk_idx * O_CHUNK) // D_BLOCK_SIZE
-                        block_offset_const = block_idx_const * TMA_O_GRANU_ELEMS
-                        smem_offset = cutlass.Int32(block_offset_const + col_offset_const) + row_in_tile * cutlass.Int32(D_BLOCK_SIZE)
-
-                        smem_ptr = sO_sub_base.subview(smem_offset).data_ptr()
-                        # mb_o_empty[qs] wait gates the FIRST SMEM store (not the
-                        # earlier TMEM-load loop), keeping TMEM-load/FFMA/cast overlapped
-                        # with TMA-STG draining the prior persistent tile.
-                        if chunk_idx == 0:
-                            bars.mb_o_empty[qs].wait(o_empty_phase, spin=SPIN_RING_WAITS)
-                        if cutlass.const_expr(_M64):
-                            # A dead lane aliases a live lane's row: its store is masked (a warp-divergent branch, accepted on the reference form).
-                            if lane_live:
-                                smem_ptr.store_swizzled(o_fp16, alignment=64, swizzle=_O_SMEM_SWIZZLE)
+                # D128 publishes O first so TMA can drain it while correction
+                # writes Stats. Keep the established Stats-first order for the
+                # D32/D64 flavors, including their bias and key-mask renderings.
+                # Both stages are unrolled: this changes only instruction order,
+                # without duplicating the Stats logic or adding runtime control.
+                for epilogue_stage in cutlass.range_constexpr(2):
+                    if cutlass.const_expr(epilogue_stage == (1 if CFG.TILE_K == CFG.TILE_O == 128 else 0)):
+                        # Convert only the final Stats; -inf padding stays -inf.
+                        if cutlass.const_expr(CFG.STATS_LOG2 and SPLIT_KV == 1):
+                            lse_val = lse_val * cutlass.Float32(1.4426950408889634)
+                        if cutlass.const_expr(CFG.THD_VARLEN):
+                            # THD: q_row_global is sequence-local; LSE is packed [1,QH,T] →
+                            # index [0, head, cu_q[b] + local], bound by per-sequence Q len S_q_b.
+                            _cu = cutlass.make_array_view(seq_kv_lens_tensor)
+                            _cu_q_b = cutlass.Int32(_cu[n_batch + batch_idx])
+                            _s_q_b = cutlass.Int32(_cu[n_batch + batch_idx + cutlass.Int32(1)]) - _cu_q_b
+                            if cutlass.const_expr(lse_tensor is not None):
+                                if q_row_global < _s_q_b:
+                                    lse_arr = cutlass.make_array_view(lse_tensor)
+                                    # The packed ragged Stats buffer is written in the
+                                    # CALLER's declared layout, selected by the STATIC rank
+                                    # compile() baked in: token-major rank-2 [T, QH] (the
+                                    # DEFAULT -- _thd_compile_kwargs only sets head-major
+                                    # when the caller asks) or head-major rank-3
+                                    # [1, QH, head_stride].  Serving only the rank-3 arm
+                                    # would silently transpose every LSE on the common path.
+                                    if cutlass.const_expr(len(lse_tensor.shape) == 2):
+                                        lse_arr[_cu_q_b + q_row_global, row_head_idx] = lse_val
+                                    else:
+                                        if cutlass.const_expr(len(lse_tensor.shape) == 4):
+                                            # rank-4 = per-batch padded Stats (B, QH, s_max, 1) in the declared strides, no ragged offsets
+                                            lse_arr[batch_idx, row_head_idx, q_row_global, 0] = lse_val
+                                        else:
+                                            lse_arr[cutlass.Int32(0), row_head_idx, _cu_q_b + q_row_global] = lse_val
                         else:
-                            smem_ptr.store_swizzled(o_fp16, alignment=64, swizzle=_O_SMEM_SWIZZLE)
+                            if cutlass.const_expr(lse_tensor is not None):
+                                if _row_store:
+                                    lse_arr = cutlass.make_array_view(lse_tensor)
+                                    lse_arr[_partial_batch(batch_idx, split_idx, n_batch), row_head_idx, q_row_global] = lse_val
+                        # Score side outputs: the DENSE, unsplit row (compile() rejects the THD and split builds), the
+                        # same OOB-row guard as the dense LSE store, natural units whatever STATS_LOG2 says (the base-2
+                        # convention is the Stats tensor's alone).  Each store folds out independently on None.
+                        if cutlass.const_expr(score_max_tensor is not None):
+                            if _row_store:
+                                _smax_arr = cutlass.make_array_view(score_max_tensor)
+                                _smax_arr[batch_idx, row_head_idx, q_row_global] = score_max_val
+                        if cutlass.const_expr(score_sum_exp_tensor is not None):
+                            if _row_store:
+                                _ssum_arr = cutlass.make_array_view(score_sum_exp_tensor)
+                                _ssum_arr[batch_idx, row_head_idx, q_row_global] = score_sum_val
 
-                    # fence_proxy needed before TMA reads SMEM written by tcgen05_st (via store_swizzled).
-                    nvvm.fence_proxy("async.shared", space="cta")
+                    if cutlass.const_expr(epilogue_stage == 0):
+                        sO_sub_base = sO[qs].base
 
-                bars.mb_o_full[qs].arrive()
+                        if cutlass.const_expr(_FP32_PARTIALS):
+                            _store_fp32_partial_tile(
+                                o_partial_f32,
+                                tmem_base_epi,
+                                tmem_O_off,
+                                inv_sum,
+                                _kv_empty,
+                                q_row_global < seqlen_q,
+                                _partial_batch(batch_idx, split_idx, n_batch),
+                                q_row_global,
+                                row_head_idx,
+                                CFG.TILE_O,
+                                O_CHUNK,
+                            )
+                            bars.mb_o_empty[qs].wait(o_empty_phase, spin=SPIN_RING_WAITS)
+                        else:
+                            for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O):
+                                o_addr = tmem_base_epi + cutlass.Int32(tmem_O_off + chunk_idx * O_CHUNK)
+                                o_chunk = nvvm.tcgen05_ld(
+                                    "32x32b",
+                                    nvvm.make_tmem_ptr(o_addr, cutlass.Float32),
+                                    num=O_CHUNK,
+                                )
+                                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                                o_scaled = o_chunk * inv_sum
+                                # SELECT the zero for an empty KV range -- see _kv_empty above.
+                                # NB: a plain `for` statement, not a comprehension -- the DSL
+                                # preprocessor only rewrites statement-level range_constexpr
+                                # loops ("range_constexpr should be preprocessed by preprocessor").
+                                _o_elems = []
+                                for _i in cutlass.range_constexpr(O_CHUNK):
+                                    _o_elems.append(
+                                        cutlass.Float32(arith.select(_kv_empty.ir_value(), cutlass.Float32(0.0).ir_value(), o_scaled[_i].ir_value()))
+                                    )
+                                o_scaled = cutlass.Vector.from_elements(tuple(_o_elems), cutlass.Float32)
+                                o_fp16 = o_scaled.to(STORAGE_DTYPE)
 
-                # Publish O before the independent row-stat stores so TMA can
-                # drain O while correction writes Stats. All values and row
-                # predicates still belong to this item; scheduler advancement
-                # and correction completion remain after these stores.
-                # Convert only the final Stats; -inf padding stays -inf.
-                if cutlass.const_expr(CFG.STATS_LOG2 and SPLIT_KV == 1):
-                    lse_val = lse_val * cutlass.Float32(1.4426950408889634)
-                if cutlass.const_expr(CFG.THD_VARLEN):
-                    # THD: q_row_global is sequence-local; LSE is packed [1,QH,T] →
-                    # index [0, head, cu_q[b] + local], bound by per-sequence Q len S_q_b.
-                    _cu = cutlass.make_array_view(seq_kv_lens_tensor)
-                    _cu_q_b = cutlass.Int32(_cu[n_batch + batch_idx])
-                    _s_q_b = cutlass.Int32(_cu[n_batch + batch_idx + cutlass.Int32(1)]) - _cu_q_b
-                    if cutlass.const_expr(lse_tensor is not None):
-                        if q_row_global < _s_q_b:
-                            lse_arr = cutlass.make_array_view(lse_tensor)
-                            # The packed ragged Stats buffer is written in the
-                            # CALLER's declared layout, selected by the STATIC rank
-                            # compile() baked in: token-major rank-2 [T, QH] (the
-                            # DEFAULT -- _thd_compile_kwargs only sets head-major
-                            # when the caller asks) or head-major rank-3
-                            # [1, QH, head_stride].  Serving only the rank-3 arm
-                            # would silently transpose every LSE on the common path.
-                            if cutlass.const_expr(len(lse_tensor.shape) == 2):
-                                lse_arr[_cu_q_b + q_row_global, row_head_idx] = lse_val
-                            else:
-                                if cutlass.const_expr(len(lse_tensor.shape) == 4):
-                                    # rank-4 = per-batch padded Stats (B, QH, s_max, 1) in the declared strides, no ragged offsets
-                                    lse_arr[batch_idx, row_head_idx, q_row_global, 0] = lse_val
+                                col_offset_const = (chunk_idx * O_CHUNK) % D_BLOCK_SIZE
+                                block_idx_const = (chunk_idx * O_CHUNK) // D_BLOCK_SIZE
+                                block_offset_const = block_idx_const * TMA_O_GRANU_ELEMS
+                                smem_offset = cutlass.Int32(block_offset_const + col_offset_const) + row_in_tile * cutlass.Int32(D_BLOCK_SIZE)
+
+                                smem_ptr = sO_sub_base.subview(smem_offset).data_ptr()
+                                # mb_o_empty[qs] wait gates the FIRST SMEM store (not the
+                                # earlier TMEM-load loop), keeping TMEM-load/FFMA/cast overlapped
+                                # with TMA-STG draining the prior persistent tile.
+                                if chunk_idx == 0:
+                                    bars.mb_o_empty[qs].wait(o_empty_phase, spin=SPIN_RING_WAITS)
+                                if cutlass.const_expr(_M64):
+                                    # A dead lane aliases a live lane's row: its store is masked (a warp-divergent branch, accepted on the reference form).
+                                    if lane_live:
+                                        smem_ptr.store_swizzled(o_fp16, alignment=64, swizzle=_O_SMEM_SWIZZLE)
                                 else:
-                                    lse_arr[cutlass.Int32(0), row_head_idx, _cu_q_b + q_row_global] = lse_val
-                else:
-                    if cutlass.const_expr(lse_tensor is not None):
-                        if _row_store:
-                            lse_arr = cutlass.make_array_view(lse_tensor)
-                            lse_arr[_partial_batch(batch_idx, split_idx, n_batch), row_head_idx, q_row_global] = lse_val
-                # Score side outputs: the DENSE, unsplit row (compile() rejects the THD and split builds), the
-                # same OOB-row guard as the dense LSE store, natural units whatever STATS_LOG2 says (the base-2
-                # convention is the Stats tensor's alone).  Each store folds out independently on None.
-                if cutlass.const_expr(score_max_tensor is not None):
-                    if _row_store:
-                        _smax_arr = cutlass.make_array_view(score_max_tensor)
-                        _smax_arr[batch_idx, row_head_idx, q_row_global] = score_max_val
-                if cutlass.const_expr(score_sum_exp_tensor is not None):
-                    if _row_store:
-                        _ssum_arr = cutlass.make_array_view(score_sum_exp_tensor)
-                        _ssum_arr[batch_idx, row_head_idx, q_row_global] = score_sum_val
+                                    smem_ptr.store_swizzled(o_fp16, alignment=64, swizzle=_O_SMEM_SWIZZLE)
+
+                            # fence_proxy needed before TMA reads SMEM written by tcgen05_st (via store_swizzled).
+                            nvvm.fence_proxy("async.shared", space="cta")
+
+                        bars.mb_o_full[qs].arrive()
 
             stat_full_phase = stat_full_phase ^ 1
             o_empty_phase = o_empty_phase ^ 1
