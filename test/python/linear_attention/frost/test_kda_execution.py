@@ -33,6 +33,13 @@ def blackwell():
         pytest.skip("requires SM100-family Frost KDA")
 
 
+def _open_chain_floor(monkeypatch):
+    """These tests exercise the chain itself, so it must chain below the KDA ``chain_min_tokens`` floor too."""
+    from cudnn.linear_attention.frost.common import piece_chain
+
+    monkeypatch.setattr(piece_chain, "chain_min_tokens", lambda **_: 0)
+
+
 def make_plan(total, heads, *, backward, invariant):
     """Build and bind a native KDA forward or backward execution plan."""
     hq, hk, hv = heads
@@ -73,6 +80,8 @@ def execute(plan, values, outputs, workspace):
 @pytest.mark.parametrize("schedule", ["uncut", "chain"])
 def test_frost_native_cache_reuses_kda_across_shapes(monkeypatch, backward, schedule):
     """One compiled native host is reused across dynamic token/head counts."""
+    if schedule == "chain":
+        _open_chain_floor(monkeypatch)
     family = schedule
     direction = "backward" if backward else "forward"
     module = importlib.import_module(f"cudnn.linear_attention.frost.kernel.kda_{family}_{direction}_f16")
@@ -370,8 +379,9 @@ def test_kda_warm_chain_binds_current_operands(optional, safe_gate, checkpoint):
         assert int(cold[-1]) == int(warm[-1]) == stream
 
 
-def test_kda_warm_chain_new_workspace_stream_and_capture():
+def test_kda_warm_chain_new_workspace_stream_and_capture(monkeypatch):
     """The warm launch uses new storage and captures on the caller's stream."""
+    _open_chain_floor(monkeypatch)
     plan, values, outputs, scratch, workspace = make_plan(512, (2, 2, 2), backward=False, invariant=False)
     assert plan.chain
     execute(plan, values, outputs, workspace)
