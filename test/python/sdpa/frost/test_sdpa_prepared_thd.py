@@ -311,8 +311,10 @@ def test_rubin_ragged_pack_rebind_and_changed_lengths_replay(dtype, stats_layout
     assert api._k_mod.THD_INITIAL_WAVES == 2
     resident = max(1, torch.cuda.get_device_properties(DEV).multi_processor_count // api._k_mod.CGA_SIZE)
     assert api._thd_plan().units <= 2 * resident
-    if geometry == "two_wave_pair" and resident < 128 <= 2 * resident:
-        assert api._thd_plan().units == 128
+    if geometry == "two_wave_pair":
+        numerator, denominator = api._k_mod.THD_INITIAL_WORK_RATIO
+        initial_limit = resident * numerator // denominator
+        assert api._thd_plan().units == (128 if 128 <= initial_limit else resident)
     ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
 
     def inputs(seed):
