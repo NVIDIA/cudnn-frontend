@@ -92,7 +92,14 @@ class _FrostSdpaPlan(CompiledPlan):
                         f"{self._name}: needs a {self._workspace_bytes}-byte workspace, got {nbytes} bytes (size it with graph.get_workspace_size())"
                     )
                 device = getattr(ctx.workspace, "__dlpack_device__", None)
-                if device is not None and tuple(device()) != (2, self._prepared.spec.device_index):
+                if device is None:
+                    # Python-only producers can expose placement without DLPack.
+                    # Bare addresses still carry no observable device contract.
+                    observed = getattr(ctx.workspace, "device", None)
+                    kind = getattr(observed, "type", None)
+                    if kind is not None and (kind != "cuda" or observed.index != self._prepared.spec.device_index):
+                        raise ValueError(f"{self._name}: workspace must be on CUDA device {self._prepared.spec.device_index}")
+                elif tuple(device()) != (2, self._prepared.spec.device_index):
                     raise ValueError(f"{self._name}: workspace must be on CUDA device {self._prepared.spec.device_index}")
             cu_stream = self._stream_handle(ctx.stream)
             stream_int = int(cu_stream) if cu_stream is not None else 0
