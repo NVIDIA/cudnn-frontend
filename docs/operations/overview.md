@@ -58,6 +58,7 @@ The experimental API catalog includes:
 - [Query Sparse Attention (QSA): attention and indexer entry points](/operations/sparse_attention/qsa)
 - [QSA training from existing token indices](/operations/sparse_attention/qsa/qsa_indexed)
 - [DeepSeek Sparse Attention (DSA)](/operations/sparse_attention/dsa)
+- [Pooled DSA](/operations/sparse_attention/pooled_dsa)
 - [Flex Attention](/operations/sparse_attention/flex_attention) and [mask plan design](/operations/sparse_attention/flex_attention/flex_attention_design)
 - [HSTU Attention (Blackwell SM100/SM103)](/operations/sparse_attention/hstu_attention)
 - [HSTU LayerNorm-Multiply-SiLU-Dropout (LMSD)](/operations/sparse_attention/hstu_lmsd)

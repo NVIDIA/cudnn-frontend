@@ -22,6 +22,9 @@ _LAZY_EXPORTS = {
     "top_k_forward_jax": ("cudnn.deepseek_sparse_attention.jax_api", "top_k_forward_jax"),
     "sparse_attention_forward_jax": ("cudnn.deepseek_sparse_attention.jax_api", "sparse_attention_forward_jax"),
     "sparse_attention_backward_jax": ("cudnn.deepseek_sparse_attention.jax_api", "sparse_attention_backward_jax"),
+    "pooled_cache_update_forward": ("cudnn.deepseek_sparse_attention.pooled.api", "pooled_cache_update_forward"),
+    "pooled_indexer_forward": ("cudnn.deepseek_sparse_attention.pooled.api", "pooled_indexer_forward"),
+    "pooled_expand_forward": ("cudnn.deepseek_sparse_attention.pooled.api", "pooled_expand_forward"),
 }
 
 __all__ = list(_LAZY_EXPORTS)

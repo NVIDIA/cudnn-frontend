@@ -58,6 +58,9 @@ navigation:
           - page: DeepSeek Sparse Attention (DSA)
             path: ../../operations/sparse_attention/dsa.md
             slug: dsa
+          - page: Pooled DSA
+            path: ../../operations/sparse_attention/pooled_dsa.md
+            slug: pooled_dsa
           - section: Query Sparse Attention (QSA)
             path: ../../operations/sparse_attention/qsa.md
             slug: qsa
