@@ -79,8 +79,9 @@ Numbered so reviews can cite them; the list grows — append, never renumber.
   warmup and checks that per-call scale changes do not modify the plan.
 - **Workspace placement checks also apply to Python-only producers.** A
   supported producer can expose `.device` without `__dlpack_device__`; validate
-  that observable placement before a prepared launch. A bare integer address
-  has no such metadata. Use a launch recorder for invalid-device regression
+  that observable placement before a prepared launch. Reject present malformed
+  or partial declarations rather than treating them as absent. A bare integer
+  address has no such metadata. Use a launch recorder for invalid-device regression
   controls so an unfixed guard cannot poison the CUDA context. Detector:
   `test_python_workspace_device_is_checked_before_launch`.
 

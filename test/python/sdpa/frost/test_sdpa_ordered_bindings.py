@@ -31,6 +31,8 @@ def test_frost_ordered_overrides_follow_mutable_values(frost_attention_case):
 
 @pytest.mark.parametrize("ordered", [False, True])
 def test_python_workspace_device_is_checked_before_launch(frost_attention_case, monkeypatch, ordered):
+    from types import SimpleNamespace
+
     import torch
 
     graph, tensors, handle, _ = frost_attention_case
@@ -70,7 +72,19 @@ def test_python_workspace_device_is_checked_before_launch(frost_attention_case, 
     launches = []
     with monkeypatch.context() as patch:
         patch.setattr(plan._prepared, "execute", lambda *args: launches.append(args))
-        for device in (torch.device("cpu"), torch.device("cuda", workspace.device.index + 1)):
+        # An absent declaration retains the raw-pointer caller contract.
+        del producer.device
+        call()
+        assert len(launches) == 1
+        launches.clear()
+        for device in (
+            "cpu",
+            torch.device("cpu"),
+            torch.device("cuda", workspace.device.index + 1),
+            SimpleNamespace(type="cuda"),
+            SimpleNamespace(index=workspace.device.index),
+            None,
+        ):
             producer.device = device
             with pytest.raises(ValueError, match="workspace must be on CUDA device"):
                 call()

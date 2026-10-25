@@ -8,6 +8,8 @@ from cudnn.engines.base import CompiledPlan, ExecutionContext
 if TYPE_CHECKING:
     from cudnn._pygraph import pygraph
 
+_MISSING_DEVICE = object()
+
 
 def _check_workspace(workspace, required: int, name: str) -> None:
     """A FROST executor carves its scratch out of the CALLER's workspace: no
@@ -95,9 +97,10 @@ class _FrostSdpaPlan(CompiledPlan):
                 if device is None:
                     # Python-only producers can expose placement without DLPack.
                     # Bare addresses still carry no observable device contract.
-                    observed = getattr(ctx.workspace, "device", None)
-                    kind = getattr(observed, "type", None)
-                    if kind is not None and (kind != "cuda" or observed.index != self._prepared.spec.device_index):
+                    observed = getattr(ctx.workspace, "device", _MISSING_DEVICE)
+                    if observed is not _MISSING_DEVICE and (
+                        getattr(observed, "type", None) != "cuda" or getattr(observed, "index", None) != self._prepared.spec.device_index
+                    ):
                         raise ValueError(f"{self._name}: workspace must be on CUDA device {self._prepared.spec.device_index}")
                 elif tuple(device()) != (2, self._prepared.spec.device_index):
                     raise ValueError(f"{self._name}: workspace must be on CUDA device {self._prepared.spec.device_index}")
