@@ -49,6 +49,7 @@ from cudnn.sdpa.fwd.config_sm90 import (
     head_dims_mismatch as _sm90_head_dims_mismatch,
 )
 from cudnn.sdpa.fwd.config_sm107 import SM107_F16_THD_SHAPES as _SM107_F16_THD_SHAPES
+from cudnn.sdpa.fwd.config_sm107 import supports_native_d128_dense_partial_pack
 from cudnn.sdpa.fwd.config_sm107 import SM107_F16_SMALL_D_SHAPES as _SM107_F16_SMALL_D_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import SM107_SMALL_D_CGAS as _SM107_SMALL_D_CGAS
 from cudnn.sdpa.fwd.config_sm107 import sm107_small_tile_leg as _sm107_small_tile_leg
@@ -2512,8 +2513,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # half d256 graph packs on cc 10.7 whatever its cache form; every other Rubin half
             # packing rides the paged / packed-split D128 pipelines.  engines.mismatch mirrors this
             # exemption (d256_decode_tile_selected); keep the two in lockstep.
-            # Dense d128 half packs on the shared SM100 prefill body (the loader's packed arm, issue #1472); the pre-folded
-            # scale declines on that body below (routing), every other nonpaged half graph stays on the Rubin sibling.
+            # Dense d128 half packs on native SM107 prefill at CGA2 (shared decode at CGA1).
+            # Its existing pre-folded-scale decline remains below.
             self._not_implemented_error_if(
                 self._device_cc == (10, 7)
                 and not self._fp8
@@ -2548,8 +2549,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 "Rubin paged D128 cga1 unsplit, or Rubin paged D256 cga2 unsplit",
             )
             # Partial PackGQA (the largest divisor of the group that divides the
-            # tile) is wired in SM100 d128 / d256 half, native Rubin ragged D128,
-            # and the qualified Rubin paged D128 routes. Other legs retain whole-group admission.
+            # tile) is wired in SM100 d128 / d256 half and the qualified Rubin
+            # native and paged D128 routes. Other legs retain whole-group admission.
             _partial = (
                 (not self._fp8 and self._device_cc != (10, 7) and self.flavor in _SM100_PARTIAL_PACK_GQA_FLAVORS)
                 or self._rubin_shared_thd_pack_leg()
@@ -2562,6 +2563,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     cga=self.cga,
                     split_kv=self.split_kv,
                 )
+                or supports_native_d128_dense_partial_pack(self.flavor, device_cc=self._device_cc, fp8=self._fp8, thd=self.thd, paged=self.paged, cga=self.cga)
             )
             # The d256 DECODE tile packs the WHOLE group whenever it fits its Q tile
             # (HEADS_PER_TILE = QH_PER_KH; 24/2 puts its 12 heads in the 16-row tile, four

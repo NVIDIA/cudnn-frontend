@@ -1669,6 +1669,14 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                     cga=knobs.cga,
                     split_kv=knobs.split_kv or 1,
                 )
+                or _config_sm107.supports_native_d128_dense_partial_pack(
+                    _selected_d_shape(capabilities, facts, knobs),
+                    device_cc=facts.device_cc,
+                    fp8=facts.is_fp8 or facts.is_mxfp8,
+                    thd=facts.thd,
+                    paged=facts.has_paged_kv,
+                    cga=knobs.cga,
+                )
             )
             # The decode tile packs the WHOLE group into its 16-row Q tile whatever tile_m (24/2: 12 live
             # rows + 4 zero tail rows), so the prefill tiles' divisibility rule does not apply to a Rubin

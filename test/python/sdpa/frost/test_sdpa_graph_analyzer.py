@@ -1058,8 +1058,9 @@ def test_pack_gqa_partial_d_shapes_in_lockstep_with_the_adapter():
     # Capabilities.pack_gqa_partial_d_shapes as a module tuple because the
     # adapter has no engine row in hand when it validates a knob request.  Pin
     # the two together so the gate cannot drift: the f16 SM100 row declares
-    # exactly the adapter's flavors, and no other row (fp8 / mxfp8, the cc 10.7
-    # line, SM120) declares partial packing -- the adapter excludes those too.
+    # exactly the adapter's flavors. Other rows keep this static field unset;
+    # native SM107 D128 uses a shared route predicate because dense CGA1 still
+    # requires whole groups. Quantized and SM120 routes retain their gates.
     from cudnn.sdpa.fwd.api_dsl import _SM100_PARTIAL_PACK_GQA_FLAVORS
 
     by_name = {s.name: s.capabilities for s in engines.ENGINE_SPECS}

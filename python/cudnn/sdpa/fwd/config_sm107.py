@@ -50,6 +50,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace as dataclasses_replace
 from typing import Optional, Tuple
 
+
 from cudnn.frost.tile_dsl.constants import (
     MASK_CAUSAL,
     MASK_NONE,
@@ -377,6 +378,16 @@ SM107_F16_SMALL_D_SHAPES = frozenset({(32, 32), (64, 64)})
 # = a 32-byte MN-major swizzle atom, which no shipped kernel runs -- declined until measured (a cga2 request at D <= 32 lands
 # on the 64-wide tile, the smallest covering one validated at that width).
 SM107_SMALL_D_CGAS = {(32, 32): frozenset({1}), (64, 64): frozenset({1, 2})}
+
+
+def supports_native_d128_dense_partial_pack(d_shape, *, device_cc, fp8, thd, paged, cga):
+    """Dense half graphs whose selected flavor uses native partial PackGQA.
+
+    The two-CTA D128 prefill body packs a divisor of the head ratio, including
+    envelope and split plans. The single-CTA dense route is a different kernel.
+    Share this admission boundary between graph and standalone lowering.
+    """
+    return device_cc == (10, 7) and not fp8 and not thd and not paged and d_shape == (128, 128) and cga in (None, 2)
 
 
 def sm107_small_tile_leg(
