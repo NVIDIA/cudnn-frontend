@@ -322,9 +322,10 @@ declaration and bounded MHA / group 2 showed no material gap and still trail. Fl
 ``max_total_seq_len_q`` unset (capacity b * max_q), so GQA 4 / 8 lead there too. Measured on cc 10.0 only.
 
 SM100 paged bf16 d128 full squares (2026-10-25, ``_sm100_paged_full_square``): Q = KV per graph (full paged prefill),
-b 1-4, page 16, head-major in-page K, causal, no window / sink. GQA 4 / 8 / 16 lead for 1024 <= S <= 8192, MHA and
-group 2 for 1024 <= S <= 2048. A legal-pool sweep over mixed-length full prefills found FROST's first plan ahead of
-engine 10 on every such shape except a single 4096-token group-2 square, which keeps the backend.
+b 1-4, page 16, head-major in-page K, causal, no window / sink: GQA 4 / 8 / 16 lead for 1024 <= S <= 8192. A
+legal-pool sweep over mixed-length full prefills found FROST's first plan ahead of engine 10 on these shapes, and a
+separately frozen holdout confirmed every GQA case in the box. MHA and group 2 keep the backend: an MHA holdout case at
+S = 2048 lost and group 2 was not covered.
 
 Rows with no measurement (SM80, SM100 mxfp8) keep the historical order (LEAD); they are still
 opt-in, so the order is only observable with ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``.
@@ -785,7 +786,6 @@ def _in_paged_d256_prefill_domain(facts) -> bool:
 def _sm100_paged_full_square(facts) -> bool:
     """cc 10.0 paged bf16 d128 full prefill (Q = KV), page 16, head-major in-page K (module docstring)."""
     group = facts.h_q // facts.h_kv if facts.h_kv and facts.h_q % facts.h_kv == 0 else 0
-    max_s = 8192 if group in (4, 8, 16) else 2048 if group in (1, 2) else 0
     return (
         facts.device_cc == (10, 0)
         and facts.has_paged_kv
@@ -793,7 +793,8 @@ def _sm100_paged_full_square(facts) -> bool:
         and (facts.d_qk, facts.d_v) == (128, 128)
         and 1 <= facts.b <= SM100_PAGED_GQA16_MAX_B
         and facts.s_q == facts.s_kv
-        and 1024 <= facts.s_q <= max_s
+        and group in (4, 8, 16)
+        and 1024 <= facts.s_q <= 8192
         and facts.page_size == 16
         and facts.causal
         and facts.window_left is None
