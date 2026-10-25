@@ -5,13 +5,12 @@
 import json
 import os
 from pathlib import Path
-import subprocess
-import sys
 
 import cudnn
 import pytest
 
 from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell
+from prepared_bwd_cache_utils import run_artifact_child
 
 pytestmark = [pytest.mark.L0, requires_dsl, requires_pre_rubin_blackwell]
 
@@ -65,13 +64,11 @@ print(json.dumps(compiled_cache.stats()))
     env.pop("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", None)
     results = []
     for reload in (0, 1):
-        result = subprocess.run(
-            [sys.executable, "-c", child, str(Path(__file__).parent), cudnn.__file__, dtype, str(reload)],
+        result = run_artifact_child(
+            child,
+            [str(Path(__file__).parent), cudnn.__file__, dtype, str(reload)],
             env=env,
             cwd=tmp_path,
-            capture_output=True,
-            text=True,
-            timeout=300,
         )
         assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-5000:]
         results.append(json.loads(result.stdout.strip().splitlines()[-1]))

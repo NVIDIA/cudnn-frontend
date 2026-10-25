@@ -906,7 +906,7 @@ def test_sm107_f16_split_coverage_and_pack_gqa_gate():
 def test_sm107_dense_d128_shared_legs_admission():
     """Issue #1472: preserve the cc 10.7 dense D128 half admission for packed native prefill at CGA2 and shared decode
     at CGA1. The pre-folded scale retains its existing unpacked domain; dense D256 PackGQA stays declined,
-    THD nonpaged keeps the cga2 prefill pipeline, and the standalone cga domain mirrors the row (keep the three in
+    THD nonpaged D128 admits both native prefill widths, and the standalone cga domain mirrors the row (keep the three in
     lockstep).  An MHA PackGQA pin is the bit-exact unpacked fold (PACK_G = 1), honorable as on the SM100 row; the
     heuristics never propose it."""
     from cudnn.sdpa.fwd import engines
@@ -921,7 +921,7 @@ def test_sm107_dense_d128_shared_legs_admission():
     assert engines.mismatch(caps, _f16_facts(h_kv=2, d_qk=256, d_v=256), pack) is not None
     assert engines.mismatch(caps, _f16_facts(h_kv=2, s_q=4), cga1) is None
     assert engines.mismatch(caps, _f16_facts(s_q=4), cga1) is None, "MHA rides the decode tile unpacked"
-    assert "outside this engine's domain" in engines.mismatch(caps, _f16_facts(h_kv=2, thd=True, padded=True), cga1)
+    assert engines.mismatch(caps, _f16_facts(h_kv=2, thd=True, padded=True), cga1) is None
     assert "outside this engine's domain" in engines.mismatch(caps, _f16_facts(h_kv=2, attn_scale_prefolded=True), cga1)
     assert supported_cgas_for((128, 128), fp8=False, device_cc=(10, 7)) == (1, 2)
 
@@ -970,22 +970,25 @@ def test_sm107_paged_d256_pack_gqa_support_contract(dtype_name, group):
 
 @pytest.mark.parametrize("dtype_name", ["HALF", "BFLOAT16"])
 @pytest.mark.parametrize("group", [2, 4, 6, 8, 12, 16])
-def test_sm107_nonpaged_d128_thd_pack_gqa_contract(dtype_name, group):
-    """Explicit unsplit ragged packing serves both half types, including partial groups."""
+@pytest.mark.parametrize("cga", [1, 2])
+def test_sm107_nonpaged_d128_thd_pack_gqa_contract(dtype_name, group, cga):
+    """Both native CTA widths serve unsplit ragged packing, including partial groups."""
     import cudnn
     from cudnn.sdpa.fwd import engines
 
     dt = getattr(cudnn.data_type, dtype_name)
     facts = _f16_facts(h_q=group * 2, h_kv=2, dtype=dt, dtype_o=dt, thd=True, padded=True)
     caps = _caps("sdpa_fwd_prefill_sm107")
-    knobs = engines.SdpaFwdKnobs(cga=2, split_kv=1, pack_gqa=True)
+    knobs = engines.SdpaFwdKnobs(cga=cga, split_kv=1, pack_gqa=True)
     for extra in ({}, dict(has_sink=True), dict(wants_stats=True, shape_overrides=True, max_total_seq_len_q=facts.b * facts.s_q)):
         assert engines.mismatch(caps, dataclasses.replace(facts, **extra), knobs) is None
     # Native packing retains the existing public pre-folded-scale admission boundary.
-    assert "attn_scale_prefolded" in engines.mismatch(caps, dataclasses.replace(facts, attn_scale_prefolded=True), knobs)
+    why = engines.mismatch(caps, dataclasses.replace(facts, attn_scale_prefolded=True), knobs)
+    assert why is not None
+    assert ("attn_scale_prefolded" if cga == 2 else "outside this engine's domain") in why
     for shape in ((192, 128), (256, 256), (512, 512)):
         assert engines.mismatch(caps, dataclasses.replace(facts, d_qk=shape[0], d_v=shape[1]), knobs) is not None
-    assert engines.mismatch(caps, facts, dataclasses.replace(knobs, cga=1)) is not None
+    assert engines.mismatch(caps, facts, dataclasses.replace(knobs, cga=4)) is not None
 
 
 def test_sm107_fp8_pack_gqa_is_d128_only():
@@ -5669,7 +5672,8 @@ def test_rubin_shared_dense_legs_decline_the_prefolded_scale_on_the_adapter(monk
     """Adapter twins of the dense cc 10.7 legs (CPU-side, the device pinned to cc 10.7): dense d128 half at cga=1 and
     PackGQA at cga2 are ADMITTED (template_params carries the width / packing verbatim) and both DECLINE the pre-folded
     scale (the shared bodies apply the scale in-kernel: a typed NotImplementedError, so the plan walk moves to the Rubin
-    cga2 body, which keeps the fold), while THD (ragged) at cga=1 keeps the existing decode-tile decline."""
+    cga2 body, which keeps the fold). Native D128 THD prefill at cga=1 admits packed and unpacked inputs without
+    the pre-folded scale."""
     import torch
 
     _fake_cc(monkeypatch, (10, 7))
@@ -5686,8 +5690,12 @@ def test_rubin_shared_dense_legs_decline_the_prefolded_scale_on_the_adapter(monk
     assert _gate_api(**ragged_pack).check_support()
     with pytest.raises(NotImplementedError, match="apply the scale in-kernel"):
         _gate_api(**ragged_pack, softmax_scale_prefolded=True, scale_softmax=None).check_support()
-    with pytest.raises(NotImplementedError, match="decode tile"):
-        _gate_api(**common, thd=True, seq_kv_lens_present=True, cga=1, split_kv=1).check_support()
+    for packed in (False, True):
+        api = _gate_api(**common, thd=True, seq_kv_lens_present=True, cga=1, split_kv=1, pack_gqa=packed)
+        assert api.check_support() and api.template_params().cta_mma == 1
+        assert api.template_params().pack_gqa is packed
+    with pytest.raises(NotImplementedError, match="requires an admitted"):
+        _gate_api(**common, thd=True, seq_kv_lens_present=True, cga=1, split_kv=1, softmax_scale_prefolded=True, scale_softmax=None).check_support()
 
 
 def test_softmax_arms_tag_reads_the_module_constants_and_the_stats_gate():

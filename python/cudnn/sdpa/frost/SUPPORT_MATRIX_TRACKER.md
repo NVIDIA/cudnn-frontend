@@ -2661,8 +2661,8 @@ binder is required; older extensions decline this new domain.
 Packed NH/HN Stats remain optional and may use ln or log2. Shape overrides
 require the existing positive bounded packed-Q capacity. Padded Stats, sinks,
 fused gates, quantized inputs and other head dimensions remain outside this
-addition. Nonpaged D128 single-CTA unsplit is not admitted. Rubin's unsplit
-nonpaged half PackGQA remains declined.
+addition. The separate native SM107 D128 unsplit route supports nonpaged THD
+with CGA1 or CGA2 and PackGQA; those plans do not use this split/combine path.
 
 The existing nonpaged first-wave split rule additionally selects D128 on
 SM100/SM103 FP16/BF16 graphs, fixed or bounded-override, with or without packed
@@ -2717,6 +2717,18 @@ partition on average; the final partition may contain a shorter tail. A full
 first wave keeps the unsplit plan. Packed Stats and bounded shape overrides
 use the same declared envelope; other requests retain their existing policy.
 
+### SM107 dense D128 partial PackGQA
+
+Explicit packed CGA2 plans on the native half D128 prefill body admit head
+ratios that share a factor with the 128-row tile (for example, G6 packs two
+heads per token and G12 packs four). This includes the existing D128 envelope
+and dense split-KV paths. Graph and standalone admission use one predicate;
+the native kernel addresses each subgroup without a gather or layout copy.
+Stats and sinks retain the original query-head coordinates. The existing
+prefolded-scale and sink-plus-split restrictions remain. Dense CGA1, paged
+and quantized partial packing retain their prior admission. This extension
+does not change automatic proposal or default ordering.
+
 ### SM107 paged D128 half partial PackGQA
 
 Exact D128/V128 FP16/BF16 paged THD also admits explicit partial PackGQA on
@@ -2769,7 +2781,10 @@ depth, B128 64/8 Q8 KV2056): the cc 10.7 half row ran the 512-row two-CTA Rubin 
 heuristics' own 21-KV-tile model) paid 8192 times -- 1236 us against the backend's 802 us default plan on the
 board (216 SMs, cuDNN 9.26.0.51, CUDA-graph replay, kernel time).
 
-**PackGQA on dense D128 half graphs.** A dense (not THD, not paged) cc 10.7 half graph on the (128, 128) flavor
+**Original shared-body PackGQA route on dense D128 half graphs.** This paragraph records the issue #1472
+implementation; native SM107 D128 CGA2 packing now supersedes its shared prefill body and admits explicit
+partial packing, including the existing D128 envelope. The shared decode body retains its whole-group
+admission. In the original implementation, a dense (not THD, not paged) cc 10.7 half graph on the (128, 128) flavor
 -- the d64 envelope included -- without the pre-folded scale lowers its `PACK_GQA=1` plans at `TILE_CGA_M=2` onto
 the shared SM100 prefill body (`sm100/prefill_d128_f16.py`, CfgD128 at cga2, 192 KiB, inside the version-0
 descriptor window; loader tag `sdpa_fwd_sm107_d128_packed`), exactly as the paged legs borrow it: the Rubin
@@ -2778,8 +2793,9 @@ runs. `engines.rubin_dense_d128_shared_leg` is the predicate (twin `SdpaFwdDslSm
 `heuristics._pack_gqa_eligible` packs such graphs, `engines.mismatch` and the adapter's PackGQA gate admit the pin,
 the adapter's cc 10.7 "split_kv > 1 with PackGQA" clause is lifted for these legs (a heuristic-listed packed split
 must build -- honored-or-never-listed), and the pre-folded scale declines on them (the shared bodies apply the
-scale in-kernel; such graphs keep the Rubin body). Dense D256 PackGQA, partial PackGQA (96/8 -> 4) and MHA packing
-as a proposal stay out (an MHA PackGQA pin is the bit-exact unpacked fold, honorable as on the SM100 row).
+scale in-kernel; such graphs keep the Rubin body). Dense D256 PackGQA and partial PackGQA (96/8 -> 4)
+were outside that original shared-body route. MHA packing remains absent from automatic proposals
+(an explicit MHA PackGQA pin is the bit-exact unpacked fold, honorable as on the SM100 row).
 
 **The shared decode tile on dense D128 half graphs.** The same row now carries two tiles behind `TILE_CGA_M` on the
 (128, 128) flavor, as the SM100 row does (`cgas_by_d_shape`): cga2 the Rubin prefill pipeline (512 rows per two-CTA

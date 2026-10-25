@@ -188,7 +188,7 @@ def test_paged_split_proposal_preserves_selected_packing(monkeypatch, packed, ba
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107") if d == 256 else SPEC
     facts = _paged_split_facts(b=batch, h_q=h_q, h_kv=h_kv, d_qk=d, d_v=d, device_cc=device_cc, wants_stats=wants_stats)
-    monkeypatch.setattr(heur, "paged_thd_split_choice", lambda caps, facts: (3, packed), raising=False)
+    monkeypatch.setattr(heur, "paged_thd_split_choice", lambda caps, facts, **_: (3, packed), raising=False)
     selected = heur._knob_sets(spec, facts)[0]
     assert (selected.cga, selected.split_kv, selected.pack_gqa) == (cga, 3, packed)
     assert mismatch(spec.capabilities, facts, selected) is None
@@ -307,7 +307,11 @@ def test_nonpaged_d128_split_explicit_contract(device_cc, pack_gqa, monkeypatch)
     facts = _mla_split_facts(d_qk=128, h_q=8, h_kv=2, device_cc=device_cc)
     knobs = heur.SdpaFwdKnobs(cga=1, split_kv=3, pack_gqa=pack_gqa)
     assert mismatch(spec.capabilities, facts, knobs) is None
-    assert mismatch(spec.capabilities, facts, replace(knobs, split_kv=1)) is not None
+    unsplit = mismatch(spec.capabilities, facts, replace(knobs, split_kv=1))
+    if device_cc == (10, 7):
+        assert unsplit is None  # Native D128 THD prefill also admits explicit CGA1.
+    else:
+        assert unsplit is not None
     for invalid in (replace(facts, has_sink=True), replace(facts, has_epilogue_gate=True), replace(facts, d_qk=256, d_v=256)):
         assert mismatch(spec.capabilities, invalid, knobs) is not None
     previous = type("PreviousNativeBinder", (), {"supports_nonpaged_packed_split": True, "supports_paged_packed_split": True})
@@ -410,7 +414,8 @@ def test_sm107_paged_cga1_domain_is_distinct_from_dense_and_quantized(monkeypatc
     facts = _paged_split_facts(device_cc=(10, 7), device_sm_count=204)
     for packing in (False, True):
         assert mismatch(spec.capabilities, facts, heur.SdpaFwdKnobs(cga=1, split_kv=1, pack_gqa=packing)) is None
-    for other in (replace(facts, has_paged_kv=False), replace(facts, thd=False), replace(facts, d_qk=256, d_v=256), replace(facts, is_fp8=True)):
+    assert effective_cgas(spec.capabilities, replace(facts, has_paged_kv=False, page_size=0), 1) == frozenset({1, 2})
+    for other in (replace(facts, thd=False), replace(facts, d_qk=256, d_v=256), replace(facts, is_fp8=True)):
         assert 1 not in effective_cgas(spec.capabilities, other, 1)
     # dense d128: cga1 is the shared decode tile (issue #1472); dense PAGED queries above stay on cga2 (not wired on cc 10.7)
     assert 1 in effective_cgas(spec.capabilities, replace(facts, thd=False, has_paged_kv=False, page_size=0), 1)

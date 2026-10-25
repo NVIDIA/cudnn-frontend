@@ -2263,8 +2263,7 @@ def _prefer_thd_pack_gqa(caps: Capabilities, facts) -> bool:
         # (packed matched or beat unpacked on all 72 measured cases, e.g. 1.58 -> 0.94). So does cc 10.7
         # paged THD with GQA16 (216 SMs, cuDNN 9.26 / 9.27, CUDA-graph replay, with or without a sink): unpacked
         # cga2 2.8 ms against the packed set's 0.22 ms at b128 64/4 q 1 / 4 / 8 KV 2k (page 16 and 128), 184 vs 43 us at b24 mixed.
-        and facts.h_q // facts.h_kv
-        in ((2, 4, 8, 16) if _sm100_f16(caps, facts) and not facts.has_paged_kv else (4, 8, 16) if _sm107_paged_half(caps, facts) else (4, 8))
+        and facts.h_q // facts.h_kv in ((2, 4, 8, 16) if _sm100_f16(caps, facts) and not facts.has_paged_kv else (4, 8, 16))
     )
 
 
@@ -2695,14 +2694,18 @@ def _d128_thd_split_wave_choice(facts, *, extra_waves: int = 1) -> Tuple[int, bo
     return 1, False
 
 
-def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
+SM107_PAGED_PREFILL_SPLIT_WAVES = 2  # Rubin paged d128 GQA (group >= 4) split budget past one Q tile, in waves of SMs
+
+
+def paged_thd_split_choice(caps: Capabilities, facts, *, first_wave: bool = False) -> Tuple[int, bool]:
     """Measured bounded-graph (split count, packing); one keeps the existing plan.
 
     Include batch in the grid estimate so multi-request chunks do not receive
-    the split budget of an underfilled single request. Rubin qualification
-    retains the first-wave budget for larger batches and multi-tile queries.
-    Small-batch one-tile prefixes can use up to three waves when no first-wave
-    split fits. Blackwell also admits
+    the split budget of an underfilled single request. On Rubin, GQA (group >= 4)
+    prefill chunks past one Q tile get a two-wave budget; MHA, group 2 and one-tile
+    queries keep the first-wave budget. Small-batch one-tile prefixes can use up to
+    three waves when no first-wave split fits. ``first_wave`` scores Rubin with the first-wave budget only (the runner
+    listed after the default; a mixed-length KV batch can lose with fewer partials). Blackwell also admits
     GQA16 and KV lengths through 32K with the same physical-grid score and
     bounded partial workspace, excluding splits with more waves than partitions.
     """
@@ -2717,7 +2720,7 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
         and 4 <= facts.h_q <= 64
         and facts.h_kv > 0
         and facts.h_q % facts.h_kv == 0
-        and facts.h_q // facts.h_kv in ((1, 2, 4, 8, 16) if caps.sm_lo == 100 else (1, 2, 4, 8))
+        and facts.h_q // facts.h_kv in (1, 2, 4, 8, 16)
         and facts.page_size in ((16, 128) if caps.sm_lo == 100 else (16,))
         and facts.causal
         and facts.bottom_right
@@ -2742,8 +2745,8 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
             if waves > splits:
                 return 1, False
         return splits, pack
-    # Retain Rubin's first-wave budget, using the same declared packed-token
-    # capacity bound as Blackwell. Never read runtime sequence lengths here.
+    # Rubin budget from the same declared packed-token capacity bound as Blackwell.
+    # Never read runtime sequence lengths here.
     kv_tiles = _ceil_div(facts.s_kv, 128)
     sm_count = facts.device_sm_count or 128
     choices = []
@@ -2752,8 +2755,11 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
         units = _d128_thd_split_units(facts, group)
         if not units:
             continue
-        # Keep four KV tiles per partition to amortize setup/combine.
-        budget = min(16, max(1, sm_count // units), max(1, kv_tiles // 4))
+        # Keep four KV tiles per partition to amortize setup/combine. Past one Q tile the declared capacity
+        # overstates mixed-length GQA units, so those chunks get a two-wave budget; MHA / group 2 keep one wave.
+        prefill_gqa = facts.h_q // facts.h_kv >= 4 and min(facts.s_q, facts.max_total_seq_len_q or facts.s_q) > 128
+        waves = SM107_PAGED_PREFILL_SPLIT_WAVES if prefill_gqa and not first_wave else 1
+        budget = min(16, max(1, waves * sm_count // units), max(1, kv_tiles // 4))
         loop_tiles = _ceil_div(kv_tiles, budget)
         splits = _ceil_div(kv_tiles, loop_tiles)
         if splits > 1:
@@ -3009,6 +3015,12 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
                 sched_policy=SCHED_NATURAL if caps.sm_lo == 107 else SCHED_LPT,
             ),
         )
+        first_splits, first_packed = paged_thd_split_choice(caps, facts, first_wave=True) if caps.sm_lo == 107 else (1, False)
+        if first_splits > 1 and (first_splits, first_packed) != (splits, packed):
+            unique.insert(
+                1,
+                replace(base, cga=_sole(effective_cgas(caps, facts, first_splits)), pack_gqa=first_packed, split_kv=first_splits, sched_policy=SCHED_NATURAL),
+            )
     nonpaged_splits, nonpaged_packed = nonpaged_thd_split_choice(caps, facts)
     if nonpaged_splits > 1:
         unique.insert(

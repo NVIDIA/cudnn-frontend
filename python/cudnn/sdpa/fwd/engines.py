@@ -25,7 +25,6 @@ engines may share one template. Neither direction is 1:1.
 
 from __future__ import annotations
 
-import inspect
 import logging
 from dataclasses import dataclass, replace
 from functools import partial
@@ -45,6 +44,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     pack_gqa_supported,
     supports_paged_prefill_cga1,
     supports_paged_d256_pack_gqa,
+    supports_nonpaged_d128_thd_prefill,
     supports_paged_d128_partial_pack_gqa,
     supports_nonpaged_d128_thd_pack_gqa,
     supports_thd_split,
@@ -1071,6 +1071,20 @@ def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split
 
     _knobs = SdpaFwdKnobs(split_kv=split_kv, cga=cga) if (split_kv is not None or cga is not None) else None
     selected = _selected_d_shape(capabilities, facts, _knobs)
+    if (
+        capabilities.sm_lo == 107
+        and not facts.attn_scale_prefolded
+        and supports_nonpaged_d128_thd_prefill(
+            (facts.d_qk, facts.d_v),
+            device_cc=facts.device_cc,
+            fp8=facts.is_fp8 or facts.is_mxfp8,
+            thd=facts.thd,
+            paged=facts.has_paged_kv,
+            cga=cga,
+            split_kv=split_kv or 1,
+        )
+    ):
+        return frozenset({1, 2})
     if capabilities.sm_lo == 107 and supports_paged_prefill_cga1(
         (facts.d_qk, facts.d_v),
         device_cc=facts.device_cc,
@@ -1411,8 +1425,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if sm120_tile_reason is not None:
             return sm120_tile_reason
         # D128 half cga1 uses the decode tile for ragged Q=1 and the split
-        # host, or the two-slab prefill body for unsplit SM100 paged Q>1.
-        # Other ragged graphs keep the cga2 prefill tile.
+        # host, or two-slab prefill for admitted paged graphs and native Rubin
+        # nonpaged exact D128. effective_cgas gates the unsplit prefill domain.
         # api_dsl.check_support mirrors these lines (keep them in lockstep).
         ragged_decode = knobs.cga == 1 and facts.thd and _thd_decode_leg(capabilities, facts)
         packed_split = packed_thd_split(capabilities, facts, knobs)
@@ -1654,6 +1668,14 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                     paged=facts.has_paged_kv,
                     cga=knobs.cga,
                     split_kv=knobs.split_kv or 1,
+                )
+                or _config_sm107.supports_native_d128_dense_partial_pack(
+                    _selected_d_shape(capabilities, facts, knobs),
+                    device_cc=facts.device_cc,
+                    fp8=facts.is_fp8 or facts.is_mxfp8,
+                    thd=facts.thd,
+                    paged=facts.has_paged_kv,
+                    cga=knobs.cga,
                 )
             )
             # The decode tile packs the WHOLE group into its 16-row Q tile whatever tile_m (24/2: 12 live
@@ -3114,7 +3136,7 @@ def lower_dsl_prefill(
     ``api_type``; descriptor conversion, adapter lifecycle, variant-pack binding,
     and launch construction remain shared here.
     """
-    from cudnn.sdpa.fwd.api_dsl import _torch_stream_context
+    from cudnn.sdpa.fwd.api_dsl import _parameter_names, _torch_stream_context
 
     seq_q_t = facts.seq_q_t if facts.padded else None
     seq_kv_t = facts.seq_kv_t if facts.padded else None
@@ -3124,8 +3146,8 @@ def lower_dsl_prefill(
     # (THD sources cu_seqlens from it instead).
     seq_q_lens_present = facts.padded and not facts.thd and facts.seq_q_t is not None
     api_cls = _adapter(api_type)
-    _ctor_params = frozenset(inspect.signature(api_cls.__init__).parameters)
-    _exec_params = frozenset(inspect.signature(api_cls.execute).parameters)
+    _ctor_params = _parameter_names(api_cls.__init__)
+    _exec_params = _parameter_names(api_cls.execute)
     api = api_cls(
         sample_q=ga.tensor_desc_from_ir(facts.q_t, name="q"),
         sample_k=ga.tensor_desc_from_ir(facts.k_t, name="k"),
