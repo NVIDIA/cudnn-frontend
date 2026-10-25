@@ -31,6 +31,7 @@ from cudnn.frost.tile_dsl.thd import (
     write_thd_live_and_ctr,
     write_thd_meta,
     write_thd_prefix_warp,
+    write_thd_small_batch_meta,
 )
 
 # The THD metadata layout, the batch ranking, the unit decode, the claim counter
@@ -291,6 +292,7 @@ def build_thd_meta_o_descs_kernel(
     clamp_kv: cutlass.Constexpr[bool] = True,
     splits: cutlass.Constexpr[int] = 1,
     rank_by_kv: cutlass.Constexpr[bool] = False,
+    small_batch_meta: cutlass.Constexpr[bool] = False,
 ) -> None:
     """Per-execute f16/bf16 THD metadata, O descriptors, and scheduler bounds.
 
@@ -315,6 +317,9 @@ def build_thd_meta_o_descs_kernel(
     tidx, _, _ = cute.arch.thread_idx()
     nthreads, _, _ = cute.arch.block_dim()
     meta = cutlass.make_array_view(meta_t)
+    fused_meta = cutlass.Boolean(False)
+    if cutlass.const_expr(small_batch_meta):
+        fused_meta = (n_batch > 1) & (n_batch <= 32)
     if n_batch <= cutlass.Int32(1):
         if nvvm.elect_sync() and tidx < cutlass.Int32(32):
             write_thd_meta(meta, cutlass.make_array_view(q_lens_t), cutlass.make_array_view(kv_lens_t), lens_form, n_batch)
@@ -328,10 +333,26 @@ def build_thd_meta_o_descs_kernel(
         warp = cutlass.Int32(tidx) // cutlass.Int32(32)
         lane = cutlass.Int32(tidx) % cutlass.Int32(32)
         nwarps = cutlass.Int32(nthreads) // cutlass.Int32(32)
-        if warp == cutlass.Int32(0):
-            write_thd_prefix_warp(meta, cutlass.make_array_view(q_lens_t), n_batch, n_batch, (lens_form & 1) != 0, lane, store_lengths=False)
-        if warp == cutlass.Int32(1):
-            write_thd_prefix_warp(meta, cutlass.make_array_view(kv_lens_t), n_batch, 2 * n_batch + 1, (lens_form & 2) != 0, lane, store_lengths=True)
+        if fused_meta:
+            if warp == cutlass.Int32(0):
+                write_thd_small_batch_meta(
+                    meta,
+                    cutlass.make_array_view(q_lens_t),
+                    cutlass.make_array_view(kv_lens_t),
+                    lens_form,
+                    n_batch,
+                    n_qh,
+                    cga_tile_m,
+                    n_clusters,
+                    lane,
+                    splits,
+                    rank_by_kv,
+                )
+        else:
+            if warp == cutlass.Int32(0):
+                write_thd_prefix_warp(meta, cutlass.make_array_view(q_lens_t), n_batch, n_batch, (lens_form & 1) != 0, lane, store_lengths=False)
+            if warp == cutlass.Int32(1):
+                write_thd_prefix_warp(meta, cutlass.make_array_view(kv_lens_t), n_batch, 2 * n_batch + 1, (lens_form & 2) != 0, lane, store_lengths=True)
         cute.arch.barrier()
         if nvvm.elect_sync():
             emit_seq_descs(base_o_desc, o_desc_words, meta, n_batch, o_tensor, n_batch, o_row_stride, seq_ord=2, first_batch=warp, batch_step=nwarps)
@@ -344,14 +365,15 @@ def build_thd_meta_o_descs_kernel(
                 if warp == nwarps - cutlass.Int32(1):
                     emit_clamped_desc(base_v_desc, o_desc_words, n_batch + cutlass.Int32(2), t_kv, seq_ord=2)
             nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
-    cute.arch.barrier()
-    write_thd_batch_remap(cutlass.make_array_view(meta_t), n_batch, cutlass.Int32(tidx), cutlass.Int32(nthreads), rank_by_kv=rank_by_kv)
-    # Live unit total + claim counter for the persistent scheduler. The host
-    # cannot know Sigma_b ceil(s_b/tile)*QH without a D2H (issue #552), so the
-    # kernel reads its own bound from here. The counter starts at n_clusters:
-    # cluster c takes unit c from its blockIdx, then pulls from the counter.
-    cute.arch.barrier()
-    write_thd_work_prefix(cutlass.make_array_view(meta_t), n_batch, n_qh, cga_tile_m, n_clusters, cutlass.Int32(tidx), splits)
+    if not fused_meta:
+        cute.arch.barrier()
+        write_thd_batch_remap(cutlass.make_array_view(meta_t), n_batch, cutlass.Int32(tidx), cutlass.Int32(nthreads), rank_by_kv=rank_by_kv)
+        # Live unit total + claim counter for the persistent scheduler. The host
+        # cannot know Sigma_b ceil(s_b/tile)*QH without a D2H (issue #552), so the
+        # kernel reads its own bound from here. The counter starts at n_clusters:
+        # cluster c takes unit c from its blockIdx, then pulls from the counter.
+        cute.arch.barrier()
+        write_thd_work_prefix(cutlass.make_array_view(meta_t), n_batch, n_qh, cga_tile_m, n_clusters, cutlass.Int32(tidx), splits)
 
 
 build_thd_meta_o_descs_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)

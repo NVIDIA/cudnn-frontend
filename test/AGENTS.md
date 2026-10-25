@@ -79,6 +79,16 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 
 ### conftest.py landmines — read before editing
 
+For a timed subprocess test, arm a child-side `faulthandler` dump before the
+parent deadline and surface `TimeoutExpired.stdout` / `.stderr` in the failure.
+The parent's watchdog shows only `subprocess.communicate()`, and pytest's
+ordinary timeout traceback does not display those captured child streams.
+`prepared_bwd_cache_utils.run_artifact_child` uses this for cold artifact checks.
+Validate with a deliberately blocked child that emits both streams; retain the
+original deadline and do not classify a compilation stall as a GPU hang without
+child-stage evidence.
+
+
 - Source-package subprocess probes must exclude `__pycache__` and bytecode
   when copying a tree shared by xdist workers. Python atomically renames its
   temporary `.pyc` files, so `copytree` can enumerate a file that disappears

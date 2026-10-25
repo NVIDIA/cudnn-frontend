@@ -139,17 +139,10 @@ def dot_do_o_kernel(
                                 acc = acc + ov[kk].to(cutlass.Float32) * dov[kk].to(cutlass.Float32)
                     else:
                         if cutlass.const_expr(
-                            D_V == 256
-                            and o.element_type == cutlass.BFloat16
-                            and do.element_type == cutlass.BFloat16
-                            and o.iterator.alignment >= 16
-                            and do.iterator.alignment >= 16
-                            and o_batch_stride % 8 == 0
-                            and o_seq_stride % 8 == 0
-                            and o_head_stride % 8 == 0
-                            and do_batch_stride % 8 == 0
-                            and do_seq_stride % 8 == 0
-                            and do_head_stride % 8 == 0
+                            (D_V == 256 and o.element_type == cutlass.BFloat16 and do.element_type == cutlass.BFloat16)
+                            and (o.iterator.alignment >= 16 and do.iterator.alignment >= 16)
+                            and (o_batch_stride % 8 == 0 and o_seq_stride % 8 == 0 and o_head_stride % 8 == 0)
+                            and (do_batch_stride % 8 == 0 and do_seq_stride % 8 == 0 and do_head_stride % 8 == 0)
                         ):
                             # Pitched BF16 rows retain 16-byte alignment when
                             # every physical origin and eight-element lane

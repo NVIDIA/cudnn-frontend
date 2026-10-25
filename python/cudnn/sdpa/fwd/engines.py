@@ -25,7 +25,6 @@ engines may share one template. Neither direction is 1:1.
 
 from __future__ import annotations
 
-import inspect
 import logging
 from dataclasses import dataclass, replace
 from functools import partial
@@ -3137,7 +3136,7 @@ def lower_dsl_prefill(
     ``api_type``; descriptor conversion, adapter lifecycle, variant-pack binding,
     and launch construction remain shared here.
     """
-    from cudnn.sdpa.fwd.api_dsl import _torch_stream_context
+    from cudnn.sdpa.fwd.api_dsl import _parameter_names, _torch_stream_context
 
     seq_q_t = facts.seq_q_t if facts.padded else None
     seq_kv_t = facts.seq_kv_t if facts.padded else None
@@ -3147,8 +3146,8 @@ def lower_dsl_prefill(
     # (THD sources cu_seqlens from it instead).
     seq_q_lens_present = facts.padded and not facts.thd and facts.seq_q_t is not None
     api_cls = _adapter(api_type)
-    _ctor_params = frozenset(inspect.signature(api_cls.__init__).parameters)
-    _exec_params = frozenset(inspect.signature(api_cls.execute).parameters)
+    _ctor_params = _parameter_names(api_cls.__init__)
+    _exec_params = _parameter_names(api_cls.execute)
     api = api_cls(
         sample_q=ga.tensor_desc_from_ir(facts.q_t, name="q"),
         sample_k=ga.tensor_desc_from_ir(facts.k_t, name="k"),
