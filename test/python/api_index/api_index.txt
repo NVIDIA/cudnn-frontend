@@ -1372,6 +1372,10 @@ cudnn.ops.block_sparse_attention_fp8_forward
 cudnn.ops.causal_conv1d
 cudnn.ops.causal_conv1d_nwh
 cudnn.ops.causal_conv1d_update
+cudnn.ops.dsa
+cudnn.ops.dsa.pooled_cache_update_forward
+cudnn.ops.dsa.pooled_expand_forward
+cudnn.ops.dsa.pooled_indexer_forward
 cudnn.ops.fft_causal_conv1d
 cudnn.ops.kimi_delta_attention_backward_jax
 cudnn.ops.kimi_delta_attention_forward_jax
