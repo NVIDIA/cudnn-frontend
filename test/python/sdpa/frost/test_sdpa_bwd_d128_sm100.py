@@ -330,23 +330,24 @@ def test_replan_reloads_artifact_without_compilation(monkeypatch, tmp_path):
 @pytest.mark.parametrize("dt", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("sq,sk", [(257, 193), (1024, 1153)])
-def test_deterministic_dense_mha_repeated_eager_and_replay(dt, causal, sq, sk):
+def test_deterministic_dense_mha_repeated_eager_and_replay(dt, causal, sq, sk, cudnn_handle):
     """Request determinism through the public graph without pinning its implementation.
 
     Each gradient has one owner and a fixed reduction order. Verify all three
     against FP64, then require bitwise repeatability after output poisoning in
     eager execution and retained CUDA-graph replay.
     """
-    case = _case(dt=dt, causal=causal, b=2, h=3, sq=sq, sk=sk, deterministic=True, accumulation=None)
-    expected_bits = {name: case.tensors[name].clone() for name in ("dq", "dk", "dv")}
-    stream = torch.cuda.Stream()
-    handle = cudnn.create_handle()
-    cudnn.set_stream(handle, stream.cuda_stream)
-    capture = torch.cuda.CUDAGraph()
+    original_stream = cudnn.get_stream(cudnn_handle)
+    capture = None
     try:
+        case = _case(dt=dt, causal=causal, b=2, h=3, sq=sq, sk=sk, deterministic=True, accumulation=None)
+        expected_bits = {name: case.tensors[name].clone() for name in ("dq", "dk", "dv")}
+        stream = torch.cuda.Stream()
+        cudnn.set_stream(cudnn_handle, stream.cuda_stream)
+        capture = torch.cuda.CUDAGraph()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.graph(capture, stream=stream):
-            case.graph.execute(case.pack, None, handle=handle)
+            case.graph.execute(case.pack, None, handle=cudnn_handle)
         for replay in (False, True):
             for _ in range(3):
                 for name in expected_bits:
@@ -363,5 +364,8 @@ def test_deterministic_dense_mha_repeated_eager_and_replay(dt, causal, sq, sk):
                 for name, expected in expected_bits.items():
                     assert torch.equal(case.tensors[name], expected), f"{name} changed across identical deterministic executions"
     finally:
-        capture.reset()
-        cudnn.destroy_handle(handle)
+        try:
+            if capture is not None:
+                capture.reset()
+        finally:
+            cudnn.set_stream(cudnn_handle, original_stream)
