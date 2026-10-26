@@ -295,6 +295,14 @@ def test_paged_thd_fp8_origins_rebind_and_capture(
         for b, (nq, nk) in enumerate(zip(ql, kl)):
             if not nq:
                 continue
+            live_o[starts["o"][b] : starts["o"][b] + nq] = True
+            stats_start = b * maximum if stats_layout == "padded" else starts["stats"][b]
+            live_stats[stats_start : stats_start + nq] = True
+            if controls:
+                # Mask/sink composition pins the established dense arithmetic
+                # exactly, including its FP8 P-rounding behavior. The other
+                # cases independently check O/Stats against FP64 references.
+                continue
             k8 = values["k"][values["kt"][b].flatten().long()].transpose(0, 1).reshape(kv_heads, kv_max, dim)
             v8 = values["v"][values["vt"][b].flatten().long()].transpose(0, 1).reshape(kv_heads, kv_max, dim)
             # Match the established FP8 reference's P cast and online rescaling.
@@ -351,13 +359,8 @@ def test_paged_thd_fp8_origins_rebind_and_capture(
                     stats[ss + lo : ss + hi].double(),
                     expected_stats,
                     atol=(0.01 if dim == 256 else 0.005) * (math.log2(math.e) if stats_layout == "head" else 1),
-                    # D256 uses the existing prepared FP8 Stats budget.
-                    # Its dense/compact controls still require exact equality.
-                    rtol=0.01 if dim == 256 else 0,
+                    rtol=0,
                 )
-            live_o[starts["o"][b] : starts["o"][b] + nq] = True
-            stats_start = b * maximum if stats_layout == "padded" else starts["stats"][b]
-            live_stats[stats_start : stats_start + nq] = True
         assert torch.all(values["o"].float()[~live_o] == -16)
         if stats_layout == "padded":
             assert torch.isneginf(stats[~live_stats]).all()
