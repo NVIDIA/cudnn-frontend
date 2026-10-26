@@ -223,12 +223,15 @@ __all__ = [
     "SPARSE_D256_WIRED_ARMS",
     "SMEM_STANDARD_CARVEOUT_BYTES",
     "CfgD256SparseLean",
+    "TemplateParamsLean",
     "make_cfg_d256_sparse_lean",
     "lean_sparse_n_sub",
     "lean_sparse_split",
+    "lean_sparse_n_mt",
     "lean_sparse_smem_bytes",
     "LEAN_SPARSE_N_KEYS",
     "LEAN_SPARSE_MAX_SUB_TILES_PER_CTA",
+    "LEAN_SPARSE_MAX_SEQLEN_Q",
 ]
 
 
@@ -3909,22 +3912,46 @@ def make_cfg_d256_decode(params: TemplateParams) -> Tuple[CfgD256Decode, TmaIter
 # ---------------------------------------------------------------------------
 # d256 index-list sparse DECODE tile, the LEAN form on Rubin (sm107/sparse_lean_d256_f16.py): mma.sync + cp.async, no TMEM / TMA / CLC
 # ---------------------------------------------------------------------------
-# The second body of the sparse function (the first is the tcgen05 tile above, make_cfg_d256_sparse): one 128-thread CTA per
-# (sequence, KV head, chunk of SUB_TILES_PER_CTA 32-key sub-tiles), S_q = 1 (the S_q 2..4 rendering with n_mt m-tiles
-# follows), four warps each owning a 64-wide d-slice (BMM1 split-K over the warps + an 8-KiB SMEM exchange, the softmax redundant
-# per warp, BMM2 on the warp's own 16 x 64 O slice), the one-shot zero-filled cp.async gather of the paged / dense rows the block list
-# names, the SAME fp32 split-major partial slab + LSE as the tcgen05 tile's split store (sm100/split_combine.py consumes it unchanged).
+# The second body of the sparse function (the first is the tcgen05 tile above, make_cfg_d256_sparse): one CTA of 128 x N_MT threads per
+# (sequence, KV head, chunk of SUB_TILES_PER_CTA 32-key sub-tiles) holding ALL S_q x G query rows of the sequence's KV head (S_q 1..4
+# through TemplateParamsLean.decode_seqlen_q; N_MT = ceil(S_q x G / 16) m16 tiles of four warps each), every warp owning a 64-wide
+# d-slice of its m-tile (BMM1 split-K over the 4 warps + an 8-KiB SMEM exchange per m-tile, the softmax redundant per warp, BMM2 on the
+# warp's own 16 x 64 O slice), the one-shot zero-filled cp.async gather of the paged / dense rows the block list names -- ONE gathered K / V
+# sub-tile per CTA shared by every m-tile (the tcgen05 tile re-gathers the list once per row) --, the SAME fp32 split-major partial slab +
+# LSE as the tcgen05 tile's split store (sm100/split_combine.py consumes it unchanged).
 # Geometry the body ASSUMES and this config PINS (sdpa-invariants section 6: the body is the truth): THREADS == 128 x N_MT (the loader's
-# `row = 8 w + p` map and the exchange's [4 warps] slot count), N_KEYS == 32 (one 32-bit mask word, 8 blocks per sub-tile), SMEM =
-# 2 x STAGES x N_KEYS x 512 + N_MT x 8192 under the standard carveout, 1 <= SUB_TILES_PER_CTA <= 8 (the body is range_constexpr-unrolled over it).
+# `row = 8 w + p` map over the FIRST m-tile's four warps, the exchange's [N_MT][4 warps] slot count, bar.sync 0 = the launch's threads),
+# N_KEYS == 32 (one 32-bit mask word per ROW per sub-tile, 8 blocks per sub-tile), SMEM = 2 x STAGES x N_KEYS x 512 + N_MT x 8192 under the
+# standard carveout, 1 <= SUB_TILES_PER_CTA <= 8 (the body is range_constexpr-unrolled over it), 1 <= S_Q <= 4 (the shared list's bound).
 _LEAN_FLAVOR = "sm107 d256 sparse lean"
 LEAN_SPARSE_N_KEYS = 32  # keys per sub-tile = 8 four-token blocks = one 32-bit valid word
 LEAN_SPARSE_BLOCKS_PER_SUB = LEAN_SPARSE_N_KEYS // _SPARSE_BLOCK_SIZE
 LEAN_SPARSE_THREADS_PER_MT = 128  # four warps per m16 tile: the d-slices of the split-D plan
+LEAN_SPARSE_ROWS_PER_MT = 16  # the m16n8k16 M extent: one m-tile = 16 query rows (token-major: row R = s x G + g)
+LEAN_SPARSE_MAX_SEQLEN_Q = 4  # the serving step's rows per sequence under ONE shared list (the sparse function's own S_q <= 4 bound)
 LEAN_SPARSE_MAX_SUB_TILES_PER_CTA = 8  # the sub-tile loop is unrolled at trace time (cutlass.range_constexpr); the fill rule never exceeds 7 (B 32)
 LEAN_SPARSE_TOPK_MIN = 8  # top_k < 8 is ONE sub-tile = split 1: the tcgen05 tile's cell (the adapter routes it there)
-_LEAN_N_TAIL_MAX = 2  # the S_q <= 4 bound on the appended tail blocks (kept at S_q 1 so the S_q 2..4 rendering changes no grid)
+_LEAN_N_TAIL_MAX = 2  # the S_q <= 4 bound on the appended tail blocks (the same host bound at every S_q, so the S_q axis changes no grid)
 _LEAN_S_EXCHANGE_BYTES = 4 * 4 * 32 * 16  # sS[4 warps][4 n-blocks][32 lanes][16 B] = 8 KiB per m-tile
+
+
+@dataclass(frozen=True)
+class TemplateParamsLean(TemplateParams):
+    """The lean tile's record: the shared ``TemplateParams`` plus the serving step's query rows per sequence.  A SEPARATE record on
+    purpose (the ``TemplateParams2x2`` pattern): the shared record gains no field, so every other template's digest and compiled-plan
+    cache entries are what they were; the adapter builds this record on the lean route only.  Frozen + hashable like its base: it is
+    the template-module cache key and the source digest."""
+
+    # S_q, the rows of the step per sequence (1..LEAN_SPARSE_MAX_SEQLEN_Q): a COMPILE-TIME axis of this kernel -- the m-tile count
+    # N_MT = ceil(S_q x G / 16), the thread count 128 x N_MT and the S exchange's extent fold on it (the tcgen05 tile takes S_q at
+    # runtime; this tile holds every row of the sequence in one CTA).  Plan-time only: the declared Q shape's S_q.
+    decode_seqlen_q: int = 1
+
+
+def lean_sparse_n_mt(seqlen_q: int, qh_per_kh: int, rows_per_mt: int = LEAN_SPARSE_ROWS_PER_MT) -> int:
+    """The m16 tiles that hold the sequence's ``S_q x G`` query rows (token-major): 1 at S_q 1 / G 12, 2 at S_q 2, 3 at S_q 3..4 (G 12), 4 at
+    S_q 4 / G 16, 1 at G 1 (four rows, one per token)."""
+    return -(-(int(seqlen_q) * int(qh_per_kh)) // int(rows_per_mt))
 
 
 def lean_sparse_n_sub(top_k: int, block_size: int = _SPARSE_BLOCK_SIZE, n_keys: int = LEAN_SPARSE_N_KEYS) -> int:
@@ -3960,10 +3987,10 @@ class CfgD256SparseLean:
     SPLIT: int = 65  # ceil(N_SUB / k): the grid's x extent = the combine's partial count
     STAGES: int = 1  # min(2, k): the K / V ring depth
     # --- the CTA
-    N_MT: int = 1  # m16 tiles: ceil(S_q x G / 16); 1 at S_q 1
-    S_Q: int = 1
-    WARPS: int = 4
-    THREADS: int = LEAN_SPARSE_THREADS_PER_MT
+    N_MT: int = 1  # m16 tiles: ceil(S_q x G / 16); 1 at S_q 1 / G 12, 3 at S_q 4 / G 12, 4 at S_q 4 / G 16
+    S_Q: int = 1  # the step's rows per sequence (TemplateParamsLean.decode_seqlen_q), 1..LEAN_SPARSE_MAX_SEQLEN_Q
+    WARPS: int = 4  # 4 x N_MT
+    THREADS: int = LEAN_SPARSE_THREADS_PER_MT  # 128 x N_MT
     QH_PER_KH: int = 12
     # --- dtypes
     DTYPE_QKV: int = _DTYPE_BF16
@@ -4015,16 +4042,23 @@ def _validate_cfg_d256_sparse_lean(cfg: CfgD256SparseLean, flavor: str = _LEAN_F
                 f"{flavor}: SPLIT must be ceil(N_SUB / k) = {-(-cfg.N_SUB // cfg.SUB_TILES_PER_CTA)} (got {cfg.SPLIT})",
             ),
             (cfg.STAGES == min(2, cfg.SUB_TILES_PER_CTA), f"{flavor}: STAGES must be min(2, k) (got {cfg.STAGES}): the body's wait_group immediates assume it"),
-            (cfg.S_Q == 1 and cfg.N_MT == 1, f"{flavor}: this rendering serves S_q = 1 (one m16 tile); S_q 2..4 (n_mt m-tiles) is not wired yet"),
+            (
+                1 <= cfg.S_Q <= LEAN_SPARSE_MAX_SEQLEN_Q,
+                f"{flavor}: S_q must be in 1..{LEAN_SPARSE_MAX_SEQLEN_Q} (got {cfg.S_Q}): the serving step's rows share ONE list (two tail blocks at most); "
+                f"a longer step is the tcgen05 tile's",
+            ),
             (
                 1 <= cfg.QH_PER_KH <= 16,
                 f"{flavor}: the token's query heads must fit the m16 tile (got qh_per_kh={cfg.QH_PER_KH}); above 16 the adapter declines",
             ),
-            (cfg.N_MT == -(-(cfg.S_Q * cfg.QH_PER_KH) // 16), f"{flavor}: N_MT must be ceil(S_q x G / 16) (got {cfg.N_MT})"),
+            (
+                cfg.N_MT == lean_sparse_n_mt(cfg.S_Q, cfg.QH_PER_KH),
+                f"{flavor}: N_MT must be ceil(S_q x G / 16) = {lean_sparse_n_mt(cfg.S_Q, cfg.QH_PER_KH)} (got {cfg.N_MT}): the m16 tiles that hold the S_q x G rows",
+            ),
             (
                 cfg.WARPS == 4 * cfg.N_MT and cfg.THREADS == 32 * cfg.WARPS == LEAN_SPARSE_THREADS_PER_MT * cfg.N_MT,
-                f"{flavor}: THREADS must be 128 x N_MT = {LEAN_SPARSE_THREADS_PER_MT * cfg.N_MT} (got {cfg.THREADS}): the loader's row map `8 w + p` and the exchange's "
-                f"[4 warps] slot count assume four warps per m-tile, and bar.sync 0 counts the launch's threads",
+                f"{flavor}: THREADS must be 128 x N_MT = {LEAN_SPARSE_THREADS_PER_MT * cfg.N_MT} (got {cfg.THREADS}): the loader's row map `8 w + p` over the first "
+                f"m-tile's warps and the exchange's [N_MT][4 warps] slot count assume four warps per m-tile, and bar.sync 0 counts the launch's threads",
             ),
             (
                 cfg.SMEM_K_BYTES == cfg.SMEM_V_BYTES == cfg.STAGES * cfg.N_KEYS * cfg.D * cfg.BPE,
@@ -4057,14 +4091,21 @@ def _validate_cfg_d256_sparse_lean(cfg: CfgD256SparseLean, flavor: str = _LEAN_F
 
 
 def make_cfg_d256_sparse_lean(params: TemplateParams, *, n_keys: int = LEAN_SPARSE_N_KEYS, sub_tiles_per_cta: Optional[int] = None) -> CfgD256SparseLean:
-    """Config for sm107/sparse_lean_d256_f16.py from the adapter's TemplateParams.  The decode form is REQUIRED (``bottom_right``,
-    ``qsa_list_per_sequence``, ``seq_kv_lens_present``); ``split_kv`` is the LEAN split ``ceil(n_sub / k)`` and selects ``k`` (a
-    ``split_kv`` that is not a lean split of this top_k is declined by name; ``split_kv`` 1 / unset takes ``sub_tiles_per_cta``, default 1);
-    ``n_keys`` is 32 only (N 64 is a measured lever, not wired).  Every other arm is a typed decline naming the feature.  Backstop
-    only: every rejection here must also be a decline of the adapter's claims record."""
+    """Config for sm107/sparse_lean_d256_f16.py from the adapter's record -- ``TemplateParamsLean`` (its ``decode_seqlen_q`` = S_q in
+    1..4 sizes the CTA: N_MT = ceil(S_q x G / 16) m-tiles of 128 threads) or the shared ``TemplateParams`` (read as S_q 1).  The decode
+    form is REQUIRED (``bottom_right``, ``qsa_list_per_sequence``, ``seq_kv_lens_present``); ``split_kv`` is the LEAN split ``ceil(n_sub /
+    k)`` and selects ``k`` (a ``split_kv`` that is not a lean split of this top_k is declined by name; ``split_kv`` 1 / unset takes
+    ``sub_tiles_per_cta``, default 1); ``n_keys`` is 32 only (N 64 is a measured lever, not wired).  Every other arm is a typed decline
+    naming the feature.  Backstop only: every rejection here must also be a decline of the adapter's claims record."""
     flavor = _LEAN_FLAVOR
     if not params.qsa_block_topk:
         raise ValueError(f"{flavor}: not an index-list record (qsa_block_topk=0); the dense templates serve it")
+    s_q = int(getattr(params, "decode_seqlen_q", 1))
+    if not 1 <= s_q <= LEAN_SPARSE_MAX_SEQLEN_Q:
+        raise ValueError(
+            f"{flavor}: decode_seqlen_q (S_q) must be in 1..{LEAN_SPARSE_MAX_SEQLEN_Q} (got {s_q}): the serving step's rows share ONE list (two tail blocks at "
+            f"most); a longer step is the tcgen05 tile's"
+        )
     if params.qsa_block_size != _SPARSE_BLOCK_SIZE:
         raise ValueError(f"{flavor}: qsa_block_size must be {_SPARSE_BLOCK_SIZE} (four-token blocks); got {params.qsa_block_size}")
     if n_keys != LEAN_SPARSE_N_KEYS:
@@ -4089,7 +4130,7 @@ def make_cfg_d256_sparse_lean(params: TemplateParams, *, n_keys: int = LEAN_SPAR
     if params.stats_log2:
         raise ValueError(f"{flavor}: stats_log2 is not wired; the partial LSE is natural-log (the combine's contract)")
     if params.seq_q_lens_present:
-        raise ValueError(f"{flavor}: seq_q_lens_present (the padded-Q trim) is not wired; S_q is 1")
+        raise ValueError(f"{flavor}: seq_q_lens_present (the padded-Q trim) is not wired; every sequence has the record's S_q rows (decode_seqlen_q)")
     if params.window_left is not None or params.window_right is not None:
         raise ValueError(f"{flavor}: the selection IS the mask; a diagonal band (window_left / window_right) is not part of this kernel")
     if not params.pack_gqa:
@@ -4152,7 +4193,7 @@ def make_cfg_d256_sparse_lean(params: TemplateParams, *, n_keys: int = LEAN_SPAR
         )
     stages = min(2, k)
     b = bpe(params.dtype_qkv)
-    n_mt = -(-(1 * params.qh_per_kh) // 16)
+    n_mt = lean_sparse_n_mt(s_q, params.qh_per_kh)
     cfg = CfgD256SparseLean(
         D=256,
         N_KEYS=n_keys,
@@ -4164,7 +4205,7 @@ def make_cfg_d256_sparse_lean(params: TemplateParams, *, n_keys: int = LEAN_SPAR
         SPLIT=split,
         STAGES=stages,
         N_MT=n_mt,
-        S_Q=1,
+        S_Q=s_q,
         WARPS=4 * n_mt,
         THREADS=LEAN_SPARSE_THREADS_PER_MT * n_mt,
         QH_PER_KH=int(params.qh_per_kh),
