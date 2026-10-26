@@ -201,11 +201,7 @@ def main():
         indices_shape=list(indices.shape),
         bitmap_bytes=0 if sel is None else sel.numel(),
         compact_forward_bytes=total * 513 * 4 if args.indexed else sel.numel() * 4,
-        compact_backward_bytes=(
-            None
-            if args.causal_topk
-            else ((total + 1) // 2) * 1026 * 4 if args.indexed else ((total + 1) // 2) * sel.shape[1] * 4 if hkv == 1 else sel.numel() * 4
-        ),
+        compact_backward_bytes=total * 513 * 4 if args.indexed else sel.numel() * 4,
         checks={},
         timings={},
     )

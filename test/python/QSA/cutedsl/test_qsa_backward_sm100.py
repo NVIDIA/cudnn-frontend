@@ -90,31 +90,34 @@ def _check(inputs, grads):
 
 
 LENGTHS = [
-    (2, 1.0),  # tail tokens only (a single token has dQ = dK = 0, which a relative bound cannot score)
-    (5, 1.0),  # one complete block and a tail
-    (2051, 1.0),  # the longest sequence whose lists are all whole causal prefixes
-    (2052, 1.0),  # the shortest sequence on which the last query drops a block
-    (4099, 1.0),  # every query in the dense kernel, sparse rows above 2050 included
-    (16384, 1.0),  # every query in the dense kernel with the larger dense unit
-    (22527, 1.0),  # the longest sequence served by the dense kernel alone
-    (22528, 1.0),  # the shortest sequence with a sparse remainder: a single query range on the key-major kernel
-    (22529, 1.0),  # one full query range and a second range holding a single query, with one KV head an unpaired item
-    (24000, 1.0),  # dense, query-major and key-major kernels in one KV pass and two query ranges
-    (24000, 1e-7),  # training-scale gradients, which rule out reduced-range accumulators
-    (32769, 1.0),  # two KV passes and a partial last block
+    # L0 keeps one representative of every path and crossover, the longer sweeps run at L1
+    pytest.param(2, 1.0, marks=pytest.mark.L0),  # tail tokens only (a single token has dQ = dK = 0, which a relative bound cannot score)
+    pytest.param(5, 1.0, marks=pytest.mark.L0),  # one complete block and a tail
+    pytest.param(2051, 1.0, marks=pytest.mark.L0),  # the longest sequence whose lists are all whole causal prefixes
+    pytest.param(2052, 1.0, marks=pytest.mark.L0),  # the shortest sequence on which the last query drops a block
+    pytest.param(4099, 1.0, marks=pytest.mark.L0),  # every query in the dense kernel, sparse rows above 2050 included
+    pytest.param(16384, 1.0, marks=pytest.mark.L1),  # every query in the dense kernel with the larger dense unit
+    pytest.param(22527, 1.0, marks=pytest.mark.L1),  # the longest sequence served by the dense kernel alone
+    pytest.param(22528, 1.0, marks=pytest.mark.L0),  # the shortest sequence with a sparse remainder: a single query range on the key-major kernel
+    pytest.param(22529, 1.0, marks=pytest.mark.L1),  # one full query range and a second range holding a single query, with one KV head an unpaired item
+    pytest.param(24000, 1.0, marks=pytest.mark.L1),  # dense, query-major and key-major kernels in one KV pass and two query ranges
+    pytest.param(24000, 1e-07, marks=pytest.mark.L1),  # training-scale gradients, which rule out reduced-range accumulators
+    pytest.param(32769, 1.0, marks=pytest.mark.L1),  # two KV passes and a partial last block
 ]
 
 PACKED = [
-    (3, 2051, 22529),  # a 3-token sequence, a whole-prefix one starting at 3 and one past the crossover (origins off the 4-token grid)
-    (4100, 24005, 2),  # dense, sparse with a 3525-query remainder, then 2 tokens
-    (500, 0, 2500),  # an empty sequence between two dense ones
-    (1000, 2051, 2051),  # every sequence within 2051 tokens
-    (3, 24577, 24577),  # several record windows and two sparse sequences with unaligned origins
-    (1000, 22000),  # a packed sequence just below the crossover is dense past 20480 queries while the buffer is not
+    # L0 keeps one representative of every path and crossover, the longer sweeps run at L1
+    pytest.param(
+        (3, 2051, 22529), marks=pytest.mark.L0
+    ),  # a 3-token sequence, a whole-prefix one starting at 3 and one past the crossover (origins off the 4-token grid)
+    pytest.param((4100, 24005, 2), marks=pytest.mark.L1),  # dense, sparse with a 3525-query remainder, then 2 tokens
+    pytest.param((500, 0, 2500), marks=pytest.mark.L0),  # an empty sequence between two dense ones
+    pytest.param((1000, 2051, 2051), marks=pytest.mark.L1),  # every sequence within 2051 tokens
+    pytest.param((3, 24577, 24577), marks=pytest.mark.L1),  # several record windows and two sparse sequences with unaligned origins
+    pytest.param((1000, 22000), marks=pytest.mark.L1),  # a packed sequence just below the crossover is dense past 20480 queries while the buffer is not
 ]
 
 
-@pytest.mark.L0
 @pytest.mark.parametrize("h_kv", [2, 1])
 @pytest.mark.parametrize("seq_len, grad_scale", LENGTHS)
 def test_bitmap_entry_matches_reference(seq_len, grad_scale, h_kv):
@@ -123,7 +126,6 @@ def test_bitmap_entry_matches_reference(seq_len, grad_scale, h_kv):
     _check(inputs, _bitmap_backward(inputs, _miles_metadata(inputs["topk_idxs"], (seq_len,))))
 
 
-@pytest.mark.L0
 @pytest.mark.parametrize("seq_len, grad_scale", LENGTHS)
 def test_indexed_entry_matches_reference(seq_len, grad_scale):
     _skip_cu12(1)
@@ -131,7 +133,6 @@ def test_indexed_entry_matches_reference(seq_len, grad_scale):
     _check(inputs, _indexed_backward(inputs))
 
 
-@pytest.mark.L0
 @pytest.mark.parametrize("h_kv", [2, 1])
 @pytest.mark.parametrize("lengths", PACKED)
 def test_bitmap_entry_packed_sequences(lengths, h_kv):
@@ -140,7 +141,6 @@ def test_bitmap_entry_packed_sequences(lengths, h_kv):
     _check(inputs, _bitmap_backward(inputs, _miles_metadata(inputs["topk_idxs"], lengths)))
 
 
-@pytest.mark.L0
 @pytest.mark.parametrize("described", [True, False])
 @pytest.mark.parametrize("lengths", PACKED)
 def test_indexed_entry_packed_sequences(lengths, described):
