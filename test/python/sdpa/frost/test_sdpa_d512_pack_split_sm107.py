@@ -108,19 +108,28 @@ def test_d512_packed_split_rebind_replay(case, graph_api, cudnn_handle):
         assert api._partial_torch_dtype() == (torch.float32 if splits > 1 else getattr(torch, dtype_name))
 
         def check(values):
-            expected_o, expected_lse = _half_oracle(
-                values["q"],
-                values["k"],
-                values["v"],
-                logit_scale=buffers["attn_scale"],
-                masked=_dense_mask(sq, sk, causal=causal, bottom_right=causal, window_left=window),
-                sinks=values.get("sinks"),
-            )
-            torch.testing.assert_close(values["out"].double(), expected_o, atol=4e-3, rtol=4e-3)
-            if stats != "none":
-                if stats == "log2":
-                    expected_lse = expected_lse / math.log(2)
-                torch.testing.assert_close(values["lse"].reshape_as(expected_lse).double(), expected_lse, atol=6e-4, rtol=0)
+            # Keep the independent FP64 reference off the instrumented GPU:
+            # racecheck can spend the test deadline inside cuBLAS rather than
+            # the attention kernels. Chunk heads to bound CPU reference storage.
+            cpu = {name: tensor.cpu() for name, tensor in values.items()}
+            mask = _dense_mask(sq, sk, causal=causal, bottom_right=causal, window_left=window)
+            mask = None if mask is None else mask.cpu()
+            for kv_head in range(2):
+                for first in range(kv_head * group, (kv_head + 1) * group, 8):
+                    heads = slice(first, min(first + 8, (kv_head + 1) * group))
+                    expected_o, expected_lse = _half_oracle(
+                        cpu["q"][:, heads],
+                        cpu["k"][:, kv_head : kv_head + 1],
+                        cpu["v"][:, kv_head : kv_head + 1],
+                        logit_scale=buffers["attn_scale"],
+                        masked=mask,
+                        sinks=cpu["sinks"][heads] if sink else None,
+                    )
+                    torch.testing.assert_close(cpu["out"][:, heads].double(), expected_o, atol=4e-3, rtol=4e-3)
+                    if stats != "none":
+                        if stats == "log2":
+                            expected_lse = expected_lse / math.log(2)
+                        torch.testing.assert_close(cpu["lse"].reshape(2, 2 * group, sq)[:, heads].double(), expected_lse, atol=6e-4, rtol=0)
 
         for ordinal in range(2):
             values = {
