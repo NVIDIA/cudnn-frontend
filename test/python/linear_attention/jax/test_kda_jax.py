@@ -192,6 +192,7 @@ def test_forward_and_jitted_gradients(dims, heads, dtype, checkpoint, gates, inv
         np.testing.assert_array_equal(residual.checkpoints[valid:], 0)
 
 
+@pytest.mark.parametrize("schedule", ["default", "chain"])
 @pytest.mark.parametrize("checkpoint", [0, 16])
 @pytest.mark.parametrize(
     "dims,heads,bounds,gates,state_dtype,with_state",
@@ -201,7 +202,13 @@ def test_forward_and_jitted_gradients(dims, heads, dtype, checkpoint, gates, inv
         ((128, 64), (1, 2, 2), (0, 129, 129, 768), False, jnp.float32, False),
     ],
 )
-def test_long_sequence_forward_and_gradients(checkpoint, dims, heads, bounds, gates, state_dtype, with_state, built_plans):
+def test_long_sequence_forward_and_gradients(schedule, checkpoint, dims, heads, bounds, gates, state_dtype, with_state, built_plans, monkeypatch):
+    if schedule == "chain":
+        from cudnn.linear_attention.frost.common import piece_chain
+
+        # Exercise the chain below the tuned minimum token count.
+        monkeypatch.setattr(piece_chain, "chain_min_tokens", lambda **_: 0)
+
     args, cu = inputs(*dims, *heads, bounds=bounds, gates=gates, state_dtype=state_dtype)
     if not with_state:
         args = (*args[:5], None, *args[6:])
@@ -228,7 +235,8 @@ def test_long_sequence_forward_and_gradients(checkpoint, dims, heads, bounds, ga
     for got, want in zip(jax.tree.leaves(actual_grads), jax.tree.leaves(expected_grads)):
         assert_close(got, want, 0.06)
     assert {plan.node.node_type.name for plan in built_plans} == {"KDA", "KDA_BWD"}
-    assert all(plan.chain for plan in built_plans), "JAX must preserve Frost's automatic piece-chain selection"
+    if schedule == "chain":
+        assert all(plan.chain for plan in built_plans), "JAX must execute the requested piece-chain plans"
 
 
 @pytest.mark.parametrize("total", [35, 768])
