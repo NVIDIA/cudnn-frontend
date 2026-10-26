@@ -55,7 +55,7 @@ CONFIG = BenchmarkConfig(
     profile_pass="both",
     deterministic_bwd=[False],
     batch_size=2,
-    num_iterations=10,
+    num_iterations=20,
     sliding_window_size=128,
     output_dir="results",
 )

@@ -74,13 +74,37 @@ class PageSizeTest(unittest.TestCase):
         self.assertEqual(result.page_size, 64)
 
     def test_qwen35_counts_distinct_executed_page_sizes(self):
-        self.assertEqual(len(list(self.runner.expand_config(QWEN35))), 276)  # 92 cases x cudnn / cudnn_oss / cudnn_auto
-        for backend, count, pages in (("flashinfer", 192, {16, 32, 64}), ("b12x", 64, {64})):
+        # per cudnn leg: 92 dense + 92 paged + 32 mixed-length paged decodes (batch > 1)
+        self.assertEqual(len(list(self.runner.expand_config(QWEN35))), 648)
+        for backend, count, pages in (("flashinfer", 288, {16, 32, 64}), ("b12x", 64, {64})):
             with self.subTest(backend=backend):
                 config = replace(QWEN35, backends=[backend], context_seqlens=[], context_chunked_shapes=[])
                 cases = list(self.runner.expand_config(config))
                 self.assertEqual(len(cases), count)
                 self.assertEqual({case["page_size"] for case in cases}, pages)
+
+    def test_kv_layout_and_fill_axes(self):
+        """cudnn legs sweep kv_layouts; mixed cache lengths ride only the paged cudnn legs and flashinfer, batch > 1."""
+        base = replace(QWEN35, context_seqlens=[], context_chunked_shapes=[], page_sizes=None)
+        for backend, layouts, fills in (
+            ("cudnn_auto", {"dense", "paged"}, {("paged", 0.25)}),
+            ("flashinfer", {"paged"}, {("paged", 0.25)}),
+            ("flash_attention_4", {"dense"}, set()),
+        ):
+            with self.subTest(backend=backend):
+                cases = list(self.runner.expand_config(replace(base, backends=[backend])))
+                self.assertEqual({c["kv_layout"] for c in cases}, layouts)
+                self.assertEqual({(c["kv_layout"], c["kv_min_fill"]) for c in cases if c["kv_min_fill"] < 1}, fills)
+                self.assertTrue(all(c["batch_size"] > 1 for c in cases if c["kv_min_fill"] < 1))
+        case = next(c for c in self.runner.expand_config(replace(base, backends=["cudnn"])) if c["kv_min_fill"] < 1)
+        with patch(
+            "benchmark.attention_inference.runner.subprocess.run",
+            return_value=subprocess.CompletedProcess([], 0, stdout="RESULT,1,2,3,,test-device,cudnn plan=x\n"),
+        ) as run:
+            result = self.runner.run_single(case, cc=(10, 0))
+        cmd = run.call_args.args[0]
+        self.assertEqual((cmd[cmd.index("--kv_layout") + 1], cmd[cmd.index("--kv_min_fill") + 1]), ("paged", "0.25"))
+        self.assertEqual((result.kv_layout, result.kv_min_fill), ("paged", 0.25))
 
 
 if __name__ == "__main__":
