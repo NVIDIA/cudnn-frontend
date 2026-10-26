@@ -3851,6 +3851,13 @@ def _auto_split_k(chain: FusionChain, config: TileConfig, sm_count: "int | None"
 _TERMINAL_QUANT_ONE_CTA_MAX_M = 1408
 
 
+def _graph_shapes_fixed(graph) -> bool:
+    """Whether every execute runs the shapes the graph declared (neither dynamic
+    nor override-shape), so a plan may depend on the declared M/N."""
+    kwargs = getattr(graph, "_cpp_graph_kwargs", {})
+    return not (kwargs.get("is_dynamic_shape_enabled", False) or kwargs.get("is_override_shape_enabled", False))
+
+
 def _graph_dynamic_shapes(graph) -> bool:
     """Whether the frontend graph declared its shapes dynamic."""
     return bool(getattr(graph, "_cpp_graph_kwargs", {}).get("is_dynamic_shape_enabled", False))
@@ -4334,7 +4341,7 @@ def _dense_plain_config(chain: FusionChain, config: TileConfig) -> TileConfig:
     return pick if pick is not None else config
 
 
-def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None) -> TileConfig:
+def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None, narrow_n_ok: bool = False) -> TileConfig:
     """Choose one strategy, or replay the exact supplied knobs."""
     config = _baseline_config(chain, dynamic_shapes=dynamic_shapes, knobs=knobs)
     if knobs is not None or dynamic_shapes:
@@ -4344,7 +4351,7 @@ def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None)
     return select_strategy(chain, config, probe=probe_chain)
 
 
-def plan_configs(chain: FusionChain, *, dynamic_shapes: bool = False) -> list[TileConfig]:
+def plan_configs(chain: FusionChain, *, dynamic_shapes: bool = False, narrow_n_ok: bool = False) -> list[TileConfig]:
     """Choose a bounded list with the single-plan recommendation first."""
     config = _baseline_config(chain, dynamic_shapes=dynamic_shapes)
     if dynamic_shapes:

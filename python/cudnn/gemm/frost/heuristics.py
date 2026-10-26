@@ -34,12 +34,13 @@ class GemmFacts:
 
     chain: Any  # fusion_ir.FusionChain
     dynamic_shapes: bool  # the graph declared dynamic shapes (split-K is skipped)
+    shapes_fixed: bool = False  # neither dynamic nor override-shape: plans may rely on the declared M/N
 
 
 def analyze_facts(graph) -> Optional[GemmFacts]:
     """The manifest's ``analyzer`` hook: facts for a GEMM graph, or None when
     the FROST analyzer cannot express it (the backend then serves it alone)."""
-    from .compiler import _graph_dynamic_shapes
+    from .compiler import _graph_dynamic_shapes, _graph_shapes_fixed
     from .graph_analyzer import _graph_has_gemm, analyze
 
     if not _graph_has_gemm(graph):
@@ -49,7 +50,7 @@ def analyze_facts(graph) -> Optional[GemmFacts]:
     except (NotImplementedError, ValueError, KeyError) as exc:
         _LOG.debug("frost_gemm analyzer declined the graph: %s", exc)
         return None
-    return GemmFacts(chain=chain, dynamic_shapes=_graph_dynamic_shapes(graph))
+    return GemmFacts(chain=chain, dynamic_shapes=_graph_dynamic_shapes(graph), shapes_fixed=_graph_shapes_fixed(graph))
 
 
 def recommend(kind: str, facts: GemmFacts, offered: Dict[str, int]) -> List[PlanConfig]:
@@ -62,7 +63,7 @@ def recommend(kind: str, facts: GemmFacts, offered: Dict[str, int]) -> List[Plan
 
     try:
         probe_cutedsl()
-        configs = plan_configs(facts.chain, dynamic_shapes=facts.dynamic_shapes)
+        configs = plan_configs(facts.chain, dynamic_shapes=facts.dynamic_shapes, narrow_n_ok=facts.shapes_fixed)
     except (NotImplementedError, ValueError, KeyError) as exc:
         _LOG.debug("frost_gemm proposes nothing (%s): %s", kind, exc)
         return []

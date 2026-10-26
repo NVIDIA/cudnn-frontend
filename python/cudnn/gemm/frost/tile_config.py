@@ -1187,6 +1187,24 @@ def as_pipeline(cfg: TileConfig, pipeline: str) -> TileConfig:
 # ---------------------------------------------------------------------------
 
 
+# An N tile below 128 reads a sub-range of one 128-row SFB block. SF for row
+# 32*c + l sits in TMEM column c, lane l, and tcgen05.mma faults on an odd SFB
+# column shift: a 64-wide tile shifts by 0 or 2 columns (any N), while 8/16/32
+# tiles shift only the utccp SMEM source and so need the kernel N extent <= 32.
+BLOCK_SCALE_NARROW_N = (8, 16, 32, 64)
+BLOCK_SCALE_NARROW_MAX_N = 32
+
+
+def block_scale_narrow_n_ok(cfg: TileConfig) -> bool:
+    return (
+        cfg.mma_tile_n in BLOCK_SCALE_NARROW_N
+        and cfg.cta_tile_n == cfg.mma_tile_n
+        and getattr(cfg, "cta_group", 1) == 1
+        and cfg.cga_size_n == 1
+        and cfg.pipeline == "sm100"
+    )
+
+
 def validate_block_scale_config_sm100(cfg: TileConfig, block_size: int, cta_tile_k_elems: int) -> None:
     """Raise if ``cfg``'s GEOMETRY cannot run a tcgen05 block-scaled matmul (the
     sm100 family; sm103 differs only in its 384-byte K-tile). ``cta_tile_k_elems``
@@ -1201,11 +1219,12 @@ def validate_block_scale_config_sm100(cfg: TileConfig, block_size: int, cta_tile
             f"each MMA instruction must cover whole SF blocks); config {cfg.name!r} "
             f"has cta_tile_m={cfg.cta_tile_m} / mma_size_m={cfg.mma_size_m} = {cfg.mma_tile_m}"
         )
-    if cfg.mma_tile_n % 128 != 0:
+    if cfg.mma_tile_n % 128 != 0 and not block_scale_narrow_n_ok(cfg):
         raise NotImplementedError(
             f"block-scaled matmul requires mma_tile_n % 128 == 0 (SF 128x4 swizzle: "
-            f"each MMA instruction must cover whole SF blocks); config {cfg.name!r} "
-            f"has mma_tile_n={cfg.mma_tile_n}"
+            f"each MMA instruction must cover whole SF blocks), or a narrow N in "
+            f"{BLOCK_SCALE_NARROW_N} on a 1-CTA, cluster-N 1 sm100 tile; config "
+            f"{cfg.name!r} has mma_tile_n={cfg.mma_tile_n}"
         )
     # The 64-byte MMA-inst K is SM 10.7+ SILICON, not a pipeline property, so it
     # is gated on the ACTIVE GPU here rather than by a config family. No GPU

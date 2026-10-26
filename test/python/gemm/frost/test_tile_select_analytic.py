@@ -492,7 +492,7 @@ def test_both_compilers_delegate_joint_selection_but_replay_and_dynamic_bypass_i
     compiler = importlib.import_module(f"cudnn.gemm.frost.{family}.compiler")
     calls = []
 
-    def select(chain, baseline, *, probe):
+    def select(chain, baseline, *, probe, **_):
         assert probe == compiler.probe_chain
         calls.append(baseline)
         return replace(baseline, split_k_slices=3)
@@ -505,7 +505,7 @@ def test_both_compilers_delegate_joint_selection_but_replay_and_dynamic_bypass_i
     config = replace(calls[0], split_k_slices=7, swap_ab=True)
     assert compiler.plan_config(None, knobs=GemmKnobs.from_config(config)) == config
     assert len(calls) == 1
-    monkeypatch.setattr(planning, "select_strategies", lambda chain, baseline, *, probe: [select(chain, baseline, probe=probe), baseline])
+    monkeypatch.setattr(planning, "select_strategies", lambda chain, baseline, *, probe, **_: [select(chain, baseline, probe=probe), baseline])
     assert compiler.plan_configs(chain)[0].split_k_slices == 3
     assert len(calls) == 2
     dynamic = compiler.plan_configs(chain, dynamic_shapes=True)

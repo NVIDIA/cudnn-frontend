@@ -1512,7 +1512,7 @@ def _render_block_scale_tile_constants(
     sizing and the SMEM→TMEM (utccp) copy schedules.
     """
     _check_own_family(tmpl)
-    from ..tile_config import CtaPairTileConfig, validate_block_scale_config_sm100
+    from ..tile_config import BLOCK_SCALE_NARROW_MAX_N, CtaPairTileConfig, validate_block_scale_config_sm100
 
     if tmpl.warps_per_cta is not None:
         cfg = replace(cfg, warps_per_cta=tmpl.warps_per_cta)
@@ -1609,9 +1609,19 @@ def _render_block_scale_tile_constants(
     sf_k = cta_k_elems // bs.block_size  # SF values along K per tile
     sf_k4 = sf_k // 4  # 4 SF-K per utccp atom
     nb_m = cta_m // 128
-    nb_n = cta_n // 128
+    # A narrow N tile still stages and copies one whole 128-row SFB block and
+    # reads its own sub-range (tile_config.block_scale_narrow_n_ok).
+    sfb_sub_tile_n = cta_n if cta_n < 128 else 0
+    if sfb_sub_tile_n and chain.moe is not None:
+        raise NotImplementedError(f"block-scale {cfg.name!r}: the MoE templates do not address an SFB sub-tile (N tile {cta_n} < 128)")
+    if sfb_sub_tile_n and sfb_sub_tile_n < 64 and chain.matmul.N > BLOCK_SCALE_NARROW_MAX_N:
+        raise NotImplementedError(
+            f"block-scale {cfg.name!r}: an N tile of {cta_n} needs the kernel N extent <= "
+            f"{BLOCK_SCALE_NARROW_MAX_N} (an odd SFB TMEM column shift faults tcgen05.mma); got N={chain.matmul.N}"
+        )
+    nb_n = max(1, cta_n // 128)
     mma_nb_m = cfg.mma_tile_m // 128
-    mma_nb_n = cfg.mma_tile_n // 128
+    mma_nb_n = max(1, cfg.mma_tile_n // 128)
     sfa_nb_m = mma_nb_m * cfg.mma_size_m
 
     _REGISTERS_PER_ATOM = 4  # cols per 128×4 utccp atom
@@ -1650,7 +1660,10 @@ def _render_block_scale_tile_constants(
 
     # SF SMEM bytes per stage (sf_dtype 1 byte; whole k-tile loaded by TMA).
     sfa_smem_bytes = cta_m * sf_k
-    sfb_smem_bytes = cta_n * sf_k
+    # A tile narrower than 64 starts its utccp source up to 31 rows into the
+    # block and reads one atom, so the ring carries one atom of slack.
+    sfb_tma_bytes = nb_n * 128 * sf_k  # what the SFB TMA writes (and the mbarrier expects)
+    sfb_smem_bytes = sfb_tma_bytes + (512 if 0 < sfb_sub_tile_n < 64 else 0)
     # SF TMA box (fp16-recast trick): inner 256 fp16 (=512 B = one 128×4 SF atom
     # block, hardcoded in the template), box-K = sf_k4 atoms.
     sf_tma_box_k = sf_k4
@@ -2050,6 +2063,7 @@ def _render_block_scale_tile_constants(
         f"word_atoms = {word_atoms}",
         f"num_blocks_m = {nb_m}",
         f"num_blocks_n = {nb_n}",
+        f"sfb_sub_tile_n = {sfb_sub_tile_n}",
         f"registers_per_block = {_REGISTERS_PER_BLOCK}",
         f"epi_cols_per_mma_m = {epi_cols_per_mma_m}",
         f"mma_c_dtype = {DTYPE_TO_CUTLASS[chain.matmul.accum_dtype]}",
@@ -2065,6 +2079,7 @@ def _render_block_scale_tile_constants(
         f"b_collector_ok = {_b_collector_ok(cfg)}",
         f"sfa_smem_bytes = {sfa_smem_bytes}",
         f"sfb_smem_bytes = {sfb_smem_bytes}",
+        f"sfb_tma_bytes = {sfb_tma_bytes}",
         f"sf_tma_box_k = {sf_tma_box_k}",
         f"sfa_tma_box_mn = {nb_m}",
         f"sfb_tma_box_mn = {nb_n}",
@@ -3104,6 +3119,7 @@ class CompiledFusedGemm:
         needs_workspace = bool(r.workspace_bytes)
         split_k_slices = self.config.split_k_slices
         swap_ab = self.config.swap_ab
+        narrow_n_limit = self._narrow_n_limit()
         packed_scale_slots = frozenset(
             o.index for o in r.outputs if o.role.startswith("quant_scale_") and self.chain.quants[int(o.role.rsplit("_", 1)[1])].scale_reorder == "F8_128x4"
         )
@@ -3145,6 +3161,9 @@ class CompiledFusedGemm:
                 gave_up["A or B is not rank 3"] += 1
                 return refuse(operands, graph_order)
             m, n, k = a_sh[1], b_sh[1], a_sh[2] * a_kpack
+            if narrow_n_limit and n > narrow_n_limit:
+                gave_up["narrow SFB tile past its N extent"] += 1
+                return refuse(operands, graph_order)
             # permute(1, 2, 0) relabels axes, so the strides the kernel wants are
             # that rotation of the ones each check already read -- no second read.
             problem = [m, n, k, batch]
@@ -3270,6 +3289,12 @@ class CompiledFusedGemm:
 
         return lowered
 
+    def _narrow_n_limit(self) -> int:
+        """The kernel-N bound of a block-scale N tile below 64, else 0."""
+        from ..tile_config import BLOCK_SCALE_NARROW_MAX_N
+
+        return BLOCK_SCALE_NARROW_MAX_N if self.chain.has_block_scale and self.config.cta_tile_n < 64 else 0
+
     def explain(self, operands, graph_order=None):
         """Say what is wrong with a call the launch path refused, and raise.
 
@@ -3289,6 +3314,13 @@ class CompiledFusedGemm:
         recipe = self.recipe
         _check_plan_device(recipe.device)
         mnk, axes = recipe.problem(operands, graph_order)
+        limit = self._narrow_n_limit()
+        kernel_n = mnk[1]  # the kernel's N: the token count under swap-AB
+        if limit and kernel_n > limit:
+            raise ValueError(
+                f"cudnn.frost gemm: plan {self.config.name!r} reads a sub-tile of the 128-row SFB block and "
+                f"serves a kernel N of at most {limit}; this call has N={kernel_n}. Build the plan for this M."
+            )
         check_shapes(recipe, operands, mnk, axes)
         check_alignment(recipe, operands, axes)
         raise RuntimeError(
@@ -4117,17 +4149,28 @@ def _auto_split_k(chain: FusionChain, config: TileConfig, sm_count: "int | None"
 _TERMINAL_QUANT_ONE_CTA_MAX_M = 1408
 
 
+def _graph_shapes_fixed(graph) -> bool:
+    """Whether every execute runs the shapes the graph declared (neither dynamic
+    nor override-shape), so a plan may depend on the declared M/N."""
+    kwargs = getattr(graph, "_cpp_graph_kwargs", {})
+    return not (kwargs.get("is_dynamic_shape_enabled", False) or kwargs.get("is_override_shape_enabled", False))
+
+
 def _graph_dynamic_shapes(graph) -> bool:
     """Whether the frontend graph declared its shapes dynamic."""
     return bool(getattr(graph, "_cpp_graph_kwargs", {}).get("is_dynamic_shape_enabled", False))
 
 
-def _baseline_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None) -> TileConfig:
+def _baseline_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None, narrow_n_ok: bool = False) -> TileConfig:
     if knobs is not None:
         try:
             config = knobs.to_config()
         except (KeyError, ValueError, NotImplementedError) as exc:
             raise NotImplementedError(f"frost_gemm: knobs do not name a canonical tile config: {exc}") from exc
+        if chain is not None and chain.has_block_scale and config.cta_tile_n < 64 and not narrow_n_ok:
+            # Its N bound is a property of the declared shape, which an
+            # override-shape or dynamic graph does not promise at execute.
+            raise NotImplementedError("frost_gemm: a block-scale N tile below 64 needs fixed graph shapes")
         if dynamic_shapes and config.split_k_slices != 1:
             # Same rule as the automatic pick below: the slice count is fixed at
             # plan time and a runtime K may not tile it, so a replayed record
@@ -4173,24 +4216,24 @@ def _baseline_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=
     return _auto_split_k(chain, config)
 
 
-def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None) -> TileConfig:
+def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None, narrow_n_ok: bool = False) -> TileConfig:
     """Choose one strategy, or replay the exact supplied knobs."""
-    config = _baseline_config(chain, dynamic_shapes=dynamic_shapes, knobs=knobs)
+    config = _baseline_config(chain, dynamic_shapes=dynamic_shapes, knobs=knobs, narrow_n_ok=narrow_n_ok)
     if knobs is not None or dynamic_shapes:
         return config
     from ..planning import select_strategy
 
-    return select_strategy(chain, config, probe=probe_chain)
+    return select_strategy(chain, config, probe=probe_chain, narrow_n_ok=narrow_n_ok)
 
 
-def plan_configs(chain: FusionChain, *, dynamic_shapes: bool = False) -> list[TileConfig]:
+def plan_configs(chain: FusionChain, *, dynamic_shapes: bool = False, narrow_n_ok: bool = False) -> list[TileConfig]:
     """Choose a bounded list with the single-plan recommendation first."""
     config = _baseline_config(chain, dynamic_shapes=dynamic_shapes)
     if dynamic_shapes:
         return [config]
     from ..planning import select_strategies
 
-    return select_strategies(chain, config, probe=probe_chain)
+    return select_strategies(chain, config, probe=probe_chain, narrow_n_ok=narrow_n_ok)
 
 
 def _precheck_plain(

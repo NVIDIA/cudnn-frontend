@@ -297,6 +297,42 @@ def split_candidates(chain: FusionChain, config: TileConfig) -> range:
     return range(1, maximum + 1)
 
 
+# Weight-streaming block-scale GEMMs at decode row counts sit outside every
+# fitted cost profile (M below its bound, the scalar alpha MUL outside its gate),
+# so they take this rule instead: swap the tokens onto the MMA N axis and split K
+# for one wave.  Measured on B200 against the default plan and the cuDNN backend.
+SMALL_M_BLOCK_SCALE_MAX_TOKENS = 32
+# A 64-wide tile pads every token sub-tile to 64; past this many weight tiles the
+# backend's 2-CTA plan wins (measured at N = 8192 / 14336).
+SMALL_M_WIDE_TILE_MAX_WEIGHT_TILES = 48
+
+
+def small_m_block_scale_config(chain: FusionChain, baseline: TileConfig, device: DeviceProperties | None, narrow_n_ok: bool) -> TileConfig | None:
+    """The swap-AB, one-wave split-K plan for a block-scale GEMM with few rows, or None."""
+    from .tile_config import BLOCK_SCALE_NARROW_MAX_N
+
+    mm = chain.matmul
+    if device is None or baseline.pipeline != "sm100" or not chain.has_block_scale or not _block_scale_supported(chain):
+        return None
+    if chain.has_moe or chain.is_multi_gemm or chain.has_mainloop_fusion or chain.quants or chain.reductions or mm.batch != 1:
+        return None
+    if mm.M > SMALL_M_BLOCK_SCALE_MAX_TOKENS or mm.a_major != "k" or mm.b_major != "k" or mm.accum_dtype != "fp32":
+        return None
+    weight_tiles = _ceil_div(mm.N, 128)
+    if narrow_n_ok and mm.M <= BLOCK_SCALE_NARROW_MAX_N:
+        width = next(w for w in (8, 16, 32) if w >= mm.M)
+    elif weight_tiles <= SMALL_M_WIDE_TILE_MAX_WEIGHT_TILES:
+        width = 64
+    else:
+        return None
+    k_tile = baseline.cta_tile_k_bytes * 8 // max(DTYPE_BITS[mm.a_dtype], DTYPE_BITS[mm.b_dtype])
+    slices = 1
+    while slices * 2 <= min(16, _ceil_div(mm.K, k_tile)) and weight_tiles * slices * 2 <= device.sm_count:
+        slices *= 2
+    name = f"CONFIG_sm100_128x{width}x{baseline.cta_tile_k_bytes}_128x{width}x{baseline.mma_tile_k_bytes}_cluster1x1_1ctamma"
+    return replace(by_name(name), split_k_slices=slices, swap_ab=True)
+
+
 def candidate_configs(chain: FusionChain, baseline: TileConfig, device: DeviceProperties, profile: CostProfile) -> list[TileConfig]:
     candidates = {baseline: None}
     for swapped, view in ((False, chain), (True, swap_ab(chain))):
@@ -394,10 +430,19 @@ def select_strategies(
     probe: Callable[[FusionChain, TileConfig], None],
     device: DeviceProperties | None = None,
     limit: int = MAX_PLAN_CONFIGS,
+    narrow_n_ok: bool = False,
 ) -> list[TileConfig]:
     if not 1 <= limit <= MAX_PLAN_CONFIGS:
         raise ValueError(f"strategy limit must be between 1 and {MAX_PLAN_CONFIGS}")
     device = current_device_properties() if device is None else device
+    small_m = small_m_block_scale_config(chain, baseline, device, narrow_n_ok)
+    if small_m is not None:
+        try:
+            probe(chain, small_m)
+        except (NotImplementedError, ValueError):
+            small_m = None
+    if small_m is not None:
+        return [small_m, baseline][:limit]
     if device is None:
         return [baseline]
     profile = profile_for(chain, baseline, device)
@@ -458,5 +503,6 @@ def select_strategy(
     *,
     probe: Callable[[FusionChain, TileConfig], None],
     device: DeviceProperties | None = None,
+    narrow_n_ok: bool = False,
 ) -> TileConfig:
-    return select_strategies(chain, baseline, probe=probe, device=device, limit=1)[0]
+    return select_strategies(chain, baseline, probe=probe, device=device, limit=1, narrow_n_ok=narrow_n_ok)[0]

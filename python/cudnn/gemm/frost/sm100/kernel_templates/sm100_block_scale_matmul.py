@@ -513,10 +513,10 @@ def _kernel(
     sB_bytes = sB_elems * (b_smem_dtype.width // 8)
     if cutlass.const_expr(cta_group == 1):
         ab_only_copy_bytes = num_a_operands * sA_tma_bytes + num_b_operands * sB_tma_bytes
-        sf_only_copy_bytes = num_sfa_operands * sfa_smem_bytes + num_sfb_operands * sfb_smem_bytes
+        sf_only_copy_bytes = num_sfa_operands * sfa_smem_bytes + num_sfb_operands * sfb_tma_bytes
     else:
         ab_only_copy_bytes = (num_a_operands * sA_tma_bytes + num_b_operands * sB_tma_bytes) * 2
-        sf_only_copy_bytes = (num_sfa_operands * sfa_smem_bytes + num_sfb_operands * sfb_smem_bytes) * 2
+        sf_only_copy_bytes = (num_sfa_operands * sfa_smem_bytes + num_sfb_operands * sfb_tma_bytes) * 2
 
     if cutlass.const_expr(cta_group == 2):
         # Per-CTA logical tile — the cluster cancels out, so these stay compile-time
@@ -1111,8 +1111,20 @@ def _kernel(
                 )
                 for j in range(num_sfb_operands)
             ]
+            # A narrow N tile reads its rows of the shared 128-row SFB block:
+            # the MMA trails the TMA warp's tile walk to locate them.
+            sfb_tile_n = init_tile_n
             while is_valid != 0:
                 acc_stage = tile_iter % acc_stages
+                if cutlass.const_expr(sfb_sub_tile_n >= 64):
+                    sfb_col_shift = ((sfb_tile_n * sfb_sub_tile_n) % 128) // 32
+                    sfb_mma_ptrs = [nvvm.make_tmem_ptr(sfb_tmem_bases[j] + sfb_col_shift, cutlass.Float32) for j in range(num_b_operands)]
+                else:
+                    sfb_mma_ptrs = sfb_scale_ptrs
+                if cutlass.const_expr(0 < sfb_sub_tile_n < 64):
+                    sfb_src_rows = (sfb_tile_n * sfb_sub_tile_n) % 32
+                else:
+                    sfb_src_rows = 0
                 if acc_stage == 0 and tile_iter != 0:
                     acc_empty_phase_bit = acc_empty_phase_bit ^ 1
 
@@ -1178,7 +1190,9 @@ def _kernel(
                                         nvvm.tcgen05_cp(
                                             s2t_shape,
                                             sfb_dst_ptrs[_bj][block_n][_a],
-                                            desc_sfb_bases[_bj] + (sf_atom_desc_stride * (sf_word * word_atoms + _a) + sf_block_desc_stride * block_n),
+                                            desc_sfb_bases[_bj]
+                                            + (sf_atom_desc_stride * (sf_word * word_atoms + _a) + sf_block_desc_stride * block_n)
+                                            + sfb_src_rows,
                                             group=_CTA_GROUP,
                                             multicast=s2t_multicast,
                                         )
@@ -1222,7 +1236,7 @@ def _kernel(
                                             idesc_k,
                                             enable_input_d=scale_d,
                                             scale_a=sfa_dst_ptrs[_ai][mma_m][0],
-                                            scale_b=sfb_scale_ptrs[_bj],
+                                            scale_b=sfb_mma_ptrs[_bj],
                                             scale_vec_size=scale_vec_size,
                                             collector_op=_a_collector_op(gemm_i),
                                             b_collector_op=_b_collector_op(mma_m),
@@ -1260,6 +1274,25 @@ def _kernel(
                 is_valid = vld
                 if cutlass.const_expr(split_k_slices > 1):
                     tile_l = _l_idx
+                if cutlass.const_expr(sfb_sub_tile_n > 0):
+                    mma_raw_m = _m_idx >> _preferred_cluster_m_shift
+                    mma_raw_n = _n_idx >> _preferred_cluster_n_shift
+                    mma_nt_m = gridx >> _preferred_cluster_m_shift
+                    mma_nt_n = gridy >> _preferred_cluster_n_shift
+                    if cutlass.const_expr(fallback_cluster_shape_mnk is not None):
+                        if (cluster_m != cluster_shape_mnk[0]) | (cluster_n != cluster_shape_mnk[1]):
+                            mma_raw_m = _m_idx >> _fallback_cluster_m_shift
+                            mma_raw_n = _n_idx >> _fallback_cluster_n_shift
+                            mma_nt_m = gridx >> _fallback_cluster_m_shift
+                            mma_nt_n = gridy >> _fallback_cluster_n_shift
+                    _unused_m, sfb_tile_n = _l2_swizzle_tile(
+                        mma_raw_m,
+                        mma_raw_n,
+                        mma_nt_m,
+                        mma_nt_n,
+                        swizzle_w,
+                        identity=tile_swizzle_n == 1,
+                    )
                 nvvm.bar_warp_sync(0xFFFFFFFF)
                 if elect_one:
                     empty_remote = nvvm.mapa(clc_empty_mbar_ptr.subview(consumer_stage), 0)
