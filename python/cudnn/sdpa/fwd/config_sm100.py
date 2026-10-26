@@ -93,6 +93,9 @@ from cudnn.sdpa.fwd.config_d128_family import (
 # Native half THD flavors whose worklist and Stats stores use packed heads.
 SM100_THD_PACK_GQA_SHAPES = frozenset({(128, 128)})
 
+# Native per-tensor FP8 bodies that compose page pools with THD Q/O maps.
+SM100_PAGED_FP8_THD_SHAPES = frozenset({(128, 128), (256, 256)})
+
 # Native half flavors whose PREFILL kernel stores the score side outputs -- the graph's optional
 # ``score_max`` / ``score_sum_exp`` fp32 (B, H_q, S_q, 1) ports: per Q row the softmax max in
 # natural units and the fp32 row-sum of exp(s - max), the two operands the LSE is built from

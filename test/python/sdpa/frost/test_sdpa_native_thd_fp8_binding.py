@@ -383,3 +383,62 @@ def test_thd_fp8_standalone_declared_length_counts(prefix_q, prefix_kv, native):
         torch.testing.assert_close(o.float(), reference, atol=0.015, rtol=0.03)
     finally:
         graph.reset()
+
+
+def _paged_origin_fixture():
+    from cudnn.sdpa.fwd.thd_origins import ROLES
+
+    spec, facts, frames = _fixture()
+    spec.paged, spec.page_size = True, 16
+    spec.paged_hnd, spec.paged_v_hnd = True, False
+    spec.origin_specs = ((0, 1, 1024, 64), None, None, (3, 1, 1024, 32), (4, 1, 8, 64))
+    facts["k"] = facts["k"]._replace(shape=(8, 2, 16, 128), strides=(4096, 2048, 128, 1), span=32768)
+    facts["v"] = facts["v"]._replace(shape=(8, 2, 16, 128), strides=(4096, 128, 256, 1), span=32768)
+    facts["block_table"] = prep.BufferFacts(0x60000000, "int32", (2, 0), 16, (4, 4), (4, 1))
+    facts["block_table_v"] = prep.BufferFacts(0x61000000, "int32", (2, 0), 34, (4, 4), (9, 2))
+    for i, (role, entry) in enumerate(zip(ROLES, spec.origin_specs)):
+        if entry is not None:
+            facts[role] = prep.BufferFacts(0x62000000 + i * 0x1000, f"int{entry[3]}", (2, 0), 5, (5,), (1,))
+    spec.native = cudnn._pybind_module._SdpaThdBinder(spec)
+    return spec, facts, frames, _ROLES + ROLES
+
+
+@pytest.mark.L0
+def test_paged_thd_fp8_binds_scales_and_origins_without_role_aliasing():
+    spec, facts, frames, roles = _paged_origin_fixture()
+    for offset in (0, 2**33):
+        fresh = {role: fact._replace(ptr=fact.ptr + offset) for role, fact in facts.items()}
+        frame, identity, amax = spec.native.bind_quantized(prep._native_pack_from_facts(fresh, roles), tuple(range(len(roles))), 0x50000000 + offset, 17)
+        assert identity == 0 and amax == fresh["amax_o"].ptr
+        assert frame[spec.index["descale_q_ptr"]] == fresh["descale_q"].ptr
+        assert frame[spec.index["table_strides"]] == (4, 1)
+        assert frame[spec.index["table_v_strides"]] == (9, 2)
+        assert frame[spec.index["thd_origin_ptrs"]] == tuple(fresh[name].ptr if name in fresh else None for name in roles[-5:])
+    assert frames == []
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("defect", ["offset_width", "offset_span", "offset_workspace", "offset_amax", "pool_stride", "scalar_shape"])
+def test_paged_thd_fp8_rejects_bad_bindings_before_writes(defect, monkeypatch):
+    writes = []
+    monkeypatch.setattr(prep._buffers, "fill_word_async", lambda *a: writes.append(a))
+    monkeypatch.setattr(prep._buffers, "memset_zero_async", lambda *a: writes.append(a))
+    spec, facts, frames, roles = _paged_origin_fixture()
+    pack = lambda: prep._native_pack_from_facts(facts, roles)
+    indices = tuple(range(len(roles)))
+    spec.native.bind_quantized(pack(), indices, 0x50000000, 17)
+    if defect == "offset_width":
+        facts["ragged_q"] = facts["ragged_q"]._replace(dtype="int32")
+    elif defect == "offset_span":
+        facts["ragged_stats"] = facts["ragged_stats"]._replace(span=4)
+    elif defect == "offset_workspace":
+        facts["ragged_stats"] = facts["ragged_stats"]._replace(ptr=0x50000000)
+    elif defect == "offset_amax":
+        facts["amax_o"] = facts["amax_o"]._replace(ptr=facts["ragged_stats"].ptr)
+    elif defect == "pool_stride":
+        facts["k"] = facts["k"]._replace(strides=(4352, 2176, 136, 1), span=34816)
+    else:
+        facts["scale_o"] = facts["scale_o"]._replace(shape=(2,), span=2)
+    with pytest.raises(ValueError):
+        spec.native.execute(pack(), indices, 0x50000000, 17)
+    assert frames == writes == []

@@ -2491,9 +2491,9 @@ def _mk_paged_graph_fp8(*, d=128, page_size=16, max_pages=8, hnd=True, thd=False
 
 
 def test_paged_fp8_probe_accepts_and_declines():
-    """Paged per-tensor FP8 admits D128 and D256 pools in HND or NHD, dense Q
-    only, with D64 on its envelope. THD queries and off-contract page sizes
-    remain declined. The f16/bf16 row never serves an sdpa_fp8 graph."""
+    """Paged per-tensor FP8 admits native D128/D256 with dense or THD Q.
+    D64 serves dense Q only. Off-contract pages remain declined, and the
+    f16/bf16 row never serves an sdpa_fp8 graph."""
     fp8_name = engines.engine_name(fp8=True)
     for hnd in (True, False):
         facts = _facts(_mk_paged_graph_fp8(hnd=hnd))
@@ -2506,7 +2506,10 @@ def test_paged_fp8_probe_accepts_and_declines():
         assert fp8_name in _eligible(_mk_paged_graph_fp8(d=256, hnd=hnd))
     assert fp8_name not in _eligible(_mk_paged_graph_fp8(d=192)), "(192, 192) has no supported kernel envelope"
     assert fp8_name not in _eligible(_mk_paged_graph_fp8(page_size=48)), "page_size must divide 128 or be a multiple of it"
-    assert fp8_name not in _eligible(_mk_paged_graph_fp8(thd=True)), "THD queries over FP8 pools clamp runtime K/V descriptors; declined"
+    for d in (128, 256):
+        for hnd in (True, False):
+            assert fp8_name in _eligible(_mk_paged_graph_fp8(d=d, hnd=hnd, thd=True))
+    assert fp8_name not in _eligible(_mk_paged_graph_fp8(d=64, thd=True))
 
 
 def test_paged_quantized_rows_mismatch_reasons():
@@ -2543,7 +2546,11 @@ def test_paged_quantized_rows_mismatch_reasons():
     assert engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=64, d_v=64)) is None
     assert "multiple of 128" in engines.mismatch(mxfp8, paged_facts(is_mxfp8=True))
     assert "paged attention" in engines.mismatch(fp8_rubin, paged_facts(is_fp8=True, device_cc=(10, 7)))
-    assert "THD" in engines.mismatch(fp8, paged_facts(is_fp8=True, thd=True))
+    for cc in ((10, 0), (10, 3)):
+        for d in (128, 256):
+            assert engines.mismatch(fp8, paged_facts(is_fp8=True, thd=True, d_qk=d, d_v=d, device_cc=cc)) is None
+    assert "dense-only" in engines.mismatch(fp8, paged_facts(is_fp8=True, thd=True, d_qk=64, d_v=64))
+    assert "native per-tensor D128/D256" in engines.mismatch(fp8, paged_facts(is_fp8=True, thd=True, d_qk=512, d_v=512))
     # Admission follows the selected flavor; D256 is exact, not a D192 envelope.
     assert engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=256, d_v=256)) is None
     assert "no kernel-flavor envelope" in engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=192, d_v=192))
