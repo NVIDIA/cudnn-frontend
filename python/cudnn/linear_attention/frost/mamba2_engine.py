@@ -474,9 +474,12 @@ class CompiledMamba2Bwd:
         V = v.dim[2]
         self.io_name = "float16" if q.get_data_type().name == "HALF" else "bfloat16"
         B = node.inputs["cu_seqlens"].dim[0] - 1
-        self.checkpoint = int(node.params.get("checkpoint_every_n_tokens", 0) or 0)
+        self.checkpoint_cadence = int(node.params.get("checkpoint_every_n_tokens", 0) or 0)
         self.has_state_checkpoints = "state_checkpoints" in node.inputs
-        self.reuse_series = self.has_state_checkpoints and self.checkpoint == self.b_t and node.inputs["state_checkpoints"].get_data_type().name != "FLOAT"
+        self.coarse_checkpoints = self.has_state_checkpoints and (
+            self.checkpoint_cadence > self.b_t or node.inputs["state_checkpoints"].get_data_type().name == "FLOAT"
+        )
+        self.reuse_series = self.has_state_checkpoints and not self.coarse_checkpoints
         self.has_initial_state = "initial_state" in node.inputs
         self.use_dstate_in = "d_final_state" in node.inputs
         self.use_dstate0 = "d_initial_state" in node.outputs
@@ -498,7 +501,7 @@ class CompiledMamba2Bwd:
             num_sm=self.num_sm,
             total_tokens=total,
             b_t=self.b_t,
-            cadence_tokens=self.checkpoint if self.has_state_checkpoints else 0,
+            cadence_tokens=self.checkpoint_cadence if self.has_state_checkpoints else 0,
             batch_invariant=self.batch_invariant,
             expand_num=1,
             reverse=True,
@@ -538,8 +541,9 @@ class CompiledMamba2Bwd:
                 ("state_g", layout.add(self.num_pieces * HO * V * K * 4), "float32", (self.num_pieces, HO, V, K)),
                 ("state_dx", layout.add(self.num_pieces * HO * V * K * 4), "float32", (self.num_pieces, HO, V, K)),
                 ("transition", layout.add(self.num_pieces * HO * 4), "float32", (self.num_pieces, HO)),
+                ("exit_base", layout.add(self.num_pieces * 4), "int32", (self.num_pieces,)),
             ]
-            if not self.reuse_series:
+            if not self.reuse_series and not self.coarse_checkpoints:
                 regions += [
                     ("state_h", layout.add(self.num_pieces * HO * V * K * 4), "float32", (self.num_pieces, HO, V, K)),
                     ("state_x", layout.add(self.num_pieces * HO * V * K * 4), "float32", (self.num_pieces, HO, V, K)),
@@ -558,14 +562,26 @@ class CompiledMamba2Bwd:
             regions.append(("recompute_tensormaps", layout.add(self.recompute_tensormap_words * 8, align=128), "int64", (self.recompute_tensormap_words,)))
             self.series_rows = max(total // self.b_t + B, 1)
             regions.append(("state_checkpoints", layout.add(self.series_rows * HO * K * V * 2), self.io_name, (self.series_rows, HO, V, K)))
+        if self.coarse_checkpoints and not self.chain:
+            # the series pass runs over checkpoint-seeded interval items, a whole number of row intervals each
+            interval_chunks = self.checkpoint_cadence // self.b_t
+            span_chunks = interval_chunks
+            if not self.batch_invariant:
+                ideal = compute_ideal_chunks(total, HO, self.num_sm, self.b_t)
+                span_chunks = interval_chunks * max(1, ideal // interval_chunks)
+            self.recompute_span_tokens = span_chunks * self.b_t
+            self.recompute_item_rows = max((total // (self.b_t * span_chunks) + 2 * B) * HO, 1)
+            regions.append(
+                ("work_items_recompute", layout.add(self.recompute_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.recompute_item_rows, WORK_ITEM_FIELDS))
+            )
+            regions.append(("work_count_recompute", layout.add(4), "int32", (1,)))
         if self.has_z:
             regions.append(("do_pre", layout.add(total * HO * V * 2), self.io_name, (total, HO, V)))
         if self.fold_dq:
             regions.append(("dq_ho", layout.add(total * HO * K * 2), self.io_name, (total, HO, K)))
         if self.fold_dk:
             regions.append(("dk_ho", layout.add(total * HO * K * 2), self.io_name, (total, HO, K)))
-        # exit-dot rows: one slot per chunk plus one past every sequence, under the slot formula
-        self.n_slots = total // self.b_t + 2 * self.num_pieces + 1
+        self.n_slots = total // self.b_t + 2 * B + 1
         regions.append(("exit_dots", layout.add(self.n_slots * HO * 4), "float32", (self.n_slots, HO)))
         regions.append(("gate_slots", layout.add(self.n_slots * 8), "int32", (self.n_slots, 2)))
         if self.skip_bwd_in_kernel and self.d_per_channel:
@@ -697,6 +713,7 @@ class CompiledMamba2Bwd:
         from the chain states), backward summary, reverse scalar chain and the bprop over the pieces, launched from one
         compiled host (kernel/mamba2_chain_backward_f16.py)."""
         regenerate = not self.reuse_series
+        coarse = self.coarse_checkpoints
         buffers = dict(
             q=q,
             k=k,
@@ -725,9 +742,11 @@ class CompiledMamba2Bwd:
             prefill_words=region["recompute_tensormaps"] if regenerate else None,
             bprop_words=region["tensormaps"],
             series=region["state_checkpoints"] if regenerate else state_checkpoints,
-            state_h=region["state_h"] if regenerate else None,
+            state_h=region["state_h"] if regenerate and not coarse else None,
             transition=region["transition"],
-            state_x=region["state_x"] if regenerate else None,
+            state_x=region["state_x"] if regenerate and not coarse else None,
+            seed_checkpoints=state_checkpoints if coarse else None,
+            seed_every_n_tokens=self.checkpoint_cadence if coarse else 0,
             state_g=region["state_g"],
             state_dx=region["state_dx"],
             seed=state0,
@@ -736,6 +755,7 @@ class CompiledMamba2Bwd:
             exit_dots=region["exit_dots"],
             skip_bwd_part=skip_bwd_part,
             exit_slots=region["gate_slots"],
+            exit_base=region["exit_base"],
         )
         if self.chain_launch is None:
             self.chain_launch = self.build_chain_backward(
@@ -771,6 +791,7 @@ class CompiledMamba2Bwd:
         """The uncut or warmup-split bprop over the forward's series, or the regenerate path (one host: table, one
         prologue, the recompute writing the chunk-cadence series, the bprop) when the graph passed none."""
         if not self.reuse_series:
+            coarse = self.coarse_checkpoints
             buffers = dict(
                 q=q,
                 k=k,
@@ -787,7 +808,7 @@ class CompiledMamba2Bwd:
                 exit_dots=region["exit_dots"],
                 skip_bwd_part=skip_bwd_part,
                 cu_seqlens=cu,
-                state_in=state0,
+                state_in=None if coarse else state0,
                 dstate_in=dstate_in,
                 dstate0=dstate0,
                 work_items=region["work_items"],
@@ -799,6 +820,11 @@ class CompiledMamba2Bwd:
                 recompute_workspace=region["recompute_tensormaps"],
                 bprop_workspace=region["tensormaps"],
                 exit_slots=region["gate_slots"],
+                seed_checkpoints=state_checkpoints if coarse else None,
+                series_items=region.get("work_items_recompute"),
+                series_count=region.get("work_count_recompute"),
+                seed_span_tokens=self.recompute_span_tokens if coarse else 0,
+                seed_every_n_tokens=self.checkpoint_cadence if coarse else 0,
             )
             if self.regenerate_launch is None:
                 self.regenerate_launch = self.build_regenerate_backward(

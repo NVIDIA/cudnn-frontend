@@ -1163,9 +1163,7 @@ def gdp_setup_context(ctx, inputs, output):
         plan_name,
     ) = inputs
     saved = [q, k, v, g, beta, cu_seqlens]
-    ctx.checkpoint_reuse = (
-        checkpoint_every_n_tokens > 0 and checkpoint_every_n_tokens % CHECKPOINT_CHUNK == 0 and output[2].numel() > 0 and checkpoint_dtype != torch.float32
-    )
+    ctx.checkpoint_reuse = checkpoint_every_n_tokens > 0 and checkpoint_every_n_tokens % CHECKPOINT_CHUNK == 0 and output[2].numel() > 0
     ctx.checkpoint_every_n_tokens = checkpoint_every_n_tokens if ctx.checkpoint_reuse else 0
     if ctx.checkpoint_reuse:
         saved.append(output[2])
@@ -1357,8 +1355,8 @@ def gated_delta_product(
             positive multiple of the kernel chunk size, 64. ``64`` lets the
             backward reuse the series; a multiple of ``lcm(64, n)`` puts every
             checkpoint on a real-token boundary.
-        checkpoint_dtype: ``None`` stores io-dtype rows; ``torch.float32`` stores fp32 rows for the caller.  The backward
-            reuses io rows at the chunk cadence, regenerates the dense series from coarser io rows and never keeps fp32 rows.
+        checkpoint_dtype: ``None`` stores io-dtype rows; ``torch.float32`` stores fp32 rows (the backward reuses io rows at the
+            chunk cadence and regenerates the dense series from any other rows).
         overwrite_initial_state: if ``True``, ``final_state`` is written
             into the ``initial_state`` buffer, which is required and
             returned as the final state; the engine runs the chain or the

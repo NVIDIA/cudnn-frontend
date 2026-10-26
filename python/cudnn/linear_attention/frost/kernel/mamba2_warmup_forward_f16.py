@@ -548,6 +548,7 @@ def recompute_host(
         scheduler,
         transition,
         checkpoint_every_n,
+        cutlass.Int32(0),
         dt_min,
         dt_max,
         workspace,

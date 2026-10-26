@@ -150,6 +150,7 @@ def chain_forward_host(
         None,
         None,
         None,
+        None,
         stream,
     )
     mamba2_recompute_f16.host(
@@ -171,6 +172,7 @@ def chain_forward_host(
         summary_count,
         scheduler_summary,
         transition,
+        cutlass.Int32(0),
         cutlass.Int32(0),
         dt_min,
         dt_max,
