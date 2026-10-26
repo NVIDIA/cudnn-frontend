@@ -357,12 +357,15 @@ offset pointers, and captured graphs read changed offset values on replay.
 With paged K/V, only Q/O/Stats use physical THD origins; K and V keep their
 page-table addressing and page-layout descriptors. The setup retains the paged
 path's original sequence ranking and never clamps a page pool to a packed total.
-The admitted unsplit SM100 D128 CGA1 prefill leg also consumes these origins.
+The admitted SM100 D128 CGA1 paged legs also consume these origins. For split
+plans, per-sequence Q maps clip physical input slots while scratch partials keep
+the compact live prefix. The final combine places O and Stats at their own
+physical origins, using the current output stride and declared Stats layout.
 The existing one-query ragged decode path keeps its own offset binding.
 Paged half D256 THD also admits explicit PackGQA at CGA2 without splitting on
 SM100/SM103, using the same packed-head body as SM107. Nonpaged D256 THD
 packing remains declined; automatic candidate ranking is unchanged.
-Standalone compact-THD behavior, split/gated paths, other head dimensions
+Standalone compact-THD behavior, other split/gated paths, other head dimensions
 and other architectures are unchanged; this does not qualify their padded offsets.
 
 The opt-in **d128 backward** (`sdpa_bwd_sm100_d128`, engine 20609) selects

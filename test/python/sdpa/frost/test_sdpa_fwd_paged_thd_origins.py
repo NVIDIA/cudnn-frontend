@@ -12,21 +12,25 @@ pytestmark = [requires_dsl]
 
 
 @pytest.mark.parametrize(
-    "dim,dtype_name,pool_layout,stats_layout,cga",
+    "dim,dtype_name,pool_layout,stats_layout,cga,splits,pack_gqa",
     [
-        pytest.param(128, "bfloat16", "hnd", "token", 2, marks=pytest.mark.L0),
-        pytest.param(128, "float16", "nhd", "head", 2, marks=pytest.mark.L1),
-        pytest.param(128, "bfloat16", "mixed", "token", 2, marks=pytest.mark.L1),
-        pytest.param(256, "bfloat16", "hnd", "head", 2, marks=pytest.mark.L0),
-        pytest.param(256, "float16", "nhd", "token", 2, marks=pytest.mark.L1),
-        pytest.param(256, "bfloat16", "mixed", "head", 2, marks=pytest.mark.L1),
-        pytest.param(128, "bfloat16", "hnd", "token", 1, marks=pytest.mark.L0),
-        pytest.param(128, "float16", "nhd", "head", 1, marks=pytest.mark.L1),
-        pytest.param(128, "bfloat16", "mixed", "token", 1, marks=pytest.mark.L1),
-        pytest.param(128, "bfloat16", "hnd", "token", None, marks=pytest.mark.L0, id="engine_default"),
+        pytest.param(128, "bfloat16", "hnd", "token", 2, 1, True, marks=pytest.mark.L0),
+        pytest.param(128, "float16", "nhd", "head", 2, 1, True, marks=pytest.mark.L1),
+        pytest.param(128, "bfloat16", "mixed", "token", 2, 1, True, marks=pytest.mark.L1),
+        pytest.param(256, "bfloat16", "hnd", "head", 2, 1, True, marks=pytest.mark.L0),
+        pytest.param(256, "float16", "nhd", "token", 2, 1, True, marks=pytest.mark.L1),
+        pytest.param(256, "bfloat16", "mixed", "head", 2, 1, True, marks=pytest.mark.L1),
+        pytest.param(128, "bfloat16", "hnd", "token", 1, 1, True, marks=pytest.mark.L0),
+        pytest.param(128, "float16", "nhd", "head", 1, 1, True, marks=pytest.mark.L1),
+        pytest.param(128, "bfloat16", "mixed", "token", 1, 1, True, marks=pytest.mark.L1),
+        pytest.param(128, "bfloat16", "hnd", "token", None, 1, True, marks=pytest.mark.L0, id="engine_default"),
+        pytest.param(128, "bfloat16", "hnd", "token", 1, 2, True, marks=pytest.mark.L0, id="split2_hnd"),
+        pytest.param(128, "float16", "nhd", "head", 1, 3, True, marks=pytest.mark.L1, id="split3_nhd"),
+        pytest.param(128, "bfloat16", "mixed", "token", 1, 8, True, marks=pytest.mark.L1, id="split8_mixed"),
+        pytest.param(128, "bfloat16", "hnd", "head", 1, 2, False, marks=pytest.mark.L1, id="split2_unpacked"),
     ],
 )
-def test_paged_thd_origins_rebind_and_capture(dim, dtype_name, pool_layout, stats_layout, cga):
+def test_paged_thd_origins_rebind_and_capture(dim, dtype_name, pool_layout, stats_layout, cga, splits, pack_gqa):
     import cudnn
     import torch
     from cudnn.engines.manifest import family_for
@@ -70,8 +74,8 @@ def test_paged_thd_origins_rebind_and_capture(dim, dtype_name, pool_layout, stat
             result["ro_" + name] = torch.empty(batch + 1, 1, 1, 1, device="cuda", dtype=width)
         return result
 
-    def fill(values, shift, replay=False, keyless=False):
-        ql = [257, 49] if replay else [300, 177]
+    def fill(values, shift, replay=False, keyless=False, empty=False):
+        ql = ([257, 49] if replay else [300, 177]) if not empty else [0, 0]
         kl = [kv_max - 31, 4096 + 7] if replay else [kv_max, kv_max]
         if keyless:
             kl[1] = 0
@@ -141,7 +145,7 @@ def test_paged_thd_origins_rebind_and_capture(dim, dtype_name, pool_layout, stat
     else:
         graph.create_execution_plan(
             family_for(graph).offered_ids()["sdpa_fwd_prefill_sm100"],
-            {cudnn.knob_type.TILE_CGA_M: cga, cudnn.knob_type.SPLIT_KV: 1, cudnn.knob_type.PACK_GQA: 1},
+            {cudnn.knob_type.TILE_CGA_M: cga, cudnn.knob_type.SPLIT_KV: splits, cudnn.knob_type.PACK_GQA: int(pack_gqa)},
         )
         graph.select_plan(0)
     graph.check_support()
@@ -207,6 +211,12 @@ def test_paged_thd_origins_rebind_and_capture(dim, dtype_name, pool_layout, stat
                 graph.execute(pack, workspace, **overrides)
         for captured, values, shift in reversed(captures):
             state = fill(values, shift + 16, replay=True, keyless=shift == 0)
+            poison(values)
+            captured.replay()
+            torch.cuda.synchronize()
+            check(values, state)
+        for captured, values, shift in captures:
+            state = fill(values, shift, empty=True)
             poison(values)
             captured.replay()
             torch.cuda.synchronize()

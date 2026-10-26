@@ -112,3 +112,36 @@ def build_thd_origins(
 
 
 build_thd_origins.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
+@cute.kernel
+def build_paged_split_q_maps(
+    q, q_desc: cutlass.GridConstant[tmap.TensorMap], maps, origins, q_offsets, multiplier: cutlass.Constexpr[int], meta_t, batch: cutlass.Int32
+):
+    """Publish physical Q maps after compact split metadata has been built."""
+    tid = cutlass.Int32(cute.arch.thread_idx()[0])
+    origin = cutlass.make_array_view(origins)
+    offsets = cutlass.make_array_view(q_offsets)
+    for b in cutlass.range(tid, batch, THD_SETUP_THREADS, unroll=1):
+        origin[0, b] = cutlass.Int64(offsets[b]) * cutlass.Int64(multiplier) // cutlass.Int64(q.stride[1])
+    cute.arch.barrier()
+    if nvvm.elect_sync():
+        emit_seq_descs(
+            q_desc,
+            maps,
+            cutlass.make_array_view(meta_t),
+            batch,
+            q,
+            batch,
+            cutlass.Int64(q.stride[1]),
+            2,
+            slot_base=batch + 1,
+            first_batch=tid // 32,
+            batch_step=cutlass.Int32(THD_SETUP_THREADS // 32),
+            origins=origins,
+            origin_row=0,
+        )
+        nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
+
+
+build_paged_split_q_maps.set_name_prefix("cudnn", remove_cutlass_symbol=True)

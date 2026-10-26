@@ -4011,6 +4011,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 lse_kind="head" if self.thd_stats_head_major else "token",
                 paged_hnd=ps is not None and ps[1] < ps[2],
                 **({"has_sink": True} if self.has_sink else {}),
+                **({"thd_origin_specs": self._thd_origin_specs} if getattr(self, "_thd_origin_specs", None) is not None else {}),
             )
         if not self.thd or self.thd_decode_leg:
             # The ragged-Q decode leg's in-kernel LSE is the dense split-major
