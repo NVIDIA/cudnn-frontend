@@ -8406,7 +8406,7 @@ class GatedAttentionBlockFwd(APIBase):
         index_commit_present: bool = False,
         rope_position_tables_only: bool = False,
         # APPENDED (the lean block-sparse decode tile; performance-only, the block-sparse stage's knob): WHICH BODY of the index-list sparse
-        # core serves stage (4) on a QsaSpec geometry -- "auto" (the default): the placement rule (cc 10.7, B x H_kv x S_q <= 32 units, the
+        # core serves stage (4) on a QsaSpec geometry -- "auto" (the default): the placement rule (cc 10.7, B x H_kv x S_q <= 4 units, the
         # lean body admissible) on the parts of heuristics.SPARSE_LEAN_TILE_DEFAULT_CCS (cc 10.7 since the end-to-end gate measured the lean
         # route; the bound LEAN_SPARSE_MAX_UNITS = 4 units refit from its table), the tcgen05 core everywhere else; "lean": the lean decode
         # tile (mma.sync + cp.async, 128 threads per m16 tile, no TMEM / TMA / CLC; the DECODE mode over the pools at S_q <= 4 under the

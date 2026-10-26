@@ -3933,6 +3933,7 @@ LEAN_SPARSE_MAX_SUB_TILES_PER_CTA = 8  # the sub-tile loop is unrolled at trace 
 LEAN_SPARSE_TOPK_MIN = 8  # top_k < 8 is ONE sub-tile = split 1: the tcgen05 tile's cell (the adapter routes it there)
 LEAN_SPARSE_SERVED_MAX_S_Q = LEAN_SPARSE_MAX_SEQLEN_Q  # the step rows per sequence the ROUTE serves on the lean body = the kernel's own S_q bound (4: N_MT = ceil(S_q x G / 16) m16 tiles over ONE gathered sub-tile); the adapter and the heuristics read THIS constant, never a literal
 _LEAN_N_TAIL_MAX = 2  # the S_q <= 4 bound on the appended tail blocks (the same host bound at every S_q, so the S_q axis changes no grid)
+assert 1 <= LEAN_SPARSE_SERVED_MAX_S_Q <= LEAN_SPARSE_MAX_SEQLEN_Q  # the route never serves more rows than the kernel renders (the tripwire)
 _LEAN_S_EXCHANGE_BYTES = 4 * 4 * 32 * 16  # sS[4 warps][4 n-blocks][32 lanes][16 B] = 8 KiB per m-tile
 
 

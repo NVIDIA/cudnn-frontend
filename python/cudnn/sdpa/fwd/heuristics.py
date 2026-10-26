@@ -78,7 +78,6 @@ from cudnn.sdpa.fwd.config_sm107 import (
     LEAN_SPARSE_MAX_SUB_TILES_PER_CTA,
     LEAN_SPARSE_SERVED_MAX_S_Q,
     LEAN_SPARSE_TOPK_MIN,
-    SM107_FP32_VECTOR_WITH_BIAS_TILE_N,
     lean_sparse_n_sub,
     lean_sparse_split,
     sm107_bias_auto_cga,
@@ -828,7 +827,6 @@ def sparse_lean_splits(top_k: int) -> Tuple[int, ...]:
     11, 10, 9)`` at top_k 512, ``(2,)`` at top_k 8; every entry >= 2 (the lean tile always splits).  The grid's x extent and the combine's
     partial count; a pinned ``split_kv`` on the lean route must be one of them (it SELECTS k), any other value is a typed decline naming
     this list."""
-    n_sub = lean_sparse_n_sub(int(top_k))
     return tuple(sorted({lean_sparse_split(int(top_k), k) for k in range(1, sparse_lean_max_sub_tiles_per_cta(top_k) + 1)}, reverse=True))
 
 

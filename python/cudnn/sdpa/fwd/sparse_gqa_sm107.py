@@ -958,11 +958,13 @@ class SparseGqaFwdDslSm107:
         folds a 0 here.  ``split_kv > 1``: the fp32 O / LSE PARTIAL slabs the kernel writes and the combine reads (split-major,
         ``(B x S, S_q, H, D)`` + ``(B x S, H, S_q)``, 16-byte aligned; plus a final-LSE scratch when no LSE output is declared).
         THD: the int32 metadata buffer the setup launch fills (``THD_META_WORDS(B) = 4 B + 4`` words, 16-byte rounded: the
-        per-sequence KV lengths, both prefix sums, the live unit total and the claim counter)."""
-        if not self.thd and self.split_kv <= 1:
-            return 0
+        per-sequence KV lengths, both prefix sums, the live unit total and the claim counter).  The plan is RESOLVED first
+        (``check_support``): on the lean body ``split_kv`` becomes the lean split there, so a caller asking for the scratch size
+        before ``check_support()`` gets the slab, never the requested split's 0."""
         if not self._G:
             self.check_support()
+        if not self.thd and self.split_kv <= 1:
+            return 0
         if self.thd:
             return self._thd_meta_bytes(self._NSEQ)
         return self._split_workspace_bytes()

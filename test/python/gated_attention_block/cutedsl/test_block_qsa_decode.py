@@ -3350,6 +3350,10 @@ def test_sparse_tile_form_declaration_facts_and_the_auto_pin(monkeypatch):
             GEOM_SMALL, 1, 4, index_list_form="per_row"
         )  # per-row lists past one row: the core (the lean CTA gathers one list per sequence)
         assert sq4_per_row.sparse_tile == _TILE_TCGEN05 and not sq4_per_row.qsa_shared_list
+        sq2_per_row, _ = _declare(
+            GEOM_SMALL, 1, 2, index_list_form="per_row"
+        )  # inside the 4-unit bound (B 1 x H_kv 2 x S_q 2 = 4 units): ONLY the list-form rule keeps the core here (review of the first PR round)
+        assert sq2_per_row.sparse_tile == _TILE_TCGEN05 and sq2_per_row.sparse_tile_form == "tcgen05" and not sq2_per_row.qsa_shared_list
         monkeypatch.setattr(
             _H, "LEAN_SPARSE_SERVED_MAX_S_Q", 1
         )  # the served rows are ONE constant the rule reads (never a literal): one row -> the explicit lean declines S_q 2, AUTO keeps the lean tile at one row

@@ -1754,6 +1754,14 @@ def test_split_bound_and_workspace_per_form():
     assert unsplit.check_support() and unsplit.scratch_workspace_bytes() == 0 and unsplit.combine_form() == sc.DECODE_GRID_OFF
     auto_k2 = _route_adapter(sub_tiles_per_cta=2)  # AUTO inside the bound honours the lean body's k pin: split 33
     assert auto_k2.check_support() and auto_k2.tile_form == "lean" and (auto_k2.split_kv, auto_k2.sub_tiles_per_cta) == (33, 2)
+    # the workspace query RESOLVES the plan first: a caller asking before check_support() gets the lean split's slab, never the
+    # requested split's 0 (the early return for the unsplit core sits behind the resolution; review of the first PR round)
+    fresh = _route_adapter(tile_form="lean")
+    assert fresh.scratch_workspace_bytes() == slab_bytes(1, 1, 24, 65) and fresh.split_kv == 65 and fresh.check_support()
+    fresh_auto = _route_adapter()  # AUTO on the measured part inside the bound: the lean body, before any check_support()
+    assert fresh_auto.scratch_workspace_bytes() == slab_bytes(1, 1, 24, 65) and fresh_auto.tile_form == "lean"
+    fresh_core = _route_adapter(tile_form="tcgen05")  # the unsplit core still reports 0 before and after
+    assert fresh_core.scratch_workspace_bytes() == 0 and fresh_core.check_support() and fresh_core.scratch_workspace_bytes() == 0
 
 
 def test_lean_kernel_carries_its_census_name_and_the_tcgen05_core_keeps_its_own():

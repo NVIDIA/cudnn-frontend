@@ -351,7 +351,6 @@ if (
 
 LOG2E = 1.4426950408889634
 LN2 = 0.6931471805599453
-_I32_MAX_BLK = (2**31 - 1) // BLOCK_SIZE
 
 
 @cute.jit
@@ -834,7 +833,7 @@ def _kernel(
 
     # --- the accumulator initialisation (barrier table row `init`): O = 0, l = 0, m = -inf per lane; nothing carried between items.
     o_acc = []
-    for i in cutlass.range_constexpr(BMM2_N_BLOCKS * 4):
+    for _ in cutlass.range_constexpr(BMM2_N_BLOCKS * 4):
         o_acc.append(opaque_f32_zero())
     m_lo = NEG_INF
     m_hi = NEG_INF
@@ -857,7 +856,7 @@ def _kernel(
         # BMM1: S_w[16 x 32] = Q[16 x 64_w] . K[32 x 64_w]^T -- 4 k-steps x 4 n-blocks, the B fragments by ldmatrix.x4 (.row) out of sK.
         sK_stage = sK_raw.subview(stage * STAGE_ELEMS)
         s_acc = []
-        for i in cutlass.range_constexpr(BMM1_N_BLOCKS * 4):
+        for _ in cutlass.range_constexpr(BMM1_N_BLOCKS * 4):
             s_acc.append(opaque_f32_zero())
         for ks in cutlass.range_constexpr(BMM1_K_STEPS):
             kb = load_b_smem_x4(

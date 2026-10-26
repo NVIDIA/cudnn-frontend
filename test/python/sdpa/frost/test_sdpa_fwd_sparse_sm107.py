@@ -85,18 +85,20 @@ INDEX_LISTS_ENV = "CUDNN_FROST_QSA_INDEX_LISTS_DIR"
 
 
 def _kernel_source() -> str:
-    import cudnn.sdpa.fwd.config_sm107 as c107
+    from cudnn.sdpa.fwd import config_sm107 as c107
 
     path = os.path.join(os.path.dirname(os.path.abspath(c107.__file__)), "kernels", "sm107", "sparse_d256_f16.py")
-    return open(path).read()
+    with open(path) as f:
+        return f.read()
 
 
 def _item_common_source() -> str:
     """The visible-set helper both sparse bodies share (sm107/_sparse_item_common.py; the arithmetic that lived in this kernel)."""
-    import cudnn.sdpa.fwd.config_sm107 as c107
+    from cudnn.sdpa.fwd import config_sm107 as c107
 
     path = os.path.join(os.path.dirname(os.path.abspath(c107.__file__)), "kernels", "sm107", "_sparse_item_common.py")
-    return open(path).read()
+    with open(path) as f:
+        return f.read()
 
 
 def _adapter_source() -> str:
