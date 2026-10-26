@@ -30,7 +30,7 @@ import enum
 import importlib
 import json
 import struct
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List
 
 from .graph_types import NodeType, Tensor
 from .nodes import Node
@@ -77,6 +77,8 @@ def _resolve_type(path: str) -> type:
     obj: Any = importlib.import_module(module)
     for part in qualname.split("."):
         obj = getattr(obj, part)
+    if not (isinstance(obj, type) and hasattr(obj, "__members__")):
+        raise ValueError(f"serialized plan names a type that is not an enum: {path!r}")
     return obj
 
 
@@ -115,6 +117,8 @@ def _decode(value: Any, tensors: Dict[int, Tensor]) -> Any:
         t = _resolve_type(value["$enum"])
         # Values are the append-only contract for backend-mirrored enums (data_type, knob_type);
         # python enums are looked up by name.
+        if "value" in value and (type(value["value"]) is not int):
+            raise ValueError(f"serialized enum value must be an integer: {value!r}")
         return t(value["value"]) if "value" in value else t[value["name"]]
     raise ValueError(f"serialized plan holds an unknown value encoding: {sorted(value)}")
 
@@ -251,22 +255,24 @@ def deserialize(graph: "pygraph", data: Any, handle: Any = None, enforce_precomp
     if header.get("format") != FORMAT:
         raise ValueError(f"serialized python-engine plan has format {header.get('format')!r}; this frontend reads format {FORMAT}")
 
-    if handle is not None:
-        graph._handle = handle
-    _decode_graph(graph, header["graph"])
-
+    # Seed (and run the strict check) before touching the graph, so a refusal leaves it empty for a retry.
+    device = getattr(getattr(handle, "device", None), "ordinal", None)
     seeded = 0
     for description in header["kernels"]:
         offset, size = int(description.pop("offset")), int(description.pop("size"))
         if offset < 0 or offset + size > len(payload):
             raise ValueError("serialized python-engine plan is truncated")
-        if compiled_cache.seed_entry(description, bytes(payload[offset : offset + size])):
+        if compiled_cache.seed_entry(description, bytes(payload[offset : offset + size]), device=device):
             seeded += 1
     if enforce_precompiled and (not header["kernels"] or seeded != len(header["kernels"])):
         raise cudnn_graph_not_supported(
             f"enforce_precompiled: {seeded} of {len(header['kernels'])} compiled kernels in the blob match this environment "
             f"(frontend, CuTe DSL, tvm-ffi, driver, device) or the compiled cache is disabled; the plan would compile"
         )
+
+    if handle is not None:
+        graph._handle = handle
+    _decode_graph(graph, header["graph"])
 
     plan = header["plan"]
     knobs = {_decode(k, {}): int(v) for k, v in plan["knobs"]}

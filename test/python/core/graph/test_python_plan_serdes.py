@@ -10,7 +10,7 @@ import json
 import pytest
 
 import cudnn
-from cudnn import _plan_serdes as ps
+import cudnn._plan_serdes as ps
 
 pytestmark = pytest.mark.L0
 
@@ -86,3 +86,12 @@ def test_deserialize_of_a_python_plan_needs_an_empty_graph():
     header = json.dumps({"format": ps.FORMAT}).encode()
     with pytest.raises(RuntimeError, match="empty pygraph"):
         _sdpa_graph().deserialize(ps.MAGIC + ps._LEN.pack(len(header)) + header)
+
+
+def test_an_enum_entry_resolves_only_to_an_enum_with_an_integer_value():
+    data_type = ps._encode(cudnn.data_type.BFLOAT16, "x")
+    assert ps._decode(data_type, {}) == cudnn.data_type.BFLOAT16
+    with pytest.raises(ValueError, match="not an enum"):
+        ps._decode({"$enum": "cudnn._plan_serdes:serialize", "value": 1}, {})
+    with pytest.raises(ValueError, match="integer"):
+        ps._decode({**data_type, "value": True}, {})

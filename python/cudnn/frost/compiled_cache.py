@@ -813,18 +813,18 @@ def read_entry(entry: Path) -> Optional[Tuple[Dict[str, Any], bytes]]:
     return {"environment": manifest, "entry": entry.name, "record": record}, data
 
 
-def seed_entry(description: Dict[str, Any], data: bytes) -> bool:
+def seed_entry(description: Dict[str, Any], data: bytes, device: Optional[int] = None) -> bool:
     """Install an entry produced by :func:`read_entry` in another process; True when it is (or already was) present.
 
     Installed only when its environment manifest equals this process's exactly -- the same rule that
     keeps a stale artifact out of the cache, so a seeded entry is never one this process could not
-    have compiled itself. Anything else is refused and the kernel compiles as usual. The entry is
+    have compiled itself. ``device`` is the one the plan will build on (default: the current device). Anything else is refused and the kernel compiles as usual. The entry is
     written like an export (object first, record last), and loading it still goes through the key
     check in ``compile_cached``.
     """
     if not enabled():
         return False
-    manifest = environment_manifest()
+    manifest = environment_manifest(device)
     record = description.get("record")
     name = str(description.get("entry", ""))
     if (

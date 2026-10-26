@@ -54,7 +54,11 @@ g = cudnn.pygraph()
 try:
     g.deserialize(open(sys.argv[1], "rb").read(), enforce_precompiled=sys.argv[2] == "strict")
 except Exception as exc:
-    print(json.dumps({"error": f"{type(exc).__name__}: {exc}", "stats": cc.stats()})); sys.exit(0)
+    error = f"{type(exc).__name__}: {exc}"
+    if sys.argv[3:] != ["retry"]:
+        print(json.dumps({"error": error, "stats": cc.stats()})); sys.exit(0)
+    g.deserialize(open(sys.argv[1], "rb").read())  # a strict refusal leaves the graph empty: retry loose on it
+    print(json.dumps({"error": error, "digest": run(g), "stats": cc.stats()})); sys.exit(0)
 print(json.dumps({"digest": run(g), "plan": g.get_plan_name_at_index(g._plan_index), "stats": cc.stats()}))
 """
 
@@ -107,8 +111,9 @@ def test_kernels_from_another_environment_are_never_loaded(produced, tmp_path):
     assert "error" not in loose, loose
     assert loose["stats"]["seeded"] == 0 and loose["stats"]["seed_rejected"] >= 1 and loose["stats"]["misses"] >= 1, loose
     assert loose["digest"] == first["digest"]
-    strict = _child(_CONSUME, tmp_path / "strict_cache", foreign, "strict")
+    strict = _child(_CONSUME, tmp_path / "strict_cache", foreign, "strict", "retry")
     assert "enforce_precompiled" in strict.get("error", ""), strict
+    assert strict["digest"] == first["digest"], strict
 
 
 def test_a_blob_without_kernels_compiles_the_plan(produced, tmp_path):
