@@ -380,6 +380,23 @@ SM107_F16_SMALL_D_SHAPES = frozenset({(32, 32), (64, 64)})
 SM107_SMALL_D_CGAS = {(32, 32): frozenset({1}), (64, 64): frozenset({1, 2})}
 
 
+def supports_native_d128_narrow_tile(d_shape, *, device_cc, half_precision, thd, paged, cga, split_kv=1, has_bias=False, has_kv_mask=False):
+    """Whether TILE_N=64 selects the native D128 two-score-slot pipeline.
+
+    Dense CGA1, paged and ragged split plans use different bodies. Keep the
+    explicit knob domain shared by graph validation and standalone lowering.
+    """
+    return (
+        device_cc == (10, 7)
+        and half_precision
+        and d_shape == (128, 128)
+        and not paged
+        and not has_bias
+        and not has_kv_mask
+        and ((thd and split_kv == 1 and cga in (None, 1, 2)) or (not thd and cga in (None, 2)))
+    )
+
+
 def supports_native_d128_dense_partial_pack(d_shape, *, device_cc, fp8, thd, paged, cga):
     """Dense half graphs whose selected flavor uses native partial PackGQA.
 
@@ -2085,17 +2102,15 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
     o_div = o_pack_div(dtype_o)
     # TILE_N is a Cfg field (TemplateParams.tile_n): the quantized siblings keep 128 (their SF geometry is tied to the 128-column
     # tile), the f16/bf16 small tiles take 64 / 128 (SM107_TILE_NS_BY_D_SHAPE; the 64-wide rendering is trace-compiled and served
-    # through the TILE_N knob), the d128 rendering keeps 128; 256 is refused by _validate_tile_n.
+    # through the TILE_N knob), and the half D128 rendering takes 64 / 128; 256 is refused by _validate_tile_n.
     tile_n = int(getattr(params, "tile_n", 128))
-    if tile_n != 128 and (params.dtype_qkv <= _DTYPE_E5M2 or tile_k > 64):
-        raise ValueError(f"{flavor}: TILE_N = {tile_n} is wired on the f16/bf16 32- / 64-wide tiles only (the quantized and d128 renderings keep 128)")
+    if tile_n != 128 and (params.dtype_qkv <= _DTYPE_E5M2 or tile_k > 128 or (tile_k == 128 and tile_n != 64)):
+        raise ValueError(f"{flavor}: TILE_N = {tile_n} requires a supported half-precision width: D128 permits 64/128; quantized renderings keep 128")
     # The S / P slot count (TemplateParams.s_slots, appended; getattr so a record without the field renders one slot): 2 = the
     # double-buffered S of the f16/bf16 small tiles at TILE_N 64 -- _validate_tile_n pins the couplings (the TMEM fit, the width, the dtype).
     s_slots = int(getattr(params, "s_slots", 1))
-    if s_slots != 1 and (params.dtype_qkv <= _DTYPE_E5M2 or mxfp8 or tile_k > 64):
-        raise ValueError(
-            f"{flavor}: s_slots = {s_slots} (the double-buffered S) is wired on the f16/bf16 32- / 64-wide tiles only (the quantized and d128 renderings keep 1)"
-        )
+    if s_slots != 1 and (params.dtype_qkv <= _DTYPE_E5M2 or mxfp8 or tile_k > 128):
+        raise ValueError(f"{flavor}: s_slots = {s_slots} requires f16/bf16 TILE_K <= 128; quantized and wider renderings keep one slot")
     # Q resident in TMEM (TemplateParams.q_in_tmem, appended; getattr so a record without the field renders Q from SMEM): the f16/bf16
     # small tiles at cga1 / TILE_M 128 / two sub-tiles -- _validate_q_in_tmem pins every coupling (the TMEM fit, the UTCCP geometry, the dtype).
     q_in_tmem = int(getattr(params, "q_in_tmem", 0))

@@ -720,7 +720,7 @@ class KernelTmemLayout:
     S_OFF: Tuple[int, ...] = _TMEM.S_OFF
     P_OFF: Tuple[int, ...] = _TMEM.P_OFF
     O_OFF: Tuple[int, ...] = _TMEM.O_OFF
-    # The S / P slot axis (CFG.S_SLOTS; 1 on every rendering but the small tiles' double-buffered S at TILE_N 64): slot p of
+    # The S / P slot axis (CFG.S_SLOTS; two on the half small/D128 tiles with double-buffered S at TILE_N 64): slot p of
     # sub-tile qs sits at S{qs}_OFF + p * S_SLOT_STRIDE, its P at P{qs}_OFF + p * S_SLOT_STRIDE (0 at one slot).
     S_SLOTS: int = _TMEM.S_SLOTS
     S_SLOT_STRIDE: int = _TMEM.S_SLOT_STRIDE
@@ -732,7 +732,7 @@ class KernelTmemLayout:
 
 LAYOUT = KernelTmemLayout()
 
-# === The double-buffered S / P slot (CFG.S_SLOTS == 2; TemplateParams.s_slots; the f16/bf16 32- / 64-wide tiles at TILE_N 64) ===
+# === The double-buffered S / P slot (CFG.S_SLOTS == 2; TemplateParams.s_slots; the f16/bf16 32- / 64- / 128-wide tiles at TILE_N 64) ===
 #
 # Each softmax sub-tile owns TWO S / P TMEM slots and every role walks a depth-2 PipelineState cursor over them, advanced once per
 # NON-EMPTY kv tile (every role iterates the same bounds, so the cursors stay in lockstep across steps and items; an empty step / tile
@@ -770,9 +770,9 @@ LAYOUT = KernelTmemLayout()
 _S2: bool = CFG.S_SLOTS == 2
 if CFG.S_SLOTS not in (1, 2):
     raise ValueError(f"prefill_d128_f16_sm107: the body walks a 1- or 2-slot S / P cursor (CFG.S_SLOTS={CFG.S_SLOTS})")
-if _S2 and (CFG.TILE_N != 64 or CFG.TILE_K > 64 or IS_TF32):
+if _S2 and (CFG.TILE_N != 64 or CFG.TILE_K > 128 or IS_TF32):
     # config_sm107._validate_tile_n pins the same couplings at config-build time; this is the kernel's own backstop.
-    raise ValueError(f"prefill_d128_f16_sm107: the double-buffered S is the f16/bf16 small tiles' TILE_N 64 form (TILE_N={CFG.TILE_N}, TILE_K={CFG.TILE_K})")
+    raise ValueError(f"prefill_d128_f16_sm107: the double-buffered S requires f16/bf16, TILE_N 64 and TILE_K <= 128 (TILE_N={CFG.TILE_N}, TILE_K={CFG.TILE_K})")
 if _S2 and CFG.SOFTMAX_WARPGROUPS != 2:
     # config_sm107._validate_tile_n pins it too: `_mma_tile_s2` / `_mma_item_pair_s2` hand-unroll TWO sub-tiles (BMM1(k) x 2 ahead of
     # BMM2(k - 1) x 2) and the slot cursors' barrier audit is the two-group one; the third softmax warp group keeps one slot per sub-tile.

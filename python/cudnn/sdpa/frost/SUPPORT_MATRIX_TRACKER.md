@@ -2717,6 +2717,15 @@ partition on average; the final partition may contain a shorter tail. A full
 first wave keeps the unsplit plan. Packed Stats and bounded shape overrides
 use the same declared envelope; other requests retain their existing policy.
 
+### Native SM107 D128 narrow KV tile
+
+Native SM107 half D128 prefill also accepts explicit `TILE_N=64`, using two
+score/P slots per query subtile. Nonpaged unsplit THD supports CGA1/2; dense
+prefill uses CGA2, including its existing split plans and head-dimension
+envelopes. Bias and per-key-mask graphs, paged plans and the shared dense
+CGA1/split-THD decode body retain their existing tile domains. The D128
+default remains `TILE_N=128`; no placement or shape-selection rule changes.
+
 ### SM107 dense D128 partial PackGQA
 
 Explicit packed CGA2 plans on the native half D128 prefill body admit head

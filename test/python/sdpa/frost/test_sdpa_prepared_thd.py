@@ -282,7 +282,7 @@ def test_rubin_ragged_pack_rebind_and_changed_lengths_replay(dtype, stats_layout
 
 
 def _check_rubin_ragged_pack_rebind(
-    dtype, stats_layout, stats_log2, geometry, *, cga, causal=True, bottom_right=False, window_left=None, packed=None, sched_policy=1
+    dtype, stats_layout, stats_log2, geometry, *, cga, causal=True, bottom_right=False, window_left=None, packed=None, sched_policy=1, tile_n=None
 ):
     import inspect
 
@@ -325,12 +325,17 @@ def _check_rubin_ragged_pack_rebind(
             cudnn.knob_type.SCHED_POLICY: sched_policy,
         }
     )
+    if tile_n is not None:
+        knobs[cudnn.knob_type.TILE_N] = tile_n
     g.create_execution_plan(engine, knobs)
     g.select_plan(g.get_execution_plan_count() - 1)
     g.check_support()
     g.build_plans()
     api = inspect.getclosurevars(_plan(g)._compiled.default_stream).nonlocals["api"]
     assert api._k_mod.__file__.endswith("sm107/prefill_d128_f16.py")
+    if tile_n is not None:
+        assert api._k_mod.PARAMS.tile_n == api._k_mod.CFG.TILE_N == tile_n
+        assert api._k_mod.PARAMS.s_slots == api._k_mod.CFG.S_SLOTS == (2 if tile_n == 64 else 1)
     assert api._k_mod.CFG.CTA_MMA == cga
     assert api._k_mod.CFG.SOFTMAX_WARPGROUPS == 2
     assert api._k_mod.THD_PERSISTENT

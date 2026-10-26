@@ -133,7 +133,7 @@ def test_a_two_slot_record_degrades_the_knobless_group_count_to_two():
 
 
 def test_two_slots_off_the_domain_raise_typed():
-    """TILE_N 128 (the map ends past STATS), 3 slots, the d128 rendering, a quantized dtype and the third softmax warp group are raises that name the failure."""
+    """TILE_N 128 (the map ends past STATS), 3 slots, the d128 TILE_N 128 rendering, a quantized dtype and the third softmax warp group are raises that name the failure."""
     from cudnn.sdpa.fwd import config_sm107 as c
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
@@ -144,8 +144,10 @@ def test_two_slots_off_the_domain_raise_typed():
         c._validate_tile_n(dataclasses.replace(cfg, TILE_N=128, N_BMM2_CHUNKS=2, TILE_O=32), "probe")  # the explicit predicate, past the fit one
     with pytest.raises(ValueError, match="validated at S_SLOTS"):
         c.make_cfg_d32(TemplateParams(cta_mma=1, dtype_qkv=2, tile_n=64, s_slots=3))
-    with pytest.raises(ValueError, match="32- / 64-wide tiles only"):
+    with pytest.raises(ValueError, match="TMEM"):
         c.make_cfg_d128(TemplateParams(cta_mma=1, dtype_qkv=2, s_slots=2))
+    narrow, _ = c.make_cfg_d128(TemplateParams(cta_mma=2, dtype_qkv=2, tile_n=64, s_slots=2))
+    assert (narrow.TILE_N, narrow.S_SLOTS) == (64, 2)
     with pytest.raises(ValueError):
         c.make_cfg_d32(TemplateParams(cta_mma=1, dtype_qkv=0, tile_n=64, s_slots=2))
     with pytest.raises(
