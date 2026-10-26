@@ -1060,25 +1060,20 @@ def test_sm107_nonpaged_d128_thd_pack_gqa_contract(dtype_name, group, cga):
     assert engines.mismatch(caps, facts, dataclasses.replace(knobs, cga=4)) is not None
 
 
-def test_sm107_fp8_pack_gqa_is_d128_only():
-    """The Rubin per-tensor FP8 row packs GQA on the d128 flavor only (`pack_gqa_d_shapes = {(128, 128)}`: the
-    d192x128 / d256 / d512 siblings carry no PackGQA path) while it serves those flavors UNPACKED.  This is the
-    typed decline behind `_skip_pack_gqa_wide_on_rubin` in test_sdpa_fwd_fp8_sm100.py -- the one Rubin marker that
-    survived retiring the d128-only-era skips -- so it is asserted on real facts here, where no GPU is needed: a
-    packed d192 / d256 / d512 graph is ineligible with a reason naming the knob, the same graph unpacked is eligible,
-    and packed d128 is eligible.  When a wider kernel gains PackGQA: widen the row, INVERT that shape's packed
-    assertion and drop the marker (test/AGENTS.md: invert the counter assertion, do not delete it)."""
+def test_sm107_fp8_pack_gqa_serves_d64_and_d128():
+    """Native D64 and D128 pack GQA; wider siblings retain their typed decline."""
     from cudnn.sdpa.fwd import engines
 
     caps = _caps("sdpa_fwd_prefill_sm107_fp8")
-    assert caps.pack_gqa_d_shapes == frozenset({(128, 128)})
+    assert caps.pack_gqa_d_shapes == frozenset({(64, 64), (128, 128)})
     for d_qk, d_v in ((192, 128), (256, 256), (512, 512)):
         facts = _f16_facts(**_fp8_ungated_kw(h_kv=2, d_qk=d_qk, d_v=d_v))
         assert engines.mismatch(caps, facts) is None, (d_qk, d_v, "the unpacked graph must be served")
         why = engines.mismatch(caps, facts, engines.SdpaFwdKnobs(pack_gqa=True))
         assert why is not None and "pack_gqa" in why, (d_qk, d_v, why)
-    packed_d128 = _f16_facts(**_fp8_ungated_kw(h_kv=2, d_qk=128, d_v=128))
-    assert engines.mismatch(caps, packed_d128, engines.SdpaFwdKnobs(pack_gqa=True)) is None
+    for d in (64, 128):
+        packed = _f16_facts(**_fp8_ungated_kw(h_kv=2, d_qk=d, d_v=d))
+        assert engines.mismatch(caps, packed, engines.SdpaFwdKnobs(pack_gqa=True)) is None
 
 
 def test_sm107_fp8_paged_sink_declines():
@@ -1099,7 +1094,8 @@ def test_sm107_quantized_strided_stats_is_ported_for_all_flavors(family, monkeyp
     host_module = _fp8_host if family == "fp8" else _mxfp8_host
     load_kw = _DTYPE_FAMILIES[1 if family == "fp8" else 2][1]
     caps = _caps("sdpa_fwd_prefill_sm107_" + family)
-    assert caps.stats is True and caps.d_shapes == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
+    flavors = [(64, 64)] + _FLAVORS if family == "fp8" else _FLAVORS
+    assert caps.stats is True and caps.d_shapes == frozenset(flavors)
     captured = []
     sentinel = object()
 
@@ -1108,14 +1104,14 @@ def test_sm107_quantized_strided_stats_is_ported_for_all_flavors(family, monkeyp
         return sentinel
 
     monkeypatch.setattr(host_module, "compile_host", compile_host)
-    for flavor in _FLAVORS:
+    for flavor in flavors:
         mod = _load(flavor, rubin=True, **load_kw)
         assert not hasattr(mod, "compile"), "quantized attention must use the pointer compiler"
         with open(mod.__file__, encoding="utf-8") as fh:
             assert "strided Stats not ported" not in _code_lines(fh.read())
         # Bypass the memoized result so the real entry forwards its metadata.
         assert mod.compile_prepared.__wrapped__(d_qk=flavor[0], d_v=flavor[1], has_lse=True) is sentinel
-    assert len(captured) == len(_FLAVORS)
+    assert len(captured) == len(flavors)
 
 
 def test_sm107_rows_carry_the_padded_stats_trim():
@@ -1133,8 +1129,8 @@ def test_sm107_rows_serve_natural_scheduling_only():
     """The ROW-WIDE floor of every Rubin row stays NATURAL-only: every LPT
     variant is claimed per flavor (`sched_policies_by_d_shape`) where it is
     validated.  SCHED_LPT_L2 needs `qh_per_kh` / `seqlen_kv` at every decode
-    call site, which only the d128 / d192x128 FP8 and MXFP8 kernels pass, so it
-    may appear ONLY on those flavors -- INVERTED 2026-09-14 (it used to appear
+    call site. Native FP8 D64/D128/D192x128 and MXFP8 D128/D192x128
+    pass those inputs, so it may appear only on those flavors -- INVERTED 2026-09-14 (it used to appear
     on none, and the MXFP8 row claimed nothing beyond NATURAL).
 
     (This test used to assert LPT was "not honored" by the ported kernels; the
@@ -1144,7 +1140,7 @@ def test_sm107_rows_serve_natural_scheduling_only():
 
     lpt_l2_flavors = {
         "sdpa_fwd_prefill_sm107": set(),
-        "sdpa_fwd_prefill_sm107_fp8": {(128, 128), (192, 128)},
+        "sdpa_fwd_prefill_sm107_fp8": {(64, 64), (128, 128), (192, 128)},
         "sdpa_fwd_prefill_sm107_mxfp8": {(128, 128), (192, 128)},
     }
     for row, l2_shapes in lpt_l2_flavors.items():
