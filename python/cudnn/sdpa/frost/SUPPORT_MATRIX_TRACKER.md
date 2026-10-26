@@ -358,6 +358,9 @@ With paged K/V, only Q/O/Stats use physical THD origins; K and V keep their
 page-table addressing and page-layout descriptors. The setup retains the paged
 path's original sequence ranking and never clamps a page pool to a packed total.
 The existing one-query ragged decode path keeps its own offset binding.
+Paged half D256 THD also admits explicit PackGQA at CGA2 without splitting on
+SM100/SM103, using the same packed-head body as SM107. Nonpaged D256 THD
+packing remains declined; automatic candidate ranking is unchanged.
 Standalone compact-THD behavior, split/gated paths, other head dimensions
 and other architectures are unchanged; this does not qualify their padded offsets.
 

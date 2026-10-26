@@ -1655,6 +1655,15 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 facts.thd
                 and not ragged_decode
                 and not (packed_split and (facts.d_qk, facts.d_v) == (64, 64))
+                and not supports_paged_d256_pack_gqa(
+                    (facts.d_qk, facts.d_v),
+                    device_cc=facts.device_cc,
+                    fp8=facts.is_fp8 or facts.is_mxfp8,
+                    thd=facts.thd,
+                    paged=facts.has_paged_kv,
+                    cga=knobs.cga,
+                    split_kv=knobs.split_kv or 1,
+                )
                 and (facts.d_qk, facts.d_v) not in capabilities.thd_pack_gqa_d_shapes
             ):
                 return "PackGQA is not supported for this THD/ragged flavor (except the decode tile's ragged-Q leg)"

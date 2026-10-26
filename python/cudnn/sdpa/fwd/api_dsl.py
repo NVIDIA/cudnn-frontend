@@ -2563,7 +2563,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     and self.split_kv == 1
                 ),
                 "THD PackGQA requires half D128 cga2 unsplit/cga1 split, native Rubin nonpaged D128 cga1/2 unsplit, "
-                "Rubin paged D128 cga1 unsplit, or Rubin paged D256 cga2 unsplit",
+                "Rubin paged D128 cga1 unsplit, or SM100/103/107 paged D256 cga2 unsplit",
             )
             # Partial PackGQA (the largest divisor of the group that divides the
             # tile) is wired in SM100 d128 / d256 half and the qualified Rubin
