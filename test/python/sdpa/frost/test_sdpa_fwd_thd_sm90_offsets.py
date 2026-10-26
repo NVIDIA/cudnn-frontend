@@ -51,7 +51,7 @@ def _starts(lens, pads, lead=0):
     return starts, t
 
 
-def _run_padded(
+def _run_padded_full(
     lens_q,
     lens_kv,
     pads,
@@ -74,9 +74,9 @@ def _run_padded(
     the O (and Stats) storage and the per-port geometry. ``stats`` is None, ``"token_major"``
     (packed (T, H)) or ``"head_major"`` (packed (H, T)); ``edit_offsets(port, values)`` may
     rewrite a port's offset values after the geometry is laid out; ``lead`` gives a port empty
-    rows before its first sequence; ``slack`` adds spare rows to every buffer. ``handles`` also
-    returns the graph, its variant pack, workspace, offset and length tensors and token strides,
-    for a caller that re-executes or captures the plan."""
+    rows before its first sequence; ``slack`` adds spare rows to every buffer. The fourth value
+    is None, or with ``handles`` the graph, its variant pack, workspace, offset and length tensors
+    and token strides, for a caller that re-executes or captures the plan."""
     dev = "cuda"
     gen = torch.Generator(device=dev).manual_seed(seed)
     b = len(lens_q)
@@ -174,7 +174,12 @@ def _run_padded(
     torch.cuda.synchronize()
     if handles:
         return packed, stor, geom, SimpleNamespace(g=g, vp=vp, workspace=workspace, ro=ro_by_port, ts=ts_by_port, slq=slq, slk=slk)
-    return packed, stor, geom
+    return packed, stor, geom, None
+
+
+def _run_padded(*args, **kwargs):
+    """``_run_padded_full`` without the handles: the packed Q/K/V, the O (and Stats) storage and the geometry."""
+    return _run_padded_full(*args, **kwargs)[:3]
 
 
 def _check(lens_q, lens_kv, packed, stor, geom, mask, stats=None, skip=()):
@@ -298,7 +303,7 @@ def test_sm90_thd_cuda_graph_replay_reads_new_offsets():
     """TE replays one captured graph while ``cu_seqlens_padded`` changes every step: a replay
     reads the offsets and lengths bound at replay time, not the capture's."""
     pads_a = {"q": [5, 0, 9], "o": [5, 0, 9], "k": [3, 11, 0], "v": [3, 11, 0], "stats": [2, 7, 0]}
-    packed, stor, geom, h = _run_padded(_LENS_Q, _LENS_KV, pads_a, gap="nan", stats="token_major", slack=96, handles=True)
+    packed, stor, geom, h = _run_padded_full(_LENS_Q, _LENS_KV, pads_a, gap="nan", stats="token_major", slack=96, handles=True)
     _check(_LENS_Q, _LENS_KV, packed, stor, geom, "none", stats="token_major")
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
