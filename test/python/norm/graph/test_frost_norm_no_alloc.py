@@ -67,7 +67,10 @@ class _AllocWatch:
 def _select(graph):
     graph.validate()
     graph.build_operation_graph()
-    graph.create_execution_plans(_HEUR)
+    try:
+        graph.create_execution_plans(_HEUR)
+    except cudnn.cudnnGraphNotSupportedError as exc:  # no engine at all on this device
+        pytest.skip(f"no engine proposed a plan for this graph: {exc}")
     idx = next((i for i, p in enumerate(graph.plans) if p.engine_id >= _PY_ENGINE_FLOOR), None)
     if idx is None:
         pytest.skip("frost norm engine proposed no plan for this graph")
