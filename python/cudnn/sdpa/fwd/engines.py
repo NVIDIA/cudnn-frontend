@@ -39,6 +39,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     d256_mxfp8_pair_leg,
     SM100_SCORE_STATS_SHAPES,
     SM100_THD_PACK_GQA_SHAPES,
+    SM100_PAGED_FP8_THD_SHAPES,
     d256_wide_decode_launch,
     decode_d256_q_tile,
     pack_gqa_supported,
@@ -1984,8 +1985,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 return f"paged MXFP8 KV needs page_size to be a multiple of 128; got {facts.page_size}"
             if facts.thd:
                 return "paged MXFP8 KV with THD queries is not wired"
-        if facts.is_fp8 and facts.thd:
-            return "paged KV with THD (ragged) queries is served by the f16/bf16 kernel only (the FP8 THD path clamps runtime K/V descriptors)"
+        if facts.is_fp8 and facts.thd and not (facts.device_cc in ((10, 0), (10, 3)) and (facts.d_qk, facts.d_v) in SM100_PAGED_FP8_THD_SHAPES):
+            return "paged FP8 THD queries require native per-tensor D128/D256 on SM100/SM103"
         if (facts.is_fp8 or facts.is_mxfp8) and facts.o_block_scale:
             return "paged KV with a block-scaled O (sf_o) is served on dense K/V only (the block-scaled epilogue over pools is not validated)"
         if not facts.padded:
@@ -3290,11 +3291,16 @@ def lower_dsl_prefill(
         facts.thd
         and not getattr(api, "thd_decode_leg", False)
         and facts.epilogue_gate_t is None
-        and not (facts.is_fp8 or facts.is_mxfp8)
         and facts.device_cc in ((10, 0), (10, 3))
         and facts.d_qk == facts.d_v
         and facts.d_qk in (128, 256)
-        and ((api.split_kv == 1 and api.cga in (None, 2)) or (facts.has_paged_kv and facts.d_qk == 128 and api.cga == 1))
+        and (
+            (
+                not (facts.is_fp8 or facts.is_mxfp8)
+                and ((api.split_kv == 1 and api.cga in (None, 2)) or (facts.has_paged_kv and facts.d_qk == 128 and api.cga == 1))
+            )
+            or (facts.is_fp8 and facts.has_paged_kv and api.split_kv == 1)
+        )
     ):
         from .thd_origins import graph_origin_specs
 

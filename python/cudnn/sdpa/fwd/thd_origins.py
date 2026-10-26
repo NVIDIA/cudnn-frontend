@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""Plan-time physical-origin contracts for the half SM100 THD forward bodies."""
+"""Plan-time physical-origin contracts for SM100 THD forward bodies."""
 
 PORTS = ("q", "k", "v", "o", "stats")
 ROLES = tuple("ragged_" + name for name in PORTS)

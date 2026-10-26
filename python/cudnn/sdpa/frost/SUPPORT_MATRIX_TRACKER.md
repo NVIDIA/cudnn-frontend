@@ -1,5 +1,15 @@
 # FROST SDPA — support matrix
 
+SM100/SM103 per-tensor FP8 paged KV also serves native D128/D256 THD queries,
+with independent runtime Q/O/Stats offsets and padded or packed Stats. The
+unsplit, unpacked native bodies retain page-pool K/V descriptors; Q/O use
+sequence-local descriptors. Scalar FP16/BF16/E4M3/E5M2 outputs and virtual
+Amax outputs retain the existing FP8 contract. D128 uses its two-CTA THD
+body and D256 its native body. Other quantization families, Rubin FP8 pools,
+block-scaled O, and THD split/PackGQA remain governed by their existing gates.
+`test_sdpa_fwd_paged_thd_fp8.py` covers independent origins, pool layouts,
+rebinding, retained capture, changed scales/tables/lengths and empty work.
+
 Prepared scalar-output MXFP8 dense plans can specialize their declared Stats strides
 at compilation and retain a generic compiled host branch for other valid runtime
 Stats layouts. THD and split partials retain their existing binding contract.
@@ -96,7 +106,7 @@ mask/sink, padded-Stats and changed-length replay tests exercise this support.
 
 Paged K and V may independently use HND or NHD physical storage on every
 existing paged forward row: SM100/SM103 half D64/D128/D192x128/D256/D512,
-per-tensor FP8 D64/D128, MXFP8 D128/D192x128/D256/D512; SM107 half THD
+per-tensor FP8 D64/D128/D256, MXFP8 D128/D192x128/D256/D512; SM107 half THD
 D128/D256 and D256 decode, plus MXFP8 D128/D256. Each operand's declared
 layout is recorded separately in the plan and checked by its native binder.
 TMA descriptors retain the existing shared coordinate order with each pool's
@@ -683,12 +693,13 @@ strides — plus `(B, 1, max_pages, 1)` int32 block tables and `use_padding_mask
 a multiple of 8 that divides the 128-row KV tile or is a multiple of it. Any `S_q`
 (decode or paged prefill), GQA (PackGQAᵐ — the whole group, or on the f16/bf16 kernels
 its largest divisor of the tile; the FP8 kernel packs the whole group only), Stats out,
-and — f16/bf16 only — **THD queries**: ragged Q/O (ragged offsets + `seq_len_q`)
+and **THD queries** on f16/bf16 and native per-tensor FP8 D128/D256: ragged Q/O (ragged offsets + `seq_len_q`)
 over the same pools — chunked prefill — with the THD scheduler walking the Q units (no
 KV split there), including top-left causal + a left window (on d192x128 that band takes
 the plain decode path: the predecoded THD+SWA scheduler is folded off under `PAGED_KV`);
-THD queries over FP8 pools are declined (the FP8 THD path clamps its runtime K/V
-descriptors to a packed total a pool does not have). At `S_q(max) == 1` a ragged d128 f16/bf16 graph with ragged Stats instead rides the d128 decode tile's ragged-Q legʳᵠ (PackGQA + KV split + combine, the offsets read on device) — FlashInfer's prefill-style paged graph at one token per sequence.
+Per-tensor FP8 D128/D256 THD keeps K/V pool descriptors intact and builds
+sequence-local Q/O descriptors, with independent Q/O/Stats physical offsets.
+FP8 THD split/PackGQA and block-scaled outputs remain declined. At `S_q(max) == 1` a ragged d128 f16/bf16 graph with ragged Stats instead rides the d128 decode tile's ragged-Q legʳᵠ (PackGQA + KV split + combine, the offsets read on device) — FlashInfer's prefill-style paged graph at one token per sequence.
 KV split is proposed on dense-Q
 paged graphs by the same wave-cost model as on dense graphs (they are padded by
 construction: the per-batch lengths bound the walk on device and the split composes

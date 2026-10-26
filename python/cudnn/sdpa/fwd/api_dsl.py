@@ -117,6 +117,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     TemplateParams as Sm100TemplateParams,
     SM100_THD_PACK_GQA_SHAPES,
     SM100_NATIVE_D576_SHAPE,
+    SM100_PAGED_FP8_THD_SHAPES,
     SM100_SCORE_STATS_SHAPES,
     CfgD128,
     canonicalize_d192_lowering,
@@ -3070,9 +3071,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # Paged KV rides the PAGED_KV specialization of the f16/bf16 kernels
             # on the flavors config_sm100._PAGED_KV_FLAVORS names (the same set
             # its _validate_params backstops, and engines' paged_d_shapes) and of
-            # the d128 per-tensor FP8 and the MXFP8 kernels; every kernel file without it (
+            # the d64/d128/d256 per-tensor FP8 and the MXFP8 kernels; every kernel file without it (
             # the SM107 half and per-tensor FP8 siblings and the SM107 d192x128 / d512
-            # MXFP8 siblings, the d192x128 / d256 / d512 FP8 flavors, the d512
+            # MXFP8 siblings, the d192x128 / d512 FP8 flavors, the d512
             # 2x2-datapath twin) backstops
             # with a module-scope guard on paged_kv, and these declines keep that
             # guard unreachable from here.  On cc 10.7: half pools serve THD queries
@@ -3090,8 +3091,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 "Rubin paged KV serves half THD queries, MXFP8 pools on D128/D256, and decode-shaped half D256 graphs on the decode tile (per-tensor FP8 pools and other dense half queries are not wired)",
             )
             self._not_implemented_error_if(
-                self._fp8 and self.thd,
-                "paged KV with THD (ragged) queries is served by the f16/bf16 kernel only (the FP8 THD path clamps runtime K/V descriptors to a packed total)",
+                self._fp8 and self.thd and not (self._pertensor and self._device_cc in ((10, 0), (10, 3)) and self.flavor in SM100_PAGED_FP8_THD_SHAPES),
+                "paged FP8 THD queries require native per-tensor D128/D256 on SM100/SM103",
             )
             self._not_implemented_error_if(
                 self._fp8 and self.o_block_scale > 0,
@@ -4045,8 +4046,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         if self.split_kv > 1:
             return self._split_workspace_bytes()
         if self.thd:
-            b = self.batch_size
-            return ws_align(self._thd_meta_words() * 4) + ws_align((b + 3) * 16 * 8) + (0 if self.has_sink else ws_align(self.h_q * 4))
+            return self._thd_workspace_layout()[1]
         return 0
 
     def _explicit_compile_kwargs(self) -> dict:
